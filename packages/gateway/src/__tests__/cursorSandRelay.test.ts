@@ -8,7 +8,7 @@ import { test } from 'node:test'
 // `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
 import protobuf from 'protobufjs'
 import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
-import { CursorSandRelay, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
+import { CursorSandRelay, classifyUpstreamReadFailure, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
 import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import {
@@ -1993,4 +1993,128 @@ test('relay maps overflow end-trailer text to "Prompt is too long"', async () =>
   } finally {
     await relay.close()
   }
+})
+
+// Regression (2026-09-06, uid 4 session): a Sand inference that produced no
+// frames for >300s was torn down by undici's default bodyTimeout as a bare
+// `TypeError: terminated`. The relay then ended the SSE response *cleanly*
+// (no `error` event) because start()'s catch ran after pipe*'s finally had
+// already called res.end(), so CCB saw a truncated-but-successful message and
+// the turn finalized as "completed" with a half-open Write tool_use.
+function stalledUpstreamFetch(mode: 'stall' | 'terminated'): typeof fetch {
+  return async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // Emit one real frame so the relay has already opened message_start,
+        // then go silent (stall) or drop the socket (terminated).
+        controller.enqueue(new Uint8Array(responseFrame('textPart', { text: 'Writing it now.' })))
+        if (mode === 'terminated') {
+          setTimeout(() => controller.error(new TypeError('terminated')), 20)
+        }
+      },
+    })
+    return new Response(stream, { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+}
+
+for (const mode of ['stall', 'terminated'] as const) {
+  test(`streaming relay surfaces an SSE error (not a clean end) when upstream ${mode}s mid-stream`, async () => {
+    const relay = new CursorSandRelay({
+      fetchImpl: stalledUpstreamFetch(mode),
+      readApiKey: () => Buffer.from('crsr_test'),
+      upstreamStallMs: 150,
+    })
+    const baseUrl = await relay.start()
+    try {
+      const response = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'cursor-fable-5-high', stream: true, max_tokens: 64,
+          messages: [{ role: 'user', content: 'go' }],
+        }),
+      })
+      assert.equal(response.status, 200)
+      const text = await response.text()
+      assert.match(text, /event: message_start/)
+      assert.match(text, /event: error/)
+      assert.match(text, mode === 'stall' ? /CURSOR_SAND_UPSTREAM_STALLED/ : /CURSOR_SAND_UPSTREAM_TERMINATED/)
+      assert.doesNotMatch(text, /event: message_stop/)
+      assert.doesNotMatch(text, /"stop_reason":"end_turn"/)
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`non-streaming relay returns 504 + named code when upstream ${mode}s`, async () => {
+    const relay = new CursorSandRelay({
+      fetchImpl: stalledUpstreamFetch(mode),
+      readApiKey: () => Buffer.from('crsr_test'),
+      upstreamStallMs: 150,
+    })
+    const baseUrl = await relay.start()
+    try {
+      const response = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'cursor-fable-5-high', stream: false, max_tokens: 64,
+          messages: [{ role: 'user', content: 'go' }],
+        }),
+      })
+      assert.equal(response.status, 504)
+      assert.equal(response.headers.get('x-should-retry'), 'false')
+      const body = await response.json() as { type: string; error: { message: string } }
+      assert.equal(body.type, 'error')
+      assert.match(body.error.message, mode === 'stall' ? /CURSOR_SAND_UPSTREAM_STALLED/ : /CURSOR_SAND_UPSTREAM_TERMINATED/)
+    } finally {
+      await relay.close()
+    }
+  })
+}
+
+test('relay treats an absent `stream` flag as non-streaming (Anthropic default, CCB fallback shape)', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(Buffer.concat([
+      responseFrame('textPart', { text: 'ok' }),
+      responseFrame('usage', { promptTokens: 3, completionTokens: 1, totalTokens: 4 }),
+      envelope(Buffer.from('{}'), 0x02),
+    ]), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5-high', max_tokens: 64, messages: [{ role: 'user', content: 'go' }] }),
+    })
+    assert.equal(response.status, 200)
+    assert.match(response.headers.get('content-type') ?? '', /application\/json/)
+    const body = await response.json() as { type: string; usage: { input_tokens: number; output_tokens: number } }
+    assert.equal(body.type, 'message')
+    assert.equal(body.usage.input_tokens, 3)
+    assert.equal(body.usage.output_tokens, 1)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('classifyUpstreamReadFailure normalises undici socket wording', () => {
+  assert.equal(classifyUpstreamReadFailure(new TypeError('terminated'), false), 'CURSOR_SAND_UPSTREAM_TERMINATED')
+  assert.equal(classifyUpstreamReadFailure(new Error('read ECONNRESET'), false), 'CURSOR_SAND_UPSTREAM_TERMINATED')
+  assert.equal(classifyUpstreamReadFailure(new Error('anything'), true), 'CURSOR_SAND_UPSTREAM_STALLED')
+  assert.equal(classifyUpstreamReadFailure(new Error('CURSOR_SAND_TRUNCATED_FRAME'), false), 'CURSOR_SAND_TRUNCATED_FRAME')
 })

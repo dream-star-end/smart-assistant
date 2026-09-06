@@ -793,6 +793,12 @@ describe("provisionV3Container", () => {
       env.includes("OC_V3_TRUSTED_FILE_SERVE=1"),
       "supervisor must inject OC_V3_TRUSTED_FILE_SERVE=1 so container gateway uses blocklist-only ACL (see packages/gateway/src/server.ts isFileAllowed trusted branch)",
     );
+    // INC-20260906-COMMERCIAL-TASKBOARD-DIGEST:测试进程无 flavor.manifest,taskboardEnv 不注入
+    // (容器默认启用);商业版生产由 manifest=commercial 判定注入 =0。显式 master env 透传见下一测试。
+    assert.ok(
+      !env.some((e) => e.startsWith("OC_TASKBOARD_ENABLED=")),
+      "without a flavor manifest supervisor must not inject OC_TASKBOARD_ENABLED",
+    );
 
     // 网络 + IP forced via IPAMConfig
     assert.equal(opts.HostConfig?.NetworkMode, V3_NETWORK_NAME);
@@ -857,6 +863,33 @@ describe("provisionV3Container", () => {
 
     // start 成功
     assert.equal(captured.started, 1);
+  });
+
+  test("OC_TASKBOARD_ENABLED explicit master env is passed through to the container", async () => {
+    const prev = process.env.OC_TASKBOARD_ENABLED;
+    process.env.OC_TASKBOARD_ENABLED = "0";
+    try {
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.30.5.44",
+          randomSecret: fixedSecret("c".repeat(64)),
+        },
+        779,
+      );
+      const env = captured.containersCreated[0]?.Env ?? [];
+      assert.ok(
+        env.includes("OC_TASKBOARD_ENABLED=0"),
+        "explicit OC_TASKBOARD_ENABLED=0 on master must reach the container gateway",
+      );
+    } finally {
+      if (prev === undefined) delete process.env.OC_TASKBOARD_ENABLED;
+      else process.env.OC_TASKBOARD_ENABLED = prev;
+    }
   });
 
   test("Codex relay env: passes non-secret knobs but rewrites upstream URL to container loopback relay", async () => {

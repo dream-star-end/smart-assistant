@@ -185,7 +185,9 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
-  if (/^packages\/gateway\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+  // test:gateway 是 `find packages/gateway/src -name "*.test.ts"`,子目录(如 taskboard/__tests__)
+  // 同样被跑;这里按 runner 的真实口径放行,不再只认顶层 __tests__。
+  if (/^packages\/gateway\/src\/(?:[^/]+\/)*__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
   }
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
@@ -390,6 +392,13 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   "c8e4e8b6e29906ed9369c5ad5fe0f4dcc07b3b11",
   // 2026-09-05 全量正向同步冻结:selfhost 2e1c90c87 已上线;只豁免其不可变祖先。含 P1 桌面底座(旗关)/GPT-6 Astra/R5 文献/UI 审计/egress 蓝绿;禁止 amend 源提交。
   "2e1c90c87bf8653c70b4be9d9a350825711b5828",
+  // 2026-09-06 全量正向同步冻结:selfhost 30ef9a3e4 已上线(rel-30ef9a3e4-20260906-021259);
+  // 含 0269-0274 计费/Fable5 下架/GPT-6 队长引擎;只豁免其不可变祖先,禁止 amend 源提交。
+  "30ef9a3e4c2d8fd290c1c38951381e264a2c25ba",
+  // 2026-09-06 全量正向同步冻结:selfhost 3dfd897f7 已上线(rel-3dfd897f7-20260906-132423);
+  // 含 0276 Grok 用量/API-key cursor 直出/OCV5-121 queued consumer/#559 单测挂死修复/#560 看门狗;
+  // 只豁免其不可变祖先,禁止 amend 源提交。
+  "3dfd897f7e92d77588016931fea228cac993bf94",
 ] as const;
 
 function checkTrailerClosure(): number {

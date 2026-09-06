@@ -22,6 +22,7 @@ import {
   TaskboardNotifier,
   type WechatDeliveryResult,
   awaitOutboundId,
+  boardHasTickets,
   collectDigestStats,
   digestOutboundId,
   fireNotify,
@@ -418,6 +419,39 @@ describe('每日简报', () => {
       settings: updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 }),
     })
     assert.equal(cap.inbox.length, 1, '同一天简报幂等')
+    db.close()
+  })
+
+  it('空面板(没有任何票)不出简报,也不标 sent;建票后同日可正常出', async () => {
+    const db = freshDb()
+    assert.equal(boardHasTickets(db), false)
+    const digestAt = new Date('2026-09-05T12:00:00.000Z') // 上海 20:00,过简报点
+    const day = zonedYmd(digestAt)
+    const cap = capture()
+    const n = new TaskboardNotifier({
+      getDb: () => db,
+      transport: cap.transport,
+      now: () => digestAt.getTime(),
+    })
+    const settings = updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 })
+    await n.onDigestTick({ db, at: digestAt, settings })
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.inbox.length, 0, '空面板不该写站内信')
+    assert.equal(cap.wechat.length, 0, '空面板不该打微信')
+    assert.equal(n.hasSent(digestOutboundId(day)), false, '未发送就不能标 sent')
+
+    const project = createProject(db, { key: 'EMP', name: '空面板' })
+    createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: '第一张票',
+      reporter: 'user:default',
+      status: 'ready',
+    })
+    assert.equal(boardHasTickets(db), true)
+    await n.onDigestTick({ db, at: digestAt, settings })
+    assert.equal(cap.inbox.length, 1, '有票之后照常出简报')
+    assert.equal(cap.inbox[0].deliveryKey, digestOutboundId(day))
     db.close()
   })
 

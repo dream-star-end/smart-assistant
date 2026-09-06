@@ -371,6 +371,7 @@ import {
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
+import { isTaskboardEnabled } from './taskboard/feature.js'
 import { PatrolEngine } from './taskboard/patrol.js'
 import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
@@ -3374,68 +3375,74 @@ export class Gateway {
       )
     }, 60_000)
 
-    // Taskboard 统一巡检 tick:一个 60s 定时器扫全部 stage,不按 stage 建 cron job。
-    // 通知复用 onDeliver 瀑布(微信接管则不再推站内信);熔断 warning 走 createInboxMessage。
-    const taskboardNotify = new TaskboardNotifier({
-      getDb: () => getTaskboardDb(),
-      log: (msg, extra) => this.log.warn(msg, extra),
-      transport: {
-        sendWechat: async ({ text, outboundId }) => {
-          const cfg = readV3WechatProactiveConfig()
-          if (!cfg) return { kind: 'fallback' as const, marked: false }
-          return sendV3WechatProactive({ config: cfg, text, outboundId })
+    // 商业版容器由 master 注入 OC_TASKBOARD_ENABLED=0(taskboardEnv.ts):不起巡检、不发简报。
+    // 只关后台自动化,/api/board/* 仍在(project-context / MCP 复用)。
+    if (isTaskboardEnabled()) {
+      // Taskboard 统一巡检 tick:一个 60s 定时器扫全部 stage,不按 stage 建 cron job。
+      // 通知复用 onDeliver 瀑布(微信接管则不再推站内信);熔断 warning 走 createInboxMessage。
+      const taskboardNotify = new TaskboardNotifier({
+        getDb: () => getTaskboardDb(),
+        log: (msg, extra) => this.log.warn(msg, extra),
+        transport: {
+          sendWechat: async ({ text, outboundId }) => {
+            const cfg = readV3WechatProactiveConfig()
+            if (!cfg) return { kind: 'fallback' as const, marked: false }
+            return sendV3WechatProactive({ config: cfg, text, outboundId })
+          },
+          postInbox: async ({ title, bodyMd, deliveryKey }) => {
+            try {
+              return await postInboxMessageDurable({ title, bodyMd, deliveryKey })
+            } catch (err) {
+              this.log.warn('taskboard inbox durable failed', {
+                deliveryKey,
+                err: String(err),
+              })
+              return false
+            }
+          },
+          createInboxMessage: async (args) => {
+            try {
+              return await postInboxAlertDurable(args)
+            } catch (err) {
+              this.log.warn('taskboard inbox-alert durable failed', {
+                deliveryKey: args.deliveryKey,
+                err: String(err),
+              })
+              return false
+            }
+          },
         },
-        postInbox: async ({ title, bodyMd, deliveryKey }) => {
-          try {
-            return await postInboxMessageDurable({ title, bodyMd, deliveryKey })
-          } catch (err) {
-            this.log.warn('taskboard inbox durable failed', {
-              deliveryKey,
-              err: String(err),
-            })
-            return false
-          }
+      })
+      this._taskboardPatrol = new PatrolEngine({
+        getDb: () => getTaskboardDb(),
+        delegate: (input) => this._runTaskboardDelegate(input),
+        log: (msg, extra) => this.log.info(msg, extra),
+        notify: taskboardNotify,
+        onAlert: (alert) => {
+          this.log.warn('taskboard guardrail', {
+            kind: alert.kind,
+            outboundId: alert.outboundId,
+            message: alert.message,
+            stageId: alert.stageId,
+            ticketId: alert.ticketId,
+          })
+          void taskboardNotify.onGuardrailAlert(alert)
         },
-        createInboxMessage: async (args) => {
-          try {
-            return await postInboxAlertDurable(args)
-          } catch (err) {
-            this.log.warn('taskboard inbox-alert durable failed', {
-              deliveryKey: args.deliveryKey,
-              err: String(err),
-            })
-            return false
-          }
-        },
-      },
-    })
-    this._taskboardPatrol = new PatrolEngine({
-      getDb: () => getTaskboardDb(),
-      delegate: (input) => this._runTaskboardDelegate(input),
-      log: (msg, extra) => this.log.info(msg, extra),
-      notify: taskboardNotify,
-      onAlert: (alert) => {
-        this.log.warn('taskboard guardrail', {
-          kind: alert.kind,
-          outboundId: alert.outboundId,
-          message: alert.message,
-          stageId: alert.stageId,
-          ticketId: alert.ticketId,
-        })
-        void taskboardNotify.onGuardrailAlert(alert)
-      },
-    })
-    setPatrolExecutionHandler((job) => {
-      void this._taskboardPatrol?.executeJob(job).catch((err) =>
-        this.log.error('taskboard patrol job failed', undefined, err),
-      )
-    })
-    this._taskboardTickTimer = setInterval(() => {
-      this._taskboardPatrol?.tick().catch((err) =>
-        this.log.error('taskboard tick failed', undefined, err),
-      )
-    }, 60_000)
-    this._taskboardTickTimer.unref()
+      })
+      setPatrolExecutionHandler((job) => {
+        void this._taskboardPatrol?.executeJob(job).catch((err) =>
+          this.log.error('taskboard patrol job failed', undefined, err),
+        )
+      })
+      this._taskboardTickTimer = setInterval(() => {
+        this._taskboardPatrol?.tick().catch((err) =>
+          this.log.error('taskboard tick failed', undefined, err),
+        )
+      }, 60_000)
+      this._taskboardTickTimer.unref()
+    } else {
+      this.log.info('taskboard automation disabled (OC_TASKBOARD_ENABLED=0)')
+    }
 
     // Invalidate task cache when tasks are created or deleted
     eventBus.on('task.created', () => this._invalidateTaskCache())

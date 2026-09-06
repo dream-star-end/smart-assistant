@@ -3957,9 +3957,20 @@ build_release() {
       else
         echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
       fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
-  # OCV5-121: real isolated PG/SQLite/HTTP journeys on this exact pinned archive.
+  # OCV5-121: real isolated PG/SQLite/HTTP journeys on this exact pinned source.
+  # The proof needs the hermetic test PostgreSQL fixture (127.0.0.1:55432, octest) which
+  # only exists on the deploy host — production has no test PG, so on 2026-09-07 the first
+  # --egress ship of 2d9b482ed died on ECONNREFUSED 127.0.0.1:55432 inside the remote
+  # staging tree (live untouched). Run it here from REPO_ROOT, fail-closed when HEAD is
+  # not the pinned sha (assert_clean_source_tree already proved the tree equals HEAD).
   # The runner owns its hard deadline and cleanup; failure cannot publish a candidate.
-  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-queued-consumer.ts"; then
+  if [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" != "$full_sha" ]]; then
+    echo "✗ pinned queued-consumer proof: REPO_ROOT HEAD != pinned $full_sha" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+        npx --no-install tsx scripts/check-v5-queued-consumer.ts); then
     echo "✗ pinned queued-consumer hermetic proof failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
@@ -3999,6 +4010,11 @@ build_release() {
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts"; then
     echo "✗ pinned session-unavailable rootfix contract gate failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
+    echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
