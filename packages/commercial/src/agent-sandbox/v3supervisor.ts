@@ -71,6 +71,7 @@ import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
 import { assertFlavorIdentity, FlavorIdentityError } from "../flavor/assertFlavor.js";
+import { taskboardContainerEnv } from "./taskboardEnv.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
@@ -2767,6 +2768,10 @@ export async function provisionV3Container(
       // 用 agent 也照扣,与产品语义不符。env 只影响 cron.yaml 不存在时的 bootstrap,
       // 已存在的用户自建 cron 不动。处理逻辑见 packages/gateway/src/cron.ts::ensureCronFile。
       "OC_SEED_DEFAULT_CRON=0",
+      // 商业版容器:关掉任务面板后台自动化(巡检 tick / 每日简报 / 待确认 / 熔断通知)。
+      // 只隐藏 UI(VITE_TASKBOARD_ENABLED=0)不够——gateway 的 PatrolEngine 无条件起,新容器
+      // 第一次 tick 就给刚注册的用户写 0/0/0 简报站内信。决策见 ./taskboardEnv.ts。
+      ...taskboardContainerEnv(),
       // v1.0.193:容器内 gateway `/api/file` ACL 切到 trusted-backend 模式
       // (`isTrustedContainerFileServeEnabled` in packages/gateway/src/server.ts)。
       // 语义:范围限定到 `/home/agent/**` + `/tmp/openclaude-*`,内层走 blocklist。

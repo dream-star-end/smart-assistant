@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "frozenAt": "2026-09-04",
-  "auroraTip": "3ea881bf08740ad6fbc74bf6924c851606b2012d",
+  "frozenAt": "2026-09-06",
+  "auroraTip": "beb531ef6c2ab9b289a61795cb49bdcae3511069",
   "selfhostTip": "e5967df4676e5981a88267cd144c6a9bdc995722",
   "incidentIds": [
     "INC-20260717-HISTORY-STUCK",
@@ -93,7 +93,8 @@
     "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
     "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD",
     "INC-20260903-TURNEND-LAST-SEGMENT-FLASH",
-    "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS"
+    "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS",
+    "INC-20260906-COMMERCIAL-TASKBOARD-DIGEST"
   ],
   "incidents": {
     "INC-20260717-HISTORY-STUCK": {
@@ -600,6 +601,9 @@
     "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS": {
       "rootFixCommit": "e5967df4",
       "coverageCommits": []
+    },
+    "INC-20260906-COMMERCIAL-TASKBOARD-DIGEST": {
+      "rootFixCommit": "beb531ef"
     }
   },
   "importedTrailerHistoryTips": [

@@ -29,6 +29,12 @@
  *   命中行在持锁事务内 markV3ContainerVanished,COMMIT 后再 docker stop/remove。
  *   单行失败不影响其他行(每行独立 try/catch),但聚合 errors[] 给 caller 上报。
  *
+ * 2026-09-06 补丁(uid 4 事故):`last_ws_activity` 只反映**用户** WS 活动。agent 自主
+ * 跑 3 小时长轮期间用户不发帧,轮次刚 terminal 11 秒容器就被扫掉,apt 装的工具链全丢,
+ * 下一轮又花积分重装。所以 idle 判定加一条:该容器上最近一次 turn 的 `terminal_at`
+ * (或仍在 accepted/admitted 的在飞轮)也必须早于 cutoff。SELECT 与 FOR UPDATE 重读同
+ * 一 predicate(`recentTurnPredicate`),vanish 守卫 UPDATE 不重复(drain 屏障已兜住在飞轮)。
+ *
  * `last_ws_activity` 何时被刷:
  *   1. provision 时初始化为 NOW()(v3supervisor.allocateBoundIpAndInsertRow)
  *   2. ensureRunning(uid) 命中 'running' 分支 → markV3ContainerActivity 刷新
@@ -76,6 +82,23 @@ export const DEFAULT_SWEEP_BATCH_LIMIT = 100;
 
 /** 首轮上线限流:生产曾积 49 个 stale,20/轮 × 60s ≈ 两三轮清空,避免 docker 风暴。 */
 export const INITIAL_SWEEP_BATCH_LIMIT = 20;
+
+/**
+ * 「该容器最近有 turn 活动」判定,与 last_ws_activity cutoff 共用同一个分钟参数。
+ * 命中 `idx_turn_dispatches_open` (open 状态 partial index) 与 terminal_at;
+ * `$containerCol` 为 agent_containers 行别名/列名,`$minParam` 为分钟数占位符。
+ */
+export function recentTurnPredicate(containerIdExpr: string, minParam: string): string {
+  return `NOT EXISTS (
+              SELECT 1 FROM turn_dispatches td
+               WHERE td.agent_container_id = ${containerIdExpr}
+                 AND (
+                   td.status IN ('admitted', 'accepted', 'rejecting')
+                   OR COALESCE(td.terminal_at, td.last_attempt_at, td.admitted_at)
+                        >= NOW() - (${minParam}::int * interval '1 minute')
+                 )
+            )`;
+}
 
 /** stopAndRemove 单行 docker stop 的超时(秒);默认 5s 跟 supervisor 一致 */
 const STOP_TIMEOUT_SEC = 5;
@@ -204,6 +227,7 @@ export async function selectStaleRows(
                WHERE m.agent_container_id = c.id
                  AND m.phase NOT IN ('committed', 'rolled_back')
             )
+        AND ${recentTurnPredicate("c.id", "$1")}
       ORDER BY last_ws_activity ASC
       LIMIT $2::int`,
     [idleCutoffMin, batchLimit, getRuntimeChannel()],
@@ -241,6 +265,7 @@ async function stillIdleLocked(
         AND state = 'active'
         AND last_ws_activity IS NOT NULL
         AND last_ws_activity < NOW() - ($3::int * interval '1 minute')
+        AND ${recentTurnPredicate("agent_containers.id", "$3")}
       FOR UPDATE`,
     [String(row.id), getRuntimeChannel(), idleCutoffMin],
   );
