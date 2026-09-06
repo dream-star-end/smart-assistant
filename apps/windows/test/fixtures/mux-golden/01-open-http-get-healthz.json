@@ -1,0 +1,8 @@
+{
+  "name": "01-open-http-get-healthz",
+  "hex": "0100000000010000003e7b226d6574686f64223a22474554222c2270617468223a222f6865616c74687a222c2268656164657273223a7b7d2c22646561646c696e654d73223a317d",
+  "length": 72,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 1,
+  "streamId": 1
+}

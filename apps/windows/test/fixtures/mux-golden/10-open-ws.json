@@ -1,0 +1,8 @@
+{
+  "name": "10-open-ws",
+  "hex": "1100000000090000000e7b2270617468223a222f7773227d",
+  "length": 24,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 17,
+  "streamId": 9
+}

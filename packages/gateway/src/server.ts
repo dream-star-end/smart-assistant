@@ -101,6 +101,16 @@ import {
   DELEGATE_CONTEXT_HEADER,
   verifyDelegateContextToken,
 } from './delegateContext.js'
+import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
+import { resolveGatewayListen } from './gatewayBind.js'
+import { resolveOpenedPath } from './openedPath.js'
+import {
+  hasResolvedPrefix,
+  isPathStrictlyUnder,
+  isPathWithinRoot,
+  openclaudeTempPrefix,
+  trustedContainerHome,
+} from './pathAcl.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -3497,10 +3507,18 @@ export class Gateway {
       this.log.warn('live stream convergence failed', undefined, err)
     }
 
+    const listenOpts = resolveGatewayListen(config.gateway.bind, config.gateway.port)
     await new Promise<void>((res) => {
-      this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
+      if (listenOpts.exclusive) {
+        this.httpServer.listen(
+          { port: listenOpts.port, host: listenOpts.host, exclusive: true },
+          () => res(),
+        )
+      } else {
+        this.httpServer.listen(listenOpts.port, listenOpts.host, () => res())
+      }
     })
-    this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
+    this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
     this.bootAutoResume().catch((err) =>
@@ -3993,7 +4011,13 @@ export class Gateway {
     const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
     const delegateAuthedByContext =
       this._isDelegateHttpPath(url.pathname) && this._hasValidDelegateContext(req)
-    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req) && !delegateAuthedByContext) {
+    if (
+      needsAuth &&
+      !bridgeVerified &&
+      !this.checkHttpAuth(req) &&
+      !checkLocalBridge(req) &&
+      !delegateAuthedByContext
+    ) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -4379,18 +4403,10 @@ export class Gateway {
       // (supervisor 写错 / 部署降级 / 容器复用)→ not ready → HOST 返 CONTAINER_OUTDATED,
       // 避免 HOST 按 bypass 发头结果容器内 checkBridgeBypass 失败 401 的 dead lock。
       // (Codex R1 SHOULD-3:校验形态,不只校验非空)
-      const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
       const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
-      const OC_BRIDGE_NONCE = process.env.OC_BRIDGE_NONCE || ''
-      // trust IP 必须是 IPv4 文本(docker bridge gateway,通常 172.30.0.1)
-      // 用 net.isIPv4 而不是松正则 —— R2 SHOULD:`999.999.999.999` 会过正则但
-      // remoteAddress 永远 match 不到,结果 /healthz 误报 ready 导致 HOST probe
-      // 通过但真实 bypass 全挂。
-      const TRUST_IP_OK = isIPv4(TRUST_BRIDGE_IP)
-      // container id 必须是 10 位以内正整数(BIGSERIAL),禁止 alpha / leading 0 / 超长
-      const CONTAINER_ID_OK = /^[1-9][0-9]{0,18}$/.test(OC_CONTAINER_ID)
-      const NONCE_OK = /^[0-9a-f]{64}$/i.test(OC_BRIDGE_NONCE)
-      const bridgeReady = TRUST_IP_OK && CONTAINER_ID_OK && NONCE_OK
+      // file-proxy-v1 仍只看 TRUST_BRIDGE 三件套形态(isHealthzFileProxyReady)。
+      // local-bridge token 不是三件套的一部分,W4:不得因此广播 file-proxy-v1。
+      const bridgeReady = isHealthzFileProxyReady(process.env)
       const body: Record<string, unknown> = c
         ? {
             ok: true,
@@ -7208,7 +7224,7 @@ export class Gateway {
     }
     let fdReal: string
     try {
-      fdReal = realpathSync(`/proc/self/fd/${fd}`)
+      fdReal = resolveOpenedPath(fd, realPath)
     } catch {
       closeSync(fd)
       res.writeHead(404)
@@ -8104,7 +8120,7 @@ export class Gateway {
       // violation. Documented in docs/audit-file-toctou.md.
       let tmpFdReal: string
       try {
-        tmpFdReal = realpathSync(`/proc/self/fd/${tmpFd}`)
+        tmpFdReal = resolveOpenedPath(tmpFd, tmpPath)
       } catch (err) {
         this.log.error('handleUpload: tmp fd realpath failed', { tmpPath }, err)
         try { unlinkSync(tmpPath) } catch {}
@@ -8370,7 +8386,7 @@ export class Gateway {
         }
         let finalReal: string
         try {
-          finalReal = realpathSync(`/proc/self/fd/${finalFd}`)
+          finalReal = resolveOpenedPath(finalFd, finalPath)
         } catch (err) {
           this.log.error('handleUpload: post-link realpath failed', { finalPath, eexistDedup }, err)
           if (!eexistDedup) {
@@ -15379,7 +15395,7 @@ export class Gateway {
       remoteIp === TRUST_BRIDGE_IP ||
       remoteIp === `::ffff:${TRUST_BRIDGE_IP}`
     )
-    if (!isFromBridge && !this.checkHttpAuth(req)) {
+    if (!isFromBridge && !checkLocalBridge(req) && !this.checkHttpAuth(req)) {
       ws.close(1008, 'unauthorized')
       return
     }
@@ -21154,8 +21170,8 @@ export const FILE_ALLOWED_DIRS: string[] = [
   resolve(paths.uploadsDir),    // /root/.openclaude/uploads/
 ]
 
-/** Temp-file prefix pattern: /tmp/openclaude-* */
-const TEMP_PREFIX = resolve('/tmp/openclaude-')
+/** Temp-file prefix pattern: /tmp/openclaude-* (win32: os.tmpdir()/openclaude-) */
+const TEMP_PREFIX = openclaudeTempPrefix()
 
 /**
  * v3 Codex sometimes writes a user-requested artifact into its cwd
@@ -21210,7 +21226,7 @@ const COMMERCIAL_USER_VOLUME_MEDIA_GATE =
  * Used only by the trusted branch of `isFileAllowed`; legacy/personal-version
  * code never references this constant.
  */
-const TRUSTED_CONTAINER_HOME = '/home/agent'
+const TRUSTED_CONTAINER_HOME = trustedContainerHome()
 
 /**
  * Call-time check (NOT a module-load const) — tests can flip the env between
@@ -21274,30 +21290,28 @@ export function isFileAllowed(
   //     must add a matching pattern in the same PR (with a `security.test.ts`
   //     case). v3supervisor.ts and entrypoint.ts cite this contract.
   if (isTrustedContainerFileServeEnabled()) {
-    const inHome =
-      resolvedPath === TRUSTED_CONTAINER_HOME ||
-      resolvedPath.startsWith(`${TRUSTED_CONTAINER_HOME}/`)
-    const inTemp = resolvedPath.startsWith(TEMP_PREFIX)
+    const inHome = isPathWithinRoot(resolvedPath, TRUSTED_CONTAINER_HOME)
+    const inTemp = hasResolvedPrefix(resolvedPath, TEMP_PREFIX)
     const inOptExport = OPT_OPENCLAUDE_EXPORT_RE.test(resolvedPath)
     if (!inHome && !inTemp && !inOptExport) return false
     return !isFileBlocked(resolvedPath)
   }
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
-    if (resolvedPath.startsWith(dir + '/') || resolvedPath === dir) return true
+    if (isPathWithinRoot(resolvedPath, dir)) return true
   }
   // 2. Temp files matching /tmp/openclaude-*
-  if (resolvedPath.startsWith(TEMP_PREFIX)) return true
+  if (hasResolvedPrefix(resolvedPath, TEMP_PREFIX)) return true
   // 3. Dynamic agent cwds (if provided) — allow media files and generated/uploads subdirs
   if (agentCwds) {
     for (const raw of agentCwds) {
       if (!raw) continue
       const cwd = resolve(raw)
-      if (resolvedPath.startsWith(cwd + '/') || resolvedPath === cwd) {
+      if (isPathWithinRoot(resolvedPath, cwd)) {
         // Allow generated/ and uploads/ subdirs unconditionally
-        const genSub = cwd + '/generated'
-        const upSub = cwd + '/uploads'
-        if (resolvedPath.startsWith(genSub + '/') || resolvedPath.startsWith(upSub + '/')) return true
+        const genSub = join(cwd, 'generated')
+        const upSub = join(cwd, 'uploads')
+        if (isPathStrictlyUnder(resolvedPath, genSub) || isPathStrictlyUnder(resolvedPath, upSub)) return true
         // Allow non-executable media file extensions anywhere in CWD
         const ext = extname(resolvedPath).toLowerCase()
         if (MEDIA_EXTENSIONS.has(ext)) return true
@@ -21331,9 +21345,7 @@ export function makeUserScopedMediaPredicate(
 ): (p: string) => boolean {
   const u = resolve(uploadsDir)
   const g = resolve(generatedDir)
-  return (p) =>
-    p === u || p.startsWith(u + '/') ||
-    p === g || p.startsWith(g + '/')
+  return (p) => isPathWithinRoot(p, u) || isPathWithinRoot(p, g)
 }
 
 /**

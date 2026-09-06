@@ -1,0 +1,8 @@
+{
+  "name": "08-http-end",
+  "hex": "04000000000100000000",
+  "length": 10,
+  "generatedFrom": "packages/commercial/src/ws/desktopMux.ts",
+  "type": 4,
+  "streamId": 1
+}

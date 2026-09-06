@@ -60,7 +60,7 @@ import type {
   TurnSummary,
   TurnToolEntry,
 } from './engine/engineEvents.js'
-import { createEngine, resolveEngine } from './engine/registry.js'
+import { createEngine, EngineNotEnabledError, isEngineEnabled, resolveEngine } from './engine/registry.js'
 import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
@@ -3700,6 +3700,7 @@ export class SessionManager {
           engineId,
           this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
         )
+    if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,

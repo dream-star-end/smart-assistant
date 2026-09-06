@@ -66,18 +66,35 @@ export interface TerminalBackend {
   spawn(opts: SpawnOpts): ChildProcessWithoutNullStreams
 }
 
+export function localBackendSpawnOptions(
+  opts: SpawnOpts,
+  platform: NodeJS.Platform = process.platform,
+) {
+  const cwd = opts.subprocessCwd ?? opts.ccbBinaryDir
+  if (platform === 'win32') {
+    return {
+      cwd,
+      env: opts.env,
+      stdio: opts.stdio,
+      detached: false,
+      windowsHide: true,
+    }
+  }
+  return {
+    cwd,
+    env: opts.env,
+    stdio: opts.stdio,
+    detached: opts.detached,
+  }
+}
+
 // ── Local backend (default) ──
 
 export class LocalBackend implements TerminalBackend {
   spawn(opts: SpawnOpts): ChildProcessWithoutNullStreams {
     // subprocessCwd 优先(Phase 5 caller 显式指定项目目录);缺省退回 ccbBinaryDir
     // 保持老行为,避免不传 subprocessCwd 的 caller(若有)出现意外破坏。
-    return spawn(opts.command, opts.args, {
-      cwd: opts.subprocessCwd ?? opts.ccbBinaryDir,
-      env: opts.env,
-      stdio: opts.stdio,
-      detached: opts.detached,
-    })
+    return spawn(opts.command, opts.args, localBackendSpawnOptions(opts))
   }
 }
 
