@@ -139,3 +139,21 @@ describe('aggregateDelegateFanoutResults — 结果聚合 + 单项失败隔离',
     assert.match(out, /### 2\. ❌ office-assistant — do something/)
   })
 })
+
+describe('normalizeFanoutTasks — allowSelf 透传(2026-09-06 MCP 自委派缺口)', () => {
+  it('allowSelf true/"true"/"1" → true;缺省/false/其它 → 不带字段', () => {
+    const r = normalizeFanoutTasks([
+      { goal: 'a', allowSelf: true },
+      { goal: 'b', allowSelf: 'true' },
+      { goal: 'c', allowSelf: '1' },
+      { goal: 'd' },
+      { goal: 'e', allowSelf: false },
+    ].slice(0, 4))
+    assert.equal(r.ok, true)
+    if (!r.ok) return
+    assert.equal(r.tasks[0].allowSelf, true)
+    assert.equal(r.tasks[1].allowSelf, true)
+    assert.equal(r.tasks[2].allowSelf, true)
+    assert.equal('allowSelf' in r.tasks[3], false)
+  })
+})

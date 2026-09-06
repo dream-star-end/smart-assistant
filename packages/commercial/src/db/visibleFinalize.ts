@@ -200,6 +200,7 @@ export type TapeDisplayDegradeReason =
   | "records_failed"
   | "finalized_tape_missing"
   | "tape_hash_mismatch"
+  | "final_record_missing"
   | "record_missing"
   | "visible_payload_hash_mismatch"
   | "record_malformed"

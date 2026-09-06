@@ -637,6 +637,8 @@ const CLOSE_REASON_LABELS: Record<string, string> = {
   baseline_missing: "基础环境未就绪，管理员处理中",
   data_host_unavailable: "数据节点暂不可用，正在保护你的工作区",
   supervisor_error: "环境启动异常，稍后自动重试",
+  desktop_offline: "桌面端未在线",
+  desktop_owned_elsewhere: "会话钉在其他实例，请重连",
 };
 
 export type CloseDecision = {

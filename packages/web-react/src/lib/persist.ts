@@ -523,6 +523,35 @@ export function isDeferredExactProcessStub(message: ChatMessage | null | undefin
   return message?._payloadDeferred === true;
 }
 
+/** A deferred locator that would otherwise count as its owner+role's
+ *  displayable exact process row (same shape `isDisplayableExactProcessRow`
+ *  accepts, minus the deferred exclusion). Its payload is still on the wire,
+ *  so the role is only partially readable and must not be reported as fully
+ *  arrived — another segment of the same role may still need its live copy.
+ *  INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW */
+function isDeferredExactProcessArrivalStub(message: ChatMessage): boolean {
+  if (!isDeferredExactProcessStub(message)) return false;
+  if (isIncompleteDurableToolRow(message)) return false;
+  if (!isTapeBackedAgentProcessRole(message.role)) return false;
+  if (message._displayDegradeReason === "records_unpublished") return false;
+  return message._timelineRecord === true ||
+    (message._source === "server" &&
+      message._turnTapeComplete === true &&
+      typeof message._turnTapeId === "string" &&
+      message._turnTapeId.length > 0);
+}
+
+/** Phase-B can land one assistant segment as a `_payloadDeferred` locator
+ *  stub (>1MiB record bodies defer): timeline record + deferred bit + empty
+ *  body. It is an address, not content — it must not blank a readable local
+ *  segment that already streamed into the same id. */
+function isDeferredExactAssistantStub(message: ChatMessage): boolean {
+  return message.role === "assistant" &&
+    message._timelineRecord === true &&
+    isDeferredExactProcessStub(message) &&
+    (typeof message.text !== "string" || message.text.length === 0);
+}
+
 function ownerRoleKey(owner: string, role: ChatMessage["role"] | undefined): string {
   return `${owner}\0${role ?? ""}`;
 }
@@ -708,7 +737,19 @@ function hasDisplayableExactRole(
   unownedDisplayableRoles: ReadonlySet<string>,
   role: ChatMessage["role"] | undefined,
   owner?: string,
+  deferredArrivalByOwnerRole?: ReadonlySet<string>,
+  unownedDeferredArrivalRoles?: ReadonlySet<string>,
 ): boolean {
+  // A deferred stub of the same owner+role means the exact tape for that role
+  // is only partially readable: another segment's payload is still on the
+  // wire, so the role must not count as positively arrived (segment
+  // granularity; owner+role alone over-reports completion when one turn has
+  // several records of the same role and only some hydrated).
+  // INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW
+  if (typeof owner === "string" && deferredArrivalByOwnerRole?.has(ownerRoleKey(owner, role))) {
+    return false;
+  }
+  if (typeof role === "string" && unownedDeferredArrivalRoles?.has(role)) return false;
   if (typeof owner === "string" && displayableExactByOwnerRole.has(ownerRoleKey(owner, role))) {
     return true;
   }
@@ -727,7 +768,9 @@ function hasDisplayableExactRole(
  *    and this owner still has no displayable exact process rows, or
  *  - Phase-B already landed a non-degrade assistant, but this live row's role
  *    still has no non-deferred exact process (thinking/tool/plan/agent-group/
- *    delegate-progress/runtime-event/assistant). Deferred stubs do not count.
+ *    delegate-progress/runtime-event/assistant). Deferred stubs do not count;
+ *    a deferred stub of the same owner+role keeps the role un-arrived even
+ *    when a sibling segment of that role is already readable.
  *
  * Default is false: ordinary P2 / completion replacement still drops live
  * copies once a displayable exact row of the same role is present.
@@ -753,6 +796,8 @@ export function isLiveProcessPendingExactTape(
   const exactProcessOwners = new Set<string>();
   const displayableExactByOwnerRole = new Set<string>();
   const unownedDisplayableRoles = new Set<string>();
+  const deferredArrivalByOwnerRole = new Set<string>();
+  const unownedDeferredArrivalRoles = new Set<string>();
   for (const row of authorityRows) {
     if (!row) continue;
     if (row.role === "assistant" && row._displayDegradeReason === "records_unpublished") {
@@ -773,6 +818,10 @@ export function isLiveProcessPendingExactTape(
       } else if (typeof row.role === "string") {
         unownedDisplayableRoles.add(row.role);
       }
+    } else if (isDeferredExactProcessArrivalStub(row)) {
+      const stubOwner = turnOwnerId(row);
+      if (typeof stubOwner === "string") deferredArrivalByOwnerRole.add(ownerRoleKey(stubOwner, row.role));
+      else if (typeof row.role === "string") unownedDeferredArrivalRoles.add(row.role);
     }
   }
   const owner = turnOwnerId(message);
@@ -805,6 +854,8 @@ export function isLiveProcessPendingExactTape(
       unownedDisplayableRoles,
       message.role,
       owner,
+      deferredArrivalByOwnerRole,
+      unownedDeferredArrivalRoles,
     );
   }
   if (hasUnownedUnpublishedAssistant && exactProcessOwners.size === 0) return true;
@@ -847,6 +898,24 @@ function isLiveAssistantFragment(message: ChatMessage): boolean {
     && message._source !== "server"
     && message._timelineRecord !== true
     && message._displayDegradeReason !== "records_unpublished";
+}
+
+/** The readable final-segment text a local row can lend to a same-id server
+ *  row (Phase-A fallback or deferred Phase-B stub): either the live fragment's
+ *  own streamed text, or the text a previous merge already carried onto the
+ *  id. Concatenated fallback blobs are deliberately NOT acceptable — only the
+ *  segment text belongs in this slot. */
+function readableLocalAssistantSegmentText(localMsg: ChatMessage): string | undefined {
+  if (isLiveAssistantFragment(localMsg) && typeof localMsg.text === "string" && localMsg.text.length > 0) {
+    return localMsg.text;
+  }
+  if (
+    typeof localMsg._unpublishedFallbackLiveText === "string" &&
+    localMsg._unpublishedFallbackLiveText.length > 0
+  ) {
+    return localMsg._unpublishedFallbackLiveText;
+  }
+  return undefined;
 }
 
 /** Phase-A unpublished fallback is one concatenated visible_head blob. Keep it
@@ -1655,13 +1724,34 @@ function mergeLocalClientFields(
     serverMsg.role === "assistant" &&
     serverMsg._displayDegradeReason === "records_unpublished"
   ) {
-    const liveText = isLiveAssistantFragment(localMsg) && typeof localMsg.text === "string" && localMsg.text
-      ? localMsg.text
-      : typeof localMsg._unpublishedFallbackLiveText === "string" && localMsg._unpublishedFallbackLiveText
-        ? localMsg._unpublishedFallbackLiveText
-        : undefined;
+    const liveText = readableLocalAssistantSegmentText(localMsg);
     if (liveText && serverMsg._unpublishedFallbackLiveText !== liveText) {
       serverMsg = { ...serverMsg, _unpublishedFallbackLiveText: liveText };
+    }
+  }
+  // INC-20260905-TURNEND-DEFERRED-STUB-SWALLOW (gen-5): Phase-B can land the
+  // final assistant segment as a `_payloadDeferred` locator stub (>1MiB record
+  // bodies defer) under the SAME id the live row / Phase-A fallback already
+  // used. The unconditional timeline-record server-wins below returned the
+  // empty stub and dropped `_unpublishedFallbackLiveText`, so the final
+  // segment went blank again until the async Range payload arrived — gen-3
+  // (isDeferredExactProcessStub) guarded only the deletion path, not this
+  // same-id overwrite. Carry the readable local text onto the stub and render
+  // it inline: the renderer routes `_payloadDeferred` rows to the locator
+  // placeholder card, so the merged row must present the streamed text itself
+  // (same fidelity tradeoff as the Phase-A fallback slot). When the real
+  // non-deferred record arrives, id server-wins replaces the row wholesale and
+  // the helper field disappears with it.
+  if (isDeferredExactAssistantStub(serverMsg)) {
+    const liveText = readableLocalAssistantSegmentText(localMsg);
+    if (liveText && serverMsg._unpublishedFallbackLiveText !== liveText) {
+      serverMsg = {
+        ...serverMsg,
+        text: liveText,
+        _payloadDeferred: undefined,
+        _payloadBytes: undefined,
+        _unpublishedFallbackLiveText: liveText,
+      };
     }
   }
   // Unified timeline rows are exact persisted Agent records. Never transform

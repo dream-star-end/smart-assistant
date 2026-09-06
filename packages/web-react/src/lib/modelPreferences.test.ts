@@ -53,8 +53,8 @@ describe("model preferences", () => {
     expect(effortForModel(MODELS, "missing", "max")).toBeUndefined();
   });
 
-  test("team leader effort is resolved against the actual Sol execution model", () => {
-    expect(effectiveEffortModelId("MiniMax-M3", true)).toBe("gpt-5.6-sol");
+  test("team leader effort is resolved against the actual Astra execution model", () => {
+    expect(effectiveEffortModelId("MiniMax-M3", true)).toBe("gpt-6-astra");
     expect(effectiveEffortModelId("gpt-5.6-terra", false)).toBe("gpt-5.6-terra");
   });
 

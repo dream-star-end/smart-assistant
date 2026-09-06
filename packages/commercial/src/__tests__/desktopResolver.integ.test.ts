@@ -20,6 +20,7 @@ import {
   getDesktopTunnelRegistry,
   resetDesktopTunnelRegistryForTest,
 } from "../ws/desktopTunnelRegistry.js";
+import { createPgDesktopTunnelOwnerStore } from "../ws/desktopTunnelOwnerStore.js";
 import { DesktopMuxSession, createMuxLoopbackPair } from "../ws/desktopMux.js";
 import { makeDesktopOrDockerResolver } from "../agent-sandbox/desktopEnsure.js";
 import { admitDispatch } from "../dispatch/turnDispatchStore.js";
@@ -115,7 +116,7 @@ describe("desktop resolver production composition", () => {
     setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
     const pair = createMuxLoopbackPair();
     const mux = new DesktopMuxSession(pair.master);
-    getDesktopTunnelRegistry().attach(desktopId, { mux, close: () => {} }, {
+    await getDesktopTunnelRegistry().attach(desktopId, { mux, close: () => {} }, {
       deviceId: "11111111-1111-4111-8111-111111111111",
       uid,
       expiresAt: new Date(Date.now() + 60_000),
@@ -160,6 +161,79 @@ describe("desktop resolver production composition", () => {
       mux.close();
       setDesktopSettingsLoader(null);
       resetDesktopFlagCache();
+      delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    }
+  });
+
+  test("registerCommercial: active desktop + foreign owner → 4503 desktop_owned_elsewhere", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    process.env.DATABASE_URL = db.url;
+    process.env.REDIS_URL = TEST_REDIS_URL;
+    process.env.COMMERCIAL_ENABLED = "1";
+    process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString("base64");
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    process.env.COMMERCIAL_ALERTS_DISABLED = "1";
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','user','active') RETURNING id::text`,
+      [`desk-else-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    const inserted = await query<{ id: string }>(
+      `INSERT INTO agent_containers(
+         user_id, host_uuid, bound_ip, secret_hash, state, port, image,
+         runtime_channel, runtime_kind, last_ws_activity
+       ) VALUES ($1, NULL, NULL, $2, 'active', 18789, 'desktop-gateway', $3, 'desktop', NOW())
+       RETURNING id::text`,
+      [uid, Buffer.alloc(32, 5), getRuntimeChannel()],
+    );
+    const desktopId = Number(inserted.rows[0]!.id);
+    resetDesktopTunnelRegistryForTest({
+      instanceId: "bridge-self",
+      instanceAddr: "127.0.0.1:18445",
+      owners: createPgDesktopTunnelOwnerStore(),
+    });
+    await createPgDesktopTunnelOwnerStore().upsert({
+      agentContainerId: desktopId,
+      instanceId: "other-slot",
+      instanceAddr: "127.0.0.1:18795",
+      generation: 1,
+      ownerEpoch: 1,
+    });
+    resetDesktopFlagCache();
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
+    const r = await registerCommercial(null, { jwtSecret: JWT, skipInternalProxy: true });
+    try {
+      const httpServer = createServer();
+      httpServer.on("upgrade", (req, socket, head) => {
+        if (!r.handleWsUpgrade(req, socket, head)) {
+          try { socket.destroy(); } catch { /* */ }
+        }
+      });
+      await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
+      const port = (httpServer.address() as AddressInfo).port;
+      const issued = await signAccess({ sub: String(uid), role: "user" }, JWT);
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${port}/ws/user-chat-bridge`,
+        ["bearer", issued.token],
+      );
+      const closeInfo = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("ws never closed")), 8000);
+        ws.on("close", (code, reason) => {
+          clearTimeout(timer);
+          resolve({ code, reason: reason.toString("utf8") });
+        });
+        ws.on("error", () => { /* */ });
+      });
+      assert.equal(closeInfo.code, CLOSE_BRIDGE.CONTAINER_UNREADY);
+      const parsed = JSON.parse(closeInfo.reason) as { reason?: string };
+      assert.equal(parsed.reason, "desktop_owned_elsewhere");
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    } finally {
+      await r.shutdown();
+      setDesktopSettingsLoader(null);
+      resetDesktopFlagCache();
+      resetDesktopTunnelRegistryForTest();
       delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
     }
   });

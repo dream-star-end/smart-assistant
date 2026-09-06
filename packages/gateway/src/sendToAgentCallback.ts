@@ -8,6 +8,10 @@ import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
 export { parseOriginWebchatSessionKey }
 
 const OUTPUT_MAX = 8_000
+// Master `/internal/v3/cron-origin-inject` rejects text > 32_000 chars; the
+// callback now rides that route for billing parity, so every variable part
+// must be bounded (goal used to be unbounded).
+const GOAL_MAX = 4_000
 
 export function buildSendToAgentCallbackText(input: {
   agentId: string
@@ -15,7 +19,7 @@ export function buildSendToAgentCallbackText(input: {
   output?: string
   error?: string
 }): string {
-  const goal = input.goal.trim() || '(未提供任务描述)'
+  const goal = (input.goal.trim() || '(未提供任务描述)').slice(0, GOAL_MAX)
   const body = (input.error?.trim() || input.output?.trim() || '(子 agent 没有返回正文)').slice(
     0,
     OUTPUT_MAX,

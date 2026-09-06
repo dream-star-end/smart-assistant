@@ -31,6 +31,8 @@ import {
 } from "../http/desktopEnroll.js";
 import type { CommercialHttpDeps, RequestContext } from "../http/handlers.js";
 import { HttpError } from "../http/util.js";
+import { makeDesktopEnsureAttached, resetDesktopEnsureCacheForTest } from "../agent-sandbox/desktopEnsure.js";
+import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import { rootLogger } from "../logging/logger.js";
 import { useDedicatedTestDatabase } from "./helpers/db.js";
 
@@ -515,5 +517,72 @@ describe("desktop enrollment integ", () => {
     await rm(caDir, { recursive: true, force: true });
     setDesktopSettingsLoader(null);
     resetDesktopFlagCache();
+  });
+
+  test("enroll_finish invalidates W-R03 cache → 4503 desktop_offline not docker", async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-enroll-cache-"));
+    const prevCa = process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = dir;
+    process.env.OC_DESKTOP_VIRTUAL_CONTAINER = "1";
+    resetDesktopFlagCache();
+    resetDesktopEnsureCacheForTest();
+    const u = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, role, status)
+       VALUES ($1,'x','user','active') RETURNING id::text`,
+      [`desk-enroll-cache-${Date.now()}@t.local`],
+    );
+    const uid = Number(u.rows[0]!.id);
+    setDesktopSettingsLoader(async () => ({ settingsOn: true, allowlist: [uid] }));
+    const flags = async () => ({
+      envEnabled: true, killSwitch: false, settingsOn: true, allowlist: [uid], assembled: true,
+    });
+    assert.equal(await makeDesktopEnsureAttached(BigInt(uid), { flags }), null);
+
+    const registry = createMemoryDesktopTunnelRegistry();
+    const deps: CommercialHttpDeps = {
+      jwtSecret: JWT,
+      mailer: { send: async () => {} },
+      redis: memRedis(),
+      desktopTunnelRegistry: registry,
+    } as CommercialHttpDeps;
+    const verifier = generatePkceVerifier();
+    const challenge = await pkceChallengeS256(verifier);
+    const startOut = response();
+    await handleDesktopEnrollStart(
+      request({ pkce_challenge: challenge, app_id: "chat.claudeai.clarvy", public_name: "sim", platform: "sim" }),
+      startOut.res,
+      ctx(),
+      deps,
+    );
+    const enrollmentId = String(startOut.body().enrollment_id);
+    const tok = await bearer(uid);
+    const confirmOut = response();
+    await handleDesktopEnrollConfirm(
+      request({ enrollment_id: enrollmentId }, { authorization: `Bearer ${tok}` }),
+      confirmOut.res,
+      ctx(),
+      deps,
+    );
+    const code = String(confirmOut.body().code);
+    const finishOut = response();
+    await handleDesktopEnrollFinish(
+      request({ enrollment_id: enrollmentId, code, pkce_verifier: verifier }),
+      finishOut.res,
+      ctx(),
+      deps,
+    );
+    assert.equal(finishOut.status(), 200);
+
+    await assert.rejects(
+      () => makeDesktopEnsureAttached(BigInt(uid), { flags }),
+      (e: unknown) => e instanceof ContainerUnreadyError && e.reason === "desktop_offline",
+    );
+    if (prevCa === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevCa;
+    delete process.env.OC_DESKTOP_VIRTUAL_CONTAINER;
+    setDesktopSettingsLoader(null);
+    resetDesktopFlagCache();
+    await rm(dir, { recursive: true, force: true });
   });
 });

@@ -132,7 +132,7 @@ describe("desktop inbound channel production composition", () => {
           WHERE user_id = $1 AND runtime_kind = 'desktop' AND state = 'active' LIMIT 1`,
         [uid],
       );
-      getDesktopTunnelRegistry().attach(Number(desktopId.rows[0]!.id), { mux, close: () => {} }, {
+      await getDesktopTunnelRegistry().attach(Number(desktopId.rows[0]!.id), { mux, close: () => {} }, {
         deviceId: "22222222-2222-4222-8222-222222222222",
         uid,
         expiresAt: new Date(Date.now() + 60_000),

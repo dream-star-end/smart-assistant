@@ -11,6 +11,22 @@
 import type { FanoutItemResult } from './delegateFanout.js'
 
 export const DEFAULT_CURSOR_FAST_WAIT_MS = 45_000
+
+/** Transport blip on one long-poll: keep waiting / hand back the job instead of failing.
+ *  (Lives here — not in delegateWaitCli — so the CLI and the MCP fast path share one
+ *  predicate without a circular import.) */
+export function isTransientDelegateWaitError(err: unknown): boolean {
+  const e = err as { code?: string; cause?: { code?: string }; message?: unknown }
+  const code = e?.code || e?.cause?.code
+  const msg = String(e?.message ?? err)
+  return (
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    /delegate client timeout/i.test(msg) ||
+    /socket hang up/i.test(msg)
+  )
+}
 export const MIN_CURSOR_FAST_WAIT_MS = 5_000
 export const MAX_CURSOR_FAST_WAIT_MS = 55_000
 
@@ -259,7 +275,24 @@ export async function runCursorDelegateFastPath(
   const started = await opts.transport.start()
   const start = interpretDelegateStartBody(started.statusCode, started.body)
   if ('error' in start) return { kind: 'error', text: start.error }
-  const waited = await opts.transport.wait(start.jobId, opts.fastWaitMs)
+  let waited: { statusCode: number; body: string }
+  try {
+    waited = await opts.transport.wait(start.jobId, opts.fastWaitMs)
+  } catch (err) {
+    // 2026-09-06 L2 矩阵实测:网关重载时 /api/delegate/wait 长轮询要 52–80s 才返回,
+    // MCP 客户端 (fastWaitMs+15s) 先超时 → 以前整段报「委派失败: delegate client timeout」,
+    // 而子任务其实已经/仍在正常跑(DB 里 completed)。作业句柄已在 start 阶段拿到,传输层
+    // 抖动(ETIMEDOUT/ECONNRESET/socket hang up)只说明"这一轮没等到",不是失败:
+    // 退化为 running 句柄,让父走 `oc-memory delegate-wait <jobId>` 阻塞取回。
+    if (isTransientDelegateWaitError(err)) {
+      return {
+        kind: 'running',
+        jobId: start.jobId,
+        text: formatDelegateRunning(start.jobId, opts.label, opts.goal, start.sessionKey),
+      }
+    }
+    throw err
+  }
   const view = interpretDelegateWaitBody(waited.statusCode, waited.body)
   if (view.kind === 'running') {
     const sessionKey = start.sessionKey || view.sessionKey

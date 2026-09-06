@@ -6007,6 +6007,9 @@ type UnifiedTimelineTapeWindow = {
   /** Exact half-open physical interval consumed by this browser page. */
   lowerOrdinal: number;
   upperOrdinal: number;
+  /** The tape's newest semantic head page held no final assistant record;
+   * the window must also emit the visible_head fallback auxiliary. */
+  missingFinalRecord?: boolean;
 };
 
 function timelineOuterKey(message: MessageLike, orderSeq: number): string {
@@ -6237,8 +6240,15 @@ async function readUnifiedTimelineBashTailAuxiliaries(
   inlineBudgetBytes: number,
 ): Promise<MessageLike[]> {
   if (windows.length === 0) return [];
-  const heads = (
-    await client.query<(DirectTapePageHead & { tape_id: string })>(
+  const windowParams = [
+    sessionId,
+    userId,
+    windows.map((window) => window.header.tapeId),
+    windows.map((window) => window.lowerOrdinal),
+    windows.map((window) => window.upperOrdinal),
+  ];
+  const indexedHeads = (
+    await client.query<DirectTapePageHead & { tape_id: string }>(
       `WITH requested(tape_id,lower_ordinal,upper_ordinal) AS (
          SELECT * FROM unnest($3::text[],$4::integer[],$5::integer[])
        )
@@ -6252,30 +6262,98 @@ async function readUnifiedTimelineBashTailAuxiliaries(
           AND r.ordinal >= requested.lower_ordinal
           AND r.ordinal < requested.upper_ordinal
         WHERE r.role='runtime-event'
-          AND (
-            EXISTS (
-              SELECT 1 FROM client_session_turn_tape_model_records m
-               WHERE m.session_id=r.session_id AND m.user_id=r.user_id
-                 AND m.tape_id=r.tape_id AND m.physical_ordinal=r.ordinal
-                 AND m.role='tool'
-            )
-            OR (
-              r.model_sidecar_complete=FALSE
-              AND convert_from(COALESCE(r.visible_payload,r.payload),'UTF8') LIKE '%bash_output_tail%'
-            )
+          AND EXISTS (
+            SELECT 1 FROM client_session_turn_tape_model_records m
+             WHERE m.session_id=r.session_id AND m.user_id=r.user_id
+               AND m.tape_id=r.tape_id AND m.physical_ordinal=r.ordinal
+               AND m.role='tool'
           )
         ORDER BY requested.tape_id,r.ordinal`,
-      [
-        sessionId,
-        userId,
-        windows.map((window) => window.header.tapeId),
-        windows.map((window) => window.lowerOrdinal),
-        windows.map((window) => window.upperOrdinal),
-      ],
+      windowParams,
     )
   ).rows;
+  // Legacy sidecar-incomplete tapes carry no model index row, so their tail
+  // can only be found by probing the raw record bytes for the marker. That
+  // probe used to decode inside SQL (`convert_from(...,'UTF8')`), which makes
+  // the statement itself throw on any invalid UTF-8 byte sequence — one bad
+  // tape then failed the whole page read for every tape on it. The probe now
+  // pre-filters with a pure byte-level `position(bytea IN bytea)` (no decoding,
+  // never throws; NB `strpos` has no bytea overload — 2026-09-05 that shipped
+  // as `function strpos(bytea, bytea) does not exist` and 500'd every session
+  // GET until rollback, so the integ test now runs this SQL against real PG) so
+  // only genuinely matching rows leave the database, and the authoritative
+  // marker check decodes those bytes lossily in JS (invalid sequences become
+  // U+FFFD and never throw), keeping the blast radius inside a single tape
+  // like every other tape read in this file.
+  const probeRows = (
+    await client.query<(DirectTapePageHead & { tape_id: string; probe_bytes: Buffer | null })>(
+      `WITH requested(tape_id,lower_ordinal,upper_ordinal) AS (
+         SELECT * FROM unnest($3::text[],$4::integer[],$5::integer[])
+       )
+       SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
+              r.content_sha256,
+              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
+              r.visible_content_sha256,
+              COALESCE(r.visible_payload,r.payload) AS probe_bytes
+         FROM requested
+         JOIN client_session_turn_tape_records r
+           ON r.session_id=$1 AND r.user_id=$2 AND r.tape_id=requested.tape_id
+          AND r.ordinal >= requested.lower_ordinal
+          AND r.ordinal < requested.upper_ordinal
+        WHERE r.role='runtime-event'
+          AND r.model_sidecar_complete=FALSE
+          AND position(
+                convert_to('bash_output_tail','UTF8')
+                IN COALESCE(r.visible_payload,r.payload)
+              ) > 0
+        ORDER BY requested.tape_id,r.ordinal`,
+      windowParams,
+    )
+  ).rows;
+  const matchedHeads: Array<DirectTapePageHead & { tape_id: string }> = [...indexedHeads];
+  const probesByTape = new Map<
+    string,
+    Array<DirectTapePageHead & { tape_id: string; probe_bytes: Buffer | null }>
+  >();
+  for (const row of probeRows) {
+    const list = probesByTape.get(row.tape_id) ?? [];
+    list.push(row);
+    probesByTape.set(row.tape_id, list);
+  }
+  for (const [tapeId, tapeProbeRows] of probesByTape) {
+    // Per-tape isolation: even if one tape's probe bytes are unusable, only
+    // that tape loses its hidden tails — the page read itself must survive.
+    try {
+      for (const row of tapeProbeRows) {
+        const bytes = row.probe_bytes;
+        if (bytes === null) continue;
+        if (!Buffer.from(bytes).toString("utf8").includes("bash_output_tail")) continue;
+        matchedHeads.push({
+          tape_id: row.tape_id,
+          msg_id: row.msg_id,
+          ordinal: row.ordinal,
+          role: row.role,
+          ts: row.ts,
+          content_sha256: row.content_sha256,
+          payload_bytes: row.payload_bytes,
+          visible_content_sha256: row.visible_content_sha256,
+        });
+      }
+    } catch (error) {
+      warnTapeDisplayDegrade({
+        sessionId,
+        tapeId,
+        reason: classifyUnifiedTimelineIntegrityError(error),
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  matchedHeads.sort((a, b) => {
+    const tapeOrder = a.tape_id.localeCompare(b.tape_id);
+    return tapeOrder !== 0 ? tapeOrder : a.ordinal - b.ordinal;
+  });
   const headsByTape = new Map<string, DirectTapePageHead[]>();
-  for (const head of heads) {
+  for (const head of matchedHeads) {
     const list = headsByTape.get(head.tape_id) ?? [];
     list.push(head);
     headsByTape.set(head.tape_id, list);
@@ -6440,6 +6518,40 @@ async function readUnifiedTimelineBashTailAuxiliaries(
     }
   }
   return auxiliaries;
+}
+
+/** True when a terminal tape's newest semantic head page cannot hold the
+ * final assistant record: either the head query enumerated zero semantic rows
+ * (e.g. every semantic record was scrubbed before read), or — on a
+ * top-of-tape read only, not a physical continuation page — the newest
+ * semantic records hold no assistant role at all. In both cases the
+ * authoritative final text still lives in the tape header's visible_head,
+ * so the consumer must degrade that one tape instead of skipping it. */
+function unifiedTimelineTapeMissingFinalRecord(input: {
+  heads: UnifiedTimelineTapeHead[];
+  beforeOrdinal: number;
+}): boolean {
+  // A physical continuation page deliberately starts below ordinals that were
+  // already rendered on an earlier page; zero further heads there simply
+  // means the tape is exhausted, not that the final record is missing.
+  if (input.beforeOrdinal < 2_147_483_647) return false;
+  if (input.heads.length === 0) return true;
+  return !input.heads.some((head) => head.role === "assistant");
+}
+
+/** The recoverable final text for a missing-final-record tape: the tape
+ * header's visible_head projection first, else the hot anchor's partial
+ * text. Empty means there is nothing to surface; the legacy skip then keeps
+ * the terminal auxiliary as the only outcome evidence instead of
+ * fabricating a placeholder body. */
+function unifiedTimelineFinalFallbackText(input: {
+  header: UnifiedTimelineTapeHeader;
+  anchor: MessageLike;
+}): string {
+  if (typeof input.header.visibleHead?.text === "string" && input.header.visibleHead.text.length > 0) {
+    return input.header.visibleHead.text;
+  }
+  return typeof input.anchor.text === "string" ? input.anchor.text : "";
 }
 
 function unifiedTimelineTerminalAuxiliary(window: UnifiedTimelineTapeWindow): MessageLike {
@@ -6997,9 +7109,28 @@ async function readClientTimelinePageImpl(
             inlineBytes += pageBytes;
             oldestSelectedOrdinal = head.ordinal;
           }
+          // A terminal tape whose newest semantic head page holds no final
+          // assistant record lost it before read (INC-20260829-PARTIAL-FINAL-
+          // TAPE-POISON, gpt-6 audit case 5). Degrade this one tape to the
+          // visible_head projection — the same fallback the poisoned-record
+          // paths use — instead of skipping the tape and rendering a
+          // completed turn with no final assistant message. The fallback
+          // rides the window's auxiliary channel (like the terminal row), so
+          // a page already full of this tape's process records still renders
+          // the final text instead of deferring it behind a cursor that can
+          // never resume this tape again.
+          const missingFinalRecord = unifiedTimelineTapeMissingFinalRecord({ heads, beforeOrdinal: upperOrdinal })
+            && unifiedTimelineFinalFallbackText({ header, anchor }).length > 0;
           // Fewer than cappedLimit+1 semantic heads means this entire physical
           // interval is consumed, including any hidden Bash-tail evidence.
-          windows.push({ anchor, orderSeq, header, lowerOrdinal: 0, upperOrdinal });
+          windows.push({
+            anchor,
+            orderSeq,
+            header,
+            lowerOrdinal: 0,
+            upperOrdinal,
+            ...(missingFinalRecord ? { missingFinalRecord: true } : {}),
+          });
           continue;
         }
         // Legacy raw transport envelopes stay available through audit reads,
@@ -7037,6 +7168,16 @@ async function readClientTimelinePageImpl(
       windows,
       TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES - inlineBytes,
     );
+    const finalFallbackAuxiliaries = windows.flatMap((window) =>
+      window.missingFinalRecord === true
+        ? unifiedTimelineTapeFallbackMessages(sessionId, {
+          tapeId: window.header.tapeId,
+          orderSeq: window.orderSeq,
+          reason: "final_record_missing",
+          header: window.header,
+          anchor: window.anchor,
+        })
+        : []);
     const terminalAuxiliaries = windows.map(unifiedTimelineTerminalAuxiliary);
     const selectedUserSeqs = selected.flatMap((unit) =>
       unit.kind === "outer" && unit.anchor.role === "user" &&
@@ -7122,7 +7263,7 @@ async function readClientTimelinePageImpl(
       }
     }
 
-    chronological.push(...bashTailAuxiliaries, ...terminalAuxiliaries);
+    chronological.push(...bashTailAuxiliaries, ...finalFallbackAuxiliaries, ...terminalAuxiliaries);
     chronological.sort((a, b) => {
       const orderSeq = (message: MessageLike): number =>
         typeof message._orderSeq === "number" && Number.isSafeInteger(message._orderSeq)

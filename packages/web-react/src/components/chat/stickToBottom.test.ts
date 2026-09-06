@@ -398,6 +398,66 @@ describe("stickToBottom", () => {
     expect(el.scrollTop).toBe(3050);
   });
 
+  test("上滑与 clientHeight 增大合并进同一 scroll 事件：clamp 巧合不能吞掉 leave", () => {
+    // 用户上滑几像素的同时底部 HUD/横幅收起，clientHeight 变大，浏览器把 scrollTop
+    // 夹到新 max。旧逻辑把这个 clamp 当成 scrollHeight 收缩、直接 return，following
+    // 仍为 true，篱笆一释放流式 pin 就把视口写回底部。
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 2000, scrollTop: 1920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+
+    stick.markUserIntent();
+    el.clientHeight = 200; // 底部 120px 占位收起
+    el.scrollTop = 1800; // = 新 maxScrollTop，看起来像 clamp
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+
+    el.scrollHeight = 2400;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1800);
+  });
+
+  test("无 mark 时 clientHeight 增大造成的 clamp 也不算 leave，但不因此 re-follow", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 2000, scrollTop: 1920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    el.clientHeight = 200;
+    el.scrollTop = 1800;
+    stick.onScroll(el);
+    // viewportGrew 路径不走 clamp 短路；current(1800) < expected(clamped 1800)? 否 → 保持 following
+    expect(stick.following.current).toBe(true);
+
+    stick.following.current = false;
+    el.clientHeight = 300;
+    el.scrollTop = 1700;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+  });
+
+  test("有 mark 时 correctTo 不写：校正不能抢走用户刚发起的滚动", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    // 首个 wheel tick：mark 已置，篱笆尚未挂上，RO 校正此刻到达
+    stick.markUserIntent();
+    stick.correctTo(el, 3960);
+    expect(el.scrollTop).toBe(3920);
+
+    el.scrollTop = 3900;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+
+    stick.releaseUserIntent();
+    stick.correctTo(el, 3940);
+    expect(el.scrollTop).toBe(3940);
+  });
+
   test("reset 清掉滚轮篱笆", () => {
     const stick = createStickToBottomController();
     const el = scroller({ scrollHeight: 4000, scrollTop: 3000, clientHeight: 80 });

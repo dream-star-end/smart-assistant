@@ -223,7 +223,41 @@
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/06-archive-paging.spec.ts",
           "assertion": "归档分页:无重复行 / 无空页死循环 / 游标收敛"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "published tape with zero semantic heads degrades to visible_head final text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "heads without any final assistant record append the visible_head fallback after process rows"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "bash-tail probe never decodes bytes in SQL and survives invalid UTF-8 tool output"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "invalid UTF-8 probe bytes on one tape leave other tapes on the page intact"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/unifiedTimelineDisplayDegrade.test.ts",
+          "assertion": "byte-level probe must be position(bytea IN bytea)"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "invalid UTF-8 bash-tail bytes on one tape never fail the page read for the others"
         }
+      ],
+      "coverageCommits": [
+        "3cd0c117",
+        "8f42698e"
       ]
     },
     {
@@ -307,7 +341,42 @@
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "part: PG 53300 too many clients → 503 TURN_TAPE_RETRYABLE(不再误判 409)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "part: 未知形态(无 code 普通 Error)→ 默认 503 可重试,而非 409 永久"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "finalize: incomplete → 503 可重试(parts 尚在途,不再永久 quarantine)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "visible: broadcast throws after storage success → 200 ACK, storage not re-run"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "finalize: header / dispatch identity / settlement / engineBillings 同键异身份冲突 → 仍 409"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3MasterSink.test.ts",
+          "assertion": "finalize keeps no content-size deadline but carries its own bounded signal"
         }
+      ],
+      "coverageCommits": [
+        "aef463bf",
+        "fa710b06",
+        "3961df52"
       ]
     },
     {
@@ -1197,7 +1266,9 @@
         "bab6c8c6",
         "d8b81aae",
         "54014c3d",
-        "d76aae91"
+        "d76aae91",
+        "f782c235",
+        "d5847fb7"
       ],
       "regressions": [
         {
@@ -1214,6 +1285,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/regression-contracts/outboundDurabilityPermanentConflict.contract.test.ts",
           "assertion": "REG-20260817: permanent live-frame conflict never closes the browser or poisons later frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "permission authority rejection behind a busy queue never surfaces as unhandledRejection"
         }
       ]
     },
@@ -2282,6 +2358,31 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
           "assertion": "continuous failure is bounded and does not query on every frame"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap1: typed-state proven-live running dispatch is never interrupted (16min, zero frames)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap1: interrupt_tapeless outside the stuck page re-probes typed state; queued skips"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap2: frame landed between scan and lock → ROLLBACK, zero UPDATE, counted stale"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
+          "assertion": "INC-20260831 gap2: first_visible appearing between scan and lock → ROLLBACK"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-visible-orphan-liveness.ts",
+          "assertion": "provenLive short-circuit must run before classifyVisibleOrphan"
         }
       ],
       "coverageCommits": [
@@ -2289,7 +2390,10 @@
         "568fb53b",
         "1c7e4aae",
         "2295a322",
-        "bfcc174e"
+        "bfcc174e",
+        "27eb21c7",
+        "89b95c33",
+        "57d40643"
       ]
     },
     {

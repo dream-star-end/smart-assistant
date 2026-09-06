@@ -514,6 +514,7 @@ const PLATFORM_LINKED_CLIS = [
   "oc-cursor",
   "oc-task",
   "oc-memory",
+  "oc-browser",
 ] as const;
 for (const cliName of PLATFORM_LINKED_CLIS) {
   const source = join(PLATFORM_BIN_DIR, cliName);

@@ -1,0 +1,17 @@
+[Unit]
+# Lease Center worker(OCV5-131):共享资源租约中心守护 tick。
+# 每 tick:train 对账 → 过期/告警 → ride 结算 → 发车(deploy.lock 继承给执行器)→ outbox 投递。
+# ExecStart 指 live 快照而非工作树:worker 逻辑随发布翻转,工作树脏改动不影响守护。
+Description=OpenClaude v5 selfhost lease-center worker tick (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/openclaude/lease-worker.env
+ExecStart=/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-lease-worker.sh
+Nice=10
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
