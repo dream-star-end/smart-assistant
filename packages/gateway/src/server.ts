@@ -11352,14 +11352,15 @@ export class Gateway {
     | { status: 'aborted'; waitedMs: number }
   > {
     const reserveOpts = { parentBucketKey: args.parentBucketKey, isReview: args.isReview }
-    const waiters = (this._delegateQueueWaiters ??= new Map())
     const first = this._tryReserveDelegateSlot(reserveOpts)
     if (!first) {
       // SM 'wait' 预占的占位 waiter 在这里放行 → 必须一并删除,否则占位永久计入
-      // DELEGATE_QUEUE_MAX_WAITERS(后续全部 queue_full)。
-      waiters.delete(args.sessionKey)
+      // DELEGATE_QUEUE_MAX_WAITERS(后续全部 queue_full)。只碰已存在的表:无压力快路径
+      // 不得初始化等待者表(delegateResourceQueue 契约)。
+      this._delegateQueueWaiters?.delete(args.sessionKey)
       return { status: 'ok' }
     }
+    const waiters = (this._delegateQueueWaiters ??= new Map())
     const preAdmitted = waiters.has(args.sessionKey)
     if (!preAdmitted && waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) {
       return { status: 'queue_full', blocked: first }
