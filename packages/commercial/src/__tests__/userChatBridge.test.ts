@@ -49,7 +49,7 @@ import {
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
 import { GoalStateError } from "../goal/goalStateService.js";
-import { formatMessageReplyPrompt } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, formatMessageReplyPrompt } from "@openclaude/protocol";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -1874,8 +1874,13 @@ describe("userChatBridge — model authorization", () => {
         assert.deepEqual(message._media, [
           { kind: "file", url: "/api/media/visible.txt" },
         ]);
+        // teamMode:true → bridge 强制队长模型 = DEFAULT_CODEX_ENGINE_MODEL 并覆写
+        // frame.model;不能写死字面量。2026-09-06 该常量 Sol→Astra 时这里的字面量
+        // 断言在 persistMasterUserMessage 桩内抛错,被 bridge 捕获成
+        // SESSION_PERSIST_UNAVAILABLE(不转发容器),而下方只等容器帧 → 用例永挂,
+        // commercial-unit 门吃满 30 min 才 cancel(#557 两轮)。
         assert.deepEqual(message._routing, {
-          model: "gpt-5.6-sol",
+          model: DEFAULT_CODEX_ENGINE_MODEL,
           teamMode: true,
           effortLevel: "high",
         });
@@ -1902,15 +1907,27 @@ describe("userChatBridge — model authorization", () => {
       const ws = openClient(rig.gatewayPort, await makeJwt("205"));
       await new Promise<void>((resolve) => ws.once("open", () => resolve()));
       const containerWs = await containerOpenP;
-      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
-        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
+      // 有界等待:若 bridge 拒轮(如 SESSION_PERSIST_UNAVAILABLE)容器永远收不到帧,
+      // 必须在秒级失败并把浏览器侧收到的错误帧带进断言信息,而不是让整个套件挂死。
+      const browserFrames: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try { browserFrames.push(JSON.parse(data.toString()) as Record<string, unknown>); } catch { /* ignore */ }
+      });
+      const forwardedP = new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`container never received the forwarded turn within 5s; browser frames=${JSON.stringify(browserFrames)}`));
+        }, 5000);
+        containerWs.once("message", (data) => {
+          clearTimeout(timer);
+          resolve(JSON.parse(data.toString()));
+        });
       });
       ws.send(JSON.stringify({
         type: "inbound.message",
         channel: "webchat",
         peer: { id: "sess-persist-order", kind: "dm" },
         clientMessageId: "m-current-turn",
-        model: "gpt-5.6-sol",
+        model: DEFAULT_CODEX_ENGINE_MODEL,
         effortLevel: "high",
         teamMode: true,
         content: {
