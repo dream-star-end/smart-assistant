@@ -97,6 +97,10 @@ import {
 } from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
 import {
+  createSessionCookieFetch,
+  refreshProductAccessToken,
+} from './productAccessToken.mjs'
+import {
   PRODUCT_PARTITION,
   SMOKE_PRODUCT_PARTITION,
   closeWebContentsView,
@@ -2568,7 +2572,27 @@ function installLocalAgentHost() {
       ensureAppLogger().info('approval_request', { id: info?.id, kind: info?.kind })
     },
   })
-  void hostSupervisor.start().catch((error) => {
+  void (async () => {
+    try {
+      const publicOrigin = publicOriginFromProductUrl(process.env.OPENCLAUDE_DESKTOP_DEV_URL, {
+        isPackaged: app.isPackaged,
+      })
+      const productSession = session.fromPartition(PRODUCT_PARTITION)
+      const tokenResult = await refreshProductAccessToken({
+        publicOrigin,
+        fetchImpl: createSessionCookieFetch(productSession),
+      })
+      hostSupervisor.setConfig({
+        publicOrigin,
+        masterHttps: desktopBootstrapState?.masterHttps || '',
+        runtimeManifestUrl: desktopHostConfig().runtimeManifestUrl || '',
+        runtimeManifestToken: tokenResult.ok ? tokenResult.accessToken : undefined,
+      })
+    } catch {
+      /* JWT is optional; bake remains the fallback */
+    }
+    await hostSupervisor.start()
+  })().catch((error) => {
     console.warn('[windows] host start failed:', error instanceof Error ? error.message : error)
   })
   return hostSupervisor

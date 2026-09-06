@@ -7,6 +7,8 @@ import { createLocalBridgeToken, createLahToken, createLahGwToken } from './toke
 import { createTunnelClient, TunnelState } from '../tunnel/tunnelClient.mjs'
 import { createApprovalController } from './workspace/approval.mjs'
 import { classifyPermissionFrame, createApprovalBridge, shouldForwardGatewayFrame } from './approvalBridge.mjs'
+import { fetchArtifact } from './runtime/fetchArtifact.mjs'
+import { resolveRuntimeManifest, shouldDownloadRuntimeArtifact } from './runtime/manifest.mjs'
 import { applyWorkspaceToGatewaySpawn } from './workspace/applySpawn.mjs'
 import { buildWorkspaceEnv } from './workspace/workspaceEnv.mjs'
 import { snapshotWorkspace } from './workspace/snapshot.mjs'
@@ -25,6 +27,12 @@ export function createHostRuntime(opts = {}) {
     claudeCodePath,
     claudeCodeEntry,
     claudeCodeRuntime,
+    runtimeManifestUrl,
+    runtimeManifestToken,
+    publicOrigin,
+    masterHttps,
+    manifestFetchImpl,
+    runtimeRoot,
     gatewayPort = GATEWAY_PORT,
     egressPort = EGRESS_PROXY_PORT,
     masterPort = MASTER_PROXY_PORT,
@@ -192,6 +200,34 @@ export function createHostRuntime(opts = {}) {
     const workspaceEnv = buildWorkspaceEnv({ roots, platform: process.platform })
     const spawnOpts = applyWorkspaceToGatewaySpawn(workspaceEnv, { extraEnv: gatewayExtraEnv })
 
+    let resolvedClaudeCodePath = claudeCodePath
+    try {
+      const resolvedManifest = await resolveRuntimeManifest({
+        remoteUrl: runtimeManifestUrl,
+        accessToken: runtimeManifestToken,
+        publicOrigin: publicOrigin || registerOrigin,
+        masterHttps,
+        fetchImpl: manifestFetchImpl,
+        env: opts.env || process.env,
+      })
+      if (shouldDownloadRuntimeArtifact(resolvedManifest)) {
+        const fetched = await fetchArtifact({
+          url: resolvedManifest.selected.url,
+          sha256: resolvedManifest.selected.sha256,
+          spkiPin,
+          publicOrigin: publicOrigin || registerOrigin,
+          caPem: deviceCaPem,
+          destRoot: runtimeRoot,
+        })
+        resolvedClaudeCodePath = fetched.path
+        emit('runtime_ready', { source: resolvedManifest.source, sha256: resolvedManifest.selected.sha256 })
+      } else {
+        emit('runtime_unavailable', { reason: resolvedManifest.reason || 'placeholder-bake', source: resolvedManifest.source })
+      }
+    } catch (err) {
+      emit('runtime_unavailable', { reason: err.code || err.message })
+    }
+
     gateway = createGatewayProcess({
       command: gatewayCommand,
       args: gatewayArgs,
@@ -202,7 +238,7 @@ export function createHostRuntime(opts = {}) {
       masterProxyPort: masterProxy.port,
       egressProxyPort: egressProxy.port,
       gatewayPort,
-      claudeCodePath,
+      claudeCodePath: resolvedClaudeCodePath,
       claudeCodeEntry,
       claudeCodeRuntime,
       extraEnv: spawnOpts.extraEnv,

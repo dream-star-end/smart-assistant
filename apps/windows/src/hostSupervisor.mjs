@@ -213,6 +213,10 @@ export function createHostSupervisor({
   return {
     start,
     stop,
+    setConfig(next) {
+      if (!next || typeof next !== 'object') return
+      pendingConfig = { ...(pendingConfig || {}), ...next }
+    },
     sendEnrollResult,
     sendPower(event) {
       send({ type: ElectronToHost.POWER_EVENT, event })
