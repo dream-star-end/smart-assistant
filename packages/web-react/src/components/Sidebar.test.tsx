@@ -1023,8 +1023,8 @@ describe("Sidebar 归档与批量", () => {
   });
 });
 
-describe("Sidebar 会话累计用时与预览", () => {
-  it("非运行态展示消息预览与相对时间，不展示累计用时", () => {
+describe("Sidebar 会话累计用时与单行布局", () => {
+  it("不显示最新消息摘要；右侧展示 createdAt → lastAt 的累计用时", () => {
     const endAt = Date.now() - 5 * 60_000;
     const createdAt = endAt - 10 * 60_000;
     renderSidebar({
@@ -1041,44 +1041,23 @@ describe("Sidebar 会话累计用时与预览", () => {
     });
     expect(screen.queryByText("Cool Model")).toBeNull();
     expect(screen.queryByText(/cool-model/i)).toBeNull();
-    expect(screen.getByText("最后一句话写在这里")).toBeInTheDocument();
-    const row = screen.getByRole("button", { name: "带模型" }).closest("div")!;
-    expect(row.querySelector("[data-session-duration]")).toBeNull();
-    expect(row.querySelector("[data-session-updated]")).toHaveTextContent(/分钟前|刚刚/);
+    expect(screen.queryByText("最后一句话写在这里")).toBeNull();
+    const duration = screen
+      .getByRole("button", { name: "带模型" })
+      .closest("div")!
+      .querySelector("[data-session-duration]");
+    expect(duration).toHaveTextContent("10m");
+    expect(duration).toHaveAttribute("title", expect.stringContaining("→"));
   });
 
-  it("运行中才按分 / 小时 / 天展示累计用时", () => {
-    const now = Date.now();
+  it("累计用时按分 / 小时 / 天展示，不再表示距今多久", () => {
+    const endAt = Date.now() - 7 * 24 * 60 * 60_000;
     renderSidebar({
       sessions: [
-        session({
-          id: "s-sec",
-          title: "不足一分钟",
-          createdAt: now - 10_000,
-          lastAt: now,
-          runState: "running",
-        }),
-        session({
-          id: "s-min",
-          title: "五分钟",
-          createdAt: now - 5 * 60_000,
-          lastAt: now,
-          runState: "running",
-        }),
-        session({
-          id: "s-hr",
-          title: "两小时",
-          createdAt: now - 2 * 60 * 60_000,
-          lastAt: now,
-          runState: "running",
-        }),
-        session({
-          id: "s-day",
-          title: "三天",
-          createdAt: now - 3 * 24 * 60 * 60_000,
-          lastAt: now,
-          runState: "running",
-        }),
+        session({ id: "s-sec", title: "不足一分钟", createdAt: endAt - 10_000, lastAt: endAt }),
+        session({ id: "s-min", title: "五分钟", createdAt: endAt - 5 * 60_000, lastAt: endAt }),
+        session({ id: "s-hr", title: "两小时", createdAt: endAt - 2 * 60 * 60_000, lastAt: endAt }),
+        session({ id: "s-day", title: "三天", createdAt: endAt - 3 * 24 * 60 * 60_000, lastAt: endAt }),
       ],
     });
     const duration = (title: string) =>
