@@ -2945,6 +2945,40 @@
           "assertion": "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS: official Claude Code answers Stop with an"
         }
       ]
+    },
+    {
+      "id": "INC-20260906-COMMERCIAL-TASKBOARD-DIGEST",
+      "occurredAt": "2026-09-06",
+      "severity": "P1",
+      "symptom": "商业版用户(含刚注册 1 分钟的新用户)收到「任务面板每日简报(当日完成 0 张,新建 0 张…)」站内信,9/3–9/6 共 39 条。根因:商业版只用 VITE_TASKBOARD_ENABLED=0 隐藏任务面板 UI,容器 gateway 的 PatrolEngine + TaskboardNotifier 无条件启动,新容器第一次 60s tick 触发 maybeSendDigest 补发前一日简报;去重只在进程内存 + master 6h/uid 内容去重,对每个新容器/新 uid 都拦不住。",
+      "rootFixCommit": "beb531ef",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/taskboard/__tests__/feature.test.ts",
+          "assertion": "server.ts 的巡检/通知启动必须包在 isTaskboardEnabled 门内"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/taskboard/__tests__/notify.test.ts",
+          "assertion": "空面板(没有任何票)不出简报,也不标 sent;建票后同日可正常出"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/taskboardEnv.test.ts",
+          "assertion": "commercial flavor injects OC_TASKBOARD_ENABLED=0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "OC_TASKBOARD_ENABLED explicit master env is passed through to the container"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-taskboard-commercial-gate.ts",
+          "assertion": "commercial containers get OC_TASKBOARD_ENABLED=0, gateway gates patrol/digest on it, empty boards never emit a digest"
+        }
+      ]
     }
   ]
 }

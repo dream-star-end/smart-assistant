@@ -185,7 +185,9 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
-  if (/^packages\/gateway\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+  // test:gateway 是 `find packages/gateway/src -name "*.test.ts"`,子目录(如 taskboard/__tests__)
+  // 同样被跑;这里按 runner 的真实口径放行,不再只认顶层 __tests__。
+  if (/^packages\/gateway\/src\/(?:[^/]+\/)*__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
   }
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
