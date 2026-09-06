@@ -211,16 +211,25 @@ describe("migrate.runMigrations", () => {
         WHERE engine = 'cursor' AND state = 'active' AND context_window = 1000000
           AND model_id ~ '^cursor-(opus-5|opus-4\\.8|fable-5|fable-5\\.1)-'`,
     );
-    assert.equal(cursorOpusFable1m.rows[0].cnt, "30", "0258: every active cursor opus/fable row must be 1M");
+    // 0258 switched every opus/fable row to 1M (30 at the time). 0271 retires the five
+    // cursor-fable-5-* rows (disabled + hidden, never `retired`), so the live lineage is
+    // 25; the 0258 invariant itself is re-asserted below as "no active non-1M row".
+    assert.equal(cursorOpusFable1m.rows[0].cnt, "25", "0258+0271: 25 active cursor opus/fable rows, all 1M");
+    const cursorOpusFableNon1m = await query<{ cnt: string }>(
+      `SELECT COUNT(*)::text AS cnt FROM model_catalog
+        WHERE engine = 'cursor' AND state = 'active' AND context_window <> 1000000
+          AND model_id ~ '^cursor-(opus-5|opus-4\\.8|fable-5|fable-5\\.1)-'`,
+    );
+    assert.equal(cursorOpusFableNon1m.rows[0].cnt, "0", "0258: every active cursor opus/fable row must be 1M");
     assert.deepEqual(cursorModels.rows, [
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "disabled", enabled: false, visibility: "hidden" },
       { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "disabled", enabled: false, visibility: "hidden" },
-      { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-fable-5-low", upstream_model_id: "claude-fable-5-thinking-low", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-fable-5-max", upstream_model_id: "claude-fable-5-thinking-max", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-fable-5-medium", upstream_model_id: "claude-fable-5-thinking-medium", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-fable-5-xhigh", upstream_model_id: "claude-fable-5-thinking-xhigh", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "disabled", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-fable-5-low", upstream_model_id: "claude-fable-5-thinking-low", state: "disabled", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-fable-5-max", upstream_model_id: "claude-fable-5-thinking-max", state: "disabled", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-fable-5-medium", upstream_model_id: "claude-fable-5-thinking-medium", state: "disabled", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-fable-5-xhigh", upstream_model_id: "claude-fable-5-thinking-xhigh", state: "disabled", enabled: false, visibility: "hidden" },
       { model_id: "cursor-fable-5.1-high", upstream_model_id: "claude-fable-5-1-thinking-high", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5.1-low", upstream_model_id: "claude-fable-5-1-thinking-low", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-fable-5.1-max", upstream_model_id: "claude-fable-5-1-thinking-max", state: "active", enabled: true, visibility: "public" },
@@ -230,14 +239,14 @@ describe("migrate.runMigrations", () => {
       { model_id: "cursor-gemini-3.8-flash-low", upstream_model_id: "gemini-3.8-flash-low", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-gemini-3.8-flash-medium", upstream_model_id: "gemini-3.8-flash-medium", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "active", enabled: true, visibility: "hidden" },
-      { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-high-fast", upstream_model_id: "cursor-grok-4.6-high-fast", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-low", upstream_model_id: "cursor-grok-4.6-low", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-low-fast", upstream_model_id: "cursor-grok-4.6-low-fast", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-medium", upstream_model_id: "cursor-grok-4.6-medium", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-medium-fast", upstream_model_id: "cursor-grok-4.6-medium-fast", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-xhigh", upstream_model_id: "cursor-grok-4.6-xhigh", state: "active", enabled: true, visibility: "public" },
-      { model_id: "cursor-grok-4.6-xhigh-fast", upstream_model_id: "cursor-grok-4.6-xhigh-fast", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-high-fast", upstream_model_id: "cursor-grok-4.6-high-fast", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-low", upstream_model_id: "cursor-grok-4.6-low", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-low-fast", upstream_model_id: "cursor-grok-4.6-low-fast", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-medium", upstream_model_id: "cursor-grok-4.6-medium", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-medium-fast", upstream_model_id: "cursor-grok-4.6-medium-fast", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-xhigh", upstream_model_id: "cursor-grok-4.6-xhigh", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-grok-4.6-xhigh-fast", upstream_model_id: "cursor-grok-4.6-xhigh-fast", state: "active", enabled: true, visibility: "admin" },
       { model_id: "cursor-opus-4.8-high", upstream_model_id: "claude-opus-4-8-thinking-high", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-opus-4.8-high-fast", upstream_model_id: "claude-opus-4-8-thinking-high-fast", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-opus-4.8-low", upstream_model_id: "claude-opus-4-8-thinking-low", state: "active", enabled: true, visibility: "public" },
@@ -258,6 +267,11 @@ describe("migrate.runMigrations", () => {
       { model_id: "cursor-opus-5-medium-fast", upstream_model_id: "claude-opus-5-thinking-medium-fast", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-opus-5-xhigh", upstream_model_id: "claude-opus-5-thinking-xhigh", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-opus-5-xhigh-fast", upstream_model_id: "claude-opus-5-thinking-xhigh-fast", state: "active", enabled: true, visibility: "public" },
+      { model_id: "cursor-sonnet-5-high", upstream_model_id: "claude-sonnet-5-thinking-high", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-sonnet-5-low", upstream_model_id: "claude-sonnet-5-thinking-low", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-sonnet-5-max", upstream_model_id: "claude-sonnet-5-thinking-max", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-sonnet-5-medium", upstream_model_id: "claude-sonnet-5-thinking-medium", state: "active", enabled: true, visibility: "admin" },
+      { model_id: "cursor-sonnet-5-xhigh", upstream_model_id: "claude-sonnet-5-thinking-xhigh", state: "active", enabled: true, visibility: "admin" },
     ]);
   });
 
