@@ -54,6 +54,8 @@ test("空查询渲染分区视图:平台精选 + 分类分区 + 未分类兜底"
 
   render(<BrowsePanel auth={auth} />);
 
+  expect(await screen.findByPlaceholderText("搜索技能")).toBeInTheDocument();
+  expect(screen.getByText("试试「翻译」「论文」「写作」")).toBeInTheDocument();
   // 分区区头(heading 角色,不与同名 chip 冲突)
   expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();

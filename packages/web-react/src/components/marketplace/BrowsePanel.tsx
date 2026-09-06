@@ -554,13 +554,7 @@ export function BrowsePanel({
               aria-label={`搜索${noun}`}
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder={
-                kind === "agent"
-                  ? "搜索智能体（试试「写作」「编程」「研究」）…"
-                  : kind === "connector"
-                    ? "搜索插件（试试「文档」「代码」「沟通」）…"
-                    : "搜索技能（试试「翻译」「论文」「写作」）…"
-              }
+              placeholder={`搜索${noun}`}
               className="pl-9"
             />
           </div>
@@ -581,6 +575,15 @@ export function BrowsePanel({
           )}
         </div>
       </div>
+      {!q && (
+        <p className="px-4 pb-1 text-caption text-faint">
+          {kind === "agent"
+            ? "试试「写作」「编程」「研究」"
+            : kind === "connector"
+              ? "试试「文档」「代码」「沟通」"
+              : "试试「翻译」「论文」「写作」"}
+        </p>
+      )}
 
       {/* 分类筛选片:仅浏览态且有分区时渲染,一行可横向滚动(移动端不换行)。
           右缘渐隐替代改造前那行「左右滑动查看更多分类」的常驻小字 —— 可滚动这件事
