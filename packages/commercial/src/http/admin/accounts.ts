@@ -68,6 +68,11 @@ import {
 } from "../../admin/cursorSessionUsage.js";
 import { refreshCursorAccountUsage } from "../../account-pool/cursorUsageSweeper.js";
 import {
+  getCachedGrokUsage,
+  type GrokUsageSnapshot,
+} from "../../admin/grokAccountUsage.js";
+import { refreshGrokAccountUsage } from "../../account-pool/grokUsageSweeper.js";
+import {
   listRefreshEvents,
   MAX_LIST_LIMIT as REFRESH_EVENTS_MAX_LIMIT,
   DEFAULT_LIST_LIMIT as REFRESH_EVENTS_DEFAULT_LIMIT,
@@ -135,6 +140,14 @@ function serializeAccount(
     cursor_billing_cycle_end: a.provider === "cursor" ? (a.cursor_billing_cycle_end?.toISOString() ?? null) : null,
     cursor_usage_updated_at: a.provider === "cursor" ? (a.cursor_usage_updated_at?.toISOString() ?? null) : null,
     cursor_usage_error: a.provider === "cursor" ? a.cursor_usage_error : null,
+    /** 0276 — Grok Build credit pool (grokUsageSweeper 每小时刷新;仅 grok 行有值)。 */
+    grok_credit_usage_pct: a.provider === "grok" ? a.grok_credit_usage_pct : null,
+    grok_build_usage_pct: a.provider === "grok" ? a.grok_build_usage_pct : null,
+    grok_credit_period_start: a.provider === "grok" ? (a.grok_credit_period_start?.toISOString() ?? null) : null,
+    grok_credit_period_end: a.provider === "grok" ? (a.grok_credit_period_end?.toISOString() ?? null) : null,
+    grok_subscription_tier: a.provider === "grok" ? a.grok_subscription_tier : null,
+    grok_usage_updated_at: a.provider === "grok" ? (a.grok_usage_updated_at?.toISOString() ?? null) : null,
+    grok_usage_error: a.provider === "grok" ? a.grok_usage_error : null,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };
@@ -263,6 +276,9 @@ export async function handleAdminGetAccount(
   if (action === "cursor-usage") {
     return handleAccountCursorUsage(idRaw, url, res);
   }
+  if (action === "grok-usage") {
+    return handleAccountGrokUsage(idRaw, url, res);
+  }
   if (action !== "") {
     throw new HttpError(404, "NOT_FOUND", "endpoint not found");
   }
@@ -364,6 +380,61 @@ async function loadStoredCursorUsage(id: string): Promise<CursorUsageSnapshot | 
   const snap = r.rows[0]?.snap;
   if (!snap || typeof snap !== "object") return null;
   return snap as CursorUsageSnapshot;
+}
+
+/**
+ * 0276 — GET /api/admin/accounts/:id/grok-usage[?refresh=1]
+ * Grok Build (xAI subscription) 额度/用量快照:周额度、GrokBuild 产品%、账期、套餐档。
+ * 只对 provider=grok 的行有意义;其他 provider 返回 409。60s 缓存,refresh=1 强制回源。
+ * 快照不含任何凭证(email 已 mask)。
+ */
+async function handleAccountGrokUsage(
+  id: string,
+  url: URL,
+  res: ServerResponse,
+): Promise<void> {
+  const a = await adminGetAccount(id);
+  if (!a) throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (a.provider !== "grok") {
+    throw new HttpError(409, "CONFLICT", "grok usage is only available for Grok accounts");
+  }
+  const force = url.searchParams.get("refresh") === "1";
+  if (!force) {
+    const cached = getCachedGrokUsage(id);
+    if (cached) {
+      sendJson(res, 200, { usage: cached, cached: true });
+      return;
+    }
+    const stored = await loadStoredGrokUsage(id);
+    if (stored) {
+      sendJson(res, 200, { usage: stored, cached: true, stored: true });
+      return;
+    }
+  }
+  const result = await refreshGrokAccountUsage(a);
+  if (result.ok) {
+    sendJson(res, 200, { usage: result.snapshot, cached: false });
+    return;
+  }
+  if (result.skipped === "missing") throw new HttpError(404, "NOT_FOUND", "account not found");
+  if (result.skipped === "token_terminal" || result.reason.startsWith("token_rejected")) {
+    throw new HttpError(409, "CONFLICT", "xAI rejected the account token; re-authorize", {
+      issues: [{ path: "token", message: result.reason }],
+    });
+  }
+  throw new HttpError(502, "UPSTREAM", "Grok usage endpoints unavailable", {
+    issues: [{ path: "upstream", message: result.reason }],
+  });
+}
+
+async function loadStoredGrokUsage(id: string): Promise<GrokUsageSnapshot | null> {
+  const r = await getPool().query<{ snap: unknown }>(
+    `SELECT grok_usage_snapshot AS snap FROM claude_accounts WHERE id = $1 AND grok_usage_snapshot IS NOT NULL`,
+    [id],
+  );
+  const snap = r.rows[0]?.snap;
+  if (!snap || typeof snap !== "object") return null;
+  return snap as GrokUsageSnapshot;
 }
 
 /**

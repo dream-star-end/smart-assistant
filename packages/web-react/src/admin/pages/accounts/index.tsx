@@ -26,13 +26,15 @@ import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
 import { AccountFormModal } from "./AccountFormModal";
-import { CursorUsageModal, RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
+import { CursorUsageModal, GrokUsageModal, RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
 import {
   AccountWarningChips,
   CooldownCell,
   CursorPlanCell,
   CursorPoolCell,
   CursorSandUsageCell,
+  GrokCreditUsageCell,
+  GrokPlanCell,
   LastUsed,
   LifetimeCell,
   QuotaCell,
@@ -58,9 +60,26 @@ const PROVIDER_SECTIONS = [
   { id: "grok", title: "Grok", desc: "Grok Build 官方账号池" },
 ] as const;
 
-/** 0262 — 按 provider 段切换的列:Cursor 段隐藏 Anthropic 配额列,其余段隐藏 Sand 列。 */
+/** 0262/0276 — 按 provider 段切换的列:Cursor 段隐藏 Anthropic 配额与 Grok 列,Grok 段隐藏 Sand 与 5h/7d 配额(保留 oauth_exp),其余段隐藏 Sand 与 Grok 列。 */
 const CCB_ONLY_COLUMNS = new Set(["q5h", "q5hr", "q7d", "q7dr", "oauth_exp"]);
 const CURSOR_ONLY_COLUMNS = new Set(["sand_pct", "sand_reset", "cursor_plan", "usage_upd", "cursor_pool"]);
+const GROK_ONLY_COLUMNS = new Set(["grok_pct", "grok_reset", "grok_plan", "grok_usage_upd"]);
+
+function unionSets(...sets: Array<ReadonlySet<string>>): Set<string> {
+  const out = new Set<string>();
+  for (const s of sets) for (const k of s) out.add(k);
+  return out;
+}
+
+function hiddenColumnsForSection(sectionId: string): Set<string> {
+  if (sectionId === "cursor") return unionSets(CCB_ONLY_COLUMNS, GROK_ONLY_COLUMNS);
+  if (sectionId === "grok") {
+    const hidden = unionSets(CCB_ONLY_COLUMNS, CURSOR_ONLY_COLUMNS);
+    hidden.delete("oauth_exp");
+    return hidden;
+  }
+  return unionSets(CURSOR_ONLY_COLUMNS, GROK_ONLY_COLUMNS);
+}
 
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
@@ -105,6 +124,7 @@ export default function AccountsPage() {
   const [historyAcc, setHistoryAcc] = useState<{ id: string; label: string } | null>(null);
   const [recentAcc, setRecentAcc] = useState<{ id: string; label: string } | null>(null);
   const [cursorUsageAcc, setCursorUsageAcc] = useState<{ id: string; label: string } | null>(null);
+  const [grokUsageAcc, setGrokUsageAcc] = useState<{ id: string; label: string } | null>(null);
 
   const onStatusChange = useCallback((v: string) => {
     setStatus(v);
@@ -187,6 +207,20 @@ export default function AccountsPage() {
     [toast, refresh],
   );
 
+  // 0276 — 立即回源刷新一行的 Grok 周额度(同 grokUsageSweeper 路径)。
+  const doRefreshGrokUsage = useCallback(
+    async (a: AccountRow) => {
+      try {
+        await adminGet(`/accounts/${encodeURIComponent(a.id)}/grok-usage?refresh=1`);
+        toast(`#${a.id} Grok 额度已刷新`, "success");
+        refresh();
+      } catch (e) {
+        toast(`刷新失败:${errMsg(e)}`, "error");
+      }
+    },
+    [toast, refresh],
+  );
+
   const columns: Column<AccountRow>[] = [
     { key: "id", title: "id", width: 60, render: (a) => <span className="font-mono text-meta">{a.id}</span> },
     {
@@ -224,6 +258,10 @@ export default function AccountsPage() {
     { key: "sand_reset", title: "Sand 重置", align: "right", render: (a) => <ResetCell resetsAt={a.cursor_sand_next_reset_at ?? null} /> },
     { key: "cursor_plan", title: "套餐 / 账期", width: 110, render: (a) => <CursorPlanCell a={a} /> },
     { key: "usage_upd", title: "用量更新", width: 100, render: (a) => <LastUsed iso={a.cursor_usage_updated_at ?? null} /> },
+    { key: "grok_pct", title: "周额度已用%", align: "right", render: (a) => <GrokCreditUsageCell a={a} /> },
+    { key: "grok_reset", title: "额度重置", align: "right", render: (a) => <ResetCell resetsAt={a.grok_credit_period_end ?? null} /> },
+    { key: "grok_plan", title: "订阅档", width: 110, render: (a) => <GrokPlanCell a={a} /> },
+    { key: "grok_usage_upd", title: "用量更新", width: 100, render: (a) => <LastUsed iso={a.grok_usage_updated_at ?? null} /> },
     { key: "q5h", title: "5h%", align: "right", render: (a) => <QuotaCell pct={a.quota_5h_pct} updatedAt={a.quota_updated_at} /> },
     { key: "q5hr", title: "5h 重置", align: "right", render: (a) => <ResetCell resetsAt={a.quota_5h_resets_at} /> },
     { key: "q7d", title: "7d%", align: "right", render: (a) => <QuotaCell pct={a.quota_7d_pct} updatedAt={a.quota_updated_at} /> },
@@ -274,6 +312,16 @@ export default function AccountsPage() {
               {a.provider === "cursor" && a.cursor_credential_kind === "session" && (
                 <DropdownMenuItem onSelect={() => doRefreshCursorUsage(a)}>
                   立即刷新 Sand 用量
+                </DropdownMenuItem>
+              )}
+              {a.provider === "grok" && (
+                <DropdownMenuItem onSelect={() => setGrokUsageAcc({ id: a.id, label: a.label })}>
+                  Grok 额度 / 用量
+                </DropdownMenuItem>
+              )}
+              {a.provider === "grok" && (
+                <DropdownMenuItem onSelect={() => doRefreshGrokUsage(a)}>
+                  立即刷新 Grok 额度
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem onSelect={() => setRecentAcc({ id: a.id, label: a.label })}>
@@ -395,10 +443,7 @@ export default function AccountsPage() {
         <div className="flex flex-col gap-6">
           {PROVIDER_SECTIONS.filter((section) => !provider || provider === section.id).map((section) => {
             const sectionRows = rows.filter((row) => row.provider === section.id);
-            // Cursor 行没有 Anthropic 5h/7d 配额、OAuth 到期;CCB/Codex/Grok 行没有 Sand 池。
-            const hidden = section.id === "cursor"
-              ? CCB_ONLY_COLUMNS
-              : CURSOR_ONLY_COLUMNS;
+            const hidden = hiddenColumnsForSection(section.id);
             const sectionColumns = columns.filter((c) => !hidden.has(c.key));
             return (
               <section key={section.id} className="flex flex-col gap-3">
@@ -445,6 +490,12 @@ export default function AccountsPage() {
         onOpenChange={(o) => !o && setCursorUsageAcc(null)}
         accountId={cursorUsageAcc?.id ?? null}
         accountLabel={cursorUsageAcc?.label ?? ""}
+      />
+      <GrokUsageModal
+        open={grokUsageAcc !== null}
+        onClose={() => setGrokUsageAcc(null)}
+        accountId={grokUsageAcc?.id ?? null}
+        label={grokUsageAcc?.label ?? ""}
       />
       {confirmEl}
     </div>

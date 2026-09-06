@@ -6769,13 +6769,17 @@ smoke() {
   #   cursorUsageSweep(2026-09-05 selfhost 7ef53b33b 正向同步引入:index.ts
   #     leaderBundle.add({name:"cursorUsageSweep",domain:"v5-owned"...}),只写 0262
   #     引入的 cursor sand usage 列;关停 COMMERCIAL_CURSOR_USAGE_SWEEP_DISABLED=1)
+  #   grokUsageSweep(2026-09-06:index.ts leaderBundle.add({name:"grokUsageSweep",
+  #     domain:"v5-owned"...}),只写 0276 引入的 grok_* usage 列;关停
+  #     COMMERCIAL_GROK_USAGE_SWEEP_DISABLED=1。名单与 trackScheduler 必须同批,
+  #     漏登会被 healthz.schedulers 子集门打红。)
   #   desktopEnrollSweep(2026-09-05 selfhost P1 桌面底座引入:index.ts domain:"shared",
   #     清扫 0264 引入表 desktop_enrollments 过期行,旗 OC_DESKTOP_VIRTUAL_CONTAINER
   #     默认关;关停 OC_DESKTOP_ENROLL_SWEEP_DISABLED=1。shared 域条目进本名单是既有
   #     先例,idleSweep/alert/refreshEventsSweep 等同列;smoke 校验 healthz.schedulers
   #     必须是本名单子集,加白名单即可,不改 domain)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep desktopEnrollSweep"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do

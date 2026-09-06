@@ -151,6 +151,7 @@ import {
 } from "./account-pool/cooldownRecoveryActor.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
+import { startGrokUsageSweeper } from "./account-pool/grokUsageSweeper.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
@@ -5841,6 +5842,23 @@ export async function registerCommercial(
         const raw = Number(process.env.COMMERCIAL_CURSOR_USAGE_SWEEP_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000;
         const h = trackScheduler("cursorUsageSweep", "v5-owned", startCursorUsageSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  // 0276 — Grok Build (xAI subscription) usage sweeper. Hourly, per grok
+  // row: cli-chat-proxy /billing + /user → claude_accounts.grok_* columns.
+  // Leader-only (one set of xAI calls per pool). No materializer: grok has
+  // no sidecar. Direct egress only (sing-box IPv6 RST).
+  if (process.env.COMMERCIAL_GROK_USAGE_SWEEP_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "grokUsageSweep",
+      domain: "v5-owned",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_GROK_USAGE_SWEEP_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000;
+        const h = trackScheduler("grokUsageSweep", "v5-owned", startGrokUsageSweeper({ intervalMs }));
         return { stop: () => h.stop() };
       },
     });

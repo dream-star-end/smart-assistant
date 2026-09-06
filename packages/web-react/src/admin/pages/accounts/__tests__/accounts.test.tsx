@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
@@ -149,5 +149,68 @@ describe("AccountsPage", () => {
     expect(screen.getByText("Cursor 订阅 API Key 池 · 1 条")).toBeTruthy();
     expect(screen.getByText("Claude Code 官方账号池 · 1 条")).toBeTruthy();
     expect(screen.getByText("Codex 官方账号池 · 1 条")).toBeTruthy();
+  });
+
+  const GROK_ROW = {
+    ...ROW,
+    id: "12",
+    provider: "grok",
+    label: "grok-build-1",
+    status: "active",
+    cooldown_until: null,
+    grok_credit_usage_pct: 67,
+    grok_build_usage_pct: 41.2,
+    grok_credit_period_start: new Date(Date.now() - 3 * 86400_000).toISOString(),
+    grok_credit_period_end: new Date(Date.now() + 4 * 86400_000).toISOString(),
+    grok_subscription_tier: "SuperGrokPro",
+    grok_usage_updated_at: new Date().toISOString(),
+    grok_usage_error: null,
+  };
+
+  function mockGrokAccounts() {
+    adminGet.mockImplementation((path: string) => {
+      if (path === "/accounts") return Promise.resolve({ rows: [GROK_ROW] });
+      if (path === "/accounts/stats") return Promise.resolve(STATS);
+      if (path === "/stats/account-pool") {
+        return Promise.resolve({ total: 0, active: 0, cooldown: 0, disabled: 0, banned: 0, avg_health: 0, today_success_rate: 1 });
+      }
+      return Promise.resolve({ rows: [] });
+    });
+  }
+
+  test("grok 行渲染周额度 Badge", async () => {
+    mockGrokAccounts();
+    renderPage(<AccountsPage />);
+    const grokDesc = await screen.findByText("Grok Build 官方账号池 · 1 条");
+    const grokSection = grokDesc.closest("section");
+    expect(grokSection).toBeTruthy();
+    expect(within(grokSection!).getByText("67%")).toBeTruthy();
+    expect(within(grokSection!).getByText("SuperGrokPro")).toBeTruthy();
+  });
+
+  test("grok 段显示周额度列头且不显示 Sand 列", async () => {
+    mockGrokAccounts();
+    renderPage(<AccountsPage />);
+    const grokDesc = await screen.findByText("Grok Build 官方账号池 · 1 条");
+    const grokSection = grokDesc.closest("section")!;
+    expect(within(grokSection).getByText("周额度已用%")).toBeTruthy();
+    expect(within(grokSection).getByText("额度重置")).toBeTruthy();
+    expect(within(grokSection).getByText("订阅档")).toBeTruthy();
+    expect(within(grokSection).queryByText("Sand 已用%")).toBeNull();
+    expect(within(grokSection).queryByText("Sand 重置")).toBeNull();
+  });
+
+  test("grok 行更多操作含立即刷新 Grok 额度", async () => {
+    mockGrokAccounts();
+    renderPage(<AccountsPage />);
+    await screen.findByText("grok-build-1");
+    // Radix DropdownMenu Trigger 在 pointerdown 开启(click 不够)。
+    fireEvent.pointerDown(screen.getByRole("button", { name: "更多操作" }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(await screen.findByRole("menuitem", { name: "立即刷新 Grok 额度" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Grok 额度 / 用量" })).toBeTruthy();
   });
 });
