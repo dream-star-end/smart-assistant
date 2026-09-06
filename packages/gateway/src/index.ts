@@ -44,6 +44,15 @@ export {
   type CursorPendingKeepaliveProgressSignal,
   type CursorPendingKeepaliveTestHooks,
 } from './engine/cursorAdapter.js'
+// Cursor Sand relay: the master's external API-key proxy drives it directly
+// (serveMessages) to run cursor-* models for local Claude Code clients.
+export {
+  CursorSandRelay,
+  isSandRoutableModel,
+  type CursorSandServeResult,
+  type CursorSandUsage,
+  type RelayCredentialKind,
+} from './engine/cursorSandRelay.js'
 export {
   ZcodeAdapter,
   ZCODE_MAX_PROMPT_ARG_BYTES,

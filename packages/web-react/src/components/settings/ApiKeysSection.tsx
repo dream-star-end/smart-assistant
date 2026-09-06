@@ -19,7 +19,19 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
   const [creating, setCreating] = useState(false);
   const [justCreated, setJustCreated] = useState<CreatedApiKey | null>(null);
   const [copied, setCopied] = useState(false);
+  const [snippetCopied, setSnippetCopied] = useState(false);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+
+  // 本地 Claude Code 接入片段。base URL 取当前页面 origin(quick tunnel 域名会变,
+  // 不能写死);ANTHROPIC_MODEL 必须显式指定 cursor-* —— 服务端不做 claude-* → cursor 别名。
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  const claudeCodeSnippet = [
+    `export ANTHROPIC_BASE_URL=${origin}/api/anthropic`,
+    `export ANTHROPIC_AUTH_TOKEN=${justCreated?.plaintext ?? "oc-cc.<你的密钥>"}`,
+    "export ANTHROPIC_MODEL=cursor-fable-5.1-high",
+    "export ANTHROPIC_SMALL_FAST_MODEL=cursor-gemini-3.8-flash-low",
+    "claude",
+  ].join("\n");
 
   useEffect(() => {
     let alive = true;
@@ -98,6 +110,15 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
       setCopied(true);
     } catch {
       setCopied(false);
+    }
+  }
+
+  async function copySnippet() {
+    try {
+      await navigator.clipboard.writeText(claudeCodeSnippet);
+      setSnippetCopied(true);
+    } catch {
+      setSnippetCopied(false);
     }
   }
 
@@ -180,6 +201,35 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
           ))}
         </ul>
       )}
+
+      <details className="mt-3 border-t border-border pt-2 text-caption">
+        <summary className="cursor-pointer text-muted">接入本地 Claude Code(Cursor 系模型)</summary>
+        <p className="mt-2 text-faint">
+          在本机终端设置以下环境变量后启动 <code className="font-mono">claude</code>
+          。请求经本站 API Key 端点转发到 Cursor,按站内积分计费(余额为 0 时返回 402)。
+        </p>
+        <div className="mt-2 flex items-start gap-2">
+          <pre className="min-w-0 flex-1 overflow-x-auto rounded-md bg-bg px-2 py-1.5 font-mono text-caption text-fg">
+            {claudeCodeSnippet}
+          </pre>
+          <Button variant="secondary" size="sm" onClick={copySnippet} className="shrink-0">
+            <Copy size={13} /> {snippetCopied ? "已复制" : "复制"}
+          </Button>
+        </div>
+        <p className="mt-2 text-faint">
+          可用模型:<code className="font-mono">cursor-fable-5.1</code> /{" "}
+          <code className="font-mono">cursor-opus-5</code> /{" "}
+          <code className="font-mono">cursor-opus-4.8</code> /{" "}
+          <code className="font-mono">cursor-sonnet-5</code> /{" "}
+          <code className="font-mono">cursor-grok-4.6</code> /{" "}
+          <code className="font-mono">cursor-gemini-3.8-flash</code>,后缀为思考档位{" "}
+          <code className="font-mono">-low</code> / <code className="font-mono">-medium</code> /{" "}
+          <code className="font-mono">-high</code> / <code className="font-mono">-xhigh</code> /{" "}
+          <code className="font-mono">-max</code>(部分家族不含全部档位),再加{" "}
+          <code className="font-mono">-fast</code>{" "}
+          为加速版、双倍计费。具体以模型列表中已启用的为准。
+        </p>
+      </details>
     </div>
   );
 }

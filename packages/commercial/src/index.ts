@@ -247,6 +247,7 @@ import {
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META } from "./http/proxy/staticProviderMeta.js";
+import { makeCursorExternalRoute, type CursorExternalRoute } from "./http/proxy/cursorExternal.js";
 import type {
   DurableCodexBilling,
   StaticProviderId,
@@ -3085,6 +3086,10 @@ export async function registerCommercial(
   // 见 undefined 走 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404(部署故障不该伪装成
   // "用户 URL 写错")。
   let externalApiKeyProxy: AnthropicProxyHandler | undefined;
+  // cursor-* 模型在 external API-key 路径上的服务端 Sand relay(本地 Claude Code 接入
+  // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
+  // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
+  let cursorExternalRoute: CursorExternalRoute | undefined;
   if (!options.skipInternalProxy) {
     try {
       const apiKeyRepo = makePgApiKeyRepo(getPool());
@@ -3106,12 +3111,20 @@ export async function registerCommercial(
       const platformContextLoader = makePlatformContextLoader({
         reader: makeDefaultVolumeContextReader(),
       });
+      cursorExternalRoute = makeCursorExternalRoute({
+        pgPool: getPool(),
+        pricing,
+        logger: rootLogger.child({ subsys: "cursorExternal" }),
+      });
       externalApiKeyProxy = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
         preCheckRedis,
         scheduler,
         identity: apiKeyStrategy,
+        cursorExternal: cursorExternalRoute,
+        // Claude Code 会打 /v1/messages/count_tokens 做上下文估算;external 实例放行。
+        allowCountTokens: true,
         loadUserModelAuthz,
         rateLimitRedis: sharedRateLimitRedis,
         // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
@@ -3133,7 +3146,7 @@ export async function registerCommercial(
       });
       // eslint-disable-next-line no-console
       console.log(
-        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages)",
+        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages, cursor-* via sand relay)",
       );
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -3142,6 +3155,9 @@ export async function registerCommercial(
         err,
       );
       externalApiKeyProxy = undefined;
+      const stale = cursorExternalRoute;
+      cursorExternalRoute = undefined;
+      void stale?.close().catch(() => undefined);
     }
   }
 
@@ -6707,6 +6723,7 @@ export async function registerCommercial(
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
+      try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
         await Promise.all([

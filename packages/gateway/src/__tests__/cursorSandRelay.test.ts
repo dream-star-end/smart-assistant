@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
@@ -1288,6 +1289,126 @@ test('legacy usage frame without cache counters keeps the bare {input_tokens, ou
   assert.doesNotMatch(streamed, /cache_read_input_tokens/)
   const json = JSON.parse(await relayUsageResponse(frames, false)) as { usage: Record<string, number> }
   assert.deepEqual(json.usage, { input_tokens: 10, output_tokens: 4 })
+})
+
+// serveMessages: the master's external API-key proxy drives the relay without
+// the loopback listener. It must (a) not need start(), (b) hand back the same
+// usage the client saw so credits can be settled server-side, (c) report
+// credential failures as `rejected` after writing the 401, and (d) leave `res`
+// untouched for non-Sand models so the caller decides the answer.
+class FakeServerResponse extends EventEmitter {
+  statusCode = 200
+  headers: Record<string, string> = {}
+  chunks: string[] = []
+  destroyed = false
+  writableEnded = false
+  writableNeedDrain = false
+  headersSent = false
+  setHeader(name: string, value: string): this { this.headers[name.toLowerCase()] = value; return this }
+  write(chunk: string | Buffer): boolean { this.headersSent = true; this.chunks.push(String(chunk)); return true }
+  end(chunk?: string | Buffer): this {
+    if (chunk !== undefined) this.chunks.push(String(chunk))
+    this.headersSent = true
+    this.writableEnded = true
+    this.emit('close')
+    return this
+  }
+  text(): string { return this.chunks.join('') }
+}
+
+function serveRelay(frames: Buffer[], exchangeStatus = 200): CursorSandRelay {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: exchangeStatus,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(Buffer.concat([...frames, envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  // Fresh Buffer per read: the relay zeroes the returned key after every use.
+  return new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+}
+
+test('serveMessages runs without start() and returns the exact usage the client received (stream + json)', async () => {
+  const frames = [
+    responseFrame('textPart', { text: 'done' }),
+    responseFrame('extendedUsage', {
+      inputTokens: 1_200, outputTokens: 9, cacheReadTokens: 1_000, cacheWriteTokens: 100, maxTokens: 64,
+    }),
+  ]
+  const relay = serveRelay(frames)
+  try {
+    const streamed = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', stream: true, max_tokens: 64, messages: [{ role: 'user', content: 'hello' }] },
+      streamed as never,
+      new AbortController().signal,
+    )
+    assert.equal(result.kind, 'completed')
+    if (result.kind !== 'completed') throw new Error('unreachable')
+    assert.equal(result.upstreamModel, 'claude-fable-5-1-thinking-high')
+    assert.deepEqual(result.usage, {
+      input_tokens: 100, output_tokens: 9, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100,
+    })
+    assert.match(streamed.text(), /"usage":\{"input_tokens":100,"output_tokens":9,"cache_read_input_tokens":1000,"cache_creation_input_tokens":100\}/)
+    assert.match(streamed.text(), /event: message_stop/)
+
+    const json = new FakeServerResponse()
+    const nonStream = await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', stream: false, max_tokens: 64, messages: [{ role: 'user', content: 'hello' }] },
+      json as never,
+      new AbortController().signal,
+    )
+    assert.equal(nonStream.kind, 'completed')
+    if (nonStream.kind !== 'completed') throw new Error('unreachable')
+    assert.deepEqual(nonStream.usage, {
+      input_tokens: 100, output_tokens: 9, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100,
+    })
+    assert.equal(json.statusCode, 200)
+    assert.deepEqual((JSON.parse(json.text()) as { usage: unknown }).usage, {
+      input_tokens: 100, output_tokens: 9, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100,
+    })
+  } finally {
+    await relay.close()
+  }
+})
+
+test('serveMessages reports credential exchange failure as rejected 401 after writing the error', async () => {
+  const relay = serveRelay([], 403)
+  try {
+    const res = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'cursor-grok-4.6-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.deepEqual(result, { kind: 'rejected', status: 401, reason: 'CURSOR_SAND_AUTH_HTTP_403', written: true })
+    assert.equal(res.statusCode, 401)
+    assert.match(res.text(), /authentication_error/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('serveMessages leaves res untouched for non-Sand models', async () => {
+  const relay = serveRelay([])
+  try {
+    const res = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'glm-5.3-zai', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.deepEqual(result, { kind: 'rejected', status: 400, reason: 'NOT_SAND_ROUTE', written: false })
+    assert.equal(res.chunks.length, 0)
+    assert.equal(res.writableEnded, false)
+  } finally {
+    await relay.close()
+  }
 })
 
 // 0257 — a `session` slot holds a Cursor account session accessToken (PKCE

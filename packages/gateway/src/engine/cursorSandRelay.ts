@@ -184,6 +184,44 @@ function usageBlock(
   return usage
 }
 
+/** Final per-request usage handed back to a server-side caller (`serveMessages`).
+ * Same exclusive-input convention as `usageBlock`, but all four buckets are
+ * always present so billing code never has to probe optional keys. */
+export interface CursorSandUsage {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens: number
+  cache_creation_input_tokens: number
+}
+
+function usageSnapshot(
+  state: Pick<StreamState, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>,
+): CursorSandUsage {
+  const block = usageBlock(state)
+  return {
+    input_tokens: block.input_tokens ?? 0,
+    output_tokens: block.output_tokens ?? 0,
+    cache_read_input_tokens: block.cache_read_input_tokens ?? 0,
+    cache_creation_input_tokens: block.cache_creation_input_tokens ?? 0,
+  }
+}
+
+/**
+ * Outcome of one Anthropic-format request served by the relay.
+ *
+ *   - `completed`: a 2xx response (SSE or JSON) was fully written; `usage` is
+ *     the same figure the client saw in `message_delta` / the JSON body.
+ *   - `rejected`: the request never produced content. `written` tells whether
+ *     the relay already wrote an error response with `status` (credential /
+ *     upstream HTTP failures) or left `res` untouched (`NOT_SAND_ROUTE`).
+ *   - `failed`: headers were sent but the stream ended with an `error` event;
+ *     `usage` carries whatever upstream reported before failing.
+ */
+export type CursorSandServeResult =
+  | { kind: 'completed'; upstreamModel: string; usage: CursorSandUsage }
+  | { kind: 'rejected'; status: number; reason: string; written: boolean }
+  | { kind: 'failed'; reason: string; usage: CursorSandUsage }
+
 function nextToolIndex(tools: ReadonlyMap<number, ToolStreamState>): number {
   let next = 0
   for (const index of tools.keys()) next = Math.max(next, index + 1)
@@ -1318,7 +1356,7 @@ export class CursorSandRelay {
     body: AnthropicMessagesBody,
     res: ServerResponse,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<CursorSandServeResult> {
     this.onRequestForTest?.(structuredClone(body))
     let opened: { response: Response; upstreamModel: string }
     try {
@@ -1336,7 +1374,7 @@ export class CursorSandRelay {
           type: 'error',
           error: { type: 'authentication_error', message: `Cursor Sand credential rejected: ${message}` },
         }))
-        return
+        return { kind: 'rejected', status: 401, reason: message, written: true }
       }
       throw error
     }
@@ -1355,11 +1393,15 @@ export class CursorSandRelay {
         type: 'error',
         error: { type: overflow ? 'invalid_request_error' : 'api_error', message },
       }))
-      return
+      return {
+        kind: 'rejected',
+        status: res.statusCode,
+        reason: overflow ? 'CURSOR_SAND_PROMPT_TOO_LONG' : `CURSOR_SAND_HTTP_${upstream.status}`,
+        written: true,
+      }
     }
     if (body.stream === false) {
-      await this.pipeNonStreaming(upstream, opened.upstreamModel, advertisedTools(body.tools), res)
-      return
+      return this.pipeNonStreaming(upstream, opened.upstreamModel, advertisedTools(body.tools), res)
     }
     const retryInvalidTool = async (invalidResponse: string): Promise<Response> => {
       const retry = await this.openInference(correctedToolBody(body, invalidResponse), signal)
@@ -1369,22 +1411,53 @@ export class CursorSandRelay {
       return retry.response
     }
     if (nativeInferenceTools(opened.upstreamModel)) {
-      await this.pipeNativeStreaming(
+      return this.pipeNativeStreaming(
         upstream,
         opened.upstreamModel,
         advertisedTools(body.tools),
         res,
         retryInvalidTool,
       )
-      return
     }
-    await this.pipeStreaming(
+    return this.pipeStreaming(
       upstream,
       opened.upstreamModel,
       advertisedTools(body.tools),
       res,
       retryInvalidTool,
     )
+  }
+
+  /**
+   * Server-side entry point: serve one Anthropic Messages request on `res`
+   * without the loopback listener / route token. The master's external
+   * API-key proxy uses this to run cursor-* models on behalf of a user and
+   * settle credits from the returned usage. `start()` is not required —
+   * inference only touches `deps`, the auth cache and the credential kind.
+   *
+   * `NOT_SAND_ROUTE` is returned **without writing** to `res` so the caller
+   * decides how to answer (the container path forwards such requests via
+   * `passthroughMessages`; the master path has no passthrough and 400s).
+   */
+  async serveMessages(
+    body: AnthropicMessagesBody,
+    res: ServerResponse,
+    signal: AbortSignal,
+  ): Promise<CursorSandServeResult> {
+    if (!isSandRoutableModel(body.model)) {
+      return { kind: 'rejected', status: 400, reason: 'NOT_SAND_ROUTE', written: false }
+    }
+    const controller = new AbortController()
+    const abort = (): void => controller.abort()
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
+    this.activeRequests.add(controller)
+    try {
+      return await this.handleMessages(body, res, controller.signal)
+    } finally {
+      signal.removeEventListener('abort', abort)
+      this.activeRequests.delete(controller)
+    }
   }
 
   private initialState(): StreamState {
@@ -1494,7 +1567,7 @@ export class CursorSandRelay {
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
     retryInvalidTool: (invalidResponse: string) => Promise<Response>,
-  ): Promise<void> {
+  ): Promise<CursorSandServeResult> {
     const state = this.initialState()
     const messageId = `msg_${randomBytes(16).toString('hex')}`
     let streamError: string | null = null
@@ -1733,7 +1806,7 @@ export class CursorSandRelay {
           type: 'error',
           error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
         })
-        return
+        return { kind: 'failed', reason: streamError ?? 'Cursor Sand inference failed', usage: usageSnapshot(state) }
       }
       const toolCount = [...state.tools.values()].filter((tool) => tool.name).length
       await emitSse(res, 'message_delta', {
@@ -1745,6 +1818,7 @@ export class CursorSandRelay {
         usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
+      return { kind: 'completed', upstreamModel: model, usage: usageSnapshot(state) }
     } finally {
       clearInterval(ping)
       if (!res.writableEnded) res.end()
@@ -1786,7 +1860,7 @@ export class CursorSandRelay {
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
     retryInvalidTool: (invalidResponse: string) => Promise<Response>,
-  ): Promise<void> {
+  ): Promise<CursorSandServeResult> {
     let state = this.initialState()
     const messageId = `msg_${randomBytes(16).toString('hex')}`
     let streamError: string | null = null
@@ -1844,7 +1918,7 @@ export class CursorSandRelay {
           type: 'error',
           error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
         })
-        return
+        return { kind: 'failed', reason: streamError ?? 'Cursor Sand inference failed', usage: usageSnapshot(state) }
       }
 
       await emitSse(res, 'message_start', {
@@ -1922,6 +1996,7 @@ export class CursorSandRelay {
         usage: usageBlock(state),
       })
       await emitSse(res, 'message_stop', { type: 'message_stop' })
+      return { kind: 'completed', upstreamModel: model, usage: usageSnapshot(state) }
     } finally {
       clearInterval(ping)
       if (!res.writableEnded) res.end()
@@ -1933,7 +2008,7 @@ export class CursorSandRelay {
     model: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
-  ): Promise<void> {
+  ): Promise<CursorSandServeResult> {
     const state = this.initialState()
     const tools = new Map<number, ToolStreamState>()
     let error: string | null = null
@@ -1951,7 +2026,7 @@ export class CursorSandRelay {
       res.statusCode = 502
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: error } }))
-      return
+      return { kind: 'rejected', status: 502, reason: error, written: true }
     }
     const content: JsonObject[] = []
     const recovered = recoverXmlToolCalls(state.text, allowedTools)
@@ -1975,5 +2050,6 @@ export class CursorSandRelay {
       stop_sequence: null,
       usage: usageBlock(state),
     }))
+    return { kind: 'completed', upstreamModel: model, usage: usageSnapshot(state) }
   }
 }
