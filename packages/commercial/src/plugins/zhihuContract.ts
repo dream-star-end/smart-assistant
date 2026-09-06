@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { ZHIHU_WORKER_SOURCE } from './zhihuWorkerSource.js'
 
 export const ZHIHU_PLUGIN_SLUG = 'zhihu'
-export const ZHIHU_PLUGIN_VERSION = '1.1.0'
+export const ZHIHU_PLUGIN_VERSION = '1.1.1'
 export const ZHIHU_WORKER_DIGEST = createHash('sha256').update(ZHIHU_WORKER_SOURCE).digest('hex')
 export const ZHIHU_DRIVER_ID = `zhihu-${ZHIHU_WORKER_DIGEST.slice(0, 57)}`
 export const ZHIHU_DRIVER_VERSION = ZHIHU_PLUGIN_VERSION
@@ -256,7 +256,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'get_self',
       description: '读取当前知乎账号的公开资料',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: { type: 'object', properties: {}, additionalProperties: false },
       result: {
         type: 'object',
@@ -269,7 +269,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'get_user',
       description: '读取指定知乎用户的公开资料',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { urlToken: urlTokenSchema },
@@ -287,7 +287,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'get_question',
       description: '读取指定知乎问题的标题、详情和计数',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { questionId: numericIdSchema },
@@ -305,7 +305,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_question_answers',
       description: '读取指定问题下当前页面可见的回答列表',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: {
@@ -330,7 +330,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'get_answer',
       description: '读取指定知乎回答的纯文本全文与互动计数',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { answerId: numericIdSchema },
@@ -348,7 +348,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_answer_comments',
       description: '读取指定回答当前页面可见的评论',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: {
@@ -373,7 +373,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'search',
       description: '按关键词读取知乎站内搜索结果',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: {
@@ -399,7 +399,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_feed',
       description: '读取知乎首页关注流当前可见条目',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } },
@@ -420,7 +420,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_notifications',
       description: '读取知乎消息通知当前可见条目',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } },
@@ -441,7 +441,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_my_answers',
       description: '读取当前账号近期回答列表',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } },
@@ -462,7 +462,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_my_articles',
       description: '读取当前账号近期文章列表',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: {
         type: 'object',
         properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } },
@@ -483,7 +483,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       id: 'list_hot',
       description: '读取知乎热榜当前可见条目',
       effect: 'read',
-      timeoutSeconds: 120,
+      timeoutSeconds: 300,
       params: { type: 'object', properties: {}, additionalProperties: false },
       result: {
         type: 'object',
