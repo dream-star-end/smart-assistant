@@ -3,7 +3,7 @@ import type { ChatProject, Session } from "../../lib/types";
 import { isSidebarSessionRunning } from "../../lib/sessionStatus";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
-import { formatDate } from "../ui/TimeAgo";
+import { TimeAgo, formatDate } from "../ui/TimeAgo";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -116,17 +116,33 @@ export function SessionRow({
         }}
         aria-current={active ? "true" : undefined}
         aria-label={title}
-        className="flex h-full min-w-0 flex-1 items-center rounded-md px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="flex h-full min-w-0 flex-1 flex-col justify-center rounded-md px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <span className={cn("truncate", unread && "font-semibold text-fg")}>{title}</span>
+        {s.lastMessagePreview ? (
+          <span className="truncate text-caption text-faint">{s.lastMessagePreview}</span>
+        ) : null}
       </button>
-      {durationText && (
+      {running && durationText ? (
         <span
           title={durationTitle}
           data-session-duration
           className="shrink-0 tabular-nums text-caption text-faint"
         >
           {durationText}
+        </span>
+      ) : (
+        <span
+          title={formatDate(s.updatedAt ?? s.lastAt, "datetime")}
+          data-session-updated
+          className="shrink-0"
+        >
+          <TimeAgo
+            value={s.updatedAt ?? s.lastAt}
+            format="relative"
+            tooltip={false}
+            className="text-caption text-faint"
+          />
         </span>
       )}
       <DropdownMenu>
