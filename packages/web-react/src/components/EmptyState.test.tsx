@@ -18,4 +18,17 @@ describe('EmptyState first-task starters', () => {
     expect(onPrefill).toHaveBeenCalledOnce()
     expect(onPrefill).toHaveBeenCalledWith(MAIN_AGENT.starters![0])
   })
+
+  test('无 starters 时渲染 2 张兜底卡', () => {
+    const onPrefill = vi.fn()
+    render(
+      <EmptyState
+        agent={{ ...MAIN_AGENT, id: 'custom', starters: [] }}
+        onPrefill={onPrefill}
+        onChangeAgent={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '帮我把下面这段内容整理成要点' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '用一句话说明你能帮我做什么' })).toBeTruthy()
+  })
 })

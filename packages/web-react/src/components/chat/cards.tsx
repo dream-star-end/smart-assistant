@@ -431,18 +431,21 @@ export function UserCard({
           )}
         </div>
       )}
-      {status !== "sending" && status !== "queued" && status !== "error" && cb?.onQuote && (
-        <div className="mt-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
-          <IconButton
-            aria-label="引用"
-            title="引用"
-            size="sm"
-            shape="square"
-            className="[@media(hover:none)]:size-11"
-            onClick={() => cb.onQuote?.(msg)}
-          >
-            <Quote size={15} />
-          </IconButton>
+      {status !== "sending" && status !== "queued" && (
+        <div className="mt-1 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
+          <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
+          {status !== "error" && cb?.onQuote && (
+            <IconButton
+              aria-label="引用"
+              title="引用"
+              size="sm"
+              shape="square"
+              className="[@media(hover:none)]:size-11"
+              onClick={() => cb.onQuote?.(msg)}
+            >
+              <Quote size={15} />
+            </IconButton>
+          )}
         </div>
       )}
     </div>

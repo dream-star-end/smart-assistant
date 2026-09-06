@@ -3,6 +3,11 @@ import type { Agent } from "../lib/agents";
 import { AgentAvatar } from "./AgentAvatar";
 import { Button } from "./ui";
 
+const FALLBACK_STARTERS = [
+  "帮我把下面这段内容整理成要点",
+  "用一句话说明你能帮我做什么",
+];
+
 export function EmptyState({
   agent,
   onPrefill,
@@ -29,7 +34,7 @@ export function EmptyState({
       </Button>
 
       <div className="mt-8 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
-        {(agent.starters ?? []).map((s, i) => (
+        {(agent.starters?.length ? agent.starters : FALLBACK_STARTERS).map((s, i) => (
           <button
             key={s}
             onClick={() => onPrefill(s)}

@@ -1,4 +1,4 @@
-import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun, X } from 'lucide-react'
+import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
@@ -17,7 +17,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from '../LongContextCostWarning'
-import { Alert, Button, Input, Modal, Switch, useConfirm } from '../ui'
+import { Alert, Button, Modal, Switch, useConfirm } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 
@@ -40,11 +40,14 @@ const NOTIF_FIELDS: { key: keyof PrefsView; label: string; hint?: string }[] = [
   { key: 'notify_telegram', label: 'Telegram 通知' },
 ]
 
-const MAX_HOTKEYS = 32
+function isMacPlatform(): boolean {
+  if (typeof navigator === 'undefined') return false
+  return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent)
+}
 
 /**
  * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
- * 通知开关。快捷键已拆到独立导航（pane="hotkeys"），仍读写同一份 prefs。
+ * 通知开关。快捷键已拆到独立导航（pane="hotkeys"），展示内置只读说明。
  * 最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
@@ -134,18 +137,7 @@ export function PreferencesTab({
       : ''
 
   if (pane === 'hotkeys') {
-    return (
-      <div className="flex flex-col">
-        {err && (
-          <div className="px-5 pt-3">
-            <Alert tone="danger" className="text-meta">
-              {err}
-            </Alert>
-          </div>
-        )}
-        <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
-      </div>
-    )
+    return <BuiltinHotkeysTable />
   }
 
   return (
@@ -389,101 +381,30 @@ export function PreferencesTab({
   )
 }
 
-/** 自定义快捷键（hotkeys: 动作名 → 按键，最多 32 条，键/值 ≤ 64 字符）。 */
-function HotkeysEditor({
-  hotkeys,
-  onPatch,
-}: {
-  hotkeys: Record<string, string>
-  onPatch: (p: Record<string, unknown>) => Promise<void>
-}) {
-  const [name, setName] = useState('')
-  const [combo, setCombo] = useState('')
-  const [err, setErr] = useState<string | null>(null)
-  const entries = Object.entries(hotkeys)
-
-  async function add() {
-    const k = name.trim()
-    const v = combo.trim()
-    setErr(null)
-    if (!k || !v) return
-    if (k.length > 64 || v.length > 64) {
-      setErr('名称与按键均需 ≤ 64 字符。')
-      return
-    }
-    if (!(k in hotkeys) && entries.length >= MAX_HOTKEYS) {
-      setErr(`最多 ${MAX_HOTKEYS} 个快捷键。`)
-      return
-    }
-    await onPatch({ hotkeys: { ...hotkeys, [k]: v } })
-    setName('')
-    setCombo('')
-  }
-
-  async function remove(k: string) {
-    const next = { ...hotkeys }
-    delete next[k]
-    // 删空 → 整字段删除（null）；否则提交剩余全集（hotkeys 在顶层是单 key，整体替换）
-    await onPatch({ hotkeys: entries.length === 1 ? null : next })
-  }
-
+function BuiltinHotkeysTable() {
+  const mod = isMacPlatform() ? '⌘' : 'Ctrl'
+  const rows: Array<{ keys: string; action: string }> = [
+    { keys: `${mod}+K`, action: '搜索会话' },
+    { keys: `${mod}+Shift+O`, action: '新建会话' },
+    { keys: 'Esc', action: '停止生成（生成中）' },
+    { keys: 'Enter / Shift+Enter', action: '发送 / 换行（桌面）' },
+    { keys: `${mod}+V`, action: '粘贴图片为附件' },
+  ]
   return (
-    <div className="border-t border-border px-5 py-4">
+    <div className="px-5 py-4">
       <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-        自定义快捷键
+        内置快捷键
       </div>
-      {err && (
-        <Alert tone="warning" className="mb-2 text-meta">
-          {err}
-        </Alert>
-      )}
-      {entries.length === 0 ? (
-        <p className="pb-2 text-meta text-faint">还没有自定义快捷键。</p>
-      ) : (
-        <ul className="mb-2 flex flex-col gap-1">
-          {entries.map(([k, v]) => (
-            <li key={k} className="flex items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-hover">
-              <span className="min-w-0 flex-1 truncate text-body text-fg">{k}</span>
-              <kbd className="rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-caption text-muted">
-                {v}
-              </kbd>
-              <button
-                onClick={() => remove(k)}
-                aria-label={`删除 ${k}`}
-                className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint outline-none hover:bg-danger-soft hover:text-danger focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X size={13} />
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      <div className="flex items-center gap-2">
-        <Input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="动作名"
-          maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-body"
-        />
-        <Input
-          value={combo}
-          onChange={(e) => setCombo(e.target.value)}
-          placeholder="如 Ctrl+K"
-          maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-body"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') add()
-          }}
-        />
-        <button
-          onClick={add}
-          disabled={!name.trim() || !combo.trim()}
-          className="shrink-0 rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-        >
-          添加
-        </button>
-      </div>
+      <ul className="flex flex-col gap-1">
+        {rows.map((row) => (
+          <li key={row.action} className="flex items-center gap-3 rounded-lg px-2 py-1.5">
+            <kbd className="shrink-0 rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-caption text-muted">
+              {row.keys}
+            </kbd>
+            <span className="min-w-0 flex-1 text-body text-fg">{row.action}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }

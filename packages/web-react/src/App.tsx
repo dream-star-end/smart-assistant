@@ -37,6 +37,7 @@ import { InboxDialog } from "./components/InboxDialog";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
+import { resolveGlobalHotkey } from "./lib/hotkeys";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
 import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
@@ -1715,16 +1716,9 @@ export function App() {
   );
 
   useEffect(() => {
-    const isEditable = (el: EventTarget | null) => {
-      if (!(el instanceof HTMLElement)) return false;
-      const tag = el.tagName;
-      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
-    };
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
-      if (!mod) return;
-      if (e.key === "k" || e.key === "K") {
-        if (e.shiftKey || isEditable(e.target)) return;
+      const action = resolveGlobalHotkey(e);
+      if (action === "search") {
         e.preventDefault();
         setCollapsed(false);
         setMobileNavOpen(true);
@@ -1735,9 +1729,9 @@ export function App() {
         }, 0);
         return;
       }
-      if ((e.key === "o" || e.key === "O") && e.shiftKey) {
-        if (isEditable(e.target)) return;
+      if (action === "new") {
         e.preventDefault();
+        setBoardOpen(false);
         handleNew();
       }
     };
@@ -2623,18 +2617,14 @@ export function App() {
   useEffect(() => {
     if (!inWorkspace) return;
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
-        e.preventDefault();
-        setBoardOpen(false);
-        handleNew();
-      } else if (e.key === "Escape" && sending) {
+      if (resolveGlobalHotkey(e, { sending }) === "stop") {
         e.preventDefault();
         stopTurn();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [inWorkspace, sending, handleNew, stopTurn]);
+  }, [inWorkspace, sending, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
   // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。

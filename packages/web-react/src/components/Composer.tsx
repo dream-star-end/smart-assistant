@@ -157,6 +157,8 @@ export function Composer({
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const dragDepthRef = useRef(0);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   // 附件 file input 的稳定 id：供「+」菜单里的 <label htmlFor> 原生激活(见下方附件项)。
@@ -312,6 +314,10 @@ export function Composer({
     }
   };
 
+  const canAcceptDrop = !disabled && !busy && !!onUpload;
+  const isFileDrag = (e: { dataTransfer: DataTransfer | null }) =>
+    Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
   const voiceStatus =
     voiceMsg != null ? (
       <span className="text-danger">{voiceMsg}</span>
@@ -347,7 +353,37 @@ export function Composer({
         className={cn(
           "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",
           "focus-within:border-border-strong",
+          dragActive && "ring-2 ring-ring",
         )}
+        onDragEnter={(e) => {
+          if (!isFileDrag(e) || !canAcceptDrop) return;
+          e.preventDefault();
+          dragDepthRef.current += 1;
+          setDragActive(true);
+        }}
+        onDragOver={(e) => {
+          if (!isFileDrag(e)) return;
+          e.preventDefault();
+          if (!canAcceptDrop) {
+            e.dataTransfer.dropEffect = "none";
+            return;
+          }
+          e.dataTransfer.dropEffect = "copy";
+          if (!dragActive) setDragActive(true);
+        }}
+        onDragLeave={(e) => {
+          if (!isFileDrag(e)) return;
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) setDragActive(false);
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          dragDepthRef.current = 0;
+          setDragActive(false);
+          if (!canAcceptDrop) return;
+          const files = Array.from(e.dataTransfer.files ?? []);
+          if (files.length > 0) void onFiles(files);
+        }}
       >
         {environmentPreparing && <EnvironmentPrepBar />}
         {replyTo && (
@@ -511,6 +547,7 @@ export function Composer({
             rows={1}
             value={value}
             disabled={disabled}
+            aria-label="消息输入框"
             onChange={(e) => setValue(e.target.value)}
             onPaste={(e) => {
               if (!onUpload) return;
@@ -547,6 +584,7 @@ export function Composer({
               <Mic size={19} />
             )}
           </IconButton>
+          {stopping && <span className="text-caption text-muted">正在停止…</span>}
           <button
             type="button"
             data-product-control
@@ -567,7 +605,7 @@ export function Composer({
             }}
             disabled={stopping || (!canSend && !busy) || disabled}
             className={cn(
-              "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all",
+              "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
               busy
                 ? "bg-fg text-bg"
                 : canSend
