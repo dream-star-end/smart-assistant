@@ -56,6 +56,7 @@ import type {
   PickResult,
   ReleaseInput,
 } from "../account-pool/scheduler.js";
+import { generatePersona } from "../account-pool/persona.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
 import { PricingCache, type ModelPricing } from "../billing/pricing.js";
@@ -66,6 +67,7 @@ import {
   getDegradedProviders,
 } from "../admin/providerHealthGate.js";
 import type { Pool, QueryResult } from "pg";
+import { matchObservabilitySql } from "./helpers/fakePoolSql.js";
 
 // ─── 通用构件 ─────────────────────────────────────────────────────────────
 
@@ -311,6 +313,8 @@ function buildFakePool(override: FakePoolOverride = {}) {
       };
     }
 
+    const _obs = matchObservabilitySql(trimmed);
+    if (_obs) return _obs;
     throw new Error(`unknown SQL in fakePool: ${trimmed.slice(0, 120)}`);
   };
 
@@ -445,7 +449,7 @@ function buildFakeScheduler(initialSpec: PickSpec | null = {}, releaseOrder?: st
         egress_host_uuid: null,
         pinned_user_id: pinned,
         account_uuid: null,
-        persona: null,
+        persona: FIXED_PERSONA,
       };
     },
     async release(input: ReleaseInput): Promise<void> {
@@ -591,6 +595,7 @@ const FIXED_CONTAINER_ID = 42;
 const FIXED_HOST_UUID = "host-self";
 const FIXED_BOUND_IP = "172.30.0.10";
 const FIXED_ACCOUNT_ID = 1001n;
+const FIXED_PERSONA = generatePersona(Buffer.from("n1-fake-pick-persona"));
 const FIXED_PINNED_USER_ID = createHash("sha256")
   .update("test-pinned-account")
   .digest("hex");

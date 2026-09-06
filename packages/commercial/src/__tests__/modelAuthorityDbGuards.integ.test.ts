@@ -128,7 +128,10 @@ before(async () => {
   );
   testUserId = u.rows[0].id;
 
-  await query("CREATE TABLE _fxg_catalog AS TABLE model_catalog");
+  // Later engine switches (0215/0216/…) leave retired catalog history.
+  // Restoring those rows into every 0144 case makes `WHERE model_id='kimi-k3'`
+  // hit an immutable retired entry. Same live-only floor as modelCatalogDb.
+  await query("CREATE TABLE _fxg_catalog AS SELECT * FROM model_catalog WHERE state <> 'retired'");
   await query("CREATE TABLE _fxg_pricing AS TABLE model_pricing");
 
   // 受限角色(割接后的 app 角色形态)。CREATE ROLE 需要 superuser —— 本地/CI 的 fixture

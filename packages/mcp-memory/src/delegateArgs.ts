@@ -25,9 +25,22 @@ export function normalizeDelegateModel(
 }
 
 export const SELF_DELEGATE_ERROR = '不能把任务委派给自己。确需自调用时请加 --allow-self'
+/** MCP 工具侧的同义提示:`--allow-self` 是 oc-memory CLI 旗标,MCP 调用方看不到 CLI。 */
+export const SELF_DELEGATE_MCP_HINT =
+  '不能把任务委派给自己(agentId 与当前成员相同)。确需自调用(例如同成员换 model 跑一份)请传 allowSelf: true;否则改派其他成员,如 agentId="coding-assistant"'
 
 export function parseDelegateAllowSelf(raw: unknown): boolean {
   return raw === true || raw === 'true' || raw === '1'
+}
+
+/**
+ * 把网关回传的 CLI 口径自委派错误改写成 MCP 口径(参数名 allowSelf 而非 --allow-self)。
+ * 其它文本原样返回。
+ */
+export function rewriteSelfDelegateErrorForMcp(text: string): string {
+  return text.includes(SELF_DELEGATE_ERROR)
+    ? text.replace(SELF_DELEGATE_ERROR, SELF_DELEGATE_MCP_HINT)
+    : text
 }
 
 export function rejectSelfDelegate(opts: {

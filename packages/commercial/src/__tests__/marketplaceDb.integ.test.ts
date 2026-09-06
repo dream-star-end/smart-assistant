@@ -55,6 +55,7 @@ import {
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
+const SAVED_RUNTIME_CHANNEL = process.env.OC_RUNTIME_CHANNEL
 
 let pgAvailable = false
 
@@ -82,6 +83,10 @@ async function probe(): Promise<boolean> {
 }
 
 before(async () => {
+  // Agent-kind marketplace is v5-only (marketplaceAgentsEnabled). Nightly
+  // runners do not set OC_RUNTIME_CHANNEL, so the default v3 gate 404s every
+  // agent install. Skill tests are unaffected: they never take this gate.
+  process.env.OC_RUNTIME_CHANNEL = 'v5'
   pgAvailable = await probe()
   if (!pgAvailable) {
     if (REQUIRE_TEST_DB) throw new Error('Postgres test fixture required (REQUIRE_TEST_DB=1)')
@@ -94,6 +99,8 @@ before(async () => {
 })
 
 after(async () => {
+  if (SAVED_RUNTIME_CHANNEL === undefined) delete process.env.OC_RUNTIME_CHANNEL
+  else process.env.OC_RUNTIME_CHANNEL = SAVED_RUNTIME_CHANNEL
   if (pgAvailable) {
     try {
       await resetSchema()

@@ -261,10 +261,18 @@ describe("/api/me/preferences (http integ)", () => {
       "effective",
       "eligible",
       "enabled",
+      "legacy_enabled",
       "min_interval_hours",
       "min_new_sessions",
       "minimum_plan_code",
+      "optimizer_enabled",
+      "telemetry_blockers",
+      "telemetry_ready",
     ]);
+    assert.equal(j.features.auto_dream.legacy_enabled, false);
+    assert.equal(j.features.auto_dream.optimizer_enabled, false);
+    assert.equal(j.features.auto_dream.telemetry_ready, null);
+    assert.deepEqual(j.features.auto_dream.telemetry_blockers, []);
   });
 
   test("PATCH 写入 → GET 反读一致", async (t) => {

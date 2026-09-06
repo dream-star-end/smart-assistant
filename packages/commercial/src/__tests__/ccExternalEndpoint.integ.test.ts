@@ -57,6 +57,7 @@ import type {
 import { createCommercialHandler } from "../http/router.js";
 import type { CommercialHttpDeps } from "../http/handlers.js";
 import type { AccountScheduler, PickInput, PickResult, ReleaseInput } from "../account-pool/scheduler.js";
+import { generatePersona } from "../account-pool/persona.js";
 import { AccountPoolUnavailableError } from "../account-pool/scheduler.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
@@ -65,6 +66,7 @@ import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import { _clearMaintenanceCache } from "../middleware/maintenanceMode.js";
 import type { Pool } from "pg";
+import { matchObservabilitySql } from "./helpers/fakePoolSql.js";
 
 // ─── 固定常量 ───────────────────────────────────────────────────────────────
 
@@ -75,6 +77,7 @@ const FIXED_SECRET = "deadbeef".repeat(6); // 48 hex chars
 const FIXED_TOKEN = `oc-cc.${FIXED_PREFIX}.${FIXED_SECRET}`;
 const FIXED_MODEL = "claude-sonnet-4-6";
 const FIXED_ACCOUNT_ID = 1001n;
+const FIXED_PERSONA = generatePersona(Buffer.from("n1-fake-pick-persona-cc"));
 const FIXED_PINNED_USER_ID = createHash("sha256")
   .update("test-pinned-account-cc-external")
   .digest("hex");
@@ -195,6 +198,19 @@ function buildFakePool(override: FakePoolOverride = {}) {
     if (head.startsWith("INSERT INTO USAGE_RECORDS")) {
       return { rows: [{ id: "1" }], rowCount: 1 };
     }
+    if (head.startsWith("SELECT U.CREDITS::TEXT AS WALLET")) {
+      const c = override.userCredits ?? 99_999_999n;
+      return { rows: [{ wallet: c.toString(), period: "0" }], rowCount: 1 };
+    }
+    if (head.startsWith("SELECT (O.CREDITS + COALESCE(OS.PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (head.startsWith("SELECT M.ORG_ID::TEXT AS ORG_ID")) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (head.startsWith("SELECT ID::TEXT AS ID, PERIOD_CREDITS::TEXT AS PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
     if (head.startsWith("SELECT CREDITS")) {
       const c = override.userCredits ?? 99_999_999n;
       return { rows: [{ credits: c.toString() }], rowCount: 1 };
@@ -218,6 +234,8 @@ function buildFakePool(override: FakePoolOverride = {}) {
     // user_api_keys.findByPrefix — fakeApiKeyRepo 自己 mock,不会落到这条
     // user_api_keys.list / revoke 同理
 
+    const _obs = matchObservabilitySql(trimmed);
+    if (_obs) return _obs;
     throw new Error(`unknown SQL in fakePool: ${trimmed.slice(0, 120)}`);
   };
 
@@ -320,7 +338,7 @@ function buildFakeScheduler(opts: FakeSchedulerOpts = {}): SchedulerSpy {
         egress_host_uuid: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
         account_uuid: accountUuid,
-        persona: null,
+        persona: FIXED_PERSONA,
       };
     },
     async release(input: ReleaseInput): Promise<void> {
@@ -463,6 +481,13 @@ class MockRes {
     if (!this.listeners.has(ev)) this.listeners.set(ev, []);
     this.listeners.get(ev)!.push(cb);
     return this;
+  }
+  once(ev: string, cb: (...a: unknown[]) => void): this {
+    const onceCb = (...args: unknown[]) => {
+      this.off(ev, onceCb);
+      cb(...args);
+    };
+    return this.on(ev, onceCb);
   }
   off(ev: string, cb: (...a: unknown[]) => void): this {
     const arr = this.listeners.get(ev);
@@ -1254,14 +1279,14 @@ describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () =>
     assert.ok(last0.startsWith("# OpenClaude Platform Context"));
   });
 
-  test("H1.2 同 userId 不同 client body → metadata.user_id keyset 同形态 + account_uuid 字节级稳定 + session_id 各异", async () => {
+  test("H1.2 同 userId 不同 client body → metadata.user_id keyset 同形态 + account_uuid 字节级稳定 + session_id 信任客户端透传", async () => {
     const accountUuids: string[] = [];
     const sessionIds: string[] = [];
     const keysets: string[][] = [];
     for (let i = 0; i < 3; i++) {
       const cap = makeCapturingFetch();
       const h = buildHarness({ fetchImpl: cap.fetchImpl });
-      // 客户端透传一个 session_id 占位值,验它必被覆盖
+      // 客户端透传 session_id:2026-05-25 起优先信任该值(不再每请求覆盖)
       const res = await h.run({
         body: {
           ...minBody(),
@@ -1291,16 +1316,11 @@ describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () =>
     // account_uuid 同 userId 跨多次稳定
     assert.equal(accountUuids[0], accountUuids[1]);
     assert.equal(accountUuids[1], accountUuids[2]);
-    // session_id 各不相同 + 都不等于 client 透传值
-    assert.notEqual(sessionIds[0], sessionIds[1]);
-    assert.notEqual(sessionIds[1], sessionIds[2]);
-    for (const sid of sessionIds) {
-      assert.notEqual(sid, "CLIENT_INJECTED_SESSION_DO_NOT_LEAK");
-      assert.match(
-        sid,
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-      );
-    }
+    // 2026-05-25:session_id 优先信任客户端透传(真 CC 同一 conversation 复用 session_id)。
+    // 旧 Phase 5 每请求 randomUUID 覆盖客户端值已翻转;同 userId 三次相同透传 → 三次相同 session_id。
+    assert.equal(sessionIds[0], "CLIENT_INJECTED_SESSION_DO_NOT_LEAK");
+    assert.equal(sessionIds[1], sessionIds[0]);
+    assert.equal(sessionIds[2], sessionIds[0]);
   });
 
   test("H2.1 outbound metadata.user_id 仅含 3 必有 key(device_id/account_uuid/session_id),无 extra", async () => {

@@ -1,0 +1,12 @@
+# nightly 全梯队(nightly-1..5)共用的计数基线 —— 与 commercial-integ.txt 配套,
+# 由 .github/scripts/diff-known-failures.sh 判据 C 消费。
+# (commercial-integ-gate.sh:91-94:找不到 commercial-integ-<shard>.counts 时回落到本文件)
+#
+# 2026-09-06 OCV5-123 建立。此前该文件不存在 → 门在 required-input 检查处 fail-closed,
+# 与用例红绿无关。基线取最严:nightly 层任何一个失败测试点都是红。
+#
+# 规则:超上界即红;**禁止为了换绿抬高这两个数**——nightly 红了开工单修用例/产品,
+# 或(必须带 issue+审批+失效日)进 commercial-integ.txt 走 known-failures 准入策略。
+# # skipped 没有上界:commercial-integ-gate.sh 的 G2 判据硬钉死必须为 0。
+fail_max = 0
+cancelled_max = 0

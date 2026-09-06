@@ -26,7 +26,7 @@ import {
   recordRefreshEvent,
 } from '../account-pool/refreshEvents.js'
 import { createAccount, deleteAccount } from '../account-pool/store.js'
-import { encrypt } from '../crypto/aead.js'
+import { insertTestEgressProxy } from './helpers/accountFixture.js'
 import { KMS_KEY_BYTES } from '../crypto/keys.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
@@ -38,7 +38,6 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 
 let pgAvailable = false
-let TEST_EGRESS_PROXY_ID = '1'
 const KEY = randomBytes(KMS_KEY_BYTES)
 const keyFn = (): Buffer => Buffer.from(KEY)
 
@@ -68,12 +67,7 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
   await resetTestSchemaForTest()
   await runMigrations()
-  const _ep = encrypt('http://test:test@10.0.0.1:8080', KEY)
-  const _r = await query<{ id: string }>(
-    "INSERT INTO egress_proxies(label, url_enc, url_nonce, status) VALUES ($1, $2, $3, 'active') RETURNING id::text AS id",
-    [`t-pool-${Date.now()}`, _ep.ciphertext, _ep.nonce],
-  )
-  TEST_EGRESS_PROXY_ID = _r.rows[0].id
+
 })
 
 after(async () => {
@@ -125,7 +119,7 @@ async function makeAccount(label: string): Promise<bigint> {
       token: 'ACC',
       refresh: 'REF',
       expires_at: new Date(Date.now() - 60_000),
-      egress_proxy_id: TEST_EGRESS_PROXY_ID,
+      egress_proxy_id: await insertTestEgressProxy(KEY, 'n5-refresh'),
     },
     keyFn,
   )
@@ -437,7 +431,7 @@ describe('refresh.ts 落事件 — err_msg 固定字符串', () => {
         plan: 'pro',
         token: 'X',
         refresh: null,
-        egress_proxy_id: TEST_EGRESS_PROXY_ID,
+        egress_proxy_id: await insertTestEgressProxy(KEY, 'n5-refresh'),
       },
       keyFn,
     )

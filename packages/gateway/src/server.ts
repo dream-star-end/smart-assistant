@@ -1945,6 +1945,10 @@ interface RunDelegateInput {
   fencingEpoch?: number
   /** SM: slot already reserved at Enqueue, skip the waiter loop. */
   capacityReserved?: boolean
+  /** SM: the exact opts `_admitDelegateCreate` reserved with (slot or waiter). Every release
+   *  of that reservation must use these — never a re-derived bucket key — or the per-parent
+   *  running counter drifts and locks the parent out(2026-09-06 槽位泄漏事故:早退未释放)。 */
+  capacitySlotOpts?: { parentBucketKey?: string; isReview?: boolean }
   idempotencyKey?: string
   _leaseTimer?: ReturnType<typeof setInterval>
 }
@@ -11391,9 +11395,14 @@ export class Gateway {
     | { status: 'aborted'; waitedMs: number }
   > {
     const reserveOpts = { parentBucketKey: args.parentBucketKey, isReview: args.isReview }
-    const first = this._tryReserveDelegateSlot(reserveOpts)
-    if (!first) return { status: 'ok' }
     const waiters = (this._delegateQueueWaiters ??= new Map())
+    const first = this._tryReserveDelegateSlot(reserveOpts)
+    if (!first) {
+      // SM 'wait' 预占的占位 waiter 在这里放行 → 必须一并删除,否则占位永久计入
+      // DELEGATE_QUEUE_MAX_WAITERS(后续全部 queue_full)。
+      waiters.delete(args.sessionKey)
+      return { status: 'ok' }
+    }
     const preAdmitted = waiters.has(args.sessionKey)
     if (!preAdmitted && waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) {
       return { status: 'queue_full', blocked: first }
@@ -11438,6 +11447,27 @@ export class Gateway {
     } finally {
       waiters.delete(args.sessionKey)
     }
+  }
+
+  /**
+   * SM: undo whatever `_admitDelegateCreate` reserved for this input (running slot or
+   * waiter entry) when `_runDelegateTaskCore` rejects BEFORE reaching the capacity gate
+   * (depth / per-turn guard / agent not found / catalog reject / team-review 409 …).
+   *
+   * 2026-09-06 事故:这些早退路径原本不释放 → `_activeDelegations` 与 per-parent 计数
+   * 只增不减(6 个 MODEL_CATALOG_UNAVAILABLE 拒绝 = 6 个幽灵槽位),随后所有委派
+   * `too many concurrent delegations (in-use 7/7)` 等满 300s 后 429。
+   * Idempotent:释放后清 flag,重复调用无副作用(与 gate 后的 finally 释放互斥)。
+   */
+  private _releasePreadmittedDelegateCapacity(input: RunDelegateInput): void {
+    if (input.capacityReserved) {
+      this._releaseDelegateSlot(input.capacitySlotOpts)
+      input.capacityReserved = false
+    }
+    if (input.capacitySlotOpts && input.sessionKey) {
+      this._delegateQueueWaiters?.delete(input.sessionKey)
+    }
+    input.capacitySlotOpts = undefined
   }
 
   /**
@@ -11870,6 +11900,7 @@ export class Gateway {
           })
         }
         runInput.capacityReserved = admit === 'slot'
+        runInput.capacitySlotOpts = slotOpts
       }
       const created = store.create(targetAgentId, {
         sessionKey: resume.sessionKey,
@@ -12202,6 +12233,9 @@ export class Gateway {
       return result
     } finally {
       if (input._leaseTimer) clearInterval(input._leaseTimer)
+      // 任何早退(rejected return 或 throw)都在这里归还 SM 预占的槽位/waiter;过闸后
+      // 预占已被消费(core 内清 flag),此调用为空操作 → 不会双重释放。
+      this._releasePreadmittedDelegateCapacity(input)
       await this._completeDelegateResumeClaim(input, sessionSpawned)
     }
   }
@@ -12529,7 +12563,13 @@ export class Gateway {
     // 时非空;cron/webhook 父 null → 只受全局闸)。review 委派豁免分桶、走保留槽。slotOpts 是
     // 预占/释放的对称口径,过闸后所有释放路径必须用它(否则 per-parent 运行计数漂移锁死)。
     const parentBucketKey = delegateParent?.sessionKey
-    const slotOpts = { parentBucketKey, isReview }
+    // SM 预占(_admitDelegateCreate)用的是 HTTP 层的 raw parentSessionKey;若父会话此刻已
+    // 不在内存(delegateParent null)会解析出不同的桶键 → 释放必须沿用预占时的 opts,否则
+    // per-parent 计数只增不减。未预占时才按本地解析口径预占/释放。
+    const slotOpts =
+      input.capacityReserved && input.capacitySlotOpts
+        ? input.capacitySlotOpts
+        : { parentBucketKey, isReview }
 
     // ── 资源闸有界排队(并发上限 + 内存水位共用 _waitForDelegateCapacity 收口)──
     // 父→子注册必须先于等待:排队期间用户 Stop 级联(_interruptDelegationsForParent)
@@ -12539,7 +12579,12 @@ export class Gateway {
       sessionKey,
     )
     let queuedNoticeSent = false
-    const gate = input.capacityReserved
+    // 过闸即接管:预占槽位的释放责任从 input(早退 finally)转到本函数的 slotOpts 释放路径;
+    // 'wait' 预占的 waiter 条目由 _waitForDelegateCapacity 自己的 finally 删除。
+    const preReserved = input.capacityReserved === true
+    input.capacityReserved = false
+    input.capacitySlotOpts = undefined
+    const gate = preReserved
       ? ({ status: 'ok' } as const)
       : await this._waitForDelegateCapacity({
       sessionKey,

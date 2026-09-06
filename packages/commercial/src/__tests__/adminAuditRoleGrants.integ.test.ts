@@ -13,8 +13,9 @@
  *   Part 1(自足,连库即跑):对临时角色跑 fn_model_authority_grant_admin_role,查
  *     information_schema.role_table_grants / column_privileges 断言拿到 admin_audit
  *     INSERT + SELECT(id) —— 直接验证 model_admin 的**授权函数**契约。
- *   Part 2(部署角色,0164 前 skip):枚举真实部署角色 openclaude_app / openclaude_model_admin,
- *     存在才断言其能写 admin_audit(属主 或 显式 INSERT);不存在则 skip 并注明依赖。
+ *   Part 2(部署角色):枚举真实部署角色 openclaude_app / openclaude_model_admin,断言其能写
+ *     admin_audit(属主 或 显式 INSERT)。测试库无安装 runbook → before() 按 runbook 临时建角色
+ *     (2026-09-06 OCV5-123:nightly G2 钉死 skipped=0,原"缺席则 skip"在 0164 合入后已是死分支)。
  *
  * ⚠ 合并顺序依赖:批A 的迁移 0164 补 model_admin 的 grant。0164 合并前,本 worktree 无 0164、
  * 部署角色也未建 → Part 2 走 skip(不误红);Part 1 自足验证授权函数,现在即绿。
@@ -25,6 +26,9 @@
  */
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
@@ -76,10 +80,13 @@ before(async () => {
   await resetTestSchemaForTest();
   await runMigrations();
   migrated = true;
+  await provisionDeploymentRolesIfAbsent();
 });
 
 after(async () => {
-  if (pgAvailable) await closePool();
+  if (!pgAvailable) return;
+  await dropProvisionedRoles();
+  await closePool();
 });
 
 function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
@@ -108,6 +115,44 @@ async function hasColumnSelect(role: string, column: string): Promise<boolean> {
     [role, column],
   );
   return Number(r.rows[0]?.n ?? "0") > 0;
+}
+
+/**
+ * 0164 已于 2026-07 合入,但 CI 测试库从不跑安装 runbook,部署角色永远缺席 → Part2 从未激活。
+ * nightly integ 门 G2 钉死 skipped 必须为 0(OCV5-123 N2C 首跑即撞)。这里按 0144 尾 runbook +
+ * migration0164.integ.test.ts 的同一路径把两个部署角色在测试库临时建出来:
+ *   - openclaude_app:runbook 里 `GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES ... TO openclaude_app`
+ *     + fn_model_authority_grant_app_role(生产里它还是属主;这里用显式 INSERT 复刻可写性);
+ *   - openclaude_model_admin:CREATE ROLE 后重放 0164,让 DO 块经 fn_model_authority_grant_admin_role 落地授权。
+ * 只建缺席的角色并在 after 里 DROP OWNED + DROP ROLE;已存在的(本机跑过 runbook)一律不动。
+ */
+const provisionedRoles: string[] = [];
+const here = path.dirname(fileURLToPath(import.meta.url));
+const MIGRATION_0164 = path.resolve(here, "../db/migrations/0164_admin_audit_model_admin_grant.sql");
+
+async function provisionDeploymentRolesIfAbsent(): Promise<void> {
+  for (const { role } of ADMIN_AUDIT_WRITER_ROLES) {
+    if (await roleExists(role)) continue;
+    await query(`CREATE ROLE ${role} NOLOGIN`);
+    provisionedRoles.push(role);
+    await query(`GRANT USAGE ON SCHEMA public TO ${role}`);
+    if (role === "openclaude_app") {
+      await query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+      await query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
+      await query(`SELECT fn_model_authority_grant_app_role($1)`, [role]);
+    }
+  }
+  if (provisionedRoles.includes("openclaude_model_admin")) {
+    // role 存在后重放 0164:DO 块此时才真正 PERFORM fn_model_authority_grant_admin_role。
+    await query(await readFile(MIGRATION_0164, "utf8"));
+  }
+}
+
+async function dropProvisionedRoles(): Promise<void> {
+  for (const role of provisionedRoles.splice(0)) {
+    await query(`DROP OWNED BY ${role}`).catch(() => {});
+    await query(`DROP ROLE IF EXISTS ${role}`).catch(() => {});
+  }
 }
 
 async function roleExists(role: string): Promise<boolean> {
@@ -172,14 +217,10 @@ describe("角色 × admin_audit 写权限契约", () => {
     }
   });
 
-  test("Part2: 部署角色(app / model_admin)能写 admin_audit —— 存在才断言,缺失则 skip(依赖批A 0164)", async (t) => {
+  test("Part2: 部署角色(app / model_admin)能写 admin_audit(测试库按 runbook 临时建角色;0164 已合入)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const skipped: string[] = [];
     for (const { role, access } of ADMIN_AUDIT_WRITER_ROLES) {
-      if (!(await roleExists(role))) {
-        skipped.push(role);
-        continue;
-      }
+      assert.equal(await roleExists(role), true, `部署角色 ${role} 应由 before() 按 runbook 建出;缺席是夹具 bug,不再 skip`);
       const owner = await isTableOwner(role);
       const insert = await hasInsertGrant(role);
       const ok = access === "grant" ? insert : owner || insert;
@@ -188,13 +229,6 @@ describe("角色 × admin_audit 写权限契约", () => {
         true,
         `部署角色 ${role} 无法写 admin_audit(owner=${owner} insert=${insert});` +
           `admin 路由经该角色 writeAdminAudit 会 permission denied → 事务回滚(2026-07-16 同类事故)`,
-      );
-    }
-    if (skipped.length > 0) {
-      // 0164 合并前部署角色未建 → 显式记录跳过原因,不误报绿也不误报红。
-      t.skip(
-        `部署角色 ${skipped.join(", ")} 在测试库不存在(未跑安装 runbook / 批A 0164 未合并);` +
-          `合并顺序 A 先 D 后:0164 到位后本断言自动激活。Part1 已自足验证授权函数契约。`,
       );
     }
   });

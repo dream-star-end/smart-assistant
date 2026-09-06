@@ -7910,7 +7910,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     });
   });
 
-  test("retry migrates a persisted GPT-5.5 routing snapshot to Sol", () => {
+  test("retry migrates a persisted GPT-5.5 routing snapshot to Astra", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -7933,12 +7933,12 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       .find((payload) => payload.clientMessageId === userMessage.id && typeof payload.idempotencyKey === "string" && payload.idempotencyKey.endsWith(":1"));
     expect(retry.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMessage.id, 1));
     expect(retry).toMatchObject({
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       effortLevel: "high",
       teamMode: true,
     });
-    expect(session._lastRouting?.model).toBe("gpt-5.6-sol");
-    expect((userMessage as ChatMessage)._routing?.model).toBe("gpt-5.6-sol");
+    expect(session._lastRouting?.model).toBe("gpt-6-astra");
+    expect((userMessage as ChatMessage)._routing?.model).toBe("gpt-6-astra");
   });
 
   test("retry preserves explicit null effort so a warm runner returns to the model default", () => {

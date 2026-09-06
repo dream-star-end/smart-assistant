@@ -266,6 +266,11 @@ export const TOOLS = [
           description:
             '可选:续跑上一轮同成员委派。值必须是该工具上次返回的 sessionKey;缺省仍新开会话。',
         },
+        allowSelf: {
+          type: 'boolean',
+          description:
+            '可选:允许 agentId 与你自己相同(默认拒绝自委派)。仅在「同一成员换 model 跑一份」这类确有必要的场景传 true;通常应改派其他成员。',
+        },
       },
       required: ['goal'],
     },
@@ -318,6 +323,10 @@ export const TOOLS = [
               resumeSessionKey: {
                 type: 'string',
                 description: '可选:续跑该子任务上一轮 sessionKey(同 delegate_task)。',
+              },
+              allowSelf: {
+                type: 'boolean',
+                description: '可选:允许该子任务 agentId 与你自己相同(同 delegate_task,默认拒绝)。',
               },
             },
             required: ['goal'],

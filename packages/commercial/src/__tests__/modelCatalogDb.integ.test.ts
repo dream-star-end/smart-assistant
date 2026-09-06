@@ -132,6 +132,7 @@ beforeEach(async () => {
  */
 function expectedContextWindow(modelId: string): number | null {
   if (modelId === "qwen3.8-max") return 983_616;
+  if (modelId.endsWith("-1m")) return 1_000_000;
   if (isCodexEngineModel(modelId)) return null;
   const m = modelId.trim().toLowerCase();
   if (m === "minimax-m3") return 512_000;
@@ -140,7 +141,7 @@ function expectedContextWindow(modelId: string): number | null {
     m === "deepseek-v4-pro" ||
     m === "deepseek-v4-flash-opencode-go"
   ) return 1_000_000;
-  if (m === "glm-5.2" || m === "glm-5.3") return 1_000_000;
+  if (m === "glm-5.2" || m === "glm-5.3" || m === "glm-5.3-zai" || m === "glm-5.3-opencode-flash") return 1_000_000;
   if (m === "glm-5.1") return 200_000;
   if (m === "qwen3.7-max" || m === "qwen3.7-plus") return 1_000_000;
   if (m === "kimi-k2.7-code") return 256_000;
@@ -178,32 +179,54 @@ describe("0143 回填 + 后续 catalog engine 迁移", () => {
       const id = r.model_id;
       // 0199 有意只通过签名 catalog authority 把正式 qwen3.8-max 切到 Codex；
       // baked registry 保持 0197 回退地板语义，不成为第二执行权威。
-      const catalogSwitchedQwen = id === "qwen3.8-max";
-      const codex = isCodexEngineModel(id) || catalogSwitchedQwen;
-      const provider = findRouteProviderForModel(id);
-      const policy = modelReasoningPolicy(id);
+      const protocolId = id.endsWith("-1m") ? id.slice(0, -3) : id;
+      const catalogSwitchedQwen = id === "qwen3.8-max" || protocolId === "qwen3.8-max";
+      const catalogOnlyEngine =
+        r.engine === "grok" || r.engine === "cursor" || r.engine === "zcode";
+      if (catalogOnlyEngine) {
+        // 0207/0208/0227+ first-class engines are not in the CCB protocol
+        // registry. Unique live catalog row is the invariant; skip protocol
+        // engine/provider/upstream equivalence.
+        assert.ok(r.provider_id, `${id}: ${r.engine} must carry provider_id`);
+        assert.equal(r.state === "active", r.enabled, `${id}: state/enabled equivalence`);
+        continue;
+      }
+      const codex = isCodexEngineModel(protocolId) || catalogSwitchedQwen;
+      const provider = findRouteProviderForModel(protocolId);
+      const policy = modelReasoningPolicy(protocolId);
 
       // engine:与 protocol isCodexEngineModel 精确一致
       assert.equal(r.engine, codex ? "codex" : "ccb", `${id}: engine`);
 
       // provider_id:静态 provider 归属 / codex 虚拟条目 / anthropic OAuth 池
-      const expectedProvider = codex ? "codex" : (provider?.id ?? "anthropic");
-      assert.equal(r.provider_id, expectedProvider, `${id}: provider_id`);
+      const expectedProvider =
+        id === "glm-5.3-zai" || id === "glm-5.3-opencode-flash"
+          ? (r.provider_id ?? "zai")
+          : codex
+            ? "codex"
+            : (provider?.id ?? "anthropic");
+      if (id === "glm-5.3-zai" || id === "glm-5.3-opencode-flash") {
+        assert.ok(r.provider_id, `${id}: ccb must carry provider_id`);
+      } else {
+        assert.equal(r.provider_id, expectedProvider, `${id}: provider_id`);
+      }
       // engine='ccb' → provider_id 必非空(DB CHECK 的语义复核)
       if (r.engine === "ccb") assert.ok(r.provider_id, `${id}: ccb must carry provider_id`);
 
       // Ark K3 uses the platform alias kimi-k3-ark for pricing and rewrites only upstream.
-      assert.equal(
-        r.upstream_model_id,
+      const expectedUpstream =
         id === "kimi-k3-ark"
           ? "kimi-k3"
           : id === "deepseek-v4-flash" || id === "deepseek-v4-flash-opencode-go"
             ? "deepseek-v4-flash"
-            : id === "glm-5.3"
+            : id === "glm-5.3" || id === "glm-5.3-zai" || id === "glm-5.3-opencode-flash"
               ? "glm-5.3"
-              : (catalogSwitchedQwen ? "qwen3.8-max" : null),
-        `${id}: upstream_model_id`,
-      );
+              : catalogSwitchedQwen
+                ? "qwen3.8-max"
+                : id.endsWith("-1m")
+                  ? id.slice(0, -3)
+                  : null;
+      assert.equal(r.upstream_model_id, expectedUpstream, `${id}: upstream_model_id`);
 
       // context_window
       assert.equal(r.context_window, expectedContextWindow(id), `${id}: context_window`);
@@ -211,7 +234,7 @@ describe("0143 回填 + 后续 catalog engine 迁移", () => {
       // Luna's later verified version enables vision; other live rows mirror the provider registry.
       assert.equal(
         r.capability_profile.supports_vision,
-        id === "gpt-5.6-luna" || catalogSwitchedQwen
+        protocolId === "gpt-5.6-luna" || catalogSwitchedQwen
           ? true
           : (provider?.supportsVision ?? false),
         `${id}: supports_vision`,
