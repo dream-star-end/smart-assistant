@@ -124,7 +124,7 @@ function compileSnapshotGuardHarness(
 
 describe('official Zhihu Plugin', () => {
   test('pins the current artifact and compiles a stable hash', () => {
-    assert.equal(ZHIHU_PLUGIN_VERSION, '1.1.0')
+    assert.equal(ZHIHU_PLUGIN_VERSION, '1.1.1')
     assert.equal(ZHIHU_DRIVER_VERSION, ZHIHU_PLUGIN_VERSION)
     assert.equal(ZHIHU_LAUNCHER_VERSION, ZHIHU_PLUGIN_VERSION)
     assert.match(COMPILED_ZHIHU_PLUGIN.artifactHash, /^[0-9a-f]{64}$/)
@@ -515,6 +515,7 @@ describe('official Zhihu Plugin', () => {
     assert.match(ZHIHU_WORKER_SOURCE, /disable-blink-features=AutomationControlled/)
     assert.match(ZHIHU_WORKER_SOURCE, /Accept-Language/)
     assert.match(ZHIHU_WORKER_SOURCE, /nav\.arrive/)
+    assert.match(ZHIHU_WORKER_SOURCE, /home-stuck/)
     assert.match(ZHIHU_WORKER_SOURCE, /browser\.launch/)
     assert.match(ZHIHU_WORKER_SOURCE, /login\.self_token/)
     assert.match(ZHIHU_WORKER_SOURCE, /humanPause/)
