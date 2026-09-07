@@ -378,3 +378,105 @@ test('paths.home is the default OPENCLAUDE_HOME for grok/zcode probes', () => {
   // Sanity: the module must not throw when env is unset and paths.home exists.
   assert.equal(typeof paths.home, 'string')
 })
+
+// ── 2026-09-07 STALE_RESUME_ID loop: engine-refused ids must not be re-promoted ──
+
+type BreakerInternals = Internals & {
+  _resumeRejectedIds: Map<string, Set<string>>
+  _markResumeRejected: (key: string, id: string | undefined | null) => void
+  _markResumeRejectedFromError: (
+    key: string,
+    errorDetail: string | undefined,
+    liveId: string | null | undefined,
+  ) => string[]
+  _resolveDurableResumeId: (
+    sessionKey: string,
+    provider: string,
+    head: string | undefined,
+    workspacePath?: string,
+    opts?: { exclude?: string; syncRunner?: boolean },
+  ) => string | undefined
+}
+
+test('extractRejectedResumeIds pulls the refused id out of CCB / zcode error text', () => {
+  const ccb = JSON.stringify({
+    subtype: 'error_during_execution',
+    errors: [`No conversation found with session ID: ${OLD}`],
+  })
+  assert.deepEqual(SessionManager.extractRejectedResumeIds(ccb), [OLD])
+  assert.deepEqual(
+    SessionManager.extractRejectedResumeIds('Session not found: sess_AbC123456789'),
+    ['sess_abc123456789'],
+  )
+  assert.deepEqual(SessionManager.extractRejectedResumeIds(undefined), [])
+  assert.deepEqual(SessionManager.extractRejectedResumeIds('API Error: ECONNRESET'), [])
+})
+
+test('circuit breaker: id CCB refused is excluded from the ladder even though its JSONL exists elsewhere', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-ladder-breaker-'))
+  const configDir = join(dir, 'claude-config')
+  // Transcript is on disk — under a project dir for a DIFFERENT cwd. The probe
+  // says "resumable"; CCB (looking only under the current cwd) said no.
+  const otherCwdProj = join(configDir, 'projects', '-home-agent--openclaude-workspace-sessions-webmtqk468nmfkvrb')
+  mkdirSync(otherCwdProj, { recursive: true })
+  writeFileSync(join(otherCwdProj, `${OLD}.jsonl`), '{"type":"user"}\n')
+  try {
+    await withEnv({ CLAUDE_CONFIG_DIR: configDir }, async () => {
+      const m = newManager(dir) as BreakerInternals
+      const key = 'agent:main:webchat:dm:webmtqk468nmfkvrb'
+      // State right after the crash: CCB minted DEAD for the failed spawn, OLD
+      // (the refused id) sits on the history ladder.
+      m._resumeMap.set(key, `sand-ccb:${DEAD}`)
+      m._resumeMapProvider.set(key, 'cursor')
+      m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`])
+
+      // Before the fix: ladder re-promotes sand-ccb:OLD → infinite loop.
+      assert.equal(
+        m._resolveDurableResumeId(key, 'cursor', undefined, undefined, { exclude: `sand-ccb:${DEAD}` }),
+        `sand-ccb:${OLD}`,
+      )
+      // Reset to crash-time state and apply the breaker as finalizeTurn does.
+      m._resumeMap.set(key, `sand-ccb:${DEAD}`)
+      m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`])
+      const marked = m._markResumeRejectedFromError(
+        key,
+        JSON.stringify({ errors: [`No conversation found with session ID: ${OLD}`] }),
+        `sand-ccb:${DEAD}`,
+      )
+      assert.deepEqual(marked, [`sand-ccb:${OLD}`])
+      // history entry is gone immediately…
+      assert.equal(m._resumeMapHistory.has(key), false)
+      // …and even if something pushes it back, the ladder refuses it.
+      m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`, `sand-ccb:${OLDER}`])
+      m._markResumeRejected(key, `sand-ccb:${DEAD}`)
+      assert.equal(
+        m._resolveDurableResumeId(key, 'cursor', undefined, undefined, { exclude: `sand-ccb:${DEAD}` }),
+        undefined,
+        'nothing resumable is left → caller drops to history replay instead of looping',
+      )
+      // _pushResumeHistory ignores rejected ids too (the session_id handler path).
+      m._resumeMapHistory.delete(key)
+      m._pushResumeHistory(key, `sand-ccb:${OLD}`)
+      assert.equal(m._resumeMapHistory.has(key), false)
+      m._pushResumeHistory(key, `sand-ccb:${OLDER}`)
+      assert.deepEqual(m._resumeMapHistory.get(key), [`sand-ccb:${OLDER}`])
+      // A head that is itself rejected is not returned even when its file exists.
+      m._resumeMap.set(key, `sand-ccb:${OLD}`)
+      assert.equal(m._resolveDurableResumeId(key, 'cursor', `sand-ccb:${OLD}`), undefined)
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('circuit breaker: rejected set is bounded per session', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-ladder-breaker-bound-'))
+  try {
+    const m = newManager(dir) as BreakerInternals
+    for (let i = 0; i < 40; i++) m._markResumeRejected('k', `id-${i}`)
+    assert.ok((m._resumeRejectedIds.get('k')?.size ?? 0) <= 16)
+    assert.equal(m._resumeRejectedIds.get('k')?.has('id-39'), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

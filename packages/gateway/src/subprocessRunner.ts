@@ -25,6 +25,7 @@ import {
   waitForCloseWithin,
 } from './processGroupShutdown.js'
 import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
+import { relocateCcbJsonlToCwd } from './engine/ccbTranscriptRelocate.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext } from './promptSlots.js'
@@ -1492,6 +1493,29 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     const restrictedMemorySources = isV3ContainerRuntime()
+    // Claude Code resolves `--resume <uuid>` ONLY under
+    // `$CLAUDE_CONFIG_DIR/projects/<sanitize(cwd)>/`. Our resume-map probe
+    // (`ccbJsonlArtifact`) scans every project dir, so the two disagree the
+    // moment a session's spawn cwd changes between turns (isolated_v1 unbound
+    // first turn → project-bound follow-up; repo clone becoming ready; desktop
+    // OPENCLAUDE_ENGINE_CWD). Make the transcript visible where CCB will look
+    // before we hand it the id, otherwise CCB exits 1 with "No conversation
+    // found" and the gateway loops on STALE_RESUME_ID (2026-09-07 incident).
+    // Docker backend pins cwd to /workspace inside the container; the host
+    // projection would be meaningless there, so only the local backend runs it.
+    const spawnCwd = learningContext.workingDir ?? effectiveAddDir
+    const backendType = this.opts.config.terminal?.type ?? 'local'
+    if (this.currentSessionId && !this.opts.hermeticNoTools && backendType === 'local') {
+      const relocation = relocateCcbJsonlToCwd({ innerId: this.currentSessionId, cwd: spawnCwd })
+      if (relocation?.relocated) {
+        runnerLog.info('resume transcript relocated for spawn cwd', {
+          sessionKey: this.opts.sessionKey,
+          resumeId: this.currentSessionId,
+          from: relocation.from,
+          cwd: spawnCwd,
+        })
+      }
+    }
     const args = harness === 'official-cc'
       ? buildOfficialClaudeCliArgs({
           model: this.opts.model,
