@@ -1607,6 +1607,7 @@ export class SubprocessRunner extends EventEmitter {
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
           ...finalizedProviderEnv,
+          OC_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
           ...(this.delegateContextFile

@@ -531,6 +531,7 @@ export const commercialConfigSchema = z
     INTERNAL_CONTROL_BIND: internalControlBind,
     INTERNAL_CONTROL_PORT: internalControlPort,
     OC_EGRESS_SECRET: egressSecret,
+    OC_LEASE_CALLBACK_SECRET: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     OC_RUNTIME_IMAGE: ocRuntimeImage,
     // V5 runtime tuple 热生效改造(见上方各字段定义)。
     OC_RUNTIME_IMAGE_ID: ocRuntimeImageId,

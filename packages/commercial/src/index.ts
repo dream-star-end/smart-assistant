@@ -346,6 +346,8 @@ import {
   type PromptQueueHandler,
 } from "./http/internalPromptQueue.js";
 import { PgPromptQueueStore } from "./promptQueue/pgPromptQueueStore.js";
+import { LEASE_CALLBACK_PATH, LEASE_CALLBACK_VALIDATE_PATH, makeLeaseCallbackHandler } from "./http/internalLeaseCallback.js";
+import { lookupLeaseCallbackSession } from "./db/pgSessionsBackend.js";
 import {
   COST_EVENT_PATH,
   makeCostEventHandler,
@@ -2949,10 +2951,24 @@ export async function registerCommercial(
           leadership: currentLeadership(),
         });
       };
+      const leaseCallbackHandler = makeLeaseCallbackHandler({
+        secret: cfg.OC_LEASE_CALLBACK_SECRET,
+        lookupSession: (uid, sid) => lookupLeaseCallbackSession(getPool(), uid, sid),
+        inject: (input) => cronOriginBridgeRef
+          ? cronOriginBridgeRef.injectCronOriginTurn(input)
+          : Promise.resolve({ kind: "no_transport" as const }),
+      });
       // 请求 dispatcher 闭包(VIP+私有双 listener 与单 listener 共用)。
       const internalRequestHandler = (req: IncomingMessage, res: ServerResponse): void => {
         // P3 控制端点前置拦截(GET /healthz、GET /internal/v5/control-probe)。
         const urlPath = (req.url ?? "").split("?")[0];
+        if (urlPath === LEASE_CALLBACK_PATH || urlPath === LEASE_CALLBACK_VALIDATE_PATH) {
+          void leaseCallbackHandler(req, res, urlPath === LEASE_CALLBACK_VALIDATE_PATH).catch(() => {
+            if (!res.headersSent) res.statusCode = 503;
+            res.end();
+          });
+          return;
+        }
         if (req.method === "GET" && urlPath === "/healthz") {
           try { respondControlHealthz(res); } catch { /* socket gone */ }
           return;
