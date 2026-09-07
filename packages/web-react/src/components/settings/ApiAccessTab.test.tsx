@@ -46,6 +46,8 @@ import { createMemoryAuthSession } from "../../lib/authSession";
 import { ApiAccessTab, ApiKeyUsagePanel } from "./ApiAccessTab";
 import { buildCcSwitchDeepLink, limitPercent, pickDefaultModel } from "./ApiKeysSection";
 
+const COMPLETE_KEY = `oc-cc.abcd1234.${"a1".repeat(24)}`;
+
 const auth: AuthSession = createMemoryAuthSession(() => {}, "t");
 
 /** 密钥列表中某一行(用 data-api-key-id 定位,避免与消耗统计表里同名文本撞车)。 */
@@ -157,7 +159,11 @@ const PUBLIC_MODELS = {
   models: [
     { id: "cursor-fable-5.1-high", display_name: "Fable 5.1 High", engine: "cursor" as const },
     { id: "cursor-sonnet-5-high", display_name: "Sonnet 5 High", engine: "cursor" as const },
-    { id: "cursor-gemini-3.8-flash-low", display_name: "Gemini 3.8 Flash Low", engine: "cursor" as const },
+    {
+      id: "cursor-gemini-3.8-flash-low",
+      display_name: "Gemini 3.8 Flash Low",
+      engine: "cursor" as const,
+    },
     { id: "gpt-6-astra", display_name: "GPT-6 Astra", engine: "codex" as const },
   ],
   lockedModels: [],
@@ -190,12 +196,18 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
   test("首选在列表里就用首选;列表缺失/为空用首选兜底;否则按家族正则退到列表项", () => {
     expect(pickDefaultModel(null, "fable-5.1-high")).toBe("fable-5.1-high");
     expect(pickDefaultModel([], "fable-5.1-high")).toBe("fable-5.1-high");
-    expect(pickDefaultModel(["sonnet-5-high", "fable-5.1-high"], "fable-5.1-high")).toBe("fable-5.1-high");
-    expect(pickDefaultModel(["sonnet-5-high", "opus-5-high"], "fable-5.1-high", /^(fable|opus)-/)).toBe("opus-5-high");
-    expect(pickDefaultModel(["sonnet-5-high"], "fable-5.1-high", /^(fable|opus)-/)).toBe("sonnet-5-high");
+    expect(pickDefaultModel(["sonnet-5-high", "fable-5.1-high"], "fable-5.1-high")).toBe(
+      "fable-5.1-high",
+    );
+    expect(
+      pickDefaultModel(["sonnet-5-high", "opus-5-high"], "fable-5.1-high", /^(fable|opus)-/),
+    ).toBe("opus-5-high");
+    expect(pickDefaultModel(["sonnet-5-high"], "fable-5.1-high", /^(fable|opus)-/)).toBe(
+      "sonnet-5-high",
+    );
   });
 
-  test("深链走 ccswitch://v1/import,URL 编码,apiKey 仅在提供时带上,不出现 cursor", () => {
+  test("深链拒绝缺失/掩码/不完整密钥,有效密钥按 CC Switch V1 编码", () => {
     const base = {
       origin: "https://x.example",
       name: "从简",
@@ -205,21 +217,21 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
       haikuModel: "gemini-3.8-flash-low",
     };
     const noKey = buildCcSwitchDeepLink(base);
-    expect(noKey.startsWith("ccswitch://v1/import?")).toBe(true);
-    const p = new URLSearchParams(noKey.slice(noKey.indexOf("?") + 1));
+    expect(noKey).toBeNull();
+    for (const apiKey of ["", "  ", "oc-cc.<你的密钥>", "oc-cc.abcd1234.ff", "****"]) {
+      expect(buildCcSwitchDeepLink({ ...base, apiKey })).toBeNull();
+    }
+    const withKey = buildCcSwitchDeepLink({ ...base, apiKey: ` ${COMPLETE_KEY}\n` })!;
+    expect(withKey.startsWith("ccswitch://v1/import?")).toBe(true);
+    const p = new URL(withKey).searchParams;
     expect(p.get("resource")).toBe("provider");
     expect(p.get("app")).toBe("claude");
     expect(p.get("name")).toBe("从简");
     expect(p.get("endpoint")).toBe("https://x.example/api/anthropic");
     expect(p.get("model")).toBe("fable-5.1-high");
     expect(p.get("haikuModel")).toBe("gemini-3.8-flash-low");
-    expect(p.has("apiKey")).toBe(false);
-    expect(noKey).not.toMatch(/cursor/i);
-
-    const withKey = buildCcSwitchDeepLink({ ...base, apiKey: "oc-cc.abcd1234.ff" });
-    expect(new URLSearchParams(withKey.slice(withKey.indexOf("?") + 1)).get("apiKey")).toBe(
-      "oc-cc.abcd1234.ff",
-    );
+    expect(p.get("apiKey")).toBe(COMPLETE_KEY);
+    expect(withKey).not.toMatch(/cursor/i);
   });
 });
 
@@ -253,7 +265,7 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     expect(env.textContent).toContain(`ANTHROPIC_BASE_URL=${window.location.origin}/api/anthropic`);
     expect(env.textContent).toContain("ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet-5-high");
     expect(env.textContent).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-3.8-flash-low");
-    expect(env.textContent).toContain("ANTHROPIC_AUTH_TOKEN=oc-cc.<你的密钥>");
+    expect(env.textContent).toContain("ANTHROPIC_AUTH_TOKEN='oc-cc.<你的密钥>");
 
     // CC Switch JSON 配置:同一组值。
     const cfg = JSON.parse(screen.getByTestId("ccswitch-config").textContent ?? "{}") as {
@@ -263,14 +275,11 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     expect(cfg.env.ANTHROPIC_MODEL).toBe("fable-5.1-high");
     expect(cfg.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("gemini-3.8-flash-low");
 
-    // 深链:未创建密钥时不带 apiKey。
-    const link = screen.getByTestId("ccswitch-deeplink") as HTMLAnchorElement;
-    expect(link.getAttribute("href")).toMatch(/^ccswitch:\/\/v1\/import\?/);
-    expect(link.getAttribute("href")).toContain("resource=provider");
-    expect(link.getAttribute("href")).toContain("model=fable-5.1-high");
-    expect(link.getAttribute("href")).not.toContain("apiKey=");
-    expect(screen.getByText(/不含密钥/)).toBeInTheDocument();
-
+    // 缺少明文时不生成可点击的坏链接,也不让用户到接收端才发现错误。
+    const link = screen.getByTestId("ccswitch-deeplink");
+    expect(link).toBeDisabled();
+    expect(link).not.toHaveAttribute("href");
+    expect(screen.getByText(/请先创建新密钥或粘贴已有的完整密钥/)).toBeInTheDocument();
     // 模型查询接口地址出现在教程里。
     expect(
       screen.getAllByText(`${window.location.origin}/api/anthropic/v1/models`).length,
@@ -287,7 +296,7 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     vi.mocked(api.createApiKey).mockResolvedValue({
       id: "13",
       label: "new-one",
-      keyPrefix: "oc-cc.zzzz",
+      keyPrefix: "zzzz9999",
       plaintext: "oc-cc.zzzz9999.0123456789abcdef0123456789abcdef0123456789abcdef",
       createdAt: "2026-09-07T00:00:00.000Z",
     });
@@ -300,7 +309,70 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     const link = screen.getByTestId("ccswitch-deeplink") as HTMLAnchorElement;
     expect(link.getAttribute("href")).toContain("apiKey=oc-cc.zzzz9999.");
     expect(screen.getByText(/已包含刚创建的密钥/)).toBeInTheDocument();
-    expect(screen.getByTestId("env-snippet").textContent).toContain("ANTHROPIC_AUTH_TOKEN=oc-cc.zzzz9999.");
+    expect(screen.getByTestId("env-snippet").textContent).toContain(
+      "ANTHROPIC_AUTH_TOKEN='oc-cc.zzzz9999.",
+    );
+  });
+
+  test("粘贴已有密钥:完整值导入/复制,显示脱敏,清空后禁用,重新挂载不保存", async () => {
+    const clipboard = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: clipboard },
+      configurable: true,
+    });
+    const view = render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    fireEvent.click(screen.getByRole("tab", { name: "使用已有密钥" }));
+    const input = screen.getByLabelText("完整 API Key");
+    expect(input).toHaveAttribute("type", "password");
+    fireEvent.change(input, { target: { value: "oc-cc.abcd1234.****" } });
+    expect(screen.getByTestId("ccswitch-deeplink")).toBeDisabled();
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    fireEvent.change(input, { target: { value: ` ${COMPLETE_KEY}\n` } });
+    const link = screen.getByTestId("ccswitch-deeplink");
+    expect(new URL(link.getAttribute("href")!).searchParams.get("apiKey")).toBe(COMPLETE_KEY);
+    expect(document.body.textContent).not.toContain(COMPLETE_KEY);
+    const guide = screen.getByTestId("guide-manual-ccswitch");
+    fireEvent.click(within(guide).getByText("手动配置 CC Switch · JSON"));
+    // jsdom 不模拟 details 的 toggle,显式打开以验证同一复制按钮。
+    guide.setAttribute("open", "");
+    fireEvent.click(within(guide).getByRole("button", { name: "复制" }));
+    await waitFor(() => expect(clipboard).toHaveBeenCalled());
+    expect(JSON.parse(clipboard.mock.calls[0][0]).env.ANTHROPIC_AUTH_TOKEN).toBe(COMPLETE_KEY);
+    fireEvent.change(input, { target: { value: "" } });
+    expect(screen.getByTestId("ccswitch-deeplink")).toBeDisabled();
+    fireEvent.change(input, { target: { value: COMPLETE_KEY } });
+    view.unmount();
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    fireEvent.click(screen.getByRole("tab", { name: "使用已有密钥" }));
+    expect(screen.getByLabelText("完整 API Key")).toHaveValue("");
+    expect(screen.getByTestId("ccswitch-deeplink")).not.toHaveAttribute("href");
+  });
+
+  test("已知密钥停用时阻止导入,启用后恢复", async () => {
+    const paused = { ...KEYS[1], keyPrefix: "abcd1234" };
+    vi.mocked(api.listApiKeys).mockResolvedValue([paused]);
+    vi.mocked(api.updateApiKey).mockResolvedValue({ ...paused, disabledAt: null });
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("12");
+    fireEvent.click(screen.getByRole("tab", { name: "使用已有密钥" }));
+    fireEvent.change(screen.getByLabelText("完整 API Key"), { target: { value: COMPLETE_KEY } });
+    expect(screen.getByTestId("ccswitch-deeplink")).toBeDisabled();
+    expect(screen.getByText(/该密钥已停用/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "启用该密钥" }));
+    await waitFor(() => expect(screen.getByTestId("ccswitch-deeplink")).toHaveAttribute("href"));
+  });
+
+  test("创建失败不产生无效链接,显示可重试错误", async () => {
+    vi.mocked(api.createApiKey).mockRejectedValueOnce(new Error("offline"));
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    fireEvent.change(screen.getByPlaceholderText(/新密钥名称/), { target: { value: "MacBook" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+    expect(await screen.findByText("创建失败")).toBeInTheDocument();
+    expect(screen.getByTestId("ccswitch-deeplink")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "创建" })).toBeEnabled();
   });
 
   test("公开模型列表加载失败 → 教程退到静态默认值,不报错", async () => {
@@ -308,7 +380,9 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     render(<ApiAccessTab auth={auth} />);
     await keyRow("11");
     await waitFor(() => expect(api.getPublicModels).toHaveBeenCalled());
-    expect(screen.getByTestId("env-snippet").textContent).toContain("ANTHROPIC_MODEL=fable-5.1-high");
+    expect(screen.getByTestId("env-snippet").textContent).toContain(
+      "ANTHROPIC_MODEL=fable-5.1-high",
+    );
     expect(screen.getAllByText("gemini-3.8-flash").length).toBeGreaterThan(0);
     expect(screen.queryByText("加载 API Key 失败")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/cursor/i);
