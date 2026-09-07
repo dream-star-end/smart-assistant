@@ -148,6 +148,48 @@ describe("消息引用动作与已发送引用块", () => {
   });
 });
 
+describe("UserCard 编辑重发", () => {
+  test("status=replied 时有编辑按钮，点击回传该消息", () => {
+    const onEditResend = vi.fn();
+    const msg = userMsg({ status: "replied", text: "请把这段再改一改" });
+    render(<UserCard msg={msg} cb={{ onEditResend }} />);
+    const btn = screen.getByRole("button", { name: "编辑" });
+    expect(btn).toHaveClass("[@media(hover:none)]:size-11");
+    fireEvent.click(btn);
+    expect(onEditResend).toHaveBeenCalledWith(msg);
+  });
+});
+
+describe("AssistantCard MetaRow 时间", () => {
+  test("助手卡 MetaRow 有 time 元素", () => {
+    const ts = Date.now() - 60_000;
+    render(
+      <AssistantCard
+        msg={{ id: "a-time", role: "assistant", text: "回答正文", ts }}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    const time = document.querySelector("time");
+    expect(time).toBeTruthy();
+    expect(time).toHaveAttribute("datetime", new Date(ts).toISOString());
+  });
+});
+
+describe("AssistantCard 切换模型按钮", () => {
+  test("retry_or_switch 末轮错误卡在有 onOpenModelPicker 时渲染按钮并调用", () => {
+    const onOpenModelPicker = vi.fn();
+    renderErr(errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" }), {
+      onRetrySend: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+      onOpenModelPicker,
+    });
+    const btn = screen.getByRole("button", { name: "切换模型" });
+    fireEvent.click(btn);
+    expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
   test.each([
     ["stopped", "本轮生成已停止。"],

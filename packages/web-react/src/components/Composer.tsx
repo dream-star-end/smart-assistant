@@ -7,6 +7,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
+import { clearDraft, readDraft, writeDraft } from "../lib/composerDraft";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -102,6 +103,8 @@ export function Composer({
   environmentPreparing,
   sendKey = "enter",
   fontSize = "default",
+  lastUserText,
+  draftKey,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -140,6 +143,10 @@ export function Composer({
   sendKey?: "enter" | "mod-enter";
   /** 输入框字号。large 时 17.5px。 */
   fontSize?: "default" | "large";
+  /** 时间线最后一条用户正文；空输入框按 ↑ 填入。 */
+  lastUserText?: string;
+  /** 会话级草稿键；变化时若输入框为空则还原 sessionStorage 草稿。 */
+  draftKey?: string;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -173,8 +180,8 @@ export function Composer({
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
 
-  // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟(reload 会丢 useState 里的
-  // 草稿,composer 草稿当前不持久化)。ref 镜像 state 让探针零依赖渲染闭包。
+  // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟。正文草稿按 draftKey 写入
+  // sessionStorage,但附件/引用仍只在内存,reload 会丢。
   const draftBusyRef = useRef(false);
   draftBusyRef.current = value.trim().length > 0 || attachments.length > 0 || !!replyTo;
   useEffect(() => appUpdate.registerBusyProbe(() => draftBusyRef.current), []);
@@ -212,6 +219,20 @@ export function Composer({
     if (!replyTo) return;
     requestAnimationFrame(() => ref.current?.focus());
   }, [replyTo]);
+
+  useEffect(() => {
+    if (!draftKey) return;
+    setValue((current) => (current === "" ? readDraft(draftKey) : current));
+  }, [draftKey]);
+
+  useEffect(() => {
+    if (!draftKey) return;
+    const timer = window.setTimeout(() => {
+      if (value) writeDraft(draftKey, value);
+      else clearDraft(draftKey);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [draftKey, value]);
 
   const onVoiceText = useCallback((text: string) => {
     setVoiceMsg(null);
@@ -266,6 +287,7 @@ export function Composer({
     if (disabled || !canSend) return;
     onSend(value.trim(), doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
     setValue("");
+    if (draftKey) clearDraft(draftKey);
     for (const a of attachments) revoke(a.previewUrl);
     setAttachments([]);
     onCancelReply?.();
@@ -563,6 +585,17 @@ export function Composer({
               void onFiles(images);
             }}
             onKeyDown={(e) => {
+              if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
+                e.preventDefault();
+                setValue(lastUserText);
+                requestAnimationFrame(() => {
+                  const el = ref.current;
+                  if (!el) return;
+                  const end = lastUserText.length;
+                  el.setSelectionRange(end, end);
+                });
+                return;
+              }
               if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                 // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                 if (coarsePointer) return;

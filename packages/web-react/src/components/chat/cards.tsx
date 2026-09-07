@@ -16,6 +16,7 @@ import {
   Sparkles,
   MessageSquare,
   MessageSquarePlus,
+  Pencil,
   Quote,
   Square,
   Target,
@@ -41,7 +42,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
+import { Alert, Avatar, Badge, Button, IconButton, TimeAgo, TooltipProvider } from "../ui";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
@@ -109,6 +110,10 @@ export type CardCallbacks = {
   resolveInterruptedContinuation?: (error: ChatMessage) => ChatMessage | undefined;
   /** 把 user / assistant 消息的精确快照带回 Composer。 */
   onQuote?: (msg: ChatMessage) => void;
+  /** 把用户原文放回输入框，改完发送即新 turn（不删原消息、不原地替换）。 */
+  onEditResend?: (msg: ChatMessage) => void;
+  /** 打开顶栏模型选择器（红卡「切换模型」）。 */
+  onOpenModelPicker?: () => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -213,9 +218,17 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
   const waived = msg.usage?.waived === true;
   // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
   const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
-  if (!traceId && !showCredits && !waived) return null;
+  const showTime = Boolean(msg.ts);
+  if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
-    <div className="mt-1.5 flex items-center gap-2 text-faint">
+    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-faint">
+      {showTime && (
+        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap">
+          <TooltipProvider>
+            <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+          </TooltipProvider>
+        </time>
+      )}
       {waived && (
         <Badge tone="success" aria-label="本轮已免单">
           <Wallet size={11} /> 已免单
@@ -446,6 +459,16 @@ export function UserCard({
               <Quote size={15} />
             </IconButton>
           )}
+          <IconButton
+            aria-label="编辑"
+            title="编辑"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={() => cb?.onEditResend?.(msg)}
+          >
+            <Pencil size={15} />
+          </IconButton>
         </div>
       )}
     </div>
@@ -566,8 +589,8 @@ export function AssistantCard({
     retryEligible && msg._clientMessageId
       ? cb.resolveRetryTarget?.(msg._clientMessageId)
       : undefined;
-  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」引导。
-  // 模型选择器为非受控 DropdownMenu,无可编程打开入口(见报告),故只留文案不做次按钮。
+  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」。
+  // 有 onOpenModelPicker 时渲染可点按钮打开顶栏受控模型菜单，否则保留引导文案。
   const showSwitchModelHint =
     !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch";
   // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
@@ -786,7 +809,13 @@ export function AssistantCard({
                     </Button>
                   ) : null}
                   {isLastTurn && showSwitchModelHint && (
-                    <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                    cb.onOpenModelPicker ? (
+                      <Button size="sm" variant="ghost" shape="pill" onClick={cb.onOpenModelPicker}>
+                        切换模型
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                    )
                   )}
                 </div>
               )}

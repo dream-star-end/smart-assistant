@@ -394,6 +394,7 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [messageReplyTarget, setMessageReplyTarget] = useState<{
     sessionId: string;
     quote: MessageReplyQuote;
@@ -2161,6 +2162,8 @@ export function App() {
             }
           },
       onRetrySend: demo ? undefined : retrySend,
+      onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
+      onOpenModelPicker: () => setModelPickerOpen(true),
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
       onQuote: demo || !activeId
@@ -2221,6 +2224,23 @@ export function App() {
     messageReplyTarget && messageReplyTarget.sessionId === activeId
       ? messageReplyTarget.quote
       : null;
+
+  let lastUserText: string | undefined;
+  if (demo) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && messages[i].content) {
+        lastUserText = messages[i].content;
+        break;
+      }
+    }
+  } else {
+    for (let i = wsMessages.length - 1; i >= 0; i--) {
+      if (wsMessages[i].role === "user" && wsMessages[i].text) {
+        lastUserText = wsMessages[i].text;
+        break;
+      }
+    }
+  }
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -3127,6 +3147,8 @@ export function App() {
           onSelectEffort={demo ? undefined : setSessionEffort}
           contextTier={contextTier}
           onSelectContextTier={demo ? undefined : setContextTier}
+          modelPickerOpen={modelPickerOpen}
+          onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
@@ -3363,6 +3385,8 @@ export function App() {
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
+            lastUserText={lastUserText}
+            draftKey={activeId ?? "new"}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}

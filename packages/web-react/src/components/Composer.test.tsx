@@ -63,6 +63,44 @@ describe("Composer 输入无障碍", () => {
   });
 });
 
+describe("Composer ↑ 拉上一条用户消息", () => {
+  test("空输入框按 ArrowUp 填入 lastUserText", () => {
+    render(<Composer onSend={() => {}} lastUserText="上一句用户消息" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue("上一句用户消息");
+  });
+
+  test("非空输入框按 ArrowUp 不改动", () => {
+    render(<Composer onSend={() => {}} lastUserText="上一句用户消息" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: "正在写" } });
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue("正在写");
+  });
+});
+
+describe("Composer 草稿持久化", () => {
+  afterEach(() => {
+    sessionStorage.clear();
+    vi.useRealTimers();
+  });
+
+  test("预置 sessionStorage 后挂载带 draftKey 的 Composer，textarea 还原草稿", () => {
+    sessionStorage.setItem("oc_v5_composer_draft:s1", "未发送的草稿");
+    render(<Composer onSend={() => {}} draftKey="s1" />);
+    expect(screen.getByLabelText("消息输入框")).toHaveValue("未发送的草稿");
+  });
+
+  test("输入后 300ms 内 sessionStorage 有值", () => {
+    vi.useFakeTimers();
+    render(<Composer onSend={() => {}} draftKey="s1" />);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "正在输入" } });
+    vi.advanceTimersByTime(300);
+    expect(sessionStorage.getItem("oc_v5_composer_draft:s1")).toBe("正在输入");
+  });
+});
+
 describe("Composer 拖拽上传", () => {
   function fileDt(file?: File, types: string[] = ["Files"]) {
     const files = file ? [file] : [];

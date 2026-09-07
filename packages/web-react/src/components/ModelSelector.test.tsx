@@ -5,7 +5,10 @@ import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  localStorage.clear()
+})
 
 const MODELS: PublicModel[] = [
   { id: 'glm-5.2', display_name: 'GLM-5.2' },
@@ -566,5 +569,76 @@ describe('ModelSelector 「更多 GPT 模型」折叠组(2026-09-05 Terra/Luna)'
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-collapsed-group]')).toBeNull()
     expect(screen.queryByText('更多 GPT 模型')).toBeNull()
+  })
+})
+
+const SEARCH_MODELS: PublicModel[] = Array.from({ length: 8 }, (_, i) => ({
+  id: `plain-search-${i}`,
+  display_name: i === 3 ? 'Zebra Unique' : `Alpha ${i}`,
+}))
+
+describe('ModelSelector 搜索', () => {
+  it('≥8 模型时渲染搜索框，输入后只剩匹配项', async () => {
+    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const input = await screen.findByLabelText('搜索模型')
+    fireEvent.change(input, { target: { value: 'Zebra' } })
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent('Zebra Unique')
+    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(false)
+  })
+
+  it('无匹配时显示「无匹配模型」', async () => {
+    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const input = await screen.findByLabelText('搜索模型')
+    fireEvent.change(input, { target: { value: 'no-such-model-zzz' } })
+    expect(screen.getByText('无匹配模型')).toBeInTheDocument()
+    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
+  })
+
+  it('<8 模型不渲染搜索框', async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.queryByLabelText('搜索模型')).toBeNull()
+  })
+})
+
+describe('ModelSelector 受控开合', () => {
+  it('open 受控为 true 时菜单按 prop 打开', async () => {
+    render(
+      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} open />,
+    )
+    const items = await screen.findAllByRole('menuitem')
+    expect(items.some((i) => i.textContent?.includes('DeepSeek-V4'))).toBe(true)
+  })
+})
+
+describe('ModelSelector 最近使用', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('选过的模型出现在「最近」分组', async () => {
+    const onSelect = vi.fn()
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const target = items.find((i) => i.textContent?.includes('DeepSeek-V4'))
+    expect(target).toBeTruthy()
+    if (target) fireEvent.click(target)
+    expect(onSelect).toHaveBeenCalledWith('deepseek-v4')
+
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const recentLabel = await screen.findByText('最近')
+    expect(recentLabel).toBeInTheDocument()
+    expect(document.querySelector('[data-recent-group="true"]')).toBeTruthy()
+    const recentItem = document.querySelector('[data-recent-group="true"]')
+      ?.parentElement
+      ?.querySelector('[data-model-id="deepseek-v4"]')
+    expect(recentItem).toBeTruthy()
+    expect(recentItem?.textContent).toContain('DeepSeek-V4')
   })
 })
