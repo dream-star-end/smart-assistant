@@ -233,6 +233,7 @@ export function ChatHeader({
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
         {onOpenFind && (
           <IconButton
+            data-product-control
             onClick={onOpenFind}
             aria-label="会话内查找"
             title="会话内查找 (⌘F)"
