@@ -1626,14 +1626,38 @@ egress_slot_flip() {
 
 # reuseport 组里「只有 systemd(pid 1)持有、没有任何 service 进程 accept」的 listener =
 # 黑洞:内核仍会把新连接哈希到它,永远没人 accept。翻转后必须为 0。
+# ss 非 0 / 空输出 / 无法解析的 listener 集合一律 fail-closed:不能先过滤再把
+# 「零孤儿」当成成功(OCV5-161:ss rc=2 或空表曾让 HTTP 重试在黑洞上假绿)。
 egress_assert_no_orphan_listener() {
-  local orphan
-  orphan="$(ss -Hltnp "sport = :${V5_EGRESS_PORT}" 2>/dev/null | grep -E "${V5_EGRESS_BIND}:${V5_EGRESS_PORT}" | grep -vc '"node"' || true)"
-  if [[ "${orphan:-0}" != 0 ]]; then
-    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 有 $orphan 个无进程 accept 的孤儿 listener(旧槽 .socket 未关?)" >&2
-    ss -ltnp "sport = :${V5_EGRESS_PORT}" >&2 || true
+  local ss_out ss_rc=0 line listeners=0
+  ss_out="$(ss -Hltnp "sport = :${V5_EGRESS_PORT}" 2>/dev/null)" || ss_rc=$?
+  if (( ss_rc != 0 )); then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 失败 rc=${ss_rc},无法证明无孤儿 listener" >&2
     return 1
   fi
+  if [[ -z "${ss_out//[$' \t\r\n']/}" ]]; then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 输出为空,无法证明无孤儿 listener" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[$' \t\r']/}" ]] && continue
+    if ! grep -q '^LISTEN' <<<"$line" || ! grep -Eq ":${V5_EGRESS_PORT}([[:space:]]|$)" <<<"$line"; then
+      echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 输出不是有效 listener 集合" >&2
+      printf '%s\n' "$ss_out" >&2
+      return 1
+    fi
+    if ! grep -Eq 'users:\(\("node",pid=[0-9]+' <<<"$line"; then
+      echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 存在无 node 持有者的 listener" >&2
+      ss -ltnp "sport = :${V5_EGRESS_PORT}" >&2 || true
+      return 1
+    fi
+    listeners=$((listeners + 1))
+  done <<<"$ss_out"
+  if (( listeners < 1 )); then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 未解析出有效 listener,无法证明无孤儿" >&2
+    return 1
+  fi
+  return 0
 }
 
 egress_slot_flip_then_master_restart() {

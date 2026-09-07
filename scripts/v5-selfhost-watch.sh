@@ -487,7 +487,7 @@ tier1_rollback() {
   fi
   write_grace
   atomic_flip_live "$prev"
-  restart_egress_for_live
+  restart_egress_for_live || return 1
   timeout 90 bash -c 'until (exec 3<>/dev/tcp/172.31.0.1/18892) 2>/dev/null; do sleep 1; done' || true
   systemctl restart "$WATCH_MASTER_UNIT"
   return 0
@@ -516,7 +516,7 @@ restart_egress_for_live() {
       # 先阻塞关旧 .socket(ignore-dependencies 绕开 Requires 反向传播),再 --no-block 停
       # service:否则 service drain 期间 .socket 仍持有 reuseport 组里一个没人 accept 的
       # listener,约一半新连接被黑洞(2026-09-07 两班列车 egress-health 失败的根因)。
-      systemctl stop --job-mode=ignore-dependencies "${WATCH_EGRESS_SLOT_TPL/@.service/@$cur.socket}" || true
+      systemctl stop --job-mode=ignore-dependencies "${WATCH_EGRESS_SLOT_TPL/@.service/@$cur.socket}" || return 1
       systemctl stop --no-block "${WATCH_EGRESS_SLOT_TPL/@./@$cur.}" || true
     fi
   else
