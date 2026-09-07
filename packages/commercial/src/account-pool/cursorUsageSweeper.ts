@@ -22,8 +22,6 @@
  * the others. A failed refresh leaves the previous numbers in place and
  * records `cursor_usage_error`; a success clears it. Never logs tokens.
  */
-import { rootLogger } from "../logging/logger.js";
-import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
   CursorUsageUnavailableError,
   fetchCursorSessionUsage,
@@ -34,14 +32,18 @@ import { getPool } from "../db/index.js";
 import { getCursorTokenSnapshot, listAccounts, type AccountRow } from "./store.js";
 import { scheduleCursorAuthSync } from "./cursorMaterializer.js";
 import { weightInputsCrossedBucket } from "./poolWeight.js";
+import {
+  USAGE_SWEEP_DEFAULT_INTERVAL_MS,
+  USAGE_SWEEP_MAX_ERROR_LEN,
+  shortUsageError,
+  sweepUsageOnce,
+  startUsageSweeper,
+  type UsageSweepSummary,
+  type UsageSweeperSpec,
+} from "./usageSweeper.js";
 
-const log = rootLogger.child({ module: "cursorUsageSweeper" });
-
-export const CURSOR_USAGE_SWEEP_INTERVAL_MS = 60 * 60_000;
-const MIN_INTERVAL_MS = 60_000;
-/** Cursor's web face rate-limits per session; pace the batch a little. */
-const PER_ACCOUNT_GAP_MS = 1_500;
-const MAX_ERROR_LEN = 200;
+export const CURSOR_USAGE_SWEEP_INTERVAL_MS = USAGE_SWEEP_DEFAULT_INTERVAL_MS;
+const MAX_ERROR_LEN = USAGE_SWEEP_MAX_ERROR_LEN;
 
 export interface CursorUsageColumnPatch {
   cursor_sand_usage_pct: number | null;
@@ -94,12 +96,9 @@ export function cursorUsageWeightInputsChanged(
 }
 
 function shortError(err: unknown): string {
-  if (err instanceof CursorUsageUnavailableError) {
-    const keys = Object.keys(err.details).slice(0, 4).join(",");
-    return `${err.code}${keys ? `:${keys}` : ""}`.slice(0, MAX_ERROR_LEN);
-  }
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.replace(/\s+/g, " ").slice(0, MAX_ERROR_LEN);
+  return err instanceof CursorUsageUnavailableError
+    ? shortUsageError(err, err.code, Object.keys(err.details))
+    : shortUsageError(err);
 }
 
 /** Secret-free snapshot for the JSONB fallback: drop nothing but be explicit. */
@@ -212,13 +211,7 @@ export interface CursorUsageSweepDeps extends RefreshCursorAccountUsageDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-export interface CursorUsageSweepSummary {
-  scanned: number;
-  refreshed: number;
-  failed: number;
-  skipped: number;
-  weightChanged: number;
-}
+export type CursorUsageSweepSummary = UsageSweepSummary;
 
 export function isCursorUsageSweepCandidate(row: AccountRow): boolean {
   return row.provider === "cursor"
@@ -227,80 +220,30 @@ export function isCursorUsageSweepCandidate(row: AccountRow): boolean {
     && row.cursor_auth_id !== null;
 }
 
-/** One pass over every eligible Cursor session row. Never throws. */
-export async function sweepCursorUsageOnce(deps: CursorUsageSweepDeps = {}): Promise<CursorUsageSweepSummary> {
-  const listCursorAccounts = deps.listCursorAccounts
-    ?? (() => listAccounts({ provider: "cursor", limit: 500 }));
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const summary: CursorUsageSweepSummary = { scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 };
-  let rows: AccountRow[];
-  try {
-    rows = await listCursorAccounts();
-  } catch (err) {
-    log.warn("cursor usage sweep: listing accounts failed", { err: err instanceof Error ? err.message : String(err) });
-    return summary;
-  }
-  const candidates = rows.filter(isCursorUsageSweepCandidate);
-  summary.scanned = candidates.length;
-  // Pool sync is debounced; fire it once at the end instead of per account.
-  let anyWeightChanged = false;
-  for (let i = 0; i < candidates.length; i += 1) {
-    const row = candidates[i];
-    try {
-      const result = await refreshCursorAccountUsage(row, {
-        ...deps,
-        onWeightInputsChanged: () => { anyWeightChanged = true; },
-      });
-      if (result.ok) {
-        summary.refreshed += 1;
-        if (result.weightInputsChanged) summary.weightChanged += 1;
-      } else if (result.skipped) {
-        summary.skipped += 1;
-      } else {
-        summary.failed += 1;
-        log.info("cursor usage sweep: account refresh failed", { accountId: row.id.toString(), reason: result.reason });
-      }
-    } catch (err) {
-      summary.failed += 1;
-      log.warn("cursor usage sweep: account refresh threw", {
-        accountId: row.id.toString(),
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-    if (i < candidates.length - 1) await sleep(PER_ACCOUNT_GAP_MS);
-  }
-  if (anyWeightChanged) {
+/**
+ * Provider strategy for the shared usage-sweep skeleton (usageSweeper.ts).
+ * Pool sync is debounced, so the per-account nudge is suppressed during a
+ * sweep and fired once at the end via onAnyWeightChanged.
+ */
+const CURSOR_USAGE_SWEEP: UsageSweeperSpec<CursorUsageSweepDeps> = {
+  label: "cursor usage sweep",
+  provider: "cursor",
+  isCandidate: isCursorUsageSweepCandidate,
+  refresh: (row, deps) => refreshCursorAccountUsage(row, { ...deps, onWeightInputsChanged: () => {} }),
+  onAnyWeightChanged: (deps) => {
     (deps.onWeightInputsChanged ?? (() => scheduleCursorAuthSync("cursor.usage-sweep")))(0n);
-  }
-  log.info("cursor usage sweep done", { ...summary });
-  return summary;
+  },
+  listRows: (deps) => (deps.listCursorAccounts ?? (() => listAccounts({ provider: "cursor", limit: 500 })))(),
+};
+
+/** One pass over every eligible Cursor session row. Never throws. */
+export function sweepCursorUsageOnce(deps: CursorUsageSweepDeps = {}): Promise<CursorUsageSweepSummary> {
+  return sweepUsageOnce({ ...CURSOR_USAGE_SWEEP, sleep: deps.sleep }, deps);
 }
 
 export function startCursorUsageSweeper(
   opts: { intervalMs?: number; runOnStart?: boolean; deps?: CursorUsageSweepDeps } = {},
 ): { stop: () => void; runOnceForTest: () => Promise<CursorUsageSweepSummary> } {
-  if (getRuntimeChannel() !== "v5") {
-    // Commercial (v3) masters have no Cursor session pool; do not schedule.
-    return { stop: () => {}, runOnceForTest: async () => ({ scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 }) };
-  }
-  const intervalMs = Math.max(MIN_INTERVAL_MS, opts.intervalMs ?? CURSOR_USAGE_SWEEP_INTERVAL_MS);
-  let inFlight: Promise<CursorUsageSweepSummary> | null = null;
-  let stopped = false;
-  const run = (): Promise<CursorUsageSweepSummary> => {
-    if (inFlight) return inFlight;
-    const task = sweepCursorUsageOnce(opts.deps).finally(() => { if (inFlight === task) inFlight = null; });
-    inFlight = task;
-    return task;
-  };
-  const timer = setInterval(() => { if (!stopped) void run(); }, intervalMs);
-  timer.unref?.();
-  if (opts.runOnStart ?? true) {
-    // Let the materializer's boot sync and DB pool settle first.
-    const boot = setTimeout(() => { if (!stopped) void run(); }, 15_000);
-    boot.unref?.();
-  }
-  return {
-    stop: () => { stopped = true; clearInterval(timer); },
-    runOnceForTest: run,
-  };
+  const deps = opts.deps ?? {};
+  return startUsageSweeper({ ...CURSOR_USAGE_SWEEP, sleep: deps.sleep }, { intervalMs: opts.intervalMs, runOnStart: opts.runOnStart, deps });
 }

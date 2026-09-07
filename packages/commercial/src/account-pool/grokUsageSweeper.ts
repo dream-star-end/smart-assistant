@@ -24,7 +24,6 @@
  */
 import type { Dispatcher } from "undici";
 import { rootLogger } from "../logging/logger.js";
-import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
   GrokUsageUnavailableError,
   fetchGrokAccountUsage,
@@ -36,14 +35,20 @@ import { listAccounts, type AccountRow } from "./store.js";
 import { getFreshGrokAccessToken, GrokOAuthRefreshError } from "./grokOAuth.js";
 import { directEgressDispatcher } from "./egressDispatcher.js";
 import { weightInputsCrossedBucket } from "./poolWeight.js";
+import {
+  USAGE_SWEEP_DEFAULT_INTERVAL_MS,
+  USAGE_SWEEP_MAX_ERROR_LEN,
+  shortUsageError,
+  sweepUsageOnce,
+  startUsageSweeper,
+  type UsageSweepSummary,
+  type UsageSweeperSpec,
+} from "./usageSweeper.js";
 
 const log = rootLogger.child({ module: "grokUsageSweeper" });
 
-export const GROK_USAGE_SWEEP_INTERVAL_MS = 60 * 60_000;
-const MIN_INTERVAL_MS = 60_000;
-/** xAI billing is not a hot path; pace the batch a little. */
-const PER_ACCOUNT_GAP_MS = 1_500;
-const MAX_ERROR_LEN = 200;
+export const GROK_USAGE_SWEEP_INTERVAL_MS = USAGE_SWEEP_DEFAULT_INTERVAL_MS;
+const MAX_ERROR_LEN = USAGE_SWEEP_MAX_ERROR_LEN;
 
 export interface GrokUsageColumnPatch {
   grok_credit_usage_pct: number | null;
@@ -91,12 +96,9 @@ export function grokUsageWeightInputsChanged(
 }
 
 function shortError(err: unknown): string {
-  if (err instanceof GrokUsageUnavailableError) {
-    const keys = Object.keys(err.details).slice(0, 4).join(",");
-    return `${err.code}${keys ? `:${keys}` : ""}`.slice(0, MAX_ERROR_LEN);
-  }
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.replace(/\s+/g, " ").slice(0, MAX_ERROR_LEN);
+  return err instanceof GrokUsageUnavailableError
+    ? shortUsageError(err, err.code, Object.keys(err.details))
+    : shortUsageError(err);
 }
 
 function oauthTerminalCode(err: GrokOAuthRefreshError): string {
@@ -230,85 +232,30 @@ export interface GrokUsageSweepDeps extends RefreshGrokAccountUsageDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-export interface GrokUsageSweepSummary {
-  scanned: number;
-  refreshed: number;
-  failed: number;
-  skipped: number;
-  weightChanged: number;
-}
+export type GrokUsageSweepSummary = UsageSweepSummary;
 
 export function isGrokUsageSweepCandidate(row: AccountRow): boolean {
   return row.provider === "grok"
     && (row.status === "active" || row.status === "cooldown");
 }
 
+/** Provider strategy for the shared usage-sweep skeleton (usageSweeper.ts). */
+const GROK_USAGE_SWEEP: UsageSweeperSpec<GrokUsageSweepDeps> = {
+  label: "grok usage sweep",
+  provider: "grok",
+  isCandidate: isGrokUsageSweepCandidate,
+  refresh: (row, deps) => refreshGrokAccountUsage(row, deps),
+  listRows: (deps) => (deps.listGrokAccounts ?? (() => listAccounts({ provider: "grok", limit: 500 })))(),
+};
+
 /** One pass over every eligible Grok account row. Never throws. */
-export async function sweepGrokUsageOnce(deps: GrokUsageSweepDeps = {}): Promise<GrokUsageSweepSummary> {
-  const listGrokAccounts = deps.listGrokAccounts
-    ?? (() => listAccounts({ provider: "grok", limit: 500 }));
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const summary: GrokUsageSweepSummary = { scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 };
-  let rows: AccountRow[];
-  try {
-    rows = await listGrokAccounts();
-  } catch (err) {
-    log.warn("grok usage sweep: listing accounts failed", { err: err instanceof Error ? err.message : String(err) });
-    return summary;
-  }
-  const candidates = rows.filter(isGrokUsageSweepCandidate);
-  summary.scanned = candidates.length;
-  for (let i = 0; i < candidates.length; i += 1) {
-    const row = candidates[i];
-    try {
-      const result = await refreshGrokAccountUsage(row, deps);
-      if (result.ok) {
-        summary.refreshed += 1;
-        if (result.weightInputsChanged) summary.weightChanged += 1;
-      } else if (result.skipped) {
-        summary.skipped += 1;
-      } else {
-        summary.failed += 1;
-        log.info("grok usage sweep: account refresh failed", { accountId: row.id.toString(), reason: result.reason });
-      }
-    } catch (err) {
-      summary.failed += 1;
-      log.warn("grok usage sweep: account refresh threw", {
-        accountId: row.id.toString(),
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-    if (i < candidates.length - 1) await sleep(PER_ACCOUNT_GAP_MS);
-  }
-  log.info("grok usage sweep done", { ...summary });
-  return summary;
+export function sweepGrokUsageOnce(deps: GrokUsageSweepDeps = {}): Promise<GrokUsageSweepSummary> {
+  return sweepUsageOnce({ ...GROK_USAGE_SWEEP, sleep: deps.sleep }, deps);
 }
 
 export function startGrokUsageSweeper(
   opts: { intervalMs?: number; runOnStart?: boolean; deps?: GrokUsageSweepDeps } = {},
 ): { stop: () => void; runOnceForTest: () => Promise<GrokUsageSweepSummary> } {
-  if (getRuntimeChannel() !== "v5") {
-    // Commercial (v3) masters have no Grok subscription pool; do not schedule.
-    return { stop: () => {}, runOnceForTest: async () => ({ scanned: 0, refreshed: 0, failed: 0, skipped: 0, weightChanged: 0 }) };
-  }
-  const intervalMs = Math.max(MIN_INTERVAL_MS, opts.intervalMs ?? GROK_USAGE_SWEEP_INTERVAL_MS);
-  let inFlight: Promise<GrokUsageSweepSummary> | null = null;
-  let stopped = false;
-  const run = (): Promise<GrokUsageSweepSummary> => {
-    if (inFlight) return inFlight;
-    const task = sweepGrokUsageOnce(opts.deps).finally(() => { if (inFlight === task) inFlight = null; });
-    inFlight = task;
-    return task;
-  };
-  const timer = setInterval(() => { if (!stopped) void run(); }, intervalMs);
-  timer.unref?.();
-  if (opts.runOnStart ?? true) {
-    // Let the DB pool settle first.
-    const boot = setTimeout(() => { if (!stopped) void run(); }, 15_000);
-    boot.unref?.();
-  }
-  return {
-    stop: () => { stopped = true; clearInterval(timer); },
-    runOnceForTest: run,
-  };
+  const deps = opts.deps ?? {};
+  return startUsageSweeper({ ...GROK_USAGE_SWEEP, sleep: deps.sleep }, { intervalMs: opts.intervalMs, runOnStart: opts.runOnStart, deps });
 }
