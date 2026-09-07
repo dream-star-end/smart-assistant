@@ -162,7 +162,8 @@ import {
 } from "./agent-sandbox/v3supervisor.js";
 import { AuthoritySigner } from "./ws/authoritySigner.js";
 import { ModelCatalogCache, PLATFORM_AUX_MODEL_IDS } from "./billing/modelCatalog.js";
-import { getCodexAccountRuntimeChannel, getRuntimeChannel } from "./runtimeChannel.js";
+import { getRuntimeChannel } from "./runtimeChannel.js";
+import { activePoolWhere } from "./account-pool/poolCandidates.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
   startPendingOrdersExpirer,
@@ -5357,20 +5358,14 @@ export async function registerCommercial(
               //   - 有   → 用户 admin 已加账号但容器 mount immutable 永远 401,
               //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
               //            重新走 picker 路径产出 per-container mount。
-              // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
-              // AND status='active'),否则可能误判为"有账号"但 picker 实际拿不到。
-              // 0098+:池按 Codex account-pool channel 划分权威,只数 picker 同口径账号行。
-              const poolParams: unknown[] = [getCodexAccountRuntimeChannel()];
-              const poolWhere = ["provider = 'codex'", "status = 'active'", "runtime_channel = $1"];
-              if (desiredGroupId !== null) {
-                poolParams.push(desiredGroupId);
-                poolWhere.push(`group_id = $${poolParams.length}`);
-              }
+              // 池子查询条件与 pickCodexAccountForBinding 同源(poolCandidates.activePoolWhere),
+              // 否则可能误判为"有账号"但 picker 实际拿不到。
+              const poolPredicate = activePoolWhere({ provider: "codex", groupId: desiredGroupId });
               const poolCount = await client.query<{ cnt: string }>(
                 `SELECT count(*)::text AS cnt
                    FROM claude_accounts
-                  WHERE ${poolWhere.join(" AND ")}`,
-                poolParams,
+                  WHERE ${poolPredicate.clauses.join(" AND ")}`,
+                poolPredicate.params,
               );
               if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
                 return null;

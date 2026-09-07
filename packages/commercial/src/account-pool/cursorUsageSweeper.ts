@@ -33,6 +33,7 @@ import {
 import { getPool } from "../db/index.js";
 import { getCursorTokenSnapshot, listAccounts, type AccountRow } from "./store.js";
 import { scheduleCursorAuthSync } from "./cursorMaterializer.js";
+import { weightInputsCrossedBucket } from "./poolWeight.js";
 
 const log = rootLogger.child({ module: "cursorUsageSweeper" });
 
@@ -83,12 +84,13 @@ export function cursorUsageWeightInputsChanged(
   before: Pick<AccountRow, "cursor_sand_usage_pct" | "cursor_sand_next_reset_at" | "cursor_billing_cycle_end">,
   after: CursorUsageColumnPatch,
 ): boolean {
-  const bucket = (pct: number | null): number | null => (pct === null ? null : Math.floor(pct / 5));
-  if (bucket(before.cursor_sand_usage_pct) !== bucket(after.cursor_sand_usage_pct)) return true;
-  const day = (d: Date | null): number | null => (d === null ? null : Math.floor(d.getTime() / 86_400_000));
-  if (day(before.cursor_sand_next_reset_at) !== day(after.cursor_sand_next_reset_at)) return true;
-  if (day(before.cursor_billing_cycle_end) !== day(after.cursor_billing_cycle_end)) return true;
-  return false;
+  return weightInputsCrossedBucket(
+    [[before.cursor_sand_usage_pct, after.cursor_sand_usage_pct]],
+    [
+      [before.cursor_sand_next_reset_at, after.cursor_sand_next_reset_at],
+      [before.cursor_billing_cycle_end, after.cursor_billing_cycle_end],
+    ],
+  );
 }
 
 function shortError(err: unknown): string {

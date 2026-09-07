@@ -35,6 +35,7 @@ import { getPool } from "../db/index.js";
 import { listAccounts, type AccountRow } from "./store.js";
 import { getFreshGrokAccessToken, GrokOAuthRefreshError } from "./grokOAuth.js";
 import { directEgressDispatcher } from "./egressDispatcher.js";
+import { weightInputsCrossedBucket } from "./poolWeight.js";
 
 const log = rootLogger.child({ module: "grokUsageSweeper" });
 
@@ -83,11 +84,10 @@ export function grokUsageWeightInputsChanged(
   before: Pick<AccountRow, "grok_credit_usage_pct" | "grok_credit_period_end">,
   after: Pick<GrokUsageColumnPatch, "grok_credit_usage_pct" | "grok_credit_period_end">,
 ): boolean {
-  const bucket = (pct: number | null): number | null => (pct === null ? null : Math.floor(pct / 5));
-  if (bucket(before.grok_credit_usage_pct) !== bucket(after.grok_credit_usage_pct)) return true;
-  const day = (d: Date | null): number | null => (d === null ? null : Math.floor(d.getTime() / 86_400_000));
-  if (day(before.grok_credit_period_end) !== day(after.grok_credit_period_end)) return true;
-  return false;
+  return weightInputsCrossedBucket(
+    [[before.grok_credit_usage_pct, after.grok_credit_usage_pct]],
+    [[before.grok_credit_period_end, after.grok_credit_period_end]],
+  );
 }
 
 function shortError(err: unknown): string {
