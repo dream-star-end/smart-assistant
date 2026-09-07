@@ -2890,6 +2890,7 @@ export function App() {
     onOpenAccount: demo ? undefined : () => openSettings(),
     onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
     onNew: handleNew,
+    onNewWithAgent: demo ? undefined : () => { handleNew(); setPickerOpen(true); },
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onTogglePin: togglePinSession,
@@ -2987,6 +2988,15 @@ export function App() {
               setBoardOpen(false);
               handleNew();
             }}
+            onNewWithAgent={
+              demo
+                ? undefined
+                : () => {
+                    setBoardOpen(false);
+                    handleNew();
+                    setPickerOpen(true);
+                  }
+            }
             onNewInProject={(projectId) => {
               setBoardOpen(false);
               newSessionInProject(projectId);
@@ -3018,6 +3028,16 @@ export function App() {
             handleNew();
             setMobileNavOpen(false);
           }}
+          onNewWithAgent={
+            demo
+              ? undefined
+              : () => {
+                  setBoardOpen(false);
+                  handleNew();
+                  setPickerOpen(true);
+                  setMobileNavOpen(false);
+                }
+          }
           onNewInProject={(projectId) => {
             setBoardOpen(false);
             newSessionInProject(projectId);

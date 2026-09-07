@@ -1372,3 +1372,19 @@ describe("HighlightedText", () => {
     expect(container.querySelector("mark")?.textContent).toBe("b");
   });
 });
+
+describe("Sidebar 选择智能体后新建", () => {
+  it("传入 onNewWithAgent 时渲染 split 按钮，点击右侧触发回调", () => {
+    const onNewWithAgent = vi.fn();
+    renderSidebar({ onNewWithAgent });
+    const split = screen.getByRole("button", { name: "选择智能体后新建" });
+    expect(split).toBeInTheDocument();
+    fireEvent.click(split);
+    expect(onNewWithAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("不传 onNewWithAgent 时不渲染「选择智能体后新建」", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: "选择智能体后新建" })).toBeNull();
+  });
+});
