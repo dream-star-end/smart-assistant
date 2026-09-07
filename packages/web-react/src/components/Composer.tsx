@@ -5,9 +5,10 @@ import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
+import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
-import { clearDraft, readDraft, writeDraft } from "../lib/composerDraft";
+import { clearDraft } from "../lib/composerDraft";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -147,7 +148,7 @@ export function Composer({
   fontSize?: "default" | "large";
   /** 时间线最后一条用户正文；空输入框按 ↑ 填入。 */
   lastUserText?: string;
-  /** 会话级草稿键；变化时若输入框为空则还原 sessionStorage 草稿。 */
+  /** 会话级草稿键；切换时只还原该会话自己的草稿。 */
   draftKey?: string;
   /** 外部请求打开目标对话框：nonce 变化即打开（与 prefill 同模式）。 */
   goalOpenRequest?: number;
@@ -155,7 +156,7 @@ export function Composer({
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
   const { annotate, annotateUnavailableReason } = useImageEditActions();
-  const [value, setValue] = useState("");
+  const [value, setValue] = useComposerDraft(draftKey);
   // 指针类型:粗指针(触屏/移动)下 Enter=换行(否则打不出多段消息),发送交给按钮;
   // 细指针(桌面鼠标)下 Enter=发送。指针类型运行期几乎不变,挂载读一次即可;
   // matchMedia 缺省(jsdom/SSR)回退细指针,保持桌面「Enter 发送」既有行为与测试稳定。
@@ -227,20 +228,6 @@ export function Composer({
     if (!replyTo) return;
     requestAnimationFrame(() => ref.current?.focus());
   }, [replyTo]);
-
-  useEffect(() => {
-    if (!draftKey) return;
-    setValue((current) => (current === "" ? readDraft(draftKey) : current));
-  }, [draftKey]);
-
-  useEffect(() => {
-    if (!draftKey) return;
-    const timer = window.setTimeout(() => {
-      if (value) writeDraft(draftKey, value);
-      else clearDraft(draftKey);
-    }, 300);
-    return () => window.clearTimeout(timer);
-  }, [draftKey, value]);
 
   const onVoiceText = useCallback((text: string) => {
     setVoiceMsg(null);

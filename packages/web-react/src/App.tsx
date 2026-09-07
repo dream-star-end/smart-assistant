@@ -14,6 +14,7 @@ import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer } from "./components/Composer";
+import { moveDraft, NEW_COMPOSER_DRAFT_KEY } from "./lib/composerDraft";
 import {
   ImageAnnotationEditor,
   type ImageAnnotationSource,
@@ -1186,6 +1187,9 @@ export function App() {
     sockRef.current?.ensureSession(id, agent.id, "新对话");
     if (modelId) sockRef.current?.setSessionModel(id, modelId);
     setSessions((c) => [s, ...c]);
+    // This is an identity promotion, not navigation to another conversation. Preserve
+    // the unsent draft; normal send consumes/clears it in Composer instead.
+    moveDraft(NEW_COMPOSER_DRAFT_KEY, id);
     setActiveId(id);
     return id;
   }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
@@ -3397,7 +3401,7 @@ export function App() {
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
             lastUserText={lastUserText}
-            draftKey={activeId ?? "new"}
+            draftKey={activeId ?? NEW_COMPOSER_DRAFT_KEY}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}
