@@ -3227,6 +3227,40 @@
           "assertion": "INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof."
         }
       ]
+    },
+    {
+      "id": "INC-20260908-COMPOSER-DRAFT-BLEED",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "切换会话时输入框残留顿号/文字被写入目标会话草稿；快速清空后切走又复活。",
+      "rootFixCommit": "768041be1ca797154d53360e4ec0f61acc964603",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useComposerDraft.test.tsx",
+          "assertion": "StrictMode switches restore each owner, never overwrite target"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/composerDraft.test.ts",
+          "assertion": "超 20KB 不写存储但留在本标签内存，不复活旧内容"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/composer-draft.node-test.mjs",
+          "assertion": "switch preserves both drafts and the input DOM"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/composer-draft.node-test.mjs",
+          "assertion": "input and deletion survive immediate switches (no debounce wait)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/composer-draft.node-test.mjs",
+          "assertion": "allocating an ID before send preserves unsent new draft"
+        }
+      ]
     }
   ]
 }
