@@ -1926,6 +1926,7 @@ export function MessageList({
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
+  const showScrollToBottom = shouldShowScrollToBottom(following, messages.length);
   return (
     <div
       ref={listRootRef}
@@ -1983,21 +1984,39 @@ export function MessageList({
         />
       ) : null}
       {footer}
-      {shouldShowScrollToBottom(following, messages.length) && (
-        <button
-          type="button"
-          data-testid="scroll-to-bottom"
-          aria-label="回到底部"
-          className="sticky bottom-4 z-10 ml-auto flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float animate-fade [@media(hover:none)]:size-11"
-          onClick={() => {
-            if (!scrollParent || !followBottomRef) return;
-            followBottomRef.current = true;
-            followBottomRef.scrollToBottom?.(scrollParent);
-            setFollowing(true);
-          }}
+      {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
+          **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
+          挂载/卸载,按钮自身 52px 就是 scrollHeight 的一部分:滑回底部 → following
+          翻真 → 按钮卸载 → scrollHeight 收缩 → 浏览器 clamp scrollTop → 篱笆仍在
+          (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
+          几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
+          -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
+      {followBottomRef && messages.length > 0 && (
+        <div
+          aria-hidden={!showScrollToBottom}
+          data-testid="scroll-to-bottom-dock"
+          data-visible={showScrollToBottom ? "true" : "false"}
+          className="sticky bottom-4 z-10 -mt-4 h-0 overflow-visible"
         >
-          <ChevronDown size={18} />
-        </button>
+          <button
+            type="button"
+            data-testid="scroll-to-bottom"
+            aria-label="回到底部"
+            tabIndex={showScrollToBottom ? 0 : -1}
+            className={
+              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float transition-opacity duration-200 [@media(hover:none)]:size-11 " +
+              (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
+            }
+            onClick={() => {
+              if (!scrollParent || !followBottomRef) return;
+              followBottomRef.current = true;
+              followBottomRef.scrollToBottom?.(scrollParent);
+              setFollowing(true);
+            }}
+          >
+            <ChevronDown size={18} />
+          </button>
+        </div>
       )}
     </div>
   );

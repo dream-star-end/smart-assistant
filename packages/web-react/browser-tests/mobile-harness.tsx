@@ -49,6 +49,8 @@ declare global {
       setBottomInset: (px: number) => void;
       /** T65:用户上滑 px 与底部占位收起落在同一帧 → 浏览器一次 scroll 事件里 scrollTop == 新 max。 */
       scrollUpWithCollapse: (px: number) => void;
+      /** T66:following 每次翻转记一笔(scroll 事件粒度),回底一次只应翻一次。 */
+      followingFlips: number;
     };
   }
 }
@@ -65,6 +67,7 @@ window.__mobilePage = {
   attemptViewportCorrection: () => {},
   setBottomInset: () => {},
   scrollUpWithCollapse: () => {},
+  followingFlips: 0,
 };
 
 // 宽内容样本:每一条都是线上真实出现过的形态,且都是移动端最容易被裁的东西。
@@ -140,6 +143,9 @@ function MobileChatPage() {
   const [modelId, setModelId] = useState(MOBILE_MODELS[0].id);
   const stick = useRef(createStickToBottomController()).current;
   const syncFollowing = useCallback(() => {
+    if (window.__mobilePage.following !== stick.following.current) {
+      window.__mobilePage.followingFlips += 1;
+    }
     window.__mobilePage.following = stick.following.current;
     window.__mobilePage.directManipulation = stick.directManipulation.current;
   }, [stick]);

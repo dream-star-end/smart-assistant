@@ -3095,7 +3095,7 @@ describe("主时间线回到底部 FAB", () => {
     expect(shouldShowScrollToBottom(false, 0)).toBe(false);
   });
 
-  test("离底时渲染按钮，贴底时不渲染，点击调用 scrollToBottom", () => {
+  test("离底时按钮可见，贴底时仍挂载但不可见不可点，点击调用 scrollToBottom", async () => {
     const scrollToBottom = vi.fn();
     const followBottomRef = {
       current: false,
@@ -3120,6 +3120,9 @@ describe("主时间线回到底部 FAB", () => {
     );
     const btn = screen.getByTestId("scroll-to-bottom");
     expect(btn).toHaveAttribute("aria-label", "回到底部");
+    expect(btn).toHaveAttribute("tabindex", "0");
+    expect(btn.className).not.toContain("pointer-events-none");
+    expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "true");
     scrollToBottom.mockClear();
     fireEvent.click(btn);
     expect(scrollToBottom).toHaveBeenCalledTimes(1);
@@ -3138,6 +3141,66 @@ describe("主时间线回到底部 FAB", () => {
       />,
     );
     fireEvent.scroll(scroller);
+    // 贴底后按钮**仍在 DOM 里**:它是滚动内容(ResizeObserver root)的子节点,随
+    // following 挂载/卸载会改 scrollHeight → 浏览器 clamp → 被判成用户离底 → 再挂载,
+    // 几何自激(2026-09-07 回弹复现根因)。只允许切 opacity/pointer-events。
+    await waitFor(() => {
+      expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "false");
+    });
+    const hidden = screen.getByTestId("scroll-to-bottom");
+    expect(hidden.className).toContain("pointer-events-none");
+    expect(hidden.className).toContain("opacity-0");
+    expect(hidden).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("aria-hidden", "true");
+    scroller.remove();
+  });
+
+  test("按钮容器零高度且抵消 space-y 间距：following 翻转不改变滚动内容几何", () => {
+    const followBottomRef = { current: false, scrollToBottom: vi.fn() };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = [
+      mk("user", { id: "fab-geo-u1", text: "问题", status: "replied" }),
+      mk("assistant", { id: "fab-geo-a1", text: "回答" }),
+    ];
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    const dock = screen.getByTestId("scroll-to-bottom-dock");
+    // 列表根是 space-y-4:任何新增的流内子节点都会给前一个兄弟加 16px 下边距。
+    // dock 自身 h-0 + -mt-4 把这 16px 抵消回去,总高与没有按钮时完全一致。
+    expect(dock.className).toContain("h-0");
+    expect(dock.className).toContain("-mt-4");
+    expect(dock.className).toContain("sticky");
+    const btn = screen.getByTestId("scroll-to-bottom");
+    // 按钮脱离文档流(absolute),不参与父级高度计算。
+    expect(btn.className).toContain("absolute");
+    expect(dock.parentElement).toBe(screen.getByTestId("timeline-short-list"));
+    scroller.remove();
+  });
+
+  test("无 controller（followBottomRef 缺省）时不渲染按钮容器", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[mk("assistant", { id: "fab-noctl-a1", text: "回答" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(screen.queryByTestId("scroll-to-bottom-dock")).toBeNull();
     expect(screen.queryByTestId("scroll-to-bottom")).toBeNull();
     scroller.remove();
   });

@@ -2163,6 +2163,115 @@ await check("T65 上滑与底部占位收起合并进同一 scroll 事件时不�
   }
   if (afterGrow.following) throw new Error("追加内容后错误恢复贴底态");
 });
+await check("T66 回到底部按钮不参与滚动几何：滚轮回底时 following 只翻一次、无 clamp 回弹、按钮只切可见", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 1200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 80);
+  // 贴底态:dock 常驻挂载(它是 RO root 的子节点),只是不可见;记下此时的 scrollHeight。
+  const dock = mobilePage.getByTestId("scroll-to-bottom-dock");
+  const dockCount = await dock.count();
+  if (dockCount !== 1) throw new Error(`贴底时 dock 未常驻挂载: count=${dockCount}`);
+  const atBottom = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+    dockVisible: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible"),
+    dockHeight: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getBoundingClientRect().height,
+  }));
+  if (!atBottom.following || Math.abs(atBottom.top - atBottom.max) > 2) {
+    throw new Error(`T66 前置未贴底: ${JSON.stringify(atBottom)}`);
+  }
+  if (atBottom.dockVisible !== "false") throw new Error(`贴底时按钮应不可见: ${JSON.stringify(atBottom)}`);
+  if (atBottom.dockHeight !== 0) throw new Error(`dock 必须零高度: ${JSON.stringify(atBottom)}`);
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可滚轮几何");
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + box.height / 2);
+  await mobilePage.mouse.move(x, y);
+  // 上滑 4 tick 离底 → 按钮出现。scrollHeight 不得因按钮出现而变化。
+  for (let i = 0; i < 4; i += 1) {
+    await mobilePage.mouse.wheel(0, -120);
+    await mobilePage.waitForTimeout(40);
+  }
+  await mobilePage.waitForFunction(
+    () => document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible") === "true",
+    null,
+    { timeout: 2000 },
+  );
+  const away = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    following: window.__mobilePage.following,
+    fence: window.__mobilePage.wheelFence,
+  }));
+  if (away.following) throw new Error(`上滑后仍贴底: ${JSON.stringify(away)}`);
+  if (away.height !== atBottom.height) {
+    throw new Error(`按钮出现改变了 scrollHeight: ${atBottom.height} → ${away.height}`);
+  }
+  const btn = mobilePage.getByTestId("scroll-to-bottom");
+  const btnBox = await btn.boundingBox();
+  if (!btnBox || btnBox.width < 30) throw new Error(`离底后按钮不可见: ${JSON.stringify(btnBox)}`);
+  if (btnBox.y + btnBox.height > box.y + box.height + 1) {
+    throw new Error(`按钮溢出滚动区底边: btn=${JSON.stringify(btnBox)} scroll=${JSON.stringify(box)}`);
+  }
+  // 篱笆仍在(离上次输入 <200ms)时滚轮回底。旧实现:following 翻真 → 按钮卸载 →
+  // scrollHeight -52 → clamp scroll 事件带 hadUserIntent → 判成离底 → following 再翻假
+  // → 按钮再挂载 …… 用户看到的是每次回底都弹一下。现在 following 只允许翻一次。
+  await mobilePage.evaluate(() => { window.__mobilePage.followingFlips = 0; window.__mobilePage.programmaticWrites = 0; });
+  const tops = [];
+  for (let i = 0; i < 8; i += 1) {
+    await mobilePage.mouse.wheel(0, 120);
+    await mobilePage.waitForTimeout(40);
+    tops.push(await scroll.evaluate((node) => node.scrollTop));
+  }
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 200);
+  const back = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+    flips: window.__mobilePage.followingFlips,
+    fence: window.__mobilePage.wheelFence,
+    writes: window.__mobilePage.programmaticWrites,
+    dockVisible: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible"),
+    dockCount: document.querySelectorAll('[data-testid="scroll-to-bottom-dock"]').length,
+  }));
+  if (back.fence) throw new Error(`回底静止后篱笆未释放: ${JSON.stringify(back)}`);
+  if (Math.abs(back.top - back.max) > 2) throw new Error(`滚轮回底未到底: ${JSON.stringify(back)}`);
+  if (!back.following) throw new Error(`回底后未恢复贴底: ${JSON.stringify(back)}`);
+  if (back.flips !== 1) {
+    throw new Error(`回底过程 following 翻转 ${back.flips} 次(应恰好 1 次): tops=${tops.join(",")} ${JSON.stringify(back)}`);
+  }
+  if (back.height !== atBottom.height) {
+    throw new Error(`回底后 scrollHeight 变化(按钮参与了几何): ${atBottom.height} → ${back.height}`);
+  }
+  for (let i = 1; i < tops.length; i += 1) {
+    if (tops[i] < tops[i - 1] - 1) {
+      throw new Error(`滚轮回底途中被向上夹回: step ${i} ${tops[i - 1]} → ${tops[i]} (all=${tops.join(",")})`);
+    }
+  }
+  if (back.writes !== 0) throw new Error(`回底期间出现程序化写入: ${JSON.stringify(back)}`);
+  if (back.dockCount !== 1 || back.dockVisible !== "false") {
+    throw new Error(`回底后按钮应仍挂载但不可见: ${JSON.stringify(back)}`);
+  }
+  // 贴底后追加内容仍跟随(following 真的稳定为 true,不是巧合落底)。
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    dist: node.scrollHeight - node.scrollTop - node.clientHeight,
+    following: window.__mobilePage.following,
+  }));
+  if (!afterGrow.following || afterGrow.dist > 2) {
+    throw new Error(`回底后追加内容未跟随: ${JSON.stringify(afterGrow)}`);
+  }
+});
 screenshotPage = page;
 
 // ── T26 微博登录页二维码挑战判定 ────────────────────────────────────────────
