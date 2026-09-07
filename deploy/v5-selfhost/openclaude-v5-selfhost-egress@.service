@@ -6,7 +6,8 @@
 Description=OpenClaude v5 Selfhost Egress Proxy (LLM upstream plane, slot %i)
 After=network.target postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service openclaude-v5-selfhost-egress@%i.socket
 Wants=postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
-Requires=openclaude-v5-selfhost-egress@%i.socket
+# Wants (not Requires): deploy closes systemd's listen fd before service drain.
+Wants=openclaude-v5-selfhost-egress@%i.socket
 Conflicts=openclaude-v5-selfhost-egress.service
 
 [Service]

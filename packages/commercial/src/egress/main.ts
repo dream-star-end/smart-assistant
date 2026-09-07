@@ -608,8 +608,9 @@ export async function startEgress(): Promise<void> {
     // 私有健康口立刻关:部署脚本/watch 把「私有口不可连」当成本槽已退出接管。
     try { slotHealthServer?.close(); } catch { /* */ }
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。
-    // 双槽下 close() 只把本进程摘出 reuseport 组(tcp_migrate_req=1 时 accept 队列
-    // 里的半开连接迁到另一槽),另一槽继续接新连接 —— 这就是零停机的全部机制。
+    // 双槽下必须先由 deploy stop .socket 释放 systemd 持有的 listener fd。
+    // 此处 close() 释放最后一份 fd 才摘出 reuseport 组；否则旧 socket 无人 accept。
+    // tcp_migrate_req=1 此时迁移 accept 队列，已建立流仍由本进程 drain。
     server.close(() => {
       void (async () => {
         try { await costSink.flush(); } finally {

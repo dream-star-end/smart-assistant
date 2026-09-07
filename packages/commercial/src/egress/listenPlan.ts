@@ -11,8 +11,8 @@
  *     SO_REUSEPORT listener,通过 sd_listen_fds 协议把 fd 3 交给本进程;
  *   · 本进程按 LISTEN_PID/LISTEN_FDS 判定是否收到了 fd,收到就 `server.listen({fd:3})`,
  *     否则回落到自己 bind(legacy 单 unit / 本地开发)。
- *   · 内核 net.ipv4.tcp_migrate_req=1 让旧槽 close() 时 accept 队列里的半开连接迁到
- *     另一个 reuseport 成员,不丢 SYN。
+ *   · 内核 net.ipv4.tcp_migrate_req=1 让旧槽最后一份 listener fd 关闭时 accept 队列里的半开连接迁到
+ *     另一个 reuseport 成员；deploy 须先 stop socket，再让 Node close()，不能遗留 systemd fd。
  *
  * 每槽另有一个只读私有健康口(127.0.0.1:18898/18899),部署脚本用它判断「新槽已就绪」,
  * 不能拿共享口判定(共享口的响应可能来自旧槽)。
@@ -55,7 +55,8 @@ export function parseEgressSlot(raw: string | undefined): EgressSlot | null {
  * - LISTEN_FDS 必须恰为 1:本 unit 只声明一个 ListenStream。多了/少了都是 unit 配置错,
  *   fail-loud 比默默 bind 第二个口更好排查。
  * - 有槽但没 fd:允许(手动 `systemctl start egress@A.service` 而不经 socket),回落自 bind;
- *   但两个槽同时自 bind 会 EADDRINUSE,由 unit 的 Requires=socket 兜住。
+ *   但两个槽同时自 bind 会 EADDRINUSE；unit 的 Wants+After 先启动 socket，
+ *   deploy 还必须检查私有口 listenMode=sd_activation，拒绝错误回落。
  */
 export function computeListenPlan(env: ListenPlanEnv, selfPid: number): ListenPlan {
   const slot = parseEgressSlot(env.OC_EGRESS_SLOT);

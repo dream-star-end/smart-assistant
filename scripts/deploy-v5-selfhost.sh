@@ -1530,20 +1530,85 @@ egress_wait_slot_ready() { # <A|B>
   return 1
 }
 
+# 单独完成 socket stop 事务，先释放 systemd 的 fd；随后 Node.close() 才能摘掉
+# 最后一份 kernel listener。Wants+After 下也禁止把两个 stop jobs 聚合，否则
+# systemd 的逆停止顺序仍会把 socket close 排在长流 drain 完成之后。
+egress_stop_slot() { # <A|B> <wait|async>
+  local slot="$1" mode="$2" sock svc
+  sock="$(egress_slot_unit "$slot" socket)"
+  svc="$(egress_slot_unit "$slot" service)"
+  systemctl stop "$sock" || return 1
+  if [[ "$mode" == wait ]]; then
+    systemctl stop "$svc"
+  else
+    systemctl stop --no-block "$svc"
+  fi
+}
+
+# ss 每行是一个 kernel LISTEN socket，不是持 fd 的进程数；一个有效 socket 可
+# 同时被 systemd/node 持有。统计该专属端口所有地址，避免漏掉 wildcard 残留。
+egress_shared_listener_count() {
+  local listeners
+  listeners="$(ss -H -ltn "sport = :$V5_EGRESS_PORT")" || return 1
+  printf '%s\n' "$listeners" | awk 'NF { n++ } END { print n+0 }'
+}
+
+egress_listener_diagnostics() {
+  echo "  egress topology=$(egress_describe_topology) shared=$V5_EGRESS_BIND:$V5_EGRESS_PORT" >&2
+  ss -H -ltnp "sport = :$V5_EGRESS_PORT" >&2 || true
+}
+
+# stop --no-block 返回并不代表 Node 已执行 SIGTERM：只对实际 listener 退场做
+# 有界收敛等待(10s)，不是重试 HTTP 掩盖无人 accept 的旧 socket。
+egress_wait_single_listener() { # <new-slot>
+  local target="$1" count i
+  for i in $(seq 1 50); do
+    count="$(egress_shared_listener_count)" || { egress_listener_diagnostics; return 1; }
+    if [[ "$count" == 1 ]] && egress_slot_is_active "$target" \
+      && [[ "$(systemctl is-active "$(egress_slot_unit "$target" socket)" 2>/dev/null || true)" == active ]]; then
+      echo "  ✓ egress shared listener=1 target=$target (old streams may still drain)" >&2
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "  ✗ egress shared listener 未收敛: count=$count target=$target" >&2
+  egress_listener_diagnostics
+  return 1
+}
+
+# 始终探真实共享入口且只探一次；保留 curl rc/HTTP/time/stderr/body，避免把
+# timeout、拒连、HTTP error 与非 ok JSON 全吞成同一句话。stdout 仅传健康 JSON。
+egress_probe_shared_health() {
+  local dir metrics rc=0 body
+  dir="$(mktemp -d)" || return 1
+  metrics="$(curl -fsS --max-time 5 -o "$dir/body" -w 'http=%{http_code} elapsed=%{time_total}s bytes=%{size_download}' \
+    "http://$V5_EGRESS_BIND:$V5_EGRESS_PORT/internal/v5/egress-health" 2>"$dir/stderr")" || rc=$?
+  body="$(head -c 4096 "$dir/body" 2>/dev/null || true)"
+  if (( rc != 0 )) || ! printf '%s\n' "$body" | jq -e '.ok==true' >/dev/null 2>&1; then
+    printf '  ✗ egress-health curl_rc=%s %s\n' "$rc" "$metrics" >&2
+    printf '  stderr=%s\n  body=%s\n' "$(head -c 512 "$dir/stderr")" "$(printf '%s' "$body" | head -c 512)" >&2
+    rm -rf -- "$dir"
+    egress_listener_diagnostics
+    return 1
+  fi
+  rm -rf -- "$dir"
+  printf '%s\n' "$body"
+}
+
 # legacy 单 unit 路径(live release 无双槽模板,即回滚到旧 release)。先把槽全停
 # (Conflicts= 也会做,这里显式化便于日志),再 restart legacy 并等端口。
 egress_restart_legacy_single_unit() {
   local s
   echo "  egress: live release 无双槽模板 → legacy 单 unit 路径(会有 drain 停机窗口)" >&2
   for s in A B; do
-    systemctl stop "$(egress_slot_unit "$s" socket)" "$(egress_slot_unit "$s" service)" 2>/dev/null || true
+    egress_stop_slot "$s" wait 2>/dev/null || true
   done
   systemctl restart "$V5_EGRESS_UNIT" && egress_wait_shared_port
 }
 
 # 槽翻转主体。幂等:任何一步失败 return 1(saga 会回滚并重跑本函数,彼时 live 已翻回)。
 egress_slot_flip() {
-  local cur="" target old_sock old_svc new_sock new_svc legacy_state
+  local cur="" target new_sock new_svc legacy_state
   if ! egress_live_release_has_slots; then
     egress_restart_legacy_single_unit
     return
@@ -1559,7 +1624,7 @@ egress_slot_flip() {
     tb="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$(egress_slot_unit B service)")"
     if (( ${ta:-0} <= ${tb:-0} )); then older=A; else older=B; fi
     echo "  egress: A/B 同时 active,先阻塞停掉更老的槽 $older(会等其 drain)" >&2
-    systemctl stop "$(egress_slot_unit "$older" socket)" "$(egress_slot_unit "$older" service)" || return 1
+    egress_stop_slot "$older" wait || return 1
   fi
   if egress_slot_is_active A; then cur=A; target=B
   elif egress_slot_is_active B; then cur=B; target=A
@@ -1587,29 +1652,24 @@ egress_slot_flip() {
   if ! systemctl start "$new_svc"; then
     journalctl -u "$new_svc" -n 20 --no-pager >&2 || true
     tail -n 40 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
-    systemctl stop "$new_sock" "$new_svc" 2>/dev/null || true
+    egress_stop_slot "$target" wait 2>/dev/null || true
     return 1
   fi
   if ! egress_wait_slot_ready "$target"; then
     tail -n 40 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
     # 新槽没起来:旧槽(若有)仍在服务,撤回新槽,保持现网不动。
-    systemctl stop "$new_sock" "$new_svc" 2>/dev/null || true
+    egress_stop_slot "$target" wait 2>/dev/null || true
     return 1
   fi
   egress_wait_shared_port || return 1
-  # 新槽已接管共享口 → 摘旧槽。socket 与 service 一起 stop:只停 service 会留下一个
-  # 没人 accept 的 listener(systemd 会按需再拉起),连接会卡在它的 backlog 里。
-  # --no-block:旧槽 drain 自己的在飞流(≤31min),不阻塞发布。
+  # 先关闭旧 socket，再异步停止服务；旧流可继续 drain，但不可遗留 LISTEN。
   if [[ -n "$cur" ]]; then
-    old_sock="$(egress_slot_unit "$cur" socket)"
-    old_svc="$(egress_slot_unit "$cur" service)"
-    echo "  egress: 新槽 $target 就绪,stop --no-block 旧槽 $cur(后台 drain)" >&2
-    systemctl stop --no-block "$old_sock" "$old_svc" || return 1
-    systemctl disable "$old_sock" "$old_svc" >/dev/null 2>&1 || true
+    echo "  egress: 新槽 $target 就绪,先关闭旧槽 $cur socket,再后台 drain service" >&2
+    egress_stop_slot "$cur" async || return 1
+    systemctl disable "$(egress_slot_unit "$cur" socket)" "$(egress_slot_unit "$cur" service)" >/dev/null 2>&1 || true
   fi
   systemctl enable "$new_sock" "$new_svc" >/dev/null 2>&1 || true
-  # 旧槽 close() 后共享口必须仍可连(reuseport 组里还有新槽)。
-  egress_wait_shared_port
+  egress_wait_single_listener "$target"
 }
 
 egress_slot_flip_then_master_restart() {
@@ -1976,9 +2036,12 @@ cutover_smoke_against_release() { # <rel>
   [[ "$got_build" == "$expected_build" ]] \
     || { cutover_fail "cutover smoke: GET / oc-build=$got_build 不等于 release dist $expected_build"; return 1; }
   cutover_clog "  ✓ GET / oc-build=$got_build 匹配 release dist"
-  local eg
-  eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
-  echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1 \
+  local eg listener_count
+  if egress_live_release_has_slots; then
+    listener_count="$(egress_shared_listener_count)" || { cutover_fail "cutover smoke: 无法读取 egress listener"; return 1; }
+    [[ "$listener_count" == 1 ]] || { egress_listener_diagnostics; cutover_fail "cutover smoke: egress listener=$listener_count (expected 1)"; return 1; }
+  fi
+  eg="$(egress_probe_shared_health)" \
     || { cutover_fail "cutover smoke: egress-health 失败"; return 1; }
   cutover_clog "  ✓ egress-health ok (slot=$(echo "$eg" | jq -r '.slot // "legacy"') mode=$(echo "$eg" | jq -r '.listenMode // "self_bind"') serving=$(egress_describe_topology))"
   # 双槽下额外要求:恰有一个槽 active(翻转后旧槽 deactivating 不算 active)且共享口
@@ -1998,7 +2061,7 @@ cutover_smoke_against_release() { # <rel>
 }
 
 cutover_smoke_healthz_only() {
-  local hz i ok=0 eg
+  local hz i ok=0
   for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
@@ -2008,8 +2071,7 @@ cutover_smoke_healthz_only() {
     sleep 2
   done
   [[ "$ok" == 1 ]] || return 1
-  eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
-  echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1
+  egress_probe_shared_health >/dev/null
 }
 
 cutover_survivor_script() {
