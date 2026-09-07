@@ -3354,6 +3354,7 @@ export function App() {
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
             lastUserText={lastUserText}
+            draftKey={activeId ?? "new"}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}
