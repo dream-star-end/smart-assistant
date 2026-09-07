@@ -197,7 +197,7 @@ describe("Composer 目标 chip", () => {
     );
     const chip = screen.getByTestId("composer-goal-chip");
     expect(chip).toHaveTextContent("迁移并验证");
-    expect(chip).toHaveTextContent("进行中");
+    expect(chip).toHaveTextContent("已启用");
     fireEvent.click(chip);
     expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
   });
