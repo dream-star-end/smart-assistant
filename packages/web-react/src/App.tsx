@@ -3363,6 +3363,7 @@ export function App() {
                 send(t);
               }}
               onDismiss={() => setChatError(null)}
+              onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
             />
           )}
           <Composer
