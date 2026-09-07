@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -159,6 +159,29 @@ describe("device CA", () => {
       assert.equal(san.dns.some((d) => d.toLowerCase() === "desktop.example.test"), false);
       assert.equal(await assertOriginCertCoversHost(second.certPem, "desktop.example.test"), false);
       assert.equal(await loadDesktopOriginMaterialIfPresent() !== null, true);
+    } finally {
+      if (prevDir === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
+      else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevDir;
+      if (prevHost === undefined) delete process.env.OC_DESKTOP_PUBLIC_HOST;
+      else process.env.OC_DESKTOP_PUBLIC_HOST = prevHost;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("loadDesktopOriginMaterialIfPresent succeeds without origin.key", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "oc-dca-nokey-"));
+    const prevDir = process.env.OPENCLAUDE_DEVICE_CA_DIR;
+    const prevHost = process.env.OC_DESKTOP_PUBLIC_HOST;
+    process.env.OPENCLAUDE_DEVICE_CA_DIR = dir;
+    delete process.env.OC_DESKTOP_PUBLIC_HOST;
+    try {
+      const issued = await ensureDesktopOriginCert();
+      await unlink(path.join(dir, "origin.key"));
+      const loaded = await loadDesktopOriginMaterialIfPresent();
+      assert.ok(loaded);
+      assert.equal(loaded.certPem, issued.certPem);
+      assert.equal(loaded.caCertPem, issued.caCertPem);
+      assert.equal("keyPem" in loaded, false);
     } finally {
       if (prevDir === undefined) delete process.env.OPENCLAUDE_DEVICE_CA_DIR;
       else process.env.OPENCLAUDE_DEVICE_CA_DIR = prevDir;

@@ -14,6 +14,7 @@ import {
   type DesktopIdentityRepo,
 } from "../auth/desktopIdentity.js";
 import { createPgDesktopIdentityRepo } from "./desktopEnroll.js";
+import { liveKeyringFp } from "./desktopBootstrap.js";
 import { DESKTOP_REGISTER_PATH, handleDesktopRegisterUpgrade } from "../ws/desktopRegister.js";
 import {
   classifyDesktopPath,
@@ -124,7 +125,11 @@ export async function startDesktopTlsListener(opts: DesktopTlsListenerOpts): Pro
       socket.destroy();
       return;
     }
-    handleDesktopRegisterUpgrade(req, socket, head, { identityRepo: repo, v3Deps: opts.v3Deps ?? null });
+    handleDesktopRegisterUpgrade(req, socket, head, {
+      identityRepo: repo,
+      v3Deps: opts.v3Deps ?? null,
+      expectedKeyringFp: () => liveKeyringFp(),
+    });
   });
 
   await new Promise<void>((resolve, reject) => {

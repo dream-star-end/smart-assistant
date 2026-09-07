@@ -83,7 +83,8 @@ function publicWebOrigin(deps: CommercialHttpDeps): string {
   return 'https://claudeai.chat'
 }
 
-function liveKeyringFp(): string {
+/** Same fingerprint runtime-manifest and register_ok must emit. */
+export function liveKeyringFp(): string {
   try {
     return desktopKeyringFpFrom(authorityKeyringProvider()())
   } catch {
@@ -91,7 +92,6 @@ function liveKeyringFp(): string {
   }
 }
 
-/** Exported so tests can pin against the same function register_ok uses. */
 function authorizeRuntimeManifest(req: IncomingMessage, deps: CommercialHttpDeps): void {
   const tls = deps.desktopPeerCert
     ? extractDesktopTlsContext(req, { peerCert: deps.desktopPeerCert })
