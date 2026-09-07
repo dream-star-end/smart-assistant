@@ -72,4 +72,35 @@ describe("v5 selfhost cutover survivor / saga contract", () => {
     assert.equal(result.status, 0, result.stderr + result.stdout);
     assert.match(`${result.stdout}`, /transform-ok/);
   });
+
+  // 2026-09-07:两班列车 `cutover smoke: egress-health 失败` 根因 —— 旧槽 service 与 .socket
+  // 一条 `stop --no-block` 下去,Requires= 让 socket 的 stop 排在 service drain(≤31min)之后,
+  // 期间 .socket 仍持有 reuseport 组里一个没人 accept 的 listener,约一半新连接被黑洞。
+  // 契约:先阻塞关旧 .socket(ignore-dependencies),再 --no-block 停 service;翻转末尾断言
+  // 共享口无孤儿 listener;smoke 的 egress-health 有界重试。deploy 与 watch 两处同语义。
+  test("egress slot flip closes the old .socket before draining its service (no reuseport black hole)", () => {
+    const src = deploy();
+    const flip = src.match(/^egress_slot_flip\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? "";
+    assert.ok(flip.length > 0, "egress_slot_flip 函数缺失");
+    assert.doesNotMatch(
+      flip,
+      /systemctl stop --no-block "\$old_sock" "\$old_svc"/,
+      "旧槽 socket+service 不得一条 --no-block 合停:socket 会等 service drain 完才关",
+    );
+    const sockStop = flip.indexOf('systemctl stop --job-mode=ignore-dependencies "$old_sock"');
+    const svcStop = flip.indexOf('systemctl stop --no-block "$old_svc"');
+    assert.ok(sockStop > 0, "必须先阻塞关旧 .socket(ignore-dependencies)");
+    assert.ok(svcStop > sockStop, "旧 service 的 --no-block stop 必须在 .socket 关闭之后");
+    assert.ok(flip.indexOf("egress_assert_no_orphan_listener") > svcStop, "翻转末尾必须断言无孤儿 listener");
+    assert.match(src, /^egress_assert_no_orphan_listener\(\) \{/m);
+    const smoke = src.match(/^cutover_smoke_against_release\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? "";
+    assert.match(smoke, /for i in \$\(seq 1 5\); do\n\s*eg="\$\(curl[^\n]*egress-health/, "egress-health 需有界重试");
+
+    const watch = readFileSync(path.join(root, "scripts/v5-selfhost-watch.sh"), "utf8");
+    const wflip = watch.match(/^restart_egress_for_live\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? "";
+    const wSock = wflip.indexOf("systemctl stop --job-mode=ignore-dependencies");
+    const wSvc = wflip.indexOf("systemctl stop --no-block");
+    assert.ok(wSock > 0 && wSvc > wSock, "watch.sh 槽翻转须与 deploy 同序:先关旧 .socket 再 --no-block 停 service");
+    assert.doesNotMatch(wflip, /stop --no-block "\$\{WATCH_EGRESS_SLOT_TPL\/@\.service\/@\$cur\.socket\}"/);
+  });
 });
