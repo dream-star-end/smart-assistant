@@ -987,8 +987,9 @@ export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 export function shouldShowScrollToBottom(
   following: boolean | undefined,
   messageCount: number,
+  distance = Number.POSITIVE_INFINITY,
 ): boolean {
-  return messageCount > 0 && following === false;
+  return messageCount > 0 && following === false && distance > 80;
 }
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
@@ -1093,6 +1094,7 @@ export function MessageList({
    */
   followBottomRef?: {
     current: boolean;
+    jumpToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
     scrollToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
     correctTo?: (
       el: { scrollTop: number; scrollHeight: number; clientHeight: number },
@@ -1128,7 +1130,7 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
-  const [following, setFollowing] = useState<boolean | undefined>(() => followBottomRef?.current);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [findCursor, setFindCursor] = useState(0);
   const findMatchesList = useMemo(
@@ -1142,17 +1144,33 @@ export function MessageList({
   useEffect(() => {
     const el = scrollParent;
     if (!el || !followBottomRef) {
-      setFollowing(followBottomRef?.current);
+      setShowScrollToBottom(false);
       return;
     }
-    const sync = () => setFollowing(followBottomRef.current);
-    sync();
-    const onScroll = () => {
-      requestAnimationFrame(sync);
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      // Store only visibility, not pixel distance: scrolling within the same
+      // state must not force the whole MessageList to re-render every frame.
+      setShowScrollToBottom(shouldShowScrollToBottom(
+        followBottomRef.current, messages.length, el.scrollHeight - el.clientHeight - el.scrollTop,
+      ));
     };
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, [scrollParent, followBottomRef]);
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(sync);
+    };
+    sync();
+    el.addEventListener("scroll", schedule, { passive: true });
+    // Viewport/keyboard or content changes need not produce a scroll event.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    observer?.observe(el);
+    if (listRootRef.current) observer?.observe(listRootRef.current);
+    return () => {
+      el.removeEventListener("scroll", schedule);
+      observer?.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [scrollParent, followBottomRef, sessionId, messages.length]);
   const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
@@ -1941,7 +1959,6 @@ export function MessageList({
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
-  const showScrollToBottom = shouldShowScrollToBottom(following, messages.length);
   const findCurrent =
     findMatchesList.length === 0
       ? -1
@@ -2101,7 +2118,7 @@ export function MessageList({
           (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
           几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
           -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
-      {followBottomRef && messages.length > 0 && (
+      {followBottomRef?.jumpToBottom && messages.length > 0 && (
         <div
           aria-hidden={!showScrollToBottom}
           data-testid="scroll-to-bottom-dock"
@@ -2118,10 +2135,15 @@ export function MessageList({
               (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
             }
             onClick={() => {
-              if (!scrollParent || !followBottomRef) return;
-              followBottomRef.current = true;
-              followBottomRef.scrollToBottom?.(scrollParent);
-              setFollowing(true);
+              if (!scrollParent || !followBottomRef?.jumpToBottom) return;
+              pendingExpandCorrectionRef.current = null;
+              viewportPreserveLockRef.current = false;
+              lastViewportAnchorRef.current = null;
+              followBottomRef.jumpToBottom(scrollParent);
+              setShowScrollToBottom(shouldShowScrollToBottom(
+                followBottomRef.current, messages.length,
+                scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
+              ));
             }}
           >
             <ChevronDown size={18} />

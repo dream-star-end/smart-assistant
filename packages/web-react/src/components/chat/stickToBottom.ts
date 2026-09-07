@@ -131,6 +131,15 @@ export function createStickToBottomController() {
     recordWrite(el);
   };
 
+  // An explicit user command is not an automatic pin. It supersedes the old
+  // upward gesture (including touchend's momentum fence) and its write baseline.
+  // Keep scrollToBottom/correctTo guarded; only this command may reset intent.
+  const jumpToBottom = (el: StickScroller) => {
+    reset();
+    el.scrollTop = maxScrollTop(el);
+    recordWrite(el);
+  };
+
   const correctTo = (el: StickScroller, nextTop: number) => {
     // The user owns scrollTop right now; the anchor is recaptured on the next
     // scroll event, so this correction is simply not needed. A transient input
@@ -202,6 +211,7 @@ export function createStickToBottomController() {
       following.current = value;
     },
     scrollToBottom,
+    jumpToBottom,
     correctTo,
   };
 
@@ -219,6 +229,7 @@ export function createStickToBottomController() {
     beginWheelFence,
     endWheelFence,
     scrollToBottom,
+    jumpToBottom,
     correctTo,
     onScroll,
   };
