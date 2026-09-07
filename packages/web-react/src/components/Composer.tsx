@@ -106,6 +106,7 @@ export function Composer({
   fontSize = "default",
   lastUserText,
   draftKey,
+  goalOpenRequest,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -148,6 +149,8 @@ export function Composer({
   lastUserText?: string;
   /** 会话级草稿键；变化时若输入框为空则还原 sessionStorage 草稿。 */
   draftKey?: string;
+  /** 外部请求打开目标对话框：nonce 变化即打开（与 prefill 同模式）。 */
+  goalOpenRequest?: number;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -166,6 +169,10 @@ export function Composer({
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   // 目标对话框开合:入口从会话头部迁至「+」菜单后,由 Composer 持有开合态(菜单项触发打开)。
   const [goalOpen, setGoalOpen] = useState(false);
+  useEffect(() => {
+    if (!goalOpenRequest) return;
+    setGoalOpen(true);
+  }, [goalOpenRequest]);
   // 「+」菜单受控开合:附件项须在 onSelect 里 preventDefault 阻止 Radix 同步关菜单
   // (卸载会杀掉 label 的原生激活,见附件项注释),菜单关闭改由我们在宏任务里手动触发。
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);

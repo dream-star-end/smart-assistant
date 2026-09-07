@@ -149,3 +149,17 @@ describe("Composer sendKey", () => {
     expect(onSend).toHaveBeenCalledWith("hello", undefined, undefined);
   });
 });
+
+describe("Composer goalOpenRequest", () => {
+  test("nonce 变化打开 GoalDialog", () => {
+    const { rerender } = render(
+      <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} />,
+    );
+    expect(screen.queryByPlaceholderText("这次会话要达成什么？")).toBeNull();
+    rerender(
+      <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} goalOpenRequest={1} />,
+    );
+    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+    expect(screen.getByText("会话目标")).toBeInTheDocument();
+  });
+});

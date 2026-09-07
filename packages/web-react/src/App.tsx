@@ -395,6 +395,7 @@ export function App() {
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [goalOpenNonce, setGoalOpenNonce] = useState(0);
   const [messageReplyTarget, setMessageReplyTarget] = useState<{
     sessionId: string;
     quote: MessageReplyQuote;
@@ -3233,6 +3234,7 @@ export function App() {
               agent={agent}
               onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
               onChangeAgent={() => setPickerOpen(true)}
+              onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
             />
           ) : demo ? (
             <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
@@ -3397,6 +3399,7 @@ export function App() {
             onGoalAction={demo ? undefined : transitionSessionGoal}
             sendKey={composerPrefs.sendKey}
             fontSize={composerPrefs.fontSize}
+            goalOpenRequest={goalOpenNonce}
           />
         </div>
         </>
