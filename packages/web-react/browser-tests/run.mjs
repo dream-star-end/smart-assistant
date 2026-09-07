@@ -2872,8 +2872,15 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
       throw new Error(`管理中心仍占侧栏主区(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: "打开使用教程" }).count() !== 1) {
-      throw new Error(`底栏教程图标丢失(${theme})`);
+    const gallery = sidebar.getByRole("button", { name: "打开案例展厅", exact: true });
+    if (await gallery.count() !== 1) {
+      throw new Error(`底栏案例展厅入口不唯一或丢失(${theme})`);
+    }
+    await gallery.waitFor({ state: "visible", timeout: 3000 });
+    const galleryOpens = await page.evaluate(() => window.__densityGalleryOpens);
+    await gallery.click();
+    if (await page.evaluate(() => window.__densityGalleryOpens) !== galleryOpens + 1) {
+      throw new Error(`案例展厅入口没有精确触发一次打开(${theme})`);
     }
     if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
       throw new Error(`底栏主题开关丢失(${theme})`);
