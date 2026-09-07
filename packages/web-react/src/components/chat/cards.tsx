@@ -42,7 +42,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Avatar, Badge, Button, IconButton, TimeAgo } from "../ui";
+import { Alert, Avatar, Badge, Button, IconButton, TimeAgo, TooltipProvider } from "../ui";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
@@ -224,7 +224,9 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
     <div className="mt-1.5 flex flex-wrap items-center gap-2 text-faint">
       {showTime && (
         <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap">
-          <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+          <TooltipProvider>
+            <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+          </TooltipProvider>
         </time>
       )}
       {waived && (

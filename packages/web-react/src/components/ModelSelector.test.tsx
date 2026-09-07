@@ -5,7 +5,10 @@ import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  localStorage.clear()
+})
 
 const MODELS: PublicModel[] = [
   { id: 'glm-5.2', display_name: 'GLM-5.2' },
@@ -583,7 +586,7 @@ describe('ModelSelector 搜索', () => {
     const items = screen.getAllByRole('menuitem')
     expect(items).toHaveLength(1)
     expect(items[0]).toHaveTextContent('Zebra Unique')
-    expect(screen.queryByText('Alpha 0')).toBeNull()
+    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(false)
   })
 
   it('无匹配时显示「无匹配模型」', async () => {
