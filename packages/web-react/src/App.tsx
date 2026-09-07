@@ -370,6 +370,7 @@ export function App() {
   const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
+  const [findOpen, setFindOpen] = useState(false);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
   // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
   const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
@@ -1750,10 +1751,15 @@ export function App() {
         setBoardOpen(false);
         handleNew();
       }
+      if (action === "find") {
+        if (!inWorkspace || demo || wsMessages.length <= 0) return;
+        e.preventDefault();
+        setFindOpen(true);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -3160,6 +3166,7 @@ export function App() {
           onNew={handleNew}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
+          onOpenFind={demo ? undefined : () => setFindOpen(true)}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
@@ -3307,6 +3314,7 @@ export function App() {
                   historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
                   sessionId={activeId}
                   followBottomRef={stickToBottomRef}
+                  find={findOpen ? { onClose: () => setFindOpen(false) } : undefined}
                 />
               </SessionTimelineBoundary>
             </ResponseRatingProvider>

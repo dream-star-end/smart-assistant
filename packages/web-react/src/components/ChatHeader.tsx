@@ -1,5 +1,5 @@
 import type { CursorContextTier } from "@openclaude/protocol";
-import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Search, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
@@ -35,6 +35,7 @@ export function ChatHeader({
   onNew,
   onOpenMobileNav,
   onOpenInbox,
+  onOpenFind,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
@@ -80,6 +81,8 @@ export function ChatHeader({
   onOpenMobileNav?: () => void;
   /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
   onOpenInbox?: () => void;
+  /** 打开会话内查找条（省略则不渲染查找键，如 demo）。按钮常驻，不随查找条开关挂卸载。 */
+  onOpenFind?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
@@ -228,6 +231,16 @@ export function ChatHeader({
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
+        {onOpenFind && (
+          <IconButton
+            onClick={onOpenFind}
+            aria-label="会话内查找"
+            title="会话内查找 (⌘F)"
+            shape="square"
+          >
+            <Search size={18} />
+          </IconButton>
+        )}
         {onOpenInbox && (
           <div className="relative">
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">

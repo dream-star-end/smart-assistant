@@ -3205,3 +3205,45 @@ describe("主时间线回到底部 FAB", () => {
     scroller.remove();
   });
 });
+
+describe("MessageList 会话内查找", () => {
+  test("输入 query 计数正确、命中行有 data-find-current；下一处走 correctTo 且不调用 scrollIntoView", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    const followBottomRef = {
+      current: true,
+      correctTo: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const rows = [
+      mk("user", { id: "find-u1", text: "苹果派", status: "sent" }),
+      mk("assistant", { id: "find-a1", text: "苹果很好吃" }),
+      mk("user", { id: "find-u2", text: "香蕉", status: "sent" }),
+      mk("tool", { id: "find-t1", text: "苹果工具", toolName: "Bash" }),
+    ];
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        find={{ onClose: vi.fn() }}
+      />,
+      { container: scroller },
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "在会话中查找" }), {
+      target: { value: "苹果" },
+    });
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    const current = scroller.querySelector("[data-find-current]");
+    expect(current).toHaveAttribute("data-chat-virtual-key", "find-u1");
+    fireEvent.click(screen.getByRole("button", { name: "下一处" }));
+    expect(followBottomRef.current).toBe(false);
+    expect(followBottomRef.correctTo).toHaveBeenCalled();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    scroller.remove();
+  });
+});

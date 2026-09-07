@@ -124,3 +124,17 @@ describe("ChatHeader 会话未读角标", () => {
     expect(inboxBadge).toHaveClass("bg-danger");
   });
 });
+
+describe("ChatHeader 会话内查找", () => {
+  it("无 onOpenFind 时不渲染查找按钮", () => {
+    renderHeader();
+    expect(screen.queryByRole("button", { name: "会话内查找" })).toBeNull();
+  });
+
+  it("有 onOpenFind 时渲染查找按钮且点击回调", () => {
+    const onOpenFind = vi.fn();
+    renderHeader({ onOpenFind });
+    fireEvent.click(screen.getByRole("button", { name: "会话内查找" }));
+    expect(onOpenFind).toHaveBeenCalledTimes(1);
+  });
+});
