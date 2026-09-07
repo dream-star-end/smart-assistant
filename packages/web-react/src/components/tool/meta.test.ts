@@ -159,6 +159,14 @@ describe("toolSummary 摘要 (P5)", () => {
   test("input 为 null → 空摘要", () => {
     expect(toolSummary("Bash", null)).toBe("");
   });
+  test("Bash 长命令截断为 40 字加省略号", () => {
+    const cmd = "a".repeat(50);
+    expect(toolSummary("Bash", { command: cmd })).toBe(`${"a".repeat(40)}…`);
+    expect(toolSummary("Bash", { command: cmd }).length).toBe(41);
+  });
+  test("Read 显示路径", () => {
+    expect(toolSummary("Read", { file_path: "src/App.tsx" })).toBe("读取 src/App.tsx");
+  });
 });
 
 describe("oc-* CLI 语义卡 (Bash 特判)", () => {

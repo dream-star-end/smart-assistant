@@ -80,9 +80,9 @@ function promoLabelOf(model: { promo_label?: unknown } | undefined): string | un
   return typeof value === 'string' && value.trim() ? value : undefined
 }
 
-function PromoBadge({ label }: { label?: string }) {
+function PromoBadge({ label, className }: { label?: string; className?: string }) {
   if (!label) return null
-  return <Badge tone="warning">{label}</Badge>
+  return <Badge tone="warning" className={className}>{label}</Badge>
 }
 
 export type LockedSelectInfo = {
@@ -499,7 +499,7 @@ export function ModelSelector({
             {teamEngineActive && <span className="hidden sm:inline">{'团队模式 · '}</span>}
             <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">{label}</span>
             {!teamEngineActive && <CostMark model={selected} />}
-            {!teamEngineActive && <PromoBadge label={selectedPromo} />}
+            {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
             <ChevronDown size={14} className="text-faint" />
           </button>
         </DropdownMenuTrigger>

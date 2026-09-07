@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, test, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { MAIN_AGENT } from '../lib/agents'
 import { EmptyState } from './EmptyState'
+
+afterEach(cleanup)
 
 describe('EmptyState first-task starters', () => {
   test('shows useful starters and only asks the composer to prefill the chosen text', () => {
@@ -30,5 +32,19 @@ describe('EmptyState first-task starters', () => {
     )
     expect(screen.getByRole('button', { name: '帮我把下面这段内容整理成要点' })).toBeTruthy()
     expect(screen.getByRole('button', { name: '用一句话说明你能帮我做什么' })).toBeTruthy()
+  })
+
+  test('有 onOpenGoal 时渲染设定目标文字链', () => {
+    const onOpenGoal = vi.fn()
+    render(
+      <EmptyState agent={MAIN_AGENT} onPrefill={() => {}} onChangeAgent={() => {}} onOpenGoal={onOpenGoal} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '为这次会话设定目标' }))
+    expect(onOpenGoal).toHaveBeenCalledOnce()
+  })
+
+  test('无 onOpenGoal 不渲染设定目标链', () => {
+    render(<EmptyState agent={MAIN_AGENT} onPrefill={() => {}} onChangeAgent={() => {}} />)
+    expect(screen.queryByRole('button', { name: '为这次会话设定目标' })).toBeNull()
   })
 })

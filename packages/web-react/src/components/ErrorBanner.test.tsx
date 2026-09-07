@@ -26,3 +26,30 @@ test("聊天错误条在窄屏把操作区换到下一行，且重试/关闭仍�
   expect(onRetry).toHaveBeenCalledTimes(1);
   expect(onDismiss).toHaveBeenCalledTimes(1);
 });
+
+test("有 onSwitchModel 时在重试右侧渲染切换模型", () => {
+  const onSwitchModel = vi.fn();
+  render(
+    <ErrorBanner
+      error={{ message: "模型不可用", retryText: "原问题" }}
+      onRetry={() => {}}
+      onDismiss={() => {}}
+      onSwitchModel={onSwitchModel}
+    />,
+  );
+  const switchBtn = screen.getByRole("button", { name: "切换模型" });
+  expect(switchBtn).toHaveClass("[@media(hover:none)]:h-11");
+  fireEvent.click(switchBtn);
+  expect(onSwitchModel).toHaveBeenCalledTimes(1);
+});
+
+test("无 onSwitchModel 时不渲染切换模型", () => {
+  render(
+    <ErrorBanner
+      error={{ message: "网络错误", retryText: "原问题" }}
+      onRetry={() => {}}
+      onDismiss={() => {}}
+    />,
+  );
+  expect(screen.queryByRole("button", { name: "切换模型" })).toBeNull();
+});

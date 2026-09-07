@@ -12,10 +12,12 @@ export function EmptyState({
   agent,
   onPrefill,
   onChangeAgent,
+  onOpenGoal,
 }: {
   agent: Agent;
   onPrefill: (text: string) => void;
   onChangeAgent: () => void;
+  onOpenGoal?: () => void;
 }) {
   return (
     <div className="flex min-h-full flex-col items-center justify-center px-4 py-12 text-center animate-fade">
@@ -47,6 +49,15 @@ export function EmptyState({
           </button>
         ))}
       </div>
+      {onOpenGoal && (
+        <button
+          type="button"
+          className="mt-4 text-caption text-muted underline-offset-2 hover:underline"
+          onClick={onOpenGoal}
+        >
+          为这次会话设定目标
+        </button>
+      )}
     </div>
   );
 }
