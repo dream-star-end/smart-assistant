@@ -340,6 +340,21 @@ export function useChatSocket(opts: {
           sessionId: p.sessionId,
         }, authRef.current?.snapshot().token);
       },
+      reportProblemCard: (p) => {
+        reportClientFriction({
+          surface: "chat",
+          stage: "problem_card",
+          code: p.code,
+          outcome: p.outcome,
+          correlation: `${p.sessionId}:${p.rootCmid}`,
+          presentation: p.presentation,
+          path: p.path,
+          reason: p.reason,
+          attempts: p.attempts,
+          traceId: p.traceId,
+          sessionId: p.sessionId,
+        }, authRef.current?.snapshot().token);
+      },
       // resume_failed / 重连 reconcile：有游标走 REST 增量、无游标才全量；两者都以 server
       // 为最终权威源并走 applyServerMessages 收口（含 client-owned 行保留与团队卡归一化）。
       syncSession: async (sessId, context) => {

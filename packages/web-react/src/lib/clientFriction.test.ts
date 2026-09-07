@@ -161,6 +161,56 @@ describe("client friction reporter", () => {
     ]);
   });
 
+  test("problem_card dims pass through; invalid path/reason/presentation dropped", () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false })));
+
+    reportClientFriction({
+      eventId: "pc_1",
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "failed",
+      correlation: "sess-1:u-root",
+      presentation: "red",
+      path: "immediate",
+      reason: "checkpoint_unsafe",
+      attempts: 1,
+    }, "token");
+    reportClientFriction({
+      eventId: "pc_2",
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "failed",
+      correlation: "sess-1:u-root",
+      presentation: "purple" as never,
+      path: "NOT VALID",
+      reason: "Has Spaces",
+    }, "token");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const valid = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
+    expect(valid).toMatchObject({
+      event_id: "pc_1",
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "failed",
+      correlation: "sess-1:u-root",
+      presentation: "red",
+      path: "immediate",
+      reason: "checkpoint_unsafe",
+      attempts: 1,
+    });
+    const dropped = JSON.parse(String((fetchMock.mock.calls[1]![1] as RequestInit).body));
+    expect(dropped.correlation).toBe("sess-1:u-root");
+    expect(dropped).not.toHaveProperty("path");
+    expect(dropped).not.toHaveProperty("reason");
+    expect(dropped).not.toHaveProperty("presentation");
+  });
+
   test("reportClientFrictionOnce dedupes the same key", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);

@@ -1,3 +1,10 @@
+export type ClientFrictionPresentation =
+  | "red"
+  | "yellow"
+  | "soft"
+  | "banner"
+  | "placeholder";
+
 export type ClientFrictionSignal = {
   eventId?: string;
   surface: string;
@@ -8,6 +15,11 @@ export type ClientFrictionSignal = {
   latencyMs?: number;
   traceId?: string;
   sessionId?: string;
+  /** 稳定事件键；problem_card 必须传 `${sessionId}:${rootCmid}`，禁止依赖默认 event_id。 */
+  correlation?: string;
+  presentation?: ClientFrictionPresentation;
+  path?: string;
+  reason?: string;
   model?: string;
   provider?: string;
   entitySlug?: string;
@@ -21,6 +33,34 @@ export type ClientFrictionSignal = {
 
 const SAFE_ERROR_NAME = /^[A-Za-z0-9_.$-]{1,64}$/;
 const SAFE_SCRIPT_REF = /^[A-Za-z0-9._-]{1,120}$/;
+const SAFE_FRICTION_PATH = /^[a-z0-9_]{1,32}$/;
+const SAFE_FRICTION_REASON = /^[a-z0-9_]{1,48}$/;
+const SAFE_FRICTION_CORRELATION = /^[A-Za-z0-9_:-]{1,224}$/;
+const FRICTION_PRESENTATIONS = new Set<ClientFrictionPresentation>([
+  "red",
+  "yellow",
+  "soft",
+  "banner",
+  "placeholder",
+]);
+
+function boundedFrictionPath(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_FRICTION_PATH.test(value) ? value : undefined;
+}
+
+function boundedFrictionReason(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_FRICTION_REASON.test(value) ? value : undefined;
+}
+
+function boundedFrictionCorrelation(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_FRICTION_CORRELATION.test(value) ? value : undefined;
+}
+
+function boundedFrictionPresentation(value: unknown): ClientFrictionPresentation | undefined {
+  return typeof value === "string" && FRICTION_PRESENTATIONS.has(value as ClientFrictionPresentation)
+    ? (value as ClientFrictionPresentation)
+    : undefined;
+}
 
 /** 取脚本 URL 的文件基名(去 query/hash);不符合有界模式时丢弃而不是截断。 */
 export function scriptRefFromSource(source: unknown): string | undefined {
@@ -83,6 +123,10 @@ function wireSignal(signal: ClientFrictionSignal, eventId: string): Record<strin
     latency_ms: signal.latencyMs,
     trace_id: signal.traceId,
     session_id: signal.sessionId,
+    correlation: boundedFrictionCorrelation(signal.correlation),
+    presentation: boundedFrictionPresentation(signal.presentation),
+    path: boundedFrictionPath(signal.path),
+    reason: boundedFrictionReason(signal.reason),
     model: signal.model,
     provider: signal.provider,
     entity_slug: signal.entitySlug,
