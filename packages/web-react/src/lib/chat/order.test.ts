@@ -173,6 +173,31 @@ describe("repairPostFinalProcessOrder", () => {
 describe("sinkOpenPermissionPrompts (INC-20260904-EXITPLAN-PROMPT-BURIED)", () => {
   const NOW = 1_000_000;
 
+  test("a stamped prompt whose owner is not loaded never adopts the visible turn", () => {
+    const rows = [
+      row("u2", "user"),
+      row("q-missing", "permission", { _turnOwnerId: "not-loaded", _resolved: false }),
+      row("t2", "thinking"),
+    ];
+    expect(sinkOpenPermissionPrompts(rows, NOW)).toBe(rows);
+    expect(repairPostFinalProcessOrder(rows, NOW)).toBe(rows);
+  });
+
+  test("early and late owned prompts are all retained and sink to their actual turns", () => {
+    const rows = [
+      row("q2", "permission", { _turnOwnerId: "u2", _resolved: false }),
+      row("u1", "user"),
+      row("a1", "assistant", { _clientMessageId: "u1" }),
+      row("u2", "user"),
+      row("a2", "assistant", { _clientMessageId: "u2" }),
+      row("q1", "permission", { _turnOwnerId: "u1", _resolved: false }),
+    ];
+    const repaired = sinkOpenPermissionPrompts(rows, NOW);
+    expect(repaired.map((m) => m.id)).toEqual(["u1", "a1", "q1", "u2", "a2", "q2"]);
+    expect(repaired.map((m) => m.id).sort()).toEqual(rows.map((m) => m.id).sort());
+    expect(sinkOpenPermissionPrompts(repaired, NOW)).toBe(repaired);
+  });
+
   test("an open prompt buried under replayed process rows sinks to its turn tail", () => {
     const user = row("u1", "user");
     const prompt = row("p1", "permission", { _turnOwnerId: "u1", _resolved: false, ts: 10 });

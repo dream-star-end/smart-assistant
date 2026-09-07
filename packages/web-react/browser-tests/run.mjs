@@ -3398,6 +3398,12 @@ await check("T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且
   if (JSON.stringify(result.incrementalIds) !== JSON.stringify(["u", "g", "a", "q"])) {
     throw new Error(`T67 applyServerIncremental 未自愈:${JSON.stringify(result)}`);
   }
+  if (JSON.stringify(result.cachedIds) !== JSON.stringify(["g", "q"])) {
+    throw new Error(`T67 未覆盖 toStored 剥离 timeline user 的原点:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.cacheReloadIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 正确内存经缓存、重载、full merge 后越过 owner:${JSON.stringify(result)}`);
+  }
   if (JSON.stringify(result.recoverIds) !== JSON.stringify([
     "u-first",
     "m-recover-3hev56n0kpyl1",

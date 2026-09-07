@@ -32,14 +32,6 @@ function isLocalProcessRow(message: ChatMessage, nowMs: number): boolean {
   return isLocalClientOwnedCard(message) && !isOpenPermissionPrompt(message, nowMs);
 }
 
-function collectUserIds(messages: ChatMessage[]): Set<string> {
-  const userIds = new Set<string>();
-  for (const message of messages) {
-    if (message?.role === "user" && nonEmptyString(message.id)) userIds.add(message.id);
-  }
-  return userIds;
-}
-
 /**
  * Prefer an explicit `_turnOwnerId` that names a user in this snapshot.
  * Legacy exact `_clientMessageId` is accepted only when that user is present.
@@ -138,53 +130,50 @@ export function sinkOpenPermissionPrompts(
   nowMs: number = Date.now(),
 ): ChatMessage[] {
   if (messages.length < 2) return messages;
-  const userIds = collectUserIds(messages);
-  const out: ChatMessage[] = [];
-  const pendingByOwner = new Map<string, ChatMessage[]>();
-  const carriedUnowned: ChatMessage[] = [];
-  let seenUser = false;
+  const ownerEnd = new Map<string, number>();
   let currentUserId: string | undefined;
-
-  const flushOwner = (ownerId: string | undefined): void => {
-    if (!ownerId) return;
-    const pending = pendingByOwner.get(ownerId);
-    if (!pending || pending.length === 0) return;
-    out.push(...pending);
-    pendingByOwner.delete(ownerId);
-  };
-
+  for (let index = 0; index < messages.length; index++) {
+    const m = messages[index];
+    if (m?.role === "user" && nonEmptyString(m.id)) {
+      if (currentUserId) ownerEnd.set(currentUserId, index);
+      currentUserId = m.id;
+    }
+  }
+  if (currentUserId) ownerEnd.set(currentUserId, messages.length);
+  const userIds = new Set(ownerEnd.keys());
+  const pendingAt = new Map<number, ChatMessage[]>();
+  const moved = new Set<ChatMessage>();
+  currentUserId = undefined;
+  // Collect before emitting: a late prompt can belong to a turn whose end
+  // was already passed. A one-pass flush silently loses such prompts.
   for (const m of messages) {
     if (m?.role === "user" && nonEmptyString(m.id)) {
-      if (carriedUnowned.length > 0) {
-        out.push(...carriedUnowned);
-        carriedUnowned.length = 0;
-      }
-      flushOwner(currentUserId);
-      seenUser = true;
       currentUserId = m.id;
-      out.push(m);
       continue;
     }
-    if (m && isOpenPermissionPrompt(m, nowMs)) {
-      const ownerId = presentOwnerId(m, userIds);
-      if (ownerId) {
-        const pending = pendingByOwner.get(ownerId) ?? [];
-        pending.push(m);
-        pendingByOwner.set(ownerId, pending);
-      } else if (!seenUser) {
-        // Unowned leading orphans stay put: do not flush them in front of
-        // the first user (that would assign them to another turn).
-        out.push(m);
-      } else {
-        carriedUnowned.push(m);
-      }
-      continue;
+    if (!m || !isOpenPermissionPrompt(m, nowMs)) continue;
+    let ownerId = presentOwnerId(m, userIds);
+    if (!ownerId) {
+      // A known but absent owner is a paged-out turn, not an unowned prompt.
+      if (nonEmptyString(m._turnOwnerId) || nonEmptyString(m._clientMessageId)) continue;
+      ownerId = currentUserId;
     }
-    out.push(m);
+    if (!ownerId) continue;
+    const end = ownerEnd.get(ownerId);
+    if (end === undefined) continue;
+    const pending = pendingAt.get(end) ?? [];
+    pending.push(m);
+    pendingAt.set(end, pending);
+    moved.add(m);
   }
-  if (carriedUnowned.length > 0) out.push(...carriedUnowned);
-  flushOwner(currentUserId);
-  return out.every((m, index) => m === messages[index]) ? messages : out;
+  if (moved.size === 0) return messages;
+  const out: ChatMessage[] = [];
+  for (let index = 0; index <= messages.length; index++) {
+    const pending = pendingAt.get(index);
+    if (pending) out.push(...pending);
+    if (index < messages.length && !moved.has(messages[index])) out.push(messages[index]);
+  }
+  return out.length === messages.length && out.every((m, index) => m === messages[index]) ? messages : out;
 }
 
 /**
@@ -243,13 +232,10 @@ function clampProcessCardsToOwnerUserBounds(messages: ChatMessage[]): ChatMessag
   if (userIndex.size === 0) return messages;
 
   const userIds = new Set(userIndex.keys());
-  const userIndices = [...userIndex.values()].sort((a, b) => a - b);
-  const hiFor = (lo: number): number => {
-    for (const index of userIndices) {
-      if (index > lo) return index;
-    }
-    return messages.length;
-  };
+  const userIndices = [...userIndex.values()];
+  const nextUserIndex = new Map(userIndices.map((lo, index) =>
+    [lo, userIndices[index + 1] ?? messages.length] as const));
+  const hiFor = (lo: number): number => nextUserIndex.get(lo) ?? messages.length;
 
   const tooEarly = new Map<string, ChatMessage[]>();
   const tooLate = new Map<string, ChatMessage[]>();

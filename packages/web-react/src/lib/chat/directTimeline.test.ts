@@ -105,6 +105,43 @@ const olderPage = (): ChatMessage[] => [
 ];
 
 describe("unified real timeline", () => {
+  test("cold cache reload restores owner bounds after toStored strips timeline users", () => {
+    const owner = "m-recover-card-owner";
+    const server = [
+      row({ id: "first-user", role: "user", text: "first", _orderSeq: 1 }),
+      row({ id: owner, role: "user", text: "recover", _orderSeq: 3 }),
+      row({ id: "answer", text: "answer", _orderSeq: 4, _clientMessageId: owner }),
+    ];
+    const group: ChatMessage = { id: "cached-group", role: "agent-group", text: "task", ts: 2, _turnOwnerId: owner };
+    const question: ChatMessage = {
+      id: "cached-question", role: "permission", text: "AskUserQuestion", ts: 3,
+      requestId: "cached-question-request", toolName: "AskUserQuestion", _turnOwnerId: owner, _resolved: false,
+    };
+    const original = socket();
+    original.applyServerMessages("cold-owner", "main", server, true, 4, {
+      timelineGeneration: 1, serverUpdatedAt: 1,
+    });
+    original.sessions.get("cold-owner")!.messages = [server[0], server[1], group, server[2], question];
+    const stored = original.toStored("cold-owner")!;
+    expect(stored.messages.map((m) => m.id)).toEqual(["cached-group", "cached-question"]);
+
+    const reloaded = socket();
+    reloaded.loadStored(stored);
+    expect(reloaded.sessions.get("cold-owner")!.messages.map((m) => m.id))
+      .toEqual(["cached-group", "cached-question"]);
+    reloaded.applyServerMessages("cold-owner", "main", server, true, 4, {
+      timelineGeneration: 1, serverUpdatedAt: 2,
+    });
+    const expected = ["first-user", owner, "cached-group", "answer", "cached-question"];
+    expect(reloaded.sessions.get("cold-owner")!.messages.map((m) => m.id)).toEqual(expected);
+    reloaded.applyServerMessages("cold-owner", "main", server, true, 4, {
+      timelineGeneration: 1, serverUpdatedAt: 3,
+    });
+    expect(reloaded.sessions.get("cold-owner")!.messages.map((m) => m.id)).toEqual(expected);
+    expect(reloaded.toStored("cold-owner")!.messages.map((m) => m.id))
+      .toEqual(["cached-group", "cached-question"]);
+  });
+
   test("latest page keeps user, thinking, tool and answer as equal chronological records", () => {
     const s = socket();
     s.applyServerMessages("s1", "main", [

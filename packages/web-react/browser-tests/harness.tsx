@@ -147,6 +147,8 @@ declare global {
       repairedIds: string[];
       mergeIds: string[];
       incrementalIds: string[];
+      cachedIds: string[];
+      cacheReloadIds: string[];
       recoverIds: string[];
       missingOwnerIds: string[];
       serverTapeIds: string[];
@@ -392,6 +394,8 @@ window.__processCardOwner = {
   repairedIds: [],
   mergeIds: [],
   incrementalIds: [],
+  cachedIds: [],
+  cacheReloadIds: [],
   recoverIds: [],
   missingOwnerIds: [],
   serverTapeIds: [],
@@ -1625,6 +1629,29 @@ window.__mountProcessCardOwnerProbe = () => {
     poisoned,
   );
   const incremental = applyServerIncremental(poisoned, []);
+  const makeColdSocket = () => new ChatSocket({
+    getToken: () => "browser-card-owner",
+    getAuthEpoch: () => 0,
+    silentRefresh: async (epoch) => ({ kind: "transient" as const, epoch, retryAfterMs: 500 }),
+    onAuthExpired: () => {},
+    defaultAgentId: "main",
+  });
+  const timeline = [CARD_OWNER_USER, CARD_OWNER_ASSISTANT]
+    .map((message) => ({ ...message, _timelineRecord: true }));
+  const original = makeColdSocket();
+  original.applyServerMessages("browser-card-owner", "main", timeline, true, 2, {
+    timelineGeneration: 1, serverUpdatedAt: 1,
+  });
+  original.sessions.get("browser-card-owner")!.messages = [
+    timeline[0], { ...CARD_OWNER_GROUP }, timeline[1], { ...CARD_OWNER_QUESTION },
+  ];
+  const stored = original.toStored("browser-card-owner")!;
+  const reloaded = makeColdSocket();
+  reloaded.loadStored(stored);
+  reloaded.applyServerMessages("browser-card-owner", "main", timeline, true, 2, {
+    timelineGeneration: 1, serverUpdatedAt: 2,
+  });
+  const cacheRestored = reloaded.sessions.get("browser-card-owner")!.messages;
   const recoverId = "m-recover-3hev56n0kpyl1";
   const firstUser: ChatMessage = {
     id: "u-first",
@@ -1716,6 +1743,8 @@ window.__mountProcessCardOwnerProbe = () => {
     repairedIds: repaired.map((message) => message.id),
     mergeIds: merged.map((message) => message.id),
     incrementalIds: incremental.map((message) => message.id),
+    cachedIds: stored.messages.map((message) => message.id),
+    cacheReloadIds: cacheRestored.map((message) => message.id),
     recoverIds: recovered.map((message) => message.id),
     missingOwnerIds: missingOwner.map((message) => message.id),
     serverTapeIds: repairPostFinalProcessOrder(serverTape).map((message) => message.id),
@@ -1735,7 +1764,7 @@ window.__mountProcessCardOwnerProbe = () => {
     <StrictMode><ProcessCardOwnerProbe messages={poisoned} /></StrictMode>,
   );
   createRoot(repairMount).render(
-    <StrictMode><ProcessCardOwnerProbe messages={repaired} /></StrictMode>,
+    <StrictMode><ProcessCardOwnerProbe messages={cacheRestored} /></StrictMode>,
   );
 };
 
