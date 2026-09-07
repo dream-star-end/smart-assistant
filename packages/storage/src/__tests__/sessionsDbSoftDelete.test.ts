@@ -29,11 +29,17 @@ const {
   appendServerAuthoredMessage,
   appendServerAuthoredMessageDurable,
   appendServerAuthoredMessageForRequest,
+  batchClientSessions,
   classifyClientSessions,
   deleteClientSession,
+  getClientSession,
   getSessionsDb,
+  listClientSessions,
+  purgeClientSession,
   queueMessageToOutbox,
   replayMsgOutbox,
+  restoreClientSession,
+  sweepTrashedClientSessions,
   upsertClientSession,
 } = await import('../sessionsDb.js')
 const { paths } = await import('../paths.js')
@@ -321,5 +327,125 @@ describe('appendServerAuthoredMessageForRequest — soft-delete is terminal, no 
       .prepare('SELECT cost_credits FROM pending_usage_patches WHERE request_id = ? AND user_id = ?')
       .get('req-pending-ghost', 'user-V') as { cost_credits: string } | undefined
     assert.equal(pending?.cost_credits, '67890', 'session_not_found path must preserve pending row')
+  })
+})
+
+describe('回收站 — delete 保留内容 / restore / purge / sweep', () => {
+  before(clearTables)
+
+  it('delete 进回收站:主列表/get 不可见,messages 保留,trashed 列表带 deletedAt', async () => {
+    await seedSession('sess-trash-1', 'user-T')
+    const t0 = Date.now()
+    assert.equal(await deleteClientSession('sess-trash-1', 'user-T'), true)
+
+    assert.equal(await getClientSession('sess-trash-1', 'user-T'), null, 'get 走 deleted_at IS NULL 门禁')
+    const active = await listClientSessions('user-T')
+    assert.equal(active.sessions.some((s) => s.id === 'sess-trash-1'), false)
+
+    const db = await getSessionsDb()
+    const row = db
+      .prepare('SELECT messages, message_count, deleted_at FROM client_sessions WHERE id = ?')
+      .get('sess-trash-1') as { messages: string; message_count: number; deleted_at: number | null }
+    assert.ok(row.deleted_at !== null && row.deleted_at >= t0)
+    assert.equal(JSON.parse(row.messages).length, 1, '回收站内 messages 不清零')
+    assert.equal(row.message_count, 1)
+
+    const trashed = await listClientSessions('user-T', { trashed: true })
+    const meta = trashed.sessions.find((s) => s.id === 'sess-trash-1')
+    assert.ok(meta, 'trashed 列表包含该行')
+    assert.equal(meta?.deletedAt, row.deleted_at)
+    // 主列表项不带 deletedAt
+    assert.equal(active.sessions.every((s) => s.deletedAt === undefined), true)
+
+    // 回收站中的行仍是 append 终态(拒绝新 turn)
+    const r = await appendServerAuthoredMessage(
+      'sess-trash-1', 'user-T', { id: 'srv-x', role: 'assistant', text: 'late', ts: 2000 },
+    )
+    assert.equal(r.applied, false)
+    if (!r.applied) assert.equal(r.reason, 'session_deleted')
+
+    // 分类:在回收站 = 'deleted'
+    const cls = await classifyClientSessions([{ sessionId: 'sess-trash-1', userId: 'user-T' }])
+    assert.equal(cls[0]?.state, 'deleted')
+  })
+
+  it('restore 还原:回到主列表,历史完整,updatedAt 单调推进;对活跃行 ok=false', async () => {
+    await seedSession('sess-trash-2', 'user-T')
+    assert.equal(await deleteClientSession('sess-trash-2', 'user-T'), true)
+    const db = await getSessionsDb()
+    const before = (db.prepare('SELECT updated_at FROM client_sessions WHERE id = ?').get('sess-trash-2') as { updated_at: number }).updated_at
+
+    const r = await restoreClientSession('sess-trash-2', 'user-T')
+    assert.equal(r.ok, true)
+    assert.ok(r.updatedAt > before, 'updated_at 严格推进')
+
+    const sess = await getClientSession('sess-trash-2', 'user-T')
+    assert.ok(sess)
+    assert.equal(sess?.messages.length, 1, '还原后历史完整')
+    const active = await listClientSessions('user-T')
+    assert.equal(active.sessions.some((s) => s.id === 'sess-trash-2'), true)
+    const trashed = await listClientSessions('user-T', { trashed: true })
+    assert.equal(trashed.sessions.some((s) => s.id === 'sess-trash-2'), false)
+
+    assert.equal((await restoreClientSession('sess-trash-2', 'user-T')).ok, false, '活跃行不可再还原')
+    assert.equal((await restoreClientSession('sess-trash-2', 'user-OTHER')).ok, false, '跨租户不可还原')
+  })
+
+  it('purge 只对回收站行生效并硬删主行;跨租户拒绝', async () => {
+    await seedSession('sess-trash-3', 'user-T')
+    assert.equal(await purgeClientSession('sess-trash-3', 'user-T'), false, '活跃行不可直接 purge')
+    assert.equal(await deleteClientSession('sess-trash-3', 'user-T'), true)
+    assert.equal(await purgeClientSession('sess-trash-3', 'user-OTHER'), false, '跨租户拒绝')
+    assert.equal(await purgeClientSession('sess-trash-3', 'user-T'), true)
+    const db = await getSessionsDb()
+    assert.equal(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-3'), undefined)
+    assert.equal(await purgeClientSession('sess-trash-3', 'user-T'), false, '幂等')
+    // 行已不存在 → 'missing'
+    const cls = await classifyClientSessions([{ sessionId: 'sess-trash-3', userId: 'user-T' }])
+    assert.equal(cls[0]?.state, 'missing')
+  })
+
+  it('batch restore/purge 只作用于回收站行,skipped 统计活跃/他人行', async () => {
+    await seedSession('sess-trash-b1', 'user-T')
+    await seedSession('sess-trash-b2', 'user-T')
+    await seedSession('sess-trash-b3', 'user-T')
+    const del = await batchClientSessions('user-T', { ids: ['sess-trash-b1', 'sess-trash-b2'], action: 'delete' })
+    assert.equal(del.ok && del.updated, 2)
+
+    const restored = await batchClientSessions('user-T', { ids: ['sess-trash-b1', 'sess-trash-b3'], action: 'restore' })
+    assert.ok(restored.ok)
+    if (restored.ok) {
+      assert.equal(restored.updated, 1, '只有 b1 在回收站')
+      assert.equal(restored.skipped, 1, 'b3 活跃 → skipped')
+    }
+    const purged = await batchClientSessions('user-T', { ids: ['sess-trash-b2', 'sess-trash-b1'], action: 'purge' })
+    assert.ok(purged.ok)
+    if (purged.ok) {
+      assert.equal(purged.updated, 1)
+      assert.equal(purged.skipped, 1)
+    }
+    const db = await getSessionsDb()
+    assert.equal(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-b2'), undefined)
+    assert.ok(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-b1'))
+    assert.ok(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-b3'))
+  })
+
+  it('sweep 只清 deleted_at < cutoff 的行', async () => {
+    await seedSession('sess-trash-old', 'user-T')
+    await seedSession('sess-trash-new', 'user-T')
+    await seedSession('sess-trash-live', 'user-T')
+    assert.equal(await deleteClientSession('sess-trash-old', 'user-T'), true)
+    assert.equal(await deleteClientSession('sess-trash-new', 'user-T'), true)
+    const db = await getSessionsDb()
+    const now = Date.now()
+    const threeDays = 3 * 24 * 3600_000
+    db.prepare('UPDATE client_sessions SET deleted_at = ? WHERE id = ?').run(now - threeDays - 60_000, 'sess-trash-old')
+
+    const stats = await sweepTrashedClientSessions(now - threeDays)
+    assert.equal(stats.purged, 1)
+    assert.equal(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-old'), undefined)
+    assert.ok(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-new'), '未到期保留')
+    assert.ok(db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('sess-trash-live'), '活跃行不受影响')
+    assert.equal((await sweepTrashedClientSessions(now - threeDays)).purged, 0, '幂等')
   })
 })

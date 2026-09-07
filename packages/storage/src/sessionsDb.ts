@@ -2047,6 +2047,23 @@ export interface ClientSessionMeta {
   unread: boolean
   /** 最后一条消息的纯文本前 80 字;无消息则不带。 */
   lastMessagePreview?: string
+  /**
+   * 进入回收站的时刻(epoch ms)。只在 `listClientSessions({ trashed: true })` 回带;
+   * 主列表(deleted_at IS NULL)不带。彻底清理时刻 = deletedAt + SESSION_TRASH_RETENTION_MS。
+   */
+  deletedAt?: number
+}
+
+/**
+ * 回收站保留期(默认 3 天)。用户删除会话 = 软删进回收站(内容保留、可还原);
+ * 超过保留期由 sweepTrashedClientSessions 硬删主行 + 全部级联。
+ * env `OC_SESSION_TRASH_RETENTION_MS` 可覆盖(供 e2e 缩短)。
+ */
+export const SESSION_TRASH_RETENTION_MS_DEFAULT = 3 * 24 * 60 * 60_000
+
+export function sessionTrashRetentionMs(): number {
+  const raw = Number(process.env.OC_SESSION_TRASH_RETENTION_MS)
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : SESSION_TRASH_RETENTION_MS_DEFAULT
 }
 
 export const CHAT_PROJECT_NAME_MAX = 60
@@ -2247,8 +2264,13 @@ export type ListClientSessionsOpts = {
   includeArchived?: boolean
   /** 不传 = 全量(老客户端);传入则上限 200。 */
   limit?: number
-  /** 上一页最后一项的 lastAt(毫秒,不含该点)。 */
+  /** 上一页最后一项的 lastAt(毫秒,不含该点)。trashed 模式下比较的是 deletedAt。 */
   before?: number
+  /**
+   * true = 只列回收站(deleted_at IS NOT NULL),忽略 includeArchived,按 deletedAt 倒序,
+   * 每项回带 deletedAt。false/缺省 = 主列表(deleted_at IS NULL)。
+   */
+  trashed?: boolean
 }
 
 export type ListClientSessionsResult = {
@@ -2293,7 +2315,14 @@ export type SearchClientSessionsResult = {
   results: SessionSearchHit[]
 }
 
-export type BatchClientSessionsAction = 'archive' | 'unarchive' | 'delete' | 'move'
+/**
+ * delete = 移入回收站(软删,内容保留);restore = 从回收站还原;purge = 彻底删除
+ * (只对回收站中的行生效)。restore/purge 的 ownership 查询按 deleted_at IS NOT NULL。
+ */
+export type BatchClientSessionsAction = 'archive' | 'unarchive' | 'delete' | 'move' | 'restore' | 'purge'
+
+export const SESSION_BATCH_ACTIONS: readonly BatchClientSessionsAction[] =
+  ['archive', 'unarchive', 'delete', 'move', 'restore', 'purge']
 
 export type BatchSessionCasRow = {
   id: string
@@ -2422,7 +2451,7 @@ export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchCl
     seen.add(id)
     ids.push(id)
   }
-  if (input.action !== 'archive' && input.action !== 'unarchive' && input.action !== 'delete' && input.action !== 'move') {
+  if (!(SESSION_BATCH_ACTIONS as readonly unknown[]).includes(input.action)) {
     return { ok: false, error: 'invalid_action' }
   }
   const expectedSessions = parseExpectedSessions(input.expectedSessions)
@@ -2450,7 +2479,7 @@ export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchCl
     }
     return { ids, action: 'move', projectId, expectedSessions, operationId }
   }
-  return { ids, action: input.action, expectedSessions, operationId }
+  return { ids, action: input.action as BatchClientSessionsAction, expectedSessions, operationId }
 }
 
 export type PatchClientSessionMetaResult =
@@ -5070,6 +5099,7 @@ function _mapClientSessionMetaRow(r: {
   archived_at: number | null
   last_preview_raw: string | null
   unread: number
+  deleted_at?: number | null
 }): ClientSessionMeta {
   const preview = toLastMessagePreview(r.last_preview_raw)
   return {
@@ -5089,6 +5119,7 @@ function _mapClientSessionMetaRow(r: {
     unread: r.unread === 1,
     ...(preview ? { lastMessagePreview: preview } : {}),
     ...(r.model_id ? { modelId: r.model_id } : {}),
+    ...(r.deleted_at != null ? { deletedAt: r.deleted_at } : {}),
   }
 }
 
@@ -5109,17 +5140,22 @@ async function _sqliteListClientSessions(
   // last_preview_raw:SQL 侧从数组尾部最多 20 条里取最近一条非空 .text(线上 assistant
   // 无 text,实际即最近 user 话);>2MB 行不展开。不把 messages blob 拉进 Node。
   const params: unknown[] = [userId]
-  let where = 'cs.user_id = ? AND cs.deleted_at IS NULL'
-  if (!includeArchived) where += ' AND cs.archived_at IS NULL'
+  // trashed 模式:回收站列表(deleted_at IS NOT NULL),按进回收站时刻倒序,游标也走 deleted_at。
+  const trashed = opts.trashed === true
+  const orderCol = trashed ? 'cs.deleted_at' : 'cs.last_at'
+  let where = trashed
+    ? 'cs.user_id = ? AND cs.deleted_at IS NOT NULL'
+    : 'cs.user_id = ? AND cs.deleted_at IS NULL'
+  if (!trashed && !includeArchived) where += ' AND cs.archived_at IS NULL'
   if (before !== undefined) {
-    where += ' AND cs.last_at < ?'
+    where += ` AND ${orderCol} < ?`
     params.push(before)
   }
   const limitSql = limit !== undefined ? ' LIMIT ?' : ''
   if (limit !== undefined) params.push(limit + 1)
   const rows = db.prepare(`
     SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
-           cs.message_count as msg_count, cs.model_id, cs.project_id, cs.archived_at,
+           cs.message_count as msg_count, cs.model_id, cs.project_id, cs.archived_at, cs.deleted_at,
            ${SQLITE_LAST_PREVIEW_SQL} AS last_preview_raw,
            CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
            last_d.outcome AS last_outcome,
@@ -5145,7 +5181,7 @@ async function _sqliteListClientSessions(
       WHERE rn = 1
     ) last_d ON last_d.session_id = cs.id
     WHERE ${where}
-    ORDER BY cs.last_at DESC${limitSql}
+    ORDER BY ${orderCol} DESC${limitSql}
   `).all(...params) as Array<{
     id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; updated_at: number; msg_count: number
@@ -5154,6 +5190,7 @@ async function _sqliteListClientSessions(
     run_state: string
     last_outcome: string | null
     archived_at: number | null
+    deleted_at: number | null
     last_preview_raw: string | null
     unread: number
   }>
@@ -5162,7 +5199,7 @@ async function _sqliteListClientSessions(
   if (limit !== undefined && rows.length > limit) {
     sliced = rows.slice(0, limit)
     const last = sliced[sliced.length - 1]
-    if (last) nextCursor = last.last_at
+    if (last) nextCursor = trashed ? (last.deleted_at ?? last.last_at) : last.last_at
   }
   return {
     sessions: sliced.map(_mapClientSessionMetaRow),
@@ -5874,35 +5911,86 @@ async function _sqliteReadUserMessagePayload(
   return null
 }
 
-/** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */
+/**
+ * 删除 = 移入回收站(软删):只打 deleted_at,**内容全部保留**(messages / 归档 chunk /
+ * inbox 等都不动),SESSION_TRASH_RETENTION_MS 内可 restoreClientSession 还原。
+ *
+ * 回收站中的行对所有 `deleted_at IS NULL` 门禁(list/get/rename/PUT/append)不可见、拒绝
+ * 新 turn,与旧"软删即销毁"在可见性/写入语义上完全一致;差别只在内容何时销毁 ——
+ * 现在推迟到 purgeClientSession(用户手动彻底删除)或 sweepTrashedClientSessions(到期)。
+ */
 async function _sqliteDeleteClientSession(id: string, userId?: string): Promise<boolean> {
   const db = await getSessionsDb()
   // updated_at 逻辑版本(RFC D3b):软删也严格单调推进 updated_at = MAX(既有+1, now),
   // 让并发 stale PUT(旧 baseSyncedAt)对 tombstone 的 ON CONFLICT 因版本落后被拒(409),
   // 与其它写路径口径一致。deleted_at 仍是删除权威,updated_at 只作乐观并发版本。
   const sql = userId
-    ? "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND deleted_at IS NULL"
+    ? 'UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    : 'UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND deleted_at IS NULL'
   const now = Date.now()
-  const txn = db.transaction((): boolean => {
-    const result = userId ? db.prepare(sql).run(now, now, id, userId) : db.prepare(sql).run(now, now, id)
-    if (result.changes === 0) return false
-    // 归档级联清理:软删清 messages 却留归档 chunk/id 行会积累"不可达但占体积"的
-    // 孤儿(用户删会话=不再要这份历史,隐私语义应与 messages 清零一致)。同事务保证
-    // 不产生"主行已删、归档还在"的中间态;仅在主行真的被本次软删时才清,幂等。
-    db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
-    db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
-    // delegate pending 级联清(RFC D3;与 PG backend 对齐,消除差异点):parent_session_id 指向
-    // 该会话的委派 pending 若不清,会话删后永无队长行去 drain → 永不排空的孤儿。软删 late-cost
-    // 现已直接 noop(见 appendCostCredits 软删分支),此处级联清是同一不变量的另一半。
-    db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
-    // turn_dispatch_inbox 级联清(RFC-v5-durable-turn-dispatch §3):identity 行本永久
-    // 保留作去重权威,但用户删会话=不再要这份历史,隐私语义应与 messages 清零一致。
-    // 删后的会话不会再受理新 turn,故清空去重权威无 at-most-once 风险。
-    db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
-    return true
-  })
-  return txn()
+  const result = userId ? db.prepare(sql).run(now, now, id, userId) : db.prepare(sql).run(now, now, id)
+  return result.changes > 0
+}
+
+/** 从回收站还原:deleted_at 清空,updated_at 单调推进(其它设备 server-wins 拿到复活行)。 */
+async function _sqliteRestoreClientSession(id: string, userId: string): Promise<{ ok: boolean; updatedAt: number }> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const row = db.prepare(
+    'UPDATE client_sessions SET deleted_at = NULL, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL RETURNING updated_at',
+  ).get(now, id, userId) as { updated_at: number } | undefined
+  return { ok: !!row, updatedAt: row ? row.updated_at : now }
+}
+
+/**
+ * 彻底删除(硬删)。只对**已在回收站**(deleted_at IS NOT NULL)的行生效 —— 活跃会话必须
+ * 先 delete 再 purge,避免一次误调用直接销毁内容。同事务级联清:
+ *   - client_session_archive_chunks / client_session_archived_ids:留着是"不可达但占体积"的孤儿。
+ *   - pending_usage_patches(parent_session_id):RFC D3,不清则永无队长行去 drain。
+ *   - turn_dispatch_inbox:去重权威;行已不存在,不会再受理 turn,无 at-most-once 风险。
+ * userId 缺省(sweeper 内部)= 不做租户过滤。
+ */
+function _sqlitePurgeClientSessionSync(db: Database.Database, id: string, userId?: string): boolean {
+  const result = userId
+    ? db.prepare('DELETE FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL').run(id, userId)
+    : db.prepare('DELETE FROM client_sessions WHERE id = ? AND deleted_at IS NOT NULL').run(id)
+  if (result.changes === 0) return false
+  db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
+  db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
+  db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
+  db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
+  return true
+}
+
+async function _sqlitePurgeClientSession(id: string, userId?: string): Promise<boolean> {
+  const db = await getSessionsDb()
+  return db.transaction(() => _sqlitePurgeClientSessionSync(db, id, userId))()
+}
+
+/**
+ * 到期清理:硬删 deleted_at < cutoffMs 的回收站行(分批,每批 ≤ batchLimit,循环直到扫空)。
+ * 幂等;多实例并发执行无害(DELETE ... WHERE deleted_at IS NOT NULL 天然互斥)。
+ */
+async function _sqliteSweepTrashedClientSessions(
+  cutoffMs: number,
+  batchLimit = 500,
+): Promise<{ purged: number }> {
+  const db = await getSessionsDb()
+  let purged = 0
+  for (;;) {
+    const rows = db.prepare(
+      'SELECT id FROM client_sessions WHERE deleted_at IS NOT NULL AND deleted_at < ? ORDER BY deleted_at ASC LIMIT ?',
+    ).all(cutoffMs, batchLimit) as Array<{ id: string }>
+    if (rows.length === 0) break
+    const n = db.transaction((): number => {
+      let c = 0
+      for (const r of rows) if (_sqlitePurgeClientSessionSync(db, r.id)) c++
+      return c
+    })()
+    purged += n
+    if (n === 0 || rows.length < batchLimit) break
+  }
+  return { purged }
 }
 
 /**
@@ -6780,7 +6868,7 @@ async function _sqliteBatchClientSessions(
           | undefined
         if (
           !live ||
-          live.deleted_at ||
+          (live.deleted_at && action !== 'restore' && action !== 'purge') ||
           live.updated_at !== exp.updatedAt ||
           (live.project_id ?? null) !== (exp.projectId ?? null)
         ) {
@@ -6795,9 +6883,11 @@ async function _sqliteBatchClientSessions(
       ).get(parsed.projectId, userId) as { ok: number } | undefined
       if (!owned) return { ok: false, error: 'project_not_found' }
     }
+    // restore/purge 作用于回收站中的行(deleted_at IS NOT NULL);其它动作作用于活跃行。
+    const trashOnly = action === 'restore' || action === 'purge'
     const ownedRows = db.prepare(
       `SELECT id FROM client_sessions
-        WHERE user_id = ? AND deleted_at IS NULL
+        WHERE user_id = ? AND deleted_at IS ${trashOnly ? 'NOT NULL' : 'NULL'}
           AND id IN (${ids.map(() => '?').join(',')})`,
     ).all(userId, ...ids) as Array<{ id: string }>
     const owned = new Set(ownedRows.map((r) => r.id))
@@ -6808,6 +6898,18 @@ async function _sqliteBatchClientSessions(
     if (action === 'delete') {
       for (const id of targetIds) {
         if (_sqliteDeleteClientSessionSync(db, id, userId, now)) updated++
+      }
+    } else if (action === 'restore') {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET deleted_at = NULL, updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NOT NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(now, userId, ...targetIds)
+      updated = res.changes
+    } else if (action === 'purge') {
+      for (const id of targetIds) {
+        if (_sqlitePurgeClientSessionSync(db, id, userId)) updated++
       }
     } else if (action === 'archive') {
       const res = db.prepare(
@@ -6897,6 +6999,7 @@ async function _sqliteMarkAllClientSessionsRead(userId: string): Promise<{ updat
   return { updated: res.changes }
 }
 
+/** 批量删除的同事务版:与 _sqliteDeleteClientSession 同义(移入回收站,内容保留)。 */
 function _sqliteDeleteClientSessionSync(
   db: Database.Database,
   id: string,
@@ -6904,14 +7007,9 @@ function _sqliteDeleteClientSessionSync(
   now: number,
 ): boolean {
   const result = db.prepare(
-    "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+    'UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
   ).run(now, now, id, userId)
-  if (result.changes === 0) return false
-  db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
-  db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
-  db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
-  db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
-  return true
+  return result.changes > 0
 }
 
 /**
@@ -7165,6 +7263,9 @@ const sqliteBackend = {
   readTapeRecordPayloadChunk: _sqliteReadTapeRecordPayloadChunk,
   readUserMessagePayload: _sqliteReadUserMessagePayload,
   deleteClientSession: _sqliteDeleteClientSession,
+  restoreClientSession: _sqliteRestoreClientSession,
+  purgeClientSession: _sqlitePurgeClientSession,
+  sweepTrashedClientSessions: _sqliteSweepTrashedClientSessions,
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
   patchClientSessionMeta: _sqlitePatchClientSessionMeta,
@@ -7323,6 +7424,15 @@ export const readUserMessagePayload: ClientSessionsBackend['readUserMessagePaylo
 
 export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
   (...args) => getActiveBackend().deleteClientSession(...args)
+
+export const restoreClientSession: ClientSessionsBackend['restoreClientSession'] =
+  (...args) => getActiveBackend().restoreClientSession(...args)
+
+export const purgeClientSession: ClientSessionsBackend['purgeClientSession'] =
+  (...args) => getActiveBackend().purgeClientSession(...args)
+
+export const sweepTrashedClientSessions: ClientSessionsBackend['sweepTrashedClientSessions'] =
+  (...args) => getActiveBackend().sweepTrashedClientSessions(...args)
 
 export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
   (...args) => getActiveBackend().renameClientSession(...args)

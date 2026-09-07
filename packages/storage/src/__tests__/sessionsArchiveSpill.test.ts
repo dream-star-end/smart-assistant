@@ -769,9 +769,9 @@ describe('history revision — 增量安全栅栏', () => {
   })
 })
 
-describe('deleteClientSession — 归档级联清理', () => {
-  it('软删会话同事务清空 archive_chunks/archived_ids,不再留孤儿', async () => {
-    const { deleteClientSession } = await import('../sessionsDb.js')
+describe('deleteClientSession / purgeClientSession — 归档级联清理', () => {
+  it('删除只进回收站(归档保留);purge 才同事务清空 archive_chunks/archived_ids', async () => {
+    const { deleteClientSession, purgeClientSession, restoreClientSession } = await import('../sessionsDb.js')
     const N = 300
     const session = {
       id: 'web-del-cascade', userId: USER, agentId: 'main', title: 't', pinned: false,
@@ -786,13 +786,24 @@ describe('deleteClientSession — 归档级联清理', () => {
     const before = countArchive()
     assert.ok(before.chunks > 0 && before.ids > 0, '前置:确实产生了归档')
 
+    // 删除 = 进回收站:归档行原样保留,还原后可继续读到历史。
     assert.equal(await deleteClientSession('web-del-cascade', USER), true)
+    assert.deepEqual(countArchive(), before, '回收站期间归档不清')
+    // 幂等:重复删除返回 false(主行已在回收站)且不抛
+    assert.equal(await deleteClientSession('web-del-cascade', USER), false)
+    // purge 只对回收站行生效:先还原再 purge 应为 false 且归档仍在
+    assert.equal((await restoreClientSession('web-del-cascade', USER)).ok, true)
+    assert.equal(await purgeClientSession('web-del-cascade', USER), false)
+    assert.deepEqual(countArchive(), before, '活跃行不可直接 purge')
+
+    assert.equal(await deleteClientSession('web-del-cascade', USER), true)
+    assert.equal(await purgeClientSession('web-del-cascade', USER), true)
     const after = countArchive()
     assert.equal(after.chunks, 0, 'chunk 行级联清空')
     assert.equal(after.ids, 0, 'id 行级联清空')
-
-    // 幂等:重复删除返回 false(主行已软删)且不抛
-    assert.equal(await deleteClientSession('web-del-cascade', USER), false)
+    const main = db.prepare('SELECT 1 FROM client_sessions WHERE id = ?').get('web-del-cascade')
+    assert.equal(main, undefined, '主行硬删')
+    assert.equal(await purgeClientSession('web-del-cascade', USER), false)
   })
 
   it('删除不存在的会话:false 且不影响其它会话归档', async () => {

@@ -912,7 +912,7 @@ describe("pgSessionsBackend contract", () => {
     assert.deepEqual(res2, { merged: "0", drained: 0 });
   });
 
-  maybe("删除级联:软删清归档 chunk/id + delegate pending", async () => {
+  maybe("回收站:delete 保留内容/归档;restore 还原;purge 才级联清归档 chunk/id + delegate pending", async () => {
     // 造归档:大 blob 触发 spill
     const big = "x".repeat(40 * 1024);
     const msgs: MessageLike[] = [];
@@ -922,13 +922,81 @@ describe("pgSessionsBackend contract", () => {
     assert.ok((before!.archivedCount ?? 0) > 0, "应触发 spill 产生归档");
     // 一笔指向该会话的 delegate pending
     await backend.appendCostCredits("dx", "u-1", "5", "as", "s-del", "aX");
+    const countArchive = async () => {
+      const out: Record<string, number> = {};
+      for (const t of ["client_session_archive_chunks", "client_session_archived_ids"]) {
+        out[t] = (await pool.query(`SELECT 1 FROM ${t} WHERE session_id=$1`, ["s-del"])).rowCount ?? 0;
+      }
+      return out;
+    };
+    const archiveBefore = await countArchive();
+
+    // delete = 进回收站:主行/messages/归档/pending 都保留;主列表不见、trashed 列表带 deletedAt。
     assert.equal(await backend.deleteClientSession("s-del", "u-1"), true);
-    for (const t of ["client_session_archive_chunks", "client_session_archived_ids"]) {
-      const r = await pool.query(`SELECT 1 FROM ${t} WHERE session_id=$1`, ["s-del"]);
-      assert.equal(r.rowCount, 0, `${t} 应被级联清空`);
-    }
+    assert.equal(await backend.deleteClientSession("s-del", "u-1"), false, "幂等");
+    assert.deepEqual(await countArchive(), archiveBefore, "回收站期间归档保留");
+    const row = await pool.query<{ message_count: number; deleted_at: string | null }>(
+      "SELECT message_count, deleted_at FROM client_sessions WHERE id=$1", ["s-del"],
+    );
+    assert.ok(row.rows[0]?.deleted_at, "deleted_at 已打标");
+    assert.ok((row.rows[0]?.message_count ?? 0) > 0, "messages 不清零");
+    assert.equal(await backend.getClientSession("s-del", "u-1"), null);
+    assert.equal((await backend.listClientSessions("u-1")).sessions.some((s) => s.id === "s-del"), false);
+    const trashed = await backend.listClientSessions("u-1", { trashed: true });
+    const meta = trashed.sessions.find((s) => s.id === "s-del");
+    assert.ok(meta?.deletedAt, "trashed 列表带 deletedAt");
+
+    // purge 只对回收站行生效;restore 后 purge 为 false
+    assert.equal((await backend.restoreClientSession("s-del", "u-1")).ok, true);
+    assert.equal(await backend.purgeClientSession("s-del", "u-1"), false, "活跃行不可直接 purge");
+    assert.ok(await backend.getClientSession("s-del", "u-1"), "还原后可读");
+    assert.equal((await backend.restoreClientSession("s-del", "u-1")).ok, false, "活跃行不可再还原");
+
+    // 再删 → purge:主行硬删 + 级联清
+    assert.equal(await backend.deleteClientSession("s-del", "u-1"), true);
+    assert.equal(await backend.purgeClientSession("s-del", "other-user"), false, "跨租户拒绝");
+    assert.equal(await backend.purgeClientSession("s-del", "u-1"), true);
+    assert.equal((await pool.query("SELECT 1 FROM client_sessions WHERE id=$1", ["s-del"])).rowCount, 0, "主行硬删");
+    for (const [t, n] of Object.entries(await countArchive())) assert.equal(n, 0, `${t} 应被级联清空`);
     const pend = await pool.query("SELECT 1 FROM pending_usage_patches WHERE parent_session_id=$1", ["s-del"]);
     assert.equal(pend.rowCount, 0, "delegate pending 应级联清");
+    assert.equal(await backend.purgeClientSession("s-del", "u-1"), false, "幂等");
+  });
+
+  maybe("回收站:batch restore/purge 只作用回收站行;sweep 只清过期行", async () => {
+    for (const id of ["s-tr-a", "s-tr-b", "s-tr-c"]) {
+      await backend.upsertClientSession(mkSession({ id, updatedAt: 1 }));
+    }
+    const del = await backend.batchClientSessions("u-1", { ids: ["s-tr-a", "s-tr-b"], action: "delete" });
+    assert.ok(del.ok && del.updated === 2);
+    const restored = await backend.batchClientSessions("u-1", { ids: ["s-tr-a", "s-tr-c"], action: "restore" });
+    assert.ok(restored.ok);
+    if (restored.ok) {
+      assert.equal(restored.updated, 1, "只有 a 在回收站");
+      assert.equal(restored.skipped, 1, "c 活跃 → skipped");
+    }
+    const purged = await backend.batchClientSessions("u-1", { ids: ["s-tr-b", "s-tr-a"], action: "purge" });
+    assert.ok(purged.ok);
+    if (purged.ok) {
+      assert.equal(purged.updated, 1);
+      assert.equal(purged.skipped, 1);
+    }
+    assert.equal((await pool.query("SELECT 1 FROM client_sessions WHERE id=$1", ["s-tr-b"])).rowCount, 0);
+    assert.equal((await pool.query("SELECT 1 FROM client_sessions WHERE id=$1", ["s-tr-a"])).rowCount, 1);
+
+    // sweep:a 再删并把 deleted_at 拨到 3 天前;c 保持活跃
+    assert.equal(await backend.deleteClientSession("s-tr-a", "u-1"), true);
+    await backend.upsertClientSession(mkSession({ id: "s-tr-d", updatedAt: 1 }));
+    assert.equal(await backend.deleteClientSession("s-tr-d", "u-1"), true);
+    const now = Date.now();
+    const threeDays = 3 * 24 * 3600_000;
+    await pool.query("UPDATE client_sessions SET deleted_at=$1 WHERE id=$2", [now - threeDays - 60_000, "s-tr-a"]);
+    const stats = await backend.sweepTrashedClientSessions(now - threeDays);
+    assert.equal(stats.purged, 1);
+    assert.equal((await pool.query("SELECT 1 FROM client_sessions WHERE id=$1", ["s-tr-a"])).rowCount, 0, "过期行硬删");
+    assert.equal((await pool.query("SELECT 1 FROM client_sessions WHERE id=$1", ["s-tr-d"])).rowCount, 1, "未过期保留");
+    assert.equal((await pool.query("SELECT 1 FROM client_sessions WHERE id=$1", ["s-tr-c"])).rowCount, 1, "活跃行不受影响");
+    assert.equal((await backend.sweepTrashedClientSessions(now - threeDays)).purged, 0, "幂等");
   });
 
   // 回归:归档会话的**首页** timeline 读取曾因缺 bigint cast 而 500。
@@ -1298,7 +1366,14 @@ describe("pgSessionsBackend lossless turn tape", () => {
       ),
       /turn_tape_recovery_links/,
     );
+    // delete = 进回收站:tape / recovery link 与主行一起保留(还原后仍可读)。
     assert.equal(await backend.deleteClientSession(sessionId, userId), true);
+    assert.ok(
+      ((await pool.query("SELECT 1 FROM client_session_turn_tapes WHERE session_id=$1", [sessionId])).rowCount ?? 0) > 0,
+      "回收站期间 tape 保留",
+    );
+    // purge 才级联清 tape / recovery link。
+    assert.equal(await backend.purgeClientSession(sessionId, userId), true);
     assert.equal(
       (await pool.query("SELECT 1 FROM turn_tape_recovery_links WHERE session_id=$1", [sessionId])).rowCount,
       0,

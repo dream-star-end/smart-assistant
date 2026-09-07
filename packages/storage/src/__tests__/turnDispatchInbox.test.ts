@@ -16,6 +16,7 @@ const {
   getSessionsDb,
   casTurnDispatchState,
   deleteClientSession,
+  purgeClientSession,
   getTurnDispatchByDispatchId,
   getTurnDispatchByLogicalKey,
   insertQueuedTurnDispatch,
@@ -323,12 +324,19 @@ test('session 硬删级联清 inbox 行', async () => {
     (await getTurnDispatchByLogicalKey('u1', sessionId, 'cm-cascade')) !== null,
     '级联前 inbox 行在',
   )
+  // 删除 = 进回收站:inbox 去重权威保留(还原后仍可防重放)。
   const deleted = await deleteClientSession(sessionId, 'u1')
   assert.equal(deleted, true)
+  assert.ok(
+    (await getTurnDispatchByLogicalKey('u1', sessionId, 'cm-cascade')) !== null,
+    'session 进回收站不清 inbox 行',
+  )
+  // 彻底删除(手动 purge / 到期 sweep)才级联清 inbox。
+  assert.equal(await purgeClientSession(sessionId, 'u1'), true)
   assert.equal(
     await getTurnDispatchByLogicalKey('u1', sessionId, 'cm-cascade'),
     null,
-    'session 软删级联清 inbox 行',
+    'session 硬删级联清 inbox 行',
   )
 })
 

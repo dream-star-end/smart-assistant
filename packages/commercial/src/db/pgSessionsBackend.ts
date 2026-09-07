@@ -410,6 +410,34 @@ async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Pr
   }
 }
 
+/**
+ * 彻底删除一条**已在回收站**(deleted_at IS NOT NULL)的会话:硬删主行 + 同事务级联清。
+ * 活跃行返回 false(必须先 delete 进回收站再 purge,避免一次误调用直接销毁内容)。
+ * userId 缺省(sweeper 内部)= 不做租户过滤。
+ *
+ * 级联(即旧 deleteClientSession 里的那组):
+ *   - client_session_user_payloads / archive_chunks / archived_ids:留着是不可达孤儿。
+ *   - turn_tape_recovery_links / client_session_turn_tapes:lossless tape 与主行同生命周期。
+ *   - pending_usage_patches(parent_session_id):RFC D3,不清则永无队长行去 drain。
+ *   - turn_dispatches 保留:reconciler 需要收口与删除竞态的执行,财务/审计可归因。
+ */
+async function pgPurgeClientSessionInTx(client: PoolClient, id: string, userId?: string): Promise<boolean> {
+  const result = userId
+    ? await client.query(
+        "DELETE FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
+        [id, userId],
+      )
+    : await client.query("DELETE FROM client_sessions WHERE id = $1 AND deleted_at IS NOT NULL", [id]);
+  if ((result.rowCount ?? 0) === 0) return false;
+  await client.query("DELETE FROM client_session_user_payloads WHERE session_id = $1", [id]);
+  await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
+  await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
+  await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
+  await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
+  await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+  return true;
+}
+
 /** One immutable browser page must observe the session row, archive chunks,
  * tape identity and dispatch-status overlay from the same snapshot. */
 async function withTimelineSnapshot<T>(
@@ -10884,11 +10912,16 @@ export function createPgSessionsBackend(
         ? Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(opts.limit))
         : undefined;
       const params: unknown[] = [userId, dispatchUid];
-      let where = "cs.user_id = $1 AND cs.deleted_at IS NULL";
-      if (!includeArchived) where += " AND cs.archived_at IS NULL";
+      // trashed 模式:回收站列表(deleted_at IS NOT NULL),按进回收站时刻倒序,游标也走 deleted_at。
+      const trashed = opts.trashed === true;
+      const orderCol = trashed ? "cs.deleted_at" : "cs.last_at";
+      let where = trashed
+        ? "cs.user_id = $1 AND cs.deleted_at IS NOT NULL"
+        : "cs.user_id = $1 AND cs.deleted_at IS NULL";
+      if (!trashed && !includeArchived) where += " AND cs.archived_at IS NULL";
       if (before !== undefined) {
         params.push(before);
-        where += ` AND cs.last_at < $${params.length}`;
+        where += ` AND ${orderCol} < $${params.length}`;
       }
       const limitSql = limit !== undefined ? ` LIMIT ${limit + 1}` : "";
       const rows = (
@@ -10904,6 +10937,7 @@ export function createPgSessionsBackend(
           model_id: string | null;
           project_id: string | null;
           archived_at: string | null;
+          deleted_at: string | null;
           last_preview_raw: string | null;
           run_state: string;
           last_outcome: string | null;
@@ -10911,7 +10945,7 @@ export function createPgSessionsBackend(
           unread: boolean;
         }>(
           `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
-                  cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
+                  cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at, cs.deleted_at,
                   CASE WHEN octet_length(cs.messages) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES}
                             OR left(COALESCE(cs.messages, ''), 1) <> '['
                             OR position((chr(92) || 'u0000') in cs.messages) > 0 THEN NULL
@@ -10952,7 +10986,7 @@ export function createPgSessionsBackend(
                WHERE rn = 1
              ) last_d ON last_d.session_id = cs.id
             WHERE ${where}
-            ORDER BY cs.last_at DESC${limitSql}`,
+            ORDER BY ${orderCol} DESC${limitSql}`,
           params,
         )
       ).rows;
@@ -10961,7 +10995,11 @@ export function createPgSessionsBackend(
       if (limit !== undefined && rows.length > limit) {
         sliced = rows.slice(0, limit);
         const last = sliced[sliced.length - 1];
-        if (last) nextCursor = bigIntNum(last.last_at, "last_at");
+        if (last) {
+          nextCursor = trashed && last.deleted_at != null
+            ? bigIntNum(last.deleted_at, "deleted_at")
+            : bigIntNum(last.last_at, "last_at");
+        }
       }
       return {
         sessions: sliced.map((r) => {
@@ -10983,6 +11021,7 @@ export function createPgSessionsBackend(
             archived: r.archived_at != null,
             ...(preview ? { lastMessagePreview: preview } : {}),
             ...(r.model_id ? { modelId: r.model_id } : {}),
+            ...(r.deleted_at != null ? { deletedAt: bigIntNum(r.deleted_at, "deleted_at") } : {}),
           };
         }),
         ...(nextCursor !== undefined ? { nextCursor } : {}),
@@ -11447,34 +11486,59 @@ export function createPgSessionsBackend(
       return readUserMessagePayloadImpl(pool, sessionId, userId, msgId, offset, length);
     },
 
-    // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
+    // ── deleteClientSession(移入回收站:只打 deleted_at,内容保留)─────────────────
+    // 与 SQLite 同义:回收站内的行对所有 deleted_at IS NULL 门禁不可见、拒绝新 turn;
+    // 内容销毁推迟到 purgeClientSession(手动彻底删除)/ sweepTrashedClientSessions(到期)。
     async deleteClientSession(id: string, userId?: string): Promise<boolean> {
       const now = Date.now();
-      return withTx(pool, async (client): Promise<boolean> => {
-        // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
-        const sql = userId
-          ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
-          : `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}), messages = '[]', message_count = 0 WHERE id = $2 AND deleted_at IS NULL`;
-        const result = userId
-          ? await client.query(sql, [now, id, userId])
-          : await client.query(sql, [now, id]);
-        if ((result.rowCount ?? 0) === 0) return false;
-        await client.query(
-          "DELETE FROM client_session_user_payloads WHERE session_id=$1" +
-            (userId ? " AND user_id=$2" : ""),
-          userId ? [id, userId] : [id],
-        );
-        // 归档级联清理(同事务,防"主行已删、归档还在"孤儿)。D3:delete 级联也清 parent_session_id
-        // 指向该会话的 delegate pending(防永不 drain 的孤儿)。
-        await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
-        await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
-        await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
-        await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
-        await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
-        // Keep dispatch evidence so the reconciler can close any execution that
-        // raced with deletion and financial/audit history remains attributable.
-        return true;
-      });
+      // updated_at 逻辑版本推进(软删也让并发 stale PUT 因版本落后被拒)。deleted_at 仍是删除权威。
+      const sql = userId
+        ? `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}) WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL`
+        : `UPDATE client_sessions SET deleted_at = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}) WHERE id = $2 AND deleted_at IS NULL`;
+      const result = userId
+        ? await pool.query(sql, [now, id, userId])
+        : await pool.query(sql, [now, id]);
+      return (result.rowCount ?? 0) > 0;
+    },
+
+    // ── restoreClientSession(从回收站还原)─────────────────────────────────────
+    async restoreClientSession(id: string, userId: string): Promise<{ ok: boolean; updatedAt: number }> {
+      const now = Date.now();
+      const r = await pool.query<{ updated_at: string }>(
+        `UPDATE client_sessions SET deleted_at = NULL, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL
+          RETURNING updated_at`,
+        [id, userId],
+      );
+      const row = r.rows[0];
+      return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+    },
+
+    // ── purgeClientSession(彻底删除:硬删主行 + 级联;只对回收站行生效)──────────────
+    async purgeClientSession(id: string, userId?: string): Promise<boolean> {
+      return withTx(pool, (client) => pgPurgeClientSessionInTx(client, id, userId));
+    },
+
+    // ── sweepTrashedClientSessions(到期清理:deleted_at < cutoff 的回收站行分批硬删)──
+    async sweepTrashedClientSessions(cutoffMs: number, batchLimit = 500): Promise<{ purged: number }> {
+      let purged = 0;
+      for (;;) {
+        const rows = (
+          await pool.query<{ id: string }>(
+            "SELECT id FROM client_sessions WHERE deleted_at IS NOT NULL AND deleted_at < $1 ORDER BY deleted_at ASC LIMIT $2",
+            [cutoffMs, batchLimit],
+          )
+        ).rows;
+        if (rows.length === 0) break;
+        const n = await withTx(pool, async (client): Promise<number> => {
+          let c = 0;
+          for (const r of rows) if (await pgPurgeClientSessionInTx(client, r.id)) c++;
+          return c;
+        });
+        purged += n;
+        if (n === 0 || rows.length < batchLimit) break;
+      }
+      return { purged };
     },
 
     async renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
@@ -11847,7 +11911,7 @@ export function createPgSessionsBackend(
             const liveUpdated = live ? Number(live.updated_at) : NaN;
             if (
               !live ||
-              live.deleted_at ||
+              (live.deleted_at && action !== "restore" && action !== "purge") ||
               liveUpdated !== exp.updatedAt ||
               (live.project_id ?? null) !== (exp.projectId ?? null)
             ) {
@@ -11865,10 +11929,12 @@ export function createPgSessionsBackend(
           ).rows[0];
           if (!owned) return { ok: false, error: "project_not_found" };
         }
+        // restore/purge 作用于回收站中的行(deleted_at IS NOT NULL);其它动作作用于活跃行。
+        const trashOnly = action === "restore" || action === "purge";
         const ownedRows = (
           await client.query<{ id: string }>(
             `SELECT id FROM client_sessions
-              WHERE user_id = $1 AND deleted_at IS NULL AND id = ANY($2::text[])`,
+              WHERE user_id = $1 AND deleted_at IS ${trashOnly ? "NOT NULL" : "NULL"} AND id = ANY($2::text[])`,
             [userId, ids],
           )
         ).rows;
@@ -11878,23 +11944,27 @@ export function createPgSessionsBackend(
         if (targetIds.length === 0) return { ok: true, updated: 0, skipped };
         let updated = 0;
         if (action === "delete") {
+          // 移入回收站(内容保留;与 deleteClientSession 同义)。
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET deleted_at = ${CLOCK_MS_SQL},
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND deleted_at IS NULL AND id = ANY($2::text[])`,
+            [userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        } else if (action === "restore") {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET deleted_at = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND deleted_at IS NOT NULL AND id = ANY($2::text[])`,
+            [userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        } else if (action === "purge") {
           for (const id of targetIds) {
-            const result = await client.query(
-              `UPDATE client_sessions
-                  SET deleted_at = ${CLOCK_MS_SQL},
-                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                      messages = '[]', message_count = 0
-                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-              [id, userId],
-            );
-            if ((result.rowCount ?? 0) === 0) continue;
-            await client.query("DELETE FROM client_session_user_payloads WHERE session_id=$1 AND user_id=$2", [id, userId]);
-            await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
-            await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
-            updated++;
+            if (await pgPurgeClientSessionInTx(client, id, userId)) updated++;
           }
         } else if (action === "archive") {
           const res = await client.query(
