@@ -36,4 +36,12 @@ describe("resolveGlobalHotkey", () => {
       resolveGlobalHotkey(key({ key: "o", metaKey: true, shiftKey: true, target: input })),
     ).toBeNull();
   });
+
+  test("⌘/Ctrl+F 会话内查找，输入框内忽略，Shift 不触发", () => {
+    expect(resolveGlobalHotkey(key({ key: "f", metaKey: true }))).toBe("find");
+    expect(resolveGlobalHotkey(key({ key: "F", ctrlKey: true }))).toBe("find");
+    expect(resolveGlobalHotkey(key({ key: "f", metaKey: true, shiftKey: true }))).toBeNull();
+    const input = document.createElement("input");
+    expect(resolveGlobalHotkey(key({ key: "f", metaKey: true, target: input }))).toBeNull();
+  });
 });

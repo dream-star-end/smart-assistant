@@ -1,4 +1,4 @@
-export type GlobalHotkeyAction = "search" | "new" | "stop" | null;
+export type GlobalHotkeyAction = "search" | "new" | "stop" | "find" | null;
 
 function isEditableTarget(el: EventTarget | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
@@ -21,6 +21,10 @@ export function resolveGlobalHotkey(
   if ((e.key === "o" || e.key === "O") && e.shiftKey) {
     if (isEditableTarget(e.target)) return null;
     return "new";
+  }
+  if ((e.key === "f" || e.key === "F") && !e.shiftKey) {
+    if (isEditableTarget(e.target)) return null;
+    return "find";
   }
   return null;
 }

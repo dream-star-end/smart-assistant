@@ -34,6 +34,7 @@ import { ratesFromPublicModel, type ModelRates } from "../../lib/skillRunCost";
 import { SKILL_RUN_MODEL } from "./SkillOptPanel";
 import { SkillEditor, type WorkbenchTab } from "./SkillEditor";
 import { ProjectSkillOverlay } from "./ProjectSkillOverlay";
+import { skillDisplayTitle } from "./skillDisplay";
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），展开看正文摘要（/api/skills/:name），
@@ -308,6 +309,7 @@ function SkillRow({
   const bodyLines = (detail?.body ?? "").split("\n");
   const preview = bodyLines.slice(0, PREVIEW_LINES).join("\n");
   const tags = skill.tags ?? [];
+  const display = skillDisplayTitle(skill);
 
   return (
     <li>
@@ -332,7 +334,7 @@ function SkillRow({
           >
             <span className="min-w-0 flex-1">
               <span className="flex min-w-0 items-center gap-1.5">
-                <span className="truncate text-section font-medium text-fg">{skill.name}</span>
+                <span className="truncate text-section font-medium text-fg">{display.title}</span>
                 <Badge tone={isHub ? "neutral" : "accent"} size="sm">
                   {isHub ? "市场" : "自建"}
                 </Badge>
@@ -345,9 +347,11 @@ function SkillRow({
                   </span>
                 )}
               </span>
-              {skill.description && (
-                <span className="mt-0.5 block truncate text-meta text-muted">{skill.description}</span>
-              )}
+              {display.caption ? (
+                <span className="mt-0.5 block truncate font-mono text-caption text-faint">
+                  {display.caption}
+                </span>
+              ) : null}
             </span>
             <ChevronRight
               size={15}
