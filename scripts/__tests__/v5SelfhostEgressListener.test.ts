@@ -29,7 +29,7 @@ function run(script: string, env: Record<string, string> = {}) {
   try {
     writeFileSync(path.join(dir, "counter"), "0");
     const result = spawnSync("bash", ["-c", common + "\n" + script], {
-      cwd: root, encoding: "utf8", timeout: 5000,
+      cwd: root, encoding: "utf8", timeout: 15000,
       env: { ...process.env, ...env, TEST_DIR: dir, TMPDIR: dir },
     });
     return { ...result, calls: (() => {

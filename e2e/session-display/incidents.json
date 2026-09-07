@@ -3147,6 +3147,25 @@
           "assertion": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true"
         }
       ]
+    },
+    {
+      "id": "INC-20260907-EGRESS-ZOMBIE-LISTENER",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "selfhost joint切流连续两次在旧槽长流排空期间egress-health精确5s失败。Requires/After把systemd socket关闭排在service drain之后，旧SO_REUSEPORT listener无人accept。生产stderr未留存；fd对照复现支持该机理，真实systemd长流证明独立核验。",
+      "rootFixCommit": "526f0a98",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5SelfhostEgressListener.test.ts",
+          "assertion": "OCV5-159 stops the socket in a separate blocking transaction before service drain"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260907-EGRESS-ZOMBIE-LISTENER: listener-first source contract deploy-gate."
+        }
+      ]
     }
   ]
 }
