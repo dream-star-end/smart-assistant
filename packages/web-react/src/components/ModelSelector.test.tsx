@@ -413,6 +413,12 @@ describe('ModelSelector GPT/Kimi 上下文档', () => {
     expect(trigger.textContent).toContain('x11.3')
   })
 
+  it('trigger 保留 CostMark', () => {
+    render(<ModelSelector models={MODELS} selectedId="gpt-5.6-sol" onSelect={() => {}} />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('x11.3')
+  })
+
   it('菜单收成 Kimi K3 一行，1M 开关改写 canonical id', async () => {
     const onSelect = vi.fn()
     render(<ModelSelector models={MODELS} selectedId="k3-256k" onSelect={onSelect} />)
