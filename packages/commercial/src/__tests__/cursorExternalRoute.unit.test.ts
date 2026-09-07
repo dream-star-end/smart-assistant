@@ -121,7 +121,7 @@ function snapshot(id: bigint, over: Partial<CursorTokenSnapshot> = {}): CursorTo
 interface Harness {
   deps: CursorExternalDeps;
   settleCalls: Parameters<NonNullable<CursorExternalDeps["settle"]>>[0][];
-  relayCalls: { accountToken: string; body: Record<string, unknown> }[];
+  relayCalls: { accountToken: string; body: Record<string, unknown>; options?: { echoModel?: string } }[];
   factoryCalls: CursorExternalRelayFactoryArgs[];
   order: string[];
 }
@@ -168,9 +168,9 @@ function harness(opts: {
     relayFactory: (args) => {
       factoryCalls.push(args);
       const relay: CursorSandRelayLike = {
-        async serveMessages(body, res, signal) {
+        async serveMessages(body, res, signal, options) {
           const key = args.readApiKey();
-          relayCalls.push({ accountToken: key.toString(), body });
+          relayCalls.push({ accountToken: key.toString(), body, options });
           key.fill(0);
           if (opts.relay) return opts.relay(body, res, signal);
           res.setHeader("content-type", "text/event-stream");
@@ -201,6 +201,7 @@ function body(over: Partial<ProxyBody> & Record<string, unknown> = {}): ProxyBod
 
 async function run(h: Harness, over: {
   body?: ProxyBody;
+  requestedModel?: string;
   authorize?: (p: ModelPricing) => Promise<void>;
   appendCostCredits?: (...a: unknown[]) => Promise<unknown>;
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
@@ -217,6 +218,7 @@ async function run(h: Harness, over: {
     uid: 3n,
     identity: { uid: 3n, containerId: null } as ProxyIdentity,
     body: over.body ?? body(),
+    requestedModel: over.requestedModel,
     authorize: over.authorize ?? (async () => {}),
     appendCostCredits: over.appendCostCredits,
     broadcastToUser: over.broadcastToUser,
@@ -257,13 +259,37 @@ describe("cursorExternal route — reject ladder", () => {
     assert.equal(h.factoryCalls.length, 0);
   });
 
-  test("no eligible account → 503 CURSOR_POOL_UNAVAILABLE with retry-after", async () => {
+  test("no eligible account → 503 MODEL_POOL_UNAVAILABLE with retry-after (engine-neutral wire)", async () => {
     const h = harness({ accounts: [account({ id: 1n, cursor_sand_enabled: false })] });
     const { res } = await run(h);
     assert.equal(res.statusCode, 503);
-    assert.equal(res.json().error?.code, "CURSOR_POOL_UNAVAILABLE");
+    assert.equal(res.json().error?.code, "MODEL_POOL_UNAVAILABLE");
     assert.equal(res.headers["retry-after"], "30");
+    assert.doesNotMatch(res.body, /cursor/i);
     assert.equal(h.settleCalls.length, 0);
+  });
+
+  test("client-visible surfaces use the requested (public) model id, never the internal one", async () => {
+    // UNKNOWN_MODEL text echoes what the client typed.
+    const h = harness({ pricing: null });
+    const { res } = await run(h, { requestedModel: "fable-5.1-high" });
+    assert.equal(res.statusCode, 400);
+    assert.match(res.json().error?.message ?? "", /'fable-5\.1-high'/);
+    assert.doesNotMatch(res.body, /cursor/i);
+
+    // Happy path: relay gets the internal id in the body + the public id to echo;
+    // settlement is keyed by the internal id.
+    const ok = harness();
+    await run(ok, { requestedModel: "fable-5.1-high" });
+    assert.equal(ok.relayCalls.length, 1);
+    assert.equal(ok.relayCalls[0]!.body.model, MODEL);
+    assert.deepEqual(ok.relayCalls[0]!.options, { echoModel: "fable-5.1-high" });
+    assert.equal(ok.settleCalls[0]!.modelId, MODEL);
+
+    // Legacy callers passing the internal id keep echoing it (requestedModel defaults to body.model).
+    const legacy = harness();
+    await run(legacy);
+    assert.deepEqual(legacy.relayCalls[0]!.options, { echoModel: MODEL });
   });
 
   test("account whose snapshot is missing is skipped and the next one is used", async () => {
@@ -425,7 +451,12 @@ describe("cursorExternal route — relay + settle + post-commit", () => {
     const h = harness({ relay: async () => ({ kind: "rejected", status: 400, reason: "NOT_SAND_ROUTE", written: false }) });
     const { res } = await run(h);
     assert.equal(res.statusCode, 400);
-    assert.equal(res.json().error?.code, "CURSOR_UPSTREAM_REJECTED");
+    assert.equal(res.json().error?.code, "UPSTREAM_REJECTED");
+    // Internal CURSOR_SAND_* reason codes are stripped of the engine prefix on the wire.
+    const h2 = harness({ relay: async () => ({ kind: "rejected", status: 502, reason: "CURSOR_SAND_HTTP_502", written: false }) });
+    const r2 = await run(h2);
+    assert.equal(r2.res.json().error?.message, "HTTP_502");
+    assert.doesNotMatch(r2.res.body, /cursor/i);
   });
 
   test("client disconnect mid-stream → settle error USER_CANCELLED with partial usage", async () => {
@@ -445,11 +476,12 @@ describe("cursorExternal route — relay + settle + post-commit", () => {
     assert.deepEqual(h.settleCalls[0]!.usage, { input_tokens: 50, output_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
   });
 
-  test("relay throws before headers → 502 CURSOR_UPSTREAM_FAILED, settle error", async () => {
+  test("relay throws before headers → 502 UPSTREAM_FAILED, settle error", async () => {
     const h = harness({ relay: async () => { throw new Error("ECONNRESET"); } });
     const { res } = await run(h);
     assert.equal(res.statusCode, 502);
-    assert.equal(res.json().error?.code, "CURSOR_UPSTREAM_FAILED");
+    assert.equal(res.json().error?.code, "UPSTREAM_FAILED");
+    assert.doesNotMatch(res.body, /cursor/i);
     assert.equal(h.settleCalls[0]!.engineStatus, "error");
     assert.equal(h.settleCalls[0]!.terminalCode, "CURSOR_RELAY_FAILED");
   });

@@ -1316,7 +1316,11 @@ class FakeServerResponse extends EventEmitter {
   text(): string { return this.chunks.join('') }
 }
 
-function serveRelay(frames: Buffer[], exchangeStatus = 200): CursorSandRelay {
+function serveRelay(
+  frames: Buffer[],
+  exchangeStatus = 200,
+  extra: { upstreamLabel?: string; inferenceStatus?: number } = {},
+): CursorSandRelay {
   const fetchImpl: typeof fetch = async (input) => {
     if (String(input).endsWith('/auth/exchange_user_api_key')) {
       return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
@@ -1324,14 +1328,110 @@ function serveRelay(frames: Buffer[], exchangeStatus = 200): CursorSandRelay {
         headers: { 'content-type': 'application/json' },
       })
     }
+    if (extra.inferenceStatus && extra.inferenceStatus !== 200) {
+      return new Response('upstream said no', { status: extra.inferenceStatus })
+    }
     return new Response(Buffer.concat([...frames, envelope(Buffer.from('{}'), 0x02)]), {
       status: 200,
       headers: { 'content-type': 'application/connect+proto' },
     })
   }
   // Fresh Buffer per read: the relay zeroes the returned key after every use.
-  return new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+  return new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: null,
+    ...(extra.upstreamLabel ? { upstreamLabel: extra.upstreamLabel } : {}),
+  })
 }
+
+test('serveMessages echoes the caller-supplied public model id instead of the upstream id (stream + json)', async () => {
+  const frames = [responseFrame('textPart', { text: 'ok' }), responseFrame('usage', { inputTokens: 3, outputTokens: 1 })]
+  const relay = serveRelay(frames)
+  try {
+    const streamed = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      streamed as never,
+      new AbortController().signal,
+      { echoModel: 'fable-5.1-high' },
+    )
+    assert.equal(result.kind, 'completed')
+    if (result.kind !== 'completed') throw new Error('unreachable')
+    // Settlement still sees the real upstream id; only the wire echo changes.
+    assert.equal(result.upstreamModel, 'claude-fable-5-1-thinking-high')
+    assert.match(streamed.text(), /"model":"fable-5\.1-high"/)
+    assert.doesNotMatch(streamed.text(), /cursor|claude-fable-5-1/i)
+
+    const json = new FakeServerResponse()
+    await relay.serveMessages(
+      { model: 'cursor-grok-4.6-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      json as never,
+      new AbortController().signal,
+      { echoModel: 'grok-4.6-high' },
+    )
+    assert.equal((JSON.parse(json.text()) as { model: string }).model, 'grok-4.6-high')
+
+    // Default (no option) keeps the historical upstream-id echo for the container path.
+    const legacy = new FakeServerResponse()
+    await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      legacy as never,
+      new AbortController().signal,
+    )
+    assert.equal((JSON.parse(legacy.text()) as { model: string }).model, 'claude-fable-5-1-thinking-high')
+  } finally {
+    await relay.close()
+  }
+})
+
+test('serveMessages with a neutral upstreamLabel never names the engine in client-visible errors', async () => {
+  const neutral = serveRelay([], 403, { upstreamLabel: 'Upstream' })
+  try {
+    const res = new FakeServerResponse()
+    const result = await neutral.serveMessages(
+      { model: 'cursor-grok-4.6-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    // Internal reason keeps the full code for operators / cooldown logic …
+    assert.deepEqual(result, { kind: 'rejected', status: 401, reason: 'CURSOR_SAND_AUTH_HTTP_403', written: true })
+    // … but the wire message is scrubbed.
+    assert.match(res.text(), /Upstream credential rejected: AUTH_HTTP_403/)
+    assert.doesNotMatch(res.text(), /cursor/i)
+  } finally {
+    await neutral.close()
+  }
+
+  const http502 = serveRelay([], 200, { upstreamLabel: 'Upstream', inferenceStatus: 502 })
+  try {
+    const res = new FakeServerResponse()
+    const result = await http502.serveMessages(
+      { model: 'cursor-grok-4.6-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.equal(result.kind, 'rejected')
+    assert.match(res.text(), /Upstream HTTP 502/)
+    assert.doesNotMatch(res.text(), /cursor/i)
+  } finally {
+    await http502.close()
+  }
+
+  // Default label is unchanged so the in-container CCB path (and its error classifier) is untouched.
+  const legacy = serveRelay([], 403)
+  try {
+    const res = new FakeServerResponse()
+    await legacy.serveMessages(
+      { model: 'cursor-grok-4.6-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.match(res.text(), /Cursor Sand credential rejected: CURSOR_SAND_AUTH_HTTP_403/)
+  } finally {
+    await legacy.close()
+  }
+})
 
 test('serveMessages runs without start() and returns the exact usage the client received (stream + json)', async () => {
   const frames = [

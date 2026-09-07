@@ -1,3 +1,4 @@
+import { publicCursorModelId } from "@openclaude/protocol";
 import { useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import type {
@@ -36,8 +37,8 @@ export function ApiAccessTab({ auth }: { auth: AuthSession }) {
       <div className="px-5 pt-4">
         <div className="text-section font-medium text-fg">API 接入</div>
         <p className="mt-1 text-caption text-muted">
-          用 API Key 把本地 Claude Code 等工具接到本站的 Cursor 系模型。此处的消耗统计只含 API Key
-          流量,不含网页对话。
+          用 API Key 把本地 Claude Code、CC Switch 等 Anthropic 兼容工具接到本站模型。此处的消耗统计只含
+          API Key 流量,不含网页对话。
         </p>
       </div>
 
@@ -249,7 +250,7 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
                 <tbody>
                   {report.by_model.map((model) => (
                     <tr key={model.model} className="border-t border-border">
-                      <td className="px-3 py-2 font-mono text-fg">{model.model}</td>
+                      <td className="px-3 py-2 font-mono text-fg">{publicCursorModelId(model.model)}</td>
                       <td className="px-3 py-2 text-right tabular-nums">
                         {groupDigits(model.requests)}
                       </td>
@@ -302,7 +303,7 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
                       <td className="max-w-[10rem] truncate px-3 py-2 text-fg">
                         {row.label ?? "(已撤销)"}
                       </td>
-                      <td className="px-3 py-2 font-mono text-fg">{row.model}</td>
+                      <td className="px-3 py-2 font-mono text-fg">{publicCursorModelId(row.model)}</td>
                       <td className="px-3 py-2 text-right tabular-nums">
                         {formatCompactCount(row.input_tokens)}
                       </td>

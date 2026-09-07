@@ -112,6 +112,163 @@ function parseApiKeyToken(raw: string | undefined): {
 }
 
 /**
+ * 从入站请求取 API key 凭据串。两个头都接受(2026-09-07):
+ *   - `Authorization: Bearer oc-cc.…` — Claude Code 的 `ANTHROPIC_AUTH_TOKEN` 形态;
+ *   - `x-api-key: oc-cc.…`           — Anthropic SDK / Claude Code 的 `ANTHROPIC_API_KEY`
+ *     形态,也是 CC Switch「自定义供应商」文档示例的默认写法,以及它「获取模型」
+ *     对 anthropic 格式供应商发 `/v1/models` 时用的头。
+ * Authorization 优先;两头都没有 → 交给 parseApiKeyToken 抛 MISSING_API_KEY。
+ */
+export function apiKeyCredentialFromHeaders(req: IncomingMessage): string | undefined {
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.trim().length > 0) return auth;
+  const xApiKey = req.headers["x-api-key"];
+  if (typeof xApiKey === "string" && xApiKey.trim().length > 0) return xApiKey;
+  return undefined;
+}
+
+export interface ResolveApiKeyIdentityOptions {
+  /**
+   * 是否执行 `^claude-cli/` UA 入站门控(见 resolve 内注释)。
+   * `/v1/messages` 路径恒 true;`GET /v1/models` 传 false —— CC Switch 等桌面工具
+   * 拉模型列表用的是自己的 HTTP 客户端,列表接口只读且不产生上游调用 / 账务,
+   * 没有 UA 门控要保护的东西。
+   */
+  enforceUserAgent: boolean;
+}
+
+/**
+ * 解析一条携带 `oc-cc.*` key 的请求 → ProxyIdentity。strategy.resolve 与
+ * `GET /api/anthropic/v1/models` 共用这一条链,保证两处对"什么 key 能用"的判定
+ * (格式 / 存在 / 撤销 / secret / 禁用 / admin gate)不分裂。
+ *
+ * 失败一律 throw IdentityError(handler 统一 401 通用文案,防枚举)。
+ * `bumpLastUsed` 由 strategy 闭包提供(持 LRU 节流状态);models 端点传 no-op ——
+ * 列表查询不算"使用"。
+ */
+export async function resolveApiKeyIdentity(
+  deps: Pick<ApiKeyIdentityStrategyDeps, "repo" | "loadUserModelAuthz" | "logger">,
+  req: IncomingMessage,
+  opts: ResolveApiKeyIdentityOptions,
+  bumpLastUsed: (keyId: bigint) => void = () => {},
+): Promise<ProxyIdentity> {
+  // === CC 外接 UA 入站门控(plan §3.5,2026-05-19 加)===
+  //
+  // 只放行 `claude-cli/*` UA。其他客户端(curl / postman / 第三方 SDK)拒。
+  // **仅"误用门控",非安全检查** — UA 客户端可伪造,真要绕过 `curl
+  // --user-agent claude-cli/x.y.z` 一行即可。目的:
+  //   1) 抬高滥用门槛(防误用 + 防 key 泄露后被脚本利用)
+  //   2) 让上游 Anthropic 看到的入站流量形态尽量贴近"原生 CC CLI",
+  //      配合 commercial proxy 已有的 device_id pin / OAuth pool 反风控
+  //
+  // **anti-enumeration**:UA 不对 → 同一 `API_KEY_INVALID` / 401 错误码,
+  // 与 unknown/revoked/secret-mismatch/non-admin 共享同 message。
+  // 攻击者无法靠错误码区分"UA 错"和"key 错",server log 内部用 reason
+  // 字段区分给运维 grep。
+  //
+  // **放在 token parse 之前**:UA 检查不依赖任何 user 数据,前置省一次
+  // DB hash 查询。timing-analysis 上 UA 检查比 DB lookup 快得多,但攻击者
+  // 想做 timing 区分必须先持合法 UA + 合法 key,这点信息无价值。
+  //
+  // **prefix match**:CCB / 官方 CC CLI 共用 `getUserAgent()`,生成
+  // `claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>, ...)`,所以
+  // `^claude-cli/` 覆盖 ant/external/firstParty + cli/vscode/sdk +
+  // workload 后缀所有合法变体。不卡版本号 — 用户 CC 版本不一定跟我们
+  // 同步,卡版本会误伤。不 trim — raw header prefix match 更干净,
+  // 防奇怪前导空白被放行(Codex Phase 7 plan-review NIT 采纳)。
+  if (opts.enforceUserAgent) {
+    const uaRaw = req.headers["user-agent"];
+    const ua = typeof uaRaw === "string" ? uaRaw : "";
+    if (!/^claude-cli\//i.test(ua)) {
+      // server log 标 reason 字段给运维区分;client 看到的仍是统一 401。
+      deps.logger?.warn("api_key_ua_gate_blocked", {
+        reason: "ua_mismatch",
+        uaPreview: ua.slice(0, 80),
+      });
+      throw new IdentityError(
+        "API_KEY_INVALID",
+        "user-agent not allowed for CC external endpoint",
+      );
+    }
+  }
+  // === /UA 入站门控 ===
+
+  const { keyPrefix, secretHex } = parseApiKeyToken(apiKeyCredentialFromHeaders(req));
+
+  const row = await deps.repo.findByPrefix(keyPrefix);
+  if (!row) {
+    // findByPrefix 已经过滤 revoked_at IS NULL(Phase 1 unit lock),
+    // null = "prefix 不存在" OR "已撤销" — 合并成同一错误码防 enumeration。
+    throw new IdentityError(
+      "API_KEY_INVALID",
+      `unknown or revoked api key prefix=${keyPrefix}`,
+    );
+  }
+
+  const candidate = hashApiKeySecret(secretHex);
+  // 显式长度判 + 短路:`timingSafeEqual` 长度不一致会抛 RangeError。
+  // 两侧理论上永远 = 32 字节(SHA-256 输出),长度判是 belt-and-suspenders。
+  if (
+    candidate.length !== row.keyHash.length ||
+    !timingSafeEqual(candidate, row.keyHash)
+  ) {
+    throw new IdentityError(
+      "API_KEY_INVALID",
+      `secret mismatch for prefix=${keyPrefix}`,
+    );
+  }
+
+  // 0277 临时禁用:secret 已验对但 owner 主动停用。对外仍 401 同型(防枚举);
+  // **不** bump last_used_at —— 禁用期间的尝试不算 "使用"。
+  if (row.disabledAt !== null) {
+    throw new IdentityError(
+      "API_KEY_DISABLED",
+      `api key id=${row.id} is temporarily disabled (prefix=${keyPrefix})`,
+    );
+  }
+
+  // Bump last_used_at,fire-and-forget + 5min 节流。
+  //
+  // **顺序说明**:bump 在 admin gate 之前。秘密已经验对 → 这是一次"持有真实 key
+  // 的使用尝试",非随机探测;让 ops 能从 last_used_at 看到有非 admin 在尝试用
+  // (Codex Phase 6 plan-review 同意)。
+  // unknown/revoked/secret-mismatch 路径在更前面已 throw,绝不触发 bump
+  // (apiKeyIdentity.unit.test 锁住:findByPrefix=null 不 bump、secret 错不 bump)。
+  bumpLastUsed(row.id);
+
+  // === Phase 6 admin-only rollout gate(Layer 2,见 plan §3.4)===
+  //
+  // fetch authz 校验 role。**临时门控**:首期只允许 admin 用 CC 外接 endpoint,
+  // 即使 DB 里残留 user-role 的 key(管理面 Layer 1 应拦,但 SQL 直插 / 历史数据 /
+  // 未来 staff 协助创建仍可能绕过)也兜底拒绝。
+  //
+  // 错误码 `API_KEY_INVALID`:与 unknown/revoked/secret-mismatch 同型,
+  // anti-enumeration 一致。loadUserModelAuthz 自身 throw 不被这里 catch,
+  // 透传给 proxy/index.ts identity 阶段(non-IdentityError 继续抛出)→ 由
+  // commercial router 的统一 handleError 映成 500 INTERNAL,fail-closed。
+  //
+  // **去 gate**:删除以下整块 if 即可,无外部 API 变化。
+  const authz = await deps.loadUserModelAuthz(row.userId);
+  if (authz.role !== "admin") {
+    throw new IdentityError(
+      "API_KEY_INVALID",
+      `non-admin uid=${row.userId} attempted CC external endpoint (admin-only rollout)`,
+    );
+  }
+  // === /admin gate ===
+
+  // 关键:`containerId: null` — 这是 Phase 0 类型放宽的实际消费点。
+  // ApiKey 路径没有容器维度,journal.container_id 写 SQL NULL,
+  // settle 路径(usage_records / credit_ledger)只按 uid 计费,与容器路径同型。
+  return {
+    uid: row.userId,
+    containerId: null,
+    // 0277:per-key 归因 + 上限预检所需快照(不含任何 secret 材料)。
+    apiKey: { id: row.id, creditLimit: row.creditLimit, spentCredits: row.spentCredits },
+  };
+}
+
+/**
  * `makeApiKeyIdentityStrategy` factory。
  *
  * 行为契约:
@@ -162,118 +319,7 @@ export function makeApiKeyIdentityStrategy(
       req: IncomingMessage,
       _ctx: { hostUuid: string; boundIp: string },
     ): Promise<ProxyIdentity> {
-      // === CC 外接 UA 入站门控(plan §3.5,2026-05-19 加)===
-      //
-      // 只放行 `claude-cli/*` UA。其他客户端(curl / postman / 第三方 SDK)拒。
-      // **仅"误用门控",非安全检查** — UA 客户端可伪造,真要绕过 `curl
-      // --user-agent claude-cli/x.y.z` 一行即可。目的:
-      //   1) 抬高滥用门槛(防误用 + 防 key 泄露后被脚本利用)
-      //   2) 让上游 Anthropic 看到的入站流量形态尽量贴近"原生 CC CLI",
-      //      配合 commercial proxy 已有的 device_id pin / OAuth pool 反风控
-      //
-      // **anti-enumeration**:UA 不对 → 同一 `API_KEY_INVALID` / 401 错误码,
-      // 与 unknown/revoked/secret-mismatch/non-admin 共享同 message。
-      // 攻击者无法靠错误码区分"UA 错"和"key 错",server log 内部用 reason
-      // 字段区分给运维 grep。
-      //
-      // **放在 token parse 之前**:UA 检查不依赖任何 user 数据,前置省一次
-      // DB hash 查询。timing-analysis 上 UA 检查比 DB lookup 快得多,但攻击者
-      // 想做 timing 区分必须先持合法 UA + 合法 key,这点信息无价值。
-      //
-      // **prefix match**:CCB / 官方 CC CLI 共用 `getUserAgent()`,生成
-      // `claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>, ...)`,所以
-      // `^claude-cli/` 覆盖 ant/external/firstParty + cli/vscode/sdk +
-      // workload 后缀所有合法变体。不卡版本号 — 用户 CC 版本不一定跟我们
-      // 同步,卡版本会误伤。不 trim — raw header prefix match 更干净,
-      // 防奇怪前导空白被放行(Codex Phase 7 plan-review NIT 采纳)。
-      const uaRaw = req.headers["user-agent"];
-      const ua = typeof uaRaw === "string" ? uaRaw : "";
-      if (!/^claude-cli\//i.test(ua)) {
-        // server log 标 reason 字段给运维区分;client 看到的仍是统一 401。
-        deps.logger?.warn("api_key_ua_gate_blocked", {
-          reason: "ua_mismatch",
-          uaPreview: ua.slice(0, 80),
-        });
-        throw new IdentityError(
-          "API_KEY_INVALID",
-          "user-agent not allowed for CC external endpoint",
-        );
-      }
-      // === /UA 入站门控 ===
-
-      const { keyPrefix, secretHex } = parseApiKeyToken(req.headers.authorization);
-
-      const row = await deps.repo.findByPrefix(keyPrefix);
-      if (!row) {
-        // findByPrefix 已经过滤 revoked_at IS NULL(Phase 1 unit lock),
-        // null = "prefix 不存在" OR "已撤销" — 合并成同一错误码防 enumeration。
-        throw new IdentityError(
-          "API_KEY_INVALID",
-          `unknown or revoked api key prefix=${keyPrefix}`,
-        );
-      }
-
-      const candidate = hashApiKeySecret(secretHex);
-      // 显式长度判 + 短路:`timingSafeEqual` 长度不一致会抛 RangeError。
-      // 两侧理论上永远 = 32 字节(SHA-256 输出),长度判是 belt-and-suspenders。
-      if (
-        candidate.length !== row.keyHash.length ||
-        !timingSafeEqual(candidate, row.keyHash)
-      ) {
-        throw new IdentityError(
-          "API_KEY_INVALID",
-          `secret mismatch for prefix=${keyPrefix}`,
-        );
-      }
-
-      // 0277 临时禁用:secret 已验对但 owner 主动停用。对外仍 401 同型(防枚举);
-      // **不** bump last_used_at —— 禁用期间的尝试不算 "使用"。
-      if (row.disabledAt !== null) {
-        throw new IdentityError(
-          "API_KEY_DISABLED",
-          `api key id=${row.id} is temporarily disabled (prefix=${keyPrefix})`,
-        );
-      }
-
-      // Bump last_used_at,fire-and-forget + 5min 节流。
-      //
-      // **顺序说明**:bump 在 admin gate 之前。秘密已经验对 → 这是一次"持有真实 key
-      // 的使用尝试",非随机探测;让 ops 能从 last_used_at 看到有非 admin 在尝试用
-      // (Codex Phase 6 plan-review 同意)。
-      // unknown/revoked/secret-mismatch 路径在更前面已 throw,绝不触发 bump
-      // (apiKeyIdentity.unit.test 锁住:findByPrefix=null 不 bump、secret 错不 bump)。
-      bumpLastUsedThrottled(row.id);
-
-      // === Phase 6 admin-only rollout gate(Layer 2,见 plan §3.4)===
-      //
-      // fetch authz 校验 role。**临时门控**:首期只允许 admin 用 CC 外接 endpoint,
-      // 即使 DB 里残留 user-role 的 key(管理面 Layer 1 应拦,但 SQL 直插 / 历史数据 /
-      // 未来 staff 协助创建仍可能绕过)也兜底拒绝。
-      //
-      // 错误码 `API_KEY_INVALID`:与 unknown/revoked/secret-mismatch 同型,
-      // anti-enumeration 一致。loadUserModelAuthz 自身 throw 不被这里 catch,
-      // 透传给 proxy/index.ts identity 阶段(non-IdentityError 继续抛出)→ 由
-      // commercial router 的统一 handleError 映成 500 INTERNAL,fail-closed。
-      //
-      // **去 gate**:删除以下整块 if 即可,无外部 API 变化。
-      const authz = await deps.loadUserModelAuthz(row.userId);
-      if (authz.role !== "admin") {
-        throw new IdentityError(
-          "API_KEY_INVALID",
-          `non-admin uid=${row.userId} attempted CC external endpoint (admin-only rollout)`,
-        );
-      }
-      // === /admin gate ===
-
-      // 关键:`containerId: null` — 这是 Phase 0 类型放宽的实际消费点。
-      // ApiKey 路径没有容器维度,journal.container_id 写 SQL NULL,
-      // settle 路径(usage_records / credit_ledger)只按 uid 计费,与容器路径同型。
-      return {
-        uid: row.userId,
-        containerId: null,
-        // 0277:per-key 归因 + 上限预检所需快照(不含任何 secret 材料)。
-        apiKey: { id: row.id, creditLimit: row.creditLimit, spentCredits: row.spentCredits },
-      };
+      return resolveApiKeyIdentity(deps, req, { enforceUserAgent: true }, bumpLastUsedThrottled);
     },
 
     async authorize(identity, _pricing, model, requiredEpoch) {
