@@ -284,5 +284,70 @@ describe('envProbe', () => {
     assert.equal(result.applied[0]?.name, 'ENV')
     assert.match(result.content, /uid=3 agent=wired-agent/)
     assert.match(result.content, /inst=新个人版V5自用/)
+    // OCV5-166:容器引擎子进程(网页/cron 会话都走这里)拿到用户面时区,而非出口 TZ。
+    assert.match(result.content, /^user_tz=Asia\/Shanghai UTC\+08:00 /m)
+  })
+
+  // ─── OCV5-166 用户面时区(与出口对齐的 OPENCLAUDE_CCB_TZ/TZ 正交) ───
+
+  it('user_tz defaults to Asia/Shanghai with +08:00 when OC_USER_TZ is absent', () => {
+    const slot = buildEnvSlot({ agentId: 'main' }, fakeDeps({ env: selfhostEnv, files: selfhostFiles }))
+    assert.ok(slot)
+    assert.match(slot.content, /^user_tz=Asia\/Shanghai UTC\+08:00 \(shell date\/TZ=出口时区,勿当用户时间\)$/m)
+    assert.doesNotMatch(slot.content, /\d{2}:\d{2}:\d{2}|user local time/) // 不带时刻,免撑爆 prompt 缓存
+  })
+
+  it('user_tz honours a valid OC_USER_TZ and computes the offset at the probe instant (DST-aware)', () => {
+    const winter = new Date('2026-01-15T12:00:00Z')
+    const summer = new Date('2026-07-15T12:00:00Z')
+    const env = { ...selfhostEnv, OC_USER_TZ: 'America/New_York' }
+    const w = computeEnvFacts({ ...fakeDeps({ env, files: selfhostFiles }), now: winter })
+    const s = computeEnvFacts({ ...fakeDeps({ env, files: selfhostFiles }), now: summer })
+    assert.equal(w.userTz, 'America/New_York')
+    assert.equal(w.userTzOffset, 'UTC-05:00')
+    assert.equal(s.userTzOffset, 'UTC-04:00')
+    const half = computeEnvFacts(fakeDeps({ env: { ...selfhostEnv, OC_USER_TZ: 'Asia/Kolkata' }, files: selfhostFiles }))
+    assert.equal(half.userTzOffset, 'UTC+05:30')
+    const utc = computeEnvFacts(fakeDeps({ env: { ...selfhostEnv, OC_USER_TZ: 'UTC' }, files: selfhostFiles }))
+    assert.equal(utc.userTzOffset, 'UTC+00:00')
+  })
+
+  it('user_tz ignores an invalid or shell-unsafe OC_USER_TZ and never throws', () => {
+    for (const bad of ['Not/AZone', '   ', 'Asia/Shanghai; rm -rf /', 'x'.repeat(65)]) {
+      const facts = computeEnvFacts(fakeDeps({ env: { ...selfhostEnv, OC_USER_TZ: bad }, files: selfhostFiles }))
+      assert.equal(facts.userTz, 'Asia/Shanghai', bad)
+      assert.equal(facts.userTzOffset, 'UTC+08:00', bad)
+    }
+  })
+
+  it('user_tz is never the egress TZ: OPENCLAUDE_CCB_TZ / TZ=Asia/Tokyo do not leak into the slot', () => {
+    const slot = buildEnvSlot(
+      { agentId: 'main' },
+      fakeDeps({ env: { ...selfhostEnv, TZ: 'Asia/Tokyo', OPENCLAUDE_CCB_TZ: 'Asia/Tokyo' }, files: selfhostFiles }),
+    )
+    assert.ok(slot)
+    assert.match(slot.content, /^user_tz=Asia\/Shanghai UTC\+08:00 /m)
+    assert.doesNotMatch(slot.content, /Tokyo/)
+  })
+
+  it('user_tz is backfilled from init environ when the engine scrubbed process env', () => {
+    const initPath = join(TEST_HOME, 'init-environ-tz')
+    writeFileSync(initPath, Buffer.from(`${['OC_USER_ID=3', 'OC_USER_TZ=Europe/Berlin'].join('\0')}\0`))
+    const facts = computeEnvFacts(
+      fakeDeps({ env: { HOME: '/tmp/openclaude-cursor.x' }, files: selfhostFiles, initEnvironPath: initPath }),
+    )
+    assert.equal(facts.userTz, 'Europe/Berlin')
+  })
+
+  it('user_tz survives the over-budget trim (paths are dropped first) and the slot stays under budget', () => {
+    const longEnv = {
+      ...selfhostEnv,
+      OC_USER_TZ: 'America/Argentina/Buenos_Aires',
+      OPENCLAUDE_HOME: '/home/agent/.openclaude',
+    }
+    const slot = buildEnvSlot({ agentId: 'a-rather-long-agent-identifier-to-push-the-budget' }, fakeDeps({ env: longEnv, files: selfhostFiles }))
+    assert.ok(slot)
+    assert.match(slot.content, /^user_tz=America\/Argentina\/Buenos_Aires UTC-03:00 /m)
+    assert.ok(Buffer.byteLength(slot.content, 'utf8') <= ENV_SLOT_MAX_BYTES)
   })
 })
