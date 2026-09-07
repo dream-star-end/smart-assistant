@@ -728,6 +728,74 @@ describe("pickUpstream — OpenCode Go DeepSeek Flash canonical + compatibility 
       assert.equal(headers.authorization, undefined);
     }
   });
+
+  // 2026-09-07 OpenCode Go 硬性要求 x-opencode-session(缺 → 400 MissingSessionID,
+  // selfhost deepseek-v4-flash 全量 502、发布金丝雀 C3 连败)。值必须与计费归因同源:
+  // 同一引擎会话恒定,才能让上游做路由/prompt cache 亲和。
+  test("x-opencode-session:取 metadata 会话 id;顶层 session_id 优先于 user_id JSON", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { opencodego: "GO-KEY" } },
+      bodyFor("deepseek-v4-flash"),
+      OPENCODEGO_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+
+    const explicit = { ...bodyFor("deepseek-v4-flash"), metadata: { session_id: "ccb-uuid-explicit" } };
+    const h1: Record<string, string> = {};
+    res.session.applyUpstreamAuth(h1, explicit, log);
+    assert.equal(h1["x-opencode-session"], "ccb-uuid-explicit");
+
+    const viaUserId = {
+      ...bodyFor("deepseek-v4-flash"),
+      metadata: { user_id: JSON.stringify({ device_id: "d", session_id: "ccb-uuid-from-json" }) },
+    };
+    const h2: Record<string, string> = {};
+    res.session.applyUpstreamAuth(h2, viaUserId, log);
+    assert.equal(h2["x-opencode-session"], "ccb-uuid-from-json");
+
+    // 同一会话两次请求 → 同一个值(稳定性是上游要求的核心)。
+    const h3: Record<string, string> = {};
+    res.session.applyUpstreamAuth(h3, structuredClone(viaUserId), log);
+    assert.equal(h3["x-opencode-session"], h2["x-opencode-session"]);
+  });
+
+  test("x-opencode-session:metadata 缺失时退化为随机 UUID,绝不留空", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { opencodego: "GO-KEY" } },
+      bodyFor("deepseek-v4-flash"),
+      OPENCODEGO_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const h: Record<string, string> = {};
+    res.session.applyUpstreamAuth(h, bodyFor("deepseek-v4-flash"), log);
+    assert.match(h["x-opencode-session"] ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  test("x-opencode-session 只对声明 sessionIdHeader 的 provider 注入(deepseek direct 字节不变)", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { deepseek: "DS-KEY" } },
+      bodyFor("deepseek-v4-pro"),
+      selectUpstreamRoute("deepseek-v4-pro"),
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const h: Record<string, string> = {};
+    res.session.applyUpstreamAuth(
+      h,
+      { ...bodyFor("deepseek-v4-pro"), metadata: { session_id: "ccb-uuid" } },
+      log,
+    );
+    assert.equal(h["x-opencode-session"], undefined);
+    assert.equal(h.authorization, "Bearer DS-KEY");
+  });
 });
 
 describe("pickUpstream — OpenCode Go 同 provider 历史", () => {

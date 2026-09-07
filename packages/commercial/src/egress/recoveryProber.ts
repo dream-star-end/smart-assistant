@@ -37,6 +37,7 @@
  *      OC_PROVIDER_HEALTH_RECOVERY_PROBE_INTERVAL_MS 调周期(缺省 60s,夹 [15s, 1h])。
  */
 
+import { randomUUID } from "node:crypto";
 import { request } from "undici";
 import {
   STATIC_KEY_PROVIDERS,
@@ -82,18 +83,33 @@ function probeCandidates(spec: StaticKeyProviderSpec): string[] {
   return [...new Set(rewritten)];
 }
 
-async function defaultProbeRequest(
+/**
+ * 探活请求头 —— 与真实流量(upstream.ts makeStaticKeyUpstream.applyUpstreamAuth)同源:
+ * 鉴权头风格照 spec;上游要求稳定会话 id 头(OpenCode Go `x-opencode-session`,2026-09-07
+ * 起缺失即 400 MissingSessionID)时探活也必须带,否则探活恒 400 → 永不恢复,正是本器要根治
+ * 的死锁形态。探活每次是独立会话,随机 UUID 即可。导出仅为单测(不发网络即可断言头集)。
+ */
+export function buildRecoveryProbeHeaders(
   spec: StaticKeyProviderSpec,
   key: string,
-): Promise<RecoveryProbeResult> {
-  const meta = STATIC_PROVIDER_META[spec.id];
-  const dispatcher = meta.egress === "direct" ? directEgressDispatcher() : undefined;
+): Record<string, string> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "anthropic-version": "2023-06-01",
   };
   if (spec.authScheme === "x-api-key") headers["x-api-key"] = key;
   else headers.authorization = `Bearer ${key}`;
+  if (spec.sessionIdHeader) headers[spec.sessionIdHeader] = randomUUID();
+  return headers;
+}
+
+async function defaultProbeRequest(
+  spec: StaticKeyProviderSpec,
+  key: string,
+): Promise<RecoveryProbeResult> {
+  const meta = STATIC_PROVIDER_META[spec.id];
+  const dispatcher = meta.egress === "direct" ? directEgressDispatcher() : undefined;
+  const headers = buildRecoveryProbeHeaders(spec, key);
 
   let statusCode: number | null = null;
   let error: string | null = null;

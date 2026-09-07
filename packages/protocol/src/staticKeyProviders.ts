@@ -113,6 +113,16 @@ export interface StaticKeyProviderSpec {
    * (否则被整体 strip,effort 透不过去)。
    */
   readonly allowedOutputConfigEfforts?: readonly string[]
+  /**
+   * 上游要求的「稳定会话 id」请求头名。声明后 master/egress 转发前必须带上
+   * `<header>: <引擎原生 session id>`(取 `metadata.session_id` / `metadata.user_id` JSON 的
+   * session_id;缺失时退化为每请求随机 UUID —— 只影响上游路由/缓存亲和,不影响正确性)。
+   * OpenCode Go 2026-09-07 起对缺此头的 /messages 直接 400 `MissingSessionID`
+   * ("Request is missing x-opencode-session and cannot be routed efficiently"),selfhost
+   * deepseek-v4-flash 全量 502 UPSTREAM_ERROR、发布金丝雀 C3 连败;与其文档
+   * https://opencode.ai/docs/go/#where-can-i-use-it 一致。未声明 = 不注入(其它 provider 字节不变)。
+   */
+  readonly sessionIdHeader?: string
 }
 
 const DEEPSEEK: StaticKeyProviderSpec = {
@@ -233,6 +243,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   upstreamEndpoint: 'https://opencode.ai/zen/go/v1/messages',
   // /messages 使用 x-api-key；/models 的 Bearer 风格不影响执行端点。
   authScheme: 'x-api-key',
+  // 2026-09-07 起 Go 网关硬性要求每请求带稳定会话 id(缺 → 400 MissingSessionID)。
+  sessionIdHeader: 'x-opencode-session',
   matchesRoute(modelId) {
     const m = modelId.toLowerCase()
     return (
