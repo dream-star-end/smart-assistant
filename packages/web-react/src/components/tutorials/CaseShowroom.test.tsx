@@ -15,6 +15,13 @@ describe('CaseShowroom', () => {
     expect(run).toHaveBeenCalledWith(expect.objectContaining({ id: 'research-bike-demand', starterPrompt: TUTORIAL_SHOWCASES[0].prompt }))
     expect(select).not.toHaveBeenCalled()
   })
+  it('shows screenshots of actual artifacts and retains data when an image fails', () => {
+    render(<CaseShowroom onSelect={vi.fn()} />)
+    const cover = screen.getByRole('img', { name: TUTORIAL_SHOWCASES[0].title + '实际看板截图' })
+    expect(cover).toHaveAttribute('src', '/tutorials/showcase-covers/research-bike-demand.png')
+    fireEvent.error(cover)
+    expect(screen.getByLabelText('实作结果摘要')).toBeInTheDocument()
+  })
   it('shows login intent without silently starting a run', () => {
     render(<CaseShowroom onSelect={vi.fn()} onRun={vi.fn()} actionLabel="登录后试用" />)
     expect(screen.getAllByText('登录后做我的版本')).toHaveLength(2)

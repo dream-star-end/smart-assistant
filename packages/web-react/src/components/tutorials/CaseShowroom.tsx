@@ -8,6 +8,13 @@ import { Button } from '../ui'
 type Props = { onSelect: (id: TutorialCaseId) => void; onRun?: (item: TutorialCase) => void; actionLabel?: string }
 function ResultCover({ item }: { item: TutorialShowcase }) {
   const mint = item.theme === 'mint'
+  const [failed, setFailed] = useState(false)
+  if (!failed) return (
+    <div className="relative overflow-hidden border-b border-border bg-[#f3f6ef]">
+      <img src={'/tutorials/showcase-covers/' + item.caseId + '.png'} alt={item.title + '实际看板截图'} width={1024} height={740} loading="lazy" onError={() => setFailed(true)} className="aspect-[16/10] w-full object-contain object-center" />
+      <span className="absolute bottom-3 right-3 rounded-full border border-white/30 bg-[#102b29]/90 px-3 py-1.5 text-caption text-white shadow-sm">真实作品 · 点开可交互</span>
+    </div>
+  )
   return (
     <div className={cn('relative flex min-h-[260px] flex-col justify-between overflow-hidden p-6 text-white sm:p-8', mint ? 'bg-[#102b29]' : 'bg-[#152442]')}>
       <div className={cn('pointer-events-none absolute -right-10 -top-16 h-64 w-64 rounded-full blur-3xl', mint ? 'bg-emerald-300/15' : 'bg-sky-300/15')} />

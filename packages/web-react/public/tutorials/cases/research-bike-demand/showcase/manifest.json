@@ -41,8 +41,8 @@
   "outputs": [
     {
       "path": "/tutorials/cases/research-bike-demand/showcase/dashboard.html",
-      "sha256": "a3921e25433fa17851ff3e3e10bb609b8a71048bd61d7890310ee037239a174e",
-      "bytes": 46700
+      "sha256": "9b52d0d411a430dc57970fec6048843fa138c7fdb546fdccb29525777990b499",
+      "bytes": 46712
     },
     {
       "path": "/tutorials/cases/research-bike-demand/showcase/report.md",

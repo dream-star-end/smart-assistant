@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { TUTORIAL_CASE_BY_ID } from './tutorialCaseCatalog'
 import { TUTORIAL_SHOWCASES, showcaseAsset, showcaseById, showcaseTask } from './tutorialShowcase'
+
+const publicRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../public')
 
 describe('public-data showcase evidence', () => {
   it('only projects existing case IDs and never upgrades pending replay', () => {
@@ -33,6 +37,18 @@ describe('public-data showcase evidence', () => {
         const data = readFileSync(new URL('../../public' + file.path, import.meta.url))
         expect(data.byteLength, file.path).toBe(file.bytes)
         expect(createHash('sha256').update(data).digest('hex'), file.path).toBe(file.sha256)
+      }
+    }
+  })
+  it('ties real browser cover images to the exact HTML artifact they depict', () => {
+    const manifest = JSON.parse(readFileSync(resolve(publicRoot, 'tutorials/showcase-covers/manifest.json'), 'utf8'))
+    expect(manifest.covers).toHaveLength(TUTORIAL_SHOWCASES.length)
+    for (const entry of manifest.covers) {
+      expect(showcaseById(entry.caseId)).toBeDefined()
+      for (const [path, hash] of [[entry.path, entry.sha256], [entry.sourcePath, entry.sourceSha256]]) {
+        expect(path).not.toContain('..')
+        const bytes = readFileSync(resolve(publicRoot, '.' + path))
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe(hash)
       }
     }
   })
