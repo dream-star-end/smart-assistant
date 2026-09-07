@@ -3176,6 +3176,25 @@
           "assertion": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true"
         }
       ]
+    },
+    {
+      "id": "INC-20260907-MEDIA-CURSOR-PRECISION",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "媒体任务及项目历史分页将 PostgreSQL 微秒时间经 JS Date 截到毫秒，keyset 边界跳过同毫秒更旧记录；CI pr-3 出现第二页1条而非2条。游标保留原始PG微秒，DTO及排序不变。 真实 SQL 行为由29项integration验证；部署源码门只证明防回退，不冒称端到端或上线。",
+      "rootFixCommit": "5636f8c5",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/mediaGeneration.integ.test.ts",
+          "assertion": "${kind} history preserves ${precision} across every page boundary"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof."
+        }
+      ]
     }
   ]
 }

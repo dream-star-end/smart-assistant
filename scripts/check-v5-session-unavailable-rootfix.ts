@@ -75,3 +75,32 @@ console.log(
   '[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked',
 )
 console.log('[session-unavailable-rootfix] PASS — INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL team-leader default-model test contract is locked')
+
+// INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
+// The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
+const mediaStore = readFileSync(join(root, 'packages/commercial/src/media-generation/store.ts'), 'utf8')
+for (const [name, next, column, rows] of [
+  ['listJobs', 'queuePosition', 'created_at', 'jobs'],
+  ['listProjects', 'getProject', 'updated_at', 'projects'],
+] as const) {
+  const start = mediaStore.indexOf(`export async function ${name}(`)
+  const end = mediaStore.indexOf(`export async function ${next}(`, start)
+  const body = start >= 0 && end > start ? mediaStore.slice(start, end) : ''
+  for (const marker of [
+    `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at`,
+    `const last = result.rows[${rows}.length - 1]`,
+    'encodeDateCursor(last.cursor_at, last.id)',
+  ]) {
+    if (!body.includes(marker)) {
+      throw new Error(`[media-cursor-rootfix] ${name} precise keyset contract missing: ${marker}`)
+    }
+  }
+  if (name === 'listProjects' && !body.includes('result.rows.map(({ cursor_at: _cursorAt, ...project }) => project)')) {
+    throw new Error('[media-cursor-rootfix] listProjects must strip the private cursor column')
+  }
+}
+const mediaEncoder = mediaStore.slice(mediaStore.indexOf('function encodeDateCursor('), mediaStore.indexOf('function decodeCursor('))
+if (!mediaEncoder.includes('JSON.stringify([timestamp, id])') || mediaEncoder.includes('toISOString')) {
+  throw new Error('[media-cursor-rootfix] cursor encoder must preserve the raw PostgreSQL timestamp')
+}
+console.log('[media-cursor-rootfix] PASS — INC-20260907-MEDIA-CURSOR-PRECISION source contracts locked')
