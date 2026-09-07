@@ -21,6 +21,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   IconButton,
+  iconButtonVariants,
   useToast,
 } from "./ui";
 
@@ -174,7 +175,7 @@ export function Composer({
   const dragDepthRef = useRef(0);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  // 附件 file input 的稳定 id：供「+」菜单里的 <label htmlFor> 原生激活(见下方附件项)。
+  // 附件 file input 的稳定 id：供工具条回形针 <label htmlFor> 原生激活。
   const fileInputId = useId();
   const idRef = useRef(0);
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
@@ -262,11 +263,11 @@ export function Composer({
   // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
   const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading && !attachFailed;
 
-  // 「+」菜单可用项:附件(有 onUpload)与目标(有 onSetGoal+onGoalAction)。两者皆无时(如 demo)
-  // 退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
+  // 「+」菜单只保留目标(有 onSetGoal+onGoalAction)。附件已提到工具条一级回形针。
+  // 无目标时(如 demo)退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
   const canAttach = !!onUpload;
   const canGoal = !!onSetGoal && !!onGoalAction;
-  const hasPlusMenu = canAttach || canGoal;
+  const hasPlusMenu = canGoal;
   const visibleGoal = visibleGoalOf(goal);
 
   const removeAttach = useCallback(
@@ -469,10 +470,11 @@ export function Composer({
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
-          {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合下方
+          {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
               <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
               合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
-              不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。 */}
+              不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。
+              禁止合成 input.click()。 */}
           <input
             data-product-feature={PRODUCT_CAPABILITIES.files.id}
             id={fileInputId}
@@ -481,14 +483,28 @@ export function Composer({
             multiple
             tabIndex={-1}
             className="sr-only"
-            // 菜单闭合时 htmlFor label 不在 DOM,可访问名退化为空;补 aria-label 供读屏。
             // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
             aria-label="选择附件文件"
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
-          {/* 「+」选项菜单:聚合附件上传与「设定目标」入口(目标入口由会话头部迁入)。
+          {canAttach && (
+            <label
+              htmlFor={fileInputId}
+              aria-label="添加附件"
+              title="添加附件"
+              data-product-feature={PRODUCT_CAPABILITIES.files.id}
+              className={cn(
+                iconButtonVariants({ shape: "square" }),
+                "mb-0.5 cursor-pointer",
+                disabled && "pointer-events-none opacity-50",
+              )}
+            >
+              <Paperclip size={18} />
+            </label>
+          )}
+          {/* 「+」选项菜单:仅「设定目标」(附件已提到一级回形针)。
               菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
-              无任何可用项时(demo)退化为禁用按钮,不弹空菜单。 */}
+              无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
           {hasPlusMenu ? (
             <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
               <DropdownMenuTrigger asChild>
@@ -515,29 +531,6 @@ export function Composer({
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" side="top">
-                {canAttach && (
-                  // 附件项渲染为原生 <label htmlFor>：点击/触摸经浏览器原生 label 激活直接打开
-                  // file input,不走合成 input.click()(国产内核/iOS Safari 会静默吞掉隐藏 input
-                  // 上的合成 click,实证 61de46e2/de16e2be)。
-                  // onSelect 必须 preventDefault:Radix 默认 select 会在受信点击的派发过程中同步
-                  // 关菜单卸载 Portal,而 label 的原生转发(post-dispatch activation)发生在派发
-                  // 完成之后——届时 label 已 detached,htmlFor 解析不到 input,选择器不弹
-                  // (真机 Chromium 实证 0 转发;jsdom fireEvent 是非受信事件不同步 flush,测不出)。
-                  // 菜单关闭改在宏任务里手动触发:排在原生激活之后,选择器已拉起,关菜单不影响。
-                  <DropdownMenuItem
-                    asChild
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      setTimeout(() => setPlusMenuOpen(false), 0);
-                    }}
-                  >
-                    <label htmlFor={fileInputId}>
-                      <Paperclip size={16} className="shrink-0 text-muted" />
-                      添加附件
-                    </label>
-                  </DropdownMenuItem>
-                )}
                 {canGoal && (
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
@@ -564,9 +557,19 @@ export function Composer({
               aria-label="更多选项"
               title="附件暂不可用"
               disabled
-              className="mb-0.5"
+              className="relative mb-0.5"
             >
               <Plus size={20} />
+              {visibleGoal && (
+                <span
+                  aria-hidden
+                  data-testid="composer-goal-dot"
+                  className={cn(
+                    "absolute right-1 top-1 size-1.5 rounded-full",
+                    goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                  )}
+                />
+              )}
             </IconButton>
           )}
           <textarea
