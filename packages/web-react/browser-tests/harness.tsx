@@ -3435,6 +3435,7 @@ const DENSITY_USER: User = {
   roles: ["user"],
   role: "admin",
 };
+(window as unknown as { __densityGalleryOpens: number }).__densityGalleryOpens = 0;
 createRoot(document.getElementById("codex-density-root")!).render(
   <StrictMode>
     <div style={{ height: 640 }}>
@@ -3468,7 +3469,9 @@ createRoot(document.getElementById("codex-density-root")!).render(
         onDelete={() => {}}
         onOpenManage={() => {}}
         onOpenMarketplace={() => {}}
-        onOpenTutorial={() => {}}
+        onOpenTutorial={() => {
+          (window as unknown as { __densityGalleryOpens: number }).__densityGalleryOpens += 1;
+        }}
         onOpenOrg={() => {}}
         onOpenAccount={() => {}}
         onOpenMediaTasks={() => {}}
