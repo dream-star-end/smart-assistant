@@ -161,3 +161,33 @@ if (!delegateCronSrc.includes('cronHeartbeat?.stop()')) {
   throw new Error('[delegate-ledger-reap] cron heartbeat must be stopped on every execution path')
 }
 console.log('[delegate-ledger-reap] PASS — INC-20260907-DELEGATE-LEDGER-REAP source contracts locked')
+
+// INC-20260908-GROK-POOL-NO-COOLDOWN: source regression guard, not end-to-end proof.
+// Unit suites (internalGrokRelay / cursorExternalSettle) exercise the classifier,
+// the recorder ordering and the last_error contract; this gate only stops the
+// production wiring from silently reverting to the counter-only recorder.
+const grokRelaySrc = readFileSync(join(root, 'packages/commercial/src/http/internalGrokRelay.ts'), 'utf8')
+const commercialIndexSrc = readFileSync(join(root, 'packages/commercial/src/index.ts'), 'utf8')
+const cursorSettleSrc = readFileSync(join(root, 'packages/commercial/src/billing/cursorExternalSettle.ts'), 'utf8')
+for (const marker of ['export function classifyGrokRelayStatus(', 'export function makeGrokRelayHealthRecorder(', 'health.onFailure(accountId, `grok_http_${statusCode}`)']) {
+  if (!grokRelaySrc.includes(marker)) {
+    throw new Error(`[grok-pool-cooldown] internalGrokRelay.ts lost health-feedback contract: ${marker}`)
+  }
+}
+// The relay must be constructed with the tracker-backed recorder; the bare
+// counter fallback inside makeGrokRelayHandler is for tracker-less callers only.
+if (!/makeGrokRelayHandler\(\{[\s\S]{0,600}?recordStatus: makeGrokRelayHealthRecorder\(\{ health: healthTracker \}\)/.test(commercialIndexSrc)) {
+  throw new Error('[grok-pool-cooldown] index.ts must wire makeGrokRelayHealthRecorder({ health: healthTracker }) into makeGrokRelayHandler')
+}
+// Cursor rows stay OFF the health tracker (materializer whitelist), but the
+// failure path must keep writing last_error so the admin table shows it.
+if (!cursorSettleSrc.includes('export function planCursorAccountUsageBump(')) {
+  throw new Error('[grok-pool-cooldown] cursorExternalSettle.ts lost planCursorAccountUsageBump')
+}
+if (!/last_error = \$2/.test(cursorSettleSrc) || !/last_error = NULL/.test(cursorSettleSrc)) {
+  throw new Error('[grok-pool-cooldown] cursor settle must write last_error on failure and clear it on success')
+}
+if (/health\.on(Success|Failure)\(/.test(cursorSettleSrc)) {
+  throw new Error('[grok-pool-cooldown] cursor settle must not call AccountHealthTracker (materializer whitelist depends on health/status/cooldown)')
+}
+console.log('[grok-pool-cooldown] PASS — INC-20260908-GROK-POOL-NO-COOLDOWN source contracts locked')
