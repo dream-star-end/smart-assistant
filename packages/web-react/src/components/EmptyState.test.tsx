@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, test, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { MAIN_AGENT } from '../lib/agents'
 import { EmptyState } from './EmptyState'
+
+afterEach(cleanup)
 
 describe('EmptyState first-task starters', () => {
   test('shows useful starters and only asks the composer to prefill the chosen text', () => {
