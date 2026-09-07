@@ -3261,6 +3261,30 @@
           "assertion": "allocating an ID before send preserves unsent new draft"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-CHAT-NAVIGATION",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "回到底部按钮被旧上滑基线/触摸结束篱笆拦住却假隐藏，近底轻滑误显；移动会话顶栏全部入口挤在一排。",
+      "rootFixCommit": "88251c81d19e8d2e1ddb4e5f22767c0706617819",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/stickToBottom.test.ts",
+          "assertion": "supersedes %s intent then respects the next gesture"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ChatHeader.test.tsx",
+          "assertion": "keeps the agent accessible and groups the model independently of actions"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/chat-navigation.node-test.mjs",
+          "assertion": "Chat navigation: real components, production CSS, trusted pointer/touch"
+        }
+      ]
     }
   ]
 }
