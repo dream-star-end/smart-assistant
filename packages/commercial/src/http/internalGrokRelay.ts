@@ -47,20 +47,28 @@ export type GrokRelayHandler = (req: IncomingMessage, res: ServerResponse, ctx: 
 
 /**
  * How an upstream xAI status reflects on the *account* (not the request).
+ * Mirrors the scheduler's ReleaseResult kinds so all providers reason alike.
  *
- *   - success      → health recovers (mirrors scheduler ReleaseResult 'success')
- *   - failure      → account-attributable: 401/402/403 (token/plan), 429 (quota),
- *                    5xx (upstream). Counts toward the 3-strike cooldown.
+ *   - success      → health recovers
+ *   - failure      → account-attributable: 401/402/403 (token/plan), 429 (quota).
+ *                    Counts toward the 3-strike cooldown.
+ *   - upstream     → 5xx: xAI itself is unhealthy. NOT a strike — the pool has
+ *                    only a handful of Grok accounts, and a global 529 burst
+ *                    would otherwise cool every one of them for 10 minutes
+ *                    (and kill in-flight routes, which require status='active')
+ *                    when the old behaviour self-healed the instant xAI did.
+ *                    Same reasoning as CCB's 'transient_network': don't bill
+ *                    the account for the provider's outage. Still surfaced on
+ *                    the row (fail_count / last_error) so admins can see it.
  *   - client_error → request-shape 4xx (400/404/405/413/422…): the CLI sent
- *                    something xAI rejects; the account is fine. No health
- *                    mutation — same reasoning as the CCB 'client_error' kind,
- *                    where a client bug must not burn a pool account.
+ *                    something xAI rejects; the account is fine. No mutation.
  */
-export type GrokRelayOutcome = 'success' | 'failure' | 'client_error'
+export type GrokRelayOutcome = 'success' | 'failure' | 'upstream' | 'client_error'
 
 export function classifyGrokRelayStatus(status: number): GrokRelayOutcome {
   if (status < 400) return 'success'
-  if (status === 401 || status === 402 || status === 403 || status === 429 || status >= 500) return 'failure'
+  if (status === 401 || status === 402 || status === 403 || status === 429) return 'failure'
+  if (status >= 500) return 'upstream'
   return 'client_error'
 }
 
@@ -85,6 +93,16 @@ export function makeGrokRelayHealthRecorder(deps: {
     if (outcome === 'client_error') return
     if (outcome === 'success') {
       await deps.health.onSuccess(accountId)
+      return
+    }
+    if (outcome === 'upstream') {
+      // Visible, but not a strike (see GrokRelayOutcome).
+      await q(
+        `UPDATE claude_accounts
+            SET fail_count = fail_count + 1, last_used_at = NOW(), last_error = $2, updated_at = NOW()
+          WHERE id = $1 AND provider = 'grok'`,
+        [String(accountId), `grok_http_${statusCode}`],
+      )
       return
     }
     if (statusCode === 401) {

@@ -344,12 +344,15 @@ describe('internal Grok relay', () => {
 })
 
 describe('grok relay account health feedback', () => {
-  test('classifyGrokRelayStatus: 2xx/3xx success, account-attributable 4xx + 5xx failure, request-shape 4xx client_error', () => {
+  test('classifyGrokRelayStatus: 2xx/3xx success, account-attributable 4xx failure, 5xx upstream, request-shape 4xx client_error', () => {
     assert.equal(classifyGrokRelayStatus(200), 'success')
     assert.equal(classifyGrokRelayStatus(201), 'success')
     assert.equal(classifyGrokRelayStatus(304), 'success')
-    for (const s of [401, 402, 403, 429, 500, 502, 503, 529]) {
+    for (const s of [401, 402, 403, 429]) {
       assert.equal(classifyGrokRelayStatus(s), 'failure', `status ${s}`)
+    }
+    for (const s of [500, 502, 503, 529]) {
+      assert.equal(classifyGrokRelayStatus(s), 'upstream', `status ${s}`)
     }
     for (const s of [400, 404, 405, 413, 422]) {
       assert.equal(classifyGrokRelayStatus(s), 'client_error', `status ${s}`)
@@ -369,9 +372,32 @@ describe('grok relay account health feedback', () => {
     await recorder(53n, 200)
     await recorder(53n, 400)
     await recorder(53n, 429)
+    await recorder(53n, 403)
+    assert.deepEqual(calls, ['ok:53', 'fail:53:grok_http_429', 'fail:53:grok_http_403'])
+    assert.equal(sql.length, 0, 'no direct SQL unless 401 / 5xx')
+  })
+
+  test('recorder treats 5xx as an upstream outage: visible on the row, never a health strike', async () => {
+    const calls: string[] = []
+    const sql: Array<[string, unknown[]]> = []
+    const recorder = makeGrokRelayHealthRecorder({
+      health: {
+        onSuccess: async (id) => { calls.push(`ok:${id}`); return null },
+        onFailure: async (id, msg) => { calls.push(`fail:${id}:${msg}`); return null },
+      },
+      query: (async (text: string, params: unknown[]) => { sql.push([text, params]); return { rows: [], rowCount: 1 } }) as never,
+    })
     await recorder(53n, 503)
-    assert.deepEqual(calls, ['ok:53', 'fail:53:grok_http_429', 'fail:53:grok_http_503'])
-    assert.equal(sql.length, 0, 'no direct SQL unless 401')
+    await recorder(53n, 529)
+    assert.deepEqual(calls, [], 'a global xAI outage must not cool every Grok account')
+    assert.equal(sql.length, 2)
+    for (const [text, params] of sql) {
+      assert.match(text, /fail_count = fail_count \+ 1/)
+      assert.match(text, /last_error = \$2/)
+      assert.doesNotMatch(text, /health_score|status =|cooldown_until/)
+      assert.equal(params[0], '53')
+    }
+    assert.deepEqual(sql.map(([, p]) => p[1]), ['grok_http_503', 'grok_http_529'])
   })
 
   test('recorder on 401 forces oauth_expires_at=NOW() before counting the failure', async () => {

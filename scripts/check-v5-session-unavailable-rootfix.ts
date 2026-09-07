@@ -174,6 +174,12 @@ for (const marker of ['export function classifyGrokRelayStatus(', 'export functi
     throw new Error(`[grok-pool-cooldown] internalGrokRelay.ts lost health-feedback contract: ${marker}`)
   }
 }
+// 5xx must stay an 'upstream' outcome (visible, not a strike): a global xAI
+// outage cooling every Grok account for 10 minutes would be worse than the
+// bug this fixes. If someone folds 5xx back into 'failure', this fires.
+if (!/if \(status >= 500\) return 'upstream'/.test(grokRelaySrc)) {
+  throw new Error("[grok-pool-cooldown] classifyGrokRelayStatus must map 5xx to 'upstream', never to a health strike")
+}
 // The relay must be constructed with the tracker-backed recorder; the bare
 // counter fallback inside makeGrokRelayHandler is for tracker-less callers only.
 if (!/makeGrokRelayHandler\(\{[\s\S]{0,600}?recordStatus: makeGrokRelayHealthRecorder\(\{ health: healthTracker \}\)/.test(commercialIndexSrc)) {
