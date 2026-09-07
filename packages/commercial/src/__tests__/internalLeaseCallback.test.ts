@@ -13,7 +13,7 @@ function req(extra: Record<string, unknown> = {}, payload: unknown = body) {
   }) as unknown as IncomingMessage;
 }
 function res() {
-  return { statusCode: 0, body: null as any, setHeader() {}, end(s: string) { this.body = JSON.parse(s); } } as unknown as ServerResponse & { body: any };
+  return { statusCode: 0, body: null as any, setHeader() {}, end(this: { body: unknown }, s: string) { this.body = JSON.parse(s); } } as unknown as ServerResponse & { body: any };
 }
 test("callback: real peer and secret required; forwarded headers cannot authorize", async () => {
   let calls = 0;

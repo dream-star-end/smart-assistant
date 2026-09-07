@@ -8,8 +8,11 @@ billing rule, or automatic redeploy policy. Commercial production is untouched.
 ## Configuration and activation order
 1. Wait for the existing deployment owner to finish; do not stop its train.
 2. Generate a dedicated 32-byte random secret encoded as 64 lowercase hex.
-   Persist OC_LEASE_CALLBACK_SECRET in the authoritative selfhost configuration
-   source AND rendered /etc/openclaude/commercial-v5-selfhost.env. Do not print
+   Persist OC_LEASE_CALLBACK_SECRET in /etc/openclaude/commercial-v5-selfhost.env
+   (the existing selfhost file is authoritative and normal deploy preserves it).
+   secrets.env imports provider keys only; it does NOT import this key. If
+   --force-env is explicitly used, restore the callback key before activation.
+   Do not print
    the secret or pass it in command arguments, do not reuse a container bearer.
 3. Deploy this reviewed commit through the normal selfhost train (master and
    container runtime source axes; no image rebuild). Worker scripts are read
