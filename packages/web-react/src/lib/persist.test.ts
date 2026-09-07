@@ -800,6 +800,97 @@ describe("persist — 历史合并纯函数", () => {
     expect(applyServerIncremental(repaired, [])).toBe(repaired);
   });
 
+  test("stableSortByTs then repair self-heals cards sitting before the owner user (INC-20260907-PROCESS-CARD-BEFORE-USER)", () => {
+    const user: ChatMessage = {
+      id: "u",
+      role: "user",
+      text: "问",
+      ts: 100,
+      _orderSeq: 1,
+      _source: "server",
+    };
+    const assistant: ChatMessage = {
+      id: "a",
+      role: "assistant",
+      text: "答",
+      ts: 400,
+      _orderSeq: 2,
+      _source: "server",
+      _clientMessageId: "u",
+    };
+    const group: ChatMessage = {
+      id: "g",
+      role: "agent-group",
+      text: "审读回到底部按钮与几何影响",
+      ts: 200,
+      _turnOwnerId: "u",
+    };
+    const question: ChatMessage = {
+      id: "q",
+      role: "permission",
+      text: "AskUserQuestion",
+      ts: 300,
+      _turnOwnerId: "u",
+      _resolved: false,
+      requestId: "req-before-user",
+    };
+    const poisoned = [group, question, user, assistant];
+    expect(stableSortByTs(poisoned).map((message) => message.id)).toEqual(["g", "q", "u", "a"]);
+
+    const restored = applyServerIncremental(poisoned, []);
+    expect(restored.map((message) => message.id)).toEqual(["u", "g", "a", "q"]);
+    expect(applyServerIncremental(restored, [])).toBe(restored);
+
+    const merged = mergeFullServerWins([user, assistant], poisoned);
+    expect(merged.map((message) => message.id)).toEqual(["u", "g", "a", "q"]);
+    const mergedAgain = mergeFullServerWins([user, assistant], merged);
+    expect(mergedAgain.map((message) => message.id)).toEqual(merged.map((message) => message.id));
+
+    const recoverId = "m-recover-3hev56n0kpyl1";
+    const firstUser: ChatMessage = {
+      id: "u-first",
+      role: "user",
+      text: "第一条",
+      ts: 10,
+      _orderSeq: 1,
+      _source: "server",
+    };
+    const recoverUser: ChatMessage = {
+      id: recoverId,
+      role: "user",
+      text: "恢复轮",
+      ts: 50,
+      _orderSeq: 3,
+      _source: "server",
+    };
+    const recoverAssistant: ChatMessage = {
+      id: "a-recover",
+      role: "assistant",
+      text: "恢复答复",
+      ts: 80,
+      _orderSeq: 4,
+      _source: "server",
+      _clientMessageId: recoverId,
+    };
+    const recoverGroup: ChatMessage = {
+      id: "g-recover",
+      role: "agent-group",
+      text: "审读回到底部按钮与几何影响",
+      ts: 20,
+      _turnOwnerId: recoverId,
+    };
+    const recoverLocal = [recoverGroup, firstUser, recoverUser, recoverAssistant];
+    expect(mergeFullServerWins(
+      [firstUser, recoverUser, recoverAssistant],
+      recoverLocal,
+    ).map((message) => message.id)).toEqual([
+      "u-first",
+      recoverId,
+      "g-recover",
+      "a-recover",
+    ]);
+  });
+
   test("mergeFullServerWins: 所有 local-only 行剥离伪造 _orderSeq,只有 server 可进入 durable axis", () => {
     const server: ChatMessage[] = [
       { id: "srv-1", role: "user", text: "一", ts: 100, _orderSeq: 1, _source: "server" },

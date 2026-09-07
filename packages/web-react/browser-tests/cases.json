@@ -265,6 +265,10 @@
     {
       "id": "T66",
       "proves": "真 Chromium 中「回到底部」按钮(OCV5-147)不参与滚动几何：它是时间线列表根(ResizeObserver root)的子节点，必须零高度常驻挂载、只切 opacity/pointer-events。贴底时 dock 存在且不可见、高度 0;滚轮上滑离底后按钮可见且 scrollHeight 不变;篱笆仍持有时滚轮回底，following 恰翻转 1 次、scrollHeight 不变、逐步位置单调不被向上夹回、零程序化写入、dock 仍挂载且不可见，随后追加内容继续跟随(根治 f445a196c 随 following 挂载/卸载 52px 按钮 → clamp → hadUserIntent 零容差判离底 → 再挂载的几何自激，2026-09-07 rel-22a377d7f 每次回底都弹一下)"
+    },
+    {
+      "id": "T67",
+      "proves": "真 Chromium 中 local agent-group/问答卡越过所属 user 的坏序（stableSortByTs 仍为 g,q,u,a）经 repair/merge/incremental 自愈为 user 之后，m-recover owner 不贴到第一条 user，缺 owner user 不猜轮，server tape 相对序不变，下一 user 上界生效，连续 merge 幂等；毒序 MessageList 用户气泡在子任务前，修复序用户气泡在子任务后（INC-20260907-PROCESS-CARD-BEFORE-USER）"
     }
   ]
 }

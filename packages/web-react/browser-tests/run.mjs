@@ -191,7 +191,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-short"]{min-height:80px}
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
   #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="process-card-owner-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -3381,6 +3381,63 @@ await check("T51 Weibo 错误码提示重新扫码且图文失败建议纯文字
   if (!result.mediaUpload.includes("纯文字")) {
     throw new Error(`WEIBO_WRITE_MEDIA_UPLOAD 未建议纯文字:${JSON.stringify(result)}`);
   }
+});
+
+await check("T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且 MessageList 红绿对照", async () => {
+  await page.evaluate(() => window.__mountProcessCardOwnerProbe());
+  const result = await page.evaluate(() => window.__processCardOwner);
+  if (JSON.stringify(result.sortIds) !== JSON.stringify(["g", "q", "u", "a"])) {
+    throw new Error(`T67 毒序对照丢失(stableSortByTs 应变坏):${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.repairedIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 repair 未把过程卡移到所属 user 之后:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.mergeIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 mergeFullServerWins 未自愈:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.incrementalIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 applyServerIncremental 未自愈:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.recoverIds) !== JSON.stringify([
+    "u-first",
+    "m-recover-3hev56n0kpyl1",
+    "g-recover",
+    "a-recover",
+  ])) {
+    throw new Error(`T67 m-recover owner 贴到了别的 user:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.missingOwnerIds) !== JSON.stringify(["g-archived", "u2", "a2"])) {
+    throw new Error(`T67 missing owner 被猜到别轮:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.serverTapeIds) !== JSON.stringify(["g-server", "u1", "think1", "a1"])) {
+    throw new Error(`T67 server tape 相对顺序被改写:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.nextUserBoundIds) !== JSON.stringify(["u1", "g1", "a1", "u2"])) {
+    throw new Error(`T67 下一 user 上界未生效:${JSON.stringify(result)}`);
+  }
+  if (!result.cleanUnchanged || !result.idempotent) {
+    throw new Error(`T67 正确序被改写或 merge 不幂等:${JSON.stringify(result)}`);
+  }
+  const poisonKeys = await page.evaluate(() =>
+    [...document.querySelectorAll("#process-card-owner-poison [data-chat-virtual-key]")]
+      .map((node) => node.getAttribute("data-chat-virtual-key")));
+  const repairedKeys = await page.evaluate(() =>
+    [...document.querySelectorAll("#process-card-owner-repaired [data-chat-virtual-key]")]
+      .map((node) => node.getAttribute("data-chat-virtual-key")));
+  const poisonUser = poisonKeys.indexOf("u");
+  const poisonGroup = poisonKeys.indexOf("g");
+  if (poisonUser < 0 || poisonGroup < 0 || poisonGroup >= poisonUser) {
+    throw new Error(`T67 毒序 MessageList 未把子任务渲在 user 前:${JSON.stringify(poisonKeys)}`);
+  }
+  const repairedUser = repairedKeys.indexOf("u");
+  const repairedGroup = repairedKeys.indexOf("g");
+  if (repairedUser < 0 || repairedGroup < 0 || repairedGroup <= repairedUser) {
+    throw new Error(`T67 修复序 MessageList 用户气泡未在子任务前:${JSON.stringify(repairedKeys)}`);
+  }
+  await page.getByText("BROWSER_CARD_OWNER_USER", { exact: true }).first().waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
 });
 
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {

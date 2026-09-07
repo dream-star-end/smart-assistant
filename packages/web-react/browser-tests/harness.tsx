@@ -41,8 +41,11 @@ import {
   restoreVisibleVirtualRowAnchor,
 } from "../src/components/chat/archivePaging";
 import {
+  applyServerIncremental,
+  mergeFullServerWins,
   mergeTimelineHistoryPage,
   SessionStore,
+  stableSortByTs,
   type StoredPendingDispatch,
   type StoredSession,
 } from "../src/lib/persist";
@@ -51,7 +54,7 @@ import type { MediaRef } from "../src/lib/chat/frames";
 import type { User } from "../src/lib/types";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import { EPOCH_BAND, packEpoch, timelineIdentity } from "@openclaude/protocol";
-import { applyServerIncremental, mergeFullServerWins } from "../src/lib/persist";
+import { repairPostFinalProcessOrder } from "../src/lib/chat/order";
 import { identityOf, lifecycleOf, projectTimeline } from "../src/lib/timeline/projectLifecycle";
 import {
   getShadowStats,
@@ -137,6 +140,20 @@ declare global {
     __mountPaintProbes: () => void;
     /** T61:刷新形态(sending=false)HUD + 畸形 agent-group 行的真实 MessageList 探针。 */
     __mountHudProbe: () => void;
+    /** T67: process cards sitting before their owner user self-heal in merge/restore. */
+    __mountProcessCardOwnerProbe: () => void;
+    __processCardOwner: {
+      sortIds: string[];
+      repairedIds: string[];
+      mergeIds: string[];
+      incrementalIds: string[];
+      recoverIds: string[];
+      missingOwnerIds: string[];
+      serverTapeIds: string[];
+      nextUserBoundIds: string[];
+      cleanUnchanged: boolean;
+      idempotent: boolean;
+    };
     __estimateAnchor: {
       following: boolean;
       armSticky: () => void;
@@ -369,6 +386,19 @@ window.__paintAnchor = {
   appendUserRow: () => "",
 };
 window.__mountHudProbe = () => {};
+window.__mountProcessCardOwnerProbe = () => {};
+window.__processCardOwner = {
+  sortIds: [],
+  repairedIds: [],
+  mergeIds: [],
+  incrementalIds: [],
+  recoverIds: [],
+  missingOwnerIds: [],
+  serverTapeIds: [],
+  nextUserBoundIds: [],
+  cleanUnchanged: false,
+  idempotent: false,
+};
 window.__estimateAnchor = {
   following: true,
   armSticky: () => {},
@@ -1530,6 +1560,182 @@ window.__mountHudProbe = () => {
   hudProbeMounted = true;
   createRoot(document.getElementById("hud-refresh-root")!).render(
     <StrictMode><HudRefreshProbe /></StrictMode>,
+  );
+};
+
+// ── T67 过程卡越过所属 user：merge/restore 自愈 + 真 MessageList 红绿对照 ──
+const CARD_OWNER_USER: ChatMessage = {
+  id: "u",
+  role: "user",
+  text: "BROWSER_CARD_OWNER_USER",
+  ts: 100,
+  _orderSeq: 1,
+  _source: "server",
+};
+const CARD_OWNER_ASSISTANT: ChatMessage = {
+  id: "a",
+  role: "assistant",
+  text: "BROWSER_CARD_OWNER_ASSISTANT",
+  ts: 400,
+  _orderSeq: 2,
+  _source: "server",
+  _clientMessageId: "u",
+};
+const CARD_OWNER_GROUP: ChatMessage = {
+  id: "g",
+  role: "agent-group",
+  text: "BROWSER_CARD_OWNER_GROUP",
+  ts: 200,
+  _turnOwnerId: "u",
+};
+const CARD_OWNER_QUESTION: ChatMessage = {
+  id: "q",
+  role: "permission",
+  text: "BROWSER_CARD_OWNER_QUESTION",
+  ts: 300,
+  _turnOwnerId: "u",
+  _resolved: false,
+  requestId: "browser-card-owner-q",
+};
+
+function ProcessCardOwnerProbe({ messages }: { messages: ChatMessage[] }) {
+  return (
+    <div data-testid="process-card-owner-probe" className="timeline-scroll-probe">
+      <SessionTimelineBoundary resetKey="browser-process-card-owner">
+        <MessageList
+          messages={messages}
+          sending={false}
+          cb={{}}
+          onRespondPermission={() => {}}
+        />
+      </SessionTimelineBoundary>
+    </div>
+  );
+}
+
+let processCardOwnerMounted = false;
+window.__mountProcessCardOwnerProbe = () => {
+  if (processCardOwnerMounted) return;
+  processCardOwnerMounted = true;
+  const poisoned = [CARD_OWNER_GROUP, CARD_OWNER_QUESTION, CARD_OWNER_USER, CARD_OWNER_ASSISTANT];
+  const sorted = stableSortByTs(poisoned.map((message) => ({ ...message })));
+  const repaired = repairPostFinalProcessOrder(sorted.map((message) => ({ ...message })));
+  const merged = mergeFullServerWins(
+    [CARD_OWNER_USER, CARD_OWNER_ASSISTANT],
+    poisoned,
+  );
+  const incremental = applyServerIncremental(poisoned, []);
+  const recoverId = "m-recover-3hev56n0kpyl1";
+  const firstUser: ChatMessage = {
+    id: "u-first",
+    role: "user",
+    text: "BROWSER_CARD_OWNER_FIRST_USER",
+    ts: 10,
+    _orderSeq: 1,
+    _source: "server",
+  };
+  const recoverUser: ChatMessage = {
+    id: recoverId,
+    role: "user",
+    text: "BROWSER_CARD_OWNER_RECOVER_USER",
+    ts: 50,
+    _orderSeq: 3,
+    _source: "server",
+  };
+  const recoverAssistant: ChatMessage = {
+    id: "a-recover",
+    role: "assistant",
+    text: "BROWSER_CARD_OWNER_RECOVER_ASSISTANT",
+    ts: 80,
+    _orderSeq: 4,
+    _source: "server",
+    _clientMessageId: recoverId,
+  };
+  const recoverGroup: ChatMessage = {
+    id: "g-recover",
+    role: "agent-group",
+    text: "BROWSER_CARD_OWNER_RECOVER_GROUP",
+    ts: 20,
+    _turnOwnerId: recoverId,
+  };
+  const recovered = repairPostFinalProcessOrder([
+    recoverGroup,
+    firstUser,
+    recoverUser,
+    recoverAssistant,
+  ]);
+  const missingOwner = repairPostFinalProcessOrder([
+    { id: "g-archived", role: "agent-group", text: "kept", ts: 1, _turnOwnerId: "u-not-loaded" },
+    { id: "u2", role: "user", text: "later", ts: 2, _orderSeq: 9, _source: "server" },
+    {
+      id: "a2",
+      role: "assistant",
+      text: "later-answer",
+      ts: 3,
+      _orderSeq: 10,
+      _source: "server",
+      _clientMessageId: "u2",
+    },
+  ]);
+  const serverTape: ChatMessage[] = [
+    { id: "g-server", role: "agent-group", text: "srv", ts: 1, _source: "server", _turnOwnerId: "u1" },
+    { id: "u1", role: "user", text: "user", ts: 2, _orderSeq: 1, _source: "server" },
+    {
+      id: "think1",
+      role: "thinking",
+      text: "think",
+      ts: 3,
+      _source: "server",
+      _clientMessageId: "u1",
+      _orderSeq: 2,
+    },
+    {
+      id: "a1",
+      role: "assistant",
+      text: "done",
+      ts: 4,
+      _source: "server",
+      _clientMessageId: "u1",
+      _orderSeq: 2,
+      _turnTapeOrdinal: 2,
+    },
+  ];
+  const nextUserBound = repairPostFinalProcessOrder([
+    { id: "u1", role: "user", text: "one", ts: 1 },
+    { id: "a1", role: "assistant", text: "first", ts: 2, _clientMessageId: "u1" },
+    { id: "u2", role: "user", text: "two", ts: 3 },
+    { id: "g1", role: "agent-group", text: "late", ts: 4, _turnOwnerId: "u1" },
+  ]);
+  const clean = [
+    CARD_OWNER_USER,
+    CARD_OWNER_GROUP,
+    CARD_OWNER_ASSISTANT,
+  ];
+  window.__processCardOwner = {
+    sortIds: sorted.map((message) => message.id),
+    repairedIds: repaired.map((message) => message.id),
+    mergeIds: merged.map((message) => message.id),
+    incrementalIds: incremental.map((message) => message.id),
+    recoverIds: recovered.map((message) => message.id),
+    missingOwnerIds: missingOwner.map((message) => message.id),
+    serverTapeIds: repairPostFinalProcessOrder(serverTape).map((message) => message.id),
+    nextUserBoundIds: nextUserBound.map((message) => message.id),
+    cleanUnchanged: repairPostFinalProcessOrder(clean) === clean,
+    idempotent: repairPostFinalProcessOrder(repaired) === repaired
+      && applyServerIncremental(incremental, []) === incremental,
+  };
+  const root = document.getElementById("process-card-owner-root")!;
+  root.innerHTML = "";
+  const poisonMount = document.createElement("div");
+  poisonMount.id = "process-card-owner-poison";
+  const repairMount = document.createElement("div");
+  repairMount.id = "process-card-owner-repaired";
+  root.append(poisonMount, repairMount);
+  createRoot(poisonMount).render(
+    <StrictMode><ProcessCardOwnerProbe messages={poisoned} /></StrictMode>,
+  );
+  createRoot(repairMount).render(
+    <StrictMode><ProcessCardOwnerProbe messages={repaired} /></StrictMode>,
   );
 };
 
