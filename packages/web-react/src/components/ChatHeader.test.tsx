@@ -68,8 +68,8 @@ describe("ChatHeader 团队模式指示 chip", () => {
 });
 
 describe("ChatHeader 会话未读角标", () => {
-  const badgeClass =
-    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums";
+  const badgeLayoutClass =
+    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none text-white tabular-nums";
 
   it("无 sessionUnreadCount 时不渲染占位，打开菜单按钮仍在", () => {
     renderHeader({ onOpenMobileNav: () => {} });
@@ -79,14 +79,14 @@ describe("ChatHeader 会话未读角标", () => {
 
   it("角标挂在「打开菜单」按钮上，类名与站内信角标一致", () => {
     renderHeader({ onOpenMobileNav: () => {}, onOpenInbox: () => {}, unreadCount: 2, sessionUnreadCount: 3 });
-    const menu = screen.getByRole("button", { name: "打开菜单" });
+    const menu = screen.getByRole("button", { name: /打开菜单/ });
     const sessionBadge = menu.parentElement?.querySelector("[data-testid=session-unread-badge]");
     expect(sessionBadge).toHaveTextContent("3");
-    expect(sessionBadge).toHaveClass(...badgeClass.split(" "));
+    expect(sessionBadge).toHaveClass(...badgeLayoutClass.split(" "));
     const inboxBtn = screen.getByRole("button", { name: "站内信" });
     const inboxBadge = inboxBtn.parentElement?.querySelector("span");
     expect(inboxBadge).toHaveTextContent("2");
-    expect(inboxBadge).toHaveClass(...badgeClass.split(" "));
+    expect(inboxBadge).toHaveClass(...badgeLayoutClass.split(" "));
   });
 
   it("折叠态角标挂在「展开侧栏」按钮上", () => {
@@ -95,7 +95,7 @@ describe("ChatHeader 会话未读角标", () => {
       onExpandSidebar: () => {},
       sessionUnreadCount: 4,
     });
-    const expand = screen.getByRole("button", { name: "展开侧栏" });
+    const expand = screen.getByRole("button", { name: /展开侧栏/ });
     const badge = expand.parentElement?.querySelector("[data-testid=session-unread-badge]");
     expect(badge).toHaveTextContent("4");
   });
@@ -109,5 +109,18 @@ describe("ChatHeader 会话未读角标", () => {
     });
     expect(screen.getByTestId("session-unread-badge")).toHaveTextContent("1");
     expect(screen.getByRole("button", { name: "站内信" }).parentElement).toHaveTextContent("7");
+  });
+
+  it("会话未读角标用 accent，铃铛未读用 danger", () => {
+    renderHeader({
+      onOpenMobileNav: () => {},
+      onOpenInbox: () => {},
+      unreadCount: 2,
+      sessionUnreadCount: 3,
+    });
+    expect(screen.getByTestId("session-unread-badge")).toHaveClass("bg-accent");
+    const inboxBtn = screen.getByRole("button", { name: "站内信" });
+    const inboxBadge = inboxBtn.parentElement?.querySelector("span");
+    expect(inboxBadge).toHaveClass("bg-danger");
   });
 });

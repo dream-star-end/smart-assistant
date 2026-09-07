@@ -95,7 +95,9 @@ import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
+import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
 import { useMdViewport } from "./hooks/useMdViewport";
+import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
@@ -331,7 +333,11 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [toolCards] = useState<ToolCard[]>([]);
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => readCollapsed());
+  const composerPrefs = useLocalComposerPrefs();
+  useEffect(() => {
+    writeCollapsed(collapsed);
+  }, [collapsed]);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
   // 已装智能体目录(agent 归属解析用):登录后拉一次,市场关闭时刷新;AgentPicker 打开时
@@ -631,6 +637,9 @@ export function App() {
     [newSession],
   );
 
+  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
+  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
+
   const {
     projects,
     collapsedIds: collapsedProjectIds,
@@ -659,6 +668,10 @@ export function App() {
       const ids = new Set(sessionIds);
       setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
     },
+    onCreated: (p) => {
+      setUngroupedAssetsOpen(false);
+      setProjectSettings(p);
+    },
   });
 
   const unreadSessions = useUnreadSessions({
@@ -674,8 +687,6 @@ export function App() {
   useEffect(() => {
     setInspectTarget(null);
   }, [activeId, boardOpen]);
-  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
-  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -2890,6 +2901,7 @@ export function App() {
     onOpenAccount: demo ? undefined : () => openSettings(),
     onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
     onNew: handleNew,
+    onNewWithAgent: demo ? undefined : () => { handleNew(); setPickerOpen(true); },
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onTogglePin: togglePinSession,
@@ -2987,6 +2999,15 @@ export function App() {
               setBoardOpen(false);
               handleNew();
             }}
+            onNewWithAgent={
+              demo
+                ? undefined
+                : () => {
+                    setBoardOpen(false);
+                    handleNew();
+                    setPickerOpen(true);
+                  }
+            }
             onNewInProject={(projectId) => {
               setBoardOpen(false);
               newSessionInProject(projectId);
@@ -3018,6 +3039,16 @@ export function App() {
             handleNew();
             setMobileNavOpen(false);
           }}
+          onNewWithAgent={
+            demo
+              ? undefined
+              : () => {
+                  setBoardOpen(false);
+                  handleNew();
+                  setPickerOpen(true);
+                  setMobileNavOpen(false);
+                }
+          }
           onNewInProject={(projectId) => {
             setBoardOpen(false);
             newSessionInProject(projectId);
@@ -3137,6 +3168,7 @@ export function App() {
           }}
           onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+          data-font-size={composerPrefs.fontSize}
         >
           {gated ? (
             <AgentGate
@@ -3338,6 +3370,8 @@ export function App() {
             goal={activeSess?.goalState}
             onSetGoal={demo ? undefined : setSessionGoal}
             onGoalAction={demo ? undefined : transitionSessionGoal}
+            sendKey={composerPrefs.sendKey}
+            fontSize={composerPrefs.fontSize}
           />
         </div>
         </>

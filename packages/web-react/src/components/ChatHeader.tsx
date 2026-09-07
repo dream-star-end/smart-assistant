@@ -5,7 +5,7 @@ import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { LockedPublicModel, PublicModel } from "../lib/types";
-import { formatCredits } from "../lib/utils";
+import { cn, formatCredits } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
 import { type LockedSelectInfo, ModelSelector, teamEngineLabel } from "./ModelSelector";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
@@ -96,20 +96,48 @@ export function ChatHeader({
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
         <div className="relative md:hidden">
-          <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square">
+          <IconButton
+            data-product-control
+            onClick={onOpenMobileNav}
+            aria-label={
+              sessionUnreadCount && sessionUnreadCount > 0
+                ? `打开菜单,${sessionUnreadCount} 条未读会话`
+                : "打开菜单"
+            }
+            shape="square"
+          >
             <Menu size={18} />
           </IconButton>
-          <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+          <HeaderCountBadge
+            count={sessionUnreadCount}
+            testId="session-unread-badge"
+            tone="accent"
+            ariaLabel={sessionUnreadCount ? `${sessionUnreadCount} 条未读会话` : undefined}
+          />
         </div>
       )}
       {/* 桌面折叠态：展开 + 新建（仅 md+，移动端用抽屉）。 */}
       {sidebarCollapsed && (
         <div className="hidden items-center gap-1 md:flex">
           <div className="relative">
-            <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
+            <IconButton
+              data-product-control
+              onClick={onExpandSidebar}
+              aria-label={
+                sessionUnreadCount && sessionUnreadCount > 0
+                  ? `展开侧栏,${sessionUnreadCount} 条未读会话`
+                  : "展开侧栏"
+              }
+              shape="square"
+            >
               <PanelLeft size={18} />
             </IconButton>
-            <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+            <HeaderCountBadge
+              count={sessionUnreadCount}
+              testId="session-unread-badge"
+              tone="accent"
+              ariaLabel={sessionUnreadCount ? `${sessionUnreadCount} 条未读会话` : undefined}
+            />
           </div>
           <IconButton data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id} onClick={onNew} aria-label="新建会话" shape="square">
             <PenSquare size={18} />
@@ -199,7 +227,7 @@ export function ChatHeader({
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
               <Bell size={18} />
             </IconButton>
-            <HeaderCountBadge count={unreadCount} />
+            <HeaderCountBadge count={unreadCount} tone="danger" />
           </div>
         )}
         {credits != null && (
@@ -224,13 +252,27 @@ export function ChatHeader({
   );
 }
 
-/** 顶栏角标：站内信与会话未读共用同一套尺寸/色。count 缺省或 ≤0 不占位。 */
-function HeaderCountBadge({ count, testId }: { count?: number; testId?: string }) {
+/** 顶栏角标：站内信 danger、会话未读 accent。count 缺省或 ≤0 不占位。 */
+function HeaderCountBadge({
+  count,
+  testId,
+  tone = "danger",
+  ariaLabel,
+}: {
+  count?: number;
+  testId?: string;
+  tone?: "danger" | "accent";
+  ariaLabel?: string;
+}) {
   if (!count || count <= 0) return null;
   return (
     <span
       data-testid={testId}
-      className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums"
+      aria-label={ariaLabel}
+      className={cn(
+        "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none text-white tabular-nums",
+        tone === "accent" ? "bg-accent" : "bg-danger",
+      )}
     >
       {count > 99 ? "99+" : count}
     </span>

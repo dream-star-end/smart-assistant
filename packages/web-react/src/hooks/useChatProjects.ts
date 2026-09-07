@@ -50,6 +50,8 @@ export type UseChatProjectsOptions = {
   onUngroupProjectSessions?: (projectId: string) => string[];
   /** 删除项目失败：把 sessionIds 重新挂回该项目。 */
   onRestoreProjectSessions?: (projectId: string, sessionIds: string[]) => void;
+  /** 真实创建成功、乐观行被服务端记录替换后调用（demo 不调）。 */
+  onCreated?: (project: ChatProject) => void;
 };
 
 export type UseChatProjects = {
@@ -140,6 +142,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     try {
       const created = await api.createChatProject(cbRef.current.authSession, { name });
       setProjects((c) => c.map((p) => (p.id === tempId ? created : p)));
+      cbRef.current.onCreated?.(created);
     } catch (e) {
       setProjects((c) => c.filter((p) => p.id !== tempId));
       console.warn("createChatProject failed", e);

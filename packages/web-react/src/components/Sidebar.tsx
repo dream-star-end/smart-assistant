@@ -126,6 +126,8 @@ export type SidebarProps = {
   onDeleteProject?: (p: ChatProject) => void;
   /** 在指定项目下直接新建会话（真实项目组专用，default 未分类走顶部 onNew）。 */
   onNewInProject?: (projectId: string) => void;
+  /** 先选智能体再新建。传入时顶部「新建会话」改成 split（右侧打开 AgentPicker）。 */
+  onNewWithAgent?: () => void;
   isSending?: (id: string) => boolean;
   liveTerminal?: (
     id: string,
@@ -193,6 +195,7 @@ export function Sidebar({
   onRenameProject,
   onDeleteProject,
   onNewInProject,
+  onNewWithAgent,
   isSending,
   liveTerminal,
   socketVersion,
@@ -736,15 +739,41 @@ export function Sidebar({
           )}
         </div>
 
-        <Button
-          data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-          variant="secondary"
-          onClick={onNew}
-          className="h-9 w-full justify-start gap-2 rounded-lg px-3 text-section font-medium"
-        >
-          <Plus size={16} />
-          新建会话
-        </Button>
+        {onNewWithAgent ? (
+          <div className="flex w-full">
+            <Button
+              data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+              variant="secondary"
+              onClick={onNew}
+              className="h-9 min-w-0 flex-1 justify-start gap-2 rounded-l-lg rounded-r-none border-r-0 px-3 text-section font-medium"
+            >
+              <Plus size={16} />
+              新建会话
+            </Button>
+            <IconButton
+              data-product-feature={PRODUCT_CAPABILITIES.agents.id}
+              variant="ghost"
+              shape="square"
+              size="md"
+              aria-label="选择智能体后新建"
+              title="选择智能体后新建"
+              onClick={onNewWithAgent}
+              className="h-9 rounded-l-none rounded-r-lg border border-border bg-surface text-fg hover:border-border-strong hover:bg-hover"
+            >
+              <ChevronDown size={16} />
+            </IconButton>
+          </div>
+        ) : (
+          <Button
+            data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+            variant="secondary"
+            onClick={onNew}
+            className="h-9 w-full justify-start gap-2 rounded-lg px-3 text-section font-medium"
+          >
+            <Plus size={16} />
+            新建会话
+          </Button>
+        )}
 
         {onOpenBoard && (
           <button
