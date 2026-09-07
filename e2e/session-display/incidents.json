@@ -3156,6 +3156,9 @@
           "path": "packages/web-react/src/lib/chat/directTimeline.test.ts",
           "assertion": "cold cache reload restores owner bounds after toStored strips timeline users"
         }
+      ],
+      "coverageCommits": [
+        "8317d48c"
       ]
     },
     {
