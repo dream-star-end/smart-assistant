@@ -631,6 +631,9 @@ export function App() {
     [newSession],
   );
 
+  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
+  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
+
   const {
     projects,
     collapsedIds: collapsedProjectIds,
@@ -659,6 +662,10 @@ export function App() {
       const ids = new Set(sessionIds);
       setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
     },
+    onCreated: (p) => {
+      setUngroupedAssetsOpen(false);
+      setProjectSettings(p);
+    },
   });
 
   const unreadSessions = useUnreadSessions({
@@ -674,8 +681,6 @@ export function App() {
   useEffect(() => {
     setInspectTarget(null);
   }, [activeId, boardOpen]);
-  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
-  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
