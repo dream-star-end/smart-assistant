@@ -3285,6 +3285,48 @@
           "assertion": "Chat navigation: real components, production CSS, trusted pointer/touch"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-GROK-POOL-NO-COOLDOWN",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "V5 selfhost Grok Build 账号池没有失败冷却：internalGrokRelay 对上游 401/403/429/5xx 只 bump fail_count，不走 AccountHealthTracker，一个 refresh token 已死或周额度耗尽的账号会一直留在 WRH 候选集被选中，直到每小时一次的 grokUsageSweeper 标 oauth_terminal 才把权重压到 0.05（仍不踢出）。同时 Cursor 账号 settle 只加计数不写 last_error，管理台账号表对连续失败的 Cursor 行毫无提示。修复：Grok relay 结果经 classifyGrokRelayStatus 分类后走共享 health.onSuccess/onFailure（401/402/403/429 计 strike，3 连败 cooldown，cooldownRecoveryActor 半开恢复）；5xx 归 upstream 只写 fail_count/last_error 不计 strike（池里只有几个 Grok 账号，一次 xAI 全局 529 不能把全池冷却 10 分钟并杀掉在飞 route，审查员 C 项）；400/404/405/413/422 归 client_error 不扣分；Cursor settle 失败写 last_error='cursor_<terminalCode>'、成功清空，不碰 health/status/cooldown（materializer 白名单依赖它们）。单测覆盖分类表与 401 强制过期顺序；部署源码门只证明防回退，不冒称端到端。",
+      "rootFixCommit": "5dedf778",
+      "coverageCommits": [
+        "aa9e495b"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
+          "assertion": "classifyGrokRelayStatus: 2xx/3xx success, account-attributable 4xx failure, 5xx upstream, request-shape 4xx client_error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
+          "assertion": "recorder routes success/failure through the shared health tracker and ignores client errors"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
+          "assertion": "recorder on 401 forces oauth_expires_at=NOW() before counting the failure"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
+          "assertion": "recorder treats 5xx as an upstream outage: visible on the row, never a health strike"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorExternalSettle.test.ts",
+          "assertion": "failure bumps fail_count and records the sanitized terminal code in last_error"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-GROK-POOL-NO-COOLDOWN: source regression guard, not end-to-end proof."
+        }
+      ]
     }
   ]
 }
