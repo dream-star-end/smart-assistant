@@ -612,3 +612,30 @@ describe('ModelSelector 受控开合', () => {
     expect(items.some((i) => i.textContent?.includes('DeepSeek-V4'))).toBe(true)
   })
 })
+
+describe('ModelSelector 最近使用', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('选过的模型出现在「最近」分组', async () => {
+    const onSelect = vi.fn()
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const target = items.find((i) => i.textContent?.includes('DeepSeek-V4'))
+    expect(target).toBeTruthy()
+    if (target) fireEvent.click(target)
+    expect(onSelect).toHaveBeenCalledWith('deepseek-v4')
+
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const recentLabel = await screen.findByText('最近')
+    expect(recentLabel).toBeInTheDocument()
+    expect(document.querySelector('[data-recent-group="true"]')).toBeTruthy()
+    const recentItem = document.querySelector('[data-recent-group="true"]')
+      ?.parentElement
+      ?.querySelector('[data-model-id="deepseek-v4"]')
+    expect(recentItem).toBeTruthy()
+    expect(recentItem?.textContent).toContain('DeepSeek-V4')
+  })
+})

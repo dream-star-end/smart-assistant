@@ -30,6 +30,7 @@ import {
 } from '../lib/cursorModelPicker'
 import type { PreferenceEffort } from '../lib/modelPreferences'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
+import { readRecentModels, writeRecentModel } from '../lib/recentModels'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { cn } from '../lib/utils'
 import {
@@ -211,6 +212,35 @@ export function ModelSelector({
   const listRows = searching ? (filteredRows ?? []) : visibleRows
   const listCollapsed = searching ? [] : collapsedRows
   const listShowCollapsed = searching ? false : showCollapsedGroup
+  const [, setRecentTick] = useState(0)
+  const recentRows = (() => {
+    if (searching) return [] as typeof rows
+    const seen = new Set<string>()
+    const out: typeof rows = []
+    for (const id of readRecentModels()) {
+      if (id === selectedId) continue
+      if (!models.some((m) => m.id === id)) continue
+      if (lockedModels.some((m) => m.id === id)) continue
+      const row = rows.find((item) => {
+        if (item.kind === 'plain') return item.model.id === id
+        if (item.kind === 'cursor-family' || item.kind === 'context-family') {
+          return item.row.members.some((m) => m.id === id)
+        }
+        return false
+      })
+      if (!row) continue
+      const ident =
+        row.kind === 'plain'
+          ? `plain:${row.model.id}`
+          : row.kind === 'cursor-family' || row.kind === 'context-family'
+            ? `${row.kind}:${row.row.family}`
+            : `other:${id}`
+      if (seen.has(ident)) continue
+      seen.add(ident)
+      out.push(row)
+    }
+    return out
+  })()
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
@@ -246,13 +276,19 @@ export function ModelSelector({
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
 
+  const rememberAndSelect = (id: string) => {
+    writeRecentModel(id)
+    setRecentTick((n) => n + 1)
+    onSelect(id)
+  }
+
   const selectCursor = (
     family: CursorEngineFamilyId,
     members: PublicModel[],
     next?: { effort?: PlatformReasoningEffort | null; fast?: boolean },
   ) => {
     const id = resolveCursorPickerSelection(members, family, selectedId, next)
-    if (id) onSelect(id)
+    if (id) rememberAndSelect(id)
   }
 
   const selectContext = async (
@@ -271,20 +307,20 @@ export function ModelSelector({
       })
       if (!confirmed) return
     }
-    onSelect(id)
+    rememberAndSelect(id)
   }
 
-  const renderRow = (row: (typeof rows)[number]) => {
+  const renderRow = (row: (typeof rows)[number], keyPrefix = '') => {
     if (row.kind === 'plain') {
       const m = row.model
       const active = m.id === selectedId
       const degraded = isDegraded(m)
       return (
         <DropdownMenuItem
-          key={m.id}
+          key={`${keyPrefix}${m.id}`}
           data-model-id={m.id}
           disabled={degraded}
-          onSelect={degraded ? undefined : () => onSelect(m.id)}
+          onSelect={degraded ? undefined : () => rememberAndSelect(m.id)}
           className="justify-between"
         >
           <span className="truncate">{modelLabel(m)}</span>
@@ -313,7 +349,7 @@ export function ModelSelector({
       const degraded = row.row.members.every(isDegraded)
       return (
         <DropdownMenuItem
-          key={row.row.family}
+          key={`${keyPrefix}${row.row.family}`}
           data-model-id={representative}
           data-context-family={row.row.family}
           disabled={degraded}
@@ -348,7 +384,7 @@ export function ModelSelector({
       const labelText = lockedPlainLabel(locked)
       return (
         <DropdownMenuItem
-          key={`locked-${locked.id}`}
+          key={`${keyPrefix}locked-${locked.id}`}
           data-model-id={locked.id}
           data-locked="true"
           onSelect={() =>
@@ -375,7 +411,7 @@ export function ModelSelector({
     if (row.kind === 'locked-cursor-family') {
       return (
         <DropdownMenuItem
-          key={`locked-family-${row.row.family}`}
+          key={`${keyPrefix}locked-family-${row.row.family}`}
           data-model-id={row.row.representative.id}
           data-cursor-family={row.row.family}
           data-locked="true"
@@ -408,7 +444,7 @@ export function ModelSelector({
     const degraded = row.row.members.every(isDegraded)
     return (
       <DropdownMenuItem
-        key={row.row.family}
+        key={`${keyPrefix}${row.row.family}`}
         data-model-id={representative}
         data-cursor-family={row.row.family}
         disabled={degraded}
@@ -516,10 +552,17 @@ export function ModelSelector({
             </div>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto">
+            {recentRows.length > 0 && (
+              <>
+                <DropdownMenuLabel data-recent-group="true">最近</DropdownMenuLabel>
+                {recentRows.map((row) => renderRow(row, 'recent-'))}
+                <DropdownMenuSeparator />
+              </>
+            )}
             {searching && listRows.length === 0 ? (
               <div className="px-2 py-3 text-caption text-faint">无匹配模型</div>
             ) : (
-              listRows.map(renderRow)
+              listRows.map((row) => renderRow(row))
             )}
             {listShowCollapsed && (
               <>
@@ -545,7 +588,7 @@ export function ModelSelector({
                     {listCollapsed.length} 个
                   </span>
                 </DropdownMenuItem>
-                {collapsedOpen && listCollapsed.map(renderRow)}
+                {collapsedOpen && listCollapsed.map((row) => renderRow(row))}
               </>
             )}
           </div>
