@@ -9,11 +9,12 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
+  buildRecoveryProbeHeaders,
   startRecoveryProber,
   type RecoveryProbeRequest,
   type RecoveryProbeResult,
 } from "./recoveryProber.js";
-import type { StaticProviderKeys } from "@openclaude/protocol";
+import { getStaticProvider, type StaticProviderKeys } from "@openclaude/protocol";
 
 const logState = { infos: [] as string[], warns: [] as string[] };
 const fakeLog = {
@@ -162,5 +163,24 @@ describe("startRecoveryProber — 开关与启动", () => {
     await new Promise((r) => setImmediate(r));
     assert.equal(probed.length, 1);
     h.stop();
+  });
+});
+
+describe("buildRecoveryProbeHeaders — 与真实流量同源的头集", () => {
+  test("opencodego:x-api-key + x-opencode-session(随机 UUID,缺失即上游 400 → 探活永不恢复)", () => {
+    const h = buildRecoveryProbeHeaders(getStaticProvider("opencodego"), "GO-KEY");
+    assert.equal(h["x-api-key"], "GO-KEY");
+    assert.equal(h.authorization, undefined);
+    assert.match(h["x-opencode-session"] ?? "", /^[0-9a-f-]{36}$/);
+    // 每次探活独立会话:两次构造不得复用同一 id。
+    const h2 = buildRecoveryProbeHeaders(getStaticProvider("opencodego"), "GO-KEY");
+    assert.notEqual(h2["x-opencode-session"], h["x-opencode-session"]);
+  });
+
+  test("未声明 sessionIdHeader 的 provider(deepseek direct)不注入任何会话头", () => {
+    const h = buildRecoveryProbeHeaders(getStaticProvider("deepseek"), "DS-KEY");
+    assert.equal(h.authorization, "Bearer DS-KEY");
+    assert.equal(h["x-opencode-session"], undefined);
+    assert.deepEqual(Object.keys(h).sort(), ["anthropic-version", "authorization", "content-type"]);
   });
 });
