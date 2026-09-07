@@ -2988,15 +2988,88 @@ export class SessionManager {
    *  resume-map.json. Cleared whenever the provider changes or the entry is
    *  intentionally reset (model switch, context_too_long, destroy). */
   private _resumeMapHistory = new Map<string, string[]>()
+  /** sessionKey → native ids the ENGINE itself rejected at runtime for this
+   *  session ("No conversation found with session ID", zcode `Session not
+   *  found`). A non-empty file on disk is not proof the engine can load it
+   *  (2026-09-07: transcript existed under another cwd's project dir), so the
+   *  durable-artifact probe alone re-promoted the same dead id after every
+   *  crash. Anything in this set is skipped by the history ladder for the
+   *  rest of the gateway process; in-memory only — a restart re-arms the
+   *  probe, and a fresh spawn either relocates the transcript or lands on a
+   *  new id. */
+  private _resumeRejectedIds = new Map<string, Set<string>>()
   // Serialized write queue to prevent concurrent writeFile race conditions
   private _resumeMapWrite: Promise<void> = Promise.resolve()
 
   /** Push `prev` onto the history ladder for `key` (dedup, newest first, bounded). */
   private _pushResumeHistory(key: string, prev: string | undefined | null): void {
     if (!prev) return
+    if (this._resumeRejectedIds.get(key)?.has(prev)) return
     const cur = this._resumeMapHistory.get(key) ?? []
     const next = [prev, ...cur.filter((x) => x !== prev)].slice(0, RESUME_HISTORY_MAX)
     this._resumeMapHistory.set(key, next)
+  }
+
+  /** Ids the engine named in its stale-resume error. CCB: `No conversation
+   *  found with session ID: <uuid>`; zcode: `Session not found: sess_…`. The
+   *  engine mints a NEW session id before it fails to load the old one, so
+   *  `session.ccbSessionId` at detection time is the fresh id, not the refused
+   *  one — the error text is the only authoritative source. */
+  static extractRejectedResumeIds(errorDetail: string | undefined): string[] {
+    if (!errorDetail) return []
+    const out = new Set<string>()
+    const re =
+      /(?:No conversation found with session ID|Session not found|Persisted child session not found):\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|sess_[A-Za-z0-9_-]{8,80})/g
+    for (const m of errorDetail.matchAll(re)) {
+      const id = m[1]
+      if (id) out.add(id.toLowerCase())
+    }
+    return [...out]
+  }
+
+  /** Mark every resume-map id for `key` (head, history, live) whose engine-side
+   *  inner id is one the engine just refused. Resume-map ids may carry a
+   *  transport prefix (`sand-ccb:<uuid>`), so match on the trailing segment. */
+  private _markResumeRejectedFromError(
+    key: string,
+    errorDetail: string | undefined,
+    liveId: string | null | undefined,
+  ): string[] {
+    const refused = SessionManager.extractRejectedResumeIds(errorDetail)
+    if (refused.length === 0) return []
+    const candidates = new Set<string>()
+    const head = this._resumeMap.get(key)
+    if (head) candidates.add(head)
+    for (const h of this._resumeMapHistory.get(key) ?? []) candidates.add(h)
+    if (liveId) candidates.add(liveId)
+    const marked: string[] = []
+    for (const cand of candidates) {
+      const inner = cand.includes(':') ? cand.slice(cand.lastIndexOf(':') + 1) : cand
+      if (refused.includes(inner.toLowerCase())) {
+        this._markResumeRejected(key, cand)
+        marked.push(cand)
+      }
+    }
+    return marked
+  }
+
+  /** Record that the engine refused to resume `id` for `key`. Bounded per key
+   *  so a pathological session cannot grow the set without limit. */
+  private _markResumeRejected(key: string, id: string | undefined | null): void {
+    if (!id) return
+    const set = this._resumeRejectedIds.get(key) ?? new Set<string>()
+    set.add(id)
+    if (set.size > RESUME_HISTORY_MAX * 4) {
+      const [oldest] = set
+      if (oldest !== undefined) set.delete(oldest)
+    }
+    this._resumeRejectedIds.set(key, set)
+    const hist = this._resumeMapHistory.get(key)
+    if (hist?.includes(id)) {
+      const next = hist.filter((h) => h !== id)
+      if (next.length > 0) this._resumeMapHistory.set(key, next)
+      else this._resumeMapHistory.delete(key)
+    }
   }
 
   /** Remove every resume-map projection for `key` (id, ts, provider, cost, history). */
@@ -3035,10 +3108,12 @@ export class SessionManager {
     },
   ): string | undefined {
     const exclude = opts?.exclude
+    const rejected = this._resumeRejectedIds.get(sessionKey)
     const history = (this._resumeMapHistory.get(sessionKey) ?? []).filter(
-      (h) => h !== exclude && h !== head,
+      (h) => h !== exclude && h !== head && !rejected?.has(h),
     )
-    const picked = pickResumableId(provider, head && head !== exclude ? head : undefined, history, {
+    const headCandidate = head && head !== exclude && !rejected?.has(head) ? head : undefined
+    const picked = pickResumableId(provider, headCandidate, history, {
       workspacePath,
     })
     if (!picked) return undefined
@@ -4090,6 +4165,11 @@ export class SessionManager {
         if (session._pendingStaleResumeClear) {
           session._pendingStaleResumeClear = false
           const staleId = session.ccbSessionId ?? this._resumeMap.get(opts.sessionKey)
+          // The head at this point is usually the id CCB minted for the spawn
+          // that then died without writing a transcript; it must never be
+          // re-picked either. The id CCB actually refused was already marked
+          // from the error text in finalizeTurn (_markResumeRejectedFromError).
+          this._markResumeRejected(opts.sessionKey, staleId)
           // Durable-artifact ladder first: the engine just told us the head id
           // is gone; a prior same-provider id may still have its transcript.
           const promoted = session.runner.setResumeSessionId
@@ -6510,9 +6590,19 @@ export class SessionManager {
         // entry from resume-map; otherwise every subsequent submit()
         // re-spawns CCB with the same dead id and loops forever.
         if (result?.staleResumeId) {
+          // Circuit breaker: the id the engine REFUSED is named in the error,
+          // not in session.ccbSessionId (CCB already minted a fresh id before
+          // failing to load the old one). Without this the crash handler's
+          // ladder walk re-promoted the same on-disk-but-unloadable id forever.
+          const refused = this._markResumeRejectedFromError(
+            session.sessionKey,
+            result.errorDetail,
+            session.ccbSessionId,
+          )
           log.warn('stale --resume session id detected, will clear resume-map entry', {
             sessionKey: session.sessionKey,
             staleId: session.ccbSessionId,
+            refusedIds: refused,
             ...(traceId ? { traceId } : {}),
           })
           session._pendingStaleResumeClear = true
