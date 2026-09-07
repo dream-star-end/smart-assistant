@@ -3233,7 +3233,7 @@
       "occurredAt": "2026-09-08",
       "severity": "P1",
       "symptom": "切换会话时输入框残留顿号/文字被写入目标会话草稿；快速清空后切走又复活。",
-      "rootFixCommit": "768041be1ca797154d53360e4ec0f61acc964603",
+      "rootFixCommit": "768041be",
       "regressions": [
         {
           "layer": "unit",
