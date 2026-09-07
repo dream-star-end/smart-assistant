@@ -299,6 +299,7 @@ import {
 import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
+  makeGrokRelayHealthRecorder,
   type GrokRelayHandler,
 } from "./http/internalGrokRelay.js";
 import {
@@ -2337,6 +2338,12 @@ export async function registerCommercial(
       });
       const grokRelayHandler: GrokRelayHandler = makeGrokRelayHandler({
         identityRepo,
+        // Per-request account feedback through the shared health tracker:
+        // 401/403/429/5xx count toward the same 3-strike cooldown as CCB, and
+        // cooldownRecoveryActor half-opens the row 10 minutes later. Previously
+        // the relay only bumped counters, so a dead Grok token stayed routable
+        // until the hourly usage sweep marked it oauth_terminal.
+        recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
         renewSlot: (accountId, slotId) => {
           if (!scheduler.renewCodexSlot(accountId, slotId)) {
             // resolveGrokRouteContext already proved the durable row active.

@@ -9,6 +9,7 @@ import {
 } from '../auth/containerIdentity.js'
 import { resolveGrokRouteContext } from '../account-pool/groups.js'
 import { getFreshGrokAccessToken } from '../account-pool/grokOAuth.js'
+import type { AccountHealthTracker } from '../account-pool/health.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { query } from '../db/queries.js'
 import { ensureRequestId, REQUEST_ID_HEADER, setSecurityHeaders } from './util.js'
@@ -43,6 +44,59 @@ const TRACEPARENT_RE = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/
 
 export interface GrokRelayCtx { hostUuid: string; boundIp: string }
 export type GrokRelayHandler = (req: IncomingMessage, res: ServerResponse, ctx: GrokRelayCtx) => Promise<void>
+
+/**
+ * How an upstream xAI status reflects on the *account* (not the request).
+ *
+ *   - success      → health recovers (mirrors scheduler ReleaseResult 'success')
+ *   - failure      → account-attributable: 401/402/403 (token/plan), 429 (quota),
+ *                    5xx (upstream). Counts toward the 3-strike cooldown.
+ *   - client_error → request-shape 4xx (400/404/405/413/422…): the CLI sent
+ *                    something xAI rejects; the account is fine. No health
+ *                    mutation — same reasoning as the CCB 'client_error' kind,
+ *                    where a client bug must not burn a pool account.
+ */
+export type GrokRelayOutcome = 'success' | 'failure' | 'client_error'
+
+export function classifyGrokRelayStatus(status: number): GrokRelayOutcome {
+  if (status < 400) return 'success'
+  if (status === 401 || status === 402 || status === 403 || status === 429 || status >= 500) return 'failure'
+  return 'client_error'
+}
+
+/**
+ * Default per-request account feedback for the relay: route the classified
+ * outcome through the shared AccountHealthTracker so a Grok account with a
+ * dead token / exhausted quota / failing upstream trips the same 3-strike
+ * cooldown (and cooldownRecoveryActor half-open) as a CCB account, instead
+ * of staying in the WRH candidate set until the hourly usage sweep notices.
+ *
+ * 401 additionally forces `oauth_expires_at = NOW()` so the next relay call
+ * refreshes the access token before retrying — preserved from the previous
+ * counter-only recorder.
+ */
+export function makeGrokRelayHealthRecorder(deps: {
+  health: Pick<AccountHealthTracker, 'onSuccess' | 'onFailure'>
+  query?: typeof query
+}): (accountId: bigint, statusCode: number) => Promise<void> {
+  const q = deps.query ?? query
+  return async (accountId, statusCode) => {
+    const outcome = classifyGrokRelayStatus(statusCode)
+    if (outcome === 'client_error') return
+    if (outcome === 'success') {
+      await deps.health.onSuccess(accountId)
+      return
+    }
+    if (statusCode === 401) {
+      await q(
+        `UPDATE claude_accounts SET oauth_expires_at = NOW(), updated_at = NOW()
+          WHERE id = $1 AND provider = 'grok'`,
+        [String(accountId)],
+      )
+    }
+    await deps.health.onFailure(accountId, `grok_http_${statusCode}`)
+  }
+}
 
 function grokRelayPublicMessage(code: string): string {
   switch (code) {
@@ -163,6 +217,9 @@ export function makeGrokRelayHandler(deps: {
           res.setHeader(rawKey, Array.isArray(rawValue) ? rawValue : String(rawValue))
         }
       }
+      // Account feedback. Production injects makeGrokRelayHealthRecorder (shared
+      // AccountHealthTracker → 3-strike cooldown); the bare counter fallback
+      // only exists for callers that have no tracker (tests / legacy wiring).
       const recordStatus = deps.recordStatus ?? (async (accountId: bigint, statusCode: number) => {
         await query(
           `UPDATE claude_accounts SET

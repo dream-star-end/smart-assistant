@@ -14,7 +14,9 @@ import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentit
 import {
   GROK_OFFICIAL_UPSTREAM_BASE_URL,
   GROK_RELAY_PREFIX,
+  classifyGrokRelayStatus,
   makeGrokRelayHandler,
+  makeGrokRelayHealthRecorder,
 } from '../http/internalGrokRelay.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 
@@ -338,5 +340,56 @@ describe('internal Grok relay', () => {
     } finally {
       await close(server)
     }
+  })
+})
+
+describe('grok relay account health feedback', () => {
+  test('classifyGrokRelayStatus: 2xx/3xx success, account-attributable 4xx + 5xx failure, request-shape 4xx client_error', () => {
+    assert.equal(classifyGrokRelayStatus(200), 'success')
+    assert.equal(classifyGrokRelayStatus(201), 'success')
+    assert.equal(classifyGrokRelayStatus(304), 'success')
+    for (const s of [401, 402, 403, 429, 500, 502, 503, 529]) {
+      assert.equal(classifyGrokRelayStatus(s), 'failure', `status ${s}`)
+    }
+    for (const s of [400, 404, 405, 413, 422]) {
+      assert.equal(classifyGrokRelayStatus(s), 'client_error', `status ${s}`)
+    }
+  })
+
+  test('recorder routes success/failure through the shared health tracker and ignores client errors', async () => {
+    const calls: string[] = []
+    const sql: Array<[string, unknown[]]> = []
+    const recorder = makeGrokRelayHealthRecorder({
+      health: {
+        onSuccess: async (id) => { calls.push(`ok:${id}`); return null },
+        onFailure: async (id, msg) => { calls.push(`fail:${id}:${msg}`); return null },
+      },
+      query: (async (text: string, params: unknown[]) => { sql.push([text, params]); return { rows: [], rowCount: 0 } }) as never,
+    })
+    await recorder(53n, 200)
+    await recorder(53n, 400)
+    await recorder(53n, 429)
+    await recorder(53n, 503)
+    assert.deepEqual(calls, ['ok:53', 'fail:53:grok_http_429', 'fail:53:grok_http_503'])
+    assert.equal(sql.length, 0, 'no direct SQL unless 401')
+  })
+
+  test('recorder on 401 forces oauth_expires_at=NOW() before counting the failure', async () => {
+    const order: string[] = []
+    const recorder = makeGrokRelayHealthRecorder({
+      health: {
+        onSuccess: async () => null,
+        onFailure: async (id, msg) => { order.push(`fail:${id}:${msg}`); return null },
+      },
+      query: (async (text: string, params: unknown[]) => {
+        assert.match(text, /oauth_expires_at = NOW\(\)/)
+        assert.match(text, /provider = 'grok'/)
+        assert.deepEqual(params, ['53'])
+        order.push('expire')
+        return { rows: [], rowCount: 1 }
+      }) as never,
+    })
+    await recorder(53n, 401)
+    assert.deepEqual(order, ['expire', 'fail:53:grok_http_401'])
   })
 })
