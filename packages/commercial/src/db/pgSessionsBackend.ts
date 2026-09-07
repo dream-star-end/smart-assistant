@@ -231,6 +231,7 @@ import {
   lockRecoveryRoot,
   pauseSilentRecoveryLineage,
   settleRecoveryJobForTape,
+  type RecoveryJobTerminalRow,
 } from "../dispatch/turnRecoveryStore.js";
 import {
   cancelPendingPermissionPromptsForTurn,
@@ -1370,6 +1371,20 @@ export interface PgSessionsBackendOptions {
     sessionId: string,
     decision: AutomaticRecoveryDecision,
   ) => void | Promise<void>;
+  /** Runs only after the Phase B finalize tx that settled a recovery job
+   * commits — including clean completed child turns where no new recovery
+   * decision is emitted. Failures are swallowed. */
+  onRecoveryJobTerminal?: (
+    userId: string,
+    sessionId: string,
+    info: {
+      rootClientMessageId: string;
+      errorCode: string;
+      semanticAttempt: number;
+      terminalStatus: "completed" | "paused";
+      pauseReason: string | null;
+    },
+  ) => void | Promise<void>;
 }
 
 type GoalUsageChange = { userId: string; sessionId: string };
@@ -1382,6 +1397,31 @@ async function notifyGoalUsageChanges(
   const unique = new Map(changes.map((change) => [`${change.userId}\0${change.sessionId}`, change]));
   await Promise.allSettled(
     [...unique.values()].map((change) => Promise.resolve(callback(change.userId, change.sessionId))),
+  );
+}
+
+export async function notifyRecoveryJobTerminals(
+  callback: PgSessionsBackendOptions["onRecoveryJobTerminal"],
+  userId: string,
+  sessionId: string,
+  rows: readonly RecoveryJobTerminalRow[],
+): Promise<void> {
+  if (!callback || rows.length === 0) return;
+  await Promise.allSettled(
+    rows
+      .filter((row): row is RecoveryJobTerminalRow & { status: "completed" | "paused" } =>
+        row.status === "completed" || row.status === "paused")
+      .map((row) =>
+        Promise.resolve().then(() =>
+          callback(userId, sessionId, {
+            rootClientMessageId: row.rootClientMessageId,
+            errorCode: row.errorCode,
+            semanticAttempt: row.semanticAttempt,
+            terminalStatus: row.status,
+            pauseReason: row.pauseReason,
+          }),
+        ),
+      ),
   );
 }
 
@@ -1991,7 +2031,7 @@ async function settleFinalizedTurnControls(
     clientMessageId: string;
     outcome: "completed" | "interrupted" | "crashed";
   },
-): Promise<void> {
+): Promise<RecoveryJobTerminalRow[]> {
   await settleStopControlsForTurn(client, {
     userId: input.uid,
     sessionId: input.sessionId,
@@ -2007,7 +2047,7 @@ async function settleFinalizedTurnControls(
     clientMessageId: input.clientMessageId,
     reason: "turn_finalized",
   });
-  await settleRecoveryJobForTape(client, {
+  return settleRecoveryJobForTape(client, {
     userId: input.uid,
     sessionId: input.sessionId,
     clientMessageId: input.clientMessageId,
@@ -2037,9 +2077,11 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     tapeSha256: string;
     currentMessages: MessageLike[];
   },
-): Promise<AutomaticRecoveryDecision | null> {
+): Promise<{ decision: AutomaticRecoveryDecision | null; terminals: RecoveryJobTerminalRow[] }> {
   const clientMessageId = input.clientMessageId;
-  if (!clientMessageId || !isClientMessageId(clientMessageId)) return null;
+  if (!clientMessageId || !isClientMessageId(clientMessageId)) {
+    return { decision: null, terminals: [] };
+  }
   // Every negative early-exit below reports *why* the master will not recover
   // this turn, so the browser can stop waiting and materialize the terminal
   // card instead of guessing from a timer. The decision is a post-commit
@@ -2054,12 +2096,16 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     reason,
   });
 
-  await settleFinalizedTurnControls(client, {
+  const terminals = await settleFinalizedTurnControls(client, {
     uid: input.uid,
     sessionId: input.sessionId,
     clientMessageId,
     outcome: input.turn.payload.status,
   });
+  const done = (
+    decision: AutomaticRecoveryDecision | null,
+    extra: RecoveryJobTerminalRow[] = [],
+  ) => ({ decision, terminals: extra.length === 0 ? terminals : [...terminals, ...extra] });
   const status = input.turn.payload.status;
   const terminalRecordErrorCode = terminalTurnRecordErrorCode(
     input.turn.records.map((record) => record.payload),
@@ -2072,18 +2118,19 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     !completedWithRecoverableError
   ) {
     // A clean completion is not a recovery candidate at all; no sideband.
-    return null;
+    // Job settlement above is the recovered path when this tape closed a job.
+    return done(null);
   }
   const errorCode = terminalRecordErrorCode ||
     input.turn.payload.errorCode || input.turn.payload.waiveReason || "";
   if (!supportsAutomaticTurnRecovery(errorCode)) {
-    return declined("not_recoverable", errorCode);
+    return done(declined("not_recoverable", errorCode));
   }
 
   const latestUser = [...input.currentMessages].reverse()
     .find((message) => message?.role === "user");
   if (!latestUser || latestUser.id !== clientMessageId) {
-    return declined("source_not_latest", errorCode);
+    return done(declined("source_not_latest", errorCode));
   }
   const source = await hydrateRecoverySourceUser(
     client,
@@ -2091,10 +2138,10 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     input.sessionUserId,
     latestUser,
   );
-  if (!source) return declined("no_routing", errorCode);
+  if (!source) return done(declined("no_routing", errorCode));
   const routing = source._routing;
   if (!routing || typeof routing !== "object" || Array.isArray(routing)) {
-    return declined("no_routing", errorCode);
+    return done(declined("no_routing", errorCode));
   }
   const route = routing as Record<string, unknown>;
 
@@ -2115,14 +2162,14 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // Exact replay remains fail-closed and is never inferred from a completed
   // tape whose header contradicts its terminal error record.
   if (status === "completed" && assessment.mode !== "checkpoint") {
-    return declined("completed_without_checkpoint", errorCode);
+    return done(declined("completed_without_checkpoint", errorCode));
   }
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
     !allowUnsafeAutomaticCheckpoint(status, errorCode, assessment.leftoverBacked)
   ) {
-    return declined("checkpoint_unsafe", errorCode);
+    return done(declined("checkpoint_unsafe", errorCode));
   }
   if (
     assessment.mode === "replay" &&
@@ -2131,7 +2178,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       !recoveryWithoutCheckpointIsProven(errorCode)
     )
   ) {
-    return declined("replay_not_proven", errorCode);
+    return done(declined("replay_not_proven", errorCode));
   }
   const mode = assessment.mode;
   const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
@@ -2153,7 +2200,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   );
   const recoveryRecords = input.turn.records.map((record) => record.payload);
   if (shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt, records: recoveryRecords })) {
-    await pauseSilentRecoveryLineage(client, {
+    const paused = await pauseSilentRecoveryLineage(client, {
       userId: input.uid,
       sessionId: input.sessionId,
       rootClientMessageId,
@@ -2168,7 +2215,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       reason: "silent_no_progress",
     });
-    return declined("silent_no_progress", errorCode);
+    return done(declined("silent_no_progress", errorCode), paused);
   }
   if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) {
     await appendRecoveryGiveUpTerminalCard(client, {
@@ -2177,7 +2224,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       reason: "retry_exhausted",
     });
-    return declined("retry_exhausted", errorCode);
+    return done(declined("retry_exhausted", errorCode));
   }
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
@@ -2194,7 +2241,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     ? source._retryMedia
     : Array.isArray(source._media) ? source._media : undefined;
   if (mode === "replay" && sourceMedia && !replayMediaIsDurable(sourceMedia)) {
-    return declined("media_not_durable", errorCode);
+    return done(declined("media_not_durable", errorCode));
   }
   const replyTo = source._replyTo && typeof source._replyTo === "object" &&
       !Array.isArray(source._replyTo)
@@ -2256,8 +2303,8 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     request,
     tapeSha256: input.tapeSha256,
   });
-  if (!enqueued) return declined("enqueue_rejected", errorCode);
-  return {
+  if (!enqueued) return done(declined("enqueue_rejected", errorCode));
+  return done({
     scheduled: true,
     sourceClientMessageId: clientMessageId,
     rootClientMessageId,
@@ -2270,7 +2317,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     ...(typeof route.model === "string" && route.model.length > 0
       ? { model: route.model }
       : {}),
-  };
+  });
 }
 
 function tapeAnchor(
@@ -9037,6 +9084,7 @@ export function createPgSessionsBackend(
       // Decided inside the Phase B tx, published only after commit so the
       // browser never learns about a recovery job that later rolled back.
       let recoveryDecision: AutomaticRecoveryDecision | null = null;
+      let recoveryJobTerminals: RecoveryJobTerminalRow[] = [];
       // Personal/test namespaces also use this backend in some deployments,
       // but only `c:<uid>` sessions participate in commercial settlement.
       const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
@@ -9903,16 +9951,31 @@ export function createPgSessionsBackend(
             tapeId: request.tapeId,
           });
         }
-        if (billingUserId !== null && !turn.payload.continuationOfTurnKey) {
-          recoveryDecision = await scheduleAutomaticRecoveryForFinalizedTurn(client, {
-            uid: billingUserId,
-            sessionUserId: userId,
-            sessionId: request.sessionId,
-            turn,
-            clientMessageId,
-            tapeSha256: request.tapeSha256,
-            currentMessages: existingMessages,
-          });
+        if (billingUserId !== null) {
+          if (turn.payload.continuationOfTurnKey) {
+            // Child recovery tape: settle the producing job, do not evaluate a
+            // new recovery (Phase 1 does not change recovery policy).
+            if (clientMessageId && isClientMessageId(clientMessageId)) {
+              recoveryJobTerminals = await settleFinalizedTurnControls(client, {
+                uid: billingUserId,
+                sessionId: request.sessionId,
+                clientMessageId,
+                outcome: turn.payload.status,
+              });
+            }
+          } else {
+            const scheduled = await scheduleAutomaticRecoveryForFinalizedTurn(client, {
+              uid: billingUserId,
+              sessionUserId: userId,
+              sessionId: request.sessionId,
+              turn,
+              clientMessageId,
+              tapeSha256: request.tapeSha256,
+              currentMessages: existingMessages,
+            });
+            recoveryDecision = scheduled.decision;
+            recoveryJobTerminals = scheduled.terminals;
+          }
         }
         return {
           applied: "finalized",
@@ -9937,6 +10000,15 @@ export function createPgSessionsBackend(
       }
       if (goalUsageChanged && result.applied === "finalized") {
         await notifyGoalUsageChanges(options.onGoalUsageChanged, [{ userId, sessionId: request.sessionId }]);
+      }
+      if (result.applied === "finalized") {
+        // Includes recoveryDecision == null (clean completed child / recovered path).
+        await notifyRecoveryJobTerminals(
+          options.onRecoveryJobTerminal,
+          userId,
+          request.sessionId,
+          recoveryJobTerminals,
+        );
       }
       if (recoveryDecision && result.applied === "finalized" && options.onAutomaticRecoveryDecision) {
         // Sideband only: a failed broadcast must not fail the finalize (the

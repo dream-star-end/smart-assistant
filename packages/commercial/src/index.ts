@@ -254,7 +254,7 @@ import type {
   StaticProviderId,
   StaticProviderKeys,
 } from "@openclaude/protocol";
-import { isGrokEngineModel } from "@openclaude/protocol";
+import { isGrokEngineModel, normalizeTurnErrorCode } from "@openclaude/protocol";
 import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
@@ -1345,6 +1345,39 @@ export async function registerCommercial(
   const recoveryDecisionBroadcastRef: {
     current: (userId: string, sessionId: string, decision: AutomaticRecoveryDecision) => void;
   } = { current: () => { /* bridge not assembled yet — browser converges via ack/history */ } };
+  const recordRecoveryJobTerminalFriction = (
+    userId: string,
+    sessionId: string,
+    info: {
+      rootClientMessageId: string;
+      errorCode: string;
+      semanticAttempt: number;
+      terminalStatus: "completed" | "paused";
+      pauseReason: string | null;
+    },
+  ): void => {
+    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+    if (!uidMatch) return;
+    const code = normalizeTurnErrorCode(info.errorCode);
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(code)) return;
+    void recordProductFrictionEvent({
+      correlation: `${sessionId}:${info.rootClientMessageId}`,
+      userId: BigInt(uidMatch[1]!),
+      surface: "recovery",
+      stage: "recovery_job",
+      code,
+      outcome: info.terminalStatus === "completed" ? "recovered" : "failed",
+      attempts: info.semanticAttempt,
+      path: "job_terminal",
+      reason: info.pauseReason ?? undefined,
+      sessionId,
+    }).catch((err: unknown) => {
+      rootLogger.warn("recovery_job_friction_failed", {
+        sessionId,
+        errorClass: err instanceof Error ? err.constructor.name : typeof err,
+      });
+    });
+  };
   // HTTP finalize (Phase A) nudges the leader-owned tape job scheduler so Phase B
   // (and therefore the recovery verdict above) runs now, not on the next 5s tick.
   // Non-leader masters keep the noop: the leader's interval still converges.
@@ -1359,6 +1392,8 @@ export async function registerCommercial(
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
+        onRecoveryJobTerminal: (userId, sessionId, info) =>
+          recordRecoveryJobTerminalFriction(userId, sessionId, info),
       });
       setClientSessionsBackend(pgSessionsBackend);
       losslessTurnTapeStorage = pgSessionsBackend;
@@ -5701,6 +5736,27 @@ export async function registerCommercial(
     // Session owners are `c:<uid>`; personal/test namespaces have no bridge user.
     const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
     if (!uidMatch) return;
+    const uid = uidMatch[1]!;
+    const code = normalizeTurnErrorCode(verdict.errorCode);
+    if (/^[A-Za-z0-9_]{1,64}$/.test(code)) {
+      void recordProductFrictionEvent({
+        correlation: `${sessionId}:${verdict.sourceClientMessageId}`,
+        userId: BigInt(uid),
+        surface: "recovery",
+        stage: "recovery_decision",
+        code,
+        outcome: verdict.scheduled ? "pending" : "failed",
+        attempts: verdict.scheduled ? verdict.attempt : undefined,
+        path: "decision",
+        reason: verdict.scheduled ? undefined : verdict.reason,
+        sessionId,
+      }).catch((err: unknown) => {
+        rootLogger.warn("recovery_decision_friction_failed", {
+          sessionId,
+          errorClass: err instanceof Error ? err.constructor.name : typeof err,
+        });
+      });
+    }
     const payload = {
       type: "sys.recovery_decision",
       peer: { id: sessionId, kind: "dm" },
@@ -5710,10 +5766,10 @@ export async function registerCommercial(
     // Phase B runs on the leader slot only; the user's WS may live on the
     // other slot. Same dual-master fan-out as outbound.cost_charged.
     if (dualMasterEnabled) {
-      void slotRelayClient.broadcastToUsers([uidMatch[1]!], payload).catch(() => undefined);
+      void slotRelayClient.broadcastToUsers([uid], payload).catch(() => undefined);
       return;
     }
-    userChatBridge.broadcastToUser(BigInt(uidMatch[1]!), payload);
+    userChatBridge.broadcastToUser(BigInt(uid), payload);
   };
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
@@ -6050,6 +6106,8 @@ export async function registerCommercial(
           // verdict sideband must be wired on this instance too.
           onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
             recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
+          onRecoveryJobTerminal: (userId, sessionId, info) =>
+            recordRecoveryJobTerminalFriction(userId, sessionId, info),
         });
         const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS);
         const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000;
@@ -6211,6 +6269,8 @@ export async function registerCommercial(
           // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
           // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
           // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
+          recordFriction: (event: Parameters<typeof recordProductFrictionEvent>[0]) =>
+            recordProductFrictionEvent(event),
           nudgeClient: (
             uid: bigint,
             sessionId: string,

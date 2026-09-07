@@ -23,6 +23,11 @@ const SAFE_CODE = /^[A-Za-z0-9_]{1,64}$/;
 const OUTCOMES = new Set<FrictionOutcome>([
   "pending", "failed", "recovered", "succeeded", "abandoned", "cancelled",
 ]);
+/** Must match 0278 CHECK character-for-character. */
+const FRICTION_PATH_RE = /^[a-z0-9_]{1,32}$/;
+const FRICTION_REASON_RE = /^[a-z0-9_]{1,48}$/;
+const PROBLEM_CARD_CORRELATION_RE = /^[A-Za-z0-9_:-]{1,225}$/;
+const PRESENTATIONS = new Set(["red", "yellow", "soft", "banner", "placeholder"]);
 
 function safeToken(value: unknown, max: number, pattern: RegExp): string | null {
   if (typeof value !== "string" || value.length === 0 || value.length > max) return null;
@@ -116,8 +121,19 @@ export function normalizeClientFrictionReport(
     typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 10_000_000
       ? Math.trunc(value)
       : null;
+  let correlation = safeId(body.event_id) ?? traceId ?? safeId(body.request_id) ?? fallbackEventId;
+  if (surface === "chat" && stage === "problem_card") {
+    const explicit = typeof body.correlation === "string" &&
+      PROBLEM_CARD_CORRELATION_RE.test(body.correlation)
+      ? body.correlation
+      : null;
+    if (explicit) correlation = explicit;
+  }
+  const presentation = typeof body.presentation === "string" && PRESENTATIONS.has(body.presentation)
+    ? body.presentation as "red" | "yellow" | "soft" | "banner" | "placeholder"
+    : null;
   return {
-    correlation: safeId(body.event_id) ?? traceId ?? safeId(body.request_id) ?? fallbackEventId,
+    correlation,
     surface,
     stage,
     code,
@@ -141,6 +157,9 @@ export function normalizeClientFrictionReport(
     lineNo: safeLine(body.line_no),
     colNo: safeLine(body.col_no),
     errorFingerprint: safeToken(body.error_fingerprint, 16, /^[a-f0-9]{1,16}$/),
+    presentation,
+    path: safeToken(body.path, 32, FRICTION_PATH_RE),
+    reason: safeToken(body.reason, 48, FRICTION_REASON_RE),
   };
 }
 

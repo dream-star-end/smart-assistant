@@ -28,7 +28,7 @@ import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol
 import { memo, useEffect, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
-import { insufficientCreditsCopy } from "../../lib/chat/pure";
+import { insufficientCreditsCopy, problemCardPresentation } from "../../lib/chat/pure";
 import {
   CONTINUE_PROMPT,
   defaultCollapsed,
@@ -564,7 +564,9 @@ export function AssistantCard({
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
   const sem = turnErrorSemantics(normalizedCode);
   const expectedError = sem.expected === true;
-  const errorTone = presentedError?.waived || expectedError ? "warning" : "danger";
+  const errorTone = problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
+    ? "warning"
+    : "danger";
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),

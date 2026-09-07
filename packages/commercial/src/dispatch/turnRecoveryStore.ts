@@ -373,11 +373,43 @@ export async function releaseRecoveryPreReceipt(
   return result.rowCount === 1
 }
 
+export type RecoveryJobTerminalRow = {
+  rootClientMessageId: string
+  errorCode: string
+  semanticAttempt: number
+  status: 'completed' | 'paused' | 'cancelled'
+  pauseReason: string | null
+}
+
+function mapRecoveryJobTerminalRows(
+  rows: Array<{
+    root_client_message_id: string
+    error_code: string | null
+    semantic_recovery_attempt: number | string
+    status: string
+    pause_reason: string | null
+  }>,
+): RecoveryJobTerminalRow[] {
+  const allowed = new Set<RecoveryJobTerminalRow['status']>(['completed', 'paused', 'cancelled'])
+  const mapped: RecoveryJobTerminalRow[] = []
+  for (const row of rows) {
+    if (!allowed.has(row.status as RecoveryJobTerminalRow['status'])) continue
+    mapped.push({
+      rootClientMessageId: row.root_client_message_id,
+      errorCode: row.error_code ?? '',
+      semanticAttempt: Number(row.semantic_recovery_attempt),
+      status: row.status as RecoveryJobTerminalRow['status'],
+      pauseReason: row.pause_reason,
+    })
+  }
+  return mapped
+}
+
 export async function settleRecoveryJobForTape(
   q: Queryable,
   input: { userId: bigint; sessionId: string; clientMessageId: string; outcome: 'completed' | 'interrupted' | 'crashed' },
-): Promise<void> {
-  await q.query(
+): Promise<RecoveryJobTerminalRow[]> {
+  const result = await q.query(
     `UPDATE turn_recovery_jobs
         SET status=CASE
               WHEN $4='completed' THEN 'completed'
@@ -393,9 +425,17 @@ export async function settleRecoveryJobForTape(
             updated_at=NOW()
       WHERE user_id=$1 AND session_id=$2
         AND request_json->>'clientMessageId'=$3
-        AND status IN ('leased','sent','forwarded')`,
+        AND status IN ('leased','sent','forwarded')
+      RETURNING root_client_message_id, error_code, semantic_recovery_attempt, status, pause_reason`,
     [input.userId.toString(), input.sessionId, input.clientMessageId, input.outcome, AUTOMATIC_TURN_RETRY_MAX],
   )
+  return mapRecoveryJobTerminalRows(result.rows as Array<{
+    root_client_message_id: string
+    error_code: string | null
+    semantic_recovery_attempt: number | string
+    status: string
+    pause_reason: string | null
+  }>)
 }
 
 /** Persist the no-progress circuit breaker on the exact recovery lineage.
@@ -411,10 +451,10 @@ export async function pauseSilentRecoveryLineage(
     currentAttempt: number
     terminalOutcome: 'completed' | 'interrupted' | 'crashed'
   },
-): Promise<void> {
-  if (!Number.isSafeInteger(input.currentAttempt) || input.currentAttempt < 1) return
+): Promise<RecoveryJobTerminalRow[]> {
+  if (!Number.isSafeInteger(input.currentAttempt) || input.currentAttempt < 1) return []
   await lockRecoveryRoot(q, input)
-  await q.query(
+  const result = await q.query(
     `UPDATE turn_recovery_jobs
         SET status=CASE
               WHEN semantic_recovery_attempt=$4 THEN 'paused'
@@ -428,10 +468,18 @@ export async function pauseSilentRecoveryLineage(
             lease_owner=NULL,lease_until=NULL,updated_at=NOW()
       WHERE user_id=$1 AND session_id=$2 AND root_client_message_id=$3
         AND semantic_recovery_attempt >= $4
-        AND status <> 'cancelled'`,
+        AND status <> 'cancelled'
+      RETURNING root_client_message_id, error_code, semantic_recovery_attempt, status, pause_reason`,
     [
       input.userId.toString(), input.sessionId, input.rootClientMessageId,
       input.currentAttempt, input.terminalOutcome,
     ],
   )
+  return mapRecoveryJobTerminalRows(result.rows as Array<{
+    root_client_message_id: string
+    error_code: string | null
+    semantic_recovery_attempt: number | string
+    status: string
+    pause_reason: string | null
+  }>)
 }
