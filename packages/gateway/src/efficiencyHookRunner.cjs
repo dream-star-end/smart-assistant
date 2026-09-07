@@ -131,17 +131,28 @@ function main() {
   const protocol = parseProtocol(argv)
   const timeoutMs = parseTimeoutMs()
   let settled = false
+  let child
 
-  const finishFail = (reason, child) => {
-    if (settled) return
-    settled = true
-    if (child && !child.killed) {
+  // Kill the whole inner process group, not just the direct child. The
+  // production inner is `tsx -> node`, so killing only `tsx` would orphan the
+  // real hook; the child is spawned `detached` so it owns its own pgid.
+  const killInner = () => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+    } catch {
       try {
         child.kill('SIGKILL')
       } catch {
-        /* ignore */
+        /* already gone */
       }
     }
+  }
+
+  const finishFail = (reason) => {
+    if (settled) return
+    settled = true
+    killInner()
     failOpen(protocol, reason)
   }
 
@@ -154,10 +165,10 @@ function main() {
     return
   }
 
-  let child
   try {
     child = spawn(process.execPath, resolved.args, {
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
     })
   } catch (err) {
     clearTimeout(timer)
@@ -167,7 +178,7 @@ function main() {
 
   child.on('error', (err) => {
     clearTimeout(timer)
-    finishFail(`spawn_error:${err && err.code ? err.code : 'unknown'}`, child)
+    finishFail(`spawn_error:${err && err.code ? err.code : 'unknown'}`)
   })
 
   process.stdin.pipe(child.stdin)
