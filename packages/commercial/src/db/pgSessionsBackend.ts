@@ -12903,3 +12903,19 @@ export async function readClientSessionModelId(
   );
   return res.rows[0]?.model_id ?? null;
 }
+
+/** Host lease callbacks need ownership only: never hydrate a session's tape.
+ * Keep the six-table read inside this backend, like readClientSessionModelId. */
+export async function lookupLeaseCallbackSession(
+  pool: Pick<Pool, "query">, uid: string, sessionId: string,
+): Promise<"owned" | "gone" | "foreign"> {
+  const own = await pool.query<{ deleted_at: unknown }>(
+    "SELECT deleted_at FROM client_sessions WHERE id = $1 AND user_id = $2",
+    [sessionId, "c:" + uid],
+  );
+  if (own.rows.length) return own.rows[0]!.deleted_at == null ? "owned" : "gone";
+  const other = await pool.query(
+    "SELECT 1 FROM client_sessions WHERE id = $1 LIMIT 1", [sessionId],
+  );
+  return other.rows.length ? "foreign" : "gone";
+}
