@@ -475,6 +475,7 @@ async function fixtureFor(
   url: URL,
   request: any,
   imagePng: Buffer,
+  sentSessions: Map<string, { agentId: string; messages: any[] }>,
 ) {
   const path = url.pathname;
   if (method === "POST" && path === "/api/auth/refresh")
@@ -493,6 +494,16 @@ async function fixtureFor(
       allow_registration: true,
     });
   if (method === "GET" && path === "/api/public/models") return json(MODELS);
+  if (method === "POST" && path === "/api/response-rating")
+    return json({ ok: true });
+  if (method === "GET" && path === "/api/chatgpt-proxy/access")
+    return json({ enabled: false });
+  if (method === "GET" && /^\/api\/sessions\/[^/]+\/inflight-delegates$/.test(path))
+    return json({ items: [] });
+  if (method === "GET" && /^\/api\/sessions\/[^/]+\/live-frames$/.test(path))
+    return json({ frames: [], nextCursor: null, hasMore: false });
+  if (method === "PATCH" && /^\/api\/sessions\/[^/]+$/.test(path))
+    return json({ ok: true });
   if (method === "GET" && path === "/api/me")
     return json({ user: USER, lane: null });
   if (path === "/api/me/preferences" && method === "GET")
@@ -561,8 +572,9 @@ async function fixtureFor(
     return json({ sessions: SESSION_ROWS });
   if (method === "GET" && /^\/api\/sessions\/[^/]+$/.test(path)) {
     const id = basename(path);
-    const messages =
-      id === "session-quarterly-report"
+    const sent = sentSessions.get(id);
+    const messages = sent?.messages ??
+      (id === "session-quarterly-report"
         ? RICH_MESSAGES
         : id === "session-preview-review"
           ? [
@@ -606,12 +618,12 @@ async function fixtureFor(
                 _seq: 2,
                 _source: "server",
               },
-            ];
-    const agentId = id.includes("client")
+            ]);
+    const agentId = sent?.agentId ?? (id.includes("client")
       ? "research-assistant"
       : id === "session-preview-review"
         ? "coding-assistant"
-        : "main";
+        : "main");
     return json({
       id,
       userId: "tutorial-user",
@@ -627,6 +639,8 @@ async function fixtureFor(
       maxSeq: messages.length,
       archivedCount: 0,
       archivedThroughSeq: 0,
+      historyRevision: 0,
+      timelineGeneration: 1,
     });
   }
   if (method === "GET" && path.endsWith("/archive"))
@@ -1815,7 +1829,7 @@ const SCENARIOS: ScenarioDefinition[] = [
     async run(ctx) {
       await tracedFill(
         ctx,
-        'input[data-product-feature="sessions-history"][placeholder="搜索会话"]',
+        'input[data-product-feature="sessions-history"][aria-label="搜索标题或消息"]',
         "客户研究",
         "搜索已有项目会话",
       );
@@ -1862,12 +1876,17 @@ const SCENARIOS: ScenarioDefinition[] = [
       await stage(ctx, "查看当前可用模型与思考档位");
       await tracedClick(
         ctx,
-        '[data-product-feature="models-reasoning"] [role="menuitem"]:has-text("GPT-5.6-Terra")',
+        '[data-product-feature="models-reasoning"] [role="menuitem"][data-collapsed-group="closed"]',
+        "展开更多 GPT 模型",
+      );
+      await tracedClick(
+        ctx,
+        '[data-product-feature="models-reasoning"] [role="menuitem"][data-model-id="gpt-5.6-terra"]',
         "选择 GPT-5.6-Terra",
       );
       await assertVisible(
         ctx,
-        'button[aria-label="选择对话模型"]:has-text("GPT-5.6-Terra")',
+        'button[aria-label="选择对话模型"]:has-text("Terra")',
         "顶栏已显示新模型",
       );
       await stage(ctx, "确认后续消息使用所选模型");
@@ -2127,10 +2146,12 @@ const SCENARIOS: ScenarioDefinition[] = [
   {
     featureId: "agents",
     async run(ctx) {
+      await plainClick(ctx, 'aside button:has-text("客户研究与竞品分析")');
+      await assertVisible(ctx, 'main :text("对比三家产品")', "先打开已有任务作为新建前的对照");
       await tracedClick(
         ctx,
-        'header button[data-product-feature="agents"]',
-        "打开智能体选择器",
+        'aside button[data-product-feature="agents"][aria-label="选择智能体后新建"]',
+        "从侧栏选择智能体后新建",
       );
       await assertVisible(
         ctx,
@@ -2144,7 +2165,14 @@ const SCENARIOS: ScenarioDefinition[] = [
         "切换到编程助手",
       );
       await assertVisible(ctx, 'header :text("编程助手")', "顶栏已切换智能体");
-      await stage(ctx, "确认当前会话使用编程助手");
+      if (
+        (await ctx.page.locator('textarea[data-product-feature="chat-basics"]').inputValue()) !== "" ||
+        (await ctx.page.locator("main").innerText()).includes("对比三家产品")
+      ) {
+        throw new Error("选择智能体后新建应进入空白会话，不携带旧任务内容");
+      }
+      ctx.assertions.push("新会话输入框为空，旧任务内容未带入");
+      await stage(ctx, "确认新会话使用编程助手");
       await tracedClick(
         ctx,
         'header button[data-product-feature="agents"]',
@@ -2446,6 +2474,8 @@ const SCENARIOS: ScenarioDefinition[] = [
 
 function browserInitScript(): string {
   return `(() => {
+    // 非敏感登录提示仅用于触发 HTTP refresh fixture；不注入 token 或替换产品状态。
+    localStorage.setItem("oc_auth_hint", "1");
     const fixed = ${JSON.stringify(Date.parse(FIXED_NOW))};
     const NativeDate = Date;
     class FixedDate extends NativeDate {
@@ -2513,6 +2543,8 @@ async function captureScenario(
   previewJpeg: Buffer,
 ): Promise<ScenarioResult> {
   const fixtureErrors: string[] = [];
+  // 同一无痕录制上下文内联动 WS 与 REST 对账，不让旧默认历史覆盖新任务的真实 UI。
+  const sentSessions = new Map<string, { agentId: string; messages: any[] }>();
   const blockedExternal = new Set<string>();
   const consoleErrors: string[] = [];
   let expectedApiKeyForbiddenResponses = 0;
@@ -2563,6 +2595,7 @@ async function captureScenario(
         url,
         request,
         imagePng,
+        sentSessions,
       );
       await route.fulfill(response);
     } catch (error) {
@@ -2647,16 +2680,39 @@ async function captureScenario(
         if (message.type === "ping")
           socket.send(JSON.stringify({ type: "pong" }));
         if (message.type === "inbound.hello") {
-          for (const peer of message.peers ?? [])
-            socket.send(
-              JSON.stringify({
-                type: "sys.relay_ready",
-                peer: { id: peer.peerId, kind: "dm" },
-              }),
-            );
+          // relay_ready 表示连接就绪，不依赖已有 peer；空白新会话也必须可发任务。
+          socket.send(JSON.stringify({
+            type: "sys.relay_ready",
+            automaticRecoveryOwner: "master-v1",
+          }));
         }
-        if (message.type === "inbound.message")
-          socket.send(JSON.stringify(chatReply(message.peer, message.agentId)));
+        if (message.type === "inbound.message") {
+          const reply = { ...chatReply(message.peer, message.agentId), clientMessageId: message.clientMessageId };
+          sentSessions.set(message.peer.id, {
+            agentId: message.agentId || "main",
+            messages: [
+              {
+                id: message.clientMessageId,
+                role: "user",
+                text: message.content.text,
+                ts: message.ts,
+                _seq: 1,
+                _source: "server",
+                status: "sent",
+              },
+              {
+                id: "tutorial-reply-1",
+                role: "assistant",
+                text: reply.blocks[0].text,
+                ts: Date.parse(FIXED_NOW),
+                completedAt: Date.parse(FIXED_NOW),
+                _seq: 2,
+                _source: "server",
+              },
+            ],
+          });
+          socket.send(JSON.stringify(reply));
+        }
         return;
       }
       if (url.pathname === "/ws/container-preview") {
@@ -2775,6 +2831,14 @@ async function captureScenario(
       assertions: scenario.assertions,
       bodyText,
     };
+  } catch (error) {
+    const body = await page.locator("body").innerText().catch(() => "(body 不可读)");
+    throw new Error(
+      (error instanceof Error ? error.message : String(error)) +
+        "\n页面：" + body + "\nfixture：" + fixtureErrors.join(" | ") +
+        "\nconsole：" + consoleErrors.join(" | "),
+      { cause: error },
+    );
   } finally {
     await context.close();
   }
