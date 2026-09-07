@@ -448,25 +448,29 @@ export interface DesktopOriginMaterial {
   caCertPem: string;
 }
 
+/** Public origin material for anonymous bootstrap (no private key). */
+export interface DesktopOriginPublicMaterial {
+  certPem: string;
+  caCertPem: string;
+}
+
 /**
- * Read origin material if already on disk. Never mkdir, never issue, never lock.
- * Anonymous bootstrap must not create a CA.
+ * Read origin public material if already on disk. Never mkdir, never issue, never lock.
+ * Anonymous bootstrap must not create a CA and must not read origin.key.
+ * Key/cert pairing stays on ensureDesktopOriginCert (18445 listen path).
  */
-export async function loadDesktopOriginMaterialIfPresent(): Promise<DesktopOriginMaterial | null> {
+export async function loadDesktopOriginMaterialIfPresent(): Promise<DesktopOriginPublicMaterial | null> {
   const dir = deviceCaDir();
   const caCrt = path.join(dir, "ca.crt");
-  const originKey = path.join(dir, "origin.key");
   const originCrt = path.join(dir, "origin.crt");
   if (!(await exists(dir))) return null;
-  if (!(await exists(caCrt)) || !(await exists(originKey)) || !(await exists(originCrt))) return null;
+  if (!(await exists(caCrt)) || !(await exists(originCrt))) return null;
   try {
     const caCertPem = await fs.readFile(caCrt, "utf8");
     const certPem = await fs.readFile(originCrt, "utf8");
-    const keyPem = await fs.readFile(originKey, "utf8");
-    if (!caCertPem.trim() || !certPem.trim() || !keyPem.trim()) return null;
-    await assertKeyMatchesCert(keyPem, certPem, "verify");
+    if (!caCertPem.trim() || !certPem.trim()) return null;
     await assertCertIssuedByCa(certPem, caCertPem, "verify");
-    return { certPem, keyPem, caCertPem };
+    return { certPem, caCertPem };
   } catch {
     return null;
   }
