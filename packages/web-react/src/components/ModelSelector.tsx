@@ -157,6 +157,8 @@ export function ModelSelector({
   onSelectEffort,
   contextTier,
   onSelectContextTier,
+  open,
+  onOpenChange,
 }: {
   models: PublicModel[]
   lockedModels?: LockedPublicModel[]
@@ -175,6 +177,8 @@ export function ModelSelector({
    */
   contextTier?: CursorContextTier | null
   onSelectContextTier?: (tier: CursorContextTier) => void
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorModelById(selectedId)
@@ -432,7 +436,9 @@ export function ModelSelector({
   return (
     <>
       <DropdownMenu
+        open={open}
         onOpenChange={(v) => {
+          onOpenChange?.(v)
           if (!v) setQuery('')
         }}
       >

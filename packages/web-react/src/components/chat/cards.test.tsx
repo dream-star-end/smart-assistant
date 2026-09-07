@@ -160,6 +160,20 @@ describe("UserCard 编辑重发", () => {
   });
 });
 
+describe("AssistantCard 切换模型按钮", () => {
+  test("retry_or_switch 末轮错误卡在有 onOpenModelPicker 时渲染按钮并调用", () => {
+    const onOpenModelPicker = vi.fn();
+    renderErr(errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" }), {
+      onRetrySend: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+      onOpenModelPicker,
+    });
+    const btn = screen.getByRole("button", { name: "切换模型" });
+    fireEvent.click(btn);
+    expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
   test.each([
     ["stopped", "本轮生成已停止。"],

@@ -24,6 +24,8 @@ export function ChatHeader({
   onSelectEffort,
   contextTier,
   onSelectContextTier,
+  modelPickerOpen,
+  onModelPickerOpenChange,
   teamModeActive,
   onDisableTeamMode,
   credits,
@@ -57,6 +59,8 @@ export function ChatHeader({
   /** Cursor Opus/Fable 上下文档位(300k 默认 / 1M);透传给模型菜单的「上下文」区块。 */
   contextTier?: CursorContextTier | null;
   onSelectContextTier?: (tier: CursorContextTier) => void;
+  modelPickerOpen?: boolean;
+  onModelPickerOpenChange?: (v: boolean) => void;
   /**
    * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
    * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
@@ -191,6 +195,8 @@ export function ChatHeader({
           onSelectEffort={onSelectEffort}
           contextTier={contextTier}
           onSelectContextTier={onSelectContextTier}
+          open={modelPickerOpen}
+          onOpenChange={onModelPickerOpenChange}
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">

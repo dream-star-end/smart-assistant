@@ -112,6 +112,8 @@ export type CardCallbacks = {
   onQuote?: (msg: ChatMessage) => void;
   /** 把用户原文放回输入框，改完发送即新 turn（不删原消息、不原地替换）。 */
   onEditResend?: (msg: ChatMessage) => void;
+  /** 打开顶栏模型选择器（红卡「切换模型」）。 */
+  onOpenModelPicker?: () => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -579,8 +581,8 @@ export function AssistantCard({
     retryEligible && msg._clientMessageId
       ? cb.resolveRetryTarget?.(msg._clientMessageId)
       : undefined;
-  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」引导。
-  // 模型选择器为非受控 DropdownMenu,无可编程打开入口(见报告),故只留文案不做次按钮。
+  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」。
+  // 有 onOpenModelPicker 时渲染可点按钮打开顶栏受控模型菜单，否则保留引导文案。
   const showSwitchModelHint =
     !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch";
   // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
@@ -799,7 +801,13 @@ export function AssistantCard({
                     </Button>
                   ) : null}
                   {isLastTurn && showSwitchModelHint && (
-                    <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                    cb.onOpenModelPicker ? (
+                      <Button size="sm" variant="ghost" shape="pill" onClick={cb.onOpenModelPicker}>
+                        切换模型
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                    )
                   )}
                 </div>
               )}

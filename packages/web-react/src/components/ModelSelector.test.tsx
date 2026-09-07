@@ -602,3 +602,13 @@ describe('ModelSelector 搜索', () => {
     expect(screen.queryByLabelText('搜索模型')).toBeNull()
   })
 })
+
+describe('ModelSelector 受控开合', () => {
+  it('open 受控为 true 时菜单按 prop 打开', async () => {
+    render(
+      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} open />,
+    )
+    const items = await screen.findAllByRole('menuitem')
+    expect(items.some((i) => i.textContent?.includes('DeepSeek-V4'))).toBe(true)
+  })
+})

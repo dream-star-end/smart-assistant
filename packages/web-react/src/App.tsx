@@ -388,6 +388,7 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [messageReplyTarget, setMessageReplyTarget] = useState<{
     sessionId: string;
     quote: MessageReplyQuote;
@@ -2151,6 +2152,7 @@ export function App() {
           },
       onRetrySend: demo ? undefined : retrySend,
       onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
+      onOpenModelPicker: () => setModelPickerOpen(true),
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
       onQuote: demo || !activeId
@@ -3114,6 +3116,8 @@ export function App() {
           onSelectEffort={demo ? undefined : setSessionEffort}
           contextTier={contextTier}
           onSelectContextTier={demo ? undefined : setContextTier}
+          modelPickerOpen={modelPickerOpen}
+          onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
