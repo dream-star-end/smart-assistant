@@ -1,18 +1,21 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 import { SignJWT } from 'jose'
+import { authorityKeyringProvider } from '../billing/modelCatalogRuntime.js'
 import { ensureDesktopOriginCert } from '../desktop/deviceCa.js'
 import { resetDesktopFlagCache, setDesktopSettingsLoader } from '../desktop/flags.js'
+import { desktopKeyringFpFrom, hashEmptyKeyring } from '../desktop/keyringFp.js'
 import {
   handleDesktopBootstrap,
   handleDesktopRuntimeManifest,
+  liveKeyringFp,
   parseDesktopRuntimeManifestJson,
   resetDesktopRuntimeManifestCacheForTest,
 } from '../http/desktopBootstrap.js'
@@ -21,6 +24,11 @@ import { HttpError } from '../http/util.js'
 import { rootLogger } from '../logging/logger.js'
 
 const JWT = 'desktop-bootstrap-test-secret-32bytes-min!!'
+
+/** Mirrors desktopRegister.ts register_ok: expected ?? hashEmptyKeyring(). */
+function registerOkKeyringFp(expected: string | null): string {
+  return expected ?? hashEmptyKeyring()
+}
 
 function opensslBuf(args: string[], stdin?: Buffer | string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -495,5 +503,29 @@ describe('desktop bootstrap + runtime-manifest', () => {
       resetDesktopFlagCache()
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  test('empty authority keyring: manifest and register_ok both equal hashEmptyKeyring', () => {
+    const empty = desktopKeyringFpFrom(null)
+    const emptyMap = desktopKeyringFpFrom(new Map())
+    assert.equal(empty, hashEmptyKeyring())
+    assert.equal(emptyMap, hashEmptyKeyring())
+    assert.equal(registerOkKeyringFp(empty), empty)
+    assert.equal(registerOkKeyringFp(null), hashEmptyKeyring())
+    assert.equal(liveKeyringFp(), desktopKeyringFpFrom(authorityKeyringProvider()()))
+  })
+
+  test('non-empty keyring: register_ok follows expectedKeyringFp from desktopKeyringFpFrom', () => {
+    const ring = new Map<string, Uint8Array>([['k1', new Uint8Array(32).fill(9)]])
+    const expected = desktopKeyringFpFrom(ring)
+    assert.notEqual(expected, hashEmptyKeyring())
+    assert.equal(registerOkKeyringFp(expected), expected)
+    assert.equal(desktopKeyringFpFrom(ring), expected)
+  })
+
+  test('desktopTlsListener wires expectedKeyringFp to liveKeyringFp', async () => {
+    const src = await readFile(new URL('../http/desktopTlsListener.ts', import.meta.url), 'utf8')
+    assert.match(src, /expectedKeyringFp:\s*\(\)\s*=>\s*liveKeyringFp\(\)/)
+    assert.match(src, /import \{ liveKeyringFp \} from "\.\/desktopBootstrap\.js"/)
   })
 })
