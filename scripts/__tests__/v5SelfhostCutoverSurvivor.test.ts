@@ -142,6 +142,7 @@ const NODE_LISTEN = 'LISTEN 0      4096       172.31.0.1:18892      0.0.0.0:*   
 const SYSTEMD_BIND_LISTEN = 'LISTEN 0      4096       172.31.0.1:18892      0.0.0.0:*    users:(("systemd",pid=1,fd=23))';
 const SYSTEMD_STAR_LISTEN = 'LISTEN 0      4096                 *:18892            0.0.0.0:*    users:(("systemd",pid=1,fd=23))';
 const NODE_AND_SYSTEMD_SAME = 'LISTEN 0      4096       172.31.0.1:18892      0.0.0.0:*    users:(("node",pid=4242,fd=20),("systemd",pid=1,fd=80))';
+const SYSTEMD_AND_NODE_SAME = 'LISTEN 0      4096       172.31.0.1:18892      0.0.0.0:*    users:(("systemd",pid=1,fd=80),("node",pid=4242,fd=20))';
 
 describe("OCV5-161 egress fail-closed behavior", () => {
   test("egress_assert_no_orphan_listener fail-closes ss rc2/empty/malformed/systemd-only/mixed, passes node holders", () => {
@@ -153,6 +154,7 @@ describe("OCV5-161 egress fail-closed behavior", () => {
       { name: "systemd-only", rc: "0", out: `${SYSTEMD_STAR_LISTEN}\n`, wantOk: false },
       { name: "node", rc: "0", out: `${NODE_LISTEN}\n`, wantOk: true },
       { name: "node+systemd-same-line", rc: "0", out: `${NODE_AND_SYSTEMD_SAME}\n`, wantOk: true },
+      { name: "systemd+node-same-line", rc: "0", out: `${SYSTEMD_AND_NODE_SAME}\n`, wantOk: true },
       { name: "mixed-orphan", rc: "0", out: `${NODE_LISTEN}\n${SYSTEMD_STAR_LISTEN}\n`, wantOk: false },
       { name: "systemd-on-bind", rc: "0", out: `${SYSTEMD_BIND_LISTEN}\n`, wantOk: false },
     ];
@@ -359,5 +361,3 @@ exit 0
     });
   });
 });
-
-

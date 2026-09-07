@@ -1646,7 +1646,7 @@ egress_assert_no_orphan_listener() {
       printf '%s\n' "$ss_out" >&2
       return 1
     fi
-    if ! grep -Eq 'users:\(\("node",pid=[0-9]+' <<<"$line"; then
+    if ! grep -Eq 'users:\((\([^)]*\),)*\("node",pid=[0-9]+' <<<"$line"; then
       echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 存在无 node 持有者的 listener" >&2
       ss -ltnp "sport = :${V5_EGRESS_PORT}" >&2 || true
       return 1
