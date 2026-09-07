@@ -3267,7 +3267,7 @@
       "occurredAt": "2026-09-08",
       "severity": "P1",
       "symptom": "回到底部按钮被旧上滑基线/触摸结束篱笆拦住却假隐藏，近底轻滑误显；移动会话顶栏全部入口挤在一排。",
-      "rootFixCommit": "88251c81d19e8d2e1ddb4e5f22767c0706617819",
+      "rootFixCommit": "88251c81",
       "regressions": [
         {
           "layer": "unit",
