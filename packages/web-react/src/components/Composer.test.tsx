@@ -150,6 +150,21 @@ describe("Composer sendKey", () => {
   });
 });
 
+describe("Composer 长文字数", () => {
+  test("超过 2000 字时工具条显示字数", () => {
+    render(<Composer onSend={() => {}} />);
+    expect(screen.queryByText(/字$/)).toBeNull();
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "啊".repeat(2001) } });
+    expect(screen.getByText("2001 字")).toBeInTheDocument();
+  });
+
+  test("不超过 2000 字不显示字数", () => {
+    render(<Composer onSend={() => {}} />);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "啊".repeat(2000) } });
+    expect(screen.queryByText("2000 字")).toBeNull();
+  });
+});
+
 describe("Composer goalOpenRequest", () => {
   test("nonce 变化打开 GoalDialog", () => {
     const { rerender } = render(

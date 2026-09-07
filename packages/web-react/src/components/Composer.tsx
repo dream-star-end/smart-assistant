@@ -641,6 +641,9 @@ export function Composer({
             )}
           </IconButton>
           {stopping && <span className="text-caption text-muted">正在停止…</span>}
+          {value.length > 2000 && (
+            <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
+          )}
           <button
             type="button"
             data-product-control
