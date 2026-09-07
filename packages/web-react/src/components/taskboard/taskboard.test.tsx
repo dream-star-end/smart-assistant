@@ -1382,6 +1382,20 @@ describe('流水线 / 阶段配置', () => {
   })
 })
 
+describe('TaskboardView compact 入口短标签', () => {
+  test('窄屏渲染下四个入口有「项目」「阶段」「模板」「看板」标签', async () => {
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([sampleProject()])
+    mockEmptyBoard()
+    renderBoard()
+    expect(await screen.findByTestId('taskboard-responsive-toolbar')).toBeInTheDocument()
+    const toolbar = screen.getByTestId('taskboard-responsive-toolbar')
+    expect(toolbar).toHaveTextContent('项目')
+    expect(toolbar).toHaveTextContent('阶段')
+    expect(toolbar).toHaveTextContent('模板')
+    expect(toolbar).toHaveTextContent('看板')
+  })
+})
+
 describe('pickInitialProject', () => {
   const e2e = {
     id: 'e2e',
