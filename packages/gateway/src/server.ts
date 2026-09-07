@@ -402,6 +402,8 @@ import {
   DelegateJobStore,
   DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
   DELEGATE_LEASE_HEARTBEAT_MS,
+  DELEGATE_REAP_INTERVAL_MS,
+  resolveDelegateHeartbeatTimeoutMs,
   resolveDelegateJobTtlMs,
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
@@ -439,7 +441,10 @@ import {
   isJobTerminalFailure,
   parseParentEngine,
 } from './jobTerminal.js'
-import { openDelegateDurableDb } from './delegateDurable.js'
+import {
+  openDelegateDurableDb,
+  resolveDelegateLedgerRetentionMs,
+} from './delegateDurable.js'
 import {
   nextDelegateReconcileAt,
   reconcileDelegateJobsOnBoot,
@@ -10882,6 +10887,8 @@ export class Gateway {
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+  /** OCV5-164 heartbeat-timeout reaper + ledger retention janitor. */
+  private _delegateReapTimer: ReturnType<typeof setInterval> | undefined
   private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
   private _engineNotifier: DefaultEngineNotifier | undefined
   /** R2 session-level inflight projection. Lazy; flag-off never opens the db. */
@@ -10919,6 +10926,7 @@ export class Gateway {
       const filled = backfillCronOccurrenceDelegateJobs(store)
       if (filled > 0) this.log.info('cron occurrence delegateJobId backfill', { filled })
       this._armDelegateReconcileFollowup(store, queueWaitMs)
+      this._armDelegateReaper(store)
       this._delegateReconcileReady = true
       if (isDelegateNotifierEffective()) {
         void this._retryDelegateNotifies().finally(() => this._armNotifyRetryScheduler())
@@ -11053,6 +11061,72 @@ export class Gateway {
       this._armDelegateReconcileFollowup(this._delegateJobs, queueWaitMs)
     }, delay)
     this._delegateReconcileTimer.unref()
+  }
+
+  /**
+   * OCV5-164: periodic heartbeat-timeout reaper + ledger retention janitor.
+   *
+   * The boot reconciler only judges `owner_lease_until`, and it defers
+   * indefinitely while the parent session still holds a runner object — so a
+   * row that stopped making progress never reaches a terminal state and keeps
+   * occupying delegate capacity. This interval closes that hole using
+   * `last_activity_at`, then interrupts the child so the ledger and the
+   * subprocess agree.
+   *
+   * Scope note: for `kind=delegate` the interrupt also unwinds
+   * `_runDelegateTaskCore`, whose `finally` releases the Grok relay lease.
+   * `kind=cron` never mints such a lease, so reaping a cron row frees delegate
+   * capacity — not a Grok slot.
+   *
+   * Fencing: `reapStaleRunning` skips rows a *live* other instance owns, so
+   * running two masters cannot double-reap; retention pruning is idempotent.
+   */
+  private _armDelegateReaper(store: DelegateJobStore): void {
+    if (this._delegateReapTimer) return
+    const timeoutMs = resolveDelegateHeartbeatTimeoutMs()
+    const retentionMs = resolveDelegateLedgerRetentionMs()
+    const tick = () => {
+      try {
+        for (const { job, idleSec } of store.reapStaleRunning({ timeoutMs })) {
+          // Settling the ledger row does not stop the child. Interrupt it here
+          // (the same closeout the delegate lease path performs when
+          // casHeartbeat fails), otherwise the row reads `failed` while the
+          // subprocess keeps running and, for cron-origin-inject, the origin
+          // has already been told the job failed.
+          let interrupted = false
+          if (job.sessionKey) {
+            try {
+              interrupted = this.sessions.interrupt(job.sessionKey) === true
+            } catch (err) {
+              this.log.warn(
+                'delegate_heartbeat_timeout_interrupt_failed',
+                { jobId: job.id, sessionKey: job.sessionKey },
+                err as Error,
+              )
+            }
+          }
+          this.log.warn('delegate_heartbeat_timeout_reaped', {
+            jobId: job.id,
+            kind: job.kind,
+            agentId: job.agentId,
+            sessionKey: job.sessionKey,
+            idleSec,
+            failureClass: job.failureClass,
+            interrupted,
+          })
+        }
+      } catch (err) {
+        this.log.warn('delegate heartbeat reaper failed', {}, err as Error)
+      }
+      try {
+        const pruned = store.pruneRetiredLedger({ retentionMs })
+        if (pruned > 0) this.log.info('delegate ledger pruned', { pruned, retentionMs })
+      } catch (err) {
+        this.log.warn('delegate ledger prune failed', {}, err as Error)
+      }
+    }
+    this._delegateReapTimer = setInterval(tick, DELEGATE_REAP_INTERVAL_MS)
+    this._delegateReapTimer.unref?.()
   }
 
   private _delegateRunnerIdle(job: DelegateJobSnapshot): boolean {
@@ -14192,6 +14266,10 @@ export class Gateway {
     if (this._delegateReconcileTimer) {
       clearTimeout(this._delegateReconcileTimer)
       this._delegateReconcileTimer = undefined
+    }
+    if (this._delegateReapTimer) {
+      clearInterval(this._delegateReapTimer)
+      this._delegateReapTimer = undefined
     }
     if (this._notifyRetryTimer) {
       clearTimeout(this._notifyRetryTimer)

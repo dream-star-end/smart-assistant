@@ -86,7 +86,11 @@ import {
 } from './delegateCronIdempotency.js'
 import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protocol'
 import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
-import type { DelegateJobStore } from './delegateJobs.js'
+import {
+  DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
+  DELEGATE_LEASE_HEARTBEAT_MS,
+  type DelegateJobStore,
+} from './delegateJobs.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -789,6 +793,103 @@ export function backfillCronOccurrenceDelegateJobs(
   return n
 }
 
+export type CronDelegateHeartbeat = {
+  /** Stop beating. Idempotent; safe from any `finally`. */
+  stop: () => void
+  /** Test/observability seam: beats actually delivered so far. */
+  beats: () => number
+}
+
+/**
+ * OCV5-164: real liveness heartbeat for a claimed cron occurrence.
+ *
+ * The heartbeat-timeout reaper judges `last_activity_at`, and a cron row has
+ * no runner-attached 15s interval like `_runDelegateTaskCore` does. Protocol
+ * events cannot stand in for one: `tool_use_detected` is consumed inside
+ * sessionManager and never reaches `onEvent`, so a legitimate long tool call
+ * (host/Bash/npm test) produces zero events for far longer than the 30min
+ * timeout while the session's own stdout watchdog still considers it alive.
+ * Beating on a timer keeps the durable row's liveness aligned with the
+ * session-level idle policy instead of a weaker signal.
+ *
+ * A failed touch means the fence is gone or the row already went terminal
+ * (e.g. the reaper won): stop beating and interrupt the child session, the
+ * same closeout the delegate path performs on `casHeartbeat` failure — so we
+ * never leave "ledger says failed, subprocess still running".
+ */
+export function startCronDelegateHeartbeat(args: {
+  store: DelegateJobStore
+  jobId: string
+  fence: { claimToken: string; fencingEpoch: number }
+  sessionKey?: string
+  intervalMs?: number
+  maxBeats?: number
+  interrupt?: (sessionKey: string) => boolean | void
+  log?: { warn: (msg: string, meta?: Record<string, unknown>) => void }
+  setIntervalFn?: typeof setInterval
+  clearIntervalFn?: typeof clearInterval
+}): CronDelegateHeartbeat {
+  const intervalMs = args.intervalMs ?? DELEGATE_LEASE_HEARTBEAT_MS
+  const maxBeats = args.maxBeats ?? DELEGATE_LEASE_HEARTBEAT_MAX_BEATS
+  const setIntervalFn = args.setIntervalFn ?? setInterval
+  const clearIntervalFn = args.clearIntervalFn ?? clearInterval
+  let beats = 0
+  let timer: ReturnType<typeof setInterval> | null = null
+  const stop = (): void => {
+    if (!timer) return
+    clearIntervalFn(timer)
+    timer = null
+  }
+  const closeout = (reason: string): void => {
+    stop()
+    if (!args.sessionKey) {
+      args.log?.warn('cron delegate heartbeat lost fence; child sessionKey missing', {
+        jobId: args.jobId,
+        reason,
+      })
+      return
+    }
+    let interrupted: boolean | void = false
+    try {
+      interrupted = args.interrupt?.(args.sessionKey)
+    } catch (err) {
+      args.log?.warn('cron delegate heartbeat interrupt failed', {
+        jobId: args.jobId,
+        sessionKey: args.sessionKey,
+        reason,
+        errorClass: stableCronErrorClass(err),
+      })
+      return
+    }
+    args.log?.warn('cron delegate heartbeat lost fence; interrupted child session', {
+      jobId: args.jobId,
+      sessionKey: args.sessionKey,
+      reason,
+      interrupted: interrupted === true,
+    })
+  }
+  timer = setIntervalFn(() => {
+    beats += 1
+    // Same hard cap as the delegate lease heartbeat: a leaked interval must
+    // not slide the row's liveness forever.
+    if (beats > maxBeats) {
+      closeout('heartbeat_hard_cap')
+      return
+    }
+    let ok = false
+    try {
+      ok = args.store.touchActivity(args.jobId, args.fence)
+    } catch {
+      // A transient sqlite error must not kill a healthy occurrence; the next
+      // beat retries and the reaper is still the backstop.
+      return
+    }
+    if (!ok) closeout('touch_activity_rejected')
+  }, intervalMs)
+  timer.unref?.()
+  return { stop, beats: () => beats }
+}
+
 async function loadOccurrenceRecords(): Promise<CronOccurrenceRecord[]> {
   if (!existsSync(OCCURRENCE_DIR)) return []
   const records: CronOccurrenceRecord[] = []
@@ -1128,6 +1229,12 @@ export function frequencyQuotaError(
 export class CronScheduler {
   /** OCV5-22 phase 0: optional shared job store. Unset = today's occurrence JSON is still the execution right. */
   public delegateJobs?: DelegateJobStore
+  /**
+   * OCV5-164 cron liveness heartbeat cadence. Production keeps the 15s lease
+   * beat; tests shorten it so a real interval can be exercised without a
+   * 15s wall-clock wait. Not an env knob — the reaper's timeout is.
+   */
+  public delegateHeartbeatMs: number = DELEGATE_LEASE_HEARTBEAT_MS
   private timer: NodeJS.Timeout | null = null
   private bootTickTimer: NodeJS.Timeout | null = null
   private stopped = false
@@ -1458,6 +1565,7 @@ export class CronScheduler {
           }
           let cronClaimFence: { claimToken: string; fencingEpoch: number } | undefined
           let cronDelegateJobId: string | undefined
+          let cronHeartbeat: CronDelegateHeartbeat | undefined
           let outcome: CronRunOutcome
           if (existingRetry?.phase === 'delivery') {
             outcome = await this.retryArchivedDelivery(job, existingRetry)
@@ -1546,6 +1654,20 @@ export class CronScheduler {
                         record.delegateJobId,
                       )
                       cronClaimFence = claimed
+                      // OCV5-164: give the cron row the same 15s liveness
+                      // heartbeat a normal delegate turn gets. Protocol events
+                      // are NOT a heartbeat — `tool_use_detected` never reaches
+                      // onEvent (sessionManager), so a legitimate long tool call
+                      // would otherwise look idle and be reaped.
+                      cronHeartbeat = startCronDelegateHeartbeat({
+                        store: this.delegateJobs,
+                        jobId: record.delegateJobId,
+                        fence: claimed,
+                        sessionKey: record.sessionKey,
+                        intervalMs: this.delegateHeartbeatMs,
+                        interrupt: (key) => this.sessions.interrupt(key),
+                        log: logger,
+                      })
                       const latest = readOccurrence(deliveryContext.deliveryId) ?? record
                       writeOccurrence({
                         ...latest,
@@ -1626,6 +1748,12 @@ export class CronScheduler {
                 // submit may have started, replaying a fresh isolated session
                 // can duplicate non-idempotent tool side effects.
                 outcome = { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
+              } finally {
+                // OCV5-164: execution is over on every path (success, throw,
+                // terminal failure). Stop beating before settle so the row's
+                // liveness cannot outlive the work it represents.
+                cronHeartbeat?.stop()
+                cronHeartbeat = undefined
               }
             }
           }

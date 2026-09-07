@@ -35,6 +35,49 @@ export const DEFAULT_MAX_DELEGATE_JOBS = 256
 export const DELEGATE_LEASE_HEARTBEAT_MS = 15_000
 export const DELEGATE_LEASE_HEARTBEAT_MAX_BEATS = 480
 
+/**
+ * OCV5-164 heartbeat-timeout reaper.
+ *
+ * `owner_lease_until` alone is not liveness: a `kind=cron` row is claimed once
+ * (`claimQueued`) and then never touched again — no 15s heartbeat interval is
+ * attached to it — while the boot reconciler defers forever whenever the
+ * parent session still carries a runner object. That is how one
+ * `cron-origin-inject` row sat `running` for 7.3h and pinned a Grok delegate
+ * lease (master caps 4 per container), 429-ing every later delegation.
+ *
+ * So `last_activity_at`, which every state transition already writes, becomes
+ * a real timeout: a running row with no activity for this long is failed with
+ * `heartbeat_timeout` through the normal terminal path, which releases the
+ * lease and lets the Grok slot count fall back naturally.
+ */
+export const DELEGATE_HEARTBEAT_TIMEOUT_MS = 30 * 60_000
+export const MIN_DELEGATE_HEARTBEAT_TIMEOUT_MS = 5 * 60_000
+export const MAX_DELEGATE_HEARTBEAT_TIMEOUT_MS = 6 * 60 * 60_000
+/** Reaper cadence when the caller does not supply one. */
+export const DELEGATE_REAP_INTERVAL_MS = 60_000
+
+/**
+ * A row the heartbeat reaper settled, with the idle span measured *before* the
+ * terminal write (`fail()` resets `last_activity_at`, so the caller cannot
+ * recompute it afterwards).
+ */
+export type DelegateReapedJob = {
+  job: DelegateJobSnapshot
+  idleSec: number
+}
+
+/** Heartbeat timeout. Default 30min; env `OC_DELEGATE_HEARTBEAT_TIMEOUT_MS`. */
+export function resolveDelegateHeartbeatTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  return normalizeMs(
+    env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS,
+    DELEGATE_HEARTBEAT_TIMEOUT_MS,
+    MIN_DELEGATE_HEARTBEAT_TIMEOUT_MS,
+    MAX_DELEGATE_HEARTBEAT_TIMEOUT_MS,
+  )
+}
+
 /** Exclusive notify claim lease. Stale injecting is reclaimable after this. */
 export const NOTIFY_CLAIM_LEASE_MS = 30_000
 export const NOTIFY_RETRY_INITIAL_MS = 1_000
@@ -628,6 +671,33 @@ export class DelegateJobStore {
     return { ok: true, claimToken: job.claimToken!, fencingEpoch: job.fencingEpoch }
   }
 
+  /**
+   * OCV5-164: liveness ping for drivers that have no 15s lease heartbeat.
+   *
+   * `kind=cron` rows are claimed once and then driven by the cron loop, which
+   * previously only wrote occurrence JSON files — leaving `last_activity_at`
+   * frozen at claim time. Now the reaper reads that column, so every cron
+   * progression/callback must stamp it, or a healthy long occurrence would be
+   * reaped. Also renews `owner_lease_until` when this instance owns the row,
+   * keeping the reconciler's view consistent with the reaper's.
+   */
+  touchActivity(jobId: string, fence?: { claimToken: string; fencingEpoch: number }): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job || isDelegateTerminalState(job.state)) return false
+    if (job.claimToken) {
+      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
+        return false
+      }
+    }
+    const now = this.now()
+    const draft = this.cloneEntry(job)
+    draft.lastActivityAt = now
+    if (job.state === 'running' && job.ownerInstanceId === this.bootId) {
+      draft.ownerLeaseUntil = now + this.leaseMs
+    }
+    return this.commit(job, draft, false)
+  }
+
   casHeartbeat(jobId: string, claimToken: string, fencingEpoch: number): boolean {
     const job = this.refreshJob(jobId)
     if (!job) return false
@@ -968,12 +1038,18 @@ export class DelegateJobStore {
     }
   }
 
+  /**
+   * TTL sweep. Drops the in-memory handle exactly as before; the durable row
+   * is now *retired* rather than DELETEd (OCV5-164) so the ledger stays
+   * auditable for the retention window. Retired rows are invisible to every
+   * durable read, so hydrate/idempotency/capacity behaviour is unchanged.
+   */
   sweep(now = this.now()): number {
     let removed = 0
     for (const [id, job] of this.jobs) {
       if (!job.result || job.expiresAt === null || job.expiresAt > now) continue
       if (job.callbackState === 'pending' || job.callbackState === 'injecting') continue
-      if (!this.persistDelete(job)) continue
+      if (!this.persistRetire(job, now)) continue
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: id, ...(this.sm ? { failure_class: 'job_ttl_elapsed' as const } : {}) })
       if (job.idempotencyKey) this.byIdempotency.delete(job.idempotencyKey)
@@ -981,6 +1057,85 @@ export class DelegateJobStore {
       removed++
     }
     return removed
+  }
+
+  /**
+   * OCV5-164 heartbeat-timeout reaper. Fails `running` rows whose
+   * `last_activity_at` is older than `timeoutMs` (applies to `kind=cron` too),
+   * going through {@link fail} so the row takes the normal terminal path:
+   * waiters wake, the notify side channel runs, and `onTerminal` releases
+   * resume occupancy.
+   *
+   * What this does NOT do by itself: stop the child. Reaping only settles the
+   * ledger row, so the caller must interrupt the child session — see
+   * `onReaped`. For `kind=delegate` the resource cleanup then follows on its
+   * own, because the next `casHeartbeat` fails and `_runDelegateTaskCore`'s
+   * `finally` releases the Grok relay lease. For `kind=cron` there is no such
+   * lease to release: the synthetic cron turn is demoted out of grok/codex/
+   * cursor and never mints a delegate Grok route. Do not read this reaper as
+   * a general "frees a Grok slot" mechanism.
+   *
+   * Only rows this instance may fence are touched. A row owned by another live
+   * instance is left to that owner — the same rule `adoptOrKill` uses — so two
+   * masters cannot double-reap.
+   *
+   * `idleSec` is captured *before* {@link fail} runs, because `fail()` sets
+   * `last_activity_at = now`; computing it afterwards would always report ~0.
+   */
+  reapStaleRunning(
+    args: { timeoutMs: number; now?: number } = { timeoutMs: DELEGATE_HEARTBEAT_TIMEOUT_MS },
+  ): DelegateReapedJob[] {
+    const now = args.now ?? this.now()
+    const timeoutMs = Math.max(0, args.timeoutMs)
+    const reaped: DelegateReapedJob[] = []
+    for (const job of this.listRunning()) {
+      const idleMs = now - (job.lastActivityAt ?? job.createdAt ?? now)
+      if (idleMs <= timeoutMs) continue
+      // Another instance's live lease is its business; do not fence-steal.
+      if (
+        job.ownerInstanceId &&
+        job.ownerInstanceId !== this.bootId &&
+        job.ownerLeaseUntil != null &&
+        job.ownerLeaseUntil >= now
+      ) {
+        continue
+      }
+      const idleSec = Math.round(idleMs / 1000)
+      const ok = this.fail(job.id, {
+        failureClass: 'heartbeat_timeout',
+        detail: `delegate job idle ${idleSec}s with no heartbeat (kind=${job.kind}, limit ${Math.round(timeoutMs / 1000)}s); reaped by OCV5-164 heartbeat reaper`,
+        httpStatus: 504,
+        body: { idle_seconds: idleSec, kind: job.kind },
+        ...(job.claimToken
+          ? { claimToken: job.claimToken, fencingEpoch: job.fencingEpoch }
+          : {}),
+      })
+      if (!ok) continue
+      const snap = this.snapshotOf(job.id)
+      if (snap) reaped.push({ job: snap, idleSec })
+    }
+    return reaped
+  }
+
+  /**
+   * Drop retired rows past the retention window (newest-N floor keeps more).
+   * Separate from {@link sweep} so retention is a slow janitor, not a hot path.
+   */
+  pruneRetiredLedger(args: { retentionMs: number; now?: number; keepRows?: number }): number {
+    if (!this.durable) return 0
+    const now = args.now ?? this.now()
+    return this.durable.prunePastRetention({
+      cutoff: now - Math.max(0, args.retentionMs),
+      ...(args.keepRows !== undefined ? { keepRows: args.keepRows } : {}),
+    })
+  }
+
+  /** Audit counters for the ledger window (total/live/retired/oldest). */
+  ledgerStats(): { total: number; live: number; retired: number; oldestCreatedAt: number | null } {
+    if (!this.durable) {
+      return { total: this.jobs.size, live: this.jobs.size, retired: 0, oldestCreatedAt: null }
+    }
+    return this.durable.ledgerStats()
   }
 
   size(): number {
@@ -1628,6 +1783,18 @@ export class DelegateJobStore {
       state: job.state,
       fencingEpoch: job.fencingEpoch,
       claimToken: job.claimToken ?? null,
+    })
+  }
+
+  /** OCV5-164: TTL retire. Same fence as {@link persistDelete}. */
+  private persistRetire(job: JobEntry, now: number): boolean {
+    if (!this.durable) return true
+    return this.durable.casRetire({
+      jobId: job.id,
+      state: job.state,
+      fencingEpoch: job.fencingEpoch,
+      claimToken: job.claimToken ?? null,
+      now,
     })
   }
 
