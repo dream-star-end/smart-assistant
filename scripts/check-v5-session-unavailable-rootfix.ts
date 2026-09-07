@@ -104,3 +104,60 @@ if (!mediaEncoder.includes('JSON.stringify([timestamp, id])') || mediaEncoder.in
   throw new Error('[media-cursor-rootfix] cursor encoder must preserve the raw PostgreSQL timestamp')
 }
 console.log('[media-cursor-rootfix] PASS — INC-20260907-MEDIA-CURSOR-PRECISION source contracts locked')
+
+// INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
+// The delegateDurable unit suite separately exercises real SQLite retire/prune and
+// a real-interval cron heartbeat; this gate only stops the contracts regressing.
+const delegateDurableSrc = readFileSync(join(root, 'packages/gateway/src/delegateDurable.ts'), 'utf8')
+const delegateJobsSrc = readFileSync(join(root, 'packages/gateway/src/delegateJobs.ts'), 'utf8')
+const delegateServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const delegateCronSrc = readFileSync(join(root, 'packages/gateway/src/cron.ts'), 'utf8')
+
+// Retired rows must stay invisible to every runtime read/CAS. If this count drops,
+// some statement started seeing audit-only rows and the ledger stopped being
+// behaviourally equivalent to the old physical DELETE.
+const retiredGuards = (delegateDurableSrc.match(/retired_at IS NULL/g) ?? []).length
+if (retiredGuards < 10) {
+  throw new Error(
+    `[delegate-ledger-reap] expected >=10 "retired_at IS NULL" guards in delegateDurable.ts, found ${retiredGuards}`,
+  )
+}
+if (!delegateDurableSrc.includes('WHERE idempotency_key IS NOT NULL AND retired_at IS NULL')) {
+  throw new Error(
+    '[delegate-ledger-reap] idempotency unique index must stay partial on retired_at, or a retired cron occurrence key can no longer be reused',
+  )
+}
+for (const marker of ['casRetire(', 'prunePastRetention(', 'DELEGATE_LEDGER_RETENTION_MS', 'retired_at INTEGER']) {
+  if (!delegateDurableSrc.includes(marker)) {
+    throw new Error(`[delegate-ledger-reap] delegateDurable.ts lost retention contract: ${marker}`)
+  }
+}
+for (const marker of ['reapStaleRunning(', "'heartbeat_timeout'", 'DELEGATE_HEARTBEAT_TIMEOUT_MS', 'persistRetire(']) {
+  if (!delegateJobsSrc.includes(marker)) {
+    throw new Error(`[delegate-ledger-reap] delegateJobs.ts lost reaper contract: ${marker}`)
+  }
+}
+// idleSec must be captured before fail() rewrites last_activity_at.
+if (!delegateJobsSrc.includes('reaped.push({ job: snap, idleSec })')) {
+  throw new Error('[delegate-ledger-reap] reapStaleRunning must report the pre-reap idle span')
+}
+if (!delegateServerSrc.includes('_armDelegateReaper(')) {
+  throw new Error('[delegate-ledger-reap] server.ts lost the reaper interval wiring')
+}
+// Settling the ledger row does not stop the child; the interrupt is what keeps
+// "ledger failed" and "subprocess running" from diverging.
+if (!delegateServerSrc.includes('delegate_heartbeat_timeout_reaped')) {
+  throw new Error('[delegate-ledger-reap] server.ts lost the reap log event')
+}
+if (!/interrupted = this\.sessions\.interrupt\(job\.sessionKey\) === true/.test(delegateServerSrc)) {
+  throw new Error('[delegate-ledger-reap] reaped rows must interrupt their child session')
+}
+// Protocol events are not a heartbeat (tool_use_detected never reaches onEvent),
+// so the cron row needs a timer beat between claim and settle.
+if (!delegateCronSrc.includes('startCronDelegateHeartbeat(')) {
+  throw new Error('[delegate-ledger-reap] cron.ts lost the claimed-occurrence heartbeat')
+}
+if (!delegateCronSrc.includes('cronHeartbeat?.stop()')) {
+  throw new Error('[delegate-ledger-reap] cron heartbeat must be stopped on every execution path')
+}
+console.log('[delegate-ledger-reap] PASS — INC-20260907-DELEGATE-LEDGER-REAP source contracts locked')
