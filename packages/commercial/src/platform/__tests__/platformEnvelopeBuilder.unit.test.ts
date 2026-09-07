@@ -770,3 +770,106 @@ describe("H1 多机一致 — builder 层断言 system[0]/[1]/[N+1] 字节级一
     assert.equal(texts[1], texts[2]);
   });
 });
+
+// ─── OCV5-166 用户面时区(OC_USER_TZ)──────────────────────────────────
+//
+// 语义:OC_USER_TZ 只影响 system-reminder 的 `# currentDate` 段,给出用户本地
+// 时刻 + 显式 UTC 偏移。它与引擎子进程 TZ(Asia/Tokyo,跟随日本出口 IP 的风控
+// 一致性控制)**正交** —— 这里不断言任何 spawn env 行为。
+//
+// 行为锁:`Today's date is <ISO>.`(含句点)必须原样保留 —— 见
+// http/proxy/upstream.ts REMINDER_DATE_RE(按账号 persona 时区改写 wire 日期)
+// 与本文件上方 NOW.1/NOW.2 等逐字断言。
+
+describe("OCV5-166 用户面时区注入 system-reminder", () => {
+  const ENV_KEY = "OC_USER_TZ";
+
+  /** 用指定 OC_USER_TZ 跑一次 builder,返回替换后的 reminder 文本。 */
+  function reminderWithUserTz(
+    value: string | undefined,
+    now: () => Date = fixedNow,
+  ): string {
+    const prev = process.env[ENV_KEY];
+    if (value === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = value;
+    try {
+      const body = makeBody({
+        messages: [
+          {
+            role: "user",
+            content: "<system-reminder># claudeMd</system-reminder>",
+            isMeta: true,
+          } as unknown,
+        ],
+      });
+      buildPlatformEnvelope({
+        body,
+        ctx: null,
+        userId: 42n,
+        serverSecret: SECRET,
+        log,
+        now,
+      });
+      return (body.messages[0] as { content: string }).content;
+    } finally {
+      if (prev === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = prev;
+    }
+  }
+
+  // FIXED_DATE = 2026-05-21T00:00:00Z → Shanghai 08:00(+08:00),NY 前一日 20:00(-04:00)
+
+  test("TZ.1 OC_USER_TZ 缺省 → 回落 Asia/Shanghai,含 UTC+08:00", () => {
+    const text = reminderWithUserTz(undefined);
+    assert.ok(text.includes("Asia/Shanghai"), text);
+    assert.ok(text.includes("UTC+08:00"), text);
+    assert.ok(text.includes("user local time 08:00"), text);
+  });
+
+  test("TZ.2 OC_USER_TZ=America/New_York → 含该 tz 与 UTC-04:00 偏移", () => {
+    const text = reminderWithUserTz("America/New_York");
+    assert.ok(text.includes("America/New_York"), text);
+    assert.ok(text.includes("UTC-04:00"), text);
+    assert.ok(text.includes("user local time 20:00"), text);
+    assert.ok(!text.includes("Asia/Shanghai"), text);
+  });
+
+  test("TZ.3 非法 OC_USER_TZ → 不抛,静默回落 Asia/Shanghai", () => {
+    const text = reminderWithUserTz("Not/AZone");
+    assert.ok(text.includes("Asia/Shanghai"), text);
+    assert.ok(text.includes("UTC+08:00"), text);
+    assert.ok(!text.includes("Not/AZone"), text);
+  });
+
+  test("TZ.4 空白 OC_USER_TZ → 回落 Asia/Shanghai", () => {
+    const text = reminderWithUserTz("   ");
+    assert.ok(text.includes("Asia/Shanghai"), text);
+  });
+
+  test("TZ.5 半小时制时区(Asia/Kolkata)偏移正确 → UTC+05:30", () => {
+    const text = reminderWithUserTz("Asia/Kolkata");
+    assert.ok(text.includes("Asia/Kolkata"), text);
+    assert.ok(text.includes("UTC+05:30"), text);
+    assert.ok(text.includes("user local time 05:30"), text);
+  });
+
+  test("TZ.6 行为锁:`Today's date is <ISO>.` 前缀含句点原样保留", () => {
+    // upstream.ts REMINDER_DATE_RE 依赖该前缀改写 persona 时区日期;
+    // 追加的用户面子句前缀不同,不被该正则命中 —— 两者正交并存。
+    const text = reminderWithUserTz("America/New_York");
+    assert.ok(text.includes("Today's date is 2026-05-21."), text);
+    assert.match(text, /Today's date is (?:now )?\d{4}-\d{2}-\d{2}/);
+  });
+
+  test("TZ.7 用户面时刻不改 UTC 日期字面(日期仍来自 now 的 UTC 日)", () => {
+    // NY 当地已是 05-20 20:00,但 ISO 日期锁 UTC 的 2026-05-21 —— 不得被本地日覆盖。
+    const text = reminderWithUserTz("America/New_York");
+    assert.ok(text.includes("Today's date is 2026-05-21."), text);
+  });
+
+  test("TZ.8 含出口时区提示语,指引模型优先用用户本地时间", () => {
+    const text = reminderWithUserTz(undefined);
+    assert.ok(text.includes("egress-aligned"), text);
+    assert.ok(text.includes("always use the user local time above"), text);
+  });
+});

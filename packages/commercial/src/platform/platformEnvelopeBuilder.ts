@@ -216,13 +216,94 @@ function detectCcbSystemReminderMessage(msg: unknown): boolean {
 }
 
 /**
+ * 用户面时区(OCV5-166)—— **与引擎子进程 TZ 正交,不可互相替代**。
+ *
+ * 背景:selfhost 的引擎子进程 `TZ=Asia/Tokyo` 是与固定日本出口 IP 对齐的风控一致性
+ * 控制(deploy 脚本 `OC_CLAUDE_CODE_TZ` → `OPENCLAUDE_CCB_TZ` → spawn env.TZ,见
+ * skill `claude-code-egress-region-consistency`),**刻意**不等于用户真实所在地。
+ * 后果是模型 `date` 只能拿到出口时区,要自己 -1h 换算成用户本地时间。
+ *
+ * 这里给出一个**只读、与出口解耦**的用户面时区:只影响 system-reminder 文本,
+ * 不参与任何 spawn env / 代理选路,因此不动上述风控控制。
+ */
+const DEFAULT_USER_TZ = "Asia/Shanghai";
+
+/** IANA 合法性校验 —— 非法 tz 会让 Intl 抛 RangeError。 */
+function isValidTimeZone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 解析用户面时区:`OC_USER_TZ` 合法则用它,缺省/空白/非法一律回落
+ * `Asia/Shanghai`(**永不抛** —— 本文件在 proxy hot path,契约是 fail-safe)。
+ */
+function resolveUserTimeZone(): string {
+  const raw = process.env.OC_USER_TZ?.trim();
+  if (!raw) return DEFAULT_USER_TZ;
+  return isValidTimeZone(raw) ? raw : DEFAULT_USER_TZ;
+}
+
+/**
+ * 把 `now` 渲染成用户面时区的 `HH:MM` + `UTC±HH:MM` 偏移。
+ *
+ * 偏移取自 `timeZoneName: "longOffset"`(输出 `GMT+08:00`),改写成 `UTC+08:00`;
+ * 半小时/45 分钟制时区(Asia/Kolkata `+05:30`、Pacific/Chatham `+12:45`)天然正确。
+ * UTC 本身 longOffset 给 `GMT+00:00` → `UTC+00:00`。
+ */
+function formatUserLocalTime(now: Date, tz: string): { time: string; offset: string } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZoneName: "longOffset",
+  }).formatToParts(now);
+  const pick = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const zoneName = pick("timeZoneName");
+  return {
+    time: `${pick("hour")}:${pick("minute")}`,
+    offset: zoneName.startsWith("GMT") ? `UTC${zoneName.slice(3)}` : zoneName,
+  };
+}
+
+/**
+ * `# currentDate` 段正文。
+ *
+ * **`Today's date is <ISO>.` 前缀(含句点)是行为锁,不能改**:
+ *   - `packages/commercial/src/http/proxy/upstream.ts` 的 `REMINDER_DATE_RE`
+ *     `/(Today's date is (?:now )?)\d{4}-\d{2}-\d{2}/g` 会在 OAuth 池转发时把该日期
+ *     改写成账号 persona 时区日期(反封:让 wire 日期与账号语言/出口自洽)。追加的
+ *     用户面子句前缀不同,不会被该正则命中 —— 两者正交并存;
+ *   - 多条既有断言逐字匹配 `Today's date is 2026-05-21.` 等整串。
+ */
+function buildCurrentDateLine(isoDate: string, now: Date): string {
+  const tz = resolveUserTimeZone();
+  const { time, offset } = formatUserLocalTime(now, tz);
+  return (
+    `Today's date is ${isoDate}. ` +
+    `(user local time ${time}, ${tz}, ${offset}). ` +
+    "Subprocess `date` may report a different zone (egress-aligned); " +
+    "always use the user local time above for scheduling and user-facing timestamps."
+  );
+}
+
+/**
  * 服务端拼装 CCB 风格 system-reminder 文本(平台 USER.md 等价 + 当前日期)。
- * 内容 = USER.md(原文)+ MEMORY.md 索引 + 当前 UTC 日期。
+ * 内容 = USER.md(原文)+ MEMORY.md 索引 + 当前 UTC 日期 + 用户面本地时间。
  *
  * ctx === null 时用占位文本,保 H1 多机一致(server-canonical default)。
+ *
+ * H1 注:用户面时刻含分钟,故本段文本每请求可变 —— 与 system[0]/[1]/[N+1] 的
+ * 字节级多机一致无关(那 3 块不含时间),但会降低本路径 message 前缀缓存命中率。
  */
 function buildServerSystemReminderText(ctx: PlatformContext | null, today: Date): string {
   const isoDate = today.toISOString().slice(0, 10);
+  const currentDateLine = buildCurrentDateLine(isoDate, today);
   if (ctx === null) {
     return [
       "<system-reminder>",
@@ -230,7 +311,7 @@ function buildServerSystemReminderText(ctx: PlatformContext | null, today: Date)
       "# claudeMd",
       PLATFORM_CONTEXT_UNAVAILABLE,
       "# currentDate",
-      `Today's date is ${isoDate}.`,
+      currentDateLine,
       "</system-reminder>",
     ].join("\n");
   }
@@ -241,7 +322,7 @@ function buildServerSystemReminderText(ctx: PlatformContext | null, today: Date)
     "# claudeMd",
     userMdTrimmed.length > 0 ? userMdTrimmed : PLATFORM_CONTEXT_UNAVAILABLE,
     "# currentDate",
-    `Today's date is ${isoDate}.`,
+    currentDateLine,
     "</system-reminder>",
   ].join("\n");
 }
