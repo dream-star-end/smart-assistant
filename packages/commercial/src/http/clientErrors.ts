@@ -26,7 +26,7 @@ const OUTCOMES = new Set<FrictionOutcome>([
 /** Must match 0278 CHECK character-for-character. */
 const FRICTION_PATH_RE = /^[a-z0-9_]{1,32}$/;
 const FRICTION_REASON_RE = /^[a-z0-9_]{1,48}$/;
-const PROBLEM_CARD_CORRELATION_RE = /^[A-Za-z0-9_:-]{1,224}$/;
+const PROBLEM_CARD_CORRELATION_RE = /^[A-Za-z0-9_:-]{1,225}$/;
 const PRESENTATIONS = new Set(["red", "yellow", "soft", "banner", "placeholder"]);
 
 function safeToken(value: unknown, max: number, pattern: RegExp): string | null {

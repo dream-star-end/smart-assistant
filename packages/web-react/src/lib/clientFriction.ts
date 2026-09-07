@@ -35,7 +35,7 @@ const SAFE_ERROR_NAME = /^[A-Za-z0-9_.$-]{1,64}$/;
 const SAFE_SCRIPT_REF = /^[A-Za-z0-9._-]{1,120}$/;
 const SAFE_FRICTION_PATH = /^[a-z0-9_]{1,32}$/;
 const SAFE_FRICTION_REASON = /^[a-z0-9_]{1,48}$/;
-const SAFE_FRICTION_CORRELATION = /^[A-Za-z0-9_:-]{1,224}$/;
+const SAFE_FRICTION_CORRELATION = /^[A-Za-z0-9_:-]{1,225}$/;
 const FRICTION_PRESENTATIONS = new Set<ClientFrictionPresentation>([
   "red",
   "yellow",
