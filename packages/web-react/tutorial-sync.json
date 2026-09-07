@@ -1,14 +1,14 @@
 {
   "capabilities": {
     "agents": {
-      "contentHash": "960d76fc609c8d968d8b75cc486824de68fa969634d7311f45fa86f5da397177",
-      "contentVersion": 1,
-      "entryIdentityHash": "a042cf675bc8d45ba26715bf7ce51fa48f62b399092d22a5aeed422d6ac8d2e9",
-      "mediaHash": "5a661d2749d2bf385aec95274728409cf3d4fda24350815da24ffb09d7ce0dfd",
+      "contentHash": "5520934e1e04f8e5b3e7cd250ec88c39b7213db61433e5e8c88bafcfa9b7bf6d",
+      "contentVersion": 2,
+      "entryIdentityHash": "1c73e6f56e9cad70c754052b6bfa6c10578ef6b215a5e32f18497a791a6f42e2",
+      "mediaHash": "da9bdf2bc3b9ed42a1d43e524001916ed74f1b3a104a4a15173184e817964def",
       "mediaKey": "agents",
-      "mediaVersion": 3,
+      "mediaVersion": 4,
       "registryHash": "94e8049f80ed0fcaca43608b1796cdd361d6f8dbb0fcb9a10b3e86121eb5aea6",
-      "sourceHash": "bc6a3a23e0632f81f0fbb829297f2755139fe158544e2772bab2f8802e490338"
+      "sourceHash": "43690e3d8f091c6717dbabf9e52c60591d51e11aa7c61eb844e49526e487fff1"
     },
     "artifacts-download": {
       "contentHash": "3c4e0d07709579bddddd1309d257599c2d4a8aec7e2ba633c4d1480a19402e33",
@@ -31,14 +31,14 @@
       "sourceHash": "83182938415a32888f4901a9898f70441807b0baafa3b170807987c42daecc22"
     },
     "chat-basics": {
-      "contentHash": "387cd97eec61939fcbc8ec2170b84aa7922ce1ba43fb8d243fdf5ec1bb18add2",
-      "contentVersion": 6,
-      "entryIdentityHash": "2b1c6269476ce53585a517e4fba7e81f540de79ae897ba04ec17ae8394829ff8",
-      "mediaHash": "0cc612d377280f73f9fcc131c43e8ebde31ec42226e82a8745b0cb6534649779",
+      "contentHash": "ba6b3e6a8349d2cac60a5ede07fa4bea3b5595b324daa2050c60f9cc0f7e6737",
+      "contentVersion": 7,
+      "entryIdentityHash": "13c1fa6f3d375c76739090117af1ea0e4be4e53214ef003d16d5118649e055e1",
+      "mediaHash": "e6197264cb7365c92362480087b05e2608ddc3e2e109e8633aeaad53987a4547",
       "mediaKey": "chat-basics",
-      "mediaVersion": 3,
+      "mediaVersion": 4,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "29ef61d1af082a4ebe67045775ddded330a58e93f02fb9ba3369d64361103430"
+      "sourceHash": "8b14f63258e918c8fd96800074c1a57f3f1fc2b4e2ccc6c7c25965903947a73b"
     },
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
@@ -144,11 +144,11 @@
       "contentHash": "6dacdc44bb76b8a3772a6234d5ea94395ec14d1fd68db1bf43fcbae24502cf47",
       "contentVersion": 5,
       "entryIdentityHash": "4083cf539ec861234296b7d70c3b75791ac011c0aca59d11c36580dd965672f7",
-      "mediaHash": "e331e8565a68475c57c08ed1742c7b8b4a512cd154c83b7f0e8e270563733a3c",
+      "mediaHash": "593b0a345dc0c4b990344ad9692e9562dda0f71fa6fe4b300a3ddf15de0cf7a3",
       "mediaKey": "models-reasoning",
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "registryHash": "05d9024636c1060f19b7670c735a8a5bc39bf7dfdacd83a719260e898df68ee2",
-      "sourceHash": "aae63afffd1341aed92ec0c957ec90b87184c8cb5d6a1709d9470b39ece8bafc"
+      "sourceHash": "495c6170d93ef6e6e2edea191b2a1e7e8cad9f1362a2a81dc23e10fd6b8dfef4"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",
@@ -194,11 +194,11 @@
       "contentHash": "ae055e00f6cda07668e7f0f2332e65ac52e5fc5b875673046e1940fdfaff68ad",
       "contentVersion": 3,
       "entryIdentityHash": "e1282c657296e588fc6d05e4134780fc76f1cb2ae4857bbee40e989e841efd7d",
-      "mediaHash": "ff30df1636efc5dfd95f414f46ff689252bd0b11be1ddc43b31111186e4eab9e",
+      "mediaHash": "b31f294f4effd2a561f0a35117e1fd7e496a404ee9b38a954cee098cafb494b6",
       "mediaKey": "sessions-history",
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "registryHash": "35fab636ddeba4b50639aa74096f650b5c342fa42457f15dd7e8265ed9c42828",
-      "sourceHash": "bdc9f6d8e38a58eb5966129f7e041bf1cf9e67b41cdc4cd03e63561bc4624725"
+      "sourceHash": "1d929ba9c2cba789f77eef026f64a0d82da90f9046c3edce10918b121844c782"
     },
     "skills-training": {
       "contentHash": "e2153ef7ccb7bbd46b3ddcfac3368e004dfff463d95c1f9f805d75c4a06846e2",
@@ -304,17 +304,17 @@
   "catalogSchema": 2,
   "media": {
     "agents": {
-      "caption": "打开智能体选择器，查看并切换已安装的专业助手。",
+      "caption": "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。",
       "codec": "VP8",
       "durationSeconds": 4,
       "height": 540,
       "poster": "/tutorials/agents.webp",
       "posterBytes": 22922,
-      "posterSha256": "1e1fb498aeafc19c05d14d26487077f8c7e808acba41c0cba22f3e65354f2b5e",
-      "version": 3,
+      "posterSha256": "b104cebccd1e3bad4d44f5203bdbbe2733aebc62e4936e16b0de54c91fdcd61d",
+      "version": 4,
       "video": "/tutorials/agents.webm",
-      "videoBytes": 107178,
-      "videoSha256": "f2443aa63e7a9005fab5ae3d0404712c77e19d80428072fc5a0afe1ec3f219ef",
+      "videoBytes": 101917,
+      "videoSha256": "8a5af55c637cbe78a997333a6213dd05db766a43aecd8916bb4a53fabc2bef56",
       "width": 960
     },
     "artifacts-download": {
@@ -351,12 +351,12 @@
       "durationSeconds": 4,
       "height": 540,
       "poster": "/tutorials/chat-basics.webp",
-      "posterBytes": 23954,
-      "posterSha256": "5f7fb3b0d8d836015c1fc7b83b1097817366f3ac757bc722b7a03189256cade2",
-      "version": 3,
+      "posterBytes": 19318,
+      "posterSha256": "aba6b8b5613501e36ff0acdaf9b87349361e6cb3cb2b89e13d73bdddb89dccf1",
+      "version": 4,
       "video": "/tutorials/chat-basics.webm",
-      "videoBytes": 97814,
-      "videoSha256": "e47fd6b09fa4382668a74117f9945ec7f56b8a90979faa9255268f9262e330c5",
+      "videoBytes": 101106,
+      "videoSha256": "b071a3d395fc8130f8c4e483e8f8b4ded9ab6cbbd2bf3c1af538ce9af3399c5d",
       "width": 960
     },
     "connectors": {
@@ -505,12 +505,12 @@
       "durationSeconds": 4,
       "height": 540,
       "poster": "/tutorials/models-reasoning.webp",
-      "posterBytes": 25074,
-      "posterSha256": "803ac951015ce15438e034537536ff8ebf9ba2bd9acf4c47a19e8ba48ba7abf3",
-      "version": 2,
+      "posterBytes": 23562,
+      "posterSha256": "d410c388227556a42eb25a428f93f4f34111cfb8c2e1e133f73d2cb2136aaf21",
+      "version": 3,
       "video": "/tutorials/models-reasoning.webm",
-      "videoBytes": 98330,
-      "videoSha256": "21c2c1ee81481e7e0fdd8057619724db062ad750cef7b4977b76922d39666e5c",
+      "videoBytes": 89105,
+      "videoSha256": "6a14a8fa3b22f59c718bee6602973acacba8da1e4732d5167777442329005352",
       "width": 960
     },
     "organization": {
@@ -575,12 +575,12 @@
       "durationSeconds": 4,
       "height": 540,
       "poster": "/tutorials/sessions-history.webp",
-      "posterBytes": 25266,
-      "posterSha256": "2529a26b5610100bcedc4a23fb412517a6a50dd92aa3e02f0005fb0f018e005a",
-      "version": 2,
+      "posterBytes": 20976,
+      "posterSha256": "051823e9c5ed9604fa02dac4335ebca307e35300e979485a238aba9528ccee67",
+      "version": 3,
       "video": "/tutorials/sessions-history.webm",
-      "videoBytes": 83388,
-      "videoSha256": "7f50cf8fcfb737574beac987591ad402619d144769232f33980a2140cea23e44",
+      "videoBytes": 68902,
+      "videoSha256": "ff806eb9533416cbf105b2c18e16b2f15660a4674e7678d819b81ee5cc40f95c",
       "width": 960
     },
     "skills-training": {

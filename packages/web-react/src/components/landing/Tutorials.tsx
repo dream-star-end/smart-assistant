@@ -150,19 +150,19 @@ export function Tutorials() {
         ))}
       </div>
 
-      {/* 指向教程中心快速上手主线；案例回放尚未采集，这里不承诺。 */}
+      {/* 指向成果展厅；公开数据实作与完整会话回放分开表述。 */}
       <div className="mb-14 overflow-hidden rounded-2xl border border-border bg-surface p-6 sm:flex sm:items-center sm:justify-between sm:gap-6 sm:p-7">
         <div className="max-w-xl">
-          <h3 className="text-[20px] font-bold tracking-tight">打开后，按 10 分钟主线走一遍</h3>
+          <h3 className="text-[20px] font-bold tracking-tight">先看看，它能把事情做到哪一步</h3>
           <p className="mt-2 text-[14.5px] leading-6 text-muted">
-            发任务、补材料、选模型、看过程、拿成果。这是功能用法，不是案例回放。
+            打开能交互的真实样例成果，再换成你的问题和材料，做一个自己的版本。
           </p>
         </div>
         <a
           href={tutorialHref(window.location)}
           className="mt-4 inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-grad-cta px-4 py-2.5 text-section font-semibold text-white shadow-sm outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring sm:mt-0"
         >
-          打开快速上手
+          打开案例展厅
           <ArrowRight size={15} />
         </a>
       </div>

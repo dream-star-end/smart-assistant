@@ -836,6 +836,32 @@ export function cursorModelById(modelId: string | null | undefined): CursorEngin
   return CURSOR_ENGINE_MODELS.find((model) => model.id === modelId)
 }
 
+/**
+ * External-facing id for a cursor engine model. Third-party clients that reach
+ * the platform through the API-key endpoint (`/api/anthropic/*`) never see the
+ * engine name: `cursor-fable-5.1-high` is presented as `fable-5.1-high`. The
+ * internal id stays the billing / catalog / log key. Non-cursor ids are
+ * returned unchanged so callers can map mixed lists without branching.
+ */
+export const CURSOR_ENGINE_ID_PREFIX = 'cursor-'
+
+export function publicCursorModelId(modelId: string): string {
+  return isCursorEngineModel(modelId) ? modelId.slice(CURSOR_ENGINE_ID_PREFIX.length) : modelId
+}
+
+/**
+ * Inverse of {@link publicCursorModelId}: accept either the public id or the
+ * internal `cursor-*` id and return the internal id, or `null` when the input
+ * names no cursor engine model. Only exact catalog ids match — no fuzzy
+ * prefixing — so `cursor-auto --force` style garbage still fails closed.
+ */
+export function cursorModelIdFromPublic(modelId: string | null | undefined): CursorEngineModelId | null {
+  if (typeof modelId !== 'string' || modelId.length === 0) return null
+  if (isCursorEngineModel(modelId)) return modelId as CursorEngineModelId
+  const prefixed = `${CURSOR_ENGINE_ID_PREFIX}${modelId}`
+  return isCursorEngineModel(prefixed) ? (prefixed as CursorEngineModelId) : null
+}
+
 export type CursorCredentialModelFamily = 'cursor_models' | 'other_models'
 
 /** Cursor's account pool has separate quota eligibility for built-in Cursor

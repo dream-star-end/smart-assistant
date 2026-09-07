@@ -128,7 +128,11 @@ describe('four hook-chain faults all fail-open with a signal', () => {
   })
 
   it('hung inner script times out quickly → allow + audit + counter', () => {
-    const script = writeFixture('hang.cjs', 'setInterval(() => {}, 1000);\n')
+    const pidFile = join(TEST_HOME, 'hang.pid')
+    const script = writeFixture(
+      'hang.cjs',
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    )
     const before = failOpenCount()
     const out = runRunner({ protocol: 'cursor', script, timeoutMs: 250 })
     assertAllowed('cursor', out.stdout, out.status)
@@ -136,6 +140,29 @@ describe('four hook-chain faults all fail-open with a signal', () => {
     assert.match(out.stderr, /timeout/)
     assert.ok(failOpenCount() > before)
     assert.match(auditText(), /timeout/)
+
+    // Regression: the hung inner must not be left behind as an orphan. Before
+    // the fix, the timeout path called finishFail() without the child, so the
+    // SIGKILL branch was dead code and one `node hang.cjs` leaked per run.
+    assert.ok(existsSync(pidFile), 'inner should have started and written its pid')
+    const innerPid = Number(readFileSync(pidFile, 'utf8'))
+    let alive = true
+    for (let i = 0; i < 40 && alive; i++) {
+      try {
+        process.kill(innerPid, 0)
+        spawnSync('sleep', ['0.05'])
+      } catch {
+        alive = false
+      }
+    }
+    if (alive) {
+      try {
+        process.kill(innerPid, 'SIGKILL')
+      } catch {
+        /* cleanup is best-effort */
+      }
+    }
+    assert.equal(alive, false, `inner pid ${innerPid} still alive after runner timeout`)
   })
 })
 

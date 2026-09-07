@@ -15,7 +15,7 @@ import {
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { useProjectScope } from '../../hooks/useProjectScope'
-import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
+import { boardWorkQuery } from '../../lib/projectScope'
 import { Button, Card, EmptyState, Field, Input, ListSkeleton, ProjectScopeSelect, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
@@ -143,7 +143,11 @@ export function CostStatsView({
         </Button>
       </div>
       {'blocked' in workQuery ? (
-        <EmptyState icon={Coins} title={UNBOUND_BOARD_COPY} hint="切换到已绑定看板的工作项目后再查看成本。" />
+        <EmptyState
+          icon={Coins}
+          title={workQuery.blocked}
+          hint="切换到已绑定看板的工作项目后再查看成本。"
+        />
       ) : loading && !stats ? (
         <ListSkeleton rows={5} variant="card" />
       ) : error ? (

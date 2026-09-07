@@ -40,10 +40,9 @@ function openPlusMenu(): void {
 describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFor> 激活）", () => {
   test("附件项是 label[for]，绑定 file input：input 非 display:none、type=file、无 accept", () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} />);
-    openPlusMenu();
-    const label = screen.getByText("添加附件").closest("label");
-    expect(label).not.toBeNull();
-    const forId = label!.getAttribute("for");
+    const label = screen.getByTitle("添加附件");
+    expect(label.tagName).toBe("LABEL");
+    const forId = label.getAttribute("for");
     expect(forId).toBeTruthy();
     const input = document.getElementById(forId as string) as HTMLInputElement | null;
     expect(input).not.toBeNull();
@@ -57,8 +56,7 @@ describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFo
 
   test("点击附件 label 原生转发一次 click 到 file input（Radix 未吞掉默认激活）", () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} />);
-    openPlusMenu();
-    const label = screen.getByText("添加附件").closest("label") as HTMLLabelElement;
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
     const input = document.getElementById(label.getAttribute("for") as string) as HTMLInputElement;
     const clickSpy = vi.fn();
     input.addEventListener("click", clickSpy);
@@ -72,15 +70,14 @@ describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFo
    *  htmlFor 按 tree scope 解析不到 input → 选择器不弹(真机 Chromium 实证 0 转发)。
    *  上面的"转发"测试在 jsdom 恒绿测不出(jsdom 的 label control 查找走 ownerDocument
    *  而非 root tree,detached 也能转发)——所以这里直接锁 detach 本身:
-   *  点击当下 label 必须仍 connected(即 onSelect 已 preventDefault),菜单随后异步关闭。 */
+   *  点击当下 label 必须仍 connected。附件入口已迁到工具条常驻 label,不再随菜单卸载。 */
   test("点击附件项后 label 在激活窗口内保持挂载（select 已拦截），菜单随后异步关闭", async () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} />);
-    openPlusMenu();
-    const label = screen.getByText("添加附件").closest("label") as HTMLLabelElement;
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
     fireEvent.click(label);
     // click 派发结束的同步时刻:label 必须还在 DOM(原生激活依赖此窗口)。
     expect(label.isConnected).toBe(true);
-    // 菜单不常驻:宏任务后正常关闭。
+    // 工具条 label 常驻,菜单里不再有「添加附件」文案。
     await waitFor(() => expect(screen.queryByText("添加附件")).toBeNull());
   });
 });

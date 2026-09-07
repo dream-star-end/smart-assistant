@@ -1,11 +1,11 @@
 import type { CursorContextTier } from "@openclaude/protocol";
-import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Search, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { LockedPublicModel, PublicModel } from "../lib/types";
-import { formatCredits } from "../lib/utils";
+import { cn, formatCredits } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
 import { type LockedSelectInfo, ModelSelector, teamEngineLabel } from "./ModelSelector";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
@@ -24,6 +24,8 @@ export function ChatHeader({
   onSelectEffort,
   contextTier,
   onSelectContextTier,
+  modelPickerOpen,
+  onModelPickerOpenChange,
   teamModeActive,
   onDisableTeamMode,
   credits,
@@ -33,6 +35,7 @@ export function ChatHeader({
   onNew,
   onOpenMobileNav,
   onOpenInbox,
+  onOpenFind,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
@@ -57,6 +60,8 @@ export function ChatHeader({
   /** Cursor Opus/Fable 上下文档位(300k 默认 / 1M);透传给模型菜单的「上下文」区块。 */
   contextTier?: CursorContextTier | null;
   onSelectContextTier?: (tier: CursorContextTier) => void;
+  modelPickerOpen?: boolean;
+  onModelPickerOpenChange?: (v: boolean) => void;
   /**
    * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
    * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
@@ -76,6 +81,8 @@ export function ChatHeader({
   onOpenMobileNav?: () => void;
   /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
   onOpenInbox?: () => void;
+  /** 打开会话内查找条（省略则不渲染查找键，如 demo）。按钮常驻，不随查找条开关挂卸载。 */
+  onOpenFind?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
@@ -96,20 +103,48 @@ export function ChatHeader({
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
         <div className="relative md:hidden">
-          <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square">
+          <IconButton
+            data-product-control
+            onClick={onOpenMobileNav}
+            aria-label={
+              sessionUnreadCount && sessionUnreadCount > 0
+                ? `打开菜单,${sessionUnreadCount} 条未读会话`
+                : "打开菜单"
+            }
+            shape="square"
+          >
             <Menu size={18} />
           </IconButton>
-          <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+          <HeaderCountBadge
+            count={sessionUnreadCount}
+            testId="session-unread-badge"
+            tone="accent"
+            ariaLabel={sessionUnreadCount ? `${sessionUnreadCount} 条未读会话` : undefined}
+          />
         </div>
       )}
       {/* 桌面折叠态：展开 + 新建（仅 md+，移动端用抽屉）。 */}
       {sidebarCollapsed && (
         <div className="hidden items-center gap-1 md:flex">
           <div className="relative">
-            <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
+            <IconButton
+              data-product-control
+              onClick={onExpandSidebar}
+              aria-label={
+                sessionUnreadCount && sessionUnreadCount > 0
+                  ? `展开侧栏,${sessionUnreadCount} 条未读会话`
+                  : "展开侧栏"
+              }
+              shape="square"
+            >
               <PanelLeft size={18} />
             </IconButton>
-            <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+            <HeaderCountBadge
+              count={sessionUnreadCount}
+              testId="session-unread-badge"
+              tone="accent"
+              ariaLabel={sessionUnreadCount ? `${sessionUnreadCount} 条未读会话` : undefined}
+            />
           </div>
           <IconButton data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id} onClick={onNew} aria-label="新建会话" shape="square">
             <PenSquare size={18} />
@@ -191,15 +226,27 @@ export function ChatHeader({
           onSelectEffort={onSelectEffort}
           contextTier={contextTier}
           onSelectContextTier={onSelectContextTier}
+          open={modelPickerOpen}
+          onOpenChange={onModelPickerOpenChange}
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
+        {onOpenFind && (
+          <IconButton
+            onClick={onOpenFind}
+            aria-label="会话内查找"
+            title="会话内查找 (⌘F)"
+            shape="square"
+          >
+            <Search size={18} />
+          </IconButton>
+        )}
         {onOpenInbox && (
           <div className="relative">
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
               <Bell size={18} />
             </IconButton>
-            <HeaderCountBadge count={unreadCount} />
+            <HeaderCountBadge count={unreadCount} tone="danger" />
           </div>
         )}
         {credits != null && (
@@ -224,13 +271,27 @@ export function ChatHeader({
   );
 }
 
-/** 顶栏角标：站内信与会话未读共用同一套尺寸/色。count 缺省或 ≤0 不占位。 */
-function HeaderCountBadge({ count, testId }: { count?: number; testId?: string }) {
+/** 顶栏角标：站内信 danger、会话未读 accent。count 缺省或 ≤0 不占位。 */
+function HeaderCountBadge({
+  count,
+  testId,
+  tone = "danger",
+  ariaLabel,
+}: {
+  count?: number;
+  testId?: string;
+  tone?: "danger" | "accent";
+  ariaLabel?: string;
+}) {
   if (!count || count <= 0) return null;
   return (
     <span
       data-testid={testId}
-      className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums"
+      aria-label={ariaLabel}
+      className={cn(
+        "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none text-white tabular-nums",
+        tone === "accent" ? "bg-accent" : "bg-danger",
+      )}
     >
       {count > 99 ? "99+" : count}
     </span>

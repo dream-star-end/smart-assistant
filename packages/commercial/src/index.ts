@@ -124,6 +124,7 @@ import {
   handleDesktopTokenRefresh,
   desktopTokenRequestContext,
 } from "./http/desktopEnroll.js";
+import { handleDesktopRuntimeManifest } from "./http/desktopBootstrap.js";
 import { startDesktopTlsListener, makeDesktopRequestVerifier } from "./http/desktopTlsListener.js";
 import { makeDesktopIdentityStrategy } from "./auth/desktopIdentity.js";
 import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
@@ -253,7 +254,7 @@ import type {
   StaticProviderId,
   StaticProviderKeys,
 } from "@openclaude/protocol";
-import { isGrokEngineModel } from "@openclaude/protocol";
+import { isGrokEngineModel, normalizeTurnErrorCode } from "@openclaude/protocol";
 import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
@@ -345,6 +346,8 @@ import {
   type PromptQueueHandler,
 } from "./http/internalPromptQueue.js";
 import { PgPromptQueueStore } from "./promptQueue/pgPromptQueueStore.js";
+import { LEASE_CALLBACK_PATH, LEASE_CALLBACK_VALIDATE_PATH, makeLeaseCallbackHandler } from "./http/internalLeaseCallback.js";
+import { lookupLeaseCallbackSession } from "./db/pgSessionsBackend.js";
 import {
   COST_EVENT_PATH,
   makeCostEventHandler,
@@ -605,7 +608,8 @@ import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
 import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
-import { makeApiKeyIdentityStrategy } from "./auth/apiKeyIdentity.js";
+import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
+import { makeExternalModelsHandler, type ExternalModelsHandler } from "./http/proxy/externalModels.js";
 import {
   createUserChatBridge,
   ContainerUnreadyError,
@@ -1341,6 +1345,39 @@ export async function registerCommercial(
   const recoveryDecisionBroadcastRef: {
     current: (userId: string, sessionId: string, decision: AutomaticRecoveryDecision) => void;
   } = { current: () => { /* bridge not assembled yet — browser converges via ack/history */ } };
+  const recordRecoveryJobTerminalFriction = (
+    userId: string,
+    sessionId: string,
+    info: {
+      rootClientMessageId: string;
+      errorCode: string;
+      semanticAttempt: number;
+      terminalStatus: "completed" | "paused";
+      pauseReason: string | null;
+    },
+  ): void => {
+    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+    if (!uidMatch) return;
+    const code = normalizeTurnErrorCode(info.errorCode);
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(code)) return;
+    void recordProductFrictionEvent({
+      correlation: `${sessionId}:${info.rootClientMessageId}`,
+      userId: BigInt(uidMatch[1]!),
+      surface: "recovery",
+      stage: "recovery_job",
+      code,
+      outcome: info.terminalStatus === "completed" ? "recovered" : "failed",
+      attempts: info.semanticAttempt,
+      path: "job_terminal",
+      reason: info.pauseReason ?? undefined,
+      sessionId,
+    }).catch((err: unknown) => {
+      rootLogger.warn("recovery_job_friction_failed", {
+        sessionId,
+        errorClass: err instanceof Error ? err.constructor.name : typeof err,
+      });
+    });
+  };
   // HTTP finalize (Phase A) nudges the leader-owned tape job scheduler so Phase B
   // (and therefore the recovery verdict above) runs now, not on the next 5s tick.
   // Non-leader masters keep the noop: the leader's interval still converges.
@@ -1355,6 +1392,8 @@ export async function registerCommercial(
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
+        onRecoveryJobTerminal: (userId, sessionId, info) =>
+          recordRecoveryJobTerminalFriction(userId, sessionId, info),
       });
       setClientSessionsBackend(pgSessionsBackend);
       losslessTurnTapeStorage = pgSessionsBackend;
@@ -2647,6 +2686,7 @@ export async function registerCommercial(
             messages: deskMessages,
             tokenMint: (req, res) => handleDesktopTokenMint(req, res, desktopTokenRequestContext(req), deskHttpDeps),
             tokenRefresh: (req, res) => handleDesktopTokenRefresh(req, res, desktopTokenRequestContext(req), deskHttpDeps),
+            runtimeManifest: (req, res) => handleDesktopRuntimeManifest(req, res, desktopTokenRequestContext(req), deskHttpDeps),
             serverAuthored: makeServerAuthoredHandler({
               identityRepo,
               verify: deskVerify,
@@ -2947,10 +2987,24 @@ export async function registerCommercial(
           leadership: currentLeadership(),
         });
       };
+      const leaseCallbackHandler = makeLeaseCallbackHandler({
+        secret: cfg.OC_LEASE_CALLBACK_SECRET,
+        lookupSession: (uid, sid) => lookupLeaseCallbackSession(getPool(), uid, sid),
+        inject: (input) => cronOriginBridgeRef
+          ? cronOriginBridgeRef.injectCronOriginTurn(input)
+          : Promise.resolve({ kind: "no_transport" as const }),
+      });
       // 请求 dispatcher 闭包(VIP+私有双 listener 与单 listener 共用)。
       const internalRequestHandler = (req: IncomingMessage, res: ServerResponse): void => {
         // P3 控制端点前置拦截(GET /healthz、GET /internal/v5/control-probe)。
         const urlPath = (req.url ?? "").split("?")[0];
+        if (urlPath === LEASE_CALLBACK_PATH || urlPath === LEASE_CALLBACK_VALIDATE_PATH) {
+          void leaseCallbackHandler(req, res, urlPath === LEASE_CALLBACK_VALIDATE_PATH).catch(() => {
+            if (!res.headersSent) res.statusCode = 503;
+            res.end();
+          });
+          return;
+        }
         if (req.method === "GET" && urlPath === "/healthz") {
           try { respondControlHealthz(res); } catch { /* socket gone */ }
           return;
@@ -3086,6 +3140,8 @@ export async function registerCommercial(
   // 见 undefined 走 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404(部署故障不该伪装成
   // "用户 URL 写错")。
   let externalApiKeyProxy: AnthropicProxyHandler | undefined;
+  // 2026-09-07:`GET /api/anthropic/v1/models` 外接模型发现,与 proxy 同批装配。
+  let externalApiKeyModels: ExternalModelsHandler | undefined;
   // cursor-* 模型在 external API-key 路径上的服务端 Sand relay(本地 Claude Code 接入
   // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
   // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
@@ -3093,11 +3149,21 @@ export async function registerCommercial(
   if (!options.skipInternalProxy) {
     try {
       const apiKeyRepo = makePgApiKeyRepo(getPool());
-      const apiKeyStrategy = makeApiKeyIdentityStrategy({
+      const apiKeyIdentityDeps = {
         repo: apiKeyRepo,
         pricing,
         loadUserModelAuthz,
         logger: rootLogger.child({ subsys: "apiKeyIdentity" }),
+      };
+      const apiKeyStrategy = makeApiKeyIdentityStrategy(apiKeyIdentityDeps);
+      // 模型发现与 messages 共用同一条 key 判定链(格式/撤销/禁用/admin gate),
+      // 只是不做 UA 门控(桌面工具用自己的 HTTP 客户端拉列表)。
+      externalApiKeyModels = makeExternalModelsHandler({
+        resolveIdentity: (req) => resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        pricing,
+        loadUserModelAuthz,
+        ownedBy: "clarvy",
+        logger: rootLogger.child({ subsys: "externalModels" }),
       });
       // Phase 5 platform envelope rewriter wiring(2026-05-21)。
       // secret 缺失 → throw → 外层 catch 将 externalApiKeyProxy 置 undefined,
@@ -3146,7 +3212,7 @@ export async function registerCommercial(
       });
       // eslint-disable-next-line no-console
       console.log(
-        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages, cursor-* via sand relay)",
+        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models, engine models via relay)",
       );
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -3155,6 +3221,7 @@ export async function registerCommercial(
         err,
       );
       externalApiKeyProxy = undefined;
+      externalApiKeyModels = undefined;
       const stale = cursorExternalRoute;
       cursorExternalRoute = undefined;
       void stale?.close().catch(() => undefined);
@@ -4124,6 +4191,7 @@ export async function registerCommercial(
     // V3 CC 外接 plan Phase 3:公网 `POST /api/anthropic/v1/messages` 的 handler
     // 实例。undefined 时 router 该路径返 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404。
     externalApiKeyProxy,
+    externalApiKeyModels,
   });
 
   // legacy /ws/agent(T-52 老 agent runtime WS 入口)已删除;v5 一律走 /ws/user-chat-bridge。
@@ -5668,6 +5736,27 @@ export async function registerCommercial(
     // Session owners are `c:<uid>`; personal/test namespaces have no bridge user.
     const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
     if (!uidMatch) return;
+    const uid = uidMatch[1]!;
+    const code = normalizeTurnErrorCode(verdict.errorCode);
+    if (/^[A-Za-z0-9_]{1,64}$/.test(code)) {
+      void recordProductFrictionEvent({
+        correlation: `${sessionId}:${verdict.sourceClientMessageId}`,
+        userId: BigInt(uid),
+        surface: "recovery",
+        stage: "recovery_decision",
+        code,
+        outcome: verdict.scheduled ? "pending" : "failed",
+        attempts: verdict.scheduled ? verdict.attempt : undefined,
+        path: "decision",
+        reason: verdict.scheduled ? undefined : verdict.reason,
+        sessionId,
+      }).catch((err: unknown) => {
+        rootLogger.warn("recovery_decision_friction_failed", {
+          sessionId,
+          errorClass: err instanceof Error ? err.constructor.name : typeof err,
+        });
+      });
+    }
     const payload = {
       type: "sys.recovery_decision",
       peer: { id: sessionId, kind: "dm" },
@@ -5677,10 +5766,10 @@ export async function registerCommercial(
     // Phase B runs on the leader slot only; the user's WS may live on the
     // other slot. Same dual-master fan-out as outbound.cost_charged.
     if (dualMasterEnabled) {
-      void slotRelayClient.broadcastToUsers([uidMatch[1]!], payload).catch(() => undefined);
+      void slotRelayClient.broadcastToUsers([uid], payload).catch(() => undefined);
       return;
     }
-    userChatBridge.broadcastToUser(BigInt(uidMatch[1]!), payload);
+    userChatBridge.broadcastToUser(BigInt(uid), payload);
   };
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
@@ -6017,6 +6106,8 @@ export async function registerCommercial(
           // verdict sideband must be wired on this instance too.
           onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
             recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
+          onRecoveryJobTerminal: (userId, sessionId, info) =>
+            recordRecoveryJobTerminalFriction(userId, sessionId, info),
         });
         const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS);
         const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000;
@@ -6178,6 +6269,8 @@ export async function registerCommercial(
           // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
           // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
           // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
+          recordFriction: (event: Parameters<typeof recordProductFrictionEvent>[0]) =>
+            recordProductFrictionEvent(event),
           nudgeClient: (
             uid: bigint,
             sessionId: string,

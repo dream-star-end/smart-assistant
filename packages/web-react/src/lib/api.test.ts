@@ -1326,3 +1326,24 @@ test('uploadFile honors Retry-After seconds and clamps to [1, 10]', async () => 
   await expect(pendingClamp).resolves.toMatchObject({ url: '/api/media/clamped.txt' })
   expect(clampMock).toHaveBeenCalledTimes(2)
 })
+
+
+test('confirmDesktopEnroll posts enrollment_id and drops code from the caller result', async () => {
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    expect(String(url)).toBe('/api/desktop/enroll/confirm')
+    expect(init?.method).toBe('POST')
+    const body = JSON.parse(String(init?.body))
+    expect(body).toEqual({ enrollment_id: '550e8400-e29b-41d4-a716-446655440000' })
+    return ok({
+      enrollment_id: '550e8400-e29b-41d4-a716-446655440000',
+      code: 'c'.repeat(64),
+      deep_link: 'openclaude://enroll/callback?enrollment_id=550e8400-e29b-41d4-a716-446655440000&code=' + 'c'.repeat(64),
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-enroll')
+  const result = await api.confirmDesktopEnroll(session, '550e8400-e29b-41d4-a716-446655440000')
+  expect(result.enrollmentId).toBe('550e8400-e29b-41d4-a716-446655440000')
+  expect(result.deepLink?.startsWith('openclaude://enroll/callback?')).toBe(true)
+  expect(result).not.toHaveProperty('code')
+})

@@ -1597,19 +1597,67 @@ egress_slot_flip() {
     return 1
   fi
   egress_wait_shared_port || return 1
-  # 新槽已接管共享口 → 摘旧槽。socket 与 service 一起 stop:只停 service 会留下一个
+  # 新槽已接管共享口 → 摘旧槽。socket 与 service 都要停:只停 service 会留下一个
   # 没人 accept 的 listener(systemd 会按需再拉起),连接会卡在它的 backlog 里。
-  # --no-block:旧槽 drain 自己的在飞流(≤31min),不阻塞发布。
+  #
+  # 2026-09-07 实发(tr-…081722Z / tr-…091334Z 两班 `cutover smoke: egress-health 失败`):
+  # `systemctl stop --no-block old.socket old.service` 一条命令下去,service 有
+  # Requires=socket,systemd 把 socket 的 stop job **排在 service stop 之后**;service 收到
+  # SIGTERM 后 server.close() 摘掉自己的 fd,但 .socket 单元在 service 整个 drain 期间
+  # (≤31min)仍持有同一 reuseport 组里的 listener → 内核继续按哈希把约一半新连接分给这个
+  # 没人 accept 的 fd(ss 里 users:(("systemd",pid=1)) 独占、Recv-Q 递增),连接卡到超时。
+  # 沙箱复现:drain 期 12 次探活 5 成功 7 超时;先关 socket 再停 service 则 12/12。
+  # 所以必须**先阻塞关旧 .socket**(--job-mode=ignore-dependencies 绕开 Requires 反向传播,
+  # 关 socket 是毫秒级、不等 drain),再 --no-block 停 service 让它只 drain 在飞流。
   if [[ -n "$cur" ]]; then
     old_sock="$(egress_slot_unit "$cur" socket)"
     old_svc="$(egress_slot_unit "$cur" service)"
-    echo "  egress: 新槽 $target 就绪,stop --no-block 旧槽 $cur(后台 drain)" >&2
-    systemctl stop --no-block "$old_sock" "$old_svc" || return 1
+    echo "  egress: 新槽 $target 就绪,先关旧槽 $cur 的共享 listener(.socket),再 stop --no-block 其 service(后台 drain)" >&2
+    systemctl stop --job-mode=ignore-dependencies "$old_sock" || return 1
+    systemctl stop --no-block "$old_svc" || return 1
     systemctl disable "$old_sock" "$old_svc" >/dev/null 2>&1 || true
   fi
   systemctl enable "$new_sock" "$new_svc" >/dev/null 2>&1 || true
-  # 旧槽 close() 后共享口必须仍可连(reuseport 组里还有新槽)。
-  egress_wait_shared_port
+  # 旧槽 close() 后共享口必须仍可连(reuseport 组里还有新槽),且 reuseport 组里不得再有
+  # 只由 systemd 持有(无 service 进程 accept)的孤儿 listener —— 那正是上面的黑洞形态。
+  egress_wait_shared_port || return 1
+  egress_assert_no_orphan_listener
+}
+
+# reuseport 组里「只有 systemd(pid 1)持有、没有任何 service 进程 accept」的 listener =
+# 黑洞:内核仍会把新连接哈希到它,永远没人 accept。翻转后必须为 0。
+# ss 非 0 / 空输出 / 无法解析的 listener 集合一律 fail-closed:不能先过滤再把
+# 「零孤儿」当成成功(OCV5-161:ss rc=2 或空表曾让 HTTP 重试在黑洞上假绿)。
+egress_assert_no_orphan_listener() {
+  local ss_out ss_rc=0 line listeners=0
+  ss_out="$(ss -Hltnp "sport = :${V5_EGRESS_PORT}" 2>/dev/null)" || ss_rc=$?
+  if (( ss_rc != 0 )); then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 失败 rc=${ss_rc},无法证明无孤儿 listener" >&2
+    return 1
+  fi
+  if [[ -z "${ss_out//[$' \t\r\n']/}" ]]; then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 输出为空,无法证明无孤儿 listener" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[$' \t\r']/}" ]] && continue
+    if ! grep -q '^LISTEN' <<<"$line" || ! grep -Eq ":${V5_EGRESS_PORT}([[:space:]]|$)" <<<"$line"; then
+      echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 输出不是有效 listener 集合" >&2
+      printf '%s\n' "$ss_out" >&2
+      return 1
+    fi
+    if ! grep -Eq 'users:\((\([^)]*\),)*\("node",pid=[0-9]+' <<<"$line"; then
+      echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 存在无 node 持有者的 listener" >&2
+      ss -ltnp "sport = :${V5_EGRESS_PORT}" >&2 || true
+      return 1
+    fi
+    listeners=$((listeners + 1))
+  done <<<"$ss_out"
+  if (( listeners < 1 )); then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 未解析出有效 listener,无法证明无孤儿" >&2
+    return 1
+  fi
+  return 0
 }
 
 egress_slot_flip_then_master_restart() {
@@ -1976,10 +2024,17 @@ cutover_smoke_against_release() { # <rel>
   [[ "$got_build" == "$expected_build" ]] \
     || { cutover_fail "cutover smoke: GET / oc-build=$got_build 不等于 release dist $expected_build"; return 1; }
   cutover_clog "  ✓ GET / oc-build=$got_build 匹配 release dist"
-  local eg
-  eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
-  echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1 \
-    || { cutover_fail "cutover smoke: egress-health 失败"; return 1; }
+  # egress-health:5 次 × 2s 有界重试。单次 curl 丢一条连接就否掉整班 20 分钟的列车
+  # 不成比例;真缺陷(孤儿 listener 黑洞)由 egress_slot_flip 末尾的
+  # egress_assert_no_orphan_listener 与下面的双槽拓扑断言兜住,这里的重试不会把它盖掉。
+  local eg eg_ok=0
+  for i in $(seq 1 5); do
+    eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
+    if echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1; then eg_ok=1; break; fi
+    cutover_clog "  egress-health 未通,重试 $i/5"
+    sleep 2
+  done
+  [[ "$eg_ok" == 1 ]] || { cutover_fail "cutover smoke: egress-health 失败"; return 1; }
   cutover_clog "  ✓ egress-health ok (slot=$(echo "$eg" | jq -r '.slot // "legacy"') mode=$(echo "$eg" | jq -r '.listenMode // "self_bind"') serving=$(egress_describe_topology))"
   # 双槽下额外要求:恰有一个槽 active(翻转后旧槽 deactivating 不算 active)且共享口
   # 应答就来自它 —— 防「新槽私有口绿、共享口仍全由旧槽应答」的假绿。

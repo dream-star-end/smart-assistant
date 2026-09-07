@@ -46,11 +46,34 @@ function normalizeCommand(value) {
   return Object.freeze({ type: value.type })
 }
 
+const APPROVAL_PENDING_CHANNEL = 'approval:pending'
+
 const api = Object.freeze({
   invoke(payload) {
     const normalized = normalizeCommand(payload)
     if (!normalized) throw new TypeError('Unsupported Clarvy local-host command')
     return ipcRenderer.invoke(LOCAL_HOST_CHANNEL, normalized)
+  },
+  onApprovalPending(listener) {
+    if (typeof listener !== 'function') return () => {}
+    const wrapped = (_event, payload) => {
+      if (!payload || typeof payload !== 'object') return
+      if (typeof payload.opId !== 'string' || payload.opId.length === 0) return
+      const summary = payload.summary && typeof payload.summary === 'object' ? payload.summary : {}
+      listener(
+        Object.freeze({
+          opId: payload.opId,
+          summary: Object.freeze({
+            tool: typeof summary.tool === 'string' ? summary.tool : '',
+            command: typeof summary.command === 'string' ? summary.command : '',
+            workspaceRoot: typeof summary.workspaceRoot === 'string' ? summary.workspaceRoot : '',
+          }),
+          deadlineAt: typeof payload.deadlineAt === 'number' ? payload.deadlineAt : 0,
+        }),
+      )
+    }
+    ipcRenderer.on(APPROVAL_PENDING_CHANNEL, wrapped)
+    return () => ipcRenderer.removeListener(APPROVAL_PENDING_CHANNEL, wrapped)
   },
 })
 

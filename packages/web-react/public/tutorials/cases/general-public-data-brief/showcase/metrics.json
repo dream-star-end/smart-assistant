@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "caseId": "general-public-data-brief",
+  "dataYear": 2022,
+  "source": "World Bank World Development Indicators",
+  "indicators": {
+    "population": {
+      "indicator": "SP.POP.TOTL",
+      "label": "人口",
+      "unit": "人",
+      "lastUpdated": "2026-07-13",
+      "records": 3,
+      "url": "https://api.worldbank.org/v2/country/IDN;PHL;VNM/indicator/SP.POP.TOTL?date=2022&format=json&per_page=100"
+    },
+    "gdp": {
+      "indicator": "NY.GDP.PCAP.CD",
+      "label": "人均 GDP",
+      "unit": "当年美元 / 人",
+      "lastUpdated": "2026-07-13",
+      "records": 3,
+      "url": "https://api.worldbank.org/v2/country/IDN;PHL;VNM/indicator/NY.GDP.PCAP.CD?date=2022&format=json&per_page=100"
+    },
+    "internet": {
+      "indicator": "IT.NET.USER.ZS",
+      "label": "互联网使用率",
+      "unit": "%",
+      "lastUpdated": "2026-07-13",
+      "records": 3,
+      "url": "https://api.worldbank.org/v2/country/IDN;PHL;VNM/indicator/IT.NET.USER.ZS?date=2022&format=json&per_page=100"
+    }
+  },
+  "countries": [
+    {
+      "country_code": "IDN",
+      "country": "印度尼西亚",
+      "year": 2022,
+      "population": 278830529,
+      "gdp": 4730.83484836107,
+      "internet": 66.48461277,
+      "internet_users_estimate": 185379397.49019256
+    },
+    {
+      "country_code": "PHL",
+      "country": "菲律宾",
+      "year": 2022,
+      "population": 113964338,
+      "gdp": 3548.06930572116,
+      "internet": 75.21114422,
+      "internet_users_estimate": 85713882.61254826
+    },
+    {
+      "country_code": "VNM",
+      "country": "越南",
+      "year": 2022,
+      "population": 99680655,
+      "gdp": 4147.69777213621,
+      "internet": 78.58999918,
+      "internet_users_estimate": 78339025.94711864
+    }
+  ],
+  "summary": {
+    "population": 492475522,
+    "internetUsersEstimate": 349432306.04985946,
+    "estimateCountryCount": 3,
+    "populationWeightedInternetRate": 70.95424857478693
+  },
+  "dataQuality": {
+    "sourceObservations": 9,
+    "joinedCountryYearRows": 3,
+    "missingIndicatorCells": 0,
+    "completeCountryYearRows": 3,
+    "duplicateKeys": 0,
+    "imputedCells": 0
+  },
+  "definitions": {
+    "internetUsersEstimate": "人口×互联网使用率/100；派生近似量，不是独立官方统计或可触达客户数。",
+    "populationWeightedInternetRate": "人口与联网率均有效国家的估算联网人数之和 / 相同国家人口之和 ×100。",
+    "gdp": "当年美元口径，不是PPP、人均收入或个人可支配收入。",
+    "null": "缺失保留null，CSV为空；不插补、不按零值排名。"
+  }
+}

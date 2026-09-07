@@ -21,8 +21,6 @@ WORKER_LOG_DIR="${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}"
 DEPLOY_BIN="${OC_V5_LEASE_DEPLOY_BIN:-$LEASE_REPO_ROOT/scripts/deploy-v5-selfhost.sh}"
 TASK_CLI="${OC_V5_LEASE_TASK_CLI:-}"            # 面板 CLI;空 → 自动探测 oc-task,再退到 docker exec 用户容器
 TASK_CONTAINER_FMT="${OC_V5_LEASE_TASK_CONTAINER_FMT:-oc-v5-u%s}"   # printf 格式,%s = owner_uid
-CALLBACK_URL="${OC_V5_LEASE_CALLBACK_URL:-}"    # P2:http://127.0.0.1:18790/internal/v3/lease-callback
-CALLBACK_SECRET_FILE="${OC_V5_LEASE_CALLBACK_SECRET_FILE:-/etc/openclaude/commercial-v5-selfhost.env}"
 DRY="${OC_V5_LEASE_DRY:-0}"
 RESOURCE="deploy:selfhost"
 ACTOR="worker:$$"
@@ -335,8 +333,11 @@ deliver_outbox() {
     [[ -n "$id" ]] || continue
     IFS=$'\t' read -r tid kind tkind target attempts < <(lease_sql -separator $'\t' "SELECT transport_id,kind,target_kind,target,attempts FROM outbox WHERE id='$(lease_q "$id")';")
     body="$(lease_sql "SELECT body FROM outbox WHERE id='$(lease_q "$id")';")"
-    # 过 deadline → expired + 一次日志告警
+    # 会话投递截止：显式降级面板，给面板独立投递窗口；不能直接无声 expired。
     if [[ "$(lease_sql "SELECT CASE WHEN deadline < strftime('%Y-%m-%dT%H:%M:%SZ','now') THEN 1 ELSE 0 END FROM outbox WHERE id='$(lease_q "$id")';")" == 1 ]]; then
+      if [[ "$tkind" == session ]]; then
+        fallback_session "$id" "session callback deadline → ticket"; continue
+      fi
       lease_tx <<SQL || true
 BEGIN IMMEDIATE; UPDATE outbox SET status='expired', last_error='deadline' WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
@@ -344,18 +345,6 @@ SQL
     fi
     case "$tkind" in
       session)
-        if [[ -z "$CALLBACK_URL" ]]; then
-          # P1:会话通道未启用 → 降级到 ticket(有)或 log
-          local lid tk; lid="$(lease_sql "SELECT lease_id FROM outbox WHERE id='$(lease_q "$id")';")"
-          tk="$(lease_field "$lid" ticket_ref)"
-          if [[ -n "$tk" ]]; then
-            lease_tx <<SQL || true
-BEGIN IMMEDIATE; UPDATE outbox SET target_kind='ticket', target='$(lease_q "$tk")', last_error='session channel disabled (P1) → ticket' WHERE id='$(lease_q "$id")'; COMMIT;
-SQL
-            continue
-          fi
-          mark_delivered_log "$id" "$body"; continue
-        fi
         deliver_session "$id" "$tid" "$target" "$body" "$attempts" ;;
       ticket) deliver_ticket "$id" "$tid" "$target" "$body" "$attempts" ;;
       log) mark_delivered_log "$id" "$body" ;;
@@ -389,13 +378,13 @@ deliver_ticket() { # <id> <tid> <ticket> <body> <attempts>
   existing="$(task_cli "$uid" ticket get "$ticket" 2>/dev/null || true)"
   if [[ "$existing" == *"lease-outbox $tid"* ]]; then
     lease_tx <<SQL || true
-BEGIN IMMEDIATE; UPDATE outbox SET status='delivered', delivered_at='$(lease_now)', last_error='already-present' WHERE id='$(lease_q "$id")'; COMMIT;
+BEGIN IMMEDIATE; UPDATE outbox SET status=CASE WHEN EXISTS (SELECT 1 FROM lease l WHERE l.id=outbox.lease_id AND l.callback_session_key IS NOT NULL) THEN 'fallback_ticket' ELSE 'delivered' END, delivered_at='$(lease_now)' WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
     wlog "outbox $id 面板已有同 transport_id 评论,标记 delivered"; return
   fi
   if out="$(task_cli "$uid" ticket comment "$ticket" --body "$marked" 2>&1)"; then
     lease_tx <<SQL || true
-BEGIN IMMEDIATE; UPDATE outbox SET status='delivered', delivered_at='$(lease_now)', attempts=attempts+1 WHERE id='$(lease_q "$id")'; COMMIT;
+BEGIN IMMEDIATE; UPDATE outbox SET status=CASE WHEN EXISTS (SELECT 1 FROM lease l WHERE l.id=outbox.lease_id AND l.callback_session_key IS NOT NULL) THEN 'fallback_ticket' ELSE 'delivered' END, delivered_at='$(lease_now)', attempts=attempts+1 WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
     wlog "outbox $id → ticket $ticket delivered"
   else
@@ -407,12 +396,9 @@ deliver_session() { # <id> <tid> <session_key> <body> <attempts>   (P2)
   local id="$1" tid="$2" sk="$3" body="$4" attempts="$5" lid uid agent sid secret code resp
   lid="$(lease_sql "SELECT lease_id FROM outbox WHERE id='$(lease_q "$id")';")"
   uid="$(lease_field "$lid" owner_uid)"; agent="${sk#agent:}"; agent="${agent%%:*}"; sid="${sk##*:}"
-  secret="$(sed -n 's/^OC_LEASE_CALLBACK_SECRET=//p' "$CALLBACK_SECRET_FILE" 2>/dev/null | head -1 | tr -d '"')"
-  [[ -n "$secret" ]] || { retry_later "$id" "$attempts" "缺 OC_LEASE_CALLBACK_SECRET"; return; }
-  resp="$(jq -cn --arg uid "$uid" --arg sid "$sid" --arg agent "$agent" --arg cmid "$tid" --arg text "$body" \
-          '{uid:$uid,sessionId:$sid,agentId:$agent,clientMessageId:$cmid,text:$text}' \
-        | curl -sS -m 20 -H "Content-Type: application/json" -H "X-OC-Lease-Secret: $secret" \
-            -w '\n%{http_code}' --data-binary @- "$CALLBACK_URL" 2>&1)" || { retry_later "$id" "$attempts" "curl: ${resp:0:200}"; return; }
+  local payload
+  payload="$(jq -cn --arg uid "$uid" --arg sid "$sid" --arg agent "$agent" --arg cmid "$tid" --arg text "$body" '{uid:$uid,sessionId:$sid,agentId:$agent,clientMessageId:$cmid,text:$text}')"
+  resp="$(lease_callback_post "" "$payload" 2>&1)" || { retry_later "$id" "$attempts" "callback: ${resp:0:200}"; return; }
   code="${resp##*$'\n'}"; resp="${resp%$'\n'*}"
   local kind; kind="$(printf '%s' "$resp" | jq -r '.kind // empty' 2>/dev/null || true)"
   case "$code:$kind" in
@@ -421,27 +407,45 @@ deliver_session() { # <id> <tid> <session_key> <body> <attempts>   (P2)
 BEGIN IMMEDIATE; UPDATE outbox SET status='delivered', delivered_at='$(lease_now)', attempts=attempts+1 WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
       wlog "outbox $id → session $sid injected" ;;
-    200:in_flight|409:*)
+    200:in_flight)
       # 会话在飞:不计 attempts,60s 后再试,直到 deadline
       lease_tx <<SQL || true
 BEGIN IMMEDIATE; UPDATE outbox SET next_attempt_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+60 seconds'), last_error='in_flight' WHERE id='$(lease_q "$id")'; COMMIT;
 SQL
       ;;
-    200:gone|404:*|410:*)
-      local tk; tk="$(lease_field "$lid" ticket_ref)"
-      if [[ -n "$tk" ]]; then
-        lease_tx <<SQL || true
-BEGIN IMMEDIATE; UPDATE outbox SET target_kind='ticket', target='$(lease_q "$tk")', status='pending', last_error='session gone → ticket', next_attempt_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$(lease_q "$id")'; COMMIT;
-SQL
-        wlog "outbox $id 会话已消失 → 转 ticket $tk"
-      else
-        lease_tx <<SQL || true
-BEGIN IMMEDIATE; UPDATE outbox SET status='fallback_ticket', last_error='session gone, no ticket' WHERE id='$(lease_q "$id")'; COMMIT;
-SQL
-        wlog "outbox $id 会话已消失且无 ticket,正文↓"; printf '%s\n' "$body" | sed 's/^/    /'
-      fi ;;
+    200:gone)
+      fallback_session "$id" "session gone → ticket" ;;
     *) retry_later "$id" "$attempts" "http=$code kind=${kind:-?} ${resp:0:160}" ;;
   esac
+}
+
+
+fallback_session() { # <outbox id> <reason> — retain transport id, never inject twice
+  local id="$1" reason="$2" lid tk body previous
+  lid="$(lease_sql "SELECT lease_id FROM outbox WHERE id='$(lease_q "$id")';")"
+  tk="$(lease_field "$lid" ticket_ref)"
+  previous="$(lease_sql "SELECT last_error FROM outbox WHERE id='$(lease_q "$id")';")"
+  body="$(lease_sql "SELECT body FROM outbox WHERE id='$(lease_q "$id")';")"
+  body="$(printf '⚠ 原会话未确认唤醒：%s%s。此评论不代表会话已通知。\n\n%s' "$reason" "${previous:+ (此前: $previous)}" "$body")"
+  if [[ -n "$tk" ]]; then
+    lease_tx <<SQL || return
+BEGIN IMMEDIATE;
+UPDATE outbox SET target_kind='ticket',target='$(lease_q "$tk")',body='$(lease_q "$body")',
+ last_error='$(lease_q "$reason${previous:+; $previous}")',attempts=0,
+ next_attempt_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+ deadline=strftime('%Y-%m-%dT%H:%M:%SZ','now','+${LEASE_NOTIFY_DEADLINE_SECONDS} seconds')
+ WHERE id='$(lease_q "$id")' AND status='pending';
+COMMIT;
+SQL
+    wlog "outbox $id 原会话未确认唤醒 → ticket $tk"
+  else
+    lease_tx <<SQL || return
+BEGIN IMMEDIATE;
+UPDATE outbox SET status='expired',last_error='$(lease_q "$reason; no ticket")' WHERE id='$(lease_q "$id")';
+COMMIT;
+SQL
+    wlog "outbox $id 原会话未确认唤醒且无 ticket"; printf '%s\n' "$body"
+  fi
 }
 
 retry_later() { # <id> <attempts> <err>
@@ -466,4 +470,4 @@ main() {
   dispatch_train
   deliver_outbox
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

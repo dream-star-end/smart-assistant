@@ -187,3 +187,51 @@ describe('PreferencesTab · Auto-Dream', () => {
     expect(screen.queryByText(/模型当前不可用/)).not.toBeInTheDocument()
   })
 })
+
+describe('PreferencesTab · 快捷键只读表', () => {
+  test('hotkeys pane 渲染内置说明且没有可编辑 input', () => {
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{}}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+        pane="hotkeys"
+      />,
+    )
+    expect(screen.getByText('搜索会话')).toBeInTheDocument()
+    expect(screen.getByText('新建会话')).toBeInTheDocument()
+    expect(screen.getByText('停止生成（生成中）')).toBeInTheDocument()
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('动作名')).not.toBeInTheDocument()
+  })
+})
+
+describe('PreferencesTab · 输入分区', () => {
+  test('偏好首屏渲染「输入」分区与本设备说明', async () => {
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{}}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    )
+    expect(await screen.findByText('输入')).toBeInTheDocument()
+    expect(screen.getByText('仅本设备生效')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Enter 发送' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '⌘+Enter 发送' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '默认' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '大' })).toBeInTheDocument()
+  })
+})

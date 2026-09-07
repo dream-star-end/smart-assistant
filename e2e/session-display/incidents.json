@@ -3130,6 +3130,38 @@
       ]
     },
     {
+      "id": "INC-20260907-PROCESS-CARD-BEFORE-USER",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "V5 selfhost 会话里子任务卡与 AskUserQuestion 问答卡渲染在所属用户消息之前（截图会话 webmtqnrb61nes60h：第一条 user=_orderSeq=1，Agent「审读回到底部按钮与几何影响」属后续 m-recover 轮）。根因：stableSortByTs 对无 _orderSeq 的本地过程卡从 anchor=0 起排且不看 _turnOwnerId；repairPostFinalProcessOrder 只把终答之后的过程卡拉回终答前，不修「早于所属 user」；sinkOpenPermissionPrompts 按数组 user 边界冲刷，会把前置孤卡留在第一个 user 前。坏序一旦进缓存，full/incremental/restore 都不自愈。 冷启动原点已红绿复现：正确内存中的 user 被标 _timelineRecord，toStored 剥离 user 但保留本地卡；loadStored 后 full merge 从 carry=0 开始，把卡放到 user 前。最终修复还覆盖明确 owner 缺页不挪位、晚到问答不丢行。",
+      "rootFixCommit": "072b2d6f",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/order.test.ts",
+          "assertion": "stableSort-shaped poison [g,q,u,a] self-heals so cards are not before the owner user"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "stableSortByTs then repair self-heals cards sitting before the owner user (INC-20260907-PROCESS-CARD-BEFORE-USER)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且 MessageList 红绿对照"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/directTimeline.test.ts",
+          "assertion": "cold cache reload restores owner bounds after toStored strips timeline users"
+        }
+      ],
+      "coverageCommits": [
+        "8317d48c"
+      ]
+    },
+    {
       "id": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL",
       "occurredAt": "2026-09-06",
       "severity": "P1",
@@ -3145,6 +3177,54 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260907-MEDIA-CURSOR-PRECISION",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "媒体任务及项目历史分页将 PostgreSQL 微秒时间经 JS Date 截到毫秒，keyset 边界跳过同毫秒更旧记录；CI pr-3 出现第二页1条而非2条。游标保留原始PG微秒，DTO及排序不变。 真实 SQL 行为由29项integration验证；部署源码门只证明防回退，不冒称端到端或上线。",
+      "rootFixCommit": "5636f8c5",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/mediaGeneration.integ.test.ts",
+          "assertion": "${kind} history preserves ${precision} across every page boundary"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof."
+        }
+      ]
+    },
+    {
+      "id": "INC-20260907-DELEGATE-LEDGER-REAP",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "V5 selfhost 委派账本 delegate_jobs 终态行在 2h TTL 被 sweep() 物理 DELETE，审计窗仅 ~2h 且反向偏置（卡住回调的行反而留下）；running 行唯一活性判据是 owner_lease_until，kind=cron 行 claimQueued 后无任何心跳，boot reconciler 在 session 仍挂 runner 时无限 defer，实测 dlgjob-mtqapydx（cron-origin-inject）idle 7.3h 不收口。修复：终态行软退休 retired_at + 7d/5000 行取宽剪枝、运行时读全部过滤 retired_at IS NULL、idempotency 部分唯一索引；新增 heartbeat-timeout reaper（30min，走 fail() 终态路径，failure_class=heartbeat_timeout，reap 后 interrupt 子会话）；cron 行在 claim→settle 之间挂 15s 定时心跳（协议事件不是心跳，tool_use_detected 不进 onEvent）。真实 SQLite 行为与真定时器心跳由 delegateDurable 单测验证；部署源码门只证明防回退，不冒称端到端或上线。",
+      "rootFixCommit": "35ff8fd8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateDurable.test.ts",
+          "assertion": "retires terminal rows at TTL instead of deleting, keeping 7d of history"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateDurable.test.ts",
+          "assertion": "reaps a running row idle past the heartbeat timeout; 29min is left alone"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateDurable.test.ts",
+          "assertion": "keeps a silent occurrence alive, and stops protecting it once halted"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof."
         }
       ]
     }

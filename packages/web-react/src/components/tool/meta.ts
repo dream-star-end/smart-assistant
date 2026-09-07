@@ -540,6 +540,11 @@ function delegateTasksSummary(input: Record<string, unknown>): string {
   return firstGoal ? `${head}: ${firstGoal.slice(0, 40)}` : head;
 }
 
+/** 折叠表头单行截断：超出 max 字加省略号。 */
+function clipOneLine(text: string, max = 40): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
 /** 工具卡 header 行的紧凑摘要（文件路径 / 命令 / 查询等）。 */
 export function toolSummary(name: string, input: Record<string, unknown> | null): string {
   if (!input) return "";
@@ -557,24 +562,32 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       // oc-* CLI 只展示解析后的动作/对象，不回显原始 shell 命令及 params。
       const cli = detectOcCli(cmd);
       if (cli) return ocCommandSummary(cli as OcCli, cmd);
-      return (asStr(input.description) || cmd.split("\n")[0]).slice(0, 60);
+      return clipOneLine(asStr(input.description) || cmd.split("\n")[0]);
     }
     case "Edit":
       return shortPath(input.file_path);
-    case "Read":
-      return shortPath(input.file_path);
+    case "Read": {
+      const path = shortPath(input.file_path);
+      return path ? `读取 ${path}` : "";
+    }
     case "Write":
       return shortPath(input.file_path);
-    case "Grep":
-      return `/${asStr(input.pattern)}/`;
-    case "Glob":
-      return asStr(input.pattern);
+    case "Grep": {
+      const q = asStr(input.pattern);
+      return q ? `搜索 "${q}"` : "";
+    }
+    case "Glob": {
+      const q = asStr(input.pattern);
+      return q ? `搜索 ${q}` : "";
+    }
     case "WebFetch":
       return asStr(input.url).slice(0, 60);
     case "WebSearch":
     case "McpSearch":
-    case "search_tool":
-      return asStr(input.query).slice(0, 60);
+    case "search_tool": {
+      const q = asStr(input.query);
+      return q ? `搜索 "${clipOneLine(q, 60)}"` : "";
+    }
     case "SearchExtraTools":
       return searchExtraToolsQuery(input).slice(0, 60);
     case "ExecuteExtraTool":

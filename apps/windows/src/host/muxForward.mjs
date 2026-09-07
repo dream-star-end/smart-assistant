@@ -155,14 +155,16 @@ export function createMuxHttpForwarder({
     })
     ws.on('open', () => {})
     ws.on('message', (data, isBinary) => {
+      let forward = true
       try {
-        onGatewayFrame?.(data, isBinary, {
+        const decision = onGatewayFrame?.(data, isBinary, {
           sendJson(frame) {
             ws.send(1, Buffer.from(JSON.stringify(frame)))
           },
         })
+        if (decision === false) forward = false
       } catch { /* */ }
-      session.sendData(isBinary ? 2 : 1, data)
+      if (forward) session.sendData(isBinary ? 2 : 1, data)
     })
     ws.on('close', (code, reason) => {
       session.sendClose(code || 1000, reason || '')

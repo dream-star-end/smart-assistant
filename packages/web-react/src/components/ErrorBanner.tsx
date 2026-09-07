@@ -12,10 +12,12 @@ export function ErrorBanner({
   error,
   onRetry,
   onDismiss,
+  onSwitchModel,
 }: {
   error: ChatError;
   onRetry: () => void;
   onDismiss: () => void;
+  onSwitchModel?: () => void;
 }) {
   return (
     <div
@@ -43,6 +45,17 @@ export function ErrorBanner({
         >
           <RotateCcw size={13} /> 重试
         </Button>
+        {onSwitchModel && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onSwitchModel}
+            aria-label="切换模型"
+            className="text-accent [@media(hover:none)]:h-11"
+          >
+            切换模型
+          </Button>
+        )}
         <IconButton
           variant="muted"
           size="sm"

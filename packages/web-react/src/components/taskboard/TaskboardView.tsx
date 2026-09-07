@@ -588,50 +588,65 @@ export function TaskboardView({
           className="order-3 flex w-full min-w-0 items-center gap-2 md:order-2 md:ml-auto md:w-auto"
         >
           <ProjectScopeSelect
+            id="taskboard-project-scope"
             variant="work"
             className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none"
           />
-          <ProjectSettings
-            auth={auth}
-            current={board.projects?.find((p) => p.id === board.projectId) ?? null}
-            onCreate={async (input) => {
-              const created = await board.createProject(input)
-              if (created) {
-                await projectScope.refreshWorkProjects()
-                projectScope.setToken(created.id)
-              }
-              return created
-            }}
-            onPatch={async (id, input) => {
-              const updated = await board.patchProject(id, input)
-              if (updated) await projectScope.refreshWorkProjects()
-              return updated
-            }}
-            onArchive={async (id) => {
-              const archived = await board.archiveProject(id)
-              if (archived) await projectScope.refreshWorkProjects()
-              return archived
-            }}
-            onUnarchive={async (id) => {
-              const restored = await board.unarchiveProject(id)
-              if (restored) await projectScope.refreshWorkProjects()
-              return Boolean(restored)
-            }}
-            compact={!desktop}
-          />
-          <StageSettings
-            auth={auth}
-            projectId={board.projectId}
-            onChanged={() => void board.reconcile()}
-            compact={!desktop}
-          />
-          <TemplateLibrary
-            auth={auth}
-            projectId={board.projectId}
-            onChanged={() => void board.reconcile()}
-            compact={!desktop}
-          />
-          <BoardSettingsPanel auth={auth} />
+          <div className="flex shrink-0 items-center gap-1">
+            <div className="flex flex-col items-center gap-0.5">
+              <ProjectSettings
+                auth={auth}
+                current={board.projects?.find((p) => p.id === board.projectId) ?? null}
+                onCreate={async (input) => {
+                  const created = await board.createProject(input)
+                  if (created) {
+                    await projectScope.refreshWorkProjects()
+                    projectScope.setToken(created.id)
+                  }
+                  return created
+                }}
+                onPatch={async (id, input) => {
+                  const updated = await board.patchProject(id, input)
+                  if (updated) await projectScope.refreshWorkProjects()
+                  return updated
+                }}
+                onArchive={async (id) => {
+                  const archived = await board.archiveProject(id)
+                  if (archived) await projectScope.refreshWorkProjects()
+                  return archived
+                }}
+                onUnarchive={async (id) => {
+                  const restored = await board.unarchiveProject(id)
+                  if (restored) await projectScope.refreshWorkProjects()
+                  return Boolean(restored)
+                }}
+                compact={!desktop}
+              />
+              {!desktop && <span className="text-[10px] leading-none text-faint">项目</span>}
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <StageSettings
+                auth={auth}
+                projectId={board.projectId}
+                onChanged={() => void board.reconcile()}
+                compact={!desktop}
+              />
+              {!desktop && <span className="text-[10px] leading-none text-faint">阶段</span>}
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <TemplateLibrary
+                auth={auth}
+                projectId={board.projectId}
+                onChanged={() => void board.reconcile()}
+                compact={!desktop}
+              />
+              {!desktop && <span className="text-[10px] leading-none text-faint">模板</span>}
+            </div>
+            <div className="flex flex-col items-center gap-0.5">
+              <BoardSettingsPanel auth={auth} />
+              {!desktop && <span className="text-[10px] leading-none text-faint">看板</span>}
+            </div>
+          </div>
         </div>
         <Button
           type="button"
@@ -721,8 +736,28 @@ export function TaskboardView({
       ) : !lockedProjectId ? (
         <EmptyState
           icon={Kanban}
-          title={UNBOUND_BOARD_COPY}
-          hint="任务看板按工作项目组织。请在上方选择一个具体的工作项目，或先把当前会话归入某个项目。"
+          title={'blocked' in workQuery ? workQuery.blocked : UNBOUND_BOARD_COPY}
+          hint={
+            projectScope.scope.kind === 'all'
+              ? '任务看板按工作项目组织。请在上方选择一个具体的工作项目。'
+              : projectScope.scope.kind === 'chat'
+                ? '当前会话项目还没有绑定看板。请在上方选择一个已绑定的工作项目。'
+                : '任务看板按工作项目组织。请在上方选择一个具体的工作项目，或先把当前会话归入某个项目。'
+          }
+          action={
+            projectScope.scope.kind === 'all' ? (
+              <Button
+                type="button"
+                onClick={() => {
+                  const el = document.getElementById('taskboard-project-scope')
+                  el?.scrollIntoView({ block: 'nearest' })
+                  el?.focus()
+                }}
+              >
+                选择工作项目
+              </Button>
+            ) : undefined
+          }
         />
       ) : !board.projectId || (lockedProjectId && board.projectId !== lockedProjectId && !board.board) ? (
         <EmptyState

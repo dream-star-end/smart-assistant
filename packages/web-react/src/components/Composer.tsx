@@ -7,6 +7,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
+import { clearDraft, readDraft, writeDraft } from "../lib/composerDraft";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -20,6 +21,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   IconButton,
+  iconButtonVariants,
   useToast,
 } from "./ui";
 
@@ -100,6 +102,11 @@ export function Composer({
   replyTo,
   onCancelReply,
   environmentPreparing,
+  sendKey = "enter",
+  fontSize = "default",
+  lastUserText,
+  draftKey,
+  goalOpenRequest,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -134,6 +141,16 @@ export function Composer({
   onCancelReply?: () => void;
   /** 容器冷启/未就绪：输入区展示「环境准备中，约 20 秒」进度条，避免静默等待。 */
   environmentPreparing?: boolean;
+  /** 发送快捷键：enter = Enter 发送（⌘+Enter 保持发送）；mod-enter = ⌘/Ctrl+Enter 发送。 */
+  sendKey?: "enter" | "mod-enter";
+  /** 输入框字号。large 时 17.5px。 */
+  fontSize?: "default" | "large";
+  /** 时间线最后一条用户正文；空输入框按 ↑ 填入。 */
+  lastUserText?: string;
+  /** 会话级草稿键；变化时若输入框为空则还原 sessionStorage 草稿。 */
+  draftKey?: string;
+  /** 外部请求打开目标对话框：nonce 变化即打开（与 prefill 同模式）。 */
+  goalOpenRequest?: number;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -152,21 +169,27 @@ export function Composer({
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   // 目标对话框开合:入口从会话头部迁至「+」菜单后,由 Composer 持有开合态(菜单项触发打开)。
   const [goalOpen, setGoalOpen] = useState(false);
+  useEffect(() => {
+    if (!goalOpenRequest) return;
+    setGoalOpen(true);
+  }, [goalOpenRequest]);
   // 「+」菜单受控开合:附件项须在 onSelect 里 preventDefault 阻止 Radix 同步关菜单
   // (卸载会杀掉 label 的原生激活,见附件项注释),菜单关闭改由我们在宏任务里手动触发。
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const dragDepthRef = useRef(0);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  // 附件 file input 的稳定 id：供「+」菜单里的 <label htmlFor> 原生激活(见下方附件项)。
+  // 附件 file input 的稳定 id：供工具条回形针 <label htmlFor> 原生激活。
   const fileInputId = useId();
   const idRef = useRef(0);
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
 
-  // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟(reload 会丢 useState 里的
-  // 草稿,composer 草稿当前不持久化)。ref 镜像 state 让探针零依赖渲染闭包。
+  // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟。正文草稿按 draftKey 写入
+  // sessionStorage,但附件/引用仍只在内存,reload 会丢。
   const draftBusyRef = useRef(false);
   draftBusyRef.current = value.trim().length > 0 || attachments.length > 0 || !!replyTo;
   useEffect(() => appUpdate.registerBusyProbe(() => draftBusyRef.current), []);
@@ -205,6 +228,20 @@ export function Composer({
     requestAnimationFrame(() => ref.current?.focus());
   }, [replyTo]);
 
+  useEffect(() => {
+    if (!draftKey) return;
+    setValue((current) => (current === "" ? readDraft(draftKey) : current));
+  }, [draftKey]);
+
+  useEffect(() => {
+    if (!draftKey) return;
+    const timer = window.setTimeout(() => {
+      if (value) writeDraft(draftKey, value);
+      else clearDraft(draftKey);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [draftKey, value]);
+
   const onVoiceText = useCallback((text: string) => {
     setVoiceMsg(null);
     setValue((v) => (v.trim() ? `${v.trim()} ${text}` : text));
@@ -233,11 +270,11 @@ export function Composer({
   // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
   const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading && !attachFailed;
 
-  // 「+」菜单可用项:附件(有 onUpload)与目标(有 onSetGoal+onGoalAction)。两者皆无时(如 demo)
-  // 退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
+  // 「+」菜单只保留目标(有 onSetGoal+onGoalAction)。附件已提到工具条一级回形针。
+  // 无目标时(如 demo)退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
   const canAttach = !!onUpload;
   const canGoal = !!onSetGoal && !!onGoalAction;
-  const hasPlusMenu = canAttach || canGoal;
+  const hasPlusMenu = canGoal;
   const visibleGoal = visibleGoalOf(goal);
 
   const removeAttach = useCallback(
@@ -258,6 +295,7 @@ export function Composer({
     if (disabled || !canSend) return;
     onSend(value.trim(), doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
     setValue("");
+    if (draftKey) clearDraft(draftKey);
     for (const a of attachments) revoke(a.previewUrl);
     setAttachments([]);
     onCancelReply?.();
@@ -312,6 +350,10 @@ export function Composer({
     }
   };
 
+  const canAcceptDrop = !disabled && !busy && !!onUpload;
+  const isFileDrag = (e: { dataTransfer: DataTransfer | null }) =>
+    Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
   const voiceStatus =
     voiceMsg != null ? (
       <span className="text-danger">{voiceMsg}</span>
@@ -347,7 +389,37 @@ export function Composer({
         className={cn(
           "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",
           "focus-within:border-border-strong",
+          dragActive && "ring-2 ring-ring",
         )}
+        onDragEnter={(e) => {
+          if (!isFileDrag(e) || !canAcceptDrop) return;
+          e.preventDefault();
+          dragDepthRef.current += 1;
+          setDragActive(true);
+        }}
+        onDragOver={(e) => {
+          if (!isFileDrag(e)) return;
+          e.preventDefault();
+          if (!canAcceptDrop) {
+            e.dataTransfer.dropEffect = "none";
+            return;
+          }
+          e.dataTransfer.dropEffect = "copy";
+          if (!dragActive) setDragActive(true);
+        }}
+        onDragLeave={(e) => {
+          if (!isFileDrag(e)) return;
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) setDragActive(false);
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          dragDepthRef.current = 0;
+          setDragActive(false);
+          if (!canAcceptDrop) return;
+          const files = Array.from(e.dataTransfer.files ?? []);
+          if (files.length > 0) void onFiles(files);
+        }}
       >
         {environmentPreparing && <EnvironmentPrepBar />}
         {replyTo && (
@@ -405,10 +477,11 @@ export function Composer({
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
-          {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合下方
+          {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
               <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
               合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
-              不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。 */}
+              不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。
+              禁止合成 input.click()。 */}
           <input
             data-product-feature={PRODUCT_CAPABILITIES.files.id}
             id={fileInputId}
@@ -417,14 +490,28 @@ export function Composer({
             multiple
             tabIndex={-1}
             className="sr-only"
-            // 菜单闭合时 htmlFor label 不在 DOM,可访问名退化为空;补 aria-label 供读屏。
             // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
             aria-label="选择附件文件"
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
-          {/* 「+」选项菜单:聚合附件上传与「设定目标」入口(目标入口由会话头部迁入)。
+          {canAttach && (
+            <label
+              htmlFor={fileInputId}
+              aria-label="添加附件"
+              title="添加附件"
+              data-product-feature={PRODUCT_CAPABILITIES.files.id}
+              className={cn(
+                iconButtonVariants({ shape: "square" }),
+                "mb-0.5 cursor-pointer",
+                disabled && "pointer-events-none opacity-50",
+              )}
+            >
+              <Paperclip size={18} />
+            </label>
+          )}
+          {/* 「+」选项菜单:仅「设定目标」(附件已提到一级回形针)。
               菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
-              无任何可用项时(demo)退化为禁用按钮,不弹空菜单。 */}
+              无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
           {hasPlusMenu ? (
             <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
               <DropdownMenuTrigger asChild>
@@ -451,29 +538,6 @@ export function Composer({
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" side="top">
-                {canAttach && (
-                  // 附件项渲染为原生 <label htmlFor>：点击/触摸经浏览器原生 label 激活直接打开
-                  // file input,不走合成 input.click()(国产内核/iOS Safari 会静默吞掉隐藏 input
-                  // 上的合成 click,实证 61de46e2/de16e2be)。
-                  // onSelect 必须 preventDefault:Radix 默认 select 会在受信点击的派发过程中同步
-                  // 关菜单卸载 Portal,而 label 的原生转发(post-dispatch activation)发生在派发
-                  // 完成之后——届时 label 已 detached,htmlFor 解析不到 input,选择器不弹
-                  // (真机 Chromium 实证 0 转发;jsdom fireEvent 是非受信事件不同步 flush,测不出)。
-                  // 菜单关闭改在宏任务里手动触发:排在原生激活之后,选择器已拉起,关菜单不影响。
-                  <DropdownMenuItem
-                    asChild
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      setTimeout(() => setPlusMenuOpen(false), 0);
-                    }}
-                  >
-                    <label htmlFor={fileInputId}>
-                      <Paperclip size={16} className="shrink-0 text-muted" />
-                      添加附件
-                    </label>
-                  </DropdownMenuItem>
-                )}
                 {canGoal && (
                   <DropdownMenuItem
                     data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
@@ -500,9 +564,19 @@ export function Composer({
               aria-label="更多选项"
               title="附件暂不可用"
               disabled
-              className="mb-0.5"
+              className="relative mb-0.5"
             >
               <Plus size={20} />
+              {visibleGoal && (
+                <span
+                  aria-hidden
+                  data-testid="composer-goal-dot"
+                  className={cn(
+                    "absolute right-1 top-1 size-1.5 rounded-full",
+                    goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                  )}
+                />
+              )}
             </IconButton>
           )}
           <textarea
@@ -511,6 +585,7 @@ export function Composer({
             rows={1}
             value={value}
             disabled={disabled}
+            aria-label="消息输入框"
             onChange={(e) => setValue(e.target.value)}
             onPaste={(e) => {
               if (!onUpload) return;
@@ -520,16 +595,34 @@ export function Composer({
               void onFiles(images);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
+                e.preventDefault();
+                setValue(lastUserText);
+                requestAnimationFrame(() => {
+                  const el = ref.current;
+                  if (!el) return;
+                  const end = lastUserText.length;
+                  el.setSelectionRange(end, end);
+                });
+                return;
+              }
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                 // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                 if (coarsePointer) return;
+                const mod = e.metaKey || e.ctrlKey;
+                // enter 模式保持原行为：Enter / ⌘+Enter 都发送，仅 Shift+Enter 换行。
+                const shouldSend = sendKey === "mod-enter" ? mod : !e.shiftKey;
+                if (!shouldSend) return;
                 e.preventDefault();
                 submit();
               }
             }}
             enterKeyHint={coarsePointer ? "enter" : "send"}
             placeholder={placeholder}
-            className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
+            className={cn(
+              "max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
+              fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
+            )}
           />
           <IconButton
             data-product-feature={PRODUCT_CAPABILITIES.voice.id}
@@ -547,6 +640,10 @@ export function Composer({
               <Mic size={19} />
             )}
           </IconButton>
+          {stopping && <span className="text-caption text-muted">正在停止…</span>}
+          {value.length > 2000 && (
+            <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
+          )}
           <button
             type="button"
             data-product-control
@@ -567,7 +664,7 @@ export function Composer({
             }}
             disabled={stopping || (!canSend && !busy) || disabled}
             className={cn(
-              "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all",
+              "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
               busy
                 ? "bg-fg text-bg"
                 : canSend

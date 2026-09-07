@@ -19,7 +19,7 @@
 // 得让 App 把聊天页外壳抽成可挂载组件,那是另一档改动(见交付说明的 followups)。
 //
 // stub 原则同主 harness:只 stub 网络/宿主副作用,不 stub 任何 UI 结构。
-import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
+import { StrictMode, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { ChatHeader } from "../src/components/ChatHeader";
@@ -49,6 +49,8 @@ declare global {
       setBottomInset: (px: number) => void;
       /** T65:用户上滑 px 与底部占位收起落在同一帧 → 浏览器一次 scroll 事件里 scrollTop == 新 max。 */
       scrollUpWithCollapse: (px: number) => void;
+      /** T66:following 每次翻转记一笔(scroll 事件粒度),回底一次只应翻一次。 */
+      followingFlips: number;
     };
   }
 }
@@ -65,6 +67,7 @@ window.__mobilePage = {
   attemptViewportCorrection: () => {},
   setBottomInset: () => {},
   scrollUpWithCollapse: () => {},
+  followingFlips: 0,
 };
 
 // 宽内容样本:每一条都是线上真实出现过的形态,且都是移动端最容易被裁的东西。
@@ -139,7 +142,24 @@ function MobileChatPage() {
   const [bottomInset, setBottomInset] = useState(0);
   const [modelId, setModelId] = useState(MOBILE_MODELS[0].id);
   const stick = useRef(createStickToBottomController()).current;
+  // 与 App.tsx 的 stickToBottomRef 同构:MessageList 读的是 `following` 本身,不是
+  // 掺了篱笆/mark 的 canRestick。否则回底最后一个 scroll 事件的 rAF 同步会在篱笆
+  // 仍持有的 200ms 内读到 false,而篱笆释放不产生任何事件 → 「回到底部」按钮卡在可见态
+  // (T66 首跑即因此红)。skill 不变量 9:paint 钉尾跟 following,不要跟临时 canRestick。
+  const followBottomRef = useMemo(() => ({
+    get current() {
+      return stick.following.current;
+    },
+    set current(value: boolean) {
+      stick.following.current = value;
+    },
+    scrollToBottom: stick.scrollToBottom,
+    correctTo: stick.correctTo,
+  }), [stick]);
   const syncFollowing = useCallback(() => {
+    if (window.__mobilePage.following !== stick.following.current) {
+      window.__mobilePage.followingFlips += 1;
+    }
     window.__mobilePage.following = stick.following.current;
     window.__mobilePage.directManipulation = stick.directManipulation.current;
   }, [stick]);
@@ -264,7 +284,7 @@ function MobileChatPage() {
             onRespondPermission={() => {}}
             scrollParent={scroller}
             historyGeneration="mobile-page"
-            followBottomRef={stick.canRestick}
+            followBottomRef={followBottomRef}
           />
         </div>
         {bottomInset > 0 ? (

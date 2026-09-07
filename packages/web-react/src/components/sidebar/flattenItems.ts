@@ -21,7 +21,7 @@ export type FlatItem =
       runningCount: number;
       height: number;
     }
-  | { kind: "hint"; key: string; text: string; height: number }
+  | { kind: "hint"; key: string; text: string; height: number; projectId?: string }
   | { kind: "searchHit"; key: string; hit: SessionSearchHit; height: number }
   | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number };
 
@@ -125,7 +125,14 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       });
       if (!collapsed) {
         if (kids.length === 0) {
-          items.push({ kind: "hint", key: `p-empty-${p.id}`, text: "暂无会话", height: HINT_ROW_HEIGHT });
+          items.push({
+            kind: "hint",
+            key: `p-empty-${p.id}`,
+            text: "暂无会话",
+            height: HINT_ROW_HEIGHT,
+            // 默认项目不带 projectId，空态 CTA 走顶部 onNew；真实项目带上以便 onNewInProject。
+            ...(p.id !== DEFAULT_PROJECT_ID ? { projectId: p.id } : {}),
+          });
         }
         for (const s of kids) {
           items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: SESSION_ROW_HEIGHT });

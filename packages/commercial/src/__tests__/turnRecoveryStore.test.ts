@@ -8,6 +8,7 @@ import {
   markRecoveryContainerReceipt,
   pauseSilentRecoveryLineage,
   releaseRecoveryForTransportWait,
+  settleRecoveryJobForTape,
 } from '../dispatch/turnRecoveryStore.js'
 
 function fakePool(
@@ -72,6 +73,76 @@ describe('Master automatic recovery scheduler store', () => {
     assert.equal(params[0], 'job-1')
     assert.equal(params[2], 12)
     assert.equal(params[3], 300_000)
+  })
+
+  test('settleRecoveryJobForTape parses RETURNING terminal rows', async () => {
+    const q = {
+      async query(sql: string) {
+        assert.match(sql, /RETURNING root_client_message_id, error_code, semantic_recovery_attempt, status, pause_reason/)
+        return {
+          rows: [{
+            root_client_message_id: 'root-1',
+            error_code: 'upstream_failed',
+            semantic_recovery_attempt: '2',
+            status: 'completed',
+            pause_reason: null,
+          }],
+          rowCount: 1,
+        }
+      },
+    }
+    const rows = await settleRecoveryJobForTape(q as never, {
+      userId: 7n,
+      sessionId: 'session-1',
+      clientMessageId: 'cm-recovery',
+      outcome: 'completed',
+    })
+    assert.deepEqual(rows, [{
+      rootClientMessageId: 'root-1',
+      errorCode: 'upstream_failed',
+      semanticAttempt: 2,
+      status: 'completed',
+      pauseReason: null,
+    }])
+  })
+
+  test('pauseSilentRecoveryLineage RETURNING includes paused and cancelled descendants', async () => {
+    const q = {
+      async query(sql: string) {
+        if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
+        assert.match(sql, /RETURNING root_client_message_id, error_code, semantic_recovery_attempt, status, pause_reason/)
+        return {
+          rows: [
+            {
+              root_client_message_id: 'root-1',
+              error_code: 'liveness_timeout',
+              semantic_recovery_attempt: 1,
+              status: 'paused',
+              pause_reason: 'automatic_silent_no_progress',
+            },
+            {
+              root_client_message_id: 'root-1',
+              error_code: 'liveness_timeout',
+              semantic_recovery_attempt: 2,
+              status: 'cancelled',
+              pause_reason: 'automatic_silent_no_progress',
+            },
+          ],
+          rowCount: 2,
+        }
+      },
+    }
+    const rows = await pauseSilentRecoveryLineage(q as never, {
+      userId: 7n,
+      sessionId: 'session-1',
+      rootClientMessageId: 'root-1',
+      currentAttempt: 1,
+      terminalOutcome: 'interrupted',
+    })
+    assert.equal(rows.length, 2)
+    assert.equal(rows[0]?.status, 'paused')
+    assert.equal(rows[1]?.status, 'cancelled')
+    assert.equal(rows[0]?.pauseReason, 'automatic_silent_no_progress')
   })
 
   test('no-progress circuit breaker persists paused current attempt and cancels descendants', async () => {

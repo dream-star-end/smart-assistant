@@ -66,7 +66,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { findRouteProviderForModel, isCursorEngineModel } from "@openclaude/protocol";
+import { cursorModelIdFromPublic, findRouteProviderForModel } from "@openclaude/protocol";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -478,25 +478,37 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 4a) cursor-* 引擎模型(仅 external API-key 实例注入 cursorExternal)。
+      // 4a) 引擎模型(仅 external API-key 实例注入 cursorExternal)。
       // 放在 authority gate 之前:gate 对 engine!=='ccb' 的模型一律 not_available,
       // 而这条路径的可用性由 cursorExternal 自己按 pricing.enabled + authorize + 账号池判定。
       // 授权/余额/账号选择/relay/settle/post-commit 全在 cursorExternal.handle 内完成;
       // 仍在本 try/finally 内 → releaseSlot 照常。
-      if (deps.cursorExternal && isCursorEngineModel(body.model)) {
-        await deps.cursorExternal.handle({
-          req,
-          res,
-          requestId,
-          uid,
-          identity,
-          body,
-          authorize: (p) => deps.identity.authorize(identity, p, body.model),
-          appendCostCredits: deps.appendCostCredits,
-          broadcastToUser: deps.broadcastToUser,
-          userLog,
-        });
-        return;
+      //
+      // 对外模型 id **不带引擎前缀**(2026-09-07):第三方客户端发 `fable-5.1-high`,
+      // 这里归一成内部 `cursor-fable-5.1-high` 走计费/授权/日志;旧的内部 id 仍静默接受
+      // (管理员现有配置不中断)。客户端原始写法保留在 requestedModel,供错误文案 / 响应
+      // `model` 回显使用,保证对外面不出现内部 id。**只在注入 cursorExternal 的实例做**
+      // (容器 internal proxy 不认无前缀 id,行为零变化)。
+      if (deps.cursorExternal) {
+        const internalModel = cursorModelIdFromPublic(body.model);
+        if (internalModel) {
+          const requestedModel = body.model;
+          body.model = internalModel;
+          await deps.cursorExternal.handle({
+            req,
+            res,
+            requestId,
+            uid,
+            identity,
+            body,
+            requestedModel,
+            authorize: (p) => deps.identity.authorize(identity, p, body.model),
+            appendCostCredits: deps.appendCostCredits,
+            broadcastToUser: deps.broadcastToUser,
+            userLog,
+          });
+          return;
+        }
       }
 
       // 4b) 模型执行权威 gate(模型权威批次 · 方案 §1.2/§4)。

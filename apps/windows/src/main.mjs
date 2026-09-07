@@ -63,10 +63,28 @@ import {
   createSafeStorageIdentityStore,
   resolveIdentityDirectory,
 } from './identity.mjs'
-import { createHostSupervisor, readDesktopHostConfigFromEnv, DEFAULT_HOST_ENTRY } from './hostSupervisor.mjs'
+import {
+  createHostSupervisor,
+  loadDesktopHostConfig,
+  readDesktopHostConfigFromEnv,
+  DEFAULT_HOST_ENTRY,
+} from './hostSupervisor.mjs'
+import {
+  BOOTSTRAP_PIN_CHANGED_MESSAGE,
+  publicOriginFromProductUrl,
+} from './desktopBootstrap.mjs'
 import { runLocalHostSmoke } from './localHostSmoke.mjs'
+import {
+  formatSmokeFailureReport,
+  resolveSmokeReportMode,
+  shouldWriteSmokeFailureReport,
+} from './smokeReport.mjs'
 import { createHostLogger, resolveLogsDirectory } from './host/log.mjs'
 import { createApprovalController } from './host/workspace/approval.mjs'
+import {
+  APPROVAL_PENDING_CHANNEL,
+  createPendingApprovalStore,
+} from './approvalWindow.mjs'
 import { snapshotWorkspace } from './host/workspace/snapshot.mjs'
 import { createWorkspaceStore } from './host/workspace/workspaces.mjs'
 import { createLocalModeController, LocalMode } from './localMode.mjs'
@@ -78,6 +96,10 @@ import {
   parseShellCommand,
 } from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
+import {
+  createSessionCookieFetch,
+  refreshProductAccessToken,
+} from './productAccessToken.mjs'
 import {
   PRODUCT_PARTITION,
   SMOKE_PRODUCT_PARTITION,
@@ -179,6 +201,8 @@ let enrollmentController = null
 let localHostIpcHandler = null
 let workspaceStore = null
 let approvalController = null
+let desktopBootstrapState = null
+const pendingApprovals = createPendingApprovalStore()
 
 function clarvyUserDataPath() {
   if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
@@ -2087,14 +2111,14 @@ async function runSmokeTest() {
 }
 
 async function writeSmokeFailureReport(stage, error) {
-  if (!smokeTest) return
+  if (!shouldWriteSmokeFailureReport({ smokeTest, smokeLocalHost })) return
   const reportPath = process.env.OPENCLAUDE_SMOKE_REPORT_PATH
   if (typeof reportPath !== 'string' || reportPath.length === 0 || reportPath.length > 32_767)
     return
 
-  const detail = error instanceof Error ? error.stack || error.message : String(error)
+  const mode = resolveSmokeReportMode({ stage, smokeTest, smokeLocalHost })
   try {
-    await writeFile(reportPath, `[windows] ${stage} failed:\n${detail}\n`, {
+    await writeFile(reportPath, formatSmokeFailureReport({ stage, error, mode }), {
       encoding: 'utf8',
       mode: 0o600,
     })
@@ -2215,6 +2239,8 @@ function installEnrollment() {
       localMode: ensureLocalMode().mode,
       tunnelState,
       desiredLocal: ensureLocalMode().desired,
+      pendingApprovals: pendingApprovals.size,
+      bootstrapDisabled: desktopBootstrapState?.disabled === true,
     }),
     workspace: {
       setWorkspace: (rootPath) => applyWorkspaceRoot(rootPath),
@@ -2233,20 +2259,59 @@ function installEnrollment() {
     },
     approval: {
       approve(id) {
+        const resolved = pendingApprovals.resolve(id, true)
+        if (!resolved.ok) return resolved
         hostSupervisor?.sendApprovalResult(id, true)
-        return ensureApprovalController().approve(id)
+        return resolved
       },
       deny(id) {
+        const resolved = pendingApprovals.resolve(id, false)
+        if (!resolved.ok) return resolved
         hostSupervisor?.sendApprovalResult(id, false)
-        return ensureApprovalController().deny(id)
+        return resolved
       },
     },
   })
   return enrollmentController
 }
 
+async function loadDesktopBootstrap() {
+  try {
+    desktopBootstrapState = await loadDesktopHostConfig({
+      publicOrigin: publicOriginFromProductUrl(process.env.OPENCLAUDE_DESKTOP_DEV_URL, {
+        isPackaged: app.isPackaged,
+      }),
+      env: process.env,
+    })
+  } catch (error) {
+    desktopBootstrapState = {
+      ready: false,
+      disabled: false,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+  if (desktopBootstrapState?.pinChanged) {
+    applyHostFallback('pin_changed')
+    ensureAppLogger().warn('bootstrap_pin_changed', { message: BOOTSTRAP_PIN_CHANGED_MESSAGE })
+  }
+  return desktopBootstrapState
+}
+
+function desktopHostConfig() {
+  if (desktopBootstrapState?.ready) return desktopBootstrapState
+  return readDesktopHostConfigFromEnv(process.env)
+}
+
 async function toggleLocalMode(enabled) {
   const mode = ensureLocalMode()
+  if (enabled && desktopBootstrapState?.disabled === true) {
+    ensureLocalHostWindow()?.show()
+    return {
+      ok: false,
+      reason: desktopBootstrapState.disabledReason || 'bootstrap-disabled',
+      message: desktopBootstrapState.message,
+    }
+  }
   if (enabled) {
     const result = mode.enableLocal()
     if (!result.ok) {
@@ -2439,6 +2504,7 @@ if (!hasSingleInstanceLock) {
         return
       }
       await installDesktopTray()
+      await loadDesktopBootstrap()
       installEnrollment()
       ensureLocalMode()
       powerBridge = createPowerEventBridge({
@@ -2480,7 +2546,7 @@ function installLocalAgentHost() {
         return null
       }
     },
-    config: readDesktopHostConfigFromEnv(process.env),
+    config: desktopHostConfig(),
     onState: (state) => {
       tunnelState = state
       if (state === 'offline' && ensureLocalMode().mode === LocalMode.LOCAL) {
@@ -2493,12 +2559,40 @@ function installLocalAgentHost() {
     },
     onFallback: (info) => applyHostFallback(info?.reason || 'host_unavailable'),
     onApprovalRequest: (info) => {
+      const payload = pendingApprovals.add(info)
       const win = ensureLocalHostWindow()
-      if (isAlive(win)) win.show()
+      if (payload && isAlive(win) && !win.webContents.isDestroyed?.()) {
+        win.webContents.send(APPROVAL_PENDING_CHANNEL, {
+          opId: payload.opId,
+          summary: payload.summary,
+          deadlineAt: payload.deadlineAt,
+        })
+        win.show()
+      }
       ensureAppLogger().info('approval_request', { id: info?.id, kind: info?.kind })
     },
   })
-  void hostSupervisor.start().catch((error) => {
+  void (async () => {
+    try {
+      const publicOrigin = publicOriginFromProductUrl(process.env.OPENCLAUDE_DESKTOP_DEV_URL, {
+        isPackaged: app.isPackaged,
+      })
+      const productSession = session.fromPartition(PRODUCT_PARTITION)
+      const tokenResult = await refreshProductAccessToken({
+        publicOrigin,
+        fetchImpl: createSessionCookieFetch(productSession),
+      })
+      hostSupervisor.setConfig({
+        publicOrigin,
+        masterHttps: desktopBootstrapState?.masterHttps || '',
+        runtimeManifestUrl: desktopHostConfig().runtimeManifestUrl || '',
+        runtimeManifestToken: tokenResult.ok ? tokenResult.accessToken : undefined,
+      })
+    } catch {
+      /* JWT is optional; bake remains the fallback */
+    }
+    await hostSupervisor.start()
+  })().catch((error) => {
     console.warn('[windows] host start failed:', error instanceof Error ? error.message : error)
   })
   return hostSupervisor

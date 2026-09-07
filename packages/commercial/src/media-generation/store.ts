@@ -356,12 +356,9 @@ export interface MediaJobPage {
   nextCursor: string | null
 }
 
-function encodeCursor(job: MediaJobRow): string {
-  return encodeDateCursor(job.createdAt, job.id)
-}
-
-function encodeDateCursor(date: Date, id: string): string {
-  return Buffer.from(JSON.stringify([date.toISOString(), id])).toString('base64url')
+// Keep PostgreSQL microseconds: JS Date would truncate the keyset boundary.
+function encodeDateCursor(timestamp: string, id: string): string {
+  return Buffer.from(JSON.stringify([timestamp, id])).toString('base64url')
 }
 
 function decodeCursor(cursor: string): [string, string] {
@@ -388,8 +385,10 @@ export async function listJobs(
 ): Promise<MediaJobPage> {
   const limit = Math.min(100, Math.max(1, pageSize))
   const after = cursor ? decodeCursor(cursor) : null
-  const result = await query<JobDb>(
-    `SELECT ${JOB_COLUMNS} FROM media_generation_jobs
+  const result = await query<JobDb & { cursor_at: string }>(
+    `SELECT ${JOB_COLUMNS},
+            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at
+       FROM media_generation_jobs
       WHERE user_id=$1
         AND ($2::timestamptz IS NULL OR (created_at,id) < ($2::timestamptz,$3))
       ORDER BY created_at DESC,id DESC LIMIT $4`,
@@ -398,9 +397,10 @@ export async function listJobs(
   const jobs = result.rows.map(mapJob)
   const hasMore = jobs.length > limit
   if (hasMore) jobs.pop()
+  const last = result.rows[jobs.length - 1]
   return {
     jobs,
-    nextCursor: hasMore && jobs.length > 0 ? encodeCursor(jobs[jobs.length - 1]!) : null,
+    nextCursor: hasMore && last ? encodeDateCursor(last.cursor_at, last.id) : null,
   }
 }
 
@@ -964,21 +964,22 @@ export async function listProjects(
 ): Promise<ProjectPage> {
   const limit = Math.min(100, Math.max(1, pageSize))
   const after = cursor ? decodeCursor(cursor) : null
-  const result = await query<ProjectDbRow>(
+  const result = await query<ProjectDbRow & { cursor_at: string }>(
     `SELECT id,user_id::text,request_id,title,rev,render_requested_at,canceled_at,
-            current_compose_job_id,created_at,updated_at
+            current_compose_job_id,created_at,updated_at,
+            to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at
        FROM video_projects WHERE user_id=$1
          AND ($2::timestamptz IS NULL OR (updated_at,id) < ($2::timestamptz,$3))
        ORDER BY updated_at DESC,id DESC LIMIT $4`,
     [userId, after?.[0] ?? null, after?.[1] ?? null, limit + 1],
   )
-  const projects = result.rows
+  const projects = result.rows.map(({ cursor_at: _cursorAt, ...project }) => project)
   const hasMore = projects.length > limit
   if (hasMore) projects.pop()
-  const last = projects[projects.length - 1]
+  const last = result.rows[projects.length - 1]
   return {
     projects,
-    nextCursor: hasMore && last ? encodeDateCursor(last.updated_at, last.id) : null,
+    nextCursor: hasMore && last ? encodeDateCursor(last.cursor_at, last.id) : null,
   }
 }
 

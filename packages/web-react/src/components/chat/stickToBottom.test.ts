@@ -379,6 +379,36 @@ describe("stickToBottom", () => {
     expect(el.scrollTop).toBe(4220);
   });
 
+  test("滚轮 tick 落在底部边界（无 scroll 事件消费 mark）：篱笆释放同时清掉残留 mark，流式继续贴底", () => {
+    // 真浏览器复现：用户滚轮回底，最后一两个 tick 到达时 scrollTop 已是 max，浏览器
+    // 不再派发 scroll 事件，React onWheel 打上的 markUserIntent 没人消费。篱笆按
+    // 静默窗释放后 following=true 但 writeSuspended 仍为 true，之后每次 stream pin
+    // 都被 `writeSuspended` 短路 —— 用户明明回到了底部，新内容却在视口下方长。
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    stick.onScroll(el);
+
+    stick.markUserIntent();
+    stick.beginWheelFence();
+    el.scrollTop = 3000;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+    stick.markUserIntent();
+    el.scrollTop = 3920;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(true);
+    // 最后一个 tick：已在底部，浏览器无 scroll 事件，mark 挂着
+    stick.markUserIntent();
+    expect(stick.gesture.current).toBe(true);
+
+    stick.endWheelFence();
+    expect(stick.gesture.current).toBe(false);
+    el.scrollHeight = 4300;
+    stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(4220);
+  });
+
   test("直接操作与滚轮篱笆叠加时，任一篱笆在场都不写", () => {
     const stick = createStickToBottomController();
     const el = scroller({ scrollHeight: 4000, scrollTop: 3920, clientHeight: 80 });

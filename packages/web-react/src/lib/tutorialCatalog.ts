@@ -20,7 +20,10 @@ const TUTORIAL_MEDIA_V3 = new Set<TutorialMediaKey>([
   "schedules-reminders",
   "skills-training",
   "team-mode",
+  "models-reasoning",
+  "sessions-history",
 ]);
+const TUTORIAL_MEDIA_V4 = new Set<TutorialMediaKey>(["agents", "chat-basics"]);
 const TUTORIAL_MEDIA_V5 = new Set<TutorialMediaKey>(["container-web-preview"]);
 
 export const TUTORIAL_MEDIA: Record<
@@ -44,7 +47,7 @@ export const TUTORIAL_MEDIA: Record<
       ],
       ["image-create-edit", "打开生成图片，进入圈选修改并查看下载操作。"],
       ["github-repository", "关联 GitHub，选择仓库与分支并确认绑定。"],
-      ["agents", "打开智能体选择器，查看并切换已安装的专业助手。"],
+      ["agents", "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。"],
       ["team-mode", "在智能体选择器中开启团队模式并确认队长说明。"],
       ["memory-auto-dream", "进入记忆中心，查看长期记忆与 Auto-Dream 报告。"],
       [
@@ -69,9 +72,11 @@ export const TUTORIAL_MEDIA: Record<
     {
       version: TUTORIAL_MEDIA_V5.has(id)
         ? 5
-        : TUTORIAL_MEDIA_V3.has(id)
-          ? 3
-          : 2,
+        : TUTORIAL_MEDIA_V4.has(id)
+          ? 4
+          : TUTORIAL_MEDIA_V3.has(id)
+            ? 3
+            : 2,
       poster: `/tutorials/${id}.webp`,
       video: `/tutorials/${id}.webm`,
       caption,
@@ -101,7 +106,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 6,
+    contentVersion: 7,
     intro:
       "从简不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，有时还会出现可点击的选择卡。任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -112,8 +117,8 @@ export const TUTORIAL_TOPICS = {
     ],
     steps: [
       {
-        title: "先说结果",
-        body: "第一句先讲清最终想拿到什么，例如“一页汇报稿”或“一份可运行脚本”。",
+        title: "新建任务，先说结果",
+        body: "侧栏点击“新建会话”进入空白任务；需要专业助手时，点它右侧的下拉箭头“选择智能体后新建”。第一句先讲清最终想拿到什么，例如“一页汇报稿”或“一份可运行脚本”。",
       },
       {
         title: "补充材料与约束",
@@ -582,9 +587,9 @@ export const TUTORIAL_TOPICS = {
   },
   agents: {
     featureId: "agents",
-    contentVersion: 1,
+    contentVersion: 2,
     intro:
-      "智能体是一套长期稳定的角色、工作方式和专用能力。点击顶栏头像可以在全能助手、平台预设和已安装智能体之间切换；每个会话记录自己的智能体归属，重新打开时会恢复。",
+      "智能体是一套长期稳定的角色、工作方式和专用能力。新任务可从侧栏“新建会话”右侧箭头先选助手；已有任务可点击顶栏当前助手名称切换。每个会话记录自己的智能体归属，重新打开时会恢复。",
     outcome: "把专业任务交给更懂该领域、带有合适工具和流程的助手。",
     scenarios: [
       "编程、科研、办公等专业任务",
@@ -593,16 +598,16 @@ export const TUTORIAL_TOPICS = {
     ],
     steps: [
       {
-        title: "打开智能体选择器",
-        body: "点击顶栏当前助手名称，查看已安装智能体与简介。",
+        title: "先选助手，再开始新任务",
+        body: "点击侧栏“新建会话”右侧的“选择智能体后新建”箭头，进入空白会话并打开智能体选择器，查看已安装智能体与简介。旧会话仍可在侧栏找回。",
       },
       {
         title: "按任务而不是名字选择",
         body: "查看能力说明、所需工具和适用场景；日常混合任务可继续用全能助手。",
       },
       {
-        title: "切换后再下达任务",
-        body: "切换只影响当前会话后续执行；旧智能体的迟到结果不会混入新角色。",
+        title: "核对角色后再下达任务",
+        body: "选择后在顶栏核对助手名称，再输入新任务。若要在已有会话中换助手，使用顶栏名称入口；它不会另开会话，只影响当前会话后续执行。",
       },
       {
         title: "从市场补充",
