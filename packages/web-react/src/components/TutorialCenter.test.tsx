@@ -85,7 +85,7 @@ function CaseHarness({
 describe("TutorialCenter", () => {
   it("默认成果展厅只展示有产物的精选实作，不再平铺教程和待采集脚本", () => {
     render(<CaseHarness />);
-    expect(screen.getByRole("heading", { name: /你的下一件事/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /让它做给你看/ })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^查看成果：/ })).toHaveLength(2);
     expect(screen.queryByRole("heading", { name: "10 分钟走完第一次任务" })).not.toBeInTheDocument();
     expect(screen.queryByText("示例待真实运行采集")).not.toBeInTheDocument();
@@ -95,7 +95,7 @@ describe("TutorialCenter", () => {
     fireEvent.click(screen.getAllByRole("button", { name: /^查看成果：/ })[0]);
     expect(screen.getByRole("button", { name: "打开交互看板" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "返回案例展厅" }));
-    expect(screen.getByRole("heading", { name: /你的下一件事/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /让它做给你看/ })).toBeInTheDocument();
   });
 
   it("快速上手退到帮助菜单，仍可进入功能详情", () => {
