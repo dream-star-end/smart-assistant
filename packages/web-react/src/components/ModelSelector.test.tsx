@@ -568,3 +568,37 @@ describe('ModelSelector 「更多 GPT 模型」折叠组(2026-09-05 Terra/Luna)'
     expect(screen.queryByText('更多 GPT 模型')).toBeNull()
   })
 })
+
+const SEARCH_MODELS: PublicModel[] = Array.from({ length: 8 }, (_, i) => ({
+  id: `plain-search-${i}`,
+  display_name: i === 3 ? 'Zebra Unique' : `Alpha ${i}`,
+}))
+
+describe('ModelSelector 搜索', () => {
+  it('≥8 模型时渲染搜索框，输入后只剩匹配项', async () => {
+    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const input = await screen.findByLabelText('搜索模型')
+    fireEvent.change(input, { target: { value: 'Zebra' } })
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent('Zebra Unique')
+    expect(screen.queryByText('Alpha 0')).toBeNull()
+  })
+
+  it('无匹配时显示「无匹配模型」', async () => {
+    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const input = await screen.findByLabelText('搜索模型')
+    fireEvent.change(input, { target: { value: 'no-such-model-zzz' } })
+    expect(screen.getByText('无匹配模型')).toBeInTheDocument()
+    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
+  })
+
+  it('<8 模型不渲染搜索框', async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.queryByLabelText('搜索模型')).toBeNull()
+  })
+})

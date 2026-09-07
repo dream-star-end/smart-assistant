@@ -108,6 +108,16 @@ export function teamEngineLabel(models: PublicModel[]): string {
   return m ? modelLabel(m) : DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME
 }
 
+function rowSearchHaystack(row: ReturnType<typeof modelPickerRows>[number]): string {
+  if (row.kind === 'plain') return `${modelLabel(row.model)} ${row.model.id}`
+  if (row.kind === 'locked-plain') return `${lockedPlainLabel(row.model)} ${row.model.id}`
+  if (row.kind === 'cursor-family' || row.kind === 'context-family') {
+    const members = row.row.members.map((m) => `${modelLabel(m)} ${m.id}`).join(' ')
+    return `${row.row.label} ${members}`
+  }
+  return `${row.row.label} ${row.row.representative.id}`
+}
+
 function triggerLabel(
   models: PublicModel[],
   selectedId: string | undefined,
@@ -187,6 +197,16 @@ export function ModelSelector({
     if (selectedInCollapsed) setCollapsedOpen(true)
   }, [selectedInCollapsed])
   const showCollapsedGroup = collapsedRows.length > 0
+  const [query, setQuery] = useState('')
+  const queryNorm = query.trim().toLowerCase()
+  const searching = queryNorm.length > 0
+  const showSearch = models.length + lockedModels.length >= 8
+  const filteredRows = searching
+    ? rows.filter((row) => rowSearchHaystack(row).toLowerCase().includes(queryNorm))
+    : null
+  const listRows = searching ? (filteredRows ?? []) : visibleRows
+  const listCollapsed = searching ? [] : collapsedRows
+  const listShowCollapsed = searching ? false : showCollapsedGroup
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
@@ -411,7 +431,11 @@ export function ModelSelector({
 
   return (
     <>
-      <DropdownMenu>
+      <DropdownMenu
+        onOpenChange={(v) => {
+          if (!v) setQuery('')
+        }}
+      >
         <DropdownMenuTrigger asChild>
           <button
             type="button"
@@ -443,6 +467,20 @@ export function ModelSelector({
           className="flex max-h-[80vh] min-w-[15rem] flex-col"
         >
           <DropdownMenuLabel className="shrink-0">对话模型</DropdownMenuLabel>
+          {showSearch && (
+            <div className="shrink-0 px-1.5 pb-1">
+              <input
+                aria-label="搜索模型"
+                placeholder="搜索模型…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Escape' && e.key !== 'ArrowDown') e.stopPropagation()
+                }}
+                className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-border-strong"
+              />
+            </div>
+          )}
           {teamEngineActive && (
             <div
               role="note"
@@ -472,8 +510,12 @@ export function ModelSelector({
             </div>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {visibleRows.map(renderRow)}
-            {showCollapsedGroup && (
+            {searching && listRows.length === 0 ? (
+              <div className="px-2 py-3 text-caption text-faint">无匹配模型</div>
+            ) : (
+              listRows.map(renderRow)
+            )}
+            {listShowCollapsed && (
               <>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -494,10 +536,10 @@ export function ModelSelector({
                     <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
                   </span>
                   <span className="text-caption font-normal text-faint">
-                    {collapsedRows.length} 个
+                    {listCollapsed.length} 个
                   </span>
                 </DropdownMenuItem>
-                {collapsedOpen && collapsedRows.map(renderRow)}
+                {collapsedOpen && listCollapsed.map(renderRow)}
               </>
             )}
           </div>
