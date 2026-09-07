@@ -23,7 +23,8 @@ export type FlatItem =
     }
   | { kind: "hint"; key: string; text: string; height: number; projectId?: string }
   | { kind: "searchHit"; key: string; hit: SessionSearchHit; height: number }
-  | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number };
+  | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number }
+  | { kind: "trashToggle"; key: string; count: number; expanded: boolean; height: number };
 
 export type FlattenInput = {
   searching: boolean;
@@ -37,6 +38,10 @@ export type FlattenInput = {
   archived: Session[];
   archivedExpanded: boolean;
   archivedLoading?: boolean;
+  /** 回收站会话（独立列表，不参与主列表过滤/分组）；排序在调用方完成。 */
+  trashed?: Session[];
+  trashedExpanded?: boolean;
+  trashedLoading?: boolean;
   searchHits: SessionSearchHit[];
   searchRemote: "idle" | "loading" | "empty" | "error";
   localEmpty: boolean;
@@ -180,6 +185,27 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       items.push({ kind: "hint", key: "archived-empty", text: "没有已归档的会话", height: HINT_ROW_HEIGHT });
     }
     for (const s of input.archived) {
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
+    }
+  }
+
+  // 回收站：位于「已归档」之后，同一套折叠交互；行与主列表互不相干。
+  const trashed = input.trashed ?? [];
+  const trashedExpanded = input.trashedExpanded ?? false;
+  items.push({
+    kind: "trashToggle",
+    key: "trash-toggle",
+    count: trashed.length,
+    expanded: trashedExpanded,
+    height: PROJECT_ROW_HEIGHT,
+  });
+  if (trashedExpanded) {
+    if (input.trashedLoading) {
+      items.push({ kind: "hint", key: "trash-loading", text: "正在加载回收站…", height: HINT_ROW_HEIGHT });
+    } else if (trashed.length === 0) {
+      items.push({ kind: "hint", key: "trash-empty", text: "回收站是空的", height: HINT_ROW_HEIGHT });
+    }
+    for (const s of trashed) {
       items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
     }
   }

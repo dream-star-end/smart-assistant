@@ -72,6 +72,8 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     lastOutcome: m.lastOutcome ?? null,
     lastErrorCode: m.lastErrorCode ?? null,
     archived: m.archived === true,
+    // 回收站删除时刻（epoch ms）；缺省 = 未在回收站。键缺席与 false 等价（spread 合并安全）。
+    deletedAt: typeof m.deletedAt === "number" ? m.deletedAt : undefined,
     unread: m.unread === true,
     lastAt: m.lastAt,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
@@ -167,7 +169,7 @@ export type UseSessionList = {
   togglePinSession: (s: Session) => Promise<void>;
   moveSessionToProject: (s: Session, projectId: string | null) => Promise<void>;
   toggleArchiveSession: (s: Session) => Promise<void>;
-  /** 批量归档 / 取消归档 / 删除 / 移动。删除会二次确认并写明条数。 */
+  /** 批量归档 / 取消归档 / 删除 / 移动 / 回收站还原·彻底删除。删除会二次确认并写明条数。 */
   batchUpdateSessions: (
     ids: string[],
     action: SessionBatchAction,
@@ -180,6 +182,14 @@ export type UseSessionList = {
   /** 展开「已归档」时用 includeArchived=1 拉取并合并。 */
   loadArchivedSessions: () => Promise<void>;
   loadingArchived: boolean;
+  /** 回收站会话（独立于主列表，server canonical）。展开「回收站」时用 trashed=1 拉取。 */
+  trashedSessions: Session[];
+  trashedLoading: boolean;
+  loadTrashedSessions: () => Promise<void>;
+  /** 回收站还原：乐观搬回主列表，失败回滚。 */
+  restoreSession: (s: Session) => Promise<void>;
+  /** 回收站彻底删除：危险确认 → 移出回收站 → best-effort 服务端 purge，失败放回。 */
+  purgeSessionConfirm: (s: Session) => Promise<void>;
   /** 服务端全文搜索（消息命中）。调用方负责防抖与 AbortController。 */
   searchSessionMessages: (
     q: string,
@@ -514,9 +524,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [hasMoreSessions, setHasMoreSessions] = useState(true);
   const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
   const [loadingArchived, setLoadingArchived] = useState(false);
+  // 回收站：独立列表（不并入主 sessions），最近删除排前面。
+  const [trashedSessions, setTrashedSessions] = useState<Session[]>([]);
+  const [trashedLoading, setTrashedLoading] = useState(false);
   const nextCursorRef = useRef<number | undefined>(undefined);
   const loadMoreInflightRef = useRef(false);
   const archivedFetchedRef = useRef(false);
+  const trashedFetchedRef = useRef(false);
   const listRefreshInflightRef = useRef(false);
 
   const mapListMetas = useCallback(
@@ -624,10 +638,22 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     }
   };
 
+  /** 删除即入回收站：回收站已展开（trashedFetchedRef）时把行搬进 trashedSessions，立即可见。 */
+  const prependTrashed = (deleted: Session[]) => {
+    if (deleted.length === 0) return;
+    const deletedAt = Date.now();
+    setTrashedSessions((c) => {
+      const fresh = deleted
+        .filter((s) => !c.some((x) => x.id === s.id))
+        .map((s) => ({ ...s, deletedAt, archived: false }));
+      return [...fresh, ...c];
+    });
+  };
+
   const deleteSessionConfirm = async (s: Session) => {
     const ok = await cbRef.current.confirmDialog({
-      title: "删除该会话?",
-      body: `「${s.title || "新对话"}」的本地与云端记录都将删除,不可恢复。`,
+      title: "删除该会话？",
+      body: `「${s.title || "新对话"}」将移入回收站，3 天后自动彻底清理，期间可还原。`,
       confirmText: "删除",
       danger: true,
     });
@@ -646,7 +672,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       cbRef.current.sockRef.current?.removeSession(s.id);
       cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
       // 服务端删除（幂等，best-effort）：否则 reload 后会从 listSessions 复活。
-      void api.deleteSession(cbRef.current.authSession, s.id).catch(() => {});
+      // 成功 = 已入回收站；回收站已拉取过则同步搬入 trashedSessions。
+      void api
+        .deleteSession(cbRef.current.authSession, s.id)
+        .then(() => {
+          if (trashedFetchedRef.current) prependTrashed([s]);
+        })
+        .catch(() => {});
     }
     setSessions((c) => c.filter((x) => x.id !== s.id));
     if (s.id === activeId) {
@@ -686,6 +718,45 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     await patchSessionMetaOptimistic(s, { archived }, { ...s, archived });
   };
 
+  // 回收站还原：乐观搬回主列表（deletedAt 清空；原 archived 态保留 → 回「已归档」或主列表），
+  // 失败两侧一起回滚。
+  const restoreSession = async (s: Session) => {
+    if (demo) return;
+    const existedInMain = sessions.some((x) => x.id === s.id);
+    const restored: Session = { ...s, deletedAt: undefined };
+    setTrashedSessions((c) => c.filter((x) => x.id !== s.id));
+    setSessions((c) => upsertSessions(c, [restored], true));
+    try {
+      await api.restoreSession(cbRef.current.authSession, s.id);
+    } catch (e) {
+      setTrashedSessions((c) => (c.some((x) => x.id === s.id) ? c : [s, ...c]));
+      if (!existedInMain) setSessions((c) => c.filter((x) => x.id !== s.id));
+      console.warn("restoreSession failed", e);
+      toast("还原失败", "error");
+    }
+  };
+
+  // 回收站彻底删除：不可恢复，须过危险确认；失败把行放回回收站。
+  const purgeSessionConfirm = async (s: Session) => {
+    const ok = await cbRef.current.confirmDialog({
+      title: "彻底删除该会话？",
+      body: `「${s.title || "新对话"}」将立即永久删除，不可恢复。`,
+      confirmText: "彻底删除",
+      danger: true,
+    });
+    if (!ok) return;
+    setTrashedSessions((c) => c.filter((x) => x.id !== s.id));
+    try {
+      await api.purgeSession(cbRef.current.authSession, s.id);
+    } catch (e) {
+      // 404 = 服务端已不在回收站（sweeper 已清理 / 其它设备已彻底删除）：目标态已达成，不放回。
+      if (e instanceof ApiError && e.status === 404) return;
+      setTrashedSessions((c) => (c.some((x) => x.id === s.id) ? c : [s, ...c]));
+      console.warn("purgeSession failed", e);
+      toast("删除失败", "error");
+    }
+  };
+
   const forgetSessionLocal = (id: string) => {
     historyFetchedAtRef.current.delete(id);
     historyFetchingRef.current.delete(id);
@@ -710,10 +781,46 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   ) => {
     const unique = [...new Set(ids)].filter(Boolean);
     if (unique.length === 0) return;
+
+    // 回收站批量操作：作用域是 trashedSessions，不触碰主列表（restore 成功才搬回主列表）。
+    if (action === "restore" || action === "purge") {
+      if (demo) return;
+      const idSet = new Set(unique);
+      const snapshot = trashedSessions.filter((s) => idSet.has(s.id));
+      if (snapshot.length === 0) return;
+      if (action === "purge") {
+        const ok = await cbRef.current.confirmDialog({
+          title: `彻底删除 ${snapshot.length} 条会话？`,
+          body: "这些会话将立即永久删除，不可恢复。",
+          confirmText: "彻底删除",
+          danger: true,
+        });
+        if (!ok) return;
+      }
+      setTrashedSessions((c) => c.filter((s) => !idSet.has(s.id)));
+      if (action === "restore") {
+        const restored = snapshot.map((s) => ({ ...s, deletedAt: undefined }));
+        setSessions((c) => upsertSessions(c, restored, true));
+      }
+      try {
+        await api.batchSessions(cbRef.current.authSession, { ids: unique, action });
+      } catch (e) {
+        if (action === "restore") setSessions((c) => c.filter((s) => !idSet.has(s.id)));
+        setTrashedSessions((c) => {
+          const map = new Map(c.map((s) => [s.id, s]));
+          for (const s of snapshot) if (!map.has(s.id)) map.set(s.id, s);
+          return [...map.values()];
+        });
+        console.warn("batchSessions failed", e);
+        toast("操作失败，已恢复", "error");
+      }
+      return;
+    }
+
     if (action === "delete") {
       const ok = await cbRef.current.confirmDialog({
-        title: `删除 ${unique.length} 条会话?`,
-        body: `将删除 ${unique.length} 条会话的本地与云端记录，不可恢复。`,
+        title: `删除 ${unique.length} 条会话？`,
+        body: "这些会话将移入回收站，3 天后自动彻底清理，期间可还原。",
         confirmText: "删除",
         danger: true,
       });
@@ -747,7 +854,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         action,
         ...(action === "move" ? { projectId: projectId ?? null } : {}),
       });
-      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+      if (action === "delete") {
+        for (const id of unique) forgetSessionLocal(id);
+        // 删除成功 = 已入回收站；回收站已拉取过则同步搬入 trashedSessions。
+        if (trashedFetchedRef.current) prependTrashed(snapshot);
+      }
     } catch (e) {
       setSessions((c) => {
         const map = new Map(c.map((s) => [s.id, s]));
@@ -822,6 +933,41 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     }
   };
 
+  // 回收站列表：trashed=1 拉取，存进独立 trashedSessions（不并入主 sessions）。
+  // server 条目按 id 覆盖本地，本地先行搬入（删除即入站）的行保留；最近删除排前面。
+  const loadTrashedSessions = async () => {
+    if (demo || !auth || !user || trashedFetchedRef.current) return;
+    trashedFetchedRef.current = true;
+    setTrashedLoading(true);
+    try {
+      const page = await api.listSessionsPage(cbRef.current.authSession, { trashed: true });
+      const incoming = page.sessions.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+      setTrashedSessions((cur) => {
+        const map = new Map(cur.map((s) => [s.id, s]));
+        for (const s of incoming) map.set(s.id, s);
+        return [...map.values()].sort((a, b) => {
+          const da = a.deletedAt ?? sessionCursorAt(a);
+          const db = b.deletedAt ?? sessionCursorAt(b);
+          if (da !== db) return da < db ? 1 : -1;
+          return a.id < b.id ? -1 : 1;
+        });
+      });
+    } catch (e) {
+      trashedFetchedRef.current = false;
+      console.warn("loadTrashedSessions failed", e);
+      toast("无法加载回收站会话", "error");
+    } finally {
+      setTrashedLoading(false);
+    }
+  };
+
   const searchSessionMessages = async (
     q: string,
     signal: AbortSignal,
@@ -886,9 +1032,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     nextCursorRef.current = undefined;
     archivedFetchedRef.current = false;
+    trashedFetchedRef.current = false;
     setHasMoreSessions(true);
     setLoadingMoreSessions(false);
     setLoadingArchived(false);
+    setTrashedSessions([]);
+    setTrashedLoading(false);
     setSessions([]);
     setActiveId(undefined);
     setServerListSettled(false); // 重新登录后 listSessions 重新落定
@@ -914,6 +1063,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     loadingMoreSessions,
     loadArchivedSessions,
     loadingArchived,
+    trashedSessions,
+    trashedLoading,
+    loadTrashedSessions,
+    restoreSession,
+    purgeSessionConfirm,
     searchSessionMessages,
     applySessionTerminal,
     reset,

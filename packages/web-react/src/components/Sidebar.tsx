@@ -18,6 +18,7 @@ import {
   ShieldCheck,
   Sparkles,
   Store,
+  Trash2,
 } from "lucide-react";
 import {
   useEffect,
@@ -26,7 +27,7 @@ import {
   useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { archivedExpandedStorageKey } from "../hooks/useChatProjects";
+import { archivedExpandedStorageKey, trashExpandedStorageKey } from "../hooks/useChatProjects";
 import { useProjectScope } from "../hooks/useProjectScope";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
@@ -88,6 +89,24 @@ function writeArchivedExpanded(userId: string | undefined, expanded: boolean): v
   if (!userId) return;
   try {
     localStorage.setItem(archivedExpandedStorageKey(userId), expanded ? "1" : "0");
+  } catch {
+    /* private mode / quota */
+  }
+}
+
+function readTrashedExpanded(userId: string | undefined): boolean {
+  if (!userId) return false;
+  try {
+    return localStorage.getItem(trashExpandedStorageKey(userId)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeTrashedExpanded(userId: string | undefined, expanded: boolean): void {
+  if (!userId) return;
+  try {
+    localStorage.setItem(trashExpandedStorageKey(userId), expanded ? "1" : "0");
   } catch {
     /* private mode / quota */
   }
@@ -167,6 +186,13 @@ export type SidebarProps = {
   loadingMore?: boolean;
   onLoadArchived?: () => void;
   loadingArchived?: boolean;
+  /** 回收站会话（独立列表；deletedAt 非空）。展开「回收站」时拉取。 */
+  trashed?: Session[];
+  trashedLoading?: boolean;
+  onLoadTrashed?: () => void;
+  /** 回收站行菜单：还原 / 彻底删除。 */
+  onRestore?: (s: Session) => void;
+  onPurge?: (s: Session) => void;
   onSearchMessages?: (
     q: string,
     signal: AbortSignal,
@@ -230,6 +256,11 @@ export function Sidebar({
   loadingMore,
   onLoadArchived,
   loadingArchived,
+  trashed,
+  trashedLoading,
+  onLoadTrashed,
+  onRestore,
+  onPurge,
   onSearchMessages,
   searchProjectId,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
@@ -238,6 +269,7 @@ export function Sidebar({
   const [now, setNow] = useState(() => Date.now());
   const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(null);
   const [archivedExpanded, setArchivedExpanded] = useState(() => readArchivedExpanded(user?.id));
+  const [trashedExpanded, setTrashedExpanded] = useState(() => readTrashedExpanded(user?.id));
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [multiSelect, setMultiSelect] = useState(false);
   const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
@@ -251,10 +283,21 @@ export function Sidebar({
   useEffect(() => {
     writeArchivedExpanded(userId, archivedExpanded);
   }, [userId, archivedExpanded]);
+  useEffect(() => {
+    setTrashedExpanded(readTrashedExpanded(userId));
+  }, [userId]);
+  useEffect(() => {
+    writeTrashedExpanded(userId, trashedExpanded);
+  }, [userId, trashedExpanded]);
   // 仅在挂载时按持久化展开去拉归档列表；之后由点击处理。
   // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only restore of archived list
   useEffect(() => {
     if (archivedExpanded) onLoadArchived?.();
+  }, []);
+  // 回收站同款：挂载时已展开则拉一次，之后由点击处理。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only restore of trashed list
+  useEffect(() => {
+    if (trashedExpanded) onLoadTrashed?.();
   }, []);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
@@ -295,6 +338,23 @@ export function Sidebar({
     () => sessions.filter((s) => s.archived).sort(compareByUpdatedDesc),
     [sessions],
   );
+  // 回收站：独立于主列表（不吃 archived 过滤/搜索分组），最近删除排前面。
+  const trashedSessions = useMemo(
+    () =>
+      (trashed ?? [])
+        .slice()
+        .sort((a, b) => {
+          const da = a.deletedAt ?? 0;
+          const db = b.deletedAt ?? 0;
+          if (da !== db) return da < db ? 1 : -1;
+          return compareByUpdatedDesc(a, b);
+        }),
+    [trashed],
+  );
+  const trashedIdSet = useMemo(() => new Set(trashedSessions.map((s) => s.id)), [trashedSessions]);
+  // 批量条按钮切换：所选会话全部在回收站 → 只显示 还原/彻底删除。
+  const selectedAllTrashed =
+    selectedIds.size > 0 && [...selectedIds].every((id) => trashedIdSet.has(id));
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -397,6 +457,9 @@ export function Sidebar({
         archived: archivedSessions,
         archivedExpanded,
         archivedLoading: loadingArchived,
+        trashed: trashedSessions,
+        trashedExpanded,
+        trashedLoading,
         searchHits,
         searchRemote,
         localEmpty: filtered.length === 0,
@@ -414,6 +477,9 @@ export function Sidebar({
       archivedSessions,
       archivedExpanded,
       loadingArchived,
+      trashedSessions,
+      trashedExpanded,
+      trashedLoading,
       searchHits,
       searchRemote,
       filtered.length,
@@ -570,6 +636,8 @@ export function Sidebar({
           onTogglePin={onTogglePin}
           onMoveToProject={onMoveToProject}
           onArchive={onArchive}
+          onRestore={onRestore}
+          onPurge={onPurge}
           onMarkRead={onMarkRead}
           unread={unreadIds?.has(s.id)}
           multiSelect={multiSelect}
@@ -685,6 +753,29 @@ export function Sidebar({
           )}
           <Archive size={14} className="shrink-0 text-faint" />
           <span className="min-w-0 flex-1 truncate">已归档</span>
+          <span className="shrink-0 text-caption text-faint">{item.count}</span>
+        </button>
+      );
+    }
+    if (item.kind === "trashToggle") {
+      return (
+        <button
+          type="button"
+          aria-expanded={item.expanded}
+          onClick={() => {
+            const next = !trashedExpanded;
+            setTrashedExpanded(next);
+            if (next) onLoadTrashed?.();
+          }}
+          className="flex h-full w-full items-center gap-1.5 rounded-md px-2 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {item.expanded ? (
+            <ChevronDown size={14} className="shrink-0 text-faint" />
+          ) : (
+            <ChevronRight size={14} className="shrink-0 text-faint" />
+          )}
+          <Trash2 size={14} className="shrink-0 text-faint" />
+          <span className="min-w-0 flex-1 truncate">回收站</span>
           <span className="shrink-0 text-caption text-faint">{item.count}</span>
         </button>
       );
@@ -827,6 +918,7 @@ export function Sidebar({
       {multiSelect && onBatch && (
         <BatchBar
           count={selectedIds.size}
+          allTrashed={selectedAllTrashed}
           projects={orderedProjects}
           onAction={(action, projectId) => {
             if (selectedIds.size === 0) return;

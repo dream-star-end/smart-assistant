@@ -41,10 +41,10 @@ function detail(id: string): SessionDetail {
   };
 }
 
-// ── 改名 / 删除:三持有方收口 + 不可逆操作的确认门 ─────────────────────────────
+// ── 改名 / 删除:三持有方收口 + 危险操作的确认门 ─────────────────────────────
 // 侧栏的改名与删除各自要同时落三处(App 列表 state / WS service 与 IndexedDB / 服务端
 // canonical),漏一处的表现都是"看起来成了,刷新又回去"或者"本地没了、云端复活"。
-// 删除更是不可逆(确认文案:本地与云端记录都将删除,不可恢复),取消路径必须一处都不动。
+// 删除会移入回收站(确认文案:3 天后自动彻底清理,期间可还原),取消路径必须一处都不动。
 // 这些行为此前零覆盖。
 function meta(id: string, title: string) {
   return {
@@ -131,8 +131,8 @@ async function renderSessionList(opts: {
   return { result, harness };
 }
 
-describe("useSessionList 删除会话（不可逆）", () => {
-  test("先弹危险确认，文案点名该会话且说明云端也会删", async () => {
+describe("useSessionList 删除会话（移入回收站）", () => {
+  test("先弹危险确认，文案点名该会话且说明移入回收站 3 天后清理", async () => {
     const { result, harness } = await renderSessionList({
       confirmResult: false,
       promptResult: null,
@@ -145,8 +145,10 @@ describe("useSessionList 删除会话（不可逆）", () => {
     const ask = harness.confirmCalls[0];
     expect(ask.danger).toBe(true);
     expect(ask.confirmText).toBe("删除");
+    expect(ask.title).toBe("删除该会话？");
     expect(String(ask.body)).toContain("待删除的会话");
-    expect(String(ask.body)).toContain("不可恢复");
+    expect(String(ask.body)).toContain("回收站");
+    expect(String(ask.body)).toContain("3 天后");
   });
 
   test("用户取消 → 本地、IndexedDB、服务端一处都不动", async () => {
@@ -659,6 +661,19 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(page.mock.calls[0][1]).toEqual({ includeArchived: true });
   });
 
+  test("batchUpdateSessions 删除确认文案说明移入回收站", async () => {
+    const batch = vi.spyOn(api, "batchSessions").mockResolvedValue({ ok: true, updated: 1 });
+    const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webdropme001"], "delete");
+    });
+    const ask = harness.confirmCalls[0];
+    expect(ask.title).toBe("删除 1 条会话？");
+    expect(String(ask.body)).toContain("回收站");
+    expect(String(ask.body)).toContain("3 天后");
+    expect(batch).not.toHaveBeenCalled();
+  });
+
   test("searchSessionMessages 透传服务端命中与项目过滤，AbortError 当空数组", async () => {
     const search = vi.spyOn(api, "searchSessions").mockResolvedValue({
       results: [
@@ -745,5 +760,180 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(result.current.sessions.map((s) => s.id)).toEqual(
       expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
     );
+  });
+});
+
+// ── 回收站：独立列表 + 还原/彻底删除 ──────────────────────────────────────────
+function trashedMeta(id: string, title: string, deletedAt: number) {
+  return { ...meta(id, title), pinned: false, createdAt: 1, deletedAt, archived: true };
+}
+
+async function renderWithTrash(opts: { confirmResult: boolean }) {
+  const page = vi.spyOn(api, "listSessionsPage").mockResolvedValue({
+    sessions: [trashedMeta("webtrash001", "回收站会话", 4_000)],
+  });
+  const rendered = await renderSessionList({
+    confirmResult: opts.confirmResult,
+    promptResult: null,
+  });
+  return { ...rendered, page };
+}
+
+describe("useSessionList 回收站", () => {
+  test("loadTrashedSessions 用 trashed=1 拉取，存独立列表且不并入主列表", async () => {
+    const { result, page } = await renderWithTrash({ confirmResult: false });
+    expect(result.current.trashedSessions).toEqual([]);
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(page.mock.calls[0][1]).toEqual({ trashed: true });
+    expect(result.current.trashedSessions.map((s) => s.id)).toEqual(["webtrash001"]);
+    expect(result.current.trashedSessions[0].deletedAt).toBe(4_000);
+    // 回收站是独立列表：主列表不该出现回收站会话。
+    expect(result.current.sessions.map((s) => s.id)).not.toContain("webtrash001");
+  });
+
+  test("restoreSession 乐观搬回主列表并清 deletedAt；服务端拒绝则双侧回滚", async () => {
+    const restore = vi.spyOn(api, "restoreSession").mockRejectedValue(new Error("boom"));
+    const { result } = await renderWithTrash({ confirmResult: false });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    const target = result.current.trashedSessions[0];
+    await act(async () => {
+      await result.current.restoreSession(target);
+    });
+    expect(restore).toHaveBeenCalledWith(expect.anything(), "webtrash001");
+    // 回滚：回到回收站、主列表没有它。
+    expect(result.current.trashedSessions.map((s) => s.id)).toEqual(["webtrash001"]);
+    expect(result.current.sessions.map((s) => s.id)).not.toContain("webtrash001");
+
+    // 成功路径：离开回收站、主列表可见且 deletedAt 清空。
+    restore.mockResolvedValue({ updatedAt: 9_000 });
+    await act(async () => {
+      await result.current.restoreSession(result.current.trashedSessions[0]);
+    });
+    expect(result.current.trashedSessions).toEqual([]);
+    expect(result.current.sessions.map((s) => s.id)).toContain("webtrash001");
+    expect(result.current.sessions.find((s) => s.id === "webtrash001")?.deletedAt).toBeUndefined();
+  });
+
+  test("purgeSessionConfirm 取消 → 不发 purge、回收站不动", async () => {
+    const purge = vi.spyOn(api, "purgeSession").mockResolvedValue(undefined);
+    const { result, harness } = await renderWithTrash({ confirmResult: false });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    await act(async () => {
+      await result.current.purgeSessionConfirm(result.current.trashedSessions[0]);
+    });
+    const ask = harness.confirmCalls[0];
+    expect(ask.title).toBe("彻底删除该会话？");
+    expect(ask.danger).toBe(true);
+    expect(String(ask.body)).toContain("不可恢复");
+    expect(purge).not.toHaveBeenCalled();
+    expect(result.current.trashedSessions).toHaveLength(1);
+  });
+
+  test("purgeSessionConfirm 确认 → 调 api.purgeSession 并移出回收站", async () => {
+    const purge = vi.spyOn(api, "purgeSession").mockResolvedValue(undefined);
+    const { result } = await renderWithTrash({ confirmResult: true });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    await act(async () => {
+      await result.current.purgeSessionConfirm(result.current.trashedSessions[0]);
+    });
+    expect(purge).toHaveBeenCalledTimes(1);
+    expect(purge.mock.calls[0][1]).toBe("webtrash001");
+    expect(result.current.trashedSessions).toEqual([]);
+    // 彻底删除不进主列表。
+    expect(result.current.sessions.map((s) => s.id)).not.toContain("webtrash001");
+  });
+
+  test("删除会话成功后，已拉取过的回收站立刻可见该行（带 deletedAt）", async () => {
+    const { result, harness } = await renderWithTrash({ confirmResult: true });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    expect(result.current.trashedSessions.map((s) => s.id)).toEqual(["webtrash001"]);
+    const target = result.current.sessions.find((s) => s.id === "webdropme001")!;
+    await act(async () => {
+      await result.current.deleteSessionConfirm(target);
+    });
+    // deleteSession 是 fire-and-forget，等微任务落定后再断言。
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.deleteSession).toHaveBeenCalledWith(expect.anything(), "webdropme001");
+    expect(result.current.trashedSessions.map((s) => s.id)).toEqual([
+      "webdropme001",
+      "webtrash001",
+    ]);
+    expect(result.current.trashedSessions[0].deletedAt).toBeGreaterThan(0);
+  });
+
+  test("batchUpdateSessions restore：批量还原搬回主列表", async () => {
+    const batch = vi.spyOn(api, "batchSessions").mockResolvedValue({ ok: true, updated: 1 });
+    const { result } = await renderWithTrash({ confirmResult: true });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webtrash001"], "restore");
+    });
+    expect(batch).toHaveBeenCalledWith(expect.anything(), {
+      ids: ["webtrash001"],
+      action: "restore",
+    });
+    expect(result.current.trashedSessions).toEqual([]);
+    expect(result.current.sessions.map((s) => s.id)).toContain("webtrash001");
+    expect(result.current.sessions.find((s) => s.id === "webtrash001")?.deletedAt).toBeUndefined();
+  });
+
+  test("batchUpdateSessions restore 失败：回滚到回收站", async () => {
+    vi.spyOn(api, "batchSessions").mockRejectedValue(new Error("nope"));
+    const { result } = await renderWithTrash({ confirmResult: true });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webtrash001"], "restore");
+    });
+    expect(result.current.trashedSessions.map((s) => s.id)).toEqual(["webtrash001"]);
+    expect(result.current.sessions.map((s) => s.id)).not.toContain("webtrash001");
+  });
+
+  test("batchUpdateSessions purge：先弹条数确认，确认后批量彻底删除", async () => {
+    const batch = vi.spyOn(api, "batchSessions").mockResolvedValue({ ok: true, updated: 1 });
+    const { result, harness } = await renderWithTrash({ confirmResult: true });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webtrash001"], "purge");
+    });
+    const ask = harness.confirmCalls[harness.confirmCalls.length - 1];
+    expect(ask.title).toBe("彻底删除 1 条会话？");
+    expect(String(ask.body)).toContain("不可恢复");
+    expect(batch).toHaveBeenCalledWith(expect.anything(), {
+      ids: ["webtrash001"],
+      action: "purge",
+    });
+    expect(result.current.trashedSessions).toEqual([]);
+  });
+
+  test("batchUpdateSessions purge 取消 → 不发批量请求、回收站不动", async () => {
+    const batch = vi.spyOn(api, "batchSessions").mockResolvedValue({ ok: true, updated: 1 });
+    const { result } = await renderWithTrash({ confirmResult: false });
+    await act(async () => {
+      await result.current.loadTrashedSessions();
+    });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webtrash001"], "purge");
+    });
+    expect(batch).not.toHaveBeenCalled();
+    expect(result.current.trashedSessions).toHaveLength(1);
   });
 });

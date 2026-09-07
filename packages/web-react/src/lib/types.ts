@@ -92,6 +92,8 @@ export type Session = {
   lastErrorCode?: string | null;
   /** 已归档。默认列表不展示；侧栏「已归档」分组展开后可见。 */
   archived?: boolean;
+  /** 回收站：删除时刻（epoch ms）。非空 = 在回收站，3 天后自动彻底清理（见 SessionMeta.deletedAt）。 */
+  deletedAt?: number;
   /** 服务端派生：有终态未看。绿点是否画出仍由 resolveSidebarDot 决定。 */
   unread?: boolean;
   /** 最后一条消息纯文本前 80 字（listSessions 新字段；缺省则会话行不占摘要位）。 */
@@ -168,6 +170,8 @@ export type SessionListQuery = {
   /** 上一页最老一条的 lastAt（毫秒）。 */
   before?: number;
   includeArchived?: boolean;
+  /** 只列回收站会话（trashed=1）；返回项带 deletedAt。 */
+  trashed?: boolean;
 };
 
 /** GET /api/sessions/list 分页信封。无参请求也可能带 nextCursor（新后端）。 */
@@ -191,7 +195,15 @@ export type SessionSearchResponse = {
   results: SessionSearchHit[];
 };
 
-export type SessionBatchAction = "archive" | "unarchive" | "delete" | "move";
+export type SessionBatchAction =
+  | "archive"
+  | "unarchive"
+  | "delete"
+  | "move"
+  /** 回收站还原（仅对 trashed 会话有意义）。 */
+  | "restore"
+  /** 回收站彻底删除（仅对 trashed 会话有意义，不可恢复）。 */
+  | "purge";
 
 /** POST /api/sessions/batch */
 export type SessionBatchInput = {
@@ -442,6 +454,8 @@ export type SessionMeta = {
   lastOutcome?: SessionLastOutcome | null;
   lastErrorCode?: string | null;
   archived?: boolean;
+  /** 回收站：删除时刻（epoch ms）。非空 = 已入回收站；purge 时间 = deletedAt + 3 天。 */
+  deletedAt?: number;
   unread?: boolean;
   lastMessagePreview?: string;
 };

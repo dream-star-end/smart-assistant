@@ -1,4 +1,4 @@
-import { Archive, Pin } from "lucide-react";
+import { Archive, Pin, RotateCcw, Trash2 } from "lucide-react";
 import type { ChatProject, Session } from "../../lib/types";
 import { isSidebarSessionRunning } from "../../lib/sessionStatus";
 import { cn } from "../../lib/utils";
@@ -19,6 +19,14 @@ import { MoreHorizontal } from "lucide-react";
 import { SESSION_DRAG_TYPE } from "./constants";
 import { formatCompactDuration, sessionDurationWindow } from "./compactDuration";
 
+/** 回收站保留期：3 天（与后端 purge 调度一致）。 */
+const TRASH_RETENTION_MS = 3 * 24 * 3600 * 1000;
+
+/** 回收站行右侧「{n} 天后清理」：n 至少 1（删除当天显示 3，次日 2……到期当天 1）。 */
+export function trashDaysLeft(deletedAt: number, now: number): number {
+  return Math.max(1, Math.ceil((deletedAt + TRASH_RETENTION_MS - now) / (24 * 3600 * 1000)));
+}
+
 export function SessionRow({
   session: s,
   active,
@@ -33,6 +41,8 @@ export function SessionRow({
   onTogglePin,
   onMoveToProject,
   onArchive,
+  onRestore,
+  onPurge,
   onMarkRead,
   unread,
   multiSelect,
@@ -54,6 +64,9 @@ export function SessionRow({
   onTogglePin?: (s: Session) => void;
   onMoveToProject?: (s: Session, projectId: string | null) => void;
   onArchive?: (s: Session) => void;
+  /** 回收站行专用：还原 / 彻底删除（deletedAt 非空时菜单只余这两项）。 */
+  onRestore?: (s: Session) => void;
+  onPurge?: (s: Session) => void;
   onMarkRead?: (id: string) => void;
   unread?: boolean;
   multiSelect: boolean;
@@ -65,7 +78,10 @@ export function SessionRow({
   const live = liveTerminal?.(s.id);
   const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
   const title = s.title || "新对话";
-  const duration = sessionDurationWindow(s, running, now);
+  // 回收站行：不可打开、不可拖拽；菜单只剩 还原/彻底删除。
+  const trashed = s.deletedAt != null;
+  const cleanupIn = trashed && s.deletedAt != null ? trashDaysLeft(s.deletedAt, now) : null;
+  const duration = trashed ? null : sessionDurationWindow(s, running, now);
   const durationText = duration ? formatCompactDuration(duration.endAt - duration.startAt) : "";
   const durationTitle = duration
     ? `${formatDate(duration.startAt, "datetime")} → ${running ? "现在" : formatDate(duration.endAt, "datetime")}`
@@ -73,8 +89,12 @@ export function SessionRow({
 
   return (
     <div
-      draggable={allowDrag && Boolean(onMoveToProject)}
+      draggable={allowDrag && Boolean(onMoveToProject) && !trashed}
       onDragStart={(e) => {
+        if (trashed) {
+          e.preventDefault();
+          return;
+        }
         e.dataTransfer.setData(SESSION_DRAG_TYPE, s.id);
         e.dataTransfer.effectAllowed = "move";
       }}
@@ -111,15 +131,23 @@ export function SessionRow({
       <button
         type="button"
         onClick={() => {
+          // 回收站行不可打开为活动会话（也无需标已读）。
+          if (trashed) return;
           onMarkRead?.(s.id);
           onSelect(s.id);
         }}
         aria-current={active ? "true" : undefined}
         aria-label={title}
+        aria-disabled={trashed ? "true" : undefined}
         className="flex h-full min-w-0 flex-1 items-center rounded-md px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <span className={cn("truncate", unread && "font-semibold text-fg")}>{title}</span>
       </button>
+      {cleanupIn != null && (
+        <span data-session-cleanup className="shrink-0 tabular-nums text-caption text-faint">
+          {cleanupIn} 天后清理
+        </span>
+      )}
       {durationText && (
         <span
           title={durationTitle}
@@ -142,49 +170,70 @@ export function SessionRow({
           </IconButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-44" onCloseAutoFocus={(e) => e.preventDefault()}>
-          <DropdownMenuItem onSelect={() => onRename(s)}>重命名</DropdownMenuItem>
-          {onTogglePin && (
-            <DropdownMenuItem onSelect={() => onTogglePin(s)}>
-              <Pin size={14} className="shrink-0 text-muted" />
-              {s.pinned ? "取消置顶" : "置顶"}
-            </DropdownMenuItem>
+          {trashed ? (
+            <>
+              {onRestore && (
+                <DropdownMenuItem onSelect={() => onRestore(s)}>
+                  <RotateCcw size={14} className="shrink-0 text-muted" />
+                  还原
+                </DropdownMenuItem>
+              )}
+              {onPurge && (
+                <DropdownMenuItem destructive onSelect={() => onPurge(s)}>
+                  <Trash2 size={14} className="shrink-0" />
+                  彻底删除
+                </DropdownMenuItem>
+              )}
+            </>
+          ) : (
+            <>
+              <DropdownMenuItem onSelect={() => onRename(s)}>重命名</DropdownMenuItem>
+              {onTogglePin && (
+                <DropdownMenuItem onSelect={() => onTogglePin(s)}>
+                  <Pin size={14} className="shrink-0 text-muted" />
+                  {s.pinned ? "取消置顶" : "置顶"}
+                </DropdownMenuItem>
+              )}
+              {onArchive && (
+                <DropdownMenuItem onSelect={() => onArchive(s)}>
+                  <Archive size={14} className="shrink-0 text-muted" />
+                  {s.archived ? "取消归档" : "归档"}
+                </DropdownMenuItem>
+              )}
+              {onMoveToProject && (
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger>移动到项目</DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent className="w-44">
+                    {projects.length === 0 && (
+                      <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>
+                    )}
+                    {projects.map((p) => (
+                      <DropdownMenuItem
+                        key={p.id}
+                        disabled={s.projectId === p.id}
+                        onSelect={() => onMoveToProject(s, p.id)}
+                      >
+                        {p.name}
+                      </DropdownMenuItem>
+                    ))}
+                    {s.projectId && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>
+                          移出项目
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              )}
+              <DropdownMenuItem onSelect={() => onEnterMultiSelect(s.id)}>多选</DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem destructive onSelect={() => onDelete(s)}>
+                删除
+              </DropdownMenuItem>
+            </>
           )}
-          {onArchive && (
-            <DropdownMenuItem onSelect={() => onArchive(s)}>
-              <Archive size={14} className="shrink-0 text-muted" />
-              {s.archived ? "取消归档" : "归档"}
-            </DropdownMenuItem>
-          )}
-          {onMoveToProject && (
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger>移动到项目</DropdownMenuSubTrigger>
-              <DropdownMenuSubContent className="w-44">
-                {projects.length === 0 && (
-                  <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>
-                )}
-                {projects.map((p) => (
-                  <DropdownMenuItem
-                    key={p.id}
-                    disabled={s.projectId === p.id}
-                    onSelect={() => onMoveToProject(s, p.id)}
-                  >
-                    {p.name}
-                  </DropdownMenuItem>
-                ))}
-                {s.projectId && (
-                  <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>移出项目</DropdownMenuItem>
-                  </>
-                )}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          )}
-          <DropdownMenuItem onSelect={() => onEnterMultiSelect(s.id)}>多选</DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive onSelect={() => onDelete(s)}>
-            删除
-          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

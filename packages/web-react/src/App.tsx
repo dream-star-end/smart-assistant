@@ -582,6 +582,11 @@ export function App() {
     loadingMoreSessions,
     loadArchivedSessions,
     loadingArchived,
+    trashedSessions,
+    trashedLoading,
+    loadTrashedSessions,
+    restoreSession,
+    purgeSessionConfirm,
     searchSessionMessages,
     applySessionTerminal,
     reset: resetSessionList,
@@ -2980,6 +2985,11 @@ export function App() {
     loadingMore: loadingMoreSessions,
     onLoadArchived: loadArchivedSessions,
     loadingArchived,
+    trashed: trashedSessions,
+    trashedLoading,
+    onLoadTrashed: loadTrashedSessions,
+    onRestore: restoreSession,
+    onPurge: purgeSessionConfirm,
     onSearchMessages: searchSessionMessages,
   };
   const closeMobileThen = (fn?: () => void) =>

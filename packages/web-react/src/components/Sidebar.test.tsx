@@ -109,8 +109,8 @@ describe("Sidebar 管理中心入口副标题", () => {
 
 // ── 会话列表本体 ───────────────────────────────────────────────────────────────
 // 之前本文件的 5 条用例全跑在 sessions: [] 上:列表渲染、选中态、改名/删除入口、
-// 搜索过滤**一条都没被覆盖**,而这些是侧栏唯一的日常用途,删除还是不可逆动作
-// (useSessionList 的确认文案:「本地与云端记录都将删除,不可恢复」)。
+// 搜索过滤**一条都没被覆盖**,而这些是侧栏唯一的日常用途,删除还要过危险确认
+// (useSessionList 的确认文案:「移入回收站,3 天后自动彻底清理」)。
 // 断言的是用户可见事实,不锁 class/DOM 排列。
 function session(over: Partial<Session> & { id: string }): Session {
   return {
@@ -1020,6 +1020,90 @@ describe("Sidebar 归档与批量", () => {
     expect(screen.queryByLabelText("选择 季度复盘 Alpha")).toBeNull();
     expect(screen.queryByLabelText("选择 Beta 上线检查")).toBeNull();
     expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+});
+
+describe("Sidebar 回收站", () => {
+  const trashedRow = session({
+    id: "t-1",
+    title: "被删的会话",
+    deletedAt: Date.now() - 60_000,
+  });
+
+  it("默认折叠；展开时拉取并显示空态，展开态按 userId 持久化", () => {
+    const onLoadTrashed = vi.fn();
+    renderSidebar({
+      sessions: [session({ id: "s-live", title: "进行中" })],
+      trashed: [],
+      onLoadTrashed,
+    });
+    const toggle = screen.getByRole("button", { name: /回收站/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(onLoadTrashed).not.toHaveBeenCalled();
+    fireEvent.click(toggle);
+    expect(onLoadTrashed).toHaveBeenCalledTimes(1);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("回收站是空的")).toBeInTheDocument();
+    expect(localStorage.getItem("oc_v5_sidebar_trash_expanded:u1")).toBe("1");
+  });
+
+  it("trashedExpanded 按 userId 从 localStorage 恢复并触发拉取", () => {
+    localStorage.setItem("oc_v5_sidebar_trash_expanded:u1", "1");
+    const onLoadTrashed = vi.fn();
+    renderSidebar({ trashed: [trashedRow], onLoadTrashed });
+    expect(screen.getByRole("button", { name: /回收站/ })).toHaveAttribute("aria-expanded", "true");
+    expect(onLoadTrashed).toHaveBeenCalled();
+  });
+
+  it("回收站行展示「{n} 天后清理」；菜单只有 还原/彻底删除；点击行不打开会话", () => {
+    const onSelect = vi.fn();
+    const onRestore = vi.fn();
+    const onPurge = vi.fn();
+    renderSidebar({
+      trashed: [trashedRow],
+      onLoadTrashed: () => {},
+      onSelect,
+      onRestore,
+      onPurge,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /回收站/ }));
+    const row = screen.getByRole("button", { name: "被删的会话" });
+    expect(row.closest("div")!.querySelector("[data-session-cleanup]")).toHaveTextContent(
+      "3 天后清理",
+    );
+    fireEvent.click(row);
+    expect(onSelect).not.toHaveBeenCalled();
+
+    openSessionMenu("被删的会话");
+    expect(screen.getByRole("menuitem", { name: "还原" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "彻底删除" })).toBeInTheDocument();
+    // 常规菜单项全部隐藏。
+    expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "归档" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "多选" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "还原" }));
+    expect(onRestore).toHaveBeenCalledTimes(1);
+    expect(onRestore.mock.calls[0][0].id).toBe("t-1");
+    expect(onPurge).not.toHaveBeenCalled();
+  });
+
+  it("多选只选回收站会话时批量条换为 还原/彻底删除", () => {
+    const onBatch = vi.fn();
+    renderSidebar({
+      sessions: [session({ id: "s-live", title: "进行中" })],
+      trashed: [trashedRow],
+      onLoadTrashed: () => {},
+      onBatch,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /回收站/ }));
+    fireEvent.click(screen.getByRole("button", { name: "多选" }));
+    fireEvent.click(screen.getByLabelText("选择 被删的会话"));
+    const bar = screen.getByTestId("sidebar-batch-bar");
+    expect(bar).toHaveTextContent("已选 1 条");
+    expect(screen.getByRole("button", { name: "还原" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "彻底删除" }));
+    expect(onBatch).toHaveBeenCalledWith(["t-1"], "purge", undefined);
   });
 });
 

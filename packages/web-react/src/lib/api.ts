@@ -1793,7 +1793,7 @@ export const api = {
     api.listSessionsPage(a).then((page) => page.sessions),
 
   /**
-   * 会话列表分页（GET /api/sessions/list?limit=&before=&includeArchived=1）。
+   * 会话列表分页（GET /api/sessions/list?limit=&before=&includeArchived=1&trashed=1）。
    * 不传 query 时后端行为与全量列表一致；有 nextCursor 则可继续用 before 拉下一页。
    */
   listSessionsPage: (a: AuthSession, query?: SessionListQuery): Promise<SessionListPage> => {
@@ -1801,6 +1801,7 @@ export const api = {
     if (query?.limit != null) params.set("limit", String(query.limit));
     if (query?.before != null) params.set("before", String(query.before));
     if (query?.includeArchived) params.set("includeArchived", "1");
+    if (query?.trashed) params.set("trashed", "1");
     const qs = params.toString();
     return jsonOrThrow<{ sessions: SessionMeta[]; nextCursor?: number }>(
       callWithRefresh(a, (t) =>
@@ -1848,7 +1849,7 @@ export const api = {
   },
 
   /**
-   * 批量归档 / 取消归档 / 删除 / 移动项目（POST /api/sessions/batch）。
+   * 批量归档 / 取消归档 / 删除 / 移动项目 / 回收站还原·彻底删除（POST /api/sessions/batch）。
    */
   batchSessions: (a: AuthSession, body: SessionBatchInput): Promise<SessionBatchResult> =>
     jsonOrThrow<SessionBatchResult>(
@@ -2281,11 +2282,35 @@ export const api = {
       ),
     ).then(() => undefined),
 
-  /** 删除会话（DELETE /api/sessions/:id，Bearer）。幂等，恒 200。 */
+  /** 删除会话（DELETE /api/sessions/:id，Bearer）。幂等，恒 200。删除即移入回收站，3 天后自动清理。 */
   deleteSession: (a: AuthSession, id: string): Promise<void> =>
     jsonOrThrow<{ ok: true }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  /** 回收站还原（POST /api/sessions/:id/restore，Bearer）。404 = 已不在回收站。 */
+  restoreSession: (a: AuthSession, id: string): Promise<{ updatedAt?: number }> =>
+    jsonOrThrow<{ ok: true; updatedAt?: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+        }),
+      ),
+    ).then((b) => ({ updatedAt: b.updatedAt })),
+
+  /** 彻底删除回收站会话（DELETE /api/sessions/:id?purge=1，Bearer）。不可恢复；404 = 已被清理。 */
+  purgeSession: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true; purged?: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}?purge=1`, {
           method: "DELETE",
           credentials: "include",
           headers: bearerHeaders(t),
