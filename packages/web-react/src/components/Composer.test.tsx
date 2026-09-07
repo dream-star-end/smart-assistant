@@ -63,6 +63,23 @@ describe("Composer 输入无障碍", () => {
   });
 });
 
+describe("Composer ↑ 拉上一条用户消息", () => {
+  test("空输入框按 ArrowUp 填入 lastUserText", () => {
+    render(<Composer onSend={() => {}} lastUserText="上一句用户消息" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue("上一句用户消息");
+  });
+
+  test("非空输入框按 ArrowUp 不改动", () => {
+    render(<Composer onSend={() => {}} lastUserText="上一句用户消息" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: "正在写" } });
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue("正在写");
+  });
+});
+
 describe("Composer 拖拽上传", () => {
   function fileDt(file?: File, types: string[] = ["Files"]) {
     const files = file ? [file] : [];

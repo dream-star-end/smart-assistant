@@ -148,6 +148,18 @@ describe("消息引用动作与已发送引用块", () => {
   });
 });
 
+describe("UserCard 编辑重发", () => {
+  test("status=replied 时有编辑按钮，点击回传该消息", () => {
+    const onEditResend = vi.fn();
+    const msg = userMsg({ status: "replied", text: "请把这段再改一改" });
+    render(<UserCard msg={msg} cb={{ onEditResend }} />);
+    const btn = screen.getByRole("button", { name: "编辑" });
+    expect(btn).toHaveClass("[@media(hover:none)]:size-11");
+    fireEvent.click(btn);
+    expect(onEditResend).toHaveBeenCalledWith(msg);
+  });
+});
+
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
   test.each([
     ["stopped", "本轮生成已停止。"],

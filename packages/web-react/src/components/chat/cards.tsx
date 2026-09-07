@@ -16,6 +16,7 @@ import {
   Sparkles,
   MessageSquare,
   MessageSquarePlus,
+  Pencil,
   Quote,
   Square,
   Target,
@@ -109,6 +110,8 @@ export type CardCallbacks = {
   resolveInterruptedContinuation?: (error: ChatMessage) => ChatMessage | undefined;
   /** 把 user / assistant 消息的精确快照带回 Composer。 */
   onQuote?: (msg: ChatMessage) => void;
+  /** 把用户原文放回输入框，改完发送即新 turn（不删原消息、不原地替换）。 */
+  onEditResend?: (msg: ChatMessage) => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -446,6 +449,16 @@ export function UserCard({
               <Quote size={15} />
             </IconButton>
           )}
+          <IconButton
+            aria-label="编辑"
+            title="编辑"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={() => cb?.onEditResend?.(msg)}
+          >
+            <Pencil size={15} />
+          </IconButton>
         </div>
       )}
     </div>

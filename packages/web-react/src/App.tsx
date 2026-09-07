@@ -2150,6 +2150,7 @@ export function App() {
             }
           },
       onRetrySend: demo ? undefined : retrySend,
+      onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
       onQuote: demo || !activeId
@@ -2210,6 +2211,23 @@ export function App() {
     messageReplyTarget && messageReplyTarget.sessionId === activeId
       ? messageReplyTarget.quote
       : null;
+
+  let lastUserText: string | undefined;
+  if (demo) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && messages[i].content) {
+        lastUserText = messages[i].content;
+        break;
+      }
+    }
+  } else {
+    for (let i = wsMessages.length - 1; i >= 0; i--) {
+      if (wsMessages[i].role === "user" && wsMessages[i].text) {
+        lastUserText = wsMessages[i].text;
+        break;
+      }
+    }
+  }
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -3331,6 +3349,7 @@ export function App() {
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
+            lastUserText={lastUserText}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}

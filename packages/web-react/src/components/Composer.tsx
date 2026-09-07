@@ -100,6 +100,7 @@ export function Composer({
   replyTo,
   onCancelReply,
   environmentPreparing,
+  lastUserText,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -134,6 +135,8 @@ export function Composer({
   onCancelReply?: () => void;
   /** 容器冷启/未就绪：输入区展示「环境准备中，约 20 秒」进度条，避免静默等待。 */
   environmentPreparing?: boolean;
+  /** 时间线最后一条用户正文；空输入框按 ↑ 填入。 */
+  lastUserText?: string;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -557,6 +560,17 @@ export function Composer({
               void onFiles(images);
             }}
             onKeyDown={(e) => {
+              if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
+                e.preventDefault();
+                setValue(lastUserText);
+                requestAnimationFrame(() => {
+                  const el = ref.current;
+                  if (!el) return;
+                  const end = lastUserText.length;
+                  el.setSelectionRange(end, end);
+                });
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                 if (coarsePointer) return;
