@@ -160,6 +160,22 @@ describe("UserCard 编辑重发", () => {
   });
 });
 
+describe("AssistantCard MetaRow 时间", () => {
+  test("助手卡 MetaRow 有 time 元素", () => {
+    const ts = Date.now() - 60_000;
+    render(
+      <AssistantCard
+        msg={{ id: "a-time", role: "assistant", text: "回答正文", ts }}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    const time = document.querySelector("time");
+    expect(time).toBeTruthy();
+    expect(time).toHaveAttribute("datetime", new Date(ts).toISOString());
+  });
+});
+
 describe("AssistantCard 切换模型按钮", () => {
   test("retry_or_switch 末轮错误卡在有 onOpenModelPicker 时渲染按钮并调用", () => {
     const onOpenModelPicker = vi.fn();

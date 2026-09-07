@@ -42,7 +42,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
+import { Alert, Avatar, Badge, Button, IconButton, TimeAgo } from "../ui";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
@@ -218,9 +218,15 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
   const waived = msg.usage?.waived === true;
   // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
   const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
-  if (!traceId && !showCredits && !waived) return null;
+  const showTime = Boolean(msg.ts);
+  if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
-    <div className="mt-1.5 flex items-center gap-2 text-faint">
+    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-faint">
+      {showTime && (
+        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap">
+          <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+        </time>
+      )}
       {waived && (
         <Badge tone="success" aria-label="本轮已免单">
           <Wallet size={11} /> 已免单
