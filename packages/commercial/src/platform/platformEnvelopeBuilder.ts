@@ -249,24 +249,29 @@ function resolveUserTimeZone(): string {
 }
 
 /**
- * 把 `now` 渲染成用户面时区的 `HH:MM` + `UTC±HH:MM` 偏移。
+ * 把 `now` 渲染成用户面时区的本地日期 `YYYY-MM-DD` + `UTC±HH:MM` 偏移。
+ *
+ * **只到日期,不到分钟**:这段文本落在 `messages[0]` 的 message 级 prompt-cache
+ * 前缀里,带 `HH:MM` 会让该路径每请求都 cache miss;日期粒度与既有
+ * `Today's date is <UTC 日>` 同频(每天变一次,本地日与 UTC 日切换点不同,最多两次)。
+ * 模型要精确时刻时仍可跑 `date -u`,再用这里给的偏移换算。
  *
  * 偏移取自 `timeZoneName: "longOffset"`(输出 `GMT+08:00`),改写成 `UTC+08:00`;
  * 半小时/45 分钟制时区(Asia/Kolkata `+05:30`、Pacific/Chatham `+12:45`)天然正确。
  * UTC 本身 longOffset 给 `GMT+00:00` → `UTC+00:00`。
  */
-function formatUserLocalTime(now: Date, tz: string): { time: string; offset: string } {
+function formatUserLocalDate(now: Date, tz: string): { date: string; offset: string } {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     timeZoneName: "longOffset",
   }).formatToParts(now);
   const pick = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
   const zoneName = pick("timeZoneName");
   return {
-    time: `${pick("hour")}:${pick("minute")}`,
+    date: `${pick("year")}-${pick("month")}-${pick("day")}`,
     offset: zoneName.startsWith("GMT") ? `UTC${zoneName.slice(3)}` : zoneName,
   };
 }
@@ -283,12 +288,12 @@ function formatUserLocalTime(now: Date, tz: string): { time: string; offset: str
  */
 function buildCurrentDateLine(isoDate: string, now: Date): string {
   const tz = resolveUserTimeZone();
-  const { time, offset } = formatUserLocalTime(now, tz);
+  const { date, offset } = formatUserLocalDate(now, tz);
   return (
     `Today's date is ${isoDate}. ` +
-    `(user local time ${time}, ${tz}, ${offset}). ` +
+    `(user local date ${date}, ${tz}, ${offset}). ` +
     "Subprocess `date` may report a different zone (egress-aligned); " +
-    "always use the user local time above for scheduling and user-facing timestamps."
+    "always use the user time zone above for scheduling and user-facing timestamps."
   );
 }
 

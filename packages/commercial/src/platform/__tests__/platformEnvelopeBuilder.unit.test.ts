@@ -817,20 +817,22 @@ describe("OCV5-166 用户面时区注入 system-reminder", () => {
     }
   }
 
-  // FIXED_DATE = 2026-05-21T00:00:00Z → Shanghai 08:00(+08:00),NY 前一日 20:00(-04:00)
+  // FIXED_DATE = 2026-05-21T00:00:00Z → Shanghai 本地日 05-21(+08:00),NY 本地日仍是 05-20(-04:00)
+  // 只到日期不到分钟:分钟粒度会让 messages[0] 的 prompt-cache 前缀每请求失效。
 
   test("TZ.1 OC_USER_TZ 缺省 → 回落 Asia/Shanghai,含 UTC+08:00", () => {
     const text = reminderWithUserTz(undefined);
     assert.ok(text.includes("Asia/Shanghai"), text);
     assert.ok(text.includes("UTC+08:00"), text);
-    assert.ok(text.includes("user local time 08:00"), text);
+    assert.ok(text.includes("user local date 2026-05-21"), text);
+    assert.ok(!/user local time \d{2}:\d{2}/.test(text), text);
   });
 
   test("TZ.2 OC_USER_TZ=America/New_York → 含该 tz 与 UTC-04:00 偏移", () => {
     const text = reminderWithUserTz("America/New_York");
     assert.ok(text.includes("America/New_York"), text);
     assert.ok(text.includes("UTC-04:00"), text);
-    assert.ok(text.includes("user local time 20:00"), text);
+    assert.ok(text.includes("user local date 2026-05-20"), text);
     assert.ok(!text.includes("Asia/Shanghai"), text);
   });
 
@@ -850,7 +852,7 @@ describe("OCV5-166 用户面时区注入 system-reminder", () => {
     const text = reminderWithUserTz("Asia/Kolkata");
     assert.ok(text.includes("Asia/Kolkata"), text);
     assert.ok(text.includes("UTC+05:30"), text);
-    assert.ok(text.includes("user local time 05:30"), text);
+    assert.ok(text.includes("user local date 2026-05-21"), text);
   });
 
   test("TZ.6 行为锁:`Today's date is <ISO>.` 前缀含句点原样保留", () => {
@@ -861,8 +863,8 @@ describe("OCV5-166 用户面时区注入 system-reminder", () => {
     assert.match(text, /Today's date is (?:now )?\d{4}-\d{2}-\d{2}/);
   });
 
-  test("TZ.7 用户面时刻不改 UTC 日期字面(日期仍来自 now 的 UTC 日)", () => {
-    // NY 当地已是 05-20 20:00,但 ISO 日期锁 UTC 的 2026-05-21 —— 不得被本地日覆盖。
+  test("TZ.7 用户面本地日不改 UTC 日期字面(前缀日期仍来自 now 的 UTC 日)", () => {
+    // NY 本地日已是 05-20,但 ISO 前缀锁 UTC 的 2026-05-21 —— 不得被本地日覆盖;两者并列出现。
     const text = reminderWithUserTz("America/New_York");
     assert.ok(text.includes("Today's date is 2026-05-21."), text);
   });
@@ -870,6 +872,6 @@ describe("OCV5-166 用户面时区注入 system-reminder", () => {
   test("TZ.8 含出口时区提示语,指引模型优先用用户本地时间", () => {
     const text = reminderWithUserTz(undefined);
     assert.ok(text.includes("egress-aligned"), text);
-    assert.ok(text.includes("always use the user local time above"), text);
+    assert.ok(text.includes("always use the user time zone above"), text);
   });
 });
