@@ -3198,6 +3198,35 @@
           "assertion": "INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof."
         }
       ]
+    },
+    {
+      "id": "INC-20260907-DELEGATE-LEDGER-REAP",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "V5 selfhost 委派账本 delegate_jobs 终态行在 2h TTL 被 sweep() 物理 DELETE，审计窗仅 ~2h 且反向偏置（卡住回调的行反而留下）；running 行唯一活性判据是 owner_lease_until，kind=cron 行 claimQueued 后无任何心跳，boot reconciler 在 session 仍挂 runner 时无限 defer，实测 dlgjob-mtqapydx（cron-origin-inject）idle 7.3h 不收口。修复：终态行软退休 retired_at + 7d/5000 行取宽剪枝、运行时读全部过滤 retired_at IS NULL、idempotency 部分唯一索引；新增 heartbeat-timeout reaper（30min，走 fail() 终态路径，failure_class=heartbeat_timeout，reap 后 interrupt 子会话）；cron 行在 claim→settle 之间挂 15s 定时心跳（协议事件不是心跳，tool_use_detected 不进 onEvent）。真实 SQLite 行为与真定时器心跳由 delegateDurable 单测验证；部署源码门只证明防回退，不冒称端到端或上线。",
+      "rootFixCommit": "35ff8fd8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateDurable.test.ts",
+          "assertion": "retires terminal rows at TTL instead of deleting, keeping 7d of history"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateDurable.test.ts",
+          "assertion": "reaps a running row idle past the heartbeat timeout; 29min is left alone"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateDurable.test.ts",
+          "assertion": "keeps a silent occurrence alive, and stops protecting it once halted"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof."
+        }
+      ]
     }
   ]
 }

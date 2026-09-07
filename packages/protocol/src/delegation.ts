@@ -40,6 +40,7 @@ export const DELEGATE_FAILURE_CLASSES = [
   'capacity_timeout',
   'capacity_queue_full',
   'idle_timeout',
+  'heartbeat_timeout',
   'grok_route_denied',
   'grok_relay_path',
   'grok_route_expired',

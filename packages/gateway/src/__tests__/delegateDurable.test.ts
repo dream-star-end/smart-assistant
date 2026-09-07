@@ -9,8 +9,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
-import { DelegateJobStore, DELEGATE_LEASE_HEARTBEAT_MAX_BEATS } from '../delegateJobs.js'
-import { DelegateDurableDb } from '../delegateDurable.js'
+import {
+  DelegateJobStore,
+  DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
+  resolveDelegateHeartbeatTimeoutMs,
+} from '../delegateJobs.js'
+import { DelegateDurableDb, resolveDelegateLedgerRetentionMs } from '../delegateDurable.js'
 import { isDelegateDurableEnabled, isDelegateDurableEffective } from '../delegateSmFlag.js'
 import {
   nextDelegateReconcileAt,
@@ -24,7 +28,7 @@ import {
   enqueueCronOccurrenceJob,
   settleCronDelegateJob,
 } from '../delegateCronIdempotency.js'
-import { backfillCronOccurrenceDelegateJobs } from '../cron.js'
+import { backfillCronOccurrenceDelegateJobs, startCronDelegateHeartbeat } from '../cron.js'
 import { callbackPayloadFromDurableJob } from '../sendToAgentCallback.js'
 import { persistDelegateJobSnapshots } from '../delegateCompleter.js'
 import { Gateway } from '../server.js'
@@ -957,3 +961,563 @@ describe('blocker 7: flag quadrants and baseline JSON DTO', () => {
   })
 })
 
+
+/**
+ * OCV5-164: the ledger must survive the 2h job TTL for process auditing, and a
+ * `running` row with no heartbeat must not pin a Grok delegate lease forever.
+ */
+describe('OCV5-164 ledger retention + heartbeat reaper', () => {
+  it('retires terminal rows at TTL instead of deleting, keeping 7d of history', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-retain-'))
+    try {
+      let clock = 1_000_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        durable,
+        bootId: 'gw:retain',
+        now: () => clock,
+      })
+      const created = store.create('coding-assistant', { sessionKey: 'sk-retain' })
+      assert.ok('jobId' in created)
+      const jobId = created.jobId
+      const snap0 = store.snapshotOf(jobId)!
+      assert.equal(
+        store.complete(
+          jobId,
+          { httpStatus: 200, body: { ok: true } },
+          { claimToken: snap0.claimToken!, fencingEpoch: snap0.fencingEpoch },
+        ),
+        true,
+      )
+
+      // Before TTL: the row is live and readable through the normal API.
+      assert.equal(store.get(jobId).status, 'done')
+
+      // Past TTL: the handle is gone (unchanged behaviour) …
+      clock += 61_000
+      assert.equal(store.sweep(), 1)
+      assert.equal(store.get(jobId).status, 'expired')
+      assert.equal(durable.get(jobId), undefined, 'retired rows are invisible to runtime reads')
+      assert.equal(store.nonTerminalCount(), 0)
+
+      // … but the audit ledger still has it (this is the OCV5-164 fix).
+      const stats = store.ledgerStats()
+      assert.equal(stats.total, 1)
+      assert.equal(stats.live, 0)
+      assert.equal(stats.retired, 1)
+      const retired = durable.loadRetired()
+      assert.equal(retired.length, 1)
+      assert.equal(retired[0]!.id, jobId)
+      assert.equal(retired[0]!.state, 'completed')
+
+      // A row 6d old is inside the 7d window → kept.
+      clock += 6 * 24 * 60 * 60_000
+      assert.equal(store.pruneRetiredLedger({ retentionMs: 7 * 24 * 60 * 60_000 }), 0)
+      assert.equal(store.ledgerStats().total, 1)
+
+      // 8d old and past the row-count floor → pruned.
+      clock += 2 * 24 * 60 * 60_000
+      assert.equal(
+        store.pruneRetiredLedger({ retentionMs: 7 * 24 * 60 * 60_000, keepRows: 0 }),
+        1,
+      )
+      assert.equal(store.ledgerStats().total, 0)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('newest-N floor keeps rows the time window would drop ("取宽")', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-floor-'))
+    try {
+      let clock = 1_000_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      const store = new DelegateJobStore({
+        sm: true,
+        ttlMs: 1_000,
+        durable,
+        bootId: 'gw:floor',
+        now: () => clock,
+      })
+      const created = store.create('coding-assistant', { sessionKey: 'sk-floor' })
+      assert.ok('jobId' in created)
+      const floorSnap = store.snapshotOf(created.jobId)!
+      assert.equal(
+        store.complete(
+          created.jobId,
+          { httpStatus: 200, body: { ok: true } },
+          { claimToken: floorSnap.claimToken!, fencingEpoch: floorSnap.fencingEpoch },
+        ),
+        true,
+      )
+      clock += 2_000
+      assert.equal(store.sweep(), 1)
+      clock += 30 * 24 * 60 * 60_000
+      // Well past the window, but the default floor keeps the newest rows.
+      assert.equal(store.pruneRetiredLedger({ retentionMs: 7 * 24 * 60 * 60_000 }), 0)
+      assert.equal(store.ledgerStats().retired, 1)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('reaps a running row idle past the heartbeat timeout; 29min is left alone', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-reap-'))
+    try {
+      let clock = 1_000_000
+      const store = openStore(dir, { bootId: 'gw:reap', now: () => clock })
+      const created = store.create('coding-assistant', { sessionKey: 'sk-reap' })
+      assert.ok('jobId' in created)
+      const jobId = created.jobId
+
+      // 29 minutes idle: under the 30min limit, must not be touched.
+      clock += 29 * 60_000
+      assert.deepEqual(store.reapStaleRunning({ timeoutMs: 30 * 60_000 }), [])
+      assert.equal(store.snapshotOf(jobId)?.state, 'running')
+
+      // 31 minutes idle: reaped through the normal terminal path.
+      clock += 2 * 60_000
+      const reaped = store.reapStaleRunning({ timeoutMs: 30 * 60_000 })
+      assert.equal(reaped.length, 1)
+      assert.equal(reaped[0]!.job.id, jobId)
+      assert.equal(reaped[0]!.job.state, 'failed')
+      assert.equal(reaped[0]!.job.failureClass, 'heartbeat_timeout')
+      assert.match(String(reaped[0]!.job.failureDetail), /idle 1860s/)
+      // idleSec is captured before fail() rewrites last_activity_at (W2).
+      assert.equal(reaped[0]!.idleSec, 1860)
+      // Terminal ⇒ the row no longer occupies delegate capacity.
+      assert.equal(store.nonTerminalCount(), 0)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('reaps an idle kind=cron row (the OCV5-164 lease-pinning case)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-reap-cron-'))
+    try {
+      let clock = 1_000_000
+      const store = openStore(dir, { bootId: 'gw:reapcron', now: () => clock })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-1',
+        dueMinuteKey: 42,
+        agentId: 'coding-assistant',
+        sessionKey: 'sk-cron',
+      })
+      assert.ok('jobId' in enq)
+      const fence = claimCronDelegateExecution(store, enq.jobId)
+      assert.equal(store.snapshotOf(enq.jobId)?.state, 'running')
+
+      // A live occurrence pushes last_activity_at forward, so it is spared.
+      clock += 25 * 60_000
+      assert.equal(store.touchActivity(enq.jobId, fence), true)
+      clock += 25 * 60_000
+      assert.deepEqual(store.reapStaleRunning({ timeoutMs: 30 * 60_000 }), [])
+
+      // No further progress for >30min ⇒ reaped, matching the 7.3h idle cron row.
+      clock += 10 * 60_000
+      const reaped = store.reapStaleRunning({ timeoutMs: 30 * 60_000 })
+      assert.equal(reaped.length, 1)
+      assert.equal(reaped[0]!.job.kind, 'cron')
+      assert.equal(reaped[0]!.job.failureClass, 'heartbeat_timeout')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('touchActivity moves last_activity_at forward and needs the fence', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-touch-'))
+    try {
+      let clock = 1_000_000
+      const store = openStore(dir, { bootId: 'gw:touch', now: () => clock })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-2',
+        dueMinuteKey: 7,
+        agentId: 'coding-assistant',
+        sessionKey: 'sk-touch',
+      })
+      assert.ok('jobId' in enq)
+      const fence = claimCronDelegateExecution(store, enq.jobId)
+      const before = store.snapshotOf(enq.jobId)?.lastActivityAt
+      clock += 5 * 60_000
+      // A wrong fence must not be able to fake liveness.
+      assert.equal(
+        store.touchActivity(enq.jobId, { claimToken: 'bogus', fencingEpoch: fence.fencingEpoch }),
+        false,
+      )
+      assert.equal(store.snapshotOf(enq.jobId)?.lastActivityAt, before)
+      assert.equal(store.touchActivity(enq.jobId, fence), true)
+      assert.equal(store.snapshotOf(enq.jobId)?.lastActivityAt, clock)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not steal a row another live instance still owns', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-reap-fence-'))
+    try {
+      let clock = 1_000_000
+      const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
+      // Lease far longer than the idle limit: the only way to get
+      // "idle past timeout" while the owner's lease is still valid.
+      const other = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 2 * 60 * 60_000,
+        durable,
+        bootId: 'gw:other',
+        now: () => clock,
+      })
+      const created = other.create('coding-assistant', { sessionKey: 'sk-other' })
+      assert.ok('jobId' in created)
+      clock += 31 * 60_000
+      const mine = new DelegateJobStore({
+        sm: true,
+        ttlMs: 60_000,
+        leaseMs: 2 * 60 * 60_000,
+        durable,
+        bootId: 'gw:mine',
+        now: () => clock,
+      })
+      const owned = mine.snapshotOf(created.jobId)!
+      assert.equal(owned.ownerInstanceId, 'gw:other')
+      assert.ok(owned.ownerLeaseUntil! > clock, 'owner lease must still be live')
+      // Idle > timeout, but the owner is alive ⇒ leave it to its owner.
+      assert.deepEqual(mine.reapStaleRunning({ timeoutMs: 30 * 60_000 }), [])
+      assert.equal(mine.snapshotOf(created.jobId)?.state, 'running')
+      // Once that lease lapses, the row is reapable.
+      clock += 3 * 60 * 60_000
+      assert.equal(mine.reapStaleRunning({ timeoutMs: 30 * 60_000 }).length, 1)
+      mine.close()
+      other.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('retention window is env-overridable and clamped', () => {
+    assert.equal(resolveDelegateLedgerRetentionMs({}), 7 * 24 * 60 * 60_000)
+    assert.equal(
+      resolveDelegateLedgerRetentionMs({ OC_DELEGATE_LEDGER_RETENTION_DAYS: '14' }),
+      14 * 24 * 60 * 60_000,
+    )
+    // Below the 1d floor / above the 90d ceiling is clamped, not honoured.
+    assert.equal(
+      resolveDelegateLedgerRetentionMs({ OC_DELEGATE_LEDGER_RETENTION_DAYS: '0.1' }),
+      24 * 60 * 60_000,
+    )
+    assert.equal(
+      resolveDelegateLedgerRetentionMs({ OC_DELEGATE_LEDGER_RETENTION_DAYS: '999' }),
+      90 * 24 * 60 * 60_000,
+    )
+    assert.equal(
+      resolveDelegateLedgerRetentionMs({ OC_DELEGATE_LEDGER_RETENTION_DAYS: 'nonsense' }),
+      7 * 24 * 60 * 60_000,
+    )
+  })
+
+  it('heartbeat timeout is env-overridable and clamped', () => {
+    assert.equal(resolveDelegateHeartbeatTimeoutMs({}), 30 * 60_000)
+    assert.equal(
+      resolveDelegateHeartbeatTimeoutMs({ OC_DELEGATE_HEARTBEAT_TIMEOUT_MS: '600000' }),
+      600_000,
+    )
+    assert.equal(
+      resolveDelegateHeartbeatTimeoutMs({ OC_DELEGATE_HEARTBEAT_TIMEOUT_MS: '1000' }),
+      5 * 60_000,
+    )
+  })
+
+  it('a retired cron occurrence key can be re-enqueued (was true when rows were deleted)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-idem-'))
+    try {
+      let clock = 1_000_000
+      const store = openStore(dir, { bootId: 'gw:idem', now: () => clock })
+      const first = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-3',
+        dueMinuteKey: 99,
+        agentId: 'coding-assistant',
+      })
+      assert.ok('jobId' in first)
+      const fence = claimCronDelegateExecution(store, first.jobId)
+      assert.equal(
+        settleCronDelegateJob(store, first.jobId, 'completed', fence, undefined, undefined, {
+          callbackState: 'delivered',
+        }),
+        true,
+      )
+      clock += 61_000
+      assert.equal(store.sweep(), 1)
+      // Same occurrence key after retirement must not hit a UNIQUE violation.
+      const again = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-3',
+        dueMinuteKey: 99,
+        agentId: 'coding-assistant',
+      })
+      assert.ok('jobId' in again)
+      assert.notEqual(again.jobId, first.jobId)
+      assert.equal(again.reused, false)
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * OCV5-164 r1: the reaper judges `last_activity_at`, so a claimed cron
+ * occurrence needs a *timer* heartbeat. Protocol events are not one —
+ * `tool_use_detected` is consumed inside sessionManager and never reaches
+ * `onEvent`, so a legitimate long tool call emits nothing for far longer than
+ * the timeout. These use a real `setInterval` (short cadence) + real sqlite.
+ */
+describe('OCV5-164 cron delegate heartbeat', () => {
+  it('keeps a silent occurrence alive, and stops protecting it once halted', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-'))
+    try {
+      const store = openStore(dir, { bootId: 'gw:hb' })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-hb',
+        dueMinuteKey: 1,
+        agentId: 'coding-assistant',
+        sessionKey: 'agent:coding-assistant:cron:dm:cron-hb:d1',
+      })
+      assert.ok('jobId' in enq)
+      const fence = claimCronDelegateExecution(store, enq.jobId)
+      const claimedAt = store.snapshotOf(enq.jobId)!.lastActivityAt!
+
+      const hb = startCronDelegateHeartbeat({
+        store,
+        jobId: enq.jobId,
+        fence,
+        sessionKey: 'agent:coding-assistant:cron:dm:cron-hb:d1',
+        intervalMs: 5,
+      })
+      // Simulate a long tool call: 120ms of work with zero protocol events.
+      await new Promise((r) => setTimeout(r, 120))
+      assert.ok(hb.beats() > 0, 'heartbeat must actually beat')
+      const afterBeats = store.snapshotOf(enq.jobId)!.lastActivityAt!
+      assert.ok(afterBeats > claimedAt, 'last_activity_at must move forward')
+      // A 30ms idle limit would have killed this row without the heartbeat.
+      assert.deepEqual(store.reapStaleRunning({ timeoutMs: 30 }), [])
+      assert.equal(store.snapshotOf(enq.jobId)?.state, 'running')
+
+      // Once execution ends the beat stops, and the row becomes reapable again.
+      hb.stop()
+      const frozen = store.snapshotOf(enq.jobId)!.lastActivityAt!
+      await new Promise((r) => setTimeout(r, 60))
+      assert.equal(store.snapshotOf(enq.jobId)!.lastActivityAt, frozen, 'stop() must stop writes')
+      const reaped = store.reapStaleRunning({ timeoutMs: 30 })
+      assert.equal(reaped.length, 1)
+      assert.equal(reaped[0]!.job.failureClass, 'heartbeat_timeout')
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('interrupts the child session when the fence is gone (row already reaped)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-fence-'))
+    try {
+      const store = openStore(dir, { bootId: 'gw:hbfence' })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-hb2',
+        dueMinuteKey: 2,
+        agentId: 'coding-assistant',
+        sessionKey: 'sk-hb2',
+      })
+      assert.ok('jobId' in enq)
+      claimCronDelegateExecution(store, enq.jobId)
+      const interrupted: string[] = []
+      const warnings: string[] = []
+      const hb = startCronDelegateHeartbeat({
+        store,
+        jobId: enq.jobId,
+        // Wrong token: stands in for "the reaper already settled this row".
+        fence: { claimToken: 'stale-token', fencingEpoch: 99 },
+        sessionKey: 'sk-hb2',
+        intervalMs: 5,
+        interrupt: (key) => {
+          interrupted.push(key)
+          return true
+        },
+        log: { warn: (msg) => warnings.push(msg) },
+      })
+      await new Promise((r) => setTimeout(r, 60))
+      assert.deepEqual(interrupted, ['sk-hb2'], 'child must be interrupted exactly once')
+      assert.equal(hb.beats(), 1, 'beating must stop after the first rejected touch')
+      assert.ok(warnings.some((w) => w.includes('interrupted child session')))
+      hb.stop()
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('warns instead of throwing when the child sessionKey is unknown', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-nokey-'))
+    try {
+      const store = openStore(dir, { bootId: 'gw:hbnokey' })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-hb3',
+        dueMinuteKey: 3,
+        agentId: 'coding-assistant',
+      })
+      assert.ok('jobId' in enq)
+      claimCronDelegateExecution(store, enq.jobId)
+      const warnings: string[] = []
+      const hb = startCronDelegateHeartbeat({
+        store,
+        jobId: enq.jobId,
+        fence: { claimToken: 'stale-token', fencingEpoch: 99 },
+        intervalMs: 5,
+        log: { warn: (msg) => warnings.push(msg) },
+      })
+      await new Promise((r) => setTimeout(r, 60))
+      assert.ok(warnings.some((w) => w.includes('child sessionKey missing')))
+      hb.stop()
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('honours the beat hard cap so a leaked interval cannot slide liveness forever', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-cap-'))
+    try {
+      const store = openStore(dir, { bootId: 'gw:hbcap' })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-hb4',
+        dueMinuteKey: 4,
+        agentId: 'coding-assistant',
+        sessionKey: 'sk-hb4',
+      })
+      assert.ok('jobId' in enq)
+      const fence = claimCronDelegateExecution(store, enq.jobId)
+      const interrupted: string[] = []
+      const hb = startCronDelegateHeartbeat({
+        store,
+        jobId: enq.jobId,
+        fence,
+        sessionKey: 'sk-hb4',
+        intervalMs: 2,
+        maxBeats: 3,
+        interrupt: (key) => {
+          interrupted.push(key)
+          return true
+        },
+      })
+      await new Promise((r) => setTimeout(r, 80))
+      assert.deepEqual(interrupted, ['sk-hb4'], 'hard cap must close out the child')
+      assert.equal(hb.beats(), 4, 'stops on the beat that exceeds the cap')
+      hb.stop()
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * OCV5-164 r1: the server-side reaper wiring itself (W3 gap). Uses the real
+ * `_armDelegateReaper` on a Gateway scaffold so the interval, the interrupt
+ * closeout and the log payload are exercised, not just the store method.
+ */
+describe('OCV5-164 reaper wiring interrupts the child session', () => {
+  it('interrupts a reaped row and logs the pre-reap idleSec', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-reap-wire-'))
+    const prevTimeout = process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS
+    try {
+      // 5min floor is the lowest the env knob allows; drive the clock past it.
+      process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS = '300000'
+      let clock = 1_000_000
+      const store = openStore(dir, { bootId: 'gw:wire', now: () => clock })
+      const created = store.create('coding-assistant', { sessionKey: 'sk-wire' })
+      assert.ok('jobId' in created)
+
+      const interrupted: string[] = []
+      const logs: Array<{ msg: string; meta: Record<string, unknown> }> = []
+      const gw = Object.create(Gateway.prototype) as any
+      gw.log = {
+        debug() {},
+        info() {},
+        error() {},
+        warn: (msg: string, meta: Record<string, unknown>) => logs.push({ msg, meta }),
+      }
+      gw.sessions = {
+        interrupt: (key: string) => {
+          interrupted.push(key)
+          return true
+        },
+      }
+      gw._armDelegateReaper(store)
+      assert.ok(gw._delegateReapTimer, 'reaper interval must be armed')
+
+      // Advance past the timeout, then run one tick the way the interval does.
+      clock += 6 * 60_000
+      gw._delegateReapTimer._onTimeout()
+
+      assert.deepEqual(interrupted, ['sk-wire'], 'reaped child must be interrupted')
+      const reapLog = logs.find((l) => l.msg === 'delegate_heartbeat_timeout_reaped')
+      assert.ok(reapLog, 'reap must be logged')
+      assert.equal(reapLog!.meta.jobId, created.jobId)
+      assert.equal(reapLog!.meta.sessionKey, 'sk-wire')
+      assert.equal(reapLog!.meta.failureClass, 'heartbeat_timeout')
+      assert.equal(reapLog!.meta.interrupted, true)
+      // W2: idleSec is the real idle span, not ~0 measured after fail().
+      assert.equal(reapLog!.meta.idleSec, 360)
+      assert.equal(store.snapshotOf(created.jobId)?.state, 'failed')
+
+      clearInterval(gw._delegateReapTimer)
+      store.close()
+    } finally {
+      if (prevTimeout === undefined) delete process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS
+      else process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS = prevTimeout
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('survives an interrupt that throws, and still logs the reap', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-reap-wire-throw-'))
+    const prevTimeout = process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS
+    try {
+      process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS = '300000'
+      let clock = 1_000_000
+      const store = openStore(dir, { bootId: 'gw:wirethrow', now: () => clock })
+      const created = store.create('coding-assistant', { sessionKey: 'sk-throw' })
+      assert.ok('jobId' in created)
+      const logs: string[] = []
+      const gw = Object.create(Gateway.prototype) as any
+      gw.log = {
+        debug() {},
+        info() {},
+        error() {},
+        warn: (msg: string) => logs.push(msg),
+      }
+      gw.sessions = {
+        interrupt: () => {
+          throw new Error('session gone')
+        },
+      }
+      gw._armDelegateReaper(store)
+      clock += 6 * 60_000
+      gw._delegateReapTimer._onTimeout()
+      assert.ok(logs.includes('delegate_heartbeat_timeout_interrupt_failed'))
+      assert.ok(logs.includes('delegate_heartbeat_timeout_reaped'))
+      // The ledger write must stand even when the interrupt failed.
+      assert.equal(store.snapshotOf(created.jobId)?.state, 'failed')
+      clearInterval(gw._delegateReapTimer)
+      store.close()
+    } finally {
+      if (prevTimeout === undefined) delete process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS
+      else process.env.OC_DELEGATE_HEARTBEAT_TIMEOUT_MS = prevTimeout
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
