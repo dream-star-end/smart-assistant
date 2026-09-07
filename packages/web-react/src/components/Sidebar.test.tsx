@@ -190,9 +190,9 @@ describe("Sidebar 会话列表", () => {
     expect(screen.queryByRole("button", { name: "退出登录" })).toBeNull();
     expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
 
-    const tutorial = screen.getByRole("button", { name: "打开使用教程" });
+    const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
     expect(tutorial).toBeInTheDocument();
-    expect(tutorial).toHaveTextContent("教程");
+    expect(tutorial).toHaveTextContent("案例");
     expect(screen.getByRole("button", { name: /切换主题/ })).toBeInTheDocument();
 
     openAccountMenu();

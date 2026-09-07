@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "caseId": "general-public-data-brief",
+  "generatedAt": "2026-09-07T04:13:30Z",
+  "summary": "把人口、人均GDP、联网率三份官方数据对齐为可交互比较：同年、同国、有原值，不做伪精确评分。",
+  "metrics": [
+    {
+      "label": "对齐国家",
+      "value": "3"
+    },
+    {
+      "label": "原始观测",
+      "value": "9"
+    },
+    {
+      "label": "数据年份",
+      "value": "2022"
+    }
+  ],
+  "highlights": [
+    {
+      "title": "不是搜几段资料，而是对齐三份原始数据",
+      "body": "人口、人均GDP、联网率按ISO3和2022年对齐：3国、9条观测，保留来源、单位与元数据更新时间。"
+    },
+    {
+      "title": "换一个问题，换一种排序",
+      "body": "印度尼西亚的样本人口最大，越南的互联网使用率最高。按指标切换，不把不同尺度硬凑成总分。"
+    },
+    {
+      "title": "算得出，也知道不能怎么用",
+      "body": "人口×联网率只是规模参考，不是产品客户数；人均GDP不等于个人收入，不给伪精确的“最佳市场”结论。"
+    }
+  ],
+  "inputs": [
+    {
+      "path": "/tutorials/cases/general-public-data-brief/inputs/world-bank-population.json",
+      "sha256": "1681702d6f9ba85240240cd258618c5bad6b35b8a2256239de9df40713987b3b",
+      "bytes": 688
+    },
+    {
+      "path": "/tutorials/cases/general-public-data-brief/inputs/world-bank-gdp.json",
+      "sha256": "4999c2a6235c3c510ac06c8276d91f07b803be668ab2a7ac08b3414ad0b6b713",
+      "bytes": 752
+    },
+    {
+      "path": "/tutorials/cases/general-public-data-brief/inputs/world-bank-internet.json",
+      "sha256": "3337d51f8246765e71acd81313f5f0cabac1e2bd59c70836c4ad733595929a83",
+      "bytes": 797
+    }
+  ],
+  "outputs": [
+    {
+      "path": "/tutorials/cases/general-public-data-brief/showcase/dashboard.html",
+      "sha256": "2f7b200b4b5ded67687bd447515767799c023c896a18740673ea2528f0187e8f",
+      "bytes": 17990
+    },
+    {
+      "path": "/tutorials/cases/general-public-data-brief/showcase/report.md",
+      "sha256": "85d42fa8effd7aaa839690b3b6951861e4014a0db4ac36ca068e165ce41be747",
+      "bytes": 3816
+    },
+    {
+      "path": "/tutorials/cases/general-public-data-brief/showcase/metrics.json",
+      "sha256": "fc82a0591cfadd07e13d3ecc6ff9fa032c1ce4590b7808495354206b87317d28",
+      "bytes": 2618
+    },
+    {
+      "path": "/tutorials/cases/general-public-data-brief/showcase/derived.csv",
+      "sha256": "352601d451b1e1c56d27737ca0fa76b401bc4affbd5b7c94c708e070cf1f7657",
+      "bytes": 305
+    }
+  ],
+  "checks": [
+    {
+      "name": "真实解析3份JSON、9条观测；API分页记录数一致",
+      "passed": true
+    },
+    {
+      "name": "指标ID、ISO3和2022年逐条验证，无重复键",
+      "passed": true
+    },
+    {
+      "name": "按国家ISO3和年份连接，不依赖源文件行顺序",
+      "passed": true
+    },
+    {
+      "name": "非空值范围合法；缺失0项，不插补",
+      "passed": true
+    },
+    {
+      "name": "人口×联网率派生估算和人口加权汇总使用同口径有效观测",
+      "passed": true
+    },
+    {
+      "name": "HTML无外部依赖，唯一内联脚本SHA-256与CSP一致",
+      "passed": true
+    },
+    {
+      "name": "HTML所有本地产物链接存在，元素ID唯一",
+      "passed": true
+    }
+  ],
+  "limitations": [
+    "公开数据样例实作，不是客户项目，不是全程平台会话回放。",
+    "仅为历史数据描述性分析，没有预测准确率、因果推断或经营收益承诺。",
+    "生成时间不是数据年份；本次离线复算不代表重新联网获取源站最新值。",
+    "只有三个国家的2022年横截面，不代表全东南亚排名或趋势。",
+    "联网人数是人口×联网率派生估算，不是官方独立计数或客户规模。",
+    "人均GDP为当年美元，不等于个人收入，不构成市场进入建议。"
+  ]
+}

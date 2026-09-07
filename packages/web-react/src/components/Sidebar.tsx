@@ -982,8 +982,8 @@ export function Sidebar({
             size="sm"
             data-product-control
             onClick={onOpenTutorial}
-            aria-label="打开使用教程"
-            title="使用教程"
+            aria-label="打开案例展厅"
+            title="案例展厅"
             className="h-8 shrink-0 gap-1 px-2 text-faint hover:text-fg"
           >
             <BookOpen size={16} />
@@ -993,7 +993,7 @@ export function Sidebar({
                 typeof width === "number" && width < 220 && "hidden",
               )}
             >
-              教程
+              案例
             </span>
           </Button>
         )}

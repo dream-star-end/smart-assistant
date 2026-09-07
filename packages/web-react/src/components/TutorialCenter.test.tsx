@@ -83,52 +83,34 @@ function CaseHarness({
 }
 
 describe("TutorialCenter", () => {
-  it("默认展示 10 分钟快速上手主线，而不是未采集案例", () => {
+  it("默认成果展厅只展示有产物的精选实作，不再平铺教程和待采集脚本", () => {
     render(<CaseHarness />);
-
-    expect(screen.getByRole("heading", { name: "10 分钟走完第一次任务" })).toBeInTheDocument();
-    expect(screen.getByText("发第一个任务")).toBeInTheDocument();
-    expect(screen.getByText("补材料与约束")).toBeInTheDocument();
-    expect(screen.getByText("选模型")).toBeInTheDocument();
-    expect(screen.getByText("看执行过程")).toBeInTheDocument();
-    expect(screen.getByText("拿交付并用反馈迭代")).toBeInTheDocument();
-    expect(screen.getByText("用会话历史继续")).toBeInTheDocument();
-    expect(screen.queryByRole("searchbox", { name: "搜索教程" })).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
-    ).not.toBeInTheDocument();
-    expect(document.body.textContent).not.toContain("先看一件难事");
-
-    const tabs = screen.getAllByRole("button", { name: /快速上手|按场景学|功能参考|教程工作室|案例示例/ });
-    expect(tabs.map((tab) => tab.textContent?.replace(/\s+/g, " ").trim())).toEqual([
-      "快速上手",
-      "按场景学",
-      "功能参考",
-      "教程工作室",
-      "案例示例",
-    ]);
-
-    fireEvent.click(screen.getByRole("button", { name: "打开步骤：发第一个任务" }));
-    expect(
-      screen.getByRole("heading", { name: "开始一场高质量对话" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /你的下一件事/ })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^查看成果：/ })).toHaveLength(2);
+    expect(screen.queryByRole("heading", { name: "10 分钟走完第一次任务" })).not.toBeInTheDocument();
+    expect(screen.queryByText("示例待真实运行采集")).not.toBeInTheDocument();
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("已读");
+    expect(screen.getByText(/不是完整会话回放/)).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: /^查看成果：/ })[0]);
+    expect(screen.getByRole("button", { name: "打开交互看板" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "返回案例展厅" }));
+    expect(screen.getByRole("heading", { name: /你的下一件事/ })).toBeInTheDocument();
   });
 
-  it("按场景学串起现有功能章，并进入对应详情", () => {
+  it("快速上手退到帮助菜单，仍可进入功能详情", () => {
     render(<CaseHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "按场景学" }));
-    expect(screen.getByRole("heading", { name: "按你现在要做的事学" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "写作与办公" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "编程与 GitHub" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "编程与 GitHub：GitHub 仓库" }));
-    expect(
-      screen.getByRole("heading", { name: "连接 GitHub 仓库协作开发" }),
-    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("帮助与创作"));
+    fireEvent.click(screen.getByRole("button", { name: "快速上手" }));
+    expect(screen.getByRole("heading", { name: "10 分钟走完第一次任务" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开步骤：发第一个任务" }));
+    expect(screen.getByRole("heading", { name: "开始一场高质量对话" })).toBeInTheDocument();
   });
 
   it("案例列表与详情都标明示例待真实运行采集", () => {
     render(<CaseHarness />);
-    fireEvent.click(screen.getByRole("button", { name: "案例示例" }));
+    fireEvent.click(screen.getByText("帮助与创作"));
+    fireEvent.click(screen.getByRole("button", { name: "案例脚本" }));
     const pending = screen.getAllByText("示例待真实运行采集");
     expect(pending.length).toBeGreaterThanOrEqual(12);
     expect(screen.getByRole("heading", { name: "这些是待采集的任务脚本" })).toBeInTheDocument();
@@ -143,6 +125,7 @@ describe("TutorialCenter", () => {
   it("社区 Tab 已改名为教程工作室，并提供四个入口", async () => {
     vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
     render(<CaseHarness />);
+    fireEvent.click(screen.getByText("帮助与创作"));
     fireEvent.click(screen.getByRole("button", { name: "教程工作室" }));
     expect(await screen.findByRole("heading", { name: "探索教程，或把一次真实会话变成可复用方法" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "探索教程" })).toBeInTheDocument();
@@ -179,19 +162,13 @@ describe("TutorialCenter", () => {
     expect(await screen.findByText("深链正文")).toBeInTheDocument();
   });
 
-  it("待采集精选案例走任务脚本详情，不展示完成态回放", () => {
+  it("公开数据实作与旧待采集回放分离，不挪用历史模型结果", () => {
     render(<CaseHarness initial="research-bike-demand" />);
-
-    expect(screen.getAllByText(/示例待真实运行采集/).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText(/当前只展示人工编写的任务脚本，不是真实运行回放/)).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "一堆出行数据，变成看得懂的需求规律。" })).toBeInTheDocument();
+    expect(screen.getByText(/非完整会话回放/)).toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "任务阶段" })).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "你不用守着它。回来时，过程和成果都还在。" }),
-    ).not.toBeInTheDocument();
-    expect(screen.queryByText(/15 分 49 秒 · Astropy #12906/)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("0.904");
+    expect(document.body.textContent).not.toContain("34 项");
   });
 
   it("主操作只把选中的真实案例交给现有开工流程", () => {

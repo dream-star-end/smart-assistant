@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "caseId": "research-bike-demand",
+  "generatedAt": "2026-09-07T04:13:30Z",
+  "summary": "把 17,379 条真实小时记录变成可筛选的需求看板：工作日高峰 17:00，非工作日 13:00。",
+  "metrics": [
+    {
+      "label": "真实小时记录",
+      "value": "17,379"
+    },
+    {
+      "label": "历史租借次数",
+      "value": "3,292,679"
+    },
+    {
+      "label": "数据年份",
+      "value": "2011–2012"
+    }
+  ],
+  "highlights": [
+    {
+      "title": "同一座城市，两种需求节奏",
+      "body": "2011–2012年：工作日17点均值525.3次，非工作日13点均值372.7次。可切换年份和用户类型自行比较。"
+    },
+    {
+      "title": "让缺口也成为结果的一部分",
+      "body": "源表少于日历应有小时数165条。未记录小时不补零，各小时均值采用实际观测数。"
+    },
+    {
+      "title": "不是一张截图，是可复算成果",
+      "body": "小时、月份与总计逐项对账；CSV、JSON、报告与输入哈希一并公开。日表只用于核验，不重复累加。"
+    }
+  ],
+  "inputs": [
+    {
+      "path": "/tutorials/cases/research-bike-demand/inputs/bike-sharing-dataset.zip",
+      "sha256": "b70182d0d0508e9abbb79306ce5c0cec34869000f8220175ac83d11dbe845401",
+      "bytes": 279992
+    }
+  ],
+  "outputs": [
+    {
+      "path": "/tutorials/cases/research-bike-demand/showcase/dashboard.html",
+      "sha256": "a3921e25433fa17851ff3e3e10bb609b8a71048bd61d7890310ee037239a174e",
+      "bytes": 46700
+    },
+    {
+      "path": "/tutorials/cases/research-bike-demand/showcase/report.md",
+      "sha256": "a3849237967ecd797bf43d965b487a01d78447b97d1d16385c9e35a04c3aab27",
+      "bytes": 3542
+    },
+    {
+      "path": "/tutorials/cases/research-bike-demand/showcase/metrics.json",
+      "sha256": "360735cdfbd73008fa94dbb16d361ec7f741c5c09c65c7f7220364031e78abe5",
+      "bytes": 60313
+    },
+    {
+      "path": "/tutorials/cases/research-bike-demand/showcase/derived.csv",
+      "sha256": "b348e35532301c4d9132e431dcc15ca217c6203bb3d69541f234de5f5ee48ff0",
+      "bytes": 598770
+    }
+  ],
+  "checks": [
+    {
+      "name": "真实解析日表731行、小时表17379行和ZIP内元数据",
+      "passed": true
+    },
+    {
+      "name": "源表无空白，日期/小时和分组码合法，非负分项之和等于总计",
+      "passed": true
+    },
+    {
+      "name": "自然日和小时键均无重复；日历完整，缺失小时不补零",
+      "passed": true
+    },
+    {
+      "name": "每个自然日的三个小时计数分别与日表对账一致",
+      "passed": true
+    },
+    {
+      "name": "9种年份/日期组合下，小时汇总、月份汇总与组总计一致",
+      "passed": true
+    },
+    {
+      "name": "HTML无外部依赖，唯一内联脚本SHA-256与CSP一致",
+      "passed": true
+    },
+    {
+      "name": "HTML所有本地产物链接存在，元素ID唯一",
+      "passed": true
+    }
+  ],
+  "limitations": [
+    "公开数据样例实作，不是客户项目，不是全程平台会话回放。",
+    "仅为历史数据描述性分析，没有预测准确率、因果推断或经营收益承诺。",
+    "生成时间不是数据年份；本次离线复算不代表重新联网获取源站最新值。",
+    "未记录165个日历小时；按实际观测求均值，不补零。",
+    "日表只作对账，不重复计数；未训练或评估预测模型。"
+  ]
+}

@@ -14,6 +14,7 @@ import {
   Download,
   ExternalLink,
   FileInput,
+  FileText as FileTextIcon,
   FileOutput,
   GitBranch,
   History,
@@ -64,13 +65,11 @@ import {
 } from "../lib/tutorialCaseCatalog";
 import {
   TUTORIAL_MEDIA,
-  TUTORIAL_TOPIC_LIST,
   tutorialById,
 } from "../lib/tutorialCatalog";
 import {
   TUTORIAL_PENDING_CAPTURE_LABEL,
   TUTORIAL_QUICKSTART,
-  TUTORIAL_SCENARIO_PATHS,
 } from "../lib/tutorialJourneys";
 import {
   markTutorialRead,
@@ -83,6 +82,8 @@ import type { AuthSession } from "../lib/types";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
 import { CommunityTutorials } from "./tutorials/CommunityTutorials";
 import { MissionReplay } from "./tutorials/MissionReplay";
+import { CaseShowroom, ShowcaseDetail } from "./tutorials/CaseShowroom";
+import { showcaseById } from "../lib/tutorialShowcase";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
 import { Badge, Button, IconButton } from "./ui";
 
@@ -234,7 +235,7 @@ export function TutorialCenter({
   sessionProjectId?: string | null;
 }) {
   const [communityOpen, setCommunityOpen] = useState(!!communityId);
-  const [browseView, setBrowseView] = useState<"start" | "scenarios" | "cases">("start");
+  const [browseView, setBrowseView] = useState<"showcase" | "start" | "cases">("showcase");
   const mode =
     communityId || communityOpen
       ? "community"
@@ -251,12 +252,15 @@ export function TutorialCenter({
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const detailRef = useRef<HTMLElement>(null);
+  useEffect(() => { if (detailRef.current) detailRef.current.scrollTop = 0; }, [mode, caseId, topicId, communityId]);
 
   const feature = capabilityById(selectedTopicId);
   const topic = tutorialById(selectedTopicId);
   const media = TUTORIAL_MEDIA[topic.media];
   const cta = actionState(feature);
   const selectedCase = caseId ? TUTORIAL_CASE_BY_ID[caseId] : null;
+  const selectedShowcase = showcaseById(caseId);
   const showMissionReplay =
     selectedCase != null &&
     selectedCase.replay.status !== "pending_capture" &&
@@ -274,16 +278,14 @@ export function TutorialCenter({
   const mobileFeatureOptions = filteredFeatures.some((item) => item.id === selectedTopicId)
     ? filteredFeatures
     : [feature, ...filteredFeatures];
-  const readCount = TUTORIAL_TOPIC_LIST.filter((item) =>
-    tutorialIsRead(progress, item.featureId),
-  ).length;
+
 
   useEffect(() => {
     if (!open) {
       setQuery("");
       setFeatureCategory("all");
       setCommunityOpen(false);
-      setBrowseView("start");
+      setBrowseView("showcase");
       return;
     }
     if (communityId) setCommunityOpen(true);
@@ -310,7 +312,7 @@ export function TutorialCenter({
       .catch(() => {});
   };
 
-  const clearToBrowse = (view: "start" | "scenarios" | "cases") => {
+  const clearToBrowse = (view: "showcase" | "start" | "cases") => {
     setQuery("");
     setCommunityOpen(false);
     setBrowseView(view);
@@ -318,8 +320,8 @@ export function TutorialCenter({
     onShowCaseGallery();
   };
 
+  const showShowroom = () => clearToBrowse("showcase");
   const showStart = () => clearToBrowse("start");
-  const showScenarios = () => clearToBrowse("scenarios");
   const showCases = () => clearToBrowse("cases");
 
   const showFeatures = () => {
@@ -335,14 +337,14 @@ export function TutorialCenter({
   };
 
   const headerCopy =
-    mode === "start"
+    mode === "showcase" || (mode === "cases" && selectedShowcase)
+      ? { title: "案例展厅", subtitle: "先看成果，再做一个你的版本" }
+      : mode === "start"
       ? { title: "快速上手", subtitle: "大约 10 分钟，走完第一次任务" }
-      : mode === "scenarios"
-        ? { title: "按场景学", subtitle: "按你的工作选一条路径" }
         : mode === "features"
           ? { title: "功能参考", subtitle: "按功能查找用法" }
           : mode === "cases"
-            ? { title: "案例示例", subtitle: "任务脚本已公开，回放仍待采集" }
+            ? { title: "案例脚本", subtitle: "参考材料，不是已完成的案例" }
             : { title: "教程工作室", subtitle: "探索、手写或从当前会话生成可复用教程" };
 
   return (
@@ -385,15 +387,7 @@ export function TutorialCenter({
                     className="min-w-0 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint"
                   />
                 </label>
-                <div className="hidden shrink-0 items-center gap-2 text-caption text-faint md:flex">
-                  <span>{readCount}/{TUTORIAL_TOPIC_LIST.length} 已读</span>
-                  <span className="h-1.5 w-16 overflow-hidden rounded-full bg-hover" aria-hidden>
-                    <span
-                      className="block h-full rounded-full bg-accent transition-[width]"
-                      style={{ width: `${(readCount / TUTORIAL_TOPIC_LIST.length) * 100}%` }}
-                    />
-                  </span>
-                </div>
+
               </>
             ) : <div className="ml-auto" />}
             <Dialog.Close asChild>
@@ -403,23 +397,22 @@ export function TutorialCenter({
             </Dialog.Close>
           </header>
 
-          <div className="no-scrollbar flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-2 sm:px-5">
-            <ViewTab active={mode === "start"} onClick={showStart} icon={Rocket}>
-              快速上手
+          <nav aria-label="案例与帮助" className="relative z-10 flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2 sm:px-5">
+            <ViewTab active={mode === "showcase" || (mode === "cases" && Boolean(selectedShowcase))} onClick={showShowroom} icon={Sparkles}>
+              案例展厅
             </ViewTab>
-            <ViewTab active={mode === "scenarios"} onClick={showScenarios} icon={Map}>
-              按场景学
-            </ViewTab>
-            <ViewTab active={mode === "features"} onClick={showFeatures} icon={Sparkles}>
-              功能参考
-            </ViewTab>
-            <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>
-              教程工作室
-            </ViewTab>
-            <ViewTab active={mode === "cases"} onClick={showCases} icon={TestTube2}>
-              案例示例
-            </ViewTab>
-          </div>
+            <details className="group relative" onClick={(event) => {
+              if ((event.target as HTMLElement).closest("button")) event.currentTarget.removeAttribute("open");
+            }}>
+              <summary className="cursor-pointer list-none rounded-lg px-3 py-2 text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">帮助与创作 <ChevronDown className="ml-1 inline" size={13} /></summary>
+              <div className="absolute right-0 top-full mt-1 flex w-48 flex-col gap-1 rounded-xl border border-border bg-surface p-2 shadow-float">
+                <ViewTab active={mode === "features"} onClick={showFeatures} icon={Search}>功能参考</ViewTab>
+                <ViewTab active={mode === "start"} onClick={showStart} icon={Rocket}>快速上手</ViewTab>
+                <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>教程工作室</ViewTab>
+                <ViewTab active={mode === "cases" && !selectedShowcase} onClick={showCases} icon={FileTextIcon}>案例脚本</ViewTab>
+              </div>
+            </details>
+          </nav>
 
           {mode === "features" && (
             <div className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto border-b border-border bg-surface px-3 py-2 lg:hidden">
@@ -470,7 +463,7 @@ export function TutorialCenter({
                 </div>
               )}
 
-              <main className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
+              <main ref={detailRef} className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
                 {mode === "community" ? (
                   <CommunityTutorials
                     auth={auth}
@@ -483,12 +476,14 @@ export function TutorialCenter({
                     initialDetailId={communityId}
                     onDetailIdChange={onCommunityChange}
                   />
+                ) : mode === "showcase" ? (
+                  <CaseShowroom onSelect={onCaseChange} onRun={onRunCase} actionLabel={caseActionLabel} />
                 ) : mode === "start" ? (
                   <QuickstartView onOpenTopic={onTopicChange} />
-                ) : mode === "scenarios" ? (
-                  <ScenarioPathsView onOpenTopic={onTopicChange} />
                 ) : mode === "cases" ? (
-                  showMissionReplay ? (
+                  selectedShowcase ? (
+                    <ShowcaseDetail key={selectedShowcase.caseId} item={selectedShowcase} onBack={showShowroom} onRun={onRunCase} actionLabel={caseActionLabel} />
+                  ) : showMissionReplay ? (
                     <MissionReplay
                       caseId={caseId}
                       actionLabel={caseActionLabel}
@@ -605,52 +600,6 @@ function QuickstartView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) =
   );
 }
 
-function ScenarioPathsView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) => void }) {
-  return (
-    <section className="mx-auto max-w-4xl px-4 pb-12 pt-7 sm:px-7 sm:pt-9">
-      <h1 className="text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">
-        按你现在要做的事学
-      </h1>
-      <p className="mt-3 max-w-2xl text-[14.5px] leading-7 text-muted">
-        每条路径只串已有功能章，点进去就是对应用法，不是新的案例回放。
-      </p>
-      <div className="mt-8 grid gap-4 md:grid-cols-2">
-        {TUTORIAL_SCENARIO_PATHS.map((path) => (
-          <article key={path.id} className="rounded-2xl border border-border bg-surface p-5 shadow-sm">
-            <div className="flex items-center gap-2">
-              <span className="flex size-8 items-center justify-center rounded-lg bg-accent-soft text-accent">
-                <ListOrdered size={16} />
-              </span>
-              <h2 className="text-[16px] font-semibold text-fg">{path.title}</h2>
-            </div>
-            <p className="mt-3 text-[13px] leading-6 text-muted">{path.description}</p>
-            <ol className="mt-4 flex flex-col gap-1.5">
-              {path.topicIds.map((topicId, index) => {
-                const feature = capabilityById(topicId);
-                return (
-                  <li key={topicId}>
-                    <button
-                      type="button"
-                      onClick={() => onOpenTopic(topicId)}
-                      aria-label={`${path.title}：${feature.shortTitle}`}
-                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-meta text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-sidebar text-micro font-semibold text-faint">
-                        {index + 1}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate">{feature.shortTitle}</span>
-                      <ArrowRight size={12} className="text-faint" />
-                    </button>
-                  </li>
-                );
-              })}
-            </ol>
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
 
 function CaseSidebar({
   items,
