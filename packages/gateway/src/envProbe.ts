@@ -61,9 +61,12 @@ export interface EnvFacts {
   runtimeDir: string | null
   generatedDir: string | null
   uploadsDir: string | null
-  /** 用户面 IANA 时区(OC_USER_TZ 合法值,否则缺省)。永不为 null:缺省本身就是事实。 */
+  /** 用户面 IANA 时区(OC_USER_TZ 合法值,否则缺省)。永不为 null;但缺省不算「已知事实」,其他全空时整段仍省略。 */
   userTz: string
-  /** `UTC±HH:MM`,按探针时刻计算(DST 时区跨季会变;Asia/Shanghai 恒定)。 */
+  /**
+   * `UTC±HH:MM`,按探针时刻计算。**只是快照**:`renderEnvSlot` 每次重算,因为 facts 被进程级
+   * 缓存而 DST 时区的偏移跨季会变 ±1h(Asia/Shanghai 无 DST,但 OC_USER_TZ 可配任意 IANA)。
+   */
   userTzOffset: string | null
 }
 
@@ -342,9 +345,11 @@ function factsAreEmpty(facts: EnvFacts): boolean {
   )
 }
 
-export function renderEnvSlot(facts: EnvFacts, agentId: string): EnvPromptSlot | null {
+export function renderEnvSlot(facts: EnvFacts, agentId: string, now: Date = new Date()): EnvPromptSlot | null {
   if (factsAreEmpty(facts) && !sanitizeAgentId(agentId)) return null
   if (factsAreEmpty(facts)) return null
+  // 偏移现算:facts 是进程级缓存,DST 时区的偏移不能跟着 uid/路径一起被冻住。
+  const userTzOffset = formatUtcOffset(facts.userTz, now) ?? facts.userTzOffset
 
   const lines: string[] = ['# Env · 勿重探']
   const ids: string[] = []
@@ -375,8 +380,8 @@ export function renderEnvSlot(facts: EnvFacts, agentId: string): EnvPromptSlot |
   // 用户面时区:子进程 `date`/`$TZ` 报的是出口对齐时区,不是用户所在地。
   // 只给时区名+偏移(不给时刻,免得每轮撑爆 prompt 缓存);要时刻自己 `date -u` 再换算。
   lines.push(
-    facts.userTzOffset
-      ? `user_tz=${facts.userTz} ${facts.userTzOffset} (shell date/TZ=出口时区,勿当用户时间)`
+    userTzOffset
+      ? `user_tz=${facts.userTz} ${userTzOffset} (shell date/TZ=出口时区,勿当用户时间)`
       : `user_tz=${facts.userTz} (shell date/TZ=出口时区,勿当用户时间)`,
   )
 

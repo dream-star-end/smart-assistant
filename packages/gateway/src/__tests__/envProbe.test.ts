@@ -18,6 +18,7 @@ const {
   buildEnvSlot,
   computeEnvFacts,
   probeEnvFacts,
+  renderEnvSlot,
   resetEnvFactsCache,
 } = await import('../envProbe.js')
 const { buildPromptContext } = await import('../promptSlots.js')
@@ -310,6 +311,17 @@ describe('envProbe', () => {
     assert.equal(half.userTzOffset, 'UTC+05:30')
     const utc = computeEnvFacts(fakeDeps({ env: { ...selfhostEnv, OC_USER_TZ: 'UTC' }, files: selfhostFiles }))
     assert.equal(utc.userTzOffset, 'UTC+00:00')
+  })
+
+  it('user_tz offset is recomputed at render time, so a cached probe does not freeze DST', () => {
+    const env = { ...selfhostEnv, OC_USER_TZ: 'America/New_York' }
+    const facts = computeEnvFacts({ ...fakeDeps({ env, files: selfhostFiles }), now: new Date('2026-01-15T12:00:00Z') })
+    assert.equal(facts.userTzOffset, 'UTC-05:00') // 探针在冬季
+    const summer = renderEnvSlot(facts, 'main', new Date('2026-07-15T12:00:00Z'))
+    assert.ok(summer)
+    assert.match(summer.content, /^user_tz=America\/New_York UTC-04:00 /m) // 渲染在夏季 → 现算
+    const winter = renderEnvSlot(facts, 'main', new Date('2026-01-15T12:00:00Z'))
+    assert.match(winter!.content, /^user_tz=America\/New_York UTC-05:00 /m)
   })
 
   it('user_tz ignores an invalid or shell-unsafe OC_USER_TZ and never throws', () => {

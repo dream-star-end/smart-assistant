@@ -299,12 +299,13 @@ function buildCurrentDateLine(isoDate: string, now: Date): string {
 
 /**
  * 服务端拼装 CCB 风格 system-reminder 文本(平台 USER.md 等价 + 当前日期)。
- * 内容 = USER.md(原文)+ MEMORY.md 索引 + 当前 UTC 日期 + 用户面本地时间。
+ * 内容 = USER.md(原文)+ MEMORY.md 索引 + 当前 UTC 日期 + 用户面本地日期与时区偏移。
  *
  * ctx === null 时用占位文本,保 H1 多机一致(server-canonical default)。
  *
- * H1 注:用户面时刻含分钟,故本段文本每请求可变 —— 与 system[0]/[1]/[N+1] 的
- * 字节级多机一致无关(那 3 块不含时间),但会降低本路径 message 前缀缓存命中率。
+ * H1 注:用户面只到日期+偏移(无时刻),故本段文本与既有 UTC 日前缀同频 —— 每天变一次,
+ * 本地日与 UTC 日切换点不同时最多两次;与 system[0]/[1]/[N+1] 的字节级多机一致无关
+ * (那 3 块不含时间),也不额外降低本路径 message 前缀缓存命中率。
  */
 function buildServerSystemReminderText(ctx: PlatformContext | null, today: Date): string {
   const isoDate = today.toISOString().slice(0, 10);
