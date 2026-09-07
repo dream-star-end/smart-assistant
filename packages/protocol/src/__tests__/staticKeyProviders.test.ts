@@ -447,6 +447,23 @@ describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
   })
 })
 
+// ─── sessionIdHeader:上游要求的稳定会话 id 头 ─────────────────────────────
+describe('staticKeyProviders — sessionIdHeader', () => {
+  it('只有 opencodego 声明 x-opencode-session(2026-09-07 起 Go 缺此头即 400 MissingSessionID)', () => {
+    assert.equal(getStaticProvider('opencodego').sessionIdHeader, 'x-opencode-session')
+    for (const p of STATIC_KEY_PROVIDERS) {
+      if (p.id === 'opencodego') continue
+      assert.equal(p.sessionIdHeader, undefined, `${p.id} 不应注入会话头(上游字节不变)`)
+    }
+  })
+  it('声明的头名不能出现在自己的 stripHeaders 里(否则注入后又被剥掉)', () => {
+    for (const p of STATIC_KEY_PROVIDERS) {
+      if (!p.sessionIdHeader) continue
+      assert.equal(p.stripHeaders.includes(p.sessionIdHeader), false, `${p.id} sessionIdHeader 与 stripHeaders 冲突`)
+    }
+  })
+})
+
 // ─── 漂移守护:protocol-owned 字段 vs 仓库根 snapshot ──────────────────────
 describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
   it('registry 的 id/inboundModelIds/maxInputTokens/upstreamEndpoint/supportsVision 与 snapshot 一致', () => {

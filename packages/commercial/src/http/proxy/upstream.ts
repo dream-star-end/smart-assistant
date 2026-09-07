@@ -30,6 +30,7 @@
  * `ProxyCore.releaseBeforeFinalizer`。"仅 finalizer 前窗口"的硬约束直接 carry over。
  */
 
+import { randomUUID } from "node:crypto";
 import type { Dispatcher } from "undici";
 
 import type { Logger } from "../../logging/logger.js";
@@ -524,6 +525,13 @@ function makeStaticKeyUpstream(
         safeHeaders["x-api-key"] = apiKey;
       } else {
         safeHeaders.authorization = `Bearer ${apiKey}`;
+      }
+      // 上游要求的稳定会话 id 头(OpenCode Go `x-opencode-session`,2026-09-07 起缺失即 400
+      // MissingSessionID)。值取引擎原生 session id(与计费归因同源 extractSessionId),同一
+      // 会话恒定 → 上游可做路由/prompt cache 亲和;拿不到时退化为随机 UUID 保证请求可路由。
+      // 先于 stripHeaders 设置:该头不在任何 provider 的 strip 列表里,顺序只为可读。
+      if (spec.sessionIdHeader) {
+        safeHeaders[spec.sessionIdHeader] = extractSessionId(body.metadata) ?? randomUUID();
       }
       for (const header of spec.stripHeaders) {
         delete safeHeaders[header];
