@@ -97,6 +97,7 @@ import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
 import { useMdViewport } from "./hooks/useMdViewport";
+import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
@@ -332,8 +333,11 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [toolCards] = useState<ToolCard[]>([]);
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => readCollapsed());
   const composerPrefs = useLocalComposerPrefs();
+  useEffect(() => {
+    writeCollapsed(collapsed);
+  }, [collapsed]);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
   // 已装智能体目录(agent 归属解析用):登录后拉一次,市场关闭时刷新;AgentPicker 打开时
