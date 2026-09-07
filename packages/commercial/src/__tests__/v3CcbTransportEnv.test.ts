@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { resolveV5LocalCcbTransportEnv } from "../agent-sandbox/v3supervisor.js";
+import { resolveUserTimeZoneEnv, resolveV5LocalCcbTransportEnv } from "../agent-sandbox/v3supervisor.js";
 
 describe("resolveV5LocalCcbTransportEnv", () => {
   test("is a zero-change default", () => {
@@ -71,5 +71,29 @@ describe("resolveV5LocalCcbTransportEnv", () => {
         }),
       /IANA timezone/,
     );
+  });
+});
+
+describe("resolveUserTimeZoneEnv (OCV5-166, orthogonal to OPENCLAUDE_CCB_TZ)", () => {
+  test("passes a valid IANA zone through as OC_USER_TZ", () => {
+    assert.deepEqual(resolveUserTimeZoneEnv("Asia/Shanghai"), ["OC_USER_TZ=Asia/Shanghai"]);
+    assert.deepEqual(resolveUserTimeZoneEnv(" America/New_York "), ["OC_USER_TZ=America/New_York"]);
+  });
+
+  test("injects nothing for absent, blank, invalid or shell-unsafe values (never throws)", () => {
+    for (const bad of [undefined, "", "   ", "Not/AZone", "Asia/Shanghai; id", "x".repeat(65)]) {
+      assert.deepEqual(resolveUserTimeZoneEnv(bad), [], String(bad));
+    }
+  });
+
+  test("does not touch the egress-aligned OPENCLAUDE_CCB_TZ contract", () => {
+    const egress = resolveV5LocalCcbTransportEnv({
+      runtimeChannel: "v5",
+      useRemote: false,
+      hostGatewayIp: "172.31.0.1",
+      timezone: "Asia/Tokyo",
+    });
+    assert.ok(egress.includes("OPENCLAUDE_CCB_TZ=Asia/Tokyo"));
+    assert.ok(!egress.some((kv) => kv.startsWith("OC_USER_TZ=")));
   });
 });

@@ -10,6 +10,10 @@
  *   - 不读 HOME、不读 CLAUDE.md(自用实例的基线文件也会自称商业版容器)
  *   - Cursor 引擎会掏空 OC_USER_ID;gateway 进程 env 是权威,缺项才从
  *     /proc/1/environ 回填白名单键
+ *   - 用户面时区(OCV5-166):`OC_USER_TZ` 与出口对齐的 `OPENCLAUDE_CCB_TZ`/`TZ`
+ *     **正交**。引擎子进程的 `date` 报的是出口时区(风控一致性控制,刻意≠用户所在地),
+ *     这里只到日期粒度给出用户时区 + 偏移,让模型不必每轮跑 `date` 再手工换算。
+ *     只写时区名与偏移、不写时刻:ENV slot 落在 system prompt 缓存前缀里。
  */
 import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, readSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -39,7 +43,11 @@ const INIT_ENV_KEYS = [
   'CLAUDE_CONFIG_DIR',
   'OC_SELFHOST_ENGINE_LOCAL_TURNS',
   'OPENCLAUDE_HOME',
+  'OC_USER_TZ',
 ] as const
+
+/** 用户面时区缺省。与 deploy 模板 `OC_USER_TZ` 及 commercial platformEnvelopeBuilder 的缺省一致。 */
+export const DEFAULT_USER_TZ = 'Asia/Shanghai'
 
 export type EnvInstance = 'v5-selfhost' | 'v5-commercial' | 'personal-legacy'
 
@@ -53,6 +61,13 @@ export interface EnvFacts {
   runtimeDir: string | null
   generatedDir: string | null
   uploadsDir: string | null
+  /** 用户面 IANA 时区(OC_USER_TZ 合法值,否则缺省)。永不为 null;但缺省不算「已知事实」,其他全空时整段仍省略。 */
+  userTz: string
+  /**
+   * `UTC±HH:MM`,按探针时刻计算。**只是快照**:`renderEnvSlot` 每次重算,因为 facts 被进程级
+   * 缓存而 DST 时区的偏移跨季会变 ±1h(Asia/Shanghai 无 DST,但 OC_USER_TZ 可配任意 IANA)。
+   */
+  userTzOffset: string | null
 }
 
 export interface EnvProbeDeps {
@@ -62,6 +77,8 @@ export interface EnvProbeDeps {
   readPrefix?: (path: string, maxBytes: number) => string | null
   /** 容器 init environ;null = 禁用回填。显式传入 env 时默认禁用。 */
   initEnvironPath?: string | null
+  /** 偏移计算时刻(测试用;DST 时区偏移随季节变)。 */
+  now?: Date
 }
 
 const INSTANCE_LABEL: Record<EnvInstance, string> = {
@@ -80,6 +97,8 @@ const EMPTY_FACTS: EnvFacts = {
   runtimeDir: null,
   tree: null,
   uploadsDir: null,
+  userTz: DEFAULT_USER_TZ,
+  userTzOffset: null,
 }
 
 let cached: EnvFacts | null = null
@@ -138,6 +157,31 @@ function sanitizeAgentId(raw: string | undefined): string | null {
 function sanitizeCommit(raw: string | undefined): string | null {
   const v = raw?.trim() ?? ''
   return /^[0-9a-f]{7,64}$/i.test(v) ? v.toLowerCase() : null
+}
+
+/** 合法 IANA 时区 → 原样;否则 null(非法值不能进 prompt,也不能让探针抛)。 */
+export function sanitizeTimeZone(raw: string | undefined): string | null {
+  const v = raw?.trim() ?? ''
+  if (!v || v.length > 64 || !/^[A-Za-z0-9_+\-/]+$/.test(v)) return null
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: v }).format()
+    return v
+  } catch {
+    return null
+  }
+}
+
+/** `UTC±HH:MM`。`longOffset` 给 `GMT+08:00`;UTC 给 `GMT`(无偏移段)→ `UTC+00:00`。 */
+export function formatUtcOffset(tz: string, now: Date = new Date()): string | null {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'longOffset' }).formatToParts(now)
+    const name = parts.find((p) => p.type === 'timeZoneName')?.value ?? ''
+    if (name === 'GMT' || name === 'UTC') return 'UTC+00:00'
+    if (name.startsWith('GMT')) return `UTC${name.slice(3)}`
+    return null
+  } catch {
+    return null
+  }
 }
 
 function sanitizeAbsPath(raw: string | undefined): string | null {
@@ -263,6 +307,7 @@ export function computeEnvFacts(deps: EnvProbeDeps = {}): EnvFacts {
     })
     const runtimeDir = ocHomeDir(env)
     const sourceCommit = exists(MANIFEST_PATH) ? readSourceCommit(readPrefix) : null
+    const userTz = sanitizeTimeZone(env.OC_USER_TZ) ?? DEFAULT_USER_TZ
 
     return {
       uid,
@@ -274,6 +319,8 @@ export function computeEnvFacts(deps: EnvProbeDeps = {}): EnvFacts {
       runtimeDir,
       generatedDir: runtimeDir ? sanitizeAbsPath(join(runtimeDir, 'generated')) : null,
       uploadsDir: runtimeDir ? sanitizeAbsPath(join(runtimeDir, 'uploads')) : null,
+      userTz,
+      userTzOffset: formatUtcOffset(userTz, deps.now ?? new Date()),
     }
   } catch {
     return { ...EMPTY_FACTS }
@@ -298,9 +345,11 @@ function factsAreEmpty(facts: EnvFacts): boolean {
   )
 }
 
-export function renderEnvSlot(facts: EnvFacts, agentId: string): EnvPromptSlot | null {
+export function renderEnvSlot(facts: EnvFacts, agentId: string, now: Date = new Date()): EnvPromptSlot | null {
   if (factsAreEmpty(facts) && !sanitizeAgentId(agentId)) return null
   if (factsAreEmpty(facts)) return null
+  // 偏移现算:facts 是进程级缓存,DST 时区的偏移不能跟着 uid/路径一起被冻住。
+  const userTzOffset = formatUtcOffset(facts.userTz, now) ?? facts.userTzOffset
 
   const lines: string[] = ['# Env · 勿重探']
   const ids: string[] = []
@@ -328,10 +377,18 @@ export function renderEnvSlot(facts: EnvFacts, agentId: string): EnvPromptSlot |
   } else if (facts.runtimeDir) {
     lines.push(`rt=${facts.runtimeDir}`)
   }
+  // 用户面时区:子进程 `date`/`$TZ` 报的是出口对齐时区,不是用户所在地。
+  // 只给时区名+偏移(不给时刻,免得每轮撑爆 prompt 缓存);要时刻自己 `date -u` 再换算。
+  lines.push(
+    userTzOffset
+      ? `user_tz=${facts.userTz} ${userTzOffset} (shell date/TZ=出口时区,勿当用户时间)`
+      : `user_tz=${facts.userTz} (shell date/TZ=出口时区,勿当用户时间)`,
+  )
 
   let content = lines.join('\n')
   if (Buffer.byteLength(content, 'utf8') > ENV_SLOT_MAX_BYTES) {
     // 超预算时丢掉最长的路径行,保留身份;仍超则整段省略以免撑爆热路径。
+    // user_tz 不丢:它是本 slot 里唯一纠正模型「date 即用户时间」误判的一行。
     const dropped = lines.filter((l) => !l.startsWith('rt=') && !l.startsWith('snap='))
     content = dropped.join('\n')
     if (Buffer.byteLength(content, 'utf8') > ENV_SLOT_MAX_BYTES) return null

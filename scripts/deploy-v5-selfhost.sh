@@ -869,6 +869,13 @@ OC_PROJECT_CONTEXT=1
 # on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
 OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
 OC_CLAUDE_CODE_TZ=Asia/Tokyo
+# 用户面时区(OCV5-166)—— 与上面的 OC_CLAUDE_CODE_TZ **正交**,不要混改。
+#   OC_CLAUDE_CODE_TZ : 引擎子进程 TZ,跟随日本出口 IP,是风控一致性控制;
+#   OC_USER_TZ        : 用户真实所在地。两处消费:① 外接 ApiKey 路径的 system-reminder
+#                       追加「用户本地日期+UTC 偏移」;② 注入容器 env(docker Create.Env),
+#                       容器 gateway envProbe 渲染成 ENV slot 的 user_tz= 行给网页/cron 会话。
+#                       不改子进程 TZ、不参与选路;非缺省值改后需重建容器才进 PID1。
+OC_USER_TZ=Asia/Shanghai
 # 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
 # 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
 # token 明文不得进 git。上线无需改本文件,下一次容器重建即带上 supervisor 注入的 env。
@@ -960,6 +967,7 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
+  ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
   ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
   ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
