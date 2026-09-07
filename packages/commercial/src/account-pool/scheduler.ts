@@ -33,8 +33,9 @@ import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
-import { getCodexAccountRuntimeChannel, getRuntimeChannel } from '../runtimeChannel.js'
 import type { AccountHealthTracker } from './health.js'
+import { activePoolWhere } from './poolCandidates.js'
+import { hoursUntil, quotaHeadroom, resetProximityFactor } from './poolWeight.js'
 import {
   type AccountPlan,
   type AccountProvider,
@@ -650,26 +651,16 @@ export function grokCreditFactor(
 ): number {
   if (c.grok_usage_error?.startsWith('oauth_terminal:')) return 0.05
 
-  const periodEnd = c.grok_credit_period_end
-  if (periodEnd != null) {
-    const untilResetMs = periodEnd.getTime() - now.getTime()
-    if (!Number.isNaN(untilResetMs) && untilResetMs <= 0) return 1.0
-  }
+  // Stale sweeper data: the weekly window already rolled over but the row
+  // still carries last week's numbers. Treat as fully neutral rather than
+  // penalising an account that in reality has a fresh quota.
+  const untilReset = hoursUntil(c.grok_credit_period_end, now)
+  if (untilReset !== null && untilReset <= 0) return 1.0
 
-  const pct = c.grok_credit_usage_pct
-  const headroom =
-    pct == null || Number.isNaN(pct) || pct < 0
-      ? 1.0
-      : Math.max(0.02, Math.min(1, (100 - Math.floor(pct / 5) * 5) / 100))
-
-  let resetFactor = 1
-  if (periodEnd != null) {
-    const hours = (periodEnd.getTime() - now.getTime()) / 3_600_000
-    if (Number.isFinite(hours)) {
-      resetFactor = hours < 24 ? 1.5 : hours < 72 ? 1.2 : 1
-    }
-  }
-  return headroom * resetFactor
+  // Grok NULL policy: unknown usage is neutral (this file's "NULL → 1.0" rule),
+  // unlike Cursor's 0.5. Bucket by 5% so hourly drift does not move WRH keys.
+  const headroom = quotaHeadroom(c.grok_credit_usage_pct, { unknown: 1.0, bucketPct: 5 })
+  return headroom * resetProximityFactor(c.grok_credit_period_end, now)
 }
 
 /**
@@ -1281,16 +1272,11 @@ export class AccountScheduler {
     provider: AccountProvider,
     groupId: bigint | string | null,
   ): Promise<CandidateRow[]> {
-    const params: unknown[] = [provider]
-    const where = ["status = 'active'", 'provider = $1']
-    if (groupId !== null) {
-      params.push(String(groupId))
-      where.push(`group_id = $${params.length}`)
-    }
-    if (provider === 'codex' || provider === 'grok') {
-      params.push(provider === 'codex' ? getCodexAccountRuntimeChannel() : getRuntimeChannel())
-      where.push(`runtime_channel = $${params.length}`)
-    }
+    // Routable-row predicate shared with every other picker / probe
+    // (poolCandidates.activePoolWhere) — provider, channel partition, group.
+    const base = activePoolWhere({ provider, groupId })
+    const params: unknown[] = [...base.params]
+    const where = [...base.clauses]
     // 反封复盘 2026-08 — 配额感知主动退避:5h / 7d 利用率达到阈值的账号直接剔除候选,
     // 歇到窗口滚动恢复(pct 由响应头回落),而不是被 WRH 低权重选中后一路打到 429。
     // NULL(未上报)保留在池内。pin-hit 命中被剔除账号 → pickPinnedAccount 返 null →
@@ -1824,18 +1810,11 @@ export async function pickOfficialOAuthAccountForBindingInTx(
   }
   const hash = deps.hash ?? defaultHash
 
-  const params: unknown[] = []
-  const where = ["status = 'active'", `provider = $1`]
-  params.push(provider)
-  // 0098 channel 划分(M1b):codex 账号池权威按 runtime_channel 归属,picker 使用 Codex account-pool channel。
-  // 默认仍是本 runtime channel；设置 OC_CODEX_ACCOUNT_RUNTIME_CHANNEL=v5 时,
-  // v3 容器可消费 v5-owned 账号池,但容器 runtime_channel 不随之改变。
-  params.push(provider === 'codex' ? getCodexAccountRuntimeChannel() : getRuntimeChannel())
-  where.push(`runtime_channel = $${params.length}`)
-  if (deps.groupId !== undefined && deps.groupId !== null) {
-    params.push(String(deps.groupId))
-    where.push(`group_id = $${params.length}`)
-  }
+  // 0098 channel 划分(M1b):codex 账号池权威按 runtime_channel 归属;channel 选择
+  // 规则(codex → OC_CODEX_ACCOUNT_RUNTIME_CHANNEL,grok → 本 runtime channel)
+  // 由 poolCandidates.accountPoolChannelFor 单点决定,与 scheduler.pick /
+  // hasActiveOfficialOAuthAccountInGroup / codexBinding.acquire 探针同源。
+  const { clauses: where, params } = activePoolWhere({ provider, groupId: deps.groupId })
 
   const res = await client.query<{ id: string; plan: AccountPlan; health_score: number }>(
     `SELECT id::text AS id, plan, health_score

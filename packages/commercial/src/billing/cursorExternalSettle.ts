@@ -136,27 +136,60 @@ export function planCursorExternalSettle(args: {
   return { settleStatus, costCredits, snapshotJson };
 }
 
+/**
+ * What a settled Cursor turn writes back onto its account row.
+ *
+ * Stats + visibility only. Deliberately NOT routed through
+ * AccountHealthTracker: health_score / status / cooldown_until feed the
+ * cursorMaterializer whitelist (`eligibleCursorRows`), and a burst of Sand
+ * 504s or a service_restart SIGKILL must not un-materialize a key for every
+ * user (the 2026-09-04 "sessions scattered across accounts" incident was
+ * exactly a false slot-fail cascade). The container-side wrapper keeps its
+ * own 600s rotation cooldown for that.
+ *
+ * What *was* missing is any admin-visible trace: a Cursor account could fail
+ * 200 turns in a row and the accounts table showed nothing but a counter.
+ * `last_error` now carries the last terminal code (`cursor_<code>`) so the
+ * "最近出错" chip lights up like it does for CCB/Grok rows, and a success
+ * clears it — same contract as `health.onSuccess`, minus the health mutation.
+ */
+export function planCursorAccountUsageBump(args: {
+  success: boolean;
+  terminalCode?: string | null;
+}): { sql: string; lastError: string | null } {
+  if (args.success) {
+    return {
+      sql: `UPDATE claude_accounts
+               SET success_count = success_count + 1,
+                   last_used_at = NOW(),
+                   last_error = NULL,
+                   updated_at = NOW()
+             WHERE id = $1 AND provider = 'cursor'`,
+      lastError: null,
+    };
+  }
+  const code = (args.terminalCode ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return {
+    sql: `UPDATE claude_accounts
+             SET fail_count = fail_count + 1,
+                 last_used_at = NOW(),
+                 last_error = $2,
+                 updated_at = NOW()
+           WHERE id = $1 AND provider = 'cursor'`,
+    lastError: `cursor_${code || "engine_error"}`,
+  };
+}
+
 async function bumpCursorAccountUsageCounts(
   pool: Pool,
   accountId: bigint,
   success: boolean,
+  terminalCode: string | null,
 ): Promise<void> {
-  // Stats-only. Do NOT call health.onSuccess/onFailure: those mutate
-  // health_score / last_error / status / cooldown and can drop a key from
-  // the cursor materializer whitelist.
+  const plan = planCursorAccountUsageBump({ success, terminalCode });
   await pool.query(
-    success
-      ? `UPDATE claude_accounts
-            SET success_count = success_count + 1,
-                last_used_at = NOW(),
-                updated_at = NOW()
-          WHERE id = $1 AND provider = 'cursor'`
-      : `UPDATE claude_accounts
-            SET fail_count = fail_count + 1,
-                last_used_at = NOW(),
-                updated_at = NOW()
-          WHERE id = $1 AND provider = 'cursor'`,
-    [accountId.toString()],
+    plan.sql,
+    plan.lastError === null ? [accountId.toString()] : [accountId.toString(), plan.lastError],
   );
 }
 
@@ -218,7 +251,12 @@ export async function settleCursorExternalUsage(args: {
   });
   if (accountId !== null) {
     try {
-      await bumpCursorAccountUsageCounts(args.pool, accountId, plan.settleStatus === "success");
+      await bumpCursorAccountUsageCounts(
+        args.pool,
+        accountId,
+        plan.settleStatus === "success",
+        args.terminalCode ?? null,
+      );
     } catch {
       // usage_records.account_id already committed; counts are best-effort.
     }

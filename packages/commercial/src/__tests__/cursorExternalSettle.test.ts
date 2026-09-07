@@ -5,6 +5,7 @@ import {
   cursorSettleMultiplier,
   mapCursorReportedUsage,
   parseCursorSettleSurcharge,
+  planCursorAccountUsageBump,
   planCursorExternalSettle,
 } from "../billing/cursorExternalSettle.js";
 import type { ModelPricing } from "../billing/pricing.js";
@@ -265,5 +266,33 @@ describe("planCursorExternalSettle", () => {
         else process.env[CURSOR_SETTLE_SURCHARGE_ENV] = prev;
       }
     });
+  });
+});
+
+describe("planCursorAccountUsageBump", () => {
+  test("success bumps success_count and clears last_error, never touches health/status", () => {
+    const plan = planCursorAccountUsageBump({ success: true });
+    assert.equal(plan.lastError, null);
+    assert.match(plan.sql, /success_count = success_count \+ 1/);
+    assert.match(plan.sql, /last_error = NULL/);
+    assert.match(plan.sql, /provider = 'cursor'/);
+    assert.doesNotMatch(plan.sql, /health_score|status =|cooldown_until/);
+  });
+
+  test("failure bumps fail_count and records the sanitized terminal code in last_error", () => {
+    const plan = planCursorAccountUsageBump({ success: false, terminalCode: "AUTH_UNAVAILABLE" });
+    assert.equal(plan.lastError, "cursor_AUTH_UNAVAILABLE");
+    assert.match(plan.sql, /fail_count = fail_count \+ 1/);
+    assert.match(plan.sql, /last_error = \$2/);
+    assert.doesNotMatch(plan.sql, /health_score|status =|cooldown_until/);
+  });
+
+  test("failure without a terminal code falls back to engine_error; odd characters are stripped", () => {
+    assert.equal(planCursorAccountUsageBump({ success: false }).lastError, "cursor_engine_error");
+    assert.equal(planCursorAccountUsageBump({ success: false, terminalCode: null }).lastError, "cursor_engine_error");
+    assert.equal(
+      planCursorAccountUsageBump({ success: false, terminalCode: "QUOTA; drop table--" }).lastError,
+      "cursor_QUOTAdroptable--",
+    );
   });
 });
