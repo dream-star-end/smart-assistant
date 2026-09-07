@@ -20,9 +20,9 @@ source "$SCRIPT_DIR/v5-lease-lib.sh"
 
 usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
-# 会话键:优先 OC_SESSION_KEY(grok/codex/cursor adapter 注入;CCB 尚无 → P2 补);须为 webchat dm。
+# 会话键:OC_SESSION_KEY 与 CCB OPENCLAUDE_SESSION_KEY 同源；只支持 webchat dm。
 detect_session_key() {
-  local sk="${OC_SESSION_KEY:-}"
+  local sk="${OC_SESSION_KEY:-${OPENCLAUDE_SESSION_KEY:-}}"
   [[ -n "$sk" ]] || return 1
   [[ "$sk" =~ ^agent:[A-Za-z0-9_-]+:webchat:dm:[A-Za-z0-9_-]+$ ]] || return 1
   printf '%s\n' "$sk"
@@ -46,9 +46,10 @@ cmd_register() {
   [[ "$resource" == "deploy:selfhost" ]] || lease_die "P1 仅支持 deploy:selfhost;其它资源待 P4"
   [[ "$mode" == ride ]] || lease_die "P1 仅支持 --mode ride;drive 待 P3"
   lease_valid_sha "$sha" || lease_die "--sha 必须是 40 位小写 sha"
-  [[ -n "$uid" ]] || lease_die "缺 uid(OC_USER_ID 未注入,或用 --uid)"
+  [[ "$uid" =~ ^[1-9][0-9]{0,18}$ ]] || lease_die "缺少/非法 uid(OC_USER_ID 未注入,或用 --uid)"
+  [[ "$callback" == auto || "$callback" == none ]] || lease_die "--callback 必须是 auto|none"
   [[ -z "$ticket" || "$ticket" =~ ^[A-Z0-9]+-[0-9]+$ ]] || lease_die "--ticket 格式应为 OCV5-123"
-  local sk_tail="${OC_SESSION_KEY:-}"; sk_tail="${sk_tail##*:}"
+  local sk_tail="${OC_SESSION_KEY:-${OPENCLAUDE_SESSION_KEY:-}}"; sk_tail="${sk_tail##*:}"
   owner="${owner:-$sk_tail}"; owner="${owner:-uid$uid}"
   lease_valid_label "$owner" || lease_die "非法 owner:$owner"
 
@@ -73,17 +74,28 @@ cmd_register() {
   local sk="" cb_note
   if [[ "$callback" == auto ]]; then
     if sk="$(detect_session_key)"; then
-      cb_note="回调:注入原会话 $sk(P2 生效前先落面板 ${ticket:-无单})"
+      local agent sid response code kind payload
+      agent="${sk#agent:}"; agent="${agent%%:*}"; sid="${sk##*:}"
+      payload="$(jq -cn --arg uid "$uid" --arg sid "$sid" --arg agent "$agent" '{uid:$uid,sessionId:$sid,agentId:$agent}')"
+      response="$(lease_callback_post /validate "$payload" 2>&1)" || {
+        echo "✗ 原会话回调未就绪，未登记: ${response:0:200}" >&2; exit 3;
+      }
+      code="${response##*$'\n'}"; response="${response%$'\n'*}"
+      kind="$(printf '%s' "$response" | jq -r '.kind // empty' 2>/dev/null || true)"
+      [[ "$code:$kind" == 200:validated ]] || {
+        echo "✗ 原会话归属/回调校验失败(http=$code kind=${kind:-?})，未登记。" >&2; exit 3;
+      }
+      cb_note="回调:已校验归属，结果将唤醒原会话 $sk；不可投递时明确降级到面板 ${ticket:-无单}"
     else
       sk=""
       if [[ -n "$ticket" ]]; then
         cb_note="回调:当前引擎未注入 OC_SESSION_KEY,降级为面板评论 $ticket"
       else
-        cb_note="回调:无会话键且无 --ticket,结果只写 worker 日志(建议补 --ticket)"
+        lease_die "无会话键且无 --ticket：请传真实会话上下文，或显式 --callback none 仅记日志"
       fi
     fi
   else
-    cb_note="回调:none(仅 status 可查)"
+    cb_note="回调:none(不唤醒会话；${ticket:+面板评论 $ticket}${ticket:-仅 worker 日志/status})"
   fi
 
   # 4) 幂等:同 resource+sha+owner 已有 open lease → 返回旧 id。
@@ -112,7 +124,7 @@ SQL
   echo "✓ lease $id 已登记:$resource/$mode want=${sha:0:12} owner=$owner"
   echo "  $cb_note"
   echo "  当前: origin tip ${tip:0:12};live ${live_sha:-未知/未committed}"
-  echo "▶ 请立即收口本回合。worker 每 30s 调度:锁空即发一班列车带上所有已登记 sha;结果送达前不要再查、不要订 reminder。"
+  echo "▶ 请立即收口本回合。worker 每 30s 调度:锁空即发一班列车带上所有已登记 sha;结果将按上方实际回调落点送达；面板评论不等于原会话已唤醒。"
 }
 
 cmd_status() {
