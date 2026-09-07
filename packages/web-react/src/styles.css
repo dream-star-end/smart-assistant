@@ -856,3 +856,7 @@ body {
 .dark .hljs-number, .dark .hljs-meta { color: #e0a45e; }
 .hljs-function, .hljs-variable, .hljs-attr { color: #3b6fd4; }
 .dark .hljs-function, .dark .hljs-attr, .dark .hljs-variable { color: #82aaff; }
+
+/* 本设备「大」字号：只放大助手/用户正文，不改工具卡。 */
+[data-font-size="large"] [data-testid="message-text"],
+[data-font-size="large"] .prose { font-size: 17px; }

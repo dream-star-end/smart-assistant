@@ -100,6 +100,8 @@ export function Composer({
   replyTo,
   onCancelReply,
   environmentPreparing,
+  sendKey = "enter",
+  fontSize = "default",
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -134,6 +136,10 @@ export function Composer({
   onCancelReply?: () => void;
   /** 容器冷启/未就绪：输入区展示「环境准备中，约 20 秒」进度条，避免静默等待。 */
   environmentPreparing?: boolean;
+  /** 发送快捷键：enter = Enter 发送（⌘+Enter 保持发送）；mod-enter = ⌘/Ctrl+Enter 发送。 */
+  sendKey?: "enter" | "mod-enter";
+  /** 输入框字号。large 时 17.5px。 */
+  fontSize?: "default" | "large";
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -557,16 +563,23 @@ export function Composer({
               void onFiles(images);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                 // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                 if (coarsePointer) return;
+                const mod = e.metaKey || e.ctrlKey;
+                // enter 模式保持原行为：Enter / ⌘+Enter 都发送，仅 Shift+Enter 换行。
+                const shouldSend = sendKey === "mod-enter" ? mod : !e.shiftKey;
+                if (!shouldSend) return;
                 e.preventDefault();
                 submit();
               }
             }}
             enterKeyHint={coarsePointer ? "enter" : "send"}
             placeholder={placeholder}
-            className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
+            className={cn(
+              "max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
+              fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
+            )}
           />
           <IconButton
             data-product-feature={PRODUCT_CAPABILITIES.voice.id}

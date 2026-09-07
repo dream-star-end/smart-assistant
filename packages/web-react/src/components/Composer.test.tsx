@@ -97,3 +97,17 @@ describe("Composer 拖拽上传", () => {
     expect(shell.className).not.toContain("ring-2");
   });
 });
+
+describe("Composer sendKey", () => {
+  test("sendKey=mod-enter 时 Enter 不发送，⌘+Enter 发送", () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} sendKey="mod-enter" />);
+    const textarea = screen.getByLabelText("消息输入框");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("hello", undefined, undefined);
+  });
+});

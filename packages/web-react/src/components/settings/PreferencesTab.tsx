@@ -1,5 +1,6 @@
 import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
+import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
@@ -83,6 +84,7 @@ export function PreferencesTab({
   const [optimizerConsentOpen, setOptimizerConsentOpen] = useState(false)
   const [optimizerConsentSaving, setOptimizerConsentSaving] = useState(false)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
+  const composerPrefs = useLocalComposerPrefs()
 
   useEffect(() => {
     let alive = true
@@ -217,6 +219,62 @@ export function PreferencesTab({
             ))}
           </Select>
         </label>
+      </div>
+
+      {/* 输入：仅本设备 */}
+      <div className="border-t border-border px-5 py-4">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+          输入
+        </div>
+        <p className="pb-3 text-meta text-muted">仅本设备生效</p>
+        <div className="pb-2 text-section text-fg">发送键</div>
+        <div className="mb-3 grid grid-cols-2 gap-2">
+          {(
+            [
+              { value: 'enter' as const, label: 'Enter 发送' },
+              { value: 'mod-enter' as const, label: '⌘+Enter 发送' },
+            ] as const
+          ).map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => composerPrefs.setSendKey(o.value)}
+              aria-pressed={composerPrefs.sendKey === o.value}
+              className={cn(
+                'flex items-center justify-center rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                composerPrefs.sendKey === o.value
+                  ? 'border-accent bg-accent-soft text-accent'
+                  : 'border-border text-muted hover:bg-hover hover:text-fg',
+              )}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+        <div className="pb-2 text-section text-fg">字号</div>
+        <div className="grid grid-cols-2 gap-2">
+          {(
+            [
+              { value: 'default' as const, label: '默认' },
+              { value: 'large' as const, label: '大' },
+            ] as const
+          ).map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => composerPrefs.setFontSize(o.value)}
+              aria-pressed={composerPrefs.fontSize === o.value}
+              className={cn(
+                'flex items-center justify-center rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                composerPrefs.fontSize === o.value
+                  ? 'border-accent bg-accent-soft text-accent'
+                  : 'border-border text-muted hover:bg-hover hover:text-fg',
+              )}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Max+ 特色功能：V5 原生后台记忆整理（默认关闭，真实调用按实际积分计费）。 */}
