@@ -190,6 +190,8 @@ import {
   appendServerAuthoredMessageDurable,
   patchServerAuthoredMessage,
   deleteClientSession,
+  restoreClientSession,
+  purgeClientSession,
   patchClientSessionMeta,
   searchClientSessions,
   batchClientSessions,
@@ -478,6 +480,7 @@ import {
 } from './delegateEngineBilling.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
+import { startSessionTrashSweeper } from './sessionTrashSweeper.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
 import { startMemoryUsageReporter } from './memoryUsageReporter.js'
 import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
@@ -2354,6 +2357,8 @@ export class Gateway {
   private _taskboardPatrol: PatrolEngine | null = null
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
+  /** 会话回收站到期清理(启动即扫一次 + 周期 sweep;start 里启动,shutdown Stage 2 stop)。 */
+  private _sessionTrashSweeper: { stop(): void } | null = null
   private _stopEviction: (() => void) | null = null
   /** v3 master sink retry queue stop hook — set when sink is wired in
    *  start(); called in shutdown stage 2 to cancel the periodic drain
@@ -3521,6 +3526,15 @@ export class Gateway {
       },
       Gateway.PENDING_PERMISSION_SWEEP_MS,
     )
+    // 会话回收站 sweeper:到期(默认 3 天,OC_SESSION_TRASH_RETENTION_MS)的软删行
+    // 周期硬删。清理性任务 —— 内部已吞错只 warn,绝不阻塞启动。周期默认 1h,
+    // env OC_SESSION_TRASH_SWEEP_MS 可缩短(e2e)。
+    this._sessionTrashSweeper = startSessionTrashSweeper({
+      log: {
+        info: (msg, meta) => this.log.info(msg, meta),
+        warn: (msg, meta, err) => this.log.warn(msg, meta, err),
+      },
+    })
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
@@ -3647,6 +3661,12 @@ export class Gateway {
       clearInterval(this._pendingPermissionSweepTimer)
       this._pendingPermissionSweepTimer = null
     }
+    try {
+      this._sessionTrashSweeper?.stop()
+    } catch (err) {
+      this.log.warn('session trash sweeper stop error', undefined, err)
+    }
+    this._sessionTrashSweeper = null
     try {
       this.cron?.stop()
     } catch (err) {
@@ -4655,6 +4675,9 @@ export class Gateway {
     if (url.pathname === '/api/sessions/list' && req.method === 'GET') {
       const userId = this.getUserId(req)
       const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
+      // 回收站列表(trashed=1/true):只列软删行,按 deletedAt 倒序,每项带 deletedAt。
+      const trashedRaw = url.searchParams.get('trashed')
+      const trashed = trashedRaw === '1' || trashedRaw === 'true'
       const limitRaw = url.searchParams.get('limit')
       const beforeRaw = url.searchParams.get('before')
       let limit: number | undefined
@@ -4675,7 +4698,7 @@ export class Gateway {
         }
         before = Math.floor(n)
       }
-      listClientSessions(userId, { includeArchived, limit, before })
+      listClientSessions(userId, { includeArchived, limit, before, trashed })
         .then((list) => this.sendJson(res, 200, {
           sessions: list.sessions,
           ...(list.nextCursor !== undefined ? { nextCursor: list.nextCursor } : {}),
@@ -4735,7 +4758,7 @@ export class Gateway {
             return
           }
           if (parsed.error === 'invalid_action') {
-            this.sendJson(res, 400, { error: 'action must be archive, unarchive, delete or move' })
+            this.sendJson(res, 400, { error: 'action must be archive, unarchive, delete, move, restore or purge' })
             return
           }
           this.sendJson(res, 400, { error: 'ids required (string array)' })
@@ -5514,6 +5537,28 @@ export class Gateway {
         .catch(() => this.sendJson(res, 500, { error: 'mark read failed' }))
       return
     }
+    // 会话回收站:POST /api/sessions/:id/restore — 把软删(deleted_at IS NOT NULL)的
+    // 会话还原为活跃。只对已在回收站且属于当前 userId 的行生效;活跃行 / 不存在 /
+    // 跨租户 → 404 'not found in trash'。必须放在下面 generic /api/sessions/:id 块之前。
+    const sessionRestoreMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]+)\/restore$/)
+    if (sessionRestoreMatch) {
+      const sessId = sessionRestoreMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'POST') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      restoreClientSession(sessId, userId)
+        .then((r) => {
+          if (!r.ok) {
+            this.sendJson(res, 404, { error: 'not found in trash' })
+            return
+          }
+          this.sendJson(res, 200, { ok: true, updatedAt: r.updatedAt })
+        })
+        .catch(() => this.sendJson(res, 500, { error: 'restore failed' }))
+      return
+    }
     // Exact browser-visible process frames, committed by the commercial
     // master before live WS delivery.  This is cursor-paged with no total cap;
     // personal/container SQLite returns an empty page.
@@ -5805,6 +5850,20 @@ export class Gateway {
         return
       }
       if (req.method === 'DELETE') {
+        // 回收站(会话回收站):DELETE = 软删进回收站(默认);?purge=1 = 彻底删除,
+        // 只对已在回收站中的行生效(活跃行必须先软删,防误触硬删)。
+        if (url.searchParams.get('purge') === '1') {
+          purgeClientSession(sessId, userId)
+            .then((purged) => {
+              if (!purged) {
+                this.sendJson(res, 404, { error: 'not found in trash' })
+                return
+              }
+              this.sendJson(res, 200, { ok: true, purged: true })
+            })
+            .catch(() => this.sendJson(res, 500, { error: 'purge failed' }))
+          return
+        }
         deleteClientSession(sessId, userId)
           .then(() => this.sendJson(res, 200, { ok: true }))
           .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
@@ -7198,7 +7257,9 @@ export class Gateway {
    * tryCompensation 构造的 `{sessionId, bindingUserId, reason, traceId?}` JSON。
    *
    * **idempotent + always-200**:
-   *   - 行存在且未 soft-deleted → 调 deleteClientSession,200 `{ok:true, deleted:true}`
+   *   - 行存在且未 soft-deleted → 先 deleteClientSession(进回收站)再立即
+   *     purgeClientSession 出回收站 —— 补偿语义是"撤销一条刚创建的空行",不该在
+   *     用户回收站里留下尸体;purge 失败不影响结果(回收站 sweeper 3 天兜底)。200 `{ok:true, deleted:true}`
    *   - 行已 soft-deleted / 不存在 / 跨 tenant userId mismatch → 200 `{ok:true, deleted:false}`
    *   - schema 错 → 400(语义是 caller 出错,不是 compensation 失败 — 跟 idempotent 语义不冲突)
    *   - body 过大 → 413(同 handleWechatInbound 风格)
@@ -7238,7 +7299,10 @@ export class Gateway {
     let deleted = false
     let errMessage: string | undefined
     try {
+      // 补偿 = 撤销刚创建的空行:软删进回收站后立即硬删出回收站(不留在用户
+      // 回收站里);purge 失败被吞掉 —— 回收站 sweeper 到期兜底,补偿结果不受影响。
       deleted = await deleteClientSession(sessionId, userId)
+      if (deleted) await purgeClientSession(sessionId, userId).catch(() => {})
     } catch (err) {
       errMessage = (err as Error)?.message ?? String(err)
       this.log.error('wechat-inbound-compensate db error', { sessionId, userId, reason, traceId, errMessage })
@@ -21896,6 +21960,7 @@ function normalizePath(p: string): string {
   // Dynamic API routes — normalize IDs
   const normalized = p
     .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/inflight-delegates$/, '/api/sessions/:id/inflight-delegates')
+    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/restore$/, '/api/sessions/:id/restore')
     .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
     .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')
