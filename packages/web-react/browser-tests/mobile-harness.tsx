@@ -132,8 +132,8 @@ const MOBILE_AGENT: Agent = {
 
 // 长展示名:顶栏拥挤度的真实上限(线上模型名比这更长的都有)。
 const MOBILE_MODELS = [
-  { id: "m-mobile-a", display_name: "OpenClaude 旗舰推理 Max 1M 长上下文" },
-  { id: "m-mobile-b", display_name: "OpenClaude 均衡 Pro" },
+  { id: "m-mobile-a", display_name: "OpenClaude 旗舰推理 Max 1M 长上下文", cost_x: 4.1 },
+  { id: "m-mobile-b", display_name: "OpenClaude 均衡 Pro", cost_x: 4.1 },
 ];
 
 function MobileChatPage() {
@@ -154,6 +154,7 @@ function MobileChatPage() {
       stick.following.current = value;
     },
     scrollToBottom: stick.scrollToBottom,
+    jumpToBottom: stick.jumpToBottom,
     correctTo: stick.correctTo,
   }), [stick]);
   const syncFollowing = useCallback(() => {
@@ -251,6 +252,8 @@ function MobileChatPage() {
           onOpenMobileNav={() => {
             window.__mobilePage.navOpens += 1;
           }}
+          onOpenFind={() => {}}
+          sessionUnreadCount={22}
           onOpenInbox={() => {}}
           unreadCount={3}
         />

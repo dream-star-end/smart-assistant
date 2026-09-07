@@ -138,3 +138,14 @@ describe("ChatHeader 会话内查找", () => {
     expect(onOpenFind).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe("ChatHeader compact navigation", () => {
+  it("keeps the agent accessible and groups the model independently of actions", () => {
+    renderHeader({onOpenMobileNav: vi.fn(), onOpenInbox: vi.fn(), onOpenFind: vi.fn()});
+    expect(screen.getByRole("button", {name: `切换智能体，当前${MAIN_AGENT.name}`})).toBeInTheDocument();
+    const row = screen.getByTestId("chat-model-row");
+    expect(row).toContainElement(screen.getByRole("button", {name: "选择对话模型"}));
+    expect(row).not.toContainElement(screen.getByRole("button", {name: "会话内查找"}));
+  });
+});

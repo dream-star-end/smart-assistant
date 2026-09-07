@@ -499,3 +499,34 @@ describe("stickToBottom", () => {
     expect(el.scrollTop).toBe(3100);
   });
 });
+
+
+describe("explicit jumpToBottom", () => {
+  test.each(["upward", "touch", "wheel", "keyboard"])("supersedes %s intent then respects the next gesture", (intent) => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 2000, clientHeight: 500, scrollTop: 0 });
+    stick.scrollToBottom(el);
+    stick.markUserIntent(); el.scrollTop = 500; stick.onScroll(el);
+    if (intent === "touch") stick.beginDirectManipulation();
+    if (intent === "wheel") stick.beginWheelFence();
+    if (intent === "keyboard") stick.markUserIntent();
+    // The old FAB set following then called the guarded automatic pin: no-op.
+    stick.following.current = true; stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(500);
+    stick.jumpToBottom(el);
+    expect(el.scrollTop).toBe(1500);
+    expect(stick.canRestick.current).toBe(true);
+    stick.onScroll(el); el.scrollHeight += 100; stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1600);
+    stick.markUserIntent(); el.scrollTop -= 8; stick.onScroll(el);
+    el.scrollHeight += 100; stick.scrollToBottom(el);
+    expect(el.scrollTop).toBe(1592);
+    expect(stick.following.current).toBe(false);
+  });
+  test("non-scrollable and already-bottom commands are idempotent", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({scrollHeight: 100, clientHeight: 500, scrollTop: 0});
+    stick.jumpToBottom(el); stick.jumpToBottom(el);
+    expect(el.scrollTop).toBe(0); expect(stick.canRestick.current).toBe(true);
+  });
+});

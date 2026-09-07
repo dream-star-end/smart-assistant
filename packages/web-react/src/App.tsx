@@ -2454,6 +2454,7 @@ export function App() {
       stick.following.current = value;
     },
     scrollToBottom: stick.scrollToBottom,
+    jumpToBottom: stick.jumpToBottom,
     correctTo: stick.correctTo,
   }), [stick]);
   const scrollToChatBottom = useCallback(() => {

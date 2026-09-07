@@ -97,12 +97,12 @@ export function ChatHeader({
   const engineLabel = teamEngineLabel(models ?? []);
   return (
     <header
-      className="flex h-14 shrink-0 items-center gap-1 px-3 pb-2.5 header-safe-t"
+      className="flex min-h-14 shrink-0 flex-wrap items-center gap-1 px-2 pb-2 header-safe-t sm:flex-nowrap sm:px-3 sm:pb-2.5"
       data-product-entry-scope="chat-header"
     >
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
-        <div className="relative md:hidden">
+        <div className="relative shrink-0 md:hidden">
           <IconButton
             data-product-control
             onClick={onOpenMobileNav}
@@ -154,14 +154,15 @@ export function ChatHeader({
       <button
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
-        className="flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+        aria-label={`切换智能体，当前${agent.name}`}
+        className="flex min-h-11 min-w-0 flex-1 items-center gap-1.5 rounded-xl px-1 py-1.5 sm:flex-initial sm:px-2.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
       >
-        <AgentAvatar agent={agent} className="size-7 rounded-lg" iconSize={15} />
+        <AgentAvatar agent={agent} className="size-7 shrink-0 rounded-lg" iconSize={15} />
         {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
         <span className="max-w-[7.5rem] truncate whitespace-nowrap text-title font-semibold text-fg sm:max-w-none">
           {agent.name}
         </span>
-        <ChevronDown size={15} className="shrink-0 text-faint" />
+        <ChevronDown size={15} className="hidden shrink-0 text-faint sm:block" />
       </button>
       {projectBreadcrumb && (projectBreadcrumb.chatName || projectBreadcrumb.workName) ? (
         <button
@@ -175,62 +176,66 @@ export function ChatHeader({
           {[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
         </button>
       ) : null}
-      {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
-          点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
-      {teamModeActive && (
-        <Popover open={teamPopoverOpen} onOpenChange={setTeamPopoverOpen}>
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
-              aria-label="团队模式已开启"
-              className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
-            >
-              <Users size={11} className="shrink-0" />
-              {/* 移动端只留图标(选择器同排还有引擎标签,文案冗余挤爆头部);sm+ 显示全称。 */}
-              <span className="hidden sm:inline">团队模式</span>
-            </button>
-          </PopoverTrigger>
-          <PopoverContent>
-            <p className="text-[12.5px] leading-relaxed text-muted">
-              团队模式已开启：队长引擎为 {engineLabel}（计费高于默认模型），并会按需委派已安装智能体协作、按对应模型计费。
-            </p>
-            {onDisableTeamMode && (
-              <Button
-                data-product-control
-                size="sm"
-                variant="secondary"
-                className="mt-2.5 w-full"
-                onClick={() => {
-                  setTeamPopoverOpen(false);
-                  onDisableTeamMode();
-                }}
-              >
-                关闭团队模式
-              </Button>
-            )}
-          </PopoverContent>
-        </Popover>
+      {(teamModeActive || (models && onSelectModel)) && (
+        <div className="order-last flex min-w-0 basis-full items-center gap-1 rounded-xl bg-hover/50 sm:order-none sm:flex-1 sm:basis-auto sm:bg-transparent" data-testid="chat-model-row">
+          {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
+              点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
+          {teamModeActive && (
+            <Popover open={teamPopoverOpen} onOpenChange={setTeamPopoverOpen}>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
+                  aria-label="团队模式已开启"
+                  className="flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+                >
+                  <Users size={11} className="shrink-0" />
+                  {/* 移动端只留图标(选择器同排还有引擎标签,文案冗余挤爆头部);sm+ 显示全称。 */}
+                  <span className="hidden sm:inline">团队模式</span>
+                </button>
+              </PopoverTrigger>
+              <PopoverContent>
+                <p className="text-[12.5px] leading-relaxed text-muted">
+                  团队模式已开启：队长引擎为 {engineLabel}（计费高于默认模型），并会按需委派已安装智能体协作、按对应模型计费。
+                </p>
+                {onDisableTeamMode && (
+                  <Button
+                    data-product-control
+                    size="sm"
+                    variant="secondary"
+                    className="mt-2.5 w-full"
+                    onClick={() => {
+                      setTeamPopoverOpen(false);
+                      onDisableTeamMode();
+                    }}
+                  >
+                    关闭团队模式
+                  </Button>
+                )}
+              </PopoverContent>
+            </Popover>
+          )}
+          {models && onSelectModel && (
+            <ModelSelector
+              models={models}
+              lockedModels={lockedModels}
+              selectedId={selectedModelId}
+              onSelect={onSelectModel}
+              onLockedSelect={onLockedSelect}
+              loading={modelsLoading}
+              teamEngineActive={teamModeActive}
+              effortSupported={effortSupported}
+              effortActive={effortActive}
+              onSelectEffort={onSelectEffort}
+              contextTier={contextTier}
+              onSelectContextTier={onSelectContextTier}
+              open={modelPickerOpen}
+              onOpenChange={onModelPickerOpenChange}
+            />
+          )}
+        </div>
       )}
-      {models && onSelectModel && (
-        <ModelSelector
-          models={models}
-          lockedModels={lockedModels}
-          selectedId={selectedModelId}
-          onSelect={onSelectModel}
-          onLockedSelect={onLockedSelect}
-          loading={modelsLoading}
-          teamEngineActive={teamModeActive}
-          effortSupported={effortSupported}
-          effortActive={effortActive}
-          onSelectEffort={onSelectEffort}
-          contextTier={contextTier}
-          onSelectContextTier={onSelectContextTier}
-          open={modelPickerOpen}
-          onOpenChange={onModelPickerOpenChange}
-        />
-      )}
-      <div className="ml-auto flex shrink-0 items-center gap-1.5">
+      <div className="ml-auto flex shrink-0 items-center gap-0 sm:gap-1.5">
         {onOpenFind && (
           <IconButton
             onClick={onOpenFind}
@@ -255,7 +260,7 @@ export function ChatHeader({
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
             aria-label="账户与计费"
-            className={`flex items-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
+            className={`flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
               low
                 ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
                 : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"

@@ -3093,15 +3093,20 @@ describe("主时间线回到底部 FAB", () => {
     expect(shouldShowScrollToBottom(true, 2)).toBe(false);
     expect(shouldShowScrollToBottom(undefined, 2)).toBe(false);
     expect(shouldShowScrollToBottom(false, 0)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 2, 8)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 2, 0)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 2, 81)).toBe(true);
   });
 
-  test("离底时按钮可见，贴底时仍挂载但不可见不可点，点击调用 scrollToBottom", async () => {
-    const scrollToBottom = vi.fn();
+  test("离底时按钮可见，贴底时仍挂载但不可见不可点，点击调用显式 jumpToBottom", async () => {
+    const jumpToBottom = vi.fn(() => { followBottomRef.current = true; scroller.scrollTop = 500; });
     const followBottomRef = {
       current: false,
-      scrollToBottom,
+      jumpToBottom,
+      scrollToBottom: vi.fn(),
     };
     const scroller = document.createElement("div");
+    Object.defineProperties(scroller, { scrollHeight: { value: 1000 }, clientHeight: { value: 500 } });
     document.body.appendChild(scroller);
     const rows = [
       mk("user", { id: "fab-u1", text: "问题", status: "replied" }),
@@ -3123,10 +3128,10 @@ describe("主时间线回到底部 FAB", () => {
     expect(btn).toHaveAttribute("tabindex", "0");
     expect(btn.className).not.toContain("pointer-events-none");
     expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "true");
-    scrollToBottom.mockClear();
+    jumpToBottom.mockClear();
     fireEvent.click(btn);
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
-    expect(scrollToBottom).toHaveBeenCalledWith(scroller);
+    expect(jumpToBottom).toHaveBeenCalledTimes(1);
+    expect(jumpToBottom).toHaveBeenCalledWith(scroller);
     expect(followBottomRef.current).toBe(true);
 
     followBottomRef.current = true;
@@ -3156,8 +3161,9 @@ describe("主时间线回到底部 FAB", () => {
   });
 
   test("按钮容器零高度且抵消 space-y 间距：following 翻转不改变滚动内容几何", () => {
-    const followBottomRef = { current: false, scrollToBottom: vi.fn() };
+    const followBottomRef = { current: false, jumpToBottom: vi.fn() };
     const scroller = document.createElement("div");
+    Object.defineProperties(scroller, { scrollHeight: { value: 1000 }, clientHeight: { value: 500 } });
     document.body.appendChild(scroller);
     const rows = [
       mk("user", { id: "fab-geo-u1", text: "问题", status: "replied" }),
