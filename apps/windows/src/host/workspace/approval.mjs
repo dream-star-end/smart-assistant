@@ -23,6 +23,18 @@ export const READONLY_TOOL_KINDS = Object.freeze([
 
 const READONLY_BASH_COMMANDS = Object.freeze(['ls', 'cat', 'rg', 'find'])
 const READONLY_GIT_SUBCOMMANDS = Object.freeze(['status', 'log', 'diff'])
+const FIND_WRITE_FLAGS = Object.freeze([
+  '-fprintf',
+  '-fprint',
+  '-fprint0',
+  '-fls',
+  '-ok',
+  '-okdir',
+  '-exec',
+  '-execdir',
+  '-delete',
+])
+const RG_PRE_FLAGS = Object.freeze(['--pre', '--pre-glob'])
 
 const WIN32_SYSTEM_ROOTS = Object.freeze(['C:\\Windows', 'C:\\Windows\\System32'])
 const POSIX_SYSTEM_ROOTS = Object.freeze(['/bin', '/etc', '/usr', '/sbin', '/System'])
@@ -121,7 +133,25 @@ function hasShellMeta(command) {
   return /[|&;`$<>()\n]/.test(command)
 }
 
-function isReadonlyBash(command) {
+function tokenMatchesFlag(token, flag) {
+  return token === flag || token.startsWith(`${flag}=`)
+}
+
+function hasRgPreprocessor(tokens) {
+  return tokens.some((token) => RG_PRE_FLAGS.some((flag) => tokenMatchesFlag(token, flag)))
+}
+
+function hasFindWriteFlag(tokens) {
+  return tokens.some((token) => FIND_WRITE_FLAGS.includes(token))
+}
+
+function hasGitOutputRedirect(tokens) {
+  return tokens.some(
+    (token) => token === '-o' || token === '--output' || token.startsWith('--output=') || token.startsWith('-o='),
+  )
+}
+
+export function isReadonlyBash(command) {
   const trimmed = String(command || '').replace(/\s+/g, ' ').trim()
   if (!trimmed) return false
   if (hasShellMeta(trimmed)) return false
@@ -129,10 +159,16 @@ function isReadonlyBash(command) {
   const cmd = tokens[0].toLowerCase().replace(/\.exe$/i, '')
   if (cmd === 'git') {
     const sub = (tokens[1] || '').toLowerCase()
-    return READONLY_GIT_SUBCOMMANDS.includes(sub)
+    if (!READONLY_GIT_SUBCOMMANDS.includes(sub)) return false
+    if (hasGitOutputRedirect(tokens)) return false
+    return true
   }
   if (cmd === 'find') {
-    if (tokens.some((t) => t === '-delete' || t === '-exec' || t === '-execdir')) return false
+    if (hasFindWriteFlag(tokens)) return false
+    return true
+  }
+  if (cmd === 'rg' || cmd === 'grep') {
+    if (hasRgPreprocessor(tokens)) return false
     return true
   }
   return READONLY_BASH_COMMANDS.includes(cmd)

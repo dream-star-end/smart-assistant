@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto'
 import os from 'node:os'
 
+import { formatApprovalDetail } from './approvalWindow.mjs'
 import { parseOpenClaudeDeepLink } from './desktop-protocol.mjs'
 import { redactSecrets } from './identity.mjs'
 import { LOCAL_HOST_ORIGIN } from './ipc-contract.mjs'
 
-export { LOCAL_HOST_ORIGIN }
+export { LOCAL_HOST_ORIGIN, formatApprovalDetail }
 export const DESKTOP_APP_ID = 'chat.claudeai.clarvy'
 export const LOCAL_HOST_PARTITION = 'persist:clarvy-local'
 export const LOCAL_HOST_URL = `${LOCAL_HOST_ORIGIN}/index.html`
@@ -40,14 +41,56 @@ const LOCAL_INDEX_HTML = `<!doctype html>
 
 const LOCAL_SCRIPT = `const status = document.getElementById('status')
 const modeStatus = document.getElementById('mode-status')
+const approvalSection = document.getElementById('approval')
+const approvalDetail = document.getElementById('approval-detail')
+const startEnrollButton = document.getElementById('start-enroll')
 const invoke = (payload) => window.clarvyLocalHost?.invoke(payload)
+let currentOpId = null
+let hideTimer = null
+
+function formatApprovalDetail(summary) {
+  const tool = String((summary && summary.tool) || '')
+  const command = String((summary && summary.command) || '')
+  const workspaceRoot = String((summary && summary.workspaceRoot) || '')
+  return '工具：' + tool + '\\n命令：' + command + '\\n工作区：' + workspaceRoot
+}
+
+function hideApproval() {
+  if (hideTimer) {
+    clearTimeout(hideTimer)
+    hideTimer = null
+  }
+  currentOpId = null
+  if (approvalSection) approvalSection.hidden = true
+  if (approvalDetail) approvalDetail.textContent = ''
+}
+
+function showApproval(payload) {
+  if (!payload || typeof payload.opId !== 'string') return
+  currentOpId = payload.opId
+  if (approvalDetail) approvalDetail.textContent = formatApprovalDetail(payload.summary || {})
+  if (approvalSection) approvalSection.hidden = false
+  const deadlineAt = Number(payload.deadlineAt) || 0
+  const remain = Math.max(0, deadlineAt - Date.now())
+  if (hideTimer) clearTimeout(hideTimer)
+  hideTimer = setTimeout(hideApproval, remain || 120000)
+}
 
 async function refreshStatus() {
   try {
     const result = await invoke({ type: 'get-status' })
     if (result?.ok && result.status) {
-      const mode = result.status.localMode || result.status.phase || ''
-      modeStatus.textContent = mode ? ('状态：' + mode) : ''
+      const bootstrapDisabled = result.status.bootstrapDisabled === true
+      if (bootstrapDisabled) {
+        modeStatus.textContent = '服务端未开放本地模式'
+        if (startEnrollButton) startEnrollButton.disabled = true
+      } else {
+        const mode = result.status.localMode || result.status.phase || ''
+        const pending = Number(result.status.pendingApprovals) || 0
+        const pendingLabel = pending > 0 ? (' · 待审批 ' + pending) : ''
+        modeStatus.textContent = mode ? ('状态：' + mode + pendingLabel) : pendingLabel.slice(3)
+        if (startEnrollButton) startEnrollButton.disabled = false
+      }
     }
   } catch {
     /* */
@@ -83,6 +126,29 @@ document.getElementById('fallback-cloud')?.addEventListener('click', async () =>
   }
   void refreshStatus()
 })
+document.getElementById('approve-op')?.addEventListener('click', async () => {
+  if (!currentOpId) return
+  const opId = currentOpId
+  try {
+    await invoke({ type: 'approve-op', id: opId })
+  } catch {
+    /* */
+  }
+  hideApproval()
+  void refreshStatus()
+})
+document.getElementById('deny-op')?.addEventListener('click', async () => {
+  if (!currentOpId) return
+  const opId = currentOpId
+  try {
+    await invoke({ type: 'deny-op', id: opId })
+  } catch {
+    /* */
+  }
+  hideApproval()
+  void refreshStatus()
+})
+window.clarvyLocalHost?.onApprovalPending?.(showApproval)
 void refreshStatus()
 `
 

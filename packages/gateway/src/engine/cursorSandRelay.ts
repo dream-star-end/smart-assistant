@@ -148,7 +148,29 @@ interface RelayDeps {
    * (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`); `null` disables.
    */
   passthrough?: RelayPassthrough | null
+  /**
+   * Human-readable name of the upstream used in client-visible error
+   * messages (`"<label> inference failed"`, `"<label> HTTP 502"`, …).
+   * Defaults to `'Cursor Sand'` for the in-container CCB path. The master's
+   * external API-key proxy passes a neutral label so third-party clients
+   * never learn which engine served them; internal `CURSOR_SAND_*` error
+   * codes are stripped of their prefix in those messages for the same reason.
+   */
+  upstreamLabel?: string
 }
+
+/** Options for {@link CursorSandRelay.serveMessages}. */
+export interface ServeMessagesOptions {
+  /**
+   * Model id to echo in the Anthropic response (`message_start.message.model`
+   * / non-streaming `model`). Defaults to the upstream model id. The external
+   * API-key proxy passes the public id the client asked for so the response
+   * mirrors the request instead of leaking the internal engine id.
+   */
+  echoModel?: string
+}
+
+export const DEFAULT_UPSTREAM_LABEL = 'Cursor Sand'
 
 export interface RelayPassthrough {
   baseUrl: string
@@ -1119,9 +1141,11 @@ export class CursorSandRelay {
   private readonly onRequestForTest?: (body: AnthropicMessagesBody) => void
   private readonly onRawTextForTest?: (text: string, attempt: number) => void
   private readonly passthrough: RelayPassthrough | null
+  private readonly upstreamLabel: string
 
   constructor(deps: RelayDeps = {}) {
     this.credentialKind = deps.credentialKind ?? 'api_key'
+    this.upstreamLabel = deps.upstreamLabel?.trim() || DEFAULT_UPSTREAM_LABEL
     if (this.credentialKind === 'session') {
       // Fail closed at construction: a session slot without its persisted
       // machine id would either be rejected upstream or, worse, tempt a
@@ -1229,8 +1253,8 @@ export class CursorSandRelay {
         // classifier) sees a stable code instead of a generic sentence.
         const known = raw === CURSOR_SAND_UPSTREAM_STALLED || raw === CURSOR_SAND_UPSTREAM_TERMINATED
         const message = known
-          ? `Cursor Sand inference failed: ${raw} (upstream produced no frames; try a smaller step)`
-          : 'Cursor Sand inference failed'
+          ? `${this.upstreamLabel} inference failed: ${this.publicCode(raw)} (upstream produced no frames; try a smaller step)`
+          : `${this.upstreamLabel} inference failed`
         log.warn('cursor sand relay request failed', { error: raw, code: known ? raw : 'relay_error' })
         if (!res.headersSent) {
           // 504 names the failure class (gateway timeout) for logs/metrics;
@@ -1431,6 +1455,7 @@ export class CursorSandRelay {
     body: AnthropicMessagesBody,
     res: ServerResponse,
     signal: AbortSignal,
+    options: ServeMessagesOptions = {},
   ): Promise<CursorSandServeResult> {
     this.onRequestForTest?.(structuredClone(body))
     let opened: { response: Response; upstreamModel: string }
@@ -1447,7 +1472,7 @@ export class CursorSandRelay {
         res.setHeader('content-type', 'application/json')
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'authentication_error', message: `Cursor Sand credential rejected: ${message}` },
+          error: { type: 'authentication_error', message: `${this.upstreamLabel} credential rejected: ${this.publicCode(message)}` },
         }))
         return { kind: 'rejected', status: 401, reason: message, written: true }
       }
@@ -1462,8 +1487,8 @@ export class CursorSandRelay {
       res.statusCode = overflow ? 413 : (upstream.status || 502)
       res.setHeader('content-type', 'application/json')
       const message = overflow
-        ? cursorSandPromptTooLongMessage(`Cursor Sand HTTP ${upstream.status}${bodyText ? ` ${bodyText}` : ''}`)
-        : `Cursor Sand HTTP ${upstream.status}`
+        ? cursorSandPromptTooLongMessage(`${this.upstreamLabel} HTTP ${upstream.status}${bodyText ? ` ${bodyText}` : ''}`)
+        : `${this.upstreamLabel} HTTP ${upstream.status}`
       res.end(JSON.stringify({
         type: 'error',
         error: { type: overflow ? 'invalid_request_error' : 'api_error', message },
@@ -1479,8 +1504,9 @@ export class CursorSandRelay {
     // `stream` entirely. Treating "absent" as streaming handed an SSE body to a
     // JSON-parsing SDK call, which surfaced as `Cannot read properties of
     // undefined (reading 'input_tokens')` inside CCB.
+    const echoModel = options.echoModel ?? opened.upstreamModel
     if (body.stream !== true) {
-      return this.pipeNonStreaming(upstream, opened.upstreamModel, advertisedTools(body.tools), res)
+      return this.pipeNonStreaming(upstream, opened.upstreamModel, echoModel, advertisedTools(body.tools), res)
     }
     const retryInvalidTool = async (invalidResponse: string): Promise<Response> => {
       const retry = await this.openInference(correctedToolBody(body, invalidResponse), signal)
@@ -1493,6 +1519,7 @@ export class CursorSandRelay {
       return this.pipeNativeStreaming(
         upstream,
         opened.upstreamModel,
+        echoModel,
         advertisedTools(body.tools),
         res,
         retryInvalidTool,
@@ -1501,10 +1528,26 @@ export class CursorSandRelay {
     return this.pipeStreaming(
       upstream,
       opened.upstreamModel,
+      echoModel,
       advertisedTools(body.tools),
       res,
       retryInvalidTool,
     )
+  }
+
+  /**
+   * Internal `CURSOR_SAND_*` codes are meaningful to operators reading the
+   * container path; the external proxy's clients only get the suffix.
+   */
+  private publicCode(code: string): string {
+    return this.upstreamLabel === DEFAULT_UPSTREAM_LABEL ? code : code.replace(/^CURSOR_SAND_/, '')
+  }
+
+  /** Stream `error` event text: parser-level defaults mention the default label; relabel for external clients. */
+  private publicMessage(message: string | null): string {
+    const text = message ?? `${this.upstreamLabel} inference failed`
+    if (this.upstreamLabel === DEFAULT_UPSTREAM_LABEL) return text
+    return text.split(DEFAULT_UPSTREAM_LABEL).join(this.upstreamLabel).replace(/\bCURSOR_SAND_/g, '')
   }
 
   /**
@@ -1522,6 +1565,7 @@ export class CursorSandRelay {
     body: AnthropicMessagesBody,
     res: ServerResponse,
     signal: AbortSignal,
+    options: ServeMessagesOptions = {},
   ): Promise<CursorSandServeResult> {
     if (!isSandRoutableModel(body.model)) {
       return { kind: 'rejected', status: 400, reason: 'NOT_SAND_ROUTE', written: false }
@@ -1532,7 +1576,7 @@ export class CursorSandRelay {
     else signal.addEventListener('abort', abort, { once: true })
     this.activeRequests.add(controller)
     try {
-      return await this.handleMessages(body, res, controller.signal)
+      return await this.handleMessages(body, res, controller.signal, options)
     } finally {
       signal.removeEventListener('abort', abort)
       this.activeRequests.delete(controller)
@@ -1685,10 +1729,10 @@ export class CursorSandRelay {
     const raw = error instanceof Error ? error.message : String(error)
     const known = raw === CURSOR_SAND_UPSTREAM_STALLED || raw === CURSOR_SAND_UPSTREAM_TERMINATED
     const message = known
-      ? `Cursor Sand inference failed: ${raw} (upstream produced no frames; try a smaller step)`
+      ? `${this.upstreamLabel} inference failed: ${this.publicCode(raw)} (upstream produced no frames; try a smaller step)`
       : raw === 'CURSOR_SAND_DOWNSTREAM_CLOSED'
         ? null
-        : 'Cursor Sand inference failed'
+        : `${this.upstreamLabel} inference failed`
     if (message === null) return
     try {
       await emitSse(res, 'error', { type: 'error', error: { type: 'api_error', message } })
@@ -1700,6 +1744,7 @@ export class CursorSandRelay {
   private async pipeNativeStreaming(
     upstream: Response,
     model: string,
+    echoModel: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
     retryInvalidTool: (invalidResponse: string) => Promise<Response>,
@@ -1783,7 +1828,7 @@ export class CursorSandRelay {
           id: messageId,
           type: 'message',
           role: 'assistant',
-          model,
+          model: echoModel,
           content: [],
           stop_reason: null,
           stop_sequence: null,
@@ -1908,7 +1953,7 @@ export class CursorSandRelay {
             && looksLikeInvalidToolIntent(collected.state.text, allowedTools)
           ) {
             state.failed = true
-            streamError = 'Cursor Sand tool protocol remained invalid after one correction'
+            streamError = `${this.upstreamLabel} tool protocol remained invalid after one correction`
           }
         } else {
           pendingText = recovered.text
@@ -1940,9 +1985,9 @@ export class CursorSandRelay {
       if (state.failed || streamError) {
         await emitSse(res, 'error', {
           type: 'error',
-          error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
+          error: { type: 'api_error', message: this.publicMessage(streamError) },
         })
-        return { kind: 'failed', reason: streamError ?? 'Cursor Sand inference failed', usage: usageSnapshot(state) }
+        return { kind: 'failed', reason: streamError ?? `${this.upstreamLabel} inference failed`, usage: usageSnapshot(state) }
       }
       const toolCount = [...state.tools.values()].filter((tool) => tool.name).length
       await emitSse(res, 'message_delta', {
@@ -2000,6 +2045,7 @@ export class CursorSandRelay {
   private async pipeStreaming(
     upstream: Response,
     model: string,
+    echoModel: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
     retryInvalidTool: (invalidResponse: string) => Promise<Response>,
@@ -2053,15 +2099,15 @@ export class CursorSandRelay {
           && looksLikeInvalidToolIntent(state.text, allowedTools)
         ) {
           state.failed = true
-          streamError = 'Cursor Sand tool protocol remained invalid after one correction'
+          streamError = `${this.upstreamLabel} tool protocol remained invalid after one correction`
         }
       }
       if (state.failed || streamError) {
         await emitSse(res, 'error', {
           type: 'error',
-          error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
+          error: { type: 'api_error', message: this.publicMessage(streamError) },
         })
-        return { kind: 'failed', reason: streamError ?? 'Cursor Sand inference failed', usage: usageSnapshot(state) }
+        return { kind: 'failed', reason: streamError ?? `${this.upstreamLabel} inference failed`, usage: usageSnapshot(state) }
       }
 
       await emitSse(res, 'message_start', {
@@ -2070,7 +2116,7 @@ export class CursorSandRelay {
           id: messageId,
           type: 'message',
           role: 'assistant',
-          model,
+          model: echoModel,
           content: [],
           stop_reason: null,
           stop_sequence: null,
@@ -2156,6 +2202,7 @@ export class CursorSandRelay {
   private async pipeNonStreaming(
     upstream: Response,
     model: string,
+    echoModel: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
   ): Promise<CursorSandServeResult> {
@@ -2175,7 +2222,7 @@ export class CursorSandRelay {
     if (error) {
       res.statusCode = 502
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: error } }))
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: this.publicMessage(error) } }))
       return { kind: 'rejected', status: 502, reason: error, written: true }
     }
     const content: JsonObject[] = []
@@ -2194,7 +2241,7 @@ export class CursorSandRelay {
     res.setHeader('content-type', 'application/json')
     res.end(JSON.stringify({
       id: `msg_${randomBytes(16).toString('hex')}`,
-      type: 'message', role: 'assistant', model,
+      type: 'message', role: 'assistant', model: echoModel,
       content,
       stop_reason: tools.size + recovered.tools.length > 0 ? 'tool_use' : 'end_turn',
       stop_sequence: null,

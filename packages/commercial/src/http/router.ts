@@ -322,6 +322,7 @@ import {
   handleDesktopTokenMint,
   handleDesktopTokenRefresh,
 } from './desktopEnroll.js'
+import { handleDesktopBootstrap, handleDesktopRuntimeManifest } from './desktopBootstrap.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
 import { dispatchOrgRoute } from './org/routes.js'
@@ -697,6 +698,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/desktop/enroll/start', handler: handleDesktopEnrollStart },
     { method: 'POST', path: '/api/desktop/enroll/confirm', handler: handleDesktopEnrollConfirm },
     { method: 'POST', path: '/api/desktop/enroll/finish', handler: handleDesktopEnrollFinish },
+    { method: 'GET', path: '/api/desktop/bootstrap', handler: handleDesktopBootstrap },
+    { method: 'GET', path: '/api/desktop/runtime-manifest', handler: handleDesktopRuntimeManifest },
     { method: 'POST', path: '/api/desktop/token', handler: handleDesktopTokenMint },
     { method: 'POST', path: '/api/desktop/token/refresh', handler: handleDesktopTokenRefresh },
     { method: 'POST', path: '/api/desktop/revoke', handler: handleDesktopRevoke },
@@ -1603,6 +1606,7 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
 }[] = [
   { path: '/api/anthropic/v1/messages', kind: 'exact', requiresPrefix: true },
   { path: '/api/anthropic/v1/messages/count_tokens', kind: 'exact', requiresPrefix: true },
+  { path: '/api/anthropic/v1/models', kind: 'exact', requiresPrefix: true },
   { path: '/api/file', kind: 'prefix', requiresPrefix: false },
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
 ]
@@ -1699,6 +1703,43 @@ export function createCommercialHandler(
     //     而**不是** 404。部署故障不该伪装成"用户 URL 写错了",保留运维可见性。
     // count_tokens 同样进 external proxy(handler 内按 allowCountTokens 决定是否放行);
     // 前缀 `/api/anthropic` 剥掉后交给 handler 自己的白名单。
+    // 2026-09-07 外接模型发现:`GET /api/anthropic/v1/models`(Anthropic / OpenAI 兼容
+    // list 形状,公开 id 无引擎前缀)。给本地 Claude Code / CC Switch「获取模型」用。
+    // 鉴权走与 /v1/messages 同一条 API key 链(见 http/proxy/externalModels.ts),
+    // 不做 UA 门控。装配失败语义与 messages 一致:未注入 → 503 EXTERNAL_PROXY_UNAVAILABLE。
+    if (path === '/api/anthropic/v1/models') {
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const mdLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
+        requestId,
+        route: '__cc_external_models__',
+        method,
+        path,
+        clientIp: clientIpOf(req),
+      })
+      if (!deps.externalApiKeyModels) {
+        mdLog.error('cc_external_models_not_assembled')
+        sendError(
+          res,
+          503,
+          'EXTERNAL_PROXY_UNAVAILABLE',
+          'external api key endpoint not available',
+          requestId,
+        )
+        incrGatewayRequest('__cc_external_models__', method, res.statusCode)
+        return true
+      }
+      req.headers[REQUEST_ID_HEADER] = requestId
+      try {
+        await deps.externalApiKeyModels(req, res)
+      } catch (err) {
+        handleError(err, res, requestId, mdLog)
+      }
+      incrGatewayRequest('__cc_external_models__', method, res.statusCode)
+      return true
+    }
+
     if (
       method === 'POST' &&
       (path === '/api/anthropic/v1/messages' || path === '/api/anthropic/v1/messages/count_tokens')

@@ -49,4 +49,132 @@ describe("Composer Stop ownership", () => {
     fireEvent.click(stopping);
     expect(onStop).not.toHaveBeenCalled();
   });
+
+  test("stopping 态渲染可见「正在停止…」文案", () => {
+    render(<Composer busy stopping onSend={() => {}} onStop={() => {}} />);
+    expect(screen.getByText("正在停止…")).toBeInTheDocument();
+  });
+});
+
+describe("Composer 输入无障碍", () => {
+  test("textarea 可用消息输入框标签取到", () => {
+    render(<Composer onSend={() => {}} />);
+    expect(screen.getByLabelText("消息输入框")).toBeInTheDocument();
+  });
+});
+
+describe("Composer ↑ 拉上一条用户消息", () => {
+  test("空输入框按 ArrowUp 填入 lastUserText", () => {
+    render(<Composer onSend={() => {}} lastUserText="上一句用户消息" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue("上一句用户消息");
+  });
+
+  test("非空输入框按 ArrowUp 不改动", () => {
+    render(<Composer onSend={() => {}} lastUserText="上一句用户消息" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: "正在写" } });
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue("正在写");
+  });
+});
+
+describe("Composer 草稿持久化", () => {
+  afterEach(() => {
+    sessionStorage.clear();
+    vi.useRealTimers();
+  });
+
+  test("预置 sessionStorage 后挂载带 draftKey 的 Composer，textarea 还原草稿", () => {
+    sessionStorage.setItem("oc_v5_composer_draft:s1", "未发送的草稿");
+    render(<Composer onSend={() => {}} draftKey="s1" />);
+    expect(screen.getByLabelText("消息输入框")).toHaveValue("未发送的草稿");
+  });
+
+  test("输入后 300ms 内 sessionStorage 有值", () => {
+    vi.useFakeTimers();
+    render(<Composer onSend={() => {}} draftKey="s1" />);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "正在输入" } });
+    vi.advanceTimersByTime(300);
+    expect(sessionStorage.getItem("oc_v5_composer_draft:s1")).toBe("正在输入");
+  });
+});
+
+describe("Composer 拖拽上传", () => {
+  function fileDt(file?: File, types: string[] = ["Files"]) {
+    const files = file ? [file] : [];
+    return {
+      types,
+      files,
+      dropEffect: "none",
+      items: [],
+    };
+  }
+
+  test("drop 含 File 的 dataTransfer 后附件列表出现文件名", async () => {
+    const onUpload = vi.fn(async () => ({ kind: "file" as const, url: "/api/media/note.txt" }));
+    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = container.querySelector(".rounded-\\[26px\\]");
+    expect(shell).toBeTruthy();
+    const file = new File(["hello"], "drop-note.txt", { type: "text/plain" });
+    fireEvent.drop(shell as Element, { dataTransfer: fileDt(file) });
+    expect(await screen.findByText("drop-note.txt")).toBeInTheDocument();
+  });
+
+  test("dragover 含 Files 时根容器出现高亮 class；拖纯文本不高亮", () => {
+    const onUpload = vi.fn(async () => ({ kind: "file" as const, url: "/x" }));
+    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = container.querySelector(".rounded-\\[26px\\]") as HTMLElement;
+    fireEvent.dragOver(shell, { dataTransfer: fileDt(undefined, ["Files"]) });
+    expect(shell.className).toContain("ring-2");
+    expect(shell.className).toContain("ring-ring");
+    fireEvent.dragLeave(shell, { dataTransfer: fileDt(undefined, ["Files"]) });
+    expect(shell.className).not.toContain("ring-2");
+    fireEvent.dragOver(shell, { dataTransfer: fileDt(undefined, ["text/plain"]) });
+    expect(shell.className).not.toContain("ring-2");
+  });
+});
+
+describe("Composer sendKey", () => {
+  test("sendKey=mod-enter 时 Enter 不发送，⌘+Enter 发送", () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} sendKey="mod-enter" />);
+    const textarea = screen.getByLabelText("消息输入框");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("hello", undefined, undefined);
+  });
+});
+
+describe("Composer 长文字数", () => {
+  test("超过 2000 字时工具条显示字数", () => {
+    render(<Composer onSend={() => {}} />);
+    expect(screen.queryByText(/字$/)).toBeNull();
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "啊".repeat(2001) } });
+    expect(screen.getByText("2001 字")).toBeInTheDocument();
+  });
+
+  test("不超过 2000 字不显示字数", () => {
+    render(<Composer onSend={() => {}} />);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "啊".repeat(2000) } });
+    expect(screen.queryByText("2000 字")).toBeNull();
+  });
+});
+
+describe("Composer goalOpenRequest", () => {
+  test("nonce 变化打开 GoalDialog", () => {
+    const { rerender } = render(
+      <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} />,
+    );
+    expect(screen.queryByPlaceholderText("这次会话要达成什么？")).toBeNull();
+    rerender(
+      <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} goalOpenRequest={1} />,
+    );
+    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+    expect(screen.getByText("会话目标")).toBeInTheDocument();
+  });
 });

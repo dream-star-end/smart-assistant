@@ -134,3 +134,118 @@ export function loadRuntimeManifest(filePath = defaultBakeManifestPath(), opts =
   const parsed = parseRuntimeManifest(raw, opts)
   return applyManifestEnvOverlay(parsed, opts.env || process.env)
 }
+
+export function isPlaceholderArtifact(artifact) {
+  if (!artifact || typeof artifact.url !== 'string') return true
+  try {
+    const hostname = new URL(artifact.url).hostname
+    if (hostname === 'example.invalid' || hostname.endsWith('.invalid')) return true
+  } catch {
+    return true
+  }
+  return artifact.sha256 === '0'.repeat(64)
+}
+
+export function isPlaceholderManifest(manifest) {
+  return !manifest?.selected || isPlaceholderArtifact(manifest.selected)
+}
+
+export function extraArtifactOriginsFromEnv(env = process.env) {
+  const raw = env.OPENCLAUDE_DESKTOP_ARTIFACT_ORIGINS || ''
+  return raw
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+export function artifactOriginAllowed(url, { publicOrigin, masterHttps, extraOrigins = [] } = {}) {
+  const origin = publicOriginFromHttpsUrl(url)
+  const allowed = new Set()
+  for (const candidate of [publicOrigin, masterHttps, ...extraOrigins]) {
+    if (!candidate) continue
+    try {
+      allowed.add(publicOriginFromHttpsUrl(candidate))
+    } catch {
+      /* skip malformed allowlist entries */
+    }
+  }
+  return allowed.has(origin)
+}
+
+export async function fetchRemoteRuntimeManifest({
+  url,
+  accessToken,
+  fetchImpl = globalThis.fetch,
+  expectedOs,
+  expectedArch,
+  publicOrigin,
+  masterHttps,
+  extraOrigins,
+  env = process.env,
+} = {}) {
+  if (typeof url !== 'string' || !url.startsWith('https://')) {
+    throw new ManifestError('NON_HTTPS_URL', 'runtime_manifest_url must be https')
+  }
+  const headers = { accept: 'application/json' }
+  if (typeof accessToken === 'string' && accessToken) {
+    headers.authorization = `Bearer ${accessToken}`
+  }
+  const response = await fetchImpl(url, { method: 'GET', headers })
+  if (!response.ok) {
+    throw new ManifestError('REMOTE_MANIFEST_HTTP', `runtime-manifest HTTP ${response.status}`)
+  }
+  const text = await response.text()
+  const parsed = parseRuntimeManifest(text, { expectedOs, expectedArch })
+  const extras = extraOrigins || extraArtifactOriginsFromEnv(env)
+  if (!artifactOriginAllowed(parsed.selected.url, { publicOrigin, masterHttps, extraOrigins: extras })) {
+    throw new ManifestError('ORIGIN_NOT_ALLOWED', 'artifact origin is not on the allowlist')
+  }
+  return applyManifestEnvOverlay(parsed, env)
+}
+
+export function shouldDownloadRuntimeArtifact(manifest) {
+  return Boolean(manifest?.available) && !isPlaceholderManifest(manifest)
+}
+
+export async function resolveRuntimeManifest(opts = {}) {
+  const bakePath = opts.bakePath || defaultBakeManifestPath()
+  let bake = null
+  let bakeError = null
+  try {
+    bake = loadRuntimeManifest(bakePath, opts)
+  } catch (error) {
+    bakeError = error
+  }
+
+  if (opts.remoteUrl) {
+    try {
+      const remote = await fetchRemoteRuntimeManifest({ url: opts.remoteUrl, ...opts })
+      return {
+        ...remote,
+        source: 'remote',
+        available: !isPlaceholderManifest(remote),
+      }
+    } catch (error) {
+      if (bake) {
+        return {
+          ...bake,
+          source: 'bake',
+          available: !isPlaceholderManifest(bake),
+          reason: isPlaceholderManifest(bake) ? 'placeholder-bake' : undefined,
+          remoteError: error.code || error.message,
+        }
+      }
+      throw error
+    }
+  }
+
+  if (!bake) {
+    throw bakeError || new ManifestError('INVALID_MANIFEST', 'bake manifest missing')
+  }
+  return {
+    ...bake,
+    source: 'bake',
+    available: !isPlaceholderManifest(bake),
+    reason: isPlaceholderManifest(bake) ? 'placeholder-bake' : undefined,
+  }
+}

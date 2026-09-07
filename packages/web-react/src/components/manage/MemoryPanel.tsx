@@ -71,7 +71,7 @@ export function MemoryPanel({
   agents: { id: string; name: string }[];
 }) {
   const [selected, setSelected] = useState(agentId);
-  const [tab, setTab] = useState<"all" | "core" | "project" | "profile" | "usage">("core");
+  const [tab, setTab] = useState<"core" | "project" | "profile" | "usage">("core");
   // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
   const effective = agents.some((a) => a.id === selected) ? selected : agentId;
   // 项目记忆与用户画像都不按智能体分,切换器在这两段里没有作用域可控。
@@ -95,10 +95,12 @@ export function MemoryPanel({
           ) : undefined
         }
       />
-      <div className="border-t border-border px-4 py-3">
+      <div className="min-w-0 overflow-x-auto border-t border-border px-4 py-3">
         <Tabs
           aria-label="记忆分区"
           idBase={TAB_ID_BASE}
+          layout="scroll"
+          className="max-w-full"
           value={tab}
           onValueChange={(v) =>
             setTab(
@@ -108,14 +110,11 @@ export function MemoryPanel({
                   ? "usage"
                   : v === "project"
                     ? "project"
-                    : v === "all"
-                      ? "all"
-                      : "core",
+                    : "core",
             )
           }
           items={[
-            { value: "all", label: "全部" },
-            { value: "core", label: "Agent Core" },
+            { value: "core", label: "核心记忆" },
             { value: "project", label: "项目记忆" },
             { value: "profile", label: "用户画像" },
             { value: "usage", label: "使用情况" },
@@ -130,11 +129,6 @@ export function MemoryPanel({
       >
         {tab === "core" ? (
           <CoreMemorySection key={`core:${effective}`} auth={auth} agentId={effective} />
-        ) : tab === "all" ? (
-          <>
-            <CoreMemorySection key={`all-core:${effective}`} auth={auth} agentId={effective} />
-            <ProjectMemorySection key="all-project" auth={auth} />
-          </>
         ) : tab === "project" ? (
           <ProjectMemorySection key="project" auth={auth} />
         ) : tab === "profile" ? (

@@ -18,6 +18,7 @@ import type { Pool } from 'pg'
 
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
+import { recordProductFrictionEvent, type ProductFrictionEvent } from '../productFriction/events.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
 import {
   GATEWAY_EXITED_AT_CTX_KEY,
@@ -242,6 +243,8 @@ export interface TurnDispatchReconcilerDeps {
     sessionId: string
     tapeId: string
   }) => Promise<void>
+  /** Optional post-commit visible-fallback friction writer. Failures swallowed. */
+  recordFriction?: (event: ProductFrictionEvent) => void | Promise<void>
 }
 
 function idOf(row: TurnDispatchRow): DispatchIdentity {
@@ -1100,6 +1103,21 @@ async function closeVisibleOrphans(
       continue
     }
     closed++
+    if (projectFallback === true) {
+      const reason = /^[a-z0-9_]{1,48}$/.test(action) ? action : undefined
+      const write = deps.recordFriction ?? recordProductFrictionEvent
+      void Promise.resolve(write({
+        correlation: row.dispatch_id,
+        userId: BigInt(row.user_id),
+        surface: 'chat',
+        stage: 'visible_fallback',
+        code: outcome,
+        outcome: 'failed',
+        path: 'reconciler',
+        reason,
+        sessionId: row.session_id,
+      })).catch(() => undefined)
+    }
     try {
       deps.nudgeClient?.(
         BigInt(row.user_id),

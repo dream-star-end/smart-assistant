@@ -335,6 +335,45 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(baseline.includes('对所有 agent(含委派子 agent)生效'))
     assert.ok(baseline.includes('只验不修'))
   })
+  it('需要用户决策时:说人话/讲影响/给推荐三条契约覆盖常驻 prompt 与四份 CCB/Codex 基线', () => {
+    const baselineDir = 'packages/commercial/agent-sandbox/ccb-baseline'
+    const sources = {
+      prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
+      claude: readFileSync(join(baselineDir, 'CLAUDE.md'), 'utf8'),
+      claudeAdmin: readFileSync(join(baselineDir, 'CLAUDE.admin.md'), 'utf8'),
+      agents: readFileSync(join(baselineDir, 'AGENTS.md'), 'utf8'),
+      agentsAdmin: readFileSync(join(baselineDir, 'AGENTS.admin.md'), 'utf8'),
+    }
+    const required = [
+      '## 需要用户决策时',
+      '不看代码、不翻上下文也能拍板',
+      '**说人话**',
+      '**讲影响**',
+      '可逆还是不可逆',
+      '**给推荐**',
+      '放第一位并标「(推荐)」',
+      '不要把问题原样甩回去',
+      '只问真正需要用户拍板的事',
+    ]
+    for (const [name, source] of Object.entries(sources)) {
+      for (const fragment of required) {
+        assert.ok(source.includes(fragment), `${name} 缺决策提问契约: ${fragment}`)
+      }
+    }
+    // 常驻 prompt 与 CLAUDE 基线须声明对子 agent / 所有通道生效,不能只约束主 agent
+    assert.ok(sources.prompt.includes('所有引擎、所有提问通道'))
+    assert.ok(sources.claude.includes('对所有 agent(含委派子 agent)、所有提问通道生效'))
+    assert.ok(sources.claudeAdmin.includes('对所有 agent(含委派子 agent)、所有提问通道生效'))
+    // 决策段必须紧跟提问通道段之后,先说「用哪个工具问」再说「怎么问」
+    assert.ok(
+      sources.prompt.indexOf('若当前工具列表没有专用提问工具') <
+        sources.prompt.indexOf('## 需要用户决策时'),
+    )
+    assert.ok(
+      sources.prompt.indexOf('## 需要用户决策时') <
+        sources.prompt.indexOf('## 子 Agent 与并行处理'),
+    )
+  })
   it('选择题:CCB/Codex 走原生 Ask 工具,Cursor 走正文 options 围栏', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(prompt.includes('AskUserQuestion'))

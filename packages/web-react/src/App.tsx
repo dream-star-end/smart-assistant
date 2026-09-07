@@ -10,6 +10,7 @@ import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
+import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer } from "./components/Composer";
@@ -37,6 +38,7 @@ import { InboxDialog } from "./components/InboxDialog";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
+import { resolveGlobalHotkey } from "./lib/hotkeys";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
 import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
@@ -93,7 +95,9 @@ import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
+import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
 import { useMdViewport } from "./hooks/useMdViewport";
+import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
@@ -281,9 +285,12 @@ export function App() {
     !demo && location.pathname === "/reset-password"
       ? params.get("token") || undefined
       : undefined;
-  // P7 最小路由（无路由库）：demo / reset-password 特判不启用。boot 时一次性解析
+  // 桌面 enrollment 确认页：/desktop/enroll?enrollment_id=（gateway SPA fallback 无扩展名回退
+  // index.html，与 /reset-password 同族）。demo 模式不启用。
+  const desktopEnroll = !demo && location.pathname === "/desktop/enroll";
+  // P7 最小路由（无路由库）：demo / reset-password / desktop/enroll 特判不启用。boot 时一次性解析
   // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
-  const routingEnabled = !demo && !resetToken;
+  const routingEnabled = !demo && !resetToken && !desktopEnroll;
   const bootPanel = routingEnabled ? parsePanelParam(params) : null;
   const bootTutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null;
   const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
@@ -310,7 +317,7 @@ export function App() {
   );
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
-  const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
+  const [view, setView] = useState<"home" | "app">(resetToken || desktopEnroll ? "app" : "home");
   // AuthGate 初始模式：「免费开始」=register，顶栏「登录」=login，重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
@@ -326,7 +333,11 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [toolCards] = useState<ToolCard[]>([]);
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => readCollapsed());
+  const composerPrefs = useLocalComposerPrefs();
+  useEffect(() => {
+    writeCollapsed(collapsed);
+  }, [collapsed]);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
   // 已装智能体目录(agent 归属解析用):登录后拉一次,市场关闭时刷新;AgentPicker 打开时
@@ -359,6 +370,7 @@ export function App() {
   const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
+  const [findOpen, setFindOpen] = useState(false);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
   // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
   const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
@@ -383,6 +395,8 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [goalOpenNonce, setGoalOpenNonce] = useState(0);
   const [messageReplyTarget, setMessageReplyTarget] = useState<{
     sessionId: string;
     quote: MessageReplyQuote;
@@ -626,6 +640,9 @@ export function App() {
     [newSession],
   );
 
+  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
+  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
+
   const {
     projects,
     collapsedIds: collapsedProjectIds,
@@ -654,6 +671,10 @@ export function App() {
       const ids = new Set(sessionIds);
       setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
     },
+    onCreated: (p) => {
+      setUngroupedAssetsOpen(false);
+      setProjectSettings(p);
+    },
   });
 
   const unreadSessions = useUnreadSessions({
@@ -669,8 +690,6 @@ export function App() {
   useEffect(() => {
     setInspectTarget(null);
   }, [activeId, boardOpen]);
-  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
-  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -1715,16 +1734,9 @@ export function App() {
   );
 
   useEffect(() => {
-    const isEditable = (el: EventTarget | null) => {
-      if (!(el instanceof HTMLElement)) return false;
-      const tag = el.tagName;
-      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
-    };
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
-      if (!mod) return;
-      if (e.key === "k" || e.key === "K") {
-        if (e.shiftKey || isEditable(e.target)) return;
+      const action = resolveGlobalHotkey(e);
+      if (action === "search") {
         e.preventDefault();
         setCollapsed(false);
         setMobileNavOpen(true);
@@ -1735,15 +1747,20 @@ export function App() {
         }, 0);
         return;
       }
-      if ((e.key === "o" || e.key === "O") && e.shiftKey) {
-        if (isEditable(e.target)) return;
+      if (action === "new") {
         e.preventDefault();
+        setBoardOpen(false);
         handleNew();
+      }
+      if (action === "find") {
+        if (!inWorkspace || demo || wsMessages.length <= 0) return;
+        e.preventDefault();
+        setFindOpen(true);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2152,6 +2169,8 @@ export function App() {
             }
           },
       onRetrySend: demo ? undefined : retrySend,
+      onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
+      onOpenModelPicker: () => setModelPickerOpen(true),
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
       onQuote: demo || !activeId
@@ -2212,6 +2231,23 @@ export function App() {
     messageReplyTarget && messageReplyTarget.sessionId === activeId
       ? messageReplyTarget.quote
       : null;
+
+  let lastUserText: string | undefined;
+  if (demo) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && messages[i].content) {
+        lastUserText = messages[i].content;
+        break;
+      }
+    }
+  } else {
+    for (let i = wsMessages.length - 1; i >= 0; i--) {
+      if (wsMessages[i].role === "user" && wsMessages[i].text) {
+        lastUserText = wsMessages[i].text;
+        break;
+      }
+    }
+  }
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -2623,18 +2659,14 @@ export function App() {
   useEffect(() => {
     if (!inWorkspace) return;
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
-        e.preventDefault();
-        setBoardOpen(false);
-        handleNew();
-      } else if (e.key === "Escape" && sending) {
+      if (resolveGlobalHotkey(e, { sending }) === "stop") {
         e.preventDefault();
         stopTurn();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [inWorkspace, sending, handleNew, stopTurn]);
+  }, [inWorkspace, sending, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
   // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。
@@ -2706,7 +2738,7 @@ export function App() {
   }
   // A transient boot failure is not a logout. Surface the dedicated recovery
   // action immediately instead of hiding it behind the ordinary landing page.
-  if (!demo && view === "home" && !authRecoveryAvailable) {
+  if (!demo && view === "home" && !authRecoveryAvailable && !desktopEnroll) {
     return (
       <>
         <LazyBoundary fallback={<SplashFallback />}>
@@ -2813,6 +2845,10 @@ export function App() {
           error={authError}
           onRetrySession={authRecoveryAvailable ? retryBoot : undefined}
           onBack={() => {
+            if (desktopEnroll) {
+              window.location.assign("/");
+              return;
+            }
             if (authRecoveryAvailable) clearAuth();
             setAuthMode("login");
             setView("home");
@@ -2829,6 +2865,10 @@ export function App() {
         />
       </div>
     );
+  }
+
+  if (desktopEnroll && auth) {
+    return <DesktopEnrollPage auth={auth} />;
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
@@ -2888,6 +2928,7 @@ export function App() {
     onOpenAccount: demo ? undefined : () => openSettings(),
     onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
     onNew: handleNew,
+    onNewWithAgent: demo ? undefined : () => { handleNew(); setPickerOpen(true); },
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onTogglePin: togglePinSession,
@@ -2985,6 +3026,15 @@ export function App() {
               setBoardOpen(false);
               handleNew();
             }}
+            onNewWithAgent={
+              demo
+                ? undefined
+                : () => {
+                    setBoardOpen(false);
+                    handleNew();
+                    setPickerOpen(true);
+                  }
+            }
             onNewInProject={(projectId) => {
               setBoardOpen(false);
               newSessionInProject(projectId);
@@ -3016,6 +3066,16 @@ export function App() {
             handleNew();
             setMobileNavOpen(false);
           }}
+          onNewWithAgent={
+            demo
+              ? undefined
+              : () => {
+                  setBoardOpen(false);
+                  handleNew();
+                  setPickerOpen(true);
+                  setMobileNavOpen(false);
+                }
+          }
           onNewInProject={(projectId) => {
             setBoardOpen(false);
             newSessionInProject(projectId);
@@ -3094,6 +3154,8 @@ export function App() {
           onSelectEffort={demo ? undefined : setSessionEffort}
           contextTier={contextTier}
           onSelectContextTier={demo ? undefined : setContextTier}
+          modelPickerOpen={modelPickerOpen}
+          onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
@@ -3105,6 +3167,7 @@ export function App() {
           onNew={handleNew}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
+          onOpenFind={demo ? undefined : () => setFindOpen(true)}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
@@ -3135,6 +3198,7 @@ export function App() {
           }}
           onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+          data-font-size={composerPrefs.fontSize}
         >
           {gated ? (
             <AgentGate
@@ -3177,6 +3241,7 @@ export function App() {
               agent={agent}
               onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
               onChangeAgent={() => setPickerOpen(true)}
+              onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
             />
           ) : demo ? (
             <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
@@ -3251,6 +3316,7 @@ export function App() {
                   historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
                   sessionId={activeId}
                   followBottomRef={stickToBottomRef}
+                  find={findOpen ? { onClose: () => setFindOpen(false) } : undefined}
                 />
               </SessionTimelineBoundary>
             </ResponseRatingProvider>
@@ -3307,6 +3373,7 @@ export function App() {
                 send(t);
               }}
               onDismiss={() => setChatError(null)}
+              onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
             />
           )}
           <Composer
@@ -3329,6 +3396,8 @@ export function App() {
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
+            lastUserText={lastUserText}
+            draftKey={activeId ?? "new"}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}
@@ -3336,6 +3405,9 @@ export function App() {
             goal={activeSess?.goalState}
             onSetGoal={demo ? undefined : setSessionGoal}
             onGoalAction={demo ? undefined : transitionSessionGoal}
+            sendKey={composerPrefs.sendKey}
+            fontSize={composerPrefs.fontSize}
+            goalOpenRequest={goalOpenNonce}
           />
         </div>
         </>

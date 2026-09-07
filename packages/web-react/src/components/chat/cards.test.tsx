@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ChatInteractionContext } from "../tool/context";
@@ -73,6 +73,27 @@ describe("F3 UserCard 发送失败重试命中区", () => {
   });
 });
 
+describe("UserCard 复制", () => {
+  test("status=replied 时复制按钮写入消息文本", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<UserCard msg={userMsg({ status: "replied", text: "请把这段复制走" })} cb={{ onQuote: () => {} }} />);
+    const copy = screen.getByRole("button", { name: "复制" });
+    expect(copy).toHaveClass("[@media(hover:none)]:size-11");
+    fireEvent.click(copy);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("请把这段复制走"));
+  });
+
+  test("error 态仍显示复制，sending 不显示", () => {
+    const { rerender } = render(
+      <UserCard msg={userMsg({ status: "error", text: "失败内容" })} cb={{ onQuote: () => {} }} />,
+    );
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+    rerender(<UserCard msg={userMsg({ status: "sending", text: "发送中" })} cb={{ onQuote: () => {} }} />);
+    expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
+  });
+});
+
 describe("AssistantCard 预期错误视觉语义", () => {
   test("route unavailable 使用紧凑 warning 卡且无 trace 时不渲染详情", () => {
     renderErr(errMsg({
@@ -124,6 +145,48 @@ describe("消息引用动作与已发送引用块", () => {
     expect(quoteText).toHaveClass("line-clamp-2");
     fireEvent.click(screen.getByRole("button", { name: "引用" }));
     expect(onQuote).toHaveBeenCalledWith(message);
+  });
+});
+
+describe("UserCard 编辑重发", () => {
+  test("status=replied 时有编辑按钮，点击回传该消息", () => {
+    const onEditResend = vi.fn();
+    const msg = userMsg({ status: "replied", text: "请把这段再改一改" });
+    render(<UserCard msg={msg} cb={{ onEditResend }} />);
+    const btn = screen.getByRole("button", { name: "编辑" });
+    expect(btn).toHaveClass("[@media(hover:none)]:size-11");
+    fireEvent.click(btn);
+    expect(onEditResend).toHaveBeenCalledWith(msg);
+  });
+});
+
+describe("AssistantCard MetaRow 时间", () => {
+  test("助手卡 MetaRow 有 time 元素", () => {
+    const ts = Date.now() - 60_000;
+    render(
+      <AssistantCard
+        msg={{ id: "a-time", role: "assistant", text: "回答正文", ts }}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    const time = document.querySelector("time");
+    expect(time).toBeTruthy();
+    expect(time).toHaveAttribute("datetime", new Date(ts).toISOString());
+  });
+});
+
+describe("AssistantCard 切换模型按钮", () => {
+  test("retry_or_switch 末轮错误卡在有 onOpenModelPicker 时渲染按钮并调用", () => {
+    const onOpenModelPicker = vi.fn();
+    renderErr(errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" }), {
+      onRetrySend: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+      onOpenModelPicker,
+    });
+    const btn = screen.getByRole("button", { name: "切换模型" });
+    fireEvent.click(btn);
+    expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
   });
 });
 

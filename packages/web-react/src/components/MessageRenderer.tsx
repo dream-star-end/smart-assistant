@@ -8,13 +8,14 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { Info, Sparkles } from "lucide-react";
+import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -87,7 +88,9 @@ import {
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
-import { Alert, Avatar, Spinner } from "./ui";
+import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
+import { cn } from "../lib/utils";
+import { findMatches, stepMatch, timelineMessageKey, type FindMatch } from "./chat/findInSession";
 import {
   delegateTokenUsage,
   displayCallTokenUsage,
@@ -980,6 +983,13 @@ function coalesceTeam(
 // top reveals already-resident rows; server history still uses the explicit
 // hasMore / loadOlder button (scroll never issues a network page).
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
+
+export function shouldShowScrollToBottom(
+  following: boolean | undefined,
+  messageCount: number,
+): boolean {
+  return messageCount > 0 && following === false;
+}
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 
@@ -990,8 +1000,7 @@ function defaultTailStart(length: number): number {
 function renderItemKey(item: RenderItem): string {
   try {
     if (item.kind === "single") {
-      const key = item.m?._timelineUnitKey ?? item.m?.id;
-      return typeof key === "string" && key.length > 0 ? key : "single-missing";
+      return timelineMessageKey(item.m);
     }
     const key = item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
     return typeof key === "string" && key.length > 0 ? key : item.kind;
@@ -1050,6 +1059,7 @@ export function MessageList({
   historyGeneration = "legacy",
   sessionId,
   followBottomRef,
+  find,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -1089,6 +1099,8 @@ export function MessageList({
       nextTop: number,
     ) => void;
   };
+  /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
+  find?: { onClose: () => void };
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -1116,6 +1128,31 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
+  const [following, setFollowing] = useState<boolean | undefined>(() => followBottomRef?.current);
+  const [findQuery, setFindQuery] = useState("");
+  const [findCursor, setFindCursor] = useState(0);
+  const findMatchesList = useMemo(
+    () => (find ? findMatches(messages, findQuery) : []),
+    [find, messages, findQuery],
+  );
+  const findHitKeys = useMemo(() => new Set(findMatchesList.map((m) => m.key)), [findMatchesList]);
+  useEffect(() => {
+    setFindCursor(0);
+  }, [findQuery]);
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el || !followBottomRef) {
+      setFollowing(followBottomRef?.current);
+      return;
+    }
+    const sync = () => setFollowing(followBottomRef.current);
+    sync();
+    const onScroll = () => {
+      requestAnimationFrame(sync);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [scrollParent, followBottomRef]);
   const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
@@ -1904,7 +1941,100 @@ export function MessageList({
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
+  const showScrollToBottom = shouldShowScrollToBottom(following, messages.length);
+  const findCurrent =
+    findMatchesList.length === 0
+      ? -1
+      : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
+  const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const estimateTopForIndex = (index: number): number => {
+    const visIdx = Math.max(0, Math.min(visibleItems.length, index - windowStart));
+    return measuredRangePx(
+      0,
+      visIdx,
+      (i) => itemKey(visibleItems[i]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    );
+  };
+  const jumpTo = (match: FindMatch) => {
+    const follow = followBottomRef;
+    const scroller = scrollParent;
+    if (!follow || !scroller) return;
+    follow.current = false;
+    const top = estimateTopForIndex(match.index);
+    follow.correctTo?.(scroller, top);
+    requestAnimationFrame(() => {
+      const esc =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(match.key)
+          : match.key.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      if (!(el instanceof HTMLElement)) return;
+      const r = el.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      follow.correctTo?.(scroller, scroller.scrollTop + (r.top - s.top) - 48);
+    });
+  };
+  const goFind = (dir: 1 | -1) => {
+    if (sending || findMatchesList.length === 0) return;
+    const next = stepMatch(findMatchesList, findCurrent, dir);
+    if (next < 0) return;
+    setFindCursor(next);
+    const match = findMatchesList[next];
+    if (match) jumpTo(match);
+  };
   return (
+    <>
+    {find ? (
+      <div className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2">
+        <Input
+          aria-label="在会话中查找"
+          autoFocus
+          inputSize="sm"
+          value={findQuery}
+          onChange={(e) => setFindQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              find.onClose();
+              return;
+            }
+            if (e.key === "Enter") {
+              e.preventDefault();
+              goFind(e.shiftKey ? -1 : 1);
+            }
+          }}
+          className="min-w-0 flex-1"
+        />
+        <span className="shrink-0 text-caption tabular-nums text-muted">
+          {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
+        </span>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="上一处"
+          title={sending ? "生成中暂不可跳转" : "上一处"}
+          disabled={sending || findMatchesList.length === 0}
+          onClick={() => goFind(-1)}
+        >
+          <ChevronUp size={16} />
+        </IconButton>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="下一处"
+          title={sending ? "生成中暂不可跳转" : "下一处"}
+          disabled={sending || findMatchesList.length === 0}
+          onClick={() => goFind(1)}
+        >
+          <ChevronDown size={16} />
+        </IconButton>
+        <IconButton shape="square" size="sm" aria-label="关闭查找" onClick={find.onClose}>
+          <X size={16} />
+        </IconButton>
+      </div>
+    ) : null}
     <div
       ref={listRootRef}
       className="mx-auto max-w-3xl space-y-4 px-5 py-8"
@@ -1940,12 +2070,15 @@ export function MessageList({
         return (
           <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
             <div
-              className={
+              className={cn(
                 liveRow
                   ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
-                  : "chat-virtual-item chat-timeline-row"
-              }
+                  : "chat-virtual-item chat-timeline-row",
+                find && findCurrentKey === key && "ring-1 ring-accent/60",
+                find && findCurrentKey !== key && findHitKeys.has(key) && "bg-accent-soft/30",
+              )}
               data-chat-virtual-key={key}
+              data-find-current={find && findCurrentKey === key ? "" : undefined}
               style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}
@@ -1961,6 +2094,41 @@ export function MessageList({
         />
       ) : null}
       {footer}
+      {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
+          **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
+          挂载/卸载,按钮自身 52px 就是 scrollHeight 的一部分:滑回底部 → following
+          翻真 → 按钮卸载 → scrollHeight 收缩 → 浏览器 clamp scrollTop → 篱笆仍在
+          (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
+          几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
+          -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
+      {followBottomRef && messages.length > 0 && (
+        <div
+          aria-hidden={!showScrollToBottom}
+          data-testid="scroll-to-bottom-dock"
+          data-visible={showScrollToBottom ? "true" : "false"}
+          className="sticky bottom-4 z-10 -mt-4 h-0 overflow-visible"
+        >
+          <button
+            type="button"
+            data-testid="scroll-to-bottom"
+            aria-label="回到底部"
+            tabIndex={showScrollToBottom ? 0 : -1}
+            className={
+              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float transition-opacity duration-200 [@media(hover:none)]:size-11 " +
+              (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
+            }
+            onClick={() => {
+              if (!scrollParent || !followBottomRef) return;
+              followBottomRef.current = true;
+              followBottomRef.scrollToBottom?.(scrollParent);
+              setFollowing(true);
+            }}
+          >
+            <ChevronDown size={18} />
+          </button>
+        </div>
+      )}
     </div>
+    </>
   );
 }

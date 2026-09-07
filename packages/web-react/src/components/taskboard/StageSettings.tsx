@@ -975,8 +975,8 @@ export function StageSettings({
           type="button"
           shape="square"
           data-testid="stage-settings-open"
-          aria-label="流水线配置"
-          title="流水线配置"
+          aria-label="阶段配置"
+          title="阶段配置"
           disabled={!projectId}
           onClick={() => setOpen(true)}
         >

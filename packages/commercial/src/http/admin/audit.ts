@@ -24,7 +24,7 @@ import {
 } from "../../admin/securityEvents.js";
 import { listAuditEvents as listHostAuditEvents } from "../../compute-pool/audit.js";
 import { getPool } from "../../db/index.js";
-import { query } from "../../db/queries.js";
+import { query, type QueryRunner } from "../../db/queries.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { parsePositiveInt, translateRangeError } from "./_shared.js";
 
@@ -248,6 +248,66 @@ async function listGithubFriction(): Promise<GithubFrictionRow[]> {
   }));
 }
 
+const PROBLEM_CARD_FUNNEL_SQL = (windowSql: string) =>
+  `SELECT code, path, reason, presentation,
+          COUNT(*)::text AS shown,
+          COUNT(*) FILTER (WHERE outcome='recovered')::text AS recovered,
+          COUNT(*) FILTER (WHERE outcome='failed')::text AS failed,
+          COUNT(*) FILTER (WHERE outcome='cancelled')::text AS cancelled,
+          COUNT(*) FILTER (WHERE outcome='pending')::text AS pending,
+          COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL)::text AS affected_users,
+          percentile_cont(0.5) WITHIN GROUP (
+            ORDER BY EXTRACT(EPOCH FROM (recovered_at-created_at))*1000
+          ) FILTER (WHERE outcome='recovered' AND recovered_at IS NOT NULL) AS p50_recover_ms
+     FROM product_friction_events
+    WHERE stage='problem_card' AND created_at > NOW()-interval '${windowSql}'
+    GROUP BY code, path, reason, presentation
+    ORDER BY COUNT(*) FILTER (WHERE outcome='failed') DESC, COUNT(*) DESC
+    LIMIT 100`;
+
+export async function loadProblemCardAdminStats(runner?: QueryRunner): Promise<{
+  funnel: { last_24h: unknown[]; last_7d: unknown[] };
+  decisions: unknown[];
+  jobs: unknown[];
+  fallbacks: unknown[];
+}> {
+  const run = (sql: string) => query(sql, [], runner);
+  const [funnel24h, funnel7d, decisions, jobs, fallbacks] = await Promise.all([
+    run(PROBLEM_CARD_FUNNEL_SQL("24 hours")),
+    run(PROBLEM_CARD_FUNNEL_SQL("7 days")),
+    run(
+      `SELECT code, outcome, reason, COUNT(*)::text AS n
+         FROM product_friction_events
+        WHERE stage='recovery_decision' AND created_at > NOW()-interval '7 days'
+        GROUP BY code, outcome, reason
+        ORDER BY COUNT(*) DESC
+        LIMIT 100`,
+    ),
+    run(
+      `SELECT code, outcome, reason, COUNT(*)::text AS n
+         FROM product_friction_events
+        WHERE stage='recovery_job' AND created_at > NOW()-interval '7 days'
+        GROUP BY code, outcome, reason
+        ORDER BY COUNT(*) DESC
+        LIMIT 100`,
+    ),
+    run(
+      `SELECT code, reason, COUNT(*)::text AS n
+         FROM product_friction_events
+        WHERE stage='visible_fallback' AND created_at > NOW()-interval '7 days'
+        GROUP BY code, reason
+        ORDER BY COUNT(*) DESC
+        LIMIT 100`,
+    ),
+  ]);
+  return {
+    funnel: { last_24h: funnel24h.rows, last_7d: funnel7d.rows },
+    decisions: decisions.rows,
+    jobs: jobs.rows,
+    fallbacks: fallbacks.rows,
+  };
+}
+
 export async function handleAdminProductFriction(
   req: IncomingMessage,
   res: ServerResponse,
@@ -255,7 +315,7 @@ export async function handleAdminProductFriction(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
-  const [events, models, modelFailures, images, imageAttempts, orders, github, ratings, eventSummary] = await Promise.all([
+  const [events, models, modelFailures, images, imageAttempts, orders, github, ratings, eventSummary, problemCards] = await Promise.all([
     query<{
       surface: string; stage: string; code: string; journeys_1d: string; journeys_7d: string;
       attempts_1d: string; attempts_7d: string; failed_7d: string; recovered_7d: string;
@@ -418,6 +478,7 @@ export async function handleAdminProductFriction(
         GROUP BY w.window_key,w.span
         ORDER BY w.span`,
     ),
+    loadProblemCardAdminStats(),
   ]);
 
   const summary = Object.fromEntries(eventSummary.rows.map((row) => [row.window_key, {
@@ -451,5 +512,6 @@ export async function handleAdminProductFriction(
     github,
     ratings: ratings.rows,
     event_summary: summary,
+    problemCards,
   });
 }

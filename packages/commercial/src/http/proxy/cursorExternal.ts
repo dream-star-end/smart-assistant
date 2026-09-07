@@ -70,6 +70,7 @@ export interface CursorSandRelayLike {
     body: Record<string, unknown>,
     res: ServerResponse,
     signal: AbortSignal,
+    options?: { echoModel?: string },
   ): Promise<CursorSandServeResult>;
   close(): Promise<void>;
 }
@@ -107,7 +108,15 @@ export interface CursorExternalHandleArgs {
   requestId: string;
   uid: bigint;
   identity: ProxyIdentity;
+  /** Body with `model` already normalised to the internal `cursor-*` id. */
   body: ProxyBody;
+  /**
+   * Model id exactly as the client sent it (public `fable-5.1-high` or legacy
+   * internal `cursor-fable-5.1-high`). Used for every client-visible surface —
+   * error text and the `model` echoed in the Anthropic response — so third
+   * parties never see the engine prefix. Defaults to `body.model`.
+   */
+  requestedModel?: string;
   /** `deps.identity.authorize(identity, pricing, model)` bound by the handler. */
   authorize: (pricing: ModelPricing) => Promise<void>;
   appendCostCredits?: (
@@ -132,6 +141,13 @@ export interface CursorExternalRoute {
 }
 
 // ─── constants ─────────────────────────────────────────────────────────────
+
+/**
+ * Client-visible name of the upstream in relay error messages. Neutral on
+ * purpose: the external API-key surface never names the engine (operator
+ * decision 2026-09-07 — no "cursor" anywhere a third-party client can see).
+ */
+export const CURSOR_EXTERNAL_UPSTREAM_LABEL = "Upstream";
 
 export const CURSOR_EXTERNAL_STICKY_TTL_MS = 15 * 60_000;
 export const CURSOR_EXTERNAL_CREDENTIAL_COOLDOWN_MS = 10 * 60_000;
@@ -244,6 +260,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         // The master has no internal loopback proxy to hand non-Sand models to;
         // serveMessages already 400s NOT_SAND_ROUTE before reaching passthrough.
         passthrough: null,
+        upstreamLabel: CURSOR_EXTERNAL_UPSTREAM_LABEL,
       }));
 
   const relays = new Map<string, CachedRelay>();
@@ -316,6 +333,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   async function handle(args: CursorExternalHandleArgs): Promise<void> {
     const { req, res, requestId, uid, body, userLog } = args;
     const model = body.model;
+    const requestedModel = args.requestedModel ?? model;
     const nowMs = now();
 
     // 1) pricing — unknown / disabled cursor model
@@ -323,7 +341,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     if (!pricing || !pricing.enabled) {
       userLog.warn("proxy_unknown_model", { model, cursorExternal: true });
       incrAnthropicProxyReject("unknown_model");
-      sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${model}' not enabled`, requestId);
+      sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${requestedModel}' not enabled`, requestId);
       return;
     }
 
@@ -394,11 +412,12 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         excluded: excluded.size,
       });
       incrAnthropicProxyReject("account_pool");
+      // Error code / text are engine-neutral: this is a third-party-facing surface.
       sendJsonError(
         res,
         503,
-        "CURSOR_POOL_UNAVAILABLE",
-        "no cursor account available for this model, retry later",
+        "MODEL_POOL_UNAVAILABLE",
+        "no upstream capacity available for this model, retry later",
         requestId,
         { "retry-after": "30" },
       );
@@ -431,7 +450,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     let failure: unknown = null;
     const startedAt = nowMs;
     try {
-      result = await relay.serveMessages(relayBody, res, ac.signal);
+      result = await relay.serveMessages(relayBody, res, ac.signal, { echoModel: requestedModel });
     } catch (err) {
       failure = err;
     } finally {
@@ -485,7 +504,14 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         });
       }
       if (!result.written && !res.headersSent) {
-        sendJsonError(res, result.status, "CURSOR_UPSTREAM_REJECTED", result.reason, requestId);
+        sendJsonError(
+          res,
+          result.status,
+          "UPSTREAM_REJECTED",
+          // Internal reasons are `CURSOR_SAND_*` / `NOT_SAND_ROUTE`; strip the engine prefix for the wire.
+          result.reason.replace(/^CURSOR_SAND_/, ""),
+          requestId,
+        );
       }
       outcome = { engineStatus: "error", terminalCode: result.reason, usage: {}, settleKind: "aborted" };
     } else {
@@ -499,7 +525,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
           err: errSummary(failure),
         });
         if (!res.headersSent) {
-          sendJsonError(res, 502, "CURSOR_UPSTREAM_FAILED", "cursor upstream failed", requestId);
+          sendJsonError(res, 502, "UPSTREAM_FAILED", "upstream request failed", requestId);
         } else if (!res.writableEnded) {
           res.end();
         }

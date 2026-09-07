@@ -1,3 +1,4 @@
+import { publicCursorModelId } from "@openclaude/protocol";
 import { useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import type {
@@ -32,12 +33,11 @@ export function ApiAccessTab({ auth }: { auth: AuthSession }) {
   const [keys, setKeys] = useState<ApiKeySummary[]>([]);
 
   return (
-    <div className="flex flex-col">
-      <div className="px-5 pt-4">
-        <div className="text-section font-medium text-fg">API 接入</div>
+    <div className="flex min-w-0 flex-col">
+      <div className="px-5 pt-5">
+        <h2 className="text-[20px] font-semibold tracking-tight text-fg">把模型接到你的工具</h2>
         <p className="mt-1 text-caption text-muted">
-          用 API Key 把本地 Claude Code 等工具接到本站的 Cursor 系模型。此处的消耗统计只含 API Key
-          流量,不含网页对话。
+          通过 API Key 连接 Claude Code 或 CC Switch,沿用本站模型与积分。
         </p>
       </div>
 
@@ -109,12 +109,12 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
   ];
 
   return (
-    <div className="border-t border-border px-5 py-4" data-api-key-usage>
+    <div className="min-w-0 border-t border-border px-5 py-5" data-api-key-usage>
       <div className="flex flex-wrap items-center gap-2 pb-3">
-        <div className="text-caption font-medium uppercase tracking-wide text-faint">
+        <div className="text-section font-semibold text-fg">
           消耗统计 · 近 {REPORT_WINDOW_NOUN[window]}
         </div>
-        <div className="ml-auto flex flex-wrap items-center gap-2">
+        <div className="flex w-full flex-wrap items-center gap-2">
           <Tabs
             aria-label="统计窗口"
             value={window}
@@ -131,6 +131,10 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
           />
         </div>
       </div>
+
+      <p className="mb-3 text-caption text-muted">
+        仅统计外部 API 请求,不含网页对话。可按时间与密钥筛选。
+      </p>
 
       {loading ? (
         <div>
@@ -249,7 +253,9 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
                 <tbody>
                   {report.by_model.map((model) => (
                     <tr key={model.model} className="border-t border-border">
-                      <td className="px-3 py-2 font-mono text-fg">{model.model}</td>
+                      <td className="px-3 py-2 font-mono text-fg">
+                        {publicCursorModelId(model.model)}
+                      </td>
                       <td className="px-3 py-2 text-right tabular-nums">
                         {groupDigits(model.requests)}
                       </td>
@@ -302,7 +308,9 @@ export function ApiKeyUsagePanel({ auth, keys }: { auth: AuthSession; keys: ApiK
                       <td className="max-w-[10rem] truncate px-3 py-2 text-fg">
                         {row.label ?? "(已撤销)"}
                       </td>
-                      <td className="px-3 py-2 font-mono text-fg">{row.model}</td>
+                      <td className="px-3 py-2 font-mono text-fg">
+                        {publicCursorModelId(row.model)}
+                      </td>
                       <td className="px-3 py-2 text-right tabular-nums">
                         {formatCompactCount(row.input_tokens)}
                       </td>
@@ -385,11 +393,11 @@ function TableShell({
 
 function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
   return (
-    <div className="rounded-xl border border-border bg-surface px-3 py-2.5">
+    <div className="rounded-xl bg-hover/60 px-4 py-3">
       <div className="text-caption text-faint">{label}</div>
       <div
         className={cn(
-          "mt-0.5 text-[16px] font-semibold tabular-nums",
+          "mt-1 text-[20px] font-semibold tabular-nums",
           accent ? "text-accent" : "text-fg",
         )}
       >

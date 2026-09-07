@@ -852,6 +852,15 @@ export const EXPECTED_TURN_ERR_CODES: ReadonlySet<string> = EXPECTED_TURN_ERROR_
  */
 export const REPORT_EXEMPT_TURN_ERR_CODES: ReadonlySet<string> = REPORT_EXEMPT_TURN_ERROR_CODES;
 
+/**
+ * 问题卡呈现色：与 cards.tsx errorTone 同源。
+ * waived 或 taxonomy.expected===true → yellow（warning 卡）；否则 red（danger 卡）。
+ */
+export function problemCardPresentation(code: string, waived: boolean): "red" | "yellow" {
+  if (waived || turnErrorSemantics(normalizeTurnErrorCode(code)).expected === true) return "yellow";
+  return "red";
+}
+
 // ═══════════════ 流式行身份（server canonical id upsert，websocket.js:606）═══════════════
 
 /**

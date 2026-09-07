@@ -112,6 +112,13 @@ export function createStickToBottomController() {
 
   const endWheelFence = () => {
     wheelFence.current = false;
+    // The fence releases only once the user has been idle for the quiet window
+    // and the scroller is at rest. A transient input mark still standing here
+    // was never consumed by a scroll event — a wheel tick delivered at the
+    // bottom boundary, or a key that did not scroll — and would otherwise keep
+    // bottom pinning suspended until some unrelated scroll event clears it
+    // (stream stops following right after the user wheels back to the bottom).
+    writeSuspended.current = false;
   };
 
   const scrollToBottom = (el: StickScroller) => {

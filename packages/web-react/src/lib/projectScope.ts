@@ -31,6 +31,13 @@ export type ResolvedProjectScope = {
 export const PROJECT_SCOPE_QUERY = "project";
 export const PROJECT_SCOPE_STORAGE_PREFIX = "oc_v5_project_scope:";
 export const UNBOUND_BOARD_COPY = "该会话项目未绑定看板";
+export const SELECT_WORK_PROJECT_COPY = "请选择一个工作项目以查看看板";
+
+/** Empty-state copy when the current scope cannot query a board. */
+export function boardBlockedCopy(kind: ProjectScopeKind): string {
+  if (kind === "all") return SELECT_WORK_PROJECT_COPY;
+  return UNBOUND_BOARD_COPY;
+}
 
 /** Taskboard / Cost / Weekly: only a work project may query; never undefined=global. */
 export function boardWorkQuery(
@@ -39,7 +46,7 @@ export function boardWorkQuery(
   if (scope.kind === "work" && scope.workProject?.id) {
     return { projectId: scope.workProject.id };
   }
-  return { blocked: UNBOUND_BOARD_COPY };
+  return { blocked: boardBlockedCopy(scope.kind) };
 }
 
 export function parseProjectScopeToken(raw: string | null | undefined): ProjectScopeToken | null {

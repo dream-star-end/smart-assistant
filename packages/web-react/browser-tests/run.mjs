@@ -191,7 +191,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-short"]{min-height:80px}
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
   #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="process-card-owner-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -2163,6 +2163,115 @@ await check("T65 上滑与底部占位收起合并进同一 scroll 事件时不�
   }
   if (afterGrow.following) throw new Error("追加内容后错误恢复贴底态");
 });
+await check("T66 回到底部按钮不参与滚动几何：滚轮回底时 following 只翻一次、无 clamp 回弹、按钮只切可见", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 1200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 80);
+  // 贴底态:dock 常驻挂载(它是 RO root 的子节点),只是不可见;记下此时的 scrollHeight。
+  const dock = mobilePage.getByTestId("scroll-to-bottom-dock");
+  const dockCount = await dock.count();
+  if (dockCount !== 1) throw new Error(`贴底时 dock 未常驻挂载: count=${dockCount}`);
+  const atBottom = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+    dockVisible: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible"),
+    dockHeight: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getBoundingClientRect().height,
+  }));
+  if (!atBottom.following || Math.abs(atBottom.top - atBottom.max) > 2) {
+    throw new Error(`T66 前置未贴底: ${JSON.stringify(atBottom)}`);
+  }
+  if (atBottom.dockVisible !== "false") throw new Error(`贴底时按钮应不可见: ${JSON.stringify(atBottom)}`);
+  if (atBottom.dockHeight !== 0) throw new Error(`dock 必须零高度: ${JSON.stringify(atBottom)}`);
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可滚轮几何");
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + box.height / 2);
+  await mobilePage.mouse.move(x, y);
+  // 上滑 4 tick 离底 → 按钮出现。scrollHeight 不得因按钮出现而变化。
+  for (let i = 0; i < 4; i += 1) {
+    await mobilePage.mouse.wheel(0, -120);
+    await mobilePage.waitForTimeout(40);
+  }
+  await mobilePage.waitForFunction(
+    () => document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible") === "true",
+    null,
+    { timeout: 2000 },
+  );
+  const away = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    following: window.__mobilePage.following,
+    fence: window.__mobilePage.wheelFence,
+  }));
+  if (away.following) throw new Error(`上滑后仍贴底: ${JSON.stringify(away)}`);
+  if (away.height !== atBottom.height) {
+    throw new Error(`按钮出现改变了 scrollHeight: ${atBottom.height} → ${away.height}`);
+  }
+  const btn = mobilePage.getByTestId("scroll-to-bottom");
+  const btnBox = await btn.boundingBox();
+  if (!btnBox || btnBox.width < 30) throw new Error(`离底后按钮不可见: ${JSON.stringify(btnBox)}`);
+  if (btnBox.y + btnBox.height > box.y + box.height + 1) {
+    throw new Error(`按钮溢出滚动区底边: btn=${JSON.stringify(btnBox)} scroll=${JSON.stringify(box)}`);
+  }
+  // 篱笆仍在(离上次输入 <200ms)时滚轮回底。旧实现:following 翻真 → 按钮卸载 →
+  // scrollHeight -52 → clamp scroll 事件带 hadUserIntent → 判成离底 → following 再翻假
+  // → 按钮再挂载 …… 用户看到的是每次回底都弹一下。现在 following 只允许翻一次。
+  await mobilePage.evaluate(() => { window.__mobilePage.followingFlips = 0; window.__mobilePage.programmaticWrites = 0; });
+  const tops = [];
+  for (let i = 0; i < 8; i += 1) {
+    await mobilePage.mouse.wheel(0, 120);
+    await mobilePage.waitForTimeout(40);
+    tops.push(await scroll.evaluate((node) => node.scrollTop));
+  }
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 200);
+  const back = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+    flips: window.__mobilePage.followingFlips,
+    fence: window.__mobilePage.wheelFence,
+    writes: window.__mobilePage.programmaticWrites,
+    dockVisible: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible"),
+    dockCount: document.querySelectorAll('[data-testid="scroll-to-bottom-dock"]').length,
+  }));
+  if (back.fence) throw new Error(`回底静止后篱笆未释放: ${JSON.stringify(back)}`);
+  if (Math.abs(back.top - back.max) > 2) throw new Error(`滚轮回底未到底: ${JSON.stringify(back)}`);
+  if (!back.following) throw new Error(`回底后未恢复贴底: ${JSON.stringify(back)}`);
+  if (back.flips !== 1) {
+    throw new Error(`回底过程 following 翻转 ${back.flips} 次(应恰好 1 次): tops=${tops.join(",")} ${JSON.stringify(back)}`);
+  }
+  if (back.height !== atBottom.height) {
+    throw new Error(`回底后 scrollHeight 变化(按钮参与了几何): ${atBottom.height} → ${back.height}`);
+  }
+  for (let i = 1; i < tops.length; i += 1) {
+    if (tops[i] < tops[i - 1] - 1) {
+      throw new Error(`滚轮回底途中被向上夹回: step ${i} ${tops[i - 1]} → ${tops[i]} (all=${tops.join(",")})`);
+    }
+  }
+  if (back.writes !== 0) throw new Error(`回底期间出现程序化写入: ${JSON.stringify(back)}`);
+  if (back.dockCount !== 1 || back.dockVisible !== "false") {
+    throw new Error(`回底后按钮应仍挂载但不可见: ${JSON.stringify(back)}`);
+  }
+  // 贴底后追加内容仍跟随(following 真的稳定为 true,不是巧合落底)。
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    dist: node.scrollHeight - node.scrollTop - node.clientHeight,
+    following: window.__mobilePage.following,
+  }));
+  if (!afterGrow.following || afterGrow.dist > 2) {
+    throw new Error(`回底后追加内容未跟随: ${JSON.stringify(afterGrow)}`);
+  }
+});
 screenshotPage = page;
 
 // ── T26 微博登录页二维码挑战判定 ────────────────────────────────────────────
@@ -2763,8 +2872,15 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
       throw new Error(`管理中心仍占侧栏主区(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: "打开使用教程" }).count() !== 1) {
-      throw new Error(`底栏教程图标丢失(${theme})`);
+    const gallery = sidebar.getByRole("button", { name: "打开案例展厅", exact: true });
+    if (await gallery.count() !== 1) {
+      throw new Error(`底栏案例展厅入口不唯一或丢失(${theme})`);
+    }
+    await gallery.waitFor({ state: "visible", timeout: 3000 });
+    const galleryOpens = await page.evaluate(() => window.__densityGalleryOpens);
+    await gallery.click();
+    if (await page.evaluate(() => window.__densityGalleryOpens) !== galleryOpens + 1) {
+      throw new Error(`案例展厅入口没有精确触发一次打开(${theme})`);
     }
     if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
       throw new Error(`底栏主题开关丢失(${theme})`);
@@ -3272,6 +3388,69 @@ await check("T51 Weibo 错误码提示重新扫码且图文失败建议纯文字
   if (!result.mediaUpload.includes("纯文字")) {
     throw new Error(`WEIBO_WRITE_MEDIA_UPLOAD 未建议纯文字:${JSON.stringify(result)}`);
   }
+});
+
+await check("T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且 MessageList 红绿对照", async () => {
+  await page.evaluate(() => window.__mountProcessCardOwnerProbe());
+  const result = await page.evaluate(() => window.__processCardOwner);
+  if (JSON.stringify(result.sortIds) !== JSON.stringify(["g", "q", "u", "a"])) {
+    throw new Error(`T67 毒序对照丢失(stableSortByTs 应变坏):${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.repairedIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 repair 未把过程卡移到所属 user 之后:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.mergeIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 mergeFullServerWins 未自愈:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.incrementalIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 applyServerIncremental 未自愈:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.cachedIds) !== JSON.stringify(["g", "q"])) {
+    throw new Error(`T67 未覆盖 toStored 剥离 timeline user 的原点:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.cacheReloadIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 正确内存经缓存、重载、full merge 后越过 owner:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.recoverIds) !== JSON.stringify([
+    "u-first",
+    "m-recover-3hev56n0kpyl1",
+    "g-recover",
+    "a-recover",
+  ])) {
+    throw new Error(`T67 m-recover owner 贴到了别的 user:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.missingOwnerIds) !== JSON.stringify(["g-archived", "u2", "a2"])) {
+    throw new Error(`T67 missing owner 被猜到别轮:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.serverTapeIds) !== JSON.stringify(["g-server", "u1", "think1", "a1"])) {
+    throw new Error(`T67 server tape 相对顺序被改写:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.nextUserBoundIds) !== JSON.stringify(["u1", "g1", "a1", "u2"])) {
+    throw new Error(`T67 下一 user 上界未生效:${JSON.stringify(result)}`);
+  }
+  if (!result.cleanUnchanged || !result.idempotent) {
+    throw new Error(`T67 正确序被改写或 merge 不幂等:${JSON.stringify(result)}`);
+  }
+  const poisonKeys = await page.evaluate(() =>
+    [...document.querySelectorAll("#process-card-owner-poison [data-chat-virtual-key]")]
+      .map((node) => node.getAttribute("data-chat-virtual-key")));
+  const repairedKeys = await page.evaluate(() =>
+    [...document.querySelectorAll("#process-card-owner-repaired [data-chat-virtual-key]")]
+      .map((node) => node.getAttribute("data-chat-virtual-key")));
+  const poisonUser = poisonKeys.indexOf("u");
+  const poisonGroup = poisonKeys.indexOf("g");
+  if (poisonUser < 0 || poisonGroup < 0 || poisonGroup >= poisonUser) {
+    throw new Error(`T67 毒序 MessageList 未把子任务渲在 user 前:${JSON.stringify(poisonKeys)}`);
+  }
+  const repairedUser = repairedKeys.indexOf("u");
+  const repairedGroup = repairedKeys.indexOf("g");
+  if (repairedUser < 0 || repairedGroup < 0 || repairedGroup <= repairedUser) {
+    throw new Error(`T67 修复序 MessageList 用户气泡未在子任务前:${JSON.stringify(repairedKeys)}`);
+  }
+  await page.getByText("BROWSER_CARD_OWNER_USER", { exact: true }).first().waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
 });
 
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {

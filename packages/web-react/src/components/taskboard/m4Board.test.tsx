@@ -620,7 +620,7 @@ describe('Taskboard/Cost/Weekly 范围不发全局请求', () => {
     getCost.mockClear()
     scopeState.kind = 'all'
     wrap(<CostStatsView auth={auth} projectId={null} projects={[sampleProject()]} />)
-    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+    expect(await screen.findByText('请选择一个工作项目以查看看板')).toBeInTheDocument()
     expect(getCost).not.toHaveBeenCalled()
 
     cleanup()

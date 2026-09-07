@@ -1164,16 +1164,16 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     render(<App />)
     expect(
-      await screen.findByRole('heading', { name: '公开数据到可复现的单车需求分析' }, { timeout: 15000 }),
+      await screen.findByRole('heading', { name: '一堆出行数据，变成看得懂的需求规律。' }, { timeout: 15000 }),
     ).toBeInTheDocument()
-    expect(screen.getByText(/当前只展示人工编写的任务脚本，不是真实运行回放/)).toBeInTheDocument()
+    expect(screen.getByText(/公开数据实作 · 非完整会话回放/)).toBeInTheDocument()
     expect(
       screen.queryByRole('heading', { name: '你不用守着它。回来时，过程和成果都还在。' }),
     ).not.toBeInTheDocument()
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).toContain('case=research-bike-demand')
 
-    fireEvent.click(screen.getByRole('button', { name: /带着我的材料开始.*登录后试用/ }))
+    fireEvent.click(screen.getByRole('button', { name: /登录后做我的版本/ }))
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: '欢迎使用 从简' })).toBeInTheDocument(),
     )
@@ -1282,5 +1282,59 @@ describe('Aurora v5 — P7 最小路由', () => {
     )
     expect(window.location.search).not.toContain('community=')
     expect(window.location.search).not.toContain('panel=help')
+  })
+})
+
+describe('Aurora v5 — desktop enroll 特判', () => {
+  const ENROLL_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+  test('/desktop/enroll 未登录：走 AuthGate，不进 Landing/工作区', async () => {
+    window.history.replaceState({}, '', `/desktop/enroll?enrollment_id=${ENROLL_ID}`)
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    expect(await screen.findByPlaceholderText('邮箱')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('密码')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '确认这台电脑' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /新建会话/ })).not.toBeInTheDocument()
+    expect(window.location.pathname).toBe('/desktop/enroll')
+  })
+
+  test('/desktop/enroll 已登录：渲染确认页，不进工作区', async () => {
+    window.history.replaceState({}, '', `/desktop/enroll?enrollment_id=${ENROLL_ID}`)
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_OK
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me')) {
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    setAuthHint()
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '确认这台电脑' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '确认这台电脑' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /新建会话/ })).not.toBeInTheDocument()
+    expect(window.location.pathname).toBe('/desktop/enroll')
+  })
+
+  test('?demo=1 不启用 /desktop/enroll 特判', async () => {
+    window.history.replaceState({}, '', `/desktop/enroll?demo=1&enrollment_id=${ENROLL_ID}`)
+    vi.stubGlobal('fetch', () => {
+      throw new Error('demo mode must not hit the network')
+    })
+    render(<App />)
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    expect(screen.queryByRole('heading', { name: '确认这台电脑' })).not.toBeInTheDocument()
   })
 })

@@ -68,6 +68,7 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
 
     renderPanel();
 
+    expect(screen.getByRole("tab", { name: "核心记忆" })).toBeInTheDocument();
     expect(await screen.findByText("深色模式偏好")).toBeInTheDocument();
     expect(screen.getByText("喜欢深色模式与简洁回答")).toBeInTheDocument();
     expect(screen.getByText("Aurora 项目")).toBeInTheDocument();

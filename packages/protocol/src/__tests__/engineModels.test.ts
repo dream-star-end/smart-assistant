@@ -7,8 +7,11 @@ import {
   CURSOR_CONTEXT_TIERS,
   CURSOR_CONTEXT_TIER_FAMILIES,
   CURSOR_CONTEXT_TIER_WINDOW,
+  CURSOR_ENGINE_ID_PREFIX,
   CURSOR_ENGINE_MODELS,
   CURSOR_ENGINE_MODEL_IDS,
+  cursorModelIdFromPublic,
+  publicCursorModelId,
   DEFAULT_CURSOR_CONTEXT_TIER,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
@@ -200,6 +203,30 @@ describe('Cursor engine model authority', () => {
     assert.equal(findCursorEngineModel('sonnet-5', 'high', false)?.upstreamModel, 'claude-sonnet-5-thinking-high')
     assert.equal(cursorCredentialModelFamily('cursor-gemini-3.8-flash-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('gemini-3.8-flash-low'), 'other_models')
+  })
+
+  test('public id strips the engine prefix and round-trips back to the internal id', () => {
+    assert.equal(publicCursorModelId('cursor-fable-5.1-high'), 'fable-5.1-high')
+    assert.equal(publicCursorModelId('cursor-grok-4.6-high-fast'), 'grok-4.6-high-fast')
+    // Non-cursor ids pass through untouched so mixed lists need no branching.
+    assert.equal(publicCursorModelId('gpt-5.6-sol'), 'gpt-5.6-sol')
+    assert.equal(publicCursorModelId('cursor-not-a-model'), 'cursor-not-a-model')
+    for (const id of CURSOR_ENGINE_MODEL_IDS) {
+      const pub = publicCursorModelId(id)
+      assert.equal(pub.startsWith(CURSOR_ENGINE_ID_PREFIX), false)
+      assert.equal(cursorModelIdFromPublic(pub), id)
+      assert.equal(cursorModelIdFromPublic(id), id)
+    }
+    // Public ids are unique — no two distinct internal ids collapse onto the same external name.
+    assert.equal(
+      new Set(CURSOR_ENGINE_MODEL_IDS.map(publicCursorModelId)).size,
+      new Set(CURSOR_ENGINE_MODEL_IDS).size,
+    )
+    assert.equal(cursorModelIdFromPublic('gpt-5.6-sol'), null)
+    assert.equal(cursorModelIdFromPublic('fable-5.1-high --force'), null)
+    assert.equal(cursorModelIdFromPublic(''), null)
+    assert.equal(cursorModelIdFromPublic(null), null)
+    assert.equal(cursorModelIdFromPublic(undefined), null)
   })
 })
 

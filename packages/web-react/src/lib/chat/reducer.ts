@@ -22,6 +22,7 @@ import {
   getFrameSeqCursor,
   isBridgeAuthControlError,
   normalizeBridgeErrorCode,
+  problemCardPresentation,
   REPORT_EXEMPT_TURN_ERR_CODES,
   safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
@@ -120,6 +121,36 @@ export type FrameEffects = {
   persistSession?: (sessId: string) => void;
   /** 1008 前的 auth-control error：交给 close handler 续期，不渲染。*/
   onAuthControlError?: () => void;
+  /** 用户看见问题卡 / 进入软状态 / 恢复收口时上报（历史水合路径不接）。*/
+  reportProblemCard?: (sessId: string, p: ProblemCardReport) => void;
+};
+
+export type ProblemCardPath =
+  | "immediate"
+  | "deferred"
+  | "decision_timeout"
+  | "adoption_timeout"
+  | "decision_declined"
+  | "recovery_skipped"
+  | "stop_fenced"
+  | "recovery_adopted";
+
+export type ProblemCardMaterializeCause =
+  | "decision_timeout"
+  | "adoption_timeout"
+  | "decision_declined"
+  | "recovery_skipped"
+  | "stop_fenced";
+
+export type ProblemCardReport = {
+  rootCmid: string;
+  code: string;
+  outcome: "pending" | "failed" | "recovered" | "cancelled";
+  path: ProblemCardPath;
+  presentation: "red" | "yellow" | "soft";
+  reason?: string;
+  attempts?: number;
+  traceId?: string;
 };
 
 // ═══════════════ frameSeq 去重（per-sessionKey 游标，§3）═══════════════
@@ -2541,17 +2572,26 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
  * 与实时路径同一 painter;若期间该轮已被 master 恢复子轮领养(`_activeClientMessageId` 已切到
  * 子 cmid)或已出现同 cmid 的完整 tape,则不再补卡。
  */
-export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, effects: FrameEffects = {}): void {
+export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, effects: FrameEffects = {}): boolean {
   const cmid = paint.clientMessageId;
   if (cmid) {
     const adopted = sess.messages.some((m) =>
       m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid);
-    if (adopted) return;
-    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode)) return;
-    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && m._turnTapeComplete === true)) return;
+    if (adopted) return false;
+    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode)) return false;
+    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && m._turnTapeComplete === true)) return false;
   }
   paintTerminalError(sess, paint, false);
   effects.persistSession?.(sess.id);
+  return true;
+}
+
+function problemCardRootCmid(sess: ChatSession, cmid: string | undefined): string | undefined {
+  if (!cmid) return undefined;
+  const source = sess.messages.find((m) => m.role === "user" && m.id === cmid);
+  const root = source?._automaticRecoveryRootClientMessageId;
+  if (typeof root === "string" && root.length > 0) return root;
+  return cmid;
 }
 
 /**
@@ -2610,6 +2650,18 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
     enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
     effects.persistSession?.(sess.id);
+    const deferredRoot = problemCardRootCmid(sess, sess._deferredTerminalErrorClientMessageId);
+    if (deferredRoot) {
+      effects.reportProblemCard?.(sess.id, {
+        rootCmid: deferredRoot,
+        code: normalized,
+        outcome: "pending",
+        path: "deferred",
+        presentation: "soft",
+        attempts: 1,
+        traceId: paint.traceId,
+      });
+    }
     if (!REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
       effects.reportTurnError?.({
         code: normalized,
@@ -2620,8 +2672,19 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     }
     return;
   }
+  const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
   paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
+  if (!userCancelled && immediateRoot) {
+    effects.reportProblemCard?.(sess.id, {
+      rootCmid: immediateRoot,
+      code: normalized,
+      outcome: "failed",
+      path: "immediate",
+      presentation: problemCardPresentation(normalized, false),
+      traceId: paint.traceId,
+    });
+  }
   // 遥测上报口径用**遥测豁免集**(reportable===false),与"预期业务态"(expected)解耦
   // (Codex 审计 R5c):rate_limited/model_capacity/service_restart/image_server_busy 虽对用户预期,
   // 但是平台运营故障信号,必须上报;仅用户主动(stopped/user_cancelled)与业务拒绝类才豁免。
@@ -2663,10 +2726,33 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
     enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
     effects.persistSession?.(sess.id);
+    const deferredRoot = problemCardRootCmid(sess, sess._deferredTerminalErrorClientMessageId);
+    if (deferredRoot) {
+      effects.reportProblemCard?.(sess.id, {
+        rootCmid: deferredRoot,
+        code: normalized,
+        outcome: "pending",
+        path: "deferred",
+        presentation: "soft",
+        attempts: 1,
+        traceId: paint.traceId,
+      });
+    }
     return;
   }
+  const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
   paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
+  if (!userCancelled && immediateRoot) {
+    effects.reportProblemCard?.(sess.id, {
+      rootCmid: immediateRoot,
+      code: normalized,
+      outcome: "failed",
+      path: "immediate",
+      presentation: problemCardPresentation(normalized, false),
+      traceId: paint.traceId,
+    });
+  }
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
   if (supportsAutomaticTurnRecovery(normalized)) {
     effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);

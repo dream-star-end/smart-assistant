@@ -2,8 +2,8 @@
   "schema": 1,
   "pipelineVersion": 2,
   "generatedAt": "2026-07-15T08:00:00.000Z",
-  "sourceCommit": "3c52ee8ceff58e7a632ab545c20522682a87a168",
-  "sourceTreeHash": "a7bfdd62f62446128f65dea94678e47e4e0bf0b34b11478c48a59afb6c584bf3",
+  "sourceCommit": "55ec3d5ec4dfea31f8b0e7f11c6411aeffba818d",
+  "sourceTreeHash": "30716d561bd0649f4f3e36f0dc052838bd56fc0ff783a458eefdb2970a9846fb",
   "productionEntry": "index.html -> src/main.tsx -> App",
   "fixtureBoundary": "HTTP / WebSocket / browser capabilities only",
   "networkPolicy": "local static + explicit fixtures; unknown local and all external requests fail",
@@ -45,33 +45,35 @@
     ]
   },
   "incremental": {
-    "at": "2026-08-27T15:59:12.774Z",
+    "at": "2026-09-07T04:40:05.147Z",
     "featureIds": [
-      "taskboard",
-      "session-goal"
+      "agents",
+      "chat-basics",
+      "models-reasoning",
+      "sessions-history"
     ],
     "previousGeneratedAt": "2026-07-15T08:00:00.000Z"
   },
   "scenarios": {
     "chat-basics": {
-      "mediaVersion": 3,
+      "mediaVersion": 4,
       "caption": "输入目标并发送，随后核对助手返回的完整交付。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
         },
         {
           "label": "新建会话，准备描述任务",
-          "dHash": "392c190a92b1a148a148a14822c8a1c0a5a0246800102020040386021c820c80"
+          "dHash": "3936394692c821b085e00068849388b420648c238c20c280c402c6432c022c80"
         },
         {
           "label": "写清目标、字段和交付格式",
-          "dHash": "392c190a92b1a148a148a14822c8a1c0a5a0246800902080064386431c830c80"
+          "dHash": "3936394692c821b085e00068849388b420648c238c20c090c643c6432c822c80"
         },
         {
           "label": "发送后核对助手的完整交付",
-          "dHash": "390c196c92e4a40bba20a9482548a608a608260024208400840386021c820c80"
+          "dHash": "3906392694cc24cc864d06cc83228580240084008080c100c402c6432c022c80"
         }
       ],
       "actions": [
@@ -101,7 +103,7 @@
           ],
           "tag": "textarea",
           "role": null,
-          "label": "和「科研助手」对话…",
+          "label": "消息输入框",
           "matchedFeatureId": "chat-basics",
           "matchedControl": true,
           "dialogTitle": null,
@@ -128,43 +130,43 @@
         "助手已返回完整交付"
       ],
       "poster": {
-        "sha256": "5f7fb3b0d8d836015c1fc7b83b1097817366f3ac757bc722b7a03189256cade2",
-        "bytes": 23954
+        "sha256": "aba6b8b5613501e36ff0acdaf9b87349361e6cb3cb2b89e13d73bdddb89dccf1",
+        "bytes": 19318
       },
       "video": {
-        "sha256": "e47fd6b09fa4382668a74117f9945ec7f56b8a90979faa9255268f9262e330c5",
-        "bytes": 97814
+        "sha256": "b071a3d395fc8130f8c4e483e8f8b4ded9ab6cbbd2bf3c1af538ce9af3399c5d",
+        "bytes": 101106
       }
     },
     "sessions-history": {
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "caption": "搜索会话并切换到“客户研究”，继续已有工作。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
         },
         {
           "label": "在侧栏搜索已有项目",
-          "dHash": "390c192a9b418748a500a5482548a747a7ac27a824038420840366021c820c80"
+          "dHash": "3926390eb48d048da489272c872884d384000400008001000402c6432c022c80"
         },
         {
           "label": "打开会话并恢复历史上下文",
-          "dHash": "390c192a9b41a748a500a5482548a747a7ac27a824038420840366021c820c80"
+          "dHash": "3926390e948d248d8489272c872884d384000400008001000402c6432c022c80"
         }
       ],
       "actions": [
         {
           "step": "搜索已有项目会话",
-          "selector": "input[data-product-feature=\"sessions-history\"][placeholder=\"搜索会话\"]",
+          "selector": "input[data-product-feature=\"sessions-history\"][aria-label=\"搜索标题或消息\"]",
           "expectedFeatureId": "sessions-history",
           "assertions": [
-            "visible:input[data-product-feature=\"sessions-history\"][placeholder=\"搜索会话\"]",
+            "visible:input[data-product-feature=\"sessions-history\"][aria-label=\"搜索标题或消息\"]",
             "feature:sessions-history"
           ],
           "tag": "input",
           "role": null,
-          "label": "搜索会话",
+          "label": "搜索标题或消息",
           "matchedFeatureId": "sessions-history",
           "matchedControl": true,
           "dialogTitle": null,
@@ -191,33 +193,33 @@
         "历史消息已恢复"
       ],
       "poster": {
-        "sha256": "2529a26b5610100bcedc4a23fb412517a6a50dd92aa3e02f0005fb0f018e005a",
-        "bytes": 25266
+        "sha256": "051823e9c5ed9604fa02dac4335ebca307e35300e979485a238aba9528ccee67",
+        "bytes": 20976
       },
       "video": {
-        "sha256": "7f50cf8fcfb737574beac987591ad402619d144769232f33980a2140cea23e44",
-        "bytes": 83388
+        "sha256": "ff806eb9533416cbf105b2c18e16b2f15660a4674e7678d819b81ee5cc40f95c",
+        "bytes": 68902
       }
     },
     "models-reasoning": {
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "caption": "打开模型选择器，比较并切换后续消息使用的模型。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
         },
         {
           "label": "查看当前可用模型与思考档位",
-          "dHash": "392c192a9835a530a420a5302640a747a72c27a8240384208403a6021c820c80"
+          "dHash": "3926392e963d243d8429053484388723243086308230c230c672c6232c022c80"
         },
         {
           "label": "确认后续消息使用所选模型",
-          "dHash": "390c193a9b41a748a500a5482548a747a7ac27a8240384208403a6021c820c80"
+          "dHash": "39163f1e969d248d8489072c872884d3240084008080c100c402c6432c022c80"
         },
         {
           "label": "在模型列表中核对当前选择与可用范围",
-          "dHash": "390c190a9835a530a430a5202640a747a72c27a8240384208403a6021c820c80"
+          "dHash": "3906392e963d243d8429053484388723243086308230c230c672c6232c022c80"
         }
       ],
       "actions": [
@@ -238,11 +240,27 @@
           "activeTabs": []
         },
         {
-          "step": "选择 GPT-5.6-Terra",
-          "selector": "[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"]:has-text(\"GPT-5.6-Terra\")",
+          "step": "展开更多 GPT 模型",
+          "selector": "[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"][data-collapsed-group=\"closed\"]",
           "expectedFeatureId": "models-reasoning",
           "assertions": [
-            "visible:[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"]:has-text(\"GPT-5.6-Terra\")",
+            "visible:[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"][data-collapsed-group=\"closed\"]",
+            "feature:models-reasoning"
+          ],
+          "tag": "div",
+          "role": "menuitem",
+          "label": "更多 GPT 模型1 个",
+          "matchedFeatureId": "models-reasoning",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        },
+        {
+          "step": "选择 GPT-5.6-Terra",
+          "selector": "[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"][data-model-id=\"gpt-5.6-terra\"]",
+          "expectedFeatureId": "models-reasoning",
+          "assertions": [
+            "visible:[data-product-feature=\"models-reasoning\"] [role=\"menuitem\"][data-model-id=\"gpt-5.6-terra\"]",
             "feature:models-reasoning"
           ],
           "tag": "div",
@@ -274,12 +292,12 @@
         "顶栏已显示新模型"
       ],
       "poster": {
-        "sha256": "803ac951015ce15438e034537536ff8ebf9ba2bd9acf4c47a19e8ba48ba7abf3",
-        "bytes": 25074
+        "sha256": "d410c388227556a42eb25a428f93f4f34111cfb8c2e1e133f73d2cb2136aaf21",
+        "bytes": 23562
       },
       "video": {
-        "sha256": "21c2c1ee81481e7e0fdd8057619724db062ad750cef7b4977b76922d39666e5c",
-        "bytes": 98330
+        "sha256": "6a14a8fa3b22f59c718bee6602973acacba8da1e4732d5167777442329005352",
+        "bytes": 89105
       }
     },
     "files-media": {
@@ -803,38 +821,38 @@
       }
     },
     "agents": {
-      "mediaVersion": 3,
-      "caption": "打开智能体选择器，查看并切换已安装的专业助手。",
+      "mediaVersion": 4,
+      "caption": "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
         },
         {
           "label": "查看已安装的专业智能体",
-          "dHash": "390c190e8416821692369116951692a692c69096a18684a6989698160c063c00"
+          "dHash": "390619068416821692369116959692c692c69096a18684a6981698960c062c00"
         },
         {
-          "label": "确认当前会话使用编程助手",
-          "dHash": "390c192a9b41a748a500a5482548a747a7ac27a8240384208403a6021c820c80"
+          "label": "确认新会话使用编程助手",
+          "dHash": "3906393692c820c085a0006881428cb12db1864e8e68c180c402c6432c022c80"
         },
         {
           "label": "在智能体目录中核对当前角色与专业说明",
-          "dHash": "390c190e8416821692369116951692a692c69196a18685a6989698160c063c00"
+          "dHash": "390619068416821692369116959692c692c69196a18685a6989698960c062c00"
         }
       ],
       "actions": [
         {
-          "step": "打开智能体选择器",
-          "selector": "header button[data-product-feature=\"agents\"]",
+          "step": "从侧栏选择智能体后新建",
+          "selector": "aside button[data-product-feature=\"agents\"][aria-label=\"选择智能体后新建\"]",
           "expectedFeatureId": "agents",
           "assertions": [
-            "visible:header button[data-product-feature=\"agents\"]",
+            "visible:aside button[data-product-feature=\"agents\"][aria-label=\"选择智能体后新建\"]",
             "feature:agents"
           ],
           "tag": "button",
           "role": null,
-          "label": "🔬科研助手",
+          "label": "选择智能体后新建",
           "matchedFeatureId": "agents",
           "matchedControl": true,
           "dialogTitle": null,
@@ -874,16 +892,18 @@
         }
       ],
       "assertions": [
+        "先打开已有任务作为新建前的对照",
         "智能体选择器已打开",
-        "顶栏已切换智能体"
+        "顶栏已切换智能体",
+        "新会话输入框为空，旧任务内容未带入"
       ],
       "poster": {
-        "sha256": "1e1fb498aeafc19c05d14d26487077f8c7e808acba41c0cba22f3e65354f2b5e",
+        "sha256": "b104cebccd1e3bad4d44f5203bdbbe2733aebc62e4936e16b0de54c91fdcd61d",
         "bytes": 22922
       },
       "video": {
-        "sha256": "f2443aa63e7a9005fab5ae3d0404712c77e19d80428072fc5a0afe1ec3f219ef",
-        "bytes": 107178
+        "sha256": "8a5af55c637cbe78a997333a6213dd05db766a43aecd8916bb4a53fabc2bef56",
+        "bytes": 101917
       }
     },
     "team-mode": {
