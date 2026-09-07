@@ -248,6 +248,12 @@
       "reason": "Registers the two delegate cutover internal routes (selfhost e65da2a10) in the protocol INTERNAL_ROUTES registry; registry completeness fix caught by internalRouteRegistry.test on PR #521, no runtime behaviour change, never deployed to claudeai.chat.",
       "approvedBy": "boss 2026-09-02 指示「反合和正向都要全量搞，拉齐两边代码，然后把商业版和个人版都发布」；2026-09-03 选项 1「补真证据再同步」(PR #521)",
       "expiresAt": "2026-10-03"
+    },
+    {
+      "commit": "090702dfe6119c0f6f2958fb0492d73adc26c0dd",
+      "reason": "oc-task ticket list stdout was cut at the 64KiB pipe buffer because main() called process.exit() before the async pipe flush; adds --ndjson/--full/slim default. In-container CLI tooling only; no user-visible production incident, no turn/billing/data semantics change.",
+      "approvedBy": "user 2026-09-07 授权「a,b,c都搞,派opus5去搞,交由你全权负责」(OCV5-163 审计整改;OCV5-165)",
+      "expiresAt": "2026-10-07"
     }
   ]
 }
