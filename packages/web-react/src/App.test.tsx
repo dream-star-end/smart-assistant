@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
+import { ChatSocket } from './lib/chat/socket'
 import { ToastProvider } from './components/ui'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
 import { setAuthHint } from './lib/authHint'
@@ -153,6 +154,7 @@ afterEach(() => {
   cleanup()
   imageByteCache.clear()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   window.history.replaceState({}, '', '/')
 })
 
@@ -466,7 +468,10 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(chatLike.length).toBe(0)
   })
 
-  test('fresh conversation can create its server row and set GoalState before the first turn', async () => {
+  test.each([false, true])('goal auto-start keeps its session/model when navigation during save=%s', async (navigate) => {
+    const sendSpy = vi.spyOn(ChatSocket.prototype, 'sendMessage')
+    let releaseSave!: () => void
+    const saveGate = new Promise<void>((resolve) => { releaseSave = resolve })
     const base = routedFetch()
     const mutations: string[] = []
     const sessionBodies: Array<Record<string, unknown>> = []
@@ -490,6 +495,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       }
       if (/\/api\/session-goals\/[^/]+$/.test(u) && method === 'PUT') {
         mutations.push('goal')
+        if (navigate) await saveGate
         const sessionId = decodeURIComponent(u.slice(u.lastIndexOf('/') + 1))
         return okJson({
           goal: {
@@ -540,24 +546,25 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
       target: { value: '先设目标再执行' },
     })
-    fireEvent.click(screen.getByRole('button', { name: '开始目标' }))
+    fireEvent.click(screen.getByRole('button', { name: '设置并开始' }))
 
     await waitFor(() => expect(mutations).toContain('goal'))
     expect(mutations.indexOf('session')).toBeLessThan(mutations.indexOf('goal'))
     expect(sessionBodies[0]?.modelId).toBe('gpt-5.6-terra')
     expect(modelTrigger.textContent).toContain('GPT-5.6-Terra')
-    expect(screen.getAllByText('先设目标再执行').length).toBeGreaterThan(0)
     expect(screen.queryByText(/会话尚未创建成功/)).toBeNull()
 
-    // 已被 Goal 提前建行的空会话首发时，真实首消息标题还要 PATCH 回服务端；否则刷新会回退。
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    if (navigate) {
+      fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+      fireEvent.click(screen.getAllByRole('button', { name: /新建会话/ })[0]!)
+      await act(async () => { releaseSave() })
+    }
+    // No extra "start" message is needed; the goal itself becomes the first prompt/title.
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
-    const composer = screen.getByPlaceholderText('和「全能助手」对话…')
-    fireEvent.change(composer, { target: { value: '首条消息成为会话标题' } })
-    fireEvent.click(screen.getByRole('button', { name: '发送' }))
     await waitFor(() => expect(
-      patchBodies.some((body) => body.title === '首条消息成为会话标题'),
+      patchBodies.some((body) => body.title === '先设目标再执行'),
     ).toBe(true))
+    expect(document.querySelectorAll('[data-user-message]')).toHaveLength(1)
   })
 
   test('team mode switch persists while reopening the agent picker', async () => {

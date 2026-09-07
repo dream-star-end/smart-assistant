@@ -33,7 +33,7 @@ describe("GoalDialog", () => {
     const optional = screen.getAllByPlaceholderText("可选");
     fireEvent.change(optional[0]!, { target: { value: "1200" } });
     fireEvent.change(optional[1]!, { target: { value: "500" } });
-    fireEvent.click(screen.getByRole("button", { name: "开始目标" }));
+    fireEvent.click(screen.getByRole("button", { name: "设置并开始" }));
     await waitFor(() => expect(onSet).toHaveBeenCalledWith({
       objective: "完成迁移",
       tokenBudget: 1200,
@@ -58,4 +58,16 @@ describe("GoalDialog", () => {
     act(() => { vi.advanceTimersByTime(2_000); });
     expect(screen.getByText("累计运行：1分 7秒")).toBeTruthy();
   });
+});
+
+it("closes after success but keeps errors visible for retry", async () => {
+  const onSet = vi.fn().mockRejectedValueOnce(new Error("目标已保存，但未能启动")).mockResolvedValue(undefined);
+  const onOpenChange = vi.fn();
+  render(<GoalDialog open onOpenChange={onOpenChange} goal={goal} onSet={onSet} onAction={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  await screen.findByRole("alert");
+  expect(onOpenChange).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+  expect(onSet).toHaveBeenCalledTimes(2);
 });

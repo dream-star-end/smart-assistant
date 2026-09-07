@@ -1,3 +1,4 @@
+import { createGoalStarter } from "./lib/goalStart";
 import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   type CursorContextTier,
@@ -877,6 +878,9 @@ export function App() {
     setContextTierState(readContextTierForSession(activeId));
   }, [activeId]);
 
+  // Async goal saves can finish after navigation; only consume the selected draft's project.
+  const selectedSessionIdRef = useRef(activeId);
+  selectedSessionIdRef.current = activeId;
   const send = useCallback(
     async (
       text: string,
@@ -884,6 +888,7 @@ export function App() {
       imageEdit?: InboundMessage["content"]["imageEdit"],
       displayText?: string,
       replyTo?: MessageReplyQuote,
+      target?: { sessionId: string; projectId?: string | null },
     ) => {
       setChatError(null);
       const visibleText = displayText ?? text;
@@ -915,11 +920,15 @@ export function App() {
         return;
       }
 
-      if (!user) return;
+      if (!user || !sockRef.current) {
+        if (target) throw new Error("登录状态或会话连接不可用");
+        return;
+      }
+      const sendProjectId = target ? target.projectId : draftProjectRef.current;
       // 隐式负反馈（改写重发）：发送前用**当前会话**的现有消息判定「5min 内高相似改写」——
       // 命中即对被改写轮的末条 assistant 静默记 implicit down（空会话无历史 → 命中不了）。
       // 现场取消息（sockRef.current === chat，稳定句柄）而非捕获每帧刷新的 wsMessages。
-      {
+      if (!target) {
         const rewriteTarget = findRewriteTarget(
           sockRef.current?.getMessages(activeId) ?? [],
           visibleText,
@@ -928,7 +937,7 @@ export function App() {
         if (rewriteTarget) sendImplicitRatingRef.current?.(rewriteTarget, { reason: "改写重发" });
       }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
-      let sessionId = activeId;
+      let sessionId = target?.sessionId ?? activeId;
       let createdSession: Session | null = null;
       if (!sessionId) {
         sessionId = genWsSessionId();
@@ -939,7 +948,7 @@ export function App() {
           updatedAt: new Date().toISOString(),
           messageCount: 0,
           // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
-          ...(draftProjectRef.current ? { projectId: draftProjectRef.current } : {}),
+          ...(sendProjectId ? { projectId: sendProjectId } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
           // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
           ...(modelId ? { modelId } : {}),
@@ -954,10 +963,13 @@ export function App() {
         writeContextTier(sessionId, contextTier);
       }
       const materializedDraft =
-        !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
+        !createdSession && (
+          sessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
+          (!!target && (sockRef.current?.getMessages(sessionId).length ?? 0) === 0)
+        );
       // 项目草稿被首轮前操作（Goal / GitHub 绑定）物化成会话行的场景：归属同样在首发落定。
-      if (materializedDraft && draftProjectRef.current) {
-        const draftPid = draftProjectRef.current;
+      if (materializedDraft && sendProjectId) {
+        const draftPid = sendProjectId;
         setSessions((c) =>
           c.map((x) => (x.id === sessionId && !x.projectId ? { ...x, projectId: draftPid } : x)),
         );
@@ -1016,10 +1028,13 @@ export function App() {
       // 首发收尾：把「项目下新建」的归属落到服务端 canonical。行由 WS 受理 / 幂等 PUT 建立，
       // PATCH 可能在建行前到达（404），补一次延迟重试；仍失败则放弃——本地归属已正确，
       // 用户可手动移动，下次 listSessions server-wins 会盖回，不阻塞首发。
-      if (draftProjectRef.current && sessionId) {
-        const draftPid = draftProjectRef.current;
+      if (sendProjectId && sessionId) {
+        const draftPid = sendProjectId;
         if (createdSession || materializedDraft) {
-          draftProjectRef.current = null;
+          if (
+            draftProjectRef.current === draftPid &&
+            (!target || selectedSessionIdRef.current === sessionId)
+          ) draftProjectRef.current = null;
           const applyProject = (retries: number) => {
             api.patchSessionMeta(authRef.current, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
               if (retries > 0) window.setTimeout(() => applyProject(retries - 1), 1500);
@@ -1789,6 +1804,7 @@ export function App() {
     return () => { cancelled = true; };
   }, [demo, activeId, user?.id]);
 
+  const goalStarterRef = useRef(createGoalStarter());
   const setSessionGoal = useCallback(async (input: {
     objective: string;
     tokenBudget: number | null;
@@ -1796,16 +1812,28 @@ export function App() {
     expectedStateRevision: number;
   }) => {
     const auth = authRef.current;
-    if (!auth) return;
+    if (!auth) throw new Error("请先登录后再设置目标");
     const sessionId = activeId ?? ensureActiveSession();
-    if (!sessionId) return;
+    if (!sessionId) throw new Error("会话尚未就绪，请稍后重试");
     const sessionTitle =
       activeSess?.title ?? sessions.find((session) => session.id === sessionId)?.title ?? "新对话";
-    const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
-    if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
-    const goal = await api.setSessionGoal(auth, sessionId, input);
-    sockRef.current?.setGoalState(sessionId, goal);
-  }, [activeId, activeSess?.title, agent.id, ensureActiveSession, sessions]);
+    const projectId = draftProjectRef.current;
+    await goalStarterRef.current(sessionId, {
+      isBusy: () => !!sockRef.current?.isSending(sessionId),
+      save: async () => {
+        const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+        if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
+        return api.setSessionGoal(auth, sessionId, input);
+      },
+      apply: (goal) => sockRef.current?.setGoalState(sessionId, goal),
+      start: (goal) => {
+        if (authRef.current !== auth || !sockRef.current?.getSession(sessionId)) {
+          throw new Error("登录状态已变化或原会话已关闭");
+        }
+        return send(goal.objective, undefined, undefined, undefined, undefined, { sessionId, projectId });
+      },
+    });
+  }, [activeId, activeSess?.title, agent.id, ensureActiveSession, sessions, send]);
 
   const transitionSessionGoal = useCallback(async (
     action: "pause" | "resume" | "complete" | "clear",

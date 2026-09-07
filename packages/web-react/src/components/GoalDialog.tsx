@@ -1,6 +1,6 @@
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { Check, Pause, Play, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { groupDigits } from "../lib/utils";
 import { Badge, Button, Input, Modal } from "./ui";
 
@@ -12,7 +12,7 @@ export type GoalSetInput = {
 };
 
 export const STATUS_LABEL: Record<GoalStateSnapshot["status"], string> = {
-  active: "进行中",
+  active: "已启用",
   paused: "已暂停",
   blocked: "受阻",
   completed: "已完成",
@@ -71,6 +71,7 @@ export function GoalDialog({
   const [tokenBudget, setTokenBudget] = useState("");
   const [creditBudget, setCreditBudget] = useState("");
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [error, setError] = useState("");
   const [snapshotReceivedAt, setSnapshotReceivedAt] = useState(() => Date.now());
   const [clock, setClock] = useState(() => Date.now());
@@ -80,8 +81,9 @@ export function GoalDialog({
     setObjective(visibleGoal?.objective ?? "");
     setTokenBudget(visibleGoal?.tokenBudget == null ? "" : String(visibleGoal.tokenBudget));
     setCreditBudget(visibleGoal?.creditBudget ?? "");
-    setError("");
   }, [open, visibleGoal?.goalId, visibleGoal?.stateRevision]);
+
+  useEffect(() => { if (open) setError(""); }, [open]);
 
   useEffect(() => {
     const now = Date.now();
@@ -104,10 +106,12 @@ export function GoalDialog({
     : 0;
 
   const run = async (fn: () => Promise<void>) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError("");
     try { await fn(); } catch (err) { setError((err as Error).message || "操作失败"); }
-    finally { setBusy(false); }
+    finally { busyRef.current = false; setBusy(false); }
   };
 
   const submit = () => run(async () => {
@@ -124,6 +128,7 @@ export function GoalDialog({
       creditBudget: credit || null,
       expectedStateRevision: goal?.stateRevision ?? 0,
     });
+    onOpenChange(false);
   });
 
   return (
@@ -165,9 +170,10 @@ export function GoalDialog({
         <label className="text-caption text-muted">Token 预算<Input className="mt-1" inputMode="numeric" value={tokenBudget} onChange={(e) => setTokenBudget(e.target.value)} placeholder="可选" /></label>
         <label className="text-caption text-muted">积分预算<Input className="mt-1" inputMode="numeric" value={creditBudget} onChange={(e) => setCreditBudget(e.target.value)} placeholder="可选" /></label>
       </div>
-      {error && <p className="mt-2 text-caption text-danger">{error}</p>}
+      <p className="mt-2 text-caption text-muted">保存已启用的目标后，空闲会话会自动开始；正在执行时只更新目标。</p>
+      {error && <p role="alert" className="mt-2 text-caption text-danger">{error}</p>}
       <div className="mt-3 flex flex-wrap gap-1.5">
-        <Button size="sm" disabled={busy} onClick={submit}>{visibleGoal ? "保存" : "开始目标"}</Button>
+        <Button size="sm" disabled={busy} onClick={submit}>{visibleGoal && visibleGoal.status !== "completed" ? "保存" : "设置并开始"}</Button>
         {visibleGoal?.status === "active" && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("pause"))}><Pause size={13} />暂停</Button>}
         {(visibleGoal?.status === "paused" || visibleGoal?.status === "blocked") && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("resume"))}><Play size={13} />继续</Button>}
         {visibleGoal && !["completed", "cleared"].includes(visibleGoal.status) && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("complete"))}><Check size={13} />完成</Button>}
