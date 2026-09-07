@@ -564,7 +564,17 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     await waitFor(() => expect(
       patchBodies.some((body) => body.title === '先设目标再执行'),
     ).toBe(true))
-    expect(document.querySelectorAll('[data-user-message]')).toHaveLength(1)
+    expect(sendSpy).toHaveBeenCalledTimes(1)
+    const savedGoalUrl = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/api/session-goals/') && (init as RequestInit)?.method === 'PUT',
+    )?.[0]
+    expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessId: decodeURIComponent(String(savedGoalUrl).split('/').at(-1)!),
+      model: 'gpt-5.6-terra',
+      text: '先设目标再执行',
+    }))
+    if (!navigate) await waitFor(() => expect(screen.getAllByTestId('user-row')).toHaveLength(1))
+    else expect(screen.queryAllByTestId('user-row')).toHaveLength(0)
   })
 
   test('team mode switch persists while reopening the agent picker', async () => {

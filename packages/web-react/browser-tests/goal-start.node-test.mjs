@@ -92,7 +92,7 @@ test("full App goal save auto-start (desktop/mobile, failure, retry, busy)", { t
         assert.equal(rows.size, 1, "must send to the just-materialized session");
         assert.equal(calls.filter(([kind]) => kind === "goal").length, 1);
         assert.ok(calls.some(([kind, id, data]) => kind === "patch" && goals.has(id) && data.title === "目标自动开工验证"));
-        await more.click(); await page.getByText("设定目标", { exact: true }).click();
+        await more.click(); await page.getByRole("menuitem", { name: /目标/ }).click();
         await objective.fill("更新目标但不重复开工");
         await page.getByRole("button", { name: "保存", exact: true }).click();
         await page.getByRole("dialog").waitFor({ state: "hidden" });
