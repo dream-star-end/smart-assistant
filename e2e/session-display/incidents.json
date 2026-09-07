@@ -3134,7 +3134,7 @@
       "occurredAt": "2026-09-07",
       "severity": "P1",
       "symptom": "V5 selfhost 会话里子任务卡与 AskUserQuestion 问答卡渲染在所属用户消息之前（截图会话 webmtqnrb61nes60h：第一条 user=_orderSeq=1，Agent「审读回到底部按钮与几何影响」属后续 m-recover 轮）。根因：stableSortByTs 对无 _orderSeq 的本地过程卡从 anchor=0 起排且不看 _turnOwnerId；repairPostFinalProcessOrder 只把终答之后的过程卡拉回终答前，不修「早于所属 user」；sinkOpenPermissionPrompts 按数组 user 边界冲刷，会把前置孤卡留在第一个 user 前。坏序一旦进缓存，full/incremental/restore 都不自愈。 冷启动原点已红绿复现：正确内存中的 user 被标 _timelineRecord，toStored 剥离 user 但保留本地卡；loadStored 后 full merge 从 carry=0 开始，把卡放到 user 前。最终修复还覆盖明确 owner 缺页不挪位、晚到问答不丢行。",
-      "rootFixCommit": "072b2d6fe",
+      "rootFixCommit": "072b2d6f",
       "regressions": [
         {
           "layer": "unit",
