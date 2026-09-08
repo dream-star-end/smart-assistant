@@ -205,9 +205,11 @@ import {
   type WechatBinding,
 } from "@openclaude/storage";
 import {
+  canonicalAgentGroupFingerprint,
   computeGoalTokensUsed,
   isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
+  parseLosslessTurnPayload,
   type LosslessTurnRecord,
   type LosslessTurnPayload,
 } from "../http/losslessTurnTape.js";
@@ -3497,6 +3499,168 @@ function userVisiblePhysicalPayload(
   };
 }
 
+export type LateDelegateRootDecision = "proceed" | "idempotent" | "retry";
+
+function retryableTapeError(message: string, cause?: unknown): Error {
+  return Object.assign(new Error(message), { retryable: true, cause });
+}
+
+function lateDelegateRootConflict(): Error {
+  return Object.assign(new Error("lossless turn tape late-delegate root conflict"), {
+    immutableConflict: true,
+  });
+}
+
+async function loadAssembledTapePayload(
+  pool: Pool | PoolClient,
+  userId: string,
+  sessionId: string,
+  tapeId: string,
+  expected: { totalBytes: number; tapeSha256: string; partCount: number },
+): Promise<{ raw: unknown } | "incomplete"> {
+  const parts = (
+    await pool.query<{ part_index: number; part_sha256: string; payload: Buffer }>(
+      `SELECT part_index, part_sha256, payload
+         FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        ORDER BY part_index`,
+      [sessionId, userId, tapeId],
+    )
+  ).rows;
+  if (parts.length !== expected.partCount) return "incomplete";
+  const canonical = Buffer.allocUnsafe(expected.totalBytes);
+  const aggregate = createHash("sha256");
+  let writeOffset = 0;
+  for (let partIndex = 0; partIndex < expected.partCount; partIndex++) {
+    const part = parts[partIndex];
+    if (!part || part.part_index !== partIndex) return "incomplete";
+    const bytes = Buffer.from(part.payload);
+    if (sha256Bytes(bytes) !== part.part_sha256) {
+      throw new Error("lossless turn tape part hash mismatch");
+    }
+    if (writeOffset + bytes.length > canonical.length) {
+      throw new Error("lossless turn tape aggregate length mismatch");
+    }
+    bytes.copy(canonical, writeOffset);
+    aggregate.update(bytes);
+    writeOffset += bytes.length;
+  }
+  if (writeOffset !== expected.totalBytes || aggregate.digest("hex") !== expected.tapeSha256) {
+    throw new Error("lossless turn tape aggregate hash mismatch");
+  }
+  try {
+    return { raw: JSON.parse(canonical.toString("utf8")) };
+  } catch (err) {
+    throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
+  }
+}
+
+/** Master-side R1-4: agent-group continuation vs the owner root tape's parts/records. */
+export async function inspectLateDelegateContinuationAgainstRoot(
+  pool: Pool | PoolClient,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+  continuationPayload?: LosslessTurnPayload,
+): Promise<LateDelegateRootDecision> {
+  let payload = continuationPayload;
+  if (!payload) {
+    let assembled: { raw: unknown } | "incomplete";
+    try {
+      assembled = await loadAssembledTapePayload(
+        pool,
+        userId,
+        request.sessionId,
+        request.tapeId,
+        {
+          totalBytes: request.totalBytes,
+          tapeSha256: request.tapeSha256,
+          partCount: request.partCount,
+        },
+      );
+    } catch (err) {
+      if (err && typeof err === "object" && (err as { immutableConflict?: unknown }).immutableConflict === true) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/part hash mismatch|aggregate (?:hash|length) mismatch|canonical JSON invalid/.test(msg)) {
+        throw err;
+      }
+      throw retryableTapeError("late-delegate root lookup failed", err);
+    }
+    if (assembled === "incomplete") return "retry";
+    payload = parseLosslessTurnPayload(assembled.raw);
+  }
+  const ownerTurnKey = payload.continuationOfTurnKey;
+  const groups = payload.agentGroups;
+  if (!ownerTurnKey || !Array.isArray(groups) || groups.length === 0) return "proceed";
+
+  let roots: Array<{
+    tape_id: string;
+    tape_sha256: string;
+    total_bytes: string;
+    part_count: number;
+    finalized_at: string | null;
+    visible_at: string | null;
+  }>;
+  try {
+    roots = (
+      await pool.query<{
+        tape_id: string;
+        tape_sha256: string;
+        total_bytes: string;
+        part_count: number;
+        finalized_at: string | null;
+        visible_at: string | null;
+      }>(
+        `SELECT t.tape_id, t.tape_sha256, t.total_bytes::text AS total_bytes, t.part_count,
+                t.finalized_at::text, t.visible_at::text
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.turn_key=$3
+            AND t.continuation_of_turn_key IS NULL
+          LIMIT 2`,
+        [request.sessionId, userId, ownerTurnKey],
+      )
+    ).rows;
+  } catch (err) {
+    throw retryableTapeError("late-delegate root lookup failed", err);
+  }
+  if (roots.length !== 1) return "retry";
+  const root = roots[0]!;
+  const totalBytes = bigIntNum(root.total_bytes, "root turn tape total_bytes");
+  let assembledRoot: { raw: unknown } | "incomplete";
+  try {
+    assembledRoot = await loadAssembledTapePayload(pool, userId, request.sessionId, root.tape_id, {
+      totalBytes,
+      tapeSha256: root.tape_sha256,
+      partCount: root.part_count,
+    });
+  } catch (err) {
+    throw retryableTapeError("late-delegate root lookup failed", err);
+  }
+  if (assembledRoot === "incomplete") return "retry";
+  let rootPayload: LosslessTurnPayload;
+  try {
+    rootPayload = parseLosslessTurnPayload(assembledRoot.raw);
+  } catch {
+    return "retry";
+  }
+  const rootGroups = rootPayload.agentGroups ?? [];
+  let matched = 0;
+  for (const group of groups) {
+    const runId = typeof group.runId === "string" ? group.runId : "";
+    if (!runId) return "retry";
+    const existing = rootGroups.find((item) => item.runId === runId);
+    if (!existing) continue;
+    const lateFp = canonicalAgentGroupFingerprint(group as Record<string, unknown>);
+    const rootFp = canonicalAgentGroupFingerprint(existing as Record<string, unknown>);
+    if (lateFp !== rootFp) throw lateDelegateRootConflict();
+    matched += 1;
+  }
+  if (matched === groups.length) return "idempotent";
+  if (matched > 0) throw lateDelegateRootConflict();
+  return "proceed";
+}
+
 export async function _prepareLosslessTurnTapeOutsideLocks(
   pool: Pool,
   userId: string,
@@ -3558,6 +3722,18 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
+  const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
+    pool,
+    userId,
+    request,
+    turn.payload,
+  );
+  if (lateDelegateRoot === "retry") return null;
+  if (lateDelegateRoot === "idempotent") {
+    throw Object.assign(new Error("late-delegate continuation already on root"), {
+      lateDelegateRootIdempotent: true,
+    });
+  }
   // Record payload BYTEA + content_sha256 stay the part-derived original.
   // visible_payload is also BYTEA and stays exact (timeline must round-trip
   // JSON \u0000). PostgreSQL jsonb rejects \u0000 / unpaired surrogates;
@@ -9140,6 +9316,17 @@ export function createPgSessionsBackend(
         userId,
         request,
       );
+      if (readyForPreparation) {
+        const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
+          pool,
+          userId,
+          request,
+        );
+        if (lateDelegateRoot === "retry") return { applied: "incomplete" };
+        if (lateDelegateRoot === "idempotent") {
+          return { applied: "idempotent", recordCount: 0, engineBillings: [] };
+        }
+      }
       let phaseA: LosslessTurnTapeFinalizeResult | null = null;
       if (readyForPreparation) {
         // HTTP action:finalize (materialize:false) is the job's creation point.
@@ -9189,6 +9376,9 @@ export function createPgSessionsBackend(
         } catch (err) {
           releaseFinalizeAdmission?.();
           releaseFinalizeAdmission = null;
+          if (err && typeof err === "object" && (err as { lateDelegateRootIdempotent?: unknown }).lateDelegateRootIdempotent === true) {
+            return { applied: "idempotent", recordCount: 0, engineBillings: [] };
+          }
           if (phaseA && phaseA.applied === "finalized" && isTransientTapeError(err)) {
             return { ...phaseA, settlementHandoff: true };
           }
