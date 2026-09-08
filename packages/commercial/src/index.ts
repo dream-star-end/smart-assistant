@@ -44,6 +44,11 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
+import {
+  cursorExternalApiOutboxDirForFlavor,
+  openCursorExternalApiOutbox,
+  type CursorExternalApiOutbox,
+} from "./billing/cursorExternalApiOutbox.js";
 import { closePool, createPool, getPool } from "./db/index.js";
 import {
   assertModelCatalogAdminPoolConfigured,
@@ -1217,7 +1222,11 @@ export async function registerCommercial(
   // 步骤 5 兼容地板(方案 §7 步 5,R3-B4):cutover marker 置位后禁止在 flag 关闭态下起。
   // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
   assertModelAuthorityCutoverFloor();
-  assertFlavorIdentity();
+  const flavorIdentity = assertFlavorIdentity();
+  const cursorExternalOutboxDir =
+    flavorIdentity.status === "ok"
+      ? cursorExternalApiOutboxDirForFlavor(flavorIdentity.flavor)
+      : null;
 
   const cfg = loadConfig();
 
@@ -3157,6 +3166,7 @@ export async function registerCommercial(
   // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
   // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
   let cursorExternalRoute: CursorExternalRoute | undefined;
+  let cursorExternalOutbox: CursorExternalApiOutbox | undefined;
   if (!options.skipInternalProxy) {
     try {
       const apiKeyRepo = makePgApiKeyRepo(getPool());
@@ -3195,11 +3205,36 @@ export async function registerCommercial(
       const platformContextLoader = makePlatformContextLoader({
         reader: makeDefaultVolumeContextReader(),
       });
-      cursorExternalRoute = makeCursorExternalRoute({
-        pgPool: getPool(),
-        pricing,
-        logger: rootLogger.child({ subsys: "cursorExternal" }),
-      });
+      if (cursorExternalOutboxDir) {
+        try {
+          cursorExternalOutbox = await openCursorExternalApiOutbox({
+            directory: cursorExternalOutboxDir,
+            logger: rootLogger.child({ subsys: "cursorExternalOutbox" }),
+          });
+          cursorExternalRoute = makeCursorExternalRoute({
+            pgPool: getPool(),
+            pricing,
+            logger: rootLogger.child({ subsys: "cursorExternal" }),
+            outbox: cursorExternalOutbox,
+          });
+        } catch (err) {
+          // Directory failure closes only the Cursor engine channel.
+          // eslint-disable-next-line no-console
+          console.error(
+            "[commercial] cursor external API outbox failed; cursor engine models unavailable on api-key proxy:",
+            err,
+          );
+          cursorExternalOutbox = undefined;
+          const staleCursor = cursorExternalRoute;
+          cursorExternalRoute = undefined;
+          void staleCursor?.close().catch(() => undefined);
+        }
+      } else {
+        // eslint-disable-next-line no-console
+        console.log(
+          "[commercial] cursor external API outbox not configured; cursor engine models unavailable on api-key proxy",
+        );
+      }
       externalApiKeyProxy = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
@@ -4232,6 +4267,27 @@ export async function registerCommercial(
   // 交给 lease(v5)/ controlPlaneEnabled(legacy)统一触发。trackScheduler 留在 start 闭包内
   // (注册进 schedulerRegistry + 满足 scheduler-wiring lint);drain 时 bundle 经 onMemberStopped 摘除。
   // orphanReconcile 曾以 v5-owned `||v5` 双跑(错峰缓解),P3 归入 leader 单跑=正解(消错峰假设)。
+  if (cursorExternalOutbox) {
+    const outbox = cursorExternalOutbox;
+    leaderBundle.add({
+      name: "cursorExternalApiOutbox",
+      domain: "v5-owned",
+      required: false,
+      start: () => {
+        const h = trackScheduler(
+          "cursorExternalApiOutbox",
+          "v5-owned",
+          outbox.startScanner({
+            pool: getPool(),
+            pricing,
+            logger: rootLogger.child({ subsys: "cursorExternalApiOutbox" }),
+          }),
+        );
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
   if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
     const deps = v3Deps;
     leaderBundle.add({
