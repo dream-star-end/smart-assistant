@@ -5,40 +5,61 @@
  *   npx tsx scripts/ops/business-health.ts
  *   npx tsx scripts/ops/business-health.ts --timeout-ms 5000 --limit 50000
  *
- * Uses DATABASE_URL / COMMERCIAL_DATABASE_URL. Read-only (default_transaction_read_only).
+ * Uses DATABASE_URL / COMMERCIAL_DATABASE_URL. Read-only (BEGIN READ ONLY).
  * Timeouts are reported as unknown, never as 0. Does not write, prune, settle, or deploy.
+ * process.exitCode is set only after pool.end so a bounded run cannot skip cleanup.
  */
+import { pathToFileURL } from "node:url";
 import pg from "pg";
 import { collectBusinessHealthSnapshot } from "../../packages/commercial/src/admin/businessHealth.ts";
 
-function arg(name: string): string | undefined {
-  const idx = process.argv.indexOf(name);
+function argFrom(argv: string[], name: string): string | undefined {
+  const idx = argv.indexOf(name);
   if (idx < 0) return undefined;
-  return process.argv[idx + 1];
+  return argv[idx + 1];
 }
 
-async function main(): Promise<void> {
-  const url = process.env.COMMERCIAL_DATABASE_URL ?? process.env.DATABASE_URL;
+export async function runBusinessHealthCli(
+  argv: string[] = process.argv,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<number> {
+  const url = (env.COMMERCIAL_DATABASE_URL || env.DATABASE_URL || "").trim();
   if (!url) {
     console.error("COMMERCIAL_DATABASE_URL or DATABASE_URL required");
-    process.exit(2);
+    return 2;
   }
-  const timeoutMs = Number(arg("--timeout-ms") ?? "5000");
-  const limit = Number(arg("--limit") ?? "50000");
+  const timeoutMs = Number(argFrom(argv, "--timeout-ms") ?? "5000");
+  const limit = Number(argFrom(argv, "--limit") ?? "50000");
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
     console.error("--timeout-ms must be a positive number");
-    process.exit(2);
+    return 2;
   }
   if (!Number.isFinite(limit) || limit < 1) {
     console.error("--limit must be a positive number");
-    process.exit(2);
+    return 2;
   }
-  const pool = new pg.Pool({ connectionString: url, max: 2 });
+  const boundedMs = Math.floor(timeoutMs);
+  const pool = new pg.Pool({
+    connectionString: url,
+    max: 2,
+    connectionTimeoutMillis: boundedMs,
+    idleTimeoutMillis: Math.max(1000, boundedMs),
+    allowExitOnIdle: true,
+  });
+  let exitCode = 1;
   try {
-    const snapshot = await collectBusinessHealthSnapshot(pool, {
-      statementTimeoutMs: Math.floor(timeoutMs),
-      streamLimit: Math.floor(limit),
-    });
+    const snapshot = await Promise.race([
+      collectBusinessHealthSnapshot(pool, {
+        statementTimeoutMs: boundedMs,
+        streamLimit: Math.floor(limit),
+      }),
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error("business-health CLI deadline exceeded")),
+          boundedMs + 100,
+        );
+      }),
+    ]);
     console.log(JSON.stringify(snapshot, null, 2));
     const unknown =
       snapshot.tapeMaterialization.unknown ||
@@ -46,13 +67,37 @@ async function main(): Promise<void> {
       snapshot.cursorAuditSuccessWithoutUsage.unknown ||
       snapshot.liveFrames.unknown ||
       snapshot.retentionUnknown;
-    process.exit(unknown ? 4 : 0);
+    exitCode = unknown ? 4 : 0;
+  } catch (err) {
+    console.error(err);
+    exitCode = 1;
   } finally {
-    await pool.end();
+    try {
+      await Promise.race([
+        pool.end(),
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, Math.max(250, boundedMs));
+        }),
+      ]);
+    } catch {
+      /* ignore */
+    }
   }
+  return exitCode;
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const invokedDirectly =
+  typeof process.argv[1] === "string" && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  void runBusinessHealthCli().then(
+    (code) => {
+      process.exitCode = code;
+      process.exit(code);
+    },
+    (err) => {
+      console.error(err);
+      process.exitCode = 1;
+      process.exit(1);
+    },
+  );
+}

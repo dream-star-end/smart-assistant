@@ -5,7 +5,8 @@
  * write lines; this module only SELECTs. Hot 60s ticks must not call these
  * functions — use the on-demand CLI (I3) with statement_timeout + limit.
  */
-import type { Pool, PoolClient } from "pg";
+import type { Pool } from "pg";
+import { isBoundedReadTimeout, withBoundedReadOnly } from "./boundedReadOnly.js";
 
 const DEFAULT_RETIRE_MIN_AGE_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -41,38 +42,8 @@ export type LiveFrameRestoreDryRun = {
   uniqueCopySample: Array<{ streamKey: string; restore: "replay_live" }>;
 };
 
-function isTimeout(err: unknown): boolean {
-  const e = err as { code?: string; message?: string };
-  return e.code === "57014" || /statement timeout/i.test(e.message ?? "");
-}
-
 function emptyCounts(): LiveJournalClassCounts {
   return { streams: 0, frames: 0, bytes: 0, oldestUpdatedAt: null };
-}
-
-async function withReadTimeout<T>(
-  pool: Pool,
-  timeoutMs: number,
-  fn: (client: PoolClient) => Promise<T>,
-): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL default_transaction_read_only = on");
-    await client.query(`SET LOCAL statement_timeout = ${Math.max(1, Math.floor(timeoutMs))}`);
-    const result = await fn(client);
-    await client.query("COMMIT");
-    return result;
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  } finally {
-    client.release();
-  }
 }
 
 function rowToCounts(row: {
@@ -102,7 +73,7 @@ export async function classifyRetiredLiveJournals(
   const streamLimit = Math.max(1, Math.min(options?.streamLimit ?? DEFAULT_STREAM_LIMIT, 500_000));
   const retireMinAgeMs = options?.retireMinAgeMs ?? DEFAULT_RETIRE_MIN_AGE_MS;
   try {
-    return await withReadTimeout(pool, timeoutMs, async (client) => {
+    return await withBoundedReadOnly(pool, timeoutMs, async (client) => {
       const bounded = await client.query<{ scanned: string | number }>(
         `SELECT COUNT(*)::bigint AS scanned FROM (
            SELECT 1 FROM client_session_live_streams
@@ -189,7 +160,7 @@ export async function classifyRetiredLiveJournals(
   } catch (err) {
     return {
       unknown: true,
-      reason: isTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
+      reason: isBoundedReadTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
       inflight: null,
       tapeRecoverable: null,
       uniqueCopy: null,
@@ -208,7 +179,7 @@ export async function dryRunLiveFrameRestore(
     return { unknown: false, tapeRecoverableSample: [], uniqueCopySample: [] };
   }
   try {
-    return await withReadTimeout(pool, timeoutMs, async (client) => {
+    return await withBoundedReadOnly(pool, timeoutMs, async (client) => {
       const recoverable = await client.query<{ stream_key: string; tape_id: string; reachable: boolean }>(
         `SELECT s.stream_key, s.tape_id::text AS tape_id,
                 EXISTS (
@@ -261,7 +232,7 @@ export async function dryRunLiveFrameRestore(
   } catch (err) {
     return {
       unknown: true,
-      reason: isTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
+      reason: isBoundedReadTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
       tapeRecoverableSample: [],
       uniqueCopySample: [],
     };

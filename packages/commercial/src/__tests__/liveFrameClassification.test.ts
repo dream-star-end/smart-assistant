@@ -47,7 +47,7 @@ describe("live frame classification (OCV5-180 C2)", () => {
     const pool = makePool(async (sql) => {
       sqls.push(sql);
       const trimmed = sql.trim();
-      if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
+      if (/^BEGIN\b/i.test(trimmed) || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
       if (trimmed.startsWith("SET LOCAL")) return { rows: [] };
       if (trimmed.includes("SELECT COUNT(*)::bigint AS scanned")) {
         return { rows: [{ scanned: "3" }] };
@@ -96,7 +96,7 @@ describe("live frame classification (OCV5-180 C2)", () => {
 
   test("timeout returns unknown with null counts, never fake 0", async () => {
     const pool = makePool(async (sql) => {
-      if (sql.trim() === "BEGIN" || sql.trim().startsWith("SET LOCAL")) return { rows: [] };
+      if (/^BEGIN\b/i.test(sql.trim()) || sql.trim().startsWith("SET LOCAL")) return { rows: [] };
       if (sql.trim() === "ROLLBACK") return { rows: [] };
       throw timeoutErr();
     });
@@ -114,7 +114,7 @@ describe("live frame classification (OCV5-180 C2)", () => {
     const pool = makePool(async (sql) => {
       sqls.push(sql);
       const trimmed = sql.trim();
-      if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
+      if (/^BEGIN\b/i.test(trimmed) || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
       if (trimmed.startsWith("SET LOCAL")) return { rows: [] };
       if (trimmed.includes("AS reachable")) {
         return { rows: [{ stream_key: "s-b", tape_id: "tape-1", reachable: true }] };
@@ -141,22 +141,36 @@ describe("retention ledger + business health (OCV5-180 C4/I3)", () => {
   });
 
   test("live coverage reports unregistered names; timeout/error is unknown not empty-green", async () => {
-    const ok = await auditLiveRetentionCoverage({
-      query: async () => ({
-        rows: [
-          { table_name: "model_pricing_0903_cw_backup" },
-          { table_name: "handmade_orphan" },
-        ],
+    const ok = await auditLiveRetentionCoverage(
+      makePool(async (sql) => {
+        const trimmed = sql.trim();
+        if (/^BEGIN\b/i.test(trimmed) || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
+        if (trimmed.startsWith("SET LOCAL")) return { rows: [] };
+        if (trimmed.includes("information_schema.tables")) {
+          return {
+            rows: [
+              { table_name: "model_pricing_0903_cw_backup" },
+              { table_name: "handmade_orphan" },
+            ],
+          };
+        }
+        throw new Error(`unhandled SQL: ${trimmed.slice(0, 80)}`);
       }),
-    });
+      { statementTimeoutMs: 200 },
+    );
     assert.equal(ok.unknown, false);
     assert.deepEqual(ok.unregistered, ["handmade_orphan"]);
 
-    const failed = await auditLiveRetentionCoverage({
-      query: async () => {
+    const failed = await auditLiveRetentionCoverage(
+      makePool(async (sql) => {
+        const trimmed = sql.trim();
+        if (/^BEGIN\b/i.test(trimmed) || trimmed.startsWith("SET LOCAL") || trimmed === "ROLLBACK") {
+          return { rows: [] };
+        }
         throw timeoutErr();
-      },
-    });
+      }),
+      { statementTimeoutMs: 200 },
+    );
     assert.equal(failed.unknown, true);
     assert.equal(failed.unregistered, null);
   });
@@ -164,7 +178,7 @@ describe("retention ledger + business health (OCV5-180 C4/I3)", () => {
   test("business health snapshot has no ok field and preserves unknown", async () => {
     const pool = makePool(async (sql) => {
       const trimmed = sql.trim();
-      if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
+      if (/^BEGIN\b/i.test(trimmed) || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };
       if (trimmed.startsWith("SET LOCAL")) return { rows: [] };
       if (trimmed.includes("turn_tape_materialization_jobs")) {
         throw timeoutErr();

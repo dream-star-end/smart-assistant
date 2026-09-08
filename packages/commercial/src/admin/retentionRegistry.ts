@@ -24,6 +24,11 @@ import {
   PERMANENT_AUDIT_TABLES,
   PERMANENT_OPS_LEDGER_TABLES,
 } from "./auditRetention.js";
+import {
+  isBoundedReadTimeout,
+  withBoundedReadOnly,
+  type BoundedReadPool,
+} from "../db/boundedReadOnly.js";
 
 export type RetentionDisposition =
   | { kind: "ttl" }
@@ -301,25 +306,28 @@ export const RETENTION_REGISTRY: Readonly<Record<string, RetentionDisposition>> 
  * returns []. Timeouts/errors must not be reported as an empty (green) set.
  */
 export async function auditLiveRetentionCoverage(
-  pool: { query: (sql: string) => Promise<{ rows: Array<{ table_name: string }> }> },
+  pool: BoundedReadPool,
+  options?: { statementTimeoutMs?: number },
 ): Promise<{ unregistered: string[] | null; unknown: boolean; reason?: string }> {
   try {
-    const live = await pool.query(
-      `SELECT table_name
-         FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
-    );
-    const registered = new Set(Object.keys(RETENTION_REGISTRY));
-    const unregistered = live.rows
-      .map((row) => row.table_name)
-      .filter((name) => !registered.has(name))
-      .sort();
-    return { unregistered, unknown: false };
+    return await withBoundedReadOnly(pool, options?.statementTimeoutMs ?? 5_000, async (client) => {
+      const live = await client.query<{ table_name: string }>(
+        `SELECT table_name
+           FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
+      );
+      const registered = new Set(Object.keys(RETENTION_REGISTRY));
+      const unregistered = live.rows
+        .map((row) => row.table_name)
+        .filter((name) => !registered.has(name))
+        .sort();
+      return { unregistered, unknown: false as const };
+    });
   } catch (err) {
     return {
       unregistered: null,
       unknown: true,
-      reason: (err as Error)?.message ?? String(err),
+      reason: isBoundedReadTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
     };
   }
 }

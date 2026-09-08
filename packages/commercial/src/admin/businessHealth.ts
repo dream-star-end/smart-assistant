@@ -12,6 +12,7 @@ import {
   classifyRetiredLiveJournals,
   type LiveJournalClassification,
 } from "../db/liveFrameClassification.js";
+import { isBoundedReadTimeout, withBoundedReadOnly } from "../db/boundedReadOnly.js";
 
 export type BoundedCount =
   | { unknown: false; count: number; oldestAgeMs: number | null }
@@ -30,41 +31,30 @@ export interface BusinessHealthSnapshot {
   backupFreshness: "not_in_scope";
 }
 
-function isTimeout(err: unknown): boolean {
-  const e = err as { code?: string; message?: string };
-  return e.code === "57014" || /statement timeout/i.test(e.message ?? "");
-}
-
 async function boundedCount(
   pool: Pool,
   timeoutMs: number,
   sql: string,
 ): Promise<BoundedCount> {
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL default_transaction_read_only = on");
-    await client.query(`SET LOCAL statement_timeout = ${Math.max(1, Math.floor(timeoutMs))}`);
-    const result = await client.query<{ count: string | number; oldest: string | null }>(sql);
-    await client.query("COMMIT");
-    const count = Number(result.rows[0]?.count ?? 0);
-    const oldest = result.rows[0]?.oldest;
-    const oldestAgeMs = oldest ? Math.max(0, Date.now() - Date.parse(oldest)) : null;
-    return { unknown: false, count, oldestAgeMs: Number.isFinite(oldestAgeMs) ? oldestAgeMs : null };
+    return await withBoundedReadOnly(pool, timeoutMs, async (client) => {
+      const result = await client.query<{ count: string | number; oldest: string | null }>(sql);
+      const count = Number(result.rows[0]?.count ?? 0);
+      const oldest = result.rows[0]?.oldest;
+      const oldestAgeMs = oldest ? Math.max(0, Date.now() - Date.parse(oldest)) : null;
+      return {
+        unknown: false as const,
+        count,
+        oldestAgeMs: Number.isFinite(oldestAgeMs) ? oldestAgeMs : null,
+      };
+    });
   } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      /* ignore */
-    }
     return {
       unknown: true,
       count: null,
       oldestAgeMs: null,
-      reason: isTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
+      reason: isBoundedReadTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
     };
-  } finally {
-    client.release();
   }
 }
 
@@ -102,7 +92,7 @@ export async function collectBusinessHealthSnapshot(
             )`,
       ),
       classifyRetiredLiveJournals(pool, { statementTimeoutMs: timeoutMs, streamLimit: limit }),
-      auditLiveRetentionCoverage(pool),
+      auditLiveRetentionCoverage(pool, { statementTimeoutMs: timeoutMs }),
     ]);
   return {
     collectedAt: new Date().toISOString(),
