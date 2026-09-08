@@ -3354,12 +3354,13 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerIdleTimeout.test.ts",
           "assertion": "明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/human-wait-resume.node-test.mjs",
+          "assertion": "Human wait: real PermissionCard click resumes the CCB adapter after twenty minutes"
         }
-      ],
-      "proofPending": {
-        "reason": "已以CCB和Codex真实适配器/fake子进程+确定性长等待时钟证明红绿回归，相关单包526测通过；未改UI。本次尚未执行真实浏览器/模型的长等待后作答旅程，不能把unit或容器源码版本核验冒称live-e2e。待selfhost运行时部署后补真实旅程证据。",
-        "since": "2026-09-08"
-      }
+      ]
     }
   ]
 }
