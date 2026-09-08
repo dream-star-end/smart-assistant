@@ -107,3 +107,27 @@ test('sync paused after config read cannot roll back a concurrent successful loc
     else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken
   }
 })
+
+
+test('local persona pointer cannot create an alternate write entry for a managed file', async () => {
+  const managedPath = paths.agentClaudeMd('managed')
+  assert.equal((await invoke('handleAgentItem', 'PUT', 'main', { persona: managedPath })).status, 409)
+  assert.equal((await readAgentsConfig()).agents.find(a => a.id === 'main')?.persona, undefined)
+  assert.equal(await readFile(managedPath, 'utf8'), 'authority persona')
+})
+
+test('already overlapping persona configuration is refused, including normalized and symlink targets', async () => {
+  const { symlink } = await import('node:fs/promises')
+  const managedPath = paths.agentClaudeMd('managed')
+  const link = join(home, 'managed-alias.md')
+  await symlink(managedPath, link)
+  try {
+    for (const target of [managedPath, join(paths.agentDir('managed'), '..', 'managed', 'CLAUDE.md'), link]) {
+      const cfg = await readAgentsConfig()
+      cfg.agents.find(a => a.id === 'main')!.persona = target
+      await writeAgentsConfig(cfg)
+      assert.equal((await invoke('handlePersona', 'PUT', 'main', { text: 'LOCAL-OVERWRITE' })).status, 409)
+      assert.equal(await readFile(managedPath, 'utf8'), 'authority persona')
+    }
+  } finally { await rm(link, { force: true }) }
+})

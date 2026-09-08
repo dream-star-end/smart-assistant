@@ -167,6 +167,7 @@ import {
   recordMemoryUsageEvent,
   syncMarketplaceHub,
   updateAgentsConfig,
+  isMarketplacePersonaTarget,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -8606,7 +8607,7 @@ export class Gateway {
     }
     if (req.method === 'PUT' || req.method === 'DELETE') {
       const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
-      const { config: cfg, result } = await updateAgentsConfig((cfg) => {
+      const { config: cfg, result } = await updateAgentsConfig(async (cfg) => {
         const idx = cfg.agents.findIndex((a) => a.id === id)
         if (idx < 0) return { status: 404, body: { error: 'agent not found' } }
         const agent = cfg.agents[idx]
@@ -8619,6 +8620,9 @@ export class Gateway {
           if (cfg.default === id) return { status: 400, body: { error: 'cannot delete default agent' } }
           cfg.agents.splice(idx, 1)
           return { status: 200, body: { ok: true } }
+        }
+        if (body.persona !== undefined && await isMarketplacePersonaTarget(cfg, body.persona)) {
+          return { status: 409, body: { error: '人格文件由 AI 市场管理，不能作为本地编辑目标。', code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace' } }
         }
         if (body.model !== undefined) agent.model = body.model
         if (body.persona !== undefined) agent.persona = body.persona
@@ -8673,6 +8677,9 @@ export class Gateway {
           code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
         } }
         const currentPath = currentAgent.persona ?? paths.agentClaudeMd(id)
+        if (await isMarketplacePersonaTarget(current, currentPath)) {
+          return { status: 409, body: { error: '人格文件由 AI 市场管理，请在市场源端修改。', code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace' } }
+        }
         await mkdir(dirname(currentPath), { recursive: true })
         await writeFile(currentPath, text, { mode: 0o600 })
         return { status: 200, body: { ok: true, path: currentPath } }

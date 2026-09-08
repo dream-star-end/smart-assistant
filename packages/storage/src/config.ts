@@ -1,5 +1,5 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { paths } from './paths.js'
 import { acquireKernelFileLock } from './kernelFileLock.js'
@@ -237,4 +237,28 @@ async function writeAgentsConfigUnlocked(cfg: AgentsConfig): Promise<void> {
   } finally {
     await rm(tmp, { force: true })
   }
+}
+
+
+/** Called inside updateAgentsConfig: ownership follows the FILE, not just its API id. */
+export async function isMarketplacePersonaTarget(cfg: AgentsConfig, target: string): Promise<boolean> {
+  async function identity(file: string) {
+    const absolute = resolve(file)
+    try {
+      const canonical = await realpath(absolute)
+      const info = await stat(canonical)
+      return { absolute, canonical, dev: info.dev, ino: info.ino }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      return { absolute, canonical: absolute, dev: undefined, ino: undefined }
+    }
+  }
+  const requested = await identity(target)
+  for (const agent of cfg.agents) {
+    if (agent.source !== 'marketplace') continue
+    const owned = await identity(agent.persona ?? paths.agentClaudeMd(agent.id))
+    if (requested.absolute === owned.absolute || requested.canonical === owned.canonical ||
+      (requested.ino !== undefined && requested.ino === owned.ino && requested.dev === owned.dev)) return true
+  }
+  return false
 }
