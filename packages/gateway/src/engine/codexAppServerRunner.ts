@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 // Test-only override of the spawn used to launch `codex app-server`. See
 // codexRunner.ts `__setCodexSpawnForTests` for rationale; same pattern here.
@@ -246,6 +247,7 @@ export interface CodexAppServerRunnerOpts {
   model?: string
   // ── Platform context injection (parity with SubprocessRunner / CodexRunner) ──
   /** Path to agent's persona file (CLAUDE.md / SOUL.md). */
+  identityCompat?: IdentityCompatRuntimeContext
   persona?: string
   /** Effective provider for `buildPromptContext` provider-keyed slot logic. */
   agentProvider?: string
@@ -1715,6 +1717,7 @@ export class CodexAppServerRunner extends EventEmitter {
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
+        identityCompat: this.opts.identityCompat,
         provider: this.opts.agentProvider,
         model: this.opts.model,
         effortLevel: this.effortLevel,
@@ -2184,6 +2187,8 @@ export class CodexAppServerRunner extends EventEmitter {
       // mcp_servers.X.env 显式注入 agent-id 才没这问题;CLI 走 ambient env 需本行补齐。
       env: {
         ...buildCodexEnv(),
+        ...identityCompatEnvironment(this.opts.identityCompat),
+        OPENCLAUDE_AGENT_ID: this.opts.agentId,
         ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
           gatewayPort: this.opts.config?.gateway.port,
           contextFile: this.cachedOverrides?.delegateContextFile,

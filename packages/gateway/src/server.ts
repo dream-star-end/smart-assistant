@@ -1,3 +1,5 @@
+import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
+import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import {
   constants as fsConstants,
@@ -1936,6 +1938,7 @@ type DelegateGateBlock =
  *  review pass 直接构造)。把委派执行核心与 HTTP req/res 解耦,让编排能内部直调同一路径
  *  拿到结构化结果(verdict/output),不必伪造 req/res。 */
 interface RunDelegateInput {
+  allowSelf?: boolean
   targetAgentId: string
   goal: string
   context?: string
@@ -8537,6 +8540,7 @@ export class Gateway {
         agents: view.agents,
         default: view.default,
         routes: view.routes,
+        identityCompat: await fetchIdentityCompatProjection(),
       })
       return
     }
@@ -8553,6 +8557,10 @@ export class Gateway {
         return
       }
       const id = body.id
+      const identityProjection = await fetchIdentityCompatProjection()
+      if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id || profile.canonicalAgentId === id)) {
+        return this.sendJson(res, 409, { error: '此身份由已登记的兼容关系管理，不能新建为独立 Agent。', code: 'IDENTITY_COMPAT_MANAGED' })
+      }
       const { config: cfg, result: agent } = await updateAgentsConfig((cfg) => {
         if (cfg.agents.find((a) => a.id === id)) {
           return null
@@ -8606,6 +8614,10 @@ export class Gateway {
       return
     }
     if (req.method === 'PUT' || req.method === 'DELETE') {
+      const identityProjection = await fetchIdentityCompatProjection()
+      if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id)) {
+        return this.sendJson(res, 409, { error: '此条目仅保留本实例运行手册；执行配置由关联市场 Agent 管理。', code: 'IDENTITY_COMPAT_MANAGED' })
+      }
       const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
       const { config: cfg, result } = await updateAgentsConfig(async (cfg) => {
         const idx = cfg.agents.findIndex((a) => a.id === id)
@@ -8931,7 +8943,8 @@ export class Gateway {
   ): Promise<void> {
     if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const store = buildAgentSkillStore(agentId)
+    const identity = await resolveRuntimeExecutionAgent({ id: agentId })
+    const store = buildAgentSkillStore(identity.agent.id, identity.context.assets ? { profile: identity.context.assets.profile } : undefined)
     // User-facing surface: never enumerate platform baseline/seed skills.
     const list = await store.list({ includePlatform: false })
     this.sendJson(res, 200, { skills: list })
@@ -8945,7 +8958,8 @@ export class Gateway {
     skillName: string,
   ): Promise<void> {
     if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    const store = buildAgentSkillStore(agentId)
+    const identity = await resolveRuntimeExecutionAgent({ id: agentId })
+    const store = buildAgentSkillStore(identity.agent.id, identity.context.assets ? { profile: identity.context.assets.profile } : undefined)
     if (req.method === 'GET') {
       // User-facing read: platform skills resolve to 404, never leak their body.
       const v = await store.view(skillName, undefined, { includePlatform: false })
@@ -10768,7 +10782,10 @@ export class Gateway {
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
-    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
+    const identityProjection = await fetchIdentityCompatProjection()
+    const targetIdentity = identityProjection ? resolveIdentityCompat(targetAgentId, identityProjection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
+    const targetAgent = cfg.agents.find((a) => a.id === (targetIdentity?.executionAgentId ?? targetAgentId))
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
     const sessionKey = `agent:${targetAgentId}:inter:dm:${sourceAgent || 'system'}`
@@ -11719,9 +11736,15 @@ export class Gateway {
     parentSessionKey?: unknown
     sourceAgent?: unknown
   }): DelegateProgressRouting | null {
+    const parent = typeof args.parentSessionKey === 'string' ? this.sessions.getByKey(args.parentSessionKey) : undefined
+    const profile = parent?._identityCompat?.assets?.profile
+    if (profile && parent?.userId && process.env.OC_USER_ID && parent.userId !== process.env.OC_USER_ID) return null
+    const sourceAgent = profile && parent?.agentId === profile.canonicalAgentId &&
+      typeof args.sourceAgent === 'string' && [profile.legacyAgentId, profile.canonicalAgentId].includes(args.sourceAgent)
+      ? profile.canonicalAgentId : args.sourceAgent
     return resolveDelegateProgressRouting({
       parentSessionKey: args.parentSessionKey,
-      sourceAgent: args.sourceAgent,
+      sourceAgent,
       maxDepth: 5,
       getSession: (key) => {
         const s = this.sessions.getByKey(key)
@@ -11753,7 +11776,8 @@ export class Gateway {
     const parent = this.sessions.getByKey(args.parentSessionKey)
     if (!parent) return null
     if (parent.channel !== 'webchat' && parent.channel !== 'delegate') return null
-    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent) {
+    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent &&
+      !(parent._identityCompat?.assets && [parent._identityCompat.assets.profile.legacyAgentId, parent._identityCompat.assets.profile.canonicalAgentId].includes(args.sourceAgent) && parent.agentId === parent._identityCompat.assets.profile.canonicalAgentId)) {
       return null
     }
     return {
@@ -11954,9 +11978,14 @@ export class Gateway {
       : typeof sourceAgent === 'string'
         ? sourceAgent
         : undefined
+    const identityProjection = await fetchIdentityCompatProjection()
+    const callerExecutionId = identityProjection && sourceAgentId
+      ? resolveIdentityCompat(sourceAgentId, identityProjection).executionAgentId : sourceAgentId
+    const targetIdentity = identityProjection ? resolveIdentityCompat(targetAgentId, identityProjection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
     const selfCheck = rejectSelfDelegate({
-      callerAgentId: sourceAgentId,
-      targetAgentId,
+      callerAgentId: callerExecutionId,
+      targetAgentId: targetIdentity?.executionAgentId ?? targetAgentId,
       allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
     })
     if (!selfCheck.ok) return this.sendError(res, 400, selfCheck.error)
@@ -11970,6 +11999,7 @@ export class Gateway {
       targetAgentId,
       sourceAgent: sourceAgentId || 'system',
       idempotencyKey,
+      identityProjection,
     })
     this._forgetEvictedDelegateResumes(resume.evictedKeys)
     if (!resume.ok) {
@@ -11994,6 +12024,7 @@ export class Gateway {
       ? this._resolveDelegateProgressTarget({ parentSessionKey, sourceAgent: sourceAgentId })?.target
       : undefined
     const runInput: RunDelegateInput = {
+      allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
       targetAgentId,
       goal,
       context: typeof context === 'string' ? context : undefined,
@@ -12508,7 +12539,16 @@ export class Gateway {
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
-    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
+    const identityProjection = await fetchIdentityCompatProjection()
+    const targetIdentity = identityProjection ? resolveIdentityCompat(targetAgentId, identityProjection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
+    const coreSelfCheck = rejectSelfDelegate({
+      callerAgentId: typeof sourceAgent === 'string' && identityProjection ? resolveIdentityCompat(sourceAgent, identityProjection).executionAgentId : sourceAgent,
+      targetAgentId: targetIdentity?.executionAgentId ?? targetAgentId,
+      allowSelf: input.allowSelf === true || (!input.resumable && sourceAgent === targetAgentId),
+    })
+    if (!coreSelfCheck.ok) return { kind: 'rejected', httpStatus: 400, message: coreSelfCheck.error }
+    const targetAgent = cfg.agents.find((a) => a.id === (targetIdentity?.executionAgentId ?? targetAgentId))
     if (!targetAgent) return { kind: 'rejected', httpStatus: 404, message: `agent "${targetAgentId}" not found` }
 
     // Resolve the delegated member's toolsets the same way the normal message
@@ -12524,7 +12564,7 @@ export class Gateway {
     // tool-arg controlled), so a marketplace agent can't spoof a privileged caller.
     // An undefined caller toolset = the trusted platform default (main) → no cap.
     const callerAgent =
-      typeof sourceAgent === 'string' ? cfg.agents.find((a) => a.id === sourceAgent) : undefined
+      typeof sourceAgent === 'string' ? cfg.agents.find((a) => a.id === (identityProjection ? resolveIdentityCompat(sourceAgent, identityProjection).executionAgentId : sourceAgent)) : undefined
     const callerToolsets = Array.isArray(callerAgent?.toolsets) ? callerAgent.toolsets : undefined
     const delegateIntentText = [goal, context].filter(Boolean).join('\n')
     const resolvedToolsets = resolveDelegateToolsets(
@@ -14058,8 +14098,9 @@ export class Gateway {
       return
     }
     const cfg = await this._getAgentsConfig()
-    const agent = cfg.agents.find((a) => a.id === task.agent)
-    if (!agent) return
+    const requestedAgent = cfg.agents.find((a) => a.id === task.agent)
+    if (!requestedAgent) return
+    const agent = (await resolveRuntimeExecutionAgent(requestedAgent, cfg)).agent
     const sessionKey = `agent:${task.agent}:task:${taskId}:${Date.now()}`
     // 合成首帧路由字段补齐(同 cron):定时任务的会话首帧绕过 master bridge 计费编排,
     // 落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
@@ -18398,13 +18439,20 @@ export class Gateway {
       } as OutboundMessage, adapter)
       return
     }
+    const executionIdentityProjection = await fetchIdentityCompatProjection()
+    const frameIdentity = frame.agentId && executionIdentityProjection
+      ? resolveIdentityCompat(frame.agentId, executionIdentityProjection) : undefined
+    if (frameIdentity) assertIdentityCompatReady(frameIdentity)
+    if (frameIdentity?.profile && !cfg.agents.some((a) => a.id === frameIdentity.executionAgentId)) {
+      throw new Error('COMPAT_CONFIG_CONFLICT: canonical agent missing')
+    }
     if (frame.agentId) {
       // Unknown agentId → demote to the default agent (全能助手), NEVER a personaless
       // {id} (which would run with no persona/toolsets/model). After the sync above a
       // genuinely-installed market agent is present; anything still unknown is treated
       // as not-installed and safely resolved to the least-privileged default.
       const ag =
-        cfg.agents.find((a) => a.id === frame.agentId) ??
+        cfg.agents.find((a) => a.id === (frameIdentity?.executionAgentId ?? frame.agentId)) ??
         cfg.agents.find((a) => a.id === cfg.default) ??
         cfg.agents.find((a) => a.id === 'main') ?? { id: 'main' }
       agent = ag
@@ -18415,6 +18463,7 @@ export class Gateway {
       sessionKey = routed.sessionKey
       agent = routed.agent
     }
+    agent = (await resolveRuntimeExecutionAgent(agent, cfg, executionIdentityProjection)).agent
     if (isHiddenSystemAgentId(agent.id)) {
       const hiddenAgentUserId: string =
         typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'

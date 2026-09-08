@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -782,6 +783,7 @@ export interface SubprocessRunnerOpts {
    *  会被 effectiveAddDir(由 getRepoSnapshot 返的 workspaceDir)覆盖。 */
   agentBaseDir: string
   config: OpenClaudeConfig
+  identityCompat?: IdentityCompatRuntimeContext
   persona?: string // 注入 system prompt 的文件
   model?: string
   /** Platform-owned per-adapter provider route. Never populated from user or
@@ -1610,6 +1612,8 @@ export class SubprocessRunner extends EventEmitter {
           OC_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          OC_AGENT_ID: this.opts.agentId,
+          ...identityCompatEnvironment(this.opts.identityCompat),
           ...(this.delegateContextFile
             ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: this.delegateContextFile }
             : {}),
@@ -2296,6 +2300,7 @@ export class SubprocessRunner extends EventEmitter {
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
+        identityCompat: this.opts.identityCompat?.assets,
         provider: effectiveProvider,
         model: this.opts.model,
         modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
@@ -2361,6 +2366,7 @@ export class SubprocessRunner extends EventEmitter {
         modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'ccb' })
       }
     } catch (err) {
+      if (this.opts.identityCompat?.assets) throw err
       runnerLog.warn(
         'failed to build extra prompt',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
@@ -2399,6 +2405,8 @@ export class SubprocessRunner extends EventEmitter {
           args: mcpLaunch.args,
           env: {
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          OC_AGENT_ID: this.opts.agentId,
+          ...identityCompatEnvironment(this.opts.identityCompat),
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
             // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
             // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill

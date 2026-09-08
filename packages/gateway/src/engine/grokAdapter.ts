@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * First-class adapter for xAI's official Grok CLI. The CLI runs once per turn
  * in headless streaming-json mode; subscription credentials never enter the
@@ -442,6 +443,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
     const cwd = cwdDecision.cwd
     const platform = projectGrokPlatform({
+      identityCompat: this.opts.identityCompat,
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,
       sessionKey: this.opts.sessionKey,
@@ -488,6 +490,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ...isolatedEnv,
       PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
       OC_AGENT_ID: this.opts.agentId,
+      OPENCLAUDE_AGENT_ID: this.opts.agentId,
+      ...identityCompatEnvironment(this.opts.identityCompat),
       OC_SESSION_KEY: this.opts.sessionKey,
       OPENCLAUDE_ENGINE: 'grok',
       ...(process.env.OPENCLAUDE_HOME?.trim()
@@ -625,6 +629,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
+        identityCompat: this.opts.identityCompat?.assets,
         provider: 'grok',
         model: this.currentModel,
         repoSnapshot: repoSnapshot ?? undefined,
@@ -658,6 +663,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       })
       return assembleGrokPrompt(GROK_PREAMBLE, platform.content || '', input, this.platformGoal)
     } catch {
+      if (this.opts.identityCompat?.assets) throw new Error('COMPAT_CONFIG_CONFLICT: identity prompt assembly failed')
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
