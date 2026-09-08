@@ -10,15 +10,19 @@
  * 修法：超过服务端 TTL 的未决卡视为孤儿，不再自动弹；但手动回答入口必须保留（fail-safe）。
  */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
+  setPermissionFullInputFetcher,
+} from "../../lib/chat/permissionPopupCoordinator";
+import {
   DETACHED_ASK_USER_TTL_MS,
   PENDING_PERMISSION_TTL_MS,
   PermissionCard,
+  PermissionPromptHost,
   isAwaitingPermissionPrompt,
   resetPermissionAutoOpenMemory,
 } from "./PermissionCard";
@@ -26,6 +30,7 @@ import {
 afterEach(() => {
   cleanup();
   resetPermissionAutoOpenMemory();
+  setPermissionFullInputFetcher(null);
 });
 
 function askMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -346,6 +351,40 @@ describe("PermissionCard 工具展示(F5/M7)", () => {
     );
     expect(document.body.textContent || "").toContain("npm run build");
     expect(screen.getByText("已允许")).toBeInTheDocument();
+  });
+
+  test("截断 AskUserQuestion 取回完整题目之前不能提交", async () => {
+    setPermissionFullInputFetcher(async () => ({
+      questions: [{ question: "长问题还在吗？", options: [{ label: "是" }, { label: "否" }] }],
+    }));
+    const onRespond = vi.fn();
+    render(
+      <PermissionCard
+        msg={askMsg({ _inputTruncated: true, inputJson: {} })}
+        onRespond={onRespond}
+        livePrompt
+      />,
+    );
+    expect(screen.getByText(/完整问题仍在加载/)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(screen.getByText("长问题还在吗？")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("是"));
+    fireEvent.click(screen.getByRole("button", { name: "提交" }));
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond.mock.calls[0][0].updatedInput.answers).toEqual({ "长问题还在吗？": "是" });
+    setPermissionFullInputFetcher(null);
+  });
+
+  test("Host 两个 pending 只开一个可见 modal，切卡不发 permission_response", async () => {
+    const onRespond = vi.fn();
+    const one = bashPermMsg({ requestId: "req-one", id: "p-one" });
+    const two = bashPermMsg({ requestId: "req-two", id: "p-two" });
+    render(
+      <PermissionPromptHost messages={[one, two]} onRespond={onRespond} sending />,
+    );
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(onRespond).not.toHaveBeenCalled();
   });
 
   test("mcp 工具名解析为中文标签(打开网页)", () => {

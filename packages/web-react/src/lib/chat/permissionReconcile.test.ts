@@ -82,6 +82,44 @@ describe("reconcilePermissionSnapshot", () => {
     expect(plan.lookupRequestIds).toEqual(["old-card"]);
   });
 
+  test("existing truncated pending is re-applied when lookup returns full input", () => {
+    const plan = reconcilePermissionSnapshot({
+      localCards: [{ requestId: "r1", resolved: false }],
+      snapshot: {
+        items: [{ ...pending("r1"), inputTruncated: false, inputJson: { questions: [{ question: "完整题" }] } }],
+        completeness: "complete",
+        source: "pg",
+      },
+    });
+    expect(plan.materialize).toHaveLength(1);
+    expect(plan.materialize[0]?.inputJson).toEqual({ questions: [{ question: "完整题" }] });
+  });
+
+  test("responded without behavior does not infer allow", () => {
+    const plan = reconcilePermissionSnapshot({
+      localCards: [{ requestId: "r1", resolved: false }],
+      snapshot: {
+        items: [{
+          requestId: "r1",
+          clientMessageId: "m-1",
+          toolUseId: "r1",
+          toolName: "Bash",
+          inputJson: {},
+          status: "responded",
+          behavior: null,
+          reason: null,
+          answers: null,
+          expiresAt: 9,
+          createdAt: 1,
+          updatedAt: 2,
+        }],
+        completeness: "complete",
+        source: "pg",
+      },
+    });
+    expect(plan.settle[0]?.behavior).toBeNull();
+  });
+
   test("unavailable pages never auto-settle from absence", () => {
     const plan = reconcilePermissionSnapshot({
       localCards: [{ requestId: "ghost", resolved: false }],

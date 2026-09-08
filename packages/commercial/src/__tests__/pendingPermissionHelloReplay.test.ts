@@ -13,7 +13,9 @@ import {
   HELLO_PENDING_PERMISSION_MAX_SESSIONS,
   HELLO_PENDING_PERMISSION_MAX_TOTAL_ROWS,
   PERMISSION_PROMPT_LOOKUP_MAX_IDS,
+  PERMISSION_PROMPT_READ_TIMEOUT_MS,
   PERMISSION_PROMPT_SNAPSHOT_LIMIT,
+  classifyPermissionInput,
   parsePermissionLookupIds,
   pendingPermissionPromptToFrame,
   readPendingPermissionPrompts,
@@ -35,6 +37,8 @@ function row(overrides: Partial<PendingPermissionPromptRow> = {}): PendingPermis
     toolUseId: 'toolu_01',
     toolName: 'AskUserQuestion',
     input: { questions: [{ question: 'How to handle the 3 incidents?', options: [] }] },
+    inputTruncated: false,
+    inputPreview: '{"questions"',
     expiresAt: new Date(NOW + 60_000),
     ...overrides,
   }
@@ -203,17 +207,19 @@ describe('readPendingPermissionPromptsForSessions', () => {
         }
       },
     } as unknown as Pool
-    const grouped = await readPendingPermissionPromptsForSessions(pool, {
+    const scan = await readPendingPermissionPromptsForSessions(pool, {
       userId: 3n,
       sessionIds: [PEER_ID, 'other-session', PEER_ID, ''],
     })
+    const grouped = scan.bySession
     assert.equal(calls.length, 1)
     const { sql, params } = calls[0]!
     assert.match(sql, /FROM turn_permission_requests p/)
     assert.match(sql, /p\.session_id = ANY\(\$2::text\[\]\)/)
-    assert.match(sql, /p\.user_id=\$1 AND p\.session_id = ANY\(\$2::text\[\]\) AND p\.status='pending' AND p\.expires_at>NOW\(\)/)
+    assert.match(sql, /ROW_NUMBER\(\) OVER \(PARTITION BY p\.session_id/)
     assert.match(sql, /NOT EXISTS \(\s*SELECT 1 FROM turn_control_requests c/)
-    assert.deepEqual(params, ['3', [PEER_ID, 'other-session'], 16])
+    assert.deepEqual(params, ['3', [PEER_ID, 'other-session'], 16, 8])
+    assert.equal(scan.rowLimited, false)
     assert.deepEqual([...grouped.keys()].sort(), ['other-session', PEER_ID])
     assert.deepEqual(grouped.get(PEER_ID)!.map((r) => r.requestId), ['toolu_01'])
     assert.deepEqual(grouped.get('other-session')!.map((r) => r.requestId), ['ask-user:abc'])
@@ -226,7 +232,7 @@ describe('readPendingPermissionPromptsForSessions', () => {
     } as unknown as Pool
     const grouped = await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds: [] })
     assert.equal(queried, 0)
-    assert.equal(grouped.size, 0)
+    assert.equal(grouped.bySession.size, 0)
   })
 
   test('truncates sessions at HELLO_PENDING_PERMISSION_MAX_SESSIONS and clamps the total LIMIT', async () => {
@@ -238,6 +244,56 @@ describe('readPendingPermissionPromptsForSessions', () => {
     await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds: many })
     assert.equal((seen[0]![1] as string[]).length, HELLO_PENDING_PERMISSION_MAX_SESSIONS)
     assert.equal(seen[0]![2], HELLO_PENDING_PERMISSION_MAX_TOTAL_ROWS)
+    assert.equal(seen[0]![3], 2)
+  })
+
+  test('Q1: LIMIT hit marks rowLimited and uncovered selected sessions', async () => {
+    const sessionIds = Array.from({ length: 32 }, (_, i) => `s-${String(i).padStart(2, '0')}`)
+    const pool = {
+      async query() {
+        return {
+          rows: Array.from({ length: 64 }, (_, i) => ({
+            session_id: sessionIds[Math.floor(i / 2)]!,
+            request_id: `r-${i}`,
+            client_message_id: 'm-1',
+            tool_use_id: `r-${i}`,
+            tool_name: 'AskUserQuestion',
+            input_json: { questions: [] },
+            expires_at: new Date(Date.now() + 60_000),
+          })),
+          rowCount: 64,
+        }
+      },
+    } as unknown as Pool
+    const scan = await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds })
+    assert.equal(scan.rowLimited, true)
+    assert.equal(scan.bySession.size, 32)
+    assert.deepEqual(scan.uncoveredSessionIds, [])
+  })
+
+  test('Q1: 32 selected sessions squeezed by 64-row page are uncovered for GET refill', async () => {
+    const sessionIds = Array.from({ length: 32 }, (_, i) => `s-${String(i).padStart(2, '0')}`)
+    const pool = {
+      async query() {
+        return {
+          rows: Array.from({ length: 64 }, (_, i) => ({
+            session_id: sessionIds[Math.floor(i / 3)]!,
+            request_id: `r-${i}`,
+            client_message_id: 'm-1',
+            tool_use_id: `r-${i}`,
+            tool_name: 'AskUserQuestion',
+            input_json: { questions: [] },
+            expires_at: new Date(Date.now() + 60_000),
+          })),
+          rowCount: 64,
+        }
+      },
+    } as unknown as Pool
+    const scan = await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds })
+    assert.equal(scan.rowLimited, true)
+    assert.ok(scan.bySession.size < 32)
+    assert.ok(scan.uncoveredSessionIds.length > 0)
+    assert.ok(scan.uncoveredSessionIds.every((id) => sessionIds.includes(id)))
   })
 })
 
@@ -270,11 +326,10 @@ describe('readPermissionPromptSnapshot', () => {
     await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: PEER_ID })
     const { sql, params } = calls[0]!
     assert.equal(calls.length, 1)
-    assert.match(sql, /FROM turn_permission_requests/)
-    assert.match(sql, /WHERE user_id=\$1 AND session_id=\$2/)
-    assert.match(sql, /response_json,status/)
-    assert.doesNotMatch(sql, /status\s*(=|IN|<>)/)
-    assert.match(sql, /ORDER BY created_at DESC/)
+    assert.match(sql, /FROM turn_permission_requests p/)
+    assert.match(sql, /WHERE p\.user_id=\$1 AND p\.session_id=\$2/)
+    assert.match(sql, /AS stopped/)
+    assert.match(sql, /ORDER BY p\.created_at DESC/)
     assert.match(sql, /LIMIT \$3/)
     assert.deepEqual(params, ['3', PEER_ID, PERMISSION_PROMPT_SNAPSHOT_LIMIT])
   })
@@ -342,8 +397,8 @@ describe('readPermissionPromptsByRequestIds', () => {
       requestIds: ['a', 'a', 'b', ''],
     })
     const { sql, params } = calls[0]!
-    assert.match(sql, /request_id = ANY\(\$2::text\[\]\)/)
-    assert.match(sql, /session_id=\$3/)
+    assert.match(sql, /p\.request_id = ANY\(\$2::text\[\]\)/)
+    assert.match(sql, /p\.session_id=\$3/)
     assert.deepEqual(params, ['3', ['a', 'b'], PEER_ID])
   })
 
@@ -386,5 +441,156 @@ describe('parsePermissionLookupIds', () => {
     assert.deepEqual(parsePermissionLookupIds('a, a, b'), ['a', 'b'])
     assert.deepEqual(parsePermissionLookupIds(''), [])
     assert.equal(parsePermissionLookupIds(Array.from({ length: 20 }, (_, i) => `id${i}`).join(','))!.length, 16)
+  })
+})
+
+describe('UTF-8 8KiB preview vs full input', () => {
+  test('CJK payload over 8192 UTF-8 bytes is truncated even if JS length is smaller', () => {
+    const questions = [{ question: '你'.repeat(3000), options: [{ label: 'a' }] }]
+    const classified = classifyPermissionInput({ questions })
+    assert.equal(classified.truncated, true)
+    assert.equal(Object.keys(classified.input).length, 0)
+    assert.ok(Buffer.byteLength(JSON.stringify({ questions }), 'utf8') > 8192)
+    assert.ok(questions[0]!.question.length < 8192)
+  })
+
+  test('hello frame omits inputJson when truncated so the client cannot blind-allow', () => {
+    const frame = pendingPermissionPromptToFrame(
+      row({ inputTruncated: true, input: {}, inputPreview: '{"q"' }),
+      { sessionKey: SESSION_KEY, peerId: PEER_ID },
+      NOW,
+    )
+    assert.ok(frame)
+    assert.equal(frame.inputTruncated, true)
+    assert.equal('inputJson' in frame, false)
+  })
+})
+
+describe('Stop projection on snapshot/lookup', () => {
+  test('pending + matching Stop becomes cancelled user_stop; detached ask-user stays pending', async () => {
+    const REAL_NOW = Date.now()
+    const pool = {
+      async query() {
+        return {
+          rows: [
+            {
+              request_id: 'toolu_stop',
+              client_message_id: 'm-turn',
+              tool_use_id: 'toolu_stop',
+              tool_name: 'Bash',
+              input_json: { command: 'ls' },
+              response_json: null,
+              status: 'pending',
+              expires_at: new Date(REAL_NOW + 60_000),
+              created_at: new Date(REAL_NOW - 10_000),
+              updated_at: new Date(REAL_NOW - 10_000),
+              stopped: true,
+            },
+            {
+              request_id: 'ask-user:keep',
+              client_message_id: 'm-turn',
+              tool_use_id: null,
+              tool_name: 'AskUserQuestion',
+              input_json: { questions: [{ question: 'q' }] },
+              response_json: null,
+              status: 'pending',
+              expires_at: new Date(REAL_NOW + 60_000),
+              created_at: new Date(REAL_NOW - 10_000),
+              updated_at: new Date(REAL_NOW - 10_000),
+              stopped: true,
+            },
+          ],
+          rowCount: 2,
+        }
+      },
+    } as unknown as Pool
+    const snapshot = await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: PEER_ID })
+    assert.equal(snapshot.items[0]!.status, 'cancelled')
+    assert.equal(snapshot.items[0]!.response?.reason, 'user_stop')
+    assert.equal(snapshot.items[1]!.status, 'pending')
+  })
+
+  test('responded without behavior is unknown, not allow', async () => {
+    const REAL_NOW = Date.now()
+    const pool = {
+      async query() {
+        return {
+          rows: [{
+            request_id: 'r-unknown',
+            client_message_id: 'm-1',
+            tool_use_id: 'r-unknown',
+            tool_name: 'Bash',
+            input_json: { command: 'ls' },
+            response_json: { nope: true },
+            status: 'responded',
+            expires_at: new Date(REAL_NOW + 60_000),
+            created_at: new Date(REAL_NOW - 10_000),
+            updated_at: new Date(REAL_NOW - 10_000),
+            stopped: false,
+          }],
+          rowCount: 1,
+        }
+      },
+    } as unknown as Pool
+    const snapshot = await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: PEER_ID })
+    assert.equal(snapshot.items[0]!.status, 'responded')
+    assert.equal(snapshot.items[0]!.response?.behavior, null)
+  })
+})
+
+describe('lookup returns full input for truncated snapshot cards', () => {
+  test('includeFullInput keeps questions even when UTF-8 size exceeds 8KiB', async () => {
+    const questions = [{ question: '你'.repeat(3000), options: [{ label: 'a' }] }]
+    const pool = {
+      async query() {
+        return {
+          rows: [{
+            request_id: 'big',
+            client_message_id: 'm-1',
+            tool_use_id: 'big',
+            tool_name: 'AskUserQuestion',
+            input_json: { questions },
+            response_json: null,
+            status: 'pending',
+            expires_at: new Date(Date.now() + 60_000),
+            created_at: new Date(),
+            updated_at: new Date(),
+            stopped: false,
+          }],
+          rowCount: 1,
+        }
+      },
+    } as unknown as Pool
+    const rows = await readPermissionPromptsByRequestIds(pool, {
+      userId: 3n,
+      sessionId: PEER_ID,
+      requestIds: ['big'],
+    })
+    assert.equal(rows[0]!.inputTruncated, false)
+    assert.equal((rows[0]!.input.questions as unknown[]).length, 1)
+  })
+})
+
+describe('250ms statement timeout on real pools', () => {
+  test('snapshot SET LOCAL statement_timeout = 250 when pool.connect exists', async () => {
+    const sqls: string[] = []
+    const pool = {
+      async query(sql: string) {
+        sqls.push(sql)
+        return { rows: [], rowCount: 0 }
+      },
+      async connect() {
+        return {
+          query: async (sql: string) => {
+            sqls.push(sql)
+            return { rows: [], rowCount: 0 }
+          },
+          release() {},
+        }
+      },
+    } as unknown as Pool
+    await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: PEER_ID })
+    assert.equal(PERMISSION_PROMPT_READ_TIMEOUT_MS, 250)
+    assert.ok(sqls.some((sql) => /SET LOCAL statement_timeout = 250/.test(sql)))
   })
 })

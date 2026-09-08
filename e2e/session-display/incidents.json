@@ -3385,6 +3385,50 @@
           "assertion": "OCV5-178 warm socket shows new text after restoring an idle cursor"
         }
       ]
+    },
+    {
+      "id": "INC-20260907-PERMISSION-ROOTFIX",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "提问/计划弹窗在 hello 与会话打开后断档：首帧丢失无卡可答，跨端已答仍弹，长输入被 8KiB 摘要毁掉可作答权威，Stop 后 GET/lookup 仍把普通权限当可答。responded 只表示控制受理不是工具已执行。",
+      "rootFixCommit": "12f7c30b",
+      "coverageCommits": [
+        "5a3f01b4",
+        "9fce39ef",
+        "98176566"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pendingPermissionHelloReplay.test.ts",
+          "assertion": "CJK payload over 8192 UTF-8 bytes is truncated even if JS length is smaller"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pendingPermissionHelloReplay.test.ts",
+          "assertion": "Q1: 32 selected sessions squeezed by 64-row page are uncovered for GET refill"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/permissionReconcile.test.ts",
+          "assertion": "responded without behavior does not infer allow"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PermissionCard.test.tsx",
+          "assertion": "Host 两个 pending 只开一个可见 modal，切卡不发 permission_response"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/permissionPromptSnapshotExplain.integ.test.ts",
+          "assertion": "B4 Stop then late persist: hello/GET/lookup hide ordinary pending, keep detached ask-user"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260907-PERMISSION-ROOTFIX: source regression guard, not end-to-end proof."
+        }
+      ]
     }
   ]
 }

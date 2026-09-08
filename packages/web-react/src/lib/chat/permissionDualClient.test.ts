@@ -101,6 +101,45 @@ describe("dual-client permission snapshot", () => {
     expect(tab.messages.filter((m) => m.role === "permission")).toHaveLength(1);
   });
 
+  test("reconnect snapshot settles an existing local pending card", () => {
+    const tabB = session("s1");
+    applyPermissionSnapshot(tabB, snapshot());
+    expect(tabB.messages.find((m) => m.requestId === "req-shared")?._resolved).toBe(false);
+    applyPermissionSnapshot(tabB, snapshot({
+      items: [{
+        ...snapshot().items[0]!,
+        status: "responded",
+        behavior: "allow",
+        updatedAt: Date.now(),
+      }],
+    }));
+    const card = tabB.messages.find((m) => m.requestId === "req-shared");
+    expect(card?._resolved).toBe(true);
+    expect(card?._behavior).toBe("allow");
+  });
+
+  test("late full lookup fills a truncated local pending card", () => {
+    const tab = session("s1");
+    applyPermissionSnapshot(tab, snapshot({
+      items: [{
+        ...snapshot().items[0]!,
+        inputJson: {},
+        inputTruncated: true,
+      }],
+    }));
+    expect(tab.messages.find((m) => m.requestId === "req-shared")?._inputTruncated).toBe(true);
+    applyPermissionSnapshot(tab, snapshot({
+      items: [{
+        ...snapshot().items[0]!,
+        inputJson: { questions: [{ question: "完整题" }] },
+        inputTruncated: false,
+      }],
+    }));
+    const card = tab.messages.find((m) => m.requestId === "req-shared");
+    expect(card?._inputTruncated).toBe(false);
+    expect(card?.inputJson).toEqual({ questions: [{ question: "完整题" }] });
+  });
+
   test("non-main agent snapshots keep agent-scoped sessionKey", () => {
     const tab = session("s1", "research-assistant");
     applyPermissionSnapshot(tab, snapshot());

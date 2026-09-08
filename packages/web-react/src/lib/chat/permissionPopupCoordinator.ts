@@ -96,3 +96,21 @@ export function yieldActiveModal(requestId: string): void {
 export function activePermissionRequest(sessionId: string): string | undefined {
   return openRequestBySession.get(sessionId);
 }
+
+type FullInputFetcher = (requestId: string) => Promise<Record<string, unknown> | null>;
+let fullInputFetcher: FullInputFetcher | null = null;
+
+export function setPermissionFullInputFetcher(fetcher: FullInputFetcher | null): void {
+  fullInputFetcher = fetcher;
+}
+
+export async function fetchPermissionFullInput(
+  requestId: string,
+): Promise<Record<string, unknown> | null> {
+  if (!requestId || !fullInputFetcher) return null;
+  try {
+    return await fullInputFetcher(requestId);
+  } catch {
+    return null;
+  }
+}

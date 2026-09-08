@@ -5544,10 +5544,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 try {
                   await Promise.resolve();
                   const sessionIds = helloPermissionScan.sessions.map((entry) => entry.peerId);
-                  const pendingBySession = await readPendingPermissionPromptsForSessions(pgPool, {
+                  const pendingScan = await readPendingPermissionPromptsForSessions(pgPool, {
                     userId: uid,
                     sessionIds,
                   });
+                  const pendingBySession = pendingScan.bySession;
                   let hits = 0;
                   for (const { peerId, sessionKey } of helloPermissionScan.sessions) {
                     if (userWs.readyState !== WebSocket.OPEN) break;
@@ -5569,14 +5570,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       });
                     }
                   }
-                  if (userWs.readyState === WebSocket.OPEN && (hits > 0 || helloPermissionScan.truncated)) {
+                  const rowLimited = pendingScan.rowLimited === true;
+                  const uncoveredSessionIds = pendingScan.uncoveredSessionIds;
+                  if (userWs.readyState === WebSocket.OPEN && (hits > 0 || helloPermissionScan.truncated || rowLimited)) {
                     try {
                       userWs.send(JSON.stringify({
                         type: "outbound.permission_hello_scan",
                         channel: "webchat",
                         scanned: helloPermissionScan.scanned,
                         omitted: helloPermissionScan.omitted,
-                        truncated: helloPermissionScan.truncated,
+                        truncated: helloPermissionScan.truncated || rowLimited,
+                        sessionTruncated: helloPermissionScan.truncated,
+                        rowLimited,
+                        uncoveredSessionIds,
                         hits,
                         ts: Date.now(),
                       }));

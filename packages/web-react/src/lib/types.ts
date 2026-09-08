@@ -511,6 +511,7 @@ export type PermissionPromptSnapshotItem = {
   toolUseId: string | null;
   toolName: string;
   inputJson: Record<string, unknown>;
+  inputTruncated?: boolean;
   status: PermissionPromptSnapshotStatus;
   behavior: "allow" | "deny" | null;
   reason: string | null;

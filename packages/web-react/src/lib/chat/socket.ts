@@ -813,6 +813,9 @@ export class ChatSocket {
   private readonly activeReplayAttemptKeys = new Set<string>();
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
+  getActiveSessionId(): string | undefined {
+    return this.activeSessionId;
+  }
 
   // ── 重连 reconcile（§4）──
   private reconnectInFlightSet: Set<string> | null = null;
@@ -2510,9 +2513,17 @@ export class ChatSocket {
       }
       default:
         if ((f as { type?: unknown }).type === "outbound.permission_hello_scan") {
-          const frame = f as { truncated?: unknown };
-          if (frame.truncated === true && this.activeSessionId) {
-            this.deps.syncSession?.(this.activeSessionId);
+          const frame = f as {
+            truncated?: unknown;
+            rowLimited?: unknown;
+            uncoveredSessionIds?: unknown;
+          };
+          const uncovered = Array.isArray(frame.uncoveredSessionIds)
+            ? frame.uncoveredSessionIds.filter((id): id is string => typeof id === "string")
+            : [];
+          const active = this.activeSessionId;
+          if (active && (frame.truncated === true || frame.rowLimited === true || uncovered.includes(active))) {
+            this.deps.syncSession?.(active);
           }
         }
         // pong 已先处理；其余 v5 webchat 不消费。
