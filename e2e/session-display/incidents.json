@@ -3432,6 +3432,59 @@
           "assertion": "OCV5-189 deploy proof: cross-turn delegate billing materializes and settles by its own locator"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-PREPARATION-RETRY",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "首次受理后上下文准备超过35秒被终态化，没有自动重试；同cmid重入可能复活准备计时器。兼容writer关闭时缺负向裁决可造成无任务假重新准备。同一准备child重领后旧物理超时计时器仍可误画失败。",
+      "rootFixCommit": "60912504",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "duplicate during preparation cannot cancel owner; one job and zero late sends"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/preparationRecovery.integ.test.ts",
+          "assertion": "intent commits before send, survives send failure and prevents false not-executed cap"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-174 real PG session-first barrier leaves dispatch unlocked while reconciler waits"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/preparation-recovery.node-test.mjs",
+          "assertion": "OCV5-174: real timeline preparation, reload/two tabs, success/exhausted and Stop"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R1 negative preparation decision"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-174 real source admission freezes >4MiB settings and reclaims exactly one deferred child"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R2 child physical timeout"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/preparation-child-readmission.node-test.mjs",
+          "assertion": "OCV5-174 C1: real 5s readmission + 15.5s wait does not terminalize a live child"
+        }
+      ],
+      "coverageCommits": [
+        "f5ad3542",
+        "7d2f2aa4"
+      ]
     }
   ]
 }

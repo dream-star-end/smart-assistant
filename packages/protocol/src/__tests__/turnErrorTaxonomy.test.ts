@@ -20,6 +20,7 @@ describe('automatic turn recovery policy', () => {
     const explicitUnsafe = new Set([
       'session_persist_unavailable', // no durable user-row/tape authority
       'durable_dispatch_unavailable', // bind fence failed; retry mints a new dispatch
+      'dispatch_preparation_retry_exhausted', // finite preparation budget exhausted; manual only
       'conn_kicked', // connection lifecycle owns reconnect, not turn replay
       'bad_sequence', // requires exact sync before any new dispatch
       'codex_turn_busy', // another turn owns the session; FIFO lifecycle owns it
@@ -275,5 +276,20 @@ describe('automatic turn recovery policy', () => {
       mode: 'checkpoint',
       checkpointSafe: true,
     })
+  })
+})
+
+
+describe('pre-transfer preparation policy', () => {
+  it('recognizes case-normalized source timeout without authorizing checkpoint-free tape replay; exhausted is manual only', () => {
+    for (const code of ['DISPATCH_ENRICHMENT_TIMEOUT', 'dispatch_enrichment_timeout']) {
+      assert.equal(supportsAutomaticTurnRecovery(code), true)
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false)
+    }
+    for (const code of ['DISPATCH_PREPARATION_RETRY_EXHAUSTED', 'dispatch_preparation_retry_exhausted']) {
+      assert.equal(supportsAutomaticTurnRecovery(code), false)
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false)
+    }
+    assert.equal(supportsAutomaticTurnRecovery('dispatch_preparation_timeout'), false)
   })
 })

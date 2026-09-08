@@ -10947,3 +10947,261 @@ describe("CCB ExecuteExtraTool wrapper → delegate agent-group", () => {
     expect(fanout?.role).toBe("tool");
   });
 });
+
+
+describe('OCV5-174 durable preparation UI', () => {
+  afterEach(() => { FakeWS.instances = []; vi.unstubAllGlobals(); vi.useRealTimers(); });
+  function fixture() {
+    vi.useFakeTimers();
+    vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn(async (_sessId: string, _context?: { clientMessageId?: string }) => {});
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!; ws.open();
+    const push = (frame: unknown) => ws.onmessage?.({ data: JSON.stringify(frame) });
+    push({ type: 'sys.relay_ready', automaticRecoveryOwner: 'master-v1' });
+    const sessId = 's-preparation';
+    sock.sendMessage({ sessId, agentId: 'main', text: 'exact original', model: 'cursor-opus-5-high' });
+    const session = sock.sessions.get(sessId)!;
+    const source = session.messages.find(m => m.role === 'user')!;
+    const peer = { id: sessId, kind: 'dm' };
+    push({ type: 'outbound.ack', admitted: true, peer, clientMessageId: source.id });
+    const pending = { cause: 'preparation' as const, mode: 'replay' as const,
+      sourceClientMessageId: source.id, rootClientMessageId: source.id, attempt: 1, max: 10 };
+    const child = 'm-recover-preparation';
+    const ack = { type: 'outbound.ack', admitted: true, peer, clientMessageId: child,
+      recovery: { ...pending, automatic: true } };
+    const error = () => push({ type: 'outbound.error', peer, clientMessageId: source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'prepare deadline' });
+    const childError = (type = 'error', code = 'DISPATCH_ENRICHMENT_TIMEOUT') => push({
+      type, peer, clientMessageId: child, code, message: 'child physical preparation deadline' });
+    const success = () => push({ type: 'outbound.message', channel: 'webchat', peer,
+      clientMessageId: child, isFinal: true, ts: Date.now(), blocks: [{ kind: 'text', text: 'child succeeded' }] });
+    return { sock, ws, push, session, source, peer, pending, child, ack, error, childError, success, syncSession, sessId };
+  }
+
+  test.each(['ack', 'rest'])('same preparation child %s adoption retires its physical timeout, preserving active #2 past old grace', async via => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError();
+    await vi.advanceTimersByTimeAsync(5_000);
+    if (via === 'ack') f.push(f.ack);
+    else f.sock.applyServerMessages(f.sessId, 'main', f.session.messages.map(m => ({ ...m, _source: 'server' })), true, 2,
+      { serverUpdatedAt: Date.now(), pendingRecovery: { ...f.pending, clientMessageId: f.child } });
+    f.syncSession.mockClear();
+    await vi.advanceTimersByTimeAsync(15_500);
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session._turnStatus).toMatchObject({ cause: 'preparation' });
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(f.syncSession).not.toHaveBeenCalled();
+    f.success();
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.some(m => m.text === 'child succeeded')).toBe(true);
+    f.push(f.ack);
+    expect(f.session._sendingInFlight).toBe(false);
+    f.sock.stop();
+  });
+  test.each(['error', 'outbound.error'])('queued child without readmission past grace only reconciles exact authority (%s)', async type => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError(type);
+    f.syncSession.mockClear();
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.syncSession.mock.calls.filter(call => (call[1] as { clientMessageId?: string } | undefined)?.clientMessageId === f.child)).toHaveLength(1);
+    expect(f.syncSession).toHaveBeenCalledWith(f.sessId, { clientMessageId: f.child });
+    f.childError('outbound.error', 'DISPATCH_PREPARATION_RETRY_EXHAUSTED');
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.filter(m => m._errorCode)).toEqual([
+      expect.objectContaining({ _clientMessageId: f.child, _errorCode: 'dispatch_preparation_retry_exhausted' }),
+    ]);
+    f.push(f.ack);
+    expect(f.session._sendingInFlight).toBe(false);
+    f.sock.stop();
+  });
+  test.each(['stop', 'success', 'exhausted', 'new-active'])('old child grace and ACK cannot revive %s', async outcome => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError();
+    await vi.advanceTimersByTimeAsync(5_000);
+    if (outcome === 'stop') f.sock.stopTurn(f.sessId);
+    else if (outcome === 'exhausted') f.childError('outbound.error', 'DISPATCH_PREPARATION_RETRY_EXHAUSTED');
+    else f.success();
+    let active: string | undefined;
+    if (outcome === 'new-active') {
+      f.sock.sendMessage({ sessId: f.sessId, agentId: 'main', text: 'new active request' });
+      active = f.session.messages.find(m => m.text === 'new active request')!.id;
+      f.push({ type: 'outbound.ack', admitted: true, peer: f.peer, clientMessageId: active });
+    }
+    f.syncSession.mockClear(); f.push(f.ack);
+    await vi.advanceTimersByTimeAsync(15_500);
+    expect(f.session._sendingInFlight).toBe(outcome === 'new-active');
+    expect(f.session._activeClientMessageId).toBe(active);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(outcome === 'exhausted' ? 1 : 0);
+    expect(f.syncSession).not.toHaveBeenCalled();
+    f.sock.stop();
+  });
+  test('preparation ACK does not discard a semantic child error timer', async () => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError('outbound.error', 'MODEL_CAPACITY');
+    await vi.advanceTimersByTimeAsync(5_000); f.push(f.ack);
+    await vi.advanceTimersByTimeAsync(15_500);
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.filter(m => m._errorCode)).toEqual([
+      expect.objectContaining({ _clientMessageId: f.child, _errorCode: 'model_capacity' }),
+    ]);
+    f.sock.stop();
+  });
+  test('source error → scheduled → duplicate child ACK preserves precise cause and hides source; late source error cannot steal child', () => {
+    const f = fixture(); f.error();
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.session._turnStatus).toMatchObject({ cause: 'preparation' });
+    f.push({ ...f.pending, type: 'sys.recovery_decision', scheduled: true, peer: f.peer, errorCode: 'dispatch_enrichment_timeout' });
+    vi.advanceTimersByTime(36_000);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    f.push(f.ack); f.push(f.ack); f.error();
+    f.push({ type: 'error', peer: f.peer, clientMessageId: f.source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'late legacy timeout' });
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session.messages.filter(m => m.id === f.child)).toHaveLength(1);
+    expect(f.session.messages.find(m => m.id === f.child)?._automaticRecoveryCause).toBe('preparation');
+    expect(f.session._turnStatus).toMatchObject({ cause: 'preparation' });
+    f.sock.stop();
+  });
+  test.each([false, true])('REST pending without child survives refresh, has no fabricated child (unified=%s)', unified => {
+    const f = fixture();
+    const rows = [{ ...f.source, _source: 'server' as const, status: 'sent' as const }];
+    f.sock.stop();
+    const sock = makeSocket({ syncSession: async () => {} }); sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!; ws.open();
+    ws.onmessage?.({ data: JSON.stringify({ type: 'sys.relay_ready', automaticRecoveryOwner: 'master-v1' }) });
+    sock.applyServerMessages(f.sessId, 'main', rows, true, 1,
+      { serverUpdatedAt: 10, historyRevision: 2, ...(unified ? { timelineGeneration: 2 } : {}), pendingRecovery: f.pending });
+    const s = sock.sessions.get(f.sessId)!;
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe(f.source.id);
+    expect(s._turnStatus).toMatchObject({ cause: 'preparation' });
+    expect(s.messages.filter(m => m._automaticRecovery)).toHaveLength(0);
+    sock.stopTurn(f.sessId);
+    ws.onmessage?.({ data: JSON.stringify(f.ack) });
+    ws.onmessage?.({ data: JSON.stringify({ type: 'error', peer: f.peer, clientMessageId: f.source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'late legacy after Stop' }) });
+    expect(s.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.some(m => m.id === f.child)).toBe(false);
+    sock.stop();
+  });
+  test('durably scheduled preparation never becomes a made-up terminal just because no executor is ready for 100 seconds', async () => {
+    const f = fixture(); f.error();
+    f.push({ ...f.pending, type: 'sys.recovery_decision', scheduled: true, peer: f.peer, errorCode: 'dispatch_enrichment_timeout' });
+    await vi.advanceTimersByTimeAsync(150_000);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    // The fake transport does not answer pings, so this long wait exercises
+    // reconnect too. Deliver the eventual ACK to the current connection.
+    const live = FakeWS.instances.at(-1)!; live.open();
+    live.onmessage?.({ data: JSON.stringify({ type: 'sys.relay_ready', automaticRecoveryOwner: 'master-v1' }) });
+    live.onmessage?.({ data: JSON.stringify(f.ack) });
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session._sendingInFlight).toBe(true);
+    f.sock.stop();
+  });
+
+  test('exhausted child is exactly one manual error and late ACK/decision do not resurrect it', () => {
+    const f = fixture(); f.error(); f.push(f.ack);
+    f.push({ type: 'outbound.error', peer: f.peer, clientMessageId: f.child,
+      code: 'DISPATCH_PREPARATION_RETRY_EXHAUSTED', message: 'exhausted' });
+    f.push(f.ack);
+    f.push({ ...f.pending, type: 'sys.recovery_decision', peer: f.peer, scheduled: true, errorCode: 'dispatch_enrichment_timeout' });
+    expect(f.session._sendingInFlight).toBe(false);
+    const errors = f.session.messages.filter(m => m._errorCode);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ _clientMessageId: f.child, _errorCode: 'dispatch_preparation_retry_exhausted' });
+    f.sock.stop();
+  });
+  test('new human turn and stale REST pending cannot be overtaken by old preparation ACK', () => {
+    const f = fixture(); f.error(); f.push(f.ack);
+    f.sock.applyServerMessages(f.sessId, 'main', [
+      { ...f.source, _source: 'server' },
+      { id: 'm-new-human', role: 'user', text: 'new request', ts: Date.now() + 1, _source: 'server', status: 'sent' },
+    ], true, 4, { serverUpdatedAt: 20, pendingRecovery: null });
+    f.session._sendingInFlight = false;
+    f.push(f.ack);
+    f.sock.applyServerMessages(f.sessId, 'main', [{ ...f.source, _source: 'server' }], true, 1,
+      { serverUpdatedAt: 10, pendingRecovery: f.pending });
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.some(m => m.id === 'm-new-human')).toBe(true);
+    f.sock.stop();
+  });
+
+  test.each(['error-first', 'decision-first'])('R0 negative preparation decision closes immediately, never fabricates a child (%s)', order => {
+    const f = fixture();
+    const negative = { type: 'sys.recovery_decision', peer: f.peer, sourceClientMessageId: f.source.id,
+      errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'enqueue_rejected' };
+    const error = { type: 'error', peer: f.peer, clientMessageId: f.source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'Preparation exceeded its deadline' };
+    if (order === 'decision-first') f.push(negative);
+    f.push(error);
+    if (order === 'error-first') {
+      expect(f.session._turnStatus).toMatchObject({ cause: 'preparation' });
+      f.push(negative);
+    }
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session._turnStatus).toBeNull();
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    expect(f.session.messages.some(m => m._automaticRecovery)).toBe(false);
+    // Both wire envelopes and repeated negative decisions are idempotent.
+    f.push(negative); f.push(error); f.error();
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    expect(f.sock.toStored(f.sessId)?._automaticRecoveryDecisions?.[f.source.id]).toBe(true);
+    vi.advanceTimersByTime(20_001);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    expect(f.session._sendingInFlight).toBe(false);
+    f.sock.stop();
+  });
+  test('queued human message does not delay no-job source closure or get failed by its negative decision', async () => {
+    const f = fixture(); f.error();
+    f.sock.sendMessage({ sessId: f.sessId, agentId: 'main', text: 'queued successor' });
+    const queued = f.session.messages.find(m => m.role === 'user' && m.text === 'queued successor')!;
+    expect(f.session._activeClientMessageId).toBe(f.source.id);
+    const negative = { type: 'sys.recovery_decision', peer: f.peer, sourceClientMessageId: f.source.id,
+      errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'enqueue_rejected' };
+    f.push(negative);
+    expect(f.session._automaticRecoveryDecisions?.[f.source.id]).toBe(true);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.session._activeClientMessageId).toBe(queued.id);
+    expect(f.session._sendingInFlight).toBe(true);
+    f.push(negative);
+    expect(f.session._activeClientMessageId).toBe(queued.id);
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session.messages.some(m => m._clientMessageId === queued.id && m._errorCode)).toBe(false);
+    f.sock.stop();
+  });
+  test('negative decision and duplicate errors after Stop cannot turn user cancellation into a source failure', () => {
+    const f = fixture(); f.error(); f.sock.stopTurn(f.sessId);
+    f.push({ type: 'sys.recovery_decision', peer: f.peer, sourceClientMessageId: f.source.id,
+      errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'not_recoverable' });
+    f.push({ type: 'error', peer: f.peer, clientMessageId: f.source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'late legacy timeout' });
+    f.error();
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.session._cancelledAutomaticRecoveryIds?.[f.source.id]).toBe(true);
+    f.sock.stop();
+  });
+  test('wrong-source or stale negative decisions cannot stop current preparation or a newer user turn', () => {
+    const f = fixture(); f.error();
+    const decision = (sourceClientMessageId: string) => ({ type: 'sys.recovery_decision', peer: f.peer,
+      sourceClientMessageId, errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'not_recoverable' });
+    f.push(decision('m-another-source'));
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session._automaticRecoveryDecisions?.['m-another-source']).not.toBe(true);
+    f.push(f.ack); f.push(decision(f.source.id));
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session._sendingInFlight).toBe(true);
+    f.session.messages.push({ id: 'm-new-ordinary-user', role: 'user', text: 'new request', ts: Date.now(), status: 'sent' });
+    f.session._activeClientMessageId = 'm-new-ordinary-user';
+    f.push(decision(f.source.id));
+    expect(f.session._activeClientMessageId).toBe('m-new-ordinary-user');
+    expect(f.session._sendingInFlight).toBe(true);
+    f.sock.stop();
+  });
+});

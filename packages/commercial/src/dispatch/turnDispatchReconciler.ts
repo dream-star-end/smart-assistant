@@ -35,6 +35,7 @@ import {
   type TraceFirstVisibleRow,
 } from './visibleOrphan.js'
 import { registerProducerFence } from '../db/liveTurnFrames.js'
+import { lockRecoveryRoot } from './turnRecoveryStore.js'
 import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
@@ -647,6 +648,11 @@ async function finalizeOrphanDispatch(input: {
   const client = await input.deps.pool.connect()
   try {
     await client.query('BEGIN')
+    await lockVisibleSessionBeforeDispatch(client, {
+      sessionId: input.row.session_id,
+      userId: BigInt(input.row.user_id),
+      clientMessageId: input.row.client_message_id,
+    })
     const locked = await client.query<{ status: string }>(
       `SELECT status FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE -- closeVisibleOrphans lock`,
       [input.row.dispatch_id],
@@ -1143,6 +1149,23 @@ async function advanceVisibleTimelineIdentity(
   await advanceClientTimelineIdentityInTransaction(q, row.sessionId, `c:${row.userId}`)
 }
 
+/** S -> session/root advisory -> dispatch. Visibility and its durable cursor
+ * invalidation still commit atomically; only WS nudges may run post-commit.
+ * Missing/deleted sessions are not created by this lock or projection. */
+async function lockVisibleSessionBeforeDispatch(
+  q: Queryable,
+  row: Pick<TurnDispatchRow, 'sessionId' | 'userId' | 'clientMessageId'>,
+): Promise<void> {
+  await q.query(
+    `SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+    [row.sessionId, `c:${row.userId}`],
+  )
+  await lockRecoveryRoot(q, {
+    userId: row.userId, sessionId: row.sessionId,
+    rootClientMessageId: row.clientMessageId,
+  })
+}
+
 /**
  * B8:terminal-未通知单行的**单事务**收敛。锁本 dispatch 行(与 tape finalize 互斥),
  * tx 内重验终态未变 + 财务联查同 snapshot,再决定直接状态可见(免单)或 manual_reconcile(歧义)。
@@ -1164,6 +1187,7 @@ async function settleTerminalUnnotified(
   let post: Post | null = null
   try {
     await client.query('BEGIN')
+    await lockVisibleSessionBeforeDispatch(client, scanned)
     const row = await getDispatchForUpdate(client, scanned.dispatchId)
     if (
       row === null ||
@@ -1186,6 +1210,22 @@ async function settleTerminalUnnotified(
       if (held) post = { kind: 'manual', reason: 'missing anchor_seq — cannot place verified failure status', reservations: [] }
       finalizeSettlePost(post, scanned, counts, enqueue, deps)
       return
+    }
+    if (row.outcome === 'not_accepted') {
+      const intent = await client.query(
+        `SELECT 1 FROM turn_recovery_jobs WHERE dispatch_id=$1
+          AND job_origin='pre_transfer_enrichment' AND preparation_send_intent_at IS NOT NULL`,
+        [row.dispatchId],
+      )
+      if (intent.rowCount) {
+        const held = await casToManualReconcile(client, {
+          dispatchId: row.dispatchId, conflictReason: 'preparation_execution_unknown', now: nowMs,
+        })
+        await client.query('COMMIT')
+        if (held) post = { kind: 'manual', reason: 'preparation send intent forbids an inferred no-execution waiver', reservations: [] }
+        finalizeSettlePost(post, scanned, counts, enqueue, deps)
+        return
+      }
     }
     // B-R1-1(钱安全):not_accepted = 容器 durable rejected proof = 从未执行 → 同一 tx 内先把
     // pre-forward inflight journal CAS 为永久 no-execution waiver aborted(no-usage 守卫内嵌),
@@ -1225,12 +1265,15 @@ async function settleTerminalUnnotified(
     await client.query('COMMIT')
     post = { kind: 'visible', notified, reservations }
     finalizeSettlePost(post, scanned, counts, enqueue, deps)
-  } catch {
+  } catch (error) {
     try {
       await client.query('ROLLBACK')
     } catch {
       /* connection already broken */
     }
+    // A lock-order regression must be visible to the caller and real PG tests,
+    // not silently interpreted as ordinary transient projection lag.
+    if ((error as { code?: string })?.code === '40P01') throw error
     // best-effort:吞掉,下轮重试(scanTerminalUnnotified 仍会选中它)。
   } finally {
     client.release()
@@ -1400,6 +1443,7 @@ async function closeAcceptedAsExecutedError(
   let terminal: TurnDispatchRow | null = null
   try {
     await client.query('BEGIN')
+    await lockVisibleSessionBeforeDispatch(client, row)
     terminal = await casToTerminal(client, {
       dispatchId: row.dispatchId,
       outcome: 'executed_error',

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { MessageReplyQuote, PendingPreparationRecovery } from "@openclaude/protocol";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
@@ -141,6 +141,7 @@ export type UseChatSocket = {
     timelineHasMore?: boolean;
     timelineSnapshotMaxSeq?: number;
     invalidateHistoryCache?: boolean;
+    pendingRecovery?: PendingPreparationRecovery | null;
     openDispatch?: {
       dispatchId: string;
       clientMessageId: string;
@@ -406,6 +407,7 @@ export function useChatSocket(opts: {
                 timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: detail._historyRevisionUnsupported === true,
                 openDispatch: detail.openDispatch,
+                pendingRecovery: detail.pendingRecovery,
               },
             );
           }
@@ -442,6 +444,7 @@ export function useChatSocket(opts: {
                   timelineHasMore: tapeDetail.timelineHasMore,
                   timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                  pendingRecovery: tapeDetail.pendingRecovery,
                 },
               );
             },
@@ -740,6 +743,7 @@ export function useChatSocket(opts: {
         timelineSnapshotMaxSeq: p.timelineSnapshotMaxSeq,
         invalidateHistoryCache: p.invalidateHistoryCache,
         openDispatch: p.openDispatch,
+        pendingRecovery: p.pendingRecovery,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
@@ -788,6 +792,7 @@ export function useChatSocket(opts: {
               timelineHasMore: tapeDetail.timelineHasMore,
               timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
               invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+              pendingRecovery: tapeDetail.pendingRecovery,
             },
           );
         },

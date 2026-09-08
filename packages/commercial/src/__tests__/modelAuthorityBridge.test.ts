@@ -15,7 +15,7 @@
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
@@ -61,6 +61,8 @@ import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import { detectScanSciPaperIntent } from "../ws/paperIntentHint.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
+import { createPgSessionsBackend } from "../db/pgSessionsBackend.js";
+import { freezePreparationRequest, preparationChildRequest } from "../dispatch/preparationRecovery.js";
 import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import {
   ModelCatalogSnapshot,
@@ -247,6 +249,8 @@ async function startRig(opts: {
   /** OCV5-187: verify the actual signed WS body before issuing a receipt. */
   verifyDispatchReceipt?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
+  failPreparationAndScheduleRecovery?: UserChatBridgeDeps["failPreparationAndScheduleRecovery"];
+  publishPreparationRecoveryDecision?: UserChatBridgeDeps["publishPreparationRecoveryDecision"];
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
   getFrontendBuildId?: UserChatBridgeDeps["getFrontendBuildId"];
@@ -515,6 +519,12 @@ async function startRig(opts: {
     containerConnectTimeoutMs: 1500,
     ...(modelAuthority ? { modelAuthority } : {}),
     ...(admitUserTurn ? { admitUserTurn } : {}),
+    ...(opts.failPreparationAndScheduleRecovery
+      ? { failPreparationAndScheduleRecovery: opts.failPreparationAndScheduleRecovery }
+      : {}),
+    ...(opts.publishPreparationRecoveryDecision
+      ? { publishPreparationRecoveryDecision: opts.publishPreparationRecoveryDecision }
+      : {}),
     ...(opts.loadMasterSessionMessages
       ? { loadMasterSessionMessages: opts.loadMasterSessionMessages }
       : {}),
@@ -1189,6 +1199,335 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
     },
   };
 }
+
+describe("OCV5-174 preparation ownership through real WebSockets", () => {
+  for (const disposition of ["queued", "exhausted", "unknown", "stopped", "lost-ownership"] as const) {
+    test(`R2 child physical timeout ${disposition}: only committed exhaustion is a logical error`, async () => {
+      const sessionId = `sess-child-timeout-${disposition}`;
+      const sourceId = `cm-source-${disposition}`;
+      const source = freezePreparationRequest(JSON.parse(inboundFrame({
+        agentId: "main", clientMessageId: sourceId, peer: { id: sessionId, kind: "dm" },
+      })));
+      assert.ok(source);
+      const request = preparationChildRequest(source, sessionId, sourceId);
+      const childId = String(request.clientMessageId);
+      let claimed = false;
+      let enteredRelease = false;
+      let commitStarted = false;
+      let committed = false;
+      let finishCommit!: () => void;
+      const commitBarrier = new Promise<void>((resolve) => { finishCommit = resolve; });
+      let finishHistory!: (rows: unknown[]) => void;
+      const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+      const staged: { terminal?: boolean; failureCode?: unknown; status?: unknown; count?: unknown } = {};
+      const errors: Error[] = [];
+      const pool = {
+        query: async (sql: string) => {
+          if (/WITH due AS/.test(sql) && /FROM turn_recovery_jobs/.test(sql)) {
+            if (claimed) return { rows: [], rowCount: 0 };
+            claimed = true;
+            return { rows: [{ job_id: "00000000-0000-0000-0000-000000000174", user_id: String(UID),
+              session_id: sessionId, root_client_message_id: sourceId, source_client_message_id: sourceId,
+              source_turn_key: null, job_origin: "pre_transfer_enrichment",
+              preparation_retry_count: disposition === "exhausted" ? 1 : 0,
+              preparation_send_intent_at: disposition === "unknown" ? new Date() : null,
+              error_code: "dispatch_enrichment_timeout", recovery_mode: "replay",
+              semantic_recovery_attempt: 1, transport_wait_attempt: 0, request_json: request, lease_epoch: "1",
+            }], rowCount: 1 };
+          }
+          if (/SELECT user_id::text,session_id,root_client_message_id FROM turn_recovery_jobs/.test(sql)) {
+            enteredRelease = true;
+            return { rows: [{ user_id: String(UID), session_id: sessionId, root_client_message_id: sourceId }], rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        connect: async () => ({
+          query: async (sql: string, params: unknown[] = []) => {
+            if (sql === "BEGIN" || sql === "ROLLBACK") return { rows: [], rowCount: 0 };
+            if (sql === "COMMIT") {
+              commitStarted = true;
+              await commitBarrier;
+              committed = true;
+              return { rows: [], rowCount: 0 };
+            }
+            if (/SELECT messages,deleted_at FROM client_sessions/.test(sql)) return {
+              rows: [{ messages: JSON.stringify([{ id: childId, role: "user" }]), deleted_at: null }], rowCount: 1,
+            };
+            if (/pg_advisory_xact_lock/.test(sql)) return { rows: [], rowCount: 1 };
+            if (/SELECT j.preparation_retry_count/.test(sql)) return disposition === "lost-ownership"
+              ? { rows: [], rowCount: 0 }
+              : { rows: [{ preparation_retry_count: disposition === "exhausted" ? 1 : 0,
+                  preparation_send_intent_at: disposition === "unknown" ? new Date() : null,
+                  client_message_id: childId, stopped: disposition === "stopped" }], rowCount: 1 };
+            if (/UPDATE turn_dispatches SET owner_id=NULL/.test(sql)) {
+              staged.terminal = params[1] === true; staged.failureCode = params[2];
+              return { rows: [], rowCount: 1 };
+            }
+            if (/UPDATE turn_recovery_jobs SET status=\$2/.test(sql)) {
+              staged.status = params[1]; staged.count = params[2]; return { rows: [], rowCount: 1 };
+            }
+            if (/UPDATE client_sessions SET history_revision/.test(sql)) return { rows: [], rowCount: 1 };
+            const error = new Error(`unexpected preparation release query: ${sql}`);
+            errors.push(error); throw error;
+          },
+          release: () => {},
+        }),
+      };
+      const admittedInputs: AdmitUserTurnInput[] = [];
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, pgPool: pool, promptQueuePreparationTimeoutMs: 40,
+        hasCompletedClientTurn: async () => false,
+        admitUserTurn: async (input) => { admittedInputs.push(input); return fakeAdmittedDispatch(input); },
+        loadMasterSessionMessages: async () => history,
+      });
+      const observed: Record<string, unknown>[] = [];
+      try {
+        const ws = await openClient(rig.port);
+        ws.on("message", (raw) => { observed.push(JSON.parse(String(raw))); });
+        await waitFor(() => enteredRelease && (disposition === "lost-ownership" || commitStarted));
+        // Use the actual scheduler -> admission -> timeout -> release path and
+        // actual WS bytes. The pool is a controlled commit barrier, not real PG.
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        assert.equal(observed.filter((frame) => frame.type === "error").length, 0,
+          "a physical child timeout cannot publish a logical failure before/without a committed cap verdict");
+        finishCommit();
+        if (disposition === "exhausted") {
+          await waitFor(() => observed.some((frame) => frame.code === "DISPATCH_PREPARATION_RETRY_EXHAUSTED"));
+          assert.equal(committed, true);
+          const errorFrames = observed.filter((frame) => frame.type === "error");
+          assert.equal(errorFrames.length, 1);
+          assert.equal(errorFrames[0]!.clientMessageId, childId);
+          assert.deepEqual(errorFrames[0]!.peer, { id: sessionId, kind: "dm" });
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          assert.equal(observed.filter((frame) => frame.type === "error").length, 0);
+        }
+        assert.equal(admittedInputs.length, 1);
+        assert.equal(admittedInputs[0]!.clientMessageId, childId);
+        assert.equal(observed.filter((frame) => frame.type === "outbound.ack" && frame.recovery).length, 1);
+        if (disposition !== "lost-ownership") {
+          assert.equal(staged.status, disposition === "stopped" ? "cancelled" : disposition === "exhausted" ? "paused" : "queued");
+          assert.equal(staged.terminal, disposition === "exhausted" || disposition === "stopped");
+          assert.equal(staged.count, disposition === "exhausted" ? 2 : disposition === "queued" ? 1 : 0);
+        }
+        finishHistory([]);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0,
+          "late physical preparation cannot escape the terminalizing fence");
+        assert.deepEqual(errors, []);
+        ws.terminate();
+      } finally { finishHistory([]); finishCommit(); await stopRig(rig); }
+    });
+  }
+
+  for (const mode of ["writer-off", "missing-hook", "takeover", "cas-miss", "lost-ownership"] as const) {
+    test(`R1 negative preparation decision ${mode}: post-commit, no phantom recovery or late send`, async () => {
+      let finishHistory!: (rows: unknown[]) => void;
+      const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+      let finishCas!: () => void;
+      const casBarrier = new Promise<void>((resolve) => { finishCas = resolve; });
+      let admitted: TurnDispatchRow | undefined;
+      let casStarted = false;
+      let casCommitted = false;
+      let scheduleCalls = 0;
+      let publishCalls = 0;
+      const terminalOutcomes: unknown[] = [];
+      const pool = { query: async (sql: string, params: unknown[] = []) => {
+        if (!/SET status = 'terminal'/.test(sql)) return { rows: [], rowCount: 0 };
+        casStarted = true;
+        terminalOutcomes.push(params[1]);
+        assert.deepEqual(params[5], ["admitted"]);
+        await casBarrier;
+        if (mode === "cas-miss") return { rows: [], rowCount: 0 };
+        assert.ok(admitted);
+        assert.equal(params[0], admitted.dispatchId);
+        assert.equal(params[6], String(admitted.leaseEpoch));
+        const row = Object.fromEntries(Object.entries(admitted).map(([key, value]) => [
+          key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+          typeof value === "bigint" ? value.toString() : value,
+        ]));
+        casCommitted = true;
+        return { rows: [{ ...row, status: "terminal", outcome: params[1], failure_code: params[2] }], rowCount: 1 };
+      } };
+      // Exercise the actual R0 production backend (no test writer override),
+      // not a stub returning the verdict we are trying to prove.
+      const backend = createPgSessionsBackend(
+        pool as Parameters<typeof createPgSessionsBackend>[0], { expectedGeneration: 1 },
+      );
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, promptQueuePreparationTimeoutMs: 40,
+        pgPool: pool,
+        admitUserTurn: async (input) => {
+          const result = fakeAdmittedDispatch(input);
+          assert.equal(result.kind, "admitted");
+          if (mode === "takeover") result.takeover = true;
+          admitted = result.dispatch;
+          return result;
+        },
+        loadMasterSessionMessages: async () => history,
+        ...(mode === "missing-hook" ? {} : {
+          failPreparationAndScheduleRecovery: async (input: Parameters<NonNullable<UserChatBridgeDeps["failPreparationAndScheduleRecovery"]>>[0]) => {
+            scheduleCalls++;
+            return mode === "lost-ownership" ? { kind: "lost_ownership" as const }
+              : backend.failPreparationAndScheduleRecovery(input);
+          },
+        }),
+        ...(mode === "writer-off" ? {
+          publishPreparationRecoveryDecision: (userId, sessionId, decision) => {
+            assert.ok(casCommitted, "production publisher must run after durable terminal success");
+            assert.equal(userId, `c:${UID}`);
+            publishCalls++;
+            rig.bridge.broadcastToUser(BigInt(UID), {
+              type: "sys.recovery_decision", peer: { id: sessionId, kind: "dm" },
+              ...decision, ts: Date.now(),
+            });
+          },
+        } : {}),
+      });
+      const observed: Record<string, unknown>[] = [];
+      try {
+        const ws = await openClient(rig.port);
+        ws.on("message", (raw) => { observed.push(JSON.parse(String(raw))); });
+        const cmid = `cm-prep-negative-${mode}`;
+        ws.send(inboundFrame({ clientMessageId: cmid, peer: { id: "sess-prep-negative", kind: "dm" } }));
+        await waitFor(() => observed.some((f) => f.code === "DISPATCH_ENRICHMENT_TIMEOUT"));
+        assert.equal(observed.some((f) => f.type === "sys.recovery_decision"), false,
+          "no negative decision before terminal CAS commits");
+        assert.equal(casStarted, mode !== "lost-ownership");
+        finishCas();
+        if (mode === "cas-miss" || mode === "lost-ownership") {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          assert.equal(observed.some((f) => f.type === "sys.recovery_decision"), false,
+            "a losing owner cannot reject the winner's recovery");
+        } else {
+          await waitFor(() => observed.some((f) => f.type === "sys.recovery_decision"));
+          const frames = observed.filter((f) => f.code === "DISPATCH_ENRICHMENT_TIMEOUT" || f.type === "sys.recovery_decision");
+          assert.deepEqual(frames.map((f) => f.type), ["error", "sys.recovery_decision"]);
+          assert.equal(frames[1]!.scheduled, false);
+          assert.equal(frames[1]!.sourceClientMessageId, cmid);
+          assert.equal(frames[1]!.reason, "enqueue_rejected");
+          if (mode === "writer-off" && process.env.OC_PREPARATION_NEGATIVE_FRAMES_OUT) {
+            await writeFile(process.env.OC_PREPARATION_NEGATIVE_FRAMES_OUT,
+              JSON.stringify({ source: "modelAuthorityBridge.test R0 actual writer=false", frames }, null, 2));
+          }
+        }
+        finishHistory([]);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0);
+        assert.equal(scheduleCalls, mode === "missing-hook" || mode === "takeover" ? 0 : 1);
+        assert.equal(publishCalls, mode === "writer-off" ? 1 : 0);
+        assert.deepEqual(terminalOutcomes, mode === "lost-ownership" ? [] : [mode === "takeover" ? "executed_error" : "not_accepted"]);
+        ws.terminate();
+      } finally { finishHistory([]); finishCas(); await stopRig(rig); }
+    });
+  }
+
+  test("duplicate during preparation cannot cancel owner; one job and zero late sends", async () => {
+    let finishHistory!: (rows: unknown[]) => void;
+    const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+    let historyReads = 0;
+    let admissions = 0;
+    const scheduled: string[] = [];
+    const terminals: unknown[][] = [];
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true,
+      promptQueuePreparationTimeoutMs: 80,
+      pgPool: { query: async (sql: string, params: unknown[] = []) => {
+        if (/SET status = 'terminal'/.test(sql)) terminals.push(params);
+        return { rows: [], rowCount: 0 };
+      } },
+      admitUserTurn: async (input) => { admissions++; return fakeAdmittedDispatch(input); },
+      loadMasterSessionMessages: async () => { historyReads++; return history; },
+      failPreparationAndScheduleRecovery: async (input) => {
+        scheduled.push(input.dispatchId);
+        return { kind: "scheduled" };
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const frame = inboundFrame({ clientMessageId: "cm-prep-duplicate", peer: { id: "sess-prep-duplicate", kind: "dm" } });
+      ws.send(frame);
+      await waitFor(() => historyReads === 1);
+      ws.send(frame);
+      await waitFor(() => scheduled.length === 1);
+      finishHistory([]);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.equal(admissions, 1, "duplicate observes the existing dispatch rather than owning preparation");
+      assert.equal(historyReads, 1);
+      assert.equal(scheduled.length, 1, "only the first timer can schedule recovery");
+      assert.equal(terminals.length, 0, "source terminalization belongs to the atomic backend, not a second CAS");
+      assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0);
+      ws.terminate();
+    } finally { finishHistory([]); await stopRig(rig); }
+  });
+
+  test("successful send with missing receipt and repeated cmid never gains another timer/job", async () => {
+    let admissions = 0;
+    let historyReads = 0;
+    let scheduled = 0;
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, holdDispatchReceipt: true,
+      promptQueuePreparationTimeoutMs: 400,
+      admitUserTurn: async (input) => { admissions++; return fakeAdmittedDispatch(input); },
+      loadMasterSessionMessages: async () => { historyReads++; return []; },
+      failPreparationAndScheduleRecovery: async () => { scheduled++; return { kind: "scheduled" }; },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const observed: unknown[] = [];
+      ws.on("message", (data) => { try { observed.push(JSON.parse(String(data))); } catch {} });
+      const frame = inboundFrame({ clientMessageId: "cm-prep-sent-duplicate", peer: { id: "sess-prep-sent-duplicate", kind: "dm" } });
+      ws.send(frame);
+      await waitFor(() => rig.containerSeen.some((raw) => JSON.parse(raw).type === "inbound.message"))
+        .catch(() => assert.fail(JSON.stringify({ observed, errors: rig.deferredPoolErrors.map(String) })));
+      ws.send(frame);
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      assert.equal(admissions, 1);
+      assert.equal(historyReads, 1);
+      assert.equal(scheduled, 0, "missing receipt is unknown, never proof of non-execution");
+      assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 1);
+      assert.deepEqual(rig.deferredPoolErrors, [], "duplicate must not terminalize the already-sent source");
+      ws.terminate();
+    } finally { await stopRig(rig); }
+  });
+
+  for (const invalid of ["takeover", "foreign_uuid", "later_attempt", "later_epoch"] as const) {
+    test(`source ${invalid} never qualifies for a new preparation child`, async () => {
+      let scheduled = 0;
+      let finishHistory!: (rows: unknown[]) => void;
+      const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+      const terminalCodes: unknown[] = [];
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, promptQueuePreparationTimeoutMs: 40,
+        pgPool: { query: async (sql: string, params: unknown[] = []) => {
+          if (/SET status = 'terminal'/.test(sql)) terminalCodes.push(params[2]);
+          return { rows: [], rowCount: 0 };
+        } },
+        admitUserTurn: async (input) => {
+          const result = fakeAdmittedDispatch(input);
+          assert.equal(result.kind, "admitted");
+          if (invalid === "takeover") result.takeover = true;
+          if (invalid === "foreign_uuid") result.dispatch.dispatchId = "00000000-0000-0000-0000-000000000174";
+          if (invalid === "later_attempt") result.dispatch.attemptNo = 2;
+          if (invalid === "later_epoch") result.dispatch.leaseEpoch = 2;
+          return result;
+        },
+        loadMasterSessionMessages: async () => history,
+        failPreparationAndScheduleRecovery: async () => { scheduled++; return { kind: "scheduled" }; },
+      });
+      try {
+        const ws = await openClient(rig.port);
+        ws.send(inboundFrame({ clientMessageId: `cm-prep-${invalid}`, peer: { id: "sess-prep-invalid", kind: "dm" } }));
+        await waitFor(() => terminalCodes.includes("dispatch_enrichment_timeout"));
+        finishHistory([]);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        assert.equal(scheduled, 0);
+        assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0);
+        ws.terminate();
+      } finally { finishHistory([]); await stopRig(rig); }
+    });
+  }
+});
 
 describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
   const cases = [

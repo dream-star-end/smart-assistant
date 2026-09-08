@@ -36,7 +36,7 @@ export type TurnStatusState =
   // 进程 spawn 中 / 带历史恢复中。首个内容块或后继阶段态到达即被清除。
   | "engine_starting"
   | "engine_resuming"
-  | { kind: "retrying"; attempt: number; max: number; retryAt: number };
+  | { kind: "retrying"; attempt: number; max: number; retryAt: number; cause?: "preparation" };
 
 /** 判别 `_turnStatus` 是否处于「引擎冷启动」阶段(内容帧兜底消解 + 渲染层消费)。 */
 export function isEngineStartupTurnStatus(
@@ -48,7 +48,7 @@ export function isEngineStartupTurnStatus(
 /** 判别 `_turnStatus` 是否处于「自动重试中」态（供 reducer 内容帧自动消解 + 渲染层消费）。 */
 export function isRetryingTurnStatus(
   s: TurnStatusState | null | undefined,
-): s is { kind: "retrying"; attempt: number; max: number; retryAt: number } {
+): s is { kind: "retrying"; attempt: number; max: number; retryAt: number; cause?: "preparation" } {
   return typeof s === "object" && s !== null && s.kind === "retrying";
 }
 
@@ -294,6 +294,7 @@ export type ChatMessage = {
   _automaticRecoveryRootClientMessageId?: string;
   _automaticRecoveryAttempt?: number;
   _automaticRecoveryMax?: number;
+  _automaticRecoveryCause?: "preparation";
   /** Client-local one-shot fence for the source turn. Server rejection must
    * not make a full-session sync schedule the same automatic recovery again. */
   _automaticRecoveryAttempted?: boolean;

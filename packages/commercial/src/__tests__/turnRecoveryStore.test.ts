@@ -109,6 +109,7 @@ describe('Master automatic recovery scheduler store', () => {
   test('pauseSilentRecoveryLineage RETURNING includes paused and cancelled descendants', async () => {
     const q = {
       async query(sql: string) {
+        if (sql.includes('SELECT messages,deleted_at FROM client_sessions')) return { rows: [{ messages: '[]',deleted_at: null }],rowCount: 1 }
         if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
         assert.match(sql, /RETURNING root_client_message_id, error_code, semantic_recovery_attempt, status, pause_reason/)
         return {
@@ -166,13 +167,16 @@ describe('Master automatic recovery scheduler store', () => {
   })
 
   test('container receipt atomically accepts dispatch and commits the semantic attempt', async () => {
-    const pool = fakePool((sql, params) => {
+    const query = async (sql: string, params: unknown[] = []) => {
+      if (['BEGIN','COMMIT','ROLLBACK'].includes(sql) || sql.includes('pg_advisory_xact_lock')) return { rows: [],rowCount: 0 }
+      if (sql.includes('SELECT user_id::text')) return { rows: [{ user_id: '7',session_id: 'session-1',root_client_message_id: 'root' }],rowCount: 1 }
       assert.match(sql, /WITH accepted AS/)
       assert.match(sql, /status='accepted'/)
       assert.match(sql, /status='forwarded'/)
       assert.deepEqual(params, ['dispatch-1', 2, 5])
-      return { rowCount: 1 }
-    })
+      return { rows: [],rowCount: 1 }
+    }
+    const pool = { query,connect: async () => ({ query,release() {} }) } as unknown as Pool
     assert.equal(await markRecoveryContainerReceipt(pool, {
       dispatchId: 'dispatch-1',
       dispatchAttemptNo: 2,
@@ -189,6 +193,7 @@ describe('Master automatic recovery scheduler store', () => {
         if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
           return { rows: [], rowCount: 0 }
         }
+        if (sql.includes('SELECT messages,deleted_at FROM client_sessions')) return { rows: [{ messages: '[]',deleted_at: null }],rowCount: 1 }
         if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
         if (sql.includes('SELECT j.job_id')) return { rows: [{ job_id: 'job-1' }], rowCount: 1 }
         if (sql.includes("SET status='sent'")) return { rows: [], rowCount: 1 }
@@ -227,6 +232,7 @@ describe('Master automatic recovery scheduler store', () => {
     const client = {
       async query(sql: string) {
         if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT messages,deleted_at FROM client_sessions')) return { rows: [{ messages: '[]',deleted_at: null }],rowCount: 1 }
         if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
         if (sql.includes('SELECT j.job_id')) return { rows: [], rowCount: 0 }
         throw new Error(`unexpected SQL: ${sql}`)
@@ -260,6 +266,7 @@ describe('Master automatic recovery scheduler store', () => {
         events.push(sql)
         if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 }
         if (sql === 'COMMIT') throw new Error('commit acknowledgement lost')
+        if (sql.includes('SELECT messages,deleted_at FROM client_sessions')) return { rows: [{ messages: '[]',deleted_at: null }],rowCount: 1 }
         if (sql.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 }
         if (sql.includes('SELECT j.job_id')) return { rows: [{ job_id: 'job-1' }], rowCount: 1 }
         if (sql.includes("SET status='sent'")) return { rows: [], rowCount: 1 }

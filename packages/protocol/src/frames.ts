@@ -199,6 +199,8 @@ export const InboundMessage = Type.Object({
            * timeout must not resume the same potentially poisoned native
            * session. Omitted means ordinary native continuation. */
           resetNativeSession: Type.Optional(Type.Literal(true)),
+          /** Display cause stamped only by the master after durable origin validation. */
+          cause: Type.Optional(Type.Literal('preparation')),
         }, { additionalProperties: false }),
         /** Rolling compatibility for an already-cached frontend. The master
          * normalizes this legacy first hop to root=source, attempt=1, max=10. */
@@ -1043,6 +1045,8 @@ export const OutboundError = Type.Object({
     Type.Literal('engine_error'),
     Type.Literal('auth_error'),
     Type.Literal('session_persist_unavailable'),
+    Type.Literal('dispatch_enrichment_timeout'),
+    Type.Literal('dispatch_preparation_retry_exhausted'),
   ]),
   /** 简短人类文案,前端直接渲染。 */
   message: Type.String(),

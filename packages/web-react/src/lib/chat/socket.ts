@@ -9,7 +9,7 @@
  * ping-pong watchdog、hello + 三层断点续传、safeWsSend 2MB 背压、离线队列三段式
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { MessageReplyQuote, PendingPreparationRecovery } from "@openclaude/protocol";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -1815,6 +1815,20 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
+        if (!isCronOrHeartbeat && !frame.meta?.interrupted && clientMessageId) {
+          const preparationChild = sess.messages.find((m) => m.role === "user" && m.id === clientMessageId &&
+            m._automaticRecovery === true && m._automaticRecoveryCause === "preparation");
+          if (preparationChild && !sess.messages.some((m) => m._clientMessageId === clientMessageId && m._errorCode)) {
+            // The live final is exact terminal evidence even before REST/tape
+            // arrives. Preserve it on this child so a delayed readmit ACK
+            // cannot revive it; do not consume semantic recovery errors.
+            preparationChild.status = "replied";
+            if (this.pendingRecoveryErrors.get(sess.id)?.paint.normalized === "dispatch_enrichment_timeout") {
+              this.settlePendingRecoveryError(sess.id, clientMessageId, "adopted");
+            }
+            this.deps.persistSession?.(sess.id);
+          }
+        }
         if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
         this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
@@ -2463,6 +2477,9 @@ export class ChatSocket {
         }
         if (frame.admitted && frame.peer?.id && frame.clientMessageId) {
           if (frame.recovery?.automatic === true) {
+            const session = this.sessions.get(frame.peer.id);
+            if (frame.recovery.cause === "preparation" && (!session ||
+              this.isObsoletePreparationRecovery(session, frame.recovery, frame.clientMessageId))) return;
             this.adoptMasterAutomaticRecovery(frame.peer.id, frame.clientMessageId, frame.recovery);
           }
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
@@ -2597,6 +2614,7 @@ export class ChatSocket {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
     if (!isClientMessageId(recovery.sourceClientMessageId)) return;
+    if (recovery.cause === "preparation" && this.isObsoletePreparationRecovery(sess, recovery, clientMessageId)) return;
     // 用户已对该血统按过停止(含「正在重试中」软状态下的停止):master 的 stop 控制可能与
     // 已入队的恢复子轮竞争,晚到的 ack 领养不得再把这条会话重新拉回 in-flight。
     if (
@@ -2609,6 +2627,13 @@ export class ChatSocket {
     }
     // 子轮领养 = 延后红卡的正向收口:丢弃暂存的错误,软状态由下方权威 attempt 接管。
     this.settlePendingRecoveryError(sessId, recovery.sourceClientMessageId, "adopted");
+    // A preparation job can re-admit the same logical child after a physical
+    // timeout. Its lineage still names the original source; retire only this
+    // child's old preparation error as well (never a semantic/tape failure).
+    if (recovery.cause === "preparation" &&
+      this.pendingRecoveryErrors.get(sessId)?.paint.normalized === "dispatch_enrichment_timeout") {
+      this.settlePendingRecoveryError(sessId, clientMessageId, "adopted");
+    }
     const attempt = Number.isSafeInteger(recovery.attempt) && recovery.attempt >= 1
       ? Math.min(recovery.attempt, AUTOMATIC_TURN_RETRY_MAX)
       : 1;
@@ -2645,9 +2670,11 @@ export class ChatSocket {
         _automaticRecoveryRootClientMessageId: rootClientMessageId,
         _automaticRecoveryAttempt: attempt,
         _automaticRecoveryMax: AUTOMATIC_TURN_RETRY_MAX,
+        ...(recovery.cause === "preparation" ? { _automaticRecoveryCause: "preparation" as const } : {}),
       });
-    } else if (existing.status !== "sent") {
+    } else {
       existing.status = "sent";
+      if (recovery.cause === "preparation") existing._automaticRecoveryCause = "preparation";
     }
     // Claim the turn so live frames stamped with this cmid project normally
     // and TurnActivity mounts; the soft hint replaces the terminal card.
@@ -2669,16 +2696,68 @@ export class ChatSocket {
       this.resetThinkingSafety(sessId);
     }
     this.dispatchSlots.set(sessId, clientMessageId);
-    sess._turnStatus = {
+    if (!alreadyActive || recovery.cause !== "preparation" ||
+      (typeof sess._turnStatus === "object" && sess._turnStatus?.kind === "retrying")) sess._turnStatus = {
       kind: "retrying",
       attempt,
       max: AUTOMATIC_TURN_RETRY_MAX,
       retryAt: Date.now(),
+      ...(recovery.cause === "preparation" || existing?._automaticRecoveryCause === "preparation"
+        ? { cause: "preparation" as const } : {}),
     };
     sess._lastRouting = { ...routing };
     this.clearTransientNotice(sessId);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
+  }
+
+  /** Late ACK/REST must not resurrect a finished child, a stopped root, or
+   * take over a newer human turn. This is UI ownership, never replay authority. */
+  private isObsoletePreparationRecovery(
+    sess: ChatSession,
+    recovery: { sourceClientMessageId: string; rootClientMessageId: string },
+    childId?: string,
+  ): boolean {
+    if ([recovery.sourceClientMessageId, recovery.rootClientMessageId, childId].some(
+      (id) => !!id && sess._cancelledAutomaticRecoveryIds?.[id] === true,
+    )) return true;
+    const lastHuman = [...sess.messages].reverse().find((m) => m.role === "user" && !m._automaticRecovery);
+    if (!lastHuman || ![recovery.sourceClientMessageId, recovery.rootClientMessageId].includes(lastHuman.id)) return true;
+    return !!childId && (detectServerTerminalTurns(sess.messages).has(childId) ||
+      sess.messages.some((m) => m.role === "user" && m.id === childId && m.status === "replied"));
+  }
+
+  private adoptPendingPreparationRecovery(sess: ChatSession, pending: PendingPreparationRecovery): void {
+    if (pending.cause !== "preparation" || pending.mode !== "replay" ||
+      !isClientMessageId(pending.sourceClientMessageId) || !isClientMessageId(pending.rootClientMessageId) ||
+      !Number.isSafeInteger(pending.attempt) || pending.attempt < 1 || pending.attempt > AUTOMATIC_TURN_RETRY_MAX ||
+      pending.max !== AUTOMATIC_TURN_RETRY_MAX ||
+      (pending.clientMessageId !== undefined && !isClientMessageId(pending.clientMessageId)) ||
+      this.isObsoletePreparationRecovery(sess, pending, pending.clientMessageId)) return;
+    if (pending.clientMessageId) {
+      this.adoptMasterAutomaticRecovery(sess.id, pending.clientMessageId, { ...pending, automatic: true });
+      return;
+    }
+    // No child identity exists yet. Keep the exact source active; never mint a
+    // local child. Reuse deferred-error Stop/telemetry rather than a new card.
+    if (sess._sendingInFlight && sess._activeClientMessageId !== pending.sourceClientMessageId) return;
+    const paint: DeferredTerminalErrorPaint = {
+      normalized: "dispatch_enrichment_timeout",
+      text: "本轮环境准备超时，尚未启动模型。请重试。",
+      detail: "",
+      clientMessageId: pending.sourceClientMessageId,
+    };
+    if (!this.pendingRecoveryErrors.has(sess.id) && !this.deferTerminalErrorForRecovery(sess.id, paint)) return;
+    sess.messages = sess.messages.filter((m) => !(m.role === "assistant" &&
+      m._clientMessageId === pending.sourceClientMessageId && normalizeTurnErrorCode(m._errorCode) === "dispatch_enrichment_timeout"));
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = pending.sourceClientMessageId;
+    sess._activeAgentId = pending.agentId || sess.agentId;
+    sess._deferredTerminalErrorClientMessageId = pending.sourceClientMessageId;
+    sess._turnStartedAt ??= Date.now();
+    this.applyRecoveryDecision({ ...pending, type: "sys.recovery_decision", peer: { id: sess.id, kind: "dm" },
+      errorCode: "dispatch_enrichment_timeout", scheduled: true });
+    this.resetThinkingSafety(sess.id);
   }
 
   private adoptPendingAutomaticRecoveryFromHistory(sess: ChatSession): void {
@@ -2721,6 +2800,7 @@ export class ChatSocket {
         : lastUser._recoveryOfClientMessageId,
       attempt,
       max: AUTOMATIC_TURN_RETRY_MAX,
+      ...(lastUser._automaticRecoveryCause === "preparation" ? { cause: "preparation" as const } : {}),
       ...(lastUser._routing?.model ? { model: lastUser._routing.model } : {}),
     });
   }
@@ -2749,7 +2829,33 @@ export class ChatSocket {
         this.materializePendingRecoveryError(sessId, "decision_timeout");
       }
     }
-    const timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
+    const preparationChild = paint.normalized === "dispatch_enrichment_timeout"
+      ? sess.messages.find((m) => m.role === "user" && m.id === clientMessageId &&
+        m._automaticRecovery === true && m._automaticRecoveryCause === "preparation" &&
+        m._recoveryMode === "replay" && (m._source === "server" || !!m._turnTapeId) &&
+        isClientMessageId(m._recoveryOfClientMessageId) &&
+        isClientMessageId(m._automaticRecoveryRootClientMessageId))
+      : undefined;
+    const timer = setTimeout(() => {
+      if (this.pendingRecoveryErrors.get(sessId)?.timer !== timer) return;
+      if (preparationChild) {
+        // Rolling old bridges may report one physical attempt's timeout even
+        // while the durable child is queued. Only authority can finish it;
+        // this grace expiry asks the existing backoff reconciler, not painter.
+        const current = this.sessions.get(sessId);
+        if (!current?._sendingInFlight || current._activeClientMessageId !== clientMessageId ||
+          this.isObsoletePreparationRecovery(current, {
+            sourceClientMessageId: preparationChild._recoveryOfClientMessageId!,
+            rootClientMessageId: preparationChild._automaticRecoveryRootClientMessageId!,
+          }, clientMessageId)) {
+          this.settlePendingRecoveryError(sessId, clientMessageId, "adopted");
+          return;
+        }
+        this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+        return;
+      }
+      this.materializePendingRecoveryError(sessId, "decision_timeout");
+    }, RECOVERY_DECISION_GRACE_MS);
     this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false });
     this.stashProblemCardSourceCode(sessId, clientMessageId, paint.normalized);
     return true;
@@ -2761,6 +2867,33 @@ export class ChatSocket {
     if (!sessId) return;
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    const preparation = normalizeTurnErrorCode(frame.errorCode) === "dispatch_enrichment_timeout";
+    if (preparation && !frame.scheduled) {
+      const source = sess.messages.find((m) => m.role === "user" && m.id === frame.sourceClientMessageId);
+      const ownsSource = !!source && sess._sendingInFlight && sess._activeClientMessageId === source.id;
+      if (!source || !isClientMessageId(source.id) ||
+        sess._cancelledAutomaticRecoveryIds?.[source.id] === true ||
+        (source._automaticRecoveryRootClientMessageId &&
+          sess._cancelledAutomaticRecoveryIds?.[source._automaticRecoveryRootClientMessageId] === true) ||
+        (sess._sendingInFlight && sess._activeClientMessageId && !ownsSource) ||
+        (!ownsSource && this.isObsoletePreparationRecovery(sess, {
+          sourceClientMessageId: source.id,
+          rootClientMessageId: source._automaticRecoveryRootClientMessageId ?? source.id,
+        })) || sess.messages.some((m) => m.role === "user" &&
+          m._automaticRecoveryCause === "preparation" && m._recoveryOfClientMessageId === source.id)) return;
+      // A locally queued human row is not a newly admitted owner. Finish the
+      // still-owned source so its queued successor can dispatch immediately.
+      // R0 writer-off (and unsafe R1 sources) are authoritative no-job
+      // decisions. Remember before looking for a pending error: the decision
+      // may arrive first, and the later error must paint immediately rather
+      // than invent twenty seconds of preparation. Reuse the persisted
+      // per-source recovery decision fence, never a session-wide flag.
+      sess._automaticRecoveryDecisions = { ...(sess._automaticRecoveryDecisions ?? {}), [source.id]: true };
+      this.deps.persistSession?.(sessId);
+    }
+    if ((frame.cause === "preparation" || preparation) && frame.scheduled &&
+      (sess._automaticRecoveryDecisions?.[frame.sourceClientMessageId] === true ||
+        this.isObsoletePreparationRecovery(sess, frame))) return;
     const pending = this.pendingRecoveryErrors.get(sessId);
     const matchesPending = !!pending &&
       (!pending.clientMessageId || pending.clientMessageId === frame.sourceClientMessageId);
@@ -2768,14 +2901,24 @@ export class ChatSocket {
       if (matchesPending && pending) {
         clearTimeout(pending.timer);
         pending.decided = true;
-        pending.timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "adoption_timeout"), RECOVERY_ADOPTION_GRACE_MS);
+        if (frame.cause === "preparation" || frame.errorCode.toLowerCase() === "dispatch_enrichment_timeout") {
+          // Queue wait without an executor does not consume preparation budget.
+          // A timer is not terminal evidence: recheck the durable snapshot with
+          // the existing bounded/backoff reconciler, never synthesize a failure.
+          pending.timer = setTimeout(() => this.startContinuousReconcile(sessId), RECOVERY_ADOPTION_GRACE_MS);
+        } else {
+          pending.timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "adoption_timeout"), RECOVERY_ADOPTION_GRACE_MS);
+        }
       }
       // 软状态仍在(延后路径)或本轮仍在飞:用权威 attempt 刷新文案;不凭裁决伪造 in-flight。
       if (sess._sendingInFlight && (matchesPending || sess._activeClientMessageId === frame.sourceClientMessageId)) {
         const attempt = Number.isSafeInteger(frame.attempt) && frame.attempt >= 1
           ? Math.min(frame.attempt, AUTOMATIC_TURN_RETRY_MAX)
           : 1;
-        sess._turnStatus = { kind: "retrying", attempt, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
+        sess._turnStatus = { kind: "retrying", attempt, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now(),
+          ...(frame.cause === "preparation" || frame.errorCode.toLowerCase() === "dispatch_enrichment_timeout"
+            ? { cause: "preparation" as const } : {}),
+        };
         this.scheduleNotify();
       }
       return;
@@ -3829,6 +3972,7 @@ export class ChatSocket {
       timelineSnapshotMaxSeq?: number;
       /** Legacy backend fallback: invalidate hydrated history on every full read. */
       invalidateHistoryCache?: boolean;
+      pendingRecovery?: PendingPreparationRecovery | null;
       openDispatch?: {
         dispatchId: string;
         clientMessageId: string;
@@ -3868,11 +4012,17 @@ export class ChatSocket {
     const hasVersion = typeof serverUpdatedAt === "number" && Number.isFinite(serverUpdatedAt);
     const watermark = s._lastServerSyncUpdatedAt ?? 0;
     if (hasVersion && serverUpdatedAt < watermark) return;
+    if (archive?.pendingRecovery?.cause === "preparation" && (
+      (typeof archive.historyRevision === "number" && typeof s._historyRevision === "number" &&
+        archive.historyRevision < s._historyRevision) ||
+      (hasTimelineGeneration && typeof s._timelineGeneration === "number" &&
+        incomingTimelineGeneration < s._timelineGeneration)
+    )) return;
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
     const openDispatch = archive?.openDispatch;
-    if (openDispatch?.clientMessageId && !s._sendingInFlight) {
+    if (openDispatch?.clientMessageId && !s._sendingInFlight && archive?.pendingRecovery?.cause !== "preparation") {
       s._sendingInFlight = true;
       s._activeClientMessageId = openDispatch.clientMessageId;
     }
@@ -3995,6 +4145,15 @@ export class ChatSocket {
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
     expireGenPlaceholdersAgainstServerRows(s);
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
+    if (archive?.pendingRecovery?.cause === "preparation") {
+      terminalTurns.delete(archive.pendingRecovery.sourceClientMessageId);
+    } else {
+      const deferred = this.pendingRecoveryErrors.get(sessId);
+      if (deferred?.paint.normalized === "dispatch_enrichment_timeout" && deferred.clientMessageId &&
+        terminalTurns.has(deferred.clientMessageId)) {
+        this.settlePendingRecoveryError(sessId, deferred.clientMessageId, "adopted");
+      }
+    }
     this.convergeTerminalTurns(s, terminalTurns);
     this.reconcileUnpublishedTapeRetry(sessId);
     this.scheduleNotify();
@@ -4022,7 +4181,10 @@ export class ChatSocket {
     // `m-recover-*` row is in the sync payload. If it is the last user row and
     // no terminal assistant row follows it, adopt it so the source red card is
     // hidden and「模型繁忙，正在重试中（n/10）」shows, same as the live path.
-    if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
+    if (this.masterOwnsAutomaticRecovery) {
+      if (archive?.pendingRecovery) this.adoptPendingPreparationRecovery(s, archive.pendingRecovery);
+      this.adoptPendingAutomaticRecoveryFromHistory(s);
+    }
     // Login/reload can open WS before REST history arrives. If that initial
     // shell hello may not include this session at all. Register idle cursors
     // too: otherwise a cached high cursor survives a gateway restart and
@@ -5694,7 +5856,16 @@ export class ChatSocket {
         if (rootId) sess._cancelledAutomaticRecoveryIds[rootId] = true;
       }
       const stopAgentId = sess._activeAgentId || sess.agentId || this.deps.defaultAgentId || "main";
-      this.materializePendingRecoveryError(sessId, "stop_fenced");
+      if (deferred.paint.normalized === "dispatch_enrichment_timeout") {
+        // The user cancelled preparation, not a failed model turn. Keep the
+        // durable Stop but never turn its pending source into a timeout card.
+        this.settlePendingRecoveryError(sessId, lineageId, "adopted");
+        this.clearSendingState(sess, { clearThinking: true });
+        const source = sess.messages.find((m) => m.role === "user" && m.id === lineageId);
+        if (source) source.status = "sent";
+      } else {
+        this.materializePendingRecoveryError(sessId, "stop_fenced");
+      }
       sess._recoveryStatus = { kind: "completed" };
       const fenceId = rootId ?? lineageId;
       if (fenceId) {

@@ -168,3 +168,12 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.queryByText("正在恢复实时内容…")).not.toBeInTheDocument();
   });
 });
+
+
+test('preparation cause uses one precise activity without the semantic ten-retry counter', () => {
+  render(<TurnActivity info={{ agentName: '助手', startedAt: Date.now(),
+    turnStatus: { kind: 'retrying', attempt: 1, max: 10, retryAt: Date.now(), cause: 'preparation' } }} />);
+  expect(screen.getAllByLabelText('生成中')).toHaveLength(1);
+  expect(screen.getByLabelText('生成中')).toHaveTextContent('正在重新准备…');
+  expect(screen.queryByText(/模型繁忙|1\/10/)).toBeNull();
+});

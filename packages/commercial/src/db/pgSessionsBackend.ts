@@ -76,6 +76,7 @@ import {
   timelineIdentity,
   EPOCH_BAND,
   type TimelineLifecycle,
+  type PendingPreparationRecovery,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
@@ -229,10 +230,19 @@ import {
   bindRecoveryJobDispatch,
   enqueueAutomaticRecoveryJob,
   lockRecoveryRoot,
+  lockRecoverySession,
+  lockRecoverySessionAdvisory,
+  bumpPreparationVisibility,
+  cancelPreparationJobUnderFence,
   pauseSilentRecoveryLineage,
   settleRecoveryJobForTape,
   type RecoveryJobTerminalRow,
 } from "../dispatch/turnRecoveryStore.js";
+import { canonicalDigestHex } from "../connectors/canonicalJson.js";
+import {
+  PREPARATION_RECOVERY_WRITER_ENABLED, PREPARATION_SOURCE_VISIBLE_SQL,
+  freezePreparationRequest, validPreparationSnapshot, preparationChildRequest, preparationRequestMatches,
+} from "../dispatch/preparationRecovery.js";
 import {
   cancelPendingPermissionPromptsForTurn,
   settleStopControlsForTurn,
@@ -987,7 +997,13 @@ function deferredUserReplayMetadata(message: MessageLike): MessageLike {
         (typeof ref.base64 === "string" && ref.base64.length > 0);
     })
   ));
+  const recoveryMetadata = Object.fromEntries([
+    "_recoveryOfClientMessageId", "_recoveryMode", "_automaticRecovery",
+    "_automaticRecoveryRootClientMessageId", "_automaticRecoveryAttempt", "_automaticRecoveryMax",
+    "_automaticRecoveryCause",
+  ].filter((key) => message[key] !== undefined).map((key) => [key,message[key]]));
   return {
+    ...recoveryMetadata,
     ...(routing ? { _routing: routing } : {}),
     ...(typeof message._sendAttempt === "number" && Number.isSafeInteger(message._sendAttempt) &&
       message._sendAttempt >= 0
@@ -1330,6 +1346,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
 export type AutomaticRecoveryDecision =
   | {
       scheduled: true;
+      cause?: "preparation";
       sourceClientMessageId: string;
       rootClientMessageId: string;
       errorCode: string;
@@ -1358,6 +1375,8 @@ export type AutomaticRecoveryDecision =
     };
 
 export interface PgSessionsBackendOptions {
+  /** Explicit isolated-fixture injection, never read from shared environment. */
+  testPreparationRecoveryWriter?: boolean;
   /** 启动时快照的权威 generation(RFC D5:probe 复核 marker 未漂移)。 */
   expectedGeneration: number;
   /** Runs only after the owning tape/cost transaction commits. Callback
@@ -1625,6 +1644,7 @@ export interface LosslessTurnTapeStorage {
 
 // ── durable turn dispatch 受理面(RFC §2.1 / §2.5 / GET turn-tape-state)──────────
 export interface AdmitUserTurnInput {
+  preparationRequest?: Record<string, unknown>;
   /** dispatch user_id(numeric)。 */
   uid: bigint;
   /** client_sessions.user_id(= `c:<uid>`),append user 行用。 */
@@ -1714,7 +1734,15 @@ export interface TurnTapeStateResult {
   producerFenced?: boolean;
 }
 
+export interface PreparationFailureInput {
+  uid: bigint; sessionId: string; clientMessageId: string; dispatchId: string;
+  attemptNo: number; ownerId: string; leaseEpoch: number;
+}
+export type PreparationFailureResult = { kind: "scheduled" | "not_eligible" | "lost_ownership" };
+
 export interface DispatchAdmissionBackend {
+  failPreparationAndScheduleRecovery(input: PreparationFailureInput): Promise<PreparationFailureResult>;
+
   /** 单事务:幂等 append user 行 → 取 _seq → UPSERT dispatch 冲突表裁定(RFC §2.1)。 */
   admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult>;
   /** Rolling-upgrade compensator: reconstruct finalized recoverable tapes
@@ -1770,6 +1798,7 @@ async function mergeVerifiedTurnStatusRows(
         WHERE user_id=$1 AND session_id=$2
           AND status='terminal' AND client_notified=TRUE
           AND outcome IN ('not_accepted','executed_error')
+          AND ${PREPARATION_SOURCE_VISIBLE_SQL}
           AND anchor_seq IS NOT NULL
         ORDER BY anchor_seq, dispatch_id`,
       [uidMatch[1], sessionId],
@@ -6920,6 +6949,7 @@ async function readUnifiedTimelineStatuses(
         WHERE user_id=$1 AND session_id=$2
           AND status='terminal' AND client_notified=TRUE
           AND outcome IN ('not_accepted','executed_error')
+          AND ${PREPARATION_SOURCE_VISIBLE_SQL}
           AND anchor_seq=ANY($3::bigint[])
         ORDER BY anchor_seq,dispatch_id`,
       [uidMatch[1], sessionId, anchorSeqs],
@@ -7928,6 +7958,7 @@ export async function commitVisibleLosslessTurnPhaseA(
     ).rows[0];
     if (!session) return { applied: "session_not_found" };
     if (session.deleted_at !== null) return { applied: "session_deleted" };
+    if (billingUserId !== null) await lockRecoverySessionAdvisory(client, { userId: billingUserId, sessionId: request.sessionId });
     if ((request.dispatchId === undefined) !== (request.attemptNo === undefined)) {
       throw new Error("lossless turn tape dispatch identity is incomplete");
     }
@@ -8272,9 +8303,39 @@ async function readOpenDispatchForSession(
   queryable: Pool | PoolClient,
   sessionId: string,
   userId: string,
-): Promise<{ openDispatch?: ClientSession["openDispatch"] }> {
+): Promise<{ openDispatch?: ClientSession["openDispatch"]; pendingRecovery?: PendingPreparationRecovery }> {
   const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
   if (!uidMatch) return {};
+  const pending = (await queryable.query<{
+    source_client_message_id: string; root_client_message_id: string; dispatch_id: string | null;
+    preparation_retry_count: number; request_json: Record<string,unknown>; next_attempt_at: Date;
+    session_messages: string;
+  }>(`SELECT j.source_client_message_id,j.root_client_message_id,j.dispatch_id,j.preparation_retry_count,j.request_json,j.next_attempt_at,
+      s.messages AS session_messages
+    FROM turn_recovery_jobs j JOIN client_sessions s ON s.id=j.session_id AND s.user_id=$3
+    WHERE j.user_id=$1 AND j.session_id=$2 AND j.job_origin='pre_transfer_enrichment'
+      AND s.deleted_at IS NULL AND j.status IN ('queued','leased','sent') ORDER BY j.created_at DESC LIMIT 1`,
+    [uidMatch[1],sessionId,userId])).rows[0];
+  // Read TEXT as-is: PostgreSQL JSONB coercion would reject legal historic NUL
+  // escapes. The job and latest human identity come from one current snapshot.
+  let pendingIsCurrent = false;
+  if (pending) {
+    try {
+      const messages: MessageLike[] = JSON.parse(pending.session_messages);
+      const latestHuman = Array.isArray(messages)
+        ? [...messages].reverse().find((message) => message?.role === "user" && message._automaticRecovery !== true)
+        : undefined;
+      pendingIsCurrent = latestHuman?.id === pending.source_client_message_id || latestHuman?.id === pending.root_client_message_id;
+    } catch { /* malformed authority cannot advertise pending recovery */ }
+  }
+  const pendingState: { pendingRecovery?: PendingPreparationRecovery } = pending && pendingIsCurrent ? {
+    pendingRecovery: { cause: "preparation",mode: "replay",sourceClientMessageId: pending.source_client_message_id,
+      rootClientMessageId: pending.root_client_message_id,attempt: 1,max: AUTOMATIC_TURN_RETRY_MAX,
+      retryAt: pending.next_attempt_at.getTime(),
+      ...(pending.dispatch_id && typeof pending.request_json.clientMessageId === "string" ? { clientMessageId: pending.request_json.clientMessageId } : {}),
+      ...(typeof pending.request_json.agentId === "string" ? { agentId: pending.request_json.agentId } : {}),
+      ...(typeof pending.request_json.model === "string" ? { model: pending.request_json.model } : {}) },
+  } : {};
   const row = (
     await queryable.query<{
       dispatch_id: string;
@@ -8300,8 +8361,9 @@ async function readOpenDispatchForSession(
       [uidMatch[1], sessionId],
     )
   ).rows[0];
-  if (!row) return {};
+  if (!row) return pendingState;
   return {
+    ...pendingState,
     openDispatch: {
       dispatchId: row.dispatch_id,
       clientMessageId: row.client_message_id,
@@ -8330,20 +8392,94 @@ export function createPgSessionsBackend(
       });
     },
 
+    async failPreparationAndScheduleRecovery(input: PreparationFailureInput): Promise<PreparationFailureResult> {
+      if ((!PREPARATION_RECOVERY_WRITER_ENABLED && options.testPreparationRecoveryWriter !== true) ||
+          input.attemptNo !== 1 || input.leaseEpoch !== 1) return { kind: "not_eligible" };
+      let decision: AutomaticRecoveryDecision | null = null;
+      const result = await withTx(pool, async (client): Promise<PreparationFailureResult> => {
+        const identity = { userId: input.uid, sessionId: input.sessionId, rootClientMessageId: input.clientMessageId };
+        const session = await lockRecoverySession(client, identity);
+        if (!session || session.deleted || session.latestClientMessageId !== input.clientMessageId) return { kind: "not_eligible" };
+        await lockRecoveryRoot(client, identity);
+        const source = (await client.query<{ preparation_request_json: unknown; preparation_request_sha256: unknown }>(
+          `SELECT preparation_request_json,preparation_request_sha256 FROM turn_dispatches
+            WHERE dispatch_id=$1 AND user_id=$2 AND session_id=$3 AND client_message_id=$4
+              AND attempt_no=1 AND lease_epoch=1 AND owner_id=$5 AND status='admitted' AND accepted_at IS NULL
+            FOR UPDATE`, [input.dispatchId,input.uid.toString(),input.sessionId,input.clientMessageId,input.ownerId])).rows[0];
+        if (!source) return { kind: "lost_ownership" };
+        if (!validPreparationSnapshot(source.preparation_request_json,source.preparation_request_sha256)) return { kind: "not_eligible" };
+        const request = preparationChildRequest(source.preparation_request_json,input.sessionId,input.clientMessageId);
+        const inserted = await client.query(`INSERT INTO turn_recovery_jobs (
+          user_id,session_id,root_client_message_id,source_client_message_id,source_dispatch_id,source_dispatch_attempt,
+          job_origin,source_turn_key,tape_sha256,error_code,recovery_mode,semantic_recovery_attempt,request_json,next_attempt_at)
+          SELECT $1,$2,$3,$3,$4,1,'pre_transfer_enrichment',NULL,NULL,'dispatch_enrichment_timeout','replay',1,$5::jsonb,NOW()+INTERVAL '2 seconds'
+          WHERE NOT EXISTS (SELECT 1 FROM turn_control_requests WHERE user_id=$1 AND session_id=$2 AND kind='stop'
+            AND (root_client_message_id=$3 OR (root_client_message_id IS NULL AND created_at >=
+              (SELECT admitted_at FROM turn_dispatches WHERE dispatch_id=$4))))
+          AND NOT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE session_id=$2 AND user_id=$6 AND client_message_id=$3)
+          ON CONFLICT DO NOTHING`, [input.uid.toString(),input.sessionId,input.clientMessageId,input.dispatchId,
+          JSON.stringify(request),`c:${input.uid.toString()}`]);
+        if (inserted.rowCount !== 1) return { kind: "not_eligible" };
+        await client.query(`UPDATE turn_dispatches SET status='terminal',outcome='not_accepted',
+          failure_code='dispatch_enrichment_timeout',owner_id=NULL,lease_until=NULL,terminal_at=NOW(),last_attempt_at=NOW()
+          WHERE dispatch_id=$1`, [input.dispatchId]);
+        await bumpPreparationVisibility(client,identity);
+        decision = { scheduled: true,cause: "preparation",sourceClientMessageId: input.clientMessageId,
+          rootClientMessageId: input.clientMessageId,errorCode: "dispatch_enrichment_timeout",mode: "replay",
+          attempt: 1,max: AUTOMATIC_TURN_RETRY_MAX,displayText: "正在重新准备…",agentId: String(request.agentId),
+          ...(typeof request.model === "string" ? { model: request.model } : {}) };
+        return { kind: "scheduled" };
+      });
+      if (decision && options.onAutomaticRecoveryDecision) {
+        try { await options.onAutomaticRecoveryDecision(`c:${input.uid.toString()}`,input.sessionId,decision); } catch { /* durable read recovers the nudge */ }
+      }
+      return result;
+    },
+
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
       try {
         return await withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
+        let preparationJob = false;
         if (input.recoveryJob) {
-          if (!input.recovery?.automatic) {
-            throw new RecoveryJobAdmissionConflict("scheduler_lineage_missing");
+          if (!input.recovery?.automatic) throw new RecoveryJobAdmissionConflict("scheduler_lineage_missing");
+          const session = await lockRecoverySession(client, { userId: input.uid, sessionId: input.sessionId });
+          await lockRecoveryRoot(client, { userId: input.uid, sessionId: input.sessionId,
+            rootClientMessageId: input.recovery.rootClientMessageId });
+          const cancelPreparation = () => cancelPreparationJobUnderFence(client, {
+            ...input.recoveryJob!,userId: input.uid,sessionId: input.sessionId });
+          if (!session || session.deleted) {
+            await cancelPreparation();
+            return { kind: session ? "session_deleted" : "session_not_found" };
           }
-          await lockRecoveryRoot(client, {
-            userId: input.uid,
-            sessionId: input.sessionId,
-            rootClientMessageId: input.recovery.rootClientMessageId,
-          });
+          const job = (await client.query<{ job_origin: string; request_json: Record<string,unknown>;
+            preparation_retry_count: number; source_dispatch_id: string; source_dispatch_attempt: number;
+            preparation_request_json: unknown; preparation_request_sha256: unknown;
+            source_status: string; source_outcome: string; source_accepted_at: Date | null;
+          }>(`SELECT j.*,d.preparation_request_json,d.preparation_request_sha256,
+            d.status AS source_status,d.outcome AS source_outcome,d.accepted_at AS source_accepted_at
+            FROM turn_recovery_jobs j LEFT JOIN turn_dispatches d ON d.dispatch_id=j.source_dispatch_id
+            WHERE j.job_id=$1 AND j.user_id=$2 AND j.session_id=$3 AND j.status='leased'
+              AND j.lease_owner=$4 AND j.lease_epoch=$5 FOR UPDATE OF j`,
+          [input.recoveryJob.jobId,input.uid.toString(),input.sessionId,input.recoveryJob.leaseOwner,input.recoveryJob.leaseEpoch])).rows[0];
+          if (!job) throw new RecoveryJobAdmissionConflict("scheduler_lease_lost");
+          preparationJob = job.job_origin === 'pre_transfer_enrichment';
+          if (preparationJob) {
+            if (job.preparation_retry_count >= 2 || job.source_dispatch_attempt !== 1 ||
+                job.source_status !== 'terminal' || job.source_outcome !== 'not_accepted' || job.source_accepted_at !== null ||
+                !validPreparationSnapshot(job.preparation_request_json,job.preparation_request_sha256))
+              throw new RecoveryJobAdmissionConflict("preparation_source_invalid");
+            const expected = preparationChildRequest(job.preparation_request_json,input.sessionId,input.recovery.sourceClientMessageId);
+            if (canonicalDigestHex(job.request_json) !== canonicalDigestHex(expected) ||
+                !preparationRequestMatches(input.preparationRequest,expected))
+              throw new RecoveryJobAdmissionConflict("preparation_snapshot_mismatch");
+            if (session.latestClientMessageId !== input.clientMessageId && session.latestClientMessageId !== input.recovery.sourceClientMessageId) {
+              await cancelPreparation();
+              return { kind: "recovery_conflict",reason: "source_not_latest" };
+            }
+          }
         }
         let message = input.message;
+        if (preparationJob) message = { ...message, _automaticRecoveryCause: "preparation" };
         if (input.exclusiveSession) {
           const locked = (
             await client.query<{ deleted_at: string | null }>(
@@ -8418,7 +8554,7 @@ export function createPgSessionsBackend(
               return { kind: "recovery_conflict", reason: "identity_reused" };
             }
             message = {
-              ...input.message,
+              ...message,
               _recoveryOfClientMessageId: input.recovery.sourceClientMessageId,
               _recoveryMode: input.recovery.mode,
               _automaticRecovery: input.recovery.automatic,
@@ -8490,7 +8626,10 @@ export function createPgSessionsBackend(
               )
             ).rows[0];
             let authoritativeRetryAttempt = automaticSourceAttempt;
-            if (finalized) {
+            if (preparationJob) {
+              if (finalized || dispatchFailure?.outcome !== "not_accepted" || input.recovery.mode !== "replay")
+                throw new RecoveryJobAdmissionConflict("preparation_source_changed");
+            } else if (finalized) {
               const recordRows = (
                 await client.query<{ payload: Buffer }>(
                   `SELECT payload
@@ -8597,7 +8736,7 @@ export function createPgSessionsBackend(
               };
             }
             message = {
-              ...input.message,
+              ...message,
               _recoveryOfClientMessageId: input.recovery.sourceClientMessageId,
               _recoveryMode: input.recovery.mode,
               _automaticRecovery: input.recovery.automatic,
@@ -8649,6 +8788,7 @@ export function createPgSessionsBackend(
         // 2) anchor_seq = 该 user 行的 _seq(会话顺序键;不在热尾巴时 null)。
         const anchorSeq = typeof appended.seq === "number" ? BigInt(appended.seq) : null;
         // 3) UPSERT dispatch + 冲突表裁定(同一 tx,受理即拥有 I1)。
+        await lockRecoverySessionAdvisory(client, { userId: input.uid, sessionId: input.sessionId });
         const dispatch = await admitDispatch(client, {
           dispatchId: input.dispatchId,
           userId: input.uid,
@@ -8665,6 +8805,15 @@ export function createPgSessionsBackend(
           ...(input.agentContainerId !== undefined ? { agentContainerId: input.agentContainerId } : {}),
           ...(input.runtimeKind !== undefined ? { runtimeKind: input.runtimeKind } : {}),
         });
+        if (!input.recovery && dispatch.kind === "admitted" && !dispatch.takeover &&
+            dispatch.dispatch.dispatchId === input.dispatchId && dispatch.dispatch.attemptNo === 1 && dispatch.dispatch.leaseEpoch === 1 && input.preparationRequest) {
+          const snapshot = freezePreparationRequest(input.preparationRequest);
+          if (snapshot && snapshot.request.clientMessageId === input.clientMessageId &&
+              (snapshot.request.peer as { id?: unknown } | undefined)?.id === input.sessionId &&
+              snapshot.request.agentId === input.agentId) await client.query(`UPDATE turn_dispatches SET preparation_request_json=$2::jsonb,
+            preparation_request_sha256=$3 WHERE dispatch_id=$1 AND preparation_request_json IS NULL`,
+          [input.dispatchId,JSON.stringify(snapshot),canonicalDigestHex(snapshot)]);
+        }
         if (input.recoveryJob) {
           const bound = await bindRecoveryJobDispatch(client, {
             jobId: input.recoveryJob.jobId,
@@ -8761,13 +8910,16 @@ export function createPgSessionsBackend(
         const verdict = await automaticRecoveryCandidateCheapVerdict(pool, sessionUserId, candidate);
         if (verdict !== "pass") {
           if (isClientMessageId(candidate.client_message_id)) {
-            await withTx(pool, (client) =>
-              settleFinalizedTurnControls(client, {
+            await withTx(pool, async (client) => {
+              await lockRecoverySession(client, { userId, sessionId: candidate.session_id });
+              await lockRecoverySessionAdvisory(client, { userId, sessionId: candidate.session_id });
+              return settleFinalizedTurnControls(client, {
                 uid: userId,
                 sessionId: candidate.session_id,
                 clientMessageId: candidate.client_message_id,
                 outcome: candidate.status,
-              }));
+              });
+            });
           }
           rememberAutomaticRecoveryReconcileSkip(
             skipKey,
@@ -8778,6 +8930,15 @@ export function createPgSessionsBackend(
           continue;
         }
         const inserted = await withTx(pool, async (client): Promise<boolean> => {
+          const session = (
+            await client.query<{ messages: string; deleted_at: string | null }>(
+              `SELECT messages,deleted_at FROM client_sessions
+                WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+              [candidate.session_id, sessionUserId],
+            )
+          ).rows[0];
+          if (!session || session.deleted_at !== null) return false;
+          await lockRecoverySessionAdvisory(client, { userId, sessionId: candidate.session_id });
           const tape = (
             await client.query<typeof candidate & { finalized_at: string | null }>(
               `SELECT session_id,tape_id,tape_sha256,agent_id,status,turn_key,
@@ -8789,14 +8950,6 @@ export function createPgSessionsBackend(
             )
           ).rows[0];
           if (!tape || tape.finalized_at === null) return false;
-          const session = (
-            await client.query<{ messages: string; deleted_at: string | null }>(
-              `SELECT messages,deleted_at FROM client_sessions
-                WHERE id=$1 AND user_id=$2 FOR UPDATE`,
-              [candidate.session_id, sessionUserId],
-            )
-          ).rows[0];
-          if (!session || session.deleted_at !== null) return false;
           let currentMessages: MessageLike[];
           try {
             const parsed = JSON.parse(session.messages);
@@ -9189,6 +9342,7 @@ export function createPgSessionsBackend(
         ).rows[0];
         if (!session) return { applied: "session_not_found" };
         if (session.deleted_at !== null) return { applied: "session_deleted" };
+        if (billingUserId !== null) await lockRecoverySessionAdvisory(client, { userId: billingUserId, sessionId: request.sessionId });
 
         const recoveryLink = await readTurnTapeRecoveryLink(
           client,
@@ -11258,6 +11412,7 @@ export function createPgSessionsBackend(
             isPartial: false,
             archivedCount,
             archivedThroughSeq,
+            ...(await readOpenDispatchForSession(queryable,row.id,row.user_id)),
           };
         }
 
@@ -11307,6 +11462,7 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
+        ...(await readOpenDispatchForSession(queryable,row.id,row.user_id)),
         };
       };
       return options.view === "timeline"
