@@ -49,9 +49,13 @@ export {
 export {
   CursorSandRelay,
   isSandRoutableModel,
+  isNonRetryableUpstreamReason,
+  stripNonRetryableMarker,
+  describeUpstreamError,
   type CursorSandServeResult,
   type CursorSandUsage,
   type RelayCredentialKind,
+  type UpstreamErrorInfo,
 } from './engine/cursorSandRelay.js'
 export {
   ZcodeAdapter,

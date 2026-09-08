@@ -8,7 +8,16 @@ import { test } from 'node:test'
 // `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
 import protobuf from 'protobufjs'
 import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
-import { CursorSandRelay, classifyUpstreamReadFailure, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
+import {
+  CURSOR_SAND_NON_RETRYABLE_SUFFIX,
+  CursorSandRelay,
+  classifyUpstreamReadFailure,
+  describeUpstreamError,
+  encodeCursorSandRequest,
+  isNonRetryableUpstreamReason,
+  recoverXmlToolCalls,
+  stripNonRetryableMarker,
+} from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
 import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import {
@@ -2090,6 +2099,137 @@ test('relay maps overflow end-trailer text to "Prompt is too long"', async () =>
     })
     const text = await response.text()
     assert.match(text, /"message":"Prompt is too long: context length exceeded for this model"/)
+  } finally {
+    await relay.close()
+  }
+})
+
+// Regression (2026-09-08, external API-key user on Mac): Sand answered a
+// long-running fable-5.1 stream with an end trailer whose top-level message is
+// the literal "Error"; the real cause lives in details[].debug
+// (aiserver.v1.ErrorDetails → ERROR_PROVIDER_ERROR, providerStatusCode 400,
+// isRetryable:false). Clients saw "Error" and Claude Code retried 10× for
+// minutes on a request that could never succeed.
+const PROVIDER_400_TRAILER = {
+  code: 'resource_exhausted',
+  message: 'Error',
+  details: [{
+    type: 'aiserver.v1.ErrorDetails',
+    debug: {
+      error: 'ERROR_PROVIDER_ERROR',
+      details: {
+        title: 'Provider Error',
+        detail: "We're having trouble connecting to the model provider. This might be temporary - please try again in a moment.",
+        isRetryable: false,
+        additionalInfo: { providerStatusCode: '400' },
+      },
+      isExpected: true,
+    },
+    value: 'CDkSnQEK…',
+  }],
+}
+
+test('describeUpstreamError surfaces aiserver.v1.ErrorDetails instead of the bare "Error"', () => {
+  const info = describeUpstreamError(PROVIDER_400_TRAILER as never, 'Cursor Sand transport error')
+  assert.equal(info.code, 'resource_exhausted')
+  assert.equal(info.debugError, 'ERROR_PROVIDER_ERROR')
+  assert.equal(info.providerStatusCode, '400')
+  assert.equal(info.retryable, false)
+  assert.equal(
+    info.message,
+    "Provider Error (400): We're having trouble connecting to the model provider. This might be temporary - please try again in a moment.",
+  )
+  // Plain code+message errors keep the old composed shape.
+  const plain = describeUpstreamError({ code: 'resource_exhausted', message: 'context length exceeded' } as never, 'x')
+  assert.equal(plain.message, 'resource_exhausted: context length exceeded')
+  assert.equal(plain.retryable, null)
+  // Generic "Error" with no details falls back to code, never to the useless word.
+  const bare = describeUpstreamError({ code: 'internal', message: 'Error' } as never, 'Cursor Sand inference failed')
+  assert.equal(bare.message, 'internal')
+  const empty = describeUpstreamError({} as never, 'Cursor Sand inference failed')
+  assert.equal(empty.message, 'Cursor Sand inference failed')
+  // Marker helpers.
+  const tagged = `${info.message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}`
+  assert.equal(isNonRetryableUpstreamReason(tagged), true)
+  assert.equal(isNonRetryableUpstreamReason(info.message), false)
+  assert.equal(stripNonRetryableMarker(tagged), info.message)
+  assert.equal(stripNonRetryableMarker(info.message), info.message)
+})
+
+test('non-retryable provider error in end trailer → readable SSE error + x-should-retry:false, external label', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(envelope(Buffer.from(JSON.stringify({ error: PROVIDER_400_TRAILER })), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), upstreamLabel: 'Upstream' })
+  const baseUrl = await relay.start()
+  try {
+    // Streaming (native path): message_start is already on the wire when the
+    // trailer lands, so the retry hint travels as the Anthropic error *type*
+    // (`invalid_request_error` = 400-class, client never retries) rather than a header.
+    const streamed = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5.1-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const text = await streamed.text()
+    assert.match(text, /event: error/)
+    assert.match(text, /"type":"invalid_request_error","message":"Provider Error \(400\): We're having trouble connecting to the model provider/)
+    assert.doesNotMatch(text, /non-retryable\]/)
+    assert.doesNotMatch(text, /Cursor Sand/)
+    // Non-streaming: 502 JSON with the same text, the 400-class type AND the header.
+    const plain = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5.1-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(plain.status, 502)
+    assert.equal(plain.headers.get('x-should-retry'), 'false')
+    const json = await plain.json() as { error: { type: string; message: string } }
+    assert.equal(json.error.type, 'invalid_request_error')
+    assert.match(json.error.message, /^Provider Error \(400\): /)
+    assert.doesNotMatch(json.error.message, /non-retryable\]/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('retryable / unclassified upstream errors do not set x-should-retry', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(envelope(Buffer.from(JSON.stringify({
+          error: { code: 'unavailable', message: 'upstream busy' },
+        })), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const plain = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5.1-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(plain.status, 502)
+    assert.equal(plain.headers.get('x-should-retry'), null)
+    const json = await plain.json() as { error: { type: string; message: string } }
+    assert.equal(json.error.type, 'api_error')
+    // Trailer text keeps its historical bare shape (no `code:` prefix).
+    assert.equal(json.error.message, 'upstream busy')
   } finally {
     await relay.close()
   }

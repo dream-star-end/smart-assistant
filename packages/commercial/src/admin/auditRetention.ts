@@ -71,6 +71,9 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "memory_usage_events", column: "observed_at", days: 30 },
   { table: "image_generation_attempts", column: "started_at", days: 30, predicate: "outcome<>'pending'" },
   { table: "selfheal_wecom_inbound_dedupe", column: "received_at", days: 90 },
+  // 0279(2026-09-08):外接 API-key 请求的用户消息审计(最后一条用户输入 ≤4KB + 请求指纹
+  // + 结果)。管理员裁定 90 天,与 agent_audit 同档;仅 admin 可读。
+  { table: "api_key_message_audit", column: "created_at", days: 90 },
   // P1#11:连接器写账本 90 天终态 retention 统一收口到这里(connectorSweeper 只做
   // 活跃→终态转换,不再自删)。谓词保证只删终态行——活跃态(pending/approved/executing)
   // 仍持 params 密文,绝不在此删除。

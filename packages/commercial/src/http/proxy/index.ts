@@ -528,6 +528,8 @@ export function makeAnthropicProxyHandler(
             identity,
             body,
             requestedModel,
+            effort: resolved.effort,
+            effortSource: resolved.effortSource,
             authorize: (p) => deps.identity.authorize(identity, p, body.model),
             appendCostCredits: deps.appendCostCredits,
             broadcastToUser: deps.broadcastToUser,

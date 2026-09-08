@@ -159,7 +159,8 @@
     "0275_restore_ccb_provider_check",
     "0276_grok_account_usage_columns",
     "0277_api_key_usage_and_controls",
-    "0278_friction_problem_card_dims"
+    "0278_friction_problem_card_dims",
+    "0279_api_key_message_audit"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

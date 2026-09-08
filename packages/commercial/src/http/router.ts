@@ -247,6 +247,7 @@ import { dispatchPluginsRoute } from './plugins.js'
 import {
   handleCreateMyApiKey,
   handleGetMyApiKeyUsage,
+  handleListMyApiKeyMessages,
   handleListMyApiKeys,
   handleRevokeMyApiKey,
   handleUpdateMyApiKey,
@@ -745,6 +746,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/me/api-keys', handler: handleListMyApiKeys },
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
     { method: 'GET', path: '/api/me/api-keys/usage', handler: handleGetMyApiKeyUsage },
+    //   GET    /api/me/api-keys/messages  → 0279 外接请求用户消息审计(admin;key_id / before / limit / errors_only)
+    { method: 'GET', path: '/api/me/api-keys/messages', handler: handleListMyApiKeyMessages },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
     { method: 'PATCH', pathPrefix: '/api/me/api-keys/', handler: handleUpdateMyApiKey },
     // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
