@@ -31,7 +31,6 @@ function urlOf(input: RequestInfo | URL): string {
 function installAuthFetchStub(): void {
   const fetches: AuthFetch[] = [];
   (window as unknown as { __authFetches: AuthFetch[] }).__authFetches = fetches;
-  const original = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = urlOf(input);
     const method = (init?.method ?? "GET").toUpperCase();
@@ -66,7 +65,6 @@ function installAuthFetchStub(): void {
     fetches.push({ url, method });
     return new Response(`unexpected fetch ${method} ${url}`, { status: 599 });
   };
-  void original;
 }
 
 installAuthFetchStub();
