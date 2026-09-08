@@ -10,6 +10,7 @@ import {
   coalesceProcessIdentities,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
+  reconcileLateDelegateAgentGroups,
   reconcileTimelineBashTailAuxiliaries,
   SessionStore,
   stableSortByTs,
@@ -1230,6 +1231,110 @@ describe("persist — hidden Bash tail reconciliation", () => {
     expect(child?.bashTail?.tail).toBe("delegate stdout");
     expect(child?.childBlocks).toEqual([{ kind: "text", text: "kept" }]);
     expect(reconciled[0]!._runtimeBashTailRevision).toBe(1);
+  });
+});
+
+describe("persist — late delegate agent-group owner merge (OCV5-180 B1)", () => {
+  const ownerTurn = "turn-owner";
+  const lateCard = (over: Partial<ChatMessage> = {}): ChatMessage => ({
+    id: over.id ?? "late-dlg-1",
+    role: "agent-group",
+    text: "晚到子任务",
+    ts: over.ts ?? 30,
+    _source: "server",
+    _timelineRecord: true,
+    _timelineUnitKey: over._timelineUnitKey ?? "late-dlg-1",
+    _delegateRunId: over._delegateRunId ?? "dlg-late-1",
+    _continuationOfTurnKey: ownerTurn,
+    _turnKey: "turn-continuation",
+    _orderSeq: over._orderSeq ?? 20,
+    ...over,
+  });
+
+  test("relocates a continuation card onto the owner turn, not T2", () => {
+    const t1: ChatMessage = {
+      id: "t1-assistant",
+      role: "assistant",
+      text: "T1",
+      ts: 1,
+      _turnKey: ownerTurn,
+      _timelineRecord: true,
+      _timelineUnitKey: "t1-assistant",
+      _orderSeq: 1,
+    };
+    const t2User: ChatMessage = {
+      id: "t2-user",
+      role: "user",
+      text: "T2",
+      ts: 10,
+      _timelineUnitKey: "t2-user",
+      _orderSeq: 10,
+    };
+    const t2: ChatMessage = {
+      id: "t2-assistant",
+      role: "assistant",
+      text: "T2 answer",
+      ts: 11,
+      _turnKey: "turn-t2",
+      _timelineRecord: true,
+      _timelineUnitKey: "t2-assistant",
+      _orderSeq: 11,
+    };
+    const late = lateCard();
+    const reconciled = reconcileLateDelegateAgentGroups([t1, t2User, t2, late]);
+    expect(reconciled.map((m) => m.id)).toEqual([
+      "t1-assistant",
+      "late-dlg-1",
+      "t2-user",
+      "t2-assistant",
+    ]);
+    expect(reconcileLateDelegateAgentGroups(reconciled)).toBe(reconciled);
+  });
+
+  test("pagination: late card stays until the owner page arrives, then merges once", () => {
+    const late = lateCard();
+    const t2: ChatMessage = {
+      id: "t2-assistant",
+      role: "assistant",
+      text: "T2",
+      ts: 11,
+      _turnKey: "turn-t2",
+      _timelineRecord: true,
+      _timelineUnitKey: "t2-assistant",
+      _orderSeq: 11,
+    };
+    const beforeOwner = reconcileLateDelegateAgentGroups([t2, late]);
+    expect(beforeOwner.map((m) => m.id)).toEqual(["t2-assistant", "late-dlg-1"]);
+
+    const owner: ChatMessage = {
+      id: "t1-assistant",
+      role: "assistant",
+      text: "T1",
+      ts: 1,
+      _turnKey: ownerTurn,
+      _timelineRecord: true,
+      _timelineUnitKey: "t1-assistant",
+      _orderSeq: 1,
+    };
+    const paged = mergeTimelineHistoryPage(beforeOwner, [owner]);
+    const merged = reconcileLateDelegateAgentGroups(paged);
+    expect(merged.map((m) => m.id)).toEqual(["t1-assistant", "late-dlg-1", "t2-assistant"]);
+    expect(reconcileLateDelegateAgentGroups(merged)).toBe(merged);
+  });
+
+  test("reload: same runId on the owner turn drops the continuation duplicate", () => {
+    const live: ChatMessage = {
+      id: "live-dlg-1",
+      role: "agent-group",
+      text: "live",
+      ts: 2,
+      _turnKey: ownerTurn,
+      _delegateRunId: "dlg-late-1",
+      _timelineUnitKey: "live-dlg-1",
+    };
+    const late = lateCard();
+    const reconciled = reconcileLateDelegateAgentGroups([live, late]);
+    expect(reconciled.map((m) => m.id)).toEqual(["live-dlg-1"]);
   });
 });
 

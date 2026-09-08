@@ -694,7 +694,7 @@ describe("SessionManager team-card buffer (P2 债A)", () => {
     assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, agentGroup("dlg-2")), true);
     assert.equal(session._pendingAgentGroups?.length, 2, "parallel delegations accumulate");
     assert.deepEqual(
-      session._pendingAgentGroups?.map((g) => g.runId),
+      session._pendingAgentGroups?.map((e) => e.group.runId),
       ["dlg-1", "dlg-2"],
     );
   });
@@ -707,9 +707,15 @@ describe("SessionManager team-card buffer (P2 债A)", () => {
   test("drainPendingAgentGroups take-and-clears (no cross-turn leak)", () => {
     const sm = new SessionManager(makeConfigStub());
     const session = makeTurnSession(new FakeTurnRunner(() => {}));
-    session._pendingAgentGroups = [agentGroup("dlg-1"), agentGroup("dlg-2")];
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    );
+    assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, agentGroup("dlg-1")), true);
+    assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, agentGroup("dlg-2")), true);
     const first = sm.drainPendingAgentGroups(session);
     assert.equal(first.length, 2, "drain returns buffered cards");
+    assert.deepEqual(first.map((g) => g.runId), ["dlg-1", "dlg-2"]);
     assert.equal(session._pendingAgentGroups, undefined, "buffer cleared after drain");
     const second = sm.drainPendingAgentGroups(session);
     assert.deepEqual(second, [], "second drain is empty — turn N cards don't leak into turn N+1");

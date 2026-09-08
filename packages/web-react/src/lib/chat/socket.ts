@@ -67,6 +67,7 @@ import {
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
+  reconcileLateDelegateAgentGroups,
   reconcileTimelineBashTailAuxiliaries,
   shouldRetainLiveProcessOnOwnerReset,
   type ServerTurnTerminal,
@@ -3951,6 +3952,7 @@ export class ChatSocket {
           },
         );
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
@@ -4720,6 +4722,7 @@ export class ChatSocket {
     }));
     s.messages = mergeTimelineHistoryPage(s.messages, page);
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     s._historyPageSerial = serial;
     s._timelineCursor = nextCursor;
     s._timelineHasMore = hasMore && typeof nextCursor === "string" && nextCursor.length > 0;
@@ -4782,6 +4785,7 @@ export class ChatSocket {
       };
     }
     s.messages = reconcileTimelineBashTailAuxiliaries(next);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);

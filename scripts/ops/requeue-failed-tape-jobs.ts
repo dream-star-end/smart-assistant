@@ -11,12 +11,18 @@
  *
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --tape <id> [--tape <id> ...]
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --plan-tapes
+ *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --plan-late-delegate-continuations
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --tape <id> --execute --allow-production
+ *
+ * `--plan-late-delegate-continuations` is read-only: it never requeues, never
+ * writes PG, and refuses to combine with --execute. Historical 65-tape
+ * reconstruction stays a separate approval.
  *
  * Uses DATABASE_URL / COMMERCIAL_DATABASE_URL. Refuses a production target
  * (db name, connection host, or env-file source) unless --allow-production
  * is also set for --execute.
  */
+import { createHash } from "node:crypto";
 import pg from "pg";
 import {
   enqueueMaterializationJob,
@@ -84,6 +90,7 @@ export function parseRequeueArgs(argv: string[]): {
   execute: boolean;
   allowProduction: boolean;
   planTapes: boolean;
+  planLateDelegateContinuations: boolean;
   sessionId?: string;
   userId?: string;
 } {
@@ -91,6 +98,7 @@ export function parseRequeueArgs(argv: string[]): {
   let execute = false;
   let allowProduction = false;
   let planTapes = false;
+  let planLateDelegateContinuations = false;
   let sessionId: string | undefined;
   let userId: string | undefined;
   for (let i = 0; i < argv.length; i++) {
@@ -98,6 +106,7 @@ export function parseRequeueArgs(argv: string[]): {
     if (token === "--execute" || token === "--apply") execute = true;
     else if (token === "--allow-production") allowProduction = true;
     else if (token === "--plan-tapes") planTapes = true;
+    else if (token === "--plan-late-delegate-continuations") planLateDelegateContinuations = true;
     else if (token === "--tape" && argv[i + 1]) {
       tapes.push(argv[++i]!);
     } else if (token === "--session" && argv[i + 1]) {
@@ -106,7 +115,84 @@ export function parseRequeueArgs(argv: string[]): {
       userId = argv[++i];
     }
   }
-  return { tapes, execute, allowProduction, planTapes, sessionId, userId };
+  return { tapes, execute, allowProduction, planTapes, planLateDelegateContinuations, sessionId, userId };
+}
+
+/** OCV5-180 B1 — read-only plan for a late-delegate group that landed on the
+ * wrong owner tape. Never writes. Root missing / not-finalized is a retryable
+ * wait (`skip`), not a permanent `manual_reconcile`. */
+export type LateDelegateContinuationPlan = {
+  tapeId: string;
+  sessionId: string;
+  groupRunId: string;
+  groupHash: string;
+  sourceLocator: { sessionId: string; turnKey: string | null };
+  targetLocator: { sessionId: string; turnKey: string | null };
+  rootFinalized: boolean | null;
+  requestId: string | null;
+  action: "continuation" | "manual_reconcile" | "skip";
+  reason: string;
+};
+
+export function planLateDelegateContinuation(input: {
+  tapeId: string;
+  sessionId: string;
+  group: {
+    runId: string;
+    engineBillings?: Array<{
+      requestId?: string;
+      parentTurnKey?: string;
+      parentSessionId?: string;
+    }>;
+  };
+  tapeTurnKey?: string | null;
+  root?: { sessionId: string; turnKey: string; finalized: boolean } | null;
+  rootAlreadyHasRequestId?: boolean;
+}): LateDelegateContinuationPlan {
+  const billing = input.group.engineBillings?.[0];
+  const requestId = typeof billing?.requestId === "string" ? billing.requestId : null;
+  const groupHash = createHash("sha256")
+    .update("oc-late-delegate-plan-v1\0")
+    .update(input.group.runId)
+    .update("\0")
+    .update(JSON.stringify(input.group.engineBillings ?? []))
+    .digest("hex");
+  const sourceLocator = {
+    sessionId: input.sessionId,
+    turnKey: input.tapeTurnKey ?? null,
+  };
+  const targetSessionId = typeof billing?.parentSessionId === "string"
+    ? billing.parentSessionId
+    : input.sessionId;
+  const targetTurnKey = typeof billing?.parentTurnKey === "string"
+    ? billing.parentTurnKey
+    : (input.root?.turnKey ?? null);
+  const base = {
+    tapeId: input.tapeId,
+    sessionId: input.sessionId,
+    groupRunId: input.group.runId,
+    groupHash,
+    sourceLocator,
+    targetLocator: { sessionId: targetSessionId, turnKey: targetTurnKey },
+    rootFinalized: input.root ? input.root.finalized : null,
+    requestId,
+  };
+  if (targetSessionId !== input.sessionId) {
+    return { ...base, action: "manual_reconcile", reason: "cross_session_locator" };
+  }
+  if (input.rootAlreadyHasRequestId && requestId) {
+    return { ...base, action: "skip", reason: "request_already_on_root" };
+  }
+  if (!input.root) {
+    return { ...base, action: "skip", reason: "root_tape_missing_retryable" };
+  }
+  if (!input.root.finalized) {
+    return { ...base, action: "skip", reason: "root_not_finalized_retryable" };
+  }
+  if (input.root.sessionId !== targetSessionId || input.root.turnKey !== targetTurnKey) {
+    return { ...base, action: "manual_reconcile", reason: "root_locator_mismatch" };
+  }
+  return { ...base, action: "continuation", reason: "owner_finalized_exact_locator" };
 }
 
 /** Production is more than an exact database name: env-file source and host count. */
@@ -459,14 +545,29 @@ export async function applyTapeRequeue(
 
 async function main(): Promise<void> {
   const args = parseRequeueArgs(process.argv.slice(2));
+  if (args.planLateDelegateContinuations && args.execute) {
+    console.error("--plan-late-delegate-continuations is read-only and refuses --execute");
+    process.exit(2);
+  }
   const tapes = [...args.tapes];
   if (args.planTapes) tapes.push(...PLAN_TAPES);
-  if (tapes.length === 0 && !args.sessionId) {
+  if (tapes.length === 0 && !args.sessionId && !args.planLateDelegateContinuations) {
     console.error(
       "usage: requeue-failed-tape-jobs.ts --tape <id> [--tape <id> ...] [--execute] [--allow-production]\n" +
-        "       requeue-failed-tape-jobs.ts --plan-tapes [--execute] [--allow-production]",
+        "       requeue-failed-tape-jobs.ts --plan-tapes [--execute] [--allow-production]\n" +
+        "       requeue-failed-tape-jobs.ts --plan-late-delegate-continuations  (read-only, no requeue)",
     );
     process.exit(2);
+  }
+  if (args.planLateDelegateContinuations) {
+    console.log(JSON.stringify({
+      planner: "late-delegate-continuations",
+      mode: "dry-run",
+      note: "historical 65-tape reconstruction requires a separate written approval; this flag never requeues or opens PG",
+      tapes,
+      plans: [],
+    }, null, 2));
+    return;
   }
   const url = process.env.COMMERCIAL_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {

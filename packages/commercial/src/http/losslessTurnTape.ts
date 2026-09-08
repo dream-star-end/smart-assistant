@@ -461,13 +461,17 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   }
   const seenBillingRequestIds = new Set<string>();
   if (engineBilling) seenBillingRequestIds.add(engineBilling.requestId);
+  // OCV5-180 B1 — a continuation tape bills under its OWNER turn key, never
+  // under the continuation's own derived key. Root tapes keep comparing
+  // against their own turnKey (unchanged rule).
+  const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey;
   for (let groupIndex = 0; groupIndex < (agentGroups ?? []).length; groupIndex++) {
     const group = agentGroups![groupIndex]!;
     const billings = group.engineBillings;
     if (billings === undefined) continue;
     for (let billingIndex = 0; billingIndex < (billings as DurableCodexBilling[]).length; billingIndex++) {
       const billing = (billings as DurableCodexBilling[])[billingIndex]!;
-      if (billing.parentTurnKey !== turnKey || billing.parentSessionId !== sessionId) {
+      if (billing.parentTurnKey !== groupBillingOwnerTurnKey || billing.parentSessionId !== sessionId) {
         throw new Error(
           `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] parent locator is invalid`,
         );
@@ -484,7 +488,9 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     }
   }
   if (continuationOfTurnKey !== undefined) {
-    if (
+    // Shared continuation invariants: completed, empty text, no second paid
+    // turn identity, no error/waiver/dispatch-adjacent fields.
+    const continuationBaseInvalid =
       status !== "completed" ||
       requiredString(raw, "text") !== "" ||
       parentTurnKey !== undefined ||
@@ -502,11 +508,17 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
       tools !== undefined ||
       assistantSegments !== undefined ||
       thinkingSegments !== undefined ||
-      agentGroups !== undefined ||
       structuredBlocks !== undefined ||
-      engineBilling !== undefined ||
-      !runtimeEvents?.length
-    ) {
+      engineBilling !== undefined;
+    // OCV5-180 B1 — restricted agent-group continuation: exactly the late
+    // delegate team card (text='', completed, owner-scoped billing). The
+    // group's own runtimeEvents/transcript ride inside the group envelope;
+    // top-level runtimeEvents stay forbidden in this branch.
+    if (agentGroups !== undefined) {
+      if (continuationBaseInvalid || agentGroups.length === 0 || runtimeEvents?.length) {
+        throw new Error("turn tape agent-group continuation must contain only completed agentGroups");
+      }
+    } else if (continuationBaseInvalid || !runtimeEvents?.length) {
       throw new Error("turn tape continuation must contain only completed runtimeEvents");
     }
   }
@@ -895,6 +907,11 @@ export function materializeLosslessTurn(
       ...(typeof group.resultSummary === "string" ? { _resultPreview: group.resultSummary } : {}),
       ...(group.verdict === "PASS" || group.verdict === "NEEDS_FIX" ? { _reviewVerdict: group.verdict } : {}),
       ...(Array.isArray(group.transcript) ? { childBlocks: group.transcript } : {}),
+      // OCV5-180 B1 — hydrate copies this onto the timeline row; persist.ts
+      // then relocates the exact card onto the owner turn (pagination/reload).
+      ...(body.continuationOfTurnKey
+        ? { _continuationOfTurnKey: body.continuationOfTurnKey }
+        : {}),
     }, groupEventOrdinal));
   }
 

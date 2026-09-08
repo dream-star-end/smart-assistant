@@ -197,3 +197,30 @@ if (/health\.on(Success|Failure)\(/.test(cursorSettleSrc)) {
   throw new Error('[grok-pool-cooldown] cursor settle must not call AccountHealthTracker (materializer whitelist depends on health/status/cooldown)')
 }
 console.log('[grok-pool-cooldown] PASS — INC-20260908-GROK-POOL-NO-COOLDOWN source contracts locked')
+
+// INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof.
+// Isolated unit suites cover seal/sink-pending/T2 isolation, validator,
+// materialize stamp, persist owner-merge, and the read-only historical planner.
+const lateDelegateHelperSrc = readFileSync(join(root, 'packages/gateway/src/delegateLateCompletion.ts'), 'utf8')
+const lateSessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+const lateServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const lateTapeSrc = readFileSync(join(root, 'packages/commercial/src/http/losslessTurnTape.ts'), 'utf8')
+const latePersistSrc = readFileSync(join(root, 'packages/web-react/src/lib/persist.ts'), 'utf8')
+const lateSocketSrc = readFileSync(join(root, 'packages/web-react/src/lib/chat/socket.ts'), 'utf8')
+for (const [name, src, marker] of [
+  ['delegateLateCompletion.ts', lateDelegateHelperSrc, 'export function lateDelegateLogicalRunKey('],
+  ['sessionManager.ts', lateSessionManagerSrc, 'deliverLateDelegateAgentGroup('],
+  ['sessionManager.ts', lateSessionManagerSrc, 'this._sealOwnerTurn(session, turnKey)'],
+  ['server.ts', lateServerSrc, 'const ownerLocatorForCard = this._delegateOwnerByRunId?.get(progressRunId)'],
+  ['losslessTurnTape.ts', lateTapeSrc, 'const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey'],
+  ['persist.ts', latePersistSrc, 'export function reconcileLateDelegateAgentGroups('],
+  ['socket.ts', lateSocketSrc, 's.messages = reconcileLateDelegateAgentGroups(s.messages)'],
+] as const) {
+  if (!src.includes(marker)) {
+    throw new Error(`[late-delegate-owner] ${name} lost exact-owner contract: ${marker}`)
+  }
+}
+if (!lateDelegateHelperSrc.includes('.update(\'oc-late-delegate-run-v1\\0\')')) {
+  throw new Error('[late-delegate-owner] tape key must derive from the logical run, not the content hash')
+}
+console.log('[late-delegate-owner] PASS — INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof.')

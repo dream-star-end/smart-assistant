@@ -6,6 +6,7 @@ import {
   jobAuthorityFromSettlement,
   loadTapeJobSnapshot,
   parseRequeueArgs,
+  planLateDelegateContinuation,
   planTapeRequeue,
   resolveTapeIdentities,
   settlementJobMatchesTapeAuthority,
@@ -47,8 +48,55 @@ describe("requeue-failed-tape-jobs planner", () => {
     assert.equal(parsed.execute, false);
     assert.deepEqual(parsed.tapes, ["abc"]);
     assert.equal(parsed.planTapes, true);
+    assert.equal(parsed.planLateDelegateContinuations, false);
     assert.equal(parseRequeueArgs(["--execute"]).execute, true);
     assert.equal(parseRequeueArgs(["--user", "c:9"]).userId, "c:9");
+    assert.equal(
+      parseRequeueArgs(["--plan-late-delegate-continuations"]).planLateDelegateContinuations,
+      true,
+    );
+  });
+
+  test("late-delegate planner: exact owner → continuation; missing root is retryable skip", () => {
+    const owner = "b".repeat(64);
+    const billing = {
+      requestId: "d".repeat(32),
+      parentTurnKey: owner,
+      parentSessionId: "sess-1",
+    };
+    const ready = planLateDelegateContinuation({
+      tapeId: "tape-late",
+      sessionId: "sess-1",
+      group: { runId: "dlg-1", engineBillings: [billing] },
+      tapeTurnKey: "c".repeat(64),
+      root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+    });
+    assert.equal(ready.action, "continuation");
+    const waiting = planLateDelegateContinuation({
+      tapeId: "tape-late",
+      sessionId: "sess-1",
+      group: { runId: "dlg-1", engineBillings: [billing] },
+      tapeTurnKey: "c".repeat(64),
+      root: null,
+    });
+    assert.equal(waiting.action, "skip");
+    assert.equal(waiting.reason, "root_tape_missing_retryable");
+    const unfinalized = planLateDelegateContinuation({
+      tapeId: "tape-late",
+      sessionId: "sess-1",
+      group: { runId: "dlg-1", engineBillings: [billing] },
+      root: { sessionId: "sess-1", turnKey: owner, finalized: false },
+    });
+    assert.equal(unfinalized.action, "skip");
+    assert.equal(unfinalized.reason, "root_not_finalized_retryable");
+    const cross = planLateDelegateContinuation({
+      tapeId: "tape-late",
+      sessionId: "sess-1",
+      group: { runId: "dlg-1", engineBillings: [{ ...billing, parentSessionId: "other" }] },
+      root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+    });
+    assert.equal(cross.action, "manual_reconcile");
+    assert.equal(cross.reason, "cross_session_locator");
   });
 
   test("stage 1 requeues materialization; stage 2 skips when settlement is unverified", () => {
