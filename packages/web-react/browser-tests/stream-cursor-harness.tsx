@@ -11,7 +11,7 @@ const socket = new ChatSocket({
   silentRefresh: async epoch => ({ kind: "transient", epoch, retryAfterMs: 500 }),
   onAuthExpired: () => {}, defaultAgentId: "main", syncSession: async () => {},
 });
-socket.loadStored({ id, agentId: "main", messages: [], createdAt: 1, lastAt: 2,
+socket.loadStored({ id, title: "cursor fixture", agentId: "main", messages: [], createdAt: 1, lastAt: 2,
   _lastFrameSeqByKey: { [key]: 401 }, _lastFrameSeq: 401 });
 const history: ChatMessage[] = [
   { id: "old-user", role: "user", text: "上次问题", ts: 1, _seq: 1 },
