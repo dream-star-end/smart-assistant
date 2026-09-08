@@ -1,3 +1,4 @@
+import { resolveRuntimeExecutionAgent } from '@openclaude/storage'
 // Cron — periodic self-reflection jobs for the learning loop.
 //
 // Jobs are defined in ~/.openclaude/cron.yaml:
@@ -2282,7 +2283,8 @@ export class CronScheduler {
     // (会被 CODEX_BILLING_GUARD 100% fail-closed 拒)。这里显式解析出非 codex 执行模型,
     // 与 agent 交互态默认(可能是 gpt-5.5=codex)解耦;非 codex agent 返回 undefined,
     // 沿用原默认(行为不变)。同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
-    const cronRoute = resolveSyntheticTurnModel(agent, this.config.defaults.model)
+    const executionAgent = (await resolveRuntimeExecutionAgent(agent)).agent
+    const cronRoute = resolveSyntheticTurnModel(executionAgent, this.config.defaults.model)
     // ── 模型权威 §3:cron 是**无 envelope 的本地路径** ────────────────────────
     // flag 开(托管)→ 判定源换成 master 的 per-uid catalog 投影:归一 / 可用性(active)/
     // engine **全取投影**,容器镜像里 baked 的两张表不再参与(它们与 catalog 必然漂移)。
@@ -2294,7 +2296,7 @@ export class CronScheduler {
     let cronExec: LocalExecutionDecision | undefined
     try {
       cronExec = await resolveLocalExecutionIfEnforced({
-        agent,
+        agent: executionAgent,
         kind: 'synthetic',
         model: cronRoute?.model,
         defaultModel: this.config.defaults.model,
@@ -2324,7 +2326,7 @@ export class CronScheduler {
     try {
       session = await this.sessions.getOrCreate({
         sessionKey,
-        agent,
+        agent: executionAgent,
         ...(cronModel ? { model: cronModel } : {}),
         ...localExecutionOverride(cronExec),
         channel: 'cron',

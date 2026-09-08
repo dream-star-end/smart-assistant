@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import {
+  resolveRuntimeExecutionAgent,
+  type IdentityCompatRuntimeContext,
   type AgentDef,
   type OpenClaudeConfig,
   appendServerAuthoredMessageDurable,
@@ -763,6 +765,11 @@ function scheduleSessionOutputAssetCollection(opts: {
 // 一个 sessionKey 对应一个 EngineAdapter(CCB = CcbAdapter 组合 SubprocessRunner)
 // + 一把 Mutex(同 session 串行)。跨 session 完全并行。
 export interface AgentSession {
+  /** In-memory execution identity only. Durable session/owner fields are untouched. */
+  _identityCreationOpts?: Parameters<SessionManager['getOrCreate']>[0]
+  _identityAgentFingerprint?: string
+  _identityCompat?: IdentityCompatRuntimeContext
+
   sessionKey: string
   agentId: string
   channel: string
@@ -3704,6 +3711,10 @@ export class SessionManager {
     ) {
       throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session')
     }
+    const identityCreationOpts = { ...opts }
+    const identity = await resolveRuntimeExecutionAgent(opts.agent)
+    opts = { ...opts, agent: identity.agent }
+    const identityAgentFingerprint = identity.context.assets ? JSON.stringify(opts.agent) : undefined
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
@@ -3791,6 +3802,8 @@ export class SessionManager {
       // prompt slots. Replacing the runner for that would drop Cursor's live
       // native session and force a visible history replay on ordinary follow-ups.
       if (
+        existing.agentId !== opts.agent.id ||
+        existing._identityAgentFingerprint !== identityAgentFingerprint ||
         existing.providerTag !== desiredEngine ||
         cursorTransportChanged ||
         workspaceModeChanged ||
@@ -3827,6 +3840,8 @@ export class SessionManager {
                 ? engineId
                 : canonical.providerTag
             const stillNeedsReplace =
+              canonical.agentId !== opts.agent.id ||
+              canonical._identityAgentFingerprint !== identityAgentFingerprint ||
               canonical.providerTag !== desiredEngineNow ||
               Boolean(
                 (opts.model !== undefined || opts.executionAuthority !== undefined) &&
@@ -3848,6 +3863,7 @@ export class SessionManager {
               if (opts.projectId !== undefined) canonical.projectId = opts.projectId
               if (nextFingerprint) canonical.contextFingerprint = nextFingerprint
               if (opts.runContext) canonical.runContext = opts.runContext
+              canonical._identityCreationOpts = identityCreationOpts
               return canonical
             }
             existing = canonical
@@ -3916,6 +3932,7 @@ export class SessionManager {
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
         if (nextFingerprint) existing.contextFingerprint = nextFingerprint
         if (opts.runContext) existing.runContext = opts.runContext
+        existing._identityCreationOpts = identityCreationOpts
         return existing
       }
     }
@@ -3951,6 +3968,7 @@ export class SessionManager {
       agentBaseDir: cwd,
       config: this.config,
       persona,
+      identityCompat: opts.hermeticNoTools ? undefined : identity.context,
       model: executionModel,
       permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
       agentProvider: opts.agent.provider,
@@ -3998,6 +4016,9 @@ export class SessionManager {
     if (resumeTransportMismatch) contextRebuildNotice = 'native-resume-loss'
     const now = Date.now()
     const session: AgentSession = {
+      _identityAgentFingerprint: identityAgentFingerprint,
+      _identityCreationOpts: identityCreationOpts,
+      _identityCompat: opts.hermeticNoTools ? undefined : identity.context,
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,
       channel: opts.channel ?? 'webchat',
@@ -4515,6 +4536,15 @@ export class SessionManager {
       modelSwitchInternal?: string
     },
   ): Promise<void> {
+    // Resolve/rebuild a warm legacy runner under the existing creation gate,
+    // before taking the per-turn lock. Never change its durable session key.
+    if (session._identityCreationOpts) {
+      session = await this.getOrCreate({
+        ...session._identityCreationOpts,
+        ...(model ? { model } : {}),
+        ...(opts?.modelSwitchId ? { modelSwitchId: opts.modelSwitchId } : {}),
+      })
+    }
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
     // Commercial PG is the only authoritative history. Never execute a paid
     // turn when the lossless container→master sink failed to initialize: the
@@ -4668,6 +4698,22 @@ export class SessionManager {
         ) {
           return
         }
+      }
+      // Every execution, including direct warm submits, explicit models, cron
+      // and delegates, crosses this fresh authority gate AFTER its predecessor.
+      // A successful getOrCreate/display sync is not permission for this turn.
+      const admission = await resolveRuntimeExecutionAgent(
+        session._identityCreationOpts?.agent ?? { id: session.agentId },
+      )
+      if (admission.agent.id !== session.agentId) {
+        throw new Error('COMPAT_CONFIG_CONFLICT: runner identity changed; reopen this session')
+      }
+      if (session._identityCompat) {
+        const changed = session._identityCompat.fingerprint !== admission.context.fingerprint
+        Object.assign(session._identityCompat, { assets: undefined, fingerprint: undefined }, admission.context)
+        if (changed) await session.runner.shutdown() // native id is deliberately retained
+      } else if (admission.context.assets && session.channel !== 'auto-dream') {
+        throw new Error('COMPAT_CONFIG_CONFLICT: runner has no validated identity context')
       }
       // Browser Stop must own the complete logical turn, including the gap
       // between engine attempts while an automatic retry is backing off.
@@ -7036,7 +7082,7 @@ export class SessionManager {
             Promise.all([
               upsertSessionMeta({
                 id: sessId,
-                agentId: session.agentId,
+                agentId: session.sessionKey.startsWith('agent:') ? session.sessionKey.split(':')[1] : session.agentId,
                 channel: session.channel,
                 peerId: session.peerId,
                 title: session.title,

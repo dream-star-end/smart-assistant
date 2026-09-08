@@ -39,3 +39,5 @@ export * from './contextPacker.js'
 export * from './memoryLifecycle.js'
 export * from './multimodalSummary.js'
 export * from './indexPipeline.js'
+
+export * from './identityCompatRuntime.js'
