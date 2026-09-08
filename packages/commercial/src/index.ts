@@ -5695,6 +5695,8 @@ export async function registerCommercial(
     failPreparationAndScheduleRecovery: dispatchAdmissionBackend
       ? (input) => dispatchAdmissionBackend!.failPreparationAndScheduleRecovery(input)
       : undefined,
+    publishPreparationRecoveryDecision: (userId, sessionId, verdict) =>
+      recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
     reconcileAutomaticRecoveryJobs: dispatchAdmissionBackend
       ? (uid, limit) => dispatchAdmissionBackend!.reconcileAutomaticRecoveryJobs(uid, limit)
       : undefined,

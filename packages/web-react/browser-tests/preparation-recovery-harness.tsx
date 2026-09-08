@@ -1,6 +1,6 @@
 import { useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
-import { ChatSocket } from "../src/lib/chat/socket";
+import { ChatSocket, preciseRetryEligible } from "../src/lib/chat/socket";
 import { MessageList } from "../src/components/MessageRenderer";
 import type { ChatMessage } from "../src/lib/chat/model";
 class Transport {
@@ -25,11 +25,14 @@ const pending = () => ({ cause: 'preparation' as const, mode: 'replay' as const,
   sourceClientMessageId: source, rootClientMessageId: source, attempt: 1, max: 10 });
 const ack = () => Transport.latest.push({ type: 'outbound.ack', admitted: true, peer,
   clientMessageId: child, recovery: { ...pending(), automatic: true } });
-const begin = () => {
+const startSource = () => {
   sock.removeSession(id); child = 'm-recover-browser-preparation';
   sock.sendMessage({ sessId: id, agentId: 'main', text: '精确原始请求' });
   source = sock.sessions.get(id)!.messages.find(m => m.role === 'user')!.id;
   Transport.latest.push({ type: 'outbound.ack', admitted: true, peer, clientMessageId: source });
+};
+const begin = () => {
+  startSource();
   Transport.latest.push({ type: 'outbound.error', peer, clientMessageId: source,
     code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'prepare timeout' });
   Transport.latest.push({ ...pending(), type: 'sys.recovery_decision', peer,
@@ -43,11 +46,15 @@ const restore = (payload: { source: string; rows: ChatMessage[]; childBound?: bo
     pendingRecovery: { ...pending(), ...(payload.childBound ? { clientMessageId: child } : {}) } });
 };
 const drive = {
-  begin, ack, restore,
+  begin, ack, restore, startSource,
+  queueHuman: () => sock.sendMessage({ sessId: id, agentId: "main", text: "排队的下一条请求" }),
+  rawFrames: (frames: unknown[]) => frames.forEach(frame => Transport.latest.push(frame)),
+  sent: () => Transport.latest.sent.map(raw => JSON.parse(raw)),
   sourceError: () => Transport.latest.push({ type: "outbound.error", peer, clientMessageId: source,
     code: "dispatch_enrichment_timeout", message: "late prepare timeout" }),
   state: () => ({ source, rows: structuredClone(sock.sessions.get(id)?.messages ?? []),
-    sending: sock.sessions.get(id)?._sendingInFlight === true }),
+    sending: sock.sessions.get(id)?._sendingInFlight === true,
+    turnStatus: sock.sessions.get(id)?._turnStatus }),
   success: () => Transport.latest.push({ type: 'outbound.message', channel: 'webchat', peer,
     clientMessageId: child, isFinal: true, ts: Date.now(), blocks: [{ kind: 'text', text: '准备后成功完成' }] }),
   exhausted: () => Transport.latest.push({ type: 'outbound.error', peer, clientMessageId: child,
@@ -59,7 +66,13 @@ function Harness() {
   const snap = useSyncExternalStore(sock.subscribe, sock.getSnapshot); void snap.version;
   const s = snap.sessions.get(id), busy = s?._sendingInFlight === true;
   return <><button onClick={() => sock.stopTurn(id)}>停止</button><div ref={setScroller} style={{ height: 720, overflow: 'auto' }}>
-    <MessageList messages={s?.messages ?? []} sending={busy} cb={{}} onRespondPermission={() => {}}
+    <MessageList messages={s?.messages ?? []} sending={busy} cb={{
+      onRetrySend: message => sock.retryMessage({ sessId: id, msgId: message.id, agentId: "main" }),
+      resolveRetryTarget: clientMessageId => {
+        const target = s?.messages.find(m => m.role === "user" && m.id === clientMessageId && m.status === "error");
+        return target && preciseRetryEligible(target) ? target : undefined;
+      },
+    }} onRespondPermission={() => {}}
       scrollParent={scroller} historyGeneration={id} turnActivity={busy ? {
         startedAt: s?._turnStartedAt ?? null, turnStatus: s?._turnStatus, agentName: '助手' } : null} />
   </div></>;

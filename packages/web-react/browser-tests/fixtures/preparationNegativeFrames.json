@@ -1,0 +1,27 @@
+{
+  "source": "modelAuthorityBridge.test R0 actual writer=false",
+  "frames": [
+    {
+      "type": "error",
+      "code": "DISPATCH_ENRICHMENT_TIMEOUT",
+      "message": "session context took too long to prepare; retry this turn",
+      "peer": {
+        "id": "sess-prep-negative",
+        "kind": "dm"
+      },
+      "clientMessageId": "cm-prep-negative-writer-off"
+    },
+    {
+      "type": "sys.recovery_decision",
+      "peer": {
+        "id": "sess-prep-negative",
+        "kind": "dm"
+      },
+      "scheduled": false,
+      "sourceClientMessageId": "cm-prep-negative-writer-off",
+      "errorCode": "dispatch_enrichment_timeout",
+      "reason": "enqueue_rejected",
+      "ts": 1788881416028
+    }
+  ]
+}

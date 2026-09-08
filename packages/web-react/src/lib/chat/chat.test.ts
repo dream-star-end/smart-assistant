@@ -11055,4 +11055,78 @@ describe('OCV5-174 durable preparation UI', () => {
     expect(f.session.messages.some(m => m.id === 'm-new-human')).toBe(true);
     f.sock.stop();
   });
+
+  test.each(['error-first', 'decision-first'])('R0 negative preparation decision closes immediately, never fabricates a child (%s)', order => {
+    const f = fixture();
+    const negative = { type: 'sys.recovery_decision', peer: f.peer, sourceClientMessageId: f.source.id,
+      errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'enqueue_rejected' };
+    const error = { type: 'error', peer: f.peer, clientMessageId: f.source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'Preparation exceeded its deadline' };
+    if (order === 'decision-first') f.push(negative);
+    f.push(error);
+    if (order === 'error-first') {
+      expect(f.session._turnStatus).toMatchObject({ cause: 'preparation' });
+      f.push(negative);
+    }
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session._turnStatus).toBeNull();
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    expect(f.session.messages.some(m => m._automaticRecovery)).toBe(false);
+    // Both wire envelopes and repeated negative decisions are idempotent.
+    f.push(negative); f.push(error); f.error();
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    expect(f.sock.toStored(f.sessId)?._automaticRecoveryDecisions?.[f.source.id]).toBe(true);
+    vi.advanceTimersByTime(20_001);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    expect(f.session._sendingInFlight).toBe(false);
+    f.sock.stop();
+  });
+  test('queued human message does not delay no-job source closure or get failed by its negative decision', async () => {
+    const f = fixture(); f.error();
+    f.sock.sendMessage({ sessId: f.sessId, agentId: 'main', text: 'queued successor' });
+    const queued = f.session.messages.find(m => m.role === 'user' && m.text === 'queued successor')!;
+    expect(f.session._activeClientMessageId).toBe(f.source.id);
+    const negative = { type: 'sys.recovery_decision', peer: f.peer, sourceClientMessageId: f.source.id,
+      errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'enqueue_rejected' };
+    f.push(negative);
+    expect(f.session._automaticRecoveryDecisions?.[f.source.id]).toBe(true);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.session._activeClientMessageId).toBe(queued.id);
+    expect(f.session._sendingInFlight).toBe(true);
+    f.push(negative);
+    expect(f.session._activeClientMessageId).toBe(queued.id);
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session.messages.some(m => m._clientMessageId === queued.id && m._errorCode)).toBe(false);
+    f.sock.stop();
+  });
+  test('negative decision and duplicate errors after Stop cannot turn user cancellation into a source failure', () => {
+    const f = fixture(); f.error(); f.sock.stopTurn(f.sessId);
+    f.push({ type: 'sys.recovery_decision', peer: f.peer, sourceClientMessageId: f.source.id,
+      errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'not_recoverable' });
+    f.push({ type: 'error', peer: f.peer, clientMessageId: f.source.id,
+      code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'late legacy timeout' });
+    f.error();
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.session._cancelledAutomaticRecoveryIds?.[f.source.id]).toBe(true);
+    f.sock.stop();
+  });
+  test('wrong-source or stale negative decisions cannot stop current preparation or a newer user turn', () => {
+    const f = fixture(); f.error();
+    const decision = (sourceClientMessageId: string) => ({ type: 'sys.recovery_decision', peer: f.peer,
+      sourceClientMessageId, errorCode: 'dispatch_enrichment_timeout', scheduled: false, reason: 'not_recoverable' });
+    f.push(decision('m-another-source'));
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session._automaticRecoveryDecisions?.['m-another-source']).not.toBe(true);
+    f.push(f.ack); f.push(decision(f.source.id));
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session._sendingInFlight).toBe(true);
+    f.session.messages.push({ id: 'm-new-ordinary-user', role: 'user', text: 'new request', ts: Date.now(), status: 'sent' });
+    f.session._activeClientMessageId = 'm-new-ordinary-user';
+    f.push(decision(f.source.id));
+    expect(f.session._activeClientMessageId).toBe('m-new-ordinary-user');
+    expect(f.session._sendingInFlight).toBe(true);
+    f.sock.stop();
+  });
 });

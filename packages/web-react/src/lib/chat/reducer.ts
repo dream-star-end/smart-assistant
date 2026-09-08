@@ -2490,8 +2490,10 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
 function isSupersededPreparationError(sess: ChatSession, code: unknown, cmid: string | undefined): boolean {
   return !!cmid && normalizeBridgeErrorCode(code) === "dispatch_enrichment_timeout" &&
     (sess._cancelledAutomaticRecoveryIds?.[cmid] === true ||
-      sess.messages.some((m) => m.role === "user" && m._automaticRecoveryCause === "preparation" &&
-        m._recoveryOfClientMessageId === cmid));
+      sess.messages.some((m) =>
+        (m.role === "user" && m._automaticRecoveryCause === "preparation" && m._recoveryOfClientMessageId === cmid) ||
+        (m.role === "assistant" && m._clientMessageId === cmid &&
+          normalizeBridgeErrorCode(m._errorCode) === "dispatch_enrichment_timeout")));
 }
 
 export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: OutboundErrorWire): boolean {

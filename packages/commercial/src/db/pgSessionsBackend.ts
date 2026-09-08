@@ -8309,10 +8309,26 @@ async function readOpenDispatchForSession(
   const pending = (await queryable.query<{
     source_client_message_id: string; root_client_message_id: string; dispatch_id: string | null;
     preparation_retry_count: number; request_json: Record<string,unknown>; next_attempt_at: Date;
-  }>(`SELECT source_client_message_id,root_client_message_id,dispatch_id,preparation_retry_count,request_json,next_attempt_at
-    FROM turn_recovery_jobs WHERE user_id=$1 AND session_id=$2 AND job_origin='pre_transfer_enrichment'
-      AND status IN ('queued','leased','sent') ORDER BY created_at DESC LIMIT 1`, [uidMatch[1],sessionId])).rows[0];
-  const pendingState: { pendingRecovery?: PendingPreparationRecovery } = pending ? {
+    session_messages: string;
+  }>(`SELECT j.source_client_message_id,j.root_client_message_id,j.dispatch_id,j.preparation_retry_count,j.request_json,j.next_attempt_at,
+      s.messages AS session_messages
+    FROM turn_recovery_jobs j JOIN client_sessions s ON s.id=j.session_id AND s.user_id=$3
+    WHERE j.user_id=$1 AND j.session_id=$2 AND j.job_origin='pre_transfer_enrichment'
+      AND s.deleted_at IS NULL AND j.status IN ('queued','leased','sent') ORDER BY j.created_at DESC LIMIT 1`,
+    [uidMatch[1],sessionId,userId])).rows[0];
+  // Read TEXT as-is: PostgreSQL JSONB coercion would reject legal historic NUL
+  // escapes. The job and latest human identity come from one current snapshot.
+  let pendingIsCurrent = false;
+  if (pending) {
+    try {
+      const messages: MessageLike[] = JSON.parse(pending.session_messages);
+      const latestHuman = Array.isArray(messages)
+        ? [...messages].reverse().find((message) => message?.role === "user" && message._automaticRecovery !== true)
+        : undefined;
+      pendingIsCurrent = latestHuman?.id === pending.source_client_message_id || latestHuman?.id === pending.root_client_message_id;
+    } catch { /* malformed authority cannot advertise pending recovery */ }
+  }
+  const pendingState: { pendingRecovery?: PendingPreparationRecovery } = pending && pendingIsCurrent ? {
     pendingRecovery: { cause: "preparation",mode: "replay",sourceClientMessageId: pending.source_client_message_id,
       rootClientMessageId: pending.root_client_message_id,attempt: 1,max: AUTOMATIC_TURN_RETRY_MAX,
       retryAt: pending.next_attempt_at.getTime(),

@@ -200,6 +200,7 @@ import {
 import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,
+  AutomaticRecoveryDecision,
 } from "../db/pgSessionsBackend.js";
 import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
@@ -1156,6 +1157,11 @@ export interface UserChatBridgeDeps {
     uid: bigint; sessionId: string; clientMessageId: string; dispatchId: string;
     attemptNo: number; ownerId: string; leaseEpoch: number;
   }) => Promise<{ kind: "scheduled" | "not_eligible" | "lost_ownership" }>;
+  /** Post-commit source preparation verdict; production preserves telemetry and
+   * cross-slot fan-out through the same publisher as finalized-tape recovery. */
+  publishPreparationRecoveryDecision?: (
+    userId: string, sessionId: string, decision: AutomaticRecoveryDecision,
+  ) => void;
   reconcileAutomaticRecoveryJobs?: (uid: bigint, limit?: number) => Promise<number>;
   /** Authoritative session cwd policy. V5 production always injects this;
    * legacy/test compositions may omit it and retain the shared workspace. */
@@ -3826,14 +3832,36 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 return;
               }
             }
-            await casToTerminal(pool, {
+            const terminal = await casToTerminal(pool, {
               dispatchId: record.dispatchId,
-              outcome: "executed_error",
+              // Only the consumed fresh-source proof means never transferred.
+              // Missing receipt/accepted_at alone cannot make takeover free.
+              outcome: sourceReplayEligible ? "not_accepted" : "executed_error",
               failureCode,
               clientNotified: false,
               fromStatuses: ["admitted"],
               expectedEpoch: record.leaseEpoch,
             });
+            if (terminal && failureCode === "dispatch_enrichment_timeout") {
+              const decision: AutomaticRecoveryDecision = {
+                scheduled: false,
+                sourceClientMessageId: record.clientMessageId,
+                errorCode: failureCode,
+                reason: "enqueue_rejected",
+              };
+              // Await the winning terminal CAS: never veto another owner's job,
+              // nor publish before the synchronous legacy error frame below.
+              if (deps.publishPreparationRecoveryDecision) {
+                deps.publishPreparationRecoveryDecision(`c:${uid}`, record.sessionId, decision);
+              } else {
+                broadcastToUser(uid, {
+                  type: "sys.recovery_decision",
+                  peer: { id: record.sessionId, kind: "dm" },
+                  ...decision,
+                  ts: Date.now(),
+                });
+              }
+            }
           }
         } catch (err) {
           bridgeLog?.error("user-chat-bridge: pre-transfer dispatch terminalization failed", {
@@ -7850,12 +7878,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   let persisted = false;
                   try {
                     if (rec.recoveryJob) {
-                      persisted = await releaseRecoveryPreReceipt(pool, {
-                        job: rec.recoveryJob,
-                        dispatchId: rec.dispatchId,
-                        dispatchOwner: rec.leaseOwnerId,
-                        dispatchLeaseEpoch: rec.leaseEpoch,
-                      });
+                      const releaseInput = {
+                        job: rec.recoveryJob, dispatchId: rec.dispatchId,
+                        dispatchOwner: rec.leaseOwnerId, dispatchLeaseEpoch: rec.leaseEpoch,
+                        failureCode: "DISPATCH_NOT_ACCEPTED",
+                      };
+                      if (rec.recoveryJob.jobOrigin === "pre_transfer_enrichment") {
+                        const result = await releasePreparationPreReceipt(pool, releaseInput);
+                        // Intent stays unknown even for a rejected receipt;
+                        // never turn a fence miss or unknown into a no-send claim.
+                        persisted = result === "queued" || result === "exhausted";
+                      } else {
+                        persisted = await releaseRecoveryPreReceipt(pool, releaseInput);
+                      }
                     } else {
                       persisted = await casToTerminal(pool, {
                         dispatchId: rec.dispatchId,

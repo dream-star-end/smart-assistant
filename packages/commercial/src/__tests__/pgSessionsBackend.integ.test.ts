@@ -12,7 +12,7 @@
 //   · §9 双连接 barrier 并发:N 并发 append(_seq 唯一严格递增)/ appendForRequest vs
 //     appendCostCredits 双 miss 两序收敛 / upsert stale 竞态
 
-import { after, before, beforeEach, describe, test } from "node:test";
+import { after, afterEach, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -61,7 +61,11 @@ import {
   claimDueRecoveryJobs,
   markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
+  releasePreparationPreReceipt,
+  forwardRecoveryUnderRootFence,
+  type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
+import { admitDurableControl } from "../dispatch/turnControlStore.js";
 import { authorizeTurnTapeRecovery } from "../admin/turnTapeRecovery.js";
 import {
   claimDueMaterializationJobs,
@@ -5720,6 +5724,275 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       ...over,
     };
   }
+
+
+  afterEach(async () => {
+    if (!pgAvailable) return;
+    await pool.query("DELETE FROM turn_recovery_jobs WHERE session_id LIKE 's-prep174-%'");
+    await pool.query("DELETE FROM turn_dispatches WHERE session_id LIKE 's-prep174-%'");
+  });
+
+  function preparationBackend(p = pool) {
+    return createPgSessionsBackend(p, { expectedGeneration: GENERATION, testPreparationRecoveryWriter: true });
+  }
+  async function startPreparation(suffix: string, large = false) {
+    const sessionId = `s-prep174-${suffix}`;
+    const cmid = `cm-prep174-${suffix}`;
+    const text = large ? `HEAD${"exact😀".repeat(600_000)}TAIL` : "exact source request";
+    const frame = {
+      type: "inbound.message", channel: "webchat", peer: { id: sessionId,kind: "dm" },
+      clientMessageId: cmid,idempotencyKey: `idem-${cmid}`,agentId: "main",model: "cursor-opus-5-high",
+      effortLevel: "high",contextTier: "1m",teamMode: true,conversationMode: "plan",modelSwitchId: "switch-prep174",ts: 123,
+      content: { text,media: [{ kind: "image",url: "/api/media/exact.png" }],
+        replyTo: { messageId: "quoted",role: "assistant",text: "exact quote" },
+        imageEdit: { clientJobId: "a".repeat(32),sourceIndex: 0,maskIndex: 0,guideIndex: 0,width: 8,height: 8 } },
+    };
+    const b = preparationBackend();
+    const admitted = await b.admitUserTurn(admitInput({ sessionId,clientMessageId: cmid,model: frame.model,
+      requestHash: sha256(text),preparationRequest: frame,
+      message: { id: cmid,role: "user",text,ts: 123,_routing: {model: frame.model,effortLevel: "high",teamMode: true},
+        _media: frame.content.media,_replyTo: frame.content.replyTo,_imageEdit: frame.content.imageEdit } }));
+    assert.equal(admitted.kind,"admitted");
+    if (admitted.kind !== "admitted") throw new Error("source admission failed");
+    assert.equal(admitted.takeover,false);
+    assert.equal((await b.failPreparationAndScheduleRecovery({ uid: UID,sessionId,clientMessageId: cmid,
+      dispatchId: admitted.dispatch.dispatchId,attemptNo: 1,ownerId: admitted.dispatch.ownerId!,leaseEpoch: 1 })).kind,"scheduled");
+    const claim = async () => {
+      await pool.query("UPDATE turn_recovery_jobs SET next_attempt_at=NOW() WHERE session_id=$1",[sessionId]);
+      const jobs = await claimDueRecoveryJobs(pool,{ userId: UID,ownerId: "prep-scheduler",leaseMs: 30000,limit: 20 });
+      const job = jobs.find((candidate) => candidate.sessionId === sessionId);
+      assert.ok(job);
+      return job;
+    };
+    const admitChild = async (job: ClaimedRecoveryJob, target = pool, billing = `child-billing-${cmid}`) => {
+      const request = job.request;
+      const content = request.content as typeof frame.content & {displayText: string;recovery: NonNullable<Parameters<PgSessionsBackend["admitUserTurn"]>[0]["recovery"]>};
+      const result = await preparationBackend(target).admitUserTurn(admitInput({ sessionId,
+        clientMessageId: String(request.clientMessageId),model: String(request.model),requestHash: sha256(text),
+        preparationRequest: request,billingRequestId: billing,recovery: content.recovery,
+        recoveryJob: {jobId: job.jobId,leaseOwner: job.leaseOwner,leaseEpoch: job.leaseEpoch},
+        message: {id: String(request.clientMessageId),role: "user",text: content.displayText,_modelText: content.text,ts: 124,
+          _routing: {model: request.model,effortLevel: request.effortLevel,teamMode: request.teamMode},
+          _media: content.media,_replyTo: content.replyTo,_imageEdit: content.imageEdit} }));
+      assert.equal(result.kind,"admitted");
+      if (result.kind !== "admitted") throw new Error(`child admission failed: ${JSON.stringify(result)}`);
+      return result;
+    };
+    return { sessionId,cmid,text,frame,b,admitted,claim,admitChild };
+  }
+  function sendInput(job: ClaimedRecoveryJob, child: {dispatch: NonNullable<Awaited<ReturnType<typeof getDispatch>>>}) {
+    return {job,dispatchId: child.dispatch.dispatchId,dispatchAttemptNo: child.dispatch.attemptNo,
+      dispatchOwner: child.dispatch.ownerId!,dispatchLeaseEpoch: child.dispatch.leaseEpoch};
+  }
+  async function waitPgLock(application: string) {
+    const deadline = Date.now()+3500;
+    do {
+      const rows = await pool.query("SELECT query FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",[application]);
+      if (rows.rowCount) return rows.rows[0].query as string;
+      await new Promise((resolve) => setTimeout(resolve,10));
+    } while (Date.now()<deadline);
+    throw new Error(`real PG barrier was not reached: ${application}`);
+  }
+  function barrierPool(name: string) {
+    return new Pool({connectionString: TEST_DB_URL,max: 3,application_name: name,options: `-c search_path=${SCHEMA} -c statement_timeout=8000`});
+  }
+
+  maybe("OCV5-174 real source admission freezes >4MiB settings and reclaims exactly one deferred child", async () => {
+    const chain = await startPreparation("large",true);
+    assert.ok(Buffer.byteLength(chain.text)>4*1024*1024);
+    const stored = (await pool.query("SELECT messages FROM client_sessions WHERE id=$1",[chain.sessionId])).rows[0].messages;
+    assert.ok(Buffer.byteLength(stored)<20_000,"source hot stub must not hold the large request");
+    const [payload] = (await pool.query("SELECT payload FROM client_session_user_payloads WHERE session_id=$1",[chain.sessionId])).rows;
+    assert.equal(JSON.parse(payload.payload.toString()).text,chain.text);
+    const pending = await chain.b.getClientSession(chain.sessionId,CUSER) as ClientSession & {pendingRecovery?: {attempt: number;max: number;clientMessageId?: string}};
+    assert.equal(pending.pendingRecovery?.attempt,1); assert.equal(pending.pendingRecovery?.max,10);
+    assert.equal(pending.pendingRecovery?.clientMessageId,undefined);
+    const job = await chain.claim();
+    for (const key of ["model","effortLevel","contextTier","teamMode","conversationMode","modelSwitchId"] as const)
+      assert.equal(job.request[key],chain.frame[key]);
+    assert.deepEqual((job.request.content as typeof chain.frame.content).media,chain.frame.content.media);
+    assert.deepEqual((job.request.content as typeof chain.frame.content).imageEdit,chain.frame.content.imageEdit);
+    assert.deepEqual((job.request.content as typeof chain.frame.content).replyTo,chain.frame.content.replyTo);
+    const child = await chain.admitChild(job);
+    const childPending = await chain.b.getClientSession(chain.sessionId,CUSER) as ClientSession & {pendingRecovery?: {clientMessageId?: string;attempt: number}};
+    assert.equal(childPending.pendingRecovery?.clientMessageId,child.dispatch.clientMessageId);
+    assert.equal(childPending.pendingRecovery?.attempt,1);
+    assert.equal(await releasePreparationPreReceipt(pool,{...sendInput(job,child),failureCode: "dispatch_enrichment_timeout"}),"queued");
+    const secondJob = await chain.claim();
+    const second = await chain.admitChild(secondJob,pool,"MUST-NOT-REPLACE-STABLE-BILLING");
+    assert.equal(second.dispatch.dispatchId,child.dispatch.dispatchId);
+    assert.equal(second.dispatch.clientMessageId,child.dispatch.clientMessageId);
+    assert.equal(second.dispatch.attemptNo,child.dispatch.attemptNo);
+    assert.equal(second.dispatch.billingRequestId,child.dispatch.billingRequestId);
+    assert.ok(second.dispatch.leaseEpoch>child.dispatch.leaseEpoch);
+    const deferred = JSON.parse((await pool.query("SELECT messages FROM client_sessions WHERE id=$1",[chain.sessionId])).rows[0].messages)
+      .find((message: MessageLike) => message.id === second.dispatch.clientMessageId);
+    assert.equal(deferred._automaticRecoveryCause,"preparation");
+    assert.equal(deferred._automaticRecoveryAttempt,1);
+    assert.equal((await pool.query("SELECT count(*) FROM turn_recovery_jobs WHERE session_id=$1",[chain.sessionId])).rows[0].count,"1");
+  });
+
+  maybe("OCV5-174 REST pending ignores newer human and soft deletion without JSONB NUL coercion",async () => {
+    const chain = await startPreparation("pending");
+    const pending = () => chain.b.getClientSession(chain.sessionId,CUSER) as Promise<(ClientSession & {pendingRecovery?: unknown}) | null>;
+    assert.ok((await pending())?.pendingRecovery);
+    await chain.b.admitUserTurn(admitInput({sessionId: chain.sessionId,clientMessageId: "cm-newer-human",
+      message: {id: "cm-newer-human",role: "user",text: "new human",ts: 200}}));
+    // Legacy TEXT authority legally stores an escaped NUL; do not route it
+    // through the unrelated initial-title TEXT parameter on admission.
+    const messages = JSON.parse((await pool.query("SELECT messages FROM client_sessions WHERE id=$1",[chain.sessionId])).rows[0].messages);
+    messages.at(-1).text = "合法\u0000正文";
+    await pool.query("UPDATE client_sessions SET messages=$2 WHERE id=$1",[chain.sessionId,JSON.stringify(messages)]);
+    assert.equal((await pending())?.pendingRecovery,undefined);
+    await pool.query("UPDATE client_sessions SET deleted_at=(EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint WHERE id=$1",[chain.sessionId]);
+    assert.equal(await pending(),null);
+  });
+
+  maybe("OCV5-174 real release-Stop barrier preserves intent and never locks child before session",async () => {
+    for (const intent of [false,true]) {
+      const chain = await startPreparation(`stop-${intent}`);
+      const job = await chain.claim(); const child = await chain.admitChild(job); const input = sendInput(job,child);
+      if (intent) assert.equal(await forwardRecoveryUnderRootFence(pool,input,() => false),false);
+      const worker = barrierPool(`prep-release-${intent}`); const holder = await pool.connect();
+      let release: ReturnType<typeof releasePreparationPreReceipt> | undefined;
+      try {
+        await holder.query("BEGIN");
+        await holder.query("SELECT 1 FROM client_sessions WHERE id=$1 FOR UPDATE",[chain.sessionId]);
+        release = releasePreparationPreReceipt(worker,{...input,failureCode: "dispatch_enrichment_timeout"});
+        assert.match(await waitPgLock(`prep-release-${intent}`),/client_sessions/);
+        await holder.query("SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1 FOR UPDATE NOWAIT",[input.dispatchId]);
+        const stop = admitDurableControl(pool,{controlId: `stop-${intent}`,userId: UID,sessionId: chain.sessionId,
+          rootClientMessageId: chain.cmid,kind: "stop",payload: {}});
+        await holder.query("COMMIT");
+        await Promise.all([release,stop]);
+        const dispatch = await getDispatch(pool,input.dispatchId);
+        assert.equal(dispatch!.status,intent ? "admitted" : "terminal");
+        if (!intent) assert.equal(dispatch!.outcome,"not_accepted");
+        else assert.equal(dispatch!.outcome,null);
+      } finally { await holder.query("ROLLBACK").catch(() => {}); holder.release(); await release?.catch(() => {}); await worker.end(); }
+    }
+  });
+
+  maybe("OCV5-174 new-user and delete win real session barriers before child physical send",async () => {
+    for (const winner of ["new-user","delete"] as const) for (const intent of [false,true]) {
+      const chain = await startPreparation(`forward-${winner}-${intent}`);
+      const job = await chain.claim(); const child = await chain.admitChild(job); const input = sendInput(job,child);
+      if (intent) assert.equal(await forwardRecoveryUnderRootFence(pool,input,() => false),false);
+      const worker = barrierPool(`prep-forward-${winner}`); const mutator=barrierPool(`prep-mutator-${winner}`); const holder = await pool.connect();
+      let mutation: Promise<unknown> | undefined;
+      let forward: ReturnType<typeof forwardRecoveryUnderRootFence> | undefined; let sends = 0;
+      try {
+        await holder.query("BEGIN"); await holder.query("SELECT 1 FROM client_sessions WHERE id=$1 FOR UPDATE",[chain.sessionId]);
+        // Queue the real public mutation before the forward, not a manually
+        // fabricated latest-message row. PostgreSQL's S wait queue is the barrier.
+        mutation=winner === "delete"
+          ? preparationBackend(mutator).deleteClientSession(chain.sessionId,CUSER)
+          : preparationBackend(mutator).admitUserTurn(admitInput({sessionId: chain.sessionId,clientMessageId: `new-user-${intent}`,
+              message: {id: `new-user-${intent}`,role: "user",text: "new real user",ts: 201}}));
+        assert.match(await waitPgLock(`prep-mutator-${winner}`),/client_sessions/);
+        forward = forwardRecoveryUnderRootFence(worker,input,() => {sends++;return true;});
+        assert.match(await waitPgLock(`prep-forward-${winner}`),/client_sessions/);
+        await holder.query("SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1 FOR UPDATE NOWAIT",[input.dispatchId]);
+        await holder.query("COMMIT");
+        const mutationResult=await mutation;
+        assert.ok(winner === "delete" ? mutationResult === true : (mutationResult as {kind?: string})?.kind === "admitted");
+        assert.equal(await forward,false);assert.equal(sends,0);
+        const persistedIntent=(await pool.query("SELECT preparation_send_intent_at FROM turn_recovery_jobs WHERE job_id=$1",[job.jobId])).rows[0].preparation_send_intent_at;
+        assert.equal(persistedIntent !== null,intent);
+        assert.equal(await releasePreparationPreReceipt(pool,{...input,failureCode: "dispatch_enrichment_timeout"}),"fenced");
+        const afterFence=await getDispatch(pool,input.dispatchId);
+        assert.equal(afterFence!.status,intent ? "admitted" : "terminal");
+        assert.equal(afterFence!.outcome,intent ? null : "not_accepted");
+      } finally {await holder.query("ROLLBACK").catch(() => {});holder.release();await mutation?.catch(() => {});await forward?.catch(() => {});await worker.end();await mutator.end();}
+    }
+  });
+
+  maybe("OCV5-174 receipt-forward real advisory barrier preserves accepted child without second send",async () => {
+    const chain = await startPreparation("receipt");const job = await chain.claim();const child = await chain.admitChild(job);const input=sendInput(job,child);
+    assert.equal(await forwardRecoveryUnderRootFence(pool,input,() => false),false);
+    const receiver = barrierPool("prep-receipt");const sender=barrierPool("prep-sender");const holder=await pool.connect();
+    let receipt: ReturnType<typeof markRecoveryContainerReceipt> | undefined;let forward: ReturnType<typeof forwardRecoveryUnderRootFence> | undefined;let sends=0;
+    try {
+      await holder.query("BEGIN");await holder.query("SELECT pg_advisory_xact_lock(hashtextextended('oc_recovery_session:9:' || $1,0))",[chain.sessionId]);
+      receipt=markRecoveryContainerReceipt(receiver,{dispatchId: input.dispatchId,dispatchAttemptNo: 1,expectedDispatchLeaseEpoch: input.dispatchLeaseEpoch});
+      assert.match(await waitPgLock("prep-receipt"),/pg_advisory_xact_lock/);
+      forward=forwardRecoveryUnderRootFence(sender,input,() => {sends++;return true;});
+      assert.match(await waitPgLock("prep-sender"),/pg_advisory_xact_lock/);
+      await holder.query("SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1 FOR UPDATE NOWAIT",[input.dispatchId]);
+      await holder.query("COMMIT");
+      assert.equal(await receipt,true);assert.equal(await forward,false);assert.equal(sends,0);
+      assert.equal((await getDispatch(pool,input.dispatchId))!.status,"accepted");
+    } finally {await holder.query("ROLLBACK").catch(() => {});holder.release();await receipt?.catch(() => {});await forward?.catch(() => {});await receiver.end();await sender.end();}
+  });
+
+
+  maybe("OCV5-174 finalize wins real session barrier against re-admission without reviving child",async () => {
+    const chain=await startPreparation("finalize");const initialJob=await chain.claim();const child=await chain.admitChild(initialJob);const input=sendInput(initialJob,child);
+    assert.equal(await forwardRecoveryUnderRootFence(pool,input,() => false),false);
+    assert.equal(await releasePreparationPreReceipt(pool,{...input,failureCode: "dispatch_enrichment_timeout"}),"unknown");
+    const job=await chain.claim();
+    const tape=buildTape({sessionId: chain.sessionId,agentId: "main",turnIndex: 1,status: "completed",turnKey: sha256(chain.sessionId),
+      clientMessageId: child.dispatch.clientMessageId,text: "completed authoritative child",createdAt: 200});
+    for (const part of tape.parts) await chain.b.stageLosslessTurnTapePart(CUSER,part.request,part.bytes,{dispatchId: input.dispatchId,attemptNo: 1});
+    const writer=barrierPool("prep-finalize");const reader=barrierPool("prep-readmit");const holder=await pool.connect();
+    let finalize: ReturnType<PgSessionsBackend["finalizeLosslessTurnTape"]> | undefined;
+    let readmit: ReturnType<PgSessionsBackend["admitUserTurn"]> | undefined;
+    try {
+      await holder.query("BEGIN");await holder.query("SELECT 1 FROM client_sessions WHERE id=$1 FOR UPDATE",[chain.sessionId]);
+      finalize=preparationBackend(writer).finalizeLosslessTurnTape(CUSER,{...tape.finalize,dispatchId: input.dispatchId,attemptNo: 1});
+      assert.match(await waitPgLock("prep-finalize"),/client_sessions/);
+      const content=job.request.content as {text: string;displayText: string;recovery: NonNullable<Parameters<PgSessionsBackend["admitUserTurn"]>[0]["recovery"]>};
+      readmit=preparationBackend(reader).admitUserTurn(admitInput({sessionId: chain.sessionId,clientMessageId: String(job.request.clientMessageId),
+        model: String(job.request.model),requestHash: sha256(chain.text),preparationRequest: job.request,
+        recovery: content.recovery,recoveryJob: {jobId: job.jobId,leaseOwner: job.leaseOwner,leaseEpoch: job.leaseEpoch},
+        message: {id: String(job.request.clientMessageId),role: "user",text: content.displayText,_modelText: content.text,ts: 124}}));
+      assert.match(await waitPgLock("prep-readmit"),/client_sessions/);
+      await holder.query("SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1 FOR UPDATE NOWAIT",[input.dispatchId]);
+      await holder.query("SELECT 1 FROM turn_recovery_jobs WHERE job_id=$1 FOR UPDATE NOWAIT",[job.jobId]);
+      await holder.query("COMMIT");
+      assert.equal((await finalize).applied,"finalized");
+      const replayResult=await readmit;
+      // Phase A has already terminalized D; re-admit may observe it before
+      // Phase B settles J. Both outcomes mean no second executable dispatch.
+      assert.ok(replayResult.kind === "deduplicated" || replayResult.kind === "recovery_conflict");
+      if (replayResult.kind === "deduplicated") {
+        assert.equal(replayResult.dispatch.dispatchId,input.dispatchId);
+        assert.equal(replayResult.dispatch.attemptNo,input.dispatchAttemptNo);
+      }
+      assert.equal((await pool.query("SELECT count(*) FROM turn_dispatches WHERE session_id=$1",[chain.sessionId])).rows[0].count,"2");
+      assert.equal((await getDispatch(pool,input.dispatchId))!.outcome,"completed");
+      const durable=(await pool.query("SELECT status,preparation_send_intent_at FROM turn_recovery_jobs WHERE job_id=$1",[job.jobId])).rows[0];
+      assert.equal(durable.status,"completed");assert.ok(durable.preparation_send_intent_at);
+    } finally {await holder.query("ROLLBACK").catch(() => {});holder.release();await finalize?.catch(() => {});await readmit?.catch(() => {});await writer.end();await reader.end();}
+  });
+
+
+  maybe("OCV5-174 unsupported remote media or nested NUL never grants source replay authority",async () => {
+    for (const unsafe of ["remote","nul"] as const) {
+      const sessionId=`s-prep174-unsafe-${unsafe}`;const cmid=`cm-prep174-unsafe-${unsafe}`;
+      const frame={type: "inbound.message",peer: {id: sessionId,kind: "dm"},channel: "webchat",agentId: "main",
+        model: "gpt-5.6-sol",clientMessageId: cmid,idempotencyKey: cmid,
+        content: unsafe === "remote" ? {text: "allowed original",media: [{kind: "image",url: "https://example.com/not-durable.png"}]} :
+          {text: "allowed original",replyTo: {messageId: "quoted",text: "nested"+String.fromCharCode(0)+"exact"}}};
+      const b=preparationBackend();const admitted=await b.admitUserTurn(admitInput({sessionId,clientMessageId: cmid,preparationRequest: frame}));
+      assert.equal(admitted.kind,"admitted");if(admitted.kind!=="admitted") throw new Error("original admission rejected");
+      assert.equal((await b.failPreparationAndScheduleRecovery({uid: UID,sessionId,clientMessageId: cmid,dispatchId: admitted.dispatch.dispatchId,
+        attemptNo: 1,ownerId: admitted.dispatch.ownerId!,leaseEpoch: 1})).kind,"not_eligible");
+      assert.equal((await pool.query("SELECT preparation_request_json FROM turn_dispatches WHERE dispatch_id=$1",[admitted.dispatch.dispatchId])).rows[0].preparation_request_json,null);
+      assert.equal((await pool.query("SELECT count(*) FROM turn_recovery_jobs WHERE session_id=$1",[sessionId])).rows[0].count,"0");
+    }
+  });
+
+  maybe("OCV5-174 actual rejected-receipt preparation release keeps intent and the original child identity",async () => {
+    const chain=await startPreparation("rejected");const job=await chain.claim();const child=await chain.admitChild(job);const input=sendInput(job,child);
+    assert.equal(await forwardRecoveryUnderRootFence(pool,input,() => true),true);
+    assert.equal(await releasePreparationPreReceipt(pool,{...input,failureCode: "DISPATCH_NOT_ACCEPTED"}),"unknown");
+    const row=(await pool.query("SELECT status,preparation_retry_count,dispatch_id,dispatch_attempt_no,preparation_send_intent_at FROM turn_recovery_jobs WHERE job_id=$1",[job.jobId])).rows[0];
+    assert.equal(row.preparation_retry_count,0);assert.equal(row.dispatch_id,input.dispatchId);assert.equal(row.dispatch_attempt_no,1);assert.ok(row.preparation_send_intent_at);
+    const next=await chain.claim();const reclaimed=await chain.admitChild(next,pool,"ignored-new-billing");
+    assert.equal(reclaimed.dispatch.dispatchId,input.dispatchId);assert.equal(reclaimed.dispatch.billingRequestId,child.dispatch.billingRequestId);
+    assert.equal(reclaimed.dispatch.status,"admitted");assert.equal(reclaimed.dispatch.outcome,null);
+  });
 
   async function seedRecoverableSource(args: {
     sessionId: string;

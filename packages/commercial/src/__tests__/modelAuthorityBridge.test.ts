@@ -15,7 +15,7 @@
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
@@ -61,6 +61,7 @@ import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import { detectScanSciPaperIntent } from "../ws/paperIntentHint.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
+import { createPgSessionsBackend } from "../db/pgSessionsBackend.js";
 import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import {
   ModelCatalogSnapshot,
@@ -248,6 +249,7 @@ async function startRig(opts: {
   verifyDispatchReceipt?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   failPreparationAndScheduleRecovery?: UserChatBridgeDeps["failPreparationAndScheduleRecovery"];
+  publishPreparationRecoveryDecision?: UserChatBridgeDeps["publishPreparationRecoveryDecision"];
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
   getFrontendBuildId?: UserChatBridgeDeps["getFrontendBuildId"];
@@ -518,6 +520,9 @@ async function startRig(opts: {
     ...(admitUserTurn ? { admitUserTurn } : {}),
     ...(opts.failPreparationAndScheduleRecovery
       ? { failPreparationAndScheduleRecovery: opts.failPreparationAndScheduleRecovery }
+      : {}),
+    ...(opts.publishPreparationRecoveryDecision
+      ? { publishPreparationRecoveryDecision: opts.publishPreparationRecoveryDecision }
       : {}),
     ...(opts.loadMasterSessionMessages
       ? { loadMasterSessionMessages: opts.loadMasterSessionMessages }
@@ -1195,6 +1200,108 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
 }
 
 describe("OCV5-174 preparation ownership through real WebSockets", () => {
+  for (const mode of ["writer-off", "missing-hook", "takeover", "cas-miss", "lost-ownership"] as const) {
+    test(`R1 negative preparation decision ${mode}: post-commit, no phantom recovery or late send`, async () => {
+      let finishHistory!: (rows: unknown[]) => void;
+      const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+      let finishCas!: () => void;
+      const casBarrier = new Promise<void>((resolve) => { finishCas = resolve; });
+      let admitted: TurnDispatchRow | undefined;
+      let casStarted = false;
+      let casCommitted = false;
+      let scheduleCalls = 0;
+      let publishCalls = 0;
+      const terminalOutcomes: unknown[] = [];
+      const pool = { query: async (sql: string, params: unknown[] = []) => {
+        if (!/SET status = 'terminal'/.test(sql)) return { rows: [], rowCount: 0 };
+        casStarted = true;
+        terminalOutcomes.push(params[1]);
+        assert.deepEqual(params[5], ["admitted"]);
+        await casBarrier;
+        if (mode === "cas-miss") return { rows: [], rowCount: 0 };
+        assert.ok(admitted);
+        assert.equal(params[0], admitted.dispatchId);
+        assert.equal(params[6], String(admitted.leaseEpoch));
+        const row = Object.fromEntries(Object.entries(admitted).map(([key, value]) => [
+          key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+          typeof value === "bigint" ? value.toString() : value,
+        ]));
+        casCommitted = true;
+        return { rows: [{ ...row, status: "terminal", outcome: params[1], failure_code: params[2] }], rowCount: 1 };
+      } };
+      // Exercise the actual R0 production backend (no test writer override),
+      // not a stub returning the verdict we are trying to prove.
+      const backend = createPgSessionsBackend(
+        pool as Parameters<typeof createPgSessionsBackend>[0], { expectedGeneration: 1 },
+      );
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, promptQueuePreparationTimeoutMs: 40,
+        pgPool: pool,
+        admitUserTurn: async (input) => {
+          const result = fakeAdmittedDispatch(input);
+          assert.equal(result.kind, "admitted");
+          if (mode === "takeover") result.takeover = true;
+          admitted = result.dispatch;
+          return result;
+        },
+        loadMasterSessionMessages: async () => history,
+        ...(mode === "missing-hook" ? {} : {
+          failPreparationAndScheduleRecovery: async (input: Parameters<NonNullable<UserChatBridgeDeps["failPreparationAndScheduleRecovery"]>>[0]) => {
+            scheduleCalls++;
+            return mode === "lost-ownership" ? { kind: "lost_ownership" as const }
+              : backend.failPreparationAndScheduleRecovery(input);
+          },
+        }),
+        ...(mode === "writer-off" ? {
+          publishPreparationRecoveryDecision: (userId, sessionId, decision) => {
+            assert.ok(casCommitted, "production publisher must run after durable terminal success");
+            assert.equal(userId, `c:${UID}`);
+            publishCalls++;
+            rig.bridge.broadcastToUser(BigInt(UID), {
+              type: "sys.recovery_decision", peer: { id: sessionId, kind: "dm" },
+              ...decision, ts: Date.now(),
+            });
+          },
+        } : {}),
+      });
+      const observed: Record<string, unknown>[] = [];
+      try {
+        const ws = await openClient(rig.port);
+        ws.on("message", (raw) => { observed.push(JSON.parse(String(raw))); });
+        const cmid = `cm-prep-negative-${mode}`;
+        ws.send(inboundFrame({ clientMessageId: cmid, peer: { id: "sess-prep-negative", kind: "dm" } }));
+        await waitFor(() => observed.some((f) => f.code === "DISPATCH_ENRICHMENT_TIMEOUT"));
+        assert.equal(observed.some((f) => f.type === "sys.recovery_decision"), false,
+          "no negative decision before terminal CAS commits");
+        assert.equal(casStarted, mode !== "lost-ownership");
+        finishCas();
+        if (mode === "cas-miss" || mode === "lost-ownership") {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          assert.equal(observed.some((f) => f.type === "sys.recovery_decision"), false,
+            "a losing owner cannot reject the winner's recovery");
+        } else {
+          await waitFor(() => observed.some((f) => f.type === "sys.recovery_decision"));
+          const frames = observed.filter((f) => f.code === "DISPATCH_ENRICHMENT_TIMEOUT" || f.type === "sys.recovery_decision");
+          assert.deepEqual(frames.map((f) => f.type), ["error", "sys.recovery_decision"]);
+          assert.equal(frames[1]!.scheduled, false);
+          assert.equal(frames[1]!.sourceClientMessageId, cmid);
+          assert.equal(frames[1]!.reason, "enqueue_rejected");
+          if (mode === "writer-off" && process.env.OC_PREPARATION_NEGATIVE_FRAMES_OUT) {
+            await writeFile(process.env.OC_PREPARATION_NEGATIVE_FRAMES_OUT,
+              JSON.stringify({ source: "modelAuthorityBridge.test R0 actual writer=false", frames }, null, 2));
+          }
+        }
+        finishHistory([]);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0);
+        assert.equal(scheduleCalls, mode === "missing-hook" || mode === "takeover" ? 0 : 1);
+        assert.equal(publishCalls, mode === "writer-off" ? 1 : 0);
+        assert.deepEqual(terminalOutcomes, mode === "lost-ownership" ? [] : [mode === "takeover" ? "executed_error" : "not_accepted"]);
+        ws.terminate();
+      } finally { finishHistory([]); finishCas(); await stopRig(rig); }
+    });
+  }
+
   test("duplicate during preparation cannot cancel owner; one job and zero late sends", async () => {
     let finishHistory!: (rows: unknown[]) => void;
     const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });

@@ -2820,8 +2820,33 @@ export class ChatSocket {
     if (!sessId) return;
     const sess = this.sessions.get(sessId);
     if (!sess) return;
-    if ((frame.cause === "preparation" || frame.errorCode.toLowerCase() === "dispatch_enrichment_timeout") &&
-      frame.scheduled && this.isObsoletePreparationRecovery(sess, frame)) return;
+    const preparation = normalizeTurnErrorCode(frame.errorCode) === "dispatch_enrichment_timeout";
+    if (preparation && !frame.scheduled) {
+      const source = sess.messages.find((m) => m.role === "user" && m.id === frame.sourceClientMessageId);
+      const ownsSource = !!source && sess._sendingInFlight && sess._activeClientMessageId === source.id;
+      if (!source || !isClientMessageId(source.id) ||
+        sess._cancelledAutomaticRecoveryIds?.[source.id] === true ||
+        (source._automaticRecoveryRootClientMessageId &&
+          sess._cancelledAutomaticRecoveryIds?.[source._automaticRecoveryRootClientMessageId] === true) ||
+        (sess._sendingInFlight && sess._activeClientMessageId && !ownsSource) ||
+        (!ownsSource && this.isObsoletePreparationRecovery(sess, {
+          sourceClientMessageId: source.id,
+          rootClientMessageId: source._automaticRecoveryRootClientMessageId ?? source.id,
+        })) || sess.messages.some((m) => m.role === "user" &&
+          m._automaticRecoveryCause === "preparation" && m._recoveryOfClientMessageId === source.id)) return;
+      // A locally queued human row is not a newly admitted owner. Finish the
+      // still-owned source so its queued successor can dispatch immediately.
+      // R0 writer-off (and unsafe R1 sources) are authoritative no-job
+      // decisions. Remember before looking for a pending error: the decision
+      // may arrive first, and the later error must paint immediately rather
+      // than invent twenty seconds of preparation. Reuse the persisted
+      // per-source recovery decision fence, never a session-wide flag.
+      sess._automaticRecoveryDecisions = { ...(sess._automaticRecoveryDecisions ?? {}), [source.id]: true };
+      this.deps.persistSession?.(sessId);
+    }
+    if ((frame.cause === "preparation" || preparation) && frame.scheduled &&
+      (sess._automaticRecoveryDecisions?.[frame.sourceClientMessageId] === true ||
+        this.isObsoletePreparationRecovery(sess, frame))) return;
     const pending = this.pendingRecoveryErrors.get(sessId);
     const matchesPending = !!pending &&
       (!pending.clientMessageId || pending.clientMessageId === frame.sourceClientMessageId);
