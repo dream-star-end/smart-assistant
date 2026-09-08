@@ -542,6 +542,11 @@ build_master_release() {
     cleanup_master_staging
     die "pinned delegate engine billing requestId contract gate 失败"
   fi
+  mlog "  callback payload hash WS proof @ pinned staging"
+  if ! ( cd "$staging" && node scripts/check-v5-callback-payload-hash.mjs ); then
+    cleanup_master_staging
+    die "pinned callback payload hash WS proof 失败"
+  fi
 
   t0="$(date +%s)"
   mlog "  web-react official build @ staging(不碰工作树 dist)"
