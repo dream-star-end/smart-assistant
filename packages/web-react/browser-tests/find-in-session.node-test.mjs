@@ -496,6 +496,12 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
             await dispatchTouchMove(page, point);
             events.touchmoves = (events.touchmoves || 0) + 1;
           }
+          // Playwright wheel dispatch can resolve before the DOM event reaches our observer.
+          // Wait for delivery, not for the pin/trust assertions below to become true.
+          await page.waitForFunction((type) =>
+            (window.__findGestureEvents || []).some((e) =>
+              e.type === type && (type !== "wheel" || e.deltaY === -240)),
+          wantType, { timeout: 4000 });
           gest = await takeGestureEvents(page);
           ev = [...gest].reverse().find((e) =>
             e.type === wantType
