@@ -3396,7 +3396,10 @@
         "e647b850",
         "49fdbb57",
         "42ce33d9",
-        "bbede052"
+        "bbede052",
+        "0a93d2eb",
+        "a11d3094",
+        "b36f9535"
       ],
       "regressions": [
         {
@@ -3443,6 +3446,26 @@
           "layer": "unit",
           "path": "scripts/__tests__/requeueFailedTapeJobs.test.ts",
           "assertion": "planner group hash covers transcript/result/status and fence is per-requestId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "finalize HTTP path is idempotent and does not run Phase A visible publish"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "leader: same run cannot ACK before the root is durable and visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "leader: idempotent root hit must not bypass payload/envelope locator check"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3MasterSink.test.ts",
+          "assertion": "late agent-group continuation defers visible until after parts+finalize"
         },
         {
           "layer": "deploy-gate",
