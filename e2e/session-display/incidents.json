@@ -3415,7 +3415,6 @@
       ]
     },
     {
-<<<<<<< HEAD
       "id": "INC-20260908-FRONTEND-OWNER-FENCE",
       "occurredAt": "2026-09-08",
       "severity": "P1",
@@ -3822,7 +3821,8 @@
       "coverageCommits": [
         "a80f8ae9"
       ]
-=======
+    },
+    {
       "id": "INC-20260908-CROSS-TURN-CARD-LOCATOR",
       "occurredAt": "2026-09-08",
       "severity": "P1",
@@ -3840,7 +3840,6 @@
           "assertion": "OCV5-189 deploy proof: cross-turn delegate billing materializes and settles by its own locator"
         }
       ]
->>>>>>> 9d84f79669c27c681863b4363f1c1a4838bfc9f7
     }
   ]
 }

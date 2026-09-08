@@ -1150,6 +1150,72 @@ describe("OCV5-180 B1: agent-group continuation tapes", () => {
     );
   });
 
+  test("rejects continuation billing whose parentTurnKey is a third turn", () => {
+    assert.throws(() => parseLosslessTurnPayload({
+      ...baseContinuation,
+      agentGroups: [{
+        runId: "dlg-late-third",
+        agentId: "coding-assistant",
+        goal: "x",
+        status: "ok",
+        completedAt: 1,
+        engineBillings: [ownerBilling({ parentTurnKey: "f".repeat(64) })],
+      }],
+    }), /parent locator is invalid/);
+  });
+
+  test("same-session root compatibility preserves earlier-turn billing without a root billing", () => {
+    const billing = ownerBilling();
+    const root = {
+      sessionId: baseContinuation.sessionId,
+      agentId: "main",
+      turnIndex: 7,
+      status: "completed",
+      turnKey: baseContinuation.turnKey,
+      text: "next turn",
+      createdAt: baseContinuation.createdAt,
+      agentGroups: [{
+        runId: "dlg-root-previous",
+        agentId: "coding-assistant",
+        goal: "x",
+        status: "ok",
+        completedAt: 1,
+        engineBillings: [billing],
+      }],
+    };
+    assert.notEqual(billing.parentTurnKey, root.turnKey);
+    assert.equal(billing.parentSessionId, root.sessionId);
+    const turn = materializeLosslessTurn(root);
+    assert.deepEqual(turn.engineBillings, [billing]);
+    const record = turn.records.find((r) => r.role === "agent-group");
+    assert.ok(record);
+    assert.deepEqual(record.payload.engineBillings, [billing]);
+    assert.equal(turn.payload.continuationOfTurnKey, undefined);
+  });
+
+  test("root and continuation reject missing session, missing parent and malformed parent locators", () => {
+    for (const continuation of [false, true]) {
+      for (const invalid of [
+        { parentSessionId: undefined },
+        { parentTurnKey: undefined },
+        { parentTurnKey: "not-a-turn-key" },
+      ]) {
+        assert.throws(() => parseLosslessTurnPayload({
+          ...baseContinuation,
+          ...(continuation ? {} : { agentId: "main", continuationOfTurnKey: undefined, text: "root" }),
+          agentGroups: [{
+            runId: "dlg-invalid-locator",
+            agentId: "coding-assistant",
+            goal: "x",
+            status: "ok",
+            completedAt: 1,
+            engineBillings: [ownerBilling(invalid)],
+          }],
+        }), /parent locator is invalid|parentTurnKey is invalid/);
+      }
+    }
+  });
+
   test("rejects cross-session billing locator", () => {
     assert.throws(
       () => parseLosslessTurnPayload({
@@ -1235,7 +1301,7 @@ describe("OCV5-180 B1: agent-group continuation tapes", () => {
     );
   });
 
-  test("root rule unchanged: a normal tape still rejects group billing for another turn", () => {
+  test("root tape rejects a delegate billing from another session", () => {
     assert.throws(
       () => parseLosslessTurnPayload({
         sessionId: "web-lossless-root",
