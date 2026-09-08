@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,59 +14,132 @@ const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, "../../..");
-const sha = process.env.OC_FIND_SHA || "unknown";
-const resultPath = process.env.OC_FIND_RESULT || join(tmpdir(), "ocv5-188-find-result.json");
 const PEAK_BUDGET = 80;
+const NEGATIVE_SHA = "87d4554efd27289844cfb3ce0146fb713ce24954";
+const NEGATIVE_HASHES = {
+  "components/MessageRenderer.tsx": "f92af0793d94540045f4d3f9f4fea2406ac0f2084574cda6aa5f6b6564a4ab95",
+};
+const PINNED_RENDERER = join(here, "baselines/87d4554-MessageRenderer.tsx");
+const resultPath = process.env.OC_FIND_RESULT || join(tmpdir(), "ocv5-188-find-result.json");
+const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+const negative = process.env.OC_FIND_NEGATIVE === "1";
+
+function sourceEvidence() {
+  const currentRenderer = readFileSync(new URL("../src/components/MessageRenderer.tsx", import.meta.url));
+  const pinned = readFileSync(PINNED_RENDERER);
+  const pinnedHash = sha256(pinned);
+  if (negative) {
+    assert.equal(pinnedHash, NEGATIVE_HASHES["components/MessageRenderer.tsx"], "negative-control source drift");
+  }
+  return {
+    mode: negative ? "pinned-negative-MessageRenderer-overlay" : "current-worktree",
+    pinnedModulesCommit: negative ? NEGATIVE_SHA : null,
+    overlay: negative ? "components/MessageRenderer.tsx" : null,
+    sourceHashes: {
+      "components/MessageRenderer.tsx": negative ? pinnedHash : sha256(currentRenderer),
+      "components/MessageRenderer.tsx.worktree": sha256(currentRenderer),
+      "baselines/87d4554-MessageRenderer.tsx": pinnedHash,
+    },
+    harnessSha256: sha256(readFileSync(new URL("./find-in-session-harness.tsx", import.meta.url))),
+    testSha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
+  };
+}
 
 function snapshot(page) {
   return page.evaluate(() => {
-    const scroller = document.querySelector("[data-testid=find-chat-scroll]");
+    const scrollerEl = document.querySelector("[data-testid=find-chat-scroll]");
+    const list = document.querySelector("[data-testid=timeline-short-list]");
+    const toolbar = document.querySelector("[aria-label='在会话中查找']")?.closest("div");
     const current = document.querySelector("[data-find-current]");
     const key = current?.getAttribute("data-chat-virtual-key") ?? null;
     const row = current?.getBoundingClientRect();
-    const view = scroller?.getBoundingClientRect();
+    const view = scrollerEl?.getBoundingClientRect();
+    const bar = toolbar?.getBoundingClientRect();
     const mounted = [...document.querySelectorAll("[data-chat-virtual-key]")].map((el) =>
       el.getAttribute("data-chat-virtual-key"),
     );
-    const visible = !!(row && view && row.height > 0 && row.bottom > view.top + 1 && row.top < view.bottom - 1);
+    const lastRow = mounted.length ? document.querySelectorAll("[data-chat-virtual-key]")[mounted.length - 1] : null;
+    let toolbarEl = toolbar instanceof HTMLElement ? toolbar : null;
+    if (scrollerEl && toolbarEl) {
+      let node = toolbarEl;
+      while (node && node !== scrollerEl) {
+        const pos = getComputedStyle(node).position;
+        if (pos === "sticky" || pos === "fixed") {
+          toolbarEl = node;
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    const stickyBar = toolbarEl?.getBoundingClientRect();
+    const viewTop = stickyBar && stickyBar.height > 0 ? stickyBar.bottom : (view?.top ?? 0);
+    const visible = !!(row && view && row.height > 0 && row.bottom > viewTop + 1 && row.top >= viewTop - 1 && row.top < view.bottom - 1);
     return {
       key,
+      text: current?.textContent ?? "",
+      findPin: list?.getAttribute("data-find-pin") || "",
       mountedFirst: mounted[0] ?? null,
-      needleMounted: mounted.includes("m0") || mounted.includes("needle"),
-      paintCount: Number(document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-timeline-paint-count") ?? 0),
+      mountedLast: lastRow?.getAttribute("data-chat-virtual-key") ?? null,
+      mountedCount: mounted.length,
+      needleMounted: mounted.includes("m0") || mounted.includes("needle") || mounted.includes("m250"),
+      paintCount: Number(list?.getAttribute("data-timeline-paint-count") ?? 0),
       peakMounted: window.__findPage.peakMounted,
       following: window.__findPage.following,
       wheelFence: window.__findPage.wheelFence,
       hit: document.body.innerText.match(/\d+\/\d+|无匹配/)?.[0] ?? null,
+      sessionId: document.querySelector("[data-testid=session]")?.textContent ?? "",
+      needle: document.querySelector("[data-testid=needle]")?.textContent ?? "",
+      findOpen: !!document.querySelector("[aria-label='在会话中查找']"),
+      listMounted: !!list,
+      scrollTop: scrollerEl?.scrollTop ?? -1,
+      distBottom: scrollerEl
+        ? scrollerEl.scrollHeight - scrollerEl.clientHeight - scrollerEl.scrollTop
+        : -1,
+      dockVisible: document.querySelector("[data-testid=scroll-to-bottom-dock]")?.getAttribute("data-visible") ?? null,
       row: row ? { top: row.top, bottom: row.bottom, height: row.height } : null,
       scroller: view ? { top: view.top, bottom: view.bottom, height: view.height } : null,
+      toolbar: stickyBar ? { top: stickyBar.top, bottom: stickyBar.bottom, height: stickyBar.height } : (bar ? { top: bar.top, bottom: bar.bottom, height: bar.height } : null),
       visible,
     };
   });
 }
 
-function record(rows, scene, expected, actual, clicks, pass, failReason, skips = []) {
+function record(rows, scene, expected, actual, events, pass, failReason) {
   const row = {
-    scene,
-    sha,
+    contractId: scene,
+    mode: negative ? "negative-overlay" : "candidate",
     expected,
     actual: {
       key: actual.key,
+      text: actual.text?.slice(0, 80),
       visible: actual.visible,
-      needleMounted: actual.needleMounted,
+      findPin: actual.findPin,
       hit: actual.hit,
-      row: actual.row,
-      scroller: actual.scroller,
+      following: actual.following,
+      wheelFence: actual.wheelFence,
+      scrollTop: actual.scrollTop,
+      distBottom: actual.distBottom,
+      needleMounted: actual.needleMounted,
+      mountedCount: actual.mountedCount,
       peakMounted: actual.peakMounted,
       paintCount: actual.paintCount,
+      dockVisible: actual.dockVisible,
+      mountedLast: actual.mountedLast,
+      sessionId: actual.sessionId,
+      findOpen: actual.findOpen,
+      listMounted: actual.listMounted,
+      row: actual.row,
+      scroller: actual.scroller,
+      toolbar: actual.toolbar,
+      pageErrors: actual.pageErrors ?? 0,
+      stable: actual.stable,
     },
-    clicks,
+    events: { ...events },
     peakMounted: actual.peakMounted,
     pass,
     failed: pass ? 0 : 1,
-    skip: skips.length,
-    skips,
+    skip: 0,
+    skips: [],
     failReason: pass ? "" : failReason,
   };
   rows.push(row);
@@ -73,8 +147,68 @@ function record(rows, scene, expected, actual, clicks, pass, failReason, skips =
   return row;
 }
 
-test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)", { timeout: 240_000 }, async (t) => {
-  const baselineFile = process.env.OC_FIND_BASELINE_FILE;
+async function waitLocated(page, key, timeout = 4000) {
+  await page.waitForFunction((k) => {
+    const current = document.querySelector("[data-find-current]");
+    const scroller = document.querySelector("[data-testid=find-chat-scroll]");
+    const input = document.querySelector("[aria-label='在会话中查找']");
+    if (!current || !scroller) return false;
+    if (current.getAttribute("data-chat-virtual-key") !== k) return false;
+    let node = input instanceof HTMLElement ? input : null;
+    while (node && node !== scroller) {
+      const pos = getComputedStyle(node).position;
+      if (pos === "sticky" || pos === "fixed") break;
+      node = node.parentElement;
+    }
+    const row = current.getBoundingClientRect();
+    const view = scroller.getBoundingClientRect();
+    const bar = node && node !== scroller ? node.getBoundingClientRect() : null;
+    const top = bar && bar.height > 0 ? bar.bottom : view.top;
+    const pin = document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") || "";
+    return row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1 && pin === "";
+  }, key, { timeout });
+}
+
+async function waitFindReady(page, hit) {
+  await page.waitForFunction((expected) => {
+    const btn = document.querySelector('[aria-label="下一处"]');
+    const found = document.body.innerText.match(/\d+\/\d+|无匹配/)?.[0] ?? "";
+    return btn instanceof HTMLButtonElement && !btn.disabled && (!expected || found === expected);
+  }, hit ?? null, { timeout: 4000 });
+}
+
+async function framesStable(page, key, count = 4) {
+  const first = await snapshot(page);
+  for (let i = 0; i < count; i += 1) {
+    await page.waitForTimeout(32);
+    const frame = await snapshot(page);
+    if (frame.key !== key || frame.visible !== true) return { stable: false, first, last: frame };
+    if (Math.abs((frame.row?.top ?? 0) - (first.row?.top ?? 0)) > 8) return { stable: false, first, last: frame };
+  }
+  return { stable: true, first, last: await snapshot(page) };
+}
+
+async function typeNeedle(page, text) {
+  const box = page.getByRole("textbox", { name: "在会话中查找" });
+  await box.click();
+  await page.keyboard.type(text, { delay: 8 });
+}
+
+async function holdFence(page) {
+  await page.evaluate(() => window.__findPage.holdFence());
+  await page.waitForFunction(() => window.__findPage.wheelFence === true, null, { timeout: 2000 });
+}
+
+async function waitPin(page, key) {
+  await page.waitForFunction((k) =>
+    document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === k,
+  key, { timeout: 4000 });
+}
+
+test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)", { timeout: 420_000 }, async (t) => {
+  const sources = sourceEvidence();
+  t.diagnostic(`find-sources ${JSON.stringify(sources)}`);
+  let out;
   const bundle = await build({
     entryPoints: [join(here, "find-in-session-harness.tsx")],
     bundle: true,
@@ -82,261 +216,562 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
     format: "iife",
     jsx: "automatic",
     loader: { ".css": "empty" },
-    alias: {
-      "node:crypto": join(here, "stubs/node-crypto.js"),
-    },
+    alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
     logLevel: "silent",
-    plugins: baselineFile
+    plugins: negative
       ? [{
-        name: "find-red-baseline",
+        name: "pinned-find-negative-control",
         setup(b) {
           b.onLoad({ filter: /src\/components\/MessageRenderer\.tsx$/ }, () => ({
-            contents: readFileSync(baselineFile, "utf8"),
+            contents: readFileSync(PINNED_RENDERER, "utf8"),
             loader: "tsx",
           }));
         },
       }]
       : [],
   });
-  const out = mkdtempSync(join(tmpdir(), "oc-find-css-"));
-  await viteBuild({
-    root: join(here, ".."),
-    configFile: false,
-    logLevel: "silent",
-    plugins: [tailwindcss()],
-    build: {
-      outDir: out,
-      emptyOutDir: true,
-      cssCodeSplit: false,
-      rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } },
-    },
-  });
-  const css = readFileSync(join(out, readdirSync(out).find((n) => n.endsWith(".css"))), "utf8");
-  const browser = await chromium.launch({
-    executablePath: resolveBrowserExecutable(),
-    headless: true,
-    args: ["--no-sandbox"],
-  });
-  const rows = [];
-  const isBaseline = Boolean(baselineFile);
   try {
-    async function openPage(scene, touch = false) {
-      const context = await browser.newContext({
-        viewport: { width: 390, height: 844 },
-        isMobile: touch,
-        hasTouch: touch,
-      });
-      const page = await context.newPage();
-      page.setDefaultTimeout(8000);
-      const errors = [];
-      page.on("pageerror", (error) => errors.push(error.message));
-      await page.setContent(
-        `<!doctype html><meta charset="utf-8"><style>${css}</style><div id="root"></div>`,
-      );
-      await page.addScriptTag({ content: bundle.outputFiles[0].text });
-      await page.evaluate((s) => window.__findPage.setScene(s), scene);
-      await page.getByTestId("scene").waitFor();
-      await page.getByRole("textbox", { name: "在会话中查找" }).waitFor();
-      await page.waitForTimeout(250);
-      await page.evaluate(() => { window.__findPage.peakMounted = 0; });
-      return { context, page, errors };
-    }
-
-    await t.test("tail-320-m0 keyboard.type then one click", async () => {
-      const { context, page, errors } = await openPage("tail");
-      try {
-        const before = await snapshot(page);
-        assert.equal(before.needleMounted, false, "precondition: m0 must start unmounted");
-        await page.getByRole("textbox", { name: "在会话中查找" }).click();
-        await page.keyboard.type("FIND_NEEDLE_A", { delay: 15 });
-        await page.waitForTimeout(50);
-        await page.getByRole("button", { name: "下一处" }).click();
-        await page.waitForFunction(() => {
-          const el = document.querySelector('[data-find-current]');
-          const scroller = document.querySelector("[data-testid=find-chat-scroll]");
-          if (!el || !scroller) return false;
-          const r = el.getBoundingClientRect();
-          const s = scroller.getBoundingClientRect();
-          return el.getAttribute("data-chat-virtual-key") === "m0" &&
-            r.height > 0 && r.bottom > s.top + 1 && r.top < s.bottom - 1;
-        }, null, { timeout: isBaseline ? 800 : 4000 }).catch(() => {});
-        const after = await snapshot(page);
-        const pass = after.key === "m0" && after.visible === true && after.hit === "1/1";
-        record(rows, "tail-320-m0", { key: "m0", visible: true, hit: "1/1", clicks: 1 }, after, 1, pass,
-          pass ? "" : `key=${after.key} visible=${after.visible} hit=${after.hit} mounted=${after.needleMounted}`);
-        assert.deepEqual(errors, []);
-        if (isBaseline) assert.equal(pass, false, "old jumpTo must fail to reveal m0");
-        else assert.equal(pass, true);
-      } finally {
-        await context.close();
-      }
+    out = mkdtempSync(join(tmpdir(), "oc-find-css-"));
+    await viteBuild({
+      root: join(here, ".."),
+      configFile: false,
+      logLevel: "silent",
+      plugins: [tailwindcss()],
+      build: {
+        outDir: out,
+        emptyOutDir: true,
+        cssCodeSplit: false,
+        rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } },
+      },
     });
-
-    await t.test("enter / shift+enter / button key / mobile tap", async () => {
-      const { context, page, errors } = await openPage("multi");
-      try {
-        await page.getByRole("textbox", { name: "在会话中查找" }).click();
-        await page.keyboard.type("MULTI_NEEDLE", { delay: 10 });
-        await page.keyboard.press("Enter");
-        await page.waitForTimeout(isBaseline ? 400 : 1500);
-        let after = await snapshot(page);
-        const enterPass = after.key === "m160" && after.visible === true;
-        record(rows, "enter-second-hit", { key: "m160", visible: true }, after, 1, enterPass,
-          enterPass ? "" : `Enter expected m160 got ${after.key} visible=${after.visible}`);
-        await page.keyboard.press("Shift+Enter");
-        await page.waitForTimeout(isBaseline ? 400 : 1500);
-        after = await snapshot(page);
-        const shiftPass = after.key === "m0" && after.visible === true;
-        record(rows, "shift-enter-first-hit", { key: "m0", visible: true }, after, 1, shiftPass,
-          shiftPass ? "" : `Shift+Enter expected m0 got ${after.key}`);
-        await page.getByRole("button", { name: "下一处" }).focus();
-        await page.keyboard.press("Enter");
-        await page.waitForTimeout(isBaseline ? 400 : 1500);
-        after = await snapshot(page);
-        const keyBtn = after.key === "m160" && after.visible === true;
-        record(rows, "button-key-activate", { key: "m160", visible: true }, after, 1, keyBtn,
-          keyBtn ? "" : `button Enter expected m160 got ${after.key}`);
-        assert.deepEqual(errors, []);
-        if (!isBaseline) {
-          assert.equal(enterPass, true);
-          assert.equal(shiftPass, true);
-          assert.equal(keyBtn, true);
-        }
-      } finally {
-        await context.close();
-      }
+    const cssFile = readdirSync(out).find((n) => n.endsWith(".css"));
+    const css = readFileSync(join(out, cssFile));
+    sources.styleSha256 = sha256(css);
+    const browser = await chromium.launch({
+      executablePath: resolveBrowserExecutable(),
+      headless: true,
+      args: ["--no-sandbox", "--disable-overlay-scrollbar"],
     });
-
-    await t.test("mobile tap completes despite own touchend fence", async () => {
-      const { context, page, errors } = await openPage("tail", true);
-      try {
-        await page.getByRole("textbox", { name: "在会话中查找" }).tap();
-        await page.keyboard.type("FIND_NEEDLE_A", { delay: 10 });
-        await page.getByRole("button", { name: "下一处" }).tap();
-        await page.waitForFunction(() => {
-          const el = document.querySelector('[data-find-current]');
-          const scroller = document.querySelector("[data-testid=find-chat-scroll]");
-          if (!el || !scroller) return false;
-          const r = el.getBoundingClientRect();
-          const s = scroller.getBoundingClientRect();
-          return el.getAttribute("data-chat-virtual-key") === "m0" &&
-            r.height > 0 && r.bottom > s.top + 1 && r.top < s.bottom - 1;
-        }, null, { timeout: isBaseline ? 800 : 4000 }).catch(() => {});
-        const after = await snapshot(page);
-        const pass = after.key === "m0" && after.visible === true;
-        record(rows, "mobile-tap", { key: "m0", visible: true }, after, 1, pass,
-          pass ? "" : `tap key=${after.key} visible=${after.visible} fence=${after.wheelFence}`);
-        assert.deepEqual(errors, []);
-        if (!isBaseline) assert.equal(pass, true);
-      } finally {
-        await context.close();
-      }
-    });
-
-    await t.test("coalesced team then ordinary assistant uses render key", async () => {
-      const { context, page, errors } = await openPage("coalesce");
-      try {
-        await page.getByRole("textbox", { name: "在会话中查找" }).click();
-        await page.keyboard.type("FIND_NEEDLE_A", { delay: 10 });
-        await page.getByRole("button", { name: "下一处" }).click();
-        await page.waitForTimeout(isBaseline ? 400 : 1500);
-        const after = await snapshot(page);
-        const pass = after.key === "needle" && after.visible === true && after.hit === "1/1";
-        record(rows, "coalesced-after-team", { key: "needle", visible: true, hit: "1/1" }, after, 1, pass,
-          pass ? "" : `expected needle got ${after.key} visible=${after.visible}`);
-        assert.deepEqual(errors, []);
-        if (!isBaseline) assert.equal(pass, true);
-      } finally {
-        await context.close();
-      }
-    });
-
-    await t.test("pending jump cancelled by real wheel does not resume after fence", async () => {
-      const { context, page, errors } = await openPage("midtail");
-      try {
-        await page.getByRole("textbox", { name: "在会话中查找" }).click();
-        await page.keyboard.type("FIND_NEEDLE_MID", { delay: 8 });
-        await page.evaluate(() => {
-          document.querySelector('[aria-label="下一处"]')?.click();
-          const scroller = document.querySelector("[data-testid=find-chat-scroll]");
-          scroller?.dispatchEvent(new WheelEvent("wheel", { deltaY: -240, bubbles: true, cancelable: true }));
+    const rows = [];
+    try {
+      async function openPage(scene, touch = false) {
+        const context = await browser.newContext({
+          viewport: { width: 390, height: 844 },
+          isMobile: touch,
+          hasTouch: touch,
         });
-        await page.waitForTimeout(700);
-        const after = await snapshot(page);
-        const forced = after.key === "m250" && after.visible === true;
-        const cancelled = !forced;
-        record(rows, "wheel-cancel-no-rejump", { cancelled: true, key: "not-m250-visible" }, after, 1, cancelled,
-          cancelled ? "" : `old generation scrolled to m250 after wheel cancel`);
-        assert.deepEqual(errors, []);
-        if (!isBaseline) assert.equal(cancelled, true);
-      } finally {
-        await context.close();
-      }
-    });
-
-    await t.test("session same id different text and query race", async () => {
-      const { context, page, errors } = await openPage("tail");
-      try {
-        await page.getByRole("textbox", { name: "在会话中查找" }).click();
-        await page.keyboard.type("FIND_NEEDLE_A", { delay: 8 });
-        await page.getByRole("button", { name: "下一处" }).click();
-        await page.evaluate(() => window.__findPage.setVariant("B"));
-        await page.waitForTimeout(300);
-        const box = page.getByRole("textbox", { name: "在会话中查找" });
-        await box.fill("");
-        await box.click();
-        await page.keyboard.type("FIND_NEEDLE_B", { delay: 8 });
-        await page.getByRole("button", { name: "下一处" }).click();
-        await page.waitForTimeout(isBaseline ? 400 : 1500);
-        const after = await snapshot(page);
-        const text = await page.locator("[data-find-current]").innerText().catch(() => "");
-        const pass = after.key === "m0" && after.visible === true && text.includes("FIND_NEEDLE_B");
-        record(rows, "session-same-id-new-text", { key: "m0", text: "FIND_NEEDLE_B" }, { ...after, text }, 1, pass,
-          pass ? "" : `key=${after.key} text=${text}`);
-        assert.deepEqual(errors, []);
-        if (!isBaseline) assert.equal(pass, true);
-      } finally {
-        await context.close();
-      }
-    });
-
-    await t.test("2000-row peak mount budget and pin release restick", async () => {
-      const { context, page, errors } = await openPage("budget");
-      try {
-        await page.getByRole("textbox", { name: "在会话中查找" }).click();
-        await page.keyboard.type("FIND_NEEDLE_A", { delay: 5 });
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const errors = [];
+        page.on("pageerror", (error) => errors.push(error.message));
+        await page.setContent(
+          `<!doctype html><meta charset="utf-8"><style>${css.toString()}
+[data-testid=find-chat-scroll]{overflow-y:scroll!important;}
+[data-testid=find-chat-scroll]::-webkit-scrollbar{width:12px;height:12px;}
+[data-testid=find-chat-scroll]::-webkit-scrollbar-thumb{background:#666;}
+</style><div id="root"></div>`,
+        );
+        await page.addScriptTag({ content: bundle.outputFiles[0].text });
+        await page.evaluate((s) => window.__findPage.setScene(s), scene);
+        await page.getByTestId("scene").waitFor();
+        await page.getByRole("textbox", { name: "在会话中查找" }).waitFor();
+        await page.waitForTimeout(200);
         await page.evaluate(() => { window.__findPage.peakMounted = 0; });
-        await page.getByRole("button", { name: "下一处" }).click();
-        await page.waitForTimeout(isBaseline ? 600 : 2000);
-        const after = await snapshot(page);
-        const underBudget = after.peakMounted <= PEAK_BUDGET;
-        const located = after.key === "m0" && after.visible === true;
-        let stable = true;
-        const firstTop = after.row?.top;
-        for (let i = 0; i < 4; i += 1) {
-          await page.waitForTimeout(32);
-          const frame = await snapshot(page);
-          if (Math.abs((frame.row?.top ?? 0) - (firstTop ?? 0)) > 8) stable = false;
+        return { context, page, errors };
+      }
+
+      await t.test("tail-320-m0 keyboard.type then one click", async () => {
+        const { context, page, errors } = await openPage("tail");
+        const events = { clicks: 0, keys: 0, wheels: 0 };
+        try {
+          const before = await snapshot(page);
+          assert.equal(before.needleMounted, false, "precondition: m0 must start unmounted");
+          await typeNeedle(page, "FIND_NEEDLE_A");
+          events.keys += 13;
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          let located = false;
+          try {
+            await waitLocated(page, "m0");
+            located = true;
+          } catch (error) {
+            const failed = await snapshot(page);
+            failed.pageErrors = errors.length;
+            record(rows, "tail-320-m0", { key: "m0", visible: true, hit: "1/1" }, failed, events, false, error.message);
+            throw error;
+          }
+          const after = await snapshot(page);
+          after.pageErrors = errors.length;
+          const pass = located && after.key === "m0" && after.visible === true && after.hit === "1/1";
+          record(rows, "tail-320-m0", { key: "m0", visible: true, hit: "1/1" }, after, events, pass,
+            pass ? "" : `key=${after.key} visible=${after.visible} hit=${after.hit} mounted=${after.needleMounted}`);
+          assert.equal(after.key, "m0");
+          assert.equal(after.visible, true);
+          assert.equal(after.hit, "1/1");
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
         }
-        await page.getByTestId("scroll-to-bottom").click({ force: true }).catch(() => {});
-        await page.waitForTimeout(300);
-        const pass = isBaseline ? false : located && underBudget && stable;
-        record(rows, "budget-2000-peak", { key: "m0", visible: true, peakLte: PEAK_BUDGET, stable: true }, after, 1, pass,
-          pass ? "" : `key=${after.key} visible=${after.visible} peak=${after.peakMounted} stable=${stable}`);
-        assert.deepEqual(errors, []);
-        if (!isBaseline) {
+      });
+
+      await t.test("enter / shift+enter / button key", async () => {
+        const { context, page, errors } = await openPage("multi");
+        const events = { clicks: 0, keys: 0, enters: 0 };
+        try {
+          await typeNeedle(page, "MULTI_NEEDLE");
+          events.keys += 12;
+          const findBox = page.getByRole("textbox", { name: "在会话中查找" });
+          await findBox.press("Enter");
+          events.enters += 1;
+          await page.waitForFunction((k) =>
+            document.querySelector("[data-find-current]")?.getAttribute("data-chat-virtual-key") === k,
+          "m160", { timeout: 4000 });
+          await waitLocated(page, "m160");
+          let after = await snapshot(page);
+          after.pageErrors = errors.length;
+          record(rows, "enter-second-hit", { key: "m160", visible: true, hit: "2/3" }, after, { ...events },
+            after.key === "m160" && after.visible, `Enter expected m160 got ${after.key}`);
+          assert.equal(after.key, "m160");
+          assert.equal(after.visible, true);
+          await findBox.press("Shift+Enter");
+          events.enters += 1;
+          await waitLocated(page, "m0");
+          after = await snapshot(page);
+          after.pageErrors = errors.length;
+          record(rows, "shift-enter-first-hit", { key: "m0", visible: true, hit: "1/3" }, after, { ...events },
+            after.key === "m0" && after.visible, `Shift+Enter expected m0 got ${after.key}`);
+          assert.equal(after.key, "m0");
+          await findBox.focus();
+          let active = "";
+          for (let i = 0; i < 6; i += 1) {
+            await page.keyboard.press("Tab");
+            active = await page.evaluate(() => document.activeElement?.getAttribute("aria-label"));
+            if (active === "下一处") break;
+          }
+          assert.equal(active, "下一处", `expected 下一处 focused, got ${active}`);
+          await page.keyboard.press("Enter");
+          events.enters += 1;
+          await waitLocated(page, "m160");
+          const stability = await framesStable(page, "m160");
+          after = stability.last;
+          after.stable = stability.stable;
+          after.pageErrors = errors.length;
+          record(rows, "button-key-activate", { key: "m160", visible: true, hit: "2/3" }, after, events,
+            after.key === "m160" && after.visible && after.hit === "2/3" && stability.stable,
+            `button Enter expected m160 got ${after.key} visible=${after.visible} hit=${after.hit} stable=${stability.stable}`);
+          assert.equal(after.key, "m160");
+          assert.equal(after.visible, true);
+          assert.equal(stability.stable, true);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("mobile tap completes despite own touchend fence", async () => {
+        const { context, page, errors } = await openPage("tail", true);
+        const events = { taps: 0, keys: 0 };
+        try {
+          await page.getByRole("textbox", { name: "在会话中查找" }).tap();
+          events.taps += 1;
+          await page.keyboard.type("FIND_NEEDLE_A", { delay: 8 });
+          events.keys += 13;
+          await page.getByRole("button", { name: "下一处" }).tap();
+          events.taps += 1;
+          await waitLocated(page, "m0");
+          const after = await snapshot(page);
+          after.pageErrors = errors.length;
+          record(rows, "mobile-tap", { key: "m0", visible: true }, after, events,
+            after.key === "m0" && after.visible, `tap key=${after.key} visible=${after.visible} fence=${after.wheelFence}`);
+          assert.equal(after.key, "m0");
+          assert.equal(after.visible, true);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("coalesced team then ordinary assistant uses render key", async () => {
+        const { context, page, errors } = await openPage("coalesce");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await typeNeedle(page, "FIND_NEEDLE_A");
+          events.keys += 13;
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          await waitLocated(page, "needle");
+          const after = await snapshot(page);
+          after.pageErrors = errors.length;
+          const pass = after.key === "needle" && after.visible === true && after.hit === "1/1";
+          record(rows, "coalesced-after-team", { key: "needle", visible: true, hit: "1/1" }, after, events, pass,
+            pass ? "" : `expected needle got ${after.key}`);
+          assert.equal(after.key, "needle");
+          assert.equal(after.visible, true);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("pending then real mouse.wheel / scrollbar drag cancel", async () => {
+        const { context, page, errors } = await openPage("midtail");
+        const events = { clicks: 0, wheels: 0, keys: 0, drags: 0 };
+        try {
+          await typeNeedle(page, "FIND_NEEDLE_MID");
+          events.keys += 15;
+          await holdFence(page);
+          events.wheels += 1;
+          const sessionBefore = await page.getByTestId("session").textContent();
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          await waitPin(page, "m250");
+          const pending = await snapshot(page);
+          pending.pageErrors = errors.length;
+          const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
+          record(rows, "pending-positive-m250", {
+            findPin: "m250", visible: false, following: false,
+          }, pending, events, pendingOk,
+            pendingOk ? "" : `pending pin=${pending.findPin} visible=${pending.visible} following=${pending.following}`);
+          assert.equal(pending.findPin, "m250");
+          assert.equal(pending.visible, false);
+          assert.equal(pending.following, false);
+          const topBefore = pending.scrollTop;
+          await page.getByTestId("find-chat-scroll").hover();
+          await page.mouse.wheel(0, -240);
+          events.wheels += 1;
+          await page.waitForTimeout(280);
+          const afterWheel = await snapshot(page);
+          afterWheel.pageErrors = errors.length;
+          const cancelled = afterWheel.findPin === "" && afterWheel.visible !== true;
+          record(rows, "wheel-cancel-no-rejump", {
+            findPin: "", visible: false, following: false,
+          }, afterWheel, events, cancelled && afterWheel.scrollTop !== topBefore,
+            cancelled ? "" : `rejump pin=${afterWheel.findPin} visible=${afterWheel.visible} key=${afterWheel.key}`);
+          assert.equal(afterWheel.findPin, "");
+          assert.notEqual(afterWheel.key === "m250" && afterWheel.visible, true);
+          assert.equal(await page.getByTestId("session").textContent(), sessionBefore);
+
+          await page.evaluate(() => { window.__findPage.peakMounted = 0; });
+          await holdFence(page);
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          await waitPin(page, "m250");
+          const pending2 = await snapshot(page);
+          assert.equal(pending2.findPin, "m250");
+          const box = await page.getByTestId("find-chat-scroll").boundingBox();
+          const metrics = await page.getByTestId("find-chat-scroll").evaluate((el) => ({
+            clientWidth: el.clientWidth, offsetWidth: el.offsetWidth, height: el.clientHeight,
+          }));
+          const gutter = Math.max(metrics.offsetWidth - metrics.clientWidth, 12);
+          const x = box.x + box.width - Math.min(6, gutter / 2);
+          const y = box.y + metrics.height * 0.7;
+          await page.mouse.move(x, y);
+          await page.mouse.down();
+          await page.mouse.move(x, y - 50, { steps: 6 });
+          await page.mouse.up();
+          events.drags += 1;
+          await page.waitForTimeout(280);
+          const afterDrag = await snapshot(page);
+          afterDrag.pageErrors = errors.length;
+          record(rows, "scrollbar-drag-cancel", { findPin: "", visible: false }, afterDrag, events,
+            afterDrag.findPin === "" && !(afterDrag.key === "m250" && afterDrag.visible),
+            `drag pin=${afterDrag.findPin} key=${afterDrag.key} visible=${afterDrag.visible}`);
+          assert.equal(afterDrag.findPin, "");
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("touchmove cancels pending jump", async () => {
+        const { context, page, errors } = await openPage("midtail", true);
+        const events = { clicks: 0, taps: 0, touchmoves: 0, keys: 0 };
+        try {
+          await typeNeedle(page, "FIND_NEEDLE_MID");
+          events.keys += 15;
+          await holdFence(page);
+          await page.getByRole("button", { name: "下一处" }).tap();
+          events.taps += 1;
+          await waitPin(page, "m250");
+          const pending = await snapshot(page);
+          assert.equal(pending.findPin, "m250");
+          assert.equal(pending.visible, false);
+          const box = await page.getByTestId("find-chat-scroll").boundingBox();
+          const client = await page.context().newCDPSession(page);
+          await client.send("Input.dispatchTouchEvent", {
+            type: "touchStart",
+            touchPoints: [{ x: box.x + 80, y: box.y + 200, id: 1 }],
+          });
+          await client.send("Input.dispatchTouchEvent", {
+            type: "touchMove",
+            touchPoints: [{ x: box.x + 80, y: box.y + 80, id: 1 }],
+          });
+          await client.send("Input.dispatchTouchEvent", {
+            type: "touchEnd",
+            touchPoints: [],
+          });
+          events.touchmoves += 1;
+          await page.waitForTimeout(280);
+          const after = await snapshot(page);
+          after.pageErrors = errors.length;
+          record(rows, "touchmove-cancel", { findPin: "" }, after, events,
+            after.findPin === "",
+            `touch pin=${after.findPin} key=${after.key} visible=${after.visible}`);
+          assert.equal(after.findPin, "");
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("same-session same-id same-length replace does not keep old pin", async () => {
+        const { context, page, errors } = await openPage("tail");
+        const events = { clicks: 0, keys: 0, replaces: 0 };
+        try {
+          const session = await page.getByTestId("session").textContent();
+          await typeNeedle(page, "FIND_NEEDLE_A");
+          events.keys += 13;
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          await waitLocated(page, "m0");
+          const located = await snapshot(page);
+          assert.ok(located.text.includes("FIND_NEEDLE_A"));
+          const scrollBefore = located.scrollTop;
+          await page.evaluate(() => window.__findPage.replaceNeedle("FIND_NEEDLE_B"));
+          events.replaces += 1;
+          await page.waitForFunction(() => document.querySelector("[data-testid=needle]")?.textContent === "FIND_NEEDLE_B");
+          assert.equal(await page.getByTestId("session").textContent(), session);
+          const afterReplace = await snapshot(page);
+          afterReplace.pageErrors = errors.length;
+          record(rows, "same-session-replace-drops-pin", {
+            sessionId: session, findPin: "", needle: "FIND_NEEDLE_B",
+          }, afterReplace, events,
+            afterReplace.sessionId === session && afterReplace.findPin === "" && afterReplace.needle === "FIND_NEEDLE_B",
+            `session ${afterReplace.sessionId} pin=${afterReplace.findPin} needle=${afterReplace.needle}`);
+          assert.equal(afterReplace.sessionId, session);
+          assert.equal(afterReplace.findPin, "");
+          assert.equal(Math.abs(afterReplace.scrollTop - scrollBefore) < 80 || afterReplace.following === false, true);
+          const box = page.getByRole("textbox", { name: "在会话中查找" });
+          await box.fill("");
+          await box.click();
+          await page.keyboard.type("FIND_NEEDLE_B", { delay: 8 });
+          events.keys += 13;
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          await waitLocated(page, "m0");
+          const after = await snapshot(page);
+          after.pageErrors = errors.length;
+          record(rows, "same-session-replace-new-needle", { key: "m0", text: "FIND_NEEDLE_B" }, after, events,
+            after.key === "m0" && after.visible && after.text.includes("FIND_NEEDLE_B"),
+            `key=${after.key} text=${after.text}`);
+          assert.equal(after.key, "m0");
+          assert.ok(after.text.includes("FIND_NEEDLE_B"));
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      async function pendingMidtail(page, events) {
+        await typeNeedle(page, "FIND_NEEDLE_MID");
+        events.keys += 15;
+        await waitFindReady(page, "1/1");
+        await holdFence(page);
+        await page.getByRole("button", { name: "下一处" }).click();
+        events.clicks += 1;
+        await waitPin(page, "m250");
+        const pending = await snapshot(page);
+        assert.equal(pending.findPin, "m250");
+        assert.equal(pending.visible, false);
+        return pending;
+      }
+
+      await t.test("session switch cancels pending pin", async () => {
+        const { context, page, errors } = await openPage("midtail");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await pendingMidtail(page, events);
+          const sessionBefore = await page.getByTestId("session").textContent();
+          assert.equal(sessionBefore, "sess-1");
+          await page.evaluate(() => window.__findPage.setSessionId("sess-2"));
+          await page.waitForFunction(() => document.querySelector("[data-testid=session]")?.textContent === "sess-2");
+          const afterSession = await snapshot(page);
+          afterSession.pageErrors = errors.length;
+          record(rows, "session-switch-cancels-pin", { findPin: "", sessionId: "sess-2" }, afterSession, events,
+            afterSession.sessionId === "sess-2" && afterSession.findPin === "",
+            `pin=${afterSession.findPin} session=${afterSession.sessionId}`);
+          assert.equal(afterSession.findPin, "");
+          assert.notEqual(afterSession.key === "m250" && afterSession.visible, true);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("close cancels pending and does not rejump", async () => {
+        const { context, page, errors } = await openPage("midtail");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await pendingMidtail(page, events);
+          await page.evaluate(() => window.__findPage.closeFind());
+          await page.waitForFunction(() => !document.querySelector("[aria-label='在会话中查找']"));
+          const afterClose = await snapshot(page);
+          afterClose.pageErrors = errors.length;
+          record(rows, "close-cancels-pin", { findOpen: false, findPin: "" }, afterClose, events,
+            afterClose.findOpen === false && afterClose.findPin === "" && !(afterClose.key === "m250" && afterClose.visible),
+            `open=${afterClose.findOpen} pin=${afterClose.findPin} key=${afterClose.key}`);
+          assert.equal(afterClose.findOpen, false);
+          assert.equal(afterClose.findPin, "");
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("sending cancels pending and does not rejump", async () => {
+        const { context, page, errors } = await openPage("midtail");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await pendingMidtail(page, events);
+          await page.evaluate(() => window.__findPage.setSending(true));
+          await page.waitForFunction(() =>
+            document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === "",
+          );
+          const afterSending = await snapshot(page);
+          afterSending.pageErrors = errors.length;
+          record(rows, "sending-cancels-pin", { findPin: "" }, afterSending, events,
+            afterSending.findPin === "" && !(afterSending.key === "m250" && afterSending.visible),
+            `sending pin=${afterSending.findPin} key=${afterSending.key} visible=${afterSending.visible}`);
+          assert.equal(afterSending.findPin, "");
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("unmount does not replay old generation", async () => {
+        const { context, page, errors } = await openPage("midtail");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await pendingMidtail(page, events);
+          await page.evaluate(() => window.__findPage.setMounted(false));
+          await page.getByTestId("list-unmounted").waitFor();
+          await page.evaluate(() => window.__findPage.setMounted(true));
+          await page.getByRole("textbox", { name: "在会话中查找" }).waitFor();
+          await page.waitForFunction(() => document.querySelector("[data-testid=timeline-short-list]"));
+          const afterUnmount = await snapshot(page);
+          afterUnmount.pageErrors = errors.length;
+          record(rows, "unmount-no-rejump", { listMounted: true, visible: false }, afterUnmount, events,
+            afterUnmount.listMounted === true && !(afterUnmount.key === "m250" && afterUnmount.visible),
+            `unmount key=${afterUnmount.key} visible=${afterUnmount.visible} pin=${afterUnmount.findPin}`);
+          assert.equal(afterUnmount.key === "m250" && afterUnmount.visible, false);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("rapid next-prev lands on second hit", async () => {
+        const { context, page, errors } = await openPage("multi");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await typeNeedle(page, "MULTI_NEEDLE");
+          events.keys += 12;
+          await waitFindReady(page, "1/3");
+          const nextBtn = page.getByRole("button", { name: "下一处" });
+          await nextBtn.click();
+          await nextBtn.click();
+          await page.getByRole("button", { name: "上一处" }).click();
+          events.clicks += 3;
+          await waitLocated(page, "m160");
+          const rapid = await snapshot(page);
+          rapid.pageErrors = errors.length;
+          record(rows, "rapid-next-prev", { key: "m160", hit: "2/3" }, rapid, events,
+            rapid.key === "m160" && rapid.visible && rapid.hit === "2/3",
+            `rapid key=${rapid.key} hit=${rapid.hit} visible=${rapid.visible}`);
+          assert.equal(rapid.key, "m160");
+          assert.equal(rapid.visible, true);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      });
+
+      await t.test("2000-row peak budget, pin release, jumpToBottom", async () => {
+        const { context, page, errors } = await openPage("budget");
+        const events = { clicks: 0, keys: 0 };
+        try {
+          await typeNeedle(page, "FIND_NEEDLE_A");
+          events.keys += 13;
+          await page.evaluate(() => { window.__findPage.peakMounted = 0; });
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          await waitLocated(page, "m0");
+          const after = await snapshot(page);
+          const underBudget = after.peakMounted <= PEAK_BUDGET;
+          const located = after.key === "m0" && after.visible === true;
+          const stability = await framesStable(page, "m0");
+          after.stable = stability.stable;
+          after.pageErrors = errors.length;
+          record(rows, "budget-2000-peak", {
+            key: "m0", visible: true, peakLte: PEAK_BUDGET, stable: true, findPin: "",
+          }, after, events, located && underBudget && stability.stable && after.findPin === "",
+            `key=${after.key} visible=${after.visible} peak=${after.peakMounted} stable=${stability.stable} pin=${after.findPin}`);
           assert.equal(located, true, "m0 visible");
           assert.equal(underBudget, true, `peak ${after.peakMounted} > ${PEAK_BUDGET}`);
-          assert.equal(stable, true, "pin release must stay put");
+          assert.equal(stability.stable, true, "pin release must stay put");
+          assert.equal(after.findPin, "");
+          await page.waitForFunction(() =>
+            document.querySelector("[data-testid=scroll-to-bottom-dock]")?.getAttribute("data-visible") === "true",
+          );
+          const btn = page.getByTestId("scroll-to-bottom");
+          assert.equal(await btn.count(), 1);
+          await btn.click();
+          events.clicks += 1;
+          await page.waitForFunction(() => {
+            const el = document.querySelector("[data-testid=find-chat-scroll]");
+            return el && el.scrollHeight - el.clientHeight - el.scrollTop <= 2;
+          });
+          let bottomOk = true;
+          let bottom = await snapshot(page);
+          for (let i = 0; i < 4; i += 1) {
+            await page.waitForTimeout(32);
+            bottom = await snapshot(page);
+            if (bottom.distBottom > 2 || bottom.following !== true) bottomOk = false;
+          }
+          bottom.stable = bottomOk;
+          bottom.pageErrors = errors.length;
+          record(rows, "jump-to-bottom-after-find", {
+            distBottomLte: 2, following: true, findPin: "", last: "m1999", stable: true,
+          }, bottom, events,
+            bottom.distBottom <= 2 && bottom.following === true && bottom.findPin === "" && bottom.mountedLast === "m1999" && bottomOk,
+            `dist=${bottom.distBottom} following=${bottom.following} last=${bottom.mountedLast} pin=${bottom.findPin} stable=${bottomOk}`);
+          assert.ok(bottom.distBottom <= 2, `distBottom ${bottom.distBottom}`);
+          assert.equal(bottom.following, true);
+          assert.equal(bottom.findPin, "");
+          assert.equal(bottom.mountedLast, "m1999");
+          assert.equal(bottomOk, true);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
         }
-      } finally {
-        await context.close();
-      }
-    });
+      });
+    } finally {
+      await browser.close();
+      writeFileSync(resultPath, JSON.stringify({
+        sources,
+        negative,
+        peakBudget: PEAK_BUDGET,
+        scenes: rows.length,
+        passed: rows.filter((r) => r.pass).length,
+        failed: rows.filter((r) => !r.pass).length,
+        skipped: 0,
+        rows,
+      }, null, 2));
+      console.log(`FIND_RESULT ${resultPath} scenes=${rows.length}`);
+    }
   } finally {
-    await browser.close();
-    writeFileSync(resultPath, JSON.stringify({ sha, baseline: isBaseline, rows }, null, 2));
-    console.log(`FIND_RESULT ${resultPath}`);
+    if (out) rmSync(out, { recursive: true, force: true });
   }
 });
