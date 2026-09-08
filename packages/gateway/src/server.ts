@@ -481,6 +481,7 @@ import {
   type DelegateEngineBillingAdmission,
   type DelegateEngineBillingClient,
 } from './delegateEngineBilling.js'
+import type { DelegateOwnerTurnLocator } from './delegateLateCompletion.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
@@ -10858,6 +10859,11 @@ export class Gateway {
   /** 2026-09-04 团队模式 — 委派 runId → 实际执行型号(有界 FIFO 512)。审查任务书据此给
    *  panel 成员标注视角型号;DurableAgentGroup 本身不带 model 字段,不改 wire 契约。 */
   private _delegateModelByRunId: Map<string, string> | undefined
+  /** OCV5-180 B1 — 委派 runId → 冻结的 exact owner locator(launch 时快照)。
+   *  完成收尾时按它判定:owner turn 未 seal → 内存缓冲随 owner tape;已 seal /
+   *  owner 会话不在内存 → 持久晚到 continuation。有界 FIFO 512,使用处惰性 ??=
+   *  (同 _delegateModelByRunId,prototype 脚手架兼容)。 */
+  private _delegateOwnerByRunId: Map<string, DelegateOwnerTurnLocator> | undefined
   /** hidden 审查员串行委派熔断(见 PerTurnDelegationGuard 注释)。gateway 是容器内
    *  单进程,内存计数即权威。 */
   private _hiddenDelegateGuard = new PerTurnDelegationGuard()
@@ -12395,14 +12401,16 @@ export class Gateway {
       //     不影响任何闸/计费 → 采信无风险;非法值回落 execution。
       //   - 用户原始需求仍取服务端权威快照,不采信模型自报。
       reviewMode = parseTeamReviewMode(input.reviewMode)
-      const evidence: ReviewEvidenceItem[] = (parent._pendingAgentGroups ?? []).map((g) => ({
-        runId: g.runId,
-        agentId: g.agentId,
-        model: this._delegateModelByRunId?.get(g.runId),
-        goal: g.goal,
-        status: g.status,
-        resultSummary: g.resultSummary,
-      }))
+      const evidence: ReviewEvidenceItem[] = (parent._pendingAgentGroups ?? []).map(
+        (entry) => ({
+          runId: entry.group.runId,
+          agentId: entry.group.agentId,
+          model: this._delegateModelByRunId?.get(entry.group.runId),
+          goal: entry.group.goal,
+          status: entry.group.status,
+          resultSummary: entry.group.resultSummary,
+        }),
+      )
       context = buildTeamReviewContext({
         mode: reviewMode,
         userTask: parent._currentTurnUserText ?? '',
@@ -12583,6 +12591,35 @@ export class Gateway {
     })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    // OCV5-180 B1 — launch 时冻结 exact owner locator {parentSessionId, parentTurnKey,
+    // turnIndex}:本次委派的完成卡只允许归属该 turn。收集时若 owner 已 seal(或父会话
+    // 已不在内存),凭此 locator 走持久晚到 continuation,不再依赖可变会话状态。
+    // parentSessionId 用与 owner turn tape 相同的 webchat client session id
+    // (= progressTarget.peerId),保证账务 locator 与 tape sessionId 一致。
+    const delegateOwnerLocator: DelegateOwnerTurnLocator | undefined = progressTarget
+      ? (() => {
+          const ownerSession = this.sessions.getByKey(progressTarget.sessionKey)
+          const ownerTurnKey = ownerSession?._currentTurnKey
+          if (!ownerSession || !ownerTurnKey) return undefined
+          return {
+            parentSessionId: progressTarget.peerId,
+            parentTurnKey: ownerTurnKey,
+            turnIndex:
+              ownerSession._currentTurnIndex ??
+              (Number.isSafeInteger(ownerSession.turns)
+                ? Math.max(1, ownerSession.turns + 1)
+                : 1),
+          }
+        })()
+      : undefined
+    if (delegateOwnerLocator) {
+      const map = (this._delegateOwnerByRunId ??= new Map())
+      map.set(progressRunId, delegateOwnerLocator)
+      if (map.size > 512) {
+        const first = map.keys().next().value
+        if (first !== undefined) map.delete(first)
+      }
+    }
     // 2026-09-04 团队模式:记录本次委派实际执行型号(runId → model),供审查任务书标注
     // panel 成员视角(审议模式)。有界 Map(FIFO 512)—— 只服务本 turn 内的审查,不需持久。
     {
@@ -12734,6 +12771,7 @@ export class Gateway {
       },
     })
     if (gate.status !== 'ok') {
+      this._delegateOwnerByRunId?.delete(progressRunId)
       unregisterDelegation?.()
       const waitedS = gate.status === 'queue_full' ? 0 : Math.round(gate.waitedMs / 1000)
       let httpStatus: number
@@ -13543,8 +13581,33 @@ export class Gateway {
       // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
       ...(verdict ? { verdict } : {}),
     }
+    // OCV5-180 B1 — exact-owner 交付用本 invocation 冻结的 locator 闭包,
+    // 不把 FIFO Map 当归属权威。progressTarget 存在但 launch 未能冻结 owner
+    // 时不得 ownerless 写入当前(可能已是 T2) turn。
+    const deliverDelegateGroupCard = (): void => {
+      if (!progressTarget) return
+      if (!delegateOwnerLocator) {
+        this.log.warn('delegate card dropped: missing frozen owner locator', {
+          runId: progressRunId,
+        })
+        return
+      }
+      const buffered = this.sessions.bufferPendingAgentGroup(
+        progressTarget.sessionKey,
+        durableGroup,
+        delegateOwnerLocator,
+      )
+      if (!buffered) {
+        this.sessions.deliverLateDelegateAgentGroup({
+          owner: delegateOwnerLocator,
+          group: durableGroup,
+          sessionKey: progressTarget.sessionKey,
+        })
+      }
+    }
+    this._delegateOwnerByRunId?.delete(progressRunId)
     if (progressTarget && !nestedProgress) {
-      this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+      deliverDelegateGroupCard()
     } else if (nestedProgress && delegateParent) {
       const directParent = this.sessions.getByKey(delegateParent.sessionKey)
       if (durableGroup.engineBillings && directParent?._durableDelegateEngineBillings) {
@@ -13579,8 +13642,9 @@ export class Gateway {
         if (durableGroup.transcript) parentTranscript.push(...durableGroup.transcript)
       } else if (progressTarget) {
         // A broken/old direct-parent collector must degrade to a separate
-        // durable card, never to silent loss.
-        this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+        // durable card, never to silent loss. Same exact-owner contract: the
+        // degraded top-level card still belongs to the frozen owner turn.
+        deliverDelegateGroupCard()
       }
     }
     if (isDelegateInflightSurfaceEffective()) {

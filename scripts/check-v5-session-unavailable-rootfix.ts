@@ -532,3 +532,39 @@ console.log(
 console.log(
   '[live-frame-classify] PASS — INC-20260908-LIVE-FRAME-CLASSIFY executed bounded helper classify/unknown/connect/query proof',
 )
+
+// INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof.
+// Isolated unit suites cover seal/sink-pending/T2 isolation, validator,
+// materialize stamp, persist owner-merge, and the read-only historical planner.
+const lateDelegateHelperSrc = readFileSync(join(root, 'packages/gateway/src/delegateLateCompletion.ts'), 'utf8')
+const lateSessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+const lateServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const lateTapeSrc = readFileSync(join(root, 'packages/commercial/src/http/losslessTurnTape.ts'), 'utf8')
+const latePersistSrc = readFileSync(join(root, 'packages/web-react/src/lib/persist.ts'), 'utf8')
+const lateSocketSrc = readFileSync(join(root, 'packages/web-react/src/lib/chat/socket.ts'), 'utf8')
+const latePgSrc = readFileSync(join(root, 'packages/commercial/src/db/pgSessionsBackend.ts'), 'utf8')
+const latePlannerSrc = readFileSync(join(root, 'scripts/ops/requeue-failed-tape-jobs.ts'), 'utf8')
+for (const [name, src, marker] of [
+  ['delegateLateCompletion.ts', lateDelegateHelperSrc, 'export function lateDelegateLogicalRunKey('],
+  ['sessionManager.ts', lateSessionManagerSrc, 'deliverLateDelegateAgentGroup('],
+  ['sessionManager.ts', lateSessionManagerSrc, 'this._sealOwnerTurn(session, turnKey)'],
+  ['sessionManager.ts', lateSessionManagerSrc, 'private _admitExactOwnerRun('],
+  ['sessionManager.ts', lateSessionManagerSrc, "if (rec.state === 'buffered' || rec.state === 'inflight') continue"],
+  ['server.ts', lateServerSrc, 'delegate card dropped: missing frozen owner locator'],
+  ['losslessTurnTape.ts', lateTapeSrc, 'const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey'],
+  ['persist.ts', latePersistSrc, 'export function reconcileLateDelegateAgentGroups('],
+  ['socket.ts', lateSocketSrc, 's.messages = reconcileLateDelegateAgentGroups(s.messages)'],
+  ['pgSessionsBackend.ts', latePgSrc, '{ continuationOfTurnKey: header.continuationOfTurnKey }'],
+  ['pgSessionsBackend.ts', latePgSrc, 't.continuation_of_turn_key'],
+  ['pgSessionsBackend.ts', latePgSrc, '{ continuationOfTurnKey: extras?.continuationOfTurnKey }'],
+  ['requeue-failed-tape-jobs.ts', latePlannerSrc, 'oc-late-delegate-plan-v2\\0'],
+  ['requeue-failed-tape-jobs.ts', latePlannerSrc, 'partial_request_fence'],
+] as const) {
+  if (!src.includes(marker)) {
+    throw new Error(`[late-delegate-owner] ${name} lost exact-owner contract: ${marker}`)
+  }
+}
+if (!lateDelegateHelperSrc.includes('.update(\'oc-late-delegate-run-v1\\0\')')) {
+  throw new Error('[late-delegate-owner] tape key must derive from the logical run, not the content hash')
+}
+console.log('[late-delegate-owner] PASS — INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof.')

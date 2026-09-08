@@ -693,16 +693,31 @@ async function postServerAuthoredJson(body: unknown, deps: AttemptSendDeps): Pro
   throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
 }
 
+/** Agent-group continuations must not pre-publish Phase A. Ordinary roots and
+ * runtimeEvents-only (`tail_`) continuations keep visible-then-parts. */
+export function shouldDeferLosslessVisibleUntilFinalize(
+  payload: V3MasterSinkWirePayload,
+): boolean {
+  return typeof payload.continuationOfTurnKey === 'string'
+    && payload.continuationOfTurnKey.length > 0
+    && Array.isArray(payload.agentGroups)
+    && payload.agentGroups.length > 0
+}
+
 export async function attemptSendLossless(
   payload: V3MasterSinkWirePayload & { agentId: string },
   deps: AttemptSendDeps,
 ): Promise<{ settlementHandoff?: boolean }> {
   const tape = buildLosslessTurnTapeRequests(payload, deps.now)
-  // Visibility is a separate, compact Phase A. It must ACK before the first
-  // large part is attempted: strict-schema drift, a slow upload, or a process
-  // replacement can delay audit materialization, but can no longer erase the
-  // already completed answer from REST/refresh.
-  const visibleAck = await postLosslessTurnTapeEnvelope(tape.visible, deps)
+  // Visibility is a separate, compact Phase A. Ordinary roots and
+  // runtimeEvents-only continuations ACK it before the first large part so
+  // a slow upload cannot erase the already completed answer. New agent-group
+  // continuations skip this pre-visible: part INSERT already creates the
+  // immutable header, and finalize runs Phase A after master root authority.
+  const deferVisible = shouldDeferLosslessVisibleUntilFinalize(payload)
+  const visibleAck = deferVisible
+    ? {}
+    : await postLosslessTurnTapeEnvelope(tape.visible, deps)
   for (const part of iterateLosslessTurnTapeParts(tape)) {
     await postLosslessTurnTapeEnvelope(part, deps)
   }

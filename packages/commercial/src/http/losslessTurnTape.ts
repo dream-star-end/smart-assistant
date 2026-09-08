@@ -383,6 +383,43 @@ function parseAgentGroups(obj: Record<string, unknown>): Array<Record<string, un
 }
 
 /** Strictly validates routing/identity fields while leaving generated content unbounded. */
+/** Stable fingerprint of one agent-group envelope. Internal ordinals are not content. */
+export function canonicalAgentGroupFingerprint(group: Record<string, unknown>): string {
+  const json = JSON.stringify(group, (key, current) => {
+    if (key === "_ocEventOrdinal") return undefined;
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current;
+    const sorted: Record<string, unknown> = {};
+    for (const next of Object.keys(current as Record<string, unknown>).sort()) {
+      sorted[next] = (current as Record<string, unknown>)[next];
+    }
+    return sorted;
+  });
+  if (json === undefined) throw new Error("agent group is not JSON serializable");
+  return createHash("sha256").update("oc-late-delegate-root-v1\0").update(json).digest("hex");
+}
+
+/** Timeline/ordinal wrappers only. Content, _delegateStatus, billings, requestId stay. */
+const PUBLISHED_AGENT_GROUP_WRAPPER_KEYS = new Set([
+  "_ocEventOrdinal",
+  "_recordOrdinal",
+  "_turnTapeOrdinal",
+  "_turnTapeId",
+  "_timelineProcessKey",
+  "_timelineIdentity",
+  "_timelineLogicalOrdinal",
+  "_lifecycle",
+  "_lifecycleEpoch",
+]);
+
+export function canonicalPublishedAgentGroupRecordFingerprint(record: Record<string, unknown>): string {
+  const normalized: Record<string, unknown> = {};
+  for (const key of Object.keys(record)) {
+    if (PUBLISHED_AGENT_GROUP_WRAPPER_KEYS.has(key)) continue;
+    normalized[key] = record[key];
+  }
+  return canonicalAgentGroupFingerprint(normalized);
+}
+
 export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (!isObject(raw)) throw new Error("turn tape payload must be an object");
   const sessionId = requiredString(raw, "sessionId");
@@ -461,13 +498,17 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   }
   const seenBillingRequestIds = new Set<string>();
   if (engineBilling) seenBillingRequestIds.add(engineBilling.requestId);
+  // OCV5-180 B1 — a continuation tape bills under its OWNER turn key, never
+  // under the continuation's own derived key. Root tapes keep comparing
+  // against their own turnKey (unchanged rule).
+  const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey;
   for (let groupIndex = 0; groupIndex < (agentGroups ?? []).length; groupIndex++) {
     const group = agentGroups![groupIndex]!;
     const billings = group.engineBillings;
     if (billings === undefined) continue;
     for (let billingIndex = 0; billingIndex < (billings as DurableCodexBilling[]).length; billingIndex++) {
       const billing = (billings as DurableCodexBilling[])[billingIndex]!;
-      if (billing.parentTurnKey !== turnKey || billing.parentSessionId !== sessionId) {
+      if (billing.parentTurnKey !== groupBillingOwnerTurnKey || billing.parentSessionId !== sessionId) {
         throw new Error(
           `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] parent locator is invalid`,
         );
@@ -484,7 +525,9 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     }
   }
   if (continuationOfTurnKey !== undefined) {
-    if (
+    // Shared continuation invariants: completed, empty text, no second paid
+    // turn identity, no error/waiver/dispatch-adjacent fields.
+    const continuationBaseInvalid =
       status !== "completed" ||
       requiredString(raw, "text") !== "" ||
       parentTurnKey !== undefined ||
@@ -502,11 +545,17 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
       tools !== undefined ||
       assistantSegments !== undefined ||
       thinkingSegments !== undefined ||
-      agentGroups !== undefined ||
       structuredBlocks !== undefined ||
-      engineBilling !== undefined ||
-      !runtimeEvents?.length
-    ) {
+      engineBilling !== undefined;
+    // OCV5-180 B1 — restricted agent-group continuation: exactly the late
+    // delegate team card (text='', completed, owner-scoped billing). The
+    // group's own runtimeEvents/transcript ride inside the group envelope;
+    // top-level runtimeEvents stay forbidden in this branch.
+    if (agentGroups !== undefined) {
+      if (continuationBaseInvalid || agentGroups.length === 0 || runtimeEvents?.length) {
+        throw new Error("turn tape agent-group continuation must contain only completed agentGroups");
+      }
+    } else if (continuationBaseInvalid || !runtimeEvents?.length) {
       throw new Error("turn tape continuation must contain only completed runtimeEvents");
     }
   }
@@ -895,6 +944,11 @@ export function materializeLosslessTurn(
       ...(typeof group.resultSummary === "string" ? { _resultPreview: group.resultSummary } : {}),
       ...(group.verdict === "PASS" || group.verdict === "NEEDS_FIX" ? { _reviewVerdict: group.verdict } : {}),
       ...(Array.isArray(group.transcript) ? { childBlocks: group.transcript } : {}),
+      // OCV5-180 B1 — hydrate copies this onto the timeline row; persist.ts
+      // then relocates the exact card onto the owner turn (pagination/reload).
+      ...(body.continuationOfTurnKey
+        ? { _continuationOfTurnKey: body.continuationOfTurnKey }
+        : {}),
     }, groupEventOrdinal));
   }
 
@@ -1094,4 +1148,35 @@ export function materializeLosslessTurn(
     billingAnchorId,
     engineBillings,
   };
+}
+
+/** Put one late group into the owner root identity so both sides share record shape. */
+export function materializeRootDomainAgentGroupRecord(
+  group: Record<string, unknown>,
+  root: {
+    sessionId: string;
+    agentId: string;
+    turnIndex: number;
+    status: "completed" | "interrupted" | "crashed";
+    turnKey: string;
+    createdAt: number;
+    clientMessageId?: string;
+  },
+): Record<string, unknown> {
+  const turn = materializeLosslessTurn({
+    sessionId: root.sessionId,
+    agentId: root.agentId,
+    turnIndex: root.turnIndex,
+    status: root.status,
+    turnKey: root.turnKey,
+    text: "",
+    createdAt: root.createdAt,
+    ...(root.clientMessageId !== undefined ? { clientMessageId: root.clientMessageId } : {}),
+    agentGroups: [group],
+  });
+  const card = turn.records.find((item) => item.role === "agent-group");
+  if (!card || !card.payload || typeof card.payload !== "object" || Array.isArray(card.payload)) {
+    throw new Error("turn tape agent-group continuation did not materialize a root-domain record");
+  }
+  return card.payload as Record<string, unknown>;
 }
