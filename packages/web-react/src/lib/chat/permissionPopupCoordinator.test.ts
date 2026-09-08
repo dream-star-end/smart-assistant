@@ -14,12 +14,19 @@ afterEach(() => {
 });
 
 describe("permissionPopupCoordinator", () => {
-  test("foreground live prompts auto-open until dismissed", () => {
+  test("foreground live prompts auto-open until dismissed or displayed", () => {
     expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(true);
+    markPermissionDisplayed("r1");
+    expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(false);
     dismissPermissionUi("r1");
     expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(false);
     reopenPermissionUi("r1");
     expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(true);
+  });
+
+  test("only one modal auto-opens at a time", () => {
+    markPermissionDisplayed("first");
+    expect(shouldAutoOpenPermission({ requestId: "second", livePrompt: true })).toBe(false);
   });
 
   test("background tabs do not auto-open and do not mark displayed", () => {

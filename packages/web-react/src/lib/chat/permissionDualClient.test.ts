@@ -3,8 +3,8 @@ import { applyPermissionSnapshot, applyPermissionRequest } from "./reducer";
 import { createSession } from "./model";
 import type { PermissionPromptSnapshotPayload } from "../types";
 
-function session(id: string) {
-  return createSession({ id, agentId: "main", title: id });
+function session(id: string, agentId = "main") {
+  return createSession({ id, agentId, title: id });
 }
 
 const snapshot = (over: Partial<PermissionPromptSnapshotPayload> = {}): PermissionPromptSnapshotPayload => ({
@@ -99,5 +99,13 @@ describe("dual-client permission snapshot", () => {
       inputJson: { questions: [] },
     } as Parameters<typeof applyPermissionRequest>[1]);
     expect(tab.messages.filter((m) => m.role === "permission")).toHaveLength(1);
+  });
+
+  test("non-main agent snapshots keep agent-scoped sessionKey", () => {
+    const tab = session("s1", "research-assistant");
+    applyPermissionSnapshot(tab, snapshot());
+    const card = tab.messages.find((m) => m.requestId === "req-shared");
+    expect(card?._turnOwnerId).toBe("m-user");
+    expect(tab.agentId).toBe("research-assistant");
   });
 });

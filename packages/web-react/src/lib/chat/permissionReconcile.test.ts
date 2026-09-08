@@ -58,13 +58,13 @@ describe("reconcilePermissionSnapshot", () => {
     expect(plan.settle).toEqual([]);
   });
 
-  test("absence is not expiry, even on a complete page", () => {
+  test("absence is not expiry; complete pages still emit exact lookup for local pending cards", () => {
     const plan = reconcilePermissionSnapshot({
       localCards: [{ requestId: "old", resolved: false }],
       snapshot: { items: [pending("new")], completeness: "complete", source: "pg" },
     });
     expect(plan.settle).toEqual([]);
-    expect(plan.lookupRequestIds).toEqual([]);
+    expect(plan.lookupRequestIds).toEqual(["old"]);
   });
 
   test("truncated pages emit lookup ids for local pending cards outside the window", () => {

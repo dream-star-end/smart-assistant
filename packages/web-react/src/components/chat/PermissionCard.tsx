@@ -17,12 +17,15 @@ import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { asStr } from "../tool/format";
 import {
+  activeModalRequest,
   dismissPermissionUi,
   isDocumentForeground,
   markPermissionDisplayed,
   reopenPermissionUi,
   resetPermissionPopupCoordinator,
   shouldAutoOpenPermission,
+  subscribePermissionCoordinator,
+  yieldActiveModal,
 } from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Button, Modal } from "../ui";
@@ -256,6 +259,26 @@ export function PermissionCard({
       markPermissionDisplayed(msg.requestId);
     }
   }, [open, msg.requestId]);
+
+  useEffect(() => {
+    return subscribePermissionCoordinator(() => {
+      const requestId = msg.requestId;
+      if (!requestId) return;
+      const active = activeModalRequest();
+      if (active && active !== requestId) {
+        setOpen(false);
+        return;
+      }
+      if (shouldAutoOpenPermission({ requestId, livePrompt })) setOpen(true);
+    });
+  }, [livePrompt, msg.requestId]);
+
+  useEffect(() => {
+    const requestId = msg.requestId;
+    return () => {
+      if (requestId) yieldActiveModal(requestId);
+    };
+  }, [msg.requestId]);
 
   const handleDismissableOpenChange = (next: boolean) => {
     if (!next) rememberDismissedPermissionRequest(msg.requestId);

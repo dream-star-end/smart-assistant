@@ -93,7 +93,7 @@ export function reconcilePermissionSnapshot(input: {
     });
   }
 
-  if (snapshot.completeness === "truncated") {
+  if (snapshot.completeness !== "unavailable") {
     for (const card of localCards) {
       if (card.resolved) continue;
       if (!byId.has(card.requestId)) result.lookupRequestIds.push(card.requestId);
@@ -107,6 +107,7 @@ export function permissionSnapshotToRequestFrame(
   item: PermissionPromptSnapshotItem,
   sessId: string,
   nowMs: number = Date.now(),
+  agentId: string = "main",
 ): {
   type: "outbound.permission_request";
   sessionKey: string;
@@ -124,7 +125,7 @@ export function permissionSnapshotToRequestFrame(
 } {
   return {
     type: "outbound.permission_request",
-    sessionKey: `agent:main:webchat:dm:${sessId}`,
+    sessionKey: `agent:${agentId}:webchat:dm:${sessId}`,
     channel: "webchat",
     peer: { id: sessId, kind: "dm" },
     requestId: item.requestId,

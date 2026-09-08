@@ -3063,12 +3063,15 @@ export function applyPermissionSnapshot(
     }));
   const plan = reconcilePermissionSnapshot({ localCards, snapshot, nowMs });
   for (const item of plan.materialize) {
-    applyPermissionRequest(sess, permissionSnapshotToRequestFrame(item, sess.id, nowMs));
+    applyPermissionRequest(
+      sess,
+      permissionSnapshotToRequestFrame(item, sess.id, nowMs, sess.agentId || "main"),
+    );
   }
   for (const settlement of plan.settle) {
     applyPermissionSettled(sess, {
       type: "outbound.permission_settled",
-      sessionKey: `agent:main:webchat:dm:${sess.id}`,
+      sessionKey: `agent:${sess.agentId || "main"}:webchat:dm:${sess.id}`,
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       requestId: settlement.requestId,

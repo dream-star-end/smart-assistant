@@ -140,13 +140,15 @@ describe("PermissionCard 自动弹框的存活边界", () => {
 });
 
 describe("PermissionCard 自动弹窗：活提问 vs 历史 vs 重挂", () => {
-  test("活提问时间线重挂仍自动弹（CCB 仍在等，不能把确认框弄丢）", () => {
+  test("活提问已展示后重挂不再自动弹，手动入口仍可开", () => {
     const msg = askMsg({ requestId: "req-remount" });
     const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     unmount();
 
     render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 
@@ -420,12 +422,14 @@ describe("ExitPlanMode 计划确认", () => {
     });
   });
 
-  test("时间线重挂未答计划确认仍自动弹", () => {
+  test("已展示的计划确认重挂不再自动弹，审阅入口仍可开", () => {
     const msg = exitPlanMsg();
     const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     unmount();
     render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "审阅计划" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByTestId("exit-plan-markdown").textContent).toContain("markdown");
   });
