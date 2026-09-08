@@ -64,7 +64,7 @@ try {
     const errors = []
     page.on('pageerror', (error) => errors.push(error.message))
     await page.goto(url + '/browser-tests/showroom.html')
-    await page.getByRole('heading', { name: /你的下一件事/ }).waitFor()
+    await page.getByRole('heading', { name: /让它做给你看/ }).waitFor()
     assert.equal(await page.getByRole('button', { name: /^查看成果：/ }).count(), 2)
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
     assert.equal(await page.getByRole('button', { name: '快速上手', exact: true }).isVisible(), false)
