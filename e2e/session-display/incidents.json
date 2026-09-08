@@ -3425,9 +3425,14 @@
           "assertion": "B4 Stop then late persist: hello/GET/lookup hide ordinary pending, keep detached ask-user"
         },
         {
-          "layer": "deploy-gate",
-          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
-          "assertion": "INC-20260907-PERMISSION-ROOTFIX: source regression guard, not end-to-end proof."
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
+          "assertion": "T5 two pending show exactly one dialog; dock[0] then dock[1] are different requests"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
+          "assertion": "T3 background does not mark displayed; after foreground close can reopen"
         }
       ]
     }
