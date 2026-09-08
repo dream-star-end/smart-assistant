@@ -1,3 +1,6 @@
+import { installDelegateSandbox } from './helpers/delegateSandbox.js'
+const sandbox = installDelegateSandbox()
+
 /**
  * OCV5-22 stage 1: durable SQLite + reconciler. No real grok processes.
  *
@@ -751,7 +754,7 @@ describe('blocker 6: restart callback uses durable result', () => {
   })
 
   it('ensureCallback injects durable output instead of empty completed text', async () => {
-    const gw = Object.create(Gateway.prototype) as any
+    const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
     gw.log = { debug() {}, info() {}, warn() {}, error() {} }
     const captured: Array<{ output?: string; error?: string }> = []
     gw.injectSendToAgentCallback = async (args: { output?: string; error?: string }) => {
@@ -790,7 +793,7 @@ describe('blocker 6: restart callback uses durable result', () => {
   })
 
   it('ensureCallback injects durable failure instead of fake completed-empty text', async () => {
-    const gw = Object.create(Gateway.prototype) as any
+    const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
     gw.log = { debug() {}, info() {}, warn() {}, error() {} }
     const captured: Array<{ output?: string; error?: string }> = []
     gw.injectSendToAgentCallback = async (args: { output?: string; error?: string }) => {
@@ -932,7 +935,7 @@ describe('blocker 7: flag quadrants and baseline JSON DTO', () => {
     process.env.OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR = dir
     try {
       assert.equal(isDelegateDurableEffective(), false)
-      const gw = Object.create(Gateway.prototype) as any
+      const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
       gw.log = { debug() {}, info() {}, warn() {}, error() {} }
       gw._activeSendToAgentCallbacks = new Map()
       const store = new DelegateJobStore({ sm: false, ttlMs: 60_000 })
@@ -1443,7 +1446,7 @@ describe('OCV5-164 reaper wiring interrupts the child session', () => {
 
       const interrupted: string[] = []
       const logs: Array<{ msg: string; meta: Record<string, unknown> }> = []
-      const gw = Object.create(Gateway.prototype) as any
+      const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
       gw.log = {
         debug() {},
         info() {},
@@ -1493,7 +1496,7 @@ describe('OCV5-164 reaper wiring interrupts the child session', () => {
       const created = store.create('coding-assistant', { sessionKey: 'sk-throw' })
       assert.ok('jobId' in created)
       const logs: string[] = []
-      const gw = Object.create(Gateway.prototype) as any
+      const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
       gw.log = {
         debug() {},
         info() {},

@@ -1,3 +1,6 @@
+import { installDelegateSandbox } from './helpers/delegateSandbox.js'
+installDelegateSandbox()
+
 /**
  * OCV5-22 R0/R1 EngineNotifier + JobTerminal dispatch.
  * No real grok / engine processes; ports are test doubles.
