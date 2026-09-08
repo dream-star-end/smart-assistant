@@ -37,7 +37,8 @@ const providerError = {
     additionalInfo: { providerStatusCode: "400" },
   } } }],
 };
-const usage = { input_tokens: 40, output_tokens: 7, cache_read_input_tokens: 3, cache_creation_input_tokens: 2 };
+// Sand inputTokens includes cache tokens; uncached input = 40 - 3 - 2.
+const usage = { input_tokens: 35, output_tokens: 7, cache_read_input_tokens: 3, cache_creation_input_tokens: 2 };
 class TestResponse extends EventEmitter {
   statusCode = 200; headersSent = false; writableEnded = false;
   writableNeedDrain = false; destroyed = false; chunks: string[] = [];
@@ -48,7 +49,7 @@ class TestResponse extends EventEmitter {
   writeHead(status: number): this { this.statusCode = status; this.headersSent = true; return this; }
   write(chunk: string | Buffer): boolean {
     const text = String(chunk);
-    if ((text.includes("event: message_stop") || text.includes('"stop_reason":')) && this.readyCount() !== 1) this.successBeforeReady = true;
+    if ((text.includes("event: message_stop") || text.includes('"stop_reason":"')) && this.readyCount() !== 1) this.successBeforeReady = true;
     this.headersSent = true; this.chunks.push(text); return true;
   }
   end(chunk?: string | Buffer): this {
@@ -142,7 +143,7 @@ for (const pipe of [
       assert.equal(audit.length, 1); assert.equal(audit[0]!.requestId, TRACE);
       assert.equal(audit[0]!.model, MODEL); assert.equal(audit[0]!.requestedModel, "fable-5.1");
       assert.equal(audit[0]!.effort, "high"); assert.equal(audit[0]!.effortSource, "request");
-      assert.deepEqual(audit[0]!.usage, { inputTokens: 40, outputTokens: 7, cacheReadTokens: 3, cacheWriteTokens: 2 });
+      assert.deepEqual(audit[0]!.usage, { inputTokens: 35, outputTokens: 7, cacheReadTokens: 3, cacheWriteTokens: 2 });
       assert.doesNotMatch(wire, /\[non-retryable\]/);
       assert.equal(res.successBeforeReady, false);
       if (success) {
