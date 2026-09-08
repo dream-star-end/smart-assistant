@@ -261,6 +261,10 @@ export interface EngineAdapter extends EventEmitter {
   readonly executionTarget: ExecutionTarget
 
   // ── permission ──
+  /** Accept only a pending request owned by the active turn. On successful
+   * delivery, renew lastActivityAt and emit activity before returning so
+   * neither idle timer counts time spent waiting for the human. Unknown,
+   * consumed or failed responses must not extend either idle deadline. */
   sendPermissionResponse(requestId: string, response: unknown): boolean
 
   // ── runtime state ──
