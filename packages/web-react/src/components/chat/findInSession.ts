@@ -2,6 +2,36 @@ import type { ChatMessage } from "../../lib/chat/model";
 
 export type FindMatch = { index: number; key: string };
 
+/** Coalesced timeline row used to map a searchable message onto real DOM. */
+export type FindRenderLookupItem = {
+  key: string;
+  memberKeys: readonly string[];
+};
+
+export type FindTarget = {
+  renderIndex: number;
+  renderKey: string;
+  memberKey: string;
+};
+
+/**
+ * Resolve a find hit onto the coalesced render list by message key.
+ * Mapping failure must cancel the jump — never fall back to the raw index.
+ */
+export function locateFindMatch(
+  items: readonly FindRenderLookupItem[],
+  match: FindMatch | null | undefined,
+): FindTarget | null {
+  if (!match || typeof match.key !== "string" || match.key.length === 0) return null;
+  for (let renderIndex = 0; renderIndex < items.length; renderIndex += 1) {
+    const item = items[renderIndex];
+    if (item.key === match.key || item.memberKeys.includes(match.key)) {
+      return { renderIndex, renderKey: item.key, memberKey: match.key };
+    }
+  }
+  return null;
+}
+
 /**
  * Row key for a single ChatMessage. Same rule as MessageRenderer.renderItemKey
  * (single branch): `_timelineUnitKey ?? id`.

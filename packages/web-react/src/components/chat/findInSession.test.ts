@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { findMatches, stepMatch, timelineMessageKey } from "./findInSession";
+import { findMatches, locateFindMatch, stepMatch, timelineMessageKey } from "./findInSession";
 
 function mk(over: Partial<ChatMessage> & Pick<ChatMessage, "id" | "role">): ChatMessage {
   return { text: "", ts: 1, ...over };
@@ -69,5 +69,37 @@ describe("stepMatch", () => {
     expect(stepMatch(matches, 2, 1)).toBe(0);
     expect(stepMatch(matches, 0, -1)).toBe(2);
     expect(stepMatch(matches, 1, -1)).toBe(0);
+  });
+
+  test("输入后游标在第一项时第一次下一处走向第二项", () => {
+    expect(stepMatch(matches, 0, 1)).toBe(1);
+  });
+});
+
+describe("locateFindMatch", () => {
+  const items = [
+    { key: "team-a", memberKeys: ["g1", "g2"] },
+    { key: "u-needle", memberKeys: ["u-needle"] },
+    { key: "u-tail", memberKeys: ["u-tail"] },
+  ];
+
+  test("按 key 映射到 coalesce 后的 renderIndex，不用原始下标", () => {
+    const match = { index: 3, key: "u-needle" };
+    expect(locateFindMatch(items, match)).toEqual({
+      renderIndex: 1,
+      renderKey: "u-needle",
+      memberKey: "u-needle",
+    });
+  });
+
+  test("团队卡之后的可搜消息落到合并后的下一项，而不是原始 messages 下标", () => {
+    expect(locateFindMatch(items, { index: 2, key: "u-needle" })?.renderIndex).toBe(1);
+    expect(locateFindMatch(items, { index: 2, key: "u-needle" })?.renderIndex).not.toBe(2);
+  });
+
+  test("映射失败取消，不猜原始 index 指向的另一行", () => {
+    expect(locateFindMatch(items, { index: 0, key: "filtered-out" })).toBeNull();
+    expect(locateFindMatch(items, { index: 1, key: "u-missing" })).toBeNull();
+    expect(locateFindMatch(items, null)).toBeNull();
   });
 });
