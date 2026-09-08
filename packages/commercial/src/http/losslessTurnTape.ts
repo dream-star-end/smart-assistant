@@ -398,6 +398,28 @@ export function canonicalAgentGroupFingerprint(group: Record<string, unknown>): 
   return createHash("sha256").update("oc-late-delegate-root-v1\0").update(json).digest("hex");
 }
 
+/** Timeline/ordinal wrappers only. Content, _delegateStatus, billings, requestId stay. */
+const PUBLISHED_AGENT_GROUP_WRAPPER_KEYS = new Set([
+  "_ocEventOrdinal",
+  "_recordOrdinal",
+  "_turnTapeOrdinal",
+  "_turnTapeId",
+  "_timelineProcessKey",
+  "_timelineIdentity",
+  "_timelineLogicalOrdinal",
+  "_lifecycle",
+  "_lifecycleEpoch",
+]);
+
+export function canonicalPublishedAgentGroupRecordFingerprint(record: Record<string, unknown>): string {
+  const normalized: Record<string, unknown> = {};
+  for (const key of Object.keys(record)) {
+    if (PUBLISHED_AGENT_GROUP_WRAPPER_KEYS.has(key)) continue;
+    normalized[key] = record[key];
+  }
+  return canonicalAgentGroupFingerprint(normalized);
+}
+
 export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (!isObject(raw)) throw new Error("turn tape payload must be an object");
   const sessionId = requiredString(raw, "sessionId");
@@ -1126,4 +1148,33 @@ export function materializeLosslessTurn(
     billingAnchorId,
     engineBillings,
   };
+}
+
+/** Put one late group into the owner root identity so both sides share record shape. */
+export function materializeRootDomainAgentGroupRecord(
+  group: Record<string, unknown>,
+  root: {
+    sessionId: string;
+    agentId: string;
+    turnIndex: number;
+    status: "completed" | "interrupted" | "crashed";
+    turnKey: string;
+    createdAt: number;
+  },
+): Record<string, unknown> {
+  const turn = materializeLosslessTurn({
+    sessionId: root.sessionId,
+    agentId: root.agentId,
+    turnIndex: root.turnIndex,
+    status: root.status,
+    turnKey: root.turnKey,
+    text: "",
+    createdAt: root.createdAt,
+    agentGroups: [group],
+  });
+  const card = turn.records.find((item) => item.role === "agent-group");
+  if (!card || !card.payload || typeof card.payload !== "object" || Array.isArray(card.payload)) {
+    throw new Error("turn tape agent-group continuation did not materialize a root-domain record");
+  }
+  return card.payload as Record<string, unknown>;
 }

@@ -46,6 +46,7 @@ import { getHeapStatistics } from "node:v8";
 import { gzipSync, gunzipSync } from "node:zlib";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
+  LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
@@ -205,10 +206,11 @@ import {
   type WechatBinding,
 } from "@openclaude/storage";
 import {
-  canonicalAgentGroupFingerprint,
+  canonicalPublishedAgentGroupRecordFingerprint,
   computeGoalTokensUsed,
   isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
+  materializeRootDomainAgentGroupRecord,
   parseLosslessTurnPayload,
   type LosslessTurnRecord,
   type LosslessTurnPayload,
@@ -3657,6 +3659,9 @@ export async function inspectLateDelegateContinuationAgainstRoot(
     turn_index: number;
     status: string;
     turn_key: string;
+    created_at: string;
+    physical_record_count: string | null;
+    materialization_status: string | null;
   }>;
   try {
     roots = (
@@ -3671,10 +3676,15 @@ export async function inspectLateDelegateContinuationAgainstRoot(
         turn_index: number;
         status: string;
         turn_key: string;
+        created_at: string;
+        physical_record_count: string | null;
+        materialization_status: string | null;
       }>(
         `SELECT t.tape_id, t.tape_sha256, t.total_bytes::text AS total_bytes, t.part_count,
                 t.finalized_at::text, t.visible_at::text,
-                t.agent_id, t.turn_index, t.status, t.turn_key
+                t.agent_id, t.turn_index, t.status, t.turn_key, t.created_at::text,
+                t.physical_record_count::text AS physical_record_count,
+                t.materialization_status
            FROM client_session_turn_tapes t
           WHERE t.session_id=$1 AND t.user_id=$2 AND t.turn_key=$3
             AND t.continuation_of_turn_key IS NULL
@@ -3689,49 +3699,93 @@ export async function inspectLateDelegateContinuationAgainstRoot(
   const root = roots[0]!;
   // Parts-only is not an owner root. Keep durable retry until visible+finalized.
   if (root.finalized_at == null || root.visible_at == null) return "retry";
-  const totalBytes = bigIntNum(root.total_bytes, "root turn tape total_bytes");
-  let assembledRoot: { raw: unknown } | "incomplete";
+  if (root.materialization_status !== "complete") return "retry";
+  if (root.status !== "completed" && root.status !== "interrupted" && root.status !== "crashed") {
+    return "retry";
+  }
+  const physicalCount = root.physical_record_count == null
+    ? NaN
+    : bigIntNum(root.physical_record_count, "root turn tape physical_record_count");
+  if (!Number.isFinite(physicalCount) || physicalCount < 1) return "retry";
+  const recordPrefix = root.agent_id === LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID
+    ? `srv-${request.sessionId}-t${root.turn_index}`
+    : `srv-${request.sessionId}-${root.agent_id}-t${root.turn_index}`;
+  let recordStats: { total: string; off_prefix: string };
   try {
-    assembledRoot = await loadAssembledTapePayloadAdmitted(
-      pool,
-      userId,
-      request.sessionId,
-      root.tape_id,
-      {
-        totalBytes,
-        tapeSha256: root.tape_sha256,
-        partCount: root.part_count,
-      },
-    );
+    recordStats = (
+      await pool.query<{ total: string; off_prefix: string }>(
+        `SELECT COUNT(*)::text AS total,
+                COUNT(*) FILTER (WHERE msg_id NOT LIKE $4)::text AS off_prefix
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [request.sessionId, userId, root.tape_id, `${recordPrefix}%`],
+      )
+    ).rows[0] ?? { total: "0", off_prefix: "0" };
   } catch (err) {
-    rethrowInspectTapeError(err);
+    throw retryableTapeError("late-delegate root lookup failed", err);
   }
-  if (assembledRoot === "incomplete") return "retry";
-  let rootPayload: LosslessTurnPayload;
-  try {
-    rootPayload = parseLosslessTurnPayload(assembledRoot.raw);
-  } catch {
-    return "retry";
-  }
-  if (
-    rootPayload.sessionId !== request.sessionId ||
-    rootPayload.agentId !== root.agent_id ||
-    rootPayload.turnIndex !== root.turn_index ||
-    rootPayload.status !== root.status ||
-    rootPayload.turnKey !== root.turn_key
-  ) {
-    return "retry";
-  }
-  const rootGroups = rootPayload.agentGroups ?? [];
-  let matched = 0;
+  const totalRecords = bigIntNum(recordStats.total, "root turn tape record count");
+  const offPrefix = bigIntNum(recordStats.off_prefix, "root turn tape off-prefix record count");
+  // Missing records are unreadiness, not "no run". Header/record identity must match.
+  if (totalRecords !== physicalCount || offPrefix !== 0) return "retry";
+
+  const runIds: string[] = [];
+  const msgIds: string[] = [];
   for (const group of groups) {
     const runId = typeof group.runId === "string" ? group.runId : "";
     if (!runId) return "retry";
-    const existing = rootGroups.find((item) => item.runId === runId);
-    if (!existing) continue;
-    const lateFp = canonicalAgentGroupFingerprint(group as Record<string, unknown>);
-    const rootFp = canonicalAgentGroupFingerprint(existing as Record<string, unknown>);
-    if (lateFp !== rootFp) throw lateDelegateRootConflict();
+    runIds.push(runId);
+    msgIds.push(`${recordPrefix}-agentgroup-${runId}`);
+  }
+  let publishedRows: Array<{ msg_id: string; role: string; content_sha256: string; payload: Buffer }>;
+  try {
+    publishedRows = (
+      await pool.query<{ msg_id: string; role: string; content_sha256: string; payload: Buffer }>(
+        `SELECT msg_id, role, content_sha256, payload
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            AND msg_id = ANY($4::text[])`,
+        [request.sessionId, userId, root.tape_id, msgIds],
+      )
+    ).rows;
+  } catch (err) {
+    throw retryableTapeError("late-delegate root lookup failed", err);
+  }
+  const byMsgId = new Map(publishedRows.map((row) => [row.msg_id, row]));
+  const createdAt = bigIntNum(root.created_at, "root turn tape created_at");
+  let matched = 0;
+  for (let index = 0; index < groups.length; index++) {
+    const group = groups[index]!;
+    const published = byMsgId.get(msgIds[index]!);
+    if (!published) continue;
+    if (published.role !== "agent-group") return "retry";
+    const bytes = Buffer.from(published.payload);
+    const release = acquireFinalizeMemoryAdmission(bytes.length);
+    try {
+      if (sha256Bytes(bytes) !== published.content_sha256) return "retry";
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(bytes.toString("utf8"));
+      } catch {
+        return "retry";
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "retry";
+      const expected = materializeRootDomainAgentGroupRecord(group as Record<string, unknown>, {
+        sessionId: request.sessionId,
+        agentId: root.agent_id,
+        turnIndex: root.turn_index,
+        status: root.status,
+        turnKey: root.turn_key,
+        createdAt,
+      });
+      const lateFp = canonicalPublishedAgentGroupRecordFingerprint(expected);
+      const rootFp = canonicalPublishedAgentGroupRecordFingerprint(parsed as Record<string, unknown>);
+      if (lateFp !== rootFp) throw lateDelegateRootConflict();
+    } catch (err) {
+      rethrowInspectTapeError(err);
+    } finally {
+      release();
+    }
     matched += 1;
   }
   if (matched === groups.length) return "idempotent";
