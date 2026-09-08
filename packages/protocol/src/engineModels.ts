@@ -862,6 +862,155 @@ export function cursorModelIdFromPublic(modelId: string | null | undefined): Cur
   return isCursorEngineModel(prefixed) ? (prefixed as CursorEngineModelId) : null
 }
 
+// ── Family-level public ids (external API-key surface, 2026-09-08) ───────────
+//
+// The internal catalog pins the thinking depth inside the id
+// (`cursor-fable-5.1-high`). For third-party clients that is the wrong axis:
+// Claude Code lets the user pick effort per session (`/effort`, `--effort`,
+// `CLAUDE_CODE_EFFORT_LEVEL`, the `/model` slider) and sends it as
+// `output_config.effort`; a model id that hard-codes `-high` silently ignores
+// that choice. So the external surface advertises **family-level** ids
+// (`fable-5.1`, `sonnet-5`, `grok-4.6-fast`, …) and the proxy resolves
+// family + requested effort → internal variant per request. Effort-suffixed
+// public ids stay accepted (and pin the level) so existing client configs keep
+// working; families without an effort axis (`auto`, `composer-2.5`) keep their
+// single public id.
+
+const FAST_SUFFIX = '-fast'
+
+/** Family ids that carry an effort axis (every variant has `effort !== null`). */
+export const CURSOR_EFFORT_FAMILIES: readonly CursorEngineFamilyId[] = Array.from(
+  new Set(
+    CURSOR_ENGINE_MODELS.filter((model) => model.effort !== null).map((model) => model.family),
+  ),
+)
+
+export function cursorFamilyHasEffortAxis(family: CursorEngineFamilyId): boolean {
+  return CURSOR_EFFORT_FAMILIES.includes(family)
+}
+
+/**
+ * Family-level public id for a cursor engine model:
+ * `cursor-fable-5.1-high` → `fable-5.1`, `cursor-grok-4.6-xhigh-fast` → `grok-4.6-fast`,
+ * `cursor-auto` → `auto`, `cursor-composer-2.5-fast` → `composer-2.5-fast`.
+ * Non-cursor ids pass through unchanged (same contract as {@link publicCursorModelId}).
+ */
+export function publicCursorFamilyModelId(modelId: string): string {
+  const model = cursorModelById(modelId)
+  if (!model) return modelId
+  if (model.effort === null) return publicCursorModelId(modelId)
+  return `${model.family}${model.fast ? FAST_SUFFIX : ''}`
+}
+
+/** Human label for a family-level public id (`Fable 5.1`, `Grok 4.6 Fast`). */
+export function cursorFamilyPublicLabel(family: CursorEngineFamilyId, fast: boolean): string {
+  const row = CURSOR_ENGINE_MODELS.find((model) => model.family === family)
+  const label = row?.familyLabel ?? family
+  return fast ? `${label} Fast` : label
+}
+
+/**
+ * Parse a family-level public id (`fable-5.1`, `grok-4.6-fast`). Only families
+ * with an effort axis are family-addressable; `-fast` is accepted only where the
+ * family actually has fast variants. Returns null for anything else.
+ */
+export function parseCursorFamilyPublicId(
+  modelId: string | null | undefined,
+): { family: CursorEngineFamilyId; fast: boolean } | null {
+  if (typeof modelId !== 'string' || modelId.length === 0) return null
+  const fast = modelId.endsWith(FAST_SUFFIX)
+  const base = fast ? modelId.slice(0, -FAST_SUFFIX.length) : modelId
+  const family = CURSOR_EFFORT_FAMILIES.find((candidate) => candidate === base)
+  if (!family) return null
+  if (fast && !cursorFamilySupportsFast(family)) return null
+  return { family, fast }
+}
+
+export type CursorEffortSource =
+  /** Effort-suffixed (or internal) id: the id itself fixes the level; client effort ignored. */
+  | 'pinned'
+  /** Client asked for a level the family offers → honoured verbatim. */
+  | 'request'
+  /** Client asked for a level the family does not offer (or it is disabled) → nearest offered. */
+  | 'clamped'
+  /** Client sent no effort → family default. */
+  | 'default'
+
+export interface CursorPublicModelResolution {
+  internalId: CursorEngineModelId
+  family: CursorEngineFamilyId
+  effort: PlatformReasoningEffort | null
+  fast: boolean
+  effortSource: CursorEffortSource
+}
+
+export function parsePlatformReasoningEffort(value: unknown): PlatformReasoningEffort | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  return (PLATFORM_REASONING_EFFORTS as readonly string[]).includes(normalized)
+    ? (normalized as PlatformReasoningEffort)
+    : undefined
+}
+
+/**
+ * Resolve what a third-party client asked for — a public model id plus the
+ * optional `output_config.effort` it sent — to one internal cursor variant.
+ *
+ * Order:
+ *   1. exact public/internal id (`fable-5.1-high`, `cursor-auto`) → that variant,
+ *      effort **pinned** by the id (a request effort never overrides an explicit id);
+ *   2. family id (`fable-5.1`, `grok-4.6-fast`) → effort = client value if the family
+ *      offers it, else the highest offered level at or below it (Claude Code's own
+ *      fallback rule), else the lowest offered; no client value → family default
+ *      (`cursorFamilyDefaultEffort`, currently `high`) with the same fallback.
+ *
+ * `isAvailable` lets the caller hide variants the deployment has disabled
+ * (catalog `enabled=false`) so a request for `max` on a family whose `max` row is
+ * off lands on `xhigh` instead of a confusing "model not enabled". Returns null
+ * when the id names no cursor model or every variant of the family is unavailable
+ * (callers fall through to their existing unknown-model handling).
+ */
+export function resolveCursorPublicModel(
+  modelId: string | null | undefined,
+  requestedEffort: unknown,
+  isAvailable: (internalId: CursorEngineModelId) => boolean = () => true,
+): CursorPublicModelResolution | null {
+  const exact = cursorModelIdFromPublic(modelId)
+  if (exact) {
+    const model = cursorModelById(exact)!
+    return {
+      internalId: exact,
+      family: model.family,
+      effort: model.effort,
+      fast: model.fast,
+      effortSource: 'pinned',
+    }
+  }
+  const parsed = parseCursorFamilyPublicId(modelId)
+  if (!parsed) return null
+  const { family, fast } = parsed
+  const ladder = cursorFamilyEfforts(family).filter((effort) => {
+    const variant = findCursorEngineModel(family, effort, fast)
+    return variant !== undefined && isAvailable(variant.id)
+  })
+  if (ladder.length === 0) return null
+
+  const requested = parsePlatformReasoningEffort(requestedEffort)
+  const target = requested ?? cursorFamilyDefaultEffort(family) ?? 'high'
+  const rank = (effort: PlatformReasoningEffort): number => PLATFORM_REASONING_EFFORTS.indexOf(effort)
+  let picked: PlatformReasoningEffort
+  if (ladder.includes(target)) {
+    picked = target
+  } else {
+    const below = ladder.filter((effort) => rank(effort) < rank(target))
+    picked = below.length > 0 ? below[below.length - 1]! : ladder[0]!
+  }
+  const variant = findCursorEngineModel(family, picked, fast)!
+  const effortSource: CursorEffortSource =
+    requested === undefined ? 'default' : picked === requested ? 'request' : 'clamped'
+  return { internalId: variant.id, family, effort: picked, fast, effortSource }
+}
+
 export type CursorCredentialModelFamily = 'cursor_models' | 'other_models'
 
 /** Cursor's account pool has separate quota eligibility for built-in Cursor

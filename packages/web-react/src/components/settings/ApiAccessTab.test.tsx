@@ -47,6 +47,7 @@ import { ApiAccessTab, ApiKeyUsagePanel } from "./ApiAccessTab";
 import {
   buildCcSwitchDeepLink,
   buildCcSwitchUsageScript,
+  claudeCodeExtraEnv,
   limitPercent,
   pickDefaultModel,
 } from "./ApiKeysSection";
@@ -159,10 +160,14 @@ function makeReport(over: Partial<ApiKeyUsageReport> = {}): ApiKeyUsageReport {
   };
 }
 
-/** 站内公开模型列表:外接引擎行带内部 id(cursor-*),页面必须只展示公开 id。 */
+/**
+ * 站内公开模型列表:外接引擎行带内部 id(cursor-*、含思考档位),页面必须只展示公开**家族** id
+ * (无前缀、无档位;同家族多档位折叠成一项)。
+ */
 const PUBLIC_MODELS = {
   models: [
     { id: "cursor-fable-5.1-high", display_name: "Fable 5.1 High", engine: "cursor" as const },
+    { id: "cursor-fable-5.1-low", display_name: "Fable 5.1 Low", engine: "cursor" as const },
     { id: "cursor-sonnet-5-high", display_name: "Sonnet 5 High", engine: "cursor" as const },
     {
       id: "cursor-gemini-3.8-flash-low",
@@ -199,16 +204,14 @@ describe("limitPercent", () => {
 
 describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
   test("首选在列表里就用首选;列表缺失/为空用首选兜底;否则按家族正则退到列表项", () => {
-    expect(pickDefaultModel(null, "fable-5.1-high")).toBe("fable-5.1-high");
-    expect(pickDefaultModel([], "fable-5.1-high")).toBe("fable-5.1-high");
-    expect(pickDefaultModel(["sonnet-5-high", "fable-5.1-high"], "fable-5.1-high")).toBe(
-      "fable-5.1-high",
-    );
-    expect(
-      pickDefaultModel(["sonnet-5-high", "opus-5-high"], "fable-5.1-high", /^(fable|opus)-/),
-    ).toBe("opus-5-high");
-    expect(pickDefaultModel(["sonnet-5-high"], "fable-5.1-high", /^(fable|opus)-/)).toBe(
-      "sonnet-5-high",
+    expect(pickDefaultModel(null, "fable-5.1")).toBe("fable-5.1");
+    expect(pickDefaultModel([], "fable-5.1")).toBe("fable-5.1");
+    expect(pickDefaultModel(["sonnet-5", "fable-5.1"], "fable-5.1")).toBe("fable-5.1");
+    expect(pickDefaultModel(["sonnet-5", "opus-5"], "fable-5.1", /^(fable|opus)-/)).toBe("opus-5");
+    expect(pickDefaultModel(["sonnet-5"], "fable-5.1", /^(fable|opus)-/)).toBe("sonnet-5");
+    // 轻量模型:家族 id 无 -low 后缀可依赖,按 gemini/-flash 匹配。
+    expect(pickDefaultModel(["fable-5.1", "gemini-3.8-flash"], "x", /^gemini-|-flash(-|$)/)).toBe(
+      "gemini-3.8-flash",
     );
   });
 
@@ -216,10 +219,10 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
     const base = {
       origin: "https://x.example",
       name: "从简",
-      model: "fable-5.1-high",
-      opusModel: "fable-5.1-high",
-      sonnetModel: "sonnet-5-high",
-      haikuModel: "gemini-3.8-flash-low",
+      model: "fable-5.1",
+      opusModel: "fable-5.1",
+      sonnetModel: "sonnet-5",
+      haikuModel: "gemini-3.8-flash",
     };
     const noKey = buildCcSwitchDeepLink(base);
     expect(noKey).toBeNull();
@@ -233,10 +236,22 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
     expect(p.get("app")).toBe("claude");
     expect(p.get("name")).toBe("从简");
     expect(p.get("endpoint")).toBe("https://x.example/api/anthropic");
-    expect(p.get("model")).toBe("fable-5.1-high");
-    expect(p.get("haikuModel")).toBe("gemini-3.8-flash-low");
+    // 模型名是家族 id,不带思考档位:深度由用户在 Claude Code 里设置。
+    expect(p.get("model")).toBe("fable-5.1");
+    expect(p.get("haikuModel")).toBe("gemini-3.8-flash");
     expect(p.get("apiKey")).toBe(COMPLETE_KEY);
     expect(withKey).not.toMatch(/cursor/i);
+    expect(withKey).not.toMatch(/-(low|medium|high|xhigh|max)(&|$)/);
+    // 额外 env 经 config(base64 JSON {env})携带,CC Switch 以它为底叠加 URL 参数写 settings。
+    expect(p.get("configFormat")).toBe("json");
+    const cfg = JSON.parse(
+      new TextDecoder().decode(Uint8Array.from(atob(p.get("config")!), (c) => c.charCodeAt(0))),
+    ) as { env: Record<string, string> };
+    expect(cfg.env).toEqual(claudeCodeExtraEnv());
+    expect(cfg.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT).toBe("1");
+    // config 只带额外 env,不重复标准字段(URL 参数才是权威,避免两处不一致)。
+    expect(cfg.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(cfg.env.ANTHROPIC_MODEL).toBeUndefined();
     // 导入后立即切换为当前供应商:不带 enabled=true 时 CC Switch 只加进列表,
     // settings.json 仍指向旧供应商/旧密钥 → 本地 Claude Code 401(OCV5-171 后续)。
     expect(p.get("enabled")).toBe("true");
@@ -351,24 +366,33 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     await keyRow("11");
     await waitFor(() => expect(api.getPublicModels).toHaveBeenCalledWith(auth));
 
-    // 环境变量片段:默认模型来自可用列表(公开 id),base URL 指向 /api/anthropic。
+    // 环境变量片段:默认模型来自可用列表(公开家族 id,无档位),base URL 指向 /api/anthropic。
     const env = await waitFor(() => {
       const el = screen.getByTestId("env-snippet");
-      if (!/ANTHROPIC_MODEL=fable-5\.1-high/.test(el.textContent ?? "")) throw new Error("not yet");
+      if (!/ANTHROPIC_MODEL=fable-5\.1\n/.test(el.textContent ?? "")) throw new Error("not yet");
       return el;
     });
     expect(env.textContent).toContain(`ANTHROPIC_BASE_URL=${window.location.origin}/api/anthropic`);
-    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet-5-high");
-    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-3.8-flash-low");
+    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet-5\n");
+    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-3.8-flash\n");
     expect(env.textContent).toContain("ANTHROPIC_AUTH_TOKEN='oc-cc.<你的密钥>");
+    // 让 Claude Code 对本站(非内置)模型名也发送 effort。
+    expect(env.textContent).toContain("export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1");
+    expect(env.textContent).not.toMatch(/MODEL=[^\n]*-(low|medium|high|xhigh|max)\n/);
 
     // CC Switch JSON 配置:同一组值。
     const cfg = JSON.parse(screen.getByTestId("ccswitch-config").textContent ?? "{}") as {
       env: Record<string, string>;
     };
     expect(cfg.env.ANTHROPIC_BASE_URL).toBe(`${window.location.origin}/api/anthropic`);
-    expect(cfg.env.ANTHROPIC_MODEL).toBe("fable-5.1-high");
-    expect(cfg.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("gemini-3.8-flash-low");
+    expect(cfg.env.ANTHROPIC_MODEL).toBe("fable-5.1");
+    expect(cfg.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("gemini-3.8-flash");
+    expect(cfg.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT).toBe("1");
+    // 思考深度说明:在 Claude Code 里自己设;带档位后缀的旧写法仍可用于钉死档位。
+    const effortGuide = screen.getByTestId("guide-effort");
+    expect(effortGuide.textContent).toContain("/effort");
+    expect(effortGuide.textContent).toContain("CLAUDE_CODE_EFFORT_LEVEL");
+    expect(effortGuide.textContent).toContain("fable-5.1-high");
 
     // 缺少明文时不生成可点击的坏链接,也不让用户到接收端才发现错误。
     const link = screen.getByTestId("ccswitch-deeplink");
@@ -382,9 +406,13 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
 
     // 产品硬要求:API 接入页任何可见文本都不出现 cursor(CSS class 不算文本)。
     expect(document.body.textContent).not.toMatch(/cursor/i);
-    // 由模型列表推导的家族名以公开 id 展示。
-    expect(screen.getAllByText("fable-5.1").length).toBeGreaterThan(0);
+    // 由模型列表推导的家族名以公开 id 展示;两个 fable-5.1 档位折叠成一项。
+    const guideEnv = screen.getByTestId("guide-env");
+    expect(within(guideEnv).getAllByText("fable-5.1").length).toBe(1);
+    expect(within(guideEnv).getAllByText("sonnet-5").length).toBe(1);
+    expect(within(guideEnv).getAllByText("gemini-3.8-flash").length).toBe(1);
     expect(screen.queryByText(/cursor-fable/)).not.toBeInTheDocument();
+    expect(screen.queryByText("fable-5.1-low")).not.toBeInTheDocument();
   });
 
   test("创建密钥后:片段 / JSON / 深链都带上明文,深链提示「已包含刚创建的密钥」", async () => {
@@ -479,9 +507,7 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     render(<ApiAccessTab auth={auth} />);
     await keyRow("11");
     await waitFor(() => expect(api.getPublicModels).toHaveBeenCalled());
-    expect(screen.getByTestId("env-snippet").textContent).toContain(
-      "ANTHROPIC_MODEL=fable-5.1-high",
-    );
+    expect(screen.getByTestId("env-snippet").textContent).toContain("ANTHROPIC_MODEL=fable-5.1\n");
     expect(screen.getAllByText("gemini-3.8-flash").length).toBeGreaterThan(0);
     expect(screen.queryByText("加载 API Key 失败")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/cursor/i);
