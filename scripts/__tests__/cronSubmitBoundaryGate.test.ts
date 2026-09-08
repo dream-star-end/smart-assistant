@@ -2,13 +2,14 @@ import assert from 'node:assert/strict'
 import {
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { after, test } from 'node:test'
 import {
   assertCronSubmitBoundarySource,
@@ -32,6 +33,35 @@ function regularRunJob(input: string): { start: number; end: number; body: strin
   const end = input.indexOf('\n  private async ', start + 1)
   assert.ok(start >= 0 && end > start)
   return { start, end, body: input.slice(start, end) }
+}
+
+function realShapedTap(opts: { leafType?: boolean } = {}): string {
+  const layer1 = CRON_EXECUTION_HEARTBEAT_LEAVES.slice(0, 11)
+  const layer2 = CRON_EXECUTION_HEARTBEAT_LEAVES[11]!
+  const leafYaml = opts.leafType === false ? '' : `      type: 'test'\n`
+  const leafBlock = (n: number, name: string) =>
+    `    ok ${n} - ${name}\n      ---\n      duration_ms: 1\n${leafYaml}      ...`
+  const suite = (n: number, name: string) =>
+    `ok ${n} - ${name}\n  ---\n  duration_ms: 1\n  type: 'suite'\n  ...`
+  return [
+    'TAP version 13',
+    '# Subtest: OCV5-188 Layer 1 — CronScheduler + SQLite + synthetic submit',
+    ...layer1.map((name, i) => leafBlock(i + 1, name)),
+    '    1..11',
+    suite(1, 'OCV5-188 Layer 1 — CronScheduler + SQLite + synthetic submit'),
+    '# Subtest: OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner (not model E2E)',
+    leafBlock(1, layer2),
+    '    1..1',
+    suite(2, 'OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner (not model E2E)'),
+    '1..2',
+    '# tests 12',
+    '# pass 12',
+    '# fail 0',
+    '# cancelled 0',
+    '# skipped 0',
+    '# todo 0',
+    '',
+  ].join('\n')
 }
 
 function validLeafTap(): string {
@@ -59,6 +89,9 @@ function runOfficial(extra: NodeJS.ProcessEnv = {}, timeoutMs = 120_000) {
       PATH: process.env.PATH,
       LANG: process.env.LANG,
       TZ: process.env.TZ,
+      HOME: dir,
+      OPENCLAUDE_HOME: dir,
+      TMPDIR: dir,
       ...extra,
     },
     encoding: 'utf8',
@@ -290,6 +323,115 @@ test('SIGTERM after real grandchild hold drains the group and deletes HOME (C-P3
   assert.equal(existsSync(`/proc/${info.pid}`), false)
   assert.deepEqual(pidsInGroup(pgid), [])
   assert.equal(existsSync(home), false)
+})
+
+test('parser rejects six single-site mutations of real-shaped TAP (C-P2-R1-1)', () => {
+  const tap = realShapedTap()
+  evaluateHeartbeatTap(tap, { code: 0, signal: null })
+  evaluateHeartbeatTap(realShapedTap({ leafType: false }), { code: 0, signal: null })
+  const cases: Record<string, string> = {
+    leafSkipContradictsSummary: tap.replace(/^(    ok 1 - .*?)$/m, '$1 # SKIP'),
+    leafTodoContradictsSummary: tap.replace(/^(    ok 1 - .*?)$/m, '$1 # TODO'),
+    failedTopSuiteContradictsSummary: tap.replace(/^ok 1 - /m, 'not ok 1 - '),
+    duplicateRootPointNumber: tap.replace(/^ok 2 - /m, 'ok 1 - '),
+    nestedBailout: tap.replace(/^(    1\.\.11)$/m, '    Bail out! actual child aborted\n$1'),
+    unclosedFinalYaml: tap.replace(/  \.\.\.\n1\.\.2/, '1..2'),
+  }
+  let accepted = 0
+  for (const [name, data] of Object.entries(cases)) {
+    assert.notEqual(data, tap, `${name} must mutate`)
+    let rejected = false
+    let error = ''
+    try {
+      evaluateHeartbeatTap(data, { code: 0, signal: null })
+    } catch (err) {
+      rejected = true
+      error = (err as Error).message
+    }
+    if (!rejected) accepted += 1
+    console.log(
+      JSON.stringify({
+        contractId: 'C-proof-R1-1-TAP',
+        case: name,
+        expected: { rejected: true },
+        actual: { rejected, error },
+      }),
+    )
+  }
+  const auditorDir = '/home/agent/.openclaude/generated'
+  for (const name of Object.keys(cases)) {
+    const path = join(auditorDir, `ocv5-188-C-proof-auditor-${name}.tap`)
+    if (!existsSync(path)) continue
+    assert.throws(
+      () => evaluateHeartbeatTap(readFileSync(path, 'utf8'), { code: 0, signal: null }),
+      /TAP rejected/,
+      `original auditor tap ${name} must stay rejected`,
+    )
+  }
+  assert.equal(accepted, 0, 'all six single-site TAP mutations must reject')
+})
+
+test('official CLI parent SIGTERM keeps already produced output (C-P3-W1)', {
+  timeout: 30_000,
+}, async () => {
+  const iso = mkdtempSync(join(dir, 'cli-sig-'))
+  const child = spawn(process.execPath, ['--import', 'tsx', gate], {
+    cwd: root,
+    env: {
+      PATH: process.env.PATH,
+      LANG: process.env.LANG,
+      TZ: process.env.TZ,
+      HOME: iso,
+      OPENCLAUDE_HOME: iso,
+      TMPDIR: iso,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (chunk: string) => {
+    stdout += chunk
+  })
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk
+  })
+  const start = Date.now()
+  while (Date.now() - start < 8_000) {
+    if (stdout.includes('C-cron-submit-boundary-behavior-start')) break
+    if (child.exitCode !== null) break
+    await new Promise((r) => setTimeout(r, 25))
+  }
+  assert.match(stdout, /C-cron-submit-boundary-behavior-start/)
+  await new Promise((r) => setTimeout(r, 2_000))
+  child.kill('SIGTERM')
+  const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve) => child.once('close', (code, signal) => resolve({ code, signal })),
+  )
+  const combined = `${stdout}${stderr}`
+  console.log(
+    JSON.stringify({
+      contractId: 'C-proof-parent-sigterm',
+      expected: { nonzero: true, noPass: true, keptSentinel: true, homeGone: true },
+      actual: {
+        code: closed.code,
+        signal: closed.signal,
+        keptSentinel: /TAP version 13|C-481-submit/.test(combined),
+        hasPass: /cron-submit-boundary.*PASS/.test(combined),
+        stdoutChars: stdout.length,
+        stderrChars: stderr.length,
+        homeExists: existsSync(iso) && readdirSync(iso).some((n) => n.startsWith('oc-cron-boundary-home-')),
+      },
+    }),
+  )
+  assert.ok(closed.code !== 0 || closed.signal)
+  assert.doesNotMatch(combined, /cron-submit-boundary.*PASS/)
+  assert.match(combined, /TAP version 13|C-481-submit|interrupted/)
+  const leftovers = existsSync(iso)
+    ? readdirSync(iso).filter((n) => n.startsWith('oc-cron-boundary-'))
+    : []
+  assert.deepEqual(leftovers, [])
 })
 
 test('official CLI with SOURCE still runs exact 12 candidate leaves (C-P1)', { timeout: 120_000 }, () => {

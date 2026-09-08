@@ -70,6 +70,21 @@ export type TapEval = {
   topLevelPoints: number
   summaryHits: Record<string, number>
   bailout: boolean
+  unclosedYaml: boolean
+  duplicatePointNumbers: string[]
+  failedSuites: number
+  skippedAny: number
+  todoAny: number
+  nestedPlanMismatches: string[]
+}
+
+function isTapStructural(line: string): boolean {
+  if (/^TAP version 13\s*$/.test(line)) return true
+  if (/^\s*Bail out!/i.test(line)) return true
+  if (/^( *)(not )?ok \d+ - /.test(line)) return true
+  if (/^( *)1\.\.\d+\s*$/.test(line)) return true
+  if (/^# (tests|pass|fail|cancelled|skipped|todo) \d+\s*$/.test(line)) return true
+  return false
 }
 
 export function parseNodeTestTap(tap: string): TapEval {
@@ -78,15 +93,38 @@ export function parseNodeTestTap(tap: string): TapEval {
   const rootPlans: number[] = []
   const summaryHits: Record<string, number> = {}
   const counts: TapCounts = {}
+  const duplicatePointNumbers: string[] = []
+  const nestedPlanMismatches: string[] = []
+  const openNumbers = new Map<number, number[]>()
   let headers = 0
   let topLevelPoints = 0
   let bailout = false
+  let unclosedYaml = false
+  let failedSuites = 0
+  let skippedAny = 0
+  let todoAny = 0
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!
     if (/^TAP version 13\s*$/.test(line)) headers += 1
-    if (/^Bail out!/i.test(line)) bailout = true
-    const planMatch = line.match(/^(\s*)1\.\.(\d+)\s*$/)
-    if (planMatch && planMatch[1] === '') rootPlans.push(Number(planMatch[2]))
+    if (/^\s*Bail out!/i.test(line)) bailout = true
+    const planMatch = line.match(/^( *)1\.\.(\d+)\s*$/)
+    if (planMatch) {
+      const indent = planMatch[1]!.length
+      const planned = Number(planMatch[2])
+      if (indent === 0) rootPlans.push(planned)
+      const seen = openNumbers.get(indent) ?? []
+      const unique = new Set(seen)
+      if (unique.size !== seen.length) {
+        duplicatePointNumbers.push(`indent ${indent}`)
+      }
+      if (seen.length !== planned) {
+        nestedPlanMismatches.push(`indent ${indent}: ${seen.length} points vs plan ${planned}`)
+      }
+      openNumbers.set(indent, [])
+      for (const deeper of [...openNumbers.keys()]) {
+        if (deeper > indent) openNumbers.set(deeper, [])
+      }
+    }
     const summary = line.match(/^# (tests|pass|fail|cancelled|skipped|todo) (\d+)\s*$/)
     if (summary) {
       const key = summary[1] as (typeof SUMMARY_KEYS)[number]
@@ -96,28 +134,64 @@ export function parseNodeTestTap(tap: string): TapEval {
     }
     const point = line.match(/^( *)(not )?ok (\d+) - (.*)$/)
     if (!point) continue
-    if (point[1] === '') topLevelPoints += 1
+    const indent = point[1]!.length
+    const num = Number(point[3])
+    if (indent === 0) topLevelPoints += 1
     const rest = point[4]!.trimEnd()
-    let skip = /\b#\s*SKIP\b/i.test(rest)
-    let todo = /\b#\s*TODO\b/i.test(rest)
+    let skip = /(?:^|\s)#\s*SKIP\b/i.test(rest)
+    let todo = /(?:^|\s)#\s*TODO\b/i.test(rest)
     const name = rest.replace(/\s+#\s*(SKIP|TODO)\b.*$/i, '').trim()
     let type = ''
-    let j = i + 1
-    if (lines[j]?.trim() === '---') {
-      j += 1
-      while (j < lines.length && lines[j]!.trim() !== '...') {
+    if (lines[i + 1]?.trim() === '---') {
+      let j = i + 2
+      let closed = false
+      while (j < lines.length) {
         const yaml = lines[j]!
+        if (yaml.trim() === '...') {
+          closed = true
+          break
+        }
+        if (isTapStructural(yaml)) {
+          unclosedYaml = true
+          break
+        }
         const typeMatch = yaml.match(/^\s*type:\s*'([^']+)'/)
         if (typeMatch) type = typeMatch[1]!
         if (/^\s*skip:\s*true\b/.test(yaml)) skip = true
         if (/^\s*todo:\s*true\b/.test(yaml)) todo = true
         j += 1
       }
+      if (!closed && i + 2 >= lines.length) unclosedYaml = true
+      if (!closed && j >= lines.length) unclosedYaml = true
     }
-    if (type === 'suite') continue
-    leaves.push({ name, ok: !point[2], skip, todo })
+    const ok = !point[2]
+    if (skip) skippedAny += 1
+    if (todo) todoAny += 1
+    const bucket = openNumbers.get(indent) ?? []
+    if (bucket.includes(num)) duplicatePointNumbers.push(`indent ${indent} #${num}`)
+    bucket.push(num)
+    openNumbers.set(indent, bucket)
+    if (type === 'suite') {
+      if (!ok || skip || todo) failedSuites += 1
+      continue
+    }
+    leaves.push({ name, ok, skip, todo })
   }
-  return { leaves, counts, headers, rootPlans, topLevelPoints, summaryHits, bailout }
+  return {
+    leaves,
+    counts,
+    headers,
+    rootPlans,
+    topLevelPoints,
+    summaryHits,
+    bailout,
+    unclosedYaml,
+    duplicatePointNumbers,
+    failedSuites,
+    skippedAny,
+    todoAny,
+    nestedPlanMismatches,
+  }
 }
 
 export function evaluateHeartbeatTap(
@@ -165,6 +239,12 @@ export function evaluateHeartbeatTap(
     rootPlan,
     topLevelPoints: parsed.topLevelPoints,
     bailout: parsed.bailout,
+    unclosedYaml: parsed.unclosedYaml,
+    duplicatePointNumbers: parsed.duplicatePointNumbers,
+    failedSuites: parsed.failedSuites,
+    skippedAny: parsed.skippedAny,
+    todoAny: parsed.todoAny,
+    nestedPlanMismatches: parsed.nestedPlanMismatches,
     summaryHits: parsed.summaryHits,
     leafCount: parsed.leaves.length,
     uniqueLeafCount: unique.size,
@@ -187,6 +267,16 @@ export function evaluateHeartbeatTap(
     problems.push(`root plan ${rootPlan} != top-level points ${parsed.topLevelPoints}`)
   }
   if (parsed.bailout) problems.push('bailout')
+  if (parsed.unclosedYaml) problems.push('unclosed yaml')
+  if (parsed.duplicatePointNumbers.length) {
+    problems.push(`duplicate point numbers ${parsed.duplicatePointNumbers.join(',')}`)
+  }
+  if (parsed.failedSuites) problems.push(`failed suites ${parsed.failedSuites}`)
+  if (parsed.skippedAny) problems.push(`skip/todo directive on ${parsed.skippedAny} result(s)`)
+  if (parsed.todoAny) problems.push(`todo directive on ${parsed.todoAny} result(s)`)
+  if (parsed.nestedPlanMismatches.length) {
+    problems.push(`plan mismatch ${parsed.nestedPlanMismatches.join(';')}`)
+  }
   for (const key of SUMMARY_KEYS) {
     const hits = parsed.summaryHits[key] ?? 0
     if (hits === 0) problems.push(`missing summary # ${key}`)
@@ -471,30 +561,17 @@ async function runOfficialBehavior(tree: string): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'oc-cron-boundary-home-'))
   const tmp = mkdtempSync(join(tmpdir(), 'oc-cron-boundary-tmp-'))
   let pgid: number | undefined
-  const onTerm = () => {
-    void (async () => {
-      try {
-        if (pgid) await stopProcessGroup(pgid)
-      } finally {
-        if (existsSync(home)) rmSync(home, { recursive: true, force: true })
-        if (existsSync(tmp)) rmSync(tmp, { recursive: true, force: true })
-        console.error('[cron-submit-boundary] behavior interrupted by SIGTERM')
-        process.exit(1)
-      }
-    })()
+  let interrupt: NodeJS.Signals | null = null
+  const requestStop = (sig: NodeJS.Signals) => {
+    interrupt = sig
+    if (pgid) {
+      void stopProcessGroup(pgid).catch(() => {
+        // drain finishes in the main supervise/finally path
+      })
+    }
   }
-  const onInt = () => {
-    void (async () => {
-      try {
-        if (pgid) await stopProcessGroup(pgid)
-      } finally {
-        if (existsSync(home)) rmSync(home, { recursive: true, force: true })
-        if (existsSync(tmp)) rmSync(tmp, { recursive: true, force: true })
-        console.error('[cron-submit-boundary] behavior interrupted by SIGINT')
-        process.exit(1)
-      }
-    })()
-  }
+  const onTerm = () => requestStop('SIGTERM')
+  const onInt = () => requestStop('SIGINT')
   process.on('SIGTERM', onTerm)
   process.on('SIGINT', onInt)
   try {
@@ -526,6 +603,11 @@ async function runOfficialBehavior(tree: string): Promise<void> {
     })
     process.stderr.write(child.stderr)
     process.stdout.write(child.stdout)
+    if (interrupt) {
+      console.error(`[cron-submit-boundary] behavior interrupted by ${interrupt}`)
+      process.exitCode = 1
+      return
+    }
     if (child.timedOut) {
       throw new Error(
         `[cron-submit-boundary] behavior timeout after ${timeoutMs}ms signal=${child.signal} code=${child.code}`,
@@ -535,6 +617,11 @@ async function runOfficialBehavior(tree: string): Promise<void> {
       code: child.code,
       signal: child.signal,
     })
+    if (interrupt) {
+      console.error(`[cron-submit-boundary] behavior interrupted by ${interrupt}`)
+      process.exitCode = 1
+      return
+    }
     console.log(
       JSON.stringify({
         contractId: 'C-cron-submit-boundary-behavior',
@@ -600,5 +687,12 @@ const invokedDirectly = (() => {
 })()
 
 if (invokedDirectly) {
-  await runOfficialCli()
+  if (process.env.OC_CRON_SUBMIT_BOUNDARY_BEHAVIOR_TEST) {
+    console.error(
+      '[cron-submit-boundary] official CLI refuses OC_CRON_SUBMIT_BOUNDARY_BEHAVIOR_TEST; parser/supervisor tests must call helpers',
+    )
+    process.exitCode = 1
+  } else {
+    await runOfficialCli()
+  }
 }
