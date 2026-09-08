@@ -806,7 +806,9 @@ export function TaskboardView({
               ]}
             />
           </div>
-          {visibleBacklogTickets.length === 0 ? (
+          {visibleBacklogTickets.length === 0 &&
+          board.backlogTickets.length === 0 &&
+          (board.backlogTotal ?? 0) <= board.backlogTickets.length ? (
             <EmptyState
               icon={Archive}
               title={board.backlogTickets.length === 0 ? '积压是空的' : '没有这类积压单'}
@@ -825,6 +827,9 @@ export function TaskboardView({
               onOpenTicket={openTicket}
               renderActions={(ticket) => renderActions(ticket, 'board')}
               hideFilters
+              total={board.backlogTotal}
+              onLoadMore={() => void board.loadMoreBacklog()}
+              loadingMore={board.backlogLoadingMore}
             />
           )}
         </div>

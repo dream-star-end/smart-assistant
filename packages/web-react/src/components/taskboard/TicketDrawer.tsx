@@ -104,6 +104,9 @@ export function TicketDrawer({
     if (timeline.length) setTimeline([])
     if (stageName) setStageName(null)
     if (comment) setComment('')
+    if (saving) setSaving(false)
+    if (commenting) setCommenting(false)
+    if (patrolling) setPatrolling(false)
     paintedOwnerRef.current = open ? ownerLookup : null
   }
   const current = belongsToOwner(detail) ? detail : belongsToOwner(ticket) ? ticket : null

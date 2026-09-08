@@ -8,7 +8,7 @@ import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
-import { clearDraft, isNewComposerDraftKey } from "../lib/composerDraft";
+import { clearDraft } from "../lib/composerDraft";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -52,9 +52,40 @@ function mediaKindOf(mime: string): MediaRef["kind"] {
 }
 
 const attachmentCache = new Map<string, Attach[]>();
+const attachmentMoves = new Map<string, string>();
+let attachEpoch = 0;
+let nextAttachId = 0;
+
+function resolveAttachOwner(owner: string | undefined): string | undefined {
+  if (!owner) return owner;
+  let cur = owner;
+  const seen = new Set<string>();
+  while (attachmentMoves.has(cur) && !seen.has(cur)) {
+    seen.add(cur);
+    cur = attachmentMoves.get(cur)!;
+  }
+  return cur;
+}
+
+/** Same-session identity promotion only. Ordinary session/account switches must not call this. */
+export function moveComposerAttachments(from: string, to: string): void {
+  if (!from || !to || from === to) return;
+  const moving = attachmentCache.get(from) ?? [];
+  const dest = attachmentCache.get(to) ?? [];
+  attachmentCache.set(to, dest.length ? [...dest, ...moving] : moving);
+  attachmentCache.delete(from);
+  attachmentMoves.set(from, to);
+}
 
 export function resetComposerAttachmentCache(): void {
+  for (const items of attachmentCache.values()) {
+    for (const a of items) {
+      if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+    }
+  }
   attachmentCache.clear();
+  attachmentMoves.clear();
+  attachEpoch += 1;
 }
 
 function clipboardImages(data: DataTransfer): File[] {
@@ -176,20 +207,19 @@ export function Composer({
     key: draftKey,
     items: draftKey ? (attachmentCache.get(draftKey) ?? []) : [],
   }));
-  if (attach.key !== draftKey) {
-    if (attach.key) attachmentCache.set(attach.key, attach.items);
-    let items = draftKey ? (attachmentCache.get(draftKey) ?? []) : [];
-    if (draftKey && items.length === 0 && isNewComposerDraftKey(attach.key) && attach.items.length > 0) {
-      items = attach.items;
-      if (attach.key) attachmentCache.delete(attach.key);
+  const attachEpochRef = useRef(attachEpoch);
+  if (attach.key !== draftKey || attachEpochRef.current !== attachEpoch) {
+    const cacheWasReset = attachEpochRef.current !== attachEpoch;
+    if (!cacheWasReset && attach.key && !attachmentMoves.has(attach.key)) {
+      attachmentCache.set(attach.key, attach.items);
     }
-    if (draftKey) attachmentCache.set(draftKey, items);
+    attachEpochRef.current = attachEpoch;
+    const items = draftKey && !cacheWasReset ? (attachmentCache.get(draftKey) ?? []) : [];
     setAttach({ key: draftKey, items });
   }
   const attachments = attach.items;
   const setAttachments = (next: SetStateAction<Attach[]>) => {
     setAttach((curr) => {
-      if (curr.key !== draftKey) return curr;
       const items = typeof next === "function" ? next(curr.items) : next;
       if (curr.key) attachmentCache.set(curr.key, items);
       return items === curr.items ? curr : { ...curr, items };
@@ -213,7 +243,6 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
   // 附件 file input 的稳定 id：供工具条回形针 <label htmlFor> 原生激活。
   const fileInputId = useId();
-  const idRef = useRef(0);
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
 
@@ -234,10 +263,18 @@ export function Composer({
       objectUrlsRef.current.delete(u);
     }
   }, []);
-  // 卸载：revoke 全部残留 object URL。
+  // 卸载：revoke 本实例创建且已不在模块 cache 里的 object URL（cache 跨 remount 仍有效）。
   useEffect(
     () => () => {
-      for (const u of objectUrlsRef.current) URL.revokeObjectURL(u);
+      const cached = new Set<string>();
+      for (const items of attachmentCache.values()) {
+        for (const a of items) {
+          if (a.previewUrl) cached.add(a.previewUrl);
+        }
+      }
+      for (const u of objectUrlsRef.current) {
+        if (!cached.has(u)) URL.revokeObjectURL(u);
+      }
       objectUrlsRef.current.clear();
     },
     [],
@@ -294,10 +331,12 @@ export function Composer({
 
   const removeAttach = useCallback(
     (id: string) => {
-      setAttachments((prev) => {
-        const hit = prev.find((x) => x.id === id);
+      setAttach((curr) => {
+        const hit = curr.items.find((x) => x.id === id);
         if (hit) revoke(hit.previewUrl);
-        return prev.filter((x) => x.id !== id);
+        const items = curr.items.filter((x) => x.id !== id);
+        if (curr.key) attachmentCache.set(curr.key, items);
+        return { ...curr, items };
       });
     },
     [revoke],
@@ -322,13 +361,14 @@ export function Composer({
     async (id: string, file: File, owner: string | undefined) => {
       if (!onUpload) return;
       const apply = (mapFn: (items: Attach[]) => Attach[]) => {
+        const target = resolveAttachOwner(owner);
         setAttach((curr) => {
-          if (curr.key === owner) {
+          if (curr.key === target || curr.key === owner) {
             const items = mapFn(curr.items);
-            if (owner) attachmentCache.set(owner, items);
+            if (curr.key) attachmentCache.set(curr.key, items);
             return { ...curr, items };
           }
-          if (owner) attachmentCache.set(owner, mapFn(attachmentCache.get(owner) ?? []));
+          if (target) attachmentCache.set(target, mapFn(attachmentCache.get(target) ?? []));
           return curr;
         });
       };
@@ -363,7 +403,7 @@ export function Composer({
     const dropped = picked.length - arr.length;
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     for (const file of arr) {
-      const id = `att-${idRef.current++}`;
+      const id = `att-${nextAttachId++}`;
       const kind = mediaKindOf(file.type);
       // 图片:选中即生成本地预览 URL（无需等上传完成，chip 立刻显缩略图、可点开看大图）。
       const previewUrl = kind === "image" ? makePreview(file) : undefined;

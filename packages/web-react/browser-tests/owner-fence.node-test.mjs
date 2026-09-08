@@ -7,9 +7,8 @@ import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.m
 
 const { build } = createRequire(import.meta.url)("esbuild");
 const { chromium } = createRequire(import.meta.url)("playwright-core");
-const prefix = "oc_v5_composer_draft:";
 
-test("Composer owner fence (real Chromium, no backend)", { timeout: 90_000 }, async (t) => {
+test("Composer owner fence (real Chromium, no backend)", { timeout: 120_000 }, async (t) => {
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL("./owner-fence-harness.tsx", import.meta.url))],
     bundle: true,
@@ -35,56 +34,104 @@ test("Composer owner fence (real Chromium, no backend)", { timeout: 90_000 }, as
       headless: true,
       args: ["--no-sandbox"],
     });
-    await t.test("A attachment does not send on B", async () => {
+    async function openPage() {
       const context = await browser.newContext();
+      const page = await context.newPage();
+      page.setDefaultTimeout(5000);
+      const errors = [];
+      page.on("pageerror", (error) => errors.push(error.message));
+      await page.goto(`http://127.0.0.1:${server.address().port}`);
+      await page.addScriptTag({ content: bundle.outputFiles[0].text });
+      return { context, page, errors };
+    }
+
+    await t.test("new attachments stay on new, not an existing other session", async () => {
+      const { context, page, errors } = await openPage();
       try {
-        const page = await context.newPage();
-        page.setDefaultTimeout(5000);
-        const errors = [];
-        page.on("pageerror", (error) => errors.push(error.message));
-        await page.goto(`http://127.0.0.1:${server.address().port}`);
-        await page.addScriptTag({ content: bundle.outputFiles[0].text });
-        const fileInput = page.locator('input[type=file]');
-        await fileInput.waitFor({ state: "attached" });
+        await page.getByRole("button", { name: "session new", exact: true }).click();
+        const fileInput = page.locator("input[type=file]");
         await fileInput.setInputFiles({
-          name: "A-private.txt",
+          name: "new-private.txt",
           mimeType: "text/plain",
           buffer: Buffer.from("private"),
         });
-        await page.getByText("A-private.txt").waitFor();
-        await page.getByRole("button", { name: "session B", exact: true }).click();
-        assert.equal(await page.getByText("A-private.txt").count(), 0);
-        await page.getByRole("textbox", { name: "消息输入框" }).fill("from B");
-        await page.getByRole("button", { name: "发送", exact: true }).click();
-        assert.equal(await page.getByTestId("sent").textContent(), "B:from B:");
-        await page.getByRole("button", { name: "session A", exact: true }).click();
-        assert.equal(await page.getByText("A-private.txt").count(), 1);
+        await page.getByText("new-private.txt").waitFor();
+        await page.getByRole("button", { name: "session existing-other", exact: true }).click();
+        assert.equal(await page.getByText("new-private.txt").count(), 0);
+        await page.getByRole("button", { name: "session new", exact: true }).click();
+        assert.equal(await page.getByText("new-private.txt").count(), 1);
         assert.deepEqual(errors, []);
       } finally {
         await context.close();
       }
     });
-    await t.test("unscoped new draft is not inherited by the next account", async () => {
-      const context = await browser.newContext();
+
+    await t.test("true materialize keeps attachments and finishes delayed upload", async () => {
+      const { context, page, errors } = await openPage();
       try {
-        const page = await context.newPage();
-        page.setDefaultTimeout(5000);
-        const errors = [];
-        page.on("pageerror", (error) => errors.push(error.message));
-        await page.goto(`http://127.0.0.1:${server.address().port}`);
-        await page.evaluate(({ prefix }) => {
-          sessionStorage.setItem(`${prefix}new`, "account-A private unsent draft");
-        }, { prefix });
-        await page.addScriptTag({ content: bundle.outputFiles[0].text });
-        const input = page.getByRole("textbox", { name: "消息输入框" });
-        await input.waitFor();
+        await page.getByRole("button", { name: "session new", exact: true }).click();
+        await page.getByRole("button", { name: "delay off" }).click();
+        const fileInput = page.locator("input[type=file]");
+        await fileInput.setInputFiles({
+          name: "late.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("late"),
+        });
+        await page.getByText("late.txt").waitFor();
+        await page.getByRole("button", { name: "materialize new" }).click();
+        assert.equal(await page.getByTestId("active").textContent(), "created");
+        await page.getByRole("button", { name: "finish upload" }).click();
+        await page.getByRole("textbox", { name: "消息输入框" }).fill("after materialize");
+        await page.getByRole("button", { name: "发送", exact: true }).click();
+        assert.equal(await page.getByTestId("sent").textContent(), "created:after materialize:/stub/late.txt");
+        assert.deepEqual(errors, []);
+      } finally {
+        await context.close();
+      }
+    });
+
+    await t.test("account switch does not inherit previous account attachments", async () => {
+      const { context, page, errors } = await openPage();
+      try {
+        await page.getByRole("button", { name: "session new", exact: true }).click();
+        const fileInput = page.locator("input[type=file]");
+        await fileInput.setInputFiles({
+          name: "account-private.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("private"),
+        });
+        await page.getByText("account-private.txt").waitFor();
         await page.getByRole("button", { name: "switch account" }).click();
-        assert.equal(await input.inputValue(), "");
         assert.equal(await page.getByTestId("account").textContent(), "user-b");
-        assert.equal(
-          await page.evaluate((key) => sessionStorage.getItem(key), `${prefix}new`),
-          null,
-        );
+        assert.equal(await page.getByText("account-private.txt").count(), 0);
+        assert.deepEqual(errors, []);
+      } finally {
+        await context.close();
+      }
+    });
+
+    await t.test("remove after switch only deletes the current session file", async () => {
+      const { context, page, errors } = await openPage();
+      try {
+        const fileInput = page.locator("input[type=file]");
+        await fileInput.setInputFiles({
+          name: "A-keep.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("a"),
+        });
+        await page.getByText("A-keep.txt").waitFor();
+        await page.getByRole("button", { name: "session B", exact: true }).click();
+        assert.equal(await page.getByText("A-keep.txt").count(), 0);
+        await fileInput.setInputFiles({
+          name: "B-drop.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("b"),
+        });
+        await page.getByText("B-drop.txt").waitFor();
+        await page.getByRole("button", { name: "移除 B-drop.txt" }).click();
+        assert.equal(await page.getByText("B-drop.txt").count(), 0);
+        await page.getByRole("button", { name: "session A", exact: true }).click();
+        assert.equal(await page.getByText("A-keep.txt").count(), 1);
         assert.deepEqual(errors, []);
       } finally {
         await context.close();

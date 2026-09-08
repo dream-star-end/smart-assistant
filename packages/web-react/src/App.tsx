@@ -14,7 +14,7 @@ import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
-import { Composer, resetComposerAttachmentCache } from "./components/Composer";
+import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import {
   ImageAnnotationEditor,
@@ -1207,6 +1207,7 @@ export function App() {
     // This is an identity promotion, not navigation to another conversation. Preserve
     // the unsent draft; normal send consumes/clears it in Composer instead.
     moveDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
+    moveComposerAttachments(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
     setActiveId(id);
     return id;
   }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
