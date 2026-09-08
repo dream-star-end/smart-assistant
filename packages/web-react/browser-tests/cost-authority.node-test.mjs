@@ -31,7 +31,7 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
     taskboardApi.getSettings=async()=>({maxConcurrentRuns:2,maxRunsPerDay:200,maxCostPerDayUsd:null,quietHoursStart:23,quietHoursEnd:8,circuitBreakerThreshold:3,maxStageLoops:5,maxRunsPerTick:2,patrolPaused:false,usage:{runsToday:1,costTodayUsd:0,activeRuns:0,unpricedRunsToday:1}});
     const auth={};
     const items=[true,false,null].map((flag,i)=>({kind:'run',createdAt:Date.now(),run:{id:'r'+i,stageId:'s',status:'succeeded',trigger:'manual',createdAt:Date.now(),durationMs:100,tokensIn:100,tokensOut:10,costUsd:i+1,costImprecise:flag}}));
-    function App(){const [mode,setMode]=useState('mixed');return <><nav>{Object.keys(cases).map(k=><button key={k} onClick={()=>setMode(k)}>{k}</button>)}</nav><CostCoverageBlock totals={cases[mode]}/><TicketTimeline items={items} loading={false} stageName='执行' stageById={new Map([['s','执行']])}/></>}
+    function App(){const [mode,setMode]=useState('mixed');return <><nav data-current-mode={mode}>{Object.keys(cases).map(k=><button key={k} onClick={()=>setMode(k)}>{k}</button>)}</nav><CostCoverageBlock totals={cases[mode]}/><TicketTimeline items={items} loading={false} stageName='执行' stageById={new Map([['s','执行']])}/></>}
     createRoot(document.getElementById('root')).render(<ToastProvider><TooltipProvider><App/><BoardSettingsPanel auth={auth}/></TooltipProvider></ToastProvider>);
   `;
   const bundle = await build({ stdin: { contents: source, resolveDir: repo, loader: 'tsx' },
@@ -73,6 +73,7 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
     assert.match(await money.textContent(), /未记录/);
     assert.doesNotMatch(await money.textContent(), /\$0/);
     await page.getByRole('button',{name:'legacy_unknown',exact:true}).click();
+    await page.waitForFunction(() => document.querySelector('nav')?.dataset.currentMode === 'legacy_unknown');
     await page.waitForFunction(() => document.querySelector('[data-testid="cost-coverage-money"]')?.textContent?.includes('未记录'));
     assert.doesNotMatch(await money.textContent(), /\$0/);
     await page.getByTestId('board-settings-open').click();
