@@ -130,7 +130,9 @@ function classifyShellDestructive(text, tokens) {
 }
 
 function hasShellMeta(command) {
-  return /[|&;`$<>()\n]/.test(command)
+  // Inspect the original command. LF, CRLF, and standalone CR are structural,
+  // not ordinary whitespace; they must be detected before collapse/trim.
+  return /[|&;`$<>()\n\r]/.test(command)
 }
 
 function tokenMatchesFlag(token, flag) {
@@ -152,9 +154,10 @@ function hasGitOutputRedirect(tokens) {
 }
 
 export function isReadonlyBash(command) {
-  const trimmed = String(command || '').replace(/\s+/g, ' ').trim()
+  const raw = String(command || '')
+  if (hasShellMeta(raw)) return false
+  const trimmed = raw.replace(/\s+/g, ' ').trim()
   if (!trimmed) return false
-  if (hasShellMeta(trimmed)) return false
   const tokens = tokenize(trimmed)
   const cmd = tokens[0].toLowerCase().replace(/\.exe$/i, '')
   if (cmd === 'git') {
