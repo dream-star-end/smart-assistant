@@ -128,6 +128,11 @@ CUTOVER_TUPLE_BUNDLE=""
 LEASE_TRAIN_ID=""
 LEASE_TARGET_SHA=""
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
+# Incident trailer 发布前快检(2026-09-09):selfhost 此前从不跑 trailer 门,坏 trailer 一律
+# 上线后才被 CI 发现,已上线源提交不可 amend,只能一次次冻结 tip(已冻 18 条)。这里在构建
+# 三面制品之前 fail-closed;规则与 check-v5-incident-regressions.ts 逐条对齐(有单测交叉对拍)。
+# 豁免只给真·止血:OC_V5_SKIP_TRAILER_GATE=1(会打 ⚠ 并写进 deploy 日志,不静默)。
+FIX_TRAILER_GATE="$SCRIPT_DIR/check-v5-fix-trailers.sh"
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -425,6 +430,9 @@ usage() {
   --lease-train=ID --target-sha=SHA
                         仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
                         人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
+  env OC_V5_SKIP_TRAILER_GATE=1
+                        仅配合 --deploy:跳过构建前的 Incident trailer 门(scripts/check-v5-fix-trailers.sh)。
+                        仅限止血;会打 ⚠ 留痕,CI check:v5:incidents 仍会红,事后必须补 waiver / 冻结 tip。
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
   --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
 
@@ -1935,6 +1943,34 @@ explain_dirty_semantics() {
   fi
 }
 
+# 发布前 Incident trailer 快检。放在 lease_train_begin 之后、构建之前:
+#   · 之后 —— 失败要经 EXIT trap 把本班 train 记 failed(worker 对同 target 不自动重发,
+#     不会像 0274 迁移门那样每 15min 烧一班);
+#   · 之前 —— 十几分钟的 vite/runtime/platform 构建一下都不跑,几秒内红。
+# 只查 HEAD 已提交历史(git show <sha>:path),工作区脏文件与 --allow-dirty 无关。
+assert_fix_trailers() {
+  local head="$1"
+  if [[ "${OC_V5_SKIP_TRAILER_GATE:-0}" == 1 ]]; then
+    log "  ⚠ OC_V5_SKIP_TRAILER_GATE=1:跳过 Incident trailer 门(仅限止血;CI check:v5:incidents 仍会红,事后必须补 waiver/冻结)"
+    return 0
+  fi
+  [[ -x "$FIX_TRAILER_GATE" ]] || die "缺 $FIX_TRAILER_GATE(或不可执行)。补救: git checkout -- scripts/check-v5-fix-trailers.sh;止血可 OC_V5_SKIP_TRAILER_GATE=1。"
+  log "── Incident trailer 门(HEAD=${head:0:12},构建前 fail-closed) ──"
+  local rc=0 out
+  out="$("$FIX_TRAILER_GATE" --repo "$REPO_ROOT" --head "$head" 2>&1)" || rc=$?
+  case "$rc" in
+    0) log "  ${out##*$'\n'}" ;;
+    2) log "  ⚠ trailer 门不可判(rc=2),放行但请人工核对:"; log "$out" ;;
+    *) die "Incident trailer 门拒绝发布(rc=$rc):
+$out
+补救:
+  在源提交 trailer 写 Incident: INC-YYYYMMDD-SLUG 并登记 e2e/session-display/incidents.json
+  或 Incident: none (<理由>) + e2e/session-display/incident-waivers.json
+  已上线不可改写的提交才走 check-v5-incident-regressions.ts 的 IMPORTED_TRAILER_HISTORY_TIPS
+  真·止血: OC_V5_SKIP_TRAILER_GATE=1 scripts/deploy-v5-selfhost.sh --deploy …(会留痕)" ;;
+  esac
+}
+
 cmd_deploy() {
   local sha dirty
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
@@ -1974,6 +2010,7 @@ $dirty
   ensure_model_authority
   sha="$(source_commit)"
   lease_train_begin "$sha"
+  assert_fix_trailers "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
   build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"

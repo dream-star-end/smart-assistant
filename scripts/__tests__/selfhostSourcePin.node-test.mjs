@@ -57,7 +57,7 @@ test('actual cmd_deploy passes captured A through lease master runtime payload e
  'preflight_common() { :; }; explain_dirty_semantics() { :; }; ensure_selfhost_env_keys() { :; }',
  'docker() { :; }; ensure_node_modules() { :; }; install_aux_units() { :; }; refresh_ccb_proxy_path() { :; }; ensure_model_authority() { :; }',
  'lease_train_begin() { echo "$1" > "$TEST_ROOT/lease"; git -C "$REPO_ROOT" checkout -q "$B"; }',
- 'lease_train_finish() { :; }; build_runtime_release() { echo "$1" > "$TEST_ROOT/runtime"; }',
+ 'assert_fix_trailers() { [[ "$1" == "$A" ]]; }; lease_train_finish() { :; }; build_runtime_release() { echo "$1" > "$TEST_ROOT/runtime"; }',
  'build_platform_bundle() { DRY=0; production_platform_bundle "$1"; DRY=1; }',
  'cmd_cutover() { cutover_expected_source_commit > "$TEST_ROOT/expected"; }','cmd_deploy; echo "$DEPLOY_BUILT_RELEASE"'].join('\n');
  assert.ok(ok(bash(f,source,body)).includes('rel-'+f.A.slice(0,9)+'-'));
