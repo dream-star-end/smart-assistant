@@ -14,7 +14,14 @@ const routes = source.slice(start, end > start ? end : start + 20_000)
 
 test('browser history uses one opaque unified timeline route', () => {
   assert.ok(start >= 0, 'client session route block not found')
-  assert.match(routes, /getClientSession\(sessId, userId, \{ view: 'timeline' \}\)/)
+  // Full GET still forces the opaque timeline view. OCV5-185 may add optional
+  // permissionLookupIds on the same options object, so the literal cannot stay
+  // a single-field `{ view: 'timeline' }` one-liner.
+  assert.match(
+    routes,
+    /getClientSession\(sessId, userId, \{[\s\S]*?view: 'timeline'[\s\S]*?permissionLookupIds[\s\S]*?\}\)/,
+  )
+  assert.match(routes, /parsePermissionLookupQuery\(url.searchParams.get\('permission_lookup'\)\)/)
   assert.match(routes, /getClientSessionPartial\(sessId, userId, sinceSeq, \{[\s\S]*?view: 'timeline',[\s\S]*?sinceHistoryRevision,[\s\S]*?\}\)/)
   assert.match(routes, /const timelineMatch = url\.pathname\.match/)
   assert.match(routes, /decodeClientTimelineCursor\(rawCursor\)/)
