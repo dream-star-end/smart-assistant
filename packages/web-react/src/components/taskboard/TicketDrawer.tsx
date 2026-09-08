@@ -86,8 +86,29 @@ export function TicketDrawer({
   const [commenting, setCommenting] = useState(false)
   const [patrolling, setPatrolling] = useState(false)
 
-  const current = detail ?? ticket
-  const lookup = current?.identifier ?? current?.id ?? ticketRef
+  const ownerLookup = ticketRef || ticket?.identifier || ticket?.id || null
+  const ownerGen = useRef(0)
+  const ownerLookupRef = useRef(ownerLookup)
+  const openRef = useRef(open)
+  if (ownerLookupRef.current !== ownerLookup) {
+    ownerGen.current += 1
+    ownerLookupRef.current = ownerLookup
+  }
+  if (openRef.current && !open) ownerGen.current += 1
+  openRef.current = open
+  const belongsToOwner = (row: Ticket | null | undefined) =>
+    !!row && !!ownerLookup && (row.id === ownerLookup || row.identifier === ownerLookup)
+  const paintedOwnerRef = useRef<string | null>(null)
+  if (paintedOwnerRef.current !== ownerLookup || (!open && paintedOwnerRef.current !== null)) {
+    if (detail) setDetail(null)
+    if (timeline.length) setTimeline([])
+    if (stageName) setStageName(null)
+    if (comment) setComment('')
+    paintedOwnerRef.current = open ? ownerLookup : null
+  }
+  const current = belongsToOwner(detail) ? detail : belongsToOwner(ticket) ? ticket : null
+  const lookup = ownerLookup
+  const editingRef = useRef(false)
 
   const stageById = useMemo(() => {
     const map = new Map<string, string>()
@@ -104,6 +125,7 @@ export function TicketDrawer({
     setDraftAssignee(src.assignee ?? '')
     setEditing(true)
   }, [])
+  editingRef.current = editing
 
   // 只在 ticket.id 变化时重跑；父级轮询换了同一张单的对象引用时不能重置草稿。
   const latestTicketRef = useRef(ticket)
@@ -120,29 +142,31 @@ export function TicketDrawer({
     else setEditing(false)
   }, [beginEdit, open, startEditing, ticket?.id])
 
-  // ticket.version 是「同一 lookup 被外部写入后重新拉详情」的触发器，effect 体只按 lookup 请求。
+  // ticket.version 是「同一 owner 被外部写入后重新拉详情」的触发器；身份只看显式 ownerLookup。
   // biome-ignore lint/correctness/useExhaustiveDependencies: ticket.version 是 refetch 触发器，删掉会少拉详情
   useEffect(() => {
     if (!open || !lookup) return
+    const gen = ownerGen.current
+    const requested = lookup
     let cancelled = false
     setLoading(true)
     const load = async () => {
       try {
         const [fresh, runs] = await Promise.all([
-          taskboardApi.getTicketDetail(auth, lookup),
-          taskboardApi.listRuns(auth, lookup),
+          taskboardApi.getTicketDetail(auth, requested),
+          taskboardApi.listRuns(auth, requested),
         ])
-        if (cancelled) return
+        if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
         setDetail(fresh.ticket)
         setStageName(fresh.stage?.name ?? null)
         let items: TimelineItem[]
         try {
-          items = await taskboardApi.listTimeline(auth, lookup)
+          items = await taskboardApi.listTimeline(auth, requested)
         } catch (e) {
           if (e instanceof AuthEpochStaleError) return
           const [comments, activities] = await Promise.all([
-            taskboardApi.listComments(auth, lookup).catch(() => [] as TicketComment[]),
-            taskboardApi.listActivity(auth, lookup).catch(() => []),
+            taskboardApi.listComments(auth, requested).catch(() => [] as TicketComment[]),
+            taskboardApi.listActivity(auth, requested).catch(() => []),
           ])
           items = mergeTimelineSources({
             activities,
@@ -150,13 +174,13 @@ export function TicketDrawer({
             comments,
           })
         }
-        if (cancelled) return
+        if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
         setTimeline(sortTimelineAsc(items))
       } catch (e) {
-        if (e instanceof AuthEpochStaleError || cancelled) return
+        if (e instanceof AuthEpochStaleError || cancelled || ownerGen.current !== gen) return
         toast(taskboardErrorMessage(e, '加载单据详情失败'), 'error')
       } finally {
-        if (!cancelled) setLoading(false)
+        if (!cancelled && ownerGen.current === gen) setLoading(false)
       }
     }
     void load()
@@ -165,7 +189,7 @@ export function TicketDrawer({
     }
   }, [auth, lookup, open, ticket?.version, toast])
 
-  const refreshAfterWrite = async (idOrIdent: string) => {
+  const refreshAfterWrite = async (idOrIdent: string, gen: number) => {
     try {
       const [fresh, items] = await Promise.all([
         taskboardApi.getTicketDetail(auth, idOrIdent),
@@ -182,6 +206,9 @@ export function TicketDrawer({
           })
         }),
       ])
+      if (ownerGen.current !== gen) return
+      const owner = ownerLookupRef.current
+      if (owner && fresh.ticket.id !== owner && fresh.ticket.identifier !== owner) return
       setDetail(fresh.ticket)
       setStageName(fresh.stage?.name ?? null)
       setTimeline(sortTimelineAsc(items))
@@ -194,6 +221,7 @@ export function TicketDrawer({
 
   const saveEdit = async () => {
     if (!current) return
+    const gen = ownerGen.current
     const title = draftTitle.trim()
     if (!title) {
       toast('请填写标题', 'error')
@@ -208,28 +236,30 @@ export function TicketDrawer({
         priority: draftPriority,
         assignee: draftAssignee || null,
       })
+      if (ownerGen.current !== gen) return
       setDetail(out.ticket)
       onTicketUpdated(out.ticket)
       setEditing(false)
       toast('已更新需求', 'success')
       void onReconcile()
-      void refreshAfterWrite(out.ticket.identifier)
+      void refreshAfterWrite(out.ticket.identifier, gen)
     } catch (e) {
-      if (e instanceof AuthEpochStaleError) return
+      if (e instanceof AuthEpochStaleError || ownerGen.current !== gen) return
       if (isVersionConflict(e)) {
         toast(taskboardErrorMessage(e, '单据已被更新，已刷新'), 'error')
         void onReconcile()
-        void refreshAfterWrite(current.identifier)
+        void refreshAfterWrite(current.identifier, gen)
         return
       }
       toast(taskboardErrorMessage(e, '保存需求失败'), 'error')
     } finally {
-      setSaving(false)
+      if (ownerGen.current === gen) setSaving(false)
     }
   }
 
   const submitComment = async () => {
     if (!current) return
+    const gen = ownerGen.current
     const body = comment.trim()
     if (!body) {
       toast('请填写评论', 'error')
@@ -252,6 +282,7 @@ export function TicketDrawer({
     ])
     try {
       const out = await taskboardApi.comment(auth, current.id, { body })
+      if (ownerGen.current !== gen) return
       setTimeline((cur) =>
         cur.map((item) =>
           item.kind === 'comment' && item.comment.id === optimistic.id
@@ -260,38 +291,40 @@ export function TicketDrawer({
         ),
       )
     } catch (e) {
-      if (e instanceof AuthEpochStaleError) return
+      if (e instanceof AuthEpochStaleError || ownerGen.current !== gen) return
       setTimeline((cur) =>
         cur.filter((item) => !(item.kind === 'comment' && item.comment.id === optimistic.id)),
       )
       setComment(body)
       toast(taskboardErrorMessage(e, '发表评论失败'), 'error')
     } finally {
-      setCommenting(false)
+      if (ownerGen.current === gen) setCommenting(false)
     }
   }
 
   const runPatrol = async () => {
     if (!current) return
+    const gen = ownerGen.current
     setPatrolling(true)
     try {
       const out = await taskboardApi.patrol(auth, current.id, current.version)
+      if (ownerGen.current !== gen) return
       setDetail(out.ticket)
       onTicketUpdated(out.ticket)
       toast('已开始巡检', 'success')
       void onReconcile()
-      void refreshAfterWrite(out.ticket.identifier)
+      void refreshAfterWrite(out.ticket.identifier, gen)
     } catch (e) {
-      if (e instanceof AuthEpochStaleError) return
+      if (e instanceof AuthEpochStaleError || ownerGen.current !== gen) return
       if (isVersionConflict(e)) {
         toast(taskboardErrorMessage(e, '单据已被更新，已刷新'), 'error')
         void onReconcile()
-        void refreshAfterWrite(current.identifier)
+        void refreshAfterWrite(current.identifier, gen)
         return
       }
       toast(taskboardErrorMessage(e, '启动巡检失败'), 'error')
     } finally {
-      setPatrolling(false)
+      if (ownerGen.current === gen) setPatrolling(false)
     }
   }
 

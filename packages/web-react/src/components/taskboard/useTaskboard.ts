@@ -26,6 +26,7 @@ import type { AuthSession } from '../../lib/types'
 import { useToast } from '../ui'
 
 const POLL_MS = 60_000
+const LIST_PAGE_SIZE = 200
 
 export type TicketAction =
   | { kind: 'ready' }
@@ -70,6 +71,9 @@ export function useTaskboard(
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<string[]>([])
+  const [listTotal, setListTotal] = useState(0)
+  const [listLoadingMore, setListLoadingMore] = useState(false)
+  const [createBusy, setCreateBusy] = useState(false)
 
   const authRef = useRef(auth)
   authRef.current = auth
@@ -77,11 +81,41 @@ export function useTaskboard(
   listQueryRef.current = listQuery
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
+  const ticketsRef = useRef(tickets)
+  ticketsRef.current = tickets
   const ticketTypeRef = useRef(ticketType)
   ticketTypeRef.current = ticketType
   const explicitType = useRef(!!ticketTypeFromUrl)
   const mounted = useRef(true)
   const epoch = useRef(0)
+  const createInFlight = useRef(false)
+  const loadMoreInFlight = useRef(false)
+
+  const scopedQuery = useCallback(
+    (extra?: Partial<TicketListQuery>): TicketListQuery => {
+      const pid = extra?.projectId || lockedProjectId || projectIdRef.current || undefined
+      return {
+        ...listQueryRef.current,
+        ...extra,
+        limit: extra?.limit ?? LIST_PAGE_SIZE,
+        offset: extra?.offset ?? 0,
+        ...(pid ? { projectId: pid } : {}),
+      }
+    },
+    [lockedProjectId],
+  )
+
+  const applyListPage = useCallback((items: Ticket[], total: number, append: boolean) => {
+    setListTotal(total)
+    if (append) {
+      setTickets((cur) => {
+        const have = new Set((cur ?? []).map((t) => t.id))
+        return [...(cur ?? []), ...items.filter((t) => !have.has(t.id))]
+      })
+    } else {
+      setTickets(items)
+    }
+  }, [])
 
   useEffect(() => {
     mounted.current = true
@@ -204,7 +238,7 @@ export function useTaskboard(
     const page = await taskboardApi.listTickets(a, {
       projectId: pid,
       status: 'backlog',
-      limit: 200,
+      limit: LIST_PAGE_SIZE,
     })
     return page.items
   }, [])
@@ -213,20 +247,23 @@ export function useTaskboard(
     const a = authRef.current
     if (!a) return
     const ticket = (epoch.current += 1)
+    const scope = lockedProjectId || projectIdRef.current
+    const query = scopedQuery({ offset: 0 })
     try {
       const [freshProjects, freshList, freshAgents] = await Promise.all([
         taskboardApi.listProjects(a),
-        taskboardApi.listTickets(a, { ...listQueryRef.current, limit: 200 }),
+        taskboardApi.listTickets(a, query),
         taskboardApi.listAgents(a).catch(() => [] as BoardAgent[]),
       ])
       if (!mounted.current || epoch.current !== ticket) return
+      if ((lockedProjectId || projectIdRef.current) !== scope) return
       setProjects(freshProjects)
-      setTickets(freshList.items)
+      applyListPage(freshList.items, freshList.total, false)
       setAgents(freshAgents)
       if (freshProjects.length && !projectIdRef.current) {
         setProjectId(freshProjects[0].id)
       }
-      const pid = projectIdRef.current || freshProjects[0]?.id
+      const pid = lockedProjectId || projectIdRef.current || freshProjects[0]?.id
       if (pid) {
         const [snap, backlog] = await Promise.all([
           taskboardApi.getProjectBoard(a, pid, boardQueryType()),
@@ -241,7 +278,7 @@ export function useTaskboard(
       if (e instanceof AuthEpochStaleError) return
       /* 后台对账失败静默，保留乐观值 */
     }
-  }, [applyBoardSnap, boardQueryType, fetchBacklog])
+  }, [applyBoardSnap, applyListPage, boardQueryType, fetchBacklog, lockedProjectId, scopedQuery])
 
   const loadInitial = useCallback(async () => {
     const a = authRef.current
@@ -262,25 +299,24 @@ export function useTaskboard(
         : null
       if (!first) {
         setTickets([])
+        setListTotal(0)
         setProjectId(null)
         setBoard(null)
         return
       }
       setProjectId(first.id)
+      projectIdRef.current = first.id
       writeLastProjectId(first.id)
       try {
         const queryType = boardQueryType()
+        const scope = first.id
         const [snap, backlog, freshList] = await Promise.all([
           taskboardApi.getProjectBoard(a, first.id, queryType),
           fetchBacklog(a, first.id).catch(() => [] as Ticket[]),
-          taskboardApi.listTickets(a, {
-            status: ACTIVE_LIST_STATUSES,
-            limit: 200,
-            projectId: first.id,
-          }),
+          taskboardApi.listTickets(a, scopedQuery({ projectId: first.id, offset: 0 })),
         ])
-        if (mounted.current) {
-          setTickets(freshList.items)
+        if (mounted.current && (lockedProjectId || projectIdRef.current) === scope) {
+          applyListPage(freshList.items, freshList.total, false)
           applyBoardSnap(snap)
           setBacklogTickets(backlog)
         }
@@ -296,12 +332,13 @@ export function useTaskboard(
     } finally {
       if (mounted.current) setLoading(false)
     }
-  }, [applyBoardSnap, boardQueryType, fetchBacklog, lockedProjectId])
+  }, [applyBoardSnap, applyListPage, boardQueryType, fetchBacklog, lockedProjectId, scopedQuery])
 
   useEffect(() => {
     if (!enabled || !auth) {
       epoch.current += 1
       setTickets(null)
+      setListTotal(0)
       setProjects(null)
       setBoard(null)
       setBacklogTickets([])
@@ -341,22 +378,25 @@ export function useTaskboard(
       const a = authRef.current
       if (!a) return
       const gate = (epoch.current += 1)
+      const scope = id
       try {
         const queryType = type !== undefined ? type || undefined : boardQueryType()
-        const [snap, backlog] = await Promise.all([
+        const [snap, backlog, freshList] = await Promise.all([
           taskboardApi.getProjectBoard(a, id, queryType),
           fetchBacklog(a, id).catch(() => [] as Ticket[]),
+          taskboardApi.listTickets(a, scopedQuery({ projectId: id, offset: 0 })),
         ])
-        if (mounted.current && epoch.current === gate) {
+        if (mounted.current && epoch.current === gate && projectIdRef.current === scope) {
           applyBoardSnap(snap)
           setBacklogTickets(backlog)
+          applyListPage(freshList.items, freshList.total, false)
         }
       } catch (e) {
         if (e instanceof AuthEpochStaleError) return
         toast(taskboardErrorMessage(e, '加载看板失败'), 'error')
       }
     },
-    [applyBoardSnap, boardQueryType, fetchBacklog, toast],
+    [applyBoardSnap, applyListPage, boardQueryType, fetchBacklog, scopedQuery, toast],
   )
 
   const selectTicketType = useCallback(
@@ -382,19 +422,46 @@ export function useTaskboard(
   const applyListQuery = useCallback(
     async (next: TicketListQuery) => {
       setListQuery(next)
+      listQueryRef.current = next
       const a = authRef.current
       if (!a) return
       const gate = (epoch.current += 1)
+      const scope = lockedProjectId || projectIdRef.current
       try {
-        const fresh = await taskboardApi.listTickets(a, { ...next, limit: 200 })
-        if (mounted.current && epoch.current === gate) setTickets(fresh.items)
+        const fresh = await taskboardApi.listTickets(a, scopedQuery({ ...next, offset: 0 }))
+        if (!mounted.current || epoch.current !== gate) return
+        if ((lockedProjectId || projectIdRef.current) !== scope) return
+        applyListPage(fresh.items, fresh.total, false)
       } catch (e) {
         if (e instanceof AuthEpochStaleError) return
         toast(taskboardErrorMessage(e, '筛选单据失败'), 'error')
       }
     },
-    [toast],
+    [applyListPage, lockedProjectId, scopedQuery, toast],
   )
+
+  const loadMoreTickets = useCallback(async () => {
+    const a = authRef.current
+    if (!a || loadMoreInFlight.current) return
+    const scope = lockedProjectId || projectIdRef.current
+    const offset = ticketsRef.current?.length ?? 0
+    if (offset === 0) return
+    loadMoreInFlight.current = true
+    setListLoadingMore(true)
+    const gate = (epoch.current += 1)
+    try {
+      const fresh = await taskboardApi.listTickets(a, scopedQuery({ offset }))
+      if (!mounted.current || epoch.current !== gate) return
+      if ((lockedProjectId || projectIdRef.current) !== scope) return
+      applyListPage(fresh.items, fresh.total, true)
+    } catch (e) {
+      if (e instanceof AuthEpochStaleError) return
+      toast(taskboardErrorMessage(e, '加载更多单据失败'), 'error')
+    } finally {
+      loadMoreInFlight.current = false
+      if (mounted.current) setListLoadingMore(false)
+    }
+  }, [applyListPage, lockedProjectId, scopedQuery, toast])
 
   const upsertProject = useCallback((fresh: Project) => {
     setProjects((cur) => {
@@ -497,7 +564,9 @@ export function useTaskboard(
   const createTicket = useCallback(
     async (input: TicketCreateInput) => {
       const a = authRef.current
-      if (!a) return null
+      if (!a || createInFlight.current) return null
+      createInFlight.current = true
+      setCreateBusy(true)
       try {
         const out = await taskboardApi.createTicket(a, input)
         commitTickets((cur) => (cur ? [out.ticket, ...cur] : [out.ticket]))
@@ -511,6 +580,9 @@ export function useTaskboard(
         if (e instanceof AuthEpochStaleError) return null
         toast(taskboardErrorMessage(e, '创建单据失败'), 'error')
         return null
+      } finally {
+        createInFlight.current = false
+        if (mounted.current) setCreateBusy(false)
       }
     },
     [commitTickets, reconcile, toast],
@@ -633,6 +705,9 @@ export function useTaskboard(
     projectId,
     ticketType,
     listQuery,
+    listTotal,
+    listLoadingMore,
+    createBusy,
     loading,
     error,
     pending,
@@ -642,6 +717,7 @@ export function useTaskboard(
     selectTicketType,
     setTicketType,
     applyListQuery,
+    loadMoreTickets,
     createProject,
     patchProject,
     archiveProject,

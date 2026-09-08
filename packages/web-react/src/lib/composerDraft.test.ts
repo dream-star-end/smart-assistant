@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { clearDraft, moveDraft, readDraft, writeDraft } from "./composerDraft";
+import {
+  accountDraftKey,
+  clearDraft,
+  moveDraft,
+  NEW_COMPOSER_DRAFT_KEY,
+  readDraft,
+  teardownComposerDrafts,
+  writeDraft,
+} from "./composerDraft";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -55,5 +63,27 @@ describe("composerDraft", () => {
     expect(readDraft("s1")).toBe("");
     moveDraft("s2", "s2");
     expect(readDraft("s2")).toBe(text);
+  });
+
+  test("accountDraftKey namespaces session keys and leaves demo keys unscoped", () => {
+    expect(accountDraftKey("new", "user-a")).toBe("user-a:new");
+    expect(accountDraftKey("s1", "user-a")).toBe("user-a:s1");
+    expect(accountDraftKey("new", null)).toBe("new");
+    expect(accountDraftKey("new", "  ")).toBe("new");
+  });
+
+  test("teardown drops this account and unscoped new, never migrates leftover new", () => {
+    writeDraft(NEW_COMPOSER_DRAFT_KEY, "account-A private unsent draft");
+    writeDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"), "A scoped");
+    writeDraft(accountDraftKey("s1", "user-a"), "A session");
+    const huge = "x".repeat(20 * 1024 + 1);
+    writeDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"), huge);
+    teardownComposerDrafts("user-a");
+    expect(readDraft(NEW_COMPOSER_DRAFT_KEY)).toBe("");
+    expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"))).toBe("");
+    expect(readDraft(accountDraftKey("s1", "user-a"))).toBe("");
+    writeDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-b"), "");
+    expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-b"))).toBe("");
+    expect(readDraft(NEW_COMPOSER_DRAFT_KEY)).toBe("");
   });
 });

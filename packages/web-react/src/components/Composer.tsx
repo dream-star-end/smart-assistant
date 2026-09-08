@@ -3,12 +3,12 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
-import { clearDraft } from "../lib/composerDraft";
+import { clearDraft, isNewComposerDraftKey } from "../lib/composerDraft";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -49,6 +49,12 @@ function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("audio/")) return "audio";
   if (mime.startsWith("video/")) return "video";
   return "file";
+}
+
+const attachmentCache = new Map<string, Attach[]>();
+
+export function resetComposerAttachmentCache(): void {
+  attachmentCache.clear();
 }
 
 function clipboardImages(data: DataTransfer): File[] {
@@ -166,7 +172,29 @@ export function Composer({
       typeof window.matchMedia === "function" &&
       window.matchMedia("(pointer: coarse)").matches,
   );
-  const [attachments, setAttachments] = useState<Attach[]>([]);
+  const [attach, setAttach] = useState<{ key: string | undefined; items: Attach[] }>(() => ({
+    key: draftKey,
+    items: draftKey ? (attachmentCache.get(draftKey) ?? []) : [],
+  }));
+  if (attach.key !== draftKey) {
+    if (attach.key) attachmentCache.set(attach.key, attach.items);
+    let items = draftKey ? (attachmentCache.get(draftKey) ?? []) : [];
+    if (draftKey && items.length === 0 && isNewComposerDraftKey(attach.key) && attach.items.length > 0) {
+      items = attach.items;
+      if (attach.key) attachmentCache.delete(attach.key);
+    }
+    if (draftKey) attachmentCache.set(draftKey, items);
+    setAttach({ key: draftKey, items });
+  }
+  const attachments = attach.items;
+  const setAttachments = (next: SetStateAction<Attach[]>) => {
+    setAttach((curr) => {
+      if (curr.key !== draftKey) return curr;
+      const items = typeof next === "function" ? next(curr.items) : next;
+      if (curr.key) attachmentCache.set(curr.key, items);
+      return items === curr.items ? curr : { ...curr, items };
+    });
+  };
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   // 目标对话框开合:入口从会话头部迁至「+」菜单后,由 Composer 持有开合态(菜单项触发打开)。
   const [goalOpen, setGoalOpen] = useState(false);
@@ -291,16 +319,27 @@ export function Composer({
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
   // 复用原 File 对象，重试无需重选文件；成功后携带 media，供 doneMedia 汇总发送。
   const uploadOne = useCallback(
-    async (id: string, file: File) => {
+    async (id: string, file: File, owner: string | undefined) => {
       if (!onUpload) return;
-      setAttachments((prev) =>
+      const apply = (mapFn: (items: Attach[]) => Attach[]) => {
+        setAttach((curr) => {
+          if (curr.key === owner) {
+            const items = mapFn(curr.items);
+            if (owner) attachmentCache.set(owner, items);
+            return { ...curr, items };
+          }
+          if (owner) attachmentCache.set(owner, mapFn(attachmentCache.get(owner) ?? []));
+          return curr;
+        });
+      };
+      apply((prev) =>
         prev.map((a) => (a.id === id ? { ...a, status: "uploading", error: undefined } : a)),
       );
       try {
         const media = await onUpload(file);
-        setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
+        apply((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
       } catch (e) {
-        setAttachments((prev) =>
+        apply((prev) =>
           prev.map((a) => (a.id === id ? { ...a, status: "error", error: apiErrorMessage(e, "上传失败") } : a)),
         );
       }
@@ -333,7 +372,7 @@ export function Composer({
         ...prev,
         { id, name: file.name, size: file.size, kind, status: "uploading", previewUrl, file },
       ]);
-      void uploadOne(id, file);
+      void uploadOne(id, file, draftKey);
     }
   };
 
@@ -445,7 +484,9 @@ export function Composer({
                     : undefined
                 }
                 onRetry={
-                  a.status === "error" && a.file ? () => void uploadOne(a.id, a.file as File) : undefined
+                  a.status === "error" && a.file
+                    ? () => void uploadOne(a.id, a.file as File, draftKey)
+                    : undefined
                 }
                 onAnnotate={
                   a.kind === "image" && a.previewUrl && a.status === "done" && annotate

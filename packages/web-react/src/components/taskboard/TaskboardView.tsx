@@ -418,6 +418,7 @@ export function TaskboardView({
   }, [backlogTypeFilter, board.backlogTickets])
 
   const submitCreate = async () => {
+    if (board.createBusy) return
     const title = draftTitle.trim()
     if (!title) {
       toast('请填写标题', 'error')
@@ -494,7 +495,7 @@ export function TaskboardView({
         value={draftTitle}
         onChange={(e) => setDraftTitle(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') void submitCreate()
+          if (e.key === 'Enter' && !board.createBusy) void submitCreate()
         }}
       />
       <textarea
@@ -544,10 +545,13 @@ export function TaskboardView({
           type="button"
           size="sm"
           aria-label="创建"
+          data-testid="ticket-create-submit"
           className={mobile ? 'flex-1' : undefined}
+          loading={board.createBusy}
+          disabled={board.createBusy}
           onClick={() => void submitCreate()}
         >
-          创建单据
+          {board.createBusy ? '创建中…' : '创建单据'}
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={() => setCreating(false)}>
           取消
@@ -783,6 +787,9 @@ export function TaskboardView({
           onQueryChange={(q) => void board.applyListQuery(q)}
           onOpenTicket={openTicket}
           renderActions={(ticket) => renderActions(ticket, 'board')}
+          total={board.listTotal}
+          onLoadMore={() => void board.loadMoreTickets()}
+          loadingMore={board.listLoadingMore}
         />
       ) : view === 'backlog' ? (
         <div className="flex min-h-0 flex-1 flex-col">
