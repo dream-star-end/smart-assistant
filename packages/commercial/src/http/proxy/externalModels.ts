@@ -135,7 +135,7 @@ export function makeExternalModelsHandler(deps: ExternalModelsHandlerDeps): Exte
       identity = await deps.resolveIdentity(req);
     } catch (err) {
       if (err instanceof IdentityError) {
-        log?.warn("external_models_identity_failed", { errcode: err.code });
+        log?.warn("external_models_identity_failed", { errcode: err.code, detail: err.message });
         // Same generic text as /v1/messages so the two endpoints leak nothing
         // about *why* a key was refused (anti-enumeration).
         sendJsonError(res, 401, "UNAUTHORIZED", "container identity verification failed", requestId);

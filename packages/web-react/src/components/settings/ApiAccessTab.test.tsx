@@ -44,7 +44,12 @@ vi.mock("../../lib/api", () => {
 import { api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import { ApiAccessTab, ApiKeyUsagePanel } from "./ApiAccessTab";
-import { buildCcSwitchDeepLink, limitPercent, pickDefaultModel } from "./ApiKeysSection";
+import {
+  buildCcSwitchDeepLink,
+  buildCcSwitchUsageScript,
+  limitPercent,
+  pickDefaultModel,
+} from "./ApiKeysSection";
 
 const COMPLETE_KEY = `oc-cc.abcd1234.${"a1".repeat(24)}`;
 
@@ -232,6 +237,68 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
     expect(p.get("haikuModel")).toBe("gemini-3.8-flash-low");
     expect(p.get("apiKey")).toBe(COMPLETE_KEY);
     expect(withKey).not.toMatch(/cursor/i);
+    // 导入后立即切换为当前供应商:不带 enabled=true 时 CC Switch 只加进列表,
+    // settings.json 仍指向旧供应商/旧密钥 → 本地 Claude Code 401(OCV5-171 后续)。
+    expect(p.get("enabled")).toBe("true");
+    // 用量查询随深链一并开启:脚本 base64(CC Switch decode_base64_param 接受标准/URL-safe)。
+    expect(p.get("usageEnabled")).toBe("true");
+    expect(p.get("usageAutoInterval")).toBe("30");
+    const script = new TextDecoder().decode(
+      Uint8Array.from(atob(p.get("usageScript")!), (c) => c.charCodeAt(0)),
+    );
+    expect(script).toBe(buildCcSwitchUsageScript());
+  });
+
+  test("CC Switch 用量脚本:请求 {{baseUrl}}/v1/usage,extractor 把余额/上限映射成 remaining/used/total", () => {
+    const script = buildCcSwitchUsageScript();
+    expect(script).toContain('"{{baseUrl}}/v1/usage"');
+    expect(script).toContain('"Bearer {{apiKey}}"');
+    expect(script).not.toMatch(/cursor/i);
+    // 与 CC Switch 一样:替换模板变量后 eval 得到 { request, extractor }。
+    const cfg = new Function(
+      `return ${script
+        .replace(/\{\{baseUrl\}\}/g, "https://x.example/api/anthropic")
+        .replace(/\{\{apiKey\}\}/g, COMPLETE_KEY)};`,
+    )() as {
+      request: { url: string; method: string; headers: Record<string, string> };
+      extractor: (r: unknown) => Record<string, unknown>;
+    };
+    expect(cfg.request.url).toBe("https://x.example/api/anthropic/v1/usage");
+    expect(cfg.request.method).toBe("GET");
+    expect(cfg.request.headers.Authorization).toBe(`Bearer ${COMPLETE_KEY}`);
+    const noLimit = cfg.extractor({
+      object: "usage",
+      unit: "credits",
+      balance: { spendable: "12345" },
+      key: { label: "MacBook", spent_credits: "200", credit_limit: null, is_valid: true },
+      window: { range: "30d", requests: "12" },
+    });
+    expect(noLimit).toMatchObject({
+      isValid: true,
+      planName: "MacBook",
+      remaining: 12345,
+      used: 200,
+      total: -1,
+      unit: "积分",
+      extra: "近 30 天 12 次请求",
+    });
+    const withLimit = cfg.extractor({
+      object: "usage",
+      balance: { spendable: "99999" },
+      key: { label: "k", spent_credits: "900", credit_limit: "1000", is_valid: true },
+      window: {},
+    });
+    expect(withLimit).toMatchObject({ remaining: 100, used: 900, total: 1000 });
+    const exhausted = cfg.extractor({
+      object: "usage",
+      balance: { spendable: "0" },
+      key: { label: "k", spent_credits: "0", credit_limit: null, is_valid: false },
+      window: {},
+    });
+    expect(exhausted.isValid).toBe(false);
+    expect(exhausted.invalidMessage).toMatch(/余额不足|上限/);
+    const denied = cfg.extractor({ error: { code: "UNAUTHORIZED", message: "container identity verification failed" } });
+    expect(denied).toEqual({ isValid: false, invalidMessage: "container identity verification failed" });
   });
 });
 
@@ -249,6 +316,33 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     expect(screen.getByRole("switch", { name: "启用该密钥" })).not.toBeChecked();
     expect(screen.getByText(/用 CC Switch 一键接入/)).toBeInTheDocument();
     expect(screen.getByText(/手动接入本地 Claude Code/)).toBeInTheDocument();
+    // 2026-09-08:用量查询教程 + 401 / Auth conflict 排查。
+    const usageGuide = screen.getByTestId("guide-usage");
+    expect(within(usageGuide).getByText(/在 CC Switch 里查看余额与用量/)).toBeInTheDocument();
+    expect(
+      within(usageGuide).getAllByText(`GET ${window.location.origin}/api/anthropic/v1/usage`).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByTestId("usage-script").textContent).toContain("{{baseUrl}}/v1/usage");
+    const trouble = screen.getByTestId("guide-troubleshoot");
+    expect(within(trouble).getByText(/401 \/ Auth conflict/)).toBeInTheDocument();
+    expect(within(trouble).getByText(/Both a token and an API key are set/)).toBeInTheDocument();
+    // 深链尾注:导入即切换 + 重开终端 + 清残留环境变量。
+    expect(screen.getByText(/直接切换为 Claude Code 当前供应商/)).toBeInTheDocument();
+  });
+
+  test("用量脚本可整段复制(与深链里 base64 的脚本同源)", async () => {
+    const clipboard = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: clipboard },
+      configurable: true,
+    });
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    const guide = screen.getByTestId("guide-usage");
+    guide.setAttribute("open", "");
+    fireEvent.click(within(guide).getByRole("button", { name: "复制" }));
+    await waitFor(() => expect(clipboard).toHaveBeenCalled());
+    expect(clipboard.mock.calls[0][0]).toBe(buildCcSwitchUsageScript());
   });
 
   test("接入教程:公开模型 id(无引擎前缀)、模型查询地址、CC Switch 深链;整页无 cursor 字样", async () => {
