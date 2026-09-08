@@ -1,4 +1,6 @@
-import { ArrowLeft, ArrowRight, ArrowUpRight, Check, Download, ExternalLink, FileText, Sparkles } from 'lucide-react'
+import { SignatureGallery, SignatureDetail } from './SignatureShowcases'
+import type { SignatureWork } from '../../lib/tutorialSignatureWorks'
+import { ArrowLeft, ArrowRight, ArrowUpRight, Check, Download, ExternalLink, FileText } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { TUTORIAL_SHOWCASES, showcaseAsset, showcaseTask, type TutorialShowcase } from '../../lib/tutorialShowcase'
 import type { TutorialCase, TutorialCaseId } from '../../lib/tutorialCaseCatalog'
@@ -34,11 +36,13 @@ function ResultCover({ item }: { item: TutorialShowcase }) {
 }
 
 export function CaseShowroom({ onSelect, onRun, actionLabel }: Props) {
+  const [activeWork, setActiveWork] = useState<SignatureWork | null>(null)
+  if (activeWork) return <SignatureDetail key={activeWork.id} work={activeWork} onBack={() => setActiveWork(null)} onRun={onRun} actionLabel={actionLabel} />
   return (
     <section className="mx-auto max-w-6xl px-4 pb-10 pt-8 sm:px-8 sm:pt-12">
-      <p className="flex items-center gap-2 text-caption font-semibold text-accent"><Sparkles size={15} /> 不止回答，交付看得见的成果</p>
-      <h1 className="mt-4 max-w-3xl text-balance text-[32px] font-semibold leading-[1.2] tracking-tight text-fg sm:text-[46px]">你的下一件事，<br />也可以这样完成。</h1>
-      <p className="mt-4 max-w-2xl text-body leading-7 text-muted">先打开作品看看，再换成你的问题和材料。这里没有必修章节，只有可以亲手探索的成果。</p>
+      <SignatureGallery onSelect={setActiveWork} />
+      <h2 className="text-[24px] font-semibold tracking-tight text-fg">还有这些，能直接用在工作里。</h2>
+      <p className="mt-2 text-meta text-muted">从真实数据到可核对的结果。继续探索这些公开数据实作。</p>
       <div className="mt-9 grid gap-6 lg:grid-cols-2">
         {TUTORIAL_SHOWCASES.map((item) => <article key={item.caseId} className="overflow-hidden rounded-3xl border border-border bg-surface shadow-sm">
           <ResultCover item={item} />
