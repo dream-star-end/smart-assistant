@@ -89,3 +89,23 @@ describe("OCV5-180 composer owner regressions", () => {
     expect(screen.getByText("A-keep.txt")).toBeInTheDocument();
   });
 });
+
+// Reusable new key is NOT a stable logical draft identity.
+test("two successive promotions keep the first pending upload on its own owner", async () => {
+  const pending = new Map<string, (value: MediaRef) => void>();
+  const onUpload = vi.fn((file: File) => new Promise<MediaRef>(resolve => pending.set(file.name, resolve)));
+  const ui = (key: string) => wrap(<Composer draftKey={key} onSend={() => {}} onUpload={onUpload} />);
+  const v = render(ui("user-a:new"));
+  await upload(v, "first.txt");
+  moveComposerAttachments("user-a:new", "user-a:first");
+  v.rerender(ui("user-a:first"));
+  v.rerender(ui("user-a:new"));
+  await upload(v, "second.txt");
+  moveComposerAttachments("user-a:new", "user-a:second");
+  v.rerender(ui("user-a:second"));
+  await act(async () => { pending.get("first.txt")!({ kind: "file", url: "/first" }); });
+  expect(screen.queryByText("first.txt")).not.toBeInTheDocument();
+  v.rerender(ui("user-a:first"));
+  expect(screen.getByText("first.txt")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "发送" })).not.toBeDisabled();
+});

@@ -26,6 +26,9 @@ import {
   useToast,
 } from "./ui";
 
+// Captured by one upload, not keyed by the reusable "new" draft name. Promotion
+// moves this exact attachment's owner without redirecting future new drafts.
+type AttachOwner = { key: string | undefined; epoch: number };
 type Attach = {
   id: string;
   name: string;
@@ -51,30 +54,19 @@ function mediaKindOf(mime: string): MediaRef["kind"] {
   return "file";
 }
 
-const attachmentCache = new Map<string, Attach[]>();
-const attachmentMoves = new Map<string, string>();
+type OwnedAttach = Attach & { owner: AttachOwner };
+const attachmentCache = new Map<string, OwnedAttach[]>();
 let attachEpoch = 0;
 let nextAttachId = 0;
-
-function resolveAttachOwner(owner: string | undefined): string | undefined {
-  if (!owner) return owner;
-  let cur = owner;
-  const seen = new Set<string>();
-  while (attachmentMoves.has(cur) && !seen.has(cur)) {
-    seen.add(cur);
-    cur = attachmentMoves.get(cur)!;
-  }
-  return cur;
-}
 
 /** Same-session identity promotion only. Ordinary session/account switches must not call this. */
 export function moveComposerAttachments(from: string, to: string): void {
   if (!from || !to || from === to) return;
   const moving = attachmentCache.get(from) ?? [];
   const dest = attachmentCache.get(to) ?? [];
+  for (const item of moving) item.owner.key = to;
   attachmentCache.set(to, dest.length ? [...dest, ...moving] : moving);
   attachmentCache.delete(from);
-  attachmentMoves.set(from, to);
 }
 
 export function resetComposerAttachmentCache(): void {
@@ -84,7 +76,6 @@ export function resetComposerAttachmentCache(): void {
     }
   }
   attachmentCache.clear();
-  attachmentMoves.clear();
   attachEpoch += 1;
 }
 
@@ -203,22 +194,21 @@ export function Composer({
       typeof window.matchMedia === "function" &&
       window.matchMedia("(pointer: coarse)").matches,
   );
-  const [attach, setAttach] = useState<{ key: string | undefined; items: Attach[] }>(() => ({
+  const [attach, setAttach] = useState<{ key: string | undefined; items: OwnedAttach[] }>(() => ({
     key: draftKey,
     items: draftKey ? (attachmentCache.get(draftKey) ?? []) : [],
   }));
   const attachEpochRef = useRef(attachEpoch);
   if (attach.key !== draftKey || attachEpochRef.current !== attachEpoch) {
     const cacheWasReset = attachEpochRef.current !== attachEpoch;
-    if (!cacheWasReset && attach.key && !attachmentMoves.has(attach.key)) {
-      attachmentCache.set(attach.key, attach.items);
-    }
+    // Every mutation already updates the cache. Re-saving old React state here
+    // would resurrect the old name after an explicit identity promotion.
     attachEpochRef.current = attachEpoch;
     const items = draftKey && !cacheWasReset ? (attachmentCache.get(draftKey) ?? []) : [];
     setAttach({ key: draftKey, items });
   }
   const attachments = attach.items;
-  const setAttachments = (next: SetStateAction<Attach[]>) => {
+  const setAttachments = (next: SetStateAction<OwnedAttach[]>) => {
     setAttach((curr) => {
       const items = typeof next === "function" ? next(curr.items) : next;
       if (curr.key) attachmentCache.set(curr.key, items);
@@ -258,7 +248,7 @@ export function Composer({
     return u;
   }, []);
   const revoke = useCallback((u?: string) => {
-    if (u && objectUrlsRef.current.has(u)) {
+    if (u) {
       URL.revokeObjectURL(u);
       objectUrlsRef.current.delete(u);
     }
@@ -358,12 +348,13 @@ export function Composer({
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
   // 复用原 File 对象，重试无需重选文件；成功后携带 media，供 doneMedia 汇总发送。
   const uploadOne = useCallback(
-    async (id: string, file: File, owner: string | undefined) => {
+    async (id: string, file: File, owner: AttachOwner) => {
       if (!onUpload) return;
-      const apply = (mapFn: (items: Attach[]) => Attach[]) => {
-        const target = resolveAttachOwner(owner);
+      const apply = (mapFn: (items: OwnedAttach[]) => OwnedAttach[]) => {
         setAttach((curr) => {
-          if (curr.key === target || curr.key === owner) {
+          if (owner.epoch !== attachEpoch) return curr;
+          const target = owner.key;
+          if (curr.key === target) {
             const items = mapFn(curr.items);
             if (curr.key) attachmentCache.set(curr.key, items);
             return { ...curr, items };
@@ -404,15 +395,16 @@ export function Composer({
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     for (const file of arr) {
       const id = `att-${nextAttachId++}`;
+      const owner: AttachOwner = { key: draftKey, epoch: attachEpoch };
       const kind = mediaKindOf(file.type);
       // 图片:选中即生成本地预览 URL（无需等上传完成，chip 立刻显缩略图、可点开看大图）。
       const previewUrl = kind === "image" ? makePreview(file) : undefined;
       // 持有原始 File：失败后「重试」复用它原地重传，多文件混合状态各 chip 独立重试。
       setAttachments((prev) => [
         ...prev,
-        { id, name: file.name, size: file.size, kind, status: "uploading", previewUrl, file },
+        { id, owner, name: file.name, size: file.size, kind, status: "uploading", previewUrl, file },
       ]);
-      void uploadOne(id, file, draftKey);
+      void uploadOne(id, file, owner);
     }
   };
 
@@ -525,7 +517,7 @@ export function Composer({
                 }
                 onRetry={
                   a.status === "error" && a.file
-                    ? () => void uploadOne(a.id, a.file as File, draftKey)
+                    ? () => void uploadOne(a.id, a.file as File, a.owner)
                     : undefined
                 }
                 onAnnotate={

@@ -248,7 +248,8 @@ describe('OCV5-180 leader regressions', () => {
     vi.spyOn(taskboardApi, 'listTickets').mockImplementation(async (_a, q) => {
       if (q?.status === 'backlog') return { items: [], total: 0 }
       const offset = q?.offset ?? 0
-      const limit = q?.limit ?? 200
+      // Match production http.ts + db/tickets.ts cap, not an unconstrained fake.
+      const limit = Math.min(Math.max(q?.limit ?? 50, 1), 200)
       return { items: rows.slice(offset, offset + limit), total: 201 }
     })
     const box: { current: ReturnType<typeof useTaskboard> | null } = { current: null }
@@ -327,7 +328,7 @@ describe('OCV5-180 leader regressions', () => {
     vi.spyOn(taskboardApi, 'listTickets').mockImplementation(async (_a, q) => {
       if (q?.status !== 'backlog') return { items: [], total: 0 }
       const offset = q.offset ?? 0
-      const limit = q.limit ?? 200
+      const limit = Math.min(Math.max(q.limit ?? 50, 1), 200)
       return { items: rows.slice(offset, offset + limit), total: 201 }
     })
     const box: { current: ReturnType<typeof useTaskboard> | null } = { current: null }
@@ -347,4 +348,33 @@ describe('OCV5-180 leader regressions', () => {
     })
     expect(box.current?.backlogTickets.length).toBe(201)
   })
+})
+
+test('slow initial projects response cannot roll the chosen project back', async () => {
+ const p1=sampleProject({id:'p1'}), p2=sampleProject({id:'p2',key:'OTHER'})
+ boardMocks([p1,p2])
+ let release!: (projects:Project[])=>void
+ vi.spyOn(taskboardApi,'listProjects').mockImplementationOnce(()=>new Promise(resolve=>{release=resolve}))
+ vi.spyOn(taskboardApi,'listTickets').mockResolvedValue({items:[],total:0})
+ const box:{current:ReturnType<typeof useTaskboard>|null}={current:null}
+ function Harness({locked}:{locked:string}) {box.current=useTaskboard(auth,true,null,locked);return null}
+ const view=render(<ToastProvider><Harness locked="p1"/></ToastProvider>)
+ view.rerender(<ToastProvider><Harness locked="p2"/></ToastProvider>)
+ await waitFor(()=>expect(box.current?.projectId).toBe('p2'))
+ await act(async()=>{release([p1,p2])})
+ expect(box.current?.projectId).toBe('p2')
+})
+
+test('reconcile invalidating initial data does not leave initial loading stuck', async () => {
+ const projects=[sampleProject()]
+ boardMocks(projects)
+ let release!:(projects:Project[])=>void
+ vi.spyOn(taskboardApi,'listProjects').mockImplementationOnce(()=>new Promise(resolve=>{release=resolve}))
+ vi.spyOn(taskboardApi,'listTickets').mockResolvedValue({items:[],total:0})
+ const box:{current:ReturnType<typeof useTaskboard>|null}={current:null}
+ function Harness(){box.current=useTaskboard(auth,true,null,'p1');return null}
+ render(<ToastProvider><Harness/></ToastProvider>)
+ await act(async()=>{await box.current!.reconcile()})
+ await act(async()=>{release(projects)})
+ expect(box.current?.loading).toBe(false)
 })

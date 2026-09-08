@@ -9,9 +9,11 @@ import {
   teardownComposerDrafts,
 } from "../src/lib/composerDraft";
 import { ToastProvider, TooltipProvider } from "../src/components/ui";
+import { TicketListView } from "../src/components/taskboard/TicketListView";
 import type { MediaRef } from "../src/lib/chat/frames";
 
-let pendingUpload: ((media: MediaRef) => void) | null = null;
+const pendingUploads: Array<{ name: string; resolve: (media: MediaRef) => void }> = [];
+let promotions = 0;
 
 function Harness() {
   const [id, setId] = useState("A");
@@ -22,7 +24,7 @@ function Harness() {
   return (
     <TooltipProvider>
       <ToastProvider>
-        {["A", "B", "new", "existing-other"].map((key) => (
+        {["A", "B", "new", "existing-other", "created", "created-2"].map((key) => (
           <button key={key} onClick={() => setId(key)}>
             session {key}
           </button>
@@ -30,10 +32,11 @@ function Harness() {
         <button
           onClick={() => {
             const from = accountDraftKey(NEW_COMPOSER_DRAFT_KEY, account);
-            const to = accountDraftKey("created", account);
+            const promoted = ++promotions === 1 ? "created" : `created-${promotions}`;
+            const to = accountDraftKey(promoted, account);
             moveDraft(from, to);
             moveComposerAttachments(from, to);
-            setId("created");
+            setId(promoted);
           }}
         >
           materialize new
@@ -53,8 +56,8 @@ function Harness() {
         </button>
         <button
           onClick={() => {
-            pendingUpload?.({ kind: "file", url: "/stub/late.txt" });
-            pendingUpload = null;
+            const pending = pendingUploads.shift();
+            pending?.resolve({ kind: "file", url: `/stub/${pending.name}` });
           }}
         >
           finish upload
@@ -70,7 +73,7 @@ function Harness() {
           onUpload={async (file): Promise<MediaRef> => {
             if (delayUpload) {
               return new Promise((resolve) => {
-                pendingUpload = resolve;
+                pendingUploads.push({ name: file.name, resolve });
               });
             }
             return { kind: "file", url: `/stub/${file.name}` };
@@ -81,4 +84,13 @@ function Harness() {
   );
 }
 
-createRoot(document.getElementById("root")!).render(<Harness />);
+function FilteredPageHarness() {
+  const [loaded, setLoaded] = useState(200);
+  return <TooltipProvider><output data-testid="loaded-raw">{loaded}</output>
+    <TicketListView tickets={[]} query={{ type: 'bug' }} onQueryChange={() => {}}
+      total={201} loadedCount={loaded} onLoadMore={() => setLoaded(201)} hideFilters />
+  </TooltipProvider>;
+}
+createRoot(document.getElementById("root")!).render(
+  new URLSearchParams(location.search).has('pagination') ? <FilteredPageHarness /> : <Harness />,
+);

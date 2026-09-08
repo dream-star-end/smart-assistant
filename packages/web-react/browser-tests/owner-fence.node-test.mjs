@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, relative, join } from "node:path";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { test } from "node:test";
@@ -11,6 +13,15 @@ const { chromium } = createRequire(import.meta.url)("playwright-core");
 test("Composer owner fence (real Chromium, no backend)", { timeout: 120_000 }, async (t) => {
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL("./owner-fence-harness.tsx", import.meta.url))],
+    plugins: process.env.OC_OWNER_COMPONENT_BASELINE ? [{
+      name: 'pinned-owner-component-negative-control',
+      setup(build) {
+        build.onLoad({ filter: /\/src\/components\/(Composer|taskboard\/TicketListView)\.tsx$/ }, (args) => ({
+          contents: readFileSync(join(process.env.OC_OWNER_COMPONENT_BASELINE, relative(fileURLToPath(new URL('../', import.meta.url)), args.path)), 'utf8'),
+          loader: 'tsx', resolveDir: dirname(args.path),
+        }));
+      },
+    }] : [],
     bundle: true,
     write: false,
     format: "iife",
@@ -34,13 +45,13 @@ test("Composer owner fence (real Chromium, no backend)", { timeout: 120_000 }, a
       headless: true,
       args: ["--no-sandbox"],
     });
-    async function openPage() {
+    async function openPage(suffix = "") {
       const context = await browser.newContext();
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
       const errors = [];
       page.on("pageerror", (error) => errors.push(error.message));
-      await page.goto(`http://127.0.0.1:${server.address().port}`);
+      await page.goto(`http://127.0.0.1:${server.address().port}${suffix}`);
       await page.addScriptTag({ content: bundle.outputFiles[0].text });
       return { context, page, errors };
     }
@@ -136,6 +147,39 @@ test("Composer owner fence (real Chromium, no backend)", { timeout: 120_000 }, a
       } finally {
         await context.close();
       }
+    });
+
+    await t.test("two promotions cannot redirect the first delayed upload", async () => {
+      const { context, page, errors } = await openPage();
+      try {
+        await page.getByRole("button", { name: "session new", exact: true }).click();
+        await page.getByRole("button", { name: "delay off" }).click();
+        const input = page.locator("input[type=file]");
+        await input.setInputFiles({ name: "first.txt", mimeType: "text/plain", buffer: Buffer.from("a") });
+        await page.getByText("first.txt").waitFor();
+        await page.getByRole("button", { name: "materialize new" }).click();
+        await page.getByRole("button", { name: "session new", exact: true }).click();
+        await input.setInputFiles({ name: "second.txt", mimeType: "text/plain", buffer: Buffer.from("b") });
+        await page.getByText("second.txt").waitFor();
+        await page.getByRole("button", { name: "materialize new" }).click();
+        assert.equal(await page.getByTestId("active").textContent(), "created-2");
+        await page.getByRole("button", { name: "finish upload" }).click();
+        assert.equal(await page.getByText("first.txt").count(), 0);
+        await page.getByRole("button", { name: "session created", exact: true }).click();
+        await page.getByRole("button", { name: "发送", exact: true }).click();
+        assert.equal(await page.getByTestId("sent").textContent(), "created::/stub/first.txt");
+        assert.deepEqual(errors, []);
+      } finally { await context.close(); }
+    });
+    await t.test("filtered empty page can load more and stops at raw total", async () => {
+      const { context, page, errors } = await openPage("?pagination=1");
+      try {
+        assert.equal(await page.getByTestId("loaded-raw").textContent(), "200");
+        await page.getByTestId("ticket-list-load-more").click();
+        assert.equal(await page.getByTestId("loaded-raw").textContent(), "201");
+        assert.equal(await page.getByTestId("ticket-list-load-more").count(), 0);
+        assert.deepEqual(errors, []);
+      } finally { await context.close(); }
     });
   } finally {
     await browser?.close();
