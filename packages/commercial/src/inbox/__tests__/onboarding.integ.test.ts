@@ -24,13 +24,21 @@ import {
 import { query } from "../../db/queries.js";
 import { runMigrations } from "../../db/migrate.js";
 import { runOnboardingTick, _internal } from "../onboarding.js";
-import { resetTestSchemaForTest } from "../../__tests__/helpers/db.js";
+import { resetTestSchemaForTest, truncateAllForTest } from "../../__tests__/helpers/db.js";
+import { prepareAuthRowResetForTest } from "../../__tests__/helpers/authRows.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
+let resetRows: () => Promise<void>;
+const ORIGINAL_RESET_ROOTS = [
+  "inbox_message_reads", "inbox_messages", "agent_audit", "agent_containers",
+  "agent_subscriptions", "request_finalize_journal", "orders", "usage_records",
+  "credit_ledger", "claude_accounts", "refresh_tokens", "email_verifications",
+  "oauth_identities", "user_preferences", "user_remote_hosts", "users",
+];
 
 async function probePg(): Promise<boolean> {
   const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 });
@@ -55,6 +63,39 @@ before(async () => {
   setPoolOverride(pool);
   await resetTestSchemaForTest();
   await runMigrations();
+  await truncateAllForTest(ORIGINAL_RESET_ROOTS);
+  const closure = await query<{ schema: string; name: string }>(`
+    WITH RECURSIVE edges(child, parent) AS (
+      SELECT conrelid, confrelid FROM pg_constraint WHERE contype = 'f'
+      UNION SELECT inhrelid, inhparent FROM pg_inherits
+    ), affected(oid) AS (
+      SELECT unnest($1::regclass[])::oid
+      UNION SELECT edges.child FROM edges JOIN affected ON edges.parent = affected.oid
+    )
+    SELECT n.nspname AS schema, c.relname AS name
+    FROM affected JOIN pg_class c USING (oid) JOIN pg_namespace n ON n.oid = c.relnamespace
+    ORDER BY n.nspname, c.relname
+  `, [ORIGINAL_RESET_ROOTS.map((name) => `public.${name}`)]);
+  for (const name of ORIGINAL_RESET_ROOTS) {
+    assert.ok(closure.rows.some((row) => row.schema === "public" && row.name === name),
+      `onboarding reset closure must contain original root ${name}`);
+  }
+  const quote = (identifier: string): string => `"${identifier.replaceAll('"', '""')}"`;
+  const emptinessSql = closure.rows.map(({ schema, name }, index) =>
+    `SELECT ${index} AS leftover WHERE EXISTS (SELECT 1 FROM ${quote(schema)}.${quote(name)})`,
+  ).join(" UNION ALL ");
+  resetRows = await prepareAuthRowResetForTest(async (client) => {
+    await client.query("DELETE FROM inbox_message_reads");
+    await client.query("DELETE FROM inbox_messages");
+    await client.query("DELETE FROM orders");
+    await client.query("DELETE FROM usage_records");
+  }, async (client) => {
+    // users alone excludes claude_accounts and its children. Check the complete
+    // original closure after cleanup, on the SAME transaction before COMMIT.
+    const leftovers = await client.query<{ leftover: number }>(emptinessSql);
+    assert.deepEqual(leftovers.rows.map(({ leftover }) => closure.rows[leftover]), [],
+      "onboarding reset must leave the entire original FK/partition closure empty");
+  });
 });
 
 after(async () => {
@@ -72,8 +113,7 @@ function skip(t: { skip: (reason: string) => void }): boolean {
 // ─── helpers ──────────────────────────────────────────────────────
 
 async function wipe(): Promise<void> {
-  // 谨慎:保留 schema_migrations
-  await query("TRUNCATE inbox_message_reads, inbox_messages, agent_audit, agent_containers, agent_subscriptions, request_finalize_journal, orders, usage_records, credit_ledger, claude_accounts, refresh_tokens, email_verifications, oauth_identities, user_preferences, user_remote_hosts, users RESTART IDENTITY CASCADE");
+  await resetRows();
 }
 
 interface SeedUserOpts {
