@@ -223,8 +223,14 @@ export async function loadAgentModelResolverForUser(
   let snapshot = buildAgentModelSnapshot(agentSets.installed, agentSets.presets, seedExecutions, identityCompat);
   let denied = runtimeDeniedAgentIds(agentSets.denied, seedExecutions);
   const resolver = ((agentId: string) => snapshot.get(agentId) ?? null) as AgentModelResolver;
-  resolver.isRuntimeDenied = (agentId: string) =>
-    resolveIdentityCompat(agentId, identityCompat).status === "registered-unavailable" || denied.has(agentId);
+  resolver.isRuntimeDenied = (agentId: string) => {
+    const identity = resolveIdentityCompat(agentId, identityCompat);
+    // Registered aliases are not a second marketplace namespace: a colliding
+    // legacy listing cannot override canonical readiness in either direction.
+    return identity.status === "no-registration"
+      ? denied.has(agentId)
+      : identity.status === "registered-unavailable";
+  };
   resolver.authorizeExecution = async (agentId) => {
     const known = resolveIdentityCompat(agentId, identityCompat);
     if (known.status === "no-registration") return { identity: known, model: resolver(agentId) };

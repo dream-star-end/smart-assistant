@@ -101,6 +101,17 @@ describe('per-execution resolver authorization (also required for explicit model
     assert.equal((await r.resolver.authorizeExecution!('main')).identity.status, 'no-registration')
     assert.equal(r.reads, before)
   })
+  it('an unready legacy listing cannot split a ready registered identity', async () => {
+    const ready = snapshot([agent('personal-butler')])
+    ready.agentSets.denied.add('butler')
+    const resolver = await loadAgentModelResolverForUser(3n, {
+      flavorIdentity: selfhost, env: { OC_SEED_AUTHORITY_BY_REV: '0' }, loadPresetSlugs: async () => [],
+      loadRuntimeSnapshot: async () => ready,
+    })
+    assert.equal(resolver.isRuntimeDenied!('butler'), false)
+    assert.equal(resolver.isRuntimeDenied!('personal-butler'), false)
+    assert.equal((await resolver.authorizeExecution!('butler')).model, 'gpt-6-astra')
+  })
 })
 
 describe('authenticated marketplace sync projection', () => {
