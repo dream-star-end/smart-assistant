@@ -48,6 +48,7 @@ export {
 // (serveMessages) to run cursor-* models for local Claude Code clients.
 export {
   CursorSandRelay,
+  classifyRelayTerminalCode,
   isSandRoutableModel,
   type CursorSandServeResult,
   type CursorSandUsage,

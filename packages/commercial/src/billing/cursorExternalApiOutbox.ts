@@ -206,6 +206,7 @@ export async function openCursorExternalApiOutbox(args: {
   }
 
   let scanCursor = "";
+  let pendingTail: OutboxScanObservation[] = [];
   let stopped = false;
   let inFlight: Promise<void> | null = null;
 
@@ -380,15 +381,26 @@ export async function openCursorExternalApiOutbox(args: {
     },
     async scanOnce(deps) {
       const batchStarted = Date.now();
-      const batch = await api.listBatch({
-        limit: MAX_OUTBOX_FILES_PER_BATCH,
-        deadlineMs: MAX_OUTBOX_SCAN_DIR_MS,
-      });
+      const carried = pendingTail;
+      pendingTail = [];
+      const batch = carried.length
+        ? { observations: carried, scanned: carried.length, truncated: carried.length >= MAX_OUTBOX_FILES_PER_BATCH }
+        : await api.listBatch({
+            limit: MAX_OUTBOX_FILES_PER_BATCH,
+            deadlineMs: MAX_OUTBOX_SCAN_DIR_MS,
+          });
       const consumed: ConsumeReadyResult[] = [];
       const batchDeadline = batchStarted + MAX_OUTBOX_BATCH_MS;
-      for (const obs of batch.observations) {
-        if (stopped) break;
-        if (Date.now() >= batchDeadline) break;
+      for (let i = 0; i < batch.observations.length; i += 1) {
+        if (stopped) {
+          pendingTail = batch.observations.slice(i);
+          break;
+        }
+        if (Date.now() >= batchDeadline) {
+          pendingTail = batch.observations.slice(i);
+          break;
+        }
+        const obs = batch.observations[i]!;
         if (obs.kind !== "ready") continue;
         // One consume is bounded by the shared master Pool
         // (connectionTimeoutMillis=5s, statement_timeout=30s). This loop
@@ -514,14 +526,40 @@ function serializeRecord(record: CursorExternalOutboxRecord): string {
   return `${JSON.stringify(record)}\n`;
 }
 
+export function writeAllSync(
+  fd: number,
+  bytes: Buffer,
+  write: (fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number) => number = writeSync,
+): void {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const n = write(fd, bytes, offset, bytes.length - offset);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`outbox short write: ${offset}/${bytes.length}`);
+    }
+    offset += n;
+  }
+}
+
 function atomicWriteFile(filePath: string, bytes: Buffer): void {
   const fd = openSync(filePath, "w", 0o600);
   try {
-    writeSync(fd, bytes);
+    writeAllSync(fd, bytes);
     fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+  } catch (err) {
+    try {
+      closeSync(fd);
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(filePath);
+    } catch {
+      /* ignore */
+    }
+    throw err;
   }
+  closeSync(fd);
 }
 
 function fsyncDir(dir: string): void {

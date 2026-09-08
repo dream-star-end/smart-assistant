@@ -1191,13 +1191,44 @@ class TerminalSession {
 
   async notifyCatch(state: StreamState, error: unknown): Promise<void> {
     if (this.notified) return
-    const raw = error instanceof Error ? error.message : String(error)
+    const code = classifyRelayTerminalCode(error)
     try {
-      await this.notify(state, 'failed', raw || undefined)
+      await this.notify(state, 'failed', code)
     } catch {
       // Hook failure must not replace the original cause or re-enter the hook.
     }
   }
+}
+
+/** Stable FS/plan terminalCode. Wire frames still use publicMessage separately. */
+export function classifyRelayTerminalCode(error: unknown): string {
+  if (error == null) return "CURSOR_SAND_UPSTREAM_ERROR"
+  if (typeof error === "string") {
+    const trimmed = error.trim()
+    if (trimmed === "USER_CANCELLED") return "USER_CANCELLED"
+    const token = trimmed.split(/[\s:]/, 1)[0] ?? ""
+    if (/^CURSOR_SAND_[A-Z0-9_]+$/.test(token)) return token
+    if (/^CURSOR_[A-Z0-9_]+$/.test(token) && token !== "CURSOR") return token
+    return classifyRelayTerminalCode({ name: "Error", message: trimmed })
+  }
+  const err = error as { name?: string; message?: string }
+  const msg = typeof err.message === "string" ? err.message : String(error)
+  if (msg === "USER_CANCELLED") return "USER_CANCELLED"
+  const token = msg.trim().split(/[\s:]/, 1)[0] ?? ""
+  if (/^CURSOR_SAND_[A-Z0-9_]+$/.test(token)) return token
+  if (err.name === "AbortError" || msg === "AbortError") return "CURSOR_SAND_ABORTED"
+  if (err.name === "TypeError" || /terminated|ECONNRESET|EPIPE|UND_ERR|fetch failed/i.test(msg)) {
+    return "CURSOR_SAND_UPSTREAM_TERMINATED"
+  }
+  return "CURSOR_SAND_UPSTREAM_ERROR"
+}
+
+function addRetryUsage(dst: StreamState, src: StreamState): void {
+  dst.inputTokens += src.inputTokens
+  dst.outputTokens += src.outputTokens
+  dst.cacheReadTokens += src.cacheReadTokens
+  dst.cacheWriteTokens += src.cacheWriteTokens
+  dst.usageSeen = dst.usageSeen || src.usageSeen
 }
 
 export class CursorSandRelay {
@@ -1989,13 +2020,16 @@ export class CursorSandRelay {
           && looksLikeInvalidToolIntent(pendingText, allowedTools)
         ) {
           const retry = await retryInvalidTool(pendingText)
-          const collected = await this.collectInference(retry)
+          const retryState = this.initialState()
+          let collected: Awaited<ReturnType<CursorSandRelay["collectInference"]>>
+          try {
+            collected = await this.collectInference(retry, retryState)
+          } catch (err) {
+            addRetryUsage(state, retryState)
+            throw err
+          }
           this.onRawTextForTest?.(collected.state.text, 2)
-          state.inputTokens += collected.state.inputTokens
-          state.outputTokens += collected.state.outputTokens
-          state.cacheReadTokens += collected.state.cacheReadTokens
-          state.cacheWriteTokens += collected.state.cacheWriteTokens
-          state.usageSeen = state.usageSeen || collected.state.usageSeen
+          addRetryUsage(state, collected.state)
           streamError ??= collected.streamError
           if (collected.state.thinking) {
             await closeText()
@@ -2172,7 +2206,13 @@ export class CursorSandRelay {
         const firstCacheWrite = state.cacheWriteTokens
         const firstUsageSeen = state.usageSeen
         const retry = await retryInvalidTool(state.text)
-        collected = await this.collectInference(retry)
+        const retryState = this.initialState()
+        try {
+          collected = await this.collectInference(retry, retryState)
+        } catch (err) {
+          addRetryUsage(state, retryState)
+          throw err
+        }
         this.onRawTextForTest?.(collected.state.text, 2)
         state = collected.state
         state.inputTokens += firstInput
