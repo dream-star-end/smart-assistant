@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-// V5 P0/P1 事故回归锁。判据:manifest 里登记的每条证据,必须是**真的会跑、真的断言
+// V5 P0/P1/P2 事故回归锁。判据:manifest 里登记的每条证据,必须是**真的会跑、真的断言
 // 了那件事**的产物 —— 而不是一个存在的文件名。
 //
 // 2026-07-26 审计实锤(本文件此前只做 existsSync,于是):
@@ -241,7 +241,7 @@ for (const incident of manifest.incidents) {
   if (ids.has(incident.id)) fail(`duplicate id ${incident.id}`);
   ids.add(incident.id);
   if (!/^2026-[0-9]{2}-[0-9]{2}$/.test(incident.occurredAt)) fail(`${incident.id}: invalid occurredAt`);
-  if (incident.severity !== "P0" && incident.severity !== "P1") fail(`${incident.id}: severity must be P0/P1`);
+  if (incident.severity !== "P0" && incident.severity !== "P1" && incident.severity !== "P2") fail(`${incident.id}: severity must be P0/P1/P2`);
   if (!incident.symptom?.trim()) fail(`${incident.id}: symptom is required`);
 
   const lineageCommits = [incident.rootFixCommit, ...(incident.coverageCommits ?? [])];
@@ -531,7 +531,7 @@ for (const note of pendingRunners) {
   process.stdout.write(`[incident-regressions] pending-runner: ${note}\n`);
 }
 process.stdout.write(
-  `[incident-regressions] PASS: ${manifest.incidents.length} P0/P1 incidents, ${linked.size} regression artifacts, `
+  `[incident-regressions] PASS: ${manifest.incidents.length} P0/P1/P2 incidents, ${linked.size} regression artifacts, `
   + `assertion debt ${assertionDebt}/${ASSERTION_DEBT_BASELINE}, proofPending ${proofPending}/${PROOF_PENDING_BASELINE}, `
   + `trailer-closure checked ${trailerChecked} fix(v5) commits, fixed live matrix locked\n`,
 );
