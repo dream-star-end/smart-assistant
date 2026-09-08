@@ -100,7 +100,9 @@ describe('team mode hidden reviewer — 可见性守护(不变)', () => {
     assert.match(src, /handleAgentMessage[\s\S]*isHiddenSystemAgentId\(targetAgentId\)[\s\S]*agent "[^"]+" not found/)
     // P2 债C:委派执行核心已从 handleDelegateTask 抽到 _runDelegateTask(HTTP 壳 + 内部
     // 硬编排两个调用方共用),按 id 找 target 的逻辑随之搬到核心。
-    assert.match(src, /_runDelegateTask[\s\S]*const targetAgent = cfg\.agents\.find\(\(a\) => a\.id === targetAgentId\)/)
+    // A4 resolves only explicitly registered aliases before looking up the member;
+    // unregistered hidden-reviewer IDs still use the original targetAgentId.
+    assert.match(src, /_runDelegateTask[\s\S]*const targetAgent = cfg\.agents\.find\(\(a\) => a\.id === \(targetIdentity\?\.executionAgentId \?\? targetAgentId\)\)/)
   })
 
   it('rejects hidden reviewer from other user-controlled execution and mutation surfaces', () => {
