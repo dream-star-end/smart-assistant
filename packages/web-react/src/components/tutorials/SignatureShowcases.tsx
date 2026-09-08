@@ -1,5 +1,5 @@
 import { ArrowLeft, ArrowRight, Download, ExternalLink, Play, Sparkles } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { SIGNATURE_WORKS, signatureAsset, signatureTask, type SignatureWork } from '../../lib/tutorialSignatureWorks'
 import type { TutorialCase } from '../../lib/tutorialCaseCatalog'
 import { Button } from '../ui'
@@ -9,7 +9,15 @@ function WorkCover({ work }: { work: SignatureWork }) {
   const [failed, setFailed] = useState(false)
   return failed ? <div className="flex h-full items-center justify-center bg-[#101624] p-8 text-center text-lg text-white">{work.subtitle}</div> : <img className="h-full w-full object-cover" src={signatureAsset(work, 'cover.png')} alt={work.title + '真实运行画面'} loading="lazy" width={1440} height={900} onError={() => setFailed(true)} />
 }
-export function SignatureGallery({ onSelect }: { onSelect: (work: SignatureWork) => void }) {
+export function SignatureGallery({ onSelect, restoreFocusWorkId }: { onSelect: (work: SignatureWork) => void; restoreFocusWorkId?: SignatureWork['id'] | null }) {
+  const entries = useRef(new Map<SignatureWork['id'], HTMLButtonElement>())
+  useLayoutEffect(() => {
+    if (!restoreFocusWorkId) return
+    const node = entries.current.get(restoreFocusWorkId)
+    if (!node) return
+    node.focus({ preventScroll: true })
+    node.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [restoreFocusWorkId])
   return <section className="mb-12" aria-label="精选可交互作品">
     <p className="flex items-center gap-2 text-caption font-semibold text-accent"><Sparkles size={15} /> 从一个想法，到眼前这个作品</p>
     <h1 className="mt-4 max-w-3xl text-balance text-[34px] font-semibold leading-[1.15] tracking-tight text-fg sm:text-[48px]">别只问 AI。<br />让它做给你看。</h1>
@@ -22,7 +30,7 @@ export function SignatureGallery({ onSelect }: { onSelect: (work: SignatureWork)
           <p className="font-mono text-[10px] tracking-[.16em] sm:text-xs" style={{ color: work.color }}>0{index + 1} / {work.kicker}</p>
           <h2 className="mt-4 text-balance text-[27px] font-semibold leading-tight tracking-tight sm:text-[36px]">{work.title}</h2>
           <p className="mt-4 max-w-md text-meta leading-7 text-white/65">{work.subtitle}</p>
-          <div className="mt-7"><button type="button" onClick={() => onSelect(work)} className="inline-flex min-h-11 items-center gap-3 rounded-full bg-white px-5 py-3 text-meta font-semibold text-[#101820] transition hover:bg-white/85 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"><Play size={15} fill="currentColor" />{work.action}<ArrowRight size={15} /></button></div>
+          <div className="mt-7"><button type="button" ref={(node) => { if (node) entries.current.set(work.id, node); else entries.current.delete(work.id) }} onClick={() => onSelect(work)} className="inline-flex min-h-11 items-center gap-3 rounded-full bg-white px-5 py-3 text-meta font-semibold text-[#101820] transition hover:bg-white/85 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"><Play size={15} fill="currentColor" />{work.action}<ArrowRight size={15} /></button></div>
           <p className="mt-4 text-[10px] text-white/40">原创代码实作 · 画面来自实际运行 · 非完整会话回放</p>
         </div>
       </article>)}

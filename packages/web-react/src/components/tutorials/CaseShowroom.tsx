@@ -37,10 +37,11 @@ function ResultCover({ item }: { item: TutorialShowcase }) {
 
 export function CaseShowroom({ onSelect, onRun, actionLabel }: Props) {
   const [activeWork, setActiveWork] = useState<SignatureWork | null>(null)
+  const [restoreFocusWorkId, setRestoreFocusWorkId] = useState<SignatureWork['id'] | null>(null)
   if (activeWork) return <SignatureDetail key={activeWork.id} work={activeWork} onBack={() => setActiveWork(null)} onRun={onRun} actionLabel={actionLabel} />
   return (
     <section className="mx-auto max-w-6xl px-4 pb-10 pt-8 sm:px-8 sm:pt-12">
-      <SignatureGallery onSelect={setActiveWork} />
+      <SignatureGallery onSelect={(work) => { setRestoreFocusWorkId(work.id); setActiveWork(work) }} restoreFocusWorkId={restoreFocusWorkId} />
       <h2 className="text-[24px] font-semibold tracking-tight text-fg">还有这些，能直接用在工作里。</h2>
       <p className="mt-2 text-meta text-muted">从真实数据到可核对的结果。继续探索这些公开数据实作。</p>
       <div className="mt-9 grid gap-6 lg:grid-cols-2">
