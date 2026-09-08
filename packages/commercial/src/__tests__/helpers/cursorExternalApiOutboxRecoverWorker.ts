@@ -21,19 +21,22 @@ const pool = createPool({
   statementTimeoutMs: 8_000,
 });
 
-const box = await openCursorExternalApiOutbox({ directory });
-const result = await box.scanOnce({ pool, pricing });
-process.stdout.write(`${JSON.stringify({
-  consumed: result.consumed.map((c) => ({
-    billingId: c.billingId,
-    disposition: c.disposition,
-    unlinked: c.unlinked,
-    reason: c.reason ?? null,
-    usageId: c.settled?.usageId?.toString() ?? null,
-    ledgerId: c.settled?.ledgerId?.toString() ?? null,
-    debited: c.settled?.debitedCredits?.toString() ?? null,
-  })),
-  observations: result.observations.map((o) => o.kind),
-  scanned: result.scanned,
-})}\n`);
-await pool.end();
+try {
+  const box = await openCursorExternalApiOutbox({ directory });
+  const result = await box.scanOnce({ pool, pricing });
+  process.stdout.write(`${JSON.stringify({
+    consumed: result.consumed.map((c) => ({
+      billingId: c.billingId,
+      disposition: c.disposition,
+      unlinked: c.unlinked,
+      reason: c.reason ?? null,
+      usageId: c.settled?.usageId?.toString() ?? null,
+      ledgerId: c.settled?.ledgerId?.toString() ?? null,
+      debited: c.settled?.debitedCredits?.toString() ?? null,
+    })),
+    observations: result.observations.map((o) => o.kind),
+    scanned: result.scanned,
+  })}\n`);
+} finally {
+  await pool.end();
+}
