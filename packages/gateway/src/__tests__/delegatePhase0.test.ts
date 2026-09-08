@@ -91,6 +91,14 @@ describe('OCV5-180: full-flag delegate fixture has no real HOME side effects', (
     assert.equal(gw._delegateJobs.snapshotOf(cron.jobId).callbackState, 'delivered')
     assert.equal(callbacks, 1, 'actual notifier CAS must deliver cron callback once')
     gw._releaseHold()
+    // This case covers storage isolation, not long-poll timers. Consume the
+    // completed result only after the actual submit/terminal path has settled.
+    // Existing delegateAsyncJobs tests separately cover the wait protocol.
+    const deadline = Date.now() + 2_000
+    while (gw._delegateJobs.snapshotOf(started.body.jobId)?.state !== 'completed' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    assert.equal(gw._delegateJobs.snapshotOf(started.body.jobId)?.state, 'completed')
     const waited = await call(gw, 'handleDelegateWait', { jobId: started.body.jobId, waitMs: 1000 })
     assert.equal(waited.status, 200)
     await Promise.all(notifications)
