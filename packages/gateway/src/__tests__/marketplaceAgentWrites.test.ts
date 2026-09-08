@@ -61,12 +61,24 @@ test('sync paused after config read cannot roll back a concurrent successful loc
   const originalFetch = globalThis.fetch
   const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
   const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  const oldUserId = process.env.OC_USER_ID
   process.env.OPENCLAUDE_V3_MASTER_BASE_URL = 'http://test.invalid'
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-only'
+  process.env.OC_USER_ID = '42'
   const manifest = JSON.stringify({ model: 'new-authority', persona: 'new authority persona' })
-  globalThis.fetch = async () => new Response(JSON.stringify({ skills: [], agents: [{
-    slug: 'managed', rawManifest: manifest, artifactHash: marketplaceArtifactHash(manifest), version: '2',
-  }] }))
+  let authorityReads = 0
+  globalThis.fetch = async (url, init) => {
+    assert.equal(String(url), 'http://test.invalid/internal/v3/marketplace/sync')
+    assert.equal(init?.method ?? 'GET', 'GET')
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer test-only')
+    authorityReads++
+    return new Response(JSON.stringify({
+      identityCompat: { schema: 1, userId: '42', profiles: [] },
+      skills: [], agents: [{
+        slug: 'managed', rawManifest: manifest, artifactHash: marketplaceArtifactHash(manifest), version: '2',
+      }],
+    }))
+  }
   let entered!: () => void
   const atPersona = new Promise<void>(resolve => { entered = resolve })
   let release!: () => void
@@ -95,6 +107,7 @@ test('sync paused after config read cannot roll back a concurrent successful loc
     const cfg = await readAgentsConfig()
     assert.equal(cfg.agents.find(a => a.id === 'main')?.model, 'saved-during-sync')
     assert.equal(cfg.agents.find(a => a.id === 'managed')?.model, 'new-authority')
+    assert.ok(authorityReads >= 2, 'sync and local save must both consult authenticated authority')
   } finally {
     release()
     await Promise.allSettled([sync, save])
@@ -105,6 +118,8 @@ test('sync paused after config read cannot roll back a concurrent successful loc
     else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase
     if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
     else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken
+    if (oldUserId === undefined) delete process.env.OC_USER_ID
+    else process.env.OC_USER_ID = oldUserId
   }
 })
 
