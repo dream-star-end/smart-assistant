@@ -43,7 +43,6 @@ import {
   createRowGeometryWarmup,
   measureMountedRowHeight,
   measuredRangePx,
-  overscanPx,
   paintWindowEnabled,
   rowHeightEstimatePx,
   selectPaintRange,
@@ -73,12 +72,10 @@ import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import {
   PermissionCard,
-  PermissionPromptHost,
   type PermissionRespond,
   isAwaitingPermissionPrompt,
 } from "./chat/PermissionCard";
-import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
-import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
+import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
 import {
@@ -93,14 +90,7 @@ import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
 import { cn } from "../lib/utils";
-import {
-  findMatches,
-  locateFindMatch,
-  stepMatch,
-  timelineMessageKey,
-  type FindMatch,
-  type FindRenderLookupItem,
-} from "./chat/findInSession";
+import { findMatches, stepMatch, timelineMessageKey, type FindMatch } from "./chat/findInSession";
 import {
   delegateTokenUsage,
   displayCallTokenUsage,
@@ -181,8 +171,6 @@ type RendererProps = {
   failurePresentedBelow?: boolean;
   /** 初始尾部 locator：跳过 600px IO，进会话即兑付正文。 */
   eagerPayload?: boolean;
-  /** MessageList owns PermissionPromptHost; timeline cards must not mount a second modal. */
-  hostedPermission?: boolean;
 };
 
 export const MessageRenderer = memo(
@@ -204,7 +192,6 @@ export const MessageRenderer = memo(
     readOnly = false,
     failurePresentedBelow = false,
     eagerPayload = false,
-    hostedPermission = false,
   }: RendererProps) {
     const ctx = {
       isLast,
@@ -329,7 +316,6 @@ export const MessageRenderer = memo(
             onRespond={onRespondPermission}
             readOnly={readOnly}
             livePrompt={live}
-            renderMode={hostedPermission ? "card" : "both"}
           />
         );
       }
@@ -644,9 +630,6 @@ function DeferredTapeRecordCard({
                 _historyPageLoadedFrom: message._historyPageLoadedFrom,
                 _historyPageKey: message._historyPageKey,
                 _clientMessageId: record._clientMessageId ?? message._clientMessageId,
-                _continuationOfTurnKey: record._continuationOfTurnKey ?? message._continuationOfTurnKey,
-                _delegateRunId: record._delegateRunId ?? message._delegateRunId,
-                _turnKey: record._turnKey ?? message._turnKey,
               };
           const final = isLast && index === records.length - 1;
           const recordIsFinalAssistant = turnFinalAssistant === true &&
@@ -674,7 +657,6 @@ function DeferredTapeRecordCard({
               onRespondPermission={onRespondPermission}
               readOnly={readOnly}
               failurePresentedBelow={failurePresentedBelow}
-              hostedPermission
             />
           );
         })}
@@ -1028,71 +1010,6 @@ function renderItemKey(item: RenderItem): string {
   }
 }
 
-function findLookupItems(items: RenderItem[]): FindRenderLookupItem[] {
-  return items.map((item) => {
-    if (item.kind === "single") {
-      const key = renderItemKey(item);
-      return { key, memberKeys: [timelineMessageKey(item.m)] };
-    }
-    return {
-      key: renderItemKey(item),
-      memberKeys: item.members.map((member) => timelineMessageKey(member)),
-    };
-  });
-}
-
-function escapeFindSelector(key: string): string {
-  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
-    ? CSS.escape(key)
-    : key.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function findToolbarEl(scroller: HTMLElement): HTMLElement | null {
-  const input = scroller.querySelector('[aria-label="在会话中查找"]');
-  if (!(input instanceof HTMLElement)) return null;
-  let node: HTMLElement | null = input;
-  while (node && node !== scroller) {
-    const pos = typeof getComputedStyle === "function" ? getComputedStyle(node).position : node.style.position;
-    if (pos === "sticky" || pos === "fixed") return node;
-    node = node.parentElement;
-  }
-  const wrap = input.closest("div");
-  return wrap instanceof HTMLElement ? wrap : null;
-}
-
-function findViewTop(scroller: HTMLElement): number {
-  const view = scroller.getBoundingClientRect();
-  const bar = findToolbarEl(scroller)?.getBoundingClientRect() ?? null;
-  return bar && bar.height > 0 ? bar.bottom : view.top;
-}
-
-function findTargetVisible(el: HTMLElement, scroller: HTMLElement): boolean {
-  const row = el.getBoundingClientRect();
-  const view = scroller.getBoundingClientRect();
-  const top = findViewTop(scroller);
-  return row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1;
-}
-
-function eventInFindToolbar(scroller: HTMLElement, target: EventTarget | null): boolean {
-  const bar = findToolbarEl(scroller);
-  return !!(bar && target instanceof Node && bar.contains(target));
-}
-
-function findPaintNeighborhood(clientHeight: number, estimatePx: number): number {
-  const extraPx = overscanPx(clientHeight);
-  return Math.max(PAINT_MIN_ITEMS, Math.ceil(extraPx / Math.max(1, estimatePx)));
-}
-
-/** Wait long enough for the 200ms wheel quiet fence plus a few layout frames. */
-const FIND_ALIGN_BUDGET_MS = 1200;
-const FIND_ALIGN_STABLE_FRAMES = 3;
-
-type FindPinState = {
-  gen: number;
-  renderIndex: number;
-  renderKey: string;
-};
-
 function lastUserItemIndex(items: RenderItem[]): number {
   for (let i = items.length - 1; i >= 0; i -= 1) {
     const item = items[i];
@@ -1183,8 +1100,6 @@ export function MessageList({
       el: { scrollTop: number; scrollHeight: number; clientHeight: number },
       nextTop: number,
     ) => void;
-    /** Consume a leftover keyboard/wheel mark. Does not clear fences. */
-    releaseUserIntent?: () => void;
   };
   /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
   find?: { onClose: () => void };
@@ -1218,139 +1133,14 @@ export function MessageList({
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [findCursor, setFindCursor] = useState(0);
-  const [findPin, setFindPin] = useState<FindPinState | null>(null);
-  const findGenRef = useRef(0);
-  const findPinRef = useRef<FindPinState | null>(null);
-  findPinRef.current = findPin;
-  const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const findMatchesList = useMemo(
     () => (find ? findMatches(messages, findQuery) : []),
     [find, messages, findQuery],
   );
   const findHitKeys = useMemo(() => new Set(findMatchesList.map((m) => m.key)), [findMatchesList]);
-  const bumpFindGeneration = useCallback(() => {
-    findGenRef.current += 1;
-    findPinRef.current = null;
-    setFindPin((prev) => (prev ? null : prev));
-  }, []);
   useEffect(() => {
     setFindCursor(0);
-    bumpFindGeneration();
-  }, [findQuery, bumpFindGeneration]);
-  useEffect(() => {
-    bumpFindGeneration();
-    setFindCursor(0);
-  }, [sessionId, bumpFindGeneration]);
-  useEffect(() => {
-    if (!find) {
-      bumpFindGeneration();
-      setFindQuery("");
-      setFindCursor(0);
-    }
-  }, [find, bumpFindGeneration]);
-  useEffect(() => {
-    if (sending) bumpFindGeneration();
-  }, [sending, bumpFindGeneration]);
-  useEffect(() => {
-    const pin = findPinRef.current;
-    if (!pin) return;
-    const stillHit = findMatchesList.some((match) => match.key === pin.renderKey);
-    if (!stillHit) bumpFindGeneration();
-  }, [findMatchesList, bumpFindGeneration]);
-  useEffect(() => {
-    const scroller = scrollParent;
-    if (!scroller) return;
-    const cancelIfFindPending = (event?: Event) => {
-      // Find-chrome edit/button/tap may keep the generation; real wheel/touchmove
-      // must invalidate even when event.target is inside the toolbar.
-      if (
-        event
-        && event.type !== "wheel"
-        && event.type !== "touchmove"
-        && eventInFindToolbar(scroller, event.target)
-      ) return;
-      if (findPinRef.current) bumpFindGeneration();
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      if (event.pointerType !== "mouse") return;
-      if (eventInFindToolbar(scroller, event.target)) return;
-      const gutter = scroller.offsetWidth - scroller.clientWidth;
-      const edge = Math.max(gutter, 12);
-      const rect = scroller.getBoundingClientRect();
-      const inScrollbar = event.clientX >= rect.right - edge - 1;
-      if (inScrollbar) cancelIfFindPending();
-    };
-    scroller.addEventListener("wheel", cancelIfFindPending, { passive: true });
-    scroller.addEventListener("touchmove", cancelIfFindPending, { passive: true });
-    scroller.addEventListener("pointerdown", onPointerDown);
-    return () => {
-      scroller.removeEventListener("wheel", cancelIfFindPending);
-      scroller.removeEventListener("touchmove", cancelIfFindPending);
-      scroller.removeEventListener("pointerdown", onPointerDown);
-    };
-  }, [scrollParent, bumpFindGeneration]);
-  useLayoutEffect(() => {
-    const pin = findPin;
-    const scroller = scrollParent;
-    const follow = followBottomRef;
-    if (!pin || !scroller || !follow) return;
-    const gen = pin.gen;
-    let frame = 0;
-    let stable = 0;
-    const started = typeof performance !== "undefined" ? performance.now() : Date.now();
-    const tick = () => {
-      frame = 0;
-      if (findGenRef.current !== gen || findPinRef.current?.gen !== gen) return;
-      const esc = escapeFindSelector(pin.renderKey);
-      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
-      if (el instanceof HTMLElement) {
-        const row = el.getBoundingClientRect();
-        follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
-        if (findGenRef.current !== gen) return;
-        if (findTargetVisible(el, scroller)) {
-          stable += 1;
-          if (stable >= FIND_ALIGN_STABLE_FRAMES) {
-            if (findGenRef.current === gen) {
-              lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(scroller);
-              findPinRef.current = null;
-              setFindPin((prev) => (prev && prev.gen === gen ? null : prev));
-              const settle = (left: number) => {
-                if (left <= 0 || findGenRef.current !== gen) return;
-                requestAnimationFrame(() => {
-                  if (findGenRef.current !== gen) return;
-                  const node = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
-                  if (node instanceof HTMLElement) {
-                    const next = node.getBoundingClientRect();
-                    follow.correctTo?.(scroller, scroller.scrollTop + (next.top - findViewTop(scroller)));
-                  }
-                  settle(left - 1);
-                });
-              };
-              settle(8);
-            }
-            return;
-          }
-        } else {
-          stable = 0;
-        }
-      } else {
-        stable = 0;
-      }
-      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
-      if (now - started > FIND_ALIGN_BUDGET_MS) {
-        if (findGenRef.current === gen) {
-          findPinRef.current = null;
-          setFindPin((prev) => (prev && prev.gen === gen ? null : prev));
-        }
-        return;
-      }
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => {
-      if (frame) cancelAnimationFrame(frame);
-    };
-  }, [findPin, scrollParent, followBottomRef, windowVersion]);
+  }, [findQuery]);
   useEffect(() => {
     const el = scrollParent;
     if (!el || !followBottomRef) {
@@ -1385,6 +1175,7 @@ export function MessageList({
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
   const eagerMediaKeysRef = useRef<Set<string> | null>(null);
+  const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
   const pinStartRef = useRef<number | undefined>(undefined);
   // INC-20260905-TIMELINE-BLANK probe state (passive; never writes scrollTop).
@@ -1418,8 +1209,6 @@ export function MessageList({
     eagerMediaKeysRef.current = null;
     lastViewportAnchorRef.current = null;
     lastPaintSpanRef.current = { start: -1, end: -1 };
-    findGenRef.current += 1;
-    findPinRef.current = null;
   }
 
   useEffect(() => {
@@ -1845,7 +1634,7 @@ export function MessageList({
       lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(scroller);
     };
     const follow = () => {
-      if (viewportPreserveLockRef.current || findPinRef.current) return;
+      if (viewportPreserveLockRef.current) return;
       if (followBottomRef.current) {
         followBottomRef.scrollToBottom?.(scroller);
         recapture();
@@ -1934,40 +1723,32 @@ export function MessageList({
   let paintEnd = visibleItems.length;
   const estimatePx = rowHeightEstimatePx(rowHeightCacheRef.current);
   if (paintOn && scrollParent) {
-    const pin = findPin;
-    const visIdx = pin ? pin.renderIndex - windowStart : -1;
-    if (pin && visIdx >= 0 && visIdx < visibleItems.length) {
-      const extra = findPaintNeighborhood(scrollParent.clientHeight, estimatePx);
-      paintStart = Math.max(0, visIdx - extra);
-      paintEnd = Math.min(visibleItems.length, visIdx + 1 + extra);
-    } else {
-      const followBottom = followBottomRef?.current === true;
-      const keyAt = (index: number) => itemKey(visibleItems[index]);
-      const desired = computePaintRange({
-        count: visibleItems.length,
-        scrollTop: scrollParent.scrollTop,
-        clientHeight: scrollParent.clientHeight,
-        followBottom,
-        keyAt,
-        heights: rowHeightCacheRef.current,
-        pinStart: pinPaintStart,
-        estimatePx,
-      });
-      const chosen = selectPaintRange({
-        prev: paintRange,
-        next: desired,
-        followBottom,
-        count: visibleItems.length,
-        scrollTop: scrollParent.scrollTop,
-        clientHeight: scrollParent.clientHeight,
-        keyAt,
-        heights: rowHeightCacheRef.current,
-        pinStart: pinPaintStart,
-        estimatePx,
-      });
-      paintStart = chosen.start;
-      paintEnd = chosen.end;
-    }
+    const followBottom = followBottomRef?.current === true;
+    const keyAt = (index: number) => itemKey(visibleItems[index]);
+    const desired = computePaintRange({
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      followBottom,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+      estimatePx,
+    });
+    const chosen = selectPaintRange({
+      prev: paintRange,
+      next: desired,
+      followBottom,
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+      estimatePx,
+    });
+    paintStart = chosen.start;
+    paintEnd = chosen.end;
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
   blankProbeStateRef.current = { paintStart, paintEnd, sending, messagesLength: messages.length };
@@ -2009,7 +1790,6 @@ export function MessageList({
       follow &&
       follow.current !== true &&
       !viewportPreserveLockRef.current &&
-      !findPinRef.current &&
       lastViewportAnchorRef.current &&
       typeof follow.correctTo === "function"
     ) {
@@ -2100,7 +1880,6 @@ export function MessageList({
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
           eagerPayload={eagerPayloadKeysRef.current?.has(rowId) === true}
-          hostedPermission
         />
       </MessageBoundary>
     );
@@ -2160,23 +1939,6 @@ export function MessageList({
     </div>
   );
 
-  // Keep hooks before both the ref-binding and empty-activity early returns.
-  const pendingSig = messages
-    .filter((message) => message.role === "permission")
-    .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
-    .join("|");
-  const pendingPrompts = useMemo(
-    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
-    [pendingSig, readOnly, messages],
-  );
-  const requestIdByToolUseId = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const message of pendingPrompts) {
-      if (message.requestId && message.toolUseId) map.set(message.toolUseId, message.requestId);
-    }
-    return map;
-  }, [pendingPrompts]);
-
   // App/admin pass an explicit null during the callback-ref's first commit.
   // Do not mount the transcript in that frame; omitted/undefined remains the
   // lightweight test/non-scroll surface contract.
@@ -2202,34 +1964,34 @@ export function MessageList({
       ? -1
       : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
   const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const estimateTopForIndex = (index: number): number => {
+    const visIdx = Math.max(0, Math.min(visibleItems.length, index - windowStart));
+    return measuredRangePx(
+      0,
+      visIdx,
+      (i) => itemKey(visibleItems[i]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    );
+  };
   const jumpTo = (match: FindMatch) => {
     const follow = followBottomRef;
     const scroller = scrollParent;
     if (!follow || !scroller) return;
-    const target = locateFindMatch(findLookupItems(renderItems), match);
-    const gen = findGenRef.current + 1;
-    findGenRef.current = gen;
-    if (!target) {
-      findPinRef.current = null;
-      setFindPin(null);
-      return;
-    }
     follow.current = false;
-    follow.releaseUserIntent?.();
-    if (target.renderIndex < windowStart) {
-      beginViewportPreserve();
-      startOverrideRef.current = target.renderIndex;
-      setWindowVersion((value) => value + 1);
-    }
-    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey };
-    findPinRef.current = pin;
-    setFindPin(pin);
-    const esc = escapeFindSelector(target.renderKey);
-    const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
-    if (el instanceof HTMLElement) {
-      const row = el.getBoundingClientRect();
-      follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
-    }
+    const top = estimateTopForIndex(match.index);
+    follow.correctTo?.(scroller, top);
+    requestAnimationFrame(() => {
+      const esc =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(match.key)
+          : match.key.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      if (!(el instanceof HTMLElement)) return;
+      const r = el.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      follow.correctTo?.(scroller, scroller.scrollTop + (r.top - s.top) - 48);
+    });
   };
   const goFind = (dir: 1 | -1) => {
     if (sending || findMatchesList.length === 0) return;
@@ -2239,44 +2001,10 @@ export function MessageList({
     const match = findMatchesList[next];
     if (match) jumpTo(match);
   };
-  const stopFindKeys = (event: { stopPropagation: () => void }) => {
-    event.stopPropagation();
-  };
   return (
-    <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
     <>
-    <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
-    {pendingPrompts.length > 0 ? (
-      <div
-        data-testid="pending-permission-dock"
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 bg-bg/95 px-5 py-2"
-      >
-        <span className="text-caption text-muted">待回答</span>
-        {pendingPrompts.map((message) => (
-          <button
-            key={message.requestId ?? message.id}
-            type="button"
-            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent"
-            onClick={() => {
-              if (message.requestId) reopenPermissionUi(message.requestId);
-            }}
-          >
-            {message.toolName === "AskUserQuestion"
-              ? "打开提问"
-              : message.toolName === "ExitPlanMode"
-                ? "打开计划"
-                : "打开审批"}
-          </button>
-        ))}
-      </div>
-    ) : null}
     {find ? (
-      <div
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2"
-        onKeyDown={stopFindKeys}
-        onPointerDown={stopFindKeys}
-        onTouchStart={stopFindKeys}
-      >
+      <div className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2">
         <Input
           aria-label="在会话中查找"
           autoFocus
@@ -2284,7 +2012,6 @@ export function MessageList({
           value={findQuery}
           onChange={(e) => setFindQuery(e.target.value)}
           onKeyDown={(e) => {
-            stopFindKeys(e);
             if (e.key === "Escape") {
               e.preventDefault();
               find.onClose();
@@ -2306,13 +2033,6 @@ export function MessageList({
           aria-label="上一处"
           title={sending ? "生成中暂不可跳转" : "上一处"}
           disabled={sending || findMatchesList.length === 0}
-          onKeyDown={(event) => {
-            stopFindKeys(event);
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              goFind(-1);
-            }
-          }}
           onClick={() => goFind(-1)}
         >
           <ChevronUp size={16} />
@@ -2323,24 +2043,11 @@ export function MessageList({
           aria-label="下一处"
           title={sending ? "生成中暂不可跳转" : "下一处"}
           disabled={sending || findMatchesList.length === 0}
-          onKeyDown={(event) => {
-            stopFindKeys(event);
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              goFind(1);
-            }
-          }}
           onClick={() => goFind(1)}
         >
           <ChevronDown size={16} />
         </IconButton>
-        <IconButton
-          shape="square"
-          size="sm"
-          aria-label="关闭查找"
-          onKeyDown={stopFindKeys}
-          onClick={find.onClose}
-        >
+        <IconButton shape="square" size="sm" aria-label="关闭查找" onClick={find.onClose}>
           <X size={16} />
         </IconButton>
       </div>
@@ -2351,7 +2058,6 @@ export function MessageList({
       data-testid="timeline-short-list"
       data-timeline-window-count={visibleItems.length}
       data-timeline-paint-count={paintedItems.length}
-      data-find-pin={findPin?.renderKey ?? ""}
     >
       {historyControl}
       {paintStart > 0 ? (
@@ -2446,6 +2152,5 @@ export function MessageList({
       )}
     </div>
     </>
-    </PermissionToolReopenContext.Provider>
   );
 }
