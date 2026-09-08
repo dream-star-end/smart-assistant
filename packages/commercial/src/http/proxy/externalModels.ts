@@ -7,13 +7,20 @@
  *   - the response must be the Anthropic **and** OpenAI compatible list shape
  *     (`{ data: [{ id, … }] }`) that desktop tools such as CC Switch parse when
  *     the user clicks「获取模型」— they only read `data[].id`;
- *   - ids are the **public** ids (`fable-5.1-high`), never the internal
- *     engine-prefixed catalog ids. This surface never names the engine.
+ *   - ids are the **public family** ids (`fable-5.1`, `grok-4.6-fast`), never
+ *     the internal engine-prefixed catalog ids and never effort-suffixed. This
+ *     surface never names the engine, and it never pins the thinking depth:
+ *     the client (Claude Code `/effort`, `--effort`, `CLAUDE_CODE_EFFORT_LEVEL`)
+ *     chooses effort per request and the proxy resolves family + effort to the
+ *     internal variant (`resolveCursorPublicModel`). Effort-suffixed ids are
+ *     still accepted on `/v1/messages` (pinned) but are not advertised here.
  *
- * Scope: exactly the models this key's owner may run through the external
- * endpoint today — cursor-engine catalog rows that are enabled and pass
- * `canUseModel` (role / grants / min_plan / visibility / denials). Other
- * catalog engines are deliberately excluded: they are not routable via
+ * Scope: exactly the model families this key's owner may run through the
+ * external endpoint today — a family is listed when **at least one** of its
+ * cursor-engine variants is enabled and passes `canUseModel` (role / grants /
+ * min_plan / visibility / denials); a request for a disabled level clamps to
+ * the nearest enabled one, so a partially enabled family is still callable.
+ * Other catalog engines are deliberately excluded: they are not routable via
  * `/api/anthropic/v1/messages` on this deployment, and listing something the
  * client cannot call is worse than a shorter list.
  *
@@ -26,7 +33,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   CURSOR_ENGINE_MODEL_IDS,
-  publicCursorModelId,
+  cursorFamilyPublicLabel,
+  cursorModelById,
+  publicCursorFamilyModelId,
 } from "@openclaude/protocol";
 import type { Logger } from "../../logging/logger.js";
 import { IdentityError, type ProxyIdentity } from "../../auth/proxyIdentity.js";
@@ -74,19 +83,21 @@ const CATALOG_EPOCH_ISO = "2026-09-01T00:00:00Z";
 const CATALOG_EPOCH_SECONDS = Math.floor(Date.parse(CATALOG_EPOCH_ISO) / 1000);
 
 /**
- * Pure projection: which cursor-engine models may `uid`'s authz run, as public
- * rows. Exported for unit tests; the handler wraps it with auth + HTTP.
+ * Pure projection: which cursor-engine model **families** may `uid`'s authz
+ * run, as public rows — one row per family-level public id, present when at
+ * least one variant is enabled + allowed. `display_name` is the family label
+ * (`Fable 5.1`, `Grok 4.6 Fast`) rather than a variant's `Fable 5.1 High`;
+ * families without an effort axis (`auto`, `composer-2.5`) keep their catalog
+ * display name. Sort key is the smallest `sort_order` among the family's
+ * listed variants. Exported for unit tests; the handler wraps it with auth + HTTP.
  */
 export function projectExternalModels(
   pricing: PricingCache,
   authz: Awaited<ReturnType<UserModelAuthzLoader>>,
   ownedBy: string,
 ): ExternalModelEntry[] {
-  const rows: { entry: ExternalModelEntry; sortOrder: number }[] = [];
-  const seen = new Set<string>();
+  const families = new Map<string, { entry: ExternalModelEntry; sortOrder: number }>();
   for (const internalId of CURSOR_ENGINE_MODEL_IDS) {
-    if (seen.has(internalId)) continue;
-    seen.add(internalId);
     const row = pricing.get(internalId);
     if (!row || !row.enabled) continue;
     const allowed = canUseModel(
@@ -101,20 +112,31 @@ export function projectExternalModels(
       },
     );
     if (!allowed) continue;
-    const id = publicCursorModelId(internalId);
-    rows.push({
+    const id = publicCursorFamilyModelId(internalId);
+    const existing = families.get(id);
+    if (existing) {
+      existing.sortOrder = Math.min(existing.sortOrder, row.sort_order);
+      continue;
+    }
+    const model = cursorModelById(internalId);
+    const displayName =
+      model && model.effort !== null
+        ? cursorFamilyPublicLabel(model.family, model.fast)
+        : row.display_name;
+    families.set(id, {
       sortOrder: row.sort_order,
       entry: {
         id,
         type: "model",
         object: "model",
-        display_name: row.display_name,
+        display_name: displayName,
         owned_by: ownedBy,
         created: CATALOG_EPOCH_SECONDS,
         created_at: CATALOG_EPOCH_ISO,
       },
     });
   }
+  const rows = [...families.values()];
   rows.sort((a, b) => a.sortOrder - b.sortOrder || a.entry.id.localeCompare(b.entry.id));
   return rows.map((r) => r.entry);
 }
