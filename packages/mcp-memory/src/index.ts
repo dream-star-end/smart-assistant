@@ -38,9 +38,6 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
   SkillDraftStore,
-  type SkillStore,
-  buildAgentSkillStore,
-  buildRunSkillStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
   searchSkillMetadata,
@@ -62,6 +59,7 @@ import {
   rewriteSelfDelegateErrorForMcp,
 } from './delegateArgs.js'
 import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
+import { buildMcpSkillStore } from './skillStoreContext.js'
 import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
@@ -131,13 +129,7 @@ const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
 
-function buildSkillStore(): SkillStore {
-  const projectId = (process.env.OPENCLAUDE_PROJECT_ID ?? '').trim()
-  if (projectId) return buildRunSkillStore({ agentId: AGENT_ID, projectId })
-  return buildAgentSkillStore(AGENT_ID)
-}
-
-const skills = buildSkillStore()
+const skills = buildMcpSkillStore()
 
 // ── Skill-eval arm 控制(评测隔离会话专用,普通会话两个 env 均缺省) ──
 // EXCLUDE:'without' 基线 —— 目标技能对本会话完全不可见(list/search/view 全隐藏,

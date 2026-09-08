@@ -19,6 +19,7 @@
     "build:mcp": "bash ./scripts/build-oc-memory-mcp.sh"
   },
   "dependencies": {
+    "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
     "@modelcontextprotocol/sdk": "^1.0.4",
     "better-sqlite3": "^11.3.0"
