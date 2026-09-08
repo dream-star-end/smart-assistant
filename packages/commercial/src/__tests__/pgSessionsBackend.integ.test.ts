@@ -74,12 +74,14 @@ import {
   type ServerAuthoredStorage,
 } from "../http/internalServerAuthored.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
+import { prepareSessionRowResetForTest } from "./helpers/sessionRows.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const SCHEMA = "oc_p2_sessions_test";
 const GENERATION = 1;
+let resetSessionRows: (() => Promise<void>) | undefined;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION_0066 = path.resolve(here, "../db/migrations/0066_wechat_pointer_outbox_audit.sql");
@@ -320,6 +322,7 @@ before(async () => {
        VALUES (true, 'pg_authoritative', $1, 'test-cutover', 'test-digest', $2)`,
     [GENERATION, Date.now()],
   );
+  resetSessionRows = await prepareSessionRowResetForTest(pool, SCHEMA);
   backend = createPgSessionsBackend(pool, { expectedGeneration: GENERATION });
 });
 
@@ -333,17 +336,11 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  // Some live-frame readers intentionally outlive the request that started
-  // them. Their final short SELECT can overlap the next fixture TRUNCATE and
-  // make PostgreSQL choose the reset as a 40P01 victim. Retry only that exact
-  // transient; every other setup error remains fatal.
+  assert.ok(resetSessionRows, "private session fixture setup must finish before each case");
+  // Retry the complete cleanup transaction only for the original 40P01 transient.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await pool.query(
-        `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-                 server_authored_request_map, pending_usage_patches, turn_waivers,
-                 wechat_bindings, admin_audit CASCADE`,
-      );
+      await resetSessionRows();
       break;
     } catch (error) {
       if ((error as { code?: string }).code !== "40P01" || attempt === 2) throw error;
@@ -5478,13 +5475,26 @@ describe("pgSessionsBackend §9 并发(双连接 barrier)", () => {
 describe("startSessionsGcSweeper advisory lease", () => {
   maybe("持锁者独占执行,备者竞不到锁", async () => {
     let statsCount = 0;
-    const s1 = startSessionsGcSweeper({ pool, intervalMs: 50, recompeteMs: 50, onStats: () => statsCount++ });
-    // 给 s1 时间竞到锁并跑一轮
-    await new Promise((r) => setTimeout(r, 200));
-    // 备者:同一固定 key 竞不到 → 不成为持有者(直接探测)
-    const probe = await pool.query("SELECT pg_try_advisory_lock(hashtextextended('oc_sessions_sweep_gc',0)) AS ok");
-    assert.equal(probe.rows[0].ok, false, "s1 持锁期间他人不应竞到");
-    await s1.stop();
+    let reportFirstSweep!: () => void;
+    let rejectFirstSweep!: (error: unknown) => void;
+    const firstSweep = new Promise<void>((resolve, reject) => {
+      reportFirstSweep = resolve;
+      rejectFirstSweep = reject;
+    });
+    const s1 = startSessionsGcSweeper({
+      pool, intervalMs: 50, recompeteMs: 50,
+      onStats: () => { statsCount++; reportFirstSweep(); },
+      onError: rejectFirstSweep,
+    });
+    try {
+      // Wait for the real completed sweep, not an assumed 200ms scheduling budget.
+      await firstSweep;
+      // 备者:同一固定 key 竞不到 → 不成为持有者(直接探测)
+      const probe = await pool.query("SELECT pg_try_advisory_lock(hashtextextended('oc_sessions_sweep_gc',0)) AS ok");
+      assert.equal(probe.rows[0].ok, false, "s1 持锁期间他人不应竞到");
+    } finally {
+      await s1.stop();
+    }
     // stop 后锁释放 → 现在能竞到
     const probe2 = await pool.query("SELECT pg_try_advisory_lock(hashtextextended('oc_sessions_sweep_gc',0)) AS ok");
     assert.equal(probe2.rows[0].ok, true, "stop 后锁应释放");

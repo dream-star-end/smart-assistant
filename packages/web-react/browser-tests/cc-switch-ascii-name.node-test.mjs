@@ -156,7 +156,7 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
       else await page.getByTestId("api-keys-list").waitFor();
       // A nondefault model proves the real fetch response, filtering and public-id conversion settled.
       await page.waitForFunction(() =>
-        document.querySelector('[data-testid="env-snippet"]')?.textContent?.includes("ANTHROPIC_MODEL=opus-5-high"));
+        document.querySelector('[data-testid="env-snippet"]')?.textContent?.includes("ANTHROPIC_MODEL=opus-5\n"));
       await assertNotImportable(page);
 
       if (source === "new") {
@@ -193,8 +193,8 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
       assert.equal(p.get("endpoint"), new URL(page.url()).origin + "/api/anthropic");
       assert.equal(p.get("apiKey"), source === "new" ? CREATED_KEY : EXISTING_KEY);
       for (const [field, model] of Object.entries({
-        model: "opus-5-high", opusModel: "opus-5-high",
-        sonnetModel: "sonnet-5-high", haikuModel: "gemini-3.8-flash-low",
+        model: "opus-5", opusModel: "opus-5",
+        sonnetModel: "sonnet-5", haikuModel: "gemini-3.8-flash",
       })) {
         assert.equal(p.get(field), model, field + " remains the public model id");
         assert.doesNotMatch(p.get(field), /^cursor-/);
@@ -206,6 +206,25 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
       assert.match(usage, /url: "\{\{baseUrl\}\}\/v1\/usage"/);
       assert.match(usage, /"Authorization": "Bearer \{\{apiKey\}\}"/);
       assert.match(usage, /extractor: function \(response\)/);
+      // The deep-link extra env and both visible configuration formats must agree.
+      assert.equal(p.get("configFormat"), "json");
+      const extraConfig = JSON.parse(Buffer.from(p.get("config") ?? "", "base64").toString("utf8"));
+      assert.deepEqual(extraConfig, { env: { CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: "1" } });
+      const manualConfig = JSON.parse(await page.getByTestId("ccswitch-config").textContent());
+      const standardEnv = {
+        ANTHROPIC_BASE_URL: p.get("endpoint"),
+        ANTHROPIC_AUTH_TOKEN: source === "new" ? p.get("apiKey") : "oc-cc.••••••••.••••••••",
+        ANTHROPIC_MODEL: p.get("model"),
+        ANTHROPIC_DEFAULT_OPUS_MODEL: p.get("opusModel"),
+        ANTHROPIC_DEFAULT_SONNET_MODEL: p.get("sonnetModel"),
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: p.get("haikuModel"),
+      };
+      assert.deepEqual(manualConfig.env, { ...standardEnv, ...extraConfig.env });
+      const snippetLines = (await page.getByTestId("env-snippet").textContent()).split("\n");
+      for (const [key, value] of Object.entries(manualConfig.env)) {
+        const shellValue = key === "ANTHROPIC_AUTH_TOKEN" ? "'" + value + "'" : value;
+        assert.ok(snippetLines.includes(`export ${key}=${shellValue}`), key + " agrees across URL, JSON and snippet");
+      }
       assert.equal(page.url(), origin + "/", "no native protocol or external navigation");
 
       assert.deepEqual(calls.map(({ method, path }) => method + " " + path).sort(), [

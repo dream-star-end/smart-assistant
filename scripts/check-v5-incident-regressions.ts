@@ -407,6 +407,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 只豁免其不可变祖先(含 2803a91e7 trailer 格式非法、090702dfe 声明 none 无 waiver 两条已上线提交);
   // 禁止 amend 源提交;后续新提交仍逐条走 trailer 门。
   "01885e894269b2d03346732a0ab41a450ecf2613",
+  // 2026-09-08 selfhost 8ab8a57c8 已上线(rel-8ab8a57c8-20260908-125444,live sourceCommit);
+  // 其祖先 f496228de(OCV5-171 CC Switch ASCII provider 名)trailer 写成 "OCV5-171 follow-up"
+  // 格式非法,源提交不可改写,只豁免其不可变祖先。之后的新提交仍逐条走 trailer 门
+  // (已 mutation 验证:tip 之上再加一条坏 trailer 的 fix(v5) 仍会红)。
+  "8ab8a57c82eee96028fe4d9b1015d3593c9e9334",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
