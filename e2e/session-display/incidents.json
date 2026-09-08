@@ -143,7 +143,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T1 点「+」→「添加附件」→ filechooser 真实弹出"
+          "assertion": "T1 点工具条回形针「添加附件」→ filechooser 真实弹出"
         },
         {
           "layer": "browser",
