@@ -16,6 +16,8 @@ runner 立即非零退出，`deploy-v5.sh --canary` 在同一 production-mutatio
 ## 事故与用例权威
 
 - `incidents.json`：近期 P0/P1 的事故 ID、症状、根修 commit 与回归证据。
+  P2 问题也可按真实严重度登记；登记后与 P0/P1 遵守完全相同的证据、血缘、runner、
+  assertion 与 proofPending 棘轮要求，不因等级获得豁免。P0/P1 必须登记的义务不变。
 - `scripts/check-v5-incident-regressions.ts`：CI/部署前检查事故 ID 唯一、根修仍在 HEAD 血缘、
   证据文件存在、每个事故有 browser/live/deploy proof，且每个 live spec 都被事故引用。
 - `SELECTORS.md`：UI 选择器与直接时间线契约。
