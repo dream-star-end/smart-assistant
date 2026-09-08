@@ -21,6 +21,7 @@ import {
   buildPermissionSidecarV1Body,
   iterateLosslessTurnTapeParts,
   isPermissionSidecarPayload,
+  shouldDeferLosslessVisibleUntilFinalize,
   getV3MasterSinkOrNull,
   makeV3MasterSink,
   readV3MasterSinkConfig,
@@ -293,6 +294,10 @@ describe("readV3MasterSinkConfig", () => {
 });
 
 describe("attemptSend — multipart upload", () => {
+  function envelopeActions(captures: Capture[]): string[] {
+    return captures.map((capture) => (JSON.parse(capture.body) as { action: string }).action);
+  }
+
   test("commits visible before every part, then uploads every part and finalize", async () => {
     const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
     const payload: V3MasterSinkPayload = {
@@ -337,6 +342,79 @@ describe("attemptSend — multipart upload", () => {
     assert.ok(Buffer.byteLength(captures[0]!.body, "utf8") < 192 * 1024);
     assert.deepEqual(decoded.payload.tools, payload.tools);
     assert.deepEqual(decoded.payload.agentGroups, payload.agentGroups);
+  });
+
+  test("late agent-group continuation defers visible until after parts+finalize", async () => {
+    const late: V3MasterSinkPayload = {
+      sessionId: "sess12345",
+      agentId: "late_0123456789abcdef01234567",
+      turnIndex: 1,
+      status: "completed",
+      text: "",
+      turnKey: "c".repeat(64),
+      continuationOfTurnKey: "b".repeat(64),
+      createdAt: 1_783_945_000_000,
+      agentGroups: [{
+        runId: "dlg-late-1",
+        agentId: "coding-assistant",
+        goal: "晚到子任务",
+        status: "ok",
+        completedAt: 1_783_945_000_001,
+      }],
+    };
+    assert.equal(shouldDeferLosslessVisibleUntilFinalize(late), true);
+    const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
+    await attemptSend(late, { config: CFG, fetcher });
+    const actions = envelopeActions(captures);
+    assert.ok(actions.length >= 2);
+    assert.notEqual(actions[0], "visible");
+    assert.ok(actions.slice(0, -1).every((action) => action === "part"));
+    assert.equal(actions.at(-1), "finalize");
+    const oldVisibleFirst = ["visible", ...actions.filter((action) => action === "part"), "finalize"];
+    assert.notDeepEqual(actions, oldVisibleFirst, "negative control: visible-first is the old red sequence");
+  });
+
+  test("runtimeEvents-only continuation keeps visible-first", async () => {
+    const tail: V3MasterSinkPayload = {
+      sessionId: "sess12345",
+      agentId: "tail_deadbeefdeadbeefdeadbe",
+      turnIndex: 1,
+      status: "completed",
+      text: "",
+      turnKey: "c".repeat(64),
+      continuationOfTurnKey: "b".repeat(64),
+      createdAt: 1_783_944_000_000,
+      runtimeEvents: [{
+        ordinal: 99,
+        observedAt: 1_783_944_000_000,
+        source: "ccb",
+        payload: { type: "system", subtype: "bash_output_tail" },
+      }],
+    };
+    assert.equal(shouldDeferLosslessVisibleUntilFinalize(tail), false);
+    const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
+    await attemptSend(tail, { config: CFG, fetcher });
+    const actions = envelopeActions(captures);
+    assert.equal(actions[0], "visible");
+    assert.equal(actions.at(-1), "finalize");
+    assert.ok(actions.slice(1, -1).every((action) => action === "part"));
+  });
+
+  test("ordinary root with agentGroups keeps visible-first", async () => {
+    const root: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      agentGroups: [{
+        runId: "dlg-on-root",
+        agentId: "coding-assistant",
+        goal: "root-owned",
+        status: "ok",
+        completedAt: 1,
+      }],
+    };
+    assert.equal(shouldDeferLosslessVisibleUntilFinalize(root), false);
+    const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
+    await attemptSend(root, { config: CFG, fetcher });
+    assert.equal(envelopeActions(captures)[0], "visible");
   });
 
   test("pre-agentId retry entry upgrades to reserved v2 identity", async () => {

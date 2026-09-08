@@ -3555,6 +3555,60 @@ async function loadAssembledTapePayload(
   }
 }
 
+async function loadAssembledTapePayloadAdmitted(
+  pool: Pool | PoolClient,
+  userId: string,
+  sessionId: string,
+  tapeId: string,
+  expected: { totalBytes: number; tapeSha256: string; partCount: number },
+): Promise<{ raw: unknown } | "incomplete"> {
+  const release = acquireFinalizeMemoryAdmission(expected.totalBytes);
+  try {
+    return await loadAssembledTapePayload(pool, userId, sessionId, tapeId, expected);
+  } finally {
+    release();
+  }
+}
+
+function isLateDelegateContinuationAgentId(agentId: string): boolean {
+  // B1 writer: `late_${runKey.slice(0, 24)}`. `tail_` runtimeEvents-only
+  // continuations keep the visible-first contract and must not assemble here.
+  return agentId.startsWith("late_");
+}
+
+function losslessEnvelopeMatchesPayload(
+  request: LosslessTurnTapeFinalizeRequest,
+  payload: LosslessTurnPayload,
+): boolean {
+  return payload.sessionId === request.sessionId &&
+    payload.agentId === request.agentId &&
+    payload.turnIndex === request.turnIndex &&
+    payload.status === request.status &&
+    payload.turnKey === request.turnKey &&
+    payload.waiveReason === request.waiveReason;
+}
+
+function assertLosslessEnvelopeMatchesPayload(
+  request: LosslessTurnTapeFinalizeRequest,
+  payload: LosslessTurnPayload,
+): void {
+  if (!losslessEnvelopeMatchesPayload(request, payload)) {
+    throw new Error("lossless turn tape envelope/payload identity mismatch");
+  }
+}
+
+function rethrowInspectTapeError(err: unknown): never {
+  if (err && typeof err === "object") {
+    if ((err as { immutableConflict?: unknown }).immutableConflict === true) throw err;
+    if ((err as { retryable?: unknown }).retryable === true) throw err;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/part hash mismatch|aggregate (?:hash|length) mismatch|canonical JSON invalid|envelope\/payload identity mismatch/.test(msg)) {
+    throw err;
+  }
+  throw retryableTapeError("late-delegate root lookup failed", err);
+}
+
 /** Master-side R1-4: agent-group continuation vs the owner root tape's parts/records. */
 export async function inspectLateDelegateContinuationAgainstRoot(
   pool: Pool | PoolClient,
@@ -3564,9 +3618,12 @@ export async function inspectLateDelegateContinuationAgainstRoot(
 ): Promise<LateDelegateRootDecision> {
   let payload = continuationPayload;
   if (!payload) {
+    // Cheap gate: HTTP finalize has no continuationOfTurnKey on the envelope.
+    // Ordinary / huge roots must not Buffer.allocUnsafe before admission.
+    if (!isLateDelegateContinuationAgentId(request.agentId)) return "proceed";
     let assembled: { raw: unknown } | "incomplete";
     try {
-      assembled = await loadAssembledTapePayload(
+      assembled = await loadAssembledTapePayloadAdmitted(
         pool,
         userId,
         request.sessionId,
@@ -3578,18 +3635,13 @@ export async function inspectLateDelegateContinuationAgainstRoot(
         },
       );
     } catch (err) {
-      if (err && typeof err === "object" && (err as { immutableConflict?: unknown }).immutableConflict === true) {
-        throw err;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/part hash mismatch|aggregate (?:hash|length) mismatch|canonical JSON invalid/.test(msg)) {
-        throw err;
-      }
-      throw retryableTapeError("late-delegate root lookup failed", err);
+      rethrowInspectTapeError(err);
     }
     if (assembled === "incomplete") return "retry";
     payload = parseLosslessTurnPayload(assembled.raw);
   }
+  // Identity vs the upload envelope must run before any idempotent ACK.
+  assertLosslessEnvelopeMatchesPayload(request, payload);
   const ownerTurnKey = payload.continuationOfTurnKey;
   const groups = payload.agentGroups;
   if (!ownerTurnKey || !Array.isArray(groups) || groups.length === 0) return "proceed";
@@ -3601,6 +3653,10 @@ export async function inspectLateDelegateContinuationAgainstRoot(
     part_count: number;
     finalized_at: string | null;
     visible_at: string | null;
+    agent_id: string;
+    turn_index: number;
+    status: string;
+    turn_key: string;
   }>;
   try {
     roots = (
@@ -3611,9 +3667,14 @@ export async function inspectLateDelegateContinuationAgainstRoot(
         part_count: number;
         finalized_at: string | null;
         visible_at: string | null;
+        agent_id: string;
+        turn_index: number;
+        status: string;
+        turn_key: string;
       }>(
         `SELECT t.tape_id, t.tape_sha256, t.total_bytes::text AS total_bytes, t.part_count,
-                t.finalized_at::text, t.visible_at::text
+                t.finalized_at::text, t.visible_at::text,
+                t.agent_id, t.turn_index, t.status, t.turn_key
            FROM client_session_turn_tapes t
           WHERE t.session_id=$1 AND t.user_id=$2 AND t.turn_key=$3
             AND t.continuation_of_turn_key IS NULL
@@ -3626,22 +3687,39 @@ export async function inspectLateDelegateContinuationAgainstRoot(
   }
   if (roots.length !== 1) return "retry";
   const root = roots[0]!;
+  // Parts-only is not an owner root. Keep durable retry until visible+finalized.
+  if (root.finalized_at == null || root.visible_at == null) return "retry";
   const totalBytes = bigIntNum(root.total_bytes, "root turn tape total_bytes");
   let assembledRoot: { raw: unknown } | "incomplete";
   try {
-    assembledRoot = await loadAssembledTapePayload(pool, userId, request.sessionId, root.tape_id, {
-      totalBytes,
-      tapeSha256: root.tape_sha256,
-      partCount: root.part_count,
-    });
+    assembledRoot = await loadAssembledTapePayloadAdmitted(
+      pool,
+      userId,
+      request.sessionId,
+      root.tape_id,
+      {
+        totalBytes,
+        tapeSha256: root.tape_sha256,
+        partCount: root.part_count,
+      },
+    );
   } catch (err) {
-    throw retryableTapeError("late-delegate root lookup failed", err);
+    rethrowInspectTapeError(err);
   }
   if (assembledRoot === "incomplete") return "retry";
   let rootPayload: LosslessTurnPayload;
   try {
     rootPayload = parseLosslessTurnPayload(assembledRoot.raw);
   } catch {
+    return "retry";
+  }
+  if (
+    rootPayload.sessionId !== request.sessionId ||
+    rootPayload.agentId !== root.agent_id ||
+    rootPayload.turnIndex !== root.turn_index ||
+    rootPayload.status !== root.status ||
+    rootPayload.turnKey !== root.turn_key
+  ) {
     return "retry";
   }
   const rootGroups = rootPayload.agentGroups ?? [];
@@ -3722,32 +3800,30 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
-  const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
-    pool,
-    userId,
-    request,
-    turn.payload,
-  );
-  if (lateDelegateRoot === "retry") return null;
-  if (lateDelegateRoot === "idempotent") {
-    throw Object.assign(new Error("late-delegate continuation already on root"), {
-      lateDelegateRootIdempotent: true,
-    });
+  // Envelope/payload identity must run before any late-delegate idempotent ACK.
+  assertLosslessEnvelopeMatchesPayload(request, turn.payload);
+  if (
+    turn.payload.continuationOfTurnKey &&
+    Array.isArray(turn.payload.agentGroups) &&
+    turn.payload.agentGroups.length > 0
+  ) {
+    const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
+      pool,
+      userId,
+      request,
+      turn.payload,
+    );
+    if (lateDelegateRoot === "retry") return null;
+    if (lateDelegateRoot === "idempotent") {
+      throw Object.assign(new Error("late-delegate continuation already on root"), {
+        lateDelegateRootIdempotent: true,
+      });
+    }
   }
   // Record payload BYTEA + content_sha256 stay the part-derived original.
   // visible_payload is also BYTEA and stays exact (timeline must round-trip
   // JSON \u0000). PostgreSQL jsonb rejects \u0000 / unpaired surrogates;
   // only jsonb binds and sidecar TEXT may be rewritten.
-  if (
-    turn.payload.sessionId !== request.sessionId ||
-    turn.payload.agentId !== request.agentId ||
-    turn.payload.turnIndex !== request.turnIndex ||
-    turn.payload.status !== request.status ||
-    turn.payload.turnKey !== request.turnKey ||
-    turn.payload.waiveReason !== request.waiveReason
-  ) {
-    throw new Error("lossless turn tape envelope/payload identity mismatch");
-  }
   const visible: UserVisiblePhysicalPayload[] = [];
   for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
     await yieldLosslessTapeWork();
@@ -9316,7 +9392,7 @@ export function createPgSessionsBackend(
         userId,
         request,
       );
-      if (readyForPreparation) {
+      if (readyForPreparation && isLateDelegateContinuationAgentId(request.agentId)) {
         const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
           pool,
           userId,

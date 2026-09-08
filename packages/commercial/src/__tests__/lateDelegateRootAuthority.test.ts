@@ -81,12 +81,29 @@ function partOf(body: object) {
   return { buf, sha: sha256(buf), bytes: buf.length };
 }
 
+const ORDINARY_TAPE = "tape-ordinary-root";
+const LATE_AGENT = "late_0123456789abcdef01234567";
+
 type Script = {
+  rootUnready?: boolean;
   rootParts?: Buffer | null;
   lateParts?: Buffer;
   rootLookupError?: Error;
   userId?: string;
+  rootHeader?: {
+    agentId?: string;
+    turnIndex?: number;
+    status?: string;
+    turnKey?: string;
+  };
 };
+
+function assembledFullPayloadSql(sql: string): boolean {
+  return sql.includes("FROM client_session_turn_tape_parts")
+    && sql.includes("ORDER BY part_index")
+    && !sql.includes("octet_length")
+    && /\bpayload\b/.test(sql);
+}
 
 function fakePool(script: Script) {
   const sqls: string[] = [];
@@ -109,14 +126,20 @@ function fakePool(script: Script) {
           tape_sha256: script.rootParts ? sha256(script.rootParts) : root.sha,
           total_bytes: String(script.rootParts ? script.rootParts.length : root.bytes),
           part_count: 1,
-          finalized_at: "1",
-          visible_at: "1",
+          finalized_at: script.rootUnready ? null : "1",
+          visible_at: script.rootUnready ? null : "1",
+          agent_id: script.rootHeader?.agentId ?? "main",
+          turn_index: script.rootHeader?.turnIndex ?? 1,
+          status: script.rootHeader?.status ?? "completed",
+          turn_key: script.rootHeader?.turnKey ?? OWNER_TURN,
         }],
       };
     }
     if (sql.includes("octet_length(payload)")) {
       const tapeId = String(params[2]);
-      const buf = tapeId === ROOT_TAPE ? (script.rootParts ?? root.buf) : lateParts;
+      const buf = tapeId === ROOT_TAPE || tapeId === ORDINARY_TAPE
+        ? (script.rootParts ?? root.buf)
+        : lateParts;
       if (tapeId === ROOT_TAPE && script.rootParts === null) return { rows: [] };
       return {
         rows: [{
@@ -128,8 +151,8 @@ function fakePool(script: Script) {
     }
     if (sql.includes("FROM client_session_turn_tape_parts")) {
       const tapeId = String(params[2]);
-      if (tapeId === ROOT_TAPE) {
-        if (script.rootParts === null) return { rows: [] };
+      if (tapeId === ROOT_TAPE || tapeId === ORDINARY_TAPE) {
+        if (tapeId === ROOT_TAPE && script.rootParts === null) return { rows: [] };
         const buf = script.rootParts ?? root.buf;
         if (sql.includes("part_index=$4") || sql.includes("AND part_index=")) {
           return { rows: [{ part_sha256: sha256(buf), payload: buf }] };
@@ -142,9 +165,27 @@ function fakePool(script: Script) {
       return { rows: [{ part_index: 0, part_sha256: sha256(lateParts), payload: lateParts }] };
     }
     if (sql.includes("FROM client_session_turn_tapes")) {
+      const tapeId = String(params[2]);
+      if (tapeId === ORDINARY_TAPE) {
+        return {
+          rows: [{
+            agent_id: "main",
+            turn_index: 1,
+            status: "completed",
+            turn_key: OWNER_TURN,
+            tape_sha256: root.sha,
+            total_bytes: String(root.bytes),
+            part_count: 1,
+            created_at: String(CREATED_AT),
+            waive_reason: null,
+            finalized_at: null,
+            record_storage_format: 2,
+          }],
+        };
+      }
       return {
         rows: [{
-          agent_id: "late_0123456789abcdef01234567",
+          agent_id: LATE_AGENT,
           turn_index: 1,
           status: "completed",
           turn_key: CONT_TURN,
@@ -169,7 +210,7 @@ function fakePool(script: Script) {
       protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
       action: "finalize" as const,
       sessionId: SESSION_ID,
-      agentId: "late_0123456789abcdef01234567",
+      agentId: LATE_AGENT,
       turnIndex: 1,
       status: "completed" as const,
       turnKey: CONT_TURN,
@@ -179,10 +220,24 @@ function fakePool(script: Script) {
       partCount: 1,
       createdAt: CREATED_AT + 1,
     },
+    ordinaryRequest: {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize" as const,
+      sessionId: SESSION_ID,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed" as const,
+      turnKey: OWNER_TURN,
+      tapeId: ORDINARY_TAPE,
+      tapeSha256: root.sha,
+      totalBytes: root.bytes,
+      partCount: 1,
+      createdAt: CREATED_AT,
+    },
   };
 }
 
-describe("OCV5-180 B1 R6 master root authority", () => {
+describe("OCV5-180 B1 R7 master root authority", () => {
   test("fingerprint changes when transcript/status change and ignores ordinal", () => {
     const base = group();
     const a = canonicalAgentGroupFingerprint(base);
@@ -219,7 +274,7 @@ describe("OCV5-180 B1 R6 master root authority", () => {
     );
   });
 
-  test("inspect: ready root without the run proceeds; other user/session retry", async () => {
+  test("inspect: ready root without the run proceeds; other user retry; envelope session mismatch rejects", async () => {
     const empty = fakePool({ rootParts: partOf(rootBody([])).buf });
     assert.equal(
       await inspectLateDelegateContinuationAgainstRoot(empty.pool, USER_ID, empty.lateRequest),
@@ -231,12 +286,12 @@ describe("OCV5-180 B1 R6 master root authority", () => {
       "retry",
     );
     const crossSession = fakePool({});
-    assert.equal(
-      await inspectLateDelegateContinuationAgainstRoot(crossSession.pool, USER_ID, {
+    await assert.rejects(
+      () => inspectLateDelegateContinuationAgainstRoot(crossSession.pool, USER_ID, {
         ...crossSession.lateRequest,
         sessionId: "web-other-session",
       }),
-      "retry",
+      /identity mismatch|conflict/,
     );
   });
 
@@ -279,6 +334,69 @@ describe("OCV5-180 B1 R6 master root authority", () => {
     await assert.rejects(
       () => backend.finalizeLosslessTurnTape(USER_ID, conflict.lateRequest, { materialize: false }),
       (err: unknown) => Boolean(err && typeof err === "object" && (err as { immutableConflict?: boolean }).immutableConflict),
+    );
+  });
+
+  test("leader: same run cannot ACK before the root is durable and visible", async () => {
+    const p = fakePool({ rootUnready: true });
+    const result = await createPgSessionsBackend(p.pool, { expectedGeneration: 0 }).finalizeLosslessTurnTape(USER_ID, p.lateRequest, { materialize: false });
+    assert.equal(result.applied, "incomplete", "parts alone are not a completed owner root");
+    assert.equal(
+      p.sqls.filter(assembledFullPayloadSql).length,
+      1,
+      "unready root must not assemble owner parts after the timestamp gate",
+    );
+  });
+
+  test("leader: idempotent root hit must not bypass payload/envelope locator check", async () => {
+    const p = fakePool({ lateParts: partOf({ ...continuationBody(), turnIndex: 2 }).buf });
+    await assert.rejects(
+      () => createPgSessionsBackend(p.pool, { expectedGeneration: 0 }).finalizeLosslessTurnTape(USER_ID, p.lateRequest, { materialize: false }),
+      /identity mismatch|conflict/,
+    );
+    assert.equal(
+      p.sqls.some((sql) => sql.includes("continuation_of_turn_key IS NULL")),
+      false,
+      "identity mismatch must run before owner-root lookup or ACK",
+    );
+  });
+
+  test("inspect: unready root is retry; header/payload mismatch is retry", async () => {
+    const unready = fakePool({ rootUnready: true });
+    assert.equal(
+      await inspectLateDelegateContinuationAgainstRoot(unready.pool, USER_ID, unready.lateRequest),
+      "retry",
+    );
+    const headerMismatch = fakePool({ rootHeader: { turnIndex: 9 } });
+    assert.equal(
+      await inspectLateDelegateContinuationAgainstRoot(headerMismatch.pool, USER_ID, headerMismatch.lateRequest),
+      "retry",
+    );
+  });
+
+  test("ordinary root finalize does not extra-read all parts before admission", async () => {
+    const p = fakePool({});
+    const backend = createPgSessionsBackend(p.pool, { expectedGeneration: 0 });
+    const result = await backend.finalizeLosslessTurnTape(USER_ID, p.ordinaryRequest, { materialize: false });
+    assert.notEqual(result.applied, undefined);
+    assert.equal(
+      p.sqls.some(assembledFullPayloadSql),
+      false,
+      "ordinary root must not ungated full-read tape parts",
+    );
+    assert.equal(
+      p.sqls.some((sql) => sql.includes("continuation_of_turn_key IS NULL")),
+      false,
+      "ordinary root must not inspect owner-root authority",
+    );
+    assert.equal(
+      await inspectLateDelegateContinuationAgainstRoot(p.pool, USER_ID, p.ordinaryRequest),
+      "proceed",
+    );
+    assert.equal(
+      p.sqls.filter(assembledFullPayloadSql).length,
+      0,
+      "inspect cheap-gate must skip assemble for non-late_ agents",
     );
   });
 });
