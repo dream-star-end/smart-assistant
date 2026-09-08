@@ -5,6 +5,7 @@
  * Two Playwright browser contexts share the mock store (two devices).
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -13,6 +14,13 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(HERE, "../../..");
+const QA_COMMIT = execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" }).trim();
+const PRODUCT_SOURCE_SHA = process.env.OC_QA_PRODUCT_SHA || QA_COMMIT;
+assert.match(PRODUCT_SOURCE_SHA, /^[0-9a-f]{40}$/, "OC_QA_PRODUCT_SHA must be a full commit SHA");
+// A QA-only merge may have a different HEAD; its actual imported product source must still match.
+execFileSync("git", ["diff", "--exit-code", PRODUCT_SOURCE_SHA, "--",
+  "packages/web-react/src", "packages/protocol/src"], { cwd: ROOT, stdio: "pipe" });
 const NODE_CANDIDATES = [
   process.env.NODE_PATH,
   "/opt/openclaude/openclaude-v5-selfhost/node_modules",
@@ -34,14 +42,14 @@ const { resolveBrowserExecutable } = await import("../../../scripts/lib/resolve-
 
 const ARTIFACTS =
   process.env.OC_BROWSER_TEST_ARTIFACTS ||
-  "/home/agent/.openclaude/generated/OCV5-185-browser-qa-r1b-artifacts";
+  join(ROOT, "test-results", "ocv5-185-qa");
 mkdirSync(ARTIFACTS, { recursive: true });
 const FOCUS = (process.env.OC_QA_FOCUS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 function want(id) {
-  return FOCUS.length === 0 || FOCUS.includes(id);
+  return FOCUS.includes(id) || (FOCUS.length === 0 && id !== "T2w");
 }
 
 const SESS = "sess185qa01";
@@ -1084,7 +1092,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       join(ARTIFACTS, "summary.json"),
       JSON.stringify(
         {
-          freeze: "5a3f01b46962373d5eb7c57c09525b3907ea0b2d",
+          freeze: PRODUCT_SOURCE_SHA,
+          qaCommit: QA_COMMIT,
           origin,
           failures,
           promptsLeft: [...store.prompts.keys()],
