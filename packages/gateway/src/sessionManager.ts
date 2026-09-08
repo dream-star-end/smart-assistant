@@ -7653,6 +7653,24 @@ export class SessionManager {
       if (admission === 'conflict' || admission === 'session_deleted') return false
       if (admission === 'duplicate') return true
     }
+    // OCV5-189 diagnostics only: exact-owner requests for an earlier/sealed
+    // turn were already rejected above and the caller takes the durable late
+    // path. Legacy ownerless or anomalous billings may still reach this point;
+    // logging must not change admission, queue ownership or drain semantics.
+    const currentTurnKey = parent._currentTurnKey
+    const crossTurn = (group.engineBillings ?? []).filter(
+      (billing) => typeof billing.parentTurnKey === 'string' && billing.parentTurnKey !== currentTurnKey,
+    )
+    if (currentTurnKey && crossTurn.length > 0) {
+      log.warn('delegate team card drains into a later turn than its billing parent', {
+        parentSessionKey,
+        runId: group.runId,
+        agentId: group.agentId,
+        currentTurnKey,
+        billingParentTurnKeys: [...new Set(crossTurn.map((billing) => billing.parentTurnKey))],
+        requestIds: crossTurn.map((billing) => billing.requestId),
+      })
+    }
     ;(parent._pendingAgentGroups ??= []).push({
       group: {
         ...group,

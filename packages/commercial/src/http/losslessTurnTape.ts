@@ -498,9 +498,11 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   }
   const seenBillingRequestIds = new Set<string>();
   if (engineBilling) seenBillingRequestIds.add(engineBilling.requestId);
-  // OCV5-180 B1 — a continuation tape bills under its OWNER turn key, never
-  // under the continuation's own derived key. Root tapes keep comparing
-  // against their own turnKey (unchanged rule).
+  // OCV5-180 / 189 — root tapes accept same-session, well-formed billing
+  // locators from older writers that drained a prior turn's delegate card.
+  // This is read compatibility, not a legacy-version gate. New writers keep
+  // exact ownership at admission; continuations must still bill their OWNER,
+  // never their derived tape key or another turn. Keep billing bytes unchanged.
   const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey;
   for (let groupIndex = 0; groupIndex < (agentGroups ?? []).length; groupIndex++) {
     const group = agentGroups![groupIndex]!;
@@ -508,7 +510,12 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     if (billings === undefined) continue;
     for (let billingIndex = 0; billingIndex < (billings as DurableCodexBilling[]).length; billingIndex++) {
       const billing = (billings as DurableCodexBilling[])[billingIndex]!;
-      if (billing.parentTurnKey !== groupBillingOwnerTurnKey || billing.parentSessionId !== sessionId) {
+      if (
+        typeof billing.parentTurnKey !== "string" ||
+        !SAFE_TURN_KEY.test(billing.parentTurnKey) ||
+        billing.parentSessionId !== sessionId ||
+        (continuationOfTurnKey !== undefined && billing.parentTurnKey !== groupBillingOwnerTurnKey)
+      ) {
         throw new Error(
           `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] parent locator is invalid`,
         );
