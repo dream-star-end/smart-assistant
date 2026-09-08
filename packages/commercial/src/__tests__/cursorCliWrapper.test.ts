@@ -516,9 +516,11 @@ describe('oc-cursor wrapper', () => {
       env: { ...f.env, OC_CURSOR_TEST_SLEEP: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'child-routes')); i += 1) {
+    // Opening child-routes precedes printf; ready follows the write and TERM trap.
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'ready')); i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
+    assert.ok(existsSync(join(f.capture, 'ready')), 'first CLI did not become ready')
     assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
 
     const second = spawn(f.wrapper, ['--', 'switch attempt'], {
