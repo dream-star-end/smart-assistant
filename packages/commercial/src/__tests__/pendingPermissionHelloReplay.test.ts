@@ -16,6 +16,8 @@ import {
   PERMISSION_PROMPT_READ_TIMEOUT_MS,
   PERMISSION_PROMPT_SNAPSHOT_LIMIT,
   classifyPermissionInput,
+  permissionReadKind,
+  queryPermissionRead,
   parsePermissionLookupIds,
   pendingPermissionPromptToFrame,
   readPendingPermissionPrompts,
@@ -593,4 +595,84 @@ describe('250ms statement timeout on real pools', () => {
     assert.equal(PERMISSION_PROMPT_READ_TIMEOUT_MS, 250)
     assert.ok(sqls.some((sql) => /SET LOCAL statement_timeout = 250/.test(sql)))
   })
+
+  test('borrowed PoolClient is not reconnected or committed', async () => {
+    const sqls: string[] = []
+    let connects = 0
+    const client = {
+      async connect() {
+        connects += 1
+        throw new Error('Client has already been connected. You cannot reuse a client.')
+      },
+      async query(sql: string) {
+        sqls.push(sql)
+        if (/SHOW statement_timeout/.test(sql)) {
+          return { rows: [{ statement_timeout: '0' }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      },
+      release() {
+        throw new Error('must not release caller transaction')
+      },
+    }
+    assert.equal(permissionReadKind(client), 'borrowed')
+    await readPermissionPromptSnapshot(client as unknown as Pool, { userId: 3n, sessionId: PEER_ID })
+    assert.equal(connects, 0)
+    assert.ok(sqls.some((sql) => /SAVEPOINT oc_perm_r_/.test(sql)))
+    assert.ok(sqls.some((sql) => /SET LOCAL statement_timeout = 250/.test(sql)))
+    assert.equal(sqls.some((sql) => sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK'), false)
+  })
+
+  test('queryPermissionRead on borrowed client restores timeout after failure', async () => {
+    const sqls: string[] = []
+    const client = {
+      async query(sql: string) {
+        sqls.push(sql)
+        if (/SHOW statement_timeout/.test(sql)) {
+          return { rows: [{ statement_timeout: '30s' }], rowCount: 1 }
+        }
+        if (/FROM turn_permission_requests/.test(sql)) {
+          throw new Error('57014 canceling statement due to statement timeout')
+        }
+        return { rows: [], rowCount: 0 }
+      },
+      release() {},
+    }
+    await assert.rejects(
+      () => queryPermissionRead(client, 'SELECT 1 FROM turn_permission_requests', []),
+    )
+    assert.ok(sqls.some((sql) => /ROLLBACK TO SAVEPOINT/.test(sql)))
+    assert.ok(sqls.some((sql) => sql.includes("SET LOCAL statement_timeout = '30s'")))
+  })
+})
+
+describe('hello fair-share completeness with uneven sessions', () => {
+  for (const fixture of [
+    { name: '31 saturated sessions plus one detached survivor', counts: [1, ...Array<number>(31).fill(2)], limited: true },
+    { name: 'one saturated session and 31 empty sessions', counts: [2, ...Array<number>(31).fill(0)], limited: true },
+    { name: 'all sessions below their fair share', counts: Array<number>(32).fill(1), limited: false },
+  ]) {
+    test(fixture.name, async () => {
+      const sessionIds = Array.from({ length: 32 }, (_, i) => `fair-${i}`)
+      const raw = fixture.counts.flatMap((count, s) => Array.from({ length: count }, (_, r) => ({
+        session_id: sessionIds[s]!,
+        request_id: `fair-${s}-${r}`,
+        client_message_id: `m-${s}`,
+        tool_use_id: `fair-${s}-${r}`,
+        tool_name: 'AskUserQuestion',
+        input_json: { questions: [{ question: 'q' }] },
+        expires_at: new Date(Date.now() + 60_000),
+      })))
+      const pool = {
+        async query(_sql: string, params: unknown[]) {
+          assert.equal(params[2], 64)
+          assert.equal(params[3], 2)
+          return { rows: raw, rowCount: raw.length }
+        },
+      } as unknown as Pool
+      const scan = await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds })
+      assert.equal([...scan.bySession.values()].reduce((n, rows) => n + rows.length, 0), raw.length)
+      assert.equal(scan.rowLimited, fixture.limited)
+    })
+  }
 })

@@ -231,7 +231,7 @@ export function PermissionCard({
   const pending = msg._controlPending === true;
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
-  const [fullReady, setFullReady] = useState(msg._inputTruncated !== true);
+  const [fullReady, setFullReady] = useState(() => msg._inputTruncated !== true);
   const isExitPlan = isExitPlanModeTool(msg.toolName);
   const input = permissionInput(msg);
   const planMarkdown = isExitPlan ? extractExitPlanMarkdown(input) : "";
@@ -241,13 +241,16 @@ export function PermissionCard({
   const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt) && !inputTruncated;
 
   useEffect(() => {
-    if (msg._inputTruncated !== true || !msg.requestId) {
+    const requestId = msg.requestId;
+    if (msg._inputTruncated !== true || !requestId) {
       setFullReady(true);
       return;
     }
+    setFullReady(false);
     let cancelled = false;
-    void fetchPermissionFullInput(msg.requestId).then((full) => {
+    void fetchPermissionFullInput(requestId).then((full) => {
       if (cancelled || !full) return;
+      if (msg.requestId !== requestId) return;
       msg.inputJson = full;
       msg._inputTruncated = false;
       setFullReady(true);
@@ -269,6 +272,9 @@ export function PermissionCard({
   }, [resolved, pending, readOnly, expired, livePrompt, inputTruncated, msg.requestId]);
 
   useEffect(() => {
+    // Timeline cards are card-only and must not auto-open or occupy the slot
+    // (T3: visibilitychange would markDisplayed with no modal).
+    if (renderMode === "card") return;
     if (!livePrompt || resolved || pending || readOnly || expired) return;
     const onVis = () => {
       const requestId = msg.requestId;
@@ -277,13 +283,14 @@ export function PermissionCard({
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
+  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId, renderMode]);
 
   useEffect(() => {
+    if (renderMode === "card") return;
     if (open && isDocumentForeground() && msg.requestId) {
       markPermissionDisplayed(msg.requestId);
     }
-  }, [open, msg.requestId]);
+  }, [open, msg.requestId, renderMode]);
 
   useEffect(() => {
     return subscribePermissionCoordinator(() => {
@@ -294,16 +301,24 @@ export function PermissionCard({
         setOpen(false);
         return;
       }
+      if (renderMode === "card") return;
       if (shouldAutoOpenPermission({ requestId, livePrompt })) setOpen(true);
     });
-  }, [livePrompt, msg.requestId]);
+  }, [livePrompt, msg.requestId, renderMode]);
+
+  useEffect(() => {
+    if (resolved && msg.requestId && renderMode !== "card") {
+      yieldActiveModal(msg.requestId);
+    }
+  }, [resolved, msg.requestId, renderMode]);
 
   useEffect(() => {
     const requestId = msg.requestId;
     return () => {
-      // Timeline cards are card-only; Host owns the singleton slot.
-      // Yielding on virtualization unmount was T5: slot occupied, 0 dialogs.
-      if (requestId && renderMode === "both") yieldActiveModal(requestId);
+      // Timeline cards are card-only and must not yield on virtualization
+      // unmount (T5). Host/modal and standalone both-mode cards yield so a
+      // settled or replaced request cannot occupy the singleton slot.
+      if (requestId && renderMode !== "card") yieldActiveModal(requestId);
     };
   }, [msg.requestId, renderMode]);
 
@@ -448,17 +463,21 @@ export function PermissionCard({
           {settledReasonLabel(msg._settledReason)}
         </div>
       )}
+      </> : null}
       {inputTruncated && !resolved && (
-        <div className="border-t border-border px-3.5 py-2 text-caption text-faint">
+        <div
+          data-testid="permission-input-loading"
+          className="border-t border-border px-3.5 py-2 text-caption text-faint"
+        >
           完整问题仍在加载，加载完成前不能提交。
         </div>
       )}
-      </> : null}
 
       {/* 审批 modal */}
       {showModal && canAnswer &&
         (questions ? (
           <AskUserQuestionModal
+            key={msg.requestId}
             open={open}
             onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
@@ -468,6 +487,7 @@ export function PermissionCard({
           />
         ) : isExitPlan ? (
           <ExitPlanModeModal
+            key={msg.requestId}
             open={open}
             onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
@@ -477,6 +497,7 @@ export function PermissionCard({
           />
         ) : (
           <GenericPermissionModal
+            key={msg.requestId}
             open={open}
             onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
@@ -497,16 +518,23 @@ export function PermissionPromptHost({
   onRespond,
   readOnly = false,
   sending = false,
+  sessionId,
 }: {
   messages: ChatMessage[];
   onRespond: PermissionRespond;
   readOnly?: boolean;
   sending?: boolean;
+  sessionId?: string;
 }) {
   const [, setTick] = useState(0);
   useEffect(() => subscribePermissionCoordinator(() => {
     setTick((n) => n + 1);
   }), []);
+  useEffect(() => {
+    const onVis = () => setTick((n) => n + 1);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
   if (readOnly) return null;
   const pending = messages.filter(
     (message) =>
@@ -526,6 +554,7 @@ export function PermissionPromptHost({
   if (!msg) return null;
   return (
     <PermissionCard
+      key={`${sessionId ?? ""}:${msg.requestId}`}
       msg={msg}
       onRespond={onRespond}
       livePrompt
@@ -706,11 +735,18 @@ function AskUserQuestionModal({
   });
   const [error, setError] = useState<number | null>(null);
 
+  useEffect(() => {
+    const init: Record<string, QState> = {};
+    for (const q of questions) init[q.question] = { selected: [], other: "" };
+    setState(init);
+    setError(null);
+  }, [requestId]);
+
   const setQ = (qtext: string, next: Partial<QState>) =>
     setState((s) => ({ ...s, [qtext]: { ...s[qtext], ...next } }));
 
   const toggle = (q: AqQuestion, label: string) => {
-    const cur = state[q.question];
+    const cur = state[q.question] ?? { selected: [], other: "" };
     if (q.multiSelect) {
       const has = cur.selected.includes(label);
       setQ(q.question, { selected: has ? cur.selected.filter((l) => l !== label) : [...cur.selected, label] });
@@ -724,7 +760,7 @@ function AskUserQuestionModal({
     const annotations: Record<string, { preview: string }> = {};
     for (let i = 0; i < questions.length; i++) {
       const q = questions[i];
-      const qs = state[q.question];
+      const qs = state[q.question] ?? { selected: [], other: "" };
       if (qs.selected.length === 0) {
         setError(i);
         return;
@@ -786,7 +822,7 @@ function AskUserQuestionModal({
     >
       <div className="space-y-5">
         {questions.map((q, idx) => {
-          const qs = state[q.question];
+          const qs = state[q.question] ?? { selected: [], other: "" };
           const hasPreview = !q.multiSelect && (q.options ?? []).some((o) => !!o.preview);
           const safeOptions = (q.options ?? []).filter((o) => o && o.label !== OTHER);
           const showOther = !hasPreview && !q.multiSelect;

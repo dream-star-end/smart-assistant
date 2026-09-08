@@ -260,4 +260,65 @@ describe('OCV5-185 isolated PG EXPLAIN + 200+ scale', () => {
     assert.equal(looked[0]?.inputTruncated, false)
     assert.equal((looked[0]?.input.questions as Array<{ question: string }>)[0]?.question, question)
   })
+
+  test('Q1 uneven 32-session fair share marks truncation below the 64-row budget', async (t) => {
+    if (skipIfNeeded(t)) return
+    await pool.query(`
+      INSERT INTO turn_permission_requests
+        (user_id,request_id,session_id,client_message_id,tool_use_id,tool_name,input_sha256,input_json,status,expires_at)
+      SELECT 3, 'q1-' || s || '-' || r, 'q1-' || s, 'q1-m-' || s,
+             'q1-' || s || '-' || r, 'AskUserQuestion', repeat('e',64),
+             '{"questions":[{"question":"q"}]}'::jsonb, 'pending', NOW() + interval '10 minutes'
+        FROM generate_series(0,31) AS s CROSS JOIN generate_series(0,2) AS r
+       WHERE s > 0 OR r = 0
+    `)
+    const scan = await readPendingPermissionPromptsForSessions(pool, {
+      userId: 3n,
+      sessionIds: Array.from({ length: 32 }, (_, i) => `q1-${i}`),
+    })
+    assert.equal(scan.bySession.size, 32)
+    assert.equal([...scan.bySession.values()].reduce((n, rows) => n + rows.length, 0), 63)
+    assert.equal(scan.rowLimited, true)
+  })
+
+  test('Q1 3+31x1 skew: production SQL drops the extra row and marks rowLimited', async (t) => {
+    if (skipIfNeeded(t)) return
+    await pool.query(`
+      INSERT INTO turn_permission_requests
+        (user_id,request_id,session_id,client_message_id,tool_use_id,tool_name,input_sha256,input_json,status,expires_at)
+      SELECT 3, 'sk31-' || s || '-' || r, 'sk31-' || s, 'sk31-m-' || s,
+             'sk31-' || s || '-' || r, 'AskUserQuestion', repeat('f',64),
+             '{"questions":[{"question":"q"}]}'::jsonb, 'pending', NOW() + interval '10 minutes'
+        FROM generate_series(0,31) AS s
+        CROSS JOIN generate_series(0, CASE WHEN s=0 THEN 2 ELSE 0 END) AS r
+    `)
+    const scan = await readPendingPermissionPromptsForSessions(pool, {
+      userId: 3n,
+      sessionIds: Array.from({ length: 32 }, (_, i) => `sk31-${i}`),
+    })
+    const s0 = scan.bySession.get('sk31-0') ?? []
+    assert.equal(s0.length, 2)
+    assert.equal([...scan.bySession.values()].reduce((n, rows) => n + rows.length, 0), 33)
+    assert.equal(scan.rowLimited, true)
+  })
+
+  test('Q1 9+1 two-session skew: per-session cap marks rowLimited below global LIMIT', async (t) => {
+    if (skipIfNeeded(t)) return
+    await pool.query(`
+      INSERT INTO turn_permission_requests
+        (user_id,request_id,session_id,client_message_id,tool_use_id,tool_name,input_sha256,input_json,status,expires_at)
+      SELECT 3, 'sk91-' || s || '-' || r, 'sk91-' || s, 'sk91-m-' || s,
+             'sk91-' || s || '-' || r, 'AskUserQuestion', repeat('g',64),
+             '{"questions":[{"question":"q"}]}'::jsonb, 'pending', NOW() + interval '10 minutes'
+        FROM generate_series(0,1) AS s
+        CROSS JOIN generate_series(0, CASE WHEN s=0 THEN 8 ELSE 0 END) AS r
+    `)
+    const scan = await readPendingPermissionPromptsForSessions(pool, {
+      userId: 3n,
+      sessionIds: ['sk91-0', 'sk91-1'],
+    })
+    assert.equal((scan.bySession.get('sk91-0') ?? []).length, 8)
+    assert.equal((scan.bySession.get('sk91-1') ?? []).length, 1)
+    assert.equal(scan.rowLimited, true)
+  })
 })

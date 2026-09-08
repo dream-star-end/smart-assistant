@@ -197,22 +197,3 @@ if (/health\.on(Success|Failure)\(/.test(cursorSettleSrc)) {
   throw new Error('[grok-pool-cooldown] cursor settle must not call AccountHealthTracker (materializer whitelist depends on health/status/cooldown)')
 }
 console.log('[grok-pool-cooldown] PASS — INC-20260908-GROK-POOL-NO-COOLDOWN source contracts locked')
-
-// INC-20260907-PERMISSION-ROOTFIX: source regression guard, not end-to-end proof.
-const permissionStoreSrc = readFileSync(join(root, 'packages/commercial/src/dispatch/turnControlStore.ts'), 'utf8')
-if (!permissionStoreSrc.includes('PERMISSION_PROMPT_HELLO_PRODUCTION_SQL')) {
-  throw new Error('[permission-rootfix] hello production SQL export missing')
-}
-if (!permissionStoreSrc.includes('ROW_NUMBER() OVER (PARTITION BY p.session_id')) {
-  throw new Error('[permission-rootfix] hello scan lost per-session fair-share')
-}
-if (!permissionStoreSrc.includes('STOPPED_PROJECTION_SQL')) {
-  throw new Error('[permission-rootfix] snapshot/lookup lost Stop projection')
-}
-if (!permissionStoreSrc.includes('utf8ByteLength(encoded) <= PERMISSION_PROMPT_MAX_INPUT_BYTES')) {
-  throw new Error('[permission-rootfix] 8KiB clamp must be UTF-8 bytes, not JS string length')
-}
-if (!permissionStoreSrc.includes('SET LOCAL statement_timeout = ${PERMISSION_PROMPT_READ_TIMEOUT_MS}')) {
-  throw new Error('[permission-rootfix] permission reads must set the 250ms statement timeout')
-}
-console.log('[permission-rootfix] PASS — INC-20260907-PERMISSION-ROOTFIX source contracts locked')

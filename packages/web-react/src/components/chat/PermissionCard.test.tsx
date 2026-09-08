@@ -10,13 +10,16 @@
  * 修法：超过服务端 TTL 的未决卡视为孤儿，不再自动弹；但手动回答入口必须保留（fail-safe）。
  */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
+  activeModalRequest,
+  reopenPermissionUi,
   setPermissionFullInputFetcher,
+  shouldAutoOpenPermission,
 } from "../../lib/chat/permissionPopupCoordinator";
 import {
   DETACHED_ASK_USER_TTL_MS,
@@ -31,7 +34,19 @@ afterEach(() => {
   cleanup();
   resetPermissionAutoOpenMemory();
   setPermissionFullInputFetcher(null);
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => "visible",
+  });
 });
+
+function setDocumentHidden(hidden: boolean): void {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => (hidden ? "hidden" : "visible"),
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
 
 function askMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -385,6 +400,149 @@ describe("PermissionCard 工具展示(F5/M7)", () => {
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
     expect(screen.getAllByRole("dialog")).toHaveLength(1);
     expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  test("T3 Host 后台挂载不弹，visibilitychange 回前台才弹出", async () => {
+    setDocumentHidden(true);
+    render(
+      <PermissionPromptHost
+        messages={[bashPermMsg({ requestId: "req-bg", id: "p-bg" })]}
+        onRespond={vi.fn()}
+        sending
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    act(() => setDocumentHidden(false));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+  });
+
+  test("T3 card-only 回前台不 mark displayed、不占 singleton slot", async () => {
+    setDocumentHidden(true);
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-card-bg" })}
+        onRespond={vi.fn()}
+        livePrompt
+        renderMode="card"
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    act(() => setDocumentHidden(false));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(activeModalRequest()).toBeNull();
+    expect(shouldAutoOpenPermission({ requestId: "req-card-bg", livePrompt: true })).toBe(true);
+    expect(screen.getByRole("button", { name: "审批" })).toBeInTheDocument();
+  });
+
+  test("T3 card-only 前台挂载也不自动占 slot，手动入口仍在", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-card-fg" })}
+        onRespond={vi.fn()}
+        livePrompt
+        renderMode="card"
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(activeModalRequest()).toBeNull();
+    expect(shouldAutoOpenPermission({ requestId: "req-card-fg", livePrompt: true })).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "审批" }));
+    expect(activeModalRequest()).toBe("req-card-fg");
+  });
+
+  test("Host 完整短请求切到截断 Ask 在取回前不能盲批", async () => {
+    setPermissionFullInputFetcher(() => new Promise(() => {}));
+    const onRespond = vi.fn();
+    const shortA = bashPermMsg({ requestId: "req-short", id: "p-short" });
+    const longB = askMsg({
+      id: "p-long",
+      requestId: "req-long",
+      _inputTruncated: true,
+      inputJson: {},
+    });
+    render(
+      <PermissionPromptHost messages={[shortA, longB]} onRespond={onRespond} sending sessionId="sess-a" />,
+    );
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "允许" })).toBeInTheDocument();
+    reopenPermissionUi("req-long");
+    await waitFor(() => expect(screen.getByText(/完整问题仍在加载/)).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "允许" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "提交" })).toBeNull();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  test("Host 完整短请求切到截断计划在取回前不能确认", async () => {
+    setPermissionFullInputFetcher(() => new Promise(() => {}));
+    const shortA = bashPermMsg({ requestId: "req-short-plan", id: "p-short-plan" });
+    const longPlan = exitPlanMsg({
+      id: "p-long-plan",
+      requestId: "req-long-plan",
+      _inputTruncated: true,
+      inputJson: {},
+    });
+    render(
+      <PermissionPromptHost messages={[shortA, longPlan]} onRespond={vi.fn()} sending sessionId="sess-plan" />,
+    );
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    reopenPermissionUi("req-long-plan");
+    await waitFor(() => expect(screen.getByText(/完整问题仍在加载/)).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "按此计划执行" })).toBeNull();
+  });
+
+  test("Host 切换不同题干不崩溃且提交只作用于当前 request", async () => {
+    const onRespond = vi.fn();
+    const q1 = askMsg({
+      id: "p-q1",
+      requestId: "req-q1",
+      inputJson: { questions: [{ question: "第一题？", options: [{ label: "甲" }, { label: "乙" }] }] },
+    });
+    const q2 = askMsg({
+      id: "p-q2",
+      requestId: "req-q2",
+      inputJson: { questions: [{ question: "第二题？", options: [{ label: "丙" }, { label: "丁" }] }] },
+    });
+    render(
+      <PermissionPromptHost messages={[q1, q2]} onRespond={onRespond} sending sessionId="sess-q" />,
+    );
+    await waitFor(() => expect(screen.getByText("第一题？")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("甲"));
+    reopenPermissionUi("req-q2");
+    await waitFor(() => expect(screen.getByText("第二题？")).toBeInTheDocument());
+    expect(screen.queryByText("第一题？")).toBeNull();
+    fireEvent.click(screen.getByText("丙"));
+    fireEvent.click(screen.getByRole("button", { name: "提交" }));
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond.mock.calls[0][0].requestId).toBe("req-q2");
+    expect(onRespond.mock.calls[0][0].updatedInput.answers).toEqual({ "第二题？": "丙" });
+  });
+
+  test("同题干不同 requestId 不继承未提交答案，切换不发 response", async () => {
+    const onRespond = vi.fn();
+    const a = askMsg({
+      id: "p-same-a",
+      requestId: "req-same-a",
+      inputJson: { questions: [{ question: "同题？", options: [{ label: "左" }, { label: "右" }] }] },
+    });
+    const b = askMsg({
+      id: "p-same-b",
+      requestId: "req-same-b",
+      inputJson: { questions: [{ question: "同题？", options: [{ label: "左" }, { label: "右" }] }] },
+    });
+    render(
+      <PermissionPromptHost messages={[a, b]} onRespond={onRespond} sending sessionId="sess-same" />,
+    );
+    await waitFor(() => expect(screen.getByText("同题？")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("左"));
+    reopenPermissionUi("req-same-b");
+    await waitFor(() => expect(screen.getByRole("button", { name: "提交" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "提交" }));
+    expect(onRespond).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("右"));
+    fireEvent.click(screen.getByRole("button", { name: "提交" }));
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond.mock.calls[0][0].requestId).toBe("req-same-b");
+    expect(onRespond.mock.calls[0][0].updatedInput.answers).toEqual({ "同题？": "右" });
   });
 
   test("mcp 工具名解析为中文标签(打开网页)", () => {

@@ -2027,7 +2027,7 @@ export function MessageList({
   return (
     <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
     <>
-    <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} />
+    <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
     {pendingPrompts.length > 0 ? (
       <div
         data-testid="pending-permission-dock"
