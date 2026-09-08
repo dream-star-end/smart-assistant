@@ -3412,6 +3412,59 @@
       "coverageCommits": [
         "e764a7f1"
       ]
+    },
+    {
+      "id": "INC-20260908-FRONTEND-OWNER-FENCE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "任务抽屉异步回写跨owner、项目过滤越锁、列表刷新静默截断与附件/草稿跨会话账号。修复显式owner fence、分页按真实cap200分片、账号草稿隔离、逐上传owner显式new到id迁移与空筛选继续加载。证据为隔离真实Chromium组件旅程及单包回归，不冒称真实登录后端或线上验收。",
+      "rootFixCommit": "7cdd0f5c",
+      "coverageCommits": [
+        "63959e6e",
+        "c0a88571"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/taskboard/ownerFence.review.test.tsx",
+          "assertion": "owner switch clears old pending patrol without letting old completion touch B"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/Composer.owner.review.test.tsx",
+          "assertion": "unsent new attachments do not migrate to an unrelated existing session"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "new attachments stay on new, not an existing other session"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "true materialize keeps attachments and finishes delayed upload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "account switch does not inherit previous account attachments"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "remove after switch only deletes the current session file"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "two promotions cannot redirect the first delayed upload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "filtered empty page can load more and stops at raw total"
+        }
+      ]
     }
   ]
 }

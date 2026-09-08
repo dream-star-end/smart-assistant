@@ -14,8 +14,8 @@ import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
-import { Composer } from "./components/Composer";
-import { moveDraft, NEW_COMPOSER_DRAFT_KEY } from "./lib/composerDraft";
+import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
+import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import {
   ImageAnnotationEditor,
   type ImageAnnotationSource,
@@ -496,6 +496,8 @@ export function App() {
     // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/私有面板态,回首页。
     // help 是公开内容：若 URL 明确携带案例/功能深链，静默续期发现未登录时仍应保留。
     onClearAuth: () => {
+      teardownComposerDrafts(user?.id);
+      resetComposerAttachmentCache();
       // signPath 只在单一租户内唯一；鉴权身份退出/过期时必须丢弃内存图片字节，避免
       // 同一 SPA 随后登录另一账号后以相同容器路径命中上一账号的 Blob。
       imageByteCache.clear();
@@ -1204,7 +1206,8 @@ export function App() {
     setSessions((c) => [s, ...c]);
     // This is an identity promotion, not navigation to another conversation. Preserve
     // the unsent draft; normal send consumes/clears it in Composer instead.
-    moveDraft(NEW_COMPOSER_DRAFT_KEY, id);
+    moveDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
+    moveComposerAttachments(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
     setActiveId(id);
     return id;
   }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
@@ -3430,7 +3433,7 @@ export function App() {
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
             lastUserText={lastUserText}
-            draftKey={activeId ?? NEW_COMPOSER_DRAFT_KEY}
+            draftKey={accountDraftKey(activeId ?? NEW_COMPOSER_DRAFT_KEY, user?.id)}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}

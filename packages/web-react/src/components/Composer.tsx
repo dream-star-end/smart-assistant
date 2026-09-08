@@ -3,7 +3,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
@@ -26,6 +26,9 @@ import {
   useToast,
 } from "./ui";
 
+// Captured by one upload, not keyed by the reusable "new" draft name. Promotion
+// moves this exact attachment's owner without redirecting future new drafts.
+type AttachOwner = { key: string | undefined; epoch: number };
 type Attach = {
   id: string;
   name: string;
@@ -49,6 +52,31 @@ function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("audio/")) return "audio";
   if (mime.startsWith("video/")) return "video";
   return "file";
+}
+
+type OwnedAttach = Attach & { owner: AttachOwner };
+const attachmentCache = new Map<string, OwnedAttach[]>();
+let attachEpoch = 0;
+let nextAttachId = 0;
+
+/** Same-session identity promotion only. Ordinary session/account switches must not call this. */
+export function moveComposerAttachments(from: string, to: string): void {
+  if (!from || !to || from === to) return;
+  const moving = attachmentCache.get(from) ?? [];
+  const dest = attachmentCache.get(to) ?? [];
+  for (const item of moving) item.owner.key = to;
+  attachmentCache.set(to, dest.length ? [...dest, ...moving] : moving);
+  attachmentCache.delete(from);
+}
+
+export function resetComposerAttachmentCache(): void {
+  for (const items of attachmentCache.values()) {
+    for (const a of items) {
+      if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+    }
+  }
+  attachmentCache.clear();
+  attachEpoch += 1;
 }
 
 function clipboardImages(data: DataTransfer): File[] {
@@ -166,7 +194,27 @@ export function Composer({
       typeof window.matchMedia === "function" &&
       window.matchMedia("(pointer: coarse)").matches,
   );
-  const [attachments, setAttachments] = useState<Attach[]>([]);
+  const [attach, setAttach] = useState<{ key: string | undefined; items: OwnedAttach[] }>(() => ({
+    key: draftKey,
+    items: draftKey ? (attachmentCache.get(draftKey) ?? []) : [],
+  }));
+  const attachEpochRef = useRef(attachEpoch);
+  if (attach.key !== draftKey || attachEpochRef.current !== attachEpoch) {
+    const cacheWasReset = attachEpochRef.current !== attachEpoch;
+    // Every mutation already updates the cache. Re-saving old React state here
+    // would resurrect the old name after an explicit identity promotion.
+    attachEpochRef.current = attachEpoch;
+    const items = draftKey && !cacheWasReset ? (attachmentCache.get(draftKey) ?? []) : [];
+    setAttach({ key: draftKey, items });
+  }
+  const attachments = attach.items;
+  const setAttachments = (next: SetStateAction<OwnedAttach[]>) => {
+    setAttach((curr) => {
+      const items = typeof next === "function" ? next(curr.items) : next;
+      if (curr.key) attachmentCache.set(curr.key, items);
+      return items === curr.items ? curr : { ...curr, items };
+    });
+  };
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   // 目标对话框开合:入口从会话头部迁至「+」菜单后,由 Composer 持有开合态(菜单项触发打开)。
   const [goalOpen, setGoalOpen] = useState(false);
@@ -185,7 +233,6 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
   // 附件 file input 的稳定 id：供工具条回形针 <label htmlFor> 原生激活。
   const fileInputId = useId();
-  const idRef = useRef(0);
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
 
@@ -201,15 +248,23 @@ export function Composer({
     return u;
   }, []);
   const revoke = useCallback((u?: string) => {
-    if (u && objectUrlsRef.current.has(u)) {
+    if (u) {
       URL.revokeObjectURL(u);
       objectUrlsRef.current.delete(u);
     }
   }, []);
-  // 卸载：revoke 全部残留 object URL。
+  // 卸载：revoke 本实例创建且已不在模块 cache 里的 object URL（cache 跨 remount 仍有效）。
   useEffect(
     () => () => {
-      for (const u of objectUrlsRef.current) URL.revokeObjectURL(u);
+      const cached = new Set<string>();
+      for (const items of attachmentCache.values()) {
+        for (const a of items) {
+          if (a.previewUrl) cached.add(a.previewUrl);
+        }
+      }
+      for (const u of objectUrlsRef.current) {
+        if (!cached.has(u)) URL.revokeObjectURL(u);
+      }
       objectUrlsRef.current.clear();
     },
     [],
@@ -266,10 +321,12 @@ export function Composer({
 
   const removeAttach = useCallback(
     (id: string) => {
-      setAttachments((prev) => {
-        const hit = prev.find((x) => x.id === id);
+      setAttach((curr) => {
+        const hit = curr.items.find((x) => x.id === id);
         if (hit) revoke(hit.previewUrl);
-        return prev.filter((x) => x.id !== id);
+        const items = curr.items.filter((x) => x.id !== id);
+        if (curr.key) attachmentCache.set(curr.key, items);
+        return { ...curr, items };
       });
     },
     [revoke],
@@ -291,16 +348,29 @@ export function Composer({
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
   // 复用原 File 对象，重试无需重选文件；成功后携带 media，供 doneMedia 汇总发送。
   const uploadOne = useCallback(
-    async (id: string, file: File) => {
+    async (id: string, file: File, owner: AttachOwner) => {
       if (!onUpload) return;
-      setAttachments((prev) =>
+      const apply = (mapFn: (items: OwnedAttach[]) => OwnedAttach[]) => {
+        setAttach((curr) => {
+          if (owner.epoch !== attachEpoch) return curr;
+          const target = owner.key;
+          if (curr.key === target) {
+            const items = mapFn(curr.items);
+            if (curr.key) attachmentCache.set(curr.key, items);
+            return { ...curr, items };
+          }
+          if (target) attachmentCache.set(target, mapFn(attachmentCache.get(target) ?? []));
+          return curr;
+        });
+      };
+      apply((prev) =>
         prev.map((a) => (a.id === id ? { ...a, status: "uploading", error: undefined } : a)),
       );
       try {
         const media = await onUpload(file);
-        setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
+        apply((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
       } catch (e) {
-        setAttachments((prev) =>
+        apply((prev) =>
           prev.map((a) => (a.id === id ? { ...a, status: "error", error: apiErrorMessage(e, "上传失败") } : a)),
         );
       }
@@ -324,16 +394,17 @@ export function Composer({
     const dropped = picked.length - arr.length;
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     for (const file of arr) {
-      const id = `att-${idRef.current++}`;
+      const id = `att-${nextAttachId++}`;
+      const owner: AttachOwner = { key: draftKey, epoch: attachEpoch };
       const kind = mediaKindOf(file.type);
       // 图片:选中即生成本地预览 URL（无需等上传完成，chip 立刻显缩略图、可点开看大图）。
       const previewUrl = kind === "image" ? makePreview(file) : undefined;
       // 持有原始 File：失败后「重试」复用它原地重传，多文件混合状态各 chip 独立重试。
       setAttachments((prev) => [
         ...prev,
-        { id, name: file.name, size: file.size, kind, status: "uploading", previewUrl, file },
+        { id, owner, name: file.name, size: file.size, kind, status: "uploading", previewUrl, file },
       ]);
-      void uploadOne(id, file);
+      void uploadOne(id, file, owner);
     }
   };
 
@@ -445,7 +516,9 @@ export function Composer({
                     : undefined
                 }
                 onRetry={
-                  a.status === "error" && a.file ? () => void uploadOne(a.id, a.file as File) : undefined
+                  a.status === "error" && a.file
+                    ? () => void uploadOne(a.id, a.file as File, a.owner)
+                    : undefined
                 }
                 onAnnotate={
                   a.kind === "image" && a.previewUrl && a.status === "done" && annotate
