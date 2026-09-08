@@ -110,6 +110,7 @@ interface Rig {
   containerWss: WebSocketServer;
   /** 容器实际收到的帧(权威的"有没有放行")。 */
   containerSeen: string[];
+  onContainerFrame: (listener: (raw: string) => void) => () => void;
   /** grants checker 被加载的次数(初始 1)。 */
   loads: () => number;
   /** 模拟 admin 撤权 + DB epoch bump(catalog 与 grants 同时前进)。 */
@@ -122,6 +123,7 @@ interface Rig {
 
 async function startRig(): Promise<Rig> {
   const containerSeen: string[] = [];
+  const containerListeners = new Set<(raw: string) => void>();
   let snapshot = snapshotAt(10n);
   let allowed = true;
   let loaderBroken = false;
@@ -141,7 +143,9 @@ async function startRig(): Promise<Rig> {
       }),
     );
     ws.on("message", (data) => {
-      containerSeen.push(typeof data === "string" ? data : String(data));
+      const raw = typeof data === "string" ? data : String(data);
+      containerSeen.push(raw);
+      for (const listener of containerListeners) listener(raw);
     });
   });
 
@@ -191,6 +195,10 @@ async function startRig(): Promise<Rig> {
     port,
     containerWss,
     containerSeen,
+    onContainerFrame: (listener) => {
+      containerListeners.add(listener);
+      return () => { containerListeners.delete(listener); };
+    },
     loads: () => loads,
     revoke: (nextEpoch) => {
       allowed = false;
@@ -221,34 +229,54 @@ async function connect(rig: Rig): Promise<WebSocket> {
   return ws;
 }
 
-/** 发一帧 inbound.message,收集这之后 300ms 内用户侧收到的**业务**帧(sys.* 是带外信号)。 */
-async function send(ws: WebSocket, peerId: string): Promise<Record<string, unknown>[]> {
+/** 等真实处理结果，再保留原300ms观测窗；sys.* 是带外信号。 */
+async function send(rig: Rig, ws: WebSocket, peerId: string): Promise<Record<string, unknown>[]> {
   const got: Record<string, unknown>[] = [];
+  let complete!: () => void;
+  let timer!: ReturnType<typeof setTimeout>;
+  const handled = new Promise<void>((resolve, reject) => {
+    complete = resolve;
+    timer = setTimeout(() => reject(new Error("bridge did not produce a delivery or error")), 5_000);
+  });
+  const offContainer = rig.onContainerFrame((raw) => {
+    try {
+      const frame = JSON.parse(raw) as { type?: string; peer?: { id?: string } };
+      if (frame.type === "inbound.message" && frame.peer?.id === peerId) complete();
+    } catch { /* Non-JSON frames are not delivery receipts. */ }
+  });
   const onMsg = (d: unknown): void => {
     const s = typeof d === "string" ? d : String(d);
     try {
       const obj = JSON.parse(s) as Record<string, unknown>;
       if (typeof obj.type === "string" && obj.type.startsWith("sys.")) return;
       got.push(obj);
+      if (typeof obj.type === "string" && obj.type.includes("error")) complete();
     } catch {
       /* 非 JSON 帧忽略 */
     }
   };
   ws.on("message", onMsg);
-  ws.send(
-    JSON.stringify({
-      type: "inbound.message",
-      channel: "webchat",
-      peer: { id: peerId, kind: "dm" },
-      content: { text: "hi" },
-      ts: Date.now(),
-      model: MODEL,
-      clientMessageId: `cm_${peerId}`,
-    }),
-  );
-  await new Promise((r) => setTimeout(r, 300));
-  ws.off("message", onMsg);
-  return got;
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: peerId, kind: "dm" },
+        content: { text: "hi" },
+        ts: Date.now(),
+        model: MODEL,
+        clientMessageId: `cm_${peerId}`,
+      }),
+    );
+    await handled;
+    clearTimeout(timer);
+    await new Promise((r) => setTimeout(r, 300));
+    return got;
+  } finally {
+    clearTimeout(timer);
+    offContainer();
+    ws.off("message", onMsg);
+  }
 }
 
 function errorCodes(frames: Record<string, unknown>[]): string[] {
@@ -290,7 +318,7 @@ describe("bridge grants checker · epoch fence(R1 BLOCKER-1)", () => {
     await new Promise((r) => setTimeout(r, 100)); // 等 attest
 
     const loadsAfterConnect = rig.loads();
-    const frames = await send(ws, "s-steady");
+    const frames = await send(rig, ws, "s-steady");
 
     assert.deepEqual(errorCodes(frames), [], "稳态不该拒帧");
     assert.equal(rig.loads(), loadsAfterConnect, "epoch 没变 → 不该触发重载(稳态零开销)");
@@ -310,14 +338,14 @@ describe("bridge grants checker · epoch fence(R1 BLOCKER-1)", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     // 第一帧正常(证明连接是通的、模型本来是被授权的)
-    await send(ws, "s-1");
+    await send(rig, ws, "s-1");
     const forwardedBefore = forwardedInbound(rig.containerSeen).length;
     assert.equal(forwardedBefore, 1);
 
     // admin 撤权 → 0144 的 trigger bump epoch(catalog 快照随之前进)
     rig.revoke(11n);
 
-    const frames = await send(ws, "s-2");
+    const frames = await send(rig, ws, "s-2");
     assert.deepEqual(
       errorCodes(frames),
       ["UNAUTHORIZED_MODEL"],
@@ -339,14 +367,14 @@ describe("bridge grants checker · epoch fence(R1 BLOCKER-1)", () => {
     const ws = await connect(rig);
     await new Promise((r) => setTimeout(r, 100));
 
-    await send(ws, "s-1");
+    await send(rig, ws, "s-1");
     const forwardedBefore = forwardedInbound(rig.containerSeen).length;
 
     // epoch 变了(可能就是撤权),但 grants 读不出来 → 不知道自己还有没有授权 → 只能拒
     rig.bumpOnly(12n);
     rig.breakLoader();
 
-    const frames = await send(ws, "s-2");
+    const frames = await send(rig, ws, "s-2");
     assert.deepEqual(
       errorCodes(frames),
       ["MODEL_AUTHORITY_UNAVAILABLE"],
@@ -366,11 +394,11 @@ describe("bridge grants checker · epoch fence(R1 BLOCKER-1)", () => {
     const ws = await connect(rig);
     await new Promise((r) => setTimeout(r, 100));
 
-    await send(ws, "s-1");
+    await send(rig, ws, "s-1");
     const forwardedBefore = forwardedInbound(rig.containerSeen).length;
 
     rig.bumpOnly(13n); // 别的模型改了价 → epoch 前进,本用户授权没动
-    const frames = await send(ws, "s-2");
+    const frames = await send(rig, ws, "s-2");
 
     assert.deepEqual(errorCodes(frames), [], "授权仍在 → 不该拒帧");
     assert.equal(
