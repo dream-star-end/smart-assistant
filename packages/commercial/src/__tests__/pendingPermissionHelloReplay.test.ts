@@ -594,3 +594,34 @@ describe('250ms statement timeout on real pools', () => {
     assert.ok(sqls.some((sql) => /SET LOCAL statement_timeout = 250/.test(sql)))
   })
 })
+
+describe('hello fair-share completeness with uneven sessions', () => {
+  for (const fixture of [
+    { name: '31 saturated sessions plus one detached survivor', counts: [1, ...Array<number>(31).fill(2)], limited: true },
+    { name: 'one saturated session and 31 empty sessions', counts: [2, ...Array<number>(31).fill(0)], limited: true },
+    { name: 'all sessions below their fair share', counts: Array<number>(32).fill(1), limited: false },
+  ]) {
+    test(fixture.name, async () => {
+      const sessionIds = Array.from({ length: 32 }, (_, i) => `fair-${i}`)
+      const raw = fixture.counts.flatMap((count, s) => Array.from({ length: count }, (_, r) => ({
+        session_id: sessionIds[s]!,
+        request_id: `fair-${s}-${r}`,
+        client_message_id: `m-${s}`,
+        tool_use_id: `fair-${s}-${r}`,
+        tool_name: 'AskUserQuestion',
+        input_json: { questions: [{ question: 'q' }] },
+        expires_at: new Date(Date.now() + 60_000),
+      })))
+      const pool = {
+        async query(_sql: string, params: unknown[]) {
+          assert.equal(params[2], 64)
+          assert.equal(params[3], 2)
+          return { rows: raw, rowCount: raw.length }
+        },
+      } as unknown as Pool
+      const scan = await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds })
+      assert.equal([...scan.bySession.values()].reduce((n, rows) => n + rows.length, 0), raw.length)
+      assert.equal(scan.rowLimited, fixture.limited)
+    })
+  }
+})

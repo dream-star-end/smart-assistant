@@ -260,4 +260,24 @@ describe('OCV5-185 isolated PG EXPLAIN + 200+ scale', () => {
     assert.equal(looked[0]?.inputTruncated, false)
     assert.equal((looked[0]?.input.questions as Array<{ question: string }>)[0]?.question, question)
   })
+
+  test('Q1 uneven 32-session fair share marks truncation below the 64-row budget', async (t) => {
+    if (skipIfNeeded(t)) return
+    await pool.query(`
+      INSERT INTO turn_permission_requests
+        (user_id,request_id,session_id,client_message_id,tool_use_id,tool_name,input_sha256,input_json,status,expires_at)
+      SELECT 3, 'q1-' || s || '-' || r, 'q1-' || s, 'q1-m-' || s,
+             'q1-' || s || '-' || r, 'AskUserQuestion', repeat('e',64),
+             '{"questions":[{"question":"q"}]}'::jsonb, 'pending', NOW() + interval '10 minutes'
+        FROM generate_series(0,31) AS s CROSS JOIN generate_series(0,2) AS r
+       WHERE s > 0 OR r = 0
+    `)
+    const scan = await readPendingPermissionPromptsForSessions(pool, {
+      userId: 3n,
+      sessionIds: Array.from({ length: 32 }, (_, i) => `q1-${i}`),
+    })
+    assert.equal(scan.bySession.size, 32)
+    assert.equal([...scan.bySession.values()].reduce((n, rows) => n + rows.length, 0), 63)
+    assert.equal(scan.rowLimited, true)
+  })
 })

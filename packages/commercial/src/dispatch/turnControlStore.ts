@@ -848,7 +848,11 @@ export async function readPendingPermissionPromptsForSessions(
     if (list) list.push(entry)
     else bySession.set(row.session_id, [entry])
   }
-  const rowLimited = result.rows.length >= totalLimit
+  // ROW_NUMBER can truncate one session even when other sessions leave unused
+  // slots in the global page. As with snapshot LIMIT, saturation means there
+  // may be more: the active session must remain eligible for a GET refill.
+  const rowLimited = result.rows.length >= totalLimit ||
+    [...bySession.values()].some((rows) => rows.length >= perSession)
   const uncoveredSessionIds = rowLimited
     ? sessionIds.filter((id) => !bySession.has(id))
     : []
