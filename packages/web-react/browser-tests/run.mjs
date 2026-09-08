@@ -2086,22 +2086,86 @@ await check("T63 滚轮连续上滑期间 controller 不写 scrollTop，无回�
   const y = Math.round(box.y + box.height / 2);
   await mobilePage.mouse.move(x, y);
   const before = await scroll.evaluate((node) => node.scrollTop);
-  // 连续 12 次滚轮上滑,间隔短于 quiet window,模拟一次真实的滚轮/触控板手势。
+  // 连续发出 12 次真实滚轮上滑。校正与真实 scroll 事件同步，不能用 Node 的
+  // wait40 + 多次跨进程调用推断手势还活跃（实际曾到 303ms，已合法 quiet）。
   // 每一步都记下 scrollTop:任何一步位置比上一步更靠下(回弹)即失败。
   const tops = [];
-  for (let i = 0; i < 12; i += 1) {
-    await mobilePage.mouse.wheel(0, -120);
-    await mobilePage.waitForTimeout(40);
-    const s = await scroll.evaluate((node) => ({
-      top: node.scrollTop,
-      fence: window.__mobilePage.wheelFence,
-      writes: window.__mobilePage.programmaticWrites,
-    }));
-    // 上方行从 200px 估高变真实高度时 RO 要求校正;篱笆期间必须挂起而不是写。
-    await mobilePage.evaluate(() => window.__mobilePage.attemptViewportCorrection(24));
-    if (!s.fence) throw new Error(`第 ${i + 1} 次滚轮后篱笆未保持: ${JSON.stringify(s)}`);
-    if (s.writes !== 0) throw new Error(`滚轮期间出现程序化 scrollTop 写入: ${JSON.stringify(s)}`);
-    tops.push(s.top);
+  await scroll.evaluate((node) => {
+    const samples = [];
+    const waiters = new Map();
+    let pending = null;
+    let closed = false;
+    const onWheel = (event) => { pending = { trusted: event.isTrusted, at: performance.now() }; };
+    const onScroll = () => {
+      if (!pending) return;
+      const input = pending;
+      pending = null;
+      // Installed after React's native scroll listener and attachWheelFence.
+      // Observe the real scroll after its transient intent mark was consumed,
+      // then attempt RO-style correction in this same browser microtask.
+      queueMicrotask(() => {
+        if (closed) return;
+        const s = {
+          top: node.scrollTop,
+          fence: window.__mobilePage.wheelFence,
+          writes: window.__mobilePage.programmaticWrites,
+          trusted: input.trusted,
+          inputToScrollMs: performance.now() - input.at,
+        };
+        window.__mobilePage.attemptViewportCorrection(24);
+        s.writesAfterCorrection = window.__mobilePage.programmaticWrites;
+        const index = samples.push(s) - 1;
+        const waiter = waiters.get(index);
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          waiters.delete(index);
+          waiter.resolve(s);
+        }
+      });
+    };
+    node.addEventListener("wheel", onWheel, { passive: true });
+    node.addEventListener("scroll", onScroll, { passive: true });
+    window.__t63Gesture = {
+      samples,
+      take(index) {
+        if (samples[index]) return Promise.resolve(samples[index]);
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            waiters.delete(index);
+            reject(new Error(`真实滚轮未产生 scroll 样本: step=${index + 1}, observed=${samples.length}`));
+          }, 5000);
+          waiters.set(index, { resolve, reject, timer });
+        });
+      },
+      cleanup() {
+        closed = true;
+        node.removeEventListener("wheel", onWheel);
+        node.removeEventListener("scroll", onScroll);
+        for (const waiter of waiters.values()) {
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error("滚轮探针已结束"));
+        }
+        delete window.__t63Gesture;
+      },
+    };
+  });
+  try {
+    for (let i = 0; i < 12; i += 1) {
+      const [s] = await Promise.all([
+        mobilePage.evaluate((index) => window.__t63Gesture.take(index), i),
+        mobilePage.mouse.wheel(0, -120),
+      ]);
+      if (!s.trusted) throw new Error(`滚轮不是浏览器受信输入: ${JSON.stringify(s)}`);
+      if (!s.fence) throw new Error(`第 ${i + 1} 次滚轮后篱笆未保持: ${JSON.stringify(s)}`);
+      if (s.writes !== 0) throw new Error(`滚轮期间出现程序化 scrollTop 写入: ${JSON.stringify(s)}`);
+      if (s.writesAfterCorrection !== 0) throw new Error(`篱笆内校正写入了 scrollTop: ${JSON.stringify(s)}`);
+      tops.push(s.top);
+    }
+    const samples = await mobilePage.evaluate(() => window.__t63Gesture.samples);
+    if (samples.length !== 12) throw new Error(`真实滚轮样本数不符: ${samples.length}`);
+    console.log(`[T63 real scroll samples] ${JSON.stringify(samples)}`);
+  } finally {
+    await mobilePage.evaluate(() => window.__t63Gesture?.cleanup());
   }
   for (let i = 1; i < tops.length; i += 1) {
     if (tops[i] > tops[i - 1] + 1) {
