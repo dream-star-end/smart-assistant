@@ -2977,6 +2977,12 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
       (m.requestId === requestId || m.id === requestId),
   );
   if (existing) {
+    const incomingTruncated = (frame as { inputTruncated?: unknown }).inputTruncated === true;
+    if (!incomingTruncated && frame.inputJson && typeof frame.inputJson === "object") {
+      existing.inputJson = frame.inputJson as Record<string, unknown>;
+      existing._inputTruncated = false;
+      if (frame.inputPreview) existing.inputPreview = frame.inputPreview;
+    }
     consumePendingPermissionSettlement(sess, existing);
     return existing;
   }
@@ -3009,6 +3015,9 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
     toolName: frame.toolName,
     inputPreview: frame.inputPreview || "",
     inputJson: frame.inputJson || null,
+    ...((frame as { inputTruncated?: unknown }).inputTruncated === true
+      ? { _inputTruncated: true }
+      : {}),
     ...((frame as { toolUseId?: unknown }).toolUseId &&
     typeof (frame as { toolUseId?: unknown }).toolUseId === "string"
       ? { toolUseId: (frame as { toolUseId: string }).toolUseId }
@@ -3069,16 +3078,25 @@ export function applyPermissionSnapshot(
     );
   }
   for (const settlement of plan.settle) {
-    applyPermissionSettled(sess, {
-      type: "outbound.permission_settled",
-      sessionKey: `agent:${sess.agentId || "main"}:webchat:dm:${sess.id}`,
-      channel: "webchat",
-      peer: { id: sess.id, kind: "dm" },
-      requestId: settlement.requestId,
-      behavior: settlement.behavior,
-      reason: settlement.reason ?? undefined,
-      ...(settlement.answers ? { answers: settlement.answers } : {}),
-    } as Parameters<typeof applyPermissionSettled>[1]);
+    if (settlement.behavior === "allow" || settlement.behavior === "deny") {
+      applyPermissionSettled(sess, {
+        type: "outbound.permission_settled",
+        sessionKey: `agent:${sess.agentId || "main"}:webchat:dm:${sess.id}`,
+        channel: "webchat",
+        peer: { id: sess.id, kind: "dm" },
+        requestId: settlement.requestId,
+        behavior: settlement.behavior,
+        reason: settlement.reason ?? undefined,
+        ...(settlement.answers ? { answers: settlement.answers } : {}),
+      } as Parameters<typeof applyPermissionSettled>[1]);
+    } else {
+      rememberSettledPermissionRequestId(sess, settlement.requestId);
+      const msg = sess.messages.find((m) => m.requestId === settlement.requestId);
+      if (msg) {
+        msg._resolved = true;
+        msg._settledReason = settlement.reason || "accepted";
+      }
+    }
     if (settlement.status === "responded") {
       const msg = sess.messages.find((m) => m.requestId === settlement.requestId);
       if (msg && msg._settledReason == null) msg._settledReason = "accepted";

@@ -9,7 +9,7 @@ import { after, before, describe, test } from 'node:test'
 import { Pool } from 'pg'
 
 import {
-  PERMISSION_PROMPT_HELLO_BATCH_SQL,
+  PERMISSION_PROMPT_HELLO_PRODUCTION_SQL,
   PERMISSION_PROMPT_LOOKUP_SQL,
   PERMISSION_PROMPT_SNAPSHOT_SQL,
   readPendingPermissionPromptsForSessions,
@@ -173,21 +173,91 @@ describe('OCV5-185 isolated PG EXPLAIN + 200+ scale', () => {
   test('hello batch SQL is user + session ANY bounded at 200+ history scale', async (t) => {
     if (skipIfNeeded(t)) return
     const sessionIds = Array.from({ length: 40 }, (_, i) => `sess-${i}`)
+    const selected = sessionIds.slice(0, 32)
     const plan = await pool.query(
-      `EXPLAIN (FORMAT JSON) ${PERMISSION_PROMPT_HELLO_BATCH_SQL} LIMIT $3`,
-      ['3', sessionIds, 64],
+      `EXPLAIN (FORMAT JSON) ${PERMISSION_PROMPT_HELLO_PRODUCTION_SQL}`,
+      ['3', selected, 64, 2],
     )
     const json = JSON.stringify(plan.rows[0]!['QUERY PLAN'])
     const grouped = await readPendingPermissionPromptsForSessions(pool, {
       userId: 3n,
       sessionIds,
     })
-    assert.ok(grouped.size > 0)
-    assert.ok(grouped.size <= 32)
-    for (const [sessionId, rows] of grouped) {
+    assert.ok(grouped.bySession.size > 0)
+    assert.ok(grouped.bySession.size <= 32)
+    for (const [sessionId, rows] of grouped.bySession) {
       assert.match(sessionId, /^sess-\d+$/)
       assert.ok(rows.every((row) => row.requestId.startsWith('req-')))
     }
     ;(globalThis as { __ocv5_185_hello_explain?: string }).__ocv5_185_hello_explain = json
+  })
+
+  test('B4 Stop then late persist: hello/GET/lookup hide ordinary pending, keep detached ask-user', async (t) => {
+    if (skipIfNeeded(t)) return
+    const now = Date.now()
+    await pool.query(
+      `INSERT INTO turn_permission_requests
+        (user_id,request_id,session_id,client_message_id,tool_use_id,tool_name,input_sha256,input_json,status,expires_at,created_at)
+       VALUES
+        (3,'req-stop-late','sess-stop','m-stop','req-stop-late','Bash',$5,$1::jsonb,'pending',$2::timestamptz,$3::timestamptz),
+        (3,'ask-user:keep-stop','sess-stop','m-stop',null,'AskUserQuestion',$6,$4::jsonb,'pending',$2::timestamptz,$3::timestamptz)`,
+      [
+        JSON.stringify({ command: 'rm -rf /tmp/x' }),
+        new Date(now + 600_000),
+        new Date(now - 5_000),
+        JSON.stringify({ questions: [{ question: '还问吗' }] }),
+        'b'.repeat(64),
+        'c'.repeat(64),
+      ],
+    )
+    await pool.query(
+      `INSERT INTO turn_control_requests (control_id,user_id,session_id,root_client_message_id,kind,status,created_at)
+       VALUES ('ctl-stop',3,'sess-stop','m-stop','stop','terminal',$1::timestamptz)`,
+      [new Date(now - 1_000)],
+    )
+    const hello = await readPendingPermissionPromptsForSessions(pool, {
+      userId: 3n,
+      sessionIds: ['sess-stop'],
+    })
+    const helloIds = (hello.bySession.get('sess-stop') ?? []).map((row) => row.requestId)
+    assert.ok(!helloIds.includes('req-stop-late'))
+    assert.ok(helloIds.includes('ask-user:keep-stop'))
+
+    const snapshot = await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: 'sess-stop' })
+    const late = snapshot.items.find((item) => item.requestId === 'req-stop-late')
+    const detached = snapshot.items.find((item) => item.requestId === 'ask-user:keep-stop')
+    assert.equal(late?.status, 'cancelled')
+    assert.equal(late?.response?.reason, 'user_stop')
+    assert.equal(detached?.status, 'pending')
+
+    const looked = await readPermissionPromptsByRequestIds(pool, {
+      userId: 3n,
+      sessionId: 'sess-stop',
+      requestIds: ['req-stop-late', 'ask-user:keep-stop'],
+    })
+    assert.equal(looked.find((row) => row.requestId === 'req-stop-late')?.status, 'cancelled')
+    assert.equal(looked.find((row) => row.requestId === 'ask-user:keep-stop')?.status, 'pending')
+  })
+
+  test('UTF-8 CJK over 8KiB is truncated on snapshot and restored by lookup', async (t) => {
+    if (skipIfNeeded(t)) return
+    const question = '你'.repeat(3000)
+    assert.ok(Buffer.byteLength(JSON.stringify({ questions: [{ question }] }), 'utf8') > 8192)
+    await pool.query(
+      `INSERT INTO turn_permission_requests
+        (user_id,request_id,session_id,client_message_id,tool_use_id,tool_name,input_sha256,input_json,status,expires_at)
+       VALUES (3,'req-cjk','sess-cjk','m-cjk','req-cjk','AskUserQuestion',$2,$1::jsonb,'pending',NOW() + interval '10 minutes')`,
+      [JSON.stringify({ questions: [{ question, options: [{ label: '是' }] }] }), 'd'.repeat(64)],
+    )
+    const snapshot = await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: 'sess-cjk' })
+    const item = snapshot.items.find((row) => row.requestId === 'req-cjk')
+    assert.equal(item?.inputTruncated, true)
+    const looked = await readPermissionPromptsByRequestIds(pool, {
+      userId: 3n,
+      sessionId: 'sess-cjk',
+      requestIds: ['req-cjk'],
+    })
+    assert.equal(looked[0]?.inputTruncated, false)
+    assert.equal((looked[0]?.input.questions as Array<{ question: string }>)[0]?.question, question)
   })
 })

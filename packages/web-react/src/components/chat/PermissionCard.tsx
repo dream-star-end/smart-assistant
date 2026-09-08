@@ -13,6 +13,7 @@
 import { Check, Clock, HelpCircle, ShieldCheck, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
+import { isRecoveryTurnClientMessageId } from "../../lib/chat/pure";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { asStr } from "../tool/format";
@@ -26,6 +27,7 @@ import {
   shouldAutoOpenPermission,
   subscribePermissionCoordinator,
   yieldActiveModal,
+  fetchPermissionFullInput,
 } from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Button, Modal } from "../ui";
@@ -211,6 +213,7 @@ export function PermissionCard({
   onRespond,
   readOnly = false,
   livePrompt = true,
+  renderMode = "both",
 }: {
   msg: ChatMessage;
   onRespond: PermissionRespond;
@@ -220,28 +223,50 @@ export function PermissionCard({
    *  只展示记录，绝不自动弹。默认 true 只为单卡单测保持「活卡挂载即弹」语义；
    *  列表层（MessageRenderer）始终传入 `inActiveTurn && sending`。 */
   livePrompt?: boolean;
+  /** card = 时间线记录；modal = 数据驱动弹窗宿主；both = 单测默认。 */
+  renderMode?: "card" | "modal" | "both";
 }) {
-  const questions = useMemo(() => asAskUserQuestion(msg), [msg]);
+  const questions = useMemo(() => asAskUserQuestion(msg), [msg, msg.inputJson, msg._inputTruncated]);
   const resolved = !!msg._resolved;
   const pending = msg._controlPending === true;
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
+  const [fullReady, setFullReady] = useState(msg._inputTruncated !== true);
   const isExitPlan = isExitPlanModeTool(msg.toolName);
   const input = permissionInput(msg);
   const planMarkdown = isExitPlan ? extractExitPlanMarkdown(input) : "";
+  const inputTruncated = msg._inputTruncated === true && !fullReady;
 
   const expired = !resolved && permissionHasExpired(msg);
-  const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt);
+  const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt) && !inputTruncated;
+
+  useEffect(() => {
+    if (msg._inputTruncated !== true || !msg.requestId) {
+      setFullReady(true);
+      return;
+    }
+    let cancelled = false;
+    void fetchPermissionFullInput(msg.requestId).then((full) => {
+      if (cancelled || !full) return;
+      msg.inputJson = full;
+      msg._inputTruncated = false;
+      setFullReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [msg, msg.requestId, msg._inputTruncated]);
 
   // 自动弹窗：仅前台活提问。后台挂载不记已弹；真正展示后才 mark。
-  // 关掉只关 UI，不批准/拒绝。时间线重挂未 dismiss 的活提问仍再弹。
+  // 关掉只关 UI，不批准/拒绝。未加载完整输入前不打开可答表单。
   useEffect(() => {
-    if (!livePrompt || resolved || pending || readOnly || expired) return;
+    if (renderMode === "card") return;
+    if (!livePrompt || resolved || pending || readOnly || expired || inputTruncated) return;
     const requestId = msg.requestId;
     if (!requestId) return;
     if (!shouldAutoOpenPermission({ requestId, livePrompt })) return;
     setOpen(true);
-  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
+  }, [resolved, pending, readOnly, expired, livePrompt, inputTruncated, msg.requestId]);
 
   useEffect(() => {
     if (!livePrompt || resolved || pending || readOnly || expired) return;
@@ -276,9 +301,11 @@ export function PermissionCard({
   useEffect(() => {
     const requestId = msg.requestId;
     return () => {
-      if (requestId) yieldActiveModal(requestId);
+      // Timeline cards are card-only; Host owns the singleton slot.
+      // Yielding on virtualization unmount was T5: slot occupied, 0 dialogs.
+      if (requestId && renderMode === "both") yieldActiveModal(requestId);
     };
-  }, [msg.requestId]);
+  }, [msg.requestId, renderMode]);
 
   const handleDismissableOpenChange = (next: boolean) => {
     if (!next) rememberDismissedPermissionRequest(msg.requestId);
@@ -288,45 +315,41 @@ export function PermissionCard({
   // 状态图标(M7):lucide 替代 emoji。等待→Clock / 已允许→Check / 已拒绝→X。
   const StatusIcon = !resolved ? Clock : behavior === "allow" ? Check : X;
   const statusIconCls = !resolved ? "text-muted" : behavior === "allow" ? "text-success" : "text-danger";
-  const statusText = !resolved
-    ? pending
-      ? "正在提交…"
-      : expired
-        ? "已过期"
-        : questions
-          ? "等待回答…"
-          : isExitPlan
-            ? "等待确认计划…"
-            : "等待审批…"
-    : behavior === "allow"
-      ? questions
-        ? "已提交"
-        : isExitPlan
-          ? "已确认计划"
-          : "已允许"
-      : questions
-        ? "已跳过"
-        : isExitPlan
-          ? "继续规划"
-          : "已拒绝";
-  const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : "deny";
+  let statusText = "等待审批…";
+  if (!resolved) {
+    if (pending) statusText = "正在提交…";
+    else if (expired) statusText = "已过期";
+    else if (inputTruncated) statusText = "正在加载完整问题…";
+    else if (questions) statusText = "等待回答…";
+    else if (isExitPlan) statusText = "等待确认计划…";
+  } else if (behavior === "allow") {
+    statusText = questions ? "已提交" : isExitPlan ? "已确认计划" : "已允许";
+  } else if (behavior === "deny") {
+    statusText = questions ? "已跳过" : isExitPlan ? "继续规划" : "已拒绝";
+  } else {
+    statusText = "已受理";
+  }
+  const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : behavior === "deny" ? "deny" : "neutral";
 
   // 工具中文标签 + 图标(F5):resolveToolMeta 单一权威;无 toolName → 「未知工具」。
   const meta = msg.toolName ? resolveToolMeta(msg.toolName, input) : null;
   const toolLabel = meta ? meta.label : "未知工具";
   const ToolIcon = meta?.icon ?? null;
 
+  const showCard = renderMode !== "modal";
+  const showModal = renderMode !== "card";
   return (
     <div
-      data-testid="permission-card"
+      data-testid={showCard ? "permission-card" : "permission-modal-host"}
       data-permission-request={msg.requestId}
       className={cn(
-        "rounded-lg border bg-surface animate-in",
+        showCard && "rounded-lg border bg-surface animate-in",
         tone === "allow" && "border-success/40",
         tone === "deny" && "border-danger/40",
         tone === "neutral" && "border-accent/40",
       )}
     >
+      {showCard ? <>
       <div className="flex items-center gap-2.5 px-3.5 py-2.5">
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {questions ? <HelpCircle size={14} /> : <ShieldCheck size={14} />}
@@ -425,9 +448,15 @@ export function PermissionCard({
           {settledReasonLabel(msg._settledReason)}
         </div>
       )}
+      {inputTruncated && !resolved && (
+        <div className="border-t border-border px-3.5 py-2 text-caption text-faint">
+          完整问题仍在加载，加载完成前不能提交。
+        </div>
+      )}
+      </> : null}
 
       {/* 审批 modal */}
-      {canAnswer &&
+      {showModal && canAnswer &&
         (questions ? (
           <AskUserQuestionModal
             open={open}
@@ -460,6 +489,48 @@ export function PermissionCard({
           />
         ))}
     </div>
+  );
+}
+
+export function PermissionPromptHost({
+  messages,
+  onRespond,
+  readOnly = false,
+  sending = false,
+}: {
+  messages: ChatMessage[];
+  onRespond: PermissionRespond;
+  readOnly?: boolean;
+  sending?: boolean;
+}) {
+  const [, setTick] = useState(0);
+  useEffect(() => subscribePermissionCoordinator(() => {
+    setTick((n) => n + 1);
+  }), []);
+  if (readOnly) return null;
+  const pending = messages.filter(
+    (message) =>
+      message.role === "permission" &&
+      isAwaitingPermissionPrompt(message) &&
+      typeof message.requestId === "string" &&
+      message.requestId.length > 0,
+  );
+  const active = activeModalRequest();
+  const activeMsg = pending.find((message) => message.requestId === active);
+  const autoMsg = pending.find((message) => {
+    const live =
+      sending || isRecoveryTurnClientMessageId(message._turnOwnerId);
+    return live && shouldAutoOpenPermission({ requestId: message.requestId!, livePrompt: true });
+  });
+  const msg = activeMsg ?? autoMsg;
+  if (!msg) return null;
+  return (
+    <PermissionCard
+      msg={msg}
+      onRespond={onRespond}
+      livePrompt
+      renderMode="modal"
+    />
   );
 }
 

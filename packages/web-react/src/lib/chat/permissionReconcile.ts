@@ -25,7 +25,7 @@ export type PermissionReconcileResult = {
   materialize: PermissionPromptSnapshotItem[];
   settle: Array<{
     requestId: string;
-    behavior: "allow" | "deny";
+    behavior: "allow" | "deny" | null;
     reason: string | null;
     answers: Record<string, string> | null;
     status: PermissionPromptSnapshotItem["status"];
@@ -73,16 +73,17 @@ export function reconcilePermissionSnapshot(input: {
         const localUpdated = local.updatedAt ?? 0;
         if (localUpdated >= item.updatedAt) continue;
       }
-      if (!local) result.materialize.push(item);
+      if (!local || !item.inputTruncated) result.materialize.push(item);
+      if (item.inputTruncated) result.lookupRequestIds.push(item.requestId);
       continue;
     }
     if (!TERMINAL.has(item.status)) continue;
     if (local?.resolved) continue;
-    const behavior: "allow" | "deny" =
+    const behavior: "allow" | "deny" | null =
       item.behavior === "allow" || item.behavior === "deny"
         ? item.behavior
         : item.status === "responded"
-          ? "allow"
+          ? null
           : "deny";
     result.settle.push({
       requestId: item.requestId,
@@ -118,7 +119,8 @@ export function permissionSnapshotToRequestFrame(
   toolUseId?: string;
   clientMessageId?: string;
   inputPreview: string;
-  inputJson: Record<string, unknown>;
+  inputJson?: Record<string, unknown>;
+  inputTruncated?: true;
   expiresAt: number;
   detachedAskUser?: true;
   ts: number;
@@ -133,7 +135,7 @@ export function permissionSnapshotToRequestFrame(
     ...(item.toolUseId ? { toolUseId: item.toolUseId } : {}),
     ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
     inputPreview: JSON.stringify(item.inputJson).slice(0, 400),
-    inputJson: item.inputJson,
+    ...(item.inputTruncated ? { inputTruncated: true as const } : { inputJson: item.inputJson }),
     expiresAt: item.expiresAt,
     ...(item.requestId.startsWith("ask-user:") ? { detachedAskUser: true as const } : {}),
     ts: nowMs,

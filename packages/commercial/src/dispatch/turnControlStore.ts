@@ -543,6 +543,34 @@ export const PERMISSION_PROMPT_MAX_INPUT_BYTES = 8192
 /** Statement timeout for snapshot/hello permission reads. */
 export const PERMISSION_PROMPT_READ_TIMEOUT_MS = 250
 
+type PermissionReadPool = Pick<Pool, 'query'> & {
+  connect?: () => Promise<PoolClient>
+}
+
+/** Bounded PG read: SET LOCAL statement_timeout on a real pool; mock query() pools skip it. */
+export async function queryPermissionRead<T extends object>(
+  pool: PermissionReadPool,
+  sql: string,
+  params: unknown[],
+): Promise<{ rows: T[]; rowCount: number | null }> {
+  if (typeof pool.connect !== 'function') {
+    return pool.query(sql, params) as Promise<{ rows: T[]; rowCount: number | null }>
+  }
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SET LOCAL statement_timeout = ${PERMISSION_PROMPT_READ_TIMEOUT_MS}`)
+    const result = await client.query(sql, params)
+    await client.query('COMMIT')
+    return result as { rows: T[]; rowCount: number | null }
+  } catch (error) {
+    try { await client.query('ROLLBACK') } catch { /* ignore */ }
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
 export type PermissionPromptCompleteness = 'complete' | 'truncated' | 'unavailable'
 
 export type PermissionPromptSource = 'pg' | 'runtime'
@@ -553,6 +581,8 @@ export interface PendingPermissionPromptRow {
   toolUseId: string | null
   toolName: string
   input: Record<string, unknown>
+  inputTruncated: boolean
+  inputPreview: string
   expiresAt: Date
 }
 
@@ -561,14 +591,14 @@ export async function readPendingPermissionPrompts(
   input: { userId: bigint; sessionId: string; limit?: number },
 ): Promise<PendingPermissionPromptRow[]> {
   const limit = Math.max(1, Math.min(input.limit ?? HELLO_PENDING_PERMISSION_MAX_ROWS, 64))
-  const result = await pool.query<{
+  const result = await queryPermissionRead<{
     request_id: string
     client_message_id: string | null
     tool_use_id: string | null
     tool_name: string
     input_json: unknown
     expires_at: Date | string
-  }>(
+  }>(pool,
     // Defence in depth for rows persisted before durable settlement existed
     // (INC-…-ZOMBIE): a turn the user durably stopped is never answerable
     // again, even if its row is still `pending`. Detached ask_user survives
@@ -603,12 +633,15 @@ export async function readPendingPermissionPrompts(
     if (typeof inputJson !== 'object' || inputJson === null || Array.isArray(inputJson)) continue
     const expiresAt = row.expires_at instanceof Date ? row.expires_at : new Date(row.expires_at)
     if (Number.isNaN(expiresAt.getTime())) continue
+    const classified = classifyPermissionInput(inputJson as Record<string, unknown>)
     rows.push({
       requestId: row.request_id,
       clientMessageId: row.client_message_id,
       toolUseId: row.tool_use_id,
       toolName: row.tool_name,
-      input: inputJson as Record<string, unknown>,
+      input: classified.input,
+      inputTruncated: classified.truncated,
+      inputPreview: classified.preview,
       expiresAt,
     })
   }
@@ -635,8 +668,10 @@ export function pendingPermissionPromptToFrame(
     toolName: row.toolName,
     ...(row.toolUseId ? { toolUseId: row.toolUseId } : {}),
     ...(clientMessageId ? { clientMessageId } : {}),
-    inputPreview: JSON.stringify(row.input).slice(0, 400),
-    inputJson: row.input,
+    inputPreview: row.inputPreview || JSON.stringify(row.input).slice(0, 400),
+    ...(row.inputTruncated
+      ? { inputTruncated: true }
+      : { inputJson: row.input }),
     expiresAt,
     ...(row.requestId.startsWith('ask-user:') ? { detachedAskUser: true } : {}),
     ts: nowMs,
@@ -659,14 +694,32 @@ function parsePromptDate(value: Date | string): Date | null {
   return Number.isNaN(date.getTime()) ? null : date
 }
 
-function clampPermissionInput(input: Record<string, unknown>): Record<string, unknown> {
-  try {
-    const encoded = JSON.stringify(input)
-    if (encoded.length <= PERMISSION_PROMPT_MAX_INPUT_BYTES) return input
-    return { _truncated: true, preview: encoded.slice(0, PERMISSION_PROMPT_MAX_INPUT_BYTES) }
-  } catch {
-    return { _truncated: true }
+function utf8ByteLength(text: string): number {
+  return Buffer.byteLength(text, 'utf8')
+}
+
+function sliceUtf8(text: string, maxBytes: number): string {
+  if (utf8ByteLength(text) <= maxBytes) return text
+  const buf = Buffer.from(text, 'utf8')
+  let end = Math.min(maxBytes, buf.length)
+  while (end > 0 && (buf[end - 1]! & 0xc0) === 0x80) end -= 1
+  return buf.subarray(0, end).toString('utf8')
+}
+
+export function classifyPermissionInput(input: Record<string, unknown>): {
+  input: Record<string, unknown>
+  truncated: boolean
+  preview: string
+} {
+  let encoded = ''
+  try { encoded = JSON.stringify(input) } catch {
+    return { input: {}, truncated: true, preview: '' }
   }
+  const preview = sliceUtf8(encoded, 400)
+  if (utf8ByteLength(encoded) <= PERMISSION_PROMPT_MAX_INPUT_BYTES) {
+    return { input, truncated: false, preview }
+  }
+  return { input: {}, truncated: true, preview }
 }
 
 const PENDING_PERMISSION_ZOMBIE_SQL = `
@@ -689,6 +742,39 @@ const PENDING_PERMISSION_ZOMBIE_SQL = `
  *  (capped at 8 peers) while hello carries every visible session. One SQL with
  *  `session_id = ANY($2::text[])` covers the bounded candidate set in a single
  *  round trip; WHERE semantics stay byte-identical to the single-session reader. */
+export type HelloPendingPermissionScan = {
+  bySession: Map<string, PendingPermissionPromptRow[]>
+  rowLimited: boolean
+  uncoveredSessionIds: string[]
+}
+
+/** Production hello scan: Stop fence + per-session row number + global LIMIT.
+ *  per-session cap is min(requested, floor(64/n)) so 32 sessions × 3 pending
+ *  cannot silently drop 10 selected sessions. */
+export const PERMISSION_PROMPT_HELLO_PRODUCTION_SQL =
+  `SELECT session_id,request_id,client_message_id,tool_use_id,tool_name,input_json,expires_at FROM (
+      SELECT p.session_id,p.request_id,p.client_message_id,p.tool_use_id,p.tool_name,p.input_json,p.expires_at,
+             ROW_NUMBER() OVER (PARTITION BY p.session_id ORDER BY p.created_at ASC) AS rn
+        FROM turn_permission_requests p
+       WHERE p.user_id=$1 AND p.session_id = ANY($2::text[]) AND p.status='pending' AND p.expires_at>NOW()
+         AND (
+           p.request_id LIKE 'ask-user:%'
+           OR p.client_message_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1 FROM turn_control_requests c
+              WHERE c.user_id=p.user_id AND c.session_id=p.session_id AND c.kind='stop'
+                AND c.status<>'cancelled'
+                AND (
+                  c.root_client_message_id=p.client_message_id
+                  OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+                )
+           )
+         )
+    ) ranked
+    WHERE rn <= $4
+    ORDER BY session_id, expires_at ASC
+    LIMIT $3`
+
 export async function readPendingPermissionPromptsForSessions(
   pool: Pick<Pool, 'query'>,
   input: {
@@ -696,7 +782,7 @@ export async function readPendingPermissionPromptsForSessions(
     sessionIds: string[]
     limitPerSession?: number
   },
-): Promise<Map<string, PendingPermissionPromptRow[]>> {
+): Promise<HelloPendingPermissionScan> {
   const seen = new Set<string>()
   const sessionIds: string[] = []
   for (const id of input.sessionIds) {
@@ -705,49 +791,68 @@ export async function readPendingPermissionPromptsForSessions(
     seen.add(id)
     sessionIds.push(id)
   }
-  const grouped = new Map<string, PendingPermissionPromptRow[]>()
-  if (sessionIds.length === 0) return grouped
+  const empty: HelloPendingPermissionScan = {
+    bySession: new Map(),
+    rowLimited: false,
+    uncoveredSessionIds: [],
+  }
+  if (sessionIds.length === 0) return empty
+  const fairShare = Math.max(1, Math.floor(HELLO_PENDING_PERMISSION_MAX_TOTAL_ROWS / sessionIds.length))
   const perSession = Math.max(1, Math.min(
-    input.limitPerSession ?? HELLO_PENDING_PERMISSION_DEFAULT_PER_SESSION, 64,
+    input.limitPerSession ?? HELLO_PENDING_PERMISSION_DEFAULT_PER_SESSION,
+    64,
+    fairShare,
   ))
   const totalLimit = Math.min(
     perSession * sessionIds.length, HELLO_PENDING_PERMISSION_MAX_TOTAL_ROWS,
   )
-  const result = await pool.query<{
-    session_id: string
-    request_id: string
-    client_message_id: string | null
-    tool_use_id: string | null
-    tool_name: string
-    input_json: unknown
-    expires_at: Date | string
-  }>(
-    `SELECT p.session_id,p.request_id,p.client_message_id,p.tool_use_id,p.tool_name,p.input_json,p.expires_at
-       FROM turn_permission_requests p
-      WHERE p.user_id=$1 AND p.session_id = ANY($2::text[]) AND p.status='pending' AND p.expires_at>NOW()
-        ${PENDING_PERMISSION_ZOMBIE_SQL}
-      ORDER BY p.session_id, p.created_at ASC
-      LIMIT $3`,
-    [input.userId.toString(), sessionIds, totalLimit],
-  )
+  let result: {
+    rows: Array<{
+      session_id: string
+      request_id: string
+      client_message_id: string | null
+      tool_use_id: string | null
+      tool_name: string
+      input_json: unknown
+      expires_at: Date | string
+    }>
+    rowCount: number | null
+  }
+  try {
+    result = await queryPermissionRead(
+      pool,
+      PERMISSION_PROMPT_HELLO_PRODUCTION_SQL,
+      [input.userId.toString(), sessionIds, totalLimit, perSession],
+    )
+  } catch {
+    return { bySession: new Map(), rowLimited: true, uncoveredSessionIds: sessionIds }
+  }
+  const bySession = new Map<string, PendingPermissionPromptRow[]>()
   for (const row of result.rows) {
     const inputJson = parsePromptJsonObject(row.input_json)
     if (inputJson === null) continue
     const expiresAt = parsePromptDate(row.expires_at)
     if (expiresAt === null) continue
+    const classified = classifyPermissionInput(inputJson)
     const entry: PendingPermissionPromptRow = {
       requestId: row.request_id,
       clientMessageId: row.client_message_id,
       toolUseId: row.tool_use_id,
       toolName: row.tool_name,
-      input: clampPermissionInput(inputJson),
+      input: classified.input,
+      inputTruncated: classified.truncated,
+      inputPreview: classified.preview,
       expiresAt,
     }
-    const list = grouped.get(row.session_id)
+    const list = bySession.get(row.session_id)
     if (list) list.push(entry)
-    else grouped.set(row.session_id, [entry])
+    else bySession.set(row.session_id, [entry])
   }
-  return grouped
+  const rowLimited = result.rows.length >= totalLimit
+  const uncoveredSessionIds = rowLimited
+    ? sessionIds.filter((id) => !bySession.has(id))
+    : []
+  return { bySession, rowLimited, uncoveredSessionIds }
 }
 
 /** One prompt of the session-GET snapshot. Unlike the pending-only readers,
@@ -760,8 +865,9 @@ export interface PermissionPromptSnapshotEntry {
   toolUseId: string | null
   toolName: string
   input: Record<string, unknown>
+  inputTruncated: boolean
   status: 'pending' | 'responded' | 'cancelled' | 'expired'
-  response: { behavior: 'allow' | 'deny'; reason: string | null; answers: Record<string, string> | null } | null
+  response: { behavior: 'allow' | 'deny' | null; reason: string | null; answers: Record<string, string> | null } | null
   expiresAt: number
   createdAt: number
   updatedAt: number
@@ -780,17 +886,19 @@ export interface PermissionPromptSnapshot {
 function summarizePermissionResponse(
   responseJson: unknown,
   status: PermissionPromptSnapshotEntry['status'],
-): { behavior: 'allow' | 'deny'; reason: string | null; answers: Record<string, string> | null } | null {
+): { behavior: 'allow' | 'deny' | null; reason: string | null; answers: Record<string, string> | null } | null {
   if (status === 'pending') return null
   const raw = parsePromptJsonObject(responseJson)
   if (raw === null) {
-    return { behavior: status === 'responded' ? 'allow' : 'deny', reason: null, answers: null }
+    return {
+      behavior: status === 'cancelled' || status === 'expired' ? 'deny' : null,
+      reason: null,
+      answers: null,
+    }
   }
   const behaviorRaw = raw.behavior
-  const behavior: 'allow' | 'deny' =
-    behaviorRaw === 'allow' || behaviorRaw === 'deny'
-      ? behaviorRaw
-      : status === 'responded' ? 'allow' : 'deny'
+  const behavior: 'allow' | 'deny' | null =
+    behaviorRaw === 'allow' || behaviorRaw === 'deny' ? behaviorRaw : null
   const reasonRaw = raw.reason
   const reason = typeof reasonRaw === 'string' ? reasonRaw : null
   let answers: Record<string, string> | null = null
@@ -817,7 +925,8 @@ function mapPermissionSnapshotRow(row: {
   expires_at: Date | string
   created_at: Date | string
   updated_at: Date | string
-}, nowMs: number): PermissionPromptSnapshotEntry | null {
+  stopped?: boolean
+}, nowMs: number, opts?: { includeFullInput?: boolean }): PermissionPromptSnapshotEntry | null {
   const parsedInput = parsePromptJsonObject(row.input_json)
   if (parsedInput === null) return null
   const expiresAt = parsePromptDate(row.expires_at)
@@ -829,36 +938,60 @@ function mapPermissionSnapshotRow(row: {
   else if (row.status === 'pending' || row.status === 'expired') {
     status = row.status === 'pending' && expiresAt.getTime() > nowMs ? 'pending' : 'expired'
   } else return null
+  const detached = row.request_id.startsWith('ask-user:')
+  if (status === 'pending' && row.stopped === true && !detached) {
+    status = 'cancelled'
+  }
+  const classified = opts?.includeFullInput
+    ? { input: parsedInput, truncated: false, preview: sliceUtf8(JSON.stringify(parsedInput), 400) }
+    : classifyPermissionInput(parsedInput)
+  const response = status === 'cancelled' && row.stopped === true && !detached
+    ? { behavior: 'deny' as const, reason: 'user_stop', answers: null }
+    : summarizePermissionResponse(row.response_json, status)
   return {
     requestId: row.request_id,
     clientMessageId: row.client_message_id,
     toolUseId: row.tool_use_id,
     toolName: row.tool_name,
-    input: clampPermissionInput(parsedInput),
+    input: classified.input,
+    inputTruncated: classified.truncated,
     status,
-    response: summarizePermissionResponse(row.response_json, status),
+    response,
     expiresAt: expiresAt.getTime(),
     createdAt: createdAt.getTime(),
     updatedAt: updatedAt.getTime(),
   }
 }
 
+const STOPPED_PROJECTION_SQL = `(
+        p.request_id NOT LIKE 'ask-user:%'
+        AND p.client_message_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM turn_control_requests c
+           WHERE c.user_id=p.user_id AND c.session_id=p.session_id AND c.kind='stop'
+             AND c.status<>'cancelled'
+             AND (
+               c.root_client_message_id=p.client_message_id
+               OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+             )
+        )
+      ) AS stopped`
+
 export const PERMISSION_PROMPT_SNAPSHOT_SQL =
-  `SELECT request_id,client_message_id,tool_use_id,tool_name,input_json,response_json,status,expires_at,created_at,updated_at
-     FROM turn_permission_requests
-    WHERE user_id=$1 AND session_id=$2
-    ORDER BY created_at DESC
+  `SELECT p.request_id,p.client_message_id,p.tool_use_id,p.tool_name,p.input_json,p.response_json,p.status,p.expires_at,p.created_at,p.updated_at,
+          ${STOPPED_PROJECTION_SQL}
+     FROM turn_permission_requests p
+    WHERE p.user_id=$1 AND p.session_id=$2
+    ORDER BY p.created_at DESC
     LIMIT $3`
 
 export const PERMISSION_PROMPT_LOOKUP_SQL =
-  `SELECT request_id,client_message_id,tool_use_id,tool_name,input_json,response_json,status,expires_at,created_at,updated_at
-     FROM turn_permission_requests
-    WHERE user_id=$1 AND request_id = ANY($2::text[]) AND session_id=$3`
-
-export const PERMISSION_PROMPT_HELLO_BATCH_SQL =
-  `SELECT p.session_id,p.request_id,p.client_message_id,p.tool_use_id,p.tool_name,p.input_json,p.expires_at
+  `SELECT p.request_id,p.client_message_id,p.tool_use_id,p.tool_name,p.input_json,p.response_json,p.status,p.expires_at,p.created_at,p.updated_at,
+          ${STOPPED_PROJECTION_SQL}
      FROM turn_permission_requests p
-    WHERE p.user_id=$1 AND p.session_id = ANY($2::text[]) AND p.status='pending' AND p.expires_at>NOW()`
+    WHERE p.user_id=$1 AND p.request_id = ANY($2::text[]) AND p.session_id=$3`
+
+export const PERMISSION_PROMPT_HELLO_BATCH_SQL = PERMISSION_PROMPT_HELLO_PRODUCTION_SQL
 
 /** Recent prompts of one session regardless of status, newest first. Feeds the
  *  `permissionPrompts` payload on session GET. A `pending` row whose expires_at
@@ -871,7 +1004,7 @@ export async function readPermissionPromptSnapshot(
 ): Promise<PermissionPromptSnapshot> {
   const limit = Math.max(1, Math.min(input.limit ?? PERMISSION_PROMPT_SNAPSHOT_LIMIT, 64))
   try {
-    const result = await pool.query<{
+    const result = await queryPermissionRead<{
       request_id: string
       client_message_id: string | null
       tool_use_id: string | null
@@ -882,11 +1015,12 @@ export async function readPermissionPromptSnapshot(
       expires_at: Date | string
       created_at: Date | string
       updated_at: Date | string
-    }>(PERMISSION_PROMPT_SNAPSHOT_SQL, [input.userId.toString(), input.sessionId, limit])
+      stopped: boolean
+    }>(pool, PERMISSION_PROMPT_SNAPSHOT_SQL, [input.userId.toString(), input.sessionId, limit])
     const nowMs = Date.now()
     const items: PermissionPromptSnapshotEntry[] = []
     for (const row of result.rows) {
-      const entry = mapPermissionSnapshotRow(row, nowMs)
+      const entry = mapPermissionSnapshotRow(row, nowMs, { includeFullInput: false })
       if (entry) items.push(entry)
     }
     return {
@@ -916,7 +1050,7 @@ export async function readPermissionPromptsByRequestIds(
   }
   if (requestIds.length === 0) return []
   try {
-    const result = await pool.query<{
+    const result = await queryPermissionRead<{
       request_id: string
       client_message_id: string | null
       tool_use_id: string | null
@@ -927,14 +1061,16 @@ export async function readPermissionPromptsByRequestIds(
       expires_at: Date | string
       created_at: Date | string
       updated_at: Date | string
+      stopped: boolean
     }>(
+      pool,
       PERMISSION_PROMPT_LOOKUP_SQL,
       [input.userId.toString(), requestIds, input.sessionId],
     )
     const nowMs = Date.now()
     const items: PermissionPromptSnapshotEntry[] = []
     for (const row of result.rows) {
-      const entry = mapPermissionSnapshotRow(row, nowMs)
+      const entry = mapPermissionSnapshotRow(row, nowMs, { includeFullInput: true })
       if (entry) items.push(entry)
     }
     return items
@@ -949,6 +1085,7 @@ export function serializePermissionPromptEntry(entry: PermissionPromptSnapshotEn
   toolUseId: string | null
   toolName: string
   inputJson: Record<string, unknown>
+  inputTruncated: boolean
   status: PermissionPromptSnapshotEntry['status']
   behavior: 'allow' | 'deny' | null
   reason: string | null
@@ -963,6 +1100,7 @@ export function serializePermissionPromptEntry(entry: PermissionPromptSnapshotEn
     toolUseId: entry.toolUseId,
     toolName: entry.toolName,
     inputJson: entry.input,
+    inputTruncated: entry.inputTruncated,
     status: entry.status,
     behavior: entry.response?.behavior ?? null,
     reason: entry.response?.reason ?? null,

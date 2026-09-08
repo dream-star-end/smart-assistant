@@ -540,6 +540,8 @@ export type ChatMessage = {
   toolUseId?: string;
   _resolved?: boolean;
   _behavior?: "allow" | "deny";
+  /** Snapshot/hello omitted the full answerable input (UTF-8 > 8KiB). */
+  _inputTruncated?: boolean;
   _settledReason?: string | null;
   _answers?: Record<string, string>;
   /** Durable permission response exists but Master has not yet reported an

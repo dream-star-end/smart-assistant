@@ -1961,6 +1961,7 @@ export interface ClientSession {
       toolUseId: string | null
       toolName: string
       inputJson: Record<string, unknown>
+      inputTruncated?: boolean
       status: 'pending' | 'responded' | 'cancelled' | 'expired'
       behavior: 'allow' | 'deny' | null
       reason: string | null
@@ -1977,6 +1978,7 @@ export interface ClientSession {
       toolUseId: string | null
       toolName: string
       inputJson: Record<string, unknown>
+      inputTruncated?: boolean
       status: 'pending' | 'responded' | 'cancelled' | 'expired'
       behavior: 'allow' | 'deny' | null
       reason: string | null

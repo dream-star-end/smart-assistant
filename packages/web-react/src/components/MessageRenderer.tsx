@@ -72,6 +72,7 @@ import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import {
   PermissionCard,
+  PermissionPromptHost,
   type PermissionRespond,
   isAwaitingPermissionPrompt,
 } from "./chat/PermissionCard";
@@ -172,6 +173,8 @@ type RendererProps = {
   failurePresentedBelow?: boolean;
   /** 初始尾部 locator：跳过 600px IO，进会话即兑付正文。 */
   eagerPayload?: boolean;
+  /** MessageList owns PermissionPromptHost; timeline cards must not mount a second modal. */
+  hostedPermission?: boolean;
 };
 
 export const MessageRenderer = memo(
@@ -193,6 +196,7 @@ export const MessageRenderer = memo(
     readOnly = false,
     failurePresentedBelow = false,
     eagerPayload = false,
+    hostedPermission = false,
   }: RendererProps) {
     const ctx = {
       isLast,
@@ -317,6 +321,7 @@ export const MessageRenderer = memo(
             onRespond={onRespondPermission}
             readOnly={readOnly}
             livePrompt={live}
+            renderMode={hostedPermission ? "card" : "both"}
           />
         );
       }
@@ -658,6 +663,7 @@ function DeferredTapeRecordCard({
               onRespondPermission={onRespondPermission}
               readOnly={readOnly}
               failurePresentedBelow={failurePresentedBelow}
+              hostedPermission
             />
           );
         })}
@@ -1881,6 +1887,7 @@ export function MessageList({
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
           eagerPayload={eagerPayloadKeysRef.current?.has(rowId) === true}
+          hostedPermission
         />
       </MessageBoundary>
     );
@@ -2002,9 +2009,13 @@ export function MessageList({
     const match = findMatchesList[next];
     if (match) jumpTo(match);
   };
+  const pendingSig = messages
+    .filter((message) => message.role === "permission")
+    .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
+    .join("|");
   const pendingPrompts = useMemo(
     () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
-    [messages, readOnly],
+    [pendingSig, readOnly, messages],
   );
   const requestIdByToolUseId = useMemo(() => {
     const map = new Map<string, string>();
@@ -2016,6 +2027,7 @@ export function MessageList({
   return (
     <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
     <>
+    <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} />
     {pendingPrompts.length > 0 ? (
       <div
         data-testid="pending-permission-dock"
@@ -2029,10 +2041,6 @@ export function MessageList({
             className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent"
             onClick={() => {
               if (message.requestId) reopenPermissionUi(message.requestId);
-              const safe = (message.requestId ?? "").replace(/["\\]/g, "");
-              document
-                .querySelector(`[data-permission-request="${safe}"] button`)
-                ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
             }}
           >
             {message.toolName === "AskUserQuestion"

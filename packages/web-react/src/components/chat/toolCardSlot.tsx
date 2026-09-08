@@ -48,10 +48,6 @@ export function ToolCardSlot({ message, tokenUsage }: ToolCardProps) {
           data-testid="permission-tool-reopen"
           onClick={() => {
             reopenPermissionUi(requestId);
-            const safe = requestId.replace(/["\\]/g, "");
-            document
-              .querySelector(`[data-permission-request="${safe}"] button`)
-              ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
           }}
         >
           打开待答
