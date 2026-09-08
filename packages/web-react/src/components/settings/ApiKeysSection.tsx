@@ -263,7 +263,10 @@ export function ApiKeysSection({
     () =>
       buildCcSwitchDeepLink({
         origin,
-        name: BRAND.name,
+        // 必须是 ASCII:CC Switch 用 name 派生供应商 id(`is_alphanumeric` 保留汉字),再把
+        // `%TEMP%\claude_<id>_<pid>.json` 写进 UTF-8 无 BOM 的 .bat 交给 cmd.exe ——含中文时
+        // cmd 会把后续行错位切分(「'g' / '--settings' 不是内部或外部命令」),「打开终端」直接失败。
+        name: BRAND.nameEn,
         apiKey: keyReady ? candidateKey : null,
         model: mainModel,
         opusModel: mainModel,
@@ -638,7 +641,8 @@ export function ApiKeysSection({
             预设选「<b>自定义</b>」。
           </li>
           <li>
-            名称任填(如 <code className="font-mono">{BRAND.name}</code>);端点地址填{" "}
+            名称请用<b>英文</b>(如 <code className="font-mono">{BRAND.nameEn}</code>
+            ,中文名会让 Windows 上的「打开终端」失败);端点地址填{" "}
             <code className="select-all font-mono">{endpoint}</code>;API Key 填{" "}
             <code className="font-mono">oc-cc.…</code> 密钥。
           </li>
@@ -735,6 +739,13 @@ export function ApiKeysSection({
           <li>
             CC Switch 的「检测连通」只探测地址可达,不校验密钥;真正的验证以运行{" "}
             <code className="font-mono">claude</code> 后能回话、或「用量查询」能显示余额为准。
+          </li>
+          <li>
+            <b>「打开终端」报 'g' / '--settings' 不是内部或外部命令</b>(Windows):CC Switch
+            按供应商名生成临时配置路径并写进 .bat,名称含中文时 cmd.exe 会把命令行切错。把该供应商<b>重命名为英文</b>
+            (或删掉后重新一键导入,新链接已改用英文名)即可;
+            也可以不用它的「打开终端」,直接在自己的终端里运行 <code className="font-mono">claude</code>
+            (CC Switch 已把配置写进 <code className="font-mono">~/.claude/settings.json</code>)。
           </li>
         </ul>
       </details>
