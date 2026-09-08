@@ -3437,7 +3437,7 @@
       "id": "INC-20260908-PREPARATION-RETRY",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "首次受理后上下文准备超过35秒被终态化，没有自动重试；同cmid重入可能复活准备计时器。R0兼容代码待审，writer关闭，尚未上线。",
+      "symptom": "首次受理后上下文准备超过35秒被终态化，没有自动重试；同cmid重入可能复活准备计时器。兼容writer关闭时缺负向裁决可造成无任务假重新准备。",
       "rootFixCommit": "60912504",
       "regressions": [
         {
@@ -3459,7 +3459,20 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/preparation-recovery.node-test.mjs",
           "assertion": "OCV5-174: real timeline preparation, reload/two tabs, success/exhausted and Stop"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "R1 negative preparation decision"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-174 real source admission freezes >4MiB settings and reclaims exactly one deferred child"
         }
+      ],
+      "coverageCommits": [
+        "f5ad3542"
       ]
     }
   ]
