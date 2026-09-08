@@ -3392,10 +3392,6 @@
       "severity": "P1",
       "symptom": "委派完成回调经cron-origin先受理冻结原文哈希，后被论文意图hint重写content.text，执行端payload_hash_mismatch拒绝并显示消息未开始处理。内部cron-origin保持已受理正文，浏览器论文hint仍在受理前应用。",
       "rootFixCommit": "471b5149",
-      "proofPending": {
-        "reason": "已通过真实master-to-container WS验签/哈希/receipt红绿回归（unit runner）；尚待正式发布后核验原会话回调，未冒充浏览器或live-e2e证据。",
-        "since": "2026-09-08"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -3406,7 +3402,15 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
           "assertion": "OCV5-187 browser paper hint stays before admission even with forged cron-origin fields"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-callback-payload-hash.mjs",
+          "assertion": "OCV5-187 deploy proof: admitted callback bytes, signature and receipt agree"
         }
+      ],
+      "coverageCommits": [
+        "e764a7f1"
       ]
     }
   ]
