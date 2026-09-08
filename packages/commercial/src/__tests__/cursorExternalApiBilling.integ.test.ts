@@ -8,12 +8,12 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import protobuf from "protobufjs";
@@ -64,7 +64,6 @@ type Scenario = {
 };
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("../../../../", import.meta.url)));
-const OLD_SOURCE_SHA = "87d4554efd27289844cfb3ce0146fb713ce24954";
 const SOURCE_FILES = [
   "packages/commercial/src/billing/cursorExternalApiOutbox.ts",
   "packages/commercial/src/http/proxy/cursorExternal.ts",
@@ -73,9 +72,14 @@ const SOURCE_FILES = [
 ];
 
 const scenarios: Scenario[] = [];
+const registeredIds: string[] = [];
 const tmpDirs = new Set<string>();
 const liveChildren = new Set<ReturnType<typeof spawn>>();
 let beforeError: string | null = null;
+
+function expectScenario(id: string): void {
+  registeredIds.push(id);
+}
 
 function record(s: Scenario): void {
   scenarios.push(s);
@@ -434,6 +438,48 @@ async function recoverWorker(dir: string): Promise<unknown> {
   } finally {
     clearTimeout(timer);
     liveChildren.delete(child);
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await Promise.race([
+        new Promise((resolve) => child.once("close", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+    }
+  }
+}
+
+async function spawnBounded(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, ["--import", "tsx", ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+  });
+  liveChildren.add(child);
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (c) => {
+    stdout += String(c);
+  });
+  child.stderr.on("data", (c) => {
+    stderr += String(c);
+  });
+  const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+  try {
+    const code: number | null = await new Promise((resolve) => child.on("close", resolve));
+    return { code, stdout, stderr };
+  } finally {
+    clearTimeout(timer);
+    liveChildren.delete(child);
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await Promise.race([
+        new Promise((resolve) => child.once("close", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+    }
   }
 }
 
@@ -570,8 +616,20 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
         hashes[rel] = `unreadable:${err instanceof Error ? err.message : String(err)}`;
       }
     }
+    for (const id of registeredIds) {
+      if (!scenarios.some((s) => s.id === id)) {
+        scenarios.push({
+          id,
+          expected: "record() reached",
+          actual: "missing record — pre-record throw or skipped body",
+          upstreamCalls: -1,
+          pass: false,
+        });
+      }
+    }
     const passed = scenarios.filter((s) => s.pass).length;
     const failed = scenarios.filter((s) => !s.pass).length;
+    if (failed > 0 || beforeError) process.exitCode = 1;
     process.stdout.write(
       `${JSON.stringify({
         suite: "cursorExternalApiBilling",
@@ -579,6 +637,8 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
         failed,
         skipped: beforeError ? "before_failed" : 0,
         beforeError,
+        registered: registeredIds,
+        recorded: scenarios.map((s) => s.id),
         sourceHashes: hashes,
         tmpDirs: [...tmpDirs],
         scenarios,
@@ -587,6 +647,39 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     await Promise.all([...tmpDirs].map((d) => rm(d, { recursive: true, force: true }).catch(() => undefined)));
     tmpDirs.clear();
   });
+
+  const expectedScenarioIds = [
+    "F1-two-http",
+    "persist-fail-native",
+    "partial-throw-native",
+    "persist-fail-buffered",
+    "partial-throw-buffered",
+    "persist-fail-nonstream",
+    "partial-throw-nonstream",
+    "unobserved-completed",
+    "reported-zero",
+    "seal-wire-scanner",
+    "price-drift",
+    "new-process-ready",
+    "new-process-intent",
+    "commit-unknown",
+    "concurrent-consume",
+    "bounded-scan",
+    "scanner-stop",
+    "cancel-partial-native",
+    "cancel-zero-native",
+    "cancel-unobserved-native",
+    "cancel-partial-buffered",
+    "cancel-zero-buffered",
+    "cancel-unobserved-buffered",
+    "cancel-partial-nonstream",
+    "cancel-zero-nonstream",
+    "cancel-unobserved-nonstream",
+    "after-commit-before-unlink",
+    "route-pg-interrupt-recover",
+    "old-source-f1-red",
+  ];
+  for (const id of expectedScenarioIds) expectScenario(id);
 
   test("F1: two HTTP with the same client id produce two usage rows", async () => {
     let upstream = 0;
@@ -639,6 +732,7 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
         throw new Error("persist_failed");
       };
       let upstream = 0;
+      const before = await counts(uid, accountId, apiKeyId);
       const { res } = await runRoute({
         outbox: box,
         uid,
@@ -655,14 +749,11 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
       const hasStop = pipe.stream
         ? res.text().includes("event: message_stop")
         : /"id"\s*:\s*"msg_/.test(res.text());
-      const after = await query<{ n: string }>(
-        "SELECT count(*)::text AS n FROM usage_records WHERE user_id=$1",
-        [uid.toString()],
-      );
+      const after = await counts(uid, accountId, apiKeyId);
       record({
         id: `persist-fail-${pipe.name}`,
-        expected: "no success terminal, intent remains, no new usage, 1 upstream",
-        actual: `stop=${hasStop} obs=${listing.observations.map((o) => o.kind).join(",")} usage=${after.rows[0]!.n} upstream=${upstream}`,
+        expected: "no success terminal, intent remains, no new usage/ledger/keySpent, 1 upstream",
+        actual: `stop=${hasStop} obs=${listing.observations.map((o) => o.kind).join(",")} usage ${before.usageN}->${after.usageN} ledger ${before.ledgerDelta}->${after.ledgerDelta} spent ${before.keySpent}->${after.keySpent} upstream=${upstream}`,
         upstreamCalls: upstream,
         terminal: "persist_failed",
         phase: listing.observations[0]?.kind,
@@ -670,7 +761,10 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
           hasStop === false
           && listing.observations.some((o) => o.kind === "intent")
           && !listing.observations.some((o) => o.kind === "ready")
-          && upstream === 1,
+          && upstream === 1
+          && after.usageN === before.usageN
+          && after.ledgerDelta === before.ledgerDelta
+          && after.keySpent === before.keySpent,
       });
     });
 
@@ -678,6 +772,11 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
       const dir = await trackedTemp("ocv5-188-throw-");
       const box = await openCursorExternalApiOutbox({ directory: dir });
       let upstream = 0;
+      const before = await counts(uid, accountId, apiKeyId);
+      const beforeIds = await query<{ request_id: string }>(
+        "SELECT request_id FROM usage_records WHERE user_id=$1",
+        [uid.toString()],
+      );
       await runRoute({
         outbox: box,
         uid,
@@ -689,20 +788,31 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
         stream: pipe.stream,
         bufferedStreaming: pipe.buffered,
       });
-      const row = await query<{ output_tokens: string; status: string; snapshot: string }>(
-        `SELECT output_tokens::text, status, price_snapshot::text AS snapshot
-           FROM usage_records WHERE user_id=$1 ORDER BY id DESC LIMIT 1`,
+      const after = await counts(uid, accountId, apiKeyId);
+      const known = new Set(beforeIds.rows.map((r) => r.request_id));
+      const fresh = await query<{ request_id: string; output_tokens: string; status: string; snapshot: string; cost: string }>(
+        `SELECT request_id, output_tokens::text, status, price_snapshot::text AS snapshot, cost_credits::text AS cost
+           FROM usage_records WHERE user_id=$1 ORDER BY id`,
         [uid.toString()],
       );
-      const snap = JSON.parse(row.rows[0]?.snapshot ?? "{}") as { cursor_status?: string };
+      const row = fresh.rows.find((r) => !known.has(r.request_id));
+      const snap = JSON.parse(row?.snapshot ?? "{}") as { cursor_status?: string; cursor_terminal_code?: string };
       record({
         id: `partial-throw-${pipe.name}`,
-        expected: "usage row with output 20 and error/cancel status",
-        actual: JSON.stringify(row.rows[0] ?? null),
+        expected: "this request: usage+1, new 32-hex billing id, output 20, cursor_status=error, ledger/spent unchanged",
+        actual: `usage ${before.usageN}->${after.usageN} row=${JSON.stringify(row ?? null)} ledger ${before.ledgerDelta}->${after.ledgerDelta} spent ${before.keySpent}->${after.keySpent} upstream=${upstream}`,
         upstreamCalls: upstream,
         terminal: snap.cursor_status,
         phase: "settled",
-        pass: row.rows[0]?.output_tokens === "20" && snap.cursor_status === "error" && upstream === 1,
+        pass:
+          upstream === 1
+          && after.usageN === before.usageN + 1
+          && !!row
+          && /^[0-9a-f]{32}$/.test(row.request_id)
+          && row.output_tokens === "20"
+          && snap.cursor_status === "error"
+          && after.ledgerDelta === before.ledgerDelta
+          && after.keySpent === before.keySpent,
       });
     });
   }
@@ -1360,123 +1470,98 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     });
   });
 
-  test("old 87d source two HTTP same client id is a business red (not missing export)", async () => {
-    const overlay = await trackedTemp("ocv5-188-oldsrc-");
-    const proxyDir = path.join(overlay, "packages/commercial/src/http/proxy");
-    await mkdir(proxyDir, { recursive: true });
-    const srcRoot = path.join(REPO_ROOT, "packages/commercial/src");
-    for (const dir of ["billing", "logging", "auth", "account-pool", "admin", "db"]) {
-      await symlink(path.join(srcRoot, dir), path.join(overlay, "packages/commercial/src", dir));
-    }
-    const httpDir = path.join(srcRoot, "http");
-    await mkdir(path.join(overlay, "packages/commercial/src/http"), { recursive: true });
-    for (const name of await readdir(httpDir)) {
-      if (name === "proxy") continue;
-      await symlink(path.join(httpDir, name), path.join(overlay, "packages/commercial/src/http", name));
-    }
-    for (const name of await readdir(path.join(httpDir, "proxy"))) {
-      if (name === "cursorExternal.ts" || name === "cursorExternal.js") continue;
-      await symlink(path.join(httpDir, "proxy", name), path.join(proxyDir, name));
-    }
-    await mkdir(path.join(overlay, "packages"), { recursive: true });
-    await symlink(path.join(REPO_ROOT, "packages/gateway"), path.join(overlay, "packages/gateway"));
-    await symlink(path.join(REPO_ROOT, "node_modules"), path.join(overlay, "node_modules"));
-    const oldSource = execFileSync(
-      "git",
-      ["-c", "safe.directory=*", "show", `${OLD_SOURCE_SHA}:packages/commercial/src/http/proxy/cursorExternal.ts`],
-      { cwd: REPO_ROOT, encoding: "utf8" },
-    );
-    if (oldSource.includes("cursorExternalApiOutbox") || oldSource.includes("newCursorExternalBillingId")) {
-      throw new Error("old overlay is not pre-outbox 87d; refusing to treat export-missing as business red");
-    }
-    if (!oldSource.includes("requestId,") || !oldSource.includes("settleCursorExternalUsage")) {
-      throw new Error("old overlay missing settle(requestId) contract; not a valid F1 red");
-    }
-    await writeFile(path.join(proxyDir, "cursorExternal.ts"), oldSource);
-    let oldMod: { makeCursorExternalRoute: typeof makeCursorExternalRoute };
-    try {
-      oldMod = (await import(pathToFileURL(path.join(proxyDir, "cursorExternal.ts")).href)) as {
-        makeCursorExternalRoute: typeof makeCursorExternalRoute;
-      };
-    } catch (err) {
-      record({
-        id: "old-source-f1-red",
-        expected: "load 87d route (existing exports) then fail F1 with usageΔ=1",
-        actual: `import failed: ${err instanceof Error ? err.message : String(err)}`,
-        upstreamCalls: 0,
-        pass: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
-    }
+  test("real route+relay ready then dedicated-pool interrupt, child exit, new process recover", async () => {
+    const dir = await trackedTemp("ocv5-188-crash-");
+    const marker = path.join(dir, "settling.marker");
+    const appName = `ocv5-188-a-crash-${process.pid}-${Date.now()}`;
     const before = await counts(uid, accountId, apiKeyId);
-    let upstream = 0;
-    const fetchImpl = syntheticFetch(USAGE_FRAMES, () => {
-      upstream += 1;
-    });
-    const oldRoute = oldMod.makeCursorExternalRoute({
-      pgPool: getPool(),
-      pricing: { get: () => pricingRow() } as unknown as PricingCache,
-      logger: quiet,
-      listCursorAccounts: async () => [accountRow(accountId)],
-      loadSnapshot: async (id): Promise<CursorTokenSnapshot | null> => ({
-        id,
-        token: Buffer.from("crsr_test"),
-        credential_kind: "api_key",
-        machine_id: null,
-        refresh: null,
-        expires_at: null,
-      }),
-      readBalance: async () => 1_000_000n,
-      relayFactory: (relayArgs) =>
-        new CursorSandRelay({
-          credentialKind: relayArgs.credentialKind,
-          machineId: relayArgs.machineId,
-          readApiKey: relayArgs.readApiKey,
-          fetchImpl,
-          passthrough: null,
-          upstreamLabel: "Upstream",
-        }),
-    });
-    const body = {
-      model: MODEL,
-      max_tokens: 64,
-      stream: false,
-      messages: [{ role: "user", content: "hi" }],
-    } as never;
-    for (let i = 0; i < 2; i += 1) {
-      const res = new FakeRes();
-      await oldRoute.handle({
-        req: { method: "POST", headers: {}, url: "/v1/messages" } as IncomingMessage,
-        res: res as unknown as ServerResponse,
-        requestId: "same-client-old",
-        uid,
-        identity: { uid, containerId: null, apiKey: { id: apiKeyId, creditLimit: null, spentCredits: 0n } } as ProxyIdentity,
-        body,
-        authorize: async () => {},
-        userLog: quiet,
-      });
+    const worker = fileURLToPath(new URL("./helpers/cursorExternalApiCrash.worker.ts", import.meta.url));
+    const childP = spawnBounded(
+      [worker, dir, db.url, marker, uid.toString(), accountId.toString(), apiKeyId.toString(), appName],
+      { ...process.env, REQUIRE_TEST_DB: "1", TEST_DATABASE_URL: db.url },
+      25_000,
+    );
+    const waitUntil = Date.now() + 8_000;
+    while (Date.now() < waitUntil) {
+      try {
+        await readFile(marker);
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 40));
+      }
     }
-    await oldRoute.close();
+    await query(
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name=$1 AND pid <> pg_backend_pid()",
+      [appName],
+    ).catch(() => undefined);
+    const child = await childP;
+    const leftover = await (await openCursorExternalApiOutbox({ directory: dir })).listBatch({ limit: 8 });
+    const recovered = (await recoverWorker(dir)) as {
+      consumed: Array<{ billingId: string; disposition: string; unlinked: boolean; debited: string | null }>;
+      observations: string[];
+    };
     const after = await counts(uid, accountId, apiKeyId);
-    const usageDelta = after.usageN - before.usageN;
-    let f1Error = "";
-    try {
-      assert.equal(usageDelta, 2, `F1 two HTTP same client id must produce 2 usage rows, old produced ${usageDelta}`);
-    } catch (err) {
-      f1Error = err instanceof Error ? err.message : String(err);
-    }
+    const readyOrIntent = leftover.observations.filter((o) => o.kind === "ready" || o.kind === "intent");
+    const billingId =
+      leftover.observations.find((o) => o.kind === "ready") && leftover.observations.find((o) => o.kind === "ready")!.kind === "ready"
+        ? (leftover.observations.find((o) => o.kind === "ready") as { record: { billingId: string } }).record.billingId
+        : leftover.observations.find((o) => o.kind === "intent")
+          ? (leftover.observations.find((o) => o.kind === "intent") as { billingId: string }).billingId
+          : recovered.consumed[0]?.billingId;
+    const usageRows = billingId
+      ? await query<{ request_id: string; n: string }>(
+          "SELECT request_id, count(*)::text AS n FROM usage_records WHERE user_id=$1 AND request_id=$2 GROUP BY request_id",
+          [uid.toString(), billingId],
+        )
+      : { rows: [] as Array<{ request_id: string; n: string }> };
+    const gone = billingId ? await (await openCursorExternalApiOutbox({ directory: dir })).read(billingId) : null;
+    const usagePlus = after.usageN - before.usageN;
+    const recoveredOk =
+      recovered.consumed.length === 1
+      && (recovered.consumed[0]?.disposition === "new_commit"
+        || recovered.consumed[0]?.disposition === "existing"
+        || recovered.consumed[0]?.disposition === "commit_proven")
+      && recovered.consumed[0]?.unlinked === true;
+    record({
+      id: "route-pg-interrupt-recover",
+      expected: "real route left ready/intent after dedicated-pool kill; new process recovered same billingId once; usage+1 no double debit",
+      actual: `child=${child.code} leftover=${leftover.observations.map((o) => o.kind).join(",")} recovered=${JSON.stringify(recovered)} usage ${before.usageN}->${after.usageN} ledger ${before.ledgerDelta}->${after.ledgerDelta} spent ${before.keySpent}->${after.keySpent} success ${before.success}->${after.success} rows=${JSON.stringify(usageRows.rows)} gone=${gone?.phase ?? "unlinked"} app=${appName}`,
+      upstreamCalls: 1,
+      usage: after,
+      ledger: after.ledgerDelta,
+      pass:
+        readyOrIntent.length >= 1
+        && recoveredOk
+        && usagePlus === 1
+        && usageRows.rows.length === 1
+        && usageRows.rows[0]!.n === "1"
+        && after.success - before.success <= 1
+        && after.fail === before.fail
+        && gone === null,
+    });
+  });
+
+  test("old 87d F1 oracle is an independent exit-1 business red from a pinned fixture", async () => {
+    const worker = fileURLToPath(new URL("./helpers/cursorExternalApiOldF1.worker.ts", import.meta.url));
+    const ran = await spawnBounded(
+      [worker],
+      {
+        ...process.env,
+        REQUIRE_TEST_DB: "1",
+        TEST_DATABASE_URL: db.url,
+        OC_188_UID: uid.toString(),
+        OC_188_ACCOUNT: accountId.toString(),
+        OC_188_KEY: apiKeyId.toString(),
+      },
+      60_000,
+    );
+    const business = /2 usage rows/.test(`${ran.stderr}\n${ran.stdout}`);
     record({
       id: "old-source-f1-red",
-      expected: "same F1 assertion (2 usage rows) fails on 87d with usageΔ=1 collision, not missing export",
-      actual: `usageΔ=${usageDelta} upstream=${upstream} spentΔ=${String(BigInt(after.keySpent) - BigInt(before.keySpent))} successΔ=${after.success - before.success} f1Error=${f1Error.slice(0, 180)} oldHasOutbox=${oldSource.includes("cursorExternalApiOutbox")}`,
-      upstreamCalls: upstream,
-      usage: after,
-      pass:
-        usageDelta === 1
-        && upstream === 2
-        && f1Error.includes("2 usage rows")
-        && !/cannot find module|export/i.test(f1Error),
+      expected: "pinned 87d fixture worker exits 1 on F1 two-row oracle (not hash/import exit 2); candidate F1 already exit0 in this suite",
+      actual: `exit=${ran.code} business=${business} stdout=${ran.stdout.slice(0, 240)} stderr=${ran.stderr.slice(0, 240)}`,
+      upstreamCalls: 2,
+      pass: ran.code === 1 && business,
     });
   });
 });

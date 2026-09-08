@@ -2,7 +2,8 @@
  * Real-FS unit tests for the Cursor external API outbox (no PG).
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
@@ -280,6 +281,85 @@ describe("cursorExternalApiOutbox startScanner lifecycle", () => {
       assert.equal(batch.scanned, 8);
       assert.equal(batch.truncated, true);
       assert.ok(elapsed < 2_000, `bounded batch should not need the full dir, elapsed=${elapsed}`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("bounded batches eventually visit every retained record regardless of dirent order", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-fair-"));
+    try {
+      const box = await openCursorExternalApiOutbox({ directory: dir });
+      const ids = Array.from({ length: 80 }, (_, i) =>
+        createHash("sha256").update(`fair-${i}`).digest("hex").slice(0, 32),
+      );
+      for (const id of ids) await box.writeIntent(intent({ billingId: id }));
+      const seen = new Set<string>();
+      const ends: string[] = [];
+      for (let i = 0; i < 16; i += 1) {
+        const batch = await box.listBatch({ limit: 32, deadlineMs: 2_000 });
+        for (const o of batch.observations) seen.add(o.file);
+        ends.push(batch.observations.at(-1)?.file ?? "");
+        assert.ok(batch.observations.length <= 32);
+      }
+      assert.equal(seen.size, 80, `must cover all 80, seen=${seen.size} ends=${ends.join(">")}`);
+      const missing = ids.map((id) => `${id}.json`).find((f) => !seen.has(f));
+      assert.equal(missing, undefined);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a later ready behind long-lived intent/unknown/corrupt becomes visible", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-later-"));
+    try {
+      const box = await openCursorExternalApiOutbox({ directory: dir });
+      await writeFile(path.join(dir, "00-corrupt.json"), "{", "utf8");
+      await writeFile(
+        path.join(dir, "01-unknown.json"),
+        JSON.stringify({ schema: 1, phase: "other", billingId: "b".repeat(32) }),
+        "utf8",
+      );
+      const ids = Array.from({ length: 40 }, (_, i) =>
+        createHash("sha256").update(`later-${i}`).digest("hex").slice(0, 32),
+      );
+      for (const id of ids) await box.writeIntent(intent({ billingId: id }));
+      const first = await box.listBatch({ limit: 8 });
+      assert.equal(first.observations.length, 8);
+      const target = ids[ids.length - 1]!;
+      await box.writeReady(ready({ billingId: target }));
+      let sawReady = false;
+      for (let i = 0; i < 12; i += 1) {
+        const batch = await box.listBatch({ limit: 8 });
+        if (batch.observations.some((o) => o.kind === "ready" && o.file === `${target}.json`)) {
+          sawReady = true;
+          break;
+        }
+      }
+      assert.equal(sawReady, true, "sealed ready must appear in a later bounded batch");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("new files are visited and deleted files do not stall the cursor", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-mut-"));
+    try {
+      const box = await openCursorExternalApiOutbox({ directory: dir });
+      const firstId = createHash("sha256").update("mut-0").digest("hex").slice(0, 32);
+      await box.writeIntent(intent({ billingId: firstId }));
+      const batch1 = await box.listBatch({ limit: 8 });
+      assert.equal(batch1.observations.some((o) => o.file === `${firstId}.json`), true);
+      await unlink(path.join(dir, `${firstId}.json`));
+      const added = createHash("sha256").update("mut-new").digest("hex").slice(0, 32);
+      await box.writeIntent(intent({ billingId: added }));
+      let sawAdded = false;
+      for (let i = 0; i < 6; i += 1) {
+        const batch = await box.listBatch({ limit: 8 });
+        if (batch.observations.some((o) => o.file === `${added}.json`)) sawAdded = true;
+        assert.equal(batch.observations.some((o) => o.file === `${firstId}.json`), false);
+      }
+      assert.equal(sawAdded, true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
