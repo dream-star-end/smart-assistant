@@ -2218,3 +2218,186 @@ test('classifyUpstreamReadFailure normalises undici socket wording', () => {
   assert.equal(classifyUpstreamReadFailure(new Error('anything'), true), 'CURSOR_SAND_UPSTREAM_STALLED')
   assert.equal(classifyUpstreamReadFailure(new Error('CURSOR_SAND_TRUNCATED_FRAME'), false), 'CURSOR_SAND_TRUNCATED_FRAME')
 })
+
+function serveRelayThrowingAfter(frames: Buffer[]): CursorSandRelay {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    let pulled = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1
+        if (pulled === 1) {
+          controller.enqueue(Buffer.concat(frames))
+          return
+        }
+        controller.error(new TypeError('terminated'))
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  return new CursorSandRelay({
+    fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null,
+  })
+}
+
+const HOOK_USAGE_FRAMES = [
+  responseFrame('textPart', { text: 'partial' }),
+  responseFrame('extendedUsage', {
+    inputTokens: 40, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64,
+  }),
+]
+
+for (const pipe of [
+  { name: 'native streaming', stream: true as const, extra: {} },
+  { name: 'buffered streaming', stream: true as const, extra: { bufferedStreaming: true as const } },
+  { name: 'nonstream', stream: false as const, extra: {} },
+]) {
+  test(`serveMessages ${pipe.name}: persist failure before success terminal withholds message_stop/JSON`, async () => {
+    const frames = [
+      responseFrame('textPart', { text: 'ok' }),
+      responseFrame('extendedUsage', {
+        inputTokens: 12, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 8,
+      }),
+    ]
+    const relay = serveRelay(frames)
+    const terminals: Array<{ kind: string; outcome: string }> = []
+    try {
+      const res = new FakeServerResponse()
+      await assert.rejects(
+        () => relay.serveMessages(
+          { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+          res as never,
+          new AbortController().signal,
+          {
+            ...pipe.extra,
+            onTerminal: async (ev) => {
+              terminals.push({ kind: ev.evidence.kind, outcome: ev.outcome })
+              throw new Error('persist_failed')
+            },
+          },
+        ),
+        /persist_failed/,
+      )
+      assert.equal(terminals.length, 1)
+      assert.equal(terminals[0]!.kind, 'reported')
+      assert.equal(terminals[0]!.outcome, 'completed')
+      if (pipe.stream) {
+        assert.doesNotMatch(res.text(), /event: message_stop/)
+      } else {
+        assert.equal(res.statusCode !== 200 || res.text() === '' || !/"type":"message"/.test(res.text()) || !res.writableEnded, true)
+        assert.doesNotMatch(res.text(), /"stop_reason"/)
+      }
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`serveMessages ${pipe.name}: usage then reader throw keeps reported partial`, async () => {
+    const relay = serveRelayThrowingAfter(HOOK_USAGE_FRAMES)
+    const terminals: Array<{ kind: string; output: number }> = []
+    try {
+      const res = new FakeServerResponse()
+      await assert.rejects(
+        () => relay.serveMessages(
+          { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+          res as never,
+          new AbortController().signal,
+          {
+            ...pipe.extra,
+            onTerminal: async (ev) => {
+              terminals.push({
+                kind: ev.evidence.kind,
+                output: ev.evidence.kind === 'reported' ? ev.evidence.usage.output_tokens : -1,
+              })
+            },
+          },
+        ),
+        /CURSOR_SAND_UPSTREAM_TERMINATED|terminated/,
+      )
+      assert.equal(terminals.length, 1)
+      assert.equal(terminals[0]!.kind, 'reported')
+      assert.equal(terminals[0]!.output, 7)
+      if (pipe.stream) assert.doesNotMatch(res.text(), /event: message_stop/)
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`serveMessages ${pipe.name}: no usage frame is unobserved`, async () => {
+    const relay = serveRelay([responseFrame('textPart', { text: 'no-usage' })])
+    const kinds: string[] = []
+    try {
+      const res = new FakeServerResponse()
+      await relay.serveMessages(
+        { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+        res as never,
+        new AbortController().signal,
+        {
+          ...pipe.extra,
+          onTerminal: async (ev) => {
+            kinds.push(ev.evidence.kind)
+            if (ev.outcome === 'completed' && ev.evidence.kind === 'unobserved') {
+              throw new Error('CURSOR_EXTERNAL_UNOBSERVED_SUCCESS')
+            }
+          },
+        },
+      ).catch((err: unknown) => {
+        if (!(err instanceof Error) || !/UNOBSERVED_SUCCESS/.test(err.message)) throw err
+      })
+      assert.deepEqual(kinds, ['unobserved'])
+      if (pipe.stream) assert.doesNotMatch(res.text(), /event: message_stop/)
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`serveMessages ${pipe.name}: explicit zero usage is reported`, async () => {
+    const relay = serveRelay([
+      responseFrame('textPart', { text: 'z' }),
+      responseFrame('extendedUsage', {
+        inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 8,
+      }),
+    ])
+    const kinds: string[] = []
+    try {
+      const res = new FakeServerResponse()
+      const result = await relay.serveMessages(
+        { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+        res as never,
+        new AbortController().signal,
+        {
+          ...pipe.extra,
+          onTerminal: async (ev) => { kinds.push(ev.evidence.kind) },
+        },
+      )
+      assert.equal(result.kind, 'completed')
+      assert.deepEqual(kinds, ['reported'])
+    } finally {
+      await relay.close()
+    }
+  })
+}
+
+test('default web callers without onTerminal keep original success semantics', async () => {
+  const relay = serveRelay([
+    responseFrame('textPart', { text: 'ok' }),
+    responseFrame('usage', { inputTokens: 3, outputTokens: 1 }),
+  ])
+  try {
+    const res = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.equal(result.kind, 'completed')
+    assert.match(res.text(), /event: message_stop/)
+  } finally {
+    await relay.close()
+  }
+})
+

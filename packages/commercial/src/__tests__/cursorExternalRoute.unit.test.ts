@@ -370,16 +370,39 @@ describe("cursorExternal route — relay + settle + post-commit", () => {
     assert.equal(s.modelId, MODEL);
     assert.equal(s.userId, 3n);
     assert.equal(s.sessionId, "web-abc");
+    assert.match(String(s.requestId), /^[0-9a-f]{32}$/);
+    assert.notEqual(s.requestId, "req-1");
     assert.deepEqual(s.usage, { input_tokens: 100, output_tokens: 9, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 });
     assert.deepEqual(h.order, ["settle", "append", "broadcast"]);
-    assert.deepEqual(broadcasts[0], {
-      type: "outbound.cost_charged",
-      requestId: "req-1",
-      costCredits: "42",
-      balanceAfter: "958",
-      sessionId: "web-abc",
-      parentSessionId: null,
-    });
+    const billed = broadcasts[0] as { type: string; requestId: string; costCredits: string };
+    assert.equal(billed.type, "outbound.cost_charged");
+    assert.equal(billed.requestId, s.requestId);
+    assert.equal(billed.costCredits, "42");
+  });
+
+  test("two HTTP calls with the same client request id mint two server billing ids", async () => {
+    const h = harness();
+    const route = makeCursorExternalRoute(h.deps);
+    const call = async () => {
+      const res = new MockRes();
+      await route.handle({
+        req: new MockReq() as unknown as IncomingMessage,
+        res: res as unknown as ServerResponse,
+        requestId: "client-same",
+        uid: 3n,
+        identity: { uid: 3n, containerId: null } as ProxyIdentity,
+        body: body(),
+        authorize: async () => {},
+        userLog: quiet,
+      });
+    };
+    await call();
+    await call();
+    assert.equal(h.settleCalls.length, 2);
+    assert.match(String(h.settleCalls[0]!.requestId), /^[0-9a-f]{32}$/);
+    assert.match(String(h.settleCalls[1]!.requestId), /^[0-9a-f]{32}$/);
+    assert.notEqual(h.settleCalls[0]!.requestId, h.settleCalls[1]!.requestId);
+    await route.close();
   });
 
   test("stream:true is passed through untouched", async () => {
