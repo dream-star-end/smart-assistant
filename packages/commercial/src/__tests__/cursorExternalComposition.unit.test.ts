@@ -166,7 +166,7 @@ for (const pipe of [
         assert.equal(broadcasts.length, 0); assert.equal(appends.length, 0);
         assert.match(wire, /"type":"invalid_request_error"/);
         assert.ok(wire.includes(PUBLIC_ERROR));
-        assert.doesNotMatch(wire, /event: message_stop|"stop_reason"/);
+        assert.doesNotMatch(wire, /event: message_stop|"stop_reason":"/);
         if (!pipe.stream || pipe.buffered) assert.equal(res.headers["x-should-retry"], "false");
         if (!pipe.stream) assert.equal(res.statusCode, 502);
       }

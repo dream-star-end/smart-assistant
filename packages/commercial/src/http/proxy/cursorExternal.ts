@@ -525,6 +525,8 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     res.on("close", onClose);
 
     let sealedReady: CursorExternalReadyRecord | null = null;
+    // The nonstream rejected result omits usage; keep actual terminal observation for the audit projection.
+    let reportedUsage: unknown;
     let sealPromise: Promise<CursorExternalReadyRecord | null> | null = null;
     const sealOnce = (ev: TerminalEvidence): Promise<CursorExternalReadyRecord | null> => {
       if (!sealPromise) {
@@ -541,6 +543,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
             }
             return null;
           }
+          reportedUsage = ev.evidence.usage;
           const usage = mapCursorReportedUsage(ev.evidence.usage);
           const plan = freezePreparedCursorSettlePlan(
             planCursorExternalSettle({
@@ -788,7 +791,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       terminalCode: outcome.terminalCode,
       errorMessage: auditError,
       durationMs: now() - startedAt,
-      usage: usageCounts(outcome.usage),
+      usage: usageCounts(reportedUsage ?? outcome.usage),
       clientUserAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"].slice(0, 256) : null,
     }).catch((err: unknown) => {
       userLog.warn("cursor_external_audit_failed", { requestId, err: errSummary(err) });
