@@ -22,11 +22,11 @@
  *
  * ## seed 权威的两种形态(模型权威批次 §5;flag `OC_SEED_AUTHORITY_BY_REV` 切换)
  *
- * - **旧(flag 未开 = 默认,零行为变化)**:seed 三元组 = master 本地常量
+ * - **兼容路径(商业默认 / 显式 flag=0)**:seed 三元组 = master 本地常量
  *   (platformDefaults + protocol DEFAULT_CODEX_ENGINE_MODEL),与容器 entrypoint 的
  *   声明**双端各自持有**。滚动窗口里(新 bundle 已发、老容器未回收)两端可指向不同
  *   模型 → **计费分叉**(master 按新常量计费,容器按旧 bundle 执行)。
- * - **新(flag=1,阶段 B)**:seed 三元组 = **该容器实际运行的 bundle rev 的 seed 声明**
+ * - **按 rev(selfhost 默认 / 显式 flag=1)**:seed 三元组 = **该容器实际运行的 bundle rev 的 seed 声明**
  *   (platform-seed.yaml schema v2,经 seedDeclarationLoader 全量校验读入)。调用方必须
  *   把容器 label `com.openclaude.runtime.bundle_rev` 传进来 —— 缺 rev / 该 rev 的 bundle
  *   读不出 → **抛 SeedDeclarationError,fail-closed 拒帧**,绝不回落常量(回落=分叉重现)。
@@ -43,9 +43,10 @@ import {
 } from "../marketplace/marketplaceDb.js";
 import { platformPresetAgentSlugs } from "../marketplace/platformPresets.js";
 import { PLATFORM_DEFAULT_MODEL, PLATFORM_HIDDEN_REVIEWER_MODEL } from "../platformDefaults.js";
-import { seedAgentModels, type SeedAgentExecution } from "./seedDeclarationLoader.js";
+import type { Flavor } from "../flavor/assertFlavor.js";
+import { SeedDeclarationError, seedAgentModels, type SeedAgentExecution } from "./seedDeclarationLoader.js";
 
-/** 阶段 B 开关:=1 时 seed 权威按容器 bundle_rev 推导(见文件头);未设 = 旧常量路径。 */
+/** selfhost 默认按 rev;商业仍需显式 1。0 是两者的显式回滚。 */
 export const SEED_AUTHORITY_BY_REV_ENV = "OC_SEED_AUTHORITY_BY_REV";
 
 const LEGACY_SEED_AGENT_MODELS = new Map<string, string>([
@@ -54,26 +55,25 @@ const LEGACY_SEED_AGENT_MODELS = new Map<string, string>([
   ["hidden-reviewer", PLATFORM_HIDDEN_REVIEWER_MODEL],
 ]);
 
-export function seedAuthorityByRevEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env[SEED_AUTHORITY_BY_REV_ENV] === "1";
+export function seedAuthorityByRevEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+  flavor?: Flavor,
+): boolean {
+  if (env[SEED_AUTHORITY_BY_REV_ENV] === "0") return false;
+  if (env[SEED_AUTHORITY_BY_REV_ENV] === "1") return true;
+  // Only the boot-verified deployment flavor opts into the selfhost default.
+  // Runtime channel=v5 is shared by commercial and selfhost, not identity proof.
+  return flavor === "selfhost";
 }
 
-/**
- * manifest JSON → model 字段(形状防御:非法 JSON / 非 string model → null)。
- *
- * `AGENT_MODEL_AUTO`(「不锁模型」声明)归一为 PLATFORM_DEFAULT_MODEL:容器侧
- * resolveExecutionModel 对 auto 跳过该档 → 落 config.defaults.model,而 defaults.model
- * 的权威 = platform-seed.yaml 的 main 声明,阶段 A 与本常量字面相等
- * (runtimeEntrypointPolicy 一致性锚锁死)→ master 归一值与容器执行同构,codex 分类 /
- * 计费不漂移;auto 也不会成为"推导不出的 null"而触发帧无 model 时 fail-closed 拒。
- */
-function manifestModel(rawManifest: string): string | null {
+/** Manifest auto uses the SAME connection revision as the seed layer. */
+function manifestModel(rawManifest: string, autoModel: string): string | null {
   try {
     const parsed: unknown = JSON.parse(rawManifest);
     if (parsed === null || typeof parsed !== "object") return null;
     const model = (parsed as { model?: unknown }).model;
     if (typeof model !== "string" || model.trim() === "") return null;
-    return model === AGENT_MODEL_AUTO ? PLATFORM_DEFAULT_MODEL : model;
+    return model === AGENT_MODEL_AUTO ? autoModel : model;
   } catch {
     return null;
   }
@@ -92,10 +92,16 @@ export function buildAgentModelSnapshot(
   presetAgents: readonly InstalledAgent[],
   seedExecutions?: ReadonlyMap<string, SeedAgentExecution>,
 ): Map<string, string> {
+  const autoModel = seedExecutions === undefined
+    ? PLATFORM_DEFAULT_MODEL
+    : seedExecutions.get("main")?.model;
+  if (typeof autoModel !== "string" || autoModel.trim() === "" || autoModel === AGENT_MODEL_AUTO) {
+    throw new SeedDeclarationError("SeedSchemaInvalid", "seed revision must declare a concrete main model");
+  }
   const map = new Map<string, string>();
   for (const list of [installedAgents, presetAgents]) {
     for (const a of list) {
-      const model = manifestModel(a.rawManifest);
+      const model = manifestModel(a.rawManifest, autoModel);
       if (model !== null) map.set(a.slug, model);
     }
   }
@@ -132,6 +138,8 @@ export interface AgentModelResolverOptions {
   bundleRev?: string | null;
   /** 平台稳定根(默认 DEFAULT_PLATFORM_ROOT);非标准布局 / 测试才传。 */
   platformRoot?: string;
+  /** Boot-verified flavor. Never infer selfhost from a request or runtime channel. */
+  flavor?: Flavor;
   /** 测试注入(默认 process.env)。 */
   env?: NodeJS.ProcessEnv;
 }
@@ -160,7 +168,7 @@ export async function loadAgentModelResolverForUser(
 ): Promise<AgentModelResolver> {
   // seed 声明**先于** DB 加载:rev 缺失/非法/bundle 坏 = 这条连接注定 fail-closed,不必再打 DB。
   // (rev 不可变 ⇒ LRU 命中时这里是纯内存查表,无额外延迟。)
-  const seedExecutions = seedAuthorityByRevEnabled(opts?.env)
+  const seedExecutions = seedAuthorityByRevEnabled(opts?.env, opts?.flavor)
     ? await seedAgentModels(opts?.bundleRev, opts?.platformRoot)
     : undefined;
   const presetSlugs = await platformPresetAgentSlugs();

@@ -1216,7 +1216,7 @@ export async function registerCommercial(
   // 步骤 5 兼容地板(方案 §7 步 5,R3-B4):cutover marker 置位后禁止在 flag 关闭态下起。
   // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
   assertModelAuthorityCutoverFloor();
-  assertFlavorIdentity();
+  const flavorIdentity = assertFlavorIdentity();
 
   const cfg = loadConfig();
 
@@ -5642,11 +5642,12 @@ export async function registerCommercial(
     // 之后把容器 label 上的 bundleRev 传进来 → seed 层按**该 rev 的 platform-seed 声明**
     // 推导(bundle 全量校验复用 resolvePlatformBundleMount)。rev 缺失 / bundle 坏 →
     // 抛 SeedDeclarationError → bridge close(1011) fail-closed,绝不回落 master 常量。
-    // flag 未设 → opts.bundleRev 被忽略,走旧的 master 常量路径(零行为变化)。
+    // 验证为selfhost的部署默认按rev;商业/无manifest兼容旧路径，显式0可回退。
     loadAgentModelResolver: async (uid, opts) => {
       const { loadAgentModelResolverForUser } = await import("./ws/agentModelAuthority.js");
       return loadAgentModelResolverForUser(uid, {
         bundleRev: opts.bundleRev ?? null,
+        flavor: flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined,
         // 与 supervisor / bundle 校验器同一稳定根(见上方 runtimeTuple 装配)。
         platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
       });
