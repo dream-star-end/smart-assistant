@@ -409,6 +409,16 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   "01885e894269b2d03346732a0ab41a450ecf2613",
 ] as const;
 
+// OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
+// imported-history exemption. The full SHA binds the original tree and message;
+// the mapped ID must still satisfy ALL ordinary manifest/proof/lineage checks.
+function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
+  return sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
+    && trailer === "OCV5-171 follow-up"
+    ? "INC-20260908-CC-SWITCH-ASCII-NAME"
+    : trailer;
+}
+
 function checkTrailerClosure(): number {
   const start = resolveTrailerGateStart();
   if (start === null) {
@@ -482,7 +492,7 @@ function checkTrailerClosure(): number {
     const touched = commitFiles(sha);
     if (!touched.some((file) => TRAILER_GATE_SURFACES.some((prefix) => file.startsWith(prefix)))) continue;
     checked += 1;
-    const trailer = /^Incident:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
+    let trailer = /^Incident:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
     if (!trailer) {
       const waiver = waivers.get(sha.slice(0, 8));
       const incident = manifest.incidents.find((item) =>
@@ -507,6 +517,11 @@ function checkTrailerClosure(): number {
       if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
+    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
+    if (normalizedTrailer !== trailer) {
+      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
+    }
+    trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
       fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
     }
