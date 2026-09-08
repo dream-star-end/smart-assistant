@@ -3870,6 +3870,8 @@ export class SessionManager {
     let contextRebuildNotice: AgentSession['_contextRebuildNotice'] =
       previousEngine && previousEngine !== engineId ? 'engine-switch' : undefined
     const workspaceMode = opts.workspaceMode ?? existing?.workspaceMode ?? 'legacy'
+    let identityRefreshSession: AgentSession | undefined
+    try {
     if (existing) {
       // 跨 engine 切换判定:只有"caller 明确给了 model"/"有 master 权威"/"agent 显式 pin
       // 到 codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见 opts.model
@@ -3967,6 +3969,20 @@ export class SessionManager {
             existing = canonical
             existing._replacing = true
           }
+          // Identity-only runner refresh keeps the logical owner held by
+          // begin/endClientTurn and B1; general engine/workspace switches don't.
+          if (
+            identity.context.assets && existing._identityCompat?.assets &&
+            JSON.stringify(identity.context.assets.profile) ===
+              JSON.stringify(existing._identityCompat.assets.profile) &&
+            existing.agentId === opts.agent.id &&
+            existing._identityAgentFingerprint !== identityAgentFingerprint &&
+            existing.providerTag === engineId && existing.model === executionModel &&
+            !cursorTransportChanged && !workspaceModeChanged && !workspaceCwdChanged &&
+            !projectIdChanged &&
+            existing.workspaceCwd === (opts.workspaceCwd ?? opts.agent.cwd ??
+              resolveDefaultWorkspaceCwd(workspaceMode, opts.repoSessionId ?? opts.peerId))
+          ) identityRefreshSession = existing
           try {
             const legacyId = this._resumeMap.get(opts.sessionKey)
             const ids =
@@ -4001,6 +4017,7 @@ export class SessionManager {
           }
           await existing.runner.shutdown()
         } catch (err) {
+          if (identityRefreshSession) throw err
           log.warn(
             'session-replacement shutdown failed',
             {
@@ -4011,7 +4028,7 @@ export class SessionManager {
             err,
           )
         }
-        if (this.sessions.get(opts.sessionKey) === existing) {
+        if (!identityRefreshSession && this.sessions.get(opts.sessionKey) === existing) {
           this.sessions.delete(opts.sessionKey)
         }
       } else {
@@ -4115,7 +4132,7 @@ export class SessionManager {
         Boolean(runner.isResumeIdCompatible && !runner.isResumeIdCompatible(mappedResumeId)))
     if (resumeTransportMismatch) contextRebuildNotice = 'native-resume-loss'
     const now = Date.now()
-    const session: AgentSession = {
+    const session: AgentSession = identityRefreshSession ?? {
       _identityAgentFingerprint: identityAgentFingerprint,
       _identityCreationOpts: identityCreationOpts,
       _identityCompat: opts.hermeticNoTools ? undefined : identity.context,
@@ -4179,6 +4196,18 @@ export class SessionManager {
       _contextRebuildNotice: contextRebuildNotice,
       _forceHistoricalContextOnFirstTurn: resumeTransportMismatch || undefined,
     }
+    if (identityRefreshSession) {
+      // Publish only after construction succeeds; never overwrite counters,
+      // lock, owner evidence or cumulative state with fresh-session defaults.
+      session.runner = runner
+      session._identityAgentFingerprint = identityAgentFingerprint
+      session._identityCreationOpts = identityCreationOpts
+      session._identityCompat = identity.context
+      session.agentProvider = opts.agent.provider
+      session._contextRebuildNotice = contextRebuildNotice
+      session._forceHistoricalContextOnFirstTurn = resumeTransportMismatch || undefined
+      session.lastUsedAt = now
+    }
     runner.on(
       'task_notification',
       (payload: {
@@ -4188,6 +4217,7 @@ export class SessionManager {
         summary: string
         toolUseId?: string
       }) => {
+        if (session.runner !== runner) return
         this.onCcbTaskNotification?.(session, payload)
       },
     )
@@ -4197,10 +4227,12 @@ export class SessionManager {
         taskId: string
         deliveredBy: 'ccb-mid-turn'
       }) => {
+        if (session.runner !== runner) return
         this.onCcbTaskNotificationDelivered?.(session, payload)
       },
     )
     runner.on('session_id', (id: string) => {
+      if (session.runner !== runner) return
       // Durable-artifact ladder: when the engine mints a NEW id for this
       // session (fresh spawn after the previous id failed to resume, codex
       // missing-rollout self-heal, cursor sand re-spawn…), keep the previous
@@ -4260,12 +4292,14 @@ export class SessionManager {
     //     a stricter fix would require CCB to persist STATE.totalCostUSD on
     //     every turn, not only at exit.
     runner.on('spawn', (info: { resumed: boolean }) => {
+      if (session.runner !== runner) return
       if (!info.resumed) {
         session._lastCcbCumulativeCost = 0
       }
     })
     // Monitor subprocess crashes — emit event so gateway can notify connected clients
     runner.on('exit', (info: { code: number | null; signal: string | null; crashed: boolean }) => {
+      if (session.runner !== runner) return
       // 子进程退出 → 清空 turn_status 缓存。crashed/正常 exit 都清:正常 exit
       // 意味着没有 in-flight turn(也就不会还有 compacting);crashed 期间如果
       // 恰好在 compact 中,这帧 cache 没有 turn_status:null 来源(子进程死了
@@ -4340,6 +4374,9 @@ export class SessionManager {
       this._sessionIdToKey.set(opts.peerId, opts.sessionKey)
     }
     return session
+    } finally {
+      if (identityRefreshSession) identityRefreshSession._replacing = false
+    }
   }
 
   async prepareModelSwitch(
