@@ -66,6 +66,7 @@ import {
   readInboxAssetForViewer,
 } from "../inbox/assets.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
+import { prepareAuthRowResetForTest } from "./helpers/authRows.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -76,6 +77,7 @@ const TEST_BRIDGE_SECRET = "a".repeat(64);
 const TEST_MEDIA_SIGN_KEY = deriveMediaSignKey(TEST_BRIDGE_SECRET);
 
 let pgAvailable = false;
+let resetInboxRows: (() => Promise<void>) | undefined;
 let redis: IORedis | null = null;
 let server: Server | null = null;
 let baseUrl = "";
@@ -109,6 +111,13 @@ before(async () => {
   setPoolOverride(pool);
   await resetTestSchemaForTest();
   await runMigrations();
+  resetInboxRows = await prepareAuthRowResetForTest(async (client) => {
+    // Preserve the original inbox/usage roots inside the guarded reset transaction.
+    // Message deletion cascades to reads, assets, delivery jobs and audience snapshots.
+    await client.query("DELETE FROM inbox_message_reads");
+    await client.query("DELETE FROM inbox_messages");
+    await client.query("DELETE FROM usage_records");
+  });
 
   redis = await probeRedis();
 
@@ -182,11 +191,8 @@ async function makeUser(
 }
 
 async function clearTables() {
-  // TRUNCATE … CASCADE 会按 FK 链自动清依赖表(admin_audit / inbox_messages 等)。
-  // 比按顺序 DELETE 更稳 —— FK 违规和写入并发都不会残留行。
-  await query(
-    "TRUNCATE TABLE admin_audit, inbox_message_reads, inbox_messages, usage_records, credit_ledger, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
-  );
+  assert.ok(resetInboxRows, "real inbox fixture setup must finish before each case");
+  await resetInboxRows();
 }
 
 // ─── DB 单元-as-integ ─────────────────────────────────────────────────────
