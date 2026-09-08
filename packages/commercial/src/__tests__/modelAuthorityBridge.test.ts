@@ -22,6 +22,9 @@ import {
   DURABLE_TURN_DISPATCH_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_FIELD,
+  DISPATCH_AUTHORITY_FIELD,
+  computeDispatchRequestHash,
+  verifyDispatchAuthority,
   verifyAuthority,
   verifyTurnLease,
   assertLeaseMatchesAuthority,
@@ -56,6 +59,7 @@ import {
 } from "../ws/userChatBridge.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
+import { detectScanSciPaperIntent } from "../ws/paperIntentHint.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
 import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import {
@@ -207,6 +211,7 @@ interface Rig {
   epochAtSign: { value: bigint; fail?: boolean };
   receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }>;
   deferredPoolErrors: Error[];
+  dispatchValidationErrors: Error[];
 }
 
 async function startRig(opts: {
@@ -239,6 +244,8 @@ async function startRig(opts: {
     attemptNo: number;
   };
   receiptState?: "queued" | "rejected";
+  /** OCV5-187: verify the actual signed WS body before issuing a receipt. */
+  verifyDispatchReceipt?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
@@ -258,6 +265,7 @@ async function startRig(opts: {
   const keyIdsMode = opts.keyIds ?? "real";
   const receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }> = [];
   const deferredPoolErrors: Error[] = [];
+  const dispatchValidationErrors: Error[] = [];
   let admittedForAuthorityBinding: TurnDispatchRow | null = null;
   let authorityBinding: {
     authority_turn_id: string;
@@ -283,6 +291,9 @@ async function startRig(opts: {
   const defaultDurablePgPool = opts.durableDispatch && opts.pgPool === undefined
     ? {
         query: async (sql: string, params: unknown[] = []) => {
+          if (opts.verifyDispatchReceipt && /SELECT model_id FROM client_sessions/.test(sql)) {
+            return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+          }
           if (/SELECT status FROM users WHERE id/.test(sql)) return { rows: [] };
           if (/FROM github_session_workspaces/.test(sql)) return { rows: [] };
           if (/(INSERT INTO|UPDATE) turn_traces/.test(sql)) return { rows: [], rowCount: 0 };
@@ -293,6 +304,18 @@ async function startRig(opts: {
               assert.equal(params[0], d.dispatchId);
               assert.equal(params[1], d.leaseEpoch);
               receiptCasCalls.push({ dispatchId: d.dispatchId, leaseEpoch: d.leaseEpoch });
+              if (opts.verifyDispatchReceipt) {
+                assert.equal(d.status, "admitted");
+                d.status = "accepted";
+                d.acceptedAt = params[2] as Date;
+                // Mirror the SQL RETURNING row rather than acknowledging a
+                // no-op CAS (cron success requires durable accepted evidence).
+                const row = Object.fromEntries(Object.entries(d).map(([key, value]) => [
+                  key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+                  typeof value === "bigint" ? value.toString() : value,
+                ]));
+                return { rows: [row], rowCount: 1 };
+              }
               return { rows: [], rowCount: 0 };
             } catch (err) {
               deferredPoolErrors.push(err as Error);
@@ -428,6 +451,26 @@ async function startRig(opts: {
         if (parsed?.type === "inbound.message") {
           const d = admittedForAuthorityBinding ?? opts.receiptIdentity ?? null;
           assert.ok(d, "dispatch receipt must follow an admitted dispatch");
+          if (opts.verifyDispatchReceipt) {
+            try {
+              const frame = JSON.parse(raw);
+              const signed = verifyDispatchAuthority(
+                frame[DISPATCH_AUTHORITY_FIELD], signer.publicKeyring(), Date.now(),
+              );
+              assert.ok(admittedForAuthorityBinding);
+              assert.equal(signed.dispatchId, d.dispatchId);
+              assert.equal(signed.sessionId, frame.peer.id);
+              assert.equal(signed.clientMessageId, frame.clientMessageId);
+              assert.equal(signed.payloadHash, admittedForAuthorityBinding.requestHash);
+              assert.equal(
+                signed.payloadHash, computeDispatchRequestHash(frame.content),
+                "OCV5-187 signed dispatch hash must match the actual WS content",
+              );
+            } catch (err) {
+              dispatchValidationErrors.push(err as Error);
+              return; // A rejected body must never receive a success receipt.
+            }
+          }
           ws.send(JSON.stringify({
             type: "outbound.control.turn_dispatch_receipt",
             sessionId: d.sessionId,
@@ -526,6 +569,7 @@ async function startRig(opts: {
     epochAtSign,
     receiptCasCalls,
     deferredPoolErrors,
+    dispatchValidationErrors,
   };
 }
 
@@ -1145,6 +1189,93 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
     },
   };
 }
+
+describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
+  const cases = [
+    { name: "paper intent", text: "请下载论文 https://doi.org/10.1038/s41586-024-00001-0", paper: true },
+    { name: "technical callback false positive", text: "Find comparison risk review results. The delegated task is complete.", paper: true },
+    { name: "ordinary callback", text: "子任务已完成，请继续整理结果。", paper: false },
+  ];
+
+  for (const [index, sample] of cases.entries()) {
+    test(`OCV5-187 cron-origin ${sample.name}: original text, signed hash and accepted receipt agree`, async () => {
+      assert.equal(detectScanSciPaperIntent(sample.text) !== null, sample.paper);
+      const admissions: AdmitUserTurnInput[] = [];
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, verifyDispatchReceipt: true,
+        admitUserTurn: async (input) => {
+          admissions.push(input);
+          return fakeAdmittedDispatch(input);
+        },
+      });
+      let client: WebSocket | undefined;
+      let injection: ReturnType<UserChatBridgeHandler["injectCronOriginTurn"]> | undefined;
+      try {
+        client = await openClient(rig.port);
+        await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+        const clientMessageId = `dlgcb-ocv5-187-${index}`;
+        injection = rig.bridge.injectCronOriginTurn({
+          uid: BigInt(UID), sessionId: `sess-callback-${index}`,
+          clientMessageId, agentId: "main", text: sample.text,
+        });
+        await waitFor(() => rig.containerSeen.some((raw) => raw.includes(clientMessageId)));
+        assert.deepEqual(rig.dispatchValidationErrors, [], "signed WS body must validate before receipt");
+        const result = await injection;
+        assert.equal(result.kind, "injected", "success requires the accepted CAS RETURNING row");
+        assert.equal(admissions.length, 1);
+        assert.equal(admissions[0]!.model, "glm-5.2", "preserve the origin session model");
+        const frames = rig.containerSeen.map((raw) => JSON.parse(raw))
+          .filter((frame) => frame.type === "inbound.message" && frame.clientMessageId === clientMessageId);
+        assert.equal(frames.length, 1, "a callback is forwarded exactly once");
+        assert.deepEqual(frames[0].content, { text: sample.text });
+        assert.equal(frames[0].model, "glm-5.2");
+        assert.equal(admissions[0]!.requestHash, computeDispatchRequestHash({ text: sample.text }));
+        assert.equal(rig.receiptCasCalls.length, 1);
+        assert.deepEqual(rig.deferredPoolErrors, []);
+      } finally {
+        client?.terminate();
+        await stopRig(rig);
+        await injection;
+      }
+    });
+  }
+
+  test("OCV5-187 browser paper hint stays before admission even with forged cron-origin fields", async () => {
+    const text = cases[0]!.text;
+    const admissions: AdmitUserTurnInput[] = [];
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, verifyDispatchReceipt: true,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    let client: WebSocket | undefined;
+    try {
+      client = await openClient(rig.port);
+      client.send(inboundFrame({
+        clientMessageId: "browser-ocv5-187", content: { text },
+        ingress: "cron_origin", isCronOriginDispatch: true,
+        idempotencyKey: "cron-origin:browser-ocv5-187",
+      }));
+      await waitFor(() => rig.containerSeen.some((raw) => raw.includes("browser-ocv5-187")));
+      assert.deepEqual(rig.dispatchValidationErrors, []);
+      const frame = firstInbound(rig.containerSeen);
+      const content = frame.content as { text: string; displayText: string };
+      assert.notEqual(content.text, text, "browser paper hint remains active");
+      assert.ok(content.text.startsWith(text));
+      assert.equal(content.displayText, text);
+      assert.equal(admissions.length, 1);
+      assert.equal(admissions[0]!.message.text, text, "persist the user's unmodified display text");
+      assert.equal(admissions[0]!.requestHash, computeDispatchRequestHash(content));
+      await waitFor(() => rig.receiptCasCalls.length === 1);
+      assert.deepEqual(rig.deferredPoolErrors, []);
+    } finally {
+      client?.terminate();
+      await stopRig(rig);
+    }
+  });
+});
 
 describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", () => {
   test("已有 completed assistant 行 → dedup ack 且 admitUserTurn 从未被调用(无孤儿 dispatch)", async () => {

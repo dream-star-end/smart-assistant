@@ -5858,10 +5858,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sanitizedParsed.model = DEFAULT_CODEX_ENGINE_MODEL;
               }
             }
-            // Chat-native paper integration: keep browser/session text unchanged,
-            // but enrich the master→container frame with a bounded ScanSci PDF
-            // usage hint when the user's message is clearly a paper task.
-            inboundParsedFrame = appendScanSciPaperIntentHintToFrame(sanitizedParsed);
+            // Browser paper hints run before admission freezes the content hash.
+            // Cron-origin callbacks have already been admitted: rewriting their
+            // text here would invalidate __oc_dispatch at the container. The
+            // ingress flag is internal, never taken from browser-authored fields.
+            inboundParsedFrame = isCronOriginDispatch
+              ? sanitizedParsed
+              : appendScanSciPaperIntentHintToFrame(sanitizedParsed);
             isAnnotatedImageInboundFrame = isValidatedAnnotatedImageInbound(inboundParsedFrame);
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
             turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
