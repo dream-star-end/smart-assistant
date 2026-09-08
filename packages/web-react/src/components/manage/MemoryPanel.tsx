@@ -14,6 +14,7 @@ import type {
   MemoryUsageDashboard,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { IdentityManual, useIdentityManualAuthority } from "./IdentityManual";
 import {
   Alert,
   Badge,
@@ -72,10 +73,19 @@ export function MemoryPanel({
 }) {
   const [selected, setSelected] = useState(agentId);
   const [tab, setTab] = useState<"core" | "project" | "profile" | "usage">("core");
+  const manualAuthority = useIdentityManualAuthority(auth);
+  // This is a management resource selector, NOT a chat/delegate execution picker.
+  // Keep explicitly registered manuals reachable when their canonical install is unavailable.
+  const resources = [...agents];
+  for (const { profile, readiness } of manualAuthority.projection?.profiles ?? []) {
+    if (!resources.some(a => a.id === profile.canonicalAgentId)) {
+      resources.push({ id: profile.canonicalAgentId, name: `${profile.canonicalAgentId}（${readiness === "unavailable" ? "仅管理手册" : "本实例手册"}）` });
+    }
+  }
   // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
-  const effective = agents.some((a) => a.id === selected) ? selected : agentId;
+  const effective = resources.some((a) => a.id === selected) ? selected : agentId;
   // 项目记忆与用户画像都不按智能体分,切换器在这两段里没有作用域可控。
-  const showPicker = agents.length > 1 && tab !== "profile" && tab !== "project";
+  const showPicker = resources.length > 1 && tab !== "profile" && tab !== "project";
 
   return (
     <div className="flex flex-col">
@@ -88,13 +98,14 @@ export function MemoryPanel({
               aria-label="选择智能体"
               value={effective}
               onValueChange={setSelected}
-              options={agents.map((a) => ({ value: a.id, label: a.name }))}
+              options={resources.map((a) => ({ value: a.id, label: a.name }))}
               inputSize="sm"
               className="w-32 sm:w-44"
             />
           ) : undefined
         }
       />
+      {tab === "core" && <IdentityManual key={`manual:${auth.snapshot().epoch}:${effective}`} auth={auth} agentId={effective} authority={manualAuthority} />}
       <div className="min-w-0 overflow-x-auto border-t border-border px-4 py-3">
         <Tabs
           aria-label="记忆分区"
