@@ -1160,6 +1160,7 @@ export function materializeRootDomainAgentGroupRecord(
     status: "completed" | "interrupted" | "crashed";
     turnKey: string;
     createdAt: number;
+    clientMessageId?: string;
   },
 ): Record<string, unknown> {
   const turn = materializeLosslessTurn({
@@ -1170,6 +1171,7 @@ export function materializeRootDomainAgentGroupRecord(
     turnKey: root.turnKey,
     text: "",
     createdAt: root.createdAt,
+    ...(root.clientMessageId !== undefined ? { clientMessageId: root.clientMessageId } : {}),
     agentGroups: [group],
   });
   const card = turn.records.find((item) => item.role === "agent-group");

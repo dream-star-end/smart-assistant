@@ -524,6 +524,7 @@ type TapeHeader = {
   billing_anchor_id: string | null;
   settlement_hash: string | null;
   visible_head: unknown;
+  client_message_id: string | null;
 };
 
 function headerFromFinalize(e: {
@@ -561,6 +562,7 @@ function headerFromFinalize(e: {
     billing_anchor_id: null,
     settlement_hash: null,
     visible_head: null,
+    client_message_id: null,
   };
 }
 
@@ -569,6 +571,9 @@ async function productionPath(opts: {
   unready?: boolean;
   lookupEio?: boolean;
   conflict?: boolean;
+  rootCmid?: string;
+  headerCmid?: string;
+  lateGroup?: Record<string, unknown>;
 }) {
   const sid = "audit-root-session";
   const uid = USER_ID;
@@ -593,6 +598,7 @@ async function productionPath(opts: {
     text: "root",
     createdAt: 1_700_000_000_000,
     agentGroups: rootGroups,
+    ...(opts.rootCmid ? { clientMessageId: opts.rootCmid } : {}),
   };
   const late = {
     sessionId: sid,
@@ -603,7 +609,7 @@ async function productionPath(opts: {
     continuationOfTurnKey: ownerTurn,
     createdAt: 1_700_000_000_001,
     text: "",
-    agentGroups: [g],
+    agentGroups: [{ ...g, ...opts.lateGroup }],
   };
   const rt = buildLosslessTurnTapeRequests(rootPayload);
   const persistedRecords = materializeLosslessTurn(rootPayload).records;
@@ -613,6 +619,7 @@ async function productionPath(opts: {
     visible_at: opts.unready ? null : "1700000000009",
     physical_record_count: String(persistedRecords.length),
     materialization_status: opts.unready ? "pending" : "complete",
+    client_message_id: opts.headerCmid ?? opts.rootCmid ?? null,
   };
   const headers = new Map<string, TapeHeader>([[rt.finalize.tapeId, rh]]);
   const parts = new Map<string, Array<{ part_index: number; part_sha256: string; payload: Buffer }>>();
@@ -633,11 +640,15 @@ async function productionPath(opts: {
   let rootPartsReads = 0;
   let recordReads = 0;
   let unknown = 0;
+  let visibleWrites = 0;
+  let materializationWrites = 0;
+  const sqlLog: string[] = [];
   let eio = Boolean(opts.lookupEio);
   const statuses: Array<{ action: string; status: number }> = [];
   const actions: string[] = [];
   const query = async (sql: string, params: unknown[] = []) => {
     const s = sql.trim().replace(/\s+/g, " ");
+    sqlLog.push(s);
     if (/^(BEGIN|COMMIT|ROLLBACK|SET )/i.test(s) || s.includes("pg_advisory_xact_lock")) {
       return { rows: [], rowCount: 0 };
     }
@@ -684,8 +695,12 @@ async function productionPath(opts: {
       return { rows: [], rowCount: 1 };
     }
     if (s.includes("UPDATE client_session_turn_tapes") && s.includes("visible_at")) {
-      const tape = headers.get(String(params[8] ?? params[params.length - 2]));
-      if (tape) tape.visible_at = String(params[0] ?? Date.now());
+      assert.deepEqual(params.slice(6, 8), [sid, uid]);
+      const tape = headers.get(String(params[8]));
+      assert.ok(tape);
+      tape.visible_at = String(params[0]);
+      tape.visible_head = JSON.parse(String(params[1]));
+      visibleWrites += 1;
       return { rows: [], rowCount: 1 };
     }
     if (s.includes("FROM client_session_turn_tapes")) {
@@ -727,6 +742,11 @@ async function productionPath(opts: {
       recordReads += 1;
       const wanted = new Set((params[3] as string[]) ?? []);
       return { rows: [...records.values()].filter((row) => wanted.has(row.msg_id)) };
+    }
+    if (s.startsWith("INSERT INTO turn_tape_materialization_jobs")) {
+      assert.deepEqual(params.slice(0, 2), [sid, uid]);
+      materializationWrites += 1;
+      return { rows: [], rowCount: 1 };
     }
     if (s.includes("turn_tape_materialization_jobs") || s.includes("turn_tape_settlement_jobs")) {
       return { rows: [], rowCount: 1 };
@@ -788,6 +808,9 @@ async function productionPath(opts: {
     dir,
     statuses,
     actions,
+    session,
+    headers,
+    sqlLog,
     advance() { auditNow += 600_000; },
     setEio(value: boolean) { eio = value; },
     setReady() {
@@ -795,7 +818,7 @@ async function productionPath(opts: {
       rh.visible_at = "1700000000009";
       rh.materialization_status = "complete";
     },
-    stats: () => ({ rootPartsReads, recordReads, unknown }),
+    stats: () => ({ rootPartsReads, recordReads, unknown, visibleWrites, materializationWrites }),
   };
 }
 
@@ -822,6 +845,59 @@ describe("OCV5-180 B1 R8 post-finalize records authority via sink/HTTP/drain", (
     assert.equal((await readdir(f.dir)).filter((name) => name.endsWith(".json")).length, 0);
     assert.equal(f.stats().unknown, 0);
     assert.ok(f.stats().recordReads >= 1);
+    const expected = buildLosslessTurnTapeRequests(f.late).finalize;
+    const messages = JSON.parse(f.session.messages) as Array<Record<string, unknown>>;
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0]?._turnTapeId, expected.tapeId);
+    assert.equal(messages[0]?._turnTapeSha256, expected.tapeSha256);
+    assert.ok(f.headers.get(expected.tapeId)?.visible_at);
+    assert.ok(f.headers.get(expected.tapeId)?.visible_head);
+    assert.equal(f.stats().visibleWrites, 1);
+    assert.equal(f.stats().materializationWrites, 1);
+    assert.equal(f.sqlLog.at(-1), "COMMIT");
+  });
+
+  test("root clientMessageId stamp ACKs the same run and real drain never quarantines", async () => {
+    const f = await productionPath({ rootCmid: "m-audit-root-origin" });
+    const outcome = await f.sink.persistOrQueue(f.late);
+    assert.equal(outcome.ok, true, JSON.stringify(f.statuses));
+    assert.equal(f.statuses.at(-1)?.status, 200);
+    f.setEio(true);
+    const queued = await f.sink.persistOrQueue(f.late);
+    assert.equal(queued.ok === false && queued.queued, true);
+    f.setEio(false);
+    f.advance();
+    const drained = await f.queue.drainOnce();
+    assert.equal(drained.drained, 1);
+    assert.equal(drained.fatalDropped, 0);
+    assert.equal(await f.queue.pendingCount(), 0);
+    assert.equal((await readdir(f.dir)).some((name) => name.includes("quarantine")), false);
+    assert.equal(f.stats().visibleWrites, 0);
+    assert.equal(f.stats().materializationWrites, 0);
+    assert.equal(f.session.messages, "[]");
+    assert.equal(f.stats().unknown, 0);
+  });
+
+  test("legacy unstamped root does not acquire a later header clientMessageId stamp", async () => {
+    const f = await productionPath({ headerCmid: "m-later-dispatch-origin" });
+    assert.equal((await f.sink.persistOrQueue(f.late)).ok, true, JSON.stringify(f.statuses));
+    assert.equal(f.statuses.at(-1)?.status, 200);
+    assert.equal(f.stats().visibleWrites, 0);
+    assert.equal(f.stats().unknown, 0);
+  });
+
+  test("root header versus published origin mismatch is an immutable conflict", async () => {
+    const f = await productionPath({ rootCmid: "m-audit-root-origin", headerCmid: "m-other-origin" });
+    assert.equal((await f.sink.persistOrQueue(f.late)).ok, false);
+    assert.equal(f.statuses.at(-1)?.status, 409);
+    assert.equal(f.stats().unknown, 0);
+  });
+
+  test("late group cannot hide its conflicting origin under the trusted root stamp", async () => {
+    const f = await productionPath({ rootCmid: "m-audit-root-origin", lateGroup: { _clientMessageId: "m-other-origin" } });
+    assert.equal((await f.sink.persistOrQueue(f.late)).ok, false);
+    assert.equal(f.statuses.at(-1)?.status, 409);
+    assert.equal(f.stats().unknown, 0);
   });
 
   test("different published content is 409 fatal, not a durable retry loop", async () => {
@@ -859,4 +935,3 @@ describe("OCV5-180 B1 R8 post-finalize records authority via sink/HTTP/drain", (
     assert.equal(f.stats().unknown, 0);
   });
 });
-

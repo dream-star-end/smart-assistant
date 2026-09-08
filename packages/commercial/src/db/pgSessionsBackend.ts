@@ -3662,6 +3662,7 @@ export async function inspectLateDelegateContinuationAgainstRoot(
     created_at: string;
     physical_record_count: string | null;
     materialization_status: string | null;
+    client_message_id: string | null;
   }>;
   try {
     roots = (
@@ -3679,12 +3680,13 @@ export async function inspectLateDelegateContinuationAgainstRoot(
         created_at: string;
         physical_record_count: string | null;
         materialization_status: string | null;
+        client_message_id: string | null;
       }>(
         `SELECT t.tape_id, t.tape_sha256, t.total_bytes::text AS total_bytes, t.part_count,
                 t.finalized_at::text, t.visible_at::text,
                 t.agent_id, t.turn_index, t.status, t.turn_key, t.created_at::text,
                 t.physical_record_count::text AS physical_record_count,
-                t.materialization_status
+                t.materialization_status, t.client_message_id
            FROM client_session_turn_tapes t
           WHERE t.session_id=$1 AND t.user_id=$2 AND t.turn_key=$3
             AND t.continuation_of_turn_key IS NULL
@@ -3770,6 +3772,21 @@ export async function inspectLateDelegateContinuationAgainstRoot(
         return "retry";
       }
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "retry";
+      // Published bytes describe the root's original stamp. A header may gain
+      // dispatch attribution later, so never stamp a legacy unstamped record
+      // merely because the header now has client_message_id.
+      const origin = (parsed as Record<string, unknown>)._clientMessageId;
+      if (origin !== undefined) {
+        if (!isClientMessageId(origin)) throw lateDelegateRootConflict();
+        if (root.client_message_id != null && root.client_message_id !== origin) {
+          throw lateDelegateRootConflict();
+        }
+        // The materializer overwrites this field when stamping. Reject a
+        // conflicting incoming identity before that overwrite can hide it.
+        if (group._clientMessageId !== undefined && group._clientMessageId !== origin) {
+          throw lateDelegateRootConflict();
+        }
+      }
       const expected = materializeRootDomainAgentGroupRecord(group as Record<string, unknown>, {
         sessionId: request.sessionId,
         agentId: root.agent_id,
@@ -3777,6 +3794,7 @@ export async function inspectLateDelegateContinuationAgainstRoot(
         status: root.status,
         turnKey: root.turn_key,
         createdAt,
+        ...(typeof origin === "string" ? { clientMessageId: origin } : {}),
       });
       const lateFp = canonicalPublishedAgentGroupRecordFingerprint(expected);
       const rootFp = canonicalPublishedAgentGroupRecordFingerprint(parsed as Record<string, unknown>);
