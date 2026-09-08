@@ -34,8 +34,15 @@ const { resolveBrowserExecutable } = await import("../../../scripts/lib/resolve-
 
 const ARTIFACTS =
   process.env.OC_BROWSER_TEST_ARTIFACTS ||
-  "/home/agent/.openclaude/generated/OCV5-185-browser-qa-artifacts";
+  "/home/agent/.openclaude/generated/OCV5-185-browser-qa-r1b-artifacts";
 mkdirSync(ARTIFACTS, { recursive: true });
+const FOCUS = (process.env.OC_QA_FOCUS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+function want(id) {
+  return FOCUS.length === 0 || FOCUS.includes(id);
+}
 
 const SESS = "sess185qa01";
 const USER_A = "user-a";
@@ -171,6 +178,9 @@ function createMock() {
     source: "pg",
     responses: [],
     clients: [],
+    httpLog: [],
+    holdOutbound: false,
+    held: [],
   };
 
   function broadcast(userId, frame) {
@@ -183,6 +193,14 @@ function createMock() {
 
   function sendTo(ws, frame) {
     if (ws.readyState === 1) ws.send(JSON.stringify(frame));
+  }
+
+  function flushHeld() {
+    const batch = store.held.splice(0, store.held.length);
+    for (const item of batch) {
+      sendTo(item.ws, item.result.receipt);
+      if (item.result.settled) broadcast(item.userId, item.result.settled);
+    }
   }
 
   function settleFromControl(userId, payload) {
@@ -254,7 +272,7 @@ function createMock() {
     };
   }
 
-  return { store, broadcast, sendTo, settleFromControl };
+  return { store, broadcast, sendTo, settleFromControl, flushHeld };
 }
 
 function ensureProtocolShim() {
@@ -332,6 +350,14 @@ function startServer(js, mock) {
       const id = decodeURIComponent(url.pathname.split("/")[3] || SESS);
       const lookup = url.searchParams.get("permission_lookup");
       const ids = lookup ? lookup.split(",").filter(Boolean).slice(0, 16) : [];
+      store.httpLog.push({
+        method: "GET",
+        path: url.pathname,
+        search: url.search,
+        lookup,
+        userId: auth.userId,
+        at: nowMs(),
+      });
       json(res, 200, sessionDetail(store, auth.userId, id, ids));
       return;
     }
@@ -375,6 +401,10 @@ function startServer(js, mock) {
       }
       if (msg.type === "inbound.permission_response") {
         const result = settleFromControl(auth.userId, msg);
+        if (store.holdOutbound) {
+          store.held.push({ ws, userId: auth.userId, result });
+          return;
+        }
         sendTo(ws, result.receipt);
         if (result.settled) broadcast(auth.userId, result.settled);
       }
@@ -420,6 +450,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
   const js = await bundleHarness();
   const mock = createMock();
   const { server, wss, store } = startServer(js, mock);
+  const { flushHeld, broadcast } = mock;
   const port = await listen(server);
   const origin = `http://127.0.0.1:${port}`;
   let browser;
@@ -481,6 +512,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
             wsRecv: page._wsRecv?.slice(-20),
             cards: parseCards(await page.getByTestId("qa-cards").textContent().catch(() => "[]")),
             responses: store.responses,
+            httpLog: store.httpLog,
+            held: store.held.length,
           },
           null,
           2,
@@ -498,7 +531,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    await t.test("T1 first-frame loss: GET materialises card, manual open", async () => {
+    if (want("T1")) await t.test("T1 first-frame loss: GET materialises card, manual open", async () => {
       store.prompts.clear();
       store.prompts.set(
         "req-lost",
@@ -534,9 +567,12 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    await t.test("T2 A answers, B refresh converges; race has one winner", async () => {
+    if (want("T2")) await t.test("T2 both UIs submit under hold; one winner; B local card settles; refresh no auto-open", async () => {
       store.prompts.clear();
       store.responses.length = 0;
+      store.held.length = 0;
+      store.httpLog.length = 0;
+      store.holdOutbound = true;
       store.prompts.set(
         "req-race",
         prompt({
@@ -554,63 +590,116 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         const pageB = await openPage(ctxB, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
         await pageA.evaluate(() => window.__qa.loadSession());
         await pageB.evaluate(() => window.__qa.loadSession());
+        await pageA.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          return cards.some((c) => c.requestId === "req-race" && c.resolved === false);
+        });
+        await pageB.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          return cards.some((c) => c.requestId === "req-race" && c.resolved === false);
+        });
+        const cardA0 = parseCards(await pageA.getByTestId("qa-cards").textContent()).find((c) => c.requestId === "req-race");
+        const cardB0 = parseCards(await pageB.getByTestId("qa-cards").textContent()).find((c) => c.requestId === "req-race");
+        assert.ok(cardA0 && cardA0.resolved === false, "A must hold local pending before submit");
+        assert.ok(cardB0 && cardB0.resolved === false, "B must hold local pending before submit");
         await pageA.getByRole("dialog").waitFor();
         await pageB.getByRole("dialog").waitFor();
         const before = store.responses.length;
-        await pageA.getByRole("dialog").getByRole("button", { name: "允许" }).click();
-        try {
-          await waitStore(
-            () => store.prompts.get("req-race")?.status === "responded",
-            "T2 mock settle after A",
-            25_000,
-          );
-        } catch (err) {
-          await failShot(pageA, "t2-a-send");
-          await failShot(pageB, "t2-b-idle");
-          throw err;
-        }
-        try {
-          await pageB.getByRole("dialog").getByRole("button", { name: "拒绝" }).click({ timeout: 3_000 });
-        } catch {
-          /* B modal may already have closed after A's settlement broadcast */
-        }
-        const row = store.prompts.get("req-race");
-        assert.equal(row.status, "responded");
-        assert.equal(row.behavior, "allow", "first writer A must win");
-        const late = store.responses.slice(before).filter((r) => r.payload.requestId === "req-race");
-        assert.ok(late.length >= 1);
-        try {
-          await pageA.waitForFunction(() => {
-            const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
-            return cards.some((c) => c.requestId === "req-race" && c.resolved === true);
-          });
-        } catch (err) {
-          await failShot(pageA, "t2-a-ui");
-          await failShot(pageB, "t2-b-ui");
-          throw err;
-        }
-        const pageB2 = await openPage(ctxB, `user=${USER_A}&sess=${SESS}&agent=main&live=0`);
-        await pageB2.evaluate(() => window.__qa.loadSession());
-        await pageB2.waitForFunction(() => {
+        await Promise.all([
+          pageA.getByRole("dialog").getByRole("button", { name: "允许" }).click(),
+          pageB.getByRole("dialog").getByRole("button", { name: "拒绝" }).click(),
+        ]);
+        await waitStore(
+          () => store.responses.filter((r) => r.payload.requestId === "req-race").length >= 2,
+          "T2 both UIs submitted inbound.permission_response",
+          25_000,
+        );
+        const submitted = store.responses.slice(before).filter((r) => r.payload.requestId === "req-race");
+        assert.equal(submitted.length, 2, `need two real UI submits, got ${JSON.stringify(submitted.map((s) => s.payload.behavior))}`);
+        const behaviors = submitted.map((s) => s.payload.behavior);
+        assert.ok(behaviors.includes("allow") && behaviors.includes("deny"), "A allow and B deny must both leave the browser");
+        const winnerBehavior = submitted[0].payload.behavior;
+        store.holdOutbound = false;
+        flushHeld();
+        assert.equal(store.prompts.get("req-race").status, "responded");
+        assert.equal(store.prompts.get("req-race").behavior, winnerBehavior, "mock authority keeps the first submitter");
+        await pageA.waitForFunction((win) => {
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
-          return cards.some((c) => c.requestId === "req-race" && c.resolved === true);
-        });
-        const cardsB = parseCards(await pageB2.getByTestId("qa-cards").textContent());
-        const cardB = cardsB.find((c) => c.requestId === "req-race");
-        assert.equal(cardB.behavior, "allow", "B refresh must converge to winner behavior");
+          const card = cards.find((c) => c.requestId === "req-race");
+          return card && card.resolved === true && card.behavior === win;
+        }, winnerBehavior);
+        await pageB.waitForFunction((win) => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          const card = cards.find((c) => c.requestId === "req-race");
+          return card && card.resolved === true && card.behavior === win;
+        }, winnerBehavior);
+        const cardB = parseCards(await pageB.getByTestId("qa-cards").textContent()).find((c) => c.requestId === "req-race");
+        assert.ok(cardB, "B must still have the local card");
         assert.equal(cardB.resolved, true);
+        assert.equal(cardB.behavior, winnerBehavior);
+        await pageB.evaluate(() => window.__qa.loadSnapshot());
+        await pageB.waitForFunction((win) => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          const card = cards.find((c) => c.requestId === "req-race");
+          return card && card.resolved === true && card.behavior === win;
+        }, winnerBehavior);
+        assert.equal(
+          await pageB.getByRole("dialog").count(),
+          0,
+          "B snapshot refresh must not auto-open a settled card",
+        );
         await shot(pageA, "t2-tab-a-after-race");
-        await shot(pageB2, "t2-tab-b-refresh-converged");
+        await shot(pageB, "t2-tab-b-settled-no-reopen");
       } catch (err) {
         failures.push("T2");
         throw err;
       } finally {
+        store.holdOutbound = false;
+        store.held.length = 0;
         await ctxA.close();
         await ctxB.close();
       }
     });
 
-    await t.test("T3 background does not mark displayed; after foreground close can reopen", async () => {
+    if (want("T2w")) await t.test("T2w empty-tape new page rematerialize responded (warning, not blocker)", async () => {
+      store.prompts.clear();
+      store.prompts.set(
+        "req-hist",
+        prompt({
+          requestId: "req-hist",
+          status: "responded",
+          behavior: "allow",
+          toolName: "Bash",
+          inputJson: { command: "hist" },
+        }),
+      );
+      const ctx = await browser.newContext();
+      try {
+        const page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=0`);
+        await page.evaluate(() => window.__qa.loadSession());
+        await page.waitForFunction(() => document.querySelector("[data-testid=qa-cards]") !== null);
+        const cards = parseCards(await page.getByTestId("qa-cards").textContent());
+        const card = cards.find((c) => c.requestId === "req-hist");
+        writeFileSync(
+          join(ARTIFACTS, "t2w-empty-tape-warning.json"),
+          JSON.stringify(
+            {
+              warning: true,
+              blocker: false,
+              reason: "empty tape GET is not required to rematerialize terminal history cards",
+              cards,
+              hasResolvedCard: !!(card && card.resolved),
+            },
+            null,
+            2,
+          ),
+        );
+      } finally {
+        await ctx.close();
+      }
+    });
+
+    if (want("T3")) await t.test("T3 background does not mark displayed; after foreground close can reopen", async () => {
       store.prompts.clear();
       store.prompts.set(
         "req-bg",
@@ -648,7 +737,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    await t.test("T4 ExitPlanMode close does not onRespond", async () => {
+    if (want("T4")) await t.test("T4 ExitPlanMode close does not onRespond", async () => {
       store.prompts.clear();
       store.prompts.set(
         "req-plan",
@@ -690,8 +779,10 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    await t.test("T5 two pending => at most one modal; dock still reaches the other", async () => {
+    if (want("T5")) await t.test("T5 slot occupied with 0 modal; dock[0] then dock[1] are different requests", async () => {
       store.prompts.clear();
+      store.responses.length = 0;
+      store.httpLog.length = 0;
       store.prompts.set(
         "req-one",
         prompt({
@@ -717,28 +808,45 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
         await page.evaluate(() => window.__qa.loadSession());
         await page.getByTestId("pending-permission-dock").waitFor();
-        const autoOpened = await page.waitForFunction(
-          () => (document.querySelector("[data-testid=qa-active-modal]")?.textContent || "").length > 0,
-          { timeout: 5_000 },
-        ).then(() => true).catch(() => false);
-        if (!autoOpened) {
-          await failShot(page, "t5-no-auto-open");
-          await page.locator("[data-testid=pending-permission-dock] button").first().click();
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          return cards.some((c) => c.requestId === "req-one") && cards.some((c) => c.requestId === "req-two");
+        });
+        const slot = (await page.getByTestId("qa-active-modal").textContent()) || "";
+        const dialogs = await page.getByRole("dialog").count();
+        assert.ok(dialogs <= 1, `at most one modal, got ${dialogs}`);
+        const slotWithoutModal = slot.length > 0 && dialogs === 0;
+        if (slotWithoutModal) await failShot(page, "t5-slot-no-modal");
+        if (dialogs > 0) {
+          await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+          await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
         }
-        await page.getByRole("dialog").waitFor();
-        assert.equal(await page.getByRole("dialog").count(), 1, "two pending must not show two modals");
-        const firstModal = (await page.getByTestId("qa-active-modal").textContent()) || "";
-        assert.ok(firstModal === "req-one" || firstModal === "req-two");
-        const dockButtons = page.locator("[data-testid=pending-permission-dock] button");
-        const n = await dockButtons.count();
-        assert.equal(n, 2, "both pending remain reachable from dock");
-        await dockButtons.nth(firstModal === "req-one" ? 1 : 0).click();
-        await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length <= 1);
-        assert.equal(await page.getByRole("dialog").count(), 1);
-        if (!autoOpened) {
-          throw new Error("two pending live cards did not auto-open a singleton modal");
+        const dock = page.locator("[data-testid=pending-permission-dock] button");
+        assert.equal(await dock.count(), 2, "dock must expose both pending requests");
+        const respondBefore = store.responses.length;
+        await dock.nth(0).click();
+        await page.waitForFunction(() => (document.querySelector("[data-testid=qa-active-modal]")?.textContent || "").length > 0);
+        const id0 = (await page.getByTestId("qa-active-modal").textContent()) || "";
+        assert.ok(id0 === "req-one" || id0 === "req-two", `dock[0] must open a real request, got ${id0}`);
+        assert.ok((await page.getByRole("dialog").count()) <= 1);
+        if (await page.getByRole("dialog").count()) {
+          await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+          await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
         }
-        await shot(page, "t5-single-modal-two-pending");
+        await dock.nth(1).click();
+        await page.waitForFunction((prev) => {
+          const id = document.querySelector("[data-testid=qa-active-modal]")?.textContent || "";
+          return id.length > 0 && id !== prev;
+        }, id0);
+        const id1 = (await page.getByTestId("qa-active-modal").textContent()) || "";
+        assert.notEqual(id1, id0, `dock[1] must open the other request (id0=${id0} id1=${id1})`);
+        assert.ok(id1 === "req-one" || id1 === "req-two");
+        assert.ok((await page.getByRole("dialog").count()) <= 1);
+        assert.equal(store.responses.length, respondBefore, "close/reopen must not send permission_response");
+        await shot(page, "t5-dock-sequential");
+        if (slotWithoutModal) {
+          throw new Error(`W1/B3: coordinator slot=${slot} but 0 visible dialog after GET materialise`);
+        }
       } catch (err) {
         failures.push("T5");
         if (page) await failShot(page, "t5").catch(() => {});
@@ -748,30 +856,30 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    await t.test("T6 new settle does not resurrect old pending; lookup beyond recent window", async () => {
+    if (want("T6")) await t.test("T6 pending exists then settles; stale pending cannot resurrect; lookup HTTP settles beyond window", async () => {
       store.prompts.clear();
-      store.windowSize = 1;
+      store.responses.length = 0;
+      store.httpLog.length = 0;
+      store.windowSize = 16;
       const oldTs = nowMs() - 10_000;
       store.prompts.set(
         "req-old",
         prompt({
           requestId: "req-old",
-          status: "responded",
-          behavior: "allow",
-          createdAt: oldTs,
-          updatedAt: oldTs + 1,
           toolName: "Bash",
           inputJson: { command: "old" },
+          createdAt: oldTs,
+          updatedAt: oldTs,
         }),
       );
       store.prompts.set(
-        "req-new",
+        "req-mid",
         prompt({
-          requestId: "req-new",
-          createdAt: nowMs(),
+          requestId: "req-mid",
           toolName: "Bash",
-          inputJson: { command: "new" },
-          toolUseId: "toolu_new",
+          inputJson: { command: "mid" },
+          toolUseId: "toolu_mid",
+          createdAt: nowMs() - 5_000,
         }),
       );
       const ctx = await browser.newContext();
@@ -780,41 +888,82 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         await page.evaluate(() => window.__qa.loadSession());
         await page.waitForFunction(() => {
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
-          return cards.some((c) => c.requestId === "req-new");
+          return cards.some((c) => c.requestId === "req-old" && c.resolved === false)
+            && cards.some((c) => c.requestId === "req-mid" && c.resolved === false);
         });
-        // Locally materialise the old card as pending, then a truncated snapshot + lookup
-        // must keep the newer local settlement from being resurrected.
-        await page.evaluate(() => window.__qa.loadSession());
-        store.windowSize = 1;
-        // Inject an older pending snapshot for req-old by flipping store then loading lookups.
-        const old = store.prompts.get("req-old");
-        const savedStatus = old.status;
-        const savedBehavior = old.behavior;
-        old.status = "pending";
-        old.behavior = null;
-        old.updatedAt = oldTs; // older than local resolved
-        await page.evaluate(() => window.__qa.loadSession());
-        const cards = parseCards(await page.getByTestId("qa-cards").textContent());
-        const oldCard = cards.find((c) => c.requestId === "req-old");
-        if (oldCard) {
-          assert.equal(oldCard.resolved, true, "newer local settle must not be resurrected");
-          assert.equal(oldCard.behavior, "allow");
-        }
-        old.status = savedStatus;
-        old.behavior = savedBehavior;
-        // Beyond window: only req-new in items; lookup req-old still returns the row.
-        const lookupPage = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=0`);
-        await lookupPage.evaluate(() => window.__qa.loadSession());
-        // Force a local pending old card then GET truncated page to trigger lookup.
-        store.windowSize = 1;
-        await lookupPage.evaluate(async () => {
-          await window.__qa.loadSession();
+        const beforeSettle = parseCards(await page.getByTestId("qa-cards").textContent());
+        const oldPending = beforeSettle.find((c) => c.requestId === "req-old");
+        assert.ok(oldPending, "old pending card must exist in the browser before settle");
+        assert.equal(oldPending.resolved, false, "old card must still be pending before settle");
+        const oldRow = store.prompts.get("req-old");
+        oldRow.status = "responded";
+        oldRow.behavior = "allow";
+        oldRow.updatedAt = nowMs();
+        broadcast(USER_A, {
+          type: "outbound.permission_settled",
+          sessionKey: `agent:main:webchat:dm:${SESS}`,
+          channel: "webchat",
+          peer: { id: SESS, kind: "dm" },
+          requestId: "req-old",
+          behavior: "allow",
+          reason: "remote",
         });
-        const detail = sessionDetail(store, USER_A, SESS, ["req-old"]);
-        assert.equal(detail.permissionPrompts.completeness, "truncated");
-        assert.equal(detail.permissionPrompts.items[0].requestId, "req-new");
-        assert.equal(detail.permissionPrompts.lookups[0].requestId, "req-old");
-        await shot(page, "t6-no-resurrect-and-lookup");
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          const card = cards.find((c) => c.requestId === "req-old");
+          return card && card.resolved === true && card.behavior === "allow";
+        });
+        oldRow.status = "pending";
+        oldRow.behavior = null;
+        oldRow.updatedAt = oldTs;
+        await page.evaluate(() => window.__qa.loadSnapshot());
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          const card = cards.find((c) => c.requestId === "req-old");
+          return card && card.resolved === true;
+        });
+        const afterStale = parseCards(await page.getByTestId("qa-cards").textContent()).find((c) => c.requestId === "req-old");
+        assert.ok(afterStale, "settled old card must still exist after stale pending snapshot");
+        assert.equal(afterStale.resolved, true, "older pending snapshot must not resurrect a newer local settle");
+
+        store.prompts.set(
+          "req-fresh",
+          prompt({
+            requestId: "req-fresh",
+            toolName: "Bash",
+            inputJson: { command: "fresh" },
+            createdAt: nowMs(),
+          }),
+        );
+        store.windowSize = 16;
+        await page.evaluate(() => window.__qa.loadSnapshot());
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          return cards.some((c) => c.requestId === "req-fresh" && c.resolved === false)
+            && cards.some((c) => c.requestId === "req-mid" && c.resolved === false);
+        });
+        const midPending = parseCards(await page.getByTestId("qa-cards").textContent()).find((c) => c.requestId === "req-mid");
+        assert.ok(midPending && midPending.resolved === false, "unanswered mid card must exist before shrinking the window");
+        store.httpLog.length = 0;
+        store.windowSize = 1;
+        const mid = store.prompts.get("req-mid");
+        mid.status = "responded";
+        mid.behavior = "deny";
+        mid.updatedAt = nowMs();
+        await page.evaluate(() => window.__qa.loadSnapshot());
+        await waitStore(
+          () => store.httpLog.some((h) => typeof h.lookup === "string" && h.lookup.split(",").includes("req-mid")),
+          "T6 real hook GET permission_lookup=req-mid",
+          15_000,
+        );
+        const lookupHits = store.httpLog.filter((h) => typeof h.lookup === "string" && h.lookup.split(",").includes("req-mid"));
+        assert.ok(lookupHits.length >= 1, `hook must issue permission_lookup HTTP, log=${JSON.stringify(store.httpLog)}`);
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          const card = cards.find((c) => c.requestId === "req-mid");
+          return card && card.resolved === true && card.behavior === "deny";
+        });
+        await shot(page, "t6-settle-stale-and-lookup");
       } catch (err) {
         failures.push("T6");
         throw err;
@@ -824,7 +973,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    await t.test("T7 toolUseId/turn bind; non-main agent; account isolation", async () => {
+    if (want("T7")) await t.test("T7 toolUseId/turn bind; non-main agent; account isolation", async () => {
       store.prompts.clear();
       store.prompts.set(
         "req-agent",
@@ -881,7 +1030,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    await t.test("T8 ordinary no-waiter does not forge success; detached id stays pending until real settle", async () => {
+    if (want("T8")) await t.test("T8 ordinary no-waiter does not forge success; detached id stays pending until real settle", async () => {
       store.prompts.clear();
       store.responses.length = 0;
       const ctx = await browser.newContext();

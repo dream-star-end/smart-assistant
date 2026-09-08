@@ -72,17 +72,13 @@ function Harness() {
     sock.setActiveSession(cfg.sessId);
   }, [cfg.agentId, cfg.sessId, sock]);
 
-  const loadSession = useCallback(async () => {
-    setLoadError("");
-    try {
-      sock.ensureSession(cfg.sessId, cfg.agentId, "OCV5-185 QA");
-      sock.setActiveSession(cfg.sessId);
-      const detail = await api.getSession(auth, cfg.sessId, 0);
+  const applyDetail = useCallback(
+    (detail: Awaited<ReturnType<typeof api.getSession>>, full: boolean) => {
       sock.mergeServerHistory({
         sessId: cfg.sessId,
         agentId: detail.agentId || cfg.agentId,
         messages: Array.isArray(detail.messages) ? (detail.messages as never[]) : [],
-        full: !detail.isPartial,
+        full,
         maxSeq: detail.maxSeq,
         archivedThroughSeq: detail.archivedThroughSeq,
         archivedCount: detail.archivedCount,
@@ -94,11 +90,34 @@ function Harness() {
         timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
         permissionPrompts: detail.permissionPrompts,
       });
+    },
+    [cfg.agentId, cfg.sessId, sock],
+  );
+
+  const loadSession = useCallback(async () => {
+    setLoadError("");
+    try {
+      sock.ensureSession(cfg.sessId, cfg.agentId, "OCV5-185 QA");
+      sock.setActiveSession(cfg.sessId);
+      const detail = await api.getSession(auth, cfg.sessId, 0);
+      applyDetail(detail, true);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
       throw err;
     }
-  }, [auth, cfg.agentId, cfg.sessId, sock]);
+  }, [applyDetail, auth, cfg.agentId, cfg.sessId, sock]);
+
+  /** Incremental snapshot only: does not full-replace the local tape. */
+  const loadSnapshot = useCallback(async () => {
+    setLoadError("");
+    try {
+      const detail = await api.getSession(auth, cfg.sessId, 0);
+      applyDetail(detail, false);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }, [applyDetail, auth, cfg.sessId]);
 
   const messages = sock.getMessages(cfg.sessId);
   const unresolved = messages.some((m) => m.role === "permission" && m._resolved !== true);
@@ -121,6 +140,7 @@ function Harness() {
   useEffect(() => {
     const apiSurface = {
       loadSession,
+      loadSnapshot,
       getState: () => ({
         userId: cfg.userId,
         sessId: cfg.sessId,
@@ -135,7 +155,7 @@ function Harness() {
       }),
     };
     (window as unknown as { __qa: typeof apiSurface }).__qa = apiSurface;
-  }, [cards, cfg.agentId, cfg.sessId, cfg.userId, loadError, loadSession, sending, sock.status.cls, sock.status.label, sock.version]);
+  }, [cards, cfg.agentId, cfg.sessId, cfg.userId, loadError, loadSession, loadSnapshot, sending, sock.status.cls, sock.status.label, sock.version]);
 
   return (
     <TooltipProvider>
