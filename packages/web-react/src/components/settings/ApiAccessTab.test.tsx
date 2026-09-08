@@ -326,6 +326,7 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     const trouble = screen.getByTestId("guide-troubleshoot");
     expect(within(trouble).getByText(/401 \/ Auth conflict/)).toBeInTheDocument();
     expect(within(trouble).getByText(/Both a token and an API key are set/)).toBeInTheDocument();
+    expect(within(trouble).getByText(/'--settings' 不是内部或外部命令/)).toBeInTheDocument();
     // 深链尾注:导入即切换 + 重开终端 + 清残留环境变量。
     expect(screen.getByText(/直接切换为 Claude Code 当前供应商/)).toBeInTheDocument();
   });
@@ -402,6 +403,10 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     await waitFor(() => expect(api.createApiKey).toHaveBeenCalledWith(auth, "new-one"));
     const link = screen.getByTestId("ccswitch-deeplink") as HTMLAnchorElement;
     expect(link.getAttribute("href")).toContain("apiKey=oc-cc.zzzz9999.");
+    // 供应商名必须是 ASCII:CC Switch Windows「打开终端」会把 name 派生的路径写进 .bat,中文名会让 cmd 解析失败。
+    const importedName = new URL(link.getAttribute("href")!).searchParams.get("name")!;
+    expect(importedName).toBe("Clarvy");
+    expect(importedName).toMatch(/^[\x20-\x7e]+$/);
     expect(screen.getByText(/已包含刚创建的密钥/)).toBeInTheDocument();
     expect(screen.getByTestId("env-snippet").textContent).toContain(
       "ANTHROPIC_AUTH_TOKEN='oc-cc.zzzz9999.",
