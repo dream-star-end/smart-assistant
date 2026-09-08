@@ -68,3 +68,4 @@ packages/commercial/src/__tests__/migration0265.integ.test.ts
 packages/commercial/src/__tests__/migration0268.integ.test.ts
 packages/commercial/src/__tests__/migration0274.integ.test.ts
 packages/commercial/src/__tests__/desktopTunnelOwners.integ.test.ts
+packages/commercial/src/__tests__/migration0278.integ.test.ts
