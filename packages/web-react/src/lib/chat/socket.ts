@@ -802,10 +802,10 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout> | null;
     inFlight: boolean;
   }>();
-  /** Exact active-turn candidate sets already attempted on the current WS.
-   * History can arrive after the initial shell hello; each new candidate set
-   * gets one targeted registration hello, then waits for a reconnect before
-   * retrying to avoid a resume_failed/sync loop. */
+  /** Active candidate sets and idle cursor registrations attempted on this WS.
+   * History can arrive after the initial shell hello; each identity gets one
+   * successful targeted hello. A server-reset idle cursor is a new identity,
+   * while repeating the same snapshot cannot cause a resume_failed/sync loop. */
   private readonly activeReplayAttemptKeys = new Set<string>();
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
@@ -3123,7 +3123,7 @@ export class ChatSocket {
   private composeHelloFrame(
     includeInFlight = true,
     onlySessionId?: string,
-    requireFreshActiveCandidate = false,
+    requireFreshRegistration = false,
   ): { data: string; attemptKeys: string[] } {
     const peers: Array<{
       peerId: string;
@@ -3143,10 +3143,16 @@ export class ChatSocket {
         if (emitted.has(aid)) return;
         emitted.add(aid);
         const candidates = this.activeTurnReplayCandidates(s);
-        const attemptKey = candidates.length > 0 ? `${pid}:${aid}:${candidates.join(",")}` : "";
-        const hasFreshCandidates = !!attemptKey && !this.activeReplayAttemptKeys.has(attemptKey);
-        if (requireFreshActiveCandidate && !hasFreshCandidates) return;
-        if (hasFreshCandidates) attemptKeys.push(attemptKey);
+        // An idle session can be loaded after this socket's initial hello.
+        // Its persisted cursor still needs server arbitration before the next
+        // turn, even though completed history has no active replay candidate.
+        const attemptKey = candidates.length > 0
+          ? `${pid}:${aid}:${candidates.join(",")}`
+          : `${pid}:${aid}:idle-cursor:${lastFrameSeq}`;
+        const fresh = !this.activeReplayAttemptKeys.has(attemptKey);
+        const hasFreshCandidates = candidates.length > 0 && fresh;
+        if (requireFreshRegistration && !fresh) return;
+        if (fresh) attemptKeys.push(attemptKey);
         const emitInFlight = includeInFlight && !!s._sendingInFlight;
         peers.push({
           peerId: pid,
@@ -3192,10 +3198,10 @@ export class ChatSocket {
   private sendHelloFrame(
     includeInFlight = true,
     onlySessionId?: string,
-    requireFreshActiveCandidate = false,
+    requireFreshRegistration = false,
   ): boolean {
-    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshActiveCandidate);
-    if (requireFreshActiveCandidate && hello.attemptKeys.length === 0) return false;
+    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshRegistration);
+    if (requireFreshRegistration && hello.attemptKeys.length === 0) return false;
     const sent = this.safeWsSend(hello.data);
     if (sent) for (const key of hello.attemptKeys) this.activeReplayAttemptKeys.add(key);
     return sent;
@@ -4018,10 +4024,10 @@ export class ChatSocket {
     // hidden and「模型繁忙，正在重试中（n/10）」shows, same as the live path.
     if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
     // Login/reload can open WS before REST history arrives. If that initial
-    // shell hello had no user-row identity it can only produce a generic
-    // resume_failed. Once full history exposes trailing persisted user rows,
-    // issue one targeted registration hello so the server can verify and
-    // replay the exact active turn from its protected boundary.
+    // shell hello may not include this session at all. Register idle cursors
+    // too: otherwise a cached high cursor survives a gateway restart and
+    // swallows the next turn's low-numbered output on this still-open socket.
+    // Active candidates retain their separate exact-turn replay identity.
     if (full && this.ws && this.ws.readyState === 1) {
       this.sendHelloFrame(false, sessId, true);
     }

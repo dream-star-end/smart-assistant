@@ -81,3 +81,32 @@ test('Chat navigation: real components, production CSS, trusted pointer/touch', 
     });
   } finally {await browser.close();}
 });
+
+// OCV5-178: real components + warm socket; backend frames are simulated.
+test('OCV5-178 warm socket shows new text after restoring an idle cursor', async () => {
+  const baseline = process.env.OC_CURSOR_BASELINE;
+  const bundle = await build({
+    entryPoints: [join(here, 'stream-cursor-harness.tsx')], bundle: true, write: false,
+    format: 'iife', jsx: 'automatic', loader: { '.css': 'empty' },
+    alias: { 'node:crypto': join(here, 'stubs/node-crypto.js') },
+    define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env.MODE': '"production"' },
+    plugins: baseline ? [{ name: 'cursor-red-baseline', setup(b) {
+      b.onLoad({ filter: /src\/lib\/chat\/socket\.ts$/ }, args => ({
+        contents: execFileSync('git', ['show', `${baseline}:packages/web-react/src/lib/chat/socket.ts`],
+          { cwd: join(here, '../../..'), encoding: 'utf8' }), loader: 'ts',
+      }));
+    } }] : [],
+  });
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ['--no-sandbox'] });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.setContent('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div>');
+    await page.addScriptTag({ content: bundle.outputFiles[0].text });
+    await page.getByRole('button', { name: '继续旧会话' }).tap();
+    await page.getByText('新的正文已实时显示', { exact: true }).waitFor({ timeout: 4000 });
+    assert.equal(await page.getByText('新的正文已实时显示', { exact: true }).count(), 1);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
