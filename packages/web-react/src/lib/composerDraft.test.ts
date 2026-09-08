@@ -82,8 +82,25 @@ describe("composerDraft", () => {
     expect(readDraft(NEW_COMPOSER_DRAFT_KEY)).toBe("");
     expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"))).toBe("");
     expect(readDraft(accountDraftKey("s1", "user-a"))).toBe("");
-    writeDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-b"), "");
     expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-b"))).toBe("");
     expect(readDraft(NEW_COMPOSER_DRAFT_KEY)).toBe("");
+  });
+
+  test("B new first read after A teardown is empty without writing B", () => {
+    writeDraft(NEW_COMPOSER_DRAFT_KEY, "unscoped leftover");
+    writeDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"), "account-A unique body");
+    teardownComposerDrafts("user-a");
+    expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-b"))).toBe("");
+    expect(readDraft(NEW_COMPOSER_DRAFT_KEY)).toBe("");
+  });
+
+  test("volatile A draft is gone after teardown; B first read empty", () => {
+    const huge = "x".repeat(20 * 1024 + 8);
+    writeDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"), huge);
+    expect(sessionStorage.getItem("oc_v5_composer_draft:user-a:new")).toBeNull();
+    expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"))).toBe(huge);
+    teardownComposerDrafts("user-a");
+    expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-a"))).toBe("");
+    expect(readDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, "user-b"))).toBe("");
   });
 });
