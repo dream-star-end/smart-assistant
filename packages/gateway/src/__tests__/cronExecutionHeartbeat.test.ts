@@ -71,7 +71,10 @@ function createManualClock(getNow: () => number, setNow: (value: number) => void
   }
 }
 
-function openStore(dir: string, opts: { bootId?: string; now?: () => number } = {}) {
+function openStore(
+  dir: string,
+  opts: { bootId?: string; now?: () => number; hydrate?: boolean } = {},
+) {
   const durable = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
   return new DelegateJobStore({
     sm: true,
@@ -80,7 +83,16 @@ function openStore(dir: string, opts: { bootId?: string; now?: () => number } = 
     durable,
     bootId: opts.bootId ?? 'gw:cron-hb',
     now: opts.now,
+    hydrate: opts.hydrate,
   })
+}
+
+function reportContract(
+  contractId: string,
+  expected: Record<string, unknown>,
+  actual: Record<string, unknown>,
+) {
+  console.log(JSON.stringify({ contractId, expected, actual }))
 }
 
 function writeDueJob(over: Record<string, unknown> = {}) {
@@ -164,7 +176,7 @@ describe('OCV5-188 cron execution heartbeat — scheduler lifecycle', () => {
     rmSync(TEST_HOME, { recursive: true, force: true })
   })
 
-  it('tick→claim→submit keeps a healthy occurrence alive across 481 injected 15s beats', async () => {
+  it('tick→claim→submit keeps a healthy occurrence alive across 481 injected 15s beats', { timeout: 15_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'oc-cron-sched-481-'))
     let now = 1_000_000
     const clock = createManualClock(
@@ -211,6 +223,25 @@ describe('OCV5-188 cron execution heartbeat — scheduler lifecycle', () => {
 
     clock.beats(BEATS_PAST_OLD_CAP)
     const live = store.snapshotOf(jobId)!
+    const elapsedMs = now - claimedAt!
+    const actual = {
+      interrupts: interrupted.length,
+      elapsedMs,
+      activityBefore: claimedAt,
+      activityAfter: live.lastActivityAt,
+      activityAdvancedMs: live.lastActivityAt! - claimedAt!,
+      state: live.state,
+      fenceEpoch: live.fencingEpoch,
+      submits: 1,
+      logicalTime: now,
+    }
+    const expected = {
+      interrupts: 0,
+      elapsedMs: BEATS_PAST_OLD_CAP * INTERVAL,
+      activityAdvancedMs: BEATS_PAST_OLD_CAP * INTERVAL,
+      state: 'running',
+    }
+    reportContract('C-481-submit', expected, actual)
     assert.equal(interrupted.length, 0)
     assert.equal(live.state, 'running')
     assert.equal(live.lastActivityAt, now)
@@ -272,6 +303,20 @@ describe('OCV5-188 cron execution heartbeat — scheduler lifecycle', () => {
     await submitted.promise
     assert.equal(session.runner.waitingForUserInput, true, 'watchdog must see a real waiting flag')
     clock.beats(BEATS_PAST_OLD_CAP)
+    const waitRow = store.listRunning()[0]
+    const waitActual = {
+      layer: 'injected-waiting-getter',
+      notRealModel: true,
+      schedulerSubmitIsSynthetic: true,
+      state: waitRow?.state,
+      interrupts: interrupted.length,
+      logicalTime: now,
+    }
+    reportContract(
+      'C-481-waiting-getter',
+      { interrupts: 0, state: 'running', layer: 'injected-waiting-getter' },
+      waitActual,
+    )
     assert.equal(store.listRunning()[0]?.state, 'running')
     assert.deepEqual(store.reapStaleRunning({ timeoutMs: 30 * 60_000 }), [])
     assert.equal(interrupted.length, 0)
@@ -307,34 +352,256 @@ describe('OCV5-188 cron execution heartbeat — scheduler lifecycle', () => {
       } as any,
       async () => {},
     )
-    sched.delegateJobs = store
-    sched.delegateHeartbeatMs = INTERVAL
-    sched.heartbeatSetInterval = clock.setInterval as typeof setInterval
-    sched.heartbeatClearInterval = clock.clearInterval as typeof clearInterval
-    const origPersist = (sched as any).persistLastRun.bind(sched)
-    ;(sched as any).persistLastRun = async (value: Record<string, number>) => {
-      persistStarted.resolve()
-      await persistGate.promise
-      return origPersist(value)
+    try {
+      sched.delegateJobs = store
+      sched.delegateHeartbeatMs = INTERVAL
+      sched.heartbeatSetInterval = clock.setInterval as typeof setInterval
+      sched.heartbeatClearInterval = clock.clearInterval as typeof clearInterval
+      const origPersist = (sched as any).persistLastRun.bind(sched)
+      ;(sched as any).persistLastRun = async (value: Record<string, number>) => {
+        persistStarted.resolve()
+        await persistGate.promise
+        return origPersist(value)
+      }
+
+      const tickP = (sched as any).tick() as Promise<void>
+      await persistStarted.promise
+      const running = store.listRunning()
+      assert.equal(running.length, 1, 'claim happens before persistLastRun')
+      const frozen = running[0]!.lastActivityAt
+      assert.equal(sched.activeExecutionHeartbeatCount, 0, 'heartbeat must not start during persist')
+      clock.beats(8)
+      assert.equal(store.snapshotOf(running[0]!.id)!.lastActivityAt, frozen)
+      assert.equal(submits, 0)
+
+      sched.stop()
+      persistGate.resolve()
+      await tickP
+      const actual = {
+        submits,
+        heartbeats: sched.activeExecutionHeartbeatCount,
+        activityBefore: frozen,
+        activityAfter: store.snapshotOf(running[0]!.id)?.lastActivityAt,
+        logicalTime: now,
+      }
+      reportContract('C-persist-pending-stop', { submits: 0, heartbeats: 0 }, actual)
+      assert.equal(submits, 0, 'stopped scheduler must not enter sessions.submit')
+      assert.equal(sched.activeExecutionHeartbeatCount, 0)
+    } finally {
+      persistGate.resolve()
+      sched.stop()
+      store.close()
+      rmSync(dir, { recursive: true, force: true })
     }
+  })
 
-    const tickP = (sched as any).tick() as Promise<void>
-    await persistStarted.promise
-    const running = store.listRunning()
-    assert.equal(running.length, 1, 'claim happens before persistLastRun')
-    const frozen = running[0]!.lastActivityAt
-    assert.equal(sched.activeExecutionHeartbeatCount, 0, 'heartbeat must not start during persist')
-    clock.beats(8)
-    assert.equal(store.snapshotOf(running[0]!.id)!.lastActivityAt, frozen)
-    assert.equal(submits, 0)
+  it('persistLastRun barrier then second-store adopt must not submit as the old owner', { timeout: 15_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-cron-sched-takeover-'))
+    let now = 1_000_000
+    const storeA = openStore(dir, { bootId: 'gw:owner-a', now: () => now })
+    let storeB: ReturnType<typeof openStore> | undefined
+    const persistStarted = deferred()
+    const persistGate = deferred()
+    let submits = 0
+    const interrupted: string[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: { sessionKey: string }) => ({ sessionKey: opts.sessionKey }),
+        submit: async () => {
+          submits++
+        },
+        destroySession: async () => {},
+        interrupt: (key: string) => {
+          interrupted.push(key)
+          return true
+        },
+      } as any,
+      async () => {},
+    )
+    try {
+      writeDueJob()
+      sched.delegateJobs = storeA
+      const origPersist = (sched as any).persistLastRun.bind(sched)
+      ;(sched as any).persistLastRun = async (value: Record<string, number>) => {
+        persistStarted.resolve()
+        await persistGate.promise
+        return origPersist(value)
+      }
+      const tickP = (sched as any).tick() as Promise<void>
+      await persistStarted.promise
+      const original = storeA.listRunning()[0]
+      assert.ok(original, 'actual scheduler must claim before pending persistence')
+      const activityBefore = original.lastActivityAt
+      now += 5_000
+      storeB = openStore(dir, { bootId: 'gw:owner-b', now: () => now, hydrate: true })
+      const adopted = storeB.adoptOrKill(original.id, original.fencingEpoch, 'running')
+      assert.ok(adopted, 'real SQLite takeover must succeed')
+      persistGate.resolve()
+      await tickP
+      const after = storeB.snapshotOf(original.id)
+      const actual = {
+        submits,
+        adopted: Boolean(adopted),
+        oldEpoch: original.fencingEpoch,
+        newEpoch: adopted.fencingEpoch,
+        interrupts: interrupted.length,
+        currentState: after?.state,
+        activityBefore,
+        activityAfter: after?.lastActivityAt,
+        logicalTime: now,
+        oldToken: original.claimToken,
+        newToken: after?.claimToken,
+      }
+      const expected = { submits: 0, oldEpoch: 1, newEpoch: 2, interrupts: 0 }
+      reportContract('C-persist-resume-after-fence-takeover', expected, actual)
+      assert.equal(actual.submits, 0, 'stale owner must not start submit after pending persistence resolves')
+      assert.equal(actual.oldEpoch, 1)
+      assert.equal(actual.newEpoch, 2)
+      assert.notEqual(after?.claimToken, original.claimToken)
+      assert.equal(interrupted.length, 0, 'old owner must not interrupt the new owner session')
+    } finally {
+      persistGate.resolve()
+      sched.stop()
+      storeA.close()
+      storeB?.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 
-    sched.stop()
-    persistGate.resolve()
-    await tickP
-    assert.equal(submits, 0, 'stopped scheduler must not enter sessions.submit')
-    assert.equal(sched.activeExecutionHeartbeatCount, 0)
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
+  it('persistLastRun barrier then reaper closeout must not submit', { timeout: 15_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-cron-sched-reap-'))
+    let now = 1_000_000
+    const store = openStore(dir, { now: () => now })
+    const persistStarted = deferred()
+    const persistGate = deferred()
+    let submits = 0
+    const interrupted: string[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: { sessionKey: string }) => ({ sessionKey: opts.sessionKey }),
+        submit: async () => {
+          submits++
+        },
+        destroySession: async () => {},
+        interrupt: (key: string) => {
+          interrupted.push(key)
+          return true
+        },
+      } as any,
+      async () => {},
+    )
+    try {
+      writeDueJob()
+      sched.delegateJobs = store
+      const origPersist = (sched as any).persistLastRun.bind(sched)
+      ;(sched as any).persistLastRun = async (value: Record<string, number>) => {
+        persistStarted.resolve()
+        await persistGate.promise
+        return origPersist(value)
+      }
+      const tickP = (sched as any).tick() as Promise<void>
+      await persistStarted.promise
+      const original = store.listRunning()[0]
+      assert.ok(original)
+      const activityBefore = original.lastActivityAt
+      now += 31 * 60_000
+      const reaped = store.reapStaleRunning({ timeoutMs: 30 * 60_000 })
+      persistGate.resolve()
+      await tickP
+      const after = store.snapshotOf(original.id)
+      const actual = {
+        submits,
+        interrupts: interrupted.length,
+        reaped: reaped.length,
+        failureClass: reaped[0]?.job.failureClass,
+        currentState: after?.state,
+        activityBefore,
+        activityAfter: after?.lastActivityAt,
+        logicalTime: now,
+        fenceEpoch: original.fencingEpoch,
+      }
+      reportContract(
+        'C-persist-resume-after-reaper',
+        { submits: 0, reaped: 1, failureClass: 'heartbeat_timeout' },
+        actual,
+      )
+      assert.equal(actual.submits, 0)
+      assert.equal(actual.reaped, 1)
+      assert.equal(actual.failureClass, 'heartbeat_timeout')
+    } finally {
+      persistGate.resolve()
+      sched.stop()
+      store.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('execution-boundary sqlite error must not start submit or look like a fence reject', { timeout: 15_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-cron-sched-dberr-'))
+    let now = 1_000_000
+    const store = openStore(dir, { now: () => now })
+    const persistStarted = deferred()
+    const persistGate = deferred()
+    let submits = 0
+    const interrupted: string[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: { sessionKey: string }) => ({ sessionKey: opts.sessionKey }),
+        submit: async () => {
+          submits++
+        },
+        destroySession: async () => {},
+        interrupt: (key: string) => {
+          interrupted.push(key)
+          return true
+        },
+      } as any,
+      async () => {},
+    )
+    try {
+      writeDueJob()
+      sched.delegateJobs = store
+      const origPersist = (sched as any).persistLastRun.bind(sched)
+      ;(sched as any).persistLastRun = async (value: Record<string, number>) => {
+        persistStarted.resolve()
+        await persistGate.promise
+        return origPersist(value)
+      }
+      const tickP = (sched as any).tick() as Promise<void>
+      await persistStarted.promise
+      const original = store.listRunning()[0]
+      assert.ok(original)
+      const activityBefore = original.lastActivityAt
+      store.injectDurableWriteFailure()
+      persistGate.resolve()
+      await tickP
+      const after = store.snapshotOf(original.id)
+      const actual = {
+        submits,
+        interrupts: interrupted.length,
+        currentState: after?.state,
+        activityBefore,
+        activityAfter: after?.lastActivityAt,
+        fenceEpoch: after?.fencingEpoch,
+        logicalTime: now,
+      }
+      reportContract(
+        'C-persist-resume-sqlite-error',
+        { submits: 0, interrupts: 0, stolen: false },
+        actual,
+      )
+      assert.equal(actual.submits, 0, 'sqlite throw at submit boundary must not start the model')
+      assert.equal(actual.interrupts, 0, 'sqlite throw is not a fence reject')
+      assert.equal(after?.claimToken, original.claimToken, 'must not re-claim or steal the fence')
+    } finally {
+      persistGate.resolve()
+      sched.stop()
+      store.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('submit success then hung destroy does not keep renewing', async () => {
@@ -405,22 +672,39 @@ describe('OCV5-188 cron execution heartbeat — scheduler lifecycle', () => {
     }
 
     const tickP = (sched as any).tick() as Promise<void>
-    await claimed.promise
-    assert.equal(injects, 1)
-    assert.equal(submits, 0)
-    assert.equal(sched.activeExecutionHeartbeatCount, 0)
-    const running = store.listRunning()
-    assert.equal(running.length, 1)
-    const frozen = running[0]!.lastActivityAt
-    clock.beats(12)
-    assert.equal(store.snapshotOf(running[0]!.id)!.lastActivityAt, frozen)
-    assert.equal(interrupted.length, 0)
-    archiveGate.resolve()
-    await tickP
-    assert.equal(submits, 0)
-    assert.equal(sched.activeExecutionHeartbeatCount, 0)
-    store.close()
-    rmSync(dir, { recursive: true, force: true })
+    try {
+      await claimed.promise
+      assert.equal(submits, 0)
+      assert.equal(sched.activeExecutionHeartbeatCount, 0)
+      const running = store.listRunning()
+      assert.equal(running.length, 1)
+      const frozen = running[0]!.lastActivityAt
+      clock.beats(12)
+      assert.equal(store.snapshotOf(running[0]!.id)!.lastActivityAt, frozen)
+      assert.equal(interrupted.length, 0)
+      archiveGate.resolve()
+      await tickP
+      reportContract(
+        'C-origin-no-local-hb',
+        { submits: 0, heartbeats: 0, interrupts: 0 },
+        {
+          submits,
+          injects,
+          heartbeats: sched.activeExecutionHeartbeatCount,
+          interrupts: interrupted.length,
+          activityBefore: frozen,
+          activityAfter: store.snapshotOf(running[0]!.id)?.lastActivityAt,
+          logicalTime: now,
+        },
+      )
+      assert.equal(submits, 0)
+      assert.equal(sched.activeExecutionHeartbeatCount, 0)
+    } finally {
+      archiveGate.resolve()
+      sched.stop()
+      store.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('stop during submit stops renewal; queued callback and the next due job cannot start', async () => {
@@ -479,6 +763,17 @@ describe('OCV5-188 cron execution heartbeat — scheduler lifecycle', () => {
     assert.equal(interrupted.length, 0)
     const lateTick = (sched as any).tick() as Promise<void>
     await lateTick
+    reportContract(
+      'C-stop-next-job',
+      { submits: 1, interrupts: 0 },
+      {
+        submits,
+        interrupts: interrupted.length,
+        activityBefore: beforeStop,
+        activityAfter: store.snapshotOf(jobId)?.lastActivityAt,
+        logicalTime: now,
+      },
+    )
     assert.equal(submits, 1, 'a tick queued after stop must not start work')
     store.close()
     rmSync(dir, { recursive: true, force: true })
@@ -524,19 +819,35 @@ async function assertDestroyBarrier(
   sched.heartbeatClearInterval = clock.clearInterval as typeof clearInterval
 
   const tickP = (sched as any).tick() as Promise<void>
-  await destroyStarted.promise
-  assert.equal(sched.activeExecutionHeartbeatCount, 0, 'heartbeat must stop before destroy')
-  const row = store.listNonTerminal()[0]
-  assert.ok(row, 'row still exists while destroy is pending')
-  const frozen = row.lastActivityAt
-  clock.beats(10)
-  const after = store.snapshotOf(row.id)
-  assert.equal(after?.lastActivityAt, frozen, 'destroy barrier must not be covered by heartbeat writes')
-  assert.equal(interrupted.length, 0)
-  destroyGate.resolve()
-  await tickP
-  store.close()
-  rmSync(dir, { recursive: true, force: true })
+  try {
+    await destroyStarted.promise
+    assert.equal(sched.activeExecutionHeartbeatCount, 0, 'heartbeat must stop before destroy')
+    const row = store.listNonTerminal()[0]
+    assert.ok(row, 'row still exists while destroy is pending')
+    const frozen = row.lastActivityAt
+    clock.beats(10)
+    const after = store.snapshotOf(row.id)
+    reportContract(
+      `C-destroy-barrier-${_label}`,
+      { heartbeats: 0, interrupts: 0 },
+      {
+        heartbeats: sched.activeExecutionHeartbeatCount,
+        interrupts: interrupted.length,
+        activityBefore: frozen,
+        activityAfter: after?.lastActivityAt,
+        logicalTime: now,
+      },
+    )
+    assert.equal(after?.lastActivityAt, frozen, 'destroy barrier must not be covered by heartbeat writes')
+    assert.equal(interrupted.length, 0)
+    destroyGate.resolve()
+    await tickP
+  } finally {
+    destroyGate.resolve()
+    sched.stop()
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 class HangRunner extends EventEmitter {
@@ -689,6 +1000,7 @@ describe('OCV5-188 SessionManager idle / 12h wiring still owns the deadline', ()
       now += 2 * 60 * 60_000
       waitTimer.fn()
       await new Promise((r) => setImmediate(r))
+      const waitingSettledAfter2h = waitSettled
       assert.equal(waitSettled, false, 'waiting turn must not idle-timeout at 2h')
       assert.equal(waitEvents.length, 0)
       now = started + AUTHORITY_TURN_MAX_LIFETIME_MS
@@ -697,6 +1009,17 @@ describe('OCV5-188 SessionManager idle / 12h wiring still owns the deadline', ()
       assert.ok(
         waitEvents.some((msg) => msg.includes('12 小时') || msg.includes('上限')),
         `12h hard limit must still fire while waiting, got ${JSON.stringify(waitEvents)}`,
+      )
+      reportContract(
+        'C-sm-idle-12h',
+        { layer: 'session-manager-submit', idleTripped: true, waitingSkips2h: true, hardLimitAt12h: true },
+        {
+          layer: 'session-manager-submit',
+          notCronSchedulerSubmit: true,
+          idleEvents,
+          waitEvents,
+          waitingSettledAfter2h,
+        },
       )
     } finally {
       Date.now = origNow

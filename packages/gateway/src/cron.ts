@@ -807,12 +807,16 @@ export type CronDelegateHeartbeat = {
   beats: () => number
 }
 
-/** Thrown when a stopped scheduler refuses to start local execution. */
+/** Thrown when local execution must not start (stopped scheduler or lost fence). */
 export class CronExecutionRejectedError extends Error {
-  readonly code = 'SCHEDULER_STOPPED'
-  constructor(message = 'cron scheduler is stopped') {
+  readonly code: 'SCHEDULER_STOPPED' | 'FENCE_REJECTED'
+  constructor(
+    message = 'cron scheduler is stopped',
+    code: 'SCHEDULER_STOPPED' | 'FENCE_REJECTED' = 'SCHEDULER_STOPPED',
+  ) {
     super(message)
     this.name = 'CronExecutionRejectedError'
+    this.code = code
   }
 }
 
@@ -1746,6 +1750,26 @@ export class CronScheduler {
                     const sessionKey =
                       record?.sessionKey ??
                       `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`
+                    // Confirm the claim-time fence still owns the durable row
+                    // immediately before submit. No await sits between this
+                    // CAS and sessions.submit. A stale owner must not start
+                    // work or interrupt the new owner's session.
+                    let owned = false
+                    try {
+                      owned = this.delegateJobs.touchActivity(jobId, cronClaimFence)
+                    } catch (err) {
+                      logger.warn(`job ${job.id} execution fence touch failed`, {
+                        jobId: job.id,
+                        errorClass: stableCronErrorClass(err),
+                      })
+                      throw err
+                    }
+                    if (!owned) {
+                      throw new CronExecutionRejectedError(
+                        'cron execution fence is no longer valid',
+                        'FENCE_REJECTED',
+                      )
+                    }
                     cronHeartbeat = this.registerExecutionHeartbeat(
                       startCronDelegateHeartbeat({
                         store: this.delegateJobs,
@@ -2517,16 +2541,22 @@ export class CronScheduler {
           }),
         )
     }
-    if (
-      submitError instanceof CronExecutionRejectedError ||
-      (typeof submitError === 'object' &&
-        submitError !== null &&
-        (submitError as { code?: unknown }).code === 'SCHEDULER_STOPPED')
-    ) {
-      logger.warn(`job ${job.id} skipped submit because scheduler is stopped`, {
+    if (submitError instanceof CronExecutionRejectedError) {
+      logger.warn(`job ${job.id} skipped submit`, {
         jobId: job.id,
+        code: submitError.code,
       })
-      return { kind: 'terminal_failure', code: 'SCHEDULER_STOPPED' }
+      return { kind: 'terminal_failure', code: submitError.code }
+    }
+    if (
+      typeof submitError === 'object' &&
+      submitError !== null &&
+      ((submitError as { code?: unknown }).code === 'SCHEDULER_STOPPED' ||
+        (submitError as { code?: unknown }).code === 'FENCE_REJECTED')
+    ) {
+      const code = (submitError as { code: 'SCHEDULER_STOPPED' | 'FENCE_REJECTED' }).code
+      logger.warn(`job ${job.id} skipped submit`, { jobId: job.id, code })
+      return { kind: 'terminal_failure', code }
     }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
