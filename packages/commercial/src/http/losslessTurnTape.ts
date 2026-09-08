@@ -383,6 +383,21 @@ function parseAgentGroups(obj: Record<string, unknown>): Array<Record<string, un
 }
 
 /** Strictly validates routing/identity fields while leaving generated content unbounded. */
+/** Stable fingerprint of one agent-group envelope. Internal ordinals are not content. */
+export function canonicalAgentGroupFingerprint(group: Record<string, unknown>): string {
+  const json = JSON.stringify(group, (key, current) => {
+    if (key === "_ocEventOrdinal") return undefined;
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current;
+    const sorted: Record<string, unknown> = {};
+    for (const next of Object.keys(current as Record<string, unknown>).sort()) {
+      sorted[next] = (current as Record<string, unknown>)[next];
+    }
+    return sorted;
+  });
+  if (json === undefined) throw new Error("agent group is not JSON serializable");
+  return createHash("sha256").update("oc-late-delegate-root-v1\0").update(json).digest("hex");
+}
+
 export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (!isObject(raw)) throw new Error("turn tape payload must be an object");
   const sessionId = requiredString(raw, "sessionId");
