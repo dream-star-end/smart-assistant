@@ -3869,6 +3869,138 @@
           "assertion": "T21 真 WS 帧驱动真时间线:条目顺序、工具卡内容、思考折叠、终态清发送"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-CURSOR-EXTERNAL-BILLING",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "外接API每次HTTP实际执行曾复用client request id而少记账，模型完成后PG短断/进程退出缺持久恢复证据。现在server billingId按执行独立，单一FS outbox在模型前fsync intent、终态前封定reported usage和执行时plan，最终usage_records/credit_ledger幂等消费。未知用量不造零/不追历史。发布proof只验证28个FS/scanner/shortwrite与真实relay取消/错误证据；真实PG33场景承担账差/重进程/重试，连接故障与COMMIT回包未知边界不混称。",
+      "rootFixCommit": "f8bb8347",
+      "coverageCommits": [
+        "22b1b7f1",
+        "faff7c86",
+        "38cbc09f",
+        "705dd106",
+        "993e374c",
+        "91037927"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorExternalApiOutbox.test.ts",
+          "assertion": "scanOnce does not starve a later ready when the first settle exceeds the batch budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorExternalApiOutbox.test.ts",
+          "assertion": "OS RLIMIT_FSIZE short write fails intent and does not clobber an existing ready"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorExternalErrorEvidence.test.ts",
+          "assertion": "reported error frame persists only stable evidence and preserves wire error"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts",
+          "assertion": "F1: two HTTP with the same client id produce two usage rows"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts",
+          "assertion": "catalog/env/delist drift still charges the sealed plan"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts",
+          "assertion": "after COMMIT before unlink, a new process recovers existing and unlinks"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts",
+          "assertion": "two scanners do not double debit / keySpent / account success"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[cursor-external-billing] PASS — exact 28 no-PG FS/relay leaves; ledger/restart/retry verified separately in PR-2"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-FIND-NAVIGATION",
+      "occurredAt": "2026-09-08",
+      "severity": "P2",
+      "symptom": "长会话查找按原消息下标定位虚拟/合并后行而命中不可见；输入键残留滚动保护、查找栏真滚轮/触摸未取消pending导致迟到跳动。修复key到render坐标、有限邻域挂载和真实rect到位，查找区明确手势取消；保全局controller和画窗预算。真实Chromium同构App/生产CSS验证，不冒称线上完整登录E2E。",
+      "rootFixCommit": "6f95910d",
+      "coverageCommits": [
+        "8d653ecc",
+        "e7dd1335",
+        "e2ef8de2",
+        "fcfb5972"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/findInSession.test.ts",
+          "assertion": "按 key 映射到 coalesce 后的 renderIndex，不用原始下标"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/find-in-session.node-test.mjs",
+          "assertion": "tail-320-m0 keyboard.type then one click"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/find-in-session.node-test.mjs",
+          "assertion": "toolbar input/blank real wheel cancels pending"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/find-in-session.node-test.mjs",
+          "assertion": "same-session same-id same-length replace does not keep old pin"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/find-in-session.node-test.mjs",
+          "assertion": "2000-row peak budget, pin release, jumpToBottom"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CRON-EXECUTION-HEARTBEAT",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Cron心跳复用普通delegate480拍上限，健康任务在第481拍被误杀；claim/persist暂停被接管后旧owner仍可submit。现在心跳只覆盖真正本地submit，执行前既有touchActivity CAS核fence，提交结束/stop同步停续租，不改普通delegate480、SM idle或12h。发布复用既有runner精确12叶；Layer1真实scheduler/SQLite+合成submit，Layer2真实SM/HangRunner，不声称模型E2E。",
+      "rootFixCommit": "b67cb890",
+      "coverageCommits": [
+        "fe758be5",
+        "5e7ff0c2",
+        "25a1cdee",
+        "c3214a6a"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
+          "assertion": "tick→claim→synthetic submit keeps a healthy occurrence alive across 481 injected 15s beats"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
+          "assertion": "persistLastRun barrier then second-store adopt must not submit as the old owner"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
+          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cron-submit-boundary.ts",
+          "assertion": "contractId: 'C-cron-submit-boundary-behavior'"
+        }
+      ]
     }
   ]
 }
