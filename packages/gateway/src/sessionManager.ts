@@ -4,6 +4,7 @@ import { rename, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import {
   resolveRuntimeExecutionAgent,
+  IdentityAssetsError,
   type IdentityCompatRuntimeContext,
   type AgentDef,
   type OpenClaudeConfig,
@@ -3741,6 +3742,13 @@ export class SessionManager {
     const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
       requireAuthority: isModelAuthorityRequired(),
     })
+    // CCB consumes --permission-mode. The other current engine adapters run
+    // fixed full-auto/force and cannot truthfully enforce a narrower profile.
+    if (identity.context.assets && engineId !== 'ccb' &&
+      identity.context.assets.effectivePermissionMode !== undefined &&
+      identity.context.assets.effectivePermissionMode !== 'bypassPermissions') {
+      throw new IdentityAssetsError('COMPAT_PERMISSION_CONFLICT', 'COMPAT_PERMISSION_CONFLICT: selected engine cannot enforce the registered permission mode')
+    }
     let existing = this.sessions.get(opts.sessionKey)
     if (existing?._modelSwitchTransition) {
       const transition = existing._modelSwitchTransition
@@ -3970,7 +3978,9 @@ export class SessionManager {
       persona,
       identityCompat: opts.hermeticNoTools ? undefined : identity.context,
       model: executionModel,
-      permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
+      permissionMode: identity.context.assets
+        ? identity.context.assets.effectivePermissionMode
+        : opts.agent.permissionMode ?? this.config.defaults.permissionMode,
       agentProvider: opts.agent.provider,
       agentMcpServers: opts.agent.mcpServers,
       agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
@@ -4707,6 +4717,14 @@ export class SessionManager {
       )
       if (admission.agent.id !== session.agentId) {
         throw new Error('COMPAT_CONFIG_CONFLICT: runner identity changed; reopen this session')
+      }
+      if (admission.context.assets && session.providerTag !== 'ccb' &&
+        admission.context.assets.effectivePermissionMode !== undefined &&
+        admission.context.assets.effectivePermissionMode !== 'bypassPermissions') {
+        throw new IdentityAssetsError('COMPAT_PERMISSION_CONFLICT', 'COMPAT_PERMISSION_CONFLICT: selected engine cannot enforce the registered permission mode')
+      }
+      if (admission.context.assets && session._identityAgentFingerprint !== JSON.stringify(admission.agent)) {
+        throw new Error('COMPAT_CONFIG_CONFLICT: execution configuration changed while awaiting the safe turn boundary; retry')
       }
       if (session._identityCompat) {
         const changed = session._identityCompat.fingerprint !== admission.context.fingerprint

@@ -2069,6 +2069,10 @@ export class CronScheduler {
       if (injectAcked) {
         result = { kind: 'injected' }
       } else {
+        // This is a NEW scheduled execution even when it resumes an old parent.
+        // Already-ACKed delivery recovery above is not a new execution and must
+        // remain settleable after uninstall/readiness loss.
+        await resolveRuntimeExecutionAgent({ id: job.agent })
         if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
         if (!useLegacyLeg) {
           result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')

@@ -204,3 +204,52 @@ test('old parent progress keeps the original address and rejects wrong user/pare
   parent.userId = '4'
   assert.equal(gateway._resolveDelegateProgressTarget({ parentSessionKey: key, sourceAgent: profile.legacyAgentId }), null)
 })
+
+
+test('origin cron rejects unavailable new execution but settles an already-ACKed occurrence', async () => {
+  const sm = manager(); let fires = 0
+  const scheduler: any = new CronScheduler(config, sm, async () => {}, async () => { fires++; return { kind: 'injected' } })
+  const job = { id: 'old-origin-job', schedule: '* * * * *', agent: profile.legacyAgentId, prompt: 'continue original conversation', resume: 'origin-session', sourceSessionKey: 'agent:old-fixture:webchat:dm:original', deliver: 'local' }
+  const hooks = { async consumeOccurrence() {}, async markSubmitStarted() {}, async stageDelivery() {}, async markCompleted() {}, async markDelivered() {} }
+  const delivery = { dueMinuteKey: 100, deliveryId: 'old-origin-delivery' }
+  projection.profiles[0].readiness = 'unavailable'
+  const rejected = await scheduler.runJob(job, agents[0], hooks, delivery)
+  assert.equal(rejected.kind, 'retryable_failure'); assert.equal(fires, 0); assert.equal(executed.length, 0)
+  scheduler.resolveCronDelegateJobId = () => 'already-delivered'
+  scheduler.delegateJobs = { snapshotOf: () => ({ callbackState: 'delivered' }) }
+  status = 503
+  const settled = await scheduler.runJob(job, agents[0], hooks, delivery)
+  assert.deepEqual(settled, { kind: 'completed' }); assert.equal(fires, 0); assert.equal(executed.length, 0)
+})
+
+
+test('permission executes the same fresh disk-default value the asset contract validated', async () => {
+  const sm = manager()
+  await writeFile(join(home, 'openclaude.json'), JSON.stringify({ ...config, defaults: { ...config.defaults, permissionMode: 'bypassPermissions' } }))
+  const session = await sm.getOrCreate({ sessionKey: 'agent:old-fixture:webchat:dm:permission-fresh', agent: agents[0] })
+  assert.equal((session.runner as any).opts.permissionMode, 'bypassPermissions')
+  assert.equal(sm.config.defaults.permissionMode, 'default', 'fixture really has an old in-memory default')
+  await sm.submit(session, 'first', () => {})
+  await writeFile(join(home, 'openclaude.json'), JSON.stringify({ ...config, defaults: { model: 'glm-5.2' } }))
+  const refreshed = await sm.getOrCreate({ sessionKey: session.sessionKey, agent: agents[0] })
+  assert.equal((refreshed.runner as any).opts.permissionMode, undefined, 'undefined authoritative mode must not fall back to stale in-memory defaults')
+})
+
+test('registered narrower permission rejects a fixed-full-auto engine before any run', async () => {
+  const sm = manager()
+  for (const agent of agents) {
+    await assert.rejects(sm.getOrCreate({ sessionKey: `agent:${agent.id}:webchat:dm:restricted-codex`, agent, model: 'gpt-5.6-sol' }), /COMPAT_PERMISSION_CONFLICT/)
+  }
+  const session = await sm.getOrCreate({ sessionKey: 'agent:old-fixture:webchat:dm:restricted-warm', agent: agents[0] })
+  await assert.rejects(sm.submit(session, 'do not start fixed-auto', () => {}, undefined, 'gpt-5.6-sol'), /COMPAT_PERMISSION_CONFLICT/)
+  assert.equal(executed.length, 0)
+})
+
+
+test('permission change after preflight cannot execute a warm runner with stale permissions', async () => {
+  const sm = manager(); const session = await sm.getOrCreate({ sessionKey: 'agent:old-fixture:webchat:dm:permission-race', agent: agents[0] })
+  session._identityCreationOpts = undefined
+  await writeFile(join(home, 'openclaude.json'), JSON.stringify({ ...config, defaults: { ...config.defaults, permissionMode: 'bypassPermissions' } }))
+  await assert.rejects(sm.submit(session, 'must not use old-mode', () => {}), /COMPAT_CONFIG_CONFLICT/)
+  assert.equal(executed.length, 0)
+})

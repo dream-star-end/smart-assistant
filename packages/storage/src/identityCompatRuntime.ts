@@ -44,8 +44,8 @@ export async function resolveRuntimeExecutionAgent(
     // Preserve a caller's already-capped execution overrides ONLY when it already
     // resolved the canonical definition. Legacy fields are not execution authority.
     agent: requested.id === canonical.id && Array.isArray(requested.toolsets)
-      ? { ...canonical, toolsets: requested.toolsets }
-      : canonical,
+      ? { ...canonical, toolsets: requested.toolsets, permissionMode: assets.effectivePermissionMode }
+      : { ...canonical, permissionMode: assets.effectivePermissionMode },
     context: { assets, fingerprint: `${JSON.stringify(resolution.profile)}:${soul.canonicalPersonaSha256}:${soul.localManualSha256}` },
   }
 }
