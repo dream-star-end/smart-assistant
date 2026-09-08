@@ -98,6 +98,7 @@ const pool = createPool({
 const uid = BigInt(uidStr);
 const accountId = BigInt(accountStr);
 const apiKeyId = BigInt(keyStr);
+let inferenceCalls = 0;
 let route: ReturnType<typeof makeCursorExternalRoute> | undefined;
 
 try {
@@ -173,6 +174,7 @@ try {
               headers: { "content-type": "application/json" },
             });
           }
+          if (String(input).includes("InferenceService")) inferenceCalls += 1;
           return new Response(Buffer.concat([...USAGE_FRAMES, envelope(Buffer.from("{}"), 0x02)]), {
             status: 200,
             headers: { "content-type": "application/connect+proto" },
@@ -197,6 +199,7 @@ try {
   process.stdout.write(
     `${JSON.stringify({
       ok: true,
+      inferenceCalls,
       observations: listing.observations.map((o) => o.kind),
       billingId: listing.observations.find((o) => o.kind === "ready" || o.kind === "intent")?.kind === "ready"
         ? (listing.observations.find((o) => o.kind === "ready") as { record: { billingId: string } }).record.billingId
@@ -206,7 +209,7 @@ try {
     })}\n`,
   );
 } catch (err) {
-  process.stdout.write(`${JSON.stringify({ ok: false, err: err instanceof Error ? err.message : String(err) })}\n`);
+  process.stdout.write(`${JSON.stringify({ ok: false, inferenceCalls, err: err instanceof Error ? err.message : String(err) })}\n`);
   process.exitCode = 0;
 } finally {
   try {

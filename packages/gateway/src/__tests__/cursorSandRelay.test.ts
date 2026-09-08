@@ -2382,6 +2382,144 @@ for (const pipe of [
   })
 }
 
+function invalidToolText(): string {
+  return '{"command":"printf ok"}\n\nFAKE_RESULT'
+}
+
+function retryFetch(firstReported: boolean): { fetchImpl: typeof fetch; calls: () => number } {
+  let calls = 0
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    calls += 1
+    if (calls === 1) {
+      const frames = [
+        responseFrame('textPart', { text: invalidToolText() }),
+        ...(firstReported
+          ? [responseFrame('extendedUsage', {
+              inputTokens: 8, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64,
+            })]
+          : []),
+        envelope(Buffer.from('{}'), 0x02),
+      ]
+      return new Response(Buffer.concat(frames), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+    }
+    let pulled = 0
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1
+        if (pulled === 1) {
+          controller.enqueue(responseFrame('extendedUsage', {
+            inputTokens: 40, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64,
+          }))
+          return
+        }
+        controller.error(new TypeError('terminated'))
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  return { fetchImpl, calls: () => calls }
+}
+
+const retryBody = {
+  model: 'cursor-fable-5.1-high',
+  stream: true as const,
+  max_tokens: 64,
+  messages: [{ role: 'user' as const, content: 'run it' }],
+  tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }],
+}
+
+for (const pipe of [
+  { name: 'native', extra: {} },
+  { name: 'buffered', extra: { bufferedStreaming: true as const } },
+]) {
+  for (const firstReported of [true, false]) {
+    test(`retry ${pipe.name} firstReported=${firstReported}: reader fault keeps retry usage`, async () => {
+      const { fetchImpl, calls } = retryFetch(firstReported)
+      const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+      const terms: Array<{ kind: string; usage?: { input_tokens: number; output_tokens: number } }> = []
+      try {
+        const res = new FakeServerResponse()
+        await assert.rejects(() => relay.serveMessages(
+          retryBody,
+          res as never,
+          new AbortController().signal,
+          {
+            ...pipe.extra,
+            onTerminal: async (ev) => {
+              terms.push({
+                kind: ev.evidence.kind,
+                usage: ev.evidence.kind === 'reported' ? ev.evidence.usage : undefined,
+              })
+            },
+          },
+        ))
+        assert.equal(calls(), 2)
+        assert.equal(terms.length, 1)
+        assert.equal(terms[0]?.kind, 'reported')
+        assert.equal(terms[0]?.usage?.input_tokens, firstReported ? 48 : 40)
+        assert.equal(terms[0]?.usage?.output_tokens, firstReported ? 13 : 7)
+      } finally {
+        await relay.close()
+      }
+    })
+  }
+}
+
+test('retry native success still reports combined usage once', async () => {
+  let calls = 0
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    calls += 1
+    if (calls === 1) {
+      return new Response(Buffer.concat([
+        responseFrame('textPart', { text: invalidToolText() }),
+        responseFrame('extendedUsage', { inputTokens: 8, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64 }),
+        envelope(Buffer.from('{}'), 0x02),
+      ]), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+    }
+    return new Response(Buffer.concat([
+      responseFrame('textPart', { text: 'fixed output' }),
+      responseFrame('extendedUsage', { inputTokens: 40, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64 }),
+      envelope(Buffer.from('{}'), 0x02),
+    ]), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+  try {
+    const res = new FakeServerResponse()
+    const terms: string[] = []
+    const result = await relay.serveMessages(
+      retryBody,
+      res as never,
+      new AbortController().signal,
+      { onTerminal: async (ev) => { terms.push(`${ev.evidence.kind}:${ev.evidence.kind === 'reported' ? ev.evidence.usage.input_tokens : 0}`) } },
+    )
+    assert.equal(result.kind, 'completed')
+    assert.equal(calls, 2)
+    assert.deepEqual(terms, ['reported:48'])
+    assert.match(res.text(), /event: message_stop/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('classifyRelayTerminalCode maps raw messages to stable codes', async () => {
+  const { classifyRelayTerminalCode } = await import('../engine/cursorSandRelay.js')
+  assert.equal(classifyRelayTerminalCode(new TypeError('terminated')), 'CURSOR_SAND_UPSTREAM_TERMINATED')
+  assert.equal(classifyRelayTerminalCode(Object.assign(new Error('AbortError'), { name: 'AbortError' })), 'CURSOR_SAND_ABORTED')
+  assert.equal(classifyRelayTerminalCode('CURSOR_SAND_RETRY_HTTP_502 extra'), 'CURSOR_SAND_RETRY_HTTP_502')
+  assert.equal(classifyRelayTerminalCode(new Error('secret=sk-live-abcdef prompt=do not persist')), 'CURSOR_SAND_UPSTREAM_ERROR')
+  assert.doesNotMatch(classifyRelayTerminalCode(new Error('secret=sk-live-abcdef')), /sk-live|prompt/)
+})
+
 test('default web callers without onTerminal keep original success semantics', async () => {
   const relay = serveRelay([
     responseFrame('textPart', { text: 'ok' }),

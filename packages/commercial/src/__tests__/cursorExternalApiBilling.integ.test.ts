@@ -225,6 +225,76 @@ const CANCEL_PARTIAL_FRAMES = [
   }),
 ];
 
+function retryCancelFetch(
+  firstReported: boolean,
+  res: FakeRes,
+  onCall?: () => void,
+): typeof fetch {
+  let calls = 0;
+  return (async (input, init) => {
+    if (String(input).includes("InferenceService")) onCall?.();
+    if (String(input).endsWith("/auth/exchange_user_api_key")) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    calls += 1;
+    if (calls === 1) {
+      const frames = [
+        responseFrame("textPart", { text: '{"command":"printf ok"}\n\nFAKE_RESULT' }),
+        ...(firstReported
+          ? [
+              responseFrame("extendedUsage", {
+                inputTokens: 8,
+                outputTokens: 6,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+                maxTokens: 64,
+              }),
+            ]
+          : []),
+        envelope(Buffer.from("{}"), 0x02),
+      ];
+      return new Response(Buffer.concat(frames), {
+        status: 200,
+        headers: { "content-type": "application/connect+proto" },
+      });
+    }
+    let n = 0;
+    const signal = (init as RequestInit | undefined)?.signal;
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (n++ === 0) {
+            controller.enqueue(
+              responseFrame("extendedUsage", {
+                inputTokens: 40,
+                outputTokens: 7,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+                maxTokens: 64,
+              }),
+            );
+            const onAbort = () => {
+              try {
+                controller.error(Object.assign(new Error("AbortError"), { name: "AbortError" }));
+              } catch {
+                /* already closed */
+              }
+            };
+            if (signal?.aborted) onAbort();
+            else signal?.addEventListener("abort", onAbort, { once: true });
+            setTimeout(() => res.hangUp(), 25);
+            return;
+          }
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/connect+proto" } },
+    );
+  }) as typeof fetch;
+}
+
 function hangingFetch(frames: Buffer[], onCall?: () => void): typeof fetch {
   return (async (input, init) => {
     if (String(input).includes("InferenceService")) onCall?.();
@@ -466,12 +536,13 @@ async function spawnBounded(
 async function lastUsageRow() {
   const row = await query<{
     request_id: string;
+    input_tokens: string;
     output_tokens: string;
     status: string;
     cost_credits: string;
     snapshot: string;
   }>(
-    `SELECT request_id, output_tokens::text, status, cost_credits::text,
+    `SELECT request_id, input_tokens::text, output_tokens::text, status, cost_credits::text,
             price_snapshot::text AS snapshot
        FROM usage_records WHERE user_id=$1 ORDER BY id DESC LIMIT 1`,
     [uid.toString()],
@@ -553,6 +624,92 @@ async function runCancelRoute(args: {
   return { listing, before, after, last, upstream, text: res.text() };
 }
 
+async function runRetryCancelRoute(args: {
+  firstReported: boolean;
+  buffered: boolean;
+}): Promise<{
+  listing: Awaited<ReturnType<CursorExternalApiOutbox["listBatch"]>>;
+  before: Awaited<ReturnType<typeof counts>>;
+  after: Awaited<ReturnType<typeof counts>>;
+  last: Awaited<ReturnType<typeof lastUsageRow>>;
+  upstream: number;
+  expectedPlan: ReturnType<typeof freezePreparedCursorSettlePlan>;
+}> {
+  const dir = await trackedTemp("ocv5-188-retry-cancel-");
+  const box = await openCursorExternalApiOutbox({ directory: dir });
+  let upstream = 0;
+  const res = new FakeRes();
+  const before = await counts(uid, accountId, apiKeyId);
+  const expectedUsage = {
+    input_tokens: args.firstReported ? 48 : 40,
+    output_tokens: args.firstReported ? 13 : 7,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+  const expectedPlan = freezePreparedCursorSettlePlan(
+    planCursorExternalSettle({
+      engineStatus: "error",
+      terminalCode: "USER_CANCELLED",
+      usage: mapCursorReportedUsage(expectedUsage),
+      pricingBasis: captureCursorPricingBasis(pricingRow()),
+    }),
+  );
+  const route = makeCursorExternalRoute({
+    pgPool: getPool(),
+    pricing: { get: () => pricingRow() } as unknown as PricingCache,
+    logger: quiet,
+    outbox: box,
+    forceBufferedStreaming: args.buffered,
+    listCursorAccounts: async () => [accountRow(accountId)],
+    loadSnapshot: async (id): Promise<CursorTokenSnapshot | null> => ({
+      id,
+      token: Buffer.from("crsr_test"),
+      credential_kind: "api_key",
+      machine_id: null,
+      refresh: null,
+      expires_at: null,
+    }),
+    readBalance: async () => 1_000_000n,
+    relayFactory: (relayArgs) =>
+      new CursorSandRelay({
+        credentialKind: relayArgs.credentialKind,
+        machineId: relayArgs.machineId,
+        readApiKey: relayArgs.readApiKey,
+        fetchImpl: retryCancelFetch(args.firstReported, res, () => {
+          upstream += 1;
+        }),
+        passthrough: null,
+        upstreamLabel: "Upstream",
+      }),
+  });
+  await route.handle({
+    req: { method: "POST", headers: {}, url: "/v1/messages" } as IncomingMessage,
+    res: res as unknown as ServerResponse,
+    requestId: "client-retry-cancel",
+    uid,
+    identity: { uid, containerId: null, apiKey: { id: apiKeyId, creditLimit: null, spentCredits: 0n } } as ProxyIdentity,
+    body: {
+      model: MODEL,
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: "user", content: "run it" }],
+      tools: [
+        {
+          name: "Bash",
+          input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+        },
+      ],
+    } as never,
+    authorize: async () => {},
+    userLog: quiet,
+  });
+  await route.close();
+  const listing = await box.listBatch({ limit: 8 });
+  const after = await counts(uid, accountId, apiKeyId);
+  const last = await lastUsageRow();
+  return { listing, before, after, last, upstream, expectedPlan };
+}
+
 let uid: bigint;
 let accountId: bigint;
 let apiKeyId: bigint;
@@ -631,6 +788,10 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     "cancel-partial-nonstream",
     "cancel-zero-nonstream",
     "cancel-unobserved-nonstream",
+    "retry-cancel-native-first",
+    "retry-cancel-native-retryonly",
+    "retry-cancel-buffered-first",
+    "retry-cancel-buffered-retryonly",
     "after-commit-before-unlink",
     "route-pg-interrupt-recover",
     "old-source-f1-red",
@@ -767,6 +928,8 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
           && /^[0-9a-f]{32}$/.test(row.request_id)
           && row.output_tokens === "20"
           && snap.cursor_status === "error"
+          && snap.cursor_terminal_code === "CURSOR_SAND_UPSTREAM_TERMINATED"
+          && !JSON.stringify(snap).includes("TypeError")
           && after.ledgerDelta === before.ledgerDelta
           && after.keySpent === before.keySpent,
       });
@@ -839,6 +1002,7 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     const res = new FakeRes();
     res.throwOnStop = true;
     let upstream = 0;
+    const before = await counts(uid, accountId, apiKeyId);
     await runRoute({
       outbox: box,
       uid,
@@ -866,28 +1030,36 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
         record: readyObs.record,
         unlink: (id) => box.unlink(id),
       });
+      const after = await counts(uid, accountId, apiKeyId);
+      const rows = await query<{ n: string }>(
+        "SELECT count(*)::text AS n FROM usage_records WHERE user_id=$1 AND request_id=$2",
+        [uid.toString(), readyObs.record.billingId],
+      );
       record({
         id: "seal-wire-scanner",
-        expected: "no message_stop; in-request/scanner share one debit",
-        actual: `a=${a.disposition} b=${b.disposition} unlinked=${b.unlinked} stop=${!noStop} upstream=${upstream}`,
+        expected: "no message_stop; one usage row for this billingId; scanner does not double debit",
+        actual: `a=${a.disposition} b=${b.disposition} unlinked=${b.unlinked} stop=${!noStop} upstream=${upstream} usage ${before.usageN}->${after.usageN} n=${rows.rows[0]?.n}`,
         upstreamCalls: upstream,
         terminal: "wire_failed",
         phase: "ready",
         pass:
           noStop
           && upstream === 1
+          && after.usageN === before.usageN + 1
+          && rows.rows[0]?.n === "1"
           && (a.disposition === "new_commit" || a.disposition === "existing" || a.disposition === "commit_proven")
-          && (b.disposition === "existing" || b.disposition === "commit_proven" || b.disposition === "left"),
+          && (b.disposition === "existing" || b.disposition === "commit_proven"),
       });
     } else {
+      const after = await counts(uid, accountId, apiKeyId);
       record({
         id: "seal-wire-scanner",
-        expected: "no message_stop; in-request already consumed the sealed ready",
-        actual: `obs=${listing.observations.map((o) => o.kind).join(",")} stop=${!noStop} upstream=${upstream}`,
+        expected: "no message_stop; in-request already consumed one unique usage row",
+        actual: `obs=${listing.observations.map((o) => o.kind).join(",")} stop=${!noStop} upstream=${upstream} usage ${before.usageN}->${after.usageN}`,
         upstreamCalls: upstream,
         terminal: "wire_failed",
         phase: listing.observations[0]?.kind ?? "unlinked",
-        pass: noStop && upstream === 1,
+        pass: noStop && upstream === 1 && after.usageN === before.usageN + 1,
       });
     }
   });
@@ -946,13 +1118,24 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
       unlink: (id) => box.unlink(id),
     });
     process.env[CURSOR_SETTLE_SURCHARGE_ENV] = "1.000";
+    const row = await query<{ cost: string; snapshot: string }>(
+      `SELECT cost_credits::text AS cost, price_snapshot::text AS snapshot
+         FROM usage_records WHERE user_id=$1 AND request_id=$2`,
+      [uid.toString(), ready.billingId],
+    );
+    const snap = JSON.parse(row.rows[0]?.snapshot ?? "{}") as { model_id?: string };
     record({
       id: "price-drift",
-      expected: `costCredits=${original.costCredits} despite catalog/env change`,
-      actual: `disposition=${consumed.disposition} cost row uses sealed plan`,
+      expected: `costCredits=${original.costCredits} snapshot model ${MODEL} despite catalog/env change`,
+      actual: `disposition=${consumed.disposition} sqlCost=${row.rows[0]?.cost ?? "missing"} snapModel=${snap.model_id ?? ""}`,
       upstreamCalls: 0,
       phase: "ready",
-      pass: consumed.disposition === "new_commit" && consumed.settled !== null && original.costCredits !== "0",
+      pass:
+        consumed.disposition === "new_commit"
+        && consumed.settled !== null
+        && original.costCredits !== "0"
+        && row.rows[0]?.cost === original.costCredits
+        && snap.model_id === MODEL,
     });
   });
 
@@ -1346,6 +1529,49 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     });
   }
 
+  for (const pipe of [
+    { name: "native", buffered: false },
+    { name: "buffered", buffered: true },
+  ]) {
+    for (const firstReported of [true, false]) {
+      const id = `retry-cancel-${pipe.name}-${firstReported ? "first" : "retryonly"}`;
+      test(`${pipe.name} retry USER_CANCELLED firstReported=${firstReported} settles combined usage`, async () => {
+        const got = await runRetryCancelRoute({ firstReported, buffered: pipe.buffered });
+        const snap = JSON.parse(got.last?.snapshot ?? "{}") as {
+          cursor_status?: string;
+          cursor_terminal_code?: string;
+        };
+        const ledgerDelta = BigInt(got.after.ledgerDelta) - BigInt(got.before.ledgerDelta);
+        const spentDelta = BigInt(got.after.keySpent) - BigInt(got.before.keySpent);
+        const expectIn = firstReported ? "48" : "40";
+        const expectOut = firstReported ? "13" : "7";
+        record({
+          id,
+          expected: `USER_CANCELLED usage+1 in=${expectIn} out=${expectOut} cost=${got.expectedPlan.costCredits}; ledgerΔ=-cost; keySpent+=cost; 2 inferences`,
+          actual: `usage ${got.before.usageN}->${got.after.usageN} in=${got.last?.input_tokens} out=${got.last?.output_tokens} status=${got.last?.status} snap=${JSON.stringify(snap)} cost=${got.last?.cost_credits} expectedCost=${got.expectedPlan.costCredits} ledgerΔ=${ledgerDelta} spentΔ=${spentDelta} obs=${got.listing.observations.map((o) => o.kind).join(",")} upstream=${got.upstream} billing=${got.last?.request_id}`,
+          upstreamCalls: got.upstream,
+          terminal: "USER_CANCELLED",
+          usage: got.after,
+          ledger: got.after.ledgerDelta,
+          pass:
+            got.upstream === 2
+            && got.after.usageN === got.before.usageN + 1
+            && got.last?.input_tokens === expectIn
+            && got.last?.output_tokens === expectOut
+            && /^[0-9a-f]{32}$/.test(got.last?.request_id ?? "")
+            && snap.cursor_status === "error"
+            && snap.cursor_terminal_code === "USER_CANCELLED"
+            && got.last?.cost_credits === got.expectedPlan.costCredits
+            && got.expectedPlan.costCredits !== "0"
+            && ledgerDelta === -BigInt(got.expectedPlan.costCredits)
+            && spentDelta === BigInt(got.expectedPlan.costCredits)
+            && !JSON.stringify(snap).includes("sk-")
+            && !JSON.stringify(got.last?.snapshot ?? "").includes("FAKE_RESULT"),
+        });
+      });
+    }
+  }
+
   test("after COMMIT before unlink, a new process recovers existing and unlinks", async () => {
     const dir = await trackedTemp("ocv5-188-aftercommit-");
     const box = await openCursorExternalApiOutbox({ directory: dir });
@@ -1451,6 +1677,13 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
       [appName],
     ).catch(() => undefined);
     const child = await childP;
+    let childUpstream = 0;
+    try {
+      const parsed = JSON.parse(child.stdout.trim().split("\n").at(-1) || "{}") as { inferenceCalls?: number };
+      childUpstream = Number(parsed.inferenceCalls ?? 0);
+    } catch {
+      childUpstream = 0;
+    }
     const leftover = await (await openCursorExternalApiOutbox({ directory: dir })).listBatch({ limit: 8 });
     const recovered = (await recoverWorker(dir)) as {
       consumed: Array<{ billingId: string; disposition: string; unlinked: boolean; debited: string | null }>;
@@ -1481,8 +1714,8 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     record({
       id: "route-pg-interrupt-recover",
       expected: "real route left ready/intent after dedicated-pool kill; new process recovered same billingId once; usage+1 no double debit",
-      actual: `child=${child.code} leftover=${leftover.observations.map((o) => o.kind).join(",")} recovered=${JSON.stringify(recovered)} usage ${before.usageN}->${after.usageN} ledger ${before.ledgerDelta}->${after.ledgerDelta} spent ${before.keySpent}->${after.keySpent} success ${before.success}->${after.success} rows=${JSON.stringify(usageRows.rows)} gone=${gone?.phase ?? "unlinked"} app=${appName}`,
-      upstreamCalls: 1,
+      actual: `child=${child.code} leftover=${leftover.observations.map((o) => o.kind).join(",")} recovered=${JSON.stringify(recovered)} usage ${before.usageN}->${after.usageN} ledger ${before.ledgerDelta}->${after.ledgerDelta} spent ${before.keySpent}->${after.keySpent} success ${before.success}->${after.success} rows=${JSON.stringify(usageRows.rows)} gone=${gone?.phase ?? "unlinked"} app=${appName} inferenceCalls=${childUpstream}`,
+      upstreamCalls: childUpstream,
       usage: after,
       ledger: after.ledgerDelta,
       pass:

@@ -3,15 +3,19 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 import type { Logger } from "../logging/logger.js";
+import { classifyRelayTerminalCode } from "../../../gateway/src/engine/cursorSandRelay.js";
 import {
   cursorExternalApiOutboxDirForFlavor,
   openCursorExternalApiOutbox,
   SELFHOST_CURSOR_EXTERNAL_API_OUTBOX_DIR,
+  writeAllSync,
   type CursorExternalIntentRecord,
   type CursorExternalReadyRecord,
 } from "../billing/cursorExternalApiOutbox.js";
@@ -120,6 +124,40 @@ describe("cursorExternalApiOutbox FS", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  test("classified terminalCode is persisted without the raw error message", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-term-"));
+    try {
+      const box = await openCursorExternalApiOutbox({ directory: dir });
+      const secret = "secret=sk-live-test-188 prompt=do-not-store";
+      const code = classifyRelayTerminalCode(new Error(secret));
+      await box.writeReady(ready({ terminalCode: code }));
+      const raw = await readFile(path.join(dir, `${BILLING}.json`), "utf8");
+      assert.equal(JSON.parse(raw).terminalCode, "CURSOR_SAND_UPSTREAM_ERROR");
+      assert.doesNotMatch(raw, /sk-live-test-188|do-not-store|secret=/);
+      assert.doesNotMatch(code, /sk-live|prompt/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("writeAllSync resumes after a short write and fails closed on zero progress", () => {
+    const bytes = Buffer.from("hello-outbox-write");
+    const chunks: Buffer[] = [];
+    let calls = 0;
+    writeAllSync(99, bytes, (_fd, buf, offset, length) => {
+      calls += 1;
+      if (calls === 1) {
+        const n = Math.min(5, length);
+        chunks.push(Buffer.from(buf.buffer, buf.byteOffset + offset, n));
+        return n;
+      }
+      chunks.push(Buffer.from(buf.buffer, buf.byteOffset + offset, length));
+      return length;
+    });
+    assert.equal(Buffer.concat(chunks).toString(), "hello-outbox-write");
+    assert.throws(() => writeAllSync(99, bytes, () => 0), /short write/);
   });
 
   test("unwritable directory fails open and does not fall back to the selfhost path", async () => {
@@ -360,6 +398,79 @@ describe("cursorExternalApiOutbox startScanner lifecycle", () => {
         assert.equal(batch.observations.some((o) => o.file === `${firstId}.json`), false);
       }
       assert.equal(sawAdded, true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("scanOnce does not starve a later ready when the first settle exceeds the batch budget", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-starve-"));
+    const realNow = Date.now;
+    let shift = 0;
+    try {
+      Date.now = () => realNow() + shift;
+      const box = await openCursorExternalApiOutbox({ directory: dir });
+      await box.writeReady(ready({ billingId: "a".repeat(32) }));
+      await box.writeReady(ready({ billingId: "b".repeat(32) }));
+      const order = (await box.listBatch({ limit: 32 })).observations
+        .filter((o) => o.kind === "ready")
+        .map((o) => o.kind === "ready" ? o.record.billingId : "");
+      const first = order[0]!;
+      const second = order[1]!;
+      const box2 = await openCursorExternalApiOutbox({ directory: dir });
+      const calls: string[] = [];
+      for (let i = 0; i < 4; i += 1) {
+        await box2.scanOnce({
+          pool: {} as never,
+          pricing: { get: () => null } as never,
+          settle: async (args) => {
+            calls.push(args.requestId);
+            if (args.requestId === first) {
+              shift += 6_000;
+              return null;
+            }
+            return {
+              usageId: 1n,
+              ledgerId: 2n,
+              clamped: false,
+              debitedCredits: 1n,
+              attributionCredits: 0n,
+              balanceAfter: 1n,
+              commitDisposition: "new_commit",
+            };
+          },
+        });
+      }
+      assert.ok(calls.includes(second), `second ready must be attempted, calls=${calls.join(",")}`);
+      assert.equal(await box2.read(second), null);
+    } finally {
+      Date.now = realNow;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("OS RLIMIT_FSIZE short write fails intent and does not clobber an existing ready", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-rlimit-"));
+    const worker = fileURLToPath(new URL("./helpers/cursorExternalApiShortwrite.worker.ts", import.meta.url));
+    const launch = (mode: string) =>
+      spawnSync(process.execPath, ["--import", "tsx", worker, dir, mode], { encoding: "utf8" });
+    try {
+      const intentRun = launch("intent");
+      const intentGot = JSON.parse(intentRun.stdout.trim() || "{}") as { resolved?: boolean; observations?: string[] };
+      assert.equal(intentGot.resolved, false, intentRun.stdout + intentRun.stderr);
+      assert.equal((intentGot.observations ?? []).includes("ready"), false);
+      assert.equal((intentGot.observations ?? []).includes("intent"), false);
+
+      const box = await openCursorExternalApiOutbox({ directory: dir });
+      await box.writeIntent(intent({ billingId: "a".repeat(32) }));
+      const before = await box.read("a".repeat(32));
+      assert.equal(before?.phase, "intent");
+      const readyRun = launch("ready");
+      const readyGot = JSON.parse(readyRun.stdout.trim().split("\n").at(-1) || "{}") as { resolved?: boolean };
+      assert.equal(readyGot.resolved, false, readyRun.stdout + readyRun.stderr);
+      const after = await box.read("a".repeat(32));
+      assert.equal(after?.phase, "intent");
+      assert.equal(JSON.stringify(after), JSON.stringify(before));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
