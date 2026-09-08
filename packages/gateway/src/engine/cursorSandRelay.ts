@@ -823,6 +823,13 @@ export function cursorSandPromptTooLongMessage(detail: string): string {
 function errorMessage(value: unknown): string {
   if (value && typeof value === 'object') {
     const record = value as JsonObject
+    // Preserve the *whole* upstream error object in the log. The composed
+    // string below keeps only message+code, which for some Sand faults is a
+    // bare "Error"; the raw object still carries errorType / details / debug
+    // fields that name the real cause (upstream timeout, capacity, etc.). No
+    // request content or credential rides in an error frame, so this is safe
+    // to emit verbatim (capped).
+    log.warn('cursor sand error frame', { raw: safeRaw(record) })
     const message = typeof record.message === 'string' ? record.message : 'Cursor Sand inference failed'
     const prefix = typeof record.code === 'string' && record.code
       ? record.code
@@ -837,6 +844,17 @@ function errorMessage(value: unknown): string {
   return 'Cursor Sand inference failed'
 }
 
+/** JSON-serialise an upstream error object for logs, capped so a pathological
+ * payload can't blow up a log line. Never carries request content/credentials. */
+function safeRaw(value: unknown): string {
+  try {
+    const text = typeof value === 'string' ? value : JSON.stringify(value)
+    return text.length > 1500 ? `${text.slice(0, 1500)}…` : text
+  } catch {
+    return String(value)
+  }
+}
+
 function parseEndTrailer(bytes: Buffer): string | null {
   if (bytes.length === 0) return null
   try {
@@ -844,6 +862,10 @@ function parseEndTrailer(bytes: Buffer): string | null {
     const error = parsed.error
     if (!error || typeof error !== 'object') return null
     const record = error as JsonObject
+    // Same rationale as errorMessage(): the gRPC-Web end trailer's error is
+    // where a mid-stream upstream fault lands as a bare "Error"; log the whole
+    // thing so the real reason (status/details) is recoverable.
+    log.warn('cursor sand end trailer error', { raw: safeRaw(record) })
     const message = typeof record.message === 'string' ? record.message : 'Cursor Sand transport error'
     return isCursorSandOverflow({ code: record.code, text: message })
       ? cursorSandPromptTooLongMessage(message)
@@ -1483,6 +1505,14 @@ export class CursorSandRelay {
       // Context overflow must reach CCB as "Prompt is too long" (413 or an
       // overflow body) so reactive compaction fires instead of a dead api_error.
       const bodyText = await upstream.text().then((text) => text.slice(0, 2000), () => '')
+      // The upstream HTTP status + body is the ground truth for a rejected open
+      // (429 capacity, 5xx, auth). It was only echoed as `CURSOR_SAND_HTTP_<n>`
+      // before, hiding the body; log it so operators see the real reason.
+      log.warn('cursor sand upstream http error', {
+        status: upstream.status,
+        body: safeRaw(bodyText),
+        upstreamModel: opened.upstreamModel,
+      })
       const overflow = isCursorSandOverflow({ status: upstream.status, text: bodyText })
       res.statusCode = overflow ? 413 : (upstream.status || 502)
       res.setHeader('content-type', 'application/json')
