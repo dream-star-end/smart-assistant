@@ -98,7 +98,7 @@ import {
   serializeVerificationSponsorshipSnapshot,
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
-import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
+import { settleDurableCursorBilling } from "../billing/durableCursorBilling.js";
 import {
   publishZcodeCatalogSettle,
   settleZcodeCatalogUsage,
@@ -158,6 +158,7 @@ import {
   type MessageReplyQuote,
   type DispatchRequestContent,
   type SessionWorkspaceMode,
+  type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
@@ -7599,24 +7600,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const pricing = deps.pricing;
               void (async () => {
                 try {
-                  const updated = await pool.query<{ model_id: string; session_id: string | null }>(
-                    `UPDATE cursor_external_usage_audit
-                        SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
-                      WHERE request_id=$1 AND user_id=$6 AND status='pending'
-                    RETURNING model_id, session_id`,
-                    [requestId, status, terminalCode, durationMs, usage, uid],
+                  // Read the audit identity without closing it: closing now
+                  // (the old UPDATE-first order) stranded audits whose settle
+                  // later failed — terminal status, no usage row, never
+                  // retried. settleDurableCursorBilling below closes the row
+                  // only after the settle commits; a pricing miss / PG failure
+                  // keeps it pending for the cursorAuditReconciler.
+                  const audit = await pool.query<{ model_id: string; session_id: string | null }>(
+                    `SELECT model_id, session_id FROM cursor_external_usage_audit
+                      WHERE request_id=$1 AND user_id=$2`,
+                    [requestId, uid],
                   );
-                  let modelId = updated.rows[0]?.model_id ?? null;
-                  let sessionId = updated.rows[0]?.session_id ?? null;
-                  if (modelId === null) {
-                    const existing = await pool.query<{ model_id: string; session_id: string | null }>(
-                      `SELECT model_id, session_id FROM cursor_external_usage_audit
-                        WHERE request_id=$1 AND user_id=$2`,
-                      [requestId, uid],
-                    );
-                    modelId = existing.rows[0]?.model_id ?? null;
-                    sessionId = existing.rows[0]?.session_id ?? sessionId;
-                  }
+                  const modelId = audit.rows[0]?.model_id ?? null;
+                  const sessionId = audit.rows[0]?.session_id ?? null;
                   let cursorAccountId: bigint | null = null;
                   const stableIdentityParts = [
                     external.cursorAccountId,
@@ -7687,32 +7683,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   } else if (!pricing) {
                     bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, pricing cache missing', { requestId, modelId });
                   } else {
-                    const settled = await settleCursorExternalUsage({
-                      pool,
-                      pricing,
-                      userId: uid,
-                      requestId,
-                      modelId,
-                      sessionId,
-                      engineStatus: status,
-                      terminalCode,
-                      usage,
-                      accountId: cursorAccountId,
-                    });
-                    if (settled === null) {
-                      bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, model pricing not in cache', { requestId, modelId });
-                    } else if (
-                      settled.debitedCredits !== null &&
-                      settled.debitedCredits > 0n &&
-                      deps.appendCostCredits
-                    ) {
-                      await deps.appendCostCredits(
+                    // Shared settle-before-close routine (same one the durable
+                    // tape path and the reconciler use): the audit row closes
+                    // only on a committed settle. The live terminal vocabulary
+                    // ('unavailable' / AUTH_UNAVAILABLE / QUOTA_UNAVAILABLE)
+                    // and the verified Cursor account attribution are passed
+                    // through options; quota learn above is unchanged.
+                    await settleDurableCursorBilling(
+                      { pgPool: pool, pricing, appendCostCredits: deps.appendCostCredits },
+                      uid,
+                      {
                         requestId,
-                        uid.toString(),
-                        settled.debitedCredits.toString(),
-                        sessionId,
-                      );
-                    }
+                        engine: 'cursor',
+                        engineSessionId: sessionId ?? '',
+                        status: status === 'success' ? 'success' : 'error',
+                        durationMs: durationMs ?? 0,
+                        usage: (usage ?? undefined) as DurableCodexBilling['usage'],
+                      },
+                      { engineStatus: status, terminalCode, accountId: cursorAccountId },
+                    );
                   }
                 } catch (err) {
                   bridgeLog?.warn('user-chat-bridge: Cursor platform settle failed', { requestId, err });
