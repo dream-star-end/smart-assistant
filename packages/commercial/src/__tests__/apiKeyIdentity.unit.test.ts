@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 
-import { makeApiKeyIdentityStrategy } from "../auth/apiKeyIdentity.js";
+import { apiKeyCredentialFromHeaders, makeApiKeyIdentityStrategy } from "../auth/apiKeyIdentity.js";
 import {
   IdentityError,
   AuthzLoadError,
@@ -883,5 +883,77 @@ describe("AINV-3 — row.userId is single source of truth (no caller-supplied ui
       [999n],
       "loadUserModelAuthz 收到的也必须是 row.userId",
     );
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2026-09-08 — 双凭据头择优(apiKeyCredentialFromHeaders)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Claude Code 在 ANTHROPIC_AUTH_TOKEN 与 ANTHROPIC_API_KEY 同时设置时会两头都发
+// (Authorization: Bearer <AUTH_TOKEN> + x-api-key: <API_KEY>)。用户机器残留的别家
+// `sk-ant-*` 或已撤销旧 key 会与新 key 同车抵达 —— 固定 Authorization 优先会让
+// "旧的在 Authorization、新的在 x-api-key" 这半边莫名 401。规则:形似本站(`oc-cc.`)
+// 的那一头胜出;都像 / 都不像时 Authorization 优先(anti-enum 不变)。
+
+describe("apiKeyCredentialFromHeaders — 两头同时存在时优选 oc-cc 形态", () => {
+  const good = "oc-cc.abcd1234." + "f".repeat(48);
+  const mk = (h: Record<string, string | undefined>) =>
+    ({ headers: h } as unknown as IncomingMessage);
+
+  test("只有 Authorization → 用它;只有 x-api-key → 用它;都没有 → undefined", () => {
+    assert.equal(apiKeyCredentialFromHeaders(mk({ authorization: `Bearer ${good}` })), `Bearer ${good}`);
+    assert.equal(apiKeyCredentialFromHeaders(mk({ "x-api-key": good })), good);
+    assert.equal(apiKeyCredentialFromHeaders(mk({})), undefined);
+    assert.equal(apiKeyCredentialFromHeaders(mk({ authorization: "   ", "x-api-key": "" })), undefined);
+  });
+
+  test("Authorization 是别家 sk-ant-*,x-api-key 是本站 key → 取 x-api-key", () => {
+    const picked = apiKeyCredentialFromHeaders(
+      mk({ authorization: "Bearer sk-ant-api03-legacy", "x-api-key": good }),
+    );
+    assert.equal(picked, good);
+  });
+
+  test("Authorization 是本站 key,x-api-key 是别家 → 取 Authorization", () => {
+    const picked = apiKeyCredentialFromHeaders(
+      mk({ authorization: `Bearer ${good}`, "x-api-key": "sk-ant-api03-legacy" }),
+    );
+    assert.equal(picked, `Bearer ${good}`);
+  });
+
+  test("两头都像本站 → Authorization 优先(与历史行为一致)", () => {
+    const other = "oc-cc.zzzz9999." + "e".repeat(48);
+    const picked = apiKeyCredentialFromHeaders(
+      mk({ authorization: `Bearer ${good}`, "x-api-key": other }),
+    );
+    assert.equal(picked, `Bearer ${good}`);
+  });
+
+  test("两头都不像本站 → Authorization 优先(后续 parse 抛 BAD_API_KEY_FORMAT,anti-enum 不变)", () => {
+    const picked = apiKeyCredentialFromHeaders(
+      mk({ authorization: "Bearer sk-ant-a", "x-api-key": "sk-ant-b" }),
+    );
+    assert.equal(picked, "Bearer sk-ant-a");
+  });
+
+  test("端到端:Authorization 残留别家 key + x-api-key 本站 key → resolve 成功", async () => {
+    const secret = "a".repeat(48);
+    const spy = makeRepoSpy(makeRow({ secretHex: secret }));
+    const strat = makeApiKeyIdentityStrategy({
+      repo: spy.repo,
+      pricing: FAKE_PRICING,
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set() }),
+    });
+    const req = {
+      headers: {
+        authorization: "Bearer sk-ant-api03-legacy",
+        "x-api-key": "oc-cc.abcd1234." + secret,
+        "user-agent": DEFAULT_CC_UA,
+      },
+    } as unknown as IncomingMessage;
+    const identity = await strat.resolve(req, CTX);
+    assert.equal(identity.containerId, null);
+    assert.equal(spy.findByPrefixCalls.length, 1);
   });
 });
