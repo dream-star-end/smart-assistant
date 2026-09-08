@@ -3391,7 +3391,7 @@
       "occurredAt": "2026-09-08",
       "severity": "P1",
       "symptom": "委派完成回调经cron-origin先受理冻结原文哈希，后被论文意图hint重写content.text，执行端payload_hash_mismatch拒绝并显示消息未开始处理。内部cron-origin保持已受理正文，浏览器论文hint仍在受理前应用。",
-      "rootFixCommit": "471b5149db93326c7a5885b2214cba2cb25463e0",
+      "rootFixCommit": "471b5149",
       "regressions": [
         {
           "layer": "unit",
