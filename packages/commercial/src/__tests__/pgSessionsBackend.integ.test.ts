@@ -3503,7 +3503,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
     }
   });
 
-  maybe("a stale format-2 writer is fenced before its next batch after a format-3 claim", async () => {
+  maybe("a stale format-2 writer cannot publish over a format-3 claim", async () => {
     const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
     const sessionId = "s-lossless-runtime-batch-stale-writer";
     const userId = "u-lossless-runtime-batch-stale-writer";
@@ -3582,9 +3582,13 @@ describe("pgSessionsBackend lossless turn tape", () => {
         convertingFinalize,
       ]);
       assert.equal(staleResult.status, "rejected");
+      // Depending on lock scheduling, the converting writer can finish its
+      // staging before the stale writer resumes. Both production checkpoints
+      // reject that stale format; the durable winner and exact content below
+      // are the business contract, not which checkpoint wins the race.
       assert.match(
         (staleResult as PromiseRejectedResult).reason.message,
-        /materialization format changed during staging/,
+        /^lossless turn tape materialization format changed (?:during staging|before publication)$/,
       );
       assert.deepEqual(convertingResult, {
         status: "fulfilled",
@@ -3601,6 +3605,18 @@ describe("pgSessionsBackend lossless turn tape", () => {
           [sessionId, userId, tape.finalize.tapeId],
         )).rows[0],
         { record_storage_format: 3, records: "4" },
+      );
+      const exact = await backend.getClientSession(sessionId, userId);
+      assert.ok(exact);
+      assert.deepEqual(
+        (exact.messages as MessageLike[])
+          .filter((message) => message.role === "runtime-event")
+          .map((message) => message._runtimeEvent),
+        runtimeEvents.map((event) => event.payload),
+      );
+      assert.equal(
+        (exact.messages as MessageLike[]).find((message) => message.role === "assistant")?.text,
+        "visible answer after stale writer fencing",
       );
     } finally {
       await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]).catch(() => undefined);

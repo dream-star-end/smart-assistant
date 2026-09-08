@@ -10954,7 +10954,8 @@ describe('OCV5-174 durable preparation UI', () => {
   function fixture() {
     vi.useFakeTimers();
     vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket({ syncSession: async () => {} });
+    const syncSession = vi.fn(async (_sessId: string, _context?: { clientMessageId?: string }) => {});
+    const sock = makeSocket({ syncSession });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!; ws.open();
     const push = (frame: unknown) => ws.onmessage?.({ data: JSON.stringify(frame) });
@@ -10972,8 +10973,82 @@ describe('OCV5-174 durable preparation UI', () => {
       recovery: { ...pending, automatic: true } };
     const error = () => push({ type: 'outbound.error', peer, clientMessageId: source.id,
       code: 'DISPATCH_ENRICHMENT_TIMEOUT', message: 'prepare deadline' });
-    return { sock, ws, push, session, source, peer, pending, child, ack, error, sessId };
+    const childError = (type = 'error', code = 'DISPATCH_ENRICHMENT_TIMEOUT') => push({
+      type, peer, clientMessageId: child, code, message: 'child physical preparation deadline' });
+    const success = () => push({ type: 'outbound.message', channel: 'webchat', peer,
+      clientMessageId: child, isFinal: true, ts: Date.now(), blocks: [{ kind: 'text', text: 'child succeeded' }] });
+    return { sock, ws, push, session, source, peer, pending, child, ack, error, childError, success, syncSession, sessId };
   }
+
+  test.each(['ack', 'rest'])('same preparation child %s adoption retires its physical timeout, preserving active #2 past old grace', async via => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError();
+    await vi.advanceTimersByTimeAsync(5_000);
+    if (via === 'ack') f.push(f.ack);
+    else f.sock.applyServerMessages(f.sessId, 'main', f.session.messages.map(m => ({ ...m, _source: 'server' })), true, 2,
+      { serverUpdatedAt: Date.now(), pendingRecovery: { ...f.pending, clientMessageId: f.child } });
+    f.syncSession.mockClear();
+    await vi.advanceTimersByTimeAsync(15_500);
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session._turnStatus).toMatchObject({ cause: 'preparation' });
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(f.syncSession).not.toHaveBeenCalled();
+    f.success();
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.some(m => m.text === 'child succeeded')).toBe(true);
+    f.push(f.ack);
+    expect(f.session._sendingInFlight).toBe(false);
+    f.sock.stop();
+  });
+  test.each(['error', 'outbound.error'])('queued child without readmission past grace only reconciles exact authority (%s)', async type => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError(type);
+    f.syncSession.mockClear();
+    await vi.advanceTimersByTimeAsync(20_500);
+    expect(f.session._sendingInFlight).toBe(true);
+    expect(f.session._activeClientMessageId).toBe(f.child);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);
+    expect(f.syncSession.mock.calls.filter(call => (call[1] as { clientMessageId?: string } | undefined)?.clientMessageId === f.child)).toHaveLength(1);
+    expect(f.syncSession).toHaveBeenCalledWith(f.sessId, { clientMessageId: f.child });
+    f.childError('outbound.error', 'DISPATCH_PREPARATION_RETRY_EXHAUSTED');
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.filter(m => m._errorCode)).toEqual([
+      expect.objectContaining({ _clientMessageId: f.child, _errorCode: 'dispatch_preparation_retry_exhausted' }),
+    ]);
+    f.push(f.ack);
+    expect(f.session._sendingInFlight).toBe(false);
+    f.sock.stop();
+  });
+  test.each(['stop', 'success', 'exhausted', 'new-active'])('old child grace and ACK cannot revive %s', async outcome => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError();
+    await vi.advanceTimersByTimeAsync(5_000);
+    if (outcome === 'stop') f.sock.stopTurn(f.sessId);
+    else if (outcome === 'exhausted') f.childError('outbound.error', 'DISPATCH_PREPARATION_RETRY_EXHAUSTED');
+    else f.success();
+    let active: string | undefined;
+    if (outcome === 'new-active') {
+      f.sock.sendMessage({ sessId: f.sessId, agentId: 'main', text: 'new active request' });
+      active = f.session.messages.find(m => m.text === 'new active request')!.id;
+      f.push({ type: 'outbound.ack', admitted: true, peer: f.peer, clientMessageId: active });
+    }
+    f.syncSession.mockClear(); f.push(f.ack);
+    await vi.advanceTimersByTimeAsync(15_500);
+    expect(f.session._sendingInFlight).toBe(outcome === 'new-active');
+    expect(f.session._activeClientMessageId).toBe(active);
+    expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(outcome === 'exhausted' ? 1 : 0);
+    expect(f.syncSession).not.toHaveBeenCalled();
+    f.sock.stop();
+  });
+  test('preparation ACK does not discard a semantic child error timer', async () => {
+    const f = fixture(); f.error(); f.push(f.ack); f.childError('outbound.error', 'MODEL_CAPACITY');
+    await vi.advanceTimersByTimeAsync(5_000); f.push(f.ack);
+    await vi.advanceTimersByTimeAsync(15_500);
+    expect(f.session._sendingInFlight).toBe(false);
+    expect(f.session.messages.filter(m => m._errorCode)).toEqual([
+      expect.objectContaining({ _clientMessageId: f.child, _errorCode: 'model_capacity' }),
+    ]);
+    f.sock.stop();
+  });
   test('source error → scheduled → duplicate child ACK preserves precise cause and hides source; late source error cannot steal child', () => {
     const f = fixture(); f.error();
     expect(f.session.messages.filter(m => m._errorCode)).toHaveLength(0);

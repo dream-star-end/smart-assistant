@@ -3813,13 +3813,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (record.recoveryJob) {
             const release = record.recoveryJob.jobOrigin === "pre_transfer_enrichment"
               ? releasePreparationPreReceipt : releaseRecoveryPreReceipt;
-            await release(pool, {
+            const result = await release(pool, {
               job: record.recoveryJob,
               dispatchId: record.dispatchId,
               dispatchOwner: record.leaseOwnerId,
               dispatchLeaseEpoch: record.leaseEpoch,
               failureCode,
             });
+            if (record.recoveryJob.jobOrigin === "pre_transfer_enrichment" && result === "exhausted") {
+              // A physical preparation timeout can requeue this same child.
+              // Only the committed cap exhaustion is a logical turn failure;
+              // queued/unknown/fenced must not start a browser failure timer.
+              broadcastToUser(uid, {
+                type: "error",
+                code: "DISPATCH_PREPARATION_RETRY_EXHAUSTED",
+                message: "session preparation retries exhausted before model execution",
+                peer: { id: record.sessionId, kind: "dm" },
+                clientMessageId: record.clientMessageId,
+              });
+            }
           } else {
             if (sourceReplayEligible && deps.failPreparationAndScheduleRecovery) {
               const result = await deps.failPreparationAndScheduleRecovery({
@@ -3901,7 +3913,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const expireIfDue = (): boolean => {
         if (state.phase !== "enriching" || Date.now() < state.deadlineAt) return false;
         if (!terminalizeEnrichmentDispatch(state, "dispatch_enrichment_timeout")) return false;
-        if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+        if (record.recoveryJob?.jobOrigin !== "pre_transfer_enrichment" &&
+            !cleaned && userWs.readyState === WebSocket.OPEN) {
           sendErrorFrame(
             userWs,
             "DISPATCH_ENRICHMENT_TIMEOUT",

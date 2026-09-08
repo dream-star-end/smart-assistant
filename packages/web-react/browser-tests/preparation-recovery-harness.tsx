@@ -15,9 +15,12 @@ class Transport {
   open() { this.readyState = 1; this.onopen?.(); this.push({ type: 'sys.relay_ready', automaticRecoveryOwner: 'master-v1' }); }
 }
 window.WebSocket = Transport as unknown as typeof WebSocket;
+const authorityChecks: Array<{ at: number; sessId: string; context?: { clientMessageId?: string } }> = [];
 const sock = new ChatSocket({ getToken: () => 'fixture', getAuthEpoch: () => 0,
   silentRefresh: async epoch => ({ kind: 'transient', epoch, retryAfterMs: 1000 }),
-  onAuthExpired: () => {}, defaultAgentId: 'main', syncSession: async () => {} });
+  onAuthExpired: () => {}, defaultAgentId: 'main', syncSession: async (sessId, context) => {
+    authorityChecks.push({ at: Date.now(), sessId, context });
+  } });
 sock.setGateReady(true); Transport.latest.open();
 const id = 's-browser-preparation', peer = { id, kind: 'dm' };
 let source = '', child = 'm-recover-browser-preparation';
@@ -26,7 +29,7 @@ const pending = () => ({ cause: 'preparation' as const, mode: 'replay' as const,
 const ack = () => Transport.latest.push({ type: 'outbound.ack', admitted: true, peer,
   clientMessageId: child, recovery: { ...pending(), automatic: true } });
 const startSource = () => {
-  sock.removeSession(id); child = 'm-recover-browser-preparation';
+  sock.removeSession(id); authorityChecks.length = 0; child = 'm-recover-browser-preparation';
   sock.sendMessage({ sessId: id, agentId: 'main', text: '精确原始请求' });
   source = sock.sessions.get(id)!.messages.find(m => m.role === 'user')!.id;
   Transport.latest.push({ type: 'outbound.ack', admitted: true, peer, clientMessageId: source });
@@ -47,6 +50,7 @@ const restore = (payload: { source: string; rows: ChatMessage[]; childBound?: bo
 };
 const drive = {
   begin, ack, restore, startSource,
+  authorityChecks: () => structuredClone(authorityChecks),
   queueHuman: () => sock.sendMessage({ sessId: id, agentId: "main", text: "排队的下一条请求" }),
   rawFrames: (frames: unknown[]) => frames.forEach(frame => Transport.latest.push(frame)),
   sent: () => Transport.latest.sent.map(raw => JSON.parse(raw)),

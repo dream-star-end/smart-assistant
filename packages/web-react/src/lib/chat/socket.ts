@@ -1815,6 +1815,20 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
+        if (!isCronOrHeartbeat && !frame.meta?.interrupted && clientMessageId) {
+          const preparationChild = sess.messages.find((m) => m.role === "user" && m.id === clientMessageId &&
+            m._automaticRecovery === true && m._automaticRecoveryCause === "preparation");
+          if (preparationChild && !sess.messages.some((m) => m._clientMessageId === clientMessageId && m._errorCode)) {
+            // The live final is exact terminal evidence even before REST/tape
+            // arrives. Preserve it on this child so a delayed readmit ACK
+            // cannot revive it; do not consume semantic recovery errors.
+            preparationChild.status = "replied";
+            if (this.pendingRecoveryErrors.get(sess.id)?.paint.normalized === "dispatch_enrichment_timeout") {
+              this.settlePendingRecoveryError(sess.id, clientMessageId, "adopted");
+            }
+            this.deps.persistSession?.(sess.id);
+          }
+        }
         if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
         this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
@@ -2613,6 +2627,13 @@ export class ChatSocket {
     }
     // 子轮领养 = 延后红卡的正向收口:丢弃暂存的错误,软状态由下方权威 attempt 接管。
     this.settlePendingRecoveryError(sessId, recovery.sourceClientMessageId, "adopted");
+    // A preparation job can re-admit the same logical child after a physical
+    // timeout. Its lineage still names the original source; retire only this
+    // child's old preparation error as well (never a semantic/tape failure).
+    if (recovery.cause === "preparation" &&
+      this.pendingRecoveryErrors.get(sessId)?.paint.normalized === "dispatch_enrichment_timeout") {
+      this.settlePendingRecoveryError(sessId, clientMessageId, "adopted");
+    }
     const attempt = Number.isSafeInteger(recovery.attempt) && recovery.attempt >= 1
       ? Math.min(recovery.attempt, AUTOMATIC_TURN_RETRY_MAX)
       : 1;
@@ -2808,7 +2829,33 @@ export class ChatSocket {
         this.materializePendingRecoveryError(sessId, "decision_timeout");
       }
     }
-    const timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
+    const preparationChild = paint.normalized === "dispatch_enrichment_timeout"
+      ? sess.messages.find((m) => m.role === "user" && m.id === clientMessageId &&
+        m._automaticRecovery === true && m._automaticRecoveryCause === "preparation" &&
+        m._recoveryMode === "replay" && (m._source === "server" || !!m._turnTapeId) &&
+        isClientMessageId(m._recoveryOfClientMessageId) &&
+        isClientMessageId(m._automaticRecoveryRootClientMessageId))
+      : undefined;
+    const timer = setTimeout(() => {
+      if (this.pendingRecoveryErrors.get(sessId)?.timer !== timer) return;
+      if (preparationChild) {
+        // Rolling old bridges may report one physical attempt's timeout even
+        // while the durable child is queued. Only authority can finish it;
+        // this grace expiry asks the existing backoff reconciler, not painter.
+        const current = this.sessions.get(sessId);
+        if (!current?._sendingInFlight || current._activeClientMessageId !== clientMessageId ||
+          this.isObsoletePreparationRecovery(current, {
+            sourceClientMessageId: preparationChild._recoveryOfClientMessageId!,
+            rootClientMessageId: preparationChild._automaticRecoveryRootClientMessageId!,
+          }, clientMessageId)) {
+          this.settlePendingRecoveryError(sessId, clientMessageId, "adopted");
+          return;
+        }
+        this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+        return;
+      }
+      this.materializePendingRecoveryError(sessId, "decision_timeout");
+    }, RECOVERY_DECISION_GRACE_MS);
     this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false });
     this.stashProblemCardSourceCode(sessId, clientMessageId, paint.normalized);
     return true;
