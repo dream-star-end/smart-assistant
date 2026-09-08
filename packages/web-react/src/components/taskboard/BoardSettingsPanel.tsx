@@ -1,11 +1,10 @@
-import { formatRecordedCostTotal } from '@openclaude/protocol'
 import { Settings } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
   type TaskboardSettings,
   type TaskboardSettingsSnapshot,
-  formatCostMoneyLine,
+  formatUsageReferenceCost,
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
@@ -144,9 +143,7 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
 
   const usage = snap?.usage
   const costLimit = draft.maxCostPerDayUsd
-  const costToday = usage ? usage.referenceCostsToday
-    ? formatCostMoneyLine(usage.referenceCostsToday)
-    : formatRecordedCostTotal(usage.costTodayUsd) : null
+  const costToday = usage ? formatUsageReferenceCost(usage) : null
 
   return (
     <>

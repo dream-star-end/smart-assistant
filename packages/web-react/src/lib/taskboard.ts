@@ -1016,13 +1016,28 @@ export const UNPRICED_ONLY_COPY = '本区间全部无单价，仅有 token 数�
  * full 直接给金额；partial 金额后附缺单价说明；none 返回 null。
  */
 export function formatCostMoneyLine(totals: CostTotals): string | null {
-  if (totals.coverage === 'none') return totals.runCount > 0 ? '参考费用未记录（不代表免费）' : null
-  if (totals.coverage === 'unpriced_only') return UNPRICED_ONLY_COPY
+  // Old servers called unknown-only aggregates "full". Counts, not that label,
+  // tell us whether the sum contains an actual recorded amount (including zero).
+  if (totals.priced.runCount === 0) {
+    if (totals.unpriced.runCount > 0) return `${UNPRICED_ONLY_COPY}${totals.unknownRunCount > 0 ? `；${formatCount(totals.unknownRunCount)} 次费用未记录` : ''}`
+    return totals.runCount > 0 ? '参考费用未记录（不代表免费）' : null
+  }
   const amount = formatRecordedCostTotal(totals.costUsd, totals.amounts)
   const notes: string[] = []
   if (totals.unpriced.runCount > 0) notes.push(formatUnpricedNote(totals.unpriced))
   if (totals.unknownRunCount > 0) notes.push(`${formatCount(totals.unknownRunCount)} 次费用未记录`)
   return notes.length ? `${amount}（${notes.join('；')}）` : amount
+}
+
+export function formatUsageReferenceCost(usage: TaskboardUsage): string | null {
+  if (usage.referenceCostsToday) return formatCostMoneyLine(usage.referenceCostsToday)
+  const unpriced = usage.unpricedRunsToday ?? 0
+  if (unpriced > 0) {
+    const note = `${formatCount(unpriced)} 次有用量但无金额`
+    if (usage.costTodayUsd === 0) return `参考费用未计价（${note}，不代表免费）`
+    return `${formatRecordedCostTotal(usage.costTodayUsd)}；${note}，未计入`
+  }
+  return formatRecordedCostTotal(usage.costTodayUsd)
 }
 
 export function emptyCostSlice(): CostSlice {

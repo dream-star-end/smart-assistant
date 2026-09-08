@@ -18,15 +18,21 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
     import React, {useState} from 'react';
     import {createRoot} from 'react-dom/client';
     import {TooltipProvider} from ${JSON.stringify(resolve(sourceRoot, 'packages/web-react/src/components/ui/Tooltip.tsx'))};
+    import {ToastProvider} from ${JSON.stringify(resolve(sourceRoot, 'packages/web-react/src/components/ui/Toast.tsx'))};
+    import {BoardSettingsPanel} from ${JSON.stringify(resolve(sourceRoot, 'packages/web-react/src/components/taskboard/BoardSettingsPanel.tsx'))};
+    import {taskboardApi} from ${JSON.stringify(resolve(sourceRoot, 'packages/web-react/src/lib/taskboard.ts'))};
     import {CostCoverageBlock} from ${JSON.stringify(resolve(sourceRoot, 'packages/web-react/src/components/taskboard/CostCoverageBlock.tsx'))};
     import {TicketTimeline} from ${JSON.stringify(resolve(sourceRoot, 'packages/web-react/src/components/taskboard/TicketTimeline.tsx'))};
     const empty={runCount:0,tokensIn:0,tokensOut:0,costUsd:0};
     const slice=n=>({runCount:1,tokensIn:100,tokensOut:10,costUsd:n});
     const mixed={runCount:3,tokensIn:300,tokensOut:30,costUsd:6,coverage:'full',priced:{runCount:3,tokensIn:300,tokensOut:30,costUsd:6},unpriced:empty,unknownRunCount:0,amounts:{estimated:slice(1),unflagged:slice(2),unverified:slice(3)}};
     const cases={mixed,legacy:{...mixed,amounts:undefined},unpriced:{...mixed,coverage:'unpriced_only',costUsd:0,priced:empty,unpriced:slice(0),amounts:{estimated:empty,unflagged:empty,unverified:empty}},unknown:{...mixed,coverage:'none',costUsd:0,priced:empty,unknownRunCount:3,amounts:undefined}};
+    cases.legacy_unknown={...cases.unknown,coverage:'full'};
+    taskboardApi.getSettings=async()=>({maxConcurrentRuns:2,maxRunsPerDay:200,maxCostPerDayUsd:null,quietHoursStart:23,quietHoursEnd:8,circuitBreakerThreshold:3,maxStageLoops:5,maxRunsPerTick:2,patrolPaused:false,usage:{runsToday:1,costTodayUsd:0,activeRuns:0,unpricedRunsToday:1}});
+    const auth={};
     const items=[true,false,null].map((flag,i)=>({kind:'run',createdAt:Date.now(),run:{id:'r'+i,stageId:'s',status:'succeeded',trigger:'manual',createdAt:Date.now(),durationMs:100,tokensIn:100,tokensOut:10,costUsd:i+1,costImprecise:flag}}));
     function App(){const [mode,setMode]=useState('mixed');return <><nav>{Object.keys(cases).map(k=><button key={k} onClick={()=>setMode(k)}>{k}</button>)}</nav><CostCoverageBlock totals={cases[mode]}/><TicketTimeline items={items} loading={false} stageName='执行' stageById={new Map([['s','执行']])}/></>}
-    createRoot(document.getElementById('root')).render(<TooltipProvider><App/></TooltipProvider>);
+    createRoot(document.getElementById('root')).render(<ToastProvider><TooltipProvider><App/><BoardSettingsPanel auth={auth}/></TooltipProvider></ToastProvider>);
   `;
   const bundle = await build({ stdin: { contents: source, resolveDir: repo, loader: 'tsx' },
     bundle: true, write: false, format: 'iife', jsx: 'automatic', loader: { '.css': 'empty' },
@@ -66,6 +72,14 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
     await page.waitForFunction(() => document.querySelector('[data-testid="cost-coverage-money"]')?.textContent?.includes('未记录'));
     assert.match(await money.textContent(), /未记录/);
     assert.doesNotMatch(await money.textContent(), /\$0/);
+    await page.getByRole('button',{name:'legacy_unknown',exact:true}).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="cost-coverage-money"]')?.textContent?.includes('未记录'));
+    assert.doesNotMatch(await money.textContent(), /\$0/);
+    await page.getByTestId('board-settings-open').click();
+    const usageLine=page.getByText(/今天已跑/);
+    await usageLine.waitFor();
+    assert.match(await usageLine.textContent(), /1 次有用量但无金额/);
+    assert.doesNotMatch(await usageLine.textContent(), /\$0/);
     assert.deepEqual(errors,[]);
     if(process.env.OCV5_COST_SCREENSHOT) await page.screenshot({path:process.env.OCV5_COST_SCREENSHOT,fullPage:true});
   } finally { if(browser) await browser.close(); await new Promise(resolve=>server.close(resolve)); }
