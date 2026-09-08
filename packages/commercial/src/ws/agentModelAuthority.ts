@@ -179,6 +179,8 @@ export interface AgentModelResolverOptions {
  */
 export type AgentModelResolver = ((agentId: string) => string | null) & {
   isRuntimeDenied?: (agentId: string) => boolean;
+  /** Pure boot registration predicate; independent of runtime readiness. */
+  isIdentityRegistered?: (agentId: string) => boolean;
   /**
    * Invoke on EVERY new execution, before model precedence (including an explicit
    * model). Registered targets always read fresh readiness; never a display TTL.
@@ -231,6 +233,9 @@ export async function loadAgentModelResolverForUser(
       ? denied.has(agentId)
       : identity.status === "registered-unavailable";
   };
+  resolver.isIdentityRegistered = (agentId) => profiles.some(
+    (profile) => profile.legacyAgentId === agentId || profile.canonicalAgentId === agentId,
+  );
   resolver.authorizeExecution = async (agentId) => {
     const known = resolveIdentityCompat(agentId, identityCompat);
     if (known.status === "no-registration") return { identity: known, model: resolver(agentId) };

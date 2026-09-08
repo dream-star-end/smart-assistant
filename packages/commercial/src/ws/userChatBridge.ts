@@ -2667,6 +2667,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           | {
               resolve: (agentId: string) => string | null;
               isRuntimeDenied: (agentId: string) => boolean;
+              isIdentityRegistered: (agentId: string) => boolean;
+              authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
               refresh: () => Promise<void>;
             }
           | null = null;
@@ -2699,6 +2701,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           agentModelResolverHandle = {
             resolve: (agentId) => innerResolve(agentId),
             isRuntimeDenied: (agentId) => innerResolve.isRuntimeDenied?.(agentId) === true,
+            isIdentityRegistered: (agentId) => innerResolve.isIdentityRegistered?.(agentId) ?? false,
+            authorizeExecution: async (agentId) => {
+              // Capture the resolver for this frame: periodic refresh must not
+              // replace a successful execution snapshot after its await.
+              const current = innerResolve;
+              return current.authorizeExecution
+                ? current.authorizeExecution(agentId)
+                : { identity: { requestedId: agentId, executionAgentId: agentId, status: "no-registration" as const }, model: current(agentId) };
+            },
             refresh: async () => {
               if (refreshInflight !== null) return refreshInflight;
               refreshInflight = (async () => {
@@ -2868,6 +2879,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       | {
           resolve: (agentId: string) => string | null;
           isRuntimeDenied: (agentId: string) => boolean;
+          isIdentityRegistered: (agentId: string) => boolean;
+          authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
           refresh: () => Promise<void>;
         }
       | null,
@@ -4850,6 +4863,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       });
     };
 
+    // Serialize only identity readiness preparation on the original transport peer.
+    // Ordinary/control frames retain the existing synchronous admission path.
+    const identityPreparations = new Map<string, Promise<void>>();
+    let identityPreparationBytes = 0;
+
     // Both the browser legacy lane and the internal PG dispatch grant enter
     // this one preparation pipeline. Consequently catalog/epoch fencing,
     // Codex slot acquisition, preCheck, journal creation and authority sealing
@@ -4977,6 +4995,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         );
         promptQueueFallbackTimer.unref?.();
       }
+      const continuePreparation = (executionAuthority: Awaited<ReturnType<NonNullable<AgentModelResolver["authorizeExecution"]>>> | null): void => {
       let passthroughData: RawData = data;
       let passthroughLen = len;
       // 0049 模型授权(plan v3 §B3/§B4 + review v1/v2 follow-up)+ P0 计费旁路
@@ -5593,10 +5612,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               cleanup("client_close", true);
               return;
             }
-            const frameAgentAuthorityModel: string | null =
-              frameAgentId !== null && agentModelResolverHandle !== null
-                ? agentModelResolverHandle.resolve(frameAgentId)
-                : null;
+            const frameAgentAuthorityModel = executionAuthority !== null
+              ? executionAuthority.model
+              : frameAgentId !== null ? agentModelResolverHandle?.resolve(frameAgentId) ?? null : null;
             // Capability readiness is a server-owned execution gate, not a model
             // selection hint. A browser normally supplies frame.model, so checking
             // only the resolver's null model on the no-model path would let an
@@ -5606,6 +5624,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (
               frameAgentId !== null &&
               agentModelResolverHandle !== null &&
+              executionAuthority?.identity.status !== "registered-ready" &&
               agentModelResolverHandle.isRuntimeDenied(frameAgentId)
             ) {
               rejectPromptQueueDispatch("UNRESOLVED_AGENT_MODEL");
@@ -7378,6 +7397,69 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       const passthroughForward = forwardPreparedFrame(passthroughData, isBinary, passthroughLen);
       if (passthroughForward instanceof Promise) void passthroughForward;
+      };
+
+      // This gate runs after raw ingress/owner/hash validation and never rewrites
+      // the queued frame. The synchronous continuation still reserves G7 before
+      // its first async model/slot operation. A later message on the same peer
+      // cannot overtake an earlier slow readiness read.
+      let identityFrame: Record<string, unknown> | null = null;
+      if (!isBinary) {
+        try {
+          const parsed: unknown = JSON.parse((Array.isArray(data) ? Buffer.concat(data) : data instanceof ArrayBuffer ? Buffer.from(data) : data).toString());
+          if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "inbound.message") {
+            identityFrame = parsed as Record<string, unknown>;
+          }
+        } catch { /* Malformed frames keep the existing validation path. */ }
+      }
+      const requestedAgentId = typeof identityFrame?.agentId === "string" ? identityFrame.agentId : null;
+      const needsIdentity = requestedAgentId !== null && agentModelResolverHandle?.isIdentityRegistered(requestedAgentId) === true;
+      const identity = inboundTurnIdentityFromParsed(identityFrame);
+      const peerKey = identity.peerId ?? "__missing_peer__";
+      const previous = identityFrame !== null ? identityPreparations.get(peerKey) : undefined;
+      if (!needsIdentity && !previous) {
+        continuePreparation(null);
+        return;
+      }
+      if (identityPreparationBytes + len > maxBufferedBytes) {
+        rejectPromptQueueDispatch("ERR_BACKPRESSURE");
+        try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+        cleanup("backpressure", true);
+        return;
+      }
+      identityPreparationBytes += len;
+      const identityPreparationCancelled = (): boolean => cleaned || promptQueueResolved ||
+        (ingress === "browser" && userWs.readyState !== WebSocket.OPEN);
+      const work = (async () => {
+        if (previous) await previous;
+        if (identityPreparationCancelled()) return;
+        let executionAuthority: Awaited<ReturnType<NonNullable<AgentModelResolver["authorizeExecution"]>>> | null = null;
+        if (needsIdentity && requestedAgentId !== null && agentModelResolverHandle !== null) {
+          try {
+            executionAuthority = await agentModelResolverHandle.authorizeExecution(requestedAgentId);
+          } catch (err) {
+            if (identityPreparationCancelled()) return;
+            rejectPromptQueueDispatch("UNRESOLVED_AGENT_MODEL");
+            bridgeLog?.info("user-chat-bridge: fresh identity authority rejected execution", { agentId: requestedAgentId, err });
+            sendErrorFrame(userWs, "UNRESOLVED_AGENT_MODEL", `agent '${requestedAgentId}' identity is not ready or its authority is unavailable`, identity);
+            try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "agent_identity_unavailable"); } catch { /* */ }
+            cleanup("client_close", true);
+            return;
+          }
+        }
+        if (identityPreparationCancelled()) return;
+        continuePreparation(executionAuthority);
+      })().catch((err) => {
+        rejectPromptQueueDispatch("ERR_INTERNAL");
+        bridgeLog?.error("user-chat-bridge: identity preparation failed", { err });
+        if (!cleaned) sendErrorFrame(userWs, "ERR_INTERNAL", "internal error", identity);
+      });
+      identityPreparations.set(peerKey, work);
+      trackPreparation(async () => {
+        await work;
+        identityPreparationBytes -= len;
+        if (identityPreparations.get(peerKey) === work) identityPreparations.delete(peerKey);
+      });
     };
 
     const onUserMessage = (

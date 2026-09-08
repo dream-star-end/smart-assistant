@@ -54,7 +54,7 @@ import {
   type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
-import { buildAgentModelSnapshot } from "../ws/agentModelAuthority.js";
+import { buildAgentModelSnapshot, type AgentModelResolver } from "../ws/agentModelAuthority.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
@@ -2239,4 +2239,90 @@ test("OCV5-179: inferred marketplace auto is signed AND forwarded as a concrete 
   } finally {
     await stopRig(rig);
   }
+});
+
+const identityProfile = { profileId: 'uid3-butler-unification', legacyAgentId: 'butler', canonicalAgentId: 'personal-butler', localPersonaPath: 'agents/butler/CLAUDE.md', localSkillStorageId: 'butler' };
+for (const requestedId of ['butler', 'personal-butler']) {
+  test(`OCV5-179 identity: ${requestedId} explicit model cannot bypass fresh unavailable authority`, async () => {
+    const resolver = (() => 'glm-5.2') as AgentModelResolver;
+    resolver.isIdentityRegistered = (id) => id === "butler" || id === "personal-butler";
+    resolver.authorizeExecution = async () => { throw new Error('COMPAT_NOT_READY'); };
+    const rig = await startRig({ attest: 'yes', loadAgentModelResolver: async () => resolver });
+    try {
+      const ws = await openClient(rig.port);
+      const received: string[] = [];
+      ws.on('message', data => received.push(data.toString()));
+      const closed = new Promise<void>(resolve => ws.once('close', () => resolve()));
+      ws.send(inboundFrame({ agentId: requestedId, model: 'glm-5.2' }));
+      await Promise.race([closed, waitFor(() => received.some(s => s.includes('UNRESOLVED_AGENT_MODEL')))]);
+      assert.ok(received.some(s => s.includes('UNRESOLVED_AGENT_MODEL')));
+      assert.equal(rig.containerSeen.some(s => s.includes('inbound.message')), false, 'unavailable identity must not reach the runner');
+    } finally { await stopRig(rig); }
+  });
+}
+
+test('OCV5-179 identity: signed model uses returned execution snapshot, raw routing stays legacy, warm revocation rejects', async () => {
+  let ready = true;
+  const resolver = (() => 'gpt-5.6-sol') as AgentModelResolver; // deliberately stale display projection
+  resolver.isIdentityRegistered = (id) => id === "butler" || id === "personal-butler";
+  resolver.isRuntimeDenied = () => true; // must not override this frame's fresh positive authority
+  resolver.authorizeExecution = async (requestedId) => {
+    if (!ready) throw new Error('COMPAT_AUTHORITY_UNAVAILABLE');
+    return { identity: { requestedId, executionAgentId: 'personal-butler', profile: identityProfile, status: 'registered-ready' }, model: 'glm-5.2' };
+  };
+  const rig = await startRig({ attest: 'yes', loadAgentModelResolver: async () => resolver });
+  try {
+    const ws = await openClient(rig.port);
+    ws.send(inboundFrame({ agentId: 'butler', model: undefined, clientMessageId: 'identity-first', peer: {id: 'legacy-peer', kind: 'dm'} }));
+    await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
+    const frame = firstInbound(rig.containerSeen);
+    assert.equal(frame.agentId, 'butler', 'raw owner/key routing is not canonicalized');
+    assert.equal((frame.peer as { id: string }).id, 'legacy-peer');
+    assert.equal(frame.model, 'glm-5.2');
+    const bundle = frame[MODEL_AUTHORITY_FIELD] as {authority: string};
+    assert.equal(verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now()).canonicalModel, 'glm-5.2');
+    const before = rig.containerSeen.filter(s => s.includes('inbound.message')).length;
+    ready = false;
+    const received: string[] = [];
+    ws.on('message', data => received.push(data.toString()));
+    ws.send(inboundFrame({ agentId: 'butler', model: 'glm-5.2', clientMessageId: 'identity-second', peer: {id: 'legacy-peer', kind: 'dm'} }));
+    await waitFor(() => received.some(s => s.includes('UNRESOLVED_AGENT_MODEL')));
+    assert.equal(rig.containerSeen.filter(s => s.includes('inbound.message')).length, before, 'warm explicit-model turn is freshly gated');
+    ws.close();
+  } finally { await stopRig(rig); }
+});
+
+
+test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer, and cleanup prevents late forwarding', async () => {
+  let release!: () => void;
+  const slow = new Promise<void>(resolve => { release = resolve; });
+  const calls: string[] = [];
+  const resolver = (() => 'glm-5.2') as AgentModelResolver;
+  resolver.isIdentityRegistered = (id) => id === 'butler' || id === 'personal-butler';
+  resolver.authorizeExecution = async (requestedId) => {
+    calls.push(requestedId);
+    if (calls.length === 1) await slow;
+    return {identity: {requestedId, executionAgentId: 'personal-butler', profile: identityProfile, status: 'registered-ready'}, model:'glm-5.2'};
+  };
+  const rig = await startRig({attest:'yes',loadAgentModelResolver:async()=>resolver});
+  try {
+    const ws = await openClient(rig.port);
+    const peer = {id:'same-legacy-peer',kind:'dm'};
+    ws.send(inboundFrame({agentId:'butler',clientMessageId:'slow-first',peer}));
+    await waitFor(()=>calls.length===1);
+    ws.send(inboundFrame({agentId:'personal-butler',clientMessageId:'fast-second',peer}));
+    // A control frame remains responsive while execution readiness is pending.
+    ws.send(JSON.stringify({type:'hello',peer}));
+    await waitFor(()=>rig.containerSeen.some(s=>s.includes('hello')));
+    assert.deepEqual(calls,['butler'], 'second same-peer readiness must not start ahead of first');
+    assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false);
+    const closed = new Promise<void>(resolve=>ws.once('close',()=>resolve()));
+    ws.close();
+    await closed;
+    release();
+    await slow;
+    await new Promise(resolve=>setTimeout(resolve,75));
+    assert.deepEqual(calls,['butler'], 'closed bridge must not start the queued readiness read');
+    assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false,'late readiness must not execute after cleanup');
+  } finally {release();await stopRig(rig);}
 });

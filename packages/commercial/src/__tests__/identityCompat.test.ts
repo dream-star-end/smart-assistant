@@ -53,6 +53,9 @@ describe('per-execution resolver authorization (also required for explicit model
   it('both ids resolve canonical model and independently reread every execution', async () => {
     const r = await rig()
     assert.equal(r.resolver('butler'), 'gpt-6-astra')
+    assert.equal(r.resolver.isIdentityRegistered!('butler'), true)
+    assert.equal(r.resolver.isIdentityRegistered!('personal-butler'), true)
+    assert.equal(r.resolver.isIdentityRegistered!('main'), false)
     for (const id of ['butler', 'personal-butler', 'butler']) {
       const result = await r.resolver.authorizeExecution!(id)
       assert.equal(result.identity.executionAgentId, 'personal-butler')
@@ -65,6 +68,7 @@ describe('per-execution resolver authorization (also required for explicit model
     const r = await rig()
     r.set(snapshot([agent('butler', 'local-decoy')]))
     for (const id of ['butler', 'personal-butler']) {
+      assert.equal(r.resolver.isIdentityRegistered!(id), true, 'uninstall must not erase the registration gate')
       await assert.rejects(r.resolver.authorizeExecution!(id), { code: 'COMPAT_NOT_READY' })
     }
   })
