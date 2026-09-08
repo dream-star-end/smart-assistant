@@ -15,7 +15,7 @@ const { SessionManager } = await import('../sessionManager.js')
 const { Gateway, PerTurnDelegationGuard } = await import('../server.js')
 const { registerEngine } = await import('../engine/registry.js')
 const { setV3MasterSinkSingleton, makeV3MasterSink } = await import('../v3MasterSink.js')
-const { paths, writeAgentsConfig, identityCompatEnvironment } = await import('@openclaude/storage')
+const { paths, writeAgentsConfig, identityCompatEnvironment, upsertClientSession, getClientSession, getEngineContextMessages } = await import('@openclaude/storage')
 const { makeV3MasterRetryQueue } = await import('../v3MasterRetryQueue.js')
 const profile = { profileId: 'registered-fixture', legacyAgentId: 'old-fixture', canonicalAgentId: 'market-fixture', localPersonaPath: 'agents/old-fixture/CLAUDE.md', localSkillStorageId: 'old-fixture' }
 let projection: any = { schema: 1, userId: '3', profiles: [{ profile, readiness: 'ready' }] }
@@ -33,12 +33,13 @@ const port = (server.address() as any).port
 const config: any = { version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: 'test' }, auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: join(home, 'sessions.db') }, defaults: { model: 'glm-5.2', permissionMode: 'default' } }
 const agents = [{ id: profile.legacyAgentId, model: 'glm-5.2', persona: paths.agentClaudeMd(profile.legacyAgentId) }, { id: profile.canonicalAgentId, source: 'marketplace' as const, model: 'glm-5.2', persona: paths.agentClaudeMd(profile.canonicalAgentId) }]
 let failNextConstruction = false
+let coldNativeFixture = false
 let onEngine: ((engine: EvidenceEngine, input: unknown) => Promise<void>) | undefined
-let executed: { agent: string; key: string; soul: string; env: Record<string,string>; native: string; input: unknown }[] = []
+let executed: { agent: string; key: string; soul: string; env: Record<string,string>; native: string | null; input: unknown }[] = []
 class EvidenceEngine extends EventEmitter {
-  engineId = 'ccb'; model = 'glm-5.2'; isRunning = false; lastActivityAt = Date.now(); nativeSessionId = 'unchanged-native'; sessionId = 'unchanged-native'; shutdowns = 0
+  engineId = 'ccb'; model = 'glm-5.2'; isRunning = false; lastActivityAt = Date.now(); nativeSessionId: string | null = 'unchanged-native'; sessionId = 'unchanged-native'; shutdowns = 0
   capabilities = { billingMode: 'proxy', supportsEffort: true, resumeKind: 'ccb-session', needsServerRequestId: false, historyMode: 'native-resume', permissionModel: 'native', emitsCallUsage: true, emitsToolInputDeltas: true, supportsNativeCompact: true, multimodalInput: 'native' }
-  constructor(readonly opts: any) { super() }
+  constructor(readonly opts: any) { super(); if (coldNativeFixture) this.nativeSessionId = opts.resumeSessionId ?? null }
   async start() { this.isRunning = true }
   async shutdown() { this.shutdowns++; this.isRunning = false; if (this.failShutdown) throw new Error('fixture shutdown failure') }
   failShutdown = false
@@ -62,7 +63,7 @@ beforeEach(async () => {
   process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${port}`
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'fixture-token'
   process.env.OC_USER_ID = '3'
-  projection = { schema: 1, userId: '3', profiles: [{ profile, readiness: 'ready' }] }; status = 200; executed = []; fetches = 0; onEngine = undefined; failNextConstruction = false
+  projection = { schema: 1, userId: '3', profiles: [{ profile, readiness: 'ready' }] }; status = 200; executed = []; fetches = 0; onEngine = undefined; failNextConstruction = false; coldNativeFixture = false
   await mkdir(paths.agentDir(profile.legacyAgentId), { recursive: true })
   await mkdir(paths.agentDir(profile.canonicalAgentId), { recursive: true })
   await mkdir(join(home, 'core'), { recursive: true })
@@ -303,4 +304,52 @@ for (const failure of ['construct', 'shutdown'] as const) test(`identity refresh
   assert.notEqual(old.runner, oldRunner)
   assert.equal((old.runner as unknown as EvidenceEngine).opts.permissionMode, 'bypassPermissions')
   assert.notEqual(old._identityAgentFingerprint, oldFingerprint)
+})
+
+for (const resume of [false, true]) test(`identity runner refresh restores historical input without replaying a valid native resume (${resume})`, async () => {
+  coldNativeFixture = true
+  const sm = manager(), peer = `history-refresh-${resume}`, key = `agent:old-fixture:webchat:dm:${peer}`
+  const now = Date.now(), marker = 'HISTORY_EVIDENCE_A4_KEEP_ME'
+  await upsertClientSession({
+    id: peer, userId: '3', agentId: profile.legacyAgentId, title: 'fixture', pinned: false,
+    createdAt: now, lastAt: now, updatedAt: now,
+    messages: [{id: 'u-history-1', role: 'user', text: marker, ts: now}],
+  })
+  const before = JSON.stringify((await getClientSession(peer, '3'))?.messages)
+  assert.match(JSON.stringify(await getEngineContextMessages(peer, '3')), /HISTORY_EVIDENCE_A4_KEEP_ME/)
+  const session = await sm.getOrCreate({sessionKey: key, agent: agents[0], channel: 'webchat', peerId: peer, userId: '3'})
+  await sm.submit(session, 'first execution', () => {})
+  assert.equal(executed.length, 1)
+  assert.match(String(executed[0].input), /HISTORY_EVIDENCE_A4_KEEP_ME/)
+  assert.equal(session._historicalContextInjected, true, 'production path set history cache')
+  const oldRunner = session.runner
+  const nativeId = '11111111-1111-4111-8111-111111111179'
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = join(home, `native-history-${resume}`)
+  try {
+    const artifacts = join(process.env.CLAUDE_CONFIG_DIR, 'projects', 'fixture')
+    await mkdir(artifacts, {recursive: true})
+    if (resume) {
+      await writeFile(join(artifacts, nativeId + '.jsonl'), JSON.stringify({type: 'user', message: {role: 'user', content: marker}}) + '\n')
+      oldRunner.emit('session_id', nativeId)
+      await sm.awaitResumeMapFlush()
+    }
+    await writeFile(join(paths.home, 'openclaude.json'), JSON.stringify({...config, defaults: {...config.defaults, permissionMode: 'bypassPermissions'}}))
+    await sm.submit(session, 'second execution on fresh runner', () => {})
+    assert.equal(executed.length, 2)
+    assert.equal(sm.getByKey(key), session)
+    assert.notEqual(session.runner, oldRunner)
+    if (resume) {
+      assert.equal((session.runner as unknown as EvidenceEngine).opts.resumeSessionId, nativeId, 'real artifact resolver retained native resume')
+      assert.equal(String(executed[1].input), 'second execution on fresh runner', 'native context needs no duplicate historical injection')
+    } else {
+      assert.equal(session.runner.nativeSessionId, null)
+      assert.match(String(executed[1].input), /HISTORY_EVIDENCE_A4_KEEP_ME/)
+    }
+    assert.equal(JSON.stringify((await getClientSession(peer, '3'))?.messages), before, 'stored historical messages remain byte-identical')
+  } finally {
+    await sm.awaitResumeMapFlush()
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+  }
 })

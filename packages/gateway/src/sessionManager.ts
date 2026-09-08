@@ -4206,6 +4206,11 @@ export class SessionManager {
       session.agentProvider = opts.agent.provider
       session._contextRebuildNotice = contextRebuildNotice
       session._forceHistoricalContextOnFirstTurn = resumeTransportMismatch || undefined
+      // These markers describe a runner's native context, not the logical
+      // owner. Let the existing resume/history gate evaluate the new runner:
+      // a valid native resume still skips replay; a cold runner gets history.
+      session._historicalContextInjected = false
+      session._historicalContextInjectedKey = undefined
       session.lastUsedAt = now
     }
     runner.on(
