@@ -3631,7 +3631,7 @@
       "id": "INC-20260908-LATE-DELEGATE-OWNER",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "一层委派在队长 T1 结束后才完成时，完成卡按 session 缓冲进入随后 T2 的 tape；losslessTurnTape 因 parentTurnKey=T1 拒绝该 tape。根治：启动冻结 exact owner，drain 同步 seal，晚到走原 owner 受限 continuation；同 logical run 一张卡，异 payload 可见冲突，T2 零污染。历史 65 条只交只读 planner，不 requeue。部署源码门只证明防回退，不冒称端到端。",
+      "symptom": "一层委派在队长 T1 结束后才完成时，完成卡按 session 缓冲进入随后 T2 的 tape；losslessTurnTape 因 parentTurnKey=T1 拒绝该 tape。根治：启动冻结 exact owner，drain 同步 seal，晚到走原 owner 受限 continuation；同 logical run 一张卡，异 payload 可见冲突，T2 零污染。历史 65 条只交只读 planner，不 requeue。发布门复用既有runner实际执行71个精确B1用例；SQL为隔离替身，不冒称真实PG或浏览器端到端。",
       "rootFixCommit": "742f7562",
       "coverageCommits": [
         "e647b850",
@@ -3640,7 +3640,9 @@
         "bbede052",
         "0a93d2eb",
         "a11d3094",
-        "b36f9535"
+        "b36f9535",
+        "2d648abf",
+        "e667e95e"
       ],
       "regressions": [
         {
@@ -3709,9 +3711,24 @@
           "assertion": "late agent-group continuation defers visible until after parts+finalize"
         },
         {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "root clientMessageId stamp ACKs the same run and real drain never quarantines"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "no-run purged-parts root publishes Phase A and dequeues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "legacy unstamped root does not acquire a later header clientMessageId stamp"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
-          "assertion": "INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof."
+          "assertion": "INC-20260908-LATE-DELEGATE-OWNER executed exact-owner seal, durable retry, root records, origin stamp and read-only planner"
         }
       ]
     }

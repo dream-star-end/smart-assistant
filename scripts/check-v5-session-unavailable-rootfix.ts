@@ -334,8 +334,8 @@ function summaryValue(tap: string, key: string): number {
   return values[0]!
 }
 
-function parseLeafLine(line: string): { ok: boolean; name: string; skip: string | null; todo: boolean } | null {
-  const match = /^( {4})(not )?ok \d+ - (.+)$/.exec(line)
+function parseLeafLine(line: string, leafIndent: 4 | 8 = 4): { ok: boolean; name: string; skip: string | null; todo: boolean } | null {
+  const match = new RegExp(`^( {${leafIndent}})(not )?ok \\d+ - (.+)$`).exec(line)
   if (!match) return null
   const rest = match[3]!
   const directive = /^(.*?)\s+#\s*(SKIP|TODO)\b(.*)$/i.exec(rest)
@@ -360,13 +360,13 @@ function assertExactLeaves(actual: string[], expected: readonly string[], label:
   assert.equal(counts.size, 0, `${label}: unexpected leaves ${[...counts.keys()].join(', ')}`)
 }
 
-function assertFullTap(tap: string, expected: readonly string[], label: string): void {
+function assertFullTap(tap: string, expected: readonly string[], label: string, leafIndent: 4 | 8 = 4): void {
   assert.equal((tap.match(/^TAP version 13\r?$/gm) ?? []).length, 1, `${label}: missing TAP header`)
   assert.equal((tap.match(/^1\.\.\d+\r?$/gm) ?? []).length, 1, `${label}: missing complete root plan`)
   assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!/gm)
   const leaves: string[] = []
   for (const line of tap.split(/\r?\n/)) {
-    const parsed = parseLeafLine(line)
+    const parsed = parseLeafLine(line, leafIndent)
     if (!parsed) continue
     if (!parsed.ok || parsed.todo || parsed.skip) {
       throw new Error(`${label}: leaf must pass without skip/todo: ${line}`)
@@ -383,14 +383,14 @@ function assertFullTap(tap: string, expected: readonly string[], label: string):
   assert.equal((tap.match(/^# duration_ms [0-9.]+\r?$/gm) ?? []).length, 1, `${label}: missing TAP completion summary`)
 }
 
-function assertSelectedTap(tap: string, expected: readonly string[], label: string): void {
+function assertSelectedTap(tap: string, expected: readonly string[], label: string, leafIndent: 4 | 8 = 4): void {
   assert.equal((tap.match(/^TAP version 13\r?$/gm) ?? []).length, 1, `${label}: missing TAP header`)
   assert.equal((tap.match(/^1\.\.\d+\r?$/gm) ?? []).length, 1, `${label}: missing complete root plan`)
   assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!/gm)
   const selected: string[] = []
   let filteredSkips = 0
   for (const line of tap.split(/\r?\n/)) {
-    const parsed = parseLeafLine(line)
+    const parsed = parseLeafLine(line, leafIndent)
     if (!parsed) continue
     const wanted = (expected as readonly string[]).includes(parsed.name)
     if (wanted) {
@@ -424,6 +424,7 @@ async function runTapProof(opts: {
   label: string
   timeoutMs: number
   namePattern?: string
+  leafIndent?: 4 | 8
 }): Promise<void> {
   for (const rel of opts.files) {
     const abs = join(opts.fromRoot, rel)
@@ -497,8 +498,8 @@ async function runTapProof(opts: {
         resolveProof(stdout)
       })
     })
-    if (opts.namePattern) assertSelectedTap(tap, opts.expected, opts.label)
-    else assertFullTap(tap, opts.expected, opts.label)
+    if (opts.namePattern) assertSelectedTap(tap, opts.expected, opts.label, opts.leafIndent)
+    else assertFullTap(tap, opts.expected, opts.label, opts.leafIndent)
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
@@ -568,3 +569,139 @@ if (!lateDelegateHelperSrc.includes('.update(\'oc-late-delegate-run-v1\\0\')')) 
   throw new Error('[late-delegate-owner] tape key must derive from the logical run, not the content hash')
 }
 console.log('[late-delegate-owner] PASS — INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof.')
+
+// Execute reviewed B1 behavior with exact leaf names/counts; no production DB.
+const B1_OWNER_LEAVES = [
+  "identity is deterministic and insertion-order insensitive",
+  "locator validation is strict",
+  "continuation args carry owner locator, empty text, deterministic 64-hex tape key",
+  "seal-before: matching current turn buffers and drains with that turn",
+  "sealed owner rejects re-buffer; the caller must use the late path",
+  "cross-turn owner is rejected: a T1 group never buffers onto T2",
+  "drain(turnKey) never takes another turn’s late entries",
+  "invalid locator is rejected before touching the buffer",
+  "absent parent session returns false (caller persists via frozen locator)",
+  "same owner/run is idempotent in the ordinary buffer; conflict is visible",
+  "cross-session owner locator is rejected even when turnKey matches",
+  "writes one restricted continuation; retry is idempotent; conflict suppressed",
+  "cross-session sessionKey/peer mismatch never schedules a write",
+  "invalid locator never schedules a write",
+  "queued outcome is reliable waiting, not a drop: retry keeps one card",
+  "stageDurable failure does not cache-swallow the same payload retry",
+  "concurrent same-payload late deliveries merge into one inflight write",
+  "session_deleted is terminal and does not resurrect",
+  "acked root run stays unique after FIFO eviction of the admission map",
+  "root drain claims the logical run so late does not mint a second card",
+  "256 sequential ACK of other owners cannot duplicate a live buffered run",
+  "sink-pending inflight survives other-owner ACK churn; late does not mint a second card",
+  "fresh manager stages a late completion without relying on local root state",
+  "root persist drop is not durable: late retry of the same run is allowed",
+  "seal-after path: one continuation card for T1, zero pollution in T2, no duplicate",
+  "seal-before contrast: the same group buffered mid-turn rides the owner tape",
+  "freezes the exact owner at launch and passes it to the buffer",
+  "routes to the persistent late path when the exact-owner buffer rejects",
+  "falls back to ownerless buffering when no webchat progress target exists",
+  "512 capacity-rejected attempts cannot evict a live frozen owner onto T2"
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ["packages/gateway/src/__tests__/delegateLateCompletion.test.ts"],
+  expected: B1_OWNER_LEAVES,
+  label: "b1-owner",
+  timeoutMs: 120_000,
+  leafIndent: 8,
+})
+
+const B1_SHUTDOWN_LEAVES = [
+  "shutdown waits for the real durable receipt before clearing the sink, not for a local root lookup",
+  "a missing managed sink rejection is consumed and releases admission for a later durable retry"
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ["packages/gateway/src/__tests__/lateDelegateShutdown.test.ts"],
+  expected: B1_SHUTDOWN_LEAVES,
+  label: "b1-shutdown",
+  timeoutMs: 120_000,
+  leafIndent: 4,
+})
+
+const B1_ROOT_LEAVES = [
+  "fingerprint changes when transcript/status change and ignores ordinal",
+  "inspect: same published records are idempotent; different content conflicts; parts stay deleted",
+  "inspect: missing root, incomplete records, or lookup EIO are retryable",
+  "inspect: ready root without the run proceeds; other user retry; envelope session mismatch rejects",
+  "prepare skips materialize when root already has the same run",
+  "finalize HTTP path is idempotent and does not run Phase A visible publish",
+  "finalize retries when owner records are incomplete, not when parts were legally deleted",
+  "finalize conflicts when root run content differs",
+  "leader: same run cannot ACK before the root is durable and visible",
+  "leader: idempotent root hit must not bypass payload/envelope locator check",
+  "inspect: unready root is retry; header/record identity mismatch is retry",
+  "ordinary root finalize does not extra-read all parts before admission",
+  "same run on purged-parts root ACKs 200 and drains",
+  "no-run purged-parts root publishes Phase A and dequeues",
+  "root clientMessageId stamp ACKs the same run and real drain never quarantines",
+  "legacy unstamped root does not acquire a later header clientMessageId stamp",
+  "root header versus published origin mismatch is an immutable conflict",
+  "late group cannot hide its conflicting origin under the trusted root stamp",
+  "different published content is 409 fatal, not a durable retry loop",
+  "unready root queues then drains after visible+finalized records appear",
+  "EIO then restore published records drains the real queue"
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ["packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts"],
+  expected: B1_ROOT_LEAVES,
+  label: "b1-root",
+  timeoutMs: 120_000,
+  leafIndent: 4,
+})
+
+const B1_DIRECT_LEAVES = [
+  "hydrateDirectTapePage deferred locator carries header owner, not a pre-stamped fixture",
+  "listTurnTapeRecordsImpl forward and before stamp continuation owner from header SELECT"
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ["packages/commercial/src/__tests__/directTapePageOwner.test.ts"],
+  expected: B1_DIRECT_LEAVES,
+  label: "b1-direct",
+  timeoutMs: 120_000,
+  leafIndent: 4,
+})
+
+const B1_PLANNER_LEAVES = [
+  "parseRequeueArgs defaults to dry-run",
+  "late-delegate planner: exact owner → continuation; missing root is retryable skip",
+  "snapshot planner emits missing/unchecked instead of empty plans[]",
+  "planner group hash covers transcript/result/status and fence is per-requestId",
+  "CLI snapshot path prints per-group plans and refuses execute",
+  "stage 1 requeues materialization; stage 2 skips when settlement is unverified",
+  "complete materialization is not requeued",
+  "verified matching billing job is kind-precise requeued",
+  "verified mismatched authority stops at manual_reconcile",
+  "job authority prefers column then payload",
+  "waiver jobs must match turnKey and reason, not only billingAnchorId",
+  "any manual_reconcile settlement blocks every settlement requeue on that tape",
+  "production target matches env-file source and host, not only exact db name",
+  "resolveTapeIdentities refuses tape_id LIMIT 1 collisions",
+  "execute re-reads under composite FOR UPDATE in the same transaction"
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ["scripts/__tests__/requeueFailedTapeJobs.test.ts"],
+  expected: B1_PLANNER_LEAVES,
+  label: "b1-planner",
+  timeoutMs: 120_000,
+  leafIndent: 4,
+})
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/v3MasterSink.test.ts'],
+  expected: ["late agent-group continuation defers visible until after parts+finalize"],
+  label: 'b1-visible-order',
+  timeoutMs: 60_000,
+  namePattern: "late\\ agent\\-group\\ continuation\\ defers\\ visible\\ until\\ after\\ parts\\+finalize",
+})
+console.log("[late-delegate-owner] PASS — INC-20260908-LATE-DELEGATE-OWNER executed exact-owner seal, durable retry, root records, origin stamp and read-only planner")
