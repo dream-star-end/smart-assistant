@@ -311,6 +311,8 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
     await writeFile(fake, [
       `#!${process.execPath}`,
       "const path = require('node:path')",
+      "const fs = require('node:fs')",
+      `const controlDir = ${JSON.stringify(dir)}`,
       "const { DatabaseSync } = require('node:sqlite')",
       "const db = new DatabaseSync(path.join(process.env.OPENCLAUDE_HOME, 'zcode-cli', 'cli', 'db', 'db.sqlite'))",
       'const now = Date.now()',
@@ -318,44 +320,59 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       "db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run('reason_live','msg_live','sess_prior',now,JSON.stringify({type:'reasoning',text:'先',time:{start:now}}),0)",
       "db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run('text_live_a','msg_live','sess_prior',now+1,JSON.stringify({type:'text',text:'答',time:{start:now+1}}),1)",
       "db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run('text_live_b','msg_live','sess_prior',now+2,JSON.stringify({type:'text',text:'案',time:{start:now+2}}),2)",
-      "setTimeout(() => db.prepare('UPDATE part SET data=? WHERE id=?').run(JSON.stringify({type:'reasoning',text:'先思考',time:{start:now}}),'reason_live'), 250)",
-      "setTimeout(() => { process.stdout.write(JSON.stringify({sessionId:'sess_prior',response:'答案完成',usage:{inputTokens:12,outputTokens:4,cacheReadTokens:0,cacheWriteTokens:0},eventCount:3,projection:{status:'idle',turnCount:1,totalTokenCount:16,contextUsed:16,contextWindow:1000}})+'\\n'); db.close() }, 2000)",
+      'let advanced = false',
+      'let finished = false',
+      'const advance = () => {',
+      "  if (!advanced && fs.existsSync(path.join(controlDir, 'advance'))) { advanced = true; db.prepare('UPDATE part SET data=? WHERE id=?').run(JSON.stringify({type:'reasoning',text:'先思考',time:{start:now}}),'reason_live') }",
+      "  if (advanced && !finished && fs.existsSync(path.join(controlDir, 'finish'))) { finished = true; watcher.close(); process.stdout.write(JSON.stringify({sessionId:'sess_prior',response:'答案完成',usage:{inputTokens:12,outputTokens:4,cacheReadTokens:0,cacheWriteTokens:0},eventCount:3,projection:{status:'idle',turnCount:1,totalTokenCount:16,contextUsed:16,contextWindow:1000}})+'\\n'); db.close() }",
+      '}',
+      'const watcher = fs.watch(controlDir, advance)',
+      'advance()',
     ].join('\n'))
     await chmod(fake, 0o755)
     const previousBin = process.env.OC_ZCODE_CLI_BIN
     const previousHome = process.env.OPENCLAUDE_HOME
     process.env.OC_ZCODE_CLI_BIN = fake
     process.env.OPENCLAUDE_HOME = home
+    const adapter = new ZcodeAdapter(createOpts(dir))
     try {
-      const adapter = new ZcodeAdapter(createOpts(dir))
       const events: EngineEvent[] = []
+      const listeners = new Set<() => void>()
+      const content = (kind: 'thinking' | 'text') => events
+        .filter((event) => event.kind === 'block' && event.block.kind === kind)
+        .map((event) => event.kind === 'block' && (event.block.kind === 'thinking' || event.block.kind === 'text') ? event.block.text : '')
+        .join('')
+      // Synchronize the real CLI fixture on observed stream content, not spawn
+      // latency versus two unrelated wall-clock timers. The bound only detects hangs.
+      const waitForContent = (thinking: string, text: string) => new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          listeners.delete(check)
+          reject(new Error(`live SQLite stream did not reach ${JSON.stringify({ thinking, text })}; observed ${JSON.stringify({ thinking: content('thinking'), text: content('text') })}`))
+        }, 10_000)
+        const check = () => {
+          if (content('thinking') !== thinking || content('text') !== text) return
+          clearTimeout(timer)
+          listeners.delete(check)
+          resolve()
+        }
+        listeners.add(check)
+        check()
+      })
       adapter.on('error', () => {})
       const run = adapter.submitTurn({
         input: 'stream it',
         requestId: REQUEST_ID,
         assistantMessageId: 'answer-base',
         thinkingMessageId: 'thinking-base',
-        onEvent: (event) => events.push(event),
+        onEvent: (event) => { events.push(event); for (const notify of listeners) notify() },
         sessionTotals: { totalCostUSD: 0, turns: 0 },
         toolUseIdToName: new Map(),
       })
       await run.submitted
-      const deadline = Date.now() + 1_500
-      while (
-        Date.now() < deadline &&
-        !(
-          events
-            .filter((event) => event.kind === 'block' && event.block.kind === 'text')
-            .map((event) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
-            .join('') === '答案' &&
-          events
-            .filter((event) => event.kind === 'block' && event.block.kind === 'thinking')
-            .map((event) => event.kind === 'block' && event.block.kind === 'thinking' ? event.block.text : '')
-            .join('') === '先思考'
-        )
-      ) {
-        await new Promise((resolve) => setTimeout(resolve, 50))
-      }
+      await waitForContent('先', '答案')
+      assert.equal(events.some((event) => event.kind === 'final'), false)
+      await writeFile(path.join(dir, 'advance'), 'observed-initial-stream')
+      await waitForContent('先思考', '答案')
       assert.equal(events.some((event) => event.kind === 'final'), false)
       assert.equal(
         events
@@ -371,6 +388,7 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
           .join(''),
         '答案',
       )
+      await writeFile(path.join(dir, 'finish'), 'observed-updated-stream')
       const summary = await run.summary
       assert.equal(summary?.thinkingText, '先思考')
       assert.equal(summary?.assistantText, '答案完成')
@@ -383,6 +401,7 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       )
       assert.equal(events.at(-1)?.kind, 'final')
     } finally {
+      await adapter.shutdown()
       restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
       restoreEnv('OPENCLAUDE_HOME', previousHome)
       await rm(dir, { recursive: true, force: true })
