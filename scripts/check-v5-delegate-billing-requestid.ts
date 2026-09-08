@@ -18,7 +18,9 @@
  * Run: npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -387,6 +389,100 @@ assert.ok(
   "v5-selfhost-master-release-lib.sh must invoke check-v5-delegate-billing-requestid.ts",
 );
 
+// INC-20260908-DELEGATE-WAIT-CLOSE: execute the durable lifecycle contract in
+// this pinned tree, not a source-marker check or a log from an earlier build.
+const WAIT_CLOSE_CASES = [
+  "complete then close then late sleep does not read SQLite or unhandle",
+  "pending close then late sleep returns expired once and does not read SQLite",
+  "custom sleep that ignores AbortSignal does not delay wait or read after settle",
+  "late reject from signal-ignoring sleep is consumed and does not read SQLite",
+  "synchronous sleep throw rejects wait and clears waiter",
+  "asynchronous sleep reject rejects wait and clears waiter",
+  "get throw after sleep fulfill rejects wait and clears waiter",
+  "normal timeout returns the current job view exactly once",
+  "default sleep timer is actually cancelled on complete",
+] as const;
+
+function assertWaitCloseTap(tap: string): void {
+  assert.equal((tap.match(/^TAP version 13\r?$/gm) ?? []).length, 1, "missing TAP header");
+  assert.equal((tap.match(/^1\.\.1\r?$/gm) ?? []).length, 1, "missing complete suite plan");
+  assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!|^\s*ok\b[^\r\n]*#\s*(?:SKIP|TODO)\b/gmi);
+  for (const [key, value] of Object.entries({ tests: 9, suites: 1, pass: 9, fail: 0, cancelled: 0, skipped: 0, todo: 0 })) {
+    const values = [...tap.matchAll(new RegExp(`^# ${key} (\\d+)\\r?$`, "gm"))].map(match => Number(match[1]));
+    assert.deepEqual(values, [value], `wait-close TAP ${key} must equal ${value} exactly once`);
+  }
+  assert.equal((tap.match(/^# duration_ms [0-9.]+\r?$/gm) ?? []).length, 1, "missing TAP completion summary");
+  const leaves = [...tap.matchAll(/^    ok \d+ - (.+)\r?$/gm)].map(match => match[1]!.trim());
+  assert.deepEqual(leaves, [...WAIT_CLOSE_CASES], "all nine lifecycle cases must succeed exactly once");
+}
+
+async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000): Promise<void> {
+  const testFile = join(candidateRoot, "packages/gateway/src/__tests__/waitClose.test.ts");
+  // Resolve from the candidate (never npx download / a global package fallback).
+  const tsx = createRequire(join(candidateRoot, "package.json")).resolve("tsx");
+  readFileSync(testFile); // missing fixture must fail before spawning
+  const home = mkdtempSync(join(tmpdir(), "oc-wait-close-proof-"));
+  const env: NodeJS.ProcessEnv = {};
+  // Deliberate allowlist: no real platform identity, DB override, NODE_OPTIONS,
+  // preload, master endpoint or inherited delegate flag can enter the fixture.
+  for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "SystemRoot"]) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  for (const dir of ["home", "state", "tmp"]) mkdirSync(join(home, dir));
+  env.HOME = join(home, "home");
+  env.OPENCLAUDE_HOME = join(home, "state");
+  env.TMPDIR = join(home, "tmp");
+  env.NO_COLOR = "1";
+  try {
+    const tap = await new Promise<string>((resolveProof, rejectProof) => {
+      const child = spawn(process.execPath, ["--import", tsx, "--test", "--test-reporter=tap", testFile], {
+        cwd: candidateRoot, env, detached: true, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let bytes = 0;
+      let failure: Error | undefined;
+      const stop = (reason: string): void => {
+        failure ??= new Error(reason);
+        if (child.pid !== undefined) {
+          try { process.kill(-child.pid, "SIGKILL"); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ESRCH") failure = err as Error; }
+        }
+      };
+      const onInterrupt = () => stop("wait-close proof interrupted");
+      process.on("SIGINT", onInterrupt);
+      process.on("SIGTERM", onInterrupt);
+      const timer = setTimeout(() => stop("wait-close proof timed out"), timeoutMs);
+      const capture = (target: "stdout" | "stderr", data: Buffer): void => {
+        bytes += data.length;
+        if (bytes > 8 * 1024 * 1024) { stop("wait-close proof exceeded output bound"); return; }
+        if (target === "stdout") stdout += data.toString("utf8");
+        else stderr += data.toString("utf8");
+      };
+      child.stdout.on("data", data => capture("stdout", data));
+      child.stderr.on("data", data => capture("stderr", data));
+      child.on("error", err => { failure ??= err; });
+      child.on("close", (code, signal) => {
+        clearTimeout(timer);
+        process.off("SIGINT", onInterrupt);
+        process.off("SIGTERM", onInterrupt);
+        if (failure || code !== 0 || signal !== null) {
+          rejectProof(new Error(`${failure?.message ?? `wait-close exit=${code} signal=${signal}`}\n${stdout}\n${stderr}`));
+          return;
+        }
+        resolveProof(stdout);
+      });
+    });
+    assertWaitCloseTap(tap);
+    console.log(tap.trimEnd());
+    console.log("[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters");
+  } finally {
+    // close has been observed before removal, including timeout/group kill.
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+await runWaitCloseProof(root);
 rmSync(testHome, { recursive: true, force: true });
 console.log(
   "[delegate-billing-requestid] PASS — codex/grok delegate admits a 32-hex requestId that reaches sessions.submit, codex_billing is live-settled once with delegate attribution, glm skips, failures abandon, failed settles are queued and retried once",

@@ -3465,6 +3465,33 @@
           "assertion": "filtered empty page can load more and stops at raw total"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-DELEGATE-WAIT-CLOSE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "委派wait已完成或close关闭真实SQLite后，迟到sleep仍先读取关闭数据库，产生未处理异步拒绝。每wait终态占位先于读库并取消真实timer；忽略signal的旧sleep迟到结果被消费，不改变正常timeout和close expired语义。",
+      "rootFixCommit": "ac1d0426",
+      "coverageCommits": [
+        "aa3eb066"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/waitClose.test.ts",
+          "assertion": "complete then close then late sleep does not read SQLite or unhandle"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/waitClose.test.ts",
+          "assertion": "default sleep timer is actually cancelled on complete"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters"
+        }
+      ]
     }
   ]
 }
