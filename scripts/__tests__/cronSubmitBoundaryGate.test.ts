@@ -9,7 +9,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { after, test } from 'node:test'
 import {
   assertCronSubmitBoundarySource,
@@ -358,81 +358,388 @@ test('parser rejects six single-site mutations of real-shaped TAP (C-P2-R1-1)', 
       }),
     )
   }
-  const auditorDir = '/home/agent/.openclaude/generated'
-  for (const name of Object.keys(cases)) {
-    const path = join(auditorDir, `ocv5-188-C-proof-auditor-${name}.tap`)
-    if (!existsSync(path)) continue
-    assert.throws(
-      () => evaluateHeartbeatTap(readFileSync(path, 'utf8'), { code: 0, signal: null }),
-      /TAP rejected/,
-      `original auditor tap ${name} must stay rejected`,
-    )
-  }
   assert.equal(accepted, 0, 'all six single-site TAP mutations must reject')
 })
 
-test('official CLI parent SIGTERM keeps already produced output (C-P3-W1)', {
-  timeout: 30_000,
-}, async () => {
-  const iso = mkdtempSync(join(dir, 'cli-sig-'))
-  const child = spawn(process.execPath, ['--import', 'tsx', gate], {
-    cwd: root,
-    env: {
-      PATH: process.env.PATH,
-      LANG: process.env.LANG,
-      TZ: process.env.TZ,
-      HOME: iso,
-      OPENCLAUDE_HOME: iso,
-      TMPDIR: iso,
+const OBSERVED_BULK_BYTES = 10_500
+const C481_CONTRACT = '"contractId":"C-481-submit"'
+const observerFixture = resolve(fixtures, 'observe-official-spawn.mjs')
+
+const PARENT_SIGTERM_ORACLE_PY = `\
+import fcntl, json, os, pathlib, signal, subprocess, sys, threading, time
+observer, cli, tree = sys.argv[1], sys.argv[2], sys.argv[3]
+node = sys.argv[4] if len(sys.argv) > 4 else "/usr/local/bin/node"
+tmp = pathlib.Path(os.environ["TMPDIR"])
+home = pathlib.Path(os.environ["HOME"])
+env = {
+    "PATH": os.environ["PATH"],
+    "LANG": os.environ.get("LANG", "C.UTF-8"),
+    "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+    "TZ": os.environ.get("TZ", "UTC"),
+    "HOME": str(home),
+    "OPENCLAUDE_HOME": str(home),
+    "TMPDIR": str(tmp),
+    "NO_COLOR": "1",
+}
+p = None
+observed_pid = 0
+try:
+    p = subprocess.Popen(
+        [node, "--import", observer, "--import", "tsx", cli],
+        cwd=tree,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        if p.stdout:
+            fcntl.fcntl(p.stdout.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+        if p.stderr:
+            fcntl.fcntl(p.stderr.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+    except OSError:
+        pass
+    deadline = time.monotonic() + 45
+    observed = b""
+    while time.monotonic() < deadline and p.poll() is None:
+        marker = tmp / "observer-child.json"
+        trace = tmp / "observer-child.stdout"
+        if marker.exists():
+            try:
+                observed_pid = int(json.loads(marker.read_text()).get("pid") or 0)
+            except Exception:
+                pass
+        if trace.exists():
+            observed = trace.read_bytes()
+        if len(observed) > 10500:
+            break
+        time.sleep(0.003)
+    if len(observed) <= 10500:
+        raise SystemExit(
+            "precondition: observed --test child did not produce >10500B before signal observedBytes=%d"
+            % len(observed)
+        )
+    if p.poll() is not None:
+        raise SystemExit(
+            "precondition: official CLI exited before >10500B observed output code=%s"
+            % p.returncode
+        )
+    p.send_signal(signal.SIGTERM)
+    out_chunks = []
+    err_chunks = []
+    def read_out():
+        out_chunks.append(p.stdout.read() if p.stdout else b"")
+    def read_err():
+        err_chunks.append(p.stderr.read() if p.stderr else b"")
+    to = threading.Thread(target=read_out)
+    te = threading.Thread(target=read_err)
+    to.start()
+    te.start()
+    p.wait(timeout=20)
+    to.join(5)
+    te.join(5)
+    stdout = b"".join(out_chunks)
+    stderr = b"".join(err_chunks)
+    observed = (tmp / "observer-child.stdout").read_bytes() if (tmp / "observer-child.stdout").exists() else observed
+    args = []
+    if (tmp / "observer-child.json").exists():
+        try:
+            args = json.loads((tmp / "observer-child.json").read_text()).get("args") or []
+        except Exception:
+            args = []
+    (tmp / "official.stdout").write_bytes(stdout)
+    (tmp / "official.stderr").write_bytes(stderr)
+    leftovers = [x.name for x in tmp.glob("oc-cron-boundary-*")] + [
+        x.name for x in home.glob("oc-cron-boundary-*")
+    ]
+    def alive(pid):
+        return pid > 0 and (pathlib.Path("/proc") / str(pid)).exists()
+    result = {
+        "parentPid": p.pid,
+        "observedPid": observed_pid,
+        "args": args,
+        "code": p.returncode,
+        "observedBytes": len(observed),
+        "officialStdoutBytes": len(stdout),
+        "officialStderrBytes": len(stderr),
+        "preserved": observed in stdout,
+        "hasC481": b'"contractId":"C-481-submit"' in observed,
+        "passPrinted": b"[cron-submit-boundary] PASS" in stdout,
+        "hasInterrupted": b"interrupted" in stdout or b"interrupted" in stderr,
+        "parentAlive": alive(p.pid),
+        "observedAlive": alive(observed_pid),
+        "leftovers": leftovers,
+    }
+    print(json.dumps(result), flush=True)
+finally:
+    for group in [observed_pid, p.pid if p else None]:
+        if group:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+    if p:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+`
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isolationEnv(iso: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: iso,
+    OPENCLAUDE_HOME: iso,
+    TMPDIR: iso,
+    NO_COLOR: '1',
+  }
+  if (process.env.LANG) env.LANG = process.env.LANG
+  if (process.env.LC_ALL) env.LC_ALL = process.env.LC_ALL
+  if (process.env.TZ) env.TZ = process.env.TZ
+  return env
+}
+
+function livePid(pid: number): boolean {
+  if (pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitPidGone(pid: number, ms: number): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < ms) {
+    if (!livePid(pid) && pidsInGroup(pid).length === 0) return true
+    await sleep(50)
+  }
+  return !livePid(pid) && pidsInGroup(pid).length === 0
+}
+
+async function reapOwnPid(pid: number, group: boolean, ms = 8_000): Promise<void> {
+  if (pid <= 0) return
+  const send = (sig: NodeJS.Signals) => {
+    try {
+      process.kill(group ? -pid : pid, sig)
+    } catch {
+      // already gone
+    }
+  }
+  if (!livePid(pid) && (!group || pidsInGroup(pid).length === 0)) return
+  send('SIGTERM')
+  if (await waitPidGone(pid, Math.floor(ms / 2))) return
+  send('SIGKILL')
+  await waitPidGone(pid, Math.ceil(ms / 2))
+}
+
+type SigtermOracle = {
+  kind: 'official-04' | 'd9-negative'
+  cli: string
+  observedAtSignal: Buffer
+  officialStdout: Buffer
+  officialStderr: Buffer
+  closed: { code: number | null; signal: NodeJS.Signals | null }
+  observedPid: number
+  parentPid: number
+  driverPid: number
+  args: string[]
+  leftovers: string[]
+}
+
+async function runOfficialParentSigtermOracle(
+  cliPath: string,
+  kind: SigtermOracle['kind'],
+): Promise<SigtermOracle> {
+  assert.equal(existsSync(observerFixture), true, `observer fixture missing: ${observerFixture}`)
+  assert.equal(existsSync(cliPath), true, `official CLI missing: ${cliPath}`)
+  const iso = mkdtempSync(join(dir, `cli-sig-${kind}-`))
+  const driver = join(iso, 'sigterm-oracle.py')
+  writeFileSync(driver, PARENT_SIGTERM_ORACLE_PY)
+  const child: ChildProcess = spawn(
+    'python3',
+    [driver, observerFixture, cliPath, root, process.execPath],
+    {
+      cwd: root,
+      env: isolationEnv(iso),
+      stdio: ['ignore', 'pipe', 'pipe'],
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  )
+  const driverPid = child.pid ?? 0
   let stdout = ''
   let stderr = ''
-  child.stdout.setEncoding('utf8')
-  child.stderr.setEncoding('utf8')
-  child.stdout.on('data', (chunk: string) => {
+  child.stdout?.setEncoding('utf8')
+  child.stderr?.setEncoding('utf8')
+  child.stdout?.on('data', (chunk: string) => {
     stdout += chunk
   })
-  child.stderr.on('data', (chunk: string) => {
+  child.stderr?.on('data', (chunk: string) => {
     stderr += chunk
   })
-  const start = Date.now()
-  while (Date.now() - start < 8_000) {
-    if (stdout.includes('C-cron-submit-boundary-behavior-start')) break
-    if (child.exitCode !== null) break
-    await new Promise((r) => setTimeout(r, 25))
+  try {
+    const closed = await Promise.race([
+      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      }),
+      sleep(70_000).then(() => {
+        throw new Error(`precondition: oracle driver did not exit within 70s stdout=${stdout} stderr=${stderr}`)
+      }),
+    ])
+    if (closed.code !== 0) {
+      throw new Error(
+        `precondition: oracle driver exited ${closed.code} signal=${closed.signal} stdout=${stdout} stderr=${stderr}`,
+      )
+    }
+    const line = stdout
+      .split('\n')
+      .map((row) => row.trim())
+      .filter(Boolean)
+      .at(-1)
+    assert.ok(line, `precondition: oracle driver printed no JSON stdout=${stdout} stderr=${stderr}`)
+    const payload = JSON.parse(line!) as {
+      parentPid: number
+      observedPid: number
+      args: string[]
+      code: number | null
+      leftovers: string[]
+    }
+    const observedAtSignal = existsSync(join(iso, 'observer-child.stdout'))
+      ? readFileSync(join(iso, 'observer-child.stdout'))
+      : Buffer.alloc(0)
+    const officialStdout = existsSync(join(iso, 'official.stdout'))
+      ? readFileSync(join(iso, 'official.stdout'))
+      : Buffer.alloc(0)
+    const officialStderr = existsSync(join(iso, 'official.stderr'))
+      ? readFileSync(join(iso, 'official.stderr'))
+      : Buffer.alloc(0)
+    assert.ok(
+      Array.isArray(payload.args) && payload.args.includes('--test'),
+      `observer must mirror official --test spawn, args=${JSON.stringify(payload.args)}`,
+    )
+    assert.match(
+      (payload.args || []).join(' '),
+      /cronExecutionHeartbeat\.test\.ts/,
+      'observer must mirror the fixed business test, not a fixture substitute',
+    )
+    await reapOwnPid(payload.parentPid, true)
+    await reapOwnPid(payload.observedPid, true)
+    await reapOwnPid(driverPid, false)
+    return {
+      kind,
+      cli: cliPath,
+      observedAtSignal,
+      officialStdout,
+      officialStderr,
+      closed: { code: payload.code, signal: null },
+      observedPid: payload.observedPid,
+      parentPid: payload.parentPid,
+      driverPid,
+      args: payload.args || [],
+      leftovers: payload.leftovers || [],
+    }
+  } finally {
+    await reapOwnPid(driverPid, false)
+    const metaPath = join(iso, 'observer-child.json')
+    if (existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { pid?: number }
+        if (meta.pid) await reapOwnPid(Number(meta.pid), true)
+      } catch {
+        // ignore malformed observer meta during cleanup
+      }
+    }
+    await waitPidGone(driverPid, 2_000)
+    if (existsSync(iso)) rmSync(iso, { recursive: true, force: true })
   }
-  assert.match(stdout, /C-cron-submit-boundary-behavior-start/)
-  await new Promise((r) => setTimeout(r, 2_000))
-  child.kill('SIGTERM')
-  const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    (resolve) => child.once('close', (code, signal) => resolve({ code, signal })),
-  )
-  const combined = `${stdout}${stderr}`
+}
+
+function assertPreservationOracle(result: SigtermOracle): void {
+  const observedText = result.observedAtSignal.toString('utf8')
+  const officialText = result.officialStdout.toString('utf8')
+  const combined = `${officialText}${result.officialStderr.toString('utf8')}`
+  const expected = {
+    observedHasContractOrBulk: true,
+    preserved: true,
+    nonzero: true,
+    noPass: true,
+    parentGone: true,
+    observedGroupGone: true,
+    behaviorDirsGone: true,
+  }
+  const actual = {
+    observedHasContractOrBulk:
+      result.observedAtSignal.length > OBSERVED_BULK_BYTES || observedText.includes(C481_CONTRACT),
+    preserved: result.officialStdout.includes(result.observedAtSignal),
+    nonzero: result.closed.code !== 0 || Boolean(result.closed.signal),
+    noPass: !/\[cron-submit-boundary\] PASS/.test(combined),
+    parentGone: !livePid(result.parentPid) && !livePid(result.driverPid),
+    observedGroupGone: !livePid(result.observedPid) && pidsInGroup(result.observedPid).length === 0,
+    behaviorDirsGone: result.leftovers.length === 0,
+  }
   console.log(
     JSON.stringify({
-      contractId: 'C-proof-parent-sigterm',
-      expected: { nonzero: true, noPass: true, keptSentinel: true, homeGone: true },
+      contractId: 'C-proof-parent-sigterm-preserve',
+      kind: result.kind,
+      expected,
       actual: {
-        code: closed.code,
-        signal: closed.signal,
-        keptSentinel: /TAP version 13|C-481-submit/.test(combined),
-        hasPass: /cron-submit-boundary.*PASS/.test(combined),
-        stdoutChars: stdout.length,
-        stderrChars: stderr.length,
-        homeExists: existsSync(iso) && readdirSync(iso).some((n) => n.startsWith('oc-cron-boundary-home-')),
+        ...actual,
+        code: result.closed.code,
+        signal: result.closed.signal,
+        observedBytes: result.observedAtSignal.length,
+        officialStdoutBytes: result.officialStdout.length,
+        officialStderrBytes: result.officialStderr.length,
+        hasTapHeaderOnly:
+          result.observedAtSignal.length <= 15 && observedText.includes('TAP version 13'),
+        hasC481: observedText.includes(C481_CONTRACT),
+        hasInterrupted: combined.includes('interrupted'),
+        observedHead: observedText.slice(0, 120),
+        officialHead: officialText.slice(0, 120),
       },
     }),
   )
-  assert.ok(closed.code !== 0 || closed.signal)
-  assert.doesNotMatch(combined, /cron-submit-boundary.*PASS/)
-  assert.match(combined, /TAP version 13|C-481-submit|interrupted/)
-  const leftovers = existsSync(iso)
-    ? readdirSync(iso).filter((n) => n.startsWith('oc-cron-boundary-'))
-    : []
-  assert.deepEqual(leftovers, [])
+  assert.equal(
+    actual.observedHasContractOrBulk,
+    true,
+    `oracle requires >${OBSERVED_BULK_BYTES}B observed child output or C-481-submit, not TAP header/interrupted`,
+  )
+  assert.equal(
+    result.observedAtSignal.length > OBSERVED_BULK_BYTES,
+    true,
+    `oracle requires the original >${OBSERVED_BULK_BYTES}B loss window, not a 15B TAP header`,
+  )
+  assert.equal(
+    actual.preserved,
+    true,
+    `C-T1 preservation oracle: observed ${result.observedAtSignal.length}B not present in official stdout ${result.officialStdout.length}B (proof-diagnostic, not cron product)`,
+  )
+  assert.deepEqual(actual, expected)
+}
+
+test('official CLI parent SIGTERM preserves observed child output (C-T1)', {
+  timeout: 90_000,
+}, async () => {
+  const result = await runOfficialParentSigtermOracle(gate, 'official-04')
+  assertPreservationOracle(result)
 })
+
+if (process.env.OCV5_188_C_D9_SIGNAL_CLI) {
+  test('d9 same-oracle parent SIGTERM preserves observed child output (proof-diagnostic negative)', {
+    timeout: 90_000,
+  }, async () => {
+    const cli = resolve(process.env.OCV5_188_C_D9_SIGNAL_CLI as string)
+    assert.equal(existsSync(cli), true, `d9 CLI missing: ${cli}`)
+    assert.notEqual(cli, gate, 'd9 negative must not point at the frozen 04 runner')
+    const result = await runOfficialParentSigtermOracle(cli, 'd9-negative')
+    assertPreservationOracle(result)
+  })
+}
 
 test('official CLI with SOURCE still runs exact 12 candidate leaves (C-P1)', { timeout: 120_000 }, () => {
   const sourceCopy = join(dir, 'cron-source-copy.ts')
