@@ -9,12 +9,12 @@ import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
+import { EXPECTED_SCENES, PEAK_BUDGET, finalizeRows, record as recordScene } from "./find-in-session-collector.mjs";
 
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
-const PEAK_BUDGET = 80;
 const NEGATIVE_SHA = "87d4554efd27289844cfb3ce0146fb713ce24954";
 const NEGATIVE_HASHES = {
   "components/MessageRenderer.tsx": "f92af0793d94540045f4d3f9f4fea2406ac0f2084574cda6aa5f6b6564a4ab95",
@@ -41,6 +41,7 @@ function sourceEvidence() {
       "baselines/87d4554-MessageRenderer.tsx": pinnedHash,
     },
     harnessSha256: sha256(readFileSync(new URL("./find-in-session-harness.tsx", import.meta.url))),
+    collectorSha256: sha256(readFileSync(new URL("./find-in-session-collector.mjs", import.meta.url))),
     testSha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
   };
 }
@@ -104,47 +105,12 @@ function snapshot(page) {
   });
 }
 
-function record(rows, scene, expected, actual, events, pass, failReason) {
-  const row = {
-    contractId: scene,
+function record(rows, scene, expected, actual, events, pass, failReason, phase) {
+  return recordScene(rows, scene, expected, actual, events, pass, failReason, {
     mode: negative ? "negative-overlay" : "candidate",
-    expected,
-    actual: {
-      key: actual.key,
-      text: actual.text?.slice(0, 80),
-      visible: actual.visible,
-      findPin: actual.findPin,
-      hit: actual.hit,
-      following: actual.following,
-      wheelFence: actual.wheelFence,
-      scrollTop: actual.scrollTop,
-      distBottom: actual.distBottom,
-      needleMounted: actual.needleMounted,
-      mountedCount: actual.mountedCount,
-      peakMounted: actual.peakMounted,
-      paintCount: actual.paintCount,
-      dockVisible: actual.dockVisible,
-      mountedLast: actual.mountedLast,
-      sessionId: actual.sessionId,
-      findOpen: actual.findOpen,
-      listMounted: actual.listMounted,
-      row: actual.row,
-      scroller: actual.scroller,
-      toolbar: actual.toolbar,
-      pageErrors: actual.pageErrors ?? 0,
-      stable: actual.stable,
-    },
-    events: { ...events },
-    peakMounted: actual.peakMounted,
-    pass,
-    failed: pass ? 0 : 1,
-    skip: 0,
-    skips: [],
-    failReason: pass ? "" : failReason,
-  };
-  rows.push(row);
-  console.log(JSON.stringify(row));
-  return row;
+    phase,
+    error: pass ? "" : failReason,
+  });
 }
 
 async function waitLocated(page, key, timeout = 4000) {
@@ -205,6 +171,68 @@ async function waitPin(page, key) {
   key, { timeout: 4000 });
 }
 
+/** Capture pending pin atomically (pin set, target not yet visible) and re-hold the fence. */
+async function waitPending(page, key, timeout = 4000) {
+  const handle = await page.waitForFunction((k) => {
+    const scrollerEl = document.querySelector("[data-testid=find-chat-scroll]");
+    const list = document.querySelector("[data-testid=timeline-short-list]");
+    const toolbar = document.querySelector("[aria-label='在会话中查找']")?.closest("div");
+    const current = document.querySelector("[data-find-current]");
+    const pin = list?.getAttribute("data-find-pin") || "";
+    if (pin !== k) return false;
+    const row = current?.getBoundingClientRect();
+    const view = scrollerEl?.getBoundingClientRect();
+    let toolbarEl = toolbar instanceof HTMLElement ? toolbar : null;
+    if (scrollerEl && toolbarEl) {
+      let node = toolbarEl;
+      while (node && node !== scrollerEl) {
+        const pos = getComputedStyle(node).position;
+        if (pos === "sticky" || pos === "fixed") {
+          toolbarEl = node;
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    const stickyBar = toolbarEl?.getBoundingClientRect();
+    const viewTop = stickyBar && stickyBar.height > 0 ? stickyBar.bottom : (view?.top ?? 0);
+    const visible = !!(row && view && row.height > 0 && row.bottom > viewTop + 1 && row.top >= viewTop - 1 && row.top < view.bottom - 1);
+    if (visible) return false;
+    window.__findPage.holdFence();
+    const mounted = [...document.querySelectorAll("[data-chat-virtual-key]")].map((el) =>
+      el.getAttribute("data-chat-virtual-key"),
+    );
+    const lastRow = mounted.length ? document.querySelectorAll("[data-chat-virtual-key]")[mounted.length - 1] : null;
+    const bar = toolbar?.getBoundingClientRect();
+    return {
+      key: current?.getAttribute("data-chat-virtual-key") ?? null,
+      text: current?.textContent ?? "",
+      findPin: pin,
+      visible,
+      hit: document.body.innerText.match(/\d+\/\d+|无匹配/)?.[0] ?? null,
+      following: window.__findPage.following,
+      wheelFence: window.__findPage.wheelFence,
+      scrollTop: scrollerEl?.scrollTop ?? -1,
+      distBottom: scrollerEl
+        ? scrollerEl.scrollHeight - scrollerEl.clientHeight - scrollerEl.scrollTop
+        : -1,
+      needleMounted: mounted.includes("m0") || mounted.includes("needle") || mounted.includes("m250"),
+      mountedCount: mounted.length,
+      peakMounted: window.__findPage.peakMounted,
+      paintCount: Number(list?.getAttribute("data-timeline-paint-count") ?? 0),
+      dockVisible: document.querySelector("[data-testid=scroll-to-bottom-dock]")?.getAttribute("data-visible") ?? null,
+      mountedLast: lastRow?.getAttribute("data-chat-virtual-key") ?? null,
+      sessionId: document.querySelector("[data-testid=session]")?.textContent ?? "",
+      findOpen: !!document.querySelector("[aria-label='在会话中查找']"),
+      listMounted: !!list,
+      row: row ? { top: row.top, bottom: row.bottom, height: row.height } : null,
+      scroller: view ? { top: view.top, bottom: view.bottom, height: view.height } : null,
+      toolbar: stickyBar ? { top: stickyBar.top, bottom: stickyBar.bottom, height: stickyBar.height } : (bar ? { top: bar.top, bottom: bar.bottom, height: bar.height } : null),
+    };
+  }, key, { timeout });
+  return handle.jsonValue();
+}
+
 test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)", { timeout: 420_000 }, async (t) => {
   const sources = sourceEvidence();
   t.diagnostic(`find-sources ${JSON.stringify(sources)}`);
@@ -254,6 +282,11 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
       args: ["--no-sandbox", "--disable-overlay-scrollbar"],
     });
     const rows = [];
+    const only = process.env.OC_FIND_ONLY || "";
+    const runTest = (name, fn) => {
+      if (only && !name.includes(only)) return Promise.resolve();
+      return t.test(name, fn);
+    };
     try {
       async function openPage(scene, touch = false) {
         const context = await browser.newContext({
@@ -281,7 +314,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         return { context, page, errors };
       }
 
-      await t.test("tail-320-m0 keyboard.type then one click", async () => {
+      await runTest("tail-320-m0 keyboard.type then one click", async () => {
         const { context, page, errors } = await openPage("tail");
         const events = { clicks: 0, keys: 0, wheels: 0 };
         try {
@@ -315,7 +348,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("enter / shift+enter / button key", async () => {
+      await runTest("enter / shift+enter / button key", async () => {
         const { context, page, errors } = await openPage("multi");
         const events = { clicks: 0, keys: 0, enters: 0 };
         try {
@@ -369,7 +402,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("mobile tap completes despite own touchend fence", async () => {
+      await runTest("mobile tap completes despite own touchend fence", async () => {
         const { context, page, errors } = await openPage("tail", true);
         const events = { taps: 0, keys: 0 };
         try {
@@ -392,7 +425,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("coalesced team then ordinary assistant uses render key", async () => {
+      await runTest("coalesced team then ordinary assistant uses render key", async () => {
         const { context, page, errors } = await openPage("coalesce");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -414,7 +447,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("pending then real mouse.wheel / scrollbar drag cancel", async () => {
+      await runTest("pending then real mouse.wheel / scrollbar drag cancel", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, wheels: 0, keys: 0, drags: 0 };
         try {
@@ -484,17 +517,35 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("touchmove cancels pending jump", async () => {
+      await runTest("touchmove cancels pending jump", async () => {
         const { context, page, errors } = await openPage("midtail", true);
         const events = { clicks: 0, taps: 0, touchmoves: 0, keys: 0 };
         try {
           await typeNeedle(page, "FIND_NEEDLE_MID");
           events.keys += 15;
+          await waitFindReady(page, "1/1");
           await holdFence(page);
           await page.getByRole("button", { name: "下一处" }).tap();
           events.taps += 1;
-          await waitPin(page, "m250");
-          const pending = await snapshot(page);
+          let pending;
+          try {
+            pending = await waitPending(page, "m250");
+          } catch (error) {
+            pending = await snapshot(page);
+            pending.pageErrors = errors.length;
+            pending.error = error.message;
+            record(rows, "touchmove-pending-positive", {
+              findPin: "m250", visible: false, following: false,
+            }, pending, events, false, error.message, "wait-pending");
+            throw error;
+          }
+          pending.pageErrors = errors.length;
+          const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
+          record(rows, "touchmove-pending-positive", {
+            findPin: "m250", visible: false, following: false,
+          }, pending, events, pendingOk,
+            pendingOk ? "" : `pending pin=${pending.findPin} visible=${pending.visible} key=${pending.key} fence=${pending.wheelFence}`,
+            "pending-positive");
           assert.equal(pending.findPin, "m250");
           assert.equal(pending.visible, false);
           const box = await page.getByTestId("find-chat-scroll").boundingBox();
@@ -512,20 +563,31 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
             touchPoints: [],
           });
           events.touchmoves += 1;
-          await page.waitForTimeout(280);
+          await page.waitForFunction(() =>
+            document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === "",
+          null, { timeout: 4000 });
           const after = await snapshot(page);
           after.pageErrors = errors.length;
           record(rows, "touchmove-cancel", { findPin: "" }, after, events,
             after.findPin === "",
-            `touch pin=${after.findPin} key=${after.key} visible=${after.visible}`);
+            `touch pin=${after.findPin} key=${after.key} visible=${after.visible}`,
+            "after-touchmove");
           assert.equal(after.findPin, "");
           assert.deepEqual(errors, []);
+        } catch (error) {
+          if (!rows.some((row) => row.contractId === "touchmove-cancel")) {
+            const failed = await snapshot(page).catch(() => ({ error: error.message }));
+            failed.pageErrors = errors.length;
+            failed.error = error.message;
+            record(rows, "touchmove-cancel", { findPin: "" }, failed, events, false, error.message, "uncaught");
+          }
+          throw error;
         } finally {
           await context.close();
         }
       });
 
-      await t.test("same-session same-id same-length replace does not keep old pin", async () => {
+      await runTest("same-session same-id same-length replace does not keep old pin", async () => {
         const { context, page, errors } = await openPage("tail");
         const events = { clicks: 0, keys: 0, replaces: 0 };
         try {
@@ -587,7 +649,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         return pending;
       }
 
-      await t.test("session switch cancels pending pin", async () => {
+      await runTest("session switch cancels pending pin", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -609,7 +671,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("close cancels pending and does not rejump", async () => {
+      await runTest("close cancels pending and does not rejump", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -629,7 +691,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("sending cancels pending and does not rejump", async () => {
+      await runTest("sending cancels pending and does not rejump", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -650,7 +712,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("unmount does not replay old generation", async () => {
+      await runTest("unmount does not replay old generation", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -672,7 +734,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("rapid next-prev lands on second hit", async () => {
+      await runTest("rapid next-prev lands on second hit", async () => {
         const { context, page, errors } = await openPage("multi");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -698,7 +760,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await t.test("2000-row peak budget, pin release, jumpToBottom", async () => {
+      await runTest("2000-row peak budget, pin release, jumpToBottom", async () => {
         const { context, page, errors } = await openPage("budget");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -759,17 +821,26 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
       });
     } finally {
       await browser.close();
+      const catalog = only
+        ? {
+          expectedScenes: rows.map((r) => r.contractId),
+          recordedBeforeFill: rows.map((r) => r.contractId),
+          missingScenes: [],
+          scenes: rows.length,
+          passed: rows.filter((r) => r.pass).length,
+          failed: rows.filter((r) => !r.pass).length,
+          skipped: 0,
+        }
+        : finalizeRows(rows, { mode: negative ? "negative-overlay" : "candidate" });
       writeFileSync(resultPath, JSON.stringify({
         sources,
         negative,
         peakBudget: PEAK_BUDGET,
-        scenes: rows.length,
-        passed: rows.filter((r) => r.pass).length,
-        failed: rows.filter((r) => !r.pass).length,
-        skipped: 0,
+        expectedSceneCount: EXPECTED_SCENES.length,
+        ...catalog,
         rows,
       }, null, 2));
-      console.log(`FIND_RESULT ${resultPath} scenes=${rows.length}`);
+      console.log(`FIND_RESULT ${resultPath} scenes=${catalog.scenes} expected=${EXPECTED_SCENES.length} missing=${catalog.missingScenes.length}`);
     }
   } finally {
     if (out) rmSync(out, { recursive: true, force: true });
