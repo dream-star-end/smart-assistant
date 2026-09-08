@@ -1950,6 +1950,23 @@ export function MessageList({
     </div>
   );
 
+  // Keep hooks before both the ref-binding and empty-activity early returns.
+  const pendingSig = messages
+    .filter((message) => message.role === "permission")
+    .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
+    .join("|");
+  const pendingPrompts = useMemo(
+    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
+    [pendingSig, readOnly, messages],
+  );
+  const requestIdByToolUseId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const message of pendingPrompts) {
+      if (message.requestId && message.toolUseId) map.set(message.toolUseId, message.requestId);
+    }
+    return map;
+  }, [pendingPrompts]);
+
   // App/admin pass an explicit null during the callback-ref's first commit.
   // Do not mount the transcript in that frame; omitted/undefined remains the
   // lightweight test/non-scroll surface contract.
@@ -2012,21 +2029,6 @@ export function MessageList({
     const match = findMatchesList[next];
     if (match) jumpTo(match);
   };
-  const pendingSig = messages
-    .filter((message) => message.role === "permission")
-    .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
-    .join("|");
-  const pendingPrompts = useMemo(
-    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
-    [pendingSig, readOnly, messages],
-  );
-  const requestIdByToolUseId = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const message of pendingPrompts) {
-      if (message.requestId && message.toolUseId) map.set(message.toolUseId, message.requestId);
-    }
-    return map;
-  }, [pendingPrompts]);
   return (
     <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
     <>
