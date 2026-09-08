@@ -31,7 +31,7 @@ await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
 const port = (server.address() as any).port
 const config: any = { version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: 'test' }, auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: join(home, 'sessions.db') }, defaults: { model: 'glm-5.2', permissionMode: 'default' } }
 const agents = [{ id: profile.legacyAgentId, model: 'glm-5.2', persona: paths.agentClaudeMd(profile.legacyAgentId) }, { id: profile.canonicalAgentId, source: 'marketplace' as const, model: 'glm-5.2', persona: paths.agentClaudeMd(profile.canonicalAgentId) }]
-let executed: { agent: string; key: string; soul: string; env: Record<string,string>; native: string }[] = []
+let executed: { agent: string; key: string; soul: string; env: Record<string,string>; native: string; input: unknown }[] = []
 class EvidenceEngine extends EventEmitter {
   engineId = 'ccb'; model = 'glm-5.2'; isRunning = false; lastActivityAt = Date.now(); nativeSessionId = 'unchanged-native'; sessionId = 'unchanged-native'; shutdowns = 0
   capabilities = { billingMode: 'proxy', supportsEffort: true, resumeKind: 'ccb-session', needsServerRequestId: false, historyMode: 'native-resume', permissionModel: 'native', emitsCallUsage: true, emitsToolInputDeltas: true, supportsNativeCompact: true, multimodalInput: 'native' }
@@ -42,9 +42,9 @@ class EvidenceEngine extends EventEmitter {
   clearSessionId() {} async waitForOutputDrain() {}
   submitTurn(params: any) {
     const soul = this.opts.identityCompat?.assets?.buildSoul().content ?? 'unregistered'
-    executed.push({ agent: this.opts.agentId, key: this.opts.sessionKey, soul, env: identityCompatEnvironment(this.opts.identityCompat), native: this.nativeSessionId })
+    executed.push({ agent: this.opts.agentId, key: this.opts.sessionKey, soul, env: identityCompatEnvironment(this.opts.identityCompat), native: this.nativeSessionId, input: params.input })
     params.onEvent({ kind: 'block', block: { kind: 'text', text: soul, blockId: 'answer' } })
-    const summary = { usage: { cost: 0, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 2 }, assistantText: soul, thinkingText: '', assistantSegments: [{ text: soul }], thinkingSegments: [], tools: [], runtimeEvents: [], stopReason: 'end_turn', numTurns: 1, isError: false, staleResumeId: false, phantomSignals: { apiState: 'skipped', skipReason: 'test-engine' } }
+    const summary = { ...(typeof params.input === 'string' && params.input.startsWith('/compact') ? { nativeCompactionSummary: 'Native compact evidence: preserve user goal and original session.' } : {}), usage: { cost: 0, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 2 }, assistantText: soul, thinkingText: '', assistantSegments: [{ text: soul }], thinkingSegments: [], tools: [], runtimeEvents: [], stopReason: 'end_turn', numTurns: 1, isError: false, staleResumeId: false, phantomSignals: { apiState: 'skipped', skipReason: 'test-engine' } }
     return { submitted: Promise.resolve(), summary: Promise.resolve(summary), end() {}, getPartialSnapshot: () => ({ assistantText: soul, thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: [], runtimeEvents: [] }), getPhantomSignals: () => summary.phantomSignals, finalized: true, pendingToolCalls: 0 }
   }
 }
@@ -253,3 +253,76 @@ test('permission change after preflight cannot execute a warm runner with stale 
   await assert.rejects(sm.submit(session, 'must not use old-mode', () => {}), /COMPAT_CONFIG_CONFLICT/)
   assert.equal(executed.length, 0)
 })
+
+
+for (const registered of [true, false]) {
+  async function completedQueueTurn(suffix: string) {
+    if (!registered) projection.profiles = []
+    const sm = manager()
+    const key = `agent:old-fixture:webchat:dm:fence-${registered}-${suffix}`
+    const fence = sm.beginPromptQueueExecutionFence(key)
+    const session = await sm.getOrCreate({ sessionKey: key, agent: agents[0], channel: 'webchat', peerId: `fence-${suffix}`, promptQueueExecutionFence: fence })
+    let reservations = 0
+    sm.beginClientTurn(session)
+    let outcome: 'completed' | 'errored' = 'errored'
+    try {
+      await sm.submit(session, 'first queued turn', () => {}, undefined, undefined, undefined, undefined, undefined, {
+        queueExecutionFence: fence,
+        queueLifecycle: { queueTurn: true, async onTurnReserved() { reservations++ } },
+      })
+      outcome = 'completed'
+    } finally {
+      sm.endClientTurn(session, outcome)
+      fence.release()
+    }
+    assert.equal(executed.length, 1, 'the initial queue turn must actually execute')
+    assert.equal(reservations, 1, 'the real queue reservation hook must run once')
+    return { sm, session, key, fence }
+  }
+
+  test(`A4 F1 queue release permits direct compact and a fresh queue ticket (registered=${registered})`, async () => {
+    const { sm, session, key } = await completedQueueTurn('direct')
+    await sm.submit(session, '/compact', () => {})
+    assert.equal(executed.length, 2)
+    assert.equal(executed[1].input, '/compact')
+    assert.equal(executed[1].key, key)
+    assert.equal(executed[1].native, executed[0].native)
+    const next = sm.beginPromptQueueExecutionFence(key)
+    try {
+      await sm.submit(session, 'new queue owner', () => {}, undefined, undefined, undefined, undefined, undefined, { queueExecutionFence: next })
+      assert.equal(executed.length, 3, 'only the current submit ticket authorizes this turn')
+      assert.equal(executed[2].key, key)
+      assert.equal(Object.hasOwn(session._identityCreationOpts!, 'promptQueueExecutionFence'), false)
+    } finally { next.release() }
+  })
+
+  test(`A4 F1 real prepareModelSwitch compacts then consumes one generation after queue release (registered=${registered})`, async () => {
+    const { sm, session, key } = await completedQueueTurn('switch')
+    const switchId = `identity-switch-${registered}`
+    const prepared = await sm.prepareModelSwitch(session, 'glm-5.2', 'glm-5.3-zai', switchId)
+    assert.deepEqual(prepared, { sourceModel: 'glm-5.2', targetModel: 'glm-5.3-zai' })
+    assert.equal(executed.length, 2, 'native compact must reach the evidence engine')
+    assert.match(String(executed[1].input), /^\/compact preserve/)
+    assert.equal(executed[1].key, key)
+    assert.equal(executed[1].native, executed[0].native)
+    assert.match(session._modelSwitchTransition!.summaryText!, /Native compact evidence/)
+    await sm.submit(session, 'first target turn', () => {}, undefined, 'glm-5.3-zai', undefined, undefined, undefined, { modelSwitchId: switchId })
+    assert.equal(executed.length, 3)
+    assert.equal(session._modelSwitchTransition, undefined, 'successful target turn consumes the generation')
+    assert.equal(Object.hasOwn(session._identityCreationOpts!, 'modelSwitchId'), false, 'switch generation is not a reusable identity property')
+    await sm.submit(session, 'ordinary followup', () => {})
+    assert.equal(executed.length, 4)
+    assert.ok(executed.every(run => run.key === key && run.native === executed[0].native))
+  })
+
+  test(`A4 F1 another active queue owner still blocks direct and internal compact (registered=${registered})`, async () => {
+    const { sm, session, key, fence: stale } = await completedQueueTurn('denial')
+    const owner = sm.beginPromptQueueExecutionFence(key)
+    try {
+      await assert.rejects(sm.submit(session, '/compact', () => {}), /PROMPT_QUEUE_EXECUTION_INVARIANT/)
+      await assert.rejects(sm.submit(session, 'stale caller ticket', () => {}, undefined, undefined, undefined, undefined, undefined, { queueExecutionFence: stale }), /PROMPT_QUEUE_EXECUTION_INVARIANT/)
+      await assert.rejects(sm.prepareModelSwitch(session, 'glm-5.2', 'glm-5.3-zai', `blocked-switch-${registered}`), /PROMPT_QUEUE_EXECUTION_INVARIANT/)
+      assert.equal(executed.length, 1, 'none of the unauthorized calls reaches the engine')
+    } finally { owner.release() }
+  })
+}

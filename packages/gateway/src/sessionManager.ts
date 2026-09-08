@@ -767,7 +767,10 @@ function scheduleSessionOutputAssetCollection(opts: {
 // + 一把 Mutex(同 session 串行)。跨 session 完全并行。
 export interface AgentSession {
   /** In-memory execution identity only. Durable session/owner fields are untouched. */
-  _identityCreationOpts?: Parameters<SessionManager['getOrCreate']>[0]
+  _identityCreationOpts?: Omit<
+    Parameters<SessionManager['getOrCreate']>[0],
+    'promptQueueExecutionFence' | 'modelSwitchId'
+  >
   _identityAgentFingerprint?: string
   _identityCompat?: IdentityCompatRuntimeContext
 
@@ -3712,7 +3715,9 @@ export class SessionManager {
     ) {
       throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session')
     }
-    const identityCreationOpts = { ...opts }
+    // Identity construction outlives an individual dispatch/switch. Never retain
+    // their one-use admission credentials in the reusable session template.
+    const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId, ...identityCreationOpts } = opts
     const identity = await resolveRuntimeExecutionAgent(opts.agent)
     opts = { ...opts, agent: identity.agent }
     const identityAgentFingerprint = identity.context.assets ? JSON.stringify(opts.agent) : undefined
@@ -4548,11 +4553,18 @@ export class SessionManager {
   ): Promise<void> {
     // Resolve/rebuild a warm legacy runner under the existing creation gate,
     // before taking the per-turn lock. Never change its durable session key.
-    if (session._identityCreationOpts) {
+    // prepareModelSwitch owns this runner while performing native compaction.
+    // It must not re-enter the creation gate that rejects concurrent switches;
+    // the existing queue ownership and locked fresh-identity gates still apply.
+    const preparingSwitchCompact =
+      session._modelSwitchTransition?.state === 'preparing' &&
+      opts?.modelSwitchInternal === session._modelSwitchTransition.id
+    if (session._identityCreationOpts && !preparingSwitchCompact) {
       session = await this.getOrCreate({
         ...session._identityCreationOpts,
         ...(model ? { model } : {}),
-        ...(opts?.modelSwitchId ? { modelSwitchId: opts.modelSwitchId } : {}),
+        modelSwitchId: opts?.modelSwitchId,
+        promptQueueExecutionFence: opts?.queueExecutionFence,
       })
     }
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
