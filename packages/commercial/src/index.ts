@@ -2504,6 +2504,16 @@ export async function registerCommercial(
         getPool,
         preCheckRedis,
         pricing,
+        catalog: {
+          async assertFresh() {
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+            if (!cache) {
+              throw new Error("DELEGATE_ENGINE_BILLING_CATALOG_UNAVAILABLE");
+            }
+            return cache.assertFresh();
+          },
+        },
+        loadUserModelAuthz,
       });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
