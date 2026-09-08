@@ -135,6 +135,7 @@ function Harness() {
       settledReason: m._settledReason ?? null,
       pending: m._controlPending === true,
       detached: m._detachedAskUser === true,
+      truncated: m._inputTruncated === true,
     }));
 
   useEffect(() => {

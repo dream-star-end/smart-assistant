@@ -81,16 +81,22 @@ function prompt(over = {}) {
     createdAt,
     updatedAt: over.updatedAt ?? createdAt,
     dropLive: over.dropLive === true,
+    truncatePreview: over.truncatePreview === true,
+    inputPreview: over.inputPreview,
   };
 }
 
-function snapshotItem(row) {
+function snapshotItem(row, opts = {}) {
+  const full = opts.full === true;
+  const truncated = row.truncatePreview === true && !full;
   return {
     requestId: row.requestId,
     clientMessageId: row.clientMessageId,
     toolUseId: row.toolUseId,
     toolName: row.toolName,
-    inputJson: row.inputJson,
+    inputJson: truncated ? {} : row.inputJson,
+    ...(truncated ? { inputTruncated: true } : {}),
+    ...(row.inputPreview ? { inputPreview: row.inputPreview } : {}),
     status: row.status,
     behavior: row.behavior,
     reason: row.reason,
@@ -123,13 +129,15 @@ function sessionDetail(store, userId, sessionId, lookupIds) {
   const rows = [...store.prompts.values()].filter((p) => p.userId === userId && p.sessionId === sessionId);
   rows.sort((a, b) => b.createdAt - a.createdAt);
   const windowSize = store.windowSize;
-  const items = rows.slice(0, windowSize).map(snapshotItem);
+  const items = rows.slice(0, windowSize).map((row) => snapshotItem(row, { full: false }));
   const completeness = rows.length > windowSize ? "truncated" : store.completeness;
   const lookups = [];
   if (lookupIds?.length) {
     for (const id of lookupIds) {
       const row = store.prompts.get(id);
-      if (row && row.userId === userId && row.sessionId === sessionId) lookups.push(snapshotItem(row));
+      if (row && row.userId === userId && row.sessionId === sessionId) {
+        lookups.push(snapshotItem(row, { full: true }));
+      }
     }
   }
   return {
@@ -787,7 +795,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       }
     });
 
-    if (want("T5")) await t.test("T5 slot occupied with 0 modal; dock[0] then dock[1] are different requests", async () => {
+    if (want("T5")) await t.test("T5 two pending show exactly one dialog; dock[0] then dock[1] are different requests", async () => {
       store.prompts.clear();
       store.responses.length = 0;
       store.httpLog.length = 0;
@@ -820,15 +828,13 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
           return cards.some((c) => c.requestId === "req-one") && cards.some((c) => c.requestId === "req-two");
         });
-        const slot = (await page.getByTestId("qa-active-modal").textContent()) || "";
+        await page.getByRole("dialog").waitFor();
         const dialogs = await page.getByRole("dialog").count();
-        assert.ok(dialogs <= 1, `at most one modal, got ${dialogs}`);
-        const slotWithoutModal = slot.length > 0 && dialogs === 0;
-        if (slotWithoutModal) await failShot(page, "t5-slot-no-modal");
-        if (dialogs > 0) {
-          await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
-          await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
-        }
+        assert.equal(dialogs, 1, "two pending must auto-open exactly one visible dialog");
+        const slot = (await page.getByTestId("qa-active-modal").textContent()) || "";
+        assert.ok(slot === "req-one" || slot === "req-two", `singleton slot must be a real request, got ${slot}`);
+        await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+        await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
         const dock = page.locator("[data-testid=pending-permission-dock] button");
         assert.equal(await dock.count(), 2, "dock must expose both pending requests");
         const respondBefore = store.responses.length;
@@ -852,9 +858,6 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         assert.ok((await page.getByRole("dialog").count()) <= 1);
         assert.equal(store.responses.length, respondBefore, "close/reopen must not send permission_response");
         await shot(page, "t5-dock-sequential");
-        if (slotWithoutModal) {
-          throw new Error(`W1/B3: coordinator slot=${slot} but 0 visible dialog after GET materialise`);
-        }
       } catch (err) {
         failures.push("T5");
         if (page) await failShot(page, "t5").catch(() => {});
@@ -1082,6 +1085,103 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         await shot(pageD, "t8-detached-still-pending");
       } catch (err) {
         failures.push("T8");
+        throw err;
+      } finally {
+        await ctx.close();
+      }
+    });
+
+    if (want("T9")) await t.test("T9 truncated CJK AskUserQuestion cannot submit until lookup restores UTF-8 questions", async () => {
+      store.prompts.clear();
+      store.responses.length = 0;
+      store.httpLog.length = 0;
+      const cjkQuestion = "你".repeat(3000);
+      assert.equal(Buffer.byteLength(cjkQuestion, "utf8"), 9000);
+      assert.ok(9000 > 8192, "fixture must exceed 8KiB UTF-8");
+      store.prompts.set(
+        "req-cjk-ask",
+        prompt({
+          requestId: "req-cjk-ask",
+          toolName: "AskUserQuestion",
+          truncatePreview: true,
+          inputPreview: "你你你…",
+          inputJson: {
+            questions: [{ question: cjkQuestion, header: "确认", options: [{ label: "是" }, { label: "否" }] }],
+          },
+        }),
+      );
+      const ctx = await browser.newContext();
+      try {
+        const page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
+        await page.evaluate(() => window.__qa.loadSession());
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          return cards.some((c) => c.requestId === "req-cjk-ask");
+        });
+        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0, "must not submit before full questions");
+        await waitStore(
+          () => store.httpLog.some((h) => typeof h.lookup === "string" && h.lookup.split(",").includes("req-cjk-ask")),
+          "T9 real hook GET permission_lookup=req-cjk-ask",
+          15_000,
+        );
+        await page.getByRole("radio", { name: /是/ }).waitFor();
+        const body = await page.locator("body").innerText();
+        assert.ok(body.includes(cjkQuestion), "full UTF-8 question must appear after lookup");
+        await page.getByRole("radio", { name: /是/ }).click();
+        await page.getByRole("button", { name: "提交" }).click();
+        await waitStore(
+          () => store.prompts.get("req-cjk-ask")?.status === "responded",
+          "T9 submit after full input",
+          15_000,
+        );
+        await shot(page, "t9-cjk-ask-full");
+      } catch (err) {
+        failures.push("T9");
+        throw err;
+      } finally {
+        await ctx.close();
+      }
+    });
+
+    if (want("T10")) await t.test("T10 truncated CJK ExitPlanMode cannot approve until lookup restores plan", async () => {
+      store.prompts.clear();
+      store.responses.length = 0;
+      store.httpLog.length = 0;
+      const cjkPlan = `## 目标\n\n${"你".repeat(2500)}`;
+      assert.ok(Buffer.byteLength(cjkPlan, "utf8") > 8192);
+      store.prompts.set(
+        "req-cjk-plan",
+        prompt({
+          requestId: "req-cjk-plan",
+          toolName: "ExitPlanMode",
+          truncatePreview: true,
+          inputPreview: "计划预览…",
+          inputJson: { plan: cjkPlan, planFilePath: "/tmp/plan.md" },
+        }),
+      );
+      const ctx = await browser.newContext();
+      try {
+        const page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
+        await page.evaluate(() => window.__qa.loadSession());
+        await page.waitForFunction(() => {
+          const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
+          return cards.some((c) => c.requestId === "req-cjk-plan");
+        });
+        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        assert.equal(await page.getByRole("button", { name: "按此计划执行" }).count(), 0, "must not approve truncated plan");
+        await waitStore(
+          () => store.httpLog.some((h) => typeof h.lookup === "string" && h.lookup.split(",").includes("req-cjk-plan")),
+          "T10 real hook GET permission_lookup=req-cjk-plan",
+          15_000,
+        );
+        await page.getByRole("button", { name: "按此计划执行" }).waitFor();
+        const planText = await page.getByTestId("exit-plan-markdown").innerText();
+        assert.ok(planText.includes("你".repeat(20)), "restored plan must keep CJK source");
+        assert.ok(planText.length > 1000, "restored plan must be the full body, not preview");
+        await shot(page, "t10-cjk-plan-full");
+      } catch (err) {
+        failures.push("T10");
         throw err;
       } finally {
         await ctx.close();
