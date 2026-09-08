@@ -23,7 +23,15 @@ test("Composer session-owned drafts (real Chromium, no backend)", { timeout: 90_
     },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
   });
-  const server = createServer((_req, res) => {
+  const server = createServer((req, res) => {
+    // Serve the same bundle bytes through the existing HTTP fixture. Repeating
+    // the large inline payload over CDP for every context/reload wastes the
+    // suite budget when the real-browser files execute concurrently.
+    if (req.url === "/fixture-bundle.js") {
+      res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+      res.end(bundle.outputFiles[0].text);
+      return;
+    }
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.end('<!doctype html><meta charset="utf-8"><div id="root"></div>');
   });
@@ -43,7 +51,7 @@ test("Composer session-owned drafts (real Chromium, no backend)", { timeout: 90_
           await page.evaluate(({ prefix, seeds }) => {
             for (const [key, value] of Object.entries(seeds)) sessionStorage.setItem(prefix + key, value);
           }, { prefix, seeds });
-          const mount = () => page.addScriptTag({ content: bundle.outputFiles[0].text });
+          const mount = () => page.addScriptTag({ url: `http://127.0.0.1:${server.address().port}/fixture-bundle.js` });
           await mount();
           const input = page.getByRole("textbox", { name: "消息输入框" });
           await input.waitFor();
