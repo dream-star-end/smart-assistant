@@ -3361,6 +3361,30 @@
           "assertion": "Human wait: real PermissionCard click resumes the CCB adapter after twenty minutes"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-IDLE-CURSOR-BLACKHOLE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Selfhost旧会话在暖WebSocket上续问：后台已有正文和工具输出，旧frameSeq游标把新输出当重复帧丢弃，页面仅显示深度思考。回收引擎保留输出编号；历史后注册idle游标由服务器仲裁。",
+      "rootFixCommit": "2041bec7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/outboundRing.test.ts",
+          "assertion": "clear() retires cached frames without reusing a wire sequence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/streamCursor.test.ts",
+          "assertion": "warm socket arbitrates a restored idle cursor before the next turn"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/chat-navigation.node-test.mjs",
+          "assertion": "OCV5-178 warm socket shows new text after restoring an idle cursor"
+        }
+      ]
     }
   ]
 }
