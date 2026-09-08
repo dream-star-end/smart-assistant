@@ -3327,6 +3327,40 @@
           "assertion": "INC-20260908-GROK-POOL-NO-COOLDOWN: source regression guard, not end-to-end proof."
         }
       ]
+    },
+    {
+      "id": "INC-20260908-HUMAN-WAIT-RESUME",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "CCB/Cursor Sand 原生提问作答后仍沿用等人之前的 lastActivityAt，答案已接收却在下一 idle tick 被误杀；Codex 同类请求存在相同缺口。只在当前回合未决答案成功送达后刷新 liveness 与30分钟activity时钟，拒绝过期/重复答复，保留真实静默和不可变硬上限。",
+      "rootFixCommit": "ffe32879",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbAdapterTurnParity.test.ts",
+          "assertion": "OCV5-177: CCB human reply renews both idle clocks after a long wait"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbAdapterTurnParity.test.ts",
+          "assertion": "OCV5-177: stale, duplicate and failed CCB replies cannot renew a turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-177: Codex long human wait resumes both clocks without blessing stale replies"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerIdleTimeout.test.ts",
+          "assertion": "明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/human-wait-resume.node-test.mjs",
+          "assertion": "Human wait: real PermissionCard click resumes the CCB adapter after twenty minutes"
+        }
+      ]
     }
   ]
 }
