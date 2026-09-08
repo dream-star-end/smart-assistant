@@ -270,6 +270,15 @@ const serveBuiltAsset = (route, request) => {
 };
 // 先注册 catch-all,再注册 harness 页:playwright 后注册者优先,harness URL 命中专用处理。
 await page.route("**/*", serveBuiltAsset);
+await page.route("**/api/agents", (route, request) => {
+  if (request.method() !== "GET") return route.fallback();
+  return route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    // T34 is the ordinary main-memory scenario, without an identity registration.
+    body: JSON.stringify({ agents: [{ id: "main", name: "全能助手" }], default: "main" }),
+  });
+});
 await page.route("**/api/agents/main/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/agents/main/memory/memory" && request.method() === "GET") {
