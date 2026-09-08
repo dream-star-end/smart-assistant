@@ -2459,6 +2459,7 @@ export function App() {
     scrollToBottom: stick.scrollToBottom,
     jumpToBottom: stick.jumpToBottom,
     correctTo: stick.correctTo,
+    releaseUserIntent: stick.releaseUserIntent,
   }), [stick]);
   const scrollToChatBottom = useCallback(() => {
     const el = scrollRef.current;

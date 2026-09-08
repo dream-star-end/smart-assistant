@@ -548,6 +548,11 @@ build_master_release() {
     cleanup_master_staging
     die "pinned callback payload hash WS proof 失败"
   fi
+  mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
+    cleanup_master_staging
+    die "pinned cron submit durability boundary gate 失败"
+  fi
   mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
   if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
     cleanup_master_staging

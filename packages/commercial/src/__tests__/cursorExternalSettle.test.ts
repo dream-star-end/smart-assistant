@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   CURSOR_SETTLE_SURCHARGE_ENV,
+  captureCursorPricingBasis,
   cursorSettleMultiplier,
+  freezePreparedCursorSettlePlan,
   mapCursorReportedUsage,
   parseCursorSettleSurcharge,
   planCursorAccountUsageBump,
@@ -294,5 +296,35 @@ describe("planCursorAccountUsageBump", () => {
       planCursorAccountUsageBump({ success: false, terminalCode: "QUOTA; drop table--" }).lastError,
       "cursor_QUOTAdroptable--",
     );
+  });
+});
+
+describe("pricingBasis freeze", () => {
+  test("replay uses captured surcharge, not a later env/catalog change", () => {
+    const fable = pricing({
+      model_id: "cursor-fable-5.1-high",
+      multiplier: "1.000",
+      input_per_mtok: 1500n,
+      output_per_mtok: 7500n,
+    });
+    const usage = { input_tokens: 1000, output_tokens: 500, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const basis = captureCursorPricingBasis(fable, { [CURSOR_SETTLE_SURCHARGE_ENV]: "1.000" });
+    const original = planCursorExternalSettle({ engineStatus: "success", usage, pricingBasis: basis });
+    const drifted = pricing({
+      model_id: "cursor-fable-5.1-high",
+      multiplier: "9.000",
+      input_per_mtok: 999999n,
+      output_per_mtok: 999999n,
+    });
+    const replay = planCursorExternalSettle({
+      engineStatus: "success",
+      usage,
+      pricing: drifted,
+      pricingBasis: basis,
+    });
+    assert.equal(replay.costCredits, original.costCredits);
+    const frozen = freezePreparedCursorSettlePlan(original);
+    assert.match(frozen.costCredits, /^-?\d+$/);
+    assert.equal(JSON.parse(frozen.snapshotJson).model_id, "cursor-fable-5.1-high");
   });
 });

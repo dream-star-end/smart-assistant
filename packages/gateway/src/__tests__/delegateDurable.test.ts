@@ -15,6 +15,7 @@ import { describe, it } from 'node:test'
 import {
   DelegateJobStore,
   DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
+  DELEGATE_LEASE_HEARTBEAT_MS,
   resolveDelegateHeartbeatTimeoutMs,
 } from '../delegateJobs.js'
 import { DelegateDurableDb, resolveDelegateLedgerRetentionMs } from '../delegateDurable.js'
@@ -1391,34 +1392,173 @@ describe('OCV5-164 cron delegate heartbeat', () => {
     }
   })
 
-  it('honours the beat hard cap so a leaked interval cannot slide liveness forever', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-cap-'))
+  it('renews the durable lease for 481 injected 15s beats without a cron hard-cap kill', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-481-'))
     try {
-      const store = openStore(dir, { bootId: 'gw:hbcap' })
+      let now = 1_000_000
+      const clock = createManualClock(() => now, (value) => {
+        now = value
+      })
+      const store = openStore(dir, { bootId: 'gw:hb481', now: () => now })
       const enq = enqueueCronOccurrenceJob(store, {
-        cronJobId: 'cron-hb4',
+        cronJobId: 'cron-hb-481',
         dueMinuteKey: 4,
         agentId: 'coding-assistant',
-        sessionKey: 'sk-hb4',
+        sessionKey: 'sk-hb481',
       })
       assert.ok('jobId' in enq)
       const fence = claimCronDelegateExecution(store, enq.jobId)
+      const claimedAt = store.snapshotOf(enq.jobId)!.lastActivityAt!
       const interrupted: string[] = []
       const hb = startCronDelegateHeartbeat({
         store,
         jobId: enq.jobId,
         fence,
-        sessionKey: 'sk-hb4',
-        intervalMs: 2,
-        maxBeats: 3,
+        sessionKey: 'sk-hb481',
+        intervalMs: DELEGATE_LEASE_HEARTBEAT_MS,
         interrupt: (key) => {
           interrupted.push(key)
           return true
         },
+        setIntervalFn: clock.setInterval as typeof setInterval,
+        clearIntervalFn: clock.clearInterval as typeof clearInterval,
       })
-      await new Promise((r) => setTimeout(r, 80))
-      assert.deepEqual(interrupted, ['sk-hb4'], 'hard cap must close out the child')
-      assert.equal(hb.beats(), 4, 'stops on the beat that exceeds the cap')
+
+      clock.beats(481, DELEGATE_LEASE_HEARTBEAT_MS)
+      const snap = store.snapshotOf(enq.jobId)!
+      assert.equal(hb.beats(), 481)
+      assert.equal(interrupted.length, 0, 'cron must not kill a healthy occurrence at beat 481')
+      assert.equal(snap.state, 'running')
+      assert.ok(snap.lastActivityAt! > claimedAt)
+      assert.equal(snap.lastActivityAt, now)
+      assert.equal(now - claimedAt, 481 * DELEGATE_LEASE_HEARTBEAT_MS)
+      assert.ok(now - claimedAt > 2 * 60 * 60_000, 'logical span must cross 2h')
+      assert.deepEqual(store.reapStaleRunning({ timeoutMs: 30 * 60_000 }), [])
+      assert.equal(store.snapshotOf(enq.jobId)?.state, 'running')
+
+      const frozen = snap.lastActivityAt!
+      hb.stop()
+      const queued = clock.captureCallback()
+      clock.beats(3, DELEGATE_LEASE_HEARTBEAT_MS)
+      if (queued) queued()
+      assert.equal(store.snapshotOf(enq.jobId)!.lastActivityAt, frozen, 'stop() must ignore queued ticks')
+      assert.equal(interrupted.length, 0)
+      hb.stop()
+      store.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('stop then a captured callback is a no-op; fence takeover interrupts the old session once', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-fence-rotate-'))
+    try {
+      let now = 1_000_000
+      const clock = createManualClock(() => now, (value) => {
+        now = value
+      })
+      const storeA = openStore(dir, { bootId: 'gw:owner-a', now: () => now })
+      const enq = enqueueCronOccurrenceJob(storeA, {
+        cronJobId: 'cron-hb-rotate',
+        dueMinuteKey: 8,
+        agentId: 'coding-assistant',
+        sessionKey: 'sk-old-owner',
+      })
+      assert.ok('jobId' in enq)
+      const oldFence = claimCronDelegateExecution(storeA, enq.jobId)
+      const interrupted: string[] = []
+      const hb = startCronDelegateHeartbeat({
+        store: storeA,
+        jobId: enq.jobId,
+        fence: oldFence,
+        sessionKey: 'sk-old-owner',
+        intervalMs: DELEGATE_LEASE_HEARTBEAT_MS,
+        interrupt: (key) => {
+          interrupted.push(key)
+          return true
+        },
+        setIntervalFn: clock.setInterval as typeof setInterval,
+        clearIntervalFn: clock.clearInterval as typeof clearInterval,
+      })
+      clock.beats(2, DELEGATE_LEASE_HEARTBEAT_MS)
+      const activityBeforeTakeover = storeA.snapshotOf(enq.jobId)!.lastActivityAt!
+
+      now += 5_000
+      const storeB = openStore(dir, { bootId: 'gw:owner-b', now: () => now, hydrate: true })
+      const adopted = storeB.adoptOrKill(enq.jobId, oldFence.fencingEpoch, 'running')
+      assert.ok(adopted, 'second store must adopt the stale lease and rotate the fence')
+      assert.notEqual(adopted.claimToken, oldFence.claimToken)
+      assert.equal(adopted.fencingEpoch, oldFence.fencingEpoch + 1)
+      const newActivity = storeB.snapshotOf(enq.jobId)!.lastActivityAt!
+
+      clock.beats(3, DELEGATE_LEASE_HEARTBEAT_MS)
+      assert.deepEqual(interrupted, ['sk-old-owner'], 'old heartbeat interrupts the captured session once')
+      assert.equal(storeB.snapshotOf(enq.jobId)!.lastActivityAt, newActivity, 'old beats must not rewrite the new owner')
+      assert.equal(storeB.snapshotOf(enq.jobId)!.claimToken, adopted.claimToken)
+      clock.beats(2, DELEGATE_LEASE_HEARTBEAT_MS)
+      assert.deepEqual(interrupted, ['sk-old-owner'])
+      assert.ok(activityBeforeTakeover <= newActivity)
+      hb.stop()
+      storeA.close()
+      storeB.close()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('transient durable write errors do not close out; persistent failure lets the reaper settle', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-cron-hb-dberr-'))
+    try {
+      let now = 1_000_000
+      const clock = createManualClock(() => now, (value) => {
+        now = value
+      })
+      const store = openStore(dir, { bootId: 'gw:hbdb', now: () => now })
+      const enq = enqueueCronOccurrenceJob(store, {
+        cronJobId: 'cron-hb-db',
+        dueMinuteKey: 9,
+        agentId: 'coding-assistant',
+        sessionKey: 'sk-hbdb',
+      })
+      assert.ok('jobId' in enq)
+      const fence = claimCronDelegateExecution(store, enq.jobId)
+      const claimedAt = store.snapshotOf(enq.jobId)!.lastActivityAt!
+      const interrupted: string[] = []
+      const hb = startCronDelegateHeartbeat({
+        store,
+        jobId: enq.jobId,
+        fence,
+        sessionKey: 'sk-hbdb',
+        intervalMs: DELEGATE_LEASE_HEARTBEAT_MS,
+        interrupt: (key) => {
+          interrupted.push(key)
+          return true
+        },
+        setIntervalFn: clock.setInterval as typeof setInterval,
+        clearIntervalFn: clock.clearInterval as typeof clearInterval,
+      })
+
+      store.injectDurableWriteFailure()
+      clock.beats(1, DELEGATE_LEASE_HEARTBEAT_MS)
+      assert.equal(store.snapshotOf(enq.jobId)!.lastActivityAt, claimedAt, 'failed touch must not look successful')
+      assert.equal(interrupted.length, 0, 'sqlite throw is not a fence reject')
+      assert.equal(store.snapshotOf(enq.jobId)?.state, 'running')
+
+      clock.beats(1, DELEGATE_LEASE_HEARTBEAT_MS)
+      const recoveredAt = store.snapshotOf(enq.jobId)!.lastActivityAt!
+      assert.ok(recoveredAt > claimedAt, 'heartbeat resumes after the transient error')
+      assert.equal(interrupted.length, 0)
+
+      for (let i = 0; i < 4; i++) {
+        store.injectDurableWriteFailure()
+        clock.beats(1, DELEGATE_LEASE_HEARTBEAT_MS)
+      }
+      assert.equal(store.snapshotOf(enq.jobId)!.lastActivityAt, recoveredAt)
+      now += 31 * 60_000
+      const reaped = store.reapStaleRunning({ timeoutMs: 30 * 60_000 })
+      assert.equal(reaped.length, 1)
+      assert.equal(reaped[0]!.job.failureClass, 'heartbeat_timeout')
+      assert.equal(interrupted.length, 0, 'reaper, not the heartbeat closeout, settles persistent write failure')
       hb.stop()
       store.close()
     } finally {
@@ -1426,6 +1566,30 @@ describe('OCV5-164 cron delegate heartbeat', () => {
     }
   })
 })
+
+function createManualClock(getNow: () => number, setNow: (value: number) => void) {
+  let nextId = 1
+  const timers = new Map<number, () => void>()
+  return {
+    setInterval(fn: () => void) {
+      const id = nextId++
+      timers.set(id, fn)
+      return id as unknown as ReturnType<typeof setInterval>
+    },
+    clearInterval(handle: ReturnType<typeof setInterval>) {
+      timers.delete(handle as unknown as number)
+    },
+    beats(n: number, intervalMs: number) {
+      for (let i = 0; i < n; i++) {
+        setNow(getNow() + intervalMs)
+        for (const fn of [...timers.values()]) fn()
+      }
+    },
+    captureCallback() {
+      return [...timers.values()][0]
+    },
+  }
+}
 
 /**
  * OCV5-164 r1: the server-side reaper wiring itself (W3 gap). Uses the real

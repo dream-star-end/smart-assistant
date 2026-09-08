@@ -675,6 +675,13 @@ export interface SettleResult {
    * caller 想展示"当前余额"且这里拿到 null 时,请另查 users 表。
    */
   balanceAfter: bigint | null;
+  /**
+   * How this return was produced. Optional so historical callers stay valid.
+   *   - new_commit: this invocation inserted usage (+ ledger when charged)
+   *   - existing: UNIQUE (user_id, request_id) hit; row was already committed
+   *   - commit_proven: COMMIT itself errored, independent read proved the row
+   */
+  commitDisposition?: "new_commit" | "existing" | "commit_proven";
 }
 
 /** COMMIT returned an error and independent reads could not yet prove whether
@@ -895,6 +902,7 @@ export async function settleUsageAndLedger(
           attributionCredits: settled.attributionCredits,
           // 同上:余额可能被别的并发请求改过,无法还原当时的 balance_after。
           balanceAfter: null,
+          commitDisposition: "existing",
         };
       }
       throw err;
@@ -957,7 +965,15 @@ export async function settleUsageAndLedger(
     }
     commitAttempted = true;
     await client.query("COMMIT");
-    return { usageId, ledgerId, clamped, debitedCredits, attributionCredits, balanceAfter };
+    return {
+      usageId,
+      ledgerId,
+      clamped,
+      debitedCredits,
+      attributionCredits,
+      balanceAfter,
+      commitDisposition: "new_commit",
+    };
   } catch (err) {
     try {
       await client.query("ROLLBACK");
@@ -980,6 +996,7 @@ export async function settleUsageAndLedger(
               debitedCredits: null,
               attributionCredits: settled.attributionCredits,
               balanceAfter: null,
+              commitDisposition: "commit_proven",
             };
           }
         } catch {

@@ -727,3 +727,64 @@ await runTapProof({
   namePattern: "late\\ agent\\-group\\ continuation\\ defers\\ visible\\ until\\ after\\ parts\\+finalize",
 })
 console.log("[late-delegate-owner] PASS — INC-20260908-LATE-DELEGATE-OWNER executed exact-owner seal, durable retry, root records, origin stamp and read-only planner")
+
+// OCV5-188 A append: reviewed fixed contract; existing proofs above are unchanged.
+// OCV5-188 A: no-PG FS/relay artifact proof. Final ledger assertions run in PR-2.
+const A_EXTERNAL_FILES = [
+  "packages/commercial/src/__tests__/cursorExternalApiOutbox.test.ts",
+  "packages/commercial/src/__tests__/cursorExternalCancel.unit.test.ts",
+  "packages/commercial/src/__tests__/cursorExternalErrorEvidence.test.ts"
+] as const;
+const A_EXTERNAL_LEAVES = [
+  "only selfhost gets the explicit StateDirectory path; commercial never defaults",
+  "intent then ready, seal-once does not rewrite, unlink removes",
+  "intent cannot replace an existing ready",
+  "corrupt / unknown / oversized files are observed and do not starve later ready",
+  "classified terminalCode is persisted without the raw error message",
+  "writeAllSync resumes after a short write and fails closed on zero progress",
+  "unwritable directory fails open and does not fall back to the selfhost path",
+  "live timer continues after the first completed empty batch",
+  "second batch still runs after a non-empty first scan, then stop drains and restart works",
+  "scanOnce failure does not pin inFlight; the next tick retries",
+  "listBatch stops at the file limit without requiring a full sorted listing",
+  "bounded batches eventually visit every retained record regardless of dirent order",
+  "a later ready behind long-lived intent/unknown/corrupt becomes visible",
+  "new files are visited and deleted files do not stall the cursor",
+  "scanOnce does not starve a later ready when the first settle exceeds the batch budget",
+  "OS RLIMIT_FSIZE short write fails intent and does not clobber an existing ready",
+  "native: hang-up after positive output seals USER_CANCELLED reported partial",
+  "native: hang-up after explicit zero output is USER_CANCELLED reported zero",
+  "native: hang-up before any usage keeps intent/unobserved",
+  "buffered: hang-up after positive output seals USER_CANCELLED reported partial",
+  "buffered: hang-up after explicit zero output is USER_CANCELLED reported zero",
+  "buffered: hang-up before any usage keeps intent/unobserved",
+  "nonstream: hang-up after positive output seals USER_CANCELLED reported partial",
+  "nonstream: hang-up after explicit zero output is USER_CANCELLED reported zero",
+  "nonstream: hang-up before any usage keeps intent/unobserved",
+  "native: reported error frame persists only stable evidence and preserves wire error",
+  "buffered: reported error frame persists only stable evidence and preserves wire error",
+  "nonstream: reported error frame persists only stable evidence and preserves wire error"
+] as const;
+const { createHash: hashAProof } = await import('node:crypto');
+const { realpathSync: realAProof } = await import('node:fs');
+for (const pkg of ['commercial', 'gateway', 'protocol', 'storage']) {
+  assert.equal(realAProof(join(candidateRoot, 'node_modules/@openclaude', pkg)),
+    realAProof(join(candidateRoot, 'packages', pkg)), `A proof workspace escaped candidate: ${pkg}`);
+}
+const aSourceFiles = [...A_EXTERNAL_FILES,
+  'packages/commercial/src/billing/cursorExternalApiOutbox.ts',
+  'packages/commercial/src/http/proxy/cursorExternal.ts',
+  'packages/gateway/src/engine/cursorSandRelay.ts',
+  'packages/gateway/src/engine/cursorSandInference.proto',
+  'packages/commercial/src/__tests__/helpers/cursorExternalApiShortwrite.worker.ts'];
+const aSource = Object.fromEntries(aSourceFiles.map((rel) => [rel,
+  hashAProof('sha256').update(readFileSync(join(candidateRoot, rel))).digest('hex')]));
+console.log(JSON.stringify({ contractId: 'A-external-FS-relay-start', root: candidateRoot,
+  node: process.version, modules: process.versions.modules, source: aSource,
+  expected: { leaves: A_EXTERNAL_LEAVES, count: A_EXTERNAL_LEAVES.length, skipped: 0 } }));
+await runTapProof({ fromRoot: candidateRoot, files: A_EXTERNAL_FILES,
+  expected: A_EXTERNAL_LEAVES, label: 'a-external-FS-relay', timeoutMs: 120_000, leafIndent: 4 });
+console.log(JSON.stringify({ contractId: 'A-external-FS-relay', source: aSource,
+  result: 'existing runTapProof verified all 28 fixed leaves exactly once, child exit0, zero skip/todo/fail',
+  boundary: 'real FS/scanner/shortwrite and relay cancel/error evidence; no PG or retry claim' }));
+console.log('[cursor-external-billing] PASS — exact 28 no-PG FS/relay leaves; ledger/restart/retry verified separately in PR-2');
