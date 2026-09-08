@@ -10,7 +10,7 @@ const DEFAULT_APPROVAL_SRC = join(HERE, '../src/host/workspace/approval.mjs')
 const BRIDGE_SRC = join(HERE, '../src/host/approvalBridge.mjs')
 const TEST_SRC = fileURLToPath(import.meta.url)
 const OS_COMMAND_E2E = false
-const APPROVAL_SRC = process.env.OCV5_188_D_APPROVAL_MODULE || DEFAULT_APPROVAL_SRC
+const APPROVAL_SRC = DEFAULT_APPROVAL_SRC
 
 const { createApprovalBridge } = await import(pathToFileURL(BRIDGE_SRC).href)
 const { classifyDestructiveOp, createApprovalController, isReadonlyBash } = await import(
@@ -50,14 +50,6 @@ function classifyBash(command) {
   })
 }
 
-function classifyFrame(request) {
-  const command = typeof request.input?.command === 'string' ? request.input.command : ''
-  return classifyDestructiveOp({
-    kind: request.toolName,
-    command,
-    detail: { toolName: request.toolName, command },
-  })
-}
 
 function fakeTimers() {
   const pending = []
@@ -178,13 +170,12 @@ after(() => {
   emit({
     contractId: 'ocv5-188-D-catalog-summary',
     phase: 'catalog-summary',
-    expected: { business: BUSINESS_IDS.length, skip: 0 },
+    expected: { business: BUSINESS_IDS.length },
     actual: {
       catalog: BUSINESS_IDS.length,
       executed: executed.length,
       pass,
       fail,
-      skip: 0,
       notRun,
       ids: executed.map((row) => ({ id: row.id, pass: row.pass })),
     },
@@ -237,7 +228,7 @@ for (const spec of CLASSIFY_CASES) {
 
 for (const spec of BRIDGE_NOCTRL_CASES) {
   test(spec.id, async () => {
-    const bridge = createApprovalBridge({ classify: classifyFrame })
+    const bridge = createApprovalBridge({})
     const sent = []
     const result = await bridge.inspectOutbound(bashFrame(spec.requestId, spec.command), {
       sendJson: (frame) => sent.push(frame),
@@ -304,7 +295,7 @@ for (const spec of BRIDGE_CONTROLLER_CASES) {
         prompts.push(request)
       },
     })
-    const bridge = createApprovalBridge({ approval, classify: classifyFrame })
+    const bridge = createApprovalBridge({ approval })
     let inspectPromise
     let testError
     try {
@@ -412,7 +403,7 @@ for (const spec of BRIDGE_SAFE_CASES) {
         prompts.push(request)
       },
     })
-    const bridge = createApprovalBridge({ approval, classify: classifyFrame })
+    const bridge = createApprovalBridge({ approval })
     let inspectPromise
     let testError
     try {
@@ -493,7 +484,6 @@ test('P1-provenance', () => {
     classifyCases: CLASSIFY_CASES.length,
     bridgeCases: BRIDGE_NOCTRL_CASES.length + BRIDGE_CONTROLLER_CASES.length + BRIDGE_SAFE_CASES.length,
     executedBusiness: executed.filter((row) => BUSINESS_IDS.includes(row.id)).length,
-    skipInvoked: 0,
     hashes: snap,
   }
   emit({
