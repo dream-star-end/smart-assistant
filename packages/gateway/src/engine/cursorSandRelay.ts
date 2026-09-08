@@ -1180,7 +1180,7 @@ class TerminalSession {
       await this.onTerminal({
         evidence: this.evidence(state),
         outcome,
-        ...(terminalCode ? { terminalCode } : {}),
+        ...(terminalCode ? { terminalCode: classifyRelayTerminalCode(terminalCode) } : {}),
       })
     } catch (err) {
       this.hookFailed = true
@@ -1201,21 +1201,31 @@ class TerminalSession {
 }
 
 /** Stable FS/plan terminalCode. Wire frames still use publicMessage separately. */
+const PERSISTED_RELAY_TERMINAL_CODES = new Set([
+  "USER_CANCELLED",
+  "CURSOR_SAND_ABORTED",
+  "CURSOR_SAND_DOWNSTREAM_CLOSED",
+  "CURSOR_SAND_UPSTREAM_ERROR",
+  "CURSOR_SAND_UPSTREAM_TERMINATED",
+  "CURSOR_SAND_UPSTREAM_STALLED",
+  "CURSOR_SAND_TRUNCATED_FRAME",
+  "CURSOR_SAND_PROMPT_TOO_LONG",
+  "CURSOR_SAND_HTTP_ERROR",
+  "CURSOR_SAND_AUTH_HTTP_ERROR",
+  "CURSOR_SAND_RETRY_HTTP_ERROR",
+]);
+
 export function classifyRelayTerminalCode(error: unknown): string {
   if (error == null) return "CURSOR_SAND_UPSTREAM_ERROR"
-  if (typeof error === "string") {
-    const trimmed = error.trim()
-    if (trimmed === "USER_CANCELLED") return "USER_CANCELLED"
-    const token = trimmed.split(/[\s:]/, 1)[0] ?? ""
-    if (/^CURSOR_SAND_[A-Z0-9_]+$/.test(token)) return token
-    if (/^CURSOR_[A-Z0-9_]+$/.test(token) && token !== "CURSOR") return token
-    return classifyRelayTerminalCode({ name: "Error", message: trimmed })
-  }
   const err = error as { name?: string; message?: string }
-  const msg = typeof err.message === "string" ? err.message : String(error)
+  const msg = typeof error === "string" ? error : typeof err.message === "string" ? err.message : String(error)
   if (msg === "USER_CANCELLED") return "USER_CANCELLED"
   const token = msg.trim().split(/[\s:]/, 1)[0] ?? ""
-  if (/^CURSOR_SAND_[A-Z0-9_]+$/.test(token)) return token
+  // Cancellation is an exact controlled value; arbitrary upstream prefixes
+  // must never turn private error text into durable evidence or billable stop.
+  if (token !== "USER_CANCELLED" && PERSISTED_RELAY_TERMINAL_CODES.has(token)) return token
+  const http = /^CURSOR_SAND_(AUTH_|RETRY_)?HTTP_[1-5][0-9]{2}$/.exec(token)
+  if (http) return token
   if (err.name === "AbortError" || msg === "AbortError") return "CURSOR_SAND_ABORTED"
   if (err.name === "TypeError" || /terminated|ECONNRESET|EPIPE|UND_ERR|fetch failed/i.test(msg)) {
     return "CURSOR_SAND_UPSTREAM_TERMINATED"
