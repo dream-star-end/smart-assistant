@@ -5,6 +5,7 @@ import { truncateAllForTest } from "./db.js";
 /** Auth-only fixture: keep real multi-connection business transactions outside reset. */
 export async function prepareAuthRowResetForTest(
   beforeUserCleanup?: (runner: QueryRunner) => Promise<void>,
+  afterUserCleanup?: (runner: QueryRunner) => Promise<void>,
 ): Promise<() => Promise<void>> {
   // Preserve the original clean start after the complete production migration chain.
   await truncateAllForTest(["refresh_tokens", "email_verifications", "users"]);
@@ -63,6 +64,7 @@ export async function prepareAuthRowResetForTest(
       const leftovers = await client.query<{ leftover: number }>(emptinessSql);
       assert.deepEqual(leftovers.rows.map(({ leftover }) => closure.rows[leftover]), [],
         "auth reset must leave the entire original FK/partition closure empty");
+      if (afterUserCleanup) await afterUserCleanup(client as unknown as QueryRunner);
     });
   };
 }
