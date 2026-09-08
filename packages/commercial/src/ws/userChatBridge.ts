@@ -179,12 +179,14 @@ import {
 import {
   admitDurableControl,
   claimDueTurnControls,
+  HELLO_PENDING_PERMISSION_MAX_SESSIONS,
   markTurnControlReceipt,
   pendingPermissionPromptToFrame,
   persistPermissionAuthority,
-  readPendingPermissionPrompts,
+  readPendingPermissionPromptsForSessions,
   releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
+  selectHelloPermissionSessions,
   settlePermissionPromptFromRuntime,
   TurnControlConflictError,
 } from "../dispatch/turnControlStore.js";
@@ -5314,9 +5316,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const terminalNotifySeen = new Set<string>();
             const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
             const liveCatchupSeen = new Set<string>();
-            // INC-20260903-PENDING-PERMISSION-LOST: durable pending prompts to
-            // re-materialise for this browser (same bound/dedupe as live catch-up).
-            const pendingPermissionSessions: Array<{ peerId: string; sessionKey: string }> = [];
+            // INC-20260907-PERMISSION-ROOTFIX: permission hello scan is independent
+            // of live catch-up's 8-session cap. Collect every visible peer here;
+            // selectHelloPermissionSessions later bounds + prioritises in-flight.
+            const helloPermissionPeers: Array<{ peerId: string; agentId?: string; inFlight?: boolean }> = [];
+            const helloPermissionPeerSeen = new Set<string>();
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
@@ -5371,11 +5375,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const safeId = peer.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
               const sessionKey = `agent:${aid}:webchat:dm:${safeId}`;
               const storeKey = `${uidStr}:${cidStr}:${sessionKey}`;
-              if (
-                liveCatchupSeen.has(peer.peerId) &&
-                !pendingPermissionSessions.some((entry) => entry.peerId === peer.peerId)
-              ) {
-                pendingPermissionSessions.push({ peerId: peer.peerId, sessionKey });
+              if (!helloPermissionPeerSeen.has(peer.peerId)) {
+                helloPermissionPeerSeen.add(peer.peerId);
+                helloPermissionPeers.push({
+                  peerId: peer.peerId,
+                  agentId: aid,
+                  inFlight: peer.inFlight === true,
+                });
               }
               // Hello is the browser's subscription authority. Register every
               // visible peer before forwarding/replay so a second attached tab
@@ -5524,26 +5530,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
               })().catch(() => {});
             }
-            // INC-20260903-PENDING-PERMISSION-LOST:permission_request 只在容器
-            // 发出那一刻投给当时已登记的 socket;bridge/浏览器处于重连窗口时这帧
-            // 就永久丢失,而引擎停在 waitingForUserInput(看门狗被抑制)——
-            // 用户看不到卡片、也点不出来。turn_permission_requests 是落盘在前的
-            // 权威,这里把仍可作答(pending 且未过期)的提示按原帧形状补发给
-            // 本条 hello 的 userWs。不打 frameSeq(前端 reducer 按 requestId 幂等,
-            // 无 seq 的帧不推游标);容器侧 autoResumeFromHello 也会补一份,重复
-            // 到达无害。同样只能是浮动 promise,绝不能挡 hello 转发。
-            if (pendingPermissionSessions.length > 0 && deps.pgPool) {
+            // INC-20260903-PENDING-PERMISSION-LOST / INC-20260907-PERMISSION-ROOTFIX:
+            // permission_request 只在容器发出那一刻投给当时已登记的 socket。
+            // 不再搭 liveCatchup 的前 8 会话车：hello 带全部可见会话，活跃会话
+            // 几乎从不在前 8。一次批量 SQL 覆盖有界候选集；超限显式截断，客户端
+            // 靠会话 GET 找回未扫到的会话。不打 frameSeq。绝不能挡 hello 转发。
+            const helloPermissionScan = selectHelloPermissionSessions(helloPermissionPeers, {
+              maxSessions: HELLO_PENDING_PERMISSION_MAX_SESSIONS,
+            });
+            if (helloPermissionScan.sessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
               void (async () => {
                 try {
                   await Promise.resolve();
-                  for (const { peerId, sessionKey } of pendingPermissionSessions) {
+                  const sessionIds = helloPermissionScan.sessions.map((entry) => entry.peerId);
+                  const pendingBySession = await readPendingPermissionPromptsForSessions(pgPool, {
+                    userId: uid,
+                    sessionIds,
+                  });
+                  let hits = 0;
+                  for (const { peerId, sessionKey } of helloPermissionScan.sessions) {
                     if (userWs.readyState !== WebSocket.OPEN) break;
-                    const rows = await readPendingPermissionPrompts(pgPool, {
-                      userId: uid,
-                      sessionId: peerId,
-                    });
-                    if (rows.length === 0) continue;
+                    const rows = pendingBySession.get(peerId);
+                    if (rows === undefined || rows.length === 0) continue;
                     let sent = 0;
                     for (const row of rows) {
                       if (userWs.readyState !== WebSocket.OPEN) break;
@@ -5552,12 +5561,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       try { userWs.send(JSON.stringify(frame)); sent += 1; } catch { break; }
                     }
                     if (sent > 0) {
+                      hits += sent;
                       bridgeLog?.info("user-chat-bridge: hello replayed pending permission prompts", {
                         uid: uidStr,
                         sessionId: peerId,
                         count: sent,
                       });
                     }
+                  }
+                  if (userWs.readyState === WebSocket.OPEN && (hits > 0 || helloPermissionScan.truncated)) {
+                    try {
+                      userWs.send(JSON.stringify({
+                        type: "outbound.permission_hello_scan",
+                        channel: "webchat",
+                        scanned: helloPermissionScan.scanned,
+                        omitted: helloPermissionScan.omitted,
+                        truncated: helloPermissionScan.truncated,
+                        hits,
+                        ts: Date.now(),
+                      }));
+                    } catch { /* */ }
                   }
                 } catch {
                   // 补发失败只能静默:不得挡转发、不得关连接。

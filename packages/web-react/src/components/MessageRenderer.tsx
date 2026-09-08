@@ -75,7 +75,8 @@ import {
   type PermissionRespond,
   isAwaitingPermissionPrompt,
 } from "./chat/PermissionCard";
-import { ToolCardSlot } from "./chat/toolCardSlot";
+import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
+import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
 import {
@@ -2001,8 +2002,48 @@ export function MessageList({
     const match = findMatchesList[next];
     if (match) jumpTo(match);
   };
+  const pendingPrompts = useMemo(
+    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
+    [messages, readOnly],
+  );
+  const requestIdByToolUseId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const message of pendingPrompts) {
+      if (message.requestId && message.toolUseId) map.set(message.toolUseId, message.requestId);
+    }
+    return map;
+  }, [pendingPrompts]);
   return (
+    <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
     <>
+    {pendingPrompts.length > 0 ? (
+      <div
+        data-testid="pending-permission-dock"
+        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 bg-bg/95 px-5 py-2"
+      >
+        <span className="text-caption text-muted">待回答</span>
+        {pendingPrompts.map((message) => (
+          <button
+            key={message.requestId ?? message.id}
+            type="button"
+            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent"
+            onClick={() => {
+              if (message.requestId) reopenPermissionUi(message.requestId);
+              const safe = (message.requestId ?? "").replace(/["\\]/g, "");
+              document
+                .querySelector(`[data-permission-request="${safe}"] button`)
+                ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+            }}
+          >
+            {message.toolName === "AskUserQuestion"
+              ? "打开提问"
+              : message.toolName === "ExitPlanMode"
+                ? "打开计划"
+                : "打开审批"}
+          </button>
+        ))}
+      </div>
+    ) : null}
     {find ? (
       <div className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2">
         <Input
@@ -2152,5 +2193,6 @@ export function MessageList({
       )}
     </div>
     </>
+    </PermissionToolReopenContext.Provider>
   );
 }

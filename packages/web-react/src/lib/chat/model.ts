@@ -536,6 +536,8 @@ export type ChatMessage = {
 
   // ── permission ──
   requestId?: string;
+  /** Engine tool_use id when the prompt is bound to a tool card. */
+  toolUseId?: string;
   _resolved?: boolean;
   _behavior?: "allow" | "deny";
   _settledReason?: string | null;

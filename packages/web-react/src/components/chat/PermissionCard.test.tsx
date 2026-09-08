@@ -390,10 +390,14 @@ describe("ExitPlanMode 计划确认", () => {
     expect(screen.getByRole("button", { name: "继续规划" })).toBeInTheDocument();
   });
 
-  test("没有关闭按钮，Escape 不能把弹窗关掉", () => {
-    render(<PermissionCard msg={exitPlanMsg()} onRespond={vi.fn()} livePrompt />);
-    expect(screen.queryByRole("button", { name: "关闭" })).toBeNull();
-    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape", code: "Escape" });
+  test("关闭只关 UI，不批准不拒绝，卡片可重开", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={exitPlanMsg()} onRespond={onRespond} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onRespond).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "审阅计划" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 

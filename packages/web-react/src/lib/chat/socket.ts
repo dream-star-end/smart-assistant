@@ -19,6 +19,7 @@ import {
   applyOutboundMessage,
   applyPermissionRequest,
   applyPermissionSettled,
+  applyPermissionSnapshot,
   applyResumeFailed,
   applyTurnStatus,
   applyTurnUsage,
@@ -76,6 +77,7 @@ import {
 } from "../persist";
 import { appUpdate } from "../appUpdate";
 import { observeTimelineShadow } from "../timeline/shadowLifecycle";
+import type { PermissionPromptSnapshotPayload } from "../types";
 import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
@@ -255,6 +257,8 @@ export type ChatSocketDeps = {
   persistSessionModel?: (sessId: string, modelId: string) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
+  /** Bounded requestId lookup when a permission snapshot page is truncated. */
+  lookupPermissionPrompts?: (sessId: string, requestIds: string[]) => void;
   /** Exact outbound journal. Production waits for one committed row before
    * the first physical WS send and exact-deletes it only after authority ACK. */
   persistPendingDispatch?: (sessId: string, item: StoredPendingDispatch) => Promise<void>;
@@ -2505,6 +2509,12 @@ export class ChatSocket {
         return;
       }
       default:
+        if ((f as { type?: unknown }).type === "outbound.permission_hello_scan") {
+          const frame = f as { truncated?: unknown };
+          if (frame.truncated === true && this.activeSessionId) {
+            this.deps.syncSession?.(this.activeSessionId);
+          }
+        }
         // pong 已先处理；其余 v5 webchat 不消费。
         return;
     }
@@ -3834,6 +3844,7 @@ export class ChatSocket {
         clientMessageId: string;
         status: string;
       };
+      permissionPrompts?: PermissionPromptSnapshotPayload;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -3994,6 +4005,10 @@ export class ChatSocket {
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
     expireGenPlaceholdersAgainstServerRows(s);
+    if (archive?.permissionPrompts) {
+      const lookupIds = applyPermissionSnapshot(s, archive.permissionPrompts);
+      if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(s.id, lookupIds);
+    }
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
     this.reconcileUnpublishedTapeRetry(sessId);
@@ -4031,6 +4046,19 @@ export class ChatSocket {
     if (full && this.ws && this.ws.readyState === 1) {
       this.sendHelloFrame(false, sessId, true);
     }
+  }
+
+  applyPermissionPromptSnapshot(
+    sessId: string,
+    snapshot: PermissionPromptSnapshotPayload | null | undefined,
+  ): string[] {
+    const sess = this.sessions.get(sessId);
+    if (!sess || !snapshot) return [];
+    const lookupIds = applyPermissionSnapshot(sess, snapshot);
+    this.deps.persistSession?.(sess.id);
+    this.scheduleNotify();
+    if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(sess.id, lookupIds);
+    return lookupIds;
   }
 
   /**

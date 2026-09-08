@@ -1898,6 +1898,7 @@ export const api = {
     id: string,
     sinceSeq = 0,
     sinceHistoryRevision?: number,
+    permissionLookupIds?: string[],
   ): Promise<SessionDetail> => {
     const params = new URLSearchParams();
     if (sinceSeq > 0) {
@@ -1905,6 +1906,9 @@ export const api = {
       if (Number.isSafeInteger(sinceHistoryRevision) && (sinceHistoryRevision as number) >= 0) {
         params.set("since_history_revision", String(sinceHistoryRevision));
       }
+    }
+    if (permissionLookupIds && permissionLookupIds.length > 0) {
+      params.set("permission_lookup", permissionLookupIds.slice(0, 16).join(","));
     }
     const query = params.toString();
     const suffix = query ? `?${query}` : "";

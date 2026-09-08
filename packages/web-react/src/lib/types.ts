@@ -498,6 +498,33 @@ export type SessionDetail = {
     lastFrameAt: number | null;
     model?: string;
   };
+  /** Optional permission snapshot. Old backends omit it. `responded` = accepted,
+   *  not executed. completeness=unavailable means absence is not "all answered". */
+  permissionPrompts?: PermissionPromptSnapshotPayload;
+};
+
+export type PermissionPromptSnapshotStatus = "pending" | "responded" | "cancelled" | "expired";
+
+export type PermissionPromptSnapshotItem = {
+  requestId: string;
+  clientMessageId: string | null;
+  toolUseId: string | null;
+  toolName: string;
+  inputJson: Record<string, unknown>;
+  status: PermissionPromptSnapshotStatus;
+  behavior: "allow" | "deny" | null;
+  reason: string | null;
+  answers: Record<string, string> | null;
+  expiresAt: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type PermissionPromptSnapshotPayload = {
+  items: PermissionPromptSnapshotItem[];
+  completeness: "complete" | "truncated" | "unavailable";
+  source: "pg" | "runtime";
+  lookups?: PermissionPromptSnapshotItem[];
 };
 
 export type DurableLiveFrame = {

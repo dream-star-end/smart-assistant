@@ -1949,6 +1949,43 @@ export interface ClientSession {
     lastFrameAt: number | null
     model?: string
   }
+  /** Optional permission/ask-user snapshot from Master PG turn_permission_requests
+   *  (PG session GET only). SQLite/old clients omit the field. `responded` means
+   *  the control was accepted, not that the tool executed. Completeness:
+   *  complete = page covers the recent window; truncated = older cards need
+   *  requestId lookup; unavailable = no PG / timeout — absence is not "all answered". */
+  permissionPrompts?: {
+    items: Array<{
+      requestId: string
+      clientMessageId: string | null
+      toolUseId: string | null
+      toolName: string
+      inputJson: Record<string, unknown>
+      status: 'pending' | 'responded' | 'cancelled' | 'expired'
+      behavior: 'allow' | 'deny' | null
+      reason: string | null
+      answers: Record<string, string> | null
+      expiresAt: number
+      createdAt: number
+      updatedAt: number
+    }>
+    completeness: 'complete' | 'truncated' | 'unavailable'
+    source: 'pg' | 'runtime'
+    lookups?: Array<{
+      requestId: string
+      clientMessageId: string | null
+      toolUseId: string | null
+      toolName: string
+      inputJson: Record<string, unknown>
+      status: 'pending' | 'responded' | 'cancelled' | 'expired'
+      behavior: 'allow' | 'deny' | null
+      reason: string | null
+      answers: Record<string, string> | null
+      expiresAt: number
+      createdAt: number
+      updatedAt: number
+    }>
+  }
 }
 
 /**
@@ -2806,6 +2843,8 @@ export type ClientSessionReadOptions = {
   view?: 'exact' | 'timeline'
   /** Revision paired with `sinceSeq`; missing/mismatch forces a full read. */
   sinceHistoryRevision?: number
+  /** Bounded requestIds for exact permission-prompt lookup (PG only). */
+  permissionLookupIds?: string[]
 }
 
 /**

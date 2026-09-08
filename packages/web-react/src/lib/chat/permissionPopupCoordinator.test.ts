@@ -1,0 +1,37 @@
+import { afterEach, describe, expect, test, vi } from "vitest";
+import {
+  dismissPermissionUi,
+  isDocumentForeground,
+  markPermissionDisplayed,
+  reopenPermissionUi,
+  resetPermissionPopupCoordinator,
+  shouldAutoOpenPermission,
+} from "./permissionPopupCoordinator";
+
+afterEach(() => {
+  resetPermissionPopupCoordinator();
+  vi.unstubAllGlobals();
+});
+
+describe("permissionPopupCoordinator", () => {
+  test("foreground live prompts auto-open until dismissed", () => {
+    expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(true);
+    dismissPermissionUi("r1");
+    expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(false);
+    reopenPermissionUi("r1");
+    expect(shouldAutoOpenPermission({ requestId: "r1", livePrompt: true })).toBe(true);
+  });
+
+  test("background tabs do not auto-open and do not mark displayed", () => {
+    vi.stubGlobal("document", { visibilityState: "hidden" });
+    expect(isDocumentForeground()).toBe(false);
+    expect(shouldAutoOpenPermission({ requestId: "bg", livePrompt: true })).toBe(false);
+    markPermissionDisplayed("bg");
+    vi.stubGlobal("document", { visibilityState: "visible" });
+    expect(shouldAutoOpenPermission({ requestId: "bg", livePrompt: true })).toBe(true);
+  });
+
+  test("non-live prompts never auto-open", () => {
+    expect(shouldAutoOpenPermission({ requestId: "hist", livePrompt: false })).toBe(false);
+  });
+});

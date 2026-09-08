@@ -5,7 +5,8 @@
  *    (Bash→命令、文件类→路径、浏览器→URL/动作),其余回落可折叠的格式化 JSON。
  *  - 审批 modal：普通工具 allow/deny；AskUserQuestion 走专用答题（单选/多选/其他/预览），
  *    提交把 `{ answers, annotations }` 经 updatedInput 回送（gateway 白名单校验）。
- *    ExitPlanMode 走计划确认框（markdown 计划书 + 按此执行/继续规划），不能无决策关掉。
+ *    ExitPlanMode 走计划确认框（markdown 计划书 + 按此执行/继续规划）；
+ *    关闭/收起只关 UI，不批准也不拒绝，卡片和待答入口可重开。
  *    modal 窄屏均为贴底 sheet(mobile="sheet")。
  *  - 全部经 props.onRespond（= useChatSocket.respondPermission，已绑 sessId）。
  */
@@ -15,6 +16,14 @@ import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { asStr } from "../tool/format";
+import {
+  dismissPermissionUi,
+  isDocumentForeground,
+  markPermissionDisplayed,
+  reopenPermissionUi,
+  resetPermissionPopupCoordinator,
+  shouldAutoOpenPermission,
+} from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
 import { Button, Modal } from "../ui";
 
@@ -64,19 +73,12 @@ function isDetachedAskUserCard(msg: ChatMessage): boolean {
   );
 }
 
-/** Page-session memory of requestIds the user dismissed without answering.
- *  Live prompts must re-open after a timeline remount (CCB still waits);
- *  only an explicit close without allow/deny suppresses the next auto-open.
- *  ExitPlanMode never enters this set — the engine cannot proceed until the
- *  user picks 按此计划执行 / 继续规划. Refresh clears the set. */
-const dismissedPermissionRequestIds = new Set<string>();
-
 export function resetPermissionAutoOpenMemory(): void {
-  dismissedPermissionRequestIds.clear();
+  resetPermissionPopupCoordinator();
 }
 
 function rememberDismissedPermissionRequest(requestId: string | undefined): void {
-  if (requestId) dismissedPermissionRequestIds.add(requestId);
+  if (requestId) dismissPermissionUi(requestId);
 }
 
 export function isExitPlanModeTool(toolName: string | undefined): boolean {
@@ -228,16 +230,32 @@ export function PermissionCard({
   const expired = !resolved && permissionHasExpired(msg);
   const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt);
 
-  // 自动弹窗：仅活提问。时间线重挂会丢掉 useState(open)，必须再弹，
-  // 否则 CCB waitingForUserInput 会卡死而用户看不到确认框。
-  // 用户主动关掉（问答/普通权限）才记入 dismissed 集，阻止下一次自动弹。
+  // 自动弹窗：仅前台活提问。后台挂载不记已弹；真正展示后才 mark。
+  // 关掉只关 UI，不批准/拒绝。时间线重挂未 dismiss 的活提问仍再弹。
   useEffect(() => {
     if (!livePrompt || resolved || pending || readOnly || expired) return;
     const requestId = msg.requestId;
     if (!requestId) return;
-    if (!isExitPlan && dismissedPermissionRequestIds.has(requestId)) return;
+    if (!shouldAutoOpenPermission({ requestId, livePrompt })) return;
     setOpen(true);
-  }, [resolved, pending, readOnly, expired, livePrompt, isExitPlan, msg.requestId]);
+  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
+
+  useEffect(() => {
+    if (!livePrompt || resolved || pending || readOnly || expired) return;
+    const onVis = () => {
+      const requestId = msg.requestId;
+      if (!requestId || !shouldAutoOpenPermission({ requestId, livePrompt })) return;
+      setOpen(true);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
+
+  useEffect(() => {
+    if (open && isDocumentForeground() && msg.requestId) {
+      markPermissionDisplayed(msg.requestId);
+    }
+  }, [open, msg.requestId]);
 
   const handleDismissableOpenChange = (next: boolean) => {
     if (!next) rememberDismissedPermissionRequest(msg.requestId);
@@ -278,6 +296,7 @@ export function PermissionCard({
   return (
     <div
       data-testid="permission-card"
+      data-permission-request={msg.requestId}
       className={cn(
         "rounded-lg border bg-surface animate-in",
         tone === "allow" && "border-success/40",
@@ -307,7 +326,15 @@ export function PermissionCard({
       {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
       {canAnswer && (
         <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
-          <Button size="sm" variant="accent" shape="pill" onClick={() => setOpen(true)}>
+          <Button
+            size="sm"
+            variant="accent"
+            shape="pill"
+            onClick={() => {
+              if (msg.requestId) reopenPermissionUi(msg.requestId);
+              setOpen(true);
+            }}
+          >
             {questions ? "回答" : isExitPlan ? "审阅计划" : "审批"}
           </Button>
           {!questions && !isExitPlan && (
@@ -390,7 +417,7 @@ export function PermissionCard({
         ) : isExitPlan ? (
           <ExitPlanModeModal
             open={open}
-            onOpenChange={setOpen}
+            onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
             plan={planMarkdown}
             planFilePath={asStr(input?.planFilePath)}
@@ -415,6 +442,8 @@ export function PermissionCard({
 
 function settledReasonLabel(reason: string): string {
   switch (reason) {
+    case "accepted":
+      return "已受理（尚未确认执行）";
     case "timeout":
       return "审批超时，已自动拒绝";
     case "disconnect":
@@ -520,16 +549,12 @@ function ExitPlanModeModal({
   return (
     <Modal
       open={open}
-      onOpenChange={(next) => {
-        if (next) onOpenChange(true);
-      }}
+      onOpenChange={onOpenChange}
       mobile="sheet"
       size="lg"
       fixedHeight
-      hideClose
-      onEscapeKeyDown={(event) => event.preventDefault()}
       title="退出计划模式"
-      description="请审阅计划后再决定是否开始执行。关掉窗口不会取消等待。"
+      description="关掉窗口不会批准或拒绝计划，执行侧仍在等待。可从卡片或待答入口重新打开。"
       footer={
         <>
           <Button variant="ghost" onClick={() => decide("deny")}>

@@ -146,6 +146,7 @@ export type UseChatSocket = {
       clientMessageId: string;
       status: string;
     };
+    permissionPrompts?: import("../lib/types").PermissionPromptSnapshotPayload;
   }) => void;
   /** Replay an immutable page from the master-side live-frame journal. */
   applyDurableLiveFrames: (
@@ -308,6 +309,8 @@ export function useChatSocket(opts: {
   onMediaJobRef.current = opts.onMediaJob;
   const queueModelPatchRef = useRef(opts.queueModelPatch);
   queueModelPatchRef.current = opts.queueModelPatch;
+  const permissionLookupAtRef = useRef(new Map<string, number>());
+  const permissionLookupFailRef = useRef(new Map<string, number>());
 
   // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
   const storeRef = useRef<SessionStore | null>(null);
@@ -329,6 +332,27 @@ export function useChatSocket(opts: {
         return api.refresh(session, expectedEpoch, "ws_auth");
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
+      lookupPermissionPrompts: (sessId, requestIds) => {
+        const now = Date.now();
+        const last = permissionLookupAtRef.current.get(sessId) ?? 0;
+        const fails = permissionLookupFailRef.current.get(sessId) ?? 0;
+        const minMs = Math.min(60_000, 8_000 * 2 ** Math.min(fails, 3));
+        if (now - last < minMs) return;
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+        if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+        permissionLookupAtRef.current.set(sessId, now);
+        const a = authRef.current;
+        const sock = socketRef.current;
+        if (!a || !sock || requestIds.length === 0) return;
+        void api.getSession(a, sessId, 0, undefined, requestIds).then((detail) => {
+          permissionLookupFailRef.current.set(sessId, 0);
+          if (detail.permissionPrompts) {
+            sock.applyPermissionPromptSnapshot(sessId, detail.permissionPrompts);
+          }
+        }).catch(() => {
+          permissionLookupFailRef.current.set(sessId, fails + 1);
+        });
+      },
       refreshBalance: () => refreshBalanceRef.current?.(),
       refreshInbox: () => refreshInboxRef.current?.(),
       reportClientError: (p) => {
@@ -406,8 +430,11 @@ export function useChatSocket(opts: {
                 timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: detail._historyRevisionUnsupported === true,
                 openDispatch: detail.openDispatch,
+                permissionPrompts: detail.permissionPrompts,
               },
             );
+          } else if (detail.permissionPrompts) {
+            socket.applyPermissionPromptSnapshot(sessId, detail.permissionPrompts);
           }
           if (context?.tapeProjectionOnly === true) {
             if (!isCurrent()) return false;
@@ -442,6 +469,7 @@ export function useChatSocket(opts: {
                   timelineHasMore: tapeDetail.timelineHasMore,
                   timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                  permissionPrompts: tapeDetail.permissionPrompts,
                 },
               );
             },
@@ -740,6 +768,7 @@ export function useChatSocket(opts: {
         timelineSnapshotMaxSeq: p.timelineSnapshotMaxSeq,
         invalidateHistoryCache: p.invalidateHistoryCache,
         openDispatch: p.openDispatch,
+        permissionPrompts: p.permissionPrompts,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
