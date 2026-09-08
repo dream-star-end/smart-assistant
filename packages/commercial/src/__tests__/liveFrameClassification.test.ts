@@ -175,7 +175,9 @@ describe("retention ledger + business health (OCV5-180 C4/I3)", () => {
     assert.equal(failed.unregistered, null);
   });
 
-  test("business health snapshot has no ok field and preserves unknown", async () => {
+  test("business health snapshot has no ok field and preserves unknown", async (t) => {
+    // Keep fake-query time deterministic; real deadline timers still bound hanging queries.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const pool = makePool(async (sql) => {
       const trimmed = sql.trim();
       if (/^BEGIN\b/i.test(trimmed) || trimmed === "COMMIT" || trimmed === "ROLLBACK") return { rows: [] };

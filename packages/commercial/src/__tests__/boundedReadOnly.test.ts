@@ -216,7 +216,9 @@ describe("bounded read-only helper", () => {
 });
 
 describe("snapshot item isolation", () => {
-  test("query timeout on one count stays unknown and the snapshot still settles", async () => {
+  test("query timeout on one count stays unknown and the snapshot still settles", async (t) => {
+    // Keep fake-query time deterministic; real deadline timers still bound hanging queries.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const pool = {
       async connect() {
         return abortableClient((sql) => {
@@ -248,7 +250,9 @@ describe("snapshot item isolation", () => {
     if (!settled!.settlementHeld.unknown) assert.equal(settled!.settlementHeld.count, 2);
   });
 
-  test("retention alone hanging still reports unknown without blocking other items", async () => {
+  test("retention alone hanging still reports unknown without blocking other items", async (t) => {
+    // Keep fake-query time deterministic; real deadline timers still bound hanging queries.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     const pool = {
       async connect() {
         return abortableClient((sql) => {
