@@ -36,6 +36,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
 import {
   CursorSandRelay,
+  isNonRetryableUpstreamReason,
+  stripNonRetryableMarker,
   type CursorSandServeResult,
   type RelayCredentialKind,
 } from "@openclaude/gateway";
@@ -46,6 +48,13 @@ import type { ModelPricing, PricingCache } from "../../billing/pricing.js";
 import { readTotalSpendableBalance } from "../../billing/preCheck.js";
 import { settleCursorExternalUsage } from "../../billing/cursorExternalSettle.js";
 import type { SettleResult } from "../../billing/proxyBilling.js";
+import {
+  describeRequestShape,
+  extractLastUserMessage,
+  recordApiKeyMessageAudit,
+  usageCounts,
+  type ApiKeyMessageAuditRow,
+} from "../../billing/apiKeyMessageAudit.js";
 import {
   getCursorTokenSnapshot,
   listAccounts,
@@ -95,6 +104,8 @@ export interface CursorExternalDeps {
   loadSnapshot?: (id: bigint) => Promise<CursorTokenSnapshot | null>;
   readBalance?: (uid: bigint) => Promise<bigint>;
   settle?: typeof settleCursorExternalUsage;
+  /** 0279 message-audit writer (default: INSERT into api_key_message_audit via pgPool). */
+  recordMessageAudit?: (row: ApiKeyMessageAuditRow) => Promise<void>;
   relayFactory?: (args: CursorExternalRelayFactoryArgs) => CursorSandRelayLike;
   /** Per-uid account stickiness window (default 15 min, mirrors oc-cursor.sh). */
   stickyTtlMs?: number;
@@ -122,6 +133,13 @@ export interface CursorExternalHandleArgs {
    * or the resolved thinking-depth suffix. Defaults to `body.model`.
    */
   requestedModel?: string;
+  /**
+   * How the thinking depth was chosen (0279 audit): the effort actually applied
+   * and whether it came from the client (`request`), a clamp, the family default
+   * or an effort-pinned id. Optional — the container path never sets it.
+   */
+  effort?: string | null;
+  effortSource?: string | null;
   /** `deps.identity.authorize(identity, pricing, model)` bound by the handler. */
   authorize: (pricing: ModelPricing) => Promise<void>;
   appendCostCredits?: (
@@ -254,6 +272,8 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   const loadSnapshot = deps.loadSnapshot ?? ((id: bigint) => getCursorTokenSnapshot(id));
   const readBalance = deps.readBalance ?? ((uid: bigint) => readTotalSpendableBalance(uid));
   const settle = deps.settle ?? settleCursorExternalUsage;
+  const writeMessageAudit =
+    deps.recordMessageAudit ?? ((row: ApiKeyMessageAuditRow) => recordApiKeyMessageAudit(deps.pgPool, row));
   const relayFactory =
     deps.relayFactory
     ?? ((args: CursorExternalRelayFactoryArgs): CursorSandRelayLike =>
@@ -470,6 +490,8 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       settleKind: "final" | "partial" | "aborted";
     };
     let outcome: Outcome;
+    /** Client-visible failure text for the 0279 audit row (null on success). */
+    let auditError: string | null = null;
     if (result && result.kind === "completed") {
       outcome = { engineStatus: "success", terminalCode: null, usage: result.usage, settleKind: "final" };
     } else if (result && result.kind === "failed") {
@@ -477,26 +499,31 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       // A client that hung up mid-stream is still charged for what reached it
       // (same USER_CANCELLED semantics as the web engine's Stop button); a
       // genuine upstream fault leaves an audit row with no debit.
+      const nonRetryable = isNonRetryableUpstreamReason(result.reason);
       outcome = {
         engineStatus: "error",
         terminalCode: clientAborted ? "USER_CANCELLED" : "CURSOR_STREAM_FAILED",
         usage: result.usage,
         settleKind: clientAborted ? "aborted" : "partial",
       };
+      auditError = clientAborted ? "client disconnected" : stripNonRetryableMarker(result.reason);
       userLog.warn("cursor_external_stream_failed", {
         model,
         accountId: accountId.toString(),
-        reason: result.reason,
+        reason: stripNonRetryableMarker(result.reason),
+        nonRetryable,
         clientAborted,
       });
     } else if (result && result.kind === "rejected") {
+      const reason = stripNonRetryableMarker(result.reason);
+      const nonRetryable = isNonRetryableUpstreamReason(result.reason);
       if (result.status === 401) {
         cooled.set(accountId.toString(), nowMs + cooldownMs);
         sticky.delete(uid.toString());
         userLog.warn("cursor_external_credential_rejected", {
           model,
           accountId: accountId.toString(),
-          reason: result.reason,
+          reason,
           cooldownMs,
         });
         incrAnthropicProxyReject("upstream_auth");
@@ -505,24 +532,30 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
           model,
           accountId: accountId.toString(),
           status: result.status,
-          reason: result.reason,
+          reason,
+          nonRetryable,
         });
       }
       if (!result.written && !res.headersSent) {
+        // Provider said "don't bother retrying" → tell Claude Code so it stops its 10× loop.
+        if (nonRetryable) res.setHeader("x-should-retry", "false");
         sendJsonError(
           res,
           result.status,
           "UPSTREAM_REJECTED",
           // Internal reasons are `CURSOR_SAND_*` / `NOT_SAND_ROUTE`; strip the engine prefix for the wire.
-          result.reason.replace(/^CURSOR_SAND_/, ""),
+          reason.replace(/^CURSOR_SAND_/, ""),
           requestId,
         );
       }
-      outcome = { engineStatus: "error", terminalCode: result.reason, usage: {}, settleKind: "aborted" };
+      // Terminal code is a DB/billing key: keep it short and marker-free.
+      outcome = { engineStatus: "error", terminalCode: reason.slice(0, 200), usage: {}, settleKind: "aborted" };
+      auditError = reason;
     } else {
       if (clientAborted || (isAbortLike(failure) && ac.signal.aborted)) {
         userLog.info("cursor_external_client_aborted", { model, accountId: accountId.toString() });
         outcome = { engineStatus: "error", terminalCode: "USER_CANCELLED", usage: {}, settleKind: "aborted" };
+        auditError = "client disconnected";
       } else {
         userLog.error("cursor_external_relay_failed", {
           model,
@@ -535,6 +568,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
           res.end();
         }
         outcome = { engineStatus: "error", terminalCode: "CURSOR_RELAY_FAILED", usage: {}, settleKind: "aborted" };
+        auditError = `relay failed: ${errSummary(failure)}`;
       }
     }
     if (!res.writableEnded) res.end();
@@ -563,6 +597,31 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       userLog.error("cursor_external_settle_failed", { model, accountId: accountId.toString(), err: errSummary(err) });
     }
     incrAnthropicProxySettle(outcome.settleKind);
+
+    // 6b) 0279 message audit — admin-visible record of what the user sent and
+    //     what came back. Fire-and-forget: never delays the response (already
+    //     ended above) and never affects billing. Success and failure both land
+    //     (usage_records only keeps billable rows).
+    void writeMessageAudit({
+      requestId,
+      userId: uid,
+      apiKeyId: args.identity.apiKey?.id ?? null,
+      requestedModel,
+      model,
+      effort: args.effort ?? null,
+      effortSource: args.effortSource ?? null,
+      accountId,
+      shape: describeRequestShape(body),
+      lastUserMessage: extractLastUserMessage(body.messages),
+      status: outcome.engineStatus,
+      terminalCode: outcome.terminalCode,
+      errorMessage: auditError,
+      durationMs: now() - startedAt,
+      usage: usageCounts(outcome.usage),
+      clientUserAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"].slice(0, 256) : null,
+    }).catch((err: unknown) => {
+      userLog.warn("cursor_external_audit_failed", { requestId, err: errSummary(err) });
+    });
 
     // 7) post-commit — same order as core.ts: persist first, broadcast second;
     //    both fail-soft.

@@ -57,6 +57,11 @@ import {
   parseApiKeyIdQuery,
   type UsageWindow,
 } from "../billing/apiKeyUsageReport.js";
+import {
+  AUDIT_LIST_DEFAULT_LIMIT,
+  AUDIT_LIST_MAX_LIMIT,
+  listApiKeyMessageAudit,
+} from "../billing/apiKeyMessageAudit.js";
 
 /** list / create / patch 共用的对外形状(0277 三列一并输出;BigInt → 字符串)。 */
 function apiKeyToJson(r: ApiKeySummary) {
@@ -310,6 +315,49 @@ export async function handleGetMyApiKeyUsage(
   }
   const report = await getApiKeyUsageReport(user.id, window, parsedKey.keyId);
   sendJson(res, 200, report);
+}
+
+/** ────────────────────────────────────────────────────────────────────────
+ * GET /api/me/api-keys/messages?key_id=<id>&before=<id>&limit=<n>&errors_only=1(0279)
+ *
+ * 外接 API-key 请求的用户消息审计(最后一条用户输入 ≤4KB + 请求指纹/形状 + 模型/档位 +
+ * 结果)。**仅 admin**(requireAdmin,与其余 api-keys 管理面同口径);SQL 双重 `user_id`
+ * 限定,别人的 key_id 得到空集不泄漏存在性。倒序,`before` 游标分页,`next_before`
+ * 为 null 表示到底。
+ * ──────────────────────────────────────────────────────────────────────── */
+export async function handleListMyApiKeyMessages(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  requireAdmin(user);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const parsedKey = parseApiKeyIdQuery(url.searchParams.get("key_id"));
+  if (!parsedKey.ok) {
+    throw new HttpError(400, "INVALID_AUDIT_QUERY", "key_id must be a positive integer");
+  }
+  const parsedBefore = parseApiKeyIdQuery(url.searchParams.get("before"));
+  if (!parsedBefore.ok) {
+    throw new HttpError(400, "INVALID_AUDIT_QUERY", "before must be a positive integer");
+  }
+  const rawLimit = url.searchParams.get("limit");
+  let limit = AUDIT_LIST_DEFAULT_LIMIT;
+  if (rawLimit !== null && rawLimit !== "") {
+    if (!/^[1-9][0-9]{0,3}$/.test(rawLimit) || Number(rawLimit) > AUDIT_LIST_MAX_LIMIT) {
+      throw new HttpError(400, "INVALID_AUDIT_QUERY", `limit must be 1..${AUDIT_LIST_MAX_LIMIT}`);
+    }
+    limit = Number(rawLimit);
+  }
+  const errorsOnly = url.searchParams.get("errors_only") === "1";
+  const page = await listApiKeyMessageAudit(getPool(), user.id, {
+    apiKeyId: parsedKey.keyId,
+    beforeId: parsedBefore.keyId,
+    limit,
+    errorsOnly,
+  });
+  sendJson(res, 200, page);
 }
 
 /** ────────────────────────────────────────────────────────────────────────

@@ -112,7 +112,7 @@ const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_
 const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
 const MIGRATION_0246_CHAT_PROJECT = path.resolve(here, "../db/migrations/0246_chat_project_board_bind.sql");
-const MIGRATION_0279 = path.resolve(here, "../db/migrations/0279_preparation_recovery_origin.sql");
+const MIGRATION_0280 = path.resolve(here, "../db/migrations/0280_preparation_recovery_origin.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -251,7 +251,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0246_CHAT_PROJECT, { encoding: "utf8" }));
-  await pool.query(await readFile(MIGRATION_0279, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0280, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE agent_containers (
       id BIGSERIAL PRIMARY KEY,

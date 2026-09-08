@@ -160,7 +160,8 @@
     "0276_grok_account_usage_columns",
     "0277_api_key_usage_and_controls",
     "0278_friction_problem_card_dims",
-    "0279_preparation_recovery_origin"
+    "0279_api_key_message_audit",
+    "0280_preparation_recovery_origin"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

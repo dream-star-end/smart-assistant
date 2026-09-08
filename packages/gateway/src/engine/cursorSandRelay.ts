@@ -820,28 +820,111 @@ export function cursorSandPromptTooLongMessage(detail: string): string {
   return `${CURSOR_SAND_PROMPT_TOO_LONG_PREFIX}: ${trimmed}`
 }
 
+/**
+ * Structured view of a Sand error (stream `error` frame or gRPC-Web end
+ * trailer). Sand wraps the real cause in `details[].debug` as
+ * `aiserver.v1.ErrorDetails`; the top-level `message` is often the literal
+ * string "Error", which is what CCB / Claude Code users saw for the
+ * `ERROR_PROVIDER_ERROR` (provider HTTP 400) case on 2026-09-08.
+ */
+export interface UpstreamErrorInfo {
+  /** Human-readable text for the client: `Provider Error (400): We're having trouble…`. */
+  message: string
+  /** Sand's coarse code, e.g. `resource_exhausted`. */
+  code: string | null
+  /** `debug.error`, e.g. `ERROR_PROVIDER_ERROR`. */
+  debugError: string | null
+  /** `debug.details.additionalInfo.providerStatusCode`, e.g. `400`. */
+  providerStatusCode: string | null
+  /** `debug.details.isRetryable` — `false` means "retrying the same request won't help". */
+  retryable: boolean | null
+}
+
+const UPSTREAM_ERROR_FALLBACK_FRAME = 'Cursor Sand inference failed'
+const UPSTREAM_ERROR_FALLBACK_TRAILER = 'Cursor Sand transport error'
+
+/** Marker appended to the reason string so the external proxy can tell a
+ * non-retryable upstream fault apart without re-parsing the frame. */
+export const CURSOR_SAND_NON_RETRYABLE_SUFFIX = ' [non-retryable]'
+
+export function describeUpstreamError(
+  record: JsonObject,
+  fallback: string,
+  options: { /** Prefix `code:` onto a plain message (error-frame contract); trailers historically did not. */ codePrefix?: boolean } = {},
+): UpstreamErrorInfo {
+  const codePrefix = options.codePrefix ?? true
+  const code = typeof record.code === 'string' && record.code ? record.code : null
+  const topMessage = typeof record.message === 'string' && record.message.trim() ? record.message.trim() : ''
+  let debugError: string | null = null
+  let title = ''
+  let detail = ''
+  let providerStatusCode: string | null = null
+  let retryable: boolean | null = null
+  const details = Array.isArray(record.details) ? record.details : []
+  for (const entry of details) {
+    if (!entry || typeof entry !== 'object') continue
+    const debug = (entry as JsonObject).debug
+    if (!debug || typeof debug !== 'object') continue
+    const debugRecord = debug as JsonObject
+    if (typeof debugRecord.error === 'string' && debugRecord.error) debugError = debugRecord.error
+    const inner = debugRecord.details
+    if (inner && typeof inner === 'object') {
+      const innerRecord = inner as JsonObject
+      if (typeof innerRecord.title === 'string') title = innerRecord.title.trim()
+      if (typeof innerRecord.detail === 'string') detail = innerRecord.detail.trim()
+      if (typeof innerRecord.isRetryable === 'boolean') retryable = innerRecord.isRetryable
+      const extra = innerRecord.additionalInfo
+      if (extra && typeof extra === 'object') {
+        const status = (extra as JsonObject).providerStatusCode
+        if (typeof status === 'string' && status) providerStatusCode = status
+        else if (typeof status === 'number') providerStatusCode = String(status)
+      }
+    }
+    if (debugError || title || detail) break
+  }
+  // Prefer the structured title/detail; the bare top-level "Error" carries nothing.
+  const generic = !topMessage || /^error$/i.test(topMessage)
+  let message: string
+  if (title || detail) {
+    const head = title || debugError || code || fallback
+    const withStatus = providerStatusCode ? `${head} (${providerStatusCode})` : head
+    message = detail ? `${withStatus}: ${detail}` : withStatus
+  } else if (!generic) {
+    const prefix = codePrefix
+      ? (code ?? (typeof record.errorType === 'number' && record.errorType > 0 ? `error_type_${record.errorType}` : ''))
+      : ''
+    message = prefix ? `${prefix}: ${topMessage}` : topMessage
+  } else {
+    const head = debugError ?? code ?? fallback
+    message = providerStatusCode ? `${head} (${providerStatusCode})` : head
+  }
+  return { message, code, debugError, providerStatusCode, retryable }
+}
+
+/** True when the reason string was tagged by {@link describeUpstreamError} consumers as non-retryable. */
+export function isNonRetryableUpstreamReason(reason: string | null | undefined): boolean {
+  return typeof reason === 'string' && reason.endsWith(CURSOR_SAND_NON_RETRYABLE_SUFFIX)
+}
+
+/** Reason string without the internal `[non-retryable]` marker (for DB terminal codes / client text). */
+export function stripNonRetryableMarker(reason: string): string {
+  return isNonRetryableUpstreamReason(reason) ? reason.slice(0, -CURSOR_SAND_NON_RETRYABLE_SUFFIX.length) : reason
+}
+
 function errorMessage(value: unknown): string {
   if (value && typeof value === 'object') {
     const record = value as JsonObject
-    // Preserve the *whole* upstream error object in the log. The composed
-    // string below keeps only message+code, which for some Sand faults is a
-    // bare "Error"; the raw object still carries errorType / details / debug
-    // fields that name the real cause (upstream timeout, capacity, etc.). No
-    // request content or credential rides in an error frame, so this is safe
-    // to emit verbatim (capped).
+    // Preserve the *whole* upstream error object in the log. No request
+    // content or credential rides in an error frame, so this is safe to emit
+    // verbatim (capped).
     log.warn('cursor sand error frame', { raw: safeRaw(record) })
-    const message = typeof record.message === 'string' ? record.message : 'Cursor Sand inference failed'
-    const prefix = typeof record.code === 'string' && record.code
-      ? record.code
-      : typeof record.errorType === 'number' && record.errorType > 0
-        ? `error_type_${record.errorType}`
-        : ''
-    const composed = prefix ? `${prefix}: ${message}` : message
-    return isCursorSandOverflow({ code: record.code, errorType: record.errorType, text: message })
+    const info = describeUpstreamError(record, UPSTREAM_ERROR_FALLBACK_FRAME)
+    const composed = info.retryable === false ? `${info.message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}` : info.message
+    return isCursorSandOverflow({ code: record.code, errorType: record.errorType, text: info.message })
       ? cursorSandPromptTooLongMessage(composed)
       : composed
   }
-  return 'Cursor Sand inference failed'
+  return UPSTREAM_ERROR_FALLBACK_FRAME
 }
 
 /** JSON-serialise an upstream error object for logs, capped so a pathological
@@ -866,10 +949,13 @@ function parseEndTrailer(bytes: Buffer): string | null {
     // where a mid-stream upstream fault lands as a bare "Error"; log the whole
     // thing so the real reason (status/details) is recoverable.
     log.warn('cursor sand end trailer error', { raw: safeRaw(record) })
-    const message = typeof record.message === 'string' ? record.message : 'Cursor Sand transport error'
-    return isCursorSandOverflow({ code: record.code, text: message })
-      ? cursorSandPromptTooLongMessage(message)
-      : message
+    // Trailers never carried the `code:` prefix on the wire (CCB's overflow
+    // matcher and existing tests depend on the bare text); keep that.
+    const info = describeUpstreamError(record, UPSTREAM_ERROR_FALLBACK_TRAILER, { codePrefix: false })
+    const composed = info.retryable === false ? `${info.message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}` : info.message
+    return isCursorSandOverflow({ code: record.code, text: info.message })
+      ? cursorSandPromptTooLongMessage(composed)
+      : composed
   } catch {
     return 'Cursor Sand transport trailer was malformed'
   }
@@ -1573,11 +1659,40 @@ export class CursorSandRelay {
     return this.upstreamLabel === DEFAULT_UPSTREAM_LABEL ? code : code.replace(/^CURSOR_SAND_/, '')
   }
 
-  /** Stream `error` event text: parser-level defaults mention the default label; relabel for external clients. */
+  /** Stream `error` event text: parser-level defaults mention the default label; relabel for external clients.
+   * The internal `[non-retryable]` marker never reaches the wire — it is turned into `x-should-retry: false`. */
   private publicMessage(message: string | null): string {
-    const text = message ?? `${this.upstreamLabel} inference failed`
+    const raw = message ?? `${this.upstreamLabel} inference failed`
+    const text = isNonRetryableUpstreamReason(raw) ? raw.slice(0, -CURSOR_SAND_NON_RETRYABLE_SUFFIX.length) : raw
     if (this.upstreamLabel === DEFAULT_UPSTREAM_LABEL) return text
     return text.split(DEFAULT_UPSTREAM_LABEL).join(this.upstreamLabel).replace(/\bCURSOR_SAND_/g, '')
+  }
+
+  /**
+   * Upstream said the fault is not retryable (provider 4xx such as the
+   * 2026-09-08 `ERROR_PROVIDER_ERROR` / providerStatusCode 400). Tell the
+   * client so before headers go out: Claude Code honours `x-should-retry:
+   * false` and stops its 10× backoff loop (users otherwise sat through
+   * "Retrying… attempt N/10" for minutes on a request that could never work).
+   * Streaming responses already have headers on the wire; there the SSE
+   * `error` text carries the reason and the client's own error type logic applies.
+   */
+  private markNonRetryable(res: ServerResponse, reason: string | null): void {
+    if (!isNonRetryableUpstreamReason(reason)) return
+    if (!res.headersSent) res.setHeader('x-should-retry', 'false')
+  }
+
+  /**
+   * SSE `error` event type for a stream failure. On the native streaming
+   * path `message_start` is already on the wire when the upstream trailer
+   * arrives, so a header cannot carry the retry hint; the Anthropic error
+   * *type* is the only signal left. `invalid_request_error` is the class the
+   * client maps to a 400 and never retries, which is exactly what a provider
+   * `isRetryable:false` fault deserves. Everything else stays `api_error`
+   * (retryable 5xx semantics), preserving CCB's existing recovery loop.
+   */
+  private streamErrorType(reason: string | null): 'api_error' | 'invalid_request_error' {
+    return isNonRetryableUpstreamReason(reason) ? 'invalid_request_error' : 'api_error'
   }
 
   /**
@@ -2015,7 +2130,7 @@ export class CursorSandRelay {
       if (state.failed || streamError) {
         await emitSse(res, 'error', {
           type: 'error',
-          error: { type: 'api_error', message: this.publicMessage(streamError) },
+          error: { type: this.streamErrorType(streamError), message: this.publicMessage(streamError) },
         })
         return { kind: 'failed', reason: streamError ?? `${this.upstreamLabel} inference failed`, usage: usageSnapshot(state) }
       }
@@ -2133,9 +2248,13 @@ export class CursorSandRelay {
         }
       }
       if (state.failed || streamError) {
+        // Nothing has been written yet on this path (collectInference buffers
+        // the whole upstream stream first), so the retry hint can still ride
+        // as a header alongside the SSE error body.
+        this.markNonRetryable(res, streamError)
         await emitSse(res, 'error', {
           type: 'error',
-          error: { type: 'api_error', message: this.publicMessage(streamError) },
+          error: { type: this.streamErrorType(streamError), message: this.publicMessage(streamError) },
         })
         return { kind: 'failed', reason: streamError ?? `${this.upstreamLabel} inference failed`, usage: usageSnapshot(state) }
       }
@@ -2252,7 +2371,8 @@ export class CursorSandRelay {
     if (error) {
       res.statusCode = 502
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: this.publicMessage(error) } }))
+      this.markNonRetryable(res, error)
+      res.end(JSON.stringify({ type: 'error', error: { type: this.streamErrorType(error), message: this.publicMessage(error) } }))
       return { kind: 'rejected', status: 502, reason: error, written: true }
     }
     const content: JsonObject[] = []

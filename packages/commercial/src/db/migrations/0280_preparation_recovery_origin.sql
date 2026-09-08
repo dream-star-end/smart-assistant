@@ -1,4 +1,4 @@
--- order-dependency: 0278_friction_problem_card_dims
+-- order-dependency: 0279_api_key_message_audit
 -- R0 readers precede R1 writers. Old finalized-tape rows retain their meaning.
 ALTER TABLE turn_recovery_jobs ADD COLUMN IF NOT EXISTS job_origin TEXT NOT NULL DEFAULT 'finalized_tape';
 ALTER TABLE turn_recovery_jobs ADD COLUMN IF NOT EXISTS source_dispatch_id UUID;
@@ -28,14 +28,14 @@ ALTER TABLE turn_dispatches ADD CONSTRAINT turn_dispatches_preparation_snapshot_
   (preparation_request_json IS NULL AND preparation_request_sha256 IS NULL) OR
   (preparation_request_json IS NOT NULL AND preparation_request_sha256 IS NOT NULL AND preparation_request_sha256 ~ '^[0-9a-f]{64}$')
 );
-CREATE OR REPLACE FUNCTION fn_0279_preparation_intent_monotonic() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION fn_0280_preparation_intent_monotonic() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF OLD.preparation_send_intent_at IS NOT NULL AND
      NEW.preparation_send_intent_at IS DISTINCT FROM OLD.preparation_send_intent_at THEN
-    RAISE EXCEPTION '0279 preparation send intent is immutable';
+    RAISE EXCEPTION '0280 preparation send intent is immutable';
   END IF;
   RETURN NEW;
 END $$;
-DROP TRIGGER IF EXISTS trg_0279_preparation_intent_monotonic ON turn_recovery_jobs;
-CREATE TRIGGER trg_0279_preparation_intent_monotonic BEFORE UPDATE ON turn_recovery_jobs
-  FOR EACH ROW EXECUTE FUNCTION fn_0279_preparation_intent_monotonic();
+DROP TRIGGER IF EXISTS trg_0280_preparation_intent_monotonic ON turn_recovery_jobs;
+CREATE TRIGGER trg_0280_preparation_intent_monotonic BEFORE UPDATE ON turn_recovery_jobs
+  FOR EACH ROW EXECUTE FUNCTION fn_0280_preparation_intent_monotonic();

@@ -34,7 +34,7 @@ before(async () => {
       status text DEFAULT 'admitted',accepted_at timestamptz,admitted_at timestamptz DEFAULT NOW(),
       last_attempt_at timestamptz,terminal_at timestamptz,outcome text,failure_code text);
     CREATE TABLE client_session_turn_tapes (session_id text,user_id text,client_message_id text);`)
-  for (const name of ['0202_turn_recovery_control','0279_preparation_recovery_origin']) {
+  for (const name of ['0202_turn_recovery_control','0280_preparation_recovery_origin']) {
     await pool.query(await readFile(new URL(`../db/migrations/${name}.sql`,import.meta.url),'utf8'))
   }
 })
