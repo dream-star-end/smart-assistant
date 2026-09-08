@@ -7540,6 +7540,27 @@ export class SessionManager {
   bufferPendingAgentGroup(parentSessionKey: string, group: DurableAgentGroup): boolean {
     const parent = this.sessions.get(parentSessionKey)
     if (!parent) return false
+    // OCV5-189: a background delegate admitted in an earlier turn can finish
+    // while a later turn (dlgcb-* callback / scheduled continuation) is the
+    // leader's active turn. Its billing keeps the admitting turn's
+    // parentTurnKey and still drains with the *current* turn's tape — master
+    // accepts that cross-turn locator (losslessTurnTape parent locator check
+    // is session-scoped). Log it so a tape carrying a foreign parentTurnKey is
+    // attributable instead of looking like a forged locator.
+    const currentTurnKey = parent._currentTurnKey
+    const crossTurn = (group.engineBillings ?? []).filter(
+      (billing) => typeof billing.parentTurnKey === 'string' && billing.parentTurnKey !== currentTurnKey,
+    )
+    if (currentTurnKey && crossTurn.length > 0) {
+      log.warn('delegate team card drains into a later turn than its billing parent', {
+        parentSessionKey,
+        runId: group.runId,
+        agentId: group.agentId,
+        currentTurnKey,
+        billingParentTurnKeys: [...new Set(crossTurn.map((billing) => billing.parentTurnKey))],
+        requestIds: crossTurn.map((billing) => billing.requestId),
+      })
+    }
     ;(parent._pendingAgentGroups ??= []).push({
       ...group,
       _ocEventOrdinal: group._ocEventOrdinal ?? takeDurableEventOrdinal(parent),

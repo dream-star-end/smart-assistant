@@ -467,7 +467,21 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     if (billings === undefined) continue;
     for (let billingIndex = 0; billingIndex < (billings as DurableCodexBilling[]).length; billingIndex++) {
       const billing = (billings as DurableCodexBilling[])[billingIndex]!;
-      if (billing.parentTurnKey !== turnKey || billing.parentSessionId !== sessionId) {
+      // OCV5-189: a background delegate admitted during turn N may only finish
+      // while turn N+1 (e.g. a `dlgcb-*` callback / scheduled continuation) is
+      // the leader's active turn. handleDelegateTask then buffers its team card
+      // into the *current* turn, so the card's billing carries turn N's
+      // parentTurnKey inside turn N+1's tape. That is a legitimate cross-turn
+      // locator, not a forgery: settlement attributes cost by the billing's own
+      // requestId/parentTurnKey (pending_usage_patches), never by the enclosing
+      // tape. Requiring parentTurnKey === turnKey here made Phase-B
+      // materialization fail permanently and the reply degrade to its last
+      // streamed segment. Keep the session boundary and shape strict.
+      if (
+        typeof billing.parentTurnKey !== "string" ||
+        !SAFE_TURN_KEY.test(billing.parentTurnKey) ||
+        billing.parentSessionId !== sessionId
+      ) {
         throw new Error(
           `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] parent locator is invalid`,
         );
