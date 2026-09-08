@@ -6,6 +6,7 @@
  *   REQUIRE_TEST_DB=1 scripts/test-mutex.sh commercial \
  *     'npx tsx --test packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts'
  */
+import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -1002,66 +1003,68 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
     const res = new FakeRes();
     res.throwOnStop = true;
     let upstream = 0;
+    const sealed: CursorExternalReadyRecord[] = [];
     const before = await counts(uid, accountId, apiKeyId);
+    // Observe the actual server-generated identity only after the real FS write.
+    // Settlement still uses the production PG function; no latest-row fallback.
     await runRoute({
-      outbox: box,
-      uid,
-      accountId,
-      apiKeyId,
-      fetchImpl: syntheticFetch(USAGE_FRAMES, () => {
-        upstream += 1;
-      }),
-      stream: true,
-      res,
+      outbox: {
+        ...box,
+        writeReady: async (ready) => {
+          const result = await box.writeReady(ready);
+          sealed.push(ready);
+          return result;
+        },
+      },
+      uid, accountId, apiKeyId,
+      fetchImpl: syntheticFetch(USAGE_FRAMES, () => { upstream += 1; }),
+      stream: true, res,
     });
-    const listing = await box.listBatch();
-    const readyObs = listing.observations.find((o) => o.kind === "ready");
-    const noStop = !res.text().includes("event: message_stop");
-    if (readyObs && readyObs.kind === "ready") {
-      const a = await consumeReadyRecord({
-        pool: getPool(),
-        pricing: { get: () => pricingRow() } as unknown as PricingCache,
-        record: readyObs.record,
-        unlink: async () => false,
-      });
-      const b = await consumeReadyRecord({
-        pool: getPool(),
-        pricing: { get: () => pricingRow() } as unknown as PricingCache,
-        record: readyObs.record,
-        unlink: (id) => box.unlink(id),
-      });
-      const after = await counts(uid, accountId, apiKeyId);
-      const rows = await query<{ n: string }>(
-        "SELECT count(*)::text AS n FROM usage_records WHERE user_id=$1 AND request_id=$2",
-        [uid.toString(), readyObs.record.billingId],
-      );
-      record({
-        id: "seal-wire-scanner",
-        expected: "no message_stop; one usage row for this billingId; scanner does not double debit",
-        actual: `a=${a.disposition} b=${b.disposition} unlinked=${b.unlinked} stop=${!noStop} upstream=${upstream} usage ${before.usageN}->${after.usageN} n=${rows.rows[0]?.n}`,
-        upstreamCalls: upstream,
-        terminal: "wire_failed",
-        phase: "ready",
-        pass:
-          noStop
-          && upstream === 1
-          && after.usageN === before.usageN + 1
-          && rows.rows[0]?.n === "1"
-          && (a.disposition === "new_commit" || a.disposition === "existing" || a.disposition === "commit_proven")
-          && (b.disposition === "existing" || b.disposition === "commit_proven"),
-      });
-    } else {
-      const after = await counts(uid, accountId, apiKeyId);
-      record({
-        id: "seal-wire-scanner",
-        expected: "no message_stop; in-request already consumed one unique usage row",
-        actual: `obs=${listing.observations.map((o) => o.kind).join(",")} stop=${!noStop} upstream=${upstream} usage ${before.usageN}->${after.usageN}`,
-        upstreamCalls: upstream,
-        terminal: "wire_failed",
-        phase: listing.observations[0]?.kind ?? "unlinked",
-        pass: noStop && upstream === 1 && after.usageN === before.usageN + 1,
-      });
-    }
+    assert.equal(sealed.length, 1, "the real request must seal exactly one ready plan");
+    const ready = sealed[0]!;
+    const afterRequest = await counts(uid, accountId, apiKeyId);
+    const a = await consumeReadyRecord({
+      pool: getPool(), pricing: { get: () => pricingRow() } as unknown as PricingCache,
+      record: ready, unlink: async () => false,
+    });
+    const b = await consumeReadyRecord({
+      pool: getPool(), pricing: { get: () => pricingRow() } as unknown as PricingCache,
+      record: ready, unlink: (id) => box.unlink(id),
+    });
+    const after = await counts(uid, accountId, apiKeyId);
+    const rows = await query<{
+      id: string; user_id: string; account_id: string; api_key_id: string;
+      cost: string; snapshot: string;
+    }>(`SELECT id::text, user_id::text, account_id::text, api_key_id::text,
+               cost_credits::text AS cost, price_snapshot::text AS snapshot
+          FROM usage_records WHERE request_id=$1`, [ready.billingId]);
+    assert.equal(rows.rows.length, 1, "one usage row for this request, not a user total");
+    const usageRow = rows.rows[0]!;
+    const ledgerRows = await query<{ user_id: string; delta: string }>(
+      "SELECT user_id::text, delta::text FROM credit_ledger WHERE ref_type='usage_record' AND ref_id=$1",
+      [usageRow.id],
+    );
+    const ledgerDelta = ledgerRows.rows.reduce((sum, row) => sum + BigInt(row.delta), 0n);
+    const planCost = BigInt(ready.plan.costCredits);
+    // The same captured plan, not a second capture with fields omitted.
+    assert.deepEqual(JSON.parse(usageRow.snapshot), JSON.parse(ready.plan.snapshotJson));
+    assert.deepEqual(after, afterRequest, "replaying an already committed ready has no new account/key/ledger effects");
+    record({
+      id: "seal-wire-scanner",
+      expected: "no stop; this billingId usage=1; full sealed snapshot; owned ledger sum=-plan; keySpent=plan; success+1; replays unchanged",
+      actual: JSON.stringify({ billingId: ready.billingId, upstream, stop: res.text().includes("event: message_stop"),
+        dispositions: [a.disposition, b.disposition], usage: usageRow, ledgerRows: ledgerRows.rows,
+        ledgerDelta: ledgerDelta.toString(), planCost: planCost.toString(), before, afterRequest, after }),
+      upstreamCalls: upstream, terminal: "wire_failed", phase: "sealed-then-replayed",
+      pass: !res.text().includes("event: message_stop") && upstream === 1
+        && /^[0-9a-f]{32}$/.test(ready.billingId)
+        && usageRow.user_id === uid.toString() && usageRow.account_id === accountId.toString()
+        && usageRow.api_key_id === apiKeyId.toString() && usageRow.cost === ready.plan.costCredits
+        && ledgerRows.rows.every((row) => row.user_id === uid.toString()) && ledgerDelta === -planCost
+        && BigInt(after.keySpent) - BigInt(before.keySpent) === planCost
+        && after.usageN === before.usageN + 1 && after.success === before.success + 1 && after.fail === before.fail
+        && [a.disposition, b.disposition].every((d) => d === "existing" || d === "commit_proven"),
+    });
   });
 
   test("catalog/env/delist drift still charges the sealed plan", async () => {
@@ -1124,10 +1127,11 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
       [uid.toString(), ready.billingId],
     );
     const snap = JSON.parse(row.rows[0]?.snapshot ?? "{}") as { model_id?: string };
+    assert.deepEqual(snap, JSON.parse(original.snapshotJson), "the entire execution-time plan survives catalog/env/delist drift");
     record({
       id: "price-drift",
-      expected: `costCredits=${original.costCredits} snapshot model ${MODEL} despite catalog/env change`,
-      actual: `disposition=${consumed.disposition} sqlCost=${row.rows[0]?.cost ?? "missing"} snapModel=${snap.model_id ?? ""}`,
+      expected: `costCredits=${original.costCredits} entire snapshot equal to sealed plan despite catalog/env change`,
+      actual: `disposition=${consumed.disposition} sqlCost=${row.rows[0]?.cost ?? "missing"} snapshot=${JSON.stringify(snap)}`,
       upstreamCalls: 0,
       phase: "ready",
       pass:
