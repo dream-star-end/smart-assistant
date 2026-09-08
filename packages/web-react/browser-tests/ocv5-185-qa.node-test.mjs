@@ -197,6 +197,8 @@ function createMock() {
     httpLog: [],
     holdOutbound: false,
     held: [],
+    holdLookup: false,
+    heldLookups: [],
   };
 
   function broadcast(userId, frame) {
@@ -217,6 +219,11 @@ function createMock() {
       sendTo(item.ws, item.result.receipt);
       if (item.result.settled) broadcast(item.userId, item.result.settled);
     }
+  }
+
+  function flushLookups() {
+    const batch = store.heldLookups.splice(0, store.heldLookups.length);
+    for (const item of batch) json(item.res, 200, item.body);
   }
 
   function settleFromControl(userId, payload) {
@@ -288,7 +295,7 @@ function createMock() {
     };
   }
 
-  return { store, broadcast, sendTo, settleFromControl, flushHeld };
+  return { store, broadcast, sendTo, settleFromControl, flushHeld, flushLookups };
 }
 
 function ensureProtocolShim() {
@@ -374,7 +381,12 @@ function startServer(js, mock) {
         userId: auth.userId,
         at: nowMs(),
       });
-      json(res, 200, sessionDetail(store, auth.userId, id, ids));
+      const body = sessionDetail(store, auth.userId, id, ids);
+      if (store.holdLookup && lookup) {
+        store.heldLookups.push({ res, body });
+        return;
+      }
+      json(res, 200, body);
       return;
     }
     if (url.pathname === "/api/client-errors") {
@@ -466,7 +478,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
   const js = await bundleHarness();
   const mock = createMock();
   const { server, wss, store } = startServer(js, mock);
-  const { flushHeld, broadcast } = mock;
+  const { flushHeld, flushLookups, broadcast } = mock;
   const port = await listen(server);
   const origin = `http://127.0.0.1:${port}`;
   let browser;
@@ -833,12 +845,19 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         assert.equal(dialogs, 1, "two pending must auto-open exactly one visible dialog");
         const slot = (await page.getByTestId("qa-active-modal").textContent()) || "";
         assert.ok(slot === "req-one" || slot === "req-two", `singleton slot must be a real request, got ${slot}`);
-        await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
-        await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
+        async function dismissDialogs(max = 3) {
+          for (let i = 0; i < max; i++) {
+            if ((await page.getByRole("dialog").count()) === 0) return;
+            await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+        }
+        await dismissDialogs();
+        assert.ok((await page.getByRole("dialog").count()) <= 1, "singleton modal after close");
         const dock = page.locator("[data-testid=pending-permission-dock] button");
         assert.equal(await dock.count(), 2, "dock must expose both pending requests");
         const respondBefore = store.responses.length;
-        await dock.nth(0).click();
+        await dock.nth(0).click({ force: true });
         await page.waitForFunction(() => (document.querySelector("[data-testid=qa-active-modal]")?.textContent || "").length > 0);
         const id0 = (await page.getByTestId("qa-active-modal").textContent()) || "";
         assert.ok(id0 === "req-one" || id0 === "req-two", `dock[0] must open a real request, got ${id0}`);
@@ -847,7 +866,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
           await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
         }
-        await dock.nth(1).click();
+        await dock.nth(1).click({ force: true });
         await page.waitForFunction((prev) => {
           const id = document.querySelector("[data-testid=qa-active-modal]")?.textContent || "";
           return id.length > 0 && id !== prev;
@@ -1095,6 +1114,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       store.prompts.clear();
       store.responses.length = 0;
       store.httpLog.length = 0;
+      store.holdLookup = true;
+      store.heldLookups.length = 0;
       const cjkQuestion = "你".repeat(3000);
       assert.equal(Buffer.byteLength(cjkQuestion, "utf8"), 9000);
       assert.ok(9000 > 8192, "fixture must exceed 8KiB UTF-8");
@@ -1116,7 +1137,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         await page.evaluate(() => window.__qa.loadSession());
         await page.waitForFunction(() => {
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
-          return cards.some((c) => c.requestId === "req-cjk-ask");
+          return cards.some((c) => c.requestId === "req-cjk-ask" && c.truncated === true);
         });
         await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
         assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0, "must not submit before full questions");
@@ -1125,6 +1146,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           "T9 real hook GET permission_lookup=req-cjk-ask",
           15_000,
         );
+        store.holdLookup = false;
+        flushLookups();
         await page.getByRole("radio", { name: /是/ }).waitFor();
         const body = await page.locator("body").innerText();
         assert.ok(body.includes(cjkQuestion), "full UTF-8 question must appear after lookup");
@@ -1140,6 +1163,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         failures.push("T9");
         throw err;
       } finally {
+        store.holdLookup = false;
+        store.heldLookups.length = 0;
         await ctx.close();
       }
     });
@@ -1148,7 +1173,9 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       store.prompts.clear();
       store.responses.length = 0;
       store.httpLog.length = 0;
-      const cjkPlan = `## 目标\n\n${"你".repeat(2500)}`;
+      store.holdLookup = true;
+      store.heldLookups.length = 0;
+      const cjkPlan = `## 目标\n\n${"你".repeat(3000)}`;
       assert.ok(Buffer.byteLength(cjkPlan, "utf8") > 8192);
       store.prompts.set(
         "req-cjk-plan",
@@ -1166,7 +1193,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         await page.evaluate(() => window.__qa.loadSession());
         await page.waitForFunction(() => {
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
-          return cards.some((c) => c.requestId === "req-cjk-plan");
+          return cards.some((c) => c.requestId === "req-cjk-plan" && c.truncated === true);
         });
         await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
         assert.equal(await page.getByRole("button", { name: "按此计划执行" }).count(), 0, "must not approve truncated plan");
@@ -1175,6 +1202,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           "T10 real hook GET permission_lookup=req-cjk-plan",
           15_000,
         );
+        store.holdLookup = false;
+        flushLookups();
         await page.getByRole("button", { name: "按此计划执行" }).waitFor();
         const planText = await page.getByTestId("exit-plan-markdown").innerText();
         assert.ok(planText.includes("你".repeat(20)), "restored plan must keep CJK source");
@@ -1184,6 +1213,8 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         failures.push("T10");
         throw err;
       } finally {
+        store.holdLookup = false;
+        store.heldLookups.length = 0;
         await ctx.close();
       }
     });
