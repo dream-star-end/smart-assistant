@@ -133,7 +133,9 @@ async function supervise() {
   process.on('SIGTERM', stop);
   try {
     child = spawn('bash', [join(root, 'scripts/test-mutex.sh'), 'commercial',
-      `${quote(process.execPath)} --import tsx ${quote(fileURLToPath(import.meta.url))} --worker`], {
+      // The mutex's fd-9 exec redirects its stderr to /dev/null. Keep worker
+      // loader/assertion diagnostics on the inherited stdout pipe instead.
+      `${quote(process.execPath)} --import tsx ${quote(fileURLToPath(import.meta.url))} --worker 2>&1`], {
       cwd: root, detached: true, stdio: 'inherit',
       // Do not inherit production DB/PG*, Redis, model keys, proxies, runtime
       // flags or NODE_OPTIONS/NODE_PATH. The CCB fixture can query global billing.
