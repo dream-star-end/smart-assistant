@@ -584,14 +584,20 @@ async function runOfficialParentSigtermOracle(
     stderr += chunk
   })
   try {
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined
     const closed = await Promise.race([
       new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         child.once('close', (code, signal) => resolve({ code, signal }))
       }),
-      sleep(70_000).then(() => {
-        throw new Error(`precondition: oracle driver did not exit within 70s stdout=${stdout} stderr=${stderr}`)
+      new Promise<never>((_resolve, reject) => {
+        deadlineTimer = setTimeout(() => {
+          reject(new Error(`precondition: oracle driver did not exit within 70s stdout=${stdout} stderr=${stderr}`))
+        }, 70_000)
       }),
-    ])
+    ]).finally(() => {
+      // The losing deadline must not keep a completed success or failure alive.
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
+    })
     if (closed.code !== 0) {
       throw new Error(
         `precondition: oracle driver exited ${closed.code} signal=${closed.signal} stdout=${stdout} stderr=${stderr}`,
