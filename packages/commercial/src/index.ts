@@ -2404,6 +2404,7 @@ export async function registerCommercial(
       // 的市场 skill artifact 做 hub 对账(pull 模型,同款 verifyContainerIdentity)。
       const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
         identityRepo,
+        flavorIdentity,
       });
       // /internal/v3/turn-waive — 滚动升级/审计修复的兼容入口。master 只按
       // (user, turnKey) 精确冲正，并在同一事务写一封定向站内信。主路径
@@ -5648,6 +5649,7 @@ export async function registerCommercial(
       return loadAgentModelResolverForUser(uid, {
         bundleRev: opts.bundleRev ?? null,
         flavor: flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined,
+        flavorIdentity,
         // 与 supervisor / bundle 校验器同一稳定根(见上方 runtimeTuple 装配)。
         platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
       });

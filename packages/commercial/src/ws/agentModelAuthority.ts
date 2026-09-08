@@ -35,15 +35,21 @@
  * 阶段 A 已保证「bundle 声明值 == master 常量」(runtimeEntrypointPolicy 一致性锚测试),
  * 故开 flag 前后判定集合等值 → 切换零行为变化;flag 关掉即回旧路径(可回滚)。
  */
-import { AGENT_MODEL_AUTO, DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import {
+  AGENT_MODEL_AUTO, DEFAULT_CODEX_ENGINE_MODEL,
+  assertIdentityCompatReady, IdentityCompatError, resolveIdentityCompat,
+  type IdentityCompatProjection, type IdentityCompatResolution,
+} from "@openclaude/protocol";
 
 import {
   listRuntimeReadyAgentSets,
+  loadMarketplaceRuntimeSnapshot,
   type InstalledAgent,
 } from "../marketplace/marketplaceDb.js";
 import { platformPresetAgentSlugs } from "../marketplace/platformPresets.js";
 import { PLATFORM_DEFAULT_MODEL, PLATFORM_HIDDEN_REVIEWER_MODEL } from "../platformDefaults.js";
-import type { Flavor } from "../flavor/assertFlavor.js";
+import type { Flavor, FlavorIdentity } from "../flavor/assertFlavor.js";
+import { projectIdentityCompat, registeredIdentityCompatProfiles } from "../identity/identityCompat.js";
 import { SeedDeclarationError, seedAgentModels, type SeedAgentExecution } from "./seedDeclarationLoader.js";
 
 /** selfhost 默认按 rev;商业仍需显式 1。0 是两者的显式回滚。 */
@@ -91,6 +97,7 @@ export function buildAgentModelSnapshot(
   installedAgents: readonly InstalledAgent[],
   presetAgents: readonly InstalledAgent[],
   seedExecutions?: ReadonlyMap<string, SeedAgentExecution>,
+  identityCompat?: IdentityCompatProjection,
 ): Map<string, string> {
   const autoModel = seedExecutions === undefined
     ? PLATFORM_DEFAULT_MODEL
@@ -105,6 +112,7 @@ export function buildAgentModelSnapshot(
       if (model !== null) map.set(a.slug, model);
     }
   }
+  const marketplaceModels = new Map(map);
   // 内置 seed(最高优先;容器侧 reserved id 同语义)。
   if (seedExecutions !== undefined) {
     for (const [agentId, exec] of seedExecutions) {
@@ -112,6 +120,20 @@ export function buildAgentModelSnapshot(
     }
   } else {
     for (const [agentId, model] of LEGACY_SEED_AGENT_MODELS) map.set(agentId, model);
+  }
+  // An explicitly registered namespace is never a second local/seed override.
+  for (const { profile, readiness } of identityCompat?.profiles ?? []) {
+    map.delete(profile.legacyAgentId);
+    if (readiness !== "ready") {
+      map.delete(profile.canonicalAgentId);
+    } else {
+      const model = marketplaceModels.get(profile.canonicalAgentId);
+      map.delete(profile.canonicalAgentId);
+      if (model !== undefined) {
+        map.set(profile.canonicalAgentId, model);
+        map.set(profile.legacyAgentId, model);
+      }
+    }
   }
   return map;
 }
@@ -140,6 +162,11 @@ export interface AgentModelResolverOptions {
   platformRoot?: string;
   /** Boot-verified flavor. Never infer selfhost from a request or runtime channel. */
   flavor?: Flavor;
+  /** Same boot proof used by the authenticated sync endpoint; required for registration. */
+  flavorIdentity?: FlavorIdentity;
+  /** Read-only dependency seams for isolated tests. */
+  loadRuntimeSnapshot?: typeof loadMarketplaceRuntimeSnapshot;
+  loadPresetSlugs?: typeof platformPresetAgentSlugs;
   /** 测试注入(默认 process.env)。 */
   env?: NodeJS.ProcessEnv;
 }
@@ -152,6 +179,15 @@ export interface AgentModelResolverOptions {
  */
 export type AgentModelResolver = ((agentId: string) => string | null) & {
   isRuntimeDenied?: (agentId: string) => boolean;
+  /**
+   * Invoke on EVERY new execution, before model precedence (including an explicit
+   * model). Registered targets always read fresh readiness; never a display TTL.
+   * The identity changes runner semantics only, never key/owner/hash/claim fields.
+   */
+  authorizeExecution?: (agentId: string) => Promise<{
+    identity: IdentityCompatResolution;
+    model: string | null;
+  }>;
 };
 
 /**
@@ -171,11 +207,45 @@ export async function loadAgentModelResolverForUser(
   const seedExecutions = seedAuthorityByRevEnabled(opts?.env, opts?.flavor)
     ? await seedAgentModels(opts?.bundleRev, opts?.platformRoot)
     : undefined;
-  const presetSlugs = await platformPresetAgentSlugs();
-  const agentSets = await listRuntimeReadyAgentSets(Number(uid), presetSlugs);
-  const snapshot = buildAgentModelSnapshot(agentSets.installed, agentSets.presets, seedExecutions);
-  const denied = runtimeDeniedAgentIds(agentSets.denied, seedExecutions);
+  const profiles = registeredIdentityCompatProfiles(opts?.flavorIdentity, uid);
+  const loadRuntimeSnapshot = opts?.loadRuntimeSnapshot ?? loadMarketplaceRuntimeSnapshot;
+  const loadPresetSlugs = opts?.loadPresetSlugs ?? platformPresetAgentSlugs;
+  const presetSlugs = await loadPresetSlugs();
+  // Preserve the existing non-registered path. Registered targets share the exact
+  // read-only snapshot API with authenticated marketplace sync.
+  const runtimeSnapshot = profiles.length > 0
+    ? await loadRuntimeSnapshot(Number(uid), presetSlugs)
+    : null;
+  const agentSets = runtimeSnapshot?.agentSets ?? await listRuntimeReadyAgentSets(Number(uid), presetSlugs);
+  let identityCompat: IdentityCompatProjection = runtimeSnapshot
+    ? projectIdentityCompat(uid, profiles, runtimeSnapshot)
+    : { schema: 1, userId: uid.toString(), profiles: [] };
+  let snapshot = buildAgentModelSnapshot(agentSets.installed, agentSets.presets, seedExecutions, identityCompat);
+  let denied = runtimeDeniedAgentIds(agentSets.denied, seedExecutions);
   const resolver = ((agentId: string) => snapshot.get(agentId) ?? null) as AgentModelResolver;
-  resolver.isRuntimeDenied = (agentId: string) => denied.has(agentId);
+  resolver.isRuntimeDenied = (agentId: string) =>
+    resolveIdentityCompat(agentId, identityCompat).status === "registered-unavailable" || denied.has(agentId);
+  resolver.authorizeExecution = async (agentId) => {
+    const known = resolveIdentityCompat(agentId, identityCompat);
+    if (known.status === "no-registration") return { identity: known, model: resolver(agentId) };
+    let fresh: Awaited<ReturnType<typeof loadMarketplaceRuntimeSnapshot>>;
+    try {
+      fresh = await loadRuntimeSnapshot(Number(uid), await loadPresetSlugs());
+    } catch {
+      throw new IdentityCompatError("COMPAT_AUTHORITY_UNAVAILABLE", "identity readiness authority unavailable");
+    }
+    const projection = projectIdentityCompat(uid, profiles, fresh);
+    const identity = resolveIdentityCompat(agentId, projection);
+    const models = buildAgentModelSnapshot(fresh.agentSets.installed, fresh.agentSets.presets, seedExecutions, projection);
+    // Keep the synchronous lookup/denial projection aligned for the remaining
+    // frame checks; an initially unready warm connection can recover safely.
+    identityCompat = projection;
+    snapshot = models;
+    denied = runtimeDeniedAgentIds(fresh.agentSets.denied, seedExecutions);
+    assertIdentityCompatReady(identity);
+    const model = models.get(identity.executionAgentId) ?? null;
+    if (model === null) throw new IdentityCompatError("COMPAT_NOT_READY", "registered agent model unavailable");
+    return { identity, model };
+  };
   return resolver;
 }
