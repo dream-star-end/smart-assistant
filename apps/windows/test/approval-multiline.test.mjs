@@ -2,25 +2,32 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import test from 'node:test'
-import { fileURLToPath } from 'node:url'
-
-import {
-  createApprovalBridge,
-} from '../src/host/approvalBridge.mjs'
-import {
-  classifyDestructiveOp,
-  createApprovalController,
-  isReadonlyBash,
-} from '../src/host/workspace/approval.mjs'
+import { after, test } from 'node:test'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const APPROVAL_SRC = join(HERE, '../src/host/workspace/approval.mjs')
+const DEFAULT_APPROVAL_SRC = join(HERE, '../src/host/workspace/approval.mjs')
 const BRIDGE_SRC = join(HERE, '../src/host/approvalBridge.mjs')
+const TEST_SRC = fileURLToPath(import.meta.url)
 const OS_COMMAND_E2E = false
+const APPROVAL_SRC = process.env.OCV5_188_D_APPROVAL_MODULE || DEFAULT_APPROVAL_SRC
+
+const { createApprovalBridge } = await import(pathToFileURL(BRIDGE_SRC).href)
+const { classifyDestructiveOp, createApprovalController, isReadonlyBash } = await import(
+  pathToFileURL(APPROVAL_SRC).href
+)
 
 function sha256File(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
+}
+
+function hashes() {
+  return {
+    approvalSha256: sha256File(APPROVAL_SRC),
+    bridgeSha256: sha256File(BRIDGE_SRC),
+    testSha256: sha256File(TEST_SRC),
+    approvalModule: APPROVAL_SRC,
+  }
 }
 
 function bashFrame(requestId, command) {
@@ -43,6 +50,15 @@ function classifyBash(command) {
   })
 }
 
+function classifyFrame(request) {
+  const command = typeof request.input?.command === 'string' ? request.input.command : ''
+  return classifyDestructiveOp({
+    kind: request.toolName,
+    command,
+    detail: { toolName: request.toolName, command },
+  })
+}
+
 function fakeTimers() {
   const pending = []
   return {
@@ -60,18 +76,33 @@ function fakeTimers() {
         handle.cleared = true
       }
     },
-    uncleared() {
-      return pending.filter((handle) => !handle.cleared).length
-    },
   }
 }
 
-async function waitFor(predicate, label) {
-  for (let i = 0; i < 30; i++) {
-    if (predicate()) return
-    await Promise.resolve()
+async function drainBridge({ timers, approval, prompts, inspectPromise }) {
+  try {
+    if (approval && typeof approval.pendingCount === 'function' && approval.pendingCount() > 0) {
+      for (const request of prompts) {
+        if (typeof request?.id === 'string' && approval.hasPending(request.id)) {
+          approval.deny(request.id)
+        }
+      }
+    }
+  } catch {
+    /* drain must not mask the original error */
   }
-  throw new Error(`timed out waiting for ${label}`)
+  try {
+    timers?.flush()
+  } catch {
+    /* drain */
+  }
+  if (inspectPromise) {
+    try {
+      await inspectPromise
+    } catch {
+      /* drain leftover inspect only */
+    }
+  }
 }
 
 const CORE_LF = 'ls\necho audit-benign'
@@ -104,9 +135,64 @@ const CLASSIFY_CASES = Object.freeze([
   { id: 'C22-echo', command: 'echo audit-benign', expectReadOnly: false, expectReason: 'unknown' },
 ])
 
-test('raw LF/CRLF/CR are not collapsed into a read-only ls prefix (strings only, never executed)', () => {
-  const ledger = []
-  for (const spec of CLASSIFY_CASES) {
+const BRIDGE_NOCTRL_CASES = Object.freeze([
+  { id: 'B1-noctrl-lf', requestId: 'req-noctrl-lf', command: CORE_LF },
+  { id: 'B2-noctrl-crlf', requestId: 'req-noctrl-crlf', command: CORE_CRLF },
+  { id: 'B3-noctrl-cr', requestId: 'req-noctrl-cr', command: CORE_CR },
+])
+
+const BRIDGE_CONTROLLER_CASES = Object.freeze([
+  { id: 'B4-deny', requestId: 'req-ml-deny', command: CORE_LF, action: 'deny', behavior: 'deny' },
+  { id: 'B5-timeout', requestId: 'req-ml-timeout', command: CORE_CRLF, action: 'timeout', behavior: 'deny' },
+  { id: 'B6-approve', requestId: 'req-ml-approve', command: CORE_CR, action: 'approve', behavior: 'allow' },
+])
+
+const BRIDGE_SAFE_CASES = Object.freeze([
+  { id: 'B7-ls', requestId: 'req-safe-ls', command: 'ls -la' },
+  { id: 'B8-ls-tab', requestId: 'req-safe-ls-tab', command: 'ls\t-la' },
+  { id: 'B9-git-status', requestId: 'req-safe-git', command: 'git status' },
+])
+
+const BUSINESS_IDS = Object.freeze([
+  ...CLASSIFY_CASES.map((spec) => spec.id),
+  ...BRIDGE_NOCTRL_CASES.map((spec) => spec.id),
+  ...BRIDGE_CONTROLLER_CASES.map((spec) => spec.id),
+  ...BRIDGE_SAFE_CASES.map((spec) => spec.id),
+])
+
+const executed = []
+
+function emit(row) {
+  console.log(JSON.stringify({ osCommandE2E: OS_COMMAND_E2E, hashes: hashes(), ...row }))
+}
+
+function mark(id, pass, extra = {}) {
+  executed.push({ id, pass: pass === true, ...extra })
+}
+
+after(() => {
+  const ran = new Set(executed.map((row) => row.id))
+  const notRun = BUSINESS_IDS.filter((id) => !ran.has(id)).map((id) => ({ id, status: 'not-run' }))
+  const pass = executed.filter((row) => row.pass).length
+  const fail = executed.filter((row) => !row.pass).length
+  emit({
+    contractId: 'ocv5-188-D-catalog-summary',
+    phase: 'catalog-summary',
+    expected: { business: BUSINESS_IDS.length, skip: 0 },
+    actual: {
+      catalog: BUSINESS_IDS.length,
+      executed: executed.length,
+      pass,
+      fail,
+      skip: 0,
+      notRun,
+      ids: executed.map((row) => ({ id: row.id, pass: row.pass })),
+    },
+  })
+})
+
+for (const spec of CLASSIFY_CASES) {
+  test(spec.id, () => {
     const classified = classifyBash(spec.command)
     const readonly = isReadonlyBash(spec.command)
     const actual = {
@@ -118,67 +204,95 @@ test('raw LF/CRLF/CR are not collapsed into a read-only ls prefix (strings only,
     const expectReadOnly = spec.expectReadOnly === true
     const expectNeedsApproval = spec.expectNeedsApproval === true || !expectReadOnly
     const expectReason = spec.expectReason
+    const expected = {
+      readOnly: expectReadOnly,
+      needsApproval: expectNeedsApproval,
+      reason: expectReason ?? '(any non-readonly reason)',
+      isReadonlyBash: expectReadOnly,
+    }
     const pass =
-      actual.readOnly === expectReadOnly &&
-      actual.needsApproval === expectNeedsApproval &&
-      actual.isReadonlyBash === expectReadOnly &&
+      actual.readOnly === expected.readOnly &&
+      actual.needsApproval === expected.needsApproval &&
+      actual.isReadonlyBash === expected.isReadonlyBash &&
       (expectReason == null || actual.reason === expectReason)
-    ledger.push({
-      id: spec.id,
-      expected: {
-        readOnly: expectReadOnly,
-        needsApproval: expectNeedsApproval,
-        reason: expectReason ?? '(any non-readonly reason)',
-      },
+    emit({
+      contractId: spec.id,
+      phase: 'classify',
+      expected,
       actual,
       pass,
     })
-    assert.equal(actual.readOnly, expectReadOnly, `${spec.id} readOnly`)
-    assert.equal(actual.needsApproval, expectNeedsApproval, `${spec.id} needsApproval`)
-    assert.equal(actual.isReadonlyBash, expectReadOnly, `${spec.id} isReadonlyBash`)
-    if (expectReason) assert.equal(actual.reason, expectReason, `${spec.id} reason`)
-  }
-  assert.equal(CLASSIFY_CASES.length, 22)
-  assert.equal(ledger.length, 22)
-  console.log(JSON.stringify({ contractId: 'ocv5-188-D-classify', cases: ledger }, null, 2))
-})
+    try {
+      assert.equal(actual.readOnly, expectReadOnly, `${spec.id} readOnly`)
+      assert.equal(actual.needsApproval, expectNeedsApproval, `${spec.id} needsApproval`)
+      assert.equal(actual.isReadonlyBash, expectReadOnly, `${spec.id} isReadonlyBash`)
+      if (expectReason) assert.equal(actual.reason, expectReason, `${spec.id} reason`)
+      mark(spec.id, true)
+    } catch (err) {
+      mark(spec.id, false)
+      throw err
+    }
+  })
+}
 
-test('inspectOutbound: no controller denies multiline and does not auto-allow ls prefix', async () => {
-  const bridge = createApprovalBridge({})
-  const cases = [
-    { id: 'B1-noctrl-lf', requestId: 'req-noctrl-lf', command: CORE_LF },
-    { id: 'B2-noctrl-crlf', requestId: 'req-noctrl-crlf', command: CORE_CRLF },
-    { id: 'B3-noctrl-cr', requestId: 'req-noctrl-cr', command: CORE_CR },
-  ]
-  for (const spec of cases) {
+for (const spec of BRIDGE_NOCTRL_CASES) {
+  test(spec.id, async () => {
+    const bridge = createApprovalBridge({ classify: classifyFrame })
     const sent = []
     const result = await bridge.inspectOutbound(bashFrame(spec.requestId, spec.command), {
       sendJson: (frame) => sent.push(frame),
     })
-    assert.equal(result.intercepted, true, spec.id)
-    assert.equal(result.classified.readOnly, false, spec.id)
-    assert.equal(result.classified.needsApproval, true, spec.id)
-    assert.equal(result.response.behavior, 'deny', spec.id)
-    assert.equal(result.response.requestId, spec.requestId, spec.id)
-    assert.equal(result.response.message, 'no-approval-controller', spec.id)
-    assert.equal(sent.length, 1, spec.id)
-    assert.equal(sent[0].behavior, 'deny', spec.id)
-    assert.equal(sent[0].requestId, spec.requestId, spec.id)
-    console.log(JSON.stringify({
-      contractId: spec.id,
-      expected: { behavior: 'deny', send: 1, requestId: spec.requestId },
-      actual: { behavior: result.response.behavior, send: sent.length, requestId: result.response.requestId },
-    }))
-  }
-})
+    const expected = {
+      intercepted: true,
+      readOnly: false,
+      needsApproval: true,
+      behavior: 'deny',
+      requestId: spec.requestId,
+      message: 'no-approval-controller',
+      send: 1,
+    }
+    const actual = {
+      intercepted: result.intercepted === true,
+      readOnly: result.classified.readOnly === true,
+      needsApproval: result.classified.needsApproval === true,
+      behavior: result.response.behavior,
+      requestId: result.response.requestId,
+      message: result.response.message,
+      send: sent.length,
+      sentBehavior: sent[0]?.behavior,
+      sentRequestId: sent[0]?.requestId,
+    }
+    const pass =
+      actual.intercepted === true &&
+      actual.readOnly === false &&
+      actual.needsApproval === true &&
+      actual.behavior === 'deny' &&
+      actual.requestId === spec.requestId &&
+      actual.message === 'no-approval-controller' &&
+      actual.send === 1 &&
+      actual.sentBehavior === 'deny' &&
+      actual.sentRequestId === spec.requestId
+    emit({ contractId: spec.id, phase: 'bridge-noctrl', expected, actual, pass })
+    try {
+      assert.equal(result.intercepted, true, spec.id)
+      assert.equal(result.classified.readOnly, false, spec.id)
+      assert.equal(result.classified.needsApproval, true, spec.id)
+      assert.equal(result.response.behavior, 'deny', spec.id)
+      assert.equal(result.response.requestId, spec.requestId, spec.id)
+      assert.equal(result.response.message, 'no-approval-controller', spec.id)
+      assert.equal(sent.length, 1, spec.id)
+      assert.equal(sent[0].behavior, 'deny', spec.id)
+      assert.equal(sent[0].requestId, spec.requestId, spec.id)
+      mark(spec.id, true)
+    } catch (err) {
+      mark(spec.id, false)
+      throw err
+    }
+  })
+}
 
-test('inspectOutbound: real controller pending then deny/timeout/approve each send once', async () => {
-  const specs = [
-    { id: 'B4-deny', requestId: 'req-ml-deny', command: CORE_LF, action: 'deny', behavior: 'deny' },
-    { id: 'B5-timeout', requestId: 'req-ml-timeout', command: CORE_CRLF, action: 'timeout', behavior: 'deny' },
-    { id: 'B6-approve', requestId: 'req-ml-approve', command: CORE_CR, action: 'approve', behavior: 'allow' },
-  ]
-  for (const spec of specs) {
+for (const spec of BRIDGE_CONTROLLER_CASES) {
+  test(spec.id, async () => {
     const timers = fakeTimers()
     const prompts = []
     const sent = []
@@ -190,12 +304,32 @@ test('inspectOutbound: real controller pending then deny/timeout/approve each se
         prompts.push(request)
       },
     })
-    const bridge = createApprovalBridge({ approval })
+    const bridge = createApprovalBridge({ approval, classify: classifyFrame })
+    let inspectPromise
+    let testError
     try {
-      const pending = bridge.inspectOutbound(bashFrame(spec.requestId, spec.command), {
+      inspectPromise = bridge.inspectOutbound(bashFrame(spec.requestId, spec.command), {
         sendJson: (frame) => sent.push(frame),
       })
-      await waitFor(() => prompts.length === 1 && approval.pendingCount() === 1, `${spec.id} pending`)
+      for (let i = 0; i < 30; i++) {
+        if (prompts.length === 1 && approval.pendingCount() === 1) break
+        await Promise.resolve()
+      }
+      const pendingExpected = { promptCount: 1, pendingCount: 1, send: 0 }
+      const pendingActual = {
+        promptCount: prompts.length,
+        pendingCount: approval.pendingCount(),
+        send: sent.length,
+      }
+      const pendingPass =
+        pendingActual.promptCount === 1 && pendingActual.pendingCount === 1 && pendingActual.send === 0
+      emit({
+        contractId: spec.id,
+        phase: 'bridge-controller-pending',
+        expected: pendingExpected,
+        actual: pendingActual,
+        pass: pendingPass,
+      })
       assert.equal(sent.length, 0, `${spec.id} no send while pending`)
       assert.equal(approval.pendingCount(), 1, `${spec.id} pendingCount`)
       const opId = prompts[0].id
@@ -211,36 +345,62 @@ test('inspectOutbound: real controller pending then deny/timeout/approve each se
         assert.equal(granted.ok, true)
         assert.equal(granted.approved, true)
       }
-      const result = await pending
+      const result = await inspectPromise
+      const expected = {
+        behavior: spec.behavior,
+        send: 1,
+        requestId: spec.requestId,
+        pendingThen: spec.action,
+        drained: 0,
+      }
+      const actual = {
+        behavior: result.response.behavior,
+        send: sent.length,
+        requestId: result.response.requestId,
+        sentBehavior: sent[0]?.behavior,
+        sentRequestId: sent[0]?.requestId,
+        promptCount: prompts.length,
+        drained: approval.pendingCount(),
+      }
+      const pass =
+        actual.behavior === spec.behavior &&
+        actual.send === 1 &&
+        actual.requestId === spec.requestId &&
+        actual.sentBehavior === spec.behavior &&
+        actual.sentRequestId === spec.requestId &&
+        actual.drained === 0
+      emit({ contractId: spec.id, phase: 'bridge-controller-result', expected, actual, pass })
       assert.equal(result.response.requestId, spec.requestId, spec.id)
       assert.equal(result.response.behavior, spec.behavior, spec.id)
       assert.equal(sent.length, 1, `${spec.id} send count`)
       assert.equal(sent[0].behavior, spec.behavior, spec.id)
       assert.equal(sent[0].requestId, spec.requestId, spec.id)
       assert.equal(approval.pendingCount(), 0, `${spec.id} drained`)
-      console.log(JSON.stringify({
+    } catch (err) {
+      testError = err
+      emit({
         contractId: spec.id,
-        expected: { behavior: spec.behavior, send: 1, requestId: spec.requestId, pendingThen: spec.action },
+        phase: 'bridge-controller-error',
+        expected: { pendingCount: 1, send: 0, then: spec.action, behavior: spec.behavior },
         actual: {
-          behavior: result.response.behavior,
-          send: sent.length,
-          requestId: result.response.requestId,
           promptCount: prompts.length,
+          pendingCount: approval.pendingCount(),
+          send: sent.length,
+          sentBehavior: sent[0]?.behavior,
+          error: err?.message || String(err),
         },
-      }))
+        pass: false,
+      })
     } finally {
-      timers.flush()
+      mark(spec.id, !testError)
+      await drainBridge({ timers, approval, prompts, inspectPromise })
     }
-  }
-})
+    if (testError) throw testError
+  })
+}
 
-test('inspectOutbound: safe single-line ls/git with tab auto-allow and never prompt', async () => {
-  const cases = [
-    { id: 'B7-ls', requestId: 'req-safe-ls', command: 'ls -la' },
-    { id: 'B8-ls-tab', requestId: 'req-safe-ls-tab', command: 'ls\t-la' },
-    { id: 'B9-git-status', requestId: 'req-safe-git', command: 'git status' },
-  ]
-  for (const spec of cases) {
+for (const spec of BRIDGE_SAFE_CASES) {
+  test(spec.id, async () => {
     const timers = fakeTimers()
     const prompts = []
     const sent = []
@@ -252,11 +412,43 @@ test('inspectOutbound: safe single-line ls/git with tab auto-allow and never pro
         prompts.push(request)
       },
     })
-    const bridge = createApprovalBridge({ approval })
+    const bridge = createApprovalBridge({ approval, classify: classifyFrame })
+    let inspectPromise
+    let testError
     try {
-      const result = await bridge.inspectOutbound(bashFrame(spec.requestId, spec.command), {
+      inspectPromise = bridge.inspectOutbound(bashFrame(spec.requestId, spec.command), {
         sendJson: (frame) => sent.push(frame),
       })
+      const result = await inspectPromise
+      const expected = {
+        behavior: 'allow',
+        message: 'read-only',
+        requestId: spec.requestId,
+        readOnly: true,
+        prompts: 0,
+        pendingCount: 0,
+        send: 1,
+      }
+      const actual = {
+        behavior: result.response.behavior,
+        message: result.response.message,
+        requestId: result.response.requestId,
+        readOnly: result.classified.readOnly === true,
+        prompts: prompts.length,
+        pendingCount: approval.pendingCount(),
+        send: sent.length,
+        sentBehavior: sent[0]?.behavior,
+      }
+      const pass =
+        actual.behavior === 'allow' &&
+        actual.message === 'read-only' &&
+        actual.requestId === spec.requestId &&
+        actual.readOnly === true &&
+        actual.prompts === 0 &&
+        actual.pendingCount === 0 &&
+        actual.send === 1 &&
+        actual.sentBehavior === 'allow'
+      emit({ contractId: spec.id, phase: 'bridge-safe', expected, actual, pass })
       assert.equal(result.response.behavior, 'allow', spec.id)
       assert.equal(result.response.message, 'read-only', spec.id)
       assert.equal(result.response.requestId, spec.requestId, spec.id)
@@ -265,43 +457,66 @@ test('inspectOutbound: safe single-line ls/git with tab auto-allow and never pro
       assert.equal(approval.pendingCount(), 0, spec.id)
       assert.equal(sent.length, 1, spec.id)
       assert.equal(sent[0].behavior, 'allow', spec.id)
-      console.log(JSON.stringify({
+    } catch (err) {
+      testError = err
+      emit({
         contractId: spec.id,
-        expected: { behavior: 'allow', send: 1, prompts: 0, requestId: spec.requestId },
+        phase: 'bridge-safe-error',
+        expected: { behavior: 'allow', prompts: 0 },
         actual: {
-          behavior: result.response.behavior,
-          send: sent.length,
           prompts: prompts.length,
-          requestId: result.response.requestId,
+          pendingCount: approval.pendingCount(),
+          send: sent.length,
+          error: err?.message || String(err),
         },
-      }))
+        pass: false,
+      })
     } finally {
-      timers.flush()
+      mark(spec.id, !testError)
+      await drainBridge({ timers, approval, prompts, inspectPromise })
     }
-  }
-})
+    if (testError) throw testError
+  })
+}
 
-test('ocv5-188-D provenance: source hashes, fixed denominator, no OS command E2E', () => {
-  const classifyN = CLASSIFY_CASES.length
-  const bridgeN = 9
-  const expectedTotal = classifyN + bridgeN
-  const approvalHash = sha256File(APPROVAL_SRC)
-  const bridgeHash = sha256File(BRIDGE_SRC)
-  const summary = {
-    contractId: 'ocv5-188-D-windows-multiline-approval',
-    classifyCases: classifyN,
-    bridgeCases: bridgeN,
-    expectedTotal,
-    skip: 0,
-    osCommandE2E: OS_COMMAND_E2E,
-    approvalSha256: approvalHash,
-    bridgeSha256: bridgeHash,
+test('P1-provenance', () => {
+  const snap = hashes()
+  const expected = {
+    osCommandE2E: false,
+    catalogBusiness: 31,
+    classifyCases: 22,
+    bridgeCases: 9,
   }
-  console.log(JSON.stringify(summary, null, 2))
-  assert.equal(classifyN, 22)
-  assert.equal(bridgeN, 9)
-  assert.equal(expectedTotal, 31)
+  const actual = {
+    osCommandE2E: OS_COMMAND_E2E,
+    catalogBusiness: BUSINESS_IDS.length,
+    classifyCases: CLASSIFY_CASES.length,
+    bridgeCases: BRIDGE_NOCTRL_CASES.length + BRIDGE_CONTROLLER_CASES.length + BRIDGE_SAFE_CASES.length,
+    executedBusiness: executed.filter((row) => BUSINESS_IDS.includes(row.id)).length,
+    skipInvoked: 0,
+    hashes: snap,
+  }
+  emit({
+    contractId: 'P1-provenance',
+    phase: 'provenance',
+    expected,
+    actual,
+    pass:
+      actual.osCommandE2E === false &&
+      actual.catalogBusiness === 31 &&
+      actual.classifyCases === 22 &&
+      actual.bridgeCases === 9 &&
+      snap.approvalSha256.length === 64 &&
+      snap.bridgeSha256.length === 64 &&
+      snap.testSha256.length === 64,
+  })
   assert.equal(OS_COMMAND_E2E, false)
-  assert.equal(approvalHash.length, 64)
-  assert.equal(bridgeHash.length, 64)
+  assert.equal(CLASSIFY_CASES.length, 22)
+  assert.equal(BRIDGE_NOCTRL_CASES.length, 3)
+  assert.equal(BRIDGE_CONTROLLER_CASES.length, 3)
+  assert.equal(BRIDGE_SAFE_CASES.length, 3)
+  assert.equal(BUSINESS_IDS.length, 31)
+  assert.equal(snap.approvalSha256.length, 64)
+  assert.equal(snap.bridgeSha256.length, 64)
+  assert.equal(snap.testSha256.length, 64)
 })
