@@ -3385,6 +3385,112 @@
           "assertion": "OCV5-178 warm socket shows new text after restoring an idle cursor"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-CURSOR-AUDIT-SETTLE-GAP",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Cursor audit 先关 pending 再 settle，pricing/PG 失败后行已终态且无 usage，补偿扫描再也扫不到。未来 pending 改为 settle-before-close；历史 terminal-gap 常驻 tick 零写，不自动补录 132 条。",
+      "rootFixCommit": "b5bf02c8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "pricing miss throws and never closes the audit row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "tick scans only status='pending' and performs no writes when none are pending"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-CURSOR-AUDIT-SETTLE-GAP: source regression guard, not end-to-end proof."
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CHATGPT-CONNECT-CAP",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "ChatGPT CONNECT 在 upstream 握手完成前不计入 cap，并发握手可越过每用户 64 / 全局 2048。client close 在 pending 阶段只标 ended，名额保留到真实 socket 终态；晚到成功先 destroy 再释放，不 200/pipe。",
+      "rootFixCommit": "b5e57a8e",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/chatgptProxy/__tests__/server.test.ts",
+          "assertion": "client close during pending keeps reservation; 65th 429; release frees; no double count"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/chatgptProxy/__tests__/server.test.ts",
+          "assertion": "client close + 10s upstream timeout releases reservation and real socket"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-CHATGPT-CONNECT-CAP: source regression guard, not end-to-end proof."
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-SESSION-DELETED-WIRE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "已删会话仍发 SESSION_PERSIST_UNAVAILABLE 并提示可安全重试，前端当瞬时失败原 peer 重发。改为 SESSION_DELETED + retryable false + new_session CTA；回收站恢复后发送路径不改。",
+      "rootFixCommit": "b661d576",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "session_deleted persist is SESSION_DELETED, not retryable, and never starts container work"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "legacy SESSION_DELETED paints a non-retryable card and does not auto-recover"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-SESSION-DELETED-WIRE: source regression guard, not end-to-end proof."
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-LIVE-FRAME-CLASSIFY",
+      "occurredAt": "2026-09-08",
+      "severity": "P2",
+      "symptom": "退休 live 帧无只读分类、手工价格备份表 model_pricing_0903_cw_backup 未进永久账本、业务健康指标绑在热 tick 会扫大表。本包只读分类在飞/tape 可恢复/唯一副本，按需 CLI timeout+limit，unknown 不伪 0，不删表不热扫。",
+      "rootFixCommit": "3ec290e1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "classifies inflight / tapeRecoverable / uniqueCopy without DELETE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "timeout returns unknown with null counts, never fake 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "model_pricing_0903_cw_backup is a permanent ledger and never a TTL table"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-LIVE-FRAME-CLASSIFY: source regression guard, not end-to-end proof."
+        }
+      ]
     }
   ]
 }

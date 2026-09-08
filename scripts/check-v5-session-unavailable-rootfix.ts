@@ -197,3 +197,77 @@ if (/health\.on(Success|Failure)\(/.test(cursorSettleSrc)) {
   throw new Error('[grok-pool-cooldown] cursor settle must not call AccountHealthTracker (materializer whitelist depends on health/status/cooldown)')
 }
 console.log('[grok-pool-cooldown] PASS — INC-20260908-GROK-POOL-NO-COOLDOWN source contracts locked')
+
+// INC-20260908-CURSOR-AUDIT-SETTLE-GAP: source regression guard, not end-to-end proof.
+// The durableCursorBilling unit suite proves settle-before-close and zero-write
+// historical gaps; this gate only stops the production order reverting.
+const durableBillingSrc = readFileSync(
+  join(root, 'packages/commercial/src/billing/durableCursorBilling.ts'),
+  'utf8',
+)
+if (!durableBillingSrc.includes('Close the audit row only now that the settle committed')) {
+  throw new Error('[cursor-audit-settle-gap] durableCursorBilling.ts must close audit after settle')
+}
+if (
+  /UPDATE cursor_external_usage_audit[\s\S]{0,400}settleCursorExternalUsage/.test(durableBillingSrc)
+) {
+  throw new Error('[cursor-audit-settle-gap] audit close must not precede settleCursorExternalUsage')
+}
+console.log('[cursor-audit-settle-gap] PASS — INC-20260908-CURSOR-AUDIT-SETTLE-GAP source contracts locked')
+
+// INC-20260908-CHATGPT-CONNECT-CAP: source regression guard, not end-to-end proof.
+const chatgptProxySrc = readFileSync(
+  join(root, 'packages/commercial/src/chatgptProxy/server.ts'),
+  'utf8',
+)
+for (const marker of [
+  'tunnels.add(clientSocket)',
+  'requestEnded = true',
+  "finish('client_aborted')",
+  'UPSTREAM_CONNECT_TIMEOUT_MS = 10_000',
+]) {
+  if (!chatgptProxySrc.includes(marker)) {
+    throw new Error(`[chatgpt-connect-cap] server.ts lost pending+active reservation contract: ${marker}`)
+  }
+}
+console.log('[chatgpt-connect-cap] PASS — INC-20260908-CHATGPT-CONNECT-CAP source contracts locked')
+
+// INC-20260908-SESSION-DELETED-WIRE: source regression guard, not end-to-end proof.
+const bridgeSrc = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
+for (const marker of [
+  'SESSION_DELETED_WIRE_MESSAGE',
+  'sendSessionDeletedFrame',
+  'action: "new_session"',
+]) {
+  if (!bridgeSrc.includes(marker)) {
+    throw new Error(`[session-deleted-wire] userChatBridge.ts lost SESSION_DELETED wire contract: ${marker}`)
+  }
+}
+const taxonomySrc = readFileSync(join(root, 'packages/protocol/src/turnErrorTaxonomy.ts'), 'utf8')
+if (!taxonomySrc.includes("session_deleted: { retryable: false, cta: 'new_session'")) {
+  throw new Error('[session-deleted-wire] protocol taxonomy must keep session_deleted non-retryable with new_session CTA')
+}
+console.log('[session-deleted-wire] PASS — INC-20260908-SESSION-DELETED-WIRE source contracts locked')
+
+// INC-20260908-LIVE-FRAME-CLASSIFY: source regression guard, not end-to-end proof.
+const classifySrc = readFileSync(
+  join(root, 'packages/commercial/src/db/liveFrameClassification.ts'),
+  'utf8',
+)
+const healthSrc = readFileSync(join(root, 'packages/commercial/src/admin/businessHealth.ts'), 'utf8')
+const retentionSrc = readFileSync(join(root, 'packages/commercial/src/admin/auditRetention.ts'), 'utf8')
+for (const marker of ['export async function classifyRetiredLiveJournals(', 'unknown: true', 'SET LOCAL statement_timeout']) {
+  if (!classifySrc.includes(marker)) {
+    throw new Error(`[live-frame-classify] classification lost bounded read-only contract: ${marker}`)
+  }
+}
+if (/\bDELETE FROM client_session_live_/.test(classifySrc)) {
+  throw new Error('[live-frame-classify] classification must not DELETE live frames')
+}
+if (!healthSrc.includes('backupFreshness: "not_in_scope"') || healthSrc.includes('ok:')) {
+  throw new Error('[live-frame-classify] business health must stay off /healthz.ok and mark backup not_in_scope')
+}
+if (!retentionSrc.includes('"model_pricing_0903_cw_backup"')) {
+  throw new Error('[live-frame-classify] model_pricing_0903_cw_backup must stay on the permanent ledger')
+}
+console.log('[live-frame-classify] PASS — INC-20260908-LIVE-FRAME-CLASSIFY source contracts locked')
