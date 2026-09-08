@@ -61,16 +61,34 @@ interface FakePoolControl {
   /** Audit-close UPDATEs that actually succeeded (injected failures excluded). */
   closeUpdateCount(): number;
   usageInsertCount(): number;
+  uniqueViolationCount(): number;
+  committedUsageCount(): number;
+}
+
+function uniqueViolation(detail: string): Error & { code: string } {
+  const err = new Error(`duplicate key value violates unique constraint ${detail}`) as Error & {
+    code: string;
+  };
+  err.code = "23505";
+  return err;
 }
 
 function makeFakePool(opts: FakePoolOptions = {}): FakePoolControl {
   const queries: QueryRecord[] = [];
+  const committedUsage = new Map<string, { id: string }>();
   let failedClose = false;
   let failedInsert = false;
   let closeOkCount = 0;
+  let uniqueViolations = 0;
+  let usageIdSeq = 100;
+  let auditPending = true;
 
   function record(sql: string, params: unknown[] | undefined): void {
     queries.push({ sql, params });
+  }
+
+  function usageKey(userId: unknown, requestId: unknown): string {
+    return `${String(userId ?? "")}\0${String(requestId ?? "")}`;
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -90,12 +108,20 @@ function makeFakePool(opts: FakePoolOptions = {}): FakePoolControl {
           failedInsert = true;
           throw opts.failInsertOnce;
         }
-        return { rows: [{ id: "100" }], rowCount: 1 };
+        const key = usageKey(params?.[0], params?.[13]);
+        if (committedUsage.has(key)) {
+          uniqueViolations += 1;
+          throw uniqueViolation("usage_records_user_id_request_id_key");
+        }
+        const id = String(usageIdSeq++);
+        committedUsage.set(key, { id });
+        return { rows: [{ id }], rowCount: 1 };
       }
       if (trimmed.startsWith("SELECT usage_records.id::text AS id")) {
-        // loadSettledUsageAttribution after a 23505: the other writer won.
+        const row = committedUsage.get(usageKey(params?.[0], params?.[1]));
+        if (!row) return { rows: [], rowCount: 0 };
         return {
-          rows: [{ id: "100", ledger_id: null, attribution_credits: null }],
+          rows: [{ id: row.id, ledger_id: null, attribution_credits: null }],
           rowCount: 1,
         };
       }
@@ -135,6 +161,8 @@ function makeFakePool(opts: FakePoolOptions = {}): FakePoolControl {
           failedClose = true;
           throw new Error("injected close failure");
         }
+        if (!auditPending) return { rows: [], rowCount: 0 };
+        auditPending = false;
         closeOkCount += 1;
         return { rows: [], rowCount: 1 };
       }
@@ -157,6 +185,12 @@ function makeFakePool(opts: FakePoolOptions = {}): FakePoolControl {
     },
     usageInsertCount() {
       return queries.filter((q) => q.sql.trim().startsWith("INSERT INTO usage_records")).length;
+    },
+    uniqueViolationCount() {
+      return uniqueViolations;
+    },
+    committedUsageCount() {
+      return committedUsage.size;
     },
   };
 }
@@ -202,11 +236,14 @@ describe("settleDurableCursorBilling settle-before-close (OCV5-180 D1)", () => {
       q.sql.trim().startsWith("INSERT INTO usage_records"),
     );
     assert.ok(insertIdx >= 0, "usage insert recorded");
+    const commitIdx = ctrl.queries.findIndex((q) => q.sql.trim() === "COMMIT");
+    assert.ok(commitIdx > insertIdx, "usage INSERT must COMMIT before the audit close");
     const closePos = ctrl.queries.findIndex((q) =>
       q.sql.trim().startsWith("UPDATE cursor_external_usage_audit"),
     );
-    assert.ok(closePos > insertIdx, "audit close must come after the usage settle");
+    assert.ok(closePos > commitIdx, "audit close must come after the usage COMMIT");
     assert.equal(ctrl.closeUpdateCount(), 1);
+    assert.equal(ctrl.committedUsageCount(), 1);
     const closeParams = ctrl.queries[closePos]?.params;
     assert.equal(closeParams?.[1], "success");
   });
@@ -226,9 +263,17 @@ describe("settleDurableCursorBilling settle-before-close (OCV5-180 D1)", () => {
       /injected close failure/,
     );
     assert.equal(ctrl.usageInsertCount(), 1);
+    assert.equal(ctrl.committedUsageCount(), 1);
+    assert.equal(ctrl.uniqueViolationCount(), 0);
     assert.equal(ctrl.closeUpdateCount(), 0);
+    const firstCommit = ctrl.queries.findIndex((q) => q.sql.trim() === "COMMIT");
+    assert.ok(firstCommit >= 0, "first settle must COMMIT the usage row");
+    const firstCloseAttempt = ctrl.queries.findIndex((q) =>
+      q.sql.trim().startsWith("UPDATE cursor_external_usage_audit"),
+    );
+    assert.ok(firstCloseAttempt > firstCommit, "failed close still happens after COMMIT");
     // 2nd call: the usage INSERT hits the UNIQUE fence (23505) and the
-    // idempotent path returns the existing row; the audit then closes.
+    // idempotent path ROLLBACK + reads the existing row; the audit then closes.
     const outcome = await settleDurableCursorBilling(
       { ...deps(ctrl, pricingFor("cursor-grok-4.6-high")), pgPool: ctrl.pool },
       UID,
@@ -237,7 +282,38 @@ describe("settleDurableCursorBilling settle-before-close (OCV5-180 D1)", () => {
     );
     assert.equal(outcome, "already_committed");
     assert.equal(ctrl.usageInsertCount(), 2); // second attempt tried and hit 23505
+    assert.equal(ctrl.uniqueViolationCount(), 1);
+    assert.equal(ctrl.committedUsageCount(), 1); // one successful usage, no double debit
     assert.equal(ctrl.closeUpdateCount(), 1); // closed exactly once, on retry
+    const secondInsert = ctrl.queries
+      .map((q, i) => ({ q, i }))
+      .filter(({ q }) => q.sql.trim().startsWith("INSERT INTO usage_records"))[1];
+    assert.ok(secondInsert, "retry must attempt the unique INSERT");
+    const rollbackAfter = ctrl.queries.findIndex(
+      (q, i) => i > secondInsert.i && q.sql.trim() === "ROLLBACK",
+    );
+    const loadExisting = ctrl.queries.findIndex(
+      (q, i) => i > rollbackAfter && q.sql.trim().startsWith("SELECT usage_records.id::text AS id"),
+    );
+    assert.ok(rollbackAfter > secondInsert.i, "23505 must ROLLBACK the aborted tx");
+    assert.ok(loadExisting > rollbackAfter, "23505 path must read the already-committed usage");
+  });
+
+  test("concurrent settlers share one committed usage and close the audit once", async () => {
+    const ctrl = makeFakePool({ pricing: pricingFor("cursor-grok-4.6-high") });
+    const d = deps(ctrl, pricingFor("cursor-grok-4.6-high"));
+    const f = frame({ input_tokens: 1000, output_tokens: 0 });
+    const results = await Promise.all([
+      settleDurableCursorBilling(d, UID, f),
+      settleDurableCursorBilling(d, UID, f),
+    ]);
+    assert.deepEqual(results.slice().sort(), ["already_committed", "already_committed"]);
+    assert.equal(ctrl.committedUsageCount(), 1, "UNIQUE fence keeps a single usage row");
+    assert.equal(ctrl.uniqueViolationCount(), 1, "the loser must take the 23505 path");
+    assert.equal(ctrl.usageInsertCount(), 2);
+    assert.equal(ctrl.closeUpdateCount(), 1, "status='pending' close wins exactly once");
+    assert.ok(ctrl.queries.some((q) => q.sql.trim() === "ROLLBACK"));
+    assert.ok(ctrl.queries.some((q) => q.sql.trim().startsWith("SELECT usage_records.id::text AS id")));
   });
 
   test("audit user mismatch refuses to settle against the foreign wallet", async () => {
