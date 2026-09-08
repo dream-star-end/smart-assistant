@@ -360,6 +360,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
           invalidateHistoryCache: detail._historyRevisionUnsupported === true,
           openDispatch: detail.openDispatch,
+          permissionPrompts: detail.permissionPrompts,
         });
         // Canonical GET is enough to dismiss the history skeleton. Journal
         // hydrate is a background fill — awaiting it used to pin
@@ -398,6 +399,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                   timelineHasMore: tapeDetail.timelineHasMore,
                   timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                  permissionPrompts: tapeDetail.permissionPrompts,
                 });
               },
               (query) => api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),

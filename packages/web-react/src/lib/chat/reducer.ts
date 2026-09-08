@@ -48,6 +48,11 @@ import {
   unwrapExecuteExtraToolInput,
 } from "./extraTool";
 import { repairPostFinalProcessOrder } from "./order";
+import type { PermissionPromptSnapshotPayload } from "../types";
+import {
+  permissionSnapshotToRequestFrame,
+  reconcilePermissionSnapshot,
+} from "./permissionReconcile";
 import {
   isOcMemoryDelegateVerb,
   isOcMemoryDelegateWait,
@@ -2972,6 +2977,12 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
       (m.requestId === requestId || m.id === requestId),
   );
   if (existing) {
+    const incomingTruncated = (frame as { inputTruncated?: unknown }).inputTruncated === true;
+    if (!incomingTruncated && frame.inputJson && typeof frame.inputJson === "object") {
+      existing.inputJson = frame.inputJson as Record<string, unknown>;
+      existing._inputTruncated = false;
+      if (frame.inputPreview) existing.inputPreview = frame.inputPreview;
+    }
     consumePendingPermissionSettlement(sess, existing);
     return existing;
   }
@@ -3004,6 +3015,13 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
     toolName: frame.toolName,
     inputPreview: frame.inputPreview || "",
     inputJson: frame.inputJson || null,
+    ...((frame as { inputTruncated?: unknown }).inputTruncated === true
+      ? { _inputTruncated: true }
+      : {}),
+    ...((frame as { toolUseId?: unknown }).toolUseId &&
+    typeof (frame as { toolUseId?: unknown }).toolUseId === "string"
+      ? { toolUseId: (frame as { toolUseId: string }).toolUseId }
+      : {}),
     _resolved: false,
     ...(detachedAskUser ? { _detachedAskUser: true } : {}),
     ...(typeof expiresAt === "number" ? { _askUserExpiresAt: expiresAt } : {}),
@@ -3035,3 +3053,54 @@ export function applyPermissionSettled(sess: ChatSession, frame: OutboundPermiss
 }
 
 export { AUTO_CONTINUE_PROMPT };
+
+/** Apply a session-GET permission snapshot. Settled rows converge cards;
+ *  pending rows missing locally materialise. Absence is not expiry. */
+export function applyPermissionSnapshot(
+  sess: ChatSession,
+  snapshot: PermissionPromptSnapshotPayload | null | undefined,
+  nowMs: number = Date.now(),
+): string[] {
+  if (!snapshot) return [];
+  const localCards = sess.messages
+    .filter((m) => m.role === "permission" && typeof m.requestId === "string")
+    .map((m) => ({
+      requestId: m.requestId as string,
+      updatedAt: m.ts,
+      resolved: m._resolved === true,
+      behavior: m._behavior ?? null,
+    }));
+  const plan = reconcilePermissionSnapshot({ localCards, snapshot, nowMs });
+  for (const item of plan.materialize) {
+    applyPermissionRequest(
+      sess,
+      permissionSnapshotToRequestFrame(item, sess.id, nowMs, sess.agentId || "main"),
+    );
+  }
+  for (const settlement of plan.settle) {
+    if (settlement.behavior === "allow" || settlement.behavior === "deny") {
+      applyPermissionSettled(sess, {
+        type: "outbound.permission_settled",
+        sessionKey: `agent:${sess.agentId || "main"}:webchat:dm:${sess.id}`,
+        channel: "webchat",
+        peer: { id: sess.id, kind: "dm" },
+        requestId: settlement.requestId,
+        behavior: settlement.behavior,
+        reason: settlement.reason ?? undefined,
+        ...(settlement.answers ? { answers: settlement.answers } : {}),
+      } as Parameters<typeof applyPermissionSettled>[1]);
+    } else {
+      rememberSettledPermissionRequestId(sess, settlement.requestId);
+      const msg = sess.messages.find((m) => m.requestId === settlement.requestId);
+      if (msg) {
+        msg._resolved = true;
+        msg._settledReason = settlement.reason || "accepted";
+      }
+    }
+    if (settlement.status === "responded") {
+      const msg = sess.messages.find((m) => m.requestId === settlement.requestId);
+      if (msg && msg._settledReason == null) msg._settledReason = "accepted";
+    }
+  }
+  return plan.lookupRequestIds;
+}

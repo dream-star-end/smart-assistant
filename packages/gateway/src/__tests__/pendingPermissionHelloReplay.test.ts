@@ -15,6 +15,9 @@ import { describe, it } from 'node:test'
 
 import {
   _pendingPermissionCatchupFrames,
+  attachPermissionSnapshotIfMissing,
+  parsePermissionLookupQuery,
+  projectRuntimePermissionSnapshot,
   type PendingPermissionCatchupEntry,
 } from '../server.js'
 
@@ -91,5 +94,43 @@ describe('_pendingPermissionCatchupFrames', () => {
 
   it('returns nothing when the map is empty', () => {
     assert.deepEqual(_pendingPermissionCatchupFrames(new Map(), SESSION_KEY, PEER_KEY, NOW), [])
+  })
+})
+
+describe('projectRuntimePermissionSnapshot', () => {
+  it('projects only still-pending rows for the exact user+session and never forges settled states', () => {
+    const pending = new Map<string, PendingPermissionCatchupEntry>([
+      ['mine', entry({ peerKey: 'c:3:webchat:wsess-permreplay01' })],
+      ['other-user', entry({ peerKey: 'c:4:webchat:wsess-permreplay01' })],
+      ['expired', entry({ peerKey: 'c:3:webchat:wsess-permreplay01', expiresAt: NOW })],
+    ])
+    const snapshot = projectRuntimePermissionSnapshot(pending, 'wsess-permreplay01', 'c:3', NOW)
+    assert.equal(snapshot.source, 'runtime')
+    assert.equal(snapshot.completeness, 'unavailable')
+    assert.deepEqual(snapshot.items.map((i) => i.requestId), ['mine'])
+    assert.equal(snapshot.items[0]!.status, 'pending')
+    assert.equal(snapshot.items[0]!.behavior, null)
+  })
+
+  it('does not overwrite an existing PG snapshot', () => {
+    const session = {
+      id: 'wsess-permreplay01',
+      userId: 'c:3',
+      permissionPrompts: { items: [], completeness: 'complete' as const, source: 'pg' as const },
+    }
+    const attached = attachPermissionSnapshotIfMissing(
+      session,
+      new Map([['mine', entry()]]),
+      'c:3',
+      NOW,
+    )
+    assert.equal(attached.permissionPrompts.source, 'pg')
+  })
+})
+
+describe('parsePermissionLookupQuery', () => {
+  it('bounds and dedupes lookup ids', () => {
+    assert.deepEqual(parsePermissionLookupQuery('a,a,b'), ['a', 'b'])
+    assert.equal(parsePermissionLookupQuery(Array.from({ length: 20 }, (_, i) => `x${i}`).join(','))!.length, 16)
   })
 })

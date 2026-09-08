@@ -536,8 +536,12 @@ export type ChatMessage = {
 
   // ── permission ──
   requestId?: string;
+  /** Engine tool_use id when the prompt is bound to a tool card. */
+  toolUseId?: string;
   _resolved?: boolean;
   _behavior?: "allow" | "deny";
+  /** Snapshot/hello omitted the full answerable input (UTF-8 > 8KiB). */
+  _inputTruncated?: boolean;
   _settledReason?: string | null;
   _answers?: Record<string, string>;
   /** Durable permission response exists but Master has not yet reported an
