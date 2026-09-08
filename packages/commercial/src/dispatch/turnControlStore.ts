@@ -543,20 +543,81 @@ export const PERMISSION_PROMPT_MAX_INPUT_BYTES = 8192
 /** Statement timeout for snapshot/hello permission reads. */
 export const PERMISSION_PROMPT_READ_TIMEOUT_MS = 250
 
-type PermissionReadPool = Pick<Pool, 'query'> & {
+type PermissionReadPool = {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: object[]; rowCount: number | null }>
   connect?: () => Promise<PoolClient>
+  release?: (err?: Error | boolean) => void
 }
 
-/** Bounded PG read: SET LOCAL statement_timeout on a real pool; mock query() pools skip it. */
-export async function queryPermissionRead<T extends object>(
-  pool: PermissionReadPool,
+type PermissionReadKind = 'pool' | 'borrowed' | 'query'
+
+/** Pool owns connect(); a borrowed PoolClient also has connect() but must not
+ *  be reconnected, committed, or released by this helper. */
+export function permissionReadKind(q: {
+  connect?: unknown
+  release?: unknown
+}): PermissionReadKind {
+  if (typeof q.release === 'function') return 'borrowed'
+  if (typeof q.connect === 'function') return 'pool'
+  return 'query'
+}
+
+function quoteShownStatementTimeout(value: string): string {
+  const trimmed = value.trim()
+  if (/^(0|\d+(\.\d+)?\s*(us|ms|s|min|h)?)$/i.test(trimmed)) return trimmed
+  return '0'
+}
+
+async function restoreBorrowedStatementTimeout(
+  client: Pick<PoolClient, 'query'>,
+  previous: string,
+): Promise<void> {
+  await client.query(`SET LOCAL statement_timeout = '${previous}'`)
+}
+
+async function queryPermissionReadOnBorrowedClient<T extends object>(
+  client: Pick<PoolClient, 'query'>,
   sql: string,
   params: unknown[],
 ): Promise<{ rows: T[]; rowCount: number | null }> {
-  if (typeof pool.connect !== 'function') {
-    return pool.query(sql, params) as Promise<{ rows: T[]; rowCount: number | null }>
+  const shown = await client.query('SHOW statement_timeout') as {
+    rows: Array<{ statement_timeout?: string }>
   }
-  const client = await pool.connect()
+  const previous = quoteShownStatementTimeout(String(shown.rows[0]?.statement_timeout ?? '0'))
+  const sp = `oc_perm_r_${Math.floor(Math.random() * 1e9)}`
+  await client.query(`SAVEPOINT ${sp}`)
+  try {
+    await client.query(`SET LOCAL statement_timeout = ${PERMISSION_PROMPT_READ_TIMEOUT_MS}`)
+    const result = await client.query(sql, params)
+    await client.query(`RELEASE SAVEPOINT ${sp}`)
+    await restoreBorrowedStatementTimeout(client, previous)
+    return result as { rows: T[]; rowCount: number | null }
+  } catch (error) {
+    try { await client.query(`ROLLBACK TO SAVEPOINT ${sp}`) } catch { /* ignore */ }
+    try { await client.query(`RELEASE SAVEPOINT ${sp}`) } catch { /* ignore */ }
+    try { await restoreBorrowedStatementTimeout(client, previous) } catch { /* ignore */ }
+    throw error
+  }
+}
+
+/** Bounded PG read. Own a Pool connection with BEGIN/COMMIT; on a borrowed
+ *  transaction client use a savepoint so a 250ms timeout cannot abort the
+ *  caller's timeline snapshot. Never connect/COMMIT/release a borrowed client. */
+export async function queryPermissionRead<T extends object>(
+  pool: PermissionReadPool | Pick<Pool, 'query'> | Pick<PoolClient, 'query'>,
+  sql: string,
+  params: unknown[],
+): Promise<{ rows: T[]; rowCount: number | null }> {
+  const q = pool as PermissionReadPool
+  const kind = permissionReadKind(q)
+  if (kind === 'query') {
+    return q.query(sql, params) as Promise<{ rows: T[]; rowCount: number | null }>
+  }
+  if (kind === 'borrowed') {
+    return queryPermissionReadOnBorrowedClient(q as Pick<PoolClient, 'query'>, sql, params)
+  }
+  const client = await q.connect!()
+  let destroyed = false
   try {
     await client.query('BEGIN')
     await client.query(`SET LOCAL statement_timeout = ${PERMISSION_PROMPT_READ_TIMEOUT_MS}`)
@@ -564,10 +625,17 @@ export async function queryPermissionRead<T extends object>(
     await client.query('COMMIT')
     return result as { rows: T[]; rowCount: number | null }
   } catch (error) {
-    try { await client.query('ROLLBACK') } catch { /* ignore */ }
+    try {
+      await client.query('ROLLBACK')
+    } catch (rollbackErr) {
+      destroyed = true
+      try {
+        client.release(rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr)))
+      } catch { /* ignore */ }
+    }
     throw error
   } finally {
-    client.release()
+    if (!destroyed) client.release()
   }
 }
 
