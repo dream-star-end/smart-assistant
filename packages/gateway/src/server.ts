@@ -166,7 +166,7 @@ import {
   getMemoryUsageDashboard,
   recordMemoryUsageEvent,
   syncMarketplaceHub,
-  writeAgentsConfig,
+  updateAgentsConfig,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -8542,7 +8542,6 @@ export class Gateway {
     if (req.method === 'POST') {
       // 建 agent 是 mutation 面:必须读/写全量 config(不能用投影视图,否则写回
       // agents.yaml 会把隐藏系统 agent 一并删掉)。保留 id 拒绝仍用 predicate 看全量。
-      const cfg = await readAgentsConfig()
       const body = await this.readJsonBody<Partial<AgentDef>>(req)
       if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
@@ -8552,26 +8551,28 @@ export class Gateway {
         this.sendError(res, 403, 'agent id is reserved')
         return
       }
-      if (cfg.agents.find((a) => a.id === body.id)) {
-        this.sendError(res, 409, 'agent already exists')
-        return
-      }
-      // Inherit provider/permissionMode/cwd from request or sensible defaults
-      const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
-      const agent: AgentDef = {
-        id: body.id,
-        model: body.model ?? this.deps.config.defaults.model,
-        persona: paths.agentClaudeMd(body.id),
-        permissionMode:
-          body.permissionMode ??
-          defaultAgent?.permissionMode ??
-          this.deps.config.defaults.permissionMode,
-        provider: body.provider ?? defaultAgent?.provider,
-        cwd: body.cwd ?? defaultAgent?.cwd,
-        toolsets: body.toolsets,
-      }
-      cfg.agents.push(agent)
-      await writeAgentsConfig(cfg)
+      const { config: cfg, result: agent } = await updateAgentsConfig((cfg) => {
+        if (cfg.agents.find((a) => a.id === body.id)) {
+          return null
+        }
+        // Inherit provider/permissionMode/cwd from request or sensible defaults
+        const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
+        const agent: AgentDef = {
+          id: body.id,
+          model: body.model ?? this.deps.config.defaults.model,
+          persona: paths.agentClaudeMd(body.id),
+          permissionMode:
+            body.permissionMode ??
+            defaultAgent?.permissionMode ??
+            this.deps.config.defaults.permissionMode,
+          provider: body.provider ?? defaultAgent?.provider,
+          cwd: body.cwd ?? defaultAgent?.cwd,
+          toolsets: body.toolsets,
+        }
+        cfg.agents.push(agent)
+        return agent
+      })
+      if (!agent) return this.sendError(res, 409, 'agent already exists')
       this.deps.agentsConfig = cfg
       await mkdir(paths.agentSessionsDir(body.id), { recursive: true })
       // Seed an empty persona file if missing
@@ -8595,43 +8596,46 @@ export class Gateway {
     id: string,
   ): Promise<void> {
     if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
-    const cfg = await readAgentsConfig()
-    const idx = cfg.agents.findIndex((a) => a.id === id)
-    if (idx < 0) return this.sendError(res, 404, 'agent not found')
-    const agent = cfg.agents[idx]
     if (req.method === 'GET') {
+      const cfg = await readAgentsConfig()
+      const agent = cfg.agents.find((a) => a.id === id)
+      if (!agent) return this.sendError(res, 404, 'agent not found')
       this.sendJson(res, 200, { agent })
       return
     }
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<Partial<AgentDef>>(req)
-      if (body.model !== undefined) agent.model = body.model
-      if (body.persona !== undefined) agent.persona = body.persona
-      if (body.cwd !== undefined) agent.cwd = body.cwd
-      if (body.permissionMode !== undefined) agent.permissionMode = body.permissionMode
-      if (body.displayName !== undefined) agent.displayName = body.displayName
-      if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
-      if (body.greeting !== undefined) agent.greeting = body.greeting
-      if (body.provider !== undefined) agent.provider = body.provider
-      if (body.toolsets !== undefined) agent.toolsets = body.toolsets
-      if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
-      cfg.agents[idx] = agent
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.router.reload(cfg)
-      this.sendJson(res, 200, { agent })
-      return
-    }
-    if (req.method === 'DELETE') {
-      if (cfg.default === id) {
-        this.sendError(res, 400, 'cannot delete default agent')
-        return
+    if (req.method === 'PUT' || req.method === 'DELETE') {
+      const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
+      const { config: cfg, result } = await updateAgentsConfig((cfg) => {
+        const idx = cfg.agents.findIndex((a) => a.id === id)
+        if (idx < 0) return { status: 404, body: { error: 'agent not found' } }
+        const agent = cfg.agents[idx]
+        // Provenance comes from the locked server state, never from the request.
+        if (agent.source === 'marketplace') return { status: 409, body: {
+          error: '此 Agent 由 AI 市场管理，请在市场源端修改或卸载。',
+          code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
+        } }
+        if (req.method === 'DELETE') {
+          if (cfg.default === id) return { status: 400, body: { error: 'cannot delete default agent' } }
+          cfg.agents.splice(idx, 1)
+          return { status: 200, body: { ok: true } }
+        }
+        if (body.model !== undefined) agent.model = body.model
+        if (body.persona !== undefined) agent.persona = body.persona
+        if (body.cwd !== undefined) agent.cwd = body.cwd
+        if (body.permissionMode !== undefined) agent.permissionMode = body.permissionMode
+        if (body.displayName !== undefined) agent.displayName = body.displayName
+        if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
+        if (body.greeting !== undefined) agent.greeting = body.greeting
+        if (body.provider !== undefined) agent.provider = body.provider
+        if (body.toolsets !== undefined) agent.toolsets = body.toolsets
+        if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
+        return { status: 200, body: { agent } }
+      })
+      if (result.status === 200) {
+        this.deps.agentsConfig = cfg
+        this.router.reload(cfg)
       }
-      cfg.agents.splice(idx, 1)
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.router.reload(cfg)
-      this.sendJson(res, 200, { ok: true })
+      this.sendJson(res, result.status, result.body)
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -8660,9 +8664,19 @@ export class Gateway {
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<{ text?: string }>(req)
       const text = typeof body.text === 'string' ? body.text : ''
-      await mkdir(dirname(personaPath), { recursive: true })
-      await writeFile(personaPath, text, { mode: 0o600 })
-      this.sendJson(res, 200, { ok: true, path: personaPath })
+      const { result } = await updateAgentsConfig(async (current) => {
+        const currentAgent = current.agents.find((a) => a.id === id)
+        if (!currentAgent) return { status: 404, body: { error: 'agent not found' } }
+        if (currentAgent.source === 'marketplace') return { status: 409, body: {
+          error: '此 Agent 的人格由 AI 市场管理，请在市场源端修改。',
+          code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
+        } }
+        const currentPath = currentAgent.persona ?? paths.agentClaudeMd(id)
+        await mkdir(dirname(currentPath), { recursive: true })
+        await writeFile(currentPath, text, { mode: 0o600 })
+        return { status: 200, body: { ok: true, path: currentPath } }
+      })
+      this.sendJson(res, result.status, result.body)
       return
     }
     this.sendError(res, 405, 'method not allowed')

@@ -12,15 +12,15 @@
  *
  * Lives in @openclaude/storage so the gateway runner (pre-prompt + agent
  * resolution) AND the mcp-memory startup hook can both call it. Both processes
- * may run concurrently → all writes are atomic (temp+rename); writeAgentsConfig
- * is atomic too.
+ * may run concurrently → persona + agents.yaml reconciliation shares the same
+ * cross-process read-modify-write lock as local management edits.
  */
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { BUNDLE_ALLOWED_PREFIXES, validateBundlePath } from '@openclaude/protocol'
 
-import { type AgentDef, type AgentsConfig, readAgentsConfig, writeAgentsConfig } from './config.js'
+import { type AgentDef, updateAgentsConfig } from './config.js'
 import { paths } from './paths.js'
 import { marketplaceArtifactHash } from './skillEmbedding.js'
 import { SKILL_AGENT_SCOPE_FILE, normalizeSkillAgentScope } from './skillStore.js'
@@ -305,50 +305,42 @@ async function reconcileAgents(installed: SyncAgent[]): Promise<void> {
     }
   }
 
-  let cfg: AgentsConfig
   try {
-    cfg = await readAgentsConfig()
-  } catch {
-    return // can't read → leave as-is
-  }
+    await updateAgentsConfig(async (cfg) => {
+      // keep platform/user agents (no source marker); their ids are RESERVED — a market
+      // agent that collides with one is skipped (never overwrite a platform/user agent's
+      // persona or shadow it in agents.yaml). 'main' is always reserved.
+      const nonMarket = (cfg.agents ?? []).filter((a) => a.source !== 'marketplace')
+      const reservedIds = new Set<string>(['main', ...nonMarket.map((a) => a.id)])
 
-  // keep platform/user agents (no source marker); their ids are RESERVED — a market
-  // agent that collides with one is skipped (never overwrite a platform/user agent's
-  // persona or shadow it in agents.yaml). 'main' is always reserved.
-  const nonMarket = (cfg.agents ?? []).filter((a) => a.source !== 'marketplace')
-  const reservedIds = new Set<string>(['main', ...nonMarket.map((a) => a.id)])
-
-  // write persona files (conditional) + build market defs
-  const marketDefs: AgentDef[] = []
-  for (const [slug, m] of desired) {
-    if (reservedIds.has(slug)) continue // collision with a platform/user agent → skip
-    try {
-      const personaPath = paths.agentClaudeMd(slug)
-      const personaText = typeof m.persona === 'string' ? m.persona : ''
-      const cur = await readFile(personaPath, 'utf8').catch(() => null)
-      if (cur !== personaText) {
-        await mkdir(dirname(personaPath), { recursive: true })
-        const tmp = `${personaPath}.tmp-${process.pid}-${randomSuffix()}`
-        await writeFile(tmp, personaText, 'utf8')
-        await rename(tmp, personaPath)
+      // write persona files (conditional) + build market defs
+      const marketDefs: AgentDef[] = []
+      for (const [slug, m] of desired) {
+        if (reservedIds.has(slug)) continue // collision with a platform/user agent → skip
+        try {
+          const personaPath = paths.agentClaudeMd(slug)
+          const personaText = typeof m.persona === 'string' ? m.persona : ''
+          const cur = await readFile(personaPath, 'utf8').catch(() => null)
+          if (cur !== personaText) {
+            await mkdir(dirname(personaPath), { recursive: true })
+            const tmp = `${personaPath}.tmp-${process.pid}-${randomSuffix()}`
+            await writeFile(tmp, personaText, 'utf8')
+            await rename(tmp, personaPath)
+          }
+          marketDefs.push(marketAgentDef(slug, m, personaPath))
+        } catch (e) {
+          // skip this agent; fail-soft(原因进限频日志)
+          const msg = e instanceof Error ? e.message : String(e)
+          warnRateLimited('agent-skip', `agent "${slug}" reconcile failed: ${msg}`)
+        }
       }
-      marketDefs.push(marketAgentDef(slug, m, personaPath))
-    } catch (e) {
-      // skip this agent; fail-soft(原因进限频日志)
-      const msg = e instanceof Error ? e.message : String(e)
-      warnRateLimited('agent-skip', `agent "${slug}" reconcile failed: ${msg}`)
-    }
-  }
 
-  const nextAgents = [...nonMarket, ...marketDefs.sort((a, b) => a.id.localeCompare(b.id))]
+      const nextAgents = [...nonMarket, ...marketDefs.sort((a, b) => a.id.localeCompare(b.id))]
 
-  // only rewrite when the agent set actually changed (avoid mtime churn / write races)
-  if (JSON.stringify(nextAgents) !== JSON.stringify(cfg.agents ?? [])) {
-    try {
-      await writeAgentsConfig({ ...cfg, agents: nextAgents })
-    } catch {
-      /* fail-soft */
-    }
+      cfg.agents = nextAgents
+    })
+  } catch (e) {
+    warnRateLimited('agent-sync', `agent config transaction failed: ${e instanceof Error ? e.message : String(e)}`)
   }
   // (A removed market agent's persona dir is left on disk — harmless: it is no
   //  longer referenced by agents.yaml, so it is never loaded. We do NOT reap dirs

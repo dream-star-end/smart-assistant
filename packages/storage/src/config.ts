@@ -1,7 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { paths } from './paths.js'
+import { acquireKernelFileLock } from './kernelFileLock.js'
 
 // Extra MCP servers injected into a CCB subprocess's --mcp-config.
 // Multi-provider extension point: register new capabilities (vision, search,
@@ -196,12 +197,44 @@ export async function readAgentsConfig(): Promise<AgentsConfig> {
   }
 }
 
+/** Whole-file replacement for bootstrap/import only. Live edits use updateAgentsConfig. */
 export async function writeAgentsConfig(cfg: AgentsConfig): Promise<void> {
+  const lock = await acquireKernelFileLock(`${paths.agentsYaml}.lock`)
+  try {
+    await writeAgentsConfigUnlocked(cfg)
+  } finally {
+    await lock.release()
+  }
+}
+
+/**
+ * One cross-process transaction for API/CLI edits and marketplace projection.
+ * Lock BEFORE reading; locking only rename still loses concurrent local edits.
+ * The callback may edit cfg in place. Do not nest a config writer inside it.
+ * Persona writes coupled to agent ownership must also happen in this callback.
+ */
+export async function updateAgentsConfig<T>(
+  update: (cfg: AgentsConfig) => T | Promise<T>,
+): Promise<{ config: AgentsConfig; result: T }> {
+  const lock = await acquireKernelFileLock(`${paths.agentsYaml}.lock`)
+  try {
+    const config = await readAgentsConfig()
+    const before = JSON.stringify(config)
+    const result = await update(config)
+    if (JSON.stringify(config) !== before) await writeAgentsConfigUnlocked(config)
+    return { config, result }
+  } finally {
+    await lock.release()
+  }
+}
+
+async function writeAgentsConfigUnlocked(cfg: AgentsConfig): Promise<void> {
   await mkdir(dirname(paths.agentsYaml), { recursive: true })
-  // Atomic temp+rename: the in-container marketplace sync (mcp-memory process) and
-  // the gateway can both write agents.yaml; a torn read would break agent
-  // resolution. rename is atomic on the same fs → readers always see a whole file.
   const tmp = `${paths.agentsYaml}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
-  await writeFile(tmp, stringifyYaml(cfg), { mode: 0o600 })
-  await rename(tmp, paths.agentsYaml)
+  try {
+    await writeFile(tmp, stringifyYaml(cfg), { mode: 0o600 })
+    await rename(tmp, paths.agentsYaml)
+  } finally {
+    await rm(tmp, { force: true })
+  }
 }
