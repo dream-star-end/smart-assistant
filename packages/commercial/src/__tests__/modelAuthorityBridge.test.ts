@@ -54,6 +54,7 @@ import {
   type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
+import { buildAgentModelSnapshot } from "../ws/agentModelAuthority.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
@@ -213,6 +214,7 @@ async function startRig(opts: {
   /** 容器是否 attest(false = 旧 release / 旧 env,不广播 capability)。 */
   attest: "yes" | "no-capability" | "silent";
   authorityOn?: boolean;
+  loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   attestTimeoutMs?: number;
   fenceFails?: boolean;
   /** 容器 attest 前的人为延迟(测缓冲与重放)。 */
@@ -464,6 +466,7 @@ async function startRig(opts: {
 
   const bridge = createUserChatBridge({
     jwtSecret: JWT_SECRET,
+    ...(opts.loadAgentModelResolver ? { loadAgentModelResolver: opts.loadAgentModelResolver } : {}),
     resolveContainerEndpoint: async () => ({
       host: "127.0.0.1",
       port: containerPort,
@@ -2213,4 +2216,27 @@ describe("M7 drain 窗口:有 admitted dispatch → max(billing, dispatch)（非
       await stopRig(rig);
     }
   });
+});
+
+
+test("OCV5-179: inferred marketplace auto is signed AND forwarded as a concrete model", async () => {
+  // A stale container defaults.model must never decide this auto turn.
+  const map = buildAgentModelSnapshot(
+    [{ slug: "auto-agent", rawManifest: JSON.stringify({ model: "auto" }) } as never], [],
+    new Map([["main", { model: "glm-5.2", provider: "zhipu" }]]),
+  );
+  const rig = await startRig({ attest: "yes", loadAgentModelResolver: async () => id => map.get(id) ?? null });
+  try {
+    const ws = await openClient(rig.port);
+    ws.send(inboundFrame({ agentId: "auto-agent", model: undefined }));
+    await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
+    const f = firstInbound(rig.containerSeen);
+    const bundle = f[MODEL_AUTHORITY_FIELD] as { authority: string; lease: string };
+    const authority = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+    assert.equal(authority.canonicalModel, "glm-5.2");
+    assert.equal(f.model, "glm-5.2", "concrete frame model outranks container agent:auto/defaults.model");
+    ws.close();
+  } finally {
+    await stopRig(rig);
+  }
 });

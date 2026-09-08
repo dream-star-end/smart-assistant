@@ -1,5 +1,6 @@
 export * from './paths.js'
 export * from './config.js'
+export * from './identityCompatAssets.js'
 export * from './jsonl.js'
 export * from './credentials.js'
 export * from './memoryShared.js'

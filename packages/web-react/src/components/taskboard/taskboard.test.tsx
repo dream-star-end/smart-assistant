@@ -762,7 +762,7 @@ describe('TicketDrawer 详情', () => {
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
   })
 
-  test('run 明细在成本旁显示不精确提示', async () => {
+  test('run 明细不把有用量但金额为零展示成免费', async () => {
     const ticket = sampleTicket()
     const run = sampleRun({
       status: 'succeeded',
@@ -778,7 +778,8 @@ describe('TicketDrawer 详情', () => {
     await act(async () => {
       fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
     })
-    expect(await screen.findByText(/\$0\.0000（不精确）/)).toBeInTheDocument()
+    expect(await screen.findByText(/有用量但无金额/)).toBeInTheDocument()
+    expect(screen.queryByText(/\$0\.0000/)).not.toBeInTheDocument()
   })
 })
 

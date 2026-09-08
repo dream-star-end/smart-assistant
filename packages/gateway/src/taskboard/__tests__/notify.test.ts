@@ -396,7 +396,7 @@ describe('每日简报', () => {
     const copy = formatDigestMessage(stats)
     assert.match(copy.title, /每日简报/)
     assert.match(copy.bodyMd, /待我确认 1/)
-    assert.match(copy.bodyMd, /成本未统计/)
+    assert.match(copy.bodyMd, /参考费用未记录/)
 
     const [y, m, d] = day.split('-').map(Number)
     const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))

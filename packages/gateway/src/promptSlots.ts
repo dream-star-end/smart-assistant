@@ -51,6 +51,9 @@ import {
   listPinnedProjectAssetsForSession,
   type ProjectAsset,
   stripProjectAssetControlChars,
+  assertIdentityCompatExecution,
+  type IdentityCompatAssets,
+  type SkillStoreCompatOptions,
 } from '@openclaude/storage'
 import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
@@ -288,6 +291,17 @@ export interface PromptSlotContext {
    * false = 整段不注入。
    */
   delegateModelCatalog?: DelegateModelSectionInput | null | false
+  /**
+   * A4 identity-compat assets: the master-resolver-validated profile resolved
+   * into local assets by resolveIdentityCompatAssets() at a safe boundary.
+   * Presence switches THIS context's SOUL assembly and skill store to the
+   * registered compat projection (persona decided by the profile, not by
+   * requestedId; private skill assets from the registered legacy namespace).
+   * Absent = pre-A4 behavior, byte-for-byte — normal and hermetic default
+   * paths are unchanged. Structural conflicts throw (fail-closed), they are
+   * never silently downgraded to a single-source persona.
+   */
+  identityCompat?: IdentityCompatAssets
 }
 
 export interface PromptSlot {
@@ -373,14 +387,26 @@ function extractUserAlwaysBlock(text: string): string | null {
   return body.trim() || null
 }
 
-function buildPromptSkillStore(agentId: string, projectId?: string | null): SkillStore {
-  if (projectId) return buildRunSkillStore({ agentId, projectId })
-  return buildAgentSkillStore(agentId)
+function buildPromptSkillStore(
+  agentId: string,
+  projectId?: string | null,
+  compat?: SkillStoreCompatOptions,
+): SkillStore {
+  if (projectId) return buildRunSkillStore({ agentId, projectId, compat })
+  return buildAgentSkillStore(agentId, compat)
 }
 
 // ── Individual slot builders ──
 
 export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
+  // A4 identity-compat: the profile (not requestedId) decides the persona. Both
+  // request entries share the same resolved assets → identical SOUL bytes; an
+  // unregistered SOUL.md can never preempt (resolver + fresh buildSoul reject),
+  // and wiring mistakes (agentId ≠ canonical) throw instead of overlaying.
+  if (ctx.identityCompat) {
+    assertIdentityCompatExecution(ctx.identityCompat, ctx.agentId)
+    return { name: 'SOUL', content: ctx.identityCompat.buildSoul().content }
+  }
   // Try SOUL.md first, then CLAUDE.md
   const soulPath = paths.agentDir(ctx.agentId) ? `${paths.agentDir(ctx.agentId)}/SOUL.md` : null
   let raw = ''
@@ -730,12 +756,19 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   if (ctx.provider === 'cursor') {
     return { name: 'SKILLS', content: CURSOR_SKILLS_COMPACT }
   }
+  // A4 identity-compat: explicit opt-in only — the store keeps canonical as the
+  // authorization identity and reads/writes private skills from the registered
+  // legacy namespace. Structural conflicts throw (fail-closed).
+  const compat: SkillStoreCompatOptions | undefined = ctx.identityCompat
+    ? { profile: ctx.identityCompat.profile }
+    : undefined
   const frozenSkills = ctx.frozenProjectContext?.skills
   const skillStore = frozenSkills
-    ? buildAgentSkillStore(ctx.agentId)
+    ? buildAgentSkillStore(ctx.agentId, compat)
     : buildPromptSkillStore(
         ctx.agentId,
         ctx.projectId ?? ctx.projectContext?.boardProjectId,
+        compat,
       )
   let skillList = await skillStore.list()
   if (frozenSkills) {

@@ -57,3 +57,47 @@ describe('buildAgentModelSnapshot', () => {
     assert.equal(map.has('broken-json'), false)
   })
 })
+
+const compatProfile = {
+  profileId: 'selfhost-u3-butler-v1', legacyAgentId: 'butler', canonicalAgentId: 'personal-butler',
+  localPersonaPath: 'agents/butler/CLAUDE.md', localSkillStorageId: 'butler',
+}
+
+describe('registered identity model projection', () => {
+  it('canonical model owns the registered legacy id, never the local legacy override', () => {
+    const projection = { schema: 1 as const, userId: '3', profiles: [{ profile: compatProfile, readiness: 'ready' as const }] }
+    const map = buildAgentModelSnapshot([agent('personal-butler', 'gpt-6-astra'), agent('butler', 'glm-5.3')], [], undefined, projection)
+    assert.equal(map.get('butler'), 'gpt-6-astra')
+    assert.equal(map.get('personal-butler'), 'gpt-6-astra')
+  })
+
+  it('an unavailable registered namespace cannot revive through legacy or seed', () => {
+    const projection = { schema: 1 as const, userId: '3', profiles: [{ profile: compatProfile, readiness: 'unavailable' as const }] }
+    const map = buildAgentModelSnapshot([agent('butler', 'glm-5.3')], [], undefined, projection)
+    assert.equal(map.has('butler'), false)
+    assert.equal(map.has('personal-butler'), false)
+  })
+
+  it('registered execution keeps the canonical marketplace model even with a colliding seed', () => {
+    const projection = { schema: 1 as const, userId: '3', profiles: [{ profile: compatProfile, readiness: 'ready' as const }] }
+    const seed = new Map([
+      ['main', { model: 'revision-main', provider: 'fixture' }],
+      ['personal-butler', { model: 'seed-decoy', provider: 'fixture' }],
+      ['butler', { model: 'legacy-seed-decoy', provider: 'fixture' }],
+    ])
+    const map = buildAgentModelSnapshot([agent('personal-butler', AGENT_MODEL_AUTO)], [], seed, projection)
+    assert.equal(map.get('butler'), 'revision-main')
+    assert.equal(map.get('personal-butler'), 'revision-main')
+  })
+
+  it('invalid canonical manifest never falls back to a colliding seed model', () => {
+    const projection = { schema: 1 as const, userId: '3', profiles: [{ profile: compatProfile, readiness: 'ready' as const }] }
+    const seed = new Map([
+      ['main', { model: 'revision-main', provider: 'fixture' }],
+      ['personal-butler', { model: 'seed-decoy', provider: 'fixture' }],
+    ])
+    const map = buildAgentModelSnapshot([agent('personal-butler', null)], [], seed, projection)
+    assert.equal(map.has('butler'), false)
+    assert.equal(map.has('personal-butler'), false)
+  })
+})
