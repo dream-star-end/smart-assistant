@@ -1,10 +1,11 @@
+import { formatRecordedCostTotal } from '@openclaude/protocol'
 import { Settings } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
   type TaskboardSettings,
   type TaskboardSettingsSnapshot,
-  formatRunCostUsd,
+  formatCostMoneyLine,
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
@@ -143,7 +144,9 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
 
   const usage = snap?.usage
   const costLimit = draft.maxCostPerDayUsd
-  const costToday = usage ? formatRunCostUsd(usage.costTodayUsd) : null
+  const costToday = usage ? usage.referenceCostsToday
+    ? formatCostMoneyLine(usage.referenceCostsToday)
+    : formatRecordedCostTotal(usage.costTodayUsd) : null
 
   return (
     <>
@@ -178,7 +181,7 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
                 <p className="rounded-lg bg-hover px-3 py-2 text-meta text-muted">
                   今天已跑 {usage.runsToday} / {draft.maxRunsPerDay}，进行中 {usage.activeRuns} /{' '}
                   {draft.maxConcurrentRuns}
-                  {costToday ? `，成本 ${costToday}` : ''}
+                  {costToday ? `，${costToday}` : ''}
                   {costLimit == null ? ' / 不限' : ` / $${costLimit}`}
                 </p>
               )}

@@ -1,3 +1,4 @@
+import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol'
 /**
  * Taskboard 前端类型 + `/api/board` 客户端。
  *
@@ -485,6 +486,7 @@ export interface TaskboardSettings {
 export interface TaskboardUsage {
   runsToday: number
   costTodayUsd: number
+  referenceCostsToday?: CostTotals
   activeRuns: number
   /** 今日 token>0 且 cost 为 0/null 的 run 数。美元顶开启时用于失败关闭。 */
   unpricedRunsToday?: number
@@ -528,6 +530,8 @@ export interface CostSlice {
 }
 
 export interface CostTotals extends CostSlice {
+  /** Optional for older servers; absent composition is unverified, never exact. */
+  amounts?: RecordedCostAmounts
   priced: CostSlice
   unpriced: CostSlice
   unknownRunCount: number
@@ -1012,13 +1016,13 @@ export const UNPRICED_ONLY_COPY = '本区间全部无单价，仅有 token 数�
  * full 直接给金额；partial 金额后附缺单价说明；none 返回 null。
  */
 export function formatCostMoneyLine(totals: CostTotals): string | null {
-  if (totals.coverage === 'none') return null
+  if (totals.coverage === 'none') return totals.runCount > 0 ? '参考费用未记录（不代表免费）' : null
   if (totals.coverage === 'unpriced_only') return UNPRICED_ONLY_COPY
-  const amount = formatRunCostUsd(totals.costUsd) ?? '$0.0000'
-  if (totals.coverage === 'partial') {
-    return `${amount}（${formatUnpricedNote(totals.unpriced)}）`
-  }
-  return amount
+  const amount = formatRecordedCostTotal(totals.costUsd, totals.amounts)
+  const notes: string[] = []
+  if (totals.unpriced.runCount > 0) notes.push(formatUnpricedNote(totals.unpriced))
+  if (totals.unknownRunCount > 0) notes.push(`${formatCount(totals.unknownRunCount)} 次费用未记录`)
+  return notes.length ? `${amount}（${notes.join('；')}）` : amount
 }
 
 export function emptyCostSlice(): CostSlice {
@@ -1582,4 +1586,11 @@ export interface ProjectMemoryItem {
   sourceSession?: string | null
   sourceTicket?: string | null
   supersedes?: string | null
+}
+
+
+export function formatRunReferenceCost(run: Pick<TicketRun, 'tokensIn' | 'tokensOut' | 'costUsd' | 'costImprecise'>): string {
+  const kind = classifyRecordedRunCost(run.tokensIn, run.tokensOut, run.costUsd, run.costImprecise)
+  if (kind === 'unpriced' || kind === 'unknown') return RECORDED_COST_LABELS[kind]
+  return `参考费用 ${formatRunCostUsd(run.costUsd)}（${RECORDED_COST_LABELS[kind]}）`
 }

@@ -218,7 +218,7 @@ export function CostStatsView({
           )}
           <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
             <StatCard
-              label="有单价"
+              label="有记录金额"
               value={formatCount(stats.totals.priced.runCount)}
               hint={formatTokenUsage(stats.totals.priced.tokensIn, stats.totals.priced.tokensOut)}
             />

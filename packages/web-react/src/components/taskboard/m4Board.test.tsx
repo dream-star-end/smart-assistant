@@ -202,7 +202,7 @@ describe('成本覆盖文案', () => {
       priced: { runCount: 1, tokensIn: 100, tokensOut: 20, costUsd: 0.2 },
       unpriced: { runCount: 1, tokensIn: 97419, tokensOut: 8532, costUsd: 0 },
     })
-    expect(formatCostMoneyLine(partial)).toBe('$0.2000（另有 1 次共 105,951 token 无单价，未计入）')
+    expect(formatCostMoneyLine(partial)).toBe('参考费用 $0.2000（来源未证实）（另有 1 次共 105,951 token 无单价，未计入）')
 
     const unpricedOnly = sampleTotals({
       coverage: 'unpriced_only',
@@ -270,7 +270,7 @@ describe('成本统计 API 与界面', () => {
       '106,071 token（入 97,519 / 出 8,552）',
     )
     expect(screen.getByTestId('cost-coverage-money')).toHaveTextContent(
-      '$0.2000（另有 1 次共 105,951 token 无单价，未计入）',
+      '参考费用 $0.2000（来源未证实）（另有 1 次共 105,951 token 无单价，未计入）',
     )
     expect(screen.getByTestId('cost-coverage')).toHaveAttribute('data-coverage', 'partial')
   })

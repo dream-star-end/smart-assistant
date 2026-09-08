@@ -9,7 +9,7 @@ import {
   assigneeLabel,
   formatActivityLine,
   formatDurationMs,
-  formatRunCostUsd,
+  formatRunReferenceCost,
   isLongComment,
   partitionTimeline,
   skipReasonLabel,
@@ -92,8 +92,7 @@ function SystemRun({
   stageName: string | null | undefined
 }) {
   const duration = formatDurationMs(run.durationMs)
-  const cost = formatRunCostUsd(run.costUsd)
-  const costText = `${cost ?? '成本未记录'}${run.costImprecise ? '（不精确）' : ''}`
+  const costText = formatRunReferenceCost(run)
   const skip = skipReasonLabel(run.skipReason)
   const tokens =
     run.tokensIn == null && run.tokensOut == null
