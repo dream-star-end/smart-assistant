@@ -164,7 +164,7 @@ describe("recordApiKeyMessageAudit", () => {
 
 describe("listApiKeyMessageAudit", () => {
   test("user-scoped, key filter double-checks ownership, cursor + errors_only + limit clamp, next_before", async () => {
-    let seen: { sql: string; params: unknown[] } | null = null;
+    const capture: { seen: { sql: string; params: unknown[] } | null } = { seen: null };
     const mk = (n: number) => Array.from({ length: n }, (_, i) => ({
       id: String(100 - i), created_at: new Date("2026-09-08T16:35:04Z"), request_id: `r${i}`, api_key_id: "14",
       requested_model: "fable-5.1", model: "cursor-fable-5.1-high", effort: "high", effort_source: "request",
@@ -173,11 +173,11 @@ describe("listApiKeyMessageAudit", () => {
       error_message: "Provider Error (400): x", duration_ms: 100, input_tokens: "0", output_tokens: "0",
       cache_read_tokens: null, cache_write_tokens: null, client_user_agent: null,
     }));
-    const pool = { query: async (sql: string, params: unknown[]) => { seen = { sql, params }; return { rows: mk(3) }; } };
+    const pool = { query: async (sql: string, params: unknown[]) => { capture.seen = { sql, params }; return { rows: mk(3) }; } };
 
     const page = await listApiKeyMessageAudit(pool, "3", { apiKeyId: "14", beforeId: "200", limit: 2, errorsOnly: true });
-    assert.ok(seen);
-    const { sql, params } = seen!;
+    assert.ok(capture.seen);
+    const { sql, params } = capture.seen!;
     assert.match(sql, /a\.user_id = \$1/);
     assert.match(sql, /a\.api_key_id = \$2 AND EXISTS \(SELECT 1 FROM user_api_keys k WHERE k\.id = a\.api_key_id AND k\.user_id = \$1\)/);
     assert.match(sql, /a\.id < \$3/);
@@ -191,10 +191,10 @@ describe("listApiKeyMessageAudit", () => {
     assert.equal(page.entries[0]!.duration_ms, 100);
 
     // No filters, small result → next_before null; limit clamped to max.
-    const pool2 = { query: async (sql: string, params: unknown[]) => { seen = { sql, params }; return { rows: mk(1) }; } };
+    const pool2 = { query: async (sql: string, params: unknown[]) => { capture.seen = { sql, params }; return { rows: mk(1) }; } };
     const p2 = await listApiKeyMessageAudit(pool2, 3n, { apiKeyId: null, beforeId: null, limit: 10_000, errorsOnly: false });
     assert.equal(p2.next_before, null);
-    assert.doesNotMatch(seen!.sql, /api_key_id = \$|a\.id <|status = 'error'/);
-    assert.deepEqual(seen!.params, ["3", AUDIT_LIST_MAX_LIMIT + 1]);
+    assert.doesNotMatch(capture.seen!.sql, /api_key_id = \$|a\.id <|status = 'error'/);
+    assert.deepEqual(capture.seen!.params, ["3", AUDIT_LIST_MAX_LIMIT + 1]);
   });
 });
