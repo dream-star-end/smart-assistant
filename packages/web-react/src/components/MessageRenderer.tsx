@@ -1251,7 +1251,14 @@ export function MessageList({
     const scroller = scrollParent;
     if (!scroller) return;
     const cancelIfFindPending = (event?: Event) => {
-      if (event && eventInFindToolbar(scroller, event.target)) return;
+      // Find-chrome edit/button/tap may keep the generation; real wheel/touchmove
+      // must invalidate even when event.target is inside the toolbar.
+      if (
+        event
+        && event.type !== "wheel"
+        && event.type !== "touchmove"
+        && eventInFindToolbar(scroller, event.target)
+      ) return;
       if (findPinRef.current) bumpFindGeneration();
     };
     const onPointerDown = (event: PointerEvent) => {
@@ -2213,10 +2220,8 @@ export function MessageList({
       <div
         className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2"
         onKeyDown={stopFindKeys}
-        onWheel={stopFindKeys}
         onPointerDown={stopFindKeys}
         onTouchStart={stopFindKeys}
-        onTouchMove={stopFindKeys}
       >
         <Input
           aria-label="在会话中查找"

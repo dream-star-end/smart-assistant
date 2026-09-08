@@ -233,6 +233,135 @@ async function waitPending(page, key, timeout = 4000) {
   return handle.jsonValue();
 }
 
+async function hoverFindChrome(page, where) {
+  const point = await findChromePoint(page, where);
+  await page.mouse.move(point.x, point.y);
+}
+
+async function findChromePoint(page, where) {
+  const point = await page.evaluate((w) => {
+    const input = document.querySelector("[aria-label='在会话中查找']");
+    const scroller = document.querySelector("[data-testid=find-chat-scroll]");
+    if (w === "input" && input instanceof HTMLElement) {
+      const r = input.getBoundingClientRect();
+      return { x: r.x + Math.min(40, Math.max(8, r.width / 2)), y: r.y + r.height / 2 };
+    }
+    let node = input instanceof HTMLElement ? input : null;
+    while (node && node !== scroller) {
+      const pos = getComputedStyle(node).position;
+      if (pos === "sticky" || pos === "fixed") break;
+      node = node.parentElement;
+    }
+    const r = node?.getBoundingClientRect();
+    if (!r) return null;
+    return { x: r.x + 8, y: r.y + Math.max(4, r.height / 2) };
+  }, where);
+  if (!point) throw new Error(`find chrome point missing for ${where}`);
+  return point;
+}
+
+async function installGestureObserver(page) {
+  await page.evaluate(() => {
+    const s = document.querySelector("[data-testid=find-chat-scroll]");
+    if (!s || window.__findGestureObserverInstalled) return;
+    window.__findGestureEvents = [];
+    window.__findGestureObserverInstalled = true;
+    const describeTarget = (t) => {
+      if (!(t instanceof Element)) return "";
+      return t.getAttribute("aria-label") || t.getAttribute("data-testid") || t.tagName;
+    };
+    const inToolbar = (t) => {
+      const input = document.querySelector("[aria-label='在会话中查找']");
+      let node = input instanceof HTMLElement ? input : null;
+      while (node && node !== s) {
+        const pos = getComputedStyle(node).position;
+        if (pos === "sticky" || pos === "fixed") break;
+        node = node.parentElement;
+      }
+      return !!(node && t instanceof Node && node.contains(t));
+    };
+    const onEvt = (e) => {
+      window.__findGestureEvents.push({
+        type: e.type,
+        trusted: e.isTrusted,
+        deltaY: e.type === "wheel" ? e.deltaY : undefined,
+        target: describeTarget(e.target),
+        inToolbar: inToolbar(e.target),
+        pin: document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") || "",
+        top: s.scrollTop,
+        fence: window.__findPage.wheelFence,
+      });
+    };
+    s.addEventListener("wheel", onEvt, { passive: true });
+    s.addEventListener("touchmove", onEvt, { passive: true });
+  });
+}
+
+async function takeGestureEvents(page) {
+  return page.evaluate(() => {
+    const rows = window.__findGestureEvents || [];
+    window.__findGestureEvents = [];
+    return rows;
+  });
+}
+
+/** Pending pin without re-holding the synthetic fence. */
+async function waitPendingNatural(page, key, timeout = 4000) {
+  const handle = await page.waitForFunction((k) => {
+    const scrollerEl = document.querySelector("[data-testid=find-chat-scroll]");
+    const list = document.querySelector("[data-testid=timeline-short-list]");
+    const toolbar = document.querySelector("[aria-label='在会话中查找']")?.closest("div");
+    const current = document.querySelector("[data-find-current]");
+    const pin = list?.getAttribute("data-find-pin") || "";
+    if (pin !== k) return false;
+    const row = current?.getBoundingClientRect();
+    const view = scrollerEl?.getBoundingClientRect();
+    let toolbarEl = toolbar instanceof HTMLElement ? toolbar : null;
+    if (scrollerEl && toolbarEl) {
+      let node = toolbarEl;
+      while (node && node !== scrollerEl) {
+        const pos = getComputedStyle(node).position;
+        if (pos === "sticky" || pos === "fixed") {
+          toolbarEl = node;
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    const stickyBar = toolbarEl?.getBoundingClientRect();
+    const viewTop = stickyBar && stickyBar.height > 0 ? stickyBar.bottom : (view?.top ?? 0);
+    const visible = !!(row && view && row.height > 0 && row.bottom > viewTop + 1 && row.top >= viewTop - 1 && row.top < view.bottom - 1);
+    if (visible) return false;
+    return {
+      key: current?.getAttribute("data-chat-virtual-key") ?? null,
+      text: current?.textContent ?? "",
+      findPin: pin,
+      visible,
+      following: window.__findPage.following,
+      wheelFence: window.__findPage.wheelFence,
+      scrollTop: scrollerEl?.scrollTop ?? -1,
+      hit: document.body.innerText.match(/\d+\/\d+|无匹配/)?.[0] ?? null,
+    };
+  }, key, { timeout });
+  return handle.jsonValue();
+}
+
+async function dispatchTouchMove(page, point) {
+  const client = await page.context().newCDPSession(page);
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x: point.x, y: point.y, id: 1 }],
+  });
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x: point.x, y: point.y - 120, id: 1 }],
+  });
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchEnd",
+    touchPoints: [],
+  });
+}
+
 test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)", { timeout: 420_000 }, async (t) => {
   if (process.env.OC_FIND_ONLY) {
     const rows = [];
@@ -327,6 +456,99 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         await page.waitForTimeout(200);
         await page.evaluate(() => { window.__findPage.peakMounted = 0; });
         return { context, page, errors };
+      }
+
+      async function runToolbarCancel(page, errors, rows, events, where, gesture) {
+        const pendingId = `toolbar-${where}-${gesture}-pending`;
+        const cancelId = `toolbar-${where}-${gesture}-cancel`;
+        const typed = await page.getByRole("textbox", { name: "在会话中查找" }).inputValue();
+        if (typed !== "FIND_NEEDLE_MID") {
+          const box = page.getByRole("textbox", { name: "在会话中查找" });
+          await box.fill("");
+          await typeNeedle(page, "FIND_NEEDLE_MID");
+          events.keys += 15;
+        }
+        await waitFindReady(page, "1/1");
+        await installGestureObserver(page);
+        const wantType = gesture === "wheel" ? "wheel" : "touchmove";
+        let pending = null;
+        let ev = null;
+        let gest = [];
+        for (let attempt = 0; attempt < 4 && !ev; attempt += 1) {
+          await page.evaluate(() => {
+            const el = document.querySelector("[data-testid=find-chat-scroll]");
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+          await page.waitForTimeout(40);
+          await takeGestureEvents(page);
+          const point = await findChromePoint(page, where);
+          await page.mouse.move(point.x, point.y);
+          await page.mouse.wheel(0, -120);
+          events.wheels = (events.wheels || 0) + 1;
+          await page.keyboard.press("Enter");
+          events.enters = (events.enters || 0) + 1;
+          pending = await snapshot(page);
+          if (!(pending.findPin === "m250" && pending.visible !== true && pending.following === false && pending.wheelFence === true)) continue;
+          if (gesture === "wheel") {
+            await page.mouse.wheel(0, -240);
+            events.wheels += 1;
+          } else {
+            await dispatchTouchMove(page, point);
+            events.touchmoves = (events.touchmoves || 0) + 1;
+          }
+          gest = await takeGestureEvents(page);
+          ev = [...gest].reverse().find((e) =>
+            e.type === wantType
+            && e.trusted === true
+            && e.inToolbar === true
+            && e.pin === "m250"
+            && Math.abs((e.top ?? 0) - pending.scrollTop) < 400) || null;
+        }
+        pending = pending || await snapshot(page);
+        pending.pageErrors = errors.length;
+        const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
+        record(rows, pendingId, { findPin: "m250", visible: false, following: false }, pending, events, pendingOk,
+          pendingOk ? "" : `pending pin=${pending.findPin} visible=${pending.visible} fence=${pending.wheelFence}`,
+          "pending-positive");
+        assert.equal(pending.findPin, "m250");
+        assert.equal(pending.visible, false);
+        const evOk = !!(ev && ev.trusted === true && ev.inToolbar === true && ev.pin === "m250");
+        if (evOk) {
+          await page.waitForFunction(() =>
+            document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === "",
+          null, { timeout: 4000 });
+        }
+        const topAtEvent = typeof ev?.top === "number" ? ev.top : pending.scrollTop;
+        await page.waitForFunction(() => window.__findPage.wheelFence === false, null, { timeout: 4000 }).catch(() => {});
+        let jumped = false;
+        let last = await snapshot(page);
+        for (let i = 0; i < 8; i += 1) {
+          await page.waitForTimeout(32);
+          last = await snapshot(page);
+          if (last.key === "m250" && last.visible === true) jumped = true;
+        }
+        last.pageErrors = errors.length;
+        last.stable = !jumped;
+        const cancelOk = last.findPin === "" && !jumped && !(last.key === "m250" && last.visible) && evOk;
+        record(rows, cancelId, {
+          findPin: "", visible: false, trusted: true, inToolbar: true, pinAtEvent: "m250",
+        }, last, {
+          ...events,
+          trusted: ev?.trusted ?? null,
+          target: ev?.target ?? null,
+          pinAtEvent: ev?.pin ?? null,
+          inToolbar: ev?.inToolbar ?? null,
+          fenceAtEvent: ev?.fence ?? null,
+          topAtEvent,
+          topAfterFence: last.scrollTop,
+          rejumpPx: (last.scrollTop ?? 0) - topAtEvent,
+        }, cancelOk,
+          cancelOk ? "" : `rejump pin=${last.findPin} visible=${last.visible} key=${last.key} trusted=${ev?.trusted} target=${ev?.target} pinAt=${ev?.pin} inToolbar=${ev?.inToolbar} jump=${(last.scrollTop ?? 0) - topAtEvent}`,
+          "after-toolbar-gesture");
+        assert.equal(last.findPin, "");
+        assert.equal(jumped, false, `old find rejumps after toolbar ${where} ${gesture}`);
+        assert.equal(evOk, true, `toolbar ${where} ${gesture} missing trusted in-toolbar event at pin`);
+        assert.deepEqual(errors, []);
       }
 
       await t.test("tail-320-m0 keyboard.type then one click", async () => {
@@ -602,6 +824,54 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
+      await t.test("toolbar input/blank real wheel cancels pending", async () => {
+        let firstError = null;
+        for (const where of ["input", "blank"]) {
+          const { context, page, errors } = await openPage("midtail");
+          const events = { clicks: 0, keys: 0, wheels: 0, enters: 0 };
+          try {
+            await runToolbarCancel(page, errors, rows, events, where, "wheel");
+          } catch (error) {
+            firstError = firstError || error;
+            for (const scene of [`toolbar-${where}-wheel-pending`, `toolbar-${where}-wheel-cancel`]) {
+              if (!rows.some((row) => row.contractId === scene)) {
+                const failed = await snapshot(page).catch(() => ({ error: error.message }));
+                failed.pageErrors = errors.length;
+                failed.error = error.message;
+                record(rows, scene, { findPin: "" }, failed, events, false, error.message, "uncaught");
+              }
+            }
+          } finally {
+            await context.close();
+          }
+        }
+        if (firstError) throw firstError;
+      });
+
+      await t.test("toolbar input/blank real touchmove cancels pending", async () => {
+        let firstError = null;
+        for (const where of ["input", "blank"]) {
+          const { context, page, errors } = await openPage("midtail", true);
+          const events = { clicks: 0, keys: 0, wheels: 0, touchmoves: 0, enters: 0 };
+          try {
+            await runToolbarCancel(page, errors, rows, events, where, "touchmove");
+          } catch (error) {
+            firstError = firstError || error;
+            for (const scene of [`toolbar-${where}-touchmove-pending`, `toolbar-${where}-touchmove-cancel`]) {
+              if (!rows.some((row) => row.contractId === scene)) {
+                const failed = await snapshot(page).catch(() => ({ error: error.message }));
+                failed.pageErrors = errors.length;
+                failed.error = error.message;
+                record(rows, scene, { findPin: "" }, failed, events, false, error.message, "uncaught");
+              }
+            }
+          } finally {
+            await context.close();
+          }
+        }
+        if (firstError) throw firstError;
+      });
+
       await t.test("same-session same-id same-length replace does not keep old pin", async () => {
         const { context, page, errors } = await openPage("tail");
         const events = { clicks: 0, keys: 0, replaces: 0 };
@@ -609,26 +879,51 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           const session = await page.getByTestId("session").textContent();
           await typeNeedle(page, "FIND_NEEDLE_A");
           events.keys += 13;
+          await holdFence(page);
           await page.getByRole("button", { name: "下一处" }).click();
           events.clicks += 1;
-          await waitLocated(page, "m0");
-          const located = await snapshot(page);
-          assert.ok(located.text.includes("FIND_NEEDLE_A"));
-          const scrollBefore = located.scrollTop;
+          let pending;
+          try {
+            pending = await waitPending(page, "m0");
+          } catch (error) {
+            pending = await snapshot(page);
+            pending.pageErrors = errors.length;
+            pending.error = error.message;
+            record(rows, "same-session-replace-drops-pin", {
+              sessionId: session, findPin: "m0", visible: false, needle: "FIND_NEEDLE_B",
+            }, pending, events, false, error.message, "wait-pending");
+            throw error;
+          }
+          pending.pageErrors = errors.length;
+          assert.equal(pending.findPin, "m0");
+          assert.equal(pending.visible, false);
+          const scrollBefore = pending.scrollTop;
           await page.evaluate(() => window.__findPage.replaceNeedle("FIND_NEEDLE_B"));
           events.replaces += 1;
           await page.waitForFunction(() => document.querySelector("[data-testid=needle]")?.textContent === "FIND_NEEDLE_B");
+          await page.waitForFunction(() =>
+            document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === "",
+          null, { timeout: 4000 });
           assert.equal(await page.getByTestId("session").textContent(), session);
-          const afterReplace = await snapshot(page);
+          let afterReplace = await snapshot(page);
+          for (let i = 0; i < 6; i += 1) {
+            await page.waitForTimeout(32);
+            afterReplace = await snapshot(page);
+          }
           afterReplace.pageErrors = errors.length;
+          const noRejump = afterReplace.findPin === "" && !(afterReplace.key === "m0" && afterReplace.visible);
           record(rows, "same-session-replace-drops-pin", {
-            sessionId: session, findPin: "", needle: "FIND_NEEDLE_B",
-          }, afterReplace, events,
-            afterReplace.sessionId === session && afterReplace.findPin === "" && afterReplace.needle === "FIND_NEEDLE_B",
-            `session ${afterReplace.sessionId} pin=${afterReplace.findPin} needle=${afterReplace.needle}`);
+            sessionId: session, findPin: "", visible: false, needle: "FIND_NEEDLE_B",
+          }, afterReplace, { ...events, pendingPin: pending.findPin, pendingVisible: pending.visible },
+            afterReplace.sessionId === session && afterReplace.needle === "FIND_NEEDLE_B" && noRejump,
+            `session ${afterReplace.sessionId} pin=${afterReplace.findPin} needle=${afterReplace.needle} visible=${afterReplace.visible} key=${afterReplace.key}`);
           assert.equal(afterReplace.sessionId, session);
           assert.equal(afterReplace.findPin, "");
+          assert.equal(afterReplace.key === "m0" && afterReplace.visible, false);
           assert.equal(Math.abs(afterReplace.scrollTop - scrollBefore) < 80 || afterReplace.following === false, true);
+          await page.getByTestId("find-chat-scroll").hover();
+          await page.mouse.wheel(0, 1);
+          await page.waitForFunction(() => window.__findPage.wheelFence === false, null, { timeout: 4000 });
           const box = page.getByRole("textbox", { name: "在会话中查找" });
           await box.fill("");
           await box.click();

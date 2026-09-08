@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EXPECTED_SCENES } from "./find-in-session-collector.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const summaryPath = process.env.OC_FIND_META_SUMMARY
@@ -35,7 +36,7 @@ try {
   const emptyOk = empty.status !== 0
     && empty.status !== null
     && (emptyPayload.failed ?? 0) > 0
-    && (emptyPayload.expectedSceneCount ?? 0) === 20
+    && (emptyPayload.expectedSceneCount ?? 0) === EXPECTED_SCENES.length
     && Array.isArray(emptyPayload.missingScenes)
     && emptyPayload.missingScenes.length > 0;
   cases.push({
