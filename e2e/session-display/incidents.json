@@ -3414,6 +3414,26 @@
           "assertion": "relocates a continuation card onto the owner turn, not T2"
         },
         {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "256 sequential ACK of other owners cannot duplicate a live buffered run"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "restart reconstructs root authority from persisted sink/materializer payload"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/directTapePageOwner.test.ts",
+          "assertion": "hydrateDirectTapePage deferred locator carries header owner, not a pre-stamped fixture"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/requeueFailedTapeJobs.test.ts",
+          "assertion": "planner group hash covers transcript/result/status and fence is per-requestId"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof."

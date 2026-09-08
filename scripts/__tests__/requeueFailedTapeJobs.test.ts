@@ -11,6 +11,7 @@ import {
   loadTapeJobSnapshot,
   parseRequeueArgs,
   planLateDelegateContinuation,
+  planLateDelegateGroupHash,
   planLateDelegateSnapshot,
   planTapeRequeue,
   resolveTapeIdentities,
@@ -148,6 +149,99 @@ describe("requeue-failed-tape-jobs planner", () => {
     assert.notEqual(plans.length, 0);
   });
 
+  test("planner group hash covers transcript/result/status and fence is per-requestId", () => {
+    const owner = "b".repeat(64);
+    const billingA = { requestId: "bill-a", parentTurnKey: owner, parentSessionId: "sess-1" };
+    const billingB = { requestId: "bill-b", parentTurnKey: owner, parentSessionId: "sess-1" };
+    const baseGroup = {
+      runId: "dlg-1",
+      status: "ok",
+      resultSummary: "one",
+      transcript: [{ kind: "text", text: "payload-A" }],
+      engineBillings: [billingA, billingB],
+    };
+    const hashA = planLateDelegateGroupHash(baseGroup);
+    const hashB = planLateDelegateGroupHash({
+      ...baseGroup,
+      transcript: [{ kind: "text", text: "payload-B" }],
+    });
+    const hashStatus = planLateDelegateGroupHash({ ...baseGroup, status: "failed" });
+    const hashResult = planLateDelegateGroupHash({ ...baseGroup, resultSummary: "two" });
+    assert.notEqual(hashA, hashB);
+    assert.notEqual(hashA, hashStatus);
+    assert.notEqual(hashA, hashResult);
+    assert.equal(planLateDelegateGroupHash({ ...baseGroup, _ocEventOrdinal: 9 }), hashA);
+
+    const none = planLateDelegateSnapshot({
+      snapshot: {
+        tapes: [{
+          tapeId: "t1",
+          sessionId: "sess-1",
+          turnKey: "c".repeat(64),
+          groups: [baseGroup],
+          root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+          settlementFence: { requestIds: [] },
+        }],
+      },
+      tapeIds: ["t1"],
+    })[0];
+    assert.equal(none?.action, "continuation");
+    assert.deepEqual(none?.fence, [
+      { requestId: "bill-a", inspected: true, matched: false },
+      { requestId: "bill-b", inspected: true, matched: false },
+    ]);
+
+    const partial = planLateDelegateSnapshot({
+      snapshot: {
+        tapes: [{
+          tapeId: "t1",
+          sessionId: "sess-1",
+          turnKey: "c".repeat(64),
+          groups: [baseGroup],
+          root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+          settlementFence: { requestIds: ["bill-a"] },
+        }],
+      },
+      tapeIds: ["t1"],
+    })[0];
+    assert.equal(partial?.action, "skip");
+    assert.equal(partial?.reason, "partial_request_fence");
+    assert.equal(partial?.fence.filter((entry) => entry.matched).length, 1);
+    assert.equal(partial?.fence.filter((entry) => !entry.matched).length, 1);
+
+    const all = planLateDelegateSnapshot({
+      snapshot: {
+        tapes: [{
+          tapeId: "t1",
+          sessionId: "sess-1",
+          turnKey: "c".repeat(64),
+          groups: [baseGroup],
+          root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+          settlementFence: { requestIds: ["bill-a", "bill-b"] },
+        }],
+      },
+      tapeIds: ["t1"],
+    })[0];
+    assert.equal(all?.action, "skip");
+    assert.equal(all?.reason, "request_already_on_root");
+    assert.equal(all?.fence.every((entry) => entry.inspected && entry.matched), true);
+
+    const unchecked = planLateDelegateSnapshot({
+      snapshot: {
+        tapes: [{
+          tapeId: "t1",
+          sessionId: "sess-1",
+          turnKey: "c".repeat(64),
+          groups: [baseGroup],
+          root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+        }],
+      },
+      tapeIds: ["t1"],
+    })[0];
+    assert.equal(unchecked?.fence.every((entry) => entry.inspected === false && entry.matched === false), true);
+    assert.notEqual(unchecked?.reason, "request_already_on_root");
+  });
+
   test("CLI snapshot path prints per-group plans and refuses execute", () => {
     const dir = join(tmpdir(), `ocv5-180-b1-planner-${process.pid}`);
     mkdirSync(dir, { recursive: true });
@@ -193,11 +287,46 @@ describe("requeue-failed-tape-jobs planner", () => {
       "audit-selected-tape",
     ]);
     assert.equal(ok.status, 0, ok.stderr);
-    const body = JSON.parse(ok.stdout) as { plans: Array<{ action: string; groupRunId: string; requestIds: string[] }> };
+    const body = JSON.parse(ok.stdout) as { plans: Array<{ action: string; groupRunId: string; requestIds: string[]; groupHash: string }> };
     assert.equal(body.plans.length, 1);
     assert.equal(body.plans[0]?.action, "continuation");
     assert.equal(body.plans[0]?.groupRunId, "dlg-1");
     assert.equal(body.plans[0]?.requestIds.length, 1);
+
+    const snapshotB = join(dir, "snapshot-b.json");
+    writeFileSync(snapshotB, JSON.stringify({
+      tapes: [{
+        tapeId: "audit-selected-tape",
+        sessionId: "sess-1",
+        turnKey: "c".repeat(64),
+        groups: [{
+          runId: "dlg-1",
+          status: "ok",
+          resultSummary: "body-b",
+          transcript: [{ kind: "text", text: "payload-B" }],
+          engineBillings: [
+            { requestId: "d".repeat(32), parentTurnKey: owner, parentSessionId: "sess-1" },
+            { requestId: "e".repeat(32), parentTurnKey: owner, parentSessionId: "sess-1" },
+          ],
+        }],
+        root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+        settlementFence: { requestIds: ["d".repeat(32)] },
+      }],
+    }));
+    const bodyB = runCli([
+      "--plan-late-delegate-continuations",
+      "--snapshot",
+      snapshotB,
+      "--tape",
+      "audit-selected-tape",
+    ]);
+    assert.equal(bodyB.status, 0, bodyB.stderr);
+    const parsedB = JSON.parse(bodyB.stdout) as {
+      plans: Array<{ groupHash: string; reason: string; fence: Array<{ requestId: string; matched: boolean }> }>;
+    };
+    assert.notEqual(parsedB.plans[0]?.groupHash, body.plans[0]?.groupHash);
+    assert.equal(parsedB.plans[0]?.reason, "partial_request_fence");
+    assert.equal(parsedB.plans[0]?.fence.length, 2);
   });
 
   test("stage 1 requeues materialization; stage 2 skips when settlement is unverified", () => {

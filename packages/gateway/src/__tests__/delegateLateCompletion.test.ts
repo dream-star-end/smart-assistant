@@ -13,6 +13,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateLateCompletion.test.ts
  */
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 
@@ -24,6 +25,7 @@ import {
   lateDelegateGroupIdentity,
   lateDelegateGroupTurnKey,
   lateDelegateLogicalRunKey,
+  persistedRootContainsLogicalRun,
   type DelegateOwnerTurnLocator,
 } from '../delegateLateCompletion.js'
 import { SessionManager, type AgentSession } from '../sessionManager.js'
@@ -436,6 +438,40 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     }
   })
 
+  it('acked root run stays unique after FIFO eviction of the admission map', async () => {
+    const captured = makeCapturingSink()
+    setV3MasterSinkSingleton(captured.sink)
+    try {
+      const { sm, session } = makeSessions()
+      const g = group('dlg-acked-root')
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
+      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
+      type Settler = {
+        _settleDrainedOwnerGroups: (
+          s: AgentSession,
+          turnKey: string,
+          groups: DurableAgentGroup[],
+          outcome: 'acked' | 'queued' | 'dropped' | 'skipped',
+        ) => void
+      }
+      ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'acked')
+      for (let i = 0; i < 256; i++) {
+        const otherTurn = createHash('sha256').update(`acked-churn-${i}`).digest('hex')
+        sm.deliverLateDelegateAgentGroup({
+          owner: owner({ parentTurnKey: otherTurn }),
+          group: group(`acked-churn-${i}`),
+        })
+        await sm.awaitPendingPersistence()
+      }
+      const before = captured.payloads.length
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(captured.payloads.length, before, 'acked root run must not mint a continuation after map eviction')
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
   it('root drain claims the logical run so late does not mint a second card', async () => {
     const captured = makeCapturingSink()
     setV3MasterSinkSingleton(captured.sink)
@@ -448,6 +484,122 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(captured.payloads.length, 0, 'root already contains the run; no continuation')
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('256 sequential ACK of other owners cannot duplicate a live buffered run', async () => {
+    const captured = makeCapturingSink()
+    setV3MasterSinkSingleton(captured.sink)
+    try {
+      const { sm, session } = makeSessions()
+      const billed = group('dlg-live', {
+        engineBillings: [
+          {
+            requestId: 'b'.repeat(32),
+            turnKey: OWNER_TURN_KEY,
+            parentTurnKey: OWNER_TURN_KEY,
+            parentSessionId: 'wsess-owner',
+            delegateAgentId: 'coding-assistant',
+            engineSessionId: `oceng-${'e'.repeat(48)}`,
+            status: 'success',
+            durationMs: 1,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          } as never,
+        ],
+      })
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, billed, owner()), true)
+      for (let i = 0; i < 256; i++) {
+        const otherTurn = createHash('sha256').update(`churn-${i}`).digest('hex')
+        assert.equal(
+          sm.deliverLateDelegateAgentGroup({
+            owner: owner({ parentTurnKey: otherTurn }),
+            group: group(`churn-${i}`),
+          }),
+          true,
+        )
+        await sm.awaitPendingPersistence()
+      }
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, billed, owner()), true)
+      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
+      assert.equal(drained.length, 1)
+      assert.equal(drained[0]?.runId, 'dlg-live')
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('sink-pending inflight survives other-owner ACK churn; late does not mint a second card', async () => {
+    const captured = makeCapturingSink({ ok: false, queued: true })
+    setV3MasterSinkSingleton(captured.sink)
+    try {
+      const { sm, session } = makeSessions()
+      const g = group('dlg-pending')
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
+      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
+      assert.equal(drained.length, 1)
+      type Settler = {
+        _settleDrainedOwnerGroups: (
+          s: AgentSession,
+          turnKey: string,
+          groups: DurableAgentGroup[],
+          outcome: 'acked' | 'queued' | 'dropped' | 'skipped',
+        ) => void
+      }
+      ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'queued')
+      const acked = makeCapturingSink()
+      setV3MasterSinkSingleton(acked.sink)
+      for (let i = 0; i < 256; i++) {
+        const otherTurn = createHash('sha256').update(`pending-churn-${i}`).digest('hex')
+        sm.deliverLateDelegateAgentGroup({
+          owner: owner({ parentTurnKey: otherTurn }),
+          group: group(`pending-churn-${i}`),
+        })
+        await sm.awaitPendingPersistence()
+      }
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(
+        acked.payloads.filter((p) => p.agentGroups?.some((ag) => ag.runId === 'dlg-pending')).length,
+        0,
+        'queued root run must not mint a continuation after churn',
+      )
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('restart reconstructs root authority from persisted sink/materializer payload', async () => {
+    const first = makeCapturingSink()
+    setV3MasterSinkSingleton(first.sink)
+    try {
+      const { sm, session } = makeSessions()
+      const g = group('dlg-restart')
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
+      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
+      type Settler = {
+        _settleDrainedOwnerGroups: (
+          s: AgentSession,
+          turnKey: string,
+          groups: DurableAgentGroup[],
+          outcome: 'acked' | 'queued' | 'dropped' | 'skipped',
+        ) => void
+      }
+      ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'acked')
+      const rootPayload = {
+        sessionId: owner().parentSessionId,
+        turnKey: OWNER_TURN_KEY,
+        agentGroups: drained,
+      }
+      assert.equal(persistedRootContainsLogicalRun(rootPayload, OWNER_TURN_KEY, 'dlg-restart'), true)
+      const restarted = makeSessions().sm
+      const late = makeCapturingSink()
+      setV3MasterSinkSingleton(late.sink)
+      restarted.observePersistedRootTape(rootPayload)
+      assert.equal(restarted.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await restarted.awaitPendingPersistence()
+      assert.equal(late.payloads.length, 0, 'persisted root authority suppresses continuation after restart')
     } finally {
       setV3MasterSinkSingleton(null)
     }

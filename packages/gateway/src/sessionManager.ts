@@ -1095,6 +1095,11 @@ export interface AgentSession {
    * arriving after its owner key is sealed must go to the persistent late
    * path, never back into `_pendingAgentGroups`. Bounded LRU. */
   _sealedOwnerTurnKeys?: Map<string, number>
+  /** OCV5-180 B1 — runId → identity for groups that already rode the root
+   * tape (acked/queued drain). Lives on the owner session next to the sealed
+   * turn keys so FIFO eviction of `_exactOwnerRuns` cannot forget a frozen
+   * root payload. Bounded by the sealed-turn cap. */
+  _ackedExactOwnerRuns?: Map<string, Map<string, string>>
   /** Browser user-row id bound to the submit that currently owns session.lock.
    * Unlike _activeTurnCount, this never describes queued submits. */
   _runningClientMessageId?: string
@@ -1943,8 +1948,12 @@ export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   /** OCV5-180 B1 — `${ownerTurnKey}\0${runId}` → exact-owner logical-run
    *  状态(buffer / drain-seal / late 共用)。同内容唯一、异内容冲突可见;
-   *  inflight 不是 durable。有界 LRU(cap 256)。 */
+   *  inflight 不是 durable。有界 LRU 只淘汰已完成(acked/queued/session_deleted);
+   *  buffered/inflight 以活 owner bucket / 冻结 payload 为权威,不可 FIFO 丢弃。 */
   private _exactOwnerRuns = new Map<string, ExactOwnerRunRecord>()
+  /** Restart reconstruction from already-acked root sink/materializer payloads.
+   *  Keyed `${ownerTurnKey}\0${runId}` → identity (empty if only runId known). */
+  private _persistedRootRuns = new Map<string, string>()
   /** Per-sessionKey mutex around getOrCreate so two concurrent turns cannot
    *  each replace the runner and --resume the same Cursor SQLite store. */
   private _sessionCreateGates = new Map<string, Promise<void>>()
@@ -7640,6 +7649,9 @@ export class SessionManager {
       if (parent.peerId !== owner.parentSessionId) return false
       if (parent._currentTurnKey !== owner.parentTurnKey) return false
       if (parent._sealedOwnerTurnKeys?.has(owner.parentTurnKey)) return false
+      const live = this._matchLiveOwnerRun(parent, owner, group)
+      if (live === 'conflict' || live === 'session_deleted') return false
+      if (live === 'duplicate') return true
       const admission = this._admitExactOwnerRun(owner, group, 'buffered')
       if (admission === 'conflict' || admission === 'session_deleted') return false
       if (admission === 'duplicate') return true
@@ -7678,9 +7690,13 @@ export class SessionManager {
     if (!pending || pending.length === 0) return []
     const take: DurableAgentGroup[] = []
     const keep: PendingAgentGroupEntry[] = []
+    const takenRuns = new Set<string>()
     for (const entry of pending) {
-      if (entry.ownerTurnKey === undefined || entry.ownerTurnKey === turnKey) take.push(entry.group)
-      else keep.push(entry)
+      if (entry.ownerTurnKey === undefined || entry.ownerTurnKey === turnKey) {
+        if (takenRuns.has(entry.group.runId)) continue
+        takenRuns.add(entry.group.runId)
+        take.push(entry.group)
+      } else keep.push(entry)
     }
     session._pendingAgentGroups = keep.length > 0 ? keep : undefined
     if (take.length > 0) {
@@ -7719,6 +7735,21 @@ export class SessionManager {
       }
     }
     const conflictKey = this._exactOwnerRunKey(args.owner.parentTurnKey, args.group.runId)
+    const live = this._matchPersistedOrLiveOwnerRun(args.owner, args.group, args.sessionKey)
+    if (live === 'conflict') {
+      log.warn('late_delegate_group_conflict: same run with different content', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      })
+      return false
+    }
+    if (live === 'session_deleted') {
+      log.warn('late delegate group dropped: session_deleted', {
+        runId: args.group.runId,
+      })
+      return false
+    }
+    if (live === 'duplicate') return true
     const admission = this._admitExactOwnerRun(args.owner, args.group, 'inflight')
     if (admission === 'conflict') {
       log.warn('late_delegate_group_conflict: same run with different content', {
@@ -7784,10 +7815,58 @@ export class SessionManager {
   }
 
   private _trimExactOwnerRuns(): void {
-    while (this._exactOwnerRuns.size > 256) {
-      const oldest = this._exactOwnerRuns.keys().next().value
+    if (this._exactOwnerRuns.size <= 256) return
+    const evictable: string[] = []
+    for (const [key, rec] of this._exactOwnerRuns) {
+      if (rec.state === 'buffered' || rec.state === 'inflight') continue
+      evictable.push(key)
+    }
+    while (this._exactOwnerRuns.size > 256 && evictable.length > 0) {
+      const oldest = evictable.shift()
       if (oldest === undefined) break
+      const rec = this._exactOwnerRuns.get(oldest)
+      if (!rec || rec.state === 'buffered' || rec.state === 'inflight') continue
       this._exactOwnerRuns.delete(oldest)
+    }
+  }
+
+  /**
+   * Reconstruct exact-owner root authority from an already-acked sink /
+   * materializer root payload after cache eviction or process restart.
+   * Continuation tapes are ignored: root key ≠ late key.
+   */
+  observePersistedRootTape(payload: {
+    turnKey?: string
+    continuationOfTurnKey?: string
+    sessionId?: string
+    agentGroups?: DurableAgentGroup[]
+  }): void {
+    const turnKey = payload.turnKey
+    if (typeof turnKey !== 'string' || !/^[0-9a-f]{64}$/.test(turnKey)) return
+    if (typeof payload.continuationOfTurnKey === 'string' && payload.continuationOfTurnKey.length > 0) {
+      return
+    }
+    const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : ''
+    for (const group of payload.agentGroups ?? []) {
+      if (typeof group.runId !== 'string' || group.runId.length === 0) continue
+      const key = this._exactOwnerRunKey(turnKey, group.runId)
+      const identity = sessionId.length > 0 && isValidDelegateOwnerLocator({
+        parentSessionId: sessionId,
+        parentTurnKey: turnKey,
+        turnIndex: 1,
+      })
+        ? lateDelegateGroupIdentity({
+          parentSessionId: sessionId,
+          parentTurnKey: turnKey,
+          turnIndex: 1,
+        }, group)
+        : ''
+      this._persistedRootRuns.set(key, identity)
+    }
+    while (this._persistedRootRuns.size > 1024) {
+      const oldest = this._persistedRootRuns.keys().next().value
+      if (oldest === undefined) break
+      this._persistedRootRuns.delete(oldest)
     }
   }
 
@@ -7847,6 +7926,18 @@ export class SessionManager {
     outcome: TapePersistResult,
   ): void {
     const owner = this._ownerLocatorForSession(session, turnKey)
+    const durable = outcome === 'acked' || outcome === 'queued' || outcome === 'skipped'
+    if (durable && isValidDelegateOwnerLocator(owner)) {
+      const byTurn = (session._ackedExactOwnerRuns ??= new Map())
+      let runs = byTurn.get(turnKey)
+      if (!runs) {
+        runs = new Map()
+        byTurn.set(turnKey, runs)
+      }
+      for (const group of groups) {
+        runs.set(group.runId, lateDelegateGroupIdentity(owner, group))
+      }
+    }
     for (const group of groups) {
       const key = this._exactOwnerRunKey(turnKey, group.runId)
       const rec = this._exactOwnerRuns.get(key)
@@ -7861,6 +7952,53 @@ export class SessionManager {
     }
   }
 
+  private _compareOwnerRunIdentity(
+    seenIdentity: string,
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+  ): 'duplicate' | 'conflict' {
+    if (!seenIdentity) return 'duplicate'
+    return seenIdentity === lateDelegateGroupIdentity(owner, group) ? 'duplicate' : 'conflict'
+  }
+
+  private _matchLiveOwnerRun(
+    session: AgentSession,
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+  ): 'accept' | 'duplicate' | 'conflict' | 'session_deleted' {
+    const pending = session._pendingAgentGroups
+    if (pending) {
+      for (const entry of pending) {
+        if (entry.ownerTurnKey !== owner.parentTurnKey) continue
+        if (entry.group.runId !== group.runId) continue
+        return this._compareOwnerRunIdentity(lateDelegateGroupIdentity(owner, entry.group), owner, group)
+      }
+    }
+    const acked = session._ackedExactOwnerRuns?.get(owner.parentTurnKey)?.get(group.runId)
+    if (acked !== undefined) return this._compareOwnerRunIdentity(acked, owner, group)
+    return 'accept'
+  }
+
+  private _matchPersistedOrLiveOwnerRun(
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+    sessionKey?: string,
+  ): 'accept' | 'duplicate' | 'conflict' | 'session_deleted' {
+    const liveSession = sessionKey ? this.sessions.get(sessionKey) : undefined
+    if (liveSession) {
+      const live = this._matchLiveOwnerRun(liveSession, owner, group)
+      if (live !== 'accept') return live
+    }
+    for (const session of this.sessions.values()) {
+      if (session.peerId !== owner.parentSessionId) continue
+      const live = this._matchLiveOwnerRun(session, owner, group)
+      if (live !== 'accept') return live
+    }
+    const persisted = this._persistedRootRuns.get(this._exactOwnerRunKey(owner.parentTurnKey, group.runId))
+    if (persisted !== undefined) return this._compareOwnerRunIdentity(persisted, owner, group)
+    return 'accept'
+  }
+
   /** OCV5-180 B1 — mark an owner turn sealed (payload frozen). Insertion-order
    * LRU; re-sealing an already-sealed key is a no-op. */
   private _sealOwnerTurn(session: AgentSession, turnKey: string): void {
@@ -7869,7 +8007,10 @@ export class SessionManager {
     sealed.set(turnKey, Date.now())
     if (sealed.size > SEALED_OWNER_TURN_KEYS_CAP) {
       const oldest = sealed.keys().next().value
-      if (oldest !== undefined) sealed.delete(oldest)
+      if (oldest !== undefined) {
+        sealed.delete(oldest)
+        session._ackedExactOwnerRuns?.delete(oldest)
+      }
     }
   }
 

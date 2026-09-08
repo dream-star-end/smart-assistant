@@ -7,6 +7,8 @@ import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS, shouldShowScrollToBottom } from "./MessageRenderer";
+import { AgentGroupCard } from "./chat/AgentGroupCard";
+import * as AgentGroupMod from "./chat/AgentGroupCard";
 import * as MarkdownMod from "./Markdown";
 import { PAINT_MIN_ITEMS } from "../lib/chat/timelinePaint";
 import { createStickToBottomController } from "./chat/stickToBottom";
@@ -2851,12 +2853,17 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
 
   test("deferred late-delegate card keeps owner after Range body expand", async () => {
     const ownerTurn = "a".repeat(64);
+    const continuationTurn = "c".repeat(64);
+    const seen: ChatMessage[] = [];
+    const real = AgentGroupCard;
+    const spy = vi.spyOn(AgentGroupMod, "AgentGroupCard").mockImplementation((props) => {
+      seen.push(props.msg);
+      return real(props);
+    });
     const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
       mk("agent-group", {
         id: "srv-late-agentgroup-dlg-late-1",
         text: "晚到子任务正文",
-        _delegateRunId: "dlg-late-1",
-        _continuationOfTurnKey: ownerTurn,
       }),
     ]);
     render(
@@ -2870,7 +2877,7 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
           _recordOrdinal: 0,
           _continuationOfTurnKey: ownerTurn,
           _delegateRunId: "dlg-late-1",
-          _turnKey: "c".repeat(64),
+          _turnKey: continuationTurn,
         })}
         sig="late-deferred"
         isLast={false}
@@ -2882,6 +2889,11 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     );
     expect(await screen.findByText("晚到子任务正文")).toBeInTheDocument();
     expect(onFetchTapeRecordPayload).toHaveBeenCalled();
+    const expanded = seen.at(-1);
+    expect(expanded?._continuationOfTurnKey).toBe(ownerTurn);
+    expect(expanded?._delegateRunId).toBe("dlg-late-1");
+    expect(expanded?._turnKey).toBe(continuationTurn);
+    spy.mockRestore();
   });
 });
 

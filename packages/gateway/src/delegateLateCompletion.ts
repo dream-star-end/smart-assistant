@@ -85,6 +85,25 @@ export function lateDelegateGroupIdentity(
     .digest('hex')
 }
 
+/** True when a persisted ROOT tape (sink/materializer payload) already
+ * carries this logical run. Continuations are ignored: their tape key is
+ * not the owner turn, so they cannot be the root authority. */
+export function persistedRootContainsLogicalRun(
+  payload: {
+    turnKey?: string
+    continuationOfTurnKey?: string
+    agentGroups?: Array<{ runId?: string }>
+  },
+  ownerTurnKey: string,
+  runId: string,
+): boolean {
+  if (typeof payload.continuationOfTurnKey === 'string' && payload.continuationOfTurnKey.length > 0) {
+    return false
+  }
+  if (payload.turnKey !== ownerTurnKey) return false
+  return (payload.agentGroups ?? []).some((group) => group.runId === runId)
+}
+
 /** One logical run under one owner turn. Tape key / agentId derive from this
  * (NOT the content hash) so a restart + different payload collides on the
  * same immutable tape (409) instead of minting a second card. */

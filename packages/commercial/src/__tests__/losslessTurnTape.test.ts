@@ -1154,6 +1154,31 @@ describe("OCV5-180 B1: agent-group continuation tapes", () => {
     );
   });
 
+  test("root tape with a duplicated group requestId is rejected; a single group passes", () => {
+    const billed = {
+      runId: "dlg-root-dup",
+      agentId: "coding-assistant",
+      goal: "root group",
+      status: "ok" as const,
+      completedAt: 1_783_945_000_001,
+      engineBillings: [ownerBilling({ parentTurnKey: OWNER_TURN_KEY, turnKey: OWNER_TURN_KEY })],
+    };
+    const root = {
+      sessionId: "web-lossless-late",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed" as const,
+      turnKey: OWNER_TURN_KEY,
+      text: "root answer",
+      createdAt: 1_783_945_000_000,
+    };
+    materializeLosslessTurn({ ...root, agentGroups: [billed] });
+    assert.throws(
+      () => materializeLosslessTurn({ ...root, agentGroups: [billed, billed] }),
+      /duplicate engine billing requestId/,
+    );
+  });
+
   test("old writer compat: runtimeEvents-only continuation still parses (no agentGroups)", () => {
     const payload = parseLosslessTurnPayload({
       ...baseContinuation,

@@ -131,6 +131,22 @@ export type LateDelegateBillingLocator = {
   parentSessionId?: string;
 };
 
+export type LateDelegateFenceEntry = {
+  requestId: string;
+  inspected: boolean;
+  matched: boolean;
+};
+
+export type LateDelegatePlanGroup = {
+  runId: string;
+  engineBillings?: LateDelegateBillingLocator[];
+  transcript?: unknown;
+  resultSummary?: unknown;
+  status?: unknown;
+  _ocEventOrdinal?: unknown;
+  [key: string]: unknown;
+};
+
 export type LateDelegateContinuationPlan = {
   tapeId: string;
   sessionId: string;
@@ -140,6 +156,7 @@ export type LateDelegateContinuationPlan = {
   targetLocator: { sessionId: string; turnKey: string | null };
   billingLocators: LateDelegateBillingLocator[];
   requestIds: string[];
+  fence: LateDelegateFenceEntry[];
   rootFinalized: boolean | null;
   requestId: string | null;
   action: "continuation" | "manual_reconcile" | "skip";
@@ -150,12 +167,9 @@ export type LateDelegateSnapshotTape = {
   tapeId: string;
   sessionId: string;
   turnKey?: string | null;
-  groups?: Array<{
-    runId: string;
-    engineBillings?: LateDelegateBillingLocator[];
-  }>;
+  groups?: LateDelegatePlanGroup[];
   root?: { sessionId: string; turnKey: string; finalized: boolean } | null;
-  settlementFence?: { requestIds?: string[] };
+  settlementFence?: { requestIds?: string[] } | null;
   inspected?: boolean;
 };
 
@@ -163,28 +177,42 @@ export type LateDelegateSnapshot = {
   tapes?: LateDelegateSnapshotTape[];
 };
 
+function canonicalLateDelegatePlanGroupBytes(group: LateDelegatePlanGroup): Buffer {
+  const json = JSON.stringify(group, (key, current) => {
+    if (key === "_ocEventOrdinal") return undefined;
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current;
+    const sorted: Record<string, unknown> = {};
+    for (const next of Object.keys(current as Record<string, unknown>).sort()) {
+      sorted[next] = (current as Record<string, unknown>)[next];
+    }
+    return sorted;
+  });
+  if (json === undefined) throw new Error("late delegate plan group is not JSON serializable");
+  return Buffer.from(json, "utf8");
+}
+
+export function planLateDelegateGroupHash(group: LateDelegatePlanGroup): string {
+  return createHash("sha256")
+    .update("oc-late-delegate-plan-v2\0")
+    .update(canonicalLateDelegatePlanGroupBytes(group))
+    .digest("hex");
+}
+
 export function planLateDelegateContinuation(input: {
   tapeId: string;
   sessionId: string;
-  group: {
-    runId: string;
-    engineBillings?: LateDelegateBillingLocator[];
-  };
+  group: LateDelegatePlanGroup;
   tapeTurnKey?: string | null;
   root?: { sessionId: string; turnKey: string; finalized: boolean } | null;
-  rootAlreadyHasRequestId?: boolean;
+  settlementFence?: { requestIds?: string[] } | null;
+  fenceInspected?: boolean;
   inspected?: boolean;
 }): LateDelegateContinuationPlan {
   const billings = Array.isArray(input.group.engineBillings) ? input.group.engineBillings : [];
   const requestIds = billings
     .map((billing) => billing.requestId)
     .filter((id): id is string => typeof id === "string" && id.length > 0);
-  const groupHash = createHash("sha256")
-    .update("oc-late-delegate-plan-v1\0")
-    .update(input.group.runId)
-    .update("\0")
-    .update(JSON.stringify(billings))
-    .digest("hex");
+  const groupHash = planLateDelegateGroupHash(input.group);
   const sourceLocator = {
     sessionId: input.sessionId,
     turnKey: input.tapeTurnKey ?? null,
@@ -201,7 +229,14 @@ export function planLateDelegateContinuation(input: {
   )];
   const targetSessionId = sessionIds[0] ?? input.sessionId;
   const targetTurnKey = turnKeys[0] ?? input.root?.turnKey ?? null;
-  const fenceRequestIds = requestIds;
+  const fenceInspected = input.fenceInspected === true;
+  const fenceIds = new Set(input.settlementFence?.requestIds ?? []);
+  const fence: LateDelegateFenceEntry[] = requestIds.map((requestId) => ({
+    requestId,
+    inspected: fenceInspected,
+    matched: fenceInspected && fenceIds.has(requestId),
+  }));
+  const matchedCount = fence.filter((entry) => entry.matched).length;
   const base = {
     tapeId: input.tapeId,
     sessionId: input.sessionId,
@@ -214,7 +249,8 @@ export function planLateDelegateContinuation(input: {
       ...(typeof billing.parentTurnKey === "string" ? { parentTurnKey: billing.parentTurnKey } : {}),
       ...(typeof billing.parentSessionId === "string" ? { parentSessionId: billing.parentSessionId } : {}),
     })),
-    requestIds: fenceRequestIds,
+    requestIds,
+    fence,
     rootFinalized: input.root ? input.root.finalized : null,
     requestId: requestIds[0] ?? null,
   };
@@ -227,8 +263,11 @@ export function planLateDelegateContinuation(input: {
   if (targetSessionId !== input.sessionId) {
     return { ...base, action: "manual_reconcile", reason: "cross_session_locator" };
   }
-  if (input.rootAlreadyHasRequestId && requestIds.length > 0) {
+  if (matchedCount > 0 && matchedCount === requestIds.length) {
     return { ...base, action: "skip", reason: "request_already_on_root" };
+  }
+  if (matchedCount > 0 && matchedCount < requestIds.length) {
+    return { ...base, action: "skip", reason: "partial_request_fence" };
   }
   if (!input.root) {
     return { ...base, action: "skip", reason: "root_tape_missing_retryable" };
@@ -260,6 +299,7 @@ export function planLateDelegateSnapshot(input: {
         targetLocator: { sessionId: "", turnKey: null },
         billingLocators: [],
         requestIds: [],
+        fence: [],
         rootFinalized: null,
         requestId: null,
         action: "skip",
@@ -283,19 +323,16 @@ export function planLateDelegateSnapshot(input: {
       plans[plans.length - 1]!.action = "skip";
       continue;
     }
-    const fence = new Set(tape.settlementFence?.requestIds ?? []);
+    const fenceInspected = tape.settlementFence != null;
     for (const group of groups) {
-      const requestIds = (group.engineBillings ?? [])
-        .map((billing) => billing.requestId)
-        .filter((id): id is string => typeof id === "string");
-      const already = requestIds.some((id) => fence.has(id));
       plans.push(planLateDelegateContinuation({
         tapeId: tape.tapeId,
         sessionId: tape.sessionId,
         group,
         tapeTurnKey: tape.turnKey,
         root: tape.root ?? null,
-        rootAlreadyHasRequestId: already,
+        settlementFence: tape.settlementFence ?? null,
+        fenceInspected,
         inspected: tape.inspected,
       }));
     }

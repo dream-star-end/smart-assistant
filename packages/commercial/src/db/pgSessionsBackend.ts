@@ -5934,7 +5934,7 @@ type DirectTapePageHead = {
 
 /** Hydrate a selected physical page without changing its paging direction.
  * The returned logical rows are always in ascending immutable ordinal order. */
-async function hydrateDirectTapePage(
+export async function hydrateDirectTapePage(
   pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
@@ -5942,6 +5942,7 @@ async function hydrateDirectTapePage(
   tapeSha256: string,
   billingAnchorId: string,
   heads: DirectTapePageHead[],
+  extras?: { continuationOfTurnKey?: string | null },
 ): Promise<MessageLike[]> {
   const deferred = heads.filter((head) =>
     bigIntNum(head.payload_bytes, "turn tape record payload bytes") > TAPE_RECORD_INLINE_QUANTUM_BYTES);
@@ -5952,6 +5953,7 @@ async function hydrateDirectTapePage(
     tapeSha256,
     { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
     bigIntNum(head.payload_bytes, "turn tape record payload bytes"),
+    { continuationOfTurnKey: extras?.continuationOfTurnKey },
   ));
 
   if (planned.length > 0) {
@@ -6519,6 +6521,7 @@ async function readUnifiedTimelineBashTailAuxiliaries(
         window.header.tapeSha256,
         window.header.billingAnchorId,
         selectedHeads,
+        { continuationOfTurnKey: window.header.continuationOfTurnKey },
       ).catch((error: unknown) => {
         warnTapeDisplayDegrade({
           sessionId,
@@ -7413,7 +7416,7 @@ async function readClientTimelinePageImpl(
  * rendered billing anchor is the only excluded row; every other role is
  * returned, with known platform-private fields removed but no semantic
  * allowlist. Oversized records use a deferred exact byte locator. */
-async function listTurnTapeRecordsImpl(
+export async function listTurnTapeRecordsImpl(
   pool: Pool,
   sessionId: string,
   userId: string,
@@ -7432,8 +7435,9 @@ async function listTurnTapeRecordsImpl(
       billing_anchor_id: string;
       physical_record_count: string;
       logical_record_count: string;
+      continuation_of_turn_key: string | null;
     }>(
-      `SELECT t.tape_sha256, t.billing_anchor_id,
+      `SELECT t.tape_sha256, t.billing_anchor_id, t.continuation_of_turn_key,
               CASE WHEN t.physical_record_count=0 THEN
                 (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
                   WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id)
@@ -7503,6 +7507,7 @@ async function listTurnTapeRecordsImpl(
       header.tape_sha256,
       header.billing_anchor_id,
       selected,
+      { continuationOfTurnKey: header.continuation_of_turn_key },
     );
     return {
       records,
@@ -7568,6 +7573,7 @@ async function listTurnTapeRecordsImpl(
       header.tape_sha256,
       header.billing_anchor_id,
       selected,
+      { continuationOfTurnKey: header.continuation_of_turn_key },
     ));
 
     if (nextCursor !== null) break;
