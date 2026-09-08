@@ -13,7 +13,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir, readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, opendir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
@@ -137,6 +137,44 @@ export function cursorExternalApiOutboxDirForFlavor(
   return null;
 }
 
+function summarizeScan(
+  observations: OutboxScanObservation[],
+  consumed: ConsumeReadyResult[],
+  scanned: number,
+  truncated: boolean,
+): Record<string, number | boolean> {
+  let intent = 0;
+  let unknown = 0;
+  let corrupt = 0;
+  let ready = 0;
+  for (const obs of observations) {
+    if (obs.kind === "intent") intent += 1;
+    else if (obs.kind === "unknown") unknown += 1;
+    else if (obs.kind === "corrupt") corrupt += 1;
+    else ready += 1;
+  }
+  let newCommit = 0;
+  let existing = 0;
+  let left = 0;
+  for (const row of consumed) {
+    if (row.disposition === "new_commit") newCommit += 1;
+    else if (row.disposition === "existing" || row.disposition === "commit_proven") existing += 1;
+    else left += 1;
+  }
+  return {
+    scanned,
+    ready,
+    intent,
+    unknown,
+    corrupt,
+    consumed: consumed.length,
+    newCommit,
+    existing,
+    left,
+    truncated,
+  };
+}
+
 export async function openCursorExternalApiOutbox(args: {
   directory: string;
   logger?: Logger;
@@ -175,6 +213,9 @@ export async function openCursorExternalApiOutbox(args: {
 
   const writeRecord = async (record: CursorExternalOutboxRecord): Promise<void> => {
     const json = serializeRecord(record);
+    if (Buffer.byteLength(json, "utf8") > MAX_OUTBOX_FILE_BYTES) {
+      throw new Error(`outbox record exceeds ${MAX_OUTBOX_FILE_BYTES} bytes`);
+    }
     const target = fileFor(record.billingId);
     const tmp = path.join(
       directory,
@@ -233,23 +274,15 @@ export async function openCursorExternalApiOutbox(args: {
       const limit = Math.max(1, Math.min(opts.limit ?? MAX_OUTBOX_FILES_PER_BATCH, MAX_OUTBOX_FILES_PER_BATCH));
       const maxBytes = opts.maxBytes ?? MAX_OUTBOX_FILE_BYTES;
       const deadline = (opts.deadlineMs ?? MAX_OUTBOX_SCAN_DIR_MS) + Date.now();
-      let names: string[];
-      try {
-        names = (await readdir(directory)).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort();
-      } catch (err) {
-        args.logger?.warn("cursor_external_outbox_readdir_failed", { err: String(err) });
-        return { observations: [], scanned: 0, truncated: false };
-      }
-      const start = names.findIndex((n) => n > scanCursor);
-      const ordered =
-        start <= 0 ? names : names.slice(start).concat(names.slice(0, start));
       const observations: OutboxScanObservation[] = [];
       let scanned = 0;
       let truncated = false;
-      for (const name of ordered) {
+      let lastFile = scanCursor;
+
+      const inspect = async (name: string): Promise<boolean> => {
         if (Date.now() >= deadline || observations.length >= limit) {
           truncated = true;
-          break;
+          return false;
         }
         scanned += 1;
         const full = path.join(directory, name);
@@ -258,51 +291,91 @@ export async function openCursorExternalApiOutbox(args: {
           size = (await stat(full)).size;
         } catch {
           observations.push({ kind: "corrupt", file: name, reason: "stat_failed" });
-          continue;
+          lastFile = name;
+          return true;
         }
         if (size > maxBytes) {
           observations.push({ kind: "corrupt", file: name, reason: `too_large:${size}` });
-          continue;
+          lastFile = name;
+          return true;
         }
         const loaded = await readRecordFile(full);
         if (!loaded) {
           observations.push({ kind: "corrupt", file: name, reason: "unreadable" });
-          continue;
+          lastFile = name;
+          return true;
         }
         if (loaded.kind === "corrupt") {
-          observations.push({ kind: "corrupt", file: name, reason: loaded.reason });
-          continue;
+          observations.push({ kind: "corrupt", file: name, reason: loaded.reason ?? "corrupt" });
+          lastFile = name;
+          return true;
         }
         const rec = loaded.record;
         if (!rec) {
           observations.push({ kind: "unknown", file: name, reason: loaded.reason ?? "unparsed" });
-          continue;
+          lastFile = name;
+          return true;
         }
         if (rec.phase === "intent") {
           observations.push({ kind: "intent", file: name, billingId: rec.billingId });
         } else {
           observations.push({ kind: "ready", file: name, record: rec });
         }
+        lastFile = name;
+        return true;
+      };
+
+      const walk = async (accept: (name: string) => boolean): Promise<void> => {
+        let dh: Awaited<ReturnType<typeof opendir>> | undefined;
+        try {
+          dh = await opendir(directory);
+        } catch (err) {
+          args.logger?.warn("cursor_external_outbox_readdir_failed", { err: String(err) });
+          truncated = true;
+          return;
+        }
+        try {
+          for await (const ent of dh) {
+            if (Date.now() >= deadline || observations.length >= limit) {
+              truncated = true;
+              break;
+            }
+            const name = ent.name;
+            if (!name.endsWith(".json") || name.startsWith(".")) continue;
+            if (!accept(name)) continue;
+            const keepGoing = await inspect(name);
+            if (!keepGoing) break;
+          }
+        } finally {
+          await dh.close().catch(() => undefined);
+        }
+      };
+
+      // Fair cursor without materialising the whole directory: first names
+      // lexicographically after the last cursor, then wrap to the start.
+      await walk((name) => name > scanCursor);
+      if (!truncated && observations.length < limit) {
+        await walk((name) => name <= scanCursor);
       }
-      if (ordered.length > 0) {
-        const last = observations.length > 0
-          ? observations[observations.length - 1]!.file
-          : ordered[Math.min(scanned, ordered.length) - 1]!;
-        scanCursor = last;
-      }
+      if (lastFile) scanCursor = lastFile;
       return { observations, scanned, truncated };
     },
     async scanOnce(deps) {
+      const batchStarted = Date.now();
       const batch = await api.listBatch({
         limit: MAX_OUTBOX_FILES_PER_BATCH,
         deadlineMs: MAX_OUTBOX_SCAN_DIR_MS,
       });
       const consumed: ConsumeReadyResult[] = [];
-      const batchDeadline = Date.now() + MAX_OUTBOX_BATCH_MS;
+      const batchDeadline = batchStarted + MAX_OUTBOX_BATCH_MS;
       for (const obs of batch.observations) {
         if (stopped) break;
         if (Date.now() >= batchDeadline) break;
         if (obs.kind !== "ready") continue;
+        // One consume is bounded by the shared master Pool
+        // (connectionTimeoutMillis=5s, statement_timeout=30s). This loop
+        // does not Promise.race those awaits; a started settle runs to the
+        // pool timeout. stop() drains the in-flight batch only.
         const result = await consumeReadyRecord({
           pool: deps.pool,
           pricing: deps.pricing,
@@ -313,12 +386,14 @@ export async function openCursorExternalApiOutbox(args: {
         });
         consumed.push(result);
       }
+      const summary = summarizeScan(batch.observations, consumed, batch.scanned, batch.truncated);
+      deps.logger?.info("cursor_external_outbox_scan", summary);
       return { consumed, observations: batch.observations, scanned: batch.scanned };
     },
     startScanner(deps) {
       stopped = false;
       const intervalMs = Math.max(500, deps.intervalMs ?? 5_000);
-      const timer = setInterval(() => {
+      const tick = (): void => {
         if (stopped || inFlight) return;
         const run = api.scanOnce(deps).then(
           () => undefined,
@@ -326,10 +401,12 @@ export async function openCursorExternalApiOutbox(args: {
             deps.logger?.warn("cursor_external_outbox_scan_failed", { err: String(err) });
           },
         );
-        inFlight = run.finally(() => {
-          if (inFlight === run) inFlight = null;
+        const tracked = run.finally(() => {
+          if (inFlight === tracked) inFlight = null;
         });
-      }, intervalMs);
+        inFlight = tracked;
+      };
+      const timer = setInterval(tick, intervalMs);
       timer.unref();
       return {
         stop: async () => {
