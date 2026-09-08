@@ -52,6 +52,9 @@ export {
   type CursorSandServeResult,
   type CursorSandUsage,
   type RelayCredentialKind,
+  type ServeMessagesOptions,
+  type UsageEvidence,
+  type TerminalEvidence,
 } from './engine/cursorSandRelay.js'
 export {
   ZcodeAdapter,

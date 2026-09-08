@@ -31,21 +31,35 @@
  * after each use, so `readApiKey` must return a fresh copy every call.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
 import {
   CursorSandRelay,
   type CursorSandServeResult,
   type RelayCredentialKind,
+  type ServeMessagesOptions,
+  type TerminalEvidence,
 } from "@openclaude/gateway";
 import type { Logger } from "../../logging/logger.js";
 import type { ProxyIdentity } from "../../auth/proxyIdentity.js";
 import { AuthzDeniedError, AuthzLoadError } from "../../auth/proxyIdentity.js";
 import type { ModelPricing, PricingCache } from "../../billing/pricing.js";
 import { readTotalSpendableBalance } from "../../billing/preCheck.js";
-import { settleCursorExternalUsage } from "../../billing/cursorExternalSettle.js";
+import {
+  captureCursorPricingBasis,
+  freezePreparedCursorSettlePlan,
+  mapCursorReportedUsage,
+  planCursorExternalSettle,
+  settleCursorExternalUsage,
+} from "../../billing/cursorExternalSettle.js";
 import type { SettleResult } from "../../billing/proxyBilling.js";
+import {
+  consumeReadyRecord,
+  newCursorExternalBillingId,
+  type CursorExternalApiOutbox,
+  type CursorExternalReadyRecord,
+} from "../../billing/cursorExternalApiOutbox.js";
 import {
   getCursorTokenSnapshot,
   listAccounts,
@@ -70,7 +84,7 @@ export interface CursorSandRelayLike {
     body: Record<string, unknown>,
     res: ServerResponse,
     signal: AbortSignal,
-    options?: { echoModel?: string },
+    options?: ServeMessagesOptions,
   ): Promise<CursorSandServeResult>;
   close(): Promise<void>;
 }
@@ -100,6 +114,13 @@ export interface CursorExternalDeps {
   stickyTtlMs?: number;
   /** In-process cooldown after a credential rejection (default 10 min). */
   credentialCooldownMs?: number;
+  /**
+   * Durable FS outbox. Required in the selfhost composition; unit tests may
+   * omit it and keep the in-process settle-after-return path.
+   */
+  outbox?: CursorExternalApiOutbox;
+  /** Test-only: force the collect-then-emit streaming pipe. */
+  forceBufferedStreaming?: boolean;
 }
 
 export interface CursorExternalHandleArgs {
@@ -432,6 +453,38 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     const attribution = extractUsageAttribution(body.metadata);
     const relayBody: Record<string, unknown> = { ...body };
     if (body.stream !== true) relayBody.stream = false;
+    const billingRequestId = newCursorExternalBillingId(() => randomBytes(16));
+    const basis = captureCursorPricingBasis(pricing, process.env, new Date(nowMs));
+    const outbox = deps.outbox;
+
+    if (outbox) {
+      try {
+        await outbox.writeIntent({
+          schema: 1,
+          phase: "intent",
+          billingId: billingRequestId,
+          userId: uid.toString(),
+          modelId: model,
+          accountId: accountId.toString(),
+          apiKeyId: args.identity.apiKey?.id?.toString() ?? null,
+          sessionId: attribution.sessionId,
+          turnKey: attribution.turnKey,
+          parentTurnKey: attribution.parentTurnKey,
+          parentSessionId: attribution.parentSessionId,
+          delegateAgentId: attribution.delegateAgentId,
+          basis,
+          createdAt: new Date(nowMs).toISOString(),
+        });
+      } catch (err) {
+        userLog.error("cursor_external_intent_persist_failed", {
+          model,
+          accountId: accountId.toString(),
+          err: errSummary(err),
+        });
+        sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+        return;
+      }
+    }
 
     // Client-disconnect detection: `res` emits 'close' both after a normal
     // `end()` and when the peer hangs up. Only the latter happens while the
@@ -446,11 +499,74 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     };
     res.on("close", onClose);
 
+    let sealedReady: CursorExternalReadyRecord | null = null;
+    let sealPromise: Promise<CursorExternalReadyRecord | null> | null = null;
+    const sealOnce = (ev: TerminalEvidence): Promise<CursorExternalReadyRecord | null> => {
+      if (!sealPromise) {
+        sealPromise = (async () => {
+          let engineStatus: "success" | "error" = ev.outcome === "completed" ? "success" : "error";
+          let terminalCode = ev.terminalCode ?? null;
+          if (clientAborted) {
+            engineStatus = "error";
+            terminalCode = "USER_CANCELLED";
+          }
+          if (ev.evidence.kind === "unobserved") {
+            if (engineStatus === "success") {
+              throw new Error("CURSOR_EXTERNAL_UNOBSERVED_SUCCESS");
+            }
+            return null;
+          }
+          const usage = mapCursorReportedUsage(ev.evidence.usage);
+          const plan = freezePreparedCursorSettlePlan(
+            planCursorExternalSettle({
+              engineStatus,
+              usage,
+              pricing,
+              pricingBasis: basis,
+              terminalCode,
+            }),
+          );
+          const ready: CursorExternalReadyRecord = {
+            schema: 1,
+            phase: "ready",
+            billingId: billingRequestId,
+            userId: uid.toString(),
+            modelId: model,
+            accountId: accountId.toString(),
+            apiKeyId: args.identity.apiKey?.id?.toString() ?? null,
+            sessionId: attribution.sessionId,
+            turnKey: attribution.turnKey,
+            parentTurnKey: attribution.parentTurnKey,
+            parentSessionId: attribution.parentSessionId,
+            delegateAgentId: attribution.delegateAgentId,
+            basis,
+            createdAt: new Date(nowMs).toISOString(),
+            engineStatus,
+            terminalCode,
+            usage: ev.evidence.usage,
+            plan,
+            sealedAt: new Date(now()).toISOString(),
+          };
+          if (outbox) {
+            sealedReady = await outbox.writeReady(ready);
+            return sealedReady;
+          }
+          sealedReady = ready;
+          return ready;
+        })();
+      }
+      return sealPromise;
+    };
+
     let result: CursorSandServeResult | null = null;
     let failure: unknown = null;
     const startedAt = nowMs;
     try {
-      result = await relay.serveMessages(relayBody, res, ac.signal, { echoModel: requestedModel });
+      result = await relay.serveMessages(relayBody, res, ac.signal, {
+        echoModel: requestedModel,
+        ...(outbox ? { onTerminal: (ev) => sealOnce(ev).then(() => undefined) } : {}),
+        ...(deps.forceBufferedStreaming ? { bufferedStreaming: true } : {}),
+      });
     } catch (err) {
       failure = err;
     } finally {
@@ -535,32 +651,88 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     if (!res.writableEnded) res.end();
 
     let settled: SettleResult | null = null;
-    try {
-      settled = await settle({
+    const settleFromReady = async (ready: CursorExternalReadyRecord): Promise<SettleResult | null> => {
+      if (outbox) {
+        const consumed = await consumeReadyRecord({
+          pool: deps.pgPool,
+          pricing: deps.pricing,
+          record: ready,
+          unlink: (id) => outbox.unlink(id),
+          settle,
+          logger: userLog,
+        });
+        return consumed.settled;
+      }
+      return settle({
         pool: deps.pgPool,
         pricing: deps.pricing,
         userId: uid,
-        requestId,
+        requestId: billingRequestId,
         modelId: model,
         sessionId: attribution.sessionId,
-        engineStatus: outcome.engineStatus,
-        terminalCode: outcome.terminalCode,
-        usage: outcome.usage,
+        engineStatus: ready.engineStatus,
+        terminalCode: ready.terminalCode,
+        usage: ready.usage,
         accountId,
         turnKey: attribution.turnKey,
         parentTurnKey: attribution.parentTurnKey,
         parentSessionId: attribution.parentSessionId,
         delegateAgentId: attribution.delegateAgentId,
-        // 0277 per-key attribution — always an API-key identity on this route.
         apiKeyId: args.identity.apiKey?.id ?? null,
+        preparedPlan: ready.plan,
       });
+    };
+
+    try {
+      if (sealedReady) {
+        settled = await settleFromReady(sealedReady);
+      } else if (outbox) {
+        const existing = await outbox.read(billingRequestId);
+        if (existing && existing.phase === "ready") {
+          settled = await settleFromReady(existing);
+        } else if (result?.kind === "rejected") {
+          const zeros = {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          };
+          const ready = await sealOnce({
+            evidence: { kind: "reported", usage: zeros },
+            outcome: "failed",
+            terminalCode: result.reason,
+          });
+          if (ready) settled = await settleFromReady(ready);
+        }
+        // unobserved failed/cancelled: leave intent; do not invent a zero ready.
+      } else {
+        settled = await settle({
+          pool: deps.pgPool,
+          pricing: deps.pricing,
+          userId: uid,
+          requestId: billingRequestId,
+          modelId: model,
+          sessionId: attribution.sessionId,
+          engineStatus: outcome.engineStatus,
+          terminalCode: outcome.terminalCode,
+          usage: outcome.usage,
+          accountId,
+          turnKey: attribution.turnKey,
+          parentTurnKey: attribution.parentTurnKey,
+          parentSessionId: attribution.parentSessionId,
+          delegateAgentId: attribution.delegateAgentId,
+          apiKeyId: args.identity.apiKey?.id ?? null,
+          pricingBasis: basis,
+        });
+      }
     } catch (err) {
       userLog.error("cursor_external_settle_failed", { model, accountId: accountId.toString(), err: errSummary(err) });
     }
     incrAnthropicProxySettle(outcome.settleKind);
 
     // 7) post-commit — same order as core.ts: persist first, broadcast second;
-    //    both fail-soft.
+    //    both fail-soft. append is request-keyed on the server billing id;
+    //    cost_charged broadcasts only on a new debit.
     if (settled) {
       const persisted =
         settled.attributionCredits !== null
@@ -571,7 +743,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       if (persisted !== null && args.appendCostCredits) {
         try {
           await args.appendCostCredits(
-            requestId,
+            billingRequestId,
             uid.toString(),
             persisted.toString(),
             attribution.sessionId,
@@ -581,14 +753,14 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
             attribution.parentTurnKey,
           );
         } catch (err) {
-          userLog.warn("proxy_persist_costcredits_failed", { err: errSummary(err), requestId });
+          userLog.warn("proxy_persist_costcredits_failed", { err: errSummary(err), requestId: billingRequestId });
         }
       }
       if (settled.debitedCredits !== null && settled.debitedCredits > 0n && args.broadcastToUser) {
         try {
           args.broadcastToUser(uid, {
             type: "outbound.cost_charged",
-            requestId,
+            requestId: billingRequestId,
             costCredits: settled.debitedCredits.toString(),
             balanceAfter: settled.balanceAfter === null ? null : settled.balanceAfter.toString(),
             sessionId: attribution.sessionId,
@@ -602,11 +774,15 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     userLog.info("cursor_external_settled", {
       model,
       accountId: accountId.toString(),
+      billingRequestId,
+      traceRequestId: requestId,
       engineStatus: outcome.engineStatus,
       terminalCode: outcome.terminalCode,
       usage: outcome.usage,
+      outboxPhase: sealedReady ? "ready" : outbox ? "intent" : null,
       debitedCredits: settled?.debitedCredits?.toString() ?? null,
       clamped: settled?.clamped ?? null,
+      commitDisposition: settled?.commitDisposition ?? null,
       durationMs: now() - startedAt,
     });
   }
