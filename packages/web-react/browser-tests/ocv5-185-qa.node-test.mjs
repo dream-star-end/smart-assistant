@@ -228,9 +228,24 @@ function createMock() {
     const batch = store.heldLookups.splice(0, store.heldLookups.length);
     for (const item of batch) {
       const ids = String(item.lookup || "").split(",").filter(Boolean);
-      const match = !onlyIds || ids.some((id) => onlyIds.includes(id));
-      if (match) json(item.res, 200, item.body);
-      else keep.push(item);
+      if (!onlyIds) {
+        json(item.res, 200, item.body);
+        continue;
+      }
+      const flushIds = ids.filter((id) => onlyIds.includes(id));
+      if (flushIds.length === 0) {
+        keep.push(item);
+        continue;
+      }
+      // One HTTP GET may batch several requestIds. Respond with only the
+      // flushed lookups so a late C body cannot unlock B in the same reply.
+      const body = JSON.parse(JSON.stringify(item.body));
+      if (body.permissionPrompts) {
+        body.permissionPrompts.lookups = (body.permissionPrompts.lookups || []).filter((row) =>
+          flushIds.includes(row.requestId),
+        );
+      }
+      json(item.res, 200, body);
     }
     store.heldLookups.push(...keep);
   }
@@ -548,9 +563,17 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
             wsSent: page._wsSent,
             wsRecv: page._wsRecv?.slice(-20),
             cards: parseCards(await page.getByTestId("qa-cards").textContent().catch(() => "[]")),
+            activeModal: await page.getByTestId("qa-active-modal").textContent().catch(() => ""),
+            dialogCount: await page.getByRole("dialog").count().catch(() => -1),
+            dock: await page.evaluate(() =>
+              [...document.querySelectorAll("[data-testid=pending-permission-dock] button")].map((b) =>
+                (b.textContent || "").trim(),
+              ),
+            ).catch(() => []),
             responses: store.responses,
             httpLog: store.httpLog,
             held: store.held.length,
+            heldLookups: store.heldLookups.map((h) => h.lookup),
           },
           null,
           2,
@@ -559,6 +582,50 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
     } catch {
       /* ignore dump errors */
     }
+  }
+
+  /** Native click: Radix dialog sets aria-hidden on the dock, so getByRole misses it. */
+  async function clickDockNamed(page, name) {
+    await page.getByTestId("pending-permission-dock").waitFor({ state: "attached" });
+    const info = await page.evaluate((label) => {
+      const buttons = [...document.querySelectorAll("[data-testid=pending-permission-dock] button")];
+      const names = buttons.map((b) => (b.textContent || "").trim());
+      const btn = buttons.find((b) => (b.textContent || "").trim() === label);
+      if (!btn) return { ok: false, names };
+      btn.click();
+      return { ok: true, names };
+    }, name);
+    assert.ok(info.ok, `dock button "${name}" not found: ${JSON.stringify(info.names)}`);
+  }
+
+  async function waitActive(page, requestId) {
+    await page.waitForFunction((id) => {
+      const el = document.querySelector("[data-testid=qa-active-modal]");
+      return (el?.textContent || "") === id;
+    }, requestId);
+  }
+
+  async function switchHostTo(page, requestId) {
+    const current = (await page.getByTestId("qa-active-modal").textContent()) || "";
+    if (current === requestId) return;
+    await page.getByTestId("pending-permission-dock").waitFor({ state: "attached" });
+    const n = await page.locator("[data-testid=pending-permission-dock] button").count();
+    for (let i = 0; i < n; i++) {
+      await page.evaluate((idx) => {
+        document.querySelectorAll("[data-testid=pending-permission-dock] button")[idx]?.click();
+      }, i);
+      try {
+        await page.waitForFunction((id) => {
+          const el = document.querySelector("[data-testid=qa-active-modal]");
+          return (el?.textContent || "") === id;
+        }, requestId, { timeout: 2500 });
+        return;
+      } catch {
+        /* try the next dock entry */
+      }
+    }
+    const after = (await page.getByTestId("qa-active-modal").textContent()) || "";
+    throw new Error(`failed to switch Host to ${requestId}, active=${after}`);
   }
 
   try {
@@ -1146,7 +1213,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
           return cards.some((c) => c.requestId === "req-cjk-ask" && c.truncated === true);
         });
-        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        await page.getByTestId("permission-input-loading").first().waitFor();
         assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0, "must not submit before full questions");
         await waitStore(
           () => store.httpLog.some((h) => typeof h.lookup === "string" && h.lookup.split(",").includes("req-cjk-ask")),
@@ -1202,7 +1269,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
           return cards.some((c) => c.requestId === "req-cjk-plan" && c.truncated === true);
         });
-        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        await page.getByTestId("permission-input-loading").first().waitFor();
         assert.equal(await page.getByRole("button", { name: "按此计划执行" }).count(), 0, "must not approve truncated plan");
         await waitStore(
           () => store.httpLog.some((h) => typeof h.lookup === "string" && h.lookup.split(",").includes("req-cjk-plan")),
@@ -1240,12 +1307,14 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       store.prompts.set("req-a", prompt({
         requestId: "req-a",
         toolName: "Bash",
+        toolUseId: "toolu_a",
         inputJson: { command: "echo short-a" },
         createdAt: nowMs() - 3000,
       }));
       store.prompts.set("req-b", prompt({
         requestId: "req-b",
         toolName: "AskUserQuestion",
+        toolUseId: "toolu_b",
         truncatePreview: true,
         inputPreview: "长问B…",
         inputJson: { questions: [{ question: qB, options: [{ label: "是B" }, { label: "否B" }] }] },
@@ -1254,14 +1323,16 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       store.prompts.set("req-c", prompt({
         requestId: "req-c",
         toolName: "ExitPlanMode",
+        toolUseId: "toolu_c",
         truncatePreview: true,
         inputPreview: "计划C…",
         inputJson: { plan: planC },
         createdAt: nowMs() - 1000,
       }));
       const ctx = await browser.newContext();
+      let page;
       try {
-        const page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
+        page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
         await page.evaluate(() => window.__qa.loadSession());
         await page.waitForFunction(() => {
           const cards = JSON.parse(document.querySelector("[data-testid=qa-cards]").textContent || "[]");
@@ -1269,29 +1340,43 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
             && cards.some((c) => c.requestId === "req-b" && c.truncated === true)
             && cards.some((c) => c.requestId === "req-c" && c.truncated === true);
         });
-        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        await page.getByTestId("pending-permission-dock").waitFor({ state: "attached" });
+        await page.waitForFunction(() => {
+          const names = [...document.querySelectorAll("[data-testid=pending-permission-dock] button")].map((b) =>
+            (b.textContent || "").trim(),
+          );
+          return names.includes("打开提问") && names.includes("打开审批") && names.includes("打开计划");
+        });
+        await page.getByTestId("permission-input-loading").first().waitFor();
         assert.equal(await page.getByRole("button", { name: "按此计划执行" }).count(), 0);
         assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0);
-        await page.getByRole("button", { name: "打开提问" }).click({ force: true });
-        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        await clickDockNamed(page, "打开提问");
+        await waitActive(page, "req-b");
+        await page.getByTestId("permission-modal-host").getByTestId("permission-input-loading").waitFor();
         assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0, "Ask B must not submit while lookup is held");
-        assert.equal(await page.getByRole("button", { name: "允许" }).count(), 0);
-        await page.getByRole("button", { name: "打开审批" }).click({ force: true });
+        assert.equal(await page.getByRole("dialog").getByRole("button", { name: "允许" }).count(), 0);
+        await clickDockNamed(page, "打开审批");
+        await waitActive(page, "req-a");
         await page.getByRole("dialog").waitFor({ state: "visible" });
-        assert.ok((await page.getByRole("button", { name: "允许" }).count()) >= 1, "complete short A can show allow");
-        await page.getByRole("button", { name: "打开提问" }).click({ force: true });
-        await page.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        assert.equal(await page.getByRole("dialog").count(), 1);
+        assert.ok((await page.getByRole("dialog").getByRole("button", { name: "允许" }).count()) >= 1, "complete short A can show allow");
+        await clickDockNamed(page, "打开提问");
+        await waitActive(page, "req-b");
+        await page.getByTestId("permission-modal-host").getByTestId("permission-input-loading").waitFor();
+        assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0);
         flushLookups(["req-c"]);
         await new Promise((r) => setTimeout(r, 400));
+        assert.equal((await page.getByTestId("qa-active-modal").textContent()) || "", "req-b");
         assert.equal(await page.getByRole("button", { name: "提交" }).count(), 0, "late Plan C fetch must not unlock Ask B");
         assert.equal(await page.getByRole("button", { name: "按此计划执行" }).count(), 0);
-        const bodyBefore = await page.locator("body").innerText();
-        assert.equal(bodyBefore.includes("计划C-UNIQUE"), false, "viewing B must not show C plan body");
+        const hostBefore = await page.getByTestId("permission-modal-host").innerText();
+        assert.equal(hostBefore.includes("计划C-UNIQUE"), false, "Host viewing B must not show C plan body");
         flushLookups(["req-b"]);
+        await page.getByRole("dialog").waitFor({ state: "visible" });
         await page.getByRole("radio", { name: /是B/ }).waitFor();
-        const bodyB = await page.locator("body").innerText();
-        assert.ok(bodyB.includes("长问B-UNIQUE"), "B's original question must appear after its own lookup");
-        assert.equal(bodyB.includes("计划C-UNIQUE"), false);
+        const dialogB = await page.getByRole("dialog").innerText();
+        assert.ok(dialogB.includes("长问B-UNIQUE"), "B's original question must appear after its own lookup");
+        assert.equal(dialogB.includes("计划C-UNIQUE"), false, "Ask B dialog must not include C plan body");
         const beforeSubmit = store.responses.length;
         await page.getByRole("radio", { name: /是B/ }).click();
         await page.getByRole("button", { name: "提交" }).click();
@@ -1312,15 +1397,17 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         }));
         const pageFail = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
         await pageFail.evaluate(() => window.__qa.loadSession());
-        await pageFail.getByText("完整问题仍在加载，加载完成前不能提交。").waitFor();
+        await pageFail.getByTestId("permission-input-loading").first().waitFor();
         await waitStore(
           () => store.httpLog.some((h) => typeof h.lookup === "string" && h.lookup.includes("req-b-fail")),
           "T11 failed lookup still issued HTTP",
           15_000,
         );
         assert.equal(await pageFail.getByRole("button", { name: "提交" }).count(), 0, "failed lookup must not expose submit");
+        assert.equal(await pageFail.getByRole("button", { name: "允许" }).count(), 0);
       } catch (err) {
         failures.push("T11");
+        if (page) await failShot(page, "t11").catch(() => {});
         throw err;
       } finally {
         store.holdLookup = false;
@@ -1339,65 +1426,99 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
       store.prompts.set("req-q1", prompt({
         requestId: "req-q1",
         toolName: "AskUserQuestion",
+        toolUseId: "toolu_q1",
         inputJson: { questions: [{ question: "苹果还是梨？", options: [{ label: "苹果" }, { label: "梨" }] }] },
         createdAt: nowMs() - 2000,
       }));
       store.prompts.set("req-q2", prompt({
         requestId: "req-q2",
         toolName: "AskUserQuestion",
+        toolUseId: "toolu_q2",
         inputJson: { questions: [{ question: "猫还是狗？", options: [{ label: "猫" }, { label: "狗" }] }] },
         createdAt: nowMs() - 1000,
       }));
       const ctx = await browser.newContext();
+      let page;
       try {
-        const page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
+        page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
         await page.evaluate(() => window.__qa.loadSession());
         await page.getByRole("dialog").waitFor({ state: "visible" });
-        const dockAsk = page.getByTestId("pending-permission-dock").getByRole("button", { name: "打开提问" });
-        assert.equal(await dockAsk.count(), 2);
-        await dockAsk.nth(1).click({ force: true });
-        await page.getByRole("radio", { name: /苹果/ }).waitFor();
-        await page.getByRole("radio", { name: /苹果/ }).click();
+        assert.equal(await page.getByRole("dialog").count(), 1);
+        await page.getByTestId("pending-permission-dock").waitFor({ state: "attached" });
+        assert.equal(await page.locator("[data-testid=pending-permission-dock] button").count(), 2);
+        const firstActive = (await page.getByTestId("qa-active-modal").textContent()) || "";
+        assert.ok(firstActive === "req-q1" || firstActive === "req-q2", `auto-open must be q1 or q2, got ${firstActive}`);
+        const other = firstActive === "req-q1" ? "req-q2" : "req-q1";
+        await switchHostTo(page, other);
+        await page.getByRole("dialog").waitFor({ state: "visible" });
+        assert.equal(await page.getByRole("dialog").count(), 1);
+        if (other === "req-q1") {
+          await page.getByRole("radio", { name: /苹果/ }).waitFor();
+          await page.getByRole("radio", { name: /苹果/ }).click();
+          assert.equal(await page.getByRole("radio", { name: /猫/ }).count(), 0, "switching questions must not keep Q2 radios");
+        } else {
+          await page.getByRole("radio", { name: /猫/ }).waitFor();
+          await page.getByRole("radio", { name: /猫/ }).click();
+          assert.equal(await page.getByRole("radio", { name: /苹果/ }).count(), 0, "switching questions must not keep Q1 radios");
+        }
         const respondBefore = store.responses.length;
-        await dockAsk.nth(0).click({ force: true });
-        await page.getByRole("radio", { name: /猫/ }).waitFor();
-        assert.equal(await page.getByRole("radio", { name: /苹果/ }).count(), 0, "switching questions must not keep Q1 radios");
+        await switchHostTo(page, firstActive);
+        await page.getByRole("dialog").waitFor({ state: "visible" });
+        assert.equal(await page.getByRole("dialog").count(), 1);
+        if (firstActive === "req-q1") {
+          await page.getByRole("radio", { name: /苹果/ }).waitFor();
+          assert.equal(await page.getByRole("radio", { name: /猫/ }).count(), 0);
+        } else {
+          await page.getByRole("radio", { name: /猫/ }).waitFor();
+          assert.equal(await page.getByRole("radio", { name: /苹果/ }).count(), 0);
+        }
         assert.equal(store.responses.length, respondBefore, "switch must not send permission_response");
+        assert.equal(page._qaErrors.length, 0, page._qaErrors.join("\n"));
         await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+        await page.waitForFunction(() => document.querySelectorAll("[role=dialog]").length === 0);
         assert.equal(store.responses.length, respondBefore, "close must not send permission_response");
         await shot(page, "t12-distinct-questions");
         store.prompts.clear();
         store.prompts.set("req-s1", prompt({
           requestId: "req-s1",
           toolName: "AskUserQuestion",
+          toolUseId: "toolu_s1",
           inputJson: { questions: [{ question: "同一题吗？", options: [{ label: "是" }, { label: "否" }] }] },
           createdAt: nowMs() - 2000,
         }));
         store.prompts.set("req-s2", prompt({
           requestId: "req-s2",
           toolName: "AskUserQuestion",
+          toolUseId: "toolu_s2",
           inputJson: { questions: [{ question: "同一题吗？", options: [{ label: "是" }, { label: "否" }] }] },
           createdAt: nowMs() - 1000,
         }));
         const page2 = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1`);
         await page2.evaluate(() => window.__qa.loadSession());
         await page2.getByRole("dialog").waitFor({ state: "visible" });
-        const dock2 = page2.getByTestId("pending-permission-dock").getByRole("button", { name: "打开提问" });
-        await dock2.nth(1).click({ force: true });
-        await page2.getByRole("radio", { name: /^是$/ }).click();
-        assert.equal(await page2.getByRole("radio", { name: /^是$/ }).getAttribute("aria-checked"), "true");
-        const beforeSame = store.responses.length;
-        await dock2.nth(0).click({ force: true });
+        assert.equal(await page2.getByRole("dialog").count(), 1);
+        const firstSame = (await page2.getByTestId("qa-active-modal").textContent()) || "";
+        assert.ok(firstSame === "req-s1" || firstSame === "req-s2", `same-text auto-open got ${firstSame}`);
+        const otherSame = firstSame === "req-s1" ? "req-s2" : "req-s1";
+        await switchHostTo(page2, otherSame);
         await page2.getByRole("dialog").waitFor({ state: "visible" });
+        await page2.getByRole("dialog").getByRole("radio", { name: /^是$/ }).click();
+        assert.equal(await page2.getByRole("dialog").getByRole("radio", { name: /^是$/ }).getAttribute("aria-checked"), "true");
+        const beforeSame = store.responses.length;
+        await switchHostTo(page2, firstSame);
+        await page2.getByRole("dialog").waitFor({ state: "visible" });
+        assert.equal(await page2.getByRole("dialog").count(), 1);
         assert.equal(
-          await page2.getByRole("radio", { name: /^是$/ }).getAttribute("aria-checked"),
+          await page2.getByRole("dialog").getByRole("radio", { name: /^是$/ }).getAttribute("aria-checked"),
           "false",
           "same question different requestId must not inherit unsubmitted selection",
         );
         assert.equal(store.responses.length, beforeSame);
+        assert.equal(page2._qaErrors.length, 0, page2._qaErrors.join("\n"));
         await shot(page2, "t12-same-question-isolated");
       } catch (err) {
         failures.push("T12");
+        if (page) await failShot(page, "t12").catch(() => {});
         throw err;
       } finally {
         await ctx.close();
