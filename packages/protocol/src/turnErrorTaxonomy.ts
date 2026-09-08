@@ -87,6 +87,9 @@ export const TURN_ERROR_TAXONOMY = {
   session_persist_unavailable: { retryable: true, cta: 'retry' },
   /** bridge bindAuthorityTurnDispatch 失败(含 cron-origin 未收养成功)。手动重试走新 dispatch。 */
   durable_dispatch_unavailable: { retryable: true, cta: 'retry' },
+  /** Only the pre-transfer origin's durable identity/send-intent fences authorize replay. */
+  dispatch_enrichment_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  dispatch_preparation_retry_exhausted: { retryable: true, cta: 'retry' },
   stopped: { retryable: false, cta: 'none', expected: true, reportable: false },
   user_cancelled: { retryable: false, cta: 'none', expected: true, reportable: false },
   runner_crashed: { retryable: true, automaticRecovery: true, cta: 'retry' },

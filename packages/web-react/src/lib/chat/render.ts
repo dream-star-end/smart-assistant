@@ -34,6 +34,8 @@ export const DISPATCH_LOST_ERROR_CODES = new Set([
   "dispatch_not_accepted",
   "service_restart",
   "durable_dispatch_unavailable",
+  "dispatch_enrichment_timeout",
+  "dispatch_preparation_retry_exhausted",
 ]);
 
 /** 归一化后是否命中 dispatch 终态错误码。 */
@@ -549,6 +551,8 @@ const ERROR_LABELS: Record<string, string> = {
   auth_error: "认证状态异常",
   service_restart: "服务重启，本轮已中断",
   session_persist_unavailable: "消息暂未安全送达",
+  dispatch_enrichment_timeout: "环境准备超时",
+  dispatch_preparation_retry_exhausted: "环境准备多次超时",
   durable_dispatch_unavailable: "派发未能接入执行通道",
   stopped: "已停止本轮生成",
   user_cancelled: "已取消本轮",

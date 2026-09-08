@@ -22,6 +22,7 @@ function fakeTransactionalPool(
   const client = {
     async query(sql: string, params: unknown[] = []) {
       calls.push(sql.replace(/\s+/g, ' ').trim())
+      if (sql.includes('SELECT id FROM client_sessions') || sql.includes('UPDATE client_sessions')) return { rows: [],rowCount: 1 }
       if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') {
         return { rows: [], rowCount: 0 }
       }
@@ -70,15 +71,16 @@ describe('Master durable turn controls', () => {
     })
     assert.deepEqual(result, { inserted: true, status: 'pending' })
     assert.equal(calls[0], 'BEGIN')
-    assert.ok(calls[1]?.startsWith('SELECT pg_advisory_xact_lock'))
-    assert.ok(calls[2]?.startsWith('SELECT root_client_message_id'))
-    assert.ok(calls[3]?.startsWith('SELECT pg_advisory_xact_lock'))
-    assert.ok(calls[4]?.startsWith('INSERT INTO turn_control_requests'))
+    assert.ok(calls[1]?.startsWith('SELECT id FROM client_sessions'))
+    assert.ok(calls[2]?.startsWith('SELECT pg_advisory_xact_lock'))
+    assert.ok(calls[3]?.startsWith('SELECT root_client_message_id'))
+    assert.ok(calls[4]?.startsWith('SELECT pg_advisory_xact_lock'))
+    assert.ok(calls[5]?.startsWith('INSERT INTO turn_control_requests'))
     // INC-20260903-PENDING-PERMISSION-ZOMBIE: the pending prompts of the
     // stopped turn are closed inside the same Stop transaction.
-    assert.ok(calls[5]?.startsWith('UPDATE turn_permission_requests p'))
-    assert.ok(calls[6]?.startsWith('SELECT status,dispatch_id,dispatch_attempt_no'))
-    assert.ok(calls[7]?.startsWith('UPDATE turn_recovery_jobs'))
+    assert.ok(calls[6]?.startsWith('UPDATE turn_permission_requests p'))
+    assert.ok(calls[7]?.startsWith('SELECT status,dispatch_id,dispatch_attempt_no'))
+    assert.ok(calls[8]?.startsWith('UPDATE turn_recovery_jobs'))
     assert.equal(calls.at(-1), 'COMMIT')
     assert.equal(permissionCancels.length, 1)
     const [uid, sid, root, controlId, responseJson] = permissionCancels[0]!
@@ -120,8 +122,8 @@ describe('Master durable turn controls', () => {
       }
       if (sql.includes('SELECT status,dispatch_id,dispatch_attempt_no')) {
         return { rows: [
-          { status: 'leased', dispatch_id: 'dispatch-pre', dispatch_attempt_no: 1 },
-          { status: 'sent', dispatch_id: 'dispatch-sent', dispatch_attempt_no: 2 },
+          { status: 'leased', dispatch_id: 'dispatch-pre', dispatch_attempt_no: 1,preparation_send_intent_at: null },
+          { status: 'sent', dispatch_id: 'dispatch-sent', dispatch_attempt_no: 2,preparation_send_intent_at: null },
         ] }
       }
       if (sql.includes('UPDATE turn_permission_requests p')) return { rowCount: 0 }

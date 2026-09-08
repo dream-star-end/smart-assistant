@@ -14,3 +14,6 @@ packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts
 packages/commercial/src/__tests__/sessionUnread.integ.test.ts
 packages/commercial/src/__tests__/inbox.integ.test.ts
 packages/commercial/src/inbox/__tests__/onboarding.integ.test.ts
+
+# Durable preparation retry source/intent/cap behavior (OCV5-174).
+packages/commercial/src/__tests__/preparationRecovery.integ.test.ts

@@ -3,6 +3,7 @@
  * (packages/commercial/src/http/{handlers,agent}.ts)。
  */
 import type {
+  PendingPreparationRecovery,
   MarketplaceArtifactKind,
   MarketplaceCapabilityInstallOutcome,
   MarketplaceCapabilityReadiness,
@@ -490,6 +491,7 @@ export type SessionDetail = {
   archivedCount?: number;
   /** 已归档的最大 `_orderSeq` 水位；字段名为滚动兼容保留。缺省=0。*/
   archivedThroughSeq?: number;
+  pendingRecovery?: PendingPreparationRecovery | null;
   openDispatch?: {
     dispatchId: string;
     clientMessageId: string;

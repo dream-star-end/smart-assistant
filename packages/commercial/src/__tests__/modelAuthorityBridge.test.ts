@@ -247,6 +247,7 @@ async function startRig(opts: {
   /** OCV5-187: verify the actual signed WS body before issuing a receipt. */
   verifyDispatchReceipt?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
+  failPreparationAndScheduleRecovery?: UserChatBridgeDeps["failPreparationAndScheduleRecovery"];
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
   getFrontendBuildId?: UserChatBridgeDeps["getFrontendBuildId"];
@@ -515,6 +516,9 @@ async function startRig(opts: {
     containerConnectTimeoutMs: 1500,
     ...(modelAuthority ? { modelAuthority } : {}),
     ...(admitUserTurn ? { admitUserTurn } : {}),
+    ...(opts.failPreparationAndScheduleRecovery
+      ? { failPreparationAndScheduleRecovery: opts.failPreparationAndScheduleRecovery }
+      : {}),
     ...(opts.loadMasterSessionMessages
       ? { loadMasterSessionMessages: opts.loadMasterSessionMessages }
       : {}),
@@ -1189,6 +1193,114 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
     },
   };
 }
+
+describe("OCV5-174 preparation ownership through real WebSockets", () => {
+  test("duplicate during preparation cannot cancel owner; one job and zero late sends", async () => {
+    let finishHistory!: (rows: unknown[]) => void;
+    const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+    let historyReads = 0;
+    let admissions = 0;
+    const scheduled: string[] = [];
+    const terminals: unknown[][] = [];
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true,
+      promptQueuePreparationTimeoutMs: 80,
+      pgPool: { query: async (sql: string, params: unknown[] = []) => {
+        if (/SET status = 'terminal'/.test(sql)) terminals.push(params);
+        return { rows: [], rowCount: 0 };
+      } },
+      admitUserTurn: async (input) => { admissions++; return fakeAdmittedDispatch(input); },
+      loadMasterSessionMessages: async () => { historyReads++; return history; },
+      failPreparationAndScheduleRecovery: async (input) => {
+        scheduled.push(input.dispatchId);
+        return { kind: "scheduled" };
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const frame = inboundFrame({ clientMessageId: "cm-prep-duplicate", peer: { id: "sess-prep-duplicate", kind: "dm" } });
+      ws.send(frame);
+      await waitFor(() => historyReads === 1);
+      ws.send(frame);
+      await waitFor(() => scheduled.length === 1);
+      finishHistory([]);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.equal(admissions, 1, "duplicate observes the existing dispatch rather than owning preparation");
+      assert.equal(historyReads, 1);
+      assert.equal(scheduled.length, 1, "only the first timer can schedule recovery");
+      assert.equal(terminals.length, 0, "source terminalization belongs to the atomic backend, not a second CAS");
+      assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0);
+      ws.terminate();
+    } finally { finishHistory([]); await stopRig(rig); }
+  });
+
+  test("successful send with missing receipt and repeated cmid never gains another timer/job", async () => {
+    let admissions = 0;
+    let historyReads = 0;
+    let scheduled = 0;
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, holdDispatchReceipt: true,
+      promptQueuePreparationTimeoutMs: 400,
+      admitUserTurn: async (input) => { admissions++; return fakeAdmittedDispatch(input); },
+      loadMasterSessionMessages: async () => { historyReads++; return []; },
+      failPreparationAndScheduleRecovery: async () => { scheduled++; return { kind: "scheduled" }; },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const observed: unknown[] = [];
+      ws.on("message", (data) => { try { observed.push(JSON.parse(String(data))); } catch {} });
+      const frame = inboundFrame({ clientMessageId: "cm-prep-sent-duplicate", peer: { id: "sess-prep-sent-duplicate", kind: "dm" } });
+      ws.send(frame);
+      await waitFor(() => rig.containerSeen.some((raw) => JSON.parse(raw).type === "inbound.message"))
+        .catch(() => assert.fail(JSON.stringify({ observed, errors: rig.deferredPoolErrors.map(String) })));
+      ws.send(frame);
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      assert.equal(admissions, 1);
+      assert.equal(historyReads, 1);
+      assert.equal(scheduled, 0, "missing receipt is unknown, never proof of non-execution");
+      assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 1);
+      assert.deepEqual(rig.deferredPoolErrors, [], "duplicate must not terminalize the already-sent source");
+      ws.terminate();
+    } finally { await stopRig(rig); }
+  });
+
+  for (const invalid of ["takeover", "foreign_uuid", "later_attempt", "later_epoch"] as const) {
+    test(`source ${invalid} never qualifies for a new preparation child`, async () => {
+      let scheduled = 0;
+      let finishHistory!: (rows: unknown[]) => void;
+      const history = new Promise<unknown[]>((resolve) => { finishHistory = resolve; });
+      const terminalCodes: unknown[] = [];
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, promptQueuePreparationTimeoutMs: 40,
+        pgPool: { query: async (sql: string, params: unknown[] = []) => {
+          if (/SET status = 'terminal'/.test(sql)) terminalCodes.push(params[2]);
+          return { rows: [], rowCount: 0 };
+        } },
+        admitUserTurn: async (input) => {
+          const result = fakeAdmittedDispatch(input);
+          assert.equal(result.kind, "admitted");
+          if (invalid === "takeover") result.takeover = true;
+          if (invalid === "foreign_uuid") result.dispatch.dispatchId = "00000000-0000-0000-0000-000000000174";
+          if (invalid === "later_attempt") result.dispatch.attemptNo = 2;
+          if (invalid === "later_epoch") result.dispatch.leaseEpoch = 2;
+          return result;
+        },
+        loadMasterSessionMessages: async () => history,
+        failPreparationAndScheduleRecovery: async () => { scheduled++; return { kind: "scheduled" }; },
+      });
+      try {
+        const ws = await openClient(rig.port);
+        ws.send(inboundFrame({ clientMessageId: `cm-prep-${invalid}`, peer: { id: "sess-prep-invalid", kind: "dm" } }));
+        await waitFor(() => terminalCodes.includes("dispatch_enrichment_timeout"));
+        finishHistory([]);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        assert.equal(scheduled, 0);
+        assert.equal(rig.containerSeen.filter((raw) => JSON.parse(raw).type === "inbound.message").length, 0);
+        ws.terminate();
+      } finally { finishHistory([]); await stopRig(rig); }
+    });
+  }
+});
 
 describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
   const cases = [

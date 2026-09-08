@@ -193,6 +193,7 @@ import {
   forwardRecoveryUnderRootFence,
   markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
+  releasePreparationPreReceipt,
   releaseRecoveryForTransportWait,
   type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
@@ -1151,6 +1152,10 @@ export interface UserChatBridgeDeps {
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
+  failPreparationAndScheduleRecovery?: (input: {
+    uid: bigint; sessionId: string; clientMessageId: string; dispatchId: string;
+    attemptNo: number; ownerId: string; leaseEpoch: number;
+  }) => Promise<{ kind: "scheduled" | "not_eligible" | "lost_ownership" }>;
   reconcileAutomaticRecoveryJobs?: (uid: bigint, limit?: number) => Promise<number>;
   /** Authoritative session cwd policy. V5 production always injects this;
    * legacy/test compositions may omit it and retain the shared workspace. */
@@ -3692,6 +3697,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       requestHash: string;
       /** Present only for a Master-scheduled automatic recovery. */
       recoveryJob?: ClaimedRecoveryJob;
+      /** One-shot proof, never restored by same-owner replay or takeover. */
+      sourceReplayEligible?: boolean;
+      /** Keep the consumed fence even after the active timer/map is removed. */
+      enrichmentState?: EnrichmentDispatchState;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
@@ -3702,6 +3711,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       closedFailureCode: string;
       /** Absolute authority; timer is only a wake-up mechanism. */
       deadlineAt: number;
+      startedAt: number;
+      stage: "admission" | "workspace" | "history" | "goal" | "transfer";
+      stageStartedAt: number;
       timer: ReturnType<typeof setTimeout> | null;
     }
     // Linearization boundary for the only proven unsafe window: a durable
@@ -3778,20 +3790,42 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       state: EnrichmentDispatchState,
       failureCode: string,
     ): boolean => {
+      const sourceReplayEligible = failureCode === "dispatch_enrichment_timeout" &&
+        state.phase === "enriching" && state.record.sourceReplayEligible === true;
       if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
+      record.sourceReplayEligible = false;
+      bridgeLog?.info("user-chat-bridge: preparation ended", {
+        dispatchId: record.dispatchId, failureCode, stage: state.stage,
+        elapsedMs: Date.now() - state.startedAt, stageElapsedMs: Date.now() - state.stageStartedAt,
+        sourceReplayEligible,
+      });
       const pool = deps.pgPool;
       void (async (): Promise<void> => {
         try {
           if (!pool) return;
           if (record.recoveryJob) {
-            await releaseRecoveryPreReceipt(pool, {
+            const release = record.recoveryJob.jobOrigin === "pre_transfer_enrichment"
+              ? releasePreparationPreReceipt : releaseRecoveryPreReceipt;
+            await release(pool, {
               job: record.recoveryJob,
               dispatchId: record.dispatchId,
               dispatchOwner: record.leaseOwnerId,
               dispatchLeaseEpoch: record.leaseEpoch,
+              failureCode,
             });
           } else {
+            if (sourceReplayEligible && deps.failPreparationAndScheduleRecovery) {
+              const result = await deps.failPreparationAndScheduleRecovery({
+                uid, sessionId: record.sessionId, clientMessageId: record.clientMessageId,
+                dispatchId: record.dispatchId, attemptNo: record.attemptNo,
+                ownerId: record.leaseOwnerId, leaseEpoch: record.leaseEpoch,
+              });
+              if (result.kind !== "not_eligible") {
+                if (result.kind === "scheduled") void drainDurableRecoveryForUser(uid);
+                return;
+              }
+            }
             await casToTerminal(pool, {
               dispatchId: record.dispatchId,
               outcome: "executed_error",
@@ -3822,15 +3856,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       record: AdmittedDispatch,
       closedFailureCode = "bridge_closed_during_admission",
     ): EnrichmentDispatchState => {
-      const existing = enrichmentDispatches.get(record.clientMessageId);
+      const existing = record.enrichmentState ?? enrichmentDispatches.get(record.clientMessageId);
       if (existing && existing.record === record) return existing;
       const state: EnrichmentDispatchState = {
         record,
         phase: "enriching",
         closedFailureCode,
         deadlineAt: Date.now() + promptQueuePreparationTimeoutMs,
+        startedAt: Date.now(),
+        stage: "admission",
+        stageStartedAt: Date.now(),
         timer: null,
       };
+      record.enrichmentState = state;
       enrichmentDispatches.set(record.clientMessageId, state);
       const expireIfDue = (): boolean => {
         if (state.phase !== "enriching" || Date.now() < state.deadlineAt) return false;
@@ -3880,6 +3918,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
+    const setPreparationStage = (
+      state: EnrichmentDispatchState | null,
+      stage: EnrichmentDispatchState["stage"],
+    ): void => {
+      if (!state || state.stage === stage) return;
+      bridgeLog?.info("user-chat-bridge: preparation stage", {
+        dispatchId: state.record.dispatchId, stage: state.stage,
+        elapsedMs: Date.now() - state.stageStartedAt,
+      });
+      state.stage = stage;
+      state.stageStartedAt = Date.now();
+    };
+
     /** Synchronous fence immediately before ws.send. No await is permitted
      * between this transition and the call into the websocket implementation. */
     const beginEnrichmentTransfer = (
@@ -3890,6 +3941,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (!state || state.record !== record) return null;
       if (enrichmentDeadlineChecks.get(state)?.() === true) return null;
       if (state.phase !== "enriching") return null;
+      record.sourceReplayEligible = false;
+      setPreparationStage(state, "transfer");
       state.phase = "transferring";
       enrichmentDeadlineChecks.delete(state);
       if (state.timer !== null) {
@@ -3909,6 +3962,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * ws.send callback. Win the pre-forward fence synchronously before any PG
      * await so a following close cannot misclassify an already accepted turn. */
     const acceptEnrichmentReceipt = (record: AdmittedDispatch): boolean => {
+      record.sourceReplayEligible = false;
       const state = enrichmentDispatches.get(record.clientMessageId);
       if (!state) return true;
       if (state.record !== record || state.phase === "terminalizing") return false;
@@ -3967,11 +4021,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       dropAdmittedDispatch(record.clientMessageId);
       if (!pool) return;
       if (record.recoveryJob) {
-        void releaseRecoveryPreReceipt(pool, {
+        const release = record.recoveryJob.jobOrigin === "pre_transfer_enrichment"
+          ? releasePreparationPreReceipt : releaseRecoveryPreReceipt;
+        void release(pool, {
           job: record.recoveryJob,
           dispatchId: record.dispatchId,
           dispatchOwner: record.leaseOwnerId,
           dispatchLeaseEpoch: record.leaseEpoch,
+          failureCode,
         }).catch(() => {});
         return;
       }
@@ -4221,6 +4278,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ? [
               "sourceClientMessageId", "mode", "automatic", "rootClientMessageId", "attempt", "max",
               ...(recoveryJob !== undefined ? ["resetNativeSession"] : []),
+              ...(recoveryJob?.jobOrigin === "pre_transfer_enrichment" ? ["cause"] : []),
             ]
           : ["sourceClientMessageId", "mode", "automatic"];
         if (
@@ -4236,6 +4294,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             max !== AUTOMATIC_TURN_RETRY_MAX
           )) ||
           (resetNativeSession !== undefined && !masterScheduledReset) ||
+          (recovery?.cause !== undefined && recovery.cause !== "preparation") ||
           keys.some((key) => !allowedKeys.includes(key)) ||
           identity?.clientMessageId !== clientMessageId ||
           identity?.idempotencyKey !== frameObj.idempotencyKey
@@ -4279,9 +4338,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (clientMessageId !== null && admittedThisFrame === null) {
         const preAdmitted = admittedDispatches.get(clientMessageId);
         if (preAdmitted !== undefined) {
-          admittedThisFrame = trackEnrichmentDispatch(preAdmitted);
-          if (!isEnriching(admittedThisFrame)) return null;
-          ensureDispatchHeartbeat();
+          // A repeated frame is an observer, not another preparation owner.
+          // In particular its early return must not terminalize the first
+          // frame's still-live history read or resurrect a consumed timer.
+          if (preAdmitted.requestHash !== computeDispatchRequestHash(
+            frameObj.content as DispatchRequestContent | null | undefined,
+          )) {
+            sendErrorFrame(userWs, "TURN_IMMUTABLE_CONFLICT", "message content changed for the same id",
+              { peerId, clientMessageId });
+          } else sendAdmissionAck();
+          return null;
         }
       }
 
@@ -4477,6 +4543,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               agentContainerId: containerId ?? null,
               runtimeKind: endpoint.desktop ? "desktop" : "docker",
               message,
+              preparationRequest: frameObj,
               ...(validatedRecovery ? { recovery: validatedRecovery } : {}),
               ...(recoveryJob ? {
                 recoveryJob: {
@@ -4531,6 +4598,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 leaseOwnerId: d.ownerId,
                 anchorSeq: d.anchorSeq,
                 requestHash,
+                sourceReplayEligible: !recoveryJob && admit.takeover === false &&
+                  d.dispatchId === dispatchId && d.attemptNo === 1 && d.leaseEpoch === 1,
                 ...(recoveryJob ? { recoveryJob } : {}),
               };
               admittedDispatches.set(clientMessageId, admittedRecord);
@@ -4572,6 +4641,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       rootClientMessageId: validatedRecovery.rootClientMessageId,
                       attempt: validatedRecovery.attempt,
                       max: validatedRecovery.max,
+                      ...(recoveryJob.jobOrigin === "pre_transfer_enrichment" ? { cause: "preparation" } : {}),
                       agentId: admitAgentId,
                       ...(admitModel ? { model: admitModel } : {}),
                       ...(displayText ? { displayText } : {}),
@@ -4726,6 +4796,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 终态化本帧受理的 dispatch —— try/finally 收口:成功交棒前置空 admittedThisFrame(所有权移交
       // 调用方,由它 lookupAdmittedDispatch 后走 failDispatchPreForward);未交棒即离开 → CAS terminal。
       try {
+        setPreparationStage(admittedThisFrame, "workspace");
         if (sessionWorkspaceMode === null) {
           if (deps.loadSessionWorkspaceMode) {
             try {
@@ -4752,6 +4823,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             sessionWorkspaceMode = "legacy";
           }
         }
+        setPreparationStage(admittedThisFrame, "history");
         const historyOk = await ensureHistory();
         if (admittedThisFrame !== null && !isEnriching(admittedThisFrame)) return null;
         if (!historyOk && admittedThisFrame !== null) {
@@ -4790,6 +4862,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
         if (deps.loadGoalState) {
+          setPreparationStage(admittedThisFrame, "goal");
           // 二分语义收敛到 resolveTurnGoalState 单一权威(NOT_FOUND=确定性放行 vs 其它=拒轮);
           // 副作用(错误帧/日志/回滚)仍留在此调用点。见该函数头注释。
           const resolved = await resolveTurnGoalState(deps.loadGoalState, uid, peerId);

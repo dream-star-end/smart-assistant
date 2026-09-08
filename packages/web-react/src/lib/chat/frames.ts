@@ -244,6 +244,7 @@ export type RecoveryDecisionWire = {
   peer?: Peer;
   sourceClientMessageId: string;
   errorCode: string;
+  cause?: "preparation";
   ts?: number;
 } & (
   | {
@@ -280,6 +281,7 @@ export type AckWire = {
    * would keep the source terminal card while the retry silently runs. */
   recovery?: {
     automatic: true;
+    cause?: "preparation";
     mode: "checkpoint" | "replay";
     sourceClientMessageId: string;
     rootClientMessageId: string;

@@ -1808,6 +1808,8 @@ function mergeLocalClientFields(
       (localMsg._recoveryMode === "checkpoint" || localMsg._recoveryMode === "replay")
         ? { _recoveryMode: localMsg._recoveryMode }
         : {}),
+      ...(serverMsg._automaticRecoveryCause === undefined && localMsg._automaticRecoveryCause === "preparation"
+        ? { _automaticRecoveryCause: "preparation" as const } : {}),
       ...(serverMsg._automaticRecovery === undefined &&
       typeof localMsg._automaticRecovery === "boolean"
         ? { _automaticRecovery: localMsg._automaticRecovery }
@@ -2193,6 +2195,8 @@ export class SessionStore {
                 _recoveryOfClientMessageId: recovery.sourceClientMessageId,
                 _recoveryMode: recovery.mode,
                 _automaticRecovery: recovery.automatic,
+                ...(recovery.automatic && "cause" in recovery && recovery.cause === "preparation"
+                  ? { _automaticRecoveryCause: "preparation" as const } : {}),
               }
             : {}),
           _routing: {

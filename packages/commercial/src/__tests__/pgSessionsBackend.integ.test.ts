@@ -108,6 +108,7 @@ const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_
 const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
 const MIGRATION_0246_CHAT_PROJECT = path.resolve(here, "../db/migrations/0246_chat_project_board_bind.sql");
+const MIGRATION_0279 = path.resolve(here, "../db/migrations/0279_preparation_recovery_origin.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -246,6 +247,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0246_CHAT_PROJECT, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0279, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE agent_containers (
       id BIGSERIAL PRIMARY KEY,
@@ -7019,6 +7021,94 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       )
     ).rows[0]!;
     assert.equal(identityReplay.timeline_generation, identityAfter.timeline_generation);
+  });
+
+  maybe("OCV5-174 notified and history identity roll back together and survive reader restart", async () => {
+    const sessionId = "s-preparation-reconcile-atomic";
+    const clientMessageId = "cm-preparation-reconcile-atomic";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admitted = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+    assert.equal(admitted.kind, "admitted");
+    const dispatchId = (admitted as { dispatch: { dispatchId: string } }).dispatch.dispatchId;
+    await casToTerminal(pool, { dispatchId, outcome: "executed_error", failureCode: "dispatch_enrichment_timeout" });
+    const snapshot = async () => (await pool.query(`SELECT d.client_notified,s.history_revision::text,s.timeline_generation::text
+      FROM turn_dispatches d JOIN client_sessions s ON s.id=d.session_id AND s.user_id='c:'||d.user_id::text
+      WHERE d.dispatch_id=$1`, [dispatchId])).rows[0];
+    const before = await snapshot();
+    const deps = {
+      pool,
+      container: {
+        rejectIfAbsent: async () => ({ kind: "unreachable" as const, detail: "unused" }),
+        getDispatchState: async () => ({ kind: "unreachable" as const, detail: "unused" }),
+      },
+      assessBilling: async () => "not_billed" as const,
+    };
+    await pool.query(`CREATE FUNCTION preparation_fail_revision() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.id='s-preparation-reconcile-atomic' AND NEW.history_revision<>OLD.history_revision THEN
+        RAISE EXCEPTION 'injected revision fault'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER preparation_fail_revision BEFORE UPDATE ON client_sessions
+      FOR EACH ROW EXECUTE FUNCTION preparation_fail_revision()`);
+    try {
+      const failed = await runReconcileTick(deps);
+      assert.equal(failed.notified, 0);
+      assert.deepEqual(await snapshot(), before, "notified must not commit ahead of its durable cursor invalidation");
+    } finally {
+      await pool.query("DROP TRIGGER preparation_fail_revision ON client_sessions; DROP FUNCTION preparation_fail_revision()");
+    }
+    const recovered = await runReconcileTick(deps);
+    assert.equal(recovered.notified, 1, "original unnotified row remains discoverable after rollback");
+    const after = await snapshot();
+    assert.equal(after.client_notified, true);
+    assert.equal(BigInt(after.history_revision), BigInt(before.history_revision) + 1n);
+    assert.equal(BigInt(after.timeline_generation), BigInt(before.timeline_generation) + 1n);
+    const restarted = createPgSessionsBackend(pool, { expectedGeneration: GENERATION });
+    const page = await restarted.readClientTimelinePage(sessionId, CUSER, null, 100);
+    assert.ok(page!.messages.some((m) => m.id === `turn-status:${dispatchId}`), "a fresh reader sees terminal without a WS nudge/new user message");
+    assert.equal((await runReconcileTick(deps)).notified, 0);
+    assert.deepEqual(await snapshot(), after, "retry is idempotent");
+  });
+
+  maybe("OCV5-174 real PG session-first barrier leaves dispatch unlocked while reconciler waits", async () => {
+    const sessionId = "s-preparation-reconcile-lock";
+    const clientMessageId = "cm-preparation-reconcile-lock";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admitted = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+    assert.equal(admitted.kind, "admitted");
+    const dispatchId = (admitted as { dispatch: { dispatchId: string } }).dispatch.dispatchId;
+    await casToTerminal(pool, { dispatchId, outcome: "executed_error", failureCode: "dispatch_enrichment_timeout" });
+    const reconcilePool = new Pool({ connectionString: TEST_DB_URL, max: 2,
+      application_name: "ocv5174-reconcile-barrier", options: `-c search_path=${SCHEMA} -c statement_timeout=5000` });
+    const holder = await pool.connect();
+    let inFlight: ReturnType<typeof runReconcileTick> | undefined;
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE", [sessionId, CUSER]);
+      inFlight = runReconcileTick({ pool: reconcilePool, assessBilling: async () => "not_billed",
+        container: {
+          rejectIfAbsent: async () => ({ kind: "unreachable" as const, detail: "unused" }),
+          getDispatchState: async () => ({ kind: "unreachable" as const, detail: "unused" }),
+        },
+      });
+      let blocked = false;
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const waiters = await pool.query(`SELECT 1 FROM pg_stat_activity WHERE application_name='ocv5174-reconcile-barrier'
+          AND wait_event_type='Lock' AND query LIKE '%client_sessions%'`);
+        if (waiters.rowCount) { blocked = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(blocked, true, "barrier must really observe the reconciler blocked on S");
+      await holder.query("SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1 FOR UPDATE NOWAIT", [dispatchId]);
+      // Old D->S code fails NOWAIT here; no deadlock retry or swallowed 40P01 can make this pass.
+      await holder.query("COMMIT");
+      assert.equal((await inFlight).notified, 1);
+      assert.equal((await getDispatch(pool, dispatchId))!.clientNotified, true);
+    } finally {
+      await holder.query("ROLLBACK").catch(() => {});
+      holder.release();
+      await inFlight?.catch(() => {});
+      await reconcilePool.end();
+    }
   });
 
   maybe("超 4 MiB 用户消息受理为精确侧车:热行恒小、范围读无损、模型上下文仍取真实文本", async () => {

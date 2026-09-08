@@ -2487,10 +2487,18 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
  * completed on tape. Hydrate/replay would otherwise append a phantom red card
  * at the end of a finished session. Never suppress the active in-flight turn.
  */
+function isSupersededPreparationError(sess: ChatSession, code: unknown, cmid: string | undefined): boolean {
+  return !!cmid && normalizeBridgeErrorCode(code) === "dispatch_enrichment_timeout" &&
+    (sess._cancelledAutomaticRecoveryIds?.[cmid] === true ||
+      sess.messages.some((m) => m.role === "user" && m._automaticRecoveryCause === "preparation" &&
+        m._recoveryOfClientMessageId === cmid));
+}
+
 export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: OutboundErrorWire): boolean {
   const cmid = typeof frame.clientMessageId === "string" && frame.clientMessageId
     ? frame.clientMessageId
     : undefined;
+  if (isSupersededPreparationError(sess, frame.code, cmid)) return true;
   if (cmid && sess._activeClientMessageId === cmid) return false;
   const isCompletedTapeAssistant = (m: ChatSession["messages"][number]) =>
     m.role === "assistant" && m._turnTapeComplete === true && !m._errorCode;
@@ -2599,7 +2607,7 @@ function problemCardRootCmid(sess: ChatSession, cmid: string | undefined): strin
  * retrying。attempt 按源轮血统推导(源 user 行已是恢复子轮 → 其 attempt+1,否则 1);后续
  * `sys.recovery_decision` / `outbound.ack{recovery}` 带权威 attempt 再覆盖。
  */
-function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: string | undefined): void {
+function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: string | undefined, code: string): void {
   const source = clientMessageId
     ? sess.messages.find((m) => m.role === "user" && m.id === clientMessageId)
     : undefined;
@@ -2618,6 +2626,7 @@ function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: stri
     attempt,
     max: AUTOMATIC_TURN_RETRY_MAX,
     retryAt: Date.now(),
+    ...(code === "dispatch_enrichment_timeout" ? { cause: "preparation" as const } : {}),
   };
 }
 
@@ -2648,7 +2657,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
   ) {
     sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
+    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId, normalized);
     effects.persistSession?.(sess.id);
     const deferredRoot = problemCardRootCmid(sess, sess._deferredTerminalErrorClientMessageId);
     if (deferredRoot) {
@@ -2704,6 +2713,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
 
 // ═══════════════ legacy bridge error（type:'error'）═══════════════
 export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErrorWire, effects: FrameEffects = {}): void {
+  if (isSupersededPreparationError(sess, frame.code, frame.clientMessageId)) return;
   if (isBridgeAuthControlError(frame.code)) {
     effects.onAuthControlError?.();
     return;
@@ -2724,7 +2734,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
   ) {
     sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
-    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId);
+    enterDeferredRecoverySoftState(sess, sess._deferredTerminalErrorClientMessageId, normalized);
     effects.persistSession?.(sess.id);
     const deferredRoot = problemCardRootCmid(sess, sess._deferredTerminalErrorClientMessageId);
     if (deferredRoot) {

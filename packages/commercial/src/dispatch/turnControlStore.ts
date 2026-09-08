@@ -126,6 +126,9 @@ export async function admitDurableControl(
   return inTransaction(pool, async (client) => {
     let effectiveRootClientMessageId = input.rootClientMessageId ?? null
     if (input.kind === 'stop') {
+      // S -> A -> J/D: terminal cancellation and visibility commit together.
+      await client.query(`SELECT id FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+        [input.sessionId, `c:${input.userId.toString()}`])
       await client.query(
         `SELECT pg_advisory_xact_lock(hashtextextended(
            'oc_recovery_session:' || $1::text || ':' || $2, 0
@@ -206,8 +209,11 @@ export async function admitDurableControl(
         status: 'queued' | 'leased' | 'sent'
         dispatch_id: string | null
         dispatch_attempt_no: number | null
+        preparation_send_intent_at: Date | null
+        source_dispatch_id: string | null
+        job_origin: string
       }>(
-        `SELECT status,dispatch_id,dispatch_attempt_no
+        `SELECT status,dispatch_id,dispatch_attempt_no,preparation_send_intent_at,source_dispatch_id,job_origin
            FROM turn_recovery_jobs
           WHERE user_id=$1 AND session_id=$2
             AND ($3::text IS NULL OR root_client_message_id=$3)
@@ -229,7 +235,7 @@ export async function admitDurableControl(
       // sent jobs may already be executing and are stopped only by the
       // ordered runtime control below.
       const preSendDispatches = cancellable.rows.filter(
-        (row) => row.status !== 'sent' && row.dispatch_id !== null,
+        (row) => row.status !== 'sent' && row.dispatch_id !== null && row.preparation_send_intent_at === null,
       )
       for (const row of preSendDispatches) {
         await client.query(
@@ -240,6 +246,15 @@ export async function admitDurableControl(
           [row.dispatch_id, row.dispatch_attempt_no],
         )
       }
+      for (const row of cancellable.rows) {
+        if (row.job_origin !== 'pre_transfer_enrichment' || row.dispatch_id !== null) continue
+        await client.query(`UPDATE turn_dispatches SET failure_code='USER_CANCELLED',terminal_at=NOW()
+          WHERE dispatch_id=$1 AND status='terminal' AND outcome='not_accepted' AND accepted_at IS NULL`, [row.source_dispatch_id])
+      }
+      if (cancellable.rowCount) await client.query(`UPDATE client_sessions
+        SET history_revision=history_revision+1,timeline_generation=timeline_generation+1,
+          updated_at=GREATEST(updated_at+1,(EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint)
+        WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`, [input.sessionId, `c:${input.userId.toString()}`])
     } else {
       const permission = await client.query<{ status: string }>(
         `SELECT status FROM turn_permission_requests

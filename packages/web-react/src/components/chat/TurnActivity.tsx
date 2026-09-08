@@ -106,7 +106,9 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     text = "正在停止…";
     cls = "stopping";
   } else if (retry) {
-    text = `模型繁忙，正在重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
+    text = retry.cause === "preparation"
+      ? "正在重新准备…"
+      : `模型繁忙，正在重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
     cls = "retrying";
   } else if (
     (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
