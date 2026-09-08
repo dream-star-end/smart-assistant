@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { assertPreparationLaneCoverage } from './lib/preparationLaneCoverage.js'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
@@ -25,9 +26,7 @@ if (timeoutMs < 30_000) {
 if (bridge.includes('terminalizeAllEnriching("client_disconnected_before_enrichment_transfer")')) {
   throw new Error('[session-unavailable-rootfix] browser detach still terminalizes enrichment')
 }
-if ((bridge.match(/trackPreparation\(async/g) ?? []).length !== 5) {
-  throw new Error('[session-unavailable-rootfix] every engine preparation lane must be tracked')
-}
+assertPreparationLaneCoverage(bridge)
 for (const marker of [
   'classifyTurnDispatchReceipt(receipt, rec)',
   'if (disposition === "rejected")',
@@ -504,6 +503,29 @@ async function runTapProof(opts: {
     rmSync(home, { recursive: true, force: true })
   }
 }
+
+// OCV5-179: preserve every original engine lane and the new identity work lane.
+// Independent exact leaves make missing/filtered negative controls fail this same entrypoint.
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['scripts/__tests__/preparationLaneCoverage.test.ts'],
+  expected: [
+    'accepts the six production preparation lanes',
+    'ignores formatting and comment or string decoys',
+    ...['cursor', 'zcode', 'annotated', 'codex-grok', 'ccb', 'identity'].flatMap((lane) => [
+      `rejects untracked ${lane} work`,
+      `rejects empty tracking substituted for ${lane}`,
+      `rejects ${lane} work hidden in an uncalled function`,
+    ]),
+    'rejects an extra tracked callback',
+    'rejects a duplicate lane replacing another lane',
+    'rejects a non-async tracking callback',
+    'rejects malformed source instead of accepting a partial parse',
+  ],
+  label: 'preparation-lane-coverage',
+  timeoutMs: 120_000,
+})
+console.log('[preparation-lane-coverage] PASS — all six lanes and 24 exact positive/negative cases, zero skip/cancel')
 
 await runTapProof({
   fromRoot: candidateRoot,
