@@ -32,6 +32,10 @@ export function TicketListView({
   onOpenTicket,
   renderActions,
   hideFilters = false,
+  total,
+  loadedCount,
+  onLoadMore,
+  loadingMore = false,
 }: {
   tickets: Ticket[]
   query: TicketListQuery
@@ -40,6 +44,11 @@ export function TicketListView({
   onOpenTicket?: (ticket: Ticket) => void
   renderActions?: (ticket: Ticket) => ReactNode
   hideFilters?: boolean
+  total?: number
+  /** Number loaded before client-side filtering; pagination is not based on visible rows. */
+  loadedCount?: number
+  onLoadMore?: () => void
+  loadingMore?: boolean
 }) {
   const desktop = useMdViewport()
   const [filtersOpen, setFiltersOpen] = useState(false)
@@ -240,6 +249,32 @@ export function TicketListView({
                 />
               ))}
             </div>
+          )}
+
+        </div>
+      )}
+      {typeof total === 'number' && total > (loadedCount ?? tickets.length) && (
+        <div
+          data-testid="ticket-list-truncated"
+          className="mt-3 flex flex-wrap items-center justify-between gap-2 text-caption text-muted"
+        >
+          <p>
+            {loadedCount == null ? '已显示' : '已加载'} {loadedCount ?? tickets.length} / {total} 条
+          </p>
+          {onLoadMore ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              data-testid="ticket-list-load-more"
+              loading={loadingMore}
+              disabled={loadingMore}
+              onClick={onLoadMore}
+            >
+              继续加载
+            </Button>
+          ) : (
+            <p>列表超过一页，请继续加载查看后续单据。</p>
           )}
         </div>
       )}

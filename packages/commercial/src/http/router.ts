@@ -1607,6 +1607,7 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
   { path: '/api/anthropic/v1/messages', kind: 'exact', requiresPrefix: true },
   { path: '/api/anthropic/v1/messages/count_tokens', kind: 'exact', requiresPrefix: true },
   { path: '/api/anthropic/v1/models', kind: 'exact', requiresPrefix: true },
+  { path: '/api/anthropic/v1/usage', kind: 'exact', requiresPrefix: true },
   { path: '/api/file', kind: 'prefix', requiresPrefix: false },
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
 ]
@@ -1705,21 +1706,29 @@ export function createCommercialHandler(
     // 前缀 `/api/anthropic` 剥掉后交给 handler 自己的白名单。
     // 2026-09-07 外接模型发现:`GET /api/anthropic/v1/models`(Anthropic / OpenAI 兼容
     // list 形状,公开 id 无引擎前缀)。给本地 Claude Code / CC Switch「获取模型」用。
-    // 鉴权走与 /v1/messages 同一条 API key 链(见 http/proxy/externalModels.ts),
-    // 不做 UA 门控。装配失败语义与 messages 一致:未注入 → 503 EXTERNAL_PROXY_UNAVAILABLE。
-    if (path === '/api/anthropic/v1/models') {
+    // 2026-09-08 外接用量:`GET /api/anthropic/v1/usage`(余额 + 单 key 消耗,给 CC Switch
+    // 「用量查询」脚本用)。两者鉴权都走与 /v1/messages 同一条 API key 链(见
+    // http/proxy/externalModels.ts / externalUsage.ts),不做 UA 门控。装配失败语义与
+    // messages 一致:未注入 → 503 EXTERNAL_PROXY_UNAVAILABLE。
+    const externalReadOnly =
+      path === '/api/anthropic/v1/models'
+        ? { route: '__cc_external_models__', handler: deps.externalApiKeyModels }
+        : path === '/api/anthropic/v1/usage'
+          ? { route: '__cc_external_usage__', handler: deps.externalApiKeyUsage }
+          : null
+    if (externalReadOnly) {
       setSecurityHeaders(res)
       const requestId = ensureRequestId(req)
       res.setHeader(REQUEST_ID_HEADER, requestId)
       const mdLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
         requestId,
-        route: '__cc_external_models__',
+        route: externalReadOnly.route,
         method,
         path,
         clientIp: clientIpOf(req),
       })
-      if (!deps.externalApiKeyModels) {
-        mdLog.error('cc_external_models_not_assembled')
+      if (!externalReadOnly.handler) {
+        mdLog.error('cc_external_readonly_not_assembled')
         sendError(
           res,
           503,
@@ -1727,16 +1736,16 @@ export function createCommercialHandler(
           'external api key endpoint not available',
           requestId,
         )
-        incrGatewayRequest('__cc_external_models__', method, res.statusCode)
+        incrGatewayRequest(externalReadOnly.route, method, res.statusCode)
         return true
       }
       req.headers[REQUEST_ID_HEADER] = requestId
       try {
-        await deps.externalApiKeyModels(req, res)
+        await externalReadOnly.handler(req, res)
       } catch (err) {
         handleError(err, res, requestId, mdLog)
       }
-      incrGatewayRequest('__cc_external_models__', method, res.statusCode)
+      incrGatewayRequest(externalReadOnly.route, method, res.statusCode)
       return true
     }
 

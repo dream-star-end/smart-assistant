@@ -305,8 +305,11 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       'CREATE TABLE part(id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT, sequence INTEGER)',
     ].join(';'))
     seed.close()
+    // Adapter spawn sanitizes PATH to /usr/bin/node (v20 here). The parent
+    // runner is Node 22 because this fixture uses node:sqlite; keep the
+    // child on process.execPath so the assertion is not an env PATH miss.
     await writeFile(fake, [
-      '#!/usr/bin/env node',
+      `#!${process.execPath}`,
       "const path = require('node:path')",
       "const { DatabaseSync } = require('node:sqlite')",
       "const db = new DatabaseSync(path.join(process.env.OPENCLAUDE_HOME, 'zcode-cli', 'cli', 'db', 'db.sqlite'))",

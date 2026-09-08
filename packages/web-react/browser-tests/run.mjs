@@ -7,8 +7,8 @@
 //   本文件把"真浏览器受信事件"前置到 CI:凡动 Composer 等高频交互面,合并前必过。
 //
 // 用例(每条都是曾经/可能的生产回归形态):
-//   T1 点「+」→「添加附件」→ filechooser 真实弹出(post-dispatch activation 存活);
-//   T2 附件菜单随后正常关闭(preventDefault 不至于让菜单常驻);
+//   T1 点工具条回形针「添加附件」label → filechooser 真实弹出(一级入口,不经「+」菜单);
+//   T2 「+」菜单不再含「添加附件」,回形针 label 常驻且点开菜单可关掉;
 //   T3 选文件后 chip 出现且非 error 态(onUpload stub → done);
 //   T4 file input 结构红线:type=file / 无 accept / 计算样式非 display:none / tabindex=-1
 //      (国产内核约束 61de46e2/de16e2be 的真浏览器断言);
@@ -550,9 +550,8 @@ async function check(name, fn) {
 
 const primaryComposer = page.locator("#root");
 const plusButton = primaryComposer.getByRole("button", { name: "更多选项" });
-// DropdownMenuContent renders in a body-level portal. Scope only the trigger
-// to the primary composer; the menu item itself must be located from the page.
-const attachItem = page.getByText("添加附件");
+// 附件已是工具条一级 <label htmlFor>，禁止再点「+」菜单里的「添加附件」。
+const attachLabel = primaryComposer.locator('label[aria-label="添加附件"]');
 
 await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回执", async () => {
   const memoryRoot = page.locator("#memory-report-root");
@@ -568,20 +567,28 @@ await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回
   }
 });
 
-await check("T1 点「+」→「添加附件」→ filechooser 真实弹出", async () => {
-  await plusButton.click();
-  await attachItem.waitFor({ state: "visible", timeout: 3000 });
+await check("T1 点工具条回形针「添加附件」→ filechooser 真实弹出", async () => {
+  await attachLabel.waitFor({ state: "visible", timeout: 3000 });
   const [chooser] = await Promise.all([
     page.waitForEvent("filechooser", { timeout: 3000 }),
-    attachItem.click(),
+    attachLabel.click(),
   ]);
   const probe = join(outDir, "attach-probe.txt");
   writeFileSync(probe, "browser-tests attach probe\n");
   await chooser.setFiles(probe);
 });
 
-await check("T2 附件菜单随后正常关闭(不常驻)", async () => {
-  await attachItem.waitFor({ state: "hidden", timeout: 3000 });
+await check("T2 「+」菜单不再含「添加附件」且不常驻挡住输入区", async () => {
+  await attachLabel.waitFor({ state: "visible", timeout: 3000 });
+  await plusButton.click();
+  const menuAttach = page.getByRole("menuitem", { name: "添加附件" });
+  if (await menuAttach.count() !== 0) {
+    throw new Error("「+」菜单仍残留「添加附件」项");
+  }
+  const goalItem = page.getByRole("menuitem", { name: "设定目标" });
+  await goalItem.waitFor({ state: "visible", timeout: 3000 });
+  await page.keyboard.press("Escape");
+  await goalItem.waitFor({ state: "hidden", timeout: 3000 });
 });
 
 await check("T3 选文件后 chip 出现且非 error 态(stub 上传 → done)", async () => {
@@ -1902,9 +1909,10 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
     );
   }
 
-  // ③ 顶栏四个入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
+  // ③ 顶栏入口全在视口内(挤爆时最先被推出去的是右侧查找/铃铛)。
   const headerEntries = [
     ["打开菜单", "汉堡(唯一的移动侧栏入口)"],
+    ["会话内查找", "会话内查找"],
     ["站内信", "站内信"],
     ["账户与计费", "余额"],
     ["选择对话模型", "模型选择器"],
@@ -1922,11 +1930,24 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if ((await mobilePage.evaluate(() => window.__mobilePage.navOpens)) !== 1) {
     throw new Error("移动端汉堡点了没反应(侧栏抽屉打不开)");
   }
-  await mobilePage.getByRole("button", { name: "更多选项" }).click();
-  const attach = mobilePage.getByRole("menuitem", { name: "添加附件" });
-  await attach.waitFor({ state: "visible", timeout: 3000 });
-  await mobilePage.keyboard.press("Escape");
-  await attach.waitFor({ state: "hidden", timeout: 3000 });
+  const mobileAttach = mobilePage.locator('label[aria-label="添加附件"]');
+  await mobileAttach.waitFor({ state: "visible", timeout: 3000 });
+  const attachBox = await mobileAttach.boundingBox();
+  if (!attachBox) throw new Error("移动端添加附件入口不可见");
+  if (attachBox.x < 0 || attachBox.x + attachBox.width > 390 + 1) {
+    throw new Error(`移动端添加附件被挤出视口: x=${Math.round(attachBox.x)} w=${Math.round(attachBox.width)}`);
+  }
+  // 本夹具未接设定目标，「+」按产品契约退化为禁用锚点；不得再出现附件菜单项。
+  const mobilePlus = mobilePage.getByRole("button", { name: "更多选项" });
+  if ((await mobilePlus.getAttribute("title")) !== "附件暂不可用") {
+    throw new Error("移动端无目标时「+」应是禁用锚点(title=附件暂不可用)");
+  }
+  if (await mobilePlus.isEnabled()) {
+    throw new Error("移动端无目标时「+」不应可点");
+  }
+  if (await mobilePage.getByRole("menuitem", { name: "添加附件" }).count() !== 0) {
+    throw new Error("移动端仍出现「添加附件」菜单项");
+  }
 
   const box = await mobilePage.getByRole("textbox").boundingBox();
   if (!box) throw new Error("输入框不可见");

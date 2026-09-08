@@ -119,6 +119,8 @@ FORCE_NPM_CI=0
 MODE=""
 CUTOVER_RELEASE=""
 DEPLOY_BUILT_RELEASE=""
+# Internal invocation provenance; never inherit an expected source from the environment.
+DEPLOY_BUILT_SOURCE_COMMIT=""
 CUTOVER_JOINT=0
 CUTOVER_TUPLE_BUNDLE=""
 # Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
@@ -1301,8 +1303,8 @@ source_commit() {
 }
 
 # ── Lease Center train 账本(OCV5-131)────────────────────────────────────────
-# 三面制品都 `git archive HEAD`;固定发布对象的方式是要求 HEAD 精确等于 --target-sha,
-# 不满足就 fail-closed(不做"archive 某个非 HEAD sha"的半套改造)。
+# 入口要求捕获的 HEAD 与已验证 train target 相同；之后三面传同一 immutable SHA。
+# 只有 platform-from-head 路径可跨共享 HEAD 前进继续切流，工作树 platform 仍走旧 strict 门。
 lease_train_enabled() { [[ -n "$LEASE_TRAIN_ID" || -f "$LEASE_LIB" ]]; }
 
 lease_train_load_lib() {
@@ -1316,7 +1318,8 @@ lease_train_begin() {
   lease_train_load_lib || { [[ -z "$LEASE_TRAIN_ID" ]] && return 0; die "缺 $LEASE_LIB,无法校验 --lease-train"; }
   [[ "$DRY" == 1 ]] && return 0
   lease_init_db
-  local head; head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  local head="${1:-$(source_commit)}"
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || die "列车 source 不是 40 位 commit SHA"
   if [[ -n "$LEASE_TRAIN_ID" ]]; then
     lease_valid_train_id "$LEASE_TRAIN_ID" || die "非法 --lease-train=$LEASE_TRAIN_ID"
     [[ "$head" == "$LEASE_TARGET_SHA" ]] \
@@ -1970,9 +1973,9 @@ $dirty
   refresh_ccb_proxy_path
   ensure_model_authority
   sha="$(source_commit)"
-  lease_train_begin
-  log "── HEAD=$sha 构建三面制品(失败则 live 不动) ──"
-  build_master_release
+  lease_train_begin "$sha"
+  log "── source=$sha 构建三面制品(失败则 live 不动) ──"
+  build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
   if [[ "$DRY" != 1 ]]; then
     [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "缺 .complete: $BUILT_MASTER_RELEASE"
@@ -1982,6 +1985,7 @@ $dirty
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
+  DEPLOY_BUILT_SOURCE_COMMIT="$sha"
   CUTOVER_JOINT=1
   log "── 进入 --cutover 翻转窗口(同一套状态机,不是第二份逻辑) release=$DEPLOY_BUILT_RELEASE ──"
   cmd_cutover
@@ -2388,6 +2392,18 @@ SQL
   cutover_clog "  ✓ model authority cutover marker 已按 DB→env 顺序绑定 exact live tuple"
 }
 
+# Only an internally built, from-head invocation owns a pinned expected source.
+# Legacy worktree-platform deploy and standalone cutover keep their current-HEAD gate.
+cutover_expected_source_commit() {
+  if [[ -n "${DEPLOY_BUILT_RELEASE:-}" && "${PLATFORM_FROM_HEAD:-0}" == 1 ]]; then
+    [[ "${DEPLOY_BUILT_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || die "本次构建缺已验证 sourceCommit,拒绝切流"
+    printf "%s\n" "$DEPLOY_BUILT_SOURCE_COMMIT"
+  else
+    source_commit
+  fi
+}
+
 cmd_cutover() {
   local rel head backup prev_val live_now expected_build step unit_snap
   CUTOVER_MUTATED=0
@@ -2405,7 +2421,7 @@ cmd_cutover() {
   fi
   : >"$CUTOVER_LOG"
   cutover_clog "══ v5 selfhost --cutover DRY=$DRY JOINT=${CUTOVER_JOINT:-0} log=$CUTOVER_LOG ══"
-  head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  head="$(cutover_expected_source_commit)" || die "无法确定本次切流 sourceCommit"
 
   step=1
   if [[ "$DRY" == 1 ]]; then

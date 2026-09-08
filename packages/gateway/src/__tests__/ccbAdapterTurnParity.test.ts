@@ -20,6 +20,7 @@ import { EventEmitter } from "node:events";
 
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
+import { IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
 import { _setPlatformPricingLookupForTests } from "../usageCost.js";
 import type { EngineEvent } from "../engine/engineEvents.js";
 import type { TurnParams } from "../engine/engineAdapter.js";
@@ -774,6 +775,94 @@ describe("CcbAdapter turn parity", () => {
     runner.msg(resultRow());
     await turn.summary;
     assert.equal(adapter.waitingForUserInput, false, "turn 终态后不再报告等用户");
+  });
+
+  test("OCV5-177: CCB human reply renews both idle clocks after a long wait", async (t) => {
+    for (const toolName of ["AskUserQuestion", "Bash"]) {
+      for (const behavior of ["allow", "deny"]) {
+        await t.test(`${toolName} / ${behavior}`, async (t) => {
+          let now = 1_000_000;
+          t.mock.method(Date, "now", () => now);
+          const { adapter, runner } = makeAdapter();
+          const turn = beginTurn(adapter, []);
+          await turn.submitted;
+          runner.msg({
+            type: "control_request", request_id: "human-1",
+            request: { subtype: "can_use_tool", tool_name: toolName, input: {} },
+          });
+          let activity = 0;
+          adapter.on("activity", () => activity++);
+          // No model stdout while the human is deciding. This exceeds both
+          // the 15min liveness window and the 30min activity backstop.
+          now += 31 * 60_000;
+          const trips = () => shouldTripIdleWatchdog({
+            waitingForUserInput: adapter.waitingForUserInput,
+            idleMs: now - adapter.lastActivityAt,
+            thresholdMs: IDLE_TIMEOUT_TOOL_MS,
+          });
+          assert.equal(trips(), false, "human wait itself is exempt");
+          const response = { behavior, updatedInput: { answers: { Plan: "Proceed" } } };
+          assert.equal(adapter.sendPermissionResponse("human-1", response), true);
+          assert.deepEqual(runner.permissionResponses, [{ requestId: "human-1", response }]);
+          assert.equal(adapter.waitingForUserInput, false);
+          assert.equal(adapter.lastActivityAt, now, "answer starts a fresh liveness window");
+          assert.equal(activity, 1, "answer refreshes the 30min activity timer as well");
+          assert.equal(trips(), false, "no stdout is needed to survive the next watchdog tick");
+          now += IDLE_TIMEOUT_TOOL_MS + 1;
+          assert.equal(trips(), true, "genuine post-answer silence still times out");
+          runner.msg(resultRow());
+          await turn.summary;
+        });
+      }
+    }
+  });
+
+  test("OCV5-177: stale, duplicate and failed CCB replies cannot renew a turn", async (t) => {
+    let now = 1_000_000;
+    t.mock.method(Date, "now", () => now);
+    const { adapter, runner } = makeAdapter();
+    const ask = (id: string) => runner.msg({
+      type: "control_request", request_id: id,
+      request: { subtype: "can_use_tool", tool_name: "AskUserQuestion", input: {} },
+    });
+    const oldTurn = beginTurn(adapter, []);
+    await oldTurn.submitted;
+    ask("old");
+    runner.msg(resultRow());
+    await oldTurn.summary;
+    now += 31 * 60_000;
+    assert.equal(adapter.sendPermissionResponse("old", { behavior: "allow" }), false);
+    assert.equal(runner.permissionResponses.length, 0, "no delivery after terminal");
+
+    const turn = beginTurn(adapter, []);
+    await turn.submitted;
+    ask("current-1");
+    ask("current-2");
+    const originalClock = adapter.lastActivityAt;
+    let activity = 0;
+    adapter.on("activity", () => activity++);
+    for (const id of ["old", "unknown"]) {
+      assert.equal(adapter.sendPermissionResponse(id, { behavior: "allow" }), false);
+    }
+    runner.permissionWritable = false;
+    assert.equal(adapter.sendPermissionResponse("current-1", { behavior: "allow" }), false);
+    assert.equal(adapter.lastActivityAt, originalClock);
+    assert.equal(activity, 0);
+    assert.equal(adapter.waitingForUserInput, true);
+    runner.permissionWritable = true;
+    assert.equal(adapter.sendPermissionResponse("current-1", { behavior: "allow" }), true);
+    assert.equal(adapter.waitingForUserInput, true, "second request is still pending");
+    assert.equal(adapter.lastActivityAt, now);
+    now += 31 * 60_000;
+    assert.equal(adapter.sendPermissionResponse("current-1", { behavior: "deny" }), false);
+    assert.notEqual(adapter.lastActivityAt, now, "duplicate cannot buy more time");
+    assert.equal(adapter.sendPermissionResponse("current-2", { behavior: "deny" }), true);
+    assert.equal(adapter.waitingForUserInput, false);
+    assert.equal(adapter.lastActivityAt, now, "last valid answer renews again");
+    assert.equal(activity, 2, "one activity per accepted answer, none for rejected answers");
+    assert.equal(runner.permissionResponses.length, 2);
+    runner.msg(resultRow());
+    await turn.summary;
   });
 
   test("activity 事件:每条原始消息 emit 一次(30-min timer refresh 信号源)", async () => {

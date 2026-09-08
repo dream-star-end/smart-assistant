@@ -55,6 +55,7 @@ describe('automatic turn recovery policy', () => {
       'stopped',
       'user_cancelled',
       'session_persist_unavailable',
+      'session_deleted',
       'durable_dispatch_unavailable',
       'model_not_available',
       'model_config_changed_retry_turn',

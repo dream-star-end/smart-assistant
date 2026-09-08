@@ -2103,9 +2103,51 @@ describe("userChatBridge — model authorization", () => {
       }));
       const error = await nextBusinessFrame(fc);
       assert.equal(error.code, "SESSION_PERSIST_UNAVAILABLE");
+      assert.equal(error.retryable, true);
       assert.deepEqual(error.peer, { id: "sess-missing", kind: "dm" });
       assert.equal(error.clientMessageId, "m-not-admitted");
       assert.equal(attempts, 3);
+      assert.equal(rig.containerSeen.some((entry) => {
+        try { return JSON.parse(entry.data.toString()).type === "inbound.message"; }
+        catch { return false; }
+      }), false);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("session_deleted persist is SESSION_DELETED, not retryable, and never starts container work", async () => {
+    let attempts = 0;
+    const rig = await startRig({
+      persistMasterUserMessage: async () => {
+        attempts += 1;
+        return { applied: false, reason: "session_deleted" };
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("208"));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      await containerOpenP;
+      const fc = frameCollector(ws);
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-deleted", kind: "dm" },
+        clientMessageId: "m-deleted",
+        model: "gpt-5.6-sol",
+        content: { text: "must not execute" },
+      }));
+      const error = await nextBusinessFrame(fc);
+      assert.equal(error.code, "SESSION_DELETED");
+      assert.equal(error.retryable, false);
+      assert.equal(error.action, "new_session");
+      assert.match(String(error.message), /deleted/i);
+      assert.deepEqual(error.peer, { id: "sess-deleted", kind: "dm" });
+      assert.equal(error.clientMessageId, "m-deleted");
+      assert.equal(attempts, 1);
       assert.equal(rig.containerSeen.some((entry) => {
         try { return JSON.parse(entry.data.toString()).type === "inbound.message"; }
         catch { return false; }

@@ -1,3 +1,6 @@
+import { installDelegateSandbox } from './helpers/delegateSandbox.js'
+const sandbox = installDelegateSandbox()
+
 /**
  * OCV5-22 phase 0: resume true-reject, capacity_timeout, owner lease, B2/B3.
  *
@@ -9,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
-import { DelegateJobStore } from '../delegateJobs.js'
+import { DelegateJobStore, type DelegateJobSnapshot } from '../delegateJobs.js'
 import {
   DELEGATE_RESUME_OCCUPIED_MESSAGE,
   DelegateResumeRegistry,
@@ -28,12 +31,84 @@ import {
 } from '../delegateContext.js'
 import { DELEGATE_MAX_CONCURRENT_DELEGATIONS } from '../delegateCapacity.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
+import { resolveDelegateJobsDbPath } from '../delegateDurable.js'
+import { resolveDelegateInflightSurfaceDbPath } from '../delegateInflightSurface.js'
+import { delegateJobsPersistDir } from '../delegateCompleter.js'
+import { DefaultEngineNotifier } from '../engineNotifier.js'
+import { dispatchJobTerminalNotify } from '../delegateNotifyDispatch.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-phase0-delegate'
 
+describe('OCV5-180: full-flag delegate fixture has no real HOME side effects', () => {
+  it('HTTP dispatch, durable/inflight, snapshots, intents and cron callback stay isolated', async () => {
+    sandbox.enableAllFlags()
+    resetDelegateContextKeyForTests()
+    const gw = makeGateway(true)
+    let callbacks = 0
+    gw._engineNotifier = new DefaultEngineNotifier({
+      resumeInject: { inject: async () => { callbacks += 1; return { ok: true } } },
+    })
+    gw._activeSendToAgentCallbacks = new Map()
+    const notifications: Promise<unknown>[] = []
+    const dispatch = gw._dispatchDelegateNotify.bind(gw)
+    gw._dispatchDelegateNotify = (job: DelegateJobSnapshot) => {
+      const promise = dispatch(job) as Promise<unknown>
+      notifications.push(promise)
+      return promise
+    }
+    const started = await call(gw, 'handleDelegateTask', {
+      goal: 'isolated full-flag fixture', sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY, async: true,
+    })
+    assert.equal(started.status, 200)
+    assert.ok(gw._delegateJobs.snapshotOf(started.body.jobId))
+    assert.ok(gw._delegateInflightSurface, 'actual inflight store must be opened')
+    assert.ok(gw._delegateReapTimer, 'actual durable reaper must be armed and cleaned up')
+    for (const path of [resolveDelegateJobsDbPath(), resolveDelegateInflightSurfaceDbPath()]) {
+      sandbox.assertOwnedPath(path)
+    }
+    await persistDelegateJobSnapshots(gw._delegateJobs)
+    await persistSendToAgentIntent({
+      v: 1, jobId: started.body.jobId, originSessionKey: PARENT_KEY,
+      agentId: 'coding-assistant', goal: 'isolated fixture', createdAt: Date.now(),
+    })
+    sandbox.assertOwnedPath(delegateJobsPersistDir())
+    sandbox.assertOwnedPath(process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR!)
+    assert.ok((await readdir(delegateJobsPersistDir())).includes(`${started.body.jobId}.json`))
+    assert.ok((await readdir(process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR!)).includes(`${started.body.jobId}.json`))
+    const cron = enqueueCronOccurrenceJob(gw._delegateJobs, {
+      cronJobId: 'remind-isolated', dueMinuteKey: 1700000000, agentId: 'main',
+      parentSessionKey: PARENT_KEY, callbackOriginSessionKey: PARENT_KEY,
+      callbackOriginUserId: 'test-user', parentEngine: 'grok',
+    })
+    assert.ok(!('error' in cron))
+    if ('error' in cron) return
+    const claim = gw._delegateJobs.claimQueued(cron.jobId)
+    assert.equal(claim.ok, true)
+    assert.equal(settleCronDelegateJob(gw._delegateJobs, cron.jobId, 'completed', claim), true)
+    await Promise.all(notifications)
+    await dispatchJobTerminalNotify(gw._delegateJobs, gw._delegateJobs.snapshotOf(cron.jobId), gw._engineNotifier)
+    assert.equal(gw._delegateJobs.snapshotOf(cron.jobId).callbackState, 'delivered')
+    assert.equal(callbacks, 1, 'actual notifier CAS must deliver cron callback once')
+    gw._releaseHold()
+    // This case covers storage isolation, not long-poll timers. Consume the
+    // completed result only after the actual submit/terminal path has settled.
+    // Existing delegateAsyncJobs tests separately cover the wait protocol.
+    const deadline = Date.now() + 2_000
+    while (gw._delegateJobs.snapshotOf(started.body.jobId)?.state !== 'completed' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    assert.equal(gw._delegateJobs.snapshotOf(started.body.jobId)?.state, 'completed')
+    const waited = await call(gw, 'handleDelegateWait', { jobId: started.body.jobId, waitMs: 1000 })
+    assert.equal(waited.status, 200)
+    await Promise.all(notifications)
+    sandbox.assertHomeUntouched()
+  })
+})
+
 function makeGateway(holdSubmit = false): any {
   const agent = { id: 'main', provider: 'anthropic', model: 'glm-5.2' }
-  const gw = Object.create(Gateway.prototype) as any
+  const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
   gw._shuttingDown = false
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
@@ -94,7 +169,7 @@ function makeGateway(holdSubmit = false): any {
     bufferPendingAgentGroup: () => true,
   }
   gw.deliver = () => {}
-  return gw
+  return sandbox.trackGateway(gw)
 }
 
 async function call(
@@ -690,7 +765,7 @@ describe('auditor probes: cron settle never borrows the live fence', () => {
 
 describe('auditor probes: snapshot persist fail-closed', () => {
   it('persist failure does not close or clear in-memory jobs', async () => {
-    const gw = Object.create(Gateway.prototype) as any
+    const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
     gw.log = { debug() {}, info() {}, warn() {}, error() {} }
     gw._activeSendToAgentCallbacks = new Map()
     const store = new DelegateJobStore({ sm: true, ttlMs: 60_000 })

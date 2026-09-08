@@ -49,6 +49,7 @@ import {
 } from "../http/anthropicProxy.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "../auth/apiKeyIdentity.js";
 import { makeExternalModelsHandler } from "../http/proxy/externalModels.js";
+import { makeExternalUsageHandler } from "../http/proxy/externalUsage.js";
 import type {
   ApiKeyRepo,
   ApiKeyRow,
@@ -522,6 +523,10 @@ interface HarnessOpts {
   omitExternalProxy?: boolean;
   /** 完全不注入 externalApiKeyModels(测试 GET /v1/models 的 503 降级)。 */
   omitExternalModels?: boolean;
+  /** 完全不注入 externalApiKeyUsage(测试 GET /v1/usage 的 503 降级)。 */
+  omitExternalUsage?: boolean;
+  /** GET /v1/usage 的余额读取(默认 12345n)。 */
+  usageBalance?: bigint;
   /**
    * 追加到 pricing 的额外目录行(GET /v1/models 用例注入 cursor-* 行;默认 harness
    * 只有 FIXED_MODEL 一行,该行不是 cursor 引擎,models 列表会是空)。
@@ -603,6 +608,32 @@ function buildHarness(opts: HarnessOpts = {}) {
         logger: testLogger,
       });
 
+  // GET /api/anthropic/v1/usage:与 production index.ts 相同的装配 —— 同一条 key 校验链,
+  // 不做 UA 门控;余额 / 窗口统计通过 seam 注入(不走真实 DB)。
+  const externalApiKeyUsage = opts.omitExternalUsage
+    ? undefined
+    : makeExternalUsageHandler({
+        resolveIdentity: (req) =>
+          resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        repo: {
+          list: async () => [
+            {
+              id: FIXED_API_KEY_ID,
+              label: "cc-cli-laptop",
+              keyPrefix: FIXED_PREFIX,
+              createdAt: new Date("2026-05-18T00:00:00Z"),
+              lastUsedAt: null,
+              disabledAt: null,
+              creditLimit: null,
+              spentCredits: 0n,
+            },
+          ],
+        },
+        readBalance: async () => opts.usageBalance ?? 12345n,
+        readWindow: async () => ({ requests: "2", credits: "40", input_tokens: "100", output_tokens: "20" }),
+        logger: testLogger,
+      });
+
   const externalApiKeyProxy: AnthropicProxyHandler | undefined = opts.omitExternalProxy
     ? undefined
     : makeAnthropicProxyHandler({
@@ -651,6 +682,7 @@ function buildHarness(opts: HarnessOpts = {}) {
     preCheckRedis: preCheckSpy.redis,
     externalApiKeyProxy,
     externalApiKeyModels,
+    externalApiKeyUsage,
   };
 
   const handler = createCommercialHandler(deps, { logger: testLogger });
@@ -1182,6 +1214,136 @@ describe("GET /api/anthropic/v1/models — 模型发现(API key 鉴权,无 UA �
     assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
     assert.equal(readErrCode(res), "MAINTENANCE");
     assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (7.2) GET /api/anthropic/v1/usage — 外接余额 / 单 key 消耗(2026-09-08)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 给 CC Switch「用量查询」脚本用。与 /v1/models 同一条 key 校验链、同样不做 UA 门控、
+// 同 503 装配失败语义。只读:不打上游、不动积分、不 bump last_used_at。
+
+const USAGE_URL = "/api/anthropic/v1/usage";
+
+describe("GET /api/anthropic/v1/usage — 外接余额(API key 鉴权,无 UA 门控)", () => {
+  test("Bearer key + 非 claude-cli UA → 200 no-store,余额 / key 快照 / 30d 窗口,全文无 cursor", async () => {
+    const h = buildHarness();
+    const res = await h.run({
+      url: USAGE_URL,
+      method: "GET",
+      body: undefined,
+      headers: { "user-agent": "cc-switch/usage" },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(res.responseHeaders["cache-control"], "no-store");
+    const body = res.bodyJson() as {
+      object: string; unit: string;
+      balance: { spendable: string };
+      key: { id: string; label: string | null; key_prefix: string | null; spent_credits: string; credit_limit: string | null; remaining_limit: string | null; is_valid: boolean };
+      window: { range: string; requests: string; credits: string };
+    };
+    assert.equal(body.object, "usage");
+    assert.equal(body.unit, "credits");
+    assert.equal(body.balance.spendable, "12345");
+    assert.equal(body.key.id, FIXED_API_KEY_ID.toString());
+    assert.equal(body.key.label, "cc-cli-laptop");
+    assert.equal(body.key.key_prefix, `oc-cc.${FIXED_PREFIX}`);
+    assert.equal(body.key.credit_limit, null);
+    assert.equal(body.key.is_valid, true);
+    assert.equal(body.window.range, "30d");
+    assert.equal(body.window.requests, "2");
+    assert.doesNotMatch(res.bodyText(), /cursor/i);
+    // 只读:不 bump last_used_at
+    assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 0);
+    assert.ok(h.logEvents.some((e) => e.msg === "external_usage_listed"));
+  });
+
+  test("x-api-key 头也能过;余额为 0 → is_valid=false", async () => {
+    const h = buildHarness({ usageBalance: 0n });
+    const res = await h.run({
+      url: USAGE_URL,
+      method: "GET",
+      body: undefined,
+      headers: { authorization: "", "x-api-key": FIXED_TOKEN, "user-agent": "cc-switch/usage" },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    const body = res.bodyJson() as { balance: { spendable: string }; key: { is_valid: boolean } };
+    assert.equal(body.balance.spendable, "0");
+    assert.equal(body.key.is_valid, false);
+  });
+
+  test("无 key → 401 泛化文案 + log external_usage_identity_failed{errcode=MISSING_API_KEY, detail}", async () => {
+    const h = buildHarness();
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined, headers: { authorization: "" } });
+    assert.equal(res.statusCode, 401);
+    const j = res.bodyJson() as { error: { code: string; message: string } };
+    assert.equal(j.error.code, "UNAUTHORIZED");
+    assert.equal(j.error.message, "container identity verification failed");
+    const ev = h.logEvents.find((e) => e.msg === "external_usage_identity_failed");
+    assert.ok(ev);
+    assert.equal(ev!.errcode, "MISSING_API_KEY");
+    assert.equal(typeof ev!.detail, "string");
+  });
+
+  test("已撤销 key → 401(anti-enum 同文案),server log detail 含 prefix", async () => {
+    const h = buildHarness();
+    h.apiKeyRepoSpy.setRow(null);
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 401);
+    const ev = h.logEvents.find((e) => e.msg === "external_usage_identity_failed");
+    assert.equal(ev?.errcode, "API_KEY_INVALID");
+    assert.match(String(ev?.detail), new RegExp(`prefix=${FIXED_PREFIX}`));
+  });
+
+  test("POST /v1/usage → 405 METHOD_NOT_ALLOWED(在鉴权之前)", async () => {
+    const h = buildHarness();
+    const res = await h.run({ url: USAGE_URL, method: "POST" });
+    assert.equal(res.statusCode, 405);
+    assert.equal(readErrCode(res), "METHOD_NOT_ALLOWED");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+
+  test("未注入 externalApiKeyUsage → 503 EXTERNAL_PROXY_UNAVAILABLE,不进鉴权", async () => {
+    const h = buildHarness({ omitExternalUsage: true });
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 503);
+    assert.equal(readErrCode(res), "EXTERNAL_PROXY_UNAVAILABLE");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+
+  test("maintenance_mode=true → 503 MAINTENANCE(闸门在 usage 路由之前)", async () => {
+    const h = buildHarness({ poolOverride: { maintenanceMode: true } });
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "MAINTENANCE");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (7.3) 双凭据头(2026-09-08):Claude Code 两头都发时,形似本站的那一头胜出
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("POST /v1/messages — Authorization 残留别家 key + x-api-key 本站 key", () => {
+  test("Authorization: Bearer sk-ant-* + x-api-key: oc-cc.* → 身份通过(不再 401)", async () => {
+    const h = buildHarness();
+    const res = await h.run({
+      headers: { authorization: "Bearer sk-ant-api03-legacy", "x-api-key": FIXED_TOKEN },
+    });
+    assert.notEqual(res.statusCode, 401, `body=${res.bodyText()}`);
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 1);
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls[0], FIXED_PREFIX);
+  });
+
+  test("proxy_identity_failed 日志带 detail(server-only),响应文案不变", async () => {
+    const h = buildHarness();
+    h.apiKeyRepoSpy.setRow(null);
+    const res = await h.run();
+    assert.equal(res.statusCode, 401);
+    const ev = h.logEvents.find((e) => e.msg === "proxy_identity_failed");
+    assert.equal(ev?.errcode, "API_KEY_INVALID");
+    assert.match(String(ev?.detail), /unknown or revoked api key prefix=/);
+    assert.doesNotMatch(res.bodyText(), /prefix=/);
   });
 });
 

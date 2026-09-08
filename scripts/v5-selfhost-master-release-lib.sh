@@ -454,8 +454,9 @@ build_master_release() {
   MASTER_DEPS_ELAPSED_S=""
   MASTER_FRONTEND_ELAPSED_S=""
 
-  full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-  [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || die "HEAD 不是 40 位 hex: $full_sha"
+  # Explicit invocation pin; build-master-only keeps the no-argument HEAD snapshot.
+  full_sha="${1:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || die "source commit 不是 40 位 hex: $full_sha"
   short_sha="$(git -C "$REPO_ROOT" rev-parse --short=9 "$full_sha")"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   staging="$MASTER_RELEASES_ROOT/.staging-${short_sha}-$$-${ts}"
@@ -463,7 +464,7 @@ build_master_release() {
 
   mlog "── build_master_release staging→$reldir (pinned $short_sha) ──"
   if [[ "${DRY:-0}" == 1 ]]; then
-    mlog "  [dry-run] git archive HEAD → $staging; 硬链或 npm ci; staging vite; .complete; mv -T → $reldir"
+    mlog "  [dry-run] git archive $full_sha → $staging; 硬链或 npm ci; staging vite; .complete; mv -T → $reldir"
     BUILT_MASTER_RELEASE="$reldir"
     return 0
   fi
@@ -541,6 +542,16 @@ build_master_release() {
   if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
     cleanup_master_staging
     die "pinned delegate engine billing requestId contract gate 失败"
+  fi
+  mlog "  callback payload hash WS proof @ pinned staging"
+  if ! ( cd "$staging" && node scripts/check-v5-callback-payload-hash.mjs ); then
+    cleanup_master_staging
+    die "pinned callback payload hash WS proof 失败"
+  fi
+  mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
+    cleanup_master_staging
+    die "pinned session unavailable / data-safety rootfix contract gate 失败"
   fi
 
   t0="$(date +%s)"

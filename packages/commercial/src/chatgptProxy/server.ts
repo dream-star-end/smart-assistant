@@ -208,20 +208,21 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       return
     }
 
-    const startedAt = now()
-    const upstream = await openUpstreamTunnel(deps.upstream, target.host, target.port)
-    if (clientSocket.destroyed) {
-      upstream.destroy()
-      return
-    }
-
+    // Reserve the slot synchronously right after the cap check (zero awaits in
+    // between): pending upstream handshakes count against the same caps as
+    // active tunnels, so concurrent CONNECTs cannot both claim the last slot
+    // and pending upstreams cannot pile up beyond the cap.
     tunnels.add(clientSocket)
     perUser.set(uid, (perUser.get(uid) ?? 0) + 1)
     deps.onTunnelUsed?.(uid)
 
+    const startedAt = now()
+    let upstream: Socket | null = null
+    let requestEnded = false
+    let finished = false
     let bytesIn = 0
     let bytesOut = 0
-    let finished = false
+    const idle = { timer: null as ReturnType<typeof setTimeout> | null }
     const finish = (reason: string) => {
       if (finished) return
       finished = true
@@ -229,9 +230,12 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       const remaining = (perUser.get(uid) ?? 1) - 1
       if (remaining <= 0) perUser.delete(uid)
       else perUser.set(uid, remaining)
-      try {
-        upstream.destroy()
-      } catch {}
+      if (idle.timer) clearTimeout(idle.timer)
+      if (upstream) {
+        try {
+          upstream.destroy()
+        } catch {}
+      }
       try {
         clientSocket.destroy()
       } catch {}
@@ -245,37 +249,76 @@ export function createChatGptProxyServer(deps: ChatGptProxyServerDeps): ChatGptP
       })
     }
 
-    const idle = { timer: null as ReturnType<typeof setTimeout> | null }
-    const touch = () => {
-      if (idle.timer) clearTimeout(idle.timer)
-      idle.timer = setTimeout(() => finish('idle'), TUNNEL_IDLE_MS)
-      idle.timer.unref?.()
+    // Pending phase: the client going away only ends the request — the
+    // reservation is held until the upstream Promise actually settles, so a
+    // still-handshaking upstream never escapes the cap.
+    const onPendingClientGone = () => {
+      requestEnded = true
     }
-    touch()
+    clientSocket.once('close', onPendingClientGone)
+    clientSocket.once('error', onPendingClientGone)
 
-    clientSocket.on('data', (chunk: Buffer) => {
-      bytesIn += chunk.length
-      touch()
-    })
-    upstream.on('data', (chunk: Buffer) => {
-      bytesOut += chunk.length
-      touch()
-    })
-    clientSocket.once('error', () => finish('client_error'))
-    upstream.once('error', () => finish('upstream_error'))
-    clientSocket.once('close', () => {
-      if (idle.timer) clearTimeout(idle.timer)
-      finish('client_close')
-    })
-    upstream.once('close', () => {
-      if (idle.timer) clearTimeout(idle.timer)
-      finish('upstream_close')
-    })
+    let opened: Socket
+    try {
+      opened = await openUpstreamTunnel(deps.upstream, target.host, target.port)
+    } catch (err) {
+      log?.warn('chatgpt_proxy.upstream_open_failed', {
+        uid,
+        host: target.host,
+        error: (err as Error)?.message ?? String(err),
+      })
+      finish('upstream_open_failed')
+      return
+    }
+    clientSocket.off('close', onPendingClientGone)
+    clientSocket.off('error', onPendingClientGone)
+    upstream = opened
 
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: OpenClaude\r\n\r\n')
-    if (head.length > 0) upstream.write(head)
-    clientSocket.pipe(upstream)
-    upstream.pipe(clientSocket)
+    if (requestEnded || clientSocket.destroyed) {
+      // Late success with the request already gone: destroy the socket that
+      // was just opened and release the reservation; never acknowledge (200)
+      // or pipe an orphaned tunnel.
+      finish('client_aborted')
+      return
+    }
+
+    try {
+      const touch = () => {
+        if (idle.timer) clearTimeout(idle.timer)
+        idle.timer = setTimeout(() => finish('idle'), TUNNEL_IDLE_MS)
+        idle.timer.unref?.()
+      }
+      touch()
+
+      clientSocket.on('data', (chunk: Buffer) => {
+        bytesIn += chunk.length
+        touch()
+      })
+      upstream.on('data', (chunk: Buffer) => {
+        bytesOut += chunk.length
+        touch()
+      })
+      clientSocket.once('error', () => finish('client_error'))
+      upstream.once('error', () => finish('upstream_error'))
+      clientSocket.once('close', () => {
+        if (idle.timer) clearTimeout(idle.timer)
+        finish('client_close')
+      })
+      upstream.once('close', () => {
+        if (idle.timer) clearTimeout(idle.timer)
+        finish('upstream_close')
+      })
+
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: OpenClaude\r\n\r\n')
+      if (head.length > 0) upstream.write(head)
+      clientSocket.pipe(upstream)
+      upstream.pipe(clientSocket)
+    } catch (err) {
+      // Unexpected failure after the reservation was taken: release it so the
+      // slot cannot leak; rethrow for the outer handler to destroy the rest.
+      finish('connect_error')
+      throw err
+    }
   }
 
   function noteAuthFail(ip: string): void {

@@ -143,7 +143,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T1 点「+」→「添加附件」→ filechooser 真实弹出"
+          "assertion": "T1 点工具条回形针「添加附件」→ filechooser 真实弹出"
         },
         {
           "layer": "browser",
@@ -3325,6 +3325,519 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260908-GROK-POOL-NO-COOLDOWN: source regression guard, not end-to-end proof."
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-HUMAN-WAIT-RESUME",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "CCB/Cursor Sand 原生提问作答后仍沿用等人之前的 lastActivityAt，答案已接收却在下一 idle tick 被误杀；Codex 同类请求存在相同缺口。只在当前回合未决答案成功送达后刷新 liveness 与30分钟activity时钟，拒绝过期/重复答复，保留真实静默和不可变硬上限。",
+      "rootFixCommit": "ffe32879",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbAdapterTurnParity.test.ts",
+          "assertion": "OCV5-177: CCB human reply renews both idle clocks after a long wait"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbAdapterTurnParity.test.ts",
+          "assertion": "OCV5-177: stale, duplicate and failed CCB replies cannot renew a turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-177: Codex long human wait resumes both clocks without blessing stale replies"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerIdleTimeout.test.ts",
+          "assertion": "明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/human-wait-resume.node-test.mjs",
+          "assertion": "Human wait: real PermissionCard click resumes the CCB adapter after twenty minutes"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-IDLE-CURSOR-BLACKHOLE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Selfhost旧会话在暖WebSocket上续问：后台已有正文和工具输出，旧frameSeq游标把新输出当重复帧丢弃，页面仅显示深度思考。回收引擎保留输出编号；历史后注册idle游标由服务器仲裁。",
+      "rootFixCommit": "2041bec7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/outboundRing.test.ts",
+          "assertion": "clear() retires cached frames without reusing a wire sequence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/streamCursor.test.ts",
+          "assertion": "warm socket arbitrates a restored idle cursor before the next turn"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/chat-navigation.node-test.mjs",
+          "assertion": "OCV5-178 warm socket shows new text after restoring an idle cursor"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CALLBACK-PAYLOAD-HASH",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "委派完成回调经cron-origin先受理冻结原文哈希，后被论文意图hint重写content.text，执行端payload_hash_mismatch拒绝并显示消息未开始处理。内部cron-origin保持已受理正文，浏览器论文hint仍在受理前应用。",
+      "rootFixCommit": "471b5149",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "OCV5-187 admitted callback content is immutable across the real WS bridge"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "OCV5-187 browser paper hint stays before admission even with forged cron-origin fields"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-callback-payload-hash.mjs",
+          "assertion": "OCV5-187 deploy proof: admitted callback bytes, signature and receipt agree"
+        }
+      ],
+      "coverageCommits": [
+        "e764a7f1",
+        "0d0c3d00"
+      ]
+    },
+    {
+      "id": "INC-20260908-FRONTEND-OWNER-FENCE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "任务抽屉异步回写跨owner、项目过滤越锁、列表刷新静默截断与附件/草稿跨会话账号。修复显式owner fence、分页按真实cap200分片、账号草稿隔离、逐上传owner显式new到id迁移与空筛选继续加载。证据为隔离真实Chromium组件旅程及单包回归，不冒称真实登录后端或线上验收。",
+      "rootFixCommit": "7cdd0f5c",
+      "coverageCommits": [
+        "63959e6e",
+        "c0a88571"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/taskboard/ownerFence.review.test.tsx",
+          "assertion": "owner switch clears old pending patrol without letting old completion touch B"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/Composer.owner.review.test.tsx",
+          "assertion": "unsent new attachments do not migrate to an unrelated existing session"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "new attachments stay on new, not an existing other session"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "true materialize keeps attachments and finishes delayed upload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "account switch does not inherit previous account attachments"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "remove after switch only deletes the current session file"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "two promotions cannot redirect the first delayed upload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/owner-fence.node-test.mjs",
+          "assertion": "filtered empty page can load more and stops at raw total"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-DELEGATE-WAIT-CLOSE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "委派wait已完成或close关闭真实SQLite后，迟到sleep仍先读取关闭数据库，产生未处理异步拒绝。每wait终态占位先于读库并取消真实timer；忽略signal的旧sleep迟到结果被消费，不改变正常timeout和close expired语义。",
+      "rootFixCommit": "ac1d0426",
+      "coverageCommits": [
+        "aa3eb066"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/waitClose.test.ts",
+          "assertion": "complete then close then late sleep does not read SQLite or unhandle"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/waitClose.test.ts",
+          "assertion": "default sleep timer is actually cancelled on complete"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CURSOR-AUDIT-SETTLE-GAP",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Cursor audit 先关 pending 再 settle，pricing/PG 失败后行已终态且无 usage，补偿扫描再也扫不到。未来 pending 改为 settle-before-close；历史 terminal-gap 常驻 tick 零写，不自动补录 132 条。",
+      "rootFixCommit": "b5bf02c8",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "pricing miss throws and never closes the audit row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "close UPDATE failure keeps usage committed; retry is idempotent and closes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "concurrent settlers share one committed usage and close the audit once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "tick scans only status='pending' and performs no writes when none are pending"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-CURSOR-AUDIT-SETTLE-GAP executed settle-before-close unique-23505 and COMMIT-before-close"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CHATGPT-CONNECT-CAP",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "ChatGPT CONNECT 在 upstream 握手完成前不计入 cap，并发握手可越过每用户 64 / 全局 2048。client close 在 pending 阶段只标 ended，名额保留到真实 socket 终态；晚到成功先 destroy 再释放，不 200/pipe。",
+      "rootFixCommit": "b5e57a8e",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/chatgptProxy/__tests__/server.test.ts",
+          "assertion": "client close during pending keeps reservation; 65th 429; release frees; no double count"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/chatgptProxy/__tests__/server.test.ts",
+          "assertion": "client close + 10s upstream timeout releases reservation and real socket"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-CHATGPT-CONNECT-CAP executed pending+active reservation transport proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-SESSION-DELETED-WIRE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "已删会话仍发 SESSION_PERSIST_UNAVAILABLE 并提示可安全重试，前端当瞬时失败原 peer 重发。改为 SESSION_DELETED + retryable false + new_session CTA；回收站恢复后发送路径不改。",
+      "rootFixCommit": "b661d576",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "session_deleted persist is SESSION_DELETED, not retryable, and never starts container work"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "session_deleted admit is SESSION_DELETED, not retryable, and never starts container work"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "legacy SESSION_DELETED paints a non-retryable card and does not auto-recover"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-SESSION-DELETED-WIRE executed admit+persist SESSION_DELETED transport proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-LIVE-FRAME-CLASSIFY",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "只读 live-frame 分类与业务健康在 connect 拒绝或卡住时会整份诊断抛错或无界等待，发布/运维必需检查因此被阻断。本包用 bounded helper（JS deadline + BEGIN READ ONLY + SET LOCAL statement_timeout）覆盖 acquisition/query，timeout/unknown 带 null 计数不得伪 0，按需 CLI 不进热 tick 与 /healthz.ok；model_pricing_0903_cw_backup 永久账本。影响是诊断整体不可用或检查挂起，不是已证实的线上资损或备份恢复失败。",
+      "rootFixCommit": "3ec290e1",
+      "coverageCommits": [
+        "5f736b0f",
+        "b569969d"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "classifies inflight / tapeRecoverable / uniqueCopy without DELETE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "timeout returns unknown with null counts, never fake 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "model_pricing_0903_cw_backup is a permanent ledger and never a TTL table"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-LIVE-FRAME-CLASSIFY executed bounded helper classify/unknown/connect/query proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-LATE-DELEGATE-OWNER",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "一层委派在队长 T1 结束后才完成时，完成卡按 session 缓冲进入随后 T2 的 tape；losslessTurnTape 因 parentTurnKey=T1 拒绝该 tape。根治：启动冻结 exact owner，drain 同步 seal，晚到走原 owner 受限 continuation；同 logical run 一张卡，异 payload 可见冲突，T2 零污染。历史 65 条只交只读 planner，不 requeue。发布门复用既有runner实际执行71个精确B1用例；SQL为隔离替身，不冒称真实PG或浏览器端到端。",
+      "rootFixCommit": "742f7562",
+      "coverageCommits": [
+        "e647b850",
+        "49fdbb57",
+        "42ce33d9",
+        "bbede052",
+        "0a93d2eb",
+        "a11d3094",
+        "b36f9535",
+        "2d648abf",
+        "e667e95e"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "seal-after path: one continuation card for T1, zero pollution in T2, no duplicate"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "cross-session owner locator is rejected even when turnKey matches"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/losslessTurnTape.test.ts",
+          "assertion": "old writer compat: runtimeEvents-only continuation still parses (no agentGroups)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "relocates a continuation card onto the owner turn, not T2"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "256 sequential ACK of other owners cannot duplicate a live buffered run"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/lateDelegateShutdown.test.ts",
+          "assertion": "shutdown waits for the real durable receipt before clearing the sink, not for a local root lookup"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/lateDelegateShutdown.test.ts",
+          "assertion": "a missing managed sink rejection is consumed and releases admission for a later durable retry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/directTapePageOwner.test.ts",
+          "assertion": "hydrateDirectTapePage deferred locator carries header owner, not a pre-stamped fixture"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/requeueFailedTapeJobs.test.ts",
+          "assertion": "planner group hash covers transcript/result/status and fence is per-requestId"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "finalize HTTP path is idempotent and does not run Phase A visible publish"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "leader: same run cannot ACK before the root is durable and visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "leader: idempotent root hit must not bypass payload/envelope locator check"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3MasterSink.test.ts",
+          "assertion": "late agent-group continuation defers visible until after parts+finalize"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "root clientMessageId stamp ACKs the same run and real drain never quarantines"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "no-run purged-parts root publishes Phase A and dequeues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/lateDelegateRootAuthority.test.ts",
+          "assertion": "legacy unstamped root does not acquire a later header clientMessageId stamp"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-LATE-DELEGATE-OWNER executed exact-owner seal, durable retry, root records, origin stamp and read-only planner"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260907-PERMISSION-ROOTFIX",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "提问/计划弹窗在 hello 与会话打开后断档：首帧丢失无卡可答，跨端已答仍弹，长输入被 8KiB 摘要毁掉可作答权威，Stop 后 GET/lookup 仍把普通权限当可答。responded 只表示控制受理不是工具已执行。",
+      "rootFixCommit": "12f7c30b",
+      "coverageCommits": [
+        "5a3f01b4",
+        "9fce39ef",
+        "98176566",
+        "b6f2e0e3",
+        "56146fa9",
+        "42b803ee"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pendingPermissionHelloReplay.test.ts",
+          "assertion": "CJK payload over 8192 UTF-8 bytes is truncated even if JS length is smaller"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pendingPermissionHelloReplay.test.ts",
+          "assertion": "Q1: 32 selected sessions squeezed by 64-row page are uncovered for GET refill"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/permissionReconcile.test.ts",
+          "assertion": "responded without behavior does not infer allow"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PermissionCard.test.tsx",
+          "assertion": "Host 两个 pending 只开一个可见 modal，切卡不发 permission_response"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/permissionPromptSnapshotExplain.integ.test.ts",
+          "assertion": "B4 Stop then late persist: hello/GET/lookup hide ordinary pending, keep detached ask-user"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/permissionTimelineGet.integ.test.ts",
+          "assertion": "borrowed-client 250ms timeout rolls back to savepoint; outer txn still commits"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
+          "assertion": "T5 two pending show exactly one dialog; dock[0] then dock[1] are different requests"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
+          "assertion": "T3 background does not mark displayed; after foreground close can reopen"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CC-SWITCH-ASCII-NAME",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Windows 用户从 API 接入页导入 CC Switch 后，中文供应商名派生的临时路径导致打开终端失败；f496 将真实组件输出改为 ASCII 名 Clarvy。此登记与精确历史 trailer 映射不声称已在 Linux 验证 Windows 原生 cmd/CC Switch。",
+      "rootFixCommit": "f496228d",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/ApiAccessTab.test.tsx",
+          "assertion": "创建密钥后:片段 / JSON / 深链都带上明文,深链提示「已包含刚创建的密钥」"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/incidentTrailerExactCompat.test.ts",
+          "assertion": "exact immutable SHA and original trailer normalize then complete incident closure"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
+          "assertion": "new key: real create click exports exact Clarvy ASCII name and intact import contract"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
+          "assertion": "existing key: real paste exports exact Clarvy ASCII name and intact import contract"
+        }
+      ],
+      "coverageCommits": [
+        "a80f8ae9"
+      ]
+    },
+    {
+      "id": "INC-20260908-CROSS-TURN-CARD-LOCATOR",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "上一轮派出的后台委派(dlgjob-*)在 dlgcb-* 回调/定时续跑轮收尾，团队卡随当前轮 tape 下发但 engineBilling.parentTurnKey 仍是上一轮 key；master parseLosslessTurnPayload 要求 parentTurnKey===turnKey 而抛 parent locator is invalid，Phase-B 物化 8 次后永久 failed，前端 records_unpublished 降级只剩最后一段 live 片段+孤字，刷新不恢复。全库 76 个 tape 命中。修复：校验改为会话内任一合法 64hex parentTurnKey（parentSessionId 仍严格），结算按 billing 自带 locator 归因不受影响。",
+      "rootFixCommit": "a9202bc4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/losslessTurnTape.test.ts",
+          "assertion": "OCV5-189 keeps a background delegate card whose billing points at an earlier turn of the same session"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-lossless-anchor-contract.ts",
+          "assertion": "OCV5-189 deploy proof: cross-turn delegate billing materializes and settles by its own locator"
         }
       ]
     }

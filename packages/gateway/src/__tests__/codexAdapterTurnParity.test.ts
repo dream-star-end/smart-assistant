@@ -29,6 +29,7 @@ import { paths } from "@openclaude/storage";
 import { CodexAdapter, buildCodexBillingEvent, classifyCodexErrorKind } from "../engine/codexAdapter.js";
 import { __setCodexAppServerSpawnForTests } from "../engine/codexAppServerRunner.js";
 import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
+import { IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
 import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
 import { _setPlatformPricingLookupForTests } from "../usageCost.js";
 import { engineSessionId } from "../engine/engineSessionId.js";
@@ -982,6 +983,69 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     assert.equal(h.adapter.waitingForUserInput, false);
     p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
     await turn.summary;
+  });
+
+  test("OCV5-177: Codex long human wait resumes both clocks without blessing stale replies", async (t) => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    for (const id of ["first", "last"]) {
+      p.reply({
+        jsonrpc: "2.0", id, method: "item/tool/requestUserInput",
+        params: {
+          threadId: "thr-new-1", turnId: "turn-1", itemId: id, isBlocking: true,
+          questions: [{ id, header: "Plan", question: `${id}?`, isOther: false, isSecret: false }],
+        },
+      });
+    }
+    const permissions = h.events.filter((e) => e.kind === "permission_request");
+    assert.equal(permissions.length, 2);
+    const originalClock = h.adapter.lastActivityAt;
+    let activity = 0;
+    h.adapter.on("activity", () => activity++);
+    now += 31 * 60_000;
+    const trips = () => shouldTripIdleWatchdog({
+      waitingForUserInput: h.adapter.waitingForUserInput === true,
+      idleMs: now - h.adapter.lastActivityAt,
+      thresholdMs: IDLE_TIMEOUT_TOOL_MS,
+    });
+    assert.equal(trips(), false);
+    assert.equal(h.adapter.sendPermissionResponse("unknown", { behavior: "deny" }), false);
+    const write = p.stdin.write;
+    p.stdin.write = () => { throw new Error("EPIPE"); };
+    assert.equal(h.adapter.sendPermissionResponse(permissions[0]!.request.requestId, { behavior: "deny" }), false);
+    p.stdin.write = write;
+    assert.equal(h.adapter.lastActivityAt, originalClock);
+    assert.equal(activity, 0, "failed/unknown answers cannot renew the activity backstop");
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(h.adapter.sendPermissionResponse(permissions[0]!.request.requestId, {
+      behavior: "allow", updatedInput: { answers: { "first?": "Proceed" } },
+    }), true);
+    assert.equal(h.adapter.lastActivityAt, now);
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(activity, 1, "existing status message refreshes the 30min backstop");
+    assert.deepEqual(p.written.at(-1), {
+      jsonrpc: "2.0", id: "first", result: { answers: { first: { answers: ["Proceed"] } } },
+    });
+    now += 31 * 60_000;
+    assert.equal(h.adapter.sendPermissionResponse(permissions[0]!.request.requestId, { behavior: "deny" }), false);
+    assert.notEqual(h.adapter.lastActivityAt, now);
+    assert.equal(h.adapter.sendPermissionResponse(permissions[1]!.request.requestId, { behavior: "deny" }), true);
+    assert.equal(h.adapter.lastActivityAt, now);
+    assert.equal(h.adapter.waitingForUserInput, false);
+    assert.equal(activity, 2);
+    assert.equal(trips(), false, "resume is safe even before the next upstream output");
+    now += IDLE_TIMEOUT_TOOL_MS + 1;
+    assert.equal(trips(), true, "real silence still triggers watchdog");
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    const closedClock = h.adapter.lastActivityAt;
+    now += 60_000;
+    assert.equal(h.adapter.sendPermissionResponse(permissions[1]!.request.requestId, { behavior: "allow" }), false);
+    assert.equal(h.adapter.lastActivityAt, closedClock, "late reply cannot revive terminal turn");
   });
 
   test("requestUserInput 0.149 isBlocking 优先级:阻塞忽略 duration,非阻塞保留合法值或默认 60s", async () => {

@@ -1530,6 +1530,10 @@ export class CodexAppServerRunner extends EventEmitter {
     const written = this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
     if (!written) return false
     this.takePendingUserInput(requestId)
+    // Resume from human wait with a fresh liveness window, without waiting
+    // for upstream stdout. The status message below also emits adapter
+    // activity, renewing the independent 30min idle backstop.
+    this.lastActivityAt = Date.now()
     this.emitUserInputWaitStatus()
     return true
   }

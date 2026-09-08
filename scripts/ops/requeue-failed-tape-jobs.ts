@@ -11,12 +11,19 @@
  *
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --tape <id> [--tape <id> ...]
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --plan-tapes
+ *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --plan-late-delegate-continuations
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --tape <id> --execute --allow-production
+ *
+ * `--plan-late-delegate-continuations` is read-only: it never requeues, never
+ * writes PG, and refuses to combine with --execute. Historical 65-tape
+ * reconstruction stays a separate approval.
  *
  * Uses DATABASE_URL / COMMERCIAL_DATABASE_URL. Refuses a production target
  * (db name, connection host, or env-file source) unless --allow-production
  * is also set for --execute.
  */
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import pg from "pg";
 import {
   enqueueMaterializationJob,
@@ -84,6 +91,8 @@ export function parseRequeueArgs(argv: string[]): {
   execute: boolean;
   allowProduction: boolean;
   planTapes: boolean;
+  planLateDelegateContinuations: boolean;
+  snapshot?: string;
   sessionId?: string;
   userId?: string;
 } {
@@ -91,6 +100,8 @@ export function parseRequeueArgs(argv: string[]): {
   let execute = false;
   let allowProduction = false;
   let planTapes = false;
+  let planLateDelegateContinuations = false;
+  let snapshot: string | undefined;
   let sessionId: string | undefined;
   let userId: string | undefined;
   for (let i = 0; i < argv.length; i++) {
@@ -98,6 +109,8 @@ export function parseRequeueArgs(argv: string[]): {
     if (token === "--execute" || token === "--apply") execute = true;
     else if (token === "--allow-production") allowProduction = true;
     else if (token === "--plan-tapes") planTapes = true;
+    else if (token === "--plan-late-delegate-continuations") planLateDelegateContinuations = true;
+    else if (token === "--snapshot" && argv[i + 1]) snapshot = argv[++i];
     else if (token === "--tape" && argv[i + 1]) {
       tapes.push(argv[++i]!);
     } else if (token === "--session" && argv[i + 1]) {
@@ -106,7 +119,225 @@ export function parseRequeueArgs(argv: string[]): {
       userId = argv[++i];
     }
   }
-  return { tapes, execute, allowProduction, planTapes, sessionId, userId };
+  return { tapes, execute, allowProduction, planTapes, planLateDelegateContinuations, snapshot, sessionId, userId };
+}
+
+/** OCV5-180 B1 — read-only plan for a late-delegate group that landed on the
+ * wrong owner tape. Never writes. Root missing / not-finalized is a retryable
+ * wait (`skip`), not a permanent `manual_reconcile`. */
+export type LateDelegateBillingLocator = {
+  requestId?: string;
+  parentTurnKey?: string;
+  parentSessionId?: string;
+};
+
+export type LateDelegateFenceEntry = {
+  requestId: string;
+  inspected: boolean;
+  matched: boolean;
+};
+
+export type LateDelegatePlanGroup = {
+  runId: string;
+  engineBillings?: LateDelegateBillingLocator[];
+  transcript?: unknown;
+  resultSummary?: unknown;
+  status?: unknown;
+  _ocEventOrdinal?: unknown;
+  [key: string]: unknown;
+};
+
+export type LateDelegateContinuationPlan = {
+  tapeId: string;
+  sessionId: string;
+  groupRunId: string;
+  groupHash: string;
+  sourceLocator: { sessionId: string; turnKey: string | null };
+  targetLocator: { sessionId: string; turnKey: string | null };
+  billingLocators: LateDelegateBillingLocator[];
+  requestIds: string[];
+  fence: LateDelegateFenceEntry[];
+  rootFinalized: boolean | null;
+  requestId: string | null;
+  action: "continuation" | "manual_reconcile" | "skip";
+  reason: string;
+};
+
+export type LateDelegateSnapshotTape = {
+  tapeId: string;
+  sessionId: string;
+  turnKey?: string | null;
+  groups?: LateDelegatePlanGroup[];
+  root?: { sessionId: string; turnKey: string; finalized: boolean } | null;
+  settlementFence?: { requestIds?: string[] } | null;
+  inspected?: boolean;
+};
+
+export type LateDelegateSnapshot = {
+  tapes?: LateDelegateSnapshotTape[];
+};
+
+function canonicalLateDelegatePlanGroupBytes(group: LateDelegatePlanGroup): Buffer {
+  const json = JSON.stringify(group, (key, current) => {
+    if (key === "_ocEventOrdinal") return undefined;
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current;
+    const sorted: Record<string, unknown> = {};
+    for (const next of Object.keys(current as Record<string, unknown>).sort()) {
+      sorted[next] = (current as Record<string, unknown>)[next];
+    }
+    return sorted;
+  });
+  if (json === undefined) throw new Error("late delegate plan group is not JSON serializable");
+  return Buffer.from(json, "utf8");
+}
+
+export function planLateDelegateGroupHash(group: LateDelegatePlanGroup): string {
+  return createHash("sha256")
+    .update("oc-late-delegate-plan-v2\0")
+    .update(canonicalLateDelegatePlanGroupBytes(group))
+    .digest("hex");
+}
+
+export function planLateDelegateContinuation(input: {
+  tapeId: string;
+  sessionId: string;
+  group: LateDelegatePlanGroup;
+  tapeTurnKey?: string | null;
+  root?: { sessionId: string; turnKey: string; finalized: boolean } | null;
+  settlementFence?: { requestIds?: string[] } | null;
+  fenceInspected?: boolean;
+  inspected?: boolean;
+}): LateDelegateContinuationPlan {
+  const billings = Array.isArray(input.group.engineBillings) ? input.group.engineBillings : [];
+  const requestIds = billings
+    .map((billing) => billing.requestId)
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+  const groupHash = planLateDelegateGroupHash(input.group);
+  const sourceLocator = {
+    sessionId: input.sessionId,
+    turnKey: input.tapeTurnKey ?? null,
+  };
+  const sessionIds = [...new Set(
+    billings
+      .map((billing) => billing.parentSessionId)
+      .filter((id): id is string => typeof id === "string" && id.length > 0),
+  )];
+  const turnKeys = [...new Set(
+    billings
+      .map((billing) => billing.parentTurnKey)
+      .filter((id): id is string => typeof id === "string" && id.length > 0),
+  )];
+  const targetSessionId = sessionIds[0] ?? input.sessionId;
+  const targetTurnKey = turnKeys[0] ?? input.root?.turnKey ?? null;
+  const fenceInspected = input.fenceInspected === true;
+  const fenceIds = new Set(input.settlementFence?.requestIds ?? []);
+  const fence: LateDelegateFenceEntry[] = requestIds.map((requestId) => ({
+    requestId,
+    inspected: fenceInspected,
+    matched: fenceInspected && fenceIds.has(requestId),
+  }));
+  const matchedCount = fence.filter((entry) => entry.matched).length;
+  const base = {
+    tapeId: input.tapeId,
+    sessionId: input.sessionId,
+    groupRunId: input.group.runId,
+    groupHash,
+    sourceLocator,
+    targetLocator: { sessionId: targetSessionId, turnKey: targetTurnKey },
+    billingLocators: billings.map((billing) => ({
+      ...(typeof billing.requestId === "string" ? { requestId: billing.requestId } : {}),
+      ...(typeof billing.parentTurnKey === "string" ? { parentTurnKey: billing.parentTurnKey } : {}),
+      ...(typeof billing.parentSessionId === "string" ? { parentSessionId: billing.parentSessionId } : {}),
+    })),
+    requestIds,
+    fence,
+    rootFinalized: input.root ? input.root.finalized : null,
+    requestId: requestIds[0] ?? null,
+  };
+  if (input.inspected === false) {
+    return { ...base, action: "skip", reason: "snapshot_not_inspected" };
+  }
+  if (sessionIds.length > 1 || turnKeys.length > 1) {
+    return { ...base, action: "manual_reconcile", reason: "mixed_billing_locators" };
+  }
+  if (targetSessionId !== input.sessionId) {
+    return { ...base, action: "manual_reconcile", reason: "cross_session_locator" };
+  }
+  if (matchedCount > 0 && matchedCount === requestIds.length) {
+    return { ...base, action: "skip", reason: "request_already_on_root" };
+  }
+  if (matchedCount > 0 && matchedCount < requestIds.length) {
+    return { ...base, action: "skip", reason: "partial_request_fence" };
+  }
+  if (!input.root) {
+    return { ...base, action: "skip", reason: "root_tape_missing_retryable" };
+  }
+  if (!input.root.finalized) {
+    return { ...base, action: "skip", reason: "root_not_finalized_retryable" };
+  }
+  if (input.root.sessionId !== targetSessionId || input.root.turnKey !== targetTurnKey) {
+    return { ...base, action: "manual_reconcile", reason: "root_locator_mismatch" };
+  }
+  return { ...base, action: "continuation", reason: "owner_finalized_exact_locator" };
+}
+
+export function planLateDelegateSnapshot(input: {
+  snapshot: LateDelegateSnapshot;
+  tapeIds: string[];
+}): LateDelegateContinuationPlan[] {
+  const byId = new Map((input.snapshot.tapes ?? []).map((tape) => [tape.tapeId, tape]));
+  const plans: LateDelegateContinuationPlan[] = [];
+  for (const tapeId of input.tapeIds) {
+    const tape = byId.get(tapeId);
+    if (!tape) {
+      plans.push({
+        tapeId,
+        sessionId: "",
+        groupRunId: "",
+        groupHash: createHash("sha256").update(`missing:${tapeId}`).digest("hex"),
+        sourceLocator: { sessionId: "", turnKey: null },
+        targetLocator: { sessionId: "", turnKey: null },
+        billingLocators: [],
+        requestIds: [],
+        fence: [],
+        rootFinalized: null,
+        requestId: null,
+        action: "skip",
+        reason: "snapshot_tape_missing",
+      });
+      continue;
+    }
+    const groups = Array.isArray(tape.groups) ? tape.groups : [];
+    if (groups.length === 0) {
+      plans.push(planLateDelegateContinuation({
+        tapeId: tape.tapeId,
+        sessionId: tape.sessionId,
+        group: { runId: "", engineBillings: [] },
+        tapeTurnKey: tape.turnKey,
+        root: tape.root ?? null,
+        inspected: tape.inspected,
+      }));
+      plans[plans.length - 1]!.reason = groups.length === 0 && tape.inspected === false
+        ? "snapshot_not_inspected"
+        : "snapshot_no_groups";
+      plans[plans.length - 1]!.action = "skip";
+      continue;
+    }
+    const fenceInspected = tape.settlementFence != null;
+    for (const group of groups) {
+      plans.push(planLateDelegateContinuation({
+        tapeId: tape.tapeId,
+        sessionId: tape.sessionId,
+        group,
+        tapeTurnKey: tape.turnKey,
+        root: tape.root ?? null,
+        settlementFence: tape.settlementFence ?? null,
+        fenceInspected,
+        inspected: tape.inspected,
+      }));
+    }
+  }
+  return plans;
 }
 
 /** Production is more than an exact database name: env-file source and host count. */
@@ -459,14 +690,49 @@ export async function applyTapeRequeue(
 
 async function main(): Promise<void> {
   const args = parseRequeueArgs(process.argv.slice(2));
+  if (args.planLateDelegateContinuations && args.execute) {
+    console.error("--plan-late-delegate-continuations is read-only and refuses --execute");
+    process.exit(2);
+  }
   const tapes = [...args.tapes];
   if (args.planTapes) tapes.push(...PLAN_TAPES);
-  if (tapes.length === 0 && !args.sessionId) {
+  if (tapes.length === 0 && !args.sessionId && !args.planLateDelegateContinuations) {
     console.error(
       "usage: requeue-failed-tape-jobs.ts --tape <id> [--tape <id> ...] [--execute] [--allow-production]\n" +
-        "       requeue-failed-tape-jobs.ts --plan-tapes [--execute] [--allow-production]",
+        "       requeue-failed-tape-jobs.ts --plan-tapes [--execute] [--allow-production]\n" +
+        "       requeue-failed-tape-jobs.ts --plan-late-delegate-continuations  (read-only, no requeue)",
     );
     process.exit(2);
+  }
+  if (args.planLateDelegateContinuations) {
+    if (!args.snapshot) {
+      console.error("missing --snapshot <file>; refusing empty plans[] (not a successful dry-run)");
+      process.exit(2);
+    }
+    let snapshot: LateDelegateSnapshot;
+    try {
+      snapshot = JSON.parse(readFileSync(args.snapshot, "utf8")) as LateDelegateSnapshot;
+    } catch (err) {
+      console.error(`snapshot unreadable: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
+    const selected = tapes.length > 0
+      ? tapes
+      : (snapshot.tapes ?? []).map((tape) => tape.tapeId);
+    if (selected.length === 0) {
+      console.error("no tape ids selected and snapshot has no tapes; refusing empty plans[]");
+      process.exit(2);
+    }
+    const plans = planLateDelegateSnapshot({ snapshot, tapeIds: selected });
+    console.log(JSON.stringify({
+      planner: "late-delegate-continuations",
+      mode: "dry-run",
+      note: "offline snapshot only; historical 65/132 reconstruction is not executed and never requeues",
+      snapshot: args.snapshot,
+      tapes: selected,
+      plans,
+    }, null, 2));
+    return;
   }
   const url = process.env.COMMERCIAL_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {

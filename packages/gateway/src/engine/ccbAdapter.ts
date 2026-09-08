@@ -801,12 +801,19 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   // ── permission ─────────────────────────────────────────────────────────
 
   sendPermissionResponse(requestId: string, response: unknown): boolean {
+    // Only a pending request owned by the active turn can resume execution.
+    // _routeTurn can outlive a finalized turn for background output routing;
+    // accepting one of its stale responses must not keep a successor alive.
+    const turn = this._activeTurn
+    if (!turn?.pendingPermissionRequestIds.has(requestId)) return false
     const sent = this.runner.sendPermissionResponse(requestId, response as PermissionResponse)
     if (sent) {
-      // P1-6:已回复即不再"等用户"。stale response(旧 turn 的 requestId)对
-      // 当前集合是 no-op,不会误清后继 turn 的未决请求。
-      this._activeTurn?.pendingPermissionRequestIds.delete(requestId)
-      this._routeTurn?.pendingPermissionRequestIds.delete(requestId)
+      turn.pendingPermissionRequestIds.delete(requestId)
+      // Human wait is not engine silence. Renew BOTH idle clocks before
+      // returning: the liveness timestamp and the 30min activity backstop.
+      // Neither change moves the immutable logical-turn hard deadline.
+      this.runner.lastActivityAt = Date.now()
+      this.emit('activity')
     }
     return sent
   }

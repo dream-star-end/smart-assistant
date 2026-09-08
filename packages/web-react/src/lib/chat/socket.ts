@@ -19,6 +19,7 @@ import {
   applyOutboundMessage,
   applyPermissionRequest,
   applyPermissionSettled,
+  applyPermissionSnapshot,
   applyResumeFailed,
   applyTurnStatus,
   applyTurnUsage,
@@ -67,6 +68,7 @@ import {
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
+  reconcileLateDelegateAgentGroups,
   reconcileTimelineBashTailAuxiliaries,
   shouldRetainLiveProcessOnOwnerReset,
   type ServerTurnTerminal,
@@ -76,6 +78,7 @@ import {
 } from "../persist";
 import { appUpdate } from "../appUpdate";
 import { observeTimelineShadow } from "../timeline/shadowLifecycle";
+import type { PermissionPromptSnapshotPayload } from "../types";
 import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
@@ -255,6 +258,8 @@ export type ChatSocketDeps = {
   persistSessionModel?: (sessId: string, modelId: string) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
+  /** Bounded requestId lookup when a permission snapshot page is truncated. */
+  lookupPermissionPrompts?: (sessId: string, requestIds: string[]) => void;
   /** Exact outbound journal. Production waits for one committed row before
    * the first physical WS send and exact-deletes it only after authority ACK. */
   persistPendingDispatch?: (sessId: string, item: StoredPendingDispatch) => Promise<void>;
@@ -802,13 +807,16 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout> | null;
     inFlight: boolean;
   }>();
-  /** Exact active-turn candidate sets already attempted on the current WS.
-   * History can arrive after the initial shell hello; each new candidate set
-   * gets one targeted registration hello, then waits for a reconnect before
-   * retrying to avoid a resume_failed/sync loop. */
+  /** Active candidate sets and idle cursor registrations attempted on this WS.
+   * History can arrive after the initial shell hello; each identity gets one
+   * successful targeted hello. A server-reset idle cursor is a new identity,
+   * while repeating the same snapshot cannot cause a resume_failed/sync loop. */
   private readonly activeReplayAttemptKeys = new Set<string>();
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
+  getActiveSessionId(): string | undefined {
+    return this.activeSessionId;
+  }
 
   // ── 重连 reconcile（§4）──
   private reconnectInFlightSet: Set<string> | null = null;
@@ -2505,6 +2513,20 @@ export class ChatSocket {
         return;
       }
       default:
+        if ((f as { type?: unknown }).type === "outbound.permission_hello_scan") {
+          const frame = f as {
+            truncated?: unknown;
+            rowLimited?: unknown;
+            uncoveredSessionIds?: unknown;
+          };
+          const uncovered = Array.isArray(frame.uncoveredSessionIds)
+            ? frame.uncoveredSessionIds.filter((id): id is string => typeof id === "string")
+            : [];
+          const active = this.activeSessionId;
+          if (active && (frame.truncated === true || frame.rowLimited === true || uncovered.includes(active))) {
+            this.deps.syncSession?.(active);
+          }
+        }
         // pong 已先处理；其余 v5 webchat 不消费。
         return;
     }
@@ -3123,7 +3145,7 @@ export class ChatSocket {
   private composeHelloFrame(
     includeInFlight = true,
     onlySessionId?: string,
-    requireFreshActiveCandidate = false,
+    requireFreshRegistration = false,
   ): { data: string; attemptKeys: string[] } {
     const peers: Array<{
       peerId: string;
@@ -3143,10 +3165,16 @@ export class ChatSocket {
         if (emitted.has(aid)) return;
         emitted.add(aid);
         const candidates = this.activeTurnReplayCandidates(s);
-        const attemptKey = candidates.length > 0 ? `${pid}:${aid}:${candidates.join(",")}` : "";
-        const hasFreshCandidates = !!attemptKey && !this.activeReplayAttemptKeys.has(attemptKey);
-        if (requireFreshActiveCandidate && !hasFreshCandidates) return;
-        if (hasFreshCandidates) attemptKeys.push(attemptKey);
+        // An idle session can be loaded after this socket's initial hello.
+        // Its persisted cursor still needs server arbitration before the next
+        // turn, even though completed history has no active replay candidate.
+        const attemptKey = candidates.length > 0
+          ? `${pid}:${aid}:${candidates.join(",")}`
+          : `${pid}:${aid}:idle-cursor:${lastFrameSeq}`;
+        const fresh = !this.activeReplayAttemptKeys.has(attemptKey);
+        const hasFreshCandidates = candidates.length > 0 && fresh;
+        if (requireFreshRegistration && !fresh) return;
+        if (fresh) attemptKeys.push(attemptKey);
         const emitInFlight = includeInFlight && !!s._sendingInFlight;
         peers.push({
           peerId: pid,
@@ -3192,10 +3220,10 @@ export class ChatSocket {
   private sendHelloFrame(
     includeInFlight = true,
     onlySessionId?: string,
-    requireFreshActiveCandidate = false,
+    requireFreshRegistration = false,
   ): boolean {
-    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshActiveCandidate);
-    if (requireFreshActiveCandidate && hello.attemptKeys.length === 0) return false;
+    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshRegistration);
+    if (requireFreshRegistration && hello.attemptKeys.length === 0) return false;
     const sent = this.safeWsSend(hello.data);
     if (sent) for (const key of hello.attemptKeys) this.activeReplayAttemptKeys.add(key);
     return sent;
@@ -3828,6 +3856,7 @@ export class ChatSocket {
         clientMessageId: string;
         status: string;
       };
+      permissionPrompts?: PermissionPromptSnapshotPayload;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -3945,6 +3974,7 @@ export class ChatSocket {
           },
         );
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
@@ -3988,6 +4018,10 @@ export class ChatSocket {
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
     expireGenPlaceholdersAgainstServerRows(s);
+    if (archive?.permissionPrompts) {
+      const lookupIds = applyPermissionSnapshot(s, archive.permissionPrompts);
+      if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(s.id, lookupIds);
+    }
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
     this.reconcileUnpublishedTapeRetry(sessId);
@@ -4018,13 +4052,26 @@ export class ChatSocket {
     // hidden and「模型繁忙，正在重试中（n/10）」shows, same as the live path.
     if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
     // Login/reload can open WS before REST history arrives. If that initial
-    // shell hello had no user-row identity it can only produce a generic
-    // resume_failed. Once full history exposes trailing persisted user rows,
-    // issue one targeted registration hello so the server can verify and
-    // replay the exact active turn from its protected boundary.
+    // shell hello may not include this session at all. Register idle cursors
+    // too: otherwise a cached high cursor survives a gateway restart and
+    // swallows the next turn's low-numbered output on this still-open socket.
+    // Active candidates retain their separate exact-turn replay identity.
     if (full && this.ws && this.ws.readyState === 1) {
       this.sendHelloFrame(false, sessId, true);
     }
+  }
+
+  applyPermissionPromptSnapshot(
+    sessId: string,
+    snapshot: PermissionPromptSnapshotPayload | null | undefined,
+  ): string[] {
+    const sess = this.sessions.get(sessId);
+    if (!sess || !snapshot) return [];
+    const lookupIds = applyPermissionSnapshot(sess, snapshot);
+    this.deps.persistSession?.(sess.id);
+    this.scheduleNotify();
+    if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(sess.id, lookupIds);
+    return lookupIds;
   }
 
   /**
@@ -4714,6 +4761,7 @@ export class ChatSocket {
     }));
     s.messages = mergeTimelineHistoryPage(s.messages, page);
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     s._historyPageSerial = serial;
     s._timelineCursor = nextCursor;
     s._timelineHasMore = hasMore && typeof nextCursor === "string" && nextCursor.length > 0;
@@ -4776,6 +4824,7 @@ export class ChatSocket {
       };
     }
     s.messages = reconcileTimelineBashTailAuxiliaries(next);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);

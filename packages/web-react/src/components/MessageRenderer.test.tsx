@@ -7,6 +7,8 @@ import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS, shouldShowScrollToBottom } from "./MessageRenderer";
+import { AgentGroupCard } from "./chat/AgentGroupCard";
+import * as AgentGroupMod from "./chat/AgentGroupCard";
 import * as MarkdownMod from "./Markdown";
 import { PAINT_MIN_ITEMS } from "../lib/chat/timelinePaint";
 import { createStickToBottomController } from "./chat/stickToBottom";
@@ -779,6 +781,69 @@ describe("permission 审批", () => {
     );
     expect(screen.getByText("本轮已停止，提问已关闭")).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("同数组 live push 出现 dock；settle 后消失；dock 重开不发 permission_response", async () => {
+    const onRespond = vi.fn();
+    const messages: ChatMessage[] = [
+      mk("user", { id: "u-live", text: "问", ts: Date.now() }),
+    ];
+    const view = render(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    messages.push(
+      mk("permission", {
+        id: "p-live",
+        toolName: "Bash",
+        requestId: "req-live-arr",
+        _resolved: false,
+        inputPreview: "ls",
+        ts: Date.now(),
+      }),
+    );
+    view.rerender(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    messages[1]!._resolved = true;
+    messages[1]!._behavior = "allow";
+    view.rerender(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  test("权限卡被虚拟化卸载时 dock 仍打开同一请求且不 decide", async () => {
+    const onRespond = vi.fn();
+    const filler = Array.from({ length: 120 }, (_, i) =>
+      mk("assistant", { id: `fill-${i}`, text: `正文 ${i}`, ts: Date.now() - 120_000 + i }),
+    );
+    const pending = mk("permission", {
+      id: "p-offscreen",
+      toolName: "Bash",
+      requestId: "req-offscreen",
+      _resolved: false,
+      inputPreview: "ls",
+      ts: Date.now(),
+    });
+    render(
+      <MessageList
+        messages={[pending, ...filler]}
+        sending
+        cb={{}}
+        onRespondPermission={onRespond}
+      />,
+    );
+    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByTestId("pending-permission-dock").querySelector("button")!);
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    expect(onRespond).not.toHaveBeenCalled();
   });
 
   test("AskUserQuestion 已提交 → 展示问答摘要", () => {
@@ -2847,6 +2912,51 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     expect(await screen.findByText("提前兑付的正文")).toBeInTheDocument();
     vi.unstubAllGlobals();
     scroller.remove();
+  });
+
+  test("deferred late-delegate card keeps owner after Range body expand", async () => {
+    const ownerTurn = "a".repeat(64);
+    const continuationTurn = "c".repeat(64);
+    const seen: ChatMessage[] = [];
+    const real = AgentGroupCard;
+    const spy = vi.spyOn(AgentGroupMod, "AgentGroupCard").mockImplementation((props) => {
+      seen.push(props.msg);
+      return real(props);
+    });
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
+      mk("agent-group", {
+        id: "srv-late-agentgroup-dlg-late-1",
+        text: "晚到子任务正文",
+      }),
+    ]);
+    render(
+      <MessageRenderer
+        message={mk("agent-group", {
+          id: "srv-late-agentgroup-dlg-late-1",
+          text: "",
+          _payloadDeferred: true,
+          _payloadBytes: 1_100_000,
+          _turnTapeId: "late-tape",
+          _recordOrdinal: 0,
+          _continuationOfTurnKey: ownerTurn,
+          _delegateRunId: "dlg-late-1",
+          _turnKey: continuationTurn,
+        })}
+        sig="late-deferred"
+        isLast={false}
+        sending={false}
+        inActiveTurn={false}
+        cb={{ onFetchTapeRecordPayload }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(await screen.findByText("晚到子任务正文")).toBeInTheDocument();
+    expect(onFetchTapeRecordPayload).toHaveBeenCalled();
+    const expanded = seen.at(-1);
+    expect(expanded?._continuationOfTurnKey).toBe(ownerTurn);
+    expect(expanded?._delegateRunId).toBe("dlg-late-1");
+    expect(expanded?._turnKey).toBe(continuationTurn);
+    spy.mockRestore();
   });
 });
 

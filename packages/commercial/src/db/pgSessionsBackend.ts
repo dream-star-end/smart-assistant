@@ -46,6 +46,7 @@ import { getHeapStatistics } from "node:v8";
 import { gzipSync, gunzipSync } from "node:zlib";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
+  LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
@@ -205,9 +206,12 @@ import {
   type WechatBinding,
 } from "@openclaude/storage";
 import {
+  canonicalPublishedAgentGroupRecordFingerprint,
   computeGoalTokensUsed,
   isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
+  materializeRootDomainAgentGroupRecord,
+  parseLosslessTurnPayload,
   type LosslessTurnRecord,
   type LosslessTurnPayload,
 } from "../http/losslessTurnTape.js";
@@ -235,6 +239,9 @@ import {
 } from "../dispatch/turnRecoveryStore.js";
 import {
   cancelPendingPermissionPromptsForTurn,
+  readPermissionPromptSnapshot,
+  readPermissionPromptsByRequestIds,
+  serializePermissionPromptEntry,
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
@@ -2894,6 +2901,7 @@ interface DirectTapeHeader {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  continuationOfTurnKey: string | null;
   materializationStatus: string | null;
   finalizedAt: string | null;
   visibleAt: string | null;
@@ -3496,6 +3504,316 @@ function userVisiblePhysicalPayload(
   };
 }
 
+export type LateDelegateRootDecision = "proceed" | "idempotent" | "retry";
+
+function retryableTapeError(message: string, cause?: unknown): Error {
+  return Object.assign(new Error(message), { retryable: true, cause });
+}
+
+function lateDelegateRootConflict(): Error {
+  return Object.assign(new Error("lossless turn tape late-delegate root conflict"), {
+    immutableConflict: true,
+  });
+}
+
+async function loadAssembledTapePayload(
+  pool: Pool | PoolClient,
+  userId: string,
+  sessionId: string,
+  tapeId: string,
+  expected: { totalBytes: number; tapeSha256: string; partCount: number },
+): Promise<{ raw: unknown } | "incomplete"> {
+  const parts = (
+    await pool.query<{ part_index: number; part_sha256: string; payload: Buffer }>(
+      `SELECT part_index, part_sha256, payload
+         FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        ORDER BY part_index`,
+      [sessionId, userId, tapeId],
+    )
+  ).rows;
+  if (parts.length !== expected.partCount) return "incomplete";
+  const canonical = Buffer.allocUnsafe(expected.totalBytes);
+  const aggregate = createHash("sha256");
+  let writeOffset = 0;
+  for (let partIndex = 0; partIndex < expected.partCount; partIndex++) {
+    const part = parts[partIndex];
+    if (!part || part.part_index !== partIndex) return "incomplete";
+    const bytes = Buffer.from(part.payload);
+    if (sha256Bytes(bytes) !== part.part_sha256) {
+      throw new Error("lossless turn tape part hash mismatch");
+    }
+    if (writeOffset + bytes.length > canonical.length) {
+      throw new Error("lossless turn tape aggregate length mismatch");
+    }
+    bytes.copy(canonical, writeOffset);
+    aggregate.update(bytes);
+    writeOffset += bytes.length;
+  }
+  if (writeOffset !== expected.totalBytes || aggregate.digest("hex") !== expected.tapeSha256) {
+    throw new Error("lossless turn tape aggregate hash mismatch");
+  }
+  try {
+    return { raw: JSON.parse(canonical.toString("utf8")) };
+  } catch (err) {
+    throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
+  }
+}
+
+async function loadAssembledTapePayloadAdmitted(
+  pool: Pool | PoolClient,
+  userId: string,
+  sessionId: string,
+  tapeId: string,
+  expected: { totalBytes: number; tapeSha256: string; partCount: number },
+): Promise<{ raw: unknown } | "incomplete"> {
+  const release = acquireFinalizeMemoryAdmission(expected.totalBytes);
+  try {
+    return await loadAssembledTapePayload(pool, userId, sessionId, tapeId, expected);
+  } finally {
+    release();
+  }
+}
+
+function isLateDelegateContinuationAgentId(agentId: string): boolean {
+  // B1 writer: `late_${runKey.slice(0, 24)}`. `tail_` runtimeEvents-only
+  // continuations keep the visible-first contract and must not assemble here.
+  return agentId.startsWith("late_");
+}
+
+function losslessEnvelopeMatchesPayload(
+  request: LosslessTurnTapeFinalizeRequest,
+  payload: LosslessTurnPayload,
+): boolean {
+  return payload.sessionId === request.sessionId &&
+    payload.agentId === request.agentId &&
+    payload.turnIndex === request.turnIndex &&
+    payload.status === request.status &&
+    payload.turnKey === request.turnKey &&
+    payload.waiveReason === request.waiveReason;
+}
+
+function assertLosslessEnvelopeMatchesPayload(
+  request: LosslessTurnTapeFinalizeRequest,
+  payload: LosslessTurnPayload,
+): void {
+  if (!losslessEnvelopeMatchesPayload(request, payload)) {
+    throw new Error("lossless turn tape envelope/payload identity mismatch");
+  }
+}
+
+function rethrowInspectTapeError(err: unknown): never {
+  if (err && typeof err === "object") {
+    if ((err as { immutableConflict?: unknown }).immutableConflict === true) throw err;
+    if ((err as { retryable?: unknown }).retryable === true) throw err;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/part hash mismatch|aggregate (?:hash|length) mismatch|canonical JSON invalid|envelope\/payload identity mismatch/.test(msg)) {
+    throw err;
+  }
+  throw retryableTapeError("late-delegate root lookup failed", err);
+}
+
+/** Master-side R1-4: agent-group continuation vs the owner root tape's parts/records. */
+export async function inspectLateDelegateContinuationAgainstRoot(
+  pool: Pool | PoolClient,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+  continuationPayload?: LosslessTurnPayload,
+): Promise<LateDelegateRootDecision> {
+  let payload = continuationPayload;
+  if (!payload) {
+    // Cheap gate: HTTP finalize has no continuationOfTurnKey on the envelope.
+    // Ordinary / huge roots must not Buffer.allocUnsafe before admission.
+    if (!isLateDelegateContinuationAgentId(request.agentId)) return "proceed";
+    let assembled: { raw: unknown } | "incomplete";
+    try {
+      assembled = await loadAssembledTapePayloadAdmitted(
+        pool,
+        userId,
+        request.sessionId,
+        request.tapeId,
+        {
+          totalBytes: request.totalBytes,
+          tapeSha256: request.tapeSha256,
+          partCount: request.partCount,
+        },
+      );
+    } catch (err) {
+      rethrowInspectTapeError(err);
+    }
+    if (assembled === "incomplete") return "retry";
+    payload = parseLosslessTurnPayload(assembled.raw);
+  }
+  // Identity vs the upload envelope must run before any idempotent ACK.
+  assertLosslessEnvelopeMatchesPayload(request, payload);
+  const ownerTurnKey = payload.continuationOfTurnKey;
+  const groups = payload.agentGroups;
+  if (!ownerTurnKey || !Array.isArray(groups) || groups.length === 0) return "proceed";
+
+  let roots: Array<{
+    tape_id: string;
+    tape_sha256: string;
+    total_bytes: string;
+    part_count: number;
+    finalized_at: string | null;
+    visible_at: string | null;
+    agent_id: string;
+    turn_index: number;
+    status: string;
+    turn_key: string;
+    created_at: string;
+    physical_record_count: string | null;
+    materialization_status: string | null;
+    client_message_id: string | null;
+  }>;
+  try {
+    roots = (
+      await pool.query<{
+        tape_id: string;
+        tape_sha256: string;
+        total_bytes: string;
+        part_count: number;
+        finalized_at: string | null;
+        visible_at: string | null;
+        agent_id: string;
+        turn_index: number;
+        status: string;
+        turn_key: string;
+        created_at: string;
+        physical_record_count: string | null;
+        materialization_status: string | null;
+        client_message_id: string | null;
+      }>(
+        `SELECT t.tape_id, t.tape_sha256, t.total_bytes::text AS total_bytes, t.part_count,
+                t.finalized_at::text, t.visible_at::text,
+                t.agent_id, t.turn_index, t.status, t.turn_key, t.created_at::text,
+                t.physical_record_count::text AS physical_record_count,
+                t.materialization_status, t.client_message_id
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.turn_key=$3
+            AND t.continuation_of_turn_key IS NULL
+          LIMIT 2`,
+        [request.sessionId, userId, ownerTurnKey],
+      )
+    ).rows;
+  } catch (err) {
+    throw retryableTapeError("late-delegate root lookup failed", err);
+  }
+  if (roots.length !== 1) return "retry";
+  const root = roots[0]!;
+  // Parts-only is not an owner root. Keep durable retry until visible+finalized.
+  if (root.finalized_at == null || root.visible_at == null) return "retry";
+  if (root.materialization_status !== "complete") return "retry";
+  if (root.status !== "completed" && root.status !== "interrupted" && root.status !== "crashed") {
+    return "retry";
+  }
+  const physicalCount = root.physical_record_count == null
+    ? NaN
+    : bigIntNum(root.physical_record_count, "root turn tape physical_record_count");
+  if (!Number.isFinite(physicalCount) || physicalCount < 1) return "retry";
+  const recordPrefix = root.agent_id === LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID
+    ? `srv-${request.sessionId}-t${root.turn_index}`
+    : `srv-${request.sessionId}-${root.agent_id}-t${root.turn_index}`;
+  let recordStats: { total: string; off_prefix: string };
+  try {
+    recordStats = (
+      await pool.query<{ total: string; off_prefix: string }>(
+        `SELECT COUNT(*)::text AS total,
+                COUNT(*) FILTER (WHERE msg_id NOT LIKE $4)::text AS off_prefix
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [request.sessionId, userId, root.tape_id, `${recordPrefix}%`],
+      )
+    ).rows[0] ?? { total: "0", off_prefix: "0" };
+  } catch (err) {
+    throw retryableTapeError("late-delegate root lookup failed", err);
+  }
+  const totalRecords = bigIntNum(recordStats.total, "root turn tape record count");
+  const offPrefix = bigIntNum(recordStats.off_prefix, "root turn tape off-prefix record count");
+  // Missing records are unreadiness, not "no run". Header/record identity must match.
+  if (totalRecords !== physicalCount || offPrefix !== 0) return "retry";
+
+  const runIds: string[] = [];
+  const msgIds: string[] = [];
+  for (const group of groups) {
+    const runId = typeof group.runId === "string" ? group.runId : "";
+    if (!runId) return "retry";
+    runIds.push(runId);
+    msgIds.push(`${recordPrefix}-agentgroup-${runId}`);
+  }
+  let publishedRows: Array<{ msg_id: string; role: string; content_sha256: string; payload: Buffer }>;
+  try {
+    publishedRows = (
+      await pool.query<{ msg_id: string; role: string; content_sha256: string; payload: Buffer }>(
+        `SELECT msg_id, role, content_sha256, payload
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            AND msg_id = ANY($4::text[])`,
+        [request.sessionId, userId, root.tape_id, msgIds],
+      )
+    ).rows;
+  } catch (err) {
+    throw retryableTapeError("late-delegate root lookup failed", err);
+  }
+  const byMsgId = new Map(publishedRows.map((row) => [row.msg_id, row]));
+  const createdAt = bigIntNum(root.created_at, "root turn tape created_at");
+  let matched = 0;
+  for (let index = 0; index < groups.length; index++) {
+    const group = groups[index]!;
+    const published = byMsgId.get(msgIds[index]!);
+    if (!published) continue;
+    if (published.role !== "agent-group") return "retry";
+    const bytes = Buffer.from(published.payload);
+    const release = acquireFinalizeMemoryAdmission(bytes.length);
+    try {
+      if (sha256Bytes(bytes) !== published.content_sha256) return "retry";
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(bytes.toString("utf8"));
+      } catch {
+        return "retry";
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "retry";
+      // Published bytes describe the root's original stamp. A header may gain
+      // dispatch attribution later, so never stamp a legacy unstamped record
+      // merely because the header now has client_message_id.
+      const origin = (parsed as Record<string, unknown>)._clientMessageId;
+      if (origin !== undefined) {
+        if (!isClientMessageId(origin)) throw lateDelegateRootConflict();
+        if (root.client_message_id != null && root.client_message_id !== origin) {
+          throw lateDelegateRootConflict();
+        }
+        // The materializer overwrites this field when stamping. Reject a
+        // conflicting incoming identity before that overwrite can hide it.
+        if (group._clientMessageId !== undefined && group._clientMessageId !== origin) {
+          throw lateDelegateRootConflict();
+        }
+      }
+      const expected = materializeRootDomainAgentGroupRecord(group as Record<string, unknown>, {
+        sessionId: request.sessionId,
+        agentId: root.agent_id,
+        turnIndex: root.turn_index,
+        status: root.status,
+        turnKey: root.turn_key,
+        createdAt,
+        ...(typeof origin === "string" ? { clientMessageId: origin } : {}),
+      });
+      const lateFp = canonicalPublishedAgentGroupRecordFingerprint(expected);
+      const rootFp = canonicalPublishedAgentGroupRecordFingerprint(parsed as Record<string, unknown>);
+      if (lateFp !== rootFp) throw lateDelegateRootConflict();
+    } catch (err) {
+      rethrowInspectTapeError(err);
+    } finally {
+      release();
+    }
+    matched += 1;
+  }
+  if (matched === groups.length) return "idempotent";
+  if (matched > 0) throw lateDelegateRootConflict();
+  return "proceed";
+}
+
 export async function _prepareLosslessTurnTapeOutsideLocks(
   pool: Pool,
   userId: string,
@@ -3557,20 +3875,30 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
+  // Envelope/payload identity must run before any late-delegate idempotent ACK.
+  assertLosslessEnvelopeMatchesPayload(request, turn.payload);
+  if (
+    turn.payload.continuationOfTurnKey &&
+    Array.isArray(turn.payload.agentGroups) &&
+    turn.payload.agentGroups.length > 0
+  ) {
+    const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
+      pool,
+      userId,
+      request,
+      turn.payload,
+    );
+    if (lateDelegateRoot === "retry") return null;
+    if (lateDelegateRoot === "idempotent") {
+      throw Object.assign(new Error("late-delegate continuation already on root"), {
+        lateDelegateRootIdempotent: true,
+      });
+    }
+  }
   // Record payload BYTEA + content_sha256 stay the part-derived original.
   // visible_payload is also BYTEA and stays exact (timeline must round-trip
   // JSON \u0000). PostgreSQL jsonb rejects \u0000 / unpaired surrogates;
   // only jsonb binds and sidecar TEXT may be rewritten.
-  if (
-    turn.payload.sessionId !== request.sessionId ||
-    turn.payload.agentId !== request.agentId ||
-    turn.payload.turnIndex !== request.turnIndex ||
-    turn.payload.status !== request.status ||
-    turn.payload.turnKey !== request.turnKey ||
-    turn.payload.waiveReason !== request.waiveReason
-  ) {
-    throw new Error("lossless turn tape envelope/payload identity mismatch");
-  }
   const visible: UserVisiblePhysicalPayload[] = [];
   for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
     await yieldLosslessTapeWork();
@@ -4235,6 +4563,7 @@ async function readDirectTapeHeaders(
       status: string;
       turn_key: string;
       client_message_id: string | null;
+      continuation_of_turn_key: string | null;
       materialization_status: string | null;
       finalized_at: string | null;
       visible_at: string | null;
@@ -4242,6 +4571,7 @@ async function readDirectTapeHeaders(
     }>(
       `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status, t.turn_key,
               COALESCE(t.client_message_id, d.client_message_id) AS client_message_id,
+              t.continuation_of_turn_key,
               t.record_payload_bytes::text AS payload_bytes,
               t.physical_record_count::text AS physical_count,
               t.logical_record_count::text AS logical_count,
@@ -4324,6 +4654,7 @@ async function readDirectTapeHeaders(
         status: row.status,
         turnKey: row.turn_key,
         clientMessageId: row.client_message_id,
+        continuationOfTurnKey: row.continuation_of_turn_key,
         materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
         finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
         visibleAt: (row as { visible_at?: string | null }).visible_at ?? null,
@@ -4777,6 +5108,7 @@ async function hydrateTurnTapeMessages(
                 : {}),
             },
             bigIntNum(head.payload_bytes, "turn tape timeline payload bytes"),
+            { continuationOfTurnKey: header.continuationOfTurnKey },
           );
           if (typeof anchor._seq === "number") deferred._seq = anchor._seq;
           if (typeof anchor._orderSeq === "number") deferred._orderSeq = anchor._orderSeq;
@@ -5873,12 +6205,25 @@ function stampTapeLifecycle(
   }) as MessageLike;
 }
 
+function agentGroupRunIdFromRecordId(msgId: string): string | undefined {
+  const marker = "-agentgroup-";
+  const index = msgId.indexOf(marker);
+  if (index < 0) return undefined;
+  const runId = msgId.slice(index + marker.length);
+  return runId.length > 0 ? runId : undefined;
+}
+
 function deferredTapeRecord(
   tapeId: string,
   tapeSha256: string,
   head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256?: string },
   payloadBytes: number,
+  extras?: { continuationOfTurnKey?: string | null },
 ): MessageLike {
+  const continuationOfTurnKey = extras?.continuationOfTurnKey;
+  const delegateRunId = head.role === "agent-group"
+    ? agentGroupRunIdFromRecordId(head.msg_id)
+    : undefined;
   return stampTapeLifecycle({
     id: head.msg_id,
     role: head.role,
@@ -5894,6 +6239,13 @@ function deferredTapeRecord(
     _payloadDeferred: true,
     _payloadBytes: payloadBytes,
     ...(head.content_sha256 ? { _payloadSha256: head.content_sha256 } : {}),
+    // OCV5-180 B1 — verified owner + logical run on the light locator so
+    // persist reconcile can place a >1MiB card before Range body hydration.
+    // Tape id/sha/ordinal stay the continuation's own Range/hash identity.
+    ...(typeof continuationOfTurnKey === "string" && continuationOfTurnKey.length > 0
+      ? { _continuationOfTurnKey: continuationOfTurnKey }
+      : {}),
+    ...(delegateRunId ? { _delegateRunId: delegateRunId } : {}),
   }, "exact_deferred", { ordinal: head.ordinal, exactBit: 0 });
 }
 
@@ -5909,7 +6261,7 @@ type DirectTapePageHead = {
 
 /** Hydrate a selected physical page without changing its paging direction.
  * The returned logical rows are always in ascending immutable ordinal order. */
-async function hydrateDirectTapePage(
+export async function hydrateDirectTapePage(
   pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
@@ -5917,6 +6269,7 @@ async function hydrateDirectTapePage(
   tapeSha256: string,
   billingAnchorId: string,
   heads: DirectTapePageHead[],
+  extras?: { continuationOfTurnKey?: string | null },
 ): Promise<MessageLike[]> {
   const deferred = heads.filter((head) =>
     bigIntNum(head.payload_bytes, "turn tape record payload bytes") > TAPE_RECORD_INLINE_QUANTUM_BYTES);
@@ -5927,6 +6280,7 @@ async function hydrateDirectTapePage(
     tapeSha256,
     { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
     bigIntNum(head.payload_bytes, "turn tape record payload bytes"),
+    { continuationOfTurnKey: extras?.continuationOfTurnKey },
   ));
 
   if (planned.length > 0) {
@@ -6007,6 +6361,8 @@ type UnifiedTimelineTapeHeader = {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  /** Verified continuation owner turn key (null for root tapes). */
+  continuationOfTurnKey: string | null;
   materializationStatus: string | null;
   finalizedAt: string | null;
   visibleHead: VisibleHead | null;
@@ -6182,9 +6538,11 @@ async function readUnifiedTimelineTapeHeaders(
       status: string;
       turn_key: string;
       client_message_id: string | null;
+      continuation_of_turn_key: string | null;
     }>(
       `SELECT t.tape_id,t.tape_sha256,t.billing_anchor_id,t.status,t.turn_key,
               COALESCE(t.client_message_id,d.client_message_id) AS client_message_id,
+              t.continuation_of_turn_key,
               t.materialization_status, t.finalized_at::text, t.visible_head
          FROM client_session_turn_tapes t
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
@@ -6201,6 +6559,7 @@ async function readUnifiedTimelineTapeHeaders(
     status: row.status,
     turnKey: row.turn_key,
     clientMessageId: row.client_message_id,
+    continuationOfTurnKey: row.continuation_of_turn_key,
     materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
     finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
     visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
@@ -6451,6 +6810,7 @@ async function readUnifiedTimelineBashTailAuxiliaries(
       window.header.tapeSha256,
       { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
       bigIntNum(head.payload_bytes, "turn tape timeline bash-tail payload bytes"),
+      { continuationOfTurnKey: window.header.continuationOfTurnKey },
     ),
     head,
     window,
@@ -6488,6 +6848,7 @@ async function readUnifiedTimelineBashTailAuxiliaries(
         window.header.tapeSha256,
         window.header.billingAnchorId,
         selectedHeads,
+        { continuationOfTurnKey: window.header.continuationOfTurnKey },
       ).catch((error: unknown) => {
         warnTapeDisplayDegrade({
           sessionId,
@@ -6772,6 +7133,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         header.tapeSha256,
         { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
         payloadBytes,
+        { continuationOfTurnKey: header.continuationOfTurnKey },
       );
       deferred = mergeBillingAnchorUsage(deferred, anchor, isBillingAnchor);
       deferred = mergeExactUsage(deferred, enrichment, isBillingAnchor);
@@ -7381,7 +7743,7 @@ async function readClientTimelinePageImpl(
  * rendered billing anchor is the only excluded row; every other role is
  * returned, with known platform-private fields removed but no semantic
  * allowlist. Oversized records use a deferred exact byte locator. */
-async function listTurnTapeRecordsImpl(
+export async function listTurnTapeRecordsImpl(
   pool: Pool,
   sessionId: string,
   userId: string,
@@ -7400,8 +7762,9 @@ async function listTurnTapeRecordsImpl(
       billing_anchor_id: string;
       physical_record_count: string;
       logical_record_count: string;
+      continuation_of_turn_key: string | null;
     }>(
-      `SELECT t.tape_sha256, t.billing_anchor_id,
+      `SELECT t.tape_sha256, t.billing_anchor_id, t.continuation_of_turn_key,
               CASE WHEN t.physical_record_count=0 THEN
                 (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
                   WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id)
@@ -7471,6 +7834,7 @@ async function listTurnTapeRecordsImpl(
       header.tape_sha256,
       header.billing_anchor_id,
       selected,
+      { continuationOfTurnKey: header.continuation_of_turn_key },
     );
     return {
       records,
@@ -7536,6 +7900,7 @@ async function listTurnTapeRecordsImpl(
       header.tape_sha256,
       header.billing_anchor_id,
       selected,
+      { continuationOfTurnKey: header.continuation_of_turn_key },
     ));
 
     if (nextCursor !== null) break;
@@ -8311,6 +8676,65 @@ async function readOpenDispatchForSession(
       ...(row.model ? { model: row.model } : {}),
     },
   };
+}
+
+/** Durable permission/ask-user snapshot for session GET
+ *  (INC-20260907-PERMISSION-ROOTFIX). Device B reconciles prompts device A
+ *  already answered and re-materialises lost permission_request frames.
+ *  A read failure must never 500 the whole session GET. */
+async function readPermissionPromptsForSession(
+  queryable: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  lookupIds?: string[],
+): Promise<{ permissionPrompts?: ClientSession["permissionPrompts"] }> {
+  const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+  if (!uidMatch) return {};
+  try {
+    const userIdBig = BigInt(uidMatch[1]);
+    const snapshot = await readPermissionPromptSnapshot(queryable, {
+      userId: userIdBig,
+      sessionId,
+    });
+    const lookups = lookupIds && lookupIds.length > 0
+      ? await readPermissionPromptsByRequestIds(queryable, {
+          userId: userIdBig,
+          sessionId,
+          requestIds: lookupIds,
+        })
+      : [];
+    if (snapshot.items.length === 0 && lookups.length === 0) {
+      return {
+        permissionPrompts: {
+          items: [],
+          completeness: snapshot.completeness,
+          source: snapshot.source,
+        },
+      };
+    }
+    return {
+      permissionPrompts: {
+        items: snapshot.items.map(serializePermissionPromptEntry),
+        completeness: snapshot.completeness,
+        source: snapshot.source,
+        ...(lookups.length > 0
+          ? { lookups: lookups.map(serializePermissionPromptEntry) }
+          : {}),
+      },
+    };
+  } catch (error) {
+    console.warn(
+      "pgSessionsBackend: readPermissionPromptsForSession failed; omitting permissionPrompts",
+      { sessionId, userId, error: error instanceof Error ? error.message : String(error) },
+    );
+    return {
+      permissionPrompts: {
+        items: [],
+        completeness: "unavailable",
+        source: "pg",
+      },
+    };
+  }
 }
 
 export function createPgSessionsBackend(
@@ -9102,6 +9526,17 @@ export function createPgSessionsBackend(
         userId,
         request,
       );
+      if (readyForPreparation && isLateDelegateContinuationAgentId(request.agentId)) {
+        const lateDelegateRoot = await inspectLateDelegateContinuationAgainstRoot(
+          pool,
+          userId,
+          request,
+        );
+        if (lateDelegateRoot === "retry") return { applied: "incomplete" };
+        if (lateDelegateRoot === "idempotent") {
+          return { applied: "idempotent", recordCount: 0, engineBillings: [] };
+        }
+      }
       let phaseA: LosslessTurnTapeFinalizeResult | null = null;
       if (readyForPreparation) {
         // HTTP action:finalize (materialize:false) is the job's creation point.
@@ -9151,6 +9586,9 @@ export function createPgSessionsBackend(
         } catch (err) {
           releaseFinalizeAdmission?.();
           releaseFinalizeAdmission = null;
+          if (err && typeof err === "object" && (err as { lateDelegateRootIdempotent?: unknown }).lateDelegateRootIdempotent === true) {
+            return { applied: "idempotent", recordCount: 0, engineBillings: [] };
+          }
           if (phaseA && phaseA.applied === "finalized" && isTransientTapeError(err)) {
             return { ...phaseA, settlementHandoff: true };
           }
@@ -11146,6 +11584,12 @@ export function createPgSessionsBackend(
           archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
           archivedThroughSeq: archivedThroughOrderSeq,
           ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
+          ...(await readPermissionPromptsForSession(
+            queryable,
+            row.id,
+            row.user_id,
+            options.permissionLookupIds,
+          )),
         };
       };
       return options.view === "timeline"
@@ -11258,6 +11702,12 @@ export function createPgSessionsBackend(
             isPartial: false,
             archivedCount,
             archivedThroughSeq,
+            ...(await readPermissionPromptsForSession(
+              queryable,
+              row.id,
+              row.user_id,
+              options.permissionLookupIds,
+            )),
           };
         }
 
@@ -11307,6 +11757,12 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
+        ...(await readPermissionPromptsForSession(
+          queryable,
+          row.id,
+          row.user_id,
+          options.permissionLookupIds,
+        )),
         };
       };
       return options.view === "timeline"

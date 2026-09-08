@@ -10,6 +10,7 @@ import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat
 import type { InboundMessage, MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
 import type { AuthSession, DurableLiveFrame, DurableLiveFramePage } from "../lib/types";
+import { setPermissionFullInputFetcher } from "../lib/chat/permissionPopupCoordinator";
 
 /** 流式期防 IDB 写抖：尾沿 debounce 后落盘一次（isFinal/resume_failed 走立即写，不等它）。*/
 const PERSIST_DEBOUNCE_MS = 900;
@@ -146,6 +147,7 @@ export type UseChatSocket = {
       clientMessageId: string;
       status: string;
     };
+    permissionPrompts?: import("../lib/types").PermissionPromptSnapshotPayload;
   }) => void;
   /** Replay an immutable page from the master-side live-frame journal. */
   applyDurableLiveFrames: (
@@ -308,6 +310,9 @@ export function useChatSocket(opts: {
   onMediaJobRef.current = opts.onMediaJob;
   const queueModelPatchRef = useRef(opts.queueModelPatch);
   queueModelPatchRef.current = opts.queueModelPatch;
+  const permissionLookupAtRef = useRef(new Map<string, number>());
+  const permissionLookupFailRef = useRef(new Map<string, number>());
+  const permissionLookupInflightRef = useRef(new Map<string, Promise<void>>());
 
   // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
   const storeRef = useRef<SessionStore | null>(null);
@@ -329,6 +334,39 @@ export function useChatSocket(opts: {
         return api.refresh(session, expectedEpoch, "ws_auth");
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
+      lookupPermissionPrompts: (sessId, requestIds) => {
+        const now = Date.now();
+        const last = permissionLookupAtRef.current.get(sessId) ?? 0;
+        const fails = permissionLookupFailRef.current.get(sessId) ?? 0;
+        const minMs = Math.min(60_000, 8_000 * 2 ** Math.min(fails, 3));
+        if (permissionLookupInflightRef.current.has(sessId)) return;
+        if (now - last < minMs) return;
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+        if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+        permissionLookupAtRef.current.set(sessId, now);
+        const a = authRef.current;
+        const sock = socketRef.current;
+        if (!a || !sock || requestIds.length === 0) return;
+        const pending = api.getSession(a, sessId, 0, undefined, requestIds).then((detail) => {
+          const snap = detail.permissionPrompts;
+          if (!snap || snap.completeness === "unavailable") {
+            permissionLookupFailRef.current.set(sessId, fails + 1);
+            return;
+          }
+          sock.applyPermissionPromptSnapshot(sessId, snap);
+          const returned = new Set<string>();
+          for (const item of [...(snap.items ?? []), ...(snap.lookups ?? [])]) {
+            if (item.requestId) returned.add(item.requestId);
+          }
+          const missed = requestIds.some((id) => !returned.has(id));
+          permissionLookupFailRef.current.set(sessId, missed ? fails + 1 : 0);
+        }).catch(() => {
+          permissionLookupFailRef.current.set(sessId, fails + 1);
+        }).finally(() => {
+          permissionLookupInflightRef.current.delete(sessId);
+        });
+        permissionLookupInflightRef.current.set(sessId, pending);
+      },
       refreshBalance: () => refreshBalanceRef.current?.(),
       refreshInbox: () => refreshInboxRef.current?.(),
       reportClientError: (p) => {
@@ -406,8 +444,11 @@ export function useChatSocket(opts: {
                 timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: detail._historyRevisionUnsupported === true,
                 openDispatch: detail.openDispatch,
+                permissionPrompts: detail.permissionPrompts,
               },
             );
+          } else if (detail.permissionPrompts) {
+            socket.applyPermissionPromptSnapshot(sessId, detail.permissionPrompts);
           }
           if (context?.tapeProjectionOnly === true) {
             if (!isCurrent()) return false;
@@ -442,6 +483,7 @@ export function useChatSocket(opts: {
                   timelineHasMore: tapeDetail.timelineHasMore,
                   timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                  permissionPrompts: tapeDetail.permissionPrompts,
                 },
               );
             },
@@ -620,12 +662,25 @@ export function useChatSocket(opts: {
     };
     window.addEventListener("pagehide", onHide);
     document.addEventListener("visibilitychange", onVis);
+    setPermissionFullInputFetcher(async (requestId) => {
+      const a = authRef.current;
+      const sock = socketRef.current;
+      const sessId = sock?.getActiveSessionId();
+      if (!a || !sock || !sessId || !requestId) return null;
+      const detail = await api.getSession(a, sessId, 0, undefined, [requestId]);
+      const snap = detail.permissionPrompts;
+      const hit = [...(snap?.lookups ?? []), ...(snap?.items ?? [])]
+        .find((item) => item.requestId === requestId);
+      if (!hit || hit.inputTruncated) return null;
+      return hit.inputJson ?? null;
+    });
 
     return () => {
       cancelled = true;
       clearTimeout(hydrationTimer);
       window.removeEventListener("pagehide", onHide);
       document.removeEventListener("visibilitychange", onVis);
+      setPermissionFullInputFetcher(null);
       // teardown 仅发生在登出/换号（enabled/userId 变）：先 final flush（wipe 后 dead→no-op），
       // 再清内存会话（隐私收尾，防换号后旧会话残留单例），最后关 store。
       flushAll();
@@ -740,6 +795,7 @@ export function useChatSocket(opts: {
         timelineSnapshotMaxSeq: p.timelineSnapshotMaxSeq,
         invalidateHistoryCache: p.invalidateHistoryCache,
         openDispatch: p.openDispatch,
+        permissionPrompts: p.permissionPrompts,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },

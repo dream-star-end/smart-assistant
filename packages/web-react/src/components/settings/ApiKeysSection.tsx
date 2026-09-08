@@ -65,8 +65,62 @@ export function isCompleteApiKey(value: string): boolean {
 }
 
 /**
+ * CC Switch「用量查询」脚本(它的 JS-script 路径:`({ request, extractor })`,QuickJS 内跑,
+ * `{{baseUrl}}` / `{{apiKey}}` 由 CC Switch 用该供应商的 ANTHROPIC_BASE_URL / AUTH_TOKEN 替换)。
+ * 打本站 `GET /v1/usage`,把积分余额与单 key 消耗映射到它 footer 的 remaining / used / total。
+ * 深链里以 base64 携带(`usageScript` 参数),手动配置时也可整段贴进它的「自定义」模板。
+ */
+export function buildCcSwitchUsageScript(): string {
+  return [
+    "({",
+    "  request: {",
+    '    url: "{{baseUrl}}/v1/usage",',
+    '    method: "GET",',
+    "    headers: {",
+    '      "Authorization": "Bearer {{apiKey}}",',
+    '      "User-Agent": "cc-switch/usage"',
+    "    }",
+    "  },",
+    "  extractor: function (response) {",
+    "    if (!response || response.object !== \"usage\") {",
+    '      return { isValid: false, invalidMessage: (response && response.error && response.error.message) || "查询失败" };',
+    "    }",
+    "    var key = response.key || {};",
+    "    var spendable = Number(response.balance && response.balance.spendable) || 0;",
+    "    var spent = Number(key.spent_credits) || 0;",
+    "    var limit = key.credit_limit === null || key.credit_limit === undefined ? null : Number(key.credit_limit);",
+    "    var remaining = limit === null ? spendable : Math.min(spendable, Math.max(limit - spent, 0));",
+    "    return {",
+    "      isValid: key.is_valid !== false,",
+    '      invalidMessage: key.is_valid === false ? "余额不足或已达该密钥上限" : undefined,',
+    '      planName: key.label || "API Key",',
+    "      remaining: remaining,",
+    "      used: spent,",
+    "      total: limit === null ? -1 : limit,",
+    '      unit: "积分",',
+    '      extra: "近 30 天 " + (Number(response.window && response.window.requests) || 0) + " 次请求"',
+    "    };",
+    "  }",
+    "})",
+  ].join("\n");
+}
+
+/** UTF-8 安全的 base64(CC Switch 接收端 `decode_base64_param` 同时接受标准/URL-safe、带/不带 padding)。 */
+function base64Utf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+/**
  * CC Switch 深链(`ccswitch://v1/import`,V1 协议)。必须包含完整 apiKey,否则接收端确认导入时拒绝。
  * 明文只来自本次创建或用户粘贴,绝不从 keyPrefix/掩码构造。
+ *
+ * `enabled=true`:导入后立即切换为 Claude Code 当前供应商(CC Switch `ProviderService::switch`)。
+ * 不带它,CC Switch 只是把供应商加进列表,`~/.claude/settings.json` 仍指向之前激活的那一个 ——
+ * 用户撤销旧 key 再一键导入新 key,本地 Claude Code 仍在用旧 key,表现就是 401。
+ * `usageEnabled=true` + `usageScript`:一并带上用量查询脚本并开启(CC Switch 确认框会展示脚本正文)。
  */
 export function buildCcSwitchDeepLink(input: {
   origin: string;
@@ -88,6 +142,10 @@ export function buildCcSwitchDeepLink(input: {
     opusModel: input.opusModel,
     sonnetModel: input.sonnetModel,
     haikuModel: input.haikuModel,
+    enabled: "true",
+    usageEnabled: "true",
+    usageScript: base64Utf8(buildCcSwitchUsageScript()),
+    usageAutoInterval: "30",
   });
   params.set("apiKey", apiKey);
   return `ccswitch://v1/import?${params.toString()}`;
@@ -119,7 +177,7 @@ export function ApiKeysSection({
   const [endpointCopied, setEndpointCopied] = useState(false);
   const keyInputId = useId();
   const keyHintId = useId();
-  const [copiedBlock, setCopiedBlock] = useState<"env" | "ccswitch" | null>(null);
+  const [copiedBlock, setCopiedBlock] = useState<"env" | "ccswitch" | "usage" | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
   /** 正在被 PATCH 的 key id(禁用按钮防双击)。 */
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -157,6 +215,8 @@ export function ApiKeysSection({
   const origin = typeof window === "undefined" ? "" : window.location.origin;
   const endpoint = `${origin}${API_ACCESS_BASE_PATH}`;
   const modelsUrl = `${endpoint}/v1/models`;
+  const usageUrl = `${endpoint}/v1/usage`;
+  const usageScript = useMemo(() => buildCcSwitchUsageScript(), []);
   const mainModel = pickDefaultModel(externalModels, DEFAULT_MAIN_MODEL, /^(fable|opus)-/);
   const sonnetModel = pickDefaultModel(externalModels, DEFAULT_SONNET_MODEL, /^sonnet-/);
   const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /-flash-|-low$/);
@@ -203,7 +263,10 @@ export function ApiKeysSection({
     () =>
       buildCcSwitchDeepLink({
         origin,
-        name: BRAND.name,
+        // 必须是 ASCII:CC Switch 用 name 派生供应商 id(`is_alphanumeric` 保留汉字),再把
+        // `%TEMP%\claude_<id>_<pid>.json` 写进 UTF-8 无 BOM 的 .bat 交给 cmd.exe ——含中文时
+        // cmd 会把后续行错位切分(「'g' / '--settings' 不是内部或外部命令」),「打开终端」直接失败。
+        name: BRAND.nameEn,
         apiKey: keyReady ? candidateKey : null,
         model: mainModel,
         opusModel: mainModel,
@@ -327,9 +390,11 @@ export function ApiKeysSection({
     }
   }
 
-  async function copyBlock(kind: "env" | "ccswitch") {
+  async function copyBlock(kind: "env" | "ccswitch" | "usage") {
     try {
-      await navigator.clipboard.writeText(kind === "env" ? claudeCodeSnippet : ccSwitchConfig);
+      await navigator.clipboard.writeText(
+        kind === "env" ? claudeCodeSnippet : kind === "ccswitch" ? ccSwitchConfig : usageScript,
+      );
       setCopiedBlock(kind);
     } catch {
       setCopiedBlock(null);
@@ -480,7 +545,14 @@ export function ApiKeysSection({
           </p>
         </div>
         <div className="mt-4 border-t border-accent/15 pt-3 text-caption text-muted">
-          <p>导入会将密钥交给本机 CC Switch,请勿分享导入链接。</p>
+          <p>
+            导入会将密钥交给本机 CC Switch,并直接切换为 Claude Code 当前供应商、开启用量查询,请勿分享导入链接。
+          </p>
+          <p className="mt-1">
+            导入后请<b>重新打开终端</b>再运行 <code className="font-mono">claude</code>
+            ;若之前手动设置过 <code className="font-mono">ANTHROPIC_API_KEY</code> /{" "}
+            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code> 环境变量,请先清掉,避免旧密钥与新密钥同时发送。
+          </p>
           <p className="mt-1">
             还未安装?{" "}
             <a
@@ -569,7 +641,8 @@ export function ApiKeysSection({
             预设选「<b>自定义</b>」。
           </li>
           <li>
-            名称任填(如 <code className="font-mono">{BRAND.name}</code>);端点地址填{" "}
+            名称请用<b>英文</b>(如 <code className="font-mono">{BRAND.nameEn}</code>
+            ,中文名会让 Windows 上的「打开终端」失败);端点地址填{" "}
             <code className="select-all font-mono">{endpoint}</code>;API Key 填{" "}
             <code className="font-mono">oc-cc.…</code> 密钥。
           </li>
@@ -579,7 +652,8 @@ export function ApiKeysSection({
             或直接把下面这段 JSON 贴进它的配置编辑器。
           </li>
           <li>
-            点「添加」并启用该供应商,重新打开终端运行 <code className="font-mono">claude</code>。
+            点「添加」并<b>启用</b>该供应商(卡片处于选中态),重新打开终端运行{" "}
+            <code className="font-mono">claude</code>。
           </li>
         </ol>
         <p className="mt-2 text-caption text-muted">
@@ -605,6 +679,75 @@ export function ApiKeysSection({
             <Copy size={13} /> {copiedBlock === "ccswitch" ? "已复制" : "复制"}
           </Button>
         </div>
+      </details>
+
+      <details
+        className="mt-2 rounded-xl border border-border p-3 text-caption"
+        data-testid="guide-usage"
+      >
+        <summary className="cursor-pointer font-medium text-muted">
+          在 CC Switch 里查看余额与用量
+        </summary>
+        <p className="mt-2 text-faint">
+          一键导入已自动开启。手动添加的供应商:卡片菜单 →「<b>用量查询</b>」→ 模板选「<b>自定义</b>
+          」→ 把下面脚本整段贴进去 → 开启并「测试」。脚本用该供应商已填的端点与密钥请求{" "}
+          <code className="select-all font-mono">GET {usageUrl}</code>
+          ,显示当前可用积分、该密钥累计消耗与上限(无上限时显示 ∞)。
+        </p>
+        <div className="mt-2 flex items-start gap-2">
+          <pre
+            className="min-w-0 flex-1 overflow-x-auto rounded-md bg-bg px-2 py-1.5 font-mono text-caption text-fg"
+            data-testid="usage-script"
+          >
+            {usageScript}
+          </pre>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => copyBlock("usage")}
+            className="shrink-0"
+          >
+            <Copy size={13} /> {copiedBlock === "usage" ? "已复制" : "复制"}
+          </Button>
+        </div>
+      </details>
+
+      <details
+        className="mt-2 rounded-xl border border-border p-3 text-caption"
+        data-testid="guide-troubleshoot"
+      >
+        <summary className="cursor-pointer font-medium text-muted">
+          Claude Code 报 401 / Auth conflict 怎么办
+        </summary>
+        <ul className="mt-2 list-disc space-y-1 pl-5 text-faint">
+          <li>
+            <b>401 container identity verification failed</b>:密钥已撤销、已停用,或本机 Claude Code
+            用的不是这把密钥。到 CC Switch 确认<b>当前选中</b>的供应商就是本站、密钥是密钥管理里仍有效的那一把;
+            撤销旧密钥后必须重新导入或改填新密钥。
+          </li>
+          <li>
+            <b>Auth conflict: Both a token and an API key are set</b>:系统环境变量里残留了{" "}
+            <code className="font-mono">ANTHROPIC_API_KEY</code>(或{" "}
+            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code>)。Claude Code 会把两把凭据一起发送,
+            请在系统环境变量 / shell 配置里删掉,只保留 CC Switch 写入的{" "}
+            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code>,然后重开终端。
+          </li>
+          <li>
+            公司代理:本站端点是普通 HTTPS,与浏览器同路;若浏览器能打开本站但 Claude Code 报连接错误,
+            为终端设置 <code className="font-mono">HTTPS_PROXY</code>。401 与代理无关。
+          </li>
+          <li>
+            CC Switch 的「检测连通」只探测地址可达,不校验密钥;真正的验证以运行{" "}
+            <code className="font-mono">claude</code> 后能回话、或「用量查询」能显示余额为准。
+          </li>
+          <li>
+            <b>「打开终端」报 'g' / '--settings' 不是内部或外部命令</b>(Windows):CC Switch
+            按供应商名生成临时配置路径并写进 .bat,名称含中文时 cmd.exe 会把命令行切错。把该供应商<b>重命名为英文</b>
+            (或删掉后重新一键导入,新链接已改用英文名)即可;
+            也可以不用它的「打开终端」,直接在自己的终端里运行 <code className="font-mono">claude</code>
+            (CC Switch 已把配置写进 <code className="font-mono">~/.claude/settings.json</code>)。
+          </li>
+        </ul>
       </details>
 
       <details

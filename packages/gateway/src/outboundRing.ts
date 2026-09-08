@@ -386,7 +386,9 @@ export class OutboundRingBuffer {
   /** Drop the ring (but keep lastSeq) for a session — used on session destroy. */
   clear(sessionKey: string): void {
     this.rings.delete(sessionKey)
-    this.lastSeq.delete(sessionKey)
+    // Retiring/resetting an engine does not change its wire sessionKey. A
+    // connected browser (and the immutable journal) still knows the old seq;
+    // restarting at one would make new output look like duplicate old frames.
     this.activeTurns.delete(sessionKey)
     this.fencedTurns.delete(sessionKey)
   }

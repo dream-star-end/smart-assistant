@@ -111,20 +111,36 @@ function parseApiKeyToken(raw: string | undefined): {
   return { keyPrefix: m[1]!, secretHex: m[2]! };
 }
 
+/** 只看"像不像本站 key"的宽松形态判断,用于两个凭据头之间的择优,不替代严格 parse。 */
+const OC_CC_SHAPE_RE = /^(?:Bearer\s+)?oc-cc\./i;
+
 /**
  * 从入站请求取 API key 凭据串。两个头都接受(2026-09-07):
  *   - `Authorization: Bearer oc-cc.…` — Claude Code 的 `ANTHROPIC_AUTH_TOKEN` 形态;
  *   - `x-api-key: oc-cc.…`           — Anthropic SDK / Claude Code 的 `ANTHROPIC_API_KEY`
  *     形态,也是 CC Switch「自定义供应商」文档示例的默认写法,以及它「获取模型」
  *     对 anthropic 格式供应商发 `/v1/models` 时用的头。
- * Authorization 优先;两头都没有 → 交给 parseApiKeyToken 抛 MISSING_API_KEY。
+ *
+ * 两头同时存在时(2026-09-08):Claude Code 在 `ANTHROPIC_AUTH_TOKEN` 与
+ * `ANTHROPIC_API_KEY` 同时设置时会**两头都发**(SDK 用 apiKey 填 x-api-key,
+ * `configureApiKeyHeaders` 再把 AUTH_TOKEN 塞进 Authorization),用户机器上残留的
+ * 别家 `sk-ant-*` / 本站旧 key 会与新 key 同车抵达。固定"Authorization 优先"会让
+ * 一半这类场景莫名 401。规则:**哪一头形似本站 key(`oc-cc.` 前缀)就用哪一头**,
+ * 都像 / 都不像时仍 Authorization 优先(anti-enum:后续 parse/hash 失败统一 401)。
+ * 两头都没有 → 交给 parseApiKeyToken 抛 MISSING_API_KEY。
  */
 export function apiKeyCredentialFromHeaders(req: IncomingMessage): string | undefined {
-  const auth = req.headers.authorization;
-  if (typeof auth === "string" && auth.trim().length > 0) return auth;
-  const xApiKey = req.headers["x-api-key"];
-  if (typeof xApiKey === "string" && xApiKey.trim().length > 0) return xApiKey;
-  return undefined;
+  const authRaw = req.headers.authorization;
+  const xRaw = req.headers["x-api-key"];
+  const auth = typeof authRaw === "string" && authRaw.trim().length > 0 ? authRaw : undefined;
+  const xApiKey = typeof xRaw === "string" && xRaw.trim().length > 0 ? xRaw : undefined;
+  if (auth !== undefined && xApiKey !== undefined) {
+    const authLooksOurs = OC_CC_SHAPE_RE.test(auth.trim());
+    const xLooksOurs = OC_CC_SHAPE_RE.test(xApiKey.trim());
+    if (xLooksOurs && !authLooksOurs) return xApiKey;
+    return auth;
+  }
+  return auth ?? xApiKey;
 }
 
 export interface ResolveApiKeyIdentityOptions {

@@ -1,3 +1,6 @@
+import { installDelegateSandbox } from './helpers/delegateSandbox.js'
+const sandbox = installDelegateSandbox()
+
 /**
  * OCV5-22 stage 3: BeginCutover freeze, recycle drain runningDelegateJobs,
  * restart ClaimPaused / unrecoverable killed_by_cutover + Notifier.

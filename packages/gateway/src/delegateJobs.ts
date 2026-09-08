@@ -248,7 +248,7 @@ export type DelegateJobStoreOptions = {
   ttlMs?: number
   maxJobs?: number
   now?: () => number
-  sleep?: (ms: number) => Promise<void>
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
   /** Phase 0 SM: queued view, failure_class, owner lease CAS. Default false. */
   sm?: boolean
   bootId?: string
@@ -317,9 +317,21 @@ function initTerminalCallback(draft: {
   }
 }
 
-const defaultSleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    setTimeout(resolve, ms)
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason)
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
   })
 
 export class DelegateJobStore {
@@ -328,7 +340,7 @@ export class DelegateJobStore {
   private readonly ttlMs: number
   private readonly maxJobs: number
   private readonly now: () => number
-  private readonly sleep: (ms: number) => Promise<void>
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>
   private readonly sm: boolean
   private readonly bootId: string
   private readonly leaseMs: number
@@ -921,23 +933,51 @@ export class DelegateJobStore {
     }
     if (job.result) return this.viewOf(job)
     const capped = resolveDelegateWaitMs(waitMs)
-    return new Promise<DelegateJobWaitView>((resolve) => {
+    return new Promise<DelegateJobWaitView>((resolve, reject) => {
       let settled = false
-      const finish = (view: DelegateJobWaitView) => {
-        if (settled) return
+      const ac = new AbortController()
+      const occupy = (): boolean => {
+        if (settled) return false
         settled = true
         const idx = job.waiters.indexOf(finish)
         if (idx >= 0) job.waiters.splice(idx, 1)
+        ac.abort()
+        return true
+      }
+      const finish = (view: DelegateJobWaitView) => {
+        if (!occupy()) return
         resolve(view)
+      }
+      const fail = (err: unknown) => {
+        if (!occupy()) return
+        reject(err)
       }
       job.waiters.push(finish)
       if (job.result) {
         finish(this.viewOf(job))
         return
       }
-      void this.sleep(capped).then(() => {
-        finish(this.get(jobId))
-      })
+      let sleepPromise: Promise<void>
+      try {
+        sleepPromise = this.sleep(capped, ac.signal)
+      } catch (err) {
+        fail(err)
+        return
+      }
+      void sleepPromise.then(
+        () => {
+          if (settled) return
+          try {
+            finish(this.get(jobId))
+          } catch (err) {
+            fail(err)
+          }
+        },
+        (err) => {
+          if (settled) return
+          fail(err)
+        },
+      )
     })
   }
 

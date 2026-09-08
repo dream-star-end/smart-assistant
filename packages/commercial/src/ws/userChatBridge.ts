@@ -98,7 +98,7 @@ import {
   serializeVerificationSponsorshipSnapshot,
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
-import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
+import { settleDurableCursorBilling } from "../billing/durableCursorBilling.js";
 import {
   publishZcodeCatalogSettle,
   settleZcodeCatalogUsage,
@@ -158,6 +158,7 @@ import {
   type MessageReplyQuote,
   type DispatchRequestContent,
   type SessionWorkspaceMode,
+  type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
@@ -179,12 +180,14 @@ import {
 import {
   admitDurableControl,
   claimDueTurnControls,
+  HELLO_PENDING_PERMISSION_MAX_SESSIONS,
   markTurnControlReceipt,
   pendingPermissionPromptToFrame,
   persistPermissionAuthority,
-  readPendingPermissionPrompts,
+  readPendingPermissionPromptsForSessions,
   releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
+  selectHelloPermissionSessions,
   settlePermissionPromptFromRuntime,
   TurnControlConflictError,
 } from "../dispatch/turnControlStore.js";
@@ -1910,11 +1913,19 @@ function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
   return { peerId, clientMessageId };
 }
 
+const SESSION_DELETED_WIRE_MESSAGE =
+  "This conversation was deleted. Start a new one; retrying here will not bring it back.";
+
 function sendErrorFrame(
   ws: WebSocket,
   code: string,
   message: string,
-  turn?: { peerId?: string | null; clientMessageId?: string | null },
+  turn?: {
+    peerId?: string | null;
+    clientMessageId?: string | null;
+    retryable?: boolean;
+    action?: string;
+  },
 ): void {
   if (ws.readyState !== WebSocket.OPEN) return;
   try {
@@ -1924,9 +1935,22 @@ function sendErrorFrame(
       message,
       ...(turn?.peerId ? { peer: { id: turn.peerId, kind: "dm" } } : {}),
       ...(turn?.clientMessageId ? { clientMessageId: turn.clientMessageId } : {}),
+      ...(turn?.retryable === false || turn?.retryable === true ? { retryable: turn.retryable } : {}),
+      ...(turn?.action ? { action: turn.action } : {}),
     }));
   }
   catch { /* client gone */ }
+}
+
+function sendSessionDeletedFrame(
+  ws: WebSocket,
+  turn: { peerId?: string | null; clientMessageId?: string | null },
+): void {
+  sendErrorFrame(ws, "SESSION_DELETED", SESSION_DELETED_WIRE_MESSAGE, {
+    ...turn,
+    retryable: false,
+    action: "new_session",
+  });
 }
 
 /**
@@ -4667,8 +4691,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 { peerId, clientMessageId },
               );
               return null;
-            case "session_not_found":
             case "session_deleted":
+              turnLog?.warn("user-chat-bridge: dispatch admission session deleted", {
+                sessionId: peerId, clientMessageId, kind: admit.kind,
+              });
+              sendSessionDeletedFrame(userWs, { peerId, clientMessageId });
+              return null;
+            case "session_not_found":
             case "append_error":
               turnLog?.warn("user-chat-bridge: dispatch admission unavailable", {
                 sessionId: peerId, clientMessageId, kind: admit.kind,
@@ -4676,7 +4705,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(
                 userWs, "SESSION_PERSIST_UNAVAILABLE",
                 "user message could not be durably admitted; retry safely",
-                { peerId, clientMessageId },
+                { peerId, clientMessageId, retryable: true },
               );
               return null;
             default: {
@@ -4716,18 +4745,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
           if (!persisted) {
-            onReject?.("SESSION_PERSIST_UNAVAILABLE");
+            const deleted = lastReason === "session_deleted";
+            onReject?.(deleted ? "SESSION_DELETED" : "SESSION_PERSIST_UNAVAILABLE");
             turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
               sessionId: peerId,
               clientMessageId,
               reason: lastReason,
             });
-            sendErrorFrame(
-              userWs,
-              "SESSION_PERSIST_UNAVAILABLE",
-              "user message could not be durably admitted; retry safely",
-              { peerId, clientMessageId },
-            );
+            if (deleted) {
+              sendSessionDeletedFrame(userWs, { peerId, clientMessageId });
+            } else {
+              sendErrorFrame(
+                userWs,
+                "SESSION_PERSIST_UNAVAILABLE",
+                "user message could not be durably admitted; retry safely",
+                { peerId, clientMessageId, retryable: true },
+              );
+            }
             return null;
           }
         }
@@ -5333,9 +5367,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const terminalNotifySeen = new Set<string>();
             const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
             const liveCatchupSeen = new Set<string>();
-            // INC-20260903-PENDING-PERMISSION-LOST: durable pending prompts to
-            // re-materialise for this browser (same bound/dedupe as live catch-up).
-            const pendingPermissionSessions: Array<{ peerId: string; sessionKey: string }> = [];
+            // INC-20260907-PERMISSION-ROOTFIX: permission hello scan is independent
+            // of live catch-up's 8-session cap. Collect every visible peer here;
+            // selectHelloPermissionSessions later bounds + prioritises in-flight.
+            const helloPermissionPeers: Array<{ peerId: string; agentId?: string; inFlight?: boolean }> = [];
+            const helloPermissionPeerSeen = new Set<string>();
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
@@ -5390,11 +5426,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const safeId = peer.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
               const sessionKey = `agent:${aid}:webchat:dm:${safeId}`;
               const storeKey = `${uidStr}:${cidStr}:${sessionKey}`;
-              if (
-                liveCatchupSeen.has(peer.peerId) &&
-                !pendingPermissionSessions.some((entry) => entry.peerId === peer.peerId)
-              ) {
-                pendingPermissionSessions.push({ peerId: peer.peerId, sessionKey });
+              if (!helloPermissionPeerSeen.has(peer.peerId)) {
+                helloPermissionPeerSeen.add(peer.peerId);
+                helloPermissionPeers.push({
+                  peerId: peer.peerId,
+                  agentId: aid,
+                  inFlight: peer.inFlight === true,
+                });
               }
               // Hello is the browser's subscription authority. Register every
               // visible peer before forwarding/replay so a second attached tab
@@ -5543,26 +5581,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
               })().catch(() => {});
             }
-            // INC-20260903-PENDING-PERMISSION-LOST:permission_request 只在容器
-            // 发出那一刻投给当时已登记的 socket;bridge/浏览器处于重连窗口时这帧
-            // 就永久丢失,而引擎停在 waitingForUserInput(看门狗被抑制)——
-            // 用户看不到卡片、也点不出来。turn_permission_requests 是落盘在前的
-            // 权威,这里把仍可作答(pending 且未过期)的提示按原帧形状补发给
-            // 本条 hello 的 userWs。不打 frameSeq(前端 reducer 按 requestId 幂等,
-            // 无 seq 的帧不推游标);容器侧 autoResumeFromHello 也会补一份,重复
-            // 到达无害。同样只能是浮动 promise,绝不能挡 hello 转发。
-            if (pendingPermissionSessions.length > 0 && deps.pgPool) {
+            // INC-20260903-PENDING-PERMISSION-LOST / INC-20260907-PERMISSION-ROOTFIX:
+            // permission_request 只在容器发出那一刻投给当时已登记的 socket。
+            // 不再搭 liveCatchup 的前 8 会话车：hello 带全部可见会话，活跃会话
+            // 几乎从不在前 8。一次批量 SQL 覆盖有界候选集；超限显式截断，客户端
+            // 靠会话 GET 找回未扫到的会话。不打 frameSeq。绝不能挡 hello 转发。
+            const helloPermissionScan = selectHelloPermissionSessions(helloPermissionPeers, {
+              maxSessions: HELLO_PENDING_PERMISSION_MAX_SESSIONS,
+            });
+            if (helloPermissionScan.sessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
               void (async () => {
                 try {
                   await Promise.resolve();
-                  for (const { peerId, sessionKey } of pendingPermissionSessions) {
+                  const sessionIds = helloPermissionScan.sessions.map((entry) => entry.peerId);
+                  const pendingScan = await readPendingPermissionPromptsForSessions(pgPool, {
+                    userId: uid,
+                    sessionIds,
+                  });
+                  const pendingBySession = pendingScan.bySession;
+                  let hits = 0;
+                  for (const { peerId, sessionKey } of helloPermissionScan.sessions) {
                     if (userWs.readyState !== WebSocket.OPEN) break;
-                    const rows = await readPendingPermissionPrompts(pgPool, {
-                      userId: uid,
-                      sessionId: peerId,
-                    });
-                    if (rows.length === 0) continue;
+                    const rows = pendingBySession.get(peerId);
+                    if (rows === undefined || rows.length === 0) continue;
                     let sent = 0;
                     for (const row of rows) {
                       if (userWs.readyState !== WebSocket.OPEN) break;
@@ -5571,12 +5613,31 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       try { userWs.send(JSON.stringify(frame)); sent += 1; } catch { break; }
                     }
                     if (sent > 0) {
+                      hits += sent;
                       bridgeLog?.info("user-chat-bridge: hello replayed pending permission prompts", {
                         uid: uidStr,
                         sessionId: peerId,
                         count: sent,
                       });
                     }
+                  }
+                  const rowLimited = pendingScan.rowLimited === true;
+                  const uncoveredSessionIds = pendingScan.uncoveredSessionIds;
+                  if (userWs.readyState === WebSocket.OPEN && (hits > 0 || helloPermissionScan.truncated || rowLimited)) {
+                    try {
+                      userWs.send(JSON.stringify({
+                        type: "outbound.permission_hello_scan",
+                        channel: "webchat",
+                        scanned: helloPermissionScan.scanned,
+                        omitted: helloPermissionScan.omitted,
+                        truncated: helloPermissionScan.truncated || rowLimited,
+                        sessionTruncated: helloPermissionScan.truncated,
+                        rowLimited,
+                        uncoveredSessionIds,
+                        hits,
+                        ts: Date.now(),
+                      }));
+                    } catch { /* */ }
                   }
                 } catch {
                   // 补发失败只能静默:不得挡转发、不得关连接。
@@ -5877,10 +5938,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sanitizedParsed.model = DEFAULT_CODEX_ENGINE_MODEL;
               }
             }
-            // Chat-native paper integration: keep browser/session text unchanged,
-            // but enrich the master→container frame with a bounded ScanSci PDF
-            // usage hint when the user's message is clearly a paper task.
-            inboundParsedFrame = appendScanSciPaperIntentHintToFrame(sanitizedParsed);
+            // Browser paper hints run before admission freezes the content hash.
+            // Cron-origin callbacks have already been admitted: rewriting their
+            // text here would invalidate __oc_dispatch at the container. The
+            // ingress flag is internal, never taken from browser-authored fields.
+            inboundParsedFrame = isCronOriginDispatch
+              ? sanitizedParsed
+              : appendScanSciPaperIntentHintToFrame(sanitizedParsed);
             isAnnotatedImageInboundFrame = isValidatedAnnotatedImageInbound(inboundParsedFrame);
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
             turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
@@ -7681,24 +7745,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const pricing = deps.pricing;
               void (async () => {
                 try {
-                  const updated = await pool.query<{ model_id: string; session_id: string | null }>(
-                    `UPDATE cursor_external_usage_audit
-                        SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
-                      WHERE request_id=$1 AND user_id=$6 AND status='pending'
-                    RETURNING model_id, session_id`,
-                    [requestId, status, terminalCode, durationMs, usage, uid],
+                  // Read the audit identity without closing it: closing now
+                  // (the old UPDATE-first order) stranded audits whose settle
+                  // later failed — terminal status, no usage row, never
+                  // retried. settleDurableCursorBilling below closes the row
+                  // only after the settle commits; a pricing miss / PG failure
+                  // keeps it pending for the cursorAuditReconciler.
+                  const audit = await pool.query<{ model_id: string; session_id: string | null }>(
+                    `SELECT model_id, session_id FROM cursor_external_usage_audit
+                      WHERE request_id=$1 AND user_id=$2`,
+                    [requestId, uid],
                   );
-                  let modelId = updated.rows[0]?.model_id ?? null;
-                  let sessionId = updated.rows[0]?.session_id ?? null;
-                  if (modelId === null) {
-                    const existing = await pool.query<{ model_id: string; session_id: string | null }>(
-                      `SELECT model_id, session_id FROM cursor_external_usage_audit
-                        WHERE request_id=$1 AND user_id=$2`,
-                      [requestId, uid],
-                    );
-                    modelId = existing.rows[0]?.model_id ?? null;
-                    sessionId = existing.rows[0]?.session_id ?? sessionId;
-                  }
+                  const modelId = audit.rows[0]?.model_id ?? null;
+                  const sessionId = audit.rows[0]?.session_id ?? null;
                   let cursorAccountId: bigint | null = null;
                   const stableIdentityParts = [
                     external.cursorAccountId,
@@ -7769,32 +7828,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   } else if (!pricing) {
                     bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, pricing cache missing', { requestId, modelId });
                   } else {
-                    const settled = await settleCursorExternalUsage({
-                      pool,
-                      pricing,
-                      userId: uid,
-                      requestId,
-                      modelId,
-                      sessionId,
-                      engineStatus: status,
-                      terminalCode,
-                      usage,
-                      accountId: cursorAccountId,
-                    });
-                    if (settled === null) {
-                      bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, model pricing not in cache', { requestId, modelId });
-                    } else if (
-                      settled.debitedCredits !== null &&
-                      settled.debitedCredits > 0n &&
-                      deps.appendCostCredits
-                    ) {
-                      await deps.appendCostCredits(
+                    // Shared settle-before-close routine (same one the durable
+                    // tape path and the reconciler use): the audit row closes
+                    // only on a committed settle. The live terminal vocabulary
+                    // ('unavailable' / AUTH_UNAVAILABLE / QUOTA_UNAVAILABLE)
+                    // and the verified Cursor account attribution are passed
+                    // through options; quota learn above is unchanged.
+                    await settleDurableCursorBilling(
+                      { pgPool: pool, pricing, appendCostCredits: deps.appendCostCredits },
+                      uid,
+                      {
                         requestId,
-                        uid.toString(),
-                        settled.debitedCredits.toString(),
-                        sessionId,
-                      );
-                    }
+                        engine: 'cursor',
+                        engineSessionId: sessionId ?? '',
+                        status: status === 'success' ? 'success' : 'error',
+                        durationMs: durationMs ?? 0,
+                        usage: (usage ?? undefined) as DurableCodexBilling['usage'],
+                      },
+                      { engineStatus: status, terminalCode, accountId: cursorAccountId },
+                    );
                   }
                 } catch (err) {
                   bridgeLog?.warn('user-chat-bridge: Cursor platform settle failed', { requestId, err });
