@@ -3385,6 +3385,40 @@
           "assertion": "OCV5-178 warm socket shows new text after restoring an idle cursor"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-LATE-DELEGATE-OWNER",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "一层委派在队长 T1 结束后才完成时，完成卡按 session 缓冲进入随后 T2 的 tape；losslessTurnTape 因 parentTurnKey=T1 拒绝该 tape。根治：启动冻结 exact owner，drain 同步 seal，晚到走原 owner 受限 continuation；同 logical run 一张卡，异 payload 可见冲突，T2 零污染。历史 65 条只交只读 planner，不 requeue。部署源码门只证明防回退，不冒称端到端。",
+      "rootFixCommit": "742f7562",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "seal-after path: one continuation card for T1, zero pollution in T2, no duplicate"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "cross-session owner locator is rejected even when turnKey matches"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/losslessTurnTape.test.ts",
+          "assertion": "old writer compat: runtimeEvents-only continuation still parses (no agentGroups)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "relocates a continuation card onto the owner turn, not T2"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-LATE-DELEGATE-OWNER: source regression guard, not end-to-end proof."
+        }
+      ]
     }
   ]
 }
