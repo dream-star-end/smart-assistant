@@ -1,18 +1,31 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, it } from 'node:test'
+import { after, describe, it } from 'node:test'
 
 import type { DurableAgentGroup } from '@openclaude/protocol'
 
-import { SessionManager } from '../sessionManager.js'
-import { makeV3MasterRetryQueue } from '../v3MasterRetryQueue.js'
-import {
-  makeV3MasterSink,
-  setV3MasterSinkSingleton,
-  type V3MasterSink,
-} from '../v3MasterSink.js'
+import type { V3MasterSink } from '../v3MasterSink.js'
+
+// Storage paths are captured at module evaluation. Set the private roots
+// before importing any production module, not in a too-late beforeEach.
+const fixtureRoot = await mkdtemp(join(tmpdir(), 'late-delegate-state-'))
+const previousEnv = new Map(['HOME', 'OPENCLAUDE_HOME', 'TMPDIR'].map((key) => [key, process.env[key]]))
+process.env.HOME = fixtureRoot
+process.env.OPENCLAUDE_HOME = join(fixtureRoot, '.openclaude')
+process.env.TMPDIR = fixtureRoot
+await mkdir(process.env.OPENCLAUDE_HOME, { recursive: true })
+after(async () => {
+  await rm(fixtureRoot, { recursive: true, force: true })
+  for (const [key, value] of previousEnv) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+})
+const { SessionManager } = await import('../sessionManager.js')
+const { makeV3MasterRetryQueue } = await import('../v3MasterRetryQueue.js')
+const { makeV3MasterSink, setV3MasterSinkSingleton } = await import('../v3MasterSink.js')
 
 const owner = { parentSessionId: 'shutdown-owner', parentTurnKey: 'a'.repeat(64), turnIndex: 1 }
 const group: DurableAgentGroup = {
@@ -61,6 +74,8 @@ describe('late delegate shutdown persistence barrier', { concurrency: 1 }, () =>
       // Wait the real resume-map write, not an arbitrary delay, so an
       // unrelated filesystem operation cannot mask an already-open barrier.
       await (sm as unknown as { _resumeMapWrite: Promise<void> })._resumeMapWrite
+      const resumeMap = await readFile(join(fixtureRoot, '.openclaude', 'resume-map.json'), 'utf8')
+      assert.equal(typeof JSON.parse(resumeMap), 'object', 'real shutdown writes only the private resume map')
       await nextTurn()
       assert.equal(closed, false, 'shutdown cannot finish before a durable receipt exists')
       assert.equal(stages, 1, 'late completion must stage without a local authority lookup')
@@ -106,6 +121,8 @@ describe('late delegate shutdown persistence barrier', { concurrency: 1 }, () =>
       await sm.awaitPendingPersistence()
       assert.equal(writes, 1, 'a non-durable failure must not pin the run as already persisted')
     } finally {
+      await sm.awaitPendingPersistence()
+      await sm.shutdownAll()
       setV3MasterSinkSingleton(null)
       if (previous === undefined) delete process.env.OC_RUNTIME_CHANNEL
       else process.env.OC_RUNTIME_CHANNEL = previous
