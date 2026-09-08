@@ -6,7 +6,6 @@
  *   REQUIRE_TEST_DB=1 scripts/test-mutex.sh commercial \
  *     'npx tsx --test packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts'
  */
-import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -41,6 +40,7 @@ import {
   type CursorExternalReadyRecord,
 } from "../billing/cursorExternalApiOutbox.js";
 import { useDedicatedTestDatabase } from "./helpers/db.js";
+import { createBillingDiagnostics, type BillingScenario } from "./helpers/cursorExternalApiDiagnostics.js";
 
 const db = useDedicatedTestDatabase("cursor_external_api_188_test");
 const MODEL = "cursor-fable-5.1-high";
@@ -50,18 +50,7 @@ const protoRoot = protobuf.loadSync(
 );
 const StreamResponse = protoRoot.lookupType("aiserver.v1.InferenceStreamResponse");
 
-type Scenario = {
-  id: string;
-  expected: string;
-  actual: string;
-  upstreamCalls: number;
-  terminal?: string;
-  phase?: string;
-  usage?: unknown;
-  ledger?: unknown;
-  pass: boolean;
-  error?: string;
-};
+type Scenario = BillingScenario;
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("../../../../", import.meta.url)));
 const SOURCE_FILES = [
@@ -69,22 +58,13 @@ const SOURCE_FILES = [
   "packages/commercial/src/http/proxy/cursorExternal.ts",
   "packages/gateway/src/engine/cursorSandRelay.ts",
   "packages/commercial/src/__tests__/cursorExternalApiBilling.integ.test.ts",
+  "packages/commercial/src/__tests__/helpers/cursorExternalApiDiagnostics.ts",
 ];
 
-const scenarios: Scenario[] = [];
-const registeredIds: string[] = [];
+const diag = createBillingDiagnostics("cursorExternalApiBilling");
+const { expectScenario, record } = diag;
 const tmpDirs = new Set<string>();
 const liveChildren = new Set<ReturnType<typeof spawn>>();
-let beforeError: string | null = null;
-
-function expectScenario(id: string): void {
-  registeredIds.push(id);
-}
-
-function record(s: Scenario): void {
-  scenarios.push(s);
-  assert.equal(s.pass, true, `${s.id}: expected ${s.expected} actual ${s.actual}`);
-}
 
 async function trackedTemp(prefix: string): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), prefix));
@@ -594,7 +574,7 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
       outboxDir = await trackedTemp("ocv5-188-outbox-");
       outbox = await openCursorExternalApiOutbox({ directory: outboxDir });
     } catch (err) {
-      beforeError = err instanceof Error ? err.message : String(err);
+      diag.noteBeforeError(err);
       throw err;
     }
   });
@@ -616,34 +596,10 @@ describe("OCV5-188 A cursor external API billing", { timeout: 180_000 }, () => {
         hashes[rel] = `unreadable:${err instanceof Error ? err.message : String(err)}`;
       }
     }
-    for (const id of registeredIds) {
-      if (!scenarios.some((s) => s.id === id)) {
-        scenarios.push({
-          id,
-          expected: "record() reached",
-          actual: "missing record — pre-record throw or skipped body",
-          upstreamCalls: -1,
-          pass: false,
-        });
-      }
-    }
-    const passed = scenarios.filter((s) => s.pass).length;
-    const failed = scenarios.filter((s) => !s.pass).length;
-    if (failed > 0 || beforeError) process.exitCode = 1;
-    process.stdout.write(
-      `${JSON.stringify({
-        suite: "cursorExternalApiBilling",
-        passed,
-        failed,
-        skipped: beforeError ? "before_failed" : 0,
-        beforeError,
-        registered: registeredIds,
-        recorded: scenarios.map((s) => s.id),
-        sourceHashes: hashes,
-        tmpDirs: [...tmpDirs],
-        scenarios,
-      })}\n`,
-    );
+    diag.summary({
+      sourceHashes: hashes,
+      tmpDirs: [...tmpDirs],
+    });
     await Promise.all([...tmpDirs].map((d) => rm(d, { recursive: true, force: true }).catch(() => undefined)));
     tmpDirs.clear();
   });
