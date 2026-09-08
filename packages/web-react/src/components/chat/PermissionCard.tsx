@@ -272,6 +272,9 @@ export function PermissionCard({
   }, [resolved, pending, readOnly, expired, livePrompt, inputTruncated, msg.requestId]);
 
   useEffect(() => {
+    // Timeline cards are card-only and must not auto-open or occupy the slot
+    // (T3: visibilitychange would markDisplayed with no modal).
+    if (renderMode === "card") return;
     if (!livePrompt || resolved || pending || readOnly || expired) return;
     const onVis = () => {
       const requestId = msg.requestId;
@@ -280,13 +283,14 @@ export function PermissionCard({
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
+  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId, renderMode]);
 
   useEffect(() => {
+    if (renderMode === "card") return;
     if (open && isDocumentForeground() && msg.requestId) {
       markPermissionDisplayed(msg.requestId);
     }
-  }, [open, msg.requestId]);
+  }, [open, msg.requestId, renderMode]);
 
   useEffect(() => {
     return subscribePermissionCoordinator(() => {
@@ -297,9 +301,10 @@ export function PermissionCard({
         setOpen(false);
         return;
       }
+      if (renderMode === "card") return;
       if (shouldAutoOpenPermission({ requestId, livePrompt })) setOpen(true);
     });
-  }, [livePrompt, msg.requestId]);
+  }, [livePrompt, msg.requestId, renderMode]);
 
   useEffect(() => {
     if (resolved && msg.requestId && renderMode !== "card") {
@@ -525,6 +530,11 @@ export function PermissionPromptHost({
   useEffect(() => subscribePermissionCoordinator(() => {
     setTick((n) => n + 1);
   }), []);
+  useEffect(() => {
+    const onVis = () => setTick((n) => n + 1);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
   if (readOnly) return null;
   const pending = messages.filter(
     (message) =>
