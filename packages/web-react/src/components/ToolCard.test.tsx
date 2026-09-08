@@ -680,10 +680,18 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("网页搜索")).toBeInTheDocument();
+    // 折叠摘要带动作说明；展开后仍须保留完整查询和结果数。
+    expect(screen.getByText('搜索 "OpenClaude v5"')).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "展开网页搜索详情" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("OpenClaude v5")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("results")).toBeInTheDocument();
     expect(screen.getByText("3")).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("results")).not.toBeInTheDocument();
   });
 
   test("Codex plan/todo_list 复用 TodoWrite 列表", () => {

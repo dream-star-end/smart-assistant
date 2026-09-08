@@ -210,12 +210,17 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     // boot 静默续期场景：模拟「登录过的浏览器」（oc_auth_hint），否则匿名访客不再发 refresh。
     setAuthHint()
-    render(<ToastProvider><App /></ToastProvider>)
+    // 连接状态也可合法使用 alert；邀请失败校验不能要求全页只有一个提示。
+    render(<><div role="alert" aria-label="连接状态">连接中…</div><ToastProvider><App /></ToastProvider></>)
     fireEvent.click(await screen.findByRole('button', { name: '接受邀请' }))
 
-    const alert = await screen.findByRole('alert')
+    const alert = (await screen.findByText('接受组织邀请失败（追踪号 req-org-invite）')).closest('[role="alert"]')
+    expect(alert).toBeInTheDocument()
+    expect(alert).toHaveAttribute('aria-live', 'assertive')
     expect(alert).toHaveTextContent('接受组织邀请失败（追踪号 req-org-invite）')
     expect(alert).not.toHaveTextContent('database unavailable')
+    expect(document.body).not.toHaveTextContent('database unavailable')
+    expect(screen.getByRole('alert', { name: '连接状态' })).toHaveTextContent('连接中…')
   })
 
   test('登录与退出清空图片 Blob 缓存，跨账号相同容器路径不得复用', async () => {
