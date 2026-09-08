@@ -30,6 +30,7 @@ import { SessionManager, type AgentSession } from '../sessionManager.js'
 import { CcbAdapter } from '../engine/ccbAdapter.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 import {
+  makeV3MasterSink,
   setV3MasterSinkSingleton,
   type V3MasterSink,
   type V3MasterSinkPayload,
@@ -37,6 +38,11 @@ import {
 
 const OWNER_TURN_KEY = 'a'.repeat(64)
 const OTHER_TURN_KEY = 'b'.repeat(64)
+
+process.env.OC_MODEL_AUTHORITY = '0'
+process.env.OC_DELEGATE_SM = process.env.OC_DELEGATE_SM ?? '0'
+
+describe('OCV5-180 B1 serial', { concurrency: 1 }, () => {
 
 function owner(over: Partial<DelegateOwnerTurnLocator> = {}): DelegateOwnerTurnLocator {
   return {
@@ -208,6 +214,22 @@ describe('SessionManager exact-owner buffer contract (OCV5-180 B1)', () => {
     assert.equal(sm.bufferPendingAgentGroup('agent:gone', group('dlg-x'), owner()), false)
   })
 
+  it('same owner/run is idempotent in the ordinary buffer; conflict is visible', () => {
+    const { sm, session } = makeSessions()
+    assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, group('dlg-1'), owner()), true)
+    assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, group('dlg-1'), owner()), true)
+    assert.equal(session._pendingAgentGroups?.length, 1)
+    assert.equal(
+      sm.bufferPendingAgentGroup(
+        session.sessionKey,
+        group('dlg-1', { resultSummary: 'other' }),
+        owner(),
+      ),
+      false,
+    )
+    assert.equal(session._pendingAgentGroups?.length, 1)
+  })
+
   it('cross-session owner locator is rejected even when turnKey matches', () => {
     const { sm, session } = makeSessions()
     assert.equal(
@@ -321,6 +343,142 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       setV3MasterSinkSingleton(null)
     }
   })
+
+  it('stageDurable failure does not cache-swallow the same payload retry', async () => {
+    let stages = 0
+    const sink = makeV3MasterSink({
+      config: { baseUrl: 'http://master.test:18791', bearer: `oc-v3.7.${'a'.repeat(64)}` },
+      retryQueue: {
+        stageDurable: async () => {
+          stages += 1
+          if (stages === 1) throw new Error('controlled stageDurable EIO')
+          return 'receipt-2'
+        },
+        ackDurable: async () => {},
+        enqueueDurable: async () => {},
+        drainOnce: async () => ({
+          considered: 0, drained: 0, retried: 0, ttlDropped: 0, fatalDropped: 0, errors: 0, pending: 0,
+        }),
+        kick: () => {},
+        startPeriodic: () => {},
+        stopPeriodic: () => {},
+        pendingCount: async () => 0,
+        hasEntryForDispatch: async () => false,
+      },
+      attemptSendImpl: async () => ({}),
+    })
+    setV3MasterSinkSingleton(sink)
+    try {
+      const { sm } = makeSessions()
+      const g = group('dlg-retry')
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(stages, 2, 'same frozen payload must retry after non-durable drop')
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('concurrent same-payload late deliveries merge into one inflight write', async () => {
+    let stages = 0
+    const sink = makeV3MasterSink({
+      config: { baseUrl: 'http://master.test:18791', bearer: `oc-v3.7.${'a'.repeat(64)}` },
+      retryQueue: {
+        stageDurable: async () => {
+          stages += 1
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          return `receipt-${stages}`
+        },
+        ackDurable: async () => {},
+        enqueueDurable: async () => {},
+        drainOnce: async () => ({
+          considered: 0, drained: 0, retried: 0, ttlDropped: 0, fatalDropped: 0, errors: 0, pending: 0,
+        }),
+        kick: () => {},
+        startPeriodic: () => {},
+        stopPeriodic: () => {},
+        pendingCount: async () => 0,
+        hasEntryForDispatch: async () => false,
+      },
+      attemptSendImpl: async () => ({}),
+    })
+    setV3MasterSinkSingleton(sink)
+    try {
+      const { sm } = makeSessions()
+      const g = group('dlg-merge')
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(stages, 1)
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('session_deleted is terminal and does not resurrect', async () => {
+    const sink = {
+      persistOrQueue: async () => ({ ok: false, queued: false, droppedReason: 'session_deleted: gone' }),
+      attemptOnce: async () => {
+        throw new Error('not used')
+      },
+    } as unknown as V3MasterSink
+    setV3MasterSinkSingleton(sink)
+    try {
+      const { sm } = makeSessions()
+      const g = group('dlg-deleted')
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), false)
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('root drain claims the logical run so late does not mint a second card', async () => {
+    const captured = makeCapturingSink()
+    setV3MasterSinkSingleton(captured.sink)
+    try {
+      const { sm, session } = makeSessions()
+      const g = group('dlg-root')
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
+      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
+      assert.equal(drained.length, 1)
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(captured.payloads.length, 0, 'root already contains the run; no continuation')
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('root persist drop is not durable: late retry of the same run is allowed', async () => {
+    const captured = makeCapturingSink()
+    setV3MasterSinkSingleton(captured.sink)
+    try {
+      const { sm, session } = makeSessions()
+      const g = group('dlg-root-fail')
+      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
+      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
+      assert.equal(drained.length, 1)
+      type Settler = {
+        _settleDrainedOwnerGroups: (
+          s: AgentSession,
+          turnKey: string,
+          groups: DurableAgentGroup[],
+          outcome: 'acked' | 'queued' | 'dropped' | 'skipped',
+        ) => void
+      }
+      ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'dropped')
+      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await sm.awaitPendingPersistence()
+      assert.equal(captured.payloads.length, 1)
+      assert.equal(captured.payloads[0]!.continuationOfTurnKey, OWNER_TURN_KEY)
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
 })
 
 // ── 3. B-R2-1 controlled sink: T1 drain/seal → sink pending → child完成 → T2 ──
@@ -328,8 +486,13 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now()
   isRunning = true
-  constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
+  private submitHandler: (runner: FakeCcbRunner) => void | Promise<void>
+  constructor(onSubmit: (runner: FakeCcbRunner) => void | Promise<void>) {
     super()
+    this.submitHandler = onSubmit
+  }
+  setSubmitHandler(onSubmit: (runner: FakeCcbRunner) => void | Promise<void>): void {
+    this.submitHandler = onSubmit
   }
   async start(): Promise<void> {}
   interrupt(): boolean {
@@ -339,7 +502,7 @@ class FakeCcbRunner extends EventEmitter {
   clearSessionId(): void {}
   async waitForOutputDrain(): Promise<void> {}
   async submit(): Promise<void> {
-    this.onSubmit(this)
+    await this.submitHandler(this)
   }
   text(text: string): void {
     this.emit('message', {
@@ -501,7 +664,7 @@ describe('B-R2-1 controlled sink: late child lands as T1 continuation, T2 stays 
     setV3MasterSinkSingleton(sink)
     try {
       const { sm, session, runner } = makeTurnHarness()
-      runner.onSubmit = (r) => {
+      runner.setSubmitHandler((r: FakeCcbRunner) => {
         r.text('answer')
         // child completes while the owner turn is still open
         const ownerLocator = {
@@ -514,7 +677,7 @@ describe('B-R2-1 controlled sink: late child lands as T1 continuation, T2 stays 
           true,
         )
         r.result()
-      }
+      })
       await sm.submit(session, 'T1 with live child', () => {}, undefined, undefined, 'd'.repeat(32))
       assert.equal(payloads.length, 1)
       assert.deepEqual(payloads[0]!.agentGroups?.map((g) => g.runId), ['dlg-early'])
@@ -529,7 +692,7 @@ describe('B-R2-1 controlled sink: late child lands as T1 continuation, T2 stays 
 
 // ── 4. server launch-freeze + collection routing (real handleDelegateTask) ──
 
-describe('handleDelegateTask owner freeze and collection routing (OCV5-180 B1)', () => {
+describe('handleDelegateTask owner freeze and collection routing (OCV5-180 B1)', { concurrency: 1 }, () => {
   const PARENT_KEY = 'agent:main:webchat:dm:wsess-late-owner'
   const PARENT_PEER = 'wsess-late-owner'
   const PARENT_TURN_KEY = 'a'.repeat(64)
@@ -553,6 +716,7 @@ describe('handleDelegateTask owner freeze and collection routing (OCV5-180 B1)',
     gw._activeDelegations = 0
     gw._activeDelegationsByParent = new Map()
     gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
+    gw._memberDelegateGuard = new PerTurnDelegationGuard(8)
     gw._delegateQueuePollMs = 10
     gw._readDelegateMemoryPressure = () => null
     gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
@@ -604,7 +768,7 @@ describe('handleDelegateTask owner freeze and collection routing (OCV5-180 B1)',
       },
     }
     gw.deliver = () => {}
-    return { gw, bufferCalls, lateCalls }
+    return { gw, bufferCalls, lateCalls, parentSession }
   }
 
   async function delegate(gw: any, body: Record<string, unknown>) {
@@ -631,7 +795,7 @@ describe('handleDelegateTask owner freeze and collection routing (OCV5-180 B1)',
       sourceAgent: 'main',
       parentSessionKey: PARENT_KEY,
     })
-    assert.equal(r.status, 200)
+    assert.equal(r.status, 200, JSON.stringify(r.body))
     assert.equal(bufferCalls.length, 1)
     const call = bufferCalls[0]!
     assert.equal(call.sessionKey, PARENT_KEY)
@@ -672,4 +836,156 @@ describe('handleDelegateTask owner freeze and collection routing (OCV5-180 B1)',
     assert.equal(bufferCalls.length, 0)
     assert.equal(lateCalls.length, 0)
   })
+})
+
+describe('handleDelegateTask FIFO eviction counterexample (OCV5-180 B1)', { concurrency: 1 }, () => {
+  it('512 capacity-rejected attempts cannot evict a live frozen owner onto T2', async () => {
+    const PARENT_KEY = 'agent:main:webchat:dm:wsess-late-owner'
+    const PARENT_PEER = 'wsess-late-owner'
+    const PARENT_TURN_KEY = OWNER_TURN_KEY
+    let releaseFirst: (() => void) | undefined
+    const bufferCalls: Array<{ sessionKey: string; group: DurableAgentGroup; owner?: unknown }> = []
+    const parentSession = {
+      sessionKey: PARENT_KEY,
+      channel: 'webchat',
+      peerId: PARENT_PEER,
+      agentId: 'main',
+      userId: '1',
+      repoSessionId: undefined,
+      _currentTurnKey: PARENT_TURN_KEY,
+      _currentTurnIndex: 7,
+      runner: Object.assign(new EventEmitter(), { lastActivityAt: 1 }),
+    }
+    type GwFifoFixture = {
+      handleDelegateTask: (req: unknown, res: unknown, agentId: string) => Promise<void>
+      _shuttingDown: boolean
+      _activeDelegations: number
+      _activeDelegationsByParent: Map<string, Set<string>>
+      _hiddenDelegateGuard: PerTurnDelegationGuard
+      _memberDelegateGuard: PerTurnDelegationGuard
+      _delegateQueuePollMs: number
+      _readDelegateMemoryPressure: () => null
+      log: { debug: () => void; info: () => void; warn: () => void; error: () => void }
+      deps: unknown
+      _getAgentsConfig: () => Promise<unknown>
+      _runLog: { start: () => object; complete: () => void }
+      sessions: unknown
+      deliver: () => void
+      readBody: () => Promise<string>
+      _waitForDelegateCapacity: () => Promise<{ status: 'ok' } | { status: 'queue_full'; blocked: { kind: 'memory'; pct: number; limitPct: number } }>
+      _applyDelegateCapacityReject: (
+        input: unknown,
+        reject: { httpStatus: number; message: string; failureClass?: string },
+      ) => Promise<{ kind: 'rejected'; httpStatus: number; message: string; failureClass?: string }>
+    }
+    const gw = Object.create(Gateway.prototype) as GwFifoFixture
+    gw._shuttingDown = false
+    gw._activeDelegations = 0
+    gw._activeDelegationsByParent = new Map()
+    gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
+    gw._memberDelegateGuard = new PerTurnDelegationGuard(8)
+    gw._delegateQueuePollMs = 10
+    gw._readDelegateMemoryPressure = () => null
+    gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+    gw.deps = {
+      config: {
+        version: 1,
+        provider: 'anthropic',
+        gateway: { bind: '127.0.0.1', port: 18789, accessToken: 'test' },
+        auth: { mode: 'subscription', claudeCodePath: '/tmp/ccb' },
+        defaults: { model: 'glm-5.2', permissionMode: 'default' },
+        channels: { webchat: { enabled: true } },
+      },
+    }
+    gw._getAgentsConfig = async () => ({
+      default: 'main',
+      agents: [
+        { id: 'main', provider: 'anthropic', model: 'glm-5.2' },
+        { id: 'coding-assistant' },
+      ],
+    })
+    gw._runLog = { start: () => ({}), complete: () => {} }
+    gw.sessions = {
+      flushSessionTailFolding: async () => {},
+      destroySession: async () => {},
+      getByKey: (key: string) => (key === PARENT_KEY ? parentSession : undefined),
+      getOrCreate: async (input: { agent?: { id?: string } }) => ({
+        agentId: input.agent?.id ?? 'coding-assistant',
+        currentTurnStatus: null,
+        runner: Object.assign(new EventEmitter(), {
+          lastActivityAt: 1,
+          engineId: 'ccb',
+          interrupt: () => {},
+          shutdown: async () => {},
+          waitForOutputDrain: async () => {},
+          sendPermissionResponse: () => {},
+        }),
+      }),
+      submit: async (
+        _s: unknown,
+        _p: string,
+        onEvent: (event: { kind: string; block?: { kind: string; text: string }; meta?: { cost: number; inputTokens: number; outputTokens: number; turn: number } }) => void,
+      ) => {
+        await new Promise<void>((resolve) => {
+          releaseFirst = () => {
+            onEvent({ kind: 'block', block: { kind: 'text', text: 'done' } })
+            onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+            resolve()
+          }
+        })
+      },
+      bufferPendingAgentGroup: (sessionKey: string, g: DurableAgentGroup, o?: unknown) => {
+        bufferCalls.push({ sessionKey, group: g, owner: o })
+        return true
+      },
+      deliverLateDelegateAgentGroup: () => true,
+    }
+    gw.deliver = () => {}
+    gw._applyDelegateCapacityReject = async (
+      _input: unknown,
+      reject: { httpStatus: number; message: string; failureClass?: string },
+    ) => ({
+      kind: 'rejected' as const,
+      httpStatus: reject.httpStatus,
+      message: reject.message,
+      failureClass: reject.failureClass,
+    })
+    const run = async (goal: string) => {
+      const req = { method: 'POST', headers: {} }
+      gw.readBody = async () => JSON.stringify({ goal, sourceAgent: 'main', parentSessionKey: PARENT_KEY })
+      let status = 0
+      const res = {
+        writeHead: (code: number) => {
+          status = code
+        },
+        end: () => {},
+      }
+      await gw.handleDelegateTask(req, res, 'coding-assistant')
+      return status
+    }
+    const first = run('活任务')
+    const deadline = Date.now() + 5000
+    while (!releaseFirst) {
+      if (Date.now() > deadline) throw new Error('first submit did not start')
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    gw._waitForDelegateCapacity = async () => ({
+      status: 'queue_full' as const,
+      blocked: { kind: 'memory' as const, pct: 95, limitPct: 85 },
+    })
+    for (let i = 0; i < 512; i++) {
+      if (i % 7 === 0) gw._memberDelegateGuard.resetForParent(PARENT_KEY)
+      await run(`reject-${i}`)
+    }
+    parentSession._currentTurnKey = OTHER_TURN_KEY
+    releaseFirst()
+    await first
+    assert.equal(bufferCalls.length, 1)
+    assert.deepEqual(bufferCalls[0]!.owner, {
+      parentSessionId: PARENT_PEER,
+      parentTurnKey: PARENT_TURN_KEY,
+      turnIndex: 7,
+    })
+  })
+})
 })

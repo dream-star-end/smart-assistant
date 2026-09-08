@@ -207,14 +207,17 @@ const lateServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'),
 const lateTapeSrc = readFileSync(join(root, 'packages/commercial/src/http/losslessTurnTape.ts'), 'utf8')
 const latePersistSrc = readFileSync(join(root, 'packages/web-react/src/lib/persist.ts'), 'utf8')
 const lateSocketSrc = readFileSync(join(root, 'packages/web-react/src/lib/chat/socket.ts'), 'utf8')
+const latePgSrc = readFileSync(join(root, 'packages/commercial/src/db/pgSessionsBackend.ts'), 'utf8')
 for (const [name, src, marker] of [
   ['delegateLateCompletion.ts', lateDelegateHelperSrc, 'export function lateDelegateLogicalRunKey('],
   ['sessionManager.ts', lateSessionManagerSrc, 'deliverLateDelegateAgentGroup('],
   ['sessionManager.ts', lateSessionManagerSrc, 'this._sealOwnerTurn(session, turnKey)'],
-  ['server.ts', lateServerSrc, 'const ownerLocatorForCard = this._delegateOwnerByRunId?.get(progressRunId)'],
+  ['sessionManager.ts', lateSessionManagerSrc, 'private _admitExactOwnerRun('],
+  ['server.ts', lateServerSrc, 'delegate card dropped: missing frozen owner locator'],
   ['losslessTurnTape.ts', lateTapeSrc, 'const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey'],
   ['persist.ts', latePersistSrc, 'export function reconcileLateDelegateAgentGroups('],
   ['socket.ts', lateSocketSrc, 's.messages = reconcileLateDelegateAgentGroups(s.messages)'],
+  ['pgSessionsBackend.ts', latePgSrc, '{ continuationOfTurnKey: header.continuationOfTurnKey }'],
 ] as const) {
   if (!src.includes(marker)) {
     throw new Error(`[late-delegate-owner] ${name} lost exact-owner contract: ${marker}`)

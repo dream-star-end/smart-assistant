@@ -2894,6 +2894,7 @@ interface DirectTapeHeader {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  continuationOfTurnKey: string | null;
   materializationStatus: string | null;
   finalizedAt: string | null;
   visibleAt: string | null;
@@ -4235,6 +4236,7 @@ async function readDirectTapeHeaders(
       status: string;
       turn_key: string;
       client_message_id: string | null;
+      continuation_of_turn_key: string | null;
       materialization_status: string | null;
       finalized_at: string | null;
       visible_at: string | null;
@@ -4242,6 +4244,7 @@ async function readDirectTapeHeaders(
     }>(
       `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status, t.turn_key,
               COALESCE(t.client_message_id, d.client_message_id) AS client_message_id,
+              t.continuation_of_turn_key,
               t.record_payload_bytes::text AS payload_bytes,
               t.physical_record_count::text AS physical_count,
               t.logical_record_count::text AS logical_count,
@@ -4324,6 +4327,7 @@ async function readDirectTapeHeaders(
         status: row.status,
         turnKey: row.turn_key,
         clientMessageId: row.client_message_id,
+        continuationOfTurnKey: row.continuation_of_turn_key,
         materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
         finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
         visibleAt: (row as { visible_at?: string | null }).visible_at ?? null,
@@ -4777,6 +4781,7 @@ async function hydrateTurnTapeMessages(
                 : {}),
             },
             bigIntNum(head.payload_bytes, "turn tape timeline payload bytes"),
+            { continuationOfTurnKey: header.continuationOfTurnKey },
           );
           if (typeof anchor._seq === "number") deferred._seq = anchor._seq;
           if (typeof anchor._orderSeq === "number") deferred._orderSeq = anchor._orderSeq;
@@ -5873,12 +5878,25 @@ function stampTapeLifecycle(
   }) as MessageLike;
 }
 
+function agentGroupRunIdFromRecordId(msgId: string): string | undefined {
+  const marker = "-agentgroup-";
+  const index = msgId.indexOf(marker);
+  if (index < 0) return undefined;
+  const runId = msgId.slice(index + marker.length);
+  return runId.length > 0 ? runId : undefined;
+}
+
 function deferredTapeRecord(
   tapeId: string,
   tapeSha256: string,
   head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256?: string },
   payloadBytes: number,
+  extras?: { continuationOfTurnKey?: string | null },
 ): MessageLike {
+  const continuationOfTurnKey = extras?.continuationOfTurnKey;
+  const delegateRunId = head.role === "agent-group"
+    ? agentGroupRunIdFromRecordId(head.msg_id)
+    : undefined;
   return stampTapeLifecycle({
     id: head.msg_id,
     role: head.role,
@@ -5894,6 +5912,13 @@ function deferredTapeRecord(
     _payloadDeferred: true,
     _payloadBytes: payloadBytes,
     ...(head.content_sha256 ? { _payloadSha256: head.content_sha256 } : {}),
+    // OCV5-180 B1 — verified owner + logical run on the light locator so
+    // persist reconcile can place a >1MiB card before Range body hydration.
+    // Tape id/sha/ordinal stay the continuation's own Range/hash identity.
+    ...(typeof continuationOfTurnKey === "string" && continuationOfTurnKey.length > 0
+      ? { _continuationOfTurnKey: continuationOfTurnKey }
+      : {}),
+    ...(delegateRunId ? { _delegateRunId: delegateRunId } : {}),
   }, "exact_deferred", { ordinal: head.ordinal, exactBit: 0 });
 }
 
@@ -6007,6 +6032,8 @@ type UnifiedTimelineTapeHeader = {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  /** Verified continuation owner turn key (null for root tapes). */
+  continuationOfTurnKey: string | null;
   materializationStatus: string | null;
   finalizedAt: string | null;
   visibleHead: VisibleHead | null;
@@ -6182,9 +6209,11 @@ async function readUnifiedTimelineTapeHeaders(
       status: string;
       turn_key: string;
       client_message_id: string | null;
+      continuation_of_turn_key: string | null;
     }>(
       `SELECT t.tape_id,t.tape_sha256,t.billing_anchor_id,t.status,t.turn_key,
               COALESCE(t.client_message_id,d.client_message_id) AS client_message_id,
+              t.continuation_of_turn_key,
               t.materialization_status, t.finalized_at::text, t.visible_head
          FROM client_session_turn_tapes t
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
@@ -6201,6 +6230,7 @@ async function readUnifiedTimelineTapeHeaders(
     status: row.status,
     turnKey: row.turn_key,
     clientMessageId: row.client_message_id,
+    continuationOfTurnKey: row.continuation_of_turn_key,
     materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
     finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
     visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
@@ -6451,6 +6481,7 @@ async function readUnifiedTimelineBashTailAuxiliaries(
       window.header.tapeSha256,
       { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
       bigIntNum(head.payload_bytes, "turn tape timeline bash-tail payload bytes"),
+      { continuationOfTurnKey: window.header.continuationOfTurnKey },
     ),
     head,
     window,
@@ -6772,6 +6803,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         header.tapeSha256,
         { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
         payloadBytes,
+        { continuationOfTurnKey: header.continuationOfTurnKey },
       );
       deferred = mergeBillingAnchorUsage(deferred, anchor, isBillingAnchor);
       deferred = mergeExactUsage(deferred, enrichment, isBillingAnchor);

@@ -2848,6 +2848,41 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     vi.unstubAllGlobals();
     scroller.remove();
   });
+
+  test("deferred late-delegate card keeps owner after Range body expand", async () => {
+    const ownerTurn = "a".repeat(64);
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
+      mk("agent-group", {
+        id: "srv-late-agentgroup-dlg-late-1",
+        text: "晚到子任务正文",
+        _delegateRunId: "dlg-late-1",
+        _continuationOfTurnKey: ownerTurn,
+      }),
+    ]);
+    render(
+      <MessageRenderer
+        message={mk("agent-group", {
+          id: "srv-late-agentgroup-dlg-late-1",
+          text: "",
+          _payloadDeferred: true,
+          _payloadBytes: 1_100_000,
+          _turnTapeId: "late-tape",
+          _recordOrdinal: 0,
+          _continuationOfTurnKey: ownerTurn,
+          _delegateRunId: "dlg-late-1",
+          _turnKey: "c".repeat(64),
+        })}
+        sig="late-deferred"
+        isLast={false}
+        sending={false}
+        inActiveTurn={false}
+        cb={{ onFetchTapeRecordPayload }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(await screen.findByText("晚到子任务正文")).toBeInTheDocument();
+    expect(onFetchTapeRecordPayload).toHaveBeenCalled();
+  });
 });
 
 describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {

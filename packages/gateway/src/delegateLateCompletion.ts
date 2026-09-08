@@ -55,7 +55,8 @@ export function isValidDelegateOwnerLocator(
  * serializeLosslessTurnPayload's key ordering so the identity is stable
  * against irrelevant insertion-order differences. */
 export function canonicalAgentGroupBytes(group: DurableAgentGroup): Buffer {
-  const json = JSON.stringify(group, (_key, current) => {
+  const json = JSON.stringify(group, (key, current) => {
+    if (key === '_ocEventOrdinal') return undefined
     if (!current || typeof current !== 'object' || Array.isArray(current)) return current
     const sorted: Record<string, unknown> = {}
     for (const key of Object.keys(current as Record<string, unknown>).sort()) {

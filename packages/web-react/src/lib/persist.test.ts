@@ -1322,6 +1322,45 @@ describe("persist — late delegate agent-group owner merge (OCV5-180 B1)", () =
     expect(reconcileLateDelegateAgentGroups(merged)).toBe(merged);
   });
 
+  test(">1MiB deferred locator with verified owner relocates before T2", () => {
+    const t1: ChatMessage = {
+      id: "t1-assistant",
+      role: "assistant",
+      text: "T1",
+      ts: 1,
+      _turnKey: ownerTurn,
+      _timelineRecord: true,
+      _timelineUnitKey: "t1-assistant",
+      _orderSeq: 1,
+    };
+    const t2User: ChatMessage = {
+      id: "t2-user",
+      role: "user",
+      text: "T2",
+      ts: 10,
+      _timelineUnitKey: "t2-user",
+      _orderSeq: 10,
+    };
+    const deferred = lateCard({
+      id: "srv-late-agentgroup-dlg-late-1",
+      text: "",
+      _payloadDeferred: true,
+      _payloadBytes: 1_100_000,
+      _timelineUnitKey: "deferred-late",
+      _turnTapeId: "late-tape",
+      _recordOrdinal: 0,
+    });
+    const reconciled = reconcileLateDelegateAgentGroups([t1, t2User, deferred]);
+    expect(reconciled.map((m) => m.id)).toEqual([
+      "t1-assistant",
+      "srv-late-agentgroup-dlg-late-1",
+      "t2-user",
+    ]);
+    expect(reconciled[1]?._payloadDeferred).toBe(true);
+    expect(reconciled[1]?._continuationOfTurnKey).toBe(ownerTurn);
+    expect(reconcileLateDelegateAgentGroups(reconciled)).toBe(reconciled);
+  });
+
   test("reload: same runId on the owner turn drops the continuation duplicate", () => {
     const live: ChatMessage = {
       id: "live-dlg-1",

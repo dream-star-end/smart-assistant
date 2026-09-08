@@ -12771,6 +12771,7 @@ export class Gateway {
       },
     })
     if (gate.status !== 'ok') {
+      this._delegateOwnerByRunId?.delete(progressRunId)
       unregisterDelegation?.()
       const waitedS = gate.status === 'queue_full' ? 0 : Math.round(gate.waitedMs / 1000)
       let httpStatus: number
@@ -13580,25 +13581,25 @@ export class Gateway {
       // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
       ...(verdict ? { verdict } : {}),
     }
-    // OCV5-180 B1 — exact-owner 交付:owner turn 仍打开 → 内存缓冲(随 owner tape
-    // 正常 drain);owner 已 seal / 父会话不在内存 / owner 定位缺失之外的一切拒绝 →
-    // 持久晚到 continuation(原 owner 名下唯一一张卡)。无 locator(进度路由无
-    // webchat 目标)时保持旧降级:client-only 卡,不丢不重。
-    const ownerLocatorForCard = this._delegateOwnerByRunId?.get(progressRunId)
+    // OCV5-180 B1 — exact-owner 交付用本 invocation 冻结的 locator 闭包,
+    // 不把 FIFO Map 当归属权威。progressTarget 存在但 launch 未能冻结 owner
+    // 时不得 ownerless 写入当前(可能已是 T2) turn。
     const deliverDelegateGroupCard = (): void => {
       if (!progressTarget) return
-      if (!ownerLocatorForCard) {
-        this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+      if (!delegateOwnerLocator) {
+        this.log.warn('delegate card dropped: missing frozen owner locator', {
+          runId: progressRunId,
+        })
         return
       }
       const buffered = this.sessions.bufferPendingAgentGroup(
         progressTarget.sessionKey,
         durableGroup,
-        ownerLocatorForCard,
+        delegateOwnerLocator,
       )
       if (!buffered) {
         this.sessions.deliverLateDelegateAgentGroup({
-          owner: ownerLocatorForCard,
+          owner: delegateOwnerLocator,
           group: durableGroup,
           sessionKey: progressTarget.sessionKey,
         })

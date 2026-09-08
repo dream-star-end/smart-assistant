@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 import {
   executeTapeRequeueInTransaction,
@@ -7,6 +11,7 @@ import {
   loadTapeJobSnapshot,
   parseRequeueArgs,
   planLateDelegateContinuation,
+  planLateDelegateSnapshot,
   planTapeRequeue,
   resolveTapeIdentities,
   settlementJobMatchesTapeAuthority,
@@ -97,6 +102,102 @@ describe("requeue-failed-tape-jobs planner", () => {
     });
     assert.equal(cross.action, "manual_reconcile");
     assert.equal(cross.reason, "cross_session_locator");
+    const mixed = planLateDelegateContinuation({
+      tapeId: "tape-late",
+      sessionId: "sess-1",
+      group: {
+        runId: "dlg-1",
+        engineBillings: [
+          billing,
+          { ...billing, parentTurnKey: "c".repeat(64), requestId: "e".repeat(32) },
+        ],
+      },
+      root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+    });
+    assert.equal(mixed.action, "manual_reconcile");
+    assert.equal(mixed.reason, "mixed_billing_locators");
+    assert.equal(mixed.requestIds.length, 2);
+    assert.equal(mixed.billingLocators.length, 2);
+  });
+
+  test("snapshot planner emits missing/unchecked instead of empty plans[]", () => {
+    const owner = "b".repeat(64);
+    const plans = planLateDelegateSnapshot({
+      snapshot: {
+        tapes: [{
+          tapeId: "tape-present",
+          sessionId: "sess-1",
+          turnKey: "c".repeat(64),
+          inspected: false,
+          groups: [{
+            runId: "dlg-1",
+            engineBillings: [{
+              requestId: "d".repeat(32),
+              parentTurnKey: owner,
+              parentSessionId: "sess-1",
+            }],
+          }],
+          root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+        }],
+      },
+      tapeIds: ["tape-missing", "tape-present"],
+    });
+    assert.equal(plans.length, 2);
+    assert.equal(plans[0]?.reason, "snapshot_tape_missing");
+    assert.equal(plans[1]?.reason, "snapshot_not_inspected");
+    assert.notEqual(plans.length, 0);
+  });
+
+  test("CLI snapshot path prints per-group plans and refuses execute", () => {
+    const dir = join(tmpdir(), `ocv5-180-b1-planner-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const snapshotPath = join(dir, "snapshot.json");
+    const owner = "b".repeat(64);
+    writeFileSync(snapshotPath, JSON.stringify({
+      tapes: [{
+        tapeId: "audit-selected-tape",
+        sessionId: "sess-1",
+        turnKey: "c".repeat(64),
+        groups: [{
+          runId: "dlg-1",
+          engineBillings: [{
+            requestId: "d".repeat(32),
+            parentTurnKey: owner,
+            parentSessionId: "sess-1",
+          }],
+        }],
+        root: { sessionId: "sess-1", turnKey: owner, finalized: true },
+      }],
+    }));
+    const runCli = (args: string[]) =>
+      spawnSync("npx", ["--no-install", "tsx", "scripts/ops/requeue-failed-tape-jobs.ts", ...args], {
+        encoding: "utf8",
+        cwd: process.cwd(),
+        env: { ...process.env, HOME: dir, OPENCLAUDE_HOME: dir },
+      });
+    const missing = runCli(["--plan-late-delegate-continuations", "--tape", "audit-selected-tape"]);
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /missing --snapshot/);
+    const execute = runCli([
+      "--plan-late-delegate-continuations",
+      "--snapshot",
+      snapshotPath,
+      "--execute",
+    ]);
+    assert.equal(execute.status, 2);
+    const ok = runCli([
+      "--plan-late-delegate-continuations",
+      "--snapshot",
+      snapshotPath,
+      "--tape",
+      "audit-selected-tape",
+    ]);
+    assert.equal(ok.status, 0, ok.stderr);
+    const body = JSON.parse(ok.stdout) as { plans: Array<{ action: string; groupRunId: string; requestIds: string[] }> };
+    assert.equal(body.plans.length, 1);
+    assert.equal(body.plans[0]?.action, "continuation");
+    assert.equal(body.plans[0]?.groupRunId, "dlg-1");
+    assert.equal(body.plans[0]?.requestIds.length, 1);
   });
 
   test("stage 1 requeues materialization; stage 2 skips when settlement is unverified", () => {

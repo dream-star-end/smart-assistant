@@ -1280,6 +1280,17 @@ export interface CronBridgeEvent {
  *                不占 cap),与"没落盘不消耗预算"语义一致。仅 legacy 分支产生。 */
 type TapePersistResult = 'acked' | 'queued' | 'dropped' | 'skipped'
 
+/** OCV5-180 B1 — shared exact-owner logical-run record. `inflight` is not
+ * durable: a dropped (non-queued) persist must delete it so the same frozen
+ * payload can retry. `queued`/`acked` are durable; `session_deleted` is
+ * terminal and must not resurrect. */
+type ExactOwnerRunState = 'buffered' | 'inflight' | 'queued' | 'acked' | 'session_deleted'
+
+interface ExactOwnerRunRecord {
+  identity: string
+  state: ExactOwnerRunState
+}
+
 /**
  * Persist the authoritative server-authored assistant text for a turn.
  *
@@ -1427,6 +1438,8 @@ function persistServerAuthoredTurnOutcome(args: {
    * co-located with the immutable turn tape so a bridge disconnect or
    * bounded outbound-ring eviction cannot erase the only settle evidence. */
   engineBilling?: EngineBillingEvent
+  /** OCV5-180 B1 — fatal drop reason (stageDurable throw / 410 session_deleted). */
+  onDroppedReason?: (reason: string) => void
 }): Promise<TapePersistResult> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -1506,6 +1519,7 @@ function persistServerAuthoredTurnOutcome(args: {
           status: args.status,
           reason: outcome.droppedReason,
         })
+        args.onDroppedReason?.(outcome.droppedReason)
         return 'dropped'
       })
       .catch((err): TapePersistResult => {
@@ -1521,6 +1535,7 @@ function persistServerAuthoredTurnOutcome(args: {
           },
           err,
         )
+        args.onDroppedReason?.(err instanceof Error ? err.message : String(err))
         return 'dropped'
       })
   }
@@ -1753,19 +1768,22 @@ function persistPostTerminalAgentGroup(args: {
   sessionKey: string
   owner: DelegateOwnerTurnLocator
   group: DurableAgentGroup
+  onDroppedReason?: (reason: string) => void
 }): Promise<TapePersistResult> {
-  return persistServerAuthoredTurnOutcome(
-    buildLateDelegateContinuationArgs({
+  return persistServerAuthoredTurnOutcome({
+    ...buildLateDelegateContinuationArgs({
       owner: args.owner,
       group: args.group,
       sessionKey: args.sessionKey,
     }),
-  ).catch((err): TapePersistResult => {
+    onDroppedReason: args.onDroppedReason,
+  }).catch((err): TapePersistResult => {
     log.error(
       'post-terminal agent-group persist threw',
       { sessionKey: args.sessionKey, runId: args.group.runId },
       err as Error,
     )
+    args.onDroppedReason?.(err instanceof Error ? err.message : String(err))
     return 'dropped'
   })
 }
@@ -1923,10 +1941,10 @@ export interface PromptQueueExecutionFence {
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
-  /** OCV5-180 B1 — `${ownerTurnKey}\0${runId}` → late-completion identity。
-   *  同一逻辑 run 只允许一张晚到卡:同 identity 重投幂等 no-op,不同内容留证
-   *  (late_delegate_group_conflict)不二写。有界 LRU(cap 256)。 */
-  private _lateDelegateGroupIdentities = new Map<string, string>()
+  /** OCV5-180 B1 — `${ownerTurnKey}\0${runId}` → exact-owner logical-run
+   *  状态(buffer / drain-seal / late 共用)。同内容唯一、异内容冲突可见;
+   *  inflight 不是 durable。有界 LRU(cap 256)。 */
+  private _exactOwnerRuns = new Map<string, ExactOwnerRunRecord>()
   /** Per-sessionKey mutex around getOrCreate so two concurrent turns cannot
    *  each replace the runner and --resume the same Cursor SQLite store. */
   private _sessionCreateGates = new Map<string, Promise<void>>()
@@ -6476,6 +6494,7 @@ export class SessionManager {
                   ? { engineBilling: terminalEngineBilling }
                   : {}),
               })
+              if (turnKey) this._settleDrainedOwnerGroups(session, turnKey, partialAgentGroups, partialOutcome)
               persistenceAcknowledged = partialOutcome === 'acked' || partialOutcome === 'skipped'
               // 同 finalizeTurn 主路径:降级投递仅限个人版本地 outbox;商用 v3
               // sink 的 queued 保持静默(master ACK 权威,契约测试锁此语义)。
@@ -7302,6 +7321,9 @@ export class SessionManager {
                 : {}),
             })
             const persistence = persistenceOutcome.then((r) => r === 'acked' || r === 'skipped')
+            this._trackPersistence(persistenceOutcome.then((r) => {
+              if (turnKey) this._settleDrainedOwnerGroups(session, turnKey, completedAgentGroups, r)
+            }))
             this._trackPersistence(persistence)
             // Do not declare the paid turn complete until master has
             // durably finalized the immutable tape. A queued local spool is
@@ -7618,6 +7640,9 @@ export class SessionManager {
       if (parent.peerId !== owner.parentSessionId) return false
       if (parent._currentTurnKey !== owner.parentTurnKey) return false
       if (parent._sealedOwnerTurnKeys?.has(owner.parentTurnKey)) return false
+      const admission = this._admitExactOwnerRun(owner, group, 'buffered')
+      if (admission === 'conflict' || admission === 'session_deleted') return false
+      if (admission === 'duplicate') return true
     }
     ;(parent._pendingAgentGroups ??= []).push({
       group: {
@@ -7658,6 +7683,9 @@ export class SessionManager {
       else keep.push(entry)
     }
     session._pendingAgentGroups = keep.length > 0 ? keep : undefined
+    if (take.length > 0) {
+      this._claimDrainedOwnerGroups(session, turnKey, take)
+    }
     return take
   }
 
@@ -7690,39 +7718,147 @@ export class SessionManager {
         return false
       }
     }
-    const conflictKey = `${args.owner.parentTurnKey}\0${args.group.runId}`
-    const identity = lateDelegateGroupIdentity(args.owner, args.group)
-    const seen = this._lateDelegateGroupIdentities.get(conflictKey)
-    if (seen !== undefined) {
-      if (seen !== identity) {
-        log.warn('late_delegate_group_conflict: same run with different content', {
-          runId: args.group.runId,
-          ownerTurnKey: args.owner.parentTurnKey,
-        })
-        return false
+    const conflictKey = this._exactOwnerRunKey(args.owner.parentTurnKey, args.group.runId)
+    const admission = this._admitExactOwnerRun(args.owner, args.group, 'inflight')
+    if (admission === 'conflict') {
+      log.warn('late_delegate_group_conflict: same run with different content', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      })
+      return false
+    }
+    if (admission === 'session_deleted') {
+      log.warn('late delegate group dropped: session_deleted', {
+        runId: args.group.runId,
+      })
+      return false
+    }
+    if (admission === 'duplicate') {
+      const seen = this._exactOwnerRuns.get(conflictKey)
+      if (seen?.state === 'inflight' || seen?.state === 'queued' || seen?.state === 'acked' || seen?.state === 'buffered') {
+        return true
       }
       return true
     }
-    this._lateDelegateGroupIdentities.set(conflictKey, identity)
-    if (this._lateDelegateGroupIdentities.size > 256) {
-      const oldest = this._lateDelegateGroupIdentities.keys().next().value
-      if (oldest !== undefined) this._lateDelegateGroupIdentities.delete(oldest)
-    }
+    let droppedReason = ''
     const persistence = persistPostTerminalAgentGroup({
       sessionKey: args.sessionKey ?? args.owner.parentSessionId,
       owner: args.owner,
       group: args.group,
+      onDroppedReason: (reason) => {
+        droppedReason = reason
+      },
     })
     this._trackPersistence(persistence.then(() => undefined))
     void persistence.then((outcome) => {
-      if (outcome === 'dropped') {
-        log.warn('late delegate group persist dropped', {
+      const rec = this._exactOwnerRuns.get(conflictKey)
+      if (!rec || rec.identity !== lateDelegateGroupIdentity(args.owner, args.group)) return
+      if (outcome === 'acked') {
+        rec.state = 'acked'
+        return
+      }
+      if (outcome === 'queued') {
+        rec.state = 'queued'
+        return
+      }
+      if (/session_deleted/i.test(droppedReason)) {
+        rec.state = 'session_deleted'
+        log.warn('late delegate group persist session_deleted', {
           runId: args.group.runId,
           ownerTurnKey: args.owner.parentTurnKey,
         })
+        return
       }
+      this._exactOwnerRuns.delete(conflictKey)
+      log.warn('late delegate group persist dropped', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+        reason: droppedReason || outcome,
+      })
     })
     return true
+  }
+
+  private _exactOwnerRunKey(ownerTurnKey: string, runId: string): string {
+    return `${ownerTurnKey}\0${runId}`
+  }
+
+  private _trimExactOwnerRuns(): void {
+    while (this._exactOwnerRuns.size > 256) {
+      const oldest = this._exactOwnerRuns.keys().next().value
+      if (oldest === undefined) break
+      this._exactOwnerRuns.delete(oldest)
+    }
+  }
+
+  private _ownerLocatorForSession(
+    session: AgentSession,
+    turnKey: string,
+  ): DelegateOwnerTurnLocator {
+    return {
+      parentSessionId: session.peerId,
+      parentTurnKey: turnKey,
+      turnIndex:
+        session._currentTurnIndex ??
+        (Number.isSafeInteger(session.turns) ? Math.max(1, session.turns) : 1),
+    }
+  }
+
+  /** Shared exact-owner logical-run admission for buffer / drain / late. */
+  private _admitExactOwnerRun(
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+    next: ExactOwnerRunState,
+  ): 'accept' | 'duplicate' | 'conflict' | 'session_deleted' {
+    const key = this._exactOwnerRunKey(owner.parentTurnKey, group.runId)
+    const identity = lateDelegateGroupIdentity(owner, group)
+    const seen = this._exactOwnerRuns.get(key)
+    if (!seen) {
+      this._exactOwnerRuns.set(key, { identity, state: next })
+      this._trimExactOwnerRuns()
+      return 'accept'
+    }
+    if (seen.identity !== identity) return 'conflict'
+    if (seen.state === 'session_deleted') return 'session_deleted'
+    return 'duplicate'
+  }
+
+  private _claimDrainedOwnerGroups(
+    session: AgentSession,
+    turnKey: string,
+    groups: DurableAgentGroup[],
+  ): void {
+    const owner = this._ownerLocatorForSession(session, turnKey)
+    if (!isValidDelegateOwnerLocator(owner)) return
+    for (const group of groups) {
+      const key = this._exactOwnerRunKey(turnKey, group.runId)
+      const identity = lateDelegateGroupIdentity(owner, group)
+      const seen = this._exactOwnerRuns.get(key)
+      if (seen && seen.identity !== identity) continue
+      this._exactOwnerRuns.set(key, { identity, state: 'inflight' })
+    }
+    this._trimExactOwnerRuns()
+  }
+
+  private _settleDrainedOwnerGroups(
+    session: AgentSession,
+    turnKey: string,
+    groups: DurableAgentGroup[],
+    outcome: TapePersistResult,
+  ): void {
+    const owner = this._ownerLocatorForSession(session, turnKey)
+    for (const group of groups) {
+      const key = this._exactOwnerRunKey(turnKey, group.runId)
+      const rec = this._exactOwnerRuns.get(key)
+      if (!rec) continue
+      if (isValidDelegateOwnerLocator(owner) && rec.identity !== lateDelegateGroupIdentity(owner, group)) {
+        continue
+      }
+      if (outcome === 'acked') rec.state = 'acked'
+      else if (outcome === 'queued') rec.state = 'queued'
+      else if (outcome === 'skipped') rec.state = 'acked'
+      else this._exactOwnerRuns.delete(key)
+    }
   }
 
   /** OCV5-180 B1 — mark an owner turn sealed (payload frozen). Insertion-order

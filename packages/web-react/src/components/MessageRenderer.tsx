@@ -630,6 +630,9 @@ function DeferredTapeRecordCard({
                 _historyPageLoadedFrom: message._historyPageLoadedFrom,
                 _historyPageKey: message._historyPageKey,
                 _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+                _continuationOfTurnKey: record._continuationOfTurnKey ?? message._continuationOfTurnKey,
+                _delegateRunId: record._delegateRunId ?? message._delegateRunId,
+                _turnKey: record._turnKey ?? message._turnKey,
               };
           const final = isLast && index === records.length - 1;
           const recordIsFinalAssistant = turnFinalAssistant === true &&
