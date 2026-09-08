@@ -19,40 +19,93 @@ const expected = [
   'OCV5-187 browser paper hint stays before admission even with forged cron-origin fields',
 ];
 
-async function verifyEvents() {
+function collectProofEvents(stream) {
   const passed = [];
   const failures = [];
-  let summary;
-  const stream = run({
-    files: [join(root, 'packages/commercial/src/__tests__/modelAuthorityBridge.test.ts')],
-    execArgv: ['--import', 'tsx'],
-    testNamePatterns: ['OCV5-187'],
-    concurrency: false,
-    forceExit: true,
-    timeout: 30_000,
-  });
-  for await (const event of stream) {
+  const counts = new Map();
+  let filteredSkips = 0;
+  let leaves = 0;
+  let suites = 0;
+  let topResults = 0;
+  let topPlan;
+  let ended = false;
+  const consume = (event) => {
     const data = event.data;
     if (event.type === 'test:stdout' || event.type === 'test:stderr') {
       process.stderr.write(data.message);
     } else if (event.type === 'test:fail') {
       failures.push(data.name);
       console.error(data.details?.error ?? data);
-    } else if (event.type === 'test:pass' && data.details?.type !== 'suite') {
-      assert.ok(!data.skip && !data.todo, 'proof cannot skip/todo: ' + data.name);
-      passed.push(data.name);
-    } else if (event.type === 'test:summary' && data.file === undefined) {
-      assert.equal(summary, undefined, 'duplicate final summary');
-      summary = data;
+    } else if (event.type === 'test:pass') {
+      if (data.nesting === 0) topResults++;
+      if (data.details?.type === 'suite') {
+        suites++;
+        assert.ok(!data.skip && !data.todo, 'proof suite cannot skip/todo: ' + data.name);
+        return;
+      }
+      // Node20 omits details.type on leaves and emits excluded tests as skips.
+      leaves++;
+      assert.ok(!data.todo, 'proof cannot contain todo: ' + data.name);
+      if (expected.includes(data.name)) {
+        assert.ok(!data.skip, 'selected proof cannot skip: ' + data.name);
+        passed.push(data.name);
+      } else {
+        assert.ok(!data.name.includes('OCV5-187'), 'unexpected selected proof: ' + data.name);
+        assert.equal(data.skip, 'test name does not match pattern', 'unexpected executed/non-filtered test: ' + data.name);
+        filteredSkips++;
+      }
+    } else if (event.type === 'test:plan' && data.nesting === 0) {
+      assert.equal(topPlan, undefined, 'duplicate root plan');
+      assert.ok(Number.isSafeInteger(data.count) && data.count > 0, 'invalid root plan');
+      topPlan = data.count;
+    } else if (event.type === 'test:diagnostic' && data.nesting === 0) {
+      const match = /^(tests|suites|pass|fail|cancelled|skipped|todo) (\d+)$/.exec(data.message);
+      if (!match) return;
+      const [, key, raw] = match;
+      assert.ok(!counts.has(key), 'duplicate runner count: ' + key);
+      assert.ok(Number.isSafeInteger(Number(raw)), 'invalid runner count: ' + key);
+      counts.set(key, Number(raw));
     }
-  }
-  assert.deepEqual(failures, [], 'WS behavior failed');
-  assert.deepEqual(passed.sort(), [...expected].sort(), 'exactly four named proof cases must run once');
-  assert.ok(summary?.success, 'complete successful test summary required');
-  for (const [key, value] of Object.entries({ tests: 4, passed: 4, failed: 0, cancelled: 0, skipped: 0, todo: 0 })) {
-    assert.equal(summary.counts[key], value, 'proof summary ' + key);
-  }
-  console.log(title + ' PASS cases=4');
+  };
+  // Consume the whole stream before judging it. forceExit/early iterator throws
+  // can discard the actual loader/assertion diagnostic and leave only exit=1.
+  return new Promise((resolve, reject) => {
+    stream.on('data', (event) => {
+      try { consume(event); } catch (error) {
+        failures.push(error.message);
+        console.error(error);
+      }
+    });
+    stream.once('error', reject);
+    stream.once('end', () => { ended = true; });
+    stream.once('close', () => {
+      try {
+        assert.ok(ended, 'proof stream closed before natural end');
+        assert.deepEqual(failures, [], 'WS behavior/event validation failed');
+        assert.deepEqual(passed.sort(), [...expected].sort(), 'exactly four named proof cases must run once');
+        assert.equal(topPlan, topResults, 'complete root plan must match final root results');
+        assert.ok(topPlan > 0, 'root plan required');
+        assert.equal(leaves, expected.length + filteredSkips, 'leaf accounting mismatch');
+        for (const [key, value] of Object.entries({ tests: leaves, suites, pass: 4, fail: 0,
+          cancelled: 0, skipped: filteredSkips, todo: 0 })) {
+          assert.equal(counts.get(key), value, 'runner count ' + key);
+        }
+        resolve({ runnerTests: leaves, filteredSkips });
+      } catch (error) { reject(error); }
+    });
+  });
+}
+
+async function verifyEvents() {
+  const result = await collectProofEvents(run({
+    files: [join(root, 'packages/commercial/src/__tests__/modelAuthorityBridge.test.ts')],
+    testNamePatterns: ['OCV5-187'],
+    concurrency: false,
+    forceExit: false,
+    timeout: 30_000,
+  }));
+  console.log(title + ` PASS selected=4 selectedSkip=0 runnerTests=${result.runnerTests}`
+    + ` filteredSkips=${result.filteredSkips} node=${process.version}`);
 }
 
 async function supervise() {
@@ -80,7 +133,7 @@ async function supervise() {
   process.on('SIGTERM', stop);
   try {
     child = spawn('bash', [join(root, 'scripts/test-mutex.sh'), 'commercial',
-      `${quote(process.execPath)} ${quote(fileURLToPath(import.meta.url))} --worker`], {
+      `${quote(process.execPath)} --import tsx ${quote(fileURLToPath(import.meta.url))} --worker`], {
       cwd: root, detached: true, stdio: 'inherit',
       // Do not inherit production DB/PG*, Redis, model keys, proxies, runtime
       // flags or NODE_OPTIONS/NODE_PATH. The CCB fixture can query global billing.
