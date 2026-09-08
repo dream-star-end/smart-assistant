@@ -6,6 +6,7 @@ import {
   reopenPermissionUi,
   resetPermissionPopupCoordinator,
   shouldAutoOpenPermission,
+  yieldActiveModal,
 } from "./permissionPopupCoordinator";
 
 afterEach(() => {
@@ -40,5 +41,12 @@ describe("permissionPopupCoordinator", () => {
 
   test("non-live prompts never auto-open", () => {
     expect(shouldAutoOpenPermission({ requestId: "hist", livePrompt: false })).toBe(false);
+  });
+
+  test("yielding a settled modal lets the next request auto-open", () => {
+    markPermissionDisplayed("first");
+    expect(shouldAutoOpenPermission({ requestId: "second", livePrompt: true })).toBe(false);
+    yieldActiveModal("first");
+    expect(shouldAutoOpenPermission({ requestId: "second", livePrompt: true })).toBe(true);
   });
 });

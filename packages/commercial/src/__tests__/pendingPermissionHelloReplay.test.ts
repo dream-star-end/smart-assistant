@@ -16,6 +16,8 @@ import {
   PERMISSION_PROMPT_READ_TIMEOUT_MS,
   PERMISSION_PROMPT_SNAPSHOT_LIMIT,
   classifyPermissionInput,
+  permissionReadKind,
+  queryPermissionRead,
   parsePermissionLookupIds,
   pendingPermissionPromptToFrame,
   readPendingPermissionPrompts,
@@ -592,6 +594,55 @@ describe('250ms statement timeout on real pools', () => {
     await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId: PEER_ID })
     assert.equal(PERMISSION_PROMPT_READ_TIMEOUT_MS, 250)
     assert.ok(sqls.some((sql) => /SET LOCAL statement_timeout = 250/.test(sql)))
+  })
+
+  test('borrowed PoolClient is not reconnected or committed', async () => {
+    const sqls: string[] = []
+    let connects = 0
+    const client = {
+      async connect() {
+        connects += 1
+        throw new Error('Client has already been connected. You cannot reuse a client.')
+      },
+      async query(sql: string) {
+        sqls.push(sql)
+        if (/SHOW statement_timeout/.test(sql)) {
+          return { rows: [{ statement_timeout: '0' }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      },
+      release() {
+        throw new Error('must not release caller transaction')
+      },
+    }
+    assert.equal(permissionReadKind(client), 'borrowed')
+    await readPermissionPromptSnapshot(client as unknown as Pool, { userId: 3n, sessionId: PEER_ID })
+    assert.equal(connects, 0)
+    assert.ok(sqls.some((sql) => /SAVEPOINT oc_perm_r_/.test(sql)))
+    assert.ok(sqls.some((sql) => /SET LOCAL statement_timeout = 250/.test(sql)))
+    assert.equal(sqls.some((sql) => sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK'), false)
+  })
+
+  test('queryPermissionRead on borrowed client restores timeout after failure', async () => {
+    const sqls: string[] = []
+    const client = {
+      async query(sql: string) {
+        sqls.push(sql)
+        if (/SHOW statement_timeout/.test(sql)) {
+          return { rows: [{ statement_timeout: '30s' }], rowCount: 1 }
+        }
+        if (/FROM turn_permission_requests/.test(sql)) {
+          throw new Error('57014 canceling statement due to statement timeout')
+        }
+        return { rows: [], rowCount: 0 }
+      },
+      release() {},
+    }
+    await assert.rejects(
+      () => queryPermissionRead(client, 'SELECT 1 FROM turn_permission_requests', []),
+    )
+    assert.ok(sqls.some((sql) => /ROLLBACK TO SAVEPOINT/.test(sql)))
+    assert.ok(sqls.some((sql) => sql.includes("SET LOCAL statement_timeout = '30s'")))
   })
 })
 
