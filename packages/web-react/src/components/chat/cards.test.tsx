@@ -336,6 +336,20 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     );
   });
 
+  test("cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试", () => {
+    const onStartNewSession = vi.fn();
+    renderErr(errMsg({ _errorCode: "session_deleted", _clientMessageId: "u1" }), {
+      onStartNewSession,
+      onRetrySend: vi.fn(),
+      onRegenerate: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "新建会话继续" }));
+    expect(onStartNewSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
+
   test("cta=new_session(context_too_long)→「新建会话继续」导航按钮,无重试类按钮", () => {
     const onStartNewSession = vi.fn();
     renderErr(errMsg({ _errorCode: "context_too_long", _clientMessageId: "u1" }), {

@@ -1911,11 +1911,19 @@ function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
   return { peerId, clientMessageId };
 }
 
+const SESSION_DELETED_WIRE_MESSAGE =
+  "This conversation was deleted. Start a new one; retrying here will not bring it back.";
+
 function sendErrorFrame(
   ws: WebSocket,
   code: string,
   message: string,
-  turn?: { peerId?: string | null; clientMessageId?: string | null },
+  turn?: {
+    peerId?: string | null;
+    clientMessageId?: string | null;
+    retryable?: boolean;
+    action?: string;
+  },
 ): void {
   if (ws.readyState !== WebSocket.OPEN) return;
   try {
@@ -1925,9 +1933,22 @@ function sendErrorFrame(
       message,
       ...(turn?.peerId ? { peer: { id: turn.peerId, kind: "dm" } } : {}),
       ...(turn?.clientMessageId ? { clientMessageId: turn.clientMessageId } : {}),
+      ...(turn?.retryable === false || turn?.retryable === true ? { retryable: turn.retryable } : {}),
+      ...(turn?.action ? { action: turn.action } : {}),
     }));
   }
   catch { /* client gone */ }
+}
+
+function sendSessionDeletedFrame(
+  ws: WebSocket,
+  turn: { peerId?: string | null; clientMessageId?: string | null },
+): void {
+  sendErrorFrame(ws, "SESSION_DELETED", SESSION_DELETED_WIRE_MESSAGE, {
+    ...turn,
+    retryable: false,
+    action: "new_session",
+  });
 }
 
 /**
@@ -4655,8 +4676,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 { peerId, clientMessageId },
               );
               return null;
-            case "session_not_found":
             case "session_deleted":
+              turnLog?.warn("user-chat-bridge: dispatch admission session deleted", {
+                sessionId: peerId, clientMessageId, kind: admit.kind,
+              });
+              sendSessionDeletedFrame(userWs, { peerId, clientMessageId });
+              return null;
+            case "session_not_found":
             case "append_error":
               turnLog?.warn("user-chat-bridge: dispatch admission unavailable", {
                 sessionId: peerId, clientMessageId, kind: admit.kind,
@@ -4664,7 +4690,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(
                 userWs, "SESSION_PERSIST_UNAVAILABLE",
                 "user message could not be durably admitted; retry safely",
-                { peerId, clientMessageId },
+                { peerId, clientMessageId, retryable: true },
               );
               return null;
             default: {
@@ -4704,18 +4730,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
           if (!persisted) {
-            onReject?.("SESSION_PERSIST_UNAVAILABLE");
+            const deleted = lastReason === "session_deleted";
+            onReject?.(deleted ? "SESSION_DELETED" : "SESSION_PERSIST_UNAVAILABLE");
             turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
               sessionId: peerId,
               clientMessageId,
               reason: lastReason,
             });
-            sendErrorFrame(
-              userWs,
-              "SESSION_PERSIST_UNAVAILABLE",
-              "user message could not be durably admitted; retry safely",
-              { peerId, clientMessageId },
-            );
+            if (deleted) {
+              sendSessionDeletedFrame(userWs, { peerId, clientMessageId });
+            } else {
+              sendErrorFrame(
+                userWs,
+                "SESSION_PERSIST_UNAVAILABLE",
+                "user message could not be durably admitted; retry safely",
+                { peerId, clientMessageId, retryable: true },
+              );
+            }
             return null;
           }
         }
