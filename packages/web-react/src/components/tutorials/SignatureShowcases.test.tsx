@@ -1,10 +1,11 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SIGNATURE_WORKS, signatureTask } from '../../lib/tutorialSignatureWorks'
 import { TUTORIAL_CASE_BY_ID } from '../../lib/tutorialCaseCatalog'
 import { SignatureGallery, SignatureDetail } from './SignatureShowcases'
-afterEach(cleanup)
+beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn() })
+afterEach(() => { cleanup(); vi.restoreAllMocks() })
 describe('signature works', () => {
   it('opens the real selected work instead of inventing a tutorial case id', () => {
     const select = vi.fn()
@@ -33,5 +34,15 @@ describe('signature works', () => {
     const before=original.starterPrompt
     for(const work of SIGNATURE_WORKS){expect(signatureTask(work).replay.status).toBe('pending_capture');expect(signatureTask(work).starterPrompt).not.toBe(before)}
     expect(original.starterPrompt).toBe(before)
+  })
+  it('does not steal focus when no restore target is provided', () => {
+    render(<SignatureGallery onSelect={vi.fn()} />)
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[0].action })).not.toHaveFocus()
+  })
+  it('focuses only the restore-target work button via its own ref', () => {
+    render(<SignatureGallery onSelect={vi.fn()} restoreFocusWorkId="gravity" />)
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[1].action })).toHaveFocus()
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[0].action })).not.toHaveFocus()
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled()
   })
 })
