@@ -3602,7 +3602,8 @@
       "symptom": "只读 live-frame 分类与业务健康在 connect 拒绝或卡住时会整份诊断抛错或无界等待，发布/运维必需检查因此被阻断。本包用 bounded helper（JS deadline + BEGIN READ ONLY + SET LOCAL statement_timeout）覆盖 acquisition/query，timeout/unknown 带 null 计数不得伪 0，按需 CLI 不进热 tick 与 /healthz.ok；model_pricing_0903_cw_backup 永久账本。影响是诊断整体不可用或检查挂起，不是已证实的线上资损或备份恢复失败。",
       "rootFixCommit": "3ec290e1",
       "coverageCommits": [
-        "5f736b0f"
+        "5f736b0f",
+        "b569969d"
       ],
       "regressions": [
         {
