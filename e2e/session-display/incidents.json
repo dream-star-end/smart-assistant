@@ -143,7 +143,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T1 点「+」→「添加附件」→ filechooser 真实弹出"
+          "assertion": "T1 点工具条回形针「添加附件」→ filechooser 真实弹出"
         },
         {
           "layer": "browser",
@@ -3730,6 +3730,63 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260908-LATE-DELEGATE-OWNER executed exact-owner seal, durable retry, root records, origin stamp and read-only planner"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260907-PERMISSION-ROOTFIX",
+      "occurredAt": "2026-09-07",
+      "severity": "P1",
+      "symptom": "提问/计划弹窗在 hello 与会话打开后断档：首帧丢失无卡可答，跨端已答仍弹，长输入被 8KiB 摘要毁掉可作答权威，Stop 后 GET/lookup 仍把普通权限当可答。responded 只表示控制受理不是工具已执行。",
+      "rootFixCommit": "12f7c30b",
+      "coverageCommits": [
+        "5a3f01b4",
+        "9fce39ef",
+        "98176566",
+        "b6f2e0e3",
+        "56146fa9",
+        "42b803ee"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pendingPermissionHelloReplay.test.ts",
+          "assertion": "CJK payload over 8192 UTF-8 bytes is truncated even if JS length is smaller"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pendingPermissionHelloReplay.test.ts",
+          "assertion": "Q1: 32 selected sessions squeezed by 64-row page are uncovered for GET refill"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/permissionReconcile.test.ts",
+          "assertion": "responded without behavior does not infer allow"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PermissionCard.test.tsx",
+          "assertion": "Host 两个 pending 只开一个可见 modal，切卡不发 permission_response"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/permissionPromptSnapshotExplain.integ.test.ts",
+          "assertion": "B4 Stop then late persist: hello/GET/lookup hide ordinary pending, keep detached ask-user"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/permissionTimelineGet.integ.test.ts",
+          "assertion": "borrowed-client 250ms timeout rolls back to savepoint; outer txn still commits"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
+          "assertion": "T5 two pending show exactly one dialog; dock[0] then dock[1] are different requests"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
+          "assertion": "T3 background does not mark displayed; after foreground close can reopen"
         }
       ]
     }

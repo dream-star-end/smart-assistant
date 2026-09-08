@@ -308,6 +308,65 @@ describe("useSessionList 新建会话", () => {
 });
 
 describe("useSessionList history loading fence", () => {
+  for (const agentId of ["main", "research-assistant"]) {
+    for (const status of ["pending", "responded"] as const) {
+      test(`permission recovery: empty incremental GET and tape reload forward ${agentId}/${status}`, async () => {
+        const id = "webpermission185";
+        const snapshot: NonNullable<SessionDetail["permissionPrompts"]> = {
+          source: "pg",
+          completeness: "complete",
+          items: [{
+            requestId: "permission-185",
+            clientMessageId: "turn-185",
+            toolUseId: "tool-185",
+            toolName: "AskUserQuestion",
+            inputJson: { questions: [{ question: "Continue?" }] },
+            status,
+            behavior: status === "responded" ? "allow" : null,
+            reason: null,
+            answers: null,
+            expiresAt: Date.now() + 60_000,
+            createdAt: 1,
+            updatedAt: 2,
+          }],
+        };
+        vi.spyOn(api, "listSessions").mockResolvedValue([]);
+        const getSession = vi.spyOn(api, "getSession")
+          .mockResolvedValueOnce({ ...detail(id), agentId, isPartial: true, permissionPrompts: snapshot })
+          .mockResolvedValueOnce({ ...detail(id), agentId, permissionPrompts: snapshot });
+        const mergeServerHistory = vi.fn();
+        const socket = {
+          storedMaxSeq: () => 10,
+          storedHistoryRevision: () => 1,
+          mergeServerHistory,
+          hydrateDurableLiveFrameJournal: vi.fn(async (
+            _id: string, _frames: unknown, reloadTape: () => Promise<void>,
+          ) => reloadTape()),
+        } as unknown as UseChatSocket;
+        const auth = createMemoryAuthSession(() => {}, "token");
+        const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+        const { result } = renderHook(() => useSessionList({
+          demo: false, auth, authSession: auth, user, agentId,
+          sockRef: { current: socket },
+          confirmDialog: async () => true,
+          promptText: async () => null,
+          clearChatError: () => {},
+          onNewSessionReset: () => {},
+          onActiveSessionDeleted: () => {},
+        }));
+        act(() => result.current.selectSession(id));
+        await waitFor(() => expect(mergeServerHistory).toHaveBeenCalledTimes(2));
+        expect(getSession.mock.calls[0][2]).toBe(10);
+        expect(mergeServerHistory).toHaveBeenNthCalledWith(1, expect.objectContaining({
+          sessId: id, agentId, messages: [], full: false, permissionPrompts: snapshot,
+        }));
+        expect(mergeServerHistory).toHaveBeenNthCalledWith(2, expect.objectContaining({
+          sessId: id, agentId, messages: [], full: true, permissionPrompts: snapshot,
+        }));
+      });
+    }
+  }
+
   test("reset 前的同 ID 请求完成时不能清掉 reset 后的新请求", async () => {
     const first = deferred<SessionDetail>();
     const second = deferred<SessionDetail>();

@@ -2330,6 +2330,93 @@ export function _pendingPermissionCatchupFrames(
   return frames
 }
 
+const PERMISSION_LOOKUP_MAX_IDS = 16
+
+export function parsePermissionLookupQuery(raw: string | null | undefined): string[] {
+  if (typeof raw !== 'string' || raw === '') return []
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const part of raw.split(',')) {
+    const id = part.trim()
+    if (id === '' || seen.has(id) || id.length > 200) continue
+    seen.add(id)
+    ids.push(id)
+    if (ids.length >= PERMISSION_LOOKUP_MAX_IDS) break
+  }
+  return ids
+}
+
+type RuntimePermissionSnapshotItem = {
+  requestId: string
+  clientMessageId: string | null
+  toolUseId: string | null
+  toolName: string
+  inputJson: Record<string, unknown>
+  status: 'pending'
+  behavior: null
+  reason: null
+  answers: null
+  expiresAt: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** SQLite / no-PG session GET: project still-answerable runtime pending entries.
+ *  Never forges responded/cancelled/expired — those require PG. Completeness is
+ *  therefore `unavailable` so the client will not treat absence as "all answered". */
+export function projectRuntimePermissionSnapshot(
+  pending: ReadonlyMap<string, PendingPermissionCatchupEntry>,
+  sessionId: string,
+  userId: string,
+  nowMs: number = Date.now(),
+): {
+  items: RuntimePermissionSnapshotItem[]
+  completeness: 'unavailable'
+  source: 'runtime'
+} {
+  const items: RuntimePermissionSnapshotItem[] = []
+  const userColon = `${userId}:`
+  const userPipe = `${userId}|`
+  for (const [requestId, entry] of pending) {
+    if (entry.peer?.id !== sessionId) continue
+    if (typeof entry.peerKey !== 'string' ||
+      !(entry.peerKey.startsWith(userColon) || entry.peerKey.startsWith(userPipe))) continue
+    if (!(typeof entry.expiresAt === 'number' && entry.expiresAt > nowMs)) continue
+    items.push({
+      requestId,
+      clientMessageId: entry.clientMessageId ?? null,
+      toolUseId: entry.toolUseId ?? null,
+      toolName: entry.toolName,
+      inputJson: entry.input,
+      status: 'pending',
+      behavior: null,
+      reason: null,
+      answers: null,
+      expiresAt: entry.expiresAt,
+      createdAt: nowMs,
+      updatedAt: nowMs,
+    })
+  }
+  return { items, completeness: 'unavailable', source: 'runtime' }
+}
+
+export function attachPermissionSnapshotIfMissing<T extends {
+  id: string
+  userId?: string
+  permissionPrompts?: unknown
+}>(
+  session: T,
+  pending: ReadonlyMap<string, PendingPermissionCatchupEntry>,
+  userId: string,
+  nowMs: number = Date.now(),
+): T {
+  if (session.permissionPrompts != null) return session
+  return {
+    ...session,
+    permissionPrompts: projectRuntimePermissionSnapshot(pending, session.id, userId, nowMs),
+  }
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -5608,28 +5695,34 @@ export class Gateway {
         // 400: storage treats them as a revision mismatch and returns a full
         // payload, which self-heals old clients without a coordinated cutover.
         const sinceHistoryRevision = _parseHistoryRevisionCursor(historyRevisionRaw)
+        const permissionLookupIds = parsePermissionLookupQuery(url.searchParams.get('permission_lookup'))
         const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
         if (useIncremental) {
           getClientSessionPartial(sessId, userId, sinceSeq, {
             view: 'timeline',
             sinceHistoryRevision,
+            ...(permissionLookupIds.length > 0 ? { permissionLookupIds } : {}),
           })
             .then((s) => {
               if (!s) {
                 this.sendJson(res, 404, { error: 'not found' })
                 return
               }
+              const stamped = attachPermissionSnapshotIfMissing(s, this._pendingPermissions, userId)
               this.sendJson(res, 200, {
-                ...s,
-                timelineCursor: s.timelineCursor
-                  ? encodeClientTimelineCursor(s.timelineCursor)
+                ...stamped,
+                timelineCursor: stamped.timelineCursor
+                  ? encodeClientTimelineCursor(stamped.timelineCursor)
                   : null,
               })
               this._preheatSessionOnOpen(sessId, userId, s)
             })
             .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         } else {
-          getClientSession(sessId, userId, { view: 'timeline' })
+          getClientSession(sessId, userId, {
+            view: 'timeline',
+            ...(permissionLookupIds.length > 0 ? { permissionLookupIds } : {}),
+          })
             .then((s) => {
               if (!s) {
                 this.sendJson(res, 404, { error: 'not found' })
@@ -5649,15 +5742,16 @@ export class Gateway {
               // 更早历史"入口与"还有 N 条"计数、以及 mergeFullServerWins 的水位保留判定。
               // 显式 stamp(不依赖 ...s 的 truthy/falsey,对齐 Codex review #6 语义)。
               const archivedCount = s.archivedCount ?? 0
+              const stamped = attachPermissionSnapshotIfMissing(s, this._pendingPermissions, userId)
               this.sendJson(res, 200, {
-                ...s,
+                ...stamped,
                 isPartial: false,
                 totalMessageCount: messages.length + archivedCount,
                 maxSeq: s.timelineSnapshotMaxSeq ?? maxSeq,
                 archivedCount,
                 archivedThroughSeq: s.archivedThroughSeq ?? 0,
-                timelineCursor: s.timelineCursor
-                  ? encodeClientTimelineCursor(s.timelineCursor)
+                timelineCursor: stamped.timelineCursor
+                  ? encodeClientTimelineCursor(stamped.timelineCursor)
                   : null,
               })
               this._preheatSessionOnOpen(sessId, userId, s)

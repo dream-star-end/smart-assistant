@@ -1,9 +1,11 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { SIGNATURE_WORKS } from '../../lib/tutorialSignatureWorks'
 import { TUTORIAL_SHOWCASES } from '../../lib/tutorialShowcase'
 import { CaseShowroom, ShowcaseDetail } from './CaseShowroom'
 
+beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn() })
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 describe('CaseShowroom', () => {
   it('delegates one editable personal request without sending it', () => {
@@ -44,5 +46,31 @@ describe('CaseShowroom', () => {
     fireEvent.click(screen.getByRole('button', { name: '复制任务指令' }))
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('未能复制'))
     expect(screen.getByText(TUTORIAL_SHOWCASES[1].prompt)).toBeInTheDocument()
+  })
+  it('does not steal a work-entry focus on first visit', () => {
+    render(<CaseShowroom onSelect={vi.fn()} />)
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[0].action })).not.toHaveFocus()
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[1].action })).not.toHaveFocus()
+  })
+  it('restores the original work entry after leaving detail, including after in-detail copy', () => {
+    const run = vi.fn()
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn().mockResolvedValue(undefined) } })
+    render(<CaseShowroom onSelect={vi.fn()} onRun={run} />)
+    fireEvent.click(screen.getByRole('button', { name: SIGNATURE_WORKS[0].action }))
+    expect(screen.getByRole('heading', { name: SIGNATURE_WORKS[0].title })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '复制创作指令' }))
+    fireEvent.click(screen.getByRole('button', { name: '返回案例展厅' }))
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[0].action })).toHaveFocus()
+    expect(screen.getByRole('button', { name: SIGNATURE_WORKS[1].action })).not.toHaveFocus()
+    expect(run).not.toHaveBeenCalled()
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled()
+  })
+  it('restores whichever of the two works was opened', () => {
+    render(<CaseShowroom onSelect={vi.fn()} />)
+    for (const work of SIGNATURE_WORKS) {
+      fireEvent.click(screen.getByRole('button', { name: work.action }))
+      fireEvent.click(screen.getByRole('button', { name: '返回案例展厅' }))
+      expect(screen.getByRole('button', { name: work.action })).toHaveFocus()
+    }
   })
 })

@@ -612,6 +612,7 @@ import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
 import { makeExternalModelsHandler, type ExternalModelsHandler } from "./http/proxy/externalModels.js";
+import { makeExternalUsageHandler, type ExternalUsageHandler } from "./http/proxy/externalUsage.js";
 import {
   createUserChatBridge,
   ContainerUnreadyError,
@@ -3150,6 +3151,8 @@ export async function registerCommercial(
   let externalApiKeyProxy: AnthropicProxyHandler | undefined;
   // 2026-09-07:`GET /api/anthropic/v1/models` 外接模型发现,与 proxy 同批装配。
   let externalApiKeyModels: ExternalModelsHandler | undefined;
+  // 2026-09-08:`GET /api/anthropic/v1/usage` 外接余额 / 单 key 消耗,同批装配。
+  let externalApiKeyUsage: ExternalUsageHandler | undefined;
   // cursor-* 模型在 external API-key 路径上的服务端 Sand relay(本地 Claude Code 接入
   // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
   // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
@@ -3172,6 +3175,13 @@ export async function registerCommercial(
         loadUserModelAuthz,
         ownedBy: "clarvy",
         logger: rootLogger.child({ subsys: "externalModels" }),
+      });
+      // 用量端点与 models 同一条 key 判定链 + 同样不做 UA 门控(CC Switch 用量脚本是
+      // reqwest 客户端)。只读、不打上游、不动积分、不 bump last_used_at。
+      externalApiKeyUsage = makeExternalUsageHandler({
+        resolveIdentity: (req) => resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        repo: apiKeyRepo,
+        logger: rootLogger.child({ subsys: "externalUsage" }),
       });
       // Phase 5 platform envelope rewriter wiring(2026-05-21)。
       // secret 缺失 → throw → 外层 catch 将 externalApiKeyProxy 置 undefined,
@@ -3220,7 +3230,7 @@ export async function registerCommercial(
       });
       // eslint-disable-next-line no-console
       console.log(
-        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models, engine models via relay)",
+        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models + GET /v1/usage, engine models via relay)",
       );
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -3230,6 +3240,7 @@ export async function registerCommercial(
       );
       externalApiKeyProxy = undefined;
       externalApiKeyModels = undefined;
+      externalApiKeyUsage = undefined;
       const stale = cursorExternalRoute;
       cursorExternalRoute = undefined;
       void stale?.close().catch(() => undefined);
@@ -4200,6 +4211,7 @@ export async function registerCommercial(
     // 实例。undefined 时 router 该路径返 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404。
     externalApiKeyProxy,
     externalApiKeyModels,
+    externalApiKeyUsage,
   });
 
   // legacy /ws/agent(T-52 老 agent runtime WS 入口)已删除;v5 一律走 /ws/user-chat-bridge。

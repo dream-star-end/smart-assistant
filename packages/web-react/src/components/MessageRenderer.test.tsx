@@ -783,6 +783,69 @@ describe("permission 审批", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  test("同数组 live push 出现 dock；settle 后消失；dock 重开不发 permission_response", async () => {
+    const onRespond = vi.fn();
+    const messages: ChatMessage[] = [
+      mk("user", { id: "u-live", text: "问", ts: Date.now() }),
+    ];
+    const view = render(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    messages.push(
+      mk("permission", {
+        id: "p-live",
+        toolName: "Bash",
+        requestId: "req-live-arr",
+        _resolved: false,
+        inputPreview: "ls",
+        ts: Date.now(),
+      }),
+    );
+    view.rerender(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    messages[1]!._resolved = true;
+    messages[1]!._behavior = "allow";
+    view.rerender(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  test("权限卡被虚拟化卸载时 dock 仍打开同一请求且不 decide", async () => {
+    const onRespond = vi.fn();
+    const filler = Array.from({ length: 120 }, (_, i) =>
+      mk("assistant", { id: `fill-${i}`, text: `正文 ${i}`, ts: Date.now() - 120_000 + i }),
+    );
+    const pending = mk("permission", {
+      id: "p-offscreen",
+      toolName: "Bash",
+      requestId: "req-offscreen",
+      _resolved: false,
+      inputPreview: "ls",
+      ts: Date.now(),
+    });
+    render(
+      <MessageList
+        messages={[pending, ...filler]}
+        sending
+        cb={{}}
+        onRespondPermission={onRespond}
+      />,
+    );
+    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByTestId("pending-permission-dock").querySelector("button")!);
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
   test("AskUserQuestion 已提交 → 展示问答摘要", () => {
     renderMsg(
       mk("permission", {

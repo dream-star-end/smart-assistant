@@ -326,7 +326,11 @@ export function makeAnthropicProxyHandler(
       identity = await deps.identity.resolve(req, ctx);
     } catch (err) {
       if (err instanceof IdentityError) {
-        reqLog.warn("proxy_identity_failed", { errcode: err.code });
+        // `detail` 只进 server log(如 `unknown or revoked api key prefix=xxxx` /
+        // `user-agent not allowed …`),客户端仍拿统一 401 文案。2026-09-08 起补上:
+        // 一线排障(用户报 401)之前只有 errcode=API_KEY_INVALID,分不清是 key 撤销
+        // 还是 UA 不对,现在 prefix 可直接对到 user_api_keys 行。message 不含 secret。
+        reqLog.warn("proxy_identity_failed", { errcode: err.code, detail: err.message });
         incrAnthropicProxyReject("identity");
         sendJsonError(
           res,

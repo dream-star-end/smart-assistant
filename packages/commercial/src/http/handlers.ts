@@ -101,6 +101,7 @@ import type { RemoteHostTester } from "../remoteHosts/service.js";
 import type { AccountHealthTracker } from "../account-pool/health.js";
 import type { AnthropicProxyHandler } from "./proxy/shared.js";
 import type { ExternalModelsHandler } from "./proxy/externalModels.js";
+import type { ExternalUsageHandler } from "./proxy/externalUsage.js";
 import {
   canAccessInboxAsset,
   inboxAssetIdFromPath,
@@ -402,6 +403,11 @@ export interface CommercialHttpDeps {
    * EXTERNAL_PROXY_UNAVAILABLE(同 messages 语义)。见 http/proxy/externalModels.ts。
    */
   externalApiKeyModels?: ExternalModelsHandler;
+  /**
+   * 2026-09-08 — `GET /api/anthropic/v1/usage`(外接余额 / 单 key 消耗,给 CC Switch
+   * 「用量查询」脚本用)。同批装配、同一鉴权链、同 503 语义。见 http/proxy/externalUsage.ts。
+   */
+  externalApiKeyUsage?: ExternalUsageHandler;
 }
 
 export interface RequestContext {

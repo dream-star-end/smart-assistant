@@ -239,6 +239,9 @@ import {
 } from "../dispatch/turnRecoveryStore.js";
 import {
   cancelPendingPermissionPromptsForTurn,
+  readPermissionPromptSnapshot,
+  readPermissionPromptsByRequestIds,
+  serializePermissionPromptEntry,
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
@@ -8675,6 +8678,65 @@ async function readOpenDispatchForSession(
   };
 }
 
+/** Durable permission/ask-user snapshot for session GET
+ *  (INC-20260907-PERMISSION-ROOTFIX). Device B reconciles prompts device A
+ *  already answered and re-materialises lost permission_request frames.
+ *  A read failure must never 500 the whole session GET. */
+async function readPermissionPromptsForSession(
+  queryable: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  lookupIds?: string[],
+): Promise<{ permissionPrompts?: ClientSession["permissionPrompts"] }> {
+  const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+  if (!uidMatch) return {};
+  try {
+    const userIdBig = BigInt(uidMatch[1]);
+    const snapshot = await readPermissionPromptSnapshot(queryable, {
+      userId: userIdBig,
+      sessionId,
+    });
+    const lookups = lookupIds && lookupIds.length > 0
+      ? await readPermissionPromptsByRequestIds(queryable, {
+          userId: userIdBig,
+          sessionId,
+          requestIds: lookupIds,
+        })
+      : [];
+    if (snapshot.items.length === 0 && lookups.length === 0) {
+      return {
+        permissionPrompts: {
+          items: [],
+          completeness: snapshot.completeness,
+          source: snapshot.source,
+        },
+      };
+    }
+    return {
+      permissionPrompts: {
+        items: snapshot.items.map(serializePermissionPromptEntry),
+        completeness: snapshot.completeness,
+        source: snapshot.source,
+        ...(lookups.length > 0
+          ? { lookups: lookups.map(serializePermissionPromptEntry) }
+          : {}),
+      },
+    };
+  } catch (error) {
+    console.warn(
+      "pgSessionsBackend: readPermissionPromptsForSession failed; omitting permissionPrompts",
+      { sessionId, userId, error: error instanceof Error ? error.message : String(error) },
+    );
+    return {
+      permissionPrompts: {
+        items: [],
+        completeness: "unavailable",
+        source: "pg",
+      },
+    };
+  }
+}
+
 export function createPgSessionsBackend(
   pool: Pool,
   options: PgSessionsBackendOptions,
@@ -11522,6 +11584,12 @@ export function createPgSessionsBackend(
           archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
           archivedThroughSeq: archivedThroughOrderSeq,
           ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
+          ...(await readPermissionPromptsForSession(
+            queryable,
+            row.id,
+            row.user_id,
+            options.permissionLookupIds,
+          )),
         };
       };
       return options.view === "timeline"
@@ -11634,6 +11702,12 @@ export function createPgSessionsBackend(
             isPartial: false,
             archivedCount,
             archivedThroughSeq,
+            ...(await readPermissionPromptsForSession(
+              queryable,
+              row.id,
+              row.user_id,
+              options.permissionLookupIds,
+            )),
           };
         }
 
@@ -11683,6 +11757,12 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
+        ...(await readPermissionPromptsForSession(
+          queryable,
+          row.id,
+          row.user_id,
+          options.permissionLookupIds,
+        )),
         };
       };
       return options.view === "timeline"
