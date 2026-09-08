@@ -1951,9 +1951,6 @@ export class SessionManager {
    *  inflight 不是 durable。有界 LRU 只淘汰已完成(acked/queued/session_deleted);
    *  buffered/inflight 以活 owner bucket / 冻结 payload 为权威,不可 FIFO 丢弃。 */
   private _exactOwnerRuns = new Map<string, ExactOwnerRunRecord>()
-  /** Restart reconstruction from already-acked root sink/materializer payloads.
-   *  Keyed `${ownerTurnKey}\0${runId}` → identity (empty if only runId known). */
-  private _persistedRootRuns = new Map<string, string>()
   /** Per-sessionKey mutex around getOrCreate so two concurrent turns cannot
    *  each replace the runner and --resume the same Cursor SQLite store. */
   private _sessionCreateGates = new Map<string, Promise<void>>()
@@ -7713,11 +7710,11 @@ export class SessionManager {
    *  - 不同内容同 run → 记 `late_delegate_group_conflict`(可观察),保留首卡,
    *    不再生成第二张卡。返回 false 仅表示「未调度新写」(invalid locator /
    *    冲突抑制),不含 sink 排队('queued' 是可靠等待,由 sink drainer 送达)。 */
-  deliverLateDelegateAgentGroup(args: {
+  async deliverLateDelegateAgentGroup(args: {
     owner: DelegateOwnerTurnLocator
     group: DurableAgentGroup
     sessionKey?: string
-  }): boolean {
+  }): Promise<boolean> {
     if (!isValidDelegateOwnerLocator(args.owner)) {
       log.warn('late delegate group dropped: invalid owner locator', {
         runId: args.group.runId,
@@ -7735,7 +7732,7 @@ export class SessionManager {
       }
     }
     const conflictKey = this._exactOwnerRunKey(args.owner.parentTurnKey, args.group.runId)
-    const live = this._matchPersistedOrLiveOwnerRun(args.owner, args.group, args.sessionKey)
+    const live = this._matchLiveSessionsOwnerRun(args.owner, args.group, args.sessionKey)
     if (live === 'conflict') {
       log.warn('late_delegate_group_conflict: same run with different content', {
         runId: args.group.runId,
@@ -7750,6 +7747,15 @@ export class SessionManager {
       return false
     }
     if (live === 'duplicate') return true
+    const durable = await this._lookupPersistedRootLogicalRun(args.owner, args.group)
+    if (durable === 'conflict') {
+      log.warn('late_delegate_group_conflict: same run with different content', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      })
+      return false
+    }
+    if (durable === 'duplicate') return true
     const admission = this._admitExactOwnerRun(args.owner, args.group, 'inflight')
     if (admission === 'conflict') {
       log.warn('late_delegate_group_conflict: same run with different content', {
@@ -7830,44 +7836,32 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Reconstruct exact-owner root authority from an already-acked sink /
-   * materializer root payload after cache eviction or process restart.
-   * Continuation tapes are ignored: root key ≠ late key.
-   */
-  observePersistedRootTape(payload: {
-    turnKey?: string
-    continuationOfTurnKey?: string
-    sessionId?: string
-    agentGroups?: DurableAgentGroup[]
-  }): void {
-    const turnKey = payload.turnKey
-    if (typeof turnKey !== 'string' || !/^[0-9a-f]{64}$/.test(turnKey)) return
-    if (typeof payload.continuationOfTurnKey === 'string' && payload.continuationOfTurnKey.length > 0) {
-      return
-    }
-    const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : ''
-    for (const group of payload.agentGroups ?? []) {
-      if (typeof group.runId !== 'string' || group.runId.length === 0) continue
-      const key = this._exactOwnerRunKey(turnKey, group.runId)
-      const identity = sessionId.length > 0 && isValidDelegateOwnerLocator({
-        parentSessionId: sessionId,
-        parentTurnKey: turnKey,
-        turnIndex: 1,
+  private async _lookupPersistedRootLogicalRun(
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+  ): Promise<'accept' | 'duplicate' | 'conflict'> {
+    const sink = getV3MasterSinkOrNull()
+    if (!sink?.lookupRootLogicalRun) return 'accept'
+    let looked: { status: 'absent' | 'match' | 'conflict' | 'unavailable'; identity?: string }
+    try {
+      looked = await sink.lookupRootLogicalRun({
+        sessionId: owner.parentSessionId,
+        ownerTurnKey: owner.parentTurnKey,
+        runId: group.runId,
       })
-        ? lateDelegateGroupIdentity({
-          parentSessionId: sessionId,
-          parentTurnKey: turnKey,
-          turnIndex: 1,
-        }, group)
-        : ''
-      this._persistedRootRuns.set(key, identity)
+    } catch (err) {
+      log.warn('late delegate root lookup failed; not dropping the late card', {
+        runId: group.runId,
+        ownerTurnKey: owner.parentTurnKey,
+      }, err as Error)
+      return 'accept'
     }
-    while (this._persistedRootRuns.size > 1024) {
-      const oldest = this._persistedRootRuns.keys().next().value
-      if (oldest === undefined) break
-      this._persistedRootRuns.delete(oldest)
+    if (looked.status === 'unavailable' || looked.status === 'absent') return 'accept'
+    if (looked.status === 'conflict') return 'conflict'
+    if (typeof looked.identity === 'string' && looked.identity.length > 0) {
+      return this._compareOwnerRunIdentity(looked.identity, owner, group)
     }
+    return 'duplicate'
   }
 
   private _ownerLocatorForSession(
@@ -7979,7 +7973,7 @@ export class SessionManager {
     return 'accept'
   }
 
-  private _matchPersistedOrLiveOwnerRun(
+  private _matchLiveSessionsOwnerRun(
     owner: DelegateOwnerTurnLocator,
     group: DurableAgentGroup,
     sessionKey?: string,
@@ -7994,8 +7988,6 @@ export class SessionManager {
       const live = this._matchLiveOwnerRun(session, owner, group)
       if (live !== 'accept') return live
     }
-    const persisted = this._persistedRootRuns.get(this._exactOwnerRunKey(owner.parentTurnKey, group.runId))
-    if (persisted !== undefined) return this._compareOwnerRunIdentity(persisted, owner, group)
     return 'accept'
   }
 

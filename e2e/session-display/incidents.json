@@ -3425,7 +3425,12 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
-          "assertion": "restart reconstructs root authority from persisted sink/materializer payload"
+          "assertion": "fresh manager late entry finds ACK"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
+          "assertion": "makeV3MasterSink ACK"
         },
         {
           "layer": "unit",

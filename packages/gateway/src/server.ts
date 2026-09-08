@@ -13598,7 +13598,7 @@ export class Gateway {
         delegateOwnerLocator,
       )
       if (!buffered) {
-        this.sessions.deliverLateDelegateAgentGroup({
+        void this.sessions.deliverLateDelegateAgentGroup({
           owner: delegateOwnerLocator,
           group: durableGroup,
           sessionKey: progressTarget.sessionKey,

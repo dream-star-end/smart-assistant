@@ -15,6 +15,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { mkdtemp, readdir } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import type { DurableAgentGroup } from '@openclaude/protocol'
@@ -37,6 +40,7 @@ import {
   type V3MasterSink,
   type V3MasterSinkPayload,
 } from '../v3MasterSink.js'
+import { makeV3MasterRetryQueue } from '../v3MasterRetryQueue.js'
 
 const OWNER_TURN_KEY = 'a'.repeat(64)
 const OTHER_TURN_KEY = 'b'.repeat(64)
@@ -151,7 +155,7 @@ function makeCapturingSink(outcome: { ok: boolean; queued?: boolean } = { ok: tr
   payloads: V3MasterSinkPayload[]
 } {
   const payloads: V3MasterSinkPayload[] = []
-  const sink = {
+  const sink: V3MasterSink = {
     persistOrQueue: async (payload: V3MasterSinkPayload) => {
       payloads.push(payload)
       return outcome as never
@@ -159,7 +163,22 @@ function makeCapturingSink(outcome: { ok: boolean; queued?: boolean } = { ok: tr
     attemptOnce: async () => {
       throw new Error('not used')
     },
-  } as unknown as V3MasterSink
+    lookupRootLogicalRun: async (input) => {
+      const owner: DelegateOwnerTurnLocator = {
+        parentSessionId: input.sessionId,
+        parentTurnKey: input.ownerTurnKey,
+        turnIndex: 1,
+      }
+      for (const payload of payloads) {
+        if (payload.sessionId !== input.sessionId) continue
+        if (!persistedRootContainsLogicalRun(payload, input.ownerTurnKey, input.runId)) continue
+        const existing = (payload.agentGroups ?? []).find((item) => item.runId === input.runId)
+        if (!existing) continue
+        return { status: 'match', identity: lateDelegateGroupIdentity(owner, existing) }
+      }
+      return { status: 'absent' }
+    },
+  }
   return { sink, payloads }
 }
 
@@ -267,9 +286,9 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
           } as never,
         ],
       })
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       // duplicate replay of the SAME completion → no second tape
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       assert.equal(captured.payloads.length, 1, 'same logical run keeps exactly one card')
       const payload = captured.payloads[0]!
       assert.equal(payload.continuationOfTurnKey, OWNER_TURN_KEY)
@@ -280,7 +299,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       assert.deepEqual(payload.agentGroups?.map((x) => x.runId), ['dlg-late'])
       // conflicting content under the same run → observable, no second write
       assert.equal(
-        sm.deliverLateDelegateAgentGroup({
+        await sm.deliverLateDelegateAgentGroup({
           owner: owner(),
           group: group('dlg-late', { resultSummary: 'conflicting rewrite' }),
         }),
@@ -292,13 +311,13 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     }
   })
 
-  it('cross-session sessionKey/peer mismatch never schedules a write', () => {
+  it('cross-session sessionKey/peer mismatch never schedules a write', async () => {
     const captured = makeCapturingSink()
     setV3MasterSinkSingleton(captured.sink)
     try {
       const { sm, session } = makeSessions()
       assert.equal(
-        sm.deliverLateDelegateAgentGroup({
+        await sm.deliverLateDelegateAgentGroup({
           owner: owner({ parentSessionId: 'other-session' }),
           group: group('dlg-x'),
           sessionKey: session.sessionKey,
@@ -311,13 +330,13 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     }
   })
 
-  it('invalid locator never schedules a write', () => {
+  it('invalid locator never schedules a write', async () => {
     const captured = makeCapturingSink()
     setV3MasterSinkSingleton(captured.sink)
     try {
       const { sm } = makeSessions()
       assert.equal(
-        sm.deliverLateDelegateAgentGroup({
+        await sm.deliverLateDelegateAgentGroup({
           owner: owner({ parentTurnKey: 'no-hex' }),
           group: group('dlg-x'),
         }),
@@ -335,11 +354,11 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     try {
       const { sm } = makeSessions()
       const g = group('dlg-q')
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await Promise.resolve()
       // a later replay of the same completion while master is unreachable must
       // not enqueue a duplicate tape; the fsynced drainer owns delivery.
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       assert.equal(captured.payloads.length, 1)
     } finally {
       setV3MasterSinkSingleton(null)
@@ -366,6 +385,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
         stopPeriodic: () => {},
         pendingCount: async () => 0,
         hasEntryForDispatch: async () => false,
+        lookupRootLogicalRun: async () => ({ status: 'absent' as const }),
       },
       attemptSendImpl: async () => ({}),
     })
@@ -373,9 +393,9 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     try {
       const { sm } = makeSessions()
       const g = group('dlg-retry')
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(stages, 2, 'same frozen payload must retry after non-durable drop')
     } finally {
@@ -403,6 +423,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
         stopPeriodic: () => {},
         pendingCount: async () => 0,
         hasEntryForDispatch: async () => false,
+        lookupRootLogicalRun: async () => ({ status: 'absent' as const }),
       },
       attemptSendImpl: async () => ({}),
     })
@@ -410,8 +431,8 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     try {
       const { sm } = makeSessions()
       const g = group('dlg-merge')
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(stages, 1)
     } finally {
@@ -430,9 +451,9 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     try {
       const { sm } = makeSessions()
       const g = group('dlg-deleted')
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), false)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), false)
     } finally {
       setV3MasterSinkSingleton(null)
     }
@@ -457,14 +478,14 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'acked')
       for (let i = 0; i < 256; i++) {
         const otherTurn = createHash('sha256').update(`acked-churn-${i}`).digest('hex')
-        sm.deliverLateDelegateAgentGroup({
+        await sm.deliverLateDelegateAgentGroup({
           owner: owner({ parentTurnKey: otherTurn }),
           group: group(`acked-churn-${i}`),
         })
         await sm.awaitPendingPersistence()
       }
       const before = captured.payloads.length
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(captured.payloads.length, before, 'acked root run must not mint a continuation after map eviction')
     } finally {
@@ -481,7 +502,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
       const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
       assert.equal(drained.length, 1)
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(captured.payloads.length, 0, 'root already contains the run; no continuation')
     } finally {
@@ -513,7 +534,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       for (let i = 0; i < 256; i++) {
         const otherTurn = createHash('sha256').update(`churn-${i}`).digest('hex')
         assert.equal(
-          sm.deliverLateDelegateAgentGroup({
+          await sm.deliverLateDelegateAgentGroup({
             owner: owner({ parentTurnKey: otherTurn }),
             group: group(`churn-${i}`),
           }),
@@ -552,13 +573,13 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       setV3MasterSinkSingleton(acked.sink)
       for (let i = 0; i < 256; i++) {
         const otherTurn = createHash('sha256').update(`pending-churn-${i}`).digest('hex')
-        sm.deliverLateDelegateAgentGroup({
+        await sm.deliverLateDelegateAgentGroup({
           owner: owner({ parentTurnKey: otherTurn }),
           group: group(`pending-churn-${i}`),
         })
         await sm.awaitPendingPersistence()
       }
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(
         acked.payloads.filter((p) => p.agentGroups?.some((ag) => ag.runId === 'dlg-pending')).length,
@@ -570,36 +591,107 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     }
   })
 
-  it('restart reconstructs root authority from persisted sink/materializer payload', async () => {
-    const first = makeCapturingSink()
-    setV3MasterSinkSingleton(first.sink)
+  it('fresh manager late entry finds ACK\'d root on the persist sink; no continuation', async () => {
+    const captured = makeCapturingSink()
+    setV3MasterSinkSingleton(captured.sink)
     try {
-      const { sm, session } = makeSessions()
       const g = group('dlg-restart')
-      assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, g, owner()), true)
-      const drained = sm.drainPendingAgentGroups(session, OWNER_TURN_KEY)
-      type Settler = {
-        _settleDrainedOwnerGroups: (
-          s: AgentSession,
-          turnKey: string,
-          groups: DurableAgentGroup[],
-          outcome: 'acked' | 'queued' | 'dropped' | 'skipped',
-        ) => void
-      }
-      ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'acked')
-      const rootPayload = {
+      await captured.sink.persistOrQueue({
         sessionId: owner().parentSessionId,
+        agentId: 'main',
+        turnIndex: 3,
         turnKey: OWNER_TURN_KEY,
-        agentGroups: drained,
-      }
-      assert.equal(persistedRootContainsLogicalRun(rootPayload, OWNER_TURN_KEY, 'dlg-restart'), true)
-      const restarted = makeSessions().sm
-      const late = makeCapturingSink()
-      setV3MasterSinkSingleton(late.sink)
-      restarted.observePersistedRootTape(rootPayload)
-      assert.equal(restarted.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
-      await restarted.awaitPendingPersistence()
-      assert.equal(late.payloads.length, 0, 'persisted root authority suppresses continuation after restart')
+        status: 'completed',
+        text: 'root answer',
+        createdAt: 1,
+        agentGroups: [g],
+      })
+      assert.equal(persistedRootContainsLogicalRun(captured.payloads[0]!, OWNER_TURN_KEY, 'dlg-restart'), true)
+      const fresh = makeSessions().sm
+      assert.equal(await fresh.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await fresh.awaitPendingPersistence()
+      assert.equal(
+        captured.payloads.filter((payload) => payload.continuationOfTurnKey === OWNER_TURN_KEY).length,
+        0,
+        'production late entry must not mint a continuation when the persisted root already has the run',
+      )
+      assert.equal(
+        await fresh.deliverLateDelegateAgentGroup({
+          owner: owner(),
+          group: group('dlg-restart', { resultSummary: 'rewritten' }),
+        }),
+        false,
+      )
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('fresh manager late entry still persists when the durable root has no such run', async () => {
+    const captured = makeCapturingSink()
+    setV3MasterSinkSingleton(captured.sink)
+    try {
+      await captured.sink.persistOrQueue({
+        sessionId: owner().parentSessionId,
+        agentId: 'main',
+        turnIndex: 3,
+        turnKey: OWNER_TURN_KEY,
+        status: 'completed',
+        text: 'root answer',
+        createdAt: 1,
+      })
+      const fresh = makeSessions().sm
+      const g = group('dlg-absent')
+      assert.equal(await fresh.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await fresh.awaitPendingPersistence()
+      assert.equal(captured.payloads.filter((payload) => payload.continuationOfTurnKey).length, 1)
+    } finally {
+      setV3MasterSinkSingleton(null)
+    }
+  })
+
+  it('makeV3MasterSink ACK\'d root is visible to a fresh manager late entry', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ocv5-180-b1-r5-'))
+    const g = group('dlg-durable-root')
+    const sink = makeV3MasterSink({
+      config: { baseUrl: 'http://master.test:18791', bearer: `oc-v3.7.${'a'.repeat(64)}` },
+      retryQueue: makeV3MasterRetryQueue({
+        dir,
+        attemptSend: async () => ({}),
+      }),
+      attemptSendImpl: async () => ({}),
+    })
+    setV3MasterSinkSingleton(sink)
+    try {
+      const outcome = await sink.persistOrQueue({
+        sessionId: owner().parentSessionId,
+        agentId: 'main',
+        turnIndex: 3,
+        turnKey: OWNER_TURN_KEY,
+        status: 'completed',
+        text: 'root answer',
+        createdAt: 1,
+        agentGroups: [g],
+      })
+      assert.equal(outcome.ok, true)
+      const fresh = makeSessions().sm
+      const before = await sink.lookupRootLogicalRun!({
+        sessionId: owner().parentSessionId,
+        ownerTurnKey: OWNER_TURN_KEY,
+        runId: 'dlg-durable-root',
+      })
+      assert.equal(before.status, 'match')
+      const jsonBefore = (await readdir(dir)).filter((name) => name.endsWith('.json')).length
+      assert.equal(await fresh.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      await fresh.awaitPendingPersistence()
+      const jsonAfter = (await readdir(dir)).filter((name) => name.endsWith('.json')).length
+      assert.equal(jsonAfter, jsonBefore, 'late entry must not stage a continuation after ACK\'d root lookup')
+      const queued = await sink.lookupRootLogicalRun!({
+        sessionId: owner().parentSessionId,
+        ownerTurnKey: OWNER_TURN_KEY,
+        runId: 'dlg-durable-root',
+      })
+      assert.equal(queued.status, 'match')
     } finally {
       setV3MasterSinkSingleton(null)
     }
@@ -623,7 +715,7 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
         ) => void
       }
       ;(sm as unknown as Settler)._settleDrainedOwnerGroups(session, OWNER_TURN_KEY, drained, 'dropped')
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await sm.awaitPendingPersistence()
       assert.equal(captured.payloads.length, 1)
       assert.equal(captured.payloads[0]!.continuationOfTurnKey, OWNER_TURN_KEY)
@@ -770,10 +862,10 @@ describe('B-R2-1 controlled sink: late child lands as T1 continuation, T2 stays 
         false,
         'sealed owner must reject in-memory buffering',
       )
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: ownerLocator, group: lateGroup }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: ownerLocator, group: lateGroup }), true)
       await waitFor(() => payloads.length >= 2)
       // replay of the same completion must not mint a second card
-      assert.equal(sm.deliverLateDelegateAgentGroup({ owner: ownerLocator, group: lateGroup }), true)
+      assert.equal(await sm.deliverLateDelegateAgentGroup({ owner: ownerLocator, group: lateGroup }), true)
 
       releaseFirst(undefined)
       await t1

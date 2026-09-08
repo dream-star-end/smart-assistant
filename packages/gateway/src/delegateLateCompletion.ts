@@ -90,6 +90,7 @@ export function lateDelegateGroupIdentity(
  * not the owner turn, so they cannot be the root authority. */
 export function persistedRootContainsLogicalRun(
   payload: {
+    sessionId?: string
     turnKey?: string
     continuationOfTurnKey?: string
     agentGroups?: Array<{ runId?: string }>
@@ -102,6 +103,37 @@ export function persistedRootContainsLogicalRun(
   }
   if (payload.turnKey !== ownerTurnKey) return false
   return (payload.agentGroups ?? []).some((group) => group.runId === runId)
+}
+
+export type RootLogicalRunLookup = {
+  status: 'absent' | 'match' | 'conflict' | 'unavailable'
+}
+
+/** Inspect already-persisted sink/materializer payloads for a root run.
+ * Used by the production late path via V3MasterSink, not a SessionManager map. */
+export function inspectPayloadsForRootLogicalRun(
+  payloads: Array<{
+    sessionId?: string
+    turnKey?: string
+    continuationOfTurnKey?: string
+    agentGroups?: DurableAgentGroup[]
+  }>,
+  owner: DelegateOwnerTurnLocator,
+  group: DurableAgentGroup,
+): RootLogicalRunLookup {
+  const wanted = lateDelegateGroupIdentity(owner, group)
+  for (const payload of payloads) {
+    if (typeof payload.sessionId === 'string' && payload.sessionId !== owner.parentSessionId) {
+      continue
+    }
+    if (!persistedRootContainsLogicalRun(payload, owner.parentTurnKey, group.runId)) continue
+    const existing = (payload.agentGroups ?? []).find((item) => item.runId === group.runId)
+    if (!existing) continue
+    return lateDelegateGroupIdentity(owner, existing) === wanted
+      ? { status: 'match' }
+      : { status: 'conflict' }
+  }
+  return { status: 'absent' }
 }
 
 /** One logical run under one owner turn. Tape key / agentId derive from this

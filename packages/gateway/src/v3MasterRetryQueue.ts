@@ -42,6 +42,7 @@
  */
 
 import {
+  appendFile,
   mkdir,
   open,
   readdir,
@@ -60,6 +61,11 @@ import {
   type V3MasterSinkWirePayload,
   type V3SinkErrorClass,
 } from './v3MasterSink.js'
+import {
+  lateDelegateGroupIdentity,
+  persistedRootContainsLogicalRun,
+  type DelegateOwnerTurnLocator,
+} from './delegateLateCompletion.js'
 
 const log = createLogger({ module: 'v3MasterRetryQueue' })
 
@@ -104,6 +110,8 @@ export const MIN_REKICK_GAP_MS = 1_000
 export function defaultQueueDir(): string {
   return join(paths.home, 'v3-master-retry.d')
 }
+
+const ROOT_RUN_INDEX = 'root-delegate-runs.jsonl'
 
 export interface V3MasterRetryEntry {
   schemaVersion: 1
@@ -157,6 +165,13 @@ export interface V3MasterRetryQueue {
    *  the crash → the inbox row can safely go sink_staged (the drainer will
    *  deliver it). Scans on-disk entries; ENOENT-tolerant. */
   hasEntryForDispatch(dispatchId: string, attemptNo: number): Promise<boolean>
+  /** OCV5-180 B1 — inspect queued + ACK'd root tapes for a delegate run.
+   *  IO failure returns `unavailable` (caller must not drop a legitimate late). */
+  lookupRootLogicalRun(input: {
+    sessionId: string
+    ownerTurnKey: string
+    runId: string
+  }): Promise<{ status: 'absent' | 'found' | 'unavailable'; identity?: string }>
 }
 
 export interface MakeV3MasterRetryQueueDeps {
@@ -242,10 +257,107 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     if (!/^[0-9]+-[0-9a-f]+\.json$/.test(receipt)) {
       throw new Error('invalid v3 master retry receipt')
     }
-    await unlinkIgnoreEnoent(join(dir, receipt))
+    const filepath = join(dir, receipt)
+    try {
+      const raw = await readFile(filepath, 'utf8')
+      const parsed = JSON.parse(raw) as V3MasterRetryEntry
+      await recordAckedRootRuns(parsed.payload)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn('v3MasterRetryQueue: could not index ACK\'d root runs', { receipt }, err)
+      }
+    }
+    await unlinkIgnoreEnoent(filepath)
     await fsyncDir().catch((err) => {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
     })
+  }
+
+  async function recordAckedRootRuns(payload: V3MasterSinkWirePayload): Promise<void> {
+    if (typeof payload.continuationOfTurnKey === 'string' && payload.continuationOfTurnKey.length > 0) {
+      return
+    }
+    const turnKey = payload.turnKey
+    if (typeof turnKey !== 'string' || !/^[0-9a-f]{64}$/.test(turnKey)) return
+    const groups = payload.agentGroups ?? []
+    if (groups.length === 0) return
+    const owner: DelegateOwnerTurnLocator = {
+      parentSessionId: payload.sessionId,
+      parentTurnKey: turnKey,
+      turnIndex: 1,
+    }
+    const lines = groups
+      .filter((group) => typeof group.runId === 'string' && group.runId.length > 0)
+      .map((group) => JSON.stringify({
+        sessionId: payload.sessionId,
+        turnKey,
+        runId: group.runId,
+        identity: lateDelegateGroupIdentity(owner, group),
+      }))
+    if (lines.length === 0) return
+    await ensureDir()
+    await appendFile(join(dir, ROOT_RUN_INDEX), `${lines.join('\n')}\n`, 'utf8')
+  }
+
+  async function lookupRootLogicalRun(input: {
+    sessionId: string
+    ownerTurnKey: string
+    runId: string
+  }): Promise<{ status: 'absent' | 'found' | 'unavailable'; identity?: string }> {
+    try {
+      let names: string[]
+      try {
+        names = await readdir(dir)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') names = []
+        else return { status: 'unavailable' }
+      }
+      const payloads: V3MasterSinkWirePayload[] = []
+      for (const name of names.filter((n) => n.endsWith('.json') && !n.includes('.tmp-'))) {
+        try {
+          const raw = await readFile(join(dir, name), 'utf8')
+          const parsed = JSON.parse(raw) as V3MasterRetryEntry
+          if (parsed?.payload) payloads.push(parsed.payload)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue
+          return { status: 'unavailable' }
+        }
+      }
+      for (const payload of payloads) {
+        if (payload.sessionId !== input.sessionId) continue
+        if (!persistedRootContainsLogicalRun(payload, input.ownerTurnKey, input.runId)) continue
+        const existing = (payload.agentGroups ?? []).find((group) => group.runId === input.runId)
+        if (!existing) continue
+        const owner: DelegateOwnerTurnLocator = {
+          parentSessionId: input.sessionId,
+          parentTurnKey: input.ownerTurnKey,
+          turnIndex: 1,
+        }
+        return { status: 'found', identity: lateDelegateGroupIdentity(owner, existing) }
+      }
+      try {
+        const indexed = await readFile(join(dir, ROOT_RUN_INDEX), 'utf8')
+        for (const line of indexed.split('\n')) {
+          if (!line.trim()) continue
+          const row = JSON.parse(line) as {
+            sessionId?: string
+            turnKey?: string
+            runId?: string
+            identity?: string
+          }
+          if (row.sessionId !== input.sessionId) continue
+          if (row.turnKey !== input.ownerTurnKey) continue
+          if (row.runId !== input.runId) continue
+          if (typeof row.identity !== 'string') continue
+          return { status: 'found', identity: row.identity }
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return { status: 'unavailable' }
+      }
+      return { status: 'absent' }
+    } catch {
+      return { status: 'unavailable' }
+    }
   }
 
   async function enqueueDurable(entry: V3MasterRetryEntry): Promise<void> {
@@ -570,6 +682,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     stopPeriodic,
     pendingCount,
     hasEntryForDispatch,
+    lookupRootLogicalRun,
   }
 }
 
