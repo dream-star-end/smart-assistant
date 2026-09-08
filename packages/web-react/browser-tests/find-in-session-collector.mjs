@@ -77,13 +77,25 @@ export function finalizeRows(rows, extra = {}) {
     record(rows, scene, { recorded: true }, { missing: true }, {}, false,
       `scene ${scene} missing from collector`, { mode: extra.mode, phase: "never-recorded" });
   }
+  const ids = rows.map((r) => r.contractId);
+  const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
   return {
     expectedScenes: [...EXPECTED_SCENES],
     recordedBeforeFill: [...seen],
     missingScenes,
+    duplicates: [...new Set(duplicates)],
     scenes: rows.length,
     passed: rows.filter((r) => r.pass).length,
     failed: rows.filter((r) => !r.pass).length,
     skipped: 0,
   };
+}
+
+/** Structural catalog problems that must force a non-zero process exit after JSON is written. */
+export function catalogIsInvalid(catalog) {
+  return catalog.failed > 0
+    || (catalog.missingScenes?.length ?? 0) > 0
+    || (catalog.duplicates?.length ?? 0) > 0
+    || catalog.skipped !== 0
+    || (catalog.expectedScenes?.length ?? 0) !== EXPECTED_SCENES.length;
 }

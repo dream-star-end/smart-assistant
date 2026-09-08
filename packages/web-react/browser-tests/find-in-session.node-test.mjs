@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
-import { EXPECTED_SCENES, PEAK_BUDGET, finalizeRows, record as recordScene } from "./find-in-session-collector.mjs";
+import { EXPECTED_SCENES, PEAK_BUDGET, catalogIsInvalid, finalizeRows, record as recordScene } from "./find-in-session-collector.mjs";
 
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
@@ -234,6 +234,26 @@ async function waitPending(page, key, timeout = 4000) {
 }
 
 test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)", { timeout: 420_000 }, async (t) => {
+  if (process.env.OC_FIND_ONLY) {
+    const rows = [];
+    const catalog = finalizeRows(rows, { mode: "official-reject" });
+    writeFileSync(resultPath, JSON.stringify({
+      sources: {
+        rejected: "OC_FIND_ONLY",
+        reason: "official suite always runs the fixed 20-scene catalog",
+        filter: process.env.OC_FIND_ONLY,
+      },
+      negative,
+      peakBudget: PEAK_BUDGET,
+      expectedSceneCount: EXPECTED_SCENES.length,
+      ...catalog,
+      rows,
+    }, null, 2));
+    process.exitCode = 1;
+    assert.fail(
+      `OC_FIND_ONLY=${JSON.stringify(process.env.OC_FIND_ONLY)} is rejected by the official find suite; run the fixed ${EXPECTED_SCENES.length}-scene catalog without a filter`,
+    );
+  }
   const sources = sourceEvidence();
   t.diagnostic(`find-sources ${JSON.stringify(sources)}`);
   let out;
@@ -282,11 +302,6 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
       args: ["--no-sandbox", "--disable-overlay-scrollbar"],
     });
     const rows = [];
-    const only = process.env.OC_FIND_ONLY || "";
-    const runTest = (name, fn) => {
-      if (only && !name.includes(only)) return Promise.resolve();
-      return t.test(name, fn);
-    };
     try {
       async function openPage(scene, touch = false) {
         const context = await browser.newContext({
@@ -314,7 +329,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         return { context, page, errors };
       }
 
-      await runTest("tail-320-m0 keyboard.type then one click", async () => {
+      await t.test("tail-320-m0 keyboard.type then one click", async () => {
         const { context, page, errors } = await openPage("tail");
         const events = { clicks: 0, keys: 0, wheels: 0 };
         try {
@@ -348,7 +363,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("enter / shift+enter / button key", async () => {
+      await t.test("enter / shift+enter / button key", async () => {
         const { context, page, errors } = await openPage("multi");
         const events = { clicks: 0, keys: 0, enters: 0 };
         try {
@@ -402,7 +417,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("mobile tap completes despite own touchend fence", async () => {
+      await t.test("mobile tap completes despite own touchend fence", async () => {
         const { context, page, errors } = await openPage("tail", true);
         const events = { taps: 0, keys: 0 };
         try {
@@ -425,7 +440,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("coalesced team then ordinary assistant uses render key", async () => {
+      await t.test("coalesced team then ordinary assistant uses render key", async () => {
         const { context, page, errors } = await openPage("coalesce");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -447,7 +462,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("pending then real mouse.wheel / scrollbar drag cancel", async () => {
+      await t.test("pending then real mouse.wheel / scrollbar drag cancel", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, wheels: 0, keys: 0, drags: 0 };
         try {
@@ -517,7 +532,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("touchmove cancels pending jump", async () => {
+      await t.test("touchmove cancels pending jump", async () => {
         const { context, page, errors } = await openPage("midtail", true);
         const events = { clicks: 0, taps: 0, touchmoves: 0, keys: 0 };
         try {
@@ -587,7 +602,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("same-session same-id same-length replace does not keep old pin", async () => {
+      await t.test("same-session same-id same-length replace does not keep old pin", async () => {
         const { context, page, errors } = await openPage("tail");
         const events = { clicks: 0, keys: 0, replaces: 0 };
         try {
@@ -649,7 +664,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         return pending;
       }
 
-      await runTest("session switch cancels pending pin", async () => {
+      await t.test("session switch cancels pending pin", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -671,7 +686,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("close cancels pending and does not rejump", async () => {
+      await t.test("close cancels pending and does not rejump", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -691,7 +706,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("sending cancels pending and does not rejump", async () => {
+      await t.test("sending cancels pending and does not rejump", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -712,7 +727,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("unmount does not replay old generation", async () => {
+      await t.test("unmount does not replay old generation", async () => {
         const { context, page, errors } = await openPage("midtail");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -734,7 +749,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("rapid next-prev lands on second hit", async () => {
+      await t.test("rapid next-prev lands on second hit", async () => {
         const { context, page, errors } = await openPage("multi");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -760,7 +775,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
 
-      await runTest("2000-row peak budget, pin release, jumpToBottom", async () => {
+      await t.test("2000-row peak budget, pin release, jumpToBottom", async () => {
         const { context, page, errors } = await openPage("budget");
         const events = { clicks: 0, keys: 0 };
         try {
@@ -820,18 +835,12 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         }
       });
     } finally {
-      await browser.close();
-      const catalog = only
-        ? {
-          expectedScenes: rows.map((r) => r.contractId),
-          recordedBeforeFill: rows.map((r) => r.contractId),
-          missingScenes: [],
-          scenes: rows.length,
-          passed: rows.filter((r) => r.pass).length,
-          failed: rows.filter((r) => !r.pass).length,
-          skipped: 0,
-        }
-        : finalizeRows(rows, { mode: negative ? "negative-overlay" : "candidate" });
+      try {
+        await browser.close();
+      } catch {
+        /* still write catalog */
+      }
+      const catalog = finalizeRows(rows, { mode: negative ? "negative-overlay" : "candidate" });
       writeFileSync(resultPath, JSON.stringify({
         sources,
         negative,
@@ -840,7 +849,16 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         ...catalog,
         rows,
       }, null, 2));
-      console.log(`FIND_RESULT ${resultPath} scenes=${catalog.scenes} expected=${EXPECTED_SCENES.length} missing=${catalog.missingScenes.length}`);
+      console.log(`FIND_RESULT ${resultPath} scenes=${catalog.scenes} expected=${EXPECTED_SCENES.length} missing=${catalog.missingScenes.length} failed=${catalog.failed}`);
+      if (catalogIsInvalid(catalog)) {
+        process.exitCode = 1;
+        const recordedFails = rows.filter((r) => !r.pass && r.phase !== "never-recorded");
+        if (recordedFails.length === 0) {
+          assert.fail(
+            `find catalog incomplete after JSON write: failed=${catalog.failed} missing=${catalog.missingScenes.join(",") || "[]"} duplicates=${(catalog.duplicates || []).join(",") || "[]"}`,
+          );
+        }
+      }
     }
   } finally {
     if (out) rmSync(out, { recursive: true, force: true });

@@ -2217,8 +2217,6 @@ export function MessageList({
         onPointerDown={stopFindKeys}
         onTouchStart={stopFindKeys}
         onTouchMove={stopFindKeys}
-        onTouchEnd={stopFindKeys}
-        onTouchCancel={stopFindKeys}
       >
         <Input
           aria-label="在会话中查找"
