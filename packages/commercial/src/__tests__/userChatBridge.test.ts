@@ -3486,7 +3486,13 @@ describe("Cursor external authority regression tripwire", () => {
       cursorBranch,
       /sendErrorFrame\(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity\)/,
     );
-    assert.match(source, /settleCursorExternalUsage/);
+    // The live bridge uses the same settle-before-close path as durable replay.
+    // Follow that production import instead of requiring the leaf settler inline.
+    assert.match(source, /import \{ settleDurableCursorBilling \} from [\"']\.\.\/billing\/durableCursorBilling\.js[\"']/);
+    assert.match(source, /await settleDurableCursorBilling\(/);
+    const durableCursorSource = await readFile(new URL("../billing/durableCursorBilling.ts", import.meta.url), "utf8");
+    assert.match(durableCursorSource, /settleCursorExternalUsage/);
+    assert.match(durableCursorSource, /await settleCursorExternalUsage\(/);
     assert.match(source, /stableIdentityProvided && !stableIdentityComplete/);
     assert.match(source, /stableIdentityCount === stableIdentityParts\.length/);
     assert.match(source, /WHERE id=\$1 AND provider='cursor'/);
