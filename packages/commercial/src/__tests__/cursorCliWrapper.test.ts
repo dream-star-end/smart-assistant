@@ -47,6 +47,9 @@ function fixture(): {
   const auth = join(authDir, 'api-key')
   const capture = join(dir, 'capture')
   const binDir = join(dir, 'bin')
+  const home = join(dir, 'home')
+  const ocHome = join(home, '.openclaude')
+  mkdirSync(ocHome, { recursive: true })
   mkdirSync(authDir)
   mkdirSync(capture)
   mkdirSync(binDir)
@@ -69,7 +72,7 @@ if [ "\${OC_CURSOR_TEST_STDERR:-0}" = 1 ]; then
   printf 'FAKE_DEBUG_LINE\\n' >&2
 fi
 if [ -L "$HOME/.config/cursor/chats" ]; then
-  readlink "$HOME/.config/cursor/chats" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+  /usr/bin/readlink "$HOME/.config/cursor/chats" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
 elif [ -e "$HOME/.config/cursor/chats" ]; then
   printf '%s\\n' "not-symlink" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
 else
@@ -96,6 +99,7 @@ if [ -n "\${OC_CURSOR_TEST_FAIL_ON_KEY:-}" ] && [ "\${CURSOR_API_KEY}" = "\${OC_
 fi
 if [ "\${OC_CURSOR_TEST_SLEEP:-0}" = 1 ]; then
   trap 'printf term > "$OC_CURSOR_TEST_CAPTURE/term"; exit 143' TERM
+  : > "$OC_CURSOR_TEST_CAPTURE/ready"
   while :; do sleep 1; done
 fi
 if [ "\${OC_CURSOR_TEST_ORPHAN:-0}" = 1 ]; then
@@ -189,6 +193,8 @@ esac
     capture,
     env: {
       ...process.env,
+      HOME: home,
+      OPENCLAUDE_HOME: ocHome,
       PATH: `${binDir}:${process.env.PATH ?? ''}`,
       OC_CURSOR_TEST_CAPTURE: capture,
       OC_CURSOR_ALLOW_LEGACY_POOL: '1',
@@ -936,10 +942,13 @@ describe('oc-cursor wrapper', () => {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       const homeFile = join(f.capture, 'home')
+      // Startup output precedes trap installation; Stop waits for the trap itself.
+      const readyFile = join(f.capture, 'ready')
       for (let i = 0; i < 40; i += 1) {
-        if (spawnSync('test', ['-f', homeFile]).status === 0) break
+        if (existsSync(readyFile)) break
         await new Promise((resolveReady) => setTimeout(resolveReady, 50))
       }
+      assert.ok(existsSync(readyFile), 'fake CLI did not install its TERM trap')
       assert.equal(spawnSync('test', ['-f', homeFile]).status, 0, 'fake CLI did not start')
       child.kill('SIGTERM')
       const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(

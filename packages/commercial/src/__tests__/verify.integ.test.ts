@@ -17,6 +17,7 @@ import { verifyAccess, refreshTokenHash } from "../auth/jwt.js";
 import { verifyPassword } from "../auth/passwords.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
+import { prepareAuthRowResetForTest } from "./helpers/authRows.js";
 
 /**
  * T-13 集成测试。
@@ -37,6 +38,7 @@ const REQUIRE_TEST_DB =
 const JWT_SECRET = "x".repeat(64);
 
 let pgAvailable = false;
+let resetAuthRows: (() => Promise<void>) | undefined;
 
 async function probe(): Promise<boolean> {
   const p = createPool({
@@ -76,6 +78,7 @@ before(async () => {
   setPoolOverride(pool);
   await resetTestSchemaForTest();
   await runMigrations();
+  resetAuthRows = await prepareAuthRowResetForTest();
 });
 
 after(async () => {
@@ -87,9 +90,8 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await query(
-    "TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
-  );
+  assert.ok(resetAuthRows, "real auth fixture setup must finish before each case");
+  await resetAuthRows();
 });
 
 function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
