@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, cp, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, readlink, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -101,13 +101,26 @@ describe('V5 branch deployment policy', () => {
 })
 
 async function runTurnCanaryFixture(
-  mode: 'foreign-then-success' | 'foreign-only' | 'own-error' | 'ccb-final-cost-tape-text' | 'ccb-final-cost-empty-session',
-): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
+  mode: 'foreign-then-success' | 'foreign-only' | 'own-error' | 'ccb-final-cost-tape-text' | 'ccb-final-cost-empty-session' | 'ccb-final-cost-wrong-text' | 'ccb-final-cost-pending-error' | 'missing-final' | 'missing-cost',
+): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number; getCount: number; tapeReads: unknown[]; clockEvents: Array<Record<string, unknown>> }> {
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-turn-canary-'))
   dirs.push(dir)
   const passwordFile = path.join(dir, 'password')
   await writeFile(passwordFile, 'fixture-password\n')
 
+  const controlledTape = mode.startsWith('ccb-final-cost-')
+  const clockEvents: Array<Record<string, unknown>> = []
+  let getCount = 0
+  let tapeRequested!: () => void
+  let tapeClockReady!: () => void
+  let tapeRead!: () => void
+  const tapeReads: unknown[] = []
+  const readEvidence = new Promise<void>((resolve) => { tapeRead = resolve })
+  const tapeRequest = new Promise<void>((resolve) => { tapeRequested = resolve })
+  const clockReady = new Promise<void>((resolve) => { tapeClockReady = resolve })
+  const pendingResponses: Array<import('node:http').ServerResponse> = []
+  const fixtureTimers: Array<ReturnType<typeof setTimeout>> = []
+  let sendOwnError: () => void = () => { throw new Error('own turn not observed') }
   const server = createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/api/auth/login') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -121,13 +134,11 @@ async function runTurnCanaryFixture(
     }
     if (req.method === 'GET' && req.url?.startsWith('/api/sessions/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      if (mode === 'ccb-final-cost-tape-text') {
-        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '2' }] }))
-      } else if (mode === 'ccb-final-cost-empty-session') {
-        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '' }] }))
-      } else {
-        res.end('{}')
-      }
+      getCount++
+      if (controlledTape) {
+        pendingResponses.push(res)
+        tapeRequested()
+      } else res.end('{}')
       return
     }
     res.writeHead(404)
@@ -142,6 +153,10 @@ async function runTurnCanaryFixture(
     ws.once('message', (raw) => {
       inboundAt = Date.now()
       const inbound = JSON.parse(raw.toString())
+      sendOwnError = () => ws.send(JSON.stringify({
+        type: 'error', code: 'UPSTREAM_FAILED', message: 'own error while tape pending',
+        peer: inbound.peer, clientMessageId: inbound.clientMessageId,
+      }))
       const foreignErrors = [
         JSON.stringify({
           type: 'error',
@@ -161,7 +176,7 @@ async function runTurnCanaryFixture(
       const sendForeignErrors = () => foreignErrors.forEach((frame) => ws.send(frame))
       if (mode === 'foreign-only') {
         const timer = setInterval(sendForeignErrors, 15)
-        setTimeout(() => clearInterval(timer), 1_200)
+        fixtureTimers.push(timer, setTimeout(() => clearInterval(timer), 1_200))
         return
       }
       sendForeignErrors()
@@ -175,7 +190,7 @@ async function runTurnCanaryFixture(
         }))
         return
       }
-      if (mode === 'ccb-final-cost-tape-text' || mode === 'ccb-final-cost-empty-session') {
+      if (controlledTape || mode === 'missing-final' || mode === 'missing-cost') {
         ws.send(JSON.stringify({
           type: 'outbound.message',
           sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
@@ -183,9 +198,9 @@ async function runTurnCanaryFixture(
           peer: inbound.peer,
           clientMessageId: inbound.clientMessageId,
           blocks: [],
-          isFinal: true,
+          isFinal: mode !== 'missing-final',
         }))
-        ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
+        if (mode !== 'missing-cost') ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
         return
       }
       ws.send(JSON.stringify({
@@ -217,35 +232,96 @@ async function runTurnCanaryFixture(
   const address = server.address()
   assert.ok(address && typeof address !== 'string')
   const startedAt = Date.now()
-  const child = spawn(process.execPath, [turnCanary], {
+  const child = spawn(process.execPath, [
+    ...(controlledTape ? ['--import', path.join(root, 'scripts/__tests__/fixtures/canary-clock.mjs')] : []),
+    turnCanary,
+  ], {
     cwd: root,
     env: {
       ...process.env,
       V5_BASE: `http://127.0.0.1:${address.port}`,
       V5_CANARY_PASSWORD_FILE: passwordFile,
+      OC_TEST_CANARY_CLOCK: controlledTape ? '1' : undefined,
+      V5_TURN_MODEL: 'gpt-5.6-sol',
+      V5_CANARY_REQUIRE_COST: '1',
+      V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE: '0',
       V5_TURN_ATTEMPTS: '1',
       V5_TURN_SILENCE_MS: '60',
       V5_CANARY_TAPE_TEXT_GRACE_MS: '80',
       V5_CANARY_TAPE_TEXT_POLL_MS: '20',
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   })
   let stdout = ''
   let stderr = ''
-  child.stdout.on('data', (chunk) => { stdout += chunk.toString() })
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
-  const code = await new Promise<number | null>((resolve, reject) => {
-    const timeout = setTimeout(() => child.kill('SIGKILL'), 3_000)
+  child.stdout!.on('data', (chunk) => { stdout += chunk.toString() })
+  child.stderr!.on('data', (chunk) => { stderr += chunk.toString() })
+  const advances = new Map<number, (alive: boolean) => void>()
+  child.on('message', (raw) => {
+    const message = raw as Record<string, unknown>
+    if (message.kind === 'clock-tape-read') { tapeReads.push(message.text); tapeRead() }
+    if (message.kind === 'clock-event') {
+      clockEvents.push(message)
+      if (message.action === 'register' && message.ms === 80) tapeClockReady()
+    }
+    if (message.kind === 'clock-advanced') {
+      advances.get(Number(message.to))?.(true)
+      advances.delete(Number(message.to))
+    }
+  })
+  const exited = new Promise<number | null>((resolve, reject) => {
     child.once('error', reject)
-    child.once('exit', (exitCode) => {
-      clearTimeout(timeout)
-      resolve(exitCode)
+    child.once('exit', (code) => {
+      for (const finish of advances.values()) finish(false)
+      advances.clear()
+      resolve(code)
     })
   })
-  const elapsedMs = Date.now() - (inboundAt || startedAt)
-  await new Promise<void>((resolve) => wss.close(() => resolve()))
-  await new Promise<void>((resolve) => server.close(() => resolve()))
-  return { code, stdout, stderr, elapsedMs }
+  const advance = (to: number) => new Promise<boolean>((resolve) => {
+    if (!child.connected) { resolve(false); return }
+    advances.set(to, resolve)
+    child.send({ kind: 'clock-advance', to }, (error) => {
+      if (error) { advances.delete(to); resolve(false) }
+    })
+  })
+  const drive = async () => {
+    if (!controlledTape) return
+    const ready = await Promise.race([
+      Promise.all([tapeRequest, clockReady]).then(() => true), exited.then(() => false),
+    ])
+    if (!ready) return // The caller still asserts the actual CLI exit and evidence.
+    if (mode === 'ccb-final-cost-pending-error') {
+      sendOwnError()
+      await exited
+    } else if (!await advance(60)) return
+    const text = mode === 'ccb-final-cost-empty-session' ? '' : mode === 'ccb-final-cost-wrong-text' ? '3' : '2'
+    for (const response of pendingResponses.splice(0)) {
+      if (!response.destroyed) response.end(JSON.stringify({ messages: [{ role: 'assistant', text }] }))
+    }
+    if (mode === 'ccb-final-cost-empty-session' || mode === 'ccb-final-cost-wrong-text') {
+      await Promise.race([readEvidence, exited])
+      await advance(80)
+    }
+  }
+  const hangGuard = setTimeout(() => child.kill('SIGKILL'), 3_000)
+  const driving = drive()
+  void driving.catch(() => undefined)
+  try {
+    const code = await exited
+    await driving
+    return { code, stdout, stderr, elapsedMs: Date.now() - (inboundAt || startedAt), getCount, tapeReads, clockEvents }
+  } finally {
+    clearTimeout(hangGuard)
+    fixtureTimers.forEach(clearTimeout)
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await exited.catch(() => undefined)
+    await driving.catch(() => undefined)
+    for (const response of pendingResponses) response.destroy()
+    for (const ws of wss.clients) ws.terminate()
+    await new Promise<void>((resolve) => wss.close(() => resolve()))
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 }
 
 afterEach(async () => {
@@ -1137,7 +1213,7 @@ function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): P
   })
 }
 
-async function manualLeaseFixture() {
+async function manualLeaseFixture(options: { clock?: boolean; holdTransport?: boolean } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-manual-lease-'))
   dirs.push(dir)
   const bin = path.join(dir, 'bin')
@@ -1150,6 +1226,17 @@ async function manualLeaseFixture() {
   const sshPids = path.join(dir, 'ssh-pids')
   const remotePids = path.join(dir, 'remote-pids')
   const commandPids = path.join(dir, 'command-pids')
+  const clock = path.join(dir, 'clock')
+  const localTimer = path.join(dir, 'local-timer')
+  const transportStarted = path.join(dir, 'transport-started')
+  const transportRelease = path.join(dir, 'transport-release')
+  if (options.clock) {
+    await writeFile(clock, '0\n')
+    for (const name of ['sleep', 'date']) {
+      await cp(path.join(root, `scripts/__tests__/fixtures/lease-clock-${name}.sh`), path.join(bin, name))
+      await chmod(path.join(bin, name), 0o755)
+    }
+  }
   const wrapper = path.join(dir, 'with-production-mutation-lease.sh')
   const command = path.join(dir, 'wrapped-command.sh')
   const source = await readFile(manualMutationLease, 'utf8')
@@ -1169,12 +1256,16 @@ async function manualLeaseFixture() {
       'done',
       '[[ $# -ge 2 ]] || exit 2',
       'shift',
+      'if [[ "${FAKE_HOLD_TRANSPORT:-0}" == 1 ]]; then',
+      '  : >"$FAKE_TRANSPORT_STARTED"',
+      '  while [[ ! -e "$FAKE_TRANSPORT_RELEASE" ]]; do /bin/sleep 0.01; done',
+      'fi',
       'remote_out=""',
       'if [[ "${FAKE_SSH_BUFFER_OUTPUT_UNTIL_REMOTE_EXIT:-0}" == 1 ]]; then',
       '  remote_out="$(mktemp)"',
-      '  bash -c "$1" >"$remote_out" &',
+      '  FAKE_MANUAL_REMOTE=1 bash -c "$1" >"$remote_out" &',
       'else',
-      '  bash -c "$1" &',
+      '  FAKE_MANUAL_REMOTE=1 bash -c "$1" &',
       'fi',
       'remote_pid=$!',
       'printf "%s\\n" "$remote_pid" >>"$FAKE_REMOTE_PIDS"',
@@ -1208,6 +1299,10 @@ async function manualLeaseFixture() {
     sshPids,
     remotePids,
     commandPids,
+    clock,
+    localTimer,
+    transportStarted,
+    transportRelease,
     wrapper,
     command,
     env: {
@@ -1216,6 +1311,11 @@ async function manualLeaseFixture() {
       KL_HOST: 'fake-manual-lease',
       FAKE_SSH_PIDS: sshPids,
       FAKE_REMOTE_PIDS: remotePids,
+      FAKE_MANUAL_CLOCK: options.clock ? clock : undefined,
+      FAKE_LOCAL_TIMER: localTimer,
+      FAKE_HOLD_TRANSPORT: options.holdTransport ? '1' : '0',
+      FAKE_TRANSPORT_STARTED: transportStarted,
+      FAKE_TRANSPORT_RELEASE: transportRelease,
       COMMAND_PIDS: commandPids,
       COMMAND_STARTED: commandStarted,
       COMMAND_RELEASE: commandRelease,
@@ -1223,6 +1323,29 @@ async function manualLeaseFixture() {
       BLOCKER_RELEASE: blockerRelease,
     } as NodeJS.ProcessEnv,
   }
+}
+
+async function advanceManualClock(fx: Awaited<ReturnType<typeof manualLeaseFixture>>, to: number): Promise<void> {
+  const current = Number((await readFile(fx.clock, 'utf8')).trim())
+  assert.ok(to >= current && Number.isSafeInteger(to), 'manual fixture clock must be monotonic')
+  await writeFile(`${fx.clock}.next`, `${to}\n`)
+  await rename(`${fx.clock}.next`, fx.clock)
+}
+
+async function assertManualClockCommandReady(fx: Awaited<ReturnType<typeof manualLeaseFixture>>): Promise<void> {
+  assert.equal(await waitUntilManualLease(async () => {
+    const raw = await readFile(fx.commandPids, 'utf8').catch(() => '')
+    const pids = raw.trim().split(/\s+/).map(Number)
+    if (pids.length !== 2 || new Set(pids).size !== 2 || !pids.every((pid) => Number.isSafeInteger(pid) && pid > 1)) return false
+    const ps = spawnSync('ps', ['-o', 'pid=,pgid=', '-p', pids.join(',')], { encoding: 'utf8' })
+    const groups = ps.stdout.trim().split('\n').map((line) => line.trim().split(/\s+/).map(Number))
+    return groups.length === 2 && groups.every(([pid, pgid]) => pids.includes(pid) && pgid === pids[0])
+  }, 5_000), true, 'both stubborn command processes must exist in the real command PGID')
+  const [timerPid, seconds, start] = (await readFile(fx.localTimer, 'utf8')).trim().split(/\s+/).map(Number)
+  assert.equal(seconds, 1, 'unchanged product must request its original 1s local TTL')
+  assert.equal(start, 0)
+  process.kill(timerPid, 0)
+  assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'real lease must be held before time advances')
 }
 
 async function killManualLeaseFixtureProcesses(...pidFiles: string[]): Promise<void> {
@@ -6809,7 +6932,7 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
   })
 
   test('manual mutation wrapper hard TTL fences long commands and preserves normal command status', async () => {
-    const ttlFx = await manualLeaseFixture()
+    const ttlFx = await manualLeaseFixture({ clock: true })
     const stubborn = await writeStubbornManualCommand(ttlFx)
     const ttlChild = spawn('bash', [ttlFx.wrapper, stubborn], {
       env: { ...ttlFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' },
@@ -6821,6 +6944,8 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'TTL command never started',
       )
+      await assertManualClockCommandReady(ttlFx)
+      await advanceManualClock(ttlFx, 1)
       assert.equal(await waitForChildExit(ttlChild, 8_000), true, 'hard TTL did not stop the wrapper')
       assert.equal(ttlChild.exitCode, 86, `hard TTL must surface as lease loss; signal=${ttlChild.signalCode}`)
       assert.equal(
@@ -6828,6 +6953,7 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'hard TTL left command-group processes alive',
       )
+      assert.equal(await waitUntilManualLease(() => spawnSync('flock', ['-n', ttlFx.lock, 'true']).status === 0, 6_000), true, 'hard TTL leaked the remote flock')
     } finally {
       ttlChild.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(ttlFx.commandPids, ttlFx.sshPids, ttlFx.remotePids)
@@ -6855,7 +6981,7 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
   })
 
   test('manual mutation wrapper local TTL fences before a live ssh observes remote TTL close', async () => {
-    const fx = await manualLeaseFixture()
+    const fx = await manualLeaseFixture({ clock: true })
     const stubborn = await writeStubbornManualCommand(fx)
     const child = spawn('bash', [fx.wrapper, stubborn], {
       env: {
@@ -6865,14 +6991,18 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       },
       stdio: 'ignore',
     })
+    let remoteDeadline: ReturnType<typeof setTimeout> | undefined
+    let remoteAdvance: Promise<void> | undefined
+    let observation: Promise<boolean> | undefined
     try {
       assert.equal(
         await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
         true,
         'delayed-close command never started',
       )
-      assert.equal(
-        await waitUntilManualLease(async () => {
+      await assertManualClockCommandReady(fx)
+      // Install the original overlap oracle BEFORE allowing either deadline to pass.
+      observation = waitUntilManualLease(async () => {
           if (spawnSync('flock', ['-n', fx.lock, 'true']).status !== 0) return false
           assert.equal(
             await allRecordedProcessesExited(fx.commandPids),
@@ -6880,12 +7010,37 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
             'remote flock became acquirable while the old command group was still alive',
           )
           return true
-        }, 6_000),
-        true,
-        'remote hard TTL did not release the lease after local fencing',
-      )
+        }, 6_000)
+      // Attach a rejection handler immediately; the assertion is consumed below.
+      void observation.catch(() => undefined)
+      await advanceManualClock(fx, 1)
+      remoteDeadline = setTimeout(() => {
+        remoteAdvance = advanceManualClock(fx, 3)
+        void remoteAdvance.catch(() => undefined)
+      }, 2_000)
+      assert.equal(await observation, true, 'remote hard TTL did not release the lease after local fencing')
       assert.equal(await waitForChildExit(child, 4_000), true, 'wrapper did not finish local-TTL cleanup')
       assert.equal(child.exitCode, 86, `local TTL must surface as lease loss; signal=${child.signalCode}`)
+    } finally {
+      clearTimeout(remoteDeadline)
+      try { await remoteAdvance } finally {
+        child.kill('SIGKILL')
+        await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+        await observation?.catch(() => undefined)
+      }
+    }
+  })
+
+  test('manual mutation wrapper real startup TTL rejects a transport held before handshake', async () => {
+    const fx = await manualLeaseFixture({ holdTransport: true })
+    const child = spawn('bash', [fx.wrapper, fx.command], {
+      env: { ...fx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' }, stdio: 'ignore',
+    })
+    try {
+      assert.equal(await waitForChildExit(child, 5_000), true, 'real pre-SSH TTL did not reject a pending handshake')
+      assert.equal(child.exitCode, 86, 'startup expiry must be a dedicated lease-loss outcome')
+      assert.equal(existsSync(fx.commandStarted), false, 'expired startup may not run the command')
+      assert.equal(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'startup expiry leaked flock')
     } finally {
       child.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
@@ -8214,16 +8369,39 @@ wait $!
   test('real-turn canary accepts tape assistant text when CCB final+cost omit WS blocks', async () => {
     const tapeOk = await runTurnCanaryFixture('ccb-final-cost-tape-text')
     assert.equal(tapeOk.code, 0, tapeOk.stderr || tapeOk.stdout)
+    assert.equal(tapeOk.getCount, 1, 'one real pending GET; polling must not pile up requests')
+    assert.ok(tapeOk.clockEvents.some((e) => e.action === 'cancel' && e.ms === 60), 'tape phase did not cancel silence')
+    assert.ok(!tapeOk.clockEvents.some((e) => e.action === 'fire' && e.ms === 60), 'obsolete silence timer fired')
     assert.match(tapeOk.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true via=tape/)
 
     const empty = await runTurnCanaryFixture('ccb-final-cost-empty-session')
     assert.equal(empty.code, 1, empty.stdout)
-    assert.match(empty.stderr, /TURN_INCOMPLETE.*缺:text/)
+    assert.match(empty.stderr, /TURN_INCOMPLETE.*resolve=tape-miss.*缺:text/)
+    assert.ok(empty.getCount > 0, 'empty tape must be read through real HTTP')
+    assert.deepEqual(empty.tapeReads, [''], 'empty evidence must actually be parsed before expiry')
     assert.match(empty.stderr, /final=true cost=true/)
     assert.ok(
       empty.elapsedMs < 900,
       `tape-miss should fail closed without waiting the WS silence window (${empty.elapsedMs}ms)`,
     )
+  })
+
+  test('tape grace stays fail-closed for wrong text, pending own error and missing turn signals', async () => {
+    const wrong = await runTurnCanaryFixture('ccb-final-cost-wrong-text')
+    assert.equal(wrong.code, 1, wrong.stdout)
+    assert.match(wrong.stderr, /TURN_INCOMPLETE.*resolve=tape-miss/)
+    assert.ok(wrong.getCount > 0)
+    assert.deepEqual(wrong.tapeReads, ['3'], 'non-2 evidence must actually reach the canary')
+    const error = await runTurnCanaryFixture('ccb-final-cost-pending-error')
+    assert.equal(error.code, 1, error.stdout)
+    assert.match(error.stderr, /TURN_FAILED.*own error while tape pending/)
+    assert.equal(error.getCount, 1, 'own error must interrupt an actual pending GET')
+    for (const mode of ['missing-final', 'missing-cost'] as const) {
+      const missing = await runTurnCanaryFixture(mode)
+      assert.equal(missing.code, 1, missing.stdout)
+      assert.match(missing.stderr, /TURN_INCOMPLETE.*resolve=silence/)
+      assert.equal(missing.getCount, 0, 'tape evidence cannot replace a missing turn signal')
+    }
   })
 
   test('candidate CCB cost fallback is exact ledger evidence and never weakens stable lanes', async () => {
@@ -9461,4 +9639,3 @@ describe('v5 versioned baseline manifest', () => {
     assert.match(verify, /OC_V5_LEGACY_BASELINE_FALLBACK/)
   })
 })
-

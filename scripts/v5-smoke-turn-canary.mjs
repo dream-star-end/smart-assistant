@@ -129,6 +129,9 @@ const attempt = () => new Promise((resolve) => {
   let ledgerCostGrace
   let tapeTextGrace
   let tapeTextPoll
+  let tapeEvidenceStarted = false
+  let tapeReadPending = false
+  const tapeReadAbort = new AbortController()
   let settled = false
   let textVia = 'ws'
   const exactText = () => finalText === '2'
@@ -140,23 +143,31 @@ const attempt = () => new Promise((resolve) => {
     clearTimeout(ledgerCostGrace)
     clearTimeout(tapeTextGrace)
     clearInterval(tapeTextPoll)
+    tapeReadAbort.abort()
     try { ws.close() } catch {}
     resolve({ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia })
   }
   const readTapeAssistantText = async () => {
     const res = await fetch(`${BASE}/api/sessions/${peerId}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: tapeReadAbort.signal,
     })
     if (!res.ok) return ''
     return extractAssistantText(await res.json())
   }
   const armTapeTextEvidence = () => {
-    if (tapeTextPoll || tapeTextGrace || sawError || exactText()) return
+    if (settled || tapeEvidenceStarted || sawError || exactText()) return
     if (!sawFinal || (REQUIRE_COST && !sawCost)) return
+    // The turn has finished; only the bounded evidence-read grace owns this phase.
+    // A leftover WS silence timer must not shorten that grace or restart it.
+    tapeEvidenceStarted = true
+    clearTimeout(silence)
     const tryOnce = async () => {
-      if (settled) return
+      if (settled || tapeReadPending) return
+      tapeReadPending = true
       try {
         const text = await readTapeAssistantText()
+        if (settled || sawError) return
         if (text === '2') {
           sawText = true
           finalText = text
@@ -164,6 +175,7 @@ const attempt = () => new Promise((resolve) => {
           finish('complete')
         }
       } catch { /* 轮询失败继续,直到 grace */ }
+      finally { tapeReadPending = false }
     }
     void tryOnce()
     tapeTextPoll = setInterval(() => { void tryOnce() }, TAPE_TEXT_POLL_MS)
@@ -174,6 +186,7 @@ const attempt = () => new Promise((resolve) => {
   }
   const resetSilence = () => {
     clearTimeout(silence)    // 冷启动/长思考兜底:静默兜底关连接,真正判成靠下方三信号
+    if (settled || tapeEvidenceStarted) return
     silence = setTimeout(() => finish('silence'), SILENCE_MS)
   }
   ws.onopen = () => {
@@ -243,7 +256,8 @@ const attempt = () => new Promise((resolve) => {
       sawError = JSON.stringify(f).slice(0, 300)
     }
     // 三信号集齐即提前收连接,不必空等满 SILENCE_MS(cost_charged 通常是最后一帧)。
-    if (criteriaMet()) finish('complete')
+    if (sawError) finish('error')
+    else if (criteriaMet()) finish('complete')
   }
   ws.onerror = () => {}
   ws.onclose = () => finish('closed')
