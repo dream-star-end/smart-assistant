@@ -1,5 +1,10 @@
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
@@ -198,70 +203,48 @@ if (/health\.on(Success|Failure)\(/.test(cursorSettleSrc)) {
 }
 console.log('[grok-pool-cooldown] PASS — INC-20260908-GROK-POOL-NO-COOLDOWN source contracts locked')
 
-// INC-20260908-CURSOR-AUDIT-SETTLE-GAP: source regression guard, not end-to-end proof.
-// The durableCursorBilling unit suite proves settle-before-close and zero-write
-// historical gaps; this gate only stops the production order reverting.
-const durableBillingSrc = readFileSync(
-  join(root, 'packages/commercial/src/billing/durableCursorBilling.ts'),
-  'utf8',
-)
-if (!durableBillingSrc.includes('Close the audit row only now that the settle committed')) {
-  throw new Error('[cursor-audit-settle-gap] durableCursorBilling.ts must close audit after settle')
-}
-if (
-  /UPDATE cursor_external_usage_audit[\s\S]{0,400}settleCursorExternalUsage/.test(durableBillingSrc)
-) {
-  throw new Error('[cursor-audit-settle-gap] audit close must not precede settleCursorExternalUsage')
-}
-console.log('[cursor-audit-settle-gap] PASS — INC-20260908-CURSOR-AUDIT-SETTLE-GAP source contracts locked')
+// --- OCV5-180 C data-safety proof (post-201; B1 must append after this block) ---
+// Helper-chain source checks first, then real node:test TAP. Do not comment-cheat
+// SET LOCAL back into liveFrameClassification.ts — timeout lives in the helper.
 
-// INC-20260908-CHATGPT-CONNECT-CAP: source regression guard, not end-to-end proof.
-const chatgptProxySrc = readFileSync(
-  join(root, 'packages/commercial/src/chatgptProxy/server.ts'),
-  'utf8',
-)
-for (const marker of [
-  'tunnels.add(clientSocket)',
-  'requestEnded = true',
-  "finish('client_aborted')",
-  'UPSTREAM_CONNECT_TIMEOUT_MS = 10_000',
-]) {
-  if (!chatgptProxySrc.includes(marker)) {
-    throw new Error(`[chatgpt-connect-cap] server.ts lost pending+active reservation contract: ${marker}`)
-  }
-}
-console.log('[chatgpt-connect-cap] PASS — INC-20260908-CHATGPT-CONNECT-CAP source contracts locked')
-
-// INC-20260908-SESSION-DELETED-WIRE: source regression guard, not end-to-end proof.
-const bridgeSrc = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
-for (const marker of [
-  'SESSION_DELETED_WIRE_MESSAGE',
-  'sendSessionDeletedFrame',
-  'action: "new_session"',
-]) {
-  if (!bridgeSrc.includes(marker)) {
-    throw new Error(`[session-deleted-wire] userChatBridge.ts lost SESSION_DELETED wire contract: ${marker}`)
-  }
-}
-const taxonomySrc = readFileSync(join(root, 'packages/protocol/src/turnErrorTaxonomy.ts'), 'utf8')
-if (!taxonomySrc.includes("session_deleted: { retryable: false, cta: 'new_session'")) {
-  throw new Error('[session-deleted-wire] protocol taxonomy must keep session_deleted non-retryable with new_session CTA')
-}
-console.log('[session-deleted-wire] PASS — INC-20260908-SESSION-DELETED-WIRE source contracts locked')
-
-// INC-20260908-LIVE-FRAME-CLASSIFY: source regression guard, not end-to-end proof.
+const candidateRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const classifySrc = readFileSync(
-  join(root, 'packages/commercial/src/db/liveFrameClassification.ts'),
+  join(candidateRoot, 'packages/commercial/src/db/liveFrameClassification.ts'),
   'utf8',
 )
-const healthSrc = readFileSync(join(root, 'packages/commercial/src/admin/businessHealth.ts'), 'utf8')
-const retentionSrc = readFileSync(join(root, 'packages/commercial/src/admin/auditRetention.ts'), 'utf8')
-for (const marker of ['export async function classifyRetiredLiveJournals(', 'unknown: true', 'SET LOCAL statement_timeout']) {
-  if (!classifySrc.includes(marker)) {
-    throw new Error(`[live-frame-classify] classification lost bounded read-only contract: ${marker}`)
-  }
+const helperSrc = readFileSync(
+  join(candidateRoot, 'packages/commercial/src/db/boundedReadOnly.ts'),
+  'utf8',
+)
+const healthSrc = readFileSync(join(candidateRoot, 'packages/commercial/src/admin/businessHealth.ts'), 'utf8')
+const retentionSrc = readFileSync(
+  join(candidateRoot, 'packages/commercial/src/admin/auditRetention.ts'),
+  'utf8',
+)
+if (!classifySrc.includes('withBoundedReadOnly')) {
+  throw new Error('[live-frame-classify] classification must call withBoundedReadOnly')
 }
-if (/\bDELETE FROM client_session_live_/.test(classifySrc)) {
+if (!classifySrc.includes('isBoundedReadTimeout')) {
+  throw new Error('[live-frame-classify] classification must map helper timeouts via isBoundedReadTimeout')
+}
+if (!classifySrc.includes('export async function classifyRetiredLiveJournals(')) {
+  throw new Error('[live-frame-classify] classifyRetiredLiveJournals export missing')
+}
+if (!classifySrc.includes('unknown: true')) {
+  throw new Error('[live-frame-classify] unknown classification arm missing')
+}
+if (classifySrc.includes('SET LOCAL statement_timeout')) {
+  throw new Error(
+    '[live-frame-classify] statement_timeout must stay in boundedReadOnly.ts, not be copied into classifySrc',
+  )
+}
+if (!helperSrc.includes('SET LOCAL statement_timeout')) {
+  throw new Error('[live-frame-classify] boundedReadOnly.ts lost SET LOCAL statement_timeout')
+}
+if (!/BEGIN READ ONLY/.test(helperSrc)) {
+  throw new Error('[live-frame-classify] boundedReadOnly.ts lost BEGIN READ ONLY')
+}
+if (/\bDELETE FROM client_session_live_/.test(classifySrc) || /\bDELETE FROM client_session_live_/.test(helperSrc)) {
   throw new Error('[live-frame-classify] classification must not DELETE live frames')
 }
 if (!healthSrc.includes('backupFreshness: "not_in_scope"') || healthSrc.includes('ok:')) {
@@ -270,4 +253,282 @@ if (!healthSrc.includes('backupFreshness: "not_in_scope"') || healthSrc.includes
 if (!retentionSrc.includes('"model_pricing_0903_cw_backup"')) {
   throw new Error('[live-frame-classify] model_pricing_0903_cw_backup must stay on the permanent ledger')
 }
-console.log('[live-frame-classify] PASS — INC-20260908-LIVE-FRAME-CLASSIFY source contracts locked')
+
+const C_FULL_LEAVES = [
+  'pricing miss throws and never closes the audit row',
+  'settle commits before the audit row closes (query order)',
+  'close UPDATE failure keeps usage committed; retry is idempotent and closes',
+  'concurrent settlers share one committed usage and close the audit once',
+  'audit user mismatch refuses to settle against the foreign wallet',
+  'live overrides keep unavailable status, live terminalCode and verified accountId',
+  "tick scans only status='pending' and performs no writes when none are pending",
+  'settle failure keeps the audit pending; the next tick settles and closes exactly once',
+  'connection refusal must remain unknown in the business-health snapshot',
+  'a stalled pool acquisition must not outlive the bounded health check',
+  'opens BEGIN READ ONLY and never sets default_transaction_read_only on the current txn',
+  'query timeout destroys the client and does not hang',
+  'late connect success releases once and does not run fn',
+  'late connect reject is consumed with no unhandledRejection',
+  'timeout then a later call recovers',
+  'query timeout on one count stays unknown and the snapshot still settles',
+  'retention alone hanging still reports unknown without blocking other items',
+  'classifies inflight / tapeRecoverable / uniqueCopy without DELETE',
+  'timeout returns unknown with null counts, never fake 0',
+  'dry-run restore samples tape reachable vs replay_live and writes nothing',
+  'model_pricing_0903_cw_backup is a permanent ledger and never a TTL table',
+  'live coverage reports unregistered names; timeout/error is unknown not empty-green',
+  'business health snapshot has no ok field and preserves unknown',
+  'serves PAC and healthz without auth; 404 elsewhere',
+  'CONNECT without credentials → 407 with Proxy-Authenticate',
+  'CONNECT with wrong secret → 407',
+  'valid credential but not entitled (not admin, not allowlisted) → 403',
+  'allowlisted host outside whitelist → 403; port 80 → 403',
+  'admin CONNECT to chatgpt.com builds transparent tunnel via upstream',
+  'allowlisted regular user is admitted; settings off blocks even admin',
+  'client close during pending keeps reservation; 65th 429; release frees; no double count',
+  'upstream failure during pending releases the reservation without 200',
+  'client close + 10s upstream timeout releases reservation and real socket',
+  'classifies every frontend-visible retryable code into automatic recovery or an explicit unsafe transport/admission exclusion',
+  'includes transient execution failures but excludes user/action and admission failures',
+  'normalizes every deployed unexpected runner label to one recovery policy',
+  'requires a checkpoint for ambiguous process-loss errors',
+  'mints one protocol-valid deterministic identity per source turn',
+  'derives the monotonic retry counter from raw controls or compacted terminal stamps',
+  'resets one first-event silent recovery, then persistently pauses the same no-progress lineage',
+  'pauses a runner-loss lineage after two zero-progress attempts, not one',
+  'keeps the ordinary retry budget once model, tool, or token progress exists',
+  'derives checkpoint safety from exact process and external-action states',
+] as const
+
+const C_SESSION_DELETED_LEAVES = [
+  'session_deleted persist is SESSION_DELETED, not retryable, and never starts container work',
+  'session_deleted admit is SESSION_DELETED, not retryable, and never starts container work',
+] as const
+
+const C_FULL_FILES = [
+  'packages/commercial/src/__tests__/durableCursorBilling.test.ts',
+  'packages/commercial/src/__tests__/boundedReadOnly.test.ts',
+  'packages/commercial/src/__tests__/liveFrameClassification.test.ts',
+  'packages/commercial/src/chatgptProxy/__tests__/server.test.ts',
+  'packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts',
+] as const
+
+const C_SESSION_DELETED_FILES = [
+  'packages/commercial/src/__tests__/userChatBridge.test.ts',
+  'packages/commercial/src/__tests__/modelAuthorityBridge.test.ts',
+] as const
+
+function resolveTsx(fromRoot: string): string {
+  try {
+    return createRequire(join(fromRoot, 'package.json')).resolve('tsx')
+  } catch (first) {
+    const snapshot = '/opt/openclaude/node_modules/tsx/dist/loader.mjs'
+    if (existsSync(snapshot)) return snapshot
+    throw first
+  }
+}
+
+function summaryValue(tap: string, key: string): number {
+  const values = [...tap.matchAll(new RegExp(`^# ${key} (\\d+)\\r?$`, 'gm'))].map((m) => Number(m[1]))
+  assert.equal(values.length, 1, `TAP ${key} must appear exactly once`)
+  return values[0]!
+}
+
+function parseLeafLine(line: string): { ok: boolean; name: string; skip: string | null; todo: boolean } | null {
+  const match = /^( {4})(not )?ok \d+ - (.+)$/.exec(line)
+  if (!match) return null
+  const rest = match[3]!
+  const directive = /^(.*?)\s+#\s*(SKIP|TODO)\b(.*)$/i.exec(rest)
+  if (!directive) return { ok: !match[2], name: rest.trim(), skip: null, todo: false }
+  const kind = directive[2]!.toUpperCase()
+  const reason = directive[3]!.replace(/^\s*:\s*/, '').trim()
+  return {
+    ok: !match[2],
+    name: directive[1]!.trim(),
+    skip: kind === 'SKIP' ? reason : null,
+    todo: kind === 'TODO',
+  }
+}
+
+function assertExactLeaves(actual: string[], expected: readonly string[], label: string): void {
+  const counts = new Map<string, number>()
+  for (const name of actual) counts.set(name, (counts.get(name) ?? 0) + 1)
+  for (const name of expected) {
+    assert.equal(counts.get(name), 1, `${label}: leaf must appear exactly once: ${name}`)
+    counts.delete(name)
+  }
+  assert.equal(counts.size, 0, `${label}: unexpected leaves ${[...counts.keys()].join(', ')}`)
+}
+
+function assertFullTap(tap: string, expected: readonly string[], label: string): void {
+  assert.equal((tap.match(/^TAP version 13\r?$/gm) ?? []).length, 1, `${label}: missing TAP header`)
+  assert.equal((tap.match(/^1\.\.\d+\r?$/gm) ?? []).length, 1, `${label}: missing complete root plan`)
+  assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!/gm)
+  const leaves: string[] = []
+  for (const line of tap.split(/\r?\n/)) {
+    const parsed = parseLeafLine(line)
+    if (!parsed) continue
+    if (!parsed.ok || parsed.todo || parsed.skip) {
+      throw new Error(`${label}: leaf must pass without skip/todo: ${line}`)
+    }
+    leaves.push(parsed.name)
+  }
+  assertExactLeaves(leaves, expected, label)
+  assert.equal(summaryValue(tap, 'tests'), expected.length, `${label}: tests`)
+  assert.equal(summaryValue(tap, 'pass'), expected.length, `${label}: pass`)
+  assert.equal(summaryValue(tap, 'fail'), 0, `${label}: fail`)
+  assert.equal(summaryValue(tap, 'cancelled'), 0, `${label}: cancelled`)
+  assert.equal(summaryValue(tap, 'skipped'), 0, `${label}: skipped`)
+  assert.equal(summaryValue(tap, 'todo'), 0, `${label}: todo`)
+  assert.equal((tap.match(/^# duration_ms [0-9.]+\r?$/gm) ?? []).length, 1, `${label}: missing TAP completion summary`)
+}
+
+function assertSelectedTap(tap: string, expected: readonly string[], label: string): void {
+  assert.equal((tap.match(/^TAP version 13\r?$/gm) ?? []).length, 1, `${label}: missing TAP header`)
+  assert.equal((tap.match(/^1\.\.\d+\r?$/gm) ?? []).length, 1, `${label}: missing complete root plan`)
+  assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!/gm)
+  const selected: string[] = []
+  let filteredSkips = 0
+  for (const line of tap.split(/\r?\n/)) {
+    const parsed = parseLeafLine(line)
+    if (!parsed) continue
+    const wanted = (expected as readonly string[]).includes(parsed.name)
+    if (wanted) {
+      if (!parsed.ok || parsed.todo || parsed.skip) {
+        throw new Error(`${label}: selected leaf must pass: ${line}`)
+      }
+      selected.push(parsed.name)
+      continue
+    }
+    if (parsed.todo) throw new Error(`${label}: unexpected TODO: ${line}`)
+    if (!parsed.ok) throw new Error(`${label}: unexpected failure: ${line}`)
+    if (parsed.skip !== 'test name does not match pattern') {
+      throw new Error(`${label}: non-selected skip must be runner filter: ${line}`)
+    }
+    filteredSkips += 1
+  }
+  assertExactLeaves(selected, expected, label)
+  assert.equal(summaryValue(tap, 'fail'), 0, `${label}: fail`)
+  assert.equal(summaryValue(tap, 'cancelled'), 0, `${label}: cancelled`)
+  assert.equal(summaryValue(tap, 'todo'), 0, `${label}: todo`)
+  assert.equal(summaryValue(tap, 'pass'), expected.length, `${label}: selected pass`)
+  assert.equal(summaryValue(tap, 'skipped'), filteredSkips, `${label}: filtered skips`)
+  assert.equal(summaryValue(tap, 'tests'), expected.length + filteredSkips, `${label}: tests`)
+  assert.equal((tap.match(/^# duration_ms [0-9.]+\r?$/gm) ?? []).length, 1, `${label}: missing TAP completion summary`)
+}
+
+async function runTapProof(opts: {
+  fromRoot: string
+  files: readonly string[]
+  expected: readonly string[]
+  label: string
+  timeoutMs: number
+  namePattern?: string
+}): Promise<void> {
+  for (const rel of opts.files) {
+    const abs = join(opts.fromRoot, rel)
+    if (!existsSync(abs)) throw new Error(`${opts.label}: missing fixture ${rel}`)
+    readFileSync(abs)
+  }
+  const tsx = resolveTsx(opts.fromRoot)
+  const home = mkdtempSync(join(tmpdir(), 'oc-c-data-safety-proof-'))
+  const env: NodeJS.ProcessEnv = {}
+  for (const key of ['PATH', 'LANG', 'LC_ALL', 'TZ', 'SystemRoot']) {
+    if (process.env[key] !== undefined) env[key] = process.env[key]
+  }
+  for (const dir of ['home', 'state', 'tmp']) mkdirSync(join(home, dir))
+  env.HOME = join(home, 'home')
+  env.OPENCLAUDE_HOME = join(home, 'state')
+  env.TMPDIR = join(home, 'tmp')
+  env.NO_COLOR = '1'
+  const args = ['--import', tsx, '--test', '--test-reporter=tap']
+  if (opts.namePattern) args.push(`--test-name-pattern=${opts.namePattern}`)
+  args.push(...opts.files.map((rel) => join(opts.fromRoot, rel)))
+  try {
+    const tap = await new Promise<string>((resolveProof, rejectProof) => {
+      const child = spawn(process.execPath, args, {
+        cwd: opts.fromRoot,
+        env,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      let bytes = 0
+      let failure: Error | undefined
+      const stop = (reason: string): void => {
+        failure ??= new Error(reason)
+        if (child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, 'SIGKILL')
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ESRCH') failure = err as Error
+          }
+        }
+      }
+      const onInterrupt = (): void => stop(`${opts.label} interrupted`)
+      process.on('SIGINT', onInterrupt)
+      process.on('SIGTERM', onInterrupt)
+      const timer = setTimeout(() => stop(`${opts.label} timed out`), opts.timeoutMs)
+      const capture = (target: 'stdout' | 'stderr', data: Buffer): void => {
+        bytes += data.length
+        if (bytes > 8 * 1024 * 1024) {
+          stop(`${opts.label} exceeded output bound`)
+          return
+        }
+        if (target === 'stdout') stdout += data.toString('utf8')
+        else stderr += data.toString('utf8')
+      }
+      child.stdout.on('data', (data: Buffer) => capture('stdout', data))
+      child.stderr.on('data', (data: Buffer) => capture('stderr', data))
+      child.on('error', (err) => {
+        failure ??= err
+      })
+      child.on('close', (code, signal) => {
+        clearTimeout(timer)
+        process.off('SIGINT', onInterrupt)
+        process.off('SIGTERM', onInterrupt)
+        if (failure || code !== 0 || signal !== null) {
+          rejectProof(
+            new Error(`${failure?.message ?? `${opts.label} exit=${code} signal=${signal}`}\n${stdout}\n${stderr}`),
+          )
+          return
+        }
+        resolveProof(stdout)
+      })
+    })
+    if (opts.namePattern) assertSelectedTap(tap, opts.expected, opts.label)
+    else assertFullTap(tap, opts.expected, opts.label)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+}
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: C_FULL_FILES,
+  expected: C_FULL_LEAVES,
+  label: 'c-data-safety-full',
+  timeoutMs: 120_000,
+})
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: C_SESSION_DELETED_FILES,
+  expected: C_SESSION_DELETED_LEAVES,
+  label: 'c-session-deleted',
+  timeoutMs: 60_000,
+  namePattern: 'session_deleted (persist|admit) is SESSION_DELETED',
+})
+
+console.log(
+  '[cursor-audit-settle-gap] PASS — INC-20260908-CURSOR-AUDIT-SETTLE-GAP executed settle-before-close unique-23505 and COMMIT-before-close',
+)
+console.log(
+  '[chatgpt-connect-cap] PASS — INC-20260908-CHATGPT-CONNECT-CAP executed pending+active reservation transport proof',
+)
+console.log(
+  '[session-deleted-wire] PASS — INC-20260908-SESSION-DELETED-WIRE executed admit+persist SESSION_DELETED transport proof',
+)
+console.log(
+  '[live-frame-classify] PASS — INC-20260908-LIVE-FRAME-CLASSIFY executed bounded helper classify/unknown/connect/query proof',
+)

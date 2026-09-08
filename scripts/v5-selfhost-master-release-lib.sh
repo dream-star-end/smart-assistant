@@ -542,6 +542,11 @@ build_master_release() {
     cleanup_master_staging
     die "pinned delegate engine billing requestId contract gate 失败"
   fi
+  mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
+  if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
+    cleanup_master_staging
+    die "pinned session unavailable / data-safety rootfix contract gate 失败"
+  fi
 
   t0="$(date +%s)"
   mlog "  web-react official build @ staging(不碰工作树 dist)"
