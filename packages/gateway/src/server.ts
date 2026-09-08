@@ -8551,16 +8551,17 @@ export class Gateway {
         this.sendError(res, 403, 'agent id is reserved')
         return
       }
+      const id = body.id
       const { config: cfg, result: agent } = await updateAgentsConfig((cfg) => {
-        if (cfg.agents.find((a) => a.id === body.id)) {
+        if (cfg.agents.find((a) => a.id === id)) {
           return null
         }
         // Inherit provider/permissionMode/cwd from request or sensible defaults
         const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
         const agent: AgentDef = {
-          id: body.id,
+          id: id,
           model: body.model ?? this.deps.config.defaults.model,
-          persona: paths.agentClaudeMd(body.id),
+          persona: paths.agentClaudeMd(id),
           permissionMode:
             body.permissionMode ??
             defaultAgent?.permissionMode ??
