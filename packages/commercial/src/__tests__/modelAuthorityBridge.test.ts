@@ -1277,6 +1277,50 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
   });
 });
 
+describe("bridge SESSION_DELETED admit wire (OCV5-180 C)", () => {
+  test("session_deleted admit is SESSION_DELETED, not retryable, and never starts container work", async () => {
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      admitUserTurn: async () => {
+        admitCalls += 1;
+        return { kind: "session_deleted" };
+      },
+      hasCompletedClientTurn: async () => false,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const fc = frameCollector(ws);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-deleted-admit",
+          idempotencyKey: "web:cm-deleted-admit:0",
+          peer: { id: "sess-deleted-admit", kind: "dm" },
+        }),
+      );
+      const error = await fc.next();
+      assert.equal(error.type, "error");
+      assert.equal(error.code, "SESSION_DELETED");
+      assert.equal(error.retryable, false);
+      assert.equal(error.action, "new_session");
+      assert.match(String(error.message), /deleted/i);
+      assert.equal(admitCalls, 1);
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(
+        rig.containerSeen.some((raw) => {
+          try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }),
+        false,
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
 describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", () => {
   test("已有 completed assistant 行 → dedup ack 且 admitUserTurn 从未被调用(无孤儿 dispatch)", async () => {
     let admitCalls = 0;

@@ -3493,6 +3493,139 @@
           "assertion": "[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters"
         }
       ]
+    },
+    {
+      "id": "INC-20260908-CURSOR-AUDIT-SETTLE-GAP",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "Cursor audit 先关 pending 再 settle，pricing/PG 失败后行已终态且无 usage，补偿扫描再也扫不到。未来 pending 改为 settle-before-close；历史 terminal-gap 常驻 tick 零写，不自动补录 132 条。",
+      "rootFixCommit": "b5bf02c8",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "pricing miss throws and never closes the audit row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "close UPDATE failure keeps usage committed; retry is idempotent and closes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "concurrent settlers share one committed usage and close the audit once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/durableCursorBilling.test.ts",
+          "assertion": "tick scans only status='pending' and performs no writes when none are pending"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-CURSOR-AUDIT-SETTLE-GAP executed settle-before-close unique-23505 and COMMIT-before-close"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-CHATGPT-CONNECT-CAP",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "ChatGPT CONNECT 在 upstream 握手完成前不计入 cap，并发握手可越过每用户 64 / 全局 2048。client close 在 pending 阶段只标 ended，名额保留到真实 socket 终态；晚到成功先 destroy 再释放，不 200/pipe。",
+      "rootFixCommit": "b5e57a8e",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/chatgptProxy/__tests__/server.test.ts",
+          "assertion": "client close during pending keeps reservation; 65th 429; release frees; no double count"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/chatgptProxy/__tests__/server.test.ts",
+          "assertion": "client close + 10s upstream timeout releases reservation and real socket"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-CHATGPT-CONNECT-CAP executed pending+active reservation transport proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-SESSION-DELETED-WIRE",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "已删会话仍发 SESSION_PERSIST_UNAVAILABLE 并提示可安全重试，前端当瞬时失败原 peer 重发。改为 SESSION_DELETED + retryable false + new_session CTA；回收站恢复后发送路径不改。",
+      "rootFixCommit": "b661d576",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "session_deleted persist is SESSION_DELETED, not retryable, and never starts container work"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "session_deleted admit is SESSION_DELETED, not retryable, and never starts container work"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "legacy SESSION_DELETED paints a non-retryable card and does not auto-recover"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-SESSION-DELETED-WIRE executed admit+persist SESSION_DELETED transport proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260908-LIVE-FRAME-CLASSIFY",
+      "occurredAt": "2026-09-08",
+      "severity": "P1",
+      "symptom": "只读 live-frame 分类与业务健康在 connect 拒绝或卡住时会整份诊断抛错或无界等待，发布/运维必需检查因此被阻断。本包用 bounded helper（JS deadline + BEGIN READ ONLY + SET LOCAL statement_timeout）覆盖 acquisition/query，timeout/unknown 带 null 计数不得伪 0，按需 CLI 不进热 tick 与 /healthz.ok；model_pricing_0903_cw_backup 永久账本。影响是诊断整体不可用或检查挂起，不是已证实的线上资损或备份恢复失败。",
+      "rootFixCommit": "3ec290e1",
+      "coverageCommits": [
+        "5f736b0f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "classifies inflight / tapeRecoverable / uniqueCopy without DELETE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "timeout returns unknown with null counts, never fake 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/liveFrameClassification.test.ts",
+          "assertion": "model_pricing_0903_cw_backup is a permanent ledger and never a TTL table"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260908-LIVE-FRAME-CLASSIFY executed bounded helper classify/unknown/connect/query proof"
+        }
+      ]
     }
   ]
 }

@@ -3314,6 +3314,31 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     },
   );
 
+  test("legacy SESSION_DELETED paints a non-retryable card and does not auto-recover", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "hello", { status: "sending", ts: 1 });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = user.id;
+    const scheduleAutomaticRecovery = vi.fn();
+    applyLegacyBridgeError(
+      s,
+      {
+        type: "error",
+        code: "SESSION_DELETED",
+        message: "This conversation was deleted. Start a new one; retrying here will not bring it back.",
+        clientMessageId: user.id,
+        retryable: false,
+        action: "new_session",
+      } as never,
+      { scheduleAutomaticRecovery },
+    );
+    expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+    expect(s._sendingInFlight).toBe(false);
+    const card = s.messages.find((m) => m._errorCode);
+    expect(card?._errorCode).toBe("session_deleted");
+    expect(card?.text).toContain("删除");
+  });
+
   test("无 clientMessageId 的取消只检查最近用户行，不改动更早的排队消息", () => {
     for (const legacy of [false, true]) {
       const s = sess();

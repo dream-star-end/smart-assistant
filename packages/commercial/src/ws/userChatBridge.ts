@@ -98,7 +98,7 @@ import {
   serializeVerificationSponsorshipSnapshot,
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
-import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
+import { settleDurableCursorBilling } from "../billing/durableCursorBilling.js";
 import {
   publishZcodeCatalogSettle,
   settleZcodeCatalogUsage,
@@ -158,6 +158,7 @@ import {
   type MessageReplyQuote,
   type DispatchRequestContent,
   type SessionWorkspaceMode,
+  type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
@@ -1910,11 +1911,19 @@ function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
   return { peerId, clientMessageId };
 }
 
+const SESSION_DELETED_WIRE_MESSAGE =
+  "This conversation was deleted. Start a new one; retrying here will not bring it back.";
+
 function sendErrorFrame(
   ws: WebSocket,
   code: string,
   message: string,
-  turn?: { peerId?: string | null; clientMessageId?: string | null },
+  turn?: {
+    peerId?: string | null;
+    clientMessageId?: string | null;
+    retryable?: boolean;
+    action?: string;
+  },
 ): void {
   if (ws.readyState !== WebSocket.OPEN) return;
   try {
@@ -1924,9 +1933,22 @@ function sendErrorFrame(
       message,
       ...(turn?.peerId ? { peer: { id: turn.peerId, kind: "dm" } } : {}),
       ...(turn?.clientMessageId ? { clientMessageId: turn.clientMessageId } : {}),
+      ...(turn?.retryable === false || turn?.retryable === true ? { retryable: turn.retryable } : {}),
+      ...(turn?.action ? { action: turn.action } : {}),
     }));
   }
   catch { /* client gone */ }
+}
+
+function sendSessionDeletedFrame(
+  ws: WebSocket,
+  turn: { peerId?: string | null; clientMessageId?: string | null },
+): void {
+  sendErrorFrame(ws, "SESSION_DELETED", SESSION_DELETED_WIRE_MESSAGE, {
+    ...turn,
+    retryable: false,
+    action: "new_session",
+  });
 }
 
 /**
@@ -4654,8 +4676,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 { peerId, clientMessageId },
               );
               return null;
-            case "session_not_found":
             case "session_deleted":
+              turnLog?.warn("user-chat-bridge: dispatch admission session deleted", {
+                sessionId: peerId, clientMessageId, kind: admit.kind,
+              });
+              sendSessionDeletedFrame(userWs, { peerId, clientMessageId });
+              return null;
+            case "session_not_found":
             case "append_error":
               turnLog?.warn("user-chat-bridge: dispatch admission unavailable", {
                 sessionId: peerId, clientMessageId, kind: admit.kind,
@@ -4663,7 +4690,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(
                 userWs, "SESSION_PERSIST_UNAVAILABLE",
                 "user message could not be durably admitted; retry safely",
-                { peerId, clientMessageId },
+                { peerId, clientMessageId, retryable: true },
               );
               return null;
             default: {
@@ -4703,18 +4730,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
           if (!persisted) {
-            onReject?.("SESSION_PERSIST_UNAVAILABLE");
+            const deleted = lastReason === "session_deleted";
+            onReject?.(deleted ? "SESSION_DELETED" : "SESSION_PERSIST_UNAVAILABLE");
             turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
               sessionId: peerId,
               clientMessageId,
               reason: lastReason,
             });
-            sendErrorFrame(
-              userWs,
-              "SESSION_PERSIST_UNAVAILABLE",
-              "user message could not be durably admitted; retry safely",
-              { peerId, clientMessageId },
-            );
+            if (deleted) {
+              sendSessionDeletedFrame(userWs, { peerId, clientMessageId });
+            } else {
+              sendErrorFrame(
+                userWs,
+                "SESSION_PERSIST_UNAVAILABLE",
+                "user message could not be durably admitted; retry safely",
+                { peerId, clientMessageId, retryable: true },
+              );
+            }
             return null;
           }
         }
@@ -7602,24 +7634,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const pricing = deps.pricing;
               void (async () => {
                 try {
-                  const updated = await pool.query<{ model_id: string; session_id: string | null }>(
-                    `UPDATE cursor_external_usage_audit
-                        SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
-                      WHERE request_id=$1 AND user_id=$6 AND status='pending'
-                    RETURNING model_id, session_id`,
-                    [requestId, status, terminalCode, durationMs, usage, uid],
+                  // Read the audit identity without closing it: closing now
+                  // (the old UPDATE-first order) stranded audits whose settle
+                  // later failed — terminal status, no usage row, never
+                  // retried. settleDurableCursorBilling below closes the row
+                  // only after the settle commits; a pricing miss / PG failure
+                  // keeps it pending for the cursorAuditReconciler.
+                  const audit = await pool.query<{ model_id: string; session_id: string | null }>(
+                    `SELECT model_id, session_id FROM cursor_external_usage_audit
+                      WHERE request_id=$1 AND user_id=$2`,
+                    [requestId, uid],
                   );
-                  let modelId = updated.rows[0]?.model_id ?? null;
-                  let sessionId = updated.rows[0]?.session_id ?? null;
-                  if (modelId === null) {
-                    const existing = await pool.query<{ model_id: string; session_id: string | null }>(
-                      `SELECT model_id, session_id FROM cursor_external_usage_audit
-                        WHERE request_id=$1 AND user_id=$2`,
-                      [requestId, uid],
-                    );
-                    modelId = existing.rows[0]?.model_id ?? null;
-                    sessionId = existing.rows[0]?.session_id ?? sessionId;
-                  }
+                  const modelId = audit.rows[0]?.model_id ?? null;
+                  const sessionId = audit.rows[0]?.session_id ?? null;
                   let cursorAccountId: bigint | null = null;
                   const stableIdentityParts = [
                     external.cursorAccountId,
@@ -7690,32 +7717,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   } else if (!pricing) {
                     bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, pricing cache missing', { requestId, modelId });
                   } else {
-                    const settled = await settleCursorExternalUsage({
-                      pool,
-                      pricing,
-                      userId: uid,
-                      requestId,
-                      modelId,
-                      sessionId,
-                      engineStatus: status,
-                      terminalCode,
-                      usage,
-                      accountId: cursorAccountId,
-                    });
-                    if (settled === null) {
-                      bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, model pricing not in cache', { requestId, modelId });
-                    } else if (
-                      settled.debitedCredits !== null &&
-                      settled.debitedCredits > 0n &&
-                      deps.appendCostCredits
-                    ) {
-                      await deps.appendCostCredits(
+                    // Shared settle-before-close routine (same one the durable
+                    // tape path and the reconciler use): the audit row closes
+                    // only on a committed settle. The live terminal vocabulary
+                    // ('unavailable' / AUTH_UNAVAILABLE / QUOTA_UNAVAILABLE)
+                    // and the verified Cursor account attribution are passed
+                    // through options; quota learn above is unchanged.
+                    await settleDurableCursorBilling(
+                      { pgPool: pool, pricing, appendCostCredits: deps.appendCostCredits },
+                      uid,
+                      {
                         requestId,
-                        uid.toString(),
-                        settled.debitedCredits.toString(),
-                        sessionId,
-                      );
-                    }
+                        engine: 'cursor',
+                        engineSessionId: sessionId ?? '',
+                        status: status === 'success' ? 'success' : 'error',
+                        durationMs: durationMs ?? 0,
+                        usage: (usage ?? undefined) as DurableCodexBilling['usage'],
+                      },
+                      { engineStatus: status, terminalCode, accountId: cursorAccountId },
+                    );
                   }
                 } catch (err) {
                   bridgeLog?.warn('user-chat-bridge: Cursor platform settle failed', { requestId, err });

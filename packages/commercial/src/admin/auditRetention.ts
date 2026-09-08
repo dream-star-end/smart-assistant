@@ -161,6 +161,10 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // the exact manual-compensation anchor named in each migration header.
   "model_pricing_0269_backup",
   "model_pricing_0270_backup",
+  // 2026-09-03 Cursor cache-write repricing before-image. Handmade live table,
+  // same class as the other model_pricing_*_backup ledgers: permanent rollback
+  // proof. Do not DROP or TTL.
+  "model_pricing_0903_cw_backup",
   "emergency_containment_authorizations",
   "emergency_containment_debts",
   "verification_runs",

@@ -24,6 +24,11 @@ import {
   PERMANENT_AUDIT_TABLES,
   PERMANENT_OPS_LEDGER_TABLES,
 } from "./auditRetention.js";
+import {
+  isBoundedReadTimeout,
+  withBoundedReadOnly,
+  type BoundedReadPool,
+} from "../db/boundedReadOnly.js";
 
 export type RetentionDisposition =
   | { kind: "ttl" }
@@ -293,3 +298,36 @@ function buildRetentionRegistry(): Readonly<Record<string, RetentionDisposition>
 /** 全表 retention 离场语义单一权威(模块加载即校验无重复登记)。 */
 export const RETENTION_REGISTRY: Readonly<Record<string, RetentionDisposition>> =
   buildRetentionRegistry();
+
+/**
+ * Live-only coverage: public base tables present in `pool` but missing from
+ * RETENTION_REGISTRY. Read-only; never DROP/TTL. Handmade live tables such as
+ * model_pricing_0903_cw_backup must be claimed as permanent-ledger so this
+ * returns []. Timeouts/errors must not be reported as an empty (green) set.
+ */
+export async function auditLiveRetentionCoverage(
+  pool: BoundedReadPool,
+  options?: { statementTimeoutMs?: number },
+): Promise<{ unregistered: string[] | null; unknown: boolean; reason?: string }> {
+  try {
+    return await withBoundedReadOnly(pool, options?.statementTimeoutMs ?? 5_000, async (client) => {
+      const live = await client.query<{ table_name: string }>(
+        `SELECT table_name
+           FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
+      );
+      const registered = new Set(Object.keys(RETENTION_REGISTRY));
+      const unregistered = live.rows
+        .map((row) => row.table_name)
+        .filter((name) => !registered.has(name))
+        .sort();
+      return { unregistered, unknown: false as const };
+    });
+  } catch (err) {
+    return {
+      unregistered: null,
+      unknown: true,
+      reason: isBoundedReadTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
+    };
+  }
+}
