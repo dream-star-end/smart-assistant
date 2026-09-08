@@ -124,14 +124,17 @@ function assertNoUnregisteredSoul(profile: IdentityCompatProfile): void {
 }
 
 function assertCoreEquivalence(profile: IdentityCompatProfile): void {
-  // Read-only equivalence proof; never relinks. Both missing = nothing to diverge.
-  const legacyReal = realPathOrNull(paths.agentMemoryDir(profile.legacyAgentId))
-  const canonicalReal = realPathOrNull(paths.agentMemoryDir(profile.canonicalAgentId))
-  if (legacyReal !== canonicalReal) {
-    throw new IdentityAssetsError(
-      'COMPAT_CONFIG_CONFLICT',
-      `Core memory dirs must be the same physical store (realpath legacy=${legacyReal ?? '(missing)'} canonical=${canonicalReal ?? '(missing)'}); this layer never migrates or relinks — resolve the drift manually`,
-    )
+  // Both the entries directory AND index are authoritative Core assets. Missing
+  // paths cannot prove this explicitly registered existing namespace is intact.
+  for (const pathFor of [paths.agentMemoryDir, paths.agentMemoryMd]) {
+    const legacyReal = realPathOrNull(pathFor(profile.legacyAgentId))
+    const canonicalReal = realPathOrNull(pathFor(profile.canonicalAgentId))
+    if (!legacyReal || !canonicalReal || legacyReal !== canonicalReal) {
+      throw new IdentityAssetsError(
+        'COMPAT_CONFIG_CONFLICT',
+        `Core paths must be the same existing physical store (realpath legacy=${legacyReal ?? '(missing)'} canonical=${canonicalReal ?? '(missing)'}); this layer never migrates or relinks — resolve the drift manually`,
+      )
+    }
   }
 }
 
@@ -210,8 +213,9 @@ export async function resolveIdentityCompatAssets(input: {
   const { profile } = input
   const [agentsCfg, config] = await Promise.all([
     readAgentsConfig(),
-    readConfig().catch(() => null),
+    readConfig().catch(() => { throw new IdentityAssetsError('COMPAT_CONFIG_CONFLICT', 'cannot read the effective permission defaults authority') }),
   ])
+  if (!config) throw new IdentityAssetsError('COMPAT_CONFIG_CONFLICT', 'effective permission defaults authority is missing')
   const legacy = agentsCfg.agents.find((a) => a.id === profile.legacyAgentId)
   const canonical = agentsCfg.agents.find((a) => a.id === profile.canonicalAgentId)
   if (!legacy || !canonical) {

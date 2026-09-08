@@ -44,13 +44,15 @@ function seedBase(): void {
   rmSync(join(TEST_HOME, 'openclaude.json'), { force: true })
 
   mkdirSync(join(TEST_HOME, 'agents/main/memory'), { recursive: true })
-  writeFileSync(join(TEST_HOME, 'agents/main/memory/MEMORY.md'), '# main\n')
+  writeFileSync(join(TEST_HOME, 'agents/main/MEMORY.md'), '# main\n')
   mkdirSync(join(TEST_HOME, 'agents/butler'), { recursive: true })
   writeFileSync(join(TEST_HOME, 'agents/butler/CLAUDE.md'), MANUAL_TEXT)
   mkdirSync(join(TEST_HOME, 'agents/personal-butler'), { recursive: true })
   writeFileSync(join(TEST_HOME, 'agents/personal-butler/CLAUDE.md'), MARKET_TEXT)
   symlinkSync('../main/memory', join(TEST_HOME, 'agents/butler/memory'))
   symlinkSync('../main/memory', join(TEST_HOME, 'agents/personal-butler/memory'))
+  symlinkSync('../main/MEMORY.md', join(TEST_HOME, 'agents/butler/MEMORY.md'))
+  symlinkSync('../main/MEMORY.md', join(TEST_HOME, 'agents/personal-butler/MEMORY.md'))
   writeFileSync(
     join(TEST_HOME, 'agents.yaml'),
     [

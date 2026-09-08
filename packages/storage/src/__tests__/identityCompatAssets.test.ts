@@ -57,7 +57,7 @@ function seedHome(opts: SeedOpts = {}): void {
   rmSync(join(TEST_HOME, 'openclaude.json'), { force: true })
 
   mkdirSync(join(TEST_HOME, 'agents/main/memory'), { recursive: true })
-  writeFileSync(join(TEST_HOME, 'agents/main/memory/MEMORY.md'), '# main index\n')
+  writeFileSync(join(TEST_HOME, 'agents/main/MEMORY.md'), '# main index\n')
 
   mkdirSync(join(TEST_HOME, 'agents/butler'), { recursive: true })
   writeFileSync(join(TEST_HOME, 'agents/butler/CLAUDE.md'), opts.manualText ?? MANUAL_TEXT)
@@ -65,6 +65,8 @@ function seedHome(opts: SeedOpts = {}): void {
   writeFileSync(join(TEST_HOME, 'agents/personal-butler/CLAUDE.md'), MARKET_TEXT)
   symlinkSync('../main/memory', join(TEST_HOME, 'agents/butler/memory'))
   symlinkSync('../main/memory', join(TEST_HOME, 'agents/personal-butler/memory'))
+  symlinkSync('../main/MEMORY.md', join(TEST_HOME, 'agents/butler/MEMORY.md'))
+  symlinkSync('../main/MEMORY.md', join(TEST_HOME, 'agents/personal-butler/MEMORY.md'))
 
   const legacyMode =
     opts.legacyPermissionMode === undefined ? 'bypassPermissions' : opts.legacyPermissionMode
@@ -112,6 +114,18 @@ function expectConflict(promise: Promise<unknown>, code: string, needle?: string
 
 describe('resolveIdentityCompatAssets', () => {
   beforeEach(() => seedHome())
+
+  it('rejects an unreadable defaults authority rather than treating both permissions as absent', async () => {
+    seedHome({ legacyPermissionMode: null })
+    writeFileSync(join(TEST_HOME, 'openclaude.json'), '{broken')
+    await expectConflict(resolveIdentityCompatAssets({ profile: PROFILE }), 'COMPAT_CONFIG_CONFLICT')
+  })
+
+  it('requires both the Core directory and its index to remain the same existing store', async () => {
+    rmSync(join(TEST_HOME, 'agents/personal-butler/MEMORY.md'))
+    writeFileSync(join(TEST_HOME, 'agents/personal-butler/MEMORY.md'), '# split index')
+    await expectConflict(resolveIdentityCompatAssets({ profile: PROFILE }), 'COMPAT_CONFIG_CONFLICT')
+  })
 
   it('resolves the registered assets with equal effective permissionMode (site shape)', async () => {
     const assets = await resolveIdentityCompatAssets({ profile: PROFILE })
