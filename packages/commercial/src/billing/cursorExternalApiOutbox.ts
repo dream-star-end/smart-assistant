@@ -325,37 +325,55 @@ export async function openCursorExternalApiOutbox(args: {
         return true;
       };
 
-      const walk = async (accept: (name: string) => boolean): Promise<void> => {
+      // Resume in the filesystem's actual enumeration order, not lexicographic
+      // order: opendir is unordered, so a lex cursor skips names forever.
+      // Each call streams the directory at most twice and always closes it.
+      type WalkMode = "from-start" | "after-cursor" | "wrap";
+      const walk = async (mode: WalkMode): Promise<"found-cursor" | "eof" | "full"> => {
         let dh: Awaited<ReturnType<typeof opendir>> | undefined;
         try {
           dh = await opendir(directory);
         } catch (err) {
           args.logger?.warn("cursor_external_outbox_readdir_failed", { err: String(err) });
           truncated = true;
-          return;
+          return "eof";
         }
         try {
+          let skipping = mode === "after-cursor";
           for await (const ent of dh) {
             if (Date.now() >= deadline || observations.length >= limit) {
               truncated = true;
-              break;
+              return "full";
             }
             const name = ent.name;
             if (!name.endsWith(".json") || name.startsWith(".")) continue;
-            if (!accept(name)) continue;
+            if (skipping) {
+              if (name === scanCursor) skipping = false;
+              continue;
+            }
+            if (mode === "wrap" && name === scanCursor) {
+              return "found-cursor";
+            }
             const keepGoing = await inspect(name);
-            if (!keepGoing) break;
+            if (!keepGoing) return "full";
           }
+          return "eof";
         } finally {
           await dh.close().catch(() => undefined);
         }
       };
 
-      // Fair cursor without materialising the whole directory: first names
-      // lexicographically after the last cursor, then wrap to the start.
-      await walk((name) => name > scanCursor);
-      if (!truncated && observations.length < limit) {
-        await walk((name) => name <= scanCursor);
+      if (!scanCursor) {
+        await walk("from-start");
+      } else {
+        const first = await walk("after-cursor");
+        if (first === "eof" && observations.length === 0) {
+          // Cursor file vanished (consumed/deleted). Restart from the first
+          // dirent so a missing cookie cannot stall the scanner.
+          await walk("from-start");
+        } else if (first !== "full" && observations.length < limit) {
+          await walk("wrap");
+        }
       }
       if (lastFile) scanCursor = lastFile;
       return { observations, scanned, truncated };
