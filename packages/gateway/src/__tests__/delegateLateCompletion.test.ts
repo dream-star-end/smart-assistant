@@ -15,9 +15,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, readdir } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import type { DurableAgentGroup } from '@openclaude/protocol'
@@ -28,7 +25,6 @@ import {
   lateDelegateGroupIdentity,
   lateDelegateGroupTurnKey,
   lateDelegateLogicalRunKey,
-  persistedRootContainsLogicalRun,
   type DelegateOwnerTurnLocator,
 } from '../delegateLateCompletion.js'
 import { SessionManager, type AgentSession } from '../sessionManager.js'
@@ -40,7 +36,6 @@ import {
   type V3MasterSink,
   type V3MasterSinkPayload,
 } from '../v3MasterSink.js'
-import { makeV3MasterRetryQueue } from '../v3MasterRetryQueue.js'
 
 const OWNER_TURN_KEY = 'a'.repeat(64)
 const OTHER_TURN_KEY = 'b'.repeat(64)
@@ -162,21 +157,6 @@ function makeCapturingSink(outcome: { ok: boolean; queued?: boolean } = { ok: tr
     },
     attemptOnce: async () => {
       throw new Error('not used')
-    },
-    lookupRootLogicalRun: async (input) => {
-      const owner: DelegateOwnerTurnLocator = {
-        parentSessionId: input.sessionId,
-        parentTurnKey: input.ownerTurnKey,
-        turnIndex: 1,
-      }
-      for (const payload of payloads) {
-        if (payload.sessionId !== input.sessionId) continue
-        if (!persistedRootContainsLogicalRun(payload, input.ownerTurnKey, input.runId)) continue
-        const existing = (payload.agentGroups ?? []).find((item) => item.runId === input.runId)
-        if (!existing) continue
-        return { status: 'match', identity: lateDelegateGroupIdentity(owner, existing) }
-      }
-      return { status: 'absent' }
     },
   }
   return { sink, payloads }
@@ -385,7 +365,6 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
         stopPeriodic: () => {},
         pendingCount: async () => 0,
         hasEntryForDispatch: async () => false,
-        lookupRootLogicalRun: async () => ({ status: 'absent' as const }),
       },
       attemptSendImpl: async () => ({}),
     })
@@ -423,7 +402,6 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
         stopPeriodic: () => {},
         pendingCount: async () => 0,
         hasEntryForDispatch: async () => false,
-        lookupRootLogicalRun: async () => ({ status: 'absent' as const }),
       },
       attemptSendImpl: async () => ({}),
     })
@@ -591,43 +569,8 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
     }
   })
 
-  it('fresh manager late entry finds ACK\'d root on the persist sink; no continuation', async () => {
-    const captured = makeCapturingSink()
-    setV3MasterSinkSingleton(captured.sink)
-    try {
-      const g = group('dlg-restart')
-      await captured.sink.persistOrQueue({
-        sessionId: owner().parentSessionId,
-        agentId: 'main',
-        turnIndex: 3,
-        turnKey: OWNER_TURN_KEY,
-        status: 'completed',
-        text: 'root answer',
-        createdAt: 1,
-        agentGroups: [g],
-      })
-      assert.equal(persistedRootContainsLogicalRun(captured.payloads[0]!, OWNER_TURN_KEY, 'dlg-restart'), true)
-      const fresh = makeSessions().sm
-      assert.equal(await fresh.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
-      await fresh.awaitPendingPersistence()
-      assert.equal(
-        captured.payloads.filter((payload) => payload.continuationOfTurnKey === OWNER_TURN_KEY).length,
-        0,
-        'production late entry must not mint a continuation when the persisted root already has the run',
-      )
-      assert.equal(
-        await fresh.deliverLateDelegateAgentGroup({
-          owner: owner(),
-          group: group('dlg-restart', { resultSummary: 'rewritten' }),
-        }),
-        false,
-      )
-    } finally {
-      setV3MasterSinkSingleton(null)
-    }
-  })
-
-  it('fresh manager late entry still persists when the durable root has no such run', async () => {
+  // Cross-root comparisons are master authority tests, not a fake ACK map.
+  it('fresh manager stages a late completion without relying on local root state', async () => {
     const captured = makeCapturingSink()
     setV3MasterSinkSingleton(captured.sink)
     try {
@@ -645,53 +588,6 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
       assert.equal(await fresh.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
       await fresh.awaitPendingPersistence()
       assert.equal(captured.payloads.filter((payload) => payload.continuationOfTurnKey).length, 1)
-    } finally {
-      setV3MasterSinkSingleton(null)
-    }
-  })
-
-  it('makeV3MasterSink ACK\'d root is visible to a fresh manager late entry', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'ocv5-180-b1-r5-'))
-    const g = group('dlg-durable-root')
-    const sink = makeV3MasterSink({
-      config: { baseUrl: 'http://master.test:18791', bearer: `oc-v3.7.${'a'.repeat(64)}` },
-      retryQueue: makeV3MasterRetryQueue({
-        dir,
-        attemptSend: async () => ({}),
-      }),
-      attemptSendImpl: async () => ({}),
-    })
-    setV3MasterSinkSingleton(sink)
-    try {
-      const outcome = await sink.persistOrQueue({
-        sessionId: owner().parentSessionId,
-        agentId: 'main',
-        turnIndex: 3,
-        turnKey: OWNER_TURN_KEY,
-        status: 'completed',
-        text: 'root answer',
-        createdAt: 1,
-        agentGroups: [g],
-      })
-      assert.equal(outcome.ok, true)
-      const fresh = makeSessions().sm
-      const before = await sink.lookupRootLogicalRun!({
-        sessionId: owner().parentSessionId,
-        ownerTurnKey: OWNER_TURN_KEY,
-        runId: 'dlg-durable-root',
-      })
-      assert.equal(before.status, 'match')
-      const jsonBefore = (await readdir(dir)).filter((name) => name.endsWith('.json')).length
-      assert.equal(await fresh.deliverLateDelegateAgentGroup({ owner: owner(), group: g }), true)
-      await fresh.awaitPendingPersistence()
-      const jsonAfter = (await readdir(dir)).filter((name) => name.endsWith('.json')).length
-      assert.equal(jsonAfter, jsonBefore, 'late entry must not stage a continuation after ACK\'d root lookup')
-      const queued = await sink.lookupRootLogicalRun!({
-        sessionId: owner().parentSessionId,
-        ownerTurnKey: OWNER_TURN_KEY,
-        runId: 'dlg-durable-root',
-      })
-      assert.equal(queued.status, 'match')
     } finally {
       setV3MasterSinkSingleton(null)
     }

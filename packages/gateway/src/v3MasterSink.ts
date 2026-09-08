@@ -778,14 +778,6 @@ export interface V3MasterSink {
    *  before the agentId field existed. Missing legacy agent IDs are upgraded
    *  to the reserved v2 identity that preserves the historical message IDs. */
   attemptOnce(payload: V3MasterSinkWirePayload): Promise<void>
-  /** OCV5-180 B1 — inspect already-persisted ROOT tapes for this logical run.
-   *  Queued (not yet ACK) and ACK'd roots both count. Lookup IO failure must
-   *  return `unavailable` so a late completion is not dropped. */
-  lookupRootLogicalRun?(input: {
-    sessionId: string
-    ownerTurnKey: string
-    runId: string
-  }): Promise<{ status: 'absent' | 'match' | 'conflict' | 'unavailable'; identity?: string }>
 }
 
 export type PersistOutcome =
@@ -980,12 +972,6 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
     persistOrQueue,
     attemptOnce: async (payload) => {
       await attemptOnce(payload)
-    },
-    lookupRootLogicalRun: async (input) => {
-      const found = await deps.retryQueue.lookupRootLogicalRun(input)
-      if (found.status === 'unavailable') return { status: 'unavailable' }
-      if (found.status === 'absent') return { status: 'absent' }
-      return { status: 'match', identity: found.identity }
     },
   }
 }

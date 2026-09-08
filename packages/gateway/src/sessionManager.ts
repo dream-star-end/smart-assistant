@@ -7710,11 +7710,11 @@ export class SessionManager {
    *  - 不同内容同 run → 记 `late_delegate_group_conflict`(可观察),保留首卡,
    *    不再生成第二张卡。返回 false 仅表示「未调度新写」(invalid locator /
    *    冲突抑制),不含 sink 排队('queued' 是可靠等待,由 sink drainer 送达)。 */
-  async deliverLateDelegateAgentGroup(args: {
+  deliverLateDelegateAgentGroup(args: {
     owner: DelegateOwnerTurnLocator
     group: DurableAgentGroup
     sessionKey?: string
-  }): Promise<boolean> {
+  }): boolean {
     if (!isValidDelegateOwnerLocator(args.owner)) {
       log.warn('late delegate group dropped: invalid owner locator', {
         runId: args.group.runId,
@@ -7747,15 +7747,6 @@ export class SessionManager {
       return false
     }
     if (live === 'duplicate') return true
-    const durable = await this._lookupPersistedRootLogicalRun(args.owner, args.group)
-    if (durable === 'conflict') {
-      log.warn('late_delegate_group_conflict: same run with different content', {
-        runId: args.group.runId,
-        ownerTurnKey: args.owner.parentTurnKey,
-      })
-      return false
-    }
-    if (durable === 'duplicate') return true
     const admission = this._admitExactOwnerRun(args.owner, args.group, 'inflight')
     if (admission === 'conflict') {
       log.warn('late_delegate_group_conflict: same run with different content', {
@@ -7778,16 +7769,18 @@ export class SessionManager {
       return true
     }
     let droppedReason = ''
-    const persistence = persistPostTerminalAgentGroup({
+    // No pre-stage local lookup: master owns cross-root idempotency. The
+    // async wrapper also captures a synchronous managed-sink rejection;
+    // register its complete outcome chain before returning to shutdown.
+    const persistence = (async () => persistPostTerminalAgentGroup({
       sessionKey: args.sessionKey ?? args.owner.parentSessionId,
       owner: args.owner,
       group: args.group,
       onDroppedReason: (reason) => {
         droppedReason = reason
       },
-    })
-    this._trackPersistence(persistence.then(() => undefined))
-    void persistence.then((outcome) => {
+    }))()
+    const settled = persistence.then((outcome) => {
       const rec = this._exactOwnerRuns.get(conflictKey)
       if (!rec || rec.identity !== lateDelegateGroupIdentity(args.owner, args.group)) return
       if (outcome === 'acked') {
@@ -7812,7 +7805,17 @@ export class SessionManager {
         ownerTurnKey: args.owner.parentTurnKey,
         reason: droppedReason || outcome,
       })
+    }, (err: unknown) => {
+      const rec = this._exactOwnerRuns.get(conflictKey)
+      if (rec?.identity === lateDelegateGroupIdentity(args.owner, args.group)) {
+        this._exactOwnerRuns.delete(conflictKey)
+      }
+      log.warn('late delegate group persist failed before durable handoff', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      }, err instanceof Error ? err : new Error(String(err)))
     })
+    this._trackPersistence(settled)
     return true
   }
 
@@ -7834,34 +7837,6 @@ export class SessionManager {
       if (!rec || rec.state === 'buffered' || rec.state === 'inflight') continue
       this._exactOwnerRuns.delete(oldest)
     }
-  }
-
-  private async _lookupPersistedRootLogicalRun(
-    owner: DelegateOwnerTurnLocator,
-    group: DurableAgentGroup,
-  ): Promise<'accept' | 'duplicate' | 'conflict'> {
-    const sink = getV3MasterSinkOrNull()
-    if (!sink?.lookupRootLogicalRun) return 'accept'
-    let looked: { status: 'absent' | 'match' | 'conflict' | 'unavailable'; identity?: string }
-    try {
-      looked = await sink.lookupRootLogicalRun({
-        sessionId: owner.parentSessionId,
-        ownerTurnKey: owner.parentTurnKey,
-        runId: group.runId,
-      })
-    } catch (err) {
-      log.warn('late delegate root lookup failed; not dropping the late card', {
-        runId: group.runId,
-        ownerTurnKey: owner.parentTurnKey,
-      }, err as Error)
-      return 'accept'
-    }
-    if (looked.status === 'unavailable' || looked.status === 'absent') return 'accept'
-    if (looked.status === 'conflict') return 'conflict'
-    if (typeof looked.identity === 'string' && looked.identity.length > 0) {
-      return this._compareOwnerRunIdentity(looked.identity, owner, group)
-    }
-    return 'duplicate'
   }
 
   private _ownerLocatorForSession(

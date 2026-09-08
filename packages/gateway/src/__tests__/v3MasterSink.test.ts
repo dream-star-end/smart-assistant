@@ -132,9 +132,6 @@ function fakeQueue(): V3MasterRetryQueue & { enqueued: any[]; kicks: number } {
         (e) => e?.payload?.dispatchId === dispatchId && e?.payload?.attemptNo === attemptNo,
       );
     },
-    async lookupRootLogicalRun() {
-      return { status: 'absent' as const };
-    },
   };
 }
 

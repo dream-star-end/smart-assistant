@@ -209,19 +209,12 @@ const latePersistSrc = readFileSync(join(root, 'packages/web-react/src/lib/persi
 const lateSocketSrc = readFileSync(join(root, 'packages/web-react/src/lib/chat/socket.ts'), 'utf8')
 const latePgSrc = readFileSync(join(root, 'packages/commercial/src/db/pgSessionsBackend.ts'), 'utf8')
 const latePlannerSrc = readFileSync(join(root, 'scripts/ops/requeue-failed-tape-jobs.ts'), 'utf8')
-const lateSinkSrc = readFileSync(join(root, 'packages/gateway/src/v3MasterSink.ts'), 'utf8')
-const lateRetrySrc = readFileSync(join(root, 'packages/gateway/src/v3MasterRetryQueue.ts'), 'utf8')
-const lateDelegateTestSrc = readFileSync(join(root, 'packages/gateway/src/__tests__/delegateLateCompletion.test.ts'), 'utf8')
 for (const [name, src, marker] of [
   ['delegateLateCompletion.ts', lateDelegateHelperSrc, 'export function lateDelegateLogicalRunKey('],
   ['sessionManager.ts', lateSessionManagerSrc, 'deliverLateDelegateAgentGroup('],
   ['sessionManager.ts', lateSessionManagerSrc, 'this._sealOwnerTurn(session, turnKey)'],
   ['sessionManager.ts', lateSessionManagerSrc, 'private _admitExactOwnerRun('],
   ['sessionManager.ts', lateSessionManagerSrc, "if (rec.state === 'buffered' || rec.state === 'inflight') continue"],
-  ['sessionManager.ts', lateSessionManagerSrc, '_lookupPersistedRootLogicalRun('],
-  ['v3MasterSink.ts', lateSinkSrc, 'lookupRootLogicalRun'],
-  ['v3MasterRetryQueue.ts', lateRetrySrc, 'ROOT_RUN_INDEX'],
-  ['delegateLateCompletion.test.ts', lateDelegateTestSrc, 'fresh manager late entry finds ACK'],
   ['server.ts', lateServerSrc, 'delegate card dropped: missing frozen owner locator'],
   ['losslessTurnTape.ts', lateTapeSrc, 'const groupBillingOwnerTurnKey = continuationOfTurnKey ?? turnKey'],
   ['persist.ts', latePersistSrc, 'export function reconcileLateDelegateAgentGroups('],

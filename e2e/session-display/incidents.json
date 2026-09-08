@@ -3425,13 +3425,13 @@
         },
         {
           "layer": "unit",
-          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
-          "assertion": "fresh manager late entry finds ACK"
+          "path": "packages/gateway/src/__tests__/lateDelegateShutdown.test.ts",
+          "assertion": "shutdown waits for the real durable receipt before clearing the sink, not for a local root lookup"
         },
         {
           "layer": "unit",
-          "path": "packages/gateway/src/__tests__/delegateLateCompletion.test.ts",
-          "assertion": "makeV3MasterSink ACK"
+          "path": "packages/gateway/src/__tests__/lateDelegateShutdown.test.ts",
+          "assertion": "a missing managed sink rejection is consumed and releases admission for a later durable retry"
         },
         {
           "layer": "unit",

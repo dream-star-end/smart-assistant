@@ -10,8 +10,7 @@
  * agent-group envelope:
  *
  *   - text='' / status='completed' / same parent session
- *   - deterministic turnKey derived from (ownerTurnKey, runId, canonical
- *     group bytes) → same logical run + same content is byte-idempotent at
+ *   - deterministic turnKey derived from (ownerTurnKey, runId) → same logical run + same content is byte-idempotent at
  *     master finalize; master UPSERT sees the same tapeId again.
  *   - every engine billing inside the group keeps parentTurnKey = the OWNER
  *     turn key (never the continuation's own key); the tape validator
@@ -83,57 +82,6 @@ export function lateDelegateGroupIdentity(
     .update('\0')
     .update(canonicalAgentGroupBytes(group))
     .digest('hex')
-}
-
-/** True when a persisted ROOT tape (sink/materializer payload) already
- * carries this logical run. Continuations are ignored: their tape key is
- * not the owner turn, so they cannot be the root authority. */
-export function persistedRootContainsLogicalRun(
-  payload: {
-    sessionId?: string
-    turnKey?: string
-    continuationOfTurnKey?: string
-    agentGroups?: Array<{ runId?: string }>
-  },
-  ownerTurnKey: string,
-  runId: string,
-): boolean {
-  if (typeof payload.continuationOfTurnKey === 'string' && payload.continuationOfTurnKey.length > 0) {
-    return false
-  }
-  if (payload.turnKey !== ownerTurnKey) return false
-  return (payload.agentGroups ?? []).some((group) => group.runId === runId)
-}
-
-export type RootLogicalRunLookup = {
-  status: 'absent' | 'match' | 'conflict' | 'unavailable'
-}
-
-/** Inspect already-persisted sink/materializer payloads for a root run.
- * Used by the production late path via V3MasterSink, not a SessionManager map. */
-export function inspectPayloadsForRootLogicalRun(
-  payloads: Array<{
-    sessionId?: string
-    turnKey?: string
-    continuationOfTurnKey?: string
-    agentGroups?: DurableAgentGroup[]
-  }>,
-  owner: DelegateOwnerTurnLocator,
-  group: DurableAgentGroup,
-): RootLogicalRunLookup {
-  const wanted = lateDelegateGroupIdentity(owner, group)
-  for (const payload of payloads) {
-    if (typeof payload.sessionId === 'string' && payload.sessionId !== owner.parentSessionId) {
-      continue
-    }
-    if (!persistedRootContainsLogicalRun(payload, owner.parentTurnKey, group.runId)) continue
-    const existing = (payload.agentGroups ?? []).find((item) => item.runId === group.runId)
-    if (!existing) continue
-    return lateDelegateGroupIdentity(owner, existing) === wanted
-      ? { status: 'match' }
-      : { status: 'conflict' }
-  }
-  return { status: 'absent' }
 }
 
 /** One logical run under one owner turn. Tape key / agentId derive from this
