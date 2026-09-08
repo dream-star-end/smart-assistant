@@ -123,6 +123,8 @@ interface Harness {
   settleCalls: Parameters<NonNullable<CursorExternalDeps["settle"]>>[0][];
   relayCalls: { accountToken: string; body: Record<string, unknown>; options?: { echoModel?: string } }[];
   factoryCalls: CursorExternalRelayFactoryArgs[];
+  /** 0279 message-audit rows handed to the writer (fake; default pgPool is `{}`). */
+  auditCalls: Parameters<NonNullable<CursorExternalDeps["recordMessageAudit"]>>[0][];
   order: string[];
 }
 
@@ -134,10 +136,12 @@ function harness(opts: {
   relay?: (body: Record<string, unknown>, res: ServerResponse, signal: AbortSignal) => Promise<CursorSandServeResult>;
   settleResult?: SettleResult | null;
   settleThrows?: boolean;
+  auditThrows?: boolean;
 } = {}): Harness {
   const settleCalls: Harness["settleCalls"] = [];
   const relayCalls: Harness["relayCalls"] = [];
   const factoryCalls: CursorExternalRelayFactoryArgs[] = [];
+  const auditCalls: Harness["auditCalls"] = [];
   const order: string[] = [];
   const accounts = opts.accounts ?? [account({ id: 17n })];
   const snapshots = opts.snapshots ?? new Map(accounts.map((a) => [a.id.toString(), snapshot(a.id)]));
@@ -165,6 +169,11 @@ function harness(opts: {
         ? { usageId: 1n, ledgerId: 2n, clamped: false, debitedCredits: 42n, attributionCredits: 42n, balanceAfter: 958n }
         : opts.settleResult;
     },
+    recordMessageAudit: async (row) => {
+      auditCalls.push(row);
+      order.push("audit");
+      if (opts.auditThrows) throw new Error("audit table missing");
+    },
     relayFactory: (args) => {
       factoryCalls.push(args);
       const relay: CursorSandRelayLike = {
@@ -187,7 +196,7 @@ function harness(opts: {
       return relay;
     },
   };
-  return { deps, settleCalls, relayCalls, factoryCalls, order };
+  return { deps, settleCalls, relayCalls, factoryCalls, auditCalls, order };
 }
 
 function body(over: Partial<ProxyBody> & Record<string, unknown> = {}): ProxyBody {
@@ -202,6 +211,9 @@ function body(over: Partial<ProxyBody> & Record<string, unknown> = {}): ProxyBod
 async function run(h: Harness, over: {
   body?: ProxyBody;
   requestedModel?: string;
+  effort?: string | null;
+  effortSource?: string | null;
+  identity?: ProxyIdentity;
   authorize?: (p: ModelPricing) => Promise<void>;
   appendCostCredits?: (...a: unknown[]) => Promise<unknown>;
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
@@ -216,9 +228,11 @@ async function run(h: Harness, over: {
     res: res as unknown as ServerResponse,
     requestId: "req-1",
     uid: 3n,
-    identity: { uid: 3n, containerId: null } as ProxyIdentity,
+    identity: over.identity ?? ({ uid: 3n, containerId: null } as ProxyIdentity),
     body: over.body ?? body(),
     requestedModel: over.requestedModel,
+    effort: over.effort,
+    effortSource: over.effortSource,
     authorize: over.authorize ?? (async () => {}),
     appendCostCredits: over.appendCostCredits,
     broadcastToUser: over.broadcastToUser,
@@ -371,7 +385,10 @@ describe("cursorExternal route — relay + settle + post-commit", () => {
     assert.equal(s.userId, 3n);
     assert.equal(s.sessionId, "web-abc");
     assert.deepEqual(s.usage, { input_tokens: 100, output_tokens: 9, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 });
-    assert.deepEqual(h.order, ["settle", "append", "broadcast"]);
+    // 0279 audit is fire-and-forget right after settle; persist/broadcast ordering unchanged.
+    assert.deepEqual(h.order.filter((step) => step !== "audit"), ["settle", "append", "broadcast"]);
+    assert.equal(h.order[0], "settle");
+    assert.ok(h.order.includes("audit"));
     assert.deepEqual(broadcasts[0], {
       type: "outbound.cost_charged",
       requestId: "req-1",
@@ -571,5 +588,137 @@ describe("anthropic proxy handler — cursorExternal wiring", () => {
     assert.equal(resOn.statusCode, 200);
     const expected = Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(payload)) / 4));
     assert.deepEqual(JSON.parse(resOn.body), { input_tokens: expected });
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 0279 — message audit (admin-visible "what did the user send / what came back")
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("cursorExternal route — 0279 message audit", () => {
+  const tick = () => new Promise((r) => setImmediate(r));
+
+  test("success: one audit row after settle with model / effort / last user text / shape / usage / UA", async () => {
+    const h = harness();
+    const req = new MockReq(undefined, { "user-agent": "claude-cli/2.1.263 (external, cli)" });
+    const b = body({
+      model: MODEL,
+      stream: true,
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: [{ type: "text", text: "ok" }] },
+        { role: "user", content: [{ type: "text", text: "你好" }] },
+      ],
+    });
+    await run(h, {
+      body: b, req, requestedModel: "fable-5.1", effort: "high", effortSource: "request",
+      identity: { uid: 3n, containerId: null, apiKey: { id: 14n, creditLimit: null, spentCredits: 0n } } as unknown as ProxyIdentity,
+    });
+    await tick();
+    assert.equal(h.auditCalls.length, 1);
+    const row = h.auditCalls[0]!;
+    assert.equal(row.requestId, "req-1");
+    assert.equal(row.userId, 3n);
+    assert.equal(row.apiKeyId, 14n);
+    assert.equal(row.requestedModel, "fable-5.1");
+    assert.equal(row.model, MODEL);
+    assert.equal(row.effort, "high");
+    assert.equal(row.effortSource, "request");
+    assert.equal(row.accountId, 17n);
+    assert.deepEqual(row.lastUserMessage, { text: "你好", truncated: false });
+    assert.equal(row.shape.messageCount, 3);
+    assert.equal(row.shape.toolCount, 1);
+    assert.equal(row.shape.stream, true);
+    assert.match(row.shape.bodySha256, /^[0-9a-f]{64}$/);
+    assert.equal(row.status, "success");
+    assert.equal(row.terminalCode, null);
+    assert.equal(row.errorMessage, null);
+    assert.deepEqual(row.usage, { inputTokens: 100, outputTokens: 9, cacheReadTokens: 1000, cacheWriteTokens: 0 });
+    assert.equal(row.clientUserAgent, "claude-cli/2.1.263 (external, cli)");
+    assert.equal(typeof row.durationMs, "number");
+    // audit runs after settle (never on the response path).
+    assert.deepEqual(h.order, ["settle", "audit"]);
+  });
+
+  test("upstream rejected (non-streaming 502): audit row carries the readable upstream reason, marker stripped, x-should-retry set", async () => {
+    const h = harness({
+      relay: async (_b, res) => {
+        return {
+          kind: "rejected",
+          status: 502,
+          reason: "Provider Error (400): We're having trouble connecting to the model provider. [non-retryable]",
+          written: false,
+        };
+      },
+    });
+    const { res } = await run(h, { requestedModel: "fable-5.1" });
+    await tick();
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.headers["x-should-retry"], "false");
+    assert.match(res.json().error?.message ?? "", /^Provider Error \(400\): /);
+    assert.doesNotMatch(res.body, /non-retryable\]/);
+    assert.equal(h.auditCalls.length, 1);
+    const row = h.auditCalls[0]!;
+    assert.equal(row.status, "error");
+    assert.equal(row.terminalCode, "Provider Error (400): We're having trouble connecting to the model provider.");
+    assert.equal(row.errorMessage, "Provider Error (400): We're having trouble connecting to the model provider.");
+    assert.equal(row.apiKeyId, null); // identity without apiKey snapshot
+    // settle got the marker-free terminal code too.
+    assert.equal(h.settleCalls[0]!.terminalCode, "Provider Error (400): We're having trouble connecting to the model provider.");
+  });
+
+  test("retryable upstream rejection does not set x-should-retry", async () => {
+    const h = harness({ relay: async () => ({ kind: "rejected", status: 502, reason: "CURSOR_SAND_HTTP_503", written: false }) });
+    const { res } = await run(h);
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.headers["x-should-retry"], undefined);
+    assert.equal(res.json().error?.message, "HTTP_503");
+  });
+
+  test("mid-stream failure: audit error = reason; tool_result-only turn → last_user_message null", async () => {
+    const h = harness({
+      relay: async (_b, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.write("event: message_start\n\n");
+        res.end("event: error\n\n");
+        return { kind: "failed", reason: "Provider Error (400): x [non-retryable]", usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
+      },
+    });
+    await run(h, {
+      body: body({
+        messages: [
+          { role: "user", content: "run it" },
+          { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "secret file body" }] },
+        ],
+      }),
+    });
+    await tick();
+    const row = h.auditCalls[0]!;
+    assert.equal(row.status, "error");
+    assert.equal(row.terminalCode, "CURSOR_STREAM_FAILED");
+    assert.equal(row.errorMessage, "Provider Error (400): x");
+    assert.deepEqual(row.lastUserMessage, { text: null, truncated: false });
+    const serialized = JSON.stringify(row, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+    assert.equal(serialized.includes("secret file body"), false);
+  });
+
+  test("audit writer failure is fail-soft: response and settle unaffected", async () => {
+    const h = harness({ auditThrows: true });
+    const { res } = await run(h);
+    await tick();
+    assert.equal(res.statusCode, 200);
+    assert.equal(h.settleCalls.length, 1);
+    assert.equal(h.auditCalls.length, 1);
+  });
+
+  test("pre-relay rejections (unknown model / 402) write no audit row", async () => {
+    const h = harness({ pricing: null });
+    await run(h);
+    const h2 = harness({ balance: 0n });
+    await run(h2);
+    await tick();
+    assert.equal(h.auditCalls.length + h2.auditCalls.length, 0);
   });
 });
