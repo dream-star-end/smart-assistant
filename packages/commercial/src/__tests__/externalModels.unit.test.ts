@@ -7,11 +7,14 @@
  * 锁住的不变量:
  *   1. 只列 cursor-engine 目录行,且必须 enabled + canUseModel 通过(role / grants /
  *      visibility / denials)。其它引擎(gpt-*、kimi-*)即使 enabled 也不出现。
- *   2. 公开 id 去掉 `cursor-` 前缀;整个响应体(含 display_name / owned_by)不出现
- *      "cursor" 字样 —— 这是产品要求,不是巧合。
+ *   2. 公开 id 是**家族级**(`fable-5.1`、`grok-4.6-fast`):去掉 `cursor-` 前缀,也
+ *      不带思考档位后缀(思考深度由客户端 output_config.effort 决定,见
+ *      resolveCursorPublicModel);同一家族多个变体折叠成一行,只要有一个变体
+ *      enabled + 授权通过就列出;display_name 用家族标签(`Fable 5.1`)。整个响应体
+ *      不出现 "cursor" 字样 —— 这是产品要求,不是巧合。
  *   3. 同时满足 Anthropic(type:"model", created_at, has_more, first_id/last_id)
  *      与 OpenAI(object:"model", owned_by, created)两种 list 形状。
- *   4. 排序 = sort_order 升序,同 sort_order 按公开 id 字典序。
+ *   4. 排序 = 家族内最小 sort_order 升序,同 sort_order 按公开 id 字典序。
  *   5. handler:非 GET → 405;身份失败 → 与 /v1/messages 相同的 401 泛化文案;
  *      成功 → 200 + cache-control: no-store。
  */
@@ -63,7 +66,7 @@ const OWNED_BY = "clarvy";
 // ─── projection ──────────────────────────────────────────────────────────────
 
 describe("projectExternalModels — scope + shape", () => {
-  test("only cursor-engine rows that are enabled and authorised; public ids strip the prefix", () => {
+  test("only cursor-engine rows that are enabled and authorised; public ids are family-level", () => {
     const pricing = fakePricing([
       pricingRow("cursor-fable-5.1-high", { display_name: "Fable 5.1 High", sort_order: 10 }),
       pricingRow("cursor-sonnet-5-high", { display_name: "Sonnet 5 High", sort_order: 20 }),
@@ -74,7 +77,7 @@ describe("projectExternalModels — scope + shape", () => {
       pricingRow("kimi-k3", { sort_order: 2 }),
     ]);
     const rows = projectExternalModels(pricing, ADMIN_AUTHZ, OWNED_BY);
-    assert.deepEqual(rows.map((r) => r.id), ["fable-5.1-high", "sonnet-5-high"]);
+    assert.deepEqual(rows.map((r) => r.id), ["fable-5.1", "sonnet-5"]);
     for (const r of rows) {
       assert.equal(r.type, "model");
       assert.equal(r.object, "model");
@@ -83,9 +86,37 @@ describe("projectExternalModels — scope + shape", () => {
       assert.equal(r.created_at, "2026-09-01T00:00:00Z");
       assert.equal(r.created, Math.floor(Date.parse(r.created_at) / 1000));
     }
-    assert.equal(rows[0]!.display_name, "Fable 5.1 High");
-    // 产品硬要求:这条 surface 任何字段都不能出现 cursor 字样
+    // display_name 是家族标签,不是某个变体的 "Fable 5.1 High"
+    assert.equal(rows[0]!.display_name, "Fable 5.1");
+    assert.equal(rows[1]!.display_name, "Sonnet 5");
+    // 产品硬要求:这条 surface 任何字段都不能出现 cursor 字样,也不能出现思考档位
     assert.doesNotMatch(JSON.stringify(rows), /cursor/i);
+    assert.doesNotMatch(JSON.stringify(rows.map((r) => r.id)), /-(low|medium|high|xhigh|max)\b/);
+  });
+
+  test("collapses every enabled variant of a family into one row; fast is a separate family id", () => {
+    const pricing = fakePricing([
+      pricingRow("cursor-fable-5.1-low", { sort_order: 13 }),
+      pricingRow("cursor-fable-5.1-medium", { sort_order: 12 }),
+      pricingRow("cursor-fable-5.1-high", { sort_order: 11 }),
+      pricingRow("cursor-fable-5.1-xhigh", { sort_order: 10 }),
+      pricingRow("cursor-fable-5.1-max", { enabled: false, sort_order: 1 }),
+      pricingRow("cursor-grok-4.6-high", { sort_order: 30 }),
+      pricingRow("cursor-grok-4.6-high-fast", { display_name: "Grok 4.6 High Fast", sort_order: 31 }),
+      pricingRow("cursor-auto", { display_name: "Auto", sort_order: 40 }),
+      pricingRow("cursor-composer-2.5-fast", { display_name: "Composer 2.5 Fast", sort_order: 41 }),
+    ]);
+    const rows = projectExternalModels(pricing, ADMIN_AUTHZ, OWNED_BY);
+    assert.deepEqual(
+      rows.map((r) => r.id),
+      ["fable-5.1", "grok-4.6", "grok-4.6-fast", "auto", "composer-2.5-fast"],
+    );
+    // 家族排序键 = 已列出变体中最小的 sort_order(禁用的 max 行 sort_order=1 不参与)
+    assert.equal(rows[0]!.display_name, "Fable 5.1");
+    assert.equal(rows[2]!.display_name, "Grok 4.6 Fast");
+    // 无 effort 轴的家族沿用目录 display_name
+    assert.equal(rows[3]!.display_name, "Auto");
+    assert.equal(rows[4]!.display_name, "Composer 2.5 Fast");
   });
 
   test("honours canUseModel: visibility=admin needs admin role or grant; denials win", () => {
@@ -97,7 +128,7 @@ describe("projectExternalModels — scope + shape", () => {
     // plain user: only the public row
     assert.deepEqual(
       projectExternalModels(pricing, USER_AUTHZ, OWNED_BY).map((r) => r.id),
-      ["sonnet-5-high"],
+      ["sonnet-5"],
     );
     // user with grants on admin+hidden rows sees them
     assert.deepEqual(
@@ -106,12 +137,12 @@ describe("projectExternalModels — scope + shape", () => {
         { role: "user", grantedModelIds: new Set(["cursor-fable-5.1-high", "cursor-grok-4.6-high"]) },
         OWNED_BY,
       ).map((r) => r.id),
-      ["fable-5.1-high", "sonnet-5-high", "grok-4.6-high"],
+      ["fable-5.1", "sonnet-5", "grok-4.6"],
     );
     // admin sees admin-visibility but not hidden without a grant
     assert.deepEqual(
       projectExternalModels(pricing, ADMIN_AUTHZ, OWNED_BY).map((r) => r.id),
-      ["fable-5.1-high", "sonnet-5-high"],
+      ["fable-5.1", "sonnet-5"],
     );
     // account-scoped denial removes an otherwise-public row
     assert.deepEqual(
@@ -120,7 +151,19 @@ describe("projectExternalModels — scope + shape", () => {
         { role: "admin", grantedModelIds: new Set(), deniedModelIds: new Set(["cursor-sonnet-5-high"]) },
         OWNED_BY,
       ).map((r) => r.id),
-      ["fable-5.1-high"],
+      ["fable-5.1"],
+    );
+    // a family stays listed while any one variant is still allowed
+    assert.deepEqual(
+      projectExternalModels(
+        fakePricing([
+          pricingRow("cursor-sonnet-5-high", { sort_order: 1 }),
+          pricingRow("cursor-sonnet-5-low", { sort_order: 2 }),
+        ]),
+        { role: "admin", grantedModelIds: new Set(), deniedModelIds: new Set(["cursor-sonnet-5-high"]) },
+        OWNED_BY,
+      ).map((r) => r.id),
+      ["sonnet-5"],
     );
   });
 
@@ -132,7 +175,7 @@ describe("projectExternalModels — scope + shape", () => {
     ]);
     assert.deepEqual(
       projectExternalModels(pricing, ADMIN_AUTHZ, OWNED_BY).map((r) => r.id),
-      ["auto", "fable-5.1-high", "sonnet-5-high"],
+      ["auto", "fable-5.1", "sonnet-5"],
     );
     assert.deepEqual(projectExternalModels(fakePricing([]), ADMIN_AUTHZ, OWNED_BY), []);
   });
@@ -203,9 +246,9 @@ describe("makeExternalModelsHandler — HTTP envelope", () => {
     const body = res.json() as ExternalModelsResponse;
     assert.equal(body.object, "list");
     assert.equal(body.has_more, false);
-    assert.deepEqual(body.data.map((d) => d.id), ["fable-5.1-high", "gemini-3.8-flash-low"]);
-    assert.equal(body.first_id, "fable-5.1-high");
-    assert.equal(body.last_id, "gemini-3.8-flash-low");
+    assert.deepEqual(body.data.map((d) => d.id), ["fable-5.1", "gemini-3.8-flash"]);
+    assert.equal(body.first_id, "fable-5.1");
+    assert.equal(body.last_id, "gemini-3.8-flash");
     assert.doesNotMatch(res.body, /cursor/i);
   });
 

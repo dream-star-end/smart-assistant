@@ -1,4 +1,4 @@
-import { publicCursorModelId } from "@openclaude/protocol";
+import { publicCursorFamilyModelId } from "@openclaude/protocol";
 import {
   Check,
   Copy,
@@ -30,10 +30,14 @@ import { shortTime } from "./labels";
 
 /** 外接端点(相对当前 origin)。CC Switch / Claude Code 的 base URL 都填到这一层,`/v1/*` 由客户端拼。 */
 export const API_ACCESS_BASE_PATH = "/api/anthropic";
-/** 默认主模型 / 轻量模型的**公开 id**(无引擎前缀)。若用户实际可用列表里没有,退到列表首项。 */
-const DEFAULT_MAIN_MODEL = "fable-5.1-high";
-const DEFAULT_SONNET_MODEL = "sonnet-5-high";
-const DEFAULT_HAIKU_MODEL = "gemini-3.8-flash-low";
+/**
+ * 默认主模型 / 轻量模型的**公开家族 id**(无引擎前缀、无思考档位后缀,2026-09-08)。
+ * 思考深度不写进模型名:用户在 Claude Code 里自己用 /effort、--effort、CLAUDE_CODE_EFFORT_LEVEL
+ * 或 /model 滑杆设置,服务端按请求携带的 output_config.effort 选档。若用户实际可用列表里没有,退到列表首项。
+ */
+const DEFAULT_MAIN_MODEL = "fable-5.1";
+const DEFAULT_SONNET_MODEL = "sonnet-5";
+const DEFAULT_HAIKU_MODEL = "gemini-3.8-flash";
 /** 模型列表拉取失败时的静态家族说明(与目录当前启用的家族一致;真值以 /v1/models 为准)。 */
 const FALLBACK_FAMILIES = [
   "fable-5.1",
@@ -43,6 +47,15 @@ const FALLBACK_FAMILIES = [
   "grok-4.6",
   "gemini-3.8-flash",
 ];
+/**
+ * 随配置一并写给 Claude Code 的额外环境变量。
+ * `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`:官方文档 —— 对 Claude Code 不认识的模型 id(经网关 / 自定义
+ * 标识)也照常发送 effort 参数。本站模型 id 不在它的内置名单里,不带这一项时部分版本会把用户设的
+ * 思考深度丢掉、服务端只能落到家族默认档。CC Switch ≥3.16 深链的 `config` 参数会把它保留进 settings。
+ */
+const CLAUDE_CODE_EXTRA_ENV: Readonly<Record<string, string>> = {
+  CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: "1",
+};
 const CC_SWITCH_RELEASES = "https://github.com/farion1231/cc-switch/releases";
 
 /** 在可用列表中挑默认模型:首选项在列表里就用它;列表为空/未加载也用它(静态兜底);否则用列表里第一个匹配项。 */
@@ -121,6 +134,9 @@ function base64Utf8(text: string): string {
  * 不带它,CC Switch 只是把供应商加进列表,`~/.claude/settings.json` 仍指向之前激活的那一个 ——
  * 用户撤销旧 key 再一键导入新 key,本地 Claude Code 仍在用旧 key,表现就是 401。
  * `usageEnabled=true` + `usageScript`:一并带上用量查询脚本并开启(CC Switch 确认框会展示脚本正文)。
+ * `config`(base64 JSON `{"env":{…}}`):CC Switch 以它的 env 为底、再叠加 URL 参数写 settings,
+ * 用来带上 URL 参数表达不了的额外环境变量(`CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`,见 CLAUDE_CODE_EXTRA_ENV)。
+ * 旧版 CC Switch(<3.16)会忽略额外 env,只剩标准字段,仍能正常导入。
  */
 export function buildCcSwitchDeepLink(input: {
   origin: string;
@@ -146,9 +162,16 @@ export function buildCcSwitchDeepLink(input: {
     usageEnabled: "true",
     usageScript: base64Utf8(buildCcSwitchUsageScript()),
     usageAutoInterval: "30",
+    configFormat: "json",
+    config: base64Utf8(JSON.stringify({ env: CLAUDE_CODE_EXTRA_ENV })),
   });
   params.set("apiKey", apiKey);
   return `ccswitch://v1/import?${params.toString()}`;
+}
+
+/** 深链 `config` 里附带的 env(测试与文案共用一处真值)。 */
+export function claudeCodeExtraEnv(): Readonly<Record<string, string>> {
+  return CLAUDE_CODE_EXTRA_ENV;
 }
 
 /**
@@ -189,17 +212,21 @@ export function ApiKeysSection({
     if (keys) onKeysChange?.(keys);
   }, [keys, onKeysChange]);
 
-  // 外接可用模型 = 站内公开模型列表里外接引擎那一部分,按公开 id(无引擎前缀)展示 ——
-  // 与 GET /api/anthropic/v1/models 同一投影。拉取失败不报错,教程退到静态默认值。
+  // 外接可用模型 = 站内公开模型列表里外接引擎那一部分,按公开**家族** id(无引擎前缀、无档位
+  // 后缀)展示,同家族多个档位折叠成一项 —— 与 GET /api/anthropic/v1/models 同一投影。
+  // 拉取失败不报错,教程退到静态默认值。
   useEffect(() => {
     let alive = true;
     api
       .getPublicModels(auth)
       .then(({ models }) => {
         if (!alive) return;
-        const ids = models
-          .filter((m) => m.engine === "cursor")
-          .map((m) => publicCursorModelId(m.id));
+        const ids: string[] = [];
+        for (const m of models) {
+          if (m.engine !== "cursor") continue;
+          const id = publicCursorFamilyModelId(m.id);
+          if (!ids.includes(id)) ids.push(id);
+        }
         setExternalModels(ids);
       })
       .catch(() => {
@@ -219,7 +246,7 @@ export function ApiKeysSection({
   const usageScript = useMemo(() => buildCcSwitchUsageScript(), []);
   const mainModel = pickDefaultModel(externalModels, DEFAULT_MAIN_MODEL, /^(fable|opus)-/);
   const sonnetModel = pickDefaultModel(externalModels, DEFAULT_SONNET_MODEL, /^sonnet-/);
-  const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /-flash-|-low$/);
+  const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /^gemini-|-flash(-|$)/);
   const candidateKey = keySource === "new" ? (justCreated?.plaintext ?? "") : existingKey.trim();
   const knownKey = keys?.find(
     (key) => candidateKey.split(".")[1] === key.keyPrefix.replace(/^oc-cc\./, ""),
@@ -235,6 +262,7 @@ export function ApiKeysSection({
           ? "已包含刚创建的密钥,可直接导入。"
           : "已填入完整密钥。有效性以实际请求为准。"
         : "请先创建新密钥或粘贴已有的完整密钥,再导入。";
+  const extraEnvLines = Object.entries(CLAUDE_CODE_EXTRA_ENV).map(([k, v]) => `export ${k}=${v}`);
   const claudeCodeSnippet = [
     `export ANTHROPIC_BASE_URL=${endpoint}`,
     `export ANTHROPIC_AUTH_TOKEN='${keyPlaceholder}'`,
@@ -242,6 +270,7 @@ export function ApiKeysSection({
     `export ANTHROPIC_DEFAULT_OPUS_MODEL=${mainModel}`,
     `export ANTHROPIC_DEFAULT_SONNET_MODEL=${sonnetModel}`,
     `export ANTHROPIC_DEFAULT_HAIKU_MODEL=${haikuModel}`,
+    ...extraEnvLines,
     "claude",
   ].join("\n");
   // CC Switch「自定义」供应商的 JSON 配置(它编辑器里贴的就是这一段)。
@@ -254,6 +283,7 @@ export function ApiKeysSection({
         ANTHROPIC_DEFAULT_OPUS_MODEL: mainModel,
         ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
         ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
+        ...CLAUDE_CODE_EXTRA_ENV,
       },
     },
     null,
@@ -275,16 +305,9 @@ export function ApiKeysSection({
       }),
     [origin, candidateKey, keyReady, mainModel, sonnetModel, haikuModel],
   );
-  const familyList = useMemo(() => {
-    if (!externalModels || externalModels.length === 0) return FALLBACK_FAMILIES;
-    // 去掉档位/加速后缀得到家族名,保序去重。
-    const fams: string[] = [];
-    for (const id of externalModels) {
-      const fam = id.replace(/-(low|medium|high|xhigh|max)(-fast)?$/, "").replace(/-fast$/, "");
-      if (!fams.includes(fam)) fams.push(fam);
-    }
-    return fams;
-  }, [externalModels]);
+  // 列表项已是家族 id(-fast 是独立可选项,一并展示);空/未加载退到静态说明。
+  const familyList =
+    !externalModels || externalModels.length === 0 ? FALLBACK_FAMILIES : externalModels;
 
   useEffect(() => {
     let alive = true;
@@ -747,6 +770,15 @@ export function ApiKeysSection({
             也可以不用它的「打开终端」,直接在自己的终端里运行 <code className="font-mono">claude</code>
             (CC Switch 已把配置写进 <code className="font-mono">~/.claude/settings.json</code>)。
           </li>
+          <li>
+            <b>启动时提示 "… isn't described by this version's model catalog"</b>:这是 Claude Code
+            对非官方模型名的提示,不影响使用 —— 它只是不知道本站模型的上下文窗口,会按保守值触发自动压缩。
+            想消除可在 <code className="font-mono">~/.claude/settings.json</code> 加{" "}
+            <code className="font-mono">
+              {`"modelPicker":{"options":[{"model":"${mainModel}","behavesAs":"claude-opus-5"}]}`}
+            </code>
+            (需 Claude Code ≥ 2.1.242),让它按 Opus 5 的客户端行为处理本站主模型。
+          </li>
         </ul>
       </details>
 
@@ -786,18 +818,25 @@ export function ApiKeysSection({
           可用模型请求 <code className="select-all font-mono">GET {modelsUrl}</code>
           (带同一个 API Key)查询,返回 Anthropic / OpenAI 兼容的{" "}
           <code className="font-mono">data[].id</code>
-          。当前家族:
+          。当前可用:
           {familyList.map((f, i) => (
             <span key={f}>
               {i > 0 ? " / " : " "}
               <code className="font-mono">{f}</code>
             </span>
           ))}
-          ,后缀为思考档位 <code className="font-mono">-low</code> /{" "}
-          <code className="font-mono">-medium</code> / <code className="font-mono">-high</code> /{" "}
-          <code className="font-mono">-xhigh</code> / <code className="font-mono">-max</code>
-          (部分家族不含全部档位),再加 <code className="font-mono">-fast</code>{" "}
-          为加速版、双倍计费。以列表接口返回的为准。
+          (带 <code className="font-mono">-fast</code> 的为加速版、双倍计费)。以列表接口返回的为准。
+        </p>
+        <p className="mt-2 text-faint" data-testid="guide-effort">
+          模型名<b>不含思考深度</b>。思考深度由你在 Claude Code 里自己设置:会话内{" "}
+          <code className="font-mono">/effort</code>(或 <code className="font-mono">/model</code>{" "}
+          里的滑杆)、启动参数 <code className="font-mono">--effort low|medium|high|xhigh|max</code>
+          、或环境变量 <code className="font-mono">CLAUDE_CODE_EFFORT_LEVEL</code>
+          ;未设置时按 <code className="font-mono">high</code> 运行。服务端按每次请求携带的档位选择对应算力,
+          某家族不提供你选的档位时,自动落到不高于它的最近档位。配置里的{" "}
+          <code className="font-mono">CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1</code>{" "}
+          让 Claude Code 对本站模型名也发送思考深度,请保留。如需把某个供应商钉死在一个档位,
+          模型名可写成 <code className="font-mono">fable-5.1-high</code> 这种带档位后缀的形式,此时忽略会话内设置。
         </p>
       </details>
     </div>

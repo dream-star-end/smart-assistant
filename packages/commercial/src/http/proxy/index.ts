@@ -66,7 +66,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { cursorModelIdFromPublic, findRouteProviderForModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, resolveCursorPublicModel } from "@openclaude/protocol";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -488,16 +488,38 @@ export function makeAnthropicProxyHandler(
       // 授权/余额/账号选择/relay/settle/post-commit 全在 cursorExternal.handle 内完成;
       // 仍在本 try/finally 内 → releaseSlot 照常。
       //
-      // 对外模型 id **不带引擎前缀**(2026-09-07):第三方客户端发 `fable-5.1-high`,
-      // 这里归一成内部 `cursor-fable-5.1-high` 走计费/授权/日志;旧的内部 id 仍静默接受
-      // (管理员现有配置不中断)。客户端原始写法保留在 requestedModel,供错误文案 / 响应
-      // `model` 回显使用,保证对外面不出现内部 id。**只在注入 cursorExternal 的实例做**
-      // (容器 internal proxy 不认无前缀 id,行为零变化)。
+      // 对外模型 id **不带引擎前缀、也不带思考档位**(2026-09-08):第三方客户端发
+      // 家族 id `fable-5.1`,思考深度由客户端自己决定(Claude Code 的 /effort、--effort、
+      // CLAUDE_CODE_EFFORT_LEVEL 会随请求带 `output_config.effort`),这里按
+      // 家族 + 请求 effort 解析成内部变体 `cursor-fable-5.1-<effort>` 走计费/授权/日志;
+      // 家族不提供的档位(或该变体在本部署被禁用)就近取不高于它的档位,没带 effort
+      // 用家族默认(high)。带档位后缀的公开 id(`fable-5.1-high`)和旧内部 id 仍接受,
+      // 且**钉死**档位(管理员现有配置不中断)。客户端原始写法保留在 requestedModel,
+      // 供错误文案 / 响应 `model` 回显使用,保证对外面不出现内部 id。Sand relay 编码
+      // 时不透传 output_config/thinking,所以这里不需要剥离。**只在注入 cursorExternal
+      // 的实例做**(容器 internal proxy 不认公开 id,行为零变化)。
       if (deps.cursorExternal) {
-        const internalModel = cursorModelIdFromPublic(body.model);
-        if (internalModel) {
+        const outputConfig = body.output_config;
+        const requestedEffort =
+          outputConfig !== null && typeof outputConfig === "object" && !Array.isArray(outputConfig)
+            ? (outputConfig as Record<string, unknown>).effort
+            : undefined;
+        const resolved = resolveCursorPublicModel(
+          body.model,
+          requestedEffort,
+          (internalId: string) => deps.pricing.get(internalId)?.enabled === true,
+        );
+        if (resolved) {
           const requestedModel = body.model;
-          body.model = internalModel;
+          body.model = resolved.internalId;
+          if (resolved.effortSource !== "pinned") {
+            userLog.info("proxy_cursor_effort_resolved", {
+              requestedModel,
+              model: resolved.internalId,
+              effort: resolved.effort,
+              effortSource: resolved.effortSource,
+            });
+          }
           await deps.cursorExternal.handle({
             req,
             res,

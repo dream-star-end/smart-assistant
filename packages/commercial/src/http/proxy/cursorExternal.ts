@@ -108,13 +108,18 @@ export interface CursorExternalHandleArgs {
   requestId: string;
   uid: bigint;
   identity: ProxyIdentity;
-  /** Body with `model` already normalised to the internal `cursor-*` id. */
+  /**
+   * Body with `model` already normalised to the internal `cursor-*` variant id
+   * (family + client `output_config.effort` resolved by the proxy handler via
+   * `resolveCursorPublicModel`).
+   */
   body: ProxyBody;
   /**
-   * Model id exactly as the client sent it (public `fable-5.1-high` or legacy
-   * internal `cursor-fable-5.1-high`). Used for every client-visible surface —
-   * error text and the `model` echoed in the Anthropic response — so third
-   * parties never see the engine prefix. Defaults to `body.model`.
+   * Model id exactly as the client sent it (public family id `fable-5.1`,
+   * effort-suffixed `fable-5.1-high`, or legacy internal `cursor-fable-5.1-high`).
+   * Used for every client-visible surface — error text and the `model` echoed
+   * in the Anthropic response — so third parties never see the engine prefix
+   * or the resolved thinking-depth suffix. Defaults to `body.model`.
    */
   requestedModel?: string;
   /** `deps.identity.authorize(identity, pricing, model)` bound by the handler. */
