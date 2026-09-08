@@ -3396,7 +3396,8 @@
         "5a3f01b4",
         "9fce39ef",
         "98176566",
-        "b6f2e0e3a"
+        "b6f2e0e3",
+        "56146fa9"
       ],
       "regressions": [
         {
@@ -3423,6 +3424,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/permissionPromptSnapshotExplain.integ.test.ts",
           "assertion": "B4 Stop then late persist: hello/GET/lookup hide ordinary pending, keep detached ask-user"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/permissionTimelineGet.integ.test.ts",
+          "assertion": "borrowed-client 250ms timeout rolls back to savepoint; outer txn still commits"
         },
         {
           "layer": "browser",
