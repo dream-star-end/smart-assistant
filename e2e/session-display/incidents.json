@@ -3817,6 +3817,9 @@
           "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
           "assertion": "existing key: real paste exports exact Clarvy ASCII name and intact import contract"
         }
+      ],
+      "coverageCommits": [
+        "a80f8ae9"
       ]
     }
   ]
