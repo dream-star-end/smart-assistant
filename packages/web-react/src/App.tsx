@@ -13,6 +13,8 @@ import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
+import { saveBlob } from "./lib/chat/download";
+import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer } from "./components/Composer";
 import { moveDraft, NEW_COMPOSER_DRAFT_KEY } from "./lib/composerDraft";
@@ -3207,6 +3209,18 @@ export function App() {
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
+          onExport={
+            demo
+              ? undefined
+              : () => {
+                  saveBlob(
+                    new Blob([exportSessionMarkdown(wsMessages)], {
+                      type: "text/markdown;charset=utf-8",
+                    }),
+                    sessionExportFilename(activeSess?.title),
+                  );
+                }
+          }
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />

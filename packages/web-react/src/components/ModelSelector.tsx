@@ -48,6 +48,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  Input,
   useConfirm,
 } from './ui'
 
@@ -511,7 +512,8 @@ export function ModelSelector({
           <DropdownMenuLabel className="shrink-0">对话模型</DropdownMenuLabel>
           {showSearch && (
             <div className="shrink-0 px-1.5 pb-1">
-              <input
+              <Input
+                inputSize="sm"
                 aria-label="搜索模型"
                 placeholder="搜索模型…"
                 value={query}
@@ -519,7 +521,6 @@ export function ModelSelector({
                 onKeyDown={(e) => {
                   if (e.key !== 'Escape' && e.key !== 'ArrowDown') e.stopPropagation()
                 }}
-                className="w-full rounded-md border border-border bg-bg px-2 py-1.5 text-sm text-fg outline-none placeholder:text-faint focus:border-border-strong"
               />
             </div>
           )}

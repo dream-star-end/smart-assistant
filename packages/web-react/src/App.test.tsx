@@ -127,6 +127,44 @@ function routedFetch(over?: {
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
     if (u.includes('/api/public/models')) return okJson(over?.models ?? MODELS)
     if (u.includes('/api/me/preferences')) return okJson(over?.preferences ?? { prefs: {} })
+    // `/api/me` 是前缀；更具体的 usage/report、subscription 必须先匹配，
+    // 否则 AccountTab 会把 {user} 当成 UsageReport，ledger 缺失即崩。
+    if (u.includes('/api/me/usage/report'))
+      return okJson({
+        window: '30d',
+        summary: {
+          requests: '0',
+          input_tokens: '0',
+          output_tokens: '0',
+          cache_read_tokens: '0',
+          cache_write_tokens: '0',
+          credits: '0',
+        },
+        trend: [],
+        models: [],
+        ledger: { trend: [], by_reason: [] },
+      })
+    if (u.includes('/api/me/usage'))
+      return okJson({ ledger: { rows: [], next_before: null } })
+    if (u.includes('/api/subscription'))
+      return okJson({
+        ok: true,
+        data: {
+          subscription: {
+            plan_code: 'free',
+            plan_name: 'Free',
+            status: 'active',
+            period_start: '2026-01-01T00:00:00.000Z',
+            period_end: '2026-02-01T00:00:00.000Z',
+            period_credits: '0',
+            monthly_credits: '0',
+            price_cents: '0',
+            tier: 0,
+            paid: false,
+          },
+          balance: { wallet: '300', period: '0', total: '300' },
+        },
+      })
     if (u.includes('/api/agent/open')) {
       opened = true
       return over?.open ?? okJson(AGENT_OPEN_202, 202)

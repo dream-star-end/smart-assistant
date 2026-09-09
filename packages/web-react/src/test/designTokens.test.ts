@@ -94,11 +94,13 @@ describe.each(THEMES)("设计 token 对比度契约 · $name", ({ selector }) =>
   const t = tokensOf(selector);
   const surface = parseHex(t.surface).rgb;
   const bg = parseHex(t.bg).rgb;
+  const elevated = parseHex(t.elevated).rgb;
 
   it.each(TEXT_TONES)("--%s 作正文前景 ≥ 4.5:1(vs surface 与 bg)", (tone) => {
     const { rgb } = parseHex(t[tone]);
     expect(contrast(rgb, surface)).toBeGreaterThanOrEqual(4.5);
     expect(contrast(rgb, bg)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(rgb, elevated)).toBeGreaterThanOrEqual(4.5);
   });
 
   it.each(BADGE_TONES)("--%s 在自身 -soft 徽章底上 ≥ 4.5:1", (tone) => {

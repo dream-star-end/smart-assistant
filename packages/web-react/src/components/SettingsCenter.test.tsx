@@ -133,27 +133,14 @@ test('桌面竖导航方向键移动焦点到新 tab', () => {
   expect(screen.getByRole('tab', { name: '账户与计费' })).not.toHaveAttribute('aria-controls')
 })
 
-test('GitHub / 插件深链先关设置再打开目标', () => {
-  const onClose = vi.fn()
-  const onOpenRepo = vi.fn()
-  const onOpenManage = vi.fn()
-  render(
-    <SettingsCenter
-      {...base}
-      onClose={onClose}
-      onOpenRepo={onOpenRepo}
-      onOpenManage={onOpenManage}
-      initialSection="github"
-    />,
-  )
-  fireEvent.click(screen.getByRole('button', { name: '绑定/更换仓库' }))
-  expect(onClose.mock.invocationCallOrder[0]).toBeLessThan(onOpenRepo.mock.invocationCallOrder[0])
-
-  onClose.mockClear()
-  fireEvent.click(screen.getByRole('tab', { name: '插件' }))
-  fireEvent.click(screen.getByRole('button', { name: '打开插件' }))
-  expect(onClose).toHaveBeenCalled()
-  expect(onOpenManage).toHaveBeenCalled()
+test('设置中心不再有 GitHub / 插件分区，未知 section 回落账户', () => {
+  render(<SettingsCenter {...base} initialSection={'github' as never} />)
+  expect(screen.queryByRole('tab', { name: 'GitHub' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('tab', { name: '插件' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '绑定/更换仓库' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '打开插件' })).not.toBeInTheDocument()
+  expect(screen.getByRole('tab', { name: '账户与计费' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByText('账户页')).toBeInTheDocument()
 })
 
 test('快捷键分区仍拉同一份 prefs', async () => {
