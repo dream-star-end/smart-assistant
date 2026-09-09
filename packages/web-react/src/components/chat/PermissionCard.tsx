@@ -91,20 +91,31 @@ export function extractExitPlanMarkdown(input: Record<string, unknown> | null | 
   return typeof plan === "string" && plan.trim().length > 0 ? plan : "";
 }
 
+function permissionExpiresAt(msg: ChatMessage): number | null {
+  const expiresAt = msg._askUserExpiresAt;
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
+    return expiresAt;
+  }
+  if (!Number.isFinite(msg.ts)) return null;
+  const ttlMs =
+    isDetachedAskUserCard(msg) || isExitPlanModeTool(msg.toolName)
+      ? DETACHED_ASK_USER_TTL_MS
+      : PENDING_PERMISSION_TTL_MS;
+  return msg.ts + ttlMs;
+}
+
 /** Prefer the server-carried absolute expiry; fall back to ts + role TTL for
  *  old rows that never received `_askUserExpiresAt`. */
 export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolean {
-  const expiresAt = msg._askUserExpiresAt;
-  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
-    return now >= expiresAt;
-  }
-  if (!Number.isFinite(msg.ts)) return false;
-  // Blocking prompts (detached ask_user, ExitPlanMode) are not subject to the
-  // 30-minute idle TTL on the server either (gateway `BLOCKING_USER_INPUT_TOOLS`).
-  const ttlMs = isDetachedAskUserCard(msg) || isExitPlanModeTool(msg.toolName)
-    ? DETACHED_ASK_USER_TTL_MS
-    : PENDING_PERMISSION_TTL_MS;
-  return now - msg.ts > ttlMs;
+  const expiresAt = permissionExpiresAt(msg);
+  if (expiresAt == null) return false;
+  return now >= expiresAt;
+}
+
+function permissionRemainingMs(msg: ChatMessage, now: number): number {
+  const expiresAt = permissionExpiresAt(msg);
+  if (expiresAt == null) return 0;
+  return Math.max(0, expiresAt - now);
 }
 
 /** A prompt the runtime is (as far as this browser can tell) still blocked on:
@@ -226,8 +237,17 @@ export function PermissionCard({
   const input = permissionInput(msg);
   const planMarkdown = isExitPlan ? extractExitPlanMarkdown(input) : "";
 
-  const expired = !resolved && permissionHasExpired(msg);
+  const [now, setNow] = useState(() => Date.now());
+  const expired = !resolved && permissionHasExpired(msg, now);
+  const remainingMs = !resolved && !expired ? permissionRemainingMs(msg, now) : 0;
+  const remainingUrgent = remainingMs > 0 && remainingMs < 2 * 60_000;
   const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt);
+
+  useEffect(() => {
+    if (resolved) return;
+    const id = window.setInterval(() => setNow(Date.now()), remainingUrgent ? 1000 : 15_000);
+    return () => window.clearInterval(id);
+  }, [resolved, remainingUrgent, msg.ts, msg._askUserExpiresAt]);
 
   // 自动弹窗：仅活提问。时间线重挂会丢掉 useState(open)，必须再弹，
   // 否则 CCB waitingForUserInput 会卡死而用户看不到确认框。
@@ -335,6 +355,11 @@ export function PermissionCard({
           <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
           {statusText}
         </span>
+        {remainingMs > 0 && (
+          <span className={cn("shrink-0 text-meta", remainingUrgent ? "text-warning" : "text-muted")}>
+            约 {Math.max(1, Math.ceil(remainingMs / 60_000))} 分钟内有效
+          </span>
+        )}
       </div>
 
       {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
@@ -691,7 +716,7 @@ function AskUserQuestionModal({
               onOpenChange(false);
             }}
           >
-            跳过
+            暂不回答，让它继续
           </Button>
           <Button variant="accent" onClick={submit}>
             提交
@@ -730,7 +755,7 @@ function AskUserQuestionModal({
                       aria-checked={sel}
                       onClick={() => toggle(q, opt.label)}
                       className={cn(
-                        "flex items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                        "flex min-h-11 items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
                         sel ? "border-accent bg-accent-soft" : "border-border bg-surface hover:bg-hover",
                       )}
                     >
@@ -760,7 +785,7 @@ function AskUserQuestionModal({
                     aria-checked={qs.selected.includes(OTHER)}
                     onClick={() => toggle(q, OTHER)}
                     className={cn(
-                      "flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                      "flex min-h-11 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
                       qs.selected.includes(OTHER)
                         ? "border-accent bg-accent-soft"
                         : "border-border bg-surface hover:bg-hover",
