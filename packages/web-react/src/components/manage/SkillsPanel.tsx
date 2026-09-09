@@ -334,7 +334,7 @@ function SkillRow({
           >
             <span className="min-w-0 flex-1">
               <span className="flex min-w-0 items-center gap-1.5">
-                <span className="truncate text-section font-medium text-fg">{display.title}</span>
+                <span className="line-clamp-2 text-section font-medium text-fg">{display.title}</span>
                 <Badge tone={isHub ? "neutral" : "accent"} size="sm">
                   {isHub ? "市场" : "自建"}
                 </Badge>

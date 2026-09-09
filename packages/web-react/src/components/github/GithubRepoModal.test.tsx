@@ -16,6 +16,7 @@ vi.mock("../../lib/api", () => ({
     startGithubOAuth: (...a: unknown[]) => startGithubOAuth(...a),
     unlinkGithub: vi.fn(),
   },
+  apiErrorMessage: (_e: unknown, fallback: string) => fallback,
 }));
 
 import { GithubRepoModal } from "./GithubRepoModal";
@@ -54,6 +55,15 @@ describe("GithubRepoModal", () => {
     expect(listGithubRepos).not.toHaveBeenCalled();
   });
 
+  test("role=dialog 带 data-product-feature=github-repository", async () => {
+    getGithubLink.mockResolvedValue({ linked: false });
+    renderModal();
+    expect(await screen.findByRole("dialog")).toHaveAttribute(
+      "data-product-feature",
+      "github-repository",
+    );
+  });
+
   test("已关联：列仓库 → 选仓 → 列分支 → 确认绑定回调", async () => {
     getGithubLink.mockResolvedValue({ linked: true, login: "octocat", scopes: "repo" });
     listGithubRepos.mockResolvedValue([
@@ -76,6 +86,14 @@ describe("GithubRepoModal", () => {
     await waitFor(() => expect(confirmBtn).toBeEnabled());
     fireEvent.click(confirmBtn);
     await waitFor(() => expect(onConfirm).toHaveBeenCalledWith("octocat", "hello", "main"));
+  });
+
+  test("账号状态加载失败：显示加载失败且没有「连接 GitHub」", async () => {
+    getGithubLink.mockRejectedValue(new Error("network down"));
+    renderModal();
+    expect(await screen.findByText(/加载失败/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /连接 GitHub/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
   });
 
   test("已有绑定：显示「解除当前绑定」", async () => {
