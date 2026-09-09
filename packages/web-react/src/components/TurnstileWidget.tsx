@@ -111,7 +111,10 @@ export function TurnstileWidget({
           callback: (token: string) => cbRef.current.onToken(token),
           "expired-callback": () => cbRef.current.onExpire?.(),
           "error-callback": () => cbRef.current.onError?.(),
-          "timeout-callback": () => cbRef.current.onExpire?.(),
+          "timeout-callback": () => {
+            cbRef.current.onExpire?.();
+            cbRef.current.onError?.();
+          },
         });
       })
       .catch(() => {

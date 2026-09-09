@@ -39,6 +39,13 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(chip.textContent).toContain("团队模式");
   });
 
+  it("窄屏 chip 另有「团队」文案，桌面全称仍在 DOM", () => {
+    renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
+    const chip = screen.getByRole("button", { name: "团队模式已开启" });
+    expect(chip.textContent).toContain("团队");
+    expect(chip.textContent).toContain("团队模式");
+  });
+
   it("点击 chip 弹出说明（引擎 + 计费告知）与关闭按钮；点击关闭翻转 flag", async () => {
     const onDisableTeamMode = vi.fn();
     renderHeader({ teamModeActive: true, onDisableTeamMode });

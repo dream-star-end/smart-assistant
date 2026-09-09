@@ -554,7 +554,7 @@ describe("PermissionCard 关掉≠作答（pending-approval-bar）", () => {
     dismissWithoutAnswering();
     expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "打开" }));
-    fireEvent.click(screen.getByRole("button", { name: "跳过" }));
+    fireEvent.click(screen.getByRole("button", { name: "暂不回答，让它继续" }));
     expect(onRespond).toHaveBeenCalled();
     rerender(
       <PermissionCard
@@ -601,5 +601,45 @@ describe("跨包契约", () => {
     const serverTtl = factors.reduce((a, b) => a * b, 1);
 
     expect(serverTtl).toBe(PENDING_PERMISSION_TTL_MS);
+  });
+});
+
+describe("审批活卡剩余时间", () => {
+  test("未决权限卡 header 以 sibling 显示约 N 分钟内有效，且不改「等待审批…」", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ ts: Date.now() - 5 * 60_000, requestId: "req-remain" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.getByText("等待审批…")).toBeInTheDocument();
+    expect(screen.getByText("约 25 分钟内有效")).toBeInTheDocument();
+    expect(screen.getByText("约 25 分钟内有效")).not.toHaveClass("text-warning");
+  });
+
+  test("剩余不足 2 分钟用 warning 色", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ ts: Date.now() - 29 * 60_000, requestId: "req-remain-urgent" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    const label = screen.getByText("约 1 分钟内有效");
+    expect(label).toHaveClass("text-warning");
+  });
+});
+
+describe("问答跳过语义", () => {
+  test("可见文案是暂不回答，payload 仍是 deny + User skipped", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={askMsg({ requestId: "req-skip-copy" })} onRespond={onRespond} livePrompt />);
+    fireEvent.click(screen.getByRole("button", { name: "暂不回答，让它继续" }));
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: "req-skip-copy",
+      behavior: "deny",
+      message: "User skipped",
+    });
   });
 });

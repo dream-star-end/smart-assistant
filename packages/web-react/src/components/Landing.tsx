@@ -27,6 +27,7 @@ import { minSeatPriceYuan } from '../lib/orgBilling'
 import { AgentAvatar } from './AgentAvatar'
 import { BrandMark } from './BrandMark'
 import { DemoShowcase } from './landing/DemoShowcase'
+import { Tutorials } from './landing/Tutorials'
 import { ThemeToggle } from './ThemeToggle'
 import { Button, buttonVariants } from './ui'
 
@@ -397,6 +398,8 @@ export function Landing(props: {
             </div>
           </div>
         </section>
+
+        <Tutorials />
 
         <section className="congjian-section border-b border-white/8 bg-[#0c0e0b]">
           <div className="mx-auto max-w-6xl px-5 py-24">

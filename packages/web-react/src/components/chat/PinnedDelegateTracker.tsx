@@ -110,9 +110,11 @@ function DelegateRow({
 export function PinnedDelegateTracker({
   items,
   onDismiss,
+  onStop,
 }: {
   items: InflightDelegateItem[];
   onDismiss: (jobId: string) => void;
+  onStop?: () => void;
 }) {
   const visible = useMemo(() => visibleDelegateItems(items), [items]);
   const live = visible.filter((item) => !isTerminalDelegateState(item.state));
@@ -138,10 +140,10 @@ export function PinnedDelegateTracker({
   }, [sig]);
 
   useEffect(() => {
-    if (!expanded || userTouched) return;
+    if (!expanded || userTouched || hasRunning) return;
     const id = setTimeout(() => setExpanded(false), AUTO_COLLAPSE_MS);
     return () => clearTimeout(id);
-  }, [expanded, userTouched, sig]);
+  }, [expanded, userTouched, sig, hasRunning]);
 
   useEffect(() => {
     if (!hasRunning) return;
@@ -182,40 +184,64 @@ export function PinnedDelegateTracker({
   return (
     <div className="mx-auto mb-2 w-full max-w-3xl px-4">
       <div className="overflow-hidden rounded-lg border border-border bg-elevated shadow-soft">
-        <button
-          type="button"
-          onClick={toggle}
-          aria-expanded={expanded}
-          aria-controls="pinned-delegate-list"
-          className="flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover"
-        >
-          <Bot className="size-4 shrink-0 text-accent" />
-          <span className="shrink-0 text-xs font-medium text-muted">
-            后台任务 {live.length}/{visible.length}
-          </span>
-          {!expanded && latestRunning && (
-            <span className="min-w-0 flex-1 truncate text-body text-fg">
-              <span className="inline-flex max-w-full items-center gap-1.5">
-                {isRunningState(latestRunning.state) ? (
-                  <LoaderCircle className="size-3 shrink-0 animate-spin text-accent" />
-                ) : (
-                  <StatusMark state={latestRunning.state} />
-                )}
-                <span className="shrink-0 text-muted">{collapsedName}</span>
-                <span className="min-w-0 truncate">{collapsedGoal}</span>
-                {elapsed ? (
-                  <span className="shrink-0 tabular-nums text-faint">{elapsed}</span>
-                ) : null}
-              </span>
+        <div className="flex min-h-11 w-full items-center gap-2 px-3 py-2 transition-colors hover:bg-hover">
+          <button
+            type="button"
+            onClick={toggle}
+            aria-expanded={expanded}
+            aria-controls="pinned-delegate-list"
+            className="flex min-h-11 min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <Bot className="size-4 shrink-0 text-accent" />
+            <span className="shrink-0 text-xs font-medium text-muted">
+              后台任务 {live.length}/{visible.length}
             </span>
-          )}
-          {expanded && <span className="flex-1" />}
-          {expanded ? (
-            <ChevronDown className="size-4 shrink-0 text-faint" />
-          ) : (
-            <ChevronUp className="size-4 shrink-0 text-faint" />
-          )}
-        </button>
+            {!expanded && latestRunning && (
+              <span className="min-w-0 flex-1 truncate text-body text-fg">
+                <span className="inline-flex max-w-full items-center gap-1.5">
+                  {isRunningState(latestRunning.state) ? (
+                    <LoaderCircle className="size-3 shrink-0 animate-spin text-accent" />
+                  ) : (
+                    <StatusMark state={latestRunning.state} />
+                  )}
+                  <span className="shrink-0 text-muted">{collapsedName}</span>
+                  <span className="min-w-0 truncate">{collapsedGoal}</span>
+                  {elapsed ? (
+                    <span className="shrink-0 tabular-nums text-faint">{elapsed}</span>
+                  ) : null}
+                </span>
+              </span>
+            )}
+            {expanded && <span className="flex-1" />}
+          </button>
+          {hasRunning && onStop ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="shrink-0"
+              onClick={(e) => {
+                e.stopPropagation();
+                onStop();
+              }}
+            >
+              停止本轮
+            </Button>
+          ) : null}
+          <button
+            type="button"
+            onClick={toggle}
+            tabIndex={-1}
+            aria-hidden
+            className="shrink-0 text-faint"
+          >
+            {expanded ? (
+              <ChevronDown className="size-4" />
+            ) : (
+              <ChevronUp className="size-4" />
+            )}
+          </button>
+        </div>
         {expanded && (
           <div
             id="pinned-delegate-list"

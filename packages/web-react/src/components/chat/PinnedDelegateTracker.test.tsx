@@ -1,10 +1,13 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import { PinnedDelegateTracker } from "./PinnedDelegateTracker";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 function item(over: Partial<InflightDelegateItem> = {}): InflightDelegateItem {
   return {
@@ -53,5 +56,46 @@ describe("PinnedDelegateTracker", () => {
     expect(container.firstChild).not.toBeNull();
     expect(screen.getByText("核验 inflight HUD")).toBeInTheDocument();
     expect(screen.getByText("coding-assistant")).toBeInTheDocument();
+  });
+
+  test("运行中且传入 onStop 时 header 有停止本轮，点击只停轮不 dismiss", () => {
+    const onStop = vi.fn();
+    const onDismiss = vi.fn();
+    render(<PinnedDelegateTracker items={[item()]} onDismiss={onDismiss} onStop={onStop} />);
+    fireEvent.click(screen.getByRole("button", { name: "停止本轮" }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onDismiss).not.toHaveBeenCalled();
+  });
+
+  test("无 onStop 时不渲染停止本轮假按钮", () => {
+    render(<PinnedDelegateTracker items={[item()]} onDismiss={() => {}} />);
+    expect(screen.queryByRole("button", { name: "停止本轮" })).toBeNull();
+  });
+
+  test("运行中不在 3s 后自动收起", () => {
+    vi.useFakeTimers();
+    render(<PinnedDelegateTracker items={[item()]} onDismiss={() => {}} />);
+    expect(screen.getByText("核验 inflight HUD")).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(3100);
+    });
+    expect(screen.getByText("核验 inflight HUD")).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  test("无 running 终态 3s 后自动收起", () => {
+    vi.useFakeTimers();
+    render(
+      <PinnedDelegateTracker
+        items={[item({ state: "completed", resultSummary: "已完成摘要第一行\n其余" })]}
+        onDismiss={() => {}}
+      />,
+    );
+    expect(screen.getByText("已完成摘要第一行")).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(3100);
+    });
+    expect(screen.queryByText("已完成摘要第一行")).toBeNull();
+    vi.useRealTimers();
   });
 });
