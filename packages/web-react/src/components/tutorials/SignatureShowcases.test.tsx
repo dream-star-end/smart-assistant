@@ -20,6 +20,7 @@ describe('signature works', () => {
     expect(frame).toHaveAttribute('src','/tutorials/showcase-works/planet/index.html')
     expect(frame).toHaveAttribute('sandbox','allow-scripts')
     expect(screen.getByRole('link',{name:'下载完整源文件'})).toHaveAttribute('download')
+    expect(frame).toHaveClass('h-[min(70dvh,480px)]')
   })
   it('keeps the existing draft callback and the exact new request', () => {
     const run=vi.fn()
