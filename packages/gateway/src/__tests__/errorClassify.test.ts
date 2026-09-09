@@ -91,6 +91,63 @@ describe('classifyRunError', () => {
     }
   })
 
+  it('Cursor Sand Box transport fault is an upstream outage, not a bad request (INC-20260909-CURSOR-SAND-BOX-NOT-RUNNING)', () => {
+    // Exact production terminal row (oc-v5-u3, trace b7ab039c, 2026-09-09T15:41:50Z):
+    // the relay wraps every CursorSandBoxError as a 400 invalid_request_error with
+    // the internal [non-retryable] marker so CCB's own request loop stops; the
+    // gateway must still see transient infrastructure, not user content.
+    const production =
+      '{"subtype":"success","result":"API Error: 400 {\\"type\\":\\"error\\",\\"error\\":{\\"type\\":\\"invalid_request_error\\",\\"message\\":\\"CURSOR_SAND_BOX_NOT_RUNNING [non-retryable]\\"}}"}'
+    const r = classifyRunError(production)
+    assert.equal(r.code, 'upstream_failed')
+    assert.equal(r.message, classifiedMessageForCode('upstream_failed'))
+    assert.doesNotMatch(r.message, /调整内容/)
+    // Every other Box transport code that the relay can emit takes the same path.
+    for (const code of [
+      'NOT_RUNNING', 'NOT_READY', 'RELAY_NOT_READY', 'UPSTREAM_FAILED', 'STREAM_FAILED',
+      'CONNECTION_REJECTED', 'CONTROL_UNAVAILABLE', 'CONTROL_FAILED', 'CONTROL_RESPONSE_INVALID',
+      'CONTROL_RESPONSE_TOO_LARGE', 'DESCRIPTOR_INVALID', 'IDENTITY_MISMATCH', 'POLICY_INVALID',
+      'POLICY_UNAVAILABLE', 'CANCELLED',
+    ]) {
+      const raw = `API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"CURSOR_SAND_BOX_${code} [non-retryable]"}}`
+      assert.equal(classifyRunError(raw).code, 'upstream_failed', code)
+      assert.equal(classifyDelegateOutputError(raw)?.code, 'upstream_failed', `delegate ${code}`)
+    }
+  })
+
+  it('Cursor Sand Box BUSY is model capacity (retry later or switch), not a bad request', () => {
+    const raw =
+      'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"CURSOR_SAND_BOX_BUSY [non-retryable]"}}'
+    const r = classifyRunError(raw)
+    assert.equal(r.code, 'model_capacity')
+    assert.equal(r.message, classifiedMessageForCode('model_capacity'))
+  })
+
+  it('Cursor Sand Box INFERENCE_TICKET_REJECTED keeps its terminal classification (INC-20260909-CURSOR-SAND-BOX-TRANSPORT)', () => {
+    // The ticket rejection is the account-level credential decision that the
+    // Box transport incident locked as no-retry; the transport rule above must
+    // not widen it into an auto-recovering outage.
+    const raw =
+      'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED [non-retryable]"}}'
+    const r = classifyRunError(raw)
+    assert.notEqual(r.code, 'upstream_failed')
+    assert.notEqual(r.code, 'model_capacity')
+    assert.equal(r.code, 'bad_request')
+  })
+
+  it('generic 400 invalid request without a Box marker still stays bad_request', () => {
+    // Guard the new rules' boundary: only the CURSOR_SAND_BOX_ prefix is a
+    // transport fault; a 400 that merely mentions "sand" or "box" is not.
+    assert.equal(
+      classifyRunError('API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"the sand box parameter is invalid"}}').code,
+      'bad_request',
+    )
+    assert.equal(
+      classifyRunError('API Error: 400 {"error":{"code":"INVALID_REQUEST","message":"CURSOR_SAND_NOT_A_BOX_CODE"}}').code,
+      'bad_request',
+    )
+  })
+
   it('upstream_failed: 502', () => {
     const r = classifyRunError('Anthropic returned 502 Bad Gateway')
     assert.equal(r.code, 'upstream_failed')

@@ -12,6 +12,7 @@
  */
 import { Check, Clock, HelpCircle, ShieldCheck, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ChatMessage } from "../../lib/chat/model";
 import { isRecoveryTurnClientMessageId } from "../../lib/chat/pure";
 import { cn } from "../../lib/utils";
@@ -30,7 +31,7 @@ import {
   fetchPermissionFullInput,
 } from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
-import { Button, Modal } from "../ui";
+import { Alert, Button, Modal } from "../ui";
 
 export type PermissionRespond = (p: {
   requestId: string;
@@ -327,6 +328,38 @@ export function PermissionCard({
     setOpen(next);
   };
 
+  const reopen = () => setOpen(true);
+
+  // 关掉弹层 ≠ 作答：未决、未过期、用户主动收起的活提问钉一条可重开 bar。
+  // ExitPlanMode 不能无决策关掉，不进 dismissed 集，也不出 bar。
+  const showPendingBar =
+    canAnswer &&
+    livePrompt &&
+    !expired &&
+    !open &&
+    !isExitPlan &&
+    !!msg.requestId &&
+    dismissedPermissionRequestIds.has(msg.requestId);
+
+  const pendingBar = showPendingBar ? (
+    <Alert
+      tone="warning"
+      density="compact"
+      data-testid="pending-approval-bar"
+      className="cursor-pointer"
+      onClick={reopen}
+      action={
+        <Button size="sm" variant="secondary" onClick={reopen}>
+          打开
+        </Button>
+      }
+    >
+      智能体在等你确认 · 打开
+    </Alert>
+  ) : null;
+  const pendingBarSlot =
+    typeof document !== "undefined" ? document.getElementById("pending-approval-bar-slot") : null;
+
   // 状态图标(M7):lucide 替代 emoji。等待→Clock / 已允许→Check / 已拒绝→X。
   const StatusIcon = !resolved ? Clock : behavior === "allow" ? Check : X;
   const statusIconCls = !resolved ? "text-muted" : behavior === "allow" ? "text-success" : "text-danger";
@@ -509,6 +542,7 @@ export function PermissionCard({
             onRespond={onRespond}
           />
         ))}
+      {pendingBar && (pendingBarSlot ? createPortal(pendingBar, pendingBarSlot) : pendingBar)}
     </div>
   );
 }

@@ -12,13 +12,13 @@
  * 数据:target.message 持 ChatSocket 就地 mutate 的消息对象引用,App 随 version 重渲
  * 时面板自然读到最新流式内容(运行中的工具在面板里也会边流边更新)。
  */
-import { X } from "lucide-react";
-import { useEffect } from "react";
+import { Check, Copy, X } from "lucide-react";
+import { useEffect, useState } from "react";
 import { ToolBody } from "./tool/bodies";
 import { ToolBodyFullContext, type ArtifactInspectTarget } from "./tool/context";
 import { normalizeToolForDisplay } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
-import { Badge, Spinner } from "./ui";
+import { Badge, IconButton, Spinner } from "./ui";
 import { cn } from "../lib/utils";
 
 const TONE_TILE: Record<string, string> = {
@@ -28,6 +28,47 @@ const TONE_TILE: Record<string, string> = {
   warning: "bg-warning-soft text-warning",
   neutral: "bg-hover text-muted",
 };
+
+function inspectorCopyText(target: ArtifactInspectTarget): string {
+  const display = normalizeToolForDisplay(target.message);
+  const parts: string[] = [];
+  if (display.name) parts.push(display.name);
+  const summary = toolSummary(display.name, display.input);
+  if (summary) parts.push(summary);
+  const output = display.tool.output;
+  if (typeof output === "string" && output.trim()) parts.push(output);
+  else if (display.input) {
+    try {
+      parts.push(JSON.stringify(display.input, null, 2));
+    } catch {
+      /* ignore */
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function CopyIconButton({ getText }: { getText: () => string }) {
+  const [done, setDone] = useState(false);
+  return (
+    <IconButton
+      aria-label="复制全文"
+      title="复制全文"
+      size="sm"
+      shape="square"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(getText());
+          setDone(true);
+          setTimeout(() => setDone(false), 1500);
+        } catch {
+          /* clipboard 不可用：静默 */
+        }
+      }}
+    >
+      {done ? <Check size={15} /> : <Copy size={15} />}
+    </IconButton>
+  );
+}
 
 /** 面板内容(头 + 全文体)。桌面 aside 与移动 Sheet 共用。 */
 export function InspectorPanelContent({
@@ -76,6 +117,7 @@ export function InspectorPanelContent({
             </div>
           )}
         </div>
+        <CopyIconButton getText={() => inspectorCopyText(target)} />
         <button
           type="button"
           aria-label="关闭详情面板"

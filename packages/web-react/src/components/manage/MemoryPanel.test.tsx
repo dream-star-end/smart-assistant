@@ -330,7 +330,7 @@ describe("MemoryPanel · 使用情况", () => {
     });
 
     renderPanel();
-    fireEvent.click(screen.getByRole("tab", { name: "使用情况" }));
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
 
     expect(await screen.findByText("记忆在会话里如何被使用")).toBeInTheDocument();
     expect(await screen.findByText("8")).toBeInTheDocument();

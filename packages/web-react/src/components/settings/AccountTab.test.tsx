@@ -222,6 +222,16 @@ describe("AccountTab 积分收支卡", () => {
     expect(within(flowTable).getByRole("cell", { name: "1,000" })).toBeInTheDocument();
   });
 
+  test("套餐加载失败展示重试而非破折号", async () => {
+    mockedGetSub.mockRejectedValueOnce(new Error("sub down"));
+    renderTab();
+    expect(await screen.findByRole("button", { name: "套餐信息加载失败 · 重试" })).toBeInTheDocument();
+    expect(screen.queryByText("—")).not.toBeInTheDocument();
+    mockedGetSub.mockResolvedValueOnce(makeSub("4000", "3000"));
+    fireEvent.click(screen.getByRole("button", { name: "套餐信息加载失败 · 重试" }));
+    expect(await screen.findByText("Lite")).toBeInTheDocument();
+  });
+
   test("账单流水行同时渲染金额与「积分」单位", async () => {
     mockedGetSub.mockResolvedValue(makeSub("4000", "3000"));
     const usage = makeUsage();

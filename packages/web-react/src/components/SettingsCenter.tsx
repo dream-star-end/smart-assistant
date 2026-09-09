@@ -21,7 +21,6 @@ import { AccountTab } from "./settings/AccountTab";
 import { ApiAccessTab } from "./settings/ApiAccessTab";
 import { FeedbackTab } from "./settings/FeedbackTab";
 import { PreferencesTab } from "./settings/PreferencesTab";
-import { SettingsRow } from "./settings/SettingsRow";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Button, Modal, Spinner, Tabs } from "./ui";
@@ -46,11 +45,6 @@ const PERSONAL: SectionDef[] = [
   { id: "about", label: "关于" },
 ];
 
-const WORKSPACE: SectionDef[] = [
-  { id: "github", label: "GitHub" },
-  { id: "plugins", label: "插件" },
-];
-
 function isAdminUser(user: User | null): boolean {
   return user?.role === "admin" || user?.roles.includes("admin") === true;
 }
@@ -61,13 +55,9 @@ function useVisibleSections(user: User | null) {
   return useMemo(() => {
     const keep = (s: SectionDef) => !s.adminOnly || admin;
     const personal = PERSONAL.filter(keep);
-    const workspace = WORKSPACE.filter(keep);
     return {
-      sections: [...personal, ...workspace],
-      groups: [
-        { label: "个人", items: personal },
-        { label: "工作区", items: workspace },
-      ],
+      sections: personal,
+      groups: [{ label: "个人", items: personal }],
     };
   }, [admin]);
 }
@@ -87,8 +77,7 @@ export function SettingsCenter({
   onRefreshMe,
   onPreferencesChange,
   onOpenMemory,
-  onOpenManage,
-  onOpenRepo,
+  onOpenProjectSettings,
   feedbackContext,
   initialSection = "account",
   subscribeOpenSignal = 0,
@@ -103,10 +92,11 @@ export function SettingsCenter({
   onRefreshMe?: () => void;
   onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
   onOpenMemory: () => void;
-  /** 插件深链：先关设置再打开管理中心 connectors。 */
+  /** 保留给 App 装配；GitHub/插件已从设置分区移除，教程深链走 openRepo/openManage。 */
   onOpenManage?: () => void;
-  /** GitHub 深链：先关设置再打开对话区绑定。 */
   onOpenRepo?: () => void;
+  /** 用量页 facade 未绑定：关设置后打开当前聊天项目设置。 */
+  onOpenProjectSettings?: () => void;
   feedbackContext?: { sessionId: string | null; requestId: string | null };
   initialSection?: SettingsSection;
   /** Increment to programmatically open SubscriptionDialog on the account tab. */
@@ -216,6 +206,7 @@ export function SettingsCenter({
               <Tabs
                 aria-label="设置分区"
                 idBase="settings"
+                layout="grid"
                 value={section}
                 onValueChange={(v) => setSection(v as SettingsSection)}
                 items={sections.map((s) => ({
@@ -253,8 +244,9 @@ export function SettingsCenter({
               ledgerReload={ledgerReload}
               onRefreshMe={onRefreshMe}
               feedbackContext={feedbackContext}
-              onOpenManage={onOpenManage ? () => leaveTo(onOpenManage) : undefined}
-              onOpenRepo={onOpenRepo ? () => leaveTo(onOpenRepo) : undefined}
+              onOpenProjectSettings={
+                onOpenProjectSettings ? () => leaveTo(onOpenProjectSettings) : undefined
+              }
             />
           </div>
         </div>
@@ -361,8 +353,7 @@ function SettingsPanel({
   ledgerReload,
   onRefreshMe,
   feedbackContext,
-  onOpenManage,
-  onOpenRepo,
+  onOpenProjectSettings,
 }: {
   section: SettingsSection;
   auth: AuthSession | null;
@@ -381,8 +372,7 @@ function SettingsPanel({
   ledgerReload: number;
   onRefreshMe?: () => void;
   feedbackContext?: { sessionId: string | null; requestId: string | null };
-  onOpenManage?: () => void;
-  onOpenRepo?: () => void;
+  onOpenProjectSettings?: () => void;
 }) {
   if (!auth) {
     return <p className="px-5 py-10 text-center text-body text-faint">请先登录。</p>;
@@ -405,7 +395,7 @@ function SettingsPanel({
   if (section === "usage") {
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
-        <UsageTab auth={auth} />
+        <UsageTab auth={auth} onOpenProjectSettings={onOpenProjectSettings} />
       </div>
     );
   }
@@ -467,32 +457,15 @@ function SettingsPanel({
 
   if (section === "about") return <AboutSection />;
 
-  if (section === "github") {
-    return (
-      <div className="px-5 py-5">
-        <SettingsRow
-          title="GitHub 仓库"
-          description="在当前对话输入区绑定或更换仓库。设置页不维护 live 分支，只提供入口。"
-          action={
-            <Button size="sm" variant="secondary" onClick={onOpenRepo} disabled={!onOpenRepo}>
-              绑定/更换仓库
-            </Button>
-          }
-        />
-      </div>
-    );
-  }
-
+  // 未知分区（含已删的 github/plugins）回落账户页。
   return (
-    <div className="px-5 py-5">
-      <SettingsRow
-        title="插件与连接器"
-        description="浏览器和外部账号仍在管理中心编辑，这里只提供入口。"
-        action={
-          <Button size="sm" variant="secondary" onClick={onOpenManage} disabled={!onOpenManage}>
-            打开插件
-          </Button>
-        }
+    <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
+      <AccountTab
+        auth={auth}
+        user={user}
+        onManageSub={onManageSub}
+        reloadKey={ledgerReload}
+        onRefreshMe={onRefreshMe}
       />
     </div>
   );

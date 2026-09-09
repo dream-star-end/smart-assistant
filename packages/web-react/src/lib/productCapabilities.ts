@@ -16,9 +16,7 @@ export type SettingsDestinationSection =
   | "preferences"
   | "hotkeys"
   | "feedback"
-  | "about"
-  | "github"
-  | "plugins";
+  | "about";
 export type MarketplaceDestinationTab = "browse" | "installed" | "publish";
 export type MarketplaceDestinationKind = "skill" | "agent" | "connector";
 export type OrgDestinationSection = "overview" | "members" | "skills" | "reports" | "invoices";

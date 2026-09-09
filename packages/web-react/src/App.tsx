@@ -13,6 +13,8 @@ import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
+import { saveBlob } from "./lib/chat/download";
+import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
@@ -3164,6 +3166,12 @@ export function App() {
                 setBoardOpen(false);
                 selectSession(id);
               }}
+              onOpenProjectSettings={(projectId) => {
+                const p = projects.find((x) => x.id === projectId);
+                if (!p) return;
+                setUngroupedAssetsOpen(false);
+                setProjectSettings(p);
+              }}
             />
           </LazyBoundary>
         ) : (
@@ -3205,6 +3213,18 @@ export function App() {
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
+          onExport={
+            demo
+              ? undefined
+              : () => {
+                  saveBlob(
+                    new Blob([exportSessionMarkdown(wsMessages)], {
+                      type: "text/markdown;charset=utf-8",
+                    }),
+                    sessionExportFilename(activeSess?.title),
+                  );
+                }
+          }
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
@@ -3214,6 +3234,10 @@ export function App() {
             selection={repo.selection}
             progressPct={repo.progressPct}
             onDismiss={repo.dismissBanner}
+            onRetry={() => {
+              const sel = repo.selection;
+              if (sel?.selected) void repo.confirm(sel.owner, sel.repo, sel.branch);
+            }}
           />
         )}
 
@@ -3379,6 +3403,12 @@ export function App() {
               onDismiss={inflightDelegates.dismiss}
             />
           )}
+          {!demo && !gated && (
+            <div
+              id="pending-approval-bar-slot"
+              className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
+            />
+          )}
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
@@ -3524,6 +3554,13 @@ export function App() {
             onOpenMemory={() => openManage("optimization")}
             onOpenManage={() => openManage("connectors")}
             onOpenRepo={demo ? undefined : openRepo}
+            onOpenProjectSettings={() => {
+              const pid = sessions.find((s) => s.id === activeId)?.projectId;
+              const p = pid ? projects.find((x) => x.id === pid) : null;
+              if (!p) return;
+              setUngroupedAssetsOpen(false);
+              setProjectSettings(p);
+            }}
             subscribeOpenSignal={subscribeOpenSignal}
           />
         </LazyBoundary>

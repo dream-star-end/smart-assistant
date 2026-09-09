@@ -139,6 +139,20 @@ describe("ChatHeader 会话内查找", () => {
   });
 });
 
+describe("ChatHeader 导出会话", () => {
+  it("无 onExport 时不渲染导出按钮", () => {
+    renderHeader();
+    expect(screen.queryByRole("button", { name: "导出会话" })).toBeNull();
+  });
+
+  it("有 onExport 时渲染导出按钮且点击回调", () => {
+    const onExport = vi.fn();
+    renderHeader({ onExport });
+    fireEvent.click(screen.getByRole("button", { name: "导出会话" }));
+    expect(onExport).toHaveBeenCalledTimes(1);
+  });
+});
+
 
 describe("ChatHeader compact navigation", () => {
   it("keeps the agent accessible and groups the model independently of actions", () => {

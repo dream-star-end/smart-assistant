@@ -87,6 +87,40 @@ const PATTERNS: Array<{
     code: 'context_too_long',
     message: '上下文长度超过模型上限',
   },
+  // Cursor Sand Box transport faults (engine/cursorSandBox.ts CursorSandBoxError).
+  // The account-bound Box relay surfaces every Box failure to CCB as an
+  // Anthropic `400 invalid_request_error` carrying the internal
+  // `[non-retryable]` marker — that marker only stops CCB's *in-request* retry
+  // loop from hammering a Box the master preparation actor has to bring back.
+  // It says nothing about the user's prompt: the request was valid, the
+  // transport was down. Left to the generic `400 invalid request` rule below,
+  // these landed on `bad_request` ("请调整内容后重试", cta=none, no automatic
+  // recovery). 2026-09-09 incident: `CURSOR_SAND_BOX_NOT_RUNNING` was shown to
+  // the user as a content problem while the sibling `Request timed out` turn
+  // in the same Box blip auto-recovered.
+  //
+  // Real semantics:
+  //   - BUSY → model_capacity (the Box is serving its max concurrent streams;
+  //     same model later / another model now — taxonomy cta=retry_or_switch);
+  //   - every other transport code (NOT_RUNNING / NOT_READY / RELAY_NOT_READY /
+  //     UPSTREAM_FAILED / STREAM_FAILED / CONTROL_* / CONNECTION_REJECTED …) →
+  //     upstream_failed (transient platform infrastructure, automaticRecovery).
+  //   - INFERENCE_TICKET_REJECTED is deliberately *excluded*: it is the
+  //     account-level credential decision INC-20260909-CURSOR-SAND-BOX-TRANSPORT
+  //     locked as terminal/no-retry; it keeps its current classification.
+  // Account/session credential faults never reach here — the relay emits them
+  // as `CURSOR_SAND_SESSION_*` / `CURSOR_SAND_AUTH_*` 401s (auth_error above).
+  // Both rules must stay above the generic `bad_request` rule.
+  {
+    re: /\bCURSOR_SAND_BOX_BUSY\b/,
+    code: 'model_capacity',
+    message: '模型繁忙，请稍后重试或切换模型',
+  },
+  {
+    re: /\bCURSOR_SAND_BOX_(?!INFERENCE_TICKET_REJECTED\b)[A-Z0-9_]+\b/,
+    code: 'upstream_failed',
+    message: '模型服务上游暂时异常，请稍后重试',
+  },
   {
     // CCB result terminals wrap the canonical assistant diagnostic inside
     // `{subtype,result}` JSON, so the marker is not necessarily at offset 0.

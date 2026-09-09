@@ -75,6 +75,7 @@ export function TaskboardView({
   sessionIds = [],
   sidebarCollapsed,
   onExpandSidebar,
+  onOpenProjectSettings,
 }: {
   auth: AuthSession
   view: BoardViewParam
@@ -88,6 +89,7 @@ export function TaskboardView({
   sessionIds?: readonly string[]
   sidebarCollapsed?: boolean
   onExpandSidebar?: () => void
+  onOpenProjectSettings?: (projectId: string) => void
 }) {
   const projectScope = useProjectScope()
   const workQuery = boardWorkQuery(projectScope.scope)
@@ -759,6 +761,13 @@ export function TaskboardView({
                 }}
               >
                 选择工作项目
+              </Button>
+            ) : projectScope.scope.kind === 'chat' && onOpenProjectSettings && projectScope.scope.chatProject ? (
+              <Button
+                type="button"
+                onClick={() => onOpenProjectSettings(projectScope.scope.chatProject!.id)}
+              >
+                去项目设置绑定
               </Button>
             ) : undefined
           }

@@ -758,7 +758,7 @@ export function Sidebar({
               aria-label="选择智能体后新建"
               title="选择智能体后新建"
               onClick={onNewWithAgent}
-              className="h-9 rounded-l-none rounded-r-lg border border-border bg-surface text-fg hover:border-border-strong hover:bg-hover"
+              className="rounded-l-none rounded-r-lg border border-border bg-surface text-fg hover:border-border-strong hover:bg-hover"
             >
               <ChevronDown size={16} />
             </IconButton>

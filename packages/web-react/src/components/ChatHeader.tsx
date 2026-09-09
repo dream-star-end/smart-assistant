@@ -1,5 +1,5 @@
 import type { CursorContextTier } from "@openclaude/protocol";
-import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Search, Users, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Download, Menu, PanelLeft, PenSquare, Search, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
@@ -36,6 +36,7 @@ export function ChatHeader({
   onOpenMobileNav,
   onOpenInbox,
   onOpenFind,
+  onExport,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
@@ -83,6 +84,8 @@ export function ChatHeader({
   onOpenInbox?: () => void;
   /** 打开会话内查找条（省略则不渲染查找键，如 demo）。按钮常驻，不随查找条开关挂卸载。 */
   onOpenFind?: () => void;
+  /** 导出会话为 Markdown（省略则不渲染，如 demo）。窄屏隐藏以免挤顶栏。 */
+  onExport?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
@@ -245,6 +248,18 @@ export function ChatHeader({
             shape="square"
           >
             <Search size={18} />
+          </IconButton>
+        )}
+        {onExport && (
+          <IconButton
+            data-product-control
+            onClick={onExport}
+            aria-label="导出会话"
+            title="导出会话"
+            shape="square"
+            className="hidden sm:flex"
+          >
+            <Download size={18} />
           </IconButton>
         )}
         {onOpenInbox && (

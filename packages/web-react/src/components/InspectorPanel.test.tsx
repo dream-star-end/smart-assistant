@@ -74,4 +74,15 @@ describe("产物详情列(inspector)", () => {
     fireEvent.click(screen.getByLabelText("关闭详情面板"));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  test("头部提供复制全文入口", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const target: ArtifactInspectTarget = { kind: "tool", message: longEditMessage };
+    render(<InspectorPanelContent target={target} onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText("复制全文"));
+    expect(writeText).toHaveBeenCalled();
+    const copied = String(writeText.mock.calls[0]?.[0] ?? "");
+    expect(copied).toContain("line-120");
+  });
 });

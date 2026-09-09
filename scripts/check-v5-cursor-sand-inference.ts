@@ -183,6 +183,42 @@ try {
   ]) assert.ok(outcomes.some((outcome) => outcome[3] === name), `required contract did not execute: ${name}`)
   console.log('[cursor-sand-box] PASS — isolated Box transport, account health, and terminal no-retry contracts executed')
 
+  // INC-20260909-CURSOR-SAND-BOX-NOT-RUNNING: the relay's `400 invalid_request_error
+  // CURSOR_SAND_BOX_* [non-retryable]` envelope only stops CCB's in-request loop; the
+  // gateway must still classify it as transient infrastructure so the turn enters
+  // automatic recovery instead of a "请调整内容后重试" bad_request card. Execute the
+  // classifier and the throw/resolved surface matrix, which pins both gateway retry
+  // seams to the same taxonomy code for every declared classification.
+  const classifyResult = spawnSync(process.execPath, [
+    '--import', 'tsx', '--test', '--test-reporter=tap', '--test-concurrency=1',
+    'packages/gateway/src/__tests__/errorClassify.test.ts',
+    'packages/gateway/src/__tests__/terminalErrorSurfaceMatrix.test.ts',
+  ], { cwd: root, env, encoding: 'utf8', timeout: 180_000, killSignal: 'SIGKILL',
+    maxBuffer: 8 * 1024 * 1024, detached: true })
+  if ((classifyResult.error || classifyResult.signal) && classifyResult.pid > 0) {
+    try { process.kill(-classifyResult.pid, 'SIGKILL') } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  }
+  process.stdout.write(classifyResult.stdout ?? '')
+  process.stderr.write(classifyResult.stderr ?? '')
+  assert.ifError(classifyResult.error)
+  assert.equal(classifyResult.signal, null, 'Box classification contract runner terminated by signal')
+  assert.equal(classifyResult.status, 0, 'Box classification contract runner failed')
+  const classifyTap = classifyResult.stdout
+  for (const label of ['fail', 'cancelled', 'todo']) assert.match(classifyTap, new RegExp(`^# ${label} 0$`, 'm'))
+  const classifyOutcomes = [...classifyTap.matchAll(/^ +ok \d+ - (.+)$/gm)]
+    .map((match) => match[1]).filter((name) => !/#\s*(SKIP|TODO)\b/i.test(name))
+  for (const name of [
+    'Cursor Sand Box transport fault is an upstream outage, not a bad request (INC-20260909-CURSOR-SAND-BOX-NOT-RUNNING)',
+    'Cursor Sand Box BUSY is model capacity (retry later or switch), not a bad request',
+    'Cursor Sand Box INFERENCE_TICKET_REJECTED keeps its terminal classification (INC-20260909-CURSOR-SAND-BOX-TRANSPORT)',
+    'generic 400 invalid request without a Box marker still stays bad_request',
+    'upstream_failed: 两种投递形态都恰好 11 次尝试',
+    'bad_request: 两种投递形态都恰好 1 次尝试',
+  ]) assert.ok(classifyOutcomes.includes(name), `required classification contract did not execute: ${name}`)
+  console.log('[cursor-sand-box-classify] PASS — Box transport faults classify as recoverable upstream outage in both gateway retry seams')
+
   // INC-20260909-CURSOR-EMPTY-POOL-MOUNT: execute the real root-filesystem
   // transitions and production provision path. Docker/PG are substituted here;
   // diagnostics/cursor-auth-mount-smoke.ts separately tests an actual Docker bind.

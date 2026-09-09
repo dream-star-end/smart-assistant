@@ -23,7 +23,7 @@ function boardProjectQuery(
   if (kind === "work" && workId) return { boardProjectId: workId };
   if (kind === "chat") {
     if (workId) return { boardProjectId: workId };
-    return { blocked: "当前是未绑定的聊天项目，用量不能按该 facade 过滤，已停用以免误查全局。" };
+    return { blocked: "当前聊天项目还没绑定任务看板,用量按全部项目统计" };
   }
   return {};
 }
@@ -85,7 +85,13 @@ export function topModelsWithOther(
  * 所有大数字段全程字符串（formatCompactCount / formatCredits / groupDigits）；
  * 唯图表 dataset 经 chartNum 收口数值化。
  */
-export function UsageTab({ auth }: { auth: AuthSession }) {
+export function UsageTab({
+  auth,
+  onOpenProjectSettings,
+}: {
+  auth: AuthSession;
+  onOpenProjectSettings?: () => void;
+}) {
   const { scope } = useProjectScope();
   const scopeQuery = boardProjectQuery(scope.kind, scope.workProject?.id);
   const boardProjectId = scopeQuery.boardProjectId;
@@ -317,7 +323,17 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   if (scopeQuery.blocked) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="warning" className="text-meta">
+        <Alert
+          tone="warning"
+          className="text-meta"
+          action={
+            onOpenProjectSettings ? (
+              <Button size="sm" variant="secondary" onClick={onOpenProjectSettings}>
+                去项目设置
+              </Button>
+            ) : undefined
+          }
+        >
           {scopeQuery.blocked}
         </Alert>
       </div>
