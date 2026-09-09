@@ -81,14 +81,14 @@
       "sourceHash": "3b6111e3b27ae20494928f8e034508be95539d91203e43740f9447a7c15ff9f9"
     },
     "github-repository": {
-      "contentHash": "98494ec3b35e6b93ac1309f0313dc1b07cc47da79cd3722c9ba8f98458c70250",
-      "contentVersion": 2,
-      "entryIdentityHash": "fdaac6442183ac96eb4c90dfc521553a8784b95b55faaed82ad0fbbb070e8704",
+      "contentHash": "0d7c180f622f932b7b689b2f76dd60ca6de4db38ba392ac38248c9b57590c127",
+      "contentVersion": 3,
+      "entryIdentityHash": "f304491510ff1a1e64c06f3a70c4c3e3cc747b6f5d584d59788f0b731c7bf3ed",
       "mediaHash": "3e289b11edeaf27153d685ad919d800ed8bf3be849ccdb8cc8a280859bda775b",
       "mediaKey": "github-repository",
       "mediaVersion": 2,
       "registryHash": "d2a4d08cdbe9fe8f304ce573f8c818d55007b22f60680c6f5225b59cfc4b6d40",
-      "sourceHash": "46f1da50f196adc39878cb54f7fdd3d9e8ac983ca73702ead86e7dcc3a6ac1a7"
+      "sourceHash": "19bfd46c005259cb626967eddcf63595c45179942c576e495f071917d725756f"
     },
     "image-create-edit": {
       "contentHash": "c540c520a658661ef339bdcdea74c6c8d6b7681ae4786a8c109fc9c54b0a6026",
@@ -221,14 +221,14 @@
       "sourceHash": "a93866a265b753179dbc697adaeefc0c9cb7dd313551e14de35f997005d3cbe4"
     },
     "team-mode": {
-      "contentHash": "99be643adaf53c612cfcdcd8d0cddebd89c3e2f01b98329fa4b683aab38927d3",
-      "contentVersion": 3,
+      "contentHash": "6b41772fb4d300f8465551a9e7d48516cdbc45c36efda9d138395ce30509375f",
+      "contentVersion": 4,
       "entryIdentityHash": "8523bda4824b3f48290dbb2e0529b26d373fdecba8bfdd64953a450443a82736",
       "mediaHash": "65c7d1266d9d4476c2751ae8d320a2c256e155293f4f8e591a479bd6b9def4eb",
       "mediaKey": "team-mode",
       "mediaVersion": 3,
       "registryHash": "b72bb329d18eb6d2bc79156b0b78af40408734514e3e711c176ae71a04c0132a",
-      "sourceHash": "f4fbfc302c54eb32a91569e43a4a2d6f7da163297b3cb553d29c9db4e113255c"
+      "sourceHash": "f045008533591a5af0cf888f860e85425437910f1f81e27627dd0b779524d4dc"
     },
     "voice-input": {
       "contentHash": "144229b18b8fdb8b87305b9d050c6b60245f0eeb110b4b3396da1aad19ac808e",

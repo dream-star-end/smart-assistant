@@ -546,7 +546,7 @@ export const TUTORIAL_TOPICS = {
   },
   "github-repository": {
     featureId: "github-repository",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
       "把 GitHub 账号授权给平台后，可为当前会话绑定一个仓库和分支。智能体会在绑定的真实代码上下文中查看文件、运行构建和测试，并按你的授权与指令提交或推送改动。仓库绑定是按会话隔离的。",
     outcome: "让编程任务直接落到仓库和分支，而不是只返回一段孤立代码。",
@@ -558,7 +558,7 @@ export const TUTORIAL_TOPICS = {
     steps: [
       {
         title: "连接 GitHub",
-        body: "点击输入框下方仓库入口，完成 GitHub OAuth 授权。",
+        body: "点击输入框下方仓库入口，在仓库对话框中完成 GitHub OAuth 授权及仓库、分支选择；关闭对话框会返回当前会话。",
       },
       {
         title: "选仓库与分支",
@@ -624,7 +624,7 @@ export const TUTORIAL_TOPICS = {
   },
   "team-mode": {
     featureId: "team-mode",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "团队模式由队长拆解任务，并按需委派给已安装的专业智能体并行工作。即使未开团队模式，对话里也可以用委派子任务；运行中会出现委派直播卡（delegate-progress），显示子任务正在做什么，而不是一条普通工具结果。界面还会展示成员进度、工具、结果和各自消耗。",
     outcome: "让调研、实现、验证等子任务并行推进，同时看清每一步委派进度。",
@@ -644,7 +644,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "看委派直播卡与成本",
-        body: "对话里的委派直播卡会持续更新子任务动作，不要当成已经结束的普通工具卡。终稿完成后检查各成员结果和积分明细。",
+        body: "对话里的委派直播卡会持续更新子任务动作，不要当成已经结束的普通工具卡。运行中的团队浮条不会自动收起，可展开查看成员；需要中止时点击“停止本轮”，只作用于当前会话这轮任务。终稿完成后检查各成员结果和积分明细。",
       },
     ],
     tips: [
