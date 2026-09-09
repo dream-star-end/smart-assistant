@@ -1221,6 +1221,30 @@ function combineRetryAssistantOutput(
 
 const TRANSIENT_RETRY_ERROR_CODES = new Set(['rate_limited', 'model_capacity', 'upstream_failed'])
 
+/** Consecutive same-class transient failures before the in-process retry circuit opens. */
+export const TRANSIENT_SAME_CLASS_BREAKER = 3
+
+export function resolveTransientBreakerThreshold(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = parseInt(String(env.OPENCLAUDE_TRANSIENT_BREAKER ?? ''), 10)
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : TRANSIENT_SAME_CLASS_BREAKER
+}
+
+/** In-process consecutive same-class counter. Mutates `state`; not persisted. */
+export function advanceTransientBreaker(
+  state: AutomaticRetryState,
+  errorClass: string,
+  threshold: number,
+): { open: boolean; consecutive: number } {
+  if (state.lastErrorClass === errorClass) {
+    state.consecutiveSameClass = (state.consecutiveSameClass ?? 0) + 1
+  } else {
+    state.consecutiveSameClass = 1
+    state.lastErrorClass = errorClass
+  }
+  const consecutive = state.consecutiveSameClass
+  return { open: consecutive >= threshold, consecutive }
+}
+
 /** E12 — 瞬时错误自动重试的续跑输入。裸「继续」会让模型丢失重试语境(可能被
  *  理解成用户新指令);这里显式附带原始意图:上一轮因上游瞬时错误被打断,应
  *  继续完成同一任务。导出供引擎回放测试引用同一权威串。 */
@@ -5877,6 +5901,23 @@ export class SessionManager {
           TRANSIENT_RETRY_ERROR_CODES.has(errorClass) ||
           /AbortError|operation was aborted|timed?\s*out/i.test(msg)
         if (!isTransient || !canRetry()) throw err
+        if (TRANSIENT_RETRY_ERROR_CODES.has(errorClass)) {
+          const breaker = advanceTransientBreaker(
+            retryState,
+            errorClass,
+            resolveTransientBreakerThreshold(),
+          )
+          if (breaker.open) {
+            log.warn('transient retry circuit open', {
+              sessionKey: session.sessionKey,
+              errorClass,
+              consecutive: breaker.consecutive,
+              attempt: retryState.attempt,
+              ...(traceId ? { traceId } : {}),
+            })
+            throw err
+          }
+        }
         const delay = this._transientRetryDelayMs(retryState.attempt)
         log.warn('transient error, retrying', {
           sessionKey: session.sessionKey,

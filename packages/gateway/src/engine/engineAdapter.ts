@@ -93,6 +93,10 @@ export interface AutomaticRetryState {
   rootClientMessageId: string
   attempt: number
   max: number
+  /** In-process same-class transient circuit count; not persisted. */
+  consecutiveSameClass?: number
+  /** Last counted transient error class; not persisted. */
+  lastErrorClass?: string
 }
 
 /** 一次 turn 的入参。spec 契约字段之外,M0 为保 CCB 成本 delta 基线逐字节不变,
