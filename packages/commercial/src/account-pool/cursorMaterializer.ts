@@ -23,6 +23,7 @@ import { join } from "node:path";
 
 import { rootLogger } from "../logging/logger.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
+import { cursorSandLifecycleEnabled, readSandLifecycleState, readySandBinding, renderManagedSandPolicy, writeSandJsonAtomic, SAND_POLICY_FILE, type SandLifecycleState, type SandReadyBinding } from "./cursorSandState.js";
 import {
   createAccount,
   getCursorTokenSnapshot,
@@ -127,6 +128,7 @@ interface MaterializedCursorSlot {
   machineId: string | null;
   /** 0262 — first-touch selection weight from Sand usage columns (1..10000). */
   weight: number;
+  boxBinding?: SandReadyBinding;
 }
 
 export function isCanonicalCursorKeyFile(name: string): boolean {
@@ -151,6 +153,8 @@ export interface CursorAuthSyncDeps {
   runtimeChannel?: "v3" | "v5";
   /** Production actor's start-instance fence; checked after awaits and before publication. */
   canPublish?: () => boolean;
+  lifecycleManaged?: boolean;
+  lifecycleState?: SandLifecycleState;
 }
 
 function requireSyncOwner(canPublish: (() => boolean) | undefined): void {
@@ -250,7 +254,8 @@ function credentialKindSlots(
   }));
 }
 
-function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): string[] {
+function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[], managed = false, canPublish: () => boolean = () => true): string[] {
+  const policy = managed ? renderManagedSandPolicy(slots.flatMap((s) => s.boxBinding ? [s.boxBinding] : [])) : null;
   mkdirSync(authDir, { recursive: true, mode: 0o700 });
   const fingerprints = slots.map((slot) => fingerprintCursorKey(slot.key));
   const generationDigest = createHash("sha256");
@@ -267,6 +272,7 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
       // 0262: weight participates so a usage refresh yields a new generation
       // (weights are bucketed upstream so hourly drift does not churn).
       String(slots[i].weight),
+      ...(slots[i].boxBinding ? [JSON.stringify(slots[i].boxBinding)] : []),
     ].join("\0"));
     generationDigest.update("\n");
   }
@@ -306,6 +312,8 @@ function writeAtomicSlots(authDir: string, slots: MaterializedCursorSlot[]): str
       rmSync(generationStaging, { recursive: true, force: true });
     }
   }
+  requireSyncOwner(canPublish);
+  if (policy) writeSandJsonAtomic(authDir, SAND_POLICY_FILE, policy, canPublish);
   const activeTemp = join(authDir, `${CURSOR_POOL_ACTIVE_FILE}.tmp-${process.pid}`);
   writeFileSync(activeTemp, `${generation}\n`, { mode: 0o600 });
   chmodSync(activeTemp, 0o600);
@@ -381,6 +389,8 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
   if (!resolved.authDir) {
     return { imported: 0, written: 0, skipped: "no-auth-dir", fingerprints: [] };
   }
+  const managed = resolved.lifecycleManaged ?? cursorSandLifecycleEnabled();
+  const lifecycle = managed ? resolved.lifecycleState ?? readSandLifecycleState(resolved.authDir) : null;
 
   requireSyncOwner(resolved.canPublish);
   const before = await listAllCursorAccounts(resolved.listAccounts, resolved.canPublish);
@@ -401,7 +411,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
     if (!hasPoolOwnershipMarker(resolved.authDir)) {
       return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
     }
-    writeAtomicSlots(resolved.authDir, []);
+    writeAtomicSlots(resolved.authDir, [], managed, resolved.canPublish);
     log.info("materialized empty owned Cursor pool; removed selectable root slots");
     return { imported, written: 0, skipped: null, fingerprints: [] };
   }
@@ -415,6 +425,10 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
       try {
         requireSyncOwner(resolved.canPublish);
         const credentialKind: CursorSlotCredentialKind = snap.credential_kind === "session" ? "session" : "api_key";
+        const boxBinding = managed && row.cursor_sand_enabled === true
+          ? readySandBinding(lifecycle!, row.id.toString(), snap.token.toString("utf8").trim(), credentialKind === "session" ? snap.machine_id : null, (resolved.now ?? (() => new Date()))().getTime())
+          : null;
+        if (managed && row.cursor_sand_enabled === true && !boxBinding) continue;
         const quotaClass: CursorQuotaClass = row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
           ? row.cursor_quota_class
           : "unknown";
@@ -444,6 +458,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
             credentialKind: "session",
             machineId,
             weight,
+            ...(boxBinding ? { boxBinding } : {}),
           });
         } else {
           slots.push({
@@ -454,6 +469,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
             credentialKind: "api_key",
             machineId: null,
             weight,
+            ...(boxBinding ? { boxBinding } : {}),
           });
         }
       } finally {
@@ -462,13 +478,21 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
       }
     }
     requireSyncOwner(resolved.canPublish);
-    const writtenFp = writeAtomicSlots(resolved.authDir, slots);
+    // Preparation can change while credentials are awaited. Recheck the latest
+    // non-secret state synchronously before publishing its admission policy.
+    const currentLifecycle = managed ? resolved.lifecycleState ?? readSandLifecycleState(resolved.authDir) : null;
+    const publishSlots = managed ? slots.flatMap((s) => {
+      if (!s.sandEnabled) return [s];
+      const boxBinding = readySandBinding(currentLifecycle!, s.accountId, s.key, s.machineId, (resolved.now ?? (() => new Date()))().getTime());
+      return boxBinding ? [{ ...s, boxBinding }] : [];
+    }) : slots;
+    const writtenFp = writeAtomicSlots(resolved.authDir, publishSlots, managed, resolved.canPublish);
     log.info("materialized cursor account pool onto host auth dir", {
-      written: slots.length,
+      written: publishSlots.length,
       imported,
       fingerprints: writtenFp,
     });
-    return { imported, written: slots.length, skipped: null, fingerprints: writtenFp };
+    return { imported, written: publishSlots.length, skipped: null, fingerprints: writtenFp };
   } finally {
     for (const slot of slots) slot.key = "";
     slots.length = 0;

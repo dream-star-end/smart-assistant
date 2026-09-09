@@ -43,3 +43,22 @@ test('Box inference ticket errors are nonretryable, real quota remains distinct'
  assert.match(cursorSandBoxTicketError('unauthenticated: ERROR_NOT_LOGGED_IN')??'',/BOX_INFERENCE_TICKET_REJECTED.*non-retryable/)
  assert.equal(cursorSandBoxTicketError('quota exceeded 429'),null)
 })
+test('managed missing binding fails closed and api-key controls use only the persisted policy machine', async () => {
+  let current: CursorSandBoxPolicy = { version: 1, managed: true, accounts: [] }
+  const calls: Array<{ url: string; headers: Headers }> = []
+  const resolver = new CursorSandBoxResolver({ accountId: '25', credentialKind: 'api_key', readPolicy: () => current,
+    fetchImpl: async (url, init) => {
+      calls.push({ url, headers: new Headers(init.headers) })
+      return Response.json(url.endsWith('GetSandBoxRunState') ? { state: 'SAND_BOX_RUN_STATE_RUNNING' }
+        : { gatewayUrl: 'https://api-box.cursorvm.com/base', gatewayToken: 'GW', networkToken: 'NET' })
+    } })
+  await assert.rejects(resolver.resolve(token(), null, signal()), /BOX_NOT_READY/)
+  assert.equal(calls.length, 0)
+  current = parseCursorSandBoxPolicy({ version: 1, managed: true, accounts: [{ accountId: '25', subjectHash: hash('account-a'), machineHash: hash(machine), machineId: machine }] })
+  assert.ok(await resolver.resolve(token(), null, signal()))
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every((c) => c.headers.get('authorization') === 'Bearer ' + token() && c.headers.has('x-cursor-checksum')))
+  current = { version: 1, managed: true, accounts: [] }
+  await assert.rejects(resolver.resolve(token(), null, signal()), /BOX_NOT_READY/)
+  assert.equal(calls.length, 2, 'revoked policy must not use cached gateway credentials')
+})
