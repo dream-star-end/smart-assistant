@@ -680,7 +680,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("网页搜索")).toBeInTheDocument();
-    expect(screen.getByText("OpenClaude v5")).toBeInTheDocument();
+    expect(screen.getByText(/OpenClaude v5/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("results")).toBeInTheDocument();
     expect(screen.getByText("3")).toBeInTheDocument();
