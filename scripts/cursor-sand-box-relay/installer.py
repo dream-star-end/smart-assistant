@@ -8,12 +8,13 @@ import json
 import os
 from pathlib import Path
 import re
-import signal
 import subprocess
 import sys
 import uuid
 
 MODULE = "ocv5-197-relay.cjs"
+# Inspected native consumer. Unknown versions can stage, never actively restart.
+SUPERVISOR_SHA256 = "a387f70a2134addc6a1f576b9a50589a2680d047daed15ecf7d102afc8f741c8"
 OLD_ROUTE_KIND = '  const isSandStreamRelay = req.method === "POST" && url2.pathname === SAND_STREAM_RELAY_PATH;'
 ROUTE_KIND = '  const isSandStreamRelay = (req.method === "POST" || req.method === "GET") && url2.pathname === SAND_STREAM_RELAY_PATH;'
 HANDLE = "async function handleRequest(deps, req, res) {"
@@ -140,11 +141,16 @@ def install(host, module, expected_hash, nonce, check_owner=lambda: None):
             fail("INSTALL_BUSY")
         check_owner()
         receipt = host.parent / (".oc-sand-receipt-" + nonce + ".json")
+        recorded = None
         if receipt.exists():
-            if receipt.is_symlink() or json.loads(receipt.read_text()).get("moduleSha256") != expected_hash:
+            recorded = json.loads(receipt.read_text()) if not receipt.is_symlink() else {}
+            if recorded.get("moduleSha256") != expected_hash:
                 fail("OPERATION_PAYLOAD_MISMATCH")
         before = host.read_bytes()
         previous_module = target.read_bytes() if target.exists() else None
+        # The loaded old relay is not included in native health.isBusy. Publishing
+        # backward-compatible source does not cancel its streams; restarting would.
+        legacy = recorded.get("legacyRelay", True) if recorded else ("handleSandStreamRelay" in before.decode("utf-8") or previous_module is not None)
         after = patch_source(before.decode("utf-8")).encode("utf-8")
         suffix = uuid.uuid4().hex
         module_next = host.parent / (".oc-module-" + suffix + ".cjs")
@@ -166,7 +172,7 @@ def install(host, module, expected_hash, nonce, check_owner=lambda: None):
             if after != before:
                 os.replace(host_next, host)
             sync_dir(host.parent)
-            result = {"hostBeforeSha256": digest(before), "hostAfterSha256": digest(after), "moduleSha256": expected_hash, "changed": before != after or previous_module != module}
+            result = {"hostBeforeSha256": digest(before), "hostAfterSha256": digest(after), "moduleSha256": expected_hash, "legacyRelay": legacy, "changed": before != after or previous_module != module}
             if not receipt.exists():
                 write_new(receipt, json.dumps(result).encode())
                 sync_dir(host.parent)
@@ -185,24 +191,87 @@ def pid_identity(pid, directory):
     return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 
+def source_predates_process(host, identity):
+    # Metadata only. A source changed since this PID started cannot prove which
+    # hook that process loaded. Conservative whole-second margin for /proc btime.
+    boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime "))
+    started = boot + int(identity) / os.sysconf("SC_CLK_TCK")
+    return host.stat().st_mtime < started - 1
+
+
+def queue_native_restart(host, mailbox, nonce, agent_id, module_hash, check_owner):
+    """One fixed-ID native restart, no overwrite or replay after unknown delivery.
+
+    This function has no signal/force/upgrade path. The supervisor, not this
+    caller's old observation, performs the final local busy check after the
+    maintenance Bot has ended. Intent-before-publish intentionally fails closed
+    if interrupted in the cross-file window; natural restart still loads source.
+    """
+    mailbox = Path(mailbox)
+    if mailbox.parent.is_symlink() or not mailbox.parent.is_dir():
+        fail("SUPERVISOR_MAILBOX_INVALID")
+    intent = Path(host).parent / (".oc-sand-restart-" + nonce + ".json")
+    binding = {"id": nonce, "agentId": agent_id, "moduleSha256": module_hash}
+    if intent.exists() or intent.is_symlink():
+        if intent.is_symlink() or json.loads(intent.read_text()) != binding:
+            fail("RESTART_INTENT_MISMATCH")
+        return "restart-delivery-unknown"
+    # Never inspect or replace another operation's command or its secrets.
+    if mailbox.exists() or mailbox.is_symlink():
+        fail("SUPERVISOR_COMMAND_BUSY")
+    check_owner()
+    write_new(intent, json.dumps(binding).encode())
+    sync_dir(intent.parent)
+    temporary = mailbox.parent / (".oc-restart-" + uuid.uuid4().hex + ".json")
+    try:
+        write_new(temporary, json.dumps({"id": nonce, "kind": "restart"}).encode())
+        check_owner()
+        # Atomic no-replace publication: consumer never sees a half-written JSON.
+        # These are private mailbox files, not shared release/donor inodes.
+        os.link(temporary, mailbox, follow_symlinks=False)
+        sync_dir(mailbox.parent)
+        return "restart-queued"
+    except FileExistsError:
+        return "restart-delivery-unknown"
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def apply_payload(payload, host=Path("/home/box/sand-host/host-main.cjs"),
+                  supervisor=Path("/usr/local/bin/sand-supervisor.mjs"),
+                  mailbox=Path("/tmp/sand-supervisor/command.json"),
+                  identify=pid_identity, predates=source_predates_process):
+    host, supervisor = Path(host), Path(supervisor)
+    pid, agent_id = payload["expectedPid"], payload.get("agentId")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        fail("HOST_PID_INVALID")
+    if not isinstance(agent_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", agent_id):
+        fail("MAINTENANCE_AGENT_INVALID")
+    identity = identify(pid, host.parent)
+    loaded_source_known = predates(host, identity)
+    def check():
+        if identify(pid, host.parent) != identity:
+            fail("HOST_PID_CHANGED")
+    native_known = (not supervisor.is_symlink() and supervisor.is_file()
+                    and supervisor.stat().st_size <= 1024 * 1024
+                    and digest(supervisor.read_bytes()) == SUPERVISOR_SHA256)
+    result = install(host, base64.b64decode(payload["moduleBase64"], validate=True), payload["moduleSha256"], payload["nonce"], check)
+    check()
+    phase = "awaiting-natural-restart"
+    if not result["legacyRelay"] and loaded_source_known and native_known:
+        if digest(host.read_bytes()) != result["hostAfterSha256"] or digest((host.parent / MODULE).read_bytes()) != payload["moduleSha256"]:
+            fail("CONCURRENT_SOURCE_CHANGE")
+        phase = queue_native_restart(host, mailbox, payload["nonce"], agent_id, payload["moduleSha256"], check)
+    return {"ok": True, "phase": phase, **result}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", required=True)
     args = parser.parse_args()
     payload = json.loads(sys.stdin.buffer.read(256 * 1024))
-    host = Path("/home/box/sand-host/host-main.cjs")
-    pid = payload["expectedPid"]
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
-        fail("HOST_PID_INVALID")
-    identity = pid_identity(pid, host.parent)
-    def check():
-        if pid_identity(pid, host.parent) != identity:
-            fail("HOST_PID_CHANGED")
-    result = install(host, base64.b64decode(payload["moduleBase64"], validate=True), payload["moduleSha256"], payload["nonce"], check)
-    check()
-    print(json.dumps({"ok": True, "phase": "applied-before-reload", **result}), flush=True)
-    os.kill(pid, signal.SIGTERM)
-    # The caller must observe a new healthy process and the expected capability hash.
+    print(json.dumps(apply_payload(payload)), flush=True)
+    # Do not stop this Bot or any process. The caller observes a later capability.
 
 
 if __name__ == "__main__":

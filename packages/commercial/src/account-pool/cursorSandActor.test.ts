@@ -16,9 +16,11 @@ test("installer prompt contains exact reviewed source and module bytes, not cred
   const body = /^payload=json\.loads\((.+)\)$/m.exec(prompt); assert.ok(body);
   const payload = JSON.parse(JSON.parse(body[1]));
   assert.equal(payload.expectedPid, 321);
+  assert.equal(payload.agentId, "own");
   assert.equal(sandHash(Buffer.from(payload.moduleBase64, "base64").toString()), assets.moduleHash);
   assert.equal(Object.keys(payload).some((k) => /token|credential/i.test(k)), false);
   assert.throws(() => assets.prompt({ nonce: "bad", hostPid: 321, agentId: "own", moduleHash: assets.moduleHash }));
+  assert.throws(() => assets.prompt({ nonce: "oc-sand-" + "b".repeat(32), hostPid: 321, agentId: "../other", moduleHash: assets.moduleHash }));
 });
 
 test("account status is non-secret, follows atomic state replacements, and disables independently of stale ready state", () => {
