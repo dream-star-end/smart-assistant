@@ -62,7 +62,7 @@ export class ChunkErrorBoundary extends Component<Props, State> {
           <p className="text-[13px] leading-relaxed text-muted">
             {this.state.stale
               ? "页面已更新，刷新后即可继续使用。"
-              : "刷新页面通常即可恢复。"}
+              : "请检查网络后刷新；若刚发版也请刷新。"}
           </p>
           <button
             type="button"
