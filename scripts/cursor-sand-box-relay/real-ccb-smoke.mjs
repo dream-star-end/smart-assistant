@@ -4,6 +4,7 @@
  * Uses the real root selector, product Adapter, CCB process and Box resolver.
  */
 import assert from 'node:assert/strict';
+import { finalAssistantText } from './smoke-final-text.mjs';
 import { randomBytes, createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -58,9 +59,11 @@ try {
   await run.submitted;
   const summary = await run.summary;
   result.isError = summary?.isError ?? true;
-  result.exactMatch = summary?.assistantText?.trim() === expected;
+  const finalText = finalAssistantText(summary);
+  result.exactMatch = finalText.trim() === expected;
+  result.finalTextCharacters = finalText.length;
   result.textCharacters = summary?.assistantText?.length ?? 0;
-  result.nativeResumeId = adapter.currentSessionId ?? null;
+  result.nativeResumeId = adapter.nativeSessionId ?? null;
   result.phase = 'completed';
   assert.equal(result.isError, false);
   assert.equal(result.exactMatch, true);
