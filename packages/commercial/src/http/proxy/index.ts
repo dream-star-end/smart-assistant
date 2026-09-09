@@ -66,7 +66,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { findRouteProviderForModel, resolveCursorPublicModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -504,10 +504,15 @@ export function makeAnthropicProxyHandler(
           outputConfig !== null && typeof outputConfig === "object" && !Array.isArray(outputConfig)
             ? (outputConfig as Record<string, unknown>).effort
             : undefined;
+        // Claude Code auto-mode 安全分类器是"侧查询"(max_tokens≤64 + stop_sequences +
+        // 无工具,只回 yes/no):按家族默认 high 跑会想 13–52s,客户端判分类器超时 →
+        // 拒绝 Bash / 子代理。识别到就强制该家族最低档(2026-09-08,用户拍板)。
+        const sideQuery = isClassifierSideQuery(body);
         const resolved = resolveCursorPublicModel(
           body.model,
           requestedEffort,
           (internalId: string) => deps.pricing.get(internalId)?.enabled === true,
+          { sideQuery },
         );
         if (resolved) {
           const requestedModel = body.model;

@@ -1333,6 +1333,38 @@ describe("POST /v1/messages — 公开家族 id + output_config.effort → 内�
     assert.equal(h.logEvents.filter((e) => e.msg === "proxy_cursor_effort_resolved").length, 0);
   });
 
+  test("Claude Code auto-mode 分类器侧查询(max_tokens 64 + stop_sequences + 无工具)→ 强制最低档 low,effortSource=classifier", async () => {
+    const { h, fake } = harnessWithEffort();
+    // effort 随主对话是 high,但分类器形状优先 → low;effort/effortSource 一并传给 cursorExternal(审计用)。
+    const res = await h.run({
+      body: {
+        ...minBody("fable-5.1"),
+        max_tokens: 64,
+        stop_sequences: ["</block>"],
+        temperature: 0,
+        output_config: { effort: "high" },
+      },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-low");
+    assert.equal(fake.calls[0]!.requestedModel, "fable-5.1");
+    const ev = h.logEvents.find((e) => e.msg === "proxy_cursor_effort_resolved");
+    assert.equal(ev!.effortSource, "classifier");
+    assert.equal(ev!.effort, "low");
+    // 同形状但带工具 → 不是分类器,照常走请求档位。
+    const res2 = await h.run({
+      body: {
+        ...minBody("fable-5.1"),
+        max_tokens: 64,
+        stop_sequences: ["</block>"],
+        tools: [{ name: "Read", input_schema: { type: "object" } }],
+        output_config: { effort: "high" },
+      },
+    });
+    assert.equal(res2.statusCode, 200);
+    assert.equal(fake.calls[1]!.model, "cursor-fable-5.1-high");
+  });
+
   test("家族 id 但整族都未在 pricing 启用 → 不进 cursorExternal,落回既有 unknown-model 路径", async () => {
     // pricing 里没有任何 cursor-sonnet-5-* 行
     const { h, fake } = harnessWithEffort();
