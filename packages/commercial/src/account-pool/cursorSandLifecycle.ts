@@ -166,10 +166,12 @@ export class CursorSandLifecycleCoordinator {
       }
       if (!op.agentId) {
         op.agentMarker = op.nonce; op.phase = "create-intent"; this.save(state);
-        const created = await call("createAgent", { name: "OpenClaude Sand Relay", description: `OpenClaude Sand maintenance [${op.agentMarker}]`, creationRoute: { kind: "box" }, isIntroductionSuppressed: true, isKickstartRequested: false, clientNonce: op.nonce + "-create" }) as { id?: unknown };
+        // Official createAgent returns { agent: summary, transcript }, not a
+        // flattened summary. An unknown reply still retains create-intent.
+        const created = await call("createAgent", { name: "OpenClaude Sand Relay", description: `OpenClaude Sand maintenance [${op.agentMarker}]`, creationRoute: { kind: "box" }, isIntroductionSuppressed: true, isKickstartRequested: false, clientNonce: op.nonce + "-create" }) as { agent?: { id?: unknown } };
         this.check();
-        if (typeof created?.id !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(created.id)) throw new SandProvisionError("UNKNOWN_CREATE_RESULT");
-        op.agentId = created.id; op.phase = "created"; this.save(state);
+        if (typeof created?.agent?.id !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(created.agent.id)) throw new SandProvisionError("UNKNOWN_CREATE_RESULT");
+        op.agentId = created.agent.id; op.phase = "created"; this.save(state);
       } else {
         const owned = agents.find((a) => a.id === op.agentId);
         if (!owned || markerOf(owned) !== `OpenClaude Sand maintenance [${op.agentMarker ?? op.nonce}]`) throw new SandProvisionError("MAINTENANCE_AGENT_CHANGED");

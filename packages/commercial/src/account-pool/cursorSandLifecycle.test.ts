@@ -29,7 +29,7 @@ test("lost install response survives new processes without a second create/send;
       if (path.endsWith("/health")) return reply({ ok: true, pid: 321, isBusy: false });
       if (path.endsWith("InferenceService/Stream")) return installed ? reply({ protocol: "oc-sand-relay-v2", moduleSha256: moduleHash, nonce: req.headers["x-oc-sand-box-probe-nonce"], active: 0, maxConcurrent: 4 }) : reply({}, 404);
       if (path.endsWith("/listAgents")) return reply(agents);
-      if (path.endsWith("/createAgent")) { creates++; const data = JSON.parse(body); agents.push({ id: "owned-maintenance-bot", description: data.description, isRunning: false }); return reply({ id: "owned-maintenance-bot" }); }
+      if (path.endsWith("/createAgent")) { creates++; const data = JSON.parse(body); agents.push({ id: "owned-maintenance-bot", description: data.description, isRunning: false }); return reply({ agent: { id: "owned-maintenance-bot" }, transcript: [] }); }
       if (path.endsWith("/sendPrompt")) { sends++; req.socket.destroy(); return; }
       return reply({}, 404);
     });
@@ -141,7 +141,7 @@ test("GET capability probe upgrades a real legacy relay without any empty infere
       if (q.url!.endsWith("EnsureSandBox")) return reply({ gatewayUrl: base, gatewayToken: "G", networkToken: "N" });
       if (q.url!.endsWith("/health")) return reply({ ok: true, pid: 123, isBusy: false });
       if (q.url!.endsWith("/listAgents")) return reply(agents);
-      if (q.url!.endsWith("/createAgent")) { creates++; agents.push({ id: "own", description: JSON.parse(Buffer.concat(chunks).toString()).description, isRunning: false }); return reply({ id: "own" }); }
+      if (q.url!.endsWith("/createAgent")) { creates++; agents.push({ id: "own", description: JSON.parse(Buffer.concat(chunks).toString()).description, isRunning: false }); return reply({ agent: { id: "own" }, transcript: [] }); }
       if (q.url!.endsWith("/sendPrompt")) { sends++; handler = require(modernPath.pathname).createRelay(options); return reply({ accepted: true }); }
       s.writeHead(404); s.end();
     });
