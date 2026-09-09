@@ -1,4 +1,4 @@
-# OCV5-199 · 账号池 Sand 生命周期（T2，方案待审）
+# OCV5-199 · 账号池 Sand 生命周期（T2，B1/B2修订待复审）
 
 ## 用户合同 / 范围
 新增、重加、激活 Sand 账号后自动准备，原聊天/本地 CCB 工具操作不变；准备中不得进入可选池或普通额度回落。停用/删除按现有入口撤销可选资格与绑定，不销毁 Box/用户数据，不取消其它 Bot。正常 API-key/普通 Cursor 不受影响。仅 selfhost 开启；商业默认关闭。198 已合入5975d21c并登记发布，禁止改其live或重复推理。
@@ -31,3 +31,8 @@ commercial/account-pool/cursorMaterializer.ts、同目录新lifecycle/provision/
 - 管理端真实浏览器原按钮新增/停用/激活/删除，显示preparing/ready/error；支持凭据无额外脚本操作。
 - 真实账号范围验收不删除/停用用户正在用的账号或重复198 smoke；必要的受控生命周期验证先用隔离存储，发布后正常入口一次确认。未有第二个授权账号时如实标明新账号真实远端创建边界，不能用fixture冒充。
 - 同一Codex方案→完整diff→合理blocker增量至PASS。最后按正式selfhost列车发布，callback核用户runtime/入口。
+
+## 首轮审查闭合（仅B1/B2与一条建议）
+- B1容量：policy消费上限从16KiB明确调整为2MiB，最多4096条、限制每字段既有长度；writer和parser共守容量，紧凑JSON写前校验字节数，超限拒绝本次物化而不是写一个所有reader均读不了的文件，也不静默截断选择池。验收使用101个真实ready条目经gateway实际readCursorSandBoxPolicy路径读取，首/尾账户resolve都能绑定；再覆盖超过字节/条数上限的明确失败。不是只验证扫描循环。
+- B2 owner epoch：现有materializer scheduler改为每次start独立owner/epoch，所有生产sync从该owner捕获publishAllowed。stop立即撤销owner、取消timer/dirty并返回本实例in-flight drain；旧调用每次await后、尤其所有副作用与最终同步写入前校验owner，失效不发布。scheduleCursorAuthSync在没有活actor时只记录待处理dirty、不得启动无主writer；新start消费当前需求，旧finally不得清空新owner状态。依赖注入的直接sync测试/显式诊断保持可调用，但生产不得绕过owner。验收挂起旧sync→stop/start→新owner空池生效→释放旧sync，旧槽和policy不复活；stop后管理触发零写，重新start才执行。
+- 未知结果建议采纳：acceptance明确区分accepted/pending/rejected/not-found/unknown-durability。create响应未知只能按持久nonce对应的唯一专属维护Bot标识找回；0个或多个候选不能重建/猜测owner。超过有界观察窗显示固定恢复错误、继续安全只读对账，不无限preparing或换nonce重发。sendPrompt响应未知核接受记录和probe；记录不存在但去重保留期限未知不能当从未接收。API schema有nonce不是服务端幂等证明。
