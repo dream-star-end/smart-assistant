@@ -247,6 +247,7 @@ import { dispatchPluginsRoute } from './plugins.js'
 import {
   handleCreateMyApiKey,
   handleGetMyApiKeyUsage,
+  handleListMyApiKeyUsageRecent,
   handleListMyApiKeyMessages,
   handleListMyApiKeys,
   handleRevokeMyApiKey,
@@ -746,6 +747,9 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/me/api-keys', handler: handleListMyApiKeys },
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
     { method: 'GET', path: '/api/me/api-keys/usage', handler: handleGetMyApiKeyUsage },
+    //   GET    /api/me/api-keys/usage/recent → 最近明细游标分页(admin;window / key_id / before / limit)
+    //   注册在 `/usage` 之后,两者同为 exact path,互不吞噬。
+    { method: 'GET', path: '/api/me/api-keys/usage/recent', handler: handleListMyApiKeyUsageRecent },
     //   GET    /api/me/api-keys/messages  → 0279 外接请求用户消息审计(admin;key_id / before / limit / errors_only)
     { method: 'GET', path: '/api/me/api-keys/messages', handler: handleListMyApiKeyMessages },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },

@@ -10,6 +10,7 @@
  *   DELETE /api/me/api-keys/:id   → 软撤销(set revoked_at)
  *   PATCH  /api/me/api-keys/:id   → 0277 改名 / 临时禁用 / 单 key 积分上限
  *   GET    /api/me/api-keys/usage → 0277 消耗报表(窗口 + 可选钉单 key)
+ *   GET    /api/me/api-keys/usage/recent → 最近明细游标分页(before / limit)
  *
  * 关键不变量(plan §4 invariant #1):**list 响应严禁含 secret / keyHash**。
  *   - repo 层用 `ApiKeySummary`(没有 keyHash 字段)从 TS 类型上锁;
@@ -54,7 +55,10 @@ import { getPool } from "../db/index.js";
 import {
   getApiKeyUsageReport,
   isUsageWindow,
+  listApiKeyUsageRecent,
   parseApiKeyIdQuery,
+  USAGE_RECENT_PAGE_DEFAULT_LIMIT,
+  USAGE_RECENT_PAGE_MAX_LIMIT,
   type UsageWindow,
 } from "../billing/apiKeyUsageReport.js";
 import {
@@ -301,20 +305,72 @@ export async function handleGetMyApiKeyUsage(
   const user = await requireAuth(req, deps.jwtSecret);
   requireAdmin(user);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  const rawWindow = url.searchParams.get("window");
-  let window: UsageWindow = "7d";
-  if (rawWindow !== null && rawWindow !== "") {
-    if (!isUsageWindow(rawWindow)) {
-      throw new HttpError(400, "INVALID_USAGE_QUERY", "window must be 24h, 7d or 30d");
-    }
-    window = rawWindow;
-  }
+  const window = parseUsageWindowQuery(url);
   const parsedKey = parseApiKeyIdQuery(url.searchParams.get("key_id"));
   if (!parsedKey.ok) {
     throw new HttpError(400, "INVALID_USAGE_QUERY", "key_id must be a positive integer");
   }
   const report = await getApiKeyUsageReport(user.id, window, parsedKey.keyId);
   sendJson(res, 200, report);
+}
+
+/** `?window=24h|7d|30d`(缺省 7d);非法 → 400 INVALID_USAGE_QUERY。usage / usage/recent 共用。 */
+function parseUsageWindowQuery(url: URL): UsageWindow {
+  const raw = url.searchParams.get("window");
+  if (raw === null || raw === "") return "7d";
+  if (!isUsageWindow(raw)) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", "window must be 24h, 7d or 30d");
+  }
+  return raw;
+}
+
+/** ────────────────────────────────────────────────────────────────────────
+ * GET /api/me/api-keys/usage/recent?window=24h|7d|30d&key_id=<id>&before=<usage_records.id>&limit=<1..200>
+ *
+ * `GET /api/me/api-keys/usage` 的 `recent` 段(固定前 50 条)的**后续页**:同一窗口 / key
+ * 筛选,`before` 是上一页最后一行的 `usage_records.id`(`u.id < before`),`next_before`
+ * 为 null 表示到底。不过滤 status —— 失败 / 被拒的请求也在列。
+ *
+ * `requireAuth` + `requireAdmin`,与 usage / messages 同口径;SQL 双重 `user_id` 限定,
+ * 别人的 key_id 得到空集不泄漏存在性。返回体**不改** usage 端点的形状(前端把 usage.recent
+ * 当第一页,后续页走本端点)。
+ * ──────────────────────────────────────────────────────────────────────── */
+export async function handleListMyApiKeyUsageRecent(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  requireAdmin(user);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const window = parseUsageWindowQuery(url);
+  const parsedKey = parseApiKeyIdQuery(url.searchParams.get("key_id"));
+  if (!parsedKey.ok) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", "key_id must be a positive integer");
+  }
+  // `before` 是 usage_records.id,与 key_id 同为正整数 BIGINT → 复用同一校验器。
+  const parsedBefore = parseApiKeyIdQuery(url.searchParams.get("before"));
+  if (!parsedBefore.ok) {
+    throw new HttpError(400, "INVALID_USAGE_QUERY", "before must be a positive integer");
+  }
+  const rawLimit = url.searchParams.get("limit");
+  let limit = USAGE_RECENT_PAGE_DEFAULT_LIMIT;
+  if (rawLimit !== null && rawLimit !== "") {
+    if (!/^[1-9][0-9]{0,3}$/.test(rawLimit) || Number(rawLimit) > USAGE_RECENT_PAGE_MAX_LIMIT) {
+      throw new HttpError(
+        400,
+        "INVALID_USAGE_QUERY",
+        `limit must be 1..${USAGE_RECENT_PAGE_MAX_LIMIT}`,
+      );
+    }
+    limit = Number(rawLimit);
+  }
+  const page = await listApiKeyUsageRecent(user.id, window, parsedKey.keyId, {
+    beforeId: parsedBefore.keyId,
+    limit,
+  });
+  sendJson(res, 200, page);
 }
 
 /** ────────────────────────────────────────────────────────────────────────
