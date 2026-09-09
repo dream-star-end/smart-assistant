@@ -39,3 +39,11 @@ commercial/account-pool/cursorMaterializer.ts、同目录新lifecycle/provision/
 
 ## 类型检查范围补充（已获独立审查PASS）
 仅修commercial/__tests__/apiKeyMessageAudit.unit.test.ts的异步capture类型（保留非空/SQL/params/分页断言），及cursorExternalRoute.unit.test.ts合成usage补两个cache字段0；不改产品计费逻辑。旧reviewer session已过期，网关拒绝未建job；唯一新reviewer session agent:auditor:delegate:main:1788946436039:776865b379636db4后续承接完整diff。首次启用及回退必须执行README的pre-managed policy备份/恢复，不能把新大policy留给旧reader。
+
+
+## C1 执行端维护修订（2026-09-09，同 reviewer 方案 PASS，待实现）
+- 依据真实 supervisor 的精确消费端摘录（17301 字节，SHA256 724e90b5715e88fe64a686d6084827e1e6fc3f4c970b8712bdcff0701ae2d689），不再由 Python 无条件 SIGTERM，也不使用会暂停所有 runner 的 prepare-upgrade。
+- 先完成确定性候选/语法/备份/源与 PID 复核，再发布兼容文件；新 Box 必须由绑定 PID 的源码布局确认没有既存 relay，不把 GET 404 当无 hook 证明。
+- 新 Box 只提交原生 `kind: restart`，固定操作 ID、无 force/version/bundle、不覆盖现存命令；维护 Bot 正常退出，由 supervisor 最新本机 health 判闲后同步重启。restart 对 busy/unknown 一直 defer，不进入 upgrade 的六小时强推。
+- 已有旧 relay 的 health 不计入 relay active，禁止主动 restart。仅安全暂存等待自然重启，并保持准备中；若发布待加载文件安全性不成立，仅留独立 staging 文件。只有新进程实际 capability probe 才能 ready。
+- 需要回归：其它 Bot 在父检查后启动仍 defer；旧 relay 长流时零主动重启；无 hook 新 Box 恰好一次原生重载+新 probe 就绪。上述是方案认可，不是实现或上线证明。
