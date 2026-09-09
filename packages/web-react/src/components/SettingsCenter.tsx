@@ -89,6 +89,7 @@ export function SettingsCenter({
   onOpenMemory,
   onOpenManage,
   onOpenRepo,
+  onOpenProjectSettings,
   feedbackContext,
   initialSection = "account",
   subscribeOpenSignal = 0,
@@ -107,6 +108,8 @@ export function SettingsCenter({
   onOpenManage?: () => void;
   /** GitHub 深链：先关设置再打开对话区绑定。 */
   onOpenRepo?: () => void;
+  /** 用量页 facade 未绑定：关设置后打开当前聊天项目设置。 */
+  onOpenProjectSettings?: () => void;
   feedbackContext?: { sessionId: string | null; requestId: string | null };
   initialSection?: SettingsSection;
   /** Increment to programmatically open SubscriptionDialog on the account tab. */
@@ -216,6 +219,7 @@ export function SettingsCenter({
               <Tabs
                 aria-label="设置分区"
                 idBase="settings"
+                layout="grid"
                 value={section}
                 onValueChange={(v) => setSection(v as SettingsSection)}
                 items={sections.map((s) => ({
@@ -255,6 +259,9 @@ export function SettingsCenter({
               feedbackContext={feedbackContext}
               onOpenManage={onOpenManage ? () => leaveTo(onOpenManage) : undefined}
               onOpenRepo={onOpenRepo ? () => leaveTo(onOpenRepo) : undefined}
+              onOpenProjectSettings={
+                onOpenProjectSettings ? () => leaveTo(onOpenProjectSettings) : undefined
+              }
             />
           </div>
         </div>
@@ -363,6 +370,7 @@ function SettingsPanel({
   feedbackContext,
   onOpenManage,
   onOpenRepo,
+  onOpenProjectSettings,
 }: {
   section: SettingsSection;
   auth: AuthSession | null;
@@ -383,6 +391,7 @@ function SettingsPanel({
   feedbackContext?: { sessionId: string | null; requestId: string | null };
   onOpenManage?: () => void;
   onOpenRepo?: () => void;
+  onOpenProjectSettings?: () => void;
 }) {
   if (!auth) {
     return <p className="px-5 py-10 text-center text-body text-faint">请先登录。</p>;
@@ -405,7 +414,7 @@ function SettingsPanel({
   if (section === "usage") {
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
-        <UsageTab auth={auth} />
+        <UsageTab auth={auth} onOpenProjectSettings={onOpenProjectSettings} />
       </div>
     );
   }

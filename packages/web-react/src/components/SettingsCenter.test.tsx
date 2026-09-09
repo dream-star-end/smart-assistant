@@ -59,7 +59,7 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
 
   const feedbackTab = screen.getByRole('tab', { name: '反馈' })
   expect(feedbackTab).toBeVisible()
-  expect(feedbackTab.closest('[role=tablist]')).toHaveClass('overflow-x-auto')
+  expect(feedbackTab.closest('[role=tablist]')).toHaveClass('grid', 'grid-cols-3')
 
   fireEvent.click(feedbackTab)
   expect(screen.getByRole('form', { name: '反馈表单' })).toBeInTheDocument()
