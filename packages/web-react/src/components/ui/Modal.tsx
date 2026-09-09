@@ -149,7 +149,9 @@ export function Modal({
         <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
-          data-product-feature={dataProductFeature}
+          {...(dataProductFeature
+            ? { "data-product-feature": dataProductFeature }
+            : {})}
           onEscapeKeyDown={onEscapeKeyDown}
           onOpenAutoFocus={onOpenAutoFocus}
           onCloseAutoFocus={onCloseAutoFocus}
