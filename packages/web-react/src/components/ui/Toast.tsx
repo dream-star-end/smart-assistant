@@ -40,7 +40,11 @@ type ToastItem = {
   tone: ToastTone;
   actionLabel?: string;
   onAction?: () => void;
+  /** 被上限挤掉的 error 条数；有值表示「还有 N 条错误」汇总条。 */
+  overflowCount?: number;
 };
+
+const MAX_ERROR_TOASTS = 3;
 
 const ToastContext = createContext<ToastFn | null>(null);
 
@@ -76,16 +80,36 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const tone = toneArg ?? "info";
       const id = ++seq.current;
       const actionable = Boolean(options?.actionLabel && options?.onAction);
-      setItems((cur) => [
-        ...cur,
-        {
+      setItems((cur) => {
+        const item: ToastItem = {
           id,
           message,
           tone,
           actionLabel: actionable ? options?.actionLabel : undefined,
           onAction: actionable ? options?.onAction : undefined,
-        },
-      ]);
+        };
+        if (tone !== "error") return [...cur, item];
+        const overflow = cur.find((t) => t.overflowCount != null);
+        const errors = cur.filter((t) => t.tone === "error" && t.overflowCount == null);
+        const rest = cur.filter((t) => t.tone !== "error");
+        let nextErrors = [...errors, item];
+        let dropped = overflow?.overflowCount ?? 0;
+        if (nextErrors.length > MAX_ERROR_TOASTS) {
+          const extra = nextErrors.length - MAX_ERROR_TOASTS;
+          nextErrors = nextErrors.slice(extra);
+          dropped += extra;
+        }
+        const next: ToastItem[] = [...rest, ...nextErrors];
+        if (dropped > 0) {
+          next.push({
+            id: overflow?.id ?? ++seq.current,
+            message: `还有 ${dropped} 条错误`,
+            tone: "error",
+            overflowCount: dropped,
+          });
+        }
+        return next;
+      });
       // 错误提示不自动消失(可达性:屏幕阅读器/慢读用户不会因 3.5s 自隐而错过失败原因;
       // 用户可点 X 关闭)。带动作的提示同理 —— 等着用户做决定的东西不能自己溜走。
       // 其余成功/信息类保持短暂自隐。
@@ -101,7 +125,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastContext.Provider value={toast}>
       {children}
       {/* 顶部居中堆叠，pointer-events 仅落在卡片上，不挡下层交互。 */}
-      <div className="pointer-events-none fixed inset-x-0 top-3 z-[100] flex flex-col items-center gap-2 px-3 header-safe-t">
+      <div className="pointer-events-none fixed inset-x-0 top-16 z-[100] flex flex-col items-center gap-2 px-3 header-safe-t">
         {items.map((t) => {
           const s = TONE_STYLE[t.tone];
           return (
