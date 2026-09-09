@@ -3520,6 +3520,15 @@ describe("pgSessionsBackend lossless turn tape", () => {
     const locker = await pool.connect();
     let staleFinalize: Promise<unknown> | null = null;
     let convertingFinalize: Promise<unknown> | null = null;
+    let completedBatches = 0;
+    let markStaleBatchCommitted!: () => void;
+    const staleBatchCommitted = new Promise<void>((resolve) => {
+      markStaleBatchCommitted = resolve;
+    });
+    let resumeStaleAfterConversion!: () => void;
+    const conversionStaged = new Promise<void>((resolve) => {
+      resumeStaleAfterConversion = resolve;
+    });
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
@@ -3527,6 +3536,48 @@ describe("pgSessionsBackend lossless turn tape", () => {
 
     process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
     try {
+      // Phase A also locks this header before the format claim. Observing a
+      // queued header query alone cannot identify the claimant's phase.
+      // Pause between committed batches, not on scheduler/lock FIFO timing.
+      _setAfterLosslessStageBatch(async () => {
+        const batch = ++completedBatches;
+        assert.ok(batch <= 2, "the stale writer must not commit a second batch");
+        const observed = (await pool.query<{
+          record_storage_format: number;
+          records: string;
+          finalized: boolean;
+        }>(
+          `SELECT t.record_storage_format,COUNT(r.*)::text AS records,
+                  t.finalized_at IS NOT NULL AS finalized
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format,t.finalized_at`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0];
+        if (batch === 1) {
+          assert.deepEqual(observed, {
+            record_storage_format: 2,
+            records: String(LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE),
+            finalized: false,
+          });
+          markStaleBatchCommitted();
+          await conversionStaged;
+        } else {
+          try {
+            assert.deepEqual(observed, {
+              record_storage_format: 3,
+              records: "4",
+              finalized: false,
+            });
+          } finally {
+            resumeStaleAfterConversion();
+          }
+          assert.ok(staleFinalize);
+          await Promise.allSettled([staleFinalize]);
+        }
+      });
       await locker.query("SELECT pg_advisory_lock($1)", [advisoryKey]);
       await pool.query(`
         CREATE OR REPLACE FUNCTION oc_test_pause_stale_format_two()
@@ -3554,20 +3605,13 @@ describe("pgSessionsBackend lossless turn tape", () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
+      await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+      await Promise.race([
+        staleBatchCommitted,
+        staleFinalize.then(() => assert.fail("stale writer finished before the first-batch barrier")),
+      ]);
       process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
       convertingFinalize = convertingBackend.finalizeLosslessTurnTape(userId, tape.finalize);
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const waiting = Number((await pool.query<{ count: string }>(
-          `SELECT COUNT(*)::text AS count FROM pg_stat_activity
-            WHERE datname=current_database() AND wait_event_type='Lock'
-              AND query LIKE '%client_session_turn_tapes%'`,
-        )).rows[0]!.count);
-        if (waiting > 0) break;
-        if (attempt === 99) assert.fail("format-3 claimant did not queue behind the stale writer");
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
       const [staleResult, convertingResult] = await Promise.allSettled([
         staleFinalize,
         convertingFinalize,
@@ -3594,6 +3638,8 @@ describe("pgSessionsBackend lossless turn tape", () => {
         { record_storage_format: 3, records: "4" },
       );
     } finally {
+      _setAfterLosslessStageBatch(null);
+      resumeStaleAfterConversion();
       await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]).catch(() => undefined);
       locker.release();
       await Promise.allSettled(
