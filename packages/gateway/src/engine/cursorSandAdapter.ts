@@ -12,6 +12,7 @@ import type { EngineCreateOpts } from './registry.js'
 import { CcbAdapter } from './ccbAdapter.js'
 import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import { CursorSandRelay } from './cursorSandRelay.js'
+import { isCursorSandBoxError } from './cursorSandBox.js'
 import {
   recordCursorCredentialResult,
   type CursorCredentialSelection,
@@ -86,6 +87,7 @@ export class CursorSandAdapter extends CcbAdapter {
     this.sessionKey = opts.sessionKey
     this.relay = relay ?? new CursorSandRelay({
       credentialName: selection.keyName,
+      boxAccountId: selection.accountId,
       poolGeneration: selection.poolGeneration,
       keyFingerprint: selection.keyFingerprint,
       credentialKind: selection.credentialKind,
@@ -101,6 +103,8 @@ export class CursorSandAdapter extends CcbAdapter {
       result,
     }))
   }
+
+  getRequestStats(): ReturnType<CursorSandRelay['getRequestStats']> { return this.relay.getRequestStats() }
 
   private assertLifecycle(generation: number): void {
     if (this.lifecycleClosed || generation !== this.lifecycleGeneration) {
@@ -214,10 +218,13 @@ export class CursorSandAdapter extends CcbAdapter {
         result?.errorClass === 'insufficient_credits' &&
         result.errorDetail === CREDIT_EXHAUSTED_DETAIL
       const errorDetail = creditExhausted ? '' : detail ?? result?.errorDetail ?? ''
-      const unavailable = /auth|credential|unauthorized|forbidden|quota|rate.?limit|usage limit|subscription|\b40[13]\b|\b429\b/i.test(errorDetail)
+      const boxTransportFailure = isCursorSandBoxError(errorDetail)
+      const unavailable = !boxTransportFailure && /auth|credential|unauthorized|forbidden|quota|rate.?limit|usage limit|subscription|\b40[13]\b|\b429\b/i.test(errorDetail)
       const status: EngineExternalBillingEvent['status'] = creditExhausted
         ? 'success'
-        : unavailable
+        : boxTransportFailure
+          ? 'error'
+          : unavailable
           ? 'unavailable'
           : result?.isError || !result
             ? 'error'
@@ -226,6 +233,8 @@ export class CursorSandAdapter extends CcbAdapter {
         ? undefined
         : interrupted
           ? 'USER_CANCELLED'
+          : boxTransportFailure
+            ? 'ENGINE_ERROR'
           : /quota|rate.?limit|usage limit|subscription|\b429\b/i.test(errorDetail)
             ? 'QUOTA_UNAVAILABLE'
             : /auth|credential|unauthorized|forbidden|\b40[13]\b/i.test(errorDetail)

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -509,6 +510,10 @@ test('transient Sand turn errors never record a slot failure; credential rejecti
     phantomSignals: { apiState: 'called', skipReason: null },
   }
   const cases: Array<{ detail: string; recorded: Array<'ok' | 'fail'>; terminalCode: string; slotResults: boolean }> = [
+    { detail: 'API Error: 400 CURSOR_SAND_BOX_CONNECTION_REJECTED [non-retryable]', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 400 CURSOR_SAND_BOX_BUSY [non-retryable]', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 400 CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED [non-retryable]', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 401 CURSOR_SAND_AUTH_BOX_CONTROL_401', recorded: ['fail'], terminalCode: 'AUTH_UNAVAILABLE', slotResults: true },
     { detail: 'API Error: 504 {"error":{"message":"Cursor Sand HTTP 504"}}', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
     { detail: 'This operation was aborted', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
     { detail: 'API Error: 401 Cursor Sand credential rejected: CURSOR_SAND_SESSION_EXPIRED', recorded: ['fail'], terminalCode: 'AUTH_UNAVAILABLE', slotResults: true },
@@ -2679,3 +2684,94 @@ test('default web callers without onTerminal keep original success semantics', a
   }
 })
 
+function boxProductFixture(mode: 'gate401'|'local429'|'upstream429'|'control401'|'ticket'|'quota', partialTool = false) {
+ const machine='abcdefghijklmnopqrstuvwxyz',subject='box-product-fixture';
+ const token=Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url')+'.'+Buffer.from(JSON.stringify({type:'session',sub:subject,exp:Math.floor(Date.now()/1000)+3600})).toString('base64url')+'.'+Buffer.from('synthetic-signature-not-real').toString('base64url');
+ const hash=(v:string)=>createHash('sha256').update(v).digest('hex');const calls:Array<{url:string;auth:string|null}>=[];
+ const relay=new CursorSandRelay({credentialKind:'session',machineId:machine,boxAccountId:'19',readApiKey:()=>Buffer.from(token),passthrough:null,readBoxPolicy:()=>({version:1,accounts:[{accountId:'19',subjectHash:hash(subject),machineHash:hash(machine)}]}),fetchImpl:async(input,init)=>{
+  const url=String(input),headers=new Headers(init?.headers);calls.push({url,auth:headers.get('authorization')});
+  if(url.endsWith('/GetSandBoxRunState'))return new Response(JSON.stringify({state:'SAND_BOX_RUN_STATE_RUNNING'}),{status:mode==='control401'?401:200});
+  if(url.endsWith('/EnsureSandBox'))return new Response(JSON.stringify({gatewayUrl:'https://box.cursorvm.com/prefix',gatewayToken:'GATEWAY_ONLY',networkToken:'NETWORK_ONLY'}));
+  assert.equal(url,'https://box.cursorvm.com/prefix/sand-stream-relay/aiserver.v1.InferenceService/Stream');assert.equal(headers.get('authorization'),'Bearer GATEWAY_ONLY');assert.equal(headers.get('x-anyrun-network-token'),'NETWORK_ONLY');assert.equal(headers.get('x-cursor-checksum'),null);
+  if(mode==='gate401')return new Response('gateway rejected',{status:401});
+  if(mode==='local429')return new Response('relay busy',{status:429});
+  if(mode==='upstream429')return new Response('quota exceeded',{status:429,headers:{'x-oc-sand-box-upstream':'1'}});
+  const error=mode==='ticket'?{code:'unauthenticated',message:'ticket rejected'}:{code:'resource_exhausted',message:'quota exceeded'};
+  return new Response(new Uint8Array(Buffer.concat([...(partialTool ? [responseFrame('textPart',{text:'tool_call: {\"name\":\"Read\", \"arguments\":'})] : []),envelope(Buffer.from(JSON.stringify({error})),2)])),{headers:{'content-type':'application/connect+proto','x-oc-sand-box-upstream':'1'}});
+ }});
+ return {relay,calls,token};
+}
+test('Box HTTP failures keep no-retry transport scope, descriptor cache, and true account/quota distinctions',async()=>{
+ for(const mode of ['gate401','local429','upstream429','control401'] as const){const f=boxProductFixture(mode);try{
+  for(let i=0;i<2;i++){const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);
+   if(mode==='gate401'||mode==='local429'){assert.equal(res.statusCode,400);assert.equal(res.headers['x-should-retry'],'false');assert.match(res.text(),new RegExp(mode==='gate401'?'BOX_CONNECTION_REJECTED':'BOX_BUSY'));}else assert.equal(res.statusCode,mode==='control401'?401:429);
+  }
+  const controls=f.calls.filter(c=>c.url.includes('GrokBotService'));for(const c of controls)assert.equal(c.auth,'Bearer '+f.token);assert.equal(controls.length,mode==='gate401'?4:mode==='control401'?2:2);assert.equal(f.calls.filter(c=>c.url.includes('cursorvm.com')).length,mode==='control401'?0:2);
+ }finally{await f.relay.close();}}
+})
+test('Box Connect unauthenticated trailers preserve transport identity in both response modes',async()=>{
+ for(const stream of [false,true]){const f=boxProductFixture('ticket');try{const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',stream,max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);assert.match(res.text(),/CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED/);assert.match(res.text(),/invalid_request_error/);if(!stream)assert.equal(res.statusCode,400);}finally{await f.relay.close();}}
+})
+test('actual Relay rejection feeds actual Adapter billing chain without poisoning the account',async()=>{
+ for(const mode of ['gate401','local429','control401','upstream429'] as const){const f=boxProductFixture(mode);const recorded:Array<string>=[];const billing:Array<any>=[];const adapter=new CursorSandAdapter({sessionKey:'agent:main:test:box-billing-'+mode,agentId:'main',agentBaseDir:process.cwd(),config:{} as never,model:'cursor-grok-4.6-high',cursorCredentialSelection:{...STABLE_SAND_SELECTION,accountId:'19',credentialKind:'session',machineId:'abcdefghijklmnopqrstuvwxyz'}},f.relay,()=>{
+  const summary=(async()=>{const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);return {usage:{cost:0,inputTokens:0,outputTokens:0,cacheReadTokens:0,cacheCreationTokens:0,totalTokens:0},assistantText:'',thinkingText:'',assistantSegments:[],thinkingSegments:[],tools:[],runtimeEvents:[],stopReason:'error',numTurns:1,isError:true,staleResumeId:false,errorDetail:'API Error: '+res.statusCode+' '+res.text(),phantomSignals:{apiState:'called',skipReason:null}};})();return {...inertRun(),summary} as never;
+ },r=>recorded.push(r));adapter.on('external_billing',e=>billing.push(e));try{const run=adapter.submitTurn({input:'test',requestId:'a'.repeat(32),onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()});await run.submitted;await run.summary;await new Promise(r=>setImmediate(r));const transport=mode==='gate401'||mode==='local429';assert.deepEqual(recorded,transport?[]:['fail']);assert.equal(billing.length,1);assert.equal(billing[0].cursorAccountId,'19');assert.equal(billing[0].status,transport?'error':'unavailable');assert.equal('cursorSlotResults' in billing[0],!transport);}finally{await adapter.shutdown();}}
+})
+
+for(const model of ['cursor-fable-5-high','cursor-grok-4.6-high'])test(`terminal Box ticket error never enters tool correction: ${model}`,async()=>{
+ const f=boxProductFixture('ticket',true);try{const url=await f.relay.start();for(let request=1;request<=2;request++){const response=await fetch(url+'/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model,stream:true,max_tokens:64,messages:[{role:'user',content:'read the file'}],tools:[{name:'Read',description:'Read a local file',input_schema:{type:'object',properties:{file_path:{type:'string'}},required:['file_path']}}]})});const text=await response.text();assert.match(text,/CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED/);assert.deepEqual({inference:f.calls.filter(c=>c.url.includes('cursorvm.com')).length,controls:f.calls.filter(c=>c.url.includes('GrokBotService')).length},{inference:request,controls:2*request});assert.deepEqual(f.relay.getRequestStats(),{messages:request,inferenceAttempts:request,toolCorrections:0,passthroughAttempts:0});}}finally{await f.relay.close();}
+})
+
+
+// OCV5-181: exact shared Box transport + per-call durable terminal composition.
+for (const pipe of [
+  { name: 'native', stream: true, extra: {} },
+  { name: 'buffered', stream: true, extra: { bufferedStreaming: true } },
+  { name: 'nonstream', stream: false, extra: {} },
+]) for (const mode of ['gate401', 'local429', 'control401', 'upstream429', 'ticket'] as const) {
+  test(`Box terminal composition ${pipe.name}/${mode}: failed evidence precedes wire exactly once`, async () => {
+    const f = boxProductFixture(mode)
+    const res = new FakeServerResponse()
+    const evidence: Array<{ outcome: string; kind: string; code?: string }> = []
+    try {
+      const result = await f.relay.serveMessages(
+        { model: 'cursor-fable-5-high', stream: pipe.stream, max_tokens: 32, messages: [{ role: 'user', content: 'synthetic composition' }] },
+        res as never, new AbortController().signal,
+        { ...pipe.extra, onTerminal: async (ev) => {
+          assert.equal(res.writableEnded, false, 'terminal must precede response end')
+          assert.doesNotMatch(res.text(), /event: error|event: message_stop|"type":"error"|"stop_reason":"/, 'terminal must precede terminal wire')
+          evidence.push({ outcome: ev.outcome, kind: ev.evidence.kind, code: ev.terminalCode })
+          await new Promise<void>(r => setImmediate(r))
+          assert.equal(res.writableEnded, false, 'relay awaits terminal persistence')
+        } },
+      )
+      assert.deepEqual(evidence, [{ outcome: 'failed', kind: 'unobserved', code: mode === 'upstream429' ? 'CURSOR_SAND_HTTP_429' : 'CURSOR_SAND_UPSTREAM_ERROR' }])
+      assert.doesNotMatch(res.text(), /event: message_stop|"stop_reason":"/)
+      const expectedStatus = mode === 'control401' ? 401 : mode === 'upstream429' ? 429 : mode === 'ticket' && pipe.stream ? 200 : 400
+      assert.equal(res.statusCode, expectedStatus)
+      if (result.kind === 'rejected') assert.equal(result.status, expectedStatus)
+      else assert.equal(result.kind, 'failed')
+      assert.equal(f.relay.getRequestStats().toolCorrections, 0)
+      assert.equal(f.relay.getRequestStats().inferenceAttempts, mode === 'control401' ? 0 : 1)
+      if (mode === 'gate401' || mode === 'local429' || mode === 'ticket') assert.match(res.text(), /CURSOR_SAND_BOX_/)
+    } finally { await f.relay.close() }
+  })
+}
+
+test('Box terminal composition rejection: failing optional hook never duplicates or replaces wire error', async () => {
+  const f = boxProductFixture('gate401')
+  const res = new FakeServerResponse()
+  let calls = 0
+  try {
+    const result = await f.relay.serveMessages(
+      { model: 'cursor-fable-5-high', max_tokens: 32, messages: [{ role: 'user', content: 'synthetic composition' }] },
+      res as never, new AbortController().signal,
+      { onTerminal: async () => { calls++; throw new Error('synthetic persistence failure') } },
+    )
+    assert.equal(calls, 1)
+    assert.equal(result.kind, 'rejected')
+    assert.equal(res.statusCode, 400)
+    assert.match(res.text(), /CURSOR_SAND_BOX_CONNECTION_REJECTED/)
+    assert.doesNotMatch(res.text(), /synthetic persistence failure|message_stop/)
+  } finally { await f.relay.close() }
+})

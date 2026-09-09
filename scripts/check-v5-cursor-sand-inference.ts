@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 
 const root = process.cwd()
@@ -118,3 +120,101 @@ assert.match(runnerAbortTests, /detaches proc, reports not running, and swallows
 assert.match(runnerAbortTests, /retired generation stdout close does not settle a newer generation barrier/)
 
 console.log('[cursor-sand-inference] PASS — Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto')
+
+// INC-20260909-CURSOR-SAND-BOX-TRANSPORT: execute synthetic loopback contracts,
+// not merely their source anchors. This is NOT a live provider/paid CCB smoke.
+const sandbox = mkdtempSync(resolve(tmpdir(), 'oc-sand-box-gate-'))
+try {
+  for (const dir of ['home', 'oc', 'tmp', 'snapshots', 'intents']) mkdirSync(resolve(sandbox, dir))
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH, LANG: process.env.LANG, TZ: process.env.TZ,
+    HOME: resolve(sandbox, 'home'), OPENCLAUDE_HOME: resolve(sandbox, 'oc'),
+    TMPDIR: resolve(sandbox, 'tmp'), NODE_ENV: 'test', OC_MODEL_AUTHORITY: '0',
+    OC_DELEGATE_SM: '0', OC_DELEGATE_DURABLE: '0',
+    OC_DELEGATE_NOTIFIER: '0', OC_DELEGATE_CUTOVER: '0',
+    OPENCLAUDE_DELEGATE_JOBS_DB: resolve(sandbox, 'jobs.db'),
+    OPENCLAUDE_DELEGATE_INFLIGHT_DB: resolve(sandbox, 'inflight.db'),
+    OPENCLAUDE_DELEGATE_JOB_SNAPSHOT_DIR: resolve(sandbox, 'snapshots'),
+    OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR: resolve(sandbox, 'intents'),
+  }
+  const result = spawnSync(process.execPath, [
+    '--import', 'tsx', '--test', '--test-reporter=tap', '--test-concurrency=1',
+    'packages/gateway/src/__tests__/cursorSandBox.test.ts',
+    'packages/gateway/src/__tests__/cursorSandBoxPolicy.test.ts',
+    'packages/gateway/src/__tests__/cursorSandRelay.test.ts',
+    'scripts/cursor-sand-box-relay/relay.test.cjs',
+    'scripts/cursor-sand-box-relay/smoke-final-text.test.mjs',
+  ], { cwd: root, env, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
+    maxBuffer: 8 * 1024 * 1024, detached: true })
+  // A killed test-runner may leave workers; they share only our detached group.
+  if ((result.error || result.signal) && result.pid > 0) {
+    try { process.kill(-result.pid, 'SIGKILL') } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  }
+  process.stdout.write(result.stdout ?? '')
+  process.stderr.write(result.stderr ?? '')
+  assert.ifError(result.error)
+  assert.equal(result.signal, null, 'Box contract runner terminated by signal')
+  assert.equal(result.status, 0, 'Box contract runner failed')
+  const tap = result.stdout
+  const plans = [...tap.matchAll(/^1\.\.(\d+)$/gm)]
+  assert.equal(plans.length, 1, 'missing or ambiguous complete TAP plan')
+  const count = Number(plans[0][1])
+  assert.ok(count >= 84, `Box contract execution count too low: ${count}`)
+  const outcomes = [...tap.matchAll(/^(not )?ok (\d+) - (.+)$/gm)]
+  assert.equal(outcomes.length, count, 'incomplete TAP results')
+  for (const [index, outcome] of outcomes.entries()) {
+    assert.equal(outcome[1], undefined, 'failed TAP result')
+    assert.equal(Number(outcome[2]), index + 1, 'noncontiguous TAP results')
+    assert.doesNotMatch(outcome[3], /#\s*(SKIP|TODO)\b/i)
+  }
+  for (const [label, expected] of [['tests', count], ['pass', count], ['fail', 0], ['cancelled', 0], ['skipped', 0], ['todo', 0]] as const) {
+    const summaries = [...tap.matchAll(new RegExp(`^# ${label} (\\d+)$`, 'gm'))]
+    assert.equal(summaries.length, 1, `missing or ambiguous ${label} summary`)
+    assert.equal(Number(summaries[0][1]), expected, `${label} summary mismatch`)
+  }
+  for (const name of [
+    'Box HTTP failures keep no-retry transport scope, descriptor cache, and true account/quota distinctions',
+    'Box Connect unauthenticated trailers preserve transport identity in both response modes',
+    'actual Relay rejection feeds actual Adapter billing chain without poisoning the account',
+    'terminal Box ticket error never enters tool correction: cursor-fable-5-high',
+    'terminal Box ticket error never enters tool correction: cursor-grok-4.6-high',
+  ]) assert.ok(outcomes.some((outcome) => outcome[3] === name), `required contract did not execute: ${name}`)
+  console.log('[cursor-sand-box] PASS — isolated Box transport, account health, and terminal no-retry contracts executed')
+
+  // INC-20260909-CURSOR-EMPTY-POOL-MOUNT: execute the real root-filesystem
+  // transitions and production provision path. Docker/PG are substituted here;
+  // diagnostics/cursor-auth-mount-smoke.ts separately tests an actual Docker bind.
+  const mountResult = spawnSync(process.execPath, [
+    '--import', 'tsx', '--test', '--test-reporter=tap',
+    '--test-name-pattern=resolveV5CursorAuthMount|v5 empty managed Cursor',
+    'packages/commercial/src/__tests__/v3Supervisor.test.ts',
+  ], { cwd: root, env, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
+    maxBuffer: 8 * 1024 * 1024, detached: true })
+  if ((mountResult.error || mountResult.signal) && mountResult.pid > 0) {
+    try { process.kill(-mountResult.pid, 'SIGKILL') } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  }
+  process.stdout.write(mountResult.stdout ?? '')
+  process.stderr.write(mountResult.stderr ?? '')
+  assert.ifError(mountResult.error)
+  assert.equal(mountResult.signal, null, 'Cursor mount contract runner terminated by signal')
+  assert.equal(mountResult.status, 0, 'Cursor mount contract runner failed')
+  const mountTap = mountResult.stdout
+  assert.match(mountTap, /^# pass 12$/m, 'all twelve selected mount contracts must execute')
+  for (const label of ['fail', 'cancelled', 'todo']) assert.match(mountTap, new RegExp(`^# ${label} 0$`, 'm'))
+  const mountOutcomes = [...mountTap.matchAll(/^ +ok \d+ - (.+)$/gm)]
+    .map((match) => match[1]).filter((name) => !/#\s*(SKIP|TODO)\b/i.test(name))
+  for (const name of [
+    'empty managed pool keeps the directory mount across 0→1→0→1 atomic publication',
+    ...['symlink', 'dangling-symlink', 'directory', 'fifo', 'public', 'non-root', 'wrong-content']
+      .map((variant) => `empty managed pool rejects ${variant} ownership marker`),
+    'valid managed marker cannot excuse an existing unsafe or dangling key',
+    'v5 empty managed Cursor pool provisions the same read-only bind before a key is ready',
+  ]) assert.ok(mountOutcomes.includes(name), `required mount contract did not execute: ${name}`)
+  console.log('[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)')
+} finally {
+  rmSync(sandbox, { recursive: true, force: true })
+}

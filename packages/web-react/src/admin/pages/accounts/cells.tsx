@@ -157,8 +157,9 @@ export function CursorPoolCell({ a }: { a: AccountRow }) {
       <span>{poolLabel}</span>
       <div className="flex flex-wrap gap-1">
         {a.cursor_sand_enabled ? (
-          <Badge tone="accent" className="w-fit px-1.5 py-0 text-micro">
-            Sand
+          <Badge tone={a.cursor_sand_box?.phase === "error" ? "danger" : a.cursor_sand_box && a.cursor_sand_box.phase !== "ready" ? "neutral" : "accent"} className="w-fit px-1.5 py-0 text-micro"
+            title={a.cursor_sand_box?.errorCode ? `Sand 自动准备失败：${a.cursor_sand_box.errorCode}（不会改用普通额度）` : "工具在本地执行，使用 Sand 额度"}>
+            Sand{a.cursor_sand_box ? ` · ${{ preparing: "准备中", ready: "就绪", error: "准备失败", disabled: "未启用" }[a.cursor_sand_box.phase]}` : ""}
           </Badge>
         ) : null}
         {a.cursor_credential_kind === "session" ? (
