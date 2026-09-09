@@ -49,7 +49,7 @@ export function SignatureDetail({ work, onBack, onRun, actionLabel }: RunProps &
     <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div><p className="font-mono text-caption text-accent">{work.kicker}</p><h1 ref={heading} tabIndex={-1} className="mt-2 text-[26px] font-semibold tracking-tight text-fg outline-none sm:text-[34px]">{work.title}</h1></div><a className="inline-flex items-center gap-2 text-meta text-accent" href={signatureAsset(work, 'index.html')} target="_blank" rel="noopener noreferrer">全屏独立体验 <ExternalLink size={15} /></a></div>
     <div className="mt-6 overflow-hidden rounded-2xl border border-border bg-[#080e19]">
       {!loaded && <p role="status" className="p-4 text-meta text-white/70">{slow ? '设备加载较慢，可点“全屏独立体验”；三维作品需要 WebGL。' : '正在打开真实作品…'}</p>}
-      <iframe title={work.title + '可交互作品'} src={signatureAsset(work, 'index.html')} sandbox="allow-scripts" referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[760px] w-full border-0 sm:h-[780px]" />
+      <iframe title={work.title + '可交互作品'} src={signatureAsset(work, 'index.html')} sandbox="allow-scripts" referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[min(70dvh,480px)] w-full border-0 sm:h-[780px]" />
     </div>
     <p className="mt-3 text-caption leading-6 text-muted">直接在作品内操作；手机可向下滑动查看参数。保存星球画面时，请使用“全屏独立体验”。</p>
     <div className="mt-4 flex flex-wrap gap-x-6 gap-y-3 text-meta"><a className="inline-flex items-center gap-2 text-accent" href={signatureAsset(work, 'source.zip')} download><Download size={15} />下载完整源文件</a><a className="text-muted" href={signatureAsset(work, 'manifest.json')} target="_blank" rel="noopener noreferrer">查看来源与校验记录</a></div>

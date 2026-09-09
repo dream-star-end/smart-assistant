@@ -8,7 +8,7 @@ import { LEGAL_DOCS, TERMS_VERSION, type LegalKind } from "../lib/legal";
 import { LegalDocBody } from "./LegalPage";
 import { ThemeToggle } from "./ThemeToggle";
 import { TurnstileWidget } from "./TurnstileWidget";
-import { Button, Input, Modal, Spinner } from "./ui";
+import { Alert, Button, Input, Modal, Spinner } from "./ui";
 
 /** 占位 token：canary 开启 TURNSTILE_TEST_BYPASS 时发它即可过（服务端 bypass 接受任意串）。*/
 const BYPASS_TOKEN = "bypass";
@@ -103,6 +103,8 @@ export function AuthGate({
   // 注册页协议勾选：默认不勾选（监管要求不得默认同意），未勾选提交时给出明确提示
   // 而非禁用按钮——可发现性优于静默禁用。登录页走「登录即代表同意」文案式（业界 Web 端惯例）。
   const [agreeTerms, setAgreeTerms] = useState(false);
+  const [turnstileErr, setTurnstileErr] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   // ── Turnstile 三态 fail-closed（与历史一致）──────────────────────────────
   const bypassKnown = typeof turnstileBypass === "boolean";
@@ -126,6 +128,7 @@ export function AuthGate({
     setLocalErr(null);
     setNotice(null);
     setToken(null);
+    setTurnstileErr(false);
     setBusy(false);
     setResetSent(false);
   }
@@ -339,17 +342,43 @@ export function AuthGate({
   };
 
   // 真 widget 仅在需要人机验证的模式渲染；token 拿到前禁用提交。
+  const emptySiteKey = needsWidget && !turnstileSiteKey;
+  function retryTurnstile() {
+    setTurnstileErr(false);
+    setToken(null);
+    setRetryNonce((n) => n + 1);
+    if (emptySiteKey) onRetryPublicConfig?.();
+  }
   const widget = modeNeedsTurnstile && needsWidget && (
     <div className="flex justify-center">
       <TurnstileWidget
-        key={mode}
+        key={`${mode}:${retryNonce}`}
         siteKey={turnstileSiteKey ?? ""}
         theme={theme === "system" ? "auto" : theme}
-        onToken={setToken}
+        onToken={(t) => {
+          setTurnstileErr(false);
+          setToken(t);
+        }}
         onExpire={() => setToken(null)}
-        onError={() => setToken(null)}
+        onError={() => {
+          setToken(null);
+          setTurnstileErr(true);
+        }}
       />
     </div>
+  );
+  const turnstileFail = modeNeedsTurnstile && (turnstileErr || emptySiteKey) && (
+    <Alert
+      tone="danger"
+      density="compact"
+      action={
+        <Button type="button" variant="secondary" onClick={retryTurnstile}>
+          重试
+        </Button>
+      }
+    >
+      验证加载失败
+    </Alert>
   );
   const turnstileGate = modeNeedsTurnstile && !bypassKnown ? (
     <output className="flex items-center justify-center gap-2 text-body text-muted">
@@ -480,6 +509,7 @@ export function AuthGate({
               </Button>
             )}
             {noticeBox}
+            {turnstileFail}
             {turnstileGate}
 
             <Button
@@ -494,7 +524,13 @@ export function AuthGate({
               }
               className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
             >
-              {busyNow || loginPending ? <Spinner size={17} /> : (<>登录<ArrowRight size={16} /></>)}
+              {busyNow ? (
+                <><Spinner size={17} />正在登录…</>
+              ) : loginPending ? (
+                <Spinner size={17} />
+              ) : (
+                <>登录<ArrowRight size={16} /></>
+              )}
             </Button>
 
             {allowRegistration && onRegister && (
@@ -580,6 +616,7 @@ export function AuthGate({
             </label>
 
             {errBox}
+            {turnstileFail}
             {turnstileGate}
 
             <Button
@@ -683,6 +720,7 @@ export function AuthGate({
                 </label>
 
                 {errBox}
+                {turnstileFail}
                 {turnstileGate}
 
                 <Button

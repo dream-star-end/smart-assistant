@@ -1,5 +1,4 @@
-import * as Dialog from "@radix-ui/react-dialog";
-import { Check, GitBranch, Lock, Search, X } from "lucide-react";
+import { Check, GitBranch, Lock, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { githubErrorText } from "../../lib/github";
@@ -13,7 +12,7 @@ import type {
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import type { ToastTone } from "../ui";
-import { Avatar, Badge, Button, Input, Spinner } from "../ui";
+import { Avatar, Badge, Button, Input, Modal, Spinner } from "../ui";
 
 /**
  * GitHub 仓库绑定 modal（对齐 v3 github.js openGithubModal）。
@@ -48,6 +47,7 @@ export function GithubRepoModal({
 }) {
   const [link, setLink] = useState<GithubLink | null>(null);
   const [linkLoading, setLinkLoading] = useState(false);
+  const [linkErr, setLinkErr] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
   const [unlinking, setUnlinking] = useState(false);
 
@@ -68,6 +68,24 @@ export function GithubRepoModal({
   const linked = link?.linked === true;
   const hasBinding = !!selection && selection.selected;
 
+  const loadLink = useCallback(() => {
+    if (!auth) return;
+    setLinkLoading(true);
+    setLinkErr(null);
+    return api
+      .getGithubLink(auth)
+      .then((l) => {
+        setLink(l);
+        setLinkErr(null);
+      })
+      .catch((e) => {
+        setLinkErr(apiErrorMessage(e, "账号状态加载失败"));
+      })
+      .finally(() => {
+        setLinkLoading(false);
+      });
+  }, [auth]);
+
   // 打开：复位瞬态 + 拉账号关联状态。
   useEffect(() => {
     if (!open || !auth) {
@@ -80,13 +98,14 @@ export function GithubRepoModal({
     }
     let alive = true;
     setLinkLoading(true);
+    setLinkErr(null);
     api
       .getGithubLink(auth)
       .then((l) => {
         if (alive) setLink(l);
       })
-      .catch(() => {
-        if (alive) setLink({ linked: false });
+      .catch((e) => {
+        if (alive) setLinkErr(apiErrorMessage(e, "账号状态加载失败"));
       })
       .finally(() => {
         if (alive) setLinkLoading(false);
@@ -224,35 +243,64 @@ export function GithubRepoModal({
   }, [repos, search]);
 
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
-        <Dialog.Content
-          aria-describedby={undefined}
-          data-product-feature={PRODUCT_CAPABILITIES.github.id}
-          className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
-        >
-          <div className="flex items-center justify-between px-5 py-4">
-            <Dialog.Title className="flex items-center gap-2 text-title font-semibold text-fg">
-              <GitBranch size={16} className="text-faint" /> 绑定 GitHub 仓库
-            </Dialog.Title>
-            <Dialog.Close asChild>
-              <button
-                aria-label="关闭"
-                className="flex size-8 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+    <Modal
+      open={open}
+      onOpenChange={(o) => !o && onClose()}
+      title="绑定 GitHub 仓库"
+      size="lg"
+      mobile="sheet"
+      data-product-feature={PRODUCT_CAPABILITIES.github.id}
+      bodyClassName="flex min-h-0 flex-col overflow-hidden p-0"
+      footer={
+        <div className="flex w-full justify-between gap-2">
+          <div>
+            {hasBinding && (
+              <Button
+                variant="subtle"
+                size="sm"
+                onClick={doUnbind}
+                disabled={unbinding}
               >
-                <X size={17} />
-              </button>
-            </Dialog.Close>
+                {unbinding ? "解除中…" : "解除当前绑定"}
+              </Button>
+            )}
           </div>
-
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={doConfirm}
+              disabled={
+                !linked || !selRepo || !selBranch || confirming || !sessionId
+              }
+            >
+              {confirming ? "绑定中…" : "确认绑定"}
+            </Button>
+          </div>
+        </div>
+      }
+    >
           {/* 账号栏 */}
-          <div className="border-y border-border bg-hover/30 px-5 py-3">
+          <div className="border-b border-border bg-hover/30 px-5 py-3">
             {!auth || linkLoading ? (
               <div className="flex items-center gap-2 text-body text-faint">
                 <Spinner /> 加载账号状态…
               </div>
-            ) : !linked ? (
+            ) : linkErr ? (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-body text-danger">{linkErr}</span>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void loadLink()}
+                >
+                  重试
+                </Button>
+              </div>
+            ) : link && !link.linked ? (
               <div className="flex items-center justify-between gap-3">
                 <span className="text-body text-muted">
                   连接 GitHub 账号后即可把仓库绑定到当前会话
@@ -266,21 +314,19 @@ export function GithubRepoModal({
                   <GitBranch size={14} /> {linking ? "跳转中…" : "连接 GitHub"}
                 </Button>
               </div>
-            ) : (
+            ) : link && link.linked ? (
               <div className="flex items-center gap-3">
                 <Avatar
                   size="sm"
-                  src={(link.linked && link.avatar_url) || undefined}
-                  fallback={
-                    (link.linked && link.login?.[0]?.toUpperCase()) || "G"
-                  }
+                  src={link.avatar_url || undefined}
+                  fallback={link.login?.[0]?.toUpperCase() || "G"}
                 />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-section font-medium text-fg">
-                    @{link.linked ? link.login : ""}
+                    @{link.login}
                   </div>
                   <div className="truncate text-caption text-faint">
-                    {(link.linked && link.scopes) || "已连接"}
+                    {link.scopes || "已连接"}
                   </div>
                 </div>
                 {confirmUnlink ? (
@@ -311,7 +357,7 @@ export function GithubRepoModal({
                   </Button>
                 )}
               </div>
-            )}
+            ) : null}
           </div>
 
           {/* 选仓 + 分支 */}
@@ -440,41 +486,6 @@ export function GithubRepoModal({
               </div>
             </div>
           )}
-
-          {/* 底部操作 */}
-          <div className="flex items-center justify-between gap-2 border-t border-border px-5 py-3">
-            <div>
-              {hasBinding && (
-                <Button
-                  variant="subtle"
-                  size="sm"
-                  onClick={doUnbind}
-                  disabled={unbinding}
-                >
-                  {unbinding ? "解除中…" : "解除当前绑定"}
-                </Button>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              <Dialog.Close asChild>
-                <Button variant="ghost" size="sm">
-                  取消
-                </Button>
-              </Dialog.Close>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={doConfirm}
-                disabled={
-                  !linked || !selRepo || !selBranch || confirming || !sessionId
-                }
-              >
-                {confirming ? "绑定中…" : "确认绑定"}
-              </Button>
-            </div>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </Modal>
   );
 }

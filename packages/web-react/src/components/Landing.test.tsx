@@ -32,6 +32,11 @@ describe('从简 Landing', () => {
     expect(document.body.textContent).not.toContain('Aurora')
   })
 
+  test('落地页挂载快速上手教程区', () => {
+    render(<Landing {...base} onStart={() => {}} onLogin={() => {}} />)
+    expect(screen.getByRole('heading', { name: '三步开始，一分钟上手' })).toBeInTheDocument()
+  })
+
   test('导航登录与主行动按钮分别触发对应入口', () => {
     const onStart = vi.fn()
     const onLogin = vi.fn()

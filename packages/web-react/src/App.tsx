@@ -78,7 +78,7 @@ import {
 import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
 import { Sidebar } from "./components/Sidebar";
 import { ProjectSettingsDialog } from "./components/ProjectSettingsDialog";
-import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
+import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
   type BoardViewParam,
@@ -1471,6 +1471,14 @@ export function App() {
     (item: TutorialCase) => {
       setTutorialOpen(false);
       if (!inWorkspace) {
+        try {
+          sessionStorage.setItem(
+            "oc_v5_pending_case",
+            JSON.stringify({ caseId: item.id, starterPrompt: item.starterPrompt }),
+          );
+        } catch {
+          /* quota / private mode */
+        }
         setAuthMode("login");
         setView("app");
         return;
@@ -1480,6 +1488,33 @@ export function App() {
     },
     [inWorkspace, handleNew],
   );
+
+  // 登录后消费待跑案例：只在 inWorkspace false→true 时读一次；有键先删再预填，禁止自动发送。
+  const wasInWorkspaceRef = useRef(inWorkspace);
+  useEffect(() => {
+    const entered = inWorkspace && !wasInWorkspaceRef.current;
+    wasInWorkspaceRef.current = inWorkspace;
+    if (!entered) return;
+    let raw: string | null = null;
+    try {
+      raw = sessionStorage.getItem("oc_v5_pending_case");
+      if (!raw) return;
+      sessionStorage.removeItem("oc_v5_pending_case");
+    } catch {
+      return;
+    }
+    let text = "";
+    try {
+      const parsed = JSON.parse(raw) as { starterPrompt?: unknown };
+      if (typeof parsed.starterPrompt === "string") text = parsed.starterPrompt;
+    } catch {
+      return;
+    }
+    if (!text) return;
+    handleNew();
+    setComposerPrefill({ text, nonce: Date.now() });
+    toast("已带入案例指令，不会自动发送", "info");
+  }, [inWorkspace, handleNew, toast]);
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
   const inbox = useInbox(auth, inWorkspace && !demo);
@@ -3401,6 +3436,7 @@ export function App() {
             <PinnedDelegateTracker
               items={inflightDelegates.items}
               onDismiss={inflightDelegates.dismiss}
+              onStop={stopTurn}
             />
           )}
           {!demo && !gated && (
@@ -3426,7 +3462,22 @@ export function App() {
               Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
           {!gated && connBanner && isMdViewport && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
+              <Alert
+                tone={connBanner.tone}
+                action={
+                  connBanner.tone === "warning" ? (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => chat.retryConnectNow()}
+                    >
+                      立即重连
+                    </Button>
+                  ) : undefined
+                }
+              >
+                {connBanner.text}
+              </Alert>
             </div>
           )}
           {/* 版本更新横幅:仅 governor 判定不能自动软刷时出现(自动刷成功的用户无感)。*/}
@@ -3455,7 +3506,22 @@ export function App() {
             banner={
               !gated && connBanner && !isMdViewport ? (
                 <div className="mb-2">
-                  <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
+                  <Alert
+                    tone={connBanner.tone}
+                    action={
+                      connBanner.tone === "warning" ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => chat.retryConnectNow()}
+                        >
+                          立即重连
+                        </Button>
+                      ) : undefined
+                    }
+                  >
+                    {connBanner.text}
+                  </Alert>
                 </div>
               ) : undefined
             }
@@ -3491,9 +3557,9 @@ export function App() {
         onOpenChange={(o) => {
           if (!o) setInspectTarget(null);
         }}
-        side="right"
+        side="bottom"
         srTitle="产物详情"
-        className="w-[min(92vw,26rem)] md:hidden"
+        className="md:hidden"
         overlayClassName="md:hidden"
       >
         {inspectTarget && (

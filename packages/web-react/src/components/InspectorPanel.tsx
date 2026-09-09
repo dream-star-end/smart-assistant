@@ -7,7 +7,7 @@
  *
  * 布局接入(App.tsx):
  *   - 桌面(md+):作为根 flex 的第三列 <aside> 内联渲染,与 Sidebar | main 并列;
- *   - 窄屏:不挤三列,复用 Sheet side="right" 抽屉呈现同一 InspectorPanelContent。
+ *   - 窄屏:不挤三列,复用 Sheet side="bottom" 贴底抽屉呈现同一 InspectorPanelContent。
  *
  * 数据:target.message 持 ChatSocket 就地 mutate 的消息对象引用,App 随 version 重渲
  * 时面板自然读到最新流式内容(运行中的工具在面板里也会边流边更新)。
@@ -118,14 +118,14 @@ export function InspectorPanelContent({
           )}
         </div>
         <CopyIconButton getText={() => inspectorCopyText(target)} />
-        <button
-          type="button"
+        <IconButton
           aria-label="关闭详情面板"
+          size="sm"
+          shape="square"
           onClick={onClose}
-          className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
         >
           <X size={16} />
-        </button>
+        </IconButton>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 [&>*:first-child]:mt-0">
         <ToolBodyFullContext.Provider value={true}>

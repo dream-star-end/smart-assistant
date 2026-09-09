@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { taskboardApi } from "../lib/taskboard";
@@ -50,6 +50,10 @@ function renderDialog(
 }
 
 describe("ProjectSettingsDialog", () => {
+  beforeEach(() => {
+    vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([]);
+  });
+
   test("PROJECT_COLORS 恰好 8 项", () => {
     expect(PROJECT_COLORS).toHaveLength(8);
   });
@@ -156,5 +160,20 @@ describe("ProjectSettingsDialog", () => {
         expect.objectContaining({ name: "调研", color: "accent", instructions: "用中文回答" }),
       ),
     );
+  });
+
+  test("看板列表加载失败：提示+重试，下拉禁用，保存仍可用", async () => {
+    vi.spyOn(taskboardApi, "listProjects").mockRejectedValue(new Error("board down"));
+    const { onSave } = renderDialog();
+    expect(await screen.findByText("看板列表加载失败")).toBeTruthy();
+    expect(screen.getByLabelText("绑定任务面板项目")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "调研", color: "accent" }),
+      ),
+    );
+    expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
   });
 });

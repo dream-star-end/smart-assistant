@@ -114,6 +114,11 @@ export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolea
   return now >= permissionExpiresAt(msg);
 }
 
+function permissionRemainingMs(msg: ChatMessage, now: number): number {
+  const expiresAt = permissionExpiresAt(msg);
+  return Number.isFinite(expiresAt) ? Math.max(0, expiresAt - now) : 0;
+}
+
 /** A prompt the runtime is (as far as this browser can tell) still blocked on:
  *  unresolved, no durable response in flight, and inside the server TTL.
  *  MessageRenderer uses it to decide whether an unresolved card in the current
@@ -238,8 +243,19 @@ export function PermissionCard({
   const planMarkdown = isExitPlan ? extractExitPlanMarkdown(input) : "";
   const inputTruncated = msg._inputTruncated === true && !fullReady;
 
+  const [now, setNow] = useState(() => Date.now());
+  // Read the current clock for gating; Host's exact deadline must not use a stale display tick.
   const expired = !resolved && permissionHasExpired(msg);
+  const remainingMs = !resolved && !expired ? permissionRemainingMs(msg, now) : 0;
+  const remainingUrgent = remainingMs > 0 && remainingMs < 2 * 60_000;
   const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt) && !inputTruncated;
+
+  useEffect(() => {
+    if (resolved) return;
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), remainingUrgent ? 1000 : 15_000);
+    return () => window.clearInterval(id);
+  }, [resolved, remainingUrgent, msg.requestId, msg.ts, msg._askUserExpiresAt]);
 
   useEffect(() => {
     const requestId = msg.requestId;
@@ -388,6 +404,11 @@ export function PermissionCard({
           <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
           {statusText}
         </span>
+        {remainingMs > 0 && (
+          <span className={cn("shrink-0 text-meta", remainingUrgent ? "text-warning" : "text-muted")}>
+            约 {Math.max(1, Math.ceil(remainingMs / 60_000))} 分钟内有效
+          </span>
+        )}
       </div>
 
       {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
@@ -850,7 +871,7 @@ function AskUserQuestionModal({
               onOpenChange(false);
             }}
           >
-            跳过
+            暂不回答，让它继续
           </Button>
           <Button variant="accent" onClick={submit}>
             提交
@@ -889,7 +910,7 @@ function AskUserQuestionModal({
                       aria-checked={sel}
                       onClick={() => toggle(q, opt.label)}
                       className={cn(
-                        "flex items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                        "flex min-h-11 items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
                         sel ? "border-accent bg-accent-soft" : "border-border bg-surface hover:bg-hover",
                       )}
                     >
@@ -919,7 +940,7 @@ function AskUserQuestionModal({
                     aria-checked={qs.selected.includes(OTHER)}
                     onClick={() => toggle(q, OTHER)}
                     className={cn(
-                      "flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                      "flex min-h-11 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
                       qs.selected.includes(OTHER)
                         ? "border-accent bg-accent-soft"
                         : "border-border bg-surface hover:bg-hover",

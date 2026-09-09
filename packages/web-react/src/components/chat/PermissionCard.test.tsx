@@ -759,7 +759,7 @@ describe("PermissionCard 关掉≠作答（pending-approval-bar）", () => {
     dismissWithoutAnswering();
     expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "打开" }));
-    fireEvent.click(screen.getByRole("button", { name: "跳过" }));
+    fireEvent.click(screen.getByRole("button", { name: "暂不回答，让它继续" }));
     expect(onRespond).toHaveBeenCalled();
     rerender(
       <PermissionCard
@@ -859,6 +859,71 @@ describe("181 ae57 stable Host pinned entry", () => {
       expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
       act(() => vi.advanceTimersByTime(1001));
       expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+      expect(respond).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe("审批活卡剩余时间", () => {
+  test("未决权限卡 header 以 sibling 显示约 N 分钟内有效，且不改「等待审批…」", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ ts: Date.now() - 5 * 60_000, requestId: "req-remain" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.getByText("等待审批…")).toBeInTheDocument();
+    expect(screen.getByText("约 25 分钟内有效")).toBeInTheDocument();
+    expect(screen.getByText("约 25 分钟内有效")).not.toHaveClass("text-warning");
+  });
+
+  test("剩余不足 2 分钟用 warning 色", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ ts: Date.now() - 29 * 60_000, requestId: "req-remain-urgent" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    const label = screen.getByText("约 1 分钟内有效");
+    expect(label).toHaveClass("text-warning");
+  });
+});
+
+describe("问答跳过语义", () => {
+  test("可见文案是暂不回答，payload 仍是 deny + User skipped", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={askMsg({ requestId: "req-skip-copy" })} onRespond={onRespond} livePrompt />);
+    fireEvent.click(screen.getByRole("button", { name: "暂不回答，让它继续" }));
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: "req-skip-copy",
+      behavior: "deny",
+      message: "User skipped",
+    });
+  });
+});
+
+describe("181 a753 countdown keeps the single expiry authority", () => {
+  test("unknown deadline stays answerable without a fictitious infinite countdown", () => {
+    const msg = bashPermMsg({ ts: Number.NaN, requestId: "unknown-deadline" });
+    render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt={false} />);
+    expect(permissionHasExpired(msg)).toBe(false);
+    expect(screen.getByRole("button", { name: "审批" })).toBeInTheDocument();
+    expect(screen.queryByText(/分钟内有效/)).toBeNull();
+  });
+
+  test("finite deadline countdown expires without an incoming frame and never responds", () => {
+    vi.useFakeTimers();
+    try {
+      const respond = vi.fn();
+      const msg = bashPermMsg({ requestId: "countdown-finite", _askUserExpiresAt: Date.now() + 1500 });
+      render(<PermissionCard msg={msg} onRespond={respond} livePrompt={false} />);
+      expect(screen.getByText("约 1 分钟内有效")).toHaveClass("text-warning");
+      act(() => vi.advanceTimersByTime(2000));
+      expect(screen.getByText("已过期")).toBeInTheDocument();
+      expect(screen.queryByText(/分钟内有效/)).toBeNull();
+      expect(screen.queryByRole("button", { name: "审批" })).toBeNull();
       expect(respond).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
   });

@@ -66,6 +66,7 @@ export function ProjectSettingsDialog(props: {
   const [instructions, setInstructions] = useState("");
   const [boardProjectId, setBoardProjectId] = useState<string>("");
   const [boardProjects, setBoardProjects] = useState<BoardProject[]>([]);
+  const [boardListErr, setBoardListErr] = useState<string | null>(null);
   const [contextVersion, setContextVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -84,16 +85,38 @@ export function ProjectSettingsDialog(props: {
     }
   }, [open, project, assetsOnly]);
 
+  const loadBoardList = () => {
+    if (!authSession) return;
+    setBoardListErr(null);
+    return taskboardApi
+      .listProjects(authSession)
+      .then((items) => {
+        setBoardProjects(items);
+        setBoardListErr(null);
+      })
+      .catch((e) => {
+        setBoardProjects([]);
+        setBoardListErr(apiErrorMessage(e, "看板列表加载失败"));
+      });
+  };
+
   useEffect(() => {
     if (!open || assetsOnly || !authSession) return;
     let cancelled = false;
+    setBoardListErr(null);
     void taskboardApi
       .listProjects(authSession)
       .then((items) => {
-        if (!cancelled) setBoardProjects(items);
+        if (!cancelled) {
+          setBoardProjects(items);
+          setBoardListErr(null);
+        }
       })
-      .catch(() => {
-        if (!cancelled) setBoardProjects([]);
+      .catch((e) => {
+        if (!cancelled) {
+          setBoardProjects([]);
+          setBoardListErr(apiErrorMessage(e, "看板列表加载失败"));
+        }
       });
     return () => {
       cancelled = true;
@@ -267,11 +290,26 @@ export function ProjectSettingsDialog(props: {
             label="绑定任务面板项目"
             hint="绑定后，聊天与看板 stage 共用项目指令、资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；仓库 clone 就绪时会话会切到仓库快照（允许覆盖）。"
           >
+            {boardListErr ? (
+              <Alert
+                tone="danger"
+                density="compact"
+                className="mb-2"
+                action={
+                  <Button size="sm" variant="secondary" onClick={() => void loadBoardList()}>
+                    重试
+                  </Button>
+                }
+              >
+                看板列表加载失败
+              </Alert>
+            ) : null}
             <select
               className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm"
               value={boardProjectId}
               onChange={(e) => setBoardProjectId(e.target.value)}
               aria-label="绑定任务面板项目"
+              disabled={!!boardListErr}
             >
               <option value="">不绑定</option>
               {boardProjects.map((p) => (

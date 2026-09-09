@@ -112,6 +112,8 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   onOpenAutoFocus?: RD.DialogContentProps["onOpenAutoFocus"];
   /** Controlled dialogs opened by an external action can explicitly restore that action's focus. */
   onCloseAutoFocus?: RD.DialogContentProps["onCloseAutoFocus"];
+  /** 教程/产品能力锚点，透传到 role=dialog 节点。 */
+  "data-product-feature"?: string;
 }
 
 /**
@@ -137,6 +139,7 @@ export function Modal({
   onEscapeKeyDown,
   onOpenAutoFocus,
   onCloseAutoFocus,
+  "data-product-feature": dataProductFeature,
 }: ModalProps) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
   const hasDescription = Boolean(title && description);
@@ -146,6 +149,9 @@ export function Modal({
         <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
+          {...(dataProductFeature
+            ? { "data-product-feature": dataProductFeature }
+            : {})}
           onEscapeKeyDown={onEscapeKeyDown}
           onOpenAutoFocus={onOpenAutoFocus}
           onCloseAutoFocus={onCloseAutoFocus}
