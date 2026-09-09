@@ -164,7 +164,7 @@
   --border-control: #64647a;
   --fg: #f2f2f6;
   --muted: #bcbcc7;
-  --faint: #7e7e87; /* was #76767f — 4.04:1 */
+  --faint: #8a8a94; /* was #7e7e87 — vs elevated 4.20; #8a8a94 vs surface 5.32 / elevated 4.95 */
   --accent: #9a8aff;
   --accent-soft: #9a8aff1f;
   --accent-strong: #ab9cff;
