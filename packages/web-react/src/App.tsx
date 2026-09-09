@@ -78,7 +78,7 @@ import {
 import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
 import { Sidebar } from "./components/Sidebar";
 import { ProjectSettingsDialog } from "./components/ProjectSettingsDialog";
-import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
+import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
   type BoardViewParam,
@@ -3422,7 +3422,22 @@ export function App() {
               Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
           {!gated && connBanner && isMdViewport && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
+              <Alert
+                tone={connBanner.tone}
+                action={
+                  connBanner.tone === "warning" ? (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => chat.retryConnectNow()}
+                    >
+                      立即重连
+                    </Button>
+                  ) : undefined
+                }
+              >
+                {connBanner.text}
+              </Alert>
             </div>
           )}
           {/* 版本更新横幅:仅 governor 判定不能自动软刷时出现(自动刷成功的用户无感)。*/}
@@ -3451,7 +3466,22 @@ export function App() {
             banner={
               !gated && connBanner && !isMdViewport ? (
                 <div className="mb-2">
-                  <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
+                  <Alert
+                    tone={connBanner.tone}
+                    action={
+                      connBanner.tone === "warning" ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => chat.retryConnectNow()}
+                        >
+                          立即重连
+                        </Button>
+                      ) : undefined
+                    }
+                  >
+                    {connBanner.text}
+                  </Alert>
                 </div>
               ) : undefined
             }

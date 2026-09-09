@@ -216,6 +216,8 @@ export type UseChatSocket = {
   sendRepoBind: (sessId: string, agentId: string, version: number) => void;
   /** GitHub：发解绑帧（DELETE /github-selection 成功后）。*/
   sendRepoUnbind: (sessId: string, version: number) => void;
+  /** 断线横幅「立即重连」：wrap ChatSocket.retryConnectNow。 */
+  retryConnectNow: (label?: string) => boolean;
 };
 
 const EMPTY_MESSAGES: ChatMessage[] = [];
@@ -1041,6 +1043,10 @@ export function useChatSocket(opts: {
     (sessId: string, version: number) => socket.sendRepoUnbind(sessId, version),
     [socket],
   );
+  const retryConnectNow = useCallback(
+    (label?: string) => socket.retryConnectNow(label),
+    [socket],
+  );
 
   return useMemo(
     () => ({
@@ -1083,6 +1089,7 @@ export function useChatSocket(opts: {
       wipePersistence,
       sendRepoBind,
       sendRepoUnbind,
+      retryConnectNow,
     }),
     [
       snap,
@@ -1121,6 +1128,7 @@ export function useChatSocket(opts: {
       wipePersistence,
       sendRepoBind,
       sendRepoUnbind,
+      retryConnectNow,
     ],
   );
 }
