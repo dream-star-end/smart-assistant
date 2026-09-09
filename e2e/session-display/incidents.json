@@ -3761,7 +3761,8 @@
         "98176566",
         "b6f2e0e3",
         "56146fa9",
-        "42b803ee"
+        "42b803ee",
+        "68d2fcce"
       ],
       "regressions": [
         {
@@ -3803,6 +3804,11 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/ocv5-185-qa.node-test.mjs",
           "assertion": "T3 background does not mark displayed; after foreground close can reopen"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/PermissionCard.test.tsx",
+          "assertion": "card-only unmount retains Host bar and reopens one dialog without responding"
         }
       ]
     },
