@@ -26,3 +26,8 @@ Box gatewayToken/networkToken不新落盘：已有选中账号accessToken经现�
 先同Codex方案PASS→实现→相关gateway typecheck/测试与Box并发/长时限配置测试→完整diff审查→真实CursorSandAdapter+实际CCB在隔离工作目录读写随机文件并正确回传→正常平台入口验证。Mock成功/旧197测试不能冒充CCB或UI恢复；测试记录真实入口、调用计数、模型/工具结果、取消/401/404失败面。Box返回Connect error需使用真实error结束帧，不再以{}冒充。
 正式平台代码按selfhost官方列车，commit立即push；串行合入前fetch核tip、门禁、发布锁与在飞会话检查；搭车用lease register，禁止为测试重启他会话。root非秘密policy安装时核当前账号/完整tokenHash+machineHash，原policy先备份，原子写并chmod600；不向generated/argv写Bearer。Box模块先备份旧SHA、语法校验、其他Bot idle、只重启已核hostPID；异常即还原旧已工作模块，不盲重试。
 回退平台candidate走官方路径；单独移除账号19 opt-in可回到原直连语义（原直连仍可能unauth，不能称功能恢复）；Box正常Bot功能不应受影响。未完成生产接线/发布就不关父192，不说Sand模式已修好。
+
+## 方案审查B1闭合：Box故障不能污染账号健康
+Box gateway 401/403与本地容量429必须成为带固定CURSOR_SAND_BOX_*标记的传输错误：Relay给CCB 400 invalid_request_error + x-should-retry:false，当前请求不重放；Adapter优先将该标记归为ENGINE_ERROR/status=error，既不recordResult(fail)也不recordResult(ok)，不输出cursorSlotResults，不触发池冷却/轮换。Box身份policy/未初始化/路由404/网络错误同属此类，不因文案含auth/credential误判。官方api2控制面401/403保留既有CURSOR_SAND_AUTH_*账户失败路径，真实上游quota保持原行为。
+Box模块对真正收到的上游HTTP响应新增固定x-oc-sand-box-upstream:1（由模块自身写，不从上游或客户端透传）；本地错误没有此头。Box HTTP401/403不论此头均属推理票/连接问题，不当成账号JWT失效；无该头的429为Box容量错误，有该头的上游429及正常Connect错误帧保留原上游分类。标记只影响此可选Box模式，不改变直连账号/普通Cursor路径。
+验收：真实CursorSandAdapter错误处理链分别注入Box401/本地429标记，断言无账号结果写入/无轮换；下一独立请求仍绑定同账号，401后重新取descriptor，容量错误不抹有效descriptor；控制面401/真实上游quota仍触发原失败路径。补测上游429标记与未标记区分、x-should-retry:false/400无CCB重放。
