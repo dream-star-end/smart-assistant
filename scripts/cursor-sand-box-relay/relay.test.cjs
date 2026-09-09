@@ -54,3 +54,9 @@ test("upstream HTTP and Connect errors preserved; redirects not followed",async(
   for(const status of [401,200,302]){let calls=0;const bytes=(()=>{const body=Buffer.from(JSON.stringify({error:{code:"unauthenticated",message:"ticket rejected"}}));const prefix=Buffer.alloc(5);prefix[0]=2;prefix.writeUInt32BE(body.length,1);return Buffer.concat([prefix,body]);})();const f=await fixture((q,s)=>{calls++;q.resume();q.on("end",()=>{s.writeHead(status,{"content-type":"application/connect+proto",location:"http://127.0.0.1:1/forbidden"});s.end(bytes);});});try{const r=await f.request();assert.equal(r.status,status===302?502:status);if(status!==302)assert.deepEqual(Buffer.from(await r.arrayBuffer()),bytes);else await r.text();assert.equal(calls,1);if(status!==302)assert.equal(r.headers.get("x-oc-sand-box-upstream"),"1");}finally{await f.close();}}
 });
 test("production transport rejects plaintext backend",async()=>{const f=await fixture((q,s)=>s.end("bad"),{allowTestHttp:false});try{const r=await f.request();assert.equal(r.status,503);await r.text();assert.equal(f.stats().transportCalls,0);}finally{await f.close();}});
+
+test("default capacity admits four complete uploads; fifth gets local429 without upstream marker",async()=>{
+ let started=0,ready;const barrier=new Promise(r=>ready=r);const pending=[];
+ const f=await fixture(async(q,s)=>{q.resume();q.on("end",()=>{pending.push(s);if(++started===4)ready();});},{maxConcurrent:undefined});
+ try{const requests=Array.from({length:4},()=>f.request());await barrier;const fifth=await f.request();assert.equal(fifth.status,429);assert.equal(fifth.headers.get("x-oc-sand-box-upstream"),null);await fifth.text();assert.deepEqual(f.stats(),{tokenCalls:4,transportCalls:4});for(const s of pending)s.end("four-ok");for(const p of requests){const r=await p;assert.equal(r.status,200);assert.equal(await r.text(),"four-ok");}}finally{for(const s of pending)if(!s.writableEnded)s.end();await f.close();}
+});

@@ -19,9 +19,10 @@ export class CursorSandBoxError extends Error {
 export function isCursorSandBoxError(message: string): boolean {
   return /\bCURSOR_SAND_BOX_[A-Z0-9_]+\b/.test(message)
 }
-export function cursorSandBoxTicketError(message: string): string | null {
-  if (/quota|rate.?limit|usage limit|subscription|\b429\b/i.test(message)) return null
-  return /auth|credential|forbidden|not.?logged.?in|token.*(?:expired|invalid)|\b40[13]\b/i.test(message)
+export function cursorSandBoxTicketError(message: string, code?: unknown): string | null {
+  const authCode = typeof code === 'string' && /unauthenticated|permission_denied|not_logged_in|authentication|unauthorized|forbidden/i.test(code)
+  if (!authCode && /quota|rate.?limit|usage limit|subscription|\b429\b/i.test(message)) return null
+  return authCode || /auth|credential|forbidden|not.?logged.?in|token.*(?:expired|invalid)|\b40[13]\b/i.test(message)
     ? 'CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED [non-retryable]'
     : null
 }

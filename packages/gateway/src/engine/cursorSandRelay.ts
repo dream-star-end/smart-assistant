@@ -1896,14 +1896,15 @@ export class CursorSandRelay {
             const error = parseEndTrailer(payload)
             if (error) {
               const box = this.boxResponses.get(response)
-              const ticket = box ? cursorSandBoxTicketError(error) : null
+              const code = box ? (JSON.parse(payload.toString('utf8')) as { error?: { code?: unknown } }).error?.code : undefined
+              const ticket = box ? cursorSandBoxTicketError(error, code) : null
               if (ticket && box) this.boxResolver?.invalidate(box)
               onEndError(ticket ?? error)
             }
           } else {
             const frame = decodeFrame(payload)
             const box = this.boxResponses.get(response)
-            const ticket = box && frame.response === 'error' ? cursorSandBoxTicketError(errorMessage(frame.error)) : null
+            const ticket = box && frame.response === 'error' ? cursorSandBoxTicketError(errorMessage(frame.error), (frame.error as JsonObject | undefined)?.code ?? (frame.error as JsonObject | undefined)?.errorType) : null
             if (ticket && box) { this.boxResolver?.invalidate(box); onEndError(ticket) }
             else await onFrame(frame)
           }
@@ -2421,11 +2422,11 @@ export class CursorSandRelay {
       (message) => { error = message },
     )
     if (error) {
-      res.statusCode = 502
+      res.statusCode = isCursorSandBoxError(error) ? 400 : 502
       res.setHeader('content-type', 'application/json')
       this.markNonRetryable(res, error)
       res.end(JSON.stringify({ type: 'error', error: { type: this.streamErrorType(error), message: this.publicMessage(error) } }))
-      return { kind: 'rejected', status: 502, reason: error, written: true }
+      return { kind: 'rejected', status: res.statusCode, reason: error, written: true }
     }
     const content: JsonObject[] = []
     const recovered = recoverXmlToolCalls(state.text, allowedTools)
