@@ -126,12 +126,17 @@ def install(host, module, expected_hash, nonce, check_owner=lambda: None):
     target = host.parent / MODULE
     if target.is_symlink() or (target.exists() and not target.is_file()):
         fail("MODULE_PATH_INVALID")
-    with (host.parent / ".oc-sand-install.lock").open("a") as lock:
+    lock_fd = os.open(host.parent / ".oc-sand-install.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, "r+b") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             fail("INSTALL_BUSY")
         check_owner()
+        receipt = host.parent / (".oc-sand-receipt-" + nonce + ".json")
+        if receipt.exists():
+            if receipt.is_symlink() or json.loads(receipt.read_text()).get("moduleSha256") != expected_hash:
+                fail("OPERATION_PAYLOAD_MISMATCH")
         before = host.read_bytes()
         previous_module = target.read_bytes() if target.exists() else None
         after = patch_source(before.decode("utf-8")).encode("utf-8")
@@ -156,7 +161,6 @@ def install(host, module, expected_hash, nonce, check_owner=lambda: None):
                 os.replace(host_next, host)
             sync_dir(host.parent)
             result = {"hostBeforeSha256": digest(before), "hostAfterSha256": digest(after), "moduleSha256": expected_hash, "changed": before != after or previous_module != module}
-            receipt = host.parent / (".oc-sand-receipt-" + nonce + ".json")
             if not receipt.exists():
                 write_new(receipt, json.dumps(result).encode())
                 sync_dir(host.parent)

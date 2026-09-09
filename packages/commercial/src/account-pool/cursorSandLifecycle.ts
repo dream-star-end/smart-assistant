@@ -126,6 +126,7 @@ export class CursorSandLifecycleCoordinator {
         op.phase = "ready"; op.moduleHash = this.deps.moduleHash; delete op.errorCode;
         this.save(state); return;
       }
+      if (probe && probe.active > 0) throw new SandProvisionError("BOX_BUSY");
       if (op.moduleHash !== this.deps.moduleHash && !["idle", "ready", "error"].includes(op.phase)) throw new SandProvisionError("INSTALL_VERSION_CHANGED_IN_FLIGHT");
       const call = async (method: string, body: Record<string, unknown>): Promise<unknown> => {
         await this.current(id, credentialHash); return client.box(method, connection, body, signal);
