@@ -12,7 +12,12 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { ApiKeySummary, ApiKeyUsageReport, AuthSession } from "../../lib/types";
+import type {
+  ApiKeySummary,
+  ApiKeyUsageRecent,
+  ApiKeyUsageReport,
+  AuthSession,
+} from "../../lib/types";
 
 vi.mock("../charts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../charts")>();
@@ -38,16 +43,27 @@ vi.mock("../../lib/api", () => {
       getPublicModels: vi.fn(),
     },
     apiErrorMessage: (_e: unknown, fallback: string) => fallback,
+    // 最近明细分页 / 请求审计走的是裸 fetch + 统一鉴权三件套(与 MediaTaskCenter 同一先例)。
+    // 这里保留真实语义、只把身份围栏与刷新重放拿掉,断言才能落在**实际请求 URL** 上。
+    bearerHeaders: (t: string) => ({ Authorization: `Bearer ${t}` }),
+    callWithRefresh: (_a: unknown, make: (t: string) => Promise<Response>) => make("t"),
+    jsonOrThrow: async (p: Promise<Response> | Response) => {
+      const res = await p;
+      if (!res.ok) throw new ApiError({ status: res.status, message: `HTTP ${res.status}` });
+      return res.json();
+    },
   };
 });
 
 import { api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
-import { ApiAccessTab, ApiKeyUsagePanel } from "./ApiAccessTab";
+import { ApiAccessTab, ApiKeyAuditPanel, ApiKeyUsagePanel } from "./ApiAccessTab";
+import type { ApiKeyMessageAuditEntry } from "./ApiAccessTab";
 import {
   buildCcSwitchDeepLink,
   buildCcSwitchUsageScript,
   claudeCodeExtraEnv,
+  familyGuideList,
   limitPercent,
   pickDefaultModel,
 } from "./ApiKeysSection";
@@ -168,7 +184,11 @@ const PUBLIC_MODELS = {
   models: [
     { id: "cursor-fable-5.1-high", display_name: "Fable 5.1 High", engine: "cursor" as const },
     { id: "cursor-fable-5.1-low", display_name: "Fable 5.1 Low", engine: "cursor" as const },
+    { id: "cursor-opus-5-high", display_name: "Opus 5 High", engine: "cursor" as const },
     { id: "cursor-sonnet-5-high", display_name: "Sonnet 5 High", engine: "cursor" as const },
+    // 单档无思考轴,公开 id 就是家族 id(0280)。
+    { id: "cursor-haiku-4.5", display_name: "Haiku 4.5", engine: "cursor" as const },
+    // 可用但**不在**默认集里 —— 教程的"当前可用"应把它过滤掉(仍可自行发现使用)。
     {
       id: "cursor-gemini-3.8-flash-low",
       display_name: "Gemini 3.8 Flash Low",
@@ -179,16 +199,115 @@ const PUBLIC_MODELS = {
   lockedModels: [],
 };
 
+/** 一条最近明细行(id 唯一即可,其它字段取默认)。 */
+function recentRow(id: string, over: Partial<ApiKeyUsageRecent> = {}): ApiKeyUsageRecent {
+  return {
+    id,
+    created_at: "2026-09-06T10:00:00.000Z",
+    api_key_id: "11",
+    label: "my-cli",
+    model: "cursor-sonnet-5-low",
+    input_tokens: "3000",
+    output_tokens: "200",
+    cache_read_tokens: "0",
+    cache_write_tokens: "0",
+    cost_credits: "31",
+    status: "success",
+    ...over,
+  };
+}
+
+/** 一条审计行。 */
+function auditRow(
+  id: string,
+  over: Partial<ApiKeyMessageAuditEntry> = {},
+): ApiKeyMessageAuditEntry {
+  return {
+    id,
+    created_at: "2026-09-06T10:00:00.000Z",
+    request_id: `req-${id}`,
+    api_key_id: "11",
+    requested_model: "sonnet-5",
+    model: "cursor-sonnet-5-low",
+    effort: "low",
+    effort_source: "classifier",
+    account_id: null,
+    body_sha256: "a".repeat(64),
+    body_bytes: 1024,
+    message_count: 3,
+    tool_count: 0,
+    stream: true,
+    last_user_message: "帮我看下这段代码",
+    last_user_message_truncated: false,
+    status: "success",
+    terminal_code: null,
+    error_message: null,
+    duration_ms: 820,
+    input_tokens: "3000",
+    output_tokens: "200",
+    cache_read_tokens: "0",
+    cache_write_tokens: "0",
+    client_user_agent: "claude-cli/2.1",
+    ...over,
+  };
+}
+
+/** 走过 fetch 的 URL(顺序保留),供断言查询串。 */
+let fetched: string[] = [];
+/** path 前缀 → 该端点依次返回的 JSON(用完最后一个就一直复用它)。 */
+let fetchRoutes: { messages: unknown[]; recent: unknown[] };
+
+function jsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => body,
+  } as unknown as Response;
+}
+
+function nextFrom(queue: unknown[]): unknown {
+  return queue.length > 1 ? queue.shift() : (queue[0] ?? { entries: [], next_before: null });
+}
+
 beforeEach(() => {
   vi.mocked(api.listApiKeys).mockResolvedValue(KEYS);
   vi.mocked(api.getApiKeyUsage).mockResolvedValue(makeReport());
   vi.mocked(api.getPublicModels).mockResolvedValue(PUBLIC_MODELS);
+  fetched = [];
+  fetchRoutes = {
+    messages: [{ entries: [], next_before: null }],
+    recent: [{ window: "7d", key_id: null, entries: [], next_before: null }],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetched.push(url);
+      if (url.startsWith("/api/me/api-keys/messages"))
+        return jsonResponse(nextFrom(fetchRoutes.messages));
+      if (url.startsWith("/api/me/api-keys/usage/recent"))
+        return jsonResponse(nextFrom(fetchRoutes.recent));
+      throw new Error(`unexpected fetch ${url}`);
+    }),
+  );
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
+
+/** 命中某端点的最后一次请求 URL(没有则抛,便于定位)。 */
+function lastFetch(prefix: string): string {
+  const hit = [...fetched].reverse().find((u) => u.startsWith(prefix));
+  if (!hit) throw new Error(`no fetch to ${prefix}; got ${JSON.stringify(fetched)}`);
+  return hit;
+}
+
+function countFetch(prefix: string): number {
+  return fetched.filter((u) => u.startsWith(prefix)).length;
+}
 
 describe("limitPercent", () => {
   test("字符串大数按 BigInt 精确算并夹到 100;无上限 / 非法项返回 null", () => {
@@ -215,14 +334,32 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
     );
   });
 
+  test("familyGuideList:未加载/空 → 默认五家族;有列表 → 交集且按默认集顺序;交集为空 → 退回实际列表", () => {
+    const DEFAULTS = ["fable-5.1", "opus-5", "opus-4.8", "sonnet-5", "haiku-4.5"];
+    // 拉取失败 / 尚未加载 / 空列表 → 静态默认集(说明性质)。
+    expect(familyGuideList(null)).toEqual(DEFAULTS);
+    expect(familyGuideList([])).toEqual(DEFAULTS);
+    // 交集:只留默认集里有的,且顺序按默认集(不是服务端返回顺序)。
+    expect(familyGuideList(["grok-4.6", "haiku-4.5", "fable-5.1"])).toEqual([
+      "fable-5.1",
+      "haiku-4.5",
+    ]);
+    expect(familyGuideList(DEFAULTS.slice().reverse())).toEqual(DEFAULTS);
+    // 默认集里的家族全都不可用(目录换代)→ 退回实际列表,不给一份全是死 id 的清单。
+    expect(familyGuideList(["grok-4.6", "gemini-3.8-flash"])).toEqual([
+      "grok-4.6",
+      "gemini-3.8-flash",
+    ]);
+  });
+
   test("深链拒绝缺失/掩码/不完整密钥,有效密钥按 CC Switch V1 编码", () => {
     const base = {
       origin: "https://x.example",
       name: "从简",
       model: "fable-5.1",
-      opusModel: "fable-5.1",
+      opusModel: "opus-5",
       sonnetModel: "sonnet-5",
-      haikuModel: "gemini-3.8-flash",
+      haikuModel: "haiku-4.5",
     };
     const noKey = buildCcSwitchDeepLink(base);
     expect(noKey).toBeNull();
@@ -238,7 +375,9 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
     expect(p.get("endpoint")).toBe("https://x.example/api/anthropic");
     // 模型名是家族 id,不带思考档位:深度由用户在 Claude Code 里设置。
     expect(p.get("model")).toBe("fable-5.1");
-    expect(p.get("haikuModel")).toBe("gemini-3.8-flash");
+    // opus 位独立于主模型:Claude Code 的 /model opus 走 ANTHROPIC_DEFAULT_OPUS_MODEL。
+    expect(p.get("opusModel")).toBe("opus-5");
+    expect(p.get("haikuModel")).toBe("haiku-4.5");
     expect(p.get("apiKey")).toBe(COMPLETE_KEY);
     expect(withKey).not.toMatch(/cursor/i);
     expect(withKey).not.toMatch(/-(low|medium|high|xhigh|max)(&|$)/);
@@ -373,8 +512,10 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
       return el;
     });
     expect(env.textContent).toContain(`ANTHROPIC_BASE_URL=${window.location.origin}/api/anthropic`);
+    // 四个模型位各自独立:主 fable-5.1、opus 位 opus-5、sonnet 位 sonnet-5、轻量位 haiku-4.5。
+    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_OPUS_MODEL=opus-5\n");
     expect(env.textContent).toContain("ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet-5\n");
-    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-3.8-flash\n");
+    expect(env.textContent).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-4.5\n");
     expect(env.textContent).toContain("ANTHROPIC_AUTH_TOKEN='oc-cc.<你的密钥>");
     // 让 Claude Code 对本站(非内置)模型名也发送 effort。
     expect(env.textContent).toContain("export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1");
@@ -386,7 +527,8 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     };
     expect(cfg.env.ANTHROPIC_BASE_URL).toBe(`${window.location.origin}/api/anthropic`);
     expect(cfg.env.ANTHROPIC_MODEL).toBe("fable-5.1");
-    expect(cfg.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("gemini-3.8-flash");
+    expect(cfg.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("opus-5");
+    expect(cfg.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("haiku-4.5");
     expect(cfg.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT).toBe("1");
     // 思考深度说明:在 Claude Code 里自己设;带档位后缀的旧写法仍可用于钉死档位。
     const effortGuide = screen.getByTestId("guide-effort");
@@ -407,12 +549,58 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     // 产品硬要求:API 接入页任何可见文本都不出现 cursor(CSS class 不算文本)。
     expect(document.body.textContent).not.toMatch(/cursor/i);
     // 由模型列表推导的家族名以公开 id 展示;两个 fable-5.1 档位折叠成一项。
+    // 教程只列「默认集 ∩ 实际可用」:gemini-3.8-flash 虽可用但不在默认集里,不出现在这里。
     const guideEnv = screen.getByTestId("guide-env");
     expect(within(guideEnv).getAllByText("fable-5.1").length).toBe(1);
+    expect(within(guideEnv).getAllByText("opus-5").length).toBe(1);
     expect(within(guideEnv).getAllByText("sonnet-5").length).toBe(1);
-    expect(within(guideEnv).getAllByText("gemini-3.8-flash").length).toBe(1);
+    expect(within(guideEnv).getAllByText("haiku-4.5").length).toBe(1);
+    expect(within(guideEnv).queryByText("gemini-3.8-flash")).not.toBeInTheDocument();
+    // opus-4.8 在默认集里但本次列表没有 → 交集里也没有它。
+    expect(within(guideEnv).queryByText("opus-4.8")).not.toBeInTheDocument();
     expect(screen.queryByText(/cursor-fable/)).not.toBeInTheDocument();
     expect(screen.queryByText("fable-5.1-low")).not.toBeInTheDocument();
+  });
+
+  test("默认模型集:列表拉取失败 → 教程展示五个默认家族;opus 位选 opus-5、轻量位选 haiku-4.5", async () => {
+    vi.mocked(api.getPublicModels).mockRejectedValue(new Error("boom"));
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    await waitFor(() => expect(api.getPublicModels).toHaveBeenCalled());
+    const guideEnv = screen.getByTestId("guide-env");
+    for (const family of ["fable-5.1", "opus-5", "opus-4.8", "sonnet-5", "haiku-4.5"]) {
+      expect(within(guideEnv).getAllByText(family).length).toBeGreaterThan(0);
+    }
+    const env = screen.getByTestId("env-snippet").textContent ?? "";
+    expect(env).toContain("ANTHROPIC_MODEL=fable-5.1\n");
+    expect(env).toContain("ANTHROPIC_DEFAULT_OPUS_MODEL=opus-5\n");
+    expect(env).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-4.5\n");
+    expect(document.body.textContent).not.toMatch(/cursor/i);
+  });
+
+  test("默认集与可用列表求交:只列交集且顺序按默认集,退化位按可用列表回退", async () => {
+    // 可用:grok(不在默认集)/ haiku-4.5 / fable-5.1 —— 交集 = fable-5.1, haiku-4.5。
+    vi.mocked(api.getPublicModels).mockResolvedValue({
+      models: [
+        { id: "cursor-grok-4.6-high", display_name: "Grok 4.6", engine: "cursor" as const },
+        { id: "cursor-haiku-4.5", display_name: "Haiku 4.5", engine: "cursor" as const },
+        { id: "cursor-fable-5.1-high", display_name: "Fable 5.1", engine: "cursor" as const },
+      ],
+      lockedModels: [],
+    });
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    const families = await waitFor(() => {
+      const list = screen.getAllByTestId("guide-family").map((el) => el.textContent);
+      if (!list.includes("haiku-4.5")) throw new Error("not yet");
+      return list;
+    });
+    expect(families).toEqual(["fable-5.1", "haiku-4.5"]);
+    // 主模型仍是 fable-5.1;opus 位默认 opus-5 不可用 → 按 /^(opus|fable)-/ 退到 fable-5.1。
+    const env = screen.getByTestId("env-snippet").textContent ?? "";
+    expect(env).toContain("ANTHROPIC_MODEL=fable-5.1\n");
+    expect(env).toContain("ANTHROPIC_DEFAULT_OPUS_MODEL=fable-5.1\n");
+    expect(env).toContain("ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-4.5\n");
   });
 
   test("创建密钥后:片段 / JSON / 深链都带上明文,深链提示「已包含刚创建的密钥」", async () => {
@@ -508,7 +696,7 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     await keyRow("11");
     await waitFor(() => expect(api.getPublicModels).toHaveBeenCalled());
     expect(screen.getByTestId("env-snippet").textContent).toContain("ANTHROPIC_MODEL=fable-5.1\n");
-    expect(screen.getAllByText("gemini-3.8-flash").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("haiku-4.5").length).toBeGreaterThan(0);
     expect(screen.queryByText("加载 API Key 失败")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/cursor/i);
   });
@@ -640,8 +828,225 @@ describe("ApiKeyUsagePanel · 消耗统计", () => {
     render(<ApiKeyUsagePanel auth={auth} keys={[]} />);
     expect(await screen.findByText("加载 API Key 消耗统计失败")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "重试" }));
-    expect(await screen.findByText("该时段暂无 API Key 用量。")).toBeInTheDocument();
-    expect(screen.getByText("该时段暂无模型用量。")).toBeInTheDocument();
-    expect(screen.getByText("该时段暂无请求记录。")).toBeInTheDocument();
+    // 空态文案除了"空",还要说清为什么空 / 下一步做什么。
+    expect(await screen.findByText(/该时段暂无 API Key 用量。/)).toBeInTheDocument();
+    expect(screen.getByText(/该时段暂无模型用量。/)).toBeInTheDocument();
+    expect(screen.getByText(/该时段暂无请求记录。/)).toBeInTheDocument();
+    expect(screen.getByText(/换更长的时间窗口/)).toBeInTheDocument();
+  });
+
+  test("最近明细「加载更多」打新端点、结果追加;next_before=null 后换成「已到底」", async () => {
+    // 第一页满 50 条 → 才认为可能还有下一页。
+    const first = Array.from({ length: 50 }, (_, i) => recentRow(String(900 - i)));
+    vi.mocked(api.getApiKeyUsage).mockResolvedValue(makeReport({ recent: first }));
+    fetchRoutes.recent = [
+      {
+        window: "7d",
+        key_id: null,
+        entries: [recentRow("800", { cost_credits: "77" })],
+        next_before: "800",
+      },
+      { window: "7d", key_id: null, entries: [recentRow("700")], next_before: null },
+    ];
+    render(<ApiKeyUsagePanel auth={auth} keys={KEYS} />);
+    const more = await screen.findByTestId("recent-load-more");
+    expect(screen.getByText("已显示 50 条")).toBeInTheDocument();
+
+    fireEvent.click(more);
+    await waitFor(() => expect(screen.getByText("已显示 51 条")).toBeInTheDocument());
+    // 游标 = 已加载的最后一行 id;窗口一并带上,且默认「全部密钥」时不带 key_id。
+    const url = new URL(lastFetch("/api/me/api-keys/usage/recent"), "https://x.example");
+    expect(url.pathname).toBe("/api/me/api-keys/usage/recent");
+    expect(url.searchParams.get("before")).toBe("851");
+    expect(url.searchParams.get("window")).toBe("7d");
+    expect(url.searchParams.get("key_id")).toBeNull();
+    // 追加的行确实进了表。
+    const recent = screen.getByRole("table", { name: /最近 API Key 请求/ });
+    expect(within(recent).getByText("77")).toBeInTheDocument();
+
+    // 第二页 next_before=null → 到底,按钮消失换成「已到底」。
+    fireEvent.click(screen.getByTestId("recent-load-more"));
+    await waitFor(() => expect(screen.getByText("已到底")).toBeInTheDocument());
+    expect(screen.queryByTestId("recent-load-more")).not.toBeInTheDocument();
+    expect(screen.getByText("已显示 52 条")).toBeInTheDocument();
+
+    // 换窗口 → 重置分页,不再残留上一窗口翻出来的行。
+    fireEvent.click(screen.getByRole("tab", { name: "24 小时" }));
+    await waitFor(() => expect(screen.getByText("已显示 50 条")).toBeInTheDocument());
+  });
+
+  test("第一页不满页时直接判「已到底」,不打分页端点", async () => {
+    render(<ApiKeyUsagePanel auth={auth} keys={KEYS} />);
+    expect(await screen.findByText("已到底")).toBeInTheDocument();
+    expect(screen.queryByTestId("recent-load-more")).not.toBeInTheDocument();
+    expect(countFetch("/api/me/api-keys/usage/recent")).toBe(0);
+  });
+
+  test("by_model 11 行 → 出现分页,每页 10,能翻到第 2 页", async () => {
+    // 用非目录 id:publicCursorModelId 只对真实 cursor 目录项剥前缀,这里要的是"11 行"本身。
+    const models = Array.from({ length: 11 }, (_, i) => ({
+      model: `m${i}-low`,
+      requests: "1",
+      input_tokens: "1",
+      output_tokens: "1",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      credits: "1",
+    }));
+    vi.mocked(api.getApiKeyUsage).mockResolvedValue(makeReport({ by_model: models }));
+    render(<ApiKeyUsagePanel auth={auth} keys={KEYS} />);
+    const byModel = await screen.findByRole("table", { name: /按模型用量/ });
+    expect(within(byModel).getAllByText(/^m\d+-low$/)).toHaveLength(10);
+    expect(within(byModel).getByText("m0-low")).toBeInTheDocument();
+    expect(within(byModel).queryByText("m10-low")).not.toBeInTheDocument();
+    expect(screen.getByText("第 1/2 页")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "按模型·下一页" }));
+    await waitFor(() => expect(within(byModel).getByText("m10-low")).toBeInTheDocument());
+    expect(within(byModel).getAllByText(/^m\d+-low$/)).toHaveLength(1);
+    expect(screen.getByText("第 2/2 页")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "按模型·下一页" })).toBeDisabled();
+
+    // by_key 只有 2 行 → 不渲染分页控件(十行以内不加噪音)。
+    expect(screen.queryByTestId("pager-按密钥")).not.toBeInTheDocument();
+  });
+});
+
+describe("ApiKeyAuditPanel · 请求审计", () => {
+  test("默认拉 limit=20;「只看失败」开关重新请求且带 errors_only=1", async () => {
+    fetchRoutes.messages = [{ entries: [auditRow("501")], next_before: null }];
+    render(<ApiKeyAuditPanel auth={auth} keys={KEYS} />);
+    await waitFor(() => expect(countFetch("/api/me/api-keys/messages")).toBe(1));
+    let url = new URL(lastFetch("/api/me/api-keys/messages"), "https://x.example");
+    expect(url.searchParams.get("limit")).toBe("20");
+    expect(url.searchParams.get("errors_only")).toBeNull();
+    expect(await screen.findByText("帮我看下这段代码")).toBeInTheDocument();
+    // 档位 + 来源(0280 的 classifier 侧查询)与耗时可读。
+    expect(screen.getByText("low · 分类器")).toBeInTheDocument();
+    expect(screen.getByText("820ms")).toBeInTheDocument();
+    // 内部 id 不外泄。
+    expect(document.body.textContent).not.toMatch(/cursor/i);
+
+    fireEvent.click(screen.getByRole("switch", { name: "只看失败" }));
+    await waitFor(() => expect(countFetch("/api/me/api-keys/messages")).toBe(2));
+    url = new URL(lastFetch("/api/me/api-keys/messages"), "https://x.example");
+    expect(url.searchParams.get("errors_only")).toBe("1");
+
+    // key 筛选也进查询串。
+    fireEvent.change(screen.getByRole("combobox", { name: "审计按密钥过滤" }), {
+      target: { value: "11" },
+    });
+    await waitFor(() => expect(countFetch("/api/me/api-keys/messages")).toBe(3));
+    url = new URL(lastFetch("/api/me/api-keys/messages"), "https://x.example");
+    expect(url.searchParams.get("key_id")).toBe("11");
+    expect(url.searchParams.get("errors_only")).toBe("1");
+  });
+
+  test("「加载更多」带 before 游标追加;到底后按钮消失", async () => {
+    fetchRoutes.messages = [
+      { entries: [auditRow("501")], next_before: "501" },
+      {
+        entries: [auditRow("400", { last_user_message: "第二页的消息" })],
+        next_before: null,
+      },
+    ];
+    render(<ApiKeyAuditPanel auth={auth} keys={KEYS} />);
+    const more = await screen.findByTestId("audit-load-more");
+    fireEvent.click(more);
+    await waitFor(() => expect(screen.getByText("第二页的消息")).toBeInTheDocument());
+    const url = new URL(lastFetch("/api/me/api-keys/messages"), "https://x.example");
+    expect(url.searchParams.get("before")).toBe("501");
+    await waitFor(() =>
+      expect(screen.queryByTestId("audit-load-more")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("已到底")).toBeInTheDocument();
+    expect(screen.getByText("已显示 2 条")).toBeInTheDocument();
+  });
+
+  test("用户消息含 <script> 时只作为文本渲染,不产生真实节点;长消息可展开", async () => {
+    const evil = `<script>alert("xss")</script><img src=x onerror=alert(1)>`;
+    const long = `${evil}${"很".repeat(200)}`;
+    fetchRoutes.messages = [
+      { entries: [auditRow("501", { last_user_message: long })], next_before: null },
+    ];
+    render(<ApiKeyAuditPanel auth={auth} keys={KEYS} />);
+    const pre = await screen.findByTestId("audit-message");
+    // 折叠态:截到 120 字 + 省略号。
+    expect(pre.textContent?.length).toBe(121);
+    expect(pre.textContent).toContain("<script>");
+    // 关键:标签是文本,不是 DOM —— 页面里不存在 script / img 节点。
+    expect(document.querySelector("script")).toBeNull();
+    expect(document.querySelector("img")).toBeNull();
+    expect(pre.innerHTML).toContain("&lt;script&gt;");
+
+    fireEvent.click(screen.getByRole("button", { name: "展开" }));
+    await waitFor(() => expect(screen.getByTestId("audit-message").textContent).toBe(long));
+    expect(document.querySelector("script")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "收起" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("audit-message").textContent?.length).toBe(121),
+    );
+  });
+
+  test("非 admin(端点 403)整段不渲染;失败态可重试;空态区分「只看失败」", async () => {
+    // 403 = 角色变更竞态兜底,与 ApiKeysSection 同策略:隐藏而不是报错。
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      fetched.push(String(input));
+      return {
+        ok: false,
+        status: 403,
+        json: async () => ({ error: { code: "FORBIDDEN" } }),
+      } as unknown as Response;
+    });
+    const view = render(<ApiKeyAuditPanel auth={auth} keys={KEYS} />);
+    await waitFor(() => expect(countFetch("/api/me/api-keys/messages")).toBe(1));
+    await waitFor(() =>
+      expect(document.querySelector("[data-api-key-audit]")).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText("请求审计")).not.toBeInTheDocument();
+    view.unmount();
+
+    // 500 不是隐藏,而是可重试的错误提示。
+    let call = 0;
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      fetched.push(String(input));
+      call += 1;
+      if (call === 1) return { ok: false, status: 500, json: async () => ({}) } as Response;
+      return jsonResponse({ entries: [], next_before: null });
+    });
+    render(<ApiKeyAuditPanel auth={auth} keys={KEYS} />);
+    expect(await screen.findByText("加载请求审计失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText(/暂无审计记录。/)).toBeInTheDocument();
+    // 开「只看失败」后的空态文案不同(告诉用户这是好事 + 怎么看全部)。
+    fireEvent.click(screen.getByRole("switch", { name: "只看失败" }));
+    expect(await screen.findByText(/该筛选下没有失败请求/)).toBeInTheDocument();
+  });
+});
+
+describe("ApiKeysSection · 密钥列表分页", () => {
+  test("11 把密钥 → 每页 10 条 + 翻页;第 2 页显示剩下 1 条", async () => {
+    const many: ApiKeySummary[] = Array.from({ length: 11 }, (_, i) => ({
+      ...KEYS[0],
+      id: String(100 + i),
+      label: `key-${i}`,
+    }));
+    vi.mocked(api.listApiKeys).mockResolvedValue(many);
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("100");
+    const list = screen.getByTestId("api-keys-list");
+    expect(within(list).getAllByText(/^key-\d+$/)).toHaveLength(10);
+    expect(within(list).queryByText("key-10")).not.toBeInTheDocument();
+    expect(screen.getByText("第 1/2 页")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "密钥列表·下一页" }));
+    await waitFor(() => expect(within(list).getByText("key-10")).toBeInTheDocument());
+    expect(within(list).getAllByText(/^key-\d+$/)).toHaveLength(1);
+  });
+
+  test("≤10 把密钥不渲染分页控件", async () => {
+    render(<ApiAccessTab auth={auth} />);
+    await keyRow("11");
+    expect(screen.queryByTestId("pager-密钥列表")).not.toBeInTheDocument();
   });
 });
