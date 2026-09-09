@@ -139,6 +139,7 @@ function Harness() {
       pending: m._controlPending === true,
       detached: m._detachedAskUser === true,
       truncated: m._inputTruncated === true,
+      expiresAt: m._askUserExpiresAt ?? null,
     }));
 
   useEffect(() => {

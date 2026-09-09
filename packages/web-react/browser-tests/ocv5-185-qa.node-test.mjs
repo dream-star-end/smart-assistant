@@ -508,7 +508,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
   let browser;
   const failures = [];
 
-  async function openPage(context, query) {
+  async function openPage(context, query, clockMs) {
     const page = await context.newPage();
     page.setDefaultTimeout(20_000);
     const errors = [];
@@ -531,6 +531,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         }
       });
     });
+    if (clockMs !== undefined) await page.clock.install({ time: clockMs });
     await page.goto(`${origin}/?${query}`);
     await page.getByTestId("qa-root").waitFor();
     await page.waitForFunction(() => {
@@ -1532,7 +1533,7 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         const ctx = await browser.newContext();
         let page;
         try {
-          page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1${split ? "&split=1" : ""}`);
+          page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1${split ? "&split=1" : ""}`, nowMs());
           await page.evaluate(() => window.__qa.loadSession());
           await page.getByRole("dialog").waitFor({ state: "visible" });
           assert.equal(await page.getByRole("dialog").count(), 1);
@@ -1554,8 +1555,9 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
           assert.equal(store.responses.length, 0, "close/reopen cannot respond");
           await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
           await bar.waitFor({ state: "visible" });
-          row.expiresAt = nowMs() + 1500;
-          await page.evaluate(() => window.__qa.loadSnapshot());
+          const cardExpiry = await page.evaluate((id) => window.__qa.getState().cards.find((c) => c.requestId === id)?.expiresAt, row.requestId);
+          assert.equal(cardExpiry, row.expiresAt, "browser must hold the original absolute expiry, not an ignored snapshot update");
+          await page.clock.fastForward(Math.max(0, row.expiresAt - await page.evaluate(() => Date.now())) + 1);
           await bar.waitFor({ state: "hidden" });
           assert.equal(store.responses.length, 0, "local expiry cannot respond");
           assert.equal(page._qaErrors.length, 0, page._qaErrors.join("\n"));
