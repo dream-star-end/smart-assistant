@@ -15,9 +15,11 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 
-const DEFAULT_TIMEOUT_MS = 1500
+const DEFAULT_TIMEOUT_MS = 2500
 const MIN_TIMEOUT_MS = 200
 const MAX_TIMEOUT_MS = 5000
+const PRECOMPILED_NODE_FLAGS = ['--conditions=openclaude-precompiled']
+const RUN_STARTED_MS = Date.now()
 
 function parseArg(prefix, argv) {
   const flag = argv.find((a) => a.startsWith(prefix))
@@ -58,12 +60,17 @@ function isValidDecisionJson(protocol, text) {
   }
 }
 
+function elapsedMs() {
+  return Math.max(0, Date.now() - RUN_STARTED_MS)
+}
+
 function recordFailOpen(reason, protocol) {
   const rec = {
     ts: new Date().toISOString(),
     event: 'fail_open',
     reason,
     protocol,
+    elapsedMs: elapsedMs(),
   }
   try {
     fs.writeSync(2, `[oc-efficiency-guard] fail-open ${JSON.stringify(rec)}\n`)
@@ -99,6 +106,16 @@ function failOpen(protocol, reason) {
   writeJsonAndExit(allowPayload(protocol))
 }
 
+function resolveTsxArgs(script, extra) {
+  let tsx
+  try {
+    tsx = require.resolve('tsx/cli')
+  } catch {
+    return { error: 'tsx_missing' }
+  }
+  return { args: [tsx, script, ...extra] }
+}
+
 function resolveInnerArgs(argv) {
   const protocol = parseProtocol(argv)
   const mode = parseArg('--mode=', argv) || 'warn'
@@ -106,24 +123,19 @@ function resolveInnerArgs(argv) {
   const extra = [`--protocol=${protocol}`, `--mode=${mode}`]
   if (override) {
     if (override.endsWith('.ts')) {
-      let tsx
-      try {
-        tsx = require.resolve('tsx/cli')
-      } catch {
-        return { error: 'tsx_missing' }
-      }
-      return { args: [tsx, override, ...extra] }
+      return resolveTsxArgs(override, extra)
     }
     return { args: [override, ...extra] }
   }
-  const innerTs = path.join(__dirname, 'efficiencyPreToolHook.ts')
-  let tsx
-  try {
-    tsx = require.resolve('tsx/cli')
-  } catch {
-    return { error: 'tsx_missing' }
+  // Runtime-release ships this runner next to the compiled inner. Prefer
+  // that path: tsx + .ts is missing in dist/ and cold-starts past the
+  // previous 1500ms budget even when the source file exists.
+  const innerJs = path.join(__dirname, 'efficiencyPreToolHook.js')
+  if (fs.existsSync(innerJs)) {
+    return { args: [innerJs, ...extra], nodeFlags: PRECOMPILED_NODE_FLAGS }
   }
-  return { args: [tsx, innerTs, ...extra] }
+  const innerTs = path.join(__dirname, 'efficiencyPreToolHook.ts')
+  return resolveTsxArgs(innerTs, extra)
 }
 
 function main() {
@@ -134,8 +146,8 @@ function main() {
   let child
 
   // Kill the whole inner process group, not just the direct child. The
-  // production inner is `tsx -> node`, so killing only `tsx` would orphan the
-  // real hook; the child is spawned `detached` so it owns its own pgid.
+  // tsx fallback is `tsx -> node`; the precompiled path is a single node.
+  // Spawn detached so the child owns its own pgid.
   const killInner = () => {
     if (!child || child.exitCode !== null || child.signalCode !== null) return
     try {
@@ -166,7 +178,8 @@ function main() {
   }
 
   try {
-    child = spawn(process.execPath, resolved.args, {
+    const spawnArgs = [...(resolved.nodeFlags || []), ...resolved.args]
+    child = spawn(process.execPath, spawnArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     })
