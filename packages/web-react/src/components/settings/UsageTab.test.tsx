@@ -441,4 +441,15 @@ describe("UsageTab 会话标题与口径说明", () => {
       ),
     ).toBeInTheDocument();
   });
+
+  test("未绑定聊天项目用量给人话说明并可去项目设置", async () => {
+    projectScopeState.kind = "chat";
+    const onOpenProjectSettings = vi.fn();
+    render(<UsageTab auth={auth} onOpenProjectSettings={onOpenProjectSettings} />);
+    expect(
+      await screen.findByText("当前聊天项目还没绑定任务看板,用量按全部项目统计"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "去项目设置" }));
+    expect(onOpenProjectSettings).toHaveBeenCalledTimes(1);
+  });
 });
