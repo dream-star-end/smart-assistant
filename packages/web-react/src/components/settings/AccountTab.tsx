@@ -69,6 +69,9 @@ export function AccountTab({
   const [err, setErr] = useState<string | null>(null);
   const [ledgerReloadTick, setLedgerReloadTick] = useState(0);
   const [sub, setSub] = useState<MySubscription | null>(null);
+  const [subLoading, setSubLoading] = useState(true);
+  const [subErr, setSubErr] = useState(false);
+  const [subReloadTick, setSubReloadTick] = useState(0);
 
   // 积分收支卡（窗口口径，独立于用量 Tab）。
   const [acctWindow, setAcctWindow] = useState<UsageReportWindow>("30d");
@@ -80,20 +83,28 @@ export function AccountTab({
   // 当前订阅（含双钱包余额明细）；reloadKey 变更（到账）后重拉。
   useEffect(() => {
     let alive = true;
+    setSubLoading(true);
+    setSubErr(false);
     api
       .getMySubscription(auth)
       .then((s) => {
         if (!alive) return;
         setSub(s);
+        setSubErr(false);
         rememberSubscriptionPaid(s.paid);
       })
       .catch(() => {
-        /* 订阅读取失败：仅不显示套餐卡，不阻断账户页 */
+        if (!alive) return;
+        setSub(null);
+        setSubErr(true);
+      })
+      .finally(() => {
+        if (alive) setSubLoading(false);
       });
     return () => {
       alive = false;
     };
-  }, [auth, reloadKey]);
+  }, [auth, reloadKey, subReloadTick]);
 
   // 收支报表：窗口切换 / 到账（reloadKey）/ 重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
@@ -269,7 +280,19 @@ export function AccountTab({
               <Crown size={13} /> 当前套餐
             </div>
             <div className="mt-1 flex items-center gap-2">
-              <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
+              {subLoading ? (
+                <Skeleton className="h-7 w-28" />
+              ) : subErr ? (
+                <button
+                  type="button"
+                  className="rounded text-body text-danger outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => setSubReloadTick((tick) => tick + 1)}
+                >
+                  套餐信息加载失败 · 重试
+                </button>
+              ) : (
+                <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
+              )}
               {sub?.paid && (
                 <span className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
                   到期 {fmtDate(sub.periodEnd)}
@@ -277,8 +300,14 @@ export function AccountTab({
               )}
             </div>
             <div className="mt-1 text-meta text-faint">
-              每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
-              {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
+              {subLoading ? (
+                <Skeleton className="h-4 w-40" />
+              ) : subErr ? null : (
+                <>
+                  每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
+                  {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
+                </>
+              )}
             </div>
           </div>
           <Button variant="secondary" size="sm" onClick={onManageSub} className="shrink-0">

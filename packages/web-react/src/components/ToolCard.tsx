@@ -29,7 +29,7 @@ import {
   normalizeToolForDisplay,
 } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
-import { Badge, Spinner } from "./ui";
+import { Badge, IconButton, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
 
@@ -170,6 +170,7 @@ export function ToolCard({
               : "border-border hover:border-border-strong",
       )}
     >
+      <div className="flex items-stretch">
       <HeaderTag
         {...(hasBody
           ? {
@@ -180,7 +181,7 @@ export function ToolCard({
             }
           : {})}
         className={cn(
-          "flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/70",
         )}
       >
@@ -224,30 +225,6 @@ export function ToolCard({
               完成
             </Badge>
           )}
-          {canInspect && hasBody && (
-            // 表头本身是 <button>(展开/折叠),入口用 role=button 的 span 避免非法嵌套;
-            // stopPropagation 使「打开详情」不连带触发折叠切换。
-            <span
-              role="button"
-              tabIndex={0}
-              aria-label="在详情面板查看"
-              title="在详情面板查看"
-              onClick={(e) => {
-                e.stopPropagation();
-                openInspect();
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  openInspect();
-                }
-              }}
-              className="flex size-6 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <PanelRight size={14} />
-            </span>
-          )}
           {hasBody && (
             <ChevronRight
               size={15}
@@ -257,6 +234,23 @@ export function ToolCard({
           )}
         </span>
       </HeaderTag>
+      {canInspect && hasBody && (
+        <div className="flex shrink-0 items-center pr-2">
+          <IconButton
+            size="sm"
+            shape="square"
+            aria-label="在详情面板查看"
+            title="在详情面板查看"
+            onClick={(e) => {
+              e.stopPropagation();
+              openInspect();
+            }}
+          >
+            <PanelRight size={14} />
+          </IconButton>
+        </div>
+      )}
+      </div>
       {open && hasBody && (
         <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
           <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>

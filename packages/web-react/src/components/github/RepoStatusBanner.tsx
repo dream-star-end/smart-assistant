@@ -2,7 +2,7 @@ import { CheckCircle2, GitBranch, Loader2, TriangleAlert, X } from "lucide-react
 import { repoStatusText } from "../../lib/github";
 import type { RepoSelection } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Progress } from "../ui";
+import { Button, Progress } from "../ui";
 
 /**
  * 会话顶部的仓库克隆状态条。pending/cloning 显进度（cloning 走本地估算曲线），
@@ -12,10 +12,12 @@ export function RepoStatusBanner({
   selection,
   progressPct,
   onDismiss,
+  onRetry,
 }: {
   selection: RepoSelection;
   progressPct: number;
   onDismiss: () => void;
+  onRetry?: () => void;
 }) {
   if (!selection.selected) return null;
   const status = selection.status;
@@ -52,6 +54,11 @@ export function RepoStatusBanner({
             <div className="mt-0.5 truncate opacity-80">{selection.error_message}</div>
           )}
         </div>
+        {status === "failed" && onRetry && (
+          <Button type="button" size="sm" variant="secondary" onClick={onRetry}>
+            重试
+          </Button>
+        )}
         {(status === "failed" || status === "ready") && (
           <button
             type="button"

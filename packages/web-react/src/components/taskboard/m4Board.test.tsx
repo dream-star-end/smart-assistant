@@ -647,4 +647,25 @@ describe('Taskboard/Cost/Weekly 范围不发全局请求', () => {
     const workSelect = screen.getByTestId('project-scope-select-work')
     expect(workSelect).toBeInTheDocument()
   })
+
+  test('chat 未绑定提供去项目设置绑定', async () => {
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([sampleProject()])
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    const onOpenProjectSettings = vi.fn()
+    scopeState.kind = 'chat'
+    wrap(
+      <TaskboardView
+        auth={auth}
+        view="board"
+        ticketId={null}
+        onViewChange={() => {}}
+        onOpenTicket={() => {}}
+        onOpenMobileNav={() => {}}
+        onOpenProjectSettings={onOpenProjectSettings}
+      />,
+    )
+    expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '去项目设置绑定' }))
+    expect(onOpenProjectSettings).toHaveBeenCalledWith('chat-unbound')
+  })
 })
