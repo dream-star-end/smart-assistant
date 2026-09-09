@@ -3160,6 +3160,12 @@ export function App() {
                 setBoardOpen(false);
                 selectSession(id);
               }}
+              onOpenProjectSettings={(projectId) => {
+                const p = projects.find((x) => x.id === projectId);
+                if (!p) return;
+                setUngroupedAssetsOpen(false);
+                setProjectSettings(p);
+              }}
             />
           </LazyBoundary>
         ) : (
@@ -3210,6 +3216,10 @@ export function App() {
             selection={repo.selection}
             progressPct={repo.progressPct}
             onDismiss={repo.dismissBanner}
+            onRetry={() => {
+              const sel = repo.selection;
+              if (sel?.selected) void repo.confirm(sel.owner, sel.repo, sel.branch);
+            }}
           />
         )}
 
@@ -3375,6 +3385,12 @@ export function App() {
               onDismiss={inflightDelegates.dismiss}
             />
           )}
+          {!demo && !gated && (
+            <div
+              id="pending-approval-bar-slot"
+              className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
+            />
+          )}
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
@@ -3520,6 +3536,13 @@ export function App() {
             onOpenMemory={() => openManage("optimization")}
             onOpenManage={() => openManage("connectors")}
             onOpenRepo={demo ? undefined : openRepo}
+            onOpenProjectSettings={() => {
+              const pid = sessions.find((s) => s.id === activeId)?.projectId;
+              const p = pid ? projects.find((x) => x.id === pid) : null;
+              if (!p) return;
+              setUngroupedAssetsOpen(false);
+              setProjectSettings(p);
+            }}
             subscribeOpenSignal={subscribeOpenSignal}
           />
         </LazyBoundary>

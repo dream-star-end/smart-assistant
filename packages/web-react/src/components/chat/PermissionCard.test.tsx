@@ -517,6 +517,64 @@ describe("isAwaitingPermissionPrompt（INC-20260904 fix C 的活提问判据）"
   });
 });
 
+describe("PermissionCard 关掉≠作答（pending-approval-bar）", () => {
+  /** overlay 与关闭按钮都走 onOpenChange(false)；jsdom 下 Radix overlay 不一定吞点击，关钮兜底。 */
+  function dismissWithoutAnswering() {
+    const overlay = document.body.querySelector(".bg-black\\/40");
+    if (overlay) {
+      fireEvent.pointerDown(overlay);
+      fireEvent.click(overlay);
+    }
+    const closeBtn = screen.queryByRole("button", { name: "关闭" });
+    if (closeBtn) fireEvent.click(closeBtn);
+  }
+
+  test("overlay 关闭后 bar 出现", () => {
+    render(<PermissionCard msg={askMsg({ requestId: "req-bar-overlay" })} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    dismissWithoutAnswering();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("pending-approval-bar")).toHaveTextContent("智能体在等你确认");
+  });
+
+  test("点 bar 重开", () => {
+    render(<PermissionCard msg={askMsg({ requestId: "req-bar-reopen" })} onRespond={vi.fn()} livePrompt />);
+    dismissWithoutAnswering();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+  });
+
+  test("作答后 bar 消失", () => {
+    const onRespond = vi.fn();
+    const msg = askMsg({ requestId: "req-bar-answered" });
+    const { rerender } = render(<PermissionCard msg={msg} onRespond={onRespond} livePrompt />);
+    dismissWithoutAnswering();
+    expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    fireEvent.click(screen.getByRole("button", { name: "跳过" }));
+    expect(onRespond).toHaveBeenCalled();
+    rerender(
+      <PermissionCard
+        msg={{ ...msg, _resolved: true, _behavior: "deny" }}
+        onRespond={onRespond}
+        livePrompt
+      />,
+    );
+    expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+  });
+
+  test("未调用 onRespond", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={askMsg({ requestId: "req-bar-no-respond" })} onRespond={onRespond} livePrompt />);
+    dismissWithoutAnswering();
+    expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+});
+
 describe("跨包契约", () => {
   // 前端改不动 gateway 常量（那是容器内源码面 / runtime release 轴），只能镜像。数值一旦漂移,
   // 孤儿判定就会与服务端 sweep 错位:偏大 → 骚扰窗口回来;偏小 → 真正在等的 agent 被静默。
