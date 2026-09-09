@@ -3487,9 +3487,9 @@ export function App() {
         onOpenChange={(o) => {
           if (!o) setInspectTarget(null);
         }}
-        side="right"
+        side="bottom"
         srTitle="产物详情"
-        className="w-[min(92vw,26rem)] md:hidden"
+        className="md:hidden"
         overlayClassName="md:hidden"
       >
         {inspectTarget && (
