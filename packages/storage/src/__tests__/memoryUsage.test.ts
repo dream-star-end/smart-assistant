@@ -32,6 +32,56 @@ describe('memory usage observability', () => {
     )
   })
 
+  test('strips system-injected guard/continuation text before current-fact classification', () => {
+    const guard = `<oc-efficiency-guard>
+平台效率护栏(本轮提醒,不是用户原话):
+- 纠正: 不要轮询现网服务运行状态或线上 release。
+</oc-efficiency-guard>`
+    const transientRetry = '上一条消息因上游瞬时错误中断，请继续完成该任务。'
+    const recoveryPrefix =
+      '继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。'
+    const recoveryFull =
+      '继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。这是一条断点续接指令，不是重放原始请求：不要重新执行已经完成的步骤，不要重复已经输出的内容。若中断前有外部写操作或部署操作，先查询其当前可观察状态（如 release 指针、进程、日志、健康检查或目标资源）并据此继续。只有在无法通过查询区分成功或失败、且重复执行可能造成不可逆后果时，才明确说明具体无法确认的操作和风险，并仅询问完成任务所必需的决定；不要泛泛要求用户再说“继续”。'
+
+    assert.equal(memory.stripSystemInjectedPrefix(`${guard}\n\n帮我解释这段代码`), '帮我解释这段代码')
+    assert.equal(memory.classifyCurrentFactIntent(`${guard}\n\n帮我解释这段代码`).current, false)
+    assert.deepEqual(memory.classifyCurrentFactIntent(`${guard}\n\n当前 healthz 状态`), {
+      current: true,
+      kind: 'runtime_status',
+    })
+    assert.deepEqual(memory.classifyCurrentFactIntent(`${guard}\n\nhealthz`), {
+      current: true,
+      kind: 'direct_status',
+    })
+
+    assert.deepEqual(memory.classifyCurrentFactIntent(transientRetry), { current: false, kind: null })
+    assert.deepEqual(memory.classifyCurrentFactIntent(recoveryPrefix), { current: false, kind: null })
+    assert.deepEqual(memory.classifyCurrentFactIntent(recoveryFull), { current: false, kind: null })
+    assert.equal(memory.stripSystemInjectedPrefix(transientRetry), '')
+    assert.equal(memory.stripSystemInjectedPrefix(recoveryPrefix), '')
+    assert.equal(memory.stripSystemInjectedPrefix(recoveryFull), '')
+
+    assert.equal(memory.classifyCurrentFactIntent(`${transientRetry}\n\n帮我解释这段代码`).current, false)
+    assert.deepEqual(
+      memory.classifyCurrentFactIntent(`${transientRetry}\n\n当前 healthz 状态`),
+      memory.classifyCurrentFactIntent('当前 healthz 状态'),
+    )
+    assert.deepEqual(
+      memory.classifyCurrentFactIntent(`${recoveryPrefix}\n\n当前 healthz 状态`),
+      memory.classifyCurrentFactIntent('当前 healthz 状态'),
+    )
+    assert.deepEqual(
+      memory.classifyCurrentFactIntent(`${recoveryFull}\n\n帮我解释这段代码`),
+      { current: false, kind: null },
+    )
+    assert.deepEqual(
+      memory.classifyCurrentFactIntent(`${recoveryFull}\n\n当前 healthz 状态`),
+      memory.classifyCurrentFactIntent('当前 healthz 状态'),
+    )
+    assert.equal(memory.classifyCurrentFactIntent(`${guard}\n\n${transientRetry}`).current, false)
+    assert.deepEqual(memory.RECOVERY_CONTINUATION_PREFIXES, [transientRetry, recoveryPrefix])
+  })
+
   test('records exact operations without persisting raw query or session key centrally', async () => {
     const sessionKey = 'agent:main:webchat:dm:memory-usage-test'
     await memory.beginMemoryTurnObservation({
