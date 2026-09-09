@@ -77,6 +77,11 @@ try {
 } finally {
   clearTimeout(timer);
   await adapter.shutdown();
+  result.transport = adapter.getRequestStats();
+  result.noSdkReplayOrPassthrough = result.transport.messages === 2
+    && result.transport.inferenceAttempts === 2 + result.transport.toolCorrections
+    && result.transport.passthroughAttempts === 0;
+  if (!result.noSdkReplayOrPassthrough) { result.phase = 'failed'; process.exitCode = 1; }
   writeFileSync(report, JSON.stringify(result, null, 2), { mode: 0o600 });
   console.log(JSON.stringify(result));
 }

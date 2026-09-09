@@ -1257,6 +1257,12 @@ export class CursorSandRelay {
   private readonly upstreamLabel: string
   private readonly boxResolver?: CursorSandBoxResolver
   private readonly boxResponses = new WeakMap<Response, CursorSandBoxConnection>()
+  private readonly requestStats = { messages: 0, inferenceAttempts: 0, toolCorrections: 0, passthroughAttempts: 0 }
+
+  /** Non-secret counters for an isolated live smoke; never exposes request bodies or tickets. */
+  getRequestStats(): Readonly<{ messages: number; inferenceAttempts: number; toolCorrections: number; passthroughAttempts: number }> {
+    return { ...this.requestStats }
+  }
 
   constructor(deps: RelayDeps = {}) {
     this.credentialKind = deps.credentialKind ?? 'api_key'
@@ -1306,6 +1312,7 @@ export class CursorSandRelay {
     res: ServerResponse,
     signal: AbortSignal,
   ): Promise<void> {
+    this.requestStats.passthroughAttempts++
     const target = this.passthrough
     if (!target) {
       res.statusCode = 400
@@ -1570,6 +1577,7 @@ export class CursorSandRelay {
     const box = await this.boxResolver?.resolve(token, this.machineId, signal)
     let response: Response
     try {
+      this.requestStats.inferenceAttempts++
       response = await this.fetchUpstream(
         box?.url ?? `${this.deps.upstreamBaseUrl}/aiserver.v1.InferenceService/Stream`,
         box ? { ...init, headers: cursorSandBoxHeaders(box, headers), redirect: 'error' } : init,
@@ -1599,6 +1607,7 @@ export class CursorSandRelay {
     options: ServeMessagesOptions = {},
   ): Promise<CursorSandServeResult> {
     this.onRequestForTest?.(structuredClone(body))
+    this.requestStats.messages++
     let opened: { response: Response; upstreamModel: string }
     try {
       opened = await this.openInference(body, signal)
@@ -1667,6 +1676,7 @@ export class CursorSandRelay {
       return this.pipeNonStreaming(upstream, opened.upstreamModel, echoModel, advertisedTools(body.tools), res)
     }
     const retryInvalidTool = async (invalidResponse: string): Promise<Response> => {
+      this.requestStats.toolCorrections++
       const retry = await this.openInference(correctedToolBody(body, invalidResponse), signal)
       if (!retry.response.ok || !retry.response.body) {
         throw new Error(`CURSOR_SAND_RETRY_HTTP_${retry.response.status}`)
@@ -2099,7 +2109,9 @@ export class CursorSandRelay {
       if (pendingText) {
         let recovered = recoverXmlToolCalls(pendingText, allowedTools)
         if (
-          allowedTools.length > 0
+          !state.failed
+          && !streamError
+          && allowedTools.length > 0
           && recovered.tools.length === 0
           && looksLikeInvalidToolIntent(pendingText, allowedTools)
         ) {
@@ -2146,6 +2158,7 @@ export class CursorSandRelay {
           pendingText = recovered.text
           if (
             !collected.state.failed
+            && !streamError
             && collected.state.tools.size === 0
             && recovered.tools.length === 0
             && looksLikeInvalidToolIntent(collected.state.text, allowedTools)
@@ -2270,7 +2283,9 @@ export class CursorSandRelay {
       thinkingSignature = collected.thinkingSignature
       let recovered = recoverXmlToolCalls(state.text, allowedTools)
       if (
-        allowedTools.length > 0
+        !state.failed
+        && !streamError
+        && allowedTools.length > 0
         && state.tools.size === 0
         && recovered.tools.length === 0
         && looksLikeInvalidToolIntent(state.text, allowedTools)
@@ -2292,6 +2307,7 @@ export class CursorSandRelay {
         recovered = recoverXmlToolCalls(state.text, allowedTools)
         if (
           !state.failed
+          && !streamError
           && state.tools.size === 0
           && recovered.tools.length === 0
           && looksLikeInvalidToolIntent(state.text, allowedTools)

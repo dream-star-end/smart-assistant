@@ -2364,7 +2364,7 @@ test('classifyUpstreamReadFailure normalises undici socket wording', () => {
   assert.equal(classifyUpstreamReadFailure(new Error('CURSOR_SAND_TRUNCATED_FRAME'), false), 'CURSOR_SAND_TRUNCATED_FRAME')
 })
 
-function boxProductFixture(mode: 'gate401'|'local429'|'upstream429'|'control401'|'ticket'|'quota') {
+function boxProductFixture(mode: 'gate401'|'local429'|'upstream429'|'control401'|'ticket'|'quota', partialTool = false) {
  const machine='abcdefghijklmnopqrstuvwxyz',subject='box-product-fixture';
  const token=Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url')+'.'+Buffer.from(JSON.stringify({type:'session',sub:subject,exp:Math.floor(Date.now()/1000)+3600})).toString('base64url')+'.'+Buffer.from('synthetic-signature-not-real').toString('base64url');
  const hash=(v:string)=>createHash('sha256').update(v).digest('hex');const calls:Array<{url:string;auth:string|null}>=[];
@@ -2377,7 +2377,7 @@ function boxProductFixture(mode: 'gate401'|'local429'|'upstream429'|'control401'
   if(mode==='local429')return new Response('relay busy',{status:429});
   if(mode==='upstream429')return new Response('quota exceeded',{status:429,headers:{'x-oc-sand-box-upstream':'1'}});
   const error=mode==='ticket'?{code:'unauthenticated',message:'ticket rejected'}:{code:'resource_exhausted',message:'quota exceeded'};
-  return new Response(new Uint8Array(envelope(Buffer.from(JSON.stringify({error})),2)),{headers:{'content-type':'application/connect+proto','x-oc-sand-box-upstream':'1'}});
+  return new Response(new Uint8Array(Buffer.concat([...(partialTool ? [responseFrame('textPart',{text:'tool_call: {\"name\":\"Read\", \"arguments\":'})] : []),envelope(Buffer.from(JSON.stringify({error})),2)])),{headers:{'content-type':'application/connect+proto','x-oc-sand-box-upstream':'1'}});
  }});
  return {relay,calls,token};
 }
@@ -2396,4 +2396,8 @@ test('actual Relay rejection feeds actual Adapter billing chain without poisonin
  for(const mode of ['gate401','local429','control401','upstream429'] as const){const f=boxProductFixture(mode);const recorded:Array<string>=[];const billing:Array<any>=[];const adapter=new CursorSandAdapter({sessionKey:'agent:main:test:box-billing-'+mode,agentId:'main',agentBaseDir:process.cwd(),config:{} as never,model:'cursor-grok-4.6-high',cursorCredentialSelection:{...STABLE_SAND_SELECTION,accountId:'19',credentialKind:'session',machineId:'abcdefghijklmnopqrstuvwxyz'}},f.relay,()=>{
   const summary=(async()=>{const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);return {usage:{cost:0,inputTokens:0,outputTokens:0,cacheReadTokens:0,cacheCreationTokens:0,totalTokens:0},assistantText:'',thinkingText:'',assistantSegments:[],thinkingSegments:[],tools:[],runtimeEvents:[],stopReason:'error',numTurns:1,isError:true,staleResumeId:false,errorDetail:'API Error: '+res.statusCode+' '+res.text(),phantomSignals:{apiState:'called',skipReason:null}};})();return {...inertRun(),summary} as never;
  },r=>recorded.push(r));adapter.on('external_billing',e=>billing.push(e));try{const run=adapter.submitTurn({input:'test',requestId:'a'.repeat(32),onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()});await run.submitted;await run.summary;await new Promise(r=>setImmediate(r));const transport=mode==='gate401'||mode==='local429';assert.deepEqual(recorded,transport?[]:['fail']);assert.equal(billing.length,1);assert.equal(billing[0].cursorAccountId,'19');assert.equal(billing[0].status,transport?'error':'unavailable');assert.equal('cursorSlotResults' in billing[0],!transport);}finally{await adapter.shutdown();}}
+})
+
+for(const model of ['cursor-fable-5-high','cursor-grok-4.6-high'])test(`terminal Box ticket error never enters tool correction: ${model}`,async()=>{
+ const f=boxProductFixture('ticket',true);try{const url=await f.relay.start();for(let request=1;request<=2;request++){const response=await fetch(url+'/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model,stream:true,max_tokens:64,messages:[{role:'user',content:'read the file'}],tools:[{name:'Read',description:'Read a local file',input_schema:{type:'object',properties:{file_path:{type:'string'}},required:['file_path']}}]})});const text=await response.text();assert.match(text,/CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED/);assert.deepEqual({inference:f.calls.filter(c=>c.url.includes('cursorvm.com')).length,controls:f.calls.filter(c=>c.url.includes('GrokBotService')).length},{inference:request,controls:2*request});assert.deepEqual(f.relay.getRequestStats(),{messages:request,inferenceAttempts:request,toolCorrections:0,passthroughAttempts:0});}}finally{await f.relay.close();}
 })

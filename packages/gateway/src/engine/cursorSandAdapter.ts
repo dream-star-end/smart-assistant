@@ -104,6 +104,8 @@ export class CursorSandAdapter extends CcbAdapter {
     }))
   }
 
+  getRequestStats(): ReturnType<CursorSandRelay['getRequestStats']> { return this.relay.getRequestStats() }
+
   private assertLifecycle(generation: number): void {
     if (this.lifecycleClosed || generation !== this.lifecycleGeneration) {
       throw new Error('CURSOR_SAND_ADAPTER_SHUTDOWN')
