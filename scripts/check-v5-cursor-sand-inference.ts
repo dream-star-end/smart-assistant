@@ -182,6 +182,39 @@ try {
     'terminal Box ticket error never enters tool correction: cursor-grok-4.6-high',
   ]) assert.ok(outcomes.some((outcome) => outcome[3] === name), `required contract did not execute: ${name}`)
   console.log('[cursor-sand-box] PASS — isolated Box transport, account health, and terminal no-retry contracts executed')
+
+  // INC-20260909-CURSOR-EMPTY-POOL-MOUNT: execute the real root-filesystem
+  // transitions and production provision path. Docker/PG are substituted here;
+  // diagnostics/cursor-auth-mount-smoke.ts separately tests an actual Docker bind.
+  const mountResult = spawnSync(process.execPath, [
+    '--import', 'tsx', '--test', '--test-reporter=tap',
+    '--test-name-pattern=resolveV5CursorAuthMount|v5 empty managed Cursor',
+    'packages/commercial/src/__tests__/v3Supervisor.test.ts',
+  ], { cwd: root, env, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
+    maxBuffer: 8 * 1024 * 1024, detached: true })
+  if ((mountResult.error || mountResult.signal) && mountResult.pid > 0) {
+    try { process.kill(-mountResult.pid, 'SIGKILL') } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  }
+  process.stdout.write(mountResult.stdout ?? '')
+  process.stderr.write(mountResult.stderr ?? '')
+  assert.ifError(mountResult.error)
+  assert.equal(mountResult.signal, null, 'Cursor mount contract runner terminated by signal')
+  assert.equal(mountResult.status, 0, 'Cursor mount contract runner failed')
+  const mountTap = mountResult.stdout
+  assert.match(mountTap, /^# pass 12$/m, 'all twelve selected mount contracts must execute')
+  for (const label of ['fail', 'cancelled', 'todo']) assert.match(mountTap, new RegExp(`^# ${label} 0$`, 'm'))
+  const mountOutcomes = [...mountTap.matchAll(/^ +ok \d+ - (.+)$/gm)]
+    .map((match) => match[1]).filter((name) => !/#\s*(SKIP|TODO)\b/i.test(name))
+  for (const name of [
+    'empty managed pool keeps the directory mount across 0→1→0→1 atomic publication',
+    ...['symlink', 'dangling-symlink', 'directory', 'fifo', 'public', 'non-root', 'wrong-content']
+      .map((variant) => `empty managed pool rejects ${variant} ownership marker`),
+    'valid managed marker cannot excuse an existing unsafe or dangling key',
+    'v5 empty managed Cursor pool provisions the same read-only bind before a key is ready',
+  ]) assert.ok(mountOutcomes.includes(name), `required mount contract did not execute: ${name}`)
+  console.log('[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)')
 } finally {
   rmSync(sandbox, { recursive: true, force: true })
 }
