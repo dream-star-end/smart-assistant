@@ -7,6 +7,7 @@ import {
   CURSOR_CONTEXT_TIERS,
   CURSOR_CONTEXT_TIER_FAMILIES,
   CURSOR_CONTEXT_TIER_WINDOW,
+  CLASSIFIER_SIDE_QUERY_MAX_TOKENS,
   CURSOR_EFFORT_FAMILIES,
   CURSOR_ENGINE_ID_PREFIX,
   CURSOR_ENGINE_MODELS,
@@ -14,6 +15,7 @@ import {
   cursorFamilyHasEffortAxis,
   cursorFamilyPublicLabel,
   cursorModelIdFromPublic,
+  isClassifierSideQuery,
   parseCursorFamilyPublicId,
   parsePlatformReasoningEffort,
   publicCursorFamilyModelId,
@@ -119,7 +121,8 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    assert.equal(CURSOR_ENGINE_MODELS.length, 60)
+    // 60 + cursor-haiku-4.5 (2026-09-08)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 61)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -244,6 +247,15 @@ describe('Cursor engine model authority', () => {
     assert.equal(cursorFamilyHasEffortAxis('fable-5.1'), true)
     assert.equal(cursorFamilyHasEffortAxis('auto'), false)
     assert.equal(cursorFamilyHasEffortAxis('composer-2.5'), false)
+    // Haiku 4.5 (2026-09-08): single Sand tier `claude-haiku-4-5`, no thinking axis → public id is the family.
+    assert.equal(cursorFamilyHasEffortAxis('haiku-4.5'), false)
+    assert.equal(publicCursorFamilyModelId('cursor-haiku-4.5'), 'haiku-4.5')
+    assert.equal(cursorModelIdFromPublic('haiku-4.5'), 'cursor-haiku-4.5')
+    assert.equal(findCursorEngineModel('haiku-4.5', null, false)?.upstreamModel, 'claude-haiku-4-5')
+    assert.deepEqual(resolveCursorPublicModel('haiku-4.5', 'max'), {
+      internalId: 'cursor-haiku-4.5', family: 'haiku-4.5', effort: null, fast: false, effortSource: 'pinned',
+    })
+    assert.equal(cursorCredentialModelFamily('cursor-haiku-4.5'), 'other_models')
 
     assert.equal(publicCursorFamilyModelId('cursor-fable-5.1-high'), 'fable-5.1')
     assert.equal(publicCursorFamilyModelId('cursor-fable-5.1-low'), 'fable-5.1')
@@ -279,6 +291,24 @@ describe('Cursor engine model authority', () => {
     assert.equal(parseCursorFamilyPublicId('gpt-6-astra'), null)
     assert.equal(parseCursorFamilyPublicId(''), null)
     assert.equal(parseCursorFamilyPublicId(undefined), null)
+  })
+
+  test('isClassifierSideQuery matches Claude Code auto-mode classifier shape only', () => {
+    // yoloClassifier.ts stage 1: max_tokens 64, stop_sequences ['</block>'], no tools.
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: ['</block>'] }), true)
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: ['</block>'], tools: [] }), true)
+    // alwaysOnThinking padding (+2048) still under the cap? No — 2112 > 512; that path only exists for ant builds.
+    assert.equal(isClassifierSideQuery({ max_tokens: 256, stop_sequences: ['</block>'] }), true)
+    // Ordinary chat turn: big max_tokens, no stop_sequences, tools present.
+    assert.equal(isClassifierSideQuery({ max_tokens: 32000, tools: [{ name: 'Bash' }] }), false)
+    assert.equal(isClassifierSideQuery({ max_tokens: 32000, stop_sequences: ['x'] }), false)
+    // Small max_tokens alone is not enough (short chat replies are legitimate).
+    assert.equal(isClassifierSideQuery({ max_tokens: 64 }), false)
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: [] }), false)
+    // Tools present → not a classifier (legacy tool-based classifier is out of scope; it sets tool_choice).
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: ['</block>'], tools: [{ name: 'x' }] }), false)
+    assert.equal(isClassifierSideQuery({}), false)
+    assert.equal(CLASSIFIER_SIDE_QUERY_MAX_TOKENS, 512)
   })
 
   test('parsePlatformReasoningEffort accepts the five platform levels case-insensitively', () => {
@@ -350,6 +380,19 @@ describe('Cursor engine model authority', () => {
     assert.equal(resolveCursorPublicModel('grok-4.5', 'high', () => false), null)
     // Pinned ids do not consult availability — the caller's pricing gate reports them.
     assert.equal(resolveCursorPublicModel('fable-5.1-high', undefined, () => false)?.internalId, 'cursor-fable-5.1-high')
+
+    // Claude Code auto-mode classifier side-query → lowest offered level, regardless of client effort / default.
+    assert.deepEqual(resolveCursorPublicModel('fable-5.1', 'high', () => true, { sideQuery: true }), {
+      internalId: 'cursor-fable-5.1-low', family: 'fable-5.1', effort: 'low', fast: false, effortSource: 'classifier',
+    })
+    assert.equal(resolveCursorPublicModel('sonnet-5', undefined, () => true, { sideQuery: true })?.internalId, 'cursor-sonnet-5-low')
+    // lowest *offered*: low disabled → medium.
+    assert.equal(
+      resolveCursorPublicModel('fable-5.1', 'max', without('cursor-fable-5.1-low'), { sideQuery: true })?.internalId,
+      'cursor-fable-5.1-medium',
+    )
+    // Pinned ids stay pinned even for side-queries (explicit `-high` means high).
+    assert.equal(resolveCursorPublicModel('fable-5.1-high', 'low', () => true, { sideQuery: true })?.effortSource, 'pinned')
 
     // Unknown ids → null.
     assert.equal(resolveCursorPublicModel('gpt-6-astra', 'high'), null)

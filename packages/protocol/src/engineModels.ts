@@ -270,6 +270,7 @@ export type CursorEngineFamilyId =
   | 'sonnet-5'
   | 'gemini-3.8-flash'
   | 'grok-4.5'
+  | 'haiku-4.5'
 
 export const CURSOR_ENGINE_MODELS = [
   {
@@ -819,6 +820,21 @@ export const CURSOR_ENGINE_MODELS = [
     effort: 'high',
     fast: false,
   },
+  // Claude Haiku 4.5 via Cursor Sand (probed live 2026-09-08 against
+  // InferenceService: `claude-haiku-4-5` streams; the `-thinking-*` spellings
+  // return ERROR_BAD_MODEL_NAME). Single tier, no thinking axis — same shape
+  // as composer-2.5, so its public id is just `haiku-4.5`. Fills Claude Code's
+  // ANTHROPIC_DEFAULT_HAIKU_MODEL slot (title generation, background
+  // classifiers) on deployments that have no Anthropic-direct account.
+  {
+    id: 'cursor-haiku-4.5',
+    displayName: 'Haiku 4.5',
+    upstreamModel: 'claude-haiku-4-5',
+    family: 'haiku-4.5',
+    familyLabel: 'Haiku 4.5',
+    effort: null,
+    fast: false,
+  },
 ] as const
 
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
@@ -935,6 +951,39 @@ export type CursorEffortSource =
   | 'clamped'
   /** Client sent no effort → family default. */
   | 'default'
+  /** Request recognised as a Claude Code side-query (auto-mode safety classifier) → lowest offered level. */
+  | 'classifier'
+
+/**
+ * Claude Code's auto-mode permission classifier is a *side query*: before
+ * running Bash / Agent / Write it asks the model "is this action safe?" and
+ * expects an immediate `<block>yes|no</block>` (yoloClassifier.ts stage 1:
+ * `max_tokens: 64`, `stop_sequences: ['</block>']`, `temperature: 0`, no
+ * tools). It reuses the *main* model id, so on the external API-key surface it
+ * inherited the family default (`high`) and spent 13–52 s "thinking" to emit
+ * 7 tokens — long enough for Claude Code to declare the classifier unavailable
+ * and refuse Bash / sub-agents ("fable-5.1 is temporarily unavailable (timed
+ * out), so auto mode cannot determine the safety of Agent"; 2026-09-08).
+ *
+ * Shape-based detection (no header from the client identifies it): tiny
+ * `max_tokens`, a `stop_sequences` list, zero tools. Ordinary chat turns send
+ * 4k–32k `max_tokens` and Claude Code never sets `stop_sequences` on them, so
+ * a false positive requires a deliberately odd client request — and the only
+ * consequence would be a cheaper, faster answer.
+ */
+export const CLASSIFIER_SIDE_QUERY_MAX_TOKENS = 512
+
+export function isClassifierSideQuery(body: {
+  max_tokens?: unknown
+  stop_sequences?: unknown
+  tools?: unknown
+  temperature?: unknown
+}): boolean {
+  if (typeof body.max_tokens !== 'number' || body.max_tokens > CLASSIFIER_SIDE_QUERY_MAX_TOKENS) return false
+  if (!Array.isArray(body.stop_sequences) || body.stop_sequences.length === 0) return false
+  if (Array.isArray(body.tools) && body.tools.length > 0) return false
+  return true
+}
 
 export interface CursorPublicModelResolution {
   internalId: CursorEngineModelId
@@ -969,11 +1018,18 @@ export function parsePlatformReasoningEffort(value: unknown): PlatformReasoningE
  * off lands on `xhigh` instead of a confusing "model not enabled". Returns null
  * when the id names no cursor model or every variant of the family is unavailable
  * (callers fall through to their existing unknown-model handling).
+ *
+ * `options.sideQuery` (see {@link isClassifierSideQuery}): a family-addressed
+ * request recognised as a Claude Code classifier side-query takes the **lowest
+ * offered** level regardless of client effort / family default — a yes/no
+ * answer must come back in seconds. Effort-pinned ids are still honoured
+ * verbatim (an explicit `fable-5.1-high` means exactly that).
  */
 export function resolveCursorPublicModel(
   modelId: string | null | undefined,
   requestedEffort: unknown,
   isAvailable: (internalId: CursorEngineModelId) => boolean = () => true,
+  options: { sideQuery?: boolean } = {},
 ): CursorPublicModelResolution | null {
   const exact = cursorModelIdFromPublic(modelId)
   if (exact) {
@@ -994,6 +1050,12 @@ export function resolveCursorPublicModel(
     return variant !== undefined && isAvailable(variant.id)
   })
   if (ladder.length === 0) return null
+
+  if (options.sideQuery) {
+    const lowest = ladder[0]!
+    const variant = findCursorEngineModel(family, lowest, fast)!
+    return { internalId: variant.id, family, effort: lowest, fast, effortSource: 'classifier' }
+  }
 
   const requested = parsePlatformReasoningEffort(requestedEffort)
   const target = requested ?? cursorFamilyDefaultEffort(family) ?? 'high'
@@ -1032,7 +1094,7 @@ export function cursorCredentialModelFamily(
 export function cursorFamilyDefaultEffort(
   family: CursorEngineFamilyId,
 ): PlatformReasoningEffort | null {
-  if (family === 'auto' || family === 'composer-2.5') return null
+  if (family === 'auto' || family === 'composer-2.5' || family === 'haiku-4.5') return null
   return 'high'
 }
 

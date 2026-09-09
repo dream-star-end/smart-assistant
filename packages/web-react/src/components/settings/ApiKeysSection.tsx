@@ -27,6 +27,7 @@ import {
   useConfirm,
 } from "../ui";
 import { shortTime } from "./labels";
+import { TablePager, useTablePage } from "./TablePager";
 
 /** 外接端点(相对当前 origin)。CC Switch / Claude Code 的 base URL 都填到这一层,`/v1/*` 由客户端拼。 */
 export const API_ACCESS_BASE_PATH = "/api/anthropic";
@@ -36,17 +37,34 @@ export const API_ACCESS_BASE_PATH = "/api/anthropic";
  * 或 /model 滑杆设置,服务端按请求携带的 output_config.effort 选档。若用户实际可用列表里没有,退到列表首项。
  */
 const DEFAULT_MAIN_MODEL = "fable-5.1";
+const DEFAULT_OPUS_MODEL = "opus-5";
 const DEFAULT_SONNET_MODEL = "sonnet-5";
-const DEFAULT_HAIKU_MODEL = "gemini-3.8-flash";
-/** 模型列表拉取失败时的静态家族说明(与目录当前启用的家族一致;真值以 /v1/models 为准)。 */
-const FALLBACK_FAMILIES = [
+const DEFAULT_HAIKU_MODEL = "haiku-4.5";
+/**
+ * 默认接入的模型集合(管理员裁定 2026-09-08):fable 5.1 / opus 5 / opus 4.8 / sonnet 5 /
+ * haiku 4.5。也是模型列表拉取失败时的静态说明;真值以 /v1/models 为准,并且教程只展示
+ * 这个集合与实际可用列表的交集(其它可用家族仍可通过 /v1/models 发现、直接填写使用)。
+ */
+const DEFAULT_MODEL_SET: readonly string[] = [
   "fable-5.1",
   "opus-5",
   "opus-4.8",
   "sonnet-5",
-  "grok-4.6",
-  "gemini-3.8-flash",
+  "haiku-4.5",
 ];
+
+/**
+ * 教程里"当前可用"要展示的家族清单。
+ *   - 列表未加载 / 加载失败 / 为空 → 静态 `DEFAULT_MODEL_SET`(说明性质,真值以 /v1/models 为准);
+ *   - 拉到了 → `DEFAULT_MODEL_SET` 与实际可用列表的**交集**,顺序按 DEFAULT_MODEL_SET;
+ *   - 交集为空(目录整体换代)→ 退回实际列表,不给用户一份全是不可用 id 的清单。
+ * 其它可用家族仍可通过 `/v1/models` 自行发现并直接填写,这里只是"推荐默认集"。
+ */
+export function familyGuideList(available: string[] | null): string[] {
+  if (!available || available.length === 0) return [...DEFAULT_MODEL_SET];
+  const intersection = DEFAULT_MODEL_SET.filter((id) => available.includes(id));
+  return intersection.length > 0 ? intersection : available;
+}
 /**
  * 随配置一并写给 Claude Code 的额外环境变量。
  * `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`:官方文档 —— 对 Claude Code 不认识的模型 id(经网关 / 自定义
@@ -57,6 +75,8 @@ const CLAUDE_CODE_EXTRA_ENV: Readonly<Record<string, string>> = {
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: "1",
 };
 const CC_SWITCH_RELEASES = "https://github.com/farion1231/cc-switch/releases";
+/** 稳定的空数组引用(列表未加载时喂给 useTablePage,避免每次渲染换引用)。 */
+const EMPTY_KEYS: ApiKeySummary[] = [];
 
 /** 在可用列表中挑默认模型:首选项在列表里就用它;列表为空/未加载也用它(静态兜底);否则用列表里第一个匹配项。 */
 export function pickDefaultModel(
@@ -245,8 +265,10 @@ export function ApiKeysSection({
   const usageUrl = `${endpoint}/v1/usage`;
   const usageScript = useMemo(() => buildCcSwitchUsageScript(), []);
   const mainModel = pickDefaultModel(externalModels, DEFAULT_MAIN_MODEL, /^(fable|opus)-/);
+  const opusModel = pickDefaultModel(externalModels, DEFAULT_OPUS_MODEL, /^(opus|fable)-/);
   const sonnetModel = pickDefaultModel(externalModels, DEFAULT_SONNET_MODEL, /^sonnet-/);
-  const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /^gemini-|-flash(-|$)/);
+  // 轻量位:haiku 优先;没有就退到 gemini flash,再退到 sonnet。
+  const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /^haiku-|^gemini-|-flash(-|$)|^sonnet-/);
   const candidateKey = keySource === "new" ? (justCreated?.plaintext ?? "") : existingKey.trim();
   const knownKey = keys?.find(
     (key) => candidateKey.split(".")[1] === key.keyPrefix.replace(/^oc-cc\./, ""),
@@ -267,7 +289,7 @@ export function ApiKeysSection({
     `export ANTHROPIC_BASE_URL=${endpoint}`,
     `export ANTHROPIC_AUTH_TOKEN='${keyPlaceholder}'`,
     `export ANTHROPIC_MODEL=${mainModel}`,
-    `export ANTHROPIC_DEFAULT_OPUS_MODEL=${mainModel}`,
+    `export ANTHROPIC_DEFAULT_OPUS_MODEL=${opusModel}`,
     `export ANTHROPIC_DEFAULT_SONNET_MODEL=${sonnetModel}`,
     `export ANTHROPIC_DEFAULT_HAIKU_MODEL=${haikuModel}`,
     ...extraEnvLines,
@@ -280,7 +302,7 @@ export function ApiKeysSection({
         ANTHROPIC_BASE_URL: endpoint,
         ANTHROPIC_AUTH_TOKEN: keyPlaceholder,
         ANTHROPIC_MODEL: mainModel,
-        ANTHROPIC_DEFAULT_OPUS_MODEL: mainModel,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
         ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
         ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
         ...CLAUDE_CODE_EXTRA_ENV,
@@ -299,15 +321,16 @@ export function ApiKeysSection({
         name: BRAND.nameEn,
         apiKey: keyReady ? candidateKey : null,
         model: mainModel,
-        opusModel: mainModel,
+        opusModel,
         sonnetModel,
         haikuModel,
       }),
-    [origin, candidateKey, keyReady, mainModel, sonnetModel, haikuModel],
+    [origin, candidateKey, keyReady, mainModel, opusModel, sonnetModel, haikuModel],
   );
-  // 列表项已是家族 id(-fast 是独立可选项,一并展示);空/未加载退到静态说明。
-  const familyList =
-    !externalModels || externalModels.length === 0 ? FALLBACK_FAMILIES : externalModels;
+  // 教程展示的家族清单:默认集 ∩ 实际可用(见 familyGuideList)。
+  const familyList = useMemo(() => familyGuideList(externalModels), [externalModels]);
+  // 密钥列表每页 10 条(与用量表同一 TablePager);≤10 条时不渲染翻页控件。
+  const keyPage = useTablePage<ApiKeySummary>(keys ?? EMPTY_KEYS);
 
   useEffect(() => {
     let alive = true;
@@ -630,19 +653,29 @@ export function ApiKeysSection({
             <Spinner /> 加载中…
           </div>
         ) : !keys || keys.length === 0 ? (
-          <p className="py-3 text-center text-meta text-faint">还没有 API Key</p>
+          <p className="py-3 text-center text-meta text-faint">
+            还没有 API Key。在上方「创建新密钥」里起个名(如 MacBook)即可创建第一把。
+          </p>
         ) : (
-          <ul className="flex flex-col gap-2" data-testid="api-keys-list">
-            {keys.map((k) => (
-              <ApiKeyRow
-                key={k.id}
-                k={k}
-                busy={busyId === k.id}
-                onPatch={(p) => patch(k.id, p)}
-                onRemove={() => remove(k.id)}
-              />
-            ))}
-          </ul>
+          <>
+            <ul className="flex flex-col gap-2" data-testid="api-keys-list">
+              {keyPage.pageRows.map((k) => (
+                <ApiKeyRow
+                  key={k.id}
+                  k={k}
+                  busy={busyId === k.id}
+                  onPatch={(p) => patch(k.id, p)}
+                  onRemove={() => remove(k.id)}
+                />
+              ))}
+            </ul>
+            <TablePager
+              label="密钥列表"
+              page={keyPage.page}
+              pageCount={keyPage.pageCount}
+              onPageChange={keyPage.setPage}
+            />
+          </>
         )}
 
         <p className="mt-3 flex items-start gap-1.5 text-caption text-faint">
@@ -822,7 +855,9 @@ export function ApiKeysSection({
           {familyList.map((f, i) => (
             <span key={f}>
               {i > 0 ? " / " : " "}
-              <code className="font-mono">{f}</code>
+              <code className="font-mono" data-testid="guide-family">
+                {f}
+              </code>
             </span>
           ))}
           (带 <code className="font-mono">-fast</code> 的为加速版、双倍计费)。以列表接口返回的为准。
