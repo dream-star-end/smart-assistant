@@ -54,6 +54,15 @@ describe("GithubRepoModal", () => {
     expect(listGithubRepos).not.toHaveBeenCalled();
   });
 
+  test("role=dialog 带 data-product-feature=github-repository", async () => {
+    getGithubLink.mockResolvedValue({ linked: false });
+    renderModal();
+    expect(await screen.findByRole("dialog")).toHaveAttribute(
+      "data-product-feature",
+      "github-repository",
+    );
+  });
+
   test("已关联：列仓库 → 选仓 → 列分支 → 确认绑定回调", async () => {
     getGithubLink.mockResolvedValue({ linked: true, login: "octocat", scopes: "repo" });
     listGithubRepos.mockResolvedValue([
