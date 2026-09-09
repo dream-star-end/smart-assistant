@@ -447,6 +447,8 @@ function BuiltinHotkeysTable() {
     { keys: 'Esc', action: '停止生成（生成中）' },
     { keys: 'Enter / Shift+Enter', action: '发送 / 换行（桌面）' },
     { keys: `${mod}+V`, action: '粘贴图片为附件' },
+    { keys: `${mod}+F`, action: '会话内查找' },
+    { keys: '↑(空输入框)', action: '编辑上一条' },
   ]
   return (
     <div className="px-5 py-4">
