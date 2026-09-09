@@ -3494,6 +3494,40 @@
           "assertion": "[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)"
         }
       ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-SAND-BOX-NOT-RUNNING",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Cursor Sand Box 短暂不在运行态时，relay 以 400 invalid_request_error 包装 CURSOR_SAND_BOX_NOT_RUNNING [non-retryable] 交给 CCB，gateway 通用 400 规则误归 bad_request：用户看到「请调整内容后重试」红卡、cta=none、不进自动恢复，需手动重发；同一抖动里的 Request timed out 回合却按 upstream_failed 自动恢复。修复按 CURSOR_SAND_BOX_ 前缀先于通用 400 规则分类：BUSY→model_capacity，其余传输码→upstream_failed（两种投递形态同为 11 次尝试），INFERENCE_TICKET_REJECTED 保持终态不放宽。",
+      "rootFixCommit": "b3991fbb",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "Cursor Sand Box transport fault is an upstream outage, not a bad request (INC-20260909-CURSOR-SAND-BOX-NOT-RUNNING)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "Cursor Sand Box BUSY is model capacity (retry later or switch), not a bad request"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "Cursor Sand Box INFERENCE_TICKET_REJECTED keeps its terminal classification (INC-20260909-CURSOR-SAND-BOX-TRANSPORT)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/terminalErrorSurfaceMatrix.test.ts",
+          "assertion": "两种投递形态都恰好 ${scenario.attempts} 次尝试"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-sand-box-classify] PASS — Box transport faults classify as recoverable upstream outage in both gateway retry seams"
+        }
+      ]
     }
   ]
 }
