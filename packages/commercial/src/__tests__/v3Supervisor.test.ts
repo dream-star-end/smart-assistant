@@ -687,7 +687,7 @@ describe("resolveV5CursorAuthMount", () => {
         } else if (variant === "directory") mkdirSync(marker, { mode: 0o700 });
         else if (variant === "fifo") execFileSync("mkfifo", [marker]);
         else {
-          writeFileSync(marker, variant === "wrong-content" ? "true\n" : "1\n", { mode: 0o600 });
+          writeFileSync(marker, variant === "wrong-content" ? "2\n" : "1\n", { mode: 0o600 });
           if (variant === "public") chmodSync(marker, 0o644);
           if (variant === "non-root") chownSync(marker, 65534, 65534);
         }
