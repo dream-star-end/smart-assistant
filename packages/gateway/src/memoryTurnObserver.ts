@@ -1,4 +1,4 @@
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, realpath, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { ToolCalledEvent, TurnCompletedEvent } from '@openclaude/protocol'
@@ -16,8 +16,47 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'memoryTurnObserver' })
 
-type Snapshot = { core: Map<string, string>; profile: string | null }
+type Snapshot = { core: Map<string, string>; profile: string | null; dirRealPath: string | null }
 const activeSnapshots = new Map<string, Snapshot>()
+const sharedDirLoggedAgents = new Set<string>()
+
+function turnSnapshotMetadata(shared: boolean): Record<string, unknown> {
+  return shared
+    ? { source: 'turn_snapshot', shared: true, attribution: 'ambiguous' }
+    : { source: 'turn_snapshot' }
+}
+
+function logSharedMemoryDirOnce(
+  agentId: string,
+  dirPath: string,
+  dirRealPath: string | null,
+  shared: boolean,
+): void {
+  if (sharedDirLoggedAgents.has(agentId)) return
+  sharedDirLoggedAgents.add(agentId)
+  log.debug('turn_snapshot memory dir shared-symlink detection', {
+    agentId,
+    dirPath,
+    dirRealPath,
+    shared,
+  })
+}
+
+async function resolveMemoryDirRealPath(dirPath: string): Promise<string | null> {
+  try {
+    return await realpath(dirPath)
+  } catch {
+    return null
+  }
+}
+
+async function isSharedMemoryDir(agentId: string): Promise<boolean> {
+  const dirPath = new MemoryDir(agentId).dirPath()
+  const dirRealPath = await resolveMemoryDirRealPath(dirPath)
+  const shared = dirRealPath != null && dirRealPath !== dirPath
+  logSharedMemoryDirOnce(agentId, dirPath, dirRealPath, shared)
+  return shared
+}
 
 function key(sessionKey: string, turnIndex: number): string {
   return `${sessionKey}\u0000${turnIndex}`
@@ -34,6 +73,7 @@ async function fileStamp(path: string): Promise<string | null> {
 
 export async function captureMemorySnapshot(agentId: string): Promise<Snapshot> {
   const dir = new MemoryDir(agentId).dirPath()
+  const dirRealPath = await resolveMemoryDirRealPath(dir)
   const core = new Map<string, string>()
   try {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -44,7 +84,7 @@ export async function captureMemorySnapshot(agentId: string): Promise<Snapshot> 
   } catch {
     // Empty/missing memory directory is a valid snapshot.
   }
-  return { core, profile: await fileStamp(paths.sharedUserMd) }
+  return { core, profile: await fileStamp(paths.sharedUserMd), dirRealPath }
 }
 
 export async function beginMemoryTurnTracking(input: {
@@ -81,7 +121,7 @@ export async function beginMemoryTurnTracking(input: {
   }
 }
 
-async function recordSnapshotDiff(
+export async function recordSnapshotDiff(
   event: Pick<TurnCompletedEvent, 'sessionKey' | 'turnIndex' | 'agentId'>,
 ): Promise<void> {
   const snapshotKey = key(event.sessionKey, event.turnIndex)
@@ -89,6 +129,7 @@ async function recordSnapshotDiff(
   activeSnapshots.delete(snapshotKey)
   if (!before) return
   const after = await captureMemorySnapshot(event.agentId)
+  const metadata = turnSnapshotMetadata(await isSharedMemoryDir(event.agentId))
   for (const [file, stamp] of after.core) {
     const previous = before.core.get(file)
     if (previous === stamp) continue
@@ -100,7 +141,7 @@ async function recordSnapshotDiff(
       memoryType: 'core',
       outcome: 'success',
       topMatchKey: file,
-      metadata: { source: 'turn_snapshot' },
+      metadata,
     })
   }
   for (const file of before.core.keys()) {
@@ -113,7 +154,7 @@ async function recordSnapshotDiff(
       memoryType: 'core',
       outcome: 'success',
       topMatchKey: file,
-      metadata: { source: 'turn_snapshot' },
+      metadata,
     })
   }
   if (before.profile !== after.profile) {
@@ -124,7 +165,7 @@ async function recordSnapshotDiff(
       operation: 'profile_write',
       memoryType: 'profile',
       outcome: 'success',
-      metadata: { source: 'turn_snapshot' },
+      metadata,
     })
   }
 }
