@@ -10,7 +10,8 @@ const POLICY_PATH = '/run/oc/cursor-auth/.sand-box-policy.json'
 const CONTROL_BASE = 'https://api2.cursor.sh/aiserver.v1.GrokBotService/'
 const RELAY_PATH = '/sand-stream-relay/aiserver.v1.InferenceService/Stream'
 const HEX = /^[0-9a-f]{64}$/
-const MAX_POLICY = 16 * 1024
+export const CURSOR_SAND_BOX_MAX_POLICY_BYTES = 2 * 1024 * 1024
+export const CURSOR_SAND_BOX_MAX_ACCOUNTS = 4096
 const MAX_CONTROL = 64 * 1024
 
 export class CursorSandBoxError extends Error {
@@ -32,7 +33,7 @@ export interface CursorSandBoxPolicy {
 }
 export function parseCursorSandBoxPolicy(value: unknown): CursorSandBoxPolicy {
   const p = value as Partial<CursorSandBoxPolicy> | null
-  if (!p || p.version !== 1 || !Array.isArray(p.accounts)) throw new CursorSandBoxError('POLICY_INVALID')
+  if (!p || p.version !== 1 || !Array.isArray(p.accounts) || p.accounts.length > CURSOR_SAND_BOX_MAX_ACCOUNTS) throw new CursorSandBoxError('POLICY_INVALID')
   const seen = new Set<string>()
   const accounts = p.accounts.map((a) => {
     if (!a || typeof a.accountId !== 'string' || !/^[1-9][0-9]{0,19}$/.test(a.accountId)
@@ -45,13 +46,14 @@ export function parseCursorSandBoxPolicy(value: unknown): CursorSandBoxPolicy {
   })
   return { version: 1, accounts }
 }
-export function readCursorSandBoxPolicy(): CursorSandBoxPolicy | null {
-  const r = spawnSync('/usr/bin/sudo', ['-n', '/bin/cat', POLICY_PATH], {
-    encoding: 'utf8', maxBuffer: MAX_POLICY, timeout: 5_000,
+/** Explicit path is for isolated filesystem verification; production uses the fixed root-owned path. */
+export function readCursorSandBoxPolicy(policyPath = POLICY_PATH): CursorSandBoxPolicy | null {
+  const r = spawnSync('/usr/bin/sudo', ['-n', '/bin/cat', policyPath], {
+    encoding: 'utf8', maxBuffer: CURSOR_SAND_BOX_MAX_POLICY_BYTES, timeout: 5_000,
     env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'pipe'],
   })
-  if (r.status !== 0) {
-    if (r.status === 1 && r.stderr?.includes(`${POLICY_PATH}: No such file or directory`)) return null
+  if (r.error || r.status !== 0 || Buffer.byteLength(r.stdout ?? '', 'utf8') > CURSOR_SAND_BOX_MAX_POLICY_BYTES) {
+    if (!r.error && r.status === 1 && r.stderr?.includes(`${policyPath}: No such file or directory`)) return null
     throw new CursorSandBoxError('POLICY_UNAVAILABLE')
   }
   try { return parseCursorSandBoxPolicy(JSON.parse(r.stdout)) }

@@ -149,6 +149,27 @@ export interface CursorAuthSyncDeps {
   authDir: string | null;
   now?: () => Date;
   runtimeChannel?: "v3" | "v5";
+  /** Production actor's start-instance fence; checked after awaits and before publication. */
+  canPublish?: () => boolean;
+}
+
+function requireSyncOwner(canPublish: (() => boolean) | undefined): void {
+  if (canPublish && !canPublish()) throw new Error("CURSOR_AUTH_SYNC_OWNER_STOPPED");
+}
+
+export async function listAllCursorAccounts(
+  list: typeof listAccounts,
+  canPublish?: () => boolean,
+): Promise<AccountRow[]> {
+  const rows: AccountRow[] = [];
+  for (let offset = 0; ; offset += 500) {
+    requireSyncOwner(canPublish);
+    const page = await list({ provider: "cursor", limit: 500, offset });
+    requireSyncOwner(canPublish);
+    rows.push(...page);
+    if (rows.length > 4096) throw new Error("CURSOR_AUTH_POOL_CAPACITY_EXCEEDED");
+    if (page.length < 500) return rows;
+  }
 }
 
 export function eligibleCursorRows(rows: AccountRow[], now: Date): AccountRow[] {
@@ -194,13 +215,15 @@ function writePoolOwnershipMarker(authDir: string): void {
   }
 }
 
-async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "listAccounts" | "createAccount" | "authDir" | "runtimeChannel">>): Promise<number> {
+async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "listAccounts" | "createAccount" | "authDir" | "runtimeChannel">>, canPublish?: () => boolean): Promise<number> {
   const existing = await deps.listAccounts({ provider: "cursor" });
+  requireSyncOwner(canPublish);
   if (existing.length > 0 || !deps.authDir) return 0;
   if (hasPoolOwnershipMarker(deps.authDir)) return 0;
   const files = readHostKeyFiles(deps.authDir);
   let imported = 0;
   for (const file of files) {
+    requireSyncOwner(canPublish);
     const fp = fingerprintCursorKey(file.key);
     await deps.createAccount({
       provider: "cursor",
@@ -210,6 +233,7 @@ async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "li
       runtime_channel: deps.runtimeChannel,
       egress_proxy_id: null,
     });
+    requireSyncOwner(canPublish);
     imported += 1;
     log.info("imported host Cursor key into account pool", { slot: file.name, fingerprint: fp });
   }
@@ -358,29 +382,38 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
     return { imported: 0, written: 0, skipped: "no-auth-dir", fingerprints: [] };
   }
 
-  const before = await resolved.listAccounts({ provider: "cursor" });
+  requireSyncOwner(resolved.canPublish);
+  const before = await listAllCursorAccounts(resolved.listAccounts, resolved.canPublish);
   const imported = await importHostKeysIfEmpty({
     listAccounts: resolved.listAccounts,
     createAccount: resolved.createAccount,
     authDir: resolved.authDir,
     runtimeChannel: resolved.runtimeChannel ?? getRuntimeChannel(),
-  });
+  }, resolved.canPublish);
+  requireSyncOwner(resolved.canPublish);
   if (imported > 0 || before.length > 0) {
     writePoolOwnershipMarker(resolved.authDir);
   }
 
-  const rows = eligibleCursorRows(await resolved.listAccounts({ provider: "cursor" }), (resolved.now ?? (() => new Date()))());
+  const rows = eligibleCursorRows(await listAllCursorAccounts(resolved.listAccounts, resolved.canPublish), (resolved.now ?? (() => new Date()))());
   if (rows.length === 0) {
-    log.warn("cursor account pool has no active keys; leaving host files unchanged");
-    return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
+    requireSyncOwner(resolved.canPublish);
+    if (!hasPoolOwnershipMarker(resolved.authDir)) {
+      return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
+    }
+    writeAtomicSlots(resolved.authDir, []);
+    log.info("materialized empty owned Cursor pool; removed selectable root slots");
+    return { imported, written: 0, skipped: null, fingerprints: [] };
   }
 
   const slots: MaterializedCursorSlot[] = [];
   try {
     for (const row of rows) {
+      requireSyncOwner(resolved.canPublish);
       const snap = await resolved.getCursorTokenSnapshot(row.id);
-      if (!snap?.token) continue;
+      if (!snap?.token) { requireSyncOwner(resolved.canPublish); continue; }
       try {
+        requireSyncOwner(resolved.canPublish);
         const credentialKind: CursorSlotCredentialKind = snap.credential_kind === "session" ? "session" : "api_key";
         const quotaClass: CursorQuotaClass = row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
           ? row.cursor_quota_class
@@ -428,10 +461,7 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
         snap.refresh?.fill(0);
       }
     }
-    if (slots.length === 0) {
-      log.warn("cursor account pool rows had no decryptable keys; leaving host files unchanged");
-      return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
-    }
+    requireSyncOwner(resolved.canPublish);
     const writtenFp = writeAtomicSlots(resolved.authDir, slots);
     log.info("materialized cursor account pool onto host auth dir", {
       written: slots.length,
@@ -445,42 +475,80 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
   }
 }
 
-let syncTimer: NodeJS.Timeout | null = null;
-let syncInFlight: Promise<void> | null = null;
+/** Each instance is its own epoch. A stopped instance can drain but never publish again. */
+export function createCursorAuthSyncScheduler(opts: {
+  run: (canPublish: () => boolean) => Promise<unknown>;
+  onError?: (error: unknown, reason: string) => void;
+  delayMs?: number;
+}): { schedule: (reason: string) => void; stop: () => Promise<void> } {
+  let live = true;
+  let dirty: string | null = null;
+  let timer: NodeJS.Timeout | null = null;
+  let inFlight: Promise<void> | null = null;
+  const schedule = (reason: string): void => {
+    if (!live) return;
+    dirty = reason;
+    if (inFlight) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (!live || dirty === null) return;
+      const currentReason = dirty;
+      dirty = null;
+      inFlight = Promise.resolve().then(() => {
+        requireSyncOwner(() => live);
+        return opts.run(() => live);
+      }).then(() => undefined).catch((error) => {
+        if (live) opts.onError?.(error, currentReason);
+      }).finally(() => {
+        inFlight = null;
+        if (live && dirty !== null) schedule(dirty);
+      });
+    }, opts.delayMs ?? 250);
+    timer.unref?.();
+  };
+  return {
+    schedule,
+    stop: () => {
+      live = false;
+      dirty = null;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      return inFlight ?? Promise.resolve();
+    },
+  };
+}
+
+let activeSyncActor: ReturnType<typeof createCursorAuthSyncScheduler> | null = null;
+let pendingSyncReason: string | null = null;
 
 export function scheduleCursorAuthSync(reason: string): void {
   if (!cursorAuthDirFromEnv()) return;
-  if (syncTimer) clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => {
-    syncTimer = null;
-    if (syncInFlight) return;
-    syncInFlight = syncCursorAuthDir()
-      .then(() => undefined)
-      .catch((err) => {
-        log.warn("cursor auth sync failed", {
-          reason,
-          errorClass: err instanceof Error ? err.name : typeof err,
-          message: err instanceof Error ? err.message : String(err),
-        });
-      })
-      .finally(() => {
-        syncInFlight = null;
-      });
-  }, 250);
+  pendingSyncReason = reason;
+  activeSyncActor?.schedule(reason);
 }
 
-export function startCursorAuthSyncActor(opts: { intervalMs?: number } = {}): { stop: () => void } {
+export function startCursorAuthSyncActor(opts: { intervalMs?: number } = {}): { stop: () => Promise<void> } {
+  void activeSyncActor?.stop();
+  const actor = createCursorAuthSyncScheduler({
+    run: (canPublish) => syncCursorAuthDir({ canPublish }),
+    onError: (err, reason) => log.warn("cursor auth sync failed", {
+      reason,
+      errorClass: err instanceof Error ? err.name : typeof err,
+      message: err instanceof Error ? err.message : String(err),
+    }),
+  });
+  activeSyncActor = actor;
   const intervalMs = opts.intervalMs && opts.intervalMs >= 1000 ? opts.intervalMs : 60_000;
-  scheduleCursorAuthSync("boot");
-  const timer = setInterval(() => scheduleCursorAuthSync("tick"), intervalMs);
+  actor.schedule(pendingSyncReason ?? "boot");
+  pendingSyncReason = null;
+  const timer = setInterval(() => actor.schedule("tick"), intervalMs);
   timer.unref?.();
   return {
     stop: () => {
       clearInterval(timer);
-      if (syncTimer) {
-        clearTimeout(syncTimer);
-        syncTimer = null;
-      }
+      if (activeSyncActor === actor) activeSyncActor = null;
+      return actor.stop();
     },
   };
 }
