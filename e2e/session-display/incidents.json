@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "scope": "V5 user-visible and release-gate P0/P1 regressions from 2026-07-17 onward. 每条证据必须写清 layer(在哪一层跑)+ path + assertion(该产物内部的精确锚点); checker 校验锚点真在文件里、layer↔路径形态一致、layer 能映射到真 runner、并要求 rootFixCommit/coverageCommits 至少动过一条登记的证据。",
+  "scope": "V5 user-visible and release-gate P0/P1 regressions from 2026-07-17 onward. \u6bcf\u6761\u8bc1\u636e\u5fc5\u987b\u5199\u6e05 layer(\u5728\u54ea\u4e00\u5c42\u8dd1)+ path + assertion(\u8be5\u4ea7\u7269\u5185\u90e8\u7684\u7cbe\u786e\u951a\u70b9); checker \u6821\u9a8c\u951a\u70b9\u771f\u5728\u6587\u4ef6\u91cc\u3001layer\u2194\u8def\u5f84\u5f62\u6001\u4e00\u81f4\u3001layer \u80fd\u6620\u5c04\u5230\u771f runner\u3001\u5e76\u8981\u6c42 rootFixCommit/coverageCommits \u81f3\u5c11\u52a8\u8fc7\u4e00\u6761\u767b\u8bb0\u7684\u8bc1\u636e\u3002",
   "fixedLiveMatrix": [
     {
       "engine": "codex",
@@ -16,7 +16,7 @@
       "id": "INC-20260717-HISTORY-STUCK",
       "occurredAt": "2026-07-17",
       "severity": "P0",
-      "symptom": "重登或增量同步后历史缓存失去权威，真实会话内容不可见或长期等待。",
+      "symptom": "\u91cd\u767b\u6216\u589e\u91cf\u540c\u6b65\u540e\u5386\u53f2\u7f13\u5b58\u5931\u53bb\u6743\u5a01\uff0c\u771f\u5b9e\u4f1a\u8bdd\u5185\u5bb9\u4e0d\u53ef\u89c1\u6216\u957f\u671f\u7b49\u5f85\u3002",
       "rootFixCommit": "e6f89f7e",
       "regressions": [
         {
@@ -26,12 +26,12 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
-          "assertion": "@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确"
+          "assertion": "@smoke login \u2192 \u4f1a\u8bdd \u2192 \u53d1\u9001 \u2192 \u91cd\u767b\u540e\u5c55\u793a\u5b8c\u6574\u4e14\u987a\u5e8f\u6b63\u786e"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
-          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
+          "assertion": "\u65ad\u7ebf\u91cd\u8fde:\u56de\u590d\u5230\u8fbe\u6216\u660e\u786e\u5931\u8d25,\u7edd\u4e0d\u6c38\u4e45\u9759\u9ed8"
         }
       ]
     },
@@ -39,7 +39,7 @@
       "id": "INC-20260718-FIRST-TURN-REJECTED",
       "occurredAt": "2026-07-18",
       "severity": "P0",
-      "symptom": "新会话首条消息在受理时因 session_not_found 确定失败。",
+      "symptom": "\u65b0\u4f1a\u8bdd\u9996\u6761\u6d88\u606f\u5728\u53d7\u7406\u65f6\u56e0 session_not_found \u786e\u5b9a\u5931\u8d25\u3002",
       "rootFixCommit": "9cbbb1df",
       "coverageCommits": [
         "137c6a67"
@@ -52,7 +52,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
-          "assertion": "@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确"
+          "assertion": "@smoke login \u2192 \u4f1a\u8bdd \u2192 \u53d1\u9001 \u2192 \u91cd\u767b\u540e\u5c55\u793a\u5b8c\u6574\u4e14\u987a\u5e8f\u6b63\u786e"
         },
         {
           "layer": "live-e2e",
@@ -65,7 +65,7 @@
       "id": "INC-20260718-DISPATCH-LOST",
       "occurredAt": "2026-07-18",
       "severity": "P0",
-      "symptom": "会话消失后的 durable dispatch 未自动结案，用户轮次悬挂且状态不可见。",
+      "symptom": "\u4f1a\u8bdd\u6d88\u5931\u540e\u7684 durable dispatch \u672a\u81ea\u52a8\u7ed3\u6848\uff0c\u7528\u6237\u8f6e\u6b21\u60ac\u6302\u4e14\u72b6\u6001\u4e0d\u53ef\u89c1\u3002",
       "rootFixCommit": "8a655b2c",
       "regressions": [
         {
@@ -79,7 +79,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/05-turn-status.spec.ts",
-          "assertion": "verified turn status:未计费状态展示 + late-tape 状态不显示"
+          "assertion": "verified turn status:\u672a\u8ba1\u8d39\u72b6\u6001\u5c55\u793a + late-tape \u72b6\u6001\u4e0d\u663e\u793a"
         }
       ]
     },
@@ -87,7 +87,7 @@
       "id": "INC-20260718-ZERO-TERMINAL",
       "occurredAt": "2026-07-18",
       "severity": "P0",
-      "symptom": "tape 信封缺 dispatch 身份，已完成轮次无法收敛为 terminal。",
+      "symptom": "tape \u4fe1\u5c01\u7f3a dispatch \u8eab\u4efd\uff0c\u5df2\u5b8c\u6210\u8f6e\u6b21\u65e0\u6cd5\u6536\u655b\u4e3a terminal\u3002",
       "rootFixCommit": "5b243bcb",
       "regressions": [
         {
@@ -97,7 +97,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts",
-          "assertion": "@smoke 回复中途刷新:终态正确收敛,spinner 不永挂"
+          "assertion": "@smoke \u56de\u590d\u4e2d\u9014\u5237\u65b0:\u7ec8\u6001\u6b63\u786e\u6536\u655b,spinner \u4e0d\u6c38\u6302"
         },
         {
           "layer": "live-e2e",
@@ -110,7 +110,7 @@
       "id": "INC-20260718-RESEND-DUPLICATE",
       "occurredAt": "2026-07-18",
       "severity": "P0",
-      "symptom": "断线重发或快速双发争抢 Codex turn ownership，可能产生双回复或重复计费。",
+      "symptom": "\u65ad\u7ebf\u91cd\u53d1\u6216\u5feb\u901f\u53cc\u53d1\u4e89\u62a2 Codex turn ownership\uff0c\u53ef\u80fd\u4ea7\u751f\u53cc\u56de\u590d\u6216\u91cd\u590d\u8ba1\u8d39\u3002",
       "rootFixCommit": "f53dd893",
       "regressions": [
         {
@@ -124,7 +124,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/07-resend-dedup.spec.ts",
-          "assertion": "resend-dedup:同 clientMessageId 重发不出双回复/不双计费"
+          "assertion": "resend-dedup:\u540c clientMessageId \u91cd\u53d1\u4e0d\u51fa\u53cc\u56de\u590d/\u4e0d\u53cc\u8ba1\u8d39"
         }
       ]
     },
@@ -132,28 +132,28 @@
       "id": "INC-20260718-ATTACH-NOOP",
       "occurredAt": "2026-07-18",
       "severity": "P1",
-      "symptom": "点击添加附件后菜单同步卸载，文件选择器未打开。",
+      "symptom": "\u70b9\u51fb\u6dfb\u52a0\u9644\u4ef6\u540e\u83dc\u5355\u540c\u6b65\u5378\u8f7d\uff0c\u6587\u4ef6\u9009\u62e9\u5668\u672a\u6253\u5f00\u3002",
       "rootFixCommit": "1ebb9e07",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/composerAttach.test.tsx",
-          "assertion": "点击附件 label 原生转发一次 click 到 file input（Radix 未吞掉默认激活）"
+          "assertion": "\u70b9\u51fb\u9644\u4ef6 label \u539f\u751f\u8f6c\u53d1\u4e00\u6b21 click \u5230 file input\uff08Radix \u672a\u541e\u6389\u9ed8\u8ba4\u6fc0\u6d3b\uff09"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T1 点「+」→「添加附件」→ filechooser 真实弹出"
+          "assertion": "T1 \u70b9\u300c+\u300d\u2192\u300c\u6dfb\u52a0\u9644\u4ef6\u300d\u2192 filechooser \u771f\u5b9e\u5f39\u51fa"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T4 file input 结构红线:type=file/无 accept/非 display:none/tabindex=-1"
+          "assertion": "T4 file input \u7ed3\u6784\u7ea2\u7ebf:type=file/\u65e0 accept/\u975e display:none/tabindex=-1"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/v5-e2e-journey-canary.mjs",
-          "assertion": "J2 附件全链:菜单→filechooser→真实上传→chip done"
+          "assertion": "J2 \u9644\u4ef6\u5168\u94fe:\u83dc\u5355\u2192filechooser\u2192\u771f\u5b9e\u4e0a\u4f20\u2192chip done"
         }
       ]
     },
@@ -161,7 +161,7 @@
       "id": "INC-20260719-PROCESS-AFTER-FINAL",
       "occurredAt": "2026-07-19",
       "severity": "P1",
-      "symptom": "重连/历史恢复后 Agent 过程卡出现在最终答案之后。",
+      "symptom": "\u91cd\u8fde/\u5386\u53f2\u6062\u590d\u540e Agent \u8fc7\u7a0b\u5361\u51fa\u73b0\u5728\u6700\u7ec8\u7b54\u6848\u4e4b\u540e\u3002",
       "rootFixCommit": "575fcf42",
       "regressions": [
         {
@@ -171,7 +171,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts",
-          "assertion": "poisoned IDB + empty incremental：过程卡在最终答复前且修复可持久化"
+          "assertion": "poisoned IDB + empty incremental\uff1a\u8fc7\u7a0b\u5361\u5728\u6700\u7ec8\u7b54\u590d\u524d\u4e14\u4fee\u590d\u53ef\u6301\u4e45\u5316"
         }
       ]
     },
@@ -179,7 +179,7 @@
       "id": "INC-20260719-POISONED-IDB-ORDER",
       "occurredAt": "2026-07-19",
       "severity": "P0",
-      "symptom": "本地 poisoned IndexedDB 与空增量响应结合后把过程卡持久化到 final 之后。",
+      "symptom": "\u672c\u5730 poisoned IndexedDB \u4e0e\u7a7a\u589e\u91cf\u54cd\u5e94\u7ed3\u5408\u540e\u628a\u8fc7\u7a0b\u5361\u6301\u4e45\u5316\u5230 final \u4e4b\u540e\u3002",
       "rootFixCommit": "5e4f0481",
       "regressions": [
         {
@@ -189,7 +189,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts",
-          "assertion": "poisoned IDB + empty incremental：过程卡在最终答复前且修复可持久化"
+          "assertion": "poisoned IDB + empty incremental\uff1a\u8fc7\u7a0b\u5361\u5728\u6700\u7ec8\u7b54\u590d\u524d\u4e14\u4fee\u590d\u53ef\u6301\u4e45\u5316"
         }
       ]
     },
@@ -197,7 +197,7 @@
       "id": "INC-20260721-LAZY-TIMELINE-LOSS",
       "occurredAt": "2026-07-21",
       "severity": "P0",
-      "symptom": "超长会话懒加载丢失真实时间线内容、滚动锚点漂移或无法继续翻页。",
+      "symptom": "\u8d85\u957f\u4f1a\u8bdd\u61d2\u52a0\u8f7d\u4e22\u5931\u771f\u5b9e\u65f6\u95f4\u7ebf\u5185\u5bb9\u3001\u6eda\u52a8\u951a\u70b9\u6f02\u79fb\u6216\u65e0\u6cd5\u7ee7\u7eed\u7ffb\u9875\u3002",
       "rootFixCommit": "e198a9f8",
       "regressions": [
         {
@@ -207,22 +207,22 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T8 上滑零请求，点击只取一页、像素锚定且 remount 不重取"
+          "assertion": "T8 \u4e0a\u6ed1\u96f6\u8bf7\u6c42\uff0c\u70b9\u51fb\u53ea\u53d6\u4e00\u9875\u3001\u50cf\u7d20\u951a\u5b9a\u4e14 remount \u4e0d\u91cd\u53d6"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T10 归档前插跨出虚拟挂载区仍保持原消息像素位置"
+          "assertion": "T10 \u5f52\u6863\u524d\u63d2\u8de8\u51fa\u865a\u62df\u6302\u8f7d\u533a\u4ecd\u4fdd\u6301\u539f\u6d88\u606f\u50cf\u7d20\u4f4d\u7f6e"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
-          "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
+          "assertion": "@smoke \u5927\u4f1a\u8bdd\u6253\u5f00 < 3s \u53ef\u4ea4\u4e92 + \u771f\u5b9e\u7b54\u590d\u76f4\u51fa + \u5de5\u5177\u8bb0\u5f55\u60f0\u6027\u6c34\u5408"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/06-archive-paging.spec.ts",
-          "assertion": "归档分页:无重复行 / 无空页死循环 / 游标收敛"
+          "assertion": "\u5f52\u6863\u5206\u9875:\u65e0\u91cd\u590d\u884c / \u65e0\u7a7a\u9875\u6b7b\u5faa\u73af / \u6e38\u6807\u6536\u655b"
         },
         {
           "layer": "unit",
@@ -264,7 +264,7 @@
       "id": "INC-20260720-BASH-TAIL-HIDDEN",
       "occurredAt": "2026-07-20",
       "severity": "P1",
-      "symptom": "精确时间线迁移后 Bash 输出尾部没有合并回工具卡，用户看不到结果。",
+      "symptom": "\u7cbe\u786e\u65f6\u95f4\u7ebf\u8fc1\u79fb\u540e Bash \u8f93\u51fa\u5c3e\u90e8\u6ca1\u6709\u5408\u5e76\u56de\u5de5\u5177\u5361\uff0c\u7528\u6237\u770b\u4e0d\u5230\u7ed3\u679c\u3002",
       "rootFixCommit": "f3261725",
       "regressions": [
         {
@@ -278,7 +278,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
-          "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
+          "assertion": "@smoke \u5927\u4f1a\u8bdd\u6253\u5f00 < 3s \u53ef\u4ea4\u4e92 + \u771f\u5b9e\u7b54\u590d\u76f4\u51fa + \u5de5\u5177\u8bb0\u5f55\u60f0\u6027\u6c34\u5408"
         }
       ]
     },
@@ -286,7 +286,7 @@
       "id": "INC-20260721-RUNTIME-RAW-LEAK",
       "occurredAt": "2026-07-21",
       "severity": "P1",
-      "symptom": "runtime transport/audit 原始行泄漏到逻辑 Agent 时间线并消耗分页槽位。",
+      "symptom": "runtime transport/audit \u539f\u59cb\u884c\u6cc4\u6f0f\u5230\u903b\u8f91 Agent \u65f6\u95f4\u7ebf\u5e76\u6d88\u8017\u5206\u9875\u69fd\u4f4d\u3002",
       "rootFixCommit": "02737240",
       "regressions": [
         {
@@ -300,7 +300,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
-          "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
+          "assertion": "@smoke \u5927\u4f1a\u8bdd\u6253\u5f00 < 3s \u53ef\u4ea4\u4e92 + \u771f\u5b9e\u7b54\u590d\u76f4\u51fa + \u5de5\u5177\u8bb0\u5f55\u60f0\u6027\u6c34\u5408"
         }
       ]
     },
@@ -308,7 +308,7 @@
       "id": "INC-20260721-HISTORICAL-THINKING-OPEN",
       "occurredAt": "2026-07-21",
       "severity": "P1",
-      "symptom": "历史 thinking 卡被强制展开且用户无法正常折叠。",
+      "symptom": "\u5386\u53f2 thinking \u5361\u88ab\u5f3a\u5236\u5c55\u5f00\u4e14\u7528\u6237\u65e0\u6cd5\u6b63\u5e38\u6298\u53e0\u3002",
       "rootFixCommit": "0f416b5c",
       "regressions": [
         {
@@ -318,7 +318,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T11 direct-timeline 思考完成后自动折叠且可完整展开"
+          "assertion": "T11 direct-timeline \u601d\u8003\u5b8c\u6210\u540e\u81ea\u52a8\u6298\u53e0\u4e14\u53ef\u5b8c\u6574\u5c55\u5f00"
         }
       ]
     },
@@ -326,7 +326,7 @@
       "id": "INC-20260721-STAGED-FINALIZE-STUCK",
       "occurredAt": "2026-07-21",
       "severity": "P0",
-      "symptom": "已 staged 的 tape finalize 滞留，dispatch 不终态且 retry 文件持续堆积。",
+      "symptom": "\u5df2 staged \u7684 tape finalize \u6ede\u7559\uff0cdispatch \u4e0d\u7ec8\u6001\u4e14 retry \u6587\u4ef6\u6301\u7eed\u5806\u79ef\u3002",
       "rootFixCommit": "5790a7e6",
       "regressions": [
         {
@@ -345,27 +345,27 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
-          "assertion": "part: PG 53300 too many clients → 503 TURN_TAPE_RETRYABLE(不再误判 409)"
+          "assertion": "part: PG 53300 too many clients \u2192 503 TURN_TAPE_RETRYABLE(\u4e0d\u518d\u8bef\u5224 409)"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
-          "assertion": "part: 未知形态(无 code 普通 Error)→ 默认 503 可重试,而非 409 永久"
+          "assertion": "part: \u672a\u77e5\u5f62\u6001(\u65e0 code \u666e\u901a Error)\u2192 \u9ed8\u8ba4 503 \u53ef\u91cd\u8bd5,\u800c\u975e 409 \u6c38\u4e45"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
-          "assertion": "finalize: incomplete → 503 可重试(parts 尚在途,不再永久 quarantine)"
+          "assertion": "finalize: incomplete \u2192 503 \u53ef\u91cd\u8bd5(parts \u5c1a\u5728\u9014,\u4e0d\u518d\u6c38\u4e45 quarantine)"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
-          "assertion": "visible: broadcast throws after storage success → 200 ACK, storage not re-run"
+          "assertion": "visible: broadcast throws after storage success \u2192 200 ACK, storage not re-run"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
-          "assertion": "finalize: header / dispatch identity / settlement / engineBillings 同键异身份冲突 → 仍 409"
+          "assertion": "finalize: header / dispatch identity / settlement / engineBillings \u540c\u952e\u5f02\u8eab\u4efd\u51b2\u7a81 \u2192 \u4ecd 409"
         },
         {
           "layer": "unit",
@@ -383,7 +383,7 @@
       "id": "INC-20260722-FINALIZE-GLOBAL-BLOCK",
       "occurredAt": "2026-07-22",
       "severity": "P0",
-      "symptom": "全局 tape finalize blocker 使一个超大轮次阻塞其它用户完成与计费收敛。",
+      "symptom": "\u5168\u5c40 tape finalize blocker \u4f7f\u4e00\u4e2a\u8d85\u5927\u8f6e\u6b21\u963b\u585e\u5176\u5b83\u7528\u6237\u5b8c\u6210\u4e0e\u8ba1\u8d39\u6536\u655b\u3002",
       "rootFixCommit": "f48441b5",
       "regressions": [
         {
@@ -405,7 +405,7 @@
       "id": "INC-20260721-WEIBO-IMAGE-BROKEN",
       "occurredAt": "2026-07-21",
       "severity": "P1",
-      "symptom": "微博插件图片附件上传链路失效。",
+      "symptom": "\u5fae\u535a\u63d2\u4ef6\u56fe\u7247\u9644\u4ef6\u4e0a\u4f20\u94fe\u8def\u5931\u6548\u3002",
       "rootFixCommit": "efabb603",
       "regressions": [
         {
@@ -449,7 +449,7 @@
         }
       ],
       "proofPending": {
-        "reason": "唯一 proof 证据原本填 scripts/v5-e2e-journey-canary.mjs,而该脚本只有 J1-J5 登录/附件/目标/发送/送达,与微博图片链路零关系(2026-07-26 审计),已移除充数证据;真活体证据待补(需要 Weibo 连接器的可重放沙箱)。",
+        "reason": "\u552f\u4e00 proof \u8bc1\u636e\u539f\u672c\u586b scripts/v5-e2e-journey-canary.mjs,\u800c\u8be5\u811a\u672c\u53ea\u6709 J1-J5 \u767b\u5f55/\u9644\u4ef6/\u76ee\u6807/\u53d1\u9001/\u9001\u8fbe,\u4e0e\u5fae\u535a\u56fe\u7247\u94fe\u8def\u96f6\u5173\u7cfb(2026-07-26 \u5ba1\u8ba1),\u5df2\u79fb\u9664\u5145\u6570\u8bc1\u636e;\u771f\u6d3b\u4f53\u8bc1\u636e\u5f85\u8865(\u9700\u8981 Weibo \u8fde\u63a5\u5668\u7684\u53ef\u91cd\u653e\u6c99\u7bb1)\u3002",
         "since": "2026-07-26"
       },
       "coverageCommits": [
@@ -463,7 +463,7 @@
       "id": "INC-20260721-WEIBO-WORKER-OOM",
       "occurredAt": "2026-07-21",
       "severity": "P0",
-      "symptom": "微博 worker 处理大图片时 OOM，用户任务中断。",
+      "symptom": "\u5fae\u535a worker \u5904\u7406\u5927\u56fe\u7247\u65f6 OOM\uff0c\u7528\u6237\u4efb\u52a1\u4e2d\u65ad\u3002",
       "rootFixCommit": "869fb3c9",
       "regressions": [
         {
@@ -476,7 +476,7 @@
         }
       ],
       "proofPending": {
-        "reason": "同上:原 deploy-gate 证据与微博 worker OOM 无关,已移除;活体证据待补(需要大图 OOM 的可控复现路径)。",
+        "reason": "\u540c\u4e0a:\u539f deploy-gate \u8bc1\u636e\u4e0e\u5fae\u535a worker OOM \u65e0\u5173,\u5df2\u79fb\u9664;\u6d3b\u4f53\u8bc1\u636e\u5f85\u8865(\u9700\u8981\u5927\u56fe OOM \u7684\u53ef\u63a7\u590d\u73b0\u8def\u5f84)\u3002",
         "since": "2026-07-26"
       }
     },
@@ -484,7 +484,7 @@
       "id": "INC-20260723-KIMI-QUOTA-EXHAUSTED",
       "occurredAt": "2026-07-23",
       "severity": "P0",
-      "symptom": "耗尽的 Kimi provider 未熔断，用户持续命中确定失败上游。",
+      "symptom": "\u8017\u5c3d\u7684 Kimi provider \u672a\u7194\u65ad\uff0c\u7528\u6237\u6301\u7eed\u547d\u4e2d\u786e\u5b9a\u5931\u8d25\u4e0a\u6e38\u3002",
       "rootFixCommit": "7476df04",
       "regressions": [
         {
@@ -501,7 +501,7 @@
         }
       ],
       "proofPending": {
-        "reason": "同上:原 deploy-gate 证据(J1-J5 旅程)不含任何 provider 配额熔断断言,已移除;活体证据待补(需要可注入的配额耗尽 provider)。",
+        "reason": "\u540c\u4e0a:\u539f deploy-gate \u8bc1\u636e(J1-J5 \u65c5\u7a0b)\u4e0d\u542b\u4efb\u4f55 provider \u914d\u989d\u7194\u65ad\u65ad\u8a00,\u5df2\u79fb\u9664;\u6d3b\u4f53\u8bc1\u636e\u5f85\u8865(\u9700\u8981\u53ef\u6ce8\u5165\u7684\u914d\u989d\u8017\u5c3d provider)\u3002",
         "since": "2026-07-26"
       }
     },
@@ -509,7 +509,7 @@
       "id": "INC-20260723-PG-NUL-SIDECAR",
       "occurredAt": "2026-07-23",
       "severity": "P0",
-      "symptom": "模型 sidecar 文本含 NUL 时 PostgreSQL 写入失败，完整时间线无法落库。",
+      "symptom": "\u6a21\u578b sidecar \u6587\u672c\u542b NUL \u65f6 PostgreSQL \u5199\u5165\u5931\u8d25\uff0c\u5b8c\u6574\u65f6\u95f4\u7ebf\u65e0\u6cd5\u843d\u5e93\u3002",
       "rootFixCommit": "7904bcf9",
       "regressions": [
         {
@@ -527,7 +527,7 @@
       "id": "INC-20260723-RUNTIME-FINALIZE-UNBOUNDED",
       "occurredAt": "2026-07-23",
       "severity": "P0",
-      "symptom": "lossless runtime tape finalize 无界占用资源，可能拖垮候选或在线轮次。",
+      "symptom": "lossless runtime tape finalize \u65e0\u754c\u5360\u7528\u8d44\u6e90\uff0c\u53ef\u80fd\u62d6\u57ae\u5019\u9009\u6216\u5728\u7ebf\u8f6e\u6b21\u3002",
       "rootFixCommit": "5ade39bf",
       "regressions": [
         {
@@ -553,7 +553,7 @@
       "id": "INC-20260723-ASK-MARKDOWN-DEADEND",
       "occurredAt": "2026-07-23",
       "severity": "P1",
-      "symptom": "Agent 在普通对话中退回不可交互的 Markdown 选项，用户无法通过专用 Ask UI 继续轮次。",
+      "symptom": "Agent \u5728\u666e\u901a\u5bf9\u8bdd\u4e2d\u9000\u56de\u4e0d\u53ef\u4ea4\u4e92\u7684 Markdown \u9009\u9879\uff0c\u7528\u6237\u65e0\u6cd5\u901a\u8fc7\u4e13\u7528 Ask UI \u7ee7\u7eed\u8f6e\u6b21\u3002",
       "rootFixCommit": "cd6b7f71",
       "regressions": [
         {
@@ -567,7 +567,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T15 活动 turn 中专用 Ask UI 在移动端可点选并提交"
+          "assertion": "T15 \u6d3b\u52a8 turn \u4e2d\u4e13\u7528 Ask UI \u5728\u79fb\u52a8\u7aef\u53ef\u70b9\u9009\u5e76\u63d0\u4ea4"
         },
         {
           "layer": "unit",
@@ -579,7 +579,7 @@
       "id": "INC-20260723-LEASE-DISPATCH-UNLINKED",
       "occurredAt": "2026-07-23",
       "severity": "P0",
-      "symptom": "旧 runtime 的 lease-only CCB 请求丢失 durable dispatch 身份，计费与 tape 证据无法精确关联。",
+      "symptom": "\u65e7 runtime \u7684 lease-only CCB \u8bf7\u6c42\u4e22\u5931 durable dispatch \u8eab\u4efd\uff0c\u8ba1\u8d39\u4e0e tape \u8bc1\u636e\u65e0\u6cd5\u7cbe\u786e\u5173\u8054\u3002",
       "rootFixCommit": "5f2f96b7",
       "regressions": [
         {
@@ -601,7 +601,7 @@
       "id": "INC-20260723-E2E-MODEL-DRIFT",
       "occurredAt": "2026-07-23",
       "severity": "P1",
-      "symptom": "发布验证预建会话的模型被前端默认态覆盖，名义上的 Luna/Flash 矩阵实际运行其它模型。",
+      "symptom": "\u53d1\u5e03\u9a8c\u8bc1\u9884\u5efa\u4f1a\u8bdd\u7684\u6a21\u578b\u88ab\u524d\u7aef\u9ed8\u8ba4\u6001\u8986\u76d6\uff0c\u540d\u4e49\u4e0a\u7684 Luna/Flash \u77e9\u9635\u5b9e\u9645\u8fd0\u884c\u5176\u5b83\u6a21\u578b\u3002",
       "rootFixCommit": "5f2f96b7",
       "regressions": [
         {
@@ -615,17 +615,17 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
-          "assertion": "@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确"
+          "assertion": "@smoke login \u2192 \u4f1a\u8bdd \u2192 \u53d1\u9001 \u2192 \u91cd\u767b\u540e\u5c55\u793a\u5b8c\u6574\u4e14\u987a\u5e8f\u6b63\u786e"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
-          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
+          "assertion": "\u65ad\u7ebf\u91cd\u8fde:\u56de\u590d\u5230\u8fbe\u6216\u660e\u786e\u5931\u8d25,\u7edd\u4e0d\u6c38\u4e45\u9759\u9ed8"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts",
-          "assertion": "@smoke 回复中途刷新:终态正确收敛,spinner 不永挂"
+          "assertion": "@smoke \u56de\u590d\u4e2d\u9014\u5237\u65b0:\u7ec8\u6001\u6b63\u786e\u6536\u655b,spinner \u4e0d\u6c38\u6302"
         }
       ]
     },
@@ -633,7 +633,7 @@
       "id": "INC-20260723-FINALIZE-STALE-ACTIVE",
       "occurredAt": "2026-07-23",
       "severity": "P0",
-      "symptom": "finalize step7 后继续复用旧 active lane 缓存，egress smoke 与异常 rollback 指向已停止的旧槽位；当前 HEAD 的前向迁移还可能阻断官方恢复命令。",
+      "symptom": "finalize step7 \u540e\u7ee7\u7eed\u590d\u7528\u65e7 active lane \u7f13\u5b58\uff0cegress smoke \u4e0e\u5f02\u5e38 rollback \u6307\u5411\u5df2\u505c\u6b62\u7684\u65e7\u69fd\u4f4d\uff1b\u5f53\u524d HEAD \u7684\u524d\u5411\u8fc1\u79fb\u8fd8\u53ef\u80fd\u963b\u65ad\u5b98\u65b9\u6062\u590d\u547d\u4ee4\u3002",
       "rootFixCommit": "b9a1773c",
       "regressions": [
         {
@@ -642,7 +642,7 @@
         }
       ],
       "proofPending": {
-        "reason": "证据 scripts/__tests__/v5ReleaseSafety.test.ts 实际在 CI job v5-ops 里跑,属 unit 层(此前误标 deploy-gate);部署门内的活体证据待补。",
+        "reason": "\u8bc1\u636e scripts/__tests__/v5ReleaseSafety.test.ts \u5b9e\u9645\u5728 CI job v5-ops \u91cc\u8dd1,\u5c5e unit \u5c42(\u6b64\u524d\u8bef\u6807 deploy-gate);\u90e8\u7f72\u95e8\u5185\u7684\u6d3b\u4f53\u8bc1\u636e\u5f85\u8865\u3002",
         "since": "2026-07-26"
       }
     },
@@ -650,7 +650,7 @@
       "id": "INC-20260725-USER-IMPACT-LOOPS",
       "occurredAt": "2026-07-25",
       "severity": "P0",
-      "symptom": "禁用模型的 turn 触发未按 turn 作用域的 UNAUTHORIZED_MODEL,整条用户 bridge 被关闭,重连重放反复命中同一拒绝;跨 agent 历史被叠加进已有 Codex 原生 resume 线程,耗尽上下文窗口后又复用被污染线程。",
+      "symptom": "\u7981\u7528\u6a21\u578b\u7684 turn \u89e6\u53d1\u672a\u6309 turn \u4f5c\u7528\u57df\u7684 UNAUTHORIZED_MODEL,\u6574\u6761\u7528\u6237 bridge \u88ab\u5173\u95ed,\u91cd\u8fde\u91cd\u653e\u53cd\u590d\u547d\u4e2d\u540c\u4e00\u62d2\u7edd;\u8de8 agent \u5386\u53f2\u88ab\u53e0\u52a0\u8fdb\u5df2\u6709 Codex \u539f\u751f resume \u7ebf\u7a0b,\u8017\u5c3d\u4e0a\u4e0b\u6587\u7a97\u53e3\u540e\u53c8\u590d\u7528\u88ab\u6c61\u67d3\u7ebf\u7a0b\u3002",
       "rootFixCommit": "29503944",
       "coverageCommits": [
         "0b928cb5",
@@ -658,14 +658,14 @@
         "51eda7ca"
       ],
       "proofPending": {
-        "reason": "containment 走紧急通道先上线,回归只补到 unit 层;禁用模型/上下文耗尽两条路径尚无 live-e2e 或真浏览器证据(需要可注入的禁用模型与超长会话夹具)。",
+        "reason": "containment \u8d70\u7d27\u6025\u901a\u9053\u5148\u4e0a\u7ebf,\u56de\u5f52\u53ea\u8865\u5230 unit \u5c42;\u7981\u7528\u6a21\u578b/\u4e0a\u4e0b\u6587\u8017\u5c3d\u4e24\u6761\u8def\u5f84\u5c1a\u65e0 live-e2e \u6216\u771f\u6d4f\u89c8\u5668\u8bc1\u636e(\u9700\u8981\u53ef\u6ce8\u5165\u7684\u7981\u7528\u6a21\u578b\u4e0e\u8d85\u957f\u4f1a\u8bdd\u5939\u5177)\u3002",
         "since": "2026-07-26"
       },
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
-          "assertion": "inbound.message 带 model 且未授权 → 精确拒帧且保持连接,避免重连重放"
+          "assertion": "inbound.message \u5e26 model \u4e14\u672a\u6388\u6743 \u2192 \u7cbe\u786e\u62d2\u5e27\u4e14\u4fdd\u6301\u8fde\u63a5,\u907f\u514d\u91cd\u8fde\u91cd\u653e"
         },
         {
           "layer": "unit",
@@ -688,13 +688,13 @@
       "id": "INC-20260725-RECOVERY-RETRY-LOOP",
       "occurredAt": "2026-07-25",
       "severity": "P0",
-      "symptom": "上下文耗尽的 turn 落成 ENGINE_ERROR 被前端当作可自动恢复;master 原子拒绝为 source_not_recoverable 后,REST 全量同步又暴露同一 source 错误并无限次重新排程。",
+      "symptom": "\u4e0a\u4e0b\u6587\u8017\u5c3d\u7684 turn \u843d\u6210 ENGINE_ERROR \u88ab\u524d\u7aef\u5f53\u4f5c\u53ef\u81ea\u52a8\u6062\u590d;master \u539f\u5b50\u62d2\u7edd\u4e3a source_not_recoverable \u540e,REST \u5168\u91cf\u540c\u6b65\u53c8\u66b4\u9732\u540c\u4e00 source \u9519\u8bef\u5e76\u65e0\u9650\u6b21\u91cd\u65b0\u6392\u7a0b\u3002",
       "rootFixCommit": "83681d59",
       "coverageCommits": [
         "8f04bb2d"
       ],
       "proofPending": {
-        "reason": "触发链=上下文耗尽→ENGINE_ERROR→自动恢复→source_not_recoverable→REST 同步后重复排程。10-stop-turn 只证用户 Stop 终态,语义不匹配,已撤销;恢复围栏跨刷新持久化目前只有 unit 覆盖,尚无覆盖该恢复重试环的 live-e2e/browser/deploy-gate。",
+        "reason": "\u89e6\u53d1\u94fe=\u4e0a\u4e0b\u6587\u8017\u5c3d\u2192ENGINE_ERROR\u2192\u81ea\u52a8\u6062\u590d\u2192source_not_recoverable\u2192REST \u540c\u6b65\u540e\u91cd\u590d\u6392\u7a0b\u300210-stop-turn \u53ea\u8bc1\u7528\u6237 Stop \u7ec8\u6001,\u8bed\u4e49\u4e0d\u5339\u914d,\u5df2\u64a4\u9500;\u6062\u590d\u56f4\u680f\u8de8\u5237\u65b0\u6301\u4e45\u5316\u76ee\u524d\u53ea\u6709 unit \u8986\u76d6,\u5c1a\u65e0\u8986\u76d6\u8be5\u6062\u590d\u91cd\u8bd5\u73af\u7684 live-e2e/browser/deploy-gate\u3002",
         "since": "2026-07-26"
       },
       "regressions": [
@@ -714,13 +714,13 @@
       "id": "INC-20260725-LEGACY-RECOVERY-LOOP",
       "occurredAt": "2026-07-25",
       "severity": "P0",
-      "symptom": "旧版前端 bundle 持续重发同一 rejected-recovery 帧,单条 WebSocket 上无限重试。",
+      "symptom": "\u65e7\u7248\u524d\u7aef bundle \u6301\u7eed\u91cd\u53d1\u540c\u4e00 rejected-recovery \u5e27,\u5355\u6761 WebSocket \u4e0a\u65e0\u9650\u91cd\u8bd5\u3002",
       "rootFixCommit": "40281ce9",
       "coverageCommits": [
         "d7817e40"
       ],
       "proofPending": {
-        "reason": "『旧 bundle 重复冲突帧在第二次即终止』只有 bridge 协议层 unit 覆盖;陈旧 bundle 的真实浏览器复现尚无活体夹具。",
+        "reason": "\u300e\u65e7 bundle \u91cd\u590d\u51b2\u7a81\u5e27\u5728\u7b2c\u4e8c\u6b21\u5373\u7ec8\u6b62\u300f\u53ea\u6709 bridge \u534f\u8bae\u5c42 unit \u8986\u76d6;\u9648\u65e7 bundle \u7684\u771f\u5b9e\u6d4f\u89c8\u5668\u590d\u73b0\u5c1a\u65e0\u6d3b\u4f53\u5939\u5177\u3002",
         "since": "2026-07-26"
       },
       "regressions": [
@@ -735,7 +735,7 @@
       "id": "INC-20260725-STOP-RETRY-LINEAGE",
       "occurredAt": "2026-07-25",
       "severity": "P0",
-      "symptom": "切换助手后浏览器端 Stop 被重定向到新助手,原 turn continue 不掉;自动恢复/空回复/重启续跑的后代轮次也不受用户取消约束。",
+      "symptom": "\u5207\u6362\u52a9\u624b\u540e\u6d4f\u89c8\u5668\u7aef Stop \u88ab\u91cd\u5b9a\u5411\u5230\u65b0\u52a9\u624b,\u539f turn continue \u4e0d\u6389;\u81ea\u52a8\u6062\u590d/\u7a7a\u56de\u590d/\u91cd\u542f\u7eed\u8dd1\u7684\u540e\u4ee3\u8f6e\u6b21\u4e5f\u4e0d\u53d7\u7528\u6237\u53d6\u6d88\u7ea6\u675f\u3002",
       "rootFixCommit": "6796ff82",
       "coverageCommits": [
         "d007c3d7",
@@ -758,7 +758,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
-          "assertion": "停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活"
+          "assertion": "\u505c\u6b62:3s \u5185\u8fdb\u7ec8\u6001 + \u4e0d\u518d\u6709\u589e\u91cf\u5e27 + \u4e0d\u989d\u5916\u8ba1\u8d39\u4e0d\u590d\u6d3b"
         }
       ]
     },
@@ -766,7 +766,7 @@
       "id": "INC-20260725-CONTEXT-OVERFLOW",
       "occurredAt": "2026-07-25",
       "severity": "P0",
-      "symptom": "超长 Codex 会话在 provider 确认 context_too_long 后没有重建更小的历史后缀,用户轮次确定失败;重放又可能重复已产生副作用的轮次。",
+      "symptom": "\u8d85\u957f Codex \u4f1a\u8bdd\u5728 provider \u786e\u8ba4 context_too_long \u540e\u6ca1\u6709\u91cd\u5efa\u66f4\u5c0f\u7684\u5386\u53f2\u540e\u7f00,\u7528\u6237\u8f6e\u6b21\u786e\u5b9a\u5931\u8d25;\u91cd\u653e\u53c8\u53ef\u80fd\u91cd\u590d\u5df2\u4ea7\u751f\u526f\u4f5c\u7528\u7684\u8f6e\u6b21\u3002",
       "rootFixCommit": "e5f5abe3",
       "coverageCommits": [
         "4617f2a5",
@@ -774,7 +774,7 @@
         "edef2d27"
       ],
       "proofPending": {
-        "reason": "上下文重建当前只有 gateway unit 覆盖;『超长会话仍能继续对话』的 live-e2e 证据待补(需要能稳定造出超窗会话的夹具)。",
+        "reason": "\u4e0a\u4e0b\u6587\u91cd\u5efa\u5f53\u524d\u53ea\u6709 gateway unit \u8986\u76d6;\u300e\u8d85\u957f\u4f1a\u8bdd\u4ecd\u80fd\u7ee7\u7eed\u5bf9\u8bdd\u300f\u7684 live-e2e \u8bc1\u636e\u5f85\u8865(\u9700\u8981\u80fd\u7a33\u5b9a\u9020\u51fa\u8d85\u7a97\u4f1a\u8bdd\u7684\u5939\u5177)\u3002",
         "since": "2026-07-26"
       },
       "regressions": [
@@ -789,7 +789,7 @@
       "id": "INC-20260726-ARCHIVE-CURSOR-OVERFLOW",
       "occurredAt": "2026-07-26",
       "severity": "P0",
-      "symptom": "内容大半已 spill 到归档、热行只剩 anchor 的长会话首次打开即 500:首页无 cursor → beforeOrderSeq=Number.MAX_SAFE_INTEGER 被绑进 `WHERE first_seq < $3`,而该列是 integer → PG 22003 integer out of range。紧邻的 last_seq 已有 ::bigint,$3 漏了。既有 spill 用例全用 limit=10、热行即可填满,从不进归档循环,所以一直没被发现。",
+      "symptom": "\u5185\u5bb9\u5927\u534a\u5df2 spill \u5230\u5f52\u6863\u3001\u70ed\u884c\u53ea\u5269 anchor \u7684\u957f\u4f1a\u8bdd\u9996\u6b21\u6253\u5f00\u5373 500:\u9996\u9875\u65e0 cursor \u2192 beforeOrderSeq=Number.MAX_SAFE_INTEGER \u88ab\u7ed1\u8fdb `WHERE first_seq < $3`,\u800c\u8be5\u5217\u662f integer \u2192 PG 22003 integer out of range\u3002\u7d27\u90bb\u7684 last_seq \u5df2\u6709 ::bigint,$3 \u6f0f\u4e86\u3002\u65e2\u6709 spill \u7528\u4f8b\u5168\u7528 limit=10\u3001\u70ed\u884c\u5373\u53ef\u586b\u6ee1,\u4ece\u4e0d\u8fdb\u5f52\u6863\u5faa\u73af,\u6240\u4ee5\u4e00\u76f4\u6ca1\u88ab\u53d1\u73b0\u3002",
       "rootFixCommit": "c5031461",
       "coverageCommits": [
         "eb5a0758"
@@ -798,7 +798,7 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
-          "assertion": "归档会话首页 timeline 不因 MAX_SAFE_INTEGER 游标而炸(22003 回归)"
+          "assertion": "\u5f52\u6863\u4f1a\u8bdd\u9996\u9875 timeline \u4e0d\u56e0 MAX_SAFE_INTEGER \u6e38\u6807\u800c\u70b8(22003 \u56de\u5f52)"
         },
         {
           "layer": "live-e2e",
@@ -811,7 +811,7 @@
       "id": "INC-20260728-WEIBO-QR-HIDDEN",
       "occurredAt": "2026-07-28",
       "severity": "P1",
-      "symptom": "微博标准登录页已经生成有效二维码，但 worker 把同页普通“验证码登录/获取验证码”标签误判为风控挑战并立即失败，二维码在用户下一次轮询前被清除。",
+      "symptom": "\u5fae\u535a\u6807\u51c6\u767b\u5f55\u9875\u5df2\u7ecf\u751f\u6210\u6709\u6548\u4e8c\u7ef4\u7801\uff0c\u4f46 worker \u628a\u540c\u9875\u666e\u901a\u201c\u9a8c\u8bc1\u7801\u767b\u5f55/\u83b7\u53d6\u9a8c\u8bc1\u7801\u201d\u6807\u7b7e\u8bef\u5224\u4e3a\u98ce\u63a7\u6311\u6218\u5e76\u7acb\u5373\u5931\u8d25\uff0c\u4e8c\u7ef4\u7801\u5728\u7528\u6237\u4e0b\u4e00\u6b21\u8f6e\u8be2\u524d\u88ab\u6e05\u9664\u3002",
       "rootFixCommit": "9027a6da",
       "coverageCommits": [
         "72e134df"
@@ -825,7 +825,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T26 微博标准登录页二维码与普通验证码标签共存时不被误判挑战"
+          "assertion": "T26 \u5fae\u535a\u6807\u51c6\u767b\u5f55\u9875\u4e8c\u7ef4\u7801\u4e0e\u666e\u901a\u9a8c\u8bc1\u7801\u6807\u7b7e\u5171\u5b58\u65f6\u4e0d\u88ab\u8bef\u5224\u6311\u6218"
         }
       ]
     },
@@ -833,7 +833,7 @@
       "id": "INC-20260728-AUTODREAM-USAGE-SIDEBAND",
       "occurredAt": "2026-07-28",
       "severity": "P1",
-      "symptom": "Auto-Dream 已完成并计费的结构化整理轮次因新增 usage/call_usage token 侧信道被误判为非法事件，最终持续显示“整理未完成”且没有改动记忆。",
+      "symptom": "Auto-Dream \u5df2\u5b8c\u6210\u5e76\u8ba1\u8d39\u7684\u7ed3\u6784\u5316\u6574\u7406\u8f6e\u6b21\u56e0\u65b0\u589e usage/call_usage token \u4fa7\u4fe1\u9053\u88ab\u8bef\u5224\u4e3a\u975e\u6cd5\u4e8b\u4ef6\uff0c\u6700\u7ec8\u6301\u7eed\u663e\u793a\u201c\u6574\u7406\u672a\u5b8c\u6210\u201d\u4e14\u6ca1\u6709\u6539\u52a8\u8bb0\u5fc6\u3002",
       "rootFixCommit": "506874f2",
       "regressions": [
         {
@@ -852,23 +852,23 @@
       "id": "INC-20260803-MOBILE-WECHAT-QR",
       "occurredAt": "2026-08-03",
       "severity": "P1",
-      "symptom": "React 手机支付入口忽略虎皮椒 mobile_url，只展示同屏二维码并要求截图；手机无法扫描自身屏幕上的截图，导致订阅和充值订单无法完成。",
+      "symptom": "React \u624b\u673a\u652f\u4ed8\u5165\u53e3\u5ffd\u7565\u864e\u76ae\u6912 mobile_url\uff0c\u53ea\u5c55\u793a\u540c\u5c4f\u4e8c\u7ef4\u7801\u5e76\u8981\u6c42\u622a\u56fe\uff1b\u624b\u673a\u65e0\u6cd5\u626b\u63cf\u81ea\u8eab\u5c4f\u5e55\u4e0a\u7684\u622a\u56fe\uff0c\u5bfc\u81f4\u8ba2\u9605\u548c\u5145\u503c\u8ba2\u5355\u65e0\u6cd5\u5b8c\u6210\u3002",
       "rootFixCommit": "d5208edd",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/payment/HupijiaoPaymentEntry.test.tsx",
-          "assertion": "普通手机只挂载安全的手机支付链接，不请求二维码"
+          "assertion": "\u666e\u901a\u624b\u673a\u53ea\u6302\u8f7d\u5b89\u5168\u7684\u624b\u673a\u652f\u4ed8\u94fe\u63a5\uff0c\u4e0d\u8bf7\u6c42\u4e8c\u7ef4\u7801"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/payment/PendingPaymentRecovery.test.tsx",
-          "assertion": "手机支付返回后立即查单、清理 pending 并刷新余额"
+          "assertion": "\u624b\u673a\u652f\u4ed8\u8fd4\u56de\u540e\u7acb\u5373\u67e5\u5355\u3001\u6e05\u7406 pending \u5e76\u5237\u65b0\u4f59\u989d"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航"
+          "assertion": "T28 iPhone \u652f\u4ed8\u8df3 mobile_url\uff0c\u5fae\u4fe1 WebView \u4e0d\u8bef\u5bfc\u822a"
         }
       ]
     },
@@ -876,13 +876,13 @@
       "id": "INC-20260804-DEPLOY-RETRY-RECOVERY",
       "occurredAt": "2026-08-04",
       "severity": "P1",
-      "symptom": "V5 部署升级中断正在运行的 Agent turn 后，旧 dispatch slot 未释放会让恢复子轮静默阻塞；同时不同重试层各自计数和展示，自动恢复不能持续且前端错误 UI 不统一。",
+      "symptom": "V5 \u90e8\u7f72\u5347\u7ea7\u4e2d\u65ad\u6b63\u5728\u8fd0\u884c\u7684 Agent turn \u540e\uff0c\u65e7 dispatch slot \u672a\u91ca\u653e\u4f1a\u8ba9\u6062\u590d\u5b50\u8f6e\u9759\u9ed8\u963b\u585e\uff1b\u540c\u65f6\u4e0d\u540c\u91cd\u8bd5\u5c42\u5404\u81ea\u8ba1\u6570\u548c\u5c55\u793a\uff0c\u81ea\u52a8\u6062\u590d\u4e0d\u80fd\u6301\u7eed\u4e14\u524d\u7aef\u9519\u8bef UI \u4e0d\u7edf\u4e00\u3002",
       "rootFixCommit": "6ef8add7",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
-          "assertion": "服务重启 exact tape 自动恢复同样复用路由字段"
+          "assertion": "\u670d\u52a1\u91cd\u542f exact tape \u81ea\u52a8\u6062\u590d\u540c\u6837\u590d\u7528\u8def\u7531\u5b57\u6bb5"
         },
         {
           "layer": "unit",
@@ -897,7 +897,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度"
+          "assertion": "T29 \u81ea\u52a8\u91cd\u8bd5\u7edf\u4e00\u663e\u793a\u6a21\u578b\u7e41\u5fd9\u4e0e\u5171\u4eab n/10 \u8fdb\u5ea6"
         }
       ]
     },
@@ -905,7 +905,7 @@
       "id": "INC-20260804-RETRY-ERROR-REDCARD",
       "occurredAt": "2026-08-04",
       "severity": "P0",
-      "symptom": "CCB 上游并发容量错误本可由 SessionManager 自动重试恢复，但 gateway 在每次失败 attempt 的 final 到达时立刻向前端发送 outbound.error 红卡；随后 retrying 虽继续执行，错误卡已把本轮终态化，而且 attempt 级拦截状态未重置会吞掉后续成功正文；刷新后持久化时间线还会同时重放已恢复 attempt 的明文 API Error。",
+      "symptom": "CCB \u4e0a\u6e38\u5e76\u53d1\u5bb9\u91cf\u9519\u8bef\u672c\u53ef\u7531 SessionManager \u81ea\u52a8\u91cd\u8bd5\u6062\u590d\uff0c\u4f46 gateway \u5728\u6bcf\u6b21\u5931\u8d25 attempt \u7684 final \u5230\u8fbe\u65f6\u7acb\u523b\u5411\u524d\u7aef\u53d1\u9001 outbound.error \u7ea2\u5361\uff1b\u968f\u540e retrying \u867d\u7ee7\u7eed\u6267\u884c\uff0c\u9519\u8bef\u5361\u5df2\u628a\u672c\u8f6e\u7ec8\u6001\u5316\uff0c\u800c\u4e14 attempt \u7ea7\u62e6\u622a\u72b6\u6001\u672a\u91cd\u7f6e\u4f1a\u541e\u6389\u540e\u7eed\u6210\u529f\u6b63\u6587\uff1b\u5237\u65b0\u540e\u6301\u4e45\u5316\u65f6\u95f4\u7ebf\u8fd8\u4f1a\u540c\u65f6\u91cd\u653e\u5df2\u6062\u590d attempt \u7684\u660e\u6587 API Error\u3002",
       "rootFixCommit": "aa583b70",
       "coverageCommits": [
         "0ced65d4",
@@ -921,7 +921,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+          "assertion": "T29 \u81ea\u52a8\u91cd\u8bd5\u7edf\u4e00\u663e\u793a\u6a21\u578b\u7e41\u5fd9\u4e0e\u5171\u4eab n/10 \u8fdb\u5ea6\uff1b\u91cd\u8bd5\u6210\u529f\u4fdd\u6301\u5b9e\u65f6\u53ef\u89c1"
         },
         {
           "layer": "integration",
@@ -934,7 +934,7 @@
       "id": "INC-20260804-NEW-USER-FREE-CREDITS",
       "occurredAt": "2026-08-04",
       "severity": "P1",
-      "symptom": "新用户验证成功后，登录响应可在免费订阅尚未物化时返回 0 额度；用户不经过后续 /api/me 就直接发起首轮时，会被余额预检拒绝。",
+      "symptom": "\u65b0\u7528\u6237\u9a8c\u8bc1\u6210\u529f\u540e\uff0c\u767b\u5f55\u54cd\u5e94\u53ef\u5728\u514d\u8d39\u8ba2\u9605\u5c1a\u672a\u7269\u5316\u65f6\u8fd4\u56de 0 \u989d\u5ea6\uff1b\u7528\u6237\u4e0d\u7ecf\u8fc7\u540e\u7eed /api/me \u5c31\u76f4\u63a5\u53d1\u8d77\u9996\u8f6e\u65f6\uff0c\u4f1a\u88ab\u4f59\u989d\u9884\u68c0\u62d2\u7edd\u3002",
       "rootFixCommit": "aa74a0eb",
       "regressions": [
         {
@@ -945,7 +945,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
-          "assertion": "登录响应必须已有可用额度，不依赖后续 /api/me"
+          "assertion": "\u767b\u5f55\u54cd\u5e94\u5fc5\u987b\u5df2\u6709\u53ef\u7528\u989d\u5ea6\uff0c\u4e0d\u4f9d\u8d56\u540e\u7eed /api/me"
         }
       ]
     },
@@ -953,7 +953,7 @@
       "id": "INC-20260804-QWEN38-CODEX-ADAPTER",
       "occurredAt": "2026-08-04",
       "severity": "P1",
-      "symptom": "qwen3.8-max 通过 Claude Code/Anthropic 兼容协议接入时无法稳定完成 V5 Agent turn，商业版与测试版均表现为模型不可用；直接 OpenAI Responses 探测证明供应商服务正常，故切换到 Codex Responses 适配路径。",
+      "symptom": "qwen3.8-max \u901a\u8fc7 Claude Code/Anthropic \u517c\u5bb9\u534f\u8bae\u63a5\u5165\u65f6\u65e0\u6cd5\u7a33\u5b9a\u5b8c\u6210 V5 Agent turn\uff0c\u5546\u4e1a\u7248\u4e0e\u6d4b\u8bd5\u7248\u5747\u8868\u73b0\u4e3a\u6a21\u578b\u4e0d\u53ef\u7528\uff1b\u76f4\u63a5 OpenAI Responses \u63a2\u6d4b\u8bc1\u660e\u4f9b\u5e94\u5546\u670d\u52a1\u6b63\u5e38\uff0c\u6545\u5207\u6362\u5230 Codex Responses \u9002\u914d\u8def\u5f84\u3002",
       "rootFixCommit": "ece3f5f8",
       "coverageCommits": [
         "7767576a",
@@ -992,7 +992,7 @@
       "id": "INC-20260805-OCR-CLI-PATH",
       "occurredAt": "2026-08-05",
       "severity": "P1",
-      "symptom": "V5 OCR 的 platform bundle 已包含 oc-ocr 可执行文件，但登录 shell 的 PATH 不含 bundle bin，entrypoint 又只为 oc-plugin 创建保留名链接，导致真实存量容器中 Agent 按技能调用 oc-ocr 时命令不存在。",
+      "symptom": "V5 OCR \u7684 platform bundle \u5df2\u5305\u542b oc-ocr \u53ef\u6267\u884c\u6587\u4ef6\uff0c\u4f46\u767b\u5f55 shell \u7684 PATH \u4e0d\u542b bundle bin\uff0centrypoint \u53c8\u53ea\u4e3a oc-plugin \u521b\u5efa\u4fdd\u7559\u540d\u94fe\u63a5\uff0c\u5bfc\u81f4\u771f\u5b9e\u5b58\u91cf\u5bb9\u5668\u4e2d Agent \u6309\u6280\u80fd\u8c03\u7528 oc-ocr \u65f6\u547d\u4ee4\u4e0d\u5b58\u5728\u3002",
       "rootFixCommit": "ee3b2e6e",
       "coverageCommits": [
         "c8b146e9"
@@ -1019,7 +1019,7 @@
       "id": "INC-20260805-OCR-TUNNEL-IDLE",
       "occurredAt": "2026-08-05",
       "severity": "P1",
-      "symptom": "SCNet 会关闭长期无应用输出的 OCR SSH remote command；远端 supervisor 随 sshd 消失后被 PID 1 收养并继续占用模型与 18960 端口，V5 宿主 tunnel 随后反复重连且每次因 EADDRINUSE 退出。",
+      "symptom": "SCNet \u4f1a\u5173\u95ed\u957f\u671f\u65e0\u5e94\u7528\u8f93\u51fa\u7684 OCR SSH remote command\uff1b\u8fdc\u7aef supervisor \u968f sshd \u6d88\u5931\u540e\u88ab PID 1 \u6536\u517b\u5e76\u7ee7\u7eed\u5360\u7528\u6a21\u578b\u4e0e 18960 \u7aef\u53e3\uff0cV5 \u5bbf\u4e3b tunnel \u968f\u540e\u53cd\u590d\u91cd\u8fde\u4e14\u6bcf\u6b21\u56e0 EADDRINUSE \u9000\u51fa\u3002",
       "rootFixCommit": "ef5bc3e8",
       "regressions": [
         {
@@ -1034,7 +1034,7 @@
         }
       ],
       "proofPending": {
-        "reason": "SCNet 已由产品负责人明确关机，OCR 不再属于 V5 主版本上线验证；独立严格 smoke 及其 CI 单测保留，活体 OCR proof 待专门 OCR 环境恢复后执行。",
+        "reason": "SCNet \u5df2\u7531\u4ea7\u54c1\u8d1f\u8d23\u4eba\u660e\u786e\u5173\u673a\uff0cOCR \u4e0d\u518d\u5c5e\u4e8e V5 \u4e3b\u7248\u672c\u4e0a\u7ebf\u9a8c\u8bc1\uff1b\u72ec\u7acb\u4e25\u683c smoke \u53ca\u5176 CI \u5355\u6d4b\u4fdd\u7559\uff0c\u6d3b\u4f53 OCR proof \u5f85\u4e13\u95e8 OCR \u73af\u5883\u6062\u590d\u540e\u6267\u884c\u3002",
         "since": "2026-08-07"
       }
     },
@@ -1042,18 +1042,18 @@
       "id": "INC-20260805-V5-IP-RETRY-TX",
       "occurredAt": "2026-08-05",
       "severity": "P1",
-      "symptom": "V5 存量容器 remount 时，随机 bound_ip 首次撞上 23505 unique 冲突后直接在同一 PostgreSQL 事务继续 INSERT，导致事务已中止并在下一次尝试稳定触发 25P02，阻断容器重建。",
+      "symptom": "V5 \u5b58\u91cf\u5bb9\u5668 remount \u65f6\uff0c\u968f\u673a bound_ip \u9996\u6b21\u649e\u4e0a 23505 unique \u51b2\u7a81\u540e\u76f4\u63a5\u5728\u540c\u4e00 PostgreSQL \u4e8b\u52a1\u7ee7\u7eed INSERT\uff0c\u5bfc\u81f4\u4e8b\u52a1\u5df2\u4e2d\u6b62\u5e76\u5728\u4e0b\u4e00\u6b21\u5c1d\u8bd5\u7a33\u5b9a\u89e6\u53d1 25P02\uff0c\u963b\u65ad\u5bb9\u5668\u91cd\u5efa\u3002",
       "rootFixCommit": "43da0df4",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
-          "assertion": "IP 分配重试的子事务序列；真 PG 会在 23505 后要求 ROLLBACK TO 才能继续"
+          "assertion": "IP \u5206\u914d\u91cd\u8bd5\u7684\u5b50\u4e8b\u52a1\u5e8f\u5217\uff1b\u771f PG \u4f1a\u5728 23505 \u540e\u8981\u6c42 ROLLBACK TO \u624d\u80fd\u7ee7\u7eed"
         },
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/v3ProvisionTxWindow.integ.test.ts",
-          "assertion": "随机 IP 首次撞 unique 后回滚到 savepoint，Tx1 可继续用第二个 IP（不触发 25P02）"
+          "assertion": "\u968f\u673a IP \u9996\u6b21\u649e unique \u540e\u56de\u6eda\u5230 savepoint\uff0cTx1 \u53ef\u7ee7\u7eed\u7528\u7b2c\u4e8c\u4e2a IP\uff08\u4e0d\u89e6\u53d1 25P02\uff09"
         },
         {
           "layer": "deploy-gate",
@@ -1066,7 +1066,7 @@
       "id": "INC-20260805-OCR-SMOKE-STDIN",
       "occurredAt": "2026-08-05",
       "severity": "P1",
-      "symptom": "V5 OCR worker 官方 smoke 的远端脚本通过 stdin 传给 bash -s，但其中的 supervisor census 又启动了未禁用 stdin 的嵌套 SSH；该 SSH 吞掉后续脚本后仍返回 0，导致稳定窗口、二次 ready/owner 校验和最终成功证据被静默跳过。",
+      "symptom": "V5 OCR worker \u5b98\u65b9 smoke \u7684\u8fdc\u7aef\u811a\u672c\u901a\u8fc7 stdin \u4f20\u7ed9 bash -s\uff0c\u4f46\u5176\u4e2d\u7684 supervisor census \u53c8\u542f\u52a8\u4e86\u672a\u7981\u7528 stdin \u7684\u5d4c\u5957 SSH\uff1b\u8be5 SSH \u541e\u6389\u540e\u7eed\u811a\u672c\u540e\u4ecd\u8fd4\u56de 0\uff0c\u5bfc\u81f4\u7a33\u5b9a\u7a97\u53e3\u3001\u4e8c\u6b21 ready/owner \u6821\u9a8c\u548c\u6700\u7ec8\u6210\u529f\u8bc1\u636e\u88ab\u9759\u9ed8\u8df3\u8fc7\u3002",
       "rootFixCommit": "e3958999",
       "regressions": [
         {
@@ -1081,7 +1081,7 @@
         }
       ],
       "proofPending": {
-        "reason": "SCNet 已由产品负责人明确关机，OCR 不再属于 V5 主版本上线验证；独立严格 smoke 及其 CI 单测保留，活体 OCR proof 待专门 OCR 环境恢复后执行。",
+        "reason": "SCNet \u5df2\u7531\u4ea7\u54c1\u8d1f\u8d23\u4eba\u660e\u786e\u5173\u673a\uff0cOCR \u4e0d\u518d\u5c5e\u4e8e V5 \u4e3b\u7248\u672c\u4e0a\u7ebf\u9a8c\u8bc1\uff1b\u72ec\u7acb\u4e25\u683c smoke \u53ca\u5176 CI \u5355\u6d4b\u4fdd\u7559\uff0c\u6d3b\u4f53 OCR proof \u5f85\u4e13\u95e8 OCR \u73af\u5883\u6062\u590d\u540e\u6267\u884c\u3002",
         "since": "2026-08-07"
       }
     },
@@ -1089,7 +1089,7 @@
       "id": "INC-20260807-LIVE-PROCESS-LOSS",
       "occurredAt": "2026-08-07",
       "severity": "P0",
-      "symptom": "V5 容器被管理重启或进程异常终止后，Agent 已经实时响应到浏览器的 thinking、工具调用与中间正文没有中央持久副本；刷新后只剩中断卡，已生成的大量过程永久不可见。",
+      "symptom": "V5 \u5bb9\u5668\u88ab\u7ba1\u7406\u91cd\u542f\u6216\u8fdb\u7a0b\u5f02\u5e38\u7ec8\u6b62\u540e\uff0cAgent \u5df2\u7ecf\u5b9e\u65f6\u54cd\u5e94\u5230\u6d4f\u89c8\u5668\u7684 thinking\u3001\u5de5\u5177\u8c03\u7528\u4e0e\u4e2d\u95f4\u6b63\u6587\u6ca1\u6709\u4e2d\u592e\u6301\u4e45\u526f\u672c\uff1b\u5237\u65b0\u540e\u53ea\u5269\u4e2d\u65ad\u5361\uff0c\u5df2\u751f\u6210\u7684\u5927\u91cf\u8fc7\u7a0b\u6c38\u4e45\u4e0d\u53ef\u89c1\u3002",
       "rootFixCommit": "640ed19b",
       "coverageCommits": [
         "120e850d"
@@ -1098,7 +1098,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
-          "assertion": "journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once"
+          "assertion": "journal page1 \u2192 overlapping WS frame \u2192 page2 applies thinking/tool/text exactly once"
         },
         {
           "layer": "integration",
@@ -1108,7 +1108,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
+          "assertion": "T31 journal page1\u2192WS N\u2192page2(N)\uff1a\u5df2\u54cd\u5e94\u601d\u8003/\u5de5\u5177/\u6b63\u6587\u5404\u6070\u597d\u4e00\u6b21"
         }
       ]
     },
@@ -1116,7 +1116,7 @@
       "id": "INC-20260807-CLIENT-ERROR-REPLAY",
       "occurredAt": "2026-08-07",
       "severity": "P1",
-      "symptom": "历史 live-frame 中的终态错误在会话同步时被反复重放；用户 Stop 又被旧 wire 误归为 upstream_failed，导致浏览器循环上报 /api/client-errors、触发 429 与告警。",
+      "symptom": "\u5386\u53f2 live-frame \u4e2d\u7684\u7ec8\u6001\u9519\u8bef\u5728\u4f1a\u8bdd\u540c\u6b65\u65f6\u88ab\u53cd\u590d\u91cd\u653e\uff1b\u7528\u6237 Stop \u53c8\u88ab\u65e7 wire \u8bef\u5f52\u4e3a upstream_failed\uff0c\u5bfc\u81f4\u6d4f\u89c8\u5668\u5faa\u73af\u4e0a\u62a5 /api/client-errors\u3001\u89e6\u53d1 429 \u4e0e\u544a\u8b66\u3002",
       "rootFixCommit": "03adb5f1",
       "coverageCommits": [
         "788ecc51",
@@ -1157,17 +1157,17 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环"
+          "assertion": "T32 durable error replay\uff1a\u7528\u6237 Stop \u4e0d\u4e0a\u62a5\uff0c\u5386\u53f2\u975e\u5c3e\u9519\u8bef\u4e0d\u89e6\u53d1\u540c\u6b65\u5faa\u73af"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
-          "assertion": "用户主动停止是预期终态，不得上报 turn_error 产品故障信号"
+          "assertion": "\u7528\u6237\u4e3b\u52a8\u505c\u6b62\u662f\u9884\u671f\u7ec8\u6001\uff0c\u4e0d\u5f97\u4e0a\u62a5 turn_error \u4ea7\u54c1\u6545\u969c\u4fe1\u53f7"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/deploy-v5.sh",
-          "assertion": "P3 会保留 OC_RUNTIME_RELEASE，但 candidate 含未生效的 runtime-source 改动"
+          "assertion": "P3 \u4f1a\u4fdd\u7559 OC_RUNTIME_RELEASE\uff0c\u4f46 candidate \u542b\u672a\u751f\u6548\u7684 runtime-source \u6539\u52a8"
         }
       ]
     },
@@ -1175,18 +1175,18 @@
       "id": "INC-20260808-CRON-INBOX-DELIVERY",
       "occurredAt": "2026-08-08",
       "severity": "P1",
-      "symptom": "定时任务完成后通过 durable inbox 送达结果时，PostgreSQL 将复用参数推断为 text，再与 bigint 用户 ID 比较，导致站内信写入稳定失败，用户看不到任务结果。",
+      "symptom": "\u5b9a\u65f6\u4efb\u52a1\u5b8c\u6210\u540e\u901a\u8fc7 durable inbox \u9001\u8fbe\u7ed3\u679c\u65f6\uff0cPostgreSQL \u5c06\u590d\u7528\u53c2\u6570\u63a8\u65ad\u4e3a text\uff0c\u518d\u4e0e bigint \u7528\u6237 ID \u6bd4\u8f83\uff0c\u5bfc\u81f4\u7ad9\u5185\u4fe1\u5199\u5165\u7a33\u5b9a\u5931\u8d25\uff0c\u7528\u6237\u770b\u4e0d\u5230\u4efb\u52a1\u7ed3\u679c\u3002",
       "rootFixCommit": "48717c15",
       "regressions": [
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/inbox.integ.test.ts",
-          "assertion": "cron delivery key 真 PG 写入、幂等与冲突保护"
+          "assertion": "cron delivery key \u771f PG \u5199\u5165\u3001\u5e42\u7b49\u4e0e\u51b2\u7a81\u4fdd\u62a4"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/11-cron-inbox-delivery.spec.ts",
-          "assertion": "cron durable inbox：真实容器直投 candidate 后用户 API 可见且字段完整"
+          "assertion": "cron durable inbox\uff1a\u771f\u5b9e\u5bb9\u5668\u76f4\u6295 candidate \u540e\u7528\u6237 API \u53ef\u89c1\u4e14\u5b57\u6bb5\u5b8c\u6574"
         }
       ]
     },
@@ -1194,7 +1194,7 @@
       "id": "INC-20260808-WEIBO-RELINK",
       "occurredAt": "2026-08-08",
       "severity": "P1",
-      "symptom": "微博上游登录状态失效或触发未归类挑战后，V5 账号可能仍显示可用且没有重新扫码入口；即使进入旧恢复流程也会先销毁连接，扫码中断后用户无法继续使用或安全重绑。",
+      "symptom": "\u5fae\u535a\u4e0a\u6e38\u767b\u5f55\u72b6\u6001\u5931\u6548\u6216\u89e6\u53d1\u672a\u5f52\u7c7b\u6311\u6218\u540e\uff0cV5 \u8d26\u53f7\u53ef\u80fd\u4ecd\u663e\u793a\u53ef\u7528\u4e14\u6ca1\u6709\u91cd\u65b0\u626b\u7801\u5165\u53e3\uff1b\u5373\u4f7f\u8fdb\u5165\u65e7\u6062\u590d\u6d41\u7a0b\u4e5f\u4f1a\u5148\u9500\u6bc1\u8fde\u63a5\uff0c\u626b\u7801\u4e2d\u65ad\u540e\u7528\u6237\u65e0\u6cd5\u7ee7\u7eed\u4f7f\u7528\u6216\u5b89\u5168\u91cd\u7ed1\u3002",
       "rootFixCommit": "169c06f7",
       "regressions": [
         {
@@ -1205,7 +1205,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/settings/ConnectorsTab.test.tsx",
-          "assertion": "当前版本微博账号始终可原位重新登录，扫码成功前不销毁旧连接"
+          "assertion": "\u5f53\u524d\u7248\u672c\u5fae\u535a\u8d26\u53f7\u59cb\u7ec8\u53ef\u539f\u4f4d\u91cd\u65b0\u767b\u5f55\uff0c\u626b\u7801\u6210\u529f\u524d\u4e0d\u9500\u6bc1\u65e7\u8fde\u63a5"
         },
         {
           "layer": "integration",
@@ -1215,7 +1215,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T33 当前微博账号重新扫码登录不会先解绑旧连接"
+          "assertion": "T33 \u5f53\u524d\u5fae\u535a\u8d26\u53f7\u91cd\u65b0\u626b\u7801\u767b\u5f55\u4e0d\u4f1a\u5148\u89e3\u7ed1\u65e7\u8fde\u63a5"
         }
       ]
     },
@@ -1223,7 +1223,7 @@
       "id": "INC-20260809-CCB-CONTEXT-OVERFLOW",
       "occurredAt": "2026-08-09",
       "severity": "P1",
-      "symptom": "CCB 长会话把完整 Base64 工具结果按字符数低估后重新注入上游，触发上下文 400；同一轮自动重试又持久化多条原始 API Error，导致会话无法继续且 UI 同时展示重复原始错误。",
+      "symptom": "CCB \u957f\u4f1a\u8bdd\u628a\u5b8c\u6574 Base64 \u5de5\u5177\u7ed3\u679c\u6309\u5b57\u7b26\u6570\u4f4e\u4f30\u540e\u91cd\u65b0\u6ce8\u5165\u4e0a\u6e38\uff0c\u89e6\u53d1\u4e0a\u4e0b\u6587 400\uff1b\u540c\u4e00\u8f6e\u81ea\u52a8\u91cd\u8bd5\u53c8\u6301\u4e45\u5316\u591a\u6761\u539f\u59cb API Error\uff0c\u5bfc\u81f4\u4f1a\u8bdd\u65e0\u6cd5\u7ee7\u7eed\u4e14 UI \u540c\u65f6\u5c55\u793a\u91cd\u590d\u539f\u59cb\u9519\u8bef\u3002",
       "rootFixCommit": "1b7c4c07",
       "coverageCommits": [
         "3ef0ecec"
@@ -1252,7 +1252,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+          "assertion": "T29 \u81ea\u52a8\u91cd\u8bd5\u7edf\u4e00\u663e\u793a\u6a21\u578b\u7e41\u5fd9\u4e0e\u5171\u4eab n/10 \u8fdb\u5ea6\uff1b\u91cd\u8bd5\u6210\u529f\u4fdd\u6301\u5b9e\u65f6\u53ef\u89c1"
         }
       ]
     },
@@ -1260,7 +1260,7 @@
       "id": "INC-20260810-LIVE-FRAME-SEQUENCE-RESET",
       "occurredAt": "2026-08-10",
       "severity": "P1",
-      "symptom": "同一容器会话销毁后重新连接时，Gateway 帧序号从 1 重新开始并撞上另一 dispatch 或无 dispatch 的服务端定时任务历史持久化身份，导致持久化失败关闭用户共享 WebSocket，页面持续断线重连。",
+      "symptom": "\u540c\u4e00\u5bb9\u5668\u4f1a\u8bdd\u9500\u6bc1\u540e\u91cd\u65b0\u8fde\u63a5\u65f6\uff0cGateway \u5e27\u5e8f\u53f7\u4ece 1 \u91cd\u65b0\u5f00\u59cb\u5e76\u649e\u4e0a\u53e6\u4e00 dispatch \u6216\u65e0 dispatch \u7684\u670d\u52a1\u7aef\u5b9a\u65f6\u4efb\u52a1\u5386\u53f2\u6301\u4e45\u5316\u8eab\u4efd\uff0c\u5bfc\u81f4\u6301\u4e45\u5316\u5931\u8d25\u5173\u95ed\u7528\u6237\u5171\u4eab WebSocket\uff0c\u9875\u9762\u6301\u7eed\u65ad\u7ebf\u91cd\u8fde\u3002",
       "rootFixCommit": "6d2c930c",
       "coverageCommits": [
         "bab6c8c6",
@@ -1279,7 +1279,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
-          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
+          "assertion": "\u65ad\u7ebf\u91cd\u8fde:\u56de\u590d\u5230\u8fbe\u6216\u660e\u786e\u5931\u8d25,\u7edd\u4e0d\u6c38\u4e45\u9759\u9ed8"
         },
         {
           "layer": "unit",
@@ -1297,7 +1297,7 @@
       "id": "INC-20260810-TURN-WAIVER-PARAM-TYPE",
       "occurredAt": "2026-08-10",
       "severity": "P1",
-      "symptom": "自动免单写入定向收件箱时，同一个 PostgreSQL 参数被同时推断为 bigint 与 text，导致 waiver 事务报 42P08 并回滚，用户无法收到免单退款与回执。",
+      "symptom": "\u81ea\u52a8\u514d\u5355\u5199\u5165\u5b9a\u5411\u6536\u4ef6\u7bb1\u65f6\uff0c\u540c\u4e00\u4e2a PostgreSQL \u53c2\u6570\u88ab\u540c\u65f6\u63a8\u65ad\u4e3a bigint \u4e0e text\uff0c\u5bfc\u81f4 waiver \u4e8b\u52a1\u62a5 42P08 \u5e76\u56de\u6eda\uff0c\u7528\u6237\u65e0\u6cd5\u6536\u5230\u514d\u5355\u9000\u6b3e\u4e0e\u56de\u6267\u3002",
       "rootFixCommit": "eef1a6c1",
       "coverageCommits": [
         "5c781c06",
@@ -1325,7 +1325,7 @@
       "id": "INC-20260810-AUTODREAM-STALE-REPORT",
       "occurredAt": "2026-08-10",
       "severity": "P1",
-      "symptom": "全面优化已接管梦境整理后，记忆中心仍反复展示已停用旧版任务的最后失败回执，让用户误以为当前整理始终未完成。",
+      "symptom": "\u5168\u9762\u4f18\u5316\u5df2\u63a5\u7ba1\u68a6\u5883\u6574\u7406\u540e\uff0c\u8bb0\u5fc6\u4e2d\u5fc3\u4ecd\u53cd\u590d\u5c55\u793a\u5df2\u505c\u7528\u65e7\u7248\u4efb\u52a1\u7684\u6700\u540e\u5931\u8d25\u56de\u6267\uff0c\u8ba9\u7528\u6237\u8bef\u4ee5\u4e3a\u5f53\u524d\u6574\u7406\u59cb\u7ec8\u672a\u5b8c\u6210\u3002",
       "rootFixCommit": "27611390",
       "coverageCommits": [
         "da945b0c",
@@ -1335,7 +1335,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/manage/MemoryPanel.test.tsx",
-          "assertion": "全面优化模式不再展示永远不会更新的旧版失败回执"
+          "assertion": "\u5168\u9762\u4f18\u5316\u6a21\u5f0f\u4e0d\u518d\u5c55\u793a\u6c38\u8fdc\u4e0d\u4f1a\u66f4\u65b0\u7684\u65e7\u7248\u5931\u8d25\u56de\u6267"
         },
         {
           "layer": "unit",
@@ -1345,7 +1345,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T34 全面优化模式隐藏不会再更新的旧版梦境失败回执"
+          "assertion": "T34 \u5168\u9762\u4f18\u5316\u6a21\u5f0f\u9690\u85cf\u4e0d\u4f1a\u518d\u66f4\u65b0\u7684\u65e7\u7248\u68a6\u5883\u5931\u8d25\u56de\u6267"
         },
         {
           "layer": "unit",
@@ -1358,7 +1358,7 @@
       "id": "INC-20260810-LIVE-TURN-VISIBILITY",
       "occurredAt": "2026-08-10",
       "severity": "P1",
-      "symptom": "Agent 后台持续执行且 live-frame 已持久化时，前端断线恢复仍从游标 0 反复全量重放并按成功次数指数退避，导致长会话已生成的思考、工具和正文长时间不可见；自动重试又额外展示带 Stop 的独立卡片，与输入框主 Stop 重复。",
+      "symptom": "Agent \u540e\u53f0\u6301\u7eed\u6267\u884c\u4e14 live-frame \u5df2\u6301\u4e45\u5316\u65f6\uff0c\u524d\u7aef\u65ad\u7ebf\u6062\u590d\u4ecd\u4ece\u6e38\u6807 0 \u53cd\u590d\u5168\u91cf\u91cd\u653e\u5e76\u6309\u6210\u529f\u6b21\u6570\u6307\u6570\u9000\u907f\uff0c\u5bfc\u81f4\u957f\u4f1a\u8bdd\u5df2\u751f\u6210\u7684\u601d\u8003\u3001\u5de5\u5177\u548c\u6b63\u6587\u957f\u65f6\u95f4\u4e0d\u53ef\u89c1\uff1b\u81ea\u52a8\u91cd\u8bd5\u53c8\u989d\u5916\u5c55\u793a\u5e26 Stop \u7684\u72ec\u7acb\u5361\u7247\uff0c\u4e0e\u8f93\u5165\u6846\u4e3b Stop \u91cd\u590d\u3002",
       "rootFixCommit": "6d4e70b1",
       "regressions": [
         {
@@ -1369,17 +1369,17 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
-          "assertion": "retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」"
+          "assertion": "retrying \u2192 \u6eda\u52a8\u65e7 max \u4e5f\u7edf\u4e00\u4e3a\u300c\u6a21\u578b\u7e41\u5fd9\uff0c\u6b63\u5728\u91cd\u8bd5\u4e2d\uff08n/10\uff09\u300d"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
+          "assertion": "T31 journal page1\u2192WS N\u2192page2(N)\uff1a\u5df2\u54cd\u5e94\u601d\u8003/\u5de5\u5177/\u6b63\u6587\u5404\u6070\u597d\u4e00\u6b21"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
+          "assertion": "T35 Composer \u662f\u552f\u4e00 Stop \u5165\u53e3\uff0c\u505c\u6b62\u7ed3\u7b97\u4e2d\u539f\u6309\u94ae\u7981\u7528\u4e14\u4e0d\u91cd\u590d\u63d0\u4ea4"
         }
       ]
     },
@@ -1387,18 +1387,18 @@
       "id": "INC-20260811-INTERRUPTED-TOOL-STATUS",
       "occurredAt": "2026-08-11",
       "severity": "P1",
-      "symptom": "用户停止 turn 后，输入框已正确恢复发送态，但中断 tape 内未完成的历史子任务仍显示运行中转圈，让用户误以为子任务没有停止。",
+      "symptom": "\u7528\u6237\u505c\u6b62 turn \u540e\uff0c\u8f93\u5165\u6846\u5df2\u6b63\u786e\u6062\u590d\u53d1\u9001\u6001\uff0c\u4f46\u4e2d\u65ad tape \u5185\u672a\u5b8c\u6210\u7684\u5386\u53f2\u5b50\u4efb\u52a1\u4ecd\u663e\u793a\u8fd0\u884c\u4e2d\u8f6c\u5708\uff0c\u8ba9\u7528\u6237\u8bef\u4ee5\u4e3a\u5b50\u4efb\u52a1\u6ca1\u6709\u505c\u6b62\u3002",
       "rootFixCommit": "276bd969",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/ToolCard.test.tsx",
-          "assertion": "被中断 turn 的未完成历史子任务显示已取消，不再伪装运行中"
+          "assertion": "\u88ab\u4e2d\u65ad turn \u7684\u672a\u5b8c\u6210\u5386\u53f2\u5b50\u4efb\u52a1\u663e\u793a\u5df2\u53d6\u6d88\uff0c\u4e0d\u518d\u4f2a\u88c5\u8fd0\u884c\u4e2d"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中"
+          "assertion": "T36 \u88ab\u4e2d\u65ad\u5386\u53f2\u5b50\u4efb\u52a1\u663e\u793a\u5df2\u53d6\u6d88\uff0c\u5b9e\u65f6\u672a\u5b8c\u6210\u5b50\u4efb\u52a1\u4ecd\u8fd0\u884c\u4e2d"
         }
       ]
     },
@@ -1406,7 +1406,7 @@
       "id": "INC-20260812-H3-WORKER-MIGRATION-CANCEL",
       "occurredAt": "2026-08-12",
       "severity": "P1",
-      "symptom": "原 H3 worker 永久下线后，已经进入 staging 的取消任务在替换 worker 上反复收到 attempt 404，永久停留在 worker_cancel_state_unknown，用户持续看到无法收敛的任务。",
+      "symptom": "\u539f H3 worker \u6c38\u4e45\u4e0b\u7ebf\u540e\uff0c\u5df2\u7ecf\u8fdb\u5165 staging \u7684\u53d6\u6d88\u4efb\u52a1\u5728\u66ff\u6362 worker \u4e0a\u53cd\u590d\u6536\u5230 attempt 404\uff0c\u6c38\u4e45\u505c\u7559\u5728 worker_cancel_state_unknown\uff0c\u7528\u6237\u6301\u7eed\u770b\u5230\u65e0\u6cd5\u6536\u655b\u7684\u4efb\u52a1\u3002",
       "rootFixCommit": "abffc3ab",
       "coverageCommits": [
         "702885fd",
@@ -1421,7 +1421,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T30 视频任务中心持久排队、实时进度与跨 worker 取消终态"
+          "assertion": "T30 \u89c6\u9891\u4efb\u52a1\u4e2d\u5fc3\u6301\u4e45\u6392\u961f\u3001\u5b9e\u65f6\u8fdb\u5ea6\u4e0e\u8de8 worker \u53d6\u6d88\u7ec8\u6001"
         }
       ]
     },
@@ -1429,7 +1429,7 @@
       "id": "INC-20260813-LIVE-REPLAY-GENERATION",
       "occurredAt": "2026-08-13",
       "severity": "P1",
-      "symptom": "Agent 执行期间刷新页面后，旧容器的高位持久化帧游标吞掉新容器从 1 重新开始的实时帧，页面永久停留在「正在恢复实时内容」且已生成内容不可见。",
+      "symptom": "Agent \u6267\u884c\u671f\u95f4\u5237\u65b0\u9875\u9762\u540e\uff0c\u65e7\u5bb9\u5668\u7684\u9ad8\u4f4d\u6301\u4e45\u5316\u5e27\u6e38\u6807\u541e\u6389\u65b0\u5bb9\u5668\u4ece 1 \u91cd\u65b0\u5f00\u59cb\u7684\u5b9e\u65f6\u5e27\uff0c\u9875\u9762\u6c38\u4e45\u505c\u7559\u5728\u300c\u6b63\u5728\u6062\u590d\u5b9e\u65f6\u5185\u5bb9\u300d\u4e14\u5df2\u751f\u6210\u5185\u5bb9\u4e0d\u53ef\u89c1\u3002",
       "rootFixCommit": "7d44e0a4",
       "regressions": [
         {
@@ -1445,7 +1445,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容"
+          "assertion": "T39 \u5237\u65b0\u8de8\u5bb9\u5668\u4ee3\u9645\u6062\u590d\uff1a\u65e7\u9ad8\u6e38\u6807\u4e0d\u518d\u541e\u6389\u65b0\u5bb9\u5668\u5b9e\u65f6\u5185\u5bb9"
         }
       ]
     },
@@ -1453,13 +1453,13 @@
       "id": "INC-20260813-GROK-AUTHORITY-REJECTED",
       "occurredAt": "2026-08-13",
       "severity": "P1",
-      "symptom": "管理员选择 Grok 后，容器 runtime 将签名 authority 中的 engine=grok 当作未知引擎拒绝，turn 未进入 Grok relay 且页面没有回复。",
+      "symptom": "\u7ba1\u7406\u5458\u9009\u62e9 Grok \u540e\uff0c\u5bb9\u5668 runtime \u5c06\u7b7e\u540d authority \u4e2d\u7684 engine=grok \u5f53\u4f5c\u672a\u77e5\u5f15\u64ce\u62d2\u7edd\uff0cturn \u672a\u8fdb\u5165 Grok relay \u4e14\u9875\u9762\u6ca1\u6709\u56de\u590d\u3002",
       "rootFixCommit": "78eaad0b",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
-          "assertion": "Grok authority:engine=grok 验签消费后保持 Grok 执行描述符"
+          "assertion": "Grok authority:engine=grok \u9a8c\u7b7e\u6d88\u8d39\u540e\u4fdd\u6301 Grok \u6267\u884c\u63cf\u8ff0\u7b26"
         },
         {
           "layer": "deploy-gate",
@@ -1472,18 +1472,18 @@
       "id": "INC-20260813-CURSOR-AUTHORITY-REJECTED",
       "occurredAt": "2026-08-13",
       "severity": "P1",
-      "symptom": "管理员受控启用 Cursor 后，容器 runtime 将签名 authority 中的 engine=cursor 当作未知引擎拒绝，turn 未启动 Cursor CLI 且页面没有回复。",
+      "symptom": "\u7ba1\u7406\u5458\u53d7\u63a7\u542f\u7528 Cursor \u540e\uff0c\u5bb9\u5668 runtime \u5c06\u7b7e\u540d authority \u4e2d\u7684 engine=cursor \u5f53\u4f5c\u672a\u77e5\u5f15\u64ce\u62d2\u7edd\uff0cturn \u672a\u542f\u52a8 Cursor CLI \u4e14\u9875\u9762\u6ca1\u6709\u56de\u590d\u3002",
       "rootFixCommit": "db7332ff",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
-          "assertion": "Cursor authority:engine=cursor 验签消费后保持受控 Cursor 执行描述符"
+          "assertion": "Cursor authority:engine=cursor \u9a8c\u7b7e\u6d88\u8d39\u540e\u4fdd\u6301\u53d7\u63a7 Cursor \u6267\u884c\u63cf\u8ff0\u7b26"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
-          "assertion": "Cursor billingRequestId 必须与 external audit 的 frame.requestId 精确绑定"
+          "assertion": "Cursor billingRequestId \u5fc5\u987b\u4e0e external audit \u7684 frame.requestId \u7cbe\u786e\u7ed1\u5b9a"
         },
         {
           "layer": "deploy-gate",
@@ -1496,7 +1496,7 @@
       "id": "INC-20260813-CURSOR-STREAM-JSON",
       "occurredAt": "2026-08-13",
       "severity": "P1",
-      "symptom": "Cursor 官方 CLI 已返回正确答案，但一等 adapter 把嵌套 assistant.message 对象序列化成文本，并再次追加最终聚合事件，导致前台展示 JSON 且答案重复。",
+      "symptom": "Cursor \u5b98\u65b9 CLI \u5df2\u8fd4\u56de\u6b63\u786e\u7b54\u6848\uff0c\u4f46\u4e00\u7b49 adapter \u628a\u5d4c\u5957 assistant.message \u5bf9\u8c61\u5e8f\u5217\u5316\u6210\u6587\u672c\uff0c\u5e76\u518d\u6b21\u8ffd\u52a0\u6700\u7ec8\u805a\u5408\u4e8b\u4ef6\uff0c\u5bfc\u81f4\u524d\u53f0\u5c55\u793a JSON \u4e14\u7b54\u6848\u91cd\u590d\u3002",
       "rootFixCommit": "f63f06c1",
       "regressions": [
         {
@@ -1553,7 +1553,7 @@
       "id": "INC-20260814-CURSOR-HOTCFG-WRAPPER",
       "occurredAt": "2026-08-14",
       "severity": "P1",
-      "symptom": "Cursor 平台 bundle 已激活，但 adapter 仍调用镜像内旧 /usr/local/bin/oc-cursor，导致 adapter 生成的 openclaude-memory MCP 配置没有被复制加载，技能检索与记忆工具显示 MCP server does not exist。",
+      "symptom": "Cursor \u5e73\u53f0 bundle \u5df2\u6fc0\u6d3b\uff0c\u4f46 adapter \u4ecd\u8c03\u7528\u955c\u50cf\u5185\u65e7 /usr/local/bin/oc-cursor\uff0c\u5bfc\u81f4 adapter \u751f\u6210\u7684 openclaude-memory MCP \u914d\u7f6e\u6ca1\u6709\u88ab\u590d\u5236\u52a0\u8f7d\uff0c\u6280\u80fd\u68c0\u7d22\u4e0e\u8bb0\u5fc6\u5de5\u5177\u663e\u793a MCP server does not exist\u3002",
       "rootFixCommit": "e5486e43",
       "regressions": [
         {
@@ -1572,7 +1572,7 @@
       "id": "INC-20260815-ZAI-AUDIT-JSON-NULL",
       "occurredAt": "2026-08-15",
       "severity": "P1",
-      "symptom": "Z.AI GLM-5.3 发布迁移把真实管理 API 写入的 JSONB null 误当成 SQL NULL 校验，导致 0218 在生产安全回滚并阻塞模型公开。",
+      "symptom": "Z.AI GLM-5.3 \u53d1\u5e03\u8fc1\u79fb\u628a\u771f\u5b9e\u7ba1\u7406 API \u5199\u5165\u7684 JSONB null \u8bef\u5f53\u6210 SQL NULL \u6821\u9a8c\uff0c\u5bfc\u81f4 0218 \u5728\u751f\u4ea7\u5b89\u5168\u56de\u6eda\u5e76\u963b\u585e\u6a21\u578b\u516c\u5f00\u3002",
       "rootFixCommit": "2948a259",
       "regressions": [
         {
@@ -1596,7 +1596,7 @@
       "id": "INC-20260815-ENGINE-STOP-DRAIN-HANG",
       "occurredAt": "2026-08-15",
       "severity": "P1",
-      "symptom": "会话点 Stop 后前端永久停在「正在停止…」。oc-cursor.sh 用绝对路径调 /bin/kill，而运行时镜像只装 util-linux 未装 procps，退码 127 被 || true 吞掉，使整个 TERM/KILL 升级块成为死代码；setsid 起的 cursor-agent 因此成为孤儿并继续持有 gateway 的 stdout，adapter 与 sessionManager 都在无上限 await waitForOutputDrain()，turn 永不落终态，客户端拿不到 control receipt。",
+      "symptom": "\u4f1a\u8bdd\u70b9 Stop \u540e\u524d\u7aef\u6c38\u4e45\u505c\u5728\u300c\u6b63\u5728\u505c\u6b62\u2026\u300d\u3002oc-cursor.sh \u7528\u7edd\u5bf9\u8def\u5f84\u8c03 /bin/kill\uff0c\u800c\u8fd0\u884c\u65f6\u955c\u50cf\u53ea\u88c5 util-linux \u672a\u88c5 procps\uff0c\u9000\u7801 127 \u88ab || true \u541e\u6389\uff0c\u4f7f\u6574\u4e2a TERM/KILL \u5347\u7ea7\u5757\u6210\u4e3a\u6b7b\u4ee3\u7801\uff1bsetsid \u8d77\u7684 cursor-agent \u56e0\u6b64\u6210\u4e3a\u5b64\u513f\u5e76\u7ee7\u7eed\u6301\u6709 gateway \u7684 stdout\uff0cadapter \u4e0e sessionManager \u90fd\u5728\u65e0\u4e0a\u9650 await waitForOutputDrain()\uff0cturn \u6c38\u4e0d\u843d\u7ec8\u6001\uff0c\u5ba2\u6237\u7aef\u62ff\u4e0d\u5230 control receipt\u3002",
       "rootFixCommit": "425b283a",
       "coverageCommits": [
         "5a5aa310",
@@ -1655,23 +1655,23 @@
       "id": "INC-20260821-SESSION-LIST-NUL-READ-STORM",
       "occurredAt": "2026-08-21",
       "severity": "P0",
-      "symptom": "同步版上线后，历史会话 messages 中合法 JSON escaped NUL 在 PostgreSQL 侧栏预览提取时触发 unsupported Unicode escape sequence，导致该用户 /api/sessions/list 持续 500；同时当前会话的 unread 投影尚未回落时，每次流式刷新都会重复 POST mark-read，形成请求风暴，前端表现为空白及连接中/已断开反复切换。",
+      "symptom": "\u540c\u6b65\u7248\u4e0a\u7ebf\u540e\uff0c\u5386\u53f2\u4f1a\u8bdd messages \u4e2d\u5408\u6cd5 JSON escaped NUL \u5728 PostgreSQL \u4fa7\u680f\u9884\u89c8\u63d0\u53d6\u65f6\u89e6\u53d1 unsupported Unicode escape sequence\uff0c\u5bfc\u81f4\u8be5\u7528\u6237 /api/sessions/list \u6301\u7eed 500\uff1b\u540c\u65f6\u5f53\u524d\u4f1a\u8bdd\u7684 unread \u6295\u5f71\u5c1a\u672a\u56de\u843d\u65f6\uff0c\u6bcf\u6b21\u6d41\u5f0f\u5237\u65b0\u90fd\u4f1a\u91cd\u590d POST mark-read\uff0c\u5f62\u6210\u8bf7\u6c42\u98ce\u66b4\uff0c\u524d\u7aef\u8868\u73b0\u4e3a\u7a7a\u767d\u53ca\u8fde\u63a5\u4e2d/\u5df2\u65ad\u5f00\u53cd\u590d\u5207\u6362\u3002",
       "rootFixCommit": "c04a6e14",
       "regressions": [
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
-          "assertion": "list/search 遇到 JSON 字符串内 escaped NUL 时按单行降级，不拖垮整个侧栏"
+          "assertion": "list/search \u9047\u5230 JSON \u5b57\u7b26\u4e32\u5185 escaped NUL \u65f6\u6309\u5355\u884c\u964d\u7ea7\uff0c\u4e0d\u62d6\u57ae\u6574\u4e2a\u4fa7\u680f"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/hooks/useUnreadSessions.test.ts",
-          "assertion": "当前会话在 unread=false 回执前重复刷新只发一次 mark-read"
+          "assertion": "\u5f53\u524d\u4f1a\u8bdd\u5728 unread=false \u56de\u6267\u524d\u91cd\u590d\u5237\u65b0\u53ea\u53d1\u4e00\u6b21 mark-read"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read"
+          "assertion": "T44 \u5f53\u524d\u4f1a\u8bdd unread=false \u56de\u6267\u524d\u7684\u6d41\u5f0f\u5237\u65b0\u53ea\u53d1\u9001\u4e00\u6b21 mark-read"
         }
       ],
       "coverageCommits": [
@@ -1682,23 +1682,23 @@
       "id": "INC-20260822-GROK-TOOL-JSON-CARD-LEAK",
       "occurredAt": "2026-08-22",
       "severity": "P1",
-      "symptom": "selfhost 引入的 Grok 显示解码把未识别 outputJson 序列化后泄漏进 ToolCard；商业侧既有 EXACT_STRUCTURED_MARKER 断言在 merge 树上失败。根修是未知 shape 返回空串，精确字节仍留在 tape/output。",
+      "symptom": "selfhost \u5f15\u5165\u7684 Grok \u663e\u793a\u89e3\u7801\u628a\u672a\u8bc6\u522b outputJson \u5e8f\u5217\u5316\u540e\u6cc4\u6f0f\u8fdb ToolCard\uff1b\u5546\u4e1a\u4fa7\u65e2\u6709 EXACT_STRUCTURED_MARKER \u65ad\u8a00\u5728 merge \u6811\u4e0a\u5931\u8d25\u3002\u6839\u4fee\u662f\u672a\u77e5 shape \u8fd4\u56de\u7a7a\u4e32\uff0c\u7cbe\u786e\u5b57\u8282\u4ecd\u7559\u5728 tape/output\u3002",
       "rootFixCommit": "b4404d1d",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/ToolCard.test.tsx",
-          "assertion": "结构化 tool_result 的附加字段不生成结果详情入口"
+          "assertion": "\u7ed3\u6784\u5316 tool_result \u7684\u9644\u52a0\u5b57\u6bb5\u4e0d\u751f\u6210\u7ed3\u679c\u8be6\u60c5\u5165\u53e3"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/liveActivityLabel.test.ts",
-          "assertion": "未知工具 / 思考原文 / 路径 → 执行操作，永不回显参数"
+          "assertion": "\u672a\u77e5\u5de5\u5177 / \u601d\u8003\u539f\u6587 / \u8def\u5f84 \u2192 \u6267\u884c\u64cd\u4f5c\uff0c\u6c38\u4e0d\u56de\u663e\u53c2\u6570"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见"
+          "assertion": "T12 Agent \u5361\u6309\u94ae\u540d\u5355\u6070\u597d\u4e3a\u767d\u540d\u5355(\u65e0\u5197\u4f59\u539f\u59cb\u8bb0\u5f55\u5165\u53e3)\u4e14\u771f\u5b9e\u8fc7\u7a0b\u53ef\u89c1"
         }
       ]
     },
@@ -1706,7 +1706,7 @@
       "id": "INC-20260823-TAPE-ANCHOR-DRIFT",
       "occurredAt": "2026-08-23",
       "severity": "P1",
-      "symptom": "format-3 runtime batching 上线后，容器 Phase A 仍按未批处理/旧 prefix 计算 settlement authority，而 master Phase B 按物理 runtime batch 选 billing anchor，导致 27 个 post-terminal continuation tape 永久 settlement hash mismatch 并反复重试；滚动 enable/rollback 期间 writer/reader flag skew 也可再次触发。",
+      "symptom": "format-3 runtime batching \u4e0a\u7ebf\u540e\uff0c\u5bb9\u5668 Phase A \u4ecd\u6309\u672a\u6279\u5904\u7406/\u65e7 prefix \u8ba1\u7b97 settlement authority\uff0c\u800c master Phase B \u6309\u7269\u7406 runtime batch \u9009 billing anchor\uff0c\u5bfc\u81f4 27 \u4e2a post-terminal continuation tape \u6c38\u4e45 settlement hash mismatch \u5e76\u53cd\u590d\u91cd\u8bd5\uff1b\u6eda\u52a8 enable/rollback \u671f\u95f4 writer/reader flag skew \u4e5f\u53ef\u518d\u6b21\u89e6\u53d1\u3002",
       "rootFixCommit": "4d41029d",
       "regressions": [
         {
@@ -1740,7 +1740,7 @@
       "id": "INC-20260825-HOST-FULL-POOL-SATURATION",
       "occurredAt": "2026-08-25",
       "severity": "P1",
-      "symptom": "商业版单节点 compute_hosts.max_containers=50 被打满，且 agent_containers state=active 恰好 50，其中 49 个 last_ws_activity 超 30 分钟（最老 401 分钟）。闲置回收器 v3idleSweep 长期被 OC_IDLE_SWEEP_DISABLED=1 关闭，槽位只进不出，把并发上限变成历史累计活跃用户上限。没有容器的用户在 WS 建桥 resolveContainerEndpoint 阶段就被 ContainerUnreadyError 挡下，前端收到 close 4503 reason=host_full 后按 server hint 每 10 秒无限重连，横幅显示「资源繁忙，正在排队重试」；turn_dispatches 与 usage_records 全为 0 行，即模型从未被调用。已有容器的用户不受影响。",
+      "symptom": "\u5546\u4e1a\u7248\u5355\u8282\u70b9 compute_hosts.max_containers=50 \u88ab\u6253\u6ee1\uff0c\u4e14 agent_containers state=active \u6070\u597d 50\uff0c\u5176\u4e2d 49 \u4e2a last_ws_activity \u8d85 30 \u5206\u949f\uff08\u6700\u8001 401 \u5206\u949f\uff09\u3002\u95f2\u7f6e\u56de\u6536\u5668 v3idleSweep \u957f\u671f\u88ab OC_IDLE_SWEEP_DISABLED=1 \u5173\u95ed\uff0c\u69fd\u4f4d\u53ea\u8fdb\u4e0d\u51fa\uff0c\u628a\u5e76\u53d1\u4e0a\u9650\u53d8\u6210\u5386\u53f2\u7d2f\u8ba1\u6d3b\u8dc3\u7528\u6237\u4e0a\u9650\u3002\u6ca1\u6709\u5bb9\u5668\u7684\u7528\u6237\u5728 WS \u5efa\u6865 resolveContainerEndpoint \u9636\u6bb5\u5c31\u88ab ContainerUnreadyError \u6321\u4e0b\uff0c\u524d\u7aef\u6536\u5230 close 4503 reason=host_full \u540e\u6309 server hint \u6bcf 10 \u79d2\u65e0\u9650\u91cd\u8fde\uff0c\u6a2a\u5e45\u663e\u793a\u300c\u8d44\u6e90\u7e41\u5fd9\uff0c\u6b63\u5728\u6392\u961f\u91cd\u8bd5\u300d\uff1bturn_dispatches \u4e0e usage_records \u5168\u4e3a 0 \u884c\uff0c\u5373\u6a21\u578b\u4ece\u672a\u88ab\u8c03\u7528\u3002\u5df2\u6709\u5bb9\u5668\u7684\u7528\u6237\u4e0d\u53d7\u5f71\u54cd\u3002",
       "rootFixCommit": "c1598ce6",
       "coverageCommits": [
         "d0171a2d",
@@ -1750,37 +1750,37 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
-          "assertion": "SELECT 之后、删除之前 last_ws_activity 被刷新 → 不 vanish,racedWithActivity=1"
+          "assertion": "SELECT \u4e4b\u540e\u3001\u5220\u9664\u4e4b\u524d last_ws_activity \u88ab\u5237\u65b0 \u2192 \u4e0d vanish,racedWithActivity=1"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
-          "assertion": "drain 返回 busy → 不 vanish、不调 docker,skippedBusy=1"
+          "assertion": "drain \u8fd4\u56de busy \u2192 \u4e0d vanish\u3001\u4e0d\u8c03 docker,skippedBusy=1"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
-          "assertion": "drain 返回 failed → 不 vanish(fail-closed),skippedDrainFailed=1"
+          "assertion": "drain \u8fd4\u56de failed \u2192 \u4e0d vanish(fail-closed),skippedDrainFailed=1"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/v3IdleSweep.test.ts",
-          "assertion": "拿不到 per-uid 锁 → skip 且不 vanish"
+          "assertion": "\u62ff\u4e0d\u5230 per-uid \u9501 \u2192 skip \u4e14\u4e0d vanish"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
-          "assertion": "requireIdleCutoffMin: 行已不满足闲置条件时返回 false,不 vanish,不 docker"
+          "assertion": "requireIdleCutoffMin: \u884c\u5df2\u4e0d\u6ee1\u8db3\u95f2\u7f6e\u6761\u4ef6\u65f6\u8fd4\u56de false,\u4e0d vanish,\u4e0d docker"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
-          "assertion": "桥接连着但用户一直没发帧时,会按周期刷 last_ws_activity"
+          "assertion": "\u6865\u63a5\u8fde\u7740\u4f46\u7528\u6237\u4e00\u76f4\u6ca1\u53d1\u5e27\u65f6,\u4f1a\u6309\u5468\u671f\u5237 last_ws_activity"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
-          "assertion": "桥关闭后 keepalive 定时器被清掉、不再刷"
+          "assertion": "\u6865\u5173\u95ed\u540e keepalive \u5b9a\u65f6\u5668\u88ab\u6e05\u6389\u3001\u4e0d\u518d\u5237"
         },
         {
           "layer": "deploy-gate",
@@ -1793,7 +1793,7 @@
       "id": "INC-20260826-UPLOAD-COLDSTART-503",
       "occurredAt": "2026-08-26",
       "severity": "P1",
-      "symptom": "容器冷启动时 POST /api/uploads fail-closed 返回 503 + Retry-After，前端 uploadFile 不重试直接抛错；Composer 只拦 uploading 不拦 error，发送键重新可用，消息照发但附件被静默丢掉。用户以为附件已上传，agent 只能回「无法读取附件」。生产 00:21/00:28 冷 503、00:52 热 200。",
+      "symptom": "\u5bb9\u5668\u51b7\u542f\u52a8\u65f6 POST /api/uploads fail-closed \u8fd4\u56de 503 + Retry-After\uff0c\u524d\u7aef uploadFile \u4e0d\u91cd\u8bd5\u76f4\u63a5\u629b\u9519\uff1bComposer \u53ea\u62e6 uploading \u4e0d\u62e6 error\uff0c\u53d1\u9001\u952e\u91cd\u65b0\u53ef\u7528\uff0c\u6d88\u606f\u7167\u53d1\u4f46\u9644\u4ef6\u88ab\u9759\u9ed8\u4e22\u6389\u3002\u7528\u6237\u4ee5\u4e3a\u9644\u4ef6\u5df2\u4e0a\u4f20\uff0cagent \u53ea\u80fd\u56de\u300c\u65e0\u6cd5\u8bfb\u53d6\u9644\u4ef6\u300d\u3002\u751f\u4ea7 00:21/00:28 \u51b7 503\u300100:52 \u70ed 200\u3002",
       "rootFixCommit": "dc2e4623",
       "regressions": [
         {
@@ -1819,12 +1819,12 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/composerAttach.test.tsx",
-          "assertion": "存在 error 状态附件时发送被禁用"
+          "assertion": "\u5b58\u5728 error \u72b6\u6001\u9644\u4ef6\u65f6\u53d1\u9001\u88ab\u7981\u7528"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/v5-e2e-journey-canary.mjs",
-          "assertion": "必须等到 chip done 终态再放行"
+          "assertion": "\u5fc5\u987b\u7b49\u5230 chip done \u7ec8\u6001\u518d\u653e\u884c"
         }
       ]
     },
@@ -1832,18 +1832,18 @@
       "id": "INC-20260824-AUTOMATIC-WAIVER-LOOP",
       "occurredAt": "2026-08-24",
       "severity": "P1",
-      "symptom": "V5 selfhost 把 Codex 等待用户回答误判为 15 分钟无输出，并把 Grok 首事件前静默自动恢复到同一坏 native session；同一根请求可连续恢复最多 10 次，每次都生成免单站内信。根修将等待用户建模为显式状态、首个静默恢复重置 native session、第二次无进展持久熔断，并按恢复血缘合并免单通知而不合并逐 turn 退款账本。",
+      "symptom": "V5 selfhost \u628a Codex \u7b49\u5f85\u7528\u6237\u56de\u7b54\u8bef\u5224\u4e3a 15 \u5206\u949f\u65e0\u8f93\u51fa\uff0c\u5e76\u628a Grok \u9996\u4e8b\u4ef6\u524d\u9759\u9ed8\u81ea\u52a8\u6062\u590d\u5230\u540c\u4e00\u574f native session\uff1b\u540c\u4e00\u6839\u8bf7\u6c42\u53ef\u8fde\u7eed\u6062\u590d\u6700\u591a 10 \u6b21\uff0c\u6bcf\u6b21\u90fd\u751f\u6210\u514d\u5355\u7ad9\u5185\u4fe1\u3002\u6839\u4fee\u5c06\u7b49\u5f85\u7528\u6237\u5efa\u6a21\u4e3a\u663e\u5f0f\u72b6\u6001\u3001\u9996\u4e2a\u9759\u9ed8\u6062\u590d\u91cd\u7f6e native session\u3001\u7b2c\u4e8c\u6b21\u65e0\u8fdb\u5c55\u6301\u4e45\u7194\u65ad\uff0c\u5e76\u6309\u6062\u590d\u8840\u7f18\u5408\u5e76\u514d\u5355\u901a\u77e5\u800c\u4e0d\u5408\u5e76\u9010 turn \u9000\u6b3e\u8d26\u672c\u3002",
       "rootFixCommit": "51cecd2a",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
-          "assertion": "两个并发 requestUserInput 只在最后一个回答后退出 waiting"
+          "assertion": "\u4e24\u4e2a\u5e76\u53d1 requestUserInput \u53ea\u5728\u6700\u540e\u4e00\u4e2a\u56de\u7b54\u540e\u9000\u51fa waiting"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerIdleTimeout.test.ts",
-          "assertion": "明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发"
+          "assertion": "\u660e\u786e\u7b49\u5f85\u7528\u6237\u65f6\u8df3\u8fc7 idle\uff0c\u4f46\u540c\u4e00\u9608\u503c\u5728\u666e\u901a\u6267\u884c\u6001\u4ecd\u89e6\u53d1"
         },
         {
           "layer": "integration",
@@ -1863,12 +1863,12 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
-          "assertion": "fallback owner 对同血缘第二次静默超时熔断，不再推进 2..10"
+          "assertion": "fallback owner \u5bf9\u540c\u8840\u7f18\u7b2c\u4e8c\u6b21\u9759\u9ed8\u8d85\u65f6\u7194\u65ad\uff0c\u4e0d\u518d\u63a8\u8fdb 2..10"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T46 Codex 等待用户回答保持人类等待态，不显示模型卡住或自动免单"
+          "assertion": "T46 Codex \u7b49\u5f85\u7528\u6237\u56de\u7b54\u4fdd\u6301\u4eba\u7c7b\u7b49\u5f85\u6001\uff0c\u4e0d\u663e\u793a\u6a21\u578b\u5361\u4f4f\u6216\u81ea\u52a8\u514d\u5355"
         }
       ]
     },
@@ -1876,7 +1876,7 @@
       "id": "INC-20260823-SELFHOST-AUDIT-CLOSURE",
       "occurredAt": "2026-08-23",
       "severity": "P1",
-      "symptom": "selfhost 近期增量存在后台委派回调跨重启丢失或乱序、相同目标卡片无法精确关联、任务面板旧种子不升级且阶段运维入口权限不对称、catalog 并发刷新回退、成本精度状态在续跑中丢失，以及 Grok 槽释放对瞬态 transport error 过度裁决等问题。",
+      "symptom": "selfhost \u8fd1\u671f\u589e\u91cf\u5b58\u5728\u540e\u53f0\u59d4\u6d3e\u56de\u8c03\u8de8\u91cd\u542f\u4e22\u5931\u6216\u4e71\u5e8f\u3001\u76f8\u540c\u76ee\u6807\u5361\u7247\u65e0\u6cd5\u7cbe\u786e\u5173\u8054\u3001\u4efb\u52a1\u9762\u677f\u65e7\u79cd\u5b50\u4e0d\u5347\u7ea7\u4e14\u9636\u6bb5\u8fd0\u7ef4\u5165\u53e3\u6743\u9650\u4e0d\u5bf9\u79f0\u3001catalog \u5e76\u53d1\u5237\u65b0\u56de\u9000\u3001\u6210\u672c\u7cbe\u5ea6\u72b6\u6001\u5728\u7eed\u8dd1\u4e2d\u4e22\u5931\uff0c\u4ee5\u53ca Grok \u69fd\u91ca\u653e\u5bf9\u77ac\u6001 transport error \u8fc7\u5ea6\u88c1\u51b3\u7b49\u95ee\u9898\u3002",
       "rootFixCommit": "4a564bc8",
       "regressions": [
         {
@@ -1897,7 +1897,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T47 编程助手官方教程路由不再回落到故障 Ark 模型"
+          "assertion": "T47 \u7f16\u7a0b\u52a9\u624b\u5b98\u65b9\u6559\u7a0b\u8def\u7531\u4e0d\u518d\u56de\u843d\u5230\u6545\u969c Ark \u6a21\u578b"
         }
       ],
       "coverageCommits": [
@@ -1909,7 +1909,7 @@
       "id": "INC-20260827-LIVE-RESET-PROCESS-VANISH",
       "occurredAt": "2026-08-27",
       "severity": "P1",
-      "symptom": "V5 商业版正常结束轮（非用户点停止）后，时间线 thinking/tool/plan 过程行先整体消失，等 Phase-B 精确 tape 到达才恢复。根因是 Phase-A unpublished fallback 带 _turnTapeComplete，convergeTerminalTurns 清掉发送态后，live journal/units 按 cmid 做 owner reset，把无 _source:server/_turnTapeId 的 live 过程行整段滤掉。",
+      "symptom": "V5 \u5546\u4e1a\u7248\u6b63\u5e38\u7ed3\u675f\u8f6e\uff08\u975e\u7528\u6237\u70b9\u505c\u6b62\uff09\u540e\uff0c\u65f6\u95f4\u7ebf thinking/tool/plan \u8fc7\u7a0b\u884c\u5148\u6574\u4f53\u6d88\u5931\uff0c\u7b49 Phase-B \u7cbe\u786e tape \u5230\u8fbe\u624d\u6062\u590d\u3002\u6839\u56e0\u662f Phase-A unpublished fallback \u5e26 _turnTapeComplete\uff0cconvergeTerminalTurns \u6e05\u6389\u53d1\u9001\u6001\u540e\uff0clive journal/units \u6309 cmid \u505a owner reset\uff0c\u628a\u65e0 _source:server/_turnTapeId \u7684 live \u8fc7\u7a0b\u884c\u6574\u6bb5\u6ee4\u6389\u3002",
       "rootFixCommit": "75a50179",
       "regressions": [
         {
@@ -1930,7 +1930,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划"
+          "assertion": "T49 Phase-A unpublished \u540e\u7a7a live-units reset \u4ecd\u4fdd\u7559\u601d\u8003/\u5de5\u5177/\u8ba1\u5212"
         }
       ]
     },
@@ -1938,7 +1938,7 @@
       "id": "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
       "occurredAt": "2026-08-27",
       "severity": "P1",
-      "symptom": "V5 商业版微博扫码授权弹窗顶部红条「Plugin 授权服务暂不可用」。POST /api/plugins/weibo/setup 两次 503 PLUGIN_RUNTIME_UNAVAILABLE（33–70ms）。根因是 weiboContract WEIBO_PLUGIN_VERSION 已到 1.6.36，但 deploy-v5.sh 只自动 seed 知识星球、不 seed 微博，生产 listing 停在 1.5.0，classifyWeiboSetupPin 拒绝。根修给 deploy-v5.sh 补与知识星球同构的无人值守 seed/transition 门；人工 cookie 验证仍走 seed-weibo-plugin.ts --verify-and-upgrade-user。",
+      "symptom": "V5 \u5546\u4e1a\u7248\u5fae\u535a\u626b\u7801\u6388\u6743\u5f39\u7a97\u9876\u90e8\u7ea2\u6761\u300cPlugin \u6388\u6743\u670d\u52a1\u6682\u4e0d\u53ef\u7528\u300d\u3002POST /api/plugins/weibo/setup \u4e24\u6b21 503 PLUGIN_RUNTIME_UNAVAILABLE\uff0833\u201370ms\uff09\u3002\u6839\u56e0\u662f weiboContract WEIBO_PLUGIN_VERSION \u5df2\u5230 1.6.36\uff0c\u4f46 deploy-v5.sh \u53ea\u81ea\u52a8 seed \u77e5\u8bc6\u661f\u7403\u3001\u4e0d seed \u5fae\u535a\uff0c\u751f\u4ea7 listing \u505c\u5728 1.5.0\uff0cclassifyWeiboSetupPin \u62d2\u7edd\u3002\u6839\u4fee\u7ed9 deploy-v5.sh \u8865\u4e0e\u77e5\u8bc6\u661f\u7403\u540c\u6784\u7684\u65e0\u4eba\u503c\u5b88 seed/transition \u95e8\uff1b\u4eba\u5de5 cookie \u9a8c\u8bc1\u4ecd\u8d70 seed-weibo-plugin.ts --verify-and-upgrade-user\u3002",
       "rootFixCommit": "9c542d82",
       "regressions": [
         {
@@ -1960,7 +1960,7 @@
       "id": "INC-20260827-PAPER-HINT-LEAK",
       "occurredAt": "2026-08-27",
       "severity": "P1",
-      "symptom": "论文/文献短句被 master 拼上【OpenClaude 论文任务系统提示】后原样写入 client_sessions 用户行 text；前端 UserCard 按 msg.text 渲染，用户气泡泄漏系统提示。根因是 appendScanSciPaperIntentHintToFrame 漏填 content.displayText，persist 回落到已拼接的 content.text。",
+      "symptom": "\u8bba\u6587/\u6587\u732e\u77ed\u53e5\u88ab master \u62fc\u4e0a\u3010OpenClaude \u8bba\u6587\u4efb\u52a1\u7cfb\u7edf\u63d0\u793a\u3011\u540e\u539f\u6837\u5199\u5165 client_sessions \u7528\u6237\u884c text\uff1b\u524d\u7aef UserCard \u6309 msg.text \u6e32\u67d3\uff0c\u7528\u6237\u6c14\u6ce1\u6cc4\u6f0f\u7cfb\u7edf\u63d0\u793a\u3002\u6839\u56e0\u662f appendScanSciPaperIntentHintToFrame \u6f0f\u586b content.displayText\uff0cpersist \u56de\u843d\u5230\u5df2\u62fc\u63a5\u7684 content.text\u3002",
       "rootFixCommit": "a1414343",
       "regressions": [
         {
@@ -1976,7 +1976,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T50 persist 后用户气泡只显示原文，不含论文任务系统提示"
+          "assertion": "T50 persist \u540e\u7528\u6237\u6c14\u6ce1\u53ea\u663e\u793a\u539f\u6587\uff0c\u4e0d\u542b\u8bba\u6587\u4efb\u52a1\u7cfb\u7edf\u63d0\u793a"
         }
       ]
     },
@@ -1984,7 +1984,7 @@
       "id": "INC-20260827-WEIBO-ERRCODE-ACTIONABLE",
       "occurredAt": "2026-08-27",
       "severity": "P1",
-      "symptom": "V5 商业版 user 1 微博读动作把 WEIBO_ACTION_FAILED 吞成 CONNECTION_ERROR，写动作对外 message 千篇一律 Weibo action failed，unknown 账本不给副作用/重试指引，会话失效也不提示重新扫码。根因是 rpc 白名单过窄、WeiboRuntimeError 统一文案、错误信封没有 agent 指引字段。",
+      "symptom": "V5 \u5546\u4e1a\u7248 user 1 \u5fae\u535a\u8bfb\u52a8\u4f5c\u628a WEIBO_ACTION_FAILED \u541e\u6210 CONNECTION_ERROR\uff0c\u5199\u52a8\u4f5c\u5bf9\u5916 message \u5343\u7bc7\u4e00\u5f8b Weibo action failed\uff0cunknown \u8d26\u672c\u4e0d\u7ed9\u526f\u4f5c\u7528/\u91cd\u8bd5\u6307\u5f15\uff0c\u4f1a\u8bdd\u5931\u6548\u4e5f\u4e0d\u63d0\u793a\u91cd\u65b0\u626b\u7801\u3002\u6839\u56e0\u662f rpc \u767d\u540d\u5355\u8fc7\u7a84\u3001WeiboRuntimeError \u7edf\u4e00\u6587\u6848\u3001\u9519\u8bef\u4fe1\u5c01\u6ca1\u6709 agent \u6307\u5f15\u5b57\u6bb5\u3002",
       "rootFixCommit": "0d4d8d09",
       "regressions": [
         {
@@ -2000,17 +2000,17 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/connectorsLogic.test.ts",
-          "assertion": "/v3/plugins/call 放行微博已知错误码并附带 agent 指引，不再吞成 CONNECTION_ERROR"
+          "assertion": "/v3/plugins/call \u653e\u884c\u5fae\u535a\u5df2\u77e5\u9519\u8bef\u7801\u5e76\u9644\u5e26 agent \u6307\u5f15\uff0c\u4e0d\u518d\u541e\u6210 CONNECTION_ERROR"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T51 Weibo 错误码提示重新扫码且图文失败建议纯文字"
+          "assertion": "T51 Weibo \u9519\u8bef\u7801\u63d0\u793a\u91cd\u65b0\u626b\u7801\u4e14\u56fe\u6587\u5931\u8d25\u5efa\u8bae\u7eaf\u6587\u5b57"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/plugins/pluginErrorGuidance.test.ts",
-          "assertion": "each write code × failed/unknown has exact retrySafe/sideEffect/nextAction"
+          "assertion": "each write code \u00d7 failed/unknown has exact retrySafe/sideEffect/nextAction"
         }
       ],
       "coverageCommits": [
@@ -2021,7 +2021,7 @@
       "id": "INC-20260828-CCB-PROMPT-TOO-LONG",
       "occurredAt": "2026-08-28",
       "severity": "P1",
-      "symptom": "CCB 长会话在用户回答 AskUserQuestion 后恢复执行时，上游以 subtype=success + result=\"Prompt is too long\" 返回上下文溢出；gateway 未把该规范诊断识别为 context_too_long，也未清除 poisoned native resume，导致进程反复崩溃、原轮被中断且继续尝试仍落回同一失败点。",
+      "symptom": "CCB \u957f\u4f1a\u8bdd\u5728\u7528\u6237\u56de\u7b54 AskUserQuestion \u540e\u6062\u590d\u6267\u884c\u65f6\uff0c\u4e0a\u6e38\u4ee5 subtype=success + result=\"Prompt is too long\" \u8fd4\u56de\u4e0a\u4e0b\u6587\u6ea2\u51fa\uff1bgateway \u672a\u628a\u8be5\u89c4\u8303\u8bca\u65ad\u8bc6\u522b\u4e3a context_too_long\uff0c\u4e5f\u672a\u6e05\u9664 poisoned native resume\uff0c\u5bfc\u81f4\u8fdb\u7a0b\u53cd\u590d\u5d29\u6e83\u3001\u539f\u8f6e\u88ab\u4e2d\u65ad\u4e14\u7ee7\u7eed\u5c1d\u8bd5\u4ecd\u843d\u56de\u540c\u4e00\u5931\u8d25\u70b9\u3002",
       "rootFixCommit": "0633e7a7",
       "regressions": [
         {
@@ -2042,7 +2042,7 @@
         {
           "layer": "unit",
           "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
-          "assertion": "CCB release build 必须固定启用且仅额外启用 REACTIVE_COMPACT"
+          "assertion": "CCB release build \u5fc5\u987b\u56fa\u5b9a\u542f\u7528\u4e14\u4ec5\u989d\u5916\u542f\u7528 REACTIVE_COMPACT"
         },
         {
           "layer": "deploy-gate",
@@ -2058,7 +2058,7 @@
       "id": "INC-20260827-PHASE-B-DEFER-VANISH",
       "occurredAt": "2026-08-27",
       "severity": "P1",
-      "symptom": "V5 自用实例 Phase-B 精确 assistant 到达后，`_payloadDeferred` 空壳（agent-group/tool）被当成「精确过程已到」，hasExactCompletionEvidence 与 journal owner-reset 删掉 live thinking/tool/agent-group，屏幕只剩虚线「正在读取真实 Agent 记录…」，直到 IntersectionObserver + Range 206 水合才补回。",
+      "symptom": "V5 \u81ea\u7528\u5b9e\u4f8b Phase-B \u7cbe\u786e assistant \u5230\u8fbe\u540e\uff0c`_payloadDeferred` \u7a7a\u58f3\uff08agent-group/tool\uff09\u88ab\u5f53\u6210\u300c\u7cbe\u786e\u8fc7\u7a0b\u5df2\u5230\u300d\uff0chasExactCompletionEvidence \u4e0e journal owner-reset \u5220\u6389 live thinking/tool/agent-group\uff0c\u5c4f\u5e55\u53ea\u5269\u865a\u7ebf\u300c\u6b63\u5728\u8bfb\u53d6\u771f\u5b9e Agent \u8bb0\u5f55\u2026\u300d\uff0c\u76f4\u5230 IntersectionObserver + Range 206 \u6c34\u5408\u624d\u8865\u56de\u3002",
       "rootFixCommit": "0002df13",
       "regressions": [
         {
@@ -2094,7 +2094,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T55 Phase-B deferred agent-group 后空 live-units reset 仍保留委派过程行"
+          "assertion": "T55 Phase-B deferred agent-group \u540e\u7a7a live-units reset \u4ecd\u4fdd\u7559\u59d4\u6d3e\u8fc7\u7a0b\u884c"
         }
       ]
     },
@@ -2102,7 +2102,7 @@
       "id": "INC-20260829-CUTOVER-SURVIVOR-STALE-WD",
       "occurredAt": "2026-08-29",
       "severity": "P0",
-      "symptom": "selfhost --cutover 失败后 cutover-survivor timeout 无视已恢复的 live master 健康，用布防时写死的 Aug18 工作树 unit 覆盖 master/egress，18790 宕约 11 分钟（11:22-11:33Z）。根因链：新 rel pgSessionsBackend.ts 链式 map 缺括号 → tsx TransformError 让 egress 崩溃 → saga 回滚后仍用新 dist 做 smoke → 补偿 die 未 disarm 幸存者。",
+      "symptom": "selfhost --cutover \u5931\u8d25\u540e cutover-survivor timeout \u65e0\u89c6\u5df2\u6062\u590d\u7684 live master \u5065\u5eb7\uff0c\u7528\u5e03\u9632\u65f6\u5199\u6b7b\u7684 Aug18 \u5de5\u4f5c\u6811 unit \u8986\u76d6 master/egress\uff0c18790 \u5b95\u7ea6 11 \u5206\u949f\uff0811:22-11:33Z\uff09\u3002\u6839\u56e0\u94fe\uff1a\u65b0 rel pgSessionsBackend.ts \u94fe\u5f0f map \u7f3a\u62ec\u53f7 \u2192 tsx TransformError \u8ba9 egress \u5d29\u6e83 \u2192 saga \u56de\u6eda\u540e\u4ecd\u7528\u65b0 dist \u505a smoke \u2192 \u8865\u507f die \u672a disarm \u5e78\u5b58\u8005\u3002",
       "rootFixCommit": "2190563c",
       "regressions": [
         {
@@ -2123,7 +2123,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/v5-runtime-release-lib.sh",
-          "assertion": "restart_cmd 失败;摘录 egress/master 最近日志"
+          "assertion": "restart_cmd \u5931\u8d25;\u6458\u5f55 egress/master \u6700\u8fd1\u65e5\u5fd7"
         }
       ]
     },
@@ -2131,7 +2131,7 @@
       "id": "INC-20260831-TURNEND-ORDER-COLLAPSE",
       "occurredAt": "2026-08-31",
       "severity": "P1",
-      "symptom": "V5 selfhost 正常结束轮后，交错在 thinking/工具卡之间的正文段全部挤到整轮末尾，Phase-B 精确 tape 到达后恢复。内容不丢。根因是 Phase-A unpublished fallback 显式 drop live assistant，pending-exact 排除 assistant，owner reset 不认 text unit；fallback 无 ordinal 排在 tape 槽末。",
+      "symptom": "V5 selfhost \u6b63\u5e38\u7ed3\u675f\u8f6e\u540e\uff0c\u4ea4\u9519\u5728 thinking/\u5de5\u5177\u5361\u4e4b\u95f4\u7684\u6b63\u6587\u6bb5\u5168\u90e8\u6324\u5230\u6574\u8f6e\u672b\u5c3e\uff0cPhase-B \u7cbe\u786e tape \u5230\u8fbe\u540e\u6062\u590d\u3002\u5185\u5bb9\u4e0d\u4e22\u3002\u6839\u56e0\u662f Phase-A unpublished fallback \u663e\u5f0f drop live assistant\uff0cpending-exact \u6392\u9664 assistant\uff0cowner reset \u4e0d\u8ba4 text unit\uff1bfallback \u65e0 ordinal \u6392\u5728 tape \u69fd\u672b\u3002",
       "rootFixCommit": "46380d50",
       "regressions": [
         {
@@ -2162,7 +2162,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T59 Phase-A unpublished 后交错 live assistant 段仍保持 thinking/正文1/tool/正文2"
+          "assertion": "T59 Phase-A unpublished \u540e\u4ea4\u9519 live assistant \u6bb5\u4ecd\u4fdd\u6301 thinking/\u6b63\u65871/tool/\u6b63\u65872"
         }
       ]
     },
@@ -2170,7 +2170,7 @@
       "id": "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT",
       "occurredAt": "2026-08-31",
       "severity": "P1",
-      "symptom": "Cursor 回合 MCP send_to_agent 报 401 async delegate requires delegate context。根因是 buildCursorMemoryMcpConfig 漏注 OPENCLAUDE_DELEGATE_CONTEXT_FILE，MCP 子进程无法带签名 context 调 /delegate。",
+      "symptom": "Cursor \u56de\u5408 MCP send_to_agent \u62a5 401 async delegate requires delegate context\u3002\u6839\u56e0\u662f buildCursorMemoryMcpConfig \u6f0f\u6ce8 OPENCLAUDE_DELEGATE_CONTEXT_FILE\uff0cMCP \u5b50\u8fdb\u7a0b\u65e0\u6cd5\u5e26\u7b7e\u540d context \u8c03 /delegate\u3002",
       "rootFixCommit": "1bfa85be",
       "coverageCommits": [
         "886e4dfa",
@@ -2195,7 +2195,7 @@
         }
       ],
       "proofPending": {
-        "reason": "Cursor MCP context 注入无法在商业候选 HTTP 上诚实复现(/delegate 对 user JWT 403,且无法从 Playwright 读取候选容器 MCP child env)。回归锁在 spawn 单测 + handleHttp 监听器单测。",
+        "reason": "Cursor MCP context \u6ce8\u5165\u65e0\u6cd5\u5728\u5546\u4e1a\u5019\u9009 HTTP \u4e0a\u8bda\u5b9e\u590d\u73b0(/delegate \u5bf9 user JWT 403,\u4e14\u65e0\u6cd5\u4ece Playwright \u8bfb\u53d6\u5019\u9009\u5bb9\u5668 MCP child env)\u3002\u56de\u5f52\u9501\u5728 spawn \u5355\u6d4b + handleHttp \u76d1\u542c\u5668\u5355\u6d4b\u3002",
         "since": "2026-08-31"
       }
     },
@@ -2203,7 +2203,7 @@
       "id": "INC-20260831-DELEGATE-MODEL-UNKNOWN",
       "occurredAt": "2026-08-31",
       "severity": "P1",
-      "symptom": "委派显式 --model 传未知 slug 时静默 inherit 默认模型。fail-loud 判定已存在但被 OC_MODEL_AUTHORITY flag 门住，flag 关时错误 slug 不报 DELEGATE_MODEL_UNKNOWN。",
+      "symptom": "\u59d4\u6d3e\u663e\u5f0f --model \u4f20\u672a\u77e5 slug \u65f6\u9759\u9ed8 inherit \u9ed8\u8ba4\u6a21\u578b\u3002fail-loud \u5224\u5b9a\u5df2\u5b58\u5728\u4f46\u88ab OC_MODEL_AUTHORITY flag \u95e8\u4f4f\uff0cflag \u5173\u65f6\u9519\u8bef slug \u4e0d\u62a5 DELEGATE_MODEL_UNKNOWN\u3002",
       "rootFixCommit": "8170334e",
       "coverageCommits": [
         "886e4dfa",
@@ -2213,7 +2213,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
-          "assertion": "HTTP delegate:flag 未开 + 显式未知型号 → 400 DELEGATE_MODEL_UNKNOWN,不得 inherit"
+          "assertion": "HTTP delegate:flag \u672a\u5f00 + \u663e\u5f0f\u672a\u77e5\u578b\u53f7 \u2192 400 DELEGATE_MODEL_UNKNOWN,\u4e0d\u5f97 inherit"
         },
         {
           "layer": "unit",
@@ -2236,7 +2236,7 @@
       "id": "INC-20260831-VISIBLE-ORPHAN-FALSE-KILL",
       "occurredAt": "2026-08-31",
       "severity": "P1",
-      "symptom": "V5 selfhost 对账器 closeVisibleOrphans 在 accepted 满 15min 且 PG 无 dispatch 流帧时走 interrupt_tapeless，把 persist 积压下仍活着的引擎(已有 turn_traces.first_visible_at / thinking+text，卡在长委派)误杀成 turn interrupted (visible fallback)；且该路径不写 producer_fenced_at，僵尸 producer 继续跑。实锤 dispatch 89f18ffe-c2a8-4412-9ce8-97c69f17ef22。",
+      "symptom": "V5 selfhost \u5bf9\u8d26\u5668 closeVisibleOrphans \u5728 accepted \u6ee1 15min \u4e14 PG \u65e0 dispatch \u6d41\u5e27\u65f6\u8d70 interrupt_tapeless\uff0c\u628a persist \u79ef\u538b\u4e0b\u4ecd\u6d3b\u7740\u7684\u5f15\u64ce(\u5df2\u6709 turn_traces.first_visible_at / thinking+text\uff0c\u5361\u5728\u957f\u59d4\u6d3e)\u8bef\u6740\u6210 turn interrupted (visible fallback)\uff1b\u4e14\u8be5\u8def\u5f84\u4e0d\u5199 producer_fenced_at\uff0c\u50f5\u5c38 producer \u7ee7\u7eed\u8dd1\u3002\u5b9e\u9524 dispatch 89f18ffe-c2a8-4412-9ce8-97c69f17ef22\u3002",
       "rootFixCommit": "19e9d471",
       "regressions": [
         {
@@ -2337,7 +2337,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
-          "assertion": "insert 首次 reject 随后成功 → 最终落库且不 warn"
+          "assertion": "insert \u9996\u6b21 reject \u968f\u540e\u6210\u529f \u2192 \u6700\u7ec8\u843d\u5e93\u4e14\u4e0d warn"
         },
         {
           "layer": "unit",
@@ -2372,12 +2372,12 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
-          "assertion": "INC-20260831 gap2: frame landed between scan and lock → ROLLBACK, zero UPDATE, counted stale"
+          "assertion": "INC-20260831 gap2: frame landed between scan and lock \u2192 ROLLBACK, zero UPDATE, counted stale"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
-          "assertion": "INC-20260831 gap2: first_visible appearing between scan and lock → ROLLBACK"
+          "assertion": "INC-20260831 gap2: first_visible appearing between scan and lock \u2192 ROLLBACK"
         },
         {
           "layer": "deploy-gate",
@@ -2400,7 +2400,7 @@
       "id": "INC-20260901-CURSOR-SAND-INFERENCE",
       "occurredAt": "2026-09-01",
       "severity": "P1",
-      "symptom": "V5 selfhost 将 Cursor Fable Sand 误实现为 AgentService CLI -H/global Headers hook；前者被 CLI 覆盖回 cli，后者把 sand 污染到 agent.v1.AgentService/Run 并被上游拒绝。人工抓包确认未命中 aiserver.v1.InferenceService/Stream。",
+      "symptom": "V5 selfhost \u5c06 Cursor Fable Sand \u8bef\u5b9e\u73b0\u4e3a AgentService CLI -H/global Headers hook\uff1b\u524d\u8005\u88ab CLI \u8986\u76d6\u56de cli\uff0c\u540e\u8005\u628a sand \u6c61\u67d3\u5230 agent.v1.AgentService/Run \u5e76\u88ab\u4e0a\u6e38\u62d2\u7edd\u3002\u4eba\u5de5\u6293\u5305\u786e\u8ba4\u672a\u547d\u4e2d aiserver.v1.InferenceService/Stream\u3002",
       "rootFixCommit": "a5da8cea",
       "regressions": [
         {
@@ -2491,7 +2491,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cursor-sand-inference.ts",
-          "assertion": "[cursor-sand-inference] PASS — Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto"
+          "assertion": "[cursor-sand-inference] PASS \u2014 Sand keys use InferenceService with native tool schemas; native Cursor stays isolated to native keys and Auto"
         }
       ],
       "coverageCommits": [
@@ -2517,7 +2517,7 @@
       "id": "INC-20260902-TIMELINE-PAINT-VISION-HINT",
       "occurredAt": "2026-09-02",
       "severity": "P1",
-      "symptom": "V5 selfhost Web 时间线:离底后新发送的用户消息落入底 spacer 迟迟不显示;流式回合中 content-visibility:auto skipped 行的 200px 估高写回高度缓存,视口内已渲染内容变空白,滚动后才恢复。同批:catalog supports_vision=false 使 cursor 家族(Read 可原生看图)的上传图片提示把 oc-vision CLI 排在 Read 之前,agent 绕过原生识图。 反合复现:距底 80px 时追加乐观 user 行,ResizeObserver effect 在 messages.length 变化时用已位移 DOM 重捕锚点,画窗 span 校正被跳过,视口内容上跳一行间距。",
+      "symptom": "V5 selfhost Web \u65f6\u95f4\u7ebf:\u79bb\u5e95\u540e\u65b0\u53d1\u9001\u7684\u7528\u6237\u6d88\u606f\u843d\u5165\u5e95 spacer \u8fdf\u8fdf\u4e0d\u663e\u793a;\u6d41\u5f0f\u56de\u5408\u4e2d content-visibility:auto skipped \u884c\u7684 200px \u4f30\u9ad8\u5199\u56de\u9ad8\u5ea6\u7f13\u5b58,\u89c6\u53e3\u5185\u5df2\u6e32\u67d3\u5185\u5bb9\u53d8\u7a7a\u767d,\u6eda\u52a8\u540e\u624d\u6062\u590d\u3002\u540c\u6279:catalog supports_vision=false \u4f7f cursor \u5bb6\u65cf(Read \u53ef\u539f\u751f\u770b\u56fe)\u7684\u4e0a\u4f20\u56fe\u7247\u63d0\u793a\u628a oc-vision CLI \u6392\u5728 Read \u4e4b\u524d,agent \u7ed5\u8fc7\u539f\u751f\u8bc6\u56fe\u3002 \u53cd\u5408\u590d\u73b0:\u8ddd\u5e95 80px \u65f6\u8ffd\u52a0\u4e50\u89c2 user \u884c,ResizeObserver effect \u5728 messages.length \u53d8\u5316\u65f6\u7528\u5df2\u4f4d\u79fb DOM \u91cd\u6355\u951a\u70b9,\u753b\u7a97 span \u6821\u6b63\u88ab\u8df3\u8fc7,\u89c6\u53e3\u5185\u5bb9\u4e0a\u8df3\u4e00\u884c\u95f4\u8ddd\u3002",
       "rootFixCommit": "db14273e",
       "regressions": [
         {
@@ -2528,12 +2528,12 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
-          "assertion": "D: pin 不生效时近底 append 仍吸收 end，结果含新 user 下标 80"
+          "assertion": "D: pin \u4e0d\u751f\u6548\u65f6\u8fd1\u5e95 append \u4ecd\u5438\u6536 end\uff0c\u7ed3\u679c\u542b\u65b0 user \u4e0b\u6807 80"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/timelinePaint.test.ts",
-          "assertion": "C: sending 但用户在顶部时，远处 pin 不把画窗 union 到 lastUser"
+          "assertion": "C: sending \u4f46\u7528\u6237\u5728\u9876\u90e8\u65f6\uff0c\u8fdc\u5904 pin \u4e0d\u628a\u753b\u7a97 union \u5230 lastUser"
         },
         {
           "layer": "unit",
@@ -2543,22 +2543,22 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
-          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false → Read 第 1、CLI 第 2"
+          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false \u2192 Read \u7b2c 1\u3001CLI \u7b2c 2"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
-          "assertion": "deepseek(确定纯文本)+hasUnderstandImage → CLI 第 1、Read 第 2"
+          "assertion": "deepseek(\u786e\u5b9a\u7eaf\u6587\u672c)+hasUnderstandImage \u2192 CLI \u7b2c 1\u3001Read \u7b2c 2"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/promptSlotsDeepseekVision.test.ts",
-          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false 不声称看不到图,先 Read 再 oc-vision"
+          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false \u4e0d\u58f0\u79f0\u770b\u4e0d\u5230\u56fe,\u5148 Read \u518d oc-vision"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T60 离底后新追加的 user 行立刻进入画窗而非落入底 spacer"
+          "assertion": "T60 \u79bb\u5e95\u540e\u65b0\u8ffd\u52a0\u7684 user \u884c\u7acb\u523b\u8fdb\u5165\u753b\u7a97\u800c\u975e\u843d\u5165\u5e95 spacer"
         }
       ],
       "coverageCommits": [
@@ -2570,7 +2570,7 @@
       "id": "INC-20260902-CCB-DEFERRED-TOOL-ADAPT",
       "occurredAt": "2026-09-02",
       "severity": "P1",
-      "symptom": "Fable/CCB（claude-code-best）个人版会话里 SearchExtraTools/ExecuteExtraTool 被前端渲染成裸扳手卡、delegate 不成 agent-group、mcp-memory skill_save 因 CCB 跳过 zod 校验报 reading 'trim' / tags.join is not a function；同时 CCB availableMcpTools 只取 config.mcpServers、内置 openclaude-memory 未登记，sanitizeUnavailableMcpClaims 把 user.md/SOUL/SKILLS 分工规则里的 delegate_task/delegate_tasks 等 19 个平台工具名抹成「（当前未注册）」，规则注入了但不可读，Fable 回合自己执行而不委派。",
+      "symptom": "Fable/CCB\uff08claude-code-best\uff09\u4e2a\u4eba\u7248\u4f1a\u8bdd\u91cc SearchExtraTools/ExecuteExtraTool \u88ab\u524d\u7aef\u6e32\u67d3\u6210\u88f8\u6273\u624b\u5361\u3001delegate \u4e0d\u6210 agent-group\u3001mcp-memory skill_save \u56e0 CCB \u8df3\u8fc7 zod \u6821\u9a8c\u62a5 reading 'trim' / tags.join is not a function\uff1b\u540c\u65f6 CCB availableMcpTools \u53ea\u53d6 config.mcpServers\u3001\u5185\u7f6e openclaude-memory \u672a\u767b\u8bb0\uff0csanitizeUnavailableMcpClaims \u628a user.md/SOUL/SKILLS \u5206\u5de5\u89c4\u5219\u91cc\u7684 delegate_task/delegate_tasks \u7b49 19 \u4e2a\u5e73\u53f0\u5de5\u5177\u540d\u62b9\u6210\u300c\uff08\u5f53\u524d\u672a\u6ce8\u518c\uff09\u300d\uff0c\u89c4\u5219\u6ce8\u5165\u4e86\u4f46\u4e0d\u53ef\u8bfb\uff0cFable \u56de\u5408\u81ea\u5df1\u6267\u884c\u800c\u4e0d\u59d4\u6d3e\u3002",
       "rootFixCommit": "58ae7303",
       "regressions": [
         {
@@ -2606,7 +2606,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/tool/meta.test.ts",
-          "assertion": "ExecuteExtraTool → 内层 MCP 工具名 + params,输出取信封 text"
+          "assertion": "ExecuteExtraTool \u2192 \u5185\u5c42 MCP \u5de5\u5177\u540d + params,\u8f93\u51fa\u53d6\u4fe1\u5c01 text"
         },
         {
           "layer": "unit",
@@ -2616,7 +2616,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-ccb-mcp-availability.ts",
-          "assertion": "[ccb-mcp-availability] PASS — CCB prompt advertises built-in openclaude-memory tools; ExecuteExtraTool wrapper unwraps to inner MCP tool"
+          "assertion": "[ccb-mcp-availability] PASS \u2014 CCB prompt advertises built-in openclaude-memory tools; ExecuteExtraTool wrapper unwraps to inner MCP tool"
         }
       ],
       "coverageCommits": [
@@ -2632,58 +2632,58 @@
       "id": "INC-20260902-WEB-TASKBOARD-TIMELINE-HUD",
       "occurredAt": "2026-09-02",
       "severity": "P1",
-      "symptom": "任务面板切换项目固定报「此页面加载出错」；打开部分会话报「会话内容渲染失败」；刷新后对话输入框上方的任务列表 HUD 消失。",
+      "symptom": "\u4efb\u52a1\u9762\u677f\u5207\u6362\u9879\u76ee\u56fa\u5b9a\u62a5\u300c\u6b64\u9875\u9762\u52a0\u8f7d\u51fa\u9519\u300d\uff1b\u6253\u5f00\u90e8\u5206\u4f1a\u8bdd\u62a5\u300c\u4f1a\u8bdd\u5185\u5bb9\u6e32\u67d3\u5931\u8d25\u300d\uff1b\u5237\u65b0\u540e\u5bf9\u8bdd\u8f93\u5165\u6846\u4e0a\u65b9\u7684\u4efb\u52a1\u5217\u8868 HUD \u6d88\u5931\u3002",
       "rootFixCommit": "51674b8c",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/taskboard/taskboard.test.tsx",
-          "assertion": "在两个 work 项目与 all/none 之间来回切换 ≥5 次不崩"
+          "assertion": "\u5728\u4e24\u4e2a work \u9879\u76ee\u4e0e all/none \u4e4b\u95f4\u6765\u56de\u5207\u6362 \u22655 \u6b21\u4e0d\u5d29"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/taskboard/taskboard.test.tsx",
-          "assertion": "collectInboxTickets 容忍 columns.tickets 缺失"
+          "assertion": "collectInboxTickets \u5bb9\u5fcd columns.tickets \u7f3a\u5931"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/ocv5-70TimelineRender.test.tsx",
-          "assertion": "真实会话精简 fixture 不打穿 SessionTimelineBoundary"
+          "assertion": "\u771f\u5b9e\u4f1a\u8bdd\u7cbe\u7b80 fixture \u4e0d\u6253\u7a7f SessionTimelineBoundary"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/ocv5-70TimelineRender.test.tsx",
-          "assertion": "单条畸形 agent-group 只落到 MessageBoundary，邻居仍在"
+          "assertion": "\u5355\u6761\u7578\u5f62 agent-group \u53ea\u843d\u5230 MessageBoundary\uff0c\u90bb\u5c45\u4ecd\u5728"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/render.test.ts",
-          "assertion": "childSignature: steps 非数组或含 null 不抛"
+          "assertion": "childSignature: steps \u975e\u6570\u7ec4\u6216\u542b null \u4e0d\u629b"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
-          "assertion": "刷新后当前轮仍有未完成任务 → HUD 钉住(不依赖 sending)"
+          "assertion": "\u5237\u65b0\u540e\u5f53\u524d\u8f6e\u4ecd\u6709\u672a\u5b8c\u6210\u4efb\u52a1 \u2192 HUD \u9489\u4f4f(\u4e0d\u4f9d\u8d56 sending)"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
-          "assertion": "hydration 形态 TodoWrite(inputJson.todos) 在当前轮未完成时仍可提取"
+          "assertion": "hydration \u5f62\u6001 TodoWrite(inputJson.todos) \u5728\u5f53\u524d\u8f6e\u672a\u5b8c\u6210\u65f6\u4ecd\u53ef\u63d0\u53d6"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/PinnedTaskTracker.test.tsx",
-          "assertion": "turn 收口(active true→false 下降沿)后,仍有未完成任务也不再钉住"
+          "assertion": "turn \u6536\u53e3(active true\u2192false \u4e0b\u964d\u6cbf)\u540e,\u4ecd\u6709\u672a\u5b8c\u6210\u4efb\u52a1\u4e5f\u4e0d\u518d\u9489\u4f4f"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
-          "assertion": "user 行 status=replied → 收口"
+          "assertion": "user \u884c status=replied \u2192 \u6536\u53e3"
         },
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoundary 邻居仍在"
+          "assertion": "T61 \u5237\u65b0\u540e HUD \u4ecd\u9489\u4f4f\u4e14\u7578\u5f62 agent-group \u53ea\u843d MessageBoundary \u90bb\u5c45\u4ecd\u5728"
         }
       ],
       "coverageCommits": [
@@ -2697,33 +2697,33 @@
       "id": "INC-20260902-DELEGATE-ENGINE-BILLING-REQUESTID",
       "occurredAt": "2026-09-02",
       "severity": "P1",
-      "symptom": "Codex/Grok 引擎委派子任务从不写入 usage_records.mode=delegate：adapter 只在 master 签发 32-hex requestId 时才 emit billing，handleDelegateTask 的 sessions.submit 第 6 参写死 undefined。GLM/CCB 委派走 anthropicProxy 不受影响。",
+      "symptom": "Codex/Grok \u5f15\u64ce\u59d4\u6d3e\u5b50\u4efb\u52a1\u4ece\u4e0d\u5199\u5165 usage_records.mode=delegate\uff1aadapter \u53ea\u5728 master \u7b7e\u53d1 32-hex requestId \u65f6\u624d emit billing\uff0chandleDelegateTask \u7684 sessions.submit \u7b2c 6 \u53c2\u5199\u6b7b undefined\u3002GLM/CCB \u59d4\u6d3e\u8d70 anthropicProxy \u4e0d\u53d7\u5f71\u54cd\u3002",
       "rootFixCommit": "654ca01f",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(a) codex 委派 submit 收到 32-hex requestId"
+          "assertion": "(a) codex \u59d4\u6d3e submit \u6536\u5230 32-hex requestId"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(b) 收到 codex_billing 后 live settle 一次且带 delegate 归因"
+          "assertion": "(b) \u6536\u5230 codex_billing \u540e live settle \u4e00\u6b21\u4e14\u5e26 delegate \u5f52\u56e0"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(c) glm 委派仍不签 requestId、不调 admit"
+          "assertion": "(c) glm \u59d4\u6d3e\u4ecd\u4e0d\u7b7e requestId\u3001\u4e0d\u8c03 admit"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(d) 委派失败时 journal 被收口"
+          "assertion": "(d) \u59d4\u6d3e\u5931\u8d25\u65f6 journal \u88ab\u6536\u53e3"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(d) 超时未决不 abandon；父 tape 已 drain 后迟到帧仍 live settle 一次"
+          "assertion": "(d) \u8d85\u65f6\u672a\u51b3\u4e0d abandon\uff1b\u7236 tape \u5df2 drain \u540e\u8fdf\u5230\u5e27\u4ecd live settle \u4e00\u6b21"
         },
         {
           "layer": "unit",
@@ -2777,7 +2777,7 @@
       "id": "INC-20260829-FAIL-LOUD-ERROR-MSG",
       "occurredAt": "2026-08-29",
       "severity": "P1",
-      "symptom": "gateway 上报的 tool-failure error_msg 被四层抹成 NULL/空串，admin 审计与 product_friction 无法定位真实失败；显式未知 --model 在 flag 关路径被映射成 HTTP 500 并 inherit 默认模型。根治：v5 只持久化 allowlist/哨兵 error_msg（≤240 code point）、三新 class 投影到 v4 other、0254 扩 CHECK+privacy_guard、未知型号 400 DELEGATE_MODEL_UNKNOWN。",
+      "symptom": "gateway \u4e0a\u62a5\u7684 tool-failure error_msg \u88ab\u56db\u5c42\u62b9\u6210 NULL/\u7a7a\u4e32\uff0cadmin \u5ba1\u8ba1\u4e0e product_friction \u65e0\u6cd5\u5b9a\u4f4d\u771f\u5b9e\u5931\u8d25\uff1b\u663e\u5f0f\u672a\u77e5 --model \u5728 flag \u5173\u8def\u5f84\u88ab\u6620\u5c04\u6210 HTTP 500 \u5e76 inherit \u9ed8\u8ba4\u6a21\u578b\u3002\u6839\u6cbb\uff1av5 \u53ea\u6301\u4e45\u5316 allowlist/\u54e8\u5175 error_msg\uff08\u2264240 code point\uff09\u3001\u4e09\u65b0 class \u6295\u5f71\u5230 v4 other\u30010254 \u6269 CHECK+privacy_guard\u3001\u672a\u77e5\u578b\u53f7 400 DELEGATE_MODEL_UNKNOWN\u3002",
       "rootFixCommit": "2491a190",
       "coverageCommits": [
         "1eae3d23",
@@ -2803,7 +2803,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalToolFailureAudit.test.ts",
-          "assertion": "v5 reporter→master keeps redacted_reason for Bearer/dump/uncertain"
+          "assertion": "v5 reporter\u2192master keeps redacted_reason for Bearer/dump/uncertain"
         },
         {
           "layer": "integration",
@@ -2821,18 +2821,18 @@
       "id": "INC-20260903-OCV5-81-CODEX-INTERRUPT-BILLING",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "Codex interrupt() 为撤销 InlinePush 资格提前清空 active turn，导致 interrupted 终态的 partial token usage 被当前-turn billing 守卫抑制，已发生的调用没有进入结算侧信道。",
+      "symptom": "Codex interrupt() \u4e3a\u64a4\u9500 InlinePush \u8d44\u683c\u63d0\u524d\u6e05\u7a7a active turn\uff0c\u5bfc\u81f4 interrupted \u7ec8\u6001\u7684 partial token usage \u88ab\u5f53\u524d-turn billing \u5b88\u536b\u6291\u5236\uff0c\u5df2\u53d1\u751f\u7684\u8c03\u7528\u6ca1\u6709\u8fdb\u5165\u7ed3\u7b97\u4fa7\u4fe1\u9053\u3002",
       "rootFixCommit": "ad72b788",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
-          "assertion": "interrupt:活跃 turn → turn/interrupt 请求;interrupted 终态仍带 usage billing"
+          "assertion": "interrupt:\u6d3b\u8dc3 turn \u2192 turn/interrupt \u8bf7\u6c42;interrupted \u7ec8\u6001\u4ecd\u5e26 usage billing"
         },
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
-          "assertion": "Codex 已产出可见内容后强制停止必须恰好结算一笔 partial usage"
+          "assertion": "Codex \u5df2\u4ea7\u51fa\u53ef\u89c1\u5185\u5bb9\u540e\u5f3a\u5236\u505c\u6b62\u5fc5\u987b\u6070\u597d\u7ed3\u7b97\u4e00\u7b14 partial usage"
         }
       ]
     },
@@ -2840,7 +2840,7 @@
       "id": "INC-20260903-OCV5-84-CRON-SUBMIT-BOUNDARY",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "Cron occurrence 已持久化为 executing 后，last-run 写失败被统一映射为 SUBMIT_START_FAILED 可重试；同一外部副作用任务可能在未知提交边界后被自动重放。",
+      "symptom": "Cron occurrence \u5df2\u6301\u4e45\u5316\u4e3a executing \u540e\uff0clast-run \u5199\u5931\u8d25\u88ab\u7edf\u4e00\u6620\u5c04\u4e3a SUBMIT_START_FAILED \u53ef\u91cd\u8bd5\uff1b\u540c\u4e00\u5916\u90e8\u526f\u4f5c\u7528\u4efb\u52a1\u53ef\u80fd\u5728\u672a\u77e5\u63d0\u4ea4\u8fb9\u754c\u540e\u88ab\u81ea\u52a8\u91cd\u653e\u3002",
       "rootFixCommit": "960a640f",
       "regressions": [
         {
@@ -2851,7 +2851,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cron-submit-boundary.ts",
-          "assertion": "[cron-submit-boundary] PASS — unknown submit-start durability failures are terminal and never auto-replayed"
+          "assertion": "[cron-submit-boundary] PASS \u2014 unknown submit-start durability failures are terminal and never auto-replayed"
         },
         {
           "layer": "unit",
@@ -2864,7 +2864,7 @@
       "id": "INC-20260903-OCV5-87-RELEASE-MARKER-GATE",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "V5 商业发布的 strong release marker 在校验 distReuse 时 jq 条件多一个右括号，合法 marker 也会编译失败并阻断发布；同时 runtime/ledger ops fixtures 已漂移，完整门无法给出可靠绿灯。",
+      "symptom": "V5 \u5546\u4e1a\u53d1\u5e03\u7684 strong release marker \u5728\u6821\u9a8c distReuse \u65f6 jq \u6761\u4ef6\u591a\u4e00\u4e2a\u53f3\u62ec\u53f7\uff0c\u5408\u6cd5 marker \u4e5f\u4f1a\u7f16\u8bd1\u5931\u8d25\u5e76\u963b\u65ad\u53d1\u5e03\uff1b\u540c\u65f6 runtime/ledger ops fixtures \u5df2\u6f02\u79fb\uff0c\u5b8c\u6574\u95e8\u65e0\u6cd5\u7ed9\u51fa\u53ef\u9760\u7eff\u706f\u3002",
       "rootFixCommit": "8d2b5211",
       "regressions": [
         {
@@ -2888,13 +2888,13 @@
       "id": "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "多条 webchat 会话因浏览器瞬断误杀已受理 enrichment、cron stale executor/假 ACK、容器 rejected 与 Master accepted 长时间分叉，以及前台 memory flock 5 秒竞争失败而显示「系统暂时不可用」。",
+      "symptom": "\u591a\u6761 webchat \u4f1a\u8bdd\u56e0\u6d4f\u89c8\u5668\u77ac\u65ad\u8bef\u6740\u5df2\u53d7\u7406 enrichment\u3001cron stale executor/\u5047 ACK\u3001\u5bb9\u5668 rejected \u4e0e Master accepted \u957f\u65f6\u95f4\u5206\u53c9\uff0c\u4ee5\u53ca\u524d\u53f0 memory flock 5 \u79d2\u7ade\u4e89\u5931\u8d25\u800c\u663e\u793a\u300c\u7cfb\u7edf\u6682\u65f6\u4e0d\u53ef\u7528\u300d\u3002",
       "rootFixCommit": "82bfb777",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
-          "assertion": "R4-B1 受理 await 期间 client detach → drain 保活并在 admission 后只转发一次"
+          "assertion": "R4-B1 \u53d7\u7406 await \u671f\u95f4 client detach \u2192 drain \u4fdd\u6d3b\u5e76\u5728 admission \u540e\u53ea\u8f6c\u53d1\u4e00\u6b21"
         },
         {
           "layer": "unit",
@@ -2914,7 +2914,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
-          "assertion": "R4-B3 enrichment deadline → terminal；history 晚成功仍不执行"
+          "assertion": "R4-B3 enrichment deadline \u2192 terminal\uff1bhistory \u665a\u6210\u529f\u4ecd\u4e0d\u6267\u884c"
         },
         {
           "layer": "unit",
@@ -2934,7 +2934,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts",
-          "assertion": "young accepted + durable rejected tombstone → immediate not_accepted convergence"
+          "assertion": "young accepted + durable rejected tombstone \u2192 immediate not_accepted convergence"
         },
         {
           "layer": "unit",
@@ -2949,7 +2949,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
-          "assertion": "[session-unavailable-rootfix] PASS — detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
+          "assertion": "[session-unavailable-rootfix] PASS \u2014 detach drain, durable cron receipt, rejected convergence and bounded memory retry are locked"
         }
       ],
       "coverageCommits": [
@@ -2960,7 +2960,7 @@
       "id": "INC-20260903-CCB-TOOL-PHASE-STOP-RED-CARD",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "Cursor Opus/Fable(sand-ccb)会话在模型执行工具期间点「停止生成」,终态被判成 ENGINE_ERROR,渲染红色「任务执行失败」卡而非灰色「已停止生成」;同时 Cursor 引擎所有用户主动停止的轮次都被 cursor_engine_not_success 免单,实际消耗的 token 一分未扣。",
+      "symptom": "Cursor Opus/Fable(sand-ccb)\u4f1a\u8bdd\u5728\u6a21\u578b\u6267\u884c\u5de5\u5177\u671f\u95f4\u70b9\u300c\u505c\u6b62\u751f\u6210\u300d,\u7ec8\u6001\u88ab\u5224\u6210 ENGINE_ERROR,\u6e32\u67d3\u7ea2\u8272\u300c\u4efb\u52a1\u6267\u884c\u5931\u8d25\u300d\u5361\u800c\u975e\u7070\u8272\u300c\u5df2\u505c\u6b62\u751f\u6210\u300d;\u540c\u65f6 Cursor \u5f15\u64ce\u6240\u6709\u7528\u6237\u4e3b\u52a8\u505c\u6b62\u7684\u8f6e\u6b21\u90fd\u88ab cursor_engine_not_success \u514d\u5355,\u5b9e\u9645\u6d88\u8017\u7684 token \u4e00\u5206\u672a\u6263\u3002",
       "rootFixCommit": "ae967d03",
       "regressions": [
         {
@@ -2981,7 +2981,7 @@
         {
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
-          "assertion": "停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活"
+          "assertion": "\u505c\u6b62:3s \u5185\u8fdb\u7ec8\u6001 + \u4e0d\u518d\u6709\u589e\u91cf\u5e27 + \u4e0d\u989d\u5916\u8ba1\u8d39\u4e0d\u590d\u6d3b"
         }
       ],
       "coverageCommits": [
@@ -2992,7 +2992,7 @@
       "id": "INC-20260903-TURNEND-LAST-SEGMENT-FLASH",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "V5 selfhost 多段正文（text→tool→text）轮正常结束时，最后一段正文闪一下消失，几秒到几十秒后 Phase-B 精确 tape 到达才重新出现。根因：Phase-A unpublished fallback 的 id = visible_head.messageId = 最后一段 live assistant 行 id（srv-…-tN-sK），server-wins 按 id 吞掉该 live 行；omitUnpublishedFallbackWhenLiveAssistantsExist 又因仍有更早 live 段而把 fallback 正文清空隐藏，最后一段文本无人渲染。",
+      "symptom": "V5 selfhost \u591a\u6bb5\u6b63\u6587\uff08text\u2192tool\u2192text\uff09\u8f6e\u6b63\u5e38\u7ed3\u675f\u65f6\uff0c\u6700\u540e\u4e00\u6bb5\u6b63\u6587\u95ea\u4e00\u4e0b\u6d88\u5931\uff0c\u51e0\u79d2\u5230\u51e0\u5341\u79d2\u540e Phase-B \u7cbe\u786e tape \u5230\u8fbe\u624d\u91cd\u65b0\u51fa\u73b0\u3002\u6839\u56e0\uff1aPhase-A unpublished fallback \u7684 id = visible_head.messageId = \u6700\u540e\u4e00\u6bb5 live assistant \u884c id\uff08srv-\u2026-tN-sK\uff09\uff0cserver-wins \u6309 id \u541e\u6389\u8be5 live \u884c\uff1bomitUnpublishedFallbackWhenLiveAssistantsExist \u53c8\u56e0\u4ecd\u6709\u66f4\u65e9 live \u6bb5\u800c\u628a fallback \u6b63\u6587\u6e05\u7a7a\u9690\u85cf\uff0c\u6700\u540e\u4e00\u6bb5\u6587\u672c\u65e0\u4eba\u6e32\u67d3\u3002",
       "rootFixCommit": "ab3f5c20",
       "regressions": [
         {
@@ -3003,7 +3003,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一段正文不闪没"
+          "assertion": "T62 Phase-A fallback \u4e0e\u6700\u540e\u4e00\u6bb5 live \u6b63\u6587\u540c id \u65f6\u6700\u540e\u4e00\u6bb5\u6b63\u6587\u4e0d\u95ea\u6ca1"
         }
       ]
     },
@@ -3011,7 +3011,7 @@
       "id": "INC-20260903-CURSOR-CLI-ERROR-WASH",
       "occurredAt": "2026-09-03",
       "severity": "P1",
-      "symptom": "Cursor Fable/Opus ENGINE_ERROR 红卡只有「内部错误/暂时中断」，usage_records.error_msg 为空、live_frames.detail 只有 traceId。根因：cursorAdapter.finish() 把非 auth/quota CLI 失败统一洗成 'Cursor CLI failed'，脱敏原文既不入库也不打日志。",
+      "symptom": "Cursor Fable/Opus ENGINE_ERROR \u7ea2\u5361\u53ea\u6709\u300c\u5185\u90e8\u9519\u8bef/\u6682\u65f6\u4e2d\u65ad\u300d\uff0cusage_records.error_msg \u4e3a\u7a7a\u3001live_frames.detail \u53ea\u6709 traceId\u3002\u6839\u56e0\uff1acursorAdapter.finish() \u628a\u975e auth/quota CLI \u5931\u8d25\u7edf\u4e00\u6d17\u6210 'Cursor CLI failed'\uff0c\u8131\u654f\u539f\u6587\u65e2\u4e0d\u5165\u5e93\u4e5f\u4e0d\u6253\u65e5\u5fd7\u3002",
       "rootFixCommit": "de8aed4c",
       "regressions": [
         {
@@ -3030,7 +3030,7 @@
       "id": "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS",
       "occurredAt": "2026-09-04",
       "severity": "P1",
-      "symptom": "Cursor Opus/Fable(official-cc harness)点「停止生成」后再发下一条消息，红卡「执行环境异常中断，你的消息已保留，请重试」+ 黄条「模型繁忙，正在重试中（n/10）」循环。根因：官方 Claude Code 对 Stop 回 aborted_streaming result 后数秒才自行 exit 1，SubprocessRunner 仍把 this.proc 指向这个正在死亡的进程，下一轮 submit() 写进去即被判 RUNNER_CRASHED（子进程异常退出 code 1），master 自动恢复最多 10 次。",
+      "symptom": "Cursor Opus/Fable(official-cc harness)\u70b9\u300c\u505c\u6b62\u751f\u6210\u300d\u540e\u518d\u53d1\u4e0b\u4e00\u6761\u6d88\u606f\uff0c\u7ea2\u5361\u300c\u6267\u884c\u73af\u5883\u5f02\u5e38\u4e2d\u65ad\uff0c\u4f60\u7684\u6d88\u606f\u5df2\u4fdd\u7559\uff0c\u8bf7\u91cd\u8bd5\u300d+ \u9ec4\u6761\u300c\u6a21\u578b\u7e41\u5fd9\uff0c\u6b63\u5728\u91cd\u8bd5\u4e2d\uff08n/10\uff09\u300d\u5faa\u73af\u3002\u6839\u56e0\uff1a\u5b98\u65b9 Claude Code \u5bf9 Stop \u56de aborted_streaming result \u540e\u6570\u79d2\u624d\u81ea\u884c exit 1\uff0cSubprocessRunner \u4ecd\u628a this.proc \u6307\u5411\u8fd9\u4e2a\u6b63\u5728\u6b7b\u4ea1\u7684\u8fdb\u7a0b\uff0c\u4e0b\u4e00\u8f6e submit() \u5199\u8fdb\u53bb\u5373\u88ab\u5224 RUNNER_CRASHED\uff08\u5b50\u8fdb\u7a0b\u5f02\u5e38\u9000\u51fa code 1\uff09\uff0cmaster \u81ea\u52a8\u6062\u590d\u6700\u591a 10 \u6b21\u3002",
       "rootFixCommit": "e5967df4",
       "regressions": [
         {
@@ -3054,18 +3054,18 @@
       "id": "INC-20260906-COMMERCIAL-TASKBOARD-DIGEST",
       "occurredAt": "2026-09-06",
       "severity": "P1",
-      "symptom": "商业版用户(含刚注册 1 分钟的新用户)收到「任务面板每日简报(当日完成 0 张,新建 0 张…)」站内信,9/3–9/6 共 39 条。根因:商业版只用 VITE_TASKBOARD_ENABLED=0 隐藏任务面板 UI,容器 gateway 的 PatrolEngine + TaskboardNotifier 无条件启动,新容器第一次 60s tick 触发 maybeSendDigest 补发前一日简报;去重只在进程内存 + master 6h/uid 内容去重,对每个新容器/新 uid 都拦不住。",
+      "symptom": "\u5546\u4e1a\u7248\u7528\u6237(\u542b\u521a\u6ce8\u518c 1 \u5206\u949f\u7684\u65b0\u7528\u6237)\u6536\u5230\u300c\u4efb\u52a1\u9762\u677f\u6bcf\u65e5\u7b80\u62a5(\u5f53\u65e5\u5b8c\u6210 0 \u5f20,\u65b0\u5efa 0 \u5f20\u2026)\u300d\u7ad9\u5185\u4fe1,9/3\u20139/6 \u5171 39 \u6761\u3002\u6839\u56e0:\u5546\u4e1a\u7248\u53ea\u7528 VITE_TASKBOARD_ENABLED=0 \u9690\u85cf\u4efb\u52a1\u9762\u677f UI,\u5bb9\u5668 gateway \u7684 PatrolEngine + TaskboardNotifier \u65e0\u6761\u4ef6\u542f\u52a8,\u65b0\u5bb9\u5668\u7b2c\u4e00\u6b21 60s tick \u89e6\u53d1 maybeSendDigest \u8865\u53d1\u524d\u4e00\u65e5\u7b80\u62a5;\u53bb\u91cd\u53ea\u5728\u8fdb\u7a0b\u5185\u5b58 + master 6h/uid \u5185\u5bb9\u53bb\u91cd,\u5bf9\u6bcf\u4e2a\u65b0\u5bb9\u5668/\u65b0 uid \u90fd\u62e6\u4e0d\u4f4f\u3002",
       "rootFixCommit": "beb531ef",
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/taskboard/__tests__/feature.test.ts",
-          "assertion": "server.ts 的巡检/通知启动必须包在 isTaskboardEnabled 门内"
+          "assertion": "server.ts \u7684\u5de1\u68c0/\u901a\u77e5\u542f\u52a8\u5fc5\u987b\u5305\u5728 isTaskboardEnabled \u95e8\u5185"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/taskboard/__tests__/notify.test.ts",
-          "assertion": "空面板(没有任何票)不出简报,也不标 sent;建票后同日可正常出"
+          "assertion": "\u7a7a\u9762\u677f(\u6ca1\u6709\u4efb\u4f55\u7968)\u4e0d\u51fa\u7b80\u62a5,\u4e5f\u4e0d\u6807 sent;\u5efa\u7968\u540e\u540c\u65e5\u53ef\u6b63\u5e38\u51fa"
         },
         {
           "layer": "unit",
@@ -3088,7 +3088,7 @@
       "id": "INC-20260905-QUEUED-CONSUMER",
       "occurredAt": "2026-09-05",
       "severity": "P1",
-      "symptom": "OCV5-121 selfhost：容器同会话前驱仍占用时后继正常 queued，master visible-orphan 把尚未启动的排队项按 15min engine-dead 终态化并 fence；本地 live waiter 仍可迟到启动。R1 用 exact queued→rejected CAS 同步撤销消费权，历史分裂由同快照 terminal recovery 收敛，迟到原闭包静默退出。",
+      "symptom": "OCV5-121 selfhost\uff1a\u5bb9\u5668\u540c\u4f1a\u8bdd\u524d\u9a71\u4ecd\u5360\u7528\u65f6\u540e\u7ee7\u6b63\u5e38 queued\uff0cmaster visible-orphan \u628a\u5c1a\u672a\u542f\u52a8\u7684\u6392\u961f\u9879\u6309 15min engine-dead \u7ec8\u6001\u5316\u5e76 fence\uff1b\u672c\u5730 live waiter \u4ecd\u53ef\u8fdf\u5230\u542f\u52a8\u3002R1 \u7528 exact queued\u2192rejected CAS \u540c\u6b65\u64a4\u9500\u6d88\u8d39\u6743\uff0c\u5386\u53f2\u5206\u88c2\u7531\u540c\u5feb\u7167 terminal recovery \u6536\u655b\uff0c\u8fdf\u5230\u539f\u95ed\u5305\u9759\u9ed8\u9000\u51fa\u3002",
       "rootFixCommit": "3158524a",
       "coverageCommits": [
         "2d745db7",
@@ -3120,7 +3120,7 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
-          "assertion": "tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据"
+          "assertion": "tape-state \u5355 statement \u540c\u65f6\u8fd4\u56de\u79df\u6237\u5185 tape + dispatch lease \u8bc1\u636e"
         },
         {
           "layer": "deploy-gate",
@@ -3133,7 +3133,7 @@
       "id": "INC-20260907-PROCESS-CARD-BEFORE-USER",
       "occurredAt": "2026-09-07",
       "severity": "P1",
-      "symptom": "V5 selfhost 会话里子任务卡与 AskUserQuestion 问答卡渲染在所属用户消息之前（截图会话 webmtqnrb61nes60h：第一条 user=_orderSeq=1，Agent「审读回到底部按钮与几何影响」属后续 m-recover 轮）。根因：stableSortByTs 对无 _orderSeq 的本地过程卡从 anchor=0 起排且不看 _turnOwnerId；repairPostFinalProcessOrder 只把终答之后的过程卡拉回终答前，不修「早于所属 user」；sinkOpenPermissionPrompts 按数组 user 边界冲刷，会把前置孤卡留在第一个 user 前。坏序一旦进缓存，full/incremental/restore 都不自愈。 冷启动原点已红绿复现：正确内存中的 user 被标 _timelineRecord，toStored 剥离 user 但保留本地卡；loadStored 后 full merge 从 carry=0 开始，把卡放到 user 前。最终修复还覆盖明确 owner 缺页不挪位、晚到问答不丢行。",
+      "symptom": "V5 selfhost \u4f1a\u8bdd\u91cc\u5b50\u4efb\u52a1\u5361\u4e0e AskUserQuestion \u95ee\u7b54\u5361\u6e32\u67d3\u5728\u6240\u5c5e\u7528\u6237\u6d88\u606f\u4e4b\u524d\uff08\u622a\u56fe\u4f1a\u8bdd webmtqnrb61nes60h\uff1a\u7b2c\u4e00\u6761 user=_orderSeq=1\uff0cAgent\u300c\u5ba1\u8bfb\u56de\u5230\u5e95\u90e8\u6309\u94ae\u4e0e\u51e0\u4f55\u5f71\u54cd\u300d\u5c5e\u540e\u7eed m-recover \u8f6e\uff09\u3002\u6839\u56e0\uff1astableSortByTs \u5bf9\u65e0 _orderSeq \u7684\u672c\u5730\u8fc7\u7a0b\u5361\u4ece anchor=0 \u8d77\u6392\u4e14\u4e0d\u770b _turnOwnerId\uff1brepairPostFinalProcessOrder \u53ea\u628a\u7ec8\u7b54\u4e4b\u540e\u7684\u8fc7\u7a0b\u5361\u62c9\u56de\u7ec8\u7b54\u524d\uff0c\u4e0d\u4fee\u300c\u65e9\u4e8e\u6240\u5c5e user\u300d\uff1bsinkOpenPermissionPrompts \u6309\u6570\u7ec4 user \u8fb9\u754c\u51b2\u5237\uff0c\u4f1a\u628a\u524d\u7f6e\u5b64\u5361\u7559\u5728\u7b2c\u4e00\u4e2a user \u524d\u3002\u574f\u5e8f\u4e00\u65e6\u8fdb\u7f13\u5b58\uff0cfull/incremental/restore \u90fd\u4e0d\u81ea\u6108\u3002 \u51b7\u542f\u52a8\u539f\u70b9\u5df2\u7ea2\u7eff\u590d\u73b0\uff1a\u6b63\u786e\u5185\u5b58\u4e2d\u7684 user \u88ab\u6807 _timelineRecord\uff0ctoStored \u5265\u79bb user \u4f46\u4fdd\u7559\u672c\u5730\u5361\uff1bloadStored \u540e full merge \u4ece carry=0 \u5f00\u59cb\uff0c\u628a\u5361\u653e\u5230 user \u524d\u3002\u6700\u7ec8\u4fee\u590d\u8fd8\u8986\u76d6\u660e\u786e owner \u7f3a\u9875\u4e0d\u632a\u4f4d\u3001\u665a\u5230\u95ee\u7b54\u4e0d\u4e22\u884c\u3002",
       "rootFixCommit": "072b2d6f",
       "regressions": [
         {
@@ -3149,7 +3149,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且 MessageList 红绿对照"
+          "assertion": "T67 \u8fc7\u7a0b\u5361\u8d8a\u8fc7\u6240\u5c5e user \u7684\u574f\u5e8f\u7ecf merge/restore \u81ea\u6108\u4e14 MessageList \u7ea2\u7eff\u5bf9\u7167"
         },
         {
           "layer": "unit",
@@ -3165,7 +3165,7 @@
       "id": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL",
       "occurredAt": "2026-09-06",
       "severity": "P1",
-      "symptom": "商业版全量同步 PR #557 的 required 门 commercial-unit 在「userChatBridge — model authorization」第 5 例后再无 TAP 输出，两轮各吃满 30 min timeout 被 cancel，紧急计费改动被拖 ~3h 后改走小切片才上线。根因：protocol DEFAULT_CODEX_ENGINE_MODEL 由 gpt-5.6-sol 改为 gpt-6-astra（GPT-6 队长引擎）；bridge 对 teamMode:true 强制覆写 frame.model 为该常量，但测试桩 persistMasterUserMessage 内断言字面量 gpt-5.6-sol → 断言在桩内抛错被 bridge 捕获为 SESSION_PERSIST_UNAVAILABLE、不再转发容器，而用例只 once('message') 无限等容器帧 → 永挂。本地绿是因为同步 worktree 的 node_modules 软链到旧 canonical，@openclaude/protocol 解析到旧常量。",
+      "symptom": "\u5546\u4e1a\u7248\u5168\u91cf\u540c\u6b65 PR #557 \u7684 required \u95e8 commercial-unit \u5728\u300cuserChatBridge \u2014 model authorization\u300d\u7b2c 5 \u4f8b\u540e\u518d\u65e0 TAP \u8f93\u51fa\uff0c\u4e24\u8f6e\u5404\u5403\u6ee1 30 min timeout \u88ab cancel\uff0c\u7d27\u6025\u8ba1\u8d39\u6539\u52a8\u88ab\u62d6 ~3h \u540e\u6539\u8d70\u5c0f\u5207\u7247\u624d\u4e0a\u7ebf\u3002\u6839\u56e0\uff1aprotocol DEFAULT_CODEX_ENGINE_MODEL \u7531 gpt-5.6-sol \u6539\u4e3a gpt-6-astra\uff08GPT-6 \u961f\u957f\u5f15\u64ce\uff09\uff1bbridge \u5bf9 teamMode:true \u5f3a\u5236\u8986\u5199 frame.model \u4e3a\u8be5\u5e38\u91cf\uff0c\u4f46\u6d4b\u8bd5\u6869 persistMasterUserMessage \u5185\u65ad\u8a00\u5b57\u9762\u91cf gpt-5.6-sol \u2192 \u65ad\u8a00\u5728\u6869\u5185\u629b\u9519\u88ab bridge \u6355\u83b7\u4e3a SESSION_PERSIST_UNAVAILABLE\u3001\u4e0d\u518d\u8f6c\u53d1\u5bb9\u5668\uff0c\u800c\u7528\u4f8b\u53ea once('message') \u65e0\u9650\u7b49\u5bb9\u5668\u5e27 \u2192 \u6c38\u6302\u3002\u672c\u5730\u7eff\u662f\u56e0\u4e3a\u540c\u6b65 worktree \u7684 node_modules \u8f6f\u94fe\u5230\u65e7 canonical\uff0c@openclaude/protocol \u89e3\u6790\u5230\u65e7\u5e38\u91cf\u3002",
       "rootFixCommit": "c26f9a81",
       "regressions": [
         {
@@ -3184,7 +3184,7 @@
       "id": "INC-20260907-MEDIA-CURSOR-PRECISION",
       "occurredAt": "2026-09-07",
       "severity": "P1",
-      "symptom": "媒体任务及项目历史分页将 PostgreSQL 微秒时间经 JS Date 截到毫秒，keyset 边界跳过同毫秒更旧记录；CI pr-3 出现第二页1条而非2条。游标保留原始PG微秒，DTO及排序不变。 真实 SQL 行为由29项integration验证；部署源码门只证明防回退，不冒称端到端或上线。",
+      "symptom": "\u5a92\u4f53\u4efb\u52a1\u53ca\u9879\u76ee\u5386\u53f2\u5206\u9875\u5c06 PostgreSQL \u5fae\u79d2\u65f6\u95f4\u7ecf JS Date \u622a\u5230\u6beb\u79d2\uff0ckeyset \u8fb9\u754c\u8df3\u8fc7\u540c\u6beb\u79d2\u66f4\u65e7\u8bb0\u5f55\uff1bCI pr-3 \u51fa\u73b0\u7b2c\u4e8c\u98751\u6761\u800c\u975e2\u6761\u3002\u6e38\u6807\u4fdd\u7559\u539f\u59cbPG\u5fae\u79d2\uff0cDTO\u53ca\u6392\u5e8f\u4e0d\u53d8\u3002 \u771f\u5b9e SQL \u884c\u4e3a\u753129\u9879integration\u9a8c\u8bc1\uff1b\u90e8\u7f72\u6e90\u7801\u95e8\u53ea\u8bc1\u660e\u9632\u56de\u9000\uff0c\u4e0d\u5192\u79f0\u7aef\u5230\u7aef\u6216\u4e0a\u7ebf\u3002",
       "rootFixCommit": "5636f8c5",
       "regressions": [
         {
@@ -3203,7 +3203,7 @@
       "id": "INC-20260907-DELEGATE-LEDGER-REAP",
       "occurredAt": "2026-09-07",
       "severity": "P1",
-      "symptom": "V5 selfhost 委派账本 delegate_jobs 终态行在 2h TTL 被 sweep() 物理 DELETE，审计窗仅 ~2h 且反向偏置（卡住回调的行反而留下）；running 行唯一活性判据是 owner_lease_until，kind=cron 行 claimQueued 后无任何心跳，boot reconciler 在 session 仍挂 runner 时无限 defer，实测 dlgjob-mtqapydx（cron-origin-inject）idle 7.3h 不收口。修复：终态行软退休 retired_at + 7d/5000 行取宽剪枝、运行时读全部过滤 retired_at IS NULL、idempotency 部分唯一索引；新增 heartbeat-timeout reaper（30min，走 fail() 终态路径，failure_class=heartbeat_timeout，reap 后 interrupt 子会话）；cron 行在 claim→settle 之间挂 15s 定时心跳（协议事件不是心跳，tool_use_detected 不进 onEvent）。真实 SQLite 行为与真定时器心跳由 delegateDurable 单测验证；部署源码门只证明防回退，不冒称端到端或上线。",
+      "symptom": "V5 selfhost \u59d4\u6d3e\u8d26\u672c delegate_jobs \u7ec8\u6001\u884c\u5728 2h TTL \u88ab sweep() \u7269\u7406 DELETE\uff0c\u5ba1\u8ba1\u7a97\u4ec5 ~2h \u4e14\u53cd\u5411\u504f\u7f6e\uff08\u5361\u4f4f\u56de\u8c03\u7684\u884c\u53cd\u800c\u7559\u4e0b\uff09\uff1brunning \u884c\u552f\u4e00\u6d3b\u6027\u5224\u636e\u662f owner_lease_until\uff0ckind=cron \u884c claimQueued \u540e\u65e0\u4efb\u4f55\u5fc3\u8df3\uff0cboot reconciler \u5728 session \u4ecd\u6302 runner \u65f6\u65e0\u9650 defer\uff0c\u5b9e\u6d4b dlgjob-mtqapydx\uff08cron-origin-inject\uff09idle 7.3h \u4e0d\u6536\u53e3\u3002\u4fee\u590d\uff1a\u7ec8\u6001\u884c\u8f6f\u9000\u4f11 retired_at + 7d/5000 \u884c\u53d6\u5bbd\u526a\u679d\u3001\u8fd0\u884c\u65f6\u8bfb\u5168\u90e8\u8fc7\u6ee4 retired_at IS NULL\u3001idempotency \u90e8\u5206\u552f\u4e00\u7d22\u5f15\uff1b\u65b0\u589e heartbeat-timeout reaper\uff0830min\uff0c\u8d70 fail() \u7ec8\u6001\u8def\u5f84\uff0cfailure_class=heartbeat_timeout\uff0creap \u540e interrupt \u5b50\u4f1a\u8bdd\uff09\uff1bcron \u884c\u5728 claim\u2192settle \u4e4b\u95f4\u6302 15s \u5b9a\u65f6\u5fc3\u8df3\uff08\u534f\u8bae\u4e8b\u4ef6\u4e0d\u662f\u5fc3\u8df3\uff0ctool_use_detected \u4e0d\u8fdb onEvent\uff09\u3002\u771f\u5b9e SQLite \u884c\u4e3a\u4e0e\u771f\u5b9a\u65f6\u5668\u5fc3\u8df3\u7531 delegateDurable \u5355\u6d4b\u9a8c\u8bc1\uff1b\u90e8\u7f72\u6e90\u7801\u95e8\u53ea\u8bc1\u660e\u9632\u56de\u9000\uff0c\u4e0d\u5192\u79f0\u7aef\u5230\u7aef\u6216\u4e0a\u7ebf\u3002",
       "rootFixCommit": "35ff8fd8",
       "regressions": [
         {
@@ -3232,7 +3232,7 @@
       "id": "INC-20260908-COMPOSER-DRAFT-BLEED",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "切换会话时输入框残留顿号/文字被写入目标会话草稿；快速清空后切走又复活。",
+      "symptom": "\u5207\u6362\u4f1a\u8bdd\u65f6\u8f93\u5165\u6846\u6b8b\u7559\u987f\u53f7/\u6587\u5b57\u88ab\u5199\u5165\u76ee\u6807\u4f1a\u8bdd\u8349\u7a3f\uff1b\u5feb\u901f\u6e05\u7a7a\u540e\u5207\u8d70\u53c8\u590d\u6d3b\u3002",
       "rootFixCommit": "768041be",
       "regressions": [
         {
@@ -3243,7 +3243,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/composerDraft.test.ts",
-          "assertion": "超 20KB 不写存储但留在本标签内存，不复活旧内容"
+          "assertion": "\u8d85 20KB \u4e0d\u5199\u5b58\u50a8\u4f46\u7559\u5728\u672c\u6807\u7b7e\u5185\u5b58\uff0c\u4e0d\u590d\u6d3b\u65e7\u5185\u5bb9"
         },
         {
           "layer": "browser",
@@ -3266,7 +3266,7 @@
       "id": "INC-20260908-CHAT-NAVIGATION",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "回到底部按钮被旧上滑基线/触摸结束篱笆拦住却假隐藏，近底轻滑误显；移动会话顶栏全部入口挤在一排。",
+      "symptom": "\u56de\u5230\u5e95\u90e8\u6309\u94ae\u88ab\u65e7\u4e0a\u6ed1\u57fa\u7ebf/\u89e6\u6478\u7ed3\u675f\u7bf1\u7b06\u62e6\u4f4f\u5374\u5047\u9690\u85cf\uff0c\u8fd1\u5e95\u8f7b\u6ed1\u8bef\u663e\uff1b\u79fb\u52a8\u4f1a\u8bdd\u9876\u680f\u5168\u90e8\u5165\u53e3\u6324\u5728\u4e00\u6392\u3002",
       "rootFixCommit": "88251c81",
       "regressions": [
         {
@@ -3290,7 +3290,7 @@
       "id": "INC-20260908-GROK-POOL-NO-COOLDOWN",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "V5 selfhost Grok Build 账号池没有失败冷却：internalGrokRelay 对上游 401/403/429/5xx 只 bump fail_count，不走 AccountHealthTracker，一个 refresh token 已死或周额度耗尽的账号会一直留在 WRH 候选集被选中，直到每小时一次的 grokUsageSweeper 标 oauth_terminal 才把权重压到 0.05（仍不踢出）。同时 Cursor 账号 settle 只加计数不写 last_error，管理台账号表对连续失败的 Cursor 行毫无提示。修复：Grok relay 结果经 classifyGrokRelayStatus 分类后走共享 health.onSuccess/onFailure（401/402/403/429 计 strike，3 连败 cooldown，cooldownRecoveryActor 半开恢复）；5xx 归 upstream 只写 fail_count/last_error 不计 strike（池里只有几个 Grok 账号，一次 xAI 全局 529 不能把全池冷却 10 分钟并杀掉在飞 route，审查员 C 项）；400/404/405/413/422 归 client_error 不扣分；Cursor settle 失败写 last_error='cursor_<terminalCode>'、成功清空，不碰 health/status/cooldown（materializer 白名单依赖它们）。单测覆盖分类表与 401 强制过期顺序；部署源码门只证明防回退，不冒称端到端。",
+      "symptom": "V5 selfhost Grok Build \u8d26\u53f7\u6c60\u6ca1\u6709\u5931\u8d25\u51b7\u5374\uff1ainternalGrokRelay \u5bf9\u4e0a\u6e38 401/403/429/5xx \u53ea bump fail_count\uff0c\u4e0d\u8d70 AccountHealthTracker\uff0c\u4e00\u4e2a refresh token \u5df2\u6b7b\u6216\u5468\u989d\u5ea6\u8017\u5c3d\u7684\u8d26\u53f7\u4f1a\u4e00\u76f4\u7559\u5728 WRH \u5019\u9009\u96c6\u88ab\u9009\u4e2d\uff0c\u76f4\u5230\u6bcf\u5c0f\u65f6\u4e00\u6b21\u7684 grokUsageSweeper \u6807 oauth_terminal \u624d\u628a\u6743\u91cd\u538b\u5230 0.05\uff08\u4ecd\u4e0d\u8e22\u51fa\uff09\u3002\u540c\u65f6 Cursor \u8d26\u53f7 settle \u53ea\u52a0\u8ba1\u6570\u4e0d\u5199 last_error\uff0c\u7ba1\u7406\u53f0\u8d26\u53f7\u8868\u5bf9\u8fde\u7eed\u5931\u8d25\u7684 Cursor \u884c\u6beb\u65e0\u63d0\u793a\u3002\u4fee\u590d\uff1aGrok relay \u7ed3\u679c\u7ecf classifyGrokRelayStatus \u5206\u7c7b\u540e\u8d70\u5171\u4eab health.onSuccess/onFailure\uff08401/402/403/429 \u8ba1 strike\uff0c3 \u8fde\u8d25 cooldown\uff0ccooldownRecoveryActor \u534a\u5f00\u6062\u590d\uff09\uff1b5xx \u5f52 upstream \u53ea\u5199 fail_count/last_error \u4e0d\u8ba1 strike\uff08\u6c60\u91cc\u53ea\u6709\u51e0\u4e2a Grok \u8d26\u53f7\uff0c\u4e00\u6b21 xAI \u5168\u5c40 529 \u4e0d\u80fd\u628a\u5168\u6c60\u51b7\u5374 10 \u5206\u949f\u5e76\u6740\u6389\u5728\u98de route\uff0c\u5ba1\u67e5\u5458 C \u9879\uff09\uff1b400/404/405/413/422 \u5f52 client_error \u4e0d\u6263\u5206\uff1bCursor settle \u5931\u8d25\u5199 last_error='cursor_<terminalCode>'\u3001\u6210\u529f\u6e05\u7a7a\uff0c\u4e0d\u78b0 health/status/cooldown\uff08materializer \u767d\u540d\u5355\u4f9d\u8d56\u5b83\u4eec\uff09\u3002\u5355\u6d4b\u8986\u76d6\u5206\u7c7b\u8868\u4e0e 401 \u5f3a\u5236\u8fc7\u671f\u987a\u5e8f\uff1b\u90e8\u7f72\u6e90\u7801\u95e8\u53ea\u8bc1\u660e\u9632\u56de\u9000\uff0c\u4e0d\u5192\u79f0\u7aef\u5230\u7aef\u3002",
       "rootFixCommit": "5dedf778",
       "coverageCommits": [
         "aa9e495b"
@@ -3332,7 +3332,7 @@
       "id": "INC-20260908-HUMAN-WAIT-RESUME",
       "occurredAt": "2026-09-07",
       "severity": "P1",
-      "symptom": "CCB/Cursor Sand 原生提问作答后仍沿用等人之前的 lastActivityAt，答案已接收却在下一 idle tick 被误杀；Codex 同类请求存在相同缺口。只在当前回合未决答案成功送达后刷新 liveness 与30分钟activity时钟，拒绝过期/重复答复，保留真实静默和不可变硬上限。",
+      "symptom": "CCB/Cursor Sand \u539f\u751f\u63d0\u95ee\u4f5c\u7b54\u540e\u4ecd\u6cbf\u7528\u7b49\u4eba\u4e4b\u524d\u7684 lastActivityAt\uff0c\u7b54\u6848\u5df2\u63a5\u6536\u5374\u5728\u4e0b\u4e00 idle tick \u88ab\u8bef\u6740\uff1bCodex \u540c\u7c7b\u8bf7\u6c42\u5b58\u5728\u76f8\u540c\u7f3a\u53e3\u3002\u53ea\u5728\u5f53\u524d\u56de\u5408\u672a\u51b3\u7b54\u6848\u6210\u529f\u9001\u8fbe\u540e\u5237\u65b0 liveness \u4e0e30\u5206\u949factivity\u65f6\u949f\uff0c\u62d2\u7edd\u8fc7\u671f/\u91cd\u590d\u7b54\u590d\uff0c\u4fdd\u7559\u771f\u5b9e\u9759\u9ed8\u548c\u4e0d\u53ef\u53d8\u786c\u4e0a\u9650\u3002",
       "rootFixCommit": "ffe32879",
       "regressions": [
         {
@@ -3353,7 +3353,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerIdleTimeout.test.ts",
-          "assertion": "明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发"
+          "assertion": "\u660e\u786e\u7b49\u5f85\u7528\u6237\u65f6\u8df3\u8fc7 idle\uff0c\u4f46\u540c\u4e00\u9608\u503c\u5728\u666e\u901a\u6267\u884c\u6001\u4ecd\u89e6\u53d1"
         },
         {
           "layer": "browser",
@@ -3366,7 +3366,7 @@
       "id": "INC-20260908-IDLE-CURSOR-BLACKHOLE",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "Selfhost旧会话在暖WebSocket上续问：后台已有正文和工具输出，旧frameSeq游标把新输出当重复帧丢弃，页面仅显示深度思考。回收引擎保留输出编号；历史后注册idle游标由服务器仲裁。",
+      "symptom": "Selfhost\u65e7\u4f1a\u8bdd\u5728\u6696WebSocket\u4e0a\u7eed\u95ee\uff1a\u540e\u53f0\u5df2\u6709\u6b63\u6587\u548c\u5de5\u5177\u8f93\u51fa\uff0c\u65e7frameSeq\u6e38\u6807\u628a\u65b0\u8f93\u51fa\u5f53\u91cd\u590d\u5e27\u4e22\u5f03\uff0c\u9875\u9762\u4ec5\u663e\u793a\u6df1\u5ea6\u601d\u8003\u3002\u56de\u6536\u5f15\u64ce\u4fdd\u7559\u8f93\u51fa\u7f16\u53f7\uff1b\u5386\u53f2\u540e\u6ce8\u518cidle\u6e38\u6807\u7531\u670d\u52a1\u5668\u4ef2\u88c1\u3002",
       "rootFixCommit": "2041bec7",
       "regressions": [
         {
@@ -3390,7 +3390,7 @@
       "id": "INC-20260908-CALLBACK-PAYLOAD-HASH",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "委派完成回调经cron-origin先受理冻结原文哈希，后被论文意图hint重写content.text，执行端payload_hash_mismatch拒绝并显示消息未开始处理。内部cron-origin保持已受理正文，浏览器论文hint仍在受理前应用。",
+      "symptom": "\u59d4\u6d3e\u5b8c\u6210\u56de\u8c03\u7ecfcron-origin\u5148\u53d7\u7406\u51bb\u7ed3\u539f\u6587\u54c8\u5e0c\uff0c\u540e\u88ab\u8bba\u6587\u610f\u56fehint\u91cd\u5199content.text\uff0c\u6267\u884c\u7aefpayload_hash_mismatch\u62d2\u7edd\u5e76\u663e\u793a\u6d88\u606f\u672a\u5f00\u59cb\u5904\u7406\u3002\u5185\u90e8cron-origin\u4fdd\u6301\u5df2\u53d7\u7406\u6b63\u6587\uff0c\u6d4f\u89c8\u5668\u8bba\u6587hint\u4ecd\u5728\u53d7\u7406\u524d\u5e94\u7528\u3002",
       "rootFixCommit": "471b5149",
       "regressions": [
         {
@@ -3418,7 +3418,7 @@
       "id": "INC-20260908-CROSS-TURN-CARD-LOCATOR",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "上一轮派出的后台委派(dlgjob-*)在 dlgcb-* 回调/定时续跑轮收尾，团队卡随当前轮 tape 下发但 engineBilling.parentTurnKey 仍是上一轮 key；master parseLosslessTurnPayload 要求 parentTurnKey===turnKey 而抛 parent locator is invalid，Phase-B 物化 8 次后永久 failed，前端 records_unpublished 降级只剩最后一段 live 片段+孤字，刷新不恢复。全库 76 个 tape 命中。修复：校验改为会话内任一合法 64hex parentTurnKey（parentSessionId 仍严格），结算按 billing 自带 locator 归因不受影响。",
+      "symptom": "\u4e0a\u4e00\u8f6e\u6d3e\u51fa\u7684\u540e\u53f0\u59d4\u6d3e(dlgjob-*)\u5728 dlgcb-* \u56de\u8c03/\u5b9a\u65f6\u7eed\u8dd1\u8f6e\u6536\u5c3e\uff0c\u56e2\u961f\u5361\u968f\u5f53\u524d\u8f6e tape \u4e0b\u53d1\u4f46 engineBilling.parentTurnKey \u4ecd\u662f\u4e0a\u4e00\u8f6e key\uff1bmaster parseLosslessTurnPayload \u8981\u6c42 parentTurnKey===turnKey \u800c\u629b parent locator is invalid\uff0cPhase-B \u7269\u5316 8 \u6b21\u540e\u6c38\u4e45 failed\uff0c\u524d\u7aef records_unpublished \u964d\u7ea7\u53ea\u5269\u6700\u540e\u4e00\u6bb5 live \u7247\u6bb5+\u5b64\u5b57\uff0c\u5237\u65b0\u4e0d\u6062\u590d\u3002\u5168\u5e93 76 \u4e2a tape \u547d\u4e2d\u3002\u4fee\u590d\uff1a\u6821\u9a8c\u6539\u4e3a\u4f1a\u8bdd\u5185\u4efb\u4e00\u5408\u6cd5 64hex parentTurnKey\uff08parentSessionId \u4ecd\u4e25\u683c\uff09\uff0c\u7ed3\u7b97\u6309 billing \u81ea\u5e26 locator \u5f52\u56e0\u4e0d\u53d7\u5f71\u54cd\u3002",
       "rootFixCommit": "a9202bc4",
       "regressions": [
         {
@@ -3437,7 +3437,7 @@
       "id": "INC-20260908-PREPARATION-RETRY",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "首次受理后上下文准备超过35秒被终态化，没有自动重试；同cmid重入可能复活准备计时器。兼容writer关闭时缺负向裁决可造成无任务假重新准备。同一准备child重领后旧物理超时计时器仍可误画失败。",
+      "symptom": "\u9996\u6b21\u53d7\u7406\u540e\u4e0a\u4e0b\u6587\u51c6\u5907\u8d85\u8fc735\u79d2\u88ab\u7ec8\u6001\u5316\uff0c\u6ca1\u6709\u81ea\u52a8\u91cd\u8bd5\uff1b\u540ccmid\u91cd\u5165\u53ef\u80fd\u590d\u6d3b\u51c6\u5907\u8ba1\u65f6\u5668\u3002\u517c\u5bb9writer\u5173\u95ed\u65f6\u7f3a\u8d1f\u5411\u88c1\u51b3\u53ef\u9020\u6210\u65e0\u4efb\u52a1\u5047\u91cd\u65b0\u51c6\u5907\u3002\u540c\u4e00\u51c6\u5907child\u91cd\u9886\u540e\u65e7\u7269\u7406\u8d85\u65f6\u8ba1\u65f6\u5668\u4ecd\u53ef\u8bef\u753b\u5931\u8d25\u3002",
       "rootFixCommit": "60912504",
       "regressions": [
         {
@@ -3484,6 +3484,68 @@
       "coverageCommits": [
         "f5ad3542",
         "7d2f2aa4"
+      ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-SAND-BOX-TRANSPORT",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Sand \u8d26\u53f7\u63a7\u5236\u9762\u53ef\u7528\u4f46\u8d26\u53f7 JWT \u76f4\u8fde InferenceService.Stream \u8fd4\u56de NOT_LOGGED_IN\uff0c\u4e0d\u80fd\u5b8c\u6210\u63a8\u7406\u3002\u6309\u8d26\u53f7\u663e\u5f0f\u7ed1\u5b9a\u81ea\u6709 Box \u7684\u53d7\u9274\u6743 inference-only \u4e2d\u8f6c\uff0c\u5de5\u5177\u4ecd\u5728\u672c\u673a\uff1bBox \u7968\u636e\u9519\u8bef\u4e0d\u5f97\u6c61\u67d3\u8d26\u53f7\u5065\u5eb7\u3001\u8f6e\u6362\u8d26\u53f7\u6216\u89e6\u53d1\u5de5\u5177\u7ea0\u9519\u91cd\u8bd5\u3002",
+      "rootFixCommit": "1d341fe5",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box HTTP failures keep no-retry transport scope, descriptor cache, and true account/quota distinctions"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box Connect unauthenticated trailers preserve transport identity in both response modes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "actual Relay rejection feeds actual Adapter billing chain without poisoning the account"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "terminal Box ticket error never enters tool correction:"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-sand-box] PASS \u2014 isolated Box transport, account health, and terminal no-retry contracts executed"
+        }
+      ],
+      "coverageCommits": [
+        "7ac9122a",
+        "f7730d2d"
+      ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-EMPTY-POOL-MOUNT",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Sand\u5f02\u6b65\u51c6\u5907\u671f\u95f4\u8d26\u53f7\u6c60\u5408\u6cd5\u4e3a\u7a7a\uff0c\u5bb9\u5668provision\u56e0api-key\u7f3a\u5931\u6f0f\u6302\u6574\u4e2aCursor\u6388\u6743\u76ee\u5f55\uff1b\u968f\u540e\u8d26\u53f7ready\u4e14\u5bbf\u4e3b\u51ed\u636e\u5df2\u53d1\u5e03\uff0c\u4f46\u5bb9\u5668\u4ecd\u65e0mount\uff0c\u6b63\u5e38UI\u5728\u6a21\u578b\u6267\u884c\u524dCURSOR_CREDENTIAL_SELECTION_FAILED\u5e76DISPATCH_NOT_ACCEPTED\u3002\u4fee\u590d\u4ec5\u5141\u8bb8\u4e25\u683croot\u79c1\u6709managed marker\u8bc1\u660e\u7684\u7a7a\u6c60\u4fdd\u6301RO\u76ee\u5f55\u6302\u8f7d\uff0c\u5df2\u6709\u574fkey\u53ca\u975e\u6210\u5458\u7ee7\u7eed\u62d2\u7edd\u3002",
+      "rootFixCommit": "bd61c413",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "empty managed pool keeps the directory mount across 0\u21921\u21920\u21921 atomic publication"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "v5 empty managed Cursor pool provisions the same read-only bind before a key is ready"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-auth-mount] PASS \u2014 real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)"
+        }
       ]
     }
   ]

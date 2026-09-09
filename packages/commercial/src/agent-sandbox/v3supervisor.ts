@@ -50,7 +50,7 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash, createHmac } from "node:crypto";
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
@@ -399,6 +399,8 @@ export interface V5CursorAuthMountOptions {
  * Resolve the host Cursor auth directory only for an explicitly configured
  * local V5 credential member. Invalid or incomplete configuration is fail-closed: the
  * Agent container still starts, but no Cursor credential is mounted.
+ * An already managed pool keeps its directory mounted while empty, so a later
+ * account activation/preparation can publish credentials without a container rebuild.
  */
 export function resolveV5CursorAuthMount(
   options: V5CursorAuthMountOptions,
@@ -426,7 +428,27 @@ export function resolveV5CursorAuthMount(
     }
 
     const keyPath = pathJoin(normalized, "api-key");
-    const keyStat = lstatSync(keyPath);
+    let keyStat;
+    try {
+      keyStat = lstatSync(keyPath);
+    } catch (error) {
+      // Only an absent key is a legitimate empty pool. Never let the marker
+      // excuse an existing malformed key, a symlink, or any other I/O error.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      const markerPath = pathJoin(normalized, ".account-pool-owned");
+      const markerStat = lstatSync(markerPath);
+      const markerMode = markerStat.mode & 0o777;
+      if (
+        !markerStat.isFile()
+        || markerStat.isSymbolicLink()
+        || markerStat.uid !== 0
+        || (markerMode !== 0o400 && markerMode !== 0o600)
+        || markerStat.size !== 2
+        || realpathSync(markerPath) !== markerPath
+        || readFileSync(markerPath, "utf8") !== "1\n"
+      ) return null;
+      return normalized;
+    }
     const keyMode = keyStat.mode & 0o777;
     if (
       !keyStat.isFile()
