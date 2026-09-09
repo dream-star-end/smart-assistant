@@ -3599,11 +3599,12 @@
       "id": "INC-20260908-LIVE-FRAME-CLASSIFY",
       "occurredAt": "2026-09-08",
       "severity": "P1",
-      "symptom": "只读 live-frame 分类与业务健康在 connect 拒绝或卡住时会整份诊断抛错或无界等待，发布/运维必需检查因此被阻断。本包用 bounded helper（JS deadline + BEGIN READ ONLY + SET LOCAL statement_timeout）覆盖 acquisition/query，timeout/unknown 带 null 计数不得伪 0，按需 CLI 不进热 tick 与 /healthz.ok；model_pricing_0903_cw_backup 永久账本。影响是诊断整体不可用或检查挂起，不是已证实的线上资损或备份恢复失败。",
+      "symptom": "只读 live-frame 分类与业务健康在 connect 拒绝或卡住时会整份诊断抛错或无界等待，发布/运维必需检查因此被阻断。本包用 bounded helper（JS deadline + BEGIN READ ONLY + SET LOCAL statement_timeout）覆盖 acquisition/query，timeout/unknown 带 null 计数不得伪 0，按需 CLI 不进热 tick 与 /healthz.ok；model_pricing_0903_cw_backup 永久账本。影响是诊断整体不可用或检查挂起，不是已证实的线上资损或备份恢复失败。 后续精确区分该historical-manual表的创建来源：fresh迁移库不强求手工历史表存在，仍拒绝未知物理表或缺失的migration-owned表；永久保护、TTL禁入和live全注册不变。",
       "rootFixCommit": "3ec290e1",
       "coverageCommits": [
         "5f736b0f",
-        "b569969d"
+        "b569969d",
+        "c6050b57"
       ],
       "regressions": [
         {
@@ -3625,6 +3626,21 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260908-LIVE-FRAME-CLASSIFY executed bounded helper classify/unknown/connect/query proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/retentionRegistry.unit.test.ts",
+          "assertion": "each migration-owned table missing from observation is still a phantom"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/retentionRegistry.unit.test.ts",
+          "assertion": "all permanent ledgers stay outside actual TTL policy resolution, including override attempts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/retentionRegistry.integ.test.ts",
+          "assertion": "information_schema 全部 base table 都在 RETENTION_REGISTRY(未声明即红)"
         }
       ]
     },
