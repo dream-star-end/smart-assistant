@@ -3470,6 +3470,30 @@
         "7ac9122a",
         "f7730d2d"
       ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-EMPTY-POOL-MOUNT",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Sand异步准备期间账号池合法为空，容器provision因api-key缺失漏挂整个Cursor授权目录；随后账号ready且宿主凭据已发布，但容器仍无mount，正常UI在模型执行前CURSOR_CREDENTIAL_SELECTION_FAILED并DISPATCH_NOT_ACCEPTED。修复仅允许严格root私有managed marker证明的空池保持RO目录挂载，已有坏key及非成员继续拒绝。",
+      "rootFixCommit": "bd61c413",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "empty managed pool keeps the directory mount across 0→1→0→1 atomic publication"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "v5 empty managed Cursor pool provisions the same read-only bind before a key is ready"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)"
+        }
+      ]
     }
   ]
 }
