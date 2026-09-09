@@ -190,7 +190,7 @@ export class CursorSandLifecycleCoordinator {
       if (code === "ACCOUNT_INACTIVE" || code === "ACCOUNT_CHANGED") delete state.accounts[id];
       else if (state.accounts[id]) {
         const authRejected = error instanceof SandProvisionError && (error.httpStatus === 401 || error.httpStatus === 403);
-        const transient = !authRejected && ["BOX_BUSY", "BOX_CONTROL_PENDING", "REQUEST_FAILED", "REQUEST_ABORTED", "BOX_PROBE_PENDING"].includes(code);
+        const transient = !authRejected && ["BOX_BUSY", "BOX_CONTROL_PENDING", "ACCOUNT_EXCHANGE_PENDING", "REQUEST_FAILED", "REQUEST_ABORTED", "BOX_PROBE_PENDING"].includes(code);
         state.accounts[id] = previousReady && transient && previousReady.readyUntil! > this.now()
           ? previousReady
           : { ...state.accounts[id], phase: transient ? "preparing" : "error", errorCode: code, updatedAt: this.now() };

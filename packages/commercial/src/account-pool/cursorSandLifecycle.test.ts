@@ -159,3 +159,28 @@ test("GET capability probe upgrades a real legacy relay without any empty infere
     assert.deepEqual({ creates, sends, tokenCalls, upstreamCalls }, { creates: 1, sends: 1, tokenCalls: 0, upstreamCalls: 0 });
   } finally { await coordinator.stop(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("API-key exchange transient failures retain exact ready expiry; expiry and explicit rejection still withdraw", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sand-exchange-recheck-"));
+  const key = "crsr_" + "a".repeat(64), machine = "b".repeat(32), subject = sandHash("api-principal"), moduleHash = "c".repeat(64);
+  const now = Date.now(), until = now + 3600_000;
+  const row: any = { id: 1n, provider: "cursor", status: "active", runtime_channel: "v5", cursor_sand_enabled: true, cooldown_until: null };
+  const snapshot = async () => ({ id: 1n, token: Buffer.from(key), refresh: null, machine_id: null, credential_kind: "api_key" as const, expires_at: null });
+  try {
+    for (const [status, expired, expected] of [[503, false, 1], [429, false, 1], [408, false, 1], [500, false, 1], [401, false, 0], [403, false, 0], [503, true, 0]] as const) {
+      const readyUntil = expired ? now - 1 : until;
+      const state: SandLifecycleState = { version: 1, accounts: { "1": { credentialHash: sandHash(key), subjectHash: subject, machineId: machine, machineHash: sandHash(machine), phase: "ready", updatedAt: now - 600_000, readyUntil } }, operations: { [subject]: { nonce: "oc-sand-" + "a".repeat(32), moduleHash, phase: "ready", machineId: machine, startedAt: now - 600_000, nextAttemptAt: 0 } } };
+      writeSandJsonAtomic(dir, SAND_STATE_FILE, state, () => true);
+      let calls = 0;
+      const c = new CursorSandLifecycleCoordinator({ authDir: dir, moduleHash, listAccounts: async () => [row], getAccount: async () => row, getTokenSnapshot: snapshot, now: () => now, onChange: () => {}, installerPrompt: () => { throw Error("must not install"); },
+        clientFor: async () => ({ client: new CursorSandProvisionClient({ now: () => now, fetchImpl: async (url) => { assert.ok(url.endsWith("/auth/exchange_user_api_key")); calls++; return Response.json({}, { status }); } }) }) });
+      try { await c.tick(); } finally { await c.stop(); }
+      const result = await syncCursorAuthDir({ authDir: dir, lifecycleManaged: true, listAccounts: async () => [row], getCursorTokenSnapshot: snapshot, now: () => new Date(now), createAccount: async () => { throw Error("no import"); } });
+      assert.equal(result.written, expected, `exchange ${status}, expired=${expired}`);
+      assert.equal(calls, 1);
+      const after = readSandLifecycleState(dir).accounts["1"];
+      if (expected === 1) { assert.equal(after.phase, "ready"); assert.equal(after.readyUntil, until, "background failure must not extend readiness"); }
+      else assert.notEqual(after.phase, "ready");
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

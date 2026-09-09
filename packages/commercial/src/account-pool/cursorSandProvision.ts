@@ -94,7 +94,7 @@ export class CursorSandProvisionClient {
     const r = await this.request(`${this.apiBase}/auth/exchange_user_api_key`, {
       method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: "{}",
     }, signal);
-    if (r.status !== 200) throw new SandProvisionError("ACCOUNT_EXCHANGE_FAILED", r.status);
+    if (r.status !== 200) throw new SandProvisionError(r.status === 408 || r.status === 429 || r.status >= 500 ? "ACCOUNT_EXCHANGE_PENDING" : "ACCOUNT_EXCHANGE_FAILED", r.status);
     const value = object(r.value); const token = bearer(value.accessToken ?? value.access_token);
     sandPrincipal(token, kind, this.options.now?.()); return token;
   }
