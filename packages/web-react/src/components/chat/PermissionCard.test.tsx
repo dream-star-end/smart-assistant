@@ -808,3 +808,58 @@ describe("跨包契约", () => {
     expect(serverTtl).toBe(PENDING_PERMISSION_TTL_MS);
   });
 });
+
+
+describe("181 ae57 stable Host pinned entry", () => {
+  test("card-only unmount retains Host bar and reopens one dialog without responding", () => {
+    const msg = askMsg({ requestId: "host-bar-unmount" });
+    const respond = vi.fn();
+    const tree = (rows: boolean) => <>
+      <div id="pending-approval-bar-slot" />
+      <PermissionPromptHost messages={[msg]} onRespond={respond} sending sessionId="bar-session" />
+      {rows && <PermissionCard msg={msg} onRespond={respond} renderMode="card" />}
+    </>;
+    const { rerender } = render(tree(true));
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getAllByTestId("pending-approval-bar")).toHaveLength(1);
+    rerender(tree(false));
+    expect(document.getElementById("pending-approval-bar-slot")).toContainElement(screen.getByTestId("pending-approval-bar"));
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  test("same Host session switch does not expose previous minimized request", () => {
+    const a = askMsg({ requestId: "host-session-a" });
+    const b = askMsg({ requestId: "host-session-b" });
+    const respond = vi.fn();
+    const { rerender } = render(<PermissionPromptHost messages={[a]} onRespond={respond} sending sessionId="a" />);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.getByTestId("pending-approval-bar")).toHaveAttribute("data-request-id", a.requestId);
+    rerender(<PermissionPromptHost messages={[b]} onRespond={respond} sending sessionId="b" />);
+    expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.getByTestId("pending-approval-bar")).toHaveAttribute("data-request-id", b.requestId);
+    rerender(<PermissionPromptHost messages={[{ ...b, _controlPending: true }]} onRespond={respond} sending sessionId="b" />);
+    expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  test("absolute expiry removes minimized bar without a new message frame", () => {
+    vi.useFakeTimers();
+    try {
+      const respond = vi.fn();
+      const msg = askMsg({ requestId: "host-expiry", _askUserExpiresAt: Date.now() + 1000 });
+      render(<PermissionPromptHost messages={[msg]} onRespond={respond} sending />);
+      fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+      expect(screen.getByTestId("pending-approval-bar")).toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(1001));
+      expect(screen.queryByTestId("pending-approval-bar")).toBeNull();
+      expect(respond).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+});

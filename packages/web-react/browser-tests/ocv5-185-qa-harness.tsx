@@ -8,6 +8,7 @@ import { createRoot } from "react-dom/client";
 import { useChatSocket } from "../src/hooks/useChatSocket";
 import { api } from "../src/lib/api";
 import type { AuthSession } from "../src/lib/types";
+import { PermissionCard, PermissionPromptHost } from "../src/components/chat/PermissionCard";
 import { MessageList } from "../src/components/MessageRenderer";
 import {
   activeModalRequest,
@@ -47,6 +48,7 @@ function params() {
     agentId: q.get("agent") || "main",
     token: q.get("token") || `tok-${q.get("user") || "user-a"}`,
     live: q.get("live") === "1",
+    split: q.get("split") === "1",
   };
 }
 
@@ -63,6 +65,7 @@ function Harness() {
   });
   const [, setCoordTick] = useState(0);
   const [loadError, setLoadError] = useState("");
+  const [mountRows, setMountRows] = useState(true);
 
   useEffect(() => resetPermissionPopupCoordinator(), [cfg.userId, cfg.sessId]);
   useEffect(() => subscribePermissionCoordinator(() => setCoordTick((n) => n + 1)), []);
@@ -140,6 +143,7 @@ function Harness() {
 
   useEffect(() => {
     const apiSurface = {
+      setMountRows,
       loadSession,
       loadSnapshot,
       getState: () => ({
@@ -167,7 +171,16 @@ function Harness() {
           <div data-testid="qa-active-modal">{activeModalRequest() ?? ""}</div>
           <pre data-testid="qa-cards">{JSON.stringify(cards)}</pre>
           {loadError ? <div data-testid="qa-load-error">{loadError}</div> : null}
+          <div id="pending-approval-bar-slot" />
           <div style={{ height: 720, overflow: "auto" }} data-testid="qa-timeline">
+            {cfg.split ? <>
+              <PermissionPromptHost messages={messages} sending={sending} sessionId={cfg.sessId}
+                onRespond={(p) => sock.respondPermission({ sessId: cfg.sessId, ...p })} />
+              {mountRows && messages.filter((m) => m.role === "permission").map((m) =>
+                <PermissionCard key={m.requestId} msg={m} renderMode="card"
+                  onRespond={(p) => sock.respondPermission({ sessId: cfg.sessId, ...p })} />)}
+            </> : (
+
             <MessageList
               messages={messages}
               sending={sending}
@@ -176,7 +189,7 @@ function Harness() {
                 sock.respondPermission({ sessId: cfg.sessId, ...p });
               }}
               sessionId={cfg.sessId}
-            />
+            />)}
           </div>
         </div>
       </ToastProvider>

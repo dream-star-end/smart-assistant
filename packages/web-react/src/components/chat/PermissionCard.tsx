@@ -22,6 +22,7 @@ import {
   activeModalRequest,
   dismissPermissionUi,
   isDocumentForeground,
+  isPermissionUiDismissed,
   markPermissionDisplayed,
   reopenPermissionUi,
   resetPermissionPopupCoordinator,
@@ -100,18 +101,17 @@ export function extractExitPlanMarkdown(input: Record<string, unknown> | null | 
 
 /** Prefer the server-carried absolute expiry; fall back to ts + role TTL for
  *  old rows that never received `_askUserExpiresAt`. */
-export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolean {
+function permissionExpiresAt(msg: ChatMessage): number {
   const expiresAt = msg._askUserExpiresAt;
-  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
-    return now >= expiresAt;
-  }
-  if (!Number.isFinite(msg.ts)) return false;
-  // Blocking prompts (detached ask_user, ExitPlanMode) are not subject to the
-  // 30-minute idle TTL on the server either (gateway `BLOCKING_USER_INPUT_TOOLS`).
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) return expiresAt;
+  if (!Number.isFinite(msg.ts)) return Infinity;
   const ttlMs = isDetachedAskUserCard(msg) || isExitPlanModeTool(msg.toolName)
-    ? DETACHED_ASK_USER_TTL_MS
-    : PENDING_PERMISSION_TTL_MS;
-  return now - msg.ts > ttlMs;
+    ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
+  return msg.ts + ttlMs;
+}
+
+export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolean {
+  return now >= permissionExpiresAt(msg);
 }
 
 /** A prompt the runtime is (as far as this browser can tell) still blocked on:
@@ -328,37 +328,10 @@ export function PermissionCard({
     setOpen(next);
   };
 
-  const reopen = () => setOpen(true);
-
-  // 关掉弹层 ≠ 作答：未决、未过期、用户主动收起的活提问钉一条可重开 bar。
-  // ExitPlanMode 不能无决策关掉，不进 dismissed 集，也不出 bar。
-  const showPendingBar =
-    canAnswer &&
-    livePrompt &&
-    !expired &&
-    !open &&
-    !isExitPlan &&
-    !!msg.requestId &&
-    dismissedPermissionRequestIds.has(msg.requestId);
-
-  const pendingBar = showPendingBar ? (
-    <Alert
-      tone="warning"
-      density="compact"
-      data-testid="pending-approval-bar"
-      className="cursor-pointer"
-      onClick={reopen}
-      action={
-        <Button size="sm" variant="secondary" onClick={reopen}>
-          打开
-        </Button>
-      }
-    >
-      智能体在等你确认 · 打开
-    </Alert>
-  ) : null;
-  const pendingBarSlot =
-    typeof document !== "undefined" ? document.getElementById("pending-approval-bar-slot") : null;
+  // Standalone compatibility only. Real timeline cards and modal instances do
+  // not own the pinned entry: PermissionPromptHost survives virtualization.
+  const showPendingBar = renderMode === "both" && canAnswer && livePrompt &&
+    !expired && !open && !isExitPlan && isPermissionUiDismissed(msg.requestId);
 
   // 状态图标(M7):lucide 替代 emoji。等待→Clock / 已允许→Check / 已拒绝→X。
   const StatusIcon = !resolved ? Clock : behavior === "allow" ? Check : X;
@@ -542,9 +515,25 @@ export function PermissionCard({
             onRespond={onRespond}
           />
         ))}
-      {pendingBar && (pendingBarSlot ? createPortal(pendingBar, pendingBarSlot) : pendingBar)}
+      {showPendingBar && <PendingApprovalBar requestId={msg.requestId!} onReopen={() => {
+        reopenPermissionUi(msg.requestId!);
+        setOpen(true);
+      }} />}
     </div>
   );
+}
+
+/** Presentation only; click bubbles from the button exactly once. */
+function PendingApprovalBar({ requestId, onReopen }: { requestId: string; onReopen: () => void }) {
+  const bar = (
+    <Alert tone="warning" density="compact" data-testid="pending-approval-bar"
+      data-request-id={requestId} className="cursor-pointer" onClick={onReopen}
+      action={<Button size="sm" variant="secondary">打开</Button>}>
+      智能体在等你确认 · 打开
+    </Alert>
+  );
+  const slot = typeof document !== "undefined" ? document.getElementById("pending-approval-bar-slot") : null;
+  return slot ? createPortal(bar, slot) : bar;
 }
 
 export function PermissionPromptHost({
@@ -560,7 +549,7 @@ export function PermissionPromptHost({
   sending?: boolean;
   sessionId?: string;
 }) {
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
   useEffect(() => subscribePermissionCoordinator(() => {
     setTick((n) => n + 1);
   }), []);
@@ -569,6 +558,15 @@ export function PermissionPromptHost({
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
+  // One deadline, not polling; use exactly the card's expiry boundary.
+  useEffect(() => {
+    if (readOnly) return;
+    const now = Date.now();
+    const next = Math.min(...messages.filter((m) => isAwaitingPermissionPrompt(m, now)).map(permissionExpiresAt));
+    if (!Number.isFinite(next)) return;
+    const timer = setTimeout(() => setTick((n) => n + 1), Math.min(next - now, 2_147_483_647));
+    return () => clearTimeout(timer);
+  }, [messages, readOnly, tick]);
   if (readOnly) return null;
   const pending = messages.filter(
     (message) =>
@@ -585,15 +583,21 @@ export function PermissionPromptHost({
     return live && shouldAutoOpenPermission({ requestId: message.requestId!, livePrompt: true });
   });
   const msg = activeMsg ?? autoMsg;
-  if (!msg) return null;
+  const minimized = !msg ? pending.find((message) =>
+    !isExitPlanModeTool(message.toolName) && isPermissionUiDismissed(message.requestId)
+  ) : undefined;
   return (
-    <PermissionCard
+    <>
+    {msg && <PermissionCard
       key={`${sessionId ?? ""}:${msg.requestId}`}
       msg={msg}
       onRespond={onRespond}
       livePrompt
       renderMode="modal"
-    />
+    />}
+    {minimized && <PendingApprovalBar requestId={minimized.requestId!}
+      onReopen={() => reopenPermissionUi(minimized.requestId!, sessionId)} />}
+    </>
   );
 }
 

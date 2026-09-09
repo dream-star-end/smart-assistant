@@ -1524,6 +1524,49 @@ test("OCV5-185 real dual Chromium permission QA", { timeout: 360_000 }, async (t
         await ctx.close();
       }
     });
+    for (const [id, split] of [["T13", false], ["T14", true]]) {
+      if (want(id)) await t.test(`${id} pinned bar reopens actual singleton Host${split ? " after controlled row unmount" : " in MessageList"}`, async () => {
+        store.prompts.clear(); store.responses.length = 0;
+        const row = prompt({ requestId: `req-bar-${id}`, expiresAt: nowMs() + 120000 });
+        store.prompts.set(row.requestId, row);
+        const ctx = await browser.newContext();
+        let page;
+        try {
+          page = await openPage(ctx, `user=${USER_A}&sess=${SESS}&agent=main&live=1${split ? "&split=1" : ""}`);
+          await page.evaluate(() => window.__qa.loadSession());
+          await page.getByRole("dialog").waitFor({ state: "visible" });
+          assert.equal(await page.getByRole("dialog").count(), 1);
+          await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+          const bar = page.locator("#pending-approval-bar-slot [data-testid=pending-approval-bar]");
+          await bar.waitFor({ state: "visible" });
+          assert.equal(await page.getByRole("dialog").count(), 0);
+          assert.equal(await bar.count(), 1);
+          if (split) {
+            await page.evaluate(() => window.__qa.setMountRows(false));
+            await page.waitForFunction(() => !document.querySelector("[data-testid=permission-card]"));
+            assert.equal(await page.getByTestId("permission-card").count(), 0, "controlled virtual-row lifecycle really unmounted all cards");
+            assert.equal(await bar.count(), 1, "stable Host entry must survive card unmount");
+          }
+          await bar.getByRole("button", { name: "打开", exact: true }).click();
+          await page.getByRole("dialog").waitFor({ state: "visible" });
+          assert.equal(await page.getByRole("dialog").count(), 1, "bar must reopen exactly one REAL dialog, not only set local open");
+          assert.equal(await bar.count(), 0);
+          assert.equal(store.responses.length, 0, "close/reopen cannot respond");
+          await page.getByRole("dialog").getByRole("button", { name: "关闭" }).click();
+          await bar.waitFor({ state: "visible" });
+          row.expiresAt = nowMs() + 1500;
+          await page.evaluate(() => window.__qa.loadSnapshot());
+          await bar.waitFor({ state: "hidden" });
+          assert.equal(store.responses.length, 0, "local expiry cannot respond");
+          assert.equal(page._qaErrors.length, 0, page._qaErrors.join("\n"));
+          await shot(page, `${id.toLowerCase()}-host-bar`);
+        } catch (err) {
+          failures.push(id);
+          if (page) await failShot(page, id.toLowerCase()).catch(() => {});
+          throw err;
+        } finally { await ctx.close(); }
+      });
+    }
   } finally {
     writeFileSync(
       join(ARTIFACTS, "summary.json"),
