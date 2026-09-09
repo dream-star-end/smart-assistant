@@ -324,13 +324,6 @@ export function TutorialCenter({
   const showStart = () => clearToBrowse("start");
   const showCases = () => clearToBrowse("cases");
 
-  const showFeatures = () => {
-    setQuery("");
-    setCommunityOpen(false);
-    onCommunityChange(null);
-    onTopicChange(selectedTopicId);
-  };
-
   const showCommunity = () => {
     setQuery("");
     setCommunityOpen(true);
@@ -398,16 +391,19 @@ export function TutorialCenter({
           </header>
 
           <nav aria-label="案例与帮助" className="relative z-10 flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2 sm:px-5">
-            <ViewTab active={mode === "showcase" || (mode === "cases" && Boolean(selectedShowcase))} onClick={showShowroom} icon={Sparkles}>
-              案例展厅
-            </ViewTab>
+            <div className="flex min-w-0 items-center gap-1">
+              <ViewTab active={mode === "showcase" || (mode === "cases" && Boolean(selectedShowcase))} onClick={showShowroom} icon={Sparkles}>
+                案例展厅
+              </ViewTab>
+              <ViewTab active={mode === "start"} onClick={showStart} icon={Rocket}>
+                快速上手
+              </ViewTab>
+            </div>
             <details className="group relative" onClick={(event) => {
               if ((event.target as HTMLElement).closest("button")) event.currentTarget.removeAttribute("open");
             }}>
               <summary className="cursor-pointer list-none rounded-lg px-3 py-2 text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">帮助与创作 <ChevronDown className="ml-1 inline" size={13} /></summary>
               <div className="absolute right-0 top-full mt-1 flex w-48 flex-col gap-1 rounded-xl border border-border bg-surface p-2 shadow-float">
-                <ViewTab active={mode === "features"} onClick={showFeatures} icon={Search}>功能参考</ViewTab>
-                <ViewTab active={mode === "start"} onClick={showStart} icon={Rocket}>快速上手</ViewTab>
                 <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>教程工作室</ViewTab>
                 <ViewTab active={mode === "cases" && !selectedShowcase} onClick={showCases} icon={FileTextIcon}>案例脚本</ViewTab>
               </div>
