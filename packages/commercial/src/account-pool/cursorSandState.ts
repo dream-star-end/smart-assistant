@@ -24,12 +24,14 @@ export interface SandAccountPreparation {
 export interface SandPreparationOperation {
   nonce: string;
   moduleHash: string;
-  phase: "create-intent" | "created" | "install-intent" | "submitted" | "ready" | "error";
+  phase: "idle" | "create-intent" | "created" | "install-intent" | "submitted" | "ready" | "error";
   startedAt: number;
   nextAttemptAt: number;
   agentId?: string;
   errorCode?: string;
   hostPid?: number;
+  machineId?: string;
+  agentMarker?: string;
 }
 export interface SandLifecycleState {
   version: 1;
@@ -38,7 +40,7 @@ export interface SandLifecycleState {
 }
 export interface SandReadyBinding { accountId: string; subjectHash: string; machineHash: string; machineId?: string }
 const accountFields = ["credentialHash", "phase", "subjectHash", "machineId", "machineHash", "errorCode", "updatedAt", "readyUntil"];
-const operationFields = ["nonce", "moduleHash", "phase", "startedAt", "nextAttemptAt", "agentId", "errorCode", "hostPid"];
+const operationFields = ["nonce", "moduleHash", "phase", "startedAt", "nextAttemptAt", "agentId", "errorCode", "hostPid", "machineId", "agentMarker"];
 
 function record(value: unknown): asserts value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("SAND_STATE_INVALID");
@@ -68,9 +70,10 @@ export function parseSandLifecycleState(value: unknown): SandLifecycleState {
     record(o); fields(o, operationFields);
     if (!HEX.test(subject) || typeof o.moduleHash !== "string" || !HEX.test(o.moduleHash)
       || typeof o.nonce !== "string" || !/^oc-sand-[a-f0-9]{32}$/.test(o.nonce)
-      || !["create-intent", "created", "install-intent", "submitted", "ready", "error"].includes(String(o.phase))
+      || !["idle", "create-intent", "created", "install-intent", "submitted", "ready", "error"].includes(String(o.phase))
       || !timestamp(o.startedAt) || !timestamp(o.nextAttemptAt)
       || !optionalString(o.agentId, /^[a-zA-Z0-9_-]{1,128}$/) || !optionalString(o.errorCode, /^[A-Z][A-Z0-9_]{0,79}$/)
+      || !optionalString(o.machineId, /^[a-z0-9]{16,64}$/) || !optionalString(o.agentMarker, /^oc-sand-[a-f0-9]{32}$/)
       || (o.hostPid !== undefined && (!timestamp(o.hostPid) || o.hostPid === 0))) throw new Error("SAND_STATE_INVALID");
   }
   return value as unknown as SandLifecycleState;

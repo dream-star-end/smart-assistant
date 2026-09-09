@@ -34,6 +34,8 @@ export function sandPrincipal(token: string, kind: "api_key" | "session", now = 
 
 export class CursorSandProvisionClient {
   private readonly apiBase: string;
+  private accountGuard: (() => Promise<void>) | undefined;
+  setAccountGuard(guard: () => Promise<void>): void { this.accountGuard = guard; }
   constructor(private readonly options: {
     fetchImpl: Fetcher;
     apiBase?: string;
@@ -49,6 +51,7 @@ export class CursorSandProvisionClient {
   }
 
   private async request(url: string, init: RequestInit, parent: AbortSignal, maxBytes = 64 * 1024): Promise<{ status: number; contentType: string; value: unknown }> {
+    await this.accountGuard?.();
     if (parent.aborted) throw new SandProvisionError("OWNER_STOPPED");
     const controller = new AbortController();
     const abort = (): void => controller.abort();
