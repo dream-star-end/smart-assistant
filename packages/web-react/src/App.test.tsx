@@ -194,6 +194,7 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
   window.history.replaceState({}, '', '/')
+  sessionStorage.removeItem('oc_v5_pending_case')
 })
 
 async function loginViaUi() {
@@ -1235,6 +1236,54 @@ describe('Aurora v5 — P7 最小路由', () => {
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).not.toContain('panel=help')
     expect(window.location.search).not.toContain('case=')
+  }, 30000)
+
+  test('未登录跑案例后登录会带入指令且不自动发送', async () => {
+    await preloadLazyPanels()
+    sessionStorage.removeItem('oc_v5_pending_case')
+    window.history.replaceState(
+      {},
+      '',
+      '/?campaign=docs&panel=help&case=research-bike-demand',
+    )
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    )
+    expect(
+      await screen.findByRole('heading', { name: '一堆出行数据，变成看得懂的需求规律。' }, { timeout: 15000 }),
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /登录后做我的版本/ }))
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: '欢迎使用 从简' })).toBeInTheDocument(),
+    )
+    const pending = JSON.parse(sessionStorage.getItem('oc_v5_pending_case') || 'null') as {
+      caseId?: string
+      starterPrompt?: string
+    } | null
+    expect(pending?.caseId).toBe('research-bike-demand')
+    expect(typeof pending?.starterPrompt).toBe('string')
+    expect((pending?.starterPrompt ?? '').length).toBeGreaterThan(20)
+
+    fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
+    const submit = screen.getByRole('button', { name: '登录' })
+    await waitFor(() => expect(submit).not.toBeDisabled())
+    await act(async () => {
+      fireEvent.click(submit)
+    })
+
+    await waitFor(() => expect(sessionStorage.getItem('oc_v5_pending_case')).toBeNull(), {
+      timeout: 15000,
+    })
+    const box = await screen.findByPlaceholderText('和「全能助手」对话…', {}, { timeout: 15000 })
+    expect(box).toHaveValue(pending!.starterPrompt)
+    expect(screen.getByText('已带入案例指令，不会自动发送')).toBeInTheDocument()
+    sessionStorage.removeItem('oc_v5_pending_case')
   }, 30000)
 
   test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {

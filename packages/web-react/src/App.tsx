@@ -1468,6 +1468,14 @@ export function App() {
     (item: TutorialCase) => {
       setTutorialOpen(false);
       if (!inWorkspace) {
+        try {
+          sessionStorage.setItem(
+            "oc_v5_pending_case",
+            JSON.stringify({ caseId: item.id, starterPrompt: item.starterPrompt }),
+          );
+        } catch {
+          /* quota / private mode */
+        }
         setAuthMode("login");
         setView("app");
         return;
@@ -1477,6 +1485,33 @@ export function App() {
     },
     [inWorkspace, handleNew],
   );
+
+  // 登录后消费待跑案例：只在 inWorkspace false→true 时读一次；有键先删再预填，禁止自动发送。
+  const wasInWorkspaceRef = useRef(inWorkspace);
+  useEffect(() => {
+    const entered = inWorkspace && !wasInWorkspaceRef.current;
+    wasInWorkspaceRef.current = inWorkspace;
+    if (!entered) return;
+    let raw: string | null = null;
+    try {
+      raw = sessionStorage.getItem("oc_v5_pending_case");
+      if (!raw) return;
+      sessionStorage.removeItem("oc_v5_pending_case");
+    } catch {
+      return;
+    }
+    let text = "";
+    try {
+      const parsed = JSON.parse(raw) as { starterPrompt?: unknown };
+      if (typeof parsed.starterPrompt === "string") text = parsed.starterPrompt;
+    } catch {
+      return;
+    }
+    if (!text) return;
+    handleNew();
+    setComposerPrefill({ text, nonce: Date.now() });
+    toast("已带入案例指令，不会自动发送", "info");
+  }, [inWorkspace, handleNew, toast]);
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
   const inbox = useInbox(auth, inWorkspace && !demo);
@@ -3397,6 +3432,7 @@ export function App() {
             <PinnedDelegateTracker
               items={inflightDelegates.items}
               onDismiss={inflightDelegates.dismiss}
+              onStop={stopTurn}
             />
           )}
           {!demo && !gated && (
