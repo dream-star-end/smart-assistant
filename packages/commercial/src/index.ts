@@ -5949,7 +5949,7 @@ export async function registerCommercial(
       start: () => {
         const raw = Number(process.env.COMMERCIAL_CURSOR_AUTH_SYNC_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
-        const preparation = startCursorSandPreparationActor();
+        const preparation = trackScheduler("cursorAuthSync", "v5-owned", startCursorSandPreparationActor());
         const h = trackScheduler("cursorAuthSync", "v5-owned", startCursorAuthSyncActor({ intervalMs }));
         return { stop: async () => { await Promise.all([h.stop(), preparation.stop()]); } };
       },
