@@ -175,6 +175,83 @@ describe("AuthGate — Turnstile gating", () => {
   });
 });
 
+describe("AuthGate — Turnstile 失败态与登录中文案", () => {
+  test("空 siteKey：显示验证加载失败，重试走 onRetryPublicConfig，不放行无 token 登录", () => {
+    const onLogin = vi.fn();
+    const retry = vi.fn();
+    render(
+      <AuthGate
+        {...base}
+        onLogin={onLogin}
+        onRetryPublicConfig={retry}
+        turnstileBypass={false}
+        turnstileSiteKey=""
+      />,
+    );
+    fill();
+    expect(screen.getByText("验证加载失败")).toBeInTheDocument();
+    const login = screen.getByRole("button", { name: "登录" });
+    expect(login).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(onLogin).not.toHaveBeenCalled();
+  });
+
+  test("widget onError：显示验证加载失败，重试 remount widget", async () => {
+    const renderWidget = vi.fn(
+      (
+        _el: HTMLElement,
+        opts: {
+          "error-callback"?: () => void;
+        },
+      ) => {
+        opts["error-callback"]?.();
+        return "widget-err";
+      },
+    );
+    window.turnstile = {
+      render: renderWidget,
+      remove: vi.fn(),
+      reset: vi.fn(),
+    };
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} turnstileBypass={false} turnstileSiteKey="0xSITEKEY" />,
+    );
+    expect(await screen.findByText("验证加载失败")).toBeInTheDocument();
+    const before = renderWidget.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(renderWidget.mock.calls.length).toBeGreaterThan(before));
+    expect(screen.getByRole("button", { name: "登录" })).toBeDisabled();
+  });
+
+  test("timeout-callback 同时当失败：显示验证加载失败", async () => {
+    window.turnstile = {
+      render: (
+        _el: HTMLElement,
+        opts: {
+          "timeout-callback"?: () => void;
+        },
+      ) => {
+        opts["timeout-callback"]?.();
+        return "widget-timeout";
+      },
+      remove: vi.fn(),
+      reset: vi.fn(),
+    };
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} turnstileBypass={false} turnstileSiteKey="0xSITEKEY" />,
+    );
+    expect(await screen.findByText("验证加载失败")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "登录" })).toBeDisabled();
+  });
+
+  test("busyNow 登录按钮文案为正在登录…", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} loading />);
+    fill();
+    expect(screen.getByRole("button", { name: /正在登录/ })).toBeInTheDocument();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 多模式：注册 / 邮箱验证 / 忘记密码 / 重置密码。
 // ---------------------------------------------------------------------------
