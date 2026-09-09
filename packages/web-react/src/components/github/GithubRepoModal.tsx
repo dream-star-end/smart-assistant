@@ -47,6 +47,7 @@ export function GithubRepoModal({
 }) {
   const [link, setLink] = useState<GithubLink | null>(null);
   const [linkLoading, setLinkLoading] = useState(false);
+  const [linkErr, setLinkErr] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
   const [unlinking, setUnlinking] = useState(false);
 
@@ -67,6 +68,24 @@ export function GithubRepoModal({
   const linked = link?.linked === true;
   const hasBinding = !!selection && selection.selected;
 
+  const loadLink = useCallback(() => {
+    if (!auth) return;
+    setLinkLoading(true);
+    setLinkErr(null);
+    return api
+      .getGithubLink(auth)
+      .then((l) => {
+        setLink(l);
+        setLinkErr(null);
+      })
+      .catch((e) => {
+        setLinkErr(apiErrorMessage(e, "账号状态加载失败"));
+      })
+      .finally(() => {
+        setLinkLoading(false);
+      });
+  }, [auth]);
+
   // 打开：复位瞬态 + 拉账号关联状态。
   useEffect(() => {
     if (!open || !auth) {
@@ -79,13 +98,14 @@ export function GithubRepoModal({
     }
     let alive = true;
     setLinkLoading(true);
+    setLinkErr(null);
     api
       .getGithubLink(auth)
       .then((l) => {
         if (alive) setLink(l);
       })
-      .catch(() => {
-        if (alive) setLink({ linked: false });
+      .catch((e) => {
+        if (alive) setLinkErr(apiErrorMessage(e, "账号状态加载失败"));
       })
       .finally(() => {
         if (alive) setLinkLoading(false);
@@ -269,7 +289,18 @@ export function GithubRepoModal({
               <div className="flex items-center gap-2 text-body text-faint">
                 <Spinner /> 加载账号状态…
               </div>
-            ) : !linked ? (
+            ) : linkErr ? (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-body text-danger">{linkErr}</span>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void loadLink()}
+                >
+                  重试
+                </Button>
+              </div>
+            ) : link && !link.linked ? (
               <div className="flex items-center justify-between gap-3">
                 <span className="text-body text-muted">
                   连接 GitHub 账号后即可把仓库绑定到当前会话
@@ -283,21 +314,19 @@ export function GithubRepoModal({
                   <GitBranch size={14} /> {linking ? "跳转中…" : "连接 GitHub"}
                 </Button>
               </div>
-            ) : (
+            ) : link && link.linked ? (
               <div className="flex items-center gap-3">
                 <Avatar
                   size="sm"
-                  src={(link.linked && link.avatar_url) || undefined}
-                  fallback={
-                    (link.linked && link.login?.[0]?.toUpperCase()) || "G"
-                  }
+                  src={link.avatar_url || undefined}
+                  fallback={link.login?.[0]?.toUpperCase() || "G"}
                 />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-section font-medium text-fg">
-                    @{link.linked ? link.login : ""}
+                    @{link.login}
                   </div>
                   <div className="truncate text-caption text-faint">
-                    {(link.linked && link.scopes) || "已连接"}
+                    {link.scopes || "已连接"}
                   </div>
                 </div>
                 {confirmUnlink ? (
@@ -328,7 +357,7 @@ export function GithubRepoModal({
                   </Button>
                 )}
               </div>
-            )}
+            ) : null}
           </div>
 
           {/* 选仓 + 分支 */}
