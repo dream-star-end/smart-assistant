@@ -3930,6 +3930,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/cursorExternalComposition.unit.test.ts",
           "assertion": "billing evidence and trace audit retain separate authority"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box terminal composition rejection: failing optional hook never duplicates or replaces wire error"
         }
       ]
     },
@@ -4005,6 +4010,68 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cron-submit-boundary.ts",
           "assertion": "contractId: 'C-cron-submit-boundary-behavior'"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-SAND-BOX-TRANSPORT",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Sand 账号控制面可用但账号 JWT 直连 InferenceService.Stream 返回 NOT_LOGGED_IN，不能完成推理。按账号显式绑定自有 Box 的受鉴权 inference-only 中转，工具仍在本机；Box 票据错误不得污染账号健康、轮换账号或触发工具纠错重试。",
+      "rootFixCommit": "1d341fe5",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box HTTP failures keep no-retry transport scope, descriptor cache, and true account/quota distinctions"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box Connect unauthenticated trailers preserve transport identity in both response modes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "actual Relay rejection feeds actual Adapter billing chain without poisoning the account"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "terminal Box ticket error never enters tool correction:"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-sand-box] PASS — isolated Box transport, account health, and terminal no-retry contracts executed"
+        }
+      ],
+      "coverageCommits": [
+        "7ac9122a",
+        "f7730d2d"
+      ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-EMPTY-POOL-MOUNT",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Sand异步准备期间账号池合法为空，容器provision因api-key缺失漏挂整个Cursor授权目录；随后账号ready且宿主凭据已发布，但容器仍无mount，正常UI在模型执行前CURSOR_CREDENTIAL_SELECTION_FAILED并DISPATCH_NOT_ACCEPTED。修复仅允许严格root私有managed marker证明的空池保持RO目录挂载，已有坏key及非成员继续拒绝。",
+      "rootFixCommit": "bd61c413",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "empty managed pool keeps the directory mount across 0→1→0→1 atomic publication"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "v5 empty managed Cursor pool provisions the same read-only bind before a key is ready"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)"
         }
       ]
     }

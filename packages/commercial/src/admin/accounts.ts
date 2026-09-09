@@ -54,6 +54,7 @@ import {
   cursorSessionTokenExpiryMs,
 } from "@openclaude/protocol";
 import { normalizeCursorApiKey, scheduleCursorAuthSync } from "../account-pool/cursorMaterializer.js";
+import { scheduleCursorSandPreparation } from "../account-pool/cursorSandActor.js";
 import { isCursorQuotaClass, type CursorQuotaClass } from "../account-pool/cursorQuota.js";
 import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
 import {
@@ -510,7 +511,7 @@ export async function adminCreateAccount(
       // 不记明文 token / proxy 密码 —— snapshotForAudit 已 mask
     },
   );
-  if (row.provider === "cursor") scheduleCursorAuthSync("account.create");
+  if (row.provider === "cursor") { scheduleCursorAuthSync("account.create"); scheduleCursorSandPreparation("account.create"); }
   return row;
 }
 
@@ -836,7 +837,7 @@ export async function adminPatchAccount(
   }
 
   await bestEffortAudit(ctx, "account.patch", `account:${String(id)}`, changedBefore, changedAfter);
-  if (after.provider === "cursor") scheduleCursorAuthSync("account.patch");
+  if (after.provider === "cursor") { scheduleCursorAuthSync("account.patch"); scheduleCursorSandPreparation("account.patch"); }
   return after;
 }
 
@@ -913,7 +914,7 @@ export async function adminResetCooldown(
     auditBefore,
     auditAfter,
   );
-  if (after.provider === "cursor") scheduleCursorAuthSync("account.reset_cooldown");
+  if (after.provider === "cursor") { scheduleCursorAuthSync("account.reset_cooldown"); scheduleCursorSandPreparation("account.reset_cooldown"); }
   return after;
 }
 
@@ -989,7 +990,7 @@ export async function adminDeleteAccount(
     snapshotForAudit(before),
     null,
   );
-  if (before.provider === "cursor") scheduleCursorAuthSync("account.delete");
+  if (before.provider === "cursor") { scheduleCursorAuthSync("account.delete"); scheduleCursorSandPreparation("account.delete"); }
   return true;
 }
 

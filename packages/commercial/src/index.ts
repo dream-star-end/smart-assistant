@@ -156,6 +156,7 @@ import {
   type CooldownRecoveryActorHandle,
 } from "./account-pool/cooldownRecoveryActor.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
+import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
 import { startGrokUsageSweeper } from "./account-pool/grokUsageSweeper.js";
 import {
@@ -6012,8 +6013,9 @@ export async function registerCommercial(
       start: () => {
         const raw = Number(process.env.COMMERCIAL_CURSOR_AUTH_SYNC_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const preparation = startCursorSandPreparationActor();
         const h = trackScheduler("cursorAuthSync", "v5-owned", startCursorAuthSyncActor({ intervalMs }));
-        return { stop: () => h.stop() };
+        return { stop: async () => { await Promise.all([h.stop(), preparation.stop()]); } };
       },
     });
   }
