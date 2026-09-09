@@ -117,7 +117,7 @@ export function MemoryPanel({
             { value: "core", label: "核心记忆" },
             { value: "project", label: "项目记忆" },
             { value: "profile", label: "用户画像" },
-            { value: "usage", label: "使用情况" },
+            { value: "usage", label: "用量" },
           ]}
         />
       </div>
