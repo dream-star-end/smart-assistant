@@ -1,9 +1,6 @@
 "use strict";
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
-const { readFileSync } = require("node:fs");
-const { createHash } = require("node:crypto");
-const MODULE_SHA256 = createHash("sha256").update(readFileSync(__filename)).digest("hex");
 const PATH = "/sand-stream-relay/aiserver.v1.InferenceService/Stream";
 const REQUEST_HEADERS = ["connect-content-encoding", "connect-accept-encoding", "x-request-id", "x-session-id", "traceparent"];
 const RESPONSE_HEADERS = ["content-type", "content-encoding", "connect-content-encoding", "connect-accept-encoding", "grpc-status", "grpc-message"];
@@ -25,18 +22,8 @@ exports.createRelay = function createRelay({ httpClient, authorize, getAuth, cre
     res.end(JSON.stringify({ error: message }));
   }
   return async function relay(deps, req, res) {
-    if ((req.method !== "POST" && req.method !== "GET") || new URL(req.url, "http://localhost").pathname !== PATH) return error(res, 404, "not found");
+    if (req.method !== "POST" || new URL(req.url, "http://localhost").pathname !== PATH) return error(res, 404, "not found");
     if (typeof deps.authToken !== "string" || !deps.authToken || !authorize(req, deps.authToken)) return error(res, 401, "unauthorized");
-    if (req.headers["x-oc-sand-box-probe"] === "1") {
-      if (req.headers["transfer-encoding"] || (req.method === "POST" ? req.headers["content-length"] !== "0" : req.headers["content-length"] !== undefined && req.headers["content-length"] !== "0")) return error(res, 400, "empty probe required");
-      const nonce = req.headers["x-oc-sand-box-probe-nonce"];
-      if (typeof nonce !== "string" || !/^[a-f0-9]{32}$/.test(nonce)) return error(res, 400, "probe nonce required");
-      if (!getAuth()) return error(res, 503, "inference credential unavailable");
-      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      res.end(JSON.stringify({ protocol: "oc-sand-relay-v2", moduleSha256: MODULE_SHA256, nonce, active, maxConcurrent }));
-      return;
-    }
-    if (req.method !== "POST") return error(res, 404, "not found");
     if (!/^application\/connect\+proto(?:;|$)/i.test(String(req.headers["content-type"] || ""))) return error(res, 415, "Connect protobuf required");
     if (Number(req.headers["content-length"]) > maxBytes) return error(res, 413, "request too large");
     if (active >= maxConcurrent) return error(res, 429, "relay busy");

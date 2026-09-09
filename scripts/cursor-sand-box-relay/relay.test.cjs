@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const http = require("node:http");
 const { once } = require("node:events");
 const { createRelay } = require("./relay.cjs");
+const { createHash } = require("node:crypto");
+const { readFileSync } = require("node:fs");
 const PATH = "/sand-stream-relay/aiserver.v1.InferenceService/Stream";
 // Test-only UniversalClient adapter: real HTTP sockets, not the bundled Connect implementation.
 // Box E2E separately verifies its exact createNodeHttpClient wiring.
@@ -30,6 +32,21 @@ test("wrong, absent, and missing configured gateway auth: zero getter and upstre
     const f=await fixture((q,s)=>s.end("bad"),{nullAuth:mode==="null"});
     try {const r=await f.request({headers:{authorization:mode==="absent"?"":"Bearer WRONG"}});assert.equal(r.status,401);await r.text();assert.deepEqual(f.stats(),{tokenCalls:0,transportCalls:0});} finally {await f.close();}
   }
+});
+test("authenticated empty capability probe returns loaded module hash with zero token or upstream calls", async () => {
+  const f = await fixture((q, s) => s.end("must not reach upstream"), { maxConcurrent: undefined });
+  const headers = { "x-oc-sand-box-probe": "1", "x-oc-sand-box-probe-nonce": "a".repeat(32) };
+  try {
+    const denied = await f.request({ body: "", headers: { ...headers, authorization: "Bearer WRONG" } });
+    assert.equal(denied.status, 401); await denied.text();
+    const bad = await f.request({ body: "x", headers });
+    assert.equal(bad.status, 400); await bad.text();
+    const result = await f.request({ body: "", headers });
+    assert.equal(result.status, 200);
+    const value = await result.json();
+    assert.deepEqual(value, { protocol: "oc-sand-relay-v2", moduleSha256: createHash("sha256").update(readFileSync(require.resolve("./relay.cjs"))).digest("hex"), nonce: "a".repeat(32), active: 0, maxConcurrent: 4 });
+    assert.deepEqual(f.stats(), { tokenCalls: 0, transportCalls: 0 });
+  } finally { await f.close(); }
 });
 test("normal upload close does NOT cancel; complete multi-chunk response and secrets filtered", async () => {
   const request=Buffer.alloc(256*1024,7), expected=Buffer.alloc(256*1024,9);let received, headers;

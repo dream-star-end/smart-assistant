@@ -10,7 +10,8 @@ const POLICY_PATH = '/run/oc/cursor-auth/.sand-box-policy.json'
 const CONTROL_BASE = 'https://api2.cursor.sh/aiserver.v1.GrokBotService/'
 const RELAY_PATH = '/sand-stream-relay/aiserver.v1.InferenceService/Stream'
 const HEX = /^[0-9a-f]{64}$/
-const MAX_POLICY = 16 * 1024
+export const CURSOR_SAND_BOX_MAX_POLICY_BYTES = 2 * 1024 * 1024
+export const CURSOR_SAND_BOX_MAX_ACCOUNTS = 4096
 const MAX_CONTROL = 64 * 1024
 
 export class CursorSandBoxError extends Error {
@@ -28,11 +29,13 @@ export function cursorSandBoxTicketError(message: string, code?: unknown): strin
 }
 export interface CursorSandBoxPolicy {
   version: 1
-  accounts: Array<{ accountId: string; subjectHash: string; machineHash: string }>
+  managed?: boolean
+  accounts: Array<{ accountId: string; subjectHash: string; machineHash: string; machineId?: string }>
 }
 export function parseCursorSandBoxPolicy(value: unknown): CursorSandBoxPolicy {
   const p = value as Partial<CursorSandBoxPolicy> | null
-  if (!p || p.version !== 1 || !Array.isArray(p.accounts)) throw new CursorSandBoxError('POLICY_INVALID')
+  if (!p || p.version !== 1 || !Array.isArray(p.accounts) || p.accounts.length > CURSOR_SAND_BOX_MAX_ACCOUNTS) throw new CursorSandBoxError('POLICY_INVALID')
+  if (p.managed !== undefined && typeof p.managed !== 'boolean') throw new CursorSandBoxError('POLICY_INVALID')
   const seen = new Set<string>()
   const accounts = p.accounts.map((a) => {
     if (!a || typeof a.accountId !== 'string' || !/^[1-9][0-9]{0,19}$/.test(a.accountId)
@@ -40,18 +43,21 @@ export function parseCursorSandBoxPolicy(value: unknown): CursorSandBoxPolicy {
       || typeof a.machineHash !== 'string' || !HEX.test(a.machineHash) || seen.has(a.accountId)) {
       throw new CursorSandBoxError('POLICY_INVALID')
     }
+    if (a.machineId !== undefined && (typeof a.machineId !== 'string' || !/^[a-z0-9]{16,64}$/.test(a.machineId)
+      || createHash('sha256').update(a.machineId).digest('hex') !== a.machineHash)) throw new CursorSandBoxError('POLICY_INVALID')
     seen.add(a.accountId)
-    return { accountId: a.accountId, subjectHash: a.subjectHash, machineHash: a.machineHash }
+    return { accountId: a.accountId, subjectHash: a.subjectHash, machineHash: a.machineHash, ...(a.machineId ? { machineId: a.machineId } : {}) }
   })
-  return { version: 1, accounts }
+  return { version: 1, ...(p.managed ? { managed: true } : {}), accounts }
 }
-export function readCursorSandBoxPolicy(): CursorSandBoxPolicy | null {
-  const r = spawnSync('/usr/bin/sudo', ['-n', '/bin/cat', POLICY_PATH], {
-    encoding: 'utf8', maxBuffer: MAX_POLICY, timeout: 5_000,
+/** Explicit path is for isolated filesystem verification; production uses the fixed root-owned path. */
+export function readCursorSandBoxPolicy(policyPath = POLICY_PATH): CursorSandBoxPolicy | null {
+  const r = spawnSync('/usr/bin/sudo', ['-n', '/bin/cat', policyPath], {
+    encoding: 'utf8', maxBuffer: CURSOR_SAND_BOX_MAX_POLICY_BYTES, timeout: 5_000,
     env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'pipe'],
   })
-  if (r.status !== 0) {
-    if (r.status === 1 && r.stderr?.includes(`${POLICY_PATH}: No such file or directory`)) return null
+  if (r.error || r.status !== 0 || Buffer.byteLength(r.stdout ?? '', 'utf8') > CURSOR_SAND_BOX_MAX_POLICY_BYTES) {
+    if (!r.error && r.status === 1 && r.stderr?.includes(`${policyPath}: No such file or directory`)) return null
     throw new CursorSandBoxError('POLICY_UNAVAILABLE')
   }
   try { return parseCursorSandBoxPolicy(JSON.parse(r.stdout)) }
@@ -74,6 +80,7 @@ function secret(value: unknown): string {
 
 export class CursorSandBoxResolver {
   private cached: CursorSandBoxConnection | null = null
+  private cachedMachineHash: string | null = null
   constructor(private readonly options: {
     accountId: string
     credentialKind: 'api_key' | 'session'
@@ -83,7 +90,7 @@ export class CursorSandBoxResolver {
     controlTimeoutMs?: number
   }) {}
 
-  clear(): void { this.cached = null }
+  clear(): void { this.cached = null; this.cachedMachineHash = null }
 
   invalidate(connection: CursorSandBoxConnection): void {
     if (this.cached === connection) this.cached = null
@@ -142,19 +149,20 @@ export class CursorSandBoxResolver {
     if (signal.aborted) throw new CursorSandBoxError('CANCELLED')
     const policy = (this.options.readPolicy ?? readCursorSandBoxPolicy)()
     const entry = policy?.accounts.find((a) => a.accountId === this.options.accountId)
-    if (!entry) { this.cached = null; return null }
-    if (this.options.credentialKind !== 'session' || !machine) throw new CursorSandBoxError('IDENTITY_MISMATCH')
+    if (!entry) { this.clear(); if (policy?.managed) throw new CursorSandBoxError('NOT_READY'); return null }
+    machine = this.options.credentialKind === 'session' ? machine : entry.machineId ?? null
+    if (!machine) throw new CursorSandBoxError('IDENTITY_MISMATCH')
     const now = (this.options.now ?? Date.now)()
     let claims: { type?: unknown; sub?: unknown; exp?: unknown }
     try { claims = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) }
     catch { throw new CursorSandBoxError('IDENTITY_MISMATCH') }
-    if (!claims || typeof claims !== 'object' || Array.isArray(claims) || claims.type !== 'session' || typeof claims.sub !== 'string' || !claims.sub || claims.sub.length > 512
+    if (!claims || typeof claims !== 'object' || Array.isArray(claims) || (this.options.credentialKind === 'session' && claims.type !== 'session') || typeof claims.sub !== 'string' || !claims.sub || claims.sub.length > 512
       || typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp * 1000 <= now
       || digest(claims.sub) !== entry.subjectHash || digest(machine) !== entry.machineHash) {
       throw new CursorSandBoxError('IDENTITY_MISMATCH')
     }
     const tokenHash = digest(token)
-    if (this.cached?.tokenHash === tokenHash && this.cached.expiresAt > now) return this.cached
+    if (this.cached?.tokenHash === tokenHash && this.cachedMachineHash === entry.machineHash && this.cached.expiresAt > now) return this.cached
     const state = await this.control('GetSandBoxRunState', token, machine, signal)
     if (state.state !== 'SAND_BOX_RUN_STATE_RUNNING') throw new CursorSandBoxError('NOT_RUNNING')
     const response = await this.control('EnsureSandBox', token, machine, signal)
@@ -171,6 +179,7 @@ export class CursorSandBoxResolver {
     }
     if (signal.aborted) throw new CursorSandBoxError('CANCELLED')
     this.cached = connection
+    this.cachedMachineHash = entry.machineHash
     return connection
   }
 }
