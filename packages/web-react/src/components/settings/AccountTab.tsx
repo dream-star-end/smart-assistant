@@ -177,8 +177,8 @@ export function AccountTab({
     : 0;
 
   // 收支图表数据（report 存在时才有值；null 时 canvas 不挂载，useChart 自 no-op）。
-  const ledgerTrend = report?.ledger.trend ?? [];
-  const byReason = report?.ledger.by_reason ?? [];
+  const ledgerTrend = report?.ledger?.trend ?? [];
+  const byReason = report?.ledger?.by_reason ?? [];
   const trendLabels = ledgerTrend.map((p) => formatReportBucket(p.bucket, acctWindow));
   const reasonHasData = byReason.some((r) => chartNum(r.debited) > 0);
   const trendHasData = ledgerTrend.some(
