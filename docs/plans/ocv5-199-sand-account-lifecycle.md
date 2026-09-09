@@ -36,3 +36,6 @@ commercial/account-pool/cursorMaterializer.ts、同目录新lifecycle/provision/
 - B1容量：policy消费上限从16KiB明确调整为2MiB，最多4096条、限制每字段既有长度；writer和parser共守容量，紧凑JSON写前校验字节数，超限拒绝本次物化而不是写一个所有reader均读不了的文件，也不静默截断选择池。验收使用101个真实ready条目经gateway实际readCursorSandBoxPolicy路径读取，首/尾账户resolve都能绑定；再覆盖超过字节/条数上限的明确失败。不是只验证扫描循环。
 - B2 owner epoch：现有materializer scheduler改为每次start独立owner/epoch，所有生产sync从该owner捕获publishAllowed。stop立即撤销owner、取消timer/dirty并返回本实例in-flight drain；旧调用每次await后、尤其所有副作用与最终同步写入前校验owner，失效不发布。scheduleCursorAuthSync在没有活actor时只记录待处理dirty、不得启动无主writer；新start消费当前需求，旧finally不得清空新owner状态。依赖注入的直接sync测试/显式诊断保持可调用，但生产不得绕过owner。验收挂起旧sync→stop/start→新owner空池生效→释放旧sync，旧槽和policy不复活；stop后管理触发零写，重新start才执行。
 - 未知结果建议采纳：acceptance明确区分accepted/pending/rejected/not-found/unknown-durability。create响应未知只能按持久nonce对应的唯一专属维护Bot标识找回；0个或多个候选不能重建/猜测owner。超过有界观察窗显示固定恢复错误、继续安全只读对账，不无限preparing或换nonce重发。sendPrompt响应未知核接受记录和probe；记录不存在但去重保留期限未知不能当从未接收。API schema有nonce不是服务端幂等证明。
+
+## 类型检查范围补充（已获独立审查PASS）
+仅修commercial/__tests__/apiKeyMessageAudit.unit.test.ts的异步capture类型（保留非空/SQL/params/分页断言），及cursorExternalRoute.unit.test.ts合成usage补两个cache字段0；不改产品计费逻辑。旧reviewer session已过期，网关拒绝未建job；唯一新reviewer session agent:auditor:delegate:main:1788946436039:776865b379636db4后续承接完整diff。首次启用及回退必须执行README的pre-managed policy备份/恢复，不能把新大policy留给旧reader。

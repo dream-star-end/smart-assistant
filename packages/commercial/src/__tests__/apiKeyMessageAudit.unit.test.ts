@@ -194,7 +194,9 @@ describe("listApiKeyMessageAudit", () => {
     const pool2 = { query: async (sql: string, params: unknown[]) => { seen = { sql, params }; return { rows: mk(1) }; } };
     const p2 = await listApiKeyMessageAudit(pool2, 3n, { apiKeyId: null, beforeId: null, limit: 10_000, errorsOnly: false });
     assert.equal(p2.next_before, null);
-    assert.doesNotMatch(seen!.sql, /api_key_id = \$|a\.id <|status = 'error'/);
-    assert.deepEqual(seen!.params, ["3", AUDIT_LIST_MAX_LIMIT + 1]);
+    const capturedAfterSecond = (() => seen)() as { sql: string; params: unknown[] } | null;
+    assert.ok(capturedAfterSecond);
+    assert.doesNotMatch(capturedAfterSecond.sql, /api_key_id = \$|a\.id <|status = 'error'/);
+    assert.deepEqual(capturedAfterSecond.params, ["3", AUDIT_LIST_MAX_LIMIT + 1]);
   });
 });

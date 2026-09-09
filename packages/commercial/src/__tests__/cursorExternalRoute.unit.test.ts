@@ -682,7 +682,7 @@ describe("cursorExternal route — 0279 message audit", () => {
         res.setHeader("content-type", "text/event-stream");
         res.write("event: message_start\n\n");
         res.end("event: error\n\n");
-        return { kind: "failed", reason: "Provider Error (400): x [non-retryable]", usage: { input_tokens: 0, output_tokens: 0 } };
+        return { kind: "failed", reason: "Provider Error (400): x [non-retryable]", usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
       },
     });
     await run(h, {

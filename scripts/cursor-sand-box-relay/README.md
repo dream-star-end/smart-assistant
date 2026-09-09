@@ -26,3 +26,11 @@ node --import tsx scripts/cursor-sand-box-relay/real-ccb-smoke.mjs --run
 ```
 
 The live smoke uses the real product Adapter and CCB process, not a fake runner. Its result must have a real Read tool invocation/result and exact unpredictable file content. It does not prove browser rendering or deployment; those are separate release checks.
+
+## Managed account lifecycle (OCV5-199, selfhost opt-in)
+
+`OC_CURSOR_SAND_LIFECYCLE=1` enables the leader-owned preparation actor and managed admission. Existing account CRUD events wake preparation; state/progress is returned by the existing admin account API. Ordinary Cursor accounts remain unchanged. Do not enable until the full lifecycle candidate and installer are reviewed and verified.
+
+Before the **first** flag enable, save the current root `.sand-box-policy.json` as a mode-0600, hash-verified `.sand-box-policy.pre-managed.json` (or record that it was absent). This is deployment preparation, not per-account user work. Keep the original credential files unchanged. Managed policy may exceed the old 16-KiB reader and contain API-key machine bindings: an operational rollback must disable the flag and restore the pre-managed policy before reverting to the old runtime. The deployment operator must verify this backup before proceeding; do not leave a large managed policy for an old reader.
+
+The installer executes fixed source bytes supplied by the platform, validates unique source anchors, saves SHA-addressed backups, checks syntax and atomically replaces the module/host. It never upgrades the Box or deletes user data. It guards the expected host PID using process metadata only, not environment/credentials. Coordinator health/busy checks precede the maintenance prompt; an installation is not declared successful until an authenticated nonce probe confirms the expected loaded module hash. An unknown layout or unknown mutation outcome is visible failure, not permission to generate a new patch or blindly resend.

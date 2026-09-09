@@ -1,3 +1,4 @@
+import { cursorSandPublicStatus } from "../../account-pool/cursorSandActor.js";
 /**
  * /api/admin/accounts/* — 账号池管理(列表/详情/创建/修改/删除/cooldown 重置/
  * OAuth 双步 / refresh-events / recent-users)。10 个 export handler,1 个
@@ -128,6 +129,7 @@ function serializeAccount(
     has_refresh_token: a.has_refresh_token,
     cursor_quota_class: a.provider === "cursor" ? a.cursor_quota_class : null,
     cursor_sand_enabled: a.provider === "cursor" ? a.cursor_sand_enabled : null,
+    cursor_sand_box: cursorSandPublicStatus(a),
     /** 0257 — Sand 凭证形态:api_key(crsr_ 换 token)| session(账号登录会话)。 */
     cursor_credential_kind: a.provider === "cursor" ? a.cursor_credential_kind : null,
     cursor_auth_id: a.provider === "cursor" ? a.cursor_auth_id : null,
