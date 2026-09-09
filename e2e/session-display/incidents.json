@@ -3438,7 +3438,7 @@
       "occurredAt": "2026-09-09",
       "severity": "P1",
       "symptom": "Sand 账号控制面可用但账号 JWT 直连 InferenceService.Stream 返回 NOT_LOGGED_IN，不能完成推理。按账号显式绑定自有 Box 的受鉴权 inference-only 中转，工具仍在本机；Box 票据错误不得污染账号健康、轮换账号或触发工具纠错重试。",
-      "rootFixCommit": "1d341fe5156ce4844bb42ee156443375827157f8",
+      "rootFixCommit": "1d341fe5",
       "regressions": [
         {
           "layer": "unit",
@@ -3467,8 +3467,8 @@
         }
       ],
       "coverageCommits": [
-        "7ac9122a6b5ba85edf4e0b5afa76db012f9c0176",
-        "f7730d2df5d1b489d6ccdb45a5d530bf2b0eac45"
+        "7ac9122a",
+        "f7730d2d"
       ]
     }
   ]
