@@ -29,5 +29,5 @@ Box gatewayToken/networkToken不新落盘：已有选中账号accessToken经现�
 
 ## 方案审查B1闭合：Box故障不能污染账号健康
 Box gateway 401/403与本地容量429必须成为带固定CURSOR_SAND_BOX_*标记的传输错误：Relay给CCB 400 invalid_request_error + x-should-retry:false，当前请求不重放；Adapter优先将该标记归为ENGINE_ERROR/status=error，既不recordResult(fail)也不recordResult(ok)，不输出cursorSlotResults，不触发池冷却/轮换。Box身份policy/未初始化/路由404/网络错误同属此类，不因文案含auth/credential误判。官方api2控制面401/403保留既有CURSOR_SAND_AUTH_*账户失败路径，真实上游quota保持原行为。
-Box模块对真正收到的上游HTTP响应新增固定x-oc-sand-box-upstream:1（由模块自身写，不从上游或客户端透传）；本地错误没有此头。Box HTTP401/403不论此头均属推理票/连接问题，不当成账号JWT失效；无该头的429为Box容量错误，有该头的上游429及正常Connect错误帧保留原上游分类。标记只影响此可选Box模式，不改变直连账号/普通Cursor路径。
+Box模块对真正收到的上游HTTP响应新增固定x-oc-sand-box-upstream:1（由模块自身写，不从上游或客户端透传）；本地错误没有此头。Box推理鉴权错误（含HTTP200的Connect unauthenticated结束帧）与HTTP401/403不论此头均属推理票/连接问题，不当成账号JWT失效；无该头的429为Box容量错误，有该头的上游429及正常Connect错误帧保留原上游分类。标记只影响此可选Box模式，不改变直连账号/普通Cursor路径。
 验收：真实CursorSandAdapter错误处理链分别注入Box401/本地429标记，断言无账号结果写入/无轮换；下一独立请求仍绑定同账号，401后重新取descriptor，容量错误不抹有效descriptor；控制面401/真实上游quota仍触发原失败路径。补测上游429标记与未标记区分、x-should-retry:false/400无CCB重放。
