@@ -27,6 +27,7 @@ import {
   PermissionCard,
   PermissionPromptHost,
   isAwaitingPermissionPrompt,
+  permissionHasExpired,
   resetPermissionAutoOpenMemory,
 } from "./PermissionCard";
 
