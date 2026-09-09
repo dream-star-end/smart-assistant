@@ -14,6 +14,8 @@ import sys
 import uuid
 
 MODULE = "ocv5-197-relay.cjs"
+OLD_ROUTE_KIND = '  const isSandStreamRelay = req.method === "POST" && url2.pathname === SAND_STREAM_RELAY_PATH;'
+ROUTE_KIND = '  const isSandStreamRelay = (req.method === "POST" || req.method === "GET") && url2.pathname === SAND_STREAM_RELAY_PATH;'
 HANDLE = "async function handleRequest(deps, req, res) {"
 CLASSIFY = '  const isCommand = req.method === "POST" && url2.pathname.startsWith(`${GATEWAY_API_PREFIX}/`);'
 GROUP = "  if (isEvents || isAvatar || isCommand || isPrepareUpgrade || isLocalExecRequests || isLocalExecResponses || isWebAuthnRequests || isWebAuthnResponses || isCookieOriginApprovalRequests || isCookieOriginApprovalResponses) {"
@@ -70,7 +72,11 @@ def patch_source(source):
         owned = HOOK in source or (old_hook in source and old_body in source)
         if not owned or source.count(HANDLE) != 1 or REGISTER not in source or ROUTE not in source:
             fail("UNSUPPORTED_EXISTING_HOOK")
-        # Existing reviewed hook is left byte-for-byte intact; only update the module.
+        # Add a GET-only capability route without changing the original auth gate.
+        if source.count(OLD_ROUTE_KIND) == 1:
+            return source.replace(OLD_ROUTE_KIND, ROUTE_KIND, 1)
+        if source.count(ROUTE_KIND) != 1:
+            fail("UNSUPPORTED_EXISTING_HOOK")
         return source
     for anchor in [HANDLE, CLASSIFY, GROUP, AUTH, SERVICE]:
         if source.count(anchor) != 1:
@@ -79,7 +85,7 @@ def patch_source(source):
         if not re.search(r"function " + name + r"\s*\(", source):
             fail("UNSUPPORTED_HOST_LAYOUT")
     source = source.replace(HANDLE, HOOK + HANDLE, 1)
-    source = source.replace(CLASSIFY, CLASSIFY + '\n  const isSandStreamRelay = req.method === "POST" && url2.pathname === SAND_STREAM_RELAY_PATH;', 1)
+    source = source.replace(CLASSIFY, CLASSIFY + '\n' + ROUTE_KIND, 1)
     source = source.replace(GROUP, GROUP.replace(") {", " || isSandStreamRelay) {"), 1)
     source = source.replace(AUTH, AUTH.replace("    if (isPrepareUpgrade) {", ROUTE + "    if (isPrepareUpgrade) {"), 1)
     source = source.replace(SERVICE, SERVICE.replace("    context2.onStop(() => service.dispose());", REGISTER), 1)

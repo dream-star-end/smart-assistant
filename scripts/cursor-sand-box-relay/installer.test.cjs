@@ -30,7 +30,7 @@ test("deterministic install preserves auth, serves actual module probe and is id
     const url = "http://127.0.0.1:"+server.address().port+"/sand-stream-relay/aiserver.v1.InferenceService/Stream";
     const headers={"content-type":"application/connect+proto","x-oc-sand-box-probe":"1","x-oc-sand-box-probe-nonce":"b".repeat(32)};
     const denied=await fetch(url,{method:"POST",body:"",headers});assert.equal(denied.status,401);await denied.text();
-    const ok=await fetch(url,{method:"POST",body:"",headers:{...headers,authorization:"Bearer TEST_GATE"}});
+    const ok=await fetch(url,{method:"GET",headers:{...headers,authorization:"Bearer TEST_GATE"}});
     assert.equal(ok.status,200);assert.equal((await ok.json()).moduleSha256,hash(readFileSync(modulePath)));
   } finally { if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}rmSync(dir,{recursive:true,force:true}); }
 });

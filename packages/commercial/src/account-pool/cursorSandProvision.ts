@@ -143,7 +143,9 @@ export class CursorSandProvisionClient {
   }
   async probe(c: SandGatewayConnection, signal: AbortSignal): Promise<SandRelayProbe | null> {
     const nonce = randomBytes(16).toString("hex");
-    const r = await this.request(`${c.gatewayUrl}${RELAY_PATH}`, { method: "POST", body: "", headers: {
+    // GET cannot enter a legacy POST-only inference handler. A missing
+    // capability is therefore observed without issuing empty inference calls.
+    const r = await this.request(`${c.gatewayUrl}${RELAY_PATH}`, { method: "GET", headers: {
       ...this.headers(c), "content-type": "application/connect+proto", "connect-protocol-version": "1",
       "x-oc-sand-box-probe": "1", "x-oc-sand-box-probe-nonce": nonce,
     } }, signal);

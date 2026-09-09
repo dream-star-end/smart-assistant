@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import type { AccountRow, CursorTokenSnapshot, ListAccountsOptions } from "./store.js";
 import { listAllCursorAccounts } from "./cursorMaterializer.js";
 import { CursorSandProvisionClient, SandProvisionError, sandPrincipal } from "./cursorSandProvision.js";
-import { readSandLifecycleState, writeSandJsonAtomic, sandHash, SAND_STATE_FILE, type SandLifecycleState } from "./cursorSandState.js";
+import { readSandLifecycleState, writeSandJsonAtomic, sandHash, SAND_STATE_FILE, type SandLifecycleState, type SandAccountPreparation } from "./cursorSandState.js";
 
 export interface SandLifecycleDeps {
   authDir: string;
@@ -93,6 +93,7 @@ export class CursorSandLifecycleCoordinator {
 
   private async step(state: SandLifecycleState, id: string, signal: AbortSignal): Promise<void> {
     let credential = "", accessToken = "";
+    let previousReady: SandAccountPreparation | undefined;
     let resource: Awaited<ReturnType<SandLifecycleDeps["clientFor"]>> | undefined;
     try {
       const source = await this.current(id); credential = source.credential;
@@ -102,8 +103,11 @@ export class CursorSandLifecycleCoordinator {
       if (sameIdentity && opBefore && opBefore.nextAttemptAt > this.now()) return;
       if (sameIdentity && old?.phase === "ready" && old.updatedAt + 300_000 > this.now()
         && opBefore?.moduleHash === this.deps.moduleHash && old.readyUntil! > this.now()) return;
-      state.accounts[id] = { credentialHash, phase: "preparing", updatedAt: this.now() };
-      this.save(state);
+      if (sameIdentity && old?.phase === "ready" && opBefore?.moduleHash === this.deps.moduleHash && old.readyUntil! > this.now()) previousReady = old;
+      if (!previousReady) {
+        state.accounts[id] = { credentialHash, phase: "preparing", updatedAt: this.now() };
+        this.save(state);
+      }
       resource = await this.deps.clientFor(source.row); this.check();
       const client = resource.client;
       client.setAccountGuard(async () => { await this.current(id, credentialHash); });
@@ -113,9 +117,12 @@ export class CursorSandLifecycleCoordinator {
       if (!op) op = state.operations[principal.subjectHash] = { nonce: nonce(), moduleHash: this.deps.moduleHash, phase: "idle", startedAt: this.now(), nextAttemptAt: 0 };
       const machine = source.kind === "session" ? source.machine : op.machineId ?? randomBytes(16).toString("hex");
       if (!machine || !/^[a-z0-9]{16,64}$/.test(machine)) throw new SandProvisionError("MACHINE_INVALID");
+      if (previousReady && (previousReady.subjectHash !== principal.subjectHash || previousReady.machineHash !== sandHash(machine))) previousReady = undefined;
       if (source.kind === "api_key") op.machineId = machine;
-      state.accounts[id] = { credentialHash, subjectHash: principal.subjectHash, machineId: machine, machineHash: sandHash(machine), phase: "preparing", updatedAt: this.now() };
-      this.save(state);
+      if (!previousReady) {
+        state.accounts[id] = { credentialHash, subjectHash: principal.subjectHash, machineId: machine, machineHash: sandHash(machine), phase: "preparing", updatedAt: this.now() };
+        this.save(state);
+      }
       if (op.nextAttemptAt > this.now()) return;
       await this.current(id, credentialHash);
       const connection = await client.connect(accessToken, machine, signal); this.check();
@@ -126,6 +133,11 @@ export class CursorSandLifecycleCoordinator {
         op.phase = "ready"; op.moduleHash = this.deps.moduleHash; delete op.errorCode;
         this.save(state); return;
       }
+      // A conclusive missing/wrong capability, unlike a slow health recheck,
+      // withdraws admission before maintenance can begin.
+      previousReady = undefined;
+      state.accounts[id] = { credentialHash, subjectHash: principal.subjectHash, machineId: machine, machineHash: sandHash(machine), phase: "preparing", updatedAt: this.now() };
+      this.save(state);
       if (probe && probe.active > 0) throw new SandProvisionError("BOX_BUSY");
       if (op.moduleHash !== this.deps.moduleHash && !["idle", "ready", "error"].includes(op.phase)) throw new SandProvisionError("INSTALL_VERSION_CHANGED_IN_FLIGHT");
       const call = async (method: string, body: Record<string, unknown>): Promise<unknown> => {
@@ -177,8 +189,11 @@ export class CursorSandLifecycleCoordinator {
       const code = error instanceof SandProvisionError ? error.code : "PREPARATION_FAILED";
       if (code === "ACCOUNT_INACTIVE" || code === "ACCOUNT_CHANGED") delete state.accounts[id];
       else if (state.accounts[id]) {
-        const transient = ["BOX_BUSY", "BOX_CONTROL_PENDING", "REQUEST_FAILED", "REQUEST_ABORTED", "BOX_PROBE_PENDING"].includes(code);
-        state.accounts[id] = { ...state.accounts[id], phase: transient ? "preparing" : "error", errorCode: code, updatedAt: this.now() };
+        const authRejected = error instanceof SandProvisionError && (error.httpStatus === 401 || error.httpStatus === 403);
+        const transient = !authRejected && ["BOX_BUSY", "BOX_CONTROL_PENDING", "REQUEST_FAILED", "REQUEST_ABORTED", "BOX_PROBE_PENDING"].includes(code);
+        state.accounts[id] = previousReady && transient && previousReady.readyUntil! > this.now()
+          ? previousReady
+          : { ...state.accounts[id], phase: transient ? "preparing" : "error", errorCode: code, updatedAt: this.now() };
         const subject = state.accounts[id].subjectHash;
         if (subject && state.operations[subject]) state.operations[subject].nextAttemptAt = this.now() + 60_000;
       }
