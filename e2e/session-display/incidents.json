@@ -3432,6 +3432,44 @@
           "assertion": "OCV5-189 deploy proof: cross-turn delegate billing materializes and settles by its own locator"
         }
       ]
+    },
+    {
+      "id": "INC-20260909-CURSOR-SAND-BOX-TRANSPORT",
+      "occurredAt": "2026-09-09",
+      "severity": "P1",
+      "symptom": "Sand 账号控制面可用但账号 JWT 直连 InferenceService.Stream 返回 NOT_LOGGED_IN，不能完成推理。按账号显式绑定自有 Box 的受鉴权 inference-only 中转，工具仍在本机；Box 票据错误不得污染账号健康、轮换账号或触发工具纠错重试。",
+      "rootFixCommit": "1d341fe5",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box HTTP failures keep no-retry transport scope, descriptor cache, and true account/quota distinctions"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "Box Connect unauthenticated trailers preserve transport identity in both response modes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "actual Relay rejection feeds actual Adapter billing chain without poisoning the account"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorSandRelay.test.ts",
+          "assertion": "terminal Box ticket error never enters tool correction:"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cursor-sand-inference.ts",
+          "assertion": "[cursor-sand-box] PASS — isolated Box transport, account health, and terminal no-retry contracts executed"
+        }
+      ],
+      "coverageCommits": [
+        "7ac9122a",
+        "f7730d2d"
+      ]
     }
   ]
 }
