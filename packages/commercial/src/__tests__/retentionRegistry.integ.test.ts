@@ -3,7 +3,8 @@
  *
  * 权威集 = 跑完全量迁移后 information_schema 里的**全部 base table**;
  * 声明集 = retentionRegistry.ts 的 RETENTION_REGISTRY(六档离场语义之一)。
- * 断言 `DB base tables === RETENTION_REGISTRY 键集`:
+ * 双向校验: DB ⊆ 全注册集, migration-owned 注册集 ⊆ DB。
+ * 精确 historical-manual 来源不要求 fresh 凭空建表,永久身份和 live 全集不变:
  *   - 有表未登记离场语义 → 红(消灭"新表静默无界增长"这一整类风险);
  *   - 注册表有幽灵条目(表已删/改名)→ 红(防注册表腐烂)。
  *
@@ -27,6 +28,9 @@ import {
 } from "../admin/auditRetention.js";
 import {
   RETENTION_REGISTRY,
+  FRESH_RETENTION_TABLES,
+  HISTORICAL_MANUAL_TABLES,
+  compareFreshRetentionCoverage,
   DEFERRED_TABLES,
   BESPOKE_SWEEPER_TABLES,
   DURABLE_TABLES,
@@ -150,10 +154,9 @@ describe("retention 反向对账门(连库跑全量迁移)", () => {
         WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name`,
     );
     const dbTables = new Set(rows.rows.map((r) => r.table_name));
-    const registered = new Set(Object.keys(RETENTION_REGISTRY));
+    const { undeclared, phantom } = compareFreshRetentionCoverage(dbTables);
 
     // ① DB ⊆ 注册表:有表没登记离场语义 → 红。
-    const undeclared = [...dbTables].filter((t2) => !registered.has(t2)).sort();
     assert.deepEqual(
       undeclared,
       [],
@@ -161,12 +164,30 @@ describe("retention 反向对账门(连库跑全量迁移)", () => {
         `${undeclared.join(", ")};修法=在 RETENTION_REGISTRY 六档之一给它一个 disposition。`,
     );
 
-    // ② 注册表 ⊆ DB:注册表里有幽灵表(已删/改名)→ 红,防注册表腐烂。
-    const phantom = [...registered].filter((t2) => !dbTables.has(t2)).sort();
+    // ② migration-owned 注册集 ⊆ DB:任意应由迁移创建的表缺失仍红。
     assert.deepEqual(
       phantom,
       [],
-      `以下表在 RETENTION_REGISTRY 里但库里不存在(表被删/改名后注册表未同步):${phantom.join(", ")}`,
+      `以下 migration-owned 表在 RETENTION_REGISTRY 里但库里不存在:${phantom.join(", ")}`,
     );
+
+    // Pure observation mutations over the REAL migrated inventory, not fake backup DDL.
+    for (const table of FRESH_RETENTION_TABLES) {
+      const missing = new Set(dbTables);
+      missing.delete(table);
+      assert.deepEqual(compareFreshRetentionCoverage(missing).phantom, [table], `missing ${table} must remain red`);
+    }
+    for (const table of Object.keys(HISTORICAL_MANUAL_TABLES)) {
+      assert.equal(RETENTION_REGISTRY[table]?.kind, "permanent-ledger");
+      const absent = new Set(dbTables);
+      absent.delete(table);
+      assert.deepEqual(compareFreshRetentionCoverage(absent), { undeclared: [], phantom: [] });
+      assert.deepEqual(compareFreshRetentionCoverage([...absent, table]), { undeclared: [], phantom: [] });
+      const typo = `${table}_typo`;
+      assert.deepEqual(compareFreshRetentionCoverage([...absent, typo]).undeclared, [typo]);
+    }
+    assert.deepEqual(compareFreshRetentionCoverage([...dbTables, "undeclared_retention_probe"]).undeclared,
+      ["undeclared_retention_probe"]);
+
   });
 });
