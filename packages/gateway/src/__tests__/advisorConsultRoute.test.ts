@@ -398,6 +398,14 @@ describe('advisor consult route lifecycle', () => {
     assert.equal(gw._advisorConfig.read().defaultAdvisorModel, null)
   })
 
+  it('selfhost default identity can GET collaboration-config', async () => {
+    const { gw } = await makeGateway()
+    gw.getUserId = () => 'default'
+    const r = await http(gw, 'GET', '/api/collaboration-config', undefined)
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.session.mode, 'solo')
+  })
+
   it('GET/PUT unknown sessionId is not treated as owned', async () => {
     const { gw } = await makeGateway()
     const get = await http(gw, 'GET', '/api/collaboration-config?sessionId=missing-session', undefined)

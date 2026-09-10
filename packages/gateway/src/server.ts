@@ -13062,7 +13062,10 @@ export class Gateway {
       return this.sendError(res, 404, 'collaboration-config is selfhost only')
     }
     const userId = this.getUserId(req)
-    if (!userId || userId === 'default') return this.sendError(res, 401, 'unauthorized')
+    // Selfhost ACCESS / container-proxy / static MCP resolve to 'default' after
+    // outer checkHttpAuth (or a valid bridge nonce). That identity owns this
+    // uid-volume config; do not remap it onto another uid or treat it as anonymous.
+    if (!userId) return this.sendError(res, 401, 'unauthorized')
     const store = this.advisorConfigStore()
     const provenNow = () => [...openAdvisorEngines(), ...store.read().provenEngines]
     const catalogOptions = async () => {

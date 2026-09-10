@@ -753,6 +753,96 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
   })
 
+  test('unauthenticated App does not GET collaboration-config; login then loads current identity', async () => {
+    const calls: string[] = []
+    const base = routedFetch()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      calls.push(`${method} ${String(url)}`)
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/collaboration-config')) {
+        return okJson(
+          collabDoc({
+            session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'default' },
+            defaultMode: 'team',
+          }),
+        )
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await screen.findByRole('button', { name: '登录' })
+    expect(calls.filter((row) => row.includes('/api/collaboration-config'))).toEqual([])
+
+    await loginViaUi()
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await waitFor(() =>
+      expect(calls.filter((row) => row.startsWith('GET ') && row.includes('/api/collaboration-config')).length).toBeGreaterThan(
+        0,
+      ),
+    )
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('logout drops in-flight collaboration GET so it cannot paint the next identity', async () => {
+    let release!: () => void
+    const hang = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let collabGets = 0
+    const base = routedFetch()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/collaboration-config') && method === 'GET') {
+        collabGets += 1
+        const thisGet = collabGets
+        if (thisGet === 1) await hang
+        return okJson(
+          collabDoc({
+            session: {
+              mode: thisGet === 1 ? 'team' : 'solo',
+              advisorModel: null,
+              configVersion: thisGet === 1 ? 'v1:team:' : 'v1:solo:',
+              source: 'default',
+            },
+            defaultMode: thisGet === 1 ? 'team' : 'solo',
+          }),
+        )
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(collabGets).toBe(1))
+    fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
+      button: 0,
+      pointerType: 'mouse',
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
+    await loginViaUi()
+    await waitFor(() => expect(collabGets).toBeGreaterThan(1))
+    release()
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await openAgentPicker()
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+  })
+
   test('server collaboration config wins over legacy localStorage team flag', async () => {
     localStorage.setItem('oc_v5_team_mode', '1')
     fetchMock = routedFetch({

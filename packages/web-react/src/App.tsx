@@ -893,7 +893,10 @@ export function App() {
       setTeamModeState(mode === "team");
       writeTeamMode(activeId, mode === "team");
       setCollabSaveError(null);
-      if (demo || !authRef.current) return;
+      // useAuth.auth is null until authed; authRef always holds MemoryAuthSession.
+      if (demo || !auth) return;
+      const collabAuth = auth;
+      const identityEpoch = collabAuth.snapshot().epoch;
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
@@ -913,7 +916,7 @@ export function App() {
       }
       try {
         const doc = await api.putCollaborationConfig(
-          authRef.current,
+          collabAuth,
           collaborationPutBody({
             sessionId: activeId,
             mode,
@@ -923,13 +926,16 @@ export function App() {
           }),
         );
         if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
         applyCollabDoc(doc);
       } catch (err) {
         if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-        if (err instanceof ApiError && err.status === 409 && authRef.current) {
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (err instanceof ApiError && err.status === 409) {
           try {
-            const fresh = await api.getCollaborationConfig(authRef.current, activeId);
+            const fresh = await api.getCollaborationConfig(collabAuth, activeId);
             if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
             applyCollabDoc(fresh);
             setCollabSaveError("配置已被更新，请确认后再选一次");
             toast("协作配置有更新，已重新读取，请再选一次", "error");
@@ -950,7 +956,7 @@ export function App() {
         toast(msg, "error");
       }
     },
-    [activeId, agent.id, applyCollabDoc, collabUi, demo, modelId, models, sessions, toast],
+    [activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
   );
   const setTeamMode = useCallback(
     (enabled: boolean) => {
@@ -977,18 +983,24 @@ export function App() {
       advisorConsultParentReason: cur.advisorConsultParentReason,
     }));
     setTeamModeState(enabled);
-    if (demo || !authRef.current) return;
+    // auth is null until login/boot getMe (useAuth). authRef always holds the
+    // MemoryAuthSession, including the anonymous epoch-0 object — do not GET on it.
+    if (demo || !auth) return;
+    const collabAuth = auth;
+    const identityEpoch = collabAuth.snapshot().epoch;
     void api
-      .getCollaborationConfig(authRef.current, activeId)
+      .getCollaborationConfig(collabAuth, activeId)
       .then((doc) => {
         if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
         applyCollabDoc(doc);
       })
       .catch((err) => {
         if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
         setCollabSaveError(apiErrorMessage(err, "协作配置读取失败"));
       });
-  }, [activeId, applyCollabDoc, demo]);
+  }, [activeId, applyCollabDoc, auth, demo]);
 
   // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
   // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
@@ -1110,7 +1122,9 @@ export function App() {
         writeContextTier(sessionId, contextTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (authRef.current && (collabMode !== "solo" || collabAsDefault)) {
+        if (auth && (collabMode !== "solo" || collabAsDefault)) {
+          const collabAuth = auth;
+          const identityEpoch = collabAuth.snapshot().epoch;
           const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
           if (!ensured) {
             toast("会话尚未创建成功，请检查网络后重试", "error");
@@ -1118,7 +1132,7 @@ export function App() {
           }
           try {
             const doc = await api.putCollaborationConfig(
-              authRef.current,
+              collabAuth,
               collaborationPutBody({
                 sessionId,
                 mode: collabMode,
@@ -1130,12 +1144,14 @@ export function App() {
                 asDefault: collabAsDefault,
               }),
             );
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
             applyCollabDoc(doc);
             modeForSend = doc.session.mode;
             advisorModelForSend = doc.session.advisorModel;
             configVersionForSend = doc.session.configVersion;
             unavailableForSend = doc.advisorUnavailableReason;
           } catch (err) {
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
             const msg = apiErrorMessage(err, "协作配置保存失败");
             setCollabSaveError(msg);
             toast(msg, "error");
@@ -1255,6 +1271,7 @@ export function App() {
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      auth,
       demo,
       user,
       agent,
