@@ -549,6 +549,25 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'present_task_approval',
+    description: [
+      '向当前对话投递一张任务单人工审批卡。调用后立刻返回(不阻塞、不等待、不轮询)。',
+      '用户在对话里点「通过/批准」或「打回」会以用户本人身份改单据;done 仍不属于 AI。',
+      '只用于 backlog(立项批准)或 waiting_human(验收通过)。id 只用面板返回的 identifier 或 uuid。',
+      '返回后必须立刻结束本回合;不要让用户去打开任务面板,不要用选择题卡代替。',
+      '一次一张单;一条回复最多 4 次。子 agent 环境会 skipped。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        prompt: { type: 'string', description: '可选,展示在卡片上的一句话说明' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
   // ── 引擎交互提问桥(cursor 等无原生交互工具的引擎,2026-08-17) ──
   {

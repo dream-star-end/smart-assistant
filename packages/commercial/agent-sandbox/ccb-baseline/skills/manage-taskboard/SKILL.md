@@ -25,6 +25,7 @@ priority: 6
 6. **禁止抢别人的 lease**。退出码 `6` = HTTP 423 `lease_held`,别人正在跑,重试无用,等。
 7. **做完先写评论再 advance**。评论必须写:改了什么 / 怎么验的 / 有什么风险。然后 `advance` 进 `waiting_human`(或下一站 `ready`,由 stage.onSuccess 决定)。
 8. **`done` 永远不属于 AI**。不要调 `POST …/done` / `…/cancel`。`POST …/approve` 只用于把 **backlog → ready**,不能拿来给人确认过站或关单。
+9. **等人批准/验收时在对话里贴审批卡**。调用 `present_task_approval(id)` 后立刻结束回合;用户点卡片会以本人身份改单据。禁止让用户单独去打开任务面板,禁止用选择题卡或 `task_approve` 代替人确认过站。
 
 ## 触发场景
 
@@ -36,7 +37,7 @@ priority: 6
 ## 前提
 
 - 容器内能跑 `oc-task`(不在 PATH 时用绝对路径 `/run/oc/platform/current/bin/oc-task` 或 `~/.local/bin/oc-task`)
-- MCP 工具 `task_create` / `task_update` / `task_comment` / `task_list` / `task_get` / `task_approve` 已挂在本会话
+- MCP 工具 `task_create` / `task_update` / `task_comment` / `task_list` / `task_get` / `task_approve` / `present_task_approval` 已挂在本会话
 - 不要假设环境变量 `OPENCLAUDE_GATEWAY_TOKEN` 存在;`oc-task` 会自己读 token file / `openclaude.json`
 
 ## 步骤
@@ -159,4 +160,5 @@ task_create(projectId="OCV5", type="bug", title="…", body="…")
 task_update(id="OCV5-42", expectedVersion=3, priority="P0")
 task_comment(id="OCV5-42", body="改了什么 / 怎么验的 / 风险")
 task_approve(id="OCV5-42", expectedVersion=3)
+present_task_approval(id="OCV5-42", prompt="请确认可以过站")
 ```

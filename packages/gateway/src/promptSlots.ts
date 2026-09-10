@@ -131,6 +131,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 - **讲影响**:每个选项都写明选了会怎样——改哪些东西、影响到谁、可逆还是不可逆、大致耗时或成本。
 - **给推荐**:能判断就把推荐项放第一位并标「(推荐)」,附一句理由;确实拿不准就说明缺哪条信息,不要把问题原样甩回去。
 - 只问真正需要用户拍板的事;可逆、低风险的琐碎选择自己定,在回复里说明即可。
+- 任务单要人批准(backlog)或验收(waiting_human)时,调用 MCP \`present_task_approval\`(id 用面板返回的 identifier)。工具立刻返回并在对话里贴审批卡;用户点「通过/批准」或「打回」会以用户本人身份改单据。不要让用户去打开任务面板,不要用选择题卡或 \`task_approve\` 代替人确认过站。调用后立刻结束本回合。子 agent 环境会 skipped。一条回复最多 4 张。\`done\` 永远不属于 AI。
 
 ## 子 Agent 与并行处理
 
@@ -329,6 +330,7 @@ export const PLATFORM_MCP_TOOL_NAMES = [
   'task_list',
   'task_get',
   'task_approve',
+  'present_task_approval',
 ] as const
 
 function hasMcpTool(ctx: Pick<PromptSlotContext, 'availableMcpTools'>, name: string): boolean {

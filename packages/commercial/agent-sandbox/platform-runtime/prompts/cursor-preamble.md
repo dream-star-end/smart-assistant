@@ -25,6 +25,8 @@ Subagents have no user-facing UI — decide yourself, or present numbered
 options as plain text and end the turn; the user's next message carries
 the answer.
 
+When a task ticket needs the user's approval or sign-off (backlog or waiting_human), call MCP `present_task_approval` with the panel identifier and end the turn. The conversation shows an approval card; the user's click updates the ticket as themselves. Do not send the user to the task panel. Do not use `present_options` or `task_approve` to stand in for human confirmation.
+
 Use OpenClaude's storage channels as their sections direct: Core memory through
 `oc-memory core-search` plus the exact platform memory files, session/archival
 recall through the `oc-memory` CLI, and skills/reminders through the

@@ -31,6 +31,7 @@ describe('grok platform projection', () => {
       })
       assert.equal(projected.grokHome, path.join(home, 'grok-build'))
       assert.ok(projected.advertisedMcpTools.includes('skill_search'))
+      assert.ok(projected.advertisedMcpTools.includes('present_task_approval'))
       assert.ok(projected.delegateContextFile)
       const raw = readFileSync(path.join(projected.grokHome, 'config.toml'), 'utf8')
       assert.match(raw, /\[shell_environment_policy\]/)
@@ -43,6 +44,7 @@ describe('grok platform projection', () => {
       assert.match(raw, /tool_timeout_sec = 600/)
       assert.ok(GROK_PREAMBLE.includes('Grok adapter'))
       assert.ok(GROK_PREAMBLE.includes('options'))
+      assert.ok(GROK_PREAMBLE.includes('present_task_approval'))
     } finally {
       rmSync(home, { recursive: true, force: true })
       restore('OPENCLAUDE_HOME', oldHome)

@@ -103,6 +103,10 @@ import {
   shouldListPresentOptions,
 } from './presentOptions.js'
 import {
+  handlePresentTaskApproval,
+  shouldListPresentTaskApproval,
+} from './presentTaskApproval.js'
+import {
   cursorDelegateCliHint,
   delegateWaitDisabledText,
   filterListedDelegateTools,
@@ -128,6 +132,7 @@ const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
+const consumePresentTaskApprovalCall = createPresentOptionsCallBudget(4)
 
 const skills = buildMcpSkillStore()
 
@@ -215,6 +220,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListPresentOptions(ENGINE_ID, DELEGATION_DEPTH)) {
     base = base.filter((t) => t.name !== 'present_options')
   }
+  if (!shouldListPresentTaskApproval(DELEGATION_DEPTH)) {
+    base = base.filter((t) => t.name !== 'present_task_approval')
+  }
   base = filterListedDelegateTools(base, ENGINE_ID)
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
@@ -291,6 +299,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           delegationDepth: DELEGATION_DEPTH,
         })
         return result.ok ? toolOk(result.message) : toolError(result.message)
+      }
+      case 'present_task_approval': {
+        if (!consumePresentTaskApprovalCall()) {
+          return toolError('present_task_approval 每回合最多调用 4 次')
+        }
+        return await handlePresentTaskApproval(args, {
+          delegationDepth: DELEGATION_DEPTH,
+        })
       }
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }

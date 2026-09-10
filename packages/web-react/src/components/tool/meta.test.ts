@@ -234,6 +234,9 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     );
     expect(resolveToolMeta("mcp__openclaude-memory__task_create").label).toBe("创建任务单");
     expect(resolveToolMeta("mcp__openclaude-memory__task_get").label).toBe("查看任务单");
+    expect(resolveToolMeta("mcp__openclaude-memory__present_task_approval").label).toBe(
+      "任务审批卡",
+    );
     expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe(
       "登录 500",
     );

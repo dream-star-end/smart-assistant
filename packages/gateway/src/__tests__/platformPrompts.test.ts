@@ -385,6 +385,8 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(prompt.includes('也不要再调用 MCP `ask_user`'))
     assert.ok(prompt.includes('优先调用 MCP `present_options`'))
     assert.ok(!prompt.includes('提问一律走 `ask_user`'))
+    assert.ok(prompt.includes('present_task_approval'))
+    assert.ok(prompt.includes('不要让用户去打开任务面板'))
   })
   it('原生容器网站预览 SOP 覆盖常驻 prompt、Codex 基线与平台 skill', () => {
     const sources = {

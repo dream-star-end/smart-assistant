@@ -42,6 +42,7 @@ export const CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS = [
   'task_list',
   'task_get',
   'task_approve',
+  'present_task_approval',
   'ask_user',
   'present_options',
 ] as const

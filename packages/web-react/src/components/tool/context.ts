@@ -10,6 +10,7 @@
  */
 import { createContext, useContext } from "react";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
+import type { Ticket } from "../../lib/taskboard";
 import type { ToolLike } from "./format";
 
 export type ToolCardActions = {
@@ -30,6 +31,17 @@ export type ToolCardActions = {
     getDetail: (id: string) => Promise<ConnectorConfirmationDetail>;
     decide: (id: string, decision: "approve" | "deny") => Promise<ConnectorDecisionResult>;
   };
+  /**
+   * 任务单对话审批卡：详情 GET + 通过/打回。动作走用户浏览器鉴权,
+   * 与任务面板 inbox 同一套 /api/board(人是闸门)。demo/未登录不注入。
+   */
+  taskApproval?: {
+    getTicket: (id: string) => Promise<Ticket>;
+    approve: (id: string, expectedVersion: number) => Promise<{ ticket: Ticket }>;
+    reject: (id: string, expectedVersion: number, reason: string) => Promise<{ ticket: Ticket }>;
+  };
+  /** 打开任务面板(可选定位到 identifier)。 */
+  onOpenTaskboard?: (identifier?: string) => void;
 };
 
 export const ToolCardActionsContext = createContext<ToolCardActions>({});

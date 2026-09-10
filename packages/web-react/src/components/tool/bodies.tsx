@@ -38,6 +38,7 @@ import {
 import { parseMcpName } from "./meta";
 import { researchToolCard, safeArtifactSrc, WebSearchResultsCard } from "./researchCards";
 import { renderReleaseJobCard } from "./releaseCards";
+import { TaskApprovalCard } from "./taskApprovalCard";
 
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
@@ -1023,6 +1024,14 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
     const title =
       safeSubtaskDescription({ description: asStr(input?.goal) || asStr(input?.message) }) || "运行子任务";
     body = <div className="mt-1.5 text-xs text-muted">{title}</div>;
+  } else if (op === "present_task_approval") {
+    const ticketId = asStr(input?.id) || asStr(input?.identifier);
+    if (ticketId && !tool.error) {
+      body = <TaskApprovalCard id={ticketId} prompt={asStr(input?.prompt) || undefined} />;
+      suppressOutput = true;
+    } else {
+      body = <KvList obj={input} />;
+    }
   } else {
     body = <KvList obj={input} />;
   }

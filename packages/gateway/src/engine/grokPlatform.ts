@@ -31,6 +31,7 @@ export const GROK_MEMORY_MCP_TOOLS = [
   'task_list',
   'task_get',
   'task_approve',
+  'present_task_approval',
 ] as const
 
 export const GROK_PREAMBLE = `# OpenClaude Platform Context (Grok adapter)
@@ -54,6 +55,8 @@ One reply may contain at most 4 options blocks. The closing fence must be on
 its own line with no characters after it. Do not write prose after the last
 options block. Subagents have no user-facing UI — decide yourself, or present
 numbered options as plain text and end the turn.
+
+When a task ticket needs the user's approval or sign-off (backlog or waiting_human), call MCP \`present_task_approval\` with the panel identifier and end the turn. The conversation shows an approval card; the user's click updates the ticket as themselves. Do not send the user to the task panel. Do not use \`options\` cards or \`task_approve\` to stand in for human confirmation. Subagents skip this tool.
 
 Use OpenClaude's storage channels: Core memory through \`oc-memory core-search\`
 plus the exact platform memory files; session/archival recall through the

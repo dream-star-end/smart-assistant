@@ -2369,6 +2369,7 @@ setInterval(() => {}, 1000);
       options: [{ label: '现在换' }, { label: '先不换' }],
     })
     assert.ok(_internals.OPENCLAUDE_MEMORY_MCP_TOOLS.includes('present_options'))
+    assert.ok(_internals.OPENCLAUDE_MEMORY_MCP_TOOLS.includes('present_task_approval'))
     assert.equal(
       (_internals.OPENCLAUDE_MEMORY_MCP_TOOLS as readonly string[]).includes('ask_user'),
       false,
@@ -2378,6 +2379,10 @@ setInterval(() => {}, 1000);
     assert.ok(
       _internals.CURSOR_PREAMBLE.includes('`present_options`'),
       'preamble must point cursor at present_options',
+    )
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('present_task_approval'),
+      'preamble must point cursor at present_task_approval',
     )
     assert.ok(
       _internals.CURSOR_PREAMBLE.includes('fenced `options`'),
