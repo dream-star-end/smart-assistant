@@ -18,6 +18,25 @@ export function isAdvisorConsultParentEngine(engine: string | undefined): boolea
   return engine === 'ccb'
 }
 
+/** Unknown parent engines fail closed. Phase-1 consult is CCB-only. */
+export function advisorConsultParentGate(engine: string | undefined | null): {
+  allowed: boolean
+  engine?: string
+  reason?: string
+} {
+  const normalized = typeof engine === 'string' ? engine.trim() : ''
+  if (!normalized) {
+    return {
+      allowed: false,
+      reason: '当前主会话引擎未知，不能开启顾问（fail closed）。主模型不会被切换。',
+    }
+  }
+  if (!isAdvisorConsultParentEngine(normalized)) {
+    return { allowed: false, engine: normalized, reason: ADVISOR_CONSULT_PARENT_REASON }
+  }
+  return { allowed: true, engine: normalized }
+}
+
 export const ADVISOR_PREAMBLE = [
   '【顾问模式已开启】当前主模型不切换。你可以使用 consult_advisor 向无工具顾问提问（question 必填，可选 concern）。',
   '顾问只给建议，没有工具、不能改文件或再委派。你必须用自己的工具验证建议后再交付。',

@@ -1354,6 +1354,10 @@ export const api = {
       }
       advisorModels?: Array<{ id: string; label: string; engine: string }>
       advisorUnavailableReason?: string
+      advisorConsultParents?: string[]
+      advisorConsultParentReason?: string
+      advisorConsultAllowed?: boolean
+      parentEngine?: string
     }>(
       callWithRefresh(a, (t) =>
         fetch(
@@ -1385,6 +1389,10 @@ export const api = {
       }
       advisorModels?: Array<{ id: string; label: string; engine: string }>
       advisorUnavailableReason?: string
+      advisorConsultParents?: string[]
+      advisorConsultParentReason?: string
+      advisorConsultAllowed?: boolean
+      parentEngine?: string
     }>(
       callWithRefresh(a, (t) =>
         fetch("/api/collaboration-config", {

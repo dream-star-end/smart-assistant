@@ -865,6 +865,22 @@ export function App() {
     async (mode: CollabMode, opts?: { advisorModel?: string | null; asDefault?: boolean }) => {
       const epoch = ++collabEpochRef.current;
       const previous = collabUi;
+      const parentEngineForGate =
+        models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine;
+      const parents = collabUi.advisorConsultParents;
+      if (
+        mode === "advisor" &&
+        (collabUi.advisorConsultAllowed === false ||
+          (parents.length > 0 &&
+            (!parentEngineForGate || !parents.includes(parentEngineForGate))))
+      ) {
+        const msg =
+          collabUi.advisorConsultParentReason ||
+          "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
+        setCollabSaveError(msg);
+        toast(msg, "error");
+        return;
+      }
       const advisorModel =
         mode === "advisor"
           ? (opts?.advisorModel ?? collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
@@ -918,7 +934,7 @@ export function App() {
         toast(msg, "error");
       }
     },
-    [activeId, applyCollabDoc, collabUi, demo, toast],
+    [activeId, applyCollabDoc, collabUi, demo, modelId, models, toast],
   );
   const setTeamMode = useCallback(
     (enabled: boolean) => {
@@ -941,6 +957,8 @@ export function App() {
       mode: enabled ? "team" : "solo",
       advisorModels: cur.advisorModels,
       advisorUnavailableReason: cur.advisorUnavailableReason,
+      advisorConsultParents: cur.advisorConsultParents,
+      advisorConsultParentReason: cur.advisorConsultParentReason,
     }));
     setTeamModeState(enabled);
     if (demo || !authRef.current) return;
@@ -1110,6 +1128,10 @@ export function App() {
         advisorModel: advisorModelForSend,
         configVersion: configVersionForSend,
         advisorUnavailableReason: unavailableForSend,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
+        advisorConsultParents: collabUi.advisorConsultParents,
+        advisorConsultAllowed: collabUi.advisorConsultAllowed,
+        advisorConsultParentReason: collabUi.advisorConsultParentReason,
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
@@ -3742,6 +3764,10 @@ export function App() {
         advisorModels={collabUi.advisorModels}
         advisorModel={collabUi.advisorModel}
         advisorUnavailableReason={collabUi.advisorUnavailableReason}
+        advisorConsultParents={collabUi.advisorConsultParents}
+        advisorConsultParentReason={collabUi.advisorConsultParentReason}
+        advisorConsultAllowed={collabUi.advisorConsultAllowed}
+        parentEngine={models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine}
         collabSaveError={collabSaveError}
         asDefault={collabAsDefault}
         onAsDefaultChange={demo ? undefined : setCollabAsDefault}

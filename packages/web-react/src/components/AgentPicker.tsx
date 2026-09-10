@@ -28,6 +28,10 @@ export function AgentPicker({
   advisorModels = [],
   advisorModel,
   advisorUnavailableReason,
+  advisorConsultParents = [],
+  advisorConsultParentReason,
+  advisorConsultAllowed,
+  parentEngine,
   collabSaveError,
   asDefault,
   onAsDefaultChange,
@@ -46,6 +50,10 @@ export function AgentPicker({
   advisorModels?: Array<{ id: string; label: string; engine: string }>
   advisorModel?: string | null
   advisorUnavailableReason?: string
+  advisorConsultParents?: readonly string[]
+  advisorConsultParentReason?: string
+  advisorConsultAllowed?: boolean
+  parentEngine?: string | null
   collabSaveError?: string | null
   asDefault?: boolean
   onAsDefaultChange?: (v: boolean) => void
@@ -57,6 +65,13 @@ export function AgentPicker({
   onAdvisorModelChange?: (id: string) => void
 }) {
   const mode = collabMode ?? (teamMode ? 'team' : 'solo')
+  const advisorBlocked =
+    advisorConsultAllowed === false ||
+    (advisorConsultParents.length > 0 &&
+      (!parentEngine || !advisorConsultParents.includes(parentEngine)))
+  const advisorBlockReason =
+    advisorConsultParentReason ||
+    '一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。'
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
   const [loading, setLoading] = useState(false)
 
@@ -155,9 +170,14 @@ export function AgentPicker({
                 data-product-feature="advisor-mode"
                 data-product-control
                 aria-pressed={mode === 'advisor'}
-                onClick={() => onCollabModeChange('advisor')}
+                disabled={advisorBlocked}
+                title={advisorBlocked ? advisorBlockReason : undefined}
+                onClick={() => {
+                  if (advisorBlocked) return
+                  onCollabModeChange('advisor')
+                }}
                 className={cn(
-                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-65",
                   mode === 'advisor'
                     ? "border-accent bg-accent-soft text-fg"
                     : "border-border bg-surface text-muted hover:border-border-strong",
@@ -167,7 +187,9 @@ export function AgentPicker({
                   <ShieldCheck size={13} />
                   顾问
                 </span>
-                <span className="mt-0.5 block text-[11px] leading-snug">主模型不切换；一期仅 CCB 主会话可咨询</span>
+                <span className="mt-0.5 block text-[11px] leading-snug">
+                  {advisorBlocked ? advisorBlockReason : '主模型不切换；一期仅 CCB 主会话可咨询'}
+                </span>
               </button>
               <button
                 type="button"

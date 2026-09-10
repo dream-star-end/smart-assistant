@@ -68,6 +68,7 @@ import {
 } from './delegateStartCli.js'
 import { CONSULT_INVOCATION_HEADER, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 import { resolveConsultInvocationId } from './consultInvocation.js'
+import { consultAdvisorUntilAdvice } from './consultAdvisorClient.js'
 
 const TOOL = 'oc-memory'
 
@@ -230,16 +231,16 @@ async function main(): Promise<void> {
     headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
     headers[CONSULT_INVOCATION_HEADER] = invocation.invocationId
     try {
-      const res = await postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
-        headers,
-        body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
-        timeoutMs: 10 * 60_000,
+      const result = await consultAdvisorUntilAdvice({
+        post: () =>
+          postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
+            headers,
+            body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
+            timeoutMs: 10 * 60_000,
+          }),
       })
-      if (res.statusCode >= 400) {
-        process.stderr.write(`${res.body}\n`)
-        process.exit(1)
-      }
-      process.stdout.write(res.body.endsWith('\n') ? res.body : `${res.body}\n`)
+      if (!result.ok) fail(result.text)
+      process.stdout.write(result.text.endsWith('\n') ? result.text : `${result.text}\n`)
       process.exit(0)
     } catch (err: unknown) {
       fail(`consult-advisor transport: ${String((err as Error)?.message ?? err)}`)

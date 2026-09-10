@@ -61,6 +61,48 @@ describe("sendCollabFields", () => {
     expect(sent.collabConfigVersion).toBeUndefined();
   });
 
+  it("blocks advisor send when parent engine is not in GET parents", () => {
+    const sent = sendCollabFields({
+      agentId: "main",
+      mode: "advisor",
+      advisorModel: "gpt-6-astra",
+      configVersion: "v1:advisor:gpt-6-astra",
+      parentEngine: "codex",
+      advisorConsultParents: ["ccb"],
+      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+    });
+    expect(sent.blockedReason).toMatch(/CCB/);
+    expect(sent.collabMode).toBe("advisor");
+    expect(sent.collabConfigVersion).toBeUndefined();
+  });
+
+  it("blocks advisor send when GET says allowed=false, without silent solo", () => {
+    const sent = sendCollabFields({
+      agentId: "main",
+      mode: "advisor",
+      advisorModel: "gpt-6-astra",
+      configVersion: "v1:advisor:gpt-6-astra",
+      advisorConsultAllowed: false,
+      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+    });
+    expect(sent.blockedReason).toMatch(/CCB/);
+    expect(sent.collabMode).toBe("advisor");
+  });
+
+  it("allows CCB parent when GET parents list includes ccb", () => {
+    const sent = sendCollabFields({
+      agentId: "main",
+      mode: "advisor",
+      advisorModel: "gpt-6-astra",
+      configVersion: "v1:advisor:gpt-6-astra",
+      parentEngine: "ccb",
+      advisorConsultParents: ["ccb"],
+      advisorConsultAllowed: true,
+    });
+    expect(sent.blockedReason).toBeUndefined();
+    expect(sent.collabMode).toBe("advisor");
+  });
+
   it("team maps to teamMode true without advisor fields", () => {
     expect(
       sendCollabFields({

@@ -276,6 +276,7 @@ import {
   formatAdvisorConsultPrompt,
   ADVISOR_CONSULT_PARENT_ENGINES,
   ADVISOR_CONSULT_PARENT_REASON,
+  advisorConsultParentGate,
   assertAdvisorModelAllowed,
   coerceHistoryMessages,
   historyFromSessionMessages,
@@ -11056,6 +11057,9 @@ export class Gateway {
    *  (_interruptDelegationsForParent)对"还没 spawn、只在排队"的委派经此打断。
    *  测试脚手架 Object.create(Gateway.prototype) 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateQueueWaiters: Map<string, () => void> | undefined
+  /** Advisor consult AbortController keyed by child session. Stop during
+   *  getOrCreate/submit must prevent a later submit on the aborted child. */
+  private _advisorConsultAborts: Map<string, AbortController> | undefined
   /** 排队复查间隔;测试覆写加速,生产走 DELEGATE_QUEUE_POLL_DEFAULT_MS。 */
   private _delegateQueuePollMs: number | undefined
   /** SM queue wait clock; tests inject a fake monotonic source. */
@@ -12022,14 +12026,17 @@ export class Gateway {
     for (const childSessionKey of [...childSessionKeys]) {
       attempted++
       const descendantInterrupted = this._interruptDelegationsForParent(childSessionKey, visited)
+      this._advisorConsultAborts?.get(childSessionKey)?.abort()
       // 还在资源闸排队等待的委派(尚未 spawn,session 不存在):唤醒并中止其等待,
       // 否则 Stop 级联对它不可达,要干等到排队超时。
       const abortQueuedWait = this._delegateQueueWaiters?.get(childSessionKey)
       if (abortQueuedWait) {
         abortQueuedWait()
-        childSessionKeys.delete(childSessionKey)
         interrupted = true
-        continue
+        if (!this.sessions.getByKey(childSessionKey)) {
+          childSessionKeys.delete(childSessionKey)
+          continue
+        }
       }
       if (!this.sessions.getByKey(childSessionKey)) {
         childSessionKeys.delete(childSessionKey)
@@ -12055,6 +12062,50 @@ export class Gateway {
     return (this._advisorConfig ??= new AdvisorConfigStore())
   }
 
+  private _liveMainSessionForClient(sessionId: string, userId: string): AgentSession | undefined {
+    const live = this.sessions.getByKey(`agent:main:webchat:dm:${sessionId}`)
+    if (!live || live.agentId !== 'main') return undefined
+    if (String(live.userId ?? '') !== String(userId)) return undefined
+    return live
+  }
+
+  private async _parentEngineForCollabSession(input: {
+    sessionId: string
+    userId: string
+  }): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
+    const live = this._liveMainSessionForClient(input.sessionId, input.userId)
+    if (live) return { missing: false, agentId: live.agentId, engine: live.providerTag }
+    const owned = await getClientSession(input.sessionId, input.userId)
+    if (!owned) return { missing: true }
+    let engine: string | undefined
+    const modelId = typeof owned.modelId === 'string' ? owned.modelId : undefined
+    if (modelId) {
+      try {
+        const view = await getLocalCatalogView()
+        const canonical = view.canonicalize(modelId)
+        engine = view.models.find((row) => row.modelId === canonical || row.modelId === modelId)?.engine
+      } catch {
+        engine = undefined
+      }
+    }
+    return { missing: false, agentId: owned.agentId, engine }
+  }
+
+  private _collaborationCapabilityFields(input: {
+    sessionId?: string
+    engine?: string
+  }): Record<string, unknown> {
+    const gate = advisorConsultParentGate(input.engine)
+    return {
+      advisorConsultParents: [...ADVISOR_CONSULT_PARENT_ENGINES],
+      advisorConsultParentReason: ADVISOR_CONSULT_PARENT_REASON,
+      ...(input.engine ? { parentEngine: input.engine } : {}),
+      ...(input.sessionId
+        ? { advisorConsultAllowed: gate.allowed }
+        : {}),
+    }
+  }
+
   private _consultWaitMs(): number {
     const raw = Number(this._advisorConsultWaitMs)
     return Number.isFinite(raw) && raw > 0 ? raw : 30_000
@@ -12067,8 +12118,78 @@ export class Gateway {
     if (typeof record.advice === 'string' && record.advice) return record.advice
     if (!record.jobId) return ''
     const view = this._ensureDelegateJobStore().get(record.jobId)
-    const body = view.status === 'done' ? view.body : undefined
+    const body = view.status === 'done' || view.status === 'failed' ? view.body : undefined
     return typeof body?.advice === 'string' ? body.advice : ''
+  }
+
+  private _consultJobFailedState(view: {
+    status: string
+    state?: string
+    failure_class?: string
+    httpStatus?: number
+  }): 'failed' | 'cancelled' | null {
+    if (view.status === 'expired') return 'failed'
+    if (view.status === 'failed') {
+      return view.state === 'cancelled' || view.failure_class === 'cancelled' ? 'cancelled' : 'failed'
+    }
+    if (view.status === 'done' && (view.failure_class || (typeof view.httpStatus === 'number' && view.httpStatus >= 400))) {
+      return view.failure_class === 'cancelled' ? 'cancelled' : 'failed'
+    }
+    return null
+  }
+
+  private _advisorSessionKey(record: { originTurnKey: string; consultId: string }): string {
+    return `advisor:${record.originTurnKey}:${record.consultId}`
+  }
+
+  private _consultStillLive(record: { originTurnKey: string; consultId: string; jobId?: string | null }): boolean {
+    const key = this._advisorSessionKey(record)
+    if (this._advisorConsultAborts?.has(key)) return true
+    const children = this._activeDelegationsByParent
+    if (children) {
+      for (const set of children.values()) {
+        if (set.has(key)) return true
+      }
+    }
+    const view = record.jobId && this._delegateJobs ? this._delegateJobs.get(record.jobId) : undefined
+    return view?.status === 'running' || view?.status === 'queued'
+  }
+
+  private _closeStaleConsult(
+    record: import('./advisorConsultStore.js').AdvisorConsultRecord,
+  ): import('./advisorConsultStore.js').AdvisorConsultRecord {
+    const terminal = new Set(['settled', 'settle_pending', 'failed', 'cancelled', 'admission_unknown'])
+    if (terminal.has(record.state)) return record
+    if (this._consultStillLive(record)) return record
+    const jobs = this._delegateJobs
+    const view = record.jobId && jobs ? jobs.get(record.jobId) : undefined
+    if (view && (view.status === 'running' || view.status === 'queued')) return record
+    const advice = this._adviceFromConsult(record)
+    if (view?.status === 'done' && !this._consultJobFailedState(view) && advice) {
+      return this.advisorConsultStore().update(record.consultId, { state: 'settled', advice })
+    }
+    const failed = view ? this._consultJobFailedState(view) : 'failed'
+    const state = failed ?? 'failed'
+    return this.advisorConsultStore().update(record.consultId, { state, advice: advice || null })
+  }
+
+  private _presentConsultBody(
+    current: import('./advisorConsultStore.js').AdvisorConsultRecord,
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    const advice = this._adviceFromConsult(current)
+    return {
+      status: current.state,
+      consultId: current.consultId,
+      jobId: current.jobId,
+      requestId: current.billingRequestId,
+      invocationId: current.invocationId,
+      advice: advice || undefined,
+      reused: true,
+      recoverable: true,
+      error: current.state === 'failed' || current.state === 'cancelled' ? current.state : undefined,
+      ...extra,
+    }
   }
 
   private async _presentExistingConsult(input: {
@@ -12098,36 +12219,38 @@ export class Gateway {
       current = this.advisorConsultStore().findById(current.consultId) ?? current
       const advice = this._adviceFromConsult(current)
       if (terminal.has(current.state) || advice) {
-        return {
-          status: 200,
-          body: {
-            status: current.state,
-            consultId: current.consultId,
-            jobId: current.jobId,
-            requestId: current.billingRequestId,
-            advice,
-            reused: true,
-            error: current.state === 'failed' || current.state === 'cancelled' ? current.state : undefined,
-          },
-        }
+        return { status: 200, body: this._presentConsultBody(current) }
       }
       if (current.jobId) {
-        const view = await this._ensureDelegateJobStore().wait(current.jobId, Math.min(5_000, deadline - Date.now()))
+        const jobs = this._ensureDelegateJobStore()
+        const view = await jobs.wait(current.jobId, Math.min(5_000, Math.max(0, deadline - Date.now())))
         current = this.advisorConsultStore().findById(current.consultId) ?? current
+        const failed = this._consultJobFailedState(view)
+        if (failed) {
+          current = this.advisorConsultStore().update(current.consultId, {
+            state: failed,
+            advice: this._adviceFromConsult(current) || null,
+          })
+          return { status: 200, body: this._presentConsultBody(current) }
+        }
         const waitedAdvice =
           this._adviceFromConsult(current) ||
-          (view.status === 'done' && typeof view.body?.advice === 'string' ? view.body.advice : '')
-        if (waitedAdvice || terminal.has(current.state) || view.status === 'done') {
-          return {
-            status: 200,
-            body: {
-              status: current.state === 'admitted' || current.state === 'spawned' ? 'settled' : current.state,
-              consultId: current.consultId,
-              jobId: current.jobId,
-              requestId: current.billingRequestId,
+          ((view.status === 'done' || view.status === 'failed') && typeof view.body?.advice === 'string'
+            ? view.body.advice
+            : '')
+        if (waitedAdvice || terminal.has(current.state)) {
+          if (waitedAdvice && !terminal.has(current.state)) {
+            current = this.advisorConsultStore().update(current.consultId, {
+              state: 'settled',
               advice: waitedAdvice,
-              reused: true,
-            },
+            })
+          }
+          return { status: 200, body: this._presentConsultBody(current, { advice: waitedAdvice || undefined }) }
+        }
+        if (view.status === 'expired') {
+          current = this._closeStaleConsult(current)
+          if (terminal.has(current.state)) {
+            return { status: 200, body: this._presentConsultBody(current) }
           }
         }
       } else {
@@ -12135,13 +12258,25 @@ export class Gateway {
       }
     }
     current = this.advisorConsultStore().findById(record.consultId) ?? record
+    if (terminal.has(current.state) || this._adviceFromConsult(current)) {
+      return { status: 200, body: this._presentConsultBody(current) }
+    }
+    if (!this._consultStillLive(current)) {
+      current = this._closeStaleConsult(current)
+      if (terminal.has(current.state) || this._adviceFromConsult(current)) {
+        return { status: 200, body: this._presentConsultBody(current) }
+      }
+    }
     return {
-      status: 200,
+      status: 202,
       body: {
-        status: current.jobId ? 'running' : current.state,
+        status: 'pending',
         consultId: current.consultId,
         jobId: current.jobId,
+        requestId: current.billingRequestId,
+        invocationId: current.invocationId,
         reused: true,
+        recoverable: true,
       },
     }
   }
@@ -12388,13 +12523,53 @@ export class Gateway {
   }): Promise<{ state: string; advice: string; jobId?: string; error?: string }> {
     const consultStore = this.advisorConsultStore()
     const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
-    const cfg = await this._getAgentsConfig()
     const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
     const unregister = this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
+    const abort = new AbortController()
+    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
     let slotHeld = false
     let jobId: string | undefined
     let jobs: DelegateJobStore | undefined
+    let liveBilling: DurableCodexBilling | null = null
+    let advice = ''
+    const cancelIfAborted = async (): Promise<{
+      state: string
+      advice: string
+      jobId?: string
+      error?: string
+    } | null> => {
+      if (!abort.signal.aborted) return null
+      if (!liveBilling) await input.billingApi.abandon(input.requestId).catch(() => {})
+      consultStore.update(input.consultId, {
+        state: liveBilling ? 'settle_pending' : 'cancelled',
+        advice: advice || null,
+      })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        const spawnFailFence =
+          spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : undefined
+        jobs.fail(jobId, {
+          failureClass: 'cancelled',
+          detail: 'parent Stop',
+          httpStatus: 409,
+          body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
+          nextState: 'cancelled',
+          ...(spawnFailFence ?? {}),
+        })
+      }
+      return {
+        state: liveBilling ? 'settle_pending' : 'cancelled',
+        advice,
+        jobId,
+        error: 'parent Stop',
+      }
+    }
     try {
+    const cfg = await this._getAgentsConfig()
+    const abortedBeforeSpawn = await cancelIfAborted()
+    if (abortedBeforeSpawn) return abortedBeforeSpawn
     const sourceAgent =
       cfg.agents.find((row) => row.id === 'main') ??
       cfg.agents.find((row) => row.id === cfg.default)
@@ -12440,6 +12615,8 @@ export class Gateway {
       }
     }
     slotHeld = true
+    const abortedAfterQueue = await cancelIfAborted()
+    if (abortedAfterQueue) return abortedAfterQueue
     const created = jobs.create(ADVISOR_AGENT_ID, {
       sessionKey: advisorSessionKey,
       parentSessionKey: input.parent.sessionKey,
@@ -12453,6 +12630,8 @@ export class Gateway {
     }
     jobId = created.jobId
     consultStore.update(input.consultId, { jobId, state: 'admitted' })
+    const abortedBeforeCreate = await cancelIfAborted()
+    if (abortedBeforeCreate) return abortedBeforeCreate
     const session = await this.sessions.getOrCreate({
       sessionKey: advisorSessionKey,
       agent,
@@ -12468,18 +12647,29 @@ export class Gateway {
         parentTurnKey: input.originTurnKey,
       },
     })
+    const abortedAfterCreate = await cancelIfAborted()
+    if (abortedAfterCreate) return abortedAfterCreate
     consultStore.update(input.consultId, { state: 'spawned', jobId })
-    let advice = ''
     let error: string | undefined
     let cancelCode: string | undefined
-    let liveBilling: DurableCodexBilling | null = null
     let settleError: string | undefined
     let settleTask: Promise<void> | undefined
+    const originConsultId = input.consultId
     try {
       await this.sessions.submit(
         session,
         formatAdvisorConsultPrompt(input.snapshot),
         (e) => {
+          const latest = consultStore.findById(originConsultId)
+          if (
+            latest &&
+            (latest.state === 'settled' ||
+              latest.state === 'failed' ||
+              latest.state === 'cancelled' ||
+              latest.originTurnKey !== input.originTurnKey)
+          ) {
+            return
+          }
           if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
           if (e.kind === 'error') {
             error = e.error
@@ -12577,8 +12767,55 @@ export class Gateway {
     return { state, advice, jobId, error }
     } catch (err) {
       const detail = String((err as Error)?.message ?? err)
+      const observed = Boolean(liveBilling)
+      const current = consultStore.findById(input.consultId)
+      if (observed || current?.state === 'settled' || current?.state === 'settle_pending') {
+        try {
+          consultStore.update(input.consultId, {
+            state: current?.state === 'settled' ? 'settled' : 'settle_pending',
+            billingRequestId: input.requestId,
+            advice: advice || current?.advice || null,
+          })
+        } catch {
+          /* keep HTTP advice even if the local projection write fails again */
+        }
+        if (jobs && jobId) {
+          const spawnFailSnap = jobs.snapshotOf(jobId)
+          const spawnFailFence =
+            spawnFailSnap?.claimToken
+              ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+              : undefined
+          try {
+            jobs.complete(
+              jobId,
+              {
+                httpStatus: 200,
+                body: {
+                  ok: true,
+                  advice,
+                  consultId: input.consultId,
+                  settlePending: current?.state !== 'settled',
+                },
+              },
+              spawnFailFence,
+            )
+          } catch {
+            /* job already terminal */
+          }
+        }
+        return {
+          state: current?.state === 'settled' ? 'settled' : 'settle_pending',
+          advice,
+          jobId,
+          error: detail,
+        }
+      }
       await input.billingApi.abandon(input.requestId).catch(() => {})
-      consultStore.update(input.consultId, { state: 'failed' })
+      try {
+        consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
+      } catch {
+        /* persist best-effort */
+      }
       if (jobs && jobId) {
         const spawnFailSnap = jobs.snapshotOf(jobId)
         const spawnFailFence =
@@ -12595,6 +12832,7 @@ export class Gateway {
       }
       return { state: 'failed', advice: '', jobId, error: detail }
     } finally {
+      this._advisorConsultAborts?.delete(advisorSessionKey)
       unregister?.()
       if (slotHeld) this._releaseDelegateSlot(slotOpts)
       await this.sessions.destroySession(advisorSessionKey).catch(() => {})
@@ -12628,10 +12866,12 @@ export class Gateway {
       try {
         const doc = store.read()
         const sessionId = url.searchParams.get('sessionId') ?? undefined
+        let parentEngine: string | undefined
         if (sessionId) {
-          const owned = await getClientSession(sessionId, userId)
-          if (!owned) return this.sendError(res, 404, 'session not found')
-          if (owned.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
+          const parent = await this._parentEngineForCollabSession({ sessionId, userId })
+          if (parent.missing) return this.sendError(res, 404, 'session not found')
+          if (parent.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
+          parentEngine = parent.engine
         }
         const resolved = resolveSessionCollab(doc, sessionId)
         const listed = await catalogOptions()
@@ -12641,8 +12881,7 @@ export class Gateway {
           defaultAdvisorModel: doc.defaultAdvisorModel,
           session: resolved,
           advisorModels: listed.advisorModels,
-          advisorConsultParents: [...ADVISOR_CONSULT_PARENT_ENGINES],
-          advisorConsultParentReason: ADVISOR_CONSULT_PARENT_REASON,
+          ...this._collaborationCapabilityFields({ sessionId, engine: parentEngine }),
           ...(listed.advisorUnavailableReason
             ? { advisorUnavailableReason: listed.advisorUnavailableReason }
             : {}),
@@ -12681,6 +12920,20 @@ export class Gateway {
       parsed.mode === 'advisor' && typeof parsed.advisorModel === 'string'
         ? parsed.advisorModel.trim()
         : null
+    const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined
+    let parentEngine: string | undefined
+    if (sessionId) {
+      const parent = await this._parentEngineForCollabSession({ sessionId, userId })
+      if (parent.missing) return this.sendError(res, 404, 'session not found')
+      if (parent.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
+      parentEngine = parent.engine
+      if (parsed.mode === 'advisor') {
+        const gate = advisorConsultParentGate(parentEngine)
+        if (!gate.allowed) {
+          return this.sendError(res, 409, gate.reason || ADVISOR_CONSULT_PARENT_REASON)
+        }
+      }
+    }
     if (parsed.mode === 'advisor') {
       const listed = await catalogOptions()
       const allowed = assertAdvisorModelAllowed({
@@ -12698,12 +12951,6 @@ export class Gateway {
         ? parsed.expectedRev
         : undefined
     try {
-      const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined
-      if (sessionId) {
-        const owned = await getClientSession(sessionId, userId)
-        if (!owned) return this.sendError(res, 404, 'session not found')
-        if (owned.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
-      }
       const next = await store.putIntent({
         sessionId,
         asDefault: parsed.asDefault === true,
@@ -12717,6 +12964,7 @@ export class Gateway {
         defaultMode: next.defaultMode,
         defaultAdvisorModel: next.defaultAdvisorModel,
         session: resolveSessionCollab(next, sessionId),
+        ...this._collaborationCapabilityFields({ sessionId, engine: parentEngine }),
         advisorModels: listed.advisorModels,
         ...(listed.advisorUnavailableReason
           ? { advisorUnavailableReason: listed.advisorUnavailableReason }

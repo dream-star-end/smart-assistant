@@ -78,6 +78,7 @@ import {
   readGatewayToken,
 } from './gatewayClient.js'
 import { resolveConsultInvocationId } from './consultInvocation.js'
+import { consultAdvisorUntilAdvice } from './consultAdvisorClient.js'
 import {
   askUserHttpTimeoutMs,
   askUserToolPostedFallback,
@@ -852,32 +853,15 @@ async function handleConsultAdvisor(
     [CONSULT_INVOCATION_HEADER]: invocation.invocationId,
   }
   try {
-    const res = await postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
-      headers,
-      body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
-      timeoutMs: 10 * 60_000,
+    const result = await consultAdvisorUntilAdvice({
+      post: () =>
+        postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
+          headers,
+          body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
+          timeoutMs: 10 * 60_000,
+        }),
     })
-    const text = res.body || ''
-    if (res.statusCode >= 400) {
-      return toolError(`consult_advisor failed (${res.statusCode}): ${text.slice(0, 2000)}`)
-    }
-    try {
-      const parsed = JSON.parse(text) as {
-        advice?: string
-        error?: string
-        missing?: string[]
-        reused?: boolean
-        status?: string
-      }
-      if (parsed.error && !parsed.advice) return toolError(parsed.error)
-      const missing =
-        Array.isArray(parsed.missing) && parsed.missing.length
-          ? `\n【缺失证据】${parsed.missing.join(', ')}`
-          : ''
-      return toolOk(`${parsed.advice || text}${missing}`)
-    } catch {
-      return toolOk(text)
-    }
+    return result.ok ? toolOk(result.text) : toolError(result.text)
   } catch (err: unknown) {
     return toolError(`consult_advisor transport: ${describeDelegateTransportError(err)}`)
   }

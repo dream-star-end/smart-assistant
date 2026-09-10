@@ -123,4 +123,43 @@ describe('advisorConsultStore', () => {
     assert.equal(one.record.consultId, two.record.consultId)
     store.close()
   })
+
+  it('two sqlite connections racing insertNew reuse one invocation row', async () => {
+    const { Worker } = await import('node:worker_threads')
+    const { fileURLToPath } = await import('node:url')
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-race-'))
+    const dbPath = join(dir, 'advisor-consults.db')
+    const schema = new AdvisorConsultStore(dbPath)
+    schema.close()
+    const a = sample(dir, { invocationId: 'inv-conn-race', consultId: mintConsultId() })
+    const b = sample(dir, { invocationId: 'inv-conn-race', consultId: mintConsultId() })
+    const workerPath = fileURLToPath(new URL('./advisorConsultInsertWorker.mjs', import.meta.url))
+    const run = (record: AdvisorConsultRecord) =>
+      new Promise<{ reused: boolean; consultId: string }>((resolve, reject) => {
+        const worker = new Worker(workerPath, {
+          workerData: { dbPath, record },
+        })
+        worker.on('message', resolve)
+        worker.on('error', reject)
+        worker.on('exit', (code) => {
+          if (code !== 0) reject(new Error(`insert worker exit ${code}`))
+        })
+      })
+    const [one, two] = await Promise.all([run(a), run(b)])
+    const reused = [one, two].filter((row) => row.reused)
+    assert.equal(reused.length, 1, JSON.stringify({ one, two }))
+    assert.equal(one.consultId, two.consultId)
+    const verify = new AdvisorConsultStore(dbPath)
+    try {
+      const rec = verify.findByInvocation({
+        userId: '3',
+        originTurnKey: 'tk-1',
+        invocationId: 'inv-conn-race',
+      })
+      assert.ok(rec)
+      assert.equal(rec?.consultId, one.consultId)
+    } finally {
+      verify.close()
+    }
+  })
 })

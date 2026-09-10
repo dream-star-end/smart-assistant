@@ -10,6 +10,7 @@ import {
   assertAdvisorModelAllowed,
   coerceHistoryMessages,
   isAdvisorConsultParentEngine,
+  advisorConsultParentGate,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
   extractGeneratedPaths,
@@ -146,6 +147,10 @@ describe('advisorMode snapshot', () => {
     assert.equal(isAdvisorConsultParentEngine('codex'), false)
     assert.equal(isAdvisorConsultParentEngine('grok'), false)
     assert.equal(isAdvisorConsultParentEngine('cursor'), false)
+    assert.equal(advisorConsultParentGate('ccb').allowed, true)
+    assert.equal(advisorConsultParentGate('codex').allowed, false)
+    assert.equal(advisorConsultParentGate(undefined).allowed, false)
+    assert.match(String(advisorConsultParentGate(undefined).reason), /未知/)
   })
 
   it('assertAdvisorModelAllowed refuses silent fallback when the requested slug is absent', () => {

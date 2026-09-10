@@ -21,6 +21,7 @@ import {
 } from '../delegateContext.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
+import { SessionManager } from '../sessionManager.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-advisor-route'
 const TURN_KEY = 'a'.repeat(64)
@@ -186,6 +187,7 @@ async function makeGateway(opts?: {
     ) => {
       gw._lastSubmitRequestId = requestId
       gw._submitOnEvent = onEvent
+      gw._submitCount = (gw._submitCount ?? 0) + 1
       if (opts?.submitError) throw opts.submitError
       if (opts?.hangSubmit) {
         await new Promise(() => {})
@@ -636,5 +638,357 @@ describe('advisor consult route lifecycle', () => {
     assert.equal(r.status, 409)
     assert.match(String(r.body.error), /CCB/)
     assert.equal(billing.admits.length, 0)
+  })
+})
+
+describe('M4c recovery contracts', () => {
+  it('config load failure after admit releases billing ownership', async () => {
+    const { gw, billing } = await makeGateway()
+    gw._getAgentsConfig = async () => {
+      throw new Error('injected config read failure')
+    }
+    let actual: unknown
+    try {
+      actual = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, consultHeaders())
+    } catch (e) {
+      actual = String(e)
+    }
+    try {
+      assert.equal(billing.admits.length, 1)
+      assert.equal(billing.abandons.length, 1, 'accepted request must be abandoned when no child spawned')
+      assert.equal(gw._spawnCount ?? 0, 0)
+      if (typeof actual === 'object' && actual && 'body' in actual) {
+        assert.equal((actual as { body: { status?: string } }).body.status, 'failed')
+      }
+    } finally {
+      gw._advisorConsults.close()
+    }
+  })
+
+  it('persist failure after settled usage must never abandon that usage', async () => {
+    const { gw, billing } = await makeGateway()
+    const orig = gw._advisorConsults.update.bind(gw._advisorConsults)
+    let injected = false
+    gw._advisorConsults.update = (id: string, patch: { state?: string }) => {
+      if (patch.state === 'settled' && !injected) {
+        injected = true
+        throw new Error('injected local write failure')
+      }
+      return orig(id, patch)
+    }
+    const actual = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders(),
+    )
+    try {
+      assert.equal(billing.settles.length, 1)
+      assert.equal(billing.abandons.length, 0, 'usage observed/settled must not go through abandon')
+      assert.equal(actual.body.advice, 'check the assertion first')
+      assert.notEqual(actual.body.status, 'failed')
+    } finally {
+      gw._advisorConsults.close()
+    }
+  })
+
+  it('replay past one wait budget is pending not success running JSON, then same invocation recovers advice', async () => {
+    const { gw, billing } = await makeGateway()
+    gw._advisorConsultWaitMs = 60
+    let entered!: () => void
+    let release!: () => void
+    const started = new Promise<void>((r) => {
+      entered = r
+    })
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    const orig = gw.sessions.submit
+    gw.sessions.submit = async (...args: unknown[]) => {
+      entered()
+      await gate
+      return orig(...args)
+    }
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-over-wait' })
+    const first = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    await started
+    const pending = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(pending.status, 202, JSON.stringify(pending.body))
+    assert.equal(pending.body.status, 'pending')
+    assert.equal(pending.body.reused, true)
+    assert.equal(pending.body.advice, undefined)
+    assert.equal(pending.body.recoverable, true)
+    release()
+    const firstResult = await first
+    const after = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    try {
+      assert.equal(firstResult.body.advice, 'check the assertion first')
+      assert.equal(after.body.advice, 'check the assertion first')
+      assert.equal(after.body.reused, true)
+      assert.equal(billing.admits.length, 1)
+    } finally {
+      gw._advisorConsults.close()
+    }
+  })
+
+  it('GET/PUT consume parent engine capability: non-CCB session cannot select advisor', async () => {
+    const { gw } = await makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent.providerTag = 'codex'
+    const get = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
+    assert.equal(get.status, 200, JSON.stringify(get.body))
+    assert.equal(get.body.advisorConsultAllowed, false)
+    assert.equal(get.body.parentEngine, 'codex')
+    assert.deepEqual(get.body.advisorConsultParents, ['ccb'])
+    const before = gw._advisorConfig.read()
+    const put = await http(gw, 'PUT', '/api/collaboration-config', {
+      sessionId: 'wsess-advisor-route',
+      mode: 'advisor',
+      advisorModel: 'gpt-6-astra',
+      expectedRev: 0,
+    })
+    assert.equal(put.status, 409, JSON.stringify(put.body))
+    assert.match(String(put.body.error), /CCB|未知/)
+    assert.equal(gw._advisorConfig.read().rev, before.rev)
+    parent.providerTag = 'ccb'
+    const allowed = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
+    assert.equal(allowed.body.advisorConsultAllowed, true)
+  })
+
+  it('unknown explicit session parent engine fail-closes advisor PUT', async () => {
+    const { gw } = await makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent.providerTag = ''
+    const put = await http(gw, 'PUT', '/api/collaboration-config', {
+      sessionId: 'wsess-advisor-route',
+      mode: 'advisor',
+      advisorModel: 'gpt-6-astra',
+      expectedRev: 0,
+    })
+    assert.equal(put.status, 409, JSON.stringify(put.body))
+    assert.match(String(put.body.error), /未知|fail closed|CCB/)
+  })
+
+  it('SessionManager.interrupt drives consult cancelled without test-side resume', async () => {
+    const { gw, billing } = await makeGateway()
+    const sm = new SessionManager({
+      version: 1,
+      gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+      auth: { mode: 'subscription', claudeCodePath: '' },
+      sessions: { dbPath: '' },
+    } as never)
+    const waiters: Array<(err: Error) => void> = []
+    const runner = {
+      interrupt(): boolean {
+        const err = Object.assign(new Error('stopped'), { errorCode: 'USER_CANCELLED' })
+        for (const wait of waiters.splice(0)) wait(err)
+        return true
+      },
+      shutdown: async () => {},
+      off: () => {},
+      on: () => {},
+    }
+    const origGetOrCreate = gw.sessions.getOrCreate
+    const origGetByKey = gw.sessions.getByKey
+    gw.sessions.getByKey = (key: string) => origGetByKey(key) ?? sm.getByKey(key)
+    gw.sessions.getOrCreate = async (opts: { sessionKey: string }) => {
+      const session = await origGetOrCreate()
+      session.sessionKey = opts.sessionKey
+      session.runner = runner
+      ;(sm as unknown as { sessions: Map<string, unknown> }).sessions.set(opts.sessionKey, session)
+      return session
+    }
+    gw.sessions.interrupt = (key: string) => sm.interrupt(key)
+    gw.sessions.submit = async (_session: unknown, _payload: string, onEvent: (e: unknown) => void) => {
+      gw._submitCount = (gw._submitCount ?? 0) + 1
+      await new Promise<void>((_resolve, reject) => {
+        waiters.push((err) => {
+          onEvent({ kind: 'error', error: err.message, errorCode: (err as { errorCode?: string }).errorCode })
+          reject(err)
+        })
+      })
+    }
+    const pending = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, consultHeaders())
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(gw._interruptDelegationsForParent(PARENT_KEY), true)
+    const r = await pending
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'cancelled')
+    assert.equal(billing.abandons.length, 1)
+    assert.equal(gw._submitCount, 1)
+  })
+
+  it('Stop during getOrCreate does not later submit', async () => {
+    const { gw, billing } = await makeGateway()
+    let release!: () => void
+    let entered!: () => void
+    const started = new Promise<void>((r) => {
+      entered = r
+    })
+    gw.sessions.getOrCreate = async () => {
+      entered()
+      await new Promise<void>((r) => {
+        release = r
+      })
+      gw._spawnCount = (gw._spawnCount ?? 0) + 1
+      return {
+        agentId: 'advisor',
+        currentTurnStatus: null,
+        runner: { interrupt: () => {}, shutdown: () => {}, off: () => {}, on: () => {} },
+      }
+    }
+    const pending = http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-create-stop' }),
+    )
+    await started
+    gw._interruptDelegationsForParent(PARENT_KEY)
+    release()
+    const r = await pending
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'cancelled')
+    assert.equal(gw._submitCount ?? 0, 0)
+    assert.equal(billing.settles.length, 0)
+    assert.equal(billing.abandons.length, 1)
+  })
+
+  it('queued Stop still yields 0 spawn after capacity is released', async () => {
+    const { gw, billing } = await makeGateway()
+    gw._activeDelegations = 99
+    gw._delegateQueuePollMs = 10
+    const pending = http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-queue-stop-2' }),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    gw._interruptDelegationsForParent(PARENT_KEY)
+    gw._activeDelegations = 0
+    const r = await pending
+    assert.equal(r.body.status, 'cancelled')
+    assert.equal(gw._spawnCount ?? 0, 0)
+    assert.equal(gw._submitCount ?? 0, 0)
+    assert.equal(billing.settles.length, 0)
+  })
+
+  it('new store on the same sqlite file rereads settled advice', async () => {
+    const { gw, dir } = await makeGateway()
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-newproc' })
+    const first = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(first.body.status, 'settled')
+    const dbPath = join(dir, 'advisor-consults.db')
+    gw._advisorConsults.close()
+    const fresh = new (await import('../advisorConsultStore.js')).AdvisorConsultStore(dbPath)
+    try {
+      const rec = fresh.findById(first.body.consultId)
+      assert.equal(rec?.state, 'settled')
+      assert.equal(rec?.advice, 'check the assertion first')
+    } finally {
+      fresh.close()
+    }
+  })
+
+  it('admitted orphan with missing job is failed, not running or fake settled', async () => {
+    const { gw } = await makeGateway()
+    gw._advisorConsultWaitMs = 40
+    const inserted = gw._advisorConsults.insertNew({
+      consultId: 'advc-orphan-1',
+      invocationId: 'cinv-orphan-1',
+      userId: '3',
+      sessionKey: PARENT_KEY,
+      clientSessionId: 'wsess-advisor-route',
+      originTurnKey: TURN_KEY,
+      originTurnIndex: 1,
+      configVersion: 'v1:advisor:gpt-6-astra',
+      evidenceVersion: 'e'.repeat(64),
+      advisorModel: 'gpt-6-astra',
+      question: 'why red?',
+      concern: '',
+      snapshotJson: '{}',
+      jobId: 'dlgjob-missing',
+      billingRequestId: REQUEST_ID,
+      state: 'admitted',
+    })
+    assert.equal(inserted.reused, false)
+    const presented = await gw._presentExistingConsult({
+      record: inserted.record,
+      question: 'why red?',
+      concern: '',
+    })
+    assert.equal(presented.status, 200)
+    assert.equal(presented.body.status, 'failed')
+    assert.notEqual(presented.body.status, 'settled')
+    assert.equal(gw._advisorConsults.findById('advc-orphan-1').state, 'failed')
+  })
+
+  it('job failed is not mapped to settled', async () => {
+    const { gw } = await makeGateway()
+    gw._advisorConsultWaitMs = 80
+    const created = gw._delegateJobs.create('advisor', {
+      sessionKey: 'advisor:x',
+      parentSessionKey: PARENT_KEY,
+      kind: 'advisor',
+      callback: 'stdout-wait',
+      idempotencyKey: 'advc-jobfail',
+    })
+    assert.equal('jobId' in created, true)
+    const jobId = (created as { jobId: string }).jobId
+    const snap = gw._delegateJobs.snapshotOf(jobId)
+    const failed = gw._delegateJobs.fail(jobId, {
+      failureClass: 'child_error',
+      detail: 'child died',
+      httpStatus: 500,
+      body: { ok: false, error: 'child died' },
+      claimToken: snap?.claimToken,
+      fencingEpoch: snap?.fencingEpoch,
+    })
+    assert.equal(failed, true)
+    const view = gw._delegateJobs.get(jobId)
+    assert.ok(view.status === 'failed' || (view.status === 'done' && view.httpStatus >= 400))
+    const inserted = gw._advisorConsults.insertNew({
+      consultId: 'advc-jobfail',
+      invocationId: 'cinv-jobfail',
+      userId: '3',
+      sessionKey: PARENT_KEY,
+      clientSessionId: 'wsess-advisor-route',
+      originTurnKey: TURN_KEY,
+      originTurnIndex: 1,
+      configVersion: 'v1:advisor:gpt-6-astra',
+      evidenceVersion: 'f'.repeat(64),
+      advisorModel: 'gpt-6-astra',
+      question: 'why red?',
+      concern: '',
+      snapshotJson: '{}',
+      jobId,
+      billingRequestId: REQUEST_ID,
+      state: 'spawned',
+    })
+    const presented = await gw._presentExistingConsult({
+      record: inserted.record,
+      question: 'why red?',
+      concern: '',
+    })
+    assert.equal(presented.body.status, 'failed')
+    assert.notEqual(presented.body.status, 'settled')
+  })
+
+  it('settle_pending replay returns original advice and does not admit again', async () => {
+    const { gw, billing } = await makeGateway({ settleError: new Error('master 503') })
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-settle-pending-replay' })
+    const first = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(first.body.status, 'settle_pending')
+    const second = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(second.body.reused, true)
+    assert.equal(second.body.status, 'settle_pending')
+    assert.equal(second.body.advice, 'check the assertion first')
+    assert.equal(billing.admits.length, 1)
+    assert.equal(billing.settles.length, 1)
+    assert.equal(billing.abandons.length, 0)
   })
 })

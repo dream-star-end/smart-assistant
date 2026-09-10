@@ -22,6 +22,10 @@ export type CollaborationConfigDoc = {
   session: CollaborationSession;
   advisorModels?: AdvisorModelOption[];
   advisorUnavailableReason?: string;
+  advisorConsultParents?: string[];
+  advisorConsultParentReason?: string;
+  advisorConsultAllowed?: boolean;
+  parentEngine?: string;
 };
 
 export type CollabUiState = {
@@ -32,6 +36,10 @@ export type CollabUiState = {
   source: "session" | "default";
   advisorModels: AdvisorModelOption[];
   advisorUnavailableReason?: string;
+  advisorConsultParents: string[];
+  advisorConsultParentReason?: string;
+  advisorConsultAllowed?: boolean;
+  parentEngine?: string;
 };
 
 export const EMPTY_COLLAB_UI: CollabUiState = {
@@ -41,6 +49,7 @@ export const EMPTY_COLLAB_UI: CollabUiState = {
   configVersion: "",
   source: "default",
   advisorModels: [],
+  advisorConsultParents: [],
 };
 
 export function isCollabMode(value: unknown): value is CollabMode {
@@ -56,6 +65,10 @@ export function docToUiState(doc: CollaborationConfigDoc): CollabUiState {
     source: doc.session.source,
     advisorModels: Array.isArray(doc.advisorModels) ? doc.advisorModels : [],
     advisorUnavailableReason: doc.advisorUnavailableReason,
+    advisorConsultParents: Array.isArray(doc.advisorConsultParents) ? doc.advisorConsultParents : [],
+    advisorConsultParentReason: doc.advisorConsultParentReason,
+    advisorConsultAllowed: doc.advisorConsultAllowed,
+    parentEngine: doc.parentEngine,
   };
 }
 
@@ -107,6 +120,10 @@ export function sendCollabFields(input: {
   advisorModel: string | null;
   configVersion: string;
   advisorUnavailableReason?: string;
+  parentEngine?: string | null;
+  advisorConsultParents?: readonly string[];
+  advisorConsultAllowed?: boolean;
+  advisorConsultParentReason?: string;
 }): {
   teamMode: boolean;
   collabMode: CollabMode;
@@ -117,6 +134,19 @@ export function sendCollabFields(input: {
   const mode: CollabMode = input.agentId === "main" ? input.mode : "solo";
   if (mode !== "advisor") {
     return { teamMode: mode === "team", collabMode: mode };
+  }
+  const parentReason =
+    input.advisorConsultParentReason ||
+    "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
+  if (input.advisorConsultAllowed === false) {
+    return { teamMode: false, collabMode: "advisor", blockedReason: parentReason };
+  }
+  const parents = input.advisorConsultParents ?? [];
+  if (parents.length > 0) {
+    const engine = (input.parentEngine ?? "").trim();
+    if (!engine || !parents.includes(engine)) {
+      return { teamMode: false, collabMode: "advisor", blockedReason: parentReason };
+    }
   }
   if (input.advisorUnavailableReason) {
     return {

@@ -84,6 +84,22 @@ describe("AgentPicker 三态协作", () => {
     expect(onToggleTeamMode).not.toHaveBeenCalled();
   });
 
+  it("非 CCB 父引擎时顾问选项 disabled，点击不切换", async () => {
+    const onCollabModeChange = vi.fn();
+    renderPicker({
+      onCollabModeChange,
+      collabMode: "solo",
+      advisorConsultParents: ["ccb"],
+      parentEngine: "codex",
+      advisorConsultAllowed: false,
+      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+    });
+    const advisor = await screen.findByRole("button", { name: /一期仅 CCB/ });
+    expect(advisor).toBeDisabled();
+    fireEvent.click(advisor);
+    expect(onCollabModeChange).not.toHaveBeenCalled();
+  });
+
   it("顾问无可用型号时明示原因，不静默填 gpt-6-astra", async () => {
     renderPicker({
       onCollabModeChange: () => {},
