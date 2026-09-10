@@ -19,6 +19,40 @@ export interface BridgeApiAllowRule {
   proxyFromCommercial: boolean
 }
 
+/** Master-authored collaboration parent identity. Never forwarded from the browser. */
+export const COLLAB_BRIDGE_SESSION_HEADER = 'x-openclaude-collab-session-id'
+export const COLLAB_BRIDGE_AGENT_HEADER = 'x-openclaude-collab-agent-id'
+export const COLLAB_BRIDGE_MODEL_HEADER = 'x-openclaude-collab-model-id'
+
+export const COLLAB_BRIDGE_SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,80}$/
+export const COLLAB_BRIDGE_AGENT_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
+export const COLLAB_BRIDGE_MODEL_ID_RE = /^[A-Za-z0-9._-]{1,64}$/
+
+export type TrustedCollabParent = {
+  sessionId: string
+  agentId: string
+  modelId?: string
+}
+
+function headerValue(headers: Record<string, unknown>, name: string): string {
+  const raw = headers[name] ?? headers[name.toLowerCase()]
+  if (Array.isArray(raw)) return String(raw[0] ?? '').trim()
+  if (typeof raw === 'string') return raw.trim()
+  return ''
+}
+
+export function parseTrustedCollabParentHeaders(
+  headers: Record<string, unknown>,
+): TrustedCollabParent | undefined {
+  const sessionId = headerValue(headers, COLLAB_BRIDGE_SESSION_HEADER)
+  const agentId = headerValue(headers, COLLAB_BRIDGE_AGENT_HEADER)
+  const modelRaw = headerValue(headers, COLLAB_BRIDGE_MODEL_HEADER)
+  if (!COLLAB_BRIDGE_SESSION_ID_RE.test(sessionId)) return undefined
+  if (!COLLAB_BRIDGE_AGENT_ID_RE.test(agentId)) return undefined
+  if (modelRaw && !COLLAB_BRIDGE_MODEL_ID_RE.test(modelRaw)) return undefined
+  return { sessionId, agentId, ...(modelRaw ? { modelId: modelRaw } : {}) }
+}
+
 const M = (...methods: string[]) => new Set(methods)
 
 export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [

@@ -4,6 +4,11 @@ import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { describe, it } from 'node:test'
 import { type V3ContainerStatus, V3_CONTAINER_PORT } from '../agent-sandbox/v3supervisor.js'
+import {
+  COLLAB_BRIDGE_AGENT_HEADER,
+  COLLAB_BRIDGE_MODEL_HEADER,
+  COLLAB_BRIDGE_SESSION_HEADER,
+} from '@openclaude/gateway'
 import { containerApiProxy, matchContainerApiProxyRoute } from '../http/containerApiProxy.js'
 
 function makeReq(opts: {
@@ -294,5 +299,130 @@ describe('containerApiProxy', () => {
     )
     assert.equal(res.statusCode, 502)
     assert.equal(psk.equals(Buffer.alloc(psk.length)), true)
+  })
+
+  it('strips forged collab headers and attaches looked-up parent for collaboration-config', async () => {
+    const captured: { current?: { options: any; body: Buffer } } = {}
+    const httpRequestImpl = (options: any) => {
+      const req = new EventEmitter() as EventEmitter & {
+        write: (chunk: Buffer) => void
+        end: () => void
+        destroy: (err?: Error) => void
+      }
+      const chunks: Buffer[] = []
+      req.write = (chunk) => {
+        chunks.push(Buffer.from(chunk))
+      }
+      req.destroy = (err?: Error) => {
+        if (err) req.emit('error', err)
+      }
+      req.end = () => {
+        captured.current = { options, body: Buffer.concat(chunks) }
+        const upstream = Readable.from([Buffer.from('{"ok":true}')]) as Readable & {
+          statusCode: number
+          headers: Record<string, string>
+          socket: { setTimeout: () => void }
+        }
+        upstream.statusCode = 200
+        upstream.headers = { 'content-type': 'application/json' }
+        upstream.socket = { setTimeout() {} }
+        queueMicrotask(() => req.emit('response', upstream))
+      }
+      return req as any
+    }
+    const req = makeReq({
+      method: 'PUT',
+      url: '/api/collaboration-config',
+      headers: {
+        host: 'claudeai.chat',
+        authorization: 'Bearer commercial-token',
+        [COLLAB_BRIDGE_SESSION_HEADER]: 'forged',
+        [COLLAB_BRIDGE_AGENT_HEADER]: 'coder',
+        [COLLAB_BRIDGE_MODEL_HEADER]: 'evil-model',
+        'content-type': 'application/json',
+      },
+      body: Buffer.from(JSON.stringify({
+        sessionId: 'fresh-1',
+        mode: 'advisor',
+        advisorModel: 'gpt-6-astra',
+        expectedRev: 0,
+      })),
+    })
+    const res = makeRes()
+    await containerApiProxy(
+      req as any,
+      res as any,
+      makeCtx() as any,
+      {
+        v3: {} as any,
+        bridgeSecret: 'bridge-secret',
+        getStatus: async () => makeStatus(),
+        httpRequestImpl: httpRequestImpl as any,
+        lookupCollabSessionParent: async ({ uid, sessionId }) => {
+          assert.equal(uid, 7n)
+          assert.equal(sessionId, 'fresh-1')
+          return { agentId: 'main', modelId: 'glm-5.2' }
+        },
+      },
+      7n,
+    )
+    assert.equal(res.statusCode, 200)
+    if (!captured.current) throw new Error('upstream request was not captured')
+    const headers = captured.current.options.headers as Record<string, string>
+    assert.equal(headers.authorization, undefined)
+    assert.equal(headers[COLLAB_BRIDGE_SESSION_HEADER], 'fresh-1')
+    assert.equal(headers[COLLAB_BRIDGE_AGENT_HEADER], 'main')
+    assert.equal(headers[COLLAB_BRIDGE_MODEL_HEADER], 'glm-5.2')
+  })
+
+  it('fail-closes collab-config when owner is missing or lookup throws', async () => {
+    let dispatched = 0
+    const httpRequestImpl = (() => {
+      dispatched += 1
+      throw new Error('should not dispatch')
+    }) as any
+    const missing = makeRes()
+    await containerApiProxy(
+      makeReq({
+        method: 'GET',
+        url: '/api/collaboration-config?sessionId=missing-1',
+      }) as any,
+      missing as any,
+      makeCtx() as any,
+      {
+        v3: {} as any,
+        bridgeSecret: 'bridge-secret',
+        getStatus: async () => makeStatus(),
+        httpRequestImpl,
+        lookupCollabSessionParent: async () => null,
+      },
+      7n,
+    )
+    assert.equal(missing.statusCode, 404)
+    assert.match(missing.body.toString(), /SESSION_NOT_FOUND/)
+
+    const boom = makeRes()
+    await containerApiProxy(
+      makeReq({
+        method: 'GET',
+        url: '/api/collaboration-config?sessionId=boom-1',
+      }) as any,
+      boom as any,
+      makeCtx() as any,
+      {
+        v3: {} as any,
+        bridgeSecret: 'bridge-secret',
+        getStatus: async () => makeStatus(),
+        httpRequestImpl,
+        lookupCollabSessionParent: async () => {
+          throw new Error('pg unavailable')
+        },
+      },
+      7n,
+    )
+    assert.equal(boom.statusCode, 503)
+    assert.match(boom.body.toString(), /COLLAB_SESSION_LOOKUP_FAILED/)
+    assert.notEqual(boom.statusCode, 401)
+    assert.equal(dispatched, 0)
   })
 })

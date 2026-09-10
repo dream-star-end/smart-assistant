@@ -539,7 +539,7 @@ import {
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
-import { matchBridgeApiAllowlist } from './bridgeApiAllowlist.js'
+import { matchBridgeApiAllowlist, parseTrustedCollabParentHeaders } from './bridgeApiAllowlist.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
@@ -12121,7 +12121,16 @@ export class Gateway {
   private async _parentEngineForCollabSession(input: {
     sessionId: string
     userId: string
+    req: IncomingMessage
+    url: URL
   }): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
+    const bridgeVerified = this.checkBridgeBypass(input.req, input.url)
+    if (bridgeVerified) {
+      const trusted = parseTrustedCollabParentHeaders(input.req.headers as Record<string, unknown>)
+      if (!trusted || trusted.sessionId !== input.sessionId) return { missing: true }
+      const fromCatalog = await this._catalogEngineForModel(trusted.modelId)
+      return { missing: false, agentId: trusted.agentId, engine: fromCatalog }
+    }
     const live = this._liveMainSessionForClient(input.sessionId, input.userId)
     let stored: { agentId?: string; modelId?: string } | null | undefined
     try {
@@ -13085,7 +13094,7 @@ export class Gateway {
         const sessionId = url.searchParams.get('sessionId') ?? undefined
         let parentEngine: string | undefined
         if (sessionId) {
-          const parent = await this._parentEngineForCollabSession({ sessionId, userId })
+          const parent = await this._parentEngineForCollabSession({ sessionId, userId, req, url })
           if (parent.missing) return this.sendError(res, 404, 'session not found')
           if (parent.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
           parentEngine = parent.engine
@@ -13140,7 +13149,7 @@ export class Gateway {
     const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined
     let parentEngine: string | undefined
     if (sessionId) {
-      const parent = await this._parentEngineForCollabSession({ sessionId, userId })
+      const parent = await this._parentEngineForCollabSession({ sessionId, userId, req, url })
       if (parent.missing) return this.sendError(res, 404, 'session not found')
       if (parent.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
       parentEngine = parent.engine

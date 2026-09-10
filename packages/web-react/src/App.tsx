@@ -941,6 +941,8 @@ export function App() {
             toast("协作配置有更新，已重新读取，请再选一次", "error");
             return;
           } catch (rereadErr) {
+            if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
             const msg = apiErrorMessage(rereadErr, "协作配置冲突后重读失败");
             setCollabUi(previous);
             setTeamModeState(previous.mode === "team");
@@ -983,6 +985,7 @@ export function App() {
       advisorConsultParentReason: cur.advisorConsultParentReason,
     }));
     setTeamModeState(enabled);
+    setCollabAsDefault(false);
     // auth is null until login/boot getMe (useAuth). authRef always holds the
     // MemoryAuthSession, including the anonymous epoch-0 object — do not GET on it.
     if (demo || !auth) return;

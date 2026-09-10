@@ -45,6 +45,11 @@ process.env.OPENCLAUDE_HOME = home
 const { Gateway } = await import('../server.js')
 const { signJwt } = await import('../auth.js')
 const { _setModelCatalogClientForTests } = await import('../modelCatalogClient.js')
+const {
+  COLLAB_BRIDGE_AGENT_HEADER,
+  COLLAB_BRIDGE_MODEL_HEADER,
+  COLLAB_BRIDGE_SESSION_HEADER,
+} = await import('../bridgeApiAllowlist.js')
 
 const ACCESS = 'test-gateway-access-collab-http'
 const jwt3 = signJwt({ userId: '3', exp: Math.floor(Date.now() / 1000) + 3600 }, ACCESS)
@@ -275,6 +280,74 @@ describe('Gateway HTTP collaboration-config ACCESS/default identity', () => {
         expectedRev: 999,
       })
       assert.equal(cas.status, 409)
+    })
+  })
+
+  it('bridge trusted parent lets missing local row read/write; forged ACCESS metadata does not', async () => {
+    process.env.OPENCLAUDE_TRUST_BRIDGE_IP = '127.0.0.1'
+    process.env.OC_CONTAINER_ID = '3'
+    process.env.OC_BRIDGE_NONCE = NONCE
+    await withServer(async (base) => {
+      const sid = 'bridgefresh1'
+      const trusted = {
+        'x-openclaude-container-id': '3',
+        'x-openclaude-bridge-nonce': NONCE,
+        [COLLAB_BRIDGE_SESSION_HEADER]: sid,
+        [COLLAB_BRIDGE_AGENT_HEADER]: 'main',
+        [COLLAB_BRIDGE_MODEL_HEADER]: 'glm-5.2',
+        'content-type': 'application/json',
+      }
+      const get = await json(base, 'GET', `/api/collaboration-config?sessionId=${sid}`, trusted)
+      assert.equal(get.status, 200, JSON.stringify(get.body))
+      assert.equal(get.body.session.mode, 'solo')
+
+      const put = await json(base, 'PUT', '/api/collaboration-config', trusted, {
+        sessionId: sid,
+        mode: 'advisor',
+        advisorModel: 'gpt-6-astra',
+        expectedRev: get.body.rev,
+      })
+      assert.equal(put.status, 200, JSON.stringify(put.body))
+      assert.equal(put.body.session.mode, 'advisor')
+
+      const mismatch = await json(base, 'GET', `/api/collaboration-config?sessionId=${sid}`, {
+        ...trusted,
+        [COLLAB_BRIDGE_SESSION_HEADER]: 'other-session',
+      })
+      assert.equal(mismatch.status, 404)
+
+      const noMeta = await json(base, 'GET', `/api/collaboration-config?sessionId=${sid}-missing`, {
+        'x-openclaude-container-id': '3',
+        'x-openclaude-bridge-nonce': NONCE,
+        'content-type': 'application/json',
+      })
+      assert.equal(noMeta.status, 404)
+
+      const coder = await json(base, 'GET', `/api/collaboration-config?sessionId=${sid}`, {
+        ...trusted,
+        [COLLAB_BRIDGE_AGENT_HEADER]: 'coder',
+      })
+      assert.equal(coder.status, 400)
+    })
+  })
+
+  it('ACCESS forged collab metadata cannot mint a missing session', async () => {
+    await withServer(async (base) => {
+      const forged = {
+        authorization: `Bearer ${ACCESS}`,
+        'content-type': 'application/json',
+        [COLLAB_BRIDGE_SESSION_HEADER]: 'forged-sid',
+        [COLLAB_BRIDGE_AGENT_HEADER]: 'main',
+        [COLLAB_BRIDGE_MODEL_HEADER]: 'glm-5.2',
+      }
+      const get = await json(base, 'GET', '/api/collaboration-config?sessionId=forged-sid', forged)
+      assert.equal(get.status, 404)
+      const put = await json(base, 'PUT', '/api/collaboration-config', forged, {
+        sessionId: 'forged-sid',
+        mode: 'team',
+        expectedRev: 0,
+      })
+      assert.equal(put.status, 404)
     })
   })
 })

@@ -11597,6 +11597,29 @@ export function createPgSessionsBackend(
         : read(pool);
     },
 
+    async getClientSessionCollabParent(sessionId, userId) {
+      const row = (
+        await pool.query<{
+          id: string;
+          user_id: string;
+          agent_id: string;
+          model_id: string | null;
+        }>(
+          `SELECT id, user_id, agent_id, model_id
+             FROM client_sessions
+            WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+          [sessionId, userId],
+        )
+      ).rows[0];
+      if (!row) return null;
+      return {
+        sessionId: row.id,
+        userId: row.user_id,
+        agentId: row.agent_id,
+        ...(row.model_id ? { modelId: row.model_id } : {}),
+      };
+    },
+
     async classifyClientSessions(
       refs: readonly ClientSessionLifecycleRef[],
     ): Promise<ClientSessionLifecycle[]> {

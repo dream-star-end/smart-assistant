@@ -20,6 +20,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 // request logger. master HTTP segment is the ONLY commercial path that reads
 // X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
 import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
+import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
@@ -1891,6 +1892,14 @@ export function createCommercialHandler(
               selfHostId: selfHostIdForProxy,
               getHostById: computePoolGetHostById,
               tunnelDial: defaultTunnelDial,
+              lookupCollabSessionParent: async ({ uid, sessionId }) => {
+                const row = await getClientSessionCollabParent(sessionId, `c:${uid.toString()}`)
+                if (!row) return null
+                return {
+                  agentId: row.agentId,
+                  ...(row.modelId ? { modelId: row.modelId } : {}),
+                }
+              },
             },
             BigInt(claims.sub),
           )

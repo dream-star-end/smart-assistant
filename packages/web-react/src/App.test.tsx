@@ -243,11 +243,28 @@ afterEach(() => {
   sessionStorage.removeItem('oc_v5_pending_case')
 })
 
-async function loginViaUi() {
+const LOGIN_B = okJson({
+  user: {
+    id: 'u2',
+    email: 'b@c.com',
+    email_verified: true,
+    role: 'user',
+    display_name: 'Bob',
+    avatar_url: null,
+    credits: '300',
+    created_at: '2026-01-01T00:00:00.000Z',
+  },
+  access_token: 'tok-b',
+  access_exp: 1234,
+  refresh_exp: 5678,
+  remember: false,
+})
+
+async function loginViaUi(email = 'a@b.com') {
   // 启动静默续期期间是 splash(无 Landing):等 refresh 401 落定、Landing 出现再点。
   const landingLogin = await screen.findByRole('button', { name: '登录' })
   fireEvent.click(landingLogin) // Landing 登录 → AuthGate
-  fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
+  fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: email } })
   fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
   // 正常路径等公开配置（turnstile_bypass）就绪后提交；异常路径另有“点一次后自动恢复”用例。
   const submit = screen.getByRole('button', { name: '登录' })
@@ -255,6 +272,13 @@ async function loginViaUi() {
   await act(async () => {
     fireEvent.click(submit)
   })
+}
+
+function requestToken(init?: RequestInit): string {
+  const raw = (init?.headers as Record<string, string> | undefined)?.authorization
+    ?? (init?.headers as Record<string, string> | undefined)?.Authorization
+    ?? ''
+  return String(raw).replace(/^Bearer\s+/i, '')
 }
 
 async function openAgentPicker() {
@@ -841,6 +865,136 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     await openAgentPicker()
     expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
     expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  test('stale CAS reread after logout cannot restore previous team into the next identity', { timeout: 45_000 }, async () => {
+    let releaseReread!: () => void
+    const hangReread = new Promise<void>((resolve) => {
+      releaseReread = resolve
+    })
+    let casArmed = false
+    const collabPuts: Array<{ token: string; body: Record<string, unknown> }> = []
+    const base = routedFetch({
+      models: {
+        models: [
+          ...MODELS.models,
+          { id: 'glm-5.2', display_name: 'GLM-5.2', engine: 'ccb' },
+        ],
+      },
+    })
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const token = requestToken(init)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { email?: string }
+        return body.email === 'b@c.com' ? LOGIN_B : LOGIN_OK
+      }
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/me') && !u.includes('/api/me/')) {
+        if (token === 'tok-b') {
+          return okJson({ user: { id: 'u2', email: 'b@c.com', role: 'user', display_name: 'Bob', credits: '300' } })
+        }
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      if (/\/api\/sessions\/[^/]+$/.test(u) && method === 'PUT') return okJson({ ok: true, applied: true })
+      if (u.includes('/api/collaboration-config') && method === 'PUT') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+        collabPuts.push({ token, body })
+        if (body.mode === 'solo' && body.asDefault === true) {
+          casArmed = true
+          return errJson(409, { error: 'cas conflict' })
+        }
+        return okJson(
+          collabDoc({
+            rev: 2,
+            session: {
+              mode: body.mode,
+              advisorModel: null,
+              configVersion: `v1:${String(body.mode)}:`,
+              source: body.sessionId ? 'session' : 'default',
+            },
+          }),
+        )
+      }
+      if (u.includes('/api/collaboration-config') && method === 'GET') {
+        if (casArmed && token === 'tok-1') {
+          await hangReread
+          return okJson(
+            collabDoc({
+              session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'session' },
+              defaultMode: 'team',
+            }),
+          )
+        }
+        if (token === 'tok-b') {
+          return okJson(
+            collabDoc({
+              session: { mode: 'solo', advisorModel: null, configVersion: 'v1:solo:', source: 'default' },
+              defaultMode: 'solo',
+            }),
+          )
+        }
+        return okJson(
+          collabDoc({
+            session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'default' },
+            defaultMode: 'team',
+          }),
+        )
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi('a@b.com')
+    const ta = await screen.findByPlaceholderText('和「全能助手」对话…')
+    await waitFor(() => expect(ta).not.toBeDisabled())
+    fireEvent.change(ta, { target: { value: 'A 开场' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    })
+    await waitFor(() => expect(screen.getAllByText('A 开场').length).toBeGreaterThan(0))
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+    const asDefaultBox = screen.getByLabelText(/同时作为新会话默认/)
+    fireEvent.click(asDefaultBox)
+    await waitFor(() => expect(asDefaultBox).toBeChecked())
+    fireEvent.click(soloChoice())
+    await waitFor(() => expect(casArmed).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切 Astra/ })).not.toBeInTheDocument())
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
+      button: 0,
+      pointerType: 'mouse',
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
+    await loginViaUi('b@c.com')
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await openAgentPicker()
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+
+    const putsBeforeRelease = collabPuts.filter((row) => row.token === 'tok-b').length
+    releaseReread()
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    const tb = await screen.findByPlaceholderText('和「全能助手」对话…')
+    fireEvent.change(tb, { target: { value: 'B 新消息' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    })
+    await waitFor(() => expect(screen.getAllByText('B 新消息').length).toBeGreaterThan(0))
+    const bPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
+    expect(bPuts.every((row) => row.body.mode !== 'team' && row.body.asDefault !== true)).toBe(true)
   })
 
   test('server collaboration config wins over legacy localStorage team flag', async () => {
