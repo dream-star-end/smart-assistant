@@ -1,6 +1,7 @@
 /**
- * M4e: original consult token survives process restart without shared HMAC keys.
- * Billing 2xx receipts project settle_pending without a manual Gateway hook.
+ * M4f: existing consult recovery requires current HMAC or the exact stored
+ * token receipt. Direct-insert rows without a receipt are 401 after key
+ * rotation. Billing 2xx projection is unchanged.
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
@@ -15,6 +16,7 @@ import { CONSULT_INVOCATION_HEADER } from '@openclaude/protocol'
 import { AdvisorConsultStore, hashEvidence, mintConsultId } from '../advisorConsultStore.js'
 import {
   DELEGATE_CONTEXT_HEADER,
+  hashConsultTurnToken,
   inspectConsultTurnToken,
   issueConsultTurnToken,
   resetDelegateContextKeyForTests,
@@ -109,42 +111,72 @@ async function replay(opts: {
   return { status, body, recordState: rec?.state }
 }
 
+function mintToken() {
+  return issueConsultTurnToken({
+    agentId: 'main',
+    sessionKey: SESSION,
+    depth: 0,
+    turnKey: TURN,
+    turnIndex: 1,
+    collabMode: 'advisor',
+    configVersion: 'v1:advisor:gpt-6-astra',
+  })
+}
+
+function forgeToken(token: string, mutate?: (claims: Record<string, unknown>) => void): string {
+  const payloadB64 = token.slice(0, token.lastIndexOf('.'))
+  const claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as Record<
+    string,
+    unknown
+  >
+  mutate?.(claims)
+  return `${Buffer.from(JSON.stringify(claims)).toString('base64url')}.invented-signature`
+}
+
 describe('advisor consult restart recovery', () => {
-  it('original token rereads settled advice after HMAC key rotation without a parent', async () => {
+  it('direct-insert settled row without receipt is 401 after HMAC rotation', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-adv-restart-'))
     const store = new AdvisorConsultStore(join(dir, 'advisor.db'))
     store.insertNew(settledRow())
-    const token = issueConsultTurnToken({
-      agentId: 'main',
-      sessionKey: SESSION,
-      depth: 0,
-      turnKey: TURN,
-      turnIndex: 1,
-      collabMode: 'advisor',
-      configVersion: 'v1:advisor:gpt-6-astra',
-    })
+    const token = mintToken()
     store.close()
     resetDelegateContextKeyForTests()
     assert.equal(inspectConsultTurnToken(token)?.hmacOk, false)
     const got = await replay({ dir, token })
-    assert.equal(got.status, 200, JSON.stringify(got.body))
-    assert.equal(got.body.advice, 'ORIGINAL_ADVICE')
+    assert.equal(got.status, 401, JSON.stringify(got.body))
     assert.equal(got.recordState, 'settled')
   })
 
-  it('rejects expired, forged, other-user, unknown invocation, and new consults without HMAC', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-neg-'))
+  it('current HMAC still presents a no-receipt old row; remint after receipt is 401', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-hmac-live-'))
     const store = new AdvisorConsultStore(join(dir, 'advisor.db'))
     store.insertNew(settledRow())
-    const token = issueConsultTurnToken({
-      agentId: 'main',
-      sessionKey: SESSION,
-      depth: 0,
-      turnKey: TURN,
-      turnIndex: 1,
-      collabMode: 'advisor',
-      configVersion: 'v1:advisor:gpt-6-astra',
-    })
+    const token = mintToken()
+    store.close()
+    const live = await replay({ dir, token })
+    assert.equal(live.status, 200, JSON.stringify(live.body))
+    assert.equal(live.body.advice, 'ORIGINAL_ADVICE')
+
+    const withReceipt = await mkdtemp(join(tmpdir(), 'oc-adv-receipt-live-'))
+    const stored = new AdvisorConsultStore(join(withReceipt, 'advisor.db'))
+    const original = mintToken()
+    stored.insertNew(settledRow({ tokenReceipt: hashConsultTurnToken(original) }))
+    stored.close()
+    const reminted = mintToken()
+    assert.equal(inspectConsultTurnToken(reminted)?.hmacOk, true)
+    assert.notEqual(hashConsultTurnToken(reminted), hashConsultTurnToken(original))
+    const remintGot = await replay({ dir: withReceipt, token: reminted })
+    assert.equal(remintGot.status, 401, JSON.stringify(remintGot.body))
+    const originalGot = await replay({ dir: withReceipt, token: original })
+    assert.equal(originalGot.status, 200, JSON.stringify(originalGot.body))
+    assert.equal(originalGot.body.advice, 'ORIGINAL_ADVICE')
+  })
+
+  it('rejects signature-only, exp-extend, missing receipt, wrong receipt, other user', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-neg-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor.db'))
+    const token = mintToken()
+    store.insertNew(settledRow())
     const expired = issueConsultTurnToken({
       agentId: 'main',
       sessionKey: SESSION,
@@ -158,28 +190,65 @@ describe('advisor consult restart recovery', () => {
     store.close()
     await new Promise((r) => setTimeout(r, 5))
     resetDelegateContextKeyForTests()
+    assert.equal(inspectConsultTurnToken(token)?.hmacOk, false)
+
+    const missingReceipt = await replay({ dir, token })
+    assert.equal(missingReceipt.status, 401)
+
+    const sigOnly = await replay({ dir, token: forgeToken(token) })
+    assert.equal(sigOnly.status, 401)
+
+    const expExtended = await replay({
+      dir,
+      token: forgeToken(token, (claims) => {
+        claims.exp = Date.now() + 3_600_000
+      }),
+    })
+    assert.equal(expExtended.status, 401)
 
     const other = await replay({ dir, token, userId: '9' })
     assert.equal(other.status, 401)
 
-    const conflict = await replay({ dir, token, question: 'a different question' })
-    assert.equal(conflict.status, 409)
-
     const unknown = await replay({ dir, token, invocation: 'cinv-not-registered' })
     assert.equal(unknown.status, 401)
 
-    const parts = token.split('.')
-    const payload = JSON.parse(Buffer.from(parts[0]!, 'base64url').toString('utf8'))
-    payload.sessionKey = 'agent:main:webchat:dm:forged'
-    const forged = `${Buffer.from(JSON.stringify(payload)).toString('base64url')}.${parts[1]}`
-    const forgedGot = await replay({ dir, token: forged })
-    assert.equal(forgedGot.status, 401)
+    const sessionForged = await replay({
+      dir,
+      token: forgeToken(token, (claims) => {
+        claims.sessionKey = 'agent:main:webchat:dm:forged'
+      }),
+    })
+    assert.equal(sessionForged.status, 401)
 
     const expiredGot = await replay({ dir, token: expired })
     assert.equal(expiredGot.status, 401)
+
+    const wrongDir = await mkdtemp(join(tmpdir(), 'oc-adv-wrong-receipt-'))
+    const wrongStore = new AdvisorConsultStore(join(wrongDir, 'advisor.db'))
+    wrongStore.insertNew(settledRow({ tokenReceipt: hashConsultTurnToken('not-the-original-token') }))
+    wrongStore.close()
+    const wrongReceipt = await replay({ dir: wrongDir, token })
+    assert.equal(wrongReceipt.status, 401)
+
+    const exactDir = await mkdtemp(join(tmpdir(), 'oc-adv-exact-receipt-'))
+    const exactStore = new AdvisorConsultStore(join(exactDir, 'advisor.db'))
+    exactStore.insertNew(settledRow({ tokenReceipt: hashConsultTurnToken(token) }))
+    exactStore.close()
+    const exactOk = await replay({ dir: exactDir, token })
+    assert.equal(exactOk.status, 200, JSON.stringify(exactOk.body))
+    assert.equal(exactOk.body.advice, 'ORIGINAL_ADVICE')
+    const exactConflict = await replay({ dir: exactDir, token, question: 'a different question' })
+    assert.equal(exactConflict.status, 409)
+    const exactForged = await replay({
+      dir: exactDir,
+      token: forgeToken(token, (claims) => {
+        claims.exp = Date.now() + 3_600_000
+      }),
+    })
+    assert.equal(exactForged.status, 401)
   })
 
-  it('two real processes: original token, no shared test key, no parent', async () => {
+  it('two real processes: direct-insert without receipt is 401, no shared test key', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-adv-proc-restart-'))
     const child = fileURLToPath(new URL('./advisorConsultRestartChild.ts', import.meta.url))
     const run = (mode: string) => {
@@ -199,8 +268,7 @@ describe('advisor consult restart recovery', () => {
     }
     run('mint')
     const replayed = run('replay')
-    assert.equal(replayed.status, 200, JSON.stringify(replayed))
-    assert.equal(replayed.body.advice, 'ORIGINAL_ADVICE')
+    assert.equal(replayed.status, 401, JSON.stringify(replayed))
     assert.equal(replayed.hmacOk, false)
     assert.equal(replayed.parentPresent, false)
   })

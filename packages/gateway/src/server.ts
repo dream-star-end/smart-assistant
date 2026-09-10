@@ -12368,11 +12368,20 @@ export class Gateway {
       invocationId,
     })
     if (existing) {
-      const receipt = hashConsultTurnToken(String(token))
       if (existing.sessionKey !== claims.sessionKey || existing.configVersion !== claims.configVersion) {
         return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
       }
-      if (existing.tokenReceipt && existing.tokenReceipt !== receipt) {
+      const presentedReceipt = hashConsultTurnToken(String(token))
+      const storedReceipt = typeof existing.tokenReceipt === 'string' ? existing.tokenReceipt.trim() : ''
+      const receiptMatches = storedReceipt.length > 0 && storedReceipt === presentedReceipt
+      // HMAC-ok: live process may present a same-user row. If a receipt was
+      // recorded, it must still be the exact original token hash (no remint).
+      // HMAC-fail: only the exact stored receipt recovers; no-receipt rows 401.
+      if (inspected.hmacOk) {
+        if (storedReceipt && !receiptMatches) {
+          return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+        }
+      } else if (!receiptMatches) {
         return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
       }
       const presented = await this._presentExistingConsult({ record: existing, question, concern })

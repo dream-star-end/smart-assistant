@@ -19,6 +19,8 @@ import { AdvisorConfigStore } from '../advisorConfigStore.js'
 import { AdvisorConsultStore } from '../advisorConsultStore.js'
 import {
   DELEGATE_CONTEXT_HEADER,
+  hashConsultTurnToken,
+  inspectConsultTurnToken,
   issueConsultTurnToken,
   resetDelegateContextKeyForTests,
 } from '../delegateContext.js'
@@ -505,6 +507,75 @@ describe('advisor consult route lifecycle', () => {
     assert.equal(billing.admits.length, 1)
     assert.equal(billing.settles.length, 1)
     assert.equal(gw._spawnCount, 1)
+  })
+
+  it('real-route receipt recovers after HMAC rotation; invented signatures do not', async () => {
+    const { gw, billing } = await makeGateway()
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-receipt-auth-1' })
+    const first = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(first.status, 200, JSON.stringify(first.body))
+    assert.equal(first.body.advice, 'check the assertion first')
+    const rec = gw._advisorConsults.findById(first.body.consultId)
+    const originalToken = headers[DELEGATE_CONTEXT_HEADER]!
+    assert.equal(rec.tokenReceipt, hashConsultTurnToken(originalToken))
+
+    resetDelegateContextKeyForTests()
+    gw.sessions.getByKey = () => undefined
+    assert.equal(inspectConsultTurnToken(originalToken)?.hmacOk, false)
+
+    const replayed = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      headers,
+    )
+    assert.equal(replayed.status, 200, JSON.stringify(replayed.body))
+    assert.equal(replayed.body.advice, 'check the assertion first')
+    assert.equal(replayed.body.reused, true)
+    assert.equal(billing.admits.length, 1)
+    assert.equal(gw._spawnCount, 1)
+
+    const payloadB64 = originalToken.slice(0, originalToken.lastIndexOf('.'))
+    const claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >
+    const signatureOnly = `${payloadB64}.invented-signature`
+    const sigGot = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      { ...headers, [DELEGATE_CONTEXT_HEADER]: signatureOnly },
+    )
+    assert.equal(sigGot.status, 401, JSON.stringify(sigGot.body))
+
+    claims.exp = Date.now() + 3_600_000
+    const expExtended = `${Buffer.from(JSON.stringify(claims)).toString('base64url')}.invented-signature`
+    const expGot = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      { ...headers, [DELEGATE_CONTEXT_HEADER]: expExtended },
+    )
+    assert.equal(expGot.status, 401, JSON.stringify(expGot.body))
+
+    const remint = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-receipt-auth-1' })
+    assert.equal(inspectConsultTurnToken(remint[DELEGATE_CONTEXT_HEADER]!)?.hmacOk, true)
+    const remintGot = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, remint)
+    assert.equal(remintGot.status, 401, JSON.stringify(remintGot.body))
+
+    gw.getUserId = () => '9'
+    const otherUser = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      headers,
+    )
+    assert.equal(otherUser.status, 401, JSON.stringify(otherUser.body))
   })
 
   it('in-flight replay waits for the original advice', async () => {
