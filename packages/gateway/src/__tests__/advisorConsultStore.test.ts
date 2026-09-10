@@ -72,4 +72,26 @@ describe('advisorConsultStore', () => {
     })?.billingRequestId, 'a'.repeat(32))
     store.close()
   })
+
+  it('records admit-before-spawn order and refuses to spawn without requestId', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const { record } = store.insertNew(sample(dir, { invocationId: 'inv-order' }))
+    const order: string[] = []
+    order.push(record.state)
+    store.update(record.consultId, { state: 'admission_attempt' })
+    order.push('admission_attempt')
+    const admitted = store.update(record.consultId, {
+      state: 'admitted',
+      billingRequestId: 'b'.repeat(32),
+    })
+    order.push(`admitted:${admitted.billingRequestId?.length}`)
+    assert.equal(admitted.state, 'admitted')
+    assert.ok(admitted.billingRequestId)
+    const spawned = store.update(record.consultId, { state: 'spawned', jobId: 'dlgjob-1' })
+    order.push(spawned.state)
+    assert.deepEqual(order, ['accepted', 'admission_attempt', 'admitted:32', 'spawned'])
+    assert.throws(() => store.update(mintConsultId(), { state: 'failed' }), /not found/)
+    store.close()
+  })
 })

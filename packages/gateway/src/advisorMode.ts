@@ -25,9 +25,94 @@ export function openAdvisorEngines(env: NodeJS.ProcessEnv = process.env): Set<st
   return new Set()
 }
 
-export function isAdvisorEngineOpen(engine: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+export function isAdvisorEngineOpen(
+  engine: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  provenEngines?: Iterable<string>,
+): boolean {
   if (!engine) return false
-  return openAdvisorEngines(env).has(engine)
+  if (openAdvisorEngines(env).has(engine)) return true
+  if (!provenEngines) return false
+  for (const item of provenEngines) {
+    if (item === engine) return true
+  }
+  return false
+}
+
+export type AdvisorCatalogModel = {
+  modelId: string
+  displayName: string
+  engine: string
+  available?: boolean
+}
+
+export type AdvisorModelOption = { id: string; label: string; engine: string }
+
+export function listProvenAdvisorModels(input: {
+  catalog: readonly AdvisorCatalogModel[]
+  provenEngines: Iterable<string>
+}): { advisorModels: AdvisorModelOption[]; advisorUnavailableReason?: string } {
+  const proven = new Set([...input.provenEngines].map((s) => s.trim()).filter(Boolean))
+  if (proven.size === 0) {
+    return {
+      advisorModels: [],
+      advisorUnavailableReason: '顾问引擎尚未完成无工具证明',
+    }
+  }
+  const advisorModels = input.catalog
+    .filter((row) => row.available !== false && proven.has(row.engine))
+    .map((row) => ({ id: row.modelId, label: row.displayName, engine: row.engine }))
+  if (advisorModels.length === 0) {
+    return {
+      advisorModels: [],
+      advisorUnavailableReason: 'catalog 中没有已证明引擎的可用顾问型号',
+    }
+  }
+  return { advisorModels }
+}
+
+export function historyFromSessionMessages(
+  messages: Array<{ role?: unknown; text?: unknown; toolName?: unknown; toolResult?: unknown }> | undefined,
+  opts?: { archivedThroughSeq?: number; hasMore?: boolean },
+): {
+  records?: AdvisorSnapshotInput['historyRecords']
+  missing: string[]
+  truncated: boolean
+} {
+  const missing: string[] = []
+  if (!messages) return { missing: ['history_tape'], truncated: false }
+  const records = messages
+    .filter((row) => {
+      const role = typeof row.role === 'string' ? row.role : ''
+      return role === 'user' || role === 'assistant' || role === 'tool' || role === 'agent-group'
+    })
+    .map((row) => ({
+      role: String(row.role),
+      text: typeof row.text === 'string' ? row.text : undefined,
+      toolName: typeof row.toolName === 'string' ? row.toolName : undefined,
+      toolResult: typeof row.toolResult === 'string' ? row.toolResult : undefined,
+    }))
+  if ((opts?.archivedThroughSeq ?? 0) > 0) missing.push('tape_archived_prefix')
+  if (opts?.hasMore) missing.push('tape_unfinalized')
+  return { records, missing, truncated: missing.length > 0 }
+}
+
+export function parentAuthorizedArtifactTexts(input: {
+  userTask?: string
+  currentTools?: Array<{ result?: string; input?: unknown }>
+}): string[] {
+  return extractGeneratedPaths([
+    input.userTask,
+    ...(input.currentTools ?? []).map((tool) => tool.result),
+    ...(input.currentTools ?? []).map((tool) =>
+      typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input ?? ''),
+    ),
+  ])
+}
+
+export function stripAdvisorPreambleFromInjected(text: string): string {
+  if (text.startsWith(ADVISOR_PREAMBLE)) return text.slice(ADVISOR_PREAMBLE.length)
+  return text
 }
 
 export type AdvisorSnapshotInput = {
@@ -173,19 +258,17 @@ export function formatAdvisorConsultPrompt(snapshot: AdvisorSnapshot): string {
     : ''
   const truncated = snapshot.truncated ? '【快照已截断】部分工具结果或约束超上限。\n' : ''
   const history = (snapshot.history ?? [])
-    .map((row) => `- ${row.role ?? 'unknown'}: ${(row.text ?? row.toolResult ?? '').slice(0, 2000)}`)
+    .map((row) => `- ${row.role ?? 'unknown'}: ${row.text ?? row.toolResult ?? ''}`)
     .join('\n')
   const tools = (snapshot.currentTools ?? [])
     .map((tool) => {
       const status = tool.completed ? 'completed' : 'in_progress'
-      return `- ${tool.name ?? 'tool'} [${status}]: ${(tool.result ?? '').slice(0, 2000)}`
+      return `- ${tool.name ?? 'tool'} [${status}]: ${tool.result ?? ''}`
     })
     .join('\n')
   const artifacts = (snapshot.artifacts ?? [])
     .map((row) =>
-      row.missing
-        ? `- ${row.path} (missing: ${row.missing})`
-        : `- ${row.path}\n${(row.content ?? '').slice(0, 4000)}`,
+      row.missing ? `- ${row.path} (missing: ${row.missing})` : `- ${row.path}\n${row.content ?? ''}`,
     )
     .join('\n')
   return [

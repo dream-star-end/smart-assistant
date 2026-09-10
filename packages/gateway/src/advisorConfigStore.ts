@@ -25,6 +25,7 @@ export type CollaborationConfigDoc = {
   rev: number
   defaultMode: CollaborationMode
   defaultAdvisorModel: string | null
+  provenEngines: string[]
   sessions: Record<string, SessionCollabConfig>
 }
 
@@ -43,6 +44,7 @@ const EMPTY: CollaborationConfigDoc = {
   rev: 0,
   defaultMode: 'solo',
   defaultAdvisorModel: null,
+  provenEngines: [],
   sessions: {},
 }
 
@@ -103,11 +105,25 @@ export function parseCollaborationConfigDoc(raw: unknown): CollaborationConfigDo
     }
     sessions[id] = { mode: row.mode, advisorModel, updatedAt: row.updatedAt }
   }
+  const provenRaw = rec.provenEngines
+  const provenEngines: string[] = []
+  if (provenRaw !== undefined && provenRaw !== null) {
+    if (!Array.isArray(provenRaw)) {
+      throw new CollaborationConfigError('CORRUPT', 'provenEngines invalid')
+    }
+    for (const item of provenRaw) {
+      if (typeof item !== 'string' || !item.trim() || item.length > 32) {
+        throw new CollaborationConfigError('CORRUPT', 'provenEngines invalid')
+      }
+      provenEngines.push(item.trim())
+    }
+  }
   return {
     format: COLLAB_CONFIG_FORMAT,
     rev: rec.rev as number,
     defaultMode: rec.defaultMode,
     defaultAdvisorModel,
+    provenEngines,
     sessions,
   }
 }
@@ -218,6 +234,47 @@ export class AdvisorConfigStore {
     return this.mutate(expectedRev, (doc) => {
       doc.defaultMode = value.mode
       doc.defaultAdvisorModel = value.mode === 'advisor' ? value.advisorModel : null
+      return doc
+    })
+  }
+
+  /**
+   * One CAS write. Session save is never replaced by asDefault.
+   * asDefault / missing sessionId updates the user default.
+   */
+  async putIntent(input: {
+    sessionId?: string
+    asDefault?: boolean
+    mode: CollaborationMode
+    advisorModel: string | null
+    expectedRev?: number
+  }): Promise<CollaborationConfigDoc> {
+    if (input.sessionId && !isSessionId(input.sessionId)) {
+      throw new CollaborationConfigError('VALIDATION', 'session id invalid')
+    }
+    const writeSession = Boolean(input.sessionId)
+    const writeDefault = input.asDefault === true || !input.sessionId
+    return this.mutate(input.expectedRev, (doc) => {
+      if (writeSession && input.sessionId) {
+        doc.sessions[input.sessionId] = {
+          mode: input.mode,
+          advisorModel: input.mode === 'advisor' ? input.advisorModel : null,
+          updatedAt: Date.now(),
+        }
+      }
+      if (writeDefault) {
+        doc.defaultMode = input.mode
+        doc.defaultAdvisorModel = input.mode === 'advisor' ? input.advisorModel : null
+      }
+      return doc
+    })
+  }
+
+  async markEngineProven(engine: string): Promise<CollaborationConfigDoc> {
+    const id = engine.trim()
+    if (!id) throw new CollaborationConfigError('VALIDATION', 'engine invalid')
+    return this.mutate(undefined, (doc) => {
+      if (!doc.provenEngines.includes(id)) doc.provenEngines = [...doc.provenEngines, id]
       return doc
     })
   }

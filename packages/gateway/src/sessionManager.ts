@@ -1097,6 +1097,8 @@ export interface AgentSession {
   /** 本 turn 入站用户文本的服务端权威快照(≤8000 字,dispatchInbound 每 turn 刷新)。
    *  审查任务书(buildTeamReviewContext)的"用户原始需求"取此,不采信模型自报。 */
   _currentTurnUserText?: string
+  /** Prefix actually prepended to this turn after stripping advisor tool preamble. */
+  _injectedTurnConstraints?: string
   /** 本 turn 的 master canonical traceId(submit 每 turn 刷新,含 undefined 清除残留)。
    *  市场使用信号(skillUsageReporter)在 tool.called(hub skill_view)派发时经
    *  SessionManager.getByKey 同步读取,作为评分归因键。单一铸造权威在 master,此处只

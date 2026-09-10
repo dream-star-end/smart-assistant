@@ -48,6 +48,30 @@ describe('advisorConfigStore', () => {
     assert.equal(await readFile(file, 'utf8'), '{not-json')
   })
 
+  it('putIntent asDefault does not replace an existing session save', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-collab-'))
+    const store = new AdvisorConfigStore(join(dir, 'collaboration-config.json'))
+    await store.putSession('web-keep', { mode: 'advisor', advisorModel: 'gpt-6-astra' }, 0)
+    const next = await store.putIntent({
+      sessionId: 'web-keep',
+      asDefault: true,
+      mode: 'team',
+      advisorModel: null,
+      expectedRev: 1,
+    })
+    assert.equal(next.rev, 2)
+    assert.equal(next.defaultMode, 'team')
+    assert.equal(next.sessions['web-keep']?.mode, 'team')
+    const onlyDefault = await store.putIntent({
+      asDefault: true,
+      mode: 'solo',
+      advisorModel: null,
+      expectedRev: 2,
+    })
+    assert.equal(onlyDefault.sessions['web-keep']?.mode, 'team')
+    assert.equal(onlyDefault.defaultMode, 'solo')
+  })
+
   it('parseCollaborationConfigDoc rejects collaborationMode native field as format', () => {
     assert.throws(
       () =>

@@ -273,10 +273,14 @@ import {
   advisorPreamble,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
-  extractGeneratedPaths,
   formatAdvisorConsultPrompt,
+  historyFromSessionMessages,
   isAdvisorEngineOpen,
+  listProvenAdvisorModels,
   matchConsultIdentity,
+  openAdvisorEngines,
+  parentAuthorizedArtifactTexts,
+  stripAdvisorPreambleFromInjected,
 } from './advisorMode.js'
 import { AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
 import {
@@ -5932,7 +5936,14 @@ export class Gateway {
       }
       if (req.method === 'DELETE') {
         deleteClientSession(sessId, userId)
-          .then(() => this.sendJson(res, 200, { ok: true }))
+          .then(async () => {
+            try {
+              await this.advisorConfigStore().deleteSession(sessId)
+            } catch {
+              /* config cleanup is best-effort; session row is already gone */
+            }
+            this.sendJson(res, 200, { ok: true })
+          })
           .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
         return
       }
@@ -12039,7 +12050,7 @@ export class Gateway {
   }
 
   private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (isCommercialManagedRuntime()) return this.sendError(res, 404, 'advisor consult is selfhost only')
+    if (!isEngineLocalTurnExempt()) return this.sendError(res, 404, 'advisor consult is selfhost only')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const body = await this.readBody(req)
     let parsed: { question?: unknown; concern?: unknown }
@@ -12118,26 +12129,40 @@ export class Gateway {
       result: typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output ?? ''),
       completed: tool.completed !== false,
     }))
-    const mentioned = extractGeneratedPaths([
-      question,
-      concern,
-      parent._currentTurnUserText,
-      ...(currentTools ?? []).map((tool) => tool.result),
-    ])
+    let historyRecords: ReturnType<typeof historyFromSessionMessages>['records']
+    let historyMissing: string[] = []
+    try {
+      const tape = await getClientSession(parent.peerId, userId)
+      const hist = historyFromSessionMessages(tape?.messages, {
+        archivedThroughSeq: tape?.archivedThroughSeq,
+        hasMore: tape?.timelineHasMore,
+      })
+      historyRecords = hist.records
+      historyMissing = hist.missing
+    } catch {
+      historyMissing = ['history_tape']
+    }
     const snapshot = buildAdvisorSnapshot({
       question,
       concern,
       advisorModel: parent._advisorTurn.advisorModel,
       source: {
         userTask: parent._currentTurnUserText ?? '',
-        injectedConstraints: advisorPreamble('advisor'),
+        injectedConstraints: parent._injectedTurnConstraints,
+        historyRecords,
         currentTools,
         authorizedArtifacts: collectAuthorizedArtifacts({
           generatedRoot: paths.generatedDir,
-          mentioned,
+          mentioned: parentAuthorizedArtifactTexts({
+            userTask: parent._currentTurnUserText,
+            currentTools,
+          }),
         }),
       },
     })
+    for (const item of historyMissing) {
+      if (!snapshot.missing.includes(item)) snapshot.missing.push(item)
+    }
     const snapshotJson = JSON.stringify(snapshot)
     const now = Date.now()
     const inserted = store.insertNew({
@@ -12167,7 +12192,8 @@ export class Gateway {
       })
     }
     const engine = parent.providerTag === 'codex' ? 'codex' : parent.providerTag
-    if (!isAdvisorEngineOpen('codex')) {
+    const proven = this.advisorConfigStore().read().provenEngines
+    if (!isAdvisorEngineOpen('codex', process.env, proven)) {
       store.update(inserted.record.consultId, { state: 'failed' })
       return this.sendJson(res, 503, {
         error: '顾问引擎尚未完成无工具证明，不能咨询',
@@ -12293,7 +12319,10 @@ export class Gateway {
       defaultModel: this.deps.config.defaults.model,
     })
     const engine = execution?.engine ?? 'codex'
-    if (engine !== 'codex' || !isAdvisorEngineOpen('codex')) {
+    if (
+      engine !== 'codex' ||
+      !isAdvisorEngineOpen('codex', process.env, this.advisorConfigStore().read().provenEngines)
+    ) {
       throw new Error('顾问引擎未开放或型号不是已证明的 Codex 顾问')
     }
     let jobId: string | undefined
@@ -12406,22 +12435,39 @@ export class Gateway {
     res: ServerResponse,
     url: URL,
   ): Promise<void> {
-    if (isCommercialManagedRuntime()) {
+    if (!isEngineLocalTurnExempt()) {
       return this.sendError(res, 404, 'collaboration-config is selfhost only')
     }
     const userId = this.getUserId(req)
     if (!userId || userId === 'default') return this.sendError(res, 401, 'unauthorized')
     const store = this.advisorConfigStore()
+    const provenNow = () => [...openAdvisorEngines(), ...store.read().provenEngines]
+    const catalogOptions = async () => {
+      try {
+        const view = await getLocalCatalogView()
+        return listProvenAdvisorModels({ catalog: view.models, provenEngines: provenNow() })
+      } catch (err) {
+        return {
+          advisorModels: [] as Array<{ id: string; label: string; engine: string }>,
+          advisorUnavailableReason: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
+        }
+      }
+    }
     if (req.method === 'GET') {
       try {
         const doc = store.read()
         const sessionId = url.searchParams.get('sessionId') ?? undefined
         const resolved = resolveSessionCollab(doc, sessionId)
+        const listed = await catalogOptions()
         return this.sendJson(res, 200, {
           rev: doc.rev,
           defaultMode: doc.defaultMode,
           defaultAdvisorModel: doc.defaultAdvisorModel,
           session: resolved,
+          advisorModels: listed.advisorModels,
+          ...(listed.advisorUnavailableReason
+            ? { advisorUnavailableReason: listed.advisorUnavailableReason }
+            : {}),
         })
       } catch (err) {
         if (err instanceof CollaborationConfigError && err.code === 'CORRUPT') {
@@ -12453,28 +12499,35 @@ export class Gateway {
           ? parsed.advisorModel.trim()
           : 'gpt-6-astra'
         : null
-    if (parsed.mode === 'advisor' && advisorModel !== 'gpt-6-astra') {
-      return this.sendError(res, 400, 'advisorModel must be catalog gpt-6-astra')
+    if (parsed.mode === 'advisor' && advisorModel) {
+      const listed = await catalogOptions()
+      if (listed.advisorModels.length > 0 && !listed.advisorModels.some((row) => row.id === advisorModel)) {
+        return this.sendError(res, 400, listed.advisorUnavailableReason || 'advisorModel not in proven catalog')
+      }
     }
     const expectedRev =
       typeof parsed.expectedRev === 'number' && Number.isInteger(parsed.expectedRev)
         ? parsed.expectedRev
         : undefined
     try {
-      const next =
-        parsed.asDefault === true || !parsed.sessionId
-          ? await store.putDefault({ mode: parsed.mode, advisorModel }, expectedRev)
-          : await store.putSession(
-              String(parsed.sessionId),
-              { mode: parsed.mode, advisorModel },
-              expectedRev,
-            )
       const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined
+      const next = await store.putIntent({
+        sessionId,
+        asDefault: parsed.asDefault === true,
+        mode: parsed.mode,
+        advisorModel,
+        expectedRev,
+      })
+      const listed = await catalogOptions()
       return this.sendJson(res, 200, {
         rev: next.rev,
         defaultMode: next.defaultMode,
         defaultAdvisorModel: next.defaultAdvisorModel,
         session: resolveSessionCollab(next, sessionId),
+        advisorModels: listed.advisorModels,
+        ...(listed.advisorUnavailableReason
+          ? { advisorUnavailableReason: listed.advisorUnavailableReason }
+          : {}),
       })
     } catch (err) {
       if (err instanceof CollaborationConfigError) {
@@ -19291,7 +19344,7 @@ export class Gateway {
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
-    const inboundCollabMode = isCommercialManagedRuntime()
+    const inboundCollabMode = !isEngineLocalTurnExempt()
       ? normalizeCollabMode({ teamMode })
       : normalizeCollabMode({
           collabMode: (frame as { collabMode?: unknown }).collabMode,
@@ -20294,19 +20347,48 @@ export class Gateway {
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
     session._collabModeTurn = agent.id === 'main' && !adapter ? inboundCollabMode : 'solo'
-    const inboundAdvisorModel =
+    const requestedAdvisorModel =
       typeof (frame as { advisorModel?: unknown }).advisorModel === 'string'
         ? (frame as { advisorModel: string }).advisorModel.trim()
-        : 'gpt-6-astra'
-    const inboundConfigVersion =
-      typeof (frame as { collabConfigVersion?: unknown }).collabConfigVersion === 'string'
-        ? (frame as { collabConfigVersion: string }).collabConfigVersion
-        : collabConfigVersionOf({ mode: inboundCollabMode, advisorModel: inboundAdvisorModel })
+        : ''
+    let frozenAdvisorModel = requestedAdvisorModel || 'gpt-6-astra'
+    if (session._collabModeTurn === 'advisor') {
+      try {
+        const collabDoc = this.advisorConfigStore().read()
+        const proven = [
+          ...openAdvisorEngines(),
+          ...(collabDoc.provenEngines ?? []),
+        ]
+        const view = await getLocalCatalogView()
+        const listed = listProvenAdvisorModels({ catalog: view.models, provenEngines: proven })
+        const allowed = listed.advisorModels.some((row) => row.id === frozenAdvisorModel)
+        if (!allowed) {
+          const sessionDefault = resolveSessionCollab(collabDoc, session.peerId)
+          frozenAdvisorModel = sessionDefault.advisorModel || listed.advisorModels[0]?.id || frozenAdvisorModel
+        }
+      } catch {
+        /* catalog unavailable: keep frozen requested/default; consult will 503 if unproven */
+      }
+    }
+    const inboundConfigVersion = collabConfigVersionOf({
+      mode: inboundCollabMode,
+      advisorModel: frozenAdvisorModel,
+    })
     session._advisorTurn =
       session._collabModeTurn === 'advisor'
-        ? { advisorModel: inboundAdvisorModel || 'gpt-6-astra', configVersion: inboundConfigVersion }
+        ? { advisorModel: frozenAdvisorModel, configVersion: inboundConfigVersion }
         : undefined
     session._currentTurnUserText = text ?? ''
+    {
+      const userText = text ?? ''
+      let injected = payload
+      if (userText && payload.endsWith(userText)) {
+        injected = payload.slice(0, payload.length - userText.length)
+      } else if (payload === userText) {
+        injected = ''
+      }
+      session._injectedTurnConstraints = stripAdvisorPreambleFromInjected(injected).trim() || undefined
+    }
     // Fire-and-forget shadow hook. It receives the turn's already-resolved agent,
     // canonical trace id and raw text only long enough to hash/rank them; no result
     // is fed back into prompt assembly or execution.
