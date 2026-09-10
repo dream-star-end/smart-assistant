@@ -994,6 +994,65 @@ describe('delegate engine-billing admit uses one fenced snapshot', () => {
     assert.equal(abortCalls.length, 0)
   })
 
+  it('advisor official group mismatch returns unavailable with the original requestId', async () => {
+    const { selectAdvisorCodexAdmitRoute } = await import('../billing/advisorCodexAdmitRoute.js')
+    const { runtime, journalCalls, abortCalls, advisorRouteCalls } = makeRuntime({
+      advisorRoute: async () =>
+        selectAdvisorCodexAdmitRoute({
+          containerId: 11,
+          userId: 42n,
+          modelId: 'gpt-5.6-sol',
+          createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+          readBinding: async () => ({
+            codexAccountId: 53n,
+            userId: 42n,
+            state: 'active',
+            provider: 'codex',
+            accountStatus: 'active',
+            accountGroupId: 8n,
+          }),
+        }),
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.deepEqual(result.route, { kind: 'unavailable', reason: 'bound_account_group_mismatch' })
+    assert.equal(journalCalls.length, 1)
+    assert.equal(abortCalls.length, 0)
+    assert.equal(advisorRouteCalls.length, 1)
+  })
+
+  it('advisor binding lookup throw after precheck releases reservation and does not journal', async () => {
+    const { selectAdvisorCodexAdmitRoute } = await import('../billing/advisorCodexAdmitRoute.js')
+    const { runtime, journalCalls, releaseCalls, abortCalls } = makeRuntime({
+      advisorRoute: async () =>
+        selectAdvisorCodexAdmitRoute({
+          containerId: 11,
+          userId: 42n,
+          modelId: 'gpt-5.6-sol',
+          createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+          readBinding: async () => {
+            throw new Error('binding lookup failed')
+          },
+        }),
+    })
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+        }),
+      /ROUTE_UNAVAILABLE/,
+    )
+    assert.equal(journalCalls.length, 0)
+    assert.equal(releaseCalls.length, 1)
+    assert.equal(abortCalls.length, 0)
+  })
+
   it('advisor selector throw after precheck releases reservation and does not journal', async () => {
     const { runtime, journalCalls, releaseCalls, abortCalls } = makeRuntime({
       advisorRouteThrow: new Error('db down'),

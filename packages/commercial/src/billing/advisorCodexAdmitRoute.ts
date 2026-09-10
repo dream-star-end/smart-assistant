@@ -27,6 +27,8 @@ export interface AdvisorCodexBindingRow {
   state: string
   provider: string | null
   accountStatus: string | null
+  /** Authoritative claude_accounts.group_id. Missing/null is fail-closed. */
+  accountGroupId?: bigint | null
 }
 
 export type AdvisorCodexSelectorDecision =
@@ -96,13 +98,29 @@ export function projectAdvisorAdmitRoute(
 export function bindingAllowsOfficialOAuth(
   binding: AdvisorCodexBindingRow | null,
   userId: bigint,
+  selectedGroupId: string,
 ): boolean {
-  if (!binding) return false
-  if (binding.userId !== userId) return false
-  if (binding.state !== 'active') return false
-  if (binding.provider !== 'codex') return false
-  if (binding.accountStatus !== 'active') return false
-  return binding.codexAccountId !== null
+  return officialOAuthBindingDenial(binding, userId, selectedGroupId) === null
+}
+
+/** Null means the bound account may use this official group. */
+export function officialOAuthBindingDenial(
+  binding: AdvisorCodexBindingRow | null,
+  userId: bigint,
+  selectedGroupId: string,
+): 'no_bound_codex_account' | 'bound_account_group_unknown' | 'bound_account_group_mismatch' | null {
+  if (!binding) return 'no_bound_codex_account'
+  if (binding.userId !== userId) return 'no_bound_codex_account'
+  if (binding.state !== 'active') return 'no_bound_codex_account'
+  if (binding.provider !== 'codex') return 'no_bound_codex_account'
+  if (binding.accountStatus !== 'active') return 'no_bound_codex_account'
+  if (binding.codexAccountId === null) return 'no_bound_codex_account'
+  if (!GROUP_ID_RE.test(selectedGroupId)) return 'bound_account_group_unknown'
+  if (binding.accountGroupId === undefined || binding.accountGroupId === null) {
+    return 'bound_account_group_unknown'
+  }
+  if (String(binding.accountGroupId) !== selectedGroupId) return 'bound_account_group_mismatch'
+  return null
 }
 
 export async function selectAdvisorCodexAdmitRoute(args: {
@@ -124,8 +142,7 @@ export async function selectAdvisorCodexAdmitRoute(args: {
   const projected = projectAdvisorAdmitRoute(decision)
   if (projected.kind !== 'official_oauth') return projected
   const binding = await args.readBinding(args.containerId)
-  if (!bindingAllowsOfficialOAuth(binding, args.userId)) {
-    return { kind: 'unavailable', reason: 'no_bound_codex_account' }
-  }
+  const denial = officialOAuthBindingDenial(binding, args.userId, projected.groupId)
+  if (denial) return { kind: 'unavailable', reason: denial }
   return projected
 }

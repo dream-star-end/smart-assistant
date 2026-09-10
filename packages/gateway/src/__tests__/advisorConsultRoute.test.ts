@@ -1617,6 +1617,32 @@ describe('OCV5-210 M15 advisor master route', () => {
     )
   })
 
+  it('official group mismatch does not spawn and abandons the original requestId once', async () => {
+    const { gw, billing } = await makeGateway()
+    billing.admit = async (input: unknown) => {
+      billing.admits.push(input)
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        route: { kind: 'unavailable', reason: 'bound_account_group_mismatch' },
+      }
+    }
+    const r = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-m16-mismatch' }),
+    )
+    assert.equal(r.status, 503, JSON.stringify(r.body))
+    assert.equal(r.body.state, 'failed')
+    assert.equal(r.body.requestId, REQUEST_ID)
+    assert.equal(gw._spawnCount ?? 0, 0)
+    assert.equal(billing.admits.length, 1)
+    assert.deepEqual(billing.abandons, [REQUEST_ID])
+    assert.equal(billing.settles.length, 0)
+  })
+
   it('master api_relay token is rebound to this gateway port', async () => {
     const token = 'ab'.repeat(32)
     const { gw, billing } = await makeGateway()

@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 
 import {
   bindingAllowsOfficialOAuth,
+  officialOAuthBindingDenial,
   projectAdvisorAdmitRoute,
   selectAdvisorCodexAdmitRoute,
 } from '../billing/advisorCodexAdmitRoute.js'
@@ -79,15 +80,68 @@ describe('selectAdvisorCodexAdmitRoute', () => {
           state: 'active',
           provider: 'codex',
           accountStatus: 'active',
+          accountGroupId: 9n,
         },
         USER,
+        '9',
       ),
       true,
     )
   })
 
-  it('keeps official_oauth when the container binding matches', async () => {
+  it('keeps official_oauth when the bound account belongs to the selected group', async () => {
     const route = await selectAdvisorCodexAdmitRoute({
+      containerId: 7,
+      userId: USER,
+      modelId: 'gpt-6-astra',
+      createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+      readBinding: async () => ({
+        codexAccountId: 53n,
+        userId: USER,
+        state: 'active',
+        provider: 'codex',
+        accountStatus: 'active',
+        accountGroupId: 9n,
+      }),
+    })
+    assert.deepEqual(route, { kind: 'official_oauth', groupId: '9' })
+  })
+
+  it('refuses official_oauth when the bound account is in another group', async () => {
+    const route = await selectAdvisorCodexAdmitRoute({
+      containerId: 11,
+      userId: USER,
+      modelId: 'gpt-6-astra',
+      createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+      readBinding: async () => ({
+        codexAccountId: 53n,
+        userId: USER,
+        state: 'active',
+        provider: 'codex',
+        accountStatus: 'active',
+        accountGroupId: 8n,
+      }),
+    })
+    assert.deepEqual(route, { kind: 'unavailable', reason: 'bound_account_group_mismatch' })
+    assert.equal(
+      officialOAuthBindingDenial(
+        {
+          codexAccountId: 53n,
+          userId: USER,
+          state: 'active',
+          provider: 'codex',
+          accountStatus: 'active',
+          accountGroupId: 8n,
+        },
+        USER,
+        '9',
+      ),
+      'bound_account_group_mismatch',
+    )
+  })
+
+  it('refuses official_oauth when the bound account group is unknown', async () => {
+    const missing = await selectAdvisorCodexAdmitRoute({
       containerId: 7,
       userId: USER,
       modelId: 'gpt-6-astra',
@@ -100,6 +154,55 @@ describe('selectAdvisorCodexAdmitRoute', () => {
         accountStatus: 'active',
       }),
     })
-    assert.deepEqual(route, { kind: 'official_oauth', groupId: '9' })
+    assert.deepEqual(missing, { kind: 'unavailable', reason: 'bound_account_group_unknown' })
+    const nulled = await selectAdvisorCodexAdmitRoute({
+      containerId: 7,
+      userId: USER,
+      modelId: 'gpt-6-astra',
+      createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+      readBinding: async () => ({
+        codexAccountId: 53n,
+        userId: USER,
+        state: 'active',
+        provider: 'codex',
+        accountStatus: 'active',
+        accountGroupId: null,
+      }),
+    })
+    assert.deepEqual(nulled, { kind: 'unavailable', reason: 'bound_account_group_unknown' })
+  })
+
+  it('propagates binding lookup failures instead of authorizing', async () => {
+    await assert.rejects(
+      () =>
+        selectAdvisorCodexAdmitRoute({
+          containerId: 7,
+          userId: USER,
+          modelId: 'gpt-6-astra',
+          createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+          readBinding: async () => {
+            throw new Error('db down')
+          },
+        }),
+      /db down/,
+    )
+  })
+
+  it('does not apply official group matching to api_relay', async () => {
+    const route = await selectAdvisorCodexAdmitRoute({
+      containerId: 7,
+      userId: USER,
+      modelId: 'gpt-6-astra',
+      createRoute: async () => ({
+        kind: 'api_relay',
+        token: TOKEN,
+        modelProvider: 'api111',
+        engine: 'codex',
+      }),
+      readBinding: async () => {
+        throw new Error('must not read binding for api_relay')
+      },
+    })
+    assert.equal(route.kind, 'api_relay')
   })
 })
