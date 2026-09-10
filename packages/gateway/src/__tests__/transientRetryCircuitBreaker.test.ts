@@ -4,11 +4,13 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { AutomaticRetryState } from '../engine/engineAdapter.js'
+import { classifyRunError } from '../errorClassify.js'
 import {
   TRANSIENT_SAME_CLASS_BREAKER,
   advanceTransientBreaker,
+  formatTransientCircuitOpenError,
   resolveTransientBreakerThreshold,
-} from '../sessionManager.js'
+} from '../transientRetryCircuit.js'
 
 function freshState(): AutomaticRetryState {
   return { rootClientMessageId: 'm1', attempt: 0, max: 10 }
@@ -38,6 +40,14 @@ describe('advanceTransientBreaker', () => {
     assert.equal(switched.open, false)
     assert.equal(switched.consecutive, 1)
     assert.equal(state.lastErrorClass, 'rate_limited')
+  })
+})
+
+describe('circuit-open error is classified as switch-engine', () => {
+  it('TRANSIENT_CIRCUIT_OPEN wraps consecutive 5xx into model_capacity', () => {
+    const r = classifyRunError(formatTransientCircuitOpenError('upstream_failed', 3))
+    assert.equal(r.code, 'model_capacity')
+    assert.match(r.message, /切换引擎/)
   })
 })
 

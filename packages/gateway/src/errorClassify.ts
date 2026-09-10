@@ -142,6 +142,14 @@ const PATTERNS: Array<{
     code: 'model_capacity',
     message: '模型繁忙，请稍后重试或切换模型',
   },
+  // Gateway opened the in-process transient-retry circuit after N consecutive
+  // same-class 5xx. Must beat the generic 5xx rule so the CTA becomes
+  // retry_or_switch ("明示切引擎") instead of another auto-retry loop.
+  {
+    re: /\bTRANSIENT_CIRCUIT_OPEN\b/,
+    code: 'model_capacity',
+    message: '上游连续失败，已停止自动重试。请切换引擎后再试',
+  },
   // 通用 5xx / 上游连接失败。
   // 审计 R1:
   //   - `\b5\d{2}\b` 覆盖全部 5xx(不再只认 502/503/504)。边界写法与旧

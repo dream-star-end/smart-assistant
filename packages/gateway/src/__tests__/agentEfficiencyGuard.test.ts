@@ -217,6 +217,39 @@ describe('observeToolUse — fan-out + counters', () => {
     const hits = observeToolUse(state, { name: 'Read', input: {} })
     assert.equal(hits.some((h) => h.code === 'tool_count'), true)
   })
+
+  it('warns Fable/Opus after 3 Edit/Write and asks for grok-build', () => {
+    const state = createTurnGuardState()
+    const model = 'cursor-fable-5.1-high'
+    assert.deepEqual(observeToolUse(state, { name: 'Edit', input: {} }, 'warn', model), [])
+    assert.deepEqual(observeToolUse(state, { name: 'Write', input: {} }, 'warn', model), [])
+    const third = observeToolUse(state, { name: 'StrReplace', input: {} }, 'warn', model)
+    assert.equal(third[0]?.code, 'fable_direct_edit')
+    assert.match(third[0]?.message ?? '', /delegate grok-build/)
+    const again = observeToolUse(state, { name: 'Edit', input: {} }, 'warn', model)
+    assert.equal(again.some((h) => h.code === 'fable_direct_edit'), false)
+  })
+
+  it('does not flag grok-build or glm Edit/Write', () => {
+    const grok = createTurnGuardState()
+    for (let i = 0; i < 5; i++) {
+      const hits = observeToolUse(grok, { name: 'Write', input: {} }, 'warn', 'grok-build')
+      assert.equal(hits.some((h) => h.code === 'fable_direct_edit'), false)
+    }
+    const glm = createTurnGuardState()
+    for (let i = 0; i < 5; i++) {
+      const hits = observeToolUse(glm, { name: 'Write', input: {} }, 'warn', 'glm-5.3-zai')
+      assert.equal(hits.some((h) => h.code === 'fable_direct_edit'), false)
+    }
+  })
+
+  it('applyEfficiencyToolObservation reads session.model for the Fable rule', () => {
+    const session: EfficiencySessionState = { model: 'cursor-opus-5-high' }
+    applyEfficiencyToolObservation(session, { name: 'Edit', input: {} }, 1)
+    applyEfficiencyToolObservation(session, { name: 'Write', input: {} }, 2)
+    applyEfficiencyToolObservation(session, { name: 'Edit', input: {} }, 3)
+    assert.equal(session._efficiencyPendingHits?.[0]?.code, 'fable_direct_edit')
+  })
 })
 
 describe('verification budget', () => {

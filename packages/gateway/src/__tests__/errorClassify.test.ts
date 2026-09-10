@@ -115,6 +115,15 @@ describe('classifyRunError', () => {
     }
   })
 
+  it('transient retry circuit-open marker classifies as capacity with switch-engine CTA copy', () => {
+    const raw =
+      'TRANSIENT_CIRCUIT_OPEN: 连续 3 次同类上游失败（upstream_failed），已停止自动重试。请切换引擎后再试。'
+    const r = classifyRunError(raw)
+    assert.equal(r.code, 'model_capacity')
+    assert.match(r.message, /切换引擎/)
+    assert.doesNotMatch(r.message, /请稍后重试$/)
+  })
+
   it('Cursor Sand Box BUSY is model capacity (retry later or switch), not a bad request', () => {
     const raw =
       'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"CURSOR_SAND_BOX_BUSY [non-retryable]"}}'
