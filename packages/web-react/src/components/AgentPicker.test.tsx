@@ -73,6 +73,27 @@ describe("AgentPicker 三态协作", () => {
     fireEvent.click(advisor);
     expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
   });
+
+  it("点顾问只走 onCollabModeChange，不再链式 onToggleTeamMode(false) 把 App 打回 solo", async () => {
+    const onCollabModeChange = vi.fn();
+    const onToggleTeamMode = vi.fn();
+    renderPicker({ onCollabModeChange, onToggleTeamMode, collabMode: "solo" });
+    fireEvent.click(await screen.findByRole("button", { name: /主模型不切换/ }));
+    expect(onCollabModeChange).toHaveBeenCalledTimes(1);
+    expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
+    expect(onToggleTeamMode).not.toHaveBeenCalled();
+  });
+
+  it("顾问无可用型号时明示原因，不静默填 gpt-6-astra", async () => {
+    renderPicker({
+      onCollabModeChange: () => {},
+      collabMode: "advisor",
+      advisorModels: [],
+      advisorUnavailableReason: "顾问引擎尚未证明无工具隔离",
+    });
+    expect(await screen.findByText(/尚未证明无工具隔离/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("选择顾问型号")).toBeNull();
+  });
 });
 
 describe("AgentPicker capability readiness", () => {

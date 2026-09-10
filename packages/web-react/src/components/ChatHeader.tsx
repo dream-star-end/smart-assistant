@@ -29,6 +29,7 @@ export function ChatHeader({
   teamModeActive,
   onDisableTeamMode,
   advisorModeActive,
+  advisorModelLabel,
   onDisableAdvisorMode,
   credits,
   onOpenBilling,
@@ -74,6 +75,8 @@ export function ChatHeader({
   /** 关闭团队模式（直接翻转 App 的全局 flag；省略则 chip 弹层不渲染关闭按钮）。 */
   onDisableTeamMode?: () => void;
   advisorModeActive?: boolean;
+  /** Frozen advisor model id from server config, not the chat model selector. */
+  advisorModelLabel?: string | null;
   onDisableAdvisorMode?: () => void;
   /** 账户余额（积分字符串大数，来自 /api/me）。省略 / null 不渲染 pill。 */
   credits?: string | null;
@@ -200,11 +203,18 @@ export function ChatHeader({
                   <ShieldCheck size={11} className="shrink-0" />
                   <span className="sm:hidden">顾问</span>
                   <span className="hidden sm:inline">顾问模式</span>
+                  {advisorModelLabel ? (
+                    <span className="hidden max-w-[8rem] truncate sm:inline" title={advisorModelLabel}>
+                      · {advisorModelLabel}
+                    </span>
+                  ) : null}
                 </button>
               </PopoverTrigger>
               <PopoverContent>
                 <p className="text-[12.5px] leading-relaxed text-muted">
-                  顾问模式已开启：主模型不切换。主模型可通过 consult_advisor 向无工具顾问提问；建议必须自行验证。
+                  顾问模式已开启：主模型不切换
+                  {advisorModelLabel ? `；本回合冻结顾问 ${advisorModelLabel}` : ""}
+                  。主模型可通过 consult_advisor 向无工具顾问提问；建议必须自行验证，不能替代审批或正式审查员。咨询按实际顾问型号计费，不承诺更省。
                 </p>
                 {onDisableAdvisorMode && (
                   <Button

@@ -1352,6 +1352,8 @@ export const api = {
         configVersion: string
         source: "session" | "default"
       }
+      advisorModels?: Array<{ id: string; label: string; engine: string }>
+      advisorUnavailableReason?: string
     }>(
       callWithRefresh(a, (t) =>
         fetch(
@@ -1381,6 +1383,8 @@ export const api = {
         configVersion: string
         source: "session" | "default"
       }
+      advisorModels?: Array<{ id: string; label: string; engine: string }>
+      advisorUnavailableReason?: string
     }>(
       callWithRefresh(a, (t) =>
         fetch("/api/collaboration-config", {

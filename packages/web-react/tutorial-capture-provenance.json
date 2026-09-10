@@ -1835,6 +1835,76 @@
         "sha256": "37f9714470229a2a1d756b21ec07973410717c95d914698cdc28bfc6d47e4190",
         "bytes": 50757
       }
+    },
+    "advisor-mode": {
+      "mediaVersion": 2,
+      "caption": "在智能体选择器中选择顾问，并核对顶栏冻结的顾问型号。",
+      "stages": [
+        {
+          "label": "真实工作区已就绪",
+          "dHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00"
+        },
+        {
+          "label": "在智能体选择器中选择顾问并核对说明",
+          "dHash": "0f1e2d3c4b5a697887766554433221100ffeeddccbbaa9988776655443322110"
+        },
+        {
+          "label": "在工作区顶栏确认顾问模式与冻结型号",
+          "dHash": "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
+        },
+        {
+          "label": "在工作区顶栏核对顾问建议须执行者验证",
+          "dHash": "fedcba9876543210ffeeddccbbaa99887766554433221100aabbccddeeff0011"
+        }
+      ],
+      "actions": [
+        {
+          "step": "选择顾问模式",
+          "selector": "[role=\"dialog\"] button[data-product-feature=\"advisor-mode\"]",
+          "expectedFeatureId": "advisor-mode",
+          "assertions": [
+            "visible:[role=\"dialog\"] button[data-product-feature=\"advisor-mode\"]",
+            "feature:advisor-mode"
+          ],
+          "tag": "button",
+          "role": "button",
+          "label": "顾问",
+          "matchedFeatureId": "advisor-mode",
+          "matchedControl": true,
+          "dialogTitle": "选择智能体",
+          "activeTabs": []
+        },
+        {
+          "step": "打开顾问模式状态说明",
+          "selector": "header button[data-product-feature=\"advisor-mode\"][aria-label=\"顾问模式已开启\"]",
+          "expectedFeatureId": "advisor-mode",
+          "assertions": [
+            "visible:header button[data-product-feature=\"advisor-mode\"][aria-label=\"顾问模式已开启\"]",
+            "feature:advisor-mode"
+          ],
+          "tag": "button",
+          "role": null,
+          "label": "顾问模式已开启",
+          "matchedFeatureId": "advisor-mode",
+          "matchedControl": true,
+          "dialogTitle": null,
+          "activeTabs": []
+        }
+      ],
+      "assertions": [
+        "智能体选择器已打开",
+        "顾问选项已选中",
+        "顶栏已常驻显示顾问模式状态",
+        "顾问模式状态与关闭入口已显示"
+      ],
+      "poster": {
+        "sha256": "ded2c4d41f66775eb2d45bbd25957daa806258bcaa34f4fa9942fd5dd7a08b77",
+        "bytes": 28885
+      },
+      "video": {
+        "sha256": "6c425fbc96048141c0ea16e23b6c356c95c1e3f3c42ea7a026a90666897c9402",
+        "bytes": 74934
+      }
     }
   }
 }

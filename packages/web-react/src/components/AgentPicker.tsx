@@ -25,22 +25,36 @@ export function AgentPicker({
   auth,
   teamMode = false,
   collabMode,
+  advisorModels = [],
+  advisorModel,
+  advisorUnavailableReason,
+  collabSaveError,
+  asDefault,
+  onAsDefaultChange,
   onClose,
   onPick,
   onAddFromMarket,
   onToggleTeamMode,
   onCollabModeChange,
+  onAdvisorModelChange,
 }: {
   open: boolean
   current: Agent
   auth: AuthSession | null
   teamMode?: boolean
   collabMode?: 'solo' | 'advisor' | 'team'
+  advisorModels?: Array<{ id: string; label: string; engine: string }>
+  advisorModel?: string | null
+  advisorUnavailableReason?: string
+  collabSaveError?: string | null
+  asDefault?: boolean
+  onAsDefaultChange?: (v: boolean) => void
   onClose: () => void
   onPick: (a: Agent) => void
   onAddFromMarket?: () => void
   onToggleTeamMode?: (v: boolean) => void
   onCollabModeChange?: (mode: 'solo' | 'advisor' | 'team') => void
+  onAdvisorModelChange?: (id: string) => void
 }) {
   const mode = collabMode ?? (teamMode ? 'team' : 'solo')
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
@@ -121,42 +135,59 @@ export function AgentPicker({
           <div className="flex flex-col gap-2 border-t border-accent/20 bg-surface/70 px-3.5 py-2.5">
             <span className="text-meta font-semibold text-fg">协作方式</span>
             <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
-              {(
-                [
-                  { id: 'solo' as const, label: '单人', desc: '主模型独立完成' },
-                  { id: 'advisor' as const, label: '顾问', desc: '主模型不切换，可咨询无工具顾问' },
-                  { id: 'team' as const, label: '团队', desc: '队长切 Astra 并委派已安装智能体' },
-                ] as const
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  data-product-feature={
-                    opt.id === 'advisor'
-                      ? PRODUCT_CAPABILITIES.advisorMode.id
-                      : opt.id === 'team'
-                        ? PRODUCT_CAPABILITIES.teamMode.id
-                        : PRODUCT_CAPABILITIES.agents.id
-                  }
-                  aria-pressed={mode === opt.id}
-                  onClick={() => {
-                    onCollabModeChange(opt.id)
-                    onToggleTeamMode?.(opt.id === 'team')
-                  }}
-                  className={cn(
-                    "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-                    mode === opt.id
-                      ? "border-accent bg-accent-soft text-fg"
-                      : "border-border bg-surface text-muted hover:border-border-strong",
-                  )}
-                >
-                  <span className="flex items-center gap-1 text-[12.5px] font-semibold">
-                    {opt.id === 'advisor' ? <ShieldCheck size={13} /> : opt.id === 'team' ? <Users size={13} /> : null}
-                    {opt.label}
-                  </span>
-                  <span className="mt-0.5 block text-[11px] leading-snug">{opt.desc}</span>
-                </button>
-              ))}
+              <button
+                type="button"
+                data-product-feature="agents"
+                aria-pressed={mode === 'solo'}
+                onClick={() => onCollabModeChange('solo')}
+                className={cn(
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  mode === 'solo'
+                    ? "border-accent bg-accent-soft text-fg"
+                    : "border-border bg-surface text-muted hover:border-border-strong",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12.5px] font-semibold">单人</span>
+                <span className="mt-0.5 block text-[11px] leading-snug">主模型独立完成</span>
+              </button>
+              <button
+                type="button"
+                data-product-feature="advisor-mode"
+                data-product-control
+                aria-pressed={mode === 'advisor'}
+                onClick={() => onCollabModeChange('advisor')}
+                className={cn(
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  mode === 'advisor'
+                    ? "border-accent bg-accent-soft text-fg"
+                    : "border-border bg-surface text-muted hover:border-border-strong",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                  <ShieldCheck size={13} />
+                  顾问
+                </span>
+                <span className="mt-0.5 block text-[11px] leading-snug">主模型不切换，可咨询无工具顾问</span>
+              </button>
+              <button
+                type="button"
+                data-product-feature="team-mode"
+                data-product-control
+                aria-pressed={mode === 'team'}
+                onClick={() => onCollabModeChange('team')}
+                className={cn(
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  mode === 'team'
+                    ? "border-accent bg-accent-soft text-fg"
+                    : "border-border bg-surface text-muted hover:border-border-strong",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                  <Users size={13} />
+                  团队
+                </span>
+                <span className="mt-0.5 block text-[11px] leading-snug">队长切 Astra 并委派已安装智能体</span>
+              </button>
             </div>
             {mode === 'team' && (
               <span className="text-[11.5px] leading-snug text-muted">
@@ -164,9 +195,47 @@ export function AgentPicker({
               </span>
             )}
             {mode === 'advisor' && (
-              <span className="text-[11.5px] leading-snug text-muted">
-                顾问固定 gpt-6-astra，无工具、不改文件。主模型必须自行验证建议后再交付。
-              </span>
+              <div className="flex flex-col gap-1.5">
+                {advisorModels.length > 0 ? (
+                  <label className="text-[11.5px] leading-snug text-muted">
+                    顾问型号
+                    <select
+                      className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1 text-[12.5px] text-fg"
+                      value={advisorModel && advisorModels.some((row) => row.id === advisorModel) ? advisorModel : advisorModels[0].id}
+                      onChange={(e) => onAdvisorModelChange?.(e.target.value)}
+                      data-product-control
+                      aria-label="选择顾问型号"
+                    >
+                      {advisorModels.map((row) => (
+                        <option key={row.id} value={row.id}>
+                          {row.label}（{row.engine}）
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="text-[11.5px] leading-snug text-warning">
+                    {advisorUnavailableReason || "当前没有已证明无工具隔离的顾问型号，不能静默换模。"}
+                  </span>
+                )}
+                <span className="text-[11.5px] leading-snug text-muted">
+                  顾问无工具、不改文件、不替代审批或正式审查员。主模型必须用证据验证建议后再交付。咨询按实际顾问型号计费，不承诺更省。
+                </span>
+              </div>
+            )}
+            {onAsDefaultChange && (
+              <label className="flex items-center gap-2 text-[11.5px] text-muted">
+                <input
+                  type="checkbox"
+                  checked={!!asDefault}
+                  onChange={(e) => onAsDefaultChange(e.target.checked)}
+                  data-product-control
+                />
+                同时作为新会话默认（不改当前会话以外的覆盖）
+              </label>
+            )}
+            {collabSaveError && (
+              <span className="text-[11.5px] leading-snug text-danger">{collabSaveError}</span>
             )}
           </div>
         ) : onToggleTeamMode ? (
