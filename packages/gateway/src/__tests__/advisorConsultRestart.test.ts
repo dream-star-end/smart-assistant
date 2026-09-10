@@ -442,16 +442,20 @@ describe('advisor consult billing startup projection', () => {
     gw.log = { warn: () => {}, info: () => {}, debug: () => {}, error: () => {} }
     gw.advisorConsultStore()
     const deadline = Date.now() + 1_000
-    while (Date.now() < deadline && db.findById(record.consultId)?.state !== 'settled') {
+    let queue: { pending: unknown[]; settledReceipts: unknown[] } = {
+      pending: [],
+      settledReceipts: [{ requestId: REQUEST_ID }],
+    }
+    while (Date.now() < deadline) {
+      if (db.findById(record.consultId)?.state === 'settled') {
+        queue = JSON.parse(await readFile(queuePath, 'utf8')) as typeof queue
+        if ((queue.settledReceipts ?? []).length === 0) break
+      }
       await new Promise((r) => setTimeout(r, 20))
     }
     assert.equal(db.findById(record.consultId)?.state, 'settled')
     assert.equal(db.findById(record.consultId)?.advice, 'ORIGINAL_ADVICE')
     assert.ok(calls >= 2, `projection calls=${calls}`)
-    const queue = JSON.parse(await readFile(queuePath, 'utf8')) as {
-      pending: unknown[]
-      settledReceipts: unknown[]
-    }
     assert.equal(queue.pending.length, 0)
     assert.equal(queue.settledReceipts.length, 0)
     db.close()

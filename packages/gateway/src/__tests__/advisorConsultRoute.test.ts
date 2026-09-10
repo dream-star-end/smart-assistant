@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, afterEach, describe, it } from 'node:test'
@@ -24,6 +24,7 @@ import {
   issueConsultTurnToken,
   resetDelegateContextKeyForTests,
 } from '../delegateContext.js'
+import { createDelegateEngineBillingClient } from '../delegateEngineBilling.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
@@ -1432,5 +1433,101 @@ describe('OCV5-210 R1 E2/W1', () => {
     assert.equal(get.status, 200, JSON.stringify(get.body))
     assert.equal(get.body.parentEngine, 'ccb')
     assert.equal(get.body.advisorConsultAllowed, true)
+  })
+})
+
+describe('OCV5-210 M7 settlement authority', () => {
+  it('failed settle plus one pending-state write failure must not become settled', async () => {
+    const { gw, dir } = await makeGateway()
+    let posts = 0
+    let faults = 0
+    const queuePath = join(dir, 'billing.json')
+    const client = createDelegateEngineBillingClient({
+      startupRecovery: false,
+      queuePath,
+      retryMs: 60_000,
+      env: {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:9',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: 'synthetic-fixture',
+      },
+      fetcher: (async () => {
+        posts += 1
+        return {
+          statusCode: 500,
+          body: (async function* () {
+            yield Buffer.from('{"error":{"code":"MASTER_DOWN"}}')
+          })(),
+        }
+      }) as never,
+    })
+    gw._delegateEngineBilling.settle = client.settle.bind(client)
+    const update = gw._advisorConsults.update.bind(gw._advisorConsults)
+    gw._advisorConsults.update = ((id: string, patch: { state?: string }) => {
+      if (patch.state === 'settle_pending' && faults === 0) {
+        faults += 1
+        throw new Error('SQLITE_BUSY')
+      }
+      return update(id, patch as Parameters<typeof update>[1])
+    }) as typeof update
+    try {
+      const response = await http(
+        gw,
+        'POST',
+        '/api/agents/advisor/consult',
+        { question: 'why red?' },
+        consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-e3-no-2xx' }),
+      )
+      const row = gw._advisorConsults.findById(response.body.consultId)
+      const queue = JSON.parse(await readFile(queuePath, 'utf8')) as {
+        pending: unknown[]
+        settledReceipts?: unknown[]
+      }
+      assert.equal(posts, 1)
+      assert.equal(faults, 1)
+      assert.equal(queue.pending.length, 1)
+      assert.equal(queue.settledReceipts?.length ?? 0, 0)
+      assert.notEqual(row.state, 'settled')
+      assert.notEqual(response.body.status, 'settled')
+    } finally {
+      gw._advisorConsults.close()
+    }
+  })
+
+  it('config read failure releases early registration; same invocation is not stuck pending', async () => {
+    const { gw, dir, billing } = await makeGateway()
+    const good = gw._advisorConfig.read()
+    const sameHeaders = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-w5-cleanup' })
+    writeFileSync(join(dir, 'collaboration-config.json'), '{broken')
+    const first = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      sameHeaders,
+    )
+    assert.ok(first.status >= 500, JSON.stringify(first.body))
+    writeFileSync(join(dir, 'collaboration-config.json'), JSON.stringify(good))
+    gw._advisorConsultWaitMs = 10
+    const replay = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      sameHeaders,
+    )
+    assert.equal(billing.admits.length, 0)
+    assert.equal(gw._spawnCount ?? 0, 0)
+    assert.equal(gw._advisorConsultAborts?.size ?? 0, 0)
+    assert.equal(gw._activeDelegationsByParent.get(PARENT_KEY)?.size ?? 0, 0)
+    assert.notEqual(replay.status, 202)
+    const rec = gw._advisorConsults.findByInvocation({
+      userId: '3',
+      originTurnKey: TURN_KEY,
+      invocationId: 'cinv-w5-cleanup',
+    })
+    assert.ok(rec)
+    assert.equal(rec.state, 'failed')
+    assert.equal(rec.billingRequestId, null)
+    gw._advisorConsults.close()
   })
 })

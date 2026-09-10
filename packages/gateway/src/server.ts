@@ -12471,6 +12471,9 @@ export class Gateway {
       this._advisorConsultAborts?.delete(advisorSessionKey)
       unregisterEarly?.()
     }
+    let handedToSpawn = false
+    let recordedConsultId: string | undefined
+    try {
     let historyRecords: ReturnType<typeof historyFromSessionMessages>['records']
     let historyMissing: string[] = []
     try {
@@ -12544,6 +12547,7 @@ export class Gateway {
       state: 'accepted',
       tokenReceipt: hashConsultTurnToken(String(token)),
     })
+    recordedConsultId = inserted.record.consultId
     if (inserted.reused) {
       releaseEarly()
       const presented = await this._presentExistingConsult({
@@ -12641,6 +12645,7 @@ export class Gateway {
       releaseEarly()
       return this.sendError(res, 500, 'consult persist after admit failed')
     }
+    handedToSpawn = true
     const spawned = await this._spawnAdvisorConsult({
       consultId: inserted.record.consultId,
       parent,
@@ -12663,6 +12668,25 @@ export class Gateway {
       truncated: snapshot.truncated,
       error: spawned.error,
     })
+    } catch (err) {
+      if (recordedConsultId) {
+        const rec = store.findById(recordedConsultId)
+        if (
+          rec &&
+          !rec.billingRequestId &&
+          (rec.state === 'accepted' || rec.state === 'admission_attempt')
+        ) {
+          try {
+            store.update(recordedConsultId, { state: 'failed' })
+          } catch {
+            /* best-effort close of a never-admitted row */
+          }
+        }
+      }
+      return this.sendError(res, 500, String((err as Error)?.message ?? err))
+    } finally {
+      if (!handedToSpawn) releaseEarly()
+    }
   }
 
   private async _loadConsultHistoryTape(peerId: string, userId: string, turnKey: string) {
@@ -12697,6 +12721,7 @@ export class Gateway {
     let jobs: DelegateJobStore | undefined
     let liveBilling: DurableCodexBilling | null = null
     let advice = ''
+    let settleError: string | undefined
     const cancelIfAborted = async (): Promise<{
       state: string
       advice: string
@@ -12822,7 +12847,6 @@ export class Gateway {
     consultStore.update(input.consultId, { state: 'spawned', jobId })
     let error: string | undefined
     let cancelCode: string | undefined
-    let settleError: string | undefined
     let settleTask: Promise<void> | undefined
     const originConsultId = input.consultId
     try {
@@ -12878,11 +12902,13 @@ export class Gateway {
       }
     }
     if (settleTask) await settleTask
-    if (advice) {
+    // Only project after an authoritative 2xx for this requestId. Advice or
+    // observed usage is not payment evidence.
+    if (!settleError && liveBilling && advice) {
       try {
         consultStore.projectOneReceipt(input.requestId)
       } catch {
-        /* keep settle_pending / spawned until auto-retry */
+        /* keep settle_pending / spawned until receipt-driven auto-retry */
       }
     }
     const jobSnap = jobs.snapshotOf(jobId)
@@ -12957,9 +12983,10 @@ export class Gateway {
       const observed = Boolean(liveBilling)
       const current = consultStore.findById(input.consultId)
       if (observed || current?.state === 'settled' || current?.state === 'settle_pending') {
+        const inheritSettled = current?.state === 'settled' && !settleError
         try {
           consultStore.update(input.consultId, {
-            state: current?.state === 'settled' ? 'settled' : 'settle_pending',
+            state: inheritSettled ? 'settled' : 'settle_pending',
             billingRequestId: input.requestId,
             advice: advice || current?.advice || null,
           })
@@ -12981,7 +13008,7 @@ export class Gateway {
                   ok: true,
                   advice,
                   consultId: input.consultId,
-                  settlePending: current?.state !== 'settled',
+                  settlePending: !inheritSettled,
                 },
               },
               spawnFailFence,
@@ -12991,7 +13018,7 @@ export class Gateway {
           }
         }
         return {
-          state: current?.state === 'settled' ? 'settled' : 'settle_pending',
+          state: inheritSettled ? 'settled' : 'settle_pending',
           advice,
           jobId,
           error: detail,
