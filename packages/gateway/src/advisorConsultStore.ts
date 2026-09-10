@@ -145,7 +145,10 @@ export class AdvisorConsultStore {
    * Insert consult + snapshot in one transaction. Unique invocation wins:
    * existing row is returned (caller must verify question/concern).
    */
-  insertNew(record: AdvisorConsultRecord): { record: AdvisorConsultRecord; reused: boolean } {
+  insertNew(
+    record: Omit<AdvisorConsultRecord, 'createdAt' | 'updatedAt'> &
+      Partial<Pick<AdvisorConsultRecord, 'createdAt' | 'updatedAt'>>,
+  ): { record: AdvisorConsultRecord; reused: boolean } {
     const existing = this.findByInvocation({
       userId: record.userId,
       originTurnKey: record.originTurnKey,

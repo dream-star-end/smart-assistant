@@ -77,6 +77,7 @@ import {
   postJsonToGateway,
   readGatewayToken,
 } from './gatewayClient.js'
+import { resolveConsultInvocationId } from './consultInvocation.js'
 import {
   askUserHttpTimeoutMs,
   askUserToolPostedFallback,
@@ -270,7 +271,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'request_review':
         return await handleRequestReview(args as any)
       case 'consult_advisor':
-        return await handleConsultAdvisor(args as any)
+        return await handleConsultAdvisor(args as any, req)
       case 'task_create':
         return await handleTaskCreate(args as any)
       case 'task_update':
@@ -834,14 +835,21 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
   }
 }
 
-async function handleConsultAdvisor(args: { question?: string; concern?: string }) {
+async function handleConsultAdvisor(
+  args: { question?: string; concern?: string },
+  req: { params?: { _meta?: unknown }; id?: unknown },
+) {
   const question = typeof args?.question === 'string' ? args.question.trim() : ''
   if (!question) return toolError('question 必填')
   const concern = typeof args?.concern === 'string' ? args.concern.trim() : ''
-  const invocationId = `cinv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const invocation = resolveConsultInvocationId({
+    mcpMeta: req?.params?._meta,
+    jsonRpcId: req?.id,
+  })
+  if (!invocation.ok) return toolError(invocation.error)
   const headers = {
     ...gatewayDelegateHeaders(),
-    [CONSULT_INVOCATION_HEADER]: invocationId,
+    [CONSULT_INVOCATION_HEADER]: invocation.invocationId,
   }
   try {
     const res = await postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {

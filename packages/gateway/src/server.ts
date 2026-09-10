@@ -12058,11 +12058,13 @@ export class Gateway {
       const proven = [...openAdvisorEngines(), ...(collabDoc.provenEngines ?? [])]
       const view = await getLocalCatalogView()
       const listed = listProvenAdvisorModels({ catalog: view.models, provenEngines: proven })
-      return assertAdvisorModelAllowed({
+      const allowed = assertAdvisorModelAllowed({
         requested,
         advisorModels: listed.advisorModels,
         unavailableReason: listed.advisorUnavailableReason,
       })
+      if (!allowed.ok) return allowed
+      return { ok: true, advisorModel: allowed.model }
     } catch (err) {
       return {
         ok: false,
@@ -12156,7 +12158,7 @@ export class Gateway {
     try {
       const page = await listTurnTapeRecords(parent.peerId, userId, parent._currentTurnKey ?? '', 0, 80)
       if (page?.records) {
-        const hist = historyFromSessionMessages(page.records, { hasMore: page.nextCursor != null })
+        const hist = historyFromSessionMessages(page.records as never, { hasMore: page.nextCursor != null })
         historyRecords = hist.records
         historyMissing = hist.missing
       }
@@ -12166,7 +12168,7 @@ export class Gateway {
     if (!historyRecords) {
       try {
         const tape = await getClientSession(parent.peerId, userId)
-        const hist = historyFromSessionMessages(tape?.messages, {
+        const hist = historyFromSessionMessages(tape?.messages as never, {
           archivedThroughSeq: tape?.archivedThroughSeq,
           hasMore: tape?.timelineHasMore,
         })
@@ -12581,11 +12583,15 @@ export class Gateway {
     if (parsed.mode !== 'solo' && parsed.mode !== 'advisor' && parsed.mode !== 'team') {
       return this.sendError(res, 400, 'mode must be solo|advisor|team')
     }
+    if (
+      parsed.mode === 'advisor' &&
+      (typeof parsed.advisorModel !== 'string' || !parsed.advisorModel.trim())
+    ) {
+      return this.sendError(res, 400, 'advisorModel required')
+    }
     const advisorModel =
-      parsed.mode === 'advisor'
-        ? typeof parsed.advisorModel === 'string' && parsed.advisorModel.trim()
-          ? parsed.advisorModel.trim()
-          : 'gpt-6-astra'
+      parsed.mode === 'advisor' && typeof parsed.advisorModel === 'string'
+        ? parsed.advisorModel.trim()
         : null
     if (parsed.mode === 'advisor') {
       const listed = await catalogOptions()
@@ -20374,20 +20380,36 @@ export class Gateway {
       typeof (frame as { advisorModel?: unknown }).advisorModel === 'string'
         ? (frame as { advisorModel: string }).advisorModel.trim()
         : ''
-    let frozenAdvisorModel = requestedAdvisorModel || 'gpt-6-astra'
+    let frozenAdvisorModel = requestedAdvisorModel
     let advisorTurnAllowed = false
     if (inboundCollabMode === 'advisor' && agent.id === 'main' && !adapter) {
-      const freeze = await this._freezeAdvisorTurn(frozenAdvisorModel)
+      const freeze = requestedAdvisorModel
+        ? await this._freezeAdvisorTurn(requestedAdvisorModel)
+        : { ok: false as const, error: 'advisorModel required' }
       if (freeze.ok) {
         advisorTurnAllowed = true
         frozenAdvisorModel = freeze.advisorModel
         finalText = advisorPreamble('advisor') + finalText
       } else {
+        const _errUserId: string =
+          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
         this.log.warn('advisor_model_rejected', {
           sessionKey,
-          requested: frozenAdvisorModel,
+          requested: requestedAdvisorModel,
           error: freeze.error,
         })
+        const rejectFrames = _earlyRejectErrorFrames({
+          sessionKey,
+          channel: frame.channel,
+          peer: frame.peer,
+          userId: _errUserId,
+          traceId: turnTraceId,
+          code: 'upstream_failed',
+          message: `顾问模式无法启动：${freeze.error}`,
+          legacyErrorText: `[error] advisor mode rejected: ${freeze.error}`,
+        })
+        for (const f of rejectFrames) this.deliver(f, adapter)
+        return
       }
     }
     // 团队模式(v5 轻量组队):main 队长这一轮前置"组队引导"——列出可委派的已安装 agent
@@ -20462,12 +20484,7 @@ export class Gateway {
     // engine persist 之前完成,走正常归因/drain)。此处只 stash 两个服务端权威快照,
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
-    session._collabModeTurn =
-      agent.id === 'main' && !adapter
-        ? inboundCollabMode === 'advisor' && !advisorTurnAllowed
-          ? 'solo'
-          : inboundCollabMode
-        : 'solo'
+    session._collabModeTurn = agent.id === 'main' && !adapter ? inboundCollabMode : 'solo'
     const inboundConfigVersion = collabConfigVersionOf({
       mode: advisorTurnAllowed ? 'advisor' : session._collabModeTurn,
       advisorModel: frozenAdvisorModel,

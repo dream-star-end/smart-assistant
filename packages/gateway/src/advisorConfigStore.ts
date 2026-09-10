@@ -252,8 +252,14 @@ export class AdvisorConfigStore {
     if (input.sessionId && !isSessionId(input.sessionId)) {
       throw new CollaborationConfigError('VALIDATION', 'session id invalid')
     }
+    if (!input.sessionId && input.asDefault !== true) {
+      throw new CollaborationConfigError(
+        'VALIDATION',
+        'asDefault or sessionId required; refusing to write the user default',
+      )
+    }
     const writeSession = Boolean(input.sessionId)
-    const writeDefault = input.asDefault === true || !input.sessionId
+    const writeDefault = input.asDefault === true
     return this.mutate(input.expectedRev, (doc) => {
       if (writeSession && input.sessionId) {
         doc.sessions[input.sessionId] = {

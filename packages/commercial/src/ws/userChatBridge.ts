@@ -368,6 +368,9 @@ export interface PromptQueueDispatchRequest {
       modelSwitchId?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
+      collabMode?: "solo" | "advisor" | "team";
+      advisorModel?: string;
+      collabConfigVersion?: string;
       contextTier?: CursorContextTier;
     };
   };
@@ -448,6 +451,14 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
+  if (
+    execution.collabMode !== undefined &&
+    execution.collabMode !== "solo" &&
+    execution.collabMode !== "advisor" &&
+    execution.collabMode !== "team"
+  ) return null;
+  if (execution.advisorModel !== undefined && typeof execution.advisorModel !== "string") return null;
+  if (execution.collabConfigVersion !== undefined && typeof execution.collabConfigVersion !== "string") return null;
   if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) return null;
   return value as unknown as PromptQueueDispatchRequest;
 }
@@ -8123,6 +8134,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
+            ...(execution.collabMode !== undefined ? { collabMode: execution.collabMode } : {}),
+            ...(execution.advisorModel !== undefined ? { advisorModel: execution.advisorModel } : {}),
+            ...(execution.collabConfigVersion !== undefined
+              ? { collabConfigVersion: execution.collabConfigVersion }
+              : {}),
             ...(execution.contextTier !== undefined ? { contextTier: execution.contextTier } : {}),
             [PROMPT_QUEUE_GRANT_FIELD]: {
               grantId: request.grantId,

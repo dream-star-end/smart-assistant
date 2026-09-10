@@ -70,7 +70,7 @@ export function cursorDelegateCliHint(name = 'delegate_task'): string {
   if (name === 'consult_advisor') {
     return [
       'Cursor MCP 不提供 consult_advisor（60 秒硬超时）。',
-      '请用 Bash：',
+      '请用 Bash（invocation 必须由引擎注入 OPENCLAUDE_CONSULT_INVOCATION，禁止自行 mint）：',
       '  oc-memory consult-advisor --question "<疑问或关注点>" [--concern "<补充>"]',
     ].join('\n')
   }

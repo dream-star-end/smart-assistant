@@ -62,6 +62,9 @@ export interface PromptQueueDetail {
     modelSwitchId?: string
     effortLevel?: string | null
     teamMode?: boolean
+    collabMode?: 'solo' | 'advisor' | 'team'
+    advisorModel?: string
+    collabConfigVersion?: string
     contextTier?: CursorContextTier
   }
   deliveryIntent?: {

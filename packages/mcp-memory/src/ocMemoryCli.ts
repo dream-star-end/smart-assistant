@@ -67,6 +67,7 @@ import {
   type DelegateCliArgs,
 } from './delegateStartCli.js'
 import { CONSULT_INVOCATION_HEADER, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
+import { resolveConsultInvocationId } from './consultInvocation.js'
 
 const TOOL = 'oc-memory'
 
@@ -223,10 +224,11 @@ async function main(): Promise<void> {
     const question = flags.question || positional[0]
     if (!question) fail('consult-advisor requires --question "<text>"')
     const concern = flags.concern || ''
-    const invocationId = `cinv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const invocation = resolveConsultInvocationId({ env: process.env })
+    if (!invocation.ok) fail(invocation.error)
     const headers = gatewayDelegateHeaders()
     headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
-    headers[CONSULT_INVOCATION_HEADER] = invocationId
+    headers[CONSULT_INVOCATION_HEADER] = invocation.invocationId
     try {
       const res = await postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
         headers,

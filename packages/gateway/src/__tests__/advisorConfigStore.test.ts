@@ -72,6 +72,25 @@ describe('advisorConfigStore', () => {
     assert.equal(onlyDefault.defaultMode, 'solo')
   })
 
+  it('putIntent without sessionId and without asDefault does not write the user default', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-collab-'))
+    const store = new AdvisorConfigStore(join(dir, 'collaboration-config.json'))
+    await assert.rejects(
+      () =>
+        store.putIntent({
+          mode: 'advisor',
+          advisorModel: 'gpt-6-astra',
+          expectedRev: 0,
+        }),
+      (err: unknown) =>
+        err instanceof CollaborationConfigError &&
+        err.code === 'VALIDATION' &&
+        /asDefault or sessionId/.test(err.message),
+    )
+    assert.equal(store.read().defaultMode, 'solo')
+    assert.equal(store.read().rev, 0)
+  })
+
   it('parseCollaborationConfigDoc rejects collaborationMode native field as format', () => {
     assert.throws(
       () =>

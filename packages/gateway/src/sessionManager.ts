@@ -7714,7 +7714,7 @@ export class SessionManager {
           ? {
               consultTurn: {
                 configVersion: session._advisorTurn.configVersion,
-                turnIndex: projectedTurnIndex,
+                turnIndex: prevTurns + 1,
               },
             }
           : {}),

@@ -308,6 +308,7 @@ describe('advisor consult route lifecycle', () => {
       await new Promise<void>((resolve) => {
         resume = resolve
       })
+      throw new Error('user_stop interrupt')
     }
     const pending = http(
       gw,
@@ -324,7 +325,7 @@ describe('advisor consult route lifecycle', () => {
     resume()
     const r = await pending
     assert.equal(r.status, 200)
-    assert.equal(r.body.status, 'failed')
+    assert.equal(r.body.status, 'cancelled')
     assert.equal(gw._activeDelegations, 0)
   })
 
@@ -396,5 +397,82 @@ describe('advisor consult route lifecycle', () => {
       [CONSULT_INVOCATION_HEADER]: 'cinv-no-token',
     })
     assert.equal(r.status, 401)
+  })
+
+  it('missing invocation header is 400 and does not admit', async () => {
+    const { gw, billing } = await makeGateway()
+    const token = issueConsultTurnToken({
+      agentId: 'main',
+      sessionKey: PARENT_KEY,
+      depth: 0,
+      turnKey: TURN_KEY,
+      turnIndex: 1,
+      collabMode: 'advisor',
+      configVersion: 'v1:advisor:gpt-6-astra',
+    })
+    const r = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, {
+      [DELEGATE_CONTEXT_HEADER]: token,
+    })
+    assert.equal(r.status, 400)
+    assert.equal(billing.admits.length, 0)
+  })
+
+  it('same invocation with a different question conflicts and does not admit twice', async () => {
+    const { gw, billing } = await makeGateway()
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-conflict-1' })
+    const first = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    const second = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'a different question' },
+      headers,
+    )
+    assert.equal(first.status, 200)
+    assert.equal(second.status, 409)
+    assert.equal(billing.admits.length, 1)
+    assert.equal(gw._spawnCount, 1)
+  })
+
+  it('admission_unknown does not admit a second time', async () => {
+    const { gw, billing } = await makeGateway()
+    billing.admit = async (input: unknown) => {
+      billing.admits.push(input)
+      throw new Error('master down')
+    }
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-unknown-1' })
+    const first = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    const second = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(first.status, 503)
+    assert.equal(first.body.state, 'admission_unknown')
+    assert.equal(second.status, 200)
+    assert.equal(second.body.reused, true)
+    assert.equal(billing.admits.length, 1)
+    assert.equal(gw._spawnCount ?? 0, 0)
+  })
+
+  it('PUT advisor without a model does not fill gpt-6-astra', async () => {
+    const { gw } = await makeGateway()
+    const r = await http(gw, 'PUT', '/api/collaboration-config', {
+      mode: 'advisor',
+      expectedRev: 0,
+      asDefault: true,
+    })
+    assert.equal(r.status, 400, JSON.stringify(r.body))
+    assert.match(String(r.body.error), /advisorModel required/)
+    assert.equal(gw._advisorConfig.read().defaultAdvisorModel, null)
+    assert.equal(gw._advisorConfig.read().rev, 0)
+  })
+
+  it('PUT without sessionId and without asDefault does not write the user default', async () => {
+    const { gw } = await makeGateway()
+    const r = await http(gw, 'PUT', '/api/collaboration-config', {
+      mode: 'solo',
+      expectedRev: 0,
+    })
+    assert.equal(r.status, 400, JSON.stringify(r.body))
+    assert.match(String(r.body.error), /asDefault or sessionId/)
+    assert.equal(gw._advisorConfig.read().defaultMode, 'solo')
+    assert.equal(gw._advisorConfig.read().rev, 0)
   })
 })
