@@ -24,13 +24,17 @@ const NONCE = createHmac('sha256', BRIDGE).update('3').digest('hex')
 const ROLE = process.env.OC_M12_TOPOLOGY_ROLE
 const temps: string[] = []
 
-after(() => {
-  for (const dir of temps) {
+function removeTemps() {
+  while (temps.length) {
+    const dir = temps.pop()
+    if (!dir) continue
     try {
       rmSync(dir, { recursive: true, force: true })
     } catch {}
   }
-})
+}
+
+after(removeTemps)
 
 function catalogView() {
   const models = [
@@ -155,7 +159,8 @@ if (ROLE === 'sidecar' || ROLE === 'master') {
     if (m.cmd === 'end') {
       _setModelCatalogClientForTests(null)
       await new Promise<void>((resolve) => server.close(() => resolve()))
-      process.exit(0)
+      await (await import('@openclaude/storage')).closeSessionsDb()
+      process.disconnect?.()
     }
   })
 } else {
@@ -335,12 +340,22 @@ if (ROLE === 'sidecar' || ROLE === 'master') {
         assert.ok(dests.every((url) => url.startsWith('http://127.0.0.1:')))
         assert.equal(dests.length > 0, true)
       } finally {
-        master.send({ cmd: 'end' })
-        side.send({ cmd: 'end' })
-        await Promise.all([
-          new Promise((resolve) => master.once('exit', resolve)),
-          new Promise((resolve) => side.once('exit', resolve)),
-        ])
+        const waitExit = (child: ChildProcess) =>
+          new Promise<void>((resolve) => {
+            if (child.exitCode != null || child.killed) {
+              resolve()
+              return
+            }
+            child.once('exit', () => resolve())
+          })
+        try {
+          master.send({ cmd: 'end' })
+        } catch {}
+        try {
+          side.send({ cmd: 'end' })
+        } catch {}
+        await Promise.all([waitExit(master), waitExit(side)])
+        removeTemps()
       }
     })
   })

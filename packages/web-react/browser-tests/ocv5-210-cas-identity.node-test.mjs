@@ -61,7 +61,9 @@ test("CAS reread failure after account switch does not send previous team as the
     const errors = [];
     const calls = [];
     let casArmed = false;
-    let releaseReread;
+    let rereadStarted = false;
+    let bLoaded = false;
+    let releaseReread = () => {};
     const hangReread = new Promise((resolve) => {
       releaseReread = resolve;
     });
@@ -101,12 +103,14 @@ test("CAS reread failure after account switch does not send previous team as the
         body = { ok: true, applied: true };
       } else if (path === "/api/collaboration-config" && method === "GET") {
         if (casArmed && token === "tok-1") {
+          rereadStarted = true;
           await hangReread;
           body = collabDoc({
             session: { mode: "team", advisorModel: null, configVersion: "v1:team:", source: "session" },
             defaultMode: "team",
           });
         } else if (token === "tok-b") {
+          bLoaded = true;
           body = collabDoc();
         } else {
           body = collabDoc({
@@ -152,10 +156,11 @@ test("CAS reread failure after account switch does not send previous team as the
       await page.getByLabel(/同时作为新会话默认/).check();
       await page.getByRole("button", { name: /主模型独立完成/ }).click();
       const armedAt = Date.now();
-      while (!casArmed && Date.now() - armedAt < 10_000) {
+      while (!(casArmed && rereadStarted) && Date.now() - armedAt < 10_000) {
         await page.waitForTimeout(50);
       }
       assert.equal(casArmed, true, "solo+asDefault PUT must 409");
+      assert.equal(rereadStarted, true, "old reread must actually be pending");
       await page.getByRole("button", { name: "关闭" }).click();
       await page.getByRole("dialog").waitFor({ state: "hidden" });
       await page.getByRole("button", { name: "账号菜单" }).click();
@@ -169,22 +174,39 @@ test("CAS reread failure after account switch does not send previous team as the
       await page.getByRole("button", { name: /切换智能体/ }).click();
       assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
       assert.equal(await page.getByRole("button", { name: /队长切 Astra/ }).getAttribute("aria-pressed"), "false");
+      assert.equal(bLoaded, true, "B collab GET must complete before releasing A");
+      assert.equal(await page.getByLabel(/同时作为新会话默认/).isChecked(), false);
       const before = calls.filter((row) => row.token === "tok-b").length;
       releaseReread();
       await page.waitForTimeout(400);
       assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
       assert.equal(await page.getByRole("button", { name: /队长切 Astra/ }).getAttribute("aria-pressed"), "false");
+      assert.equal(await page.getByLabel(/同时作为新会话默认/).isChecked(), false);
       await page.keyboard.press("Escape");
       await page.getByPlaceholder(/和「全能助手」对话/).fill("B 新消息");
       await page.getByRole("button", { name: "发送" }).click();
       await page.getByTestId("user-row").filter({ hasText: "B 新消息" }).waitFor();
-      const bPuts = calls.filter((row) => row.token === "tok-b").slice(before);
-      assert.equal(bPuts.some((row) => row.mode === "team" || row.asDefault === true), false);
+      const ordinaryBPuts = calls.filter((row) => row.token === "tok-b").slice(before);
+      assert.deepEqual(ordinaryBPuts, []);
+      await page.getByRole("button", { name: /切换智能体/ }).click();
+      assert.equal(await page.getByLabel(/同时作为新会话默认/).isChecked(), false);
+      await page.getByRole("button", { name: /队长切 Astra/ }).click();
+      const chosenAt = Date.now();
+      while (calls.filter((row) => row.token === "tok-b").length <= before && Date.now() - chosenAt < 10_000) {
+        await page.waitForTimeout(50);
+      }
+      const actualB = calls.filter((row) => row.token === "tok-b").at(-1);
+      assert.ok(actualB, "require nonempty legitimate B config HTTP");
+      assert.equal(actualB.token, "tok-b");
+      assert.equal(actualB.mode, "team");
+      assert.equal(actualB.asDefault, false);
+      assert.ok(actualB.sessionId);
       assert.deepEqual(errors, []);
     } catch (error) {
       console.error("page errors:", errors, "calls:", calls, "body:", (await page.locator("body").innerText()).slice(-2000));
       throw error;
     } finally {
+      releaseReread();
       await context.close();
     }
   } finally {

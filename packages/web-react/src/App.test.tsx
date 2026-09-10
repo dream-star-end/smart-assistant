@@ -873,6 +873,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       releaseReread = resolve
     })
     let casArmed = false
+    let rereadStarted = false
+    let bLoaded = false
     const collabPuts: Array<{ token: string; body: Record<string, unknown> }> = []
     const base = routedFetch({
       models: {
@@ -920,6 +922,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       }
       if (u.includes('/api/collaboration-config') && method === 'GET') {
         if (casArmed && token === 'tok-1') {
+          rereadStarted = true
           await hangReread
           return okJson(
             collabDoc({
@@ -929,6 +932,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
           )
         }
         if (token === 'tok-b') {
+          bLoaded = true
           return okJson(
             collabDoc({
               session: { mode: 'solo', advisorModel: null, configVersion: 'v1:solo:', source: 'default' },
@@ -962,7 +966,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     fireEvent.click(asDefaultBox)
     await waitFor(() => expect(asDefaultBox).toBeChecked())
     fireEvent.click(soloChoice())
-    await waitFor(() => expect(casArmed).toBe(true))
+    try {
+    await waitFor(() => expect(casArmed && rereadStarted).toBe(true))
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
     await waitFor(() => expect(screen.queryByRole('button', { name: /队长切 Astra/ })).not.toBeInTheDocument())
 
@@ -974,9 +979,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
     await loginViaUi('b@c.com')
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await waitFor(() => expect(bLoaded).toBe(true))
     await openAgentPicker()
     expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
     expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByLabelText(/同时作为新会话默认/)).not.toBeChecked()
 
     const putsBeforeRelease = collabPuts.filter((row) => row.token === 'tok-b').length
     releaseReread()
@@ -985,6 +992,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
     expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
     expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByLabelText(/同时作为新会话默认/)).not.toBeChecked()
 
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
     const tb = await screen.findByPlaceholderText('和「全能助手」对话…')
@@ -993,8 +1001,22 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       fireEvent.click(screen.getByRole('button', { name: '发送' }))
     })
     await waitFor(() => expect(screen.getAllByText('B 新消息').length).toBeGreaterThan(0))
-    const bPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
-    expect(bPuts.every((row) => row.body.mode !== 'team' && row.body.asDefault !== true)).toBe(true)
+    const ordinaryBPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
+    expect(ordinaryBPuts).toEqual([])
+    await openAgentPicker()
+    expect(screen.getByLabelText(/同时作为新会话默认/)).not.toBeChecked()
+    fireEvent.click(teamChoice())
+    await waitFor(() =>
+      expect(collabPuts.filter((row) => row.token === 'tok-b').length).toBeGreaterThan(putsBeforeRelease),
+    )
+    const actual = collabPuts.filter((row) => row.token === 'tok-b').at(-1)!
+    expect(actual.token).toBe('tok-b')
+    expect(actual.body.mode).toBe('team')
+    expect(actual.body.asDefault).not.toBe(true)
+    expect(actual.body.sessionId).toBeTruthy()
+    } finally {
+      releaseReread()
+    }
   })
 
   test('server collaboration config wins over legacy localStorage team flag', async () => {
