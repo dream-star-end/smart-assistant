@@ -59,6 +59,9 @@ import {
   ZCODE_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   AGENT_MODEL_AUTO,
+  ADVISOR_AGENT_ID,
+  normalizeCollabMode,
+  collabConfigVersionOf,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
   AUTHORITY_TURN_MAX_LIFETIME_MS,
@@ -101,7 +104,9 @@ import {
 } from './errorClassify.js'
 import { parseCreditBudgetFen } from './creditExhaustion.js'
 import {
+  CONSULT_INVOCATION_HEADER,
   DELEGATE_CONTEXT_HEADER,
+  isConsultTurnClaims,
   verifyDelegateContextToken,
 } from './delegateContext.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
@@ -260,9 +265,25 @@ import {
   filterUserVisibleByAgentField,
   filterUserVisibleRoutesForManagement,
   isHiddenSystemAgentId,
+  isTeamReviewExecution,
   userVisibleDefaultAgentId,
 } from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
+import {
+  advisorPreamble,
+  buildAdvisorSnapshot,
+  collectAuthorizedArtifacts,
+  extractGeneratedPaths,
+  formatAdvisorConsultPrompt,
+  isAdvisorEngineOpen,
+  matchConsultIdentity,
+} from './advisorMode.js'
+import { AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
+import {
+  AdvisorConfigStore,
+  CollaborationConfigError,
+  resolveSessionCollab,
+} from './advisorConfigStore.js'
 import type {
   GatewayEngineErrorEvent,
   GatewayStreamEvent,
@@ -519,6 +540,7 @@ import {
 } from './sessionRepoWorkspace.js'
 import {
   SessionManager,
+  isCommercialManagedRuntime,
   lookupRecentTerminal,
   parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
@@ -6200,6 +6222,15 @@ export class Gateway {
       this.handleDelegateWait(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
+    // ── Advisor consult (dedicated; never /delegate) ──
+    if (url.pathname === '/api/agents/advisor/consult' && req.method === 'POST') {
+      this.handleConsultAdvisor(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
+    if (url.pathname === '/api/collaboration-config') {
+      this.handleCollaborationConfig(req, res, url).catch((err) => this.sendInternalError(res, err))
+      return
+    }
     // ── Synchronous task delegation ──
     const delegateMatch = url.pathname.match(/^\/api\/agents\/([A-Za-z0-9._:-]+)\/delegate$/)
     if (delegateMatch) {
@@ -11016,6 +11047,8 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  private _advisorConsults: AdvisorConsultStore | undefined
+  private _advisorConfig: AdvisorConfigStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
   /** Test seam: grok relay route mint(默认 grok-build 优先 → mint 失败回落 glm 的用例注入)。 */
@@ -11997,6 +12030,461 @@ export class Gateway {
     return interrupted
   }
 
+  private advisorConsultStore(): AdvisorConsultStore {
+    return (this._advisorConsults ??= new AdvisorConsultStore())
+  }
+
+  private advisorConfigStore(): AdvisorConfigStore {
+    return (this._advisorConfig ??= new AdvisorConfigStore())
+  }
+
+  private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (isCommercialManagedRuntime()) return this.sendError(res, 404, 'advisor consult is selfhost only')
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: { question?: unknown; concern?: unknown }
+    try {
+      parsed = JSON.parse(body) as { question?: unknown; concern?: unknown }
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const question = typeof parsed.question === 'string' ? parsed.question.trim() : ''
+    const concern = typeof parsed.concern === 'string' ? parsed.concern.trim() : ''
+    if (!question) return this.sendError(res, 400, 'question 必填')
+    const contextRaw = req.headers[DELEGATE_CONTEXT_HEADER]
+    const token = Array.isArray(contextRaw) ? contextRaw[0] : contextRaw
+    const claims = verifyDelegateContextToken(typeof token === 'string' ? token : undefined)
+    if (!claims || !isConsultTurnClaims(claims) || claims.collabMode !== 'advisor') {
+      return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+    }
+    const invocationRaw = req.headers[CONSULT_INVOCATION_HEADER]
+    const invocationId = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim()
+    if (!invocationId || !/^[A-Za-z0-9:_-]{8,128}$/.test(invocationId)) {
+      return this.sendError(res, 400, 'x-openclaude-consult-invocation required')
+    }
+    const parent = this.sessions.getByKey(claims.sessionKey)
+    if (!parent || parent.agentId !== 'main' || parent._collabModeTurn !== 'advisor' || !parent._advisorTurn) {
+      return this.sendError(res, 409, '当前回合不是顾问模式，无法咨询')
+    }
+    if (parent._currentTurnKey !== claims.turnKey) {
+      const existing = this.advisorConsultStore().findByInvocation({
+        userId: String(parent.userId ?? ''),
+        originTurnKey: claims.turnKey,
+        invocationId,
+      })
+      if (!existing) {
+        return this.sendError(res, 409, '原回合已结束，不能再发起新的顾问咨询')
+      }
+      if (!matchConsultIdentity(existing, { question, concern })) {
+        return this.sendError(res, 409, 'invocation 与 question/concern 不一致')
+      }
+      return this.sendJson(res, 200, {
+        status: existing.jobId ? 'running' : existing.state,
+        jobId: existing.jobId,
+        consultId: existing.consultId,
+        reused: true,
+      })
+    }
+    const userId = String(parent.userId ?? this.getUserId(req) ?? '')
+    if (!userId) return this.sendError(res, 401, 'missing user')
+    const store = this.advisorConsultStore()
+    const existing = store.findByInvocation({
+      userId,
+      originTurnKey: claims.turnKey,
+      invocationId,
+    })
+    if (existing) {
+      if (!matchConsultIdentity(existing, { question, concern })) {
+        return this.sendError(res, 409, 'invocation 与 question/concern 不一致')
+      }
+      return this.sendJson(res, 200, {
+        status: existing.jobId ? 'running' : existing.state,
+        jobId: existing.jobId,
+        consultId: existing.consultId,
+        reused: true,
+        snapshotMissing: (() => {
+          try {
+            return (JSON.parse(existing.snapshotJson) as { missing?: string[] }).missing ?? []
+          } catch {
+            return ['snapshot_unreadable']
+          }
+        })(),
+      })
+    }
+    const snap = parent.runner.getPartialSnapshot()
+    const currentTools = snap.completedTools?.map((tool) => ({
+      name: tool.toolName,
+      input: tool.inputJson,
+      result: typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output ?? ''),
+      completed: tool.completed !== false,
+    }))
+    const mentioned = extractGeneratedPaths([
+      question,
+      concern,
+      parent._currentTurnUserText,
+      ...(currentTools ?? []).map((tool) => tool.result),
+    ])
+    const snapshot = buildAdvisorSnapshot({
+      question,
+      concern,
+      advisorModel: parent._advisorTurn.advisorModel,
+      source: {
+        userTask: parent._currentTurnUserText ?? '',
+        injectedConstraints: advisorPreamble('advisor'),
+        currentTools,
+        authorizedArtifacts: collectAuthorizedArtifacts({
+          generatedRoot: paths.generatedDir,
+          mentioned,
+        }),
+      },
+    })
+    const snapshotJson = JSON.stringify(snapshot)
+    const now = Date.now()
+    const inserted = store.insertNew({
+      consultId: mintConsultId(now),
+      invocationId,
+      userId,
+      sessionKey: claims.sessionKey,
+      clientSessionId: parent.peerId,
+      originTurnKey: claims.turnKey,
+      originTurnIndex: claims.turnIndex,
+      configVersion: claims.configVersion,
+      evidenceVersion: hashEvidence(snapshotJson),
+      advisorModel: parent._advisorTurn.advisorModel,
+      question,
+      concern,
+      snapshotJson,
+      jobId: null,
+      billingRequestId: null,
+      state: 'accepted',
+    })
+    if (inserted.reused) {
+      return this.sendJson(res, 200, {
+        status: inserted.record.jobId ? 'running' : inserted.record.state,
+        jobId: inserted.record.jobId,
+        consultId: inserted.record.consultId,
+        reused: true,
+      })
+    }
+    const engine = parent.providerTag === 'codex' ? 'codex' : parent.providerTag
+    if (!isAdvisorEngineOpen('codex')) {
+      store.update(inserted.record.consultId, { state: 'failed' })
+      return this.sendJson(res, 503, {
+        error: '顾问引擎尚未完成无工具证明，不能咨询',
+        consultId: inserted.record.consultId,
+      })
+    }
+    store.update(inserted.record.consultId, { state: 'admission_attempt' })
+    const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
+    let admission: { requestId: string }
+    try {
+      admission = await billingApi.admit({
+        model: parent._advisorTurn.advisorModel,
+        engine: 'codex',
+        agentId: ADVISOR_AGENT_ID,
+        delegateAgentId: ADVISOR_AGENT_ID,
+        sessionKey: `advisor:${claims.turnKey}:${inserted.record.consultId}`,
+        parentSessionId: parent.peerId,
+        parentTurnKey: claims.turnKey,
+      })
+    } catch (err) {
+      store.update(inserted.record.consultId, { state: 'admission_unknown' })
+      return this.sendJson(res, 503, {
+        error: `顾问准入不确定，不重复 admit: ${String((err as Error)?.message ?? err)}`,
+        consultId: inserted.record.consultId,
+        state: 'admission_unknown',
+      })
+    }
+    try {
+      store.update(inserted.record.consultId, {
+        state: 'admitted',
+        billingRequestId: admission.requestId,
+      })
+    } catch (err) {
+      try {
+        await billingApi.abandon(admission.requestId)
+      } catch {
+        store.update(inserted.record.consultId, {
+          state: 'admission_unknown',
+          billingRequestId: admission.requestId,
+        })
+        return this.sendJson(res, 503, {
+          error: '已准入但绑定落盘失败，已尝试 abandon',
+          consultId: inserted.record.consultId,
+          state: 'admission_unknown',
+        })
+      }
+      store.update(inserted.record.consultId, { state: 'failed' })
+      return this.sendError(res, 500, 'consult persist after admit failed')
+    }
+    void engine
+    try {
+      const spawned = await this._spawnAdvisorConsult({
+        consultId: inserted.record.consultId,
+        parent,
+        originTurnKey: claims.turnKey,
+        snapshot,
+        requestId: admission.requestId,
+        billingApi,
+      })
+      return this.sendJson(res, 200, {
+        status: spawned.state,
+        consultId: inserted.record.consultId,
+        requestId: admission.requestId,
+        jobId: spawned.jobId,
+        advice: spawned.advice,
+        missing: snapshot.missing,
+        truncated: snapshot.truncated,
+        error: spawned.error,
+      })
+    } catch (err) {
+      store.update(inserted.record.consultId, { state: 'failed' })
+      try {
+        await billingApi.abandon(admission.requestId)
+      } catch {
+        store.update(inserted.record.consultId, {
+          state: 'admission_unknown',
+          billingRequestId: admission.requestId,
+        })
+        return this.sendJson(res, 503, {
+          error: `顾问 spawn 失败且 abandon 不确定: ${String((err as Error)?.message ?? err)}`,
+          consultId: inserted.record.consultId,
+          state: 'admission_unknown',
+        })
+      }
+      return this.sendJson(res, 500, {
+        error: `顾问 spawn 失败: ${String((err as Error)?.message ?? err)}`,
+        consultId: inserted.record.consultId,
+        state: 'failed',
+      })
+    }
+  }
+
+  private async _spawnAdvisorConsult(input: {
+    consultId: string
+    parent: AgentSession
+    originTurnKey: string
+    snapshot: ReturnType<typeof buildAdvisorSnapshot>
+    requestId: string
+    billingApi: typeof defaultDelegateEngineBilling
+  }): Promise<{ state: string; advice: string; jobId?: string; error?: string }> {
+    const consultStore = this.advisorConsultStore()
+    const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
+    const cfg = await this._getAgentsConfig()
+    const sourceAgent =
+      cfg.agents.find((row) => row.id === 'main') ??
+      cfg.agents.find((row) => row.id === cfg.default)
+    if (!sourceAgent) throw new Error('advisor source agent missing')
+    const agent: AgentDef = {
+      ...sourceAgent,
+      id: ADVISOR_AGENT_ID,
+      model: input.snapshot.advisorModel,
+      provider: undefined,
+      runnerKind: undefined,
+      persona: undefined,
+      cwd: undefined,
+      mcpServers: [],
+      toolsets: [],
+    }
+    const execution = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'turn',
+      model: input.snapshot.advisorModel,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    const engine = execution?.engine ?? 'codex'
+    if (engine !== 'codex' || !isAdvisorEngineOpen('codex')) {
+      throw new Error('顾问引擎未开放或型号不是已证明的 Codex 顾问')
+    }
+    let jobId: string | undefined
+    if (this._delegateJobs) {
+      const created = this._delegateJobs.create(ADVISOR_AGENT_ID, {
+        sessionKey: advisorSessionKey,
+        parentSessionKey: input.parent.sessionKey,
+        queued: false,
+        kind: 'advisor',
+        callback: 'stdout-wait',
+        idempotencyKey: input.consultId,
+      })
+      if (!('error' in created)) {
+        jobId = created.jobId
+        consultStore.update(input.consultId, { jobId, state: 'admitted' })
+      }
+    }
+    let session: AgentSession
+    try {
+      session = await this.sessions.getOrCreate({
+        sessionKey: advisorSessionKey,
+        agent,
+        ...localExecutionOverride(execution),
+        channel: 'advisor',
+        peerId: input.parent.peerId,
+        userId: input.parent.userId,
+        hermeticNoTools: true,
+        usageAttribution: {
+          mode: 'delegate',
+          delegateAgentId: ADVISOR_AGENT_ID,
+          parentSessionId: input.parent.peerId,
+          parentTurnKey: input.originTurnKey,
+        },
+      })
+    } catch (err) {
+      await input.billingApi.abandon(input.requestId).catch(() => {})
+      throw err
+    }
+    consultStore.update(input.consultId, { state: 'spawned', ...(jobId ? { jobId } : {}) })
+    let advice = ''
+    let error: string | undefined
+    let liveBilling: DurableCodexBilling | null = null
+    let liveSettle: Promise<void> | undefined
+    try {
+      await this.sessions.submit(
+        session,
+        formatAdvisorConsultPrompt(input.snapshot),
+        (e) => {
+          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
+          if (e.kind === 'error') error = e.error
+          if (e.kind === 'codex_billing') {
+            const billing = { ...e } as DurableCodexBilling & { kind?: string }
+            delete billing.kind
+            liveBilling = billing
+            liveSettle = input.billingApi.settle(billing).catch((settleErr) => {
+              this.log.warn('advisor_engine_billing_settle_failed', {
+                consultId: input.consultId,
+                requestId: billing.requestId,
+                err: String(settleErr),
+              })
+            })
+          }
+        },
+        undefined,
+        input.snapshot.advisorModel,
+        input.requestId,
+      )
+      if (liveSettle) await liveSettle
+      if (!liveBilling) {
+        await input.billingApi.abandon(input.requestId).catch(() => {})
+        consultStore.update(input.consultId, { state: 'failed' })
+        return {
+          state: 'failed',
+          advice,
+          jobId,
+          error: error || '顾问未产生计费帧（401 或未完成推理不算无工具 PASS）',
+        }
+      }
+      consultStore.update(input.consultId, { state: error ? 'failed' : 'settled' })
+      if (jobId && this._delegateJobs) {
+        const jobSnap = this._delegateJobs.snapshotOf(jobId)
+        const fence =
+          jobSnap?.claimToken
+            ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
+            : undefined
+        if (error) {
+          this._delegateJobs.fail(jobId, {
+            failureClass: 'child_error',
+            detail: error,
+            httpStatus: 500,
+            body: { ok: false, error, consultId: input.consultId },
+            ...(fence ?? {}),
+          })
+        } else {
+          this._delegateJobs.complete(
+            jobId,
+            { httpStatus: 200, body: { ok: true, advice, consultId: input.consultId } },
+            fence,
+          )
+        }
+      }
+      return { state: error ? 'failed' : 'settled', advice, jobId, error }
+    } finally {
+      await this.sessions.destroySession(advisorSessionKey).catch(() => {})
+    }
+  }
+
+  private async handleCollaborationConfig(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    if (isCommercialManagedRuntime()) {
+      return this.sendError(res, 404, 'collaboration-config is selfhost only')
+    }
+    const userId = this.getUserId(req)
+    if (!userId || userId === 'default') return this.sendError(res, 401, 'unauthorized')
+    const store = this.advisorConfigStore()
+    if (req.method === 'GET') {
+      try {
+        const doc = store.read()
+        const sessionId = url.searchParams.get('sessionId') ?? undefined
+        const resolved = resolveSessionCollab(doc, sessionId)
+        return this.sendJson(res, 200, {
+          rev: doc.rev,
+          defaultMode: doc.defaultMode,
+          defaultAdvisorModel: doc.defaultAdvisorModel,
+          session: resolved,
+        })
+      } catch (err) {
+        if (err instanceof CollaborationConfigError && err.code === 'CORRUPT') {
+          return this.sendError(res, 500, 'collaboration config unreadable; original file left intact')
+        }
+        throw err
+      }
+    }
+    if (req.method !== 'PUT') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: {
+      sessionId?: unknown
+      mode?: unknown
+      advisorModel?: unknown
+      expectedRev?: unknown
+      asDefault?: unknown
+    }
+    try {
+      parsed = JSON.parse(body) as typeof parsed
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    if (parsed.mode !== 'solo' && parsed.mode !== 'advisor' && parsed.mode !== 'team') {
+      return this.sendError(res, 400, 'mode must be solo|advisor|team')
+    }
+    const advisorModel =
+      parsed.mode === 'advisor'
+        ? typeof parsed.advisorModel === 'string' && parsed.advisorModel.trim()
+          ? parsed.advisorModel.trim()
+          : 'gpt-6-astra'
+        : null
+    if (parsed.mode === 'advisor' && advisorModel !== 'gpt-6-astra') {
+      return this.sendError(res, 400, 'advisorModel must be catalog gpt-6-astra')
+    }
+    const expectedRev =
+      typeof parsed.expectedRev === 'number' && Number.isInteger(parsed.expectedRev)
+        ? parsed.expectedRev
+        : undefined
+    try {
+      const next =
+        parsed.asDefault === true || !parsed.sessionId
+          ? await store.putDefault({ mode: parsed.mode, advisorModel }, expectedRev)
+          : await store.putSession(
+              String(parsed.sessionId),
+              { mode: parsed.mode, advisorModel },
+              expectedRev,
+            )
+      const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined
+      return this.sendJson(res, 200, {
+        rev: next.rev,
+        defaultMode: next.defaultMode,
+        defaultAdvisorModel: next.defaultAdvisorModel,
+        session: resolveSessionCollab(next, sessionId),
+      })
+    } catch (err) {
+      if (err instanceof CollaborationConfigError) {
+        const status = err.code === 'CAS' ? 409 : err.code === 'VALIDATION' ? 400 : 500
+        return this.sendError(res, status, err.message)
+      }
+      throw err
+    }
+  }
+
   private async handleDelegateTask(
     req: IncomingMessage,
     res: ServerResponse,
@@ -12016,6 +12504,9 @@ export class Gateway {
         400,
         'agentId 只能是平台成员 id(如 coding-assistant)。型号请用 body.model,例如 cursor-grok-4.6-high-fast',
       )
+    }
+    if (targetAgentId === ADVISOR_AGENT_ID) {
+      return this.sendError(res, 403, 'consult_advisor 只能走 /api/agents/advisor/consult，不能用 delegate')
     }
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
@@ -12157,7 +12648,7 @@ export class Gateway {
       const store = this._ensureDelegateJobStore()
       const slotOpts = {
         parentBucketKey: parentSessionKey,
-        isReview: isHiddenSystemAgentId(targetAgentId),
+        isReview: isTeamReviewExecution(targetAgentId),
       }
       if (sm) {
         const admit = this._admitDelegateCreate(resume.sessionKey, slotOpts)
@@ -12527,7 +13018,7 @@ export class Gateway {
 
     // 队长自主送审(2026-07-07):目标是隐藏审查员 ⇒ 一律按审查语义执行(资源闸保留槽/
     // 免 per-parent 桶/回传不封顶/结构化 verdict)。单一权威 = 目标身份,不采信调用方自报。
-    if (!isReview && isHiddenSystemAgentId(targetAgentId)) {
+    if (!isReview && isTeamReviewExecution(targetAgentId)) {
       isReview = true
       const parent =
         typeof parentSessionKey === 'string' && parentSessionKey
@@ -12607,7 +13098,7 @@ export class Gateway {
       typeof parentSessionKey === 'string' && parentSessionKey
         ? parentSessionKey
         : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
-    if (isHiddenSystemAgentId(targetAgentId)) {
+    if (isTeamReviewExecution(targetAgentId)) {
       const hiddenLimit = resolveHiddenDelegationsPerTurn()
       if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
         this.log.warn('delegate_hidden_limit', {
@@ -18800,6 +19291,12 @@ export class Gateway {
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
+    const inboundCollabMode = isCommercialManagedRuntime()
+      ? normalizeCollabMode({ teamMode })
+      : normalizeCollabMode({
+          collabMode: (frame as { collabMode?: unknown }).collabMode,
+          teamMode,
+        })
 
     // v5 codex route 消费链(A1):master bridge 注入的 `__oc_codex_route` →
     // 严格校验(_buildSafeCodexRouteOverride)→ submit opts.codexRoute →
@@ -19721,6 +20218,9 @@ export class Gateway {
 
       finalText = lines.join('\n')
     }
+    if (inboundCollabMode === 'advisor' && agent.id === 'main') {
+      finalText = advisorPreamble('advisor') + finalText
+    }
     // 团队模式(v5 轻量组队):main 队长这一轮前置"组队引导"——列出可委派的已安装 agent
     // + 让它自主判断是否 delegate_task 组队(简单任务自己答)。turn 级,开关中途切立即生效;
     // 放在 media 拼接之后,确保带附件时引导也在。委派本身走内置 delegate_task,无需改工具。
@@ -19793,6 +20293,19 @@ export class Gateway {
     // engine persist 之前完成,走正常归因/drain)。此处只 stash 两个服务端权威快照,
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
+    session._collabModeTurn = agent.id === 'main' && !adapter ? inboundCollabMode : 'solo'
+    const inboundAdvisorModel =
+      typeof (frame as { advisorModel?: unknown }).advisorModel === 'string'
+        ? (frame as { advisorModel: string }).advisorModel.trim()
+        : 'gpt-6-astra'
+    const inboundConfigVersion =
+      typeof (frame as { collabConfigVersion?: unknown }).collabConfigVersion === 'string'
+        ? (frame as { collabConfigVersion: string }).collabConfigVersion
+        : collabConfigVersionOf({ mode: inboundCollabMode, advisorModel: inboundAdvisorModel })
+    session._advisorTurn =
+      session._collabModeTurn === 'advisor'
+        ? { advisorModel: inboundAdvisorModel || 'gpt-6-astra', configVersion: inboundConfigVersion }
+        : undefined
     session._currentTurnUserText = text ?? ''
     // Fire-and-forget shadow hook. It receives the turn's already-resolved agent,
     // canonical trace id and raw text only long enough to hash/rank them; no result
@@ -22184,7 +22697,7 @@ const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
   '/api/sessions/read-all',
-  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
+  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/collaboration-config', '/api/search',
   '/api/cron', '/api/cron/channels', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',

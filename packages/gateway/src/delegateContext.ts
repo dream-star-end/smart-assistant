@@ -23,7 +23,7 @@ export const DELEGATE_CONTEXT_HEADER = 'x-openclaude-delegate-context'
 export const DELEGATE_CONTEXT_TTL_MS =
   AUTHORITY_TURN_MAX_LIFETIME_MS + TURN_LEASE_GRACE_MS
 
-export type DelegateContextClaims = {
+export type DelegateContextClaimsV1 = {
   v: 1
   agentId: string
   sessionKey: string
@@ -32,6 +32,18 @@ export type DelegateContextClaims = {
   exp: number
   nonce: string
 }
+
+export type DelegateContextClaimsV2 = Omit<DelegateContextClaimsV1, 'v'> & {
+  v: 2
+  turnKey: string
+  turnIndex: number
+  collabMode: 'solo' | 'advisor' | 'team'
+  configVersion: string
+}
+
+export type DelegateContextClaims = DelegateContextClaimsV1 | DelegateContextClaimsV2
+
+export const CONSULT_INVOCATION_HEADER = 'x-openclaude-consult-invocation'
 
 let signingKey: Buffer | undefined
 
@@ -58,7 +70,7 @@ export function issueDelegateContextToken(input: {
 }): string {
   const now = input.now ?? Date.now()
   const ttlMs = input.ttlMs ?? DELEGATE_CONTEXT_TTL_MS
-  const claims: DelegateContextClaims = {
+  const claims: DelegateContextClaimsV1 = {
     v: 1,
     agentId: input.agentId.trim(),
     sessionKey: input.sessionKey.trim(),
@@ -72,6 +84,44 @@ export function issueDelegateContextToken(input: {
   }
   const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
   return `${payload}.${signPayload(payload)}`
+}
+
+/** Immutable per-turn token for advisor-mode parents. Never refreshed onto a later turn's file. */
+export function issueConsultTurnToken(input: {
+  agentId: string
+  sessionKey: string
+  depth: number
+  turnKey: string
+  turnIndex: number
+  collabMode: 'solo' | 'advisor' | 'team'
+  configVersion: string
+  now?: number
+  ttlMs?: number
+}): string {
+  const now = input.now ?? Date.now()
+  const ttlMs = input.ttlMs ?? DELEGATE_CONTEXT_TTL_MS
+  const claims: DelegateContextClaimsV2 = {
+    v: 2,
+    agentId: input.agentId.trim(),
+    sessionKey: input.sessionKey.trim(),
+    depth: Number.isFinite(input.depth) ? Math.max(0, Math.floor(input.depth)) : 0,
+    iat: now,
+    exp: now + ttlMs,
+    nonce: randomBytes(8).toString('hex'),
+    turnKey: input.turnKey.trim(),
+    turnIndex: Math.max(1, Math.floor(input.turnIndex)),
+    collabMode: input.collabMode,
+    configVersion: input.configVersion.trim(),
+  }
+  if (!claims.agentId || !claims.sessionKey || !claims.turnKey || !claims.configVersion) {
+    throw new Error('consult turn token requires agentId, sessionKey, turnKey, configVersion')
+  }
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
+  return `${payload}.${signPayload(payload)}`
+}
+
+export function isConsultTurnClaims(claims: DelegateContextClaims): claims is DelegateContextClaimsV2 {
+  return claims.v === 2
 }
 
 export function verifyDelegateContextToken(
@@ -92,13 +142,21 @@ export function verifyDelegateContextToken(
   let claims: DelegateContextClaims
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as DelegateContextClaims
-    if (parsed?.v !== 1) return null
+    if (parsed?.v !== 1 && parsed?.v !== 2) return null
     if (typeof parsed.agentId !== 'string' || !parsed.agentId.trim()) return null
     if (typeof parsed.sessionKey !== 'string' || !parsed.sessionKey.trim()) return null
     if (typeof parsed.depth !== 'number' || !Number.isFinite(parsed.depth) || parsed.depth < 0) {
       return null
     }
     if (typeof parsed.exp !== 'number' || parsed.exp <= now) return null
+    if (parsed.v === 2) {
+      if (typeof parsed.turnKey !== 'string' || !parsed.turnKey.trim()) return null
+      if (typeof parsed.turnIndex !== 'number' || !Number.isFinite(parsed.turnIndex)) return null
+      if (parsed.collabMode !== 'solo' && parsed.collabMode !== 'advisor' && parsed.collabMode !== 'team') {
+        return null
+      }
+      if (typeof parsed.configVersion !== 'string' || !parsed.configVersion.trim()) return null
+    }
     claims = parsed
   } catch {
     return null

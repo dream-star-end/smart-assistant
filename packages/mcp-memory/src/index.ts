@@ -70,6 +70,7 @@ import {
 } from './delegateCursorFastPath.js'
 import { formatSendToAgentStart } from './sendToAgent.js'
 import {
+  CONSULT_INVOCATION_HEADER,
   describeDelegateTransportError,
   gatewayDelegateHeaders,
   gatewayBaseUrl,
@@ -268,6 +269,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateWait(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
+      case 'consult_advisor':
+        return await handleConsultAdvisor(args as any)
       case 'task_create':
         return await handleTaskCreate(args as any)
       case 'task_update':
@@ -828,6 +831,47 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
       `[mcp-memory] ask_user gateway call failed: ${describeDelegateTransportError(err)}\n`,
     )
     return askUserToolPostedFallback()
+  }
+}
+
+async function handleConsultAdvisor(args: { question?: string; concern?: string }) {
+  const question = typeof args?.question === 'string' ? args.question.trim() : ''
+  if (!question) return toolError('question 必填')
+  const concern = typeof args?.concern === 'string' ? args.concern.trim() : ''
+  const invocationId = `cinv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const headers = {
+    ...gatewayDelegateHeaders(),
+    [CONSULT_INVOCATION_HEADER]: invocationId,
+  }
+  try {
+    const res = await postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
+      headers,
+      body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
+      timeoutMs: 10 * 60_000,
+    })
+    const text = res.body || ''
+    if (res.statusCode >= 400) {
+      return toolError(`consult_advisor failed (${res.statusCode}): ${text.slice(0, 2000)}`)
+    }
+    try {
+      const parsed = JSON.parse(text) as {
+        advice?: string
+        error?: string
+        missing?: string[]
+        reused?: boolean
+        status?: string
+      }
+      if (parsed.error && !parsed.advice) return toolError(parsed.error)
+      const missing =
+        Array.isArray(parsed.missing) && parsed.missing.length
+          ? `\n【缺失证据】${parsed.missing.join(', ')}`
+          : ''
+      return toolOk(`${parsed.advice || text}${missing}`)
+    } catch {
+      return toolOk(text)
+    }
+  } catch (err: unknown) {
+    return toolError(`consult_advisor transport: ${describeDelegateTransportError(err)}`)
   }
 }
 

@@ -3,6 +3,8 @@ import { describe, it } from 'node:test'
 
 import {
   DELEGATE_CONTEXT_TTL_MS,
+  isConsultTurnClaims,
+  issueConsultTurnToken,
   issueDelegateContextToken,
   resetDelegateContextKeyForTests,
   verifyDelegateContextToken,
@@ -53,5 +55,24 @@ describe('delegateContext token', () => {
     assert.equal(verifyDelegateContextToken(token, 1_050), null)
     // re-issue after reset so later tests are not poisoned
     resetDelegateContextKeyForTests()
+  })
+
+  it('consult v2 token freezes origin turnKey and is not a v1 claim', () => {
+    const token = issueConsultTurnToken({
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:s1',
+      depth: 0,
+      turnKey: 'a'.repeat(64),
+      turnIndex: 3,
+      collabMode: 'advisor',
+      configVersion: 'v1:advisor:gpt-6-astra',
+    })
+    const claims = verifyDelegateContextToken(token)
+    assert.ok(claims)
+    assert.equal(isConsultTurnClaims(claims), true)
+    if (!isConsultTurnClaims(claims)) return
+    assert.equal(claims.turnKey, 'a'.repeat(64))
+    assert.equal(claims.turnIndex, 3)
+    assert.equal(claims.collabMode, 'advisor')
   })
 })

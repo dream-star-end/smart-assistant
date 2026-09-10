@@ -409,6 +409,28 @@ export const TOOLS = [
       required: ['draft'],
     },
   },
+  {
+    name: 'consult_advisor',
+    description: [
+      '【仅顾问模式】向无工具顾问提出一个疑问或关注点。顾问不能执行工具、写文件或再委派。',
+      '只传 question（必填）和可选 concern。不要传 session/model/turn/权限。',
+      '顾问建议可能有错，必须用你自己的工具验证后再交付。失败时可继续主任务。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: '要咨询的疑问或关注点。',
+        },
+        concern: {
+          type: 'string',
+          description: '可选：补充关注点或风险。',
+        },
+      },
+      required: ['question'],
+    },
+  },
   // ── 任务面板(与网页 /board、oc-task CLI 同一份 /api/board)──
   // identifier 服务端生成,工具参数禁止收 identifier/userId/originSessionKey。
   // originSessionKey 由 handler 从 OPENCLAUDE_SESSION_KEY 注入,卡片才能点回原对话。

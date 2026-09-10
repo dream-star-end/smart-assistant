@@ -142,6 +142,11 @@ export interface TurnParams {
   nextDurableEventOrdinal?: () => number
   /** OpenClaude team-mode hint for Codex native collaboration tool calls. */
   collabAgentPolicy?: CollabAgentPolicy
+  /** Advisor-mode parent turn: mint an immutable per-turn consult token. */
+  consultTurn?: {
+    configVersion: string
+    turnIndex: number
+  }
   automaticRetryState?: AutomaticRetryState
   /** turn 事件流(内容事件 + tool_use/result_detected)。同步、按底座输出顺序回调。 */
   onEvent: (e: EngineEvent) => void

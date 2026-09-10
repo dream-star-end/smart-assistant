@@ -191,6 +191,16 @@ export const PRODUCT_CAPABILITIES = {
     destination: { kind: "agent-picker" },
     requirements: ["authenticated"],
   },
+  advisorMode: {
+    id: "advisor-mode",
+    title: "给全能助手配一个无工具顾问",
+    shortTitle: "顾问模式",
+    category: "extend",
+    icon: "users",
+    aliases: ["顾问", "咨询", "第二意见", "advisor"],
+    destination: { kind: "agent-picker" },
+    requirements: ["authenticated"],
+  },
   memory: {
     id: "memory-auto-dream",
     title: "长期记忆与 Auto-Dream",

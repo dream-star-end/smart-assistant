@@ -36,6 +36,7 @@ export const CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS = [
   'delegate_tasks',
   'delegate_wait',
   'request_review',
+  'consult_advisor',
   'task_create',
   'task_update',
   'task_comment',

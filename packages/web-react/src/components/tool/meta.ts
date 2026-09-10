@@ -266,6 +266,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
   "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
   "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
+  "openclaude-memory:consult_advisor": { icon: ShieldCheck, label: "咨询顾问" },
   "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
   "openclaude-memory:present_options": { icon: ListChecks, label: "投递选项卡" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },

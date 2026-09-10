@@ -36,6 +36,7 @@ export function gatewayAuthHeaders(): Record<string, string> {
 
 /** Opaque per-turn caller binding. Identity is inside the token; env must not override it. */
 export const DELEGATE_CONTEXT_HEADER = 'x-openclaude-delegate-context'
+export const CONSULT_INVOCATION_HEADER = 'x-openclaude-consult-invocation'
 
 export function readDelegateContextTokenFromFile(env: NodeJS.ProcessEnv = process.env): string {
   const file = env.OPENCLAUDE_DELEGATE_CONTEXT_FILE

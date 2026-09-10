@@ -236,7 +236,7 @@ function validateMutation(value: unknown, owner: PromptQueueOwner): void {
       if (!isRecord(value.requestedExecution)) {
         throw new InvalidPromptQueueBodyError('requestedExecution object required')
       }
-      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'contextTier'])
+      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier'])
       assertOptionalString('model', value.requestedExecution.model, 256)
       assertOptionalString('effortLevel', value.requestedExecution.effortLevel, 64, true)
       if (

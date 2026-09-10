@@ -1090,6 +1090,9 @@ export interface AgentSession {
   /** 队长自主送审(2026-07-07)— 本 turn 是否为团队模式队长回合(dispatchInbound 每
    *  turn 刷新)。_runDelegateTask 的审查门读它:目标为隐藏审查员的委派仅在 true 时放行。 */
   _teamModeTurn?: boolean
+  /** Frozen collaboration mode for this inbound turn (main only). */
+  _collabModeTurn?: 'solo' | 'advisor' | 'team'
+  _advisorTurn?: { advisorModel: string; configVersion: string }
 
   /** 本 turn 入站用户文本的服务端权威快照(≤8000 字,dispatchInbound 每 turn 刷新)。
    *  审查任务书(buildTeamReviewContext)的"用户原始需求"取此,不采信模型自报。 */
@@ -7700,6 +7703,14 @@ export class SessionManager {
         nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
         onPostTerminalRuntimeEvent,
         collabAgentPolicy,
+        ...(session._collabModeTurn === 'advisor' && session._advisorTurn && turnKey
+          ? {
+              consultTurn: {
+                configVersion: session._advisorTurn.configVersion,
+                turnIndex: projectedTurnIndex,
+              },
+            }
+          : {}),
         automaticRetryState,
         ...(session._usageAttribution ? { usageAttribution: session._usageAttribution } : {}),
         ...(session._turnCreditBudgetFen !== undefined

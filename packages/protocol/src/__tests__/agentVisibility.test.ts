@@ -7,14 +7,19 @@ import {
   filterUserVisibleByAgentField,
   filterUserVisibleRoutesForManagement,
   isHiddenSystemAgentId,
+  isTeamReviewExecution,
   userVisibleDefaultAgentId,
 } from '../agentVisibility.js'
 
 test('hidden system agent authority: hidden-reviewer is the reserved id', () => {
   assert.equal(HIDDEN_SYSTEM_AGENT_IDS.has('hidden-reviewer'), true)
   assert.equal(isHiddenSystemAgentId('hidden-reviewer'), true)
+  assert.equal(isHiddenSystemAgentId('advisor'), true)
   assert.equal(isHiddenSystemAgentId('main'), false)
   assert.equal(isHiddenSystemAgentId('market-writer'), false)
+  assert.equal(isTeamReviewExecution('hidden-reviewer'), true)
+  assert.equal(isTeamReviewExecution('advisor'), false)
+  assert.equal(isTeamReviewExecution('main'), false)
 })
 
 test('UserView projection: agents/routes/default all exclude the hidden system agent', () => {
@@ -64,6 +69,7 @@ test('filterUserVisibleByAgentField drops hidden-targeting items but keeps unkno
   const items = [
     { id: 't1', agent: 'main' },
     { id: 't2', agent: 'hidden-reviewer' },
+    { id: 't2b', agent: 'advisor' },
     { id: 't3', agent: 'market-writer' },
     // references a deleted/unknown (but not hidden) agent — must be RETAINED
     // (blacklist semantics, not whitelist-by-visible-set).

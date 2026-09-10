@@ -46,7 +46,9 @@ import { isPatrolSessionKey } from './taskboard/domain.js'
 /** 阶段 agent / 巡检会话不挂平台 MCP skills(TEST-10 / OCV5-46)。上下文走 prompt。 */
 export function shouldOmitPlatformMcp(agentId?: string, sessionKey?: string): boolean {
   if (agentId?.startsWith('stage-')) return true
+  if (agentId === 'advisor') return true
   if (sessionKey && isPatrolSessionKey(sessionKey)) return true
+  if (sessionKey?.startsWith('advisor:')) return true
   return false
 }
 

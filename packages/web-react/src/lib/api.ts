@@ -1341,6 +1341,57 @@ export const api = {
       ),
     ),
 
+  getCollaborationConfig: (a: AuthSession, sessionId?: string) =>
+    jsonOrThrow<{
+      rev: number
+      defaultMode: "solo" | "advisor" | "team"
+      defaultAdvisorModel: string | null
+      session: {
+        mode: "solo" | "advisor" | "team"
+        advisorModel: string | null
+        configVersion: string
+        source: "session" | "default"
+      }
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/collaboration-config${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    ),
+
+  putCollaborationConfig: (
+    a: AuthSession,
+    body: {
+      sessionId?: string
+      mode: "solo" | "advisor" | "team"
+      advisorModel?: string | null
+      expectedRev?: number
+      asDefault?: boolean
+    },
+  ) =>
+    jsonOrThrow<{
+      rev: number
+      defaultMode: "solo" | "advisor" | "team"
+      defaultAdvisorModel: string | null
+      session: {
+        mode: "solo" | "advisor" | "team"
+        advisorModel: string | null
+        configVersion: string
+        source: "session" | "default"
+      }
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/collaboration-config", {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
   /** 改偏好（PATCH /api/me/preferences，Bearer）→ 新快照。 */
   patchPreferences: (a: AuthSession, patch: Preferences) =>
     jsonOrThrow<Preferences>(

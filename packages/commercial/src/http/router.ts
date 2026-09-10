@@ -441,6 +441,7 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // ─── host agent RCE 面 ───
   // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
   { re: /^\/api\/agents$/, label: '/api/agents' },
+  { re: /^\/api\/collaboration-config$/, label: '/api/collaboration-config' },
   // /api/agents/:id GET/PUT/DELETE —— 读 host agent 元信息、改 model/persona、删 agent
   { re: /^\/api\/agents\/[^/]+$/, label: '/api/agents/:id' },
   // /api/agents/:id/persona GET/PUT —— 读/写 host agent CLAUDE.md

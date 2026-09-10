@@ -442,7 +442,7 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "contextTier"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;

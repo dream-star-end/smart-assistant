@@ -65,6 +65,16 @@ describe("AgentPicker 团队模式开关文案（知情同意）", () => {
   });
 });
 
+describe("AgentPicker 三态协作", () => {
+  it("onCollabModeChange 时渲染单人/顾问/团队三选一", async () => {
+    const onCollabModeChange = vi.fn();
+    renderPicker({ onCollabModeChange, collabMode: "solo" });
+    const advisor = await screen.findByRole("button", { name: /主模型不切换/ });
+    fireEvent.click(advisor);
+    expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
+  });
+});
+
 describe("AgentPicker capability readiness", () => {
   it("保留未就绪 Agent 供用户理解状态，但禁止选择执行", async () => {
     const onPick = vi.fn();

@@ -50,6 +50,12 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/collaboration-config',
+    re: /^\/api\/collaboration-config$/,
+    methods: M('GET', 'PUT'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/agents/:id',
     re: /^\/api\/agents\/[^/]+$/,
     methods: M('GET', 'PUT', 'DELETE'),

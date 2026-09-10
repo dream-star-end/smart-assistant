@@ -583,6 +583,15 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       this._pendingGoalMessage = null
       parser.parse(pendingGoal as unknown as SdkMessage)
     }
+    if (params.consultTurn && params.turnKey) {
+      this.kernel.setConsultTurn({
+        turnKey: params.turnKey,
+        turnIndex: params.consultTurn.turnIndex,
+        configVersion: params.consultTurn.configVersion,
+      })
+    } else {
+      this.kernel.setConsultTurn(undefined)
+    }
     let submitted: Promise<void>
     try {
       submitted = this.kernel.submit(

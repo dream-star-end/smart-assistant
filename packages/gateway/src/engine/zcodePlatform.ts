@@ -22,6 +22,7 @@ export const ZCODE_MEMORY_MCP_TOOLS = [
   'delegate_task',
   'delegate_tasks',
   'request_review',
+  'consult_advisor',
   'task_create',
   'task_update',
   'task_comment',

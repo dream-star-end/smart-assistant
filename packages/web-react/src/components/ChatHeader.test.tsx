@@ -60,6 +60,11 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(onDisableTeamMode).toHaveBeenCalledTimes(1);
   });
 
+  it("advisorModeActive=true 时渲染顾问模式 chip", () => {
+    renderHeader({ advisorModeActive: true, onDisableAdvisorMode: () => {} });
+    expect(screen.getByRole("button", { name: "顾问模式已开启" }).textContent).toContain("顾问模式");
+  });
+
   it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎", () => {
     renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
     const trigger = screen.getByRole("button", { name: "选择对话模型" });

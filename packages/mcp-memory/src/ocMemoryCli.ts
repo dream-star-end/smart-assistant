@@ -66,7 +66,7 @@ import {
   runDelegateStartAndWait,
   type DelegateCliArgs,
 } from './delegateStartCli.js'
-import { DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
+import { CONSULT_INVOCATION_HEADER, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 
 const TOOL = 'oc-memory'
 
@@ -120,6 +120,7 @@ const USAGE = [
   '  oc-memory delegate-wait <jobId> [<jobId>...]',
   '  oc-memory delegate --goal "<text>" [--agent-id ID] [--model SLUG] [--context "..."] [--effort low|medium|high] [--toolsets a,b] [--resume-session-key KEY] [--allow-self]',
   '  oc-memory request-review --draft "<text>" [--mode execution|deliberation] [--revision-note "..."] [--resume-session-key KEY]',
+  '  oc-memory consult-advisor --question "<text>" [--concern "..."]',
 ].join('\n')
 
 /**
@@ -215,6 +216,33 @@ async function main(): Promise<void> {
   }
 
   const { positional, flags } = parseFlags(rest)
+
+  if (cmd === 'consult-advisor') {
+    const ctxTok = readDelegateContextToken()
+    if (!ctxTok.ok) fail(ctxTok.error)
+    const question = flags.question || positional[0]
+    if (!question) fail('consult-advisor requires --question "<text>"')
+    const concern = flags.concern || ''
+    const invocationId = `cinv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const headers = gatewayDelegateHeaders()
+    headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
+    headers[CONSULT_INVOCATION_HEADER] = invocationId
+    try {
+      const res = await postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
+        headers,
+        body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
+        timeoutMs: 10 * 60_000,
+      })
+      if (res.statusCode >= 400) {
+        process.stderr.write(`${res.body}\n`)
+        process.exit(1)
+      }
+      process.stdout.write(res.body.endsWith('\n') ? res.body : `${res.body}\n`)
+      process.exit(0)
+    } catch (err: unknown) {
+      fail(`consult-advisor transport: ${String((err as Error)?.message ?? err)}`)
+    }
+  }
 
   if (cmd === 'delegate' || cmd === 'request-review') {
     const ctxTok = readDelegateContextToken()

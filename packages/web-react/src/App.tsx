@@ -836,18 +836,53 @@ export function App() {
   // agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
   // 声明在 useSessionList 之后:setTeamMode/重读 effect 需要 activeId 定位当前会话。
   const [teamMode, setTeamModeState] = useState(() => readTeamModeForSession(activeId));
+  const [collabMode, setCollabModeState] = useState<"solo" | "advisor" | "team">(() =>
+    readTeamModeForSession(activeId) ? "team" : "solo",
+  );
   const setTeamMode = useCallback(
     (enabled: boolean) => {
       setTeamModeState(enabled);
       writeTeamMode(activeId, enabled);
+      setCollabModeState(enabled ? "team" : "solo");
     },
     [activeId],
+  );
+  const setCollabMode = useCallback(
+    (mode: "solo" | "advisor" | "team") => {
+      setCollabModeState(mode);
+      setTeamModeState(mode === "team");
+      writeTeamMode(activeId, mode === "team");
+      if (!demo && authRef.current && activeId) {
+        void api
+          .putCollaborationConfig(authRef.current, {
+            sessionId: activeId,
+            mode,
+            advisorModel: mode === "advisor" ? "gpt-6-astra" : null,
+            asDefault: true,
+          })
+          .catch(() => {
+            /* volume CAS 失败不回滚本地 turn intent，下次打开 picker 会再同步 */
+          });
+      }
+    },
+    [activeId, demo],
   );
   // 切会话:按目标会话的 per-session 键重读(缺失回退全局默认)。activeId 为空(空会话态)
   // 读全局默认;首条消息在 send 里把当前 intent 落地为该会话的 per-session 键。
   useEffect(() => {
-    setTeamModeState(readTeamModeForSession(activeId));
-  }, [activeId]);
+    const enabled = readTeamModeForSession(activeId);
+    setTeamModeState(enabled);
+    setCollabModeState(enabled ? "team" : "solo");
+    if (!demo && authRef.current && activeId) {
+      void api
+        .getCollaborationConfig(authRef.current, activeId)
+        .then((doc) => {
+          setCollabModeState(doc.session.mode);
+          setTeamModeState(doc.session.mode === "team");
+        })
+        .catch(() => {});
+    }
+  }, [activeId, demo]);
 
   // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
   // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
@@ -1010,6 +1045,10 @@ export function App() {
         imageEdit,
         replyTo,
         teamMode: teamLeaderTurn,
+        collabMode: agent.id === "main" ? (teamMode ? "team" : collabMode) : "solo",
+        ...(agent.id === "main" && collabMode === "advisor"
+          ? { advisorModel: "gpt-6-astra", collabConfigVersion: "v1:advisor:gpt-6-astra" }
+          : {}),
         // Cursor Opus/Fable 上下文档位:只在当前模型支持分档时随帧发送;其它模型不带该字段
         // (master 对非分档模型本就忽略,但不发送可以让路由快照/日志更干净)。
         ...(cursorModelSupportsContextTier(modelId) ? { contextTier } : {}),
@@ -1063,6 +1102,7 @@ export function App() {
       sessionEffort,
       contextTier,
       teamMode,
+      collabMode,
       sessions,
       setSessions,
       setActiveId,
@@ -3240,6 +3280,8 @@ export function App() {
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
+          advisorModeActive={!demo && collabMode === "advisor" && agent.id === "main"}
+          onDisableAdvisorMode={() => setCollabMode("solo")}
           credits={demo ? null : (user?.credits ?? null)}
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
@@ -3572,7 +3614,9 @@ export function App() {
         current={agent}
         auth={demo ? null : auth}
         teamMode={teamMode}
+        collabMode={collabMode}
         onToggleTeamMode={demo ? undefined : setTeamMode}
+        onCollabModeChange={demo ? undefined : setCollabMode}
         onAddFromMarket={
           demo
             ? undefined
