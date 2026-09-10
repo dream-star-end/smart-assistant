@@ -333,9 +333,8 @@ function summaryValue(tap: string, key: string): number {
   return values[0]!
 }
 
-function parseLeafLine(line: string, leafIndent: 4 | 8 = 4): { ok: boolean; name: string; skip: string | null; todo: boolean } | null {
+function parseLeafLine(line: string, leafIndent: 4 | 8 | 0 = 4): { ok: boolean; name: string; skip: string | null; todo: boolean } | null {
   const match = new RegExp(`^( {${leafIndent}})(not )?ok \\d+ - (.+)$`).exec(line)
-  if (!match) return null
   const rest = match[3]!
   const directive = /^(.*?)\s+#\s*(SKIP|TODO)\b(.*)$/i.exec(rest)
   if (!directive) return { ok: !match[2], name: rest.trim(), skip: null, todo: false }
@@ -389,7 +388,12 @@ function assertSelectedTap(tap: string, expected: readonly string[], label: stri
   const selected: string[] = []
   let filteredSkips = 0
   for (const line of tap.split(/\r?\n/)) {
-    const parsed = parseLeafLine(line, leafIndent)
+    let parsed = parseLeafLine(line, leafIndent)
+    if (!parsed) {
+      // 顶层 it() 缩进为 0；只收 namePattern 过滤 SKIP，避免把 suite 汇总行当叶子。
+      const top = parseLeafLine(line, 0)
+      if (top?.skip === 'test name does not match pattern') parsed = top
+    }
     if (!parsed) continue
     const wanted = (expected as readonly string[]).includes(parsed.name)
     if (wanted) {
