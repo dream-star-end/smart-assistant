@@ -170,9 +170,28 @@ export function historyFromSessionMessages(
 const TRUSTED_FILE_TOOL_RE =
   /^(read|read_file|write|edit|search_replace|oc-web parse|oc_web_parse)$/i
 
+/** Target path fields on Read/Write/Edit (not content/new_string/patch). */
+const TRUSTED_FILE_TARGET_KEYS = ['file_path', 'path', 'target_file', 'absolute_path', 'filePath'] as const
+
 /** Read/Write/Edit this turn are current-task file tools. Web/shell stdout is not. */
 export function isTrustedCurrentTaskFileTool(name?: string): boolean {
   return TRUSTED_FILE_TOOL_RE.test(String(name ?? '').trim())
+}
+
+export function trustedFileToolTargetPaths(input: unknown): string[] {
+  if (typeof input === 'string') {
+    const trimmed = input.trim()
+    const found = extractGeneratedPaths([trimmed])
+    return found.length === 1 && found[0] === trimmed ? found : []
+  }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return []
+  const rec = input as Record<string, unknown>
+  const targets: string[] = []
+  for (const key of TRUSTED_FILE_TARGET_KEYS) {
+    const value = rec[key]
+    if (typeof value === 'string' && value.trim()) targets.push(value)
+  }
+  return extractGeneratedPaths(targets)
 }
 
 export function parentAuthorizedArtifactTexts(input: {
@@ -182,8 +201,7 @@ export function parentAuthorizedArtifactTexts(input: {
   const mentioned = extractGeneratedPaths([input.userTask])
   for (const tool of input.currentTools ?? []) {
     if (!isTrustedCurrentTaskFileTool(tool.name)) continue
-    const inputText = typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input ?? '')
-    mentioned.push(...extractGeneratedPaths([inputText]))
+    mentioned.push(...trustedFileToolTargetPaths(tool.input))
   }
   return [...new Set(mentioned)]
 }

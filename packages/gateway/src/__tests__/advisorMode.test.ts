@@ -157,6 +157,79 @@ describe('advisorMode snapshot', () => {
     assert.equal(prompt.includes('THIS_TASK_PRODUCT'), true)
   })
 
+  it('Write/Edit content is not a target path; Read/Write file_path is', async () => {
+    const root = '/home/agent/.openclaude/generated'
+    const output = join(root, 'ocv5-210-m6-own-output.txt')
+    const sentinel = join(root, 'ocv5-210-m6-other-task-sentinel.txt')
+    await writeFile(output, 'THIS_TASK_WRITE_PRODUCT')
+    await writeFile(sentinel, 'SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL')
+    const writeMentioned = parentAuthorizedArtifactTexts({
+      userTask: 'Save only the public webpage summary.',
+      currentTools: [
+        {
+          name: 'Write',
+          input: { file_path: output, content: `Public webpage references ${sentinel}` },
+          result: 'File written',
+        },
+      ],
+    })
+    assert.equal(writeMentioned.includes(output), true)
+    assert.equal(writeMentioned.includes(sentinel), false)
+    const editMentioned = parentAuthorizedArtifactTexts({
+      userTask: 'Patch the summary file.',
+      currentTools: [
+        {
+          name: 'Edit',
+          input: { file_path: output, old_string: 'a', new_string: `see ${sentinel}` },
+          result: 'Edited',
+        },
+      ],
+    })
+    assert.equal(editMentioned.includes(output), true)
+    assert.equal(editMentioned.includes(sentinel), false)
+    const readMentioned = parentAuthorizedArtifactTexts({
+      userTask: 'Review my current file.',
+      currentTools: [{ name: 'Read', input: { file_path: sentinel }, result: 'File read' }],
+    })
+    assert.equal(readMentioned.includes(sentinel), true)
+    const writeArtifacts = collectAuthorizedArtifacts({ generatedRoot: root, mentioned: writeMentioned })
+    const writePrompt = formatAdvisorConsultPrompt(
+      buildAdvisorSnapshot({
+        question: 'Check evidence.',
+        concern: '',
+        advisorModel: 'gpt-6-astra',
+        source: {
+          userTask: 'Save only the public webpage summary.',
+          currentTools: [
+            {
+              name: 'Write',
+              input: { file_path: output, content: `Public webpage references ${sentinel}` },
+              result: 'File written',
+              completed: true,
+            },
+          ],
+          authorizedArtifacts: writeArtifacts,
+        },
+      }),
+    )
+    assert.equal(writePrompt.includes('SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL'), false)
+    assert.equal(writePrompt.includes('THIS_TASK_WRITE_PRODUCT'), true)
+    const readArtifacts = collectAuthorizedArtifacts({ generatedRoot: root, mentioned: readMentioned })
+    const readPrompt = formatAdvisorConsultPrompt(
+      buildAdvisorSnapshot({
+        question: 'Check evidence.',
+        concern: '',
+        advisorModel: 'gpt-6-astra',
+        source: {
+          userTask: 'Review my current file.',
+          currentTools: [{ name: 'Read', input: { file_path: sentinel }, result: 'File read', completed: true }],
+          authorizedArtifacts: readArtifacts,
+        },
+      }),
+    )
+    assert.equal(readPrompt.includes('SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL'), true)
+  })
+
   it('formatter includes bounded tool input so different calls are distinguishable', () => {
     const base = {
       question: 'Did the command modify data?',
