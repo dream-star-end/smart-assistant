@@ -335,6 +335,7 @@ function summaryValue(tap: string, key: string): number {
 
 function parseLeafLine(line: string, leafIndent: 4 | 8 | 0 = 4): { ok: boolean; name: string; skip: string | null; todo: boolean } | null {
   const match = new RegExp(`^( {${leafIndent}})(not )?ok \\d+ - (.+)$`).exec(line)
+  if (!match) return null
   const rest = match[3]!
   const directive = /^(.*?)\s+#\s*(SKIP|TODO)\b(.*)$/i.exec(rest)
   if (!directive) return { ok: !match[2], name: rest.trim(), skip: null, todo: false }
