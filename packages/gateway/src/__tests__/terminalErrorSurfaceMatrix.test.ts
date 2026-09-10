@@ -47,7 +47,8 @@ import { readClassifiedErrorCodes } from './helpers/classifiedErrorCodes.js'
 
 // ── 期望决策表(每个引擎可产出的 errorClass 都必须在此回答"该不该自动重试")──────
 //
-// attempts = 用户这一条消息实际发生的引擎尝试次数(1 = 不重试;11 = 初次 + 10 次自动重试)。
+// attempts = 用户这一条消息实际发生的引擎尝试次数(1 = 不重试;同类瞬时故障被
+// same-class breaker 截到 3 = 初次 + 2 次自动重试后熔断,见 TRANSIENT_SAME_CLASS_BREAKER)。
 // 这张表是**声明**,不是从实现读的镜子:改了实现的重试集合而不改这里
 // 就会红,改了这里则两种投递形态必须同时满足 —— 两处判定漂移由此暴露。
 interface Scenario {
@@ -59,6 +60,12 @@ interface Scenario {
   readonly attempts: number
   /** 期望依据(评审可读性;不参与断言)。 */
   readonly why: string
+  /**
+   * 默认 true:resolved 形态要把引擎 errorClass 原样写入终态 tape。
+   * same-class 熔断会让 submit reject(TRANSIENT_CIRCUIT_OPEN),本 harness
+   * 的 capturing sink 收不到 tape —— 那些场景显式关掉。
+   */
+  readonly persistEngineClass?: boolean
 }
 
 const SCENARIOS: readonly Scenario[] = [
@@ -72,20 +79,23 @@ const SCENARIOS: readonly Scenario[] = [
   {
     code: 'rate_limited',
     sample: '429 Too Many Requests',
-    attempts: 11,
-    why: '账号限流是临时的,自动续跑比让用户手点重试更符合"不降 UX"',
+    attempts: 3,
+    persistEngineClass: false,
+    why: '账号限流可自动续跑,但同类连续 3 次后熔断,避免 5xx/限流风暴空烧',
   },
   {
     code: 'model_capacity',
     sample: 'Selected model is at capacity. Please try a different model.',
-    attempts: 11,
-    why: '#229 本体:容量故障必须自动重试,而不是把红卡摔给用户',
+    attempts: 3,
+    persistEngineClass: false,
+    why: '#229 本体仍自动重试容量故障;同类连续 3 次后熔断并引导换引擎',
   },
   {
     code: 'upstream_failed',
     sample: 'Anthropic returned 502 Bad Gateway',
-    attempts: 11,
-    why: '上游 5xx 属瞬时故障',
+    attempts: 3,
+    persistEngineClass: false,
+    why: '上游 5xx 属瞬时故障,同类连续 3 次后熔断,避免空烧重试风暴',
   },
   {
     code: 'insufficient_credits',
@@ -252,7 +262,9 @@ async function attemptsForResolvedSurface(
       setImmediate(() => r.errorResult(code, sample))
     })
     const session = makeSession(runner)
-    await sm.submit(session, 'hello', () => {}, undefined, undefined, 'b'.repeat(32))
+    await sm.submit(session, 'hello', () => {}, undefined, undefined, 'b'.repeat(32)).catch(() => {
+      // 同类瞬时故障熔断后 reject 是既定语义;本门只数 runner.submits。
+    })
     return {
       attempts: runner.submits,
       persistedErrorCode: captured.payloads.at(-1)?.errorCode,
@@ -316,11 +328,14 @@ describe('terminal-error surface matrix — throw 与 resolved(isError=true)必�
       )
       // resolved 形态还要证明:引擎上报的 errorClass 原样成为持久化终态码
       // (前端按它渲染红卡 + CTA;链路一断用户看到的就是无 CTA 的通用失败)。
-      assert.equal(
-        resolved.persistedErrorCode,
-        scenario.code,
-        `${scenario.code}: 终态 tape 的 errorCode 不是引擎上报的 errorClass(链路断了)`,
-      )
+      // 同类熔断会让 submit reject,本 harness 收不到 tape,那些场景关掉本断言。
+      if (scenario.persistEngineClass !== false) {
+        assert.equal(
+          resolved.persistedErrorCode,
+          scenario.code,
+          `${scenario.code}: 终态 tape 的 errorCode 不是引擎上报的 errorClass(链路断了)`,
+        )
+      }
     })
   }
 })

@@ -214,7 +214,7 @@ try {
     'Cursor Sand Box BUSY is model capacity (retry later or switch), not a bad request',
     'Cursor Sand Box INFERENCE_TICKET_REJECTED keeps its terminal classification (INC-20260909-CURSOR-SAND-BOX-TRANSPORT)',
     'generic 400 invalid request without a Box marker still stays bad_request',
-    'upstream_failed: 两种投递形态都恰好 11 次尝试',
+    'upstream_failed: 两种投递形态都恰好 3 次尝试',
     'bad_request: 两种投递形态都恰好 1 次尝试',
   ]) assert.ok(classifyOutcomes.includes(name), `required classification contract did not execute: ${name}`)
   console.log('[cursor-sand-box-classify] PASS — Box transport faults classify as recoverable upstream outage in both gateway retry seams')
