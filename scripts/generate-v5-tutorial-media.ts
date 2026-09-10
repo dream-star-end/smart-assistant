@@ -2182,6 +2182,49 @@ const SCENARIOS: ScenarioDefinition[] = [
     },
   },
   {
+    featureId: "advisor-mode",
+    async run(ctx) {
+      await plainClick(ctx, 'header button[data-product-feature="agents"]');
+      await assertVisible(
+        ctx,
+        '[role="dialog"]:has-text("选择智能体")',
+        "智能体选择器已打开",
+      );
+      await tracedClick(
+        ctx,
+        '[role="dialog"] button[data-product-feature="advisor-mode"]',
+        "选择顾问模式",
+      );
+      await assertVisible(
+        ctx,
+        '[role="dialog"] button[data-product-feature="advisor-mode"][aria-pressed="true"]',
+        "顾问选项已选中",
+      );
+      await stage(ctx, "在智能体选择器中选择顾问并核对说明");
+      await plainClick(
+        ctx,
+        '[role="dialog"] button[data-product-feature="agents"]:has-text("全能助手")',
+      );
+      await assertVisible(
+        ctx,
+        'header button[data-product-feature="advisor-mode"][aria-label="顾问模式已开启"]',
+        "顶栏已常驻显示顾问模式状态",
+      );
+      await stage(ctx, "在工作区顶栏确认顾问模式与冻结型号");
+      await tracedClick(
+        ctx,
+        'header button[data-product-feature="advisor-mode"][aria-label="顾问模式已开启"]',
+        "打开顾问模式状态说明",
+      );
+      await assertVisible(
+        ctx,
+        ':text("建议必须自行验证")',
+        "顾问模式状态与关闭入口已显示",
+      );
+      await stage(ctx, "在工作区顶栏核对顾问建议须执行者验证");
+    },
+  },
+  {
     featureId: "team-mode",
     async run(ctx) {
       await plainClick(ctx, 'header button[data-product-feature="agents"]');
@@ -2192,13 +2235,13 @@ const SCENARIOS: ScenarioDefinition[] = [
       );
       await tracedClick(
         ctx,
-        '[role="dialog"] [role="switch"][data-product-feature="team-mode"]',
-        "启用团队模式",
+        '[role="dialog"] button[data-product-feature="team-mode"]',
+        "选择团队模式",
       );
       await assertVisible(
         ctx,
-        '[role="switch"][aria-checked="true"]',
-        "团队模式开关已启用",
+        '[role="dialog"] button[data-product-feature="team-mode"][aria-pressed="true"]',
+        "团队选项已选中",
       );
       await stage(ctx, "启用团队模式并核对队长计费说明");
       await plainClick(

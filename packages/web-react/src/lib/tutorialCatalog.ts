@@ -49,6 +49,7 @@ export const TUTORIAL_MEDIA: Record<
       ["github-repository", "关联 GitHub，选择仓库与分支并确认绑定。"],
       ["agents", "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。"],
       ["team-mode", "在智能体选择器中开启团队模式并确认队长说明。"],
+      ["advisor-mode", "在智能体选择器中选择顾问，并核对顶栏冻结的顾问型号。"],
       ["memory-auto-dream", "进入记忆中心，查看长期记忆与 Auto-Dream 报告。"],
       [
         "schedules-reminders",
@@ -587,7 +588,7 @@ export const TUTORIAL_TOPICS = {
   },
   agents: {
     featureId: "agents",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "智能体是一套长期稳定的角色、工作方式和专用能力。新任务可从侧栏“新建会话”右侧箭头先选助手；已有任务可点击顶栏当前助手名称切换。每个会话记录自己的智能体归属，重新打开时会恢复。",
     outcome: "把专业任务交给更懂该领域、带有合适工具和流程的助手。",
@@ -607,7 +608,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "核对角色后再下达任务",
-        body: "选择后在顶栏核对助手名称，再输入新任务。窄屏可能截短名称并隐藏箭头，仍可点击整个助手按钮；助手入口用于切换角色，不是模型入口。已有会话切换不会另开会话，只影响后续执行。",
+        body: "选择后在顶栏核对助手名称，再输入新任务。全能助手卡片里还有单人/顾问/团队三选一，那是协作方式，不是换助手。窄屏可能截短名称并隐藏箭头，仍可点击整个助手按钮；助手入口用于切换角色，不是模型入口。已有会话切换不会另开会话，只影响后续执行。",
       },
       {
         title: "从市场补充",
@@ -620,11 +621,11 @@ export const TUTORIAL_TOPICS = {
     ],
     cautions: ["社区智能体安装前查看介绍、权限和依赖技能。"],
     media: "agents",
-    related: ["team-mode", "marketplace-discovery", "skills-training"],
+    related: ["team-mode", "advisor-mode", "marketplace-discovery"],
   },
   "team-mode": {
     featureId: "team-mode",
-    contentVersion: 4,
+    contentVersion: 5,
     intro:
       "团队模式由队长拆解任务，并按需委派给已安装的专业智能体并行工作。即使未开团队模式，对话里也可以用委派子任务；运行中会出现委派直播卡（delegate-progress），显示子任务正在做什么，而不是一条普通工具结果。界面还会展示成员进度、工具、结果和各自消耗。",
     outcome: "让调研、实现、验证等子任务并行推进，同时看清每一步委派进度。",
@@ -636,7 +637,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "在智能体选择器开启团队模式",
-        body: "开启后顶栏会常驻团队标识，并显示真实队长引擎说明。队长引擎与顶栏“当前模型”不是同一件事。",
+        body: "在全能助手卡片的「单人 / 顾问 / 团队」里点团队。开启后顶栏会常驻团队标识，并显示真实队长引擎说明。队长引擎与顶栏“当前模型”不是同一件事。顾问模式不会切换队长引擎。",
       },
       {
         title: "给出可拆分目标",
@@ -656,6 +657,42 @@ export const TUTORIAL_TOPICS = {
     ],
     media: "team-mode",
     related: ["agents", "billing-usage", "marketplace-discovery"],
+  },
+  "advisor-mode": {
+    featureId: "advisor-mode",
+    contentVersion: 1,
+    intro:
+      "顾问模式给全能助手配一个无工具顾问。主模型不切换；需要时可通过 consult_advisor 提问。顾问只能给建议，不能改文件、跑命令或再委派。建议必须由执行者用证据验证后才交付，不能替代审批或正式审查员。",
+    outcome: "在不换主模型的前提下获得第二意见，并由主模型负责核验与执行。",
+    scenarios: ["方案取舍需要第二意见", "主模型想核对实现约束", "对照普通/顾问/更强主模型的质量与费用"],
+    steps: [
+      {
+        title: "打开智能体选择器",
+        body: "点顶栏当前智能体名称，在全能助手卡片里看到「单人 / 顾问 / 团队」三选一。",
+      },
+      {
+        title: "选择顾问",
+        body: "点「顾问」。主模型选择器保持不变。若列表为空，说明还没有已证明无工具隔离的顾问型号，此时不能发送顾问回合，也不会静默换成别的模型。",
+      },
+      {
+        title: "核对顶栏冻结配置",
+        body: "顶栏顾问标识会显示本回合冻结的顾问型号。发送、排队、重试和刷新都沿用这次快照，不会改用后来的偏好。",
+      },
+      {
+        title: "阅读建议并自行验证",
+        body: "对话里的「咨询顾问」工具卡展示意见、状态、实际型号和耗时。主模型必须对照证据决定是否采纳；错误建议应被驳回。",
+      },
+    ],
+    tips: [
+      "只在需要第二意见时开顾问，简单问答用单人即可。",
+      "可以把「同时作为新会话默认」勾上，但那只改默认，不会覆盖已经保存的会话设置。",
+    ],
+    cautions: [
+      "顾问按实际型号计费，不承诺比单人更省。",
+      "顾问意见不是审批通过，也不能代替正式代码审查。",
+    ],
+    media: "advisor-mode",
+    related: ["team-mode", "agents", "billing-usage"],
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",

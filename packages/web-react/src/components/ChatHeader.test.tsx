@@ -65,6 +65,22 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(screen.getByRole("button", { name: "顾问模式已开启" }).textContent).toContain("顾问模式");
   });
 
+  it("顾问 chip 展示冻结型号，不改主模型选择器", () => {
+    renderHeader({
+      advisorModeActive: true,
+      advisorModelLabel: "gpt-6-astra",
+      onDisableAdvisorMode: () => {},
+    });
+    const chip = screen.getByRole("button", { name: "顾问模式已开启" });
+    expect(chip.textContent).toContain("gpt-6-astra");
+    fireEvent.click(chip);
+    expect(screen.getByText(/本回合冻结顾问 gpt-6-astra/)).toBeInTheDocument();
+    expect(screen.getByText(/不承诺更省/)).toBeInTheDocument();
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger.textContent).toContain("GLM-5.2");
+    expect(trigger.textContent).not.toContain("团队模式 · GPT-6-Astra");
+  });
+
   it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎", () => {
     renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
