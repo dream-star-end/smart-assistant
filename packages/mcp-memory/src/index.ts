@@ -78,7 +78,7 @@ import {
   readGatewayToken,
 } from './gatewayClient.js'
 import { resolveConsultInvocationId } from './consultInvocation.js'
-import { consultAdvisorUntilAdvice } from './consultAdvisorClient.js'
+import { consultAdvisorUntilAdvice, formatConsultAdvisorToolPayload } from './consultAdvisorClient.js'
 import {
   askUserHttpTimeoutMs,
   askUserToolPostedFallback,
@@ -861,7 +861,12 @@ async function handleConsultAdvisor(
           timeoutMs: 10 * 60_000,
         }),
     })
-    return result.ok ? toolOk(result.text) : toolError(result.text)
+    const payload = formatConsultAdvisorToolPayload({
+      ok: result.ok,
+      text: result.text,
+      parsed: result.parsed,
+    })
+    return result.ok ? toolOk(payload) : toolError(payload)
   } catch (err: unknown) {
     return toolError(`consult_advisor transport: ${describeDelegateTransportError(err)}`)
   }

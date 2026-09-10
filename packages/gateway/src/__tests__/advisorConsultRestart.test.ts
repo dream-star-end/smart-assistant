@@ -272,6 +272,33 @@ describe('advisor consult restart recovery', () => {
     assert.equal(replayed.hmacOk, false)
     assert.equal(replayed.parentPresent, false)
   })
+
+  it('child process exit with spawned empty advice is not consumer success', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-crash-child-'))
+    const child = fileURLToPath(new URL('./advisorConsultRestartChild.ts', import.meta.url))
+    const minted = spawnSync(process.execPath, ['--import', 'tsx', child, 'mint'], {
+      env: {
+        ...process.env,
+        OC_ADVISOR_RESTART_HOME: dir,
+        OC_SELFHOST_ENGINE_LOCAL_TURNS: '1',
+        OC_ADVISOR_CRASH_WINDOW: '1',
+      },
+      encoding: 'utf8',
+      timeout: 45_000,
+    })
+    if (minted.status !== 0) throw new Error(minted.stderr || minted.stdout)
+    const store = new AdvisorConsultStore(join(dir, 'advisor.db'))
+    const rec = store.findByInvocation({
+      userId: '3',
+      originTurnKey: TURN,
+      invocationId: INVOCATION,
+    })
+    assert.equal(rec?.state, 'spawned')
+    assert.equal(rec?.advice, null)
+    store.markSettledFromBilling(REQUEST_ID)
+    assert.equal(store.findById(rec!.consultId)?.state, 'spawned')
+    store.close()
+  })
 })
 
 describe('advisor consult billing startup projection', () => {
@@ -374,5 +401,97 @@ describe('advisor consult billing startup projection', () => {
     assert.equal(db.findById(record.consultId)?.state, 'settled')
     assert.equal(db.findById(record.consultId)?.advice, 'ORIGINAL_ADVICE')
     db.close()
+  })
+
+  it('first SQLITE_BUSY projection retries in-process without hand-calling projectConsults', async () => {
+    setDelegateEngineBillingSettledHook(undefined)
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-busy-retry-'))
+    const db = new AdvisorConsultStore(join(dir, 'consults.db'))
+    const record = db.insertNew({ ...settledRow(), state: 'settle_pending' }).record
+    const queuePath = join(dir, 'queue.json')
+    await writeFile(
+      queuePath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        pending: [],
+        settledReceipts: [{ requestId: REQUEST_ID, at: Date.now() }],
+      })}\n`,
+    )
+    const orig = db.projectOneReceipt.bind(db)
+    let calls = 0
+    db.projectOneReceipt = ((id: string) => {
+      calls += 1
+      if (calls === 1) throw new Error('SQLITE_BUSY')
+      return orig(id)
+    }) as typeof db.projectOneReceipt
+    const client = createDelegateEngineBillingClient({
+      env: {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:9',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: 'tok',
+      },
+      queuePath,
+      startupRecovery: false,
+      fetcher: (async () => {
+        throw new Error('network forbidden')
+      }) as never,
+    })
+    const gw = Object.create(Gateway.prototype) as any
+    gw._advisorConsults = db
+    gw._delegateEngineBilling = client
+    gw._consultBillingRetryMs = 20
+    gw.log = { warn: () => {}, info: () => {}, debug: () => {}, error: () => {} }
+    gw.advisorConsultStore()
+    const deadline = Date.now() + 1_000
+    while (Date.now() < deadline && db.findById(record.consultId)?.state !== 'settled') {
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    assert.equal(db.findById(record.consultId)?.state, 'settled')
+    assert.equal(db.findById(record.consultId)?.advice, 'ORIGINAL_ADVICE')
+    assert.ok(calls >= 2, `projection calls=${calls}`)
+    const queue = JSON.parse(await readFile(queuePath, 'utf8')) as {
+      pending: unknown[]
+      settledReceipts: unknown[]
+    }
+    assert.equal(queue.pending.length, 0)
+    assert.equal(queue.settledReceipts.length, 0)
+    db.close()
+  })
+
+  it('spawned without advice after reopen is not consumer success', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-empty-settle-'))
+    const dbPath = join(dir, 'advisor.db')
+    const store = new AdvisorConsultStore(dbPath)
+    store.insertNew(
+      settledRow({
+        state: 'spawned',
+        advice: null,
+        billingRequestId: REQUEST_ID,
+      }),
+    )
+    store.markSettledFromBilling(REQUEST_ID)
+    store.close()
+    const reopened = new AdvisorConsultStore(dbPath)
+    assert.equal(reopened.findByInvocation({
+      userId: '3',
+      originTurnKey: TURN,
+      invocationId: INVOCATION,
+    })?.state, 'spawned')
+    const gw = Object.create(Gateway.prototype) as any
+    gw._advisorConsults = reopened
+    gw._advisorConsultWaitMs = 20
+    gw._delegateJobs = { get: () => undefined, wait: async () => ({ status: 'expired' }) }
+    gw._ensureDelegateJobStore = () => gw._delegateJobs
+    const presented = await gw._presentExistingConsult({
+      record: reopened.findByInvocation({
+        userId: '3',
+        originTurnKey: TURN,
+        invocationId: INVOCATION,
+      }),
+      question: 'why red?',
+      concern: '',
+    })
+    assert.notEqual(presented.body.status, 'settled')
+    assert.ok(!presented.body.advice)
+    reopened.close()
   })
 })

@@ -139,11 +139,53 @@ export class AdvisorConsultStore {
     return n
   }
 
+  static projectSettledReceipt(
+    requestId: string,
+  ): 'projected' | 'pending' | 'not-applicable' | 'store-closed' {
+    if (OPEN_STORES.size === 0) return 'store-closed'
+    let pending = false
+    let projected = false
+    for (const store of OPEN_STORES) {
+      const outcome = store.projectOneReceipt(requestId)
+      if (outcome === 'pending') pending = true
+      if (outcome === 'projected') projected = true
+    }
+    if (pending) return 'pending'
+    if (projected) return 'projected'
+    return 'not-applicable'
+  }
+
   findById(consultId: string): AdvisorConsultRecord | undefined {
     const row = this.db
       .prepare('SELECT * FROM advisor_consults WHERE consult_id = ?')
       .get(consultId) as Record<string, unknown> | undefined
     return row ? rowToRecord(row) : undefined
+  }
+
+  projectOneReceipt(requestId: string): 'projected' | 'pending' | 'not-applicable' {
+    if (!requestId) return 'not-applicable'
+    const rows = this.db
+      .prepare('SELECT * FROM advisor_consults WHERE billing_request_id = ?')
+      .all(requestId) as Record<string, unknown>[]
+    if (rows.length === 0) return 'not-applicable'
+    let pending = false
+    let projected = false
+    for (const raw of rows) {
+      const row = rowToRecord(raw)
+      if (row.state === 'settled' || row.state === 'failed' || row.state === 'cancelled') {
+        projected = true
+        continue
+      }
+      if (!PROJECTABLE.has(row.state)) continue
+      if (!row.advice) {
+        pending = true
+        continue
+      }
+      this.update(row.consultId, { state: 'settled', advice: row.advice })
+      projected = true
+    }
+    if (pending) return 'pending'
+    return projected ? 'projected' : 'not-applicable'
   }
 
   markSettledFromBilling(requestId: string): AdvisorConsultRecord[] {
@@ -156,6 +198,7 @@ export class AdvisorConsultStore {
       const row = rowToRecord(raw)
       if (row.state === 'settled') continue
       if (!PROJECTABLE.has(row.state)) continue
+      if (!row.advice) continue
       updated.push(this.update(row.consultId, { state: 'settled', advice: row.advice }))
     }
     return updated

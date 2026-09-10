@@ -149,6 +149,36 @@ describe('createDelegateEngineBillingClient', () => {
     assert.equal(calls[1]?.body.requestId, requestId)
   })
 
+  it('ordinary delegate 2xx does not accumulate consult receipts', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-bill-w4-'))
+    const queuePath = join(dir, 'queue.json')
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      startupRecovery: false,
+      fetcher: (async () => response(200, { ok: true })) as never,
+    })
+    await client.settle({
+      requestId: 'd'.repeat(32),
+      engineSessionId: `oceng-${'e'.repeat(48)}`,
+      status: 'success',
+      durationMs: 9,
+      delegateAgentId: 'auditor',
+    })
+    let receipts: unknown[] = []
+    try {
+      const queue = JSON.parse(await readFile(queuePath, 'utf8')) as {
+        pending: unknown[]
+        settledReceipts?: unknown[]
+      }
+      assert.equal(queue.pending.length, 0)
+      receipts = queue.settledReceipts ?? []
+    } catch (err) {
+      assert.equal((err as NodeJS.ErrnoException).code, 'ENOENT')
+    }
+    assert.equal(receipts.length, 0)
+  })
+
   it('queues a failed live settle and retries the same requestId once', async () => {
     const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-bill-')), 'queue.json')
     let settlePosts = 0

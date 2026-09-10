@@ -4,6 +4,7 @@ import { describe, it } from 'node:test'
 import {
   consultAdvisorResultFromGateway,
   consultAdvisorUntilAdvice,
+  formatConsultAdvisorToolPayload,
 } from '../consultAdvisorClient.js'
 
 describe('consultAdvisor consumer', () => {
@@ -112,5 +113,34 @@ describe('consultAdvisor consumer', () => {
     assert.equal(result.pending, true)
     assert.match(result.text, /pending/)
     assert.match(result.text, /invocation/)
+  })
+
+  it('settled without durable advice is not success; failed keeps partial advice and status', () => {
+    const empty = consultAdvisorResultFromGateway({
+      statusCode: 200,
+      body: JSON.stringify({ status: 'settled', consultId: 'advc-1' }),
+    })
+    assert.equal(empty.kind, 'error')
+    const failed = consultAdvisorResultFromGateway({
+      statusCode: 200,
+      body: JSON.stringify({
+        status: 'failed',
+        advice: 'partial',
+        advisorModel: 'gpt-6-astra',
+        error: 'failed',
+      }),
+    })
+    assert.equal(failed.kind, 'error')
+    assert.match(failed.text, /partial/)
+    const payload = formatConsultAdvisorToolPayload({
+      ok: false,
+      text: failed.text,
+      parsed: failed.kind === 'error' ? failed.parsed : undefined,
+    })
+    const parsed = JSON.parse(payload) as { status?: string; advice?: string; advisorModel?: string }
+    assert.equal(parsed.status, 'failed')
+    assert.equal(parsed.advice, 'partial')
+    assert.equal(parsed.advisorModel, 'gpt-6-astra')
+    assert.equal('usage' in parsed, false)
   })
 })

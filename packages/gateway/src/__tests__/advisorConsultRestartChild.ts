@@ -36,8 +36,8 @@ if (mode === 'mint') {
     snapshotJson: '{}',
     jobId: null,
     billingRequestId: 'ab'.repeat(16),
-    advice: 'ORIGINAL_ADVICE',
-    state: 'settled',
+    advice: process.env.OC_ADVISOR_CRASH_WINDOW === '1' ? null : 'ORIGINAL_ADVICE',
+    state: process.env.OC_ADVISOR_CRASH_WINDOW === '1' ? 'spawned' : 'settled',
   })
   store.close()
   const token = issueConsultTurnToken({

@@ -167,17 +167,25 @@ export function historyFromSessionMessages(
   return { records, missing, truncated: missing.length > 0 }
 }
 
+const TRUSTED_FILE_TOOL_RE =
+  /^(read|read_file|write|edit|search_replace|oc-web parse|oc_web_parse)$/i
+
+/** Read/Write/Edit this turn are current-task file tools. Web/shell stdout is not. */
+export function isTrustedCurrentTaskFileTool(name?: string): boolean {
+  return TRUSTED_FILE_TOOL_RE.test(String(name ?? '').trim())
+}
+
 export function parentAuthorizedArtifactTexts(input: {
   userTask?: string
-  currentTools?: Array<{ result?: string; input?: unknown }>
+  currentTools?: Array<{ name?: string; result?: string; input?: unknown }>
 }): string[] {
-  return extractGeneratedPaths([
-    input.userTask,
-    ...(input.currentTools ?? []).map((tool) => tool.result),
-    ...(input.currentTools ?? []).map((tool) =>
-      typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input ?? ''),
-    ),
-  ])
+  const mentioned = extractGeneratedPaths([input.userTask])
+  for (const tool of input.currentTools ?? []) {
+    if (!isTrustedCurrentTaskFileTool(tool.name)) continue
+    const inputText = typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input ?? '')
+    mentioned.push(...extractGeneratedPaths([inputText]))
+  }
+  return [...new Set(mentioned)]
 }
 
 export function stripAdvisorPreambleFromInjected(text: string): string {
@@ -208,9 +216,33 @@ export type AdvisorSnapshot = {
 
 const CONSTRAINT_CAP = 8_000
 const TOOL_CAP = 8_000
+const TOOL_INPUT_CAP = 2_000
 const ARTIFACT_FILE_CAP = 64 * 1024
 const ARTIFACT_TOTAL_CAP = 256 * 1024
 const GENERATED_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/[A-Za-z0-9._@+=,-]{1,180}/g
+const ADVISOR_SECRET_RE =
+  /(\b(?:password|secret|api[_-]?key|token)\s*[:=]\s*)\S+|(\bbearer\s+)\S+|(\bsk-|xai-|ghp_|github_pat_)[A-Za-z0-9._-]{8,}/gi
+
+function redactAdvisorSecrets(text: string): string {
+  return text.replace(ADVISOR_SECRET_RE, (match, prefix?: string, bearer?: string, keyPrefix?: string) => {
+    if (typeof prefix === 'string' && prefix) return `${prefix}[redacted]`
+    if (typeof bearer === 'string' && bearer) return `${bearer}[redacted]`
+    if (typeof keyPrefix === 'string' && keyPrefix) return `${keyPrefix}[redacted]`
+    return '[redacted]'
+  })
+}
+
+export function formatAdvisorToolInput(input: unknown): { text: string; missing?: string } {
+  if (input == null || input === '') return { text: '', missing: 'input_missing' }
+  const raw = typeof input === 'string' ? input : JSON.stringify(input)
+  if (!raw) return { text: '', missing: 'input_missing' }
+  const redacted = redactAdvisorSecrets(raw)
+  const capped = cap(redacted, TOOL_INPUT_CAP)
+  return {
+    text: capped.text,
+    missing: capped.truncated ? 'input_truncated' : undefined,
+  }
+}
 
 function cap(text: string, max: number): { text: string; truncated: boolean } {
   if (text.length <= max) return { text, truncated: false }
@@ -333,7 +365,10 @@ export function formatAdvisorConsultPrompt(snapshot: AdvisorSnapshot): string {
   const tools = (snapshot.currentTools ?? [])
     .map((tool) => {
       const status = tool.completed ? 'completed' : 'in_progress'
-      return `- ${tool.name ?? 'tool'} [${status}]: ${tool.result ?? ''}`
+      const formatted = formatAdvisorToolInput(tool.input)
+      const missing = formatted.missing ? ` [${formatted.missing}]` : ''
+      const inputText = formatted.text || '（未提供）'
+      return `- ${tool.name ?? 'tool'} [${status}] input=${inputText}${missing}: ${tool.result ?? ''}`
     })
     .join('\n')
   const artifacts = (snapshot.artifacts ?? [])

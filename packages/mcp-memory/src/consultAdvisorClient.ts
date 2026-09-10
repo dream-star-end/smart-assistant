@@ -18,12 +18,37 @@ export type ConsultParsedBody = {
   consultId?: string
   jobId?: string
   recoverable?: boolean
+  advisorModel?: string
+  usage?: Record<string, unknown>
 }
 
 export type ConsultConsumeResult =
   | { kind: 'advice'; text: string; parsed: ConsultParsedBody }
-  | { kind: 'error'; text: string }
+  | { kind: 'error'; text: string; parsed?: ConsultParsedBody }
   | { kind: 'pending'; parsed: ConsultParsedBody }
+
+export function formatConsultAdvisorToolPayload(input: {
+  ok: boolean
+  text: string
+  parsed?: ConsultParsedBody
+}): string {
+  const parsed = input.parsed ?? {}
+  const missing =
+    Array.isArray(parsed.missing) && parsed.missing.length
+      ? `\n【缺失证据】${parsed.missing.join(', ')}`
+      : ''
+  const payload: Record<string, unknown> = {
+    advice: typeof parsed.advice === 'string' && parsed.advice ? parsed.advice : input.ok ? input.text : undefined,
+    status: parsed.status,
+    advisorModel: parsed.advisorModel,
+    consultId: parsed.consultId,
+    jobId: parsed.jobId,
+  }
+  if (parsed.usage && typeof parsed.usage === 'object') payload.usage = parsed.usage
+  if (!input.ok) payload.error = parsed.error || input.text
+  if (missing) payload.missing = parsed.missing
+  return JSON.stringify(payload)
+}
 
 export function parseConsultAdvisorBody(text: string): ConsultParsedBody | null {
   try {
@@ -54,7 +79,22 @@ export function consultAdvisorResultFromGateway(res: ConsultGatewayResponse): Co
     if (res.statusCode === 202) return { kind: 'pending', parsed: { status: 'pending' } }
     return { kind: 'advice', text, parsed: {} }
   }
-  if (parsed.error && !parsed.advice) return { kind: 'error', text: parsed.error }
+  if (parsed.status === 'failed' || parsed.status === 'cancelled') {
+    const missing =
+      Array.isArray(parsed.missing) && parsed.missing.length
+        ? `\n【缺失证据】${parsed.missing.join(', ')}`
+        : ''
+    const advice = typeof parsed.advice === 'string' && parsed.advice ? parsed.advice : ''
+    return {
+      kind: 'error',
+      text: `${parsed.error || parsed.status}${advice ? `\n${advice}` : ''}${missing}`,
+      parsed,
+    }
+  }
+  if (parsed.status === 'settle_pending' && !(typeof parsed.advice === 'string' && parsed.advice)) {
+    return { kind: 'pending', parsed }
+  }
+  if (parsed.error && !parsed.advice) return { kind: 'error', text: parsed.error, parsed }
   if (typeof parsed.advice === 'string' && parsed.advice) {
     const missing =
       Array.isArray(parsed.missing) && parsed.missing.length
@@ -69,17 +109,10 @@ export function consultAdvisorResultFromGateway(res: ConsultGatewayResponse): Co
   ) {
     return { kind: 'pending', parsed }
   }
-  if (parsed.status === 'failed' || parsed.status === 'cancelled') {
-    return { kind: 'error', text: parsed.error || parsed.status }
+  if (parsed.status === 'settled') {
+    return { kind: 'error', text: 'consult settled without durable advice', parsed }
   }
-  if (parsed.status === 'settled' || parsed.status === 'settle_pending') {
-    const missing =
-      Array.isArray(parsed.missing) && parsed.missing.length
-        ? `\n【缺失证据】${parsed.missing.join(', ')}`
-        : ''
-    return { kind: 'advice', text: `${parsed.advice || ''}${missing}`, parsed }
-  }
-  return { kind: 'error', text: `consult_advisor unexpected status ${parsed.status ?? res.statusCode}` }
+  return { kind: 'error', text: `consult_advisor unexpected status ${parsed.status ?? res.statusCode}`, parsed }
 }
 
 const RETRYABLE_TRANSPORT_CODES = new Set([
@@ -108,7 +141,10 @@ export async function consultAdvisorUntilAdvice(input: {
   overallMs?: number
   sleep?: (ms: number) => Promise<void>
   retryGapMs?: number
-}): Promise<{ ok: true; text: string } | { ok: false; text: string; pending?: boolean }> {
+}): Promise<
+  | { ok: true; text: string; parsed?: ConsultParsedBody }
+  | { ok: false; text: string; pending?: boolean; parsed?: ConsultParsedBody }
+> {
   const now = input.now ?? Date.now
   const overallMs = input.overallMs ?? CONSULT_ADVISOR_OVERALL_MS
   const sleep = input.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
@@ -129,8 +165,8 @@ export async function consultAdvisorUntilAdvice(input: {
       continue
     }
     const result = consultAdvisorResultFromGateway(res)
-    if (result.kind === 'advice') return { ok: true, text: result.text }
-    if (result.kind === 'error') return { ok: false, text: result.text }
+    if (result.kind === 'advice') return { ok: true, text: result.text, parsed: result.parsed }
+    if (result.kind === 'error') return { ok: false, text: result.text, parsed: result.parsed }
     lastPending = result.parsed
     const remaining = deadline - now()
     if (remaining <= 0) break

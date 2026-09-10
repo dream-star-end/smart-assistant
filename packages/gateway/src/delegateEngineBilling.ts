@@ -259,13 +259,17 @@ export function createDelegateEngineBillingClient(args?: {
       await writeDurableJson(queuePath, queue)
     })
 
-  const dropSettled = async (requestId: string): Promise<void> =>
+  const dropSettled = async (billing: DurableCodexBilling): Promise<void> =>
     withQueueLock(async () => {
       const queue = await readBillingQueue(queuePath)
-      const next = queue.pending.filter((row) => row.requestId !== requestId)
+      const next = queue.pending.filter((row) => row.requestId !== billing.requestId)
       const receipts = [...(queue.settledReceipts ?? [])]
-      if (!receipts.some((row) => row.requestId === requestId)) {
-        receipts.push({ requestId, at: Date.now() })
+      const needsConsultProjection = billing.delegateAgentId === 'advisor'
+      if (
+        needsConsultProjection &&
+        !receipts.some((row) => row.requestId === billing.requestId)
+      ) {
+        receipts.push({ requestId: billing.requestId, at: Date.now() })
       }
       if (next.length !== queue.pending.length || receipts.length !== (queue.settledReceipts?.length ?? 0)) {
         await writeDurableJson(queuePath, {
@@ -311,7 +315,7 @@ export function createDelegateEngineBillingClient(args?: {
       }
       try {
         await post(SETTLE_PATH, billing)
-        await dropSettled(billing.requestId)
+        await dropSettled(billing)
       } catch (err) {
         // Same durable-boundary pattern as Auto-Dream: persist then retry.
         // UNIQUE(user_id, request_id) makes a later successful POST idempotent.
@@ -334,16 +338,15 @@ export function createDelegateEngineBillingClient(args?: {
     async retryPending() {
       return withQueueLock(async () => {
         const queue = await readBillingQueue(queuePath)
-        if (queue.pending.length === 0) {
-          clearRetry()
-          return
-        }
         const remaining: DurableCodexBilling[] = []
         const receipts = [...(queue.settledReceipts ?? [])]
         for (const billing of queue.pending) {
           try {
             await post(SETTLE_PATH, billing)
-            if (!receipts.some((row) => row.requestId === billing.requestId)) {
+            if (
+              billing.delegateAgentId === 'advisor' &&
+              !receipts.some((row) => row.requestId === billing.requestId)
+            ) {
               receipts.push({ requestId: billing.requestId, at: Date.now() })
             }
             try {
@@ -355,14 +358,23 @@ export function createDelegateEngineBillingClient(args?: {
             remaining.push(billing)
           }
         }
+        const kept: BillingSettledReceipt[] = []
+        for (const rec of receipts) {
+          const outcome = AdvisorConsultStore.projectSettledReceipt(rec.requestId)
+          if (outcome === 'pending' || outcome === 'store-closed') kept.push(rec)
+        }
         await writeDurableJson(queuePath, {
           schemaVersion: 1,
           pending: remaining,
-          settledReceipts: receipts,
+          settledReceipts: kept,
         })
         if (remaining.length > 0) {
           scheduleRetry()
           throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
+        }
+        if (kept.length > 0) {
+          scheduleRetry()
+          return
         }
         clearRetry()
       })
@@ -372,8 +384,8 @@ export function createDelegateEngineBillingClient(args?: {
         const queue = await readBillingQueue(queuePath)
         const kept: BillingSettledReceipt[] = []
         for (const rec of queue.settledReceipts ?? []) {
-          const updated = store.markSettledFromBilling(rec.requestId)
-          if (updated.length === 0) kept.push(rec)
+          const outcome = store.projectOneReceipt(rec.requestId)
+          if (outcome === 'pending') kept.push(rec)
         }
         if (kept.length !== (queue.settledReceipts?.length ?? 0)) {
           await writeDurableJson(queuePath, {

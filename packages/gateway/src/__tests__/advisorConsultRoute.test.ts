@@ -153,6 +153,7 @@ async function makeGateway(opts?: {
   gw._delegateJobs = new DelegateJobStore({ ttlMs: 60_000 })
   gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
   gw.getUserId = () => '3'
+  gw._loadClientSession = async () => null
   gw.deps = {
     config: {
       version: 1,
@@ -1358,5 +1359,78 @@ describe('M4c recovery contracts', () => {
     assert.equal(second.body.advice, 'check the assertion first')
     assert.equal(second.spawn, 0)
     assert.equal(second.settlePosts, 2)
+  })
+})
+
+describe('OCV5-210 R1 E2/W1', () => {
+  it('Stop during history: 0 admit/spawn and no next-turn model/task in snapshot', async () => {
+    const { gw, billing } = await makeGateway()
+    let release!: (value: { records: unknown[] }) => void
+    gw._loadConsultHistoryTape = () =>
+      new Promise((resolve) => {
+        release = resolve
+      })
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-e2-hist' })
+    const pending = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    await new Promise((r) => setTimeout(r, 30))
+    gw._interruptDelegationsForParent(PARENT_KEY)
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._currentTurnKey = 'b'.repeat(64)
+    parent._currentTurnUserText = 'task-B'
+    parent._advisorTurn = { advisorModel: 'other-model', configVersion: 'v1:advisor:other-model' }
+    release({ records: [] })
+    const got = await pending
+    assert.equal(got.status, 409, JSON.stringify(got.body))
+    assert.equal(billing.admits.length, 0)
+    assert.equal(gw._spawnCount ?? 0, 0)
+    const rec = gw._advisorConsults.findByInvocation({
+      userId: '3',
+      originTurnKey: TURN_KEY,
+      invocationId: 'cinv-e2-hist',
+    })
+    assert.equal(rec, undefined)
+  })
+
+  it('Stop during admit: 0 spawn and original owner abandon', async () => {
+    const { gw, billing } = await makeGateway()
+    let release!: (value: { requestId: string; engineSessionId: string }) => void
+    billing.admit = async (input: unknown) => {
+      billing.admits.push(input)
+      return await new Promise((resolve) => {
+        release = resolve
+      })
+    }
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-e2-admit' })
+    const pending = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    await new Promise((r) => setTimeout(r, 30))
+    gw._interruptDelegationsForParent(PARENT_KEY)
+    release({ requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}` })
+    const got = await pending
+    assert.equal(gw._spawnCount ?? 0, 0)
+    assert.equal(billing.admits.length, 1)
+    assert.equal(billing.abandons.length, 1)
+    assert.equal(billing.abandons[0], REQUEST_ID)
+    assert.ok(got.status === 409 || got.status === 503, JSON.stringify(got.body))
+    const rec = gw._advisorConsults.findByInvocation({
+      userId: '3',
+      originTurnKey: TURN_KEY,
+      invocationId: 'cinv-e2-admit',
+    })
+    assert.ok(rec)
+    assert.ok(rec.state === 'cancelled' || rec.state === 'admission_unknown', rec.state)
+  })
+
+  it('warm live old model does not override saved CCB selection', async () => {
+    const { gw } = await makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent.providerTag = 'codex'
+    parent.model = 'old-codex'
+    gw._loadClientSession = async () => ({ agentId: 'main', modelId: 'glm-5.2' })
+    gw._catalogEngineForModel = async (modelId: string) =>
+      modelId === 'glm-5.2' ? 'ccb' : modelId === 'old-codex' ? 'codex' : undefined
+    const get = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
+    assert.equal(get.status, 200, JSON.stringify(get.body))
+    assert.equal(get.body.parentEngine, 'ccb')
+    assert.equal(get.body.advisorConsultAllowed, true)
   })
 })

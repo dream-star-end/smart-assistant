@@ -68,7 +68,7 @@ import {
 } from './delegateStartCli.js'
 import { CONSULT_INVOCATION_HEADER, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 import { resolveConsultInvocationId } from './consultInvocation.js'
-import { consultAdvisorUntilAdvice } from './consultAdvisorClient.js'
+import { consultAdvisorUntilAdvice, formatConsultAdvisorToolPayload } from './consultAdvisorClient.js'
 
 const TOOL = 'oc-memory'
 
@@ -240,7 +240,12 @@ async function main(): Promise<void> {
           }),
       })
       if (!result.ok) fail(result.text)
-      process.stdout.write(result.text.endsWith('\n') ? result.text : `${result.text}\n`)
+      const payload = formatConsultAdvisorToolPayload({
+        ok: true,
+        text: result.text,
+        parsed: result.parsed,
+      })
+      process.stdout.write(payload.endsWith('\n') ? payload : `${payload}\n`)
       process.exit(0)
     } catch (err: unknown) {
       fail(`consult-advisor transport: ${String((err as Error)?.message ?? err)}`)

@@ -202,4 +202,26 @@ describe('advisorConsultStore', () => {
       verify.close()
     }
   })
+
+  it('billing 2xx does not settle admitted/spawned rows without durable advice', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-e3-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const requestId = 'a'.repeat(32)
+    const { record } = store.insertNew(
+      sample(dir, {
+        invocationId: 'inv-e3',
+        state: 'spawned',
+        billingRequestId: requestId,
+        advice: null,
+      }),
+    )
+    assert.equal(store.projectOneReceipt(requestId), 'pending')
+    assert.equal(store.findById(record.consultId)?.state, 'spawned')
+    assert.equal(store.markSettledFromBilling(requestId).length, 0)
+    store.update(record.consultId, { advice: 'PERSISTED_ADVICE' })
+    assert.equal(store.projectOneReceipt(requestId), 'projected')
+    assert.equal(store.findById(record.consultId)?.state, 'settled')
+    assert.equal(store.findById(record.consultId)?.advice, 'PERSISTED_ADVICE')
+    store.close()
+  })
 })
