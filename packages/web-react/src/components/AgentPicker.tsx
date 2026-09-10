@@ -167,7 +167,7 @@ export function AgentPicker({
                   <ShieldCheck size={13} />
                   顾问
                 </span>
-                <span className="mt-0.5 block text-[11px] leading-snug">主模型不切换，可咨询无工具顾问</span>
+                <span className="mt-0.5 block text-[11px] leading-snug">主模型不切换；一期仅 CCB 主会话可咨询</span>
               </button>
               <button
                 type="button"

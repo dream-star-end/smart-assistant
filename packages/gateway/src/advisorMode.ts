@@ -6,7 +6,17 @@ import {
   type CollaborationMode,
   DEFAULT_ADVISOR_MODEL,
 } from '@openclaude/protocol'
+import type { MessageLike } from '@openclaude/storage'
 import { isPathWithinRoot } from './pathAcl.js'
+
+/** Phase-1 consult identity is proven only for CCB parent turns. */
+export const ADVISOR_CONSULT_PARENT_ENGINES = ['ccb'] as const
+export const ADVISOR_CONSULT_PARENT_REASON =
+  '一期仅 CCB 主会话（如 glm/MiniMax）可咨询顾问。Codex/Grok/Cursor 主引擎尚未证明稳定 tool_use 身份，不能选择顾问后在 consult 上必失败。主模型不会因此被切换。'
+
+export function isAdvisorConsultParentEngine(engine: string | undefined): boolean {
+  return engine === 'ccb'
+}
 
 export const ADVISOR_PREAMBLE = [
   '【顾问模式已开启】当前主模型不切换。你可以使用 consult_advisor 向无工具顾问提问（question 必填，可选 concern）。',
@@ -87,8 +97,33 @@ export function listProvenAdvisorModels(input: {
   return { advisorModels }
 }
 
+function historyText(row: MessageLike): string | undefined {
+  if (typeof row.text === 'string' && row.text) return row.text
+  if (typeof row.content === 'string' && row.content) return row.content
+  return undefined
+}
+
+function historyToolName(row: MessageLike): string | undefined {
+  if (typeof row.toolName === 'string' && row.toolName) return row.toolName
+  if (typeof row.tool_name === 'string' && row.tool_name) return row.tool_name
+  return undefined
+}
+
+function historyToolResult(row: MessageLike): string | undefined {
+  if (typeof row.toolResult === 'string' && row.toolResult) return row.toolResult
+  if (typeof row.tool_result === 'string' && row.tool_result) return row.tool_result
+  if (row.role === 'tool' && typeof row.content === 'string') return row.content
+  return undefined
+}
+
+export function coerceHistoryMessages(raw: unknown): MessageLike[] | undefined {
+  if (raw == null) return undefined
+  if (!Array.isArray(raw)) return undefined
+  return raw.filter((row): row is MessageLike => Boolean(row) && typeof row === 'object' && !Array.isArray(row))
+}
+
 export function historyFromSessionMessages(
-  messages: Array<{ role?: unknown; text?: unknown; toolName?: unknown; toolResult?: unknown }> | undefined,
+  messages: readonly MessageLike[] | undefined,
   opts?: { archivedThroughSeq?: number; hasMore?: boolean },
 ): {
   records?: AdvisorSnapshotInput['historyRecords']
@@ -104,9 +139,9 @@ export function historyFromSessionMessages(
     })
     .map((row) => ({
       role: String(row.role),
-      text: typeof row.text === 'string' ? row.text : undefined,
-      toolName: typeof row.toolName === 'string' ? row.toolName : undefined,
-      toolResult: typeof row.toolResult === 'string' ? row.toolResult : undefined,
+      text: historyText(row),
+      toolName: historyToolName(row),
+      toolResult: historyToolResult(row),
     }))
   if ((opts?.archivedThroughSeq ?? 0) > 0) missing.push('tape_archived_prefix')
   if (opts?.hasMore) missing.push('tape_unfinalized')

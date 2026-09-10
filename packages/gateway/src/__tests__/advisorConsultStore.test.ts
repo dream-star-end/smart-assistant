@@ -29,6 +29,7 @@ function sample(dir: string, over: Partial<AdvisorConsultRecord> = {}): AdvisorC
     snapshotJson,
     jobId: null,
     billingRequestId: null,
+    advice: null,
     state: 'accepted',
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -105,6 +106,21 @@ describe('advisorConsultStore', () => {
     assert.equal(pending.billingRequestId?.length, 32)
     assert.equal(store.listByState('settle_pending').length, 1)
     assert.equal(store.findById(record.consultId)?.state, 'settle_pending')
+    store.close()
+  })
+
+  it('concurrent insertNew of the same invocation reuses one row', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const a = sample(dir, { invocationId: 'inv-race', consultId: mintConsultId() })
+    const b = sample(dir, { invocationId: 'inv-race', consultId: mintConsultId() })
+    const [one, two] = await Promise.all([
+      Promise.resolve(store.insertNew(a)),
+      Promise.resolve(store.insertNew(b)),
+    ])
+    const reused = [one, two].filter((row) => row.reused)
+    assert.equal(reused.length, 1)
+    assert.equal(one.record.consultId, two.record.consultId)
     store.close()
   })
 })

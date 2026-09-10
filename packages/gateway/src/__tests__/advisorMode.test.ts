@@ -8,6 +8,8 @@ import { symlinkSync } from 'node:fs'
 import {
   ADVISOR_PREAMBLE,
   assertAdvisorModelAllowed,
+  coerceHistoryMessages,
+  isAdvisorConsultParentEngine,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
   extractGeneratedPaths,
@@ -105,21 +107,45 @@ describe('advisorMode snapshot', () => {
     assert.deepEqual(fromQuestion, ['/home/agent/.openclaude/generated/other.txt'])
   })
 
-  it('historyFromSessionMessages drops thinking and flags archived prefix', () => {
+  it('historyFromSessionMessages reads MessageLike tape/session schema, not empty rows', () => {
     const hist = historyFromSessionMessages(
       [
-        { role: 'thinking', text: 'secret chain' },
-        { role: 'user', text: 'hello' },
-        { role: 'assistant', text: 'hi' },
+        { role: 'thinking', text: 'secret chain', _orderSeq: 1 },
+        { role: 'user', text: 'calendar in Tokyo', _orderSeq: 2 },
+        { role: 'assistant', content: 'I will check offset', _orderSeq: 3 },
+        { role: 'tool', toolName: 'Read', toolResult: 'TZ=Asia/Tokyo', _orderSeq: 4 },
       ],
       { archivedThroughSeq: 12 },
     )
     assert.deepEqual(
       hist.records?.map((row) => row.role),
-      ['user', 'assistant'],
+      ['user', 'assistant', 'tool'],
     )
+    assert.equal(hist.records?.[0]?.text, 'calendar in Tokyo')
+    assert.equal(hist.records?.[1]?.text, 'I will check offset')
+    assert.equal(hist.records?.[2]?.toolName, 'Read')
+    assert.equal(hist.records?.[2]?.toolResult, 'TZ=Asia/Tokyo')
     assert.ok(hist.missing.includes('tape_archived_prefix'))
     assert.equal(hist.records?.some((row) => row.text === 'secret chain'), false)
+  })
+
+  it('coerceHistoryMessages keeps object rows from unknown session arrays', () => {
+    const raw: unknown = [
+      { role: 'user', text: 'keep me', _orderSeq: 7 },
+      'not-a-row',
+      null,
+    ]
+    const rows = coerceHistoryMessages(raw)
+    const hist = historyFromSessionMessages(rows)
+    assert.equal(hist.records?.length, 1)
+    assert.equal(hist.records?.[0]?.text, 'keep me')
+  })
+
+  it('isAdvisorConsultParentEngine is CCB-only in phase 1', () => {
+    assert.equal(isAdvisorConsultParentEngine('ccb'), true)
+    assert.equal(isAdvisorConsultParentEngine('codex'), false)
+    assert.equal(isAdvisorConsultParentEngine('grok'), false)
+    assert.equal(isAdvisorConsultParentEngine('cursor'), false)
   })
 
   it('assertAdvisorModelAllowed refuses silent fallback when the requested slug is absent', () => {

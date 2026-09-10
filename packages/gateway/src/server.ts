@@ -274,8 +274,12 @@ import {
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
   formatAdvisorConsultPrompt,
+  ADVISOR_CONSULT_PARENT_ENGINES,
+  ADVISOR_CONSULT_PARENT_REASON,
   assertAdvisorModelAllowed,
+  coerceHistoryMessages,
   historyFromSessionMessages,
+  isAdvisorConsultParentEngine,
   isAdvisorEngineOpen,
   listProvenAdvisorModels,
   matchConsultIdentity,
@@ -11060,6 +11064,7 @@ export class Gateway {
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
   private _advisorConsults: AdvisorConsultStore | undefined
+  private _advisorConsultWaitMs: number | undefined
   private _advisorConfig: AdvisorConfigStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
@@ -12050,6 +12055,97 @@ export class Gateway {
     return (this._advisorConfig ??= new AdvisorConfigStore())
   }
 
+  private _consultWaitMs(): number {
+    const raw = Number(this._advisorConsultWaitMs)
+    return Number.isFinite(raw) && raw > 0 ? raw : 30_000
+  }
+
+  private _adviceFromConsult(record: {
+    advice?: string | null
+    jobId?: string | null
+  }): string {
+    if (typeof record.advice === 'string' && record.advice) return record.advice
+    if (!record.jobId) return ''
+    const view = this._ensureDelegateJobStore().get(record.jobId)
+    const body = view.status === 'done' ? view.body : undefined
+    return typeof body?.advice === 'string' ? body.advice : ''
+  }
+
+  private async _presentExistingConsult(input: {
+    record: import('./advisorConsultStore.js').AdvisorConsultRecord
+    question: string
+    concern: string
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    const { record } = input
+    if (!matchConsultIdentity(record, { question: input.question, concern: input.concern })) {
+      return { status: 409, body: { error: 'invocation 与 question/concern 不一致' } }
+    }
+    if (record.state === 'admission_unknown') {
+      return {
+        status: 503,
+        body: {
+          error: '顾问准入不确定，不重复 admit',
+          consultId: record.consultId,
+          state: 'admission_unknown',
+          reused: true,
+        },
+      }
+    }
+    const terminal = new Set(['settled', 'settle_pending', 'failed', 'cancelled'])
+    const deadline = Date.now() + this._consultWaitMs()
+    let current = record
+    while (Date.now() <= deadline) {
+      current = this.advisorConsultStore().findById(current.consultId) ?? current
+      const advice = this._adviceFromConsult(current)
+      if (terminal.has(current.state) || advice) {
+        return {
+          status: 200,
+          body: {
+            status: current.state,
+            consultId: current.consultId,
+            jobId: current.jobId,
+            requestId: current.billingRequestId,
+            advice,
+            reused: true,
+            error: current.state === 'failed' || current.state === 'cancelled' ? current.state : undefined,
+          },
+        }
+      }
+      if (current.jobId) {
+        const view = await this._ensureDelegateJobStore().wait(current.jobId, Math.min(5_000, deadline - Date.now()))
+        current = this.advisorConsultStore().findById(current.consultId) ?? current
+        const waitedAdvice =
+          this._adviceFromConsult(current) ||
+          (view.status === 'done' && typeof view.body?.advice === 'string' ? view.body.advice : '')
+        if (waitedAdvice || terminal.has(current.state) || view.status === 'done') {
+          return {
+            status: 200,
+            body: {
+              status: current.state === 'admitted' || current.state === 'spawned' ? 'settled' : current.state,
+              consultId: current.consultId,
+              jobId: current.jobId,
+              requestId: current.billingRequestId,
+              advice: waitedAdvice,
+              reused: true,
+            },
+          }
+        }
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+    }
+    current = this.advisorConsultStore().findById(record.consultId) ?? record
+    return {
+      status: 200,
+      body: {
+        status: current.jobId ? 'running' : current.state,
+        consultId: current.consultId,
+        jobId: current.jobId,
+        reused: true,
+      },
+    }
+  }
+
   private async _freezeAdvisorTurn(
     requested: string,
   ): Promise<{ ok: true; advisorModel: string } | { ok: false; error: string }> {
@@ -12101,6 +12197,9 @@ export class Gateway {
     if (!parent || parent.agentId !== 'main' || parent._collabModeTurn !== 'advisor' || !parent._advisorTurn) {
       return this.sendError(res, 409, '当前回合不是顾问模式，无法咨询')
     }
+    if (!isAdvisorConsultParentEngine(parent.providerTag)) {
+      return this.sendError(res, 409, ADVISOR_CONSULT_PARENT_REASON)
+    }
     if (parent._currentTurnKey !== claims.turnKey) {
       const existing = this.advisorConsultStore().findByInvocation({
         userId: String(parent.userId ?? ''),
@@ -12110,15 +12209,8 @@ export class Gateway {
       if (!existing) {
         return this.sendError(res, 409, '原回合已结束，不能再发起新的顾问咨询')
       }
-      if (!matchConsultIdentity(existing, { question, concern })) {
-        return this.sendError(res, 409, 'invocation 与 question/concern 不一致')
-      }
-      return this.sendJson(res, 200, {
-        status: existing.jobId ? 'running' : existing.state,
-        jobId: existing.jobId,
-        consultId: existing.consultId,
-        reused: true,
-      })
+      const presented = await this._presentExistingConsult({ record: existing, question, concern })
+      return this.sendJson(res, presented.status, presented.body)
     }
     const userId = String(parent.userId ?? this.getUserId(req) ?? '')
     if (!userId) return this.sendError(res, 401, 'missing user')
@@ -12129,22 +12221,8 @@ export class Gateway {
       invocationId,
     })
     if (existing) {
-      if (!matchConsultIdentity(existing, { question, concern })) {
-        return this.sendError(res, 409, 'invocation 与 question/concern 不一致')
-      }
-      return this.sendJson(res, 200, {
-        status: existing.jobId ? 'running' : existing.state,
-        jobId: existing.jobId,
-        consultId: existing.consultId,
-        reused: true,
-        snapshotMissing: (() => {
-          try {
-            return (JSON.parse(existing.snapshotJson) as { missing?: string[] }).missing ?? []
-          } catch {
-            return ['snapshot_unreadable']
-          }
-        })(),
-      })
+      const presented = await this._presentExistingConsult({ record: existing, question, concern })
+      return this.sendJson(res, presented.status, presented.body)
     }
     const snap = parent.runner.getPartialSnapshot()
     const currentTools = snap.completedTools?.map((tool) => ({
@@ -12158,7 +12236,7 @@ export class Gateway {
     try {
       const page = await listTurnTapeRecords(parent.peerId, userId, parent._currentTurnKey ?? '', 0, 80)
       if (page?.records) {
-        const hist = historyFromSessionMessages(page.records as never, { hasMore: page.nextCursor != null })
+        const hist = historyFromSessionMessages(page.records, { hasMore: page.nextCursor != null })
         historyRecords = hist.records
         historyMissing = hist.missing
       }
@@ -12168,7 +12246,7 @@ export class Gateway {
     if (!historyRecords) {
       try {
         const tape = await getClientSession(parent.peerId, userId)
-        const hist = historyFromSessionMessages(tape?.messages as never, {
+        const hist = historyFromSessionMessages(coerceHistoryMessages(tape?.messages), {
           archivedThroughSeq: tape?.archivedThroughSeq,
           hasMore: tape?.timelineHasMore,
         })
@@ -12220,12 +12298,12 @@ export class Gateway {
       state: 'accepted',
     })
     if (inserted.reused) {
-      return this.sendJson(res, 200, {
-        status: inserted.record.jobId ? 'running' : inserted.record.state,
-        jobId: inserted.record.jobId,
-        consultId: inserted.record.consultId,
-        reused: true,
+      const presented = await this._presentExistingConsult({
+        record: inserted.record,
+        question,
+        concern,
       })
+      return this.sendJson(res, presented.status, presented.body)
     }
     const engine = parent.providerTag === 'codex' ? 'codex' : parent.providerTag
     const proven = this.advisorConfigStore().read().provenEngines
@@ -12311,6 +12389,12 @@ export class Gateway {
     const consultStore = this.advisorConsultStore()
     const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
     const cfg = await this._getAgentsConfig()
+    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
+    const unregister = this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
+    let slotHeld = false
+    let jobId: string | undefined
+    let jobs: DelegateJobStore | undefined
+    try {
     const sourceAgent =
       cfg.agents.find((row) => row.id === 'main') ??
       cfg.agents.find((row) => row.id === cfg.default)
@@ -12339,8 +12423,7 @@ export class Gateway {
     ) {
       throw new Error('顾问引擎未开放或型号不是已证明的 Codex 顾问')
     }
-    const jobs = this._ensureDelegateJobStore()
-    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
+    jobs = this._ensureDelegateJobStore()
     const gate = await this._waitForDelegateCapacity({
       sessionKey: advisorSessionKey,
       parentBucketKey: input.parent.sessionKey,
@@ -12348,13 +12431,15 @@ export class Gateway {
     })
     if (gate.status !== 'ok') {
       await input.billingApi.abandon(input.requestId).catch(() => {})
-      consultStore.update(input.consultId, { state: 'failed' })
+      const state = gate.status === 'aborted' ? 'cancelled' : 'failed'
+      consultStore.update(input.consultId, { state })
       return {
-        state: 'failed',
+        state,
         advice: '',
         error: `顾问资源闸未放行: ${gate.status}`,
       }
     }
+    slotHeld = true
     const created = jobs.create(ADVISOR_AGENT_ID, {
       sessionKey: advisorSessionKey,
       parentSessionKey: input.parent.sessionKey,
@@ -12364,153 +12449,154 @@ export class Gateway {
       idempotencyKey: input.consultId,
     })
     if ('error' in created) {
-      this._releaseDelegateSlot(slotOpts)
-      await input.billingApi.abandon(input.requestId).catch(() => {})
-      consultStore.update(input.consultId, { state: 'failed' })
-      return { state: 'failed', advice: '', error: 'too many in-flight advisor jobs' }
+      throw new Error('too many in-flight advisor jobs')
     }
-    const jobId = created.jobId
+    jobId = created.jobId
     consultStore.update(input.consultId, { jobId, state: 'admitted' })
-    const unregister = this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
-    let session: AgentSession
-    try {
-      session = await this.sessions.getOrCreate({
-        sessionKey: advisorSessionKey,
-        agent,
-        ...localExecutionOverride(execution),
-        channel: 'advisor',
-        peerId: input.parent.peerId,
-        userId: input.parent.userId,
-        hermeticNoTools: true,
-        usageAttribution: {
-          mode: 'delegate',
-          delegateAgentId: ADVISOR_AGENT_ID,
-          parentSessionId: input.parent.peerId,
-          parentTurnKey: input.originTurnKey,
-        },
-      })
-    } catch (err) {
-      unregister?.()
-      this._releaseDelegateSlot(slotOpts)
-      await input.billingApi.abandon(input.requestId).catch(() => {})
-      consultStore.update(input.consultId, { state: 'failed' })
-      const spawnFailSnap = jobs.snapshotOf(jobId)
-      const spawnFailFence =
-        spawnFailSnap?.claimToken
-          ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
-          : undefined
-      jobs.fail(jobId, {
-        failureClass: 'child_error',
-        detail: String((err as Error)?.message ?? err),
-        httpStatus: 500,
-        body: { ok: false, error: String((err as Error)?.message ?? err), consultId: input.consultId },
-        ...(spawnFailFence ?? {}),
-      })
-      return { state: 'failed', advice: '', jobId, error: String((err as Error)?.message ?? err) }
-    }
+    const session = await this.sessions.getOrCreate({
+      sessionKey: advisorSessionKey,
+      agent,
+      ...localExecutionOverride(execution),
+      channel: 'advisor',
+      peerId: input.parent.peerId,
+      userId: input.parent.userId,
+      hermeticNoTools: true,
+      usageAttribution: {
+        mode: 'delegate',
+        delegateAgentId: ADVISOR_AGENT_ID,
+        parentSessionId: input.parent.peerId,
+        parentTurnKey: input.originTurnKey,
+      },
+    })
     consultStore.update(input.consultId, { state: 'spawned', jobId })
     let advice = ''
     let error: string | undefined
+    let cancelCode: string | undefined
     let liveBilling: DurableCodexBilling | null = null
     let settleError: string | undefined
     let settleTask: Promise<void> | undefined
     try {
-      try {
-        await this.sessions.submit(
-          session,
-          formatAdvisorConsultPrompt(input.snapshot),
-          (e) => {
-            if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
-            if (e.kind === 'error') error = e.error
-            if (e.kind === 'codex_billing') {
-              const billing = { ...e } as DurableCodexBilling & { kind?: string }
-              delete billing.kind
-              liveBilling = billing
-              settleTask = input.billingApi.settle(billing).catch((settleErr) => {
-                settleError = String((settleErr as Error)?.message ?? settleErr)
-                this.log.warn('advisor_engine_billing_settle_failed', {
-                  consultId: input.consultId,
-                  requestId: billing.requestId,
-                  err: settleError,
-                })
+      await this.sessions.submit(
+        session,
+        formatAdvisorConsultPrompt(input.snapshot),
+        (e) => {
+          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
+          if (e.kind === 'error') {
+            error = e.error
+            const code = (e as { errorCode?: string }).errorCode
+            if (code === 'USER_CANCELLED') cancelCode = code
+          }
+          if (e.kind === 'codex_billing') {
+            const billing = { ...e } as DurableCodexBilling & { kind?: string }
+            delete billing.kind
+            liveBilling = billing
+            settleTask = input.billingApi.settle(billing).catch((settleErr) => {
+              settleError = String((settleErr as Error)?.message ?? settleErr)
+              this.log.warn('advisor_engine_billing_settle_failed', {
+                consultId: input.consultId,
+                requestId: billing.requestId,
+                err: settleError,
               })
-            }
-          },
-          undefined,
-          input.snapshot.advisorModel,
-          input.requestId,
-        )
-      } catch (err) {
-        error = String((err as Error)?.message ?? err)
+            })
+          }
+        },
+        undefined,
+        input.snapshot.advisorModel,
+        input.requestId,
+      )
+    } catch (err) {
+      const code = (err as { errorCode?: string })?.errorCode
+      if (code === 'USER_CANCELLED') cancelCode = code
+      error = String((err as Error)?.message ?? err)
+    }
+    if (settleTask) await settleTask
+    const jobSnap = jobs.snapshotOf(jobId)
+    const fence =
+      jobSnap?.claimToken
+        ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
+        : undefined
+    const cancelled = cancelCode === 'USER_CANCELLED'
+    if (!liveBilling) {
+      await input.billingApi.abandon(input.requestId).catch(() => {})
+      const state = cancelled ? 'cancelled' : 'failed'
+      consultStore.update(input.consultId, { state, advice: advice || null })
+      jobs.fail(jobId, {
+        failureClass: cancelled ? 'cancelled' : 'child_error',
+        detail: error || 'missing billing frame',
+        httpStatus: cancelled ? 409 : 500,
+        body: { ok: false, error, advice, consultId: input.consultId },
+        ...(cancelled ? { nextState: 'cancelled' as const } : {}),
+        ...(fence ?? {}),
+      })
+      return {
+        state,
+        advice,
+        jobId,
+        error: error || '顾问未产生计费帧（401 或未完成推理不算无工具 PASS）',
       }
-      if (settleTask) await settleTask
-      const jobSnap = jobs.snapshotOf(jobId)
-      const fence =
-        jobSnap?.claimToken
-          ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
-          : undefined
-      const cancelled = /interrupt|cancel|abort|user.?stop/i.test(error || '')
-      if (!liveBilling) {
-        await input.billingApi.abandon(input.requestId).catch(() => {})
-        const state = cancelled ? 'cancelled' : 'failed'
-        consultStore.update(input.consultId, { state })
+    }
+    if (settleError) {
+      consultStore.update(input.consultId, {
+        state: 'settle_pending',
+        billingRequestId: input.requestId,
+        advice,
+      })
+      jobs.complete(
+        jobId,
+        {
+          httpStatus: 200,
+          body: { ok: true, advice, consultId: input.consultId, settlePending: true },
+        },
+        fence,
+      )
+      return {
+        state: 'settle_pending',
+        advice,
+        jobId,
+        error: `计费 settle 失败，保留 pending 与原 owner: ${settleError}`,
+      }
+    }
+    const state = cancelled ? 'cancelled' : error ? 'failed' : 'settled'
+    consultStore.update(input.consultId, { state, advice })
+    if (cancelled || error) {
+      jobs.fail(jobId, {
+        failureClass: cancelled ? 'cancelled' : 'child_error',
+        detail: error || 'cancelled',
+        httpStatus: cancelled ? 409 : 500,
+        body: { ok: false, error, advice, consultId: input.consultId },
+        ...(cancelled ? { nextState: 'cancelled' as const } : {}),
+        ...(fence ?? {}),
+      })
+    } else {
+      jobs.complete(
+        jobId,
+        { httpStatus: 200, body: { ok: true, advice, consultId: input.consultId } },
+        fence,
+      )
+    }
+    return { state, advice, jobId, error }
+    } catch (err) {
+      const detail = String((err as Error)?.message ?? err)
+      await input.billingApi.abandon(input.requestId).catch(() => {})
+      consultStore.update(input.consultId, { state: 'failed' })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        const spawnFailFence =
+          spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : undefined
         jobs.fail(jobId, {
-          failureClass: cancelled ? 'cancelled' : 'child_error',
-          detail: error || 'missing billing frame',
-          httpStatus: cancelled ? 409 : 500,
-          body: { ok: false, error, consultId: input.consultId },
-          ...(cancelled ? { nextState: 'cancelled' as const } : {}),
-          ...(fence ?? {}),
+          failureClass: 'child_error',
+          detail,
+          httpStatus: 500,
+          body: { ok: false, error: detail, consultId: input.consultId },
+          ...(spawnFailFence ?? {}),
         })
-        return {
-          state,
-          advice,
-          jobId,
-          error: error || '顾问未产生计费帧（401 或未完成推理不算无工具 PASS）',
-        }
       }
-      if (settleError) {
-        consultStore.update(input.consultId, {
-          state: 'settle_pending',
-          billingRequestId: input.requestId,
-        })
-        jobs.complete(
-          jobId,
-          {
-            httpStatus: 200,
-            body: { ok: true, advice, consultId: input.consultId, settlePending: true },
-          },
-          fence,
-        )
-        return {
-          state: 'settle_pending',
-          advice,
-          jobId,
-          error: `计费 settle 失败，保留 pending 与原 owner: ${settleError}`,
-        }
-      }
-      const state = error ? (cancelled ? 'cancelled' : 'failed') : 'settled'
-      consultStore.update(input.consultId, { state })
-      if (error) {
-        jobs.fail(jobId, {
-          failureClass: cancelled ? 'cancelled' : 'child_error',
-          detail: error,
-          httpStatus: cancelled ? 409 : 500,
-          body: { ok: false, error, consultId: input.consultId },
-          ...(cancelled ? { nextState: 'cancelled' as const } : {}),
-          ...(fence ?? {}),
-        })
-      } else {
-        jobs.complete(
-          jobId,
-          { httpStatus: 200, body: { ok: true, advice, consultId: input.consultId } },
-          fence,
-        )
-      }
-      return { state, advice, jobId, error }
+      return { state: 'failed', advice: '', jobId, error: detail }
     } finally {
       unregister?.()
-      this._releaseDelegateSlot(slotOpts)
+      if (slotHeld) this._releaseDelegateSlot(slotOpts)
       await this.sessions.destroySession(advisorSessionKey).catch(() => {})
     }
   }
@@ -12555,6 +12641,8 @@ export class Gateway {
           defaultAdvisorModel: doc.defaultAdvisorModel,
           session: resolved,
           advisorModels: listed.advisorModels,
+          advisorConsultParents: [...ADVISOR_CONSULT_PARENT_ENGINES],
+          advisorConsultParentReason: ADVISOR_CONSULT_PARENT_REASON,
           ...(listed.advisorUnavailableReason
             ? { advisorUnavailableReason: listed.advisorUnavailableReason }
             : {}),
@@ -20387,6 +20475,33 @@ export class Gateway {
         ? await this._freezeAdvisorTurn(requestedAdvisorModel)
         : { ok: false as const, error: 'advisorModel required' }
       if (freeze.ok) {
+        const parentEngine = resolveEngine(
+          safeModelForRouting ?? agent.model,
+          agent,
+          turnAuthority !== undefined
+            ? { canonicalModel: turnAuthority.canonicalModel, engine: turnAuthority.engine }
+            : undefined,
+        )
+        if (!isAdvisorConsultParentEngine(parentEngine)) {
+          const _engineUserId: string =
+            typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+          this.log.warn('advisor_parent_engine_unsupported', {
+            sessionKey,
+            parentEngine,
+          })
+          const rejectFrames = _earlyRejectErrorFrames({
+            sessionKey,
+            channel: frame.channel,
+            peer: frame.peer,
+            userId: _engineUserId,
+            traceId: turnTraceId,
+            code: 'upstream_failed',
+            message: ADVISOR_CONSULT_PARENT_REASON,
+            legacyErrorText: `[error] advisor parent engine unsupported: ${parentEngine}`,
+          })
+          for (const f of rejectFrames) this.deliver(f, adapter)
+          return
+        }
         advisorTurnAllowed = true
         frozenAdvisorModel = freeze.advisorModel
         finalText = advisorPreamble('advisor') + finalText

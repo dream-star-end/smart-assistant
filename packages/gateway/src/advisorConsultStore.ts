@@ -36,6 +36,7 @@ export type AdvisorConsultRecord = {
   snapshotJson: string
   jobId: string | null
   billingRequestId: string | null
+  advice: string | null
   state: AdvisorConsultState
   createdAt: number
   updatedAt: number
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS advisor_consults (
   snapshot_json TEXT NOT NULL,
   job_id TEXT,
   billing_request_id TEXT,
+  advice TEXT,
   state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -83,6 +85,7 @@ function rowToRecord(row: Record<string, unknown>): AdvisorConsultRecord {
     snapshotJson: String(row.snapshot_json),
     jobId: row.job_id == null ? null : String(row.job_id),
     billingRequestId: row.billing_request_id == null ? null : String(row.billing_request_id),
+    advice: row.advice == null ? null : String(row.advice),
     state: row.state as AdvisorConsultState,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
@@ -105,6 +108,11 @@ export class AdvisorConsultStore {
     this.db = new Database(dbPath)
     this.db.pragma('journal_mode = WAL')
     this.db.exec(DDL)
+    try {
+      this.db.exec('ALTER TABLE advisor_consults ADD COLUMN advice TEXT')
+    } catch {
+      /* column already exists on upgraded files */
+    }
   }
 
   close(): void {
@@ -146,8 +154,8 @@ export class AdvisorConsultStore {
    * existing row is returned (caller must verify question/concern).
    */
   insertNew(
-    record: Omit<AdvisorConsultRecord, 'createdAt' | 'updatedAt'> &
-      Partial<Pick<AdvisorConsultRecord, 'createdAt' | 'updatedAt'>>,
+    record: Omit<AdvisorConsultRecord, 'createdAt' | 'updatedAt' | 'advice'> &
+      Partial<Pick<AdvisorConsultRecord, 'createdAt' | 'updatedAt' | 'advice'>>,
   ): { record: AdvisorConsultRecord; reused: boolean } {
     const existing = this.findByInvocation({
       userId: record.userId,
@@ -166,8 +174,8 @@ export class AdvisorConsultStore {
               consult_id, invocation_id, user_id, session_key, client_session_id,
               origin_turn_key, origin_turn_index, config_version, evidence_version,
               advisor_model, question, concern, snapshot_json, job_id,
-              billing_request_id, state, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              billing_request_id, advice, state, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           )
           .run(
             record.consultId,
@@ -185,6 +193,7 @@ export class AdvisorConsultStore {
             record.snapshotJson,
             record.jobId,
             record.billingRequestId,
+            record.advice ?? null,
             record.state,
             createdAt,
             updatedAt,
@@ -199,7 +208,10 @@ export class AdvisorConsultStore {
     }
   }
 
-  update(consultId: string, patch: Partial<Pick<AdvisorConsultRecord, 'jobId' | 'billingRequestId' | 'state'>>): AdvisorConsultRecord {
+  update(
+    consultId: string,
+    patch: Partial<Pick<AdvisorConsultRecord, 'jobId' | 'billingRequestId' | 'state' | 'advice'>>,
+  ): AdvisorConsultRecord {
     const current = this.db
       .prepare('SELECT * FROM advisor_consults WHERE consult_id = ?')
       .get(consultId) as Record<string, unknown> | undefined
@@ -212,10 +224,10 @@ export class AdvisorConsultStore {
     this.db
       .prepare(
         `UPDATE advisor_consults
-            SET job_id = ?, billing_request_id = ?, state = ?, updated_at = ?
+            SET job_id = ?, billing_request_id = ?, advice = ?, state = ?, updated_at = ?
           WHERE consult_id = ?`,
       )
-      .run(next.jobId, next.billingRequestId, next.state, next.updatedAt, consultId)
+      .run(next.jobId, next.billingRequestId, next.advice, next.state, next.updatedAt, consultId)
     return next
   }
 }

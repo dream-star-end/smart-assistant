@@ -131,7 +131,7 @@ async function makeGateway(opts?: {
     channel: 'webchat',
     peerId: 'wsess-advisor-route',
     userId: '3',
-    providerTag: 'codex',
+    providerTag: 'ccb',
     runner: { getPartialSnapshot: () => ({ completedTools: [] }) },
   }
   const gw = Object.create(Gateway.prototype) as any
@@ -304,11 +304,18 @@ describe('advisor consult route lifecycle', () => {
   it('parent Stop interrupts the in-flight advisor session', async () => {
     const { gw } = await makeGateway({ hangSubmit: true })
     let resume!: () => void
-    gw.sessions.submit = async () => {
+    gw.sessions.submit = async (
+      _session: unknown,
+      _payload: string,
+      onEvent: (e: any) => void,
+    ) => {
+      gw._submitOnEvent = onEvent
       await new Promise<void>((resolve) => {
         resume = resolve
       })
-      throw new Error('user_stop interrupt')
+      const err = Object.assign(new Error('stopped'), { errorCode: 'USER_CANCELLED' })
+      onEvent({ kind: 'error', error: err.message, errorCode: 'USER_CANCELLED' })
+      throw err
     }
     const pending = http(
       gw,
@@ -445,8 +452,9 @@ describe('advisor consult route lifecycle', () => {
     const second = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
     assert.equal(first.status, 503)
     assert.equal(first.body.state, 'admission_unknown')
-    assert.equal(second.status, 200)
+    assert.equal(second.status, 503)
     assert.equal(second.body.reused, true)
+    assert.equal(second.body.state, 'admission_unknown')
     assert.equal(billing.admits.length, 1)
     assert.equal(gw._spawnCount ?? 0, 0)
   })
@@ -474,5 +482,159 @@ describe('advisor consult route lifecycle', () => {
     assert.match(String(r.body.error), /asDefault or sessionId/)
     assert.equal(gw._advisorConfig.read().defaultMode, 'solo')
     assert.equal(gw._advisorConfig.read().rev, 0)
+  })
+
+  it('settled replay returns the original advice without a second admit', async () => {
+    const { gw, billing } = await makeGateway()
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-replay-1' })
+    const first = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    const second = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(first.status, 200)
+    assert.equal(first.body.advice, 'check the assertion first')
+    assert.equal(second.status, 200)
+    assert.equal(second.body.reused, true)
+    assert.equal(second.body.advice, first.body.advice)
+    assert.equal(billing.admits.length, 1)
+    assert.equal(billing.settles.length, 1)
+    assert.equal(gw._spawnCount, 1)
+  })
+
+  it('in-flight replay waits for the original advice', async () => {
+    const { gw, billing } = await makeGateway({ hangSubmit: true })
+    gw._advisorConsultWaitMs = 2_000
+    let resume!: () => void
+    gw.sessions.submit = async (
+      _session: unknown,
+      _payload: string,
+      onEvent: (e: any) => void,
+    ) => {
+      gw._lastSubmitRequestId = REQUEST_ID
+      await new Promise<void>((resolve) => {
+        resume = resolve
+      })
+      onEvent({
+        kind: 'codex_billing',
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        status: 'success',
+        durationMs: 12,
+        usage: { input_tokens: 8, output_tokens: 3 },
+        delegateAgentId: 'advisor',
+        parentSessionId: 'wsess-advisor-route',
+      })
+      onEvent({ kind: 'block', block: { kind: 'text', text: 'waited advice' } })
+    }
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-wait-1' })
+    const firstP = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    const secondP = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    resume()
+    const [first, second] = await Promise.all([firstP, secondP])
+    assert.equal(first.status, 200, JSON.stringify(first.body))
+    assert.equal(second.status, 200, JSON.stringify(second.body))
+    assert.equal(second.body.reused, true)
+    assert.equal(second.body.advice, 'waited advice')
+    assert.equal(billing.admits.length, 1)
+    assert.equal(gw._spawnCount, 1)
+  })
+
+  it('queued consult aborted by parent Stop does not spawn', async () => {
+    const { gw, billing } = await makeGateway()
+    gw._activeDelegations = 99
+    gw._delegateQueuePollMs = 10
+    const pending = http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-queue-stop' }),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(gw._spawnCount ?? 0, 0)
+    const interrupted = gw._interruptDelegationsForParent(PARENT_KEY)
+    assert.equal(interrupted, true)
+    const r = await pending
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'cancelled')
+    assert.equal(gw._spawnCount ?? 0, 0)
+    assert.equal(billing.admits.length, 1)
+    assert.equal(billing.abandons.length, 1)
+    assert.equal(billing.settles.length, 0)
+  })
+
+  it('Stop after usage settles the original owner and does not abandon', async () => {
+    const { gw, billing } = await makeGateway({ hangSubmit: true })
+    let resume!: () => void
+    gw.sessions.submit = async (
+      _session: unknown,
+      _payload: string,
+      onEvent: (e: any) => void,
+    ) => {
+      onEvent({
+        kind: 'codex_billing',
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        status: 'success',
+        durationMs: 9,
+        usage: { input_tokens: 4, output_tokens: 2 },
+        delegateAgentId: 'advisor',
+        parentSessionId: 'wsess-advisor-route',
+      })
+      await new Promise<void>((resolve) => {
+        resume = resolve
+      })
+      const err = Object.assign(new Error('stopped'), { errorCode: 'USER_CANCELLED' })
+      onEvent({ kind: 'error', error: err.message, errorCode: 'USER_CANCELLED' })
+      throw err
+    }
+    const pending = http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders(),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    gw._interruptDelegationsForParent(PARENT_KEY)
+    resume()
+    const r = await pending
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'cancelled')
+    assert.equal(billing.settles.length, 1)
+    assert.equal(billing.abandons.length, 0)
+  })
+
+  it('source-agent miss after admit abandons and does not spawn', async () => {
+    const { gw, billing } = await makeGateway()
+    gw._getAgentsConfig = async () => ({ default: 'main', agents: [] })
+    const r = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders(),
+    )
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.status, 'failed')
+    assert.equal(billing.admits.length, 1)
+    assert.equal(billing.abandons.length, 1)
+    assert.equal(gw._spawnCount ?? 0, 0)
+  })
+
+  it('codex parent consult is a visible capability limit, not a silent model swap', async () => {
+    const { gw, billing } = await makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent.providerTag = 'codex'
+    const r = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders(),
+    )
+    assert.equal(r.status, 409)
+    assert.match(String(r.body.error), /CCB/)
+    assert.equal(billing.admits.length, 0)
   })
 })
