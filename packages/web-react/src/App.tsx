@@ -144,6 +144,7 @@ import {
   type CollabMode,
   type CollabUiState,
   EMPTY_COLLAB_UI,
+  advisorParentCapabilityAllowed,
   collaborationPutBody,
   docToUiState,
   isStaleCollabEpoch,
@@ -867,12 +868,13 @@ export function App() {
       const previous = collabUi;
       const parentEngineForGate =
         models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine;
-      const parents = collabUi.advisorConsultParents;
       if (
         mode === "advisor" &&
-        (collabUi.advisorConsultAllowed === false ||
-          (parents.length > 0 &&
-            (!parentEngineForGate || !parents.includes(parentEngineForGate))))
+        !advisorParentCapabilityAllowed({
+          parentEngine: parentEngineForGate,
+          advisorConsultParents: collabUi.advisorConsultParents,
+          advisorConsultAllowed: collabUi.advisorConsultAllowed,
+        })
       ) {
         const msg =
           collabUi.advisorConsultParentReason ||
@@ -895,6 +897,20 @@ export function App() {
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
+      if (activeId && sockRef.current) {
+        if (modelId) sockRef.current.setSessionModel(activeId, modelId);
+        const title =
+          sessions.find((session) => session.id === activeId)?.title || "新对话";
+        const ensured = await sockRef.current.ensureServerSession(activeId, agent.id, title);
+        if (!ensured) {
+          setCollabUi(previous);
+          setTeamModeState(previous.mode === "team");
+          const msg = "会话尚未创建成功，请检查网络后重试";
+          setCollabSaveError(msg);
+          toast(msg, "error");
+          return;
+        }
+      }
       try {
         const doc = await api.putCollaborationConfig(
           authRef.current,
@@ -934,7 +950,7 @@ export function App() {
         toast(msg, "error");
       }
     },
-    [activeId, applyCollabDoc, collabUi, demo, modelId, models, toast],
+    [activeId, agent.id, applyCollabDoc, collabUi, demo, modelId, models, sessions, toast],
   );
   const setTeamMode = useCallback(
     (enabled: boolean) => {
@@ -1092,7 +1108,14 @@ export function App() {
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
+        sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
+        if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
         if (authRef.current && (collabMode !== "solo" || collabAsDefault)) {
+          const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+          if (!ensured) {
+            toast("会话尚未创建成功，请检查网络后重试", "error");
+            return;
+          }
           try {
             const doc = await api.putCollaborationConfig(
               authRef.current,

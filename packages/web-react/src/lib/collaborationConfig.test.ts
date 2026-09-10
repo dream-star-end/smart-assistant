@@ -89,6 +89,21 @@ describe("sendCollabFields", () => {
     expect(sent.collabMode).toBe("advisor");
   });
 
+  it("uses current CCB model even when GET allowed=false from a stale live engine", () => {
+    const sent = sendCollabFields({
+      agentId: "main",
+      mode: "advisor",
+      advisorModel: "gpt-6-astra",
+      configVersion: "v1:advisor:gpt-6-astra",
+      parentEngine: "ccb",
+      advisorConsultParents: ["ccb"],
+      advisorConsultAllowed: false,
+      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+    });
+    expect(sent.blockedReason).toBeUndefined();
+    expect(sent.collabMode).toBe("advisor");
+  });
+
   it("allows CCB parent when GET parents list includes ccb", () => {
     const sent = sendCollabFields({
       agentId: "main",

@@ -114,6 +114,19 @@ export function collaborationPutBody(input: {
   return body;
 }
 
+/** Current selected model engine wins over a stale GET allowed=false. Unknown engine stays fail-closed when parents are known. */
+export function advisorParentCapabilityAllowed(input: {
+  parentEngine?: string | null
+  advisorConsultParents?: readonly string[]
+  advisorConsultAllowed?: boolean
+}): boolean {
+  const parents = input.advisorConsultParents ?? []
+  const engine = (input.parentEngine ?? "").trim()
+  if (parents.length > 0) return Boolean(engine && parents.includes(engine))
+  if (input.advisorConsultAllowed === false) return false
+  return true
+}
+
 export function sendCollabFields(input: {
   agentId: string;
   mode: CollabMode;
@@ -138,15 +151,14 @@ export function sendCollabFields(input: {
   const parentReason =
     input.advisorConsultParentReason ||
     "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
-  if (input.advisorConsultAllowed === false) {
+  if (
+    !advisorParentCapabilityAllowed({
+      parentEngine: input.parentEngine,
+      advisorConsultParents: input.advisorConsultParents,
+      advisorConsultAllowed: input.advisorConsultAllowed,
+    })
+  ) {
     return { teamMode: false, collabMode: "advisor", blockedReason: parentReason };
-  }
-  const parents = input.advisorConsultParents ?? [];
-  if (parents.length > 0) {
-    const engine = (input.parentEngine ?? "").trim();
-    if (!engine || !parents.includes(engine)) {
-      return { teamMode: false, collabMode: "advisor", blockedReason: parentReason };
-    }
   }
   if (input.advisorUnavailableReason) {
     return {

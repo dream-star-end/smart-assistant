@@ -51,6 +51,53 @@ describe('consultAdvisor consumer', () => {
     assert.equal(posts.length, 3)
   })
 
+  it('retries ECONNRESET with the same post identity', async () => {
+    const posts: string[] = []
+    const result = await consultAdvisorUntilAdvice({
+      overallMs: 1_000,
+      retryGapMs: 5,
+      post: async () => {
+        posts.push('hit')
+        if (posts.length === 1) {
+          throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+        }
+        return {
+          statusCode: 200,
+          body: JSON.stringify({ status: 'settled', advice: 'check the assertion first', reused: true }),
+        }
+      },
+    })
+    assert.equal(result.ok, true)
+    if (!result.ok) return
+    assert.equal(result.text, 'check the assertion first')
+    assert.equal(posts.length, 2)
+  })
+
+  it('does not retry auth or parameter-conflict HTTP statuses', async () => {
+    const posts: number[] = []
+    const auth = await consultAdvisorUntilAdvice({
+      overallMs: 1_000,
+      retryGapMs: 5,
+      post: async () => {
+        posts.push(401)
+        return { statusCode: 401, body: JSON.stringify({ error: 'unauthorized' }) }
+      },
+    })
+    assert.equal(auth.ok, false)
+    assert.equal(posts.length, 1)
+    const conflictPosts: number[] = []
+    const conflict = await consultAdvisorUntilAdvice({
+      overallMs: 1_000,
+      retryGapMs: 5,
+      post: async () => {
+        conflictPosts.push(409)
+        return { statusCode: 409, body: JSON.stringify({ error: 'invocation 与 question/concern 不一致' }) }
+      },
+    })
+    assert.equal(conflict.ok, false)
+    assert.equal(conflictPosts.length, 1)
+  })
+
   it('overall timeout stays pending error, never tool-success JSON', async () => {
     const result = await consultAdvisorUntilAdvice({
       overallMs: 30,

@@ -82,6 +82,26 @@ export function consultAdvisorResultFromGateway(res: ConsultGatewayResponse): Co
   return { kind: 'error', text: `consult_advisor unexpected status ${parsed.status ?? res.statusCode}` }
 }
 
+const RETRYABLE_TRANSPORT_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'EPIPE',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+])
+
+export function isRetryableConsultTransportError(err: unknown): boolean {
+  const rec = err as { code?: string; cause?: { code?: string }; message?: string } | undefined
+  const code = rec?.code || rec?.cause?.code
+  if (code && RETRYABLE_TRANSPORT_CODES.has(code)) return true
+  const message = String(rec?.message ?? err)
+  return /socket hang up|ECONNRESET|ECONNREFUSED|ETIMEDOUT|network timeout|socket disconnected/i.test(
+    message,
+  )
+}
+
 export async function consultAdvisorUntilAdvice(input: {
   post: () => Promise<ConsultGatewayResponse>
   now?: () => number
@@ -96,7 +116,18 @@ export async function consultAdvisorUntilAdvice(input: {
   const deadline = now() + overallMs
   let lastPending: ConsultParsedBody | undefined
   while (now() <= deadline) {
-    const res = await input.post()
+    let res: ConsultGatewayResponse
+    try {
+      res = await input.post()
+    } catch (err) {
+      if (!isRetryableConsultTransportError(err)) {
+        return { ok: false, text: String((err as Error)?.message ?? err) }
+      }
+      const remaining = deadline - now()
+      if (remaining <= 0) break
+      await sleep(Math.min(retryGapMs, remaining))
+      continue
+    }
     const result = consultAdvisorResultFromGateway(res)
     if (result.kind === 'advice') return { ok: true, text: result.text }
     if (result.kind === 'error') return { ok: false, text: result.text }

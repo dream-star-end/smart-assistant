@@ -152,10 +152,14 @@ describe('createDelegateEngineBillingClient', () => {
   it('queues a failed live settle and retries the same requestId once', async () => {
     const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-bill-')), 'queue.json')
     let settlePosts = 0
+    const settledIds: string[] = []
     const client = createDelegateEngineBillingClient({
       env: ENV,
       queuePath,
       retryMs: 60_000,
+      onSettled: (row) => {
+        settledIds.push(row.requestId)
+      },
       fetcher: (async (url: string) => {
         const path = new URL(url).pathname
         if (path.endsWith('/settle')) {
@@ -174,6 +178,7 @@ describe('createDelegateEngineBillingClient', () => {
       delegateAgentId: 'auditor',
     }
     await assert.rejects(() => client.settle(billing), /HTTP_500/)
+    assert.deepEqual(settledIds, [])
     const queued = JSON.parse(await readFile(queuePath, 'utf8')) as {
       pending: Array<{ requestId: string }>
     }
@@ -181,6 +186,7 @@ describe('createDelegateEngineBillingClient', () => {
     assert.equal(queued.pending[0]?.requestId, billing.requestId)
     await client.retryPending?.()
     assert.equal(settlePosts, 2)
+    assert.deepEqual(settledIds, [billing.requestId])
     const drained = JSON.parse(await readFile(queuePath, 'utf8')) as { pending: unknown[] }
     assert.deepEqual(drained.pending, [])
     await client.retryPending?.()

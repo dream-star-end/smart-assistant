@@ -149,6 +149,22 @@ async function readBillingQueue(queuePath: string): Promise<BillingQueue> {
   }
 }
 
+let defaultSettledHook: ((billing: DurableCodexBilling) => void | Promise<void>) | undefined
+
+export function setDelegateEngineBillingSettledHook(
+  hook: ((billing: DurableCodexBilling) => void | Promise<void>) | undefined,
+): void {
+  defaultSettledHook = hook
+}
+
+async function emitDelegateEngineBillingSettled(
+  billing: DurableCodexBilling,
+  extra?: (billing: DurableCodexBilling) => void | Promise<void>,
+): Promise<void> {
+  await extra?.(billing)
+  await defaultSettledHook?.(billing)
+}
+
 export function createDelegateEngineBillingClient(args?: {
   env?: NodeJS.ProcessEnv
   fetcher?: typeof undiciRequest
@@ -156,6 +172,8 @@ export function createDelegateEngineBillingClient(args?: {
   retryMs?: number
   /** Default true: drain leftover queue files after construct (C1). Tests may set false. */
   startupRecovery?: boolean
+  /** Fired only after an authoritative 2xx settle POST, never from an empty queue. */
+  onSettled?: (billing: DurableCodexBilling) => void | Promise<void>
 }): DelegateEngineBillingClient {
   const env = args?.env ?? process.env
   const fetcher = args?.fetcher ?? undiciRequest
@@ -269,6 +287,7 @@ export function createDelegateEngineBillingClient(args?: {
       try {
         await post(SETTLE_PATH, billing)
         await dropSettled(billing.requestId)
+        await emitDelegateEngineBillingSettled(billing, args?.onSettled)
       } catch (err) {
         // Same durable-boundary pattern as Auto-Dream: persist then retry.
         // UNIQUE(user_id, request_id) makes a later successful POST idempotent.
@@ -294,6 +313,7 @@ export function createDelegateEngineBillingClient(args?: {
         for (const billing of queue.pending) {
           try {
             await post(SETTLE_PATH, billing)
+            await emitDelegateEngineBillingSettled(billing, args?.onSettled)
           } catch {
             remaining.push(billing)
           }

@@ -57,6 +57,11 @@ export function resetDelegateContextKeyForTests(): void {
   signingKey = randomBytes(32)
 }
 
+/** Test-only: share a signing key across subprocesses that replay consult tokens. */
+export function setDelegateContextKeyForTests(key: Buffer | string): void {
+  signingKey = Buffer.isBuffer(key) ? key : Buffer.from(String(key), 'hex')
+}
+
 function signPayload(payload: string): string {
   return createHmac('sha256', getSigningKey()).update(payload).digest('base64url')
 }

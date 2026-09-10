@@ -126,6 +126,15 @@ export class AdvisorConsultStore {
     return row ? rowToRecord(row) : undefined
   }
 
+  markSettledFromBilling(requestId: string): AdvisorConsultRecord[] {
+    const updated: AdvisorConsultRecord[] = []
+    for (const row of this.listByState('settle_pending')) {
+      if (row.billingRequestId !== requestId) continue
+      updated.push(this.update(row.consultId, { state: 'settled', advice: row.advice }))
+    }
+    return updated
+  }
+
   listByState(state: AdvisorConsultState): AdvisorConsultRecord[] {
     const rows = this.db
       .prepare('SELECT * FROM advisor_consults WHERE state = ? ORDER BY created_at ASC')

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
+import { advisorParentCapabilityAllowed } from '../lib/collaborationConfig'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
@@ -65,10 +66,11 @@ export function AgentPicker({
   onAdvisorModelChange?: (id: string) => void
 }) {
   const mode = collabMode ?? (teamMode ? 'team' : 'solo')
-  const advisorBlocked =
-    advisorConsultAllowed === false ||
-    (advisorConsultParents.length > 0 &&
-      (!parentEngine || !advisorConsultParents.includes(parentEngine)))
+  const advisorBlocked = !advisorParentCapabilityAllowed({
+    parentEngine,
+    advisorConsultParents,
+    advisorConsultAllowed,
+  })
   const advisorBlockReason =
     advisorConsultParentReason ||
     '一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。'

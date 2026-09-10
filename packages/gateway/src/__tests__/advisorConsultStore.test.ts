@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   AdvisorConsultStore,
@@ -124,28 +127,64 @@ describe('advisorConsultStore', () => {
     store.close()
   })
 
-  it('two sqlite connections racing insertNew reuse one invocation row', async () => {
-    const { Worker } = await import('node:worker_threads')
-    const { fileURLToPath } = await import('node:url')
+  it('two processes racing product insertNew reuse one invocation row', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-advc-race-'))
     const dbPath = join(dir, 'advisor-consults.db')
+    const barrier = join(dir, 'go')
     const schema = new AdvisorConsultStore(dbPath)
     schema.close()
-    const a = sample(dir, { invocationId: 'inv-conn-race', consultId: mintConsultId() })
-    const b = sample(dir, { invocationId: 'inv-conn-race', consultId: mintConsultId() })
-    const workerPath = fileURLToPath(new URL('./advisorConsultInsertWorker.mjs', import.meta.url))
-    const run = (record: AdvisorConsultRecord) =>
-      new Promise<{ reused: boolean; consultId: string }>((resolve, reject) => {
-        const worker = new Worker(workerPath, {
-          workerData: { dbPath, record },
-        })
-        worker.on('message', resolve)
-        worker.on('error', reject)
-        worker.on('exit', (code) => {
-          if (code !== 0) reject(new Error(`insert worker exit ${code}`))
-        })
+    const a = sample(dir, { invocationId: 'inv-conn-race', consultId: mintConsultId(), question: 'why red?' })
+    const b = sample(dir, {
+      invocationId: 'inv-conn-race',
+      consultId: mintConsultId(),
+      question: 'a different question',
+    })
+    const childPath = fileURLToPath(new URL('./advisorConsultStoreChild.ts', import.meta.url))
+    const run = (record: AdvisorConsultRecord) => {
+      let released!: () => void
+      const sawReady = new Promise<void>((r) => {
+        released = r
       })
-    const [one, two] = await Promise.all([run(a), run(b)])
+      const result = new Promise<{ reused: boolean; consultId: string; question: string }>(
+        (resolve, reject) => {
+          const child = spawn(process.execPath, ['--import', 'tsx', childPath], {
+            env: {
+              ...process.env,
+              OC_ADVISOR_DB: dbPath,
+              OC_ADVISOR_RECORD: JSON.stringify(record),
+              OC_ADVISOR_BARRIER: barrier,
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          let out = ''
+          let err = ''
+          child.stdout.on('data', (chunk) => {
+            out += String(chunk)
+            if (out.includes('ready')) released()
+          })
+          child.stderr.on('data', (chunk) => {
+            err += String(chunk)
+          })
+          child.on('exit', (code) => {
+            if (code !== 0) reject(new Error(err || out || `exit ${code}`))
+            else {
+              const line = out
+                .trim()
+                .split('\n')
+                .filter((row) => row.startsWith('{'))
+                .pop()
+              resolve(JSON.parse(line || '{}'))
+            }
+          })
+        },
+      )
+      return { sawReady, result }
+    }
+    const first = run(a)
+    const second = run(b)
+    await Promise.all([first.sawReady, second.sawReady])
+    writeFileSync(barrier, 'go')
+    const [one, two] = await Promise.all([first.result, second.result])
     const reused = [one, two].filter((row) => row.reused)
     assert.equal(reused.length, 1, JSON.stringify({ one, two }))
     assert.equal(one.consultId, two.consultId)

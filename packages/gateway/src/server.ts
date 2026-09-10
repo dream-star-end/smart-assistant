@@ -511,6 +511,7 @@ import {
   defaultDelegateEngineBilling,
   mapDelegateEngineBillingError,
   resolveDelegateEngineBillingEngine,
+  setDelegateEngineBillingSettledHook,
   shouldAdmitDelegateEngineBilling,
   type DelegateEngineBillingAdmission,
   type DelegateEngineBillingClient,
@@ -11068,6 +11069,7 @@ export class Gateway {
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
   private _advisorConsults: AdvisorConsultStore | undefined
+  private _consultBillingHookBound: boolean | undefined
   private _advisorConsultWaitMs: number | undefined
   private _advisorConfig: AdvisorConfigStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
@@ -12055,7 +12057,12 @@ export class Gateway {
   }
 
   private advisorConsultStore(): AdvisorConsultStore {
-    return (this._advisorConsults ??= new AdvisorConsultStore())
+    const store = (this._advisorConsults ??= new AdvisorConsultStore())
+    if (!this._consultBillingHookBound) {
+      this._consultBillingHookBound = true
+      setDelegateEngineBillingSettledHook((billing) => this._projectAdvisorConsultSettled(billing))
+    }
+    return store
   }
 
   private advisorConfigStore(): AdvisorConfigStore {
@@ -12069,26 +12076,44 @@ export class Gateway {
     return live
   }
 
+  private async _catalogEngineForModel(modelId: string | undefined): Promise<string | undefined> {
+    if (!modelId) return undefined
+    try {
+      const view = await getLocalCatalogView()
+      const canonical = view.canonicalize(modelId)
+      return view.models.find((row) => row.modelId === canonical || row.modelId === modelId)?.engine
+    } catch {
+      return undefined
+    }
+  }
+
   private async _parentEngineForCollabSession(input: {
     sessionId: string
     userId: string
   }): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
     const live = this._liveMainSessionForClient(input.sessionId, input.userId)
-    if (live) return { missing: false, agentId: live.agentId, engine: live.providerTag }
-    const owned = await getClientSession(input.sessionId, input.userId)
+    const owned = live
+      ? {
+          agentId: live.agentId,
+          modelId: typeof live.model === 'string' ? live.model : undefined,
+        }
+      : await getClientSession(input.sessionId, input.userId)
     if (!owned) return { missing: true }
-    let engine: string | undefined
-    const modelId = typeof owned.modelId === 'string' ? owned.modelId : undefined
-    if (modelId) {
-      try {
-        const view = await getLocalCatalogView()
-        const canonical = view.canonicalize(modelId)
-        engine = view.models.find((row) => row.modelId === canonical || row.modelId === modelId)?.engine
-      } catch {
-        engine = undefined
-      }
+    if (owned.agentId !== 'main') {
+      return { missing: false, agentId: owned.agentId, engine: undefined }
     }
+    const modelId =
+      (typeof owned.modelId === 'string' && owned.modelId.trim()) ||
+      (typeof live?.model === 'string' ? live.model : undefined)
+    const fromCatalog = await this._catalogEngineForModel(modelId)
+    const engine = fromCatalog || live?.providerTag || undefined
     return { missing: false, agentId: owned.agentId, engine }
+  }
+
+  private _projectAdvisorConsultSettled(billing: { requestId?: string }): void {
+    const requestId = typeof billing.requestId === 'string' ? billing.requestId : ''
+    if (!requestId || !this._advisorConsults) return
+    this._advisorConsults.markSettledFromBilling(requestId)
   }
 
   private _collaborationCapabilityFields(input: {
@@ -12660,6 +12685,20 @@ export class Gateway {
         session,
         formatAdvisorConsultPrompt(input.snapshot),
         (e) => {
+          if (e.kind === 'codex_billing') {
+            const billing = { ...e } as DurableCodexBilling & { kind?: string }
+            delete billing.kind
+            liveBilling = billing
+            settleTask = input.billingApi.settle(billing).catch((settleErr) => {
+              settleError = String((settleErr as Error)?.message ?? settleErr)
+              this.log.warn('advisor_engine_billing_settle_failed', {
+                consultId: input.consultId,
+                requestId: billing.requestId,
+                err: settleError,
+              })
+            })
+            return
+          }
           const latest = consultStore.findById(originConsultId)
           if (
             latest &&
@@ -12675,19 +12714,6 @@ export class Gateway {
             error = e.error
             const code = (e as { errorCode?: string }).errorCode
             if (code === 'USER_CANCELLED') cancelCode = code
-          }
-          if (e.kind === 'codex_billing') {
-            const billing = { ...e } as DurableCodexBilling & { kind?: string }
-            delete billing.kind
-            liveBilling = billing
-            settleTask = input.billingApi.settle(billing).catch((settleErr) => {
-              settleError = String((settleErr as Error)?.message ?? settleErr)
-              this.log.warn('advisor_engine_billing_settle_failed', {
-                consultId: input.consultId,
-                requestId: billing.requestId,
-                err: settleError,
-              })
-            })
           }
         },
         undefined,

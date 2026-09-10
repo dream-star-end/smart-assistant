@@ -5,10 +5,14 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/advisorConsultRoute.test.ts
  */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import { CONSULT_INVOCATION_HEADER } from '@openclaude/protocol'
 
@@ -18,6 +22,7 @@ import {
   DELEGATE_CONTEXT_HEADER,
   issueConsultTurnToken,
   resetDelegateContextKeyForTests,
+  setDelegateContextKeyForTests,
 } from '../delegateContext.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
@@ -215,12 +220,15 @@ async function makeGateway(opts?: {
   return { gw, billing, dir }
 }
 
-function consultHeaders(over: Record<string, string> = {}): Record<string, string> {
+function consultHeaders(
+  over: Record<string, string> = {},
+  turnKey = TURN_KEY,
+): Record<string, string> {
   const token = issueConsultTurnToken({
     agentId: 'main',
     sessionKey: PARENT_KEY,
     depth: 0,
-    turnKey: TURN_KEY,
+    turnKey,
     turnIndex: 1,
     collabMode: 'advisor',
     configVersion: 'v1:advisor:gpt-6-astra',
@@ -990,5 +998,300 @@ describe('M4c recovery contracts', () => {
     assert.equal(billing.admits.length, 1)
     assert.equal(billing.settles.length, 1)
     assert.equal(billing.abandons.length, 0)
+  })
+
+  it('GET allowed follows current model catalog, not a stale live providerTag', async () => {
+    const { gw } = await makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent.providerTag = 'codex'
+    parent.model = 'glm-5.2'
+    gw._catalogEngineForModel = async (modelId: string) => (modelId === 'glm-5.2' ? 'ccb' : undefined)
+    const get = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
+    assert.equal(get.status, 200, JSON.stringify(get.body))
+    assert.equal(get.body.parentEngine, 'ccb')
+    assert.equal(get.body.advisorConsultAllowed, true)
+  })
+
+  it('Stop then new turn: late old advice is not delivered; usage stays on original requestId', async () => {
+    const { gw, billing } = await makeGateway()
+    const sm = new SessionManager({
+      version: 1,
+      gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+      auth: { mode: 'subscription', claudeCodePath: '' },
+      sessions: { dbPath: '' },
+    } as never)
+    const waiters: Array<(err: Error) => void> = []
+    let lateAdvice: ((text: string) => void) | undefined
+    const runner = {
+      interrupt(): boolean {
+        const err = Object.assign(new Error('stopped'), { errorCode: 'USER_CANCELLED' })
+        for (const wait of waiters.splice(0)) wait(err)
+        return true
+      },
+      shutdown: async () => {},
+      off: () => {},
+      on: () => {},
+    }
+    const origGetOrCreate = gw.sessions.getOrCreate
+    const origGetByKey = gw.sessions.getByKey
+    gw.sessions.getByKey = (key: string) => origGetByKey(key) ?? sm.getByKey(key)
+    gw.sessions.getOrCreate = async (opts: { sessionKey: string }) => {
+      const session = await origGetOrCreate()
+      session.sessionKey = opts.sessionKey
+      session.runner = runner
+      ;(sm as unknown as { sessions: Map<string, unknown> }).sessions.set(opts.sessionKey, session)
+      return session
+    }
+    gw.sessions.interrupt = (key: string) => sm.interrupt(key)
+    let firstOnEvent: ((e: unknown) => void) | undefined
+    gw.sessions.submit = async (
+      _session: unknown,
+      _payload: string,
+      onEvent: (e: any) => void,
+      _effort?: string | null,
+      _model?: string,
+      requestId?: string,
+    ) => {
+      gw._submitCount = (gw._submitCount ?? 0) + 1
+      if (!firstOnEvent) {
+        firstOnEvent = onEvent
+        onEvent({
+          kind: 'codex_billing',
+          requestId,
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+          status: 'success',
+          durationMs: 9,
+          usage: { input_tokens: 4, output_tokens: 2 },
+          delegateAgentId: 'advisor',
+          parentSessionId: 'wsess-advisor-route',
+        })
+        await new Promise<void>((_resolve, reject) => {
+          lateAdvice = (text: string) => onEvent({ kind: 'block', block: { kind: 'text', text } })
+          waiters.push((err) => {
+            onEvent({ kind: 'error', error: err.message, errorCode: (err as { errorCode?: string }).errorCode })
+            reject(err)
+          })
+        })
+        return
+      }
+      onEvent({
+        kind: 'codex_billing',
+        requestId,
+        engineSessionId: `oceng-${'c'.repeat(48)}`,
+        status: 'success',
+        durationMs: 4,
+        usage: { input_tokens: 1, output_tokens: 1 },
+        delegateAgentId: 'advisor',
+        parentSessionId: 'wsess-advisor-route',
+      })
+      onEvent({ kind: 'block', block: { kind: 'text', text: 'second turn advice' } })
+    }
+    const firstHeaders = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-old-turn' })
+    const pending = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, firstHeaders)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    gw._interruptDelegationsForParent(PARENT_KEY)
+    const first = await pending
+    assert.equal(first.body.status, 'cancelled')
+    assert.equal(billing.settles.length, 1)
+    assert.equal((billing.settles[0] as { requestId: string }).requestId, REQUEST_ID)
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._currentTurnKey = 'c'.repeat(64)
+    const secondHeaders = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-new-turn' }, 'c'.repeat(64))
+    const secondP = http(gw, 'POST', '/api/agents/advisor/consult', { question: 'new turn?' }, secondHeaders)
+    lateAdvice?.('old advice must not land')
+    const second = await secondP
+    assert.equal(second.body.advice, 'second turn advice')
+    assert.notEqual(second.body.advice, 'old advice must not land')
+    assert.equal(billing.settles.length, 2)
+    assert.equal((billing.settles[0] as { requestId: string }).requestId, REQUEST_ID)
+  })
+
+  it('new process route replay returns settled advice without a second admit', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-proc-'))
+    const dbPath = join(dir, 'advisor-consults.db')
+    const key = randomBytes(32).toString('hex')
+    setDelegateContextKeyForTests(key)
+    const childPath = fileURLToPath(new URL('./advisorConsultRouteChild.ts', import.meta.url))
+    const run = (mode: string, extra: Record<string, string> = {}) =>
+      new Promise<any>((resolve, reject) => {
+        const child = spawn(process.execPath, ['--import', 'tsx', childPath], {
+          env: {
+            ...process.env,
+            OC_ADVISOR_CHILD_MODE: mode,
+            OC_ADVISOR_DB: dbPath,
+            OC_ADVISOR_INVOCATION: 'cinv-proc-replay',
+            OC_DELEGATE_CONTEXT_KEY: key,
+            ...extra,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let out = ''
+        let err = ''
+        child.stdout.on('data', (c) => {
+          out += String(c)
+        })
+        child.stderr.on('data', (c) => {
+          err += String(c)
+        })
+        child.on('exit', (code) => {
+          if (code !== 0) reject(new Error(err || out || `exit ${code}`))
+          else {
+            const line = out
+              .trim()
+              .split('\n')
+              .filter((row) => row.startsWith('{'))
+              .pop()
+            resolve(JSON.parse(line || '{}'))
+          }
+        })
+      })
+    const first = await run('consult')
+    assert.equal(first.body.status, 'settled')
+    assert.equal(first.body.advice, 'check the assertion first')
+    assert.equal(first.admit, 1)
+    const replay = await run('replay')
+    assert.equal(replay.body.advice, 'check the assertion first')
+    assert.equal(replay.body.reused, true)
+    assert.equal(replay.admit, 0)
+    assert.equal(replay.spawn, 0)
+  })
+
+  it('two process insertNew of same invocation different questions conflict at the route', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-conflict-'))
+    const dbPath = join(dir, 'advisor-consults.db')
+    const barrier = join(dir, 'go')
+    new AdvisorConsultStore(dbPath).close()
+    const childPath = fileURLToPath(new URL('./advisorConsultStoreChild.ts', import.meta.url))
+    const base = {
+      userId: '3',
+      sessionKey: PARENT_KEY,
+      clientSessionId: 'wsess-advisor-route',
+      originTurnKey: TURN_KEY,
+      originTurnIndex: 1,
+      configVersion: 'v1:advisor:gpt-6-astra',
+      evidenceVersion: 'e'.repeat(64),
+      advisorModel: 'gpt-6-astra',
+      concern: '',
+      snapshotJson: '{}',
+      jobId: null,
+      billingRequestId: null,
+      state: 'accepted',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    const run = (record: Record<string, unknown>) => {
+      let released!: () => void
+      const sawReady = new Promise<void>((r) => {
+        released = r
+      })
+      const result = new Promise<any>((resolve, reject) => {
+        const child = spawn(process.execPath, ['--import', 'tsx', childPath], {
+          env: {
+            ...process.env,
+            OC_ADVISOR_DB: dbPath,
+            OC_ADVISOR_RECORD: JSON.stringify(record),
+            OC_ADVISOR_BARRIER: barrier,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let out = ''
+        let err = ''
+        child.stdout.on('data', (c) => {
+          out += String(c)
+          if (out.includes('ready')) released()
+        })
+        child.stderr.on('data', (c) => {
+          err += String(c)
+        })
+        child.on('exit', (code) => {
+          if (code !== 0) reject(new Error(err || out || `exit ${code}`))
+          else {
+            const line = out
+              .trim()
+              .split('\n')
+              .filter((row) => row.startsWith('{'))
+              .pop()
+            resolve(JSON.parse(line || '{}'))
+          }
+        })
+      })
+      return { sawReady, result }
+    }
+    const a = run({ ...base, consultId: 'advc-a', invocationId: 'cinv-conflict-proc', question: 'why red?' })
+    const b = run({
+      ...base,
+      consultId: 'advc-b',
+      invocationId: 'cinv-conflict-proc',
+      question: 'a different question',
+    })
+    await Promise.all([a.sawReady, b.sawReady])
+    writeFileSync(barrier, 'go')
+    const [one, two] = await Promise.all([a.result, b.result])
+    assert.equal(one.consultId, two.consultId)
+    const { gw, billing } = await makeGateway()
+    gw._advisorConsults.close()
+    gw._advisorConsults = new AdvisorConsultStore(dbPath)
+    const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-conflict-proc' })
+    const winnerQuestion = one.reused ? two.question : one.question
+    const loserQuestion = winnerQuestion === 'why red?' ? 'a different question' : 'why red?'
+    const ok = await http(gw, 'POST', '/api/agents/advisor/consult', { question: winnerQuestion }, headers)
+    const conflict = await http(gw, 'POST', '/api/agents/advisor/consult', { question: loserQuestion }, headers)
+    assert.equal(ok.status, 200)
+    assert.equal(conflict.status, 409)
+    assert.equal(billing.admits.length, 0)
+    assert.equal(gw._spawnCount ?? 0, 0)
+    gw._advisorConsults.close()
+  })
+
+  it('new process retryPending 2xx projects settle_pending to settled with original advice', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-adv-retry-'))
+    const dbPath = join(dir, 'advisor-consults.db')
+    const queuePath = join(dir, 'billing-queue.json')
+    const key = randomBytes(32).toString('hex')
+    setDelegateContextKeyForTests(key)
+    const childPath = fileURLToPath(new URL('./advisorConsultRouteChild.ts', import.meta.url))
+    const run = (mode: string, extra: Record<string, string> = {}) =>
+      new Promise<any>((resolve, reject) => {
+        const child = spawn(process.execPath, ['--import', 'tsx', childPath], {
+          env: {
+            ...process.env,
+            OC_ADVISOR_CHILD_MODE: mode,
+            OC_ADVISOR_DB: dbPath,
+            OC_ADVISOR_QUEUE: queuePath,
+            OC_ADVISOR_INVOCATION: 'cinv-retry-settle',
+            OC_DELEGATE_CONTEXT_KEY: key,
+            ...extra,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let out = ''
+        let err = ''
+        child.stdout.on('data', (c) => {
+          out += String(c)
+        })
+        child.stderr.on('data', (c) => {
+          err += String(c)
+        })
+        child.on('exit', (code) => {
+          if (code !== 0) reject(new Error(err || out || `exit ${code}`))
+          else {
+            const line = out
+              .trim()
+              .split('\n')
+              .filter((row) => row.startsWith('{'))
+              .pop()
+            resolve(JSON.parse(line || '{}'))
+          }
+        })
+      })
+    const first = await run('settle-pending')
+    assert.equal(first.body.status, 'settle_pending')
+    assert.equal(first.body.advice, 'check the assertion first')
+    const second = await run('retry-settle', { OC_ADVISOR_SETTLE_POSTS: '1' })
+    assert.equal(second.consultState, 'settled')
+    assert.equal(second.advice, 'check the assertion first')
+    assert.equal(second.body.advice, 'check the assertion first')
+    assert.equal(second.spawn, 0)
+    assert.equal(second.settlePosts, 2)
   })
 })
