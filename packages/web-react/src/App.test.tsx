@@ -108,6 +108,25 @@ const AGENT_OPEN_202 = {
   home_volume: 'h1',
 }
 
+function collabDoc(over: Record<string, unknown> = {}) {
+  return {
+    rev: 0,
+    defaultMode: 'solo',
+    defaultAdvisorModel: 'gpt-6-astra',
+    session: {
+      mode: 'solo',
+      advisorModel: null,
+      configVersion: 'v1:solo:',
+      source: 'default',
+    },
+    advisorModels: [{ id: 'gpt-6-astra', label: 'GPT-6-Astra', engine: 'codex' }],
+    advisorConsultParents: ['ccb'],
+    advisorConsultAllowed: true,
+    parentEngine: 'ccb',
+    ...over,
+  }
+}
+
 /**
  * 按 URL 路由的 fetch mock。默认：login OK、模型 OK、agent 状态 ready。
  * overrides 可注入 unsubscribed 状态 / open 应答 / 让 open 后状态翻转为 ready。
@@ -118,13 +137,40 @@ function routedFetch(over?: {
   open?: unknown
   models?: unknown
   preferences?: unknown
+  collaboration?: Record<string, unknown>
 }) {
   let opened = false
-  return vi.fn(async (url: string) => {
+  let collab = collabDoc(over?.collaboration)
+  return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
+    const method = (init?.method ?? 'GET').toUpperCase()
     if (u.includes('/api/auth/refresh')) return REFRESH_401
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+    if (u.includes('/api/collaboration-config') && method === 'PUT') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        mode?: string
+        advisorModel?: string | null
+        sessionId?: string
+        asDefault?: boolean
+      }
+      const mode = body.mode === 'advisor' || body.mode === 'team' ? body.mode : 'solo'
+      const advisorModel = mode === 'advisor' ? body.advisorModel || 'gpt-6-astra' : null
+      collab = collabDoc({
+        rev: Number(collab.rev ?? 0) + 1,
+        defaultMode: body.asDefault ? mode : collab.defaultMode,
+        defaultAdvisorModel:
+          body.asDefault && mode === 'advisor' ? advisorModel : collab.defaultAdvisorModel,
+        session: {
+          mode,
+          advisorModel,
+          configVersion: mode === 'advisor' ? `v1:advisor:${advisorModel}` : `v1:${mode}:`,
+          source: body.sessionId ? 'session' : 'default',
+        },
+      })
+      return okJson(collab)
+    }
+    if (u.includes('/api/collaboration-config')) return okJson(collab)
     if (u.includes('/api/public/models')) return okJson(over?.models ?? MODELS)
     if (u.includes('/api/me/preferences')) return okJson(over?.preferences ?? { prefs: {} })
     // `/api/me` 是前缀；更具体的 usage/report、subscription 必须先匹配，
@@ -209,6 +255,18 @@ async function loginViaUi() {
   await act(async () => {
     fireEvent.click(submit)
   })
+}
+
+async function openAgentPicker() {
+  fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+}
+
+function teamChoice() {
+  return screen.getByRole('button', { name: /队长切 Astra/ })
+}
+
+function soloChoice() {
+  return screen.getByRole('button', { name: /主模型独立完成/ })
 }
 
 describe('Aurora v5 skeleton — landing (de-branded)', () => {
@@ -444,15 +502,21 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
   test('login error localizes the backend code to friendly Chinese (no raw English / trace id)', async () => {
     // 生产实况：后端 message 是英文 "invalid credentials" + x-request-id 头（追踪号来源）。
-    const invalidCreds = {
+    // 登录 401 必须是独立响应对象：catch-all 复用同一 401 会被 callWithRefresh 打 fence，
+    // beginIdentity 后 throwApi 会把 INVALID_CREDENTIALS 误报成 AuthEpochStaleError 英文。
+    const login401 = () => ({
       ok: false,
       status: 401,
       headers: { get: (h: string) => (h === 'x-request-id' ? '0f0ac9caa' : null) },
       json: async () => ({ error: { code: 'INVALID_CREDENTIALS', message: 'invalid credentials' } }),
-    }
+    })
     fetchMock = vi.fn(async (url: string) => {
-      if (String(url).includes('/api/auth/refresh')) return REFRESH_401
-      return String(url).includes('/api/public/config') ? PUBLIC_CONFIG : invalidCreds
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/auth/login')) return login401()
+      if (u.includes('/api/collaboration-config')) return okJson(collabDoc())
+      return okJson({})
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
@@ -462,7 +526,9 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 红条展示友好中文；绝不把后端英文 message / 追踪号怼给用户。
     await waitFor(() => expect(screen.getByText('邮箱或密码错误')).toBeInTheDocument())
     expect(screen.queryByText(/invalid credentials/)).toBeNull()
+    expect(screen.queryByText(/auth identity changed/)).toBeNull()
     expect(screen.queryByText(/追踪号/)).toBeNull()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/auth/login'))).toBe(true)
   })
 
   test('Landing「免费开始」进入注册表单（register）', async () => {
@@ -627,34 +693,86 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     await loginViaUi()
+    const ta = await screen.findByPlaceholderText('和「全能助手」对话…')
+    await waitFor(() => expect(ta).not.toBeDisabled())
+    fireEvent.change(ta, { target: { value: '开场' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    })
+    await waitFor(() => expect(screen.getAllByText('开场').length).toBeGreaterThan(0))
+    await openAgentPicker()
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
 
-    fireEvent.click(await screen.findByRole('button', { name: /全能助手/ }))
-    const sw = await screen.findByRole('switch', { name: '启用团队模式' })
-    expect(sw).not.toBeChecked()
-
-    fireEvent.click(sw)
-    expect(sw).toBeChecked()
+    fireEvent.click(teamChoice())
+    await waitFor(() => expect(teamChoice()).toHaveAttribute('aria-pressed', 'true'))
     expect(localStorage.getItem('oc_v5_team_mode')).toBe('1')
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes('/api/collaboration-config') &&
+          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+      )
+      expect(put).toBeTruthy()
+      expect(JSON.parse(String((put![1] as RequestInit).body))).toEqual(
+        expect.objectContaining({ mode: 'team' }),
+      )
+    })
 
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
-    await waitFor(() =>
-      expect(screen.queryByRole('switch', { name: '启用团队模式' })).not.toBeInTheDocument(),
-    )
+    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切 Astra/ })).not.toBeInTheDocument())
 
-    fireEvent.click(screen.getByRole('button', { name: /全能助手/ }))
-    expect(await screen.findByRole('switch', { name: '启用团队模式' })).toBeChecked()
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+    const lastPut = [...fetchMock.mock.calls].reverse().find(
+      ([url, init]) =>
+        String(url).includes('/api/collaboration-config') &&
+        ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+    )
+    expect(JSON.parse(String((lastPut![1] as RequestInit).body)).mode).toBe('team')
   })
 
-  test('team mode restores from localStorage after a fresh App mount', async () => {
+  test('team mode restores from server config after a fresh App mount', async () => {
     localStorage.setItem('oc_v5_team_mode', '1')
-    fetchMock = routedFetch()
+    fetchMock = routedFetch({
+      collaboration: collabDoc({
+        defaultMode: 'team',
+        session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'default' },
+      }),
+    })
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
     await loginViaUi()
 
-    fireEvent.click(await screen.findByRole('button', { name: /全能助手/ }))
-    expect(await screen.findByRole('switch', { name: '启用团队模式' })).toBeChecked()
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).includes('/api/collaboration-config')),
+      ).toBe(true),
+    )
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('server collaboration config wins over legacy localStorage team flag', async () => {
+    localStorage.setItem('oc_v5_team_mode', '1')
+    fetchMock = routedFetch({
+      collaboration: collabDoc({
+        defaultMode: 'solo',
+        session: { mode: 'solo', advisorModel: null, configVersion: 'v1:solo:', source: 'default' },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).includes('/api/collaboration-config')),
+      ).toBe(true),
+    )
+    await openAgentPicker()
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
   })
 })
 
