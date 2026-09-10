@@ -178,7 +178,6 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
-import { taskboardApi } from "./lib/taskboard";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
@@ -2105,11 +2104,18 @@ export function App() {
             ...(TASKBOARD_ENABLED
               ? {
                   taskApproval: {
-                    getTicket: (id: string) => taskboardApi.getTicket(authRef.current, id),
-                    approve: (id: string, expectedVersion: number) =>
-                      taskboardApi.approve(authRef.current, id, expectedVersion),
-                    reject: (id: string, expectedVersion: number, reason: string) =>
-                      taskboardApi.reject(authRef.current, id, expectedVersion, reason),
+                    getTicket: async (id: string) => {
+                      const { taskboardApi } = await import("./lib/taskboard");
+                      return taskboardApi.getTicket(authRef.current, id);
+                    },
+                    approve: async (id: string, expectedVersion: number) => {
+                      const { taskboardApi } = await import("./lib/taskboard");
+                      return taskboardApi.approve(authRef.current, id, expectedVersion);
+                    },
+                    reject: async (id: string, expectedVersion: number, reason: string) => {
+                      const { taskboardApi } = await import("./lib/taskboard");
+                      return taskboardApi.reject(authRef.current, id, expectedVersion, reason);
+                    },
                   },
                   onOpenTaskboard: () => {
                     setCollapsed(false);

@@ -6,7 +6,7 @@
  * format 层归一化为 native builtin/MCP 工具。
  */
 import { Sparkles, FileText } from "lucide-react";
-import { useContext, useMemo, useState, type ReactNode } from "react";
+import { lazy, Suspense, useContext, useMemo, useState, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { SignedImg } from "../chat/media";
 import { Badge, Button } from "../ui";
@@ -38,7 +38,10 @@ import {
 import { parseMcpName } from "./meta";
 import { researchToolCard, safeArtifactSrc, WebSearchResultsCard } from "./researchCards";
 import { renderReleaseJobCard } from "./releaseCards";
-import { TaskApprovalCard } from "./taskApprovalCard";
+
+const TaskApprovalCard = lazy(() =>
+  import("./taskApprovalCard").then((m) => ({ default: m.TaskApprovalCard })),
+);
 
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
@@ -1027,7 +1030,11 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
   } else if (op === "present_task_approval") {
     const ticketId = asStr(input?.id) || asStr(input?.identifier);
     if (ticketId && !tool.error) {
-      body = <TaskApprovalCard id={ticketId} prompt={asStr(input?.prompt) || undefined} />;
+      body = (
+        <Suspense fallback={<div className="mt-1.5 text-caption text-faint">加载审批卡…</div>}>
+          <TaskApprovalCard id={ticketId} prompt={asStr(input?.prompt) || undefined} />
+        </Suspense>
+      );
       suppressOutput = true;
     } else {
       body = <KvList obj={input} />;
