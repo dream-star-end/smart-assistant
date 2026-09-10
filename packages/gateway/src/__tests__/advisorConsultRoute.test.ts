@@ -24,7 +24,7 @@ import {
   issueConsultTurnToken,
   resetDelegateContextKeyForTests,
 } from '../delegateContext.js'
-import { createDelegateEngineBillingClient } from '../delegateEngineBilling.js'
+import { createDelegateEngineBillingClient, type DelegateEngineBillingAdmission } from '../delegateEngineBilling.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
@@ -67,9 +67,13 @@ function makeBilling() {
     admits,
     settles,
     abandons,
-    async admit(input: unknown) {
+    async admit(input: unknown): Promise<DelegateEngineBillingAdmission> {
       admits.push(input)
-      return { requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}` }
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        route: { kind: 'official_oauth', groupId: '42' },
+      }
     },
     async settle(billing: unknown) {
       settles.push(billing)
@@ -191,8 +195,12 @@ async function makeGateway(opts?: {
       _effort?: string | null,
       _model?: string,
       requestId?: string,
+      _traceId?: string,
+      _conversationMode?: string,
+      submitOpts?: { codexRoute?: unknown },
     ) => {
       gw._lastSubmitRequestId = requestId
+      gw._lastCodexRoute = submitOpts?.codexRoute ?? null
       gw._submitOnEvent = onEvent
       gw._submitCount = (gw._submitCount ?? 0) + 1
       if (opts?.submitError) throw opts.submitError
@@ -1402,7 +1410,7 @@ describe('OCV5-210 R1 E2/W1', () => {
 
   it('Stop during admit: 0 spawn and original owner abandon', async () => {
     const { gw, billing } = await makeGateway()
-    let release!: (value: { requestId: string; engineSessionId: string }) => void
+    let release!: (value: DelegateEngineBillingAdmission) => void
     billing.admit = async (input: unknown) => {
       billing.admits.push(input)
       return await new Promise((resolve) => {
@@ -1537,5 +1545,103 @@ describe('OCV5-210 M7 settlement authority', () => {
     assert.equal(rec.state, 'failed')
     assert.equal(rec.billingRequestId, null)
     gw._advisorConsults.close()
+  })
+})
+
+describe('OCV5-210 M15 advisor master route', () => {
+  it('a3c-shaped admit without route abandons once and never spawns', async () => {
+    const { gw, billing } = await makeGateway()
+    billing.admit = async (input: unknown) => {
+      billing.admits.push(input)
+      return { requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}` }
+    }
+    const r = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-m15-missing' }),
+    )
+    assert.equal(r.status, 503, JSON.stringify(r.body))
+    assert.equal(r.body.state, 'failed')
+    assert.equal(r.body.requestId, REQUEST_ID)
+    assert.equal(gw._spawnCount ?? 0, 0)
+    assert.deepEqual(billing.abandons, [REQUEST_ID])
+    assert.equal(billing.settles.length, 0)
+    assert.equal(gw._advisorConsults.findById(r.body.consultId).state, 'failed')
+  })
+
+  it('unknown kind and forged baseUrl reject without spawn', async () => {
+    for (const route of [
+      { kind: 'official_oauth', extra: 1 },
+      { kind: 'api_relay', token: 'a'.repeat(64), modelProvider: 'api111', baseUrl: 'http://evil.example/x' },
+      { kind: 'mystery' },
+      { kind: 'unavailable', reason: 'no group' },
+    ]) {
+      const { gw, billing } = await makeGateway()
+      billing.admit = async (input: unknown) => {
+        billing.admits.push(input)
+        return { requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}`, route }
+      }
+      const r = await http(
+        gw,
+        'POST',
+        '/api/agents/advisor/consult',
+        { question: 'why red?' },
+        consultHeaders({ [CONSULT_INVOCATION_HEADER]: `cinv-m15-bad-${route.kind}` }),
+      )
+      assert.equal(r.status, 503, JSON.stringify({ route, body: r.body }))
+      assert.equal(gw._spawnCount ?? 0, 0, JSON.stringify(route))
+      assert.deepEqual(billing.abandons, [REQUEST_ID])
+    }
+  })
+
+  it('master official_oauth becomes this gateway port loopback on submit', async () => {
+    const { gw, billing } = await makeGateway()
+    gw.deps.config.gateway.port = 19101
+    const r = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-m15-official' }),
+    )
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(gw._spawnCount, 1)
+    assert.equal(billing.abandons.length, 0)
+    const route = gw._lastCodexRoute as { baseUrl?: string; modelProvider?: string }
+    assert.equal(route.modelProvider, 'oc_chatgpt_official')
+    assert.equal(
+      route.baseUrl,
+      'http://127.0.0.1:19101/internal/v3/codex-relay/backend-api/codex',
+    )
+  })
+
+  it('master api_relay token is rebound to this gateway port', async () => {
+    const token = 'ab'.repeat(32)
+    const { gw, billing } = await makeGateway()
+    gw.deps.config.gateway.port = 19107
+    billing.admit = async (input: unknown) => {
+      billing.admits.push(input)
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        route: { kind: 'api_relay', token, modelProvider: 'api111', preferredAuthMethod: 'apikey' },
+      }
+    }
+    const r = await http(
+      gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-m15-relay' }),
+    )
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    const route = gw._lastCodexRoute as { baseUrl?: string; modelProvider?: string }
+    assert.equal(route.modelProvider, 'api111')
+    assert.equal(
+      route.baseUrl,
+      `http://127.0.0.1:19107/internal/v3/codex-relay/route/${token}`,
+    )
   })
 })

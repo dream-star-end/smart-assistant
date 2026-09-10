@@ -53,6 +53,8 @@ export interface DelegateEngineBillingAdmitInput {
 export interface DelegateEngineBillingAdmission {
   requestId: string
   engineSessionId: string
+  /** Advisor-consult only. Regular delegate admits omit this. */
+  route?: unknown
 }
 
 export interface DelegateEngineBillingClient {
@@ -106,6 +108,9 @@ export function mapDelegateEngineBillingError(err: unknown): {
   const code = err instanceof Error ? err.message : String(err)
   if (code.includes('INSUFFICIENT_CREDITS')) {
     return { httpStatus: 402, message: '余额不足，engine-reported 委派未启动' }
+  }
+  if (code.includes('ROUTE_UNAVAILABLE')) {
+    return { httpStatus: 503, message: '顾问模型路由不可用，未启动' }
   }
   if (code.includes('INVALID_')) {
     return { httpStatus: 400, message: `engine-reported 委派计费初始化失败: ${code}` }
@@ -307,6 +312,7 @@ export function createDelegateEngineBillingClient(args?: {
       return {
         requestId: result.requestId,
         engineSessionId: result.engineSessionId,
+        ...(result.route !== undefined ? { route: result.route } : {}),
       }
     },
     async settle(billing) {

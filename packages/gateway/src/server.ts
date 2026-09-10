@@ -516,6 +516,7 @@ import {
   type DelegateEngineBillingAdmission,
   type DelegateEngineBillingClient,
 } from './delegateEngineBilling.js'
+import { parseAdvisorAdmitRoute, type AdvisorAdmitRouteOk } from './advisorCodexRoute.js'
 import type { DelegateOwnerTurnLocator } from './delegateLateCompletion.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
@@ -12582,7 +12583,7 @@ export class Gateway {
     }
     store.update(inserted.record.consultId, { state: 'admission_attempt' })
     const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
-    let admission: { requestId: string }
+    let admission: DelegateEngineBillingAdmission
     try {
       admission = await billingApi.admit({
         model: frozen.advisorModel,
@@ -12630,6 +12631,38 @@ export class Gateway {
         })
       }
     }
+    const parsedRoute = parseAdvisorAdmitRoute(admission.route)
+    const codexRoute = parsedRoute.ok
+      ? this._advisorConsultRouteOverride(parsedRoute.route, frozen.advisorModel)
+      : null
+    if (!codexRoute) {
+      try {
+        await billingApi.abandon(admission.requestId)
+        store.update(inserted.record.consultId, {
+          state: 'failed',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 503, {
+          error: '顾问路由不可用，已按原 requestId abandon',
+          consultId: inserted.record.consultId,
+          state: 'failed',
+          requestId: admission.requestId,
+        })
+      } catch {
+        store.update(inserted.record.consultId, {
+          state: 'admission_unknown',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 503, {
+          error: '已准入但顾问路由不可用，abandon 不确定',
+          consultId: inserted.record.consultId,
+          state: 'admission_unknown',
+          requestId: admission.requestId,
+        })
+      }
+    }
     try {
       store.update(inserted.record.consultId, {
         state: 'admitted',
@@ -12664,6 +12697,7 @@ export class Gateway {
       billingApi,
       abort,
       unregister: unregisterEarly,
+      codexRoute,
     })
     return this.sendJson(res, 200, {
       status: spawned.state,
@@ -12702,6 +12736,35 @@ export class Gateway {
     return listTurnTapeRecords(peerId, userId, turnKey, 0, 80)
   }
 
+  private _advisorConsultRouteOverride(
+    route: AdvisorAdmitRouteOk,
+    model: string,
+  ): import('./engine/codexShared.js').CodexProviderConfigOverride | null {
+    const port = this.deps.config.gateway.port
+    if (route.kind === 'official_oauth') {
+      return _buildSafeCodexRouteOverride({
+        agent: { id: ADVISOR_AGENT_ID },
+        model,
+        rawRoute: { kind: 'official_oauth' },
+        officialRelayPort: port,
+      })
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+    return _buildSafeCodexRouteOverride({
+      agent: { id: ADVISOR_AGENT_ID },
+      model,
+      rawRoute: {
+        baseUrl: `http://127.0.0.1:${port}${V3_CODEX_RELAY_PREFIX}/route/${route.token}`,
+        modelProvider: route.modelProvider,
+        providerName: route.providerName ?? null,
+        wireApi: route.wireApi ?? 'responses',
+        preferredAuthMethod: route.preferredAuthMethod ?? 'apikey',
+        disableResponseStorage: route.disableResponseStorage ?? true,
+      },
+      officialRelayPort: port,
+    })
+  }
+
   private async _spawnAdvisorConsult(input: {
     consultId: string
     parent: AgentSession
@@ -12711,6 +12774,7 @@ export class Gateway {
     billingApi: typeof defaultDelegateEngineBilling
     abort?: AbortController
     unregister?: (() => void) | null
+    codexRoute: import('./engine/codexShared.js').CodexProviderConfigOverride
   }): Promise<{
     state: string
     advice: string
@@ -12897,6 +12961,9 @@ export class Gateway {
         undefined,
         input.snapshot.advisorModel,
         input.requestId,
+        undefined,
+        undefined,
+        { codexRoute: input.codexRoute },
       )
     } catch (err) {
       const code = (err as { errorCode?: string })?.errorCode

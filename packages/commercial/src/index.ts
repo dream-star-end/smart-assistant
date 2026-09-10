@@ -294,8 +294,13 @@ import {
 } from "./account-pool/groups.js";
 import {
   CODEX_RELAY_PREFIX,
+  makeDefaultCodexRelayDb,
   type CodexRelayHandler,
 } from "./http/internalCodexRelay.js";
+import {
+  selectAdvisorCodexAdmitRoute,
+  type AdvisorCodexSelectorDecision,
+} from "./billing/advisorCodexAdmitRoute.js";
 import {
   isDelegateGrokRoutePath,
   makeDelegateGrokRouteHandler,
@@ -2035,6 +2040,14 @@ export async function registerCommercial(
   const autoDreamOptimizerRuntimeRef: { current: AutoDreamOptimizerRuntime | null } = {
     current: null,
   };
+  const commercialCodexRouteRef: {
+    current: ((args: {
+      containerId: number
+      userId: bigint
+      modelId: string
+      sessionId?: string
+    }) => Promise<AdvisorCodexSelectorDecision>) | null
+  } = { current: null }
   const delegateEngineBillingRuntimeRef: { current: DelegateEngineBillingRuntime | null } = {
     current: null,
   };
@@ -2512,6 +2525,7 @@ export async function registerCommercial(
         identityRepo,
         runtimeRef: autoDreamOptimizerRuntimeRef,
       });
+      const advisorCodexRelayDb = makeDefaultCodexRelayDb();
       delegateEngineBillingRuntimeRef.current = createDelegateEngineBillingRuntime({
         getPool,
         preCheckRedis,
@@ -2526,6 +2540,18 @@ export async function registerCommercial(
           },
         },
         loadUserModelAuthz,
+        createAdvisorCodexRoute: async ({ containerId, userId, modelId }) => {
+          const createRoute = commercialCodexRouteRef.current
+          if (!createRoute) return { kind: 'unavailable' as const, reason: 'selector_unwired' }
+          return selectAdvisorCodexAdmitRoute({
+            containerId,
+            userId,
+            modelId,
+            createRoute,
+            readBinding: (id) => advisorCodexRelayDb.readContainerBinding(id),
+          })
+        },
+        expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
       });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
@@ -4491,6 +4517,7 @@ export async function registerCommercial(
     }
     return { kind: "unavailable" as const, reason: "no usable enabled Codex group" };
   };
+  commercialCodexRouteRef.current = (args) => createCommercialCodexRoute(args);
 
   const createWechatApiRelayRoute = async (args: {
     containerId: number;

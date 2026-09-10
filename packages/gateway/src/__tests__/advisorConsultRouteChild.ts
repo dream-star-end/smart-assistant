@@ -42,7 +42,11 @@ function makeBillingStub() {
     abandons,
     async admit(input: unknown) {
       admits.push(input)
-      return { requestId: REQUEST_ID, engineSessionId: `oceng-${'b'.repeat(48)}` }
+      return {
+        requestId: REQUEST_ID,
+        engineSessionId: `oceng-${'b'.repeat(48)}`,
+        route: { kind: 'official_oauth', groupId: '42' },
+      }
     },
     async settle(billing: unknown) {
       settles.push(billing)
@@ -242,6 +246,7 @@ async function main() {
           return jsonResponse(200, {
             requestId: REQUEST_ID,
             engineSessionId: `oceng-${'b'.repeat(48)}`,
+            route: { kind: 'official_oauth', groupId: '42' },
           })
         }
         if (path.includes('settle')) {

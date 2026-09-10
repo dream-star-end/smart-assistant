@@ -92,6 +92,7 @@ describe('createDelegateEngineBillingClient', () => {
       parentTurnKey: 'c'.repeat(64),
     })
     assert.equal(admission.requestId, 'a'.repeat(32))
+    assert.equal('route' in admission, false)
     assert.deepEqual(JSON.parse(posted), {
       model: 'grok-build',
       engine: 'grok',
@@ -101,6 +102,26 @@ describe('createDelegateEngineBillingClient', () => {
       parentSessionId: 'web-parent',
       parentTurnKey: 'c'.repeat(64),
     })
+  })
+
+  it('forwards advisor route metadata from admit without requiring it', async () => {
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      fetcher: (async () =>
+        response(200, {
+          requestId: 'a'.repeat(32),
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+          route: { kind: 'official_oauth', groupId: '9' },
+        })) as any,
+    })
+    const admission = await client.admit({
+      model: 'gpt-6-astra',
+      engine: 'codex',
+      agentId: 'advisor',
+      delegateAgentId: 'advisor',
+      sessionKey: 'advisor:' + 'a'.repeat(64) + ':advc-test',
+    })
+    assert.deepEqual(admission.route, { kind: 'official_oauth', groupId: '9' })
   })
 
   it('rejects a non-hex admission requestId', async () => {
