@@ -15,6 +15,7 @@ export type AdvisorConsultState =
   | 'admission_unknown'
   | 'admitted'
   | 'spawned'
+  | 'settle_pending'
   | 'settled'
   | 'failed'
   | 'cancelled'
@@ -110,6 +111,20 @@ export class AdvisorConsultStore {
     this.db.close()
   }
 
+  findById(consultId: string): AdvisorConsultRecord | undefined {
+    const row = this.db
+      .prepare('SELECT * FROM advisor_consults WHERE consult_id = ?')
+      .get(consultId) as Record<string, unknown> | undefined
+    return row ? rowToRecord(row) : undefined
+  }
+
+  listByState(state: AdvisorConsultState): AdvisorConsultRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM advisor_consults WHERE state = ? ORDER BY created_at ASC')
+      .all(state) as Record<string, unknown>[]
+    return rows.map(rowToRecord)
+  }
+
   findByInvocation(input: {
     userId: string
     originTurnKey: string
@@ -137,6 +152,9 @@ export class AdvisorConsultStore {
       invocationId: record.invocationId,
     })
     if (existing) return { record: existing, reused: true }
+    const now = Date.now()
+    const createdAt = record.createdAt || now
+    const updatedAt = record.updatedAt || now
     try {
       const insert = this.db.transaction(() => {
         this.db
@@ -165,8 +183,8 @@ export class AdvisorConsultStore {
             record.jobId,
             record.billingRequestId,
             record.state,
-            record.createdAt,
-            record.updatedAt,
+            createdAt,
+            updatedAt,
           )
         return this.findByInvocation(record)!
       })

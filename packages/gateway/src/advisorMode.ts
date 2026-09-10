@@ -48,6 +48,22 @@ export type AdvisorCatalogModel = {
 
 export type AdvisorModelOption = { id: string; label: string; engine: string }
 
+export function assertAdvisorModelAllowed(input: {
+  requested: string
+  advisorModels: readonly AdvisorModelOption[]
+  unavailableReason?: string
+}): { ok: true; model: string } | { ok: false; error: string } {
+  const requested = input.requested.trim()
+  if (input.advisorModels.length === 0) {
+    return { ok: false, error: input.unavailableReason || '顾问型号目录不可用或尚未证明' }
+  }
+  if (!requested) return { ok: false, error: 'advisorModel required' }
+  if (!input.advisorModels.some((row) => row.id === requested)) {
+    return { ok: false, error: `advisorModel ${requested} 不在已证明 catalog 中` }
+  }
+  return { ok: true, model: requested }
+}
+
 export function listProvenAdvisorModels(input: {
   catalog: readonly AdvisorCatalogModel[]
   provenEngines: Iterable<string>

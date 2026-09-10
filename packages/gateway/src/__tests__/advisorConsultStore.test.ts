@@ -94,4 +94,17 @@ describe('advisorConsultStore', () => {
     assert.throws(() => store.update(mintConsultId(), { state: 'failed' }), /not found/)
     store.close()
   })
+
+  it('keeps settle_pending instead of pretending settled', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const { record } = store.insertNew(sample(dir, { invocationId: 'inv-settle' }))
+    store.update(record.consultId, { state: 'admitted', billingRequestId: 'c'.repeat(32) })
+    const pending = store.update(record.consultId, { state: 'settle_pending' })
+    assert.equal(pending.state, 'settle_pending')
+    assert.equal(pending.billingRequestId?.length, 32)
+    assert.equal(store.listByState('settle_pending').length, 1)
+    assert.equal(store.findById(record.consultId)?.state, 'settle_pending')
+    store.close()
+  })
 })

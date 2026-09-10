@@ -3820,7 +3820,12 @@ export class SessionManager {
     // Identity construction outlives an individual dispatch/switch. Never retain
     // their one-use admission credentials in the reusable session template.
     const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId, ...identityCreationOpts } = opts
-    const identity = await resolveRuntimeExecutionAgent(opts.agent)
+    // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
+    // Fetching marketplace identity here would fail-closed the no-tools path
+    // whenever master sync is briefly unavailable.
+    const identity = opts.hermeticNoTools
+      ? { agent: opts.agent, context: {} }
+      : await resolveRuntimeExecutionAgent(opts.agent)
     opts = { ...opts, agent: identity.agent }
     const identityAgentFingerprint = identity.context.assets ? JSON.stringify(opts.agent) : undefined
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)

@@ -6,6 +6,8 @@ import { describe, it } from 'node:test'
 import { symlinkSync } from 'node:fs'
 
 import {
+  ADVISOR_PREAMBLE,
+  assertAdvisorModelAllowed,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
   extractGeneratedPaths,
@@ -15,7 +17,6 @@ import {
   matchConsultIdentity,
   parentAuthorizedArtifactTexts,
   stripAdvisorPreambleFromInjected,
-  ADVISOR_PREAMBLE,
 } from '../advisorMode.js'
 
 describe('advisorMode snapshot', () => {
@@ -119,6 +120,22 @@ describe('advisorMode snapshot', () => {
     )
     assert.ok(hist.missing.includes('tape_archived_prefix'))
     assert.equal(hist.records?.some((row) => row.text === 'secret chain'), false)
+  })
+
+  it('assertAdvisorModelAllowed refuses silent fallback when the requested slug is absent', () => {
+    const listed = [
+      { id: 'gpt-6-astra', label: 'GPT-6 Astra', engine: 'codex' },
+    ]
+    assert.equal(assertAdvisorModelAllowed({ requested: 'gpt-6-astra', advisorModels: listed }).ok, true)
+    const denied = assertAdvisorModelAllowed({ requested: 'deepseek-v4-flash', advisorModels: listed })
+    assert.equal(denied.ok, false)
+    const closed = assertAdvisorModelAllowed({
+      requested: 'gpt-6-astra',
+      advisorModels: [],
+      unavailableReason: 'catalog unavailable',
+    })
+    assert.equal(closed.ok, false)
+    if (!closed.ok) assert.match(closed.error, /catalog unavailable/)
   })
 
   it('listProvenAdvisorModels stays empty until an engine is proven', () => {
