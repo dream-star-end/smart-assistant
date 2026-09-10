@@ -8,7 +8,7 @@
  * claims. A model can replay a stolen token (same-uid residual) but cannot mint
  * a new identity.
  */
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import {
   AUTHORITY_TURN_MAX_LIFETIME_MS,
   TURN_LEASE_GRACE_MS,
@@ -127,6 +127,62 @@ export function issueConsultTurnToken(input: {
 
 export function isConsultTurnClaims(claims: DelegateContextClaims): claims is DelegateContextClaimsV2 {
   return claims.v === 2
+}
+
+export function hashConsultTurnToken(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex')
+}
+
+function parseConsultTurnPayload(raw: string): DelegateContextClaimsV2 | null {
+  const token = String(raw ?? '').trim()
+  const dot = token.lastIndexOf('.')
+  if (dot <= 0) return null
+  const payload = token.slice(0, dot)
+  if (!payload) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as DelegateContextClaims
+    if (parsed?.v !== 2) return null
+    if (typeof parsed.agentId !== 'string' || !parsed.agentId.trim()) return null
+    if (typeof parsed.sessionKey !== 'string' || !parsed.sessionKey.trim()) return null
+    if (typeof parsed.depth !== 'number' || !Number.isFinite(parsed.depth) || parsed.depth < 0) return null
+    if (typeof parsed.exp !== 'number') return null
+    if (typeof parsed.turnKey !== 'string' || !parsed.turnKey.trim()) return null
+    if (typeof parsed.turnIndex !== 'number' || !Number.isFinite(parsed.turnIndex)) return null
+    if (parsed.collabMode !== 'solo' && parsed.collabMode !== 'advisor' && parsed.collabMode !== 'team') {
+      return null
+    }
+    if (typeof parsed.configVersion !== 'string' || !parsed.configVersion.trim()) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/** Decode v2 consult claims without HMAC. Expired tokens are rejected. Never used for v1 delegate tokens. */
+export function decodeConsultTurnClaims(
+  raw: string | undefined,
+  now = Date.now(),
+): DelegateContextClaimsV2 | null {
+  const parsed = parseConsultTurnPayload(String(raw ?? ''))
+  if (!parsed || parsed.exp <= now) return null
+  return parsed
+}
+
+export function inspectConsultTurnToken(
+  raw: string | undefined,
+  now = Date.now(),
+): { claims: DelegateContextClaimsV2; hmacOk: boolean } | null {
+  const token = String(raw ?? '').trim()
+  if (!token) return null
+  const verified = verifyDelegateContextToken(token, now)
+  if (verified && isConsultTurnClaims(verified) && verified.collabMode === 'advisor') {
+    return { claims: verified, hmacOk: true }
+  }
+  const decoded = decodeConsultTurnClaims(token, now)
+  if (decoded && decoded.collabMode === 'advisor') {
+    return { claims: decoded, hmacOk: false }
+  }
+  return null
 }
 
 export function verifyDelegateContextToken(

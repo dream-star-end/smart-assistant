@@ -6,15 +6,14 @@ import { CONSULT_INVOCATION_HEADER } from '@openclaude/protocol'
 
 import { AdvisorConfigStore } from '../advisorConfigStore.js'
 import { AdvisorConsultStore } from '../advisorConsultStore.js'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+
 import {
   DELEGATE_CONTEXT_HEADER,
   issueConsultTurnToken,
-  setDelegateContextKeyForTests,
 } from '../delegateContext.js'
-import {
-  createDelegateEngineBillingClient,
-  setDelegateEngineBillingSettledHook,
-} from '../delegateEngineBilling.js'
+import { createDelegateEngineBillingClient } from '../delegateEngineBilling.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 
@@ -25,10 +24,6 @@ const REQUEST_ID = process.env.OC_ADVISOR_REQUEST_ID || 'ab'.repeat(16)
 process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
 process.env.OC_ADVISOR_OPEN_ENGINES = 'codex'
 process.env.OC_MODEL_AUTHORITY = '0'
-
-if (process.env.OC_DELEGATE_CONTEXT_KEY) {
-  setDelegateContextKeyForTests(process.env.OC_DELEGATE_CONTEXT_KEY)
-}
 
 const mode = process.env.OC_ADVISOR_CHILD_MODE || 'consult'
 const dbPath = process.env.OC_ADVISOR_DB
@@ -172,16 +167,31 @@ async function makeGateway(opts?: { settleError?: boolean; billing?: any }) {
   return { gw, billing }
 }
 
+function tokenPath(): string {
+  return process.env.OC_ADVISOR_TOKEN_FILE || join(dirname(String(dbPath)), 'consult.token')
+}
+
 function headers() {
-  const token = issueConsultTurnToken({
-    agentId: 'main',
-    sessionKey: PARENT_KEY,
-    depth: 0,
-    turnKey: TURN_KEY,
-    turnIndex: 1,
-    collabMode: 'advisor',
-    configVersion: 'v1:advisor:gpt-6-astra',
-  })
+  let token = process.env.OC_ADVISOR_TOKEN
+  if (!token) {
+    try {
+      token = readFileSync(tokenPath(), 'utf8').trim()
+    } catch {
+      token = ''
+    }
+  }
+  if (!token) {
+    token = issueConsultTurnToken({
+      agentId: 'main',
+      sessionKey: PARENT_KEY,
+      depth: 0,
+      turnKey: TURN_KEY,
+      turnIndex: 1,
+      collabMode: 'advisor',
+      configVersion: 'v1:advisor:gpt-6-astra',
+    })
+    writeFileSync(tokenPath(), token)
+  }
   return {
     [DELEGATE_CONTEXT_HEADER]: token,
     [CONSULT_INVOCATION_HEADER]: invocation,
@@ -243,7 +253,6 @@ async function main() {
       }) as any,
     })
     const { gw } = await makeGateway({ billing: client })
-    setDelegateEngineBillingSettledHook((billing) => gw._projectAdvisorConsultSettled(billing))
     if (mode === 'settle-pending') {
       const r = await http(gw, { question }, headers())
       process.stdout.write(

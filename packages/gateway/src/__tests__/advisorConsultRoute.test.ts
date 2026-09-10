@@ -6,7 +6,6 @@
  */
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -22,7 +21,6 @@ import {
   DELEGATE_CONTEXT_HEADER,
   issueConsultTurnToken,
   resetDelegateContextKeyForTests,
-  setDelegateContextKeyForTests,
 } from '../delegateContext.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
@@ -1109,8 +1107,6 @@ describe('M4c recovery contracts', () => {
   it('new process route replay returns settled advice without a second admit', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-adv-proc-'))
     const dbPath = join(dir, 'advisor-consults.db')
-    const key = randomBytes(32).toString('hex')
-    setDelegateContextKeyForTests(key)
     const childPath = fileURLToPath(new URL('./advisorConsultRouteChild.ts', import.meta.url))
     const run = (mode: string, extra: Record<string, string> = {}) =>
       new Promise<any>((resolve, reject) => {
@@ -1120,7 +1116,7 @@ describe('M4c recovery contracts', () => {
             OC_ADVISOR_CHILD_MODE: mode,
             OC_ADVISOR_DB: dbPath,
             OC_ADVISOR_INVOCATION: 'cinv-proc-replay',
-            OC_DELEGATE_CONTEXT_KEY: key,
+            OC_ADVISOR_TOKEN_FILE: join(dir, 'consult.token'),
             ...extra,
           },
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -1247,8 +1243,6 @@ describe('M4c recovery contracts', () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-adv-retry-'))
     const dbPath = join(dir, 'advisor-consults.db')
     const queuePath = join(dir, 'billing-queue.json')
-    const key = randomBytes(32).toString('hex')
-    setDelegateContextKeyForTests(key)
     const childPath = fileURLToPath(new URL('./advisorConsultRouteChild.ts', import.meta.url))
     const run = (mode: string, extra: Record<string, string> = {}) =>
       new Promise<any>((resolve, reject) => {
@@ -1259,7 +1253,7 @@ describe('M4c recovery contracts', () => {
             OC_ADVISOR_DB: dbPath,
             OC_ADVISOR_QUEUE: queuePath,
             OC_ADVISOR_INVOCATION: 'cinv-retry-settle',
-            OC_DELEGATE_CONTEXT_KEY: key,
+            OC_ADVISOR_TOKEN_FILE: join(dir, 'consult.token'),
             ...extra,
           },
           stdio: ['ignore', 'pipe', 'pipe'],

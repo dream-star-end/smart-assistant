@@ -40,6 +40,7 @@ export type AdvisorConsultRecord = {
   state: AdvisorConsultState
   createdAt: number
   updatedAt: number
+  tokenReceipt: string | null
 }
 
 const DDL = `
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS advisor_consults (
   advice TEXT,
   state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  token_receipt TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_advisor_consults_invocation
   ON advisor_consults(user_id, origin_turn_key, invocation_id);
@@ -89,8 +91,13 @@ function rowToRecord(row: Record<string, unknown>): AdvisorConsultRecord {
     state: row.state as AdvisorConsultState,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
+    tokenReceipt: row.token_receipt == null ? null : String(row.token_receipt),
   }
 }
+
+const OPEN_STORES = new Set<AdvisorConsultStore>()
+
+const PROJECTABLE = new Set<AdvisorConsultState>(['settle_pending', 'spawned', 'admitted'])
 
 export function mintConsultId(now = Date.now()): string {
   return `advc-${now.toString(36)}-${randomBytes(6).toString('hex')}`
@@ -113,10 +120,23 @@ export class AdvisorConsultStore {
     } catch {
       /* column already exists on upgraded files */
     }
+    try {
+      this.db.exec('ALTER TABLE advisor_consults ADD COLUMN token_receipt TEXT')
+    } catch {
+      /* column already exists on upgraded files */
+    }
+    OPEN_STORES.add(this)
   }
 
   close(): void {
+    OPEN_STORES.delete(this)
     this.db.close()
+  }
+
+  static projectSettledRequestId(requestId: string): number {
+    let n = 0
+    for (const store of OPEN_STORES) n += store.markSettledFromBilling(requestId).length
+    return n
   }
 
   findById(consultId: string): AdvisorConsultRecord | undefined {
@@ -128,8 +148,14 @@ export class AdvisorConsultStore {
 
   markSettledFromBilling(requestId: string): AdvisorConsultRecord[] {
     const updated: AdvisorConsultRecord[] = []
-    for (const row of this.listByState('settle_pending')) {
-      if (row.billingRequestId !== requestId) continue
+    if (!requestId) return updated
+    const rows = this.db
+      .prepare('SELECT * FROM advisor_consults WHERE billing_request_id = ?')
+      .all(requestId) as Record<string, unknown>[]
+    for (const raw of rows) {
+      const row = rowToRecord(raw)
+      if (row.state === 'settled') continue
+      if (!PROJECTABLE.has(row.state)) continue
       updated.push(this.update(row.consultId, { state: 'settled', advice: row.advice }))
     }
     return updated
@@ -163,8 +189,8 @@ export class AdvisorConsultStore {
    * existing row is returned (caller must verify question/concern).
    */
   insertNew(
-    record: Omit<AdvisorConsultRecord, 'createdAt' | 'updatedAt' | 'advice'> &
-      Partial<Pick<AdvisorConsultRecord, 'createdAt' | 'updatedAt' | 'advice'>>,
+    record: Omit<AdvisorConsultRecord, 'createdAt' | 'updatedAt' | 'advice' | 'tokenReceipt'> &
+      Partial<Pick<AdvisorConsultRecord, 'createdAt' | 'updatedAt' | 'advice' | 'tokenReceipt'>>,
   ): { record: AdvisorConsultRecord; reused: boolean } {
     const existing = this.findByInvocation({
       userId: record.userId,
@@ -183,8 +209,8 @@ export class AdvisorConsultStore {
               consult_id, invocation_id, user_id, session_key, client_session_id,
               origin_turn_key, origin_turn_index, config_version, evidence_version,
               advisor_model, question, concern, snapshot_json, job_id,
-              billing_request_id, advice, state, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              billing_request_id, advice, state, created_at, updated_at, token_receipt
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           )
           .run(
             record.consultId,
@@ -206,6 +232,7 @@ export class AdvisorConsultStore {
             record.state,
             createdAt,
             updatedAt,
+            record.tokenReceipt ?? null,
           )
         return this.findByInvocation(record)!
       })

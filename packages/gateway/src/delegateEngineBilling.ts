@@ -23,6 +23,7 @@ import {
   type DurableCodexBilling,
 } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
+import { AdvisorConsultStore } from './advisorConsultStore.js'
 import { request as undiciRequest } from 'undici'
 
 // Concatenated so the internal-route scanner does not treat these as new
@@ -59,6 +60,7 @@ export interface DelegateEngineBillingClient {
   settle(billing: DurableCodexBilling): Promise<void>
   abandon(requestId: string): Promise<void>
   retryPending?(): Promise<void>
+  projectConsults?(store: AdvisorConsultStore): Promise<void>
 }
 
 export function shouldAdmitDelegateEngineBilling(args: {
@@ -114,9 +116,15 @@ export function mapDelegateEngineBillingError(err: unknown): {
   }
 }
 
+interface BillingSettledReceipt {
+  requestId: string
+  at: number
+}
+
 interface BillingQueue {
   schemaVersion: 1
   pending: DurableCodexBilling[]
+  settledReceipts?: BillingSettledReceipt[]
 }
 
 function isNotFound(err: unknown): boolean {
@@ -142,7 +150,11 @@ async function readBillingQueue(queuePath: string): Promise<BillingQueue> {
     if (raw?.schemaVersion !== 1 || !Array.isArray(raw.pending)) {
       throw new Error('DELEGATE_ENGINE_BILLING_QUEUE_INVALID')
     }
-    return { schemaVersion: 1, pending: raw.pending }
+    return {
+      schemaVersion: 1,
+      pending: raw.pending,
+      settledReceipts: Array.isArray(raw.settledReceipts) ? raw.settledReceipts : [],
+    }
   } catch (err) {
     if (isNotFound(err)) return { schemaVersion: 1, pending: [] }
     throw err
@@ -161,8 +173,13 @@ async function emitDelegateEngineBillingSettled(
   billing: DurableCodexBilling,
   extra?: (billing: DurableCodexBilling) => void | Promise<void>,
 ): Promise<void> {
+  AdvisorConsultStore.projectSettledRequestId(billing.requestId)
   await extra?.(billing)
   await defaultSettledHook?.(billing)
+}
+
+export function defaultDelegateEngineBillingQueuePath(): string {
+  return join(paths.agentDir('_platform'), 'delegate-engine-billing.json')
 }
 
 export function createDelegateEngineBillingClient(args?: {
@@ -246,8 +263,16 @@ export function createDelegateEngineBillingClient(args?: {
     withQueueLock(async () => {
       const queue = await readBillingQueue(queuePath)
       const next = queue.pending.filter((row) => row.requestId !== requestId)
-      if (next.length !== queue.pending.length) {
-        await writeDurableJson(queuePath, { schemaVersion: 1, pending: next })
+      const receipts = [...(queue.settledReceipts ?? [])]
+      if (!receipts.some((row) => row.requestId === requestId)) {
+        receipts.push({ requestId, at: Date.now() })
+      }
+      if (next.length !== queue.pending.length || receipts.length !== (queue.settledReceipts?.length ?? 0)) {
+        await writeDurableJson(queuePath, {
+          schemaVersion: 1,
+          pending: next,
+          settledReceipts: receipts,
+        })
       }
     })
 
@@ -287,13 +312,17 @@ export function createDelegateEngineBillingClient(args?: {
       try {
         await post(SETTLE_PATH, billing)
         await dropSettled(billing.requestId)
-        await emitDelegateEngineBillingSettled(billing, args?.onSettled)
       } catch (err) {
         // Same durable-boundary pattern as Auto-Dream: persist then retry.
         // UNIQUE(user_id, request_id) makes a later successful POST idempotent.
         await persistBilling(billing)
         scheduleRetry()
         throw err
+      }
+      try {
+        await emitDelegateEngineBillingSettled(billing, args?.onSettled)
+      } catch {
+        // Authoritative 2xx already recorded; consult projection retries from settledReceipts.
       }
     },
     async abandon(requestId) {
@@ -310,20 +339,49 @@ export function createDelegateEngineBillingClient(args?: {
           return
         }
         const remaining: DurableCodexBilling[] = []
+        const receipts = [...(queue.settledReceipts ?? [])]
         for (const billing of queue.pending) {
           try {
             await post(SETTLE_PATH, billing)
-            await emitDelegateEngineBillingSettled(billing, args?.onSettled)
+            if (!receipts.some((row) => row.requestId === billing.requestId)) {
+              receipts.push({ requestId: billing.requestId, at: Date.now() })
+            }
+            try {
+              await emitDelegateEngineBillingSettled(billing, args?.onSettled)
+            } catch {
+              /* 2xx receipt kept; consult projection is retried from settledReceipts */
+            }
           } catch {
             remaining.push(billing)
           }
         }
-        await writeDurableJson(queuePath, { schemaVersion: 1, pending: remaining })
+        await writeDurableJson(queuePath, {
+          schemaVersion: 1,
+          pending: remaining,
+          settledReceipts: receipts,
+        })
         if (remaining.length > 0) {
           scheduleRetry()
           throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
         }
         clearRetry()
+      })
+    },
+    async projectConsults(store: AdvisorConsultStore) {
+      return withQueueLock(async () => {
+        const queue = await readBillingQueue(queuePath)
+        const kept: BillingSettledReceipt[] = []
+        for (const rec of queue.settledReceipts ?? []) {
+          const updated = store.markSettledFromBilling(rec.requestId)
+          if (updated.length === 0) kept.push(rec)
+        }
+        if (kept.length !== (queue.settledReceipts?.length ?? 0)) {
+          await writeDurableJson(queuePath, {
+            schemaVersion: 1,
+            pending: queue.pending,
+            settledReceipts: kept,
+          })
+        }
       })
     },
   }

@@ -106,7 +106,8 @@ import { parseCreditBudgetFen } from './creditExhaustion.js'
 import {
   CONSULT_INVOCATION_HEADER,
   DELEGATE_CONTEXT_HEADER,
-  isConsultTurnClaims,
+  hashConsultTurnToken,
+  inspectConsultTurnToken,
   verifyDelegateContextToken,
 } from './delegateContext.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
@@ -511,7 +512,6 @@ import {
   defaultDelegateEngineBilling,
   mapDelegateEngineBillingError,
   resolveDelegateEngineBillingEngine,
-  setDelegateEngineBillingSettledHook,
   shouldAdmitDelegateEngineBilling,
   type DelegateEngineBillingAdmission,
   type DelegateEngineBillingClient,
@@ -12058,9 +12058,14 @@ export class Gateway {
 
   private advisorConsultStore(): AdvisorConsultStore {
     const store = (this._advisorConsults ??= new AdvisorConsultStore())
+    const billing = this._delegateEngineBilling ?? defaultDelegateEngineBilling
     if (!this._consultBillingHookBound) {
       this._consultBillingHookBound = true
-      setDelegateEngineBillingSettledHook((billing) => this._projectAdvisorConsultSettled(billing))
+      void billing.projectConsults?.(store).catch((err) => {
+        this.log.warn('advisor_consult_billing_projection_failed', {
+          err: String((err as Error)?.message ?? err),
+        })
+      })
     }
     return store
   }
@@ -12344,35 +12349,17 @@ export class Gateway {
     if (!question) return this.sendError(res, 400, 'question 必填')
     const contextRaw = req.headers[DELEGATE_CONTEXT_HEADER]
     const token = Array.isArray(contextRaw) ? contextRaw[0] : contextRaw
-    const claims = verifyDelegateContextToken(typeof token === 'string' ? token : undefined)
-    if (!claims || !isConsultTurnClaims(claims) || claims.collabMode !== 'advisor') {
+    const inspected = inspectConsultTurnToken(typeof token === 'string' ? token : undefined)
+    if (!inspected) {
       return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
     }
+    const claims = inspected.claims
     const invocationRaw = req.headers[CONSULT_INVOCATION_HEADER]
     const invocationId = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim()
     if (!invocationId || !/^[A-Za-z0-9:_-]{8,128}$/.test(invocationId)) {
       return this.sendError(res, 400, 'x-openclaude-consult-invocation required')
     }
-    const parent = this.sessions.getByKey(claims.sessionKey)
-    if (!parent || parent.agentId !== 'main' || parent._collabModeTurn !== 'advisor' || !parent._advisorTurn) {
-      return this.sendError(res, 409, '当前回合不是顾问模式，无法咨询')
-    }
-    if (!isAdvisorConsultParentEngine(parent.providerTag)) {
-      return this.sendError(res, 409, ADVISOR_CONSULT_PARENT_REASON)
-    }
-    if (parent._currentTurnKey !== claims.turnKey) {
-      const existing = this.advisorConsultStore().findByInvocation({
-        userId: String(parent.userId ?? ''),
-        originTurnKey: claims.turnKey,
-        invocationId,
-      })
-      if (!existing) {
-        return this.sendError(res, 409, '原回合已结束，不能再发起新的顾问咨询')
-      }
-      const presented = await this._presentExistingConsult({ record: existing, question, concern })
-      return this.sendJson(res, presented.status, presented.body)
-    }
-    const userId = String(parent.userId ?? this.getUserId(req) ?? '')
+    const userId = String(this.getUserId(req) ?? '')
     if (!userId) return this.sendError(res, 401, 'missing user')
     const store = this.advisorConsultStore()
     const existing = store.findByInvocation({
@@ -12381,8 +12368,31 @@ export class Gateway {
       invocationId,
     })
     if (existing) {
+      const receipt = hashConsultTurnToken(String(token))
+      if (existing.sessionKey !== claims.sessionKey || existing.configVersion !== claims.configVersion) {
+        return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+      }
+      if (existing.tokenReceipt && existing.tokenReceipt !== receipt) {
+        return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+      }
       const presented = await this._presentExistingConsult({ record: existing, question, concern })
       return this.sendJson(res, presented.status, presented.body)
+    }
+    if (!inspected.hmacOk) {
+      return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+    }
+    const parent = this.sessions?.getByKey(claims.sessionKey)
+    if (!parent || parent.agentId !== 'main' || parent._collabModeTurn !== 'advisor' || !parent._advisorTurn) {
+      return this.sendError(res, 409, '当前回合不是顾问模式，无法咨询')
+    }
+    if (!isAdvisorConsultParentEngine(parent.providerTag)) {
+      return this.sendError(res, 409, ADVISOR_CONSULT_PARENT_REASON)
+    }
+    if (parent._currentTurnKey !== claims.turnKey) {
+      return this.sendError(res, 409, '原回合已结束，不能再发起新的顾问咨询')
+    }
+    if (String(parent.userId ?? '') && String(parent.userId) !== userId) {
+      return this.sendError(res, 401, 'missing user')
     }
     const snap = parent.runner.getPartialSnapshot()
     const currentTools = snap.completedTools?.map((tool) => ({
@@ -12456,6 +12466,7 @@ export class Gateway {
       jobId: null,
       billingRequestId: null,
       state: 'accepted',
+      tokenReceipt: hashConsultTurnToken(String(token)),
     })
     if (inserted.reused) {
       const presented = await this._presentExistingConsult({

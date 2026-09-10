@@ -36,6 +36,7 @@ function sample(dir: string, over: Partial<AdvisorConsultRecord> = {}): AdvisorC
     state: 'accepted',
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    tokenReceipt: null,
     ...over,
   }
 }
