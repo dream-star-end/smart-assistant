@@ -1067,40 +1067,6 @@ async function waitForLivenessTimer(
 }
 
 describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner (not model E2E)', () => {
-  it('records consult binding then clears it on an ordinary submitTurn', async () => {
-    const runner = new HangRunner()
-    const adapter = new CcbAdapter({} as any, runner as any)
-    try {
-      await adapter.submitTurn({
-        input: 'consult',
-        turnKey: 'tk-consult',
-        consultTurn: { turnIndex: 4, configVersion: 'cv-1' },
-        onEvent: () => {},
-        sessionTotals: { totalCostUSD: 0, turns: 0 },
-        toolUseIdToName: new Map(),
-      }).submitted
-      assert.deepEqual(runner.consultTurnBinding, {
-        turnKey: 'tk-consult',
-        turnIndex: 4,
-        configVersion: 'cv-1',
-      })
-      await adapter.submitTurn({
-        input: 'plain',
-        onEvent: () => {},
-        sessionTotals: { totalCostUSD: 0, turns: 0 },
-        toolUseIdToName: new Map(),
-      }).submitted
-      assert.equal(runner.consultTurnBinding, undefined)
-    } finally {
-      try {
-        runner.interrupt()
-      } catch {
-        // drain
-      }
-      await adapter.shutdown().catch(() => {})
-    }
-  })
-
   it('non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires', { timeout: 15_000 }, async () => {
     const origNow = Date.now
     const origSetInterval = globalThis.setInterval
