@@ -427,6 +427,10 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     'delegate-wait': memoryProbe(['delegate-wait'], /delegate-wait requires/),
     delegate: memoryProbe(['delegate'], /OPENCLAUDE_DELEGATE_CONTEXT_FILE|delegate requires/),
     'request-review': memoryProbe(['request-review'], /OPENCLAUDE_DELEGATE_CONTEXT_FILE|request-review requires/),
+    'consult-advisor': memoryProbe(
+      ['consult-advisor', '--question', 'why red?'],
+      /OPENCLAUDE_DELEGATE_CONTEXT_FILE/,
+    ),
     'memory.retired': memoryProbe(['memory'], /子命令已退役/),
   },
   'oc-minimax': {
