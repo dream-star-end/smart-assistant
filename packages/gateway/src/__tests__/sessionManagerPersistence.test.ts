@@ -78,6 +78,15 @@ class FakeTurnRunner extends EventEmitter {
   isRunning = false;
   interruptCalls = 0;
   interruptResult = false;
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined;
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding;
+  }
 
   constructor(
     private readonly onSubmit: (runner: FakeTurnRunner, requestId?: string) => void,

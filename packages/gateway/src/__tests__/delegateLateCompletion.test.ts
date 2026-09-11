@@ -626,7 +626,15 @@ describe('SessionManager late delivery (OCV5-180 B1)', () => {
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now()
   isRunning = true
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
   private submitHandler: (runner: FakeCcbRunner) => void | Promise<void>
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
+  }
   constructor(onSubmit: (runner: FakeCcbRunner) => void | Promise<void>) {
     super()
     this.submitHandler = onSubmit

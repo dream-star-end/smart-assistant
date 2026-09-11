@@ -139,9 +139,18 @@ function makeConfigStub(): OpenClaudeConfig {
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now()
   submits = 0
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
     super()
+  }
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
   }
 
   interrupt(): boolean {
