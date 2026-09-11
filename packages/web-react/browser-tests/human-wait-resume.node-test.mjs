@@ -18,6 +18,10 @@ class Runner extends EventEmitter {
   lastActivityAt = Date.now();
   model = 'claude-opus-4-6';
   responses = [];
+  consultTurnBinding;
+  setConsultTurn(binding) {
+    this.consultTurnBinding = binding;
+  }
   async submit() {}
   sendPermissionResponse(requestId, response) {
     this.responses.push({ requestId, response });

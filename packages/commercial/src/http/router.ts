@@ -443,6 +443,10 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
   { re: /^\/api\/agents$/, label: '/api/agents' },
   { re: /^\/api\/collaboration-config$/, label: '/api/collaboration-config' },
+  // Advisor consult is container-local authenticated MCP (parent turn token +
+  // invocation). It is not a commercial browser/host proxy surface. All methods
+  // are denied for ordinary users so a leaked path cannot execute on the host.
+  { re: /^\/api\/agents\/advisor\/consult$/, label: '/api/agents/advisor/consult' },
   // /api/agents/:id GET/PUT/DELETE —— 读 host agent 元信息、改 model/persona、删 agent
   { re: /^\/api\/agents\/[^/]+$/, label: '/api/agents/:id' },
   // /api/agents/:id/persona GET/PUT —— 读/写 host agent CLAUDE.md

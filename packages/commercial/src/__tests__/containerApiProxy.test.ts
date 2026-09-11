@@ -100,6 +100,13 @@ describe('containerApiProxy', () => {
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/usage', 'GET'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/usage', 'POST'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/message', 'POST'), false)
+    for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']) {
+      assert.equal(
+        matchContainerApiProxyRoute('/api/agents/advisor/consult', method),
+        false,
+        `consult must not be commercially proxied (${method})`,
+      )
+    }
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer', 'GET'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer', 'POST'), true)
     assert.equal(
