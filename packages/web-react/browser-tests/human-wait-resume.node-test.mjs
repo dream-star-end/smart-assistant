@@ -85,7 +85,7 @@ test('Human wait: real PermissionCard click resumes the CCB adapter after twenty
           if (behavior === 'allow') {
             await page.getByRole('radio', { name: /继续/ }).click();
             await page.getByRole('button', { name: '提交', exact: true }).click();
-          } else await page.getByRole('button', { name: '跳过', exact: true }).click();
+          } else await page.getByRole('button', { name: '暂不回答，让它继续', exact: true }).click();
           await page.waitForFunction(() => document.querySelector('[data-testid="human-wait-result"]').textContent !== '等待作答');
           assert.equal(await page.getByTestId('human-wait-result').textContent(), '继续执行');
           assert.equal(adapter.waitingForUserInput, false);
