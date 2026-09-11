@@ -4958,6 +4958,9 @@ export class ChatSocket {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    collabMode?: "solo" | "advisor" | "team";
+    advisorModel?: string;
+    collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
@@ -4984,6 +4987,9 @@ export class ChatSocket {
       model: p.model,
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       teamMode: !!p.teamMode,
+      ...(p.collabMode ? { collabMode: p.collabMode } : {}),
+      ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
+      ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
       effortLevel: p.effortLevel ?? null,
       ...(p.contextTier ? { contextTier: p.contextTier } : {}),
     };
@@ -5020,6 +5026,9 @@ export class ChatSocket {
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
+      ...(p.collabMode ? { collabMode: p.collabMode } : {}),
+      ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
+      ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
       // Cursor Opus/Fable 上下文档位(300k/1m):master 逐 turn 收窄签名 descriptor 的窗口。
       ...(p.contextTier ? { contextTier: p.contextTier } : {}),
       ts: Date.now(),
@@ -5202,6 +5211,9 @@ export class ChatSocket {
       ...(routing.model ? { model: routing.model } : {}),
       ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
+      ...(routing.collabMode ? { collabMode: routing.collabMode } : {}),
+      ...(routing.advisorModel ? { advisorModel: routing.advisorModel } : {}),
+      ...(routing.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
@@ -5381,6 +5393,9 @@ export class ChatSocket {
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
+      ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
+      ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
     };
@@ -6005,6 +6020,9 @@ export class ChatSocket {
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
+      ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
+      ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
     };

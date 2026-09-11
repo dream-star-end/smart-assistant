@@ -11,7 +11,13 @@ import { createHmac } from 'node:crypto'
 import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import type { TLSSocket } from 'node:tls'
-import { matchCommercialContainerApiProxy } from '@openclaude/gateway'
+import {
+  COLLAB_BRIDGE_AGENT_HEADER,
+  COLLAB_BRIDGE_MODEL_HEADER,
+  COLLAB_BRIDGE_SESSION_HEADER,
+  COLLAB_BRIDGE_SESSION_ID_RE,
+  matchCommercialContainerApiProxy,
+} from '@openclaude/gateway'
 import { isPlatformContainerIp } from '../containerNet.js'
 import type { V3ContainerStatus, V3SupervisorDeps } from '../agent-sandbox/v3supervisor.js'
 import { V3_CONTAINER_PORT, getV3ContainerStatus } from '../agent-sandbox/v3supervisor.js'
@@ -35,6 +41,11 @@ const FORWARD_REQUEST_HEADERS = new Set(['accept', 'content-type', 'user-agent',
 
 const RESPONSE_HEADER_ALLOWLIST = new Set(['content-type', 'etag', 'last-modified'])
 
+export interface CollabSessionParentLookup {
+  agentId: string
+  modelId?: string
+}
+
 export interface ContainerApiProxyDeps {
   v3: V3SupervisorDeps
   bridgeSecret: string
@@ -44,6 +55,11 @@ export interface ContainerApiProxyDeps {
   rowToTarget?: typeof hostRowToTarget
   getStatus?: (uid: number) => Promise<V3ContainerStatus | null>
   httpRequestImpl?: typeof httpRequest
+  /** Master-owned collab parent. Missing/throw must fail closed; never hydrate tape. */
+  lookupCollabSessionParent?: (input: {
+    uid: bigint
+    sessionId: string
+  }) => Promise<CollabSessionParentLookup | null>
 }
 
 export function matchContainerApiProxyRoute(path: string, method: string): boolean {
@@ -72,11 +88,38 @@ async function readRequestBodyCapped(req: IncomingMessage): Promise<Buffer> {
   return total === 0 ? Buffer.alloc(0) : Buffer.concat(chunks, total)
 }
 
+function extractCollabSessionId(method: string, url: URL, body: Buffer): {
+  sessionId?: string
+  invalid: boolean
+} {
+  if (method === 'GET') {
+    if (!url.searchParams.has('sessionId')) return { invalid: false }
+    const raw = url.searchParams.get('sessionId') ?? ''
+    if (!raw) return { invalid: true }
+    if (!COLLAB_BRIDGE_SESSION_ID_RE.test(raw)) return { invalid: true }
+    return { sessionId: raw, invalid: false }
+  }
+  if (method === 'PUT' && body.length > 0) {
+    try {
+      const parsed = JSON.parse(body.toString('utf8')) as { sessionId?: unknown }
+      if (parsed.sessionId === undefined) return { invalid: false }
+      if (typeof parsed.sessionId !== 'string' || !COLLAB_BRIDGE_SESSION_ID_RE.test(parsed.sessionId)) {
+        return { invalid: true }
+      }
+      return { sessionId: parsed.sessionId, invalid: false }
+    } catch {
+      return { invalid: false }
+    }
+  }
+  return { invalid: false }
+}
+
 function buildBridgeHeaders(
   req: IncomingMessage,
   status: Pick<V3ContainerStatus, 'containerId'>,
   bridgeSecret: string,
   body: Buffer,
+  collabParent?: { sessionId: string; agentId: string; modelId?: string },
 ): Record<string, string> {
   const headers: Record<string, string> = {}
   for (const [k, v] of Object.entries(req.headers)) {
@@ -87,11 +130,17 @@ function buildBridgeHeaders(
     if (/[\r\n]/.test(value)) continue
     headers[k] = value
   }
-  // FORWARD_REQUEST_HEADERS deliberately excludes commercial auth material.
+  // FORWARD_REQUEST_HEADERS deliberately excludes commercial auth material
+  // and collab parent headers. Client-forged X-OpenClaude-Collab-* are dropped.
   headers['X-OpenClaude-Container-Id'] = String(status.containerId)
   headers['X-OpenClaude-Bridge-Nonce'] = createHmac('sha256', bridgeSecret)
     .update(String(status.containerId))
     .digest('hex')
+  if (collabParent) {
+    headers[COLLAB_BRIDGE_SESSION_HEADER] = collabParent.sessionId
+    headers[COLLAB_BRIDGE_AGENT_HEADER] = collabParent.agentId
+    if (collabParent.modelId) headers[COLLAB_BRIDGE_MODEL_HEADER] = collabParent.modelId
+  }
   headers['Accept-Encoding'] = 'identity'
   if (body.length > 0) headers['Content-Length'] = String(body.length)
   return headers
@@ -153,10 +202,11 @@ async function dispatchLocal(
   deps: ContainerApiProxyDeps,
   status: V3ContainerStatus,
   body: Buffer,
+  collabParent?: { sessionId: string; agentId: string; modelId?: string },
 ): Promise<void> {
   const host = req.headers.host ?? 'x.invalid'
   const reqUrl = new URL(req.url ?? '/', `http://${host}`)
-  const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body)
+  const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent)
   const requestImpl = deps.httpRequestImpl ?? httpRequest
 
   await new Promise<void>((resolve) => {
@@ -239,6 +289,7 @@ async function dispatchTunnel(
   deps: ContainerApiProxyDeps,
   status: V3ContainerStatus,
   body: Buffer,
+  collabParent?: { sessionId: string; agentId: string; modelId?: string },
 ): Promise<void> {
   if (!deps.tunnelDial || !deps.getHostById || !status.hostId || !status.dockerContainerId) {
     sendJsonError(res, 502, 'BAD_GATEWAY', 'remote dispatch unavailable', ctx.requestId)
@@ -259,7 +310,7 @@ async function dispatchTunnel(
   try {
     const host = req.headers.host ?? 'x.invalid'
     const reqUrl = new URL(req.url ?? '/', `http://${host}`)
-    const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body)
+    const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent)
     const params = new URLSearchParams(reqUrl.search)
     params.set('port', String(status.port))
     const pathAndQuery = `${reqUrl.pathname}?${params.toString()}`
@@ -358,11 +409,59 @@ export async function containerApiProxy(
     return
   }
 
+  let collabParent: { sessionId: string; agentId: string; modelId?: string } | undefined
+  if (rule.label === '/api/collaboration-config') {
+    const extracted = extractCollabSessionId(method, reqUrl, body)
+    if (extracted.invalid) {
+      sendJsonError(res, 400, 'BAD_SESSION_ID', 'invalid collaboration sessionId', ctx.requestId)
+      return
+    }
+    if (extracted.sessionId) {
+      if (!deps.lookupCollabSessionParent) {
+        sendJsonError(
+          res,
+          503,
+          'COLLAB_SESSION_LOOKUP_UNAVAILABLE',
+          'collaboration session lookup unavailable',
+          ctx.requestId,
+        )
+        return
+      }
+      let parent: CollabSessionParentLookup | null
+      try {
+        parent = await deps.lookupCollabSessionParent({ uid, sessionId: extracted.sessionId })
+      } catch (err) {
+        ctx.log.warn('container_api_proxy_collab_lookup_failed', {
+          uid: String(uid),
+          sessionId: extracted.sessionId,
+          error: (err as Error)?.message ?? String(err),
+        })
+        sendJsonError(
+          res,
+          503,
+          'COLLAB_SESSION_LOOKUP_FAILED',
+          'collaboration session lookup failed',
+          ctx.requestId,
+        )
+        return
+      }
+      if (!parent || typeof parent.agentId !== 'string' || !parent.agentId.trim()) {
+        sendJsonError(res, 404, 'SESSION_NOT_FOUND', 'session not found', ctx.requestId)
+        return
+      }
+      collabParent = {
+        sessionId: extracted.sessionId,
+        agentId: parent.agentId.trim(),
+        ...(parent.modelId ? { modelId: parent.modelId } : {}),
+      }
+    }
+  }
+
   ctx.log.info('container_api_proxy_dispatch', { uid: String(uid), route: rule.label })
   const remote = Boolean(status.hostId && deps.selfHostId && status.hostId !== deps.selfHostId)
   if (remote) {
-    await dispatchTunnel(req, res, ctx, deps, status, body)
+    await dispatchTunnel(req, res, ctx, deps, status, body, collabParent)
   } else {
-    await dispatchLocal(req, res, ctx, deps, status, body)
+    await dispatchLocal(req, res, ctx, deps, status, body, collabParent)
   }
 }

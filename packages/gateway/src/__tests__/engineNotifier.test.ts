@@ -598,6 +598,14 @@ describe('档 A InlinePush', () => {
     class FakeCcbRunner extends EventEmitter {
       isRunning = true
       writes: string[] = []
+      consultTurnBinding:
+        | { turnKey: string; turnIndex: number; configVersion: string }
+        | undefined
+      setConsultTurn(
+        binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+      ): void {
+        this.consultTurnBinding = binding
+      }
       async submit() {
         return
       }
@@ -628,6 +636,14 @@ describe('档 A InlinePush', () => {
       isRunning = true
       hasIngestedParentTurn = true
       lines: string[] = []
+      consultTurnBinding:
+        | { turnKey: string; turnIndex: number; configVersion: string }
+        | undefined
+      setConsultTurn(
+        binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+      ): void {
+        this.consultTurnBinding = binding
+      }
       submit() {
         return Promise.resolve()
       }
@@ -881,6 +897,14 @@ describe('R3 blocker regressions', () => {
       isRunning = true
       lastActivityAt = Date.now()
       writes = 0
+      consultTurnBinding:
+        | { turnKey: string; turnIndex: number; configVersion: string }
+        | undefined
+      setConsultTurn(
+        binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+      ): void {
+        this.consultTurnBinding = binding
+      }
       submit(): Promise<void> {
         return Promise.reject(new Error('submit rejected before user line'))
       }
@@ -1331,6 +1355,14 @@ describe('R3 blocker regressions', () => {
       isRunning = true
       hasIngestedParentTurn = false
       writes = 0
+      consultTurnBinding:
+        | { turnKey: string; turnIndex: number; configVersion: string }
+        | undefined
+      setConsultTurn(
+        binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+      ): void {
+        this.consultTurnBinding = binding
+      }
       submit(): Promise<void> {
         return Promise.reject(new Error('turn/start rejected before ingest'))
       }

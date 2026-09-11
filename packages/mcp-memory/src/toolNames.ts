@@ -18,6 +18,7 @@ export const MEMORY_MCP_TOOL_NAMES = [
   'delegate_tasks',
   'delegate_wait',
   'request_review',
+  'consult_advisor',
   'task_create',
   'task_update',
   'task_comment',

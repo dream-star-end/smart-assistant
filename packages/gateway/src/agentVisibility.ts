@@ -8,6 +8,7 @@
 export {
   HIDDEN_SYSTEM_AGENT_IDS,
   isHiddenSystemAgentId,
+  isTeamReviewExecution,
   filterUserVisibleAgentsForManagement,
   filterUserVisibleByAgentField,
   filterUserVisibleRoutesForManagement,

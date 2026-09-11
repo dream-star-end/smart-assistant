@@ -65,6 +65,69 @@ describe("AgentPicker 团队模式开关文案（知情同意）", () => {
   });
 });
 
+describe("AgentPicker 三态协作", () => {
+  it("onCollabModeChange 时渲染单人/顾问/团队三选一", async () => {
+    const onCollabModeChange = vi.fn();
+    renderPicker({ onCollabModeChange, collabMode: "solo" });
+    const advisor = await screen.findByRole("button", { name: /主模型不切换/ });
+    fireEvent.click(advisor);
+    expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
+  });
+
+  it("点顾问只走 onCollabModeChange，不再链式 onToggleTeamMode(false) 把 App 打回 solo", async () => {
+    const onCollabModeChange = vi.fn();
+    const onToggleTeamMode = vi.fn();
+    renderPicker({ onCollabModeChange, onToggleTeamMode, collabMode: "solo" });
+    fireEvent.click(await screen.findByRole("button", { name: /主模型不切换/ }));
+    expect(onCollabModeChange).toHaveBeenCalledTimes(1);
+    expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
+    expect(onToggleTeamMode).not.toHaveBeenCalled();
+  });
+
+  it("非 CCB 父引擎时顾问选项 disabled，点击不切换", async () => {
+    const onCollabModeChange = vi.fn();
+    renderPicker({
+      onCollabModeChange,
+      collabMode: "solo",
+      advisorConsultParents: ["ccb"],
+      parentEngine: "codex",
+      advisorConsultAllowed: false,
+      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+    });
+    const advisor = await screen.findByRole("button", { name: /一期仅 CCB/ });
+    expect(advisor).toBeDisabled();
+    fireEvent.click(advisor);
+    expect(onCollabModeChange).not.toHaveBeenCalled();
+  });
+
+  it("当前已选 CCB 时不因 GET allowed=false 禁用顾问", async () => {
+    const onCollabModeChange = vi.fn();
+    renderPicker({
+      onCollabModeChange,
+      collabMode: "solo",
+      advisorConsultParents: ["ccb"],
+      parentEngine: "ccb",
+      advisorConsultAllowed: false,
+      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+    });
+    const advisor = await screen.findByRole("button", { name: /主模型不切换/ });
+    expect(advisor).not.toBeDisabled();
+    fireEvent.click(advisor);
+    expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
+  });
+
+  it("顾问无可用型号时明示原因，不静默填 gpt-6-astra", async () => {
+    renderPicker({
+      onCollabModeChange: () => {},
+      collabMode: "advisor",
+      advisorModels: [],
+      advisorUnavailableReason: "顾问引擎尚未证明无工具隔离",
+    });
+    expect(await screen.findByText(/尚未证明无工具隔离/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("选择顾问型号")).toBeNull();
+  });
+});
+
 describe("AgentPicker capability readiness", () => {
   it("保留未就绪 Agent 供用户理解状态，但禁止选择执行", async () => {
     const onPick = vi.fn();

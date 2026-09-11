@@ -456,6 +456,22 @@ describe('handleLine — dispatch', () => {
     await h.cleanup()
   })
 
+  it('hermeticNoTools denies command/file reverse-RPC instead of acceptForSession', async () => {
+    const h = await makeHarness({ withFakeProc: true, hermeticNoTools: true })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: 'srv-deny',
+      method: 'item/commandExecution/requestApproval',
+      params: { command: 'rm -rf /' },
+    })
+    assert.equal(h.written.length, 1)
+    const reply = JSON.parse(h.written[0])
+    assert.equal(reply.id, 'srv-deny')
+    assert.equal(reply.result.decision, 'denied')
+    assert.equal(JSON.stringify(reply).includes('acceptForSession'), false)
+    await h.cleanup()
+  })
+
   it('auto-approves recognized codex permission requests for the session', async () => {
     const h = await makeHarness({ withFakeProc: true })
     feed(h.runner, {

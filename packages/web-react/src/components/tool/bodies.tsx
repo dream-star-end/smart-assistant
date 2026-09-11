@@ -956,6 +956,19 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
   );
 }
 
+function parseJsonObjectSafe(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
   const actions = useToolCardActions();
   if (op === "skill_save" || op === "skill_propose") {
@@ -1039,6 +1052,36 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
     } else {
       body = <KvList obj={input} />;
     }
+  } else if (op === "consult_advisor") {
+    const parsed = parseJsonObjectSafe(tool.outputJson ?? tool.output);
+    const advice = asStr(parsed?.advice) || asStr(parsed?.result) || "";
+    const model = asStr(parsed?.model) || asStr(parsed?.advisorModel) || asStr(input?.model);
+    const status = asStr(parsed?.status);
+    const err = asStr(parsed?.error);
+    const duration =
+      typeof parsed?.durationMs === "number"
+        ? parsed.durationMs
+        : typeof tool.durationMs === "number"
+          ? tool.durationMs
+          : null;
+    const usage = parsed?.usage;
+    body = (
+      <div className="mt-1.5 space-y-1.5 text-xs leading-relaxed text-fg">
+        <div className="text-muted">
+          {model ? `实际顾问型号 ${model}` : "实际顾问型号未随工具结果返回"}
+          {status ? ` · 状态 ${status}` : ""}
+          {duration != null ? ` · ${Math.round(duration)} ms` : " · 耗时未返回"}
+        </div>
+        {err && status && status !== "settled" ? <div className="text-danger">{err}</div> : null}
+        {advice ? <PromptBlock>{advice}</PromptBlock> : null}
+        {usage == null ? (
+          <div className="text-faint">顾问用量未随工具结果返回，主/顾问分项以账户用量明细为准。</div>
+        ) : (
+          <KvList obj={typeof usage === "object" && usage ? (usage as Record<string, unknown>) : { usage }} />
+        )}
+      </div>
+    );
+    suppressOutput = !!advice || !!status;
   } else {
     body = <KvList obj={input} />;
   }

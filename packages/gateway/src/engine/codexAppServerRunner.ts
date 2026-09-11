@@ -61,7 +61,11 @@ import {
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
 import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
-import { issueDelegateContextToken } from '../delegateContext.js'
+import { issueConsultTurnToken, issueDelegateContextToken } from '../delegateContext.js'
+import {
+  buildHermeticDenial,
+  isHermeticExecutionMethod,
+} from './codexHermeticPolicy.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
 import type {
@@ -1765,20 +1769,44 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  /** The app-server process is long-lived, so re-mint the caller binding for
-   * every logical turn while keeping the inherited file path stable. */
+  private consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
+  private pendingConsultRespawn = false
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    const prev = this.consultTurnBinding?.turnKey
+    this.consultTurnBinding = binding
+    if (binding && prev && prev !== binding.turnKey && this.proc) {
+      this.pendingConsultRespawn = true
+    }
+  }
+
+  /** The app-server process is long-lived. Advisor-mode parents mint a v2
+   * turn token; changing origin turnKey forces a respawn so MCP env cannot
+   * reread a later turn's file. */
   private refreshDelegateContext(): void {
     const file = this.cachedOverrides?.delegateContextFile
     if (!file) return
-    writeFileSync(
-      file,
-      `${issueDelegateContextToken({
-        agentId: this.opts.agentId,
-        sessionKey: this.opts.sessionKey,
-        depth: this.opts.delegationDepth ?? 0,
-      })}\n`,
-      { mode: 0o600 },
-    )
+    const consult = this.consultTurnBinding
+    const token = consult
+      ? issueConsultTurnToken({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          depth: this.opts.delegationDepth ?? 0,
+          turnKey: consult.turnKey,
+          turnIndex: consult.turnIndex,
+          collabMode: 'advisor',
+          configVersion: consult.configVersion,
+        })
+      : issueDelegateContextToken({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          depth: this.opts.delegationDepth ?? 0,
+        })
+    writeFileSync(file, `${token}\n`, { mode: 0o600 })
   }
 
   /** Cleanup helper shared by `shutdown()` and the proc close handler so
@@ -2132,13 +2160,17 @@ export class CodexAppServerRunner extends EventEmitter {
     // 走同一条“暂停当前 turn → 专用 Ask UI → 回写答案后续跑”的交互链，不能退回
     // busy 期间不可点击的 Markdown options 卡。与 multi-agent/telemetry 一样无条件
     // 注入，确保 platform context 构建失败走 naked launch 时仍可提问。
-    const requestUserInputArgs = ['-c', 'features.default_mode_request_user_input=true']
+    const requestUserInputArgs = this.opts.hermeticNoTools
+      ? []
+      : ['-c', 'features.default_mode_request_user_input=true']
     // Codex 0.144 can parse a model-authored apply_patch while its custom-tool
     // input is still arriving and emit cumulative structured
     // `item/fileChange/patchUpdated` snapshots. Without this feature the first
     // fileChange item is only visible after the complete patch has been
     // generated, which leaves large edits looking frozen for minutes.
-    const applyPatchStreamingArgs = ['-c', 'features.apply_patch_streaming_events=true']
+    const applyPatchStreamingArgs = this.opts.hermeticNoTools
+      ? []
+      : ['-c', 'features.apply_patch_streaming_events=true']
     // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
     // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
     // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
@@ -2770,6 +2802,18 @@ export class CodexAppServerRunner extends EventEmitter {
         // here become a JSON-RPC error frame back to codex.
         void this._handleChatgptAuthTokensRefresh(msg.id, msg.params)
         return
+      }
+      if (this.opts.hermeticNoTools && isHermeticExecutionMethod(msg.method)) {
+        const denial = buildHermeticDenial(msg.method)
+        if (denial) {
+          this.attemptHadToolOrPermission = true
+          log.info('codex app-server hermetic reverse-RPC denied', {
+            sessionKey: this.opts.sessionKey,
+            method: msg.method,
+          })
+          this.writeRaw(jsonRpcResult(msg.id, denial))
+          return
+        }
       }
       if (msg.method === 'item/tool/requestUserInput') {
         this.handleRequestUserInput(msg.id, msg.params)
@@ -3950,6 +3994,11 @@ export class CodexAppServerRunner extends EventEmitter {
       // A route-change shutdown above clears active turn state; restore this
       // queued turn's policy before the actual turn/start notifications arrive.
       this.currentCollabAgentPolicy = collabAgentPolicy
+      if (this.pendingConsultRespawn) {
+        this.pendingConsultRespawn = false
+        await this.shutdown()
+        this.shuttingDown = false
+      }
       await this.ensureSpawned(repoSnap, effectiveCwd)
       this.refreshDelegateContext()
 

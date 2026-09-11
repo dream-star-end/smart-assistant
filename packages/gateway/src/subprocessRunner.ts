@@ -34,7 +34,7 @@ import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
-import { issueDelegateContextToken } from './delegateContext.js'
+import { issueConsultTurnToken, issueDelegateContextToken } from './delegateContext.js'
 
 export { renderCcbGoalPrompt }
 
@@ -1622,6 +1622,7 @@ export class SubprocessRunner extends EventEmitter {
           // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
           // gateway-process env doesn't bleed into spawned CCBs.
           CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
+          ...(this.opts.hermeticNoTools ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
           // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
           // here to strip run_in_background from Bash/Agent/PowerShell tool
           // schemas (visibility band-aid for Opus 4.7 over-using background
@@ -2016,6 +2017,10 @@ export class SubprocessRunner extends EventEmitter {
       shouldRecycleForVisionCapability(this.spawnedExecutionDescriptor, runtime.descriptor)
     ) {
       // vision 决定 spawn-time prompt/upload fallback；长驻进程不能只靠 stdin env 热改。
+      await this.shutdown()
+    }
+    if (this.pendingConsultRespawn) {
+      this.pendingConsultRespawn = false
       await this.shutdown()
     }
     this.currentExecutionDescriptor = runtime.descriptor
@@ -2615,18 +2620,41 @@ export class SubprocessRunner extends EventEmitter {
     this.delegateContextFile = null
   }
 
+  private consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
+  private pendingConsultRespawn = false
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    const prev = this.consultTurnBinding?.turnKey
+    this.consultTurnBinding = binding
+    if (binding && prev && prev !== binding.turnKey && this.proc) {
+      this.pendingConsultRespawn = true
+    }
+  }
+
   /** Refresh caller binding at the actual turn boundary, not process spawn. */
   private refreshDelegateContext(): void {
     if (!this.delegateContextFile) return
-    writeFileSync(
-      this.delegateContextFile,
-      `${issueDelegateContextToken({
-        agentId: this.opts.agentId,
-        sessionKey: this.opts.sessionKey,
-        depth: this.opts.delegationDepth ?? 0,
-      })}\n`,
-      { mode: 0o600 },
-    )
+    const consult = this.consultTurnBinding
+    const token = consult
+      ? issueConsultTurnToken({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          depth: this.opts.delegationDepth ?? 0,
+          turnKey: consult.turnKey,
+          turnIndex: consult.turnIndex,
+          collabMode: 'advisor',
+          configVersion: consult.configVersion,
+        })
+      : issueDelegateContextToken({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          depth: this.opts.delegationDepth ?? 0,
+        })
+    writeFileSync(this.delegateContextFile, `${token}\n`, { mode: 0o600 })
   }
 
   /** Forward a fully-drained child exit only while that exact child still owns

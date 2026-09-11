@@ -141,6 +141,18 @@ import {
   writeTeamMode,
 } from "./lib/teamMode";
 import {
+  type CollabMode,
+  type CollabUiState,
+  EMPTY_COLLAB_UI,
+  advisorParentCapabilityAllowed,
+  collaborationPutBody,
+  docToUiState,
+  isStaleCollabEpoch,
+  recommendedAdvisorModel,
+  sendCollabFields,
+} from "./lib/collaborationConfig";
+
+import {
   clearSessionEffort,
   readSessionEffort,
   writeSessionEffort,
@@ -158,7 +170,7 @@ import {
 } from "./lib/productCapabilities";
 import { resolveTutorialAction } from "./lib/tutorialActions";
 import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
-import { api, apiErrorMessage } from "./lib/api";
+import { api, apiErrorMessage, ApiError } from "./lib/api";
 import { reportClientFriction } from "./lib/clientFriction";
 import {
   effectiveEffortModelId,
@@ -836,18 +848,162 @@ export function App() {
   // agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
   // 声明在 useSessionList 之后:setTeamMode/重读 effect 需要 activeId 定位当前会话。
   const [teamMode, setTeamModeState] = useState(() => readTeamModeForSession(activeId));
+  const [collabUi, setCollabUi] = useState<CollabUiState>(() => ({
+    ...EMPTY_COLLAB_UI,
+    mode: readTeamModeForSession(activeId) ? "team" : "solo",
+  }));
+  const collabMode = collabUi.mode;
+  const collabEpochRef = useRef(0);
+  const [collabAsDefault, setCollabAsDefault] = useState(false);
+  const [collabSaveError, setCollabSaveError] = useState<string | null>(null);
+  const applyCollabDoc = useCallback((doc: Parameters<typeof docToUiState>[0]) => {
+    const next = docToUiState(doc);
+    setCollabUi(next);
+    setTeamModeState(next.mode === "team");
+    setCollabSaveError(null);
+  }, []);
+  const persistCollab = useCallback(
+    async (mode: CollabMode, opts?: { advisorModel?: string | null; asDefault?: boolean }) => {
+      const epoch = ++collabEpochRef.current;
+      const previous = collabUi;
+      const parentEngineForGate =
+        models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine;
+      if (
+        mode === "advisor" &&
+        !advisorParentCapabilityAllowed({
+          parentEngine: parentEngineForGate,
+          advisorConsultParents: collabUi.advisorConsultParents,
+          advisorConsultAllowed: collabUi.advisorConsultAllowed,
+        })
+      ) {
+        const msg =
+          collabUi.advisorConsultParentReason ||
+          "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
+        setCollabSaveError(msg);
+        toast(msg, "error");
+        return;
+      }
+      const advisorModel =
+        mode === "advisor"
+          ? (opts?.advisorModel ?? collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
+          : null;
+      const asDefault = opts?.asDefault === true;
+      // Optimistic mode only; configVersion stays empty until the server returns it.
+      setCollabUi((cur) => ({ ...cur, mode, advisorModel, configVersion: "" }));
+      setTeamModeState(mode === "team");
+      writeTeamMode(activeId, mode === "team");
+      setCollabSaveError(null);
+      // useAuth.auth is null until authed; authRef always holds MemoryAuthSession.
+      if (demo || !auth) return;
+      const collabAuth = auth;
+      const identityEpoch = collabAuth.snapshot().epoch;
+      // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
+      // default-write path; first send persists against the minted session id.
+      if (!activeId && !asDefault) return;
+      if (activeId && sockRef.current) {
+        if (modelId) sockRef.current.setSessionModel(activeId, modelId);
+        const title =
+          sessions.find((session) => session.id === activeId)?.title || "新对话";
+        const ensured = await sockRef.current.ensureServerSession(activeId, agent.id, title);
+        if (!ensured) {
+          setCollabUi(previous);
+          setTeamModeState(previous.mode === "team");
+          const msg = "会话尚未创建成功，请检查网络后重试";
+          setCollabSaveError(msg);
+          toast(msg, "error");
+          return;
+        }
+      }
+      try {
+        const doc = await api.putCollaborationConfig(
+          collabAuth,
+          collaborationPutBody({
+            sessionId: activeId,
+            mode,
+            advisorModel,
+            expectedRev: collabUi.rev,
+            asDefault,
+          }),
+        );
+        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        applyCollabDoc(doc);
+      } catch (err) {
+        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (err instanceof ApiError && err.status === 409) {
+          try {
+            const fresh = await api.getCollaborationConfig(collabAuth, activeId);
+            if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            applyCollabDoc(fresh);
+            setCollabSaveError("配置已被更新，请确认后再选一次");
+            toast("协作配置有更新，已重新读取，请再选一次", "error");
+            return;
+          } catch (rereadErr) {
+            if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            const msg = apiErrorMessage(rereadErr, "协作配置冲突后重读失败");
+            setCollabUi(previous);
+            setTeamModeState(previous.mode === "team");
+            setCollabSaveError(msg);
+            toast(msg, "error");
+            return;
+          }
+        }
+        setCollabUi(previous);
+        setTeamModeState(previous.mode === "team");
+        const msg = apiErrorMessage(err, "协作配置保存失败");
+        setCollabSaveError(msg);
+        toast(msg, "error");
+      }
+    },
+    [activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
+  );
   const setTeamMode = useCallback(
     (enabled: boolean) => {
-      setTeamModeState(enabled);
-      writeTeamMode(activeId, enabled);
+      void persistCollab(enabled ? "team" : "solo");
     },
-    [activeId],
+    [persistCollab],
   );
-  // 切会话:按目标会话的 per-session 键重读(缺失回退全局默认)。activeId 为空(空会话态)
-  // 读全局默认;首条消息在 send 里把当前 intent 落地为该会话的 per-session 键。
+  const setCollabMode = useCallback(
+    (mode: CollabMode) => {
+      void persistCollab(mode, { asDefault: collabAsDefault });
+    },
+    [collabAsDefault, persistCollab],
+  );
+  // 切会话:服务端配置为权威。epoch 让慢 GET 不能覆盖后来的会话或用户点击。
   useEffect(() => {
-    setTeamModeState(readTeamModeForSession(activeId));
-  }, [activeId]);
+    const epoch = ++collabEpochRef.current;
+    const enabled = readTeamModeForSession(activeId);
+    setCollabUi((cur) => ({
+      ...EMPTY_COLLAB_UI,
+      mode: enabled ? "team" : "solo",
+      advisorModels: cur.advisorModels,
+      advisorUnavailableReason: cur.advisorUnavailableReason,
+      advisorConsultParents: cur.advisorConsultParents,
+      advisorConsultParentReason: cur.advisorConsultParentReason,
+    }));
+    setTeamModeState(enabled);
+    setCollabAsDefault(false);
+    // auth is null until login/boot getMe (useAuth). authRef always holds the
+    // MemoryAuthSession, including the anonymous epoch-0 object — do not GET on it.
+    if (demo || !auth) return;
+    const collabAuth = auth;
+    const identityEpoch = collabAuth.snapshot().epoch;
+    void api
+      .getCollaborationConfig(collabAuth, activeId)
+      .then((doc) => {
+        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        applyCollabDoc(doc);
+      })
+      .catch((err) => {
+        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
+        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        setCollabSaveError(apiErrorMessage(err, "协作配置读取失败"));
+      });
+  }, [activeId, applyCollabDoc, auth, demo]);
 
   // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
   // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
@@ -943,6 +1099,10 @@ export function App() {
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
       let sessionId = target?.sessionId ?? activeId;
       let createdSession: Session | null = null;
+      let modeForSend = collabMode;
+      let advisorModelForSend = collabUi.advisorModel;
+      let configVersionForSend = collabUi.configVersion;
+      let unavailableForSend = collabUi.advisorUnavailableReason;
       if (!sessionId) {
         sessionId = genWsSessionId();
         createdSession = {
@@ -957,14 +1117,67 @@ export function App() {
           // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
           ...(modelId ? { modelId } : {}),
         };
-        setSessions((c) => [createdSession!, ...c]);
-        setActiveId(sessionId);
         // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, teamMode);
+        writeTeamMode(sessionId, collabMode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
+        sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
+        if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
+        if (auth && (collabMode !== "solo" || collabAsDefault)) {
+          const collabAuth = auth;
+          const identityEpoch = collabAuth.snapshot().epoch;
+          const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+          if (!ensured) {
+            toast("会话尚未创建成功，请检查网络后重试", "error");
+            return;
+          }
+          try {
+            const doc = await api.putCollaborationConfig(
+              collabAuth,
+              collaborationPutBody({
+                sessionId,
+                mode: collabMode,
+                advisorModel:
+                  collabMode === "advisor"
+                    ? (collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
+                    : null,
+                expectedRev: collabUi.rev,
+                asDefault: collabAsDefault,
+              }),
+            );
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            applyCollabDoc(doc);
+            modeForSend = doc.session.mode;
+            advisorModelForSend = doc.session.advisorModel;
+            configVersionForSend = doc.session.configVersion;
+            unavailableForSend = doc.advisorUnavailableReason;
+          } catch (err) {
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            const msg = apiErrorMessage(err, "协作配置保存失败");
+            setCollabSaveError(msg);
+            toast(msg, "error");
+            return;
+          }
+        }
+        setSessions((c) => [createdSession!, ...c]);
+        setActiveId(sessionId);
+      }
+      const sendCollab = sendCollabFields({
+        agentId: agent.id,
+        mode: modeForSend,
+        advisorModel: advisorModelForSend,
+        configVersion: configVersionForSend,
+        advisorUnavailableReason: unavailableForSend,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
+        advisorConsultParents: collabUi.advisorConsultParents,
+        advisorConsultAllowed: collabUi.advisorConsultAllowed,
+        advisorConsultParentReason: collabUi.advisorConsultParentReason,
+      });
+      if (sendCollab.blockedReason) {
+        toast(sendCollab.blockedReason, "error");
+        return;
       }
       const materializedDraft =
         !createdSession && (
@@ -994,7 +1207,7 @@ export function App() {
       // 的支持集过滤(不支持 → null 发送,不硬塞)。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
-      const teamLeaderTurn = agent.id === "main" && teamMode;
+      const teamLeaderTurn = sendCollab.teamMode;
       sockRef.current?.send({
         sessId: sessionId,
         agentId: agent.id,
@@ -1010,6 +1223,13 @@ export function App() {
         imageEdit,
         replyTo,
         teamMode: teamLeaderTurn,
+        collabMode: sendCollab.collabMode,
+        ...(sendCollab.collabMode === "advisor"
+          ? {
+              advisorModel: sendCollab.advisorModel,
+              collabConfigVersion: sendCollab.collabConfigVersion,
+            }
+          : {}),
         // Cursor Opus/Fable 上下文档位:只在当前模型支持分档时随帧发送;其它模型不带该字段
         // (master 对非分档模型本就忽略,但不发送可以让路由快照/日志更干净)。
         ...(cursorModelSupportsContextTier(modelId) ? { contextTier } : {}),
@@ -1054,6 +1274,7 @@ export function App() {
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      auth,
       demo,
       user,
       agent,
@@ -1063,6 +1284,9 @@ export function App() {
       sessionEffort,
       contextTier,
       teamMode,
+      collabMode,
+      collabUi,
+      collabAsDefault,
       sessions,
       setSessions,
       setActiveId,
@@ -3262,6 +3486,13 @@ export function App() {
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
+          advisorModeActive={!demo && collabMode === "advisor" && agent.id === "main"}
+          advisorModelLabel={
+            collabMode === "advisor" && agent.id === "main"
+              ? collabUi.advisorModel
+              : undefined
+          }
+          onDisableAdvisorMode={() => setCollabMode("solo")}
           credits={demo ? null : (user?.credits ?? null)}
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
@@ -3594,7 +3825,26 @@ export function App() {
         current={agent}
         auth={demo ? null : auth}
         teamMode={teamMode}
+        collabMode={collabMode}
+        advisorModels={collabUi.advisorModels}
+        advisorModel={collabUi.advisorModel}
+        advisorUnavailableReason={collabUi.advisorUnavailableReason}
+        advisorConsultParents={collabUi.advisorConsultParents}
+        advisorConsultParentReason={collabUi.advisorConsultParentReason}
+        advisorConsultAllowed={collabUi.advisorConsultAllowed}
+        parentEngine={models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine}
+        collabSaveError={collabSaveError}
+        asDefault={collabAsDefault}
+        onAsDefaultChange={demo ? undefined : setCollabAsDefault}
         onToggleTeamMode={demo ? undefined : setTeamMode}
+        onCollabModeChange={demo ? undefined : setCollabMode}
+        onAdvisorModelChange={
+          demo
+            ? undefined
+            : (id) => {
+                void persistCollab("advisor", { advisorModel: id, asDefault: collabAsDefault });
+              }
+        }
         onAddFromMarket={
           demo
             ? undefined

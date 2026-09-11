@@ -164,6 +164,8 @@ function makeRuntime(opts?: {
   journalAdmitted?: boolean
   agentMul?: string
   pricingGet?: (model: string) => ModelPricing | undefined
+  advisorRoute?: import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute | (() => Promise<import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute>)
+  advisorRouteThrow?: Error
 }) {
   const journals =
     opts?.journals ??
@@ -175,6 +177,8 @@ function makeRuntime(opts?: {
   const precheckCalls: unknown[] = []
   const pricingGets: string[] = []
   const authzCalls: Array<{ uid: bigint; requiredEpoch?: bigint }> = []
+  const advisorRouteCalls: unknown[] = []
+  const expireCalls: string[] = []
   let assertFreshCalls = 0
   let snapshot = opts?.snapshot ?? defaultSnapshot()
   const runtime = createDelegateEngineBillingRuntime({
@@ -245,6 +249,20 @@ function makeRuntime(opts?: {
       abortCalls.push(requestId)
       return true
     },
+    createAdvisorCodexRoute: opts?.advisorRouteThrow
+      ? async (args) => {
+          advisorRouteCalls.push(args)
+          throw opts.advisorRouteThrow
+        }
+      : opts?.advisorRoute
+        ? async (args) => {
+            advisorRouteCalls.push(args)
+            return typeof opts.advisorRoute === 'function' ? opts.advisorRoute() : opts.advisorRoute!
+          }
+        : undefined,
+    expireAdvisorCodexRoute: async (token) => {
+      expireCalls.push(token)
+    },
     releasePreCheckFn: async (redis, reservation) => {
       releaseCalls.push({ redis, reservation })
       return true
@@ -260,6 +278,8 @@ function makeRuntime(opts?: {
     precheckCalls,
     pricingGets,
     authzCalls,
+    advisorRouteCalls,
+    expireCalls,
     get assertFreshCalls() {
       return assertFreshCalls
     },
@@ -287,6 +307,7 @@ describe('delegate engine-billing runtime', () => {
     })
     assert.equal(result.requestId, REQUEST_ID)
     assert.match(String(result.engineSessionId), /^oceng-[0-9a-f]{48}$/)
+    assert.equal('route' in result, false)
     const ctx = journalCalls[0] as {
       model: string
       ctxJson: Record<string, unknown>
@@ -910,5 +931,143 @@ describe('delegate engine-billing admit uses one fenced snapshot', () => {
     assert.equal(stillFrozen.input_per_mtok, 111n)
     assert.equal(stillFrozen.multiplier, '3.000')
     assert.notEqual(stillFrozen.input_per_mtok, later.billingPricingFor('gpt-5.6-sol')?.input_per_mtok)
+  })
+
+  it('advisor official_oauth returns kind metadata without a hardcoded loopback URL', async () => {
+    const { runtime, advisorRouteCalls, journalCalls } = makeRuntime({
+      advisorRoute: { kind: 'official_oauth', groupId: '9' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor', model: 'gpt-5.6-sol' }),
+    })
+    assert.deepEqual(result.route, { kind: 'official_oauth', groupId: '9' })
+    assert.equal(JSON.stringify(result).includes('18789'), false)
+    assert.equal((advisorRouteCalls[0] as { modelId: string; containerId: number }).modelId, 'gpt-5.6-sol')
+    assert.equal((advisorRouteCalls[0] as { containerId: number }).containerId, 7)
+    assert.equal((journalCalls[0] as { ctxJson: { advisorRouteKind: string } }).ctxJson.advisorRouteKind, 'official_oauth')
+  })
+
+  it('advisor api_relay stores the opaque token and expires it on abandon', async () => {
+    const token = 'cd'.repeat(32)
+    const { runtime, journals, expireCalls } = makeRuntime({
+      advisorRoute: {
+        kind: 'api_relay',
+        token,
+        modelProvider: 'api111',
+        providerName: 'Yunwu',
+        wireApi: 'responses',
+        preferredAuthMethod: 'apikey',
+        disableResponseStorage: true,
+      },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+    })
+    assert.equal((result.route as { kind: string }).kind, 'api_relay')
+    assert.equal((result.route as { token: string }).token, token)
+    assert.equal('baseUrl' in (result.route as object), false)
+    assert.equal(journals.get(REQUEST_ID)?.ctx.advisorRouteToken, token)
+    await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+      identity: IDENTITY,
+      body: { requestId: REQUEST_ID },
+    })
+    assert.deepEqual(expireCalls, [token])
+  })
+
+  it('advisor unavailable still returns the original requestId', async () => {
+    const { runtime, abortCalls, journalCalls } = makeRuntime({
+      advisorRoute: { kind: 'unavailable', reason: 'no_bound_codex_account' },
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.deepEqual(result.route, { kind: 'unavailable', reason: 'no_bound_codex_account' })
+    assert.equal(journalCalls.length, 1)
+    assert.equal(abortCalls.length, 0)
+  })
+
+  it('advisor official group mismatch returns unavailable with the original requestId', async () => {
+    const { selectAdvisorCodexAdmitRoute } = await import('../billing/advisorCodexAdmitRoute.js')
+    const { runtime, journalCalls, abortCalls, advisorRouteCalls } = makeRuntime({
+      advisorRoute: async () =>
+        selectAdvisorCodexAdmitRoute({
+          containerId: 11,
+          userId: 42n,
+          modelId: 'gpt-5.6-sol',
+          createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+          readBinding: async () => ({
+            codexAccountId: 53n,
+            userId: 42n,
+            state: 'active',
+            provider: 'codex',
+            accountStatus: 'active',
+            accountGroupId: 8n,
+          }),
+        }),
+    })
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    assert.deepEqual(result.route, { kind: 'unavailable', reason: 'bound_account_group_mismatch' })
+    assert.equal(journalCalls.length, 1)
+    assert.equal(abortCalls.length, 0)
+    assert.equal(advisorRouteCalls.length, 1)
+  })
+
+  it('advisor binding lookup throw after precheck releases reservation and does not journal', async () => {
+    const { selectAdvisorCodexAdmitRoute } = await import('../billing/advisorCodexAdmitRoute.js')
+    const { runtime, journalCalls, releaseCalls, abortCalls } = makeRuntime({
+      advisorRoute: async () =>
+        selectAdvisorCodexAdmitRoute({
+          containerId: 11,
+          userId: 42n,
+          modelId: 'gpt-5.6-sol',
+          createRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+          readBinding: async () => {
+            throw new Error('binding lookup failed')
+          },
+        }),
+    })
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+        }),
+      /ROUTE_UNAVAILABLE/,
+    )
+    assert.equal(journalCalls.length, 0)
+    assert.equal(releaseCalls.length, 1)
+    assert.equal(abortCalls.length, 0)
+  })
+
+  it('advisor selector throw after precheck releases reservation and does not journal', async () => {
+    const { runtime, journalCalls, releaseCalls, abortCalls } = makeRuntime({
+      advisorRouteThrow: new Error('db down'),
+    })
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: admitBody({ agentId: 'advisor', delegateAgentId: 'advisor' }),
+        }),
+      /ROUTE_UNAVAILABLE/,
+    )
+    assert.equal(journalCalls.length, 0)
+    assert.equal(releaseCalls.length, 1)
+    assert.equal(abortCalls.length, 0)
   })
 })

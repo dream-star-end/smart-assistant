@@ -5261,6 +5261,36 @@ async function _sqliteGetClientSession(
   }
 }
 
+/** Lightweight parent identity for collaboration-config. Never selects messages/tape. */
+export type ClientSessionCollabParent = {
+  sessionId: string
+  userId: string
+  agentId: string
+  modelId?: string
+}
+
+async function _sqliteGetClientSessionCollabParent(
+  sessionId: string,
+  userId: string,
+): Promise<ClientSessionCollabParent | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT id, user_id, agent_id, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessionId, userId) as {
+    id: string
+    user_id: string
+    agent_id: string
+    model_id: string | null
+  } | undefined
+  if (!row) return null
+  return {
+    sessionId: row.id,
+    userId: row.user_id,
+    agentId: row.agent_id,
+    ...(row.model_id ? { modelId: row.model_id } : {}),
+  }
+}
+
 async function _sqliteClassifyClientSessions(
   refs: readonly ClientSessionLifecycleRef[],
 ): Promise<ClientSessionLifecycle[]> {
@@ -7191,6 +7221,7 @@ const sqliteBackend = {
   sweepUsageAggregationGc: _sqliteSweepUsageAggregationGc,
   listClientSessions: _sqliteListClientSessions,
   getClientSession: _sqliteGetClientSession,
+  getClientSessionCollabParent: _sqliteGetClientSessionCollabParent,
   classifyClientSessions: _sqliteClassifyClientSessions,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
@@ -7319,6 +7350,9 @@ export const listClientSessions: ClientSessionsBackend['listClientSessions'] =
 
 export const getClientSession: ClientSessionsBackend['getClientSession'] =
   (...args) => getActiveBackend().getClientSession(...args)
+
+export const getClientSessionCollabParent: ClientSessionsBackend['getClientSessionCollabParent'] =
+  (...args) => getActiveBackend().getClientSessionCollabParent(...args)
 
 export const classifyClientSessions: ClientSessionsBackend['classifyClientSessions'] =
   (...args) => getActiveBackend().classifyClientSessions(...args)

@@ -56,6 +56,30 @@ describe("imageView 缩略图最小显示尺寸", () => {
   });
 });
 
+describe("consult_advisor 卡", () => {
+  test("保留型号/状态/部分建议，未知用量不填 0", () => {
+    render(
+      <ToolBody
+        name="mcp__openclaude-memory__consult_advisor"
+        input={{ question: "why red?" }}
+        tool={tool({
+          output: JSON.stringify({
+            advice: "partial advice",
+            status: "failed",
+            advisorModel: "gpt-6-astra",
+            error: "failed",
+          }),
+        })}
+      />,
+    );
+    expect(screen.getByText(/实际顾问型号 gpt-6-astra/)).toBeInTheDocument();
+    expect(screen.getByText(/状态 failed/)).toBeInTheDocument();
+    expect(screen.getByText("partial advice")).toBeInTheDocument();
+    expect(screen.getByText(/用量未随工具结果返回/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/input_tokens["']?\s*[:=]\s*0/);
+  });
+});
+
 describe("imageGeneration 失败态", () => {
   test("status=failed → 生成失败 danger 行,绝不「图片已生成」", () => {
     render(

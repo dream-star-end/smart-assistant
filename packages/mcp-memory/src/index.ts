@@ -70,12 +70,15 @@ import {
 } from './delegateCursorFastPath.js'
 import { formatSendToAgentStart } from './sendToAgent.js'
 import {
+  CONSULT_INVOCATION_HEADER,
   describeDelegateTransportError,
   gatewayDelegateHeaders,
   gatewayBaseUrl,
   postJsonToGateway,
   readGatewayToken,
 } from './gatewayClient.js'
+import { resolveConsultInvocationId } from './consultInvocation.js'
+import { consultAdvisorUntilAdvice, formatConsultAdvisorToolPayload } from './consultAdvisorClient.js'
 import {
   askUserHttpTimeoutMs,
   askUserToolPostedFallback,
@@ -276,6 +279,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateWait(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
+      case 'consult_advisor':
+        return await handleConsultAdvisor(args as any, req)
       case 'task_create':
         return await handleTaskCreate(args as any)
       case 'task_update':
@@ -844,6 +849,42 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
       `[mcp-memory] ask_user gateway call failed: ${describeDelegateTransportError(err)}\n`,
     )
     return askUserToolPostedFallback()
+  }
+}
+
+async function handleConsultAdvisor(
+  args: { question?: string; concern?: string },
+  req: { params?: { _meta?: unknown }; id?: unknown },
+) {
+  const question = typeof args?.question === 'string' ? args.question.trim() : ''
+  if (!question) return toolError('question 必填')
+  const concern = typeof args?.concern === 'string' ? args.concern.trim() : ''
+  const invocation = resolveConsultInvocationId({
+    mcpMeta: req?.params?._meta,
+    jsonRpcId: req?.id,
+  })
+  if (!invocation.ok) return toolError(invocation.error)
+  const headers = {
+    ...gatewayDelegateHeaders(),
+    [CONSULT_INVOCATION_HEADER]: invocation.invocationId,
+  }
+  try {
+    const result = await consultAdvisorUntilAdvice({
+      post: () =>
+        postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
+          headers,
+          body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
+          timeoutMs: 10 * 60_000,
+        }),
+    })
+    const payload = formatConsultAdvisorToolPayload({
+      ok: result.ok,
+      text: result.text,
+      parsed: result.parsed,
+    })
+    return result.ok ? toolOk(payload) : toolError(payload)
+  } catch (err: unknown) {
+    return toolError(`consult_advisor transport: ${describeDelegateTransportError(err)}`)
   }
 }
 

@@ -93,6 +93,9 @@ export type UseChatSocket = {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    collabMode?: "solo" | "advisor" | "team";
+    advisorModel?: string;
+    collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
   }) => void;
   stop: (sessId: string) => void;

@@ -1,5 +1,5 @@
 import type { CursorContextTier } from "@openclaude/protocol";
-import { Bell, ChevronDown, Download, Menu, PanelLeft, PenSquare, Search, Users, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Download, Menu, PanelLeft, PenSquare, Search, ShieldCheck, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
@@ -28,6 +28,9 @@ export function ChatHeader({
   onModelPickerOpenChange,
   teamModeActive,
   onDisableTeamMode,
+  advisorModeActive,
+  advisorModelLabel,
+  onDisableAdvisorMode,
   credits,
   onOpenBilling,
   sidebarCollapsed,
@@ -71,6 +74,10 @@ export function ChatHeader({
   teamModeActive?: boolean;
   /** 关闭团队模式（直接翻转 App 的全局 flag；省略则 chip 弹层不渲染关闭按钮）。 */
   onDisableTeamMode?: () => void;
+  advisorModeActive?: boolean;
+  /** Frozen advisor model id from server config, not the chat model selector. */
+  advisorModelLabel?: string | null;
+  onDisableAdvisorMode?: () => void;
   /** 账户余额（积分字符串大数，来自 /api/me）。省略 / null 不渲染 pill。 */
   credits?: string | null;
   /** 点击 balance-pill 打开计费面板（省略则 pill 不可点）。 */
@@ -97,6 +104,7 @@ export function ChatHeader({
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
+  const [advisorPopoverOpen, setAdvisorPopoverOpen] = useState(false);
   const engineLabel = teamEngineLabel(models ?? []);
   return (
     <header
@@ -179,10 +187,52 @@ export function ChatHeader({
           {[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
         </button>
       ) : null}
-      {(teamModeActive || (models && onSelectModel)) && (
+      {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (
         <div className="order-last flex min-w-0 basis-full items-center gap-1 rounded-xl bg-hover/50 sm:order-none sm:flex-1 sm:basis-auto sm:bg-transparent" data-testid="chat-model-row">
           {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
               点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
+          {advisorModeActive && (
+            <Popover open={advisorPopoverOpen} onOpenChange={setAdvisorPopoverOpen}>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
+                  aria-label="顾问模式已开启"
+                  className="flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+                >
+                  <ShieldCheck size={11} className="shrink-0" />
+                  <span className="sm:hidden">顾问</span>
+                  <span className="hidden sm:inline">顾问模式</span>
+                  {advisorModelLabel ? (
+                    <span className="hidden max-w-[8rem] truncate sm:inline" title={advisorModelLabel}>
+                      · {advisorModelLabel}
+                    </span>
+                  ) : null}
+                </button>
+              </PopoverTrigger>
+              <PopoverContent>
+                <p className="text-[12.5px] leading-relaxed text-muted">
+                  顾问模式已开启：主模型不切换
+                  {advisorModelLabel ? `；本回合冻结顾问 ${advisorModelLabel}` : ""}
+                  。主模型可通过 consult_advisor 向无工具顾问提问；建议必须自行验证，不能替代审批或正式审查员。咨询按实际顾问型号计费，不承诺更省。
+                </p>
+                {onDisableAdvisorMode && (
+                  <Button
+                    data-product-control
+                    size="sm"
+                    variant="secondary"
+                    className="mt-2.5 w-full"
+                    onClick={() => {
+                      setAdvisorPopoverOpen(false);
+                      onDisableAdvisorMode();
+                    }}
+                  >
+                    关闭顾问模式
+                  </Button>
+                )}
+              </PopoverContent>
+            </Popover>
+          )}
           {teamModeActive && (
             <Popover open={teamPopoverOpen} onOpenChange={setTeamPopoverOpen}>
               <PopoverTrigger asChild>

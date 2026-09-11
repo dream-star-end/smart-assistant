@@ -20,6 +20,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 // request logger. master HTTP segment is the ONLY commercial path that reads
 // X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
 import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
+import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
@@ -441,6 +442,11 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // ─── host agent RCE 面 ───
   // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
   { re: /^\/api\/agents$/, label: '/api/agents' },
+  { re: /^\/api\/collaboration-config$/, label: '/api/collaboration-config' },
+  // Advisor consult is container-local authenticated MCP (parent turn token +
+  // invocation). It is not a commercial browser/host proxy surface. All methods
+  // are denied for ordinary users so a leaked path cannot execute on the host.
+  { re: /^\/api\/agents\/advisor\/consult$/, label: '/api/agents/advisor/consult' },
   // /api/agents/:id GET/PUT/DELETE —— 读 host agent 元信息、改 model/persona、删 agent
   { re: /^\/api\/agents\/[^/]+$/, label: '/api/agents/:id' },
   // /api/agents/:id/persona GET/PUT —— 读/写 host agent CLAUDE.md
@@ -1890,6 +1896,14 @@ export function createCommercialHandler(
               selfHostId: selfHostIdForProxy,
               getHostById: computePoolGetHostById,
               tunnelDial: defaultTunnelDial,
+              lookupCollabSessionParent: async ({ uid, sessionId }) => {
+                const row = await getClientSessionCollabParent(sessionId, `c:${uid.toString()}`)
+                if (!row) return null
+                return {
+                  agentId: row.agentId,
+                  ...(row.modelId ? { modelId: row.modelId } : {}),
+                }
+              },
             },
             BigInt(claims.sub),
           )

@@ -32,6 +32,15 @@ class FakeCcbRunner extends EventEmitter {
   model: string | undefined = "claude-opus-4-6";
   interrupts = 0;
   submitted: Array<{ input: unknown; requestId?: string }> = [];
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined;
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding;
+  }
 
   interrupt(): boolean {
     this.interrupts++;
@@ -875,5 +884,27 @@ describe("CcbAdapter turn parity", () => {
     runner.msg({ type: "system", subtype: "init" }); // parser 忽略的消息同样计活
     runner.msg(resultRow());
     assert.equal(activity, 3);
+  });
+
+  test("consult turn binding is recorded then cleared on an ordinary turn", async () => {
+    const { adapter, runner } = makeAdapter();
+    const events: EngineEvent[] = [];
+    const consult = beginTurn(adapter, events, {
+      turnKey: "turn-consult-1",
+      consultTurn: { turnIndex: 3, configVersion: "cfg-v1" },
+    });
+    await consult.submitted;
+    assert.deepEqual(runner.consultTurnBinding, {
+      turnKey: "turn-consult-1",
+      turnIndex: 3,
+      configVersion: "cfg-v1",
+    });
+    runner.msg(resultRow());
+    await consult.summary;
+    const ordinary = beginTurn(adapter, events);
+    await ordinary.submitted;
+    assert.equal(runner.consultTurnBinding, undefined);
+    runner.msg(resultRow());
+    await ordinary.summary;
   });
 });

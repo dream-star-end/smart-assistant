@@ -1,14 +1,24 @@
 {
   "capabilities": {
+    "advisor-mode": {
+      "contentHash": "c08d8eda8b105329900983c6b14c1885937ba9b2ddf5f652359d2523b1d95f90",
+      "contentVersion": 2,
+      "entryIdentityHash": "24e04eecd3a7f6cfa91bbc293f50dba69adca8cb28e06bbbaded5dbba129407a",
+      "mediaHash": "cd76d4e5d826c6da1b0cb941a27cbbfc9871fb031f69987899127460914889e4",
+      "mediaKey": "advisor-mode",
+      "mediaVersion": 2,
+      "registryHash": "d7b4dec4c98bf12dc0a8ddb1c6a35152df28156ed8ae34d1362a0a9c1c099747",
+      "sourceHash": "a8bda479ce0b1813765c41b4b4ce39722654b80ebdbb714534a98531d7990080"
+    },
     "agents": {
-      "contentHash": "5f3b1fe568b5ffd9ba9a11a53f6122986ffce9586ebae9f38843a360a725ff3c",
-      "contentVersion": 3,
-      "entryIdentityHash": "1c73e6f56e9cad70c754052b6bfa6c10578ef6b215a5e32f18497a791a6f42e2",
+      "contentHash": "f9adee3d39156abd3aa5beb353bfe217e6cb364b81c083ed7e46cd66e60242b8",
+      "contentVersion": 4,
+      "entryIdentityHash": "203b8e169a181478787d663f0f04737dedc8f7c3d0a1f04aeea9136c53f075bb",
       "mediaHash": "da9bdf2bc3b9ed42a1d43e524001916ed74f1b3a104a4a15173184e817964def",
       "mediaKey": "agents",
       "mediaVersion": 4,
       "registryHash": "94e8049f80ed0fcaca43608b1796cdd361d6f8dbb0fcb9a10b3e86121eb5aea6",
-      "sourceHash": "5095185b69fa8f5568b08e4729e5a592d11e317099c0abf67ad848a82a340b6a"
+      "sourceHash": "caf449b42fdf864fd12e2d5a7d13748c62e7254e7844ac4f8af16a57bf83975b"
     },
     "artifacts-download": {
       "contentHash": "3c4e0d07709579bddddd1309d257599c2d4a8aec7e2ba633c4d1480a19402e33",
@@ -221,14 +231,14 @@
       "sourceHash": "a93866a265b753179dbc697adaeefc0c9cb7dd313551e14de35f997005d3cbe4"
     },
     "team-mode": {
-      "contentHash": "6b41772fb4d300f8465551a9e7d48516cdbc45c36efda9d138395ce30509375f",
-      "contentVersion": 4,
-      "entryIdentityHash": "8523bda4824b3f48290dbb2e0529b26d373fdecba8bfdd64953a450443a82736",
+      "contentHash": "1045a1f7c4c205cafbb340dfdf9257289a01f8324ff35b83c3c971f07173dd28",
+      "contentVersion": 5,
+      "entryIdentityHash": "11e3b88adeeb011ea5fd19165c77e99ccd380bdce60e9cfdbab625b9b9fd7fb1",
       "mediaHash": "65c7d1266d9d4476c2751ae8d320a2c256e155293f4f8e591a479bd6b9def4eb",
       "mediaKey": "team-mode",
       "mediaVersion": 3,
       "registryHash": "b72bb329d18eb6d2bc79156b0b78af40408734514e3e711c176ae71a04c0132a",
-      "sourceHash": "f045008533591a5af0cf888f860e85425437910f1f81e27627dd0b779524d4dc"
+      "sourceHash": "6ea277f8675dd8afa5c8409bfc4daeb040dc8c337bc36937ce339596a509660f"
     },
     "voice-input": {
       "contentHash": "144229b18b8fdb8b87305b9d050c6b60245f0eeb110b4b3396da1aad19ac808e",
@@ -303,6 +313,20 @@
   },
   "catalogSchema": 2,
   "media": {
+    "advisor-mode": {
+      "caption": "在智能体选择器中选择顾问，并核对顶栏冻结的顾问型号。",
+      "codec": "VP8",
+      "durationSeconds": 4,
+      "height": 540,
+      "poster": "/tutorials/advisor-mode.webp",
+      "posterBytes": 28885,
+      "posterSha256": "ded2c4d41f66775eb2d45bbd25957daa806258bcaa34f4fa9942fd5dd7a08b77",
+      "version": 2,
+      "video": "/tutorials/advisor-mode.webm",
+      "videoBytes": 74934,
+      "videoSha256": "6c425fbc96048141c0ea16e23b6c356c95c1e3f3c42ea7a026a90666897c9402",
+      "width": 960
+    },
     "agents": {
       "caption": "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。",
       "codec": "VP8",

@@ -64,6 +64,7 @@ export const DELEGATE_JOB_KINDS = [
   'cron',
   'taskboard',
   'ccb_local',
+  'advisor',
 ] as const
 
 export type DelegateJobKind = (typeof DELEGATE_JOB_KINDS)[number]

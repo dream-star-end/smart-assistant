@@ -1,8 +1,9 @@
-import { Check, Loader2, Store, Users } from 'lucide-react'
+import { Check, Loader2, ShieldCheck, Store, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
+import { advisorParentCapabilityAllowed } from '../lib/collaborationConfig'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
@@ -24,20 +25,55 @@ export function AgentPicker({
   current,
   auth,
   teamMode = false,
+  collabMode,
+  advisorModels = [],
+  advisorModel,
+  advisorUnavailableReason,
+  advisorConsultParents = [],
+  advisorConsultParentReason,
+  advisorConsultAllowed,
+  parentEngine,
+  collabSaveError,
+  asDefault,
+  onAsDefaultChange,
   onClose,
   onPick,
   onAddFromMarket,
   onToggleTeamMode,
+  onCollabModeChange,
+  onAdvisorModelChange,
 }: {
   open: boolean
   current: Agent
   auth: AuthSession | null
   teamMode?: boolean
+  collabMode?: 'solo' | 'advisor' | 'team'
+  advisorModels?: Array<{ id: string; label: string; engine: string }>
+  advisorModel?: string | null
+  advisorUnavailableReason?: string
+  advisorConsultParents?: readonly string[]
+  advisorConsultParentReason?: string
+  advisorConsultAllowed?: boolean
+  parentEngine?: string | null
+  collabSaveError?: string | null
+  asDefault?: boolean
+  onAsDefaultChange?: (v: boolean) => void
   onClose: () => void
   onPick: (a: Agent) => void
   onAddFromMarket?: () => void
   onToggleTeamMode?: (v: boolean) => void
+  onCollabModeChange?: (mode: 'solo' | 'advisor' | 'team') => void
+  onAdvisorModelChange?: (id: string) => void
 }) {
+  const mode = collabMode ?? (teamMode ? 'team' : 'solo')
+  const advisorBlocked = !advisorParentCapabilityAllowed({
+    parentEngine,
+    advisorConsultParents,
+    advisorConsultAllowed,
+  })
+  const advisorBlockReason =
+    advisorConsultParentReason ||
+    '一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。'
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
   const [loading, setLoading] = useState(false)
 
@@ -112,7 +148,121 @@ export function AgentPicker({
           </span>
         </button>
 
-        {onToggleTeamMode && (
+        {onCollabModeChange ? (
+          <div className="flex flex-col gap-2 border-t border-accent/20 bg-surface/70 px-3.5 py-2.5">
+            <span className="text-meta font-semibold text-fg">协作方式</span>
+            <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+              <button
+                type="button"
+                data-product-feature="agents"
+                aria-pressed={mode === 'solo'}
+                onClick={() => onCollabModeChange('solo')}
+                className={cn(
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  mode === 'solo'
+                    ? "border-accent bg-accent-soft text-fg"
+                    : "border-border bg-surface text-muted hover:border-border-strong",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12.5px] font-semibold">单人</span>
+                <span className="mt-0.5 block text-[11px] leading-snug">主模型独立完成</span>
+              </button>
+              <button
+                type="button"
+                data-product-feature="advisor-mode"
+                data-product-control
+                aria-pressed={mode === 'advisor'}
+                disabled={advisorBlocked}
+                title={advisorBlocked ? advisorBlockReason : undefined}
+                onClick={() => {
+                  if (advisorBlocked) return
+                  onCollabModeChange('advisor')
+                }}
+                className={cn(
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-65",
+                  mode === 'advisor'
+                    ? "border-accent bg-accent-soft text-fg"
+                    : "border-border bg-surface text-muted hover:border-border-strong",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                  <ShieldCheck size={13} />
+                  顾问
+                </span>
+                <span className="mt-0.5 block text-[11px] leading-snug">
+                  {advisorBlocked ? advisorBlockReason : '主模型不切换；一期仅 CCB 主会话可咨询'}
+                </span>
+              </button>
+              <button
+                type="button"
+                data-product-feature="team-mode"
+                data-product-control
+                aria-pressed={mode === 'team'}
+                onClick={() => onCollabModeChange('team')}
+                className={cn(
+                  "rounded-lg border px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  mode === 'team'
+                    ? "border-accent bg-accent-soft text-fg"
+                    : "border-border bg-surface text-muted hover:border-border-strong",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                  <Users size={13} />
+                  团队
+                </span>
+                <span className="mt-0.5 block text-[11px] leading-snug">队长切 Astra 并委派已安装智能体</span>
+              </button>
+            </div>
+            {mode === 'team' && (
+              <span className="text-[11.5px] leading-snug text-muted">
+                开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
+              </span>
+            )}
+            {mode === 'advisor' && (
+              <div className="flex flex-col gap-1.5">
+                {advisorModels.length > 0 ? (
+                  <label className="text-[11.5px] leading-snug text-muted">
+                    顾问型号
+                    <select
+                      className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1 text-[12.5px] text-fg"
+                      value={advisorModel && advisorModels.some((row) => row.id === advisorModel) ? advisorModel : advisorModels[0].id}
+                      onChange={(e) => onAdvisorModelChange?.(e.target.value)}
+                      data-product-control
+                      aria-label="选择顾问型号"
+                    >
+                      {advisorModels.map((row) => (
+                        <option key={row.id} value={row.id}>
+                          {row.label}（{row.engine}）
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="text-[11.5px] leading-snug text-warning">
+                    {advisorUnavailableReason || "当前没有已证明无工具隔离的顾问型号，不能静默换模。"}
+                  </span>
+                )}
+                <span className="text-[11.5px] leading-snug text-muted">
+                  顾问无工具、不改文件、不替代审批或正式审查员。主模型必须用证据验证建议后再交付。咨询按实际顾问型号计费，不承诺更省。
+                </span>
+              </div>
+            )}
+            {onAsDefaultChange && (
+              <label className="flex items-center gap-2 text-[11.5px] text-muted">
+                <input
+                  type="checkbox"
+                  checked={!!asDefault}
+                  onChange={(e) => onAsDefaultChange(e.target.checked)}
+                  data-product-control
+                />
+                同时作为新会话默认（不改当前会话以外的覆盖）
+              </label>
+            )}
+            {collabSaveError && (
+              <span className="text-[11.5px] leading-snug text-danger">{collabSaveError}</span>
+            )}
+          </div>
+        ) : onToggleTeamMode ? (
           <div className="flex items-center justify-between gap-3 border-t border-accent/20 bg-surface/70 px-3.5 py-2.5">
             <span className="flex min-w-0 flex-col">
               <span className="flex items-center gap-1.5 text-meta font-semibold text-fg">
@@ -129,7 +279,7 @@ export function AgentPicker({
               aria-label="启用团队模式"
             />
           </div>
-        )}
+        ) : null}
       </div>
 
       {/* 其它已安装 agent + 市场入口 —— 2 列均匀网格 */}
