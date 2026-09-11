@@ -26,6 +26,7 @@ import {
 } from '../delegateContext.js'
 import { createDelegateEngineBillingClient, type DelegateEngineBillingAdmission } from '../delegateEngineBilling.js'
 import { DelegateJobStore } from '../delegateJobs.js'
+import { _setModelCatalogClientForTests } from '../modelCatalogClient.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
 
@@ -46,13 +47,73 @@ function restoreEnv(): void {
     else process.env[key] = ORIG_ENV[key]
   }
 }
+
+/** Minimal gpt-6-astra/codex catalog; same shape as collaborationConfigHttp.test.ts. */
+function advisorCatalogView() {
+  const models = [
+    {
+      modelId: 'glm-5.2',
+      displayName: 'GLM-5.2',
+      engine: 'ccb' as const,
+      providerId: 'ccb',
+      contextWindow: 200000,
+      supportedEfforts: ['high'],
+      supportsVision: false,
+      capabilityZero: false,
+      supportsThinking: true,
+      defaultEffort: 'high',
+      available: true,
+    },
+    {
+      modelId: 'gpt-6-astra',
+      displayName: 'GPT-6-Astra',
+      engine: 'codex' as const,
+      providerId: 'codex',
+      contextWindow: 200000,
+      supportedEfforts: [],
+      supportsVision: false,
+      capabilityZero: false,
+      supportsThinking: false,
+      defaultEffort: null,
+      available: true,
+    },
+  ]
+  return {
+    models,
+    projectionRevision: '1',
+    availabilityRevision: '1',
+    securityEpoch: '1',
+    canonicalize: (id: string) => id,
+    aliasEntries: () => [],
+    isRoutable: (id: string) => models.some((row) => row.modelId === id),
+    resolve: (id: string) => models.find((row) => row.modelId === id) ?? null,
+    engineOf: (id: string) => models.find((row) => row.modelId === id)?.engine ?? null,
+  }
+}
+
+async function withAdvisorCatalog<T>(fn: (calls: { routing: number }) => Promise<T>): Promise<T> {
+  const calls = { routing: 0 }
+  _setModelCatalogClientForTests({
+    getRoutingView: async () => {
+      calls.routing += 1
+      return advisorCatalogView()
+    },
+  } as never)
+  try {
+    return await fn(calls)
+  } finally {
+    _setModelCatalogClientForTests(null)
+  }
+}
 afterEach(() => {
   process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
   process.env.OC_ADVISOR_OPEN_ENGINES = 'codex'
   process.env.OC_MODEL_AUTHORITY = '0'
+  _setModelCatalogClientForTests(null)
 })
 after(() => {
   restoreEnv()
+  _setModelCatalogClientForTests(null)
   resetDelegateContextKeyForTests()
 })
 process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
@@ -377,33 +438,65 @@ describe('advisor consult route lifecycle', () => {
   })
 
   it('PUT advisor fails closed when catalog is unproven, without writing a model', async () => {
+    const prevOpen = process.env.OC_ADVISOR_OPEN_ENGINES
     process.env.OC_ADVISOR_OPEN_ENGINES = ''
-    const { gw } = await makeGateway()
-    const before = gw._advisorConfig.read()
-    const r = await http(gw, 'PUT', '/api/collaboration-config', {
-      mode: 'advisor',
-      advisorModel: 'gpt-6-astra',
-      expectedRev: 0,
-      asDefault: true,
-    })
-    assert.ok(r.status === 400 || r.status === 503, JSON.stringify(r.body))
-    assert.match(String(r.body.error), /尚未完成无工具证明|尚未证明|不可用|不在已证明/)
-    assert.equal(gw._advisorConfig.read().rev, before.rev)
-    assert.equal(gw._advisorConfig.read().defaultMode, 'solo')
+    try {
+      await withAdvisorCatalog(async (calls) => {
+        const { gw } = await makeGateway()
+        const before = gw._advisorConfig.read()
+        const listed = await http(gw, 'GET', '/api/collaboration-config', undefined)
+        assert.equal(listed.status, 200, JSON.stringify(listed.body))
+        assert.deepEqual(listed.body.advisorModels, [])
+        assert.match(String(listed.body.advisorUnavailableReason), /尚未完成无工具证明/)
+        assert.doesNotMatch(String(listed.body.advisorUnavailableReason ?? ''), /catalog unavailable/i)
+        const r = await http(gw, 'PUT', '/api/collaboration-config', {
+          mode: 'advisor',
+          advisorModel: 'gpt-6-astra',
+          expectedRev: 0,
+          asDefault: true,
+        })
+        assert.equal(r.status, 400, JSON.stringify(r.body))
+        assert.match(String(r.body.error), /尚未完成无工具证明/)
+        assert.doesNotMatch(String(r.body.error), /catalog unavailable/i)
+        assert.ok(calls.routing >= 1)
+        assert.equal(gw._advisorConfig.read().rev, before.rev)
+        assert.equal(gw._advisorConfig.read().defaultMode, 'solo')
+        assert.equal(gw._advisorConfig.read().defaultAdvisorModel, null)
+      })
+    } finally {
+      if (prevOpen === undefined) delete process.env.OC_ADVISOR_OPEN_ENGINES
+      else process.env.OC_ADVISOR_OPEN_ENGINES = prevOpen
+      _setModelCatalogClientForTests(null)
+    }
   })
 
   it('PUT unknown advisor model does not silently swap to listed[0]', async () => {
-    const { gw } = await makeGateway()
-    await gw._advisorConfig.markEngineProven('codex')
-    const r = await http(gw, 'PUT', '/api/collaboration-config', {
-      mode: 'advisor',
-      advisorModel: 'deepseek-v4-flash',
-      expectedRev: 1,
-      asDefault: true,
+    await withAdvisorCatalog(async (calls) => {
+      const { gw } = await makeGateway()
+      await gw._advisorConfig.markEngineProven('codex')
+      const afterProven = gw._advisorConfig.read()
+      const listed = await http(gw, 'GET', '/api/collaboration-config', undefined)
+      assert.equal(listed.status, 200, JSON.stringify(listed.body))
+      assert.deepEqual(
+        listed.body.advisorModels.map((row: { id: string }) => row.id),
+        ['gpt-6-astra'],
+      )
+      const r = await http(gw, 'PUT', '/api/collaboration-config', {
+        mode: 'advisor',
+        advisorModel: 'deepseek-v4-flash',
+        expectedRev: afterProven.rev,
+        asDefault: true,
+      })
+      assert.equal(r.status, 400, JSON.stringify(r.body))
+      assert.match(String(r.body.error), /deepseek-v4-flash/)
+      assert.match(String(r.body.error), /不在已证明/)
+      assert.doesNotMatch(String(r.body.error), /catalog unavailable/i)
+      assert.doesNotMatch(String(r.body.error), /尚未完成无工具证明/)
+      assert.ok(calls.routing >= 1)
+      assert.equal(gw._advisorConfig.read().rev, afterProven.rev)
+      assert.equal(gw._advisorConfig.read().defaultMode, 'solo')
+      assert.equal(gw._advisorConfig.read().defaultAdvisorModel, null)
     })
-    assert.ok(r.status === 400 || r.status === 503, JSON.stringify(r.body))
-    assert.match(String(r.body.error), /不在已证明|不可用|尚未证明/)
-    assert.equal(gw._advisorConfig.read().defaultAdvisorModel, null)
   })
 
   it('selfhost default identity can GET collaboration-config', async () => {
