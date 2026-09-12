@@ -89,10 +89,9 @@ export class StreamingToolExecutor {
    * Add a tool to the execution queue. Will start executing immediately if conditions allow.
    */
   addTool(block: ToolUseBlock, assistantMessage: AssistantMessage): void {
-    const noToolsEnabled = (this.toolDefinitions?.length ?? 0) === 0
-    if (isOpenClaudeAdvisorHermetic() || noToolsEnabled) {
+    if (isOpenClaudeAdvisorHermetic()) {
       console.error(
-        `[openclaude-advisor-hermetic] streaming reject ${block.name} id=${block.id} tools=${this.toolDefinitions?.length ?? 0}`,
+        `[openclaude-advisor-hermetic] OCV5-213-A5-HERMETIC addTool reject ${block.name} id=${block.id} file=${import.meta.url}`,
       )
       if (!this.toolUseContext.abortController.signal.aborted) {
         this.toolUseContext.abortController.abort('advisor_hermetic_no_tools')
