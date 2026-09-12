@@ -28,6 +28,7 @@ import type { DurableAgentGroup } from '@openclaude/protocol'
 
 import { resolveDelegateJobsDbPath } from './delegateDurable.js'
 import { DEFAULT_DELEGATE_JOB_TTL_MS, type DelegateJobSnapshot } from './delegateJobs.js'
+import { effectiveDelegateOutcome } from './delegateOutcome.js'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'delegate-inflight-surface' })
@@ -192,6 +193,9 @@ function publicView(row: SurfaceRow): InflightDelegateSurface {
     out.foldedGroup = bounded.group
     if (bounded.truncated) out.truncated = true
   }
+  // Compatibility read for old rows whose surface/group disagree. Do not
+  // rewrite the historical job or resurrect its old callback.
+  if (out.state === 'completed' && out.foldedGroup?.status === 'failed') out.state = 'failed'
   return out
 }
 
@@ -258,7 +262,7 @@ export function summaryGroupFromJob(
       : typeof job.failureDetail === 'string'
         ? job.failureDetail
         : ''
-  const ok = job.state === 'completed'
+  const ok = effectiveDelegateOutcome(job) === 'completed'
   return {
     runId: existing?.runId || defaultRunId(job.id),
     agentId: existing?.agentId || job.agentId,
@@ -825,7 +829,7 @@ export class DelegateInflightSurfaceStore {
       const folded = this.foldTerminal({
         jobId: job.id,
         group,
-        state: job.state,
+        state: effectiveDelegateOutcome(job),
         parentSessionKey: job.parentSessionKey,
         userId: job.callbackOriginUserId || row.userId,
         summaryOnly: true,

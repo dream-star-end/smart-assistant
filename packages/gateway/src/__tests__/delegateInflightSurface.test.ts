@@ -425,7 +425,7 @@ describe('blocker 2 — fence / monotonic CAS', () => {
     }
   })
 
-  it('maps complete(http 200, ok:false) to surface completed, not failed', async () => {
+  it('maps child failure to failed surface while retaining completed job settlement', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-r2-state-'))
     try {
       const jobsDb = new DelegateDurableDb(join(dir, 'delegate-jobs.db'))
@@ -466,10 +466,10 @@ describe('blocker 2 — fence / monotonic CAS', () => {
         group: group({ status: 'failed', resultSummary: 'child exploded' }),
         state: 'completed',
       })
-      assert.equal(surface.get(created.jobId)?.state, 'completed')
+      assert.equal(surface.get(created.jobId)?.state, 'failed')
       assert.equal(surface.get(created.jobId)?.foldedGroup?.status, 'failed')
       surface.projectJob(jobs.snapshotOf(created.jobId)!)
-      assert.equal(surface.get(created.jobId)?.state, 'completed')
+      assert.equal(surface.get(created.jobId)?.state, 'failed')
       assert.equal(surface.get(created.jobId)?.foldedGroup?.status, 'failed')
       surface.close()
       jobs.close()

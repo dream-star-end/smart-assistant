@@ -10,6 +10,7 @@ import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
+import { effectiveDelegateOutcome } from './delegateOutcome.js'
 import type {
   DelegateCallback,
   DelegateCallbackState,
@@ -25,7 +26,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 4
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 5
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -161,6 +162,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_delegate_jobs_idempotency
 CREATE INDEX IF NOT EXISTS idx_delegate_jobs_retired
   ON delegate_jobs(retired_at) WHERE retired_at IS NOT NULL;
 `
+
+/** No FK to delegate_jobs: runtime retirement/pruning must not delete unread failures. */
+const DDL_V5 = `
+ALTER TABLE delegate_jobs ADD COLUMN failure_inbox_enabled INTEGER NOT NULL DEFAULT 0
+  CHECK (failure_inbox_enabled IN (0, 1));
+CREATE TABLE delegate_failure_inbox (
+  job_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  user_id TEXT NOT NULL CHECK (length(user_id) > 0),
+  parent_session TEXT NOT NULL CHECK (length(parent_session) > 0),
+  child_session TEXT,
+  summary_code TEXT NOT NULL,
+  summary_text TEXT NOT NULL CHECK (length(summary_text) <= 256),
+  failed_at INTEGER NOT NULL,
+  ack_at INTEGER,
+  PRIMARY KEY (job_id, generation)
+);
+CREATE INDEX idx_delegate_failure_unacked
+  ON delegate_failure_inbox(user_id, failed_at DESC, job_id DESC, generation DESC)
+  WHERE ack_at IS NULL;
+`
+
+export type DelegateFailureCursor = { failedAt: number; jobId: string; generation: number }
+export type DelegateFailureInboxItem = {
+  jobId: string
+  generation: number
+  userId: string
+  parentSession: string
+  childSession: string | null
+  summaryCode: string
+  summaryText: string
+  failedAt: number
+  ackAt: number | null
+}
 
 export function resolveDelegateJobsDbPath(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim()
@@ -480,6 +515,7 @@ export class DelegateDurableDb {
       if (current < 2) this.addNotifyDeliveryColumns()
       if (current < 3) this.addNotifyAAttemptedColumn()
       if (current < 4) this.addRetiredAtColumn()
+      if (current < 5) this.db.exec(DDL_V5)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
@@ -535,7 +571,11 @@ export class DelegateDurableDb {
 
   upsert(record: DurableJobRecord): void {
     this.throwIfInjectedFailure()
-    this.upsertStmt.run(toRow(record))
+    this.transaction(() => {
+      this.upsertStmt.run(toRow(record))
+      const row = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id=?').get(record.id)
+      this.persistFailureInbox(row as Record<string, unknown>)
+    })
   }
 
   /**
@@ -545,6 +585,7 @@ export class DelegateDurableDb {
   insertCreate(
     record: DurableJobRecord,
     maxJobs: number,
+    opts: { failureInbox?: boolean } = {},
   ): { ok: true } | { error: 'capacity' } | { reused: DurableJobRecord } {
     this.throwIfInjectedFailure()
     return this.transaction(() => {
@@ -554,9 +595,11 @@ export class DelegateDurableDb {
       }
       const n = this.countNonTerminal()
       if (n >= maxJobs) return { error: 'capacity' as const }
+      if (opts.failureInbox && (!record.callbackOriginUserId?.trim() || !record.parentSessionKey?.trim())) {
+        throw new Error('delegate failure inbox requires verified owner and parent')
+      }
       try {
         this.insertStmt.run(toRow(record))
-        return { ok: true as const }
       } catch (err) {
         const code = (err as { code?: string }).code ?? ''
         if (code.startsWith('SQLITE_CONSTRAINT') && record.idempotencyKey) {
@@ -565,6 +608,13 @@ export class DelegateDurableDb {
         }
         throw err
       }
+      // Only an INSERT collision is reusable. An auxiliary write failure must
+      // roll back, not find this transaction's own row and misreport reuse.
+      if (opts.failureInbox) {
+        this.db.prepare('UPDATE delegate_jobs SET failure_inbox_enabled=1 WHERE job_id=?').run(record.id)
+        this.persistFailureInbox({ ...toRow(record), failure_inbox_enabled: 1 })
+      }
+      return { ok: true as const }
     })
   }
 
@@ -582,13 +632,78 @@ export class DelegateDurableDb {
     record: DurableJobRecord,
   ): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
-    const row = this.casUpdateStmt.get({
-      ...toRow(record),
-      expected_state: expected.state,
-      expected_epoch: expected.fencingEpoch,
-      expected_token: expected.claimToken ?? null,
-    }) as Record<string, unknown> | undefined
-    return row ? fromRow(row) : undefined
+    return this.transaction(() => {
+      const row = this.casUpdateStmt.get({
+        ...toRow(record),
+        expected_state: expected.state,
+        expected_epoch: expected.fencingEpoch,
+        expected_token: expected.claimToken ?? null,
+      }) as Record<string, unknown> | undefined
+      if (!row) return undefined
+      this.persistFailureInbox(row)
+      return fromRow(row)
+    })
+  }
+
+  /** Runs inside the winning job write transaction, before wake/onTerminal. */
+  private persistFailureInbox(row: Record<string, unknown>): void {
+    if (row.failure_inbox_enabled !== 1) return
+    const record = fromRow(row)
+    const outcome = effectiveDelegateOutcome(record)
+    if (outcome !== 'failed' && outcome !== 'killed_by_cutover') return
+    // Deliberately do not retain raw output/errors/credentials in the cross-session index.
+    const summaryCode = outcome === 'killed_by_cutover' ? 'killed_by_cutover' : 'delegate_failed'
+    const summaryText = outcome === 'killed_by_cutover' ? '子任务因服务切换中断' : '子任务失败，可展开详情'
+    this.db.prepare(`
+      INSERT INTO delegate_failure_inbox
+        (job_id, generation, user_id, parent_session, child_session, summary_code, summary_text, failed_at)
+      VALUES (@jobId, @generation, @userId, @parentSession, @childSession, @summaryCode, @summaryText, @failedAt)
+      ON CONFLICT(job_id, generation) DO NOTHING
+    `).run({
+      jobId: record.id, generation: record.generation,
+      userId: record.callbackOriginUserId ?? '', parentSession: record.parentSessionKey ?? '',
+      childSession: record.sessionKey ?? null, summaryCode, summaryText,
+      failedAt: record.terminalCommittedAt ?? record.lastActivityAt,
+    })
+  }
+
+  /** Indexed user-scoped inbox; independent of runtime TTL and surface cap. */
+  listUnacknowledgedFailures(
+    userId: string,
+    opts: { limit?: number; before?: DelegateFailureCursor } = {},
+  ): { items: DelegateFailureInboxItem[]; nextCursor: DelegateFailureCursor | null; count: number } {
+    if (!userId.trim()) throw new Error('failure inbox user required')
+    const limit = Math.min(50, Math.max(1, Number.isFinite(opts.limit) ? Math.floor(opts.limit!) : 20))
+    const before = opts.before
+    if (before && (!Number.isSafeInteger(before.failedAt) || !Number.isSafeInteger(before.generation) || !before.jobId)) {
+      throw new Error('invalid failure inbox cursor')
+    }
+    return this.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT * FROM delegate_failure_inbox
+        WHERE user_id=@userId AND ack_at IS NULL
+          ${before ? 'AND (failed_at, job_id, generation) < (@failedAt, @jobId, @generation)' : ''}
+        ORDER BY failed_at DESC, job_id DESC, generation DESC LIMIT @limit
+      `).all({ userId, limit: limit + 1, ...(before ?? {}) }) as Array<Record<string, unknown>>
+      const more = rows.length > limit
+      const items = rows.slice(0, limit).map(failureInboxFromRow)
+      const last = items.at(-1)
+      const count = (this.db.prepare(`SELECT count(*) AS n FROM delegate_failure_inbox
+        WHERE user_id=? AND ack_at IS NULL`).get(userId) as { n: number }).n
+      return { items, count, nextCursor: more && last
+        ? { failedAt: last.failedAt, jobId: last.jobId, generation: last.generation } : null }
+    })
+  }
+
+  /** Idempotent across tabs/restarts. Ownership comes from the inbox, not the expired job. */
+  acknowledgeFailure(userId: string, jobId: string, generation: number, now: number): boolean {
+    if (!userId.trim() || !Number.isSafeInteger(generation) || !Number.isSafeInteger(now)) {
+      throw new Error('invalid failure acknowledgement')
+    }
+    this.throwIfInjectedFailure()
+    return this.db.prepare(`UPDATE delegate_failure_inbox SET ack_at=COALESCE(ack_at, @now)
+      WHERE user_id=@userId AND job_id=@jobId AND generation=@generation
+      RETURNING job_id`).get({ userId, jobId, generation, now }) !== undefined
   }
 
   casDelete(expected: {
@@ -904,4 +1019,13 @@ function str(v: unknown): string | undefined {
 function num(v: unknown): number {
   const n = Number(v)
   return Number.isFinite(n) ? n : 0
+}
+
+function failureInboxFromRow(row: Record<string, unknown>): DelegateFailureInboxItem {
+  return {
+    jobId: String(row.job_id), generation: num(row.generation), userId: String(row.user_id),
+    parentSession: String(row.parent_session), childSession: str(row.child_session) ?? null,
+    summaryCode: String(row.summary_code), summaryText: String(row.summary_text),
+    failedAt: num(row.failed_at), ackAt: row.ack_at == null ? null : num(row.ack_at),
+  }
 }

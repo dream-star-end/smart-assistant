@@ -245,6 +245,8 @@ type JobEntry = {
 }
 
 export type DelegateJobStoreOptions = {
+  /** C0 groundwork: new-job inbox admission only; off until paired consumers ship. */
+  failureInbox?: boolean
   ttlMs?: number
   maxJobs?: number
   now?: () => number
@@ -345,6 +347,7 @@ export class DelegateJobStore {
   private readonly bootId: string
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
+  private readonly failureInbox: boolean
   private readonly onTerminal?: (job: DelegateJobSnapshot) => void
   private readonly onDrop?: (job: DelegateJobSnapshot) => void
   /**
@@ -373,6 +376,10 @@ export class DelegateJobStore {
     this.bootId = opts.bootId ?? `gw:${randomBytes(8).toString('hex')}`
     this.leaseMs = opts.leaseMs ?? 45_000
     this.durable = opts.durable ?? null
+    this.failureInbox = opts.failureInbox === true
+    if (this.failureInbox && (!this.durable || !this.sm)) {
+      throw new Error('delegate failure inbox requires durable state machine')
+    }
     this.onTerminal = opts.onTerminal
     this.onDrop = opts.onDrop
     if (this.durable && opts.hydrate !== false) this.hydrateFromDurable()
@@ -436,7 +443,9 @@ export class DelegateJobStore {
       terminalCommittedAt: null,
     }
     if (this.durable) {
-      const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs)
+      const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs, {
+        failureInbox: this.failureInbox && entry.kind === 'delegate',
+      })
       if ('error' in outcome) return { error: 'capacity' }
       if ('reused' in outcome) {
         this.ingestDurableRow(outcome.reused)
