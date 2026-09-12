@@ -17,6 +17,8 @@ import {
   formatAdvisorConsultPrompt,
   historyFromSessionMessages,
   listProvenAdvisorModels,
+  isAdvisorEngineOpen,
+  isCcbAdvisorModelProven,
   matchConsultIdentity,
   parentAuthorizedArtifactTexts,
   stripAdvisorPreambleFromInjected,
@@ -339,5 +341,34 @@ describe('advisorMode snapshot', () => {
     assert.match(closed.advisorUnavailableReason ?? '', /尚未完成无工具证明/)
     const open = listProvenAdvisorModels({ catalog, provenEngines: ['codex'] })
     assert.deepEqual(open.advisorModels, [{ id: 'gpt-6-astra', label: 'GPT-6 Astra', engine: 'codex' }])
+  })
+
+  it('env or provenEngines=ccb cannot list CCB models; MiniMax proof does not open GLM', () => {
+    const catalog = [
+      { modelId: 'MiniMax-M3', displayName: 'MiniMax', engine: 'ccb', providerId: 'minimax', available: true },
+      { modelId: 'glm-5.3-zai', displayName: 'GLM', engine: 'ccb', providerId: 'zai', available: true },
+      { modelId: 'gpt-6-astra', displayName: 'Astra', engine: 'codex', available: true },
+    ]
+    const bypass = listProvenAdvisorModels({ catalog, provenEngines: ['ccb'] })
+    assert.deepEqual(bypass.advisorModels, [])
+    assert.equal(isAdvisorEngineOpen('ccb', { OC_ADVISOR_OPEN_ENGINES: 'ccb' }, ['ccb']), false)
+    const one = listProvenAdvisorModels({
+      catalog,
+      provenEngines: ['ccb'],
+      provenCcbModels: [
+        { modelId: 'MiniMax-M3', providerId: 'minimax', profileVersion: 'ccb-advisor-v1' },
+      ],
+    })
+    assert.deepEqual(one.advisorModels, [
+      { id: 'MiniMax-M3', label: 'MiniMax', engine: 'ccb', providerId: 'minimax' },
+    ])
+    assert.equal(
+      isCcbAdvisorModelProven({
+        modelId: 'glm-5.3-zai',
+        providerId: 'zai',
+        provenCcbModels: [{ modelId: 'MiniMax-M3', providerId: 'minimax', profileVersion: 'ccb-advisor-v1' }],
+      }),
+      false,
+    )
   })
 })

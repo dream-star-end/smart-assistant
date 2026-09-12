@@ -109,6 +109,9 @@ export function consultAdvisorResultFromGateway(res: ConsultGatewayResponse): Co
   ) {
     return { kind: 'pending', parsed }
   }
+  if (parsed.status === 'completed') {
+    return { kind: 'error', text: 'consult completed without durable advice', parsed }
+  }
   if (parsed.status === 'settled') {
     return { kind: 'error', text: 'consult settled without durable advice', parsed }
   }

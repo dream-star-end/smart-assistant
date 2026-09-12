@@ -11,6 +11,11 @@ import {
   collabConfigVersionOf,
   isCollaborationMode,
 } from '@openclaude/protocol'
+import {
+  CCB_ADVISOR_PROFILE_VERSION,
+  parseProvenCcbModels,
+  type ProvenCcbAdvisorModel,
+} from './advisorMode.js'
 
 export const COLLAB_CONFIG_FORMAT = 1 as const
 
@@ -26,6 +31,7 @@ export type CollaborationConfigDoc = {
   defaultMode: CollaborationMode
   defaultAdvisorModel: string | null
   provenEngines: string[]
+  provenCcbModels: ProvenCcbAdvisorModel[]
   sessions: Record<string, SessionCollabConfig>
 }
 
@@ -45,6 +51,7 @@ const EMPTY: CollaborationConfigDoc = {
   defaultMode: 'solo',
   defaultAdvisorModel: null,
   provenEngines: [],
+  provenCcbModels: [],
   sessions: {},
 }
 
@@ -118,12 +125,19 @@ export function parseCollaborationConfigDoc(raw: unknown): CollaborationConfigDo
       provenEngines.push(item.trim())
     }
   }
+  let provenCcbModels: ProvenCcbAdvisorModel[]
+  try {
+    provenCcbModels = parseProvenCcbModels(rec.provenCcbModels)
+  } catch {
+    throw new CollaborationConfigError('CORRUPT', 'provenCcbModels invalid')
+  }
   return {
     format: COLLAB_CONFIG_FORMAT,
     rev: rec.rev as number,
     defaultMode: rec.defaultMode,
     defaultAdvisorModel,
     provenEngines,
+    provenCcbModels,
     sessions,
   }
 }
@@ -279,8 +293,42 @@ export class AdvisorConfigStore {
   async markEngineProven(engine: string): Promise<CollaborationConfigDoc> {
     const id = engine.trim()
     if (!id) throw new CollaborationConfigError('VALIDATION', 'engine invalid')
+    if (id === 'ccb') {
+      throw new CollaborationConfigError('VALIDATION', 'ccb advisors must be marked per model/provider')
+    }
     return this.mutate(undefined, (doc) => {
       if (!doc.provenEngines.includes(id)) doc.provenEngines = [...doc.provenEngines, id]
+      return doc
+    })
+  }
+
+  async markProvenCcbModel(input: {
+    modelId: string
+    providerId: string
+    profileVersion?: string
+  }): Promise<CollaborationConfigDoc> {
+    const modelId = input.modelId.trim()
+    const providerId = input.providerId.trim()
+    const profileVersion = input.profileVersion ?? CCB_ADVISOR_PROFILE_VERSION
+    if (!modelId || !providerId) {
+      throw new CollaborationConfigError('VALIDATION', 'ccb advisor model/provider invalid')
+    }
+    if (profileVersion !== CCB_ADVISOR_PROFILE_VERSION) {
+      throw new CollaborationConfigError('VALIDATION', 'ccb advisor profileVersion invalid')
+    }
+    return this.mutate(undefined, (doc) => {
+      const exists = doc.provenCcbModels.some(
+        (row) =>
+          row.modelId === modelId &&
+          row.providerId === providerId &&
+          row.profileVersion === CCB_ADVISOR_PROFILE_VERSION,
+      )
+      if (!exists) {
+        doc.provenCcbModels = [
+          ...doc.provenCcbModels,
+          { modelId, providerId, profileVersion: CCB_ADVISOR_PROFILE_VERSION },
+        ]
+      }
       return doc
     })
   }

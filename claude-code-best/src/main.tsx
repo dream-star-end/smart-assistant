@@ -190,7 +190,7 @@ import {
 import { getContextWindowForModel } from './utils/context.js';
 import { loadConversationForResume } from './utils/conversationRecovery.js';
 import { buildDeepLinkBanner } from './utils/deepLink/banner.js';
-import { hasNodeOption, isBareMode, isEnvTruthy, isInProtectedNamespace } from './utils/envUtils.js';
+import { hasNodeOption, isBareMode, isEnvTruthy, isInProtectedNamespace, isOpenClaudeAdvisorHermetic } from './utils/envUtils.js';
 import { refreshExampleCommands } from './utils/exampleCommands.js';
 import type { FpsMetrics } from './utils/fpsTracker.js';
 import { getWorktreePaths } from './utils/getWorktreePaths.js';
@@ -1864,19 +1864,21 @@ async function run(): Promise<CommanderCommand> {
       }
 
       // Parse the MCP config files/strings if provided
-      let dynamicMcpConfig: Record<string, ScopedMcpServerConfig> = {
-        // Built-in MCP servers (default disabled, user enables via /mcp)
-        'mcp-chrome': {
-          type: 'http',
-          url: 'http://127.0.0.1:12306/mcp',
-          scope: 'dynamic',
-          headers: {
-            Authorization: 'Bearer my-static-token',
-          },
-        },
-      };
+      let dynamicMcpConfig: Record<string, ScopedMcpServerConfig> = isOpenClaudeAdvisorHermetic()
+        ? {}
+        : {
+            // Built-in MCP servers (default disabled, user enables via /mcp)
+            'mcp-chrome': {
+              type: 'http',
+              url: 'http://127.0.0.1:12306/mcp',
+              scope: 'dynamic',
+              headers: {
+                Authorization: 'Bearer my-static-token',
+              },
+            },
+          };
 
-      if (mcpConfig && mcpConfig.length > 0) {
+      if (mcpConfig && mcpConfig.length > 0 && !isOpenClaudeAdvisorHermetic()) {
         // Process mcpConfig array
         const processedConfigs = mcpConfig.map(config => config.trim()).filter(config => config.length > 0);
 
@@ -1991,8 +1993,10 @@ async function run(): Promise<CommanderCommand> {
       // Store the explicit CLI flag so teammates can inherit it
       setChromeFlagOverride(chromeOpts.chrome);
       const enableClaudeInChrome =
+        !isOpenClaudeAdvisorHermetic() &&
         shouldEnableClaudeInChrome(chromeOpts.chrome) && (process.env.USER_TYPE === 'ant' || isClaudeAISubscriber());
-      const autoEnableClaudeInChrome = !enableClaudeInChrome && shouldAutoEnableClaudeInChrome();
+      const autoEnableClaudeInChrome =
+        !isOpenClaudeAdvisorHermetic() && !enableClaudeInChrome && shouldAutoEnableClaudeInChrome();
 
       if (enableClaudeInChrome) {
         const platform = getPlatform();
@@ -2077,7 +2081,12 @@ async function run(): Promise<CommanderCommand> {
       // `type: 'stdio'`. An enterprise-config ant with the GB gate on would
       // otherwise process.exit(1). Chrome has the same latent issue but has
       // shipped without incident; chicago places itself correctly.
-      if (feature('CHICAGO_MCP') && getPlatform() !== 'unknown' && !getIsNonInteractiveSession()) {
+      if (
+        !isOpenClaudeAdvisorHermetic() &&
+        feature('CHICAGO_MCP') &&
+        getPlatform() !== 'unknown' &&
+        !getIsNonInteractiveSession()
+      ) {
         try {
           const { getChicagoEnabled } = await import('src/utils/computerUse/gates.js');
           if (getChicagoEnabled()) {
@@ -2274,7 +2283,7 @@ async function run(): Promise<CommanderCommand> {
       // only explicit --mcp-config works. dynamicMcpConfig is spread onto
       // allMcpConfigs downstream so it survives this skip.
       const mcpConfigPromise = (
-        strictMcpConfig || isBareMode()
+        strictMcpConfig || isBareMode() || isOpenClaudeAdvisorHermetic()
           ? Promise.resolve({
               servers: {} as Record<string, ScopedMcpServerConfig>,
             })
@@ -2929,10 +2938,12 @@ async function run(): Promise<CommanderCommand> {
         `[STARTUP] MCP configs resolved in ${mcpConfigResolvedMs}ms (awaited at +${Date.now() - mcpConfigStart}ms)`,
       );
       // CLI flag (--mcp-config) should override file-based configs, matching settings precedence
-      const allMcpConfigs = {
-        ...existingMcpConfigs,
-        ...dynamicMcpConfig,
-      };
+      const allMcpConfigs = isOpenClaudeAdvisorHermetic()
+        ? {}
+        : {
+            ...existingMcpConfigs,
+            ...dynamicMcpConfig,
+          };
 
       // Separate SDK configs from regular MCP configs
       const sdkMcpConfigs: Record<string, McpSdkServerConfig> = {};

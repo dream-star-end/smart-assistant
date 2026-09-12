@@ -272,6 +272,7 @@ import {
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import {
   advisorPreamble,
+  advisorExecutionFromSnapshotJson,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
   formatAdvisorConsultPrompt,
@@ -279,15 +280,18 @@ import {
   ADVISOR_CONSULT_PARENT_REASON,
   advisorConsultParentGate,
   assertAdvisorModelAllowed,
+  CCB_ADVISOR_PROFILE_VERSION,
   coerceHistoryMessages,
   historyFromSessionMessages,
   isAdvisorConsultParentEngine,
   isAdvisorEngineOpen,
+  isCcbAdvisorModelProven,
   listProvenAdvisorModels,
   matchConsultIdentity,
   openAdvisorEngines,
   parentAuthorizedArtifactTexts,
   stripAdvisorPreambleFromInjected,
+  type AdvisorConsultExecution,
 } from './advisorMode.js'
 import { AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
 import {
@@ -12224,13 +12228,19 @@ export class Gateway {
   private _closeStaleConsult(
     record: import('./advisorConsultStore.js').AdvisorConsultRecord,
   ): import('./advisorConsultStore.js').AdvisorConsultRecord {
-    const terminal = new Set(['settled', 'settle_pending', 'failed', 'cancelled', 'admission_unknown'])
+    const terminal = new Set(['settled', 'settle_pending', 'completed', 'failed', 'cancelled', 'admission_unknown'])
     if (terminal.has(record.state)) return record
     if (this._consultStillLive(record)) return record
     const jobs = this._delegateJobs
     const view = record.jobId && jobs ? jobs.get(record.jobId) : undefined
     if (view && (view.status === 'running' || view.status === 'queued')) return record
     const advice = this._adviceFromConsult(record)
+    const ccb = advisorExecutionFromSnapshotJson(record.snapshotJson)?.engine === 'ccb'
+    if (ccb) {
+      const failed = view ? this._consultJobFailedState(view) : 'failed'
+      const state = failed ?? 'failed'
+      return this.advisorConsultStore().update(record.consultId, { state, advice: advice || null })
+    }
     if (view?.status === 'done' && !this._consultJobFailedState(view) && advice) {
       return this.advisorConsultStore().update(record.consultId, { state: 'settled', advice })
     }
@@ -12244,6 +12254,7 @@ export class Gateway {
     extra: Record<string, unknown> = {},
   ): Record<string, unknown> {
     const advice = this._adviceFromConsult(current)
+    const ccb = advisorExecutionFromSnapshotJson(current.snapshotJson)?.engine === 'ccb'
     return {
       status: current.state,
       consultId: current.consultId,
@@ -12254,6 +12265,7 @@ export class Gateway {
       advice: advice || undefined,
       reused: true,
       recoverable: true,
+      ...(current.state === 'completed' || ccb ? { billingMode: 'proxy' } : {}),
       error:
         current.state === 'failed' || current.state === 'cancelled'
           ? current.state
@@ -12284,13 +12296,14 @@ export class Gateway {
         },
       }
     }
-    const terminal = new Set(['settled', 'settle_pending', 'failed', 'cancelled'])
+    const terminal = new Set(['settled', 'settle_pending', 'completed', 'failed', 'cancelled'])
+    const ccbConsult = advisorExecutionFromSnapshotJson(record.snapshotJson)?.engine === 'ccb'
     const deadline = Date.now() + this._consultWaitMs()
     let current = record
     while (Date.now() <= deadline) {
       current = this.advisorConsultStore().findById(current.consultId) ?? current
       const advice = this._adviceFromConsult(current)
-      if (terminal.has(current.state) || advice) {
+      if (terminal.has(current.state) || (advice && !ccbConsult)) {
         return { status: 200, body: this._presentConsultBody(current) }
       }
       if (current.jobId) {
@@ -12311,7 +12324,7 @@ export class Gateway {
             ? view.body.advice
             : '')
         if (waitedAdvice || terminal.has(current.state)) {
-          if (waitedAdvice && !terminal.has(current.state)) {
+          if (waitedAdvice && !terminal.has(current.state) && !ccbConsult) {
             current = this.advisorConsultStore().update(current.consultId, {
               state: 'settled',
               advice: waitedAdvice,
@@ -12330,12 +12343,12 @@ export class Gateway {
       }
     }
     current = this.advisorConsultStore().findById(record.consultId) ?? record
-    if (terminal.has(current.state) || this._adviceFromConsult(current)) {
+    if (terminal.has(current.state) || (this._adviceFromConsult(current) && !ccbConsult)) {
       return { status: 200, body: this._presentConsultBody(current) }
     }
     if (!this._consultStillLive(current)) {
       current = this._closeStaleConsult(current)
-      if (terminal.has(current.state) || this._adviceFromConsult(current)) {
+      if (terminal.has(current.state) || (this._adviceFromConsult(current) && !ccbConsult)) {
         return { status: 200, body: this._presentConsultBody(current) }
       }
     }
@@ -12360,7 +12373,11 @@ export class Gateway {
       const collabDoc = this.advisorConfigStore().read()
       const proven = [...openAdvisorEngines(), ...(collabDoc.provenEngines ?? [])]
       const view = await getLocalCatalogView()
-      const listed = listProvenAdvisorModels({ catalog: view.models, provenEngines: proven })
+      const listed = listProvenAdvisorModels({
+        catalog: view.models,
+        provenEngines: proven,
+        provenCcbModels: collabDoc.provenCcbModels,
+      })
       const allowed = assertAdvisorModelAllowed({
         requested,
         advisorModels: listed.advisorModels,
@@ -12567,6 +12584,45 @@ export class Gateway {
       })
       return this.sendJson(res, presented.status, presented.body)
     }
+    const resolvedExec = await this._resolveAdvisorConsultExecution(frozen.advisorModel)
+    if (!resolvedExec.ok) {
+      releaseEarly()
+      store.update(inserted.record.consultId, { state: 'failed' })
+      return this.sendJson(res, resolvedExec.status, {
+        error: resolvedExec.error,
+        consultId: inserted.record.consultId,
+      })
+    }
+    snapshot.execution = resolvedExec.value
+    store.update(inserted.record.consultId, { snapshotJson: JSON.stringify(snapshot) })
+    if (resolvedExec.value.engine === 'ccb') {
+      if (!originIntact()) {
+        releaseEarly()
+        store.update(inserted.record.consultId, { state: 'cancelled' })
+        return this.sendJson(res, 409, { error: 'parent Stop', state: 'cancelled', consultId })
+      }
+      handedToSpawn = true
+      const spawned = await this._spawnCcbAdvisorConsult({
+        consultId: inserted.record.consultId,
+        parent,
+        originTurnKey: frozen.originTurnKey,
+        snapshot,
+        execution: resolvedExec.value,
+        abort,
+        unregister: unregisterEarly,
+      })
+      return this.sendJson(res, 200, {
+        status: spawned.state,
+        consultId: inserted.record.consultId,
+        jobId: spawned.jobId,
+        advice: spawned.advice,
+        advisorModel: frozen.advisorModel,
+        billingMode: 'proxy',
+        missing: snapshot.missing,
+        truncated: snapshot.truncated,
+        error: spawned.error,
+      })
+    }
     const proven = this.advisorConfigStore().read().provenEngines
     if (!isAdvisorEngineOpen('codex', process.env, proven)) {
       releaseEarly()
@@ -12734,6 +12790,343 @@ export class Gateway {
 
   private async _loadConsultHistoryTape(peerId: string, userId: string, turnKey: string) {
     return listTurnTapeRecords(peerId, userId, turnKey, 0, 80)
+  }
+
+  private async _resolveAdvisorConsultExecution(
+    advisorModel: string,
+  ): Promise<
+    | { ok: true; value: AdvisorConsultExecution }
+    | { ok: false; error: string; status: number }
+  > {
+    const store = this.advisorConfigStore().read()
+    if (!isModelAuthorityRequired()) {
+      const baked = resolveEngine(advisorModel, { id: ADVISOR_AGENT_ID })
+      if (baked === 'codex' && isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
+        return {
+          ok: true,
+          value: { modelId: advisorModel, engine: 'codex', providerId: 'codex' },
+        }
+      }
+    }
+    try {
+      const view = await getLocalCatalogView()
+      const row = view.resolve(view.canonicalize(advisorModel))
+      if (!row || row.available === false) {
+        return { ok: false, status: 400, error: '顾问型号不在当前 catalog' }
+      }
+      if (row.engine === 'ccb') {
+        const providerId = (row.providerId ?? '').trim()
+        if (
+          !isCcbAdvisorModelProven({
+            modelId: row.modelId,
+            providerId,
+            provenCcbModels: store.provenCcbModels,
+          })
+        ) {
+          return { ok: false, status: 503, error: '该 CCB 顾问型号尚未完成无工具证明' }
+        }
+        return {
+          ok: true,
+          value: {
+            modelId: row.modelId,
+            engine: 'ccb',
+            providerId,
+            profileVersion: CCB_ADVISOR_PROFILE_VERSION,
+          },
+        }
+      }
+      if (row.engine === 'codex') {
+        if (!isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
+          return { ok: false, status: 503, error: '顾问引擎尚未完成无工具证明，不能咨询' }
+        }
+        return {
+          ok: true,
+          value: {
+            modelId: row.modelId,
+            engine: 'codex',
+            providerId: (row.providerId ?? 'codex').trim() || 'codex',
+          },
+        }
+      }
+      return { ok: false, status: 409, error: '顾问型号引擎不是已证明的 Codex 或 CCB' }
+    } catch (err) {
+      // Authority mode: catalog failure is always fail-closed.
+      // Non-authority Codex already returned via baked resolveEngine above;
+      // CCB/unknown must not inherit a proven Codex engine.
+      return {
+        ok: false,
+        status: 503,
+        error: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
+      }
+    }
+  }
+
+  private async _spawnCcbAdvisorConsult(input: {
+    consultId: string
+    parent: AgentSession
+    originTurnKey: string
+    snapshot: ReturnType<typeof buildAdvisorSnapshot>
+    execution: AdvisorConsultExecution
+    abort?: AbortController
+    unregister?: (() => void) | null
+  }): Promise<{
+    state: string
+    advice: string
+    jobId?: string
+    error?: string
+  }> {
+    const consultStore = this.advisorConsultStore()
+    const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
+    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
+    const unregister =
+      input.unregister ?? this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
+    const abort = input.abort ?? new AbortController()
+    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
+    let slotHeld = false
+    let jobId: string | undefined
+    let jobs: DelegateJobStore | undefined
+    let advice = ''
+    let toolViolation = false
+    const cancelIfAborted = async (): Promise<{
+      state: string
+      advice: string
+      jobId?: string
+      error?: string
+    } | null> => {
+      const liveParent = this.sessions?.getByKey(input.parent.sessionKey)
+      const originGone =
+        abort.signal.aborted ||
+        !liveParent ||
+        liveParent._currentTurnKey !== input.originTurnKey
+      if (!originGone) return null
+      consultStore.update(input.consultId, {
+        state: 'cancelled',
+        advice: advice || null,
+      })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        const spawnFailFence =
+          spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : undefined
+        jobs.fail(jobId, {
+          failureClass: 'cancelled',
+          detail: 'parent Stop',
+          httpStatus: 409,
+          body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
+          nextState: 'cancelled',
+          ...(spawnFailFence ?? {}),
+        })
+      }
+      return { state: 'cancelled', advice, jobId, error: 'parent Stop' }
+    }
+    try {
+    const cfg = await this._getAgentsConfig()
+    const abortedBeforeSpawn = await cancelIfAborted()
+    if (abortedBeforeSpawn) return abortedBeforeSpawn
+    const sourceAgent =
+      cfg.agents.find((row) => row.id === 'main') ??
+      cfg.agents.find((row) => row.id === cfg.default)
+    if (!sourceAgent) throw new Error('advisor source agent missing')
+    const agent: AgentDef = {
+      ...sourceAgent,
+      id: ADVISOR_AGENT_ID,
+      model: input.execution.modelId,
+      provider: undefined,
+      runnerKind: undefined,
+      persona: undefined,
+      cwd: undefined,
+      mcpServers: [],
+      toolsets: [],
+    }
+    const execution = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'turn',
+      model: input.execution.modelId,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    const engine = execution?.engine ?? 'ccb'
+    if (engine !== 'ccb' || input.execution.engine !== 'ccb') {
+      throw new Error('顾问引擎未开放或型号不是已证明的 CCB 顾问')
+    }
+    jobs = this._ensureDelegateJobStore()
+    const gate = await this._waitForDelegateCapacity({
+      sessionKey: advisorSessionKey,
+      parentBucketKey: input.parent.sessionKey,
+      isReview: false,
+    })
+    if (gate.status !== 'ok') {
+      const state = gate.status === 'aborted' ? 'cancelled' : 'failed'
+      consultStore.update(input.consultId, { state })
+      return {
+        state,
+        advice: '',
+        error: `顾问资源闸未放行: ${gate.status}`,
+      }
+    }
+    slotHeld = true
+    const abortedAfterQueue = await cancelIfAborted()
+    if (abortedAfterQueue) return abortedAfterQueue
+    const created = jobs.create(ADVISOR_AGENT_ID, {
+      sessionKey: advisorSessionKey,
+      parentSessionKey: input.parent.sessionKey,
+      queued: false,
+      kind: 'advisor',
+      callback: 'stdout-wait',
+      idempotencyKey: input.consultId,
+    })
+    if ('error' in created) {
+      throw new Error('too many in-flight advisor jobs')
+    }
+    jobId = created.jobId
+    consultStore.update(input.consultId, { jobId, state: 'spawned' })
+    const abortedBeforeCreate = await cancelIfAborted()
+    if (abortedBeforeCreate) return abortedBeforeCreate
+    const session = await this.sessions.getOrCreate({
+      sessionKey: advisorSessionKey,
+      agent,
+      ...localExecutionOverride(execution),
+      channel: 'advisor',
+      peerId: input.parent.peerId,
+      userId: input.parent.userId,
+      hermeticNoTools: true,
+      advisorExecutionLock: input.execution,
+      usageAttribution: {
+        mode: 'delegate',
+        delegateAgentId: ADVISOR_AGENT_ID,
+        parentSessionId: input.parent.peerId,
+        parentTurnKey: input.originTurnKey,
+      },
+    })
+    const abortedAfterCreate = await cancelIfAborted()
+    if (abortedAfterCreate) return abortedAfterCreate
+    let error: string | undefined
+    let cancelCode: string | undefined
+    const originConsultId = input.consultId
+    const lockToolViolation = (): void => {
+      if (toolViolation) return
+      toolViolation = true
+      try {
+        session.runner.interrupt()
+      } catch {
+        /* interrupt is best-effort; finally still destroys the session */
+      }
+    }
+    try {
+      await this.sessions.submit(
+        session,
+        formatAdvisorConsultPrompt(input.snapshot),
+        (e) => {
+          const latest = consultStore.findById(originConsultId)
+          if (
+            latest &&
+            (latest.state === 'completed' ||
+              latest.state === 'failed' ||
+              latest.state === 'cancelled' ||
+              latest.originTurnKey !== input.originTurnKey)
+          ) {
+            return
+          }
+          if (e.kind === 'error') {
+            error = e.error
+            const code = (e as { errorCode?: string }).errorCode
+            if (code === 'USER_CANCELLED') cancelCode = code
+          }
+          if (toolViolation) return
+          const eventKind = (e as { kind?: string }).kind
+          if (eventKind === 'tool_use_detected' || eventKind === 'permission_request') {
+            lockToolViolation()
+            return
+          }
+          if (e.kind === 'block' && (e.block.kind === 'tool_use' || e.block.kind === 'tool_result')) {
+            lockToolViolation()
+            return
+          }
+          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
+        },
+        undefined,
+        input.execution.modelId,
+        undefined,
+        undefined,
+        undefined,
+        {
+          automaticRetryState: {
+            rootClientMessageId: input.consultId,
+            attempt: 0,
+            max: 0,
+          },
+        },
+      )
+    } catch (err) {
+      const code = (err as { errorCode?: string })?.errorCode
+      if (code === 'USER_CANCELLED') cancelCode = code
+      error = String((err as Error)?.message ?? err)
+    }
+    const cancelled =
+      !toolViolation && (cancelCode === 'USER_CANCELLED' || abort.signal.aborted)
+    const jobSnap = jobs.snapshotOf(jobId)
+    const fence =
+      jobSnap?.claimToken
+        ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
+        : undefined
+    if (cancelled) {
+      consultStore.update(input.consultId, { state: 'cancelled', advice: advice || null })
+      jobs.fail(jobId, {
+        failureClass: 'cancelled',
+        detail: 'parent Stop',
+        httpStatus: 409,
+        body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
+        nextState: 'cancelled',
+        ...(fence ?? {}),
+      })
+      return { state: 'cancelled', advice, jobId, error: 'parent Stop' }
+    }
+    if (toolViolation || error || !advice.trim()) {
+      const detail = toolViolation
+        ? '顾问发出了工具或权限事件，不能作为无工具完成'
+        : error || '顾问未返回非空建议'
+      consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
+      jobs.fail(jobId, {
+        failureClass: 'child_error',
+        detail,
+        httpStatus: 500,
+        body: { ok: false, error: detail, advice, consultId: input.consultId },
+        ...(fence ?? {}),
+      })
+      return { state: 'failed', advice, jobId, error: detail }
+    }
+    consultStore.update(input.consultId, { state: 'completed', advice })
+    jobs.complete(
+      jobId,
+      {
+        httpStatus: 200,
+        body: { ok: true, advice, consultId: input.consultId, billingMode: 'proxy' },
+      },
+      fence,
+    )
+    return { state: 'completed', advice, jobId }
+    } catch (err) {
+      const detail = String((err as Error)?.message ?? err)
+      consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        jobs.fail(jobId, {
+          failureClass: 'child_error',
+          detail,
+          httpStatus: 500,
+          body: { ok: false, error: detail, advice, consultId: input.consultId },
+          ...(spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : {}),
+        })
+      }
+      return { state: 'failed', advice, jobId, error: detail }
+    } finally {
+      this._advisorConsultAborts?.delete(advisorSessionKey)
+      unregister?.()
+      if (slotHeld) this._releaseDelegateSlot(slotOpts)
+      await this.sessions.destroySession(advisorSessionKey).catch(() => {})
+    }
   }
 
   private _advisorConsultRouteOverride(
@@ -13143,11 +13536,22 @@ export class Gateway {
     // uid-volume config; do not remap it onto another uid or treat it as anonymous.
     if (!userId) return this.sendError(res, 401, 'unauthorized')
     const store = this.advisorConfigStore()
-    const provenNow = () => [...openAdvisorEngines(), ...store.read().provenEngines]
+    const provenNow = () => {
+      const doc = store.read()
+      return {
+        provenEngines: [...openAdvisorEngines(), ...doc.provenEngines],
+        provenCcbModels: doc.provenCcbModels,
+      }
+    }
     const catalogOptions = async () => {
       try {
         const view = await getLocalCatalogView()
-        return listProvenAdvisorModels({ catalog: view.models, provenEngines: provenNow() })
+        const proven = provenNow()
+        return listProvenAdvisorModels({
+          catalog: view.models,
+          provenEngines: proven.provenEngines,
+          provenCcbModels: proven.provenCcbModels,
+        })
       } catch (err) {
         return {
           advisorModels: [] as Array<{ id: string; label: string; engine: string }>,

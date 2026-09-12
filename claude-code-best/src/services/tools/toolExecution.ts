@@ -61,6 +61,7 @@ import type {
 import { count } from '../../utils/array.js'
 import { createAttachmentMessage } from '../../utils/attachments.js'
 import { logForDebugging } from '../../utils/debug.js'
+import { isOpenClaudeAdvisorHermetic } from '../../utils/envUtils.js'
 import {
   AbortError,
   errorMessage,
@@ -370,6 +371,20 @@ export async function* runToolUse(
   toolUseContext: ToolUseContext,
 ): AsyncGenerator<MessageUpdateLazy, void> {
   const toolName = toolUse.name
+  // OpenClaude CCB advisor hermetic profile only. Do not treat empty tools
+  // as a substitute — ordinary CCB / Auto-Dream keep unknown-tool_result.
+  if (isOpenClaudeAdvisorHermetic()) {
+    logForDebugging(
+      `OpenClaude advisor hermetic rejected tool ${toolName}: ${toolUse.id}`,
+    )
+    console.error(
+      `[openclaude-advisor-hermetic] OCV5-213-A5-HERMETIC runToolUse reject ${toolName} id=${toolUse.id} file=${import.meta.url}`,
+    )
+    if (!toolUseContext.abortController.signal.aborted) {
+      toolUseContext.abortController.abort('advisor_hermetic_no_tools')
+    }
+    return
+  }
   // First try to find in the available tools (what the model sees)
   let tool = findToolByName(toolUseContext.options.tools, toolName)
 

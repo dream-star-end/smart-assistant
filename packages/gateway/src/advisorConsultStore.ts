@@ -17,6 +17,7 @@ export type AdvisorConsultState =
   | 'spawned'
   | 'settle_pending'
   | 'settled'
+  | 'completed'
   | 'failed'
   | 'cancelled'
 
@@ -289,7 +290,7 @@ export class AdvisorConsultStore {
 
   update(
     consultId: string,
-    patch: Partial<Pick<AdvisorConsultRecord, 'jobId' | 'billingRequestId' | 'state' | 'advice'>>,
+    patch: Partial<Pick<AdvisorConsultRecord, 'jobId' | 'billingRequestId' | 'state' | 'advice' | 'snapshotJson'>>,
   ): AdvisorConsultRecord {
     const current = this.db
       .prepare('SELECT * FROM advisor_consults WHERE consult_id = ?')
@@ -303,10 +304,18 @@ export class AdvisorConsultStore {
     this.db
       .prepare(
         `UPDATE advisor_consults
-            SET job_id = ?, billing_request_id = ?, advice = ?, state = ?, updated_at = ?
+            SET job_id = ?, billing_request_id = ?, advice = ?, state = ?, snapshot_json = ?, updated_at = ?
           WHERE consult_id = ?`,
       )
-      .run(next.jobId, next.billingRequestId, next.advice, next.state, next.updatedAt, consultId)
+      .run(
+        next.jobId,
+        next.billingRequestId,
+        next.advice,
+        next.state,
+        next.snapshotJson,
+        next.updatedAt,
+        consultId,
+      )
     return next
   }
 }

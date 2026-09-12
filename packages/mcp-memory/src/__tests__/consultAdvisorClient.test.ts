@@ -116,6 +116,21 @@ describe('consultAdvisor consumer', () => {
   })
 
   it('settled without durable advice is not success; failed keeps partial advice and status', () => {
+    const completedEmpty = consultAdvisorResultFromGateway({
+      statusCode: 200,
+      body: JSON.stringify({ status: 'completed', consultId: 'advc-ccb' }),
+    })
+    assert.equal(completedEmpty.kind, 'error')
+    const completedOk = consultAdvisorResultFromGateway({
+      statusCode: 200,
+      body: JSON.stringify({
+        status: 'completed',
+        advice: 'use evidence',
+        billingMode: 'proxy',
+        consultId: 'advc-ccb',
+      }),
+    })
+    assert.equal(completedOk.kind, 'advice')
     const empty = consultAdvisorResultFromGateway({
       statusCode: 200,
       body: JSON.stringify({ status: 'settled', consultId: 'advc-1' }),
