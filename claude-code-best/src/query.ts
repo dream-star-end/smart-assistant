@@ -25,6 +25,7 @@ import {
   logEvent,
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
 } from 'src/services/analytics/index.js'
+import { admitReceiptInput } from './utils/receiptInputAdmission.js'
 import { ImageSizeError } from './utils/imageValidation.js'
 import { ImageResizeError } from './utils/imageResizer.js'
 import { findToolByName, type ToolUseContext } from './Tool.js'
@@ -1110,10 +1111,14 @@ async function* queryLoop(
             ) {
               for (const result of streamingToolExecutor.getCompletedResults()) {
                 if (result.message) {
-                  yield result.message
+                  const admittedMessage = await admitReceiptInput(
+                    result.message,
+                    messagesForQuery.concat(assistantMessages, toolResults),
+                  )
+                  yield admittedMessage
                   toolResults.push(
                     ...normalizeMessagesForAPI(
-                      [result.message],
+                      [admittedMessage],
                       toolUseContext.options.tools,
                     ).filter(_ => _.type === 'user'),
                   )
@@ -1674,7 +1679,11 @@ async function* queryLoop(
 
     for await (const update of toolUpdates) {
       if (update.message) {
-        yield update.message
+        const admittedMessage = await admitReceiptInput(
+          update.message,
+          messagesForQuery.concat(assistantMessages, toolResults),
+        )
+        yield admittedMessage
 
         if (
           update.message.type === 'attachment' &&
@@ -1685,7 +1694,7 @@ async function* queryLoop(
 
         toolResults.push(
           ...normalizeMessagesForAPI(
-            [update.message],
+            [admittedMessage],
             toolUseContext.options.tools,
           ).filter(_ => _.type === 'user'),
         )
@@ -1898,8 +1907,12 @@ async function* queryLoop(
       messagesForQuery.concat(assistantMessages, toolResults),
       querySource,
     )) {
-      yield attachment
-      toolResults.push(attachment)
+      const admittedMessage = await admitReceiptInput(
+        attachment,
+        messagesForQuery.concat(assistantMessages, toolResults),
+      )
+      yield admittedMessage
+      toolResults.push(admittedMessage)
     }
 
     // Memory prefetch consume: only if settled and not already consumed on

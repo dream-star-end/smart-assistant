@@ -16,6 +16,13 @@ import {
   writeFile,
 } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
+import {
+  appendNativeReceiptRecord,
+  observeNativeReceiptRecord,
+  prepareNativeReceiptRecord,
+  serializeTranscriptWrite,
+  type NativeReceiptProof,
+} from './nativeReceiptTranscript.js'
 import { basename, dirname, join } from 'path'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -646,14 +653,15 @@ class Project {
   }
 
   private async appendToFile(filePath: string, data: string): Promise<void> {
-    try {
-      await fsAppendFile(filePath, data, { mode: 0o600 })
-    } catch {
-      // Directory may not exist — some NFS-like filesystems return
-      // unexpected error codes, so don't discriminate on code.
-      await mkdir(dirname(filePath), { recursive: true, mode: 0o700 })
-      await fsAppendFile(filePath, data, { mode: 0o600 })
-    }
+    return serializeTranscriptWrite(filePath, async () => {
+      try {
+        await fsAppendFile(filePath, data, { mode: 0o600 })
+      } catch {
+        // Keep ordinary queue semantics; receipt commits never use this retry.
+        await mkdir(dirname(filePath), { recursive: true, mode: 0o700 })
+        await fsAppendFile(filePath, data, { mode: 0o600 })
+      }
+    })
   }
 
   private async drainWriteQueue(): Promise<void> {
@@ -1010,6 +1018,76 @@ class Project {
         await this.appendEntry(entry)
       }
     }
+  }
+
+  /** Preparation has no input side effects. The owner calls commit under its
+   * shared writer barrier, and only then may query yield the original result. */
+  async prepareStrictReceiptInput(
+    message: UserMessage,
+    history: readonly Message[],
+    marker: ReceiptInputMarker,
+  ) {
+    const sessionId = getSessionId()
+    const file = getTranscriptPath()
+    const check = () => {
+      if (this.shouldSkipPersistence() || this.remoteIngressUrl || this.internalEventWriter ||
+          getSessionId() !== sessionId || getTranscriptPath() !== file) {
+        throw new Error('strict receipt input persistence is unavailable or changed')
+      }
+    }
+    check()
+    if (!marker.jobId || marker.jobId.length > 256 ||
+        !Number.isSafeInteger(marker.generation) || marker.generation < 0 ||
+        !/^[a-f0-9]{64}$/.test(marker.resultDigest)) {
+      throw new Error('invalid strict receipt input identity')
+    }
+    const cleaned = cleanMessagesForLogging([message], history)[0]
+    if (!cleaned || cleaned.type !== 'user' || history.some(m => m.uuid === message.uuid)) {
+      throw new Error('receipt input must not already be in query history')
+    }
+    const parentUuid = message.sourceToolAssistantUUID ?? history.findLast(isChainParticipant)?.uuid
+    if (!parentUuid) throw new Error('receipt input needs its native parent')
+    const entry: TranscriptMessage & { delegateReceipt: ReceiptInputMarker } = {
+      ...cleaned,
+      parentUuid,
+      isSidechain: false,
+      agentId: undefined,
+      userType: getUserType(),
+      entrypoint: getEntrypoint(),
+      cwd: getCwd(),
+      sessionId,
+      timestamp: new Date().toISOString(),
+      version: VERSION,
+      delegateReceipt: { jobId: marker.jobId, generation: marker.generation, resultDigest: marker.resultDigest },
+    }
+    const prepared = prepareNativeReceiptRecord(file, sessionId, message.uuid, jsonStringify(entry))
+    // Snapshot before any await: neither proof nor the eventual model input may
+    // drift while the caller waits for a receipt owner/another writer.
+    const prior = JSON.parse(jsonStringify(history)) as Message[]
+    const admitted = JSON.parse(jsonStringify(cleaned)) as UserMessage
+    return Object.freeze({
+      proof: prepared.proof,
+      message: admitted,
+      commit: async () => {
+        check()
+        await recordTranscript(prior)
+        await this.flush()
+        check()
+        await serializeTranscriptWrite(file, async () => {
+          const { messages } = await loadTranscriptFile(file)
+          const parent = messages.get(parentUuid)
+          if (!parent || parent.isSidechain || parent.sessionId !== sessionId) {
+            throw new Error('receipt parent was not actually persisted')
+          }
+          check()
+          await appendNativeReceiptRecord(prepared)
+          // Unlike appendEntry, do not poison the UUID set before commit.
+          const messageSet = await getSessionMessages(sessionId as UUID)
+          messageSet.add(prepared.uuid as UUID)
+        })
+      },
+      observe: () => observeStrictReceiptInput(prepared.proof),
+    })
   }
 
   async insertMessageChain(
@@ -1423,6 +1501,33 @@ class Project {
 export type TeamInfo = {
   teamName?: string
   agentName?: string
+}
+
+export type ReceiptInputMarker = Readonly<{
+  jobId: string
+  generation: number
+  resultDigest: string
+}>
+
+export function prepareStrictReceiptInput(
+  message: UserMessage,
+  history: readonly Message[],
+  marker: ReceiptInputMarker,
+) {
+  return getProject().prepareStrictReceiptInput(message, history, marker)
+}
+
+/** The same latest-leaf/chain reconstruction as native --resume, not a
+ * receipt-only side file. Caller must hold the receipt writer barrier. */
+export function observeStrictReceiptInput(proof: NativeReceiptProof) {
+  return observeNativeReceiptRecord(proof, async (file, uuid) => {
+    const { messages, leafUuids } = await loadTranscriptFile(file)
+    const leaf = findLatestMessage(messages.values(), msg =>
+      leafUuids.has(msg.uuid) && (msg.type === 'user' || msg.type === 'assistant'))
+    if (!leaf || leaf.sessionId !== proof.nativeSessionId) return false
+    return buildConversationChain(messages, leaf).some(msg =>
+      msg.uuid === uuid && msg.sessionId === proof.nativeSessionId && !msg.isSidechain)
+  })
 }
 
 // Filter out already-recorded messages before passing to insertMessageChain.
