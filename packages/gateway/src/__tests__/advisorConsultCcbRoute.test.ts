@@ -3,6 +3,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/advisorConsultCcbRoute.test.ts
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -213,7 +214,14 @@ async function makeCcbGateway(opts?: { advisorModel?: string; emitTool?: boolean
       return {
         agentId: 'advisor',
         currentTurnStatus: null,
-        runner: { interrupt: () => {}, shutdown: () => {}, off: () => {}, on: () => {} },
+        runner: {
+          interrupt: () => {
+            gw._interruptCount = (gw._interruptCount ?? 0) + 1
+          },
+          shutdown: () => {},
+          off: () => {},
+          on: () => {},
+        },
       }
     },
     submit: async (
@@ -350,5 +358,120 @@ describe('CCB advisor consult route', () => {
       assert.equal(second.body.consultId, first.body.consultId)
       assert.equal(gw._spawnCount, 1)
     })
+  })
+
+  it('catalog outage does not admit CCB or unknown as Codex; baked Codex still works off authority', async () => {
+    _setModelCatalogClientForTests({
+      configured: true,
+      getView: async () => {
+        throw new Error('catalog down')
+      },
+      getRoutingView: async () => {
+        throw new Error('catalog down')
+      },
+      getToken: async () => {
+        throw new Error('catalog down')
+      },
+    } as never)
+    const hit = { authority: 0, spawn: 0, interrupt: 0 }
+    const runMiniMax = async (authority: '0' | '1', provenCcb: boolean) => {
+      process.env.OC_MODEL_AUTHORITY = authority
+      const { gw, admits } = await makeCcbGateway()
+      await gw._advisorConfig.markEngineProven('codex')
+      if (provenCcb) {
+        await gw._advisorConfig.markProvenCcbModel({ modelId: 'MiniMax-M3', providerId: 'minimax' })
+      }
+      const r = await http(
+        gw,
+        'POST',
+        '/api/agents/advisor/consult',
+        { question: 'why red?' },
+        consultHeaders({ [CONSULT_INVOCATION_HEADER]: `cinv-outage-${authority}-${provenCcb}` }),
+      )
+      hit.authority += Number(authority)
+      hit.spawn += gw._spawnCount ?? 0
+      hit.interrupt += gw._interruptCount ?? 0
+      return { r, admits, spawn: gw._spawnCount ?? 0 }
+    }
+    const a1 = await runMiniMax('1', true)
+    assert.equal(a1.r.status, 503, JSON.stringify(a1.r.body))
+    assert.match(String(a1.r.body.error), /catalog unavailable/)
+    assert.equal(a1.admits.length, 0)
+    assert.equal(a1.spawn, 0)
+    const a0 = await runMiniMax('0', true)
+    assert.equal(a0.r.status, 503, JSON.stringify(a0.r.body))
+    assert.match(String(a0.r.body.error), /catalog unavailable/)
+    assert.equal(a0.admits.length, 0)
+    assert.equal(a0.spawn, 0)
+    process.env.OC_MODEL_AUTHORITY = '0'
+    const unknownGw = await makeCcbGateway({ advisorModel: 'not-a-real-model' })
+    await unknownGw.gw._advisorConfig.markEngineProven('codex')
+    const unknown = await http(
+      unknownGw.gw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-outage-unknown' }, 'not-a-real-model'),
+    )
+    assert.equal(unknown.status, 503, JSON.stringify(unknown.body))
+    assert.equal(unknownGw.admits.length, 0)
+    assert.equal(unknownGw.gw._spawnCount ?? 0, 0)
+    process.env.OC_MODEL_AUTHORITY = '0'
+    const { gw: codexGw, admits: codexAdmits } = await makeCcbGateway({ advisorModel: 'gpt-6-astra' })
+    await codexGw._advisorConfig.markEngineProven('codex')
+    const baked = await http(
+      codexGw,
+      'POST',
+      '/api/agents/advisor/consult',
+      { question: 'why red?' },
+      consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-outage-codex' }, 'gpt-6-astra'),
+    )
+    assert.equal(codexAdmits.length, 1, JSON.stringify({ baked: baked.body, admits: codexAdmits }))
+    assert.equal((codexAdmits[0] as { engine?: string; model?: string }).engine, 'codex')
+    assert.equal((codexAdmits[0] as { engine?: string; model?: string }).model, 'gpt-6-astra')
+    assert.ok(hit.spawn === 0)
+  })
+
+  it('first tool event interrupts immediately and trailing text cannot complete', async () => {
+    await withCcbCatalog(async () => {
+      const tools = await makeCcbGateway({ emitTool: true })
+      await tools.gw._advisorConfig.markProvenCcbModel({ modelId: 'MiniMax-M3', providerId: 'minimax' })
+      const headers = consultHeaders({ [CONSULT_INVOCATION_HEADER]: 'cinv-ccb-tool-interrupt' })
+      const toolFail = await http(
+        tools.gw,
+        'POST',
+        '/api/agents/advisor/consult',
+        { question: 'why red?' },
+        headers,
+      )
+      assert.equal(toolFail.body.status, 'failed', JSON.stringify(toolFail.body))
+      assert.match(String(toolFail.body.error), /工具或权限/)
+      assert.equal(tools.gw._interruptCount, 1)
+      assert.equal(toolFail.body.status === 'cancelled', false)
+      const replay = await http(
+        tools.gw,
+        'POST',
+        '/api/agents/advisor/consult',
+        { question: 'why red?' },
+        headers,
+      )
+      assert.equal(replay.body.status, 'failed', JSON.stringify(replay.body))
+      assert.equal(replay.body.consultId, toolFail.body.consultId)
+      assert.equal(tools.gw._spawnCount, 1)
+    })
+  })
+
+  it('CLI runToolUse rejects advisor hermetic before tool lookup', () => {
+    const src = readFileSync(
+      new URL('../../../../claude-code-best/src/services/tools/toolExecution.ts', import.meta.url),
+      'utf8',
+    )
+    const fn = src.indexOf('export async function* runToolUse')
+    const lookup = src.indexOf('findToolByName', fn)
+    const hermetic = src.indexOf('isOpenClaudeAdvisorHermetic', fn)
+    assert.ok(fn >= 0)
+    assert.ok(hermetic > fn)
+    assert.ok(hermetic < lookup)
+    assert.match(src.slice(fn, lookup), /abortController\.abort/)
   })
 })

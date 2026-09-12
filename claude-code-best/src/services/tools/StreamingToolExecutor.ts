@@ -10,6 +10,7 @@ import { BASH_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/BashTool/t
 import type { AssistantMessage, Message } from '../../types/message.js'
 import { createChildAbortController } from '../../utils/abortController.js'
 import { runToolUse } from './toolExecution.js'
+import { isOpenClaudeAdvisorHermetic } from '../../utils/envUtils.js'
 import { createToolBatchSpan, endToolBatchSpan } from '../langfuse/index.js'
 import type { LangfuseSpan } from '../langfuse/index.js'
 
@@ -88,6 +89,16 @@ export class StreamingToolExecutor {
    * Add a tool to the execution queue. Will start executing immediately if conditions allow.
    */
   addTool(block: ToolUseBlock, assistantMessage: AssistantMessage): void {
+    const noToolsEnabled = (this.toolDefinitions?.length ?? 0) === 0
+    if (isOpenClaudeAdvisorHermetic() || noToolsEnabled) {
+      console.error(
+        `[openclaude-advisor-hermetic] streaming reject ${block.name} id=${block.id} tools=${this.toolDefinitions?.length ?? 0}`,
+      )
+      if (!this.toolUseContext.abortController.signal.aborted) {
+        this.toolUseContext.abortController.abort('advisor_hermetic_no_tools')
+      }
+      return
+    }
     // Create turn span on first tool — will be ended in getRemainingResults
     if (this.tools.length === 0 && this.turnSpan === null) {
       this.turnSpan = createToolBatchSpan(

@@ -12850,12 +12850,9 @@ export class Gateway {
       }
       return { ok: false, status: 409, error: '顾问型号引擎不是已证明的 Codex 或 CCB' }
     } catch (err) {
-      if (isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
-        return {
-          ok: true,
-          value: { modelId: advisorModel, engine: 'codex', providerId: 'codex' },
-        }
-      }
+      // Authority mode: catalog failure is always fail-closed.
+      // Non-authority Codex already returned via baked resolveEngine above;
+      // CCB/unknown must not inherit a proven Codex engine.
       return {
         ok: false,
         status: 503,
@@ -13006,6 +13003,15 @@ export class Gateway {
     let error: string | undefined
     let cancelCode: string | undefined
     const originConsultId = input.consultId
+    const lockToolViolation = (): void => {
+      if (toolViolation) return
+      toolViolation = true
+      try {
+        session.runner.interrupt()
+      } catch {
+        /* interrupt is best-effort; finally still destroys the session */
+      }
+    }
     try {
       await this.sessions.submit(
         session,
@@ -13021,19 +13027,22 @@ export class Gateway {
           ) {
             return
           }
-          const eventKind = (e as { kind?: string }).kind
-          if (eventKind === 'tool_use_detected' || eventKind === 'permission_request') {
-            toolViolation = true
-          }
-          if (e.kind === 'block' && (e.block.kind === 'tool_use' || e.block.kind === 'tool_result')) {
-            toolViolation = true
-          }
-          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
           if (e.kind === 'error') {
             error = e.error
             const code = (e as { errorCode?: string }).errorCode
             if (code === 'USER_CANCELLED') cancelCode = code
           }
+          if (toolViolation) return
+          const eventKind = (e as { kind?: string }).kind
+          if (eventKind === 'tool_use_detected' || eventKind === 'permission_request') {
+            lockToolViolation()
+            return
+          }
+          if (e.kind === 'block' && (e.block.kind === 'tool_use' || e.block.kind === 'tool_result')) {
+            lockToolViolation()
+            return
+          }
+          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
         },
         undefined,
         input.execution.modelId,
@@ -13053,7 +13062,8 @@ export class Gateway {
       if (code === 'USER_CANCELLED') cancelCode = code
       error = String((err as Error)?.message ?? err)
     }
-    const cancelled = cancelCode === 'USER_CANCELLED' || abort.signal.aborted
+    const cancelled =
+      !toolViolation && (cancelCode === 'USER_CANCELLED' || abort.signal.aborted)
     const jobSnap = jobs.snapshotOf(jobId)
     const fence =
       jobSnap?.claimToken

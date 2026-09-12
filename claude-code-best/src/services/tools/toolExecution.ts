@@ -61,6 +61,7 @@ import type {
 import { count } from '../../utils/array.js'
 import { createAttachmentMessage } from '../../utils/attachments.js'
 import { logForDebugging } from '../../utils/debug.js'
+import { isOpenClaudeAdvisorHermetic } from '../../utils/envUtils.js'
 import {
   AbortError,
   errorMessage,
@@ -370,6 +371,22 @@ export async function* runToolUse(
   toolUseContext: ToolUseContext,
 ): AsyncGenerator<MessageUpdateLazy, void> {
   const toolName = toolUse.name
+  // OpenClaude CCB advisor hermetic profile: refuse before lookup/alias/hooks
+  // and abort the query so a missing-tool tool_result cannot start another
+  // model HTTP. Do not yield a tool_result. Ordinary CCB is unchanged.
+  const noToolsEnabled = (toolUseContext.options.tools?.length ?? 0) === 0
+  if (isOpenClaudeAdvisorHermetic() || noToolsEnabled) {
+    logForDebugging(
+      `OpenClaude advisor hermetic rejected tool ${toolName}: ${toolUse.id}`,
+    )
+    console.error(
+      `[openclaude-advisor-hermetic] rejected tool ${toolName} id=${toolUse.id} hermetic=${isOpenClaudeAdvisorHermetic()} tools=${toolUseContext.options.tools?.length ?? 0}`,
+    )
+    if (!toolUseContext.abortController.signal.aborted) {
+      toolUseContext.abortController.abort('advisor_hermetic_no_tools')
+    }
+    return
+  }
   // First try to find in the available tools (what the model sees)
   let tool = findToolByName(toolUseContext.options.tools, toolName)
 
