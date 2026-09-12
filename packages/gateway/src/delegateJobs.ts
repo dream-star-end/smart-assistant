@@ -584,7 +584,11 @@ export class DelegateJobStore {
     draft.state = next
     draft.failureClass = args.failureClass
     draft.failureDetail = args.detail.slice(0, 512)
-    if (isResumeInjectCallback(draft.callback)) {
+    if (this.durable?.hasDeliveryReceiptEnrollment(jobId)) {
+      // Failure/cancel is not consumption. Preserve the receipt owner fence,
+      // exactly as complete() does; only v1 retains the old silent callback.
+      initTerminalCallback(draft)
+    } else if (isResumeInjectCallback(draft.callback)) {
       draft.callbackState = 'pending'
       draft.callbackEpoch = 1
     } else {

@@ -220,3 +220,69 @@ test('two paths to the same database cannot create independent receipt barriers'
     })
   } finally { other.close() }
 })
+
+for (const nextState of ['failed', 'cancelled', 'killed_by_cutover'] as const) {
+  test(`receipt fail commits ${nextState} through the real fenced failure entry without marking it consumed`, t => {
+    const f = fixture(t)
+    const { id, fence } = create(f.store)
+    const args = { ...fence, failureClass: 'child_error' as const, detail: 'child failed', httpStatus: 500, nextState }
+    assert.equal(f.store.fail(id, { ...args, claimToken: 'stale' }), false)
+    assert.equal(f.store.fail(id, args), true)
+    assert.equal(f.store.fail(id, args), false)
+    assert.equal(f.db.get(id)?.state, nextState)
+    assert.equal(f.db.get(id)?.callbackState, 'none')
+    assert.equal(f.db.get(id)?.result?.body.error, 'child failed')
+    assert.equal(f.db.getDeliveryReceipt(id, 0)?.state, 'offered')
+    assert.equal(f.db.listUnacknowledgedFailures('3').count, nextState === 'cancelled' ? 0 : 1)
+    assert.equal(f.terminals(), 1)
+    assert.equal(f.store.markResultConsumed(id), false)
+  })
+}
+
+for (const kind of ['timeout', 'abort'] as const) {
+  test(`queued receipt capacity ${kind} really terminates and cannot later be dispatched`, t => {
+    const f = fixture(t)
+    const made = f.store.create('worker', { queued: true, callback: 'stdout-wait', deliveryReceipt: receipt,
+      callbackOriginUserId: '3', parentSessionKey: parent })
+    assert.ok('jobId' in made)
+    const args = { failureClass: 'capacity_timeout' as const, detail: kind, httpStatus: 429, drop: false,
+      nextState: kind === 'abort' ? 'cancelled' as const : 'failed' as const }
+    assert.equal(f.store.settleCapacityReject(made.jobId, args), 'failed', 'not falsely claimed/already dispatched')
+    assert.equal(f.db.get(made.jobId)?.state, args.nextState)
+    assert.equal(f.db.getDeliveryReceipt(made.jobId, 0)?.state, 'offered')
+    assert.equal(f.db.listUnacknowledgedFailures('3').count, kind === 'timeout' ? 1 : 0)
+    assert.deepEqual(f.store.claimQueued(made.jobId), { ok: false })
+    assert.equal(f.terminals(), 1)
+  })
+}
+
+for (const table of ['delegate_delivery_receipt', 'delegate_failure_inbox']) {
+  test(`fail entry rolls back job, receipt, inbox and observers when ${table} insertion fails`, t => {
+    const f = fixture(t)
+    const { id, fence } = create(f.store)
+    const raw = new Database(f.path)
+    const args = { ...fence, failureClass: 'child_error' as const, detail: 'upstream failed', httpStatus: 500 }
+    try {
+      raw.exec(`CREATE TRIGGER reject_aux BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'aux failure'); END`)
+      assert.throws(() => f.store.fail(id, args), /aux failure/)
+      assert.equal(f.db.get(id)?.state, 'running')
+      assert.equal(f.store.snapshotOf(id)?.state, 'running')
+      assert.equal(f.db.get(id)?.result, null)
+      assert.equal(f.db.getDeliveryReceipt(id, 0), undefined)
+      assert.equal(f.db.listUnacknowledgedFailures('3').count, 0)
+      assert.equal(f.terminals(), 0)
+      raw.exec('DROP TRIGGER reject_aux')
+      assert.equal(f.store.fail(id, args), true)
+      assert.equal(f.terminals(), 1)
+    } finally { raw.close() }
+  })
+}
+
+test('ordinary v1 fail still preserves its historical skipped_silent callback', t => {
+  const f = fixture(t)
+  const { id, fence } = create(f.store, { deliveryReceipt: undefined })
+  assert.equal(f.store.fail(id, { ...fence, failureClass: 'child_error', detail: 'old fail', httpStatus: 500 }), true)
+  assert.equal(f.db.get(id)?.callbackState, 'skipped_silent')
+  assert.equal(f.db.getDeliveryReceipt(id, 0), undefined)
+  assert.equal(f.db.listUnacknowledgedFailures('3').count, 0)
+})
