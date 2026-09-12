@@ -1,14 +1,14 @@
 {
   "capabilities": {
     "advisor-mode": {
-      "contentHash": "c08d8eda8b105329900983c6b14c1885937ba9b2ddf5f652359d2523b1d95f90",
-      "contentVersion": 2,
+      "contentHash": "33f068425f5a2f6c42c04e0a03989e63dd95af0639a7dbc829b0bd885b1a55c1",
+      "contentVersion": 3,
       "entryIdentityHash": "24e04eecd3a7f6cfa91bbc293f50dba69adca8cb28e06bbbaded5dbba129407a",
       "mediaHash": "cd76d4e5d826c6da1b0cb941a27cbbfc9871fb031f69987899127460914889e4",
       "mediaKey": "advisor-mode",
       "mediaVersion": 2,
       "registryHash": "d7b4dec4c98bf12dc0a8ddb1c6a35152df28156ed8ae34d1362a0a9c1c099747",
-      "sourceHash": "a8bda479ce0b1813765c41b4b4ce39722654b80ebdbb714534a98531d7990080"
+      "sourceHash": "76577c529b993a761f370a35a0ed6e8008a4cad84d4eee450312821456d98ec4"
     },
     "agents": {
       "contentHash": "f9adee3d39156abd3aa5beb353bfe217e6cb364b81c083ed7e46cd66e60242b8",
