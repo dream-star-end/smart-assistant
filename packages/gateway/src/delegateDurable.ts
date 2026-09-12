@@ -508,9 +508,11 @@ export class DelegateDurableDb {
   }
 
   private migrate(): void {
-    const current = Number(this.db.pragma('user_version', { simple: true }) ?? 0)
-    if (current >= DELEGATE_DURABLE_SCHEMA_VERSION) return
     const apply = this.db.transaction(() => {
+      // Obtain the migration writer lock before reading the version. A second
+      // opener must observe the first opener's commit, not rerun its ALTER.
+      const current = Number(this.db.pragma('user_version', { simple: true }) ?? 0)
+      if (current >= DELEGATE_DURABLE_SCHEMA_VERSION) return
       if (current < 1) this.db.exec(DDL_V1)
       if (current < 2) this.addNotifyDeliveryColumns()
       if (current < 3) this.addNotifyAAttemptedColumn()
@@ -518,7 +520,7 @@ export class DelegateDurableDb {
       if (current < 5) this.db.exec(DDL_V5)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
-    apply()
+    apply.immediate()
   }
 
   private addNotifyDeliveryColumns(): void {
@@ -684,7 +686,10 @@ export class DelegateDurableDb {
         WHERE user_id=@userId AND ack_at IS NULL
           ${before ? 'AND (failed_at, job_id, generation) < (@failedAt, @jobId, @generation)' : ''}
         ORDER BY failed_at DESC, job_id DESC, generation DESC LIMIT @limit
-      `).all({ userId, limit: limit + 1, ...(before ?? {}) }) as Array<Record<string, unknown>>
+      `).all({
+        userId, limit: limit + 1,
+        ...(before ? { failedAt: before.failedAt, jobId: before.jobId, generation: before.generation } : {}),
+      }) as Array<Record<string, unknown>>
       const more = rows.length > limit
       const items = rows.slice(0, limit).map(failureInboxFromRow)
       const last = items.at(-1)

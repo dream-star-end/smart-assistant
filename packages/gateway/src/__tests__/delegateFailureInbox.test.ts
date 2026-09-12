@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawnSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { test, type TestContext } from 'node:test'
 import Database from 'better-sqlite3'
@@ -151,6 +151,53 @@ test('enabled admission refuses an unowned job without inserting anything', t =>
   assert.throws(() => store.create('worker'), /requires verified owner/)
   assert.equal(db.ledgerStats().total, 0)
   assert.equal(store.size(), 0)
+})
+
+test('cursor extra fields cannot override trusted user scope or page limit', t => {
+  const { store, db } = fixture(t)
+  const own = create(store)
+  const foreign = create(store, '4')
+  store.complete(own.id, failure, own.fence)
+  store.complete(foreign.id, failure, foreign.fence)
+  const forged = { failedAt: 2000, jobId: 'zzz', generation: 0, userId: '4', limit: 0 }
+  const result = db.listUnacknowledgedFailures('3', { before: forged, limit: 1 })
+  assert.equal(result.count, 1)
+  assert.deepEqual(result.items.map(item => [item.userId, item.jobId]), [['3', own.id]])
+})
+
+test('multiple real processes opening the same v4 database converge on one migration', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-206-migration-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, 'jobs.db')
+  new DelegateDurableDb(path).close()
+  const v4 = new Database(path)
+  v4.exec('DROP TABLE delegate_failure_inbox; ALTER TABLE delegate_jobs DROP COLUMN failure_inbox_enabled; PRAGMA user_version=4;')
+  v4.close()
+  const mod = fileURLToPath(new URL('../delegateDurable.ts', import.meta.url))
+  const tasks = Array.from({ length: 4 }, () => new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import { DelegateDurableDb } from ${JSON.stringify(mod)};
+      process.stdin.once('data', () => {
+        const db = new DelegateDurableDb(${JSON.stringify(path)});
+        if(db.listUnacknowledgedFailures('3').count !== 0) throw Error('unexpected inbox');
+        db.close();
+      });
+      console.log('ready');`], { stdio: ['pipe', 'pipe', 'pipe'] })
+    let stderr = ''
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.stdout.once('data', () => { child.stdin.end('open') })
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 10000)
+    child.once('error', err => { clearTimeout(timeout); reject(err) })
+    child.once('close', code => { clearTimeout(timeout); code === 0 ? resolve() : reject(new Error(stderr || `child exit ${code}`)) })
+  }))
+  // allSettled ensures every owned process has exited before fixture cleanup.
+  const results = await Promise.allSettled(tasks)
+  for (const result of results) if (result.status === 'rejected') throw result.reason
+  const inspect = new Database(path, { readonly: true })
+  try {
+    assert.equal(inspect.pragma('user_version', { simple: true }), 5)
+    assert.equal((inspect.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{name: string}>).filter(x => x.name === 'failure_inbox_enabled').length, 1)
+  } finally { inspect.close() }
 })
 
 test('v4 upgrade keeps existing jobs and never backfills old failures', t => {
