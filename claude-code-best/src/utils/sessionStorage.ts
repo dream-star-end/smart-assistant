@@ -1045,8 +1045,11 @@ class Project {
     if (!cleaned || cleaned.type !== 'user' || history.some(m => m.uuid === message.uuid)) {
       throw new Error('receipt input must not already be in query history')
     }
-    const parentUuid = message.sourceToolAssistantUUID ?? history.findLast(isChainParticipant)?.uuid
-    if (!parentUuid) throw new Error('receipt input needs its native parent')
+    const parent = message.sourceToolAssistantUUID ?? history.findLast(isChainParticipant)?.uuid
+    if (typeof parent !== 'string' || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(parent)) {
+      throw new Error('receipt input needs its native parent UUID')
+    }
+    const parentUuid = parent as UUID
     const entry: TranscriptMessage & { delegateReceipt: ReceiptInputMarker } = {
       ...cleaned,
       parentUuid,

@@ -1,3 +1,4 @@
+import type { UUID } from 'node:crypto'
 import type { Message, UserMessage } from '../types/message.js'
 import { createUserMessage } from './messages.js'
 import {
@@ -45,10 +46,12 @@ export async function admitReceiptInput<T extends Message>(
 ): Promise<T | UserMessage> {
   const admission = admissions.get(message)
   if (!admission) return message
-  if (message.type !== 'user')
+  if (message.type !== 'user' || !message.message)
     throw new Error('unsupported receipt input record')
+  // CCB's base Message is not a discriminated union.
+  const userMessage = message as UserMessage
   const prepared = await prepareStrictReceiptInput(
-    message,
+    userMessage,
     history,
     admission.marker,
   )
@@ -63,8 +66,8 @@ export async function admitReceiptInput<T extends Message>(
   // prepared input's UUID/hash and poison crash recovery. Preserve tool pairing
   // but strip every original-result side channel (mcpMeta/toolUseResult/etc.).
   const neutral = '该子任务结果由持久任务回调交付；此处不重复提交结果。'
-  const content = Array.isArray(message.message.content)
-    ? message.message.content
+  const content = Array.isArray(userMessage.message.content)
+    ? userMessage.message.content
         .filter(block => block.type === 'tool_result')
         .map(block => ({
           type: 'tool_result' as const,
@@ -74,6 +77,9 @@ export async function admitReceiptInput<T extends Message>(
     : []
   return createUserMessage({
     content: content.length ? content : neutral,
-    sourceToolAssistantUUID: message.sourceToolAssistantUUID,
+    sourceToolAssistantUUID:
+      typeof message.sourceToolAssistantUUID === 'string'
+        ? (message.sourceToolAssistantUUID as UUID)
+        : undefined,
   })
 }
