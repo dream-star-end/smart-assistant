@@ -6,7 +6,9 @@
  * Schema version is PRAGMA user_version (gateway-local SQLite, not a
  * commercial PG migration). Flag OC_DELEGATE_DURABLE defaults off.
  */
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, realpathSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { withReceiptWriteBarrier } from '@openclaude/storage/receiptWriteBarrier'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -26,7 +28,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 5
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 6
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -183,6 +185,49 @@ CREATE INDEX idx_delegate_failure_unacked
   ON delegate_failure_inbox(user_id, failed_at DESC, job_id DESC, generation DESC)
   WHERE ack_at IS NULL;
 `
+
+/** Trusted create-time binding. Nonce is supplied by the paired caller; only its hash is stored. */
+export type DelegateReceiptContext = {
+  parentTurnKey: string
+  nativeToolUseId: string
+  receiptNonceHash: string
+}
+export type DelegateDeliveryReceipt = DelegateReceiptContext & {
+  jobId: string
+  generation: number
+  userId: string
+  parentSession: string
+  resultDigest: string
+  state: 'offered' | 'ingest_claimed' | 'ingested' | 'notify_pending' | 'notify_claimed' | 'notified'
+  createdAt: number
+}
+const DDL_V6 = `
+ALTER TABLE delegate_jobs ADD COLUMN delivery_receipt_context TEXT;
+CREATE TABLE delegate_delivery_receipt (
+  job_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  parent_session TEXT NOT NULL,
+  parent_turn_key TEXT NOT NULL,
+  native_tool_use_id TEXT NOT NULL,
+  receipt_nonce_hash TEXT NOT NULL,
+  result_digest TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'offered'
+    CHECK(state IN ('offered','ingest_claimed','ingested','notify_pending','notify_claimed','notified')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(job_id, generation)
+);
+CREATE INDEX idx_delegate_receipt_pending ON delegate_delivery_receipt(parent_session, state, created_at);
+`
+function checkedReceiptContext(context: DelegateReceiptContext): DelegateReceiptContext {
+  if (typeof context.parentTurnKey !== 'string' || !context.parentTurnKey.trim() || context.parentTurnKey.length > 256 ||
+      typeof context.nativeToolUseId !== 'string' || !context.nativeToolUseId.trim() || context.nativeToolUseId.length > 256 ||
+      typeof context.receiptNonceHash !== 'string' || !/^[a-f0-9]{64}$/.test(context.receiptNonceHash)) {
+    throw new Error('invalid delegate receipt context')
+  }
+  return { parentTurnKey: context.parentTurnKey, nativeToolUseId: context.nativeToolUseId, receiptNonceHash: context.receiptNonceHash }
+}
 
 export type DelegateFailureCursor = { failedAt: number; jobId: string; generation: number }
 export type DelegateFailureInboxItem = {
@@ -518,6 +563,7 @@ export class DelegateDurableDb {
       if (current < 3) this.addNotifyAAttemptedColumn()
       if (current < 4) this.addRetiredAtColumn()
       if (current < 5) this.db.exec(DDL_V5)
+      if (current < 6) this.db.exec(DDL_V6)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply.immediate()
@@ -574,9 +620,11 @@ export class DelegateDurableDb {
   upsert(record: DurableJobRecord): void {
     this.throwIfInjectedFailure()
     this.transaction(() => {
+      if (this.hasDeliveryReceiptEnrollment(record.id)) throw new Error('receipt job requires fenced update')
       this.upsertStmt.run(toRow(record))
       const row = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id=?').get(record.id)
       this.persistFailureInbox(row as Record<string, unknown>)
+      this.persistDeliveryReceipt(row as Record<string, unknown>)
     })
   }
 
@@ -587,18 +635,25 @@ export class DelegateDurableDb {
   insertCreate(
     record: DurableJobRecord,
     maxJobs: number,
-    opts: { failureInbox?: boolean } = {},
+    opts: { failureInbox?: boolean; deliveryReceipt?: DelegateReceiptContext } = {},
   ): { ok: true } | { error: 'capacity' } | { reused: DurableJobRecord } {
     this.throwIfInjectedFailure()
     return this.transaction(() => {
       if (record.idempotencyKey) {
         const hit = this.findByIdempotencyKey(record.idempotencyKey)
-        if (hit) return { reused: hit }
+        if (hit) {
+          this.checkReceiptReuse(hit, record, opts.deliveryReceipt)
+          return { reused: hit }
+        }
       }
       const n = this.countNonTerminal()
       if (n >= maxJobs) return { error: 'capacity' as const }
-      if (opts.failureInbox && (!record.callbackOriginUserId?.trim() || !record.parentSessionKey?.trim())) {
+      if ((opts.failureInbox || opts.deliveryReceipt) && (!record.callbackOriginUserId?.trim() || !record.parentSessionKey?.trim())) {
         throw new Error('delegate failure inbox requires verified owner and parent')
+      }
+      const receipt = opts.deliveryReceipt ? checkedReceiptContext(opts.deliveryReceipt) : undefined
+      if (receipt && (record.kind !== 'delegate' || record.callback !== 'stdout-wait' || record.callbackState !== 'none')) {
+        throw new Error('receipt admission requires a new stdout-wait delegate')
       }
       try {
         this.insertStmt.run(toRow(record))
@@ -606,15 +661,23 @@ export class DelegateDurableDb {
         const code = (err as { code?: string }).code ?? ''
         if (code.startsWith('SQLITE_CONSTRAINT') && record.idempotencyKey) {
           const hit = this.findByIdempotencyKey(record.idempotencyKey)
-          if (hit) return { reused: hit }
+          if (hit) {
+            this.checkReceiptReuse(hit, record, opts.deliveryReceipt)
+            return { reused: hit }
+          }
         }
         throw err
       }
       // Only an INSERT collision is reusable. An auxiliary write failure must
       // roll back, not find this transaction's own row and misreport reuse.
-      if (opts.failureInbox) {
+      if (opts.failureInbox || receipt) {
         this.db.prepare('UPDATE delegate_jobs SET failure_inbox_enabled=1 WHERE job_id=?').run(record.id)
         this.persistFailureInbox({ ...toRow(record), failure_inbox_enabled: 1 })
+      }
+      if (receipt) {
+        this.db.prepare('UPDATE delegate_jobs SET delivery_receipt_context=? WHERE job_id=?')
+          .run(JSON.stringify(receipt), record.id)
+        this.persistDeliveryReceipt({ ...toRow(record), delivery_receipt_context: JSON.stringify(receipt) })
       }
       return { ok: true as const }
     })
@@ -635,6 +698,13 @@ export class DelegateDurableDb {
   ): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
     return this.transaction(() => {
+      if (this.hasDeliveryReceiptEnrollment(record.id)) {
+        const bound = this.get(record.id)
+        if (!bound || record.callback !== 'stdout-wait' || record.callbackState !== 'none' ||
+            record.kind !== bound.kind || record.generation !== bound.generation ||
+            record.callbackOriginUserId !== bound.callbackOriginUserId ||
+            record.parentSessionKey !== bound.parentSessionKey) return undefined
+      }
       const row = this.casUpdateStmt.get({
         ...toRow(record),
         expected_state: expected.state,
@@ -643,7 +713,79 @@ export class DelegateDurableDb {
       }) as Record<string, unknown> | undefined
       if (!row) return undefined
       this.persistFailureInbox(row)
+      this.persistDeliveryReceipt(row)
       return fromRow(row)
+    })
+  }
+
+  hasDeliveryReceiptEnrollment(jobId: string): boolean {
+    const row = this.db.prepare('SELECT delivery_receipt_context FROM delegate_jobs WHERE job_id=?').get(jobId) as
+      { delivery_receipt_context: string | null } | undefined
+    return row?.delivery_receipt_context != null
+  }
+
+  private checkReceiptReuse(existing: DurableJobRecord, incoming: DurableJobRecord, context?: DelegateReceiptContext): void {
+    const row = this.db.prepare('SELECT delivery_receipt_context FROM delegate_jobs WHERE job_id=?').get(existing.id) as
+      { delivery_receipt_context: string | null }
+    if (row.delivery_receipt_context == null && !context) return
+    if (!context || row.delivery_receipt_context == null ||
+        JSON.stringify(checkedReceiptContext(context)) !== row.delivery_receipt_context ||
+        incoming.kind !== existing.kind || incoming.callback !== existing.callback ||
+        incoming.generation !== existing.generation || incoming.parentSessionKey !== existing.parentSessionKey ||
+        incoming.callbackOriginUserId !== existing.callbackOriginUserId) {
+      throw new Error('delegate receipt idempotency binding mismatch')
+    }
+  }
+
+  /** Metadata-only offer; possession of a job ID is NOT permission to consume its result. */
+  getDeliveryReceipt(jobId: string, generation: number): DelegateDeliveryReceipt | undefined {
+    const row = this.db.prepare('SELECT * FROM delegate_delivery_receipt WHERE job_id=? AND generation=?')
+      .get(jobId, generation) as Record<string, unknown> | undefined
+    if (!row) return undefined
+    return {
+      jobId: String(row.job_id), generation: num(row.generation), userId: String(row.user_id),
+      parentSession: String(row.parent_session), parentTurnKey: String(row.parent_turn_key),
+      nativeToolUseId: String(row.native_tool_use_id), receiptNonceHash: String(row.receipt_nonce_hash),
+      resultDigest: String(row.result_digest), state: row.state as DelegateDeliveryReceipt['state'],
+      createdAt: num(row.created_at),
+    }
+  }
+
+  /** Same deterministic inode for the gateway coordinator and the eventual CCB writer. */
+  async withDeliveryReceiptBarrier<T>(
+    jobId: string,
+    generation: number,
+    write: (receipt: DelegateDeliveryReceipt) => Promise<T>,
+    opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<T> {
+    if (this.path === ':memory:') throw new Error('receipt barrier requires a persistent database')
+    const key = createHash('sha256').update(JSON.stringify([jobId, generation])).digest('hex')
+    return withReceiptWriteBarrier(join(dirname(realpathSync(this.path)), 'delegate-receipt-locks', key + '.lock'), async () => {
+      const receipt = this.getDeliveryReceipt(jobId, generation)
+      if (!receipt) throw new Error('delegate receipt not found')
+      return await write(receipt)
+    }, opts)
+  }
+
+  private persistDeliveryReceipt(row: Record<string, unknown>): void {
+    if (row.delivery_receipt_context == null || !['completed', 'failed', 'cancelled', 'killed_by_cutover'].includes(String(row.state))) return
+    const context = checkedReceiptContext(JSON.parse(String(row.delivery_receipt_context)))
+    if (typeof row.result_json !== 'string') throw new Error('terminal receipt requires a durable result')
+    const resultDigest = createHash('sha256').update(row.result_json).digest('hex')
+    const existing = this.getDeliveryReceipt(String(row.job_id), num(row.generation))
+    if (existing && (existing.resultDigest !== resultDigest || existing.userId !== row.callback_origin_user_id ||
+        existing.parentSession !== row.parent_session_key || existing.parentTurnKey !== context.parentTurnKey ||
+        existing.nativeToolUseId !== context.nativeToolUseId || existing.receiptNonceHash !== context.receiptNonceHash)) {
+      throw new Error('delegate receipt binding is immutable')
+    }
+    this.db.prepare(`INSERT INTO delegate_delivery_receipt
+      (job_id,generation,user_id,parent_session,parent_turn_key,native_tool_use_id,receipt_nonce_hash,result_digest,created_at,updated_at)
+      VALUES (@jobId,@generation,@userId,@parentSession,@parentTurnKey,@nativeToolUseId,@receiptNonceHash,@resultDigest,@now,@now)
+      ON CONFLICT(job_id,generation) DO NOTHING`).run({
+      jobId: row.job_id, generation: row.generation,
+      userId: row.callback_origin_user_id, parentSession: row.parent_session_key,
+      ...context, resultDigest,
+      now: row.terminal_committed_at ?? row.last_activity_at,
     })
   }
 
@@ -737,6 +879,7 @@ export class DelegateDurableDb {
     claimedUntil: number
   }): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
+    if (this.hasDeliveryReceiptEnrollment(args.jobId)) return undefined
     const row = this.casClaimNotifyStmt.get({
       job_id: args.jobId,
       expected_state: args.state,
@@ -831,6 +974,7 @@ export class DelegateDurableDb {
     now: number
   }): boolean {
     this.throwIfInjectedFailure()
+    if (this.hasDeliveryReceiptEnrollment(args.jobId)) return false
     const info = this.casRetireStmt.run({
       job_id: args.jobId,
       expected_state: args.state,

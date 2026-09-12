@@ -6,7 +6,7 @@ import { spawnSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { test, type TestContext } from 'node:test'
 import Database from 'better-sqlite3'
-import { DelegateDurableDb, type DelegateFailureCursor } from '../delegateDurable.js'
+import { DelegateDurableDb, DELEGATE_DURABLE_SCHEMA_VERSION, type DelegateFailureCursor } from '../delegateDurable.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { DelegateInflightSurfaceStore } from '../delegateInflightSurface.js'
 import { effectiveDelegateOutcome } from '../delegateOutcome.js'
@@ -171,7 +171,7 @@ test('multiple real processes opening the same v4 database converge on one migra
   const path = join(dir, 'jobs.db')
   new DelegateDurableDb(path).close()
   const v4 = new Database(path)
-  v4.exec('DROP TABLE delegate_failure_inbox; ALTER TABLE delegate_jobs DROP COLUMN failure_inbox_enabled; PRAGMA user_version=4;')
+  v4.exec('DROP TABLE delegate_delivery_receipt; ALTER TABLE delegate_jobs DROP COLUMN delivery_receipt_context; DROP TABLE delegate_failure_inbox; ALTER TABLE delegate_jobs DROP COLUMN failure_inbox_enabled; PRAGMA user_version=4;')
   v4.close()
   const mod = fileURLToPath(new URL('../delegateDurable.ts', import.meta.url))
   const tasks = Array.from({ length: 4 }, () => new Promise<void>((resolve, reject) => {
@@ -195,7 +195,7 @@ test('multiple real processes opening the same v4 database converge on one migra
   for (const result of results) if (result.status === 'rejected') throw result.reason
   const inspect = new Database(path, { readonly: true })
   try {
-    assert.equal(inspect.pragma('user_version', { simple: true }), 5)
+    assert.equal(inspect.pragma('user_version', { simple: true }), DELEGATE_DURABLE_SCHEMA_VERSION)
     assert.equal((inspect.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{name: string}>).filter(x => x.name === 'failure_inbox_enabled').length, 1)
   } finally { inspect.close() }
 })
@@ -209,7 +209,7 @@ test('v4 upgrade keeps existing jobs and never backfills old failures', t => {
   store.complete(id, failure, fence)
   store.close()
   const legacy = new Database(path)
-  legacy.exec('DROP TABLE delegate_failure_inbox; ALTER TABLE delegate_jobs DROP COLUMN failure_inbox_enabled; PRAGMA user_version=4;')
+  legacy.exec('DROP TABLE delegate_delivery_receipt; ALTER TABLE delegate_jobs DROP COLUMN delivery_receipt_context; DROP TABLE delegate_failure_inbox; ALTER TABLE delegate_jobs DROP COLUMN failure_inbox_enabled; PRAGMA user_version=4;')
   const before = legacy.prepare('SELECT * FROM delegate_jobs').get() as Record<string, unknown>
   legacy.close()
   const upgraded = new DelegateDurableDb(path)
@@ -218,10 +218,11 @@ test('v4 upgrade keeps existing jobs and never backfills old failures', t => {
     assert.equal(upgraded.listUnacknowledgedFailures('3').count, 0)
     const connection = new Database(path, { readonly: true })
     try {
-      const { failure_inbox_enabled, ...after } = connection.prepare('SELECT * FROM delegate_jobs').get() as Record<string, unknown>
+      const { failure_inbox_enabled, delivery_receipt_context, ...after } = connection.prepare('SELECT * FROM delegate_jobs').get() as Record<string, unknown>
       assert.equal(failure_inbox_enabled, 0)
+      assert.equal(delivery_receipt_context, null)
       assert.deepEqual(after, before)
-      assert.equal(connection.pragma('user_version', { simple: true }), 5)
+      assert.equal(connection.pragma('user_version', { simple: true }), DELEGATE_DURABLE_SCHEMA_VERSION)
     } finally { connection.close() }
   } finally { upgraded.close() }
 })

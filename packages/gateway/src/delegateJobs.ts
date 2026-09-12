@@ -19,7 +19,7 @@ import {
   type DelegateJobKind,
   type DelegateJobState,
 } from '@openclaude/protocol'
-import type { DelegateDurableDb, DurableJobRecord } from './delegateDurable.js'
+import type { DelegateDurableDb, DurableJobRecord, DelegateReceiptContext } from './delegateDurable.js'
 
 export const DEFAULT_DELEGATE_JOB_TTL_MS = 2 * 60 * 60_000
 export const MIN_DELEGATE_JOB_TTL_MS = 60_000
@@ -155,6 +155,7 @@ export type DelegateJobWaitView =
     }
 
 export type DelegateCreateMeta = {
+  deliveryReceipt?: DelegateReceiptContext
   sessionKey?: string
   parentSessionKey?: string
   queued?: boolean
@@ -245,6 +246,8 @@ type JobEntry = {
 }
 
 export type DelegateJobStoreOptions = {
+  /** C0: no production caller may enable before the complete v2 consumer pair ships. */
+  deliveryReceipts?: boolean
   /** C0 groundwork: new-job inbox admission only; off until paired consumers ship. */
   failureInbox?: boolean
   ttlMs?: number
@@ -348,6 +351,7 @@ export class DelegateJobStore {
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
   private readonly failureInbox: boolean
+  private readonly deliveryReceipts: boolean
   private readonly onTerminal?: (job: DelegateJobSnapshot) => void
   private readonly onDrop?: (job: DelegateJobSnapshot) => void
   /**
@@ -376,8 +380,9 @@ export class DelegateJobStore {
     this.bootId = opts.bootId ?? `gw:${randomBytes(8).toString('hex')}`
     this.leaseMs = opts.leaseMs ?? 45_000
     this.durable = opts.durable ?? null
+    this.deliveryReceipts = opts.deliveryReceipts === true
     this.failureInbox = opts.failureInbox === true
-    if (this.failureInbox && (!this.durable || !this.sm)) {
+    if ((this.failureInbox || this.deliveryReceipts) && (!this.durable || !this.sm)) {
       throw new Error('delegate failure inbox requires durable state machine')
     }
     this.onTerminal = opts.onTerminal
@@ -397,12 +402,13 @@ export class DelegateJobStore {
     agentId: string,
     meta?: DelegateCreateMeta,
   ): { jobId: string; reused?: boolean } | { error: 'capacity' } {
+    if (meta?.deliveryReceipt && !this.deliveryReceipts) throw new Error('delegate receipt admission disabled')
     this.sweep()
     const idempotencyKey =
       this.sm && typeof meta?.idempotencyKey === 'string' && meta.idempotencyKey.trim()
         ? meta.idempotencyKey.trim()
         : undefined
-    if (idempotencyKey) {
+    if (idempotencyKey && !this.durable) {
       const existingId = this.byIdempotency.get(idempotencyKey)
       if (existingId && this.jobs.has(existingId)) return { jobId: existingId, reused: true }
     }
@@ -444,7 +450,8 @@ export class DelegateJobStore {
     }
     if (this.durable) {
       const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs, {
-        failureInbox: this.failureInbox && entry.kind === 'delegate',
+        failureInbox: (this.failureInbox && entry.kind === 'delegate') || !!meta?.deliveryReceipt,
+        deliveryReceipt: meta?.deliveryReceipt,
       })
       if ('error' in outcome) return { error: 'capacity' }
       if ('reused' in outcome) {
@@ -922,6 +929,7 @@ export class DelegateJobStore {
   }
 
   get(jobId: string): DelegateJobWaitView {
+    if (this.durable?.hasDeliveryReceiptEnrollment(jobId)) throw new Error('delegate receipt requires v2 consumer')
     this.sweep()
     const job = this.refreshJob(jobId)
     if (!job) {
@@ -933,6 +941,7 @@ export class DelegateJobStore {
   }
 
   async wait(jobId: string, waitMs: number): Promise<DelegateJobWaitView> {
+    if (this.durable?.hasDeliveryReceiptEnrollment(jobId)) throw new Error('delegate receipt requires v2 consumer')
     this.sweep()
     const job = this.refreshJob(jobId)
     if (!job) {
@@ -1098,6 +1107,8 @@ export class DelegateJobStore {
     for (const [id, job] of this.jobs) {
       if (!job.result || job.expiresAt === null || job.expiresAt > now) continue
       if (job.callbackState === 'pending' || job.callbackState === 'injecting') continue
+      // Pending receipt results cannot be retired before the paired consumer exists.
+      if (this.durable?.hasDeliveryReceiptEnrollment(id)) continue
       if (!this.persistRetire(job, now)) continue
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: id, ...(this.sm ? { failure_class: 'job_ttl_elapsed' as const } : {}) })
@@ -1345,6 +1356,7 @@ export class DelegateJobStore {
    * alone; the notifier owns them.
    */
   markResultConsumed(jobId: string): boolean {
+    if (this.durable?.hasDeliveryReceiptEnrollment(jobId)) return false
     const job = this.refreshJob(jobId)
     if (!job || !job.result) return false
     if (job.callback === 'stdout-wait') {
@@ -1386,6 +1398,7 @@ export class DelegateJobStore {
     const out: DelegateJobSnapshot[] = []
     for (const job of [...this.jobs.values()]) {
       if (job.parentSessionKey !== parentSessionKey) continue
+      if (this.durable?.hasDeliveryReceiptEnrollment(job.id)) continue
       if (job.callback !== 'stdout-wait' || job.callbackState !== 'none') continue
       const terminal = job.result != null || isDelegateTerminalState(job.state)
       if (

@@ -9,6 +9,11 @@
       "types": "./src/index.ts",
       "openclaude-precompiled": "./dist/index.js",
       "default": "./src/index.ts"
+    },
+    "./receiptWriteBarrier": {
+      "types": "./src/receiptWriteBarrier.ts",
+      "openclaude-precompiled": "./dist/receiptWriteBarrier.js",
+      "default": "./src/receiptWriteBarrier.ts"
     }
   },
   "dependencies": {
