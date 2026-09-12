@@ -14,6 +14,11 @@
       "types": "./src/receiptWriteBarrier.ts",
       "openclaude-precompiled": "./dist/receiptWriteBarrier.js",
       "default": "./src/receiptWriteBarrier.ts"
+    },
+    "./receiptDeliveryStore": {
+      "types": "./src/receiptDeliveryStore.ts",
+      "openclaude-precompiled": "./dist/receiptDeliveryStore.js",
+      "default": "./src/receiptDeliveryStore.ts"
     }
   },
   "dependencies": {

@@ -28,7 +28,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 6
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 7
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -219,6 +219,11 @@ CREATE TABLE delegate_delivery_receipt (
   PRIMARY KEY(job_id, generation)
 );
 CREATE INDEX idx_delegate_receipt_pending ON delegate_delivery_receipt(parent_session, state, created_at);
+`
+const DDL_V7 = `
+ALTER TABLE delegate_delivery_receipt ADD COLUMN owner_token TEXT;
+ALTER TABLE delegate_delivery_receipt ADD COLUMN parent_owner_epoch TEXT;
+ALTER TABLE delegate_delivery_receipt ADD COLUMN input_proof TEXT;
 `
 function checkedReceiptContext(context: DelegateReceiptContext): DelegateReceiptContext {
   if (typeof context.parentTurnKey !== 'string' || !context.parentTurnKey.trim() || context.parentTurnKey.length > 256 ||
@@ -564,6 +569,7 @@ export class DelegateDurableDb {
       if (current < 4) this.addRetiredAtColumn()
       if (current < 5) this.db.exec(DDL_V5)
       if (current < 6) this.db.exec(DDL_V6)
+      if (current < 7) this.db.exec(DDL_V7)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply.immediate()
