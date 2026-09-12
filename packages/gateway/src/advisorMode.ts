@@ -59,7 +59,7 @@ export function isAdvisorEngineOpen(
   env: NodeJS.ProcessEnv = process.env,
   provenEngines?: Iterable<string>,
 ): boolean {
-  if (!engine) return false
+  if (!engine || engine === 'ccb') return false
   if (openAdvisorEngines(env).has(engine)) return true
   if (!provenEngines) return false
   for (const item of provenEngines) {
@@ -68,14 +68,31 @@ export function isAdvisorEngineOpen(
   return false
 }
 
+export const CCB_ADVISOR_PROFILE_VERSION = 'ccb-advisor-v1' as const
+export const CCB_ADVISOR_HERMETIC_ENV = 'OPENCLAUDE_CCB_ADVISOR_HERMETIC'
+
+export type ProvenCcbAdvisorModel = {
+  modelId: string
+  providerId: string
+  profileVersion: typeof CCB_ADVISOR_PROFILE_VERSION
+}
+
+export type AdvisorConsultExecution = {
+  modelId: string
+  engine: 'ccb' | 'codex'
+  providerId: string
+  profileVersion?: typeof CCB_ADVISOR_PROFILE_VERSION
+}
+
 export type AdvisorCatalogModel = {
   modelId: string
   displayName: string
   engine: string
+  providerId?: string | null
   available?: boolean
 }
 
-export type AdvisorModelOption = { id: string; label: string; engine: string }
+export type AdvisorModelOption = { id: string; label: string; engine: string; providerId?: string }
 
 export function assertAdvisorModelAllowed(input: {
   requested: string
@@ -93,27 +110,125 @@ export function assertAdvisorModelAllowed(input: {
   return { ok: true, model: requested }
 }
 
+export function parseProvenCcbModels(raw: unknown): ProvenCcbAdvisorModel[] {
+  if (raw == null) return []
+  if (!Array.isArray(raw)) throw new Error('provenCcbModels invalid')
+  const out: ProvenCcbAdvisorModel[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error('provenCcbModels invalid')
+    }
+    const rec = item as Record<string, unknown>
+    if (typeof rec.modelId !== 'string' || !rec.modelId.trim() || rec.modelId.length > 64) {
+      throw new Error('provenCcbModels invalid')
+    }
+    if (typeof rec.providerId !== 'string' || !rec.providerId.trim() || rec.providerId.length > 64) {
+      throw new Error('provenCcbModels invalid')
+    }
+    if (rec.profileVersion !== CCB_ADVISOR_PROFILE_VERSION) {
+      throw new Error('provenCcbModels invalid')
+    }
+    out.push({
+      modelId: rec.modelId.trim(),
+      providerId: rec.providerId.trim(),
+      profileVersion: CCB_ADVISOR_PROFILE_VERSION,
+    })
+  }
+  return out
+}
+
+export function isCcbAdvisorModelProven(input: {
+  modelId: string
+  providerId: string | null | undefined
+  provenCcbModels?: Iterable<ProvenCcbAdvisorModel>
+}): boolean {
+  const modelId = input.modelId.trim()
+  const providerId = (input.providerId ?? '').trim()
+  if (!modelId || !providerId) return false
+  for (const row of input.provenCcbModels ?? []) {
+    if (
+      row.modelId === modelId &&
+      row.providerId === providerId &&
+      row.profileVersion === CCB_ADVISOR_PROFILE_VERSION
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 export function listProvenAdvisorModels(input: {
   catalog: readonly AdvisorCatalogModel[]
   provenEngines: Iterable<string>
+  provenCcbModels?: Iterable<ProvenCcbAdvisorModel>
 }): { advisorModels: AdvisorModelOption[]; advisorUnavailableReason?: string } {
-  const proven = new Set([...input.provenEngines].map((s) => s.trim()).filter(Boolean))
-  if (proven.size === 0) {
-    return {
-      advisorModels: [],
-      advisorUnavailableReason: '顾问引擎尚未完成无工具证明',
+  const proven = new Set(
+    [...input.provenEngines].map((s) => s.trim()).filter((s) => s && s !== 'ccb'),
+  )
+  const provenCcb = [...(input.provenCcbModels ?? [])]
+  const advisorModels: AdvisorModelOption[] = []
+  const seen = new Set<string>()
+  for (const row of input.catalog) {
+    if (row.available === false) continue
+    if (row.engine === 'codex' && proven.has('codex')) {
+      const key = `${row.engine}:${row.modelId}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      advisorModels.push({ id: row.modelId, label: row.displayName, engine: 'codex' })
+      continue
+    }
+    if (
+      row.engine === 'ccb' &&
+      isCcbAdvisorModelProven({
+        modelId: row.modelId,
+        providerId: row.providerId,
+        provenCcbModels: provenCcb,
+      })
+    ) {
+      const key = `${row.engine}:${row.modelId}:${row.providerId ?? ''}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      advisorModels.push({
+        id: row.modelId,
+        label: row.displayName,
+        engine: 'ccb',
+        providerId: row.providerId ?? undefined,
+      })
     }
   }
-  const advisorModels = input.catalog
-    .filter((row) => row.available !== false && proven.has(row.engine))
-    .map((row) => ({ id: row.modelId, label: row.displayName, engine: row.engine }))
   if (advisorModels.length === 0) {
     return {
       advisorModels: [],
-      advisorUnavailableReason: 'catalog 中没有已证明引擎的可用顾问型号',
+      advisorUnavailableReason:
+        proven.size === 0 && provenCcb.length === 0
+          ? '顾问引擎尚未完成无工具证明'
+          : 'catalog 中没有已证明引擎的可用顾问型号',
     }
   }
   return { advisorModels }
+}
+
+export function advisorExecutionFromSnapshotJson(snapshotJson: string | null | undefined): AdvisorConsultExecution | null {
+  if (!snapshotJson) return null
+  try {
+    const parsed = JSON.parse(snapshotJson) as { execution?: unknown }
+    const exec = parsed?.execution
+    if (!exec || typeof exec !== 'object' || Array.isArray(exec)) return null
+    const rec = exec as Record<string, unknown>
+    if (rec.engine !== 'ccb' && rec.engine !== 'codex') return null
+    if (typeof rec.modelId !== 'string' || !rec.modelId.trim()) return null
+    if (typeof rec.providerId !== 'string' || !rec.providerId.trim()) return null
+    return {
+      modelId: rec.modelId.trim(),
+      engine: rec.engine,
+      providerId: rec.providerId.trim(),
+      ...(rec.engine === 'ccb' && rec.profileVersion === CCB_ADVISOR_PROFILE_VERSION
+        ? { profileVersion: CCB_ADVISOR_PROFILE_VERSION }
+        : {}),
+    }
+  } catch {
+    return null
+  }
 }
 
 function historyText(row: MessageLike): string | undefined {
@@ -230,6 +345,7 @@ export type AdvisorSnapshot = {
   history: AdvisorSnapshotInput['historyRecords']
   currentTools: AdvisorSnapshotInput['currentTools']
   artifacts: AdvisorSnapshotInput['authorizedArtifacts']
+  execution?: AdvisorConsultExecution
 }
 
 const CONSTRAINT_CAP = 8_000
@@ -275,6 +391,7 @@ export function buildAdvisorSnapshot(input: {
   concern: string
   advisorModel: string
   source: AdvisorSnapshotInput
+  execution?: AdvisorConsultExecution
 }): AdvisorSnapshot {
   const missing: string[] = []
   let truncated = false
@@ -301,6 +418,7 @@ export function buildAdvisorSnapshot(input: {
     history: (input.source.historyRecords ?? []).filter((row) => row.role !== 'thinking'),
     currentTools: tools,
     artifacts,
+    ...(input.execution ? { execution: input.execution } : {}),
   }
 }
 

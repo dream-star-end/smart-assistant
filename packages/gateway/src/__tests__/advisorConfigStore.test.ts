@@ -72,6 +72,34 @@ describe('advisorConfigStore', () => {
     assert.equal(onlyDefault.defaultMode, 'solo')
   })
 
+  it('missing provenCcbModels reads as empty and markProvenCcbModel is model/provider scoped', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-collab-'))
+    const file = join(dir, 'collaboration-config.json')
+    await writeFile(
+      file,
+      JSON.stringify({
+        format: 1,
+        rev: 0,
+        defaultMode: 'solo',
+        defaultAdvisorModel: null,
+        provenEngines: ['codex'],
+        sessions: {},
+      }),
+      'utf8',
+    )
+    const store = new AdvisorConfigStore(file)
+    const doc = store.read()
+    assert.deepEqual(doc.provenCcbModels, [])
+    await assert.rejects(() => store.markEngineProven('ccb'))
+    const marked = await store.markProvenCcbModel({ modelId: 'MiniMax-M3', providerId: 'minimax' })
+    assert.equal(marked.provenCcbModels.length, 1)
+    assert.equal(marked.provenEngines.includes('ccb'), false)
+    const again = await store.markProvenCcbModel({ modelId: 'MiniMax-M3', providerId: 'minimax' })
+    assert.equal(again.provenCcbModels.length, 1)
+    const glm = await store.markProvenCcbModel({ modelId: 'glm-5.3-zai', providerId: 'zai' })
+    assert.equal(glm.provenCcbModels.length, 2)
+  })
+
   it('putIntent without sessionId and without asDefault does not write the user default', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'oc-collab-'))
     const store = new AdvisorConfigStore(join(dir, 'collaboration-config.json'))

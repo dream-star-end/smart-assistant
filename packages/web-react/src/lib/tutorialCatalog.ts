@@ -660,9 +660,9 @@ export const TUTORIAL_TOPICS = {
   },
   "advisor-mode": {
     featureId: "advisor-mode",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "顾问模式给全能助手配一个无工具 Codex 顾问。主模型不会因此被切换。一期只有已证明的 CCB 主会话可以咨询（MiniMax、GLM 等以实时 catalog 为准）；Codex、Cursor、Grok 等其它主引擎会在选择或发送前可见拒绝，不会静默换主或静默改成单人。需要时主模型通过 consult_advisor 提问。顾问只能给建议，不能改文件、跑命令或再委派。建议必须由执行者用证据验证后才交付，不能替代审批或正式审查员。",
+      "顾问模式给全能助手配一个无工具顾问（已证明的 Codex，以及按型号/供应商单独证明的 CCB）。主模型不会因此被切换。一期只有已证明的 CCB 主会话可以咨询（MiniMax、GLM 等以实时 catalog 为准）；Codex、Cursor、Grok 等其它主引擎会在选择或发送前可见拒绝，不会静默换主或静默改成单人。需要时主模型通过 consult_advisor 提问。顾问只能给建议，不能改文件、跑命令或再委派。建议必须由执行者用证据验证后才交付，不能替代审批或正式审查员。",
     outcome: "在不换主模型的前提下获得第二意见，并由主模型负责核验与执行。",
     scenarios: ["方案取舍需要第二意见", "主模型想核对实现约束", "对照普通/顾问/更强主模型的质量与费用"],
     steps: [

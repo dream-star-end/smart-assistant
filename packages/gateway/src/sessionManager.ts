@@ -3771,6 +3771,8 @@ export class SessionManager {
     skillEvalDraft?: { name: string; dir: string }
     /** V5 Auto-Dream one-shot isolation profile (CCB only). */
     hermeticNoTools?: boolean
+    /** Frozen CCB advisor model/provider/profile; last catalog ticket must match. */
+    advisorExecutionLock?: import('./advisorMode.js').AdvisorConsultExecution
     /** Static CCB --json-schema contract for one-shot structured output. */
     structuredOutputSchema?: Readonly<Record<string, unknown>>
     /** delegate 子会话计费归因(仅 handleDelegateTask 设置)→ runner
@@ -4145,6 +4147,7 @@ export class SessionManager {
       skillEvalDraft: opts.skillEvalDraft,
       usageAttribution: opts.usageAttribution,
       hermeticNoTools: opts.hermeticNoTools,
+      advisorExecutionLock: opts.advisorExecutionLock,
       structuredOutputSchema: opts.structuredOutputSchema,
     })
     const resumeTransportMismatch =
@@ -4873,9 +4876,14 @@ export class SessionManager {
       // Every execution, including direct warm submits, explicit models, cron
       // and delegates, crosses this fresh authority gate AFTER its predecessor.
       // A successful getOrCreate/display sync is not permission for this turn.
-      const admission = await resolveRuntimeExecutionAgent(
-        session._identityCreationOpts?.agent ?? { id: session.agentId },
-      )
+      // Hermetic advisor/Auto-Dream sessions skip marketplace identity the same
+      // way getOrCreate does — fetching it here would fail-closed the no-tools path.
+      const hermeticNoTools = session._identityCreationOpts?.hermeticNoTools === true
+      const admission = hermeticNoTools
+        ? { agent: session._identityCreationOpts?.agent ?? { id: session.agentId }, context: {} }
+        : await resolveRuntimeExecutionAgent(
+            session._identityCreationOpts?.agent ?? { id: session.agentId },
+          )
       if (admission.agent.id !== session.agentId) {
         throw new Error('COMPAT_CONFIG_CONFLICT: runner identity changed; reopen this session')
       }
