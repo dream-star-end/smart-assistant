@@ -340,19 +340,28 @@ async function main(): Promise<void> {
     const headers = gatewayDelegateHeaders()
     const receipt = process.env[RECEIPT_CAP_ENV] ? new ReceiptCliTransport() : undefined
     const jobIds = [...new Set(positional)]
-    const locators = new Map(await Promise.all(jobIds.map(async id => [id, await receipt?.lookup(id)] as const)))
-    if (receipt && jobIds.some(id => !locators.get(id))) throw new Error('receipt locator unavailable; job retained, do not resubmit')
+    const locators = new Map(await Promise.all(jobIds.map(async id =>
+      [id, await receipt?.lookup(id).catch(() => undefined)] as const)))
     const result = await runDelegateWaitLoop({
       jobIds,
       pollWaitMs: resolveDelegateWaitPollMs(),
       foregroundBudgetMs: resolveDelegateCliForegroundBudgetMs(),
-      waitOnce: (jobId, waitMs) => receipt && locators.get(jobId)
-        ? receipt.wait(locators.get(jobId)!, waitMs)
-        : postJsonToGateway(`${base}/api/delegate/wait`, {
+      waitOnce: async (jobId, waitMs) => {
+        if (receipt) {
+          const locator = locators.get(jobId)
+          // A failed/missing local candidate belongs to this item only. Never
+          // downgrade it to legacy consume or suppress ready sibling receipts.
+          if (!locator) return { statusCode: 409, body: JSON.stringify({
+            error: 'receipt locator unavailable; job retained, do not resubmit', jobId,
+          }) }
+          return receipt.wait(locator, waitMs)
+        }
+        return postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
           body: JSON.stringify({ jobId, waitMs }),
           timeoutMs: waitMs + 60_000,
-        }),
+        })
+      },
     })
     if (result.stderr) process.stderr.write(result.stderr)
     if (result.stdout) process.stdout.write(result.stdout)
