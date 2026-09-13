@@ -25,6 +25,10 @@ export function receiptContextHash(token: string): string {
 
 export function isReceiptConsumerTool(name: string): boolean {
   return name === 'Bash' || [
+    // CCB preserves hyphens; Codex's normalized namespace uses underscores.
+    'mcp__openclaude-memory__delegate_task',
+    'mcp__openclaude-memory__delegate_tasks',
+    'mcp__openclaude-memory__delegate_wait',
     'mcp__openclaude_memory__delegate_task',
     'mcp__openclaude_memory__delegate_tasks',
     'mcp__openclaude_memory__delegate_wait',

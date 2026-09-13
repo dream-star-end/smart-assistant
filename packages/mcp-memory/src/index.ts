@@ -32,6 +32,7 @@
 
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
 import './mcpStdioGuard.js'
+import { createReceiptMcpTransport, RECEIPT_MCP_META } from './receiptMcpTransport.js'
 import { readFileSync } from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -132,6 +133,7 @@ const DELEGATION_DEPTH = Math.max(
  *  Cursor 已改走正文 ```options 围栏;仅 OC_ASK_USER_MCP=1 时恢复原 MCP 卡。
  *  恢复时仍只挂在 Cursor 主会话上 —— CCB/Codex 各有原生提问工具。 */
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
+const receiptWaitEnabled = () => process.env.OPENCLAUDE_RECEIPT_CALLER_V2 === '1' && ENGINE_ID !== 'cursor'
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
@@ -226,7 +228,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListPresentTaskApproval(DELEGATION_DEPTH)) {
     base = base.filter((t) => t.name !== 'present_task_approval')
   }
+  const receiptWait = receiptWaitEnabled() ? base.filter(t => t.name === 'delegate_wait') : []
   base = filterListedDelegateTools(base, ENGINE_ID)
+  if (!base.some(t => t.name === 'delegate_wait')) base = [...base, ...receiptWait]
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
@@ -245,7 +249,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (isCursorHiddenDelegateTool(name)) {
       return toolError(cursorDelegateCliHint(name))
     }
-    if (name === 'delegate_wait' && !shouldExposeDelegateWait()) {
+    if (name === 'delegate_wait' && !shouldExposeDelegateWait() && !(receiptWaitEnabled() && req.params._meta?.[RECEIPT_MCP_META] !== undefined)) {
       return toolError(delegateWaitDisabledText())
     }
     switch (name) {
@@ -272,11 +276,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'send_to_agent':
         return await handleSendToAgent(args as any)
       case 'delegate_task':
-        return await handleDelegateTask(args as any)
+        return await handleDelegateTask(args as any, req.params._meta)
       case 'delegate_tasks':
         return await handleDelegateTasks(args as any)
       case 'delegate_wait':
-        return await handleDelegateWait(args as any)
+        return await handleDelegateWait(args as any, req.params._meta)
       case 'request_review':
         return await handleRequestReview(args as any)
       case 'consult_advisor':
@@ -750,7 +754,7 @@ async function handleDelegateTask(args: {
   toolsets?: string[]
   resumeSessionKey?: string
   allowSelf?: unknown
-}) {
+}, meta?: Record<string, unknown>) {
   const goalNorm = normalizeDelegateGoal(args?.goal, args as Record<string, unknown>)
   if (!goalNorm.ok) return toolError(goalNorm.error)
   const agentNorm = normalizeDelegateAgentId(args.agentId)
@@ -758,6 +762,10 @@ async function handleDelegateTask(args: {
   const modelNorm = normalizeDelegateModel(args.model)
   if (!modelNorm.ok) return toolError(modelNorm.error)
   const agentId = agentNorm.agentId || 'main'
+  const receipt = createReceiptMcpTransport(meta)
+  if (receipt) return receipt.start({ agentId, goal: goalNorm.goal, context: args.context,
+    effort: args.effort, toolsets: args.toolsets, resumeSessionKey: args.resumeSessionKey,
+    model: modelNorm.model, allowSelf: parseDelegateAllowSelf(args.allowSelf) })
   return handleDelegateTaskToAgent(agentId, {
     goal: goalNorm.goal,
     context: args.context,
@@ -1042,12 +1050,14 @@ async function runAsyncDelegateToAgent(
   })
 }
 
-async function handleDelegateWait(args: { jobId?: unknown; waitMs?: unknown }) {
-  if (!shouldExposeDelegateWait()) {
+async function handleDelegateWait(args: { jobId?: unknown; waitMs?: unknown }, meta?: Record<string, unknown>) {
+  if (!shouldExposeDelegateWait() && !(receiptWaitEnabled() && meta?.[RECEIPT_MCP_META] !== undefined)) {
     return toolError(delegateWaitDisabledText())
   }
   const jobId = typeof args?.jobId === 'string' ? args.jobId : ''
   try {
+    const receipt = createReceiptMcpTransport(meta)
+    if (receipt) return await receipt.wait(jobId, args?.waitMs)
     const r = await runMcpDelegateWait({
       jobId,
       waitMs: args?.waitMs,

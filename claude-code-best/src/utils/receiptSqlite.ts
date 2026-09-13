@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module'
 import type NodeDatabase from 'better-sqlite3'
-import { ReceiptDeliveryCoordinator, type ReceiptSqliteFactory } from '../../../packages/storage/src/receiptDeliveryCoordinator.js'
+import { ReceiptDeliveryCoordinator, type ReceiptSqlValue, type ReceiptSqliteFactory } from '../../../packages/storage/src/receiptDeliveryCoordinator.js'
 
 /** No eager native-addon import: the default CCB runtime is Bun, not Node. */
 export async function openReceiptDelivery(
@@ -18,7 +18,11 @@ export async function openReceiptDelivery(
     const Database = createRequire(import.meta.url)(
       'better-sqlite3',
     ) as typeof NodeDatabase
-    open = path => new Database(path, { fileMustExist: true })
+    open = path => {
+      const db = new Database(path, { fileMustExist: true })
+      return { exec: sql => db.exec(sql), prepare: sql => db.prepare<ReceiptSqlValue[]>(sql),
+        transaction: write => db.transaction(write), close: () => db.close() }
+    }
   }
   return new ReceiptDeliveryCoordinator(existingDatabasePath, open)
 }

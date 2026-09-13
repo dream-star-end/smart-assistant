@@ -1,17 +1,60 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { buildMcpToolName } from '../services/mcp/mcpStringUtils.js'
+import { RECEIPT_MCP_META, RECEIPT_MCP_RESULT_META } from '../../../packages/mcp-memory/src/receiptMcpTransport.js'
 import { homedir } from 'node:os'
 import type { AssistantMessage, UserMessage } from '../types/message.js'
 import { getSessionId } from '../bootstrap/state.js'
-import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
+import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator, type ReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../../../packages/mcp-memory/src/gatewayClient.js'
 
-const scopes = new AsyncLocalStorage<Readonly<Record<string, string>>>()
-/** Called only by the actual Shell spawn, never mutates process.env. Clear
- * inherited identity outside a native main-thread tool (including subagents). */
+type ReceiptScope = {
+  toolUseId: string; toolName: string; capability: string
+  env?: Readonly<Record<string, string>>
+  candidate?: ReceiptLocator
+}
+const scopes = new AsyncLocalStorage<ReceiptScope>()
+const platformServer = 'openclaude-memory'
+const mcpNames = ['delegate_task', 'delegate_wait'].map(name => buildMcpToolName(platformServer, name))
+/** Child shells inherit identity only inside their own actual native Bash call. */
 export function receiptShellEnvironment(): Record<string, string | undefined> {
-  return { [RECEIPT_CAP_ENV]: undefined, [RECEIPT_REPORT_ENV]: undefined, [RECEIPT_CACHE_ENV]: undefined, ...scopes.getStore() }
+  return { [RECEIPT_CAP_ENV]: undefined, [RECEIPT_REPORT_ENV]: undefined, [RECEIPT_CACHE_ENV]: undefined, ...scopes.getStore()?.env }
+}
+
+/** Only the co-located, gateway-configured stdio server receives capabilities.
+ * A same-named remote/SDK server or arbitrary local executable is not enrolled. */
+export function receiptMcpRequest(serverName: string, toolName: string, toolUseId: string | undefined,
+  config: { type?: string; command?: string; args?: string[]; env?: Record<string, string> }) {
+  const scope = scopes.getStore()
+  if (!scope || !mcpNames.includes(scope.toolName)) return undefined
+  if (serverName !== platformServer || scope.toolName !== buildMcpToolName(serverName, toolName) || scope.toolUseId !== toolUseId) {
+    throw new Error('receipt MCP actual tool mismatch')
+  }
+  const entry = (relative: string) => {
+    try { return realpathSync(fileURLToPath(new URL(relative, import.meta.url))) } catch { return undefined }
+  }
+  const source = entry('../../../packages/mcp-memory/src/index.ts')
+  const bundle = entry('../../../packages/mcp-memory/dist/oc-memory-mcp.cjs')
+  let actual: string | undefined
+  try { actual = realpathSync(config.args?.at(-1) || '') } catch { /* rejected below */ }
+  const args = config.args || []
+  const isSource = actual && actual === source && config.command === 'npx' && args.length === 2 && args[0] === 'tsx'
+  const isBundle = actual && actual === bundle && config.command === '/usr/local/bin/node' && args.length === 1
+  if ((config.type && config.type !== 'stdio') || (!isSource && !isBundle) ||
+      !process.env.OPENCLAUDE_DELEGATE_CONTEXT_FILE || config.env?.OPENCLAUDE_DELEGATE_CONTEXT_FILE !== process.env.OPENCLAUDE_DELEGATE_CONTEXT_FILE) {
+    throw new Error('receipt MCP requires built-in stdio transport')
+  }
+  return {
+    meta: { [RECEIPT_MCP_META]: { capability: scope.capability }, 'claudecode/toolUseId': scope.toolUseId },
+    capture(meta?: Record<string, unknown>) {
+      if (meta?.[RECEIPT_MCP_RESULT_META] === undefined) return
+      if (scope.candidate) throw new Error('multiple MCP results require composite admission')
+      scope.candidate = parseReceiptLocator(meta[RECEIPT_MCP_RESULT_META])
+    },
+  }
 }
 
 export async function prepareReceiptToolInvocation(opts: {
@@ -23,8 +66,8 @@ export async function prepareReceiptToolInvocation(opts: {
   const blocks = opts.assistantMessage.message.content
   const block = Array.isArray(blocks) ? blocks.filter(b => b.type === 'tool_use' && b.id === opts.toolUseId) : []
   if (block.length !== 1 || block[0]?.type !== 'tool_use') throw new Error('receipt invocation requires actual SDK tool')
-  // MCP enrollment is a separate per-request meta transport, not process env.
-  if (block[0].name !== 'Bash') return undefined
+  const toolName = block[0].name
+  if (toolName !== 'Bash' && !mcpNames.includes(toolName)) return undefined
   const nativeSessionId = getSessionId()
   const headers = gatewayDelegateHeaders()
   let response!: { statusCode: number; body: string }
@@ -44,19 +87,27 @@ export async function prepareReceiptToolInvocation(opts: {
   if (claims.nativeSessionId !== nativeSessionId || getSessionId() !== nativeSessionId ||
       claims.consumerToolUseId !== opts.toolUseId || claims.toolName !== block[0].name) throw new Error('receipt invocation native mismatch')
   const home = process.env.OPENCLAUDE_HOME?.trim() || join(homedir(), '.openclaude')
-  const root = join(home, 'receipt-invocations')
-  await mkdir(root, { recursive: true, mode: 0o700 })
-  const dir = await mkdtemp(join(root, 'call-'))
-  const report = join(dir, 'locator.json')
-  const env = Object.freeze({ [RECEIPT_CAP_ENV]: capability, [RECEIPT_REPORT_ENV]: report,
-    [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators') })
+  const scope: ReceiptScope = { toolUseId: opts.toolUseId, toolName, capability }
+  let report: string | undefined
+  if (toolName === 'Bash') {
+    const root = join(home, 'receipt-invocations')
+    await mkdir(root, { recursive: true, mode: 0o700 })
+    const dir = await mkdtemp(join(root, 'call-'))
+    report = join(dir, 'locator.json')
+    scope.env = Object.freeze({ [RECEIPT_CAP_ENV]: capability, [RECEIPT_REPORT_ENV]: report,
+      [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators') })
+  }
   return {
-    run: fn => scopes.run(env, fn),
+    run: fn => scopes.run(scope, fn),
     input: async () => {
-      let raw: string
-      try { raw = await readFile(report, 'utf8') }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
-      const locator = parseReceiptLocator(JSON.parse(raw))
+      let locator = scope.candidate
+      if (report) {
+        let raw: string
+        try { raw = await readFile(report, 'utf8') }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+        locator = parseReceiptLocator(JSON.parse(raw))
+      }
+      if (!locator) return undefined
       const { openReceiptDelivery } = await import('./receiptSqlite.js')
       const { createHttpReceiptInput } = await import('./receiptHttpInput.js')
       const delivery = await openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db'))

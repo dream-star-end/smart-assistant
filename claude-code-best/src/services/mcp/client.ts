@@ -1,3 +1,4 @@
+import { receiptMcpRequest } from '../../utils/receiptToolInvocation.js'
 import { feature } from 'bun:bundle'
 import type {
   Base64ImageSource,
@@ -1850,9 +1851,10 @@ export const fetchToolsForClient = memoizeWithLRU(
               onProgress?: ToolCallProgress<MCPProgress>,
             ) {
               const toolUseId = extractToolUseId(parentMessage)
-              const meta = toolUseId
+              const receipt = receiptMcpRequest(client.name, tool.name, context.toolUseId, client.config)
+              const meta = receipt?.meta ?? (toolUseId
                 ? { 'claudecode/toolUseId': toolUseId }
-                : {}
+                : {})
 
               // Emit progress when tool starts
               if (onProgress && toolUseId) {
@@ -1878,6 +1880,7 @@ export const fetchToolsForClient = memoizeWithLRU(
                     tool: tool.name,
                     args,
                     meta,
+                    disableRetries: !!receipt,
                     signal: context.abortController.signal,
                     setAppState: context.setAppState,
                     onProgress:
@@ -1892,6 +1895,7 @@ export const fetchToolsForClient = memoizeWithLRU(
                     handleElicitation: context.handleElicitation,
                   })
 
+                  receipt?.capture(mcpResult._meta)
                   // Emit progress when tool completes successfully
                   if (onProgress && toolUseId) {
                     onProgress({
@@ -1923,7 +1927,7 @@ export const fetchToolsForClient = memoizeWithLRU(
                   // Session expired — the connection cache has been
                   // cleared, so retry with a fresh client.
                   if (
-                    error instanceof McpSessionExpiredError &&
+                    !receipt && error instanceof McpSessionExpiredError &&
                     attempt < MAX_SESSION_RETRIES
                   ) {
                     logMCPDebug(
@@ -2902,6 +2906,7 @@ export async function callMCPToolWithUrlElicitationRetry({
   imageLimits,
   hasResultSizeAnnotation = false,
   callToolFn = callMCPTool,
+  disableRetries = false,
   handleElicitation,
 }: {
   client: ConnectedMCPServer
@@ -2914,6 +2919,8 @@ export async function callMCPToolWithUrlElicitationRetry({
   onProgress?: (data: MCPProgress) => void
   imageLimits?: ImageLimits
   hasResultSizeAnnotation?: boolean
+  /** Receipt creates cannot be replayed after an ambiguous transport error. */
+  disableRetries?: boolean
   /** Injectable for testing. Defaults to callMCPTool. */
   callToolFn?: (opts: {
     client: ConnectedMCPServer
@@ -2947,6 +2954,7 @@ export async function callMCPToolWithUrlElicitationRetry({
         hasResultSizeAnnotation,
       })
     } catch (error) {
+      if (disableRetries) throw error
       // The MCP SDK's Protocol creates plain McpError (not UrlElicitationRequiredError)
       // for error responses, so we check the error code instead of instanceof.
       if (

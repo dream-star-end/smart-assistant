@@ -26,11 +26,11 @@ export class ReceiptCliTransport {
   private readonly headers = Object.freeze(gatewayDelegateHeaders())
   private readonly cache: string
   private readonly report: string
-  constructor(env: NodeJS.ProcessEnv = process.env) {
+  constructor(env: NodeJS.ProcessEnv = process.env, private readonly onReady?: (locator: ReceiptLocator) => void) {
     this.capability = env[RECEIPT_CAP_ENV] || ''
     const root = env[RECEIPT_CACHE_ENV]
     this.report = env[RECEIPT_REPORT_ENV] || ''
-    if (!this.capability || !root || !this.report || !this.headers[DELEGATE_CONTEXT_HEADER]) throw new Error('receipt invocation unavailable')
+    if (!this.capability || !root || (!this.report && !onReady) || !this.headers[DELEGATE_CONTEXT_HEADER]) throw new Error('receipt invocation unavailable')
     this.cache = join(root, hash(this.headers[DELEGATE_CONTEXT_HEADER]))
     mkdirSync(this.cache, { recursive: true, mode: 0o700 })
   }
@@ -66,8 +66,11 @@ export class ReceiptCliTransport {
     }
     // A per-invocation file is a candidate channel, not stdout parsing and not
     // identity. O_EXCL prevents silently replacing another result in one tool.
-    const fd = openSync(this.report, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-    try { writeFileSync(fd, JSON.stringify(locator)); fsyncSync(fd) } finally { closeSync(fd) }
+    if (this.onReady) this.onReady(parseReceiptLocator(locator))
+    else {
+      const fd = openSync(this.report, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+      try { writeFileSync(fd, JSON.stringify(locator)); fsyncSync(fd) } finally { closeSync(fd) }
+    }
     return { statusCode: 200, body: JSON.stringify({ status: 'done', httpStatus: 200,
       output: '结果已准备，等待原生持久接收。' }) }
   }

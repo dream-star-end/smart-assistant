@@ -10,7 +10,8 @@ import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
-const mode=process.argv[3] || 'create';assert.ok(['create','wait','stop'].includes(mode))
+const requestedMode=process.argv[3] || 'create', mcp=requestedMode.startsWith('mcp-')
+const mode=requestedMode.replace(/^mcp-/, '');assert.ok(['create','wait','stop'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
@@ -24,7 +25,7 @@ const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packag
 const command=(mode==='wait'?'timeout --signal=TERM 8s ':'')+cli
 function send(res:any,body:any,tool:boolean,wait=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
- const content=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:'Bash',input:{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id}`:command,timeout:20000}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ const content=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:mcp?`mcp__openclaude-memory__${wait?'delegate_wait':'delegate_task'}`:'Bash',input:mcp?(wait?{jobId:(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id,waitMs:10000}:{agentId:'coding-assistant',goal:'synthetic-child-only'}):{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id}`:command,timeout:20000}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
  const message={id,type:'message',role:'assistant',model:body.model,content:[content],stop_reason:tool?'tool_use':'end_turn',stop_sequence:null,usage:{input_tokens:10,output_tokens:10}}
  if(!body.stream){res.setHeader('Content-Type','application/json');res.end(JSON.stringify(message));return}
  res.setHeader('Content-Type','text/event-stream')
@@ -41,10 +42,10 @@ const upstream=createServer(async(req,res)=>{
   let raw='';for await(const c of req)raw+=c
   const body=JSON.parse(raw||'{}')
   assert.ok(req.headers['x-api-key']==='synthetic-local-only'||req.headers.authorization==='Bearer synthetic-local-only','only synthetic upstream auth permitted')
-  requests.push({path:req.url,method:req.method,model:body.model,stream:body.stream,containsSentinel:raw.includes(sentinel)})
+  requests.push({path:req.url,method:req.method,model:body.model,stream:body.stream,containsSentinel:raw.includes(sentinel),toolNames:body.tools?.map((t:any)=>t.name)})
   if(req.url?.includes('count_tokens')) {res.end(JSON.stringify({input_tokens:100}));return}
   if(!req.url?.startsWith('/v1/messages')){res.statusCode=404;res.end('{}');return}
-  const main=body.tools?.some((t:any)=>t.name==='Bash')
+  const main=body.tools?.some((t:any)=>t.name===(mcp?'mcp__openclaude-memory__delegate_task':'Bash'))
   if(main&&phase===0){phase++;send(res,body,true)}
   else if(main&&phase===1&&mode==='wait'){assert.equal(executions,1);assert.ok(!raw.includes(sentinel));releaseChild();phase++;send(res,body,true,true)}
   else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
@@ -69,8 +70,9 @@ await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const port=(server.ad
 writeFileSync(join(dir,'token'),token,{mode:0o600})
 process.env.OPENCLAUDE_GATEWAY_PORT=String(port);process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE=join(dir,'token')
 process.env.OPENCLAUDE_HOME=dir;process.env.OPENCLAUDE_DELEGATE_JOBS_DB=dbPath
+if(mcp)process.env.OPENCLAUDE_DELEGATE_CURSOR_FAST_WAIT_MS='5000'
 process.env.CLAUDE_CONFIG_DIR=join(dir,'native');process.env.OPENCLAUDE_RECEIPT_CALLER_V2='1'
-const providerEnvOverride={ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
+const providerEnvOverride={...(mcp?{ENABLE_SEARCH_EXTRA_TOOLS:'false'}:{}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
 runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
 adapter=new CcbAdapter({harness:'ccb'} as any,runner)
 const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}
@@ -94,12 +96,12 @@ try {
   assert.equal(modelResults.length,1);assert.equal(nativeResults.length,1);assert.deepEqual(modelResults[0].content,nativeResults[0].content)
  }
  if(mode==='stop')assert.ok(!sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(sentinel)))
- process.stdout.write('MODEL_PROBE_PASS '+JSON.stringify({mode,nativeSession:runner.sessionId,phase,executions,received,isError:result?.isError,receiptState:row.state})+'\n')
-} catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n')}
+ process.stdout.write('MODEL_PROBE_PASS '+JSON.stringify({mode:requestedMode,nativeSession:runner.sessionId,phase,executions,received,isError:result?.isError,receiptState:row.state})+'\n')
+} catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n'+JSON.stringify({requests,http,sdkErrors:sdk.filter((m:any)=>m.type==='user'||m.type==='result').map((m:any)=>({type:m.type,message:m.message,errors:m.errors}))})+'\n')}
 finally {
  clearTimeout(timer);releaseChild();turn?.end();await runner.shutdown();server.closeAllConnections();upstream.closeAllConnections()
  await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r()))])
- writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup and child executor fixture'},null,2))
+ writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup and child executor fixture'},null,2))
  jobs.close()
 }
 
