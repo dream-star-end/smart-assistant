@@ -19,6 +19,11 @@
       "types": "./src/receiptDeliveryStore.ts",
       "openclaude-precompiled": "./dist/receiptDeliveryStore.js",
       "default": "./src/receiptDeliveryStore.ts"
+    },
+    "./receiptDeliveryCoordinator": {
+      "types": "./src/receiptDeliveryCoordinator.ts",
+      "openclaude-precompiled": "./dist/receiptDeliveryCoordinator.js",
+      "default": "./src/receiptDeliveryCoordinator.ts"
     }
   },
   "dependencies": {
