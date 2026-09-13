@@ -944,6 +944,14 @@ export class DelegateJobStore {
     return this.viewOf(job)
   }
 
+  /** No old wait/get/markResultConsumed, sweep, or in-memory fallback for v2. */
+  readReceiptInputOffer(jobId: string, generation: number, scope: {
+    userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
+  }) {
+    if (!this.durable) throw new Error('receipt input requires durable storage')
+    return this.durable.readReceiptInputOffer(jobId, generation, scope)
+  }
+
   async wait(jobId: string, waitMs: number): Promise<DelegateJobWaitView> {
     if (this.durable?.hasDeliveryReceiptEnrollment(jobId)) throw new Error('delegate receipt requires v2 consumer')
     this.sweep()

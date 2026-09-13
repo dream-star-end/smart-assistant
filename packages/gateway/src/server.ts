@@ -6249,6 +6249,10 @@ export class Gateway {
       this.handleReceiptOwner(req, res, url.pathname.endsWith('/issue')).catch((err) => this.sendInternalError(res, err))
       return
     }
+    if (url.pathname === `${RECEIPT_OWNER_PREFIX}input`) {
+      this.handleReceiptInputOffer(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
     // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
     if (url.pathname === '/api/delegate/wait') {
       this.handleDelegateWait(req, res).catch((err) => this.sendInternalError(res, err))
@@ -14138,6 +14142,51 @@ export class Gateway {
     const ownerState = observed === 'active' && parent._currentTurnKey !== claims.turnKey
       ? 'unknown' : observed
     return this.sendJson(res, 200, { ownerState })
+  }
+
+  /** Read an authoritative result for a separately attested native consumer.
+   * This endpoint never acknowledges delivery or rebinds the receipt creator. */
+  private async handleReceiptInputOffer(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    res.setHeader('Cache-Control', 'no-store')
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const contextToken = req.headers[DELEGATE_CONTEXT_HEADER]
+    if (!this.receiptHttpPrincipal(req) || typeof contextToken !== 'string' || !verifyDelegateContextToken(contextToken)) {
+      return this.sendError(res, 401, 'receipt input requires both credentials')
+    }
+    let body: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(await this.readBody(req))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid body')
+      body = parsed as Record<string, unknown>
+    } catch { return this.sendError(res, 400, 'invalid receipt input request') }
+    if (Object.keys(body).sort().join(',') !== 'capability,generation,jobId,receiptNonce' ||
+        typeof body.capability !== 'string' || typeof body.jobId !== 'string' || !body.jobId || body.jobId.length > 256 ||
+        !Number.isSafeInteger(body.generation) || (body.generation as number) < 0 ||
+        typeof body.receiptNonce !== 'string' || !/^[a-f0-9]{64}$/.test(body.receiptNonce)) {
+      return this.sendError(res, 400, 'invalid receipt input request')
+    }
+    // No await after this authenticated snapshot. A readBody timeout/expiry must
+    // never change the principal or allow a stale consumer to take a result.
+    const principal = this.receiptHttpPrincipal(req)
+    const bound = verifyDelegateContextToken(contextToken)
+    const consumer = this._receiptOwnerCapabilities.verify(body.capability)
+    if (!principal || !bound || !consumer || consumer.contextHash !== receiptContextHash(contextToken) ||
+        consumer.agentId !== bound.agentId || consumer.sessionKey !== bound.sessionKey) {
+      return this.sendError(res, 401, 'invalid receipt input authority')
+    }
+    if (principal.kind === 'user' && principal.userId !== consumer.userId) return this.sendError(res, 403, 'receipt input user mismatch')
+    const parent = this.sessions?.getByKey(bound.sessionKey)
+    if (!parent || parent.agentId !== consumer.agentId || (parent.userId || 'default') !== consumer.userId ||
+        parent._currentTurnKey !== consumer.turnKey || parent.runner.checkReceiptOwner?.(consumer) !== 'active') {
+      return this.sendError(res, 409, 'receipt input consumer unavailable')
+    }
+    if (!this._delegateJobs) return this.sendError(res, 503, 'receipt storage unavailable')
+    const offer = this._delegateJobs.readReceiptInputOffer(body.jobId, body.generation as number, {
+      userId: consumer.userId, parentSession: consumer.sessionKey, parentTurnKey: consumer.turnKey,
+      receiptNonceHash: receiptContextHash(body.receiptNonce),
+    })
+    if (!offer) return this.sendError(res, 404, 'receipt input unavailable')
+    return this.sendJson(res, 200, { ...offer, consumer })
   }
 
   private async handleDelegateWait(

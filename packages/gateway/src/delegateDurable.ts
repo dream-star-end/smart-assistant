@@ -757,6 +757,25 @@ export class DelegateDurableDb {
     }
   }
 
+  /** Authorized v2 offer, not consumption. Preserve the exact committed JSON
+   * bytes: reserializing a parsed result is not its durable digest contract. */
+  readReceiptInputOffer(jobId: string, generation: number, scope: {
+    userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
+  }): { binding: DelegateDeliveryReceipt; resultJson: string } | undefined {
+    return this.transaction(() => {
+      const binding = this.getDeliveryReceipt(jobId, generation)
+      if (!binding || binding.userId !== scope.userId || binding.parentSession !== scope.parentSession ||
+          binding.parentTurnKey !== scope.parentTurnKey || binding.receiptNonceHash !== scope.receiptNonceHash) return undefined
+      const row = this.db.prepare('SELECT result_json FROM delegate_jobs WHERE job_id=? AND retired_at IS NULL')
+        .get(jobId) as { result_json: string | null } | undefined
+      if (!row) return undefined
+      if (typeof row.result_json !== 'string' || createHash('sha256').update(row.result_json).digest('hex') !== binding.resultDigest) {
+        throw new Error('receipt durable result digest mismatch')
+      }
+      return { binding, resultJson: row.result_json }
+    })
+  }
+
   /** Same deterministic inode for the gateway coordinator and the eventual CCB writer. */
   async withDeliveryReceiptBarrier<T>(
     jobId: string,
