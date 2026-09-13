@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdtempSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -15,6 +15,7 @@ const home = mkdtempSync(join(tmpdir(), 'receipt-owner-http-'))
 process.env.OPENCLAUDE_HOME = home
 const { Gateway } = await import('../server.js')
 const { CcbAdapter } = await import('../engine/ccbAdapter.js')
+const { SubprocessRunner: NativeRunner } = await import('../subprocessRunner.js')
 const { issueDelegateContextToken, DELEGATE_CONTEXT_HEADER } = await import('../delegateContext.js')
 const { signJwt } = await import('../auth.js')
 const { ReceiptOwnerCapabilities } = await import('../receiptOwnerCapability.js')
@@ -25,10 +26,19 @@ const TURN = 'server-owned-turn-1'
 class SdkProcess extends EventEmitter {
   sessionId = 'native-ccb-session'
   isRunning = true
+  receiptProcessIdentity: object = {}
+  beforeInput?: () => void
+  afterInput?: () => void
   submitGate: Promise<void> = Promise.resolve()
   shutdownGate: Promise<void> = Promise.resolve()
   setConsultTurn(): void {}
-  async submit(): Promise<void> { await this.submitGate }
+  async submit(_input?: unknown, _requestId?: string, _authority?: unknown, _turn?: string,
+    onInput?: (identity: object) => void): Promise<void> {
+    await this.submitGate
+    this.beforeInput?.()
+    onInput?.(this.receiptProcessIdentity)
+    this.afterInput?.()
+  }
   interrupt(): boolean { return true }
   async shutdown(): Promise<void> { await this.shutdownGate; this.isRunning = false }
   tool(id: string, name = 'Bash', parent?: string): void {
@@ -74,6 +84,32 @@ async function fixture(userId = 'default') {
     })
     return { status: response.status, data: await response.json() as any, cache: response.headers.get('cache-control') }
   }
+  async function partialPost(action: string, body: unknown, authorization: string, completeAt: number) {
+    const bytes = JSON.stringify(body)
+    let atDispatch = 0
+    let atCompletion = 0
+    const result = await new Promise<{ status: number; data: any }>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const req = request(`http://127.0.0.1:${port}/api/delegate/receipt-owner/${action}`, {
+        method: 'POST', headers: { authorization, 'content-type': 'application/json',
+          'content-length': Buffer.byteLength(bytes), [DELEGATE_CONTEXT_HEADER]: context },
+      }, res => {
+        let text = ''
+        res.setEncoding('utf8'); res.on('data', chunk => { text += chunk })
+        res.on('end', () => { clearTimeout(timer); resolve({ status: res.statusCode!, data: JSON.parse(text) }) })
+      })
+      req.on('error', reject)
+      req.setTimeout(6000, () => req.destroy(new Error('partial-body test watchdog')))
+      // This listener runs after the actual Gateway.handleHttp listener has
+      // entered authentication/readBody; no auth or clock is mocked.
+      server.once('request', () => {
+        atDispatch = Date.now()
+        timer = setTimeout(() => { atCompletion = Date.now(); req.end(bytes.slice(1)) }, Math.max(1, completeAt - Date.now()))
+      })
+      req.write(bytes.slice(0, 1))
+    })
+    return { ...result, atDispatch, atCompletion }
+  }
   async function issue(id = 'creator') {
     const result = await post('issue', { toolUseId: id })
     assert.equal(result.status, 200, JSON.stringify(result.data))
@@ -81,7 +117,7 @@ async function fixture(userId = 'default') {
     assert.equal(result.cache, 'no-store')
     return result.data.capability as string
   }
-  return { process, adapter, turn, parent, post, issue, context,
+  return { process, adapter, turn, parent, post, partialPost, issue, context,
     hideParent: () => { visibleParent = undefined },
     close: async () => { turn.end(); await new Promise<void>(resolve => server.close(() => resolve())) },
   }
@@ -255,4 +291,126 @@ test('pending submit/failed submit, missing turn key, official-cc and native ses
   assert.ok(owner)
   process.sessionId = 'different-native-session'
   assert.equal(adapter.checkReceiptOwner(owner), 'inactive'); live.end()
+})
+
+
+test('body wait expiry rejects foreign JWT instead of changing it to default on issue and check', async () => {
+  const f = await fixture()
+  try {
+    f.process.tool('creator')
+    const capability = await f.issue()
+    assert.equal((await f.post('issue', { toolUseId: 'creator' }, { authorization: jwt('foreign') })).status, 403)
+    const expired = signJwt({ userId: 'foreign', exp: Math.floor(Date.now() / 1000) - 1 }, TOKEN)
+    assert.equal((await f.post('issue', { toolUseId: 'creator' }, { authorization: `Bearer ${expired}` })).status, 401)
+    for (const action of ['issue', 'check']) {
+      const exp = Math.floor(Date.now() / 1000) + 2
+      const token = signJwt({ userId: 'foreign', exp }, TOKEN)
+      const r = await f.partialPost(action, action === 'issue' ? { toolUseId: 'creator' } : { capability },
+        `Bearer ${token}`, exp * 1000 + 100)
+      assert.ok(r.atDispatch < exp * 1000, 'fixture must reach real handler before expiry')
+      assert.ok(r.atCompletion > exp * 1000, 'body must finish after real expiry')
+      assert.equal(r.status, 401, `${action}: expired foreign user must not become default`)
+      assert.equal(r.data.capability, undefined)
+      assert.notEqual(r.data.ownerState, 'active')
+    }
+    assert.equal((await f.post('issue', { toolUseId: 'creator' }, { authorization: jwt('default') })).status, 200)
+    assert.equal((await f.post('check', { capability }, { authorization: jwt('default') })).data.ownerState, 'active')
+    assert.equal((await f.post('check', { capability })).data.ownerState, 'active', 'explicit raw service remains supported')
+  } finally { await f.close() }
+})
+
+for (const event of ['exit-before-input', 'error-before-input', 'exit-after-input', 'stop-before-input', 'stop-after-input'] as const) {
+  test(`new writer ${event} during successful submit never revives receipt authority`, async () => {
+    const { adapter, process } = makeAdapter()
+    adapter.on('error', () => {})
+    const action = () => {
+      if (event.startsWith('stop')) adapter.interrupt()
+      else if (event.startsWith('error')) process.emit('error', new Error('synthetic writer error'))
+      else process.emit('exit', { code: 1, signal: null, crashed: true })
+    }
+    if (event.endsWith('before-input')) process.beforeInput = action
+    else process.afterInput = action
+    const turn = start(adapter)
+    await turn.submitted // deliberately successful callback even after the terminal signal
+    process.tool('creator')
+    assert.equal(adapter.getReceiptToolOwner('creator'), null)
+    turn.end()
+  })
+}
+
+const descriptor = { canonicalModel: 'glm-5.2', contextWindow: 1000000, capabilityZero: true,
+  supportsThinking: true, supportsVision: false, supportedEfforts: ['high'] }
+function nativeSubmitHarness() {
+  const runner = new NativeRunner({ sessionKey: SESSION, agentId: 'main', agentBaseDir: home,
+    model: 'glm-5.2', config: {} } as never)
+  const adapter = new CcbAdapter({ harness: 'ccb' } as EngineCreateOpts, runner)
+  const writes: Array<{ process: object; type: string }> = []
+  let duringUserWrite: (() => void) | undefined
+  const makeProcess = () => {
+    const proc = { stdin: {
+      write(line: string, cb?: (err?: Error | null) => void) {
+        const type = JSON.parse(line).type
+        writes.push({ process: proc, type })
+        if (type === 'user') duringUserWrite?.()
+        queueMicrotask(() => cb?.(null))
+        return true
+      }, destroy() {},
+    }, kill() { return true } }
+    return proc
+  }
+  const install = (nativeId: string) => {
+    const proc = makeProcess()
+    Object.assign(runner, { proc, closed: false, currentSessionId: nativeId,
+      spawnedExecutionDescriptor: descriptor })
+    return proc
+  }
+  const first = install('native-before')
+  runner.shutdown = async () => {
+    const proc = runner.receiptProcessIdentity
+    assert.ok(proc)
+    ;(runner as any)._forwardDrainedExitForProcess(proc, { code: 0, signal: null, crashed: false })
+  }
+  runner.start = async () => { install('native-after') }
+  const submit = (key: string, vision: boolean) => adapter.submitTurn({
+    input: 'native submit path', turnKey: key, onEvent: () => {},
+    sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+    modelAuthority: { authorityEnvelope: 'synthetic-authority', leaseEnvelope: 'synthetic-lease',
+      executionDescriptor: { ...descriptor, supportsVision: vision } },
+  })
+  const tool = (id: string) => runner.emit('message', { type: 'assistant', message: {
+    content: [{ type: 'tool_use', id, name: 'Bash', input: {} }],
+  } })
+  return { runner, adapter, first, writes, submit, tool, install,
+    onUserWrite: (fn: () => void) => { duringUserWrite = fn } }
+}
+
+test('actual SubprocessRunner.submit vision recycle binds only the new user-line writer', async () => {
+  const h = nativeSubmitHarness()
+  const first = h.submit('first-turn', false); await first.submitted; h.tool('first-tool')
+  const oldOwner = h.adapter.getReceiptToolOwner('first-tool'); assert.ok(oldOwner); first.end()
+  const next = h.submit('second-turn', true) // actual shouldRecycleForVisionCapability branch
+  await next.submitted; h.tool('next-tool')
+  const owner = h.adapter.getReceiptToolOwner('next-tool')
+  assert.ok(owner, 'successful new stdin writer must have receipt authority')
+  assert.equal(owner.nativeSessionId, 'native-after')
+  assert.notEqual(owner.parentOwnerEpoch, oldOwner.parentOwnerEpoch)
+  assert.equal(h.adapter.checkReceiptOwner(oldOwner), 'inactive')
+  assert.deepEqual(h.writes.map(w => w.type), ['update_environment_variables', 'user', 'update_environment_variables', 'user'])
+  assert.equal(h.writes[0].process, h.first)
+  assert.notEqual(h.writes[2].process, h.first)
+  assert.equal(h.writes[3].process, h.runner.receiptProcessIdentity)
+  next.end()
+})
+
+test('actual user stdin success followed by writer exit cannot mint authority on a later process', async () => {
+  const h = nativeSubmitHarness()
+  h.onUserWrite(() => {
+    ;(h.runner as any)._forwardDrainedExitForProcess(h.runner.receiptProcessIdentity, { code: 1, signal: null, crashed: true })
+  })
+  const turn = h.submit('first-turn', false)
+  await turn.submitted
+  h.install('native-after')
+  h.tool('late-tool')
+  assert.equal(h.adapter.getReceiptToolOwner('late-tool'), null)
+  turn.end()
 })

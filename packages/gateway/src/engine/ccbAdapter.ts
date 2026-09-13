@@ -207,6 +207,7 @@ interface CcbTurnContext {
   receiptOwnerEpoch: string
   receiptTurnKey?: string
   receiptRevoked: boolean
+  receiptProcessIdentity?: object
   receiptTools: Map<string, { name: string; nativeSessionId: string }>
   /**
    * P1-6 — 本 turn 未决的 can_use_tool permission_request(request_id 集)。
@@ -375,6 +376,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    */
   private _activeTurn: CcbTurnContext | null = null
   private readonly _receiptInstanceId = randomUUID()
+  private readonly _receiptDeadProcesses = new WeakSet<object>()
   /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
   private _interrupting = false
   /**
@@ -411,7 +413,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     for (const name of FORWARDED_RUNNER_EVENTS) {
       this.runner.on(name, (...args: unknown[]) => {
         // A later process start must never resurrect a dead writer's authority.
-        if (name === 'exit' || name === 'error') this._revokeReceiptOwner()
+        if (name === 'exit' || name === 'error') this._revokeReceiptProcessOwner()
         this.emit(name, ...args)
       })
     }
@@ -488,7 +490,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         // This callback is main-thread SDK-only (unlike Bash tail attribution).
         // The first observation is immutable; text/stdout and nested tools do not mint owners.
         const nativeSessionId = this.runner.sessionId
-        if (!ctx.receiptRevoked && tool.id && nativeSessionId && !ctx.receiptTools.has(tool.id)) {
+        if (!ctx.receiptRevoked && ctx.receiptProcessIdentity &&
+            ctx.receiptProcessIdentity === this.runner.receiptProcessIdentity &&
+            !this._receiptDeadProcesses.has(ctx.receiptProcessIdentity) &&
+            tool.id && nativeSessionId && !ctx.receiptTools.has(tool.id)) {
           ctx.receiptTools.set(tool.id, { name: tool.name, nativeSessionId })
         }
         params.onEvent({ kind: 'tool_use_detected', tool })
@@ -568,7 +573,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       this.runner.setConsultTurn(undefined)
     }
     const submitted = this.runner
-      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey)
+      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey, (identity) => {
+        // The runner has now selected the actual stdin writer, which may be a
+        // new process after a normal vision/profile recycle. Never clear Stop
+        // or a death observed for this exact writer during pending submission.
+        if (ctx.receiptProcessIdentity && ctx.receiptProcessIdentity !== identity) ctx.receiptRevoked = true
+        ctx.receiptProcessIdentity = identity
+        if (this._receiptDeadProcesses.has(identity)) ctx.receiptRevoked = true
+      })
       .then(() => {
         if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
           this._activeTurn = ctx
@@ -602,6 +614,15 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
+  private _revokeReceiptProcessOwner(): void {
+    const identity = this.runner.receiptProcessIdentity
+    if (!identity) return
+    this._receiptDeadProcesses.add(identity)
+    for (const ctx of [this._activeTurn, this._routeTurn]) {
+      if (ctx?.receiptProcessIdentity === identity) ctx.receiptRevoked = true
+    }
+  }
+
   private _revokeReceiptOwner(): void {
     if (this._activeTurn) this._activeTurn.receiptRevoked = true
     if (this._routeTurn) this._routeTurn.receiptRevoked = true
@@ -610,7 +631,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   getReceiptToolOwner(toolUseId: string): ReceiptToolOwner | null {
     const ctx = this._activeTurn
     if (this.harness !== 'ccb' || !ctx || this._routeTurn !== ctx || ctx.receiptRevoked ||
-        this._interrupting || ctx.parser.finalized || !this.runner.isRunning || !ctx.receiptTurnKey) return null
+        this._interrupting || ctx.parser.finalized || !this.runner.isRunning || !ctx.receiptTurnKey ||
+        !ctx.receiptProcessIdentity || ctx.receiptProcessIdentity !== this.runner.receiptProcessIdentity ||
+        this._receiptDeadProcesses.has(ctx.receiptProcessIdentity)) return null
     const tool = ctx.receiptTools.get(toolUseId)
     if (!tool || tool.nativeSessionId !== this.runner.sessionId) return null
     return {

@@ -14063,15 +14063,28 @@ export class Gateway {
     }
   }
 
+  /** Receipt endpoints cannot use getUserId's legacy default fallback as auth. */
+  private receiptHttpPrincipal(req: IncomingMessage): { kind: 'service' } | { kind: 'user'; userId: string } | null {
+    const token = this.extractToken(req)
+    if (checkToken(token, this.deps.config.gateway.accessToken)) return { kind: 'service' }
+    const jwt = verifyJwt(token, this.deps.config.gateway.accessToken)
+    if (jwt && typeof jwt.userId === 'string' && jwt.userId &&
+        Number.isFinite(jwt.exp) && jwt.exp > Date.now() / 1000) return { kind: 'user', userId: jwt.userId }
+    const commercial = this.verifyCommercialJwt(token)
+    if (commercial && commercial.exp > Date.now() / 1000) return { kind: 'user', userId: `c:${commercial.sub}` }
+    return null
+  }
+
   private async handleReceiptOwner(req: IncomingMessage, res: ServerResponse, issue: boolean): Promise<void> {
     res.setHeader('Cache-Control', 'no-store')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     // Explicitly require HTTP credentials; neither loopback nor bridge bypass
     // alone can grant this native capability.
-    if (!this.checkHttpAuth(req)) return this.sendError(res, 401, 'receipt owner requires HTTP authentication')
+    if (!this.receiptHttpPrincipal(req)) return this.sendError(res, 401, 'receipt owner requires HTTP authentication')
     const contextToken = req.headers[DELEGATE_CONTEXT_HEADER]
-    const bound = typeof contextToken === 'string' ? verifyDelegateContextToken(contextToken) : null
-    if (!bound || typeof contextToken !== 'string') return this.sendError(res, 401, 'invalid delegate context')
+    if (typeof contextToken !== 'string' || !verifyDelegateContextToken(contextToken)) {
+      return this.sendError(res, 401, 'invalid delegate context')
+    }
     let body: Record<string, unknown>
     try {
       const parsed: unknown = JSON.parse(await this.readBody(req))
@@ -14082,13 +14095,17 @@ export class Gateway {
     if (Object.keys(body).length !== 1 || typeof body[field] !== 'string' || !body[field]) {
       return this.sendError(res, 400, `only ${field} is accepted`)
     }
+    // readBody can outlive either credential. Re-authenticate at the decision
+    // boundary and snapshot an explicit principal; expired JWT is never default.
+    const principal = this.receiptHttpPrincipal(req)
+    const bound = verifyDelegateContextToken(contextToken)
+    if (!principal || !bound) return this.sendError(res, 401, 'receipt owner authentication expired')
     const parent = this.sessions?.getByKey(bound.sessionKey)
-    const rawBearer = checkToken(this.extractToken(req), this.deps.config.gateway.accessToken)
     // Raw gateway credentials are the existing single-tenant service principal,
     // NOT the multi-user JWT named 'default'. In that explicit mode, the signed
     // parent session supplies its own partition (e.g. c:3 on the container).
     // No fallback from a failed/foreign JWT, and no identity from the body/env.
-    const matchesUser = (userId: string): boolean => rawBearer || this.getUserId(req) === userId
+    const matchesUser = (userId: string): boolean => principal.kind === 'service' || principal.userId === userId
     const contextHash = receiptContextHash(contextToken)
     if (issue) {
       if (!parent || parent.agentId !== bound.agentId) return this.sendError(res, 409, 'parent unavailable')

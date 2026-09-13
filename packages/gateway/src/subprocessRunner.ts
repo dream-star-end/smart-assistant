@@ -1408,6 +1408,10 @@ export class SubprocessRunner extends EventEmitter {
     return this._boundRepoBinding
   }
 
+  /** Opaque in-process identity, never a PID or child-supplied session ID.
+   * Exit/error are emitted while this exact process still owns runner state. */
+  get receiptProcessIdentity(): object | null { return this.proc }
+
   /** True if the subprocess is currently alive or being started */
   get isRunning(): boolean {
     return (this.proc !== null && !this.closed) || this.starting
@@ -2091,6 +2095,7 @@ export class SubprocessRunner extends EventEmitter {
     _requestId?: string,
     authority?: TurnModelAuthority,
     turnKey?: string,
+    onReceiptInputProcess?: (identity: object) => void,
   ): Promise<void> {
     // 先解析 + 校验凭据:抛在这里 = 一行都没写 = 本 turn 没发出去(fail-closed)。
     // 也保证下方两次 write 之间**没有 await**(不给交叠 turn 插队的窗口)。
@@ -2158,7 +2163,7 @@ export class SubprocessRunner extends EventEmitter {
     // turn (fail-closed), but do not pretend descriptor/headers/attribution are
     // hot-updated in the stock process.
     if (envUpdateLine) await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
-    await this.writeTurnLineOrDestroy(`${JSON.stringify(userMsg)}\n`, 'user_message')
+    await this.writeTurnLineOrDestroy(`${JSON.stringify(userMsg)}\n`, 'user_message', onReceiptInputProcess)
   }
 
   /**
@@ -2192,9 +2197,13 @@ export class SubprocessRunner extends EventEmitter {
   private async writeTurnLineOrDestroy(
     line: string,
     phase: 'authority_env' | 'user_message',
+    onReceiptInputProcess?: (identity: object) => void,
   ): Promise<void> {
     const proc = this.proc
     if (!proc) throw new Error('CCB subprocess disappeared before stdin write')
+    // Bind receipt authority to the process that actually receives the user line,
+    // after normal internal recycle/start, before the synchronous stdin write.
+    onReceiptInputProcess?.(proc)
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const done = (err?: Error | null): void => {
