@@ -4,7 +4,7 @@ import { createDeferredReceiptInput } from './receiptInputAdmission.js'
 import type { QueuedCommand } from '../types/textInputTypes.js'
 import { receiptMcpTargetForSdk } from '../../../packages/gateway/src/receiptOwnerCapability.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { mkdtemp, mkdir } from 'node:fs/promises'
+import { ReceiptCandidateLifecycle } from '../../../packages/storage/src/receiptCandidateLifecycle.js'
 import { join } from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -124,7 +124,7 @@ export async function prepareReceiptToolInvocation(opts: {
     await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)))
   }
   if (response.statusCode !== 200) throw new Error(`receipt invocation rejected (${response.statusCode})`)
-  const { capability } = JSON.parse(response.body) as { capability?: string }
+  const { capability, reportPath } = JSON.parse(response.body) as { capability?: string; reportPath?: string }
   if (typeof capability !== 'string') throw new Error('receipt invocation capability missing')
   const credentials = new ReceiptConsumerCredentials(capability)
   // Authority is the authenticated HTTP response; decoding merely checks its
@@ -136,12 +136,12 @@ export async function prepareReceiptToolInvocation(opts: {
   const scope: ReceiptScope = { toolUseId: opts.toolUseId, toolName, capability, mcpToolName }
   let report: string | undefined
   if (toolName === 'Bash') {
-    const root = join(home, 'receipt-invocations')
-    await mkdir(root, { recursive: true, mode: 0o700 })
-    const dir = await mkdtemp(join(root, 'call-'))
-    report = dir
+    const root = join(home, 'receipt-candidates-v1')
+    const lifecycle = new ReceiptCandidateLifecycle(root)
+    if (typeof reportPath !== 'string' || reportPath !== lifecycle.reportPath(claims.locatorPartition, opts.toolUseId)) throw new Error('receipt report path mismatch')
+    report = reportPath
     scope.env = Object.freeze({ [RECEIPT_CAP_ENV]: capability, [RECEIPT_REPORT_ENV]: report,
-      [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators') })
+      [RECEIPT_CACHE_ENV]: root })
   }
   const readLocators = () => {
     if (scope.collection) return scope.collection

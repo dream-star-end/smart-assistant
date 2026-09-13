@@ -340,7 +340,8 @@ async function main(): Promise<void> {
     const headers = gatewayDelegateHeaders()
     const receipt = process.env[RECEIPT_CAP_ENV] ? new ReceiptCliTransport() : undefined
     const jobIds = [...new Set(positional)]
-    const locators = new Map(jobIds.map(id => [id, receipt?.lookup(id)]))
+    const locators = new Map(await Promise.all(jobIds.map(async id => [id, await receipt?.lookup(id)] as const)))
+    if (receipt && jobIds.some(id => !locators.get(id))) throw new Error('receipt locator unavailable; job retained, do not resubmit')
     const result = await runDelegateWaitLoop({
       jobIds,
       pollWaitMs: resolveDelegateWaitPollMs(),

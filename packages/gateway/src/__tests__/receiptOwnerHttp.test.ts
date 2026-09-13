@@ -2,11 +2,12 @@
  * Proves native identity and lifecycle, NOT receipt ingestion/notification ACK. */
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
 import { createServer, request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { withReceiptWriteBarrier } from '@openclaude/storage/receiptWriteBarrier'
 import type { SubprocessRunner } from '../subprocessRunner.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { TurnParams } from '../engine/engineAdapter.js'
@@ -117,10 +118,10 @@ async function fixture(userId = 'default') {
     assert.equal(result.cache, 'no-store')
     return result.data.capability as string
   }
-  return { process, adapter, turn, parent, post, partialPost, issue, context,
+  return { gw, process, adapter, turn, parent, post, partialPost, issue, context,
     caps: (gw as unknown as { _receiptOwnerCapabilities: InstanceType<typeof ReceiptOwnerCapabilities> })._receiptOwnerCapabilities,
     hideParent: () => { visibleParent = undefined },
-    close: async () => { turn.end(); await new Promise<void>(resolve => server.close(() => resolve())) },
+    close: async () => { turn.end(); clearTimeout((gw as any)._receiptCandidateTimer); await new Promise<void>(resolve => server.close(() => resolve())) },
   }
 }
 const jwt = (userId: string) => `Bearer ${signJwt({ userId, exp: Math.floor(Date.now() / 1000) + 3600 }, TOKEN)}`
@@ -558,4 +559,54 @@ test('refresh body wait rechecks JWT and signed context expiry, never changing p
     assert.equal(c.status, 401); assert.equal(c.data.capability, undefined)
 
   } finally { await f.close() }
+})
+
+
+test('candidate lifecycle HTTP issue registers ordinary Bash without a job and same-turn consumers share cache', async () => {
+  const f = await fixture()
+  try {
+    f.process.tool('plain-a'); f.process.tool('plain-b')
+    const a = await f.post('issue', { toolUseId: 'plain-a' }), b = await f.post('issue', { toolUseId: 'plain-b' })
+    assert.equal(a.status, 200); assert.equal(b.status, 200)
+    const claims = f.caps.verify(a.data.capability)!
+    assert.equal(claims.locatorPartition, f.caps.verify(b.data.capability)!.locatorPartition)
+    assert.ok(existsSync(a.data.reportPath)); assert.ok(existsSync(b.data.reportPath))
+    assert.notEqual(a.data.reportPath, b.data.reportPath)
+    assert.equal((f.gw as any)._delegateJobs, undefined)
+    f.turn.end()
+    await (f.gw as any)._sweepReceiptCandidates()
+    assert.equal(existsSync(a.data.reportPath), false); assert.equal(existsSync(b.data.reportPath), false)
+    const state = JSON.parse(readFileSync(join(home, 'receipt-candidates-v1', 'namespaces', claims.locatorPartition + '.json'), 'utf8'))
+    assert.equal(state.state, 'retired')
+    assert.equal((f.gw as any)._engineNotifier, undefined)
+  } finally { await f.close() }
+})
+
+
+test('candidate lifecycle retries a zero-job lock timeout via the real scheduler without manual recovery', { timeout: 45000 }, async () => {
+  const f = await fixture()
+  let release!: () => void
+  let holder: Promise<void> | undefined
+  try {
+    f.process.tool('retry-no-job')
+    const issued = await f.post('issue', { toolUseId: 'retry-no-job' })
+    assert.equal(issued.status, 200)
+    let entered!: () => void
+    const ready = new Promise<void>(r => { entered = r }), gate = new Promise<void>(r => { release = r })
+    holder = withReceiptWriteBarrier(join(home, 'receipt-candidates-v1', 'barrier.lock'), async () => { entered(); await gate })
+    await ready
+    f.turn.end()
+    await (f.gw as any)._sweepReceiptCandidates() // same turn-end call; real flock times out
+    assert.ok(existsSync(issued.data.reportPath))
+    release(); await holder
+    const deadline = Date.now() + 35000
+    while (existsSync(issued.data.reportPath)) {
+      assert.ok(Date.now() < deadline, 'real zero-job retry did not retire data')
+      await new Promise(r => setTimeout(r, 25))
+    }
+    const claims = f.caps.verify(issued.data.capability)!
+    assert.equal(JSON.parse(readFileSync(join(home, 'receipt-candidates-v1', 'namespaces', claims.locatorPartition + '.json'), 'utf8')).state, 'retired')
+    assert.equal((f.gw as any)._delegateJobs, undefined)
+    assert.equal((f.gw as any)._engineNotifier, undefined)
+  } finally { release?.(); await holder; await f.close() }
 })

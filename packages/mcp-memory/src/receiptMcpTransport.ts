@@ -24,7 +24,7 @@ export function createReceiptMcpTransport(meta?: Record<string, unknown>) {
   const home = process.env.OPENCLAUDE_HOME?.trim() || join(homedir(), '.openclaude')
   const receipt = new ReceiptCliTransport({ ...process.env,
     [RECEIPT_CAP_ENV]: (value as { capability: string }).capability,
-    [RECEIPT_REPORT_ENV]: undefined, [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators'),
+    [RECEIPT_REPORT_ENV]: undefined, [RECEIPT_CACHE_ENV]: join(home, 'receipt-candidates-v1'),
   }, locator => {
     if (candidate) throw new Error('multiple receipt results require composite admission')
     candidate = locator
@@ -45,7 +45,7 @@ export function createReceiptMcpTransport(meta?: Record<string, unknown>) {
       }))
     },
     async wait(jobId: string, waitMs: unknown) {
-      const locator = receipt.lookup(jobId)
+      const locator = await receipt.lookup(jobId)
       if (!locator) throw new Error('receipt locator unavailable; do not resubmit the job')
       return result(await runDelegateWaitLoop({ jobIds: [jobId],
         waitOnce: (_id, ms) => receipt.wait(locator, ms), pollWaitMs: 1000,

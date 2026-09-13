@@ -1,3 +1,6 @@
+import { homedir as receiptHome } from 'node:os'
+import { ReceiptCandidateLifecycle, type ReceiptCandidateScope } from '@openclaude/storage/receiptCandidateLifecycle'
+import { checkedReceiptToolOwner as checkedCandidateOwner, receiptLocatorPartition } from './receiptOwnerCapability.js'
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
@@ -2819,6 +2822,52 @@ export class Gateway {
   })
 
   private readonly _receiptOwnerCapabilities = new ReceiptOwnerCapabilities()
+  private _receiptCandidateStopped = false
+  private _receiptCandidateStore?: ReceiptCandidateLifecycle
+  private _receiptCandidateTimer?: ReturnType<typeof setTimeout>
+  private _receiptCandidateSweep?: Promise<void>
+  private receiptCandidates(): ReceiptCandidateLifecycle {
+    return this._receiptCandidateStore ??= new ReceiptCandidateLifecycle(join(
+      process.env.OPENCLAUDE_HOME?.trim() || join(receiptHome(), '.openclaude'), 'receipt-candidates-v1'))
+  }
+  /** Independent of job/notifier existence: enrolled ordinary Bash has no job. */
+  private _sweepReceiptCandidates(): Promise<void> {
+    if (this._receiptCandidateSweep) return this._receiptCandidateSweep
+    const work = (async () => {
+      let pending = false
+      try {
+        const store = this.receiptCandidates()
+        for (const partition of store.list()) {
+          try {
+            const retired = await store.retire(partition, scope => {
+              const owner = checkedCandidateOwner(scope.owner)
+              if (receiptLocatorPartition({ ...scope, ...owner }) !== partition) return false
+              const parent = this.sessions?.getByKey(scope.sessionKey)
+              if (parent && parent.agentId === scope.agentId && (parent.userId || 'default') === scope.userId) {
+                const state = parent.runner.checkReceiptOwner?.(owner)
+                if (state === 'active') return false
+                if (state === 'inactive') return true
+              }
+              return receiptParentDeathState(owner.parentProcess) === 'inactive'
+            })
+            if (!retired) pending = true
+          } catch (error) { pending = true; this.log.warn('receipt candidate retirement deferred', { partition }, error as Error) }
+        }
+      } catch (error) { pending = true; this.log.warn('receipt candidate discovery deferred', undefined, error as Error) }
+      if (pending) this._armReceiptCandidateRetry()
+    })()
+    this._receiptCandidateSweep = work
+    return work.finally(() => { this._receiptCandidateSweep = undefined })
+  }
+  private _armReceiptCandidateRetry(): void {
+    if (this._receiptCandidateStopped || this._receiptCandidateTimer) return
+    this._receiptCandidateTimer = setTimeout(() => {
+      this._receiptCandidateTimer = undefined
+      void this._sweepReceiptCandidates()
+    }, 30_000)
+    this._receiptCandidateTimer.unref()
+  }
+
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
@@ -2939,6 +2988,8 @@ export class Gateway {
 
   async start(): Promise<void> {
     const { config } = this.deps
+    this._receiptCandidateStopped = false
+    await this._sweepReceiptCandidates()
 
     // Phase 0.2: replay any server-authored messages queued to the outbox
     // while the previous gateway instance was unable to reach SQLite (disk
@@ -14207,10 +14258,25 @@ export class Gateway {
       if (!owner || owner.turnKey !== parent._currentTurnKey || !isReceiptConsumerTool(owner.toolName, owner.receiptMcpTarget)) {
         return this.sendError(res, 409, 'native receipt consumer unavailable')
       }
-      const capability = this._receiptOwnerCapabilities.issue({
-        ...owner, userId, agentId: parent.agentId, sessionKey: parent.sessionKey, contextHash,
-      })
-      return this.sendJson(res, 200, { capability, ownerState: 'active' })
+      const identity = { ...owner, userId, agentId: parent.agentId, sessionKey: parent.sessionKey, contextHash }
+      const scope: ReceiptCandidateScope = { partition: receiptLocatorPartition(identity), userId,
+        agentId: parent.agentId, sessionKey: parent.sessionKey, owner: { ...checkedCandidateOwner(owner) },
+        ...(parent.channel === 'webchat' && parent.peerId && parent.peerId !== 'unknown' ? { clientSessionId: parent.peerId } : {}) }
+      const validate = () => {
+        const currentPrincipal = this.receiptHttpPrincipal(req)
+        const currentContext = verifyDelegateContextToken(contextToken)
+        if (!currentPrincipal || !currentContext || currentContext.sessionKey !== bound.sessionKey || currentContext.agentId !== bound.agentId) throw new Error('receipt registration authentication expired')
+        if ((currentPrincipal.kind === 'user' && currentPrincipal.userId !== userId) ||
+            this.sessions?.getByKey(bound.sessionKey) !== parent || (parent.userId || 'default') !== userId ||
+            parent.agentId !== bound.agentId || parent._currentTurnKey !== owner.turnKey ||
+            parent.runner.checkReceiptOwner?.(owner) !== 'active') throw new Error('receipt registration owner unavailable')
+      }
+      let reportPath: string
+      try { reportPath = await this.receiptCandidates().register(scope, owner.consumerToolUseId, validate); validate() }
+      catch { this._armReceiptCandidateRetry(); return this.sendError(res, 409, 'receipt candidate registration unavailable') }
+      this._armReceiptCandidateRetry()
+      const capability = this._receiptOwnerCapabilities.issue(identity)
+      return this.sendJson(res, 200, { capability, ownerState: 'active', ...(owner.toolName === 'Bash' ? { reportPath } : {}) })
     }
     if (refresh) {
       // An expired signature is an identity witness, never direct result access.
@@ -16421,6 +16487,9 @@ export class Gateway {
       clearInterval(this._delegateReapTimer)
       this._delegateReapTimer = undefined
     }
+    this._receiptCandidateStopped = true
+    if (this._receiptCandidateTimer) clearTimeout(this._receiptCandidateTimer)
+    this._receiptCandidateTimer = undefined
     if (this._notifyRetryTimer) {
       clearTimeout(this._notifyRetryTimer)
       this._notifyRetryTimer = undefined
@@ -22486,6 +22555,8 @@ export class Gateway {
         turnErrored || clientTurnThrew ? 'errored' : 'completed',
         safeClientMessageId,
       )
+      // Retire candidate namespaces even when this ordinary turn created no job.
+      void this._sweepReceiptCandidates()
       // Parent turn is over. Any `delegate_task` (stdout-wait) job this turn
       // spawned and did not wait out has no one left to read it — hand it to
       // the Notifier so a later terminal wakes this webchat session.

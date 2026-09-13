@@ -24,6 +24,11 @@
       "types": "./src/receiptDeliveryCoordinator.ts",
       "openclaude-precompiled": "./dist/receiptDeliveryCoordinator.js",
       "default": "./src/receiptDeliveryCoordinator.ts"
+    },
+    "./receiptCandidateLifecycle": {
+      "types": "./src/receiptCandidateLifecycle.ts",
+      "openclaude-precompiled": "./dist/receiptCandidateLifecycle.js",
+      "default": "./src/receiptCandidateLifecycle.ts"
     }
   },
   "dependencies": {

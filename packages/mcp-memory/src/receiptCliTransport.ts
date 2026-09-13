@@ -1,6 +1,7 @@
 /** CLI carries locators, never an input ACK or authoritative result text. */
 import { randomBytes } from 'node:crypto'
-import { constants, mkdirSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, readSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
+import { ReceiptCandidateLifecycle, receiptReportId } from '@openclaude/storage/receiptCandidateLifecycle'
+import { constants, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, readSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { gatewayBaseUrl, postJsonToGateway, describeDelegateTransportError } from './gatewayClient.js'
 import { ReceiptConsumerCredentials } from './receiptConsumerCredentials.js'
@@ -134,6 +135,8 @@ export class ReceiptCliTransport {
   private readonly cacheRoot: string
   private readonly partition: string
   private readonly report: string
+  private readonly lifecycle: ReceiptCandidateLifecycle
+  private readonly reportId: string
   constructor(env: NodeJS.ProcessEnv = process.env, private readonly onReady?: (locator: ReceiptLocator) => void) {
     this.capability = env[RECEIPT_CAP_ENV] || ''
     const root = env[RECEIPT_CACHE_ENV]
@@ -143,26 +146,18 @@ export class ReceiptCliTransport {
     this.credentials = new ReceiptConsumerCredentials(this.capability)
     if (process.platform !== 'linux' || !isAbsolute(root)) throw new Error('receipt cache requires an absolute Linux path')
     this.cacheRoot = root
+    this.lifecycle = new ReceiptCandidateLifecycle(root)
+    const claims = JSON.parse(Buffer.from(this.capability.split('.')[0]!, 'base64url').toString())
+    this.reportId = receiptReportId(claims.consumerToolUseId)
+    if (this.report && this.report !== this.lifecycle.reportPath(this.partition, claims.consumerToolUseId)) throw new Error('receipt report scope mismatch')
   }
-  /** Pin both directories; later path replacement must not redirect operations.
-   * No long-lived FD and no cache GC: descendant writer lifetime is not known. */
-  private withCache<T>(create: boolean, fn: (path: string, fd: number) => T): T | undefined {
-    if (create) mkdirSync(this.cacheRoot, { recursive: true, mode: 0o700 })
-    let root: number
-    try { root = openPrivateDirectory(this.cacheRoot) }
-    catch (error) { if (!create && (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
-    try {
-      const path = `/proc/self/fd/${root}/${this.partition}`
-      if (create) {
-        try { mkdirSync(path, { mode: 0o700 }) }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
-        fsyncSync(root)
-      }
-      let fd: number
-      try { fd = openPrivateDirectory(path) }
-      catch (error) { if (!create && (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+  /** Lifecycle and publication share the original writer-held FD barrier.
+   * Only Gateway registration creates directories; no late mkdir on this path. */
+  private async withCache<T>(_create: boolean, fn: (path: string, fd: number) => T): Promise<T> {
+    return this.lifecycle.withActive(this.partition, namespace => {
+      const fd = openPrivateDirectory(join(namespace, 'cache'))
       try { return fn(`/proc/self/fd/${fd}`, fd) } finally { closeSync(fd) }
-    } finally { closeSync(root) }
+    })
   }
   async start(agentId: string, body: Record<string, unknown>) {
     const { headers, capability } = await this.credentials.current()
@@ -174,9 +169,9 @@ export class ReceiptCliTransport {
     })
     return { ...response, receiptNonce }
   }
-  remember(locator: ReceiptLocator): void {
+  async remember(locator: ReceiptLocator): Promise<void> {
     const checked = parseReceiptLocator(locator), data = JSON.stringify(checked)
-    this.withCache(true, (path, directory) => {
+    await this.withCache(true, (path, directory) => {
       const file = join(path, checked.jobId + '.json')
       const temp = join(path, '.pending-' + randomBytes(16).toString('hex'))
       const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
@@ -191,7 +186,7 @@ export class ReceiptCliTransport {
       } finally { unlinkSync(temp) }
     })
   }
-  lookup(jobId: string): ReceiptLocator | undefined {
+  async lookup(jobId: string): Promise<ReceiptLocator | undefined> {
     if (!/^dlgjob-[a-z0-9-]{1,150}$/.test(jobId)) throw new Error('invalid receipt job')
     return this.withCache(false, path => {
       try { return readCacheRecord(join(path, jobId + '.json'), jobId) }
@@ -221,7 +216,13 @@ export class ReceiptCliTransport {
     }
     // Per-invocation records are candidates, never input ACKs or identity.
     if (this.onReady) this.onReady(parseReceiptLocator(locator))
-    else publishReceiptReport(this.report, locator)
+    else await this.lifecycle.withActive(this.partition, namespace => {
+      const reports = openPrivateDirectory(join(namespace, 'reports'))
+      try {
+        const report = openPrivateDirectory(`/proc/self/fd/${reports}/${this.reportId}`)
+        try { publishReceiptReport(`/proc/self/fd/${report}`, locator) } finally { closeSync(report) }
+      } finally { closeSync(reports) }
+    })
     return { statusCode: 200, body: JSON.stringify({ status: 'done', httpStatus: 200,
       output: '结果已准备，等待原生持久接收。' }) }
   }

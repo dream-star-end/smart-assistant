@@ -141,7 +141,7 @@ export async function runDelegateStartAndWait(opts: {
     const data = JSON.parse(started.body) as { receiptGeneration?: number }
     if (!Number.isSafeInteger(data.receiptGeneration)) throw new Error('receipt start missing generation; do not resubmit')
     const locator = { jobId: start.jobId, generation: data.receiptGeneration!, receiptNonce: receipt.receiptNonce }
-    opts.receipt.remember(locator)
+    await opts.receipt.remember(locator)
     return runDelegateWaitLoop({ jobIds: [start.jobId], waitOnce: (_id, ms) => opts.receipt!.wait(locator, ms),
       pollWaitMs: opts.pollWaitMs, foregroundBudgetMs: opts.foregroundBudgetMs })
   }
