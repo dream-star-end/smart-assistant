@@ -205,6 +205,34 @@ test('missing session, replaced adapter, tampered capability and lost key remain
   } finally { await f.close() }
 })
 
+test('platform turn transition before adapter submit cannot attest old consumer as active', async () => {
+  const f = await fixture()
+  try {
+    f.process.tool('creator')
+    const capability = await f.issue()
+    f.parent._currentTurnKey = 'platform-next-turn-before-native-submit'
+    assert.equal((await f.post('issue', { toolUseId: 'creator' })).status, 409)
+    assert.equal((await f.post('check', { capability })).data.ownerState, 'unknown')
+    f.adapter.interrupt()
+    assert.equal((await f.post('check', { capability })).data.ownerState, 'inactive')
+  } finally { await f.close() }
+})
+
+test('capability verification handles expiry, future issue, non-ASCII signature and key replacement', () => {
+  const caps = new ReceiptOwnerCapabilities()
+  const owner = { userId: 'u', agentId: 'main', sessionKey: 's', contextHash: 'h',
+    adapterInstanceId: 'a', parentOwnerEpoch: 'p', turnKey: 't', nativeSessionId: 'n',
+    consumerToolUseId: 'tu', toolName: 'Bash' }
+  const token = caps.issue(owner, 1000)
+  const verified = caps.verify(token, 1001)
+  assert.ok(verified)
+  assert.equal(caps.verify(token, 999), null)
+  assert.equal(caps.verify(token, verified.exp), null)
+  assert.equal(caps.verify(token.split('.')[0] + '.' + '中'.repeat(43), 1001), null)
+  assert.equal(new ReceiptOwnerCapabilities().verify(token, 1001), null)
+  assert.equal(caps.verify(caps.issue({ ...owner, toolName: 'Read' }, 1000), 1001), null)
+})
+
 test('pending submit/failed submit, missing turn key, official-cc and native session change fail closed', async () => {
   const { adapter, process } = makeAdapter()
   let reject!: (err: Error) => void

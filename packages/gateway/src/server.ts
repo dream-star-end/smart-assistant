@@ -14115,7 +14115,11 @@ export class Gateway {
     if (!parent || parent.agentId !== claims.agentId || (parent.userId || 'default') !== claims.userId) {
       return this.sendJson(res, 200, { ownerState: 'unknown' })
     }
-    const ownerState = parent.runner.checkReceiptOwner?.(claims) ?? 'unknown'
+    const observed = parent.runner.checkReceiptOwner?.(claims) ?? 'unknown'
+    // Platform ownership can move before the adapter receives submit/interrupt.
+    // That transitional mismatch cannot authorize input or prove native death.
+    const ownerState = observed === 'active' && parent._currentTurnKey !== claims.turnKey
+      ? 'unknown' : observed
     return this.sendJson(res, 200, { ownerState })
   }
 
