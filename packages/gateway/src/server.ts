@@ -110,7 +110,8 @@ import {
   inspectConsultTurnToken,
   verifyDelegateContextToken,
 } from './delegateContext.js'
-import { ReceiptOwnerCapabilities, RECEIPT_OWNER_PREFIX, receiptContextHash, isReceiptConsumerTool } from './receiptOwnerCapability.js'
+import { receiptParentDeathState } from './receiptParentProcess.js'
+import { ReceiptOwnerCapabilities, RECEIPT_OWNER_PREFIX, receiptContextHash, isReceiptConsumerTool, checkedReceiptToolOwner } from './receiptOwnerCapability.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
 import { resolveGatewayListen } from './gatewayBind.js'
 import { resolveOpenedPath } from './openedPath.js'
@@ -483,6 +484,7 @@ import {
 } from './jobTerminal.js'
 import {
   openDelegateDurableDb,
+  type DelegateReceiptContext,
   resolveDelegateLedgerRetentionMs,
 } from './delegateDurable.js'
 import {
@@ -11475,11 +11477,44 @@ export class Gateway {
     return this._engineNotifier
   }
 
+  private readonly _receiptRecovering = new Map<string, Promise<void>>()
+
+  private async _recoverDelegateReceipt(job: DelegateJobSnapshot): Promise<void> {
+    const store = this._delegateJobs
+    if (!store?.hasDeliveryReceiptEnrollment(job.id)) return
+    const key = JSON.stringify([job.id, job.generation])
+    const existing = this._receiptRecovering.get(key)
+    if (existing) return existing
+    const work = (async () => {
+      await store.recoverReceipt(job.id, job.generation, async (saved, binding) => {
+        const session = this.sessions?.getByKey(binding.parentSession)
+        if (session) {
+          if (session.agentId !== saved.agentId || (session.userId || 'default') !== binding.userId) return 'unknown'
+          const state = session.runner.checkReceiptOwner?.(saved.owner) ?? 'unknown'
+          if (state === 'active') return session._currentTurnKey === binding.parentTurnKey ? 'active' : 'unknown'
+          if (state === 'inactive') return 'inactive'
+        }
+        return receiptParentDeathState(saved.owner.parentProcess)
+      })
+    })()
+    this._receiptRecovering.set(key, work)
+    try { await work } finally { this._receiptRecovering.delete(key) }
+  }
+
+  private async _recoverDelegateReceipts(parentSession?: string): Promise<void> {
+    for (const job of this._delegateJobs?.listReceiptRecoveryJobs(parentSession) ?? []) {
+      try { await this._recoverDelegateReceipt(job) }
+      catch (err) { this.log.warn('delegate receipt recovery deferred', { jobId: job.id }, err as Error) }
+    }
+  }
+
   private async _dispatchDelegateNotify(job: DelegateJobSnapshot): Promise<void> {
     const store = this._delegateJobs
     const notifier = this._ensureEngineNotifier()
     if (!store || !notifier) return
     try {
+      await this._recoverDelegateReceipt(job)
+      job = store.snapshotOf(job.id) ?? job
       const result = await dispatchJobTerminalNotify(store, job, notifier, this._notifyDispatchHooks())
       if ('skipped' in result) return
       if (!result.ok) {
@@ -11514,11 +11549,15 @@ export class Gateway {
   private _adoptOrphanedStdoutWaitDelegates(
     parentSessionKey: string | undefined,
     meta: { userId?: string; turnStartedAt?: number },
-  ): void {
+  ): Promise<void> | void {
     if (!parentSessionKey || !isDelegateNotifierEffective()) return
     const store = this._delegateJobs
     if (!store || !this._delegateReconcileReady) return
     if (!parseOriginWebchatSessionKey(parentSessionKey)) return
+    // Receipt jobs remain fenced out of the legacy adoption writer.
+    const receiptRecovery = this._recoverDelegateReceipts(parentSessionKey).then(() => this._retryDelegateNotifies())
+      .finally(() => this._armNotifyRetryScheduler())
+      .catch(err => this.log.warn('delegate receipt adoption deferred', { parentSessionKey }, err as Error))
     let adopted: DelegateJobSnapshot[]
     try {
       adopted = store.adoptOrphanedStdoutWait(parentSessionKey, {
@@ -11528,9 +11567,9 @@ export class Gateway {
       })
     } catch (err) {
       this.log.warn('delegate stdout-wait adoption failed', { parentSessionKey }, err as Error)
-      return
+      return receiptRecovery
     }
-    if (adopted.length === 0) return
+    if (adopted.length === 0) return receiptRecovery
     this.log.info('delegate stdout-wait jobs adopted for origin-inject', {
       parentSessionKey,
       jobIds: adopted.map((j) => j.id),
@@ -11541,6 +11580,7 @@ export class Gateway {
       // Already terminal: commit() does not re-fire onTerminal, dispatch now.
       void this._dispatchDelegateNotify(job)
     }
+    return receiptRecovery
   }
 
   private async _retryDelegateNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
@@ -11548,6 +11588,7 @@ export class Gateway {
     const notifier = this._ensureEngineNotifier()
     if (!store || !notifier) return
     try {
+      await this._recoverDelegateReceipts()
       const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks(), opts)
       if (summary.scanned > 0) this.log.info('delegate notify retry', summary)
     } catch (err) {
@@ -11597,12 +11638,15 @@ export class Gateway {
     if (!this._delegateJobs) return
     const notifierOn = isDelegateNotifierEffective()
     if (!notifierOn && !isDelegateDurableEffective()) return
-    const delay = notifierOn
+    let delay = notifierOn
       ? delayUntilNextNotifyRetry(this._delegateJobs)
       : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
           callbacks: ['cron-origin-inject'],
           skipLegacyCron: true,
         })
+    // Offered/unknown receipts have no old callback deadline yet. Reconcile
+    // through the existing scheduler, never reinterpret timeout as parent death.
+    if (notifierOn && this._delegateJobs.listReceiptRecoveryJobs().length) delay = Math.min(delay ?? 30_000, 30_000)
     if (delay == null) return
     this._notifyRetryTimer = setTimeout(() => {
       this._notifyRetryTimer = undefined
@@ -13787,7 +13831,7 @@ export class Gateway {
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
     // 拒绝路径不得产生副作用（不 create job、不 spawn、不 persist intent）。
-    let receiptEnrollment: { parentTurnKey: string; nativeToolUseId: string; receiptNonceHash: string } | undefined
+    let receiptEnrollment: DelegateReceiptContext | undefined
     let receiptUserId: string | undefined
     if (parsed.receipt !== undefined) {
       const receipt: unknown = parsed.receipt
@@ -13811,7 +13855,8 @@ export class Gateway {
       // Full C0 admission remains off in production; no env/body override.
       if (!isDelegateSmEnabled() || !this._delegateJobs?.acceptsDeliveryReceipts) return this.sendError(res, 409, 'receipt admission disabled')
       receiptEnrollment = { parentTurnKey: consumer.turnKey, nativeToolUseId: consumer.consumerToolUseId,
-        receiptNonceHash: receiptContextHash(receipt.receiptNonce) }
+        receiptNonceHash: receiptContextHash(receipt.receiptNonce),
+        parent: { agentId: consumer.agentId, owner: checkedReceiptToolOwner(consumer) } }
       receiptUserId = consumer.userId
     }
     const idempotencyKey = parseDelegateIdempotencyKey(parsed, req.headers)

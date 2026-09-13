@@ -1,4 +1,5 @@
 import { receiptMcpTargetForSdk, isReceiptConsumerTool } from '../receiptOwnerCapability.js'
+import { captureReceiptParentProcess } from '../receiptParentProcess.js'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
  *
@@ -638,6 +639,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         this._receiptDeadProcesses.has(ctx.receiptProcessIdentity)) return null
     const tool = ctx.receiptTools.get(toolUseId)
     if (!tool || tool.nativeSessionId !== this.runner.sessionId || !isReceiptConsumerTool(tool.name, tool.receiptMcpTarget)) return null
+    const parentProcess = captureReceiptParentProcess((ctx.receiptProcessIdentity as { pid?: number }).pid)
     return {
       adapterInstanceId: this._receiptInstanceId,
       parentOwnerEpoch: ctx.receiptOwnerEpoch,
@@ -646,6 +648,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       consumerToolUseId: toolUseId,
       toolName: tool.name,
       ...(tool.receiptMcpTarget ? { receiptMcpTarget: tool.receiptMcpTarget } : {}),
+      ...(parentProcess ? { parentProcess } : {}),
     }
   }
 

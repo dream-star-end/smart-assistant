@@ -5,6 +5,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { ReceiptToolOwner } from './engine/engineAdapter.js'
 import { DELEGATE_CONTEXT_TTL_MS } from './delegateContext.js'
+import { checkedReceiptParentProcess } from './receiptParentProcess.js'
 
 export const RECEIPT_OWNER_PREFIX = '/api/delegate/receipt-owner/'
 
@@ -47,6 +48,20 @@ export function isReceiptConsumerTool(name: string, receiptMcpTarget?: string): 
   ].includes(name)
 }
 
+/** Whitelist a persisted owner descriptor; never retain bearer/context tokens. */
+export function checkedReceiptToolOwner(value: unknown): ReceiptToolOwner {
+  const owner = value as ReceiptToolOwner | null
+  const copy: Record<string, unknown> = {}
+  for (const key of ['adapterInstanceId', 'parentOwnerEpoch', 'turnKey', 'nativeSessionId', 'consumerToolUseId', 'toolName'] as const) {
+    if (!owner || typeof owner[key] !== 'string' || !owner[key] || owner[key].length > 256) throw new Error('invalid receipt parent owner')
+    copy[key] = owner[key]
+  }
+  if (!isReceiptConsumerTool(owner!.toolName, owner!.receiptMcpTarget)) throw new Error('invalid receipt parent tool')
+  if (owner!.receiptMcpTarget !== undefined) copy.receiptMcpTarget = owner!.receiptMcpTarget
+  if (owner!.parentProcess !== undefined) copy.parentProcess = checkedReceiptParentProcess(owner!.parentProcess)
+  return Object.freeze(copy) as unknown as ReceiptToolOwner
+}
+
 /** One key per gateway instance. No disk/env key, no signing material in the child. */
 export class ReceiptOwnerCapabilities {
   private readonly key = randomBytes(32)
@@ -76,7 +91,8 @@ export class ReceiptOwnerCapabilities {
         'parentOwnerEpoch', 'turnKey', 'nativeSessionId', 'consumerToolUseId', 'toolName'] as const) {
         if (typeof c[key] !== 'string' || !c[key]) return null
       }
-      return isReceiptConsumerTool(c.toolName, c.receiptMcpTarget) ? c : null
+      checkedReceiptToolOwner(c)
+      return c
     } catch { return null }
   }
 

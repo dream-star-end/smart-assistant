@@ -9,6 +9,8 @@
 import { mkdirSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { withReceiptWriteBarrier } from '@openclaude/storage/receiptWriteBarrier'
+import { checkedReceiptToolOwner } from './receiptOwnerCapability.js'
+import type { ReceiptToolOwner } from './engine/engineAdapter.js'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -191,6 +193,7 @@ export type DelegateReceiptContext = {
   parentTurnKey: string
   nativeToolUseId: string
   receiptNonceHash: string
+  parent?: { agentId: string; owner: ReceiptToolOwner }
 }
 export type DelegateDeliveryReceipt = DelegateReceiptContext & {
   jobId: string
@@ -231,7 +234,16 @@ function checkedReceiptContext(context: DelegateReceiptContext): DelegateReceipt
       typeof context.receiptNonceHash !== 'string' || !/^[a-f0-9]{64}$/.test(context.receiptNonceHash)) {
     throw new Error('invalid delegate receipt context')
   }
-  return { parentTurnKey: context.parentTurnKey, nativeToolUseId: context.nativeToolUseId, receiptNonceHash: context.receiptNonceHash }
+  let parent: DelegateReceiptContext['parent']
+  if (context.parent !== undefined) {
+    const { agentId, owner: rawOwner } = context.parent
+    if (typeof agentId !== 'string' || !agentId || agentId.length > 256) throw new Error('invalid receipt parent agent')
+    const owner = checkedReceiptToolOwner(rawOwner)
+    if (owner.turnKey !== context.parentTurnKey || owner.consumerToolUseId !== context.nativeToolUseId) throw new Error('receipt creator owner mismatch')
+    parent = { agentId, owner }
+  }
+  return { parentTurnKey: context.parentTurnKey, nativeToolUseId: context.nativeToolUseId, receiptNonceHash: context.receiptNonceHash,
+    ...(parent ? { parent } : {}) }
 }
 
 export type DelegateFailureCursor = { failedAt: number; jobId: string; generation: number }
@@ -755,6 +767,20 @@ export class DelegateDurableDb {
       resultDigest: String(row.result_digest), state: row.state as DelegateDeliveryReceipt['state'],
       createdAt: num(row.created_at),
     }
+  }
+
+  getReceiptParent(jobId: string, generation: number): DelegateReceiptContext['parent'] {
+    const row = this.db.prepare('SELECT delivery_receipt_context FROM delegate_jobs WHERE job_id=? AND generation=? AND retired_at IS NULL')
+      .get(jobId, generation) as { delivery_receipt_context?: string } | undefined
+    if (!row?.delivery_receipt_context) return undefined
+    return checkedReceiptContext(JSON.parse(row.delivery_receipt_context)).parent
+  }
+
+  listReceiptRecoveryJobs(parentSession?: string): string[] {
+    return (this.db.prepare(`SELECT j.job_id FROM delegate_jobs j JOIN delegate_delivery_receipt r
+      ON r.job_id=j.job_id AND r.generation=j.generation WHERE j.retired_at IS NULL
+      AND r.state IN ('offered','ingest_claimed') AND (? IS NULL OR r.parent_session=?) ORDER BY r.created_at`)
+      .all(parentSession ?? null, parentSession ?? null) as { job_id: string }[]).map(row => row.job_id)
   }
 
   /** Scoped metadata only; never exposes result bytes or acknowledges delivery. */

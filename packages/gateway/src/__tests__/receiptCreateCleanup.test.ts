@@ -121,6 +121,12 @@ for (const mode of ['slot', 'waiter', 'sqlite-abort'] as const) {
       assert.equal(fresh.status, 200, JSON.stringify(fresh.body))
       const freshJob = jobs.snapshotOf(fresh.body.jobId)
       assert.equal(freshJob?.state, 'completed')
+      const saved = db.getReceiptParent(fresh.body.jobId, freshJob!.generation)!
+      assert.equal(saved.agentId, 'main')
+      assert.deepEqual(saved.owner, adapter.getReceiptToolOwner('creator'))
+      assert.equal(JSON.stringify(saved).includes(capability), false)
+      assert.deepEqual(Object.keys(saved).sort(), ['agentId', 'owner'])
+
       assert.equal(freshJob.result?.body.output, 'fresh request executed')
       assert.equal(executions, 1)
       assert.equal(observe().jobs, before.jobs + 1)

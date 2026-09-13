@@ -214,6 +214,7 @@ export interface ReceiptToolOwner {
   toolName: string
   /** Exact inner MCP target observed in an actual ExecuteExtraTool SDK block. */
   receiptMcpTarget?: string
+  parentProcess?: import('../receiptParentProcess.js').ReceiptParentProcess
 }
 export type ReceiptOwnerState = 'active' | 'inactive' | 'unknown'
 

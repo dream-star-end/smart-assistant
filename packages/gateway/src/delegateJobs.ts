@@ -951,6 +951,33 @@ export class DelegateJobStore {
     return this.durable?.hasDeliveryReceiptEnrollment(jobId) === true
   }
 
+  listReceiptRecoveryJobs(parentSession?: string): DelegateJobSnapshot[] {
+    return (this.durable?.listReceiptRecoveryJobs(parentSession) ?? [])
+      .flatMap(id => { const job = this.snapshotOf(id); return job ? [job] : [] })
+  }
+
+  /** Restart/turn-end caller only. Identity is the immutable create-time
+   * descriptor, not a fresh capability, missing session or inactivity timer. */
+  async recoverReceipt(jobId: string, generation: number,
+    parentState: (parent: NonNullable<DelegateReceiptContext['parent']>,
+      binding: import('@openclaude/storage/receiptDeliveryStore').TrustedReceiptBinding) => Promise<'active' | 'inactive' | 'unknown'>) {
+    if (!this.durable) return 'unknown' as const
+    const binding = this.durable.getDeliveryReceipt(jobId, generation)
+    const parent = this.durable.getReceiptParent(jobId, generation)
+    if (!binding || !parent || parent.owner.turnKey !== binding.parentTurnKey ||
+        parent.owner.consumerToolUseId !== binding.nativeToolUseId) return 'unknown' as const
+    const { ReceiptDeliveryStore } = await import('@openclaude/storage/receiptDeliveryStore')
+    const { observeReceiptNativeRecovery } = await import('./receiptNativeRecovery.js')
+    const delivery = new ReceiptDeliveryStore(this.durable.path, this.now)
+    const matches = (claim: import('@openclaude/storage/receiptDeliveryStore').ReceiptInputClaim) =>
+      claim.parentOwnerEpoch === parent.owner.parentOwnerEpoch && claim.proof.nativeSessionId === parent.owner.nativeSessionId
+    try {
+      return await delivery.recover(binding,
+        async claim => matches(claim) ? observeReceiptNativeRecovery(claim.proof) : { kind: 'unknown' },
+        async claim => claim && !matches(claim) ? 'unknown' : parentState(parent, binding))
+    } finally { delivery.close(); this.refreshJob(jobId) }
+  }
+
   /** Internal dispatcher only; not an HTTP identity or owner-selection API. */
   async dispatchReceiptNotification<T>(jobId: string, generation: number,
     dispatch: (claim: import('@openclaude/storage/receiptDeliveryStore').ReceiptNotifyClaim) => Promise<T>) {
