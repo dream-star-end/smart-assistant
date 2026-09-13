@@ -125,3 +125,30 @@ for (const finish of ['publish', 'kill'] as const) test(`actual second-process w
     assert.equal(existsSync(f.data), false)
   } finally { clearTimeout(timer); child.kill('SIGKILL'); await closed }
 })
+
+test('actual retire process SIGKILL after durable tombstone and before GC is recovered by a fresh instance', async () => {
+  const f = fixture(); await f.store.register(f.scope, 'a', () => {})
+  const root = fileURLToPath(new URL('../../../../', import.meta.url))
+  const child = spawn(process.execPath, ['--import', join(root, 'node_modules/tsx/dist/loader.mjs'),
+    fileURLToPath(new URL('./fixtures/receiptCandidateRetire.fixture.ts', import.meta.url)), f.store.root, f.scope.partition],
+  { env: { PATH: process.env.PATH!, HOME: f.dir }, stdio: ['ignore', 'pipe', 'pipe'] })
+  let output = '', error = '', ready!: () => void
+  const synced = new Promise<void>(r => { ready = r })
+  child.stdout.on('data', b => { output += b; if (output.includes('RETIRED_SYNCED')) ready() })
+  child.stderr.on('data', b => { error += b })
+  const closed = new Promise<number | null>((resolve, reject) => { child.once('close', resolve); child.once('error', reject) })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([synced, closed.then(() => { throw new Error(`retire exited early: ${error}`) }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('retire sync deadline')), 10000) })])
+    clearTimeout(timer)
+    assert.equal(JSON.parse(readFileSync(join(f.store.root, 'namespaces', f.scope.partition + '.json'), 'utf8')).state, 'retired')
+    assert.ok(existsSync(f.data), 'GC must not yet have run')
+    await assert.rejects(withReceiptWriteBarrier(join(f.store.root, 'barrier.lock'), async () => assert.fail('live retire lock stolen'), { timeoutMs: 30 }), /flock/)
+    child.kill('SIGKILL'); assert.equal(await closed, null)
+    const recovered = new ReceiptCandidateLifecycle(f.store.root)
+    assert.equal(await recovered.retire(f.scope.partition, () => false), true)
+    assert.equal(existsSync(f.data), false)
+    await assert.rejects(recovered.withActive(f.scope.partition, () => assert.fail('retired writer')), /unavailable/)
+  } finally { clearTimeout(timer); child.kill('SIGKILL'); await closed }
+})
