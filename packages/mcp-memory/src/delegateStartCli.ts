@@ -130,12 +130,9 @@ export async function runDelegateStartAndWait(opts: {
   pollWaitMs: number
   foregroundBudgetMs?: number
 }): Promise<DelegateWaitLoopResult> {
-  const receipt = opts.receipt?.enrollment()
-  const started = await opts.start(
-    opts.args.agentId,
-    JSON.stringify({ ...buildDelegateStartBody(opts.args), ...(receipt ? { receipt } : {}) }),
-    opts.contextToken,
-  )
+  const body = buildDelegateStartBody(opts.args)
+  const receipt = opts.receipt ? await opts.receipt.start(opts.args.agentId, body) : undefined
+  const started = receipt ?? await opts.start(opts.args.agentId, JSON.stringify(body), opts.contextToken)
   const start = interpretDelegateStartBody(started.statusCode, started.body)
   if ('error' in start) {
     return { exitCode: 1, stdout: '', stderr: `${start.error}\n` }

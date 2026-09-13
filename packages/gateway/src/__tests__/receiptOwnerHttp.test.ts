@@ -84,7 +84,7 @@ async function fixture(userId = 'default') {
     })
     return { status: response.status, data: await response.json() as any, cache: response.headers.get('cache-control') }
   }
-  async function partialPost(action: string, body: unknown, authorization: string, completeAt: number) {
+  async function partialPost(action: string, body: unknown, authorization: string, completeAt: number, signedContext = context) {
     const bytes = JSON.stringify(body)
     let atDispatch = 0
     let atCompletion = 0
@@ -92,7 +92,7 @@ async function fixture(userId = 'default') {
       let timer: ReturnType<typeof setTimeout> | undefined
       const req = request(`http://127.0.0.1:${port}/api/delegate/receipt-owner/${action}`, {
         method: 'POST', headers: { authorization, 'content-type': 'application/json',
-          'content-length': Buffer.byteLength(bytes), [DELEGATE_CONTEXT_HEADER]: context },
+          'content-length': Buffer.byteLength(bytes), [DELEGATE_CONTEXT_HEADER]: signedContext },
       }, res => {
         let text = ''
         res.setEncoding('utf8'); res.on('data', chunk => { text += chunk })
@@ -118,6 +118,7 @@ async function fixture(userId = 'default') {
     return result.data.capability as string
   }
   return { process, adapter, turn, parent, post, partialPost, issue, context,
+    caps: (gw as unknown as { _receiptOwnerCapabilities: InstanceType<typeof ReceiptOwnerCapabilities> })._receiptOwnerCapabilities,
     hideParent: () => { visibleParent = undefined },
     close: async () => { turn.end(); await new Promise<void>(resolve => server.close(() => resolve())) },
   }
@@ -478,5 +479,83 @@ test('locator partition is stable across real HTTP credential refresh but does n
     assert.equal((await f.post('check',{capability:fresh.data.capability},{[DELEGATE_CONTEXT_HEADER]:context})).data.ownerState,'active')
     f.parent._currentTurnKey='next-turn'
     assert.equal((await f.post('check',{capability:fresh.data.capability},{[DELEGATE_CONTEXT_HEADER]:context})).data.ownerState,'unknown')
+  } finally { await f.close() }
+})
+
+
+test('refresh uses signed expired witness only for the same active owner and new authenticated context', async () => {
+  const f = await fixture('c:3')
+  try {
+    f.process.tool('creator')
+    const original = await f.issue(), claims = f.caps.verify(original)!
+    const renewedContext = issueDelegateContextToken({ agentId: 'main', sessionKey: SESSION, depth: 0 })
+    const headers = { [DELEGATE_CONTEXT_HEADER]: renewedContext, authorization: jwt('c:3') }
+    const expired = f.caps.issue(claims, Date.now() - (claims.exp - claims.iat) - 100)
+    assert.equal((await f.post('check', { capability: expired })).status, 401)
+    assert.equal((await f.post('input', { capability: expired, jobId: 'dlgjob-no-job', generation: 1, receiptNonce: 'a'.repeat(64) })).status, 401)
+    for (const capability of [original, expired]) {
+      const refreshed = await f.post('refresh', { capability }, headers)
+      assert.equal(refreshed.status, 200, JSON.stringify(refreshed.data))
+      const next = f.caps.verify(refreshed.data.capability)!
+      assert.ok(next)
+      const fixed = (c: typeof claims) => { const { iat, exp, contextHash, ...identity } = c; return identity }
+      assert.deepEqual(fixed(next), fixed(claims))
+      assert.notEqual(next.contextHash, claims.contextHash)
+      assert.equal((await f.post('check', { capability: refreshed.data.capability }, headers)).data.ownerState, 'active')
+      assert.equal((await f.post('check', { capability: refreshed.data.capability })).status, 401)
+    }
+    const rejectedHeaders: Record<string, string>[] = [{ authorization: '' }, { authorization: jwt('c:4') }, { [DELEGATE_CONTEXT_HEADER]: '' },
+      { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ agentId: 'other', sessionKey: SESSION, depth: 0 }) },
+      { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ agentId: 'main', sessionKey: 'other-session', depth: 0 }) }]
+    for (const headers of rejectedHeaders) {
+      assert.ok([401, 403].includes((await f.post('refresh', { capability: expired }, headers)).status))
+    }
+    for (const capability of [expired + 'x', expired.split('.')[0] + '.' + 'a'.repeat(43), 'untrusted-tool-id']) {
+      assert.equal((await f.post('refresh', { capability }, headers)).status, 401)
+    }
+    assert.equal((await f.post('refresh', { capability: original, toolUseId: 'creator' }, headers)).status, 400)
+    assert.equal((await f.post('refresh', { capability: f.caps.issue(claims, Date.now() + 60000) }, headers)).status, 401)
+    f.adapter.interrupt()
+    assert.equal((await f.post('refresh', { capability: expired }, headers)).status, 409)
+    assert.equal((await f.post('refresh', { capability: original }, headers)).status, 409)
+  } finally { await f.close() }
+})
+
+test('refresh rejects replaced owner/process/native/session and same SDK ID reused after owner change', async () => {
+  for (const change of ['platform-turn', 'epoch-same-id', 'native', 'process', 'adapter', 'missing'] as const) {
+    const f = await fixture()
+    try {
+      f.process.tool('creator'); const capability = await f.issue()
+      if (change === 'platform-turn') f.parent._currentTurnKey = 'new-turn'
+      if (change === 'epoch-same-id') {
+        f.turn.end(); const next = start(f.adapter, TURN); await next.submitted; f.process.tool('creator')
+      }
+      if (change === 'native') f.process.sessionId = 'new-native'
+      if (change === 'process') f.process.receiptProcessIdentity = {}
+      if (change === 'adapter') {
+        const next = makeAdapter(); const turn = start(next.adapter); await turn.submitted
+        next.process.tool('creator'); f.parent.runner = next.adapter
+      }
+      if (change === 'missing') f.hideParent()
+      assert.equal((await f.post('refresh', { capability })).status, 409, change)
+    } finally { await f.close() }
+  }
+})
+
+test('refresh body wait rechecks JWT and signed context expiry, never changing principal', async () => {
+  const f = await fixture()
+  try {
+    f.process.tool('creator'); const capability = await f.issue()
+    const exp = Math.floor(Date.now() / 1000) + 2
+    const token = signJwt({ userId: 'foreign', exp }, TOKEN)
+    const r = await f.partialPost('refresh', { capability }, `Bearer ${token}`, exp * 1000 + 100)
+    assert.ok(r.atDispatch < exp * 1000); assert.ok(r.atCompletion > exp * 1000)
+    assert.equal(r.status, 401); assert.equal(r.data.capability, undefined)
+    const now = Date.now(), expires = now + 1200
+    const context = issueDelegateContextToken({ agentId: 'main', sessionKey: SESSION, depth: 0, now, ttlMs: 1200 })
+    const c = await f.partialPost('refresh', { capability }, `Bearer ${TOKEN}`, expires + 100, context)
+    assert.ok(c.atDispatch < expires); assert.ok(c.atCompletion > expires)
+    assert.equal(c.status, 401); assert.equal(c.data.capability, undefined)
+
   } finally { await f.close() }
 })

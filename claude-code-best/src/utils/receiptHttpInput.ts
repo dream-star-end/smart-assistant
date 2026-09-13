@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto'
 import type { ReceiptDeliveryCoordinator, TrustedReceiptBinding } from '../../../packages/storage/src/receiptDeliveryCoordinator.js'
 import type { ReceiptOwnerClaims } from '../../../packages/gateway/src/receiptOwnerCapability.js'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway, DELEGATE_CONTEXT_HEADER } from '../../../packages/mcp-memory/src/gatewayClient.js'
+import { ReceiptConsumerCredentials } from '../../../packages/mcp-memory/src/receiptConsumerCredentials.js'
 import { formatDelegateHttpResult } from '../../../packages/mcp-memory/src/delegateCursorFastPath.js'
 import { getSessionId } from '../bootstrap/state.js'
 import type { AssistantMessage, UserMessage } from '../types/message.js'
@@ -45,26 +46,31 @@ export async function createHttpReceiptInput(opts: {
   if (!headers[DELEGATE_CONTEXT_HEADER] || !headers.Authorization?.replace(/^Bearer\s*/, '')) {
     throw new Error('receipt HTTP credentials unavailable')
   }
-  const post = async (action: string, body: unknown) => {
+  const issue = async () => {
     for (let attempt = 0; ; attempt++) {
-      const response = await postJsonToGateway(base + action, { headers, body: JSON.stringify(body), timeoutMs: 5000 })
+      const response = await postJsonToGateway(base + 'issue', { headers, body: JSON.stringify({ toolUseId }), timeoutMs: 5000 })
       // SDK stdout registration and tool HTTP can briefly race. Retry only
       // unavailable ISSUE, same native identity, bounded; never rebind/fallback.
-      if (action === 'issue' && response.statusCode === 409 && attempt < 3) {
+      if (response.statusCode === 409 && attempt < 3) {
         await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)))
         continue
       }
-      if (response.statusCode !== 200) throw new Error(`receipt ${action} rejected (${response.statusCode})`)
+      if (response.statusCode !== 200) throw new Error(`receipt issue rejected (${response.statusCode})`)
       return JSON.parse(response.body)
     }
   }
   // No stdout parsing or caller-supplied epoch. Actual SDK ID is looked up by
   // the gateway, then checked again against this actual native session/tool.
-  const issued = opts.backgroundNotification && opts.capability
-    ? { capability: opts.capability } : await post('issue', { toolUseId })
+  const issued = opts.capability ? { capability: opts.capability } : await issue()
   if (typeof issued.capability !== 'string') throw new Error('missing receipt consumer capability')
-  const capability: string = issued.capability
-  const offered = await post('input', { ...locator, capability })
+  const credentials = new ReceiptConsumerCredentials(issued.capability)
+  const post = async (action: string, body: Record<string, unknown> = {}) => {
+    const { headers, capability } = await credentials.current()
+    const response = await postJsonToGateway(base + action, { headers, body: JSON.stringify({ ...body, capability }), timeoutMs: 5000 })
+    if (response.statusCode !== 200) throw new Error(`receipt ${action} rejected (${response.statusCode})`)
+    return JSON.parse(response.body)
+  }
+  const offered = await post('input', locator)
   const consumer = offered.consumer as ReceiptOwnerClaims
   const rawBinding = offered.binding as TrustedReceiptBinding
   const resultJson: unknown = offered.resultJson
@@ -101,7 +107,7 @@ export async function createHttpReceiptInput(opts: {
       const delivery = opts.delivery ?? await opts.openDelivery!()
       try { return await delivery.ingest(binding, { parentOwnerEpoch: epoch, proof, isCurrentParentOwner: async () => {
         if (getSessionId() !== nativeSessionId) return false
-        const checked = await post('check', { capability })
+        const checked = await post('check')
         return getSessionId() === nativeSessionId && checked.ownerState === 'active'
       } }, write, oracle) }
       finally { if (opts.openDelivery) delivery.close(); else opts.releaseDelivery?.() }

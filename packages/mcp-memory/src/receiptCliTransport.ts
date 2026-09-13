@@ -2,7 +2,8 @@
 import { randomBytes } from 'node:crypto'
 import { constants, mkdirSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, readSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
-import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
+import { gatewayBaseUrl, postJsonToGateway, describeDelegateTransportError } from './gatewayClient.js'
+import { ReceiptConsumerCredentials } from './receiptConsumerCredentials.js'
 
 export const RECEIPT_CAP_ENV = 'OPENCLAUDE_RECEIPT_INVOCATION'
 export const RECEIPT_REPORT_ENV = 'OPENCLAUDE_RECEIPT_REPORT'
@@ -129,7 +130,7 @@ export function snapshotReceiptReport(directory: string): { locators: ReceiptLoc
  * gateway verifies its hash/partition and native independently verifies consumer. */
 export class ReceiptCliTransport {
   readonly capability: string
-  private readonly headers = Object.freeze(gatewayDelegateHeaders())
+  private readonly credentials: ReceiptConsumerCredentials
   private readonly cacheRoot: string
   private readonly partition: string
   private readonly report: string
@@ -137,8 +138,9 @@ export class ReceiptCliTransport {
     this.capability = env[RECEIPT_CAP_ENV] || ''
     const root = env[RECEIPT_CACHE_ENV]
     this.report = env[RECEIPT_REPORT_ENV] || ''
-    if (!this.capability || !root || (!this.report && !onReady) || !this.headers[DELEGATE_CONTEXT_HEADER]) throw new Error('receipt invocation unavailable')
+    if (!this.capability || !root || (!this.report && !onReady)) throw new Error('receipt invocation unavailable')
     this.partition = candidatePartition(this.capability)
+    this.credentials = new ReceiptConsumerCredentials(this.capability)
     if (process.platform !== 'linux' || !isAbsolute(root)) throw new Error('receipt cache requires an absolute Linux path')
     this.cacheRoot = root
   }
@@ -162,7 +164,16 @@ export class ReceiptCliTransport {
       try { return fn(`/proc/self/fd/${fd}`, fd) } finally { closeSync(fd) }
     } finally { closeSync(root) }
   }
-  enrollment() { return { capability: this.capability, receiptNonce: randomBytes(32).toString('hex') } }
+  async start(agentId: string, body: Record<string, unknown>) {
+    const { headers, capability } = await this.credentials.current()
+    const receiptNonce = randomBytes(32).toString('hex')
+    // Refresh BEFORE nonce/create. Never retry a failed create or use a stale
+    // start closure's context token; one operation owns this exact pair.
+    const response = await postJsonToGateway(gatewayBaseUrl() + `/api/agents/${encodeURIComponent(agentId)}/delegate`, {
+      headers, body: JSON.stringify({ ...body, receipt: { capability, receiptNonce } }), timeoutMs: 15000,
+    })
+    return { ...response, receiptNonce }
+  }
   remember(locator: ReceiptLocator): void {
     const checked = parseReceiptLocator(locator), data = JSON.stringify(checked)
     this.withCache(true, (path, directory) => {
@@ -188,9 +199,19 @@ export class ReceiptCliTransport {
     })
   }
   async wait(locator: ReceiptLocator, waitMs: number): Promise<{ statusCode: number; body: string }> {
-    const result = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
-      headers: this.headers, body: JSON.stringify({ ...locator, capability: this.capability }), timeoutMs: 5000,
-    })
+    let result: { statusCode: number; body: string }
+    try {
+      const { headers, capability } = await this.credentials.current()
+      result = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
+        headers, body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
+      })
+    } catch (error) {
+      // The legacy wait loop retries thrown socket errors. Receipt refresh/status
+      // must fail this attempt closed, not silently resend or downgrade identity.
+      // This reports an unavailable read, NOT a failed child or a delivery ACK.
+      return { statusCode: 503, body: JSON.stringify({ error:
+        `receipt status unavailable: ${describeDelegateTransportError(error)}; job retained, do not resubmit` }) }
+    }
     if (result.statusCode !== 200) return result
     const data = JSON.parse(result.body) as { status?: string }
     if (data.status !== 'ready') {

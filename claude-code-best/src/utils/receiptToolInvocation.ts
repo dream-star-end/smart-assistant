@@ -15,6 +15,7 @@ import type { AssistantMessage, UserMessage } from '../types/message.js'
 import { getSessionId } from '../bootstrap/state.js'
 import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator, parseReceiptLocatorCollection, snapshotReceiptReport, type ReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../../../packages/mcp-memory/src/gatewayClient.js'
+import { ReceiptConsumerCredentials } from '../../../packages/mcp-memory/src/receiptConsumerCredentials.js'
 
 type ReceiptScope = {
   collection?: ReturnType<typeof parseReceiptLocatorCollection>
@@ -125,6 +126,7 @@ export async function prepareReceiptToolInvocation(opts: {
   if (response.statusCode !== 200) throw new Error(`receipt invocation rejected (${response.statusCode})`)
   const { capability } = JSON.parse(response.body) as { capability?: string }
   if (typeof capability !== 'string') throw new Error('receipt invocation capability missing')
+  const credentials = new ReceiptConsumerCredentials(capability)
   // Authority is the authenticated HTTP response; decoding merely checks its
   // binding against the actual native process before passing it to a child.
   const claims = JSON.parse(Buffer.from(capability.split('.')[0]!, 'base64url').toString())
@@ -150,9 +152,9 @@ export async function prepareReceiptToolInvocation(opts: {
     const { openReceiptDelivery } = await import('./receiptSqlite.js')
     const { createHttpReceiptInput } = await import('./receiptHttpInput.js')
     return createHttpReceiptInput({ toolUseId: opts.toolUseId, assistantMessage: opts.assistantMessage,
-      agentId: opts.agentId, locator, compoundText,
+      agentId: opts.agentId, locator, compoundText, capability,
       openDelivery: () => openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db')),
-      ...(backgroundNotification ? { backgroundNotification: true, capability } : {}) })
+      ...(backgroundNotification ? { backgroundNotification: true } : {}) })
   }
   scope.backgroundNotification = async (ordinary, preserveOrdinary) => {
     const snapshot = readLocators()
@@ -162,8 +164,9 @@ export async function prepareReceiptToolInvocation(opts: {
     if (!snapshot.locators.length || (compound && !ordinary)) return undefined
     const candidates = await Promise.all(snapshot.locators.map(async locator => {
       try {
+        const pair = await credentials.current()
         const status = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
-          headers: gatewayDelegateHeaders(), body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
+          headers: pair.headers, body: JSON.stringify({ ...locator, capability: pair.capability }), timeoutMs: 5000,
         })
         return status.statusCode === 200 && JSON.parse(status.body).status === 'ready' ? locator : undefined
       } catch { return undefined }

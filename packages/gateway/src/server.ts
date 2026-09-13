@@ -6247,8 +6247,9 @@ export class Gateway {
     }
     // Receipt authority is behind ordinary HTTP auth AND a signed parent context.
     // It is intentionally NOT part of the legacy delegate-context auth bypass.
-    if (url.pathname === `${RECEIPT_OWNER_PREFIX}issue` || url.pathname === `${RECEIPT_OWNER_PREFIX}check`) {
-      this.handleReceiptOwner(req, res, url.pathname.endsWith('/issue')).catch((err) => this.sendInternalError(res, err))
+    if (url.pathname === `${RECEIPT_OWNER_PREFIX}issue` || url.pathname === `${RECEIPT_OWNER_PREFIX}check` ||
+        url.pathname === `${RECEIPT_OWNER_PREFIX}refresh`) {
+      this.handleReceiptOwner(req, res, url.pathname.endsWith('/issue'), url.pathname.endsWith('/refresh')).catch((err) => this.sendInternalError(res, err))
       return
     }
     if (url.pathname === `${RECEIPT_OWNER_PREFIX}input` || url.pathname === `${RECEIPT_OWNER_PREFIX}status`) {
@@ -14166,7 +14167,7 @@ export class Gateway {
     return null
   }
 
-  private async handleReceiptOwner(req: IncomingMessage, res: ServerResponse, issue: boolean): Promise<void> {
+  private async handleReceiptOwner(req: IncomingMessage, res: ServerResponse, issue: boolean, refresh = false): Promise<void> {
     res.setHeader('Cache-Control', 'no-store')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     // Explicitly require HTTP credentials; neither loopback nor bridge bypass
@@ -14209,6 +14210,23 @@ export class Gateway {
       const capability = this._receiptOwnerCapabilities.issue({
         ...owner, userId, agentId: parent.agentId, sessionKey: parent.sessionKey, contextHash,
       })
+      return this.sendJson(res, 200, { capability, ownerState: 'active' })
+    }
+    if (refresh) {
+      // An expired signature is an identity witness, never direct result access.
+      // Do not fall back to issue(toolUseId): that would upgrade an untrusted ID.
+      const original = this._receiptOwnerCapabilities.verifyForRefresh(body.capability)
+      if (!original || original.agentId !== bound.agentId || original.sessionKey !== bound.sessionKey) {
+        return this.sendError(res, 401, 'invalid receipt refresh witness')
+      }
+      if (!matchesUser(original.userId)) return this.sendError(res, 403, 'receipt owner user mismatch')
+      if (!parent || parent.agentId !== original.agentId || (parent.userId || 'default') !== original.userId ||
+          parent._currentTurnKey !== original.turnKey || parent.runner.checkReceiptOwner?.(original) !== 'active') {
+        return this.sendError(res, 409, 'original receipt owner unavailable')
+      }
+      // No await between final auth/owner snapshot and signing. issue derives
+      // partition and times internally; no receipt/creator/nonce/ACK is changed.
+      const capability = this._receiptOwnerCapabilities.issue({ ...original, contextHash })
       return this.sendJson(res, 200, { capability, ownerState: 'active' })
     }
     const claims = this._receiptOwnerCapabilities.verify(body.capability)

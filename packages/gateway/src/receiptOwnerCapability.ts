@@ -87,6 +87,16 @@ export class ReceiptOwnerCapabilities {
   }
 
   verify(token: unknown, now = Date.now()): ReceiptOwnerClaims | null {
+    return this.verifySigned(token, now, false)
+  }
+
+  /** Identity witness ONLY. Refresh must additionally authenticate the new
+   * context and attest this exact original owner active before issuing anything. */
+  verifyForRefresh(token: unknown, now = Date.now()): ReceiptOwnerClaims | null {
+    return this.verifySigned(token, now, true)
+  }
+
+  private verifySigned(token: unknown, now: number, expiredWitness: boolean): ReceiptOwnerClaims | null {
     if (typeof token !== 'string' || token.length > 16384) return null
     const parts = token.split('.')
     if (parts.length !== 2) return null
@@ -98,7 +108,7 @@ export class ReceiptOwnerCapabilities {
       const c = JSON.parse(Buffer.from(payload, 'base64url').toString()) as ReceiptOwnerClaims
       if (!c || c.v !== 1 || c.purpose !== 'receipt-consumer' ||
           !Number.isSafeInteger(c.iat) || !Number.isSafeInteger(c.exp) ||
-          c.iat > now || c.exp <= now || c.exp - c.iat !== DELEGATE_CONTEXT_TTL_MS) return null
+          c.iat > now || (!expiredWitness && c.exp <= now) || c.exp - c.iat !== DELEGATE_CONTEXT_TTL_MS) return null
       for (const key of ['userId', 'agentId', 'sessionKey', 'contextHash', 'adapterInstanceId',
         'parentOwnerEpoch', 'turnKey', 'nativeSessionId', 'consumerToolUseId', 'toolName'] as const) {
         if (typeof c[key] !== 'string' || !c[key]) return null
