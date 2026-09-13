@@ -1,5 +1,6 @@
 /** Actual CCB CLI probe; no SDK/process/query stubs. Only parent lookup and child executor are fixtures. */
-import {openReceiptDelivery} from '../../../../../claude-code-best/src/utils/receiptSqlite.js'
+import Database from 'better-sqlite3'
+import {ReceiptDeliveryCoordinator, type ReceiptSqlValue} from '../../../../storage/src/receiptDeliveryCoordinator.js'
 import {fileURLToPath} from 'node:url'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -95,7 +96,11 @@ const server=createServer(async(req,res)=>{
     selectedNotify=true
     const first=(db as any).db.prepare('SELECT job_id FROM delegate_delivery_receipt ORDER BY rowid LIMIT 1').get()
     const binding=db.getDeliveryReceipt(first.job_id,0)!
-    const delivery=await openReceiptDelivery(dbPath)
+    const delivery=new ReceiptDeliveryCoordinator(dbPath,path=>{
+     const connection=new Database(path,{fileMustExist:true})
+     return {exec:sql=>connection.exec(sql),prepare:sql=>connection.prepare<ReceiptSqlValue[]>(sql),
+      transaction:write=>connection.transaction(write),close:()=>connection.close()}
+    })
     // Deliberately select the competing notify owner at a deterministic seam;
     // real coordinator/state/native/HTTP, NOT a production parent-death race.
     try { assert.equal(await delivery.recover(binding,async()=>({kind:'absent'}),async()=>'inactive'),'notify_ready') }
