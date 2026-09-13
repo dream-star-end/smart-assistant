@@ -108,8 +108,9 @@ function context() {
 async function seedLocator(f: Awaited<ReturnType<typeof fixture>>) {
   // CREATE has already durably bound this nonce in the fixture. This is an
   // untrusted persisted locator, not a shortcut past HTTP or native checks.
-  new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: (await f.post('issue', {toolUseId:'creator'})).data.capability,
-    [RECEIPT_CACHE_ENV]: join(dir, 'receipt-locators'), [RECEIPT_REPORT_ENV]: join(dir, 'unused') }).remember(f.options().locator)
+  const issued = (await f.post('issue', {toolUseId:'creator'})).data
+  await new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: issued.capability,
+    [RECEIPT_CACHE_ENV]: join(dir, 'receipt-candidates-v1'), [RECEIPT_REPORT_ENV]: issued.reportPath }).remember(f.options().locator)
 }
 
 async function until(fn: () => boolean) {
@@ -137,7 +138,8 @@ for (const mode of ['explicit', 'user', 'auto'] as const) test(`actual ShellComm
       else expect(backgroundExistingForegroundTask(id, shell, 'child', ctx.setAppState, 'waiter')).toBe(true)
     }
     expect(await invocation!.finish()).toBeUndefined()
-    await shell.result
+    const result = await shell.result
+    expect(result.code, JSON.stringify(result)).toBe(0)
   })
   await until(() => getCommandQueue().length > 0)
   const queued = getCommandQueue()[0]!

@@ -102,8 +102,9 @@ function context() {
 async function seedLocator(f: Awaited<ReturnType<typeof fixture>>) {
   // CREATE has already durably bound this nonce in the fixture. This is an
   // untrusted persisted locator, not a shortcut past HTTP or native checks.
-  new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: (await f.post('issue', {toolUseId:'creator'})).data.capability,
-    [RECEIPT_CACHE_ENV]: join(dir, 'receipt-locators'), [RECEIPT_REPORT_ENV]: join(dir, 'unused') }).remember(f.options().locator)
+  const issued = (await f.post('issue', {toolUseId:'creator'})).data
+  await new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: issued.capability,
+    [RECEIPT_CACHE_ENV]: join(dir, 'receipt-candidates-v1'), [RECEIPT_REPORT_ENV]: issued.reportPath }).remember(f.options().locator)
 }
 
 for (const mode of ['create', 'wait'] as const) test(`actual query -> BashTool -> Shell -> ${mode} CLI -> HTTP -> native input`, async () => {

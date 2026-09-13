@@ -1,8 +1,9 @@
 /** Real Gateway HTTP + CcbAdapter/parser, synthetic SDK process (no model/CLI).
  * Proves native identity and lifecycle, NOT receipt ingestion/notification ACK. */
 import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { EventEmitter, once } from 'node:events'
+import { mkdtempSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createServer, request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -609,4 +610,71 @@ test('candidate lifecycle retries a zero-job lock timeout via the real scheduler
     assert.equal((f.gw as any)._delegateJobs, undefined)
     assert.equal((f.gw as any)._engineNotifier, undefined)
   } finally { release?.(); await holder; await f.close() }
+})
+
+
+// Executes the actual boot entry up to and including its candidate recovery.
+// A sentinel stops unrelated service startup; this is not a full Gateway boot.
+test('candidate lifecycle actual boot retains live parent then recovers zero-job namespace after kernel death', async () => {
+  const original = await fixture(), boot = await fixture()
+  const child = spawn(process.execPath, ['-e', 'process.stdout.write("READY\\n");setInterval(()=>{},1000)'], { stdio: ['ignore','pipe','pipe'] })
+  const closed = once(child, 'close')
+  const sentinel = new Error('candidate boot boundary reached')
+  const gw = boot.gw as any, sweep = gw._sweepReceiptCandidates.bind(gw)
+  let sweeps = 0
+  gw._sweepReceiptCandidates = async () => { await sweep(); sweeps++; throw sentinel }
+  try {
+    await once(child.stdout!, 'data')
+    Object.assign(original.process.receiptProcessIdentity, { pid: child.pid })
+    original.process.tool('boot-no-job')
+    const issued = await original.post('issue', { toolUseId: 'boot-no-job' })
+    assert.equal(issued.status, 200)
+    const claims = original.caps.verify(issued.data.capability)!
+    assert.ok(claims.parentProcess, 'actual Node PID must produce kernel descriptor')
+    assert.equal((original.gw as any)._delegateJobs, undefined)
+    original.hideParent()
+    await assert.rejects(boot.gw.start(), error => error === sentinel)
+    assert.equal(sweeps, 1)
+    assert.ok(existsSync(issued.data.reportPath), 'new adapter must not retire a live prior process')
+    child.kill('SIGKILL'); await closed
+    await assert.rejects(boot.gw.start(), error => error === sentinel)
+    assert.equal(sweeps, 2)
+    assert.equal(existsSync(issued.data.reportPath), false)
+    const manifest = JSON.parse(readFileSync(join(home, 'receipt-candidates-v1', 'namespaces', claims.locatorPartition + '.json'), 'utf8'))
+    assert.equal(manifest.state, 'retired')
+    assert.equal((boot.gw as any)._delegateJobs, undefined)
+    assert.equal((boot.gw as any)._engineNotifier, undefined)
+  } finally { child.kill('SIGKILL'); await closed; await original.close(); await boot.close() }
+})
+
+for (const revoke of ['jwt', 'context', 'owner'] as const) test(`candidate lifecycle issue revalidates ${revoke} after actual flock wait with zero namespace side effects`, async () => {
+  const bootstrap = await fixture()
+  bootstrap.process.tool('root-only'); await bootstrap.issue('root-only'); await bootstrap.close()
+  const f = await fixture('c:3')
+  let release!: () => void, entered!: () => void, seen!: () => void
+  const gate = new Promise<void>(r => { release = r }), ready = new Promise<void>(r => { entered = r })
+  const observed = new Promise<void>(r => { seen = r })
+  const root = join(home, 'receipt-candidates-v1')
+  const before = readdirSync(join(root, 'namespaces')).sort()
+  const owner = f.adapter.getReceiptToolOwner.bind(f.adapter)
+  f.adapter.getReceiptToolOwner = id => { const result = owner(id); if (result) seen(); return result }
+  const holder = withReceiptWriteBarrier(join(root, 'barrier.lock'), async () => { entered(); await gate })
+  try {
+    await ready
+    f.process.tool('wait-for-lock')
+    const now = Date.now(), expiration = revoke === 'jwt' ? (Math.floor(now / 1000) + 2) * 1000 : now + 1500
+    const headers: Record<string,string> = { authorization: jwt('c:3') }
+    if (revoke === 'jwt') headers.authorization = `Bearer ${signJwt({ userId: 'c:3', exp: expiration / 1000 }, TOKEN)}`
+    if (revoke === 'context') headers[DELEGATE_CONTEXT_HEADER] = issueDelegateContextToken({ agentId: 'main', sessionKey: SESSION, depth: 0, now, ttlMs: 1500 })
+    const pending = f.post('issue', { toolUseId: 'wait-for-lock' }, headers)
+    await observed
+    assert.ok(Date.now() < expiration, 'initial owner lookup was before credentials expired')
+    if (revoke === 'owner') f.turn.end()
+    else await new Promise(r => setTimeout(r, expiration + 80 - Date.now()))
+    release(); await holder
+    const response = await pending
+    assert.equal(response.status, 409)
+    assert.equal(response.data.capability, undefined)
+    assert.deepEqual(readdirSync(join(root, 'namespaces')).sort(), before)
+  } finally { release(); await holder; await f.close() }
 })

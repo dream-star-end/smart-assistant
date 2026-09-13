@@ -88,6 +88,13 @@ function readReportSlot(file: string): ReceiptLocator {
   } finally { closeSync(fd) }
 }
 export function publishReceiptReport(directory: string, value: ReceiptLocator): void {
+  const fd = openPrivateDirectory(directory)
+  try { publishReceiptReportAt(fd, value) } finally { closeSync(fd) }
+}
+/** Already pinned and validated by the lifecycle writer; never reopen the proc
+ * descriptor symlink with O_NOFOLLOW or switch to an unpinned pathname. */
+function publishReceiptReportAt(directoryFd: number, value: ReceiptLocator): void {
+  const directory = `/proc/self/fd/${directoryFd}`
   const locator = parseReceiptLocator(value), data = JSON.stringify(locator)
   const temp = join(directory, '.pending-' + randomBytes(16).toString('hex'))
   const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
@@ -102,8 +109,7 @@ export function publishReceiptReport(directory: string, value: ReceiptLocator): 
         if (existing.jobId !== locator.jobId) continue
         if (JSON.stringify(existing) !== data) throw new Error('conflicting receipt report locator')
       }
-      const dir = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
-      try { fsyncSync(dir) } finally { closeSync(dir) }
+      fsyncSync(directoryFd)
       return
     }
     throw new Error('receipt report limit exceeded; remaining jobs retain durable recovery')
@@ -218,7 +224,7 @@ export class ReceiptCliTransport {
       const reports = openPrivateDirectory(join(namespace, 'reports'))
       try {
         const report = openPrivateDirectory(`/proc/self/fd/${reports}/${this.reportId}`)
-        try { publishReceiptReport(`/proc/self/fd/${report}`, locator) } finally { closeSync(report) }
+        try { publishReceiptReportAt(report, locator) } finally { closeSync(report) }
       } finally { closeSync(reports) }
     })
     return { statusCode: 200, body: JSON.stringify({ status: 'done', httpStatus: 200,
