@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, rename, symlink, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -17,7 +17,7 @@ import { openReceiptDelivery } from '../utils/receiptSqlite.js'
 import { asSystemPrompt } from '../utils/systemPromptType.js'
 import { getSessionId, resetStateForTests, setCwdState, setOriginalCwd, setProjectRoot } from '../bootstrap/state.js'
 import { clearSessionMessagesCache, flushSessionStorage, getProjectDir, getTranscriptPath,
-  recordTranscript, resetProjectForTesting } from '../utils/sessionStorage.js'
+  recordTranscript, resetProjectForTesting, observeStrictReceiptInput } from '../utils/sessionStorage.js'
 import { resetCommandQueue } from '../utils/messageQueueManager.js'
 import type { Message } from '../types/message.js'
 import type { TrustedReceiptBinding } from '../../../packages/storage/src/receiptDeliveryCoordinator.js'
@@ -37,8 +37,9 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-for (const mode of ['normal', 'abort', 'notify-loser', 'bad-candidate', 'copied-canonical', 'write-failure'] as const) {
+for (const mode of ['normal', 'abort', 'notify-loser', 'bad-candidate', 'copied-canonical', 'write-failure', 'oracle-normal', 'oracle-abort'] as const) {
   test(`receipt batch ${mode}: late ordinary tool cannot cut acknowledged native inputs off recovery`, async () => {
+    const oracleFault = mode === 'oracle-normal' || mode === 'oracle-abort'
     const dbPath = join(dir, 'jobs.db')
     const bindings: TrustedReceiptBinding[] = JSON.parse(execFileSync('node', ['--import', 'tsx', '--input-type=module', '-e', `
       import {createHash} from 'node:crypto';
@@ -85,11 +86,27 @@ for (const mode of ['normal', 'abort', 'notify-loser', 'bad-candidate', 'copied-
             if (i === 0 && mode === 'bad-candidate') throw Error('candidate HTTP unavailable')
             const canonical = createUserMessage({ content: [{ type: 'text', text: `BATCH_RESULT_${i}` }] })
             bindReceiptInput(canonical, { marker: { jobId: binding.jobId, generation: binding.generation, resultDigest: binding.resultDigest },
-              ingest: (proof, write, oracle) => delivery.ingest(binding, { proof, parentOwnerEpoch: 'fixture-active-epoch', isCurrentParentOwner: async () => true }, write, oracle) })
+              ingest: (proof, write, oracle) => delivery.ingest(binding, { proof, parentOwnerEpoch: 'fixture-active-epoch', isCurrentParentOwner: async () => true }, write, async () => {
+                if (!oracleFault || i !== 0) return oracle()
+                // Actual one-shot native open failure: the strict bytes have
+                // already been written and synced. O_NOFOLLOW must reject this
+                // temporary symlink; restore the SAME file before releasing the
+                // receipt barrier. No mock oracle/state/ACK or production I/O.
+                const file = getTranscriptPath(), held = file + '.oracle-held'
+                await rename(file, held)
+                try {
+                  await symlink(held, file)
+                  try {
+                    const observation = await oracle()
+                    expect(observation.kind).toBe('unknown')
+                    return observation
+                  } finally { await unlink(file) }
+                } finally { await rename(held, file) }
+              }) })
             return i === 0 && mode === 'copied-canonical' ? { ...canonical } : canonical
           }))
         }
-        if (block.id === 'late-read' && mode === 'abort') abort.abort('test-completed-before-drain')
+        if (block.id === 'late-read' && (mode === 'abort' || mode === 'oracle-abort')) abort.abort('test-completed-before-drain')
       })
       restoreSpy = () => spy.mockRestore()
       const first = createUserMessage({ content: 'batch recovery proof' })
@@ -104,12 +121,7 @@ for (const mode of ['normal', 'abort', 'notify-loser', 'bad-candidate', 'copied-
       } catch (error) { failure = error }
       await flushSessionStorage()
       expect(calls).toBe(1) // no next model request/assistant to repair a broken chain
-      if (mode === 'write-failure') expect(String(failure)).toContain('batch ACK fault')
-      else expect(failure).toBeUndefined()
       const rows: any[] = db.query('SELECT job_id,state,native_tool_use_id,receipt_nonce_hash FROM delegate_delivery_receipt ORDER BY rowid').all()
-      expect(rows.map(r => r.state)).toEqual(mode === 'notify-loser' ? ['notify_pending', 'ingested'] :
-        mode === 'bad-candidate' || mode === 'copied-canonical' ? ['offered', 'ingested'] : mode === 'write-failure' ? ['ingest_claimed', 'offered'] : ['ingested', 'ingested'])
-      rows.forEach((row, i) => { expect(row.native_tool_use_id).toBe('bash-batch'); expect(row.receipt_nonce_hash).toBe(bindings[i]!.receiptNonceHash) })
       const child = Bun.spawn([process.execPath, '-e', `
         import {loadFullLog} from ${JSON.stringify(new URL('../utils/sessionStorage.ts', import.meta.url).pathname)};
         const log=await loadFullLog({isLite:true,sessionId:${JSON.stringify(getSessionId())},fullPath:${JSON.stringify(getTranscriptPath())},messages:[],date:'',value:0,created:new Date(),modified:new Date(),firstPrompt:'',messageCount:6,isSidechain:false});
@@ -119,11 +131,21 @@ for (const mode of ['normal', 'abort', 'notify-loser', 'bad-candidate', 'copied-
       expect({ exit, err }).toEqual({ exit: 0, err: '' })
       const restored: any[] = JSON.parse(out)
       for (let i = 0; i < 2; i++) {
-        const expected = mode === 'write-failure' ? Number(i === 0) : (i === 0 && ['notify-loser', 'bad-candidate', 'copied-canonical'].includes(mode)) ? 0 : 1
+        const expected = mode === 'write-failure' || oracleFault ? Number(i === 0) : (i === 0 && ['notify-loser', 'bad-candidate', 'copied-canonical'].includes(mode)) ? 0 : 1
         expect(restored.filter(m => m.type === 'user' && JSON.stringify(m.message).includes(`BATCH_RESULT_${i}`))).toHaveLength(expected)
       }
       expect(JSON.stringify(restored)).toContain('ORDINARY_READ_RESULT')
       expect(JSON.stringify(restored)).toContain('ORDINARY_BASH_RESULT')
+      if (mode === 'write-failure') expect(String(failure)).toContain('batch ACK fault')
+      else if (oracleFault) expect(String(failure)).toContain('receipt input outcome uncertain: unknown')
+      else expect(failure).toBeUndefined()
+      expect(rows.map(r => r.state)).toEqual(mode === 'notify-loser' ? ['notify_pending', 'ingested'] :
+        mode === 'bad-candidate' || mode === 'copied-canonical' ? ['offered', 'ingested'] : mode === 'write-failure' || oracleFault ? ['ingest_claimed', 'offered'] : ['ingested', 'ingested'])
+      rows.forEach((row, i) => { expect(row.native_tool_use_id).toBe('bash-batch'); expect(row.receipt_nonce_hash).toBe(bindings[i]!.receiptNonceHash) })
+      if (oracleFault) {
+        expect(await delivery.recover(bindings[0]!, claim => observeStrictReceiptInput(claim.proof), async () => 'active')).toBe('ingested')
+        expect(db.query('SELECT state FROM delegate_delivery_receipt ORDER BY rowid').all()).toEqual([{ state: 'ingested' }, { state: 'offered' }])
+      }
       const callback: any[] = db.query('SELECT callback_state FROM delegate_jobs ORDER BY rowid').all()
       expect(callback.map(r => r.callback_state)).toEqual(mode === 'notify-loser' ? ['pending', 'none'] : ['none', 'none'])
     } finally { delivery.close(); db.close() }

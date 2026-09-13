@@ -83,6 +83,12 @@ export async function admitReceiptInput<T extends Message>(
     prepared.observe,
   )
   if (outcome === 'ingested') return prepared.message
+  // A returned uncertainty is as important as a thrown write failure. A prior
+  // strict append may exist but not yet be confirmed; a neutral replacement or
+  // later receipt could rebranch it out of the recoverable native chain.
+  if (outcome === 'unknown' || outcome === 'pending_recovery') {
+    throw new Error(`receipt input outcome uncertain: ${outcome}`)
+  }
 
   // A different UUID is essential: a losing placeholder must not occupy the
   // prepared input's UUID/hash and poison crash recovery. Preserve tool pairing
