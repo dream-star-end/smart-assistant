@@ -3,16 +3,18 @@ import {fileURLToPath} from 'node:url'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { mkdirSync,writeFileSync,readFileSync,readdirSync } from 'node:fs'
+import { mkdirSync,writeFileSync,readFileSync,readdirSync,unlinkSync,existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { Gateway } from '../../server.js'
 import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
+import { receiptLocatorPartition } from '../../receiptOwnerCapability.js'
 const requestedMode=process.argv[3] || 'create', wrapped=requestedMode.startsWith('deferred-'), mcp=wrapped||requestedMode.startsWith('mcp-')
 const mixed=requestedMode==='mixed'
-const mode=(requestedMode==='success'||mixed)?'create':requestedMode.replace(/^(mcp|deferred)-/, '');assert.ok(['create','wait','stop'].includes(mode))
+const incomplete=requestedMode==='missing-locator'||requestedMode==='corrupt-locator'
+const mode=incomplete?'wait':(requestedMode==='success'||mixed)?'create':requestedMode.replace(/^(mcp|deferred)-/, '');assert.ok(['create','wait','stop'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
@@ -21,6 +23,8 @@ const token=randomBytes(32).toString('hex'), session='agent:main:webchat:dm:real
 const requests:any[]=[], sdk:any[]=[], http:any[]=[]
 let resolveBatchBoundary:()=>void=()=>{};const batchBoundary=new Promise<void>(r=>{resolveBatchBoundary=r})
 let phase=0, executions=0, received=false, discovered=false, failure:any
+let receiptBindingsBefore: Array<{job_id:string;receipt_nonce_hash:string;native_tool_use_id:string}> = []
+let missingJobId:string|undefined
 let adapter:CcbAdapter, runner:SubprocessRunner, turn:any
 const sentinel='REAL_MODEL_CLI_AUTHORITATIVE_RESULT'
 const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate --agent-id coding-assistant --goal synthetic-child-only`
@@ -29,7 +33,7 @@ const suffix="; printf 'ORDINARY_SHELL_STDOUT'; printf 'ORDINARY_SHELL_STDERR' >
 const command=mode==='wait'?'timeout --signal=TERM 8s '+cli+'; timeout --signal=TERM 8s '+cli.replace('synthetic-child-only','synthetic-child-two'):cli+'; '+cli.replace('synthetic-child-only','synthetic-child-two')+suffix
 function send(res:any,body:any,tool:boolean,wait=false,discover=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
- let content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:mcp?`mcp__openclaude-memory__${wait?'delegate_wait':'delegate_task'}`:'Bash',input:mcp?(wait?{jobId:(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id,waitMs:10000}:{agentId:'coding-assistant',goal:'synthetic-child-only'}):{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').all().map((r:any)=>r.job_id).join(' ')}${suffix}`:command,timeout:20000}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ let content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:mcp?`mcp__openclaude-memory__${wait?'delegate_wait':'delegate_task'}`:'Bash',input:mcp?(wait?{jobId:(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id,waitMs:10000}:{agentId:'coding-assistant',goal:'synthetic-child-only'}):{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').all().map((r:any)=>r.job_id).join(' ')}${incomplete?'; multiwait_code=$?; printf \"MULTIWAIT_EXIT:%s\" \"$multiwait_code\"':''}${suffix}`:command,timeout:20000}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
  if(wrapped && tool) {
    content=discover?{type:'tool_use',id:'real_discovery',name:'SearchExtraTools',input:{query:'select:mcp__openclaude-memory__delegate_task,mcp__openclaude-memory__delegate_wait'}}:
      {...content,name:'ExecuteExtraTool',input:{tool_name:content.name,params:content.input}}
@@ -65,9 +69,35 @@ const upstream=createServer(async(req,res)=>{
     if(wrapped)assert.ok(raw.includes('Found 2 deferred tool'),'actual discovery must finish before execution')
     phase++;send(res,body,true)
   }
-  else if(main&&phase===1&&mode==='wait'){assert.equal(executions,2);assert.ok(!raw.includes(sentinel));releaseChild();phase++;send(res,body,true,true)}
+  else if(main&&phase===1&&mode==='wait'){
+    assert.equal(executions,2,'two actual child executors before wait');assert.ok(!raw.includes(sentinel))
+    if(incomplete) {
+      // Receipt rows are offered by the real terminal commit, not by create.
+      // Both original CLI processes have exited; finish the children before
+      // inspecting their immutable bindings and inducing local cache loss.
+      releaseChild()
+      const deadline=Date.now()+10000
+      while((db as any).db.prepare('SELECT count(*) n FROM delegate_delivery_receipt').get().n!==2) {
+        assert.ok(Date.now()<deadline,'real terminal receipts deadline')
+        await new Promise(r=>setTimeout(r,10))
+      }
+      receiptBindingsBefore=(db as any).db.prepare('SELECT job_id,receipt_nonce_hash,native_tool_use_id FROM delegate_delivery_receipt ORDER BY rowid').all()
+      assert.equal(receiptBindingsBefore.length,2,'two persisted receipts before corrupting candidate')
+      const owner=adapter.getReceiptToolOwner('real_creator');assert.ok(owner)
+      const partition=receiptLocatorPartition({...owner,userId:'default',agentId:'main',sessionKey:session})
+      const cache=join(dir,'receipt-candidates-v1','data',partition,'cache')
+      assert.ok(existsSync(join(cache,receiptBindingsBefore[0]!.job_id+'.json')))
+      missingJobId=receiptBindingsBefore[1]!.job_id
+      const file=join(cache,missingJobId+'.json');assert.ok(existsSync(file))
+      // Exact private candidate, not a job/nonce mutation or a recovery fallback.
+      // Both real CLI creates succeeded; emulate loss/corruption before later wait.
+      if(requestedMode==='missing-locator')unlinkSync(file)
+      else writeFileSync(file,'{incomplete-private-record')
+    }
+    releaseChild();phase++;send(res,body,true,true)
+  }
   else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}if(main&&mixed){resolveBatchBoundary();return}send(res,body,false)}
- }catch(e){failure=e;res.statusCode=500;res.end('{}')}
+ }catch(e){failure=e;process.stderr.write('UPSTREAM_FIXTURE_ERROR '+(e instanceof Error?e.stack:String(e))+'\n');res.statusCode=500;res.end('{}')}
 })
 await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r))
 const upstreamPort=(upstream.address() as any).port
@@ -106,12 +136,28 @@ try {
  const result=await Promise.race([mixed?batchBoundary:turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn deadline')),90000)})]);clearTimeout(timer)
  assert.ok(!failure,String(failure));assert.equal(executions,2);assert.equal(received,mode!=='stop')
  assert.ok(runner.sessionId);assert.equal(phase,mode==='wait'?3:mode==='stop'?1:2)
- const rows=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt').all();writeFileSync(join(dir,'receipt-rows.json'),JSON.stringify(rows,null,2));assert.equal(rows.length,2);assert.ok(rows.every((r:any)=>r.state==='ingested'),'both results must be durably ingested');const row=rows[0];assert.equal(row.state,mode==='stop'?'offered':'ingested');assert.equal(row.native_tool_use_id,'real_creator')
+ const rows=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt ORDER BY rowid').all();writeFileSync(join(dir,'receipt-rows.json'),JSON.stringify(rows,null,2));assert.equal(rows.length,2)
+ if(incomplete) {
+  assert.deepEqual(rows.map((r:any)=>({job_id:r.job_id,receipt_nonce_hash:r.receipt_nonce_hash,native_tool_use_id:r.native_tool_use_id})),receiptBindingsBefore)
+  assert.deepEqual(rows.map((r:any)=>r.state),['ingested','offered'])
+  assert.ok(rows.every((r:any)=>r.native_tool_use_id==='real_creator'))
+  assert.equal(http.filter((r:any)=>r.path==='/api/agents/coding-assistant/delegate').length,2)
+  assert.equal(http.filter((r:any)=>r.path==='/api/delegate/wait').length,0)
+  assert.equal(http.filter((r:any)=>r.path==='/api/delegate/receipt-owner/input').length,1)
+ } else assert.ok(rows.every((r:any)=>r.state==='ingested'),'both results must be durably ingested')
+ const row=rows[0];assert.equal(row.state,mode==='stop'?'offered':'ingested');assert.equal(row.native_tool_use_id,'real_creator')
  if(mode!=='stop') {
   const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
   const modelResults=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id===(mode==='wait'?'real_waiter':'real_creator')):[])
   const nativeResults=sdk.flatMap((m:any)=>m.type==='user'&&Array.isArray(m.message?.content)?m.message.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id===(mode==='wait'?'real_waiter':'real_creator')):[])
-  assert.ok(JSON.stringify(modelMessages).includes(sentinel+'1'));assert.ok(JSON.stringify(modelMessages).includes(sentinel+'2'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDOUT'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDERR'));assert.equal(Boolean(modelResults[0].is_error),!(requestedMode==='success'||mixed));assert.equal(modelResults.length,1);assert.equal(nativeResults.length,1);assert.deepEqual(modelResults[0].content,nativeResults[0].content)
+  assert.ok(JSON.stringify(modelMessages).includes(sentinel+'1'))
+  if(incomplete) {
+    assert.ok(!JSON.stringify(modelMessages).includes(sentinel+'2'))
+    assert.ok(JSON.stringify(modelResults).includes('receipt locator unavailable; job retained, do not resubmit'))
+    assert.ok(JSON.stringify(modelResults).includes(missingJobId!))
+    assert.ok(JSON.stringify(modelResults).includes('MULTIWAIT_EXIT:2'))
+  } else assert.ok(JSON.stringify(modelMessages).includes(sentinel+'2'));
+  assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDOUT'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDERR'));assert.equal(Boolean(modelResults[0].is_error),!(requestedMode==='success'||mixed));assert.equal(modelResults.length,1);assert.equal(nativeResults.length,1);assert.deepEqual(modelResults[0].content,nativeResults[0].content)
  }
  if(mixed) {
   // The second real model REQUEST has arrived, but no response/assistant output
@@ -129,7 +175,7 @@ try {
  }
  if(mode==='stop')assert.ok(!sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(sentinel)))
  process.stdout.write('MODEL_PROBE_PASS '+JSON.stringify({mode:requestedMode,nativeSession:runner.sessionId,phase,executions,received,isError:result?.isError,receiptState:row.state})+'\n')
-} catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n'+JSON.stringify({requests,http,sdkErrors:sdk.filter((m:any)=>m.type==='user'||m.type==='result').map((m:any)=>({type:m.type,message:m.message,errors:m.errors}))})+'\n')}
+} catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n'+JSON.stringify({executions,receipts:(db as any).db.prepare('SELECT job_id,state,native_tool_use_id FROM delegate_delivery_receipt').all(),requests,http,sdkErrors:sdk.filter((m:any)=>m.type==='user'||m.type==='result').map((m:any)=>({type:m.type,message:m.message,errors:m.errors}))})+'\n')}
 finally {
  clearTimeout(timer);releaseChild();turn?.end();await runner.shutdown();server.closeAllConnections();upstream.closeAllConnections()
  await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r()))])

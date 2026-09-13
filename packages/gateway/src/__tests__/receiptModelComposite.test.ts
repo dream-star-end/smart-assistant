@@ -20,19 +20,20 @@ async function run(command:string,args:string[],home:string) {
   return out
  }finally{clearTimeout(timer)}
 }
-for(const mode of ['create','wait','success','mixed'] as const)test(`actual model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
+for(const mode of ['create','wait','success','mixed','missing-locator','corrupt-locator'] as const)test(`actual model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
+ const incomplete=mode==='missing-locator'||mode==='corrupt-locator'
  const dir=mkdtempSync(join(tmpdir(),'receipt-model-composite-'))
  try {
   const out=await run(process.execPath,['--import',join(root,'node_modules/tsx/dist/loader.mjs'),fixture,dir,mode],dir)
   const e=JSON.parse(readFileSync(join(dir,'evidence.json'),'utf8'))
   assert.equal(e.failure,null,JSON.stringify(e));assert.match(out,/MODEL_PROBE_PASS/);
   assert.equal(e.failure,null);assert.equal(e.executions,2)
-  assert.equal(e.requests.length,mode==='wait'?3:2)
+  assert.equal(e.requests.length,mode==='wait'||incomplete?3:2)
   assert.equal(e.received,true)
   assert.ok(e.http.some((r:{path:string;status:number})=>r.path==='/api/delegate/receipt-owner/input'&&r.status===200))
   const restored=await run('bun',['run',restore,dir,mode],dir)
   const proof=JSON.parse(restored.trim().split('\n').pop()!)
-  assert.equal(proof.passed,true);assert.equal(proof.receiptInputs,2)
+  assert.equal(proof.passed,true);assert.equal(proof.receiptInputs,incomplete?1:2)
   console.log(JSON.stringify({mode,modelRequests:e.requests.length,executions:e.executions,received:e.received,nativeReceiptInputs:proof.receiptInputs}))
  }finally{rmSync(dir,{recursive:true,force:true})}
 })
