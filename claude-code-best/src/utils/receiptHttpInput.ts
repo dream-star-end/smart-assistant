@@ -19,10 +19,14 @@ export async function createHttpReceiptInput(opts: {
   toolUseId: string
   assistantMessage: AssistantMessage
   agentId?: string
-  delivery: ReceiptDeliveryCoordinator
+  delivery?: ReceiptDeliveryCoordinator
+  /** Native factory: acquire only inside ingest, after strict preparation. */
+  openDelivery?: () => Promise<ReceiptDeliveryCoordinator>
   releaseDelivery?: () => void
   /** Internal actual ShellCommand enrollment only; never read from HTTP/body. */
   backgroundNotification?: boolean
+  /** Internal compound Bash input; retains actual SDK consumer verification. */
+  compoundText?: boolean
   capability?: string
 }): Promise<UserMessage> {
   if (opts.agentId) throw new Error('receipt consumption requires the native main thread')
@@ -35,7 +39,7 @@ export async function createHttpReceiptInput(opts: {
   if (tools.length !== 1 || tools[0]?.type !== 'tool_use') throw new Error('receipt consumer must be an actual native tool')
   const toolName = tools[0].name
   const locator = Object.freeze({ ...opts.locator })
-  const delivery = opts.delivery
+  if ((!opts.delivery && !opts.openDelivery) || (opts.delivery && opts.openDelivery)) throw new Error('one receipt coordinator required')
   const headers = Object.freeze({ ...gatewayDelegateHeaders() })
   const base = `${gatewayBaseUrl()}/api/delegate/receipt-owner/`
   if (!headers[DELEGATE_CONTEXT_HEADER] || !headers.Authorization?.replace(/^Bearer\s*/, '')) {
@@ -79,7 +83,7 @@ export async function createHttpReceiptInput(opts: {
   const epoch = consumer.parentOwnerEpoch
   const result = JSON.parse(resultJson)
   const text = formatDelegateHttpResult(result.httpStatus, result.body, binding.jobId).text
-  const message = opts.backgroundNotification
+  const message = opts.backgroundNotification || opts.compoundText
     ? createUserMessage({ content: [{ type: 'text', text }] })
     : createUserMessage({ content: [{ type: 'tool_result', tool_use_id: toolUseId, content: text }], sourceToolAssistantUUID: sourceId })
   // Final canonical text is made here, not copied from arbitrary CLI stdout or
@@ -92,13 +96,15 @@ export async function createHttpReceiptInput(opts: {
   Object.freeze(message)
   bindReceiptInput(message, {
     marker: { jobId: binding.jobId, generation: binding.generation, resultDigest: binding.resultDigest },
-    ingest: (proof, write, oracle) => {
+    ingest: async (proof, write, oracle) => {
       if (proof.nativeSessionId !== nativeSessionId) throw new Error('receipt native proof session changed')
-      return delivery.ingest(binding, { parentOwnerEpoch: epoch, proof, isCurrentParentOwner: async () => {
+      const delivery = opts.delivery ?? await opts.openDelivery!()
+      try { return await delivery.ingest(binding, { parentOwnerEpoch: epoch, proof, isCurrentParentOwner: async () => {
         if (getSessionId() !== nativeSessionId) return false
         const checked = await post('check', { capability })
         return getSessionId() === nativeSessionId && checked.ownerState === 'active'
-      } }, write, oracle).finally(() => opts.releaseDelivery?.())
+      } }, write, oracle) }
+      finally { if (opts.openDelivery) delivery.close(); else opts.releaseDelivery?.() }
     },
   })
   return message

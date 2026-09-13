@@ -1,6 +1,6 @@
 /** CLI carries locators, never an input ACK or authoritative result text. */
 import { createHash, randomBytes } from 'node:crypto'
-import { constants, mkdirSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync } from 'node:fs'
+import { constants, mkdirSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
 import { join } from 'node:path'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 
@@ -18,6 +18,57 @@ export function parseReceiptLocator(value: unknown): ReceiptLocator {
   return Object.freeze({ jobId: v.jobId, generation: Number(v.generation), receiptNonce: v.receiptNonce })
 }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+
+// Closed, fsynced records are atomically published into bounded exclusive slots.
+// Concurrent writers cannot overwrite another job or publish partially written JSON.
+const REPORT_SLOTS = 64
+function readReportSlot(file: string): ReceiptLocator {
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.size > 4096) throw new Error('invalid receipt report record')
+    return parseReceiptLocator(JSON.parse(readFileSync(fd, 'utf8')))
+  } finally { closeSync(fd) }
+}
+export function publishReceiptReport(directory: string, value: ReceiptLocator): void {
+  const locator = parseReceiptLocator(value), data = JSON.stringify(locator)
+  const temp = join(directory, '.pending-' + randomBytes(16).toString('hex'))
+  const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+  try { writeFileSync(fd, data); fsyncSync(fd) } finally { closeSync(fd) }
+  try {
+    for (let i = 0; i < REPORT_SLOTS; i++) {
+      const file = join(directory, String(i).padStart(2, '0') + '.json')
+      try { linkSync(temp, file) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        const existing = readReportSlot(file)
+        if (existing.jobId !== locator.jobId) continue
+        if (JSON.stringify(existing) !== data) throw new Error('conflicting receipt report locator')
+      }
+      const dir = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+      try { fsyncSync(dir) } finally { closeSync(dir) }
+      return
+    }
+    throw new Error('receipt report limit exceeded; remaining jobs retain durable recovery')
+  } finally { unlinkSync(temp) }
+}
+export function snapshotReceiptReport(directory: string): { locators: ReceiptLocator[]; invalid: boolean } {
+  const locators = new Map<string, ReceiptLocator>()
+  let invalid = false
+  for (let i = 0; i < REPORT_SLOTS; i++) {
+    try {
+      const locator = readReportSlot(join(directory, String(i).padStart(2, '0') + '.json'))
+      const existing = locators.get(locator.jobId)
+      if (existing && JSON.stringify(existing) !== JSON.stringify(locator)) { invalid = true; continue }
+      locators.set(locator.jobId, locator)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') invalid = true
+    }
+  }
+  // Shell exit is not descendant death. Keep directory/records for late writers;
+  // full lifecycle GC must use its own proven boundary, never an input ACK.
+  return { locators: [...locators.values()], invalid }
+}
 
 /** Cache is explicitly untrusted. Immutable nonce survives a separate wait CLI;
  * gateway verifies its hash/partition and native independently verifies consumer. */
@@ -64,13 +115,9 @@ export class ReceiptCliTransport {
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 1000)))
       return { statusCode: 200, body: JSON.stringify({ status: 'running', jobId: locator.jobId }) }
     }
-    // A per-invocation file is a candidate channel, not stdout parsing and not
-    // identity. O_EXCL prevents silently replacing another result in one tool.
+    // Per-invocation records are candidates, never input ACKs or identity.
     if (this.onReady) this.onReady(parseReceiptLocator(locator))
-    else {
-      const fd = openSync(this.report, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-      try { writeFileSync(fd, JSON.stringify(locator)); fsyncSync(fd) } finally { closeSync(fd) }
-    }
+    else publishReceiptReport(this.report, locator)
     return { statusCode: 200, body: JSON.stringify({ status: 'done', httpStatus: 200,
       output: '结果已准备，等待原生持久接收。' }) }
   }

@@ -1,9 +1,10 @@
 import type { ShellCommand } from './ShellCommand.js'
 import { createQueuedReceiptInput } from './receiptQueuedInput.js'
+import { createDeferredReceiptInput } from './receiptInputAdmission.js'
 import type { QueuedCommand } from '../types/textInputTypes.js'
 import { receiptMcpTargetForSdk } from '../../../packages/gateway/src/receiptOwnerCapability.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { mkdtemp, mkdir, readFile } from 'node:fs/promises'
+import { mkdtemp, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -12,7 +13,7 @@ import { RECEIPT_MCP_META, RECEIPT_MCP_RESULT_META } from '../../../packages/mcp
 import { homedir } from 'node:os'
 import type { AssistantMessage, UserMessage } from '../types/message.js'
 import { getSessionId } from '../bootstrap/state.js'
-import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator, type ReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
+import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator, snapshotReceiptReport, type ReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../../../packages/mcp-memory/src/gatewayClient.js'
 
 type ReceiptScope = {
@@ -88,7 +89,8 @@ export function receiptMcpRequest(serverName: string, toolName: string, toolUseI
 
 export async function prepareReceiptToolInvocation(opts: {
   toolUseId: string; assistantMessage: AssistantMessage; agentId?: string
-}): Promise<{ run<T>(fn: () => Promise<T>): Promise<T>; input(): Promise<UserMessage | undefined> } | undefined> {
+}): Promise<{ run<T>(fn: () => Promise<T>): Promise<T>;
+  finish(): Promise<{ mode: 'replace' | 'append'; messages: UserMessage[] } | undefined> } | undefined> {
   // Staging wiring switch, NOT the gateway's v2 new-job admission. It remains
   // off until the full C0 caller/background/compatibility verification completes.
   if (process.env.OPENCLAUDE_RECEIPT_CALLER_V2 !== '1' || opts.agentId) return undefined
@@ -123,29 +125,28 @@ export async function prepareReceiptToolInvocation(opts: {
     const root = join(home, 'receipt-invocations')
     await mkdir(root, { recursive: true, mode: 0o700 })
     const dir = await mkdtemp(join(root, 'call-'))
-    report = join(dir, 'locator.json')
+    report = dir
     scope.env = Object.freeze({ [RECEIPT_CAP_ENV]: capability, [RECEIPT_REPORT_ENV]: report,
       [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators') })
   }
-  const readLocator = async () => {
-    if (!report) return scope.candidate
-    let raw: string
-    try { raw = await readFile(report, 'utf8') }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
-    return parseReceiptLocator(JSON.parse(raw))
+  const readLocators = () => {
+    if (!report) return { locators: scope.candidate ? [scope.candidate] : [], invalid: false }
+    return snapshotReceiptReport(report)
   }
-  const input = async (locator: ReceiptLocator, backgroundNotification = false) => {
+  const input = async (locator: ReceiptLocator, backgroundNotification = false, compoundText = false) => {
     const { openReceiptDelivery } = await import('./receiptSqlite.js')
     const { createHttpReceiptInput } = await import('./receiptHttpInput.js')
-    const delivery = await openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db'))
-    try {
-      return await createHttpReceiptInput({ ...opts, locator, delivery, releaseDelivery: () => delivery.close(),
-        ...(backgroundNotification ? { backgroundNotification: true, capability } : {}) })
-    } catch (error) { delivery.close(); throw error }
+    return createHttpReceiptInput({ toolUseId: opts.toolUseId, assistantMessage: opts.assistantMessage,
+      agentId: opts.agentId, locator, compoundText,
+      openDelivery: () => openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db')),
+      ...(backgroundNotification ? { backgroundNotification: true, capability } : {}) })
   }
   scope.backgroundNotification = async () => {
-    const locator = await readLocator()
-    if (!locator) return undefined
+    const snapshot = readLocators()
+    // Multi-background is not yet enrolled: retain ordinary shell notification,
+    // and the existing durable recovery for ALL receipts, never just the last.
+    if (snapshot.invalid || snapshot.locators.length !== 1) return undefined
+    const locator = snapshot.locators[0]!
     const status = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
       headers: gatewayDelegateHeaders(), body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
     })
@@ -155,10 +156,14 @@ export async function prepareReceiptToolInvocation(opts: {
   }
   return {
     run: fn => scopes.run(scope, fn),
-    input: async () => {
+    finish: async () => {
       if (scope.backgrounded) return undefined
-      const locator = await readLocator()
-      return locator ? input(locator) : undefined
+      const { locators, invalid } = readLocators()
+      if (!locators.length && !invalid) return undefined
+      if (toolName !== 'Bash') return { mode: 'replace', messages: [await input(locators[0]!)] }
+      const messages = locators.map(locator => createDeferredReceiptInput(() => input(locator, false, true)))
+      if (invalid) messages.push(createDeferredReceiptInput(async () => { throw new Error('receipt candidate unavailable') }))
+      return { mode: 'append', messages }
     },
   }
 }

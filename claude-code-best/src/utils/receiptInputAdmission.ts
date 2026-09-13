@@ -24,6 +24,15 @@ export type ReceiptInputAdmission = Readonly<{
 // No JSON/stdout/jobId sniffing: reconstructed/untrusted messages cannot opt in.
 // No production transport enrollment until the complete C0 consumer handshake.
 const admissions = new WeakMap<Message, ReceiptInputAdmission>()
+const deferred = new WeakMap<Message, () => Promise<UserMessage>>()
+const deferredNeutral = '子任务结果由持久收据协调交付；此处不重复提交结果。'
+/** Native invocation only. No result bytes or database handles before the batch boundary. */
+export function createDeferredReceiptInput(resolve: () => Promise<UserMessage>): UserMessage {
+  const message = createUserMessage({ content: deferredNeutral })
+  deferred.set(message, resolve)
+  return message
+}
+export function isDeferredReceiptInput(message: Message): boolean { return deferred.has(message) }
 export function bindReceiptInput(
   message: UserMessage,
   admission: ReceiptInputAdmission,
@@ -44,6 +53,19 @@ export async function admitReceiptInput<T extends Message>(
   message: T,
   history: readonly Message[],
 ): Promise<T | UserMessage> {
+  const resolve = deferred.get(message)
+  if (resolve) {
+    deferred.delete(message)
+    let canonical: UserMessage
+    try {
+      canonical = await resolve()
+      // A formatter/copy must not turn unadmitted result bytes into ordinary input.
+      if (!admissions.has(canonical)) throw new Error('missing canonical receipt admission')
+    } catch { return createUserMessage({ content: deferredNeutral }) }
+    // Once strict writing begins, errors must stop this batch. Continuing on an
+    // uncertain write could rebranch an already durable/ACKed record off the log.
+    return admitReceiptInput(canonical, history)
+  }
   const admission = admissions.get(message)
   if (!admission) return message
   if (message.type !== 'user' || !message.message)

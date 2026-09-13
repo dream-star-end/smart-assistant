@@ -136,7 +136,7 @@ for (const mode of ['explicit', 'user', 'auto'] as const) test(`actual ShellComm
       if (mode === 'user') backgroundAll(ctx.getAppState, ctx.setAppState)
       else expect(backgroundExistingForegroundTask(id, shell, 'child', ctx.setAppState, 'waiter')).toBe(true)
     }
-    expect(await invocation!.input()).toBeUndefined()
+    expect(await invocation!.finish()).toBeUndefined()
     await shell.result
   })
   await until(() => getCommandQueue().length > 0)

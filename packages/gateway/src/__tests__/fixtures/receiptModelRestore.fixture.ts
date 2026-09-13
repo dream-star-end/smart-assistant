@@ -13,9 +13,13 @@ assert.equal(matching.length,mode==='stop'?0:1)
 if(mode!=='stop') {
  assert.ok((matching[0] as any).delegateReceipt)
  const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
- const actualContent=(matching[0] as any).message.content[0].content
+ const block=(matching[0] as any).message.content[0]
+ const actualContent=block.content ?? block.text
  const modelResult=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content:[]).find((c:any)=>c.type==='tool_result'&&c.tool_use_id===(mode==='wait'?'real_waiter':'real_creator'))
- assert.ok(modelResult);assert.deepEqual(actualContent,modelResult.content)
- assert.equal((matching[0] as any).message.content[0].tool_use_id,mode==='wait'?'real_waiter':'real_creator')
+ assert.ok(modelResult)
+ if(evidence.mode.startsWith('mcp-')||evidence.mode.startsWith('deferred-')) {
+  assert.deepEqual(actualContent,modelResult.content)
+  assert.equal(block.tool_use_id,mode==='wait'?'real_waiter':'real_creator')
+ } else { assert.equal(block.type,'text'); assert.ok(modelMessages.flatMap((m:any)=>Array.isArray(m.content)?m.content:[]).some((c:any)=>c.type==='text'&&c.text.includes(actualContent))) }
 }
 process.stdout.write(JSON.stringify({mode,nativeSession:evidence.nativeSession,restoredMessageCount:restored.messages.length,receiptInputs:matching.length,passed:true})+"\n")

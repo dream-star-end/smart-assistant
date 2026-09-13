@@ -1261,6 +1261,7 @@ async function checkPermissionsAndCallTool(
   } else if (processedInput !== backfilledClone) {
     callInput = processedInput
   }
+  let receiptInvocation: Awaited<ReturnType<typeof prepareReceiptToolInvocation>>
   try {
     // AC1 parity: wrap the single canonical tool.call site with deterministic
     // tool-event observation hooks (codex review follow-up). Hooks are
@@ -1269,7 +1270,7 @@ async function checkPermissionsAndCallTool(
     //
     // The invoke lambda is shared between the flag-on (wrapper) and flag-off
     // (direct) paths so that post-call processing is never duplicated.
-    const receiptInvocation = await prepareReceiptToolInvocation({ toolUseId: toolUseID, assistantMessage, agentId: toolUseContext.agentId })
+    receiptInvocation = await prepareReceiptToolInvocation({ toolUseId: toolUseID, assistantMessage, agentId: toolUseContext.agentId })
     const callNativeTool = () =>
       tool.call(
         callInput,
@@ -1305,13 +1306,14 @@ async function checkPermissionsAndCallTool(
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
 
-    const receiptInput = await receiptInvocation?.input()
-    if (receiptInput) {
-      // The original frozen object must reach query's WeakMap admission. Do not
-      // remap, truncate, run output-changing hooks, or attach raw CLI side data.
-      endToolExecutionSpan({ success: true })
-      endToolSpan()
-      return [{ message: receiptInput }]
+    if (tool.name !== 'Bash') {
+      const receiptInput = await receiptInvocation?.finish()
+      if (receiptInput?.mode === 'replace') {
+        // Preserve the canonical MCP object through the existing WeakMap path.
+        endToolExecutionSpan({ success: true })
+        endToolSpan()
+        return receiptInput.messages.map(message => ({ message }))
+      }
     }
 
     // Log tool content/output as span event if enabled
@@ -1687,6 +1689,10 @@ async function checkPermissionsAndCallTool(
     for (const hookResult of hookResults) {
       resultingMessages.push(hookResult)
     }
+    if (tool.name === 'Bash') {
+      const receiptInput = await receiptInvocation?.finish()
+      if (receiptInput?.mode === 'append') resultingMessages.push(...receiptInput.messages.map(message => ({ message })))
+    }
     return resultingMessages
   } catch (error) {
     const durationMs = Date.now() - startTime
@@ -1825,6 +1831,9 @@ async function checkPermissionsAndCallTool(
       hookMessages.push(hookResult)
     }
 
+    // ShellError is a real completed command too. Preserve its original error
+    // result, then let query's batch barrier admit each independent receipt.
+    const receiptInput = tool.name === 'Bash' ? await receiptInvocation?.finish() : undefined
     return [
       {
         message: createUserMessage({
@@ -1847,6 +1856,7 @@ async function checkPermissionsAndCallTool(
         }),
       },
       ...hookMessages,
+      ...(receiptInput?.mode === 'append' ? receiptInput.messages.map(message => ({ message })) : []),
     ]
   } finally {
     stopSessionActivity('tool_exec')

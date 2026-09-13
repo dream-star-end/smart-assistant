@@ -54,7 +54,7 @@ test('parallel MCP invocations retain actual non-first SDK IDs without shared en
         expect(JSON.parse(Buffer.from(meta[RECEIPT_MCP_META].capability.split('.')[0]!, 'base64url').toString()).consumerToolUseId).toBe(toolUseId)
         expect(receiptShellEnvironment()[RECEIPT_CAP_ENV]).toBeUndefined()
       })
-      expect(await call!.input()).toBeUndefined()
+      expect(await call!.finish()).toBeUndefined()
     }))
     expect(process.env[RECEIPT_CAP_ENV]).toBe(before)
     expect(receiptMcpRequest('third-party','delegate_task','one',config)).toBeUndefined()

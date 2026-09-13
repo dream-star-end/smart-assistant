@@ -26,7 +26,7 @@ import {
   logEvent,
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
 } from 'src/services/analytics/index.js'
-import { admitReceiptInput } from './utils/receiptInputAdmission.js'
+import { admitReceiptInput, isDeferredReceiptInput } from './utils/receiptInputAdmission.js'
 import { ImageSizeError } from './utils/imageValidation.js'
 import { ImageResizeError } from './utils/imageResizer.js'
 import { findToolByName, type ToolUseContext } from './Tool.js'
@@ -752,6 +752,9 @@ async function* queryLoop(
 
     const assistantMessages: AssistantMessage[] = []
     const toolResults: (UserMessage | AttachmentMessage)[] = []
+    // Never ACK receipt text before a later ordinary result in this assistant
+    // batch can reparent to sourceToolAssistantUUID and cut it off the log chain.
+    const receiptCandidates: Message[] = []
     // @see https://docs.claude.com/en/docs/build-with-claude/tool-use
     // Note: stop_reason === 'tool_use' is unreliable -- it's not always set correctly.
     // Set during streaming whenever a tool_use block arrives — the sole
@@ -1112,6 +1115,10 @@ async function* queryLoop(
             ) {
               for (const result of streamingToolExecutor.getCompletedResults()) {
                 if (result.message) {
+                  if (isDeferredReceiptInput(result.message)) {
+                    receiptCandidates.push(result.message)
+                    continue
+                  }
                   const admittedMessage = await admitReceiptInput(
                     result.message,
                     messagesForQuery.concat(assistantMessages, toolResults),
@@ -1314,10 +1321,14 @@ async function* queryLoop(
         // reach the outer consumer's ordinary transcript persistence.
         for await (const update of streamingToolExecutor.getRemainingResults()) {
           if (update.message) {
-            yield await admitReceiptInput(
-              update.message,
-              messagesForQuery.concat(assistantMessages, toolResults),
-            )
+            if (isDeferredReceiptInput(update.message)) {
+              receiptCandidates.push(update.message)
+              continue
+            }
+            const admitted = await admitReceiptInput(update.message,
+              messagesForQuery.concat(assistantMessages, toolResults))
+            yield admitted
+            if (admitted.type === 'user') toolResults.push(admitted as UserMessage)
           }
         }
       } else {
@@ -1326,6 +1337,13 @@ async function* queryLoop(
           'Interrupted by user',
         )
       }
+      for (const candidate of receiptCandidates) {
+        const admitted = await admitReceiptInput(candidate,
+          messagesForQuery.concat(assistantMessages, toolResults))
+        yield admitted
+        toolResults.push(admitted as UserMessage)
+      }
+      receiptCandidates.length = 0
       // chicago MCP: auto-unhide + lock release on interrupt. Same cleanup
       // as the natural turn-end path in stopHooks.ts. Main thread only —
       // see stopHooks.ts for the subagent-releasing-main's-lock rationale.
@@ -1683,6 +1701,10 @@ async function* queryLoop(
       : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
 
     for await (const update of toolUpdates) {
+      if (update.message && isDeferredReceiptInput(update.message)) {
+        receiptCandidates.push(update.message)
+        continue
+      }
       if (update.message) {
         const admittedMessage = await admitReceiptInput(
           update.message,
@@ -1711,6 +1733,17 @@ async function* queryLoop(
         }
       }
     }
+
+    // The entire assistant/tool batch is now drained. Keep exact admitted
+    // messages in history; each subsequent strict record extends the same tail.
+    for (const candidate of receiptCandidates) {
+      const admitted = await admitReceiptInput(candidate,
+        messagesForQuery.concat(assistantMessages, toolResults))
+      yield admitted
+      toolResults.push(admitted as UserMessage)
+    }
+    receiptCandidates.length = 0
+
     queryCheckpoint('query_tool_execution_end')
 
     // Generate tool use summary after tool batch completes — passed to next recursive call

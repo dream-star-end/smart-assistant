@@ -339,16 +339,14 @@ async function main(): Promise<void> {
     const base = gatewayBaseUrl()
     const headers = gatewayDelegateHeaders()
     const receipt = process.env[RECEIPT_CAP_ENV] ? new ReceiptCliTransport() : undefined
-    const locators = positional.map(id => receipt?.lookup(id))
-    // Until the composite tool-result owner is paired, reject v2 fanout before
-    // reading any result. Ordinary v1 multi-wait retains its existing behavior.
-    if (positional.length > 1 && locators.some(Boolean)) fail('receipt multi-wait is not yet supported; wait one job per tool')
+    const jobIds = [...new Set(positional)]
+    const locators = new Map(jobIds.map(id => [id, receipt?.lookup(id)]))
     const result = await runDelegateWaitLoop({
-      jobIds: positional,
+      jobIds,
       pollWaitMs: resolveDelegateWaitPollMs(),
       foregroundBudgetMs: resolveDelegateCliForegroundBudgetMs(),
-      waitOnce: (jobId, waitMs) => receipt && locators[0]
-        ? receipt.wait(locators[0], waitMs)
+      waitOnce: (jobId, waitMs) => receipt && locators.get(jobId)
+        ? receipt.wait(locators.get(jobId)!, waitMs)
         : postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
           body: JSON.stringify({ jobId, waitMs }),
