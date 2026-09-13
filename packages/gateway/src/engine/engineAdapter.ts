@@ -203,9 +203,25 @@ export interface EngineTurnRun {
  * (effort/model/toolsets/executionTarget/lastActivityAt/repoBinding),
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
+/** Receipt consumer identity, captured only from the engine's main-thread SDK
+ * tool registry. This is NOT a create-time receipt binding and never rewrites it. */
+export interface ReceiptToolOwner {
+  adapterInstanceId: string
+  parentOwnerEpoch: string
+  turnKey: string
+  nativeSessionId: string
+  consumerToolUseId: string
+  toolName: string
+}
+export type ReceiptOwnerState = 'active' | 'inactive' | 'unknown'
+
 export interface EngineAdapter extends EventEmitter {
   readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   readonly capabilities: EngineCapabilities
+  /** Optional trusted native receipt consumer surface; not an environment/body lookup. */
+  getReceiptToolOwner?(toolUseId: string): ReceiptToolOwner | null
+  /** Unknown (including adapter replacement) must NEVER authorize fallback notify. */
+  checkReceiptOwner?(owner: ReceiptToolOwner): ReceiptOwnerState
 
   // ── lifecycle ──
   start(): Promise<void>

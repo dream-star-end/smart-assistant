@@ -17,6 +17,7 @@
  * 硬约束:CCB stream-json SdkMessage 形状不跨出本模块。
  */
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
@@ -33,6 +34,8 @@ import type {
   EngineCapabilities,
   EngineSessionTotals,
   EngineTurnRun,
+  ReceiptToolOwner,
+  ReceiptOwnerState,
   TurnParams,
 } from './engineAdapter.js'
 import type {
@@ -201,6 +204,10 @@ interface CcbTurnContext {
    * 不明的 tail 灌进当前 turn)。per-turn 不设上限(受本 turn 工具数天然约束)。
    */
   ownedBashToolUseIds: Set<string>
+  receiptOwnerEpoch: string
+  receiptTurnKey?: string
+  receiptRevoked: boolean
+  receiptTools: Map<string, { name: string; nativeSessionId: string }>
   /**
    * P1-6 — 本 turn 未决的 can_use_tool permission_request(request_id 集)。
    * CCB 在 stdio 等待 control_response 期间零输出,idle watchdog 若不感知会把
@@ -367,6 +374,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * pendingToolCalls 归 0、telemetry 停止 ingest。
    */
   private _activeTurn: CcbTurnContext | null = null
+  private readonly _receiptInstanceId = randomUUID()
   /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
   private _interrupting = false
   /**
@@ -402,6 +410,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     })
     for (const name of FORWARDED_RUNNER_EVENTS) {
       this.runner.on(name, (...args: unknown[]) => {
+        // A later process start must never resurrect a dead writer's authority.
+        if (name === 'exit' || name === 'error') this._revokeReceiptOwner()
         this.emit(name, ...args)
       })
     }
@@ -421,6 +431,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
+    this._revokeReceiptOwner()
     const telemetry = new TelemetryChannel()
     let nativeCompactionSummary: string | undefined
     let resolveSummary!: (s: TurnSummary | null) => void
@@ -473,7 +484,15 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // tool_use_detected 先于 finalized tool_use block,tool_result block 先于
       // tool_result_detected —— 与旧回调触发点逐一对位。
       // 主 agent-only 桥接事件(与登记解耦,见下方 onBashToolObserved)。
-      onToolUse: (tool) => params.onEvent({ kind: 'tool_use_detected', tool }),
+      onToolUse: (tool) => {
+        // This callback is main-thread SDK-only (unlike Bash tail attribution).
+        // The first observation is immutable; text/stdout and nested tools do not mint owners.
+        const nativeSessionId = this.runner.sessionId
+        if (!ctx.receiptRevoked && tool.id && nativeSessionId && !ctx.receiptTools.has(tool.id)) {
+          ctx.receiptTools.set(tool.id, { name: tool.name, nativeSessionId })
+        }
+        params.onEvent({ kind: 'tool_use_detected', tool })
+      },
       // F5:所有 Bash tool_use(含子 agent)的归属登记入口 —— 只登记 tool_use_id → 本
       // turn ctx(fail-closed:非 Bash id 绝不进 origin map),供 tail 归位(活跃 turn /
       // post-terminal 皆然)。不触发 host bridge(那是 onToolUse 的职责)。
@@ -485,6 +504,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       onNativeCompactionSummary: (summaryText) => { nativeCompactionSummary = summaryText },
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
       onFinish: (result) => {
+        ctx.receiptRevoked = true
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
@@ -509,6 +529,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       parser,
       telemetry,
       ownedBashToolUseIds: new Set(),
+      receiptOwnerEpoch: randomUUID(),
+      receiptTurnKey: params.turnKey,
+      receiptRevoked: false,
+      receiptTools: new Map(),
       pendingPermissionRequestIds: new Set(),
       creditGuard: null as unknown as CreditBudgetGuard,
       creditErrorEmitted: false,
@@ -526,6 +550,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
           budgetFen: params.creditBudgetFen?.toString(),
         })
         // Same cooperative wire as a user Stop (stdin control_request).
+        ctx.receiptRevoked = true
         this.runner.interrupt()
       },
     })
@@ -557,6 +582,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         }
       })
     void submitted.catch(() => {
+      ctx.receiptRevoked = true
       if (this._activeTurn === ctx) this._activeTurn = null
     })
     return {
@@ -574,6 +600,38 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         return parser.pendingToolCalls
       },
     }
+  }
+
+  private _revokeReceiptOwner(): void {
+    if (this._activeTurn) this._activeTurn.receiptRevoked = true
+    if (this._routeTurn) this._routeTurn.receiptRevoked = true
+  }
+
+  getReceiptToolOwner(toolUseId: string): ReceiptToolOwner | null {
+    const ctx = this._activeTurn
+    if (this.harness !== 'ccb' || !ctx || this._routeTurn !== ctx || ctx.receiptRevoked ||
+        this._interrupting || ctx.parser.finalized || !this.runner.isRunning || !ctx.receiptTurnKey) return null
+    const tool = ctx.receiptTools.get(toolUseId)
+    if (!tool || tool.nativeSessionId !== this.runner.sessionId) return null
+    return {
+      adapterInstanceId: this._receiptInstanceId,
+      parentOwnerEpoch: ctx.receiptOwnerEpoch,
+      turnKey: ctx.receiptTurnKey,
+      nativeSessionId: tool.nativeSessionId,
+      consumerToolUseId: toolUseId,
+      toolName: tool.name,
+    }
+  }
+
+  checkReceiptOwner(owner: ReceiptToolOwner): ReceiptOwnerState {
+    // A new adapter cannot prove the old process is gone. Its FD lock/oracle
+    // must still be reconciled, even if the platform session has been replaced.
+    if (owner.adapterInstanceId !== this._receiptInstanceId) return 'unknown'
+    const current = this.getReceiptToolOwner(owner.consumerToolUseId)
+    if (!current) return 'inactive'
+    return current.parentOwnerEpoch === owner.parentOwnerEpoch &&
+      current.turnKey === owner.turnKey && current.nativeSessionId === owner.nativeSessionId &&
+      current.toolName === owner.toolName ? 'active' : 'inactive'
   }
 
   private _startLeaseRenewal(
@@ -718,12 +776,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
+    this._revokeReceiptOwner()
     this._interrupting = true
     if (this._activeTurn) this._activeTurn = null
     return this.runner.interrupt()
   }
 
   async shutdown(): Promise<void> {
+    this._revokeReceiptOwner()
     // F3⑤:先 await 底座停产出(SIGTERM+SIGKILL 链走完),drain 期间的尾帧仍能按
     // origin map 正确归位;**之后**再清 map,避免清早了让尾 tail 落回 fail-closed 丢弃。
     await this.runner.shutdown()

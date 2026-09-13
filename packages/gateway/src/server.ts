@@ -110,6 +110,7 @@ import {
   inspectConsultTurnToken,
   verifyDelegateContextToken,
 } from './delegateContext.js'
+import { ReceiptOwnerCapabilities, RECEIPT_OWNER_PREFIX, receiptContextHash, isReceiptConsumerTool } from './receiptOwnerCapability.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
 import { resolveGatewayListen } from './gatewayBind.js'
 import { resolveOpenedPath } from './openedPath.js'
@@ -2814,6 +2815,8 @@ export class Gateway {
     warn: (msg, fields) => this.log.warn(msg, fields),
     error: (msg, fields) => this.log.error(msg, undefined, fields ? new Error(JSON.stringify(fields)) : undefined),
   })
+
+  private readonly _receiptOwnerCapabilities = new ReceiptOwnerCapabilities()
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
@@ -6238,6 +6241,12 @@ export class Gateway {
       this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    // Receipt authority is behind ordinary HTTP auth AND a signed parent context.
+    // It is intentionally NOT part of the legacy delegate-context auth bypass.
+    if (url.pathname === `${RECEIPT_OWNER_PREFIX}issue` || url.pathname === `${RECEIPT_OWNER_PREFIX}check`) {
+      this.handleReceiptOwner(req, res, url.pathname.endsWith('/issue')).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
@@ -14052,6 +14061,62 @@ export class Gateway {
         ...(result.sessionKey ? { sessionKey: result.sessionKey } : {}),
       },
     }
+  }
+
+  private async handleReceiptOwner(req: IncomingMessage, res: ServerResponse, issue: boolean): Promise<void> {
+    res.setHeader('Cache-Control', 'no-store')
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    // Explicitly require HTTP credentials; neither loopback nor bridge bypass
+    // alone can grant this native capability.
+    if (!this.checkHttpAuth(req)) return this.sendError(res, 401, 'receipt owner requires HTTP authentication')
+    const contextToken = req.headers[DELEGATE_CONTEXT_HEADER]
+    const bound = typeof contextToken === 'string' ? verifyDelegateContextToken(contextToken) : null
+    if (!bound || typeof contextToken !== 'string') return this.sendError(res, 401, 'invalid delegate context')
+    let body: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(await this.readBody(req))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid body')
+      body = parsed as Record<string, unknown>
+    } catch { return this.sendError(res, 400, 'invalid JSON object') }
+    const field = issue ? 'toolUseId' : 'capability'
+    if (Object.keys(body).length !== 1 || typeof body[field] !== 'string' || !body[field]) {
+      return this.sendError(res, 400, `only ${field} is accepted`)
+    }
+    const parent = this.sessions?.getByKey(bound.sessionKey)
+    const rawBearer = checkToken(this.extractToken(req), this.deps.config.gateway.accessToken)
+    // Raw gateway credentials are the existing single-tenant service principal,
+    // NOT the multi-user JWT named 'default'. In that explicit mode, the signed
+    // parent session supplies its own partition (e.g. c:3 on the container).
+    // No fallback from a failed/foreign JWT, and no identity from the body/env.
+    const matchesUser = (userId: string): boolean => rawBearer || this.getUserId(req) === userId
+    const contextHash = receiptContextHash(contextToken)
+    if (issue) {
+      if (!parent || parent.agentId !== bound.agentId) return this.sendError(res, 409, 'parent unavailable')
+      const userId = parent.userId || 'default'
+      if (!matchesUser(userId)) return this.sendError(res, 403, 'receipt owner user mismatch')
+      const owner = parent.runner.getReceiptToolOwner?.(body.toolUseId as string)
+      if (!owner || owner.turnKey !== parent._currentTurnKey || !isReceiptConsumerTool(owner.toolName)) {
+        return this.sendError(res, 409, 'native receipt consumer unavailable')
+      }
+      const capability = this._receiptOwnerCapabilities.issue({
+        ...owner, userId, agentId: parent.agentId, sessionKey: parent.sessionKey, contextHash,
+      })
+      return this.sendJson(res, 200, { capability, ownerState: 'active' })
+    }
+    const claims = this._receiptOwnerCapabilities.verify(body.capability)
+    if (!claims || claims.agentId !== bound.agentId || claims.sessionKey !== bound.sessionKey ||
+        claims.contextHash !== contextHash) {
+      return this.sendJson(res, 401, { error: 'invalid receipt owner capability', ownerState: 'unknown' })
+    }
+    if (!matchesUser(claims.userId)) return this.sendError(res, 403, 'receipt owner user mismatch')
+    // A missing/replaced session is not proof that its process stopped. Only the
+    // same adapter incarnation can attest revocation; native oracle+FD lock
+    // remain mandatory before a later notify path can act on 'inactive'.
+    if (!parent || parent.agentId !== claims.agentId || (parent.userId || 'default') !== claims.userId) {
+      return this.sendJson(res, 200, { ownerState: 'unknown' })
+    }
+    const ownerState = parent.runner.checkReceiptOwner?.(claims) ?? 'unknown'
+    return this.sendJson(res, 200, { ownerState })
   }
 
   private async handleDelegateWait(
