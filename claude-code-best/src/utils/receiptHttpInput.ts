@@ -1,3 +1,4 @@
+import { receiptMcpTargetForSdk } from '../../../packages/gateway/src/receiptOwnerCapability.js'
 /** Native-only receipt consumer. Wire/stdout material is an untrusted locator;
  * result bytes, immutable creator and consumer come from authenticated HTTP.
  * Ordinary tools/CLI are NOT enrolled until the complete C0 registration. */
@@ -60,7 +61,7 @@ export async function createHttpReceiptInput(opts: {
   const rawBinding = offered.binding as TrustedReceiptBinding
   const resultJson: unknown = offered.resultJson
   if (!consumer || !rawBinding || consumer.nativeSessionId !== nativeSessionId || getSessionId() !== nativeSessionId ||
-      consumer.consumerToolUseId !== toolUseId || consumer.toolName !== toolName || !consumer.parentOwnerEpoch ||
+      consumer.consumerToolUseId !== toolUseId || consumer.toolName !== toolName || consumer.receiptMcpTarget !== receiptMcpTargetForSdk(toolName, tools[0].input) || !consumer.parentOwnerEpoch ||
       rawBinding.userId !== consumer.userId || rawBinding.parentSession !== consumer.sessionKey ||
       rawBinding.parentTurnKey !== consumer.turnKey || rawBinding.jobId !== locator.jobId || rawBinding.generation !== locator.generation ||
       rawBinding.receiptNonceHash !== hash(locator.receiptNonce) || typeof resultJson !== 'string' || hash(resultJson) !== rawBinding.resultDigest) {

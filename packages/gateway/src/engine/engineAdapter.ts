@@ -212,6 +212,8 @@ export interface ReceiptToolOwner {
   nativeSessionId: string
   consumerToolUseId: string
   toolName: string
+  /** Exact inner MCP target observed in an actual ExecuteExtraTool SDK block. */
+  receiptMcpTarget?: string
 }
 export type ReceiptOwnerState = 'active' | 'inactive' | 'unknown'
 

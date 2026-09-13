@@ -14158,7 +14158,7 @@ export class Gateway {
       const userId = parent.userId || 'default'
       if (!matchesUser(userId)) return this.sendError(res, 403, 'receipt owner user mismatch')
       const owner = parent.runner.getReceiptToolOwner?.(body.toolUseId as string)
-      if (!owner || owner.turnKey !== parent._currentTurnKey || !isReceiptConsumerTool(owner.toolName)) {
+      if (!owner || owner.turnKey !== parent._currentTurnKey || !isReceiptConsumerTool(owner.toolName, owner.receiptMcpTarget)) {
         return this.sendError(res, 409, 'native receipt consumer unavailable')
       }
       const capability = this._receiptOwnerCapabilities.issue({

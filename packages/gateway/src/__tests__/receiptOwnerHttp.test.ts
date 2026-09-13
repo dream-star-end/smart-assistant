@@ -41,9 +41,9 @@ class SdkProcess extends EventEmitter {
   }
   interrupt(): boolean { return true }
   async shutdown(): Promise<void> { await this.shutdownGate; this.isRunning = false }
-  tool(id: string, name = 'Bash', parent?: string): void {
+  tool(id: string, name = 'Bash', parent?: string, input: Record<string, unknown> = {}): void {
     this.emit('message', { type: 'assistant', parent_tool_use_id: parent,
-      message: { content: [{ type: 'tool_use', id, name, input: {} }] } })
+      message: { content: [{ type: 'tool_use', id, name, input }] } })
   }
 }
 function makeAdapter(harness: 'ccb' | 'official-cc' = 'ccb') {
@@ -413,4 +413,48 @@ test('actual user stdin success followed by writer exit cannot mint authority on
   h.tool('late-tool')
   assert.equal(h.adapter.getReceiptToolOwner('late-tool'), null)
   turn.end()
+})
+
+
+test('deferred receipt capability preserves outer SDK identity and immutable exact inner target', async () => {
+  const f = await fixture()
+  const target = 'mcp__openclaude-memory__delegate_task'
+  try {
+    f.process.tool('outer', 'ExecuteExtraTool', undefined, {tool_name:target,params:{goal:'synthetic'}})
+    const cap = await f.issue('outer')
+    const claims = JSON.parse(Buffer.from(cap.split('.')[0], 'base64url').toString())
+    assert.equal(claims.consumerToolUseId, 'outer'); assert.equal(claims.toolName, 'ExecuteExtraTool')
+    assert.equal(claims.receiptMcpTarget, target)
+    const owner = f.adapter.getReceiptToolOwner('outer')!
+    assert.equal(f.adapter.checkReceiptOwner({...owner,receiptMcpTarget:'mcp__openclaude-memory__delegate_wait'}),'inactive')
+    f.process.tool('outer','ExecuteExtraTool',undefined,{tool_name:'mcp__untrusted__delegate_task'})
+    assert.deepEqual(f.adapter.getReceiptToolOwner('outer'),owner)
+    assert.equal((await f.post('check',{capability:cap})).data.ownerState,'active')
+    f.process.tool('wait-outer','ExecuteExtraTool',undefined,{tool_name:'mcp__openclaude-memory__delegate_wait'})
+    const wait = f.adapter.getReceiptToolOwner('wait-outer')!
+    assert.equal(wait.parentOwnerEpoch,owner.parentOwnerEpoch); assert.notEqual(wait.consumerToolUseId,owner.consumerToolUseId)
+    await f.issue('wait-outer')
+    f.adapter.interrupt();assert.equal((await f.post('check',{capability:cap})).data.ownerState,'inactive')
+  } finally {await f.close()}
+})
+test('deferred receipt rejects missing, third-party, nested or HTTP-asserted target',async()=>{
+  const f=await fixture()
+  try {
+    for(const [id,input] of [['missing',{}],['untrusted',{tool_name:'mcp__untrusted__delegate_task'}],['ordinary',{tool_name:'Read'}],['composite',{tool_name:'mcp__openclaude-memory__delegate_tasks'}]] as const){
+      f.process.tool(id,'ExecuteExtraTool',undefined,input)
+      assert.equal((await f.post('issue',{toolUseId:id})).status,409)
+    }
+    f.process.tool('nested','ExecuteExtraTool','parent-agent',{tool_name:'mcp__openclaude-memory__delegate_task'})
+    assert.equal((await f.post('issue',{toolUseId:'nested'})).status,409)
+    assert.equal((await f.post('issue',{toolUseId:'missing',receiptMcpTarget:'mcp__openclaude-memory__delegate_task'})).status,400)
+  }finally{await f.close()}
+})
+test('deferred receipt signed capability schema disallows absent or misplaced inner target',()=>{
+  const issuer=new ReceiptOwnerCapabilities()
+  const input={adapterInstanceId:'instance',parentOwnerEpoch:'epoch',turnKey:'turn',nativeSessionId:'session',consumerToolUseId:'outer',toolName:'ExecuteExtraTool',userId:'user',agentId:'main',sessionKey:'parent',contextHash:'context'}
+  assert.equal(issuer.verify(issuer.issue(input)),null)
+  assert.equal(issuer.verify(issuer.issue({...input,receiptMcpTarget:'mcp__untrusted__delegate_task'})),null)
+  const accepted=issuer.verify(issuer.issue({...input,receiptMcpTarget:'mcp__openclaude-memory__delegate_task'}))!
+  assert.equal(accepted.toolName,'ExecuteExtraTool');assert.equal(accepted.consumerToolUseId,'outer')
+  assert.equal(issuer.verify(issuer.issue({...input,toolName:'Bash',receiptMcpTarget:'mcp__openclaude-memory__delegate_task'})),null)
 })

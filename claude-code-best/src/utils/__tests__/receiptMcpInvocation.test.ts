@@ -17,14 +17,14 @@ function assistant(id: string): any { return { type: 'assistant', uuid: randomUU
   { type: 'tool_use', id: 'unrelated-first-block', name: 'Read', input: {} },
   { type: 'tool_use', id, name, input: {} },
 ] } } }
-async function fixture(fn: (config: any) => Promise<void>) {
+async function fixture(fn: (config: any) => Promise<void>, wrapped = false) {
   const dir = await mkdtemp(join(tmpdir(), 'receipt-mcp-unit-'))
   const keys = ['OPENCLAUDE_RECEIPT_CALLER_V2','OPENCLAUDE_HOME','OPENCLAUDE_GATEWAY_PORT','OPENCLAUDE_GATEWAY_TOKEN_FILE','OPENCLAUDE_DELEGATE_CONTEXT_FILE']
   const old = keys.map(k => process.env[k])
   const server = createServer(async (req, res) => {
     let data = ''; for await (const b of req) data += b
     const { toolUseId } = JSON.parse(data)
-    const claims = { nativeSessionId: getSessionId(), consumerToolUseId: toolUseId, toolName: name }
+    const claims = { nativeSessionId: getSessionId(), consumerToolUseId: toolUseId, toolName: wrapped ? 'ExecuteExtraTool' : name, ...(wrapped ? {receiptMcpTarget:name} : {}) }
     res.end(JSON.stringify({ capability: Buffer.from(JSON.stringify(claims)).toString('base64url')+'.synthetic-unit' }))
   })
   try {
@@ -90,4 +90,23 @@ test('receipt URL elicitation cannot replay a possibly started request', async (
     callToolFn:async()=>{calls++;throw error},
   })).rejects.toBe(error)
   expect(calls).toBe(1);expect(elicitations).toBe(0)
+})
+
+test('deferred native scope keeps outer identity and enforces the parsed inner MCP target',async()=>{
+  await fixture(async config=>{
+    const message=assistant('outer')
+    message.message.content[1].name='ExecuteExtraTool'
+    message.message.content[1].input={tool_name:name,params:{goal:'synthetic'}}
+    const call=await prepareReceiptToolInvocation({toolUseId:'outer',assistantMessage:message})
+    expect(call).toBeDefined()
+    await call!.run(async()=>{
+      const request=receiptMcpRequest('openclaude-memory','delegate_task','outer',config)!
+      const claims=JSON.parse(Buffer.from(request.meta[RECEIPT_MCP_META].capability.split('.')[0]!, 'base64url').toString())
+      expect(claims.toolName).toBe('ExecuteExtraTool');expect(claims.consumerToolUseId).toBe('outer');expect(claims.receiptMcpTarget).toBe(name)
+      expect(()=>receiptMcpRequest('openclaude-memory','delegate_wait','outer',config)).toThrow()
+      expect(receiptShellEnvironment()[RECEIPT_CAP_ENV]).toBeUndefined()
+    })
+    message.message.content[1].input.tool_name='mcp__untrusted__delegate_task'
+    expect(await prepareReceiptToolInvocation({toolUseId:'outer',assistantMessage:message})).toBeUndefined()
+  },true)
 })

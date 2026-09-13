@@ -1,3 +1,4 @@
+import { receiptMcpTargetForSdk } from '../../../packages/gateway/src/receiptOwnerCapability.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -12,7 +13,7 @@ import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLoc
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../../../packages/mcp-memory/src/gatewayClient.js'
 
 type ReceiptScope = {
-  toolUseId: string; toolName: string; capability: string
+  toolUseId: string; toolName: string; capability: string; mcpToolName?: string
   env?: Readonly<Record<string, string>>
   candidate?: ReceiptLocator
 }
@@ -29,8 +30,8 @@ export function receiptShellEnvironment(): Record<string, string | undefined> {
 export function receiptMcpRequest(serverName: string, toolName: string, toolUseId: string | undefined,
   config: { type?: string; command?: string; args?: string[]; env?: Record<string, string> }) {
   const scope = scopes.getStore()
-  if (!scope || !mcpNames.includes(scope.toolName)) return undefined
-  if (serverName !== platformServer || scope.toolName !== buildMcpToolName(serverName, toolName) || scope.toolUseId !== toolUseId) {
+  if (!scope || !mcpNames.includes(scope.mcpToolName ?? scope.toolName)) return undefined
+  if (serverName !== platformServer || (scope.mcpToolName ?? scope.toolName) !== buildMcpToolName(serverName, toolName) || scope.toolUseId !== toolUseId) {
     throw new Error('receipt MCP actual tool mismatch')
   }
   const entry = (relative: string) => {
@@ -67,7 +68,8 @@ export async function prepareReceiptToolInvocation(opts: {
   const block = Array.isArray(blocks) ? blocks.filter(b => b.type === 'tool_use' && b.id === opts.toolUseId) : []
   if (block.length !== 1 || block[0]?.type !== 'tool_use') throw new Error('receipt invocation requires actual SDK tool')
   const toolName = block[0].name
-  if (toolName !== 'Bash' && !mcpNames.includes(toolName)) return undefined
+  const mcpToolName = receiptMcpTargetForSdk(toolName, block[0].input)
+  if (toolName !== 'Bash' && !mcpNames.includes(toolName) && !mcpToolName) return undefined
   const nativeSessionId = getSessionId()
   const headers = gatewayDelegateHeaders()
   let response!: { statusCode: number; body: string }
@@ -85,9 +87,9 @@ export async function prepareReceiptToolInvocation(opts: {
   // binding against the actual native process before passing it to a child.
   const claims = JSON.parse(Buffer.from(capability.split('.')[0]!, 'base64url').toString())
   if (claims.nativeSessionId !== nativeSessionId || getSessionId() !== nativeSessionId ||
-      claims.consumerToolUseId !== opts.toolUseId || claims.toolName !== block[0].name) throw new Error('receipt invocation native mismatch')
+      claims.consumerToolUseId !== opts.toolUseId || claims.toolName !== block[0].name || claims.receiptMcpTarget !== mcpToolName) throw new Error('receipt invocation native mismatch')
   const home = process.env.OPENCLAUDE_HOME?.trim() || join(homedir(), '.openclaude')
-  const scope: ReceiptScope = { toolUseId: opts.toolUseId, toolName, capability }
+  const scope: ReceiptScope = { toolUseId: opts.toolUseId, toolName, capability, mcpToolName }
   let report: string | undefined
   if (toolName === 'Bash') {
     const root = join(home, 'receipt-invocations')

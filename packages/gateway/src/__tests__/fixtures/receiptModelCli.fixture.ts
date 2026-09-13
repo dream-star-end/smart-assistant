@@ -10,22 +10,26 @@ import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
-const requestedMode=process.argv[3] || 'create', mcp=requestedMode.startsWith('mcp-')
-const mode=requestedMode.replace(/^mcp-/, '');assert.ok(['create','wait','stop'].includes(mode))
+const requestedMode=process.argv[3] || 'create', wrapped=requestedMode.startsWith('deferred-'), mcp=wrapped||requestedMode.startsWith('mcp-')
+const mode=requestedMode.replace(/^(mcp|deferred)-/, '');assert.ok(['create','wait','stop'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
 mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
 const token=randomBytes(32).toString('hex'), session='agent:main:webchat:dm:real-model-cli', turnKey='real-model-cli-turn'
 const requests:any[]=[], sdk:any[]=[], http:any[]=[]
-let phase=0, executions=0, received=false, failure:any
+let phase=0, executions=0, received=false, discovered=false, failure:any
 let adapter:CcbAdapter, runner:SubprocessRunner, turn:any
 const sentinel='REAL_MODEL_CLI_AUTHORITATIVE_RESULT'
 const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate --agent-id coding-assistant --goal synthetic-child-only`
 const command=(mode==='wait'?'timeout --signal=TERM 8s ':'')+cli
-function send(res:any,body:any,tool:boolean,wait=false) {
+function send(res:any,body:any,tool:boolean,wait=false,discover=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
- const content=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:mcp?`mcp__openclaude-memory__${wait?'delegate_wait':'delegate_task'}`:'Bash',input:mcp?(wait?{jobId:(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id,waitMs:10000}:{agentId:'coding-assistant',goal:'synthetic-child-only'}):{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id}`:command,timeout:20000}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ let content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:mcp?`mcp__openclaude-memory__${wait?'delegate_wait':'delegate_task'}`:'Bash',input:mcp?(wait?{jobId:(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id,waitMs:10000}:{agentId:'coding-assistant',goal:'synthetic-child-only'}):{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id}`:command,timeout:20000}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ if(wrapped && tool) {
+   content=discover?{type:'tool_use',id:'real_discovery',name:'SearchExtraTools',input:{query:'select:mcp__openclaude-memory__delegate_task,mcp__openclaude-memory__delegate_wait'}}:
+     {...content,name:'ExecuteExtraTool',input:{tool_name:content.name,params:content.input}}
+ }
  const message={id,type:'message',role:'assistant',model:body.model,content:[content],stop_reason:tool?'tool_use':'end_turn',stop_sequence:null,usage:{input_tokens:10,output_tokens:10}}
  if(!body.stream){res.setHeader('Content-Type','application/json');res.end(JSON.stringify(message));return}
  res.setHeader('Content-Type','text/event-stream')
@@ -45,8 +49,15 @@ const upstream=createServer(async(req,res)=>{
   requests.push({path:req.url,method:req.method,model:body.model,stream:body.stream,containsSentinel:raw.includes(sentinel),toolNames:body.tools?.map((t:any)=>t.name)})
   if(req.url?.includes('count_tokens')) {res.end(JSON.stringify({input_tokens:100}));return}
   if(!req.url?.startsWith('/v1/messages')){res.statusCode=404;res.end('{}');return}
-  const main=body.tools?.some((t:any)=>t.name===(mcp?'mcp__openclaude-memory__delegate_task':'Bash'))
-  if(main&&phase===0){phase++;send(res,body,true)}
+  const main=body.tools?.some((t:any)=>t.name===(wrapped?'ExecuteExtraTool':mcp?'mcp__openclaude-memory__delegate_task':'Bash'))
+  if(main&&wrapped&&!discovered){
+    assert.ok(!body.tools.some((t:any)=>t.name==='mcp__openclaude-memory__delegate_task'),'default MCP must remain deferred')
+    discovered=true;send(res,body,true,false,true)
+  }
+  else if(main&&phase===0){
+    if(wrapped)assert.ok(raw.includes('Found 2 deferred tool'),'actual discovery must finish before execution')
+    phase++;send(res,body,true)
+  }
   else if(main&&phase===1&&mode==='wait'){assert.equal(executions,1);assert.ok(!raw.includes(sentinel));releaseChild();phase++;send(res,body,true,true)}
   else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
  }catch(e){failure=e;res.statusCode=500;res.end('{}')}
@@ -72,7 +83,7 @@ process.env.OPENCLAUDE_GATEWAY_PORT=String(port);process.env.OPENCLAUDE_GATEWAY_
 process.env.OPENCLAUDE_HOME=dir;process.env.OPENCLAUDE_DELEGATE_JOBS_DB=dbPath
 if(mcp)process.env.OPENCLAUDE_DELEGATE_CURSOR_FAST_WAIT_MS='5000'
 process.env.CLAUDE_CONFIG_DIR=join(dir,'native');process.env.OPENCLAUDE_RECEIPT_CALLER_V2='1'
-const providerEnvOverride={...(mcp?{ENABLE_SEARCH_EXTRA_TOOLS:'false'}:{}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
+const providerEnvOverride={...(mcp&&!wrapped?{ENABLE_SEARCH_EXTRA_TOOLS:'false'}:{}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
 runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
 adapter=new CcbAdapter({harness:'ccb'} as any,runner)
 const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}

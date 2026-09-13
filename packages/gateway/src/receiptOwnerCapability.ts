@@ -23,7 +23,19 @@ export function receiptContextHash(token: string): string {
   return createHash('sha256').update(token).digest('hex')
 }
 
-export function isReceiptConsumerTool(name: string): boolean {
+const DEFERRED_RECEIPT_TARGETS = [
+  'mcp__openclaude-memory__delegate_task', 'mcp__openclaude-memory__delegate_wait',
+] as const
+/** Only from the actual SDK tool_use block, never an HTTP body assertion. */
+export function receiptMcpTargetForSdk(name: string, input: unknown): string | undefined {
+  if (name !== 'ExecuteExtraTool' || !input || typeof input !== 'object' || Array.isArray(input)) return undefined
+  const target = (input as Record<string, unknown>).tool_name
+  return typeof target === 'string' && (DEFERRED_RECEIPT_TARGETS as readonly string[]).includes(target) ? target : undefined
+}
+
+export function isReceiptConsumerTool(name: string, receiptMcpTarget?: string): boolean {
+  if (name === 'ExecuteExtraTool') return !!receiptMcpTarget && (DEFERRED_RECEIPT_TARGETS as readonly string[]).includes(receiptMcpTarget)
+  if (receiptMcpTarget !== undefined) return false
   return name === 'Bash' || [
     // CCB preserves hyphens; Codex's normalized namespace uses underscores.
     'mcp__openclaude-memory__delegate_task',
@@ -64,7 +76,7 @@ export class ReceiptOwnerCapabilities {
         'parentOwnerEpoch', 'turnKey', 'nativeSessionId', 'consumerToolUseId', 'toolName'] as const) {
         if (typeof c[key] !== 'string' || !c[key]) return null
       }
-      return isReceiptConsumerTool(c.toolName) ? c : null
+      return isReceiptConsumerTool(c.toolName, c.receiptMcpTarget) ? c : null
     } catch { return null }
   }
 

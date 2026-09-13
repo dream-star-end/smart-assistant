@@ -1,3 +1,4 @@
+import { receiptMcpTargetForSdk, isReceiptConsumerTool } from '../receiptOwnerCapability.js'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
  *
@@ -208,7 +209,7 @@ interface CcbTurnContext {
   receiptTurnKey?: string
   receiptRevoked: boolean
   receiptProcessIdentity?: object
-  receiptTools: Map<string, { name: string; nativeSessionId: string }>
+  receiptTools: Map<string, { name: string; nativeSessionId: string; receiptMcpTarget?: string }>
   /**
    * P1-6 — 本 turn 未决的 can_use_tool permission_request(request_id 集)。
    * CCB 在 stdio 等待 control_response 期间零输出,idle watchdog 若不感知会把
@@ -494,7 +495,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
             ctx.receiptProcessIdentity === this.runner.receiptProcessIdentity &&
             !this._receiptDeadProcesses.has(ctx.receiptProcessIdentity) &&
             tool.id && nativeSessionId && !ctx.receiptTools.has(tool.id)) {
-          ctx.receiptTools.set(tool.id, { name: tool.name, nativeSessionId })
+          const receiptMcpTarget = receiptMcpTargetForSdk(tool.name, tool.input)
+          ctx.receiptTools.set(tool.id, { name: tool.name, nativeSessionId, ...(receiptMcpTarget ? { receiptMcpTarget } : {}) })
         }
         params.onEvent({ kind: 'tool_use_detected', tool })
       },
@@ -635,7 +637,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         !ctx.receiptProcessIdentity || ctx.receiptProcessIdentity !== this.runner.receiptProcessIdentity ||
         this._receiptDeadProcesses.has(ctx.receiptProcessIdentity)) return null
     const tool = ctx.receiptTools.get(toolUseId)
-    if (!tool || tool.nativeSessionId !== this.runner.sessionId) return null
+    if (!tool || tool.nativeSessionId !== this.runner.sessionId || !isReceiptConsumerTool(tool.name, tool.receiptMcpTarget)) return null
     return {
       adapterInstanceId: this._receiptInstanceId,
       parentOwnerEpoch: ctx.receiptOwnerEpoch,
@@ -643,6 +645,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       nativeSessionId: tool.nativeSessionId,
       consumerToolUseId: toolUseId,
       toolName: tool.name,
+      ...(tool.receiptMcpTarget ? { receiptMcpTarget: tool.receiptMcpTarget } : {}),
     }
   }
 
@@ -654,7 +657,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     if (!current) return 'inactive'
     return current.parentOwnerEpoch === owner.parentOwnerEpoch &&
       current.turnKey === owner.turnKey && current.nativeSessionId === owner.nativeSessionId &&
-      current.toolName === owner.toolName ? 'active' : 'inactive'
+      current.toolName === owner.toolName && current.receiptMcpTarget === owner.receiptMcpTarget ? 'active' : 'inactive'
   }
 
   private _startLeaseRenewal(
