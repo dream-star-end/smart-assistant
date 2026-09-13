@@ -99,15 +99,15 @@ function context() {
     setAppState: (fn: any) => { state = fn(state) }, setInProgressToolUseIDs() {}, setResponseLength() {},
     updateFileHistoryState() {}, updateAttributionState() {}, messages: [] } as any
 }
-function seedLocator(f: Awaited<ReturnType<typeof fixture>>) {
+async function seedLocator(f: Awaited<ReturnType<typeof fixture>>) {
   // CREATE has already durably bound this nonce in the fixture. This is an
   // untrusted persisted locator, not a shortcut past HTTP or native checks.
-  new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: 'cache-only-not-authority',
+  new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: (await f.post('issue', {toolUseId:'creator'})).data.capability,
     [RECEIPT_CACHE_ENV]: join(dir, 'receipt-locators'), [RECEIPT_REPORT_ENV]: join(dir, 'unused') }).remember(f.options().locator)
 }
 
 for (const mode of ['create', 'wait'] as const) test(`actual query -> BashTool -> Shell -> ${mode} CLI -> HTTP -> native input`, async () => {
-  const f = await fixture(); seedLocator(f)
+  const f = await fixture(); await seedLocator(f)
   const opts = f.options(mode === 'create' ? 'creator' : 'waiter')
   const command = `node --import ${JSON.stringify(join(root, 'node_modules/tsx/dist/loader.mjs'))} ${JSON.stringify(join(root, 'packages/mcp-memory/src/ocMemoryCli.ts'))} ${mode === 'create' ? 'delegate --agent-id coding-assistant --goal local-fixture-only' : `delegate-wait ${f.info.jobId}`}`
   opts.assistantMessage.message.content[0].input = { command, timeout: 20000 }

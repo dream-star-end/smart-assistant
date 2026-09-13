@@ -105,10 +105,10 @@ function context() {
     setAppState: (fn: any) => { state = fn(state) }, setInProgressToolUseIDs() {}, setResponseLength() {},
     updateFileHistoryState() {}, updateAttributionState() {}, messages: [] } as any
 }
-function seedLocator(f: Awaited<ReturnType<typeof fixture>>) {
+async function seedLocator(f: Awaited<ReturnType<typeof fixture>>) {
   // CREATE has already durably bound this nonce in the fixture. This is an
   // untrusted persisted locator, not a shortcut past HTTP or native checks.
-  new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: 'cache-only-not-authority',
+  new ReceiptCliTransport({ [RECEIPT_CAP_ENV]: (await f.post('issue', {toolUseId:'creator'})).data.capability,
     [RECEIPT_CACHE_ENV]: join(dir, 'receipt-locators'), [RECEIPT_REPORT_ENV]: join(dir, 'unused') }).remember(f.options().locator)
 }
 
@@ -122,7 +122,7 @@ async function until(fn: () => boolean) {
 const cli = (f: Awaited<ReturnType<typeof fixture>>) => `node --import ${JSON.stringify(join(root, 'node_modules/tsx/dist/loader.mjs'))} ${JSON.stringify(join(root, 'packages/mcp-memory/src/ocMemoryCli.ts'))} delegate-wait ${f.info.jobId}`
 
 for (const mode of ['explicit', 'user', 'auto'] as const) test(`actual ShellCommand ${mode} background -> authenticated queue -> strict native user input once`, async () => {
-  const f = await fixture(); seedLocator(f)
+  const f = await fixture(); await seedLocator(f)
   const opts = f.options('waiter'), ctx = context()
   const first = createUserMessage({ content: 'background child' })
   await recordTranscript([first, opts.assistantMessage])
@@ -158,7 +158,7 @@ for (const mode of ['explicit', 'user', 'auto'] as const) test(`actual ShellComm
 }, 60000)
 
 test('actual query Bash background placeholder never repeats tool_result; queue admission produces native user notification', async () => {
-  const f = await fixture(); seedLocator(f)
+  const f = await fixture(); await seedLocator(f)
   const opts = f.options('waiter'), ctx = context()
   opts.assistantMessage.message.content[0].input = { command: cli(f), timeout: 20000, run_in_background: true }
   const first = createUserMessage({ content: 'background child then observe completion' }); ctx.messages = [first]
@@ -196,7 +196,7 @@ test('actual query Bash background placeholder never repeats tool_result; queue 
 }, 60000)
 
 for (const mode of ['ordinary-failure','rejected-create','stopped-parent'] as const) test(`background ${mode} preserves shell failure notification`, async () => {
-  const f = await fixture(); seedLocator(f)
+  const f = await fixture(); await seedLocator(f)
   if (mode === 'rejected-create') await f.control('disable-admission')
   const opts = f.options('waiter'), ctx = context()
   const invocation = await prepareReceiptToolInvocation(opts)
@@ -219,7 +219,7 @@ for (const mode of ['ordinary-failure','rejected-create','stopped-parent'] as co
 }, 60000)
 
 test('Stop after confirmed enqueue never admits original text or acknowledges receipt', async () => {
-  const f = await fixture(); seedLocator(f)
+  const f = await fixture(); await seedLocator(f)
   const opts = f.options('waiter'), ctx = context()
   const invocation = await prepareReceiptToolInvocation(opts)
   await invocation!.run(async () => {
@@ -238,7 +238,7 @@ test('Stop after confirmed enqueue never admits original text or acknowledges re
 }, 60000)
 
 test('actual background-completion handoff keeps an active-turn receipt path', async () => {
-  const f = await fixture(); seedLocator(f)
+  const f = await fixture(); await seedLocator(f)
   const opts = f.options('waiter'), ctx = context()
   ctx.setToolJSX = () => {}
   const fs = await import('node:fs/promises')

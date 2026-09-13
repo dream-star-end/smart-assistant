@@ -2,7 +2,7 @@
 import {fileURLToPath} from 'node:url'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdirSync,writeFileSync,readFileSync,readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { Gateway } from '../../server.js'
@@ -11,14 +11,14 @@ import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
 const requestedMode=process.argv[3] || 'create', wrapped=requestedMode.startsWith('deferred-'), mcp=wrapped||requestedMode.startsWith('mcp-')
-const mode=requestedMode.replace(/^(mcp|deferred)-/, '');assert.ok(['create','wait','stop'].includes(mode))
+const refreshContext=requestedMode.endsWith('-refresh');const mode=requestedMode.replace(/^(mcp|deferred)-/, '').replace(/-refresh$/, '');assert.ok(['create','wait','stop'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
 mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
 const token=randomBytes(32).toString('hex'), session='agent:main:webchat:dm:real-model-cli', turnKey='real-model-cli-turn'
 const requests:any[]=[], sdk:any[]=[], http:any[]=[]
-let phase=0, executions=0, received=false, discovered=false, failure:any
+let phase=0, executions=0, received=false, discovered=false, failure:any; let refresh: { changed: boolean; sameTurn: boolean; nonceHash: string } | undefined
 let adapter:CcbAdapter, runner:SubprocessRunner, turn:any
 const sentinel='REAL_MODEL_CLI_AUTHORITATIVE_RESULT'
 const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate --agent-id coding-assistant --goal synthetic-child-only`
@@ -58,7 +58,19 @@ const upstream=createServer(async(req,res)=>{
     if(wrapped)assert.ok(raw.includes('Found 2 deferred tool'),'actual discovery must finish before execution')
     phase++;send(res,body,true)
   }
-  else if(main&&phase===1&&mode==='wait'){assert.equal(executions,1);assert.ok(!raw.includes(sentinel));releaseChild();phase++;send(res,body,true,true)}
+  else if(main&&phase===1&&mode==='wait'){assert.equal(executions,1);assert.ok(!raw.includes(sentinel));
+    if(refreshContext) {
+      const before=readFileSync((runner as any).delegateContextFile,'utf8').trim();
+      const partition=readdirSync(join(dir,'receipt-locators'))[0]!;
+      const files=readdirSync(join(dir,'receipt-locators',partition)).filter(f=>f.startsWith('dlgjob-'));
+      assert.equal(files.length,1);
+      const original=JSON.parse(readFileSync(join(dir,'receipt-locators',partition,files[0]!), 'utf8'));
+      (runner as any).refreshDelegateContext();
+      assert.notEqual(readFileSync((runner as any).delegateContextFile,'utf8').trim(),before);
+      assert.equal(parent._currentTurnKey,turnKey);
+      refresh={changed:true,sameTurn:true,nonceHash:createHash('sha256').update(original.receiptNonce).digest('hex')};
+    }
+    releaseChild();phase++;send(res,body,true,true)}
   else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
  }catch(e){failure=e;res.statusCode=500;res.end('{}')}
 })
@@ -99,7 +111,7 @@ try {
  const result=await Promise.race([turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn deadline')),90000)})]);clearTimeout(timer)
  assert.ok(!failure,String(failure));assert.equal(executions,1);assert.equal(received,mode!=='stop')
  assert.ok(runner.sessionId);assert.equal(phase,mode==='wait'?3:mode==='stop'?1:2)
- const row=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt').get();assert.equal(row.state,mode==='stop'?'offered':'ingested');assert.equal(row.native_tool_use_id,'real_creator')
+ const row=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt').get();assert.equal(row.state,mode==='stop'?'offered':'ingested');assert.equal(row.native_tool_use_id,'real_creator'); if(refresh){assert.equal(row.receipt_nonce_hash,refresh.nonceHash);assert.ok(!http.some(x=>x.path==='/api/delegate/wait'));}
  if(mode!=='stop') {
   const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
   const modelResults=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id===(mode==='wait'?'real_waiter':'real_creator')):[])
@@ -112,7 +124,7 @@ try {
 finally {
  clearTimeout(timer);releaseChild();turn?.end();await runner.shutdown();server.closeAllConnections();upstream.closeAllConnections()
  await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r()))])
- writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup and child executor fixture'},null,2))
+ writeFileSync(join(dir,'evidence.json'),JSON.stringify({refresh,mode:requestedMode,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup and child executor fixture'},null,2))
  jobs.close()
 }
 

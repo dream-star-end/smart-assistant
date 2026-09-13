@@ -458,3 +458,25 @@ test('deferred receipt signed capability schema disallows absent or misplaced in
   assert.equal(accepted.toolName,'ExecuteExtraTool');assert.equal(accepted.consumerToolUseId,'outer')
   assert.equal(issuer.verify(issuer.issue({...input,toolName:'Bash',receiptMcpTarget:'mcp__openclaude-memory__delegate_task'})),null)
 })
+
+
+test('locator partition is stable across real HTTP credential refresh but does not relax capability/context or user binding', async () => {
+  const f = await fixture('c:3')
+  try {
+    f.process.tool('creator')
+    const original = await f.issue()
+    const context = issueDelegateContextToken({agentId:'main',sessionKey:SESSION,depth:0})
+    assert.notEqual(context,f.context)
+    f.process.tool('fresh-waiter','mcp__openclaude-memory__delegate_wait')
+    const fresh = await f.post('issue',{toolUseId:'fresh-waiter'},{[DELEGATE_CONTEXT_HEADER]:context,authorization:jwt('c:3')})
+    assert.equal(fresh.status,200)
+    const claims = (cap:string) => JSON.parse(Buffer.from(cap.split('.')[0]!,'base64url').toString())
+    assert.equal(claims(original).locatorPartition,claims(fresh.data.capability).locatorPartition)
+    assert.notEqual(claims(original).contextHash,claims(fresh.data.capability).contextHash)
+    assert.equal((await f.post('check',{capability:original},{[DELEGATE_CONTEXT_HEADER]:context})).status,401)
+    assert.equal((await f.post('check',{capability:fresh.data.capability},{[DELEGATE_CONTEXT_HEADER]:context,authorization:jwt('c:4')})).status,403)
+    assert.equal((await f.post('check',{capability:fresh.data.capability},{[DELEGATE_CONTEXT_HEADER]:context})).data.ownerState,'active')
+    f.parent._currentTurnKey='next-turn'
+    assert.equal((await f.post('check',{capability:fresh.data.capability},{[DELEGATE_CONTEXT_HEADER]:context})).data.ownerState,'unknown')
+  } finally { await f.close() }
+})

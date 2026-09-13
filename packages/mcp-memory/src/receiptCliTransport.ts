@@ -1,7 +1,7 @@
 /** CLI carries locators, never an input ACK or authoritative result text. */
-import { createHash, randomBytes } from 'node:crypto'
-import { constants, mkdirSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
-import { join } from 'node:path'
+import { randomBytes } from 'node:crypto'
+import { constants, mkdirSync, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, readSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 
 export const RECEIPT_CAP_ENV = 'OPENCLAUDE_RECEIPT_INVOCATION'
@@ -35,7 +35,44 @@ export function parseReceiptLocatorCollection(value: unknown): { locators: Recei
   }
   return { locators: [...locators.values()], invalid }
 }
-const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+/** Only a path selector: the gateway still authenticates the whole capability. */
+function candidatePartition(capability: string): string {
+  if (capability.length > 16384) throw new Error('invalid receipt locator partition')
+  const parts = capability.split('.')
+  if (parts.length !== 2) throw new Error('invalid receipt locator partition')
+  const claims: unknown = JSON.parse(Buffer.from(parts[0]!, 'base64url').toString())
+  const partition = claims && typeof claims === 'object'
+    ? (claims as Record<string, unknown>).locatorPartition : undefined
+  if (typeof partition !== 'string' || !/^[a-f0-9]{64}$/.test(partition)) throw new Error('invalid receipt locator partition')
+  return partition
+}
+
+function openPrivateDirectory(path: string): number {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+      throw new Error('receipt cache directory must be private and owned')
+    }
+    return fd
+  } catch (error) { closeSync(fd); throw error }
+}
+
+function readCacheRecord(file: string, jobId: string): ReceiptLocator {
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.size > 4096 || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+      throw new Error('invalid receipt cache record')
+    }
+    const bytes = Buffer.alloc(4097)
+    const length = readSync(fd, bytes, 0, bytes.length, 0)
+    if (length > 4096) throw new Error('invalid receipt cache record')
+    const locator = parseReceiptLocator(JSON.parse(bytes.subarray(0, length).toString()))
+    if (locator.jobId !== jobId) throw new Error('receipt cache job mismatch')
+    return locator
+  } finally { closeSync(fd) }
+}
 
 // Closed, fsynced records are atomically published into bounded exclusive slots.
 // Concurrent writers cannot overwrite another job or publish partially written JSON.
@@ -93,34 +130,62 @@ export function snapshotReceiptReport(directory: string): { locators: ReceiptLoc
 export class ReceiptCliTransport {
   readonly capability: string
   private readonly headers = Object.freeze(gatewayDelegateHeaders())
-  private readonly cache: string
+  private readonly cacheRoot: string
+  private readonly partition: string
   private readonly report: string
   constructor(env: NodeJS.ProcessEnv = process.env, private readonly onReady?: (locator: ReceiptLocator) => void) {
     this.capability = env[RECEIPT_CAP_ENV] || ''
     const root = env[RECEIPT_CACHE_ENV]
     this.report = env[RECEIPT_REPORT_ENV] || ''
     if (!this.capability || !root || (!this.report && !onReady) || !this.headers[DELEGATE_CONTEXT_HEADER]) throw new Error('receipt invocation unavailable')
-    this.cache = join(root, hash(this.headers[DELEGATE_CONTEXT_HEADER]))
-    mkdirSync(this.cache, { recursive: true, mode: 0o700 })
+    this.partition = candidatePartition(this.capability)
+    if (process.platform !== 'linux' || !isAbsolute(root)) throw new Error('receipt cache requires an absolute Linux path')
+    this.cacheRoot = root
+  }
+  /** Pin both directories; later path replacement must not redirect operations.
+   * No long-lived FD and no cache GC: descendant writer lifetime is not known. */
+  private withCache<T>(create: boolean, fn: (path: string, fd: number) => T): T | undefined {
+    if (create) mkdirSync(this.cacheRoot, { recursive: true, mode: 0o700 })
+    let root: number
+    try { root = openPrivateDirectory(this.cacheRoot) }
+    catch (error) { if (!create && (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+    try {
+      const path = `/proc/self/fd/${root}/${this.partition}`
+      if (create) {
+        try { mkdirSync(path, { mode: 0o700 }) }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+        fsyncSync(root)
+      }
+      let fd: number
+      try { fd = openPrivateDirectory(path) }
+      catch (error) { if (!create && (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+      try { return fn(`/proc/self/fd/${fd}`, fd) } finally { closeSync(fd) }
+    } finally { closeSync(root) }
   }
   enrollment() { return { capability: this.capability, receiptNonce: randomBytes(32).toString('hex') } }
   remember(locator: ReceiptLocator): void {
-    const data = JSON.stringify(parseReceiptLocator(locator))
-    const file = join(this.cache, locator.jobId + '.json')
-    let fd: number
-    try { fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600) }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || readFileSync(file, 'utf8') !== data) throw error
-      return
-    }
-    try { writeFileSync(fd, data); fsyncSync(fd) } finally { closeSync(fd) }
-    const dir = openSync(this.cache, constants.O_RDONLY | constants.O_DIRECTORY)
-    try { fsyncSync(dir) } finally { closeSync(dir) }
+    const checked = parseReceiptLocator(locator), data = JSON.stringify(checked)
+    this.withCache(true, (path, directory) => {
+      const file = join(path, checked.jobId + '.json')
+      const temp = join(path, '.pending-' + randomBytes(16).toString('hex'))
+      const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+      try {
+        try { writeFileSync(fd, data); fsyncSync(fd) } finally { closeSync(fd) }
+        try { linkSync(temp, file) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+          if (JSON.stringify(readCacheRecord(file, checked.jobId)) !== data) throw new Error('conflicting receipt cache locator')
+        }
+        fsyncSync(directory)
+      } finally { unlinkSync(temp) }
+    })
   }
   lookup(jobId: string): ReceiptLocator | undefined {
     if (!/^dlgjob-[a-z0-9-]{1,150}$/.test(jobId)) throw new Error('invalid receipt job')
-    try { return parseReceiptLocator(JSON.parse(readFileSync(join(this.cache, jobId + '.json'), 'utf8'))) }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+    return this.withCache(false, path => {
+      try { return readCacheRecord(join(path, jobId + '.json'), jobId) }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+    })
   }
   async wait(locator: ReceiptLocator, waitMs: number): Promise<{ statusCode: number; body: string }> {
     const result = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {

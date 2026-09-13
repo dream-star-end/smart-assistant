@@ -16,12 +16,22 @@ export interface ReceiptOwnerClaims extends ReceiptToolOwner {
   agentId: string
   sessionKey: string
   contextHash: string
+  /** Signed locator namespace, not an input capability or delivery ACK. */
+  locatorPartition: string
   iat: number
   exp: number
 }
 
 export function receiptContextHash(token: string): string {
   return createHash('sha256').update(token).digest('hex')
+}
+
+function locatorPartition(owner: Pick<ReceiptOwnerClaims, 'userId' | 'agentId' | 'sessionKey' |
+  'adapterInstanceId' | 'parentOwnerEpoch' | 'turnKey' | 'nativeSessionId'>): string {
+  return receiptContextHash('receipt-locator-v1\0' + JSON.stringify([
+    owner.userId, owner.agentId, owner.sessionKey, owner.adapterInstanceId,
+    owner.parentOwnerEpoch, owner.turnKey, owner.nativeSessionId,
+  ]))
 }
 
 const DEFERRED_RECEIPT_TARGETS = [
@@ -67,9 +77,10 @@ export function checkedReceiptToolOwner(value: unknown): ReceiptToolOwner {
 export class ReceiptOwnerCapabilities {
   private readonly key = randomBytes(32)
 
-  issue(input: Omit<ReceiptOwnerClaims, 'v' | 'purpose' | 'iat' | 'exp'>, now = Date.now()): string {
+  issue(input: Omit<ReceiptOwnerClaims, 'v' | 'purpose' | 'iat' | 'exp' | 'locatorPartition'>, now = Date.now()): string {
     const claims: ReceiptOwnerClaims = {
-      ...input, v: 1, purpose: 'receipt-consumer', iat: now, exp: now + DELEGATE_CONTEXT_TTL_MS,
+      ...input, locatorPartition: locatorPartition(input),
+      v: 1, purpose: 'receipt-consumer', iat: now, exp: now + DELEGATE_CONTEXT_TTL_MS,
     }
     const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
     return `${payload}.${this.sign(payload)}`
@@ -93,6 +104,7 @@ export class ReceiptOwnerCapabilities {
         if (typeof c[key] !== 'string' || !c[key]) return null
       }
       checkedReceiptToolOwner(c)
+      if (c.locatorPartition !== locatorPartition(c)) return null
       return c
     } catch { return null }
   }
