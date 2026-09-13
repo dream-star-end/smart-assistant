@@ -26,6 +26,7 @@ export function receiptContextHash(token: string): string {
 
 const DEFERRED_RECEIPT_TARGETS = [
   'mcp__openclaude-memory__delegate_task', 'mcp__openclaude-memory__delegate_wait',
+  'mcp__openclaude-memory__delegate_tasks',
 ] as const
 /** Only from the actual SDK tool_use block, never an HTTP body assertion. */
 export function receiptMcpTargetForSdk(name: string, input: unknown): string | undefined {

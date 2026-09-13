@@ -17,6 +17,24 @@ export function parseReceiptLocator(value: unknown): ReceiptLocator {
       typeof v.receiptNonce !== 'string' || !/^[a-f0-9]{64}$/.test(v.receiptNonce)) throw new Error('invalid receipt locator')
   return Object.freeze({ jobId: v.jobId, generation: Number(v.generation), receiptNonce: v.receiptNonce })
 }
+/** Bounded, untrusted MCP candidates. Conflicting identities never replace one another. */
+export function parseReceiptLocatorCollection(value: unknown): { locators: ReceiptLocator[]; invalid: boolean } {
+  if (!Array.isArray(value) || value.length > 4) return { locators: [], invalid: true }
+  const locators = new Map<string, ReceiptLocator>(), conflicts = new Set<string>()
+  let invalid = false
+  for (const item of value) {
+    try {
+      const locator = parseReceiptLocator(item)
+      if (conflicts.has(locator.jobId)) continue
+      const previous = locators.get(locator.jobId)
+      if (previous && JSON.stringify(previous) !== JSON.stringify(locator)) {
+        invalid = true; locators.delete(locator.jobId); conflicts.add(locator.jobId); continue
+      }
+      locators.set(locator.jobId, locator)
+    } catch { invalid = true }
+  }
+  return { locators: [...locators.values()], invalid }
+}
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 
 // Closed, fsynced records are atomically published into bounded exclusive slots.

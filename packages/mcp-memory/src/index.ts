@@ -32,7 +32,7 @@
 
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
 import './mcpStdioGuard.js'
-import { createReceiptMcpTransport, RECEIPT_MCP_META } from './receiptMcpTransport.js'
+import { createReceiptMcpTransport, startReceiptMcpBatch, RECEIPT_MCP_META } from './receiptMcpTransport.js'
 import { readFileSync } from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -278,7 +278,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'delegate_task':
         return await handleDelegateTask(args as any, req.params._meta)
       case 'delegate_tasks':
-        return await handleDelegateTasks(args as any)
+        return await handleDelegateTasks(args as any, req.params._meta)
       case 'delegate_wait':
         return await handleDelegateWait(args as any, req.params._meta)
       case 'request_review':
@@ -786,9 +786,10 @@ async function handleDelegateTask(args: {
  * 结果按输入顺序聚合、每项独立标注 ✅/❌。校验/聚合逻辑抽到纯函数 delegateFanout.ts
  * (可单测),本处只负责调用编排。
  */
-async function handleDelegateTasks(args: { tasks?: unknown }) {
+async function handleDelegateTasks(args: { tasks?: unknown }, meta?: Record<string, unknown>) {
   const normalized = normalizeFanoutTasks(args?.tasks)
   if (!normalized.ok) return toolError(normalized.error)
+  if (meta?.[RECEIPT_MCP_META] !== undefined) return startReceiptMcpBatch(normalized.tasks, meta)
   return handleAsyncDelegateTasks(normalized.tasks)
 }
 

@@ -1306,7 +1306,7 @@ async function checkPermissionsAndCallTool(
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
 
-    if (tool.name !== 'Bash') {
+    if (receiptInvocation?.mode === 'replace') {
       const receiptInput = await receiptInvocation?.finish()
       if (receiptInput?.mode === 'replace') {
         // Preserve the canonical MCP object through the existing WeakMap path.
@@ -1689,7 +1689,7 @@ async function checkPermissionsAndCallTool(
     for (const hookResult of hookResults) {
       resultingMessages.push(hookResult)
     }
-    if (tool.name === 'Bash') {
+    if (receiptInvocation?.mode === 'append') {
       const receiptInput = await receiptInvocation?.finish()
       if (receiptInput?.mode === 'append') resultingMessages.push(...receiptInput.messages.map(message => ({ message })))
     }
@@ -1833,7 +1833,7 @@ async function checkPermissionsAndCallTool(
 
     // ShellError is a real completed command too. Preserve its original error
     // result, then let query's batch barrier admit each independent receipt.
-    const receiptInput = tool.name === 'Bash' ? await receiptInvocation?.finish() : undefined
+    const receiptInput = receiptInvocation?.mode === 'append' ? await receiptInvocation.finish() : undefined
     return [
       {
         message: createUserMessage({

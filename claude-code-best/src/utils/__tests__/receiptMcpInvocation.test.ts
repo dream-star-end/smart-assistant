@@ -9,7 +9,8 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { getSessionId } from '../../bootstrap/state.js'
 import { prepareReceiptToolInvocation, receiptMcpRequest, receiptShellEnvironment } from '../receiptToolInvocation.js'
 import { callMCPToolWithUrlElicitationRetry } from '../../services/mcp/client.js'
-import { RECEIPT_MCP_META } from '../../../../packages/mcp-memory/src/receiptMcpTransport.js'
+import { isDeferredReceiptInput } from '../receiptInputAdmission.js'
+import { RECEIPT_MCP_META, RECEIPT_MCP_RESULTS_META } from '../../../../packages/mcp-memory/src/receiptMcpTransport.js'
 import { RECEIPT_CAP_ENV } from '../../../../packages/mcp-memory/src/receiptCliTransport.js'
 
 const name = 'mcp__openclaude-memory__delegate_task'
@@ -17,14 +18,14 @@ function assistant(id: string): any { return { type: 'assistant', uuid: randomUU
   { type: 'tool_use', id: 'unrelated-first-block', name: 'Read', input: {} },
   { type: 'tool_use', id, name, input: {} },
 ] } } }
-async function fixture(fn: (config: any) => Promise<void>, wrapped = false) {
+async function fixture(fn: (config: any) => Promise<void>, wrapped = false, target = name) {
   const dir = await mkdtemp(join(tmpdir(), 'receipt-mcp-unit-'))
   const keys = ['OPENCLAUDE_RECEIPT_CALLER_V2','OPENCLAUDE_HOME','OPENCLAUDE_GATEWAY_PORT','OPENCLAUDE_GATEWAY_TOKEN_FILE','OPENCLAUDE_DELEGATE_CONTEXT_FILE']
   const old = keys.map(k => process.env[k])
   const server = createServer(async (req, res) => {
     let data = ''; for await (const b of req) data += b
     const { toolUseId } = JSON.parse(data)
-    const claims = { nativeSessionId: getSessionId(), consumerToolUseId: toolUseId, toolName: wrapped ? 'ExecuteExtraTool' : name, ...(wrapped ? {receiptMcpTarget:name} : {}) }
+    const claims = { nativeSessionId: getSessionId(), consumerToolUseId: toolUseId, toolName: wrapped ? 'ExecuteExtraTool' : target, ...(wrapped ? {receiptMcpTarget:target} : {}) }
     res.end(JSON.stringify({ capability: Buffer.from(JSON.stringify(claims)).toString('base64url')+'.synthetic-unit' }))
   })
   try {
@@ -109,4 +110,29 @@ test('deferred native scope keeps outer identity and enforces the parsed inner M
     message.message.content[1].input.tool_name='mcp__untrusted__delegate_task'
     expect(await prepareReceiptToolInvocation({toolUseId:'outer',assistantMessage:message})).toBeUndefined()
   },true)
+})
+
+test('batch native request captures per-item candidates once and preserves deferred identities',async()=>{
+ const batch='mcp__openclaude-memory__delegate_tasks'
+ await fixture(async config=>{
+  const message=assistant('batch-outer')
+  message.message.content[1]={type:'tool_use',id:'batch-outer',name:'ExecuteExtraTool',input:{tool_name:batch,params:{tasks:[]}}}
+  const call=await prepareReceiptToolInvocation({toolUseId:'batch-outer',assistantMessage:message})
+  expect(call?.mode).toBe('append')
+  await call!.run(async()=>{
+   const request=receiptMcpRequest('openclaude-memory','delegate_tasks','batch-outer',config)!
+   const claims=JSON.parse(Buffer.from(request.meta[RECEIPT_MCP_META].capability.split('.')[0]!, 'base64url').toString())
+   expect(claims.receiptMcpTarget).toBe(batch)
+   const a={jobId:'dlgjob-a',generation:0,receiptNonce:'a'.repeat(64)},b={jobId:'dlgjob-b',generation:0,receiptNonce:'b'.repeat(64)}
+   const meta={[RECEIPT_MCP_RESULTS_META]:[a,{invalid:true},b,a]}
+   request.capture(meta)
+   expect(()=>request.capture(meta)).toThrow('duplicate')
+   expect(()=>receiptMcpRequest('openclaude-memory','delegate_task','batch-outer',config)).toThrow()
+  })
+  const first=await call!.finish(),again=await call!.finish()
+  expect(first).toBe(again)
+  expect(first?.messages).toHaveLength(3)
+  expect(first!.messages.every(isDeferredReceiptInput)).toBe(true)
+  expect(JSON.stringify(first!.messages)).not.toContain('dlgjob-')
+ },true,batch)
 })

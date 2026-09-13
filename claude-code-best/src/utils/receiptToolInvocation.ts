@@ -9,14 +9,15 @@ import { join } from 'node:path'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { buildMcpToolName } from '../services/mcp/mcpStringUtils.js'
-import { RECEIPT_MCP_META, RECEIPT_MCP_RESULT_META } from '../../../packages/mcp-memory/src/receiptMcpTransport.js'
+import { RECEIPT_MCP_META, RECEIPT_MCP_RESULT_META, RECEIPT_MCP_RESULTS_META } from '../../../packages/mcp-memory/src/receiptMcpTransport.js'
 import { homedir } from 'node:os'
 import type { AssistantMessage, UserMessage } from '../types/message.js'
 import { getSessionId } from '../bootstrap/state.js'
-import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator, snapshotReceiptReport, type ReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
+import { RECEIPT_CAP_ENV, RECEIPT_REPORT_ENV, RECEIPT_CACHE_ENV, parseReceiptLocator, parseReceiptLocatorCollection, snapshotReceiptReport, type ReceiptLocator } from '../../../packages/mcp-memory/src/receiptCliTransport.js'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../../../packages/mcp-memory/src/gatewayClient.js'
 
 type ReceiptScope = {
+  collection?: ReturnType<typeof parseReceiptLocatorCollection>
   toolUseId: string; toolName: string; capability: string; mcpToolName?: string
   env?: Readonly<Record<string, string>>
   backgrounded?: boolean
@@ -48,7 +49,8 @@ export async function receiptShellNotification(shell: ShellCommand): Promise<Que
 }
 
 const platformServer = 'openclaude-memory'
-const mcpNames = ['delegate_task', 'delegate_wait'].map(name => buildMcpToolName(platformServer, name))
+const mcpBatchName = buildMcpToolName(platformServer, 'delegate_tasks')
+const mcpNames = ['delegate_task', 'delegate_wait', 'delegate_tasks'].map(name => buildMcpToolName(platformServer, name))
 /** Child shells inherit identity only inside their own actual native Bash call. */
 export function receiptShellEnvironment(): Record<string, string | undefined> {
   return { [RECEIPT_CAP_ENV]: undefined, [RECEIPT_REPORT_ENV]: undefined, [RECEIPT_CACHE_ENV]: undefined, ...scopes.getStore()?.env }
@@ -80,6 +82,15 @@ export function receiptMcpRequest(serverName: string, toolName: string, toolUseI
   return {
     meta: { [RECEIPT_MCP_META]: { capability: scope.capability }, 'claudecode/toolUseId': scope.toolUseId },
     capture(meta?: Record<string, unknown>) {
+      const batch = (scope.mcpToolName ?? scope.toolName) === mcpBatchName
+      if (batch) {
+        if (meta?.[RECEIPT_MCP_RESULTS_META] === undefined && meta?.[RECEIPT_MCP_RESULT_META] === undefined) return
+        if (scope.collection) throw new Error('duplicate MCP batch result capture')
+        scope.collection = parseReceiptLocatorCollection(meta?.[RECEIPT_MCP_RESULTS_META])
+        if (meta?.[RECEIPT_MCP_RESULT_META] !== undefined) scope.collection.invalid = true
+        return
+      }
+      if (meta?.[RECEIPT_MCP_RESULTS_META] !== undefined) throw new Error('batch metadata on single receipt tool')
       if (meta?.[RECEIPT_MCP_RESULT_META] === undefined) return
       if (scope.candidate) throw new Error('multiple MCP results require composite admission')
       scope.candidate = parseReceiptLocator(meta[RECEIPT_MCP_RESULT_META])
@@ -89,7 +100,7 @@ export function receiptMcpRequest(serverName: string, toolName: string, toolUseI
 
 export async function prepareReceiptToolInvocation(opts: {
   toolUseId: string; assistantMessage: AssistantMessage; agentId?: string
-}): Promise<{ run<T>(fn: () => Promise<T>): Promise<T>;
+}): Promise<{ mode: 'replace' | 'append'; run<T>(fn: () => Promise<T>): Promise<T>;
   finish(): Promise<{ mode: 'replace' | 'append'; messages: UserMessage[] } | undefined> } | undefined> {
   // Staging wiring switch, NOT the gateway's v2 new-job admission. It remains
   // off until the full C0 caller/background/compatibility verification completes.
@@ -100,6 +111,7 @@ export async function prepareReceiptToolInvocation(opts: {
   const toolName = block[0].name
   const mcpToolName = receiptMcpTargetForSdk(toolName, block[0].input)
   if (toolName !== 'Bash' && !mcpNames.includes(toolName) && !mcpToolName) return undefined
+  const compound = toolName === 'Bash' || (mcpToolName ?? toolName) === mcpBatchName
   const nativeSessionId = getSessionId()
   const headers = gatewayDelegateHeaders()
   let response!: { statusCode: number; body: string }
@@ -130,6 +142,7 @@ export async function prepareReceiptToolInvocation(opts: {
       [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators') })
   }
   const readLocators = () => {
+    if (scope.collection) return scope.collection
     if (!report) return { locators: scope.candidate ? [scope.candidate] : [], invalid: false }
     return snapshotReceiptReport(report)
   }
@@ -154,16 +167,18 @@ export async function prepareReceiptToolInvocation(opts: {
     // Do not open a DB or fetch result bytes until the real query input boundary.
     return createQueuedReceiptInput(() => input(locator, true))
   }
+  let finished: Promise<{ mode: 'replace' | 'append'; messages: UserMessage[] } | undefined> | undefined
   return {
+    mode: compound ? 'append' : 'replace',
     run: fn => scopes.run(scope, fn),
-    finish: async () => {
+    finish: () => finished ??= (async () => {
       if (scope.backgrounded) return undefined
       const { locators, invalid } = readLocators()
       if (!locators.length && !invalid) return undefined
-      if (toolName !== 'Bash') return { mode: 'replace', messages: [await input(locators[0]!)] }
+      if (!compound) return { mode: 'replace' as const, messages: [await input(locators[0]!)] }
       const messages = locators.map(locator => createDeferredReceiptInput(() => input(locator, false, true)))
       if (invalid) messages.push(createDeferredReceiptInput(async () => { throw new Error('receipt candidate unavailable') }))
-      return { mode: 'append', messages }
-    },
+      return { mode: 'append' as const, messages }
+    })(),
   }
 }
