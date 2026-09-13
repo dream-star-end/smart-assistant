@@ -116,7 +116,7 @@ for (const mode of ['create', 'wait'] as const) test(`actual query -> BashTool -
   let modelCalls = 0
   const persisted: any[] = [first]
   const stream = query({ messages: [first], systemPrompt: asSystemPrompt([]), userContext: {}, systemContext: {},
-    canUseTool: async (_tool: unknown, input: unknown) => ({ behavior: 'allow', updatedInput: input }),
+    canUseTool: async (_tool, input) => ({ behavior: 'allow', updatedInput: input }),
     toolUseContext: ctx, querySource: 'sdk', maxTurns: 1,
     deps: { uuid: randomUUID, microcompact: async (messages: unknown[]) => ({ messages }),
       autocompact: async () => ({ compactionResult: undefined, consecutiveFailures: 0 }),
