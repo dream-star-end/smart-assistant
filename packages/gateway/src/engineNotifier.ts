@@ -73,6 +73,8 @@ export type EngineNotifierOptions = {
 export const NOTIFY_CLAIM_FENCE = Symbol.for('openclaude.notifyClaimFence')
 
 export type NotifyClaimFence = {
+  /** Set only by the receipt-aware dispatcher under its physical writer lock. */
+  receiptDelivery?: true
   isLive: () => boolean
   ackDelivered: () => boolean
   markAAttempted?: () => boolean
@@ -118,7 +120,7 @@ export class DefaultEngineNotifier implements EngineNotifier {
       return finish({ ok: true, lane: classifySafe(event), notifyId })
     }
 
-    if (event.callback === 'none' || isHeartbeatSilentOutput(event.resultRef)) {
+    if (!notifyClaimFenceOf(event)?.receiptDelivery && (event.callback === 'none' || isHeartbeatSilentOutput(event.resultRef))) {
       this.mark(notifyId)
       return finish({ ok: true, lane: 'skipped_silent', notifyId })
     }

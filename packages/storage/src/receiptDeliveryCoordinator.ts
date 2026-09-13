@@ -40,6 +40,18 @@ export type ReceiptRecordObservation = { kind: 'present'; proof: ReceiptInputPro
 export type ReceiptRecordOracle = (claim: ReceiptInputClaim) => Promise<ReceiptRecordObservation>
 export type ReceiptInputOutcome = 'ingested' | 'already_ingested' | 'notify_owned' | 'pending_recovery' | 'stale_parent' | 'unknown'
 export type ReceiptRecoveryOutcome = 'ingested' | 'already_ingested' | 'notify_ready' | 'notify_owned' | 'pending' | 'unknown'
+/** Valid only while the callback holds the actual receipt writer barrier. */
+export type ReceiptNotifyClaim = Readonly<{
+  callbackEpoch: number
+  isLive: () => boolean
+  ackDelivered: () => boolean
+  markAAttempted: () => boolean
+  hasAAttempted: () => boolean
+  aAttemptedAt: () => number | undefined
+  release: (retryAt: number) => boolean
+}>
+export type ReceiptNotifyOutcome<T> = { kind: 'not_ready' } | { kind: 'already_notified' } |
+  { kind: 'attempted'; value: T; acknowledged: boolean }
 type Row = Record<string, unknown>
 type BarrierOptions = { timeoutMs?: number; signal?: AbortSignal }
 const hash = (s: string) => createHash('sha256').update(s).digest('hex')
@@ -166,9 +178,101 @@ export class ReceiptDeliveryCoordinator {
           .run(this.now(), this.now(), binding.jobId, binding.generation)
         if (job.changes !== 1) throw new Error('receipt notification job preparation failed')
       })()
-      // This is preparation only. The old notifier's claim guard remains
-      // closed until the paired receipt-aware dispatch/ACK adapter is installed.
+      // This is preparation only. Old notifier writers remain fenced; only
+      // dispatchNotification may pair this owner with dispatch and durable ACK.
       return 'notify_ready'
+    }, opts)
+  }
+
+  /** Pair the already-selected notify owner with the existing dispatcher. No
+   * lease/TTL can replace this physical lock across dispatch and durable ACK.
+   * A crash leaves notify_claimed; recovery uses the SAME callback epoch/id. */
+  async dispatchNotification<T>(
+    binding: TrustedReceiptBinding,
+    dispatch: (claim: ReceiptNotifyClaim) => Promise<T>,
+    opts: BarrierOptions = {},
+  ): Promise<ReceiptNotifyOutcome<T>> {
+    binding = checkedBinding(binding)
+    return this.barrier(binding, async receipt => {
+      if (receipt.state === 'notified') return { kind: 'already_notified' }
+      if (receipt.state !== 'notify_pending' && receipt.state !== 'notify_claimed') return { kind: 'not_ready' }
+      const readJob = () => this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id=? AND generation=?')
+        .get(binding.jobId, binding.generation) as Row | undefined
+      const job = readJob()
+      if (!job || job.retired_at != null || job.callback !== 'origin-inject' ||
+          !['pending', 'injecting'].includes(String(job.callback_state)) ||
+          !['completed', 'failed', 'cancelled', 'killed_by_cutover'].includes(String(job.state)) ||
+          job.callback_origin_user_id !== binding.userId || job.parent_session_key !== binding.parentSession ||
+          typeof job.result_json !== 'string' || hash(job.result_json) !== binding.resultDigest ||
+          !Number.isSafeInteger(job.callback_epoch) || Number(job.callback_epoch) < 1) throw new Error('receipt notify job mismatch')
+      const now = this.now()
+      if ((job.callback_state === 'pending' && Number(job.notify_retry_at ?? 0) > now) ||
+          (job.callback_state === 'injecting' && Number(job.notify_claimed_until ?? 0) > now)) return { kind: 'not_ready' }
+      const token = randomBytes(24).toString('hex')
+      const epoch = Number(job.callback_epoch)
+      const transact = (write: () => void) => this.db.transaction(write)()
+      transact(() => {
+        const r = this.db.prepare(`UPDATE delegate_delivery_receipt SET state='notify_claimed',owner_token=?,updated_at=?
+          WHERE job_id=? AND generation=? AND state=? AND owner_token IS ?`)
+          .run(token, now, binding.jobId, binding.generation, String(receipt.state), receipt.owner_token as string | null)
+        if (r.changes !== 1) throw new Error('receipt notify claim CAS lost')
+        const j = this.db.prepare(`UPDATE delegate_jobs SET callback_state='injecting',notify_delivery_token=?,
+          notify_claimed_until=?,last_activity_at=?,updated_at=? WHERE job_id=? AND generation=? AND retired_at IS NULL
+          AND callback_epoch=? AND callback_state=? AND notify_delivery_token IS ?`)
+          .run(token, now + 30_000, now, now, binding.jobId, binding.generation, epoch,
+            String(job.callback_state), (job.notify_delivery_token ?? null) as string | null)
+        if (j.changes !== 1) throw new Error('receipt notify job claim CAS lost')
+      })
+      let open = true, acknowledged = false
+      const isLive = () => {
+        if (!open || acknowledged) return false
+        const r = this.readBound(binding), j = readJob()
+        return r.state === 'notify_claimed' && r.owner_token === token && j?.retired_at == null &&
+          j?.callback_state === 'injecting' && j.callback_epoch === epoch && j.notify_delivery_token === token
+      }
+      const finish = (delivered: boolean, retryAt = 0): boolean => {
+        if (!open) return false
+        if (acknowledged) return delivered
+        if (!isLive()) return false
+        const timestamp = this.now()
+        transact(() => {
+          const r = this.db.prepare(`UPDATE delegate_delivery_receipt SET state=?,updated_at=?
+            WHERE job_id=? AND generation=? AND state='notify_claimed' AND owner_token=?`)
+            .run(delivered ? 'notified' : 'notify_pending', timestamp, binding.jobId, binding.generation, token)
+          if (r.changes !== 1) throw new Error('receipt notify completion CAS lost')
+          const j = this.db.prepare(`UPDATE delegate_jobs SET callback_state=?,notify_delivery_token=NULL,
+            notify_claimed_until=NULL,notify_retry_at=?,notify_attempt=notify_attempt+?,last_activity_at=?,updated_at=?
+            WHERE job_id=? AND generation=? AND retired_at IS NULL AND callback_epoch=?
+            AND callback_state='injecting' AND notify_delivery_token=?`)
+            .run(delivered ? 'delivered' : 'pending', delivered ? null : retryAt, delivered ? 0 : 1,
+              timestamp, timestamp, binding.jobId, binding.generation, epoch, token)
+          if (j.changes !== 1) throw new Error('receipt notify job completion CAS lost')
+        })
+        acknowledged = delivered
+        return true
+      }
+      const attemptedAt = () => {
+        const value = readJob()?.notify_a_attempted_at
+        return typeof value === 'number' && value > 0 ? value : undefined
+      }
+      const claim: ReceiptNotifyClaim = Object.freeze({
+        callbackEpoch: epoch, isLive,
+        ackDelivered: () => finish(true),
+        release: (retryAt: number) => {
+          if (!Number.isSafeInteger(retryAt) || retryAt < 0) throw new Error('invalid receipt retry time')
+          return finish(false, retryAt)
+        },
+        aAttemptedAt: attemptedAt,
+        hasAAttempted: () => attemptedAt() !== undefined,
+        markAAttempted: () => {
+          if (!isLive()) return false
+          return this.db.prepare(`UPDATE delegate_jobs SET notify_a_attempted_at=COALESCE(notify_a_attempted_at,?),updated_at=?
+            WHERE job_id=? AND generation=? AND callback_epoch=? AND callback_state='injecting' AND notify_delivery_token=?`)
+            .run(this.now(), this.now(), binding.jobId, binding.generation, epoch, token).changes === 1
+        },
+      })
+      try { return { kind: 'attempted', value: await dispatch(claim), acknowledged } }
+      finally { open = false }
     }, opts)
   }
 

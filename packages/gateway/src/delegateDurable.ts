@@ -939,6 +939,7 @@ export class DelegateDurableDb {
     now: number
   }): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
+    if (this.hasDeliveryReceiptEnrollment(args.jobId)) return undefined
     const row = this.casCompleteNotifyStmt.get({
       job_id: args.jobId,
       expected_state: args.state,
@@ -961,6 +962,7 @@ export class DelegateDurableDb {
     notifyAttempt: number
   }): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
+    if (this.hasDeliveryReceiptEnrollment(args.jobId)) return undefined
     const row = this.casReleaseNotifyStmt.get({
       job_id: args.jobId,
       expected_state: args.state,
@@ -983,6 +985,7 @@ export class DelegateDurableDb {
     now: number
   }): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
+    if (this.hasDeliveryReceiptEnrollment(args.jobId)) return undefined
     const row = this.casMarkAAttemptedStmt.get({
       job_id: args.jobId,
       expected_state: args.state,

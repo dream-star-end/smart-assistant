@@ -947,6 +947,22 @@ export class DelegateJobStore {
   /** No old wait/get/markResultConsumed, sweep, or in-memory fallback for v2. */
   get acceptsDeliveryReceipts(): boolean { return this.deliveryReceipts && this.sm && !!this.durable }
 
+  hasDeliveryReceiptEnrollment(jobId: string): boolean {
+    return this.durable?.hasDeliveryReceiptEnrollment(jobId) === true
+  }
+
+  /** Internal dispatcher only; not an HTTP identity or owner-selection API. */
+  async dispatchReceiptNotification<T>(jobId: string, generation: number,
+    dispatch: (claim: import('@openclaude/storage/receiptDeliveryStore').ReceiptNotifyClaim) => Promise<T>) {
+    if (!this.durable) throw new Error('receipt notification requires durable storage')
+    const binding = this.durable.getDeliveryReceipt(jobId, generation)
+    if (!binding) return { kind: 'not_ready' as const }
+    const { ReceiptDeliveryStore } = await import('@openclaude/storage/receiptDeliveryStore')
+    const delivery = new ReceiptDeliveryStore(this.durable.path, this.now)
+    try { return await delivery.dispatchNotification(binding, dispatch) }
+    finally { delivery.close(); this.refreshJob(jobId) }
+  }
+
   readReceiptStatus(jobId: string, generation: number, scope: {
     userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
   }): 'running' | 'ready' | undefined {

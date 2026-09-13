@@ -32,6 +32,7 @@ import {
   parseOriginWebchatSessionKey,
 } from './cronOriginSession.js'
 import { NOTIFY_CLAIM_FENCE, type NotifyClaimFence } from './engineNotifier.js'
+import { dispatchReceiptTerminalNotify } from './receiptNotifyDispatch.js'
 
 const log = createLogger({ module: 'delegateNotifyDispatch' })
 
@@ -77,6 +78,9 @@ export async function dispatchJobTerminalNotify(
 ): Promise<NotifyResult | { skipped: true; reason: string }> {
   if (!isDelegateTerminalState(job.state)) {
     return { skipped: true, reason: 'not_terminal' }
+  }
+  if (store.hasDeliveryReceiptEnrollment(job.id)) {
+    return dispatchReceiptTerminalNotify(store, job, notifier, hooks)
   }
 
   let parentEngine =
