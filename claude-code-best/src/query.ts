@@ -1308,11 +1308,15 @@ async function* queryLoop(
     // Without this, tool_use blocks would lack matching tool_result blocks.
     if (toolUseContext.abortController.signal.aborted) {
       if (streamingToolExecutor) {
-        // Consume remaining results - executor generates synthetic tool_results for
-        // aborted tools since it checks the abort signal in executeTool()
+        // Completed-but-undrained results are NOT replaced by synthetic abort
+        // messages. They still require receipt ownership before any yield can
+        // reach the outer consumer's ordinary transcript persistence.
         for await (const update of streamingToolExecutor.getRemainingResults()) {
           if (update.message) {
-            yield update.message
+            yield await admitReceiptInput(
+              update.message,
+              messagesForQuery.concat(assistantMessages, toolResults),
+            )
           }
         }
       } else {
