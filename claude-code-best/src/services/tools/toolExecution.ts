@@ -1,3 +1,4 @@
+import { prepareReceiptToolInvocation } from '../../utils/receiptToolInvocation.js'
 import { feature } from 'bun:bundle'
 import type {
   ContentBlockParam,
@@ -1268,7 +1269,8 @@ async function checkPermissionsAndCallTool(
     //
     // The invoke lambda is shared between the flag-on (wrapper) and flag-off
     // (direct) paths so that post-call processing is never duplicated.
-    const invokeToolCall = () =>
+    const receiptInvocation = await prepareReceiptToolInvocation({ toolUseId: toolUseID, assistantMessage, agentId: toolUseContext.agentId })
+    const callNativeTool = () =>
       tool.call(
         callInput,
         {
@@ -1285,6 +1287,7 @@ async function checkPermissionsAndCallTool(
           })
         },
       )
+    const invokeToolCall = () => receiptInvocation ? receiptInvocation.run(callNativeTool) : callNativeTool()
     // Fast-path: skip wrapper entirely when skill-learning is disabled to
     // avoid even the cached-import resolution on the hot path.
     const result = isSkillLearningEnabled()
@@ -1301,6 +1304,15 @@ async function checkPermissionsAndCallTool(
       : await invokeToolCall()
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
+
+    const receiptInput = await receiptInvocation?.input()
+    if (receiptInput) {
+      // The original frozen object must reach query's WeakMap admission. Do not
+      // remap, truncate, run output-changing hooks, or attach raw CLI side data.
+      endToolExecutionSpan({ success: true })
+      endToolSpan()
+      return [{ message: receiptInput }]
+    }
 
     // Log tool content/output as span event if enabled
     if (result.data && typeof result.data === 'object') {

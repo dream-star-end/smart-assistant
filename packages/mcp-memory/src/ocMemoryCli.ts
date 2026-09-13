@@ -1,3 +1,4 @@
+import { ReceiptCliTransport, RECEIPT_CAP_ENV } from './receiptCliTransport.js'
 /**
  * oc-memory — 容器内长期记忆 CLI(Core / Recall / Archival 三层记忆的一次性入口)。
  *
@@ -309,6 +310,7 @@ async function main(): Promise<void> {
     const foregroundBudgetMs = resolveDelegateCliForegroundBudgetMs()
     const result = await runDelegateStartAndWait({
       args,
+      receipt: process.env[RECEIPT_CAP_ENV] ? new ReceiptCliTransport() : undefined,
       contextToken: ctxTok.token,
       pollWaitMs,
       foregroundBudgetMs,
@@ -336,12 +338,18 @@ async function main(): Promise<void> {
       fail('delegate-wait requires at least one <jobId> positional argument')
     const base = gatewayBaseUrl()
     const headers = gatewayDelegateHeaders()
+    const receipt = process.env[RECEIPT_CAP_ENV] ? new ReceiptCliTransport() : undefined
+    const locators = positional.map(id => receipt?.lookup(id))
+    // Until the composite tool-result owner is paired, reject v2 fanout before
+    // reading any result. Ordinary v1 multi-wait retains its existing behavior.
+    if (positional.length > 1 && locators.some(Boolean)) fail('receipt multi-wait is not yet supported; wait one job per tool')
     const result = await runDelegateWaitLoop({
       jobIds: positional,
       pollWaitMs: resolveDelegateWaitPollMs(),
       foregroundBudgetMs: resolveDelegateCliForegroundBudgetMs(),
-      waitOnce: (jobId, waitMs) =>
-        postJsonToGateway(`${base}/api/delegate/wait`, {
+      waitOnce: (jobId, waitMs) => receipt && locators[0]
+        ? receipt.wait(locators[0], waitMs)
+        : postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
           body: JSON.stringify({ jobId, waitMs }),
           timeoutMs: waitMs + 60_000,

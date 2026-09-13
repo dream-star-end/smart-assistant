@@ -757,6 +757,19 @@ export class DelegateDurableDb {
     }
   }
 
+  /** Scoped metadata only; never exposes result bytes or acknowledges delivery. */
+  readReceiptStatus(jobId: string, generation: number, scope: {
+    userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
+  }): 'running' | 'ready' | undefined {
+    const row = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id=? AND generation=? AND retired_at IS NULL')
+      .get(jobId, generation) as Record<string, unknown> | undefined
+    if (!row || typeof row.delivery_receipt_context !== 'string' ||
+        (row.callback_origin_user_id || 'default') !== scope.userId || row.parent_session_key !== scope.parentSession) return undefined
+    const context = checkedReceiptContext(JSON.parse(row.delivery_receipt_context))
+    if (context.parentTurnKey !== scope.parentTurnKey || context.receiptNonceHash !== scope.receiptNonceHash) return undefined
+    return typeof row.result_json === 'string' ? 'ready' : 'running'
+  }
+
   /** Authorized v2 offer, not consumption. Preserve the exact committed JSON
    * bytes: reserializing a parsed result is not its durable digest contract. */
   readReceiptInputOffer(jobId: string, generation: number, scope: {

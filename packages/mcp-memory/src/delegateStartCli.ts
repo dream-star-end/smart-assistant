@@ -1,3 +1,4 @@
+import type { ReceiptCliTransport } from './receiptCliTransport.js'
 /**
  * `oc-memory delegate` / `request-review` — start an async gateway job then
  * use the same bounded foreground wait loop as `delegate-wait`. Identity/depth come from the
@@ -122,20 +123,30 @@ export type DelegateStartOnce = (
 
 export async function runDelegateStartAndWait(opts: {
   args: DelegateCliArgs
+  receipt?: ReceiptCliTransport
   contextToken: string
   start: DelegateStartOnce
   waitOnce: DelegateWaitOnce
   pollWaitMs: number
   foregroundBudgetMs?: number
 }): Promise<DelegateWaitLoopResult> {
+  const receipt = opts.receipt?.enrollment()
   const started = await opts.start(
     opts.args.agentId,
-    JSON.stringify(buildDelegateStartBody(opts.args)),
+    JSON.stringify({ ...buildDelegateStartBody(opts.args), ...(receipt ? { receipt } : {}) }),
     opts.contextToken,
   )
   const start = interpretDelegateStartBody(started.statusCode, started.body)
   if ('error' in start) {
     return { exitCode: 1, stdout: '', stderr: `${start.error}\n` }
+  }
+  if (receipt && opts.receipt) {
+    const data = JSON.parse(started.body) as { receiptGeneration?: number }
+    if (!Number.isSafeInteger(data.receiptGeneration)) throw new Error('receipt start missing generation; do not resubmit')
+    const locator = { jobId: start.jobId, generation: data.receiptGeneration!, receiptNonce: receipt.receiptNonce }
+    opts.receipt.remember(locator)
+    return runDelegateWaitLoop({ jobIds: [start.jobId], waitOnce: (_id, ms) => opts.receipt!.wait(locator, ms),
+      pollWaitMs: opts.pollWaitMs, foregroundBudgetMs: opts.foregroundBudgetMs })
   }
   return runDelegateWaitLoop({
     jobIds: [start.jobId],

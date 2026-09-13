@@ -19,6 +19,7 @@ export async function createHttpReceiptInput(opts: {
   assistantMessage: AssistantMessage
   agentId?: string
   delivery: ReceiptDeliveryCoordinator
+  releaseDelivery?: () => void
 }): Promise<UserMessage> {
   if (opts.agentId) throw new Error('receipt consumption requires the native main thread')
   const sourceId = opts.assistantMessage.uuid
@@ -90,7 +91,7 @@ export async function createHttpReceiptInput(opts: {
         if (getSessionId() !== nativeSessionId) return false
         const checked = await post('check', { capability })
         return getSessionId() === nativeSessionId && checked.ownerState === 'active'
-      } }, write, oracle)
+      } }, write, oracle).finally(() => opts.releaseDelivery?.())
     },
   })
   return message

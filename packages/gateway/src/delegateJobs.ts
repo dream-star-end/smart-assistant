@@ -402,7 +402,7 @@ export class DelegateJobStore {
     agentId: string,
     meta?: DelegateCreateMeta,
   ): { jobId: string; reused?: boolean } | { error: 'capacity' } {
-    if (meta?.deliveryReceipt && !this.deliveryReceipts) throw new Error('delegate receipt admission disabled')
+    if (meta?.deliveryReceipt && !this.acceptsDeliveryReceipts) throw new Error('delegate receipt admission disabled')
     this.sweep()
     const idempotencyKey =
       this.sm && typeof meta?.idempotencyKey === 'string' && meta.idempotencyKey.trim()
@@ -945,6 +945,15 @@ export class DelegateJobStore {
   }
 
   /** No old wait/get/markResultConsumed, sweep, or in-memory fallback for v2. */
+  get acceptsDeliveryReceipts(): boolean { return this.deliveryReceipts && this.sm && !!this.durable }
+
+  readReceiptStatus(jobId: string, generation: number, scope: {
+    userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
+  }): 'running' | 'ready' | undefined {
+    if (!this.durable) throw new Error('receipt status requires durable storage')
+    return this.durable.readReceiptStatus(jobId, generation, scope)
+  }
+
   readReceiptInputOffer(jobId: string, generation: number, scope: {
     userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
   }) {

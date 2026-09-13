@@ -55,6 +55,16 @@ const parent = { userId: 'default', sessionKey: parentSession, agentId: 'main', 
 let visible = true
 ;(gw as any).sessions = { getByKey: (key: string) => visible && key === parentSession ? parent : undefined }
 ;(gw as any)._delegateJobs = jobs
+if (process.argv[4] === 'caller') {
+  ;(gw as any)._delegateReconcileReady = true
+  ;(gw as any)._runDelegateTask = async (input: any) => {
+    const claim = jobs.claimQueued(input.backgroundJobId)
+    if (!claim.ok) throw new Error('fixture failed to claim queued job')
+    const job = jobs.snapshotOf(input.backgroundJobId)!
+    input.claimToken = job.claimToken; input.fencingEpoch = job.fencingEpoch
+    return { kind: 'completed', ok: true, output: 'NEW_CLI_AUTHORITATIVE_RESULT', sessionKey: input.sessionKey }
+  }
+}
 const server = createServer((req, res) => { void (gw as any).handleHttp(req, res) })
 await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
 const port = (server.address() as { port: number }).port
@@ -67,6 +77,7 @@ process.stdout.write('PAIR_READY ' + JSON.stringify({ port, dbPath, contextFile,
 const reader = createInterface({ input: process.stdin })
 reader.on('line', async line => {
   const command = JSON.parse(line)
+  if (process.argv[4] === 'caller' && command.action === 'disable-admission') (jobs as any).deliveryReceipts = false
   if (command.action === 'stop') adapter.interrupt()
   if (command.action === 'hide') visible = false
   if (command.action === 'change-turn') parent._currentTurnKey = 'other-turn'

@@ -6249,8 +6249,8 @@ export class Gateway {
       this.handleReceiptOwner(req, res, url.pathname.endsWith('/issue')).catch((err) => this.sendInternalError(res, err))
       return
     }
-    if (url.pathname === `${RECEIPT_OWNER_PREFIX}input`) {
-      this.handleReceiptInputOffer(req, res).catch((err) => this.sendInternalError(res, err))
+    if (url.pathname === `${RECEIPT_OWNER_PREFIX}input` || url.pathname === `${RECEIPT_OWNER_PREFIX}status`) {
+      this.handleReceiptInputOffer(req, res, url.pathname.endsWith('/status')).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
@@ -13787,6 +13787,33 @@ export class Gateway {
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
     // 拒绝路径不得产生副作用（不 create job、不 spawn、不 persist intent）。
+    let receiptEnrollment: { parentTurnKey: string; nativeToolUseId: string; receiptNonceHash: string } | undefined
+    let receiptUserId: string | undefined
+    if (parsed.receipt !== undefined) {
+      const receipt: unknown = parsed.receipt
+      if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
+          Object.keys(receipt).sort().join(',') !== 'capability,receiptNonce' ||
+          !('capability' in receipt) || !('receiptNonce' in receipt) || typeof receipt.receiptNonce !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(receipt.receiptNonce) || parsed.async !== true || parsed.callbackOnComplete) {
+        return this.sendError(res, 400, 'invalid receipt enrollment')
+      }
+      const principal = this.receiptHttpPrincipal(req)
+      const context = typeof contextRaw === 'string' ? verifyDelegateContextToken(contextRaw) : null
+      const consumer = this._receiptOwnerCapabilities.verify(receipt.capability)
+      if (!principal || !context || !consumer || consumer.contextHash !== receiptContextHash(contextRaw as string) ||
+          consumer.agentId !== context.agentId || consumer.sessionKey !== context.sessionKey) return this.sendError(res, 401, 'invalid receipt authority')
+      if (principal.kind === 'user' && principal.userId !== consumer.userId) return this.sendError(res, 403, 'receipt user mismatch')
+      const parent = this.sessions?.getByKey(consumer.sessionKey)
+      if (!parent || parent.agentId !== consumer.agentId || (parent.userId || 'default') !== consumer.userId ||
+          parent._currentTurnKey !== consumer.turnKey || parent.runner.checkReceiptOwner?.(consumer) !== 'active') {
+        return this.sendError(res, 409, 'receipt creator unavailable')
+      }
+      // Full C0 admission remains off in production; no env/body override.
+      if (!isDelegateSmEnabled() || !this._delegateJobs?.acceptsDeliveryReceipts) return this.sendError(res, 409, 'receipt admission disabled')
+      receiptEnrollment = { parentTurnKey: consumer.turnKey, nativeToolUseId: consumer.consumerToolUseId,
+        receiptNonceHash: receiptContextHash(receipt.receiptNonce) }
+      receiptUserId = consumer.userId
+    }
     const idempotencyKey = parseDelegateIdempotencyKey(parsed, req.headers)
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
       resumeSessionKey: parsed.resumeSessionKey,
@@ -13800,6 +13827,7 @@ export class Gateway {
     if (!resume.ok) {
       return this.sendError(res, resume.httpStatus, resume.message)
     }
+    if (receiptEnrollment && resume.replay && !resume.dispatchGranted) return this.sendError(res, 409, DELEGATE_RESUME_OCCUPIED_MESSAGE)
     if (resume.replay && !resume.dispatchGranted) {
       const existing = resume.jobId ? this._delegateJobs?.snapshotOf(resume.jobId) : undefined
       if (existing) {
@@ -13871,6 +13899,7 @@ export class Gateway {
         runInput.capacitySlotOpts = slotOpts
       }
       const created = store.create(targetAgentId, {
+        ...(receiptEnrollment ? { deliveryReceipt: receiptEnrollment } : {}),
         sessionKey: resume.sessionKey,
         parentSessionKey,
         queued: sm,
@@ -13881,7 +13910,7 @@ export class Gateway {
           ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
           : undefined,
         callbackOriginSessionKey: callbackTarget?.sessionKey,
-        callbackOriginUserId: callbackTarget?.userId,
+        callbackOriginUserId: receiptUserId ?? callbackTarget?.userId,
       })
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
@@ -13905,6 +13934,7 @@ export class Gateway {
         return this.sendJson(res, 200, {
           status: existing?.state === 'queued' ? 'queued' : 'running',
           jobId: created.jobId,
+          ...(receiptEnrollment ? { receiptGeneration: store.snapshotOf(created.jobId)?.generation } : {}),
           agentId: targetAgentId,
           sessionKey: resume.sessionKey,
         })
@@ -14020,6 +14050,7 @@ export class Gateway {
       return this.sendJson(res, 200, {
         status: 'running',
         jobId,
+        ...(receiptEnrollment ? { receiptGeneration: store.snapshotOf(jobId)?.generation } : {}),
         agentId: targetAgentId,
         sessionKey: resume.sessionKey,
       })
@@ -14146,7 +14177,7 @@ export class Gateway {
 
   /** Read an authoritative result for a separately attested native consumer.
    * This endpoint never acknowledges delivery or rebinds the receipt creator. */
-  private async handleReceiptInputOffer(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handleReceiptInputOffer(req: IncomingMessage, res: ServerResponse, statusOnly = false): Promise<void> {
     res.setHeader('Cache-Control', 'no-store')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const contextToken = req.headers[DELEGATE_CONTEXT_HEADER]
@@ -14181,6 +14212,13 @@ export class Gateway {
       return this.sendError(res, 409, 'receipt input consumer unavailable')
     }
     if (!this._delegateJobs) return this.sendError(res, 503, 'receipt storage unavailable')
+    if (statusOnly) {
+      const status = this._delegateJobs.readReceiptStatus(body.jobId, body.generation as number, {
+        userId: consumer.userId, parentSession: consumer.sessionKey, parentTurnKey: consumer.turnKey,
+        receiptNonceHash: receiptContextHash(body.receiptNonce),
+      })
+      return status ? this.sendJson(res, 200, { status }) : this.sendError(res, 404, 'receipt unavailable')
+    }
     const offer = this._delegateJobs.readReceiptInputOffer(body.jobId, body.generation as number, {
       userId: consumer.userId, parentSession: consumer.sessionKey, parentTurnKey: consumer.turnKey,
       receiptNonceHash: receiptContextHash(body.receiptNonce),
