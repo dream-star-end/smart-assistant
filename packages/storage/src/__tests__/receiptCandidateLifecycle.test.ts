@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import fs from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { mkdtempSync, existsSync, readFileSync, writeFileSync, symlinkSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -72,4 +76,52 @@ test('retired cleanup is restart-idempotent and never follows unknown data symli
   assert.equal(JSON.parse(readFileSync(join(f.store.root, 'namespaces', f.scope.partition + '.json'), 'utf8')).state, 'retired')
   await assert.rejects(new ReceiptCandidateLifecycle(f.store.root).retire(f.scope.partition, () => false), /unknown/)
   assert.ok(readdirSync(join(f.data, 'cache')).includes('unknown-link'))
+})
+
+test('failed retirement directory fsync retains data until a fresh instance proves durability', async () => {
+  const f = fixture(); await f.store.register(f.scope, 'a', () => {})
+  const original = fs.fsyncSync
+  let failed = false
+  fs.fsyncSync = fd => {
+    if (!failed && fs.readlinkSync(`/proc/self/fd/${fd}`) === join(f.store.root, 'namespaces')) {
+      failed = true; throw new Error('injected namespace fsync failure')
+    }
+    original(fd)
+  }
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(f.store.retire(f.scope.partition, () => true), /injected namespace fsync/)
+    assert.equal(failed, true); assert.equal(existsSync(f.data), true)
+  } finally { fs.fsyncSync = original; syncBuiltinESMExports() }
+  assert.equal(await new ReceiptCandidateLifecycle(f.store.root).retire(f.scope.partition, () => false), true)
+  assert.equal(existsSync(f.data), false)
+})
+
+for (const finish of ['publish', 'kill'] as const) test(`actual second-process writer ${finish} holds retirement until its real lifetime ends`, async () => {
+  const f = fixture(); await f.store.register(f.scope, 'a', () => {})
+  const root = fileURLToPath(new URL('../../../../', import.meta.url))
+  const child = spawn(process.execPath, ['--import', join(root, 'node_modules/tsx/dist/loader.mjs'),
+    fileURLToPath(new URL('./fixtures/receiptCandidateWriter.fixture.ts', import.meta.url)), f.store.root, f.scope.partition],
+  { env: { PATH: process.env.PATH!, HOME: f.dir }, stdio: ['pipe', 'pipe', 'pipe'] })
+  let output = '', error = '', ready!: () => void
+  const locked = new Promise<void>(r => { ready = r })
+  child.stdout.on('data', chunk => { output += chunk; if (output.includes('WRITER_LOCKED')) ready() })
+  child.stderr.on('data', chunk => { error += chunk })
+  const closed = new Promise<number | null>((resolve, reject) => { child.once('close', resolve); child.once('error', reject) })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([locked, closed.then(() => { throw new Error(`writer exited before lock: ${error}`) }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('writer startup deadline')), 10000) })])
+    clearTimeout(timer)
+    if (finish === 'kill') child.kill('SIGSTOP')
+    await assert.rejects(withReceiptWriteBarrier(join(f.store.root, 'barrier.lock'), async () => assert.fail('writer lock stolen'), { timeoutMs: 30 }), /flock/)
+    const retiring = f.store.retire(f.scope.partition, () => true)
+    if (finish === 'kill') child.kill('SIGKILL')
+    else child.stdin.end('publish')
+    const exit = await closed
+    assert.equal(exit, finish === 'kill' ? null : 0, error)
+    assert.equal(await retiring, true)
+    assert.equal(output.includes('WRITER_PUBLISHED'), finish === 'publish')
+    assert.equal(existsSync(f.data), false)
+  } finally { clearTimeout(timer); child.kill('SIGKILL'); await closed }
 })

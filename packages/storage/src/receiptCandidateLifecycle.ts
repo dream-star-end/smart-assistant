@@ -2,7 +2,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { constants, openSync, closeSync, fstatSync, mkdirSync, readSync, writeSync,
   fsyncSync, renameSync, unlinkSync, readdirSync, lstatSync, rmdirSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, dirname } from 'node:path'
 import { withReceiptWriteBarrier } from './receiptWriteBarrier.js'
 
 export interface ReceiptCandidateScope {
@@ -102,7 +102,11 @@ export class ReceiptCandidateLifecycle {
   private async locked<T>(create: boolean, work: (root: number, manifests: number, data: number) => T | Promise<T>): Promise<T> {
     // Only authoritative registration may create the control root. Writers and
     // retirement open it first, so the barrier helper's mkdir cannot resurrect it.
-    if (create) mkdirSync(this.root, { recursive: true, mode: 0o700 })
+    if (create) {
+      mkdirSync(this.root, { recursive: true, mode: 0o700 })
+      const parent = openSync(dirname(this.root), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+      try { fsyncSync(parent) } finally { closeSync(parent) }
+    }
     const root = privateDirectory(this.root)
     try {
       return await withReceiptWriteBarrier(`/proc/self/fd/${root}/barrier.lock`, async () => {

@@ -132,7 +132,6 @@ export function snapshotReceiptReport(directory: string): { locators: ReceiptLoc
 export class ReceiptCliTransport {
   readonly capability: string
   private readonly credentials: ReceiptConsumerCredentials
-  private readonly cacheRoot: string
   private readonly partition: string
   private readonly report: string
   private readonly lifecycle: ReceiptCandidateLifecycle
@@ -145,7 +144,6 @@ export class ReceiptCliTransport {
     this.partition = candidatePartition(this.capability)
     this.credentials = new ReceiptConsumerCredentials(this.capability)
     if (process.platform !== 'linux' || !isAbsolute(root)) throw new Error('receipt cache requires an absolute Linux path')
-    this.cacheRoot = root
     this.lifecycle = new ReceiptCandidateLifecycle(root)
     const claims = JSON.parse(Buffer.from(this.capability.split('.')[0]!, 'base64url').toString())
     this.reportId = receiptReportId(claims.consumerToolUseId)
