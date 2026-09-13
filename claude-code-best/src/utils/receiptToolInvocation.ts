@@ -33,6 +33,12 @@ export function markReceiptShellBackground(shell: ShellCommand): void {
   const scope = shells.get(shell)
   if (scope) scope.backgrounded = true
 }
+/** Bash has not yielded a background placeholder: its real completion won the
+ * handoff race. Restore the foreground canonical path before muting shell notify. */
+export function markReceiptShellForegroundResult(shell: ShellCommand): void {
+  const scope = shells.get(shell)
+  if (scope) scope.backgrounded = false
+}
 export async function receiptShellNotification(shell: ShellCommand): Promise<QueuedCommand | undefined> {
   const scope = shells.get(shell)
   if (!scope?.backgrounded) return undefined
@@ -143,7 +149,7 @@ export async function prepareReceiptToolInvocation(opts: {
     const status = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
       headers: gatewayDelegateHeaders(), body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
     })
-    if (status.statusCode !== 200 || JSON.parse(status.body).status !== 'ready') return undefined
+    if (!scope.backgrounded || status.statusCode !== 200 || JSON.parse(status.body).status !== 'ready') return undefined
     // Do not open a DB or fetch result bytes until the real query input boundary.
     return createQueuedReceiptInput(() => input(locator, true))
   }

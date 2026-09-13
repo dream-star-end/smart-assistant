@@ -236,3 +236,36 @@ test('Stop after confirmed enqueue never admits original text or acknowledges re
   expect(JSON.stringify(input)).not.toContain('AUTHORITATIVE_NATIVE_RESULT')
   expect(f.inspect().receipt.state).toBe('offered')
 }, 60000)
+
+test('actual background-completion handoff keeps an active-turn receipt path', async () => {
+  const f = await fixture(); seedLocator(f)
+  const opts = f.options('waiter'), ctx = context()
+  ctx.setToolJSX = () => {}
+  const fs = await import('node:fs/promises')
+  const { existsSync } = await import('node:fs')
+  const ready = join(dir, 'exit-ready'), release = join(dir, 'exit-release'), preload = join(dir, 'gate-exit.mjs')
+  await fs.writeFile(preload, `import {writeFileSync,existsSync} from 'node:fs';const end=process.exit.bind(process);process.exit=(code)=>{writeFileSync(${JSON.stringify(ready)},'ready');setInterval(()=>{if(existsSync(${JSON.stringify(release)}))end(code)},5)}`)
+  const command = `node --import ${JSON.stringify(preload)} --import ${JSON.stringify(join(root,'node_modules/tsx/dist/loader.mjs'))} ${JSON.stringify(join(root,'packages/mcp-memory/src/ocMemoryCli.ts'))} delegate-wait ${f.info.jobId}`
+  opts.assistantMessage.message.content[0].input = { command, timeout:20000 }
+  const first = createUserMessage({content:'background completion race'});ctx.messages=[first]
+  const persisted:any[]=[first]
+  const stream=query({messages:[first],systemPrompt:asSystemPrompt([]),userContext:{},systemContext:{},canUseTool:async(_tool: unknown,input: unknown)=>({behavior:'allow',updatedInput:input}),toolUseContext:ctx,querySource:'sdk',maxTurns:1,deps:{uuid:randomUUID,microcompact:async(messages:unknown[])=>({messages}),autocompact:async()=>({compactionResult:undefined,consecutiveFailures:0}),callModel:async function*(){yield opts.assistantMessage}}} as any)
+  const running=(async()=>{for await(const message of stream)if(['user','assistant','system'].includes(message.type)){persisted.push(message);await recordTranscript(persisted)}})()
+  try {
+    await until(()=>existsSync(ready)&&Object.values(ctx.getAppState().tasks).some((t:any)=>t.status==='running'&&!t.isBackgrounded))
+    backgroundAll(ctx.getAppState,ctx.setAppState)
+    await fs.writeFile(release,'release')
+    await running
+    await until(()=>Object.values(ctx.getAppState().tasks).some((t:any)=>t.status==='completed'&&t.shellCommand===null))
+    await flushSessionStorage()
+    const restored=await f.restored()
+    const actual=restored.messages.filter(m=>m.type==='user'&&JSON.stringify(m).includes('AUTHORITATIVE_NATIVE_RESULT')).length
+    console.log('REVIEWER_HANDOFF',JSON.stringify({actual,queue:getCommandQueue().length,receipt:f.inspect().receipt.state,tasks:Object.values(ctx.getAppState().tasks).map((t:any)=>({status:t.status,notified:t.notified,isBackgrounded:t.isBackgrounded}))}))
+    expect(actual).toBe(1)
+    expect(f.inspect().receipt.state).toBe('ingested')
+    expect(f.inspect().receipt.native_tool_use_id).toBe('creator')
+    const paired=restored.messages.flatMap((m:any)=>m.type==='user'&&Array.isArray(m.message?.content)?m.message.content.filter((b:any)=>b.type==='tool_result'&&b.tool_use_id==='waiter'):[])
+    expect(paired).toHaveLength(1)
+    expect(getCommandQueue()).toHaveLength(0)
+  } finally {await fs.writeFile(release,'release');await running}
+},60000)

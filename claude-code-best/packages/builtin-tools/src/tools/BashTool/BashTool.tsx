@@ -1,4 +1,4 @@
-import { bindReceiptShellCommand } from 'src/utils/receiptToolInvocation.js';
+import { bindReceiptShellCommand, markReceiptShellForegroundResult } from 'src/utils/receiptToolInvocation.js';
 import { feature } from 'bun:bundle';
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import { copyFile, stat as fsStat, truncate as fsTruncate, link } from 'fs/promises';
@@ -1273,6 +1273,7 @@ async function* runShellCommand({
         // Check result.backgroundTaskId (not the closure var) to also cover
         // Ctrl+B, which calls shellCommand.background() directly.
         if (result.backgroundTaskId !== undefined) {
+          markReceiptShellForegroundResult(shellCommand);
           markTaskNotified(result.backgroundTaskId, setAppState);
           const fixedResult: ExecResult = {
             ...result,
