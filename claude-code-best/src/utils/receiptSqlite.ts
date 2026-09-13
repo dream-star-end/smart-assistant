@@ -22,4 +22,3 @@ export async function openReceiptDelivery(
   }
   return new ReceiptDeliveryCoordinator(existingDatabasePath, open)
 }
-
