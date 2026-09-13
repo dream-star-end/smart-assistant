@@ -11,18 +11,21 @@ import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
 const requestedMode=process.argv[3] || 'create', wrapped=requestedMode.startsWith('deferred-'), mcp=wrapped||requestedMode.startsWith('mcp-')
-const mode=requestedMode==='success'?'create':requestedMode.replace(/^(mcp|deferred)-/, '');assert.ok(['create','wait','stop'].includes(mode))
+const mixed=requestedMode==='mixed'
+const mode=(requestedMode==='success'||mixed)?'create':requestedMode.replace(/^(mcp|deferred)-/, '');assert.ok(['create','wait','stop'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
 mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
 const token=randomBytes(32).toString('hex'), session='agent:main:webchat:dm:real-model-cli', turnKey='real-model-cli-turn'
 const requests:any[]=[], sdk:any[]=[], http:any[]=[]
+let resolveBatchBoundary:()=>void=()=>{};const batchBoundary=new Promise<void>(r=>{resolveBatchBoundary=r})
 let phase=0, executions=0, received=false, discovered=false, failure:any
 let adapter:CcbAdapter, runner:SubprocessRunner, turn:any
 const sentinel='REAL_MODEL_CLI_AUTHORITATIVE_RESULT'
 const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate --agent-id coding-assistant --goal synthetic-child-only`
-const suffix="; printf 'ORDINARY_SHELL_STDOUT'; printf 'ORDINARY_SHELL_STDERR' >&2; exit "+(requestedMode==='success'?0:7)
+const readPath=join(dir,'late-read.txt')
+const suffix="; printf 'ORDINARY_SHELL_STDOUT'; printf 'ORDINARY_SHELL_STDERR' >&2; "+(mixed?`printf 'LATE_READ_AFTER_REAL_BASH' > ${JSON.stringify(readPath)}; `:'')+'exit '+(requestedMode==='success'||mixed?0:7)
 const command=mode==='wait'?'timeout --signal=TERM 8s '+cli+'; timeout --signal=TERM 8s '+cli.replace('synthetic-child-only','synthetic-child-two'):cli+'; '+cli.replace('synthetic-child-only','synthetic-child-two')+suffix
 function send(res:any,body:any,tool:boolean,wait=false,discover=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
@@ -31,14 +34,17 @@ function send(res:any,body:any,tool:boolean,wait=false,discover=false) {
    content=discover?{type:'tool_use',id:'real_discovery',name:'SearchExtraTools',input:{query:'select:mcp__openclaude-memory__delegate_task,mcp__openclaude-memory__delegate_wait'}}:
      {...content,name:'ExecuteExtraTool',input:{tool_name:content.name,params:content.input}}
  }
- const message={id,type:'message',role:'assistant',model:body.model,content:[content],stop_reason:tool?'tool_use':'end_turn',stop_sequence:null,usage:{input_tokens:10,output_tokens:10}}
+ const blocks=mixed&&tool?[content,{type:'tool_use',id:'late_read',name:'Read',input:{file_path:readPath}}]:[content]
+ const message={id,type:'message',role:'assistant',model:body.model,content:blocks,stop_reason:tool?'tool_use':'end_turn',stop_sequence:null,usage:{input_tokens:10,output_tokens:10}}
  if(!body.stream){res.setHeader('Content-Type','application/json');res.end(JSON.stringify(message));return}
  res.setHeader('Content-Type','text/event-stream')
  const emit=(event:string,data:any)=>res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
  emit('message_start',{type:'message_start',message:{...message,content:[],stop_reason:null}})
- emit('content_block_start',{type:'content_block_start',index:0,content_block:tool?{...content,input:{}}:{type:'text',text:''}})
- emit('content_block_delta',{type:'content_block_delta',index:0,delta:tool?{type:'input_json_delta',partial_json:JSON.stringify(content.input)}:{type:'text_delta',text:content.text}})
- emit('content_block_stop',{type:'content_block_stop',index:0})
+ for(const [index,block] of blocks.entries()) {
+  emit('content_block_start',{type:'content_block_start',index,content_block:tool?{...block,input:{}}:{type:'text',text:''}})
+  emit('content_block_delta',{type:'content_block_delta',index,delta:tool?{type:'input_json_delta',partial_json:JSON.stringify(block.input)}:{type:'text_delta',text:block.text}})
+  emit('content_block_stop',{type:'content_block_stop',index})
+ }
  emit('message_delta',{type:'message_delta',delta:{stop_reason:message.stop_reason,stop_sequence:null},usage:{output_tokens:10}})
  emit('message_stop',{type:'message_stop'});res.end()
 }
@@ -60,7 +66,7 @@ const upstream=createServer(async(req,res)=>{
     phase++;send(res,body,true)
   }
   else if(main&&phase===1&&mode==='wait'){assert.equal(executions,2);assert.ok(!raw.includes(sentinel));releaseChild();phase++;send(res,body,true,true)}
-  else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
+  else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}if(main&&mixed){resolveBatchBoundary();return}send(res,body,false)}
  }catch(e){failure=e;res.statusCode=500;res.end('{}')}
 })
 await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r))
@@ -97,7 +103,7 @@ let timer:ReturnType<typeof setTimeout>|undefined
 try {
  turn=adapter.submitTurn({input:'RECEIPT_MODEL_PROBE: run synthetic child command then report its result.',turnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()} as any)
  await Promise.race([turn.submitted,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('submit deadline')),60000)})]);clearTimeout(timer)
- const result=await Promise.race([turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn deadline')),90000)})]);clearTimeout(timer)
+ const result=await Promise.race([mixed?batchBoundary:turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn deadline')),90000)})]);clearTimeout(timer)
  assert.ok(!failure,String(failure));assert.equal(executions,2);assert.equal(received,mode!=='stop')
  assert.ok(runner.sessionId);assert.equal(phase,mode==='wait'?3:mode==='stop'?1:2)
  const rows=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt').all();writeFileSync(join(dir,'receipt-rows.json'),JSON.stringify(rows,null,2));assert.equal(rows.length,2);assert.ok(rows.every((r:any)=>r.state==='ingested'),'both results must be durably ingested');const row=rows[0];assert.equal(row.state,mode==='stop'?'offered':'ingested');assert.equal(row.native_tool_use_id,'real_creator')
@@ -105,7 +111,21 @@ try {
   const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
   const modelResults=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id===(mode==='wait'?'real_waiter':'real_creator')):[])
   const nativeResults=sdk.flatMap((m:any)=>m.type==='user'&&Array.isArray(m.message?.content)?m.message.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id===(mode==='wait'?'real_waiter':'real_creator')):[])
-  assert.ok(JSON.stringify(modelMessages).includes(sentinel+'1'));assert.ok(JSON.stringify(modelMessages).includes(sentinel+'2'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDOUT'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDERR'));assert.equal(Boolean(modelResults[0].is_error),requestedMode!=='success');assert.equal(modelResults.length,1);assert.equal(nativeResults.length,1);assert.deepEqual(modelResults[0].content,nativeResults[0].content)
+  assert.ok(JSON.stringify(modelMessages).includes(sentinel+'1'));assert.ok(JSON.stringify(modelMessages).includes(sentinel+'2'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDOUT'));assert.ok(JSON.stringify(modelResults).includes('ORDINARY_SHELL_STDERR'));assert.equal(Boolean(modelResults[0].is_error),!(requestedMode==='success'||mixed));assert.equal(modelResults.length,1);assert.equal(nativeResults.length,1);assert.deepEqual(modelResults[0].content,nativeResults[0].content)
+ }
+ if(mixed) {
+  // The second real model REQUEST has arrived, but no response/assistant output
+  // can repair the chain. queryReceiptBatch separately stops before any request.
+  const users=sdk.filter((m:any)=>m.type==='user')
+  const indexOf=(id:string)=>users.findIndex((m:any)=>m.message?.content?.some((c:any)=>c.type==='tool_result'&&c.tool_use_id===id))
+  assert.ok(indexOf('real_creator')>=0&&indexOf('late_read')>indexOf('real_creator'),'real Read must complete after real Bash')
+  const read=users[indexOf('late_read')].message.content.find((c:any)=>c.type==='tool_result'&&c.tool_use_id==='late_read')
+  assert.ok(!read.is_error&&JSON.stringify(read.content).includes('LATE_READ_AFTER_REAL_BASH'),'Read must read the file actually created by Bash')
+  assert.equal(users.filter((m:any)=>m.message?.content?.some((c:any)=>c.type==='tool_result'&&c.tool_use_id==='late_read')).length,1)
+  const receiptIndices=users.flatMap((m:any,i:number)=>JSON.stringify(m.message).includes(sentinel)?[i]:[])
+  assert.equal(receiptIndices.length,2);assert.ok(receiptIndices.every(i=>i>indexOf('late_read')))
+  assert.equal(new Set(sdk.filter((m:any)=>m.type==='assistant').map((m:any)=>m.message.id)).size,1,'both tools belong to one real assistant batch')
+  assert.ok(!sdk.some((m:any)=>m.type==='assistant'&&JSON.stringify(m).includes('SYNTHETIC_MODEL_DONE')))
  }
  if(mode==='stop')assert.ok(!sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(sentinel)))
  process.stdout.write('MODEL_PROBE_PASS '+JSON.stringify({mode:requestedMode,nativeSession:runner.sessionId,phase,executions,received,isError:result?.isError,receiptState:row.state})+'\n')

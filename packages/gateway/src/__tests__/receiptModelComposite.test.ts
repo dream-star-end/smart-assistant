@@ -20,7 +20,7 @@ async function run(command:string,args:string[],home:string) {
   return out
  }finally{clearTimeout(timer)}
 }
-for(const mode of ['create','wait','success'] as const)test(`actual model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
+for(const mode of ['create','wait','success','mixed'] as const)test(`actual model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
  const dir=mkdtempSync(join(tmpdir(),'receipt-model-composite-'))
  try {
   const out=await run(process.execPath,['--import',join(root,'node_modules/tsx/dist/loader.mjs'),fixture,dir,mode],dir)

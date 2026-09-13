@@ -23,7 +23,13 @@ for (const row of rows) {
  assert.equal(matching.filter((m:any)=>m.delegateReceipt.jobId===row.job_id).length,1)
 }
 const ordinary=restored.messages.filter((m:any)=>m.type==='user'&&Array.isArray(m.message.content)&&m.message.content.some((c:any)=>c.type==='tool_result'))
-assert.equal(ordinary.length,mode==='wait'?2:1)
+assert.equal(ordinary.length,mode==='wait'||mode==='mixed'?2:1)
 assert.ok(JSON.stringify(ordinary).includes('ORDINARY_SHELL_STDOUT'))
 assert.ok(JSON.stringify(ordinary).includes('ORDINARY_SHELL_STDERR'))
+if(mode==='mixed') {
+ assert.ok(JSON.stringify(ordinary).includes('LATE_READ_AFTER_REAL_BASH'))
+ assert.ok(!restored.messages.some((m:any)=>m.type==='assistant'&&JSON.stringify(m.message).includes('SYNTHETIC_MODEL_DONE')))
+ const toolIds=ordinary.flatMap((m:any)=>m.message.content.filter((c:any)=>c.type==='tool_result').map((c:any)=>c.tool_use_id))
+ assert.deepEqual(toolIds,['real_creator','late_read'])
+}
 process.stdout.write(JSON.stringify({mode,passed:true,receiptInputs:matching.length,ordinaryResults:ordinary.length})+'\n')
