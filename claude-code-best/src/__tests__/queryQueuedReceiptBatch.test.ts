@@ -149,7 +149,14 @@ for (const mode of ['normal', 'notify-loser', 'bad-candidate', 'copied-canonical
       expect(rows.map(r => r.state)).toEqual(mode === 'notify-loser' ? ['notify_pending', 'ingested'] :
         mode === 'bad-candidate' || mode === 'copied-canonical' ? ['offered', 'ingested'] : oracleFault ? ['ingest_claimed', 'offered'] : ['ingested', 'ingested'])
       rows.forEach((row, i) => { expect(row.native_tool_use_id).toBe('bash-batch'); expect(row.receipt_nonce_hash).toBe(bindings[i]!.receiptNonceHash) })
-      expect(getCommandQueue()).toHaveLength(0)
+      if (oracleFault) {
+        // Existing queue removal is after successful attachment processing.
+        // A strict throw keeps the ordinary notice, but its receipt capability
+        // was already taken exactly once and must never be reconstructed.
+        expect(getCommandQueue()).toHaveLength(1)
+        expect(hasQueuedReceiptInput(getCommandQueue()[0]!)).toBe(false)
+        expect(takeQueuedReceiptInputs(getCommandQueue()[0]!)).toBeUndefined()
+      } else expect(getCommandQueue()).toHaveLength(0)
       if (oracleFault) {
         expect(await delivery.recover(bindings[0]!, claim => observeStrictReceiptInput(claim.proof), async () => 'active')).toBe('ingested')
         expect(db.query('SELECT state FROM delegate_delivery_receipt ORDER BY rowid').all()).toEqual([{ state: 'ingested' }, { state: 'offered' }])
