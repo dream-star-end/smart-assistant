@@ -13898,20 +13898,31 @@ export class Gateway {
         runInput.capacityReserved = admit === 'slot'
         runInput.capacitySlotOpts = slotOpts
       }
-      const created = store.create(targetAgentId, {
-        ...(receiptEnrollment ? { deliveryReceipt: receiptEnrollment } : {}),
-        sessionKey: resume.sessionKey,
-        parentSessionKey,
-        queued: sm,
-        kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
-        callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
-        idempotencyKey: sm ? idempotencyKey : undefined,
-        parentEngine: isDelegateNotifierEffective()
-          ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
-          : undefined,
-        callbackOriginSessionKey: callbackTarget?.sessionKey,
-        callbackOriginUserId: receiptUserId ?? callbackTarget?.userId,
-      })
+      let created: ReturnType<typeof store.create>
+      try {
+        created = store.create(targetAgentId, {
+          ...(receiptEnrollment ? { deliveryReceipt: receiptEnrollment } : {}),
+          sessionKey: resume.sessionKey,
+          parentSessionKey,
+          queued: sm,
+          kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
+          callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
+          idempotencyKey: sm ? idempotencyKey : undefined,
+          parentEngine: isDelegateNotifierEffective()
+            ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
+            : undefined,
+          callbackOriginSessionKey: callbackTarget?.sessionKey,
+          callbackOriginUserId: receiptUserId ?? callbackTarget?.userId,
+        })
+      } catch (error) {
+        // No runner owns this request yet. In particular, the durable receipt
+        // reuse guard can throw after resume + slot/waiter were pre-admitted.
+        // Roll back only this request's reservations; keep the original error
+        // and immutable receipt binding instead of retrying or rewriting it.
+        this._delegateResume.abort(resume.sessionKey, resume.minted)
+        this._releasePreadmittedDelegateCapacity(runInput)
+        throw error
+      }
       if ('error' in created) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
         if (sm && runInput.capacityReserved) this._releaseDelegateSlot(slotOpts)
