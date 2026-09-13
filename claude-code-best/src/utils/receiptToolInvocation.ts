@@ -1,3 +1,6 @@
+import type { ShellCommand } from './ShellCommand.js'
+import { createQueuedReceiptInput } from './receiptQueuedInput.js'
+import type { QueuedCommand } from '../types/textInputTypes.js'
 import { receiptMcpTargetForSdk } from '../../../packages/gateway/src/receiptOwnerCapability.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, mkdir, readFile } from 'node:fs/promises'
@@ -15,9 +18,28 @@ import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../..
 type ReceiptScope = {
   toolUseId: string; toolName: string; capability: string; mcpToolName?: string
   env?: Readonly<Record<string, string>>
+  backgrounded?: boolean
+  backgroundNotification?: () => Promise<QueuedCommand | undefined>
   candidate?: ReceiptLocator
 }
 const scopes = new AsyncLocalStorage<ReceiptScope>()
+// Actual ShellCommand identity, not stdout, arguments or an environment flag.
+const shells = new WeakMap<ShellCommand, ReceiptScope>()
+export function bindReceiptShellCommand(shell: ShellCommand): void {
+  const scope = scopes.getStore()
+  if (scope?.toolName === 'Bash') shells.set(shell, scope)
+}
+export function markReceiptShellBackground(shell: ShellCommand): void {
+  const scope = shells.get(shell)
+  if (scope) scope.backgrounded = true
+}
+export async function receiptShellNotification(shell: ShellCommand): Promise<QueuedCommand | undefined> {
+  const scope = shells.get(shell)
+  if (!scope?.backgrounded) return undefined
+  try { return await scope.backgroundNotification?.() }
+  catch { return undefined } // Ordinary/rejected/unknown shells retain their failure notice.
+}
+
 const platformServer = 'openclaude-memory'
 const mcpNames = ['delegate_task', 'delegate_wait'].map(name => buildMcpToolName(platformServer, name))
 /** Child shells inherit identity only inside their own actual native Bash call. */
@@ -99,23 +121,38 @@ export async function prepareReceiptToolInvocation(opts: {
     scope.env = Object.freeze({ [RECEIPT_CAP_ENV]: capability, [RECEIPT_REPORT_ENV]: report,
       [RECEIPT_CACHE_ENV]: join(home, 'receipt-locators') })
   }
+  const readLocator = async () => {
+    if (!report) return scope.candidate
+    let raw: string
+    try { raw = await readFile(report, 'utf8') }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+    return parseReceiptLocator(JSON.parse(raw))
+  }
+  const input = async (locator: ReceiptLocator, backgroundNotification = false) => {
+    const { openReceiptDelivery } = await import('./receiptSqlite.js')
+    const { createHttpReceiptInput } = await import('./receiptHttpInput.js')
+    const delivery = await openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db'))
+    try {
+      return await createHttpReceiptInput({ ...opts, locator, delivery, releaseDelivery: () => delivery.close(),
+        ...(backgroundNotification ? { backgroundNotification: true, capability } : {}) })
+    } catch (error) { delivery.close(); throw error }
+  }
+  scope.backgroundNotification = async () => {
+    const locator = await readLocator()
+    if (!locator) return undefined
+    const status = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
+      headers: gatewayDelegateHeaders(), body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
+    })
+    if (status.statusCode !== 200 || JSON.parse(status.body).status !== 'ready') return undefined
+    // Do not open a DB or fetch result bytes until the real query input boundary.
+    return createQueuedReceiptInput(() => input(locator, true))
+  }
   return {
     run: fn => scopes.run(scope, fn),
     input: async () => {
-      let locator = scope.candidate
-      if (report) {
-        let raw: string
-        try { raw = await readFile(report, 'utf8') }
-        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
-        locator = parseReceiptLocator(JSON.parse(raw))
-      }
-      if (!locator) return undefined
-      const { openReceiptDelivery } = await import('./receiptSqlite.js')
-      const { createHttpReceiptInput } = await import('./receiptHttpInput.js')
-      const delivery = await openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db'))
-      try {
-        return await createHttpReceiptInput({ ...opts, locator, delivery, releaseDelivery: () => delivery.close() })
-      } catch (error) { delivery.close(); throw error }
+      if (scope.backgrounded) return undefined
+      const locator = await readLocator()
+      return locator ? input(locator) : undefined
     },
   }
 }

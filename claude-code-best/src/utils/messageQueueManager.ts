@@ -1,3 +1,4 @@
+import { transferQueuedReceiptInput } from './receiptQueuedInput.js'
 import { feature } from 'bun:bundle'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import type { Permutations } from 'src/types/utils.js'
@@ -140,7 +141,9 @@ export function enqueue(command: QueuedCommand): void {
  * is never starved by system messages.
  */
 export function enqueuePendingNotification(command: QueuedCommand): void {
-  commandQueue.push({ ...command, priority: command.priority ?? 'later' })
+  const queued = { ...command, priority: command.priority ?? 'later' as const }
+  transferQueuedReceiptInput(command, queued)
+  commandQueue.push(queued)
   notifySubscribers()
   logOperation(
     'enqueue',

@@ -1,3 +1,4 @@
+import { markReceiptShellBackground, receiptShellNotification } from '../../utils/receiptToolInvocation.js';
 import { feature } from 'bun:bundle';
 import { stat } from 'fs/promises';
 import {
@@ -126,7 +127,7 @@ The command is likely blocked on an interactive prompt. Kill this task and re-ru
   };
 }
 
-function enqueueShellNotification(
+async function enqueueShellNotification(
   taskId: string,
   description: string,
   status: 'completed' | 'failed' | 'killed',
@@ -135,7 +136,8 @@ function enqueueShellNotification(
   toolUseId?: string,
   kind: BashTaskKind = 'bash',
   agentId?: AgentId,
-): void {
+  shellCommand?: ShellCommand,
+): Promise<void> {
   // Atomically check and set notified flag to prevent duplicate notifications.
   // If the task was already marked as notified (e.g., by TaskStopTool), skip
   // enqueueing to avoid sending redundant messages to the model.
@@ -186,6 +188,12 @@ function enqueueShellNotification(
         summary = `${BACKGROUND_BASH_SUMMARY_PREFIX}"${description}" was stopped`;
         break;
     }
+  }
+
+  const receiptNotification = !agentId && shellCommand ? await receiptShellNotification(shellCommand) : undefined;
+  if (receiptNotification) {
+    enqueuePendingNotification(receiptNotification);
+    return;
   }
 
   const outputPath = getTaskOutputPath(taskId);
@@ -269,6 +277,7 @@ export async function spawnShellTask(
   // Data flows through TaskOutput automatically — no stream listeners needed.
   // Just transition to backgrounded state so the process keeps running.
   shellCommand.background(taskId);
+  markReceiptShellBackground(shellCommand);
 
   const cancelStallWatchdog = startStallWatchdog(taskId, description, kind, toolUseId, agentId);
   // Stream the tail to the SDK channel so the web shows live output for
@@ -297,7 +306,7 @@ export async function spawnShellTask(
       };
     });
 
-    enqueueShellNotification(
+    await enqueueShellNotification(
       taskId,
       description,
       wasKilled ? 'killed' : result.code === 0 ? 'completed' : 'failed',
@@ -306,6 +315,7 @@ export async function spawnShellTask(
       toolUseId,
       kind,
       agentId,
+      shellCommand,
     );
 
     void evictTaskOutput(taskId);
@@ -374,6 +384,7 @@ function backgroundTask(taskId: string, getAppState: () => AppState, setAppState
   if (!shellCommand.background(taskId)) {
     return false;
   }
+  markReceiptShellBackground(shellCommand);
 
   setAppState(prev => {
     const prevTask = prev.tasks[taskId];
@@ -425,10 +436,10 @@ function backgroundTask(taskId: string, getAppState: () => AppState, setAppState
     cleanupFn?.();
 
     if (wasKilled) {
-      enqueueShellNotification(taskId, description, 'killed', result.code, setAppState, toolUseId, kind, agentId);
+      await enqueueShellNotification(taskId, description, 'killed', result.code, setAppState, toolUseId, kind, agentId, shellCommand);
     } else {
       const finalStatus = result.code === 0 ? 'completed' : 'failed';
-      enqueueShellNotification(taskId, description, finalStatus, result.code, setAppState, toolUseId, kind, agentId);
+      await enqueueShellNotification(taskId, description, finalStatus, result.code, setAppState, toolUseId, kind, agentId, shellCommand);
     }
 
     void evictTaskOutput(taskId);
@@ -498,6 +509,7 @@ export function backgroundExistingForegroundTask(
   if (!shellCommand.background(taskId)) {
     return false;
   }
+  markReceiptShellBackground(shellCommand);
 
   let agentId: AgentId | undefined;
   setAppState(prev => {
@@ -547,7 +559,7 @@ export function backgroundExistingForegroundTask(
     cleanupFn?.();
 
     const finalStatus = wasKilled ? 'killed' : result.code === 0 ? 'completed' : 'failed';
-    enqueueShellNotification(taskId, description, finalStatus, result.code, setAppState, toolUseId, undefined, agentId);
+    await enqueueShellNotification(taskId, description, finalStatus, result.code, setAppState, toolUseId, undefined, agentId, shellCommand);
 
     void evictTaskOutput(taskId);
   });

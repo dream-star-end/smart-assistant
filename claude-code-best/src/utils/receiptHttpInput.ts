@@ -21,6 +21,9 @@ export async function createHttpReceiptInput(opts: {
   agentId?: string
   delivery: ReceiptDeliveryCoordinator
   releaseDelivery?: () => void
+  /** Internal actual ShellCommand enrollment only; never read from HTTP/body. */
+  backgroundNotification?: boolean
+  capability?: string
 }): Promise<UserMessage> {
   if (opts.agentId) throw new Error('receipt consumption requires the native main thread')
   const sourceId = opts.assistantMessage.uuid
@@ -53,7 +56,8 @@ export async function createHttpReceiptInput(opts: {
   }
   // No stdout parsing or caller-supplied epoch. Actual SDK ID is looked up by
   // the gateway, then checked again against this actual native session/tool.
-  const issued = await post('issue', { toolUseId })
+  const issued = opts.backgroundNotification && opts.capability
+    ? { capability: opts.capability } : await post('issue', { toolUseId })
   if (typeof issued.capability !== 'string') throw new Error('missing receipt consumer capability')
   const capability: string = issued.capability
   const offered = await post('input', { ...locator, capability })
@@ -75,7 +79,9 @@ export async function createHttpReceiptInput(opts: {
   const epoch = consumer.parentOwnerEpoch
   const result = JSON.parse(resultJson)
   const text = formatDelegateHttpResult(result.httpStatus, result.body, binding.jobId).text
-  const message = createUserMessage({ content: [{ type: 'tool_result', tool_use_id: toolUseId, content: text }], sourceToolAssistantUUID: sourceId })
+  const message = opts.backgroundNotification
+    ? createUserMessage({ content: [{ type: 'text', text }] })
+    : createUserMessage({ content: [{ type: 'tool_result', tool_use_id: toolUseId, content: text }], sourceToolAssistantUUID: sourceId })
   // Final canonical text is made here, not copied from arbitrary CLI stdout or
   // post-tool hooks. Prevent later mutation before the input admission boundary.
   if (Array.isArray(message.message.content)) {

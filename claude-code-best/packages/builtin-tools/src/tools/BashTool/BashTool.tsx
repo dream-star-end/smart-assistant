@@ -1,3 +1,4 @@
+import { bindReceiptShellCommand } from 'src/utils/receiptToolInvocation.js';
 import { feature } from 'bun:bundle';
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import { copyFile, stat as fsStat, truncate as fsTruncate, link } from 'fs/promises';
@@ -1093,6 +1094,8 @@ async function* runShellCommand({
     shouldUseSandbox: shouldUseSandbox(input),
     shouldAutoBackground,
   });
+
+  bindReceiptShellCommand(shellCommand);
 
   // Start the command execution
   const resultPromise = shellCommand.result;

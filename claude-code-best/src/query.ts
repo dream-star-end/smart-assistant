@@ -1,3 +1,4 @@
+import { hasQueuedReceiptInput, resolveQueuedReceiptInput } from './utils/receiptQueuedInput.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import type {
   ToolResultBlockParam,
@@ -1903,11 +1904,28 @@ async function* queryLoop(
       removeFromQueue(claimedConsumedCommands)
     }
 
+    // A background Bash already returned its tool_result placeholder. Consume
+    // its authenticated receipt as a new user notification, never a second
+    // result for that old tool ID. Only internal queue object identity opts in.
+    const ordinaryAttachmentCommands = []
+    for (const command of queuedAutonomyClaim.attachmentCommands) {
+      if (!hasQueuedReceiptInput(command)) {
+        ordinaryAttachmentCommands.push(command)
+        continue
+      }
+      const receiptInput = await resolveQueuedReceiptInput(command)
+      const admittedMessage = await admitReceiptInput(
+        receiptInput, messagesForQuery.concat(assistantMessages, toolResults),
+      )
+      yield admittedMessage
+      toolResults.push(admittedMessage)
+    }
+
     for await (const attachment of getAttachmentMessages(
       null,
       updatedToolUseContext,
       null,
-      queuedAutonomyClaim.attachmentCommands,
+      ordinaryAttachmentCommands,
       messagesForQuery.concat(assistantMessages, toolResults),
       querySource,
     )) {
