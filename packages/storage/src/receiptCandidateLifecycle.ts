@@ -9,7 +9,8 @@ export interface ReceiptCandidateScope {
   partition: string; userId: string; agentId: string; sessionKey: string
   owner: Record<string, unknown>; clientSessionId?: string
 }
-type Manifest = { v: 1; partition: string; state: 'retired' } |
+export interface ReceiptCandidateDeletionRef { userId: string; clientSessionId: string }
+type Manifest = { v: 1; partition: string; state: 'retired'; deletionRef?: ReceiptCandidateDeletionRef } |
   { v: 1; partition: string; state: 'active'; scope: ReceiptCandidateScope }
 const HASH = /^[a-f0-9]{64}$/
 const MAX_MANIFEST = 16384
@@ -52,6 +53,9 @@ function readManifest(directory: number, partition: string): Manifest | undefine
     const m = JSON.parse(bytes.subarray(0, size).toString()) as Manifest
     if (m.v !== 1 || m.partition !== partition || (m.state !== 'active' && m.state !== 'retired') ||
       (m.state === 'active' && (!m.scope || m.scope.partition !== partition || !m.scope.owner))) throw new Error('invalid receipt candidate manifest')
+    if (m.state === 'retired' && m.deletionRef !== undefined &&
+      (!m.deletionRef || typeof m.deletionRef.userId !== 'string' || !m.deletionRef.userId ||
+       typeof m.deletionRef.clientSessionId !== 'string' || !m.deletionRef.clientSessionId)) throw new Error('invalid receipt candidate deletion reference')
     return m
   } finally { closeSync(fd) }
 }
@@ -150,7 +154,11 @@ export class ReceiptCandidateLifecycle {
       if (!current) return false
       if (current.state === 'active') {
         if (!inactive(current.scope)) return false
-        writeManifest(manifests, { v: 1, partition, state: 'retired' })
+        // Preserve the original exact tenant mapping even if GC later refuses
+        // an unknown inode. A retired partition hash cannot recover this identity.
+        const deletionRef = current.scope.clientSessionId
+          ? { userId: current.scope.userId, clientSessionId: current.scope.clientSessionId } : undefined
+        writeManifest(manifests, { v: 1, partition, state: 'retired', ...(deletionRef ? { deletionRef } : {}) })
       }
       // A previous directory fsync failure may have left visible but unproved
       // retirement. Re-prove it before deleting anything on retry.

@@ -152,3 +152,28 @@ test('actual retire process SIGKILL after durable tombstone and before GC is rec
     await assert.rejects(recovered.withActive(f.scope.partition, () => assert.fail('retired writer')), /unavailable/)
   } finally { clearTimeout(timer); child.kill('SIGKILL'); await closed }
 })
+
+
+test('retired GC refusal preserves exact deletion identity across fresh-instance retries', async () => {
+  const f = fixture()
+  const scope = { ...f.scope, userId: 'tenant-owned', clientSessionId: 'client-owned' }
+  await f.store.register(scope, 'a', () => {})
+  const victim = join(f.dir, 'external-kept'); writeFileSync(victim, 'KEEP')
+  const link = join(f.data, 'cache', 'unknown-link'); symlinkSync(victim, link)
+  const manifest = () => JSON.parse(readFileSync(join(f.store.root, 'namespaces', scope.partition + '.json'), 'utf8'))
+  const expected = { v: 1, partition: scope.partition, state: 'retired',
+    deletionRef: { userId: 'tenant-owned', clientSessionId: 'client-owned' } }
+  await assert.rejects(f.store.retire(scope.partition, () => true), /unknown/)
+  assert.deepEqual(manifest(), expected)
+  const fresh = new ReceiptCandidateLifecycle(f.store.root)
+  await assert.rejects(fresh.retire(scope.partition, () => false), /unknown/)
+  assert.deepEqual(manifest(), expected)
+  assert.equal(readFileSync(victim, 'utf8'), 'KEEP')
+  assert.ok(existsSync(link))
+  // Only the test creator removes its own unknown link; product GC never does.
+  fs.unlinkSync(link)
+  assert.equal(await fresh.retire(scope.partition, () => false), true)
+  assert.equal(existsSync(f.data), false)
+  assert.deepEqual(manifest(), expected)
+  await assert.rejects(fresh.withActive(scope.partition, () => assert.fail('retired writer')))
+})
