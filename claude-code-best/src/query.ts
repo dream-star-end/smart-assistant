@@ -1,4 +1,5 @@
-import { hasQueuedReceiptInput, resolveQueuedReceiptInput } from './utils/receiptQueuedInput.js'
+import { hasQueuedReceiptInput, takeQueuedReceiptInputs } from './utils/receiptQueuedInput.js'
+import { cleanMessagesForLogging } from './utils/sessionStorage.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import type {
   ToolResultBlockParam,
@@ -1941,17 +1942,15 @@ async function* queryLoop(
     // its authenticated receipt as a new user notification, never a second
     // result for that old tool ID. Only internal queue object identity opts in.
     const ordinaryAttachmentCommands = []
+    const queuedReceiptInputs = []
     for (const command of queuedAutonomyClaim.attachmentCommands) {
       if (!hasQueuedReceiptInput(command)) {
         ordinaryAttachmentCommands.push(command)
         continue
       }
-      const receiptInput = await resolveQueuedReceiptInput(command)
-      const admittedMessage = await admitReceiptInput(
-        receiptInput, messagesForQuery.concat(assistantMessages, toolResults),
-      )
-      yield admittedMessage
-      toolResults.push(admittedMessage)
+      const batch = takeQueuedReceiptInputs(command)
+      if (batch?.keepOrdinary) ordinaryAttachmentCommands.push(command)
+      if (batch) queuedReceiptInputs.push(...batch.messages)
     }
 
     for await (const attachment of getAttachmentMessages(
@@ -1965,6 +1964,20 @@ async function* queryLoop(
       const admittedMessage = await admitReceiptInput(
         attachment,
         messagesForQuery.concat(assistantMessages, toolResults),
+      )
+      yield admittedMessage
+      toolResults.push(admittedMessage)
+    }
+
+    // All ordinary queue attachments precede strict receipt input. Each next
+    // receipt sees the previous admitted history; never catch a strict unknown
+    // and write a later sibling or neutral replacement over its native chain.
+    for (const receiptInput of queuedReceiptInputs) {
+      // Queue attachments remain in the model history but are deliberately not
+      // transcript records. Select the parent from the native writer's own
+      // persistable projection, not an attachment UUID it will never store.
+      const admittedMessage = await admitReceiptInput(
+        receiptInput, cleanMessagesForLogging(messagesForQuery.concat(assistantMessages, toolResults)),
       )
       yield admittedMessage
       toolResults.push(admittedMessage)

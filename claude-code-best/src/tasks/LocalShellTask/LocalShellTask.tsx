@@ -190,12 +190,6 @@ async function enqueueShellNotification(
     }
   }
 
-  const receiptNotification = !agentId && shellCommand ? await receiptShellNotification(shellCommand) : undefined;
-  if (receiptNotification) {
-    enqueuePendingNotification(receiptNotification);
-    return;
-  }
-
   const outputPath = getTaskOutputPath(taskId);
   const toolUseIdLine = toolUseId ? `\n<${TOOL_USE_ID_TAG}>${toolUseId}</${TOOL_USE_ID_TAG}>` : '';
   const message = `<${TASK_NOTIFICATION_TAG}>
@@ -205,12 +199,15 @@ async function enqueueShellNotification(
 <${SUMMARY_TAG}>${escapeXml(summary)}</${SUMMARY_TAG}>
 </${TASK_NOTIFICATION_TAG}>`;
 
-  enqueuePendingNotification({
+  const ordinaryNotification = {
     value: message,
-    mode: 'task-notification',
-    priority: feature('MONITOR_TOOL') ? 'next' : 'later',
+    mode: 'task-notification' as const,
+    priority: feature('MONITOR_TOOL') ? 'next' as const : 'later' as const,
     agentId,
-  });
+  };
+  const receiptNotification = !agentId && shellCommand
+    ? await receiptShellNotification(shellCommand, ordinaryNotification, status !== 'completed') : undefined;
+  enqueuePendingNotification(receiptNotification ?? ordinaryNotification);
 }
 /**
  * Keep the shared TaskOutput poller alive for a backgrounded shell so

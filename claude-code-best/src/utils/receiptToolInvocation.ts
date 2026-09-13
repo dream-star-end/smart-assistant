@@ -1,5 +1,5 @@
 import type { ShellCommand } from './ShellCommand.js'
-import { createQueuedReceiptInput } from './receiptQueuedInput.js'
+import { createQueuedReceiptInput, createQueuedReceiptInputs } from './receiptQueuedInput.js'
 import { createDeferredReceiptInput } from './receiptInputAdmission.js'
 import type { QueuedCommand } from '../types/textInputTypes.js'
 import { receiptMcpTargetForSdk } from '../../../packages/gateway/src/receiptOwnerCapability.js'
@@ -21,7 +21,7 @@ type ReceiptScope = {
   toolUseId: string; toolName: string; capability: string; mcpToolName?: string
   env?: Readonly<Record<string, string>>
   backgrounded?: boolean
-  backgroundNotification?: () => Promise<QueuedCommand | undefined>
+  backgroundNotification?: (ordinary?: QueuedCommand, preserveOrdinary?: boolean) => Promise<QueuedCommand | undefined>
   candidate?: ReceiptLocator
 }
 const scopes = new AsyncLocalStorage<ReceiptScope>()
@@ -41,10 +41,10 @@ export function markReceiptShellForegroundResult(shell: ShellCommand): void {
   const scope = shells.get(shell)
   if (scope) scope.backgrounded = false
 }
-export async function receiptShellNotification(shell: ShellCommand): Promise<QueuedCommand | undefined> {
+export async function receiptShellNotification(shell: ShellCommand, ordinary?: QueuedCommand, preserveOrdinary = false): Promise<QueuedCommand | undefined> {
   const scope = shells.get(shell)
   if (!scope?.backgrounded) return undefined
-  try { return await scope.backgroundNotification?.() }
+  try { return await scope.backgroundNotification?.(ordinary, preserveOrdinary) }
   catch { return undefined } // Ordinary/rejected/unknown shells retain their failure notice.
 }
 
@@ -154,18 +154,26 @@ export async function prepareReceiptToolInvocation(opts: {
       openDelivery: () => openReceiptDelivery(process.env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim() || join(home, 'delegate-jobs.db')),
       ...(backgroundNotification ? { backgroundNotification: true, capability } : {}) })
   }
-  scope.backgroundNotification = async () => {
+  scope.backgroundNotification = async (ordinary, preserveOrdinary) => {
     const snapshot = readLocators()
-    // Multi-background is not yet enrolled: retain ordinary shell notification,
-    // and the existing durable recovery for ALL receipts, never just the last.
-    if (snapshot.invalid || snapshot.locators.length !== 1) return undefined
-    const locator = snapshot.locators[0]!
-    const status = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
-      headers: gatewayDelegateHeaders(), body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
-    })
-    if (!scope.backgrounded || status.statusCode !== 200 || JSON.parse(status.body).status !== 'ready') return undefined
+    // Decide before filtering: one ready sibling must not turn a compound or
+    // failed shell into the old single-receipt branch and hide its failure.
+    const compound = snapshot.invalid || snapshot.locators.length > 1 || preserveOrdinary
+    if (!snapshot.locators.length || (compound && !ordinary)) return undefined
+    const candidates = await Promise.all(snapshot.locators.map(async locator => {
+      try {
+        const status = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/status', {
+          headers: gatewayDelegateHeaders(), body: JSON.stringify({ ...locator, capability }), timeoutMs: 5000,
+        })
+        return status.statusCode === 200 && JSON.parse(status.body).status === 'ready' ? locator : undefined
+      } catch { return undefined }
+    }))
+    const ready = candidates.filter((locator): locator is ReceiptLocator => locator !== undefined)
+    if (!scope.backgrounded || !ready.length) return undefined
     // Do not open a DB or fetch result bytes until the real query input boundary.
-    return createQueuedReceiptInput(() => input(locator, true))
+    return compound
+      ? createQueuedReceiptInputs(ready.map(locator => () => input(locator, true)), ordinary!)
+      : createQueuedReceiptInput(() => input(ready[0]!, true))
   }
   let finished: Promise<{ mode: 'replace' | 'append'; messages: UserMessage[] } | undefined> | undefined
   return {

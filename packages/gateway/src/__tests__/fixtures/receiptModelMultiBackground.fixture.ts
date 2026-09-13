@@ -1,0 +1,173 @@
+/** Actual CCB CLI probe; no SDK/process/query stubs. Only parent lookup and child executor are fixtures. */
+import Database from 'better-sqlite3'
+import {ReceiptDeliveryCoordinator,type ReceiptSqlValue} from '../../../../storage/src/receiptDeliveryCoordinator.js'
+import {fileURLToPath} from 'node:url'
+import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { randomBytes } from 'node:crypto'
+import { mkdirSync,writeFileSync,readFileSync,readdirSync,existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { Gateway } from '../../server.js'
+import { SubprocessRunner } from '../../subprocessRunner.js'
+import { CcbAdapter } from '../../engine/ccbAdapter.js'
+import { DelegateDurableDb } from '../../delegateDurable.js'
+import { DelegateJobStore } from '../../delegateJobs.js'
+const requestedMode=process.argv[3] || 'success', wrapped=false, mcp=false
+assert.ok(['success','failure','partial','stop','notify-loser'].includes(requestedMode))
+const mode=requestedMode==='stop'?'stop':'create'
+const expectedCount=requestedMode==='partial'?1:2
+const expectedInputs=mode==='stop'?0:requestedMode==='notify-loser'?1:expectedCount
+let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
+const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
+const dir=process.argv[2]; assert.ok(dir)
+mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
+const token=randomBytes(32).toString('hex'), session='agent:main:webchat:dm:real-model-cli', turnKey='real-model-cli-turn'
+const requests:any[]=[], sdk:any[]=[], http:any[]=[]
+let phase=0, executions=0, received=false, discovered=false, failure:any
+let adapter:CcbAdapter, runner:SubprocessRunner, turn:any
+const sentinel='REAL_MODEL_CLI_AUTHORITATIVE_RESULT'
+const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate --agent-id coding-assistant --goal synthetic-child-only`
+const donePath=join(dir,'shell-finished.txt')
+const command=cli+'; '+cli.replace('synthetic-child-only','synthetic-child-two').replace('coding-assistant',requestedMode==='partial'?'main':'coding-assistant')+`; printf ORDINARY_MULTI_STDOUT; printf ORDINARY_MULTI_STDERR >&2; printf finished > ${JSON.stringify(donePath)}; exit ${['failure','partial'].includes(requestedMode)?7:0}`
+function send(res:any,body:any,tool:boolean,wait=false,discover=false) {
+ const id='synthetic_'+randomBytes(6).toString('hex');
+ let content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:mcp?`mcp__openclaude-memory__${wait?'delegate_wait':'delegate_task'}`:'Bash',input:mcp?(wait?{jobId:(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id,waitMs:10000}:{agentId:'coding-assistant',goal:'synthetic-child-only'}):{command:wait?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id}`:command,timeout:20000,run_in_background:true}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ if(wait && tool) content={type:'tool_use',id:'real_waiter',name:'Bash',input:{command:'sleep 1; printf background-checkpoint',timeout:20000}}
+ if(wrapped && tool) {
+   content=discover?{type:'tool_use',id:'real_discovery',name:'SearchExtraTools',input:{query:'select:mcp__openclaude-memory__delegate_task,mcp__openclaude-memory__delegate_wait'}}:
+     {...content,name:'ExecuteExtraTool',input:{tool_name:content.name,params:content.input}}
+ }
+ const message={id,type:'message',role:'assistant',model:body.model,content:[content],stop_reason:tool?'tool_use':'end_turn',stop_sequence:null,usage:{input_tokens:10,output_tokens:10}}
+ if(!body.stream){res.setHeader('Content-Type','application/json');res.end(JSON.stringify(message));return}
+ res.setHeader('Content-Type','text/event-stream')
+ const emit=(event:string,data:any)=>res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+ emit('message_start',{type:'message_start',message:{...message,content:[],stop_reason:null}})
+ emit('content_block_start',{type:'content_block_start',index:0,content_block:tool?{...content,input:{}}:{type:'text',text:''}})
+ emit('content_block_delta',{type:'content_block_delta',index:0,delta:tool?{type:'input_json_delta',partial_json:JSON.stringify(content.input)}:{type:'text_delta',text:content.text}})
+ emit('content_block_stop',{type:'content_block_stop',index:0})
+ emit('message_delta',{type:'message_delta',delta:{stop_reason:message.stop_reason,stop_sequence:null},usage:{output_tokens:10}})
+ emit('message_stop',{type:'message_stop'});res.end()
+}
+const upstream=createServer(async(req,res)=>{
+ try {
+  let raw='';for await(const c of req)raw+=c
+  const body=JSON.parse(raw||'{}')
+  assert.ok(req.headers['x-api-key']==='synthetic-local-only'||req.headers.authorization==='Bearer synthetic-local-only','only synthetic upstream auth permitted')
+  requests.push({path:req.url,method:req.method,model:body.model,stream:body.stream,containsSentinel:raw.includes(sentinel),toolNames:body.tools?.map((t:any)=>t.name)})
+  if(req.url?.includes('count_tokens')) {res.end(JSON.stringify({input_tokens:100}));return}
+  if(!req.url?.startsWith('/v1/messages')){res.statusCode=404;res.end('{}');return}
+  const main=body.tools?.some((t:any)=>t.name===(wrapped?'ExecuteExtraTool':mcp?'mcp__openclaude-memory__delegate_task':'Bash'))
+  if(main&&wrapped&&!discovered){
+    assert.ok(!body.tools.some((t:any)=>t.name==='mcp__openclaude-memory__delegate_task'),'default MCP must remain deferred')
+    discovered=true;send(res,body,true,false,true)
+  }
+  else if(main&&phase===0){
+    if(wrapped)assert.ok(raw.includes('Found 2 deferred tool'),'actual discovery must finish before execution')
+    phase++;send(res,body,true)
+  }
+  else if(main&&phase===1){
+     assert.ok(!raw.includes(sentinel),'background placeholder cannot contain result')
+     const deadline=Date.now()+20000
+     while(executions!==1){assert.ok(Date.now()<deadline,'create deadline');await new Promise(r=>setTimeout(r,20))}
+     releaseChild()
+     while(!existsSync(donePath)){
+       assert.ok(Date.now()<deadline,'authenticated shell notification deadline');await new Promise(r=>setTimeout(r,20))
+     }
+     while(http.filter(r=>r.path==='/api/delegate/receipt-owner/status'&&r.status===200).length<expectedCount*2){
+       assert.ok(Date.now()<deadline,'actual shell receipt confirmation deadline');await new Promise(r=>setTimeout(r,20))
+     }
+     phase++;send(res,body,true,true)
+   }
+  else {if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
+ }catch(e){failure=e;res.statusCode=500;res.end('{}')}
+})
+await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r))
+const upstreamPort=(upstream.address() as any).port
+const dbPath=join(dir,'delegate-jobs.db'),db=new DelegateDurableDb(dbPath)
+const jobs=new DelegateJobStore({durable:db,sm:true,deliveryReceipts:true})
+const config:any={version:1,gateway:{bind:'127.0.0.1',port:0,accessToken:token},auth:{mode:'subscription',claudeCodePath:join(root,'claude-code-best'),claudeCodeEntry:'scripts/dev.ts'},sessions:{dbPath:join(dir,'sessions.db')},defaults:{model:'claude-sonnet-4-5-20250929',permissionMode:'bypassPermissions'},channels:{webchat:{enabled:true}},terminal:{type:'local'}}
+const gw=new Gateway({config,agentsConfig:{agents:[{id:'main',model:config.defaults.model}],routes:[],default:'main'}} as any)
+;(gw as any)._delegateJobs=jobs;(gw as any)._delegateReconcileReady=true;(gw as any)._readDelegateMemoryPressure=()=>null
+;(gw as any)._runDelegateTask=async(input:any)=>{
+ const execution=++executions;const claim=jobs.claimQueued(input.backgroundJobId);assert.ok(claim.ok)
+ input.claimToken=claim.claimToken;input.fencingEpoch=claim.fencingEpoch
+ await childGate
+ ;(gw as any)._releasePreadmittedDelegateCapacity(input)
+ return {kind:'completed',ok:true,output:sentinel+execution,sessionKey:input.sessionKey}
+}
+let electedNotify=false
+const server=createServer(async(req,res)=>{res.on('finish',()=>http.push({path:req.url,status:res.statusCode}));
+ try {
+  if(req.url==='/api/delegate/receipt-owner/input') {
+   if(mode==='stop')adapter.interrupt()
+   if(requestedMode==='notify-loser'&&!electedNotify) {
+    electedNotify=true
+    const row=(db as any).db.prepare('SELECT job_id FROM delegate_delivery_receipt ORDER BY rowid LIMIT 1').get()
+    const binding=db.getDeliveryReceipt(row.job_id,0)!
+    const delivery=new ReceiptDeliveryCoordinator(dbPath,path=>{
+      const conn=new Database(path,{fileMustExist:true})
+      return {exec:sql=>conn.exec(sql),prepare:sql=>conn.prepare<ReceiptSqlValue[]>(sql),transaction:write=>conn.transaction(write),close:()=>conn.close()}
+    })
+    try{assert.equal(await delivery.recover(binding,async()=>({kind:'absent'}),async()=>'inactive'),'notify_ready')}
+    finally{delivery.close()}
+   }
+  }
+  void(gw as any).handleHttp(req,res)
+ }catch(error){failure=error;res.statusCode=500;res.end('{}')}
+})
+await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const port=(server.address() as any).port;config.gateway.port=port
+writeFileSync(join(dir,'token'),token,{mode:0o600})
+process.env.OPENCLAUDE_GATEWAY_PORT=String(port);process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE=join(dir,'token')
+process.env.OPENCLAUDE_HOME=dir;process.env.OPENCLAUDE_DELEGATE_JOBS_DB=dbPath
+if(mcp)process.env.OPENCLAUDE_DELEGATE_CURSOR_FAST_WAIT_MS='5000'
+process.env.CLAUDE_CONFIG_DIR=join(dir,'native');process.env.OPENCLAUDE_RECEIPT_CALLER_V2='1'
+const providerEnvOverride={...(mcp&&!wrapped?{ENABLE_SEARCH_EXTRA_TOOLS:'false'}:{}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
+runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
+adapter=new CcbAdapter({harness:'ccb'} as any,runner)
+const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}
+;(gw as any).sessions={getByKey:(key:string)=>key===session?parent:undefined}
+runner.on('message',(m:any)=>{sdk.push(m);if(m.type==='control_request'&&m.request?.subtype==='can_use_tool')runner.sendPermissionResponse(m.request_id,{behavior:'allow',updatedInput:m.request.input} as any)})
+runner.on('stderr',(line:any)=>{process.stderr.write(String(line)+'\n')})
+runner.on('error',(e:any)=>{failure=e})
+process.once('SIGTERM',()=>{failure=Error('fixture terminated');turn?.end();void runner.shutdown()})
+let timer:ReturnType<typeof setTimeout>|undefined
+try {
+ turn=adapter.submitTurn({input:'RECEIPT_MODEL_PROBE: run synthetic child command then report its result.',turnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()} as any)
+ await Promise.race([turn.submitted,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('submit deadline')),60000)})]);clearTimeout(timer)
+ const result=await Promise.race([turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn deadline')),90000)})]);clearTimeout(timer)
+ writeFileSync(join(dir,'receipt-rows.json'),JSON.stringify((db as any).db.prepare('SELECT * FROM delegate_delivery_receipt').all(),null,2));assert.ok(!failure,String(failure));assert.equal(executions,expectedCount);assert.equal(received,mode!=='stop')
+ assert.ok(runner.sessionId);assert.equal(phase,mode==='stop'?2:3)
+ const rows=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt ORDER BY rowid').all();assert.equal(rows.length,expectedCount)
+ const row=rows[0]
+ for(const [i,receipt] of rows.entries()){
+  assert.equal(receipt.state,mode==='stop'?'offered':requestedMode==='notify-loser'&&i===0?'notify_pending':'ingested');assert.equal(receipt.native_tool_use_id,'real_creator')
+ }
+ assert.equal(new Set(rows.map((r:any)=>r.receipt_nonce_hash)).size,expectedCount)
+ if(mode!=='stop') {
+  const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
+  const modelResults=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id==='real_creator'):[])
+  const nativeResults=sdk.flatMap((m:any)=>m.type==='user'&&Array.isArray(m.message?.content)?m.message.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id==='real_creator'):[])
+  assert.equal(modelResults.length,1);assert.equal(nativeResults.length,1);assert.deepEqual(modelResults[0].content,nativeResults[0].content)
+   assert.ok(!JSON.stringify(modelResults).includes(sentinel),'no duplicate tool result')
+   const resultTexts=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='text'&&c.text.includes(sentinel)):[])
+   assert.equal(resultTexts.length,expectedInputs,'each input-owned receipt admitted exactly once')
+   const ordinary=JSON.stringify(modelMessages)
+   assert.ok(ordinary.includes('<status>'+(['failure','partial'].includes(requestedMode)?'failed':'completed')+'</status>'))
+   assert.ok(ordinary.includes('<output-file>'))
+   if(['failure','partial'].includes(requestedMode))assert.ok(ordinary.includes('exit code 7'))
+   const output=String(modelResults[0].content).split('Output is being written to: ')[1]
+   const outputText=readFileSync(output,'utf8');assert.ok(outputText.includes('ORDINARY_MULTI_STDOUT')&&outputText.includes('ORDINARY_MULTI_STDERR'))
+   assert.ok(!outputText.includes(sentinel),'ordinary CLI output is not authoritative receipt content')
+   writeFileSync(join(dir,'shell-output-proof.json'),JSON.stringify({stdout:true,stderr:true,failed:['failure','partial'].includes(requestedMode)}))
+ }
+ if(mode==='stop')assert.ok(!sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(sentinel)))
+ process.stdout.write('MODEL_PROBE_PASS '+JSON.stringify({mode:requestedMode,nativeSession:runner.sessionId,phase,executions,received,isError:result?.isError,receiptState:row.state})+'\n')
+} catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n'+JSON.stringify({requests,http,sdkErrors:sdk.filter((m:any)=>m.type==='user'||m.type==='result').map((m:any)=>({type:m.type,message:m.message,errors:m.errors}))})+'\n')}
+finally {
+ clearTimeout(timer);releaseChild();turn?.end();await runner.shutdown();server.closeAllConnections();upstream.closeAllConnections()
+ await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r()))])
+ writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup and child executor fixture'},null,2))
+ jobs.close()
+}
+
+process.exitCode=failure?1:0
