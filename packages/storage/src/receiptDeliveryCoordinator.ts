@@ -150,10 +150,13 @@ export class ReceiptDeliveryCoordinator {
       if (parent !== 'inactive') return 'pending'
       opts.signal?.throwIfAborted()
       const token = randomBytes(24).toString('hex')
+      const previousState = row.state
+      const previousToken = row.owner_token ?? null
+      if (previousToken !== null && typeof previousToken !== 'string') throw new Error('invalid receipt owner token')
       this.db.transaction(() => {
         const changed = this.db.prepare(`UPDATE delegate_delivery_receipt SET state='notify_pending',owner_token=?,updated_at=?
           WHERE job_id=? AND generation=? AND state=? AND owner_token IS ?`)
-          .run(token, this.now(), binding.jobId, binding.generation, row.state, row.owner_token ?? null)
+          .run(token, this.now(), binding.jobId, binding.generation, previousState, previousToken)
         if (changed.changes !== 1) throw new Error('receipt notification owner CAS lost')
         const job = this.db.prepare(`UPDATE delegate_jobs SET callback='origin-inject',callback_state='pending',
           callback_epoch=callback_epoch+1,notify_retry_at=NULL,notify_delivery_token=NULL,notify_claimed_until=NULL,

@@ -31,7 +31,7 @@ beforeEach(async () => {
   getProjectDir.cache.clear?.()
   resetProjectForTesting()
   clearSessionMessagesCache()
-  switchSession(randomUUID())
+  switchSession(randomUUID() as ReturnType<typeof getSessionId>)
 })
 afterEach(async () => {
   await flushSessionStorage()
