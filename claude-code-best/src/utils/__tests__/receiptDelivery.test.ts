@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, rename, symlink, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { getSessionId, switchSession } from '../../bootstrap/state.js'
 import type { Message } from '../../types/message.js'
@@ -206,6 +206,110 @@ test('schema11 Bun recovery and notification ACK keep the original owner and one
   expect((await f.delivery.dispatchNotification(f.binding, async () => { calls++; })).kind).toBe('already_notified')
   expect(calls).toBe(1)
 }, 60000)
+
+/** Independent native consumer, with no inherited credentials/network endpoints. */
+async function freshBun(source: string): Promise<any> {
+  const child = Bun.spawn([process.execPath, '-e', source], {
+    cwd: join(root, 'claude-code-best'),
+    env: { PATH: process.env.PATH!, HOME: dir, CLAUDE_CONFIG_DIR: dir, NODE_ENV: 'test', TEST_ENABLE_SESSION_PERSISTENCE: '1' },
+    stdout: 'pipe', stderr: 'pipe',
+  })
+  const watchdog = setTimeout(() => child.kill('SIGKILL'), 20000)
+  try {
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+    expect({ code, err }).toEqual({ code: 0, err: '' })
+    return JSON.parse(out.trim())
+  } finally {
+    clearTimeout(watchdog)
+    if (child.exitCode === null) child.kill('SIGKILL')
+    await child.exited
+  }
+}
+function c0Reopen(f: Awaited<ReturnType<typeof fixture>>, ack = false) {
+  return JSON.parse(node(`
+    import {DelegateDurableDb} from './packages/gateway/src/delegateDurable.ts';
+    import {DelegateJobStore} from './packages/gateway/src/delegateJobs.ts';
+    const db=new DelegateDurableDb(${JSON.stringify(f.dbPath)});
+    const jobs=new DelegateJobStore({durable:db,sm:true});
+    const before=jobs.userFailureInbox('3').count;
+    const acked=${ack} ? jobs.acknowledgeUserFailure('3',${JSON.stringify(f.binding.jobId)},0) : null;
+    console.log(JSON.stringify({floor:db.minimumConsumer,admission:jobs.acceptsDeliveryReceipts,
+      sources:jobs.acceptsNewFailureSources,inbox:jobs.userFailureInbox('3').count,acked,...(${ack}?{before}:{})}));jobs.close();
+  `))
+}
+function freshRecoverySource(f: Awaited<ReturnType<typeof fixture>>) {
+  return `
+    import {openReceiptDelivery} from './src/utils/receiptSqlite.ts';
+    import {observeStrictReceiptInput} from './src/utils/sessionStorage.ts';
+    const store=await openReceiptDelivery(${JSON.stringify(f.dbPath)});
+    const result=await store.recover(${JSON.stringify(f.binding)},claim=>observeStrictReceiptInput(claim.proof),async()=>'inactive');
+    store.close();console.log(JSON.stringify({result,pid:process.pid}));
+  `
+}
+
+test('D17 closed C0 admission preserves real native unknown and fresh Bun recovers the original input exactly once', async () => {
+  const f = await fixture()
+  expect(c0Reopen(f)).toEqual({ floor: 2, admission: false, sources: false, inbox: 1, acked: null })
+  f.sql("CREATE TRIGGER private_ack_fault BEFORE UPDATE OF state ON delegate_delivery_receipt WHEN NEW.state='ingested' BEGIN SELECT RAISE(ABORT,'private ACK fault'); END")
+  bindCoordinatedReceiptInput(f.result, f.delivery, f.binding, f.parent)
+  await expect(admitReceiptInput(f.result, f.history)).rejects.toThrow('private ACK fault')
+  const committed = f.inspect()
+  expect(committed.receipt.state).toBe('ingest_claimed')
+  f.sql('DROP TRIGGER private_ack_fault')
+  const proof = JSON.parse(committed.receipt.input_proof)
+  const native = JSON.parse(proof.recordLocator)[0] as string
+  const rel = relative(dir, native)
+  expect(rel.startsWith('..') || rel.startsWith('/')).toBe(false)
+  const saved = native + '.private-saved'
+  await rename(native, saved)
+  await symlink(saved, native)
+  try {
+    const unknown = await freshBun(freshRecoverySource(f))
+    expect(unknown.pid).not.toBe(process.pid)
+    expect(unknown.result).toBe('unknown')
+    const retained = f.inspect()
+    expect(retained.receipt.state).toBe('ingest_claimed')
+    expect(retained.job.callback_state).toBe('none')
+  } finally { await unlink(native); await rename(saved, native) }
+  expect((await freshBun(freshRecoverySource(f))).result).toBe('ingested')
+  expect((await freshBun(freshRecoverySource(f))).result).toBe('already_ingested')
+  const restored = await freshBun(`
+    import {loadFullLog} from './src/utils/sessionStorage.ts';
+    const log=await loadFullLog({isLite:true,sessionId:${JSON.stringify(proof.nativeSessionId)},fullPath:${JSON.stringify(native)},
+      messages:[],date:'',value:0,created:new Date(),modified:new Date(),firstPrompt:'',messageCount:3,isSidechain:false});
+    console.log(JSON.stringify(log.messages.filter(m=>m.uuid===${JSON.stringify(f.result.uuid)})));
+  `)
+  expect(restored).toHaveLength(1)
+  expect(JSON.stringify(restored)).toContain('EXACT_CHILD_FAILURE')
+  expect(f.inspect().job.callback_state).toBe('none')
+  expect(c0Reopen(f, true)).toEqual({ floor: 2, admission: false, sources: false, inbox: 0, acked: true, before: 1 })
+  expect(c0Reopen(f).inbox).toBe(0)
+}, 90000)
+
+test('D17 closed C0 admission preserves pending notification and inbox across independent consumers', async () => {
+  const f = await fixture()
+  expect(c0Reopen(f).admission).toBe(false)
+  expect((await freshBun(freshRecoverySource(f))).result).toBe('notify_ready')
+  const before = f.inspect()
+  expect(before.receipt.state).toBe('notify_pending')
+  expect(c0Reopen(f).inbox).toBe(1)
+  const notifySource = `
+    import {openReceiptDelivery} from './src/utils/receiptSqlite.ts';
+    const store=await openReceiptDelivery(${JSON.stringify(f.dbPath)});let calls=0;
+    const result=await store.dispatchNotification(${JSON.stringify(f.binding)},async claim=>{
+      calls++;if(!claim.isLive()||!claim.markAAttempted()||!claim.ackDelivered())throw Error('original ACK failed');
+      return 'private receiver substitute, not a real master';
+    });store.close();console.log(JSON.stringify({kind:result.kind,calls}));
+  `
+  expect(await freshBun(notifySource)).toEqual({ kind: 'attempted', calls: 1 })
+  expect(await freshBun(notifySource)).toEqual({ kind: 'already_notified', calls: 0 })
+  expect(f.inspect().receipt.state).toBe('notified')
+  expect(f.inspect().job.callback_state).toBe('delivered')
+  // Notification ACK is not the user dismissal ACK.
+  expect(c0Reopen(f).inbox).toBe(1)
+  expect(c0Reopen(f, true).acked).toBe(true)
+  expect(c0Reopen(f).inbox).toBe(0)
+}, 90000)
 
 test('Bun rejects stale parent, wrong native tool and cross-user bindings before original input writes', async () => {
   const f = await fixture()
