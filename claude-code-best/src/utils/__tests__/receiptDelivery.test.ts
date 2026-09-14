@@ -189,6 +189,24 @@ test('Bun transaction rolls back both receipt and callback when job-update fails
   expect(f.inspect().job.callback_state).toBe('none')
 }, 60000)
 
+test('schema11 Bun recovery and notification ACK keep the original owner and one delivery', async () => {
+  const f = await fixture()
+  expect(await f.delivery.recover(f.binding, async () => ({ kind: 'absent' }), async () => 'inactive')).toBe('notify_ready')
+  let calls = 0
+  const delivered = await f.delivery.dispatchNotification(f.binding, async claim => {
+    calls++
+    expect(claim.isLive()).toBe(true)
+    expect(claim.markAAttempted()).toBe(true)
+    expect(claim.ackDelivered()).toBe(true)
+    return 'private durable receiver substitute'
+  })
+  expect(delivered.kind).toBe('attempted')
+  expect(f.inspect().receipt.state).toBe('notified')
+  expect(f.inspect().job.callback_state).toBe('delivered')
+  expect((await f.delivery.dispatchNotification(f.binding, async () => { calls++; })).kind).toBe('already_notified')
+  expect(calls).toBe(1)
+}, 60000)
+
 test('Bun rejects stale parent, wrong native tool and cross-user bindings before original input writes', async () => {
   const f = await fixture()
   expect(() => bindCoordinatedReceiptInput(f.result, f.delivery, { ...f.binding, nativeToolUseId: 'other' }, f.parent))
