@@ -230,6 +230,36 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       await appPage.getByRole("dialog", { name: "后台任务失败收件箱" }).waitFor();
       await appContext.close();
     });
+    await journey("actual navigation and sole Composer Stop use original App and offline ChatSocket", async () => {
+      api.enableAppSessions();
+      const appContext = await isolate(await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 1000 } }));
+      const p = await appContext.newPage(); p.setDefaultTimeout(15_000);
+      const appErrors = []; p.on("pageerror", e => appErrors.push(e.message));
+      await p.addInitScript(() => { window.WebSocket = undefined; localStorage.setItem("oc_auth_hint", "1"); });
+      try {
+        await p.goto(api.url);
+        const failureBadge = p.getByTestId("delegate-failure-footer").getByRole("button", { name: /失败/ });
+        await failureBadge.waitFor();
+        await p.waitForURL(/session-other/);
+        const acks = api.ackCalls.length, writes = api.sessionWrites.length;
+        assert.equal(api.sessionReads.includes("session-alice"), false, "source not loaded by aggregate inbox GET");
+        await failureBadge.click();
+        const inbox = p.getByRole("dialog", { name: "后台任务失败收件箱" });
+        await inbox.locator("li[data-job-id]").first().getByRole("button", { name: "查看原会话", exact: true }).click();
+        await inbox.waitFor({ state: "hidden" }); await p.waitForURL(/session-alice/);
+        assert.equal(api.sessionReads.includes("session-alice"), true, "original selectSession triggered exact parent history GET");
+        assert.equal(api.sessionWrites.length, writes, "navigation does not recreate source");
+        assert.equal(api.ackCalls.length, acks);
+        await p.getByPlaceholder(/和「.*」对话/).fill("D15 private offline Stop proof");
+        await p.getByRole("button", { name: "发送", exact: true }).click();
+        const stop = p.getByRole("button", { name: "停止", exact: true }); await stop.waitFor();
+        assert.equal(await stop.count(), 1); assert.equal(await p.getByRole("button", { name: "停止本轮", exact: true }).count(), 0);
+        await stop.click(); await p.getByRole("button", { name: "发送", exact: true }).waitFor();
+        assert.equal(api.ackCalls.length, acks); assert.deepEqual(appErrors, []);
+        t.diagnostic("actual App→selectSession/history + Composer→original ChatSocket offline queue Stop; no running model/PTY stop claim");
+      } catch (error) { t.diagnostic(JSON.stringify({ body: (await p.locator("body").innerText()).slice(-3500), appErrors, reads: api.sessionReads, writes: api.sessionWrites })); throw error; }
+      finally { await appContext.close(); }
+    });
     assert.deepEqual(errors, []);
     assert.deepEqual(external, [], "no request may escape private loopback fixture");
     t.diagnostic("real HTTP + original SQLite projection/ACK/action replay; native eligibility, principal auth and lifecycle are fixture seams; no production/master/model claim");

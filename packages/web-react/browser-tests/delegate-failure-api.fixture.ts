@@ -30,7 +30,8 @@ export async function createFailureUiServer(html: (path: string) => string) {
   const reopen = () => { jobs.close(); db.close(); db = new DelegateDurableDb(path);
     jobs = new DelegateJobStore({ sm: true, durable: db, failureInbox: true, maxJobs: 200, now: () => now }); };
   reopen();
-  let failAck = false, dropRetry = false, unavailable = false;
+  let failAck = false, dropRetry = false, unavailable = false, appSessions = false;
+  const sessionReads: string[] = [], sessionWrites: string[] = [];
   const retryKeys: DelegateRetryActionKey[] = [], ackCalls: string[] = [];
   const nativeUnavailable = new Set<string>();
   let heldSummary: { started: () => void; release: (() => void) | null; closed: boolean } | null = null;
@@ -86,14 +87,23 @@ export async function createFailureUiServer(html: (path: string) => string) {
       else if (url.pathname === "/api/public/models") body = { models: [{ id: "glm-5.2", display_name: "GLM-5.2", engine: "ccb" }] };
       else if (url.pathname === "/api/me/preferences") body = { prefs: { default_model: "glm-5.2" } };
       else if (url.pathname === "/api/agent/status") body = { runtime_ready: true, container: { id: "private", status: "running" }, subscription: { status: "active" } };
-      else if (url.pathname === "/api/sessions/list") body = { sessions: [] };
+      else if (url.pathname === "/api/sessions/list") body = { sessions: appSessions ? [
+        { id: "session-other", title: "另一会话", agentId: "main", updatedAt: now + 1, createdAt: now, lastAt: now + 1, messageCount: 0, modelId: "glm-5.2" },
+        { id: "session-alice", title: "失败来源会话", agentId: "main", updatedAt: now, createdAt: now, lastAt: now, messageCount: 0, modelId: "glm-5.2" },
+      ] : [] };
+      else if (/^\/api\/sessions\/[^/]+$/.test(url.pathname)) {
+        const id = url.pathname.split("/").at(-1)!;
+        if (req.method === "GET") { sessionReads.push(id); body = { id, agentId: "main", title: id, messages: [], updatedAt: now }; }
+        else { sessionWrites.push(`${req.method}:${id}`); body = { ok: true, updatedAt: now }; }
+      }
       else if (url.pathname === "/api/marketplace/my-agents") body = { agents: [{ id: "main", slug: "main", name: "全能助手", installed: true, isDefault: true }] };
       res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(body)); return;
     }
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end(html(url.pathname));
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  return { url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, ids, ackCalls, retryKeys, reopen,
+  return { url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, ids, ackCalls, retryKeys, reopen, sessionReads, sessionWrites,
+    enableAppSessions: () => { appSessions = true; },
     failNextAck: () => { failAck = true; }, dropNextRetry: () => { dropRetry = true; },
     setUnavailable: (v: boolean) => { unavailable = v; },
     setNativeUnavailable: (id: string, value: boolean) => { if (value) nativeUnavailable.add(id); else nativeUnavailable.delete(id); },
