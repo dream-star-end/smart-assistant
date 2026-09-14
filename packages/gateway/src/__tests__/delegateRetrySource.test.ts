@@ -269,12 +269,16 @@ test('D14 lifecycle per-ref failure and bad candidate metadata do not block heal
     await storage.deleteClientSession(f.peerId, 'c:7'); await storage.deleteClientSession(badPeer, 'c:7')
     f.sql.exec(`CREATE TRIGGER private_fence_failure BEFORE UPDATE ON delegate_retry_source
       WHEN OLD.parent_client_session_id='${badPeer}' BEGIN SELECT RAISE(ABORT,'private fence failure'); END`)
-    mkdirSync(join(home, 'receipt-candidates-v1', 'namespaces'), { recursive: true }); writeFileSync(badManifest, '{unknown-private-manifest')
+    mkdirSync(join(home, 'receipt-candidates-v1', 'namespaces'), { recursive: true, mode: 0o700 })
+    writeFileSync(badManifest, '{unknown-private-manifest', { mode: 0o600 })
     // A separate Gateway/store/connection, no runtime parent or candidate for the good source.
     fresh = new Gateway(f.gw.deps); fresh.sessions = { getByKey: () => undefined }
     fresh._delegateJobs = new DelegateJobStore({ durable: new DelegateDurableDb(f.path), sm: true })
     await fresh._sweepReceiptCandidates()
     retired(f, made.data.jobId); assert.ok(f.db.getRetrySource('c:7', bad.jobId, 0))
+    assert.equal(fresh.receiptCandidates().snapshots().pending, 1, 'actual malformed manifest, not a directory-permission fixture error')
+    assert.equal(f.sql.prepare('SELECT 1 FROM delegate_retry_parent_fence WHERE user_id=? AND client_session_id=?').get('c:7', badPeer), undefined,
+      'late retirement SQL fault must roll back the earlier fence INSERT')
     assert.ok(fresh._receiptCandidateTimer); assert.equal(readFileSync(badManifest, 'utf8'), '{unknown-private-manifest')
     assert.equal((await userRequest(f, '/api/delegates/summary')).status, 503)
     f.sql.exec('DROP TRIGGER private_fence_failure')
