@@ -2122,13 +2122,18 @@ cutover_survivor_script() {
 
 # phase 必须在覆盖第一个 unit 之前落盘;写失败不得 || true 吞掉。
 cutover_persist_phase() {
-  local phase="$1" state script
+  local phase="$1" state consumer_state script
   CUTOVER_PHASE="$phase"
   state="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
-  [[ -f "$state" && ! -L "$state" ]] || return 0
+  consumer_state="${SURVIVOR_CONSUMER_STATE:-/opt/openclaude/openclaude-v5-selfhost-releases/.consumer-transition.state}"
+  # Loss of the volatile projection cannot silently skip an enrolled phase.
+  # Invalid durable objects go through the strict reader, never legacy fallback.
+  if [[ ! -e "$consumer_state" && ! -L "$consumer_state" ]]; then
+    [[ -f "$state" && ! -L "$state" ]] || return 0
+  fi
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script,无法持久化 phase=$phase"; return 1; }
-  SURVIVOR_STATE="$state" bash "$script" --set-phase "$phase"
+  SURVIVOR_STATE="$state" SURVIVOR_CONSUMER_STATE="$consumer_state" bash "$script" --set-phase "$phase"
 }
 
 cutover_persist_phase_or_compensate() { # <phase> <reason>

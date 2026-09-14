@@ -6,6 +6,10 @@ set -euo pipefail
 
 SURVIVOR_STATE="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
 SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
+# Consumer facts survive reboot. /run remains only a legacy projection, never
+# fallback authority once this original transition has been consumer-enrolled.
+SURVIVOR_CONSUMER_STATE="${SURVIVOR_CONSUMER_STATE:-/opt/openclaude/openclaude-v5-selfhost-releases/.consumer-transition.state}"
+SURVIVOR_CONSUMER_HELPER="${SURVIVOR_CONSUMER_HELPER:-$(dirname -- "${BASH_SOURCE[0]}")/lib/delegate-consumer-state.py}"
 SURVIVOR_RESTORE="${SURVIVOR_RESTORE:-/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh}"
 SURVIVOR_POLL_SEC="${SURVIVOR_POLL_SEC:-2}"
 SURVIVOR_MAX_LOOPS="${SURVIVOR_MAX_LOOPS:-900}"
@@ -91,8 +95,30 @@ phase_health_may_skip_restore() {
   esac
 }
 
+consumer_state_exists() {
+  [[ -e "$SURVIVOR_CONSUMER_STATE" || -L "$SURVIVOR_CONSUMER_STATE" ]]
+}
+
+consumer_state() {
+  [[ -f "$SURVIVOR_CONSUMER_HELPER" && ! -L "$SURVIVOR_CONSUMER_HELPER" ]] || {
+    log "consumer helper 缺失,拒绝从 /run 猜状态"
+    return 1
+  }
+  python3 "$SURVIVOR_CONSUMER_HELPER" "$@" --state "$SURVIVOR_CONSUMER_STATE"
+}
+
+begin_consumer_transition() {
+  local pid="$1"
+  consumer_state begin --legacy "$SURVIVOR_STATE" --pid "$pid" \
+    --lock "${OC_V5_SELFHOST_DEPLOY_LOCK:-/run/openclaude-v5-selfhost/deploy.lock}"
+}
+
 parse_state() {
   local key="$1"
+  if consumer_state_exists; then
+    consumer_state read --key "$key"
+    return
+  fi
   [[ -f "$SURVIVOR_STATE" && ! -L "$SURVIVOR_STATE" ]] || return 1
   awk -F= -v k="$key" '$1==k {print substr($0, index($0,"=")+1); exit}' "$SURVIVOR_STATE"
 }
@@ -136,6 +162,13 @@ write_state() {
   if [[ -z "$armed_at" ]]; then
     armed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
+  if consumer_state_exists; then
+    # First persist all bound consumer fields under the original deploy FD8.
+    # Never erase them by reconstructing only the four legacy key=value lines.
+    [[ "$(parse_state executor_pid)" == "$pid" && "$(parse_state backup_dir)" == "$backup" \
+      && "$(parse_state armed_at)" == "$armed_at" ]] || return 1
+    consumer_state phase --phase "$phase" || return 1
+  fi
   printf 'phase=%s\nexecutor_pid=%s\nbackup_dir=%s\narmed_at=%s\n' \
     "$phase" "$pid" "$backup" "$armed_at" \
     | atomic_write_file "$SURVIVOR_STATE"
@@ -144,10 +177,10 @@ write_state() {
 set_phase() {
   local phase="$1" pid backup armed_at
   phase_is_legal "$phase" || { log "拒绝写入非法 phase=$phase"; return 1; }
-  [[ -f "$SURVIVOR_STATE" && ! -L "$SURVIVOR_STATE" ]] || {
+  if ! consumer_state_exists && [[ ! -f "$SURVIVOR_STATE" || -L "$SURVIVOR_STATE" ]]; then
     log "无 state 文件,无法持久化 phase=$phase"
     return 1
-  }
+  fi
   pid="$(parse_state executor_pid || true)"
   backup="$(parse_state backup_dir || true)"
   armed_at="$(parse_state armed_at || true)"
@@ -222,6 +255,14 @@ do_restore() {
 
 maybe_restore() {
   local phase
+  if consumer_state_exists; then
+    # Neither health nor an old /run committed marker authorizes a consumer
+    # transition. Until the full caller rebuilds proof under the deploy lock,
+    # refuse BEFORE do_restore/any unit or symlink mutation.
+    consumer_state read --key consumer_phase >/dev/null || return 1
+    log "consumer transition 需持原发布锁重建兼容/停写证据,拒绝旧恢复入口"
+    return 1
+  fi
   if [[ -f "$SURVIVOR_COMMITTED" ]]; then
     log "已 committed,不恢复"
     return 0
@@ -253,7 +294,7 @@ maybe_restore() {
 watch_loop() {
   local i pid
   for ((i = 0; i < SURVIVOR_MAX_LOOPS; i++)); do
-    if [[ -f "$SURVIVOR_COMMITTED" ]]; then
+    if ! consumer_state_exists && [[ -f "$SURVIVOR_COMMITTED" ]]; then
       log "committed,解除监视"
       exit 0
     fi
@@ -272,6 +313,10 @@ watch_loop() {
 
 arm_via_systemd() { # <executor-pid> <backup-dir>
   local pid="$1" backup="$2" timeout_s="${SURVIVOR_TIMEOUT_SEC:-1200}"
+  if consumer_state_exists; then
+    log "已有持久 consumer transition,必须先按原锁恢复/收口,禁止重新 arm 覆盖"
+    return 1
+  fi
   write_state "$pid" "$backup" armed
   rm -f -- "$SURVIVOR_COMMITTED"
   systemd-run --unit=openclaude-v5-selfhost-cutover-watch \
@@ -294,6 +339,10 @@ arm_via_systemd() { # <executor-pid> <backup-dir>
 }
 
 disarm() {
+  if consumer_state_exists; then
+    log "consumer transition 尚无经过完整 caller 的提交证明,拒绝写 committed marker"
+    return 1
+  fi
   if ! write_committed_marker; then
     log "committed marker 写入失败,拒绝报告已解除武装"
     return 1
@@ -313,6 +362,7 @@ selftest() {
   echo "SURVIVOR_SELFTEST_DIR=$base"
   export SURVIVOR_STATE="$base/state"
   export SURVIVOR_COMMITTED="$base/committed"
+  export SURVIVOR_CONSUMER_STATE="$base/consumer.state"
   export SURVIVOR_POLL_SEC=1
   export SURVIVOR_MAX_LOOPS=30
   export SURVIVOR_HEALTH_CMD='false'
@@ -454,12 +504,14 @@ selftest() {
 
 usage() {
   cat <<'EOF'
-用法: cutover-survivor.sh --watch|--recover|--arm PID BACKUP|--disarm|--selftest|--set-phase PHASE
+用法: cutover-survivor.sh --watch|--recover|--arm PID BACKUP|--disarm|--selftest|--set-phase PHASE|--consumer-begin PID|--read-phase
   --watch      监视 executor;消失后按 phase 决定是否二级恢复
   --recover    超时/OnFailure 入口:与 --watch 相同的 phase-aware 恢复判定
   --arm        写 state 并用 systemd-run 武装 watch+timeout(仅 cutover 真窗口)
   --disarm     原子 fsync 写 committed marker;写失败必须非 0
   --set-phase  把已武装 state 的 phase 原子落盘(覆盖第一个 unit 前必须先写 mutated)
+  --consumer-begin  在真实原锁内将 armed transition 登记为持久 quiescing;不是启动许可
+  --read-phase 原状态读取;已登记时只读持久记录,不从 /run 回落
   --selftest   假 phase + 故意 kill 模拟 executor,不碰真 unit
 EOF
 }
@@ -472,6 +524,11 @@ case "${1:-}" in
     arm_via_systemd "$2" "$3"
     ;;
   --disarm) disarm ;;
+  --consumer-begin)
+    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    begin_consumer_transition "$2"
+    ;;
+  --read-phase) parse_state phase ;;
   --set-phase)
     [[ $# -ge 2 ]] || { usage >&2; exit 2; }
     set_phase "$2"
