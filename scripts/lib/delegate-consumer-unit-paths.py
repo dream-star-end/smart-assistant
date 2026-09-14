@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Conservative systemd path projection, not startup authorization.
 
-The caller supplies ordered actual fragment/drop-in and EnvironmentFile texts
-after binding root-owned file identities. This parser cannot discover drop-ins,
-prove the effective live unit, or authorize exec. Unsupported syntax is unknown.
+The text parser consumes ordered fragment/drop-in and EnvironmentFile texts.
+capture_effective_unit discovers and checks the actual loaded local unit against
+root-owned inputs. Neither operation authorizes exec. Unsupported syntax is unknown.
 Only path keys are returned; secrets and arbitrary environment are not retained.
 """
 from pathlib import Path
@@ -12,6 +12,7 @@ import pwd
 import re
 import shlex
 import stat
+import subprocess
 import time
 
 MAX_TEXT = 1024 * 1024
@@ -247,6 +248,96 @@ def capture_root_files(fragment_paths, deadline):
         for filename, proof in proofs.items():
             require(time.monotonic() < deadline)
             require(_root_identity(filename, optional=proof['file'] is None) == proof)
-        return {"projection": projection, "inputs": list(proofs.values())}
+        return {"projection": projection, "inputs": list(proofs.values()), "unitPlan": plan}
     except (OSError, UnicodeError, TypeError, ValueError, KeyError):
         raise Unknown("unverifiable_unit_paths") from None
+
+
+SELFHOST_UNITS = {
+    'openclaude-v5-selfhost.service', 'openclaude-v5-selfhost-egress.service',
+    'openclaude-v5-selfhost-egress@A.service', 'openclaude-v5-selfhost-egress@B.service',
+}
+SHOW_EMPTY = {'RootDirectory', 'RootImage', 'BindPaths', 'BindReadOnlyPaths',
+              'TemporaryFileSystem', 'PAMName', 'PassEnvironment', 'UnsetEnvironment',
+              'MountImages', 'ExtensionImages', 'ExtensionDirectories'}
+SHOW_NO = {'ProtectHome', 'PrivateTmp', 'DynamicUser'}
+SHOW_KEYS = {'Id', 'LoadState', 'NeedDaemonReload', 'FragmentPath', 'DropInPaths',
+             'User', 'Group', 'Type', 'WorkingDirectory', 'Environment',
+             'EnvironmentFiles', 'ExecStart'} | SHOW_EMPTY | SHOW_NO
+
+
+def parse_effective_properties(output, unit):
+    """Parse only the observed systemctl show grammar; unfamiliar forms reject."""
+    values = {}
+    for line in text_lines(output):
+        require('=' in line)
+        key, value = line.split('=', 1)
+        require(key in SHOW_KEYS and key not in values)
+        values[key] = value
+    require(values.get('Id') == unit and values.get('LoadState') == 'loaded')
+    require(values.get('NeedDaemonReload') == 'no')
+    require(values.get('User') == 'root' and values.get('Group') in ('', 'root'))
+    require(values.get('Type') == 'simple')
+    require(all(values.get(key) == '' for key in SHOW_EMPTY))
+    require(all(values.get(key) == 'no' for key in SHOW_NO))
+    fragments = [str(path(values.get('FragmentPath')))] + [str(path(p)) for p in words(values.get('DropInPaths', ''))]
+    require(len(fragments) <= 128 and len(fragments) == len(set(fragments)))
+    environment = {}
+    for entry in words(values.get('Environment', '')):
+        require('=' in entry)
+        name, value = entry.split('=', 1)
+        if name in PATH_KEYS:
+            require(name not in environment and '%' not in value)
+            environment[name] = value
+    environment_files, remaining = [], values.get('EnvironmentFiles', '')
+    while remaining:
+        match = re.match(r'(\S+) \(ignore_errors=(yes|no)\)(?: |$)', remaining)
+        require(match is not None)
+        environment_files.append({'path': str(path(match[1])), 'optional': match[2] == 'yes'})
+        remaining = remaining[match.end():]
+    command = re.fullmatch(r'\{ path=([^;\n]+) ; argv\[\]=(.*?) ; ignore_errors=no ; [^{}]* \}', values.get('ExecStart', ''))
+    require(command is not None)
+    argv = words(command[2])
+    require(tuple(argv) in ENTRYPOINTS and command[1] == argv[0])
+    return {'fragments': fragments, 'plan': {'environment': environment,
+            'environmentFiles': environment_files, 'workingDirectory': str(path(values.get('WorkingDirectory'))),
+            'argv': argv, 'user': 'root'}}
+
+
+def _show_effective(unit, deadline):
+    remaining = deadline - time.monotonic()
+    require(remaining > 0)
+    try:
+        result = subprocess.run(['/usr/bin/systemctl', '--system', 'show', '--no-pager',
+            '--property=' + ','.join(sorted(SHOW_KEYS)), '--', unit],
+            env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'SYSTEMD_COLORS': '0'},
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=remaining, check=False)
+        require(result.returncode == 0 and len(result.stdout) <= MAX_TEXT)
+        return parse_effective_properties(result.stdout.decode('utf-8'), unit)
+    except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError):
+        raise Unknown('unverifiable_effective_unit') from None
+
+
+def _capture_effective_unit(unit, deadline):
+    """Internal adapter for explicit private-unit tests; no CLI or env bypass."""
+    require(os.geteuid() == 0 and 0 < deadline - time.monotonic() <= 30)
+    require(isinstance(unit, str) and re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', unit))
+    before = _show_effective(unit, deadline)
+    captured = capture_root_files(before['fragments'], deadline)
+    require(captured['unitPlan'] == before['plan'])
+    # Files alone are not the loaded configuration. Neither a pending reload
+    # nor a changed effective drop-in list may be treated as the old snapshot.
+    require(_show_effective(unit, deadline) == before)
+    for proof in captured['inputs']:
+        require(time.monotonic() < deadline)
+        require(_root_identity(proof['path'], optional=proof['file'] is None) == proof)
+    return {'unit': unit, **captured}
+
+
+def capture_effective_unit(unit, deadline):
+    """Fixed local selfhost unit discovery, still NOT permission to start/stop."""
+    require(isinstance(unit, str) and unit in SELFHOST_UNITS)
+    try:
+        return _capture_effective_unit(unit, deadline)
+    except (OSError, UnicodeError, TypeError, ValueError, KeyError):
+        raise Unknown('unverifiable_effective_unit') from None
