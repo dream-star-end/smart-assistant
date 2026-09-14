@@ -266,7 +266,7 @@ await withPrivatePg(async ({ pool, backend, schema }: any) => {
         if (failure)
             throw failure;
         evidence.success = true;
-        console.log('D13_FULL_PASS');
+        process.stdout.write('D13_FULL_PASS\n');
     }
     finally {
         const cleanupErrors: unknown[] = [];

@@ -11,11 +11,37 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deadline, terminateOwnedTree, trackOwnedTree } from './fixtures/receiptMasterProcess.fixture.js';
+import { deadline, rememberDescendants, terminateOwnedTree, trackOwnedTree } from './fixtures/receiptMasterProcess.fixture.js';
 
 const root = fileURLToPath(new URL('../../../../', import.meta.url));
 const fixtures = fileURLToPath(new URL('./fixtures/', import.meta.url));
 const readJson = (path: string) => JSON.parse(readFileSync(path, 'utf8'));
+
+test('receipt fixture cleanup kills only its recorded detached descendants and reports failure', { timeout: 15_000 }, async () => {
+  const child = spawn(process.execPath, ['-e', `
+    const {spawn}=require('node:child_process');
+    process.on('SIGTERM',()=>{});
+    const grandchild=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000)"],
+      {detached:true,stdio:['ignore','ignore','ignore','ipc']});
+    grandchild.on('message',()=>process.send({ready:true,pid:grandchild.pid}));
+    setInterval(()=>{},1000);
+  `], { env: { PATH: process.env.PATH }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], detached: true });
+  const tracked = trackOwnedTree(child);
+  try {
+    const ready = await deadline(new Promise<{pid: number}>(resolve => child.once('message', resolve)), 5000, 'cleanup probe did not start');
+    rememberDescendants(child.pid!, tracked.known);
+    assert.ok(tracked.known.has(ready.pid), 'actual detached descendant captured before parent dies');
+    assert.equal(tracked.known.has(process.pid), false, 'test runner is never an owned descendant');
+    await assert.rejects(terminateOwnedTree(child, tracked.known, 100), /test cleanup forced 2 owned processes/);
+    await deadline(new Promise<void>(resolve => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve(); else child.once('close', () => resolve());
+    }), 5000, 'forced test process was not reaped');
+    assert.equal(child.signalCode, 'SIGKILL');
+  } finally {
+    tracked.stop();
+    await terminateOwnedTree(child, tracked.known, 100);
+  }
+});
 
 async function run(command: string, args: string[], base: string, label: string, env: NodeJS.ProcessEnv) {
   const child = spawn(command, args, { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
