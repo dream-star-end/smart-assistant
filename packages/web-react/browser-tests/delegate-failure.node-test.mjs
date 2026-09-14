@@ -175,7 +175,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       held.release();
       await badge.click(); await rows.first().waitFor();
       assert.equal(await rows.count(), 3);
-      assert.equal(await page.getByTestId("delegate-failure-footer").textContent(), "后台任务 0 运行中 / 0 排队 / 3 失败待确认");
+      assert.equal(await page.getByTestId("delegate-failure-footer").textContent(), "后台任务 0 运行中 / 0 排队 / 3 失败 · 会话诊断待确认");
       for (const id of api.ids.alice) assert.equal(await dialog.locator(`li[data-job-id="${id}"]`).count(), 0);
       t.diagnostic(`real held response released after B; socket closed=${held.closed()} (abort can prevent body consumption; pure Promise fence test separately proves post-json check)`);
       await page.keyboard.press("Escape"); await page.getByRole("button", { name: "切换 A", exact: true }).click();
@@ -262,6 +262,56 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
         t.diagnostic("actual App→selectSession/history + Composer→original ChatSocket offline queue Stop; no running model/PTY stop claim");
       } catch (error) { t.diagnostic(JSON.stringify({ body: (await p.locator("body").innerText()).slice(-3500), appErrors, reads: api.sessionReads, writes: api.sessionWrites })); throw error; }
       finally { await appContext.close(); }
+    });
+    await journey("legacy diagnostics survive zero or unavailable summary without becoming ACK authority", async () => {
+      const headers = { Authorization: "Bearer A", "content-type": "application/json" };
+      const first = await (await fetch(api.url + "/api/delegates/inbox?limit=50", { headers })).json();
+      assert.ok(first.items.length); const overlap = first.items[0].jobId;
+      const legacyContext = await isolate(await browser.newContext({ serviceWorkers: "block", viewport: { width: 375, height: 812 } }));
+      const p = await legacyContext.newPage(); p.setDefaultTimeout(10_000);
+      try {
+        await p.goto(api.url + "/focused?diagnosticJob=" + encodeURIComponent(overlap));
+        const trigger = p.getByTestId("delegate-failure-footer").getByRole("button"); await trigger.click();
+        const d = p.getByRole("dialog", { name: "后台任务失败收件箱" }), legacy = d.getByTestId("delegate-session-diagnostics");
+        await legacy.locator("summary").click();
+        await legacy.getByText("原始alice失败诊断", { exact: true }).waitFor();
+        assert.equal(await p.locator('[data-diagnostic-job-id="raw-failed-alice"]').count(), 1);
+        assert.equal(await legacy.getByRole("button", { name: "知道了", exact: true }).count(), 0);
+        assert.equal(await legacy.getByRole("button", { name: "继续原子会话", exact: true }).count(), 0);
+        const row = d.locator(`li[data-job-id="${overlap}"]`); assert.equal(await row.count(), 1);
+        assert.equal(await row.getByRole("button", { name: "知道了", exact: true }).count(), 1);
+        const retryBefore = api.retryKeys.length;
+        // Exercise original HTTP/SQLite ACK for every private source, not direct fixture deletion.
+        for (let batch = 0; batch < 4 && api.count("alice") > 0; batch++) {
+          const list = await (await fetch(api.url + "/api/delegates/inbox?limit=50", { headers })).json();
+          for (const entry of list.items) {
+            const ack = await fetch(api.url + `/api/delegates/inbox/${entry.jobId}/ack`, { method: "POST", headers, body: JSON.stringify({ generation: entry.generation }) });
+            assert.equal(ack.status, 200); assert.equal((await ack.json()).acknowledged, true);
+          }
+        }
+        assert.equal(api.count("alice"), 0);
+        await d.getByRole("button", { name: "刷新", exact: true }).click();
+        await d.getByText(/0 条未确认/).waitFor();
+        assert.equal(await d.locator("li[data-job-id]").count(), 0);
+        await legacy.getByText("原始alice失败诊断", { exact: true }).waitFor();
+        assert.equal(api.retryKeys.length, retryBefore);
+        api.setUnavailable(true);
+        await d.getByRole("button", { name: "刷新", exact: true }).click();
+        await d.getByRole("alert").waitFor();
+        assert.equal(await legacy.getByText("原始alice失败诊断", { exact: true }).count(), 1);
+        // Fresh app scope has no cached summary: must show unknown, not invented zero.
+        await p.reload(); await trigger.filter({ hasText: "状态待确认" }).waitFor(); await trigger.click();
+        await d.getByTestId("delegate-session-diagnostics").locator("summary").click();
+        await d.getByText("原始alice失败诊断", { exact: true }).waitFor();
+        assert.equal((await p.getByTestId("delegate-failure-footer").textContent()).includes("0 失败"), false);
+        api.setUnavailable(false);
+        await p.keyboard.press("Escape"); await p.getByRole("button", { name: "切换 B", exact: true }).click();
+        await trigger.filter({ hasText: "3 失败" }).waitFor(); await trigger.click();
+        await d.getByTestId("delegate-session-diagnostics").locator("summary").click();
+        await d.getByText("原始bob失败诊断", { exact: true }).waitFor();
+        assert.equal(await d.getByText("原始alice失败诊断", { exact: true }).count(), 0);
+        if (process.env.OC_D15_SCREENSHOT) await p.screenshot({ path: process.env.OC_D15_SCREENSHOT });
+      } finally { api.setUnavailable(false); await legacyContext.close(); }
     });
     assert.ok(executedJourneys > 0, "browser selector must execute a business journey");
     assert.deepEqual(errors, []);

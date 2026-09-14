@@ -12,6 +12,8 @@ function Harness() {
   const failures = useDelegateFailures(auth, user, true);
   const switchTo = (id: string, token: string) => { auth.commitToken(auth.beginIdentity(), token); setUser(id); };
   const items = [{ jobId: `raw-failed-${user}`, runId: "raw", agentId: "worker", goal: `原始${user}失败诊断`, state: "failed" as const, liveHint: "", updatedAt: 1, parentSessionKey: `agent:main:webchat:dm:session-${user}` }];
+  const overlap = new URLSearchParams(location.search).get("diagnosticJob");
+  if (overlap && user === "alice") items.push({ ...items[0], jobId: overlap, goal: "已归档失败诊断" });
   const diagnostics = failures.controller ? sessionFailureDiagnostics(items) : [];
   return <main className="mx-auto w-full max-w-3xl p-4">
     <Button onClick={() => switchTo("alice", "A")}>切换 A</Button><Button onClick={() => switchTo("bob", "B")}>切换 B</Button>
