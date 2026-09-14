@@ -24,6 +24,11 @@ async function fixture(t: TestContext, withParent = true) {
  const dir = mkdtempSync(join(tmpdir(), 'receipt-recovery-'))
  const old = { ...process.env }
  Object.assign(process.env, { OPENCLAUDE_HOME: dir, OC_DELEGATE_SM: '1', OC_DELEGATE_DURABLE: '1', OC_DELEGATE_NOTIFIER: '1' })
+ // Receipt notification now also requires the actual parent client lifecycle.
+ // Seed its private SQLite row, rather than weakening the deletion guard.
+ const { upsertClientSession } = await import('../../../storage/src/sessionsDb.js')
+ await upsertClientSession({ id: 'receipt-recovery', userId: 'default', agentId: 'main', title: 'private recovery fixture', pinned: false,
+  createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
  const sdk = new class extends EventEmitter {
   sessionId = randomUUID(); isRunning = true; receiptProcessIdentity = { pid: process.pid }
   setConsultTurn() {}
@@ -72,7 +77,8 @@ async function fixture(t: TestContext, withParent = true) {
   for (const k of ['OPENCLAUDE_HOME', 'OC_DELEGATE_SM', 'OC_DELEGATE_DURABLE', 'OC_DELEGATE_NOTIFIER']) {
    if (old[k] === undefined) delete process.env[k]; else process.env[k] = old[k]
   }
-  rmSync(dir, {recursive: true, force: true})
+  // The shared sessions module retains its first private SQLite connection.
+  // Keep fixture directories until that connection/process has ended.
  })
  return {dir, db, jobs, gw, owner, parent, turn, id, create, delivery, requests: () => requests, body: () => body,
   hide: () => {visible = undefined}, receipt: (job = id) => db.getDeliveryReceipt(job, 0)!,

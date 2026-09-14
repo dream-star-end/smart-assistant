@@ -136,3 +136,42 @@ test('foreign-user deletion attempt cannot suppress active receipt parent notifi
  assert.equal(f.requests(), 1); assert.match(f.body(), /ACTIVE_PRIVATE_RESULT/)
  assert.equal(f.receipt(r.jobId).state, 'notified')
 })
+
+test('SQL deletion while notification waits for the original receipt flock is rechecked before receiver and ACK', { timeout: 10000 }, async t => {
+ const f = await fixture(t)
+ const peer = 'receipt-delete-lock-race', sessionKey = 'agent:main:webchat:dm:' + peer
+ await sessionStorage.upsertClientSession({ id: peer, userId: 'default', agentId: 'main', title: 'private lock race', pinned: false,
+  createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
+ const created = f.jobs.create('worker', { callback: 'stdout-wait', callbackOriginUserId: 'default', parentSessionKey: sessionKey, parentEngine: 'ccb',
+  deliveryReceipt: { parentTurnKey: TURN, nativeToolUseId: 'creator', receiptNonceHash: hash(randomUUID()), parent: { agentId: 'main', owner: f.owner } } })
+ assert.ok('jobId' in created)
+ const initial = f.jobs.snapshotOf(created.jobId)!
+ f.jobs.complete(created.jobId, { httpStatus: 200, body: { output: 'LOCK_RACE_PRIVATE_RESULT' } },
+  { claimToken: initial.claimToken!, fencingEpoch: initial.fencingEpoch })
+ f.gw.sessions = { getByKey: (key: string) => key === sessionKey ? { ...f.parent, sessionKey } : undefined }
+ f.turn.end(); await f.gw._recoverDelegateReceipt(f.jobs.snapshotOf(created.jobId))
+ assert.equal(f.receipt(created.jobId).state, 'notify_pending')
+ let release!: () => void, held!: () => void, acquiring!: () => void
+ const gate = new Promise<void>(r => { release = r }), ready = new Promise<void>(r => { held = r })
+ const waiting = new Promise<void>(r => { acquiring = r })
+ const holder = f.db.withDeliveryReceiptBarrier(created.jobId, 0, async () => { held(); await gate })
+ await ready
+ const actual = f.jobs.dispatchReceiptNotification.bind(f.jobs)
+ const spy = t.mock.method(f.jobs, 'dispatchReceiptNotification', (async (...args: Parameters<typeof actual>) => {
+  acquiring(); return actual(...args)
+ }) as typeof actual)
+ const { dispatchJobTerminalNotify } = await import('../delegateNotifyDispatch.js')
+ const dispatch = dispatchJobTerminalNotify(f.jobs, f.jobs.snapshotOf(created.jobId)!, f.gw._engineNotifier, f.gw._notifyDispatchHooks())
+ try {
+  await waiting // the real outer active lifecycle check has already passed
+  assert.equal(await sessionStorage.deleteClientSession(peer, 'default'), true)
+  assert.equal(f.requests(), 0)
+  release(); await holder; await dispatch
+  assert.equal(f.requests(), 0, 'deleted result must not reach receiver after waiting for flock')
+  assert.notEqual(f.receipt(created.jobId).state, 'notified')
+  assert.notEqual(f.jobs.snapshotOf(created.jobId)!.callbackState, 'delivered')
+  assert.equal(f.receipt(created.jobId).nativeToolUseId, 'creator')
+  f.gw._armNotifyRetryScheduler()
+  assert.ok(f.gw._receiptNotifyNotBefore.get(f.gw._receiptNotifyKey(f.jobs.snapshotOf(created.jobId))) > Date.now())
+ } finally { release(); await holder; await dispatch; spy.mock.restore() }
+})

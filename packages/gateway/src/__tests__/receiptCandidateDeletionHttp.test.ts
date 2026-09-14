@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { EventEmitter, once } from 'node:events'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdtempSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createServer, request } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -137,6 +138,109 @@ async function requestSession(f: Awaited<ReturnType<typeof fixture>>, path: stri
     ...(body ? { body: JSON.stringify(body) } : {}) })
   return { status: r.status, body: await r.json() as any }
 }
+
+/** Real durable job/result; only the child executor is synthetic. */
+async function receiptFixture(peer: string) {
+  const f = await fixture('c:3')
+  await seed(peer, 'c:3'); Object.assign(f.parent, { channel: 'webchat', peerId: peer })
+  f.process.tool('creator'); const capability = await f.issue()
+  const { DelegateDurableDb } = await import('../delegateDurable.js')
+  const { DelegateJobStore } = await import('../delegateJobs.js')
+  const db = new DelegateDurableDb(join(home, randomUUID() + '-jobs.db'))
+  const jobs = new DelegateJobStore({ durable: db, sm: true, deliveryReceipts: true })
+  const nonce = 'b'.repeat(64), owner = f.adapter.getReceiptToolOwner('creator')!
+  const made = jobs.create('coding-assistant', { callback: 'stdout-wait', callbackOriginUserId: 'c:3', parentSessionKey: SESSION,
+    deliveryReceipt: { parentTurnKey: TURN, nativeToolUseId: 'creator',
+      receiptNonceHash: createHash('sha256').update(nonce).digest('hex'), parent: { agentId: 'main', owner } } })
+  assert.ok('jobId' in made)
+  const initial = jobs.snapshotOf(made.jobId)!
+  jobs.complete(made.jobId, { httpStatus: 200, body: { output: 'F2_PRIVATE_AUTHORITATIVE_RESULT' } },
+    { claimToken: initial.claimToken!, fencingEpoch: initial.fencingEpoch })
+  const gw = f.gw as any
+  gw._delegateJobs = jobs; gw._delegateReconcileReady = true; gw._readDelegateMemoryPressure = () => null
+  let executions = 0
+  gw._runDelegateTask = async () => { executions++; throw new Error('rejected F2 request reached executor') }
+  const previousSm = process.env.OC_DELEGATE_SM, previousDurable = process.env.OC_DELEGATE_DURABLE
+  process.env.OC_DELEGATE_SM = '1'; process.env.OC_DELEGATE_DURABLE = '1'
+  const input = { capability, jobId: made.jobId, generation: 0, receiptNonce: nonce }
+  const observe = () => ({ jobs: (db as any).db.prepare('SELECT count(*) n FROM delegate_jobs').get().n, executions,
+    receipt: db.getDeliveryReceipt(made.jobId, 0), active: gw._activeDelegations, reserved: gw._delegateResume?.reservedSize() ?? 0 })
+  const act = async (action: string, authorization = `Bearer ${TOKEN}`) => {
+    if (action !== 'create') return f.post(action, action === 'issue' ? { toolUseId: 'creator' }
+      : action === 'refresh' || action === 'check' ? { capability } : input, { authorization })
+    const r = await fetch(f.url + '/api/agents/coding-assistant/delegate', { method: 'POST',
+      headers: { authorization, 'content-type': 'application/json', [DELEGATE_CONTEXT_HEADER]: f.context },
+      body: JSON.stringify({ goal: 'must not execute', async: true, receipt: { capability, receiptNonce: 'c'.repeat(64) } }) })
+    return { status: r.status, data: await r.json() as any }
+  }
+  return { ...f, db, jobs, owner, capability, input, observe, act, close: async () => {
+    clearTimeout(gw._notifyRetryTimer); await f.close(); jobs.close()
+    for (const [key, value] of [['OC_DELEGATE_SM', previousSm], ['OC_DELEGATE_DURABLE', previousDurable]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value
+    }
+  } }
+}
+
+test('deleted old capability cannot read status/input or create jobs; receipt binding and reservations remain unchanged', async () => {
+  const f = await receiptFixture('f2-old-capability')
+  try {
+    assert.equal((await f.act('status')).status, 200)
+    const readable = await f.act('input')
+    assert.equal(readable.status, 200); assert.match(JSON.stringify(readable.data), /F2_PRIVATE_AUTHORITATIVE_RESULT/)
+    const before = f.observe()
+    const removed = await requestSession(f, '/api/sessions/f2-old-capability', 'DELETE')
+    assert.equal(removed.body.receiptCandidateCleanup.state, 'complete')
+    for (const action of ['create', 'status', 'input']) {
+      const rejected = await f.act(action)
+      assert.equal(rejected.status, 409, action + ': ' + JSON.stringify(rejected.data))
+      assert.doesNotMatch(JSON.stringify(rejected.data), /F2_PRIVATE_AUTHORITATIVE_RESULT/)
+      assert.deepEqual(f.observe(), before)
+    }
+  } finally { await f.close() }
+})
+
+for (const action of ['issue', 'refresh', 'create', 'status', 'input', 'check']) {
+  test(`SQL-await credential expiry refuses ${action} before issuing authority, reading result or reserving capacity`, { timeout: 10000 }, async () => {
+    const f = await receiptFixture('f2-expire-' + action)
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>(r => { release = r }), ready = new Promise<void>(r => { entered = r })
+    const gw = f.gw as any, actual = gw._receiptClientState.bind(gw)
+    // Delay the actual SQLite classification result, not its authority/state.
+    gw._receiptClientState = async (...args: unknown[]) => { const result = await actual(...args); entered(); await gate; return result }
+    try {
+      const before = f.observe(), exp = Math.floor(Date.now() / 1000) + 2
+      const pending = f.act(action, `Bearer ${signJwt({ userId: 'c:3', exp }, TOKEN)}`)
+      await ready
+      await new Promise<void>(r => setTimeout(r, Math.max(1, exp * 1000 + 15 - Date.now())))
+      release()
+      const rejected = await pending
+      assert.equal(rejected.status, 401, JSON.stringify(rejected.data))
+      assert.doesNotMatch(JSON.stringify(rejected.data), /F2_PRIVATE_AUTHORITATIVE_RESULT/)
+      assert.deepEqual(f.observe(), before)
+    } finally { release(); gw._receiptClientState = actual; await f.close() }
+  })
+}
+
+for (const action of ['create', 'input']) test(`SQL-await ${action} cannot consume old turn authority or revoke a replacement owner`, async () => {
+  const f = await receiptFixture('f2-turn-race-' + action)
+  const gw = f.gw as any, actual = gw._receiptClientState.bind(gw)
+  let release!: () => void, entered!: () => void, replacement: ReturnType<typeof start> | undefined
+  const ready = new Promise<void>(r => { entered = r }), gate = new Promise<void>(r => { release = r })
+  gw._receiptClientState = async (...args: unknown[]) => { const value = await actual(...args); entered(); await gate; return value }
+  try {
+    const before = f.observe(), pending = f.act(action)
+    await ready; f.turn.end()
+    f.parent._currentTurnKey = 'f2-replacement-turn'
+    replacement = start(f.adapter, f.parent._currentTurnKey); await replacement.submitted; f.process.tool('new-creator')
+    const freshOwner = f.adapter.getReceiptToolOwner('new-creator')!
+    assert.ok(freshOwner); assert.notEqual(freshOwner.parentOwnerEpoch, f.owner.parentOwnerEpoch)
+    assert.equal(f.adapter.revokeReceiptOwner(f.owner), false)
+    assert.equal(f.adapter.checkReceiptOwner(freshOwner), 'active')
+    release(); const rejected = await pending
+    assert.equal(rejected.status, 409); assert.deepEqual(f.observe(), before)
+    assert.equal(f.adapter.checkReceiptOwner(freshOwner), 'active')
+  } finally { release(); replacement?.end(); gw._receiptClientState = actual; await f.close() }
+})
 
 for (const route of ['single', 'batch', 'compensate'] as const) test(`real ${route} transaction deletion fences only owned candidates and revokes the old receipt owner`, async () => {
   const f = await fixture('c:3')
