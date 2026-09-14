@@ -264,7 +264,7 @@ try {
  assert.equal(row.nativeToolUseId,'real_creator')
  assert.equal(masterRequests.length,mode==='ingested-end'?0:1)
  assert.equal(accepted.size,mode==='ingested-end'?0:1)
- assert.equal(jobs.snapshotOf(jobId).callbackState,mode==='ingested-end'?'none':'delivered')
+ assert.equal(jobs.snapshotOf(jobId)!.callbackState,mode==='ingested-end'?'none':'delivered')
  assert.ok(terminalWork.length>=1,'actual onTerminal dispatch must execute')
  if(mode==='cross-turn')await turn.summary
  assert.ok(!failure,String(failure));if(mixed)assert.ok(mixedBefore,'mixed result boundary must execute')
