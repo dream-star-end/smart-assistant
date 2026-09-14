@@ -38,7 +38,7 @@ function gate() {
   const promise = new Promise<void>(resolve => { release = resolve })
   return { promise, release }
 }
-async function fixture(peer?: string, physicalUser = 'c:7', newSourceAdmission = true) {
+async function fixture(peer?: string, physicalUser = 'c:7', newSourceAdmission: boolean | 'factory' = true) {
   const dir = mkdtempSync(join(home, 'case-')), peerId = peer ?? dir.split('/').pop()!
   await storage.upsertClientSession({ id: peerId, userId: physicalUser, agentId: 'main', title: 'private source',
     pinned: false, createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
@@ -48,14 +48,16 @@ async function fixture(peer?: string, physicalUser = 'c:7', newSourceAdmission =
   const path = join(dir, 'delegate.db'), db = new DelegateDurableDb(path)
   // These C1 source tests explicitly opt in to the already-sealed protocol.
   // No blanket failureInbox: only proven source creation may enable an inbox.
-  const jobs = new DelegateJobStore({ durable: db, sm: true, deliveryReceipts: newSourceAdmission,
+  const jobs = new DelegateJobStore({ durable: db, sm: true, deliveryReceipts: newSourceAdmission === true,
     ttlMs: 100, now: () => now })
   const gw: any = new Gateway({ config: { version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: TOKEN },
     auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: join(dir, 'sessions.db') },
     defaults: { model: 'glm-5.2', permissionMode: 'default' }, channels: { webchat: { enabled: true } } } as never,
     agentsConfig: { agents: [{ id: 'main', model: 'glm-5.2' }, { id: 'coding-assistant', model: 'glm-5.2' }], routes: [], default: 'main' } })
   gw.sessions = { getByKey: (key: string) => key === parent.sessionKey ? visible : undefined }
-  gw._delegateJobs = jobs; gw._delegateReconcileReady = true; gw._readDelegateMemoryPressure = () => null
+  gw._delegateDurablePath = path
+  if (newSourceAdmission !== 'factory') gw._delegateJobs = jobs
+  gw._delegateReconcileReady = true; gw._readDelegateMemoryPressure = () => null
   gw._runDelegateTask = async (input: any) => {
     executions++
     // Actual core is outside this fixture. It normally owns/releases these reservations.
@@ -80,10 +82,14 @@ async function fixture(peer?: string, physicalUser = 'c:7', newSourceAdmission =
     sources: (sql.prepare('SELECT count(*) n FROM delegate_retry_source').get() as { n: number }).n,
     executions, active: gw._activeDelegations, resume: gw._delegateResume?.reservedSize() ?? 0,
     queued: gw._delegateQueueWaiters?.size ?? 0 })
-  return { gw, parent, peerId, path, db, jobs, sql, post, context, counts, base,
+  return { gw, parent, peerId, path, db, get jobs() { return gw._delegateJobs ?? jobs }, sql, post, context, counts, base,
     hide() { visible = undefined }, expire() { now += 1000; return jobs.sweep() },
     async close() { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
-      clearTimeout(gw._notifyRetryTimer); clearTimeout(gw._receiptCandidateTimer); jobs.close(); db.close(); sql.close() },
+      gw._shuttingDown = true
+      clearTimeout(gw._notifyRetryTimer); clearTimeout(gw._receiptCandidateTimer)
+      clearTimeout(gw._delegateReconcileTimer); clearInterval(gw._delegateReapTimer)
+      if (gw._delegateJobs !== jobs) gw._delegateJobs?.close()
+      jobs.close(); db.close(); sql.close() },
   }
 }
 
@@ -109,6 +115,83 @@ for (const enabled of [false, true]) test(`D17 bootstrap signed HTTP source admi
     assert.equal((f.sql.prepare('SELECT count(*) n FROM delegate_delivery_receipt').get() as { n: number }).n, 0)
   } finally { await f.close() }
 })
+
+test('D17 bootstrap original Gateway factory stays C0 through a real signed ordinary failure', async () => {
+  const keys = ['OC_DELEGATE_NOTIFIER', 'OC_DELEGATE_INFLIGHT_SURFACE', 'OC_DELEGATE_CUTOVER'] as const
+  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+  for (const key of keys) process.env[key] = '0'
+  const f = await fixture(undefined, 'c:7', 'factory')
+  try {
+    assert.equal(f.gw._delegateJobs, undefined, 'exercise lazy original factory, not a substituted store')
+    const made = await f.post({ failureInbox: true, deliveryReceipts: true })
+    assert.equal(made.status, 200, JSON.stringify(made))
+    assert.ok(f.gw._delegateJobs)
+    assert.equal(f.jobs.acceptsNewFailureSources, false)
+    assert.equal(f.jobs.acceptsDeliveryReceipts, false)
+    assert.equal(f.db.minimumConsumer, 1)
+    assert.equal(f.counts().executions, 1)
+    assert.equal(f.counts().sources, 0)
+    assert.equal(f.jobs.userFailureInbox('c:7').count, 0)
+  } finally {
+    await f.close()
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key]
+      else process.env[key] = saved[key]
+    }
+  }
+})
+
+for (const order of ['delete-first', 'enable-first'] as const) {
+  test(`D17 bootstrap actual SQL deletion interleaves protocol enable ${order}`, { timeout: 12000 }, async () => {
+    const f = await fixture(undefined, 'default', false), entered = gate(), proceed = gate()
+    let pending: Promise<unknown> | undefined
+    const enable = () => {
+      f.gw._delegateJobs = new DelegateJobStore({ durable: f.db, sm: true, deliveryReceipts: true })
+      assert.equal(f.db.minimumConsumer, 2)
+    }
+    try {
+      f.gw._delegatePublicOwners = new DelegatePublicOwnerBindings()
+      f.gw._delegatePublicOwners.bind(f.parent, signedOwner(7))
+      const fenceCount = () => (f.sql.prepare('SELECT count(*) n FROM delegate_retry_parent_fence').get() as { n: number }).n
+      if (order === 'delete-first') {
+        const cleanup = f.gw._cleanupDeletedReceiptCandidates.bind(f.gw)
+        f.gw._cleanupDeletedReceiptCandidates = async (refs: unknown) => {
+          const result = await cleanup(refs)
+          assert.equal(f.db.minimumConsumer, 1)
+          assert.equal(fenceCount(), 0, 'ordinary C0 deletion must not activate the new format')
+          entered.release(); await proceed.promise; return result
+        }
+        const deletion = userRequest(f, '/api/sessions/' + f.peerId, 'DELETE', undefined, jwt('default'))
+        pending = deletion
+        await entered.promise
+        enable()
+        const rejected = await f.post()
+        assert.ok(rejected.status >= 400, JSON.stringify(rejected))
+        proceed.release(); assert.equal((await deletion).status, 200)
+      } else {
+        enable()
+        const capture = f.gw._captureDelegateRetrySource.bind(f.gw)
+        f.gw._captureDelegateRetrySource = async (...args: unknown[]) => {
+          const captured = await capture(...args)
+          assert.ok(captured.source, 'real active SQL and signed owner must precede interleaved delete')
+          entered.release(); await proceed.promise; return captured
+        }
+        const creation = f.post(); pending = creation
+        await entered.promise
+        const deletion = await userRequest(f, '/api/sessions/' + f.peerId, 'DELETE', undefined, jwt('default'))
+        assert.equal(deletion.status, 200)
+        assert.equal(fenceCount(), 1, 'published capability requires the original permanent F2 fence')
+        proceed.release()
+        assert.ok((await creation).status >= 400, 'late captured source cannot cross deletion fence')
+      }
+      const [client] = await storage.classifyClientSessions([{ sessionId: f.peerId, userId: 'default' }])
+      assert.equal(client?.state, 'deleted', 'only real committed SQL deletion authorizes this outcome')
+      assert.equal(f.db.minimumConsumer, 2)
+      assert.equal(f.counts().jobs, 0); assert.equal(f.counts().sources, 0); assert.equal(f.counts().executions, 0)
+      assert.equal(f.counts().active, 0); assert.equal(f.counts().resume, 0)
+    } finally { proceed.release(); await pending; await f.close() }
+  })
+}
 
 test('HTTP authenticated create captures exact source, enables only its inbox, survives runtime TTL/reopen', async () => {
   const f = await fixture()

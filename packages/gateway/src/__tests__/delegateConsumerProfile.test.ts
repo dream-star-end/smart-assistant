@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { test, type TestContext } from 'node:test'
 import Database from 'better-sqlite3'
 import { DelegateDurableDb as LegacyV4 } from './fixtures/delegateLegacyV4.fixture.js'
+import { migrateOriginalV4Prefix } from './fixtures/delegateHistoricalMigrations.fixture.js'
 import { DelegateDurableDb, type DurableJobRecord } from '../delegateDurable.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { readDelegateConsumerProfile } from '@openclaude/storage/delegateConsumerProfile'
@@ -106,12 +107,36 @@ test('sealed profile cannot decrease, and a C0 store still reads preexisting sta
   assert.equal(f.modern.minimumConsumer, 2)
 })
 
+for (const version of [5, 6, 7, 8, 9, 10, 11]) test(`historical complete schema${version} migration remains sealed even with zero rows`, t => {
+  const path = join(sandbox.root, `historical-${version}.db`)
+  new LegacyV4(path).close()
+  migrateOriginalV4Prefix(path, version)
+  const raw = new Database(path)
+  t.after(() => raw.close())
+  assert.equal(raw.pragma('user_version', { simple: true }), version)
+  assert.equal((raw.prepare('SELECT count(*) n FROM delegate_jobs').get() as { n: number }).n, 0)
+  assert.equal(!!raw.prepare("SELECT 1 FROM sqlite_schema WHERE name='delegate_delivery_receipt'").get(), version >= 6)
+  assert.equal(!!raw.prepare("SELECT 1 FROM sqlite_schema WHERE name='delegate_retry_source'").get(), version >= 9)
+  assert.equal(!!raw.prepare("SELECT 1 FROM sqlite_schema WHERE name='identity_v10_delegate_jobs_insert'").get(), version >= 10)
+  const modern = new DelegateDurableDb(path)
+  t.after(() => modern.close())
+  assert.equal(raw.pragma('user_version', { simple: true }), 12)
+  assert.equal(modern.minimumConsumer, 2, 'existing protocol schema never regains a legacy floor from empty inventory')
+  assert.equal((raw.prepare('SELECT count(*) n FROM delegate_jobs').get() as { n: number }).n, 0)
+  const jobs = new DelegateJobStore({ durable: modern, sm: true })
+  assert.equal(jobs.acceptsNewFailureSources, false)
+  const made = jobs.create('child'); assert.ok('jobId' in made)
+  assert.throws(() => raw.exec('DELETE FROM delegate_jobs'), /oc_delegate_schema10/)
+  assert.ok(modern.get(made.jobId))
+})
+
 function worker(t: TestContext, role: 'legacy' | 'modern', path: string) {
   const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./fixtures/delegateProfileProcess.fixture.ts', import.meta.url)), role, path],
     { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...process.env } })
   type Reply = { event?: string; id?: number; ok?: boolean; result?: unknown; error?: string; pid?: number }
   const messages: Reply[] = []
   let serial = 0, output = '', ended = false
+  assert.ok(child.stdout && child.stderr, 'private worker output pipes are required')
   child.stdout.on('data', chunk => { output += String(chunk) })
   child.stderr.on('data', chunk => { output += String(chunk) })
   child.on('message', message => messages.push(message as Reply))
