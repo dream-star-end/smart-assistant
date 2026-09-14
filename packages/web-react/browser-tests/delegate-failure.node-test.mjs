@@ -174,7 +174,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       held.release();
       await badge.click(); await rows.first().waitFor();
       assert.equal(await rows.count(), 3);
-      assert.equal(await badge.textContent(), "后台任务 0 运行中 / 0 排队 / 3 失败待确认");
+      assert.equal(await page.getByTestId("delegate-failure-footer").textContent(), "后台任务 0 运行中 / 0 排队 / 3 失败待确认");
       for (const id of api.ids.alice) assert.equal(await dialog.locator(`li[data-job-id="${id}"]`).count(), 0);
       t.diagnostic(`real held response released after B; socket closed=${held.closed()} (abort can prevent body consumption; pure Promise fence test separately proves post-json check)`);
       await page.keyboard.press("Escape"); await page.getByRole("button", { name: "切换 A", exact: true }).click();
