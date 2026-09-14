@@ -121,6 +121,9 @@ test('original source/action accepted transaction and terminal remain visible to
   assert.equal(result.code, 0); assert.equal(result.verdict.databases?.[0]?.counts?.actions, 1)
   assert.equal(result.verdict.databases?.[0]?.counts?.sources, 2)
   assert.equal(f.db.getRetryAction(key)?.state, 'accepted')
+  f.store.fenceDeletedRetryParent({ userId: source.storageUserId!, clientSessionId: source.parentClientSessionId })
+  assert.equal(f.db.getRetryAction(key)?.state, 'source_deleted')
+  assert.equal(run([f.path], modern).code, 0, 'original source_deleted is a supported durable tombstone, not unknown')
 })
 
 test('all known receipt states including ingested/notified require v2 in v7 reader fixture', t => {

@@ -186,7 +186,7 @@ def inventory(value, deadline):
                 shape(db, "delegate_retry_source", SOURCE_COLUMNS + (["storage_user_id"] if version >= 10 else []))
                 shape(db, "delegate_retry_action", ACTION_COLUMNS)
                 shape(db, "delegate_retry_parent_fence", ["user_id", "client_session_id", "deleted_at"])
-                states(db, "delegate_retry_action", "state", ["accepted", "dispatched", "terminal"])
+                states(db, "delegate_retry_action", "state", ["accepted", "dispatched", "terminal", "source_deleted"])
                 totals["sources"] = count(db, "delegate_retry_source")
                 totals["actions"] = count(db, "delegate_retry_action")
                 totals["parentFences"] = count(db, "delegate_retry_parent_fence")
