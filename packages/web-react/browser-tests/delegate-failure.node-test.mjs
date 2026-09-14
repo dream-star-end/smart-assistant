@@ -52,6 +52,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
     };
     const context = await isolate(await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 1000 } }));
     const page = await context.newPage(); page.setDefaultTimeout(10_000);
+    const retryResponses = []; page.on("response", r => { if (r.url().endsWith("/retry")) void r.text().then(body => retryResponses.push({ status: r.status(), body }), () => retryResponses.push({ status: r.status(), body: "<interrupted>" })); });
     const errors = []; page.on("pageerror", e => errors.push(e.message));
     await page.goto(api.url + "/focused");
     const badge = page.getByRole("button", { name: /后台任务 .*失败/ });
@@ -97,11 +98,12 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       const source = dialog.locator(`li[data-job-id="${id}"]`), ackCount = api.ackCalls.length, originalCount = api.count("alice");
       api.dropNextRetry(); await source.getByRole("button", { name: "继续原子会话", exact: true }).click();
       await source.getByRole("alert").waitFor();
+      await page.waitForFunction(id => [...document.querySelectorAll(`li[data-job-id="${id}"] button`)].some(b => b.textContent === "继续原子会话" && b.disabled), id);
       assert.equal(await source.getByRole("button", { name: "继续原子会话", exact: true }).isDisabled(), true);
       await source.getByRole("button", { name: "确认上次继续", exact: true }).click();
       await page.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
       await source.getByText(/已受理，等待执行/).waitFor().catch(async error => {
-        t.diagnostic(JSON.stringify({ source: await source.textContent(), actions: api.retrySnapshot() })); throw error;
+        t.diagnostic(JSON.stringify({ source: await source.textContent(), retryResponses, actions: api.retrySnapshot() })); throw error;
       });
       assert.equal(api.retryKeys.length, 2); assert.equal(api.retryKeys[0].actionId, api.retryKeys[1].actionId);
       assert.equal(api.retryTargets(), 1); assert.equal(api.ackCalls.length, ackCount); assert.equal(api.count("alice"), originalCount);
