@@ -84,6 +84,7 @@ export async function createFailureUiServer(html: (path: string) => string) {
     failNextAck: () => { failAck = true; }, dropNextRetry: () => { dropRetry = true; },
     setUnavailable: (v: boolean) => { unavailable = v; },
     count: (user: string) => jobs.userSummary(user).unacknowledgedFailures,
+    retrySnapshot: () => retryKeys.map(k => ({ state: jobs.getRetryAction(k)?.state, target: jobs.getRetryAction(k)?.targetJobId })),
     retryTargets: () => new Set(retryKeys.map(k => jobs.getRetryAction(k)?.targetJobId)).size,
     finishRetry: () => { const k = retryKeys[0]; assert.ok(k); const a = jobs.getRetryAction(k)!;
       assert.equal(jobs.fail(a.targetJobId, { failureClass: "child_error", detail: "private retry failure", httpStatus: 500 }), true); },

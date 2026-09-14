@@ -100,7 +100,9 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(await source.getByRole("button", { name: "继续原子会话", exact: true }).isDisabled(), true);
       await source.getByRole("button", { name: "确认上次继续", exact: true }).click();
       await page.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
-      await source.getByText(/已受理，等待执行/).waitFor();
+      await source.getByText(/已受理，等待执行/).waitFor().catch(async error => {
+        t.diagnostic(JSON.stringify({ source: await source.textContent(), actions: api.retrySnapshot() })); throw error;
+      });
       assert.equal(api.retryKeys.length, 2); assert.equal(api.retryKeys[0].actionId, api.retryKeys[1].actionId);
       assert.equal(api.retryTargets(), 1); assert.equal(api.ackCalls.length, ackCount); assert.equal(api.count("alice"), originalCount);
       api.finishRetry();
@@ -135,8 +137,11 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       const appPage = await appContext.newPage(); appPage.setDefaultTimeout(20_000);
       await appPage.addInitScript(() => { window.WebSocket = undefined; localStorage.setItem("oc_auth_hint", "1"); });
       const expectedCount = api.count("alice");
+      const appErrors = []; appPage.on("pageerror", e => appErrors.push(e.message));
       await appPage.goto(api.url);
-      await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: new RegExp(`${expectedCount} 失败`) }).waitFor();
+      await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: new RegExp(`${expectedCount} 失败`) }).waitFor().catch(async error => {
+        t.diagnostic(JSON.stringify({ body: (await appPage.textContent("body")).slice(0, 5000), appErrors })); throw error;
+      });
       await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: new RegExp(`${expectedCount} 失败`) }).click();
       await appPage.getByRole("dialog", { name: "后台任务失败收件箱" }).waitFor();
       await appContext.close();
