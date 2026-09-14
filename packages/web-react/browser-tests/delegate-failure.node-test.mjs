@@ -18,6 +18,10 @@ const { createFailureUiServer } = await tsImport("./delegate-failure-api.fixture
 test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not native/model authorization", { timeout: 180_000 }, async t => {
   const cssDir = mkdtempSync(join(tmpdir(), "delegate-browser-css-"));
   let browser, api;
+  const selected = process.env.OC_D15_BROWSER_GROUP;
+  const journey = async (name, fn) => {
+    if (!selected || name.startsWith(selected)) await t.test(name, fn);
+  };
   try {
     const negative = process.env.OC_D15_BROWSER_NEGATIVE === "skip-ack";
     const plugins = negative ? [{ name: "virtual-original-ack-removal", setup(builder) {
@@ -57,7 +61,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
     const rows = dialog.locator("li[data-job-id]");
     await rows.first().waitFor();
 
-    await t.test("51 old failures survive runtime TTL and fresh DB; page boundaries do not ACK", async () => {
+    await journey("51 old failures survive runtime TTL and fresh DB; page boundaries do not ACK", async () => {
       assert.equal(await rows.count(), 50); assert.equal(api.count("alice"), 51);
       await dialog.getByRole("button", { name: "下一页", exact: true }).click();
       await page.waitForFunction(() => document.querySelectorAll("li[data-job-id]").length === 1);
@@ -66,7 +70,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(api.ackCalls.length, 0); assert.equal((await page.textContent("body")).includes("PRIVATE_RAW_SECRET_DETAIL"), false);
     });
 
-    if (!negative) await t.test("failed server ACK keeps row and visible error", async () => {
+    if (!negative) await journey("failed server ACK keeps row and visible error", async () => {
       api.failNextAck();
       const id = await rows.first().getAttribute("data-job-id");
       await rows.first().getByRole("button", { name: "知道了", exact: true }).click();
@@ -75,7 +79,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(api.count("alice"), 51);
     });
 
-    await t.test("explicit ACK reaches original SQLite; browser reload and DB reopen do not resurrect it", async () => {
+    await journey("explicit ACK reaches original SQLite; browser reload and DB reopen do not resurrect it", async () => {
       const id = await rows.first().getAttribute("data-job-id"), before = api.ackCalls.length;
       await rows.first().getByRole("button", { name: "知道了", exact: true }).click();
       await dialog.getByRole("button", { name: "刷新", exact: true }).waitFor();
@@ -88,9 +92,9 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
     });
     if (negative) return;
 
-    await t.test("accepted response loss + busy hint: explicit deterministic intent replay has one persisted target, never ACK", async () => {
+    await journey("accepted response loss + busy hint: explicit deterministic intent replay has one persisted target, never ACK", async () => {
       const id = await rows.first().getAttribute("data-job-id");
-      const source = dialog.locator(`li[data-job-id="${id}"]`), ackCount = api.ackCalls.length;
+      const source = dialog.locator(`li[data-job-id="${id}"]`), ackCount = api.ackCalls.length, originalCount = api.count("alice");
       api.dropNextRetry(); await source.getByRole("button", { name: "继续原子会话", exact: true }).click();
       await source.getByRole("alert").waitFor();
       assert.equal(await source.getByRole("button", { name: "继续原子会话", exact: true }).isDisabled(), true);
@@ -98,15 +102,15 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       await page.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
       await source.getByText(/已受理，等待执行/).waitFor();
       assert.equal(api.retryKeys.length, 2); assert.equal(api.retryKeys[0].actionId, api.retryKeys[1].actionId);
-      assert.equal(api.retryTargets(), 1); assert.equal(api.ackCalls.length, ackCount); assert.equal(api.count("alice"), 50);
+      assert.equal(api.retryTargets(), 1); assert.equal(api.ackCalls.length, ackCount); assert.equal(api.count("alice"), originalCount);
       api.finishRetry();
       await source.getByRole("button", { name: "确认上次继续", exact: true }).click();
       await page.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
       await source.getByText(/本次继续已结束，结果以原会话为准/).waitFor();
-      assert.equal(api.retryTargets(), 1); assert.equal(api.count("alice"), 51);
+      assert.equal(api.retryTargets(), 1); assert.equal(api.count("alice"), originalCount + 1);
     });
 
-    await t.test("same mounted auth object switches account without showing A rows or counts", async () => {
+    await journey("same mounted auth object switches account without showing A rows or counts", async () => {
       await page.keyboard.press("Escape");
       await page.getByRole("button", { name: "切换 B", exact: true }).click();
       await badge.filter({ hasText: "3 失败" }).waitFor(); await badge.click(); await rows.first().waitFor();
@@ -117,7 +121,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(api.count("bob"), 3);
     });
 
-    await t.test("real production CSS mobile sheet stays in viewport, focus returns to badge", async () => {
+    await journey("real production CSS mobile sheet stays in viewport, focus returns to badge", async () => {
       await page.setViewportSize({ width: 375, height: 812 }); await badge.click();
       const box = await dialog.boundingBox(); assert.ok(box && box.x >= -1 && box.x + box.width <= 376 && box.y >= -1);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
@@ -126,18 +130,19 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(await page.getByRole("button", { name: "停止本轮", exact: true }).count(), 0);
     });
 
-    await t.test("actual App with no active session still mounts authenticated failure footer", async () => {
+    await journey("actual App with no active session still mounts authenticated failure footer", async () => {
       const appContext = await isolate(await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 1000 } }));
       const appPage = await appContext.newPage(); appPage.setDefaultTimeout(20_000);
       await appPage.addInitScript(() => { window.WebSocket = undefined; localStorage.setItem("oc_auth_hint", "1"); });
+      const expectedCount = api.count("alice");
       await appPage.goto(api.url);
-      await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: /51 失败/ }).waitFor();
-      await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: /51 失败/ }).click();
+      await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: new RegExp(`${expectedCount} 失败`) }).waitFor();
+      await appPage.getByTestId("delegate-failure-footer").getByRole("button", { name: new RegExp(`${expectedCount} 失败`) }).click();
       await appPage.getByRole("dialog", { name: "后台任务失败收件箱" }).waitFor();
       await appContext.close();
     });
     assert.deepEqual(errors, []);
     assert.deepEqual(external, [], "no request may escape private loopback fixture");
     t.diagnostic("real HTTP + original SQLite projection/ACK/action replay; native eligibility, principal auth and lifecycle are fixture seams; no production/master/model claim");
-  } finally { await browser?.close(); await api?.close(); rmSync(cssDir, { recursive: true, force: true }); }
+  } finally { if (api) t.diagnostic(JSON.stringify({ retryRequests: api.retryKeys.length, retryTargets: api.retryTargets(), ackRequests: api.ackCalls.length, alice: api.count("alice"), bob: api.count("bob") })); await browser?.close(); await api?.close(); rmSync(cssDir, { recursive: true, force: true }); }
 });

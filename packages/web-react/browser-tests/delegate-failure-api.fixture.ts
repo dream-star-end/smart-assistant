@@ -54,7 +54,12 @@ export async function createFailureUiServer(html: (path: string) => string) {
           return { replay: accepted.kind === "replay", action: accepted.action };
         },
         send: (r, status, value) => {
-          if (url.pathname.endsWith("/retry") && dropRetry && status === 202) { dropRetry = false; r.destroy(); return; }
+          if (url.pathname.endsWith("/retry") && dropRetry && status === 202) {
+            // Commit response headers first: a bare pre-header close can be transparently
+            // replayed by Chromium, which is not the ambiguous-body contract under test.
+            dropRetry = false; r.writeHead(202, { "content-type": "application/json", "content-length": "9999" });
+            r.flushHeaders(); r.write('{"version":'); setTimeout(() => r.destroy(), 10); return;
+          }
           r.writeHead(status, { "content-type": "application/json" }); r.end(JSON.stringify(value));
         },
       }).catch(error => { res.statusCode = 500; res.end(JSON.stringify({ error: String(error) })); });
