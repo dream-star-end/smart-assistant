@@ -228,7 +228,7 @@ test('D14 unsupported paths/methods and unavailable proxy cannot use admin host 
   try {
     for (const role of ['user', 'admin'] as const) {
       const token = (await signAccess({ sub: '7', role }, SECRET)).token
-      for (const [path, method] of [['summary', 'POST'], ['inbox/x/retry', 'POST'], ['inbox/x/ack/extra', 'GET']]) {
+      for (const [path, method] of [['summary', 'POST'], ['inbox/x/retry', 'GET'], ['inbox/x/ack/extra', 'GET']]) {
         assert.equal((await f.call(path, token, method, undefined, { 'x-oc-host-scope': '1' })).status, 403)
       }
     }
@@ -236,6 +236,24 @@ test('D14 unsupported paths/methods and unavailable proxy cannot use admin host 
     const token = (await signAccess({ sub: '7', role: 'admin' }, SECRET)).token
     assert.equal((await f.call('inbox', token, 'GET', undefined, { 'x-oc-host-scope': '1' })).status, 403)
     assert.equal(f.counts.hostFallbacks, 0); assert.equal(f.counts.routedRequests, 0)
+  } finally { await f.close() }
+})
+
+test('D14 exact retry POST reaches bound container; never falls back to host or accepts free input', async () => {
+  const f = await fixture()
+  try {
+    const path = 'inbox/' + f.good + '/retry'
+    const valid = JSON.stringify({ generation: 0, actionId: 'private-master-retry-0001' })
+    const unavailable = await f.call(path, undefined, 'POST', valid)
+    // Fixture has no ready source/native executor: the real container must
+    // reject, not the master allowlist. End-to-end execution has its own fixture.
+    assert.equal(unavailable.status, 503)
+    assert.equal(unavailable.body.error, 'retry_not_ready')
+    assert.equal(f.counts.routedRequests, 1); assert.equal(f.counts.gatewayRequests, 1)
+    const forged = await f.call(path, undefined, 'POST', JSON.stringify({ generation: 0,
+      actionId: 'private-master-retry-0002', userId: 'c:8', goal: 'forged' }))
+    assert.equal(forged.status, 400); assert.equal(f.counts.routedRequests, 2)
+    assert.equal(f.counts.hostFallbacks, 0)
   } finally { await f.close() }
 })
 

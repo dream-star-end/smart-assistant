@@ -294,6 +294,24 @@ export class DelegateResumeRegistry {
     this.bindJob(input.sessionKey, input.idempotencyKey, input.jobId)
   }
 
+  /** Server-internal durable-source recovery, NOT public resume authorization.
+   * Exact tuple only; never overwrite an occupied/retiring or conflicting key.
+   * The caller must immediately use ordinary preflight with no intervening await. */
+  restoreTrustedIdle(input: Pick<DelegateResumeBinding, 'sessionKey' | 'parentSessionKey' | 'targetAgentId' | 'sourceAgent'>): boolean {
+    if (this.reserved.has(input.sessionKey)) return false
+    const existing = this.bindings.get(input.sessionKey)
+    if (existing) {
+      if (existing.parentSessionKey !== input.parentSessionKey || existing.targetAgentId !== input.targetAgentId ||
+          existing.sourceAgent !== input.sourceAgent) return false
+      existing.lastUsedAt = this.now()
+      return true
+    }
+    // Do not evict unrelated live/native keys as a side effect of retry.
+    if (this.bindings.size >= this.maxBindings) return false
+    this.bindings.set(input.sessionKey, { ...input, createdAt: this.now(), lastUsedAt: this.now() })
+    return true
+  }
+
   bindJob(sessionKey: string, idempotencyKey: string | undefined, jobId: string): void {
     if (!idempotencyKey) return
     const id = attemptId(sessionKey, idempotencyKey)

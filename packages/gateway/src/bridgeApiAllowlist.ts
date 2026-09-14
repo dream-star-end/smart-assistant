@@ -73,7 +73,7 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   { label: '/api/delegates/inbox', re: /^\/api\/delegates\/inbox$/, methods: M('GET'), proxyFromCommercial: true },
   { label: '/api/delegates/summary', re: /^\/api\/delegates\/summary$/, methods: M('GET'), proxyFromCommercial: true },
   { label: '/api/delegates/inbox/:jobId/ack', re: /^\/api\/delegates\/inbox\/[A-Za-z0-9_-]{1,128}\/ack$/, methods: M('POST'), proxyFromCommercial: true },
-  // Retry is not proxied until its persistent source/action execution path exists.
+  { label: '/api/delegates/inbox/:jobId/retry', re: /^\/api\/delegates\/inbox\/[A-Za-z0-9_-]{1,128}\/retry$/, methods: M('POST'), proxyFromCommercial: true },
 
   // Existing v3 file/media proxy bypass. Handled by containerFileProxy on the master side.
   {

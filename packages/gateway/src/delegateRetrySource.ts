@@ -20,6 +20,10 @@ export type DelegateRetryAction = DelegateRetryActionKey & Readonly<{
   dispatchedAt: number | null
   terminalCode: string | null
 }>
+/** Public retry errors are bounded codes, never native paths/result payloads. */
+export class DelegateRetryUnavailable extends Error {
+  constructor(readonly status: number, readonly code: string) { super(code) }
+}
 export function checkedDelegateRetryActionKey(key: DelegateRetryActionKey): DelegateRetryActionKey {
   if (!key || typeof key.userId !== 'string' || !key.userId.trim() || key.userId !== key.userId.trim() || key.userId.length > 1024 ||
       typeof key.sourceJobId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key.sourceJobId) || !Number.isSafeInteger(key.generation) || key.generation < 0 ||

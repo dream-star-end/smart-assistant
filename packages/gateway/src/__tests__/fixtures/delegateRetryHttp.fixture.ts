@@ -1,0 +1,168 @@
+/** Real HTTP -> SQL/source/action -> original executor -> actual manager/adapter
+ * and stdio RPC. Source/native seed, app-server enrollment and billing are private
+ * fixtures; no real user/paid model, master ACK or boot scheduling claim. */
+import assert from 'node:assert/strict'
+import { mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { createInterface } from 'node:readline'
+import { createServer, request } from 'node:http'
+import Database from 'better-sqlite3'
+import { Gateway } from '../../server.js'
+import { SessionManager } from '../../sessionManager.js'
+import { DelegateDurableDb } from '../../delegateDurable.js'
+import { DelegateJobStore } from '../../delegateJobs.js'
+import { signJwt } from '../../auth.js'
+import { upsertClientSession, deleteClientSession } from '../../../../storage/src/sessionsDb.js'
+import { paths, type OpenClaudeConfig, type AgentDef } from '@openclaude/storage'
+
+async function main() {
+  const mode = process.argv[2]!, home = process.env.OPENCLAUDE_HOME!, codexHome = process.env.CODEX_HOME!
+  assert.ok(home.includes('retry-http-private-')); assert.equal(process.env.HOME, home)
+  const token = 'private-retry-user-token', userId = 'c:7', peer = 'web-private-retry'
+  const parentKey = 'agent:main:webchat:dm:' + peer, childKey = 'agent:worker:delegate:main:1:private-retry'
+  const nativeId = '8aef3dc0-cd8b-4fe5-9743-af842e17b605'
+  const config = { version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: token },
+    auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: join(home, 'sessions.db') },
+    defaults: { model: 'gpt-6-astra', permissionMode: 'default' }, channels: { webchat: { enabled: true } } } as unknown as OpenClaudeConfig
+  const agents = ['main', 'worker'].map(id => ({ id, model: 'gpt-6-astra', provider: 'codex-native', cwd: home } as AgentDef))
+  writeFileSync(paths.agentsYaml, JSON.stringify({ agents, routes: [], default: 'main' }))
+  const gw: any = new Gateway({ config, agentsConfig: { agents, routes: [], default: 'main' } })
+  const sm = new SessionManager(config), ins: any = sm
+  gw.sessions = sm
+  gw._delegateReconcileReady = true; gw._readDelegateMemoryPressure = () => null
+  await upsertClientSession({ id: peer, userId, agentId: 'main', title: 'private retry', pinned: false,
+    createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
+  await sm.getOrCreate({ sessionKey: parentKey, agent: agents[0]!, model: 'gpt-6-astra',
+    channel: 'webchat', peerId: peer, userId, hermeticNoTools: true })
+  const artifactDir = join(codexHome, 'sessions', '2026', '01', '01'); mkdirSync(artifactDir, { recursive: true })
+  const artifact = join(artifactDir, `rollout-private-${nativeId}.jsonl`), rpcLog = join(home, 'rpc.jsonl')
+  writeFileSync(artifact, '{"private":true}\n')
+  ins._resumeMap.set(childKey, nativeId); ins._resumeMapProvider.set(childKey, 'codex')
+  const childSession = await sm.getOrCreate({ sessionKey: childKey, agent: agents[1]!, model: 'gpt-6-astra',
+    channel: 'delegate', peerId: 'main', parentSessionKey: parentKey, userId, hermeticNoTools: true,
+    requireNativeResume: { engine: 'codex', nativeSessionId: nativeId } })
+  const db = new DelegateDurableDb(join(home, 'delegate.db')), sql = new Database(join(home, 'delegate.db'))
+  const jobs = new DelegateJobStore({ durable: db, sm: true })
+  gw._delegateJobs = jobs
+  const source = { version: 1 as const, userId, parentSessionKey: parentKey, originSessionKey: parentKey,
+    parentClientSessionId: peer, childSessionKey: childKey, targetAgentId: 'worker', sourceAgentId: 'main', depth: 0, model: 'gpt-6-astra' }
+  const made = jobs.create('worker', { retrySource: source, callbackOriginUserId: userId,
+    callbackOriginSessionKey: parentKey, sessionKey: childKey, parentSessionKey: parentKey })
+  assert.ok('jobId' in made)
+  const original = jobs.snapshotOf(made.jobId)!
+  assert.equal(jobs.fail(made.jobId, { failureClass: 'child_error', detail: 'private original failure', httpStatus: 500,
+    claimToken: original.claimToken, fencingEpoch: original.fencingEpoch }), true)
+  let billed = 0
+  gw._delegateEngineBilling = { admit: async (input: any) => {
+    billed++; assert.equal(input.parentSessionId, peer); assert.equal(input.sessionKey, childKey)
+    return { requestId: 'a'.repeat(32), engineSessionId: childKey }
+  }, settle: async () => {}, abandon: async () => {} }
+  const kernel: any = (childSession.runner as any).kernel
+  const rpc = spawn(process.execPath, [fileURLToPath(new URL('./codexStrictResumeRpc.fixture.mjs', import.meta.url)),
+    artifact, rpcLog, 'success'], { env: { PATH: process.env.PATH, HOME: home, NODE_ENV: 'test' }, stdio: ['pipe', 'pipe', 'pipe'] })
+  const closed = once(rpc, 'close')
+  rpc.stderr.on('data', b => process.stderr.write(b))
+  const lines = createInterface({ input: rpc.stdout }); lines.on('line', line => kernel.handleLine(line))
+  kernel.proc = rpc; kernel.initialized = true
+  kernel.ensureSpawned = async () => { if (mode === 'missing-late' && existsSync(artifact)) unlinkSync(artifact) }
+  const server = createServer((req, res) => { gw.handleHttp(req, res) })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  const url = base + `/api/delegates/inbox/${made.jobId}/retry`
+  const action = 'private-retry-action-0001', body = { generation: 0, actionId: action }
+  const jwt = (uid = userId, exp = Math.floor(Date.now() / 1000) + 60) => 'Bearer ' + signJwt({ userId: uid, exp }, token)
+  const post = async (value: unknown = body, authorization = jwt()) => {
+    const response = await fetch(url, { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: JSON.stringify(value) })
+    return { status: response.status, body: await response.json() as any }
+  }
+  const counts = () => ({ jobs: (sql.prepare('SELECT count(*) n FROM delegate_jobs').get() as any).n,
+    actions: (sql.prepare('SELECT count(*) n FROM delegate_retry_action').get() as any).n,
+    slots: gw._activeDelegations, waiters: gw._delegateQueueWaiters?.size ?? 0, resume: gw._delegateResume?.reservedSize() ?? 0 })
+  if (mode === 'deleted-after-accept') {
+    const read = gw._getAgentsConfig.bind(gw); let reads = 0
+    gw._getAgentsConfig = async () => {
+      const config = await read()
+      if (++reads === 2) {
+        assert.equal(counts().actions, 1, 'deletion is after real acceptance, not precheck')
+        await deleteClientSession(peer, userId)
+      }
+      return config
+    }
+  }
+  try {
+    if (mode === 'denied') {
+      assert.equal((await post(body, jwt('c:8'))).status, 409)
+      assert.equal((await post({ ...body, userId })).status, 400)
+      assert.equal((await post({ ...body, generation: 1 })).status, 409)
+      assert.equal((await post({ ...body, actionId: 'short' })).status, 400)
+      assert.equal((await post(body, 'Bearer ' + token)).status, 401)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else if (mode === 'write-fault') {
+      // Real original acceptance transaction fault AFTER reservation.
+      sql.exec(`CREATE TRIGGER private_action_fault BEFORE INSERT ON delegate_retry_action BEGIN SELECT RAISE(ABORT,'private action fault'); END`)
+      assert.equal((await post()).status, 503)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else if (mode === 'expired-body') {
+      const exp = Math.floor(Date.now() / 1000) + 2, text = JSON.stringify(body)
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = request(url, { method: 'POST', headers: { authorization: jwt(userId, exp),
+          'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => {
+          res.resume(); res.on('end', () => resolve(res.statusCode!))
+        })
+        req.on('error', reject); req.setTimeout(6000, () => req.destroy(Error('private body timeout')))
+        server.once('request', () => setTimeout(() => req.end(text.slice(1)), Math.max(1, exp * 1000 + 30 - Date.now())))
+        req.write(text.slice(0, 1))
+      })
+      assert.equal(status, 401)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else if (mode === 'expired-permission') {
+      const exp = Math.floor(Date.now() / 1000) + 2
+      const originalRead = gw._getAgentsConfig.bind(gw)
+      gw._getAgentsConfig = async () => {
+        const config = await originalRead() // real file permission config; source SQL already completed
+        await new Promise(r => setTimeout(r, Math.max(1, exp * 1000 + 30 - Date.now())))
+        return config // production coordinator must recheck the original user after this await
+      }
+      assert.equal((await post(body, jwt(userId, exp))).status, 401)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else {
+      const responses = await Promise.all([post(), post()])
+      assert.deepEqual(responses.map(r => r.status).sort(), [200, 202], JSON.stringify(responses))
+      const target = responses[0]!.body.jobId
+      assert.equal(responses[1]!.body.jobId, target); assert.notEqual(target, made.jobId)
+      for (let i = 0; i < 1000 && !jobs.snapshotOf(target)?.result; i++) await new Promise(r => setTimeout(r, 10))
+      const terminal = jobs.snapshotOf(target)!
+      assert.ok(terminal.result, JSON.stringify(terminal))
+      const requests = existsSync(rpcLog) ? readFileSync(rpcLog, 'utf8').trim().split('\n').map(s => JSON.parse(s)) : []
+      assert.equal(requests.filter(r => r.method === 'thread/start').length, 0)
+      assert.equal(requests.filter(r => r.method === 'turn/start').length, mode === 'missing-late' || mode === 'deleted-after-accept' ? 0 : 1, JSON.stringify(terminal))
+      if (mode === 'missing-late') assert.match(JSON.stringify(terminal.result), /STRICT_NATIVE_RESUME_UNAVAILABLE/)
+      else if (mode === 'deleted-after-accept') assert.match(JSON.stringify(terminal.result), /retry_source_unavailable/)
+      else assert.match(JSON.stringify(terminal.result), /PRIVATE_NATIVE_CONTINUATION_RESULT/)
+      assert.equal(billed, mode === 'deleted-after-accept' ? 0 : 1)
+      assert.deepEqual(counts(), { jobs: 2, actions: 1, slots: 0, waiters: 0, resume: 0 })
+      assert.equal(db.getRetryAction({ userId, sourceJobId: made.jobId, generation: 0, actionId: action })?.state,
+        mode === 'deleted-after-accept' ? 'source_deleted' : 'terminal')
+      assert.equal((await post()).body.jobId, target)
+      assert.equal(billed, mode === 'deleted-after-accept' ? 0 : 1)
+      if (mode === 'deleted-after-accept') {
+        assert.equal(jobs.userFailureInbox(userId).count, 0)
+        assert.equal(db.getRetrySource(userId, made.jobId, 0), undefined)
+      } else {
+        assert.equal(jobs.userFailureInbox(userId).items.some(r => r.jobId === made.jobId), true, 'retry never ACKs original failure')
+        assert.deepEqual(db.getRetrySource(userId, made.jobId, 0), source)
+      }
+      process.stdout.write(JSON.stringify({ mode, target, methods: requests.map(r => r.method), counts: counts() }) + '\n')
+    }
+    process.stdout.write(`RETRY_HTTP_PASS ${mode}\n`)
+  } finally {
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()))
+    lines.close(); rpc.kill('SIGKILL'); await closed
+    clearTimeout(gw._receiptCandidateTimer); clearTimeout(gw._notifyRetryTimer)
+    jobs.close(); db.close(); sql.close(); await sm.awaitResumeMapFlush()
+  }
+}
+main().catch(error => { process.stderr.write(String(error?.stack ?? error) + '\n'); process.exitCode = 1 })

@@ -1,4 +1,5 @@
-import type { DelegateRetrySource } from './delegateRetrySource.js'
+import { DelegateRetryUnavailable, checkedDelegateRetryActionKey, type DelegateRetrySource, type DelegateRetryActionKey, type DelegateRetryAction } from './delegateRetrySource.js'
+import type { StrictNativeResume } from './engine/engineAdapter.js'
 import { DELEGATE_USER_PREFIX, handleDelegateUserHttp } from './delegateUserHttp.js'
 import { homedir as receiptHome } from 'node:os'
 import { ReceiptCandidateLifecycle, receiptCandidateDeletionRef, receiptCandidateDeletionKey, type ReceiptCandidateDeletionRef, type ReceiptCandidateScope } from '@openclaude/storage/receiptCandidateLifecycle'
@@ -2039,6 +2040,9 @@ interface RunDelegateInput {
    *  running counter drifts and locks the parent out(2026-09-06 槽位泄漏事故:早退未释放)。 */
   capacitySlotOpts?: { parentBucketKey?: string; isReview?: boolean }
   idempotencyKey?: string
+  /** Internal user retry only; never deserialized from delegate tool/body args. */
+  retrySource?: Readonly<{ key: DelegateRetryActionKey; source: DelegateRetrySource }>
+  requireNativeResume?: StrictNativeResume
   _leaseTimer?: ReturnType<typeof setInterval>
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
@@ -6417,6 +6421,7 @@ export class Gateway {
         },
         store: () => this._delegateJobs,
         reconcileLifecycle: async (userId, authorize) => (await this._reconcileDelegateUserLifecycle(userId, authorize)).complete,
+        retry: (key, authorize) => this._retryUserDelegate(key, authorize),
         readBody: request => this.readBody(request),
         send: (response, status, body) => this.sendJson(response, status, body),
       }).catch(err => this.sendInternalError(res, err))
@@ -13945,7 +13950,161 @@ export class Gateway {
     }
   }
 
-  /** Real caller provenance, captured before resume/capacity reservation. No body identity. */
+  /** Exact durable provenance plus current real manager chain; no fallback user,
+   * fake parent or nonce-directory discovery. Unknown/missing parent stays disabled. */
+  private _delegateRetrySourceGuard(key: DelegateRetryActionKey, source: DelegateRetrySource, authorize: () => void): () => void {
+    const chain: AgentSession[] = []
+    const visited = new Set<string>()
+    let cursor = this.sessions.getByKey(source.parentSessionKey)
+    while (cursor && chain.length < 5 && !visited.has(cursor.sessionKey)) {
+      visited.add(cursor.sessionKey); chain.push(cursor)
+      if (cursor.channel === 'webchat') break
+      if (cursor.channel !== 'delegate' || !cursor.parentSessionKey) break
+      cursor = this.sessions.getByKey(cursor.parentSessionKey)
+    }
+    const project = (s: AgentSession) => JSON.stringify([s.sessionKey, s.userId, s.agentId, s.channel, s.peerId, s.parentSessionKey])
+    const snapshots = chain.map(project)
+    const check = () => {
+      authorize()
+      const current = this._delegateJobs?.getRetrySource(key.userId, key.sourceJobId, key.generation)
+      if (!current || JSON.stringify(current) !== JSON.stringify(source) || source.userId !== key.userId) {
+        throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
+      }
+      const root = chain.at(-1), parent = chain[0]
+      if (!parent || parent.agentId !== source.sourceAgentId || !root || root.channel !== 'webchat' ||
+          root.sessionKey !== source.originSessionKey || root.peerId !== source.parentClientSessionId ||
+          chain.some((s, i) => s.userId !== source.userId || this.sessions.getByKey(s.sessionKey) !== s || project(s) !== snapshots[i]) ||
+          !this._resolveDelegateParent({ parentSessionKey: source.parentSessionKey, sourceAgent: source.sourceAgentId })) {
+        throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
+      }
+      const child = this.sessions.getByKey(source.childSessionKey)
+      if (child && (child.agentId !== source.targetAgentId || child.userId !== source.userId ||
+          child.channel !== 'delegate' || child.parentSessionKey !== source.parentSessionKey)) {
+        throw new DelegateRetryUnavailable(409, 'retry_child_identity_changed')
+      }
+    }
+    check()
+    return check
+  }
+
+  private async _checkDelegateRetrySource(key: DelegateRetryActionKey, source: DelegateRetrySource, check: () => void): Promise<void> {
+    check()
+    let rows: Awaited<ReturnType<typeof classifyClientSessions>>
+    try { rows = await classifyClientSessions([{ userId: source.userId, sessionId: source.parentClientSessionId }]) }
+    catch (error) { check(); throw error }
+    check()
+    const observed = rows[0]
+    if (!observed || observed.userId !== source.userId || observed.sessionId !== source.parentClientSessionId) {
+      throw new DelegateRetryUnavailable(503, 'retry_lifecycle_unknown')
+    }
+    if (observed.state === 'deleted') {
+      this._delegateJobs!.fenceDeletedRetryParent({ userId: source.userId, clientSessionId: source.parentClientSessionId })
+      throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
+    }
+    if (observed.state !== 'active') throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
+  }
+
+  private async _checkDelegateRetryExecution(input: RunDelegateInput): Promise<void> {
+    if (!input.retrySource) return
+    const { key, source } = input.retrySource
+    const guard = this._delegateRetrySourceGuard(key, source, () => {})
+    await this._checkDelegateRetrySource(key, source, guard)
+    const native = this.sessions.resolveStrictNativeResume(source.childSessionKey)
+    if (!native || !input.requireNativeResume || native.nativeSessionId !== input.requireNativeResume.nativeSessionId ||
+        native.engine !== input.requireNativeResume.engine) throw new DelegateRetryUnavailable(409, 'retry_native_unavailable')
+  }
+
+  private async _retryUserDelegate(raw: DelegateRetryActionKey, authorize: () => void): Promise<{ replay: boolean; action: DelegateRetryAction }> {
+    const key = checkedDelegateRetryActionKey(raw)
+    try { return await this._acceptUserDelegateRetry(key, authorize) }
+    catch (error) {
+      // A concurrent tab can accept this exact action during any preparation
+      // await, then retire its source/native before this tab resumes. Auth is
+      // still mandatory, but that late request must return the immutable target,
+      // not misreport the action as rejected or recreate it. Inner reservations
+      // have already been released before this read-only recovery.
+      authorize()
+      const replay = this._delegateJobs?.getRetryAction(key)
+      if (replay) return { replay: true, action: replay }
+      throw error
+    }
+  }
+
+  private async _acceptUserDelegateRetry(raw: DelegateRetryActionKey, authorize: () => void): Promise<{ replay: boolean; action: DelegateRetryAction }> {
+    const key = checkedDelegateRetryActionKey(raw), store = this._delegateJobs
+    authorize()
+    if (!store?.hasDurableUserSurface) throw new DelegateRetryUnavailable(503, 'retry_not_ready')
+    // Read-only replay precedes runtime/source existence and capacity, including
+    // permanent tombstones. It can NEVER start an executor or recreate a target.
+    const replay = store.getRetryAction(key)
+    if (replay) return { replay: true, action: replay }
+    if (!isDelegateSmEnabled() || !isDelegateDurableEffective() || !isDelegateNotifierEffective() || !this._delegateReconcileReady) {
+      throw new DelegateRetryUnavailable(503, 'retry_not_ready')
+    }
+    const source = store.getRetrySource(key.userId, key.sourceJobId, key.generation)
+    if (!source) throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
+    const guard = this._delegateRetrySourceGuard(key, source, authorize)
+    await this._checkDelegateRetrySource(key, source, guard)
+    const cfg = await this._getAgentsConfig(); guard()
+    const projection = await fetchIdentityCompatProjection(); guard()
+    const targetIdentity = projection ? resolveIdentityCompat(source.targetAgentId, projection) : undefined
+    const callerIdentity = projection ? resolveIdentityCompat(source.sourceAgentId, projection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
+    if (callerIdentity) assertIdentityCompatReady(callerIdentity)
+    const target = cfg.agents.find(a => a.id === (targetIdentity?.executionAgentId ?? source.targetAgentId))
+    const caller = cfg.agents.find(a => a.id === (callerIdentity?.executionAgentId ?? source.sourceAgentId))
+    // Review-model selection belongs to the original team policy, not this button.
+    if (!target || !caller || source.depth >= 3 || isTeamReviewExecution(source.targetAgentId)) {
+      throw new DelegateRetryUnavailable(409, 'retry_target_unavailable')
+    }
+    const model = source.model ?? this.sessions.getByKey(source.childSessionKey)?.model
+    if (!model) throw new DelegateRetryUnavailable(409, 'retry_model_unavailable')
+    const execution = await resolveLocalExecutionIfEnforced({ agent: { ...target, model }, kind: 'turn', model,
+      defaultModel: this.deps.config.defaults.model }); guard()
+    if ((execution?.engine ?? resolveEngine(model, target)) !== 'codex') throw new DelegateRetryUnavailable(409, 'retry_native_unsupported')
+    const required = this.sessions.resolveStrictNativeResume(source.childSessionKey)
+    if (!required) throw new DelegateRetryUnavailable(409, 'retry_native_unavailable')
+    // Last SQL/credential check precedes the entirely synchronous reserve+accept.
+    await this._checkDelegateRetrySource(key, source, guard)
+    const currentNative = this.sessions.resolveStrictNativeResume(source.childSessionKey)
+    if (!currentNative || currentNative.nativeSessionId !== required.nativeSessionId) throw new DelegateRetryUnavailable(409, 'retry_native_unavailable')
+    const concurrentReplay = store.getRetryAction(key)
+    if (concurrentReplay) return { replay: true, action: concurrentReplay }
+    const resume = (this._delegateResume ??= new DelegateResumeRegistry())
+    if (!resume.restoreTrustedIdle({ sessionKey: source.childSessionKey, parentSessionKey: source.parentSessionKey,
+      targetAgentId: source.targetAgentId, sourceAgent: source.sourceAgentId })) throw new DelegateRetryUnavailable(409, 'retry_child_busy')
+    const reservation = resume.preflight({ resumeSessionKey: source.childSessionKey, parentSessionKey: source.parentSessionKey,
+      targetAgentId: source.targetAgentId, sourceAgent: source.sourceAgentId })
+    if (!reservation.ok || !reservation.dispatchGranted) throw new DelegateRetryUnavailable(409, 'retry_child_busy')
+    const goal = '继续本子会话中尚未完成的原任务；保留已有上下文，报告真实结果。'
+    const input: RunDelegateInput = { targetAgentId: source.targetAgentId, sourceAgent: source.sourceAgentId,
+      parentSessionKey: source.parentSessionKey, sessionKey: source.childSessionKey, model, goal, depth: source.depth,
+      allowSelf: true, resumable: true, resumeMinted: false, callbackOnComplete: 'origin-inject',
+      callbackOriginSessionKey: source.originSessionKey, callbackOriginUserId: source.userId,
+      retrySource: Object.freeze({ key, source }), requireNativeResume: Object.freeze({ ...required }) }
+    let transferred = false
+    try {
+      const slotOpts = { parentBucketKey: source.parentSessionKey, isReview: false }
+      const admission = this._admitDelegateCreate(source.childSessionKey, slotOpts)
+      if (admission === 'full') throw new DelegateRetryUnavailable(429, 'retry_capacity')
+      input.capacitySlotOpts = slotOpts; input.capacityReserved = admission === 'slot'
+      guard()
+      const accepted = store.acceptRetryAction(key, source, this.sessions.getByKey(source.parentSessionKey)?.runner.engineId)
+      if ('error' in accepted) throw new DelegateRetryUnavailable(accepted.error === 'capacity' ? 429 : 409, 'retry_' + accepted.error)
+      if (accepted.kind === 'replay') return { replay: true, action: accepted.action }
+      input.backgroundJobId = accepted.action.targetJobId
+      this._executeAcceptedDelegateJob(input, store, accepted.action.targetJobId, goal, source.targetAgentId, true)
+      transferred = true
+      return { replay: false, action: accepted.action }
+    } finally {
+      if (!transferred) {
+        this._releasePreadmittedDelegateCapacity(input)
+        resume.abort(source.childSessionKey, false)
+      }
+    }
+  }
+
+  /** Original terminal/notify wrapper shared by tool creates and user retries. */
   private _executeAcceptedDelegateJob(runInput: RunDelegateInput, store: DelegateJobStore, jobId: string, goal: string, targetAgentId: string, sm: boolean): void {
   void this._runDelegateTask(runInput)
     .then((result) => {
@@ -14979,6 +15138,11 @@ export class Gateway {
       }
     }
 
+    if (input.requireNativeResume &&
+        (delegateExec?.engine ?? resolveEngine(requestedModel ?? execAgent.model, execAgent)) !== input.requireNativeResume.engine) {
+      return { kind: 'rejected', httpStatus: 409, message: 'retry_native_unsupported' }
+    }
+
     const sessionKey =
       input.sessionKey ??
       `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
@@ -15254,8 +15418,12 @@ export class Gateway {
         httpStatus,
         message,
         failureClass,
-        drop: gate.status === 'queue_full',
+        drop: gate.status === 'queue_full' && !input.retrySource,
       })
+    }
+    if (input.retrySource) {
+      try { await this._checkDelegateRetryExecution(input) }
+      catch (error) { this._releaseDelegateSlot(slotOpts); unregisterDelegation?.(); throw error }
     }
     if (isDelegateSmEnabled() && input.backgroundJobId) {
       const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
@@ -15489,7 +15657,10 @@ export class Gateway {
     let session: AgentSession
     let detachAncestorActivity: (() => void) | undefined
     try {
+      if (input.retrySource) await this._checkDelegateRetryExecution(input)
       session = await this.sessions.getOrCreate({
+        ...(input.requireNativeResume ? { requireNativeResume: input.requireNativeResume } : {}),
+        ...(input.retrySource ? { userId: input.retrySource.source.userId } : {}),
         sessionKey,
         agent: execAgent,
         // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
@@ -15519,6 +15690,7 @@ export class Gateway {
         },
       })
       hooks?.onSessionSpawned?.()
+      if (input.retrySource) await this._checkDelegateRetryExecution(input)
       session._durableDelegateTranscript = durableTranscript
       session._durableDelegateRuntimeEvents = durableRuntimeEvents
       session._durableDelegateEngineBillings = durableEngineBillings
@@ -15719,7 +15891,8 @@ export class Gateway {
       engineBillingAdmission?.requestId,
       undefined,
       undefined,
-      { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
+      { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}),
+        ...(input.requireNativeResume ? { requireNativeResume: input.requireNativeResume } : {}) },
     )
     try {
       await Promise.race([submitPromise, timeoutPromise])

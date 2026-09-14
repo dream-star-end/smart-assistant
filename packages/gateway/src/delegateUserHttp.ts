@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { DelegateJobStore } from './delegateJobs.js'
 import type { DelegateFailureCursor } from './delegateDurable.js'
+import { DelegateRetryUnavailable, type DelegateRetryActionKey, type DelegateRetryAction } from './delegateRetrySource.js'
 
 /** New user APIs, not the native receipt or CLI-consumed protocol. */
 export const DELEGATE_USER_PREFIX = '/api/delegates/'
@@ -9,6 +10,7 @@ export type DelegateUserHttpDeps = {
   store: () => DelegateJobStore | undefined
   readBody: (req: IncomingMessage) => Promise<string>
   reconcileLifecycle: (userId: string, authorize: () => void) => Promise<boolean>
+  retry: (key: DelegateRetryActionKey, authorize: () => void) => Promise<{ replay: boolean; action: DelegateRetryAction }>
   send: (res: ServerResponse, status: number, value: unknown) => void
 }
 function cursor(raw: string | null): DelegateFailureCursor | undefined {
@@ -29,17 +31,23 @@ export async function handleDelegateUserHttp(req: IncomingMessage, res: ServerRe
   const userId = deps.user()
   if (!userId) return error(401, 'user_authentication_required')
   const ack = /^\/api\/delegates\/inbox\/([A-Za-z0-9_-]{1,128})\/ack$/.exec(url.pathname)
+  const retry = /^\/api\/delegates\/inbox\/([A-Za-z0-9_-]{1,128})\/retry$/.exec(url.pathname)
   const read = url.pathname === DELEGATE_USER_PREFIX + 'inbox' || url.pathname === DELEGATE_USER_PREFIX + 'summary'
-  if (!ack && !read) return error(404, 'not_found')
-  if ((ack && req.method !== 'POST') || (read && req.method !== 'GET')) return error(405, 'method_not_allowed')
-  let generation: number | undefined, options: { limit?: number; before?: DelegateFailureCursor } = {}
+  if (!ack && !retry && !read) return error(404, 'not_found')
+  if (((ack || retry) && req.method !== 'POST') || (read && req.method !== 'GET')) return error(405, 'method_not_allowed')
+  let generation: number | undefined, actionId: string | undefined, options: { limit?: number; before?: DelegateFailureCursor } = {}
   try {
-    if (ack) {
+    if (ack || retry) {
       if (url.search) throw Error('unexpected query')
       const body: unknown = JSON.parse(await deps.readBody(req))
-      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).join(',') !== 'generation') throw Error('invalid body')
+      if (!body || typeof body !== 'object' || Array.isArray(body) ||
+          Object.keys(body).sort().join(',') !== (retry ? 'actionId,generation' : 'generation')) throw Error('invalid body')
       generation = (body as { generation: number }).generation
       if (!Number.isSafeInteger(generation) || generation < 0) throw Error('invalid generation')
+      if (retry) {
+        actionId = (body as { actionId: string }).actionId
+        if (typeof actionId !== 'string' || !/^[A-Za-z0-9_-]{16,80}$/.test(actionId)) throw Error('invalid action')
+      }
     } else if (url.pathname.endsWith('/inbox')) {
       if ([...url.searchParams.keys()].some(key => !['limit', 'before'].includes(key)) ||
           url.searchParams.getAll('limit').length > 1 || url.searchParams.getAll('before').length > 1) throw Error('invalid query')
@@ -54,6 +62,15 @@ export async function handleDelegateUserHttp(req: IncomingMessage, res: ServerRe
   if (!store) return error(503, 'delegate_user_surface_unavailable')
   try {
     const authorize = () => { if (deps.user() !== userId) throw new Error('delegate user expired') }
+    // Replay is read-only and must remain possible even after the original
+    // source is retired. The retry coordinator performs exact lifecycle checks
+    // for NEW actions rather than a full inbox scan before looking up replay.
+    if (retry) {
+      const result = await deps.retry({ userId, sourceJobId: retry[1], generation: generation!, actionId: actionId! }, authorize)
+      authorize()
+      return deps.send(res, result.replay ? 200 : 202, { version: 1, jobId: result.action.targetJobId,
+        state: result.action.state, replay: result.replay })
+    }
     const complete = await deps.reconcileLifecycle(userId, authorize)
     if (deps.user() !== userId) return error(401, 'user_authentication_expired')
     if (!complete) return error(503, 'delegate_user_lifecycle_pending')
@@ -69,6 +86,6 @@ export async function handleDelegateUserHttp(req: IncomingMessage, res: ServerRe
         summaryCode: row.summaryCode, summaryText: row.summaryText, failedAt: row.failedAt,
         // Retry is unavailable until the complete durable source/action path is wired.
         retry: { available: false, reason: 'retry_not_ready' } })) })
-  } catch { return error(deps.user() !== userId ? 401 : 503,
-    deps.user() !== userId ? 'user_authentication_expired' : 'delegate_user_surface_unavailable') }
+  } catch (err) { return error(deps.user() !== userId ? 401 : err instanceof DelegateRetryUnavailable ? err.status : 503,
+    deps.user() !== userId ? 'user_authentication_expired' : err instanceof DelegateRetryUnavailable ? err.code : 'delegate_user_surface_unavailable') }
 }
