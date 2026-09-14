@@ -58,13 +58,23 @@ describe("PinnedDelegateTracker", () => {
     expect(screen.getByText("coding-assistant")).toBeInTheDocument();
   });
 
-  test("运行中且传入 onStop 时 header 有停止本轮，点击只停轮不 dismiss", () => {
-    const onStop = vi.fn();
-    const onDismiss = vi.fn();
-    render(<PinnedDelegateTracker items={[item()]} onDismiss={onDismiss} onStop={onStop} />);
-    fireEvent.click(screen.getByRole("button", { name: "停止本轮" }));
-    expect(onStop).toHaveBeenCalledTimes(1);
-    expect(onDismiss).not.toHaveBeenCalled();
+  test("Stop has one owner in Composer, not a duplicate HUD button", () => {
+    render(<PinnedDelegateTracker items={[item()]} onDismiss={() => {}} onStop={() => {}} />);
+    expect(screen.queryByRole("button", { name: "停止本轮" })).toBeNull();
+  });
+
+  test("failed legacy diagnostic opens durable inbox and never locally ACKs", () => {
+    const open = vi.fn(), dismiss = vi.fn();
+    render(<PinnedDelegateTracker items={[item({ state: "failed", resultSummary: '{"token":"secret"}' })]} onDismiss={dismiss} onOpenFailures={open} />);
+    expect(screen.queryByRole("button", { name: "知道了" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看失败" }));
+    expect(open).toHaveBeenCalledOnce(); expect(dismiss).not.toHaveBeenCalled();
+    expect(screen.queryByText(/secret/)).toBeNull();
+  });
+
+  test("durable failure surface replaces, not duplicates, raw session failed HUD", () => {
+    const { container } = render(<PinnedDelegateTracker items={[item({ state: "failed" })]} onDismiss={() => {}} failuresInInbox />);
+    expect(container.firstChild).toBeNull();
   });
 
   test("无 onStop 时不渲染停止本轮假按钮", () => {

@@ -57,14 +57,19 @@ function StatusMark({ state }: { state: string }) {
 function DelegateRow({
   item,
   onDismiss,
+  onOpenFailures,
 }: {
   item: InflightDelegateItem;
   onDismiss: (jobId: string) => void;
+  onOpenFailures?: () => void;
 }) {
   const terminal = isTerminalDelegateState(item.state);
   const goalLine = firstLine(item.goal);
-  const hint = item.liveHint.trim();
-  const summary = item.state === "completed" ? firstLine(item.resultSummary ?? "") : "";
+  const failed = item.state === "failed" || item.state === "killed_by_cutover";
+  const hint = terminal ? "" : item.liveHint.trim();
+  const rawSummary = firstLine(item.resultSummary ?? "");
+  const summary = failed ? (item.state === "killed_by_cutover" ? "子任务因服务切换中断" : "子任务失败，请查看原会话了解详情")
+    : item.state === "completed" ? (/^[{[]/.test(rawSummary) ? "子任务已结束，请查看原会话结果" : rawSummary.slice(0, 160)) : "";
   const name = agentDisplayName(item.agentId) || item.agentId;
   return (
     <div className="flex items-start gap-2 text-body">
@@ -84,12 +89,12 @@ function DelegateRow({
           </div>
         ) : null}
         {summary ? (
-          <div className="truncate text-faint" title={item.resultSummary}>
+          <div className="truncate text-faint" title={summary}>
             {summary}
           </div>
         ) : null}
       </div>
-      {terminal ? (
+      {terminal && (!failed || onOpenFailures) ? (
         <Button
           type="button"
           variant="ghost"
@@ -97,10 +102,11 @@ function DelegateRow({
           className="shrink-0"
           onClick={(e) => {
             e.stopPropagation();
-            onDismiss(item.jobId);
+            if (failed) onOpenFailures?.();
+            else onDismiss(item.jobId);
           }}
         >
-          知道了
+          {failed ? "查看失败" : "知道了"}
         </Button>
       ) : null}
     </div>
@@ -110,13 +116,19 @@ function DelegateRow({
 export function PinnedDelegateTracker({
   items,
   onDismiss,
-  onStop,
+  onOpenFailures,
+  failuresInInbox = false,
 }: {
   items: InflightDelegateItem[];
   onDismiss: (jobId: string) => void;
+  /** Kept as a type-only compatibility prop; Stop has one UI owner: Composer. */
   onStop?: () => void;
+  onOpenFailures?: () => void;
+  /** Route failure feedback to the durable account inbox, not a second per-session ACK list. */
+  failuresInInbox?: boolean;
 }) {
-  const visible = useMemo(() => visibleDelegateItems(items), [items]);
+  const visible = useMemo(() => visibleDelegateItems(failuresInInbox
+    ? items.filter(item => item.state !== "failed" && item.state !== "killed_by_cutover") : items), [items, failuresInInbox]);
   const live = visible.filter((item) => !isTerminalDelegateState(item.state));
   const running = live.filter((item) => isRunningState(item.state));
   const latestRunning =
@@ -214,20 +226,6 @@ export function PinnedDelegateTracker({
             )}
             {expanded && <span className="flex-1" />}
           </button>
-          {hasRunning && onStop ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              className="shrink-0"
-              onClick={(e) => {
-                e.stopPropagation();
-                onStop();
-              }}
-            >
-              停止本轮
-            </Button>
-          ) : null}
           <button
             type="button"
             onClick={toggle}
@@ -248,7 +246,7 @@ export function PinnedDelegateTracker({
             className="flex max-h-52 flex-col gap-1.5 overflow-y-auto border-t border-border px-3 py-2"
           >
             {visible.map((item) => (
-              <DelegateRow key={item.jobId} item={item} onDismiss={onDismiss} />
+              <DelegateRow key={item.jobId} item={item} onDismiss={onDismiss} onOpenFailures={onOpenFailures} />
             ))}
           </div>
         )}

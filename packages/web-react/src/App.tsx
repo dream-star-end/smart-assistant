@@ -105,6 +105,8 @@ import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
+import { useDelegateFailures } from "./hooks/useDelegateFailures";
+import { DelegateFailureInbox, knownFailureParentId } from "./components/chat/DelegateFailureInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
@@ -1742,6 +1744,8 @@ export function App() {
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
   const inbox = useInbox(auth, inWorkspace && !demo);
+  // Separate from station messages: account-wide durable failures, even with no active session.
+  const delegateFailures = useDelegateFailures(auth, user?.id ?? null, inWorkspace && !demo);
 
   // GitHub OAuth 回调返回：URL 带 ?github_linked / ?github_error → toast + 清 query（仅一次，
   // 对齐 v3 handleBootGithubParams）。redirect 回 /?github_linked=1，全局 toast 即时反馈。
@@ -3689,7 +3693,8 @@ export function App() {
             <PinnedDelegateTracker
               items={inflightDelegates.items}
               onDismiss={inflightDelegates.dismiss}
-              onStop={stopTurn}
+              onOpenFailures={() => delegateFailures.controller?.setOpen(true)}
+              failuresInInbox={delegateFailures.state.summary !== null}
             />
           )}
           {!demo && !gated && (
@@ -3795,6 +3800,19 @@ export function App() {
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
           />
+          {!demo && delegateFailures.controller && user && (
+            <DelegateFailureInbox
+              key={JSON.stringify([user.id, auth?.snapshot().epoch])}
+              state={delegateFailures.state}
+              controller={delegateFailures.controller}
+              onOpenParent={(parentKey) => {
+                const id = knownFailureParentId(parentKey, sessions, user.id);
+                if (!id) return false;
+                selectSession(id);
+                return true;
+              }}
+            />
+          )}
         </div>
         </>
         )}

@@ -38,6 +38,11 @@ function count(value: unknown): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw invalid();
   return value;
 }
+function timestamp(value: unknown): number {
+  const n = count(value);
+  if (n > 8_640_000_000_000_000) throw invalid();
+  return n;
+}
 function text(value: unknown, max: number): string {
   if (typeof value !== "string" || value.length > max) throw invalid();
   return value;
@@ -68,7 +73,7 @@ export function parseFailurePage(value: unknown): DelegateFailurePage {
     if (typeof retry.available !== "boolean" || (retry.reason !== null && typeof retry.reason !== "string")) throw invalid();
     return { jobId: jobId(row.jobId), generation: count(row.generation),
       parentSessionKey: text(row.parentSessionKey, 2048), summaryCode: text(row.summaryCode, 128),
-      summaryText: text(row.summaryText, 512), failedAt: count(row.failedAt),
+      summaryText: text(row.summaryText, 512), failedAt: timestamp(row.failedAt),
       retry: { available: retry.available, reason: retry.reason === null ? null : text(retry.reason, 128) } };
   });
   if (new Set(items.map(failureKey)).size !== items.length) throw invalid();
