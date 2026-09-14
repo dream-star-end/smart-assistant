@@ -170,7 +170,7 @@ test('handoff rejects foreign identity, stale generation, retired, malformed inp
  try{
   const old=await f.issue('creator');e.complete();const n=await e.next(),body={jobId:e.jobId,capability:n.capability}
   assert.equal((await f.post('handoff-status',body)).status,200)
-  for(const overrides of [{authorization:''},{[DELEGATE_CONTEXT_HEADER]:''},{authorization:jwt('c:4')}])assert.notEqual((await f.post('handoff-status',body,overrides)).status,200)
+  for(const overrides of ([{authorization:''},{[DELEGATE_CONTEXT_HEADER]:''},{authorization:jwt('c:4')}] as Record<string,string>[]))assert.notEqual((await f.post('handoff-status',body,overrides)).status,200)
   for(const extra of [{generation:0},{receiptNonce:'a'.repeat(64)},{sourceTurn:TURN}])assert.equal((await f.post('handoff-status',{...body,...extra})).status,400)
   assert.equal((await f.post('handoff-status',{...body,capability:old})).status,409)
   for(const [column,value] of [['callback_origin_user_id','c:4'],['parent_session_key','foreign'],['retired_at',1],['generation',1]] as const){
@@ -199,5 +199,25 @@ test('handoff reauthenticates after real SQL await, fails closed for unknown and
   ;(f.gw as any)._receiptClientState=async()=> 'unknown';assert.equal((await f.post('handoff-status',body)).status,503)
   ;(f.gw as any)._receiptClientState=original
   await storage.deleteClientSession('handoff-private','c:3');assert.equal((await f.post('handoff-status',body)).status,409);n.turn.end()
+ }finally{await f.close();e.jobs.close()}
+})
+
+test('handoff validates context, capability and exact owner after SQL suspension',async()=>{
+ const f=await fixture('c:3'),e=await enrolled(f)
+ try {
+  e.complete();const n=await e.next(),body={jobId:e.jobId,capability:n.capability}
+  const original=(f.gw as any)._receiptClientState.bind(f.gw)
+  const {DELEGATE_CONTEXT_TTL_MS}=await import('../delegateContext.js')
+  for(const kind of ['context','capability','turn'] as const){
+   const until=Date.now()+250
+   const context=kind==='context'?issueDelegateContextToken({agentId:'main',sessionKey:SESSION,depth:0,ttlMs:250}):f.context
+   const claims=f.caps.verify(n.capability)!
+   const cap=kind==='capability'?f.caps.issue({...claims,contextHash:createHash('sha256').update(context).digest('hex')},until-DELEGATE_CONTEXT_TTL_MS):
+    f.caps.issue({...claims,contextHash:createHash('sha256').update(context).digest('hex')})
+   ;(f.gw as any)._receiptClientState=async(parent:unknown)=>{const state=await original(parent);await new Promise(r=>setTimeout(r,Math.max(1,until+30-Date.now())));if(kind==='turn')f.parent._currentTurnKey='moved';return state}
+   const result=await f.post('handoff-status',{...body,capability:cap},{[DELEGATE_CONTEXT_HEADER]:context})
+   assert.equal(result.status,kind==='turn'?409:401,kind)
+  }
+  n.turn.end()
  }finally{await f.close();e.jobs.close()}
 })

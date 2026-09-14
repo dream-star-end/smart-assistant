@@ -174,7 +174,12 @@ try {
   }else if(mode==='end') {
    assert.equal(adapter.checkReceiptOwner(savedOwner),'inactive')
   }
-  enableMasterCallback();releaseChild()
+  enableMasterCallback()
+  if(requestedMode==='handoff-running') {
+   await until(()=>http.some(r=>r.path==='/api/delegate/receipt-owner/handoff-status'&&r.status===200),'handoff must return before child completes')
+   assert.equal(jobs.snapshotOf(jobId)?.state,'running');assert.equal(accepted.size,0)
+  }
+  releaseChild()
   await until(()=>jobs.snapshotOf(jobId)?.state==='completed','child terminal')
  }else {assert.equal(received,true);assert.equal(before?.state,'ingested')}
  enableMasterCallback()
@@ -197,6 +202,7 @@ try {
   const waited=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id==='real_waiter'):[])
   assert.equal(waited.length,1);assert.notEqual(waited[0].is_error,true,JSON.stringify(waited))
   assert.ok(JSON.stringify(waited).includes('原回调'));assert.ok(!JSON.stringify(waited).includes(sentinel))
+  if(requestedMode==='handoff-running')assert.ok(JSON.stringify(waited).includes('仍在运行'))
   assert.ok(!JSON.stringify(waited).includes('receipt-locator'))
   assert.equal(http.filter(r=>r.path==='/api/delegate/receipt-owner/handoff-status'&&r.status===200).length,1)
   assert.equal(http.filter(r=>r.path==='/api/delegate/wait'||r.path==='/api/delegate/receipt-owner/input').length,0)
