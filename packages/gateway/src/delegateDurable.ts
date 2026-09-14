@@ -829,7 +829,7 @@ export class DelegateDurableDb {
     checkedDelegateRetryActionKey(key)
     const expected = checkedDelegateRetrySource(expectedSource)
     this.throwIfInjectedFailure()
-    return this.db.transaction(() => {
+    return this.db.transaction((): ReturnType<DelegateDurableDb['acceptRetryAction']> => {
       const replay = this.getRetryAction(key)
       if (replay) return { kind: 'replay', action: replay, target: this.get(replay.targetJobId) }
       const source = this.getRetrySource(key.userId, key.sourceJobId, key.generation)

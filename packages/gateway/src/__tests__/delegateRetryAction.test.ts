@@ -1,7 +1,7 @@
 /** Original store/SQLite acceptance, claims, terminal and reconciliation.
  * Does not claim HTTP authorization/native attach/model or notifier E2E. */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -164,4 +164,61 @@ test('shared original execution wrapper preserves accepted retry failure instead
     const replay = f.jobs.acceptRetryAction(f.key, f.source); assert.ok('kind' in replay); assert.equal(replay.kind, 'replay')
     assert.equal(replay.action.targetJobId, a.action.targetJobId)
   } finally { if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME; else process.env.OPENCLAUDE_HOME = previousHome; f.close() }
+})
+
+for (const phase of ['accepted', 'dispatched'] as const) test(`real SIGKILL after ${phase} keeps action target and original recovery never blind reexecutes`, { timeout: 20000 }, async () => {
+  const f = fixture(), fixturePath = fileURLToPath(new URL('./fixtures/delegateRetryAction.fixture.ts', import.meta.url))
+  const output = join(f.dir, 'executions.txt')
+  const child = spawn(process.execPath, ['--import', 'tsx', fixturePath, f.path, JSON.stringify(f.key), JSON.stringify(f.source), output, phase],
+    { env: { PATH: process.env.PATH, NODE_ENV: 'test', HOME: f.dir }, stdio: ['pipe', 'pipe', 'pipe'] })
+  const closed = once(child, 'close'); let stdout = '', stderr = ''
+  const deadline = setTimeout(() => child.kill('SIGKILL'), 16000)
+  try {
+    const held = new Promise<{ held: string; target: string }>((resolve, reject) => {
+      child.stdout!.on('data', bytes => {
+        stdout += bytes
+        if (stdout.includes('READY\n') && !child.stdin!.writableEnded) child.stdin!.end('GO\n')
+        for (const line of stdout.split('\n')) {
+          try { const row = JSON.parse(line); if (row.held) resolve(row) } catch { /* fragmented JSON */ }
+        }
+      })
+      child.stderr!.on('data', bytes => { stderr += bytes })
+      child.once('close', () => { if (!stdout.includes('"held"')) reject(new Error(stderr || 'no durable hold point')) })
+    })
+    const evidence = await held
+    assert.equal(evidence.held, phase); assert.equal(f.db.getRetryAction(f.key)?.state, phase)
+    child.kill('SIGKILL'); const [code, signal] = await closed
+    assert.equal(code, null); assert.equal(signal, 'SIGKILL'); assert.equal(existsSync(output), false)
+    const fresh = new DelegateJobStore({ sm: true, durable: new DelegateDurableDb(f.path), bootId: 'verified-after-sigkill' })
+    try {
+      const replay = fresh.acceptRetryAction(f.key, f.source); assert.ok('kind' in replay)
+      assert.equal(replay.kind, 'replay'); assert.equal(replay.action.targetJobId, evidence.target)
+      reconcileDelegateJobsOnBoot(fresh, { isChildAlive: () => false })
+      if (phase === 'accepted') {
+        assert.equal(fresh.snapshotOf(evidence.target)?.state, 'queued')
+        assert.equal(fresh.getRetryAction(f.key)?.state, 'accepted')
+        const claim = fresh.claimQueued(evidence.target); assert.ok(claim.ok)
+        assert.equal(fresh.claimQueued(evidence.target).ok, false)
+      } else {
+        assert.equal(fresh.snapshotOf(evidence.target)?.state, 'killed_by_cutover')
+        assert.equal(fresh.getRetryAction(f.key)?.state, 'terminal')
+        assert.equal(fresh.claimQueued(evidence.target).ok, false)
+      }
+      assert.equal(existsSync(output), false, 'original reconciliation is not an executor')
+    } finally { fresh.close() }
+  } finally { clearTimeout(deadline); child.kill('SIGKILL'); await closed; f.close() }
+})
+
+test('capacity rejection leaves no accepted action or target/source; later identical action remains valid', () => {
+  const f = fixture(), busy: string[] = []
+  try {
+    for (let i = 0; i < 4; i++) {
+      const made = f.jobs.create('busy', { queued: true, sessionKey: 'private-busy-' + i }); assert.ok('jobId' in made); busy.push(made.jobId)
+    }
+    const before = f.counts()
+    assert.deepEqual(f.jobs.acceptRetryAction(f.key, f.source), { error: 'capacity' }); assert.deepEqual(f.counts(), before)
+    assert.equal(f.jobs.getRetryAction(f.key), undefined)
+    f.jobs.fail(busy[0]!, { failureClass: 'internal', detail: 'private release capacity', httpStatus: 503 })
+    const accepted = f.jobs.acceptRetryAction(f.key, f.source); assert.ok('kind' in accepted); assert.equal(accepted.kind, 'accepted')
+  } finally { f.close() }
 })
