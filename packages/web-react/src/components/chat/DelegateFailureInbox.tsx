@@ -81,7 +81,9 @@ export function DelegateFailureInbox({ state, controller, onOpenParent }: {
           </li>;
         })}
       </ul>
+      {/* Keep confirmation in the parent dialog's React tree. A sibling portal
+          counts as an outside interaction and can dismiss the inbox on replay. */}
+      {confirmElement}
     </Modal>
-    {confirmElement}
   </>;
 }
