@@ -111,6 +111,8 @@ def drain():
   try:rawpty.extend(os.read(master,65536))
   except OSError:pass
  (d/'terminal.raw').write_bytes(rawpty)
+def terminal_text():
+ text=rawpty.decode(errors='replace');text=re.sub(r'\x1b\[\d+C',' ',text);text=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',text);return re.sub(r'\s+',' ',text)
 def until(check,label,seconds):
  end=time.monotonic()+seconds
  while not check():
@@ -126,7 +128,7 @@ try:
   os.write(master,b'\x1b[A\r') # real selection of the isolated synthetic key only
   until(lambda:b'pid:' in rawpty or b'Welcome back!' in rawpty,'interactive prompt after synthetic key approval',20)
  os.write(master,b'Run the private gated shell once and report its completion.')
- until(lambda:b'Run the private gated shell' in rawpty,'real terminal text entry',5)
+ until(lambda:'Run the private gated shell once and report its completion.' in terminal_text(),'real terminal text entry',5)
  for _ in range(4): drain()
  os.write(master,b'\r')
  if mode=='unowned':
