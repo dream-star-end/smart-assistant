@@ -32,7 +32,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 10
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 11
 
 // Additive local SQLite schema; no FK/TTL cascade from runtime jobs to retry identity.
 const DDL_V9 = `
@@ -625,6 +625,23 @@ export class DelegateDurableDb {
             BEGIN SELECT CASE WHEN oc_delegate_schema10() IS NOT 10
               THEN RAISE(ABORT,'delegate identity schema10 writer required') END; END;`)
         }
+      }
+      if (current < 11) {
+        // Bun's native SQLite has no UDF registration. These are precisely the
+        // original receipt coordinator's jobs writes; its physical barrier,
+        // binding and paired receipt/job CAS still enforce delivery ownership.
+        // Identity/result/state/retirement and every other current column stay
+        // fenced. Future column-adding migrations MUST rebuild this trigger.
+        const bookkeeping = new Set(['callback', 'callback_state', 'callback_epoch',
+          'notify_retry_at', 'notify_delivery_token', 'notify_claimed_until',
+          'last_activity_at', 'updated_at', 'notify_attempt', 'notify_a_attempted_at'])
+        const protectedColumns = (this.db.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{ name: string }>)
+          .map(row => row.name).filter(name => !bookkeeping.has(name))
+          .map(name => '"' + name.replaceAll('"', '""') + '"')
+        this.db.exec(`DROP TRIGGER identity_v10_delegate_jobs_update;
+          CREATE TRIGGER identity_v10_delegate_jobs_update BEFORE UPDATE OF ${protectedColumns.join(',')} ON delegate_jobs
+          BEGIN SELECT CASE WHEN oc_delegate_schema10() IS NOT 10
+            THEN RAISE(ABORT,'delegate identity schema10 writer required') END; END;`)
       }
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
