@@ -113,9 +113,8 @@ if (mode === 'retry') testAgents.push({ id: 'retry-worker', model: 'gpt-5.6-sol'
 const gw: any = new Gateway({ config, agentsConfig: { agents: testAgents, routes: [], default: 'main' } } as any);
 if (mode === 'retry') writeFileSync(join(dir, 'agents.yaml'), JSON.stringify({ agents: testAgents, routes: [], default: 'main' }));
 gw._delegateDurablePath = join(dir, 'delegate-jobs.db');
-const jobs = gw._ensureDelegateJobStore();
-assert.equal(jobs.acceptsDeliveryReceipts, false);
-Object.defineProperty(jobs, 'acceptsDeliveryReceipts', { get: () => true });
+const { enrollPrivateReceiptStore } = await import(root + '/packages/gateway/src/__tests__/fixtures/receiptStoreEnrollment.fixture.ts');
+const jobs = enrollPrivateReceiptStore(gw, dir);
 const terminalWork: Promise<any>[] = [];
 const dispatch = gw._dispatchDelegateNotify.bind(gw);
 gw._dispatchDelegateNotify = (job: any) => { const work = dispatch(job); terminalWork.push(work); work.then(() => send({ type: 'notify-finished', rows: jobs.durable.db.prepare('SELECT job_id,state FROM delegate_delivery_receipt').all() }), () => { }); return work; };

@@ -13,6 +13,7 @@ import { Gateway } from '../../server.js'
 import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
+import { enrollPrivateReceiptStore } from './receiptStoreEnrollment.fixture.js'
 
 const requestedMode=process.argv[3] || 'end';const managed=requestedMode.startsWith('managed-');const scenarioMode=managed?requestedMode.slice(8):requestedMode;const kairos=requestedMode==='kairos';let creatorRequestAt=0,kairosElapsedMs:number|undefined;const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const handoffIngested=requestedMode==='handoff-ingested';const mixed=requestedMode==='handoff-mixed';let mixedStage=0,mixedBefore:any;let mixedRows:any[]=[];const mode=handoffIngested||kairos?'ingested-end':handoff?'cross-turn':scenarioMode;let jobToWait='',discovered=false,handoffWaiting=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r});let releaseCurrent:()=>void=()=>{};const currentGate=new Promise<void>(r=>{releaseCurrent=r})
@@ -142,11 +143,9 @@ const gw=new Gateway({config,agentsConfig:{agents:[{id:'main',model:config.defau
 // Keep the actual production constructor, terminal hook, boot/retry scheduler and notifier.
 // Only fixture enrollment opts in; production gate is unchanged and asserted closed.
 ;(gw as any)._delegateDurablePath=dbPath
-const jobs=(gw as any)._ensureDelegateJobStore()
-assert.equal(jobs.acceptsDeliveryReceipts,false)
+const jobs=enrollPrivateReceiptStore(gw,dir)
 const db=(jobs as any).durable as DelegateDurableDb
 assert.ok(db instanceof DelegateDurableDb);assert.equal(db.path,dbPath)
-Object.defineProperty(jobs,'acceptsDeliveryReceipts',{get:()=>true})
 const dispatch=(gw as any)._dispatchDelegateNotify.bind(gw)
 ;(gw as any)._dispatchDelegateNotify=(job:any)=>{const work=dispatch(job);terminalWork.push(work);return work}
 ;(gw as any)._readDelegateMemoryPressure=()=>null
