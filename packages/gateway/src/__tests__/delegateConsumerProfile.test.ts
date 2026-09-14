@@ -2,7 +2,11 @@ import { installDelegateSandbox } from './helpers/delegateSandbox.js'
 const sandbox = installDelegateSandbox()
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 import { test, type TestContext } from 'node:test'
 import Database from 'better-sqlite3'
 import { DelegateDurableDb as LegacyV4 } from './fixtures/delegateLegacyV4.fixture.js'
@@ -100,4 +104,80 @@ test('sealed profile cannot decrease, and a C0 store still reads preexisting sta
   const reader = new ReceiptDeliveryStore(f.path)
   reader.close()
   assert.equal(f.modern.minimumConsumer, 2)
+})
+
+function worker(t: TestContext, role: 'legacy' | 'modern', path: string) {
+  const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('./fixtures/delegateProfileProcess.fixture.ts', import.meta.url)), role, path],
+    { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: { ...process.env } })
+  type Reply = { event?: string; id?: number; ok?: boolean; result?: unknown; error?: string; pid?: number }
+  const messages: Reply[] = []
+  let serial = 0, output = '', ended = false
+  child.stdout.on('data', chunk => { output += String(chunk) })
+  child.stderr.on('data', chunk => { output += String(chunk) })
+  child.on('message', message => messages.push(message as Reply))
+  const exit = new Promise<number | null>(resolve => child.once('exit', code => { ended = true; resolve(code) }))
+  child.on('error', error => { output += String(error) })
+  const until = async (predicate: (r: Reply) => boolean) => {
+    const deadline = Date.now() + 15000
+    for (;;) {
+      const value = messages.find(predicate)
+      if (value) return value
+      if (ended || Date.now() > deadline) throw new Error(`private ${role} worker failed: ${output}`)
+      await delay(5)
+    }
+  }
+  const send = (command: string, job?: string) => {
+    const id = ++serial
+    child.send({ id, command, job })
+    return { id, result: until(m => m.id === id && m.ok !== undefined) }
+  }
+  t.after(async () => {
+    if (!ended) {
+      child.kill('SIGKILL')
+      await Promise.race([exit, delay(3000).then(() => { throw new Error('private profile child did not exit') })])
+    }
+    assert.equal(ended, true, 'independent writer cleanup must be observed')
+  })
+  return { send, until, messages, exit, pid: child.pid }
+}
+
+test('independent original v4 writer commits before racing seal and never writes after capability publication', { timeout: 25000 }, async t => {
+  const path = join(sandbox.root, 'process-profile.db')
+  const old = worker(t, 'legacy', path)
+  const ready = await old.until(m => m.event === 'ready')
+  assert.notEqual(ready.pid, process.pid)
+  assert.equal((await old.send('write', 'old-before-c0').result).ok, true)
+  const modern = worker(t, 'modern', path)
+  await modern.until(m => m.event === 'ready')
+  assert.notEqual(modern.pid, old.pid)
+  const reader = new Database(path)
+  t.after(() => reader.close())
+  assert.equal(readDelegateConsumerProfile(reader), 1)
+  assert.equal((await old.send('write', 'old-after-c0').result).ok, true)
+
+  const holding = old.send('hold-write', 'old-transaction')
+  await old.until(m => m.id === holding.id && m.event === 'holding')
+  const seal = modern.send('seal')
+  await modern.until(m => m.id === seal.id && m.event === 'sealing')
+  await delay(100)
+  assert.equal(modern.messages.some(m => m.id === seal.id && m.ok !== undefined), false,
+    'capability cannot publish while original old write transaction holds the lock')
+  assert.equal(readDelegateConsumerProfile(reader), 1)
+  assert.equal(reader.prepare("SELECT 1 FROM delegate_jobs WHERE job_id='old-transaction'").get(), undefined,
+    'old transaction really remains uncommitted')
+  writeFileSync(join(sandbox.root, 'release-writer'), 'release private writer')
+  assert.equal((await holding.result).ok, true)
+  assert.deepEqual(await seal.result, { id: seal.id, ok: true, result: { floor: 2, admits: true } })
+  assert.ok(reader.prepare("SELECT 1 FROM delegate_jobs WHERE job_id='old-transaction'").get())
+  assert.equal(readDelegateConsumerProfile(reader), 2)
+  for (const command of ['write', 'fresh-write']) {
+    const result = await old.send(command, command + '-after-seal').result
+    assert.equal(result.ok, false)
+    assert.match(result.error!, /oc_delegate_schema10/)
+    assert.equal(reader.prepare('SELECT 1 FROM delegate_jobs WHERE job_id=?').get(command + '-after-seal'), undefined)
+  }
+  for (const process of [old, modern]) {
+    assert.equal((await process.send('close').result).ok, true)
+    assert.equal(await process.exit, 0, 'worker closes naturally after business assertions')
+  }
 })

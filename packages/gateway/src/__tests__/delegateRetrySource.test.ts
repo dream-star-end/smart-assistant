@@ -6,12 +6,21 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import Database from 'better-sqlite3'
 import { DelegatePublicOwnerBindings } from '../delegatePublicOwner.js'
 import { signedOwner } from './fixtures/delegateSignedOwner.fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'delegate-retry-source-'))
+// This fixture has no master server. Do not inherit a real container's identity
+// or let a private HTTP request escape to its master compatibility endpoint.
+const containerKeys = ['OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN', 'OC_USER_ID'] as const
+const containerEnv = Object.fromEntries(containerKeys.map(key => [key, process.env[key]]))
+for (const key of containerKeys) delete process.env[key]
+after(() => { for (const key of containerKeys) {
+  if (containerEnv[key] === undefined) delete process.env[key]
+  else process.env[key] = containerEnv[key]
+} })
 process.env.OPENCLAUDE_HOME = home
 process.env.OC_DELEGATE_SM = '1'
 process.env.OC_DELEGATE_DURABLE = '1'
@@ -29,7 +38,7 @@ function gate() {
   const promise = new Promise<void>(resolve => { release = resolve })
   return { promise, release }
 }
-async function fixture(peer?: string, physicalUser = 'c:7') {
+async function fixture(peer?: string, physicalUser = 'c:7', newSourceAdmission = true) {
   const dir = mkdtempSync(join(home, 'case-')), peerId = peer ?? dir.split('/').pop()!
   await storage.upsertClientSession({ id: peerId, userId: physicalUser, agentId: 'main', title: 'private source',
     pinned: false, createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
@@ -37,8 +46,10 @@ async function fixture(peer?: string, physicalUser = 'c:7') {
     _currentTurnKey: 'private-source-turn', channel: 'webchat', peerId, runner: {} }
   let visible = parent, now = Date.now(), executions = 0
   const path = join(dir, 'delegate.db'), db = new DelegateDurableDb(path)
-  // No blanket failureInbox opt-in: only proven source creation may enable it.
-  const jobs = new DelegateJobStore({ durable: db, sm: true, ttlMs: 100, now: () => now })
+  // These C1 source tests explicitly opt in to the already-sealed protocol.
+  // No blanket failureInbox: only proven source creation may enable an inbox.
+  const jobs = new DelegateJobStore({ durable: db, sm: true, deliveryReceipts: newSourceAdmission,
+    ttlMs: 100, now: () => now })
   const gw: any = new Gateway({ config: { version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: TOKEN },
     auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: join(dir, 'sessions.db') },
     defaults: { model: 'glm-5.2', permissionMode: 'default' }, channels: { webchat: { enabled: true } } } as never,
@@ -75,6 +86,29 @@ async function fixture(peer?: string, physicalUser = 'c:7') {
       clearTimeout(gw._notifyRetryTimer); clearTimeout(gw._receiptCandidateTimer); jobs.close(); db.close(); sql.close() },
   }
 }
+
+for (const enabled of [false, true]) test(`D17 bootstrap signed HTTP source admission ${enabled ? 'enabled' : 'disabled'}`, async () => {
+  const f = await fixture(undefined, 'default', enabled)
+  try {
+    f.gw._delegatePublicOwners = new DelegatePublicOwnerBindings()
+    f.gw._delegatePublicOwners.bind(f.parent, signedOwner(7))
+    const made = await f.post({ failureInbox: true, deliveryReceipts: true, userId: 'c:8',
+      retrySource: { userId: 'c:8', storageUserId: 'default' } })
+    assert.equal(made.status, 200, JSON.stringify(made))
+    assert.equal(f.counts().executions, 1, 'ordinary child still executes with admission disabled')
+    assert.equal(f.db.minimumConsumer, enabled ? 2 : 1)
+    assert.equal(f.counts().sources, enabled ? 1 : 0)
+    assert.equal(f.jobs.userFailureInbox('c:7').count, enabled ? 1 : 0)
+    assert.equal(f.jobs.userFailureInbox('c:8').count, 0)
+    const source = f.db.getRetrySource('c:7', made.data.jobId, 0)
+    if (enabled) {
+      assert.equal(source?.userId, 'c:7'); assert.equal(source.storageUserId, 'default')
+      assert.equal(source.parentSessionKey, f.parent.sessionKey)
+      assert.equal(source.childSessionKey, made.data.sessionKey)
+    } else assert.equal(source, undefined)
+    assert.equal((f.sql.prepare('SELECT count(*) n FROM delegate_delivery_receipt').get() as { n: number }).n, 0)
+  } finally { await f.close() }
+})
 
 test('HTTP authenticated create captures exact source, enables only its inbox, survives runtime TTL/reopen', async () => {
   const f = await fixture()
