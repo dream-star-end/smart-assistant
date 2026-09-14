@@ -196,6 +196,7 @@ test('original Gateway HTTP survives persistent terminal AND cleanup fault with 
       assert.equal(freshDb.getDeliveryReceipt(bound.id, 0)?.state, 'offered')
       assert.equal(freshDb.get(bound.id)?.generation, 0)
     } finally { fresh.close() }
+    assert.equal(f.store.thawDispatch('drain:other'), true)
     const next = f.create()
     const success = await request('/internal/v3/delegate-begin-cutover?generation=74')
     assert.equal(success.status, 200); const body = await success.json() as any
