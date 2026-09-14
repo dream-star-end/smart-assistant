@@ -416,3 +416,17 @@ test('D14 source notification held by actual callback barrier rejects late SQL d
     await f.close()
   }
 })
+
+test('D14 create persists only the actual parent workspace witness, not request extras', async () => {
+  const f = await fixture()
+  try {
+    f.parent.workspaceMode = 'isolated_v1'
+    const made = await f.post({ parentWorkspaceMode: 'legacy', retrySource: { parentWorkspaceMode: 'legacy' } })
+    assert.equal(made.status, 200)
+    const source = f.db.getRetrySource('c:7', made.data.jobId, 0)!
+    assert.equal(source.parentWorkspaceMode, 'isolated_v1')
+    const before = f.counts()
+    assert.throws(() => f.jobs.create('coding-assistant', { callbackOriginUserId: source.userId, parentSessionKey: source.parentSessionKey, sessionKey: source.childSessionKey, retrySource: { ...source, parentWorkspaceMode: 'forged' } as any }), /workspace/)
+    assert.deepEqual(f.counts(), before)
+  } finally { await f.close() }
+})

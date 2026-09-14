@@ -3856,6 +3856,9 @@ export class Gateway {
     })
     this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
 
+    this._delegateRetryBootReady = true
+    void this._resumeAcceptedDelegateRetries()
+
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
     this.bootAutoResume().catch((err) =>
       this.log.error('auto-resume boot failed', undefined, err),
@@ -11296,6 +11299,8 @@ export class Gateway {
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+  private _delegateRetryBootReady = false
+  private _delegateRetryRecovering = false
   /** OCV5-164 heartbeat-timeout reaper + ledger retention janitor. */
   private _delegateReapTimer: ReturnType<typeof setInterval> | undefined
   private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
@@ -11332,7 +11337,7 @@ export class Gateway {
       if (summary.scanned > 0) {
         this.log.info('delegate durable reconcile', summary)
       }
-      restoreResumeOccupancyFromJobs(resume, store)
+      restoreResumeOccupancyFromJobs(resume, store, job => ['accepted', 'source_deleted'].includes(store.getRetryActionForTarget(job.id)?.state ?? ''))
       const filled = backfillCronOccurrenceDelegateJobs(store)
       if (filled > 0) this.log.info('cron occurrence delegateJobId backfill', { filled })
       this._armDelegateReconcileFollowup(store, queueWaitMs)
@@ -11454,7 +11459,12 @@ export class Gateway {
       clearTimeout(this._delegateReconcileTimer)
       this._delegateReconcileTimer = undefined
     }
-    const next = nextDelegateReconcileAt(store, { queueWaitMs })
+    let next = nextDelegateReconcileAt(store, { queueWaitMs })
+    if (this._delegateRetryBootReady) {
+      try {
+        if (store.listUnclaimedRetryTargets().length) next = Math.min(next ?? Infinity, Date.now() + 30_000)
+      } catch (error) { this.log.warn('accepted retry deadline lookup deferred', undefined, error as Error) }
+    }
     if (next == null) return
     const delay = Math.max(0, next - Date.now())
     this._delegateReconcileTimer = setTimeout(() => {
@@ -11468,7 +11478,9 @@ export class Gateway {
       if (summary.killed > 0 || summary.capacityTimedOut > 0) {
         this.log.info('delegate durable reconcile follow-up', summary)
       }
-      this._armDelegateReconcileFollowup(this._delegateJobs, queueWaitMs)
+      void this._resumeAcceptedDelegateRetries().finally(() => {
+        if (this._delegateJobs) this._armDelegateReconcileFollowup(this._delegateJobs, queueWaitMs)
+      })
     }, delay)
     this._delegateReconcileTimer.unref()
   }
@@ -14003,15 +14015,16 @@ export class Gateway {
     if (!metadata || metadata.agentId !== source.sourceAgentId || !metadata.modelId) {
       throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_unavailable')
     }
-    // The ordinary bridge's workspaceMode is not in client_sessions. A live,
-    // exact child carries the inherited mode. Without this witness, fail closed
-    // rather than switching an isolated workspace to the legacy default.
+    // client_sessions lacks the bridge workspace policy. Use the immutable
+    // create-time source witness, or an exact live child's inherited mode for
+    // older rows; with neither, never guess the legacy default.
     const child = this.sessions.getByKey(source.childSessionKey)
-    if (!child || child.userId !== source.userId || child.agentId !== source.targetAgentId ||
-        child.channel !== 'delegate' || child.parentSessionKey !== source.parentSessionKey) {
+    if (child && (child.userId !== source.userId || child.agentId !== source.targetAgentId ||
+        child.channel !== 'delegate' || child.parentSessionKey !== source.parentSessionKey)) {
       throw new DelegateRetryUnavailable(409, 'retry_parent_workspace_unavailable')
     }
-    const workspaceMode = child.workspaceMode
+    const workspaceMode = source.parentWorkspaceMode ?? child?.workspaceMode
+    if (!workspaceMode) throw new DelegateRetryUnavailable(409, 'retry_parent_workspace_unavailable')
     const cfg = await this._getAgentsConfig(); check()
     const agent = cfg.agents.find(a => a.id === metadata.agentId)
     if (!agent) throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
@@ -14022,7 +14035,7 @@ export class Gateway {
       check()
       const current = await getClientSessionCollabParent(source.parentClientSessionId, source.userId); check()
       if (JSON.stringify(current) !== JSON.stringify(metadata) || this.sessions.getByKey(source.childSessionKey) !== child ||
-          child.workspaceMode !== workspaceMode || child.userId !== source.userId || child.parentSessionKey !== source.parentSessionKey) {
+          (child && (child.workspaceMode !== workspaceMode || child.userId !== source.userId || child.parentSessionKey !== source.parentSessionKey))) {
         throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_changed')
       }
     }
@@ -14114,14 +14127,17 @@ export class Gateway {
     }
   }
 
-  private async _acceptUserDelegateRetry(raw: DelegateRetryActionKey, authorize: () => void): Promise<{ replay: boolean; action: DelegateRetryAction }> {
+  private async _acceptUserDelegateRetry(raw: DelegateRetryActionKey, authorize: () => void, recoverTarget?: string): Promise<{ replay: boolean; action: DelegateRetryAction }> {
     const key = checkedDelegateRetryActionKey(raw), store = this._delegateJobs
     authorize()
     if (!store?.hasDurableUserSurface) throw new DelegateRetryUnavailable(503, 'retry_not_ready')
     // Read-only replay precedes runtime/source existence and capacity, including
     // permanent tombstones. It can NEVER start an executor or recreate a target.
     const replay = store.getRetryAction(key)
-    if (replay) return { replay: true, action: replay }
+    const recoverable = (action: DelegateRetryAction | undefined) => action?.targetJobId === recoverTarget &&
+      action?.state === 'accepted' && store.snapshotOf(action.targetJobId)?.state === 'queued'
+    if (replay && (!recoverTarget || !recoverable(replay))) return { replay: true, action: replay }
+    if (recoverTarget && !replay) throw new DelegateRetryUnavailable(409, 'retry_action_unavailable')
     if (!isDelegateSmEnabled() || !isDelegateDurableEffective() || !isDelegateNotifierEffective() || !this._delegateReconcileReady) {
       throw new DelegateRetryUnavailable(503, 'retry_not_ready')
     }
@@ -14154,7 +14170,7 @@ export class Gateway {
     const currentNative = this.sessions.resolveStrictNativeResume(source.childSessionKey)
     if (!currentNative || currentNative.nativeSessionId !== required.nativeSessionId) throw new DelegateRetryUnavailable(409, 'retry_native_unavailable')
     const concurrentReplay = store.getRetryAction(key)
-    if (concurrentReplay) return { replay: true, action: concurrentReplay }
+    if (concurrentReplay && (!recoverTarget || !recoverable(concurrentReplay))) return { replay: true, action: concurrentReplay }
     const resume = (this._delegateResume ??= new DelegateResumeRegistry())
     if (!resume.restoreTrustedIdle({ sessionKey: source.childSessionKey, parentSessionKey: source.parentSessionKey,
       targetAgentId: source.targetAgentId, sourceAgent: source.sourceAgentId })) throw new DelegateRetryUnavailable(409, 'retry_child_busy')
@@ -14174,7 +14190,11 @@ export class Gateway {
       if (admission === 'full') throw new DelegateRetryUnavailable(429, 'retry_capacity')
       input.capacitySlotOpts = slotOpts; input.capacityReserved = admission === 'slot'
       guard()
-      const accepted = store.acceptRetryAction(key, source, this.sessions.getByKey(source.parentSessionKey)?.runner.engineId)
+      const recovered = recoverTarget ? store.getRetryAction(key) : undefined
+      if (recoverTarget && !recoverable(recovered)) throw new DelegateRetryUnavailable(409, 'retry_action_unavailable')
+      const accepted = recovered
+        ? { kind: 'accepted' as const, action: recovered }
+        : store.acceptRetryAction(key, source, this.sessions.getByKey(source.parentSessionKey)?.runner.engineId)
       if ('error' in accepted) throw new DelegateRetryUnavailable(accepted.error === 'capacity' ? 429 : 409, 'retry_' + accepted.error)
       if (accepted.kind === 'replay') return { replay: true, action: accepted.action }
       input.backgroundJobId = accepted.action.targetJobId
@@ -14186,6 +14206,41 @@ export class Gateway {
         this._releasePreadmittedDelegateCapacity(input)
         resume.abort(source.childSessionKey, false)
       }
+    }
+  }
+
+  /** Boot/follow-up share the original accept preparation, queue and executor.
+   * Only an accepted+queued immutable target is resumable; dispatched is never
+   * re-issued. Transient/busy stays with the original queue deadline/reconciler. */
+  private async _resumeAcceptedDelegateRetries(): Promise<void> {
+    const store = this._delegateJobs
+    if (!this._delegateRetryBootReady || this._delegateRetryRecovering || this._shuttingDown ||
+        !store || !isDelegateSmEnabled() || !isDelegateDurableEffective() || !isDelegateNotifierEffective()) return
+    this._delegateRetryRecovering = true
+    try {
+      for (const target of store.listUnclaimedRetryTargets()) {
+        try {
+          const action = store.getRetryActionForTarget(target)
+          if (action?.state === 'source_deleted') {
+            store.fail(target, { failureClass: 'internal', detail: 'retry_source_unavailable', httpStatus: 409 })
+            continue
+          }
+          if (!action || action.state !== 'accepted') continue
+          await this._acceptUserDelegateRetry(action, () => {
+            if (this._shuttingDown || this._delegateJobs !== store) throw new DelegateRetryUnavailable(503, 'retry_not_ready')
+          }, target)
+        } catch (error) {
+          if (error instanceof DelegateRetryUnavailable && error.status === 409 && error.code !== 'retry_child_busy') {
+            if (store.snapshotOf(target)?.state === 'queued') store.fail(target, {
+              failureClass: 'internal', detail: error.code, httpStatus: 409,
+            })
+          } else this.log.warn('accepted delegate retry deferred', { jobId: target }, error as Error)
+        }
+      }
+    } catch (error) { this.log.warn('accepted delegate retry scan deferred', undefined, error as Error) }
+    finally {
+      this._delegateRetryRecovering = false
+      if (this._delegateJobs === store && !this._shuttingDown) this._armDelegateReconcileFollowup(store, parseDelegateQueueWaitMs())
     }
   }
 
@@ -14290,7 +14345,7 @@ export class Gateway {
     const root = chain.at(-1)
     if (!root || root.channel !== 'webchat' || !root.peerId || root.peerId === 'unknown') return {}
     const project = (s: AgentSession) => JSON.stringify([s.sessionKey, s.agentId, s.userId,
-      s.channel, s.peerId, s.parentSessionKey, s._currentTurnKey])
+      s.channel, s.peerId, s.parentSessionKey, s._currentTurnKey, s.workspaceMode])
     const snapshots = chain.map(project)
     const clientSessionId = root.peerId
     const lifecycle = await this._receiptClientState(root)
@@ -14309,7 +14364,8 @@ export class Gateway {
     if (lifecycle !== 'active') return denied(lifecycle === 'deleted' ? 409 : 503, 'delegate source session unavailable')
     return { revalidate, source: Object.freeze({ version: 1, userId, parentSessionKey: parent.sessionKey,
       parentClientSessionId: clientSessionId, originSessionKey: root.sessionKey,
-      targetAgentId, sourceAgentId: parent.agentId, depth: claims.depth, model: model ?? null }) }
+      targetAgentId, sourceAgentId: parent.agentId, depth: claims.depth, model: model ?? null,
+      ...(parent.workspaceMode === 'legacy' || parent.workspaceMode === 'isolated_v1' ? { parentWorkspaceMode: parent.workspaceMode } : {}) }) }
   }
 
   private async handleDelegateTask(

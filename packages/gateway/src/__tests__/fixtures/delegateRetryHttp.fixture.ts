@@ -44,11 +44,11 @@ async function main() {
   const childSession = await sm.getOrCreate({ sessionKey: childKey, agent: agents[1]!, model: 'gpt-6-astra',
     channel: 'delegate', peerId: 'main', parentSessionKey: parentKey, userId, hermeticNoTools: true,
     requireNativeResume: { engine: 'codex', nativeSessionId: nativeId } })
-  const db = new DelegateDurableDb(join(home, 'delegate.db')), sql = new Database(join(home, 'delegate.db'))
-  const jobs = new DelegateJobStore({ durable: db, sm: true })
+  let db = new DelegateDurableDb(join(home, 'delegate.db')); const sql = new Database(join(home, 'delegate.db'))
+  let jobs = new DelegateJobStore({ durable: db, sm: true })
   gw._delegateJobs = jobs
   const source = { version: 1 as const, userId, parentSessionKey: parentKey, originSessionKey: parentKey,
-    parentClientSessionId: peer, childSessionKey: childKey, targetAgentId: 'worker', sourceAgentId: 'main', depth: 0, model: 'gpt-6-astra' }
+    parentClientSessionId: peer, childSessionKey: childKey, targetAgentId: 'worker', sourceAgentId: 'main', depth: 0, model: 'gpt-6-astra', ...(mode.startsWith('boot-') ? { parentWorkspaceMode: 'legacy' as const } : {}) }
   const made = jobs.create('worker', { retrySource: source, callbackOriginUserId: userId,
     callbackOriginSessionKey: parentKey, sessionKey: childKey, parentSessionKey: parentKey })
   assert.ok('jobId' in made)
@@ -100,8 +100,59 @@ async function main() {
       return config
     }
   }
+  let booted = false
   try {
-    if (mode === 'parent-restore-expired') {
+    if (mode.startsWith('boot-')) {
+      const key = { userId, sourceJobId: made.jobId, generation: 0, actionId: action }
+      const accepted = jobs.acceptRetryAction(key, source, 'codex')
+      assert.ok(!('error' in accepted)); const target = accepted.action.targetJobId
+      assert.equal(jobs.snapshotOf(target)?.state, 'queued')
+      if (mode === 'boot-dispatched') assert.equal(jobs.claimQueued(target).ok, true)
+      if (mode === 'boot-deleted') await deleteClientSession(peer, userId)
+      if (mode === 'boot-missing-native') { unlinkSync(artifact); ins.sessions.delete(childKey) }
+      // Simulate the persisted acceptance boundary without executing. Reopen the
+      // original durable store through actual Gateway.start; native/app-server
+      // seed and billing remain private seams, not a real Codex CLI restart.
+      jobs.close(); db.close(); gw._delegateJobs = undefined
+      gw._delegateDurablePath = join(home, 'delegate.db')
+      ins.sessions.delete(parentKey)
+      // This case tests boot dispatch, not callback model admission. Retain
+      // pending notification without fabricating durable ACK or contacting an
+      // actual model; D13/retry-master callback acceptance remains separate.
+      gw.injectSendToAgentCallback = async () => ({ kind: 'retryable_failure', code: 'NO_TRANSPORT' })
+      let unregisteredSpawns = 0
+      // Defense in the test, not production: the seeded child has its own real
+      // synthetic-stdio ensureSpawned. No other kernel may launch a CLI/network.
+      kernel.constructor.prototype.ensureSpawned = async () => {
+        unregisteredSpawns++; throw new Error('PRIVATE_BOOT_UNREGISTERED_NATIVE_PROCESS')
+      }
+      await gw.start(); booted = true
+      jobs = gw._delegateJobs
+      db = new DelegateDurableDb(join(home, 'delegate.db'))
+      if (mode === 'boot-accepted' || mode === 'boot-missing-native') {
+        for (let i = 0; i < 1200 && !jobs.snapshotOf(target)?.result; i++) await new Promise(r => setTimeout(r, 10))
+        const terminal = jobs.snapshotOf(target)!
+        assert.ok(terminal.result, JSON.stringify(terminal))
+        assert.match(JSON.stringify(terminal.result), mode === 'boot-accepted' ? /PRIVATE_NATIVE_CONTINUATION_RESULT/ : /retry_native_unavailable/)
+      }
+      const requests = existsSync(rpcLog) ? readFileSync(rpcLog, 'utf8').trim().split('\n').map(s => JSON.parse(s)) : []
+      assert.equal(requests.filter(r => r.method === 'thread/start').length, 0)
+      assert.equal(requests.filter(r => r.method === 'turn/start').length, mode === 'boot-accepted' ? 1 : 0)
+      const replay = await post(); assert.equal(replay.status, 200); assert.equal(replay.body.jobId, target)
+      assert.equal(billed, mode === 'boot-accepted' ? 1 : 0)
+      assert.equal(unregisteredSpawns, 0)
+      assert.equal(counts().jobs, 2); assert.equal(counts().actions, 1)
+      if (mode !== 'boot-dispatched') assert.equal(counts().resume, 0)
+      assert.equal(counts().slots, 0); assert.equal(counts().waiters, 0)
+      if (mode === 'boot-deleted') assert.equal(db.getRetryAction(key)?.state, 'source_deleted')
+      if (mode === 'boot-dispatched') assert.notEqual(db.getRetryAction(key)?.state, 'accepted')
+      if (mode === 'boot-accepted' || mode === 'boot-missing-native') {
+        const restored = sm.getByKey(parentKey)!
+        assert.equal(restored.userId, userId); assert.equal(restored._currentTurnKey, undefined)
+        assert.equal(restored.turns, 0)
+      }
+      process.stdout.write(JSON.stringify({ mode, target, methods: requests.map(r => r.method), counts: counts() }) + '\n')
+    } else if (mode === 'parent-restore-expired') {
       const exp = Math.floor(Date.now() / 1000) + 2
       const originalRead = gw._getAgentsConfig.bind(gw)
       gw._getAgentsConfig = async () => {
@@ -203,6 +254,7 @@ async function main() {
     process.stdout.write(`RETRY_HTTP_PASS ${mode}\n`)
   } finally {
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()))
+    if (booted) await gw.shutdown(false)
     lines.close(); rpc.kill('SIGKILL'); await closed
     clearTimeout(gw._receiptCandidateTimer); clearTimeout(gw._notifyRetryTimer)
     jobs.close(); db.close(); sql.close(); await sm.awaitResumeMapFlush()

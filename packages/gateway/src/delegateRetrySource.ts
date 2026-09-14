@@ -10,6 +10,8 @@ export type DelegateRetrySource = Readonly<{
   sourceAgentId: string
   depth: number
   model: string | null
+  /** Captured from the trusted parent, never reconstructed from environment. */
+  parentWorkspaceMode?: 'legacy' | 'isolated_v1'
 }>
 
 export type DelegateRetryActionKey = Readonly<{ userId: string; sourceJobId: string; generation: number; actionId: string }>
@@ -45,9 +47,13 @@ export function checkedDelegateRetrySource(value: DelegateRetrySource): Delegate
   if (value.model !== null && (typeof value.model !== 'string' || !value.model.trim() || value.model.length > 200)) {
     throw new Error('invalid delegate retry source model')
   }
+  if (value.parentWorkspaceMode !== undefined && value.parentWorkspaceMode !== 'legacy' && value.parentWorkspaceMode !== 'isolated_v1') {
+    throw new Error('invalid delegate retry parent workspace')
+  }
   // Project an exact field set: callers cannot persist goal/result/credential extras.
   return Object.freeze({ version: 1, userId: value.userId, parentSessionKey: value.parentSessionKey,
     parentClientSessionId: value.parentClientSessionId, originSessionKey: value.originSessionKey,
     childSessionKey: value.childSessionKey, targetAgentId: value.targetAgentId,
-    sourceAgentId: value.sourceAgentId, depth: value.depth, model: value.model })
+    sourceAgentId: value.sourceAgentId, depth: value.depth, model: value.model,
+    ...(value.parentWorkspaceMode === undefined ? {} : { parentWorkspaceMode: value.parentWorkspaceMode }) })
 }

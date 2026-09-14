@@ -824,6 +824,19 @@ export class DelegateDurableDb {
     return !!this.db.prepare('SELECT 1 FROM delegate_retry_action WHERE target_job_id=?').get(jobId)
   }
 
+  getRetryActionForTarget(jobId: string): DelegateRetryAction | undefined {
+    const row = this.db.prepare('SELECT user_id,source_job_id,generation,action_id FROM delegate_retry_action WHERE target_job_id=?')
+      .get(jobId) as { user_id: string; source_job_id: string; generation: number; action_id: string } | undefined
+    return row ? this.getRetryAction({ userId: row.user_id, sourceJobId: row.source_job_id, generation: row.generation, actionId: row.action_id }) : undefined
+  }
+
+  /** Only original unclaimed targets, not dispatched intents or TTL tombstones. */
+  listUnclaimedRetryTargets(): string[] {
+    return (this.db.prepare(`SELECT a.target_job_id FROM delegate_retry_action a JOIN delegate_jobs j ON j.job_id=a.target_job_id
+      WHERE a.state IN ('accepted','source_deleted') AND j.state='queued' AND j.retired_at IS NULL ORDER BY a.created_at,a.target_job_id`)
+      .all() as Array<{ target_job_id: string }>).map(row => row.target_job_id)
+  }
+
   /** One accepted action and its original queued target in ONE DB transaction.
    * Authorization/native eligibility must precede this; immutable source equality
    * is checked again here. Replay never creates a replacement for a retired job. */

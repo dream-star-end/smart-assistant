@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { test } from 'node:test'
 
-for (const mode of ['success', 'missing-late', 'denied', 'write-fault', 'expired-body', 'expired-permission', 'deleted-after-accept', 'parent-restore', 'parent-metadata-missing', 'parent-restore-expired', 'parent-restore-race']) {
+for (const mode of ['success', 'missing-late', 'denied', 'write-fault', 'expired-body', 'expired-permission', 'deleted-after-accept', 'parent-restore', 'parent-metadata-missing', 'parent-restore-expired', 'parent-restore-race', 'boot-accepted', 'boot-dispatched', 'boot-deleted', 'boot-missing-native']) {
   test(`actual retry HTTP and original native executor: ${mode}`, { timeout: 45000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'retry-http-private-'))
     const child = spawn(process.execPath, ['--import', 'tsx',

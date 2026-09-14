@@ -137,11 +137,15 @@ function shouldDeferKill(
 export function restoreResumeOccupancyFromJobs(
   registry: DelegateResumeRegistry,
   store: DelegateJobStore,
+  isUnclaimedRetry: (job: DelegateJobSnapshot) => boolean = () => false,
 ): number {
   let n = 0
   for (const job of store.listNonTerminal()) {
     if (!job.sessionKey) continue
     if (job.kind === 'cron' || job.kind === 'taskboard' || job.kind === 'ccb_local') continue
+    // Accepted retry has no executor yet. Its exact source is revalidated and
+    // reserved by the original dispatcher; do not invent an active boot owner.
+    if (job.state === 'queued' && isUnclaimedRetry(job)) continue
     registry.restoreInFlight({
       sessionKey: job.sessionKey,
       parentSessionKey: job.parentSessionKey ?? '',

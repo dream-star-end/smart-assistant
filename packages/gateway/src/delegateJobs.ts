@@ -482,6 +482,8 @@ export class DelegateJobStore {
     return this.durable.getRetryAction(key)
   }
   isRetryTarget(jobId: string): boolean { return this.durable?.isRetryTarget(jobId) ?? false }
+  getRetryActionForTarget(jobId: string) { return this.durable?.getRetryActionForTarget(jobId) }
+  listUnclaimedRetryTargets(): string[] { return this.durable?.listUnclaimedRetryTargets() ?? [] }
   getRetrySource(userId: string, jobId: string, generation: number) {
     if (!this.durable) throw new Error('delegate retry requires durable store')
     return this.durable.getRetrySource(userId, jobId, generation)
