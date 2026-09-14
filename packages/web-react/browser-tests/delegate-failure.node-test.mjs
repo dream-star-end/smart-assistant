@@ -241,13 +241,15 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
         await p.goto(api.url);
         const failureBadge = p.getByTestId("delegate-failure-footer").getByRole("button", { name: /失败/ });
         await failureBadge.waitFor();
-        await p.waitForURL(/session-other/);
+        await p.getByText("另一会话", { exact: true }).waitFor();
+        assert.equal(api.sessionReads.includes("session-other"), true);
         const acks = api.ackCalls.length, writes = api.sessionWrites.length;
         assert.equal(api.sessionReads.includes("session-alice"), false, "source not loaded by aggregate inbox GET");
         await failureBadge.click();
         const inbox = p.getByRole("dialog", { name: "后台任务失败收件箱" });
+        const parentLoaded = p.waitForResponse(r => new URL(r.url()).pathname === "/api/sessions/session-alice" && r.request().method() === "GET");
         await inbox.locator("li[data-job-id]").first().getByRole("button", { name: "查看原会话", exact: true }).click();
-        await inbox.waitFor({ state: "hidden" }); await p.waitForURL(/session-alice/);
+        await inbox.waitFor({ state: "hidden" }); assert.equal((await parentLoaded).status(), 200);
         assert.equal(api.sessionReads.includes("session-alice"), true, "original selectSession triggered exact parent history GET");
         assert.equal(api.sessionWrites.length, writes, "navigation does not recreate source");
         assert.equal(api.ackCalls.length, acks);
