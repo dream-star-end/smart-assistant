@@ -385,8 +385,8 @@ acquire_selfhost_deploy_lock() {
   fi
   SELFHOST_DEPLOY_LOCK_HOLDER="${lock}.holder"
   starttime="$(python3 -c 'import os,sys
-p="/proc/%d/stat"%os.getpid()
-t=open(p).read(); rest=t[t.rfind(")")+2:].split(); print(rest[19])')" \
+p="/proc/%d/stat"%int(sys.argv[1])
+t=open(p).read(); rest=t[t.rfind(")")+2:].split(); print(rest[19])' "$$")" \
     || die "无法读取 /proc/$$/stat starttime(看护靠它防 PID reuse)"
   [[ "$starttime" =~ ^[0-9]+$ ]] || die "starttime 非法: $starttime"
   holder_line="$(printf 'pid=%s user=%s tree=%s started=%s starttime=%s\n' \
