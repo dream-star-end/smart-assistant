@@ -886,6 +886,23 @@ export class DelegateJobStore {
     return job.state
   }
 
+  /** Receipt/source generations identify persistent results, not cutover windows. */
+  hasCutoverGenerationBinding(jobId: string, generation: number): boolean {
+    return Boolean(this.durable?.hasDeliveryReceiptEnrollment(jobId) ||
+      this.durable?.hasRetrySource(jobId, generation))
+  }
+
+  /** Fence this owner's bound writer through the original terminal transaction.
+   * This is not proof that the child process or its descendants have exited. */
+  closeBoundForCutover(jobId: string, fence: { claimToken: string; fencingEpoch: number }): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job || job.state !== 'running' || job.ownerInstanceId !== this.bootId ||
+        job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch ||
+        !this.hasCutoverGenerationBinding(job.id, job.generation)) return false
+    return this.fail(jobId, { ...fence, nextState: 'killed_by_cutover',
+      failureClass: 'cutover', detail: 'delegate-cutover', httpStatus: 409 })
+  }
+
   /**
    * Phase F CAS: running → paused_for_cutover, rotate claim_token/fencing_epoch.
    * `runner_quiesced` only when the caller proved the runner stopped feeding turns.
@@ -903,6 +920,7 @@ export class DelegateJobStore {
     const job = this.refreshJob(jobId)
     if (!job || job.state !== 'running') return undefined
     if (job.claimToken !== args.claimToken || job.fencingEpoch !== args.fencingEpoch) return undefined
+    if (this.hasCutoverGenerationBinding(job.id, job.generation)) return undefined
     const gate = assertDelegateTransition('running', 'paused_for_cutover')
     if (!gate.ok) return undefined
     const now = this.now()

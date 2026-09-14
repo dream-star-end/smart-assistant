@@ -4,6 +4,8 @@
  * Flag-off callers must not invoke this. Timeout path marks remaining
  * running rows `paused_for_cutover` with checkpoint `none` — no SIGTERM,
  * no `failed`. G1 reconciler then ClaimPaused or killed_by_cutover.
+ * Generation-bound receipt/source jobs instead close via their original
+ * terminal CAS without rekeying identity. Neither path proves OS process exit.
  */
 import { DELEGATE_CUTOVER_FREEZE_MS } from '@openclaude/protocol'
 import type { DelegateJobSnapshot, DelegateJobStore } from './delegateJobs.js'
@@ -27,6 +29,7 @@ export type BeginCutoverResult = {
   timedOut: number
   completedDuring: number
   remainingRunning: number
+  closedBound: number
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -69,6 +72,9 @@ export type EndCutoverResult = {
   generation: number
   thawed: boolean
   closed: number
+  failed: number
+  /** Internal diagnostics only; never spread into an HTTP response. */
+  errors: Array<{ jobId?: string; error: unknown }>
 }
 
 /**
@@ -82,12 +88,21 @@ export function endDelegateCutover(
 ): EndCutoverResult {
   const thawed = store.thawDispatch(cutoverFreezeHolder(generation))
   let closed = 0
-  for (const job of store.listNonTerminal()) {
+  const errors: EndCutoverResult['errors'] = []
+  let jobs: DelegateJobSnapshot[] = []
+  try { jobs = store.listNonTerminal() }
+  catch (error) { errors.push({ error }) }
+  for (const job of jobs) {
     if (job.state !== 'paused_for_cutover') continue
     if (job.generation !== generation) continue
-    if (store.killOwnedPaused(job.id)) closed += 1
+    try {
+      if (store.killOwnedPaused(job.id)) closed += 1
+      else if (store.snapshotOf(job.id)?.state === 'paused_for_cutover') {
+        errors.push({ jobId: job.id, error: new Error('cutover paused writer remains') })
+      }
+    } catch (error) { errors.push({ jobId: job.id, error }) }
   }
-  return { generation, thawed, closed }
+  return { generation, thawed, closed, failed: errors.length, errors }
 }
 
 export async function beginDelegateCutover(
@@ -104,12 +119,21 @@ export async function beginDelegateCutover(
   store.freezeDispatch(cutoverFreezeHolder(generation))
   try {
     const initialIds = new Set(store.listRunning().map((job) => job.id))
+    const closedBound = new Set<string>()
+    const closeBound = (job: DelegateJobSnapshot): boolean => {
+      if (!store.hasCutoverGenerationBinding(job.id, job.generation)) return false
+      if (job.claimToken && store.closeBoundForCutover(job.id, {
+        claimToken: job.claimToken, fencingEpoch: job.fencingEpoch,
+      })) closedBound.add(job.id)
+      return true // Bound jobs must never fall back to generation-changing pause.
+    }
 
     const pauseIdle = (): number => {
       let n = 0
       for (const job of store.listRunning()) {
         if (isIdle(job) !== true) continue
         if (!job.claimToken) continue
+        if (closeBound(job)) continue
         const paused = store.pauseForCutover(job.id, {
           claimToken: job.claimToken,
           fencingEpoch: job.fencingEpoch,
@@ -131,6 +155,7 @@ export async function beginDelegateCutover(
     let timedOut = 0
     for (const job of store.listRunning()) {
       if (!job.claimToken) continue
+      if (closeBound(job)) continue
       const paused = store.pauseForCutover(job.id, {
         claimToken: job.claimToken,
         fencingEpoch: job.fencingEpoch,
@@ -142,22 +167,28 @@ export async function beginDelegateCutover(
 
     let completedDuring = 0
     for (const id of initialIds) {
+      if (closedBound.has(id)) continue
       const snap = store.snapshotOf(id)
       if (!snap || snap.state === 'completed' || snap.state === 'failed' || snap.state === 'cancelled') {
         completedDuring += 1
       }
     }
 
+    const remainingRunning = store.countRunning()
+    if (remainingRunning > 0) throw new Error(`delegate cutover incomplete: ${remainingRunning} running`)
     return {
       generation,
       paused: quiesced + timedOut,
       quiesced,
       timedOut,
       completedDuring,
-      remainingRunning: store.countRunning(),
+      remainingRunning,
+      closedBound: closedBound.size,
     }
   } catch (err) {
-    endDelegateCutover(store, generation)
+    const cleanup = endDelegateCutover(store, generation)
+    if (cleanup.failed > 0) throw new AggregateError(
+      [err, ...cleanup.errors.map(item => item.error)], 'delegate cutover and cleanup failed', { cause: err })
     throw err
   }
 }

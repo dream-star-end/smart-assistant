@@ -4493,16 +4493,18 @@ export class Gateway {
         generation,
         freezeBudgetMs: resolveDelegateCutoverFreezeMs(),
         isIdle: (job) => this._delegateRunnerIdle(job),
-      }).then(
-        (result) => {
-          this.sendJson(res, 200, { ok: true, ...result })
-        },
-        (err) => {
-          endDelegateCutover(store, generation)
+      }).then((result) => {
+        this.sendJson(res, 200, { ok: true, ...result })
+      }).catch((err) => {
+        // begin owns cleanup, including persistent failures during cleanup.
+        // A second unguarded end here could reject this detached Promise.
+        try {
           this.log.error('delegate begin-cutover failed', undefined, err as Error)
-          this.sendJson(res, 503, { ok: false, reason: 'cutover_quiesce_failed' })
-        },
-      )
+          if (!res.destroyed && !res.writableEnded) {
+            this.sendJson(res, 503, { ok: false, reason: 'cutover_quiesce_failed' })
+          }
+        } catch { res.destroy() }
+      })
       return
     }
 
@@ -4521,7 +4523,14 @@ export class Gateway {
         this.sendJson(res, 400, { ok: false, reason: 'generation_required' })
         return
       }
-      this.sendJson(res, 200, { ok: true, ...endDelegateCutover(store, rawGeneration) })
+      const result = endDelegateCutover(store, rawGeneration)
+      try {
+        for (const item of result.errors) this.log.error('delegate end-cutover cleanup failed', undefined, item.error as Error)
+        this.sendJson(res, result.failed > 0 ? 503 : 200, {
+          ok: result.failed === 0, generation: result.generation, thawed: result.thawed,
+          closed: result.closed, failed: result.failed,
+        })
+      } catch { res.destroy() }
       return
     }
 
