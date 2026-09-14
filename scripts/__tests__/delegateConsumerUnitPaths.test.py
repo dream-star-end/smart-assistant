@@ -54,7 +54,8 @@ class UnitPaths(unittest.TestCase):
 
     def test_unknown_exec_user_rootnamespace_or_missing_effective_command_refused(self):
         for extra in ['User=agent', 'RootDirectory=/private/jail', 'PassEnvironment=HOME',
-                      'UnsetEnvironment=HOME', 'ExecStart=/bin/bash /private/start.sh', 'ExecStart=']:
+                      'UnsetEnvironment=HOME', 'ExecStart=/bin/bash /private/start.sh', 'ExecStart=',
+                      'ProtectHome=tmpfs', 'PrivateTmp=yes', 'ExtensionImages=/private/overlay']:
             with self.subTest(extra=extra), self.assertRaises(units.Unknown):
                 self.resolve([BASE, '[Service]\n' + extra])
 

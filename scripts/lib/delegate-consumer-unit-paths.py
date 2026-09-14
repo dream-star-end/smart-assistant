@@ -20,7 +20,9 @@ ENTRYPOINTS = {
 # These can alter the actual path/user/environment outside this small parser.
 UNSUPPORTED = {"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths",
                "TemporaryFileSystem", "DynamicUser", "PAMName", "PassEnvironment",
-               "UnsetEnvironment", "SetLoginEnvironment", "EnvironmentDirectory"}
+               "UnsetEnvironment", "SetLoginEnvironment", "EnvironmentDirectory",
+               "ProtectHome", "PrivateTmp", "MountImages", "ExtensionImages",
+               "ExtensionDirectories"}
 
 
 class Unknown(Exception):
