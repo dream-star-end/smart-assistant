@@ -4,7 +4,8 @@ const sandbox = installDelegateSandbox()
 /** Real Python/SQLite classifier only: not a deploy/cutover/master ACK test. */
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { once } from 'node:events'
 import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,6 +22,45 @@ const receipt = { parentTurnKey: 'private-turn', nativeToolUseId: 'private-tool'
   receiptNonceHash: createHash('sha256').update('private-secret-nonce').digest('hex') }
 type Snapshot = { schema: number | null; required: number; absent: boolean; counts?: Record<string, number> }
 type Verdict = { status: string; required?: number; databases?: Snapshot[]; reason?: string }
+
+for (const mode of ['existing', 'absent'] as const) {
+  test(`two readonly scans cannot fence an independent ${mode} database first writer`, { timeout: 60_000 }, async t => {
+    const path = join(sandbox.root, `first-write-${mode}.db`)
+    const legacy = metadata(`first-write-${mode}-legacy.json`)
+    const worker = fileURLToPath(new URL('./fixtures/delegateCompatFirstWrite.fixture.ts', import.meta.url))
+    const loader = fileURLToPath(new URL('../../node_modules/tsx/dist/loader.mjs', import.meta.url))
+    const child = spawn(process.execPath, ['--import', loader, worker, path, mode], {
+      env: { PATH: process.env.PATH, HOME: sandbox.root, OPENCLAUDE_HOME: sandbox.root, NODE_ENV: 'test' },
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    })
+    let stderr = ''
+    child.stderr!.on('data', chunk => { stderr += chunk })
+    const closed = once(child, 'close')
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      await closed
+    })
+    assert.deepEqual(await once(child, 'message', { signal: AbortSignal.timeout(20_000) }), ['ready', undefined])
+    const before = [run([path], legacy), run([path], legacy)]
+    for (const result of before) {
+      assert.equal(result.code, 0)
+      assert.equal(result.verdict.required, 1)
+      assert.equal(result.verdict.databases?.[0]?.absent, mode === 'absent')
+    }
+    const sealed = once(child, 'message', { signal: AbortSignal.timeout(20_000) })
+    child.send('seal')
+    assert.deepEqual(await sealed, ['sealed', undefined])
+    const [code, signal] = await closed
+    assert.equal(code, 0, stderr)
+    assert.equal(signal, null)
+    assert.equal(stderr, '')
+    const after = run([path], legacy)
+    assert.equal(after.code, 1)
+    assert.equal(after.verdict.required, 2)
+    // This proves snapshot instability, not an implemented deployment barrier.
+    assert.equal(after.verdict.databases?.[0]?.schema, 12)
+  })
+}
 
 function metadata(name: string, capabilities: unknown = []) {
   const path = join(sandbox.root, name)
