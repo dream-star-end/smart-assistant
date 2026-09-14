@@ -15,7 +15,8 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
 import { effectiveDelegateOutcome } from './delegateOutcome.js'
-import { checkedDelegateRetrySource, type DelegateRetrySource } from './delegateRetrySource.js'
+import { checkedDelegateRetrySource, checkedDelegateRetryActionKey, type DelegateRetrySource,
+  type DelegateRetryActionKey, type DelegateRetryAction } from './delegateRetrySource.js'
 import type {
   DelegateCallback,
   DelegateCallbackState,
@@ -664,6 +665,7 @@ export class DelegateDurableDb {
     this.throwIfInjectedFailure()
     this.transaction(() => {
       if (this.hasDeliveryReceiptEnrollment(record.id)) throw new Error('receipt job requires fenced update')
+      if (this.isRetryTarget(record.id)) throw new Error('retry target requires fenced update')
       this.upsertStmt.run(toRow(record))
       const row = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id=?').get(record.id)
       this.persistFailureInbox(row as Record<string, unknown>)
@@ -802,6 +804,56 @@ export class DelegateDurableDb {
         WHERE f.user_id=s.user_id AND f.client_session_id=s.parent_client_session_id))`).get(jobId, generation)
   }
 
+  getRetryAction(key: DelegateRetryActionKey): DelegateRetryAction | undefined {
+    checkedDelegateRetryActionKey(key)
+    const row = this.db.prepare(`SELECT * FROM delegate_retry_action
+      WHERE user_id=? AND source_job_id=? AND generation=? AND action_id=?`)
+      .get(key.userId, key.sourceJobId, key.generation, key.actionId) as Record<string, unknown> | undefined
+    if (!row) return undefined
+    if (!['accepted', 'dispatched', 'terminal', 'source_deleted'].includes(String(row.state))) throw new Error('unknown retry action state')
+    return Object.freeze({ ...key, targetJobId: String(row.target_job_id), state: row.state as DelegateRetryAction['state'],
+      createdAt: num(row.created_at), dispatchedAt: row.dispatched_at == null ? null : num(row.dispatched_at),
+      terminalCode: row.terminal_code == null ? null : String(row.terminal_code) })
+  }
+
+  isRetryTarget(jobId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM delegate_retry_action WHERE target_job_id=?').get(jobId)
+  }
+
+  /** One accepted action and its original queued target in ONE DB transaction.
+   * Authorization/native eligibility must precede this; immutable source equality
+   * is checked again here. Replay never creates a replacement for a retired job. */
+  acceptRetryAction(key: DelegateRetryActionKey, expectedSource: DelegateRetrySource, target: DurableJobRecord, maxJobs: number):
+    | { kind: 'accepted' | 'replay'; action: DelegateRetryAction; target?: DurableJobRecord }
+    | { error: 'source_unavailable' | 'source_changed' | 'child_busy' | 'capacity' } {
+    checkedDelegateRetryActionKey(key)
+    const expected = checkedDelegateRetrySource(expectedSource)
+    this.throwIfInjectedFailure()
+    return this.db.transaction(() => {
+      const replay = this.getRetryAction(key)
+      if (replay) return { kind: 'replay', action: replay, target: this.get(replay.targetJobId) }
+      const source = this.getRetrySource(key.userId, key.sourceJobId, key.generation)
+      if (!source || !this.db.prepare(`SELECT 1 FROM delegate_failure_inbox WHERE user_id=? AND job_id=? AND generation=?`)
+        .get(key.userId, key.sourceJobId, key.generation)) return { error: 'source_unavailable' }
+      if (JSON.stringify(source) !== JSON.stringify(expected)) return { error: 'source_changed' }
+      if (target.state !== 'queued' || target.callback !== 'origin-inject' || target.kind !== 'delegate' || target.result != null ||
+          target.claimToken || target.attemptNo !== 0 || target.fencingEpoch !== 0 || target.idempotencyKey ||
+          target.callbackState !== 'none' || target.callbackEpoch !== 0 || target.generation !== 0 || target.id === key.sourceJobId ||
+          target.agentId !== source.targetAgentId || target.sessionKey !== source.childSessionKey ||
+          target.parentSessionKey !== source.parentSessionKey || target.callbackOriginUserId !== source.userId ||
+          target.callbackOriginSessionKey !== source.originSessionKey) throw new Error('invalid retry target binding')
+      if (this.db.prepare(`SELECT 1 FROM delegate_jobs WHERE session_key=? AND retired_at IS NULL
+        AND state IN ('queued','running','paused_for_cutover') LIMIT 1`).get(source.childSessionKey)) return { error: 'child_busy' }
+      const inserted = this.insertCreate(target, maxJobs, { retrySource: source })
+      if ('error' in inserted) return inserted
+      if ('reused' in inserted) throw new Error('retry target unexpectedly reused')
+      this.db.prepare(`INSERT INTO delegate_retry_action
+        (user_id,source_job_id,generation,action_id,target_job_id,state,created_at) VALUES(?,?,?,?,?,'accepted',?)`)
+        .run(key.userId, key.sourceJobId, key.generation, key.actionId, target.id, target.createdAt)
+      return { kind: 'accepted', action: this.getRetryAction(key)!, target }
+    }).immediate()
+  }
+
   private checkRetrySourceReuse(existing: DurableJobRecord, incoming?: DelegateRetrySource): void {
     const row = this.db.prepare('SELECT metadata_json,retired_at FROM delegate_retry_source WHERE job_id=? AND generation=?')
       .get(existing.id, existing.generation) as { metadata_json: string | null; retired_at: number | null } | undefined
@@ -827,7 +879,11 @@ export class DelegateDurableDb {
     record: DurableJobRecord,
   ): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
-    return this.transaction(() => {
+    return this.db.transaction(() => {
+      const retry = this.db.prepare('SELECT state FROM delegate_retry_action WHERE target_job_id=?')
+        .get(record.id) as { state: DelegateRetryAction['state'] } | undefined
+      if (retry && expected.state === 'queued' && record.state === 'running' &&
+          (retry.state !== 'accepted' || this.isRetrySourceRetired(record.id, record.generation))) return undefined
       if (this.hasDeliveryReceiptEnrollment(record.id)) {
         const bound = this.get(record.id)
         if (!bound || record.callback !== 'stdout-wait' || record.callbackState !== 'none' ||
@@ -842,10 +898,19 @@ export class DelegateDurableDb {
         expected_token: expected.claimToken ?? null,
       }) as Record<string, unknown> | undefined
       if (!row) return undefined
+      if (retry) {
+        if (expected.state === 'queued' && record.state === 'running') {
+          this.db.prepare(`UPDATE delegate_retry_action SET state='dispatched',dispatched_at=?
+            WHERE target_job_id=? AND state='accepted'`).run(record.lastActivityAt, record.id)
+        } else if (['completed', 'failed', 'cancelled', 'killed_by_cutover'].includes(record.state)) {
+          this.db.prepare(`UPDATE delegate_retry_action SET state='terminal',terminal_code=?
+            WHERE target_job_id=? AND state IN ('accepted','dispatched')`).run(record.failureClass ?? record.state, record.id)
+        }
+      }
       this.persistFailureInbox(row)
       this.persistDeliveryReceipt(row)
       return fromRow(row)
-    })
+    }).immediate()
   }
 
   hasDeliveryReceiptEnrollment(jobId: string): boolean {

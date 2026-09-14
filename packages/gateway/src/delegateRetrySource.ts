@@ -12,6 +12,21 @@ export type DelegateRetrySource = Readonly<{
   model: string | null
 }>
 
+export type DelegateRetryActionKey = Readonly<{ userId: string; sourceJobId: string; generation: number; actionId: string }>
+export type DelegateRetryAction = DelegateRetryActionKey & Readonly<{
+  targetJobId: string
+  state: 'accepted' | 'dispatched' | 'terminal' | 'source_deleted'
+  createdAt: number
+  dispatchedAt: number | null
+  terminalCode: string | null
+}>
+export function checkedDelegateRetryActionKey(key: DelegateRetryActionKey): DelegateRetryActionKey {
+  if (!key || typeof key.userId !== 'string' || !key.userId.trim() || key.userId !== key.userId.trim() || key.userId.length > 1024 ||
+      typeof key.sourceJobId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key.sourceJobId) || !Number.isSafeInteger(key.generation) || key.generation < 0 ||
+      typeof key.actionId !== 'string' || !/^[A-Za-z0-9_-]{16,80}$/.test(key.actionId)) throw new Error('invalid delegate retry action identity')
+  return Object.freeze({ userId: key.userId, sourceJobId: key.sourceJobId, generation: key.generation, actionId: key.actionId })
+}
+
 export function checkedDelegateRetrySource(value: DelegateRetrySource): DelegateRetrySource {
   if (!value || value.version !== 1 || !Number.isSafeInteger(value.depth) || value.depth < 0 || value.depth > 5) {
     throw new Error('invalid delegate retry source')

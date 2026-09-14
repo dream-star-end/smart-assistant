@@ -20,7 +20,7 @@ import {
   type DelegateJobState,
 } from '@openclaude/protocol'
 import type { DelegateDurableDb, DurableJobRecord, DelegateReceiptContext } from './delegateDurable.js'
-import type { DelegateRetrySource } from './delegateRetrySource.js'
+import type { DelegateRetrySource, DelegateRetryActionKey } from './delegateRetrySource.js'
 
 export const DEFAULT_DELEGATE_JOB_TTL_MS = 2 * 60 * 60_000
 export const MIN_DELEGATE_JOB_TTL_MS = 60_000
@@ -423,26 +423,12 @@ export class DelegateJobStore {
     return this.bootId
   }
 
-  create(
-    agentId: string,
-    meta?: DelegateCreateMeta,
-  ): { jobId: string; reused?: boolean } | { error: 'capacity' } {
-    if (meta?.retrySource && !this.durable) throw new Error('delegate retry source requires durable store')
-    if (meta?.deliveryReceipt && !this.acceptsDeliveryReceipts) throw new Error('delegate receipt admission disabled')
-    this.sweep()
-    const idempotencyKey =
-      this.sm && typeof meta?.idempotencyKey === 'string' && meta.idempotencyKey.trim()
-        ? meta.idempotencyKey.trim()
-        : undefined
-    if (idempotencyKey && !this.durable) {
-      const existingId = this.byIdempotency.get(idempotencyKey)
-      if (existingId && this.jobs.has(existingId)) return { jobId: existingId, reused: true }
-    }
+  private newEntry(agentId: string, meta?: DelegateCreateMeta, idempotencyKey?: string): JobEntry {
     const jobId = `dlgjob-${this.now().toString(36)}-${randomBytes(6).toString('hex')}`
     const createdAt = this.now()
     const queued = this.sm && meta?.queued === true
     const claimToken = meta?.claimToken ?? (queued ? undefined : mintDelegateClaimToken())
-    const entry: JobEntry = {
+    return {
       id: jobId,
       agentId,
       createdAt,
@@ -474,6 +460,47 @@ export class DelegateJobStore {
       notifyClaimedUntil: null,
       terminalCommittedAt: null,
     }
+  }
+
+
+  /** Internal acceptance only; HTTP must first prove current owner/lifecycle and
+   * actual strict-native eligibility. Never starts an executor or ACKs source. */
+  acceptRetryAction(key: DelegateRetryActionKey, source: DelegateRetrySource, parentEngine?: DelegateCreateMeta['parentEngine']) {
+    if (!this.sm || !this.durable) throw new Error('delegate retry requires durable state machine')
+    const entry = this.newEntry(source.targetAgentId, { queued: true, kind: 'delegate', callback: 'origin-inject',
+      sessionKey: source.childSessionKey, parentSessionKey: source.parentSessionKey,
+      callbackOriginSessionKey: source.originSessionKey, callbackOriginUserId: source.userId, parentEngine })
+    const outcome = this.durable.acceptRetryAction(key, source, this.toDurable(entry), this.maxJobs)
+    if ('kind' in outcome && outcome.kind === 'accepted') this.ingestDurableRow(outcome.target!)
+    return outcome
+  }
+  getRetryAction(key: DelegateRetryActionKey) {
+    if (!this.durable) throw new Error('delegate retry requires durable store')
+    return this.durable.getRetryAction(key)
+  }
+  isRetryTarget(jobId: string): boolean { return this.durable?.isRetryTarget(jobId) ?? false }
+  getRetrySource(userId: string, jobId: string, generation: number) {
+    if (!this.durable) throw new Error('delegate retry requires durable store')
+    return this.durable.getRetrySource(userId, jobId, generation)
+  }
+
+  create(
+    agentId: string,
+    meta?: DelegateCreateMeta,
+  ): { jobId: string; reused?: boolean } | { error: 'capacity' } {
+    if (meta?.retrySource && !this.durable) throw new Error('delegate retry source requires durable store')
+    if (meta?.deliveryReceipt && !this.acceptsDeliveryReceipts) throw new Error('delegate receipt admission disabled')
+    this.sweep()
+    const idempotencyKey =
+      this.sm && typeof meta?.idempotencyKey === 'string' && meta.idempotencyKey.trim()
+        ? meta.idempotencyKey.trim()
+        : undefined
+    if (idempotencyKey && !this.durable) {
+      const existingId = this.byIdempotency.get(idempotencyKey)
+      if (existingId && this.jobs.has(existingId)) return { jobId: existingId, reused: true }
+    }
+    const entry = this.newEntry(agentId, meta, idempotencyKey)
+    const jobId = entry.id, queued = entry.state === 'queued'
     if (this.durable) {
       const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs, {
         failureInbox: (this.failureInbox && entry.kind === 'delegate') || !!meta?.deliveryReceipt,

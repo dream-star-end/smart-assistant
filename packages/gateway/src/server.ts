@@ -13946,6 +13946,79 @@ export class Gateway {
   }
 
   /** Real caller provenance, captured before resume/capacity reservation. No body identity. */
+  private _executeAcceptedDelegateJob(runInput: RunDelegateInput, store: DelegateJobStore, jobId: string, goal: string, targetAgentId: string, sm: boolean): void {
+  void this._runDelegateTask(runInput)
+    .then((result) => {
+      if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
+      const mapped = this._delegateResultToHttp(result, targetAgentId)
+      const fence =
+        runInput.claimToken && runInput.fencingEpoch !== undefined
+          ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
+          : undefined
+      if (result.kind === 'rejected' && result.alreadyDispatched) {
+        return
+      }
+      let winner = false
+      if (sm && result.kind === 'rejected' && result.failureClass) {
+        const dropped =
+              result.failureClass === 'capacity_queue_full' && !store.isRetryTarget(jobId) && store.dropIfUnclaimed(jobId)
+        if (dropped) {
+          this._dropDelegateInflightSurface(jobId)
+        } else {
+          winner = store.fail(jobId, {
+            failureClass: result.failureClass,
+            detail: result.message,
+            httpStatus: mapped.httpStatus,
+            body: mapped.body,
+            claimToken: fence?.claimToken,
+            fencingEpoch: fence?.fencingEpoch,
+            nextState: result.failureClass === 'cancelled' ? 'cancelled' : 'failed',
+          })
+        }
+      } else if (sm) {
+        winner = store.complete(jobId, mapped, fence)
+      } else {
+        store.complete(jobId, mapped)
+        winner = true
+      }
+      if (!winner) return
+      const output = result.kind === 'completed' ? result.output : ''
+      const error =
+        result.kind === 'rejected' || result.kind === 'error'
+          ? result.message
+          : result.kind === 'completed'
+            ? result.error
+            : undefined
+      this._queueSendToAgentCallback(runInput, {
+        jobId,
+        agentId: targetAgentId,
+        goal,
+        output,
+        error,
+      })
+    })
+    .catch((err) => {
+      if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
+      const message = (err as Error)?.message ?? String(err)
+      const fence =
+        runInput.claimToken && runInput.fencingEpoch !== undefined
+          ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
+          : undefined
+      if (sm) {
+        const winner = store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence)
+        if (!winner) return
+      } else {
+        store.complete(jobId, { httpStatus: 500, body: { error: message } })
+      }
+      this._queueSendToAgentCallback(runInput, {
+        jobId,
+        agentId: targetAgentId,
+        goal,
+        error: message,
+      })
+    })
+  }
+
   private async _captureDelegateRetrySource(
     req: IncomingMessage, contextToken: string, targetAgentId: string,
     model: string | undefined, callerAgentId: string | undefined,
@@ -14315,76 +14388,7 @@ export class Gateway {
           goal,
         })
       }
-      void this._runDelegateTask(runInput)
-        .then((result) => {
-          if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
-          const mapped = this._delegateResultToHttp(result, targetAgentId)
-          const fence =
-            runInput.claimToken && runInput.fencingEpoch !== undefined
-              ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
-              : undefined
-          if (result.kind === 'rejected' && result.alreadyDispatched) {
-            return
-          }
-          let winner = false
-          if (sm && result.kind === 'rejected' && result.failureClass) {
-            const dropped =
-              result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
-            if (dropped) {
-              this._dropDelegateInflightSurface(jobId)
-            } else {
-              winner = store.fail(jobId, {
-                failureClass: result.failureClass,
-                detail: result.message,
-                httpStatus: mapped.httpStatus,
-                body: mapped.body,
-                claimToken: fence?.claimToken,
-                fencingEpoch: fence?.fencingEpoch,
-                nextState: result.failureClass === 'cancelled' ? 'cancelled' : 'failed',
-              })
-            }
-          } else if (sm) {
-            winner = store.complete(jobId, mapped, fence)
-          } else {
-            store.complete(jobId, mapped)
-            winner = true
-          }
-          if (!winner) return
-          const output = result.kind === 'completed' ? result.output : ''
-          const error =
-            result.kind === 'rejected' || result.kind === 'error'
-              ? result.message
-              : result.kind === 'completed'
-                ? result.error
-                : undefined
-          this._queueSendToAgentCallback(runInput, {
-            jobId,
-            agentId: targetAgentId,
-            goal,
-            output,
-            error,
-          })
-        })
-        .catch((err) => {
-          if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
-          const message = (err as Error)?.message ?? String(err)
-          const fence =
-            runInput.claimToken && runInput.fencingEpoch !== undefined
-              ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
-              : undefined
-          if (sm) {
-            const winner = store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence)
-            if (!winner) return
-          } else {
-            store.complete(jobId, { httpStatus: 500, body: { error: message } })
-          }
-          this._queueSendToAgentCallback(runInput, {
-            jobId,
-            agentId: targetAgentId,
-            goal,
-            error: message,
-          })
-        })
+      this._executeAcceptedDelegateJob(runInput, store, jobId, goal, targetAgentId, sm)
       return this.sendJson(res, 200, {
         status: 'running',
         jobId,
