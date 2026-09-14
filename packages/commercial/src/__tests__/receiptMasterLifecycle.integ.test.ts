@@ -141,7 +141,7 @@ for (const mode of ['normal', 'ack-loss', 'ingested', 'accept-blocked', 'retry']
     const proof = JSON.parse(restored.trim().split('\n').pop()!);
     assert.equal(proof.passed, true); assert.equal(proof.creatorReceiptInputs, mode === 'ingested' ? 1 : 0);
     assert.equal(proof.callbackInputs, mode === 'ingested' ? 0 : 1); assert.equal(proof.finals, 1);
-    console.log(JSON.stringify({ mode, base, models: container.mainRequests, executions: 1, ...proof }));
+    console.log(JSON.stringify({ mode, base, models: container.mainRequests, executions: container.executions, ...proof }));
     // Retain private artifacts on both outcomes: failed cleanup must not erase the only evidence.
   });
 }

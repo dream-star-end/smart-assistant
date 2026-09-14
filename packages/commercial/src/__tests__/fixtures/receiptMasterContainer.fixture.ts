@@ -96,7 +96,11 @@ assert.ok(upstreamAddress && typeof upstreamAddress !== 'string');
 const upstreamPort = upstreamAddress.port;
 Object.assign(process.env, { OPENCLAUDE_HOME: dir, OPENCLAUDE_DELEGATE_JOBS_DB: join(dir, 'delegate-jobs.db'), OC_DELEGATE_SM: '1', OC_DELEGATE_DURABLE: '1', OC_DELEGATE_NOTIFIER: '1', CLAUDE_CONFIG_DIR: join(dir, 'native'), OPENCLAUDE_RECEIPT_CALLER_V2: mode === 'retry' ? '0' : '1', ANTHROPIC_BASE_URL: `http://127.0.0.1:${upstreamPort}`, ANTHROPIC_API_KEY: 'synthetic-local-only', ANTHROPIC_AUTH_TOKEN: 'synthetic-local-only', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_DISABLE_ATTACHMENTS: '1', DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1', CLAUDE_CODE_MAX_RETRIES: '0', CLAUDE_CODE_UNATTENDED_RETRY: '0', CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1', NPM_CONFIG_OFFLINE: 'true' });
 mkdirSync(join(dir, 'native'), { recursive: true });
-if (mode === 'retry') process.env.CODEX_HOME = join(dir, 'codex-native');
+if (mode === 'retry') {
+  process.env.CODEX_HOME = join(dir, 'codex-native');
+  // Explicit private selfhost fixture, not a change to commercial local-turn policy.
+  process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1';
+}
 const { Gateway } = await import(root + '/packages/gateway/src/server.ts');
 const { upsertClientSession } = await import(root + '/packages/storage/src/sessionsDb.ts');
 await upsertClientSession({ id: 'd13-probe', userId: 'default', agentId: 'main', ...(mode === 'retry' ? { modelId: 'glm-5.3-zai' } : {}), title: 'synthetic d13', pinned: false, createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] });

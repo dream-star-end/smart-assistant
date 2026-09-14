@@ -30,3 +30,29 @@ test('identity schema storage fence rejects preexisting and reopened legacy conn
     assert.equal(jobs.snapshotOf(source.jobId)?.state,'failed','registered original writer remains functional')
   } finally {jobs.close();db.close();held.close();reopened.close()}
 })
+
+test('schema9 metadata upgrades preserve exact old users without promoting default to a public owner', () => {
+  const path=join(mkdtempSync(join(tmpdir(),'delegate-identity-upgrade-')),'jobs.db')
+  const seed=new DelegateDurableDb(path);seed.close()
+  const sql=new Database(path)
+  // PRIVATE schema-shape fixture, not a production downgrade or old binary.
+  // The actual frozen schema9 writer is independently covered by the retained
+  // old-writer-guard probe; here the oracle is exact migration/backfill content.
+  const triggers=sql.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'identity_v10_%'").all() as {name:string}[]
+  for (const {name} of triggers) sql.exec(`DROP TRIGGER "${name}"`)
+  sql.exec('DROP INDEX idx_delegate_retry_source_storage_parent; DROP INDEX idx_delegate_retry_source_public; ALTER TABLE delegate_retry_source DROP COLUMN storage_user_id; PRAGMA user_version=9;')
+  const metadata=(userId:string)=>JSON.stringify({version:1,userId,parentSessionKey:'agent:main:webchat:dm:p',parentClientSessionId:'p',
+    originSessionKey:'agent:main:webchat:dm:p',childSessionKey:'agent:worker:delegate:main:old',targetAgentId:'worker',sourceAgentId:'main',depth:0,model:null})
+  for (const userId of ['default','c:7']) sql.prepare(`INSERT INTO delegate_retry_source
+    (job_id,generation,user_id,parent_client_session_id,parent_session,child_session,target_agent_id,metadata_json,created_at)
+    VALUES (?,0,?,'p','agent:main:webchat:dm:p','agent:worker:delegate:main:old','worker',?,1)`).run('old-'+userId,userId,metadata(userId))
+  sql.close()
+  const migrated=new DelegateDurableDb(path)
+  try {
+    for (const userId of ['default','c:7']) {
+      const source=migrated.getRetrySource(userId,'old-'+userId,0)
+      assert.equal(JSON.stringify(source),metadata(userId));assert.equal(source?.storageUserId,undefined)
+    }
+    assert.equal(migrated.getRetrySource('c:7','old-default',0),undefined)
+  } finally {migrated.close()}
+})
