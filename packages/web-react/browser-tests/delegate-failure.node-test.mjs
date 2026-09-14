@@ -146,6 +146,56 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(api.ackCalls.length, ackBefore);
     });
 
+    await journey("boundary native unavailable refuses new intent and does not fake ACK", async () => {
+      const id = (await rows.evaluateAll(elements => elements.map(el => el.getAttribute("data-job-id"))))
+        .find(value => value && api.ids.alice.includes(value) && !api.retryKeys.some(k => k.sourceJobId === value));
+      assert.ok(id); const source = dialog.locator(`li[data-job-id="${id}"]`);
+      const before = api.retryKeys.length, targets = api.retryTargets(), acks = api.ackCalls.length;
+      api.setNativeUnavailable(id, true);
+      try {
+        await dialog.getByRole("button", { name: "刷新", exact: true }).click();
+        await source.getByText("原生会话不可用，无法安全继续", { exact: true }).waitFor();
+        assert.equal(await source.getByRole("button", { name: "继续原子会话", exact: true }).isDisabled(), true);
+        assert.equal(api.retryKeys.length, before);
+        await source.getByRole("button", { name: "确认上次继续", exact: true }).click();
+        await page.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
+        await source.getByRole("alert").filter({ hasText: "原生会话不可用，无法安全继续" }).waitFor();
+        assert.equal(api.retryKeys.length, before + 1, "explicit confirmation can POST but cannot invent a native session");
+        assert.equal(api.retryTargets(), targets); assert.equal(api.ackCalls.length, acks);
+      } finally { api.setNativeUnavailable(id, false); }
+    });
+
+    await journey("boundary late real HTTP body cannot put A state into mounted B scope", async () => {
+      await page.keyboard.press("Escape");
+      const held = api.holdNextAliceSummary();
+      await page.getByRole("button", { name: "刷新后台状态", exact: true }).click(); await held.ready;
+      await page.getByRole("button", { name: "切换 B", exact: true }).click();
+      await badge.filter({ hasText: "3 失败" }).waitFor();
+      held.release();
+      await badge.click(); await rows.first().waitFor();
+      assert.equal(await rows.count(), 3);
+      assert.equal(await badge.textContent(), "后台任务 0 运行中 / 0 排队 / 3 失败待确认");
+      for (const id of api.ids.alice) assert.equal(await dialog.locator(`li[data-job-id="${id}"]`).count(), 0);
+      t.diagnostic(`real held response released after B; socket closed=${held.closed()} (abort can prevent body consumption; pure Promise fence test separately proves post-json check)`);
+      await page.keyboard.press("Escape"); await page.getByRole("button", { name: "切换 A", exact: true }).click();
+      await badge.filter({ hasText: `${api.count("alice")} 失败` }).waitFor(); await badge.click(); await rows.first().waitFor();
+    });
+
+    await journey("boundary mobile nested confirmation cancels and returns to original failure", async () => {
+      await page.setViewportSize({ width: 375, height: 812 });
+      const row = rows.first(), acks = api.ackCalls.length, attempts = api.retryKeys.length;
+      await row.getByRole("button", { name: "确认上次继续", exact: true }).click();
+      const confirmation = page.getByRole("dialog", { name: "确认同一次继续？" });
+      await confirmation.waitFor(); const bounds = await confirmation.boundingBox();
+      assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= 376 && bounds.y >= -1);
+      await confirmation.getByRole("button", { name: "取消", exact: true }).click();
+      await dialog.waitFor();
+      assert.equal(api.ackCalls.length, acks); assert.equal(api.retryKeys.length, attempts);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      if (process.env.OC_D15_SCREENSHOT) await page.screenshot({ path: process.env.OC_D15_SCREENSHOT });
+      await page.setViewportSize({ width: 1280, height: 1000 });
+    });
+
     await journey("same mounted auth object switches account without showing A rows or counts", async () => {
       await page.keyboard.press("Escape");
       await page.getByRole("button", { name: "切换 B", exact: true }).click();

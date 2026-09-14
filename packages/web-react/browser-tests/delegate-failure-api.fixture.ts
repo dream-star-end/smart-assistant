@@ -32,6 +32,8 @@ export async function createFailureUiServer(html: (path: string) => string) {
   reopen();
   let failAck = false, dropRetry = false, unavailable = false;
   const retryKeys: DelegateRetryActionKey[] = [], ackCalls: string[] = [];
+  const nativeUnavailable = new Set<string>();
+  let heldSummary: { started: () => void; release: (() => void) | null; closed: boolean } | null = null;
   const server = createServer((req, res) => {
     const url = new URL(req.url!, "http://127.0.0.1");
     const user = req.headers.authorization === "Bearer B" ? "bob" : req.headers.authorization === "Bearer A" ? "alice" : null;
@@ -42,11 +44,14 @@ export async function createFailureUiServer(html: (path: string) => string) {
         user: () => user, store: () => jobs,
         readBody: async r => { let body = ""; for await (const chunk of r) { body += String(chunk); assert.ok(body.length < 8192); } return body; },
         reconcileLifecycle: async () => true,
-        retryAvailability: async (uid, rows) => rows.map(row => ({ available: !jobs.hasActiveRetryChild(jobs.getRetrySource(uid, row.jobId, row.generation)?.childSessionKey ?? "") && !row.jobId.endsWith("denied"), reason: "retry_child_busy" })),
+        retryAvailability: async (uid, rows) => rows.map(row => nativeUnavailable.has(row.jobId)
+          ? { available: false, reason: "retry_native_unavailable" }
+          : { available: !jobs.hasActiveRetryChild(jobs.getRetrySource(uid, row.jobId, row.generation)?.childSessionKey ?? ""), reason: "retry_child_busy" }),
         retry: async (key, authorize) => {
           authorize(); retryKeys.push(key);
           const previous = jobs.getRetryAction(key);
           if (previous) return { replay: true, action: previous };
+          if (nativeUnavailable.has(key.sourceJobId)) throw new DelegateRetryUnavailable(409, "retry_native_unavailable");
           const source = jobs.getRetrySource(key.userId, key.sourceJobId, key.generation);
           if (!source) throw new DelegateRetryUnavailable(409, "retry_source_unavailable");
           const accepted = jobs.acceptRetryAction(key, source, "codex");
@@ -54,6 +59,14 @@ export async function createFailureUiServer(html: (path: string) => string) {
           return { replay: accepted.kind === "replay", action: accepted.action };
         },
         send: (r, status, value) => {
+          if (heldSummary && user === "alice" && url.pathname.endsWith("/summary") && status === 200) {
+            const held = heldSummary; heldSummary = null;
+            const body = JSON.stringify(value);
+            r.writeHead(status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(body)) });
+            r.flushHeaders(); r.write(body.slice(0, 1));
+            r.on("close", () => { held.closed = true; });
+            held.release = () => r.end(body.slice(1)); held.started(); return;
+          }
           if (url.pathname.endsWith("/retry") && dropRetry && status === 202) {
             // Commit response headers first: a bare pre-header close can be transparently
             // replayed by Chromium, which is not the ambiguous-body contract under test.
@@ -83,9 +96,16 @@ export async function createFailureUiServer(html: (path: string) => string) {
   return { url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, ids, ackCalls, retryKeys, reopen,
     failNextAck: () => { failAck = true; }, dropNextRetry: () => { dropRetry = true; },
     setUnavailable: (v: boolean) => { unavailable = v; },
+    setNativeUnavailable: (id: string, value: boolean) => { if (value) nativeUnavailable.add(id); else nativeUnavailable.delete(id); },
+    holdNextAliceSummary: () => {
+      assert.equal(heldSummary, null);
+      let started!: () => void; const ready = new Promise<void>(resolve => { started = resolve; });
+      const held = { started, release: null as (() => void) | null, closed: false }; heldSummary = held;
+      return { ready, release: () => { assert.ok(held.release); held.release(); }, closed: () => held.closed };
+    },
     count: (user: string) => jobs.userSummary(user).unacknowledgedFailures,
     retrySnapshot: () => retryKeys.map(k => ({ state: jobs.getRetryAction(k)?.state, target: jobs.getRetryAction(k)?.targetJobId })),
-    retryTargets: () => new Set(retryKeys.map(k => jobs.getRetryAction(k)?.targetJobId)).size,
+    retryTargets: () => new Set(retryKeys.flatMap(k => { const id = jobs.getRetryAction(k)?.targetJobId; return id ? [id] : []; })).size,
     finishRetry: () => { const k = retryKeys[0]; assert.ok(k); const a = jobs.getRetryAction(k)!;
       assert.equal(jobs.fail(a.targetJobId, { failureClass: "child_error", detail: "private retry failure", httpStatus: 500 }), true); },
     close: async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); jobs.close(); db.close(); rmSync(dir, { recursive: true, force: true }); },

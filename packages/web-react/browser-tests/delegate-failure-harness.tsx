@@ -13,6 +13,7 @@ function Harness() {
   const switchTo = (id: string, token: string) => { auth.commitToken(auth.beginIdentity(), token); setUser(id); };
   return <main className="mx-auto w-full max-w-3xl p-4">
     <Button onClick={() => switchTo("alice", "A")}>切换 A</Button><Button onClick={() => switchTo("bob", "B")}>切换 B</Button>
+    <Button onClick={() => void failures.controller?.refresh()}>刷新后台状态</Button>
     <p data-testid="account">{user}</p><p data-testid="parent">{parent}</p>
     <PinnedDelegateTracker items={[{ jobId: "raw-failed", runId: "raw", agentId: "worker", goal: "原始失败诊断", state: "failed", liveHint: "", updatedAt: 1, parentSessionKey: "agent:main:webchat:dm:session-alice" }]}
       onDismiss={() => { throw Error("failure must never locally ACK"); }} onOpenFailures={() => failures.controller?.setOpen(true)} failuresInInbox={failures.state.summary !== null} />
