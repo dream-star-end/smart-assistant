@@ -20,22 +20,24 @@ async function run(command:string,args:string[],home:string) {
   return out
  }finally{clearTimeout(timer)}
 }
-for(const mode of ['end','kill','cross-turn','ingested-end','handoff-cli','handoff-running','handoff-mcp','handoff-deferred'] as const)test(`actual parent lifecycle model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
+for(const mode of ['end','kill','cross-turn','ingested-end','handoff-cli','handoff-running','handoff-ingested','handoff-mixed','handoff-mcp','handoff-deferred'] as const)test(`actual parent lifecycle model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
+ const ingested=mode==='ingested-end'||mode==='handoff-ingested',mixed=mode==='handoff-mixed'
  const dir=mkdtempSync(join(tmpdir(),'receipt-model-cli-'))
  try {
   const out=await run(process.execPath,['--import',join(root,'node_modules/tsx/dist/loader.mjs'),fixture,dir,mode],dir)
   const e=JSON.parse(readFileSync(join(dir,'evidence.json'),'utf8'))
   assert.equal(e.failure,null,JSON.stringify(e));assert.match(out,/MODEL_PROBE_PASS/);
-  assert.equal(e.failure,null);assert.equal(e.executions,1)
-  assert.equal(e.requests.length,mode==='kill'?2:mode==='end'?2:mode==='handoff-deferred'?5:mode==='cross-turn'||mode.startsWith('handoff-')?4:3)
-  assert.equal(e.accepted.length,mode==='ingested-end'?0:1);assert.equal(e.masterRequests.length,e.accepted.length)
+  assert.equal(e.failure,null);assert.equal(e.executions,mixed?3:1)
+  assert.equal(e.requests.length,mode==='kill'?2:mode==='end'?2:(mode==='handoff-deferred'||mode==='handoff-ingested'||mixed)?5:mode==='cross-turn'||mode.startsWith('handoff-')?4:3)
+  assert.equal(e.accepted.length,mixed?2:ingested?0:1);assert.equal(e.masterRequests.length,e.accepted.length)
+  if(mixed){assert.deepEqual(e.mixedBefore.states,['notified','ingested','offered']);assert.equal(e.mixedBefore.callbacks,1);assert.ok(e.accepted.every((v:{text:string})=>!v.text.includes('REAL_MODEL_CLI_AUTHORITATIVE_RESULT2')))}
   assert.ok(e.terminalCalls>=1);if(mode==='kill')assert.equal(e.killedSignal,'SIGKILL')
-  assert.equal(e.received,mode==='ingested-end')
+  assert.equal(e.received,ingested||mixed)
   assert.ok(e.http.some((r:{path:string;status:number})=>r.path==='/api/agents/coding-assistant/delegate'&&r.status===200))
-  const restored=await run('bun',['run',restore,dir,mode==='ingested-end'?'create':'stop'],dir)
+  const restored=await run('bun',['run',restore,dir,ingested||mixed?'create':'stop'],dir)
   const proof=JSON.parse(restored.trim().split('\n').pop()!)
-  assert.equal(proof.passed,true);assert.equal(proof.receiptInputs,mode==='ingested-end'?1:0)
-  assert.equal(proof.receiptInputs+e.accepted.length,1,'one delivery owner across native and callback')
+  assert.equal(proof.passed,true);assert.equal(proof.receiptInputs,ingested||mixed?1:0)
+  assert.equal(proof.receiptInputs+e.accepted.length,mixed?3:1,'one delivery owner across native and callback')
   console.log(JSON.stringify({mode,modelRequests:e.requests.length,executions:e.executions,received:e.received,nativeReceiptInputs:proof.receiptInputs}))
  }finally{rmSync(dir,{recursive:true,force:true})}
 })

@@ -5,7 +5,7 @@ import { runDelegateWaitLoop } from '../delegateWaitCli.js'
 const handoff={status:'receipt_handoff',jobId:'dlgjob-old',generation:0,execution:'running',delivery:'pending'}
 const response=(data:unknown,statusCode=200)=>({statusCode,body:JSON.stringify(data)})
 test('handoff is metadata, never counted as child success; malformed or HTTP failure cannot become handoff',async()=>{
- for(const bad of [{...handoff,result:'private'},{...handoff,delivery:'notified'},{...handoff,generation:-1}])assert.equal(parseReceiptHandoff(bad),undefined)
+ for(const bad of [{...handoff,result:'private'},{...handoff,delivery:'notified'},{...handoff,generation:-1},{...handoff,execution:['running']},{...handoff,delivery:['pending']}])assert.equal(parseReceiptHandoff(bad),undefined)
  const result=await runDelegateWaitLoop({jobIds:['dlgjob-old','dlgjob-good','dlgjob-bad'],pollWaitMs:500,
   waitOnce:async id=>id==='dlgjob-old'?response(handoff):id==='dlgjob-bad'?response({error:'bad item'},409):response({status:'done',output:'GOOD'})})
  assert.equal(result.exitCode,2);assert.match(result.stdout,/1 成功 \/ 1 失败/);assert.match(result.stdout,/1 项仅交接状态/)

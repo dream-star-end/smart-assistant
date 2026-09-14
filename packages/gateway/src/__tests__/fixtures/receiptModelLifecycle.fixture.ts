@@ -5,16 +5,17 @@ import { createServer } from 'node:http'
 import { once } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
 import { receiptParentDeathState } from '../../receiptParentProcess.js'
+import { receiptLocatorPartition } from '../../receiptOwnerCapability.js'
 import { randomBytes } from 'node:crypto'
-import { mkdirSync,writeFileSync,readFileSync,readdirSync } from 'node:fs'
+import { mkdirSync,writeFileSync,readFileSync,readdirSync,existsSync,unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { Gateway } from '../../server.js'
 import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 
-const requestedMode=process.argv[3] || 'end';const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const mode=handoff?'cross-turn':requestedMode;let jobToWait='',discovered=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
-let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
+const requestedMode=process.argv[3] || 'end';const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const handoffIngested=requestedMode==='handoff-ingested';const mixed=requestedMode==='handoff-mixed';let mixedStage=0,mixedBefore:any;let mixedRows:any[]=[];const mode=handoffIngested?'ingested-end':handoff?'cross-turn':requestedMode;let jobToWait='',discovered=false,handoffWaiting=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
+let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r});let releaseCurrent:()=>void=()=>{};const currentGate=new Promise<void>(r=>{releaseCurrent=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
 mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
@@ -38,9 +39,14 @@ const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packag
 const command=cli
 function send(res:any,body:any,tool:boolean,wait=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
- let content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:'Bash',input:wait?
-  {command:handoff?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${jobToWait}`:'printf background-checkpoint',timeout:20000}:
+ let content:any=tool?{type:'tool_use',id:wait?(handoffIngested&&!handoffWaiting?'real_ingest_checkpoint':'real_waiter'):'real_creator',name:'Bash',input:wait?
+  {command:handoff&&(!handoffIngested||handoffWaiting)?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${jobToWait}`:'printf background-checkpoint',timeout:20000}:
   {command,timeout:20000,run_in_background:true}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ if(tool&&wait&&mixed) {
+  const cmd=mixedStage===1?`timeout --signal=TERM 8s ${cli.replace('synthetic-child-only','current-good')}; timeout --signal=TERM 8s ${cli.replace('synthetic-child-only','current-bad')}`:
+   `node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${jobToWait} ${mixedRows.map(r=>r.job_id).join(' ')}; code=$?; printf 'MIXED_WAIT_EXIT:%s ORDINARY_STDOUT' "$code"; printf 'ORDINARY_STDERR' >&2; exit "$code"`
+  content={type:'tool_use',id:mixedStage===1?'real_current_creator':'real_waiter',name:'Bash',input:{command:cmd,timeout:20000}}
+ }
  if(tool&&wait&&mcp) {
   content={...content,name:'mcp__openclaude-memory__delegate_wait',input:{jobId:jobToWait,waitMs:10000}}
   if(wrapped) content=discovered?{...content,name:'ExecuteExtraTool',input:{tool_name:content.name,params:content.input}}:
@@ -67,8 +73,22 @@ const upstream=createServer(async(req,res)=>{
   if(!req.url?.startsWith('/v1/messages')){res.statusCode=404;res.end('{}');return}
   const main=body.tools?.some((t:any)=>t.name==='Bash')
   if(main&&nextTurnStarted){
+    if(mixed)mixedStage=1
     if(wrapped&&!discovered){send(res,body,true,true);discovered=true}
      else {nextTurnStarted=false;send(res,body,true,true)}
+  }
+  else if(main&&mixed&&mixedStage===1){
+   assert.equal(executions,3,'old plus two real current CLI creates')
+   releaseCurrent()
+   await until(()=>(db as any).db.prepare('SELECT count(*) n FROM delegate_delivery_receipt').get().n===3,'three real terminal receipts')
+   mixedRows=(db as any).db.prepare("SELECT * FROM delegate_delivery_receipt WHERE native_tool_use_id='real_current_creator' ORDER BY rowid").all()
+   assert.equal(mixedRows.length,2)
+   const owner=adapter.getReceiptToolOwner('real_current_creator');assert.ok(owner)
+   const partition=receiptLocatorPartition({...owner,userId:'default',agentId:'main',sessionKey:session})
+   const cache=join(dir,'receipt-candidates-v1','data',partition,'cache')
+   assert.ok(existsSync(join(cache,mixedRows[0].job_id+'.json')))
+   const bad=join(cache,mixedRows[1].job_id+'.json');assert.ok(existsSync(bad));unlinkSync(bad)
+   mixedStage=2;send(res,body,true,true)
   }
   else if(main&&phase===0){
     phase++;send(res,body,true)
@@ -90,7 +110,20 @@ const upstream=createServer(async(req,res)=>{
      }
      phase++;send(res,body,true,true)
    }
-  else {if(main&&mode==='cross-turn'){await until(()=>accepted.size===1,'cross-turn callback accepted')}if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
+  else {if(main&&mode==='cross-turn'){await until(()=>accepted.size===1,'cross-turn callback accepted')}
+   if(main&&mixed&&mixedStage===2){
+    const waited=body.messages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id==='real_waiter'):[])
+    assert.equal(waited.length,1);assert.equal(waited[0].is_error,true)
+    const text=JSON.stringify(waited)
+    for(const expected of ['MIXED_WAIT_EXIT:2','ORDINARY_STDOUT','ORDINARY_STDERR','交接状态','1 项仅交接状态','receipt locator unavailable'])assert.ok(text.includes(expected),expected)
+    assert.ok(!text.includes(sentinel))
+    const rows=(db as any).db.prepare('SELECT * FROM delegate_delivery_receipt ORDER BY rowid').all()
+    assert.deepEqual(rows.map((r:any)=>r.state),['notified','ingested','offered'])
+    assert.deepEqual(rows.slice(1).map((r:any)=>[r.job_id,r.native_tool_use_id,r.receipt_nonce_hash]),mixedRows.map(r=>[r.job_id,r.native_tool_use_id,r.receipt_nonce_hash]))
+    assert.ok(raw.includes(sentinel+'2'));assert.ok(!raw.includes(sentinel+'1'));assert.ok(!raw.includes(sentinel+'3'))
+    mixedBefore={states:rows.map((r:any)=>r.state),callbacks:accepted.size,ordinaryError:true};mixedStage=3
+   }
+   if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
  }catch(e){failure=e;res.statusCode=500;res.end('{}')}
 })
 await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r))
@@ -130,11 +163,11 @@ function enableMasterCallback(){
  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN='synthetic-master-only'
 }
 ;(gw as any)._runDelegateTask=async(input:any)=>{
- executions++;const claim=jobs.claimQueued(input.backgroundJobId);assert.ok(claim.ok)
+ const execution=++executions;const claim=jobs.claimQueued(input.backgroundJobId);assert.ok(claim.ok)
  input.claimToken=claim.claimToken;input.fencingEpoch=claim.fencingEpoch
- await childGate
+ await (mixed&&execution>1?currentGate:childGate)
  ;(gw as any)._releasePreadmittedDelegateCapacity(input)
- return {kind:'completed',ok:true,output:sentinel,sessionKey:input.sessionKey}
+ return {kind:'completed',ok:true,output:sentinel+(mixed?execution:''),sessionKey:input.sessionKey}
 }
 const server=createServer((req,res)=>{res.on('finish',()=>http.push({path:req.url,status:res.statusCode}));void(gw as any).handleHttp(req,res)})
 await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const port=(server.address() as any).port;config.gateway.port=port
@@ -167,8 +200,8 @@ try {
    jobToWait=jobId;parent._currentTurnKey='real-next-turn';nextTurnStarted=true
    turn=adapter.submitTurn({input:'New real user turn; old child still pending.',turnKey:parent._currentTurnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:1},toolUseIdToName:new Map()} as any)
    await turn.submitted
-   await until(()=>!!adapter.getReceiptToolOwner('real_waiter'),'new SDK owner')
-   const newOwner=adapter.getReceiptToolOwner('real_waiter')!
+   await until(()=>!!adapter.getReceiptToolOwner(mixed?'real_current_creator':'real_waiter'),'new SDK owner')
+   const newOwner=adapter.getReceiptToolOwner(mixed?'real_current_creator':'real_waiter')!
    assert.notEqual(newOwner.parentOwnerEpoch,savedOwner.parentOwnerEpoch)
    assert.equal(adapter.checkReceiptOwner(savedOwner),'inactive')
   }else if(mode==='end') {
@@ -197,7 +230,18 @@ try {
  assert.equal(jobs.snapshotOf(jobId).callbackState,mode==='ingested-end'?'none':'delivered')
  assert.ok(terminalWork.length>=1,'actual onTerminal dispatch must execute')
  if(mode==='cross-turn')await turn.summary
- if(handoff) {
+ if(handoffIngested) {
+  // The previous turn genuinely committed through native admission. Now wait
+  // with a different SDK tool/owner; do not manufacture an ingested DB state.
+  assert.equal(before?.state,'ingested');assert.equal(accepted.size,0)
+  handoffWaiting=true;jobToWait=jobId;parent._currentTurnKey='real-next-turn';nextTurnStarted=true
+  turn=adapter.submitTurn({input:'New turn: query the already received old job without duplicating it.',turnKey:parent._currentTurnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:1},toolUseIdToName:new Map()} as any)
+  await turn.submitted
+  await Promise.race([turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('handoff after ingest deadline')),90000)})]);clearTimeout(timer)
+  assert.ok(!failure,String(failure));await settle()
+  assert.deepEqual(db.getDeliveryReceipt(jobId,0),before);assert.equal(accepted.size,0);assert.equal(executions,1)
+ }
+ if(handoff&&!mixed) {
   const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
   const waited=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id==='real_waiter'):[])
   assert.equal(waited.length,1);assert.notEqual(waited[0].is_error,true,JSON.stringify(waited))
@@ -205,7 +249,7 @@ try {
   if(requestedMode==='handoff-running')assert.ok(JSON.stringify(waited).includes('仍在运行'))
   assert.ok(!JSON.stringify(waited).includes('receipt-locator'))
   assert.equal(http.filter(r=>r.path==='/api/delegate/receipt-owner/handoff-status'&&r.status===200).length,1)
-  assert.equal(http.filter(r=>r.path==='/api/delegate/wait'||r.path==='/api/delegate/receipt-owner/input').length,0)
+  assert.equal(http.filter(r=>r.path==='/api/delegate/wait'||r.path==='/api/delegate/receipt-owner/input').length,handoffIngested?1:0)
   assert.equal(http.filter(r=>r.path==='/api/agents/coding-assistant/delegate').length,1)
  }
  if(mode==='kill')assert.equal(killedSignal,'SIGKILL')
@@ -218,17 +262,17 @@ try {
    const resultTexts=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='text'&&c.text.includes(sentinel)):[])
    assert.equal(resultTexts.length,1,'exactly one admitted background user input')
  }
- if(mode!=='ingested-end')assert.ok(!sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(sentinel)))
+ if(mode!=='ingested-end'&&!mixed)assert.ok(!sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(sentinel)))
  process.stdout.write('MODEL_PROBE_PASS '+JSON.stringify({mode:requestedMode,nativeSession:runner.sessionId,phase,executions,received,isError:result?.isError,receiptState:row.state,masterRequests:masterRequests.length,accepted:accepted.size,terminalCalls:terminalWork.length,killedSignal})+'\n')
 } catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n'+JSON.stringify({requests,http,sdkErrors:sdk.filter((m:any)=>m.type==='user'||m.type==='result').map((m:any)=>({type:m.type,message:m.message,errors:m.errors}))})+'\n')}
 finally {
- clearTimeout(timer);releaseChild();turn?.end();await runner.shutdown();
- if(executions===1)await until(()=>jobs.listNonTerminal().length===0,'cleanup child terminal');
+ clearTimeout(timer);releaseChild();releaseCurrent();turn?.end();await runner.shutdown();
+ if(executions>0)await until(()=>jobs.listNonTerminal().length===0,'cleanup child terminal');
  await settle();
  clearTimeout((gw as any)._notifyRetryTimer);clearTimeout((gw as any)._delegateReconcileTimer);clearInterval((gw as any)._delegateReapTimer)
  server.closeAllConnections();upstream.closeAllConnections();master.closeAllConnections()
  await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r())),new Promise<void>(r=>master.close(()=>r()))])
- writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,masterRequests,accepted:[...accepted.values()],terminalCalls:terminalWork.length,killedSignal,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup, child executor, enrollment opt-in and master receiver fixtures; actual production store hooks, recovery, notifier and HTTP client'},null,2))
+ writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,mixedBefore,masterRequests,accepted:[...accepted.values()],terminalCalls:terminalWork.length,killedSignal,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup, child executor, enrollment opt-in and master receiver fixtures; actual production store hooks, recovery, notifier and HTTP client'},null,2))
  jobs.close()
 }
 

@@ -9,7 +9,8 @@ export function parseReceiptHandoff(value: unknown): ReceiptHandoff | undefined 
   if (Object.keys(v).sort().join(',') !== 'delivery,execution,generation,jobId,status' ||
       v.status !== 'receipt_handoff' || typeof v.jobId !== 'string' || !/^dlgjob-[a-z0-9-]{1,150}$/.test(v.jobId) ||
       !Number.isSafeInteger(v.generation) || Number(v.generation) < 0 ||
-      !['running','terminal'].includes(String(v.execution)) || !['pending','notified','ingested'].includes(String(v.delivery)) ||
+      (v.execution !== 'running' && v.execution !== 'terminal') ||
+      (v.delivery !== 'pending' && v.delivery !== 'notified' && v.delivery !== 'ingested') ||
       (v.execution === 'running' && v.delivery !== 'pending')) return undefined
   return { status: 'receipt_handoff', jobId: v.jobId, generation: Number(v.generation),
     execution: v.execution as ReceiptHandoff['execution'], delivery: v.delivery as ReceiptHandoff['delivery'] }
