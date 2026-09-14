@@ -244,14 +244,20 @@ export class ReceiptCandidateLifecycle {
     })
   }
   /** Snapshots are discovery only. Destructive matching is repeated under the barrier. */
-  snapshots(): ReceiptCandidateManifest[] {
+  snapshots(): { items: ReceiptCandidateManifest[]; pending: number } {
     let root: number
-    try { root = privateDirectory(this.root) } catch (e) { if (missing(e)) return []; throw e }
+    try { root = privateDirectory(this.root) } catch (e) { if (missing(e)) return { items: [], pending: 0 }; throw e }
     try {
       const manifests = childDirectory(root, 'namespaces', false)
       try {
-        return readdirSync(`/proc/self/fd/${manifests}`).filter(n => /^[a-f0-9]{64}\.json$/.test(n))
-          .flatMap(n => { const m = readManifest(manifests, n.slice(0, -5)); return m ? [m] : [] })
+        const items: ReceiptCandidateManifest[] = []
+        let pending = 0
+        for (const name of readdirSync(`/proc/self/fd/${manifests}`)) {
+          if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
+          try { const m = readManifest(manifests, name.slice(0, -5)); if (m) items.push(m) }
+          catch { pending++ } // keep unknown bytes/inodes; do not poison healthy discoveries
+        }
+        return { items, pending }
       } finally { closeSync(manifests) }
     } finally { closeSync(root) }
   }

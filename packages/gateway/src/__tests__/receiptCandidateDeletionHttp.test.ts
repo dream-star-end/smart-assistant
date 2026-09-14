@@ -366,3 +366,40 @@ test('actual SQLite lookup failure retains candidate data and returns unknown wi
     db?.close(); await f.close()
   }
 })
+
+for (const fault of ['json', 'symlink'] as const) test(`bad manifest ${fault} stays pending while healthy HTTP and fresh-instance deletion progress`, async () => {
+  const a = await fixture('c:3'), b = await fixture('c:4'), c = await fixture('c:3')
+  const fs = await import('node:fs')
+  const { receiptCandidateDeletionKey } = await import('@openclaude/storage/receiptCandidateLifecycle')
+  const root = join(home, 'receipt-candidates-v1'), prefix = 'f2-isolate-' + fault
+  let badFile: string | undefined, original: string | undefined, fresh: any
+  const outside = join(home, prefix + '-unknown-data')
+  try {
+    for (const [f, id, user] of [[a, prefix + '-http', 'c:3'], [b, prefix + '-bad', 'c:4'], [c, prefix + '-boot', 'c:3']] as const) {
+      await seed(id, user); Object.assign(f.parent, { channel: 'webchat', peerId: id }); f.process.tool('creator')
+    }
+    const ca = a.caps.verify(await a.issue())!, cb = b.caps.verify(await b.issue())!, cc = c.caps.verify(await c.issue())!
+    badFile = join(root, 'namespaces', cb.locatorPartition + '.json'); original = fs.readFileSync(badFile, 'utf8')
+    if (fault === 'json') fs.writeFileSync(badFile, '{private-invalid-record')
+    else { fs.writeFileSync(outside, 'UNKNOWN_DATA_MUST_SURVIVE'); fs.unlinkSync(badFile); fs.symlinkSync(outside, badFile) }
+    const result = await requestSession(a, '/api/sessions/' + prefix + '-http', 'DELETE')
+    assert.equal(result.status, 200); assert.equal(result.body.receiptCandidateCleanup.state, 'pending')
+    assert.equal(fs.existsSync(join(root, 'data', ca.locatorPartition)), false, 'healthy HTTP deletion must progress despite unrelated bad record')
+    assert.equal(await storage.deleteClientSession(prefix + '-boot', 'c:3'), true)
+    fresh = new Gateway((a.gw as any).deps) as any; fresh.sessions = { getByKey: () => undefined }
+    await fresh._sweepReceiptCandidates()
+    assert.equal(fs.existsSync(join(root, 'data', cc.locatorPartition)), false, 'fresh recovery must not require manual repair of the bad record')
+    for (const id of [prefix + '-http', prefix + '-boot']) {
+      assert.ok(fs.existsSync(join(root, 'deleted', receiptCandidateDeletionKey({ userId: 'c:3', clientSessionId: id }) + '.json')))
+    }
+    assert.ok(fs.existsSync(join(root, 'data', cb.locatorPartition)), 'foreign unknown namespace is retained')
+    const scan = fresh.receiptCandidates().snapshots()
+    assert.equal(scan.pending, 1); assert.ok(scan.items.length >= 2)
+    assert.ok(fresh._receiptCandidateTimer, 'unknown item remains scheduled, not silently completed')
+    if (fault === 'json') assert.equal(fs.readFileSync(badFile, 'utf8'), '{private-invalid-record')
+    else { assert.ok(fs.lstatSync(badFile).isSymbolicLink()); assert.equal(fs.readFileSync(outside, 'utf8'), 'UNKNOWN_DATA_MUST_SURVIVE') }
+  } finally {
+    if (badFile && original) { if (fs.lstatSync(badFile).isSymbolicLink()) fs.unlinkSync(badFile); fs.writeFileSync(badFile, original) }
+    clearTimeout(fresh?._receiptCandidateTimer); await a.close(); await b.close(); await c.close()
+  }
+})

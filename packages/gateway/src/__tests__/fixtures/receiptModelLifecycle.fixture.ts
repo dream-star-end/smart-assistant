@@ -91,6 +91,10 @@ await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r))
 const upstreamPort=(upstream.address() as any).port
 const dbPath=join(dir,'delegate-jobs.db')
 Object.assign(process.env,{OPENCLAUDE_HOME:dir,OPENCLAUDE_DELEGATE_JOBS_DB:dbPath,OC_DELEGATE_SM:'1',OC_DELEGATE_DURABLE:'1',OC_DELEGATE_NOTIFIER:'1'})
+// F2 notification requires a real active private client row, not just an SDK parent stub.
+const {upsertClientSession}=await import('../../../../storage/src/sessionsDb.js')
+await upsertClientSession({id:'real-model-cli',userId:'default',agentId:'main',title:'private lifecycle fixture',pinned:false,
+ createdAt:1000,lastAt:1000,updatedAt:1000,messages:[]})
 const config:any={version:1,gateway:{bind:'127.0.0.1',port:0,accessToken:token},auth:{mode:'subscription',claudeCodePath:join(root,'claude-code-best'),claudeCodeEntry:'scripts/dev.ts'},sessions:{dbPath:join(dir,'sessions.db')},defaults:{model:'claude-sonnet-4-5-20250929',permissionMode:'bypassPermissions'},channels:{webchat:{enabled:true}},terminal:{type:'local'}}
 const gw=new Gateway({config,agentsConfig:{agents:[{id:'main',model:config.defaults.model}],routes:[],default:'main'}} as any)
 // Keep the actual production constructor, terminal hook, boot/retry scheduler and notifier.

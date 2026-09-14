@@ -2845,19 +2845,25 @@ export class Gateway {
       return observed.state === 'active' || observed.state === 'deleted' ? observed.state : 'unknown'
     } catch { return 'unknown' }
   }
-  private _revokeDeletedReceiptParents(refs: readonly ReceiptCandidateDeletionRef[]): void {
+  private _revokeDeletedReceiptParents(refs: readonly ReceiptCandidateDeletionRef[]): number {
     const keys = new Set(refs.map(receiptCandidateDeletionKey))
-    for (const m of this.receiptCandidates().snapshots()) {
-      if (m.state !== 'active') continue
-      const ref = receiptCandidateDeletionRef(m.scope)
-      if (!ref || !keys.has(receiptCandidateDeletionKey(ref))) continue
-      const parent = this.sessions?.getByKey(m.scope.sessionKey)
-      if (!parent || parent.agentId !== m.scope.agentId || (parent.userId || 'default') !== m.scope.userId) continue
-      const actualRef = this._receiptClientRef(parent)
-      if (actualRef && receiptCandidateDeletionKey(actualRef) === receiptCandidateDeletionKey(ref)) {
-        parent.runner.revokeReceiptOwner?.(checkedCandidateOwner(m.scope.owner))
-      }
+    let discovered: ReturnType<ReceiptCandidateLifecycle['snapshots']>
+    try { discovered = this.receiptCandidates().snapshots() } catch { return 1 }
+    let pending = discovered.pending
+    for (const m of discovered.items) {
+      try {
+        if (m.state !== 'active') continue
+        const ref = receiptCandidateDeletionRef(m.scope)
+        if (!ref || !keys.has(receiptCandidateDeletionKey(ref))) continue
+        const parent = this.sessions?.getByKey(m.scope.sessionKey)
+        if (!parent || parent.agentId !== m.scope.agentId || (parent.userId || 'default') !== m.scope.userId) continue
+        const actualRef = this._receiptClientRef(parent)
+        if (actualRef && receiptCandidateDeletionKey(actualRef) === receiptCandidateDeletionKey(ref)) {
+          parent.runner.revokeReceiptOwner?.(checkedCandidateOwner(m.scope.owner))
+        }
+      } catch { pending++ }
     }
+    return pending
   }
   /** SQL transaction has returned; classify exact identities again, never infer deletion from HTTP/IDs. */
   private async _cleanupDeletedReceiptCandidates(refs: readonly ReceiptCandidateDeletionRef[]): Promise<{ state: 'complete' | 'pending' | 'not_applicable' }> {
@@ -2871,10 +2877,11 @@ export class Gateway {
         if (observed.state === 'deleted') deleted.push(ref)
       }
       if (!deleted.length) return { state: 'not_applicable' }
-      this._revokeDeletedReceiptParents(deleted)
+      const revokePending = this._revokeDeletedReceiptParents(deleted)
       const result = await this.receiptCandidates().fenceDeleted(deleted)
-      if (result.pending) this._armReceiptCandidateRetry()
-      return { state: result.pending ? 'pending' : 'complete' }
+      const pending = revokePending > 0 || result.pending > 0
+      if (pending) this._armReceiptCandidateRetry()
+      return { state: pending ? 'pending' : 'complete' }
     } catch (error) {
       this._armReceiptCandidateRetry()
       this.log.warn('receipt deletion cleanup pending', undefined, error as Error)
@@ -2888,7 +2895,9 @@ export class Gateway {
       let pending = false
       try {
         const store = this.receiptCandidates()
-        for (const snapshot of store.snapshots()) {
+        const discovered = store.snapshots()
+        pending = discovered.pending > 0
+        for (const snapshot of discovered.items) {
           const partition = snapshot.partition
           try {
             const ref = snapshot.state === 'active' ? receiptCandidateDeletionRef(snapshot.scope) : snapshot.deletionRef

@@ -22,7 +22,7 @@ test('exact deleted tenant retires all current namespaces, preserves foreign ten
   const other = { ...f.scope, partition: 'c'.repeat(64) }
   const foreignPath = await f.store.register(foreign, 'foreign', () => {})
   // This namespace was not in the caller snapshot, but must be retired under the lock.
-  const oldSnapshot = f.store.snapshots(); assert.equal(oldSnapshot.length, 2)
+    const oldSnapshot = f.store.snapshots(); assert.equal(oldSnapshot.items.length, 2); assert.equal(oldSnapshot.pending, 0)
   const otherPath = await f.store.register(other, 'two', () => {})
   assert.deepEqual(await f.store.fenceDeleted([f.ref]), { pending: 0 })
   assert.equal(fs.existsSync(f.data), false); assert.equal(fs.existsSync(otherPath), false)
@@ -39,7 +39,7 @@ test('authoritative deletion with no job or namespace fences later registration'
   assert.deepEqual(await f.store.fenceDeleted([f.ref]), { pending: 0 })
   await assert.rejects(f.store.register(f.scope, 'never', () => {}), /deleted/)
   assert.equal(fs.existsSync(f.data), false)
-  assert.deepEqual(f.store.snapshots(), [])
+    assert.deepEqual(f.store.snapshots(), { items: [], pending: 0 })
 })
 
 test('one unknown inode remains pending with identity while other deleted candidates still retire', async () => {
@@ -50,7 +50,7 @@ test('one unknown inode remains pending with identity while other deleted candid
   fs.symlinkSync(victim, join(f.data, 'cache', 'unknown'))
   assert.deepEqual(await f.store.fenceDeleted([f.ref]), { pending: 1 })
   assert.equal(fs.existsSync(otherPath), false); assert.equal(fs.readFileSync(victim, 'utf8'), 'KEEP')
-  const snapshot = f.store.snapshots().find(m => m.partition === f.scope.partition)!
+    const snapshot = f.store.snapshots().items.find(m => m.partition === f.scope.partition)!
   assert.equal(snapshot.state, 'retired')
   if (snapshot.state === 'retired') assert.deepEqual(snapshot.deletionRef, f.ref)
   await assert.rejects(f.store.withActive(f.scope.partition, () => assert.fail('late unknown writer')))
