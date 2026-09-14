@@ -1844,11 +1844,21 @@ export function createCommercialHandler(
       } else {
         // user + admin 都按「自己的容器」验证/代理(admin 也是平台的普通使用者;
         // requireUserVerifyDb 硬编码 role='user',会把 admin 挡成 403)。
-        const verified = await requireActiveAccountVerifyDb(
-          claims.sub,
-          ['user', 'admin'],
-          deps.v3Supervisor.pool,
-        )
+        let verified: Awaited<ReturnType<typeof requireActiveAccountVerifyDb>>
+        try {
+          verified = await requireActiveAccountVerifyDb(
+            claims.sub,
+            ['user', 'admin'],
+            deps.v3Supervisor.pool,
+          )
+        } catch (err) {
+          if (!path.startsWith('/api/delegates/')) throw err
+          // This user surface never turns an unavailable authority into a host
+          // fallback or an acknowledged action. Do not expose the DB error.
+          sendError(res, 503, 'USER_AUTHORITY_UNAVAILABLE', 'delegate user authority unavailable', requestId)
+          incrGatewayRequest('__container_api_proxy__', method, res.statusCode)
+          return true
+        }
         if (!verified) {
           apiProxyLog.warn('container_api_proxy_user_inactive', { sub: claims.sub })
           sendError(res, 403, 'FORBIDDEN', 'user account not active', requestId)
@@ -2080,7 +2090,7 @@ export function createCommercialHandler(
       const token = extractTokenFromReq(req)
       const claims = verifyCommercialJwtSync(token, deps.jwtSecret)
       if (claims) {
-        if (claims.role === 'admin') {
+        if (claims.role === 'admin' && !path.startsWith('/api/delegates/')) {
           // admin: DB double-check(role/status 撤权立即生效),通过后 fall through
           try {
             const admin = await requireAdminVerifyDb(req, deps.jwtSecret)

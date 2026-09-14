@@ -1,0 +1,21 @@
+{
+  "extends": "../../../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": "../../../..",
+    "composite": false,
+    "incremental": false,
+    "noEmit": true,
+    "emitDeclarationOnly": false,
+    "declaration": false,
+    "declarationMap": false,
+    "typeRoots": ["../../../../node_modules/@types"],
+    "paths": {
+      "@openclaude/protocol": ["packages/protocol/src/index.ts"],
+      "@openclaude/storage": ["packages/storage/src/index.ts"],
+      "@openclaude/gateway": ["packages/gateway/src/index.ts"],
+      "@openclaude/plugin-sdk": ["packages/plugin-sdk/src/index.ts"],
+      "@openclaude/channel-wechat": ["packages/channels/wechat/src/index.ts"]
+    }
+  },
+  "files": ["delegateUserProxy.test.ts"]
+}
