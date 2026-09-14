@@ -804,6 +804,10 @@ export class DelegateDurableDb {
         WHERE f.user_id=s.user_id AND f.client_session_id=s.parent_client_session_id))`).get(jobId, generation)
   }
 
+  hasRetrySource(jobId: string, generation: number): boolean {
+    return !!this.db.prepare('SELECT 1 FROM delegate_retry_source WHERE job_id=? AND generation=?').get(jobId, generation)
+  }
+
   getRetryAction(key: DelegateRetryActionKey): DelegateRetryAction | undefined {
     checkedDelegateRetryActionKey(key)
     const row = this.db.prepare(`SELECT * FROM delegate_retry_action

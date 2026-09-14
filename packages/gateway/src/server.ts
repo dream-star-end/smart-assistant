@@ -476,7 +476,7 @@ import {
   isDelegateRunnerIdle,
   resolveDelegateCutoverFreezeMs,
 } from './delegateCutover.js'
-import { DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
+import { DefaultEngineNotifier, notifyClaimFenceOf, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
 import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import {
   delayUntilNextNotifyRetry,
@@ -11587,6 +11587,8 @@ export class Gateway {
 
   private _notifyDispatchHooks() {
     return {
+      sourceDeliveryAllowed: (job: DelegateJobSnapshot) => this._sourceNotifyAllowed(job),
+      sourceDeliveryLive: (job: DelegateJobSnapshot) => !this._delegateJobs?.isRetrySourceRetired(job.id, job.generation),
       receiptDeliveryAllowed: (job: DelegateJobSnapshot) => this._receiptNotifyAllowed(job),
       resolveParentEngine: (job: DelegateJobSnapshot) =>
         this._resolveDelegateParentEngine(job.callbackOriginSessionKey ?? job.parentSessionKey) ??
@@ -11611,6 +11613,9 @@ export class Gateway {
     this._engineNotifier = new DefaultEngineNotifier({
       inlinePush: {
         write: async (event) => {
+          const job = this._delegateJobs?.snapshotOf(event.jobId)
+          if (job && this._delegateJobs?.hasRetrySource(job.id, job.generation) &&
+              (!await this._sourceNotifyAllowed(job) || notifyClaimFenceOf(event)?.isLive() === false)) return { ok: false, processAlive: false }
           const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
           return writeInlinePushForSession(
             session,
@@ -11635,6 +11640,11 @@ export class Gateway {
         }),
       resumeInject: {
         inject: async (event) => {
+          const job = this._delegateJobs?.snapshotOf(event.jobId)
+          const deliveryAllowed = job && this._delegateJobs?.hasRetrySource(job.id, job.generation)
+            ? async () => await this._sourceNotifyAllowed(job) && notifyClaimFenceOf(event)?.isLive() !== false
+            : undefined
+          if (deliveryAllowed && !await deliveryAllowed()) return { ok: false, failureClass: 'internal' as const }
           const result =
             event.callback === 'cron-origin-inject'
               ? await this.injectCronOriginFromTerminal(event)
@@ -11647,6 +11657,7 @@ export class Gateway {
                   userId: event.callbackOriginUserId,
                   clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
                   once: true,
+                  deliveryAllowed,
                 })
           if (result.kind === 'injected') return { ok: true }
           if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
@@ -11672,6 +11683,28 @@ export class Gateway {
 
   // Not a delivery queue/ACK: a lower bound consumed by the existing retry timer.
   private readonly _receiptNotifyNotBefore = new Map<string, number>()
+
+  private async _sourceNotifyAllowed(job: DelegateJobSnapshot): Promise<boolean> {
+    const store = this._delegateJobs
+    if (!store?.hasRetrySource(job.id, job.generation)) return true // genuinely legacy, not a deleted source
+    const key = this._receiptNotifyKey(job)
+    if ((this._receiptNotifyNotBefore.get(key) ?? 0) > Date.now()) return false
+    try {
+      const source = job.callbackOriginUserId ? store.getRetrySource(job.callbackOriginUserId, job.id, job.generation) : undefined
+      if (source && !store.isRetrySourceRetired(job.id, job.generation)) {
+        const [observed] = await classifyClientSessions([{ userId: source.userId, sessionId: source.parentClientSessionId }])
+        if (observed?.userId === source.userId && observed.sessionId === source.parentClientSessionId) {
+          if (observed.state === 'deleted') store.fenceDeletedRetryParent({ userId: source.userId, clientSessionId: source.parentClientSessionId })
+          if (observed.state === 'active' && JSON.stringify(store.getRetrySource(source.userId, job.id, job.generation)) === JSON.stringify(source)) {
+            this._receiptNotifyNotBefore.delete(key)
+            return true
+          }
+        }
+      }
+    } catch { /* unknown is not deleted/delivered; retain the original claim/ACK */ }
+    this._receiptNotifyNotBefore.set(key, Date.now() + 30_000)
+    return false
+  }
   private _receiptNotifyKey(job: DelegateJobSnapshot): string { return JSON.stringify([job.id, job.generation]) }
   private async _receiptNotifyAllowed(job: DelegateJobSnapshot): Promise<boolean> {
     const key = this._receiptNotifyKey(job)
@@ -17382,6 +17415,8 @@ export class Gateway {
     clientMessageId?: string
     /** Stage 2 notifier: one try, BUSY returns to pending instead of 12-then-fallback. */
     once?: boolean
+    /** Exact source lifecycle supplied only by the original notifier. */
+    deliveryAllowed?: () => Promise<boolean>
   }): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
     if (!origin) {
@@ -17399,6 +17434,7 @@ export class Gateway {
     })
     const clientMessageId = args.clientMessageId || sendToAgentCallbackClientMessageId(args.jobId)
     const tryOnce = async (): Promise<CronOriginFireResult> => {
+      if (args.deliveryAllowed && !await args.deliveryAllowed()) return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
       // Billing parity with cron-origin-inject (2026-09-05): when a master is
       // reachable the callback turn MUST be admitted by master (admitUserTurn →
       // turn_dispatches row + billingRequestId) and come back down as a durable
@@ -17430,6 +17466,7 @@ export class Gateway {
       const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
       let queued = false
       try {
+        if (args.deliveryAllowed && !await args.deliveryAllowed()) return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
         const parent = this.sessions.getByKey(origin.sessionKey)
         if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
           return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
@@ -17446,6 +17483,7 @@ export class Gateway {
           clientMessageId,
           jobId: args.jobId,
           barrierOwner: barrier.owner,
+          deliveryAllowed: args.deliveryAllowed,
           onQueued: () => {
             queued = true
             barrier.release()
@@ -17473,6 +17511,7 @@ export class Gateway {
     jobId: string
     barrierOwner?: string
     onQueued?: () => void
+    deliveryAllowed?: () => Promise<boolean>
   }): Promise<CronOriginFireResult> {
     if (this._shuttingDown || this._runtimeRecycleDrainUntil > Date.now()) {
       return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
@@ -17527,6 +17566,7 @@ export class Gateway {
     }
     try {
       let wasQueued = false
+      if (args.deliveryAllowed && !await args.deliveryAllowed()) return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
       await this.dispatchInbound({
         type: 'inbound.message',
         channel: args.origin.channel,

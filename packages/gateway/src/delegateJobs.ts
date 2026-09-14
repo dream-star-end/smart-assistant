@@ -419,6 +419,9 @@ export class DelegateJobStore {
     return this.sm
   }
 
+  hasRetrySource(jobId: string, generation: number): boolean { return this.durable?.hasRetrySource(jobId, generation) ?? false }
+  isRetrySourceRetired(jobId: string, generation: number): boolean { return this.durable?.isRetrySourceRetired(jobId, generation) ?? false }
+
   get ownerInstanceId(): string {
     return this.bootId
   }

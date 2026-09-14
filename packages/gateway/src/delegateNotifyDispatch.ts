@@ -39,6 +39,9 @@ const log = createLogger({ module: 'delegateNotifyDispatch' })
 export type NotifyFence = { claimToken: string; fencingEpoch: number }
 
 export type NotifyDispatchHooks = {
+  /** Ordinary attributed jobs share the original claim/notifier, not receipt ACK. */
+  sourceDeliveryAllowed?: (job: DelegateJobSnapshot) => Promise<boolean>
+  sourceDeliveryLive?: (job: DelegateJobSnapshot) => boolean
   /** Receipt-only lifecycle gate; false retains the original owner and ACK state. */
   receiptDeliveryAllowed?: (job: DelegateJobSnapshot) => Promise<boolean>
   resolveParentEngine?: (job: DelegateJobSnapshot) => ReturnType<typeof parseParentEngine>
@@ -81,6 +84,7 @@ export async function dispatchJobTerminalNotify(
   if (!isDelegateTerminalState(job.state)) {
     return { skipped: true, reason: 'not_terminal' }
   }
+  if (hooks.sourceDeliveryAllowed && !await hooks.sourceDeliveryAllowed(job)) return { skipped: true, reason: 'source_session_unavailable' }
   if (store.hasDeliveryReceiptEnrollment(job.id)) {
     if (hooks.receiptDeliveryAllowed && !await hooks.receiptDeliveryAllowed(job)) return { skipped: true, reason: 'receipt_session_unavailable' }
     return dispatchReceiptTerminalNotify(store, job, notifier, hooks)
@@ -188,7 +192,7 @@ export async function dispatchJobTerminalNotify(
     deliveryToken = claimed.token
     const token = claimed.token
     const fence: NotifyClaimFence = {
-      isLive: () => store.isNotifyClaimLive(live.id, token),
+      isLive: () => store.isNotifyClaimLive(live.id, token) && (hooks.sourceDeliveryLive?.(live) ?? true),
       ackDelivered: () => {
         try {
           return store.completeNotifyDelivery(live.id, token, fenceOf(live))
@@ -215,6 +219,12 @@ export async function dispatchJobTerminalNotify(
 
   let result: NotifyResult
   try {
+    // Claim may have blocked behind deletion in another process. Recheck SQL
+    // after acquisition, release only this token, retain the original ACK state.
+    if (hooks.sourceDeliveryAllowed && !await hooks.sourceDeliveryAllowed(live)) {
+      if (deliveryToken) store.releaseNotifyClaim(job.id, deliveryToken, fenceOf(live))
+      return { skipped: true, reason: 'source_session_unavailable' }
+    }
     result = await notifier.notify(event)
   } catch (err) {
     // A write may already have landed. Never release a delivered receipt;

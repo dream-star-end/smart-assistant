@@ -326,3 +326,93 @@ test('D14 lifecycle original 30s scheduler finds SQL-only deletion without recei
     retired(f, made.data.jobId)
   } finally { clearTimeout(deadline); await f.close() }
 })
+
+// Original notifier claim and scheduler; no new ACK queue. Receiver/model ports
+// are counted seams here, not a claim of the D13 master/actual-model matrix.
+for (const mode of ['active', 'deleted-before', 'deleted-after-claim', 'corrupt', 'legacy'] as const) {
+  test(`D14 source notification lifecycle ${mode}`, async () => {
+    const f = await fixture()
+    const { dispatchJobTerminalNotify, delayUntilNextNotifyRetry } = await import('../delegateNotifyDispatch.js')
+    const { DefaultEngineNotifier } = await import('../engineNotifier.js')
+    try {
+      const made = await f.post(); assert.equal(made.status, 200)
+      const source = f.db.getRetrySource('c:7', made.data.jobId, 0)!
+      const created = f.jobs.create('coding-assistant', { callback: 'origin-inject', parentEngine: 'codex',
+        callbackOriginUserId: 'c:7', callbackOriginSessionKey: source.originSessionKey,
+        sessionKey: 'notify-child', parentSessionKey: source.parentSessionKey,
+        ...(mode === 'legacy' ? {} : { retrySource: { ...source, childSessionKey: 'notify-child' } }) })
+      assert.ok('jobId' in created)
+      const initial = f.jobs.snapshotOf(created.jobId)!
+      assert.equal(f.jobs.fail(created.jobId, { failureClass: 'internal', detail: 'private notify failure', httpStatus: 503,
+        claimToken: initial.claimToken, fencingEpoch: initial.fencingEpoch }), true)
+      if (mode === 'deleted-before' || mode === 'legacy') await storage.deleteClientSession(f.peerId, 'c:7')
+      if (mode === 'corrupt') f.sql.prepare('UPDATE delegate_retry_source SET metadata_json=? WHERE job_id=?').run('{bad', created.jobId)
+      let injected = 0
+      const notifier = new DefaultEngineNotifier({ resumeInject: { inject: async () => { injected++; return { ok: true } } } })
+      const hooks = f.gw._notifyDispatchHooks()
+      if (mode === 'deleted-after-claim') {
+        const original = hooks.sourceDeliveryAllowed
+        hooks.sourceDeliveryAllowed = async (job: any) => {
+          if (f.jobs.snapshotOf(job.id)?.callbackState === 'injecting') await storage.deleteClientSession(f.peerId, 'c:7')
+          return original(job)
+        }
+      }
+      const result = await dispatchJobTerminalNotify(f.jobs, f.jobs.snapshotOf(created.jobId)!, notifier, hooks)
+      const allowed = mode === 'active' || mode === 'legacy'
+      assert.equal(injected, allowed ? 1 : 0, JSON.stringify(result))
+      assert.equal(f.jobs.snapshotOf(created.jobId)?.callbackState === 'delivered', allowed)
+      if (!allowed) {
+        assert.equal('skipped' in result, true)
+        const delay = delayUntilNextNotifyRetry(f.jobs, Date.now(), {
+          receiptRetryNotBefore: job => f.gw._receiptNotifyNotBefore.get(f.gw._receiptNotifyKey(job)) })
+        assert.ok(delay !== undefined && delay >= 29_000, String(delay))
+        assert.equal((await dispatchJobTerminalNotify(f.jobs, f.jobs.snapshotOf(created.jobId)!, notifier, hooks) as any).skipped, true)
+        assert.equal(injected, 0)
+        if (mode !== 'corrupt') assert.equal(f.db.isRetrySourceRetired(created.jobId, 0), true)
+        else assert.equal(f.db.isRetrySourceRetired(created.jobId, 0), false, 'unknown is not deletion')
+      }
+    } finally { await f.close() }
+  })
+}
+
+test('D14 source notification held by actual callback barrier rejects late SQL deletion', async () => {
+  const f = await fixture(), previousNotifier = process.env.OC_DELEGATE_NOTIFIER
+  const { dispatchJobTerminalNotify, delayUntilNextNotifyRetry } = await import('../delegateNotifyDispatch.js')
+  let holder: { release(): void } | undefined
+  try {
+    const made = await f.post(); assert.equal(made.status, 200)
+    const source = f.db.getRetrySource('c:7', made.data.jobId, 0)!
+    const created = f.jobs.create('coding-assistant', { callback: 'origin-inject', parentEngine: 'codex',
+      callbackOriginUserId: 'c:7', callbackOriginSessionKey: source.originSessionKey,
+      sessionKey: 'notify-barrier-child', parentSessionKey: source.parentSessionKey,
+      retrySource: { ...source, childSessionKey: 'notify-barrier-child' } })
+    assert.ok('jobId' in created)
+    const initial = f.jobs.snapshotOf(created.jobId)!
+    f.jobs.fail(created.jobId, { failureClass: 'internal', detail: 'private notify failure', httpStatus: 503,
+      claimToken: initial.claimToken, fencingEpoch: initial.fencingEpoch })
+    process.env.OC_DELEGATE_NOTIFIER = '1'
+    let callbacks = 0
+    f.gw.dispatchInbound = async () => { callbacks++ }
+    const acquire = f.gw._acquireSyntheticTurnBarrier.bind(f.gw), entered = gate()
+    holder = await acquire(source.originSessionKey)
+    f.gw._acquireSyntheticTurnBarrier = async (key: string) => { entered.release(); return acquire(key) }
+    const pending = dispatchJobTerminalNotify(f.jobs, f.jobs.snapshotOf(created.jobId)!, f.gw._ensureEngineNotifier(), f.gw._notifyDispatchHooks())
+    await entered.promise
+    assert.equal(f.jobs.snapshotOf(created.jobId)?.callbackState, 'injecting')
+    assert.equal(await storage.deleteClientSession(f.peerId, 'c:7'), true)
+    holder!.release()
+    const result = await pending
+    assert.equal(callbacks, 0, JSON.stringify(result))
+    assert.equal(f.db.isRetrySourceRetired(created.jobId, 0), true)
+    assert.notEqual(f.jobs.snapshotOf(created.jobId)?.callbackState, 'delivered')
+    assert.equal(f.gw._syntheticTurnBarriers.size, 0)
+    const delay = delayUntilNextNotifyRetry(f.jobs, Date.now(), {
+      receiptRetryNotBefore: job => f.gw._receiptNotifyNotBefore.get(f.gw._receiptNotifyKey(job)) })
+    assert.ok(delay !== undefined && delay >= 29_000, String(delay))
+  } finally {
+    holder?.release()
+    if (previousNotifier === undefined) delete process.env.OC_DELEGATE_NOTIFIER
+    else process.env.OC_DELEGATE_NOTIFIER = previousNotifier
+    await f.close()
+  }
+})
