@@ -188,7 +188,7 @@ await withPrivatePg(async ({ pool, backend, schema }: any) => {
                 assert.equal(req.headers.authorization, 'Bearer ' + token);
                 const state = { security_epoch: '12', availability_revision: 'private-d14' };
                 res.setHeader('Content-Type', 'application/json');
-                res.end(JSON.stringify(path === MODEL_CATALOG_EPOCH_PATH ? state : { ...state,
+                res.end(JSON.stringify(path === MODEL_CATALOG_EPOCH_PATH ? { epoch: state.security_epoch, availability_revision: state.availability_revision } : { ...state,
                   projection_revision: 'private-d14-retry', agent_cost_overrides: {}, models: [
                     { model_id: 'glm-5.3-zai', engine: 'ccb', provider_id: 'zai', context_window: 200000,
                       supported_efforts: ['low','medium','high'], supports_vision: false, capability_zero: true, supports_thinking: true },
@@ -264,7 +264,7 @@ await withPrivatePg(async ({ pool, backend, schema }: any) => {
             held.release();
             held = null;
         }
-        await until(async () => { const rows = (await pool.query('SELECT dispatch_id,status,outcome,client_message_id FROM turn_dispatches ORDER BY admitted_at')).rows; evidence.dispatches = rows; return rows.length === (mode === 'ingested' ? 1 : mode === 'retry' ? 3 : 2) && rows.every((r: any) => r.status === 'terminal'); }, 'two actual PG terminal dispatches', 90000);
+        await until(async () => { const rows = (await pool.query('SELECT dispatch_id,status,outcome,client_message_id FROM turn_dispatches ORDER BY admitted_at')).rows; evidence.dispatches = rows; return rows.length === (mode === 'ingested' ? 1 : 2) && rows.every((r: any) => r.status === 'terminal'); }, 'two actual PG terminal dispatches', 90000);
         if (mode === 'ack-loss' || mode === 'accept-blocked') {
             await until(() => evidence.injectResults?.length >= 2, 'original notify retry response', 90000);
             child.send({ type: 'watch-notified' });

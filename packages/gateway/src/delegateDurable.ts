@@ -769,18 +769,21 @@ export class DelegateDurableDb {
   }
 
   getRetrySource(userId: string, jobId: string, generation: number): DelegateRetrySource | undefined {
-    const source = this.getRetrySourceForJob(jobId, generation)
+    const source = this.getRetrySourceForJob(jobId, generation, userId)
     return source?.userId === userId ? source : undefined
   }
 
   /** Internal trusted job lookup; never use this to resolve an HTTP principal. */
-  getRetrySourceForJob(jobId: string, generation: number): DelegateRetrySource | undefined {
-    const row = this.db.prepare(`SELECT metadata_json,user_id,storage_user_id FROM delegate_retry_source
-      WHERE job_id=? AND generation=? AND retired_at IS NULL`).get(jobId, generation) as
-      { metadata_json: string | null; user_id: string; storage_user_id: string } | undefined
+  getRetrySourceForJob(jobId: string, generation: number, expectedPublicUser?: string): DelegateRetrySource | undefined {
+    const row = this.db.prepare(`SELECT metadata_json,user_id,storage_user_id,parent_client_session_id,parent_session,child_session,target_agent_id FROM delegate_retry_source
+      WHERE job_id=? AND generation=? AND retired_at IS NULL ${expectedPublicUser === undefined ? '' : 'AND user_id=?'}`)
+      .get(jobId, generation, ...(expectedPublicUser === undefined ? [] : [expectedPublicUser])) as
+      { metadata_json: string | null; user_id: string; storage_user_id: string; parent_client_session_id: string; parent_session: string; child_session: string; target_agent_id: string } | undefined
     if (!row?.metadata_json) return undefined
     const source = checkedDelegateRetrySource(JSON.parse(row.metadata_json))
     if (source.userId !== row.user_id || delegateRetryStorageUser(source) !== row.storage_user_id ||
+        source.parentClientSessionId !== row.parent_client_session_id || source.parentSessionKey !== row.parent_session ||
+        source.childSessionKey !== row.child_session || source.targetAgentId !== row.target_agent_id ||
         this.isRetryParentFenced(row.storage_user_id, source.parentClientSessionId)) return undefined
     return source
   }

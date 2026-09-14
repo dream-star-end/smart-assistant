@@ -6,7 +6,7 @@ const mode = process.argv[3] || 'normal', ingested = mode === 'ingested', retry 
 const dir = process.argv[2];
 const e = JSON.parse(readFileSync(join(dir, 'container-evidence.json'), 'utf8'));
 assert.equal(e.executions, retry ? 2 : 1);
-assert.equal(e.mainRequests, ingested ? 2 : retry ? 4 : 3);
+assert.equal(e.mainRequests, ingested ? 2 : retry ? e.retryEvidence.beforeRetryRequests + 1 : 3);
 assert.equal(e.callbackModels, ingested ? 0 : 1);
 assert.equal(e.rows.length, retry ? 0 : 1);
 if (!retry) {

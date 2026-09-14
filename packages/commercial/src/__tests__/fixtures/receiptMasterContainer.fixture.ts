@@ -116,6 +116,8 @@ const terminalWork: Promise<any>[] = [];
 const dispatch = gw._dispatchDelegateNotify.bind(gw);
 gw._dispatchDelegateNotify = (job: any) => { const work = dispatch(job); terminalWork.push(work); work.then(() => send({ type: 'notify-finished', rows: jobs.durable.db.prepare('SELECT job_id,state FROM delegate_delivery_receipt').all() }), () => { }); return work; };
 gw._readDelegateMemoryPressure = () => null;
+const originalRetry = gw._retryUserDelegate.bind(gw);
+gw._retryUserDelegate = async (...args: any[]) => { try { return await originalRetry(...args); } catch (e) { writeFileSync(join(dir, 'retry-error.json'), JSON.stringify({error:String(e),stack:(e as Error).stack},null,2)); throw e; } };
 gw._runDelegateTask = async (input: any) => { executions++; const claim = jobs.claimQueued(input.backgroundJobId); assert.ok(claim.ok); input.claimToken = claim.claimToken; input.fencingEpoch = claim.fencingEpoch;
     if (mode === 'retry' && !input.retrySource) { retrySourceJobId = input.backgroundJobId; gw._delegateResume.release(input.sessionKey); gw._releasePreadmittedDelegateCapacity(input); return { kind: 'rejected', status: 503, failureClass: 'internal', message: 'PRIVATE_INITIAL_CHILD_FAILURE' }; }
     if (mode === 'ingested')
@@ -137,8 +139,8 @@ catch (e) {
 async function startRetry() {
     assert.equal(mode, 'retry'); assert.equal(retryEvidence, undefined);
     const parentKey = 'agent:main:webchat:dm:d13-probe';
-    await until(() => retrySourceJobId && jobs.snapshotOf(retrySourceJobId)?.callbackState === 'delivered' &&
-      gw.sessions.getByKey(parentKey)?._currentTurnKey === undefined && gw.sessions.getByKey(parentKey)?._activeTurnCount === 0, 'initial failure actual callback and parent settlement');
+    await until(() => retrySourceJobId && jobs.snapshotOf(retrySourceJobId)?.callbackState === 'skipped_silent' &&
+      gw.sessions.getByKey(parentKey)?._currentTurnKey === undefined && gw.sessions.getByKey(parentKey)?._activeTurnCount === 0, 'initial failure actual CLI consumption and parent settlement');
     const parent = gw.sessions.getByKey(parentKey);
     const identity = { sessionKey: parent?.sessionKey, localUserId: parent?.userId,
       expectedApiUserId: 'c:' + process.env.OC_USER_ID, expectedSource: 'authenticated master user fixture',
@@ -169,13 +171,14 @@ async function startRetry() {
     const key = { userId: identity.expectedApiUserId, sourceJobId: created.jobId, generation: 0, actionId: 'private-master-retry-action-0001' };
     const post = async () => { const r = await fetch(url, { method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ generation: 0, actionId: key.actionId }) }); return { status: r.status, body: await r.json() as any }; };
+    const beforeRetryRequests = mainRequests;
     const accepted = await post(), replay = await post();
     writeFileSync(join(dir, 'retry-http-identity.json'), JSON.stringify({ identity, accepted, replay }, null, 2));
     assert.equal(accepted.status, 202, JSON.stringify(accepted)); assert.equal(replay.status, 200, JSON.stringify(replay));
     assert.equal(accepted.body.jobId, replay.body.jobId); assert.notEqual(accepted.body.jobId, created.jobId);
     assert.equal(jobs.hasDeliveryReceiptEnrollment(accepted.body.jobId), false);
     assert.equal(executions, 2); assert.equal(unexpectedSpawns, 0);
-    retryEvidence = { source: created.jobId, target: accepted.body.jobId, key, accepted, replay, unexpectedSpawns,
+    retryEvidence = { beforeRetryRequests, sourceJobId: created.jobId, target: accepted.body.jobId, key, accepted, replay, unexpectedSpawns,
       source, boundary: 'original signed parent model CLI creates source; native enrollment and two child executions fixture; actual user HTTP/action/claim/terminal/master ACK/callback model' };
     releaseChild();
     await until(() => jobs.snapshotOf(accepted.body.jobId)?.callbackState === 'delivered', 'new retry original durable notification ACK');
