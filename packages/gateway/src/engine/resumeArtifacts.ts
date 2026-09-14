@@ -242,6 +242,19 @@ export function resumeArtifactExists(
   return probeResumeArtifact(engine, resumeId, ctx).exists
 }
 
+/** Retry-only evidence. Ordinary probes intentionally tolerate unknown; a
+ * promise to resume the same native conversation must not use that fallback. */
+export function probeStrictNativeResume(
+  engine: string,
+  resumeId: string,
+  ctx: ResumeArtifactContext = {},
+): 'present' | 'absent' | 'unknown' | 'unsupported' {
+  if (engine !== 'codex') return 'unsupported'
+  const result = codexRolloutArtifact(resumeId, resolveCtx(ctx).codexHome)
+  if (result === 'unknown') return 'unknown'
+  return result?.exists && result.path ? 'present' : 'absent'
+}
+
 /** Upper bound on remembered prior ids per session. Small on purpose: this is
  *  a fallback ladder for "the newest id never landed", not an archive. */
 export const RESUME_HISTORY_MAX = 4

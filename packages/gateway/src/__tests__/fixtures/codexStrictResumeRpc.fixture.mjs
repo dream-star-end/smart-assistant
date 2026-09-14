@@ -1,7 +1,7 @@
 // Private synthetic app-server over real stdio JSON-RPC. Never calls a model.
 import { existsSync, appendFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
-const [artifact, log] = process.argv.slice(2)
+const [artifact, log, mode] = process.argv.slice(2)
 const reply = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n')
 createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line)
@@ -13,7 +13,14 @@ createInterface({ input: process.stdin }).on('line', line => {
     reply({ id: request.id, result: { thread: { id: request.params?.threadId ?? 'private-fresh-thread' } } })
   } else if (request.method === 'turn/start') {
     reply({ id: request.id, result: { turn: { id: 'private-turn' } } })
-    setTimeout(() => reply({ method: 'turn/completed', params: { threadId: request.params.threadId,
-      turn: { id: 'private-turn', status: 'completed' } } }), 10)
+    setTimeout(() => {
+      if (mode === 'success') reply({ method: 'item/agentMessage/delta', params: {
+        threadId: request.params.threadId, turnId: 'private-turn', itemId: 'private-message',
+        delta: 'PRIVATE_NATIVE_CONTINUATION_RESULT',
+      } })
+      reply({ method: 'turn/completed', params: { threadId: request.params.threadId,
+      turn: { id: 'private-turn', status: mode === 'context' ? 'failed' : 'completed',
+        ...(mode === 'context' ? { error: { message: 'context window exceeded' } } : {}) } } })
+    }, 10)
   } else reply({ id: request.id, result: {} })
 })

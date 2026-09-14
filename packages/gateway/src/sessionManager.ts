@@ -51,12 +51,14 @@ import {
   RESUME_HISTORY_MAX,
   pickResumableId,
   probeResumeArtifact,
+  probeStrictNativeResume,
 } from './engine/resumeArtifacts.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
   EngineAdapter,
   EngineTurnRun,
+  StrictNativeResume,
 } from './engine/engineAdapter.js'
 import type {
   DurableRuntimeEvent,
@@ -3666,7 +3668,36 @@ export class SessionManager {
     )
   }
 
+  /** Server-internal eligibility only. Source/user permission is checked by
+   * the retry route; this lookup never scans other logical session identities,
+   * promotes history or treats unknown artifact evidence as present. */
+  resolveStrictNativeResume(sessionKey: string): StrictNativeResume | undefined {
+    const live = this.sessions.get(sessionKey)
+    const provider = live?.providerTag ??
+      SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    if (provider !== 'codex' || (live && live.runner.engineId !== 'codex')) return undefined
+    const nativeSessionId = live ? live.runner.nativeSessionId : this._resumeMap.get(sessionKey)
+    if (!nativeSessionId || this._resumeRejectedIds.get(sessionKey)?.has(nativeSessionId)) return undefined
+    if (probeStrictNativeResume(provider, nativeSessionId) !== 'present') return undefined
+    return Object.freeze({ engine: 'codex', nativeSessionId })
+  }
+
+  private _assertStrictNativeResume(
+    sessionKey: string,
+    required: StrictNativeResume,
+    session?: AgentSession,
+  ): void {
+    const eligible = this.resolveStrictNativeResume(sessionKey)
+    if (required.engine !== 'codex' || !eligible || eligible.nativeSessionId !== required.nativeSessionId ||
+        (session && (session.providerTag !== 'codex' || session.runner.engineId !== 'codex' ||
+          session.runner.nativeSessionId !== required.nativeSessionId))) {
+      throw new Error('STRICT_NATIVE_RESUME_UNAVAILABLE')
+    }
+  }
+
   async getOrCreate(opts: {
+    /** One execution only; never retained in reusable identity options. */
+    requireNativeResume?: StrictNativeResume
     sessionKey: string
     agent: AgentDef
     channel?: string
@@ -3781,6 +3812,9 @@ export class SessionManager {
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
   }): Promise<AgentSession> {
+    if (opts.requireNativeResume) {
+      opts = { ...opts, requireNativeResume: Object.freeze({ ...opts.requireNativeResume }) }
+    }
     return this._enterSessionCreateGate(opts.sessionKey, () => this._getOrCreateExclusive(opts))
   }
 
@@ -3821,7 +3855,8 @@ export class SessionManager {
     }
     // Identity construction outlives an individual dispatch/switch. Never retain
     // their one-use admission credentials in the reusable session template.
-    const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId, ...identityCreationOpts } = opts
+    const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId,
+      requireNativeResume: _strict, ...identityCreationOpts } = opts
     // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
     // Fetching marketplace identity here would fail-closed the no-tools path
     // whenever master sync is briefly unavailable.
@@ -3856,6 +3891,10 @@ export class SessionManager {
     const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
       requireAuthority: isModelAuthorityRequired(),
     })
+    if (opts.requireNativeResume) {
+      if (engineId !== 'codex') throw new Error('STRICT_NATIVE_RESUME_UNSUPPORTED')
+      this._assertStrictNativeResume(opts.sessionKey, opts.requireNativeResume)
+    }
     // CCB consumes --permission-mode. The other current engine adapters run
     // fixed full-auto/force and cannot truthfully enforce a narrower profile.
     if (identity.context.assets && engineId !== 'ccb' &&
@@ -4093,13 +4132,13 @@ export class SessionManager {
     const hadSameProviderResume =
       Boolean(this._resumeMap.get(opts.sessionKey)) &&
       SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
-    const mappedResumeId = opts.hermeticNoTools
+    const mappedResumeId = opts.requireNativeResume?.nativeSessionId ?? (opts.hermeticNoTools
       ? undefined
       : this._resumeIdFor(
           opts.sessionKey,
           engineId,
           this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
-        )
+        ))
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
       sessionKey: opts.sessionKey,
@@ -4641,6 +4680,8 @@ export class SessionManager {
     conversationMode?: 'default' | 'plan',
     opts?: {
       historicalMessages?: unknown[]
+      /** Retry-only same-native execution constraint, captured before any await. */
+      requireNativeResume?: StrictNativeResume
       /** v5 codex route 消费链(A1):dispatchInbound 校验后的 per-turn provider
        *  路由覆盖。每 turn 显式 set(null = 清除 stale route);仅 codex engine
        *  runner 实现 setCodexRoute,其余 runner duck-type 缺方法 → noop。 */
@@ -4703,6 +4744,9 @@ export class SessionManager {
       modelSwitchInternal?: string
     },
   ): Promise<void> {
+    const requireNativeResume = opts?.requireNativeResume
+      ? Object.freeze({ ...opts.requireNativeResume }) : undefined
+    if (requireNativeResume) this._assertStrictNativeResume(session.sessionKey, requireNativeResume, session)
     // Resolve/rebuild a warm legacy runner under the existing creation gate,
     // before taking the per-turn lock. Never change its durable session key.
     // prepareModelSwitch owns this runner while performing native compaction.
@@ -4717,6 +4761,7 @@ export class SessionManager {
         ...(model ? { model } : {}),
         modelSwitchId: opts?.modelSwitchId,
         promptQueueExecutionFence: opts?.queueExecutionFence,
+        requireNativeResume,
       })
     }
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -4854,6 +4899,7 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      if (requireNativeResume) this._assertStrictNativeResume(session.sessionKey, requireNativeResume, session)
       // A deferred dispatch can be cancelled while its predecessor owns the lock.
       // Fence it before resume promotion / runner reconfiguration, not only before
       // submitTurn. This read does not replace the final queued -> running CAS:
@@ -5179,7 +5225,7 @@ export class SessionManager {
               })
           : undefined
       let providerResumeId =
-        usableCursorId ?? this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
+        requireNativeResume?.nativeSessionId ?? usableCursorId ?? this._resumeIdFor(session.sessionKey, session.providerTag, spawnCwd)
       if (
         providerResumeId &&
         session.runner.isResumeIdCompatible &&
@@ -5196,6 +5242,9 @@ export class SessionManager {
         session._contextRebuildNotice ??= 'native-resume-loss'
         providerResumeId = undefined
       }
+      if (requireNativeResume && session._forceHistoricalContextOnFirstTurn) {
+        throw new Error('STRICT_NATIVE_RESUME_CONTEXT_REBUILD_FORBIDDEN')
+      }
       if (session._forceHistoricalContextOnFirstTurn) providerResumeId = undefined
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
@@ -5203,6 +5252,9 @@ export class SessionManager {
         agentId: session.agentId,
         hasProviderResumeId: !!providerResumeId,
       })
+      if (requireNativeResume && injectionKey !== null) {
+        throw new Error('STRICT_NATIVE_RESUME_CONTEXT_REBUILD_FORBIDDEN')
+      }
       if (providerResumeId && injectionKey !== null) {
         log.warn('master history gap invalidated native resume before context rebuild', {
           sessionKey: session.sessionKey,
@@ -5423,6 +5475,7 @@ export class SessionManager {
         consumingModelSwitch ? [] : contextOverflowRetryInputs,
         opts?.automaticRetryState,
         consumingModelSwitch ? transition : undefined,
+        requireNativeResume,
       )
       try {
         await Promise.race([logicalTurnRun, livenessPromise])
@@ -5607,6 +5660,7 @@ export class SessionManager {
     contextOverflowRetryInputs: string[] = [],
     automaticRetryState?: AutomaticRetryState,
     modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
+    requireNativeResume?: StrictNativeResume,
   ): Promise<void> {
     const retryState: AutomaticRetryState = automaticRetryState ?? {
       rootClientMessageId: clientMessageId ?? session.sessionKey,
@@ -5776,7 +5830,7 @@ export class SessionManager {
     const retryStructuredBlocks: Array<Record<string, unknown>> = []
     let retryInput = userTextOrBlocks
     let contextOverflowRetryIndex = 0
-    const canRetry = (): boolean => retryState.attempt < retryState.max
+    const canRetry = (): boolean => !requireNativeResume && retryState.attempt < retryState.max
     const emitRetryStatus = (code: string, delayMs = 0): boolean => {
       if (!canRetry()) return false
       retryState.attempt += 1
@@ -5834,11 +5888,12 @@ export class SessionManager {
           retryStructuredBlocks,
           queueLifecycle?.queueTurn === true,
           canRetry(),
-          !phantomRetryUsed,
+          !requireNativeResume && !phantomRetryUsed,
           canRetry(),
           attemptOrdinal,
           retryState,
           modelSwitchTransition,
+          requireNativeResume,
         )
         return // success
       } catch (err: any) {
@@ -6047,6 +6102,7 @@ export class SessionManager {
     attemptOrdinal = 0,
     automaticRetryState?: AutomaticRetryState,
     modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
+    requireNativeResume?: StrictNativeResume,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -6146,6 +6202,7 @@ export class SessionManager {
         ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
       })
 
+    if (requireNativeResume) this._assertStrictNativeResume(session.sessionKey, requireNativeResume, session)
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const settle = (fn: () => void) => {
@@ -6885,7 +6942,7 @@ export class SessionManager {
         const terminalResultErrorClass =
           result?.errorClass ?? classifyRunError(result?.errorDetail).code
         if (
-          terminalResultErrorClass === 'context_too_long' &&
+          !requireNativeResume && terminalResultErrorClass === 'context_too_long' &&
           (session.providerTag === 'ccb' || session.providerTag === 'codex')
         ) {
           log.warn('native context window exhausted; clearing resume before context rebuild', {
@@ -7704,6 +7761,7 @@ export class SessionManager {
       // (每 session 恒一个路由目标,旧 turn 闭包链自此可 GC)收进 adapter。
       // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
       const submittedTurn = runner.submitTurn({
+        ...(requireNativeResume ? { requireNativeResume } : {}),
         input: userTextOrBlocks,
         ...(queueTurn ? { queueTurn: true } : {}),
         requestId,
