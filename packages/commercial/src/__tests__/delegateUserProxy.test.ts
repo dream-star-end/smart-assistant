@@ -249,8 +249,8 @@ test('D14 remote tunnel framing preserves user/nonce, rejects wrong identity and
     void containerApiProxy(req, res, { requestId: 'private-tunnel', log: quiet } as never, {
       v3: {} as never, bridgeSecret: BRIDGE, selfHostId: 'self', getStatus: async () => status,
       getHostById: async () => { if (stale) await expired(expiresAt / 1000); return { status: 'active' } as never },
-      rowToTarget: () => ({ id: 'remote', host: 'unused.invalid', port: 0, psk: key,
-        ca: Buffer.alloc(0), certFingerprintSha256: 'f'.repeat(64) }),
+      rowToTarget: () => ({ hostId: 'remote', host: 'unused.invalid', agentPort: 9444, psk: key,
+        expectedFingerprint: 'f'.repeat(64) }),
       authorizeDelegateUser: async () => ({ userId: identity, expiresAt }),
       tunnelDial: async input => {
         dials++
