@@ -7,8 +7,12 @@ prove the effective live unit, or authorize exec. Unsupported syntax is unknown.
 Only path keys are returned; secrets and arbitrary environment are not retained.
 """
 from pathlib import Path
+import os
+import pwd
 import re
 import shlex
+import stat
+import time
 
 MAX_TEXT = 1024 * 1024
 PATH_KEYS = {"HOME", "OPENCLAUDE_HOME", "OPENCLAUDE_DELEGATE_JOBS_DB"}
@@ -166,3 +170,83 @@ def resolve_unit_paths(plan, environment_files, passwd_home):
         database = (path(home) if home else path(env.get("HOME", root_home)) / '.openclaude') / 'delegate-jobs.db'
     return {"database": str(database), "pathEnvironment": env,
             "workingDirectory": plan["workingDirectory"], "argv": plan["argv"]}
+
+
+def _root_identity(filename, *, optional=False):
+    current, chain = Path('/'), []
+    parts = path(filename).parts[1:]
+    require(parts)
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            item = current.lstat()
+        except FileNotFoundError:
+            require(optional and index == len(parts) - 1)
+            return {"path": filename, "ancestors": chain, "file": None}
+        require(item.st_uid == 0 and not (item.st_mode & 0o022))
+        if index == len(parts) - 1:
+            require(stat.S_ISREG(item.st_mode) and item.st_size <= MAX_TEXT)
+            return {"path": filename, "ancestors": chain, "file": _file_identity(item)}
+        require(stat.S_ISDIR(item.st_mode))
+        chain.append([item.st_dev, item.st_ino, item.st_uid, item.st_mode])
+    raise Unknown("unverifiable_unit_paths")
+
+
+def _file_identity(info):
+    return [info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _root_text(filename, deadline, *, optional=False):
+    require(time.monotonic() < deadline)
+    proof = _root_identity(filename, optional=optional)
+    if proof['file'] is None:
+        return None, proof
+    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        require(_file_identity(os.fstat(fd)) == proof['file'])
+        chunks, length = [], 0
+        while True:
+            require(time.monotonic() < deadline)
+            chunk = os.read(fd, min(65536, MAX_TEXT + 1 - length))
+            if not chunk:
+                break
+            chunks.append(chunk); length += len(chunk)
+            require(length <= MAX_TEXT)
+        require(_file_identity(os.fstat(fd)) == proof['file'])
+        require(_root_identity(filename) == proof)
+        return b''.join(chunks).decode('utf-8'), proof
+    finally:
+        os.close(fd)
+
+
+def capture_root_files(fragment_paths, deadline):
+    """Read pinned root-owned inputs; caller MUST prove effective fragment order.
+
+    Not a systemctl discovery API or permission to start. Source files and all
+    ancestors must be root-owned/non-writable by tenants. Optional missing files
+    retain verified parent identities; no unproven read error means absence.
+    """
+    try:
+        require(os.geteuid() == 0 and 0 < deadline - time.monotonic() <= 30)
+        require(isinstance(fragment_paths, list) and 0 < len(fragment_paths) <= 128)
+        fragments, proofs = [], {}
+        for filename in fragment_paths:
+            text, proof = _root_text(filename, deadline)
+            fragments.append(text); proofs[filename] = proof
+        plan = parse_unit(fragments)
+        require(len(plan['environmentFiles']) <= 128)
+        files = {}
+        for item in plan['environmentFiles']:
+            text, proof = _root_text(item['path'], deadline, optional=item['optional'])
+            files[item['path']] = text
+            # A repeated file cannot change between its two reads unnoticed.
+            require(item['path'] not in proofs or proofs[item['path']] == proof)
+            proofs[item['path']] = proof
+        projection = resolve_unit_paths(plan, files, pwd.getpwnam('root').pw_dir)
+        for filename, proof in proofs.items():
+            require(time.monotonic() < deadline)
+            require(_root_identity(filename, optional=proof['file'] is None) == proof)
+        return {"projection": projection, "inputs": list(proofs.values())}
+    except (OSError, UnicodeError, TypeError, ValueError, KeyError):
+        raise Unknown("unverifiable_unit_paths") from None
