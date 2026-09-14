@@ -17,6 +17,10 @@ import time
 
 MAX_TEXT = 1024 * 1024
 PATH_KEYS = {"HOME", "OPENCLAUDE_HOME", "OPENCLAUDE_DELEGATE_JOBS_DB"}
+# These non-secret keys bind the code a real supervisor will provision. Keep
+# their namespace separate from database paths and never copy the whole env.
+TUPLE_KEYS = {"OC_RUNTIME_IMAGE", "OC_RUNTIME_IMAGE_ID", "OC_RUNTIME_RELEASE", "OC_PLATFORM_BUNDLE"}
+PROJECTED_KEYS = PATH_KEYS | TUPLE_KEYS
 ENTRYPOINTS = {
     ("/usr/bin/npx", "tsx", "packages/cli/src/index.ts", "gateway"),
     ("/usr/bin/npx", "tsx", "packages/commercial/src/egress/main.ts"),
@@ -90,7 +94,7 @@ def parse_unit(fragments):
                     require("=" in entry)
                     name, val = entry.split("=", 1)
                     require(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
-                    if name in PATH_KEYS:
+                    if name in PROJECTED_KEYS:
                         require("%" not in val)
                         env[name] = val
             elif key == "EnvironmentFile":
@@ -139,7 +143,7 @@ def parse_environment_file(text):
             value = value[1:-1]
         else:
             require('"' not in value and "'" not in value)
-        if name in PATH_KEYS:
+        if name in PROJECTED_KEYS:
             require(name not in result)  # Duplicate same-file keys are ambiguous.
             result[name] = value
     return result
@@ -169,7 +173,8 @@ def resolve_unit_paths(plan, environment_files, passwd_home):
     else:
         # node:os.homedir() uses HOME when set; an empty HOME is not guessed.
         database = (path(home) if home else path(env.get("HOME", root_home)) / '.openclaude') / 'delegate-jobs.db'
-    return {"database": str(database), "pathEnvironment": env,
+    return {"database": str(database), "pathEnvironment": {k: v for k, v in env.items() if k in PATH_KEYS},
+            "runtimeEnvironment": {k: v for k, v in env.items() if k in TUPLE_KEYS},
             "workingDirectory": plan["workingDirectory"], "argv": plan["argv"]}
 
 
@@ -288,7 +293,7 @@ def parse_effective_properties(output, unit):
     for entry in words(values.get('Environment', '')):
         require('=' in entry)
         name, value = entry.split('=', 1)
-        if name in PATH_KEYS:
+        if name in PROJECTED_KEYS:
             require(name not in environment and '%' not in value)
             environment[name] = value
     environment_files, remaining = [], values.get('EnvironmentFiles', '')
@@ -333,7 +338,7 @@ def _capture_effective_unit(unit, deadline):
     for proof in captured['inputs']:
         require(time.monotonic() < deadline)
         require(_root_identity(proof['path'], optional=proof['file'] is None) == proof)
-    return {'unit': unit, **captured}
+    return {'unit': unit, 'fragments': before['fragments'], **captured}
 
 
 def capture_effective_unit(unit, deadline):

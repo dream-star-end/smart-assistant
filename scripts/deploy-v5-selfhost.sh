@@ -2446,6 +2446,19 @@ cutover_expected_source_commit() {
   fi
 }
 
+cutover_consumer_preflight() { # <exact selected master release>
+  local rel="$1" args
+  args=(--candidate-master "$rel")
+  if [[ "${CUTOVER_JOINT:-0}" == 1 ]]; then
+    [[ -n "${BUILT_RUNTIME_RELEASE:-}" && -n "${RUNTIME_IMAGE_ID:-}" ]] || return 2
+    args+=(--candidate-runtime "$BUILT_RUNTIME_RELEASE" --candidate-image "$RUNTIME_IMAGE"
+      --candidate-image-id "$RUNTIME_IMAGE_ID" --candidate-bundle "${CUTOVER_TUPLE_BUNDLE:-}")
+  fi
+  # Initial rejection only. A compatible snapshot does not replace the later
+  # real writer barrier / start allowance. Never pass env-supplied proof JSON.
+  python3 "$SCRIPT_DIR/delegate-consumer-preflight.py" "${args[@]}"
+}
+
 cmd_cutover() {
   local rel head backup prev_val live_now expected_build step unit_snap
   CUTOVER_MUTATED=0
@@ -2518,6 +2531,11 @@ cmd_cutover() {
   else
     prev_val="none"
   fi
+
+  # Before backup, survivor arm, first unit install or live symlink mutation.
+  # The original selected release/build tuple is the only candidate input.
+  cutover_consumer_preflight "$rel" \
+    || { cutover_clog "consumer 初检拒绝；尚未备份/布防/覆盖 unit/翻转"; return 1; }
 
   step=4
   cutover_clog "STEP $step 备份当前 master+egress unit"

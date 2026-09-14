@@ -68,5 +68,21 @@ class UnitPaths(unittest.TestCase):
         with self.assertRaises(units.Unknown):
             self.resolve([BASE, '[Service]\nEnvironment='], {'/private/base.env': 'HOME='})
 
+    def test_runtime_projection_is_separate_from_paths_and_secrets(self):
+        result = self.resolve([BASE, '[Service]\nEnvironment=OC_RUNTIME_IMAGE=inline:old'],
+            {'/private/base.env': 'OC_RUNTIME_IMAGE=file:new\nOC_RUNTIME_IMAGE_ID=sha256:private\n'
+             'OC_RUNTIME_RELEASE=/private/runtime\nOC_PLATFORM_BUNDLE=\nTOKEN=hidden'})
+        self.assertEqual(result['runtimeEnvironment'], {'OC_RUNTIME_IMAGE': 'file:new',
+            'OC_RUNTIME_IMAGE_ID': 'sha256:private', 'OC_RUNTIME_RELEASE': '/private/runtime',
+            'OC_PLATFORM_BUNDLE': ''})
+        self.assertNotIn('OC_RUNTIME_IMAGE', result['pathEnvironment'])
+        self.assertNotIn('TOKEN', str(result))
+
+    def test_duplicate_runtime_keys_and_specifier_are_unknown(self):
+        with self.assertRaises(units.Unknown):
+            self.resolve(files={'/private/base.env': 'OC_RUNTIME_RELEASE=/a\nOC_RUNTIME_RELEASE=/b'})
+        with self.assertRaises(units.Unknown):
+            self.resolve([BASE, '[Service]\nEnvironment=OC_RUNTIME_IMAGE=%i'])
+
 
 if __name__ == '__main__': unittest.main()
