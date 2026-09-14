@@ -12,6 +12,9 @@ import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import type { TLSSocket } from 'node:tls'
 import {
+  DELEGATE_BRIDGE_USER_HEADER,
+  DELEGATE_BRIDGE_EXPIRY_HEADER,
+  type DelegateBridgeUser,
   COLLAB_BRIDGE_AGENT_HEADER,
   COLLAB_BRIDGE_MODEL_HEADER,
   COLLAB_BRIDGE_SESSION_HEADER,
@@ -49,6 +52,8 @@ export interface CollabSessionParentLookup {
 export interface ContainerApiProxyDeps {
   v3: V3SupervisorDeps
   bridgeSecret: string
+  /** Only for user delegate routes. Router revalidates original JWT + account. */
+  authorizeDelegateUser?: () => Promise<DelegateBridgeUser | null>
   selfHostId?: string
   getHostById?: (id: string) => Promise<ComputeHostRow | null>
   tunnelDial?: typeof dialTunnelSocket
@@ -120,6 +125,7 @@ function buildBridgeHeaders(
   bridgeSecret: string,
   body: Buffer,
   collabParent?: { sessionId: string; agentId: string; modelId?: string },
+  delegateUser?: DelegateBridgeUser,
 ): Record<string, string> {
   const headers: Record<string, string> = {}
   for (const [k, v] of Object.entries(req.headers)) {
@@ -140,6 +146,10 @@ function buildBridgeHeaders(
     headers[COLLAB_BRIDGE_SESSION_HEADER] = collabParent.sessionId
     headers[COLLAB_BRIDGE_AGENT_HEADER] = collabParent.agentId
     if (collabParent.modelId) headers[COLLAB_BRIDGE_MODEL_HEADER] = collabParent.modelId
+  }
+  if (delegateUser) {
+    headers[DELEGATE_BRIDGE_USER_HEADER] = delegateUser.userId
+    headers[DELEGATE_BRIDGE_EXPIRY_HEADER] = String(delegateUser.expiresAt)
   }
   headers['Accept-Encoding'] = 'identity'
   if (body.length > 0) headers['Content-Length'] = String(body.length)
@@ -195,6 +205,15 @@ async function readTunnelBody(
   return await readBodyCapped(socket, head.leftover, IDLE_MS, MAX_RESPONSE_BODY_BYTES)
 }
 
+async function delegateIdentity(req: IncomingMessage, deps: ContainerApiProxyDeps): Promise<DelegateBridgeUser | undefined> {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  if (!url.pathname.startsWith('/api/delegates/')) return undefined
+  const identity = await deps.authorizeDelegateUser?.()
+  if (!identity || !/^c:[1-9][0-9]{0,18}$/.test(identity.userId) || !Number.isSafeInteger(identity.expiresAt) ||
+      identity.expiresAt <= Date.now() || identity.expiresAt > Date.now() + 30_000) throw Error('delegate user authentication expired')
+  return identity
+}
+
 async function dispatchLocal(
   req: IncomingMessage,
   res: ServerResponse,
@@ -206,7 +225,8 @@ async function dispatchLocal(
 ): Promise<void> {
   const host = req.headers.host ?? 'x.invalid'
   const reqUrl = new URL(req.url ?? '/', `http://${host}`)
-  const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent)
+  const delegateUser = await delegateIdentity(req, deps)
+  const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent, delegateUser)
   const requestImpl = deps.httpRequestImpl ?? httpRequest
 
   await new Promise<void>((resolve) => {
@@ -310,7 +330,8 @@ async function dispatchTunnel(
   try {
     const host = req.headers.host ?? 'x.invalid'
     const reqUrl = new URL(req.url ?? '/', `http://${host}`)
-    const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent)
+    const delegateUser = await delegateIdentity(req, deps)
+    const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent, delegateUser)
     const params = new URLSearchParams(reqUrl.search)
     params.set('port', String(status.port))
     const pathAndQuery = `${reqUrl.pathname}?${params.toString()}`
@@ -379,6 +400,14 @@ export async function containerApiProxy(
   if (uid <= 0n || uid > BigInt(Number.MAX_SAFE_INTEGER)) {
     sendJsonError(res, 400, 'BAD_UID', 'invalid uid', ctx.requestId)
     return
+  }
+
+  if (reqUrl.pathname.startsWith('/api/delegates/')) {
+    const authorize = deps.authorizeDelegateUser
+    deps = { ...deps, authorizeDelegateUser: async () => {
+      const identity = await authorize?.()
+      return identity?.userId === `c:${uid}` ? identity : null
+    } }
   }
 
   let body: Buffer

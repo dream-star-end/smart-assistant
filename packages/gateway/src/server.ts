@@ -551,7 +551,7 @@ import {
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
-import { matchBridgeApiAllowlist, parseTrustedCollabParentHeaders } from './bridgeApiAllowlist.js'
+import { matchBridgeApiAllowlist, parseTrustedCollabParentHeaders, parseDelegateBridgeUser } from './bridgeApiAllowlist.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
@@ -6374,6 +6374,7 @@ export class Gateway {
     if (url.pathname.startsWith(DELEGATE_USER_PREFIX)) {
       void handleDelegateUserHttp(req, res, url, {
         user: () => {
+          if (this.checkBridgeBypass(req, url)) return parseDelegateBridgeUser(req.headers)?.userId ?? null
           const principal = this.receiptHttpPrincipal(req)
           return principal?.kind === 'user' ? principal.userId : null
         },

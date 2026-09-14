@@ -439,6 +439,7 @@ interface BlockedForUserRule {
 const M = (...methods: string[]) => new Set(methods)
 
 const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
+  { re: /^\/api\/delegates(?:\/|$)/, label: '/api/delegates/*' },
   // ─── host agent RCE 面 ───
   // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
   { re: /^\/api\/agents$/, label: '/api/agents' },
@@ -1893,6 +1894,14 @@ export function createCommercialHandler(
             {
               v3: deps.v3Supervisor,
               bridgeSecret: deps.bridgeSecret,
+              authorizeDelegateUser: async () => {
+                const fresh = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null
+                if (!fresh || fresh.sub !== claims.sub) return null
+                const active = await requireActiveAccountVerifyDb(fresh.sub, ['user', 'admin'], deps.v3Supervisor!.pool)
+                const final = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null
+                if (!active || !final || final.sub !== claims.sub) return null
+                return { userId: `c:${final.sub}`, expiresAt: Math.min(final.exp * 1000, Date.now() + 30_000) }
+              },
               selfHostId: selfHostIdForProxy,
               getHostById: computePoolGetHostById,
               tunnelDial: defaultTunnelDial,

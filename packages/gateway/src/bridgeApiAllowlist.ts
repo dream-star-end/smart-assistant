@@ -20,6 +20,20 @@ export interface BridgeApiAllowRule {
 }
 
 /** Master-authored collaboration parent identity. Never forwarded from the browser. */
+/** Only trusted alongside the existing IP/container/nonce bridge binding. */
+export const DELEGATE_BRIDGE_USER_HEADER = 'x-openclaude-delegate-user'
+export const DELEGATE_BRIDGE_EXPIRY_HEADER = 'x-openclaude-delegate-user-expires'
+export type DelegateBridgeUser = { userId: string; expiresAt: number }
+export function parseDelegateBridgeUser(headers: Record<string, unknown>, now = Date.now()): DelegateBridgeUser | null {
+  const userId = headers[DELEGATE_BRIDGE_USER_HEADER]
+  const expiry = headers[DELEGATE_BRIDGE_EXPIRY_HEADER]
+  if (typeof userId !== 'string' || !/^c:[1-9][0-9]{0,18}$/.test(userId) ||
+      typeof expiry !== 'string' || !/^[0-9]{1,16}$/.test(expiry)) return null
+  const expiresAt = Number(expiry)
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt > now + 30_000) return null
+  return { userId, expiresAt }
+}
+
 export const COLLAB_BRIDGE_SESSION_HEADER = 'x-openclaude-collab-session-id'
 export const COLLAB_BRIDGE_AGENT_HEADER = 'x-openclaude-collab-agent-id'
 export const COLLAB_BRIDGE_MODEL_HEADER = 'x-openclaude-collab-model-id'
@@ -56,6 +70,11 @@ export function parseTrustedCollabParentHeaders(
 const M = (...methods: string[]) => new Set(methods)
 
 export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
+  { label: '/api/delegates/inbox', re: /^\/api\/delegates\/inbox$/, methods: M('GET'), proxyFromCommercial: true },
+  { label: '/api/delegates/summary', re: /^\/api\/delegates\/summary$/, methods: M('GET'), proxyFromCommercial: true },
+  { label: '/api/delegates/inbox/:jobId/ack', re: /^\/api\/delegates\/inbox\/[A-Za-z0-9_-]{1,128}\/ack$/, methods: M('POST'), proxyFromCommercial: true },
+  // Retry is not proxied until its persistent source/action execution path exists.
+
   // Existing v3 file/media proxy bypass. Handled by containerFileProxy on the master side.
   {
     label: '/api/file',
