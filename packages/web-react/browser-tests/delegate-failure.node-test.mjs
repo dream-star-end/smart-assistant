@@ -114,6 +114,32 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       assert.equal(api.retryTargets(), 1); assert.equal(api.count("alice"), originalCount + 1);
     });
 
+    await journey("reload and cross-tab replay retain one persisted retry intent", async () => {
+      const id = await rows.first().getAttribute("data-job-id"), before = api.retryKeys.length, ackBefore = api.ackCalls.length;
+      await rows.first().getByRole("button", { name: "继续原子会话", exact: true }).click();
+      await rows.first().getByText(/已受理，等待执行/).waitFor();
+      api.reopen(); await page.reload();
+      await badge.click(); await dialog.locator(`li[data-job-id="${id}"]`).waitFor();
+      const replay = async p => {
+        const row = p.getByRole("dialog", { name: "后台任务失败收件箱" }).locator(`li[data-job-id="${id}"]`);
+        await row.getByRole("button", { name: "确认上次继续", exact: true }).click();
+        await p.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
+        await row.getByText(/已受理，等待执行/).waitFor();
+      };
+      await replay(page);
+      const tab = await context.newPage(); tab.setDefaultTimeout(10_000);
+      try {
+        await tab.goto(api.url + "/focused");
+        await tab.getByRole("button", { name: /后台任务 .*失败/ }).click();
+        await replay(tab);
+      } finally { await tab.close(); }
+      const actions = api.retryKeys.slice(before);
+      assert.equal(actions.length, 3);
+      assert.equal(new Set(actions.map(k => k.actionId)).size, 1);
+      assert.equal(api.retryTargets(), before ? 2 : 1);
+      assert.equal(api.ackCalls.length, ackBefore);
+    });
+
     await journey("same mounted auth object switches account without showing A rows or counts", async () => {
       await page.keyboard.press("Escape");
       await page.getByRole("button", { name: "切换 B", exact: true }).click();
