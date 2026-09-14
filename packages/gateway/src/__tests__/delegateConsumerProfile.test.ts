@@ -9,7 +9,7 @@ import { DelegateDurableDb as LegacyV4 } from './fixtures/delegateLegacyV4.fixtu
 import { DelegateDurableDb, type DurableJobRecord } from '../delegateDurable.js'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { readDelegateConsumerProfile } from '@openclaude/storage/delegateConsumerProfile'
-import { ReceiptDeliveryCoordinator } from '@openclaude/storage/receiptDeliveryCoordinator'
+import { ReceiptDeliveryStore } from '@openclaude/storage/receiptDeliveryStore'
 
 function record(id: string): DurableJobRecord {
   return { id, agentId: 'child', state: 'queued', kind: 'delegate', generation: 0,
@@ -97,7 +97,7 @@ test('sealed profile cannot decrease, and a C0 store still reads preexisting sta
   const c0 = new DelegateJobStore({ durable: f.modern, sm: true })
   assert.equal(c0.acceptsNewFailureSources, false)
   assert.equal(c0.hasDurableUserSurface, true)
-  const reader = new ReceiptDeliveryCoordinator(f.path, path => new Database(path))
+  const reader = new ReceiptDeliveryStore(f.path)
   reader.close()
   assert.equal(f.modern.minimumConsumer, 2)
 })
