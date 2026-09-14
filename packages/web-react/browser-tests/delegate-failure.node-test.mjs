@@ -33,7 +33,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' }, logLevel: "error" })).outputFiles[0].text;
     const [focused, app] = await Promise.all([bundle("delegate-failure-harness.tsx"), bundle("goal-start-harness.tsx")]);
     await viteBuild({ root: join(HERE, ".."), configFile: false, logLevel: "silent", plugins: [tailwindcss()],
-      build: { outDir: cssDir, emptyOutDir: true, cssCodeSplit: false, rollupOptions: { input: join(HERE, "preview-styles.ts"), output: { entryFileNames: "styles.js" } } } });
+      build: { outDir: cssDir, emptyOutDir: true, cssCodeSplit: false, rollupOptions: { input: join(HERE, "preview-styles.ts"), output: { entryFileNames: "styles.js", assetFileNames: "[name][extname]" } } } });
     const cssName = readdirSync(cssDir).find(n => n.endsWith(".css")); assert.ok(cssName);
     const css = readFileSync(join(cssDir, cssName), "utf8");
     api = await createFailureUiServer(path => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${css}</style></head><body><div id="root"></div><script>${path === "/focused" ? focused : app}</script></body></html>`);
