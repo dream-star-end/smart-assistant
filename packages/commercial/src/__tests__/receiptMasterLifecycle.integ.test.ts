@@ -88,7 +88,7 @@ async function run(command: string, args: string[], base: string, label: string,
   }
 }
 
-for (const mode of ['normal', 'ack-loss', 'ingested', 'accept-blocked'] as const) {
+for (const mode of ['normal', 'ack-loss', 'ingested', 'accept-blocked', 'retry'] as const) {
   test(`receipt master durable lifecycle ${mode}`, { timeout: 330_000 }, async () => {
     const base = mkdtempSync(join(process.env.OC_RECEIPT_TEST_ARTIFACTS ?? tmpdir(), 'receipt-master-'));
     mkdirSync(join(base, 'home')); mkdirSync(join(base, 'runtime'));
@@ -111,8 +111,13 @@ for (const mode of ['normal', 'ack-loss', 'ingested', 'accept-blocked'] as const
     const container = readJson(join(dir, 'container', 'container-evidence.json'));
     assert.equal(master.success, true); assert.equal(master.failure, undefined);
     assert.equal(container.failure, undefined); assert.equal(container.executions, 1);
-    assert.equal(container.mainRequests, mode === 'ingested' ? 2 : 3);
+    assert.equal(container.mainRequests, mode === 'ingested' || mode === 'retry' ? 2 : 3);
     assert.equal(container.callbackModels, mode === 'ingested' ? 0 : 1);
+    if (mode === 'retry') {
+      assert.equal(container.rows.length, 0); assert.equal(container.retryEvidence.terminal.callbackState, 'delivered');
+      assert.equal(container.retryEvidence.action.state, 'terminal'); assert.equal(container.retryEvidence.unexpectedSpawns, 0);
+      assert.equal(container.retryEvidence.accepted.body.jobId, container.retryEvidence.replay.body.jobId);
+    }
     assert.equal(master.dispatches.length, mode === 'ingested' ? 1 : 2);
     assert.ok(master.dispatches.every((r: {status: string; outcome: string}) => r.status === 'terminal' && r.outcome === 'completed'));
     const injections = master.injectResults ?? [];

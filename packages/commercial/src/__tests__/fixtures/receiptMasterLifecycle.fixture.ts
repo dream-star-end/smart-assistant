@@ -15,7 +15,7 @@ import { signAccess } from '../../auth/jwt.js';
 import { AuthoritySigner } from '../../ws/authoritySigner.js';
 import { AuthorityKeyCensus } from '../../ws/authorityKeyCensus.js';
 import { ModelCatalogSnapshot } from '../../billing/modelCatalog.js';
-import { SERVER_AUTHORED_PATH } from '../../../../protocol/src/index.js';
+import { SERVER_AUTHORED_PATH, MODEL_CATALOG_PATH, MODEL_CATALOG_EPOCH_PATH } from '../../../../protocol/src/index.js';
 const root = fileURLToPath(new URL('../../../../../', import.meta.url)).replace(/\/$/, '');
 const base = process.env.OC_RECEIPT_MASTER_PROBE_BASE!;
 assert.ok(base, 'private artifact base required');
@@ -184,6 +184,18 @@ await withPrivatePg(async ({ pool, backend, schema }: any) => {
                 await sink(req, res, ctx);
                 return;
             }
+            if (mode === 'retry' && (path === MODEL_CATALOG_PATH || path === MODEL_CATALOG_EPOCH_PATH)) {
+                assert.equal(req.headers.authorization, 'Bearer ' + token);
+                const state = { security_epoch: '12', availability_revision: 'private-d14' };
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify(path === MODEL_CATALOG_EPOCH_PATH ? state : { ...state,
+                  projection_revision: 'private-d14-retry', agent_cost_overrides: {}, models: [
+                    { model_id: 'glm-5.3-zai', engine: 'ccb', provider_id: 'zai', context_window: 200000,
+                      supported_efforts: ['low','medium','high'], supports_vision: false, capability_zero: true, supports_thinking: true },
+                    { model_id: 'gpt-5.6-sol', engine: 'codex', provider_id: 'codex', context_window: 400000,
+                      supported_efforts: ['medium','xhigh'], supports_vision: true, capability_zero: false, supports_thinking: false },
+                  ] })); return;
+            }
             if (path === '/internal/v3/marketplace/sync') {
                 assert.equal(req.headers.authorization, 'Bearer ' + token);
                 res.end(JSON.stringify({ identityCompat: { schema: 1, userId: String(uid), profiles: [] } }));
@@ -258,6 +270,7 @@ await withPrivatePg(async ({ pool, backend, schema }: any) => {
             child.send({ type: 'watch-notified' });
             await until(() => evidence.childEvents.some((m: any) => m.type === 'notified-proof'), 'original receipt marked notified after actual ACK', 90000);
         }
+        if (mode === 'retry') await until(() => evidence.childEvents.some((m: any) => m.type === 'retry-notified'), 'new retry target actual ACK and replay proof');
         const session = await backend.getClientSession('d13-probe', 'c:' + uid);
         evidence.persistedSession = session;
         assert.ok(JSON.stringify(session).includes(mode === 'ingested' ? 'D13_PARENT_INGESTED_FINAL' : 'D13_CALLBACK_MODEL_FINAL'), 'actual model final persisted');
