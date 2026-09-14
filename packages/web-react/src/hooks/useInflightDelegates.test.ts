@@ -19,6 +19,12 @@ function item(over: Partial<InflightDelegateItem> = {}): InflightDelegateItem {
 const none = new Set<string>();
 
 describe("filterVisibleInflightItems", () => {
+  test("failed task never expires or locally dismisses; only durable inbox ACK owns it", () => {
+    const out = filterVisibleInflightItems([item({ state: "failed" }), item({ jobId: "cutover", state: "killed_by_cutover" })], {
+      dismissed: new Set(["dlgjob-1", "cutover"]), seenLive: none, now: 1_000_000 + TERMINAL_RECENCY_MS * 10,
+    });
+    expect(out).toHaveLength(2);
+  });
   test("running items always visible", () => {
     const out = filterVisibleInflightItems([item()], { dismissed: none, seenLive: none, now: 0 });
     expect(out).toHaveLength(1);

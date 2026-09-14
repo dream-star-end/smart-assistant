@@ -109,6 +109,18 @@ describe("normalizeInflightDelegateItem", () => {
 });
 
 describe("mergeInflightWithTimeline", () => {
+  test("authoritative HTTP failure cannot become a successful checkmark from a late completed timeline", () => {
+    const failed = item({ state: "failed", resultSummary: "failure", updatedAt: 3000 });
+    const merged = mergeInflightWithTimeline([failed], [group({ _completed: true, _delegateStatus: "ok", completedAt: 9000 })]);
+    expect(merged[0]).toEqual(failed);
+  });
+
+  test("explicit folded failure defeats a superficial completed surface without parsing error words", () => {
+    const got = normalizeInflightDelegateItem({ ...item({ state: "completed" }), foldedGroup: { status: "failed", resultSummary: "raw result" } });
+    expect(got?.state).toBe("failed");
+    expect(normalizeInflightDelegateItem({ ...item({ state: "completed" }), goal: "test error handling", foldedGroup: { status: "ok" } })?.state).toBe("completed");
+  });
+
   test("HTTP running 且时间线没有对应组卡 → 仍显示 running", () => {
     const merged = mergeInflightWithTimeline([item()], []);
     expect(merged).toHaveLength(1);

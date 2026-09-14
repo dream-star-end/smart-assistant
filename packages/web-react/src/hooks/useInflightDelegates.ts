@@ -10,7 +10,7 @@ import type { AuthSession } from "../lib/types";
 
 const POLL_MS = 15_000;
 /**
- * Terminal rows persist server-side (≤32/session). Without a recency gate an
+ * Successful terminal rows persist server-side (≤32/session). Without a recency gate an
  * old session would pin a stale "completed" pill on open. Show a terminal item
  * only if this tab watched it run, or it settled within this window.
  */
@@ -22,6 +22,8 @@ export function filterVisibleInflightItems(
 ): InflightDelegateItem[] {
   return items.filter((item) => {
     if (!isTerminalDelegateState(item.state)) return true;
+    // Failure ACK belongs to the durable account inbox, never this local Set/TTL.
+    if (item.state === "failed" || item.state === "killed_by_cutover") return true;
     if (opts.dismissed.has(item.jobId)) return false;
     if (opts.seenLive.has(item.jobId)) return true;
     return item.updatedAt > 0 && opts.now - item.updatedAt <= TERMINAL_RECENCY_MS;
@@ -44,9 +46,11 @@ export function useInflightDelegates(opts: {
   const { sessionId, messages, enabled, auth } = opts;
   const [rawItems, setRawItems] = useState<InflightDelegateItem[] | null>(null);
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
-  const [seenSessionId, setSeenSessionId] = useState(sessionId);
-  if (sessionId !== seenSessionId) {
-    setSeenSessionId(sessionId);
+  const epoch = auth?.snapshot().epoch;
+  const scopeKey = JSON.stringify([sessionId, epoch, enabled]);
+  const [seenScope, setSeenScope] = useState({ key: scopeKey, auth });
+  if (scopeKey !== seenScope.key || seenScope.auth !== auth) {
+    setSeenScope({ key: scopeKey, auth });
     setRawItems(null);
     setDismissed(new Set());
   }
@@ -56,6 +60,7 @@ export function useInflightDelegates(opts: {
   const authRef = useRef(auth);
   authRef.current = auth;
   const genRef = useRef(0);
+  const pullingRef = useRef<number | null>(null);
 
   const dismiss = useCallback((jobId: string) => {
     setDismissed((prev) => {
@@ -68,12 +73,16 @@ export function useInflightDelegates(opts: {
   const pull = useCallback(async (sid: string, myGen: number) => {
     const a = authRef.current;
     if (!a) return;
+    const usedEpoch = a.snapshot().epoch;
+    if (pullingRef.current === myGen) return;
     if (notFoundRef.current.has(sid)) {
       if (genRef.current === myGen) setRawItems(null);
       return;
     }
+    pullingRef.current = myGen;
     const result = await fetchInflightDelegatesResult(sid, a);
-    if (genRef.current !== myGen) return;
+    if (pullingRef.current === myGen) pullingRef.current = null;
+    if (genRef.current !== myGen || authRef.current !== a || a.snapshot().epoch !== usedEpoch) return;
     if (result.ok) {
       for (const item of result.items) {
         if (!isTerminalDelegateState(item.state)) seenLiveRef.current.add(item.jobId);
@@ -93,6 +102,7 @@ export function useInflightDelegates(opts: {
       return;
     }
     const myGen = ++genRef.current;
+    notFoundRef.current = new Set();
     setRawItems(null);
     setDismissed(new Set());
     seenLiveRef.current = new Set();
@@ -100,7 +110,7 @@ export function useInflightDelegates(opts: {
     return () => {
       genRef.current += 1;
     };
-  }, [enabled, sessionId, auth, pull]);
+  }, [enabled, sessionId, auth, epoch, pull]);
 
   const shouldPoll =
     !!enabled &&

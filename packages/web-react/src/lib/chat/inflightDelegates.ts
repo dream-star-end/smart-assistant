@@ -11,7 +11,7 @@ import {
   type DelegateJobState,
   type InflightDelegateSurface,
 } from "@openclaude/protocol";
-import { bearerHeaders, callWithRefresh } from "../api";
+import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from "../api";
 import type { AuthSession } from "../types";
 import { agentGroupRunId, type ChatMessage } from "./model";
 
@@ -60,12 +60,13 @@ export function normalizeInflightDelegateItem(raw: unknown): InflightDelegateIte
   const updatedAt =
     typeof o.updatedAt === "number" && Number.isFinite(o.updatedAt) ? o.updatedAt : 0;
   const resultSummary = pickResultSummary(o);
+  const foldedStatus = asRecord(o.foldedGroup)?.status;
   const item: InflightDelegateItem = {
     jobId: o.jobId,
     runId: o.runId,
     agentId: o.agentId,
     goal: o.goal,
-    state: o.state as DelegateJobState,
+    state: foldedStatus === "failed" || foldedStatus === "timeout" ? "failed" : o.state as DelegateJobState,
     liveHint: typeof o.liveHint === "string" ? o.liveHint : "",
     updatedAt,
     parentSessionKey: typeof o.parentSessionKey === "string" ? o.parentSessionKey : "",
@@ -92,7 +93,7 @@ function timelineResultSummary(m: ChatMessage): string | undefined {
 
 /**
  * HTTP snapshot ∪ current timeline agent-group rows, keyed by runId.
- * A terminal timeline group wins (the card already folded); HTTP `running`
+ * A terminal timeline group settles running rows, but cannot erase HTTP failure; HTTP `running`
  * with no matching group still displays (refresh emptied the process tree).
  */
 export function mergeInflightWithTimeline(
@@ -114,6 +115,7 @@ export function mergeInflightWithTimeline(
     if (!group) return item;
     const terminal = timelineTerminalState(group);
     if (!terminal) return item;
+    if (item.state === "failed" || item.state === "killed_by_cutover") return item;
     const summary = timelineResultSummary(group) ?? item.resultSummary;
     const updatedAt =
       typeof group.completedAt === "number" && group.completedAt > 0
@@ -142,6 +144,7 @@ export async function fetchInflightDelegatesResult(
     if (res.status === 404) return { ok: false, notFound: true };
     if (res.status !== 200) return { ok: false, notFound: false };
     const body = (await res.json()) as unknown;
+    assertAuthResponseCurrent(res);
     const rec = asRecord(body);
     const rawItems = rec && Array.isArray(rec.items) ? rec.items : [];
     const items: InflightDelegateItem[] = [];
