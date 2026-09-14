@@ -168,6 +168,6 @@ finally:
    error=error or 'gateway cleanup '+repr(e);gateway.kill();gateway.wait()
  try:reap_owned()
  except Exception as e:error=error or repr(e)
- evidence={'mode':mode,'observedBeforeCleanup':observed,'private':str(d),'argv':argv,'mainModelRequests':sum(r['main'] for r in rows),'allRequests':len(rows),'keySent':(d/'key-sent').exists(),'background':background.is_set(),'modelReceivedOrdinaryResult':done.is_set(),'error':error,'handlerFailures':fail,'exit':p.returncode,'networkGuard':'Bun fetch fixture-origin only; explicit env allowlist; no namespace claim','receiptOwner':'none; ordinary interactive compatibility only'}
+ evidence={'mode':mode,'observedBeforeCleanup':observed,'private':str(d),'argv':argv,'mainModelRequests':sum(r['main'] for r in rows),'allRequests':len(rows),'keySent':(d/'key-sent').exists(),'background':background.is_set(),'modelReceivedOrdinaryResult':done.is_set() and mode=='ordinary','modelReceivedUnownedError':done.is_set() and mode=='unowned','error':error,'handlerFailures':fail,'exit':p.returncode,'networkGuard':'Bun fetch fixture-origin only; explicit env allowlist; no namespace claim','receiptOwner':'none; ordinary interactive compatibility only'}
  (d/'evidence.json').write_text(json.dumps(evidence,indent=2));print(json.dumps(evidence),flush=True)
  if error or fail:sys.exit(1)
