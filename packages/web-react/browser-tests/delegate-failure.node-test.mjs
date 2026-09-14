@@ -115,9 +115,15 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
     });
 
     await journey("reload and cross-tab replay retain one persisted retry intent", async () => {
-      const id = await rows.first().getAttribute("data-job-id"), before = api.retryKeys.length, ackBefore = api.ackCalls.length;
-      await rows.first().getByRole("button", { name: "继续原子会话", exact: true }).click();
-      await rows.first().getByText(/已受理，等待执行/).waitFor();
+      // Pick an untouched original source, not a newly failed target inserted by
+      // another journey. The same scenario must work standalone and in the suite.
+      const previousSources = new Set(api.retryKeys.map(k => k.sourceJobId));
+      const id = (await rows.evaluateAll(elements => elements.map(el => el.getAttribute("data-job-id"))))
+        .find(value => value && api.ids.alice.includes(value) && !previousSources.has(value));
+      assert.ok(id);
+      const original = dialog.locator(`li[data-job-id="${id}"]`), before = api.retryKeys.length, ackBefore = api.ackCalls.length;
+      await original.getByRole("button", { name: "继续原子会话", exact: true }).click();
+      await original.getByText(/已受理，等待执行/).waitFor();
       api.reopen(); await page.reload();
       await badge.click(); await dialog.locator(`li[data-job-id="${id}"]`).waitFor();
       const replay = async p => {
