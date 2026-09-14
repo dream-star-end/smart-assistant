@@ -205,12 +205,12 @@ async function readTunnelBody(
   return await readBodyCapped(socket, head.leftover, IDLE_MS, MAX_RESPONSE_BODY_BYTES)
 }
 
-async function delegateIdentity(req: IncomingMessage, deps: ContainerApiProxyDeps): Promise<DelegateBridgeUser | undefined> {
+async function delegateIdentity(req: IncomingMessage, deps: ContainerApiProxyDeps): Promise<DelegateBridgeUser | undefined | null> {
   const url = new URL(req.url ?? '/', 'http://localhost')
   if (!url.pathname.startsWith('/api/delegates/')) return undefined
   const identity = await deps.authorizeDelegateUser?.()
   if (!identity || !/^c:[1-9][0-9]{0,18}$/.test(identity.userId) || !Number.isSafeInteger(identity.expiresAt) ||
-      identity.expiresAt <= Date.now() || identity.expiresAt > Date.now() + 30_000) throw Error('delegate user authentication expired')
+      identity.expiresAt <= Date.now() || identity.expiresAt > Date.now() + 30_000) return null
   return identity
 }
 
@@ -226,6 +226,7 @@ async function dispatchLocal(
   const host = req.headers.host ?? 'x.invalid'
   const reqUrl = new URL(req.url ?? '/', `http://${host}`)
   const delegateUser = await delegateIdentity(req, deps)
+  if (delegateUser === null) return sendJsonError(res, 401, 'UNAUTHORIZED', 'delegate user authentication expired', ctx.requestId)
   const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent, delegateUser)
   const requestImpl = deps.httpRequestImpl ?? httpRequest
 
@@ -331,6 +332,7 @@ async function dispatchTunnel(
     const host = req.headers.host ?? 'x.invalid'
     const reqUrl = new URL(req.url ?? '/', `http://${host}`)
     const delegateUser = await delegateIdentity(req, deps)
+    if (delegateUser === null) return sendJsonError(res, 401, 'UNAUTHORIZED', 'delegate user authentication expired', ctx.requestId)
     const headers = buildBridgeHeaders(req, status, deps.bridgeSecret, body, collabParent, delegateUser)
     const params = new URLSearchParams(reqUrl.search)
     params.set('port', String(status.port))
@@ -488,9 +490,17 @@ export async function containerApiProxy(
 
   ctx.log.info('container_api_proxy_dispatch', { uid: String(uid), route: rule.label })
   const remote = Boolean(status.hostId && deps.selfHostId && status.hostId !== deps.selfHostId)
-  if (remote) {
-    await dispatchTunnel(req, res, ctx, deps, status, body, collabParent)
-  } else {
-    await dispatchLocal(req, res, ctx, deps, status, body, collabParent)
+  try {
+    if (remote) {
+      await dispatchTunnel(req, res, ctx, deps, status, body, collabParent)
+    } else {
+      await dispatchLocal(req, res, ctx, deps, status, body, collabParent)
+    }
+  } catch (error) {
+    if (reqUrl.pathname.startsWith('/api/delegates/') && !res.headersSent) {
+      sendJsonError(res, 503, 'USER_AUTHORITY_UNAVAILABLE', 'delegate user authority unavailable', ctx.requestId)
+      return
+    }
+    throw error
   }
 }

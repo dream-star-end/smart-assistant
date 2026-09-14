@@ -1835,7 +1835,7 @@ export function createCommercialHandler(
       const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null
       if (!claims) {
         // Let BLOCKED_FOR_USER_RULES / gateway auth produce the canonical 401.
-      } else if (claims.role === 'admin' && req.headers['x-oc-host-scope'] === '1') {
+      } else if (claims.role === 'admin' && req.headers['x-oc-host-scope'] === '1' && !path.startsWith('/api/delegates/')) {
         // 显式宿主范围(仅 admin,须带 X-OC-Host-Scope: 1):保留 host 级运维调试语义,
         // fall through 到原 admin bypass。默认不再静默落宿主 —— 否则 admin 账号的
         // 管理中心(记忆/定时/技能)读写的是宿主 gateway,与其容器内 agent 的同名数据

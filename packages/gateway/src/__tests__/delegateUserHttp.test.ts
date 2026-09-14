@@ -116,3 +116,48 @@ test('durable write failure is explicit503, not acknowledged/empty success', asy
     f.db.close(); assert.equal((await f.call('summary')).status, 503)
   } finally { await f.close() }
 })
+
+test('real master proxy strips forged identity and gateway accepts only its bound user plus bridge', async () => {
+  const { containerApiProxy } = await import('../../../commercial/src/http/containerApiProxy.js')
+  const { V3_CONTAINER_PORT } = await import('../../../commercial/src/agent-sandbox/v3supervisor.js')
+  const { containerSubnetPrefixForChannel } = await import('../../../commercial/src/containerNet.js')
+  const { createHmac } = await import('node:crypto')
+  const f = await fixture(), bridgeSecret = 'private-master-bridge-secret'
+  const keys = ['OPENCLAUDE_TRUST_BRIDGE_IP', 'OC_CONTAINER_ID', 'OC_BRIDGE_NONCE']
+  const saved = keys.map(key => process.env[key])
+  process.env.OPENCLAUDE_TRUST_BRIDGE_IP = '127.0.0.1'; process.env.OC_CONTAINER_ID = '77'
+  process.env.OC_BRIDGE_NONCE = createHmac('sha256', bridgeSecret).update('77').digest('hex')
+  let dispatches = 0, checks = 0, expired = false
+  const proxy = createServer((req, res) => {
+    void containerApiProxy(req, res, { requestId: 'private-proxy', log: { info() {}, warn() {} } } as never, {
+      v3: {} as never, bridgeSecret,
+      getStatus: async () => ({ state: 'running', containerId: 77, boundIp: containerSubnetPrefixForChannel() + '.0.77', port: V3_CONTAINER_PORT } as never),
+      authorizeDelegateUser: async () => { checks++; return expired ? null : { userId: 'c:7', expiresAt: Date.now() + 20000 } },
+      httpRequestImpl: ((options: any, listener: any) => {
+        dispatches++
+        assert.equal(options.headers['x-openclaude-delegate-user'], 'c:7')
+        assert.equal(options.headers.authorization, undefined)
+        return request({ ...options, host: '127.0.0.1', port: Number(new URL(f.base).port) }, listener)
+      }) as typeof request,
+    }, 7n).catch(() => { res.statusCode = 503; res.end('{}') })
+  })
+  await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve))
+  try {
+    f.create('c:7'); f.create('c:8'); f.create('c:8')
+    const url = `http://127.0.0.1:${(proxy.address() as any).port}/api/delegates/inbox`
+    const response = await fetch(url, { headers: { authorization: 'Bearer forged',
+      'x-openclaude-delegate-user': 'c:8', 'x-openclaude-delegate-user-expires': String(Date.now() + 999999),
+      'x-openclaude-container-id': '88', 'x-openclaude-bridge-nonce': 'b'.repeat(64) } })
+    const body: any = await response.json(); assert.equal(response.status, 200, JSON.stringify(body))
+    assert.equal(body.count, 1); assert.equal(checks, 1); assert.equal(dispatches, 1)
+    expired = true
+    const denied = await fetch(url); assert.equal(denied.status, 401); assert.equal(checks, 2); assert.equal(dispatches, 1)
+    const direct = await fetch(f.base + 'inbox', { headers: { 'x-openclaude-delegate-user': 'c:7',
+      'x-openclaude-delegate-user-expires': String(Date.now() + 20000) } })
+    assert.equal(direct.status, 401, 'plain header is not user authority')
+  } finally {
+    proxy.closeAllConnections(); await new Promise<void>(resolve => proxy.close(() => resolve()))
+    for (let i = 0; i < keys.length; i++) if (saved[i] === undefined) delete process.env[keys[i]]; else process.env[keys[i]] = saved[i]
+    await f.close()
+  }
+})
