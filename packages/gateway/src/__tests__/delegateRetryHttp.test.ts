@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { test } from 'node:test'
 
-for (const mode of ['success', 'missing-late', 'denied', 'write-fault', 'expired-body', 'expired-permission', 'deleted-after-accept', 'parent-restore', 'parent-metadata-missing', 'parent-restore-expired', 'parent-restore-race', 'boot-accepted', 'boot-dispatched', 'boot-deleted', 'boot-missing-native']) {
-  test(`actual retry HTTP and original native executor: ${mode}`, { timeout: 45000 }, async () => {
+for (const mode of ['success', 'missing-late', 'denied', 'write-fault', 'expired-body', 'expired-permission', 'deleted-after-accept', 'parent-restore', 'parent-metadata-missing', 'parent-restore-expired', 'parent-restore-race', 'boot-accepted', 'boot-dispatched', 'boot-deleted', 'boot-missing-native', 'availability-live', 'availability-parent', 'availability-model', 'availability-expired', 'availability-delete', 'availability-expired-final', 'boot-busy', 'boot-transient']) {
+  test(`actual retry HTTP and original native executor: ${mode}`, { timeout: mode === 'boot-busy' || mode === 'boot-transient' ? 85000 : 45000 }, async () => {
     const home = mkdtempSync(join(tmpdir(), 'retry-http-private-'))
     const child = spawn(process.execPath, ['--import', 'tsx',
       fileURLToPath(new URL('./fixtures/delegateRetryHttp.fixture.ts', import.meta.url)), mode], {
@@ -16,7 +16,7 @@ for (const mode of ['success', 'missing-late', 'denied', 'write-fault', 'expired
       stdio: ['ignore', 'pipe', 'pipe'], detached: true,
     })
     let output = ''; child.stdout.on('data', b => { output += b }); child.stderr.on('data', b => { output += b })
-    const timer = setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL') } catch {} }, 35000)
+    const timer = setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL') } catch {} }, mode === 'boot-busy' || mode === 'boot-transient' ? 75000 : 35000)
     try {
       const exit = await new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', resolve) })
       assert.equal(exit, 0, output); assert.match(output, new RegExp(`RETRY_HTTP_PASS ${mode}`))

@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { DelegateJobStore } from './delegateJobs.js'
 import type { DelegateFailureCursor } from './delegateDurable.js'
-import { DelegateRetryUnavailable, type DelegateRetryActionKey, type DelegateRetryAction } from './delegateRetrySource.js'
+import { DelegateRetryUnavailable, type DelegateRetryActionKey, type DelegateRetryAction, type DelegateRetryAvailability } from './delegateRetrySource.js'
 
 /** New user APIs, not the native receipt or CLI-consumed protocol. */
 export const DELEGATE_USER_PREFIX = '/api/delegates/'
@@ -10,6 +10,7 @@ export type DelegateUserHttpDeps = {
   store: () => DelegateJobStore | undefined
   readBody: (req: IncomingMessage) => Promise<string>
   reconcileLifecycle: (userId: string, authorize: () => void) => Promise<boolean>
+  retryAvailability: (userId: string, rows: readonly { jobId: string; generation: number }[], authorize: () => void) => Promise<readonly DelegateRetryAvailability[]>
   retry: (key: DelegateRetryActionKey, authorize: () => void) => Promise<{ replay: boolean; action: DelegateRetryAction }>
   send: (res: ServerResponse, status: number, value: unknown) => void
 }
@@ -79,13 +80,17 @@ export async function handleDelegateUserHttp(req: IncomingMessage, res: ServerRe
       return ok ? deps.send(res, 200, { version: 1, acknowledged: true }) : error(404, 'not_found')
     }
     if (url.pathname.endsWith('/summary')) return deps.send(res, 200, { version: 1, available: true, ...store.userSummary(userId) })
-    const page = store.userFailureInbox(userId, options)
+    let page = store.userFailureInbox(userId, options)
+    const hints = await deps.retryAvailability(userId, page.items, authorize); authorize()
+    const checked = new Map(page.items.map((row, i) => [JSON.stringify([row.jobId, row.generation]), hints[i]]))
+    // The availability coordinator completes lifecycle checks before its final
+    // synchronous permission/native snapshot. No later await can stale that hint.
+    page = store.userFailureInbox(userId, options)
     deps.send(res, 200, { version: 1, count: page.count,
       nextCursor: page.nextCursor ? Buffer.from(JSON.stringify(page.nextCursor)).toString('base64url') : null,
       items: page.items.map(row => ({ jobId: row.jobId, generation: row.generation, parentSessionKey: row.parentSession,
         summaryCode: row.summaryCode, summaryText: row.summaryText, failedAt: row.failedAt,
-        // Retry is unavailable until the complete durable source/action path is wired.
-        retry: { available: false, reason: 'retry_not_ready' } })) })
+        retry: checked.get(JSON.stringify([row.jobId, row.generation])) ?? { available: false, reason: 'retry_check_pending' } })) })
   } catch (err) { return error(deps.user() !== userId ? 401 : err instanceof DelegateRetryUnavailable ? err.status : 503,
     deps.user() !== userId ? 'user_authentication_expired' : err instanceof DelegateRetryUnavailable ? err.code : 'delegate_user_surface_unavailable') }
 }

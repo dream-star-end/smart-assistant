@@ -745,6 +745,11 @@ export class DelegateDurableDb {
   }
 
   /** No fallback to job/result rows or directory scans after TTL or missing provenance. */
+  hasActiveRetryChild(sessionKey: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM delegate_jobs WHERE session_key=? AND retired_at IS NULL
+      AND state IN ('queued','running','paused_for_cutover') LIMIT 1`).get(sessionKey))
+  }
+
   getRetrySource(userId: string, jobId: string, generation: number): DelegateRetrySource | undefined {
     const row = this.db.prepare(`SELECT metadata_json FROM delegate_retry_source
       WHERE user_id=? AND job_id=? AND generation=? AND retired_at IS NULL`)
@@ -859,8 +864,7 @@ export class DelegateDurableDb {
           target.agentId !== source.targetAgentId || target.sessionKey !== source.childSessionKey ||
           target.parentSessionKey !== source.parentSessionKey || target.callbackOriginUserId !== source.userId ||
           target.callbackOriginSessionKey !== source.originSessionKey) throw new Error('invalid retry target binding')
-      if (this.db.prepare(`SELECT 1 FROM delegate_jobs WHERE session_key=? AND retired_at IS NULL
-        AND state IN ('queued','running','paused_for_cutover') LIMIT 1`).get(source.childSessionKey)) return { error: 'child_busy' }
+      if (this.hasActiveRetryChild(source.childSessionKey)) return { error: 'child_busy' }
       const inserted = this.insertCreate(target, maxJobs, { retrySource: source })
       if ('error' in inserted) return inserted
       if ('reused' in inserted) throw new Error('retry target unexpectedly reused')

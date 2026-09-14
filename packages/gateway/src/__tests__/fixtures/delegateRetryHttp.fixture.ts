@@ -14,6 +14,7 @@ import { Gateway } from '../../server.js'
 import { SessionManager } from '../../sessionManager.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
+import { DelegateResumeRegistry } from '../../delegateResume.js'
 import { signJwt } from '../../auth.js'
 import { upsertClientSession, deleteClientSession } from '../../../../storage/src/sessionsDb.js'
 import { paths, type OpenClaudeConfig, type AgentDef } from '@openclaude/storage'
@@ -102,7 +103,84 @@ async function main() {
   }
   let booted = false
   try {
-    if (mode.startsWith('boot-')) {
+    if (mode.startsWith('availability-')) {
+      const get = async (path = '/inbox?limit=50', auth = jwt()) => {
+        const response = await fetch(base + '/api/delegates' + path, { headers: { authorization: auth } })
+        return { status: response.status, body: await response.json() as any }
+      }
+      const start = counts(), sessions = ins.sessions.size
+      let probes = 0
+      const probe = sm.strictNativeResumeAvailability.bind(sm)
+      sm.strictNativeResumeAvailability = keys => { probes++; return probe(keys) }
+      // Guard against accidentally falling back to a full scan for EACH row.
+      sm.resolveStrictNativeResume = () => { throw new Error('UNBOUNDED_GET_NATIVE_PROBE') }
+      const hint = (result: any) => result.body.items.find((r: any) => r.jobId === made.jobId)?.retry
+      if (mode === 'availability-live') {
+        for (let i = 0; i < 49; i++) {
+          const sibling = jobs.create('worker', { retrySource: source, callbackOriginUserId: userId,
+            callbackOriginSessionKey: parentKey, sessionKey: childKey, parentSessionKey: parentKey })
+          assert.ok('jobId' in sibling)
+          const snap = jobs.snapshotOf(sibling.jobId)!
+          jobs.fail(sibling.jobId, { failureClass: 'child_error', detail: 'private', httpStatus: 500,
+            claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch })
+        }
+        assert.equal((await get('/summary')).body.unacknowledgedFailures, 50); assert.equal(probes, 0)
+        const page = await get(); assert.equal(page.status, 200); assert.equal(page.body.items.length, 50)
+        assert.ok(page.body.items.every((r: any) => r.retry.available && r.retry.reason === null)); assert.equal(probes, 1)
+        assert.equal((await get('/inbox', jwt('c:8'))).body.count, 0)
+        assert.doesNotMatch(JSON.stringify(page.body), /nativeSessionId|rollout-private|private original failure/)
+        // Missing file and wrong provider are not inferred as success, even if a
+        // previous GET was positive. No cross-request native cache is authority.
+        unlinkSync(artifact); assert.deepEqual(hint(await get()), { available: false, reason: 'retry_native_unavailable' })
+        writeFileSync(artifact, '{"private":true}\n')
+        const provider = childSession.providerTag; (childSession as any).providerTag = 'ccb'
+        assert.equal(hint(await get()).available, false); (childSession as any).providerTag = provider
+        assert.equal(hint(await get()).available, true)
+        const active = jobs.create('worker', { sessionKey: childKey, parentSessionKey: parentKey })
+        assert.ok('jobId' in active)
+        assert.deepEqual(hint(await get()), { available: false, reason: 'retry_child_busy' })
+        assert.equal(counts().jobs, 51)
+      } else if (mode === 'availability-parent') {
+        ins.sessions.delete(parentKey)
+        assert.deepEqual(hint(await get()), { available: true, reason: null })
+        assert.equal(sm.getByKey(parentKey), undefined, 'GET must not restore a parent')
+        assert.equal(ins.sessions.size, sessions - 1)
+      } else if (mode === 'availability-model') {
+        // Seed a null-model source through the REAL create transaction. With no
+        // live child witness this must not resolve the default model.
+        const noModel = jobs.create('worker', { retrySource: { ...source, model: null, parentWorkspaceMode: 'legacy' },
+          callbackOriginUserId: userId, callbackOriginSessionKey: parentKey, sessionKey: childKey, parentSessionKey: parentKey })
+        assert.ok('jobId' in noModel); const snap = jobs.snapshotOf(noModel.jobId)!
+        jobs.fail(noModel.jobId, { failureClass: 'child_error', detail: 'private', httpStatus: 500,
+          claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch })
+        ins.sessions.delete(childKey)
+        const page = await get()
+        assert.deepEqual(page.body.items.find((r: any) => r.jobId === noModel.jobId).retry,
+          { available: false, reason: 'retry_model_unavailable' })
+      } else if ((mode === 'availability-expired' || mode === 'availability-expired-final')) {
+        const exp = Math.floor(Date.now() / 1000) + 2, read = gw._getAgentsConfig.bind(gw)
+        const expire = () => new Promise(r => setTimeout(r, Math.max(1, exp * 1000 + 30 - Date.now())))
+        if (mode === 'availability-expired-final') {
+          const reconcile = gw._reconcileDelegateUserLifecycle.bind(gw); let calls = 0
+          gw._reconcileDelegateUserLifecycle = async (...args: any[]) => {
+            const result = await reconcile(...args)
+            if (++calls === 2) await expire()
+            return result
+          }
+        } else gw._getAgentsConfig = async () => { const config = await read(); await expire(); return config }
+        assert.equal((await get('/inbox', jwt(userId, exp))).status, 401)
+      } else if (mode === 'availability-delete') {
+        const read = gw._getAgentsConfig.bind(gw)
+        gw._getAgentsConfig = async () => { const cfg = await read(); await deleteClientSession(peer, userId); return cfg }
+        const page = await get(); assert.equal(page.status, 200); assert.equal(page.body.count, 0)
+        assert.equal(page.body.items.length, 0, 'deleted during availability must not remain in the final page')
+      }
+      assert.equal(counts().actions, start.actions); assert.equal(counts().slots, 0)
+      assert.equal(counts().waiters, 0); assert.equal(counts().resume, 0); assert.equal(billed, 0)
+      const requests = existsSync(rpcLog) ? readFileSync(rpcLog, 'utf8') : ''
+      assert.equal(requests, '', 'GET cannot execute a native RPC')
+      if (!['availability-parent', 'availability-model'].includes(mode)) assert.equal(ins.sessions.size, sessions)
+    } else if (mode.startsWith('boot-')) {
       const key = { userId, sourceJobId: made.jobId, generation: 0, actionId: action }
       const accepted = jobs.acceptRetryAction(key, source, 'codex')
       assert.ok(!('error' in accepted)); const target = accepted.action.targetJobId
@@ -126,9 +204,41 @@ async function main() {
       kernel.constructor.prototype.ensureSpawned = async () => {
         unregisteredSpawns++; throw new Error('PRIVATE_BOOT_UNREGISTERED_NATIVE_PROCESS')
       }
+      let transientReads = 0
+      if (mode === 'boot-busy') {
+        gw._delegateResume = new DelegateResumeRegistry()
+        assert.equal(gw._delegateResume.restoreTrustedIdle({ sessionKey: childKey, parentSessionKey: parentKey,
+          targetAgentId: 'worker', sourceAgent: 'main' }), true)
+        assert.equal(gw._delegateResume.preflight({ resumeSessionKey: childKey, parentSessionKey: parentKey,
+          targetAgentId: 'worker', sourceAgent: 'main' }).dispatchGranted, true)
+      }
+      if (mode === 'boot-transient') {
+        const read = gw._getAgentsConfig.bind(gw)
+        gw._getAgentsConfig = async () => {
+          const cfg = await read()
+          if (gw._delegateRetryBootReady && transientReads++ === 0) throw new Error('PRIVATE_CONFIG_READ_UNKNOWN')
+          return cfg
+        }
+      }
       await gw.start(); booted = true
       jobs = gw._delegateJobs
       db = new DelegateDurableDb(join(home, 'delegate.db'))
+      if (mode === 'boot-busy' || mode === 'boot-transient') {
+        for (let i = 0; i < 1000 && gw._delegateRetryRecovering; i++) await new Promise(r => setTimeout(r, 10))
+        assert.equal(gw._delegateRetryRecovering, false)
+        assert.equal(jobs.snapshotOf(target)?.state, 'queued', 'busy/unknown cannot settle or re-create accepted intent')
+        assert.equal(db.getRetryAction(key)?.state, 'accepted')
+        assert.equal(billed, 0); assert.equal(existsSync(rpcLog) ? readFileSync(rpcLog, 'utf8') : '', '')
+        if (mode === 'boot-transient') assert.equal(transientReads, 1)
+        else gw._delegateResume.release(childKey)
+        // Do NOT manually call recovery or shorten its timer. The original 30s
+        // reconcile must reclaim the exact persisted target once the obstacle clears.
+        const start = Date.now()
+        for (let i = 0; i < 4400 && !jobs.snapshotOf(target)?.result; i++) await new Promise(r => setTimeout(r, 10))
+        assert.ok(Date.now() - start >= 20_000, 'observed original bounded timer, not direct redispatch')
+        assert.match(JSON.stringify(jobs.snapshotOf(target)?.result), /PRIVATE_NATIVE_CONTINUATION_RESULT/)
+      }
+      const executed = ['boot-accepted', 'boot-busy', 'boot-transient'].includes(mode)
       if (mode === 'boot-accepted' || mode === 'boot-missing-native') {
         for (let i = 0; i < 1200 && !jobs.snapshotOf(target)?.result; i++) await new Promise(r => setTimeout(r, 10))
         const terminal = jobs.snapshotOf(target)!
@@ -137,9 +247,9 @@ async function main() {
       }
       const requests = existsSync(rpcLog) ? readFileSync(rpcLog, 'utf8').trim().split('\n').map(s => JSON.parse(s)) : []
       assert.equal(requests.filter(r => r.method === 'thread/start').length, 0)
-      assert.equal(requests.filter(r => r.method === 'turn/start').length, mode === 'boot-accepted' ? 1 : 0)
+      assert.equal(requests.filter(r => r.method === 'turn/start').length, executed ? 1 : 0)
       const replay = await post(); assert.equal(replay.status, 200); assert.equal(replay.body.jobId, target)
-      assert.equal(billed, mode === 'boot-accepted' ? 1 : 0)
+      assert.equal(billed, executed ? 1 : 0)
       assert.equal(unregisteredSpawns, 0)
       assert.equal(counts().jobs, 2); assert.equal(counts().actions, 1)
       if (mode !== 'boot-dispatched') assert.equal(counts().resume, 0)

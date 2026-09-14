@@ -52,6 +52,7 @@ import {
   pickResumableId,
   probeResumeArtifact,
   probeStrictNativeResume,
+  presentStrictNativeResumes,
 } from './engine/resumeArtifacts.js'
 import type {
   AutomaticRetryState,
@@ -3671,15 +3672,27 @@ export class SessionManager {
   /** Server-internal eligibility only. Source/user permission is checked by
    * the retry route; this lookup never scans other logical session identities,
    * promotes history or treats unknown artifact evidence as present. */
-  resolveStrictNativeResume(sessionKey: string): StrictNativeResume | undefined {
+  private _strictNativeResumeCandidate(sessionKey: string): StrictNativeResume | undefined {
     const live = this.sessions.get(sessionKey)
     const provider = live?.providerTag ??
       SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
     if (provider !== 'codex' || (live && live.runner.engineId !== 'codex')) return undefined
     const nativeSessionId = live ? live.runner.nativeSessionId : this._resumeMap.get(sessionKey)
     if (!nativeSessionId || this._resumeRejectedIds.get(sessionKey)?.has(nativeSessionId)) return undefined
-    if (probeStrictNativeResume(provider, nativeSessionId) !== 'present') return undefined
     return Object.freeze({ engine: 'codex', nativeSessionId })
+  }
+
+  resolveStrictNativeResume(sessionKey: string): StrictNativeResume | undefined {
+    const candidate = this._strictNativeResumeCandidate(sessionKey)
+    return candidate && probeStrictNativeResume(candidate.engine, candidate.nativeSessionId) === 'present' ? candidate : undefined
+  }
+
+  /** Read-only, bounded inbox hint; does not create/promote a runner or identity. */
+  strictNativeResumeAvailability(sessionKeys: readonly string[]): ReadonlySet<string> {
+    if (sessionKeys.length > 50) throw new Error('native availability batch too large')
+    const candidates = sessionKeys.map(key => [key, this._strictNativeResumeCandidate(key)] as const)
+    const present = presentStrictNativeResumes(candidates.flatMap(([, c]) => c ? [c.nativeSessionId] : []))
+    return new Set(candidates.filter(([, c]) => c && present.has(c.nativeSessionId.toLowerCase())).map(([key]) => key))
   }
 
   private _assertStrictNativeResume(

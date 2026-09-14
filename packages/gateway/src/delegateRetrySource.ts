@@ -57,3 +57,6 @@ export function checkedDelegateRetrySource(value: DelegateRetrySource): Delegate
     sourceAgentId: value.sourceAgentId, depth: value.depth, model: value.model,
     ...(value.parentWorkspaceMode === undefined ? {} : { parentWorkspaceMode: value.parentWorkspaceMode }) })
 }
+
+export type DelegateRetryAvailability = Readonly<{ available: boolean; reason: string | null }>
+export type DelegateRetrySourceKey = Pick<DelegateRetryActionKey, 'userId' | 'sourceJobId' | 'generation'>

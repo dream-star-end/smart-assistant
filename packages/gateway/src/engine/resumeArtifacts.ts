@@ -25,7 +25,7 @@
  * (let the engine's own stale detection fire) — the same posture as
  * `SessionManager._ccbJsonlExists`.
  */
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, opendirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { paths } from '@openclaude/storage'
@@ -253,6 +253,43 @@ export function probeStrictNativeResume(
   const result = codexRolloutArtifact(resumeId, resolveCtx(ctx).codexHome)
   if (result === 'unknown') return 'unknown'
   return result?.exists && result.path ? 'present' : 'absent'
+}
+
+/** Advisory inbox-only batch probe. One traversal, a fixed read budget and no
+ * cache across requests. Exhaustion/read faults never turn unknown into present.
+ * IDs come from the manager's exact resume bindings, not directory discovery.
+ * The executing POST still uses its original strict checks and actual attach. */
+export function presentStrictNativeResumes(
+  ids: readonly string[], ctx: ResumeArtifactContext = {},
+): ReadonlySet<string> {
+  if (ids.length > 50) throw new Error('native availability batch too large')
+  const wanted = new Set(ids.filter(id => UUID_RE.test(id)).map(id => id.toLowerCase()))
+  const found = new Set<string>()
+  if (!wanted.size) return found
+  let reads = 8192
+  const walk = (path: string, depth: number): void => {
+    if (reads <= 0 || found.size === wanted.size) return
+    let dir: ReturnType<typeof opendirSync>
+    try { dir = opendirSync(path) } catch { return }
+    try {
+      while (reads-- > 0 && found.size < wanted.size) {
+        const entry = dir.readSync()
+        if (!entry) break
+        if (depth < 3) {
+          if (entry.isDirectory() && (depth === 0 ? /^\d{4}$/ : /^\d{2}$/).test(entry.name)) {
+            walk(join(path, entry.name), depth + 1)
+          }
+        } else if (entry.isFile() && entry.name.startsWith('rollout-')) {
+          const match = /-([0-9a-f-]{36})\.jsonl$/i.exec(entry.name)
+          const id = match?.[1]?.toLowerCase()
+          if (id && wanted.has(id) && nonEmptyFile(join(path, entry.name))) found.add(id)
+        }
+      }
+    } catch { /* unreadable remainder is unknown, never positive */ }
+    finally { dir.closeSync() }
+  }
+  walk(join(resolveCtx(ctx).codexHome, 'sessions'), 0)
+  return found
 }
 
 /** Upper bound on remembered prior ids per session. Small on purpose: this is
