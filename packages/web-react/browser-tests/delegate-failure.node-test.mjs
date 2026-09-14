@@ -38,7 +38,15 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
     const css = readFileSync(join(cssDir, cssName), "utf8");
     api = await createFailureUiServer(path => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${css}</style></head><body><div id="root"></div><script>${path === "/focused" ? focused : app}</script></body></html>`);
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
-    const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+    const external = [];
+    const isolate = async context => {
+      await context.route("**/*", route => {
+        if (new URL(route.request().url()).origin === api.url) return route.continue();
+        external.push(route.request().url()); return route.abort();
+      });
+      return context;
+    };
+    const context = await isolate(await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 1000 } }));
     const page = await context.newPage(); page.setDefaultTimeout(10_000);
     const errors = []; page.on("pageerror", e => errors.push(e.message));
     await page.goto(api.url + "/focused");
@@ -119,7 +127,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
     });
 
     await t.test("actual App with no active session still mounts authenticated failure footer", async () => {
-      const appContext = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+      const appContext = await isolate(await browser.newContext({ serviceWorkers: "block", viewport: { width: 1280, height: 1000 } }));
       const appPage = await appContext.newPage(); appPage.setDefaultTimeout(20_000);
       await appPage.addInitScript(() => { window.WebSocket = undefined; localStorage.setItem("oc_auth_hint", "1"); });
       await appPage.goto(api.url);
@@ -129,6 +137,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       await appContext.close();
     });
     assert.deepEqual(errors, []);
+    assert.deepEqual(external, [], "no request may escape private loopback fixture");
     t.diagnostic("real HTTP + original SQLite projection/ACK/action replay; native eligibility, principal auth and lifecycle are fixture seams; no production/master/model claim");
   } finally { await browser?.close(); await api?.close(); rmSync(cssDir, { recursive: true, force: true }); }
 });
