@@ -3840,8 +3840,18 @@ export class SessionManager {
     }
   }
 
+  /** Restore an attributable idle webchat parent, never reconfigure a session
+   * which appeared while SQL/identity checks were in flight. No turn is submitted. */
+  async restoreIdleSession(
+    opts: Parameters<SessionManager['getOrCreate']>[0] & { channel: 'webchat'; userId: string; peerId: string; contextFingerprint: string },
+    validate: () => Promise<void>,
+  ): Promise<AgentSession> {
+    return this._enterSessionCreateGate(opts.sessionKey, () => this._getOrCreateExclusive(opts, validate))
+  }
+
   private async _getOrCreateExclusive(
     opts: Parameters<SessionManager['getOrCreate']>[0],
+    restoreGuard?: () => Promise<void>,
   ): Promise<AgentSession> {
     const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
       opts.sessionKey,
@@ -3863,6 +3873,14 @@ export class SessionManager {
     const identity = opts.hermeticNoTools
       ? { agent: opts.agent, context: {} }
       : await resolveRuntimeExecutionAgent(opts.agent)
+    if (restoreGuard) {
+      await restoreGuard()
+      const existing = this.sessions.get(opts.sessionKey)
+      if (existing) return existing // caller checks exact identity; no mutation
+      if (identity.agent.id !== opts.agent.id || typeof opts.contextFingerprint !== 'string') {
+        throw new Error('IDLE_SESSION_RESTORE_IDENTITY_CHANGED')
+      }
+    }
     opts = { ...opts, agent: identity.agent }
     const identityAgentFingerprint = identity.context.assets ? JSON.stringify(opts.agent) : undefined
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)

@@ -33,7 +33,7 @@ async function main() {
   const sm = new SessionManager(config), ins: any = sm
   gw.sessions = sm
   gw._delegateReconcileReady = true; gw._readDelegateMemoryPressure = () => null
-  await upsertClientSession({ id: peer, userId, agentId: 'main', title: 'private retry', pinned: false,
+  await upsertClientSession({ id: peer, userId, agentId: 'main', modelId: 'gpt-6-astra', title: 'private retry', pinned: false,
     createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
   await sm.getOrCreate({ sessionKey: parentKey, agent: agents[0]!, model: 'gpt-6-astra',
     channel: 'webchat', peerId: peer, userId, hermeticNoTools: true })
@@ -55,6 +55,14 @@ async function main() {
   const original = jobs.snapshotOf(made.jobId)!
   assert.equal(jobs.fail(made.jobId, { failureClass: 'child_error', detail: 'private original failure', httpStatus: 500,
     claimToken: original.claimToken, fencingEpoch: original.fencingEpoch }), true)
+  if (mode.startsWith('parent-')) {
+    const parent = sm.getByKey(parentKey)!
+    assert.equal(parent._currentTurnKey, undefined)
+    // Remove only this real idle parent, leaving the actual child as its trusted
+    // inherited workspace witness. No fabricated lookup or submitted parent turn.
+    ins.sessions.delete(parentKey)
+    if (mode === 'parent-metadata-missing') await deleteClientSession(peer, userId)
+  }
   let billed = 0
   gw._delegateEngineBilling = { admit: async (input: any) => {
     billed++; assert.equal(input.parentSessionId, peer); assert.equal(input.sessionKey, childKey)
@@ -93,7 +101,36 @@ async function main() {
     }
   }
   try {
-    if (mode === 'denied') {
+    if (mode === 'parent-restore-expired') {
+      const exp = Math.floor(Date.now() / 1000) + 2
+      const originalRead = gw._getAgentsConfig.bind(gw)
+      gw._getAgentsConfig = async () => {
+        const cfg = await originalRead()
+        await new Promise(r => setTimeout(r, Math.max(1, exp * 1000 + 30 - Date.now())))
+        return cfg
+      }
+      assert.equal((await post(body, jwt(userId, exp))).status, 401)
+      assert.equal(sm.getByKey(parentKey), undefined)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else if (mode === 'parent-metadata-missing') {
+      assert.equal((await post()).status, 409)
+      assert.equal(sm.getByKey(parentKey), undefined)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else if (mode === 'parent-restore-race') {
+      const restore = sm.restoreIdleSession.bind(sm)
+      let rival: any
+      sm.restoreIdleSession = async (opts, validate) => {
+        // Real manager creation wins before the recovery lock. Recovery must not
+        // adopt its user, switch its model or mutate its workspace.
+        rival = await sm.getOrCreate({ sessionKey: parentKey, agent: agents[0]!, model: 'gpt-6-astra',
+          channel: 'webchat', peerId: peer, userId: 'c:8', hermeticNoTools: true })
+        return restore(opts, validate)
+      }
+      assert.equal((await post()).status, 409)
+      assert.equal(sm.getByKey(parentKey), rival); assert.equal(rival.userId, 'c:8')
+      assert.equal(rival._currentTurnKey, undefined)
+      assert.deepEqual(counts(), { jobs: 1, actions: 0, slots: 0, waiters: 0, resume: 0 })
+    } else if (mode === 'denied') {
       assert.equal((await post(body, jwt('c:8'))).status, 409)
       assert.equal((await post({ ...body, userId })).status, 400)
       assert.equal((await post({ ...body, generation: 1 })).status, 409)
@@ -131,6 +168,12 @@ async function main() {
     } else {
       const responses = await Promise.all([post(), post()])
       assert.deepEqual(responses.map(r => r.status).sort(), [200, 202], JSON.stringify(responses))
+      if (mode === 'parent-restore') {
+        const parent = sm.getByKey(parentKey)!
+        assert.equal(parent.userId, userId); assert.equal(parent.agentId, 'main')
+        assert.equal(parent._currentTurnKey, undefined); assert.equal(parent._activeTurnCount ?? 0, 0)
+        assert.equal(parent.turns, 0); assert.equal(parent.workspaceMode, childSession.workspaceMode)
+      }
       const target = responses[0]!.body.jobId
       assert.equal(responses[1]!.body.jobId, target); assert.notEqual(target, made.jobId)
       for (let i = 0; i < 1000 && !jobs.snapshotOf(target)?.result; i++) await new Promise(r => setTimeout(r, 10))

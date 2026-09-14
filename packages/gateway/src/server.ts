@@ -189,6 +189,7 @@ import {
   queryEvents,
   listClientSessions,
   classifyClientSessions,
+  getClientSessionCollabParent,
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
@@ -13950,8 +13951,58 @@ export class Gateway {
     }
   }
 
+  /** Reconstitute only an exact owned root. Nested ephemeral parents and missing
+   * workspace/model authority remain unavailable; never invent a billing turn. */
+  private async _restoreDelegateRetryParent(key: DelegateRetryActionKey, source: DelegateRetrySource, authorize: () => void): Promise<void> {
+    if (this.sessions.getByKey(source.parentSessionKey)) return
+    const check = () => {
+      authorize()
+      if (source.userId !== key.userId || JSON.stringify(this._delegateJobs?.getRetrySource(key.userId, key.sourceJobId, key.generation)) !== JSON.stringify(source)) {
+        throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
+      }
+    }
+    check()
+    if (source.parentSessionKey !== source.originSessionKey ||
+        source.parentSessionKey !== `agent:${source.sourceAgentId}:webchat:dm:${source.parentClientSessionId}`) {
+      throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
+    }
+    const metadata = await getClientSessionCollabParent(source.parentClientSessionId, source.userId); check()
+    if (!metadata || metadata.agentId !== source.sourceAgentId || !metadata.modelId) {
+      throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_unavailable')
+    }
+    // The ordinary bridge's workspaceMode is not in client_sessions. A live,
+    // exact child carries the inherited mode. Without this witness, fail closed
+    // rather than switching an isolated workspace to the legacy default.
+    const child = this.sessions.getByKey(source.childSessionKey)
+    if (!child || child.userId !== source.userId || child.agentId !== source.targetAgentId ||
+        child.channel !== 'delegate' || child.parentSessionKey !== source.parentSessionKey) {
+      throw new DelegateRetryUnavailable(409, 'retry_parent_workspace_unavailable')
+    }
+    const workspaceMode = child.workspaceMode
+    const cfg = await this._getAgentsConfig(); check()
+    const agent = cfg.agents.find(a => a.id === metadata.agentId)
+    if (!agent) throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
+    const execution = await resolveLocalExecutionIfEnforced({ agent: { ...agent, model: metadata.modelId },
+      kind: 'turn', model: metadata.modelId, defaultModel: this.deps.config.defaults.model }); check()
+    const workspace = await resolveChatRunWorkspace({ sessionId: metadata.sessionId }); check()
+    const validate = async () => {
+      check()
+      const current = await getClientSessionCollabParent(source.parentClientSessionId, source.userId); check()
+      if (JSON.stringify(current) !== JSON.stringify(metadata) || this.sessions.getByKey(source.childSessionKey) !== child ||
+          child.workspaceMode !== workspaceMode || child.userId !== source.userId || child.parentSessionKey !== source.parentSessionKey) {
+        throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_changed')
+      }
+    }
+    await this.sessions.restoreIdleSession({ sessionKey: source.parentSessionKey, agent, model: metadata.modelId,
+      channel: 'webchat', peerId: metadata.sessionId, userId: metadata.userId, workspaceMode,
+      workspaceCwd: workspace.workspaceCwd, projectId: workspace.projectId,
+      contextFingerprint: workspace.contextFingerprint, assetsRevision: workspace.assetsRevision,
+      ...localExecutionOverride(execution) }, validate)
+    check()
+  }
+
   /** Exact durable provenance plus current real manager chain; no fallback user,
-   * fake parent or nonce-directory discovery. Unknown/missing parent stays disabled. */
+   * fake parent or nonce-directory discovery. Unknown parent stays disabled. */
   private _delegateRetrySourceGuard(key: DelegateRetryActionKey, source: DelegateRetrySource, authorize: () => void): () => void {
     const chain: AgentSession[] = []
     const visited = new Set<string>()
@@ -14043,6 +14094,7 @@ export class Gateway {
     }
     const source = store.getRetrySource(key.userId, key.sourceJobId, key.generation)
     if (!source) throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
+    await this._restoreDelegateRetryParent(key, source, authorize)
     const guard = this._delegateRetrySourceGuard(key, source, authorize)
     await this._checkDelegateRetrySource(key, source, guard)
     const cfg = await this._getAgentsConfig(); guard()
