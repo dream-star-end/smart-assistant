@@ -14,7 +14,7 @@ import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 
-const requestedMode=process.argv[3] || 'end';const kairos=requestedMode==='kairos';let creatorRequestAt=0,kairosElapsedMs:number|undefined;const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const handoffIngested=requestedMode==='handoff-ingested';const mixed=requestedMode==='handoff-mixed';let mixedStage=0,mixedBefore:any;let mixedRows:any[]=[];const mode=handoffIngested||kairos?'ingested-end':handoff?'cross-turn':requestedMode;let jobToWait='',discovered=false,handoffWaiting=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
+const requestedMode=process.argv[3] || 'end';const managed=requestedMode.startsWith('managed-');const scenarioMode=managed?requestedMode.slice(8):requestedMode;const kairos=requestedMode==='kairos';let creatorRequestAt=0,kairosElapsedMs:number|undefined;const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const handoffIngested=requestedMode==='handoff-ingested';const mixed=requestedMode==='handoff-mixed';let mixedStage=0,mixedBefore:any;let mixedRows:any[]=[];const mode=handoffIngested||kairos?'ingested-end':handoff?'cross-turn':scenarioMode;let jobToWait='',discovered=false,handoffWaiting=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r});let releaseCurrent:()=>void=()=>{};const currentGate=new Promise<void>(r=>{releaseCurrent=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
@@ -100,6 +100,7 @@ const upstream=createServer(async(req,res)=>{
      const deadline=Date.now()+20000
      while(executions!==1){assert.ok(Date.now()<deadline,'create deadline');await new Promise(r=>setTimeout(r,20))}
      savedOwner=adapter.getReceiptToolOwner('real_creator');assert.ok(savedOwner?.parentProcess)
+      if(managed){assert.equal(manager.getByKey(session),parent);assert.ok(parent._currentTurnKey);assert.equal(savedOwner.turnKey,parent._currentTurnKey);assert.equal(parent._activeTurnCount,1);managedProof={activeTurnKey:parent._currentTurnKey,ownerEpoch:savedOwner.parentOwnerEpoch,settledTurns:0}}
      if(mode==='kill') {
        const proc=runner.receiptProcessIdentity as ChildProcess;assert.equal(proc.pid,savedOwner.parentProcess.pid)
        const closed=once(proc,'close');visible=false;process.kill(-proc.pid!,'SIGKILL');await closed;killedSignal=proc.signalCode;markKilled()
@@ -126,7 +127,7 @@ const upstream=createServer(async(req,res)=>{
     mixedBefore={states:rows.map((r:any)=>r.state),callbacks:accepted.size,ordinaryError:true};mixedStage=3
    }
    if(main){received=raw.includes(sentinel);phase++;writeFileSync(join(dir,'model-final-messages.json'),JSON.stringify(body.messages,null,2))}send(res,body,false)}
- }catch(e){failure=e;res.statusCode=500;res.end('{}')}
+ }catch(e){if(!failure)failure=e;process.stderr.write('MODEL_HANDLER_FAILURE '+String(e)+'\n');res.statusCode=500;res.end('{}')}
 })
 await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',r))
 const upstreamPort=(upstream.address() as any).port
@@ -161,7 +162,7 @@ const master=createServer(async(req,res)=>{
   masterRequests.push(body)
   if(!accepted.has(body.clientMessageId)) {accepted.set(body.clientMessageId,body);writeFileSync(join(dir,'master-accepted.json'),JSON.stringify([...accepted.values()]))}
   res.end('{}')
- }catch(e){failure=e;res.statusCode=500;res.end('{}')}
+ }catch(e){if(!failure)failure=e;process.stderr.write('MODEL_HANDLER_FAILURE '+String(e)+'\n');res.statusCode=500;res.end('{}')}
 })
 await new Promise<void>(r=>master.listen(0,'127.0.0.1',r))
 function enableMasterCallback(){
@@ -183,21 +184,51 @@ process.env.OPENCLAUDE_GATEWAY_PORT=String(port);process.env.OPENCLAUDE_GATEWAY_
 process.env.OPENCLAUDE_HOME=dir;process.env.OPENCLAUDE_DELEGATE_JOBS_DB=dbPath
 process.env.CLAUDE_CONFIG_DIR=join(dir,'native');process.env.OPENCLAUDE_RECEIPT_CALLER_V2='1'
 const providerEnvOverride={...(mcp&&!wrapped?{ENABLE_SEARCH_EXTRA_TOOLS:'false'}:{}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
-runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
-adapter=new CcbAdapter({harness:'ccb'} as any,runner)
-const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}
-;(gw as any).sessions={getByKey:(key:string)=>key===session&&visible?parent:undefined}
+const manager=(gw as any).sessions
+let parent:any
+let managedProof:{activeTurnKey:string;ownerEpoch:string;settledTurns:number}|undefined
+if(managed) {
+ assert.ok(['end','ingested-end'].includes(mode),'managed modes exercise real submit completion')
+ // This entire fixture is a private child process. Set only synthetic transport
+ // before the original factory spawns; do not replace registry or runner opts.
+ Object.assign(process.env,providerEnvOverride)
+ parent=await manager.getOrCreate({sessionKey:session,agent:{id:'main',model:config.defaults.model,cwd:dir,permissionMode:'bypassPermissions'},channel:'webchat',peerId:'real-model-cli',userId:'default'})
+ assert.equal(manager.getByKey(session),parent)
+ assert.equal(parent._currentTurnKey,undefined)
+ adapter=parent.runner
+ assert.ok(adapter instanceof CcbAdapter)
+ runner=(adapter as any).runner
+ assert.ok(runner instanceof SubprocessRunner)
+} else {
+ runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
+ adapter=new CcbAdapter({harness:'ccb'} as any,runner)
+ parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}
+ ;(gw as any).sessions={getByKey:(key:string)=>key===session&&visible?parent:undefined}
+}
 runner.on('message',(m:any)=>{sdk.push(m);if(m.type==='control_request'&&m.request?.subtype==='can_use_tool')runner.sendPermissionResponse(m.request_id,{behavior:'allow',updatedInput:m.request.input} as any)})
 runner.on('stderr',(line:any)=>{process.stderr.write(String(line)+'\n')})
 runner.on('error',(e:any)=>{if(mode!=='kill')failure=e})
 process.once('SIGTERM',()=>{failure=Error('fixture terminated');turn?.end();void runner.shutdown()})
 let timer:ReturnType<typeof setTimeout>|undefined
 try {
- turn=adapter.submitTurn({input:'RECEIPT_MODEL_PROBE: run synthetic child command then report its result.',turnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()} as any)
+ if(managed) {
+   const summary=manager.submit(parent,'RECEIPT_MODEL_PROBE: run synthetic child command then report its result.',()=>{})
+   // submit() itself settles the full managed turn; no fabricated adapter
+   // summary, active owner, counters or turn key is written by this fixture.
+   turn={submitted:Promise.resolve(),summary,end(){}}
+  } else turn=adapter.submitTurn({input:'RECEIPT_MODEL_PROBE: run synthetic child command then report its result.',turnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()} as any)
  await Promise.race([turn.submitted,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('submit deadline')),60000)})]);clearTimeout(timer)
  const result=await Promise.race([mode==='kill'?killed:turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn or actual kill deadline')),90000)})]);clearTimeout(timer)
  assert.ok(!failure,String(failure));assert.equal(executions,1)
- assert.ok(runner.sessionId)
+  assert.ok(runner.sessionId)
+  if(managed) {
+   assert.ok(managedProof)
+   assert.equal(parent._currentTurnKey,undefined)
+   assert.equal(parent._activeTurnCount,0)
+   assert.equal(parent.turns,1)
+   managedProof.settledTurns=parent.turns
+   assert.equal(adapter.checkReceiptOwner(savedOwner),'inactive')
+  }
  if(mode==='kill')await until(()=>killedSignal==='SIGKILL','actual parent close after SIGKILL')
  const jobId=(db as any).db.prepare('SELECT job_id FROM delegate_jobs').get().job_id as string
  const before=db.getDeliveryReceipt(jobId,0)
@@ -280,7 +311,7 @@ finally {
  clearTimeout((gw as any)._notifyRetryTimer);clearTimeout((gw as any)._delegateReconcileTimer);clearInterval((gw as any)._delegateReapTimer)
  server.closeAllConnections();upstream.closeAllConnections();master.closeAllConnections()
  await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r())),new Promise<void>(r=>master.close(()=>r()))])
- writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,kairosElapsedMs,mixedBefore,masterRequests,accepted:[...accepted.values()],terminalCalls:terminalWork.length,killedSignal,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup, child executor, enrollment opt-in and master receiver fixtures; actual production store hooks, recovery, notifier and HTTP client'},null,2))
+ writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,managedProof,kairosElapsedMs,mixedBefore,masterRequests,accepted:[...accepted.values()],terminalCalls:terminalWork.length,killedSignal,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:managed?'actual Gateway.sessions.getOrCreate/factory/SessionManager.submit + CCB CLI/SDK/HTTP/SQLite/native; child executor, enrollment and master receiver remain fixtures; NOT dispatchInbound finally/master durable ACK': 'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup, child executor, enrollment opt-in and master receiver fixtures; actual production store hooks, recovery, notifier and HTTP client'},null,2))
  jobs.close()
 }
 
