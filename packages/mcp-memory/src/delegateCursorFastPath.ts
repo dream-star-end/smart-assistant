@@ -8,6 +8,7 @@
  * Every engine uses this path so Codex/CCB MCP call deadlines are never
  * mistaken for the lifetime of a healthy child job.
  */
+import { parseReceiptHandoff, formatReceiptHandoff, type ReceiptHandoff } from './receiptHandoffView.js'
 import type { FanoutItemResult } from './delegateFanout.js'
 
 export const DEFAULT_CURSOR_FAST_WAIT_MS = 45_000
@@ -108,6 +109,7 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
 }
 
 export type DelegateWaitView =
+  | { kind: 'handoff'; handoff: ReceiptHandoff }
   | { kind: 'running'; jobId: string; sessionKey?: string }
   | { kind: 'expired'; jobId?: string; error: string }
   | { kind: 'result'; httpStatus: number; body: Record<string, unknown> }
@@ -195,6 +197,10 @@ export function interpretDelegateWaitBody(
     return { kind: 'expired', jobId, error }
   }
   if (!data) return { kind: 'error', error: `等待委派结果失败: 无效 JSON: ${raw.slice(0, 200)}` }
+  if (data.status === 'receipt_handoff') {
+    const handoff = statusCode === 200 ? parseReceiptHandoff(data) : undefined
+    return handoff ? { kind: 'handoff', handoff } : { kind: 'error', error: 'invalid receipt handoff response' }
+  }
   const live = waitRunningView(data)
   if (live) return live
   if (data.status === 'done' || data.status === 'failed') {
@@ -224,6 +230,7 @@ export function looksLikeDelegateApiError(raw: unknown): boolean {
 }
 
 export type FormattedDelegateResult =
+  | { kind: 'handoff'; text: string }
   | { kind: 'ok'; text: string }
   | { kind: 'error'; text: string }
   | { kind: 'running'; text: string; jobId: string }
@@ -294,6 +301,7 @@ export async function runCursorDelegateFastPath(
     throw err
   }
   const view = interpretDelegateWaitBody(waited.statusCode, waited.body)
+  if (view.kind === 'handoff') return { kind: 'handoff', text: formatReceiptHandoff(view.handoff) }
   if (view.kind === 'running') {
     const sessionKey = start.sessionKey || view.sessionKey
     return {

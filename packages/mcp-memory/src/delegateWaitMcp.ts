@@ -1,3 +1,4 @@
+import { formatReceiptHandoff } from './receiptHandoffView.js'
 /**
  * Cursor MCP `delegate_wait` — one long-poll round against a durable job.
  *
@@ -25,7 +26,7 @@ export type McpDelegateWaitOnce = (
 
 export type McpDelegateWaitResult = {
   isError: boolean
-  status: 'done' | 'failed' | 'running' | 'not_found' | 'error'
+  status: 'handoff' | 'done' | 'failed' | 'running' | 'not_found' | 'error'
   text: string
   jobId?: string
 }
@@ -54,6 +55,7 @@ export function formatMcpDelegateWaitNotFound(jobId: string, error: string): str
 }
 
 export function formatMcpDelegateWaitView(view: DelegateWaitView, jobId: string): McpDelegateWaitResult {
+  if (view.kind === 'handoff') return { isError: false, status: 'handoff', jobId, text: formatReceiptHandoff(view.handoff) }
   if (view.kind === 'running') {
     return {
       isError: false,

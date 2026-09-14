@@ -6377,6 +6377,10 @@ export class Gateway {
       this.handleReceiptOwner(req, res, url.pathname.endsWith('/issue'), url.pathname.endsWith('/refresh')).catch((err) => this.sendInternalError(res, err))
       return
     }
+    if (url.pathname === `${RECEIPT_OWNER_PREFIX}handoff-status`) {
+      this.handleReceiptInputOffer(req, res, false, true).catch((err) => this.sendInternalError(res, err))
+      return
+    }
     if (url.pathname === `${RECEIPT_OWNER_PREFIX}input` || url.pathname === `${RECEIPT_OWNER_PREFIX}status`) {
       this.handleReceiptInputOffer(req, res, url.pathname.endsWith('/status')).catch((err) => this.sendInternalError(res, err))
       return
@@ -14452,7 +14456,7 @@ export class Gateway {
 
   /** Read an authoritative result for a separately attested native consumer.
    * This endpoint never acknowledges delivery or rebinds the receipt creator. */
-  private async handleReceiptInputOffer(req: IncomingMessage, res: ServerResponse, statusOnly = false): Promise<void> {
+  private async handleReceiptInputOffer(req: IncomingMessage, res: ServerResponse, statusOnly = false, handoffOnly = false): Promise<void> {
     res.setHeader('Cache-Control', 'no-store')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const contextToken = req.headers[DELEGATE_CONTEXT_HEADER]
@@ -14465,10 +14469,12 @@ export class Gateway {
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid body')
       body = parsed as Record<string, unknown>
     } catch { return this.sendError(res, 400, 'invalid receipt input request') }
-    if (Object.keys(body).sort().join(',') !== 'capability,generation,jobId,receiptNonce' ||
+    if (handoffOnly ? (Object.keys(body).sort().join(',') !== 'capability,jobId' ||
+        typeof body.capability !== 'string' || typeof body.jobId !== 'string' || !/^dlgjob-[a-z0-9-]{1,150}$/.test(body.jobId)) :
+        (Object.keys(body).sort().join(',') !== 'capability,generation,jobId,receiptNonce' ||
         typeof body.capability !== 'string' || typeof body.jobId !== 'string' || !body.jobId || body.jobId.length > 256 ||
         !Number.isSafeInteger(body.generation) || (body.generation as number) < 0 ||
-        typeof body.receiptNonce !== 'string' || !/^[a-f0-9]{64}$/.test(body.receiptNonce)) {
+        typeof body.receiptNonce !== 'string' || !/^[a-f0-9]{64}$/.test(body.receiptNonce))) {
       return this.sendError(res, 400, 'invalid receipt input request')
     }
     const preliminaryContext = verifyDelegateContextToken(contextToken)
@@ -14492,16 +14498,24 @@ export class Gateway {
       return this.sendError(res, 409, 'receipt input consumer unavailable')
     }
     if (!this._delegateJobs) return this.sendError(res, 503, 'receipt storage unavailable')
+    if (handoffOnly) {
+      const status = this._delegateJobs.readReceiptHandoff(body.jobId as string, {
+        userId: consumer.userId, parentSession: consumer.sessionKey,
+        parentAgentId: consumer.agentId, consumerTurnKey: consumer.turnKey,
+      })
+      if (status === 'same_turn') return this.sendError(res, 409, 'receipt locator unavailable; job retained, do not resubmit')
+      return status ? this.sendJson(res, 200, status) : this.sendError(res, 404, 'receipt handoff unavailable')
+    }
     if (statusOnly) {
-      const status = this._delegateJobs.readReceiptStatus(body.jobId, body.generation as number, {
+      const status = this._delegateJobs.readReceiptStatus(body.jobId as string, body.generation as number, {
         userId: consumer.userId, parentSession: consumer.sessionKey, parentTurnKey: consumer.turnKey,
-        receiptNonceHash: receiptContextHash(body.receiptNonce),
+        receiptNonceHash: receiptContextHash(body.receiptNonce as string),
       })
       return status ? this.sendJson(res, 200, { status }) : this.sendError(res, 404, 'receipt unavailable')
     }
-    const offer = this._delegateJobs.readReceiptInputOffer(body.jobId, body.generation as number, {
+    const offer = this._delegateJobs.readReceiptInputOffer(body.jobId as string, body.generation as number, {
       userId: consumer.userId, parentSession: consumer.sessionKey, parentTurnKey: consumer.turnKey,
-      receiptNonceHash: receiptContextHash(body.receiptNonce),
+      receiptNonceHash: receiptContextHash(body.receiptNonce as string),
     })
     if (!offer) return this.sendError(res, 404, 'receipt input unavailable')
     return this.sendJson(res, 200, { ...offer, consumer })

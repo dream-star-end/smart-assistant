@@ -990,6 +990,13 @@ export class DelegateJobStore {
     finally { delivery.close(); this.refreshJob(jobId) }
   }
 
+  readReceiptHandoff(jobId: string, scope: {
+    userId: string; parentSession: string; parentAgentId: string; consumerTurnKey: string
+  }) {
+    if (!this.durable) throw new Error('receipt handoff requires durable storage')
+    return this.durable.readReceiptHandoff(jobId, scope)
+  }
+
   readReceiptStatus(jobId: string, generation: number, scope: {
     userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string
   }): 'running' | 'ready' | undefined {

@@ -158,5 +158,5 @@ export function formatCliDelegateResult(result: DelegateWaitLoopResult): Delegat
 }
 
 export function looksLikeFormattedDelegate(result: FormattedDelegateResult): boolean {
-  return result.kind === 'ok' || result.kind === 'error' || result.kind === 'running'
+  return result.kind === 'ok' || result.kind === 'error' || result.kind === 'running' || result.kind === 'handoff'
 }

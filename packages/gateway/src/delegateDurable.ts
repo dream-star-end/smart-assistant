@@ -783,6 +783,37 @@ export class DelegateDurableDb {
       .all(parentSession ?? null, parentSession ?? null) as { job_id: string }[]).map(row => row.job_id)
   }
 
+  /** Cross-turn read-only handoff. The durable generation/source, not a caller
+   * locator, select the row. Deliberately do not SELECT result_json bytes. */
+  readReceiptHandoff(jobId: string, scope: {
+    userId: string; parentSession: string; parentAgentId: string; consumerTurnKey: string
+  }): 'same_turn' | { status: 'receipt_handoff'; jobId: string; generation: number;
+    execution: 'running' | 'terminal'; delivery: 'pending' | 'notified' | 'ingested' } | undefined {
+    const row = this.db.prepare(`SELECT j.generation, j.state AS job_state,
+      j.callback_origin_user_id, j.parent_session_key, j.delivery_receipt_context,
+      (j.result_json IS NOT NULL) AS has_result,
+      r.state AS receipt_state, r.user_id, r.parent_session, r.parent_turn_key,
+      r.native_tool_use_id, r.receipt_nonce_hash
+      FROM delegate_jobs j LEFT JOIN delegate_delivery_receipt r
+        ON r.job_id=j.job_id AND r.generation=j.generation
+      WHERE j.job_id=? AND j.retired_at IS NULL`).get(jobId) as Record<string, unknown> | undefined
+    if (!row || row.callback_origin_user_id !== scope.userId || row.parent_session_key !== scope.parentSession ||
+        typeof row.delivery_receipt_context !== 'string') return undefined
+    const source = checkedReceiptContext(JSON.parse(row.delivery_receipt_context))
+    if (!source.parent || source.parent.agentId !== scope.parentAgentId) return undefined
+    if (source.parentTurnKey === scope.consumerTurnKey) return 'same_turn'
+    if (!Number.isSafeInteger(row.generation) || Number(row.generation) < 0) return undefined
+    const terminal = ['completed', 'failed', 'cancelled', 'killed_by_cutover'].includes(String(row.job_state))
+    if (terminal !== Boolean(row.has_result) || (!terminal && row.receipt_state != null)) return undefined
+    if (terminal && (row.user_id !== scope.userId || row.parent_session !== scope.parentSession ||
+        row.parent_turn_key !== source.parentTurnKey || row.native_tool_use_id !== source.nativeToolUseId ||
+        row.receipt_nonce_hash !== source.receiptNonceHash ||
+        !['offered','ingest_claimed','ingested','notify_pending','notify_claimed','notified'].includes(String(row.receipt_state)))) return undefined
+    return { status: 'receipt_handoff', jobId, generation: Number(row.generation),
+      execution: terminal ? 'terminal' : 'running',
+      delivery: row.receipt_state === 'notified' ? 'notified' : row.receipt_state === 'ingested' ? 'ingested' : 'pending' }
+  }
+
   /** Scoped metadata only; never exposes result bytes or acknowledges delivery. */
   readReceiptStatus(jobId: string, generation: number, scope: {
     userId: string; parentSession: string; parentTurnKey: string; receiptNonceHash: string

@@ -1,4 +1,5 @@
 /** CLI carries locators, never an input ACK or authoritative result text. */
+import { parseReceiptHandoff } from './receiptHandoffView.js'
 import { randomBytes } from 'node:crypto'
 import { ReceiptCandidateLifecycle, receiptReportId } from '@openclaude/storage/receiptCandidateLifecycle'
 import { constants, openSync, closeSync, fsyncSync, writeFileSync, readFileSync, readSync, linkSync, unlinkSync, fstatSync } from 'node:fs'
@@ -196,6 +197,23 @@ export class ReceiptCliTransport {
       try { return readCacheRecord(join(path, jobId + '.json'), jobId) }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
     })
+  }
+  /** Missing local cache is never a legacy consume fallback. Only another
+   * durable source turn may return ordinary handoff text, without a candidate. */
+  async handoff(jobId: string): Promise<{ statusCode: number; body: string }> {
+    try {
+      const { headers, capability } = await this.credentials.current()
+      const response = await postJsonToGateway(gatewayBaseUrl() + '/api/delegate/receipt-owner/handoff-status', {
+        headers, body: JSON.stringify({ jobId, capability }), timeoutMs: 5000,
+      })
+      if (response.statusCode !== 200) return response
+      const view = parseReceiptHandoff(JSON.parse(response.body))
+      if (!view || view.jobId !== jobId) throw new Error('invalid receipt handoff metadata')
+      return { statusCode: 200, body: JSON.stringify(view) }
+    } catch (error) {
+      return { statusCode: 503, body: JSON.stringify({ error:
+        `receipt handoff unavailable: ${describeDelegateTransportError(error)}; job retained, do not resubmit` }) }
+    }
   }
   async wait(locator: ReceiptLocator, waitMs: number): Promise<{ statusCode: number; body: string }> {
     let result: { statusCode: number; body: string }

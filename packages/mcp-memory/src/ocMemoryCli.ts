@@ -351,9 +351,7 @@ async function main(): Promise<void> {
           const locator = locators.get(jobId)
           // A failed/missing local candidate belongs to this item only. Never
           // downgrade it to legacy consume or suppress ready sibling receipts.
-          if (!locator) return { statusCode: 409, body: JSON.stringify({
-            error: 'receipt locator unavailable; job retained, do not resubmit', jobId,
-          }) }
+          if (!locator) return receipt.handoff(jobId)
           return receipt.wait(locator, waitMs)
         }
         return postJsonToGateway(`${base}/api/delegate/wait`, {

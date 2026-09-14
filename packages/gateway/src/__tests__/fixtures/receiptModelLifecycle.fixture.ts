@@ -13,7 +13,7 @@ import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 
-const mode=process.argv[3] || 'end';const requestedMode=mode;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
+const requestedMode=process.argv[3] || 'end';const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const mode=handoff?'cross-turn':requestedMode;let jobToWait='',discovered=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
@@ -38,9 +38,14 @@ const cli=`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packag
 const command=cli
 function send(res:any,body:any,tool:boolean,wait=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
- const content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:'Bash',input:wait?
-  {command:'printf background-checkpoint',timeout:20000}:
+ let content:any=tool?{type:'tool_use',id:wait?'real_waiter':'real_creator',name:'Bash',input:wait?
+  {command:handoff?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${jobToWait}`:'printf background-checkpoint',timeout:20000}:
   {command,timeout:20000,run_in_background:true}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+ if(tool&&wait&&mcp) {
+  content={...content,name:'mcp__openclaude-memory__delegate_wait',input:{jobId:jobToWait,waitMs:10000}}
+  if(wrapped) content=discovered?{...content,name:'ExecuteExtraTool',input:{tool_name:content.name,params:content.input}}:
+   {type:'tool_use',id:'real_discovery',name:'SearchExtraTools',input:{query:'select:mcp__openclaude-memory__delegate_wait'}}
+ }
  const message={id,type:'message',role:'assistant',model:body.model,content:[content],stop_reason:tool?'tool_use':'end_turn',stop_sequence:null,usage:{input_tokens:10,output_tokens:10}}
  if(!body.stream){res.setHeader('Content-Type','application/json');res.end(JSON.stringify(message));return}
  res.setHeader('Content-Type','text/event-stream')
@@ -62,7 +67,8 @@ const upstream=createServer(async(req,res)=>{
   if(!req.url?.startsWith('/v1/messages')){res.statusCode=404;res.end('{}');return}
   const main=body.tools?.some((t:any)=>t.name==='Bash')
   if(main&&nextTurnStarted){
-    nextTurnStarted=false;send(res,body,true,true)
+    if(wrapped&&!discovered){send(res,body,true,true);discovered=true}
+     else {nextTurnStarted=false;send(res,body,true,true)}
   }
   else if(main&&phase===0){
     phase++;send(res,body,true)
@@ -136,7 +142,7 @@ writeFileSync(join(dir,'token'),token,{mode:0o600})
 process.env.OPENCLAUDE_GATEWAY_PORT=String(port);process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE=join(dir,'token')
 process.env.OPENCLAUDE_HOME=dir;process.env.OPENCLAUDE_DELEGATE_JOBS_DB=dbPath
 process.env.CLAUDE_CONFIG_DIR=join(dir,'native');process.env.OPENCLAUDE_RECEIPT_CALLER_V2='1'
-const providerEnvOverride={ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
+const providerEnvOverride={...(mcp&&!wrapped?{ENABLE_SEARCH_EXTRA_TOOLS:'false'}:{}),ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
 runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
 adapter=new CcbAdapter({harness:'ccb'} as any,runner)
 const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}
@@ -158,7 +164,7 @@ try {
  if(mode!=='ingested-end'){
   assert.equal(received,false);assert.equal(accepted.size,0)
   if(mode==='cross-turn') {
-   parent._currentTurnKey='real-next-turn';nextTurnStarted=true
+   jobToWait=jobId;parent._currentTurnKey='real-next-turn';nextTurnStarted=true
    turn=adapter.submitTurn({input:'New real user turn; old child still pending.',turnKey:parent._currentTurnKey,onEvent(){},sessionTotals:{totalCostUSD:0,turns:1},toolUseIdToName:new Map()} as any)
    await turn.submitted
    await until(()=>!!adapter.getReceiptToolOwner('real_waiter'),'new SDK owner')
@@ -186,6 +192,16 @@ try {
  assert.equal(jobs.snapshotOf(jobId).callbackState,mode==='ingested-end'?'none':'delivered')
  assert.ok(terminalWork.length>=1,'actual onTerminal dispatch must execute')
  if(mode==='cross-turn')await turn.summary
+ if(handoff) {
+  const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))
+  const waited=modelMessages.flatMap((m:any)=>m.role==='user'&&Array.isArray(m.content)?m.content.filter((c:any)=>c.type==='tool_result'&&c.tool_use_id==='real_waiter'):[])
+  assert.equal(waited.length,1);assert.notEqual(waited[0].is_error,true,JSON.stringify(waited))
+  assert.ok(JSON.stringify(waited).includes('原回调'));assert.ok(!JSON.stringify(waited).includes(sentinel))
+  assert.ok(!JSON.stringify(waited).includes('receipt-locator'))
+  assert.equal(http.filter(r=>r.path==='/api/delegate/receipt-owner/handoff-status'&&r.status===200).length,1)
+  assert.equal(http.filter(r=>r.path==='/api/delegate/wait'||r.path==='/api/delegate/receipt-owner/input').length,0)
+  assert.equal(http.filter(r=>r.path==='/api/agents/coding-assistant/delegate').length,1)
+ }
  if(mode==='kill')assert.equal(killedSignal,'SIGKILL')
  if(mode==='ingested-end') {
   const modelMessages=JSON.parse(readFileSync(join(dir,'model-final-messages.json'),'utf8'))

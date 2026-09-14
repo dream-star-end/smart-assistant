@@ -45,10 +45,9 @@ export function createReceiptMcpTransport(meta?: Record<string, unknown>) {
       }))
     },
     async wait(jobId: string, waitMs: unknown) {
-      const locator = await receipt.lookup(jobId)
-      if (!locator) throw new Error('receipt locator unavailable; do not resubmit the job')
+      const locator = await receipt.lookup(jobId).catch(() => undefined)
       return result(await runDelegateWaitLoop({ jobIds: [jobId],
-        waitOnce: (_id, ms) => receipt.wait(locator, ms), pollWaitMs: 1000,
+        waitOnce: (_id, ms) => locator ? receipt.wait(locator, ms) : receipt.handoff(jobId), pollWaitMs: 1000,
         foregroundBudgetMs: resolveMcpDelegateWaitMs(waitMs),
       }))
     },

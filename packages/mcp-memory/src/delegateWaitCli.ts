@@ -1,3 +1,4 @@
+import { formatReceiptHandoff } from './receiptHandoffView.js'
 /**
  * `oc-memory delegate-wait` — long-poll the gateway until every jobId reaches
  * a terminal state, or until this foreground Bash segment approaches Cursor's
@@ -120,6 +121,10 @@ export async function runDelegateWaitLoop(opts: {
     for (const { jobId, view } of views) {
       if (view.kind === 'running') continue
       pending.delete(jobId)
+      if (view.kind === 'handoff') {
+        results.set(jobId, { kind: 'handoff', text: formatReceiptHandoff(view.handoff) })
+        continue
+      }
       if (view.kind === 'expired') {
         results.set(jobId, { kind: 'error', text: `委派失败: ${view.error}` })
         continue
@@ -168,10 +173,11 @@ function formatForegroundBudgetElapsed(
   pending: Set<string>,
   results: Map<string, FormattedDelegateResult>,
 ): DelegateWaitLoopResult {
-  const completed = jobIds.filter((id) => !pending.has(id))
+  const handoffs = jobIds.filter(id => results.get(id)?.kind === 'handoff')
+  const completed = jobIds.filter((id) => !pending.has(id) && results.get(id)?.kind !== 'handoff')
   const pendingIds = jobIds.filter((id) => pending.has(id))
   const lines = [
-    `前台安全等待窗口已到: ${completed.length} 已完成 / ${pendingIds.length} 仍在运行。`,
+    `前台安全等待窗口已到: ${completed.length} 已完成 / ${pendingIds.length} 仍在运行。${handoffs.length ? ` ${handoffs.length} 项仅交接状态（非子任务完成）。` : ''}`,
     '已主动退出本次 Bash,避免 Cursor 把长命令改挂到无法感知 delegate 终态的 TaskOutput。',
   ]
   if (completed.length > 0) {
@@ -181,6 +187,7 @@ function formatForegroundBudgetElapsed(
       lines.push(`- ${id}`, result?.text ?? '(无输出)')
     }
   }
+  if (handoffs.length) lines.push('', '### 交接状态（不再续等）', ...handoffs.flatMap(id => [`- ${id}`, results.get(id)!.text]))
   lines.push(
     '',
     '### 仍在运行',
@@ -208,13 +215,14 @@ function formatCollected(
   }
   const sections = jobIds.map((id, i) => {
     const r = results.get(id)
-    const mark = !r ? '…' : r.kind === 'error' ? '❌' : '✅'
+    const mark = !r ? '…' : r.kind === 'error' ? '❌' : r.kind === 'handoff' ? '↪' : '✅'
     const body = r?.text ?? '(无输出)'
     return [`### ${i + 1}. ${mark} ${id}`, body].join('\n')
   })
   const okCount = jobIds.filter((id) => results.get(id)?.kind === 'ok').length
-  const failCount = jobIds.length - okCount
-  return [`委派等待 ${jobIds.length} 个作业: ${okCount} 成功 / ${failCount} 失败。`, '', sections.join('\n\n')].join(
+  const handoffCount = jobIds.filter(id => results.get(id)?.kind === 'handoff').length
+  const failCount = jobIds.length - okCount - handoffCount
+  return [`委派等待 ${jobIds.length} 个作业: ${okCount} 成功 / ${failCount} 失败。${handoffCount ? ` ${handoffCount} 项仅交接状态（非子任务成功）。` : ''}`, '', sections.join('\n\n')].join(
     '\n',
   )
 }
