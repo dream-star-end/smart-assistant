@@ -20,7 +20,7 @@ const gw=new Gateway({config:{version:1,gateway:{bind:'127.0.0.1',port:0,accessT
 ;(gw as any)._delegateJobs=jobs
 assert.equal((gw as any).sessions.getByKey(session),undefined)
 const requests:Array<{path:string;status:number}>=[]
-const server=createServer((req,res)=>{res.on('finish',()=>requests.push({path:req.url||'',status:res.statusCode}));void(gw as any).handleHttp(req,res).catch((e:Error)=>{process.stderr.write(String(e));process.exitCode=1;res.destroy()})})
+const server=createServer((req,res)=>{res.on('finish',()=>requests.push({path:req.url||'',status:res.statusCode}));try{(gw as any).handleHttp(req,res)}catch(e){process.stderr.write(String(e));process.exitCode=1;res.destroy()}})
 await new Promise<void>(r=>server.listen(0,'127.0.0.1',r))
 const tokenFile=join(dir,'gateway-token'),contextFile=join(dir,'gateway-context')
 writeFileSync(tokenFile,token,{mode:0o600})
