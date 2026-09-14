@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 // Private test transport: original pg protocol over the authorized host channel.
 // No SQL/result RPC, listeners, install, service or production config changes.
 import { Duplex } from 'node:stream';
@@ -38,25 +37,36 @@ export class HostPgWire extends Duplex {
     ref() { this.child?.ref(); return this; }
     unref() { this.child?.unref(); return this; }
 }
+/** Self-contained so the SAME proof runs inside the host keeper before READY.
+ * A wrapper process/printed marker alone is not proof: test-mutex may fallback.
+ * No DB access; only the original ancestor's held FD and kernel lock are read. */
+export function assertCommercialMutexOwner(load: NodeRequire): void {
+    const fs = load('node:fs');
+    const expected = fs.statSync('/var/lock/oc-test-commercial.lock', { bigint: true });
+    let pid = process.ppid;
+    while (pid > 1) {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const command: string[] = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+        if (command.some(v => v.endsWith('/test-mutex.sh')) && command.includes('commercial')) {
+            const held = fs.statSync(`/proc/${pid}/fd/9`, { bigint: true });
+            const fd = fs.readFileSync(`/proc/${pid}/fdinfo/9`, 'utf8');
+            if (held.dev !== expected.dev || held.ino !== expected.ino ||
+                !/lock:.*FLOCK\s+ADVISORY\s+WRITE/.test(fd)) {
+                throw Error('commercial ancestor lacks the original inode kernel lock');
+            }
+            return;
+        }
+        pid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+    }
+    throw Error('PG test requires original test-mutex.sh commercial kernel owner');
+}
 export async function holdCommercialMutex() {
     if (process.env.OC_RECEIPT_TEST_HOST_PG !== '1') {
-        // Do not trust a caller's boolean env flag: prove a live ancestor's actual FD lock.
-        let pid = process.ppid, found = false;
-        while (pid > 1) {
-            const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-            const command = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
-            if (command.some(v => v.endsWith('/test-mutex.sh')) && command.includes('commercial')) {
-                const fd = readFileSync(`/proc/${pid}/fdinfo/9`, 'utf8');
-                assert.match(fd, /lock:.*FLOCK\s+ADVISORY\s+WRITE/, 'commercial ancestor does not hold original kernel lock');
-                found = true;
-                break;
-            }
-            pid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
-        }
-        assert.ok(found, 'direct PG test must run under original test-mutex.sh commercial');
+        assertCommercialMutexOwner(require);
         return async () => { };
     }
-    const child = spawn('host', ["cd /opt/openclaude/openclaude-v5-selfhost && OC_TEST_MUTEX_TIMEOUT=300 bash scripts/test-mutex.sh commercial " + quote("node -e " + quote("process.stdout.write('MUTEX_READY\\n');process.stdin.resume();"))], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const keeper = `try { (${assertCommercialMutexOwner.toString()})(require);process.stdout.write('MUTEX_READY\\n');process.stdin.resume(); } catch (error) { process.stdout.write('MUTEX_PROOF_FAILED: '+String(error)+'\\n');process.exitCode=1; }`;
+    const child = spawn('host', ["cd /opt/openclaude/openclaude-v5-selfhost && OC_TEST_MUTEX_TIMEOUT=300 bash scripts/test-mutex.sh commercial " + quote("node -e " + quote(keeper))], { stdio: ['pipe', 'pipe', 'pipe'] });
     let log = '';
     child.stderr.on('data', (b: Buffer) => { log += b; });
     const closed = new Promise(r => child.once('close', (code: number | null) => r(code)));

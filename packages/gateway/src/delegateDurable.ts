@@ -30,7 +30,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 7
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 8
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -582,6 +582,7 @@ export class DelegateDurableDb {
       if (current < 5) this.db.exec(DDL_V5)
       if (current < 6) this.db.exec(DDL_V6)
       if (current < 7) this.db.exec(DDL_V7)
+      if (current < 8) this.db.exec(`CREATE INDEX idx_delegate_user_active ON delegate_jobs(callback_origin_user_id,state) WHERE retired_at IS NULL`)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply.immediate()
@@ -946,6 +947,20 @@ export class DelegateDurableDb {
     return this.db.prepare(`UPDATE delegate_failure_inbox SET ack_at=COALESCE(ack_at, @now)
       WHERE user_id=@userId AND job_id=@jobId AND generation=@generation
       RETURNING job_id`).get({ userId, jobId, generation, now }) !== undefined
+  }
+
+  /** Current-user aggregate only; never reads retained result_json. */
+  userSummary(userId: string): { running: number; queued: number; unacknowledgedFailures: number } {
+    if (!userId.trim()) throw new Error('delegate summary user required')
+    return this.transaction(() => {
+      const jobs = this.db.prepare(`SELECT state, count(*) AS n FROM delegate_jobs
+        WHERE callback_origin_user_id=? AND retired_at IS NULL AND state IN ('running','queued')
+        GROUP BY state`).all(userId) as Array<{ state: string; n: number }>
+      const inbox = this.db.prepare(`SELECT count(*) AS n FROM delegate_failure_inbox
+        WHERE user_id=? AND ack_at IS NULL`).get(userId) as { n: number }
+      return { running: jobs.find(row => row.state === 'running')?.n ?? 0,
+        queued: jobs.find(row => row.state === 'queued')?.n ?? 0, unacknowledgedFailures: inbox.n }
+    })
   }
 
   casDelete(expected: {

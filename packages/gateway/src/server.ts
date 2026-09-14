@@ -1,3 +1,4 @@
+import { DELEGATE_USER_PREFIX, handleDelegateUserHttp } from './delegateUserHttp.js'
 import { homedir as receiptHome } from 'node:os'
 import { ReceiptCandidateLifecycle, receiptCandidateDeletionRef, receiptCandidateDeletionKey, type ReceiptCandidateDeletionRef, type ReceiptCandidateScope } from '@openclaude/storage/receiptCandidateLifecycle'
 import { checkedReceiptToolOwner as checkedCandidateOwner, receiptLocatorPartition } from './receiptOwnerCapability.js'
@@ -6368,6 +6369,18 @@ export class Gateway {
       this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    if (url.pathname.startsWith(DELEGATE_USER_PREFIX)) {
+      void handleDelegateUserHttp(req, res, url, {
+        user: () => {
+          const principal = this.receiptHttpPrincipal(req)
+          return principal?.kind === 'user' ? principal.userId : null
+        },
+        store: () => this._delegateJobs,
+        readBody: request => this.readBody(request),
+        send: (response, status, body) => this.sendJson(response, status, body),
+      }).catch(err => this.sendInternalError(res, err))
       return
     }
     // Receipt authority is behind ordinary HTTP auth AND a signed parent context.

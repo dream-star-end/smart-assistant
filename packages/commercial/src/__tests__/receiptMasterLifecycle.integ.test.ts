@@ -6,7 +6,9 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { assertCommercialMutexOwner, holdCommercialMutex } from './fixtures/receiptMasterPgTransport.fixture.js';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,6 +43,26 @@ test('receipt fixture cleanup kills only its recorded detached descendants and r
     tracked.stop();
     await terminateOwnedTree(child, tracked.known, 100);
   }
+});
+
+test('receipt commercial mutex requires actual original inode before ready, without PG', { timeout: 45_000 }, async () => {
+  if (process.env.OC_RECEIPT_TEST_HOST_PG === '1') {
+    const quote = (s: string) => "'" + s.replaceAll("'", "'\"'\"'") + "'";
+    const child = spawnSync('host', ['node -e ' + quote(`(${assertCommercialMutexOwner.toString()})(require);process.stdout.write('MUTEX_READY');`)],
+      { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(child.status, 1, child.stderr);
+    assert.equal(child.stdout.includes('MUTEX_READY'), false, 'unlocked host never reaches ready');
+    const release = await holdCommercialMutex();
+    await release();
+  } else {
+    assertCommercialMutexOwner(createRequire(import.meta.url));
+  }
+  const fakeFs = {
+    statSync: (path: string) => ({ dev: 1n, ino: path.includes('/fd/') ? 2n : 1n }),
+    readFileSync: (path: string) => path.endsWith('/cmdline') ? 'bash\0scripts/test-mutex.sh\0commercial\0' :
+      path.includes('/fdinfo/') ? 'lock: 1: FLOCK ADVISORY WRITE' : '1 (bash) S 1',
+  };
+  assert.throws(() => assertCommercialMutexOwner((() => fakeFs) as unknown as NodeRequire), /original inode kernel lock/);
 });
 
 async function run(command: string, args: string[], base: string, label: string, env: NodeJS.ProcessEnv) {

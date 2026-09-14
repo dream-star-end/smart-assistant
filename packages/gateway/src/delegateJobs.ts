@@ -390,6 +390,20 @@ export class DelegateJobStore {
     if (this.durable && opts.hydrate !== false) this.hydrateFromDurable()
   }
 
+  /** User-facing durable projection. Missing durability is not an empty inbox. */
+  userFailureInbox(userId: string, opts: Parameters<DelegateDurableDb['listUnacknowledgedFailures']>[1] = {}) {
+    if (!this.durable) throw new Error('delegate durable user surface unavailable')
+    return this.durable.listUnacknowledgedFailures(userId, opts)
+  }
+  userSummary(userId: string) {
+    if (!this.durable) throw new Error('delegate durable user surface unavailable')
+    return this.durable.userSummary(userId)
+  }
+  acknowledgeUserFailure(userId: string, jobId: string, generation: number): boolean {
+    if (!this.durable) throw new Error('delegate durable user surface unavailable')
+    return this.durable.acknowledgeFailure(userId, jobId, generation, this.now())
+  }
+
   get smEnabled(): boolean {
     return this.sm
   }
