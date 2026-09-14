@@ -305,6 +305,7 @@ interface QueuedTurn {
   collabAgentPolicy?: CollabAgentPolicy
   queueTurn?: boolean
   automaticRetryState?: AutomaticRetryState
+  requireNativeResume?: import('./engineAdapter.js').StrictNativeResume
 }
 
 export class PromptQueueRunnerInvariantError extends Error {
@@ -1855,7 +1856,12 @@ export class CodexAppServerRunner extends EventEmitter {
     collabAgentPolicy?: CollabAgentPolicy,
     queueTurn = false,
     automaticRetryState?: AutomaticRetryState,
+    requireNativeResume?: import('./engineAdapter.js').StrictNativeResume,
   ): Promise<void> {
+    if (requireNativeResume && (requireNativeResume.engine !== 'codex' ||
+        typeof requireNativeResume.nativeSessionId !== 'string' || !requireNativeResume.nativeSessionId.trim())) {
+      throw new Error('STRICT_NATIVE_RESUME_INVALID')
+    }
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
       this.spawnEmitted = true
@@ -1872,6 +1878,7 @@ export class CodexAppServerRunner extends EventEmitter {
         collabAgentPolicy,
         queueTurn,
         automaticRetryState,
+        requireNativeResume: requireNativeResume ? Object.freeze({ engine: 'codex', nativeSessionId: requireNativeResume.nativeSessionId }) : undefined,
       })
       void this.drain()
     })
@@ -2018,6 +2025,7 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.requestId,
         turn.collabAgentPolicy,
         turn.automaticRetryState,
+        turn.requireNativeResume,
       )
       turn.resolve()
     } catch (err) {
@@ -3939,6 +3947,7 @@ export class CodexAppServerRunner extends EventEmitter {
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
     automaticRetryState?: AutomaticRetryState,
+    requireNativeResume?: import('./engineAdapter.js').StrictNativeResume,
   ): Promise<void> {
     const startedAt = Date.now()
     this.activeRequestId = requestId
@@ -3999,7 +4008,13 @@ export class CodexAppServerRunner extends EventEmitter {
         await this.shutdown()
         this.shuttingDown = false
       }
+      if (requireNativeResume && this.threadId !== requireNativeResume.nativeSessionId) {
+        throw new Error('STRICT_NATIVE_RESUME_IDENTITY_MISMATCH')
+      }
       await this.ensureSpawned(repoSnap, effectiveCwd)
+      if (requireNativeResume && this.threadId !== requireNativeResume.nativeSessionId) {
+        throw new Error('STRICT_NATIVE_RESUME_IDENTITY_MISMATCH')
+      }
       this.refreshDelegateContext()
 
       // Each fresh app-server proc must explicitly attach a thread before
@@ -4009,7 +4024,11 @@ export class CodexAppServerRunner extends EventEmitter {
       //   2. first turn after construction with resumeSessionId (thread/resume)
       //   3. first turn after proc respawn (shutdown / crash) — re-attach via
       //      thread/resume against the captured threadId.
-      if (!this.attached) {
+      if (!this.attached || requireNativeResume) {
+        // A strict re-attach can fail on an already attached runner. Revoke the
+        // old attachment before attempting it so later ordinary turns cannot
+        // skip resume against stale native state.
+        this.attached = false
         if (!this.threadId) {
           await this._startNewThread(effectiveCwd)
         } else {
@@ -4037,6 +4056,7 @@ export class CodexAppServerRunner extends EventEmitter {
             // schema drift, etc.) re-throws so the outer catch surfaces it
             // as ok=false rather than masking it with a fresh thread.
             if (!isMissingRolloutError(err)) throw err
+            if (requireNativeResume) throw new Error(`STRICT_NATIVE_RESUME_UNAVAILABLE: ${(err as Error).message}`)
             const staleThreadId = this.threadId
             const fallback = staleThreadId
               ? this.opts.resolveResumeFallback?.(staleThreadId)

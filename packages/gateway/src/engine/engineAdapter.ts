@@ -101,8 +101,12 @@ export interface AutomaticRetryState {
 
 /** 一次 turn 的入参。spec 契约字段之外,M0 为保 CCB 成本 delta 基线逐字节不变,
  *  额外携带 sessionTotals ref / toolUseIdToName(spec 明示允许 totals ref 方案)。 */
+/** Retry-only execution constraint. Support is not advertised until the caller's
+ * source/provider/artifact proof and the concrete adapter both enforce it. */
+export type StrictNativeResume = Readonly<{ engine: 'codex'; nativeSessionId: string }>
 export interface TurnParams {
   input: string | Array<{ type: string; [k: string]: unknown }>
+  requireNativeResume?: StrictNativeResume
   /** PG coordinator-originated turn. Adapters may use this to enforce that
    * no hidden runner-local queue forms behind the platform claim. */
   queueTurn?: boolean
