@@ -20,6 +20,7 @@ import {
   type DelegateJobState,
 } from '@openclaude/protocol'
 import type { DelegateDurableDb, DurableJobRecord, DelegateReceiptContext } from './delegateDurable.js'
+import type { DelegateRetrySource } from './delegateRetrySource.js'
 
 export const DEFAULT_DELEGATE_JOB_TTL_MS = 2 * 60 * 60_000
 export const MIN_DELEGATE_JOB_TTL_MS = 60_000
@@ -155,6 +156,7 @@ export type DelegateJobWaitView =
     }
 
 export type DelegateCreateMeta = {
+  retrySource?: DelegateRetrySource
   deliveryReceipt?: DelegateReceiptContext
   sessionKey?: string
   parentSessionKey?: string
@@ -416,6 +418,7 @@ export class DelegateJobStore {
     agentId: string,
     meta?: DelegateCreateMeta,
   ): { jobId: string; reused?: boolean } | { error: 'capacity' } {
+    if (meta?.retrySource && !this.durable) throw new Error('delegate retry source requires durable store')
     if (meta?.deliveryReceipt && !this.acceptsDeliveryReceipts) throw new Error('delegate receipt admission disabled')
     this.sweep()
     const idempotencyKey =
@@ -466,6 +469,7 @@ export class DelegateJobStore {
       const outcome = this.durable.insertCreate(this.toDurable(entry), this.maxJobs, {
         failureInbox: (this.failureInbox && entry.kind === 'delegate') || !!meta?.deliveryReceipt,
         deliveryReceipt: meta?.deliveryReceipt,
+        retrySource: meta?.retrySource,
       })
       if ('error' in outcome) return { error: 'capacity' }
       if ('reused' in outcome) {

@@ -15,6 +15,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
 import { effectiveDelegateOutcome } from './delegateOutcome.js'
+import { checkedDelegateRetrySource, type DelegateRetrySource } from './delegateRetrySource.js'
 import type {
   DelegateCallback,
   DelegateCallbackState,
@@ -30,7 +31,29 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 8
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 9
+
+// Additive local SQLite schema; no FK/TTL cascade from runtime jobs to retry identity.
+const DDL_V9 = `
+CREATE TABLE delegate_retry_source (
+  job_id TEXT NOT NULL, generation INTEGER NOT NULL, user_id TEXT NOT NULL,
+  parent_client_session_id TEXT, parent_session TEXT, child_session TEXT, target_agent_id TEXT,
+  metadata_json TEXT, created_at INTEGER NOT NULL, retired_at INTEGER,
+  PRIMARY KEY(job_id,generation)
+);
+CREATE INDEX idx_delegate_retry_source_parent ON delegate_retry_source(user_id,parent_client_session_id)
+  WHERE retired_at IS NULL;
+CREATE TABLE delegate_retry_parent_fence (
+  user_id TEXT NOT NULL, client_session_id TEXT NOT NULL, deleted_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id,client_session_id)
+);
+CREATE TABLE delegate_retry_action (
+  user_id TEXT NOT NULL, source_job_id TEXT NOT NULL, generation INTEGER NOT NULL,
+  action_id TEXT NOT NULL, target_job_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL,
+  created_at INTEGER NOT NULL, dispatched_at INTEGER, terminal_code TEXT,
+  PRIMARY KEY(user_id,source_job_id,generation,action_id)
+);
+`
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -583,6 +606,7 @@ export class DelegateDurableDb {
       if (current < 6) this.db.exec(DDL_V6)
       if (current < 7) this.db.exec(DDL_V7)
       if (current < 8) this.db.exec(`CREATE INDEX idx_delegate_user_active ON delegate_jobs(callback_origin_user_id,state) WHERE retired_at IS NULL`)
+      if (current < 9) this.db.exec(DDL_V9)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply.immediate()
@@ -654,7 +678,7 @@ export class DelegateDurableDb {
   insertCreate(
     record: DurableJobRecord,
     maxJobs: number,
-    opts: { failureInbox?: boolean; deliveryReceipt?: DelegateReceiptContext } = {},
+    opts: { failureInbox?: boolean; deliveryReceipt?: DelegateReceiptContext; retrySource?: DelegateRetrySource } = {},
   ): { ok: true } | { error: 'capacity' } | { reused: DurableJobRecord } {
     this.throwIfInjectedFailure()
     return this.transaction(() => {
@@ -662,15 +686,24 @@ export class DelegateDurableDb {
         const hit = this.findByIdempotencyKey(record.idempotencyKey)
         if (hit) {
           this.checkReceiptReuse(hit, record, opts.deliveryReceipt)
+          this.checkRetrySourceReuse(hit, opts.retrySource)
           return { reused: hit }
         }
       }
       const n = this.countNonTerminal()
       if (n >= maxJobs) return { error: 'capacity' as const }
-      if ((opts.failureInbox || opts.deliveryReceipt) && (!record.callbackOriginUserId?.trim() || !record.parentSessionKey?.trim())) {
+      if ((opts.failureInbox || opts.deliveryReceipt || opts.retrySource) && (!record.callbackOriginUserId?.trim() || !record.parentSessionKey?.trim())) {
         throw new Error('delegate failure inbox requires verified owner and parent')
       }
       const receipt = opts.deliveryReceipt ? checkedReceiptContext(opts.deliveryReceipt) : undefined
+      const source = opts.retrySource ? checkedDelegateRetrySource(opts.retrySource) : undefined
+      if (source && (source.userId !== record.callbackOriginUserId || source.parentSessionKey !== record.parentSessionKey ||
+          source.childSessionKey !== record.sessionKey || source.targetAgentId !== record.agentId)) {
+        throw new Error('delegate retry source/job mismatch')
+      }
+      if (source && this.isRetryParentFenced(source.userId, source.parentClientSessionId)) {
+        throw new Error('delegate retry source parent deleted')
+      }
       if (receipt && (record.kind !== 'delegate' || record.callback !== 'stdout-wait' || record.callbackState !== 'none')) {
         throw new Error('receipt admission requires a new stdout-wait delegate')
       }
@@ -682,6 +715,7 @@ export class DelegateDurableDb {
           const hit = this.findByIdempotencyKey(record.idempotencyKey)
           if (hit) {
             this.checkReceiptReuse(hit, record, opts.deliveryReceipt)
+            this.checkRetrySourceReuse(hit, source)
             return { reused: hit }
           }
         }
@@ -689,7 +723,13 @@ export class DelegateDurableDb {
       }
       // Only an INSERT collision is reusable. An auxiliary write failure must
       // roll back, not find this transaction's own row and misreport reuse.
-      if (opts.failureInbox || receipt) {
+      if (source) {
+        this.db.prepare(`INSERT INTO delegate_retry_source
+          (job_id,generation,user_id,parent_client_session_id,parent_session,child_session,target_agent_id,metadata_json,created_at)
+          VALUES (?,?,?,?,?,?,?,?,?)`).run(record.id, record.generation, source.userId, source.parentClientSessionId,
+            source.parentSessionKey, source.childSessionKey, source.targetAgentId, JSON.stringify(source), record.createdAt)
+      }
+      if (opts.failureInbox || receipt || source) {
         this.db.prepare('UPDATE delegate_jobs SET failure_inbox_enabled=1 WHERE job_id=?').run(record.id)
         this.persistFailureInbox({ ...toRow(record), failure_inbox_enabled: 1 })
       }
@@ -700,6 +740,33 @@ export class DelegateDurableDb {
       }
       return { ok: true as const }
     })
+  }
+
+  /** No fallback to job/result rows or directory scans after TTL or missing provenance. */
+  getRetrySource(userId: string, jobId: string, generation: number): DelegateRetrySource | undefined {
+    const row = this.db.prepare(`SELECT metadata_json FROM delegate_retry_source
+      WHERE user_id=? AND job_id=? AND generation=? AND retired_at IS NULL`)
+      .get(userId, jobId, generation) as { metadata_json: string | null } | undefined
+    if (!row?.metadata_json) return undefined
+    const source = checkedDelegateRetrySource(JSON.parse(row.metadata_json))
+    if (source.userId !== userId || this.isRetryParentFenced(userId, source.parentClientSessionId)) return undefined
+    return source
+  }
+
+  private isRetryParentFenced(userId: string, clientSessionId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM delegate_retry_parent_fence WHERE user_id=? AND client_session_id=?')
+      .get(userId, clientSessionId)
+  }
+
+  private checkRetrySourceReuse(existing: DurableJobRecord, incoming?: DelegateRetrySource): void {
+    const row = this.db.prepare('SELECT metadata_json,retired_at FROM delegate_retry_source WHERE job_id=? AND generation=?')
+      .get(existing.id, existing.generation) as { metadata_json: string | null; retired_at: number | null } | undefined
+    if (!row && !incoming) return
+    if (!row || row.retired_at !== null || !incoming ||
+        JSON.stringify(checkedDelegateRetrySource(incoming)) !== row.metadata_json ||
+        this.isRetryParentFenced(incoming.userId, incoming.parentClientSessionId)) {
+      throw new Error('delegate retry source idempotency binding mismatch')
+    }
   }
 
   /**

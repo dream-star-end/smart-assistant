@@ -1,3 +1,4 @@
+import type { DelegateRetrySource } from './delegateRetrySource.js'
 import { DELEGATE_USER_PREFIX, handleDelegateUserHttp } from './delegateUserHttp.js'
 import { homedir as receiptHome } from 'node:os'
 import { ReceiptCandidateLifecycle, receiptCandidateDeletionRef, receiptCandidateDeletionKey, type ReceiptCandidateDeletionRef, type ReceiptCandidateScope } from '@openclaude/storage/receiptCandidateLifecycle'
@@ -13906,6 +13907,56 @@ export class Gateway {
     }
   }
 
+  /** Real caller provenance, captured before resume/capacity reservation. No body identity. */
+  private async _captureDelegateRetrySource(
+    req: IncomingMessage, contextToken: string, targetAgentId: string,
+    model: string | undefined, callerAgentId: string | undefined,
+  ): Promise<{ source?: Omit<DelegateRetrySource, 'childSessionKey'>; error?: { status: number; message: string }; revalidate?: () => { status: number; message: string } | undefined }> {
+    const denied = (status: number, message: string) => ({ error: { status, message } })
+    const claims = verifyDelegateContextToken(contextToken)
+    const principal = this.receiptHttpPrincipal(req)
+    if (!claims || !principal) return denied(401, 'delegate source authority expired')
+    const parent = this.sessions?.getByKey(claims.sessionKey)
+    // Historical callers without live, attributable metadata remain non-retryable.
+    if (!parent || !parent.userId?.trim() || !parent._currentTurnKey || parent.agentId !== callerAgentId) return {}
+    const userId = parent.userId
+    if (principal.kind === 'user' && principal.userId !== userId) return denied(403, 'delegate source user mismatch')
+    if ('turnKey' in claims && claims.turnKey !== parent._currentTurnKey) return denied(409, 'delegate source turn changed')
+    const chain: AgentSession[] = []
+    const visited = new Set<string>()
+    let cursor: AgentSession | undefined = parent
+    while (cursor && chain.length < 5) {
+      if (visited.has(cursor.sessionKey) || cursor.userId !== userId) return {}
+      visited.add(cursor.sessionKey); chain.push(cursor)
+      if (cursor.channel === 'webchat') break
+      if (cursor.channel !== 'delegate' || !cursor.parentSessionKey) return {}
+      cursor = this.sessions?.getByKey(cursor.parentSessionKey)
+    }
+    const root = chain.at(-1)
+    if (!root || root.channel !== 'webchat' || !root.peerId || root.peerId === 'unknown') return {}
+    const project = (s: AgentSession) => JSON.stringify([s.sessionKey, s.agentId, s.userId,
+      s.channel, s.peerId, s.parentSessionKey, s._currentTurnKey])
+    const snapshots = chain.map(project)
+    const clientSessionId = root.peerId
+    const lifecycle = await this._receiptClientState(root)
+    const revalidate = () => {
+      const finalClaims = verifyDelegateContextToken(contextToken)
+      const finalPrincipal = this.receiptHttpPrincipal(req)
+      if (!finalClaims || !finalPrincipal || finalPrincipal.kind !== principal.kind ||
+          (finalPrincipal.kind === 'user' && finalPrincipal.userId !== userId)) return denied(401, 'delegate source authority expired').error
+      if (chain.some((s, i) => this.sessions?.getByKey(s.sessionKey) !== s || project(s) !== snapshots[i])) {
+        return denied(409, 'delegate source parent changed').error
+      }
+      return undefined
+    }
+    const error = revalidate()
+    if (error) return { error }
+    if (lifecycle !== 'active') return denied(lifecycle === 'deleted' ? 409 : 503, 'delegate source session unavailable')
+    return { revalidate, source: Object.freeze({ version: 1, userId, parentSessionKey: parent.sessionKey,
+      parentClientSessionId: clientSessionId, originSessionKey: root.sessionKey,
+      targetAgentId, sourceAgentId: parent.agentId, depth: claims.depth, model: model ?? null }) }
+  }
+
   private async handleDelegateTask(
     req: IncomingMessage,
     res: ServerResponse,
@@ -14004,6 +14055,14 @@ export class Gateway {
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
     // 拒绝路径不得产生副作用（不 create job、不 spawn、不 persist intent）。
+    let retrySourceParent: Omit<DelegateRetrySource, 'childSessionKey'> | undefined
+    let revalidateRetrySource: (() => { status: number; message: string } | undefined) | undefined
+    if (parsed.async === true && isDelegateSmEnabled() && isDelegateDurableEffective() && typeof contextRaw === 'string') {
+      const capture = await this._captureDelegateRetrySource(req, contextRaw, targetAgentId, modelNorm.model, callerExecutionId)
+      if (capture.error) return this.sendError(res, capture.error.status, capture.error.message)
+      retrySourceParent = capture.source
+      revalidateRetrySource = capture.revalidate
+    }
     let receiptEnrollment: DelegateReceiptContext | undefined
     let receiptUserId: string | undefined
     if (parsed.receipt !== undefined) {
@@ -14041,6 +14100,8 @@ export class Gateway {
         parent: { agentId: consumer.agentId, owner: checkedReceiptToolOwner(consumer) } }
       receiptUserId = consumer.userId
     }
+    const sourceError = revalidateRetrySource?.()
+    if (sourceError) return this.sendError(res, sourceError.status, sourceError.message)
     const idempotencyKey = parseDelegateIdempotencyKey(parsed, req.headers)
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
       resumeSessionKey: parsed.resumeSessionKey,
@@ -14129,6 +14190,7 @@ export class Gateway {
       try {
         created = store.create(targetAgentId, {
           ...(receiptEnrollment ? { deliveryReceipt: receiptEnrollment } : {}),
+          ...(retrySourceParent ? { retrySource: { ...retrySourceParent, childSessionKey: resume.sessionKey } } : {}),
           sessionKey: resume.sessionKey,
           parentSessionKey,
           queued: sm,
@@ -14139,7 +14201,7 @@ export class Gateway {
             ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
             : undefined,
           callbackOriginSessionKey: callbackTarget?.sessionKey,
-          callbackOriginUserId: receiptUserId ?? callbackTarget?.userId,
+          callbackOriginUserId: receiptUserId ?? retrySourceParent?.userId ?? callbackTarget?.userId,
         })
       } catch (error) {
         // No runner owns this request yet. In particular, the durable receipt
