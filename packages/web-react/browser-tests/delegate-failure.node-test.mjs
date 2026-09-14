@@ -19,8 +19,9 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
   const cssDir = mkdtempSync(join(tmpdir(), "delegate-browser-css-"));
   let browser, api;
   const selected = process.env.OC_D15_BROWSER_GROUP;
+  let executedJourneys = 0;
   const journey = async (name, fn) => {
-    if (!selected || name.startsWith(selected)) await t.test(name, fn);
+    if (!selected || name.startsWith(selected)) { executedJourneys++; await t.test(name, fn); }
   };
   try {
     const negative = process.env.OC_D15_BROWSER_NEGATIVE === "skip-ack";
@@ -91,7 +92,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       await badge.filter({ hasText: "50 失败" }).waitFor(); await badge.click(); await rows.first().waitFor();
       assert.equal(await dialog.locator(`li[data-job-id="${id}"]`).count(), 0);
     });
-    if (negative) return;
+    if (negative) { assert.ok(executedJourneys > 0, "browser selector must execute a business journey"); return; }
 
     await journey("accepted response loss + busy hint: explicit deterministic intent replay has one persisted target, never ACK", async () => {
       const id = await rows.first().getAttribute("data-job-id");
@@ -260,6 +261,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       } catch (error) { t.diagnostic(JSON.stringify({ body: (await p.locator("body").innerText()).slice(-3500), appErrors, reads: api.sessionReads, writes: api.sessionWrites })); throw error; }
       finally { await appContext.close(); }
     });
+    assert.ok(executedJourneys > 0, "browser selector must execute a business journey");
     assert.deepEqual(errors, []);
     assert.deepEqual(external, [], "no request may escape private loopback fixture");
     t.diagnostic("real HTTP + original SQLite projection/ACK/action replay; native eligibility, principal auth and lifecycle are fixture seams; no production/master/model claim");
