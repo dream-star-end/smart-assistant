@@ -185,8 +185,14 @@ test('two coordinator instances competing for input admission produce one real i
   } finally { other.close() }
 })
 
-test('v6 upgrade only adds nullable owner fields; the coordinator refuses a not-yet-migrated DB', t => {
+test('v6 receipt contents survive additive migrations; the coordinator refuses a not-yet-migrated DB', t => {
   const f = fixture(t)
+  // Reconstruct the actual private v6 shape, not just its version header over
+  // later tables/indexes. Production consumers still never downgrade or migrate.
+  const identityTriggers = f.raw.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'identity_v10_%'").all() as { name: string }[]
+  for (const { name } of identityTriggers) f.raw.exec(`DROP TRIGGER "${name}"`)
+  f.raw.exec(`DROP INDEX idx_delegate_user_active;
+    DROP TABLE delegate_retry_action; DROP TABLE delegate_retry_source; DROP TABLE delegate_retry_parent_fence;`)
   f.raw.exec(`ALTER TABLE delegate_delivery_receipt DROP COLUMN owner_token;
     ALTER TABLE delegate_delivery_receipt DROP COLUMN parent_owner_epoch;
     ALTER TABLE delegate_delivery_receipt DROP COLUMN input_proof; PRAGMA user_version=6;`)
