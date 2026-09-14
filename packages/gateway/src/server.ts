@@ -2879,9 +2879,16 @@ export class Gateway {
         if (observed.state === 'deleted') deleted.push(ref)
       }
       if (!deleted.length) return { state: 'not_applicable' }
+      // UI/source retirement must not depend on candidate files, or be blocked
+      // by an unrelated malformed manifest. Each SQL-confirmed ref is isolated.
+      let sourcePending = false
+      for (const ref of deleted) {
+        try { if (this._delegateJobs?.hasDurableUserSurface) this._delegateJobs.fenceDeletedRetryParent(ref) }
+        catch { sourcePending = true }
+      }
       const revokePending = this._revokeDeletedReceiptParents(deleted)
       const result = await this.receiptCandidates().fenceDeleted(deleted)
-      const pending = revokePending > 0 || result.pending > 0
+      const pending = sourcePending || revokePending > 0 || result.pending > 0
       if (pending) this._armReceiptCandidateRetry()
       return { state: pending ? 'pending' : 'complete' }
     } catch (error) {
@@ -2890,15 +2897,43 @@ export class Gateway {
       return { state: 'pending' }
     }
   }
+  /** Durable scopes include ordinary delegates with no candidate directory.
+   * Missing/foreign/SQL errors remain pending; only exact SQL-deleted rows fence.
+   * HTTP callers revalidate their principal after EVERY lifecycle await. */
+  private async _reconcileDelegateUserLifecycle(userId?: string, authorize?: () => void): Promise<{ complete: boolean; hasRefs: boolean }> {
+    const store = this._delegateJobs
+    if (!store?.hasDurableUserSurface) return { complete: true, hasRefs: false }
+    const discovered = store.retryLifecycleRefs(userId)
+    let pending = discovered.pending > 0
+    for (const ref of discovered.items) {
+      try {
+        const [observed] = await classifyClientSessions([{ userId: ref.userId, sessionId: ref.clientSessionId }])
+        authorize?.()
+        if (!observed || observed.userId !== ref.userId || observed.sessionId !== ref.clientSessionId ||
+            !['active', 'deleted'].includes(observed.state)) { pending = true; continue }
+        if (observed.state === 'deleted') store.fenceDeletedRetryParent(ref)
+      } catch (error) {
+        authorize?.()
+        pending = true
+        this.log.warn('delegate user lifecycle deferred', undefined, error as Error)
+      }
+    }
+    if (pending || discovered.items.length) this._armReceiptCandidateRetry()
+    return { complete: !pending, hasRefs: discovered.items.length > 0 }
+  }
   /** Independent of job/notifier existence: enrolled ordinary Bash has no job. */
   private _sweepReceiptCandidates(): Promise<void> {
     if (this._receiptCandidateSweep) return this._receiptCandidateSweep
     const work = (async () => {
       let pending = false
       try {
+        const ui = await this._reconcileDelegateUserLifecycle()
+        pending = !ui.complete || ui.hasRefs
+      } catch (error) { pending = true; this.log.warn('delegate user discovery deferred', undefined, error as Error) }
+      try {
         const store = this.receiptCandidates()
         const discovered = store.snapshots()
-        pending = discovered.pending > 0
+        pending ||= discovered.pending > 0
         for (const snapshot of discovered.items) {
           const partition = snapshot.partition
           try {
@@ -3082,6 +3117,7 @@ export class Gateway {
     try {
       if (isDelegateSmEnabled()) {
         const store = this._ensureDelegateJobStore()
+        await this._reconcileDelegateUserLifecycle()
         if (!isDelegateDurableEffective()) {
           await restoreDelegateJobSnapshots(store)
         }
@@ -6380,6 +6416,7 @@ export class Gateway {
           return principal?.kind === 'user' ? principal.userId : null
         },
         store: () => this._delegateJobs,
+        reconcileLifecycle: async (userId, authorize) => (await this._reconcileDelegateUserLifecycle(userId, authorize)).complete,
         readBody: request => this.readBody(request),
         send: (response, status, body) => this.sendJson(response, status, body),
       }).catch(err => this.sendInternalError(res, err))
@@ -11279,6 +11316,7 @@ export class Gateway {
     })
     this._delegateJobs = store
     if (durableOn) {
+      this._armReceiptCandidateRetry()
       const queueWaitMs = parseDelegateQueueWaitMs()
       const summary = reconcileDelegateJobsOnBoot(store, {
         isChildAlive: (job) => this._delegateChildAlive(job.sessionKey),

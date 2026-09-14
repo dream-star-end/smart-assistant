@@ -8,6 +8,7 @@ export type DelegateUserHttpDeps = {
   user: () => string | null
   store: () => DelegateJobStore | undefined
   readBody: (req: IncomingMessage) => Promise<string>
+  reconcileLifecycle: (userId: string, authorize: () => void) => Promise<boolean>
   send: (res: ServerResponse, status: number, value: unknown) => void
 }
 function cursor(raw: string | null): DelegateFailureCursor | undefined {
@@ -52,6 +53,10 @@ export async function handleDelegateUserHttp(req: IncomingMessage, res: ServerRe
   const store = deps.store()
   if (!store) return error(503, 'delegate_user_surface_unavailable')
   try {
+    const authorize = () => { if (deps.user() !== userId) throw new Error('delegate user expired') }
+    const complete = await deps.reconcileLifecycle(userId, authorize)
+    if (deps.user() !== userId) return error(401, 'user_authentication_expired')
+    if (!complete) return error(503, 'delegate_user_lifecycle_pending')
     if (ack) {
       const ok = store.acknowledgeUserFailure(userId, ack[1], generation!)
       return ok ? deps.send(res, 200, { version: 1, acknowledged: true }) : error(404, 'not_found')
@@ -64,5 +69,6 @@ export async function handleDelegateUserHttp(req: IncomingMessage, res: ServerRe
         summaryCode: row.summaryCode, summaryText: row.summaryText, failedAt: row.failedAt,
         // Retry is unavailable until the complete durable source/action path is wired.
         retry: { available: false, reason: 'retry_not_ready' } })) })
-  } catch { return error(503, 'delegate_user_surface_unavailable') }
+  } catch { return error(deps.user() !== userId ? 401 : 503,
+    deps.user() !== userId ? 'user_authentication_expired' : 'delegate_user_surface_unavailable') }
 }

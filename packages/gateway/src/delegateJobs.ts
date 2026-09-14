@@ -393,6 +393,15 @@ export class DelegateJobStore {
   }
 
   /** User-facing durable projection. Missing durability is not an empty inbox. */
+  get hasDurableUserSurface(): boolean { return this.durable !== null }
+  retryLifecycleRefs(userId?: string) {
+    if (!this.durable) throw new Error('delegate durable user surface unavailable')
+    return this.durable.retryLifecycleRefs(userId)
+  }
+  fenceDeletedRetryParent(ref: { userId: string; clientSessionId: string }): void {
+    if (!this.durable) throw new Error('delegate durable user surface unavailable')
+    this.durable.fenceDeletedRetryParent(ref, this.now())
+  }
   userFailureInbox(userId: string, opts: Parameters<DelegateDurableDb['listUnacknowledgedFailures']>[1] = {}) {
     if (!this.durable) throw new Error('delegate durable user surface unavailable')
     return this.durable.listUnacknowledgedFailures(userId, opts)

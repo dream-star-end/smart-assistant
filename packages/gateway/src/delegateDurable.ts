@@ -758,6 +758,50 @@ export class DelegateDurableDb {
       .get(userId, clientSessionId)
   }
 
+  /** Enumerate authenticated INSERT columns, never parse metadata or discover nonce directories. */
+  retryLifecycleRefs(userId?: string): { items: Array<{ userId: string; clientSessionId: string }>; pending: number } {
+    const rows = this.db.prepare(`SELECT DISTINCT user_id,parent_client_session_id FROM delegate_retry_source
+      WHERE retired_at IS NULL ${userId === undefined ? '' : 'AND user_id=?'}`)
+      .all(...(userId === undefined ? [] : [userId])) as Array<{ user_id: unknown; parent_client_session_id: unknown }>
+    const items: Array<{ userId: string; clientSessionId: string }> = []
+    let pending = 0
+    for (const row of rows) {
+      if (typeof row.user_id !== 'string' || !row.user_id.trim() ||
+          typeof row.parent_client_session_id !== 'string' || !row.parent_client_session_id.trim()) { pending++; continue }
+      items.push({ userId: row.user_id, clientSessionId: row.parent_client_session_id })
+    }
+    return { items, pending }
+  }
+
+  /** Caller must have just classified this exact owner/ref as SQL-deleted.
+   * Tombstone and removal share the original DB transaction. Retained identity
+   * blocks old writers/replays, without retaining parent/child/metadata payload. */
+  fenceDeletedRetryParent(ref: { userId: string; clientSessionId: string }, now: number): void {
+    if (!ref.userId.trim() || !ref.clientSessionId.trim() || !Number.isSafeInteger(now)) throw new Error('invalid retry deletion identity')
+    this.throwIfInjectedFailure()
+    this.transaction(() => {
+      this.db.prepare(`INSERT INTO delegate_retry_parent_fence VALUES(?,?,?) ON CONFLICT DO NOTHING`)
+        .run(ref.userId, ref.clientSessionId, now)
+      this.db.prepare(`DELETE FROM delegate_failure_inbox WHERE user_id=? AND EXISTS (
+        SELECT 1 FROM delegate_retry_source s WHERE s.job_id=delegate_failure_inbox.job_id
+          AND s.generation=delegate_failure_inbox.generation AND s.user_id=? AND s.parent_client_session_id=?)`)
+        .run(ref.userId, ref.userId, ref.clientSessionId)
+      this.db.prepare(`UPDATE delegate_retry_action SET state='source_deleted',terminal_code='source_deleted'
+        WHERE user_id=? AND EXISTS (SELECT 1 FROM delegate_retry_source s WHERE s.user_id=?
+          AND s.parent_client_session_id=? AND ((s.job_id=source_job_id AND s.generation=delegate_retry_action.generation)
+            OR s.job_id=target_job_id))`).run(ref.userId, ref.userId, ref.clientSessionId)
+      this.db.prepare(`UPDATE delegate_retry_source SET retired_at=COALESCE(retired_at,?),
+        parent_client_session_id=NULL,parent_session=NULL,child_session=NULL,target_agent_id=NULL,metadata_json=NULL
+        WHERE user_id=? AND parent_client_session_id=?`).run(now, ref.userId, ref.clientSessionId)
+    })
+  }
+
+  isRetrySourceRetired(jobId: string, generation: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM delegate_retry_source s WHERE s.job_id=? AND s.generation=?
+      AND (s.retired_at IS NOT NULL OR EXISTS (SELECT 1 FROM delegate_retry_parent_fence f
+        WHERE f.user_id=s.user_id AND f.client_session_id=s.parent_client_session_id))`).get(jobId, generation)
+  }
+
   private checkRetrySourceReuse(existing: DurableJobRecord, incoming?: DelegateRetrySource): void {
     const row = this.db.prepare('SELECT metadata_json,retired_at FROM delegate_retry_source WHERE job_id=? AND generation=?')
       .get(existing.id, existing.generation) as { metadata_json: string | null; retired_at: number | null } | undefined
@@ -956,6 +1000,7 @@ export class DelegateDurableDb {
   private persistFailureInbox(row: Record<string, unknown>): void {
     if (row.failure_inbox_enabled !== 1) return
     const record = fromRow(row)
+    if (this.isRetrySourceRetired(record.id, record.generation)) return
     const outcome = effectiveDelegateOutcome(record)
     if (outcome !== 'failed' && outcome !== 'killed_by_cutover') return
     // Deliberately do not retain raw output/errors/credentials in the cross-session index.
@@ -1022,6 +1067,8 @@ export class DelegateDurableDb {
     return this.transaction(() => {
       const jobs = this.db.prepare(`SELECT state, count(*) AS n FROM delegate_jobs
         WHERE callback_origin_user_id=? AND retired_at IS NULL AND state IN ('running','queued')
+          AND NOT EXISTS (SELECT 1 FROM delegate_retry_source s WHERE s.job_id=delegate_jobs.job_id
+            AND s.generation=delegate_jobs.generation AND s.retired_at IS NOT NULL)
         GROUP BY state`).all(userId) as Array<{ state: string; n: number }>
       const inbox = this.db.prepare(`SELECT count(*) AS n FROM delegate_failure_inbox
         WHERE user_id=? AND ack_at IS NULL`).get(userId) as { n: number }
