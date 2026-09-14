@@ -652,6 +652,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
+  revokeReceiptOwner(owner: ReceiptToolOwner): boolean {
+    if (this.checkReceiptOwner(owner) !== 'active') return false
+    this._revokeReceiptOwner()
+    return true
+  }
+
   checkReceiptOwner(owner: ReceiptToolOwner): ReceiptOwnerState {
     // A new adapter cannot prove the old process is gone. Its FD lock/oracle
     // must still be reconciled, even if the platform session has been replaced.

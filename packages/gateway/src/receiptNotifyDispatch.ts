@@ -12,6 +12,11 @@ export async function dispatchReceiptTerminalNotify(store: DelegateJobStore, req
     if (!live || live.generation !== requested.generation || live.callbackEpoch !== claim.callbackEpoch) {
       throw new Error('receipt notify snapshot changed')
     }
+    // The receipt barrier acquisition may have waited behind another writer.
+    // Recheck lifecycle here too; a pre-lock active snapshot is not current authority.
+    if (hooks.receiptDeliveryAllowed && !await hooks.receiptDeliveryAllowed(live)) {
+      return { ok: false, failureClass: 'internal', hold: true } as NotifyResult
+    }
     const parentEngine = hooks.resolveParentEngine?.(live) ?? parseParentEngine(live.parentEngine)
     if (!parentEngine) {
       claim.release(Date.now() + nextNotifyBackoffMs(live.notifyAttempt ?? 0))

@@ -1,5 +1,5 @@
 import { homedir as receiptHome } from 'node:os'
-import { ReceiptCandidateLifecycle, type ReceiptCandidateScope } from '@openclaude/storage/receiptCandidateLifecycle'
+import { ReceiptCandidateLifecycle, receiptCandidateDeletionRef, receiptCandidateDeletionKey, type ReceiptCandidateDeletionRef, type ReceiptCandidateScope } from '@openclaude/storage/receiptCandidateLifecycle'
 import { checkedReceiptToolOwner as checkedCandidateOwner, receiptLocatorPartition } from './receiptOwnerCapability.js'
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
@@ -2830,6 +2830,57 @@ export class Gateway {
     return this._receiptCandidateStore ??= new ReceiptCandidateLifecycle(join(
       process.env.OPENCLAUDE_HOME?.trim() || join(receiptHome(), '.openclaude'), 'receipt-candidates-v1'))
   }
+  private _receiptClientRef(parent: Pick<AgentSession, 'channel' | 'peerId' | 'userId'>): ReceiptCandidateDeletionRef | undefined {
+    return parent.channel === 'webchat' && parent.peerId && parent.peerId !== 'unknown'
+      ? { userId: parent.userId || 'default', clientSessionId: parent.peerId } : undefined
+  }
+  private async _receiptClientState(parent: AgentSession): Promise<'active' | 'deleted' | 'unknown' | 'unmapped'> {
+    const ref = this._receiptClientRef(parent)
+    if (!ref) return 'unmapped'
+    try {
+      const [observed] = await classifyClientSessions([{ sessionId: ref.clientSessionId, userId: ref.userId }])
+      const current = this._receiptClientRef(parent)
+      if (!current || receiptCandidateDeletionKey(current) !== receiptCandidateDeletionKey(ref) ||
+          observed?.userId !== ref.userId || observed.sessionId !== ref.clientSessionId) return 'unknown'
+      return observed.state === 'active' || observed.state === 'deleted' ? observed.state : 'unknown'
+    } catch { return 'unknown' }
+  }
+  private _revokeDeletedReceiptParents(refs: readonly ReceiptCandidateDeletionRef[]): void {
+    const keys = new Set(refs.map(receiptCandidateDeletionKey))
+    for (const m of this.receiptCandidates().snapshots()) {
+      if (m.state !== 'active') continue
+      const ref = receiptCandidateDeletionRef(m.scope)
+      if (!ref || !keys.has(receiptCandidateDeletionKey(ref))) continue
+      const parent = this.sessions?.getByKey(m.scope.sessionKey)
+      if (!parent || parent.agentId !== m.scope.agentId || (parent.userId || 'default') !== m.scope.userId) continue
+      const actualRef = this._receiptClientRef(parent)
+      if (actualRef && receiptCandidateDeletionKey(actualRef) === receiptCandidateDeletionKey(ref)) {
+        parent.runner.revokeReceiptOwner?.(checkedCandidateOwner(m.scope.owner))
+      }
+    }
+  }
+  /** SQL transaction has returned; classify exact identities again, never infer deletion from HTTP/IDs. */
+  private async _cleanupDeletedReceiptCandidates(refs: readonly ReceiptCandidateDeletionRef[]): Promise<{ state: 'complete' | 'pending' | 'not_applicable' }> {
+    if (!refs.length) return { state: 'not_applicable' }
+    try {
+      const states = await classifyClientSessions(refs.map(ref => ({ sessionId: ref.clientSessionId, userId: ref.userId })))
+      const deleted: ReceiptCandidateDeletionRef[] = []
+      for (let i = 0; i < refs.length; i++) {
+        const ref = refs[i]!, observed = states[i]
+        if (!observed || observed.userId !== ref.userId || observed.sessionId !== ref.clientSessionId) throw new Error('receipt deletion classification mismatch')
+        if (observed.state === 'deleted') deleted.push(ref)
+      }
+      if (!deleted.length) return { state: 'not_applicable' }
+      this._revokeDeletedReceiptParents(deleted)
+      const result = await this.receiptCandidates().fenceDeleted(deleted)
+      if (result.pending) this._armReceiptCandidateRetry()
+      return { state: result.pending ? 'pending' : 'complete' }
+    } catch (error) {
+      this._armReceiptCandidateRetry()
+      this.log.warn('receipt deletion cleanup pending', undefined, error as Error)
+      return { state: 'pending' }
+    }
+  }
   /** Independent of job/notifier existence: enrolled ordinary Bash has no job. */
   private _sweepReceiptCandidates(): Promise<void> {
     if (this._receiptCandidateSweep) return this._receiptCandidateSweep
@@ -2837,8 +2888,19 @@ export class Gateway {
       let pending = false
       try {
         const store = this.receiptCandidates()
-        for (const partition of store.list()) {
+        for (const snapshot of store.snapshots()) {
+          const partition = snapshot.partition
           try {
+            const ref = snapshot.state === 'active' ? receiptCandidateDeletionRef(snapshot.scope) : snapshot.deletionRef
+            if (ref) {
+              const [observed] = await classifyClientSessions([{ sessionId: ref.clientSessionId, userId: ref.userId }])
+              if (!observed || observed.userId !== ref.userId || observed.sessionId !== ref.clientSessionId || observed.state === 'missing') { pending = true; continue }
+              if (observed.state === 'deleted') {
+                const cleaned = await this._cleanupDeletedReceiptCandidates([ref])
+                if (cleaned.state !== 'complete') pending = true
+                continue
+              }
+            }
             const retired = await store.retire(partition, scope => {
               const owner = checkedCandidateOwner(scope.owner)
               if (receiptLocatorPartition({ ...scope, ...owner }) !== partition) return false
@@ -4949,7 +5011,9 @@ export class Gateway {
           this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
           return
         }
-        this.sendJson(res, 200, result)
+        const receiptCandidateCleanup = 'action' in parsed && parsed.action === 'delete'
+          ? await this._cleanupDeletedReceiptCandidates(parsed.ids.map(clientSessionId => ({ userId, clientSessionId }))) : undefined
+        this.sendJson(res, 200, { ...result, ...(receiptCandidateCleanup ? { receiptCandidateCleanup } : {}) })
       })().catch(() => this.sendJson(res, 500, { error: 'batch failed' }))
       return
     }
@@ -6010,7 +6074,8 @@ export class Gateway {
             } catch {
               /* config cleanup is best-effort; session row is already gone */
             }
-            this.sendJson(res, 200, { ok: true })
+            const receiptCandidateCleanup = await this._cleanupDeletedReceiptCandidates([{ userId, clientSessionId: sessId }])
+            this.sendJson(res, 200, { ok: true, receiptCandidateCleanup })
           })
           .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
         return
@@ -7477,9 +7542,12 @@ export class Gateway {
       deleted,
       ...(errMessage ? { errMessage } : {}),
     })
+    const receiptCandidateCleanup = errMessage ? { state: 'pending' as const }
+      : await this._cleanupDeletedReceiptCandidates([{ userId, clientSessionId: sessionId }])
     this.sendJson(res, 200, {
       ok: true,
       deleted,
+      receiptCandidateCleanup,
       ...(errMessage ? { errMessage } : {}),
     })
   }
@@ -11447,6 +11515,7 @@ export class Gateway {
 
   private _notifyDispatchHooks() {
     return {
+      receiptDeliveryAllowed: (job: DelegateJobSnapshot) => this._receiptNotifyAllowed(job),
       resolveParentEngine: (job: DelegateJobSnapshot) =>
         this._resolveDelegateParentEngine(job.callbackOriginSessionKey ?? job.parentSessionKey) ??
         parseParentEngine(job.parentEngine),
@@ -11527,6 +11596,28 @@ export class Gateway {
       },
     })
     return this._engineNotifier
+  }
+
+  // Not a delivery queue/ACK: a lower bound consumed by the existing retry timer.
+  private readonly _receiptNotifyNotBefore = new Map<string, number>()
+  private _receiptNotifyKey(job: DelegateJobSnapshot): string { return JSON.stringify([job.id, job.generation]) }
+  private async _receiptNotifyAllowed(job: DelegateJobSnapshot): Promise<boolean> {
+    const key = this._receiptNotifyKey(job)
+    if ((this._receiptNotifyNotBefore.get(key) ?? 0) > Date.now()) return false
+    const origin = parseOriginWebchatSessionKey(job.parentSessionKey ?? '')
+    if (!origin) return true // no invented client identity for other channels
+    const userId = job.callbackOriginUserId // persisted from the validated receipt capability at create
+    if (userId) {
+      try {
+        const [observed] = await classifyClientSessions([{ userId, sessionId: origin.peerId }])
+        if (observed?.userId === userId && observed.sessionId === origin.peerId && observed.state === 'active') {
+          this._receiptNotifyNotBefore.delete(key)
+          return true
+        }
+      } catch { /* unknown retains original receipt and rechecks on original timer */ }
+    }
+    this._receiptNotifyNotBefore.set(key, Date.now() + 30_000)
+    return false
   }
 
   private readonly _receiptRecovering = new Map<string, Promise<void>>()
@@ -11691,10 +11782,13 @@ export class Gateway {
     const notifierOn = isDelegateNotifierEffective()
     if (!notifierOn && !isDelegateDurableEffective()) return
     let delay = notifierOn
-      ? delayUntilNextNotifyRetry(this._delegateJobs)
+      ? delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
+          receiptRetryNotBefore: job => this._receiptNotifyNotBefore.get(this._receiptNotifyKey(job)),
+        })
       : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
           callbacks: ['cron-origin-inject'],
           skipLegacyCron: true,
+          receiptRetryNotBefore: job => this._receiptNotifyNotBefore.get(this._receiptNotifyKey(job)),
         })
     // Offered/unknown receipts have no old callback deadline yet. Reconcile
     // through the existing scheduler, never reinterpret timeout as parent death.
@@ -13900,7 +13994,16 @@ export class Gateway {
           consumer.agentId !== context.agentId || consumer.sessionKey !== context.sessionKey) return this.sendError(res, 401, 'invalid receipt authority')
       if (principal.kind === 'user' && principal.userId !== consumer.userId) return this.sendError(res, 403, 'receipt user mismatch')
       const parent = this.sessions?.getByKey(consumer.sessionKey)
-      if (!parent || parent.agentId !== consumer.agentId || (parent.userId || 'default') !== consumer.userId ||
+      const clientRef = parent ? this._receiptClientRef(parent) : undefined
+      const clientState = parent ? await this._receiptClientState(parent) : 'unknown'
+      const finalPrincipal = this.receiptHttpPrincipal(req)
+      const finalContext = typeof contextRaw === 'string' ? verifyDelegateContextToken(contextRaw) : null
+      if (!finalPrincipal || !finalContext || !this._receiptOwnerCapabilities.verify(receipt.capability) ||
+          finalContext.agentId !== consumer.agentId || finalContext.sessionKey !== consumer.sessionKey) return this.sendError(res, 401, 'receipt authority expired')
+      if (finalPrincipal.kind === 'user' && finalPrincipal.userId !== consumer.userId) return this.sendError(res, 403, 'receipt user mismatch')
+      if (clientState === 'deleted' || clientState === 'unknown') return this.sendError(res, clientState === 'deleted' ? 409 : 503, 'receipt client session unavailable')
+      if (!parent || this.sessions?.getByKey(consumer.sessionKey) !== parent ||
+          JSON.stringify(this._receiptClientRef(parent)) !== JSON.stringify(clientRef) || parent.agentId !== consumer.agentId || (parent.userId || 'default') !== consumer.userId ||
           parent._currentTurnKey !== consumer.turnKey || parent.runner.checkReceiptOwner?.(consumer) !== 'active') {
         return this.sendError(res, 409, 'receipt creator unavailable')
       }
@@ -14238,8 +14341,12 @@ export class Gateway {
     if (Object.keys(body).length !== 1 || typeof body[field] !== 'string' || !body[field]) {
       return this.sendError(res, 400, `only ${field} is accepted`)
     }
-    // readBody can outlive either credential. Re-authenticate at the decision
-    // boundary and snapshot an explicit principal; expired JWT is never default.
+    // SQL is outside candidate flock; afterwards re-authenticate every authority.
+    const preliminary = verifyDelegateContextToken(contextToken)
+    const lifecycleParent = preliminary ? this.sessions?.getByKey(preliminary.sessionKey) : undefined
+    const lifecycleRef = lifecycleParent ? this._receiptClientRef(lifecycleParent) : undefined
+    const clientState = lifecycleParent ? await this._receiptClientState(lifecycleParent) : 'unknown'
+    // readBody/SQL can outlive either credential. Never turn expiry into default.
     const principal = this.receiptHttpPrincipal(req)
     const bound = verifyDelegateContextToken(contextToken)
     if (!principal || !bound) return this.sendError(res, 401, 'receipt owner authentication expired')
@@ -14250,10 +14357,16 @@ export class Gateway {
     // No fallback from a failed/foreign JWT, and no identity from the body/env.
     const matchesUser = (userId: string): boolean => principal.kind === 'service' || principal.userId === userId
     const contextHash = receiptContextHash(contextToken)
+    const lifecycleStable = parent === lifecycleParent && JSON.stringify(parent ? this._receiptClientRef(parent) : undefined) === JSON.stringify(lifecycleRef)
+    const effectiveClientState = lifecycleStable ? clientState : 'unknown'
     if (issue) {
       if (!parent || parent.agentId !== bound.agentId) return this.sendError(res, 409, 'parent unavailable')
       const userId = parent.userId || 'default'
       if (!matchesUser(userId)) return this.sendError(res, 403, 'receipt owner user mismatch')
+      if (effectiveClientState === 'deleted' || effectiveClientState === 'unknown') {
+        if (effectiveClientState === 'deleted' && lifecycleRef) void this._cleanupDeletedReceiptCandidates([lifecycleRef])
+        return this.sendError(res, effectiveClientState === 'deleted' ? 409 : 503, 'receipt client session unavailable')
+      }
       const owner = parent.runner.getReceiptToolOwner?.(body.toolUseId as string)
       if (!owner || owner.turnKey !== parent._currentTurnKey || !isReceiptConsumerTool(owner.toolName, owner.receiptMcpTarget)) {
         return this.sendError(res, 409, 'native receipt consumer unavailable')
@@ -14269,10 +14382,19 @@ export class Gateway {
         if ((currentPrincipal.kind === 'user' && currentPrincipal.userId !== userId) ||
             this.sessions?.getByKey(bound.sessionKey) !== parent || (parent.userId || 'default') !== userId ||
             parent.agentId !== bound.agentId || parent._currentTurnKey !== owner.turnKey ||
+            JSON.stringify(this._receiptClientRef(parent)) !== JSON.stringify(lifecycleRef) ||
             parent.runner.checkReceiptOwner?.(owner) !== 'active') throw new Error('receipt registration owner unavailable')
       }
       let reportPath: string
-      try { reportPath = await this.receiptCandidates().register(scope, owner.consumerToolUseId, validate); validate() }
+      try {
+        reportPath = await this.receiptCandidates().register(scope, owner.consumerToolUseId, validate)
+        const afterRegistration = await this._receiptClientState(parent)
+        validate()
+        if (afterRegistration === 'deleted' || afterRegistration === 'unknown') {
+          if (afterRegistration === 'deleted' && lifecycleRef) void this._cleanupDeletedReceiptCandidates([lifecycleRef])
+          throw new Error('receipt client session changed during registration')
+        }
+      }
       catch { this._armReceiptCandidateRetry(); return this.sendError(res, 409, 'receipt candidate registration unavailable') }
       this._armReceiptCandidateRetry()
       const capability = this._receiptOwnerCapabilities.issue(identity)
@@ -14290,6 +14412,7 @@ export class Gateway {
           parent._currentTurnKey !== original.turnKey || parent.runner.checkReceiptOwner?.(original) !== 'active') {
         return this.sendError(res, 409, 'original receipt owner unavailable')
       }
+      if (effectiveClientState === 'deleted' || effectiveClientState === 'unknown') return this.sendError(res, effectiveClientState === 'deleted' ? 409 : 503, 'receipt client session unavailable')
       // No await between final auth/owner snapshot and signing. issue derives
       // partition and times internally; no receipt/creator/nonce/ACK is changed.
       const capability = this._receiptOwnerCapabilities.issue({ ...original, contextHash })
@@ -14306,6 +14429,9 @@ export class Gateway {
     // remain mandatory before a later notify path can act on 'inactive'.
     if (!parent || parent.agentId !== claims.agentId || (parent.userId || 'default') !== claims.userId) {
       return this.sendJson(res, 200, { ownerState: 'unknown' })
+    }
+    if (effectiveClientState === 'deleted' || effectiveClientState === 'unknown') {
+      return this.sendJson(res, 200, { ownerState: effectiveClientState === 'deleted' ? 'inactive' : 'unknown' })
     }
     const observed = parent.runner.checkReceiptOwner?.(claims) ?? 'unknown'
     // Platform ownership can move before the adapter receives submit/interrupt.
@@ -14336,8 +14462,11 @@ export class Gateway {
         typeof body.receiptNonce !== 'string' || !/^[a-f0-9]{64}$/.test(body.receiptNonce)) {
       return this.sendError(res, 400, 'invalid receipt input request')
     }
-    // No await after this authenticated snapshot. A readBody timeout/expiry must
-    // never change the principal or allow a stale consumer to take a result.
+    const preliminaryContext = verifyDelegateContextToken(contextToken)
+    const lifecycleParent = preliminaryContext ? this.sessions?.getByKey(preliminaryContext.sessionKey) : undefined
+    const lifecycleRef = lifecycleParent ? this._receiptClientRef(lifecycleParent) : undefined
+    const clientState = lifecycleParent ? await this._receiptClientState(lifecycleParent) : 'unknown'
+    // No await after this authenticated snapshot, including SQL lifecycle lookup.
     const principal = this.receiptHttpPrincipal(req)
     const bound = verifyDelegateContextToken(contextToken)
     const consumer = this._receiptOwnerCapabilities.verify(body.capability)
@@ -14347,7 +14476,9 @@ export class Gateway {
     }
     if (principal.kind === 'user' && principal.userId !== consumer.userId) return this.sendError(res, 403, 'receipt input user mismatch')
     const parent = this.sessions?.getByKey(bound.sessionKey)
-    if (!parent || parent.agentId !== consumer.agentId || (parent.userId || 'default') !== consumer.userId ||
+    if (clientState === 'deleted' || clientState === 'unknown') return this.sendError(res, clientState === 'deleted' ? 409 : 503, 'receipt client session unavailable')
+    if (!parent || parent !== lifecycleParent ||
+        JSON.stringify(this._receiptClientRef(parent)) !== JSON.stringify(lifecycleRef) || parent.agentId !== consumer.agentId || (parent.userId || 'default') !== consumer.userId ||
         parent._currentTurnKey !== consumer.turnKey || parent.runner.checkReceiptOwner?.(consumer) !== 'active') {
       return this.sendError(res, 409, 'receipt input consumer unavailable')
     }

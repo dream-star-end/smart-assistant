@@ -11,7 +11,7 @@ import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 import { DelegateJobStore } from '../../delegateJobs.js'
-const mode=process.argv[3] || 'late'; assert.ok(['late','ordinary'].includes(mode))
+const mode=process.argv[3] || 'late'; assert.ok(['late','ordinary','deleted'].includes(mode))
 const root=fileURLToPath(new URL('../../../../../',import.meta.url))
 const dir=process.argv[2]; assert.ok(dir)
 mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
@@ -50,7 +50,7 @@ const upstream=createServer(async(req,res)=>{
   if(main&&phase===0){phase++;send(res,body,true)}
   else {
     if(main){
-      if(mode==='late') {
+      if(mode!=='ordinary') {
         const until=Date.now()+30000;
         while(!existsSync(join(dir,'writer-ready'))){assert.ok(Date.now()<until,'late writer gate deadline');await new Promise(r=>setTimeout(r,20))}
       }
@@ -83,7 +83,12 @@ process.env.CLAUDE_CONFIG_DIR=join(dir,'native');process.env.OPENCLAUDE_RECEIPT_
 const providerEnvOverride={ANTHROPIC_BASE_URL:`http://127.0.0.1:${upstreamPort}`,ANTHROPIC_API_KEY:'synthetic-local-only',ANTHROPIC_AUTH_TOKEN:'synthetic-local-only',CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1',CLAUDE_CODE_DISABLE_AUTO_MEMORY:'1',CLAUDE_CODE_DISABLE_ATTACHMENTS:'1',DISABLE_TELEMETRY:'1',DISABLE_ERROR_REPORTING:'1',CLAUDE_CODE_MAX_RETRIES:'0',CLAUDE_CODE_UNATTENDED_RETRY:'0',CLAUDE_CODE_DISABLE_ADVISOR_TOOL:'1',NPM_CONFIG_OFFLINE:'true'}
 runner=new SubprocessRunner({sessionKey:session,agentId:'main',agentBaseDir:dir,config,harness:'ccb',model:config.defaults.model,permissionMode:'bypassPermissions',providerEnvOverride})
 adapter=new CcbAdapter({harness:'ccb'} as any,runner)
-const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter}
+const parent={userId:'default',sessionKey:session,agentId:'main',_currentTurnKey:turnKey,runner:adapter,
+ ...(mode==='deleted'?{channel:'webchat',peerId:'real-model-cli'}:{})}
+if(mode==='deleted'){
+ const {upsertClientSession}=await import('../../../../storage/src/sessionsDb.js')
+ await upsertClientSession({id:'real-model-cli',userId:'default',agentId:'main',title:'private deleted CLI',pinned:false,createdAt:1000,lastAt:1000,updatedAt:1000,messages:[]})
+}
 ;(gw as any).sessions={getByKey:(key:string)=>key===session?parent:undefined}
 runner.on('message',(m:any)=>{sdk.push(m);if(m.type==='control_request'&&m.request?.subtype==='can_use_tool')runner.sendPermissionResponse(m.request_id,{behavior:'allow',updatedInput:m.request.input} as any)})
 runner.on('stderr',(line:any)=>{process.stderr.write(String(line)+'\n')})
@@ -96,15 +101,18 @@ try {
  const result=await Promise.race([turn.summary,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('model turn deadline')),90000)})]);clearTimeout(timer)
  assert.ok(!failure,String(failure));assert.equal(received,false)
  assert.ok(savedOwner);turn.end();assert.equal(adapter.checkReceiptOwner(savedOwner),'inactive')
- assert.ok(sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(mode==='late'?'parent-shell-completed':'ordinary-no-job-proof')))
+ assert.ok(sdk.some((m:any)=>m.type==='user'&&JSON.stringify(m.message).includes(mode!=='ordinary'?'parent-shell-completed':'ordinary-no-job-proof')))
  const candidateRoot=join(dir,'receipt-candidates-v1')
  assert.equal(readdirSync(join(candidateRoot,'data')).length,1)
  let writer:any
- if(mode==='late') {
+ if(mode!=='ordinary') {
    writer=JSON.parse(readFileSync(join(dir,'writer-ready'),'utf8'));process.kill(writer.pid,0)
    assert.equal(writer.cache,candidateRoot);assert.ok(writer.report.startsWith(candidateRoot+'/'))
  }
- await (gw as any)._sweepReceiptCandidates() // actual turn-end helper; SessionManager lookup is fixture
+ if(mode==='deleted'){
+  const response=await fetch(`http://127.0.0.1:${port}/api/sessions/real-model-cli`,{method:'DELETE',headers:{authorization:`Bearer ${token}`}})
+  const body=await response.json() as any;assert.equal(response.status,200);assert.equal(body.receiptCandidateCleanup.state,'complete')
+ } else await (gw as any)._sweepReceiptCandidates() // actual turn-end helper; SessionManager lookup is fixture
  assert.equal(readdirSync(join(candidateRoot,'data')).length,0)
  if(writer) {
    const fd=openSync(join(dir,'writer-release'),constants.O_WRONLY);writeSync(fd,'release');closeSync(fd)
@@ -118,9 +126,9 @@ try {
    executions,receipts:rows,http,cliExit:writer?readFileSync(join(dir,'writer-exit'),'utf8').trim():null}
  writeFileSync(join(dir,'lifecycle-proof.json'),JSON.stringify(proof,null,2))
  assert.equal(recreated,false,'retired namespace must not be recreated by the actual late CLI')
- assert.deepEqual(states,['retired']);assert.equal(executions,mode==='late'?1:0)
- assert.equal(rows.length,mode==='late'?1:0)
- if(mode==='late'){assert.equal(rows[0].state,'offered');assert.equal(rows[0].native_tool_use_id,'real_creator')}
+ assert.deepEqual(states,['retired']);assert.equal(executions,mode!=='ordinary'?1:0)
+ assert.equal(rows.length,mode!=='ordinary'?1:0)
+ if(mode!=='ordinary'){assert.equal(rows[0].state,'offered');assert.equal(rows[0].native_tool_use_id,'real_creator')}
  process.stdout.write('CANDIDATE_LIFECYCLE_PASS\n')
 
 } catch(e){failure=e;process.exitCode=1;process.stderr.write(String(e)+'\n'+JSON.stringify({requests,http,sdkErrors:sdk.filter((m:any)=>m.type==='user'||m.type==='result').map((m:any)=>({type:m.type,message:m.message,errors:m.errors}))})+'\n')}

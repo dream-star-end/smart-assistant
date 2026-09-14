@@ -225,6 +225,8 @@ export interface EngineAdapter extends EventEmitter {
   getReceiptToolOwner?(toolUseId: string): ReceiptToolOwner | null
   /** Unknown (including adapter replacement) must NEVER authorize fallback notify. */
   checkReceiptOwner?(owner: ReceiptToolOwner): ReceiptOwnerState
+  /** Revoke only this exact native receipt owner, never a replacement turn/process. */
+  revokeReceiptOwner?(owner: ReceiptToolOwner): boolean
 
   // ── lifecycle ──
   start(): Promise<void>

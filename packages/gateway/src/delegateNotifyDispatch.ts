@@ -39,6 +39,8 @@ const log = createLogger({ module: 'delegateNotifyDispatch' })
 export type NotifyFence = { claimToken: string; fencingEpoch: number }
 
 export type NotifyDispatchHooks = {
+  /** Receipt-only lifecycle gate; false retains the original owner and ACK state. */
+  receiptDeliveryAllowed?: (job: DelegateJobSnapshot) => Promise<boolean>
   resolveParentEngine?: (job: DelegateJobSnapshot) => ReturnType<typeof parseParentEngine>
   resolveNativeId?: (job: DelegateJobSnapshot) => string | undefined
   resolveGoal?: (job: DelegateJobSnapshot) => string | undefined
@@ -80,6 +82,7 @@ export async function dispatchJobTerminalNotify(
     return { skipped: true, reason: 'not_terminal' }
   }
   if (store.hasDeliveryReceiptEnrollment(job.id)) {
+    if (hooks.receiptDeliveryAllowed && !await hooks.receiptDeliveryAllowed(job)) return { skipped: true, reason: 'receipt_session_unavailable' }
     return dispatchReceiptTerminalNotify(store, job, notifier, hooks)
   }
 
@@ -306,7 +309,7 @@ export async function retryPendingNotifies(
 export function delayUntilNextNotifyRetry(
   store: DelegateJobStore,
   now = Date.now(),
-  opts: { callbacks?: readonly string[]; skipLegacyCron?: boolean } = {},
+  opts: { callbacks?: readonly string[]; skipLegacyCron?: boolean; receiptRetryNotBefore?: (job: DelegateJobSnapshot) => number | undefined } = {},
 ): number | undefined {
   let next: number | undefined
   for (const job of store.listPendingNotify()) {
@@ -314,10 +317,11 @@ export function delayUntilNextNotifyRetry(
     if (opts.skipLegacyCron && job.callback === 'cron-origin-inject' && isLegacyCronOriginLane(job.notifyLane)) {
       continue
     }
-    const at =
+    const originalAt =
       job.callbackState === 'injecting'
         ? (job.notifyClaimedUntil ?? now)
         : (job.notifyRetryAt ?? now)
+    const at = Math.max(originalAt, opts.receiptRetryNotBefore?.(job) ?? 0)
     if (next === undefined || at < next) next = at
   }
   if (next === undefined) return undefined

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 const root = fileURLToPath(new URL('../../../../', import.meta.url))
-for (const mode of ['late', 'ordinary']) test(`real model candidate lifecycle ${mode}`, { timeout: 150000 }, async () => {
+for (const mode of ['late', 'ordinary', 'deleted']) test(`real model candidate lifecycle ${mode}`, { timeout: 150000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'candidate-model-'))
   const child = spawn(process.execPath, ['--import', join(root, 'node_modules/tsx/dist/loader.mjs'),
     fileURLToPath(new URL('./fixtures/receiptCandidateModel.fixture.ts', import.meta.url)), dir, mode],
@@ -21,8 +21,8 @@ for (const mode of ['late', 'ordinary']) test(`real model candidate lifecycle ${
     assert.equal(exit, 0, error.slice(-6000)); assert.match(output, /CANDIDATE_LIFECYCLE_PASS/)
     const p = JSON.parse(readFileSync(join(dir, 'lifecycle-proof.json'), 'utf8'))
     assert.equal(p.recreated, false); assert.equal(p.ordinaryPreserved, true)
-    assert.deepEqual(p.states, ['retired']); assert.equal(p.executions, mode === 'late' ? 1 : 0)
-    assert.equal(p.writerAliveAfterEnd, mode === 'late')
+    assert.deepEqual(p.states, ['retired']); assert.equal(p.executions, mode !== 'ordinary' ? 1 : 0)
+    assert.equal(p.writerAliveAfterEnd, mode !== 'ordinary')
     process.stdout.write(JSON.stringify(p) + '\n')
   } finally { clearTimeout(timer); rmSync(dir, { recursive: true, force: true }) }
 })
