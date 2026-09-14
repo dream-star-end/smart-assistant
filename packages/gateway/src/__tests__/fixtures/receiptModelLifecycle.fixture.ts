@@ -149,7 +149,11 @@ const dispatch=(gw as any)._dispatchDelegateNotify.bind(gw)
 ;(gw as any)._readDelegateMemoryPressure=()=>null
 const master=createServer(async(req,res)=>{
  try {
-  assert.equal(req.url,'/internal/v3/cron-origin-inject');assert.equal(req.headers.authorization,'Bearer synthetic-master-only')
+  assert.equal(req.headers.authorization,'Bearer synthetic-master-only')
+   if(mixed&&req.url==='/internal/v3/marketplace/sync') {
+    res.end(JSON.stringify({identityCompat:{schema:1,userId:'987654321',profiles:[]}}));return
+   }
+   assert.equal(req.url,'/internal/v3/cron-origin-inject')
   let raw='';for await(const c of req)raw+=c;const body=JSON.parse(raw)
   assert.equal(body.sessionId,'real-model-cli');assert.equal(body.agentId,'main');assert.ok(body.text.includes(sentinel))
   masterRequests.push(body)
@@ -161,6 +165,7 @@ await new Promise<void>(r=>master.listen(0,'127.0.0.1',r))
 function enableMasterCallback(){
  process.env.OPENCLAUDE_V3_MASTER_BASE_URL=`http://127.0.0.1:${(master.address() as any).port}`
  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN='synthetic-master-only'
+ if(mixed)process.env.OC_USER_ID='987654321' // private synthetic compatibility authority only
 }
 ;(gw as any)._runDelegateTask=async(input:any)=>{
  const execution=++executions;const claim=jobs.claimQueued(input.backgroundJobId);assert.ok(claim.ok)
@@ -230,6 +235,7 @@ try {
  assert.equal(jobs.snapshotOf(jobId).callbackState,mode==='ingested-end'?'none':'delivered')
  assert.ok(terminalWork.length>=1,'actual onTerminal dispatch must execute')
  if(mode==='cross-turn')await turn.summary
+ assert.ok(!failure,String(failure));if(mixed)assert.ok(mixedBefore,'mixed result boundary must execute')
  if(handoffIngested) {
   // The previous turn genuinely committed through native admission. Now wait
   // with a different SDK tool/owner; do not manufacture an ingested DB state.
