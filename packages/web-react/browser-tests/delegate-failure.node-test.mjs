@@ -31,6 +31,12 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
         assert.ok(code.includes(anchor));
         return { contents: code.replace(anchor, "/* negative: no server ACK */"), loader: "ts" };
       });
+    } }] : process.env.OC_D15_BROWSER_NEGATIVE === "omit-diagnostics" ? [{ name: "virtual-diagnostic-loss", setup(builder) {
+      builder.onLoad({ filter: /DelegateFailureInbox\.tsx$/ }, args => {
+        const code = readFileSync(args.path, "utf8"), anchor = "const total = state.summary;";
+        assert.ok(code.includes(anchor));
+        return { contents: code.replace(anchor, "diagnostics = []; " + anchor), loader: "tsx" };
+      });
     } }] : [];
     const bundle = async entry => (await build({ entryPoints: [join(HERE, entry)], bundle: true, write: false, format: "iife", jsx: "automatic",
       plugins, loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" },
@@ -273,6 +279,8 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
         await p.goto(api.url + "/focused?diagnosticJob=" + encodeURIComponent(overlap));
         const trigger = p.getByTestId("delegate-failure-footer").getByRole("button"); await trigger.click();
         const d = p.getByRole("dialog", { name: "后台任务失败收件箱" }), legacy = d.getByTestId("delegate-session-diagnostics");
+        await d.locator("li[data-job-id]").first().waitFor();
+        assert.equal(await legacy.count(), 1, "unmatched historical failure must reach the shared dialog, not vanish behind loaded summary");
         await legacy.locator("summary").click();
         await legacy.getByText("原始alice失败诊断", { exact: true }).waitFor();
         assert.equal(await p.locator('[data-diagnostic-job-id="raw-failed-alice"]').count(), 1);
