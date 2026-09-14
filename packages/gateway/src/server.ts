@@ -14576,7 +14576,8 @@ export class Gateway {
     // 拒绝路径不得产生副作用（不 create job、不 spawn、不 persist intent）。
     let retrySourceParent: Omit<DelegateRetrySource, 'childSessionKey'> | undefined
     let revalidateRetrySource: (() => { status: number; message: string } | undefined) | undefined
-    if (parsed.async === true && isDelegateSmEnabled() && isDelegateDurableEffective() && typeof contextRaw === 'string') {
+    if (parsed.async === true && isDelegateSmEnabled() && isDelegateDurableEffective() && typeof contextRaw === 'string' &&
+        this._ensureDelegateJobStore().acceptsNewFailureSources) {
       const capture = await this._captureDelegateRetrySource(req, contextRaw, targetAgentId, modelNorm.model, callerExecutionId)
       if (capture.error) return this.sendError(res, capture.error.status, capture.error.message)
       retrySourceParent = capture.source

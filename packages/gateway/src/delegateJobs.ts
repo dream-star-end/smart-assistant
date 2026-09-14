@@ -387,6 +387,8 @@ export class DelegateJobStore {
     if ((this.failureInbox || this.deliveryReceipts) && (!this.durable || !this.sm)) {
       throw new Error('delegate failure inbox requires durable state machine')
     }
+    // No caller can observe new-v2 admission before its durable floor commits.
+    if (this.failureInbox || this.deliveryReceipts) this.durable!.sealConsumerV2()
     this.onTerminal = opts.onTerminal
     this.onDrop = opts.onDrop
     if (this.durable && opts.hydrate !== false) this.hydrateFromDurable()
@@ -394,6 +396,9 @@ export class DelegateJobStore {
 
   /** User-facing durable projection. Missing durability is not an empty inbox. */
   get hasDurableUserSurface(): boolean { return this.durable !== null }
+  get acceptsNewFailureSources(): boolean {
+    return !!this.durable && this.sm && (this.failureInbox || this.deliveryReceipts)
+  }
   retryLifecycleRefs(userId?: string) {
     if (!this.durable) throw new Error('delegate durable user surface unavailable')
     return this.durable.retryLifecycleRefs(userId)

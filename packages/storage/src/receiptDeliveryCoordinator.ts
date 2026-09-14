@@ -2,12 +2,13 @@ import { createHash, randomBytes } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { withReceiptWriteBarrier } from './receiptWriteBarrier.js'
+import { readDelegateConsumerProfile } from './delegateConsumerProfile.js'
 
 /** Identity writer protocol, independent of later additive DB schema versions. */
 export const RECEIPT_IDENTITY_WRITER_VERSION = 10
 // Schema 10's all-column UDF trigger cannot be used by the native Bun consumer.
 // Only Gateway migration 11 can replace it; consumers never migrate or guess.
-const RECEIPT_CONSUMER_SCHEMAS = new Set([7, 8, 9, 11])
+const RECEIPT_CONSUMER_SCHEMAS = new Set([7, 8, 9, 11, 12])
 
 // Only the synchronous SQL surface used by receipt ownership. Node and Bun
 // share the exact queries, transactions, identity guards and physical barrier.
@@ -99,7 +100,9 @@ export class ReceiptDeliveryCoordinator {
     this.db = openDatabase(this.path)
     try {
       this.db.exec('PRAGMA busy_timeout = 10000')
-      if (!RECEIPT_CONSUMER_SCHEMAS.has((this.db.prepare('PRAGMA user_version').get() as Row)?.user_version as number)) throw new Error('unsupported receipt consumer schema')
+      const version = (this.db.prepare('PRAGMA user_version').get() as Row)?.user_version as number
+      if (!RECEIPT_CONSUMER_SCHEMAS.has(version)) throw new Error('unsupported receipt consumer schema')
+      if (version === 12 && readDelegateConsumerProfile(this.db) !== 2) throw new Error('receipt consumer requires sealed profile')
       this.db.prepare('SELECT owner_token,parent_owner_epoch,input_proof FROM delegate_delivery_receipt LIMIT 0').all()
     } catch (err) { this.db.close(); throw err }
   }

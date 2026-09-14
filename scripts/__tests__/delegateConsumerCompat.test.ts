@@ -92,10 +92,10 @@ test('original offered/unacked inventory refuses legacy and admits only paired C
   assert.equal(f.db.userSummary('private-secret-user').unacknowledgedFailures, 1)
 })
 
-test('real schema11 empty still fences old writer; running enrollment visible before terminal', t => {
+test('real sealed C0 empty still fences old writer; running enrollment visible before terminal', t => {
   const f = current(t), old = metadata('old.json'), modern = metadata('c0.json', [cap])
   assert.equal(run([f.path], old).code, 1)
-  assert.equal(run([f.path], modern).verdict.databases?.[0]?.schema, 11)
+  assert.equal(run([f.path], modern).verdict.databases?.[0]?.schema, 12)
   const job = f.store.create('child', { queued: true, parentSessionKey: parent,
     callbackOriginUserId: 'private-secret-user', callback: 'stdout-wait', deliveryReceipt: receipt })
   assert.ok('jobId' in job); assert.ok(f.store.claimQueued(job.jobId).ok)
@@ -157,7 +157,7 @@ test('committed WAL remains visible while original writer stays open; acknowledg
   assert.equal(f.db.open, true)
 })
 
-test('versions 0..9 old empty shapes and valid absence do not migrate; mixed schema11 raises floor', t => {
+test('versions 0..9 old empty shapes and valid absence do not migrate; mixed sealed C0 raises floor', t => {
   const old = metadata('old.json'), modern = metadata('c0.json', [cap])
   for (let version = 0; version <= 9; version++) {
     const f = oldShape(t, version, `v${version}.db`)

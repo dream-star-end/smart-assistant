@@ -122,6 +122,54 @@ def states(db, table, column, allowed):
     require(invalid is None)
 
 
+def consumer_profile(db):
+    """Schema12 SQL contract mirrors storage/delegateConsumerProfile.ts.
+
+    Compare actual trigger bodies, not their names or a user-provided marker.
+    Native writers use the same guard definitions; this reader executes no DDL.
+    """
+    table = "delegate_consumer_profile"
+    shape(db, table, ["id", "min_consumer"])
+    rows = db.execute("SELECT id,min_consumer FROM " + table).fetchall()
+    require(len(rows) == 1 and rows[0][0] == 1 and rows[0][1] in (1, 2))
+    floor = rows[0][1]
+    normalize = lambda sql: " ".join(sql.strip().removesuffix(";").split())
+    expected = {
+        "delegate_profile_no_insert": f"CREATE TRIGGER delegate_profile_no_insert BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'delegate profile already initialized'); END",
+        "delegate_profile_no_delete": f"CREATE TRIGGER delegate_profile_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'delegate profile cannot be deleted'); END",
+        "delegate_profile_update": f"CREATE TRIGGER delegate_profile_update BEFORE UPDATE ON {table} BEGIN SELECT CASE WHEN NEW.id IS NOT OLD.id OR NEW.min_consumer < OLD.min_consumer THEN RAISE(ABORT,'delegate consumer floor cannot decrease') END; SELECT CASE WHEN oc_delegate_schema10() IS NOT 10 THEN RAISE(ABORT,'delegate profile writer required') END; END",
+    }
+    identity_tables = ["delegate_jobs", "delegate_retry_source", "delegate_retry_action",
+                       "delegate_retry_parent_fence", "delegate_failure_inbox"]
+    v2_tables = identity_tables[1:] + ["delegate_delivery_receipt"]
+    for target in v2_tables:
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            name = f"delegate_legacy_{target}_{operation.lower()}"
+            expected[name] = f"CREATE TRIGGER {name} BEFORE {operation} ON {target} WHEN (SELECT min_consumer FROM {table} WHERE id=1) IS NOT 2 BEGIN SELECT RAISE(ABORT,'delegate v2 profile required'); END"
+    for operation in ("INSERT", "UPDATE"):
+        name = f"delegate_legacy_jobs_{operation.lower()}"
+        expected[name] = f"CREATE TRIGGER {name} BEFORE {operation} ON delegate_jobs WHEN (SELECT min_consumer FROM {table} WHERE id=1) IS NOT 2 AND (NEW.failure_inbox_enabled IS NOT 0 OR NEW.delivery_receipt_context IS NOT NULL) BEGIN SELECT RAISE(ABORT,'delegate v2 enrollment requires profile'); END"
+    bookkeeping = set("callback callback_state callback_epoch notify_retry_at notify_delivery_token notify_claimed_until last_activity_at updated_at notify_attempt notify_a_attempted_at".split())
+    columns = [row[1] for row in db.execute("PRAGMA table_info(delegate_jobs)") if row[1] not in bookkeeping]
+    protected = ",".join('"' + c.replace('"', '""') + '"' for c in columns)
+    identity = {}
+    for target in identity_tables:
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            name = f"identity_v10_{target}_{operation.lower()}"
+            event = "UPDATE OF " + protected if target == "delegate_jobs" and operation == "UPDATE" else operation
+            identity[name] = f"CREATE TRIGGER {name} BEFORE {event} ON {target} BEGIN SELECT CASE WHEN oc_delegate_schema10() IS NOT 10 THEN RAISE(ABORT,'delegate identity schema10 writer required') END; END"
+    if floor == 2:
+        expected.update(identity)
+    actual = dict(db.execute("SELECT name,sql FROM sqlite_schema WHERE type='trigger'"))
+    for name, sql in expected.items():
+        require(isinstance(actual.get(name), str) and normalize(actual[name]) == normalize(sql))
+    if floor == 1:
+        require(not any(name in actual for name in identity))
+        require(count(db, "delegate_jobs", "failure_inbox_enabled IS NOT 0 OR delivery_receipt_context IS NOT NULL") == 0)
+        require(all(count(db, target) == 0 for target in v2_tables))
+    return floor
+
+
 def inventory(value, deadline):
     path, identity, info = checked_path(value, allow_missing=True)
     # SQLite may follow WAL/SHM/journal links independently of the main file.
@@ -140,7 +188,7 @@ def inventory(value, deadline):
         db.execute("PRAGMA query_only=ON")
         db.execute("BEGIN")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        require(isinstance(version, int) and 0 <= version <= 11)
+        require(isinstance(version, int) and 0 <= version <= 12)
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
         if version == 0:
             require(db.execute("SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1").fetchone() is None)
@@ -162,6 +210,8 @@ def inventory(value, deadline):
                 expected.add("delegate_delivery_receipt")
             if version >= 9:
                 expected.update(("delegate_retry_source", "delegate_retry_action", "delegate_retry_parent_fence"))
+            if version == 12:
+                expected.add("delegate_consumer_profile")
             require(tables == expected)
             shape(db, "delegate_jobs", columns)
             states(db, "delegate_jobs", "state", JOB_STATES)
@@ -190,9 +240,12 @@ def inventory(value, deadline):
                 totals["sources"] = count(db, "delegate_retry_source")
                 totals["actions"] = count(db, "delegate_retry_action")
                 totals["parentFences"] = count(db, "delegate_retry_parent_fence")
-            need_v2 = version >= 10 or any(v for k, v in totals.items() if k != "jobs")
+            profile = consumer_profile(db) if version == 12 else None
+            need_v2 = (version in (10, 11) or profile == 2 or any(v for k, v in totals.items() if k != "jobs"))
             result = {"schema": version, "required": 2 if need_v2 else 1,
                       "absent": False, "counts": totals}
+            if profile is not None:
+                result["profile"] = profile
         db.rollback()
     finally:
         db.close()

@@ -9,6 +9,7 @@
 import { mkdirSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { withReceiptWriteBarrier } from '@openclaude/storage/receiptWriteBarrier'
+import { delegateIdentityGuardSql, delegateProfileGuardSql, readDelegateConsumerProfile } from '@openclaude/storage/delegateConsumerProfile'
 import { checkedReceiptToolOwner } from './receiptOwnerCapability.js'
 import type { ReceiptToolOwner } from './engine/engineAdapter.js'
 import { homedir } from 'node:os'
@@ -32,7 +33,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 11
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 12
 
 // Additive local SQLite schema; no FK/TTL cascade from runtime jobs to retry identity.
 const DDL_V9 = `
@@ -326,7 +327,10 @@ export class DelegateDurableDb {
     // Storage-level compatibility fence: schema9 processes, including already
     // open writers, cannot execute mutation statements after schema10 migration.
     this.db.function('oc_delegate_schema10', () => 10)
-    this.migrate()
+    try {
+      this.migrate()
+      readDelegateConsumerProfile(this.db)
+    } catch (error) { this.db.close(); throw error }
     this.upsertStmt = this.db.prepare(`
       INSERT INTO delegate_jobs (
         job_id, agent_id, state, kind, session_key, parent_session_key, generation,
@@ -601,7 +605,10 @@ export class DelegateDurableDb {
       // Obtain the migration writer lock before reading the version. A second
       // opener must observe the first opener's commit, not rerun its ALTER.
       const current = Number(this.db.pragma('user_version', { simple: true }) ?? 0)
-      if (current >= DELEGATE_DURABLE_SCHEMA_VERSION) return
+      if (!Number.isSafeInteger(current) || current < 0 || current > DELEGATE_DURABLE_SCHEMA_VERSION) {
+        throw new Error('unsupported delegate durable schema')
+      }
+      if (current === DELEGATE_DURABLE_SCHEMA_VERSION) return
       if (current < 1) this.db.exec(DDL_V1)
       if (current < 2) this.addNotifyDeliveryColumns()
       if (current < 3) this.addNotifyAAttemptedColumn()
@@ -642,6 +649,22 @@ export class DelegateDurableDb {
           CREATE TRIGGER identity_v10_delegate_jobs_update BEFORE UPDATE OF ${protectedColumns.join(',')} ON delegate_jobs
           BEGIN SELECT CASE WHEN oc_delegate_schema10() IS NOT 10
             THEN RAISE(ABORT,'delegate identity schema10 writer required') END; END;`)
+      }
+      if (current < 12) {
+        // Only an original 0..4 database can enter reversible C0 bootstrap.
+        // Existing 5..11 stays sealed even if all payloads have been retired.
+        const floor = current <= 4 ? 1 : 2
+        this.db.exec(`CREATE TABLE delegate_consumer_profile (
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          min_consumer INTEGER NOT NULL CHECK(min_consumer IN(1,2))
+        ); INSERT INTO delegate_consumer_profile VALUES(1,${floor});`)
+        // Original migrations10/11 are unchanged above. Rebuild their final
+        // rules canonically for12; no old writer can interleave this IMMEDIATE.
+        const guards = delegateIdentityGuardSql(this.db)
+        for (const name of guards.keys()) this.db.exec(`DROP TRIGGER ${name}`)
+        if (floor === 2) for (const sql of guards.values()) this.db.exec(sql)
+        for (const sql of delegateProfileGuardSql().values()) this.db.exec(sql)
+        readDelegateConsumerProfile(this.db)
       }
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
@@ -696,6 +719,20 @@ export class DelegateDurableDb {
     return this.db.transaction(fn)()
   }
 
+  /** Publish a v2 admission capability only AFTER this irreversible commit. */
+  sealConsumerV2(): void {
+    const seal = () => {
+      if (readDelegateConsumerProfile(this.db) === 2) return
+      for (const sql of delegateIdentityGuardSql(this.db).values()) this.db.exec(sql)
+      this.db.prepare('UPDATE delegate_consumer_profile SET min_consumer=2 WHERE id=1 AND min_consumer=1').run()
+      if (readDelegateConsumerProfile(this.db) !== 2) throw new Error('delegate consumer seal failed')
+    }
+    if (this.db.inTransaction) seal()
+    else this.db.transaction(seal).immediate()
+  }
+
+  get minimumConsumer(): 1 | 2 { return readDelegateConsumerProfile(this.db) }
+
   upsert(record: DurableJobRecord): void {
     this.throwIfInjectedFailure()
     this.transaction(() => {
@@ -744,6 +781,7 @@ export class DelegateDurableDb {
       if (receipt && (record.kind !== 'delegate' || record.callback !== 'stdout-wait' || record.callbackState !== 'none')) {
         throw new Error('receipt admission requires a new stdout-wait delegate')
       }
+      if (opts.failureInbox || receipt || source) this.sealConsumerV2()
       try {
         this.insertStmt.run(toRow(record))
       } catch (err) {
@@ -832,6 +870,9 @@ export class DelegateDurableDb {
     if (!ref.userId.trim() || !ref.clientSessionId.trim() || !Number.isSafeInteger(now)) throw new Error('invalid retry deletion identity')
     this.throwIfInjectedFailure()
     this.transaction(() => {
+      // New source capture is impossible until its store has sealed first.
+      // Do not turn an ordinary C0 session deletion into v2 activation.
+      if (readDelegateConsumerProfile(this.db) === 1) return
       this.db.prepare(`INSERT INTO delegate_retry_parent_fence VALUES(?,?,?) ON CONFLICT DO NOTHING`)
         .run(ref.userId, ref.clientSessionId, now)
       this.db.prepare(`DELETE FROM delegate_failure_inbox WHERE EXISTS (

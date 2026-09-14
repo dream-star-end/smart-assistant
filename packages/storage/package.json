@@ -29,6 +29,11 @@
       "types": "./src/receiptCandidateLifecycle.ts",
       "openclaude-precompiled": "./dist/receiptCandidateLifecycle.js",
       "default": "./src/receiptCandidateLifecycle.ts"
+    },
+    "./delegateConsumerProfile": {
+      "types": "./src/delegateConsumerProfile.ts",
+      "openclaude-precompiled": "./dist/delegateConsumerProfile.js",
+      "default": "./src/delegateConsumerProfile.ts"
     }
   },
   "dependencies": {
