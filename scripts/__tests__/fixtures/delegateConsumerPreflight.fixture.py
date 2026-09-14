@@ -58,6 +58,11 @@ try:
     for filename, encoded in OC206_ARTIFACT_FILES.items():
         f = root / filename; f.parent.mkdir(parents=True, exist_ok=True)
         f.write_bytes(base64.b64decode(encoded)); f.chmod(0o700)
+    # Match the actual canonical checkout, where the source rules are NOT
+    # colocated with scripts/lib. No rule contents or flavor policy change.
+    rules = root / 'packages/commercial/src/flavor/flavor-rules.json'
+    rules.parent.mkdir(parents=True)
+    (root / 'scripts/lib/flavor-rules.json').rename(rules)
     spec = importlib.util.spec_from_file_location('preflight', root / 'scripts/delegate-consumer-preflight.py')
     pf = importlib.util.module_from_spec(spec); spec.loader.exec_module(pf)
     mod = pf.artifacts
@@ -206,6 +211,45 @@ raise SystemExit(rc)
         assert r.returncode == 1 and (root / 'gate-called').read_text() == str(status), r.stderr
         (root / 'gate-called').unlink()
     out['cases'].append('original-cutover-incompatible-and-unknown-before-mutation')
+
+    # Real running PID1 process: a private synthetic import loader keeps node
+    # alive BEFORE loading any application. No copied/installed tsx dependency,
+    # model, network, or actual egress/gateway code is executed.
+    loader = lm / 'node_modules/tsx'
+    (loader / 'package.json').write_text('{"type":"module","exports":"./index.mjs"}')
+    (loader / 'index.mjs').write_text("import fs from 'node:fs'; fs.writeFileSync('runtime-probe-started', String(process.pid)); await new Promise(() => setInterval(() => {}, 1000));\n")
+    unit_file.write_text(unit_text(root / 'home-legacy').replace(
+        'ConditionPathExists=' + str(root / 'never-start') + '\n', '').replace(
+        '/usr/bin/npx tsx packages/cli/src/index.ts gateway',
+        '/usr/bin/node --import tsx packages/commercial/src/egress/main.ts'))
+    ctl('daemon-reload'); ctl('start', name)
+    until = time.monotonic() + 5
+    while not (lm / 'runtime-probe-started').exists() and time.monotonic() < until:
+        time.sleep(.02)
+    assert (lm / 'runtime-probe-started').exists(), 'private node import probe never started'
+    projection = mod.paths._capture_effective_unit(name, time.monotonic() + 10)['projection']
+    running = pf.runtime_snapshot(name, projection, str(lm), time.monotonic() + 10)
+    assert running['process'] is not None and running['properties']['MainPID'] == (lm / 'runtime-probe-started').read_text()
+    assert running['quiescenceProven'] is False
+    out['runtimeProbeStarted'] = True
+    out['cases'].append('actual-pid-cgroup-cwd-and-env-bound-not-quiescence')
+    env_file.write_text(saved.replace(image_id, 'sha256:' + '2' * 64))
+    changed_projection = mod.paths._capture_effective_unit(name, time.monotonic() + 10)['projection']
+    refused(lambda: pf.runtime_snapshot(name, changed_projection, str(lm), time.monotonic() + 10),
+            'disk-env-new-but-running-pid-old-refused')
+    env_file.write_text(saved)
+    refused(lambda: pf.runtime_snapshot(name, projection, str(cm), time.monotonic() + 10),
+            'live-selection-not-running-physical-cwd-refused')
+    ctl('stop', name)
+    stopped = pf.runtime_snapshot(name, projection, str(lm), time.monotonic() + 10)
+    assert stopped['process'] is None and stopped != running and stopped['quiescenceProven'] is False
+    out['cases'].append('stopped-process-invalidates-live-proof-not-subtree-death')
+    # Stable installed layout remains supported too; the same ORIGINAL rules
+    # move back beside the helper, without replacing contents or weakening policy.
+    rules.rename(root / 'scripts/lib/flavor-rules.json')
+    installed = mod.capture(str(cm), str(cr), str(repo), time.monotonic() + 30)
+    assert installed['runtime']['consumer'] == 2
+    out['cases'].append('canonical-and-colocated-original-policy-layouts-supported')
 except BaseException as exc:
     error = type(exc).__name__ + ': ' + str(exc)
     out['failure'] = error
@@ -235,4 +279,4 @@ finally:
     if cleanup_errors:
         out['cleanupFailures'] = cleanup_errors
 print(json.dumps(out))
-raise SystemExit(0 if error is None and len(out['cases']) == 11 and out['cleanupComplete'] else 1)
+raise SystemExit(0 if error is None and len(out['cases']) == 16 and out['cleanupComplete'] else 1)

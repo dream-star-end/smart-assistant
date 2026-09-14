@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import stat
 import sys
@@ -74,6 +75,82 @@ def image_snapshot(values, deadline):
     return values['OC_RUNTIME_IMAGE_ID']
 
 
+def runtime_snapshot(unit, projection, master, deadline):
+    """Loaded config is not proof that a running supervisor ate that config.
+
+    Read only the exact PID supplied by the local system manager. Pin its proc
+    directory and start time/cgroup; retain only non-secret projection values.
+    MainPID=0 is an inactive CONFIG snapshot, explicitly not subtree emptiness.
+    """
+    keys = {'MainPID', 'ControlGroup', 'ActiveState', 'SubState', 'InvocationID'}
+    def show():
+        raw = artifacts._run(['/usr/bin/systemctl', '--system', 'show', '--no-pager',
+                              '--property=' + ','.join(sorted(keys)), '--', unit], deadline)
+        result = {}
+        for line in raw.decode().splitlines():
+            key, sep, value = line.partition('=')
+            require(sep and key in keys and key not in result)
+            result[key] = value
+        require(set(result) == keys and result['MainPID'].isdigit())
+        return result
+    before = show()
+    pid = int(before['MainPID'])
+    if not pid:
+        require(before['ActiveState'] in {'inactive', 'failed'} and before['SubState'] in {'dead', 'failed'})
+        require(show() == before)
+        return {'properties': before, 'process': None, 'quiescenceProven': False}
+    require(before['ActiveState'] == 'active' and before['SubState'] == 'running')
+    require(re.fullmatch(r'[a-f0-9]{32}', before['InvocationID']))
+    cgroup = str(paths.path(before['ControlGroup']))
+    require(cgroup != '/')
+    fd = os.open('/proc/' + str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        require(info.st_uid == 0)
+        def read(name):
+            require(time.monotonic() < deadline)
+            file = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                data = bytearray()
+                while True:
+                    chunk = os.read(file, min(65536, paths.MAX_TEXT + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    require(len(data) <= paths.MAX_TEXT and time.monotonic() < deadline)
+                return bytes(data)
+            finally:
+                os.close(file)
+        def identity():
+            raw = read('stat').decode()
+            fields = raw[raw.rfind(')') + 2:].split()
+            require(len(fields) >= 20 and fields[0] not in {'Z', 'X'})
+            group = read('cgroup').decode().splitlines()
+            require(group == ['0::' + cgroup])
+            require(os.readlink('cwd', dir_fd=fd) == master)
+            return [info.st_dev, info.st_ino, fields[19], cgroup, master]
+        process = identity()
+        selected = {}
+        raw_env = read('environ')
+        require(raw_env.endswith(b'\0'))
+        for entry in raw_env[:-1].split(b'\0'):
+            key, sep, value = entry.partition(b'=')
+            require(sep)
+            # Do not decode or retain ignored credentials at all.
+            if key in {k.encode() for k in paths.PROJECTED_KEYS}:
+                key = key.decode(); require(key not in selected)
+                selected[key] = value.decode()
+        require({k: v for k, v in selected.items() if k in paths.TUPLE_KEYS} == projection['runtimeEnvironment'])
+        actual = paths.resolve_unit_paths({'environment': selected, 'environmentFiles': [],
+            'workingDirectory': master, 'argv': projection['argv']}, {}, pwd.getpwnam('root').pw_dir)
+        require(actual['database'] == projection['database'])
+        require(identity() == process and show() == before)
+        require(os.stat('/proc/' + str(pid)).st_ino == info.st_ino)
+        return {'properties': before, 'process': process, 'quiescenceProven': False}
+    finally:
+        os.close(fd)
+
+
 def capture_context(unit, master, values, repository, deadline):
     require(unit['projection']['runtimeEnvironment'] == values)
     code = artifacts.capture(master, values['OC_RUNTIME_RELEASE'], repository, deadline)
@@ -107,6 +184,7 @@ def initial(candidate_master, candidate_runtime, candidate_image, candidate_imag
     # systemctl implementation through its internal private-unit entrypoint.
     loaded = paths._capture_effective_unit(unit_name, deadline)
     require(loaded['projection']['workingDirectory'] == live)
+    running = runtime_snapshot(unit_name, loaded['projection'], current_master, deadline)
     current_values = tuple_values(loaded['projection']['runtimeEnvironment'])
     current = capture_context(loaded, current_master, current_values, repository, deadline)
     template = str(Path(candidate_master) / 'deploy/v5-selfhost' / MASTER)
@@ -137,6 +215,7 @@ def initial(candidate_master, candidate_runtime, candidate_image, candidate_imag
     revalidate_context(current, deadline)
     revalidate_context(candidate, deadline)
     require(paths._show_effective(unit_name, deadline)['plan'] == loaded['unitPlan'])
+    require(runtime_snapshot(unit_name, loaded['projection'], current_master, deadline) == running)
     require(link_snapshot(live) == selector)
     inventory.revalidate(inv)
     require(time.monotonic() < deadline)

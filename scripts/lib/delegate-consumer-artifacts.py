@@ -168,9 +168,16 @@ def _capture(master_release, runtime_release, repository, deadline):
     for lib in (master_lib, runtime_lib, flavor_lib):
         _, proof = paths._root_text(lib, deadline)
         proofs[lib] = proof
-    # Pin the same first rules file used by the original flavor parser; do not
-    # silently let its fallback search select an unrelated mutable policy.
-    _read(str(LIB / 'flavor-rules.json'), deadline, proofs)
+    # A canonical checkout keeps the original rules in packages/commercial;
+    # a stable installed helper keeps them colocated. Resolve via the ORIGINAL
+    # selector, allow only these two layouts, pin the file, and recheck the
+    # selection in the actual parser invocation. Never require an invented
+    # colocated file that the official checkout does not contain.
+    rules = _run(['/bin/bash', '-c', 'source "$1"; flavor_rules_path',
+                  'consumer-flavor-rules', flavor_lib], deadline).decode()
+    require(rules in {str(LIB / 'flavor-rules.json'),
+                      str(LIB.parent.parent / 'packages/commercial/src/flavor/flavor-rules.json')})
+    _read(rules, deadline, proofs)
     _run(['/bin/bash', '-c', '''set -euo pipefail
 die() { exit 2; }
 source "$1"
@@ -180,8 +187,9 @@ assert_master_release_static_gate "$2"
 source "$1"
 oc_hotcfg_verify_manifest_full "$2"
 source "$3"
+[[ "$(flavor_rules_path)" == "$4" ]]
 flavor_parse_manifest "$2/flavor.manifest.json" >/dev/null
-''', 'consumer-runtime-verify', runtime_lib, runtime_release, flavor_lib], deadline)
+''', 'consumer-runtime-verify', runtime_lib, runtime_release, flavor_lib, rules], deadline)
     require(flavor.get('flavor') == 'selfhost' and flavor.get('builder') == 'deploy-v5-selfhost.sh')
     require(manifest.get('sourceCommit') == flavor.get('sourceCommit'))
     require(isinstance(manifest.get('digest'), str) and re.fullmatch(r'[a-f0-9]{12}', manifest['digest']))
