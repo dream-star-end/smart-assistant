@@ -14,11 +14,12 @@ import { SubprocessRunner } from '../../subprocessRunner.js'
 import { CcbAdapter } from '../../engine/ccbAdapter.js'
 import { DelegateDurableDb } from '../../delegateDurable.js'
 
-const requestedMode=process.argv[3] || 'end';const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const handoffIngested=requestedMode==='handoff-ingested';const mixed=requestedMode==='handoff-mixed';let mixedStage=0,mixedBefore:any;let mixedRows:any[]=[];const mode=handoffIngested?'ingested-end':handoff?'cross-turn':requestedMode;let jobToWait='',discovered=false,handoffWaiting=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
+const requestedMode=process.argv[3] || 'end';const kairos=requestedMode==='kairos';let creatorRequestAt=0,kairosElapsedMs:number|undefined;const handoff=requestedMode.startsWith('handoff-');const wrapped=requestedMode==='handoff-deferred';const mcp=wrapped||requestedMode==='handoff-mcp';const handoffIngested=requestedMode==='handoff-ingested';const mixed=requestedMode==='handoff-mixed';let mixedStage=0,mixedBefore:any;let mixedRows:any[]=[];const mode=handoffIngested||kairos?'ingested-end':handoff?'cross-turn':requestedMode;let jobToWait='',discovered=false,handoffWaiting=false;assert.ok(['end','kill','cross-turn','ingested-end'].includes(mode))
 let releaseChild:()=>void=()=>{};const childGate=new Promise<void>(r=>{releaseChild=r});let releaseCurrent:()=>void=()=>{};const currentGate=new Promise<void>(r=>{releaseCurrent=r})
 const root=fileURLToPath(new URL('../../../../../',import.meta.url)).replace(/\/$/,'')
 const dir=process.argv[2]; assert.ok(dir)
 mkdirSync(dir,{recursive:true}); mkdirSync(join(dir,'native'),{recursive:true})
+if(kairos)writeFileSync(join(dir,'native','.claude.json'),JSON.stringify({projects:{[join(root,'claude-code-best')]:{hasTrustDialogAccepted:true},[root]:{hasTrustDialogAccepted:true}}}),{mode:0o600})
 const token=randomBytes(32).toString('hex'), session='agent:main:webchat:dm:real-model-cli', turnKey='real-model-cli-turn'
 const requests:any[]=[], sdk:any[]=[], http:any[]=[]
 let phase=0, executions=0, received=false, failure:any
@@ -41,7 +42,7 @@ function send(res:any,body:any,tool:boolean,wait=false) {
  const id='synthetic_'+randomBytes(6).toString('hex');
  let content:any=tool?{type:'tool_use',id:wait?(handoffIngested&&!handoffWaiting?'real_ingest_checkpoint':'real_waiter'):'real_creator',name:'Bash',input:wait?
   {command:handoff&&(!handoffIngested||handoffWaiting)?`node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${jobToWait}`:'printf background-checkpoint',timeout:20000}:
-  {command,timeout:20000,run_in_background:true}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
+  {command,timeout:kairos?60000:20000,run_in_background:!kairos}}:{type:'text',text:'SYNTHETIC_MODEL_DONE'}
  if(tool&&wait&&mixed) {
   const cmd=mixedStage===1?`timeout --signal=TERM 8s ${cli.replace('synthetic-child-only','current-good')}; timeout --signal=TERM 8s ${cli.replace('synthetic-child-only','current-bad')}`:
    `node --import ${root}/node_modules/tsx/dist/loader.mjs ${root}/packages/mcp-memory/src/ocMemoryCli.ts delegate-wait ${jobToWait} ${mixedRows.map(r=>r.job_id).join(' ')}; code=$?; printf 'MIXED_WAIT_EXIT:%s ORDINARY_STDOUT' "$code"; printf 'ORDINARY_STDERR' >&2; exit "$code"`
@@ -91,10 +92,11 @@ const upstream=createServer(async(req,res)=>{
    mixedStage=2;send(res,body,true,true)
   }
   else if(main&&phase===0){
-    phase++;send(res,body,true)
+    creatorRequestAt=Date.now();phase++;send(res,body,true)
   }
   else if(main&&phase===1){
      assert.ok(!raw.includes(sentinel),'background placeholder cannot contain result')
+     if(kairos){kairosElapsedMs=Date.now()-creatorRequestAt;assert.ok(raw.includes('assistant-mode blocking budget (15s)'), 'must be the original Kairos timer, not onTimeout or explicit background');assert.ok(kairosElapsedMs>=15000)}
      const deadline=Date.now()+20000
      while(executions!==1){assert.ok(Date.now()<deadline,'create deadline');await new Promise(r=>setTimeout(r,20))}
      savedOwner=adapter.getReceiptToolOwner('real_creator');assert.ok(savedOwner?.parentProcess)
@@ -134,7 +136,7 @@ Object.assign(process.env,{OPENCLAUDE_HOME:dir,OPENCLAUDE_DELEGATE_JOBS_DB:dbPat
 const {upsertClientSession}=await import('../../../../storage/src/sessionsDb.js')
 await upsertClientSession({id:'real-model-cli',userId:'default',agentId:'main',title:'private lifecycle fixture',pinned:false,
  createdAt:1000,lastAt:1000,updatedAt:1000,messages:[]})
-const config:any={version:1,gateway:{bind:'127.0.0.1',port:0,accessToken:token},auth:{mode:'subscription',claudeCodePath:join(root,'claude-code-best'),claudeCodeEntry:'scripts/dev.ts'},sessions:{dbPath:join(dir,'sessions.db')},defaults:{model:'claude-sonnet-4-5-20250929',permissionMode:'bypassPermissions'},channels:{webchat:{enabled:true}},terminal:{type:'local'}}
+const config:any={version:1,gateway:{bind:'127.0.0.1',port:0,accessToken:token},auth:{mode:'subscription',claudeCodePath:join(root,'claude-code-best'),claudeCodeEntry:kairos?fileURLToPath(new URL('./receiptKairosCli.fixture.ts',import.meta.url)):'scripts/dev.ts'},sessions:{dbPath:join(dir,'sessions.db')},defaults:{model:'claude-sonnet-4-5-20250929',permissionMode:'bypassPermissions'},channels:{webchat:{enabled:true}},terminal:{type:'local'}}
 const gw=new Gateway({config,agentsConfig:{agents:[{id:'main',model:config.defaults.model}],routes:[],default:'main'}} as any)
 // Keep the actual production constructor, terminal hook, boot/retry scheduler and notifier.
 // Only fixture enrollment opts in; production gate is unchanged and asserted closed.
@@ -278,7 +280,7 @@ finally {
  clearTimeout((gw as any)._notifyRetryTimer);clearTimeout((gw as any)._delegateReconcileTimer);clearInterval((gw as any)._delegateReapTimer)
  server.closeAllConnections();upstream.closeAllConnections();master.closeAllConnections()
  await Promise.all([new Promise<void>(r=>server.close(()=>r())),new Promise<void>(r=>upstream.close(()=>r())),new Promise<void>(r=>master.close(()=>r()))])
- writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,mixedBefore,masterRequests,accepted:[...accepted.values()],terminalCalls:terminalWork.length,killedSignal,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup, child executor, enrollment opt-in and master receiver fixtures; actual production store hooks, recovery, notifier and HTTP client'},null,2))
+ writeFileSync(join(dir,'evidence.json'),JSON.stringify({mode:requestedMode,kairosElapsedMs,mixedBefore,masterRequests,accepted:[...accepted.values()],terminalCalls:terminalWork.length,killedSignal,requests,http,sdk,nativeSession:runner.sessionId,phase,executions,received,failure:failure?String(failure):null,boundary:'actual SubprocessRunner+CCB CLI/SDK/HTTP/SQLite; SessionManager lookup, child executor, enrollment opt-in and master receiver fixtures; actual production store hooks, recovery, notifier and HTTP client'},null,2))
  jobs.close()
 }
 

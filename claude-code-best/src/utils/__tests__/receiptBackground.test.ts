@@ -25,6 +25,43 @@ import { clearSessionMessagesCache, resetProjectForTesting, getProjectDir, flush
   recordTranscript, loadFullLog, getTranscriptPath } from '../sessionStorage.js'
 import { gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from '../../../../packages/mcp-memory/src/gatewayClient.js'
 import { signJwt } from '../../../../packages/gateway/src/auth.js'
+import { createElement } from 'react'
+import { PassThrough, Writable } from 'node:stream'
+import { renderSync, KeybindingProvider } from '@anthropic/ink'
+import { AppStoreContext } from '../../state/AppState.js'
+import { SessionBackgroundHint } from '../../components/SessionBackgroundHint.js'
+import { DEFAULT_BINDINGS } from '../../keybindings/defaultBindings.js'
+import { parseBindings } from '../../keybindings/parser.js'
+
+/** Real mounted component + Ink's stdin parser, not a direct backgroundAll call.
+ * The terminal stream and AppState store adapter are test fixtures, not a PTY. */
+async function mountBackgroundKeyboard(ctx: ReturnType<typeof context>) {
+  const input = new PassThrough()
+  const output = new Writable({ write(_chunk, _encoding, done) { done() } })
+  let rawEnabled = false
+  Object.assign(input, { isTTY: true, setRawMode(on: boolean) { rawEnabled = on; return input }, ref() { return input }, unref() { return input } })
+  Object.assign(output, { isTTY: true, columns: 100, rows: 30 })
+  const listeners = new Set<() => void>()
+  const originalSet = ctx.setAppState
+  ctx.setAppState = (update: unknown) => { originalSet(update); for (const notify of listeners) notify() }
+  const store = { getState: ctx.getAppState, setState: ctx.setAppState,
+    subscribe(notify: () => void) { listeners.add(notify); return () => { listeners.delete(notify) } } }
+  const registry = { current: new Map() }, pending = { current: null }
+  const ui = renderSync(createElement(AppStoreContext.Provider, { value: store },
+    createElement(KeybindingProvider, { bindings: parseBindings(DEFAULT_BINDINGS), pendingChordRef: pending,
+      pendingChord: null, setPendingChord() {}, activeContexts: new Set(['Task']), registerActiveContext() {},
+      unregisterActiveContext() {}, handlerRegistryRef: registry,
+      children: createElement(SessionBackgroundHint, { isLoading: true, onBackgroundSession() { throw new Error('must background the shell, not the session') } }),
+    })), { stdin: input as unknown as NodeJS.ReadStream, stdout: output as unknown as NodeJS.WriteStream,
+      stderr: output as unknown as NodeJS.WriteStream, exitOnCtrlC: false, patchConsole: false })
+  const exited = ui.waitUntilExit()
+  const close = async () => { ui.unmount(); await exited; ui.cleanup(); ctx.setAppState = originalSet; input.destroy(); output.destroy() }
+  try {
+    await until(() => registry.current.has('task:background'))
+    expect(rawEnabled).toBe(true)
+    return { press() { input.write('\x02') }, close }
+  } catch (error) { await close(); throw error }
+}
 
 const root = fileURLToPath(new URL('../../../../', import.meta.url))
 let dir: string
@@ -239,7 +276,9 @@ test('Stop after confirmed enqueue never admits original text or acknowledges re
   expect(f.inspect().receipt.state).toBe('offered')
 }, 60000)
 
-test('actual background-completion handoff keeps an active-turn receipt path', async () => {
+for (const backgroundMode of ['direct-handoff', 'keyboard'] as const) test(backgroundMode === 'keyboard'
+  ? 'actual Ctrl+B stdin through mounted hint keeps exactly one receipt input'
+  : 'actual background-completion handoff keeps an active-turn receipt path', async () => {
   const f = await fixture(); await seedLocator(f)
   const opts = f.options('waiter'), ctx = context()
   ctx.setToolJSX = () => {}
@@ -248,14 +287,22 @@ test('actual background-completion handoff keeps an active-turn receipt path', a
   const ready = join(dir, 'exit-ready'), release = join(dir, 'exit-release'), preload = join(dir, 'gate-exit.mjs')
   await fs.writeFile(preload, `import {writeFileSync,existsSync} from 'node:fs';const end=process.exit.bind(process);process.exit=(code)=>{writeFileSync(${JSON.stringify(ready)},'ready');setInterval(()=>{if(existsSync(${JSON.stringify(release)}))end(code)},5)}`)
   const command = `node --import ${JSON.stringify(preload)} --import ${JSON.stringify(join(root,'node_modules/tsx/dist/loader.mjs'))} ${JSON.stringify(join(root,'packages/mcp-memory/src/ocMemoryCli.ts'))} delegate-wait ${f.info.jobId}`
-  opts.assistantMessage.message.content[0].input = { command, timeout:20000 }
+  opts.assistantMessage.message.content[0].input = { command, timeout:backgroundMode==='keyboard'?60000:20000 }
   const first = createUserMessage({content:'background completion race'});ctx.messages=[first]
   const persisted:any[]=[first]
-  const stream=query({messages:[first],systemPrompt:asSystemPrompt([]),userContext:{},systemContext:{},canUseTool:async(_tool: unknown,input: unknown)=>({behavior:'allow',updatedInput:input}),toolUseContext:ctx,querySource:'sdk',maxTurns:1,deps:{uuid:randomUUID,microcompact:async(messages:unknown[])=>({messages}),autocompact:async()=>({compactionResult:undefined,consecutiveFailures:0}),callModel:async function*(){yield opts.assistantMessage}}} as any)
+  let keyboardModelCalls=0
+  const stream=query({messages:[first],systemPrompt:asSystemPrompt([]),userContext:{},systemContext:{},canUseTool:async(_tool: unknown,input: unknown)=>({behavior:'allow',updatedInput:input}),toolUseContext:ctx,querySource:'sdk',maxTurns:backgroundMode==='keyboard'?2:1,deps:{uuid:randomUUID,microcompact:async(messages:unknown[])=>({messages}),autocompact:async()=>({compactionResult:undefined,consecutiveFailures:0}),callModel:async function*(){keyboardModelCalls++;if(keyboardModelCalls===1)yield opts.assistantMessage;else{await until(()=>getCommandQueue().length>0);const checkpoint=f.options('creator').assistantMessage;checkpoint.message.content[0].input={command:'printf keyboard-checkpoint'};yield checkpoint}}}} as any)
   const running=(async()=>{for await(const message of stream)if(['user','assistant','system'].includes(message.type)){persisted.push(message);await recordTranscript(persisted)}})()
+  let keyboard: Awaited<ReturnType<typeof mountBackgroundKeyboard>> | undefined
   try {
     await until(()=>existsSync(ready)&&Object.values(ctx.getAppState().tasks).some((t:any)=>t.status==='running'&&!t.isBackgrounded))
-    backgroundAll(ctx.getAppState,ctx.setAppState)
+    if (backgroundMode === 'keyboard') {
+      keyboard = await mountBackgroundKeyboard(ctx)
+      expect(f.inspect().receipt.state).toBe('offered')
+      keyboard.press()
+      await until(() => Object.values(ctx.getAppState().tasks).some((t:any) => t.isBackgrounded))
+      await until(() => keyboardModelCalls===2) // placeholder must return before child completion
+    } else backgroundAll(ctx.getAppState,ctx.setAppState)
     await fs.writeFile(release,'release')
     await running
     await until(()=>Object.values(ctx.getAppState().tasks).some((t:any)=>t.status==='completed'&&t.shellCommand===null))
@@ -269,5 +316,6 @@ test('actual background-completion handoff keeps an active-turn receipt path', a
     const paired=restored.messages.flatMap((m:any)=>m.type==='user'&&Array.isArray(m.message?.content)?m.message.content.filter((b:any)=>b.type==='tool_result'&&b.tool_use_id==='waiter'):[])
     expect(paired).toHaveLength(1)
     expect(getCommandQueue()).toHaveLength(0)
-  } finally {await fs.writeFile(release,'release');await running}
+    if(backgroundMode==='keyboard'){expect(keyboardModelCalls).toBe(2);expect(JSON.stringify(paired)).toContain('manually backgrounded by user')}
+  } finally {await fs.writeFile(release,'release');try {await running} finally {await keyboard?.close()}}
 },60000)

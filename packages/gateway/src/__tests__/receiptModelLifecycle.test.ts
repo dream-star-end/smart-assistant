@@ -20,8 +20,8 @@ async function run(command:string,args:string[],home:string) {
   return out
  }finally{clearTimeout(timer)}
 }
-for(const mode of ['end','kill','cross-turn','ingested-end','handoff-cli','handoff-running','handoff-ingested','handoff-mixed','handoff-mcp','handoff-deferred'] as const)test(`actual parent lifecycle model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
- const ingested=mode==='ingested-end'||mode==='handoff-ingested',mixed=mode==='handoff-mixed'
+for(const mode of ['end','kill','cross-turn','ingested-end','kairos','handoff-cli','handoff-running','handoff-ingested','handoff-mixed','handoff-mcp','handoff-deferred'] as const)test(`actual parent lifecycle model CLI receipt ${mode} and new-process native restore`,{timeout:240000},async()=>{
+ const ingested=mode==='ingested-end'||mode==='handoff-ingested'||mode==='kairos',mixed=mode==='handoff-mixed'
  const dir=mkdtempSync(join(tmpdir(),'receipt-model-cli-'))
  try {
   const out=await run(process.execPath,['--import',join(root,'node_modules/tsx/dist/loader.mjs'),fixture,dir,mode],dir)
@@ -33,6 +33,7 @@ for(const mode of ['end','kill','cross-turn','ingested-end','handoff-cli','hando
   if(mixed){assert.deepEqual(e.mixedBefore.states,['notified','ingested','offered']);assert.equal(e.mixedBefore.callbacks,1);assert.ok(e.accepted.every((v:{text:string})=>!v.text.includes('REAL_MODEL_CLI_AUTHORITATIVE_RESULT2')))}
   assert.ok(e.terminalCalls>=1);if(mode==='kill')assert.equal(e.killedSignal,'SIGKILL')
   assert.equal(e.received,ingested||mixed)
+  if(mode==='kairos')assert.ok(e.kairosElapsedMs>=15000,'real unchanged 15s timer must run')
   assert.ok(e.http.some((r:{path:string;status:number})=>r.path==='/api/agents/coding-assistant/delegate'&&r.status===200))
   const restored=await run('bun',['run',restore,dir,ingested||mixed?'create':'stop'],dir)
   const proof=JSON.parse(restored.trim().split('\n').pop()!)
