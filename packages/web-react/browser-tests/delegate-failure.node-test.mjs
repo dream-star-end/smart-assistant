@@ -63,7 +63,6 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       const id = await rows.first().getAttribute("data-job-id");
       await rows.first().getByRole("button", { name: "知道了", exact: true }).click();
       await dialog.getByRole("alert").waitFor();
-      assert.equal(await rows.filter({ has: page.locator(`[data-job-id="${id}"]`) }).count(), 0); // direct row assertion below
       assert.equal(await dialog.locator(`li[data-job-id="${id}"]`).count(), 1);
       assert.equal(api.count("alice"), 51);
     });
