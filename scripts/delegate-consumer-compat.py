@@ -19,7 +19,10 @@ import time
 
 CAP = "delegate-receipt-consumer-v2"
 MAX_DATABASES = 4096
-MAX_METADATA = 1024 * 1024
+# Runtime MANIFEST includes the complete files[] index (~8 MiB in current
+# artifacts), not just capability tokens. Keep a hard bound without rejecting
+# every genuine runtime manifest before the original consumer checks run.
+MAX_METADATA = 16 * 1024 * 1024
 MAX_BUDGET_MS = 30000
 JOB_COLUMNS = """job_id agent_id state kind session_key parent_session_key generation
 owner_instance_id owner_lease_until claim_token attempt_no fencing_epoch

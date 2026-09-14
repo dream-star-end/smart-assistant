@@ -173,7 +173,8 @@ def resolve_unit_paths(plan, environment_files, passwd_home):
             "workingDirectory": plan["workingDirectory"], "argv": plan["argv"]}
 
 
-def _root_identity(filename, *, optional=False):
+def _root_identity(filename, *, optional=False, max_bytes=MAX_TEXT):
+    require(type(max_bytes) is int and 0 < max_bytes <= 16 * 1024 * 1024)
     current, chain = Path('/'), []
     parts = path(filename).parts[1:]
     require(parts)
@@ -186,7 +187,7 @@ def _root_identity(filename, *, optional=False):
             return {"path": filename, "ancestors": chain, "file": None}
         require(item.st_uid == 0 and not (item.st_mode & 0o022))
         if index == len(parts) - 1:
-            require(stat.S_ISREG(item.st_mode) and item.st_size <= MAX_TEXT)
+            require(stat.S_ISREG(item.st_mode) and item.st_size <= max_bytes)
             return {"path": filename, "ancestors": chain, "file": _file_identity(item)}
         require(stat.S_ISDIR(item.st_mode))
         chain.append([item.st_dev, item.st_ino, item.st_uid, item.st_mode])
@@ -198,9 +199,10 @@ def _file_identity(info):
             info.st_mtime_ns, info.st_ctime_ns]
 
 
-def _root_text(filename, deadline, *, optional=False):
+def _root_text(filename, deadline, *, optional=False, max_bytes=MAX_TEXT):
     require(time.monotonic() < deadline)
-    proof = _root_identity(filename, optional=optional)
+    require(type(max_bytes) is int and 0 < max_bytes <= 16 * 1024 * 1024)
+    proof = _root_identity(filename, optional=optional, max_bytes=max_bytes)
     if proof['file'] is None:
         return None, proof
     fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -209,13 +211,13 @@ def _root_text(filename, deadline, *, optional=False):
         chunks, length = [], 0
         while True:
             require(time.monotonic() < deadline)
-            chunk = os.read(fd, min(65536, MAX_TEXT + 1 - length))
+            chunk = os.read(fd, min(65536, max_bytes + 1 - length))
             if not chunk:
                 break
             chunks.append(chunk); length += len(chunk)
-            require(length <= MAX_TEXT)
+            require(length <= max_bytes)
         require(_file_identity(os.fstat(fd)) == proof['file'])
-        require(_root_identity(filename) == proof)
+        require(_root_identity(filename, max_bytes=max_bytes) == proof)
         return b''.join(chunks).decode('utf-8'), proof
     finally:
         os.close(fd)
