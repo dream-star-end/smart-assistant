@@ -36,9 +36,11 @@ import {
   attachTurnAuthority,
   buildContainerAttestFrame,
   getTurnAuthority,
+  getConsumedAuthorityUserId,
   stripModelAuthorityField,
   type TurnExecutionDescriptor,
 } from '../modelAuthority.js'
+import { DelegatePublicOwnerBindings } from '../delegatePublicOwner.js'
 import { resolveEngine } from '../engine/registry.js'
 import { resolveExecutionModel } from '../server.js'
 
@@ -631,5 +633,33 @@ describe('descriptor 驱动执行选择(engine / model)', () => {
     assert.equal(d.codexDefaultEffort, 'xhigh')
     assert.deepEqual([...d.supportedEfforts], ['medium', 'xhigh'])
     assert.equal(d.supportsVision, true)
+  })
+})
+
+
+describe('D14 consumed public owner provenance', () => {
+  test('actual signed consume binds only original root and descriptor objects', () => {
+    const key=makeKey('identity'), consumer=makeConsumer(key), conn=consumer.newConnection()
+    const frame=mintFrame(key,{connectionChallenge:conn.challenge})
+    const descriptor=consumer.consume(frame,conn), owners=new DelegatePublicOwnerBindings()
+    const root={sessionKey:'agent:main:webchat:dm:private',userId:'default',agentId:'main',channel:'webchat',peerId:'private'}
+    assert.equal(getConsumedAuthorityUserId({...descriptor}),undefined)
+    owners.bind(root,{...descriptor}); assert.equal(owners.get(root),undefined)
+    const fakeFrame={_userId:'c:42'}; attachTurnAuthority(fakeFrame,{...descriptor})
+    owners.bind(root,getTurnAuthority(fakeFrame)); assert.equal(owners.get(root),undefined)
+    owners.bind(root,descriptor); assert.equal(owners.get(root),'c:42');assert.equal(root.userId,'default')
+    assert.equal(owners.get({...root}),undefined,'new/restored object is not a new-create public witness')
+    assert.throws(()=>consumer.consume(frame,conn), (e: unknown)=>e instanceof AuthorityRejected && e.code==='replay')
+    root.peerId='changed';assert.throws(()=>owners.get(root),/identity changed/)
+  })
+  test('valid other UID and wrong signature cannot overwrite the same root association', () => {
+    const key=makeKey('identity'), consumer=makeConsumer(key), conn=consumer.newConnection()
+    const owners=new DelegatePublicOwnerBindings(),root={sessionKey:'agent:main:webchat:dm:p',userId:'default',agentId:'main',channel:'webchat',peerId:'p'}
+    owners.bind(root,consumer.consume(mintFrame(key,{connectionChallenge:conn.challenge}),conn))
+    const other=new ModelAuthorityConsumer({keyring:keyring(key),uid:43,containerId:CONTAINER_ID,clock:()=>NOW}), c=other.newConnection()
+    const d=other.consume(mintFrame(key,{uid:43,connectionChallenge:c.challenge}),c)
+    assert.throws(()=>owners.bind(root,d),/binding changed/); assert.equal(owners.get(root),'c:42')
+    const forged=mintFrame(makeKey('identity'),{connectionChallenge:conn.challenge})
+    assert.throws(()=>consumer.consume(forged,conn));assert.equal(owners.get(root),'c:42')
   })
 })

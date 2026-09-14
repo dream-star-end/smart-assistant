@@ -274,6 +274,12 @@ export class AuthorityReplayCache implements AuthorityReplayGuard {
  * 根本无法表达,伪造面为 0。签名字段 `__oc_model_authority` 本身则在每个入口被无条件 strip。
  */
 const authorityByFrame = new WeakMap<object, TurnExecutionDescriptor>()
+// Only successful consumption mints this provenance. attachTurnAuthority and
+// copied descriptor fields are not proof of a verified public user identity.
+const consumedAuthorityUsers = new WeakMap<object, string>()
+export function getConsumedAuthorityUserId(descriptor: TurnExecutionDescriptor | undefined): string | undefined {
+  return descriptor ? consumedAuthorityUsers.get(descriptor) : undefined
+}
 
 export function attachTurnAuthority(frame: object, descriptor: TurnExecutionDescriptor): void {
   authorityByFrame.set(frame, descriptor)
@@ -532,7 +538,7 @@ export class ModelAuthorityConsumer {
       this.maxSeenEpoch = payload.securityEpoch
     }
 
-    return {
+    const descriptor: TurnExecutionDescriptor = {
       canonicalModel: payload.canonicalModel,
       engine: payload.engine,
       contextWindow: descriptorRaw.contextWindow,
@@ -552,6 +558,8 @@ export class ModelAuthorityConsumer {
       authorityEnvelope: bundle.authority,
       leaseEnvelope: bundle.lease,
     }
+    consumedAuthorityUsers.set(descriptor, `c:${payload.uid}`)
+    return descriptor
   }
 }
 

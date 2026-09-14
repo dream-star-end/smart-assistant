@@ -8,6 +8,8 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { test } from 'node:test'
 import Database from 'better-sqlite3'
+import { DelegatePublicOwnerBindings } from '../delegatePublicOwner.js'
+import { signedOwner } from './fixtures/delegateSignedOwner.fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'delegate-retry-source-'))
 process.env.OPENCLAUDE_HOME = home
@@ -27,11 +29,11 @@ function gate() {
   const promise = new Promise<void>(resolve => { release = resolve })
   return { promise, release }
 }
-async function fixture(peer?: string) {
+async function fixture(peer?: string, physicalUser = 'c:7') {
   const dir = mkdtempSync(join(home, 'case-')), peerId = peer ?? dir.split('/').pop()!
-  await storage.upsertClientSession({ id: peerId, userId: 'c:7', agentId: 'main', title: 'private source',
+  await storage.upsertClientSession({ id: peerId, userId: physicalUser, agentId: 'main', title: 'private source',
     pinned: false, createdAt: 1000, lastAt: 1000, updatedAt: 1000, messages: [] })
-  const parent: any = { agentId: 'main', userId: 'c:7', sessionKey: 'agent:main:webchat:dm:' + peerId,
+  const parent: any = { agentId: 'main', userId: physicalUser, sessionKey: 'agent:main:webchat:dm:' + peerId,
     _currentTurnKey: 'private-source-turn', channel: 'webchat', peerId, runner: {} }
   let visible = parent, now = Date.now(), executions = 0
   const path = join(dir, 'delegate.db'), db = new DelegateDurableDb(path)
@@ -62,6 +64,7 @@ async function fixture(peer?: string) {
     return { status: res.status, data }
   }
   const sql = new Database(path)
+  sql.function('oc_delegate_schema10', () => 10)
   const counts = () => ({ jobs: (sql.prepare('SELECT count(*) n FROM delegate_jobs').get() as { n: number }).n,
     sources: (sql.prepare('SELECT count(*) n FROM delegate_retry_source').get() as { n: number }).n,
     executions, active: gw._activeDelegations, resume: gw._delegateResume?.reservedSize() ?? 0,
@@ -429,4 +432,40 @@ test('D14 create persists only the actual parent workspace witness, not request 
     assert.throws(() => f.jobs.create('coding-assistant', { callbackOriginUserId: source.userId, parentSessionKey: source.parentSessionKey, sessionKey: source.childSessionKey, retrySource: { ...source, parentWorkspaceMode: 'forged' } as any }), /workspace/)
     assert.deepEqual(f.counts(), before)
   } finally { await f.close() }
+})
+
+
+test('D14 mapped source actual HTTP captures signed owner, public inbox isolation and physical deletion', async () => {
+  const f=await fixture(undefined,'default')
+  try {
+    f.gw._delegatePublicOwners=new DelegatePublicOwnerBindings()
+    f.gw._delegatePublicOwners.bind(f.parent,signedOwner(7))
+    const made=await f.post();assert.equal(made.status,200,JSON.stringify(made))
+    const source=f.db.getRetrySource('c:7',made.data.jobId,0)!
+    assert.equal(source.userId,'c:7');assert.equal(source.storageUserId,'default');assert.equal(f.parent.userId,'default')
+    assert.equal(f.db.getRetrySource('default',made.data.jobId,0),undefined)
+    const owner=await userRequest(f,'/api/delegates/inbox','GET'),foreign=await userRequest(f,'/api/delegates/inbox','GET',undefined,jwt('c:8'))
+    assert.equal(owner.status,200);assert.equal(f.jobs.userFailureInbox('c:7').count,1)
+    assert.equal(foreign.status,200);assert.equal(f.jobs.userFailureInbox('c:8').count,0)
+    assert.equal(f.jobs.userSummary('c:7').unacknowledgedFailures,1);assert.equal(f.jobs.userSummary('default').unacknowledgedFailures,0)
+    const key={userId:'c:7',sourceJobId:made.data.jobId,generation:0,actionId:'private-mapped-action-0001'}
+    const accepted=f.jobs.acceptRetryAction(key,source,'ccb');assert.ok('kind' in accepted && accepted.kind==='accepted')
+    if (!('kind' in accepted)) throw Error('accept failed')
+    assert.equal(f.jobs.snapshotOf(accepted.action.targetJobId)?.callbackOriginUserId,'default')
+    assert.equal(f.jobs.userSummary('c:7').queued,1);assert.equal(f.jobs.userSummary('default').queued,0)
+    const deleted=await userRequest(f,'/api/sessions/'+f.peerId,'DELETE',undefined,jwt('default'))
+    assert.equal(deleted.status,200);assert.equal(f.db.getRetrySource('c:7',made.data.jobId,0),undefined)
+    assert.equal(f.jobs.userFailureInbox('c:7').count,0);assert.equal(f.jobs.getRetryAction(key)?.state,'source_deleted')
+    assert.equal(f.jobs.userSummary('c:7').queued,0);assert.equal(f.jobs.acknowledgeUserFailure('c:7',made.data.jobId,0),false)
+    const reopened=new DelegateDurableDb(f.path)
+    try {assert.equal(reopened.getRetryAction(key)?.targetJobId,accepted.action.targetJobId);assert.equal(reopened.getRetryAction(key)?.state,'source_deleted')}
+    finally {reopened.close()}
+  } finally {await f.close()}
+})
+
+test('D14 physical default without consumed witness cannot claim public owner by body or JWT', async () => {
+  const f=await fixture(undefined,'default')
+  try {const denied=await f.post({userId:'c:7',storageUserId:'default',retrySource:{userId:'c:7'}})
+    assert.equal(denied.status,403);assert.equal(f.counts().jobs,0);assert.equal(f.counts().executions,0)
+  } finally {await f.close()}
 })

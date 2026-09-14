@@ -20,7 +20,7 @@ import {
   type DelegateJobState,
 } from '@openclaude/protocol'
 import type { DelegateDurableDb, DurableJobRecord, DelegateReceiptContext } from './delegateDurable.js'
-import type { DelegateRetrySource, DelegateRetryActionKey } from './delegateRetrySource.js'
+import { delegateRetryStorageUser, type DelegateRetrySource, type DelegateRetryActionKey } from './delegateRetrySource.js'
 
 export const DEFAULT_DELEGATE_JOB_TTL_MS = 2 * 60 * 60_000
 export const MIN_DELEGATE_JOB_TTL_MS = 60_000
@@ -472,7 +472,7 @@ export class DelegateJobStore {
     if (!this.sm || !this.durable) throw new Error('delegate retry requires durable state machine')
     const entry = this.newEntry(source.targetAgentId, { queued: true, kind: 'delegate', callback: 'origin-inject',
       sessionKey: source.childSessionKey, parentSessionKey: source.parentSessionKey,
-      callbackOriginSessionKey: source.originSessionKey, callbackOriginUserId: source.userId, parentEngine })
+      callbackOriginSessionKey: source.originSessionKey, callbackOriginUserId: delegateRetryStorageUser(source), parentEngine })
     const outcome = this.durable.acceptRetryAction(key, source, this.toDurable(entry), this.maxJobs)
     if ('kind' in outcome && outcome.kind === 'accepted') this.ingestDurableRow(outcome.target!)
     return outcome
@@ -488,6 +488,7 @@ export class DelegateJobStore {
     if (!this.durable) throw new Error('delegate retry requires durable store')
     return this.durable.hasActiveRetryChild(sessionKey)
   }
+  getRetrySourceForJob(jobId: string, generation: number) { return this.durable?.getRetrySourceForJob(jobId, generation) }
   getRetrySource(userId: string, jobId: string, generation: number) {
     if (!this.durable) throw new Error('delegate retry requires durable store')
     return this.durable.getRetrySource(userId, jobId, generation)

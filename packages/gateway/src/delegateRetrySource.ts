@@ -2,6 +2,8 @@
 export type DelegateRetrySource = Readonly<{
   version: 1
   userId: string
+  /** Physical session/client/callback partition, from the exact trusted root. */
+  storageUserId?: string
   parentSessionKey: string
   parentClientSessionId: string
   originSessionKey: string
@@ -50,12 +52,19 @@ export function checkedDelegateRetrySource(value: DelegateRetrySource): Delegate
   if (value.parentWorkspaceMode !== undefined && value.parentWorkspaceMode !== 'legacy' && value.parentWorkspaceMode !== 'isolated_v1') {
     throw new Error('invalid delegate retry parent workspace')
   }
+  if (value.storageUserId !== undefined && (typeof value.storageUserId !== 'string' || !value.storageUserId.trim() ||
+      value.storageUserId !== value.storageUserId.trim() || value.storageUserId.length > 1024)) throw new Error('invalid delegate storage user')
   // Project an exact field set: callers cannot persist goal/result/credential extras.
   return Object.freeze({ version: 1, userId: value.userId, parentSessionKey: value.parentSessionKey,
     parentClientSessionId: value.parentClientSessionId, originSessionKey: value.originSessionKey,
     childSessionKey: value.childSessionKey, targetAgentId: value.targetAgentId,
     sourceAgentId: value.sourceAgentId, depth: value.depth, model: value.model,
+    ...(value.storageUserId === undefined ? {} : { storageUserId: value.storageUserId }),
     ...(value.parentWorkspaceMode === undefined ? {} : { parentWorkspaceMode: value.parentWorkspaceMode }) })
+}
+
+export function delegateRetryStorageUser(source: Pick<DelegateRetrySource, 'userId' | 'storageUserId'>): string {
+  return source.storageUserId ?? source.userId
 }
 
 export type DelegateRetryAvailability = Readonly<{ available: boolean; reason: string | null }>

@@ -15,7 +15,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
 import { effectiveDelegateOutcome } from './delegateOutcome.js'
-import { checkedDelegateRetrySource, checkedDelegateRetryActionKey, type DelegateRetrySource,
+import { checkedDelegateRetrySource, checkedDelegateRetryActionKey, delegateRetryStorageUser, type DelegateRetrySource,
   type DelegateRetryActionKey, type DelegateRetryAction } from './delegateRetrySource.js'
 import type {
   DelegateCallback,
@@ -32,7 +32,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 9
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 10
 
 // Additive local SQLite schema; no FK/TTL cascade from runtime jobs to retry identity.
 const DDL_V9 = `
@@ -323,6 +323,9 @@ export class DelegateDurableDb {
     this.db.pragma('busy_timeout = 10000')
     this.db.pragma('journal_mode = WAL')
     this.db.pragma('foreign_keys = ON')
+    // Storage-level compatibility fence: schema9 processes, including already
+    // open writers, cannot execute mutation statements after schema10 migration.
+    this.db.function('oc_delegate_schema10', () => 10)
     this.migrate()
     this.upsertStmt = this.db.prepare(`
       INSERT INTO delegate_jobs (
@@ -608,6 +611,21 @@ export class DelegateDurableDb {
       if (current < 7) this.db.exec(DDL_V7)
       if (current < 8) this.db.exec(`CREATE INDEX idx_delegate_user_active ON delegate_jobs(callback_origin_user_id,state) WHERE retired_at IS NULL`)
       if (current < 9) this.db.exec(DDL_V9)
+      if (current < 10) {
+        this.db.exec(`ALTER TABLE delegate_retry_source ADD COLUMN storage_user_id TEXT;
+          UPDATE delegate_retry_source SET storage_user_id=user_id;
+          CREATE INDEX idx_delegate_retry_source_storage_parent
+            ON delegate_retry_source(storage_user_id,parent_client_session_id) WHERE retired_at IS NULL;
+          CREATE INDEX idx_delegate_retry_source_public ON delegate_retry_source(user_id,retired_at,job_id,generation);`)
+        // This is a compatibility fence, not a credential. Do not remove it to
+        // force a downgrade: old physical/public interpretation is incompatible.
+        for (const table of ['delegate_jobs', 'delegate_retry_source', 'delegate_retry_action', 'delegate_retry_parent_fence', 'delegate_failure_inbox']) {
+          for (const operation of ['INSERT', 'UPDATE', 'DELETE']) this.db.exec(`
+            CREATE TRIGGER identity_v10_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
+            BEGIN SELECT CASE WHEN oc_delegate_schema10() IS NOT 10
+              THEN RAISE(ABORT,'delegate identity schema10 writer required') END; END;`)
+        }
+      }
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply.immediate()
@@ -699,11 +717,11 @@ export class DelegateDurableDb {
       }
       const receipt = opts.deliveryReceipt ? checkedReceiptContext(opts.deliveryReceipt) : undefined
       const source = opts.retrySource ? checkedDelegateRetrySource(opts.retrySource) : undefined
-      if (source && (source.userId !== record.callbackOriginUserId || source.parentSessionKey !== record.parentSessionKey ||
+      if (source && (delegateRetryStorageUser(source) !== record.callbackOriginUserId || source.parentSessionKey !== record.parentSessionKey ||
           source.childSessionKey !== record.sessionKey || source.targetAgentId !== record.agentId)) {
         throw new Error('delegate retry source/job mismatch')
       }
-      if (source && this.isRetryParentFenced(source.userId, source.parentClientSessionId)) {
+      if (source && this.isRetryParentFenced(delegateRetryStorageUser(source), source.parentClientSessionId)) {
         throw new Error('delegate retry source parent deleted')
       }
       if (receipt && (record.kind !== 'delegate' || record.callback !== 'stdout-wait' || record.callbackState !== 'none')) {
@@ -727,9 +745,9 @@ export class DelegateDurableDb {
       // roll back, not find this transaction's own row and misreport reuse.
       if (source) {
         this.db.prepare(`INSERT INTO delegate_retry_source
-          (job_id,generation,user_id,parent_client_session_id,parent_session,child_session,target_agent_id,metadata_json,created_at)
-          VALUES (?,?,?,?,?,?,?,?,?)`).run(record.id, record.generation, source.userId, source.parentClientSessionId,
-            source.parentSessionKey, source.childSessionKey, source.targetAgentId, JSON.stringify(source), record.createdAt)
+          (job_id,generation,user_id,parent_client_session_id,parent_session,child_session,target_agent_id,metadata_json,created_at,storage_user_id)
+          VALUES (?,?,?,?,?,?,?,?,?,?)`).run(record.id, record.generation, source.userId, source.parentClientSessionId,
+            source.parentSessionKey, source.childSessionKey, source.targetAgentId, JSON.stringify(source), record.createdAt, delegateRetryStorageUser(source))
       }
       if (opts.failureInbox || receipt || source) {
         this.db.prepare('UPDATE delegate_jobs SET failure_inbox_enabled=1 WHERE job_id=?').run(record.id)
@@ -751,12 +769,19 @@ export class DelegateDurableDb {
   }
 
   getRetrySource(userId: string, jobId: string, generation: number): DelegateRetrySource | undefined {
-    const row = this.db.prepare(`SELECT metadata_json FROM delegate_retry_source
-      WHERE user_id=? AND job_id=? AND generation=? AND retired_at IS NULL`)
-      .get(userId, jobId, generation) as { metadata_json: string | null } | undefined
+    const source = this.getRetrySourceForJob(jobId, generation)
+    return source?.userId === userId ? source : undefined
+  }
+
+  /** Internal trusted job lookup; never use this to resolve an HTTP principal. */
+  getRetrySourceForJob(jobId: string, generation: number): DelegateRetrySource | undefined {
+    const row = this.db.prepare(`SELECT metadata_json,user_id,storage_user_id FROM delegate_retry_source
+      WHERE job_id=? AND generation=? AND retired_at IS NULL`).get(jobId, generation) as
+      { metadata_json: string | null; user_id: string; storage_user_id: string } | undefined
     if (!row?.metadata_json) return undefined
     const source = checkedDelegateRetrySource(JSON.parse(row.metadata_json))
-    if (source.userId !== userId || this.isRetryParentFenced(userId, source.parentClientSessionId)) return undefined
+    if (source.userId !== row.user_id || delegateRetryStorageUser(source) !== row.storage_user_id ||
+        this.isRetryParentFenced(row.storage_user_id, source.parentClientSessionId)) return undefined
     return source
   }
 
@@ -767,7 +792,7 @@ export class DelegateDurableDb {
 
   /** Enumerate authenticated INSERT columns, never parse metadata or discover nonce directories. */
   retryLifecycleRefs(userId?: string): { items: Array<{ userId: string; clientSessionId: string }>; pending: number } {
-    const rows = this.db.prepare(`SELECT DISTINCT user_id,parent_client_session_id FROM delegate_retry_source
+    const rows = this.db.prepare(`SELECT DISTINCT storage_user_id AS user_id,parent_client_session_id FROM delegate_retry_source
       WHERE retired_at IS NULL ${userId === undefined ? '' : 'AND user_id=?'}`)
       .all(...(userId === undefined ? [] : [userId])) as Array<{ user_id: unknown; parent_client_session_id: unknown }>
     const items: Array<{ userId: string; clientSessionId: string }> = []
@@ -789,24 +814,24 @@ export class DelegateDurableDb {
     this.transaction(() => {
       this.db.prepare(`INSERT INTO delegate_retry_parent_fence VALUES(?,?,?) ON CONFLICT DO NOTHING`)
         .run(ref.userId, ref.clientSessionId, now)
-      this.db.prepare(`DELETE FROM delegate_failure_inbox WHERE user_id=? AND EXISTS (
+      this.db.prepare(`DELETE FROM delegate_failure_inbox WHERE EXISTS (
         SELECT 1 FROM delegate_retry_source s WHERE s.job_id=delegate_failure_inbox.job_id
-          AND s.generation=delegate_failure_inbox.generation AND s.user_id=? AND s.parent_client_session_id=?)`)
-        .run(ref.userId, ref.userId, ref.clientSessionId)
+          AND s.generation=delegate_failure_inbox.generation AND s.storage_user_id=? AND s.parent_client_session_id=?)`)
+        .run(ref.userId, ref.clientSessionId)
       this.db.prepare(`UPDATE delegate_retry_action SET state='source_deleted',terminal_code='source_deleted'
-        WHERE user_id=? AND EXISTS (SELECT 1 FROM delegate_retry_source s WHERE s.user_id=?
+        WHERE EXISTS (SELECT 1 FROM delegate_retry_source s WHERE s.storage_user_id=?
           AND s.parent_client_session_id=? AND ((s.job_id=source_job_id AND s.generation=delegate_retry_action.generation)
-            OR s.job_id=target_job_id))`).run(ref.userId, ref.userId, ref.clientSessionId)
+            OR s.job_id=target_job_id))`).run(ref.userId, ref.clientSessionId)
       this.db.prepare(`UPDATE delegate_retry_source SET retired_at=COALESCE(retired_at,?),
         parent_client_session_id=NULL,parent_session=NULL,child_session=NULL,target_agent_id=NULL,metadata_json=NULL
-        WHERE user_id=? AND parent_client_session_id=?`).run(now, ref.userId, ref.clientSessionId)
+        WHERE storage_user_id=? AND parent_client_session_id=?`).run(now, ref.userId, ref.clientSessionId)
     })
   }
 
   isRetrySourceRetired(jobId: string, generation: number): boolean {
     return !!this.db.prepare(`SELECT 1 FROM delegate_retry_source s WHERE s.job_id=? AND s.generation=?
       AND (s.retired_at IS NOT NULL OR EXISTS (SELECT 1 FROM delegate_retry_parent_fence f
-        WHERE f.user_id=s.user_id AND f.client_session_id=s.parent_client_session_id))`).get(jobId, generation)
+        WHERE f.user_id=s.storage_user_id AND f.client_session_id=s.parent_client_session_id))`).get(jobId, generation)
   }
 
   hasRetrySource(jobId: string, generation: number): boolean {
@@ -862,7 +887,7 @@ export class DelegateDurableDb {
           target.claimToken || target.attemptNo !== 0 || target.fencingEpoch !== 0 || target.idempotencyKey ||
           target.callbackState !== 'none' || target.callbackEpoch !== 0 || target.generation !== 0 || target.id === key.sourceJobId ||
           target.agentId !== source.targetAgentId || target.sessionKey !== source.childSessionKey ||
-          target.parentSessionKey !== source.parentSessionKey || target.callbackOriginUserId !== source.userId ||
+          target.parentSessionKey !== source.parentSessionKey || target.callbackOriginUserId !== delegateRetryStorageUser(source) ||
           target.callbackOriginSessionKey !== source.originSessionKey) throw new Error('invalid retry target binding')
       if (this.hasActiveRetryChild(source.childSessionKey)) return { error: 'child_busy' }
       const inserted = this.insertCreate(target, maxJobs, { retrySource: source })
@@ -1087,6 +1112,8 @@ export class DelegateDurableDb {
     if (row.failure_inbox_enabled !== 1) return
     const record = fromRow(row)
     if (this.isRetrySourceRetired(record.id, record.generation)) return
+    const source = this.getRetrySourceForJob(record.id, record.generation)
+    if (this.hasRetrySource(record.id, record.generation) && !source) throw new Error('delegate source identity unavailable')
     const outcome = effectiveDelegateOutcome(record)
     if (outcome !== 'failed' && outcome !== 'killed_by_cutover') return
     // Deliberately do not retain raw output/errors/credentials in the cross-session index.
@@ -1099,7 +1126,7 @@ export class DelegateDurableDb {
       ON CONFLICT(job_id, generation) DO NOTHING
     `).run({
       jobId: record.id, generation: record.generation,
-      userId: record.callbackOriginUserId ?? '', parentSession: record.parentSessionKey ?? '',
+      userId: source?.userId ?? record.callbackOriginUserId ?? '', parentSession: record.parentSessionKey ?? '',
       childSession: record.sessionKey ?? null, summaryCode, summaryText,
       failedAt: record.terminalCommittedAt ?? record.lastActivityAt,
     })
@@ -1151,11 +1178,14 @@ export class DelegateDurableDb {
   userSummary(userId: string): { running: number; queued: number; unacknowledgedFailures: number } {
     if (!userId.trim()) throw new Error('delegate summary user required')
     return this.transaction(() => {
-      const jobs = this.db.prepare(`SELECT state, count(*) AS n FROM delegate_jobs
-        WHERE callback_origin_user_id=? AND retired_at IS NULL AND state IN ('running','queued')
-          AND NOT EXISTS (SELECT 1 FROM delegate_retry_source s WHERE s.job_id=delegate_jobs.job_id
-            AND s.generation=delegate_jobs.generation AND s.retired_at IS NOT NULL)
-        GROUP BY state`).all(userId) as Array<{ state: string; n: number }>
+      const jobs = this.db.prepare(`SELECT state, count(*) AS n FROM (
+        SELECT j.state FROM delegate_retry_source s JOIN delegate_jobs j ON j.job_id=s.job_id AND j.generation=s.generation
+          WHERE s.user_id=@userId AND s.retired_at IS NULL AND j.retired_at IS NULL AND j.state IN ('running','queued')
+        UNION ALL
+        SELECT j.state FROM delegate_jobs j WHERE j.callback_origin_user_id=@userId AND j.retired_at IS NULL
+          AND j.state IN ('running','queued') AND NOT EXISTS
+          (SELECT 1 FROM delegate_retry_source s WHERE s.job_id=j.job_id AND s.generation=j.generation)
+      ) GROUP BY state`).all({ userId }) as Array<{ state: string; n: number }>
       const inbox = this.db.prepare(`SELECT count(*) AS n FROM delegate_failure_inbox
         WHERE user_id=? AND ack_at IS NULL`).get(userId) as { n: number }
       return { running: jobs.find(row => row.state === 'running')?.n ?? 0,

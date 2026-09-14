@@ -264,7 +264,7 @@ await withPrivatePg(async ({ pool, backend, schema }: any) => {
             held.release();
             held = null;
         }
-        await until(async () => { const rows = (await pool.query('SELECT dispatch_id,status,outcome,client_message_id FROM turn_dispatches ORDER BY admitted_at')).rows; evidence.dispatches = rows; return rows.length === (mode === 'ingested' ? 1 : 2) && rows.every((r: any) => r.status === 'terminal'); }, 'two actual PG terminal dispatches', 90000);
+        await until(async () => { const rows = (await pool.query('SELECT dispatch_id,status,outcome,client_message_id FROM turn_dispatches ORDER BY admitted_at')).rows; evidence.dispatches = rows; return rows.length === (mode === 'ingested' ? 1 : mode === 'retry' ? 3 : 2) && rows.every((r: any) => r.status === 'terminal'); }, 'two actual PG terminal dispatches', 90000);
         if (mode === 'ack-loss' || mode === 'accept-blocked') {
             await until(() => evidence.injectResults?.length >= 2, 'original notify retry response', 90000);
             child.send({ type: 'watch-notified' });

@@ -110,21 +110,21 @@ for (const mode of ['normal', 'ack-loss', 'ingested', 'accept-blocked', 'retry']
     const master = readJson(join(dir, 'master-evidence.json'));
     const container = readJson(join(dir, 'container', 'container-evidence.json'));
     assert.equal(master.success, true); assert.equal(master.failure, undefined);
-    assert.equal(container.failure, undefined); assert.equal(container.executions, 1);
-    assert.equal(container.mainRequests, mode === 'ingested' || mode === 'retry' ? 2 : 3);
+    assert.equal(container.failure, undefined); assert.equal(container.executions, mode === 'retry' ? 2 : 1);
+    assert.equal(container.mainRequests, mode === 'ingested' ? 2 : mode === 'retry' ? 4 : 3);
     assert.equal(container.callbackModels, mode === 'ingested' ? 0 : 1);
     if (mode === 'retry') {
       assert.equal(container.rows.length, 0); assert.equal(container.retryEvidence.terminal.callbackState, 'delivered');
       assert.equal(container.retryEvidence.action.state, 'terminal'); assert.equal(container.retryEvidence.unexpectedSpawns, 0);
       assert.equal(container.retryEvidence.accepted.body.jobId, container.retryEvidence.replay.body.jobId);
     }
-    assert.equal(master.dispatches.length, mode === 'ingested' ? 1 : 2);
+    assert.equal(master.dispatches.length, mode === 'ingested' ? 1 : mode === 'retry' ? 3 : 2);
     assert.ok(master.dispatches.every((r: {status: string; outcome: string}) => r.status === 'terminal' && r.outcome === 'completed'));
     const injections = master.injectResults ?? [];
     if (mode === 'ingested') assert.equal(injections.length, 0);
     else {
       assert.ok(injections.length >= 1);
-      assert.equal(new Set(injections.map((v: {cmid: string}) => v.cmid)).size, 1, 'all retries retain original cmid');
+      assert.equal(new Set(injections.map((v: {cmid: string}) => v.cmid)).size, mode === 'retry' ? 2 : 1, 'one cmid per original job, including the initial failed source notification');
       for (const result of injections) if (result.result.kind === 'injected') {
         assert.equal(result.rows.length, 1);
         assert.ok(['accepted', 'terminal'].includes(result.rows[0].status));

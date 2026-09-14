@@ -1,4 +1,5 @@
-import { DelegateRetryUnavailable, checkedDelegateRetryActionKey, type DelegateRetrySource, type DelegateRetryActionKey, type DelegateRetryAction, type DelegateRetryAvailability, type DelegateRetrySourceKey } from './delegateRetrySource.js'
+import { DelegatePublicOwnerBindings } from './delegatePublicOwner.js'
+import { DelegateRetryUnavailable, checkedDelegateRetryActionKey, delegateRetryStorageUser, type DelegateRetrySource, type DelegateRetryActionKey, type DelegateRetryAction, type DelegateRetryAvailability, type DelegateRetrySourceKey } from './delegateRetrySource.js'
 import type { StrictNativeResume } from './engine/engineAdapter.js'
 import { DELEGATE_USER_PREFIX, handleDelegateUserHttp } from './delegateUserHttp.js'
 import { homedir as receiptHome } from 'node:os'
@@ -2828,6 +2829,7 @@ export class Gateway {
     error: (msg, fields) => this.log.error(msg, undefined, fields ? new Error(JSON.stringify(fields)) : undefined),
   })
 
+  private _delegatePublicOwners?: DelegatePublicOwnerBindings
   private readonly _receiptOwnerCapabilities = new ReceiptOwnerCapabilities()
   private _receiptCandidateStopped = false
   private _receiptCandidateStore?: ReceiptCandidateLifecycle
@@ -11703,11 +11705,11 @@ export class Gateway {
     const key = this._receiptNotifyKey(job)
     if ((this._receiptNotifyNotBefore.get(key) ?? 0) > Date.now()) return false
     try {
-      const source = job.callbackOriginUserId ? store.getRetrySource(job.callbackOriginUserId, job.id, job.generation) : undefined
-      if (source && !store.isRetrySourceRetired(job.id, job.generation)) {
-        const [observed] = await classifyClientSessions([{ userId: source.userId, sessionId: source.parentClientSessionId }])
-        if (observed?.userId === source.userId && observed.sessionId === source.parentClientSessionId) {
-          if (observed.state === 'deleted') store.fenceDeletedRetryParent({ userId: source.userId, clientSessionId: source.parentClientSessionId })
+      const source = store.getRetrySourceForJob(job.id, job.generation)
+      if (source && delegateRetryStorageUser(source) === job.callbackOriginUserId && !store.isRetrySourceRetired(job.id, job.generation)) {
+        const [observed] = await classifyClientSessions([{ userId: delegateRetryStorageUser(source), sessionId: source.parentClientSessionId }])
+        if (observed?.userId === delegateRetryStorageUser(source) && observed.sessionId === source.parentClientSessionId) {
+          if (observed.state === 'deleted') store.fenceDeletedRetryParent({ userId: delegateRetryStorageUser(source), clientSessionId: source.parentClientSessionId })
           if (observed.state === 'active' && JSON.stringify(store.getRetrySource(source.userId, job.id, job.generation)) === JSON.stringify(source)) {
             this._receiptNotifyNotBefore.delete(key)
             return true
@@ -14012,7 +14014,7 @@ export class Gateway {
         source.parentSessionKey !== `agent:${source.sourceAgentId}:webchat:dm:${source.parentClientSessionId}`) {
       throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
     }
-    const metadata = await getClientSessionCollabParent(source.parentClientSessionId, source.userId); check()
+    const metadata = await getClientSessionCollabParent(source.parentClientSessionId, delegateRetryStorageUser(source)); check()
     if (!metadata || metadata.agentId !== source.sourceAgentId || !metadata.modelId) {
       throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_unavailable')
     }
@@ -14020,7 +14022,7 @@ export class Gateway {
     // create-time source witness, or an exact live child's inherited mode for
     // older rows; with neither, never guess the legacy default.
     const child = this.sessions.getByKey(source.childSessionKey)
-    if (child && (child.userId !== source.userId || child.agentId !== source.targetAgentId ||
+    if (child && (child.userId !== delegateRetryStorageUser(source) || child.agentId !== source.targetAgentId ||
         child.channel !== 'delegate' || child.parentSessionKey !== source.parentSessionKey)) {
       throw new DelegateRetryUnavailable(409, 'retry_parent_workspace_unavailable')
     }
@@ -14034,9 +14036,9 @@ export class Gateway {
     const workspace = await resolveChatRunWorkspace({ sessionId: metadata.sessionId }); check()
     const validate = async () => {
       check()
-      const current = await getClientSessionCollabParent(source.parentClientSessionId, source.userId); check()
+      const current = await getClientSessionCollabParent(source.parentClientSessionId, delegateRetryStorageUser(source)); check()
       if (JSON.stringify(current) !== JSON.stringify(metadata) || this.sessions.getByKey(source.childSessionKey) !== child ||
-          (child && (child.workspaceMode !== workspaceMode || child.userId !== source.userId || child.parentSessionKey !== source.parentSessionKey))) {
+          (child && (child.workspaceMode !== workspaceMode || child.userId !== delegateRetryStorageUser(source) || child.parentSessionKey !== source.parentSessionKey))) {
         throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_changed')
       }
     }
@@ -14071,12 +14073,12 @@ export class Gateway {
       const root = chain.at(-1), parent = chain[0]
       if (!parent || parent.agentId !== source.sourceAgentId || !root || root.channel !== 'webchat' ||
           root.sessionKey !== source.originSessionKey || root.peerId !== source.parentClientSessionId ||
-          chain.some((s, i) => s.userId !== source.userId || this.sessions.getByKey(s.sessionKey) !== s || project(s) !== snapshots[i]) ||
+          chain.some((s, i) => s.userId !== delegateRetryStorageUser(source) || this.sessions.getByKey(s.sessionKey) !== s || project(s) !== snapshots[i]) ||
           !this._resolveDelegateParent({ parentSessionKey: source.parentSessionKey, sourceAgent: source.sourceAgentId })) {
         throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
       }
       const child = this.sessions.getByKey(source.childSessionKey)
-      if (child && (child.agentId !== source.targetAgentId || child.userId !== source.userId ||
+      if (child && (child.agentId !== source.targetAgentId || child.userId !== delegateRetryStorageUser(source) ||
           child.channel !== 'delegate' || child.parentSessionKey !== source.parentSessionKey)) {
         throw new DelegateRetryUnavailable(409, 'retry_child_identity_changed')
       }
@@ -14088,15 +14090,15 @@ export class Gateway {
   private async _checkDelegateRetrySource(key: DelegateRetrySourceKey, source: DelegateRetrySource, check: () => void): Promise<void> {
     check()
     let rows: Awaited<ReturnType<typeof classifyClientSessions>>
-    try { rows = await classifyClientSessions([{ userId: source.userId, sessionId: source.parentClientSessionId }]) }
+    try { rows = await classifyClientSessions([{ userId: delegateRetryStorageUser(source), sessionId: source.parentClientSessionId }]) }
     catch (error) { check(); throw error }
     check()
     const observed = rows[0]
-    if (!observed || observed.userId !== source.userId || observed.sessionId !== source.parentClientSessionId) {
+    if (!observed || observed.userId !== delegateRetryStorageUser(source) || observed.sessionId !== source.parentClientSessionId) {
       throw new DelegateRetryUnavailable(503, 'retry_lifecycle_unknown')
     }
     if (observed.state === 'deleted') {
-      this._delegateJobs!.fenceDeletedRetryParent({ userId: source.userId, clientSessionId: source.parentClientSessionId })
+      this._delegateJobs!.fenceDeletedRetryParent({ userId: delegateRetryStorageUser(source), clientSessionId: source.parentClientSessionId })
       throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
     }
     if (observed.state !== 'active') throw new DelegateRetryUnavailable(409, 'retry_source_unavailable')
@@ -14146,13 +14148,13 @@ export class Gateway {
             } else if (source.parentSessionKey !== source.originSessionKey ||
                 source.parentSessionKey !== `agent:${source.sourceAgentId}:webchat:dm:${source.parentClientSessionId}` ||
                 this.sessions.getByKey(source.childSessionKey) !== child ||
-                (child && (child.userId !== userId || child.agentId !== source.targetAgentId || child.channel !== 'delegate' ||
+                (child && (child.userId !== delegateRetryStorageUser(source) || child.agentId !== source.targetAgentId || child.channel !== 'delegate' ||
                   child.parentSessionKey !== source.parentSessionKey)) || !(source.parentWorkspaceMode ?? child?.workspaceMode)) {
               throw new DelegateRetryUnavailable(409, 'retry_parent_unavailable')
             }
           }
           check()
-          const metadata = await getClientSessionCollabParent(source.parentClientSessionId, userId); check()
+          const metadata = await getClientSessionCollabParent(source.parentClientSessionId, delegateRetryStorageUser(source)); check()
           const parentAgent = cfg.agents.find(a => a.id === metadata?.agentId)
           if (!metadata || metadata.agentId !== source.sourceAgentId || !metadata.modelId || !parentAgent) {
             throw new DelegateRetryUnavailable(409, 'retry_parent_metadata_unavailable')
@@ -14272,7 +14274,7 @@ export class Gateway {
     const input: RunDelegateInput = { targetAgentId: source.targetAgentId, sourceAgent: source.sourceAgentId,
       parentSessionKey: source.parentSessionKey, sessionKey: source.childSessionKey, model, goal, depth: source.depth,
       allowSelf: true, resumable: true, resumeMinted: false, callbackOnComplete: 'origin-inject',
-      callbackOriginSessionKey: source.originSessionKey, callbackOriginUserId: source.userId,
+      callbackOriginSessionKey: source.originSessionKey, callbackOriginUserId: delegateRetryStorageUser(source),
       retrySource: Object.freeze({ key, source }), requireNativeResume: Object.freeze({ ...required }) }
     let transferred = false
     try {
@@ -14420,14 +14422,13 @@ export class Gateway {
     const parent = this.sessions?.getByKey(claims.sessionKey)
     // Historical callers without live, attributable metadata remain non-retryable.
     if (!parent || !parent.userId?.trim() || !parent._currentTurnKey || parent.agentId !== callerAgentId) return {}
-    const userId = parent.userId
-    if (principal.kind === 'user' && principal.userId !== userId) return denied(403, 'delegate source user mismatch')
+    const storageUserId = parent.userId
     if ('turnKey' in claims && claims.turnKey !== parent._currentTurnKey) return denied(409, 'delegate source turn changed')
     const chain: AgentSession[] = []
     const visited = new Set<string>()
     let cursor: AgentSession | undefined = parent
     while (cursor && chain.length < 5) {
-      if (visited.has(cursor.sessionKey) || cursor.userId !== userId) return {}
+      if (visited.has(cursor.sessionKey) || cursor.userId !== storageUserId) return {}
       visited.add(cursor.sessionKey); chain.push(cursor)
       if (cursor.channel === 'webchat') break
       if (cursor.channel !== 'delegate' || !cursor.parentSessionKey) return {}
@@ -14435,6 +14436,9 @@ export class Gateway {
     }
     const root = chain.at(-1)
     if (!root || root.channel !== 'webchat' || !root.peerId || root.peerId === 'unknown') return {}
+    const publicWitness = this._delegatePublicOwners?.get(root)
+    const userId = publicWitness ?? storageUserId
+    if (principal.kind === 'user' && principal.userId !== userId) return denied(403, 'delegate source user mismatch')
     const project = (s: AgentSession) => JSON.stringify([s.sessionKey, s.agentId, s.userId,
       s.channel, s.peerId, s.parentSessionKey, s._currentTurnKey, s.workspaceMode])
     const snapshots = chain.map(project)
@@ -14445,6 +14449,7 @@ export class Gateway {
       const finalPrincipal = this.receiptHttpPrincipal(req)
       if (!finalClaims || !finalPrincipal || finalPrincipal.kind !== principal.kind ||
           (finalPrincipal.kind === 'user' && finalPrincipal.userId !== userId)) return denied(401, 'delegate source authority expired').error
+      if (this._delegatePublicOwners?.get(root) !== publicWitness) return denied(409, 'delegate source owner changed').error
       if (chain.some((s, i) => this.sessions?.getByKey(s.sessionKey) !== s || project(s) !== snapshots[i])) {
         return denied(409, 'delegate source parent changed').error
       }
@@ -14453,7 +14458,7 @@ export class Gateway {
     const error = revalidate()
     if (error) return { error }
     if (lifecycle !== 'active') return denied(lifecycle === 'deleted' ? 409 : 503, 'delegate source session unavailable')
-    return { revalidate, source: Object.freeze({ version: 1, userId, parentSessionKey: parent.sessionKey,
+    return { revalidate, source: Object.freeze({ version: 1, userId, ...(storageUserId === userId ? {} : { storageUserId }), parentSessionKey: parent.sessionKey,
       parentClientSessionId: clientSessionId, originSessionKey: root.sessionKey,
       targetAgentId, sourceAgentId: parent.agentId, depth: claims.depth, model: model ?? null,
       ...(parent.workspaceMode === 'legacy' || parent.workspaceMode === 'isolated_v1' ? { parentWorkspaceMode: parent.workspaceMode } : {}) }) }
@@ -14703,7 +14708,7 @@ export class Gateway {
             ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
             : undefined,
           callbackOriginSessionKey: callbackTarget?.sessionKey,
-          callbackOriginUserId: receiptUserId ?? retrySourceParent?.userId ?? callbackTarget?.userId,
+          callbackOriginUserId: receiptUserId ?? (retrySourceParent ? delegateRetryStorageUser(retrySourceParent) : undefined) ?? callbackTarget?.userId,
         })
       } catch (error) {
         // No runner owns this request yet. In particular, the durable receipt
@@ -15892,7 +15897,7 @@ export class Gateway {
       if (input.retrySource) await this._checkDelegateRetryExecution(input)
       session = await this.sessions.getOrCreate({
         ...(input.requireNativeResume ? { requireNativeResume: input.requireNativeResume } : {}),
-        ...(input.retrySource ? { userId: input.retrySource.source.userId } : {}),
+        ...(input.retrySource ? { userId: delegateRetryStorageUser(input.retrySource.source) } : {}),
         sessionKey,
         agent: execAgent,
         // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
@@ -21668,6 +21673,7 @@ export class Gateway {
         ? { promptQueueExecutionFence }
         : {}),
     })
+    ;(this._delegatePublicOwners ??= new DelegatePublicOwnerBindings()).bind(session, turnAuthority)
     admitCmid = typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
       ? safeClientMessageId
       : undefined
