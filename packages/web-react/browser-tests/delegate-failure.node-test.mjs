@@ -103,7 +103,7 @@ test("durable failure UI: actual Chromium + original HTTP handler/SQLite, not na
       await source.getByRole("button", { name: "确认上次继续", exact: true }).click();
       await page.getByRole("button", { name: "确认并重发同一请求", exact: true }).click();
       await source.getByText(/已受理，等待执行/).waitFor().catch(async error => {
-        t.diagnostic(JSON.stringify({ source: await source.textContent(), retryResponses, actions: api.retrySnapshot() })); throw error;
+        t.diagnostic(JSON.stringify({ body: (await page.textContent("body")).slice(0, 3500), sourcePresent: await page.locator(`li[data-job-id="${id}"]`).count(), retryResponses, actions: api.retrySnapshot() })); throw error;
       });
       assert.equal(api.retryKeys.length, 2); assert.equal(api.retryKeys[0].actionId, api.retryKeys[1].actionId);
       assert.equal(api.retryTargets(), 1); assert.equal(api.ackCalls.length, ackCount); assert.equal(api.count("alice"), originalCount);
