@@ -4,6 +4,7 @@ import {
   DelegateFailureApiError, failureErrorText, failureKey, failureSummaryText, retryStateText,
   type DelegateFailure,
 } from "../../lib/delegateFailures";
+import type { InflightDelegateItem } from "../../lib/chat/inflightDelegates";
 import type { Session } from "../../lib/types";
 import { Alert, Badge, Button, Modal, useConfirm } from "../ui";
 
@@ -16,8 +17,22 @@ export function knownFailureParentId(parentKey: string, sessions: readonly Sessi
   return row.id;
 }
 
+export type SessionFailureDiagnostic = Readonly<{
+  jobId: string; parentSessionKey: string; summary: string; goal: string;
+}>;
+/** A bounded current-scope historical view, never an ACK or generation assertion. */
+export function sessionFailureDiagnostics(items: readonly InflightDelegateItem[]): SessionFailureDiagnostic[] {
+  return items.filter(item => item.state === "failed" || item.state === "killed_by_cutover").slice(0, 20).map(item => {
+    const goal = item.goal.split(/[\r\n]/, 1)[0].trim();
+    return { jobId: item.jobId, parentSessionKey: item.parentSessionKey,
+      summary: item.state === "killed_by_cutover" ? "子任务因服务切换中断" : "子任务失败，请查看原会话了解详情",
+      goal: /^[{[]/.test(goal) ? "当前会话子任务" : goal.slice(0, 160) };
+  });
+}
+
 /** One durable failure feedback surface: badge and dialog use the same account snapshot. */
-export function DelegateFailureInbox({ state, controller, onOpenParent }: {
+export function DelegateFailureInbox({ state, controller, onOpenParent, diagnostics = [] }: {
+  diagnostics?: readonly SessionFailureDiagnostic[];
   state: FailureInboxState;
   controller: DelegateFailureController;
   onOpenParent: (parentKey: string) => boolean;
@@ -25,15 +40,16 @@ export function DelegateFailureInbox({ state, controller, onOpenParent }: {
   const trigger = useRef<HTMLButtonElement>(null);
   const [confirm, confirmElement] = useConfirm();
   const total = state.summary;
-  const label = total
+  const statusLabel = total
     ? `后台任务 ${total.running} 运行中 / ${total.queued} 排队 / ${total.unacknowledgedFailures} 失败`
     : "后台任务 · 状态待确认";
+  const label = statusLabel + (diagnostics.length ? " · 会话诊断" : "");
   const repeat = async (row: DelegateFailure) => {
     const accepted = await confirm({ title: "确认同一次继续？", confirmText: "确认并重发同一请求",
       body: "用于上次请求中断或结果不确定。会使用同一个请求编号；若此前未受理，可能开始执行原子会话。不会新建第二次继续，也不会确认这条失败。" });
     if (accepted === true) await controller.retry(row, true);
   };
-  const openParent = async (row: DelegateFailure) => {
+  const openParent = async (row: Pick<DelegateFailure, "parentSessionKey">) => {
     if (onOpenParent(row.parentSessionKey)) controller.setOpen(false);
     else await confirm({ title: "原会话暂不在当前列表中", body: "请先从会话列表找到原会话。不会自动创建或恢复会话，这条失败仍保留。", confirmText: "知道了" });
   };
@@ -60,6 +76,14 @@ export function DelegateFailureInbox({ state, controller, onOpenParent }: {
       {state.error && <Alert tone="warning">{state.error}。已有记录会保留，不代表没有失败。</Alert>}
       {state.loading && <p role="status" className="text-meta text-muted">正在更新…</p>}
       {!state.loading && !state.error && state.page?.items.length === 0 && <p className="text-body text-muted">本页没有未确认失败{state.before ? "，可返回首页查看" : ""}。</p>}
+      {diagnostics.length > 0 && <details className="mb-3 rounded-lg border border-border p-3" data-testid="delegate-session-diagnostics">
+        <summary className="cursor-pointer text-meta text-muted">当前会话诊断（不表示尚未确认） · {diagnostics.length}</summary>
+        <p className="mt-2 text-meta text-muted">历史失败信号，不计入待确认数量；即使已确认也可能保留。只有下方持久记录可以确认或继续。</p>
+        <ul className="mt-2 flex flex-col gap-2">{diagnostics.map(row => <li key={row.jobId} data-diagnostic-job-id={row.jobId}>
+          <p className="text-meta">{row.summary}</p><p className="break-words text-meta text-muted">{row.goal}</p>
+          <Button size="sm" variant="ghost" onClick={() => void openParent(row)}>查看诊断原会话</Button>
+        </li>)}</ul>
+      </details>}
       <ul className="flex flex-col gap-3">
         {state.page?.items.map(row => {
           const key = failureKey(row), pending = state.pending[key], retry = state.retries[key];

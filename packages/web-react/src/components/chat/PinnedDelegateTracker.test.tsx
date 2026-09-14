@@ -73,8 +73,13 @@ describe("PinnedDelegateTracker", () => {
   });
 
   test("durable failure surface replaces, not duplicates, raw session failed HUD", () => {
-    const { container } = render(<PinnedDelegateTracker items={[item({ state: "failed" })]} onDismiss={() => {}} failuresInInbox />);
+    const { container } = render(<PinnedDelegateTracker items={[item({ state: "failed" })]} onDismiss={() => {}} diagnosticJobIds={["dlgjob-1"]} />);
     expect(container.firstChild).toBeNull();
+  });
+
+  test("only explicitly transferred diagnostics are hidden, never aggregate availability", () => {
+    render(<PinnedDelegateTracker items={[item({ state: "failed", jobId: "not-transferred" })]} onDismiss={() => {}} diagnosticJobIds={["different-id"]} />);
+    expect(screen.getByText("子任务失败，请查看原会话了解详情")).toBeInTheDocument();
   });
 
   test("无 onStop 时不渲染停止本轮假按钮", () => {

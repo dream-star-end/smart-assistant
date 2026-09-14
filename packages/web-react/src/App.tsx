@@ -106,7 +106,7 @@ import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useDelegateFailures } from "./hooks/useDelegateFailures";
-import { DelegateFailureInbox, knownFailureParentId } from "./components/chat/DelegateFailureInbox";
+import { DelegateFailureInbox, knownFailureParentId, sessionFailureDiagnostics } from "./components/chat/DelegateFailureInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
@@ -1993,6 +1993,10 @@ export function App() {
     auth,
   });
 
+  const failureDiagnostics = useMemo(() => delegateFailures.controller && user
+    ? sessionFailureDiagnostics(inflightDelegates.items) : [], [delegateFailures.controller, user, inflightDelegates.items]);
+  const failureDiagnosticIds = useMemo(() => failureDiagnostics.map(item => item.jobId), [failureDiagnostics]);
+
   const sendingIdsRef = useRef(new Set<string>());
   const liveTerminalsRef = useRef(
     new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null }>(),
@@ -3694,7 +3698,7 @@ export function App() {
               items={inflightDelegates.items}
               onDismiss={inflightDelegates.dismiss}
               onOpenFailures={() => delegateFailures.controller?.setOpen(true)}
-              failuresInInbox={delegateFailures.state.summary !== null}
+              diagnosticJobIds={failureDiagnosticIds}
             />
           )}
           {!demo && !gated && (
@@ -3805,6 +3809,7 @@ export function App() {
               key={JSON.stringify([user.id, auth?.snapshot().epoch])}
               state={delegateFailures.state}
               controller={delegateFailures.controller}
+              diagnostics={failureDiagnostics}
               onOpenParent={(parentKey) => {
                 const id = knownFailureParentId(parentKey, sessions, user.id);
                 if (!id) return false;

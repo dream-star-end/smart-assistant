@@ -117,18 +117,21 @@ export function PinnedDelegateTracker({
   items,
   onDismiss,
   onOpenFailures,
-  failuresInInbox = false,
+  diagnosticJobIds = [],
 }: {
   items: InflightDelegateItem[];
   onDismiss: (jobId: string) => void;
   /** Kept as a type-only compatibility prop; Stop has one UI owner: Composer. */
   onStop?: () => void;
   onOpenFailures?: () => void;
-  /** Route failure feedback to the durable account inbox, not a second per-session ACK list. */
-  failuresInInbox?: boolean;
+  /** Exact currently handed-off diagnostics; aggregate counts never prove coverage or ACK. */
+  diagnosticJobIds?: readonly string[];
 }) {
-  const visible = useMemo(() => visibleDelegateItems(failuresInInbox
-    ? items.filter(item => item.state !== "failed" && item.state !== "killed_by_cutover") : items), [items, failuresInInbox]);
+  const visible = useMemo(() => {
+    const handedOff = new Set(diagnosticJobIds);
+    return visibleDelegateItems(items.filter(item =>
+      !((item.state === "failed" || item.state === "killed_by_cutover") && handedOff.has(item.jobId))));
+  }, [items, diagnosticJobIds]);
   const live = visible.filter((item) => !isTerminalDelegateState(item.state));
   const running = live.filter((item) => isRunningState(item.state));
   const latestRunning =
