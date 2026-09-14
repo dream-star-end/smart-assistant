@@ -4,7 +4,8 @@ const sandbox = installDelegateSandbox()
 /** Real SQLite/CAS/HTTP. No claim of OS quiesce, model consumption or deployment. */
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -111,23 +112,48 @@ test('cleanup isolates persistent failed legacy row and keeps other freeze holde
   assert.equal(f.store.isDispatchFrozen(), true)
 })
 
-test('independent original Node writer cannot publish after cutover terminal', async t => {
+test('independent Node writer loaded before cutover cannot publish with its original fence', async t => {
   const f = fixture(t), job = f.create()
-  await beginDelegateCutover(f.store, { generation: 73, freezeBudgetMs: 0 })
   const dbModule = fileURLToPath(new URL('../delegateDurable.ts', import.meta.url))
   const storeModule = fileURLToPath(new URL('../delegateJobs.ts', import.meta.url))
-  const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
     import assert from 'node:assert/strict';
+    import {once} from 'node:events';
     import {DelegateDurableDb} from ${JSON.stringify(dbModule)};
     import {DelegateJobStore} from ${JSON.stringify(storeModule)};
     const db=new DelegateDurableDb(${JSON.stringify(f.path)}), s=new DelegateJobStore({durable:db,sm:true});
-    try { assert.equal(s.complete(${JSON.stringify(job.id)},{httpStatus:200,body:{late:true}},${JSON.stringify(job.fence)}),false);
+    try { assert.equal(db.get(${JSON.stringify(job.id)}).state,'running');
+      console.log('READY'); await once(process.stdin,'data'); process.stdin.destroy();
+      assert.equal(s.complete(${JSON.stringify(job.id)},{httpStatus:200,body:{late:true}},${JSON.stringify(job.fence)}),false);
       assert.equal(db.getDeliveryReceipt(${JSON.stringify(job.id)},0).state,'offered');
       assert.equal(db.get(${JSON.stringify(job.id)}).result.body.error,'delegate-cutover');
     } finally {s.close()}
-  `], { encoding: 'utf8', timeout: 15000, env: { PATH: process.env.PATH, HOME: sandbox.root } })
-  assert.equal(child.status, 0, child.stderr)
-  assert.equal(f.terminals(), 1)
+  `], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH, HOME: sandbox.root } })
+  const closed = once(child, 'close'); let stdout = '', stderr = ''
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 15000)
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on('data', b => { stdout += b; if (stdout.includes('READY\n')) resolve() })
+      child.stderr.on('data', b => { stderr += b })
+      child.once('error', reject)
+      child.once('close', () => { if (!stdout.includes('READY\n')) reject(new Error(stderr || 'writer never ready')) })
+    })
+    await beginDelegateCutover(f.store, { generation: 73, freezeBudgetMs: 0 })
+    child.stdin.end('GO\n')
+    const [code] = await closed; assert.equal(code, 0, stderr); assert.equal(f.terminals(), 1)
+  } finally { clearTimeout(timeout); child.kill('SIGKILL'); await closed }
+})
+
+test('foreign owner bound writer cannot be silently paused or reported as successful cutover', async t => {
+  const f = fixture(t), job = f.create()
+  const foreign = new DelegateJobStore({ durable: new DelegateDurableDb(f.path), sm: true, bootId: 'foreign-owner' })
+  try {
+    await assert.rejects(beginDelegateCutover(foreign, { generation: 73, freezeBudgetMs: 0 }), /cutover incomplete/)
+    assert.equal(f.db.get(job.id)?.state, 'running'); assert.equal(f.db.getDeliveryReceipt(job.id, 0), undefined)
+    assert.equal(foreign.isDispatchFrozen(), false)
+    assert.equal(foreign.closeBoundForCutover(job.id, job.fence), false)
+    assert.equal(f.store.closeBoundForCutover(job.id, { ...job.fence, claimToken: 'stale' }), false)
+  } finally { foreign.close() }
 })
 
 test('original Gateway HTTP survives persistent terminal AND cleanup fault with 503 and fresh recovery', async t => {
@@ -170,6 +196,12 @@ test('original Gateway HTTP survives persistent terminal AND cleanup fault with 
       assert.equal(freshDb.getDeliveryReceipt(bound.id, 0)?.state, 'offered')
       assert.equal(freshDb.get(bound.id)?.generation, 0)
     } finally { fresh.close() }
+    const next = f.create()
+    const success = await request('/internal/v3/delegate-begin-cutover?generation=74')
+    assert.equal(success.status, 200); const body = await success.json() as any
+    assert.equal(body.remainingRunning, 0); assert.equal(body.closedBound, 1)
+    assert.equal(f.db.getDeliveryReceipt(next.id, 0)?.state, 'offered')
+    assert.deepEqual(unhandled, [])
   } finally {
     server.closeAllConnections(); await new Promise<void>(r => server.close(() => r()))
     process.off('unhandledRejection', onUnhandled)

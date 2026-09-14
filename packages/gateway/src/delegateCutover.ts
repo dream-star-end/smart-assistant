@@ -97,8 +97,11 @@ export function endDelegateCutover(
     if (job.generation !== generation) continue
     try {
       if (store.killOwnedPaused(job.id)) closed += 1
-      else if (store.snapshotOf(job.id)?.state === 'paused_for_cutover') {
-        errors.push({ jobId: job.id, error: new Error('cutover paused writer remains') })
+      else {
+        const current = store.snapshotOf(job.id)
+        if (!current || current.state === 'paused_for_cutover') {
+          errors.push({ jobId: job.id, error: new Error('cutover paused writer unresolved') })
+        }
       }
     } catch (error) { errors.push({ jobId: job.id, error }) }
   }

@@ -4500,6 +4500,9 @@ export class Gateway {
         // A second unguarded end here could reject this detached Promise.
         try {
           this.log.error('delegate begin-cutover failed', undefined, err as Error)
+          if (err instanceof AggregateError) {
+            for (const cause of err.errors) this.log.error('delegate cutover failure cause', undefined, cause as Error)
+          }
           if (!res.destroyed && !res.writableEnded) {
             this.sendJson(res, 503, { ok: false, reason: 'cutover_quiesce_failed' })
           }
