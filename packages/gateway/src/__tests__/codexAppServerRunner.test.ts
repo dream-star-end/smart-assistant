@@ -2297,6 +2297,16 @@ describe('interrupt fence', () => {
     await h.cleanup()
   })
 
+  it('intentional recycle does not emit exit for a follow-up turn to inherit', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const exits: unknown[] = []
+    h.runner.on('exit', (e) => exits.push(e))
+    ;(h.runner as any).drain = async () => {}
+    await (h.runner as any).recycleProcKeepQueue('test')
+    assert.equal(exits.length, 0)
+    await h.cleanup()
+  })
+
   it('two chatgpt.com WS stderr lines recycle the proc only once', async () => {
     const h = await makeHarness({ withFakeProc: true })
     let shutdownCalls = 0

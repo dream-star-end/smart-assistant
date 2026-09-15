@@ -39,6 +39,10 @@ must(runner.includes('recycleInflight'), 'recycle must be one-shot / join inflig
 must(runner.includes('keepQueuedTurns'), 'recycle shutdown must keep queued turns')
 must(runner.includes("await this.recycleProcKeepQueue('user-cancelled')"), 'USER_CANCELLED must await recycle')
 must(
+  runner.includes('Intentional recycle/shutdown must not surface SIGTERM as SERVICE_RESTART'),
+  'shutdown close must not emit exit for the next turn',
+)
+must(
   /if \(result\.abortWebsocketDirect\) this\.abortTurnForChatgptWebsocketDirect\(\)/.test(runner),
   'stderr path must abort websocket-direct before PATH_NOT_ALLOWED',
 )
