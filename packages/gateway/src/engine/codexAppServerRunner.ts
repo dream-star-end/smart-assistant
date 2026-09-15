@@ -2343,11 +2343,15 @@ export class CodexAppServerRunner extends EventEmitter {
       // explicit-stop path) but matches the symmetry "proc gone → context
       // regenerated" so a crash-respawn can't reuse a stale path.
       this.cleanupLaunchOverrides()
-      this.emit('exit', {
-        code: code ?? 0,
-        signal,
-        crashed: code != null && code !== 0 && !wasShutdown,
-      })
+      // Intentional recycle/shutdown must not surface SIGTERM as SERVICE_RESTART
+      // on a follow-up turn that already installed its exit listener (OCV5-224).
+      if (!wasShutdown) {
+        this.emit('exit', {
+          code: code ?? 0,
+          signal,
+          crashed: code != null && code !== 0,
+        })
+      }
       if (wasShutdown) this.shuttingDown = false
     })
 
@@ -4296,8 +4300,11 @@ export class CodexAppServerRunner extends EventEmitter {
             ...(errorClass ? { errorClass } : {}),
           })
         } else if (status === 'interrupted') {
-          // Bill partial work on interrupted turns: codex already charged for
-          // tokens before the user hit stop, so emit the delta we observed.
+          // Reap the app-server BEFORE publishing USER_CANCELLED so a follow-up
+          // submit cannot inherit this proc's SIGTERM as SERVICE_RESTART.
+          this.activeTurnId = null
+          this.currentTurnCompleter = null
+          await this.recycleProcKeepQueue('user-cancelled')
           this.emitResult({
             durationMs,
             ok: false,
@@ -4305,16 +4312,9 @@ export class CodexAppServerRunner extends EventEmitter {
             usage: usagePayload,
             requestId,
             rateLimits: rateLimitsPayload,
-            // LOW-2:用户主动 stop —— 无 Anthropic 等价枚举,用自描述 'interrupted'
-            // (下游只对 'max_tokens' 有分支语义,其余值透传展示)。
             stopReason: 'interrupted',
             terminalCode: 'USER_CANCELLED',
           })
-          // Cooperative turn/interrupt does not kill app-server. Reap now so
-          // the next submit cannot reuse a hung ChatGPT-WS process (OCV5-224).
-          // Await so session.lock stays held until proc is dead and queued
-          // submits are drained, not rejected as "runner shutdown".
-          await this.recycleProcKeepQueue('user-cancelled')
         } else {
           this.emitResult({
             durationMs,
