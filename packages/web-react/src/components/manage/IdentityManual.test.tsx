@@ -10,7 +10,7 @@ const projection = { schema: 1, userId: "3", profiles: [{ profile, readiness: "r
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-function fixture(options: { projection?: unknown; readiness?: string; failRead?: boolean; failMarket?: boolean; failSave?: number; mismatch?: boolean; rejectAck?: boolean } = {}) {
+function fixture(options: { projection?: unknown; readiness?: string; failRead?: boolean; failMarket?: boolean; failSave?: number; mismatch?: boolean; rejectAck?: boolean; failProjection?: boolean } = {}) {
   const auth = createMemoryAuthSession(() => {}, "token");
   let local = "本地原始手册\n原文";
   const market = "市场底线原文";
@@ -18,7 +18,10 @@ function fixture(options: { projection?: unknown; readiness?: string; failRead?:
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input), method = init?.method ?? "GET", body = String(init?.body ?? "");
     requests.push({ path, method, body });
-    if (path === "/api/agents") return json({ agents: [{id:"butler"},{id:"personal-butler"}], ...(Object.hasOwn(options, "projection") ? {identityCompat: options.projection} : {identityCompat: {...projection, profiles:[{profile,readiness:options.readiness ?? "ready"}]}}) });
+    if (path === "/api/agents") {
+      if (options.failProjection) return json({error:"网关暂不可达"},502);
+      return json({ agents: [{id:"butler"},{id:"personal-butler"}], ...(Object.hasOwn(options, "projection") ? {identityCompat: options.projection} : {identityCompat: {...projection, profiles:[{profile,readiness:options.readiness ?? "ready"}]}}) });
+    }
     if (path === "/api/auth/refresh") return json({error:{code:"INVALID_REFRESH",message:"登录已过期"}},401);
     if (path === "/api/agents/old-resource/persona") {
       if (method === "PUT") {
@@ -114,6 +117,22 @@ test("auth changes during a save cannot produce a success notification or read u
   expect(f.requests.filter(r=>r.path==="/api/agents/old-resource/persona")).toHaveLength(1);
 });
 
+
+test("registration read failure degrades to a one-line notice below the memory list, not a full-width alert", async () => {
+  const f = fixture({ failProjection: true }); f.renderManual();
+  const notice = await screen.findByText(/网关暂不可达|无法读取本实例手册的注册信息/);
+  // 不是 role=alert（不再打断读屏、不再占记忆首屏），但仍有行内重试出口。
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(notice.closest("section")).toHaveAttribute("aria-label", "本实例运行手册管理");
+  // 可访问名带对象：与核心记忆的「重试」在读屏按钮列表里分得开。
+  const retry = screen.getByRole("button", { name: "重试读取本实例运行手册" });
+  expect(retry).toHaveTextContent("重试");
+  // 位置：在核心记忆分区之后（DOM 顺序），而不是二级页签之前。
+  const tabs = screen.getByRole("tablist", { name: "记忆分区" });
+  expect(tabs.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  fireEvent.click(retry);
+  expect(f.requests.filter(r => r.path === "/api/agents")).toHaveLength(2);
+});
 
 test("invalid registration data fails closed rather than exposing any persona write", async () => {
   const f=fixture({projection:{...projection,profiles:[{profile:{...profile,legacyAgentId:"../unsafe"},readiness:"ready"}]}});

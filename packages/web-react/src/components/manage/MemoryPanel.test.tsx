@@ -16,6 +16,10 @@ afterEach(() => {
   vi.useRealTimers();
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  localStorage.clear();
+  // ProjectScopeProvider 解析到工作项目后会把 ?project= 写回 URL，不清掉会漏给下一个用例。
+  window.history.replaceState({}, "", "/");
 });
 
 /** 镜像 main.tsx 的根 Provider 树：TimeAgo 走 Tooltip，写操作反馈走 useToast。 */
@@ -736,5 +740,168 @@ describe("MemoryPanel · 用户画像（单文本编辑）", () => {
     await waitFor(() => expect(put).toHaveBeenCalled());
     expect(put.mock.calls[0][3]).toBe("称呼：dx");
     expect(put.mock.calls[0][4]).toBeUndefined(); // 首次创建不做版本校验
+  });
+});
+
+/**
+ * 「报错 + 空态」互斥：核心记忆早已用 failedCold 挡掉；用量 / 项目记忆两段此前仍会
+ * 把读失败渲染成"红条 + 一个自信的空"（用量），或只闪一条 toast 再落成「还没有项目记忆」。
+ */
+describe("MemoryPanel · 读失败不再与空态并排", () => {
+  test("用量：失败只给红条 + 重试，不出现「还没有可统计的记忆操作」；重试成功后正常渲染", async () => {
+    mockIndex([]);
+    const usage = vi
+      .spyOn(api, "getMemoryUsage")
+      .mockRejectedValueOnce(new ApiError({ status: 500, message: "统计服务暂不可用", requestId: "r1" }))
+      .mockResolvedValueOnce({
+        window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
+        totals: { events: 2, sessions: 1, hits: 1, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+        byOperation: [
+          { operation: "core_search", memoryType: "core", events: 2, sessions: 1, hits: 1, noMatch: 0, p50Ms: 10, p95Ms: 20 },
+        ],
+        recentSessions: [],
+      });
+
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+
+    expect(await screen.findByText(/统计服务暂不可用/)).toBeInTheDocument();
+    expect(screen.queryByText("还没有可统计的记忆操作")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("核心检索")).toBeInTheDocument();
+    expect(usage).toHaveBeenCalledTimes(2);
+  });
+
+  test("用量：统计卡与表头走设计系统档位，不再引用不存在的工具类", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue({
+      window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
+      totals: { events: 2, sessions: 1, hits: 1, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+      byOperation: [],
+      recentSessions: [],
+    });
+    const { container } = renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+    await screen.findByText("使用会话");
+    // 这三个类名在 styles.css 里没有定义（Tailwind v4 不会生成 CSS），出现即回归。
+    expect(container.innerHTML).not.toMatch(/text-body-sm|text-foreground|bg-surface-subtle/);
+  });
+
+  test("项目记忆：读失败渲染带重试的红条，不再落成「还没有项目记忆」", async () => {
+    mockIndex([]);
+    const work = { id: "wp_muying_2026", key: "MY", name: "小红书母婴号运营", description: null, workspace: null, labels: [], archivedAt: null, createdAt: 1, updatedAt: 1 };
+    const chat = { id: "chat_muying_0001", name: "momo 号运营", boardProjectId: work.id };
+    let memoriesCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input).split("?")[0];
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        if (path === "/api/board/projects") return json({ items: [work] });
+        if (path === `/api/board/projects/${work.id}/memories`) {
+          memoriesCalls += 1;
+          if (memoriesCalls === 1) return json({ error: "boom" }, 500);
+          return json({ projectId: work.id, official: [], candidates: [] });
+        }
+        // 项目上下文预览等其它 board 读接口：给个空对象即可。
+        return json({});
+      }),
+    );
+    // 项目资产面板（sidebar 组件）走 api 代理，这里只关心它被挂在同一页签。
+    vi.spyOn(api, "listProjectAssets").mockResolvedValue([]);
+    localStorage.setItem("oc_v5_project_scope:u1", chat.id);
+    const { ProjectScopeProvider } = await import("../../hooks/useProjectScope");
+    renderPanel(
+      <ProjectScopeProvider auth={auth} chatProjects={[chat]} userId="u1">
+        <MemoryPanel auth={auth} agentId="main" agents={agents} />
+      </ProjectScopeProvider>,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "项目记忆" }));
+
+    expect(await screen.findByText(/加载项目记忆失败/)).toBeInTheDocument();
+    expect(screen.queryByText("还没有项目记忆")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("还没有项目记忆")).toBeInTheDocument();
+    // 项目维度的两块面板跟项目记忆在同一页签里，而不是追加在整个记忆面板之后。
+    expect(screen.getByText("项目资产")).toBeInTheDocument();
+  });
+
+  test("项目记忆：采纳 / 忽略在请求在途时进忙态（防连点），成功给 toast", async () => {
+    mockIndex([]);
+    const work = { id: "wp_muying_2026", key: "MY", name: "小红书母婴号运营", description: null, workspace: null, labels: [], archivedAt: null, createdAt: 1, updatedAt: 1 };
+    const chat = { id: "chat_muying_0001", name: "momo 号运营", boardProjectId: work.id };
+    const candidate = {
+      id: "cand_1",
+      projectId: work.id,
+      slug: "muying-disclaimer",
+      contentSha256: "sha",
+      status: "pending",
+      version: 2,
+      content: "母婴医疗内容必须附权威来源",
+    };
+    let releasePromote: (() => void) | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        if (path === "/api/board/projects") return json({ items: [work] });
+        if (path === `/api/board/projects/${work.id}/memories`) {
+          return json({ projectId: work.id, official: [], candidates: releasePromote ? [] : [candidate] });
+        }
+        if (path === `/api/board/projects/${work.id}/memories/cand_1/promote` && init?.method === "POST") {
+          // 挂起直到测试放行：期间两个按钮都必须不可再点。
+          await new Promise<void>((resolve) => {
+            releasePromote = resolve;
+          });
+          return json({ ok: true, official: { ...candidate, status: "official" } });
+        }
+        return json({});
+      }),
+    );
+    vi.spyOn(api, "listProjectAssets").mockResolvedValue([]);
+    localStorage.setItem("oc_v5_project_scope:u1", chat.id);
+    const { ProjectScopeProvider } = await import("../../hooks/useProjectScope");
+    renderPanel(
+      <ProjectScopeProvider auth={auth} chatProjects={[chat]} userId="u1">
+        <MemoryPanel auth={auth} agentId="main" agents={agents} />
+      </ProjectScopeProvider>,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "项目记忆" }));
+
+    const promote = await screen.findByRole("button", { name: "采纳" });
+    const reject = screen.getByRole("button", { name: "忽略" });
+    fireEvent.click(promote);
+    await waitFor(() => expect(reject).toBeDisabled());
+    // loading 态的按钮同样不可点（Button 原语 loading → disabled）。
+    expect(screen.getByRole("button", { name: /采纳/ })).toBeDisabled();
+
+    await act(async () => {
+      await waitFor(() => expect(releasePromote).not.toBeNull());
+      releasePromote?.();
+    });
+    expect(await screen.findByText("已采纳")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("早前留下的待确认条目")).not.toBeInTheDocument());
+  });
+});
+
+describe("MemoryPanel · 用户画像字数口径", () => {
+  test("计数与超限判定同一口径：超过限额时显示的数字与 title 里的一致，不会跳", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemory").mockResolvedValue({ target: "user", text: "abc", version: "u1", limit: 5 });
+    renderPanel();
+    openProfileTab();
+    const box = (await screen.findByDisplayValue("abc")) as HTMLTextAreaElement;
+    expect(screen.getByText(/^3\/5 字符$/)).toBeInTheDocument();
+
+    // 首尾空白也算字符（后端按 limit 比较的是原文长度）：改造前正常态 trim 后计数、超限态又换成
+    // text.length，跨过限额那一刻数字会跳。
+    fireEvent.change(box, { target: { value: " abcde " } });
+    expect(screen.getByText(/^7\/5 字符$/)).toBeInTheDocument();
+    const save = screen.getByRole("button", { name: "保存" });
+    expect(save).toBeDisabled();
+    expect(save).toHaveAttribute("title", expect.stringContaining("（7/5）"));
   });
 });

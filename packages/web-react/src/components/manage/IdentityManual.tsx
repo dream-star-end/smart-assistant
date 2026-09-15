@@ -3,7 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { AuthEpochStaleError, apiErrorMessage } from "../../lib/api";
 import { identityCompatApi, type PersonaDocument } from "../../lib/identityCompat";
 import type { AuthSession } from "../../lib/types";
-import { Alert, Button, Textarea, useToast } from "../ui";
+import { Alert, Badge, Button, Textarea, useToast } from "../ui";
 
 type Registration = IdentityCompatProjection["profiles"][number];
 
@@ -36,7 +36,18 @@ export function IdentityManual({ auth, agentId, authority }: {
   const { projection, loading, error, retry } = authority;
   const registration = projection?.profiles.find(({ profile }) => profile.canonicalAgentId === agentId);
   if (loading) return <span className="sr-only" data-testid="identity-manual-loading">读取手册入口</span>;
-  if (error) return <div className="px-4 py-3"><Alert tone="warning" action={<Button size="sm" onClick={retry}>重试手册入口</Button>}>{error}</Alert></div>;
+  // 附属能力的读失败只值一行：改造前是整宽 warning Alert 压在记忆面板首屏第一块
+  // （预览台 /api/agents 未打桩时每张记忆截图都带着它；生产里旧后端 / 网关抖动同样触发）。
+  // 与梦境报告的静默降级对齐：一枚徽章 + 原因 + 行内重试，不抢主内容的注意力。
+  if (error)
+    return (
+      <section className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-border px-4 py-2.5 text-caption text-muted" aria-label="本实例运行手册管理">
+        <Badge tone="warning" size="sm">本实例运行手册</Badge>
+        <span>{error}</span>
+        {/* 可访问名带上对象：同一面板里核心记忆的读失败也有一枚「重试」，读屏按钮列表里要分得开。 */}
+        <Button variant="link" size="sm" className="h-auto px-0" aria-label="重试读取本实例运行手册" onClick={retry}>重试</Button>
+      </section>
+    );
   if (!registration) return null;
   return <section className="border-t border-border px-4 py-3" aria-label="本实例运行手册管理">
     <Button variant="link" size="sm" className="px-0" aria-expanded={open} aria-controls={sectionId} onClick={() => setOpen(v => !v)}>本实例运行手册</Button>
