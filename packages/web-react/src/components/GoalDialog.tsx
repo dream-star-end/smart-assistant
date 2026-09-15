@@ -1,8 +1,9 @@
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { Check, Pause, Play, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { apiErrorMessage } from "../lib/api";
 import { groupDigits } from "../lib/utils";
-import { Badge, Button, Input, Modal } from "./ui";
+import { Badge, Button, Input, Modal, useConfirm } from "./ui";
 
 export type GoalSetInput = {
   objective: string;
@@ -75,6 +76,8 @@ export function GoalDialog({
   const [error, setError] = useState("");
   const [snapshotReceivedAt, setSnapshotReceivedAt] = useState(() => Date.now());
   const [clock, setClock] = useState(() => Date.now());
+  // 「清除」是不可撤销的危险操作(清除后徽标 / 菜单状态点立刻消失):二次确认 + danger 视觉(C-05)。
+  const [confirm, confirmEl] = useConfirm();
 
   useEffect(() => {
     if (!open) return;
@@ -110,8 +113,20 @@ export function GoalDialog({
     busyRef.current = true;
     setBusy(true);
     setError("");
-    try { await fn(); } catch (err) { setError((err as Error).message || "操作失败"); }
+    // 表单校验错误原样展示;接口错误经 apiErrorMessage 统一转成用户可读文案(C-31)。
+    try { await fn(); } catch (err) { setError(apiErrorMessage(err, "操作失败")); }
     finally { busyRef.current = false; setBusy(false); }
+  };
+
+  const clear = async () => {
+    const ok = await confirm({
+      title: "清除会话目标？",
+      body: "目标与预算统计将被移除，且无法撤销。已产生的对话内容不受影响。",
+      confirmText: "清除目标",
+      danger: true,
+    });
+    if (ok !== true) return;
+    await run(() => onAction("clear"));
   };
 
   const submit = () => run(async () => {
@@ -140,7 +155,16 @@ export function GoalDialog({
         <span className="flex items-center gap-2">
           会话目标
           {visibleGoal && (
-            <Badge tone={warning ? "warning" : visibleGoal.status === "completed" ? "success" : "accent"}>
+            // 「受阻」是需要处理的负向状态,用 warning 而不是 accent(C-31)。
+            <Badge
+              tone={
+                warning || visibleGoal.status === "blocked"
+                  ? "warning"
+                  : visibleGoal.status === "completed"
+                    ? "success"
+                    : "accent"
+              }
+            >
               {STATUS_LABEL[visibleGoal.status]}
             </Badge>
           )}
@@ -177,8 +201,19 @@ export function GoalDialog({
         {visibleGoal?.status === "active" && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("pause"))}><Pause size={13} />暂停</Button>}
         {(visibleGoal?.status === "paused" || visibleGoal?.status === "blocked") && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("resume"))}><Play size={13} />继续</Button>}
         {visibleGoal && !["completed", "cleared"].includes(visibleGoal.status) && <Button size="sm" variant="secondary" disabled={busy} onClick={() => run(() => onAction("complete"))}><Check size={13} />完成</Button>}
-        {visibleGoal && <Button size="sm" variant="ghost" disabled={busy} onClick={() => run(() => onAction("clear"))}><Trash2 size={13} />清除</Button>}
+        {visibleGoal && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto text-danger hover:text-danger"
+            disabled={busy}
+            onClick={() => void clear()}
+          >
+            <Trash2 size={13} />清除
+          </Button>
+        )}
       </div>
+      {confirmEl}
     </Modal>
   );
 }

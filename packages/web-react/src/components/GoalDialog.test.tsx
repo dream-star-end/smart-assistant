@@ -60,6 +60,40 @@ describe("GoalDialog", () => {
   });
 });
 
+// C-05:「清除」此前与「完成」并排、点一下目标即清,无确认、无 danger 视觉。
+describe("GoalDialog 清除需二次确认", () => {
+  it("点「清除」先弹确认;取消不调 onAction,确认才调 clear", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(<GoalDialog open onOpenChange={() => {}} goal={goal} onSet={vi.fn()} onAction={onAction} />);
+    const clearBtn = screen.getByRole("button", { name: /清除/ });
+    expect(clearBtn.className).toContain("text-danger");
+    fireEvent.click(clearBtn);
+    await screen.findByText("清除会话目标？");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(screen.queryByText("清除会话目标？")).toBeNull());
+    expect(onAction).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /清除/ }));
+    await screen.findByText("清除会话目标？");
+    fireEvent.click(screen.getByRole("button", { name: "清除目标" }));
+    await waitFor(() => expect(onAction).toHaveBeenCalledWith("clear"));
+  });
+
+  it("受阻状态用 warning 徽记而不是 accent", () => {
+    render(
+      <GoalDialog
+        open
+        onOpenChange={() => {}}
+        goal={{ ...goal, status: "blocked", tokensUsed: 1, tokenBudget: 100, creditsUsed: "0", creditBudget: null }}
+        onSet={vi.fn()}
+        onAction={vi.fn()}
+      />,
+    );
+    const badge = screen.getByText("受阻");
+    expect(badge.className).toMatch(/warning/);
+  });
+});
+
 it("closes after success but keeps errors visible for retry", async () => {
   const onSet = vi.fn().mockRejectedValueOnce(new Error("目标已保存，但未能启动")).mockResolvedValue(undefined);
   const onOpenChange = vi.fn();
