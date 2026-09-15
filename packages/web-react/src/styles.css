@@ -199,6 +199,11 @@ html, body { height: 100%; margin: 0; }
    露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
    末个有效值生效)。iOS Safari 截图/地址栏/键盘显隐时 100dvh 与 visual viewport
    offset 仍会短暂抖动,React 侧用 visualViewport 写入 CSS var 作最终权威。 */
+/* 顶部 toast 轨道的顶距(components/ui/Toast.tsx `top-[var(--oc-toast-top,4rem)]`)。
+   取值 = ChatHeader 的最小高度 min-h-14(3.5rem)+ 0.5rem 呼吸空间;安全区内边距由轨道自己的
+   header-safe-t 再叠一层。原先 Toast.tsx 写死 top-16,与头部高度两处各写各的(shell 审计 S-20):
+   头部改高度时改这里一处即可,不要再去 Toast.tsx 里改 top-*。 */
+:root { --oc-toast-top: 4rem; }
 #root {
   position: fixed;
   top: var(--oc-visual-offset-top, 0px);
