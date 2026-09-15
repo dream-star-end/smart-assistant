@@ -150,3 +150,74 @@ B 阶段交付顺序建议：SET-02/03/04（用量与快捷键，纯前端、低
 | `ApiKeysSection` 深链把完整密钥放进 `ccswitch://` URL | 设计如此（CC Switch V1 协议要求），页面已有「请勿分享导入链接」提示。 |
 | 账单流水未知 reason「绝不吞掉」的注释意图 | 保留可观测性：SET-16 用「其他 + title 原值」兼顾，不做纯隐藏。 |
 | 关于页「备案信息更新中」占位 | 来自 `lib/brand.ts`（shell 归属），运营填值即可，非代码问题。 |
+
+## 6. 修复记录（B 阶段 t-41）
+
+> 分支 `feat/v5-selfhost-audit-settings`（接续 A 阶段 commit `82c0f80f`） · 修复人：fable-5-1-20（接手 fable-5-1-21 / fable-5-1-11 的未交付工作树）
+> 口径：P1 0 条（本模块无）；**P2 12 条全部落地**；P3 31 条中 29 条落地，2 条按下表判定为「不修」并写明理由。
+
+### 6.1 P2（12/12）
+
+| 编号 | 改动 | 落点 |
+|---|---|---|
+| SET-01 | `choose()` 在「续费 / 切换」（付费用户且非升档）前弹 `useConfirm`：写明「本期积分会重置为 N、当前剩余 M 不累计、周期顺延 X 天、钱包余额不受影响」；升档按差价补齐、周期不变，不打断 | `settings/SubscriptionDialog.tsx` |
+| SET-02 | `needsPreferences = section === 'preferences'`；`BuiltinHotkeysTable` 提升为导出件，由 `SettingsCenter` 直接渲染；`PreferencesTab` 删掉 `pane` 形参，`getPublicModels` 回调对 `models` 做数组守卫（返回体缺字段不再把整页打崩） | `SettingsCenter.tsx`、`settings/PreferencesTab.tsx` |
+| SET-03 | `creditTrendHasData` / `requestTrendHasData` 为假时不挂 canvas，改渲染与同页另两卡一致的文字空态 | `settings/UsageTab.tsx` |
+| SET-04 | `blocked` 改 `notice`：范围选「当前聊天项目」但未绑看板时**回落到全部项目照常请求并展示**，顶部保留 Alert +「去项目设置」 | `settings/UsageTab.tsx` |
+| SET-05 | 与微信两开关同策略，从 `NOTIF_FIELDS` 移除 `notify_telegram`（偏好字段保留在后端 allowlist，通道接通再放回渲染）。判据：用户侧无任何 Telegram 绑定入口，后端只有 `admin/alertChannels` 管理员告警通道（`commercial/src/http/router.ts:1368` 仅 `/api/admin/alerts/channels/telegram`），开关打开也不会有消息送达 —— 属「死开关」，不必开 `ask_decision` | `settings/PreferencesTab.tsx` |
+| SET-06 | 新增 `settings/StatTile.tsx`（16px + `tabular-nums`，数字与单位各自 `whitespace-nowrap`、只在两者之间换行），替换 `ApiAccessTab` 的 20px `Stat` | `settings/StatTile.tsx`、`settings/ApiAccessTab.tsx` |
+| SET-07 | `THEAD_CLS` 加 `[&_th]:whitespace-nowrap`；结果徽章抽 `StatusChip`（`inline-flex whitespace-nowrap`，`title` 保留后端原始码）；模型列 `whitespace-nowrap` | `settings/ApiAccessTab.tsx` |
+| SET-08 | 引导 Tab 标签缩短为 `Chrome / Firefox / Switchy`，完整名写进各段正文第一句 | `ChatGptProxyDialog.tsx` |
+| SET-09 | 付款前无法预估（后端不下发汇率，见 §5）：填额段说明「到账积分 = 支付金额 × 平台汇率（以支付时为准，本页暂不预估）+ 到账数会在本弹层与概览显示」；**到账段新增实际入账数**（`creditedDelta(到账后余额, 基线)`，纯 BigInt） | `org/OrgTopupDialog.tsx` |
+| SET-10 | 组织名步骤文案改为「创建后暂不支持自助修改，如需变更请联系客服」，不再承诺不存在的改名功能 | `org/CreateOrgWizard.tsx` |
+| SET-11 | 触控靶统一下沉到原语：密钥行 `IconBtn` / 撤销键 → `ui/IconButton`（触屏 44px）；向导关闭键、`OrgCenter` 关闭键 → `IconButton`；`SeatPicker ±` 与席位输入 `[@media(hover:none)]:size-11 / h-11`；发票复选框 16→20px（整行 label 仍是命中区）；用量与账单的纯文本「加载更多 / 重试」→ `Button` | `settings/ApiKeysSection.tsx`、`org/CreateOrgWizard.tsx`、`OrgCenter.tsx`、`org/InvoicesTab.tsx`、`settings/UsageTab.tsx`、`settings/AccountTab.tsx` |
+| SET-12 | 窄屏宫格分区数 > 6（admin 7 项）时改四列（4+3），6 项保持 3+3；并给「账户与计费」加 `narrowLabel: '账户'`，避免四列列宽把长标签截成「账户与…」 | `SettingsCenter.tsx` |
+
+### 6.2 P3（29/31 落地）
+
+- **计费与文案**：SET-13 进度条改「剩余占比」与右侧文字同语义、剩余 > 月度额度时按 100% 显示并加注「含加量包积分」；SET-14 余额耗尽时红卡承担主 CTA（免费 → `开通 Lite` + `加量包`；付费 → `购买加量包` + `升级套餐`），此时套餐行按钮隐藏，余额充足时只保留套餐行一个入口；SET-15 免费档积分从 `plans` 真值取、加量包价格/积分统一读 `lib/plans.ts` 的 `TOPUP_PACK`；SET-18 到期/余额行 `flex-wrap` + `whitespace-nowrap`；SET-19 免费档右侧改「到期未续自动回落」。
+- **术语与状态码**：SET-16 新增 `ledgerReasonView()`（未知 reason → 「其他」+ 原值进 `title`）；SET-25 新增 `apiRequestStatusLabel()`（success/insufficient_credits/rate_limited/key_revoked/… → 中文，未知回退原文并保留 `title`）；SET-26 「按密钥」表已撤销 key 与「最近明细」统一显示「(已撤销)」；SET-28 单 key 触达上限补「已达上限」文字徽章（不只靠进度条变红）。
+- **图表**：SET-17 `charts.tsx` 的 `LineSeries` 新增 `axis: 'left' | 'right'`（标 right 的序列走右侧独立刻度 `y1`，不画第二套网格），收支趋势把收入挂右轴、支出留左轴，卡片 hint 同步标注轴别；SET-37 组织报表小节标题 `uppercase` → `normal-case`（不再把「Token 构成」渲成「TOKEN 构成」）。
+- **设计系统一致性**：SET-21 偏好页自绘原生 `select` 与成员页两处原生 `select` 全部换 `ui/Select`（本文件内的 `Select` 私有实现删除）；SET-27 `ApiAccessTab` / `UsageTab` / `org/ReportsTab` 三份 `Stat` 合并为共用 `StatTile`。
+- **交互与容错**：SET-20 发送键选项与快捷键表共用 `modifierKeyLabel()`（Windows/Linux 显示 `Ctrl`）；SET-22 邮件通知补 hint；SET-23 QQ 绑定命令复制包 try/catch，失败给「复制失败，请手动输入上面的绑定命令。」；SET-24 密钥名输入回车加 `isComposing` 守卫；SET-29 ChatGPT 直连时间格式改 `shortTime`；SET-31 二维码 `onError` → 失败态文案 +「重新获取二维码」（新二维码 URL 到达时自动复位）；SET-34 组织中心弹层在向导态改 `max-h` 自适应（不再留 700px 空白）；SET-35 扫码段也渲染 `WizardSteps` 并高亮第 3 步；SET-36 「可安装」项换中性 `Boxes` 图标；SET-38 成员行邮箱与加入时间分两行；SET-39 成员 > 10 时出现搜索框（`filterMembers`：名称/邮箱大小写不敏感）+ 本地分页（复用 `TablePager`，每页 10）；SET-40 非 owner 的「组织结算」开关补 `title` 与「（仅拥有者可改）」说明。
+- **文案标点（SET-30）**：settings / org / payment 归属文件里**用户可见中文**的 ASCII `, ; : ? !` 全部全角化（脚本按「紧邻 CJK」匹配后逐条过 diff），复扫结果 0 处遗留。
+- **死代码（SET-43）**：`git rm` 掉零引用的 `settings/TopupDialog.tsx`、`settings/SettingsRow.tsx`（含 `SettingsRow.test.tsx`）；`PaymentDialogs.test.tsx` 去掉 TopupDialog 用例、保留订阅弹层用例；`AccountTab` 顶部注释里指向 TopupDialog 的失效说明改为 SubscriptionDialog。
+- **SET-41/42**：左导航单分组时不渲染分组标题；关于页新增「版本 {meta[name=oc-build]}」与「用户协议 / 隐私政策」两个新标签链接（术语与落地页、登录页一致）。
+
+### 6.3 遗留 / 不修（连同 §5 一并读）
+
+| 项 | 处置 |
+|---|---|
+| SET-32 双份轮询 | **判定不修**：手机跳出收银台后整页重载时订阅弹层已卸载、由 `PendingPaymentRecovery` 接手；bfcache 原页恢复时恢复条不会重读 sessionStorage（`pending` 只在挂载时取一次），两者不会在同一 document 里并存。已把这段判据写进 `SubscriptionDialog.tsx` 轮询 effect 的注释。 |
+| SET-42 更新检查入口 | 关于页只补了版本号与法务链接；「检查更新」属 shell 归属（`lib/appUpdate.ts` / `UpdateBanner`），不越界。 |
+| SET-09 汇率预估 / SET-10 组织改名 | 前端已做到文案与到账数可核对；真正的预估与改名**需后端配合**（`credits_per_yuan` 下发、`PATCH /api/org {name}`），见 §5。 |
+| 跨模块 · `lib/chat/pure.ts:587` 红卡文案 | 硬编码「Lite(¥38/月,4000 积分)」+ ASCII 标点，归属 messages。已 `send_to` messages owner（fable-5-1-26）说明改法；本模块不越界改 `lib/chat/**`。 |
+| 跨模块 · `manage/CronPanel.tsx:64-66` | Telegram 投递项 hint 指向已移除的偏好开关。manage 当前无人持有，已请指挥官代转给 manage 接手人。 |
+| `ConnectorsTab` / `KnowledgePlanetAutomationPanel` 目录迁移 | 仍按 §5：由 manage owner 决定，本轮不动。 |
+
+## 7. 验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿 |
+| 模块单测 | `npx vitest run src/components/settings src/components/org src/components/payment src/components/SettingsCenter.test.tsx src/components/ChatGptProxyDialog.test.tsx src/components/OrgCenter.test.tsx src/components/charts.test.tsx --maxWorkers=1` | ✅ 19 文件 / 215 用例全绿 |
+| web-react 全量单测 | `npm test --workspace packages/web-react` | ✅ 绿（见交付摘要里的文件/用例数） |
+| after 截图 | `OC_UI_SCENES='settings-,payment-,org-' node browser-tests/ui-preview/shoot.mjs` | ✅ 27 场景 / 108 张 / failures 0 / retried 0 / `unmockedApi` 空 |
+| 代码风格 | `npx biome lint <改动文件>` | 与基线逐文件对比**未新增**任何诊断（`UsageTab` / `ApiAccessTab` 各减少 1 条）。注：仓库 `npm run lint` 在基线即为红（本目录既有文件与 biome 的 quote/semicolon 配置不一致），故以「不新增」为判据。 |
+
+本轮新增/改写的测试（每个逻辑改动都有用例）：
+
+- `SettingsCenter.test.tsx`：快捷键分区不再请求 prefs / models 且偏好接口 reject 时照常渲染（SET-02）；关于页版本号与法务链接（SET-42）；窄屏 6 项三列 / admin 7 项四列 + 账户短名（SET-12）。
+- `settings/UsageTab.test.tsx`：全 0 数据四张卡都走文字空态且不构造 chart（SET-03）；未绑看板回落全部项目仍发请求并渲染数据（SET-04）。
+- `settings/PreferencesTab.test.tsx`：`BuiltinHotkeysTable` 独立渲染不发请求、修饰键随平台（SET-02/SET-20）；不渲染 Telegram 开关、邮件通知带 hint（SET-05/SET-22）；`getPublicModels` 返回体缺 `models` 时退化为空列表（SET-02）。
+- `settings/AccountTab.test.tsx`：进度条与文字同为剩余语义、加量包超额按 100% + 加注（SET-13）；套餐入口三态按钮集合（SET-14）；未知 reason 显示「其他」且原值在 `title`（SET-16）；收支趋势收入挂右轴 `y1`（SET-17）。
+- `settings/labels.test.ts`（新增）：`ledgerReasonView` 与 `apiRequestStatusLabel` 的已知/未知/空值分支（SET-16/SET-25）。
+- `settings/ApiAccessTab.test.tsx`：统计卡走 `StatTile`（数字与单位分离、accent 落在数字行）（SET-06/SET-27）。
+- `settings/QqBindingCard.test.tsx`：clipboard 缺失（非安全上下文）不抛错并给出提示，可用时正常复制（SET-23）。
+- `org/MembersTab.test.tsx`（新增）：`filterMembers` 纯函数分支；≤10 人无搜索无分页且邮箱/加入时间分两行；>10 人搜索 + 翻页；角色下拉是 `ui/Select` 且改选即 patch；非 owner 开关禁用并说明原因（SET-38/39/40/21）。
+- `org/OrgTopupDialog.test.tsx`：`creditedDelta` 大数分支；填额段汇率说明；到账段显示实际入账积分（SET-09）。
+- `org/ReportsTab.test.tsx`：摘要卡走 `StatTile`、「Token 构成」不被 uppercase 改写（SET-27/SET-37）。
+- `payment/HupijiaoPaymentEntry.test.tsx`：二维码加载失败 → 提示 + 重新获取，换新 URL 后复位（SET-31）。
+- `charts.test.tsx`：双 y 轴接线（未标 right 时只有一条轴；标 right 的序列挂 `y1` 且不画第二套网格）（SET-17）。
+
+截图（仓库外）：`D:\code\test_project\test123\.audit-tmp\settings\{before,after}\`（各 27 场景 × desktop/mobile × light/dark = 108 张，`manifest.json` failures 0）；长图切段在 `crops\`（before）与 `crops-after\`（after）。逐张对照已确认：快捷键页不再是错误态、用量空态无假坐标轴、移动端统计卡与表格状态列不再断字竖排、ChatGPT 引导 Tab 标签完整、窄屏设置导航两行无孤项且标签不截断、订阅弹层日期不折行、创建组织向导无 700px 空白且第 3 步高亮、组织成员行邮箱与加入时间分两行、组织报表「Token 构成」大小写正确、可安装技能不再用 ✓。

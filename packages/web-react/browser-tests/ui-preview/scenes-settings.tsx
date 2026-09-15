@@ -1126,9 +1126,9 @@ export const settingsScenes: Scene[] = [
     group: '工作区',
     viewports: ['desktop', 'mobile'],
     api: {
+      // B 阶段(SET-02)后快捷键分区是静态表,不再拉 prefs / 模型列表;这两个桩只作回归哨兵 ——
+      // manifest.unmockedApi 若重新出现这两个方法,说明快捷键又被挂回了偏好页的加载链。
       getPreferences: async () => prefsSnapshot({ eligible: true, optimizer: true }),
-      // 快捷键面板复用 PreferencesTab,挂载即拉模型列表(见审计问题 S-P3-xx);不打桩会在
-      // initialModelFromPreferences 里对 undefined 调 find 崩掉。
       getPublicModels: async () => publicModels,
     },
     render: () => settings('hotkeys', paidUser),
