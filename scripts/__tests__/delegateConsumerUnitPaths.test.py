@@ -85,4 +85,20 @@ class UnitPaths(unittest.TestCase):
             self.resolve([BASE, '[Service]\nEnvironment=OC_RUNTIME_IMAGE=%i'])
 
 
+class TupleRestoreProjection(unittest.TestCase):
+    def test_unset_reveals_original_inline_value_not_ambient(self):
+        plan = units.parse_unit([BASE + '\nEnvironment=OC_RUNTIME_IMAGE=inline:old'])
+        values = {key: '' for key in units.TUPLE_KEYS}
+        values['OC_RUNTIME_IMAGE'] = '<UNSET>'
+        r = units.resolve_unit_paths(plan, {'/private/base.env': 'OC_RUNTIME_IMAGE=file:new'},
+            '/private/passwd', tuple_replacement=('/private/base.env', values))
+        self.assertEqual(r['runtimeEnvironment']['OC_RUNTIME_IMAGE'], 'inline:old')
+
+    def test_unknown_target_file_cannot_replace_effective_tuple(self):
+        plan = units.parse_unit([BASE])
+        with self.assertRaises(units.Unknown):
+            units.resolve_unit_paths(plan, {'/private/base.env': ''}, '/private/passwd',
+                tuple_replacement=('/private/not-referenced.env', {key: '' for key in units.TUPLE_KEYS}))
+
+
 if __name__ == '__main__': unittest.main()

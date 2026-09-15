@@ -57,11 +57,11 @@ def _directory(path):
         os.close(fd)
 
 
-def _run(argv, deadline):
+def _run(argv, deadline, *, pass_fds=()):
     remaining = deadline - time.monotonic()
     require(0 < remaining <= 30)
     child = subprocess.Popen(argv, env=ENV, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+                              stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=pass_fds)
     try:
         try:
             output, _ = child.communicate(timeout=remaining)

@@ -7,6 +7,7 @@ and the full original inventory/B0 oracle. The snapshot must be taken AGAIN
 under the real writer barrier by the later authorization stage.
 """
 import argparse
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -281,6 +282,129 @@ def revalidate_context(context, deadline):
         require(paths._root_identity(proof['path'], optional=proof['file'] is None) == proof)
     artifacts.revalidate(context['code'], deadline)
     require(image_snapshot(context['tuple'], deadline) == context['image'])
+
+
+def _revalidate_inputs(inputs, deadline):
+    for proof in inputs:
+        require(time.monotonic() < deadline)
+        require(paths._root_identity(proof['path'], optional=proof['file'] is None) == proof)
+
+
+def history_selection(filename, index, deadline):
+    """Original nth-committed/checksum reader over an immutable pinned copy.
+
+    Do not choose a .bak by mtime or reconstruct the checksum. A regular sealed
+    memfd lets the ORIGINAL shell reader keep its regular-file/tac semantics,
+    without reopening an unpinned history pathname or passing MiB on argv.
+    This is recovery input, never permission to restore a consumer.
+    """
+    require(type(index) is int and 1 <= index <= 100)
+    raw, proof = paths._root_text(filename, deadline)
+    lib = str(ROOT / 'v5-runtime-release-lib.sh')
+    _, library = paths._root_text(lib, deadline)
+    fd = os.memfd_create('consumer-history', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        data = raw.encode()
+        offset = 0
+        while offset < len(data):
+            count = os.write(fd, data[offset:]); require(count > 0)
+            offset += count
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        os.lseek(fd, 0, os.SEEK_SET)
+        selected = artifacts._run(['/bin/bash', '-c',
+            'set -euo pipefail; source "$1"; oc_hotcfg_history_nth_committed "$2" "$3"',
+            'consumer-history', lib, '/proc/self/fd/' + str(fd), str(index)],
+            deadline, pass_fds=(fd,))
+    finally:
+        os.close(fd)
+    row = artifacts._json(selected)
+    values = tuple_values({key: row[field] for key, field in (
+        ('OC_RUNTIME_IMAGE', 'image'), ('OC_RUNTIME_IMAGE_ID', 'image_id'),
+        ('OC_RUNTIME_RELEASE', 'release'), ('OC_PLATFORM_BUNDLE', 'bundle'))})
+    require(isinstance(row['masterRelease'], str) and row['masterRelease'])
+    inputs = [proof, library]
+    _revalidate_inputs(inputs, deadline)
+    return {'tuple': values, 'masterRelease': row['masterRelease'], 'inputs': inputs,
+            'transitionKind': row['transitionKind'], 'previousMasterRelease': row['previousMasterRelease']}
+
+
+def _fallback_projection(current, master, deadline, *, repository, live, releases,
+                         archive_fragment=None, tuple_replacement=None, inputs=()):
+    """Project the exact original restore operations, not an archived-env guess.
+
+    A unit backup restores its fragment ONLY: loaded drop-ins and referenced
+    EnvironmentFiles survive. A saga/history restore replaces four keys in one
+    file ONLY. The resulting runtime (including later-file overrides) is what
+    must pass artifact/B0 checks. Original restore WD policy remains outside
+    this projection and must still reject unsupported restoration routes.
+    """
+    require(Path(master).parent == Path(releases) and Path(master).name.startswith('rel-'))
+    loaded = paths._capture_effective_unit(current['unit']['unit'], deadline)
+    require(loaded == current['unit'])
+    fragments = list(loaded['fragments'])
+    if archive_fragment is not None:
+        fragments[0] = str(paths.path(archive_fragment))
+    restored = paths.capture_root_files(fragments, deadline, tuple_replacement=tuple_replacement)
+    require(restored['projection']['workingDirectory'] == live)
+    restored['inputs'].extend(inputs)
+    values = tuple_values(restored['projection']['runtimeEnvironment'])
+    result = capture_context(restored, master, values, repository, deadline)
+    revalidate_context(current, deadline)
+    revalidate_context(result, deadline)
+    require(paths._capture_effective_unit(loaded['unit'], deadline) == loaded)
+    return result
+
+
+def capture_unit_fallback(current, master, archive_fragment, deadline, *,
+                          repository=REPOSITORY, live=LIVE, releases=RELEASES):
+    return _fallback_projection(current, master, deadline, repository=repository,
+        live=live, releases=releases, archive_fragment=archive_fragment)
+
+
+def capture_saga_fallback(current, master, snapshot, env_file, deadline, *,
+                          repository=REPOSITORY, live=LIVE, releases=RELEASES):
+    raw, proof = paths._root_text(snapshot, deadline)
+    # Exact original four-key snapshot, not a full env file, JSON claim, or
+    # arbitrary chosen .bak. <UNSET> means delete that key in this file only.
+    lines = [line for line in raw.splitlines() if line]
+    require(len(lines) == 4 and all(line.partition('=')[0] in paths.TUPLE_KEYS for line in lines))
+    values = paths.parse_environment_file(raw)
+    require(set(values) == paths.TUPLE_KEYS)
+    return _fallback_projection(current, master, deadline, repository=repository,
+        live=live, releases=releases, tuple_replacement=(env_file, values), inputs=[proof])
+
+
+def capture_history_fallback(current, history, index, env_file, deadline, *,
+                             repository=REPOSITORY, live=LIVE, releases=RELEASES):
+    selected = history_selection(history, index, deadline)
+    name = selected['masterRelease']
+    # Original history contains either a release basename or its full path.
+    # No HEAD/current/env fallback when old schema-v1 lacks a master binding.
+    master = str(Path(releases) / name) if '/' not in name else str(paths.path(name))
+    return _fallback_projection(current, master, deadline, repository=repository,
+        live=live, releases=releases, tuple_replacement=(env_file, selected['tuple']),
+        inputs=selected['inputs'])
+
+
+def assess_fallback(current, fallback, deadline, *, repository=REPOSITORY):
+    """Feed both actual DB projections into the ORIGINAL inventory/B0 oracle.
+
+    This is deliberately not a start/restore permit: the official recovery
+    caller still needs its original lock, rebuilt writer barrier and allowance.
+    No serialized proof or caller-supplied inventory is accepted by a CLI.
+    """
+    inv = inventory.capture_local([current['unit']['projection']['database'],
+                                   fallback['unit']['projection']['database']], deadline)
+    writers = capture_writer_contexts(inv, current, repository, deadline)
+    decision = artifacts.classify_transition(current['code'], fallback['code'], fallback['code'],
+        inv, deadline, writers=[w['code'] for w in writers])
+    revalidate_context(current, deadline)
+    revalidate_context(fallback, deadline)
+    inventory.revalidate(inv)
+    revalidate_writer_contexts(writers, deadline)
+    require(paths._capture_effective_unit(current['unit']['unit'], deadline) == current['unit'])
+    return {'decision': decision, 'fallback': fallback, 'inventory': inv}
 
 
 def capture_transition(candidate_master, candidate_runtime, candidate_image, candidate_image_id,

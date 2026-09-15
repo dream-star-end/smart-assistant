@@ -149,7 +149,7 @@ def parse_environment_file(text):
     return result
 
 
-def resolve_unit_paths(plan, environment_files, passwd_home):
+def resolve_unit_paths(plan, environment_files, passwd_home, *, tuple_replacement=None):
     """All files are actual contents (None only for proven missing optional file).
 
     EnvironmentFile overrides Environment regardless of textual order, and
@@ -158,13 +158,28 @@ def resolve_unit_paths(plan, environment_files, passwd_home):
     """
     require(isinstance(environment_files, dict))
     env = dict(plan["environment"])
+    if tuple_replacement is not None:
+        target, replacement = tuple_replacement
+        path(target)
+        require(isinstance(replacement, dict) and set(replacement) == TUPLE_KEYS)
+        require(all(isinstance(v, str) for v in replacement.values()))
+        require(any(item['path'] == target for item in plan['environmentFiles']))
     for item in plan["environmentFiles"]:
         require(item["path"] in environment_files)
         text = environment_files[item["path"]]
         if text is None:
             require(item["optional"])
         else:
-            env.update(parse_environment_file(text))
+            parsed = parse_environment_file(text)
+            if tuple_replacement is not None and item['path'] == target:
+                # Original saga/history writes ONLY these four keys in ONE
+                # EnvironmentFile. Retain its path overrides and precedence;
+                # a later file may still override any of the restored values.
+                for key, value in replacement.items():
+                    parsed.pop(key, None)
+                    if value != '<UNSET>':
+                        parsed[key] = value
+            env.update(parsed)
     root_home = str(path(passwd_home))
     override = env.get("OPENCLAUDE_DELEGATE_JOBS_DB", "").strip()
     home = env.get("OPENCLAUDE_HOME", "").strip()
@@ -228,7 +243,7 @@ def _root_text(filename, deadline, *, optional=False, max_bytes=MAX_TEXT):
         os.close(fd)
 
 
-def capture_root_files(fragment_paths, deadline):
+def capture_root_files(fragment_paths, deadline, *, tuple_replacement=None):
     """Read pinned root-owned inputs; caller MUST prove effective fragment order.
 
     Not a systemctl discovery API or permission to start. Source files and all
@@ -251,7 +266,11 @@ def capture_root_files(fragment_paths, deadline):
             # A repeated file cannot change between its two reads unnoticed.
             require(item['path'] not in proofs or proofs[item['path']] == proof)
             proofs[item['path']] = proof
-        projection = resolve_unit_paths(plan, files, pwd.getpwnam('root').pw_dir)
+        if tuple_replacement is not None:
+            # A missing optional file cannot serve as a real restore source.
+            require(files.get(tuple_replacement[0]) is not None)
+        projection = resolve_unit_paths(plan, files, pwd.getpwnam('root').pw_dir,
+                                        tuple_replacement=tuple_replacement)
         for filename, proof in proofs.items():
             require(time.monotonic() < deadline)
             require(_root_identity(filename, optional=proof['file'] is None) == proof)
@@ -279,7 +298,14 @@ def parse_effective_properties(output, unit):
     for line in text_lines(output):
         require('=' in line)
         key, value = line.split('=', 1)
-        require(key in SHOW_KEYS and key not in values)
+        require(key in SHOW_KEYS)
+        if key == 'EnvironmentFiles' and key in values:
+            # systemctl show emits one property line per EnvironmentFile.
+            # Preserve that actual order; all scalar duplicates still reject.
+            require(values[key] and value)
+            values[key] += ' ' + value
+            continue
+        require(key not in values)
         values[key] = value
     require(values.get('Id') == unit and values.get('LoadState') == 'loaded')
     require(values.get('NeedDaemonReload') == 'no')

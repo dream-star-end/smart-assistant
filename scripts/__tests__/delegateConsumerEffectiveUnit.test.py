@@ -26,6 +26,16 @@ def output(d): return '\n'.join(k + '=' + v for k, v in d.items()) + '\n'
 
 
 class EffectiveUnit(unittest.TestCase):
+    def test_actual_repeated_environmentfiles_property_lines_keep_order(self):
+        d = properties()
+        d['EnvironmentFiles'] = '/private/a.env (ignore_errors=no)'
+        rendered = output(d) + 'EnvironmentFiles=/private/b.env (ignore_errors=yes)\n'
+        actual = units.parse_effective_properties(rendered, NAME)
+        self.assertEqual(actual['plan']['environmentFiles'], [
+            {'path': '/private/a.env', 'optional': False}, {'path': '/private/b.env', 'optional': True}])
+        with self.assertRaises(units.Unknown):
+            units.parse_effective_properties(rendered + 'EnvironmentFiles=\n', NAME)
+
     def test_loaded_order_and_optional_files_preserved(self):
         r = units.parse_effective_properties(output(properties()), NAME)
         self.assertEqual(r['fragments'], ['/private/master.service', '/private/10-base.conf', '/private/20-final.conf'])
