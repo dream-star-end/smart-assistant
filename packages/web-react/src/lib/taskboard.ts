@@ -34,14 +34,20 @@ export const TICKET_STATUSES = [
 ] as const
 export type TicketStatus = (typeof TICKET_STATUSES)[number]
 
+/**
+ * 状态的唯一权威文案。列头 / 卡片徽章 / 列表 / 新建表单 / 空态都从这里取：
+ * 审计 T-08 之前 `backlog` 在列头叫「积压」、徽章叫「待立项」，`waiting_human` 列头叫「待确认」、
+ * 徽章叫「等我确认」，同一状态两套叫法。统一取列头那套 —— 「积压」更贴合「AI 不碰」的语义，
+ * 「待确认」与「通过 / 打回」这对动作同轴。
+ */
 export const TICKET_STATUS_LABEL: Record<TicketStatus, string> = {
-  backlog: '待立项',
+  backlog: '积压',
   ready: '待执行',
   running: '执行中',
-  waiting_human: '等我确认',
+  waiting_human: '待确认',
   blocked: '受阻',
-  done: '完成',
-  canceled: '取消',
+  done: '已完成',
+  canceled: '已取消',
 }
 
 export const TERMINAL_STATUSES: ReadonlySet<TicketStatus> = new Set<TicketStatus>([

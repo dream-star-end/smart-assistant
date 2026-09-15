@@ -1,6 +1,7 @@
 import { type SetStateAction, useCallback, useEffect, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
+  ACTIVE_LIST_STATUSES,
   type BoardAgent,
   type BoardSnapshot,
   type Project,
@@ -12,12 +13,9 @@ import {
   type TicketMoveInput,
   type TicketMoveResult,
   type TicketType,
-  ACTIVE_LIST_STATUSES,
   boardErrorCode,
   boardErrorDetail,
   isVersionConflict,
-  pickInitialProject,
-  readLastProjectId,
   taskboardApi,
   taskboardErrorMessage,
   writeLastProjectId,
@@ -319,6 +317,7 @@ export function useTaskboard(
     }
   }, [applyBoardSnap, applyListPage, boardQueryType, fetchTicketWindow, scopedQuery])
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: lockedProjectId 变化必须让 loadInitial 换身份,才能驱动下面的 effect 为新项目重新加载(它是唯一的加载路径,见 TaskboardView)
   const loadInitial = useCallback(async () => {
     const a = authRef.current
     if (!a) return
@@ -335,9 +334,13 @@ export function useTaskboard(
         taskboardApi.listProjects(a),
         taskboardApi.listAgents(a).catch(() => [] as BoardAgent[]),
       ])
-      if (!isCurrent()) return
+      // projects / agents 与 epoch 无关：只要还是同一个锁定项目、同一份 auth，谁先到都可用。
+      // 以前把它们放在 isCurrent() 之后，任何一次并发写（选项目 / 筛选）都会让首屏的
+      // 「管理项目」入口与执行者下拉整整丢到下一次 60s 对账（审计 T-01）。
+      if (!ownsLoading()) return
       setProjects(freshProjects)
       setAgents(freshAgents)
+      if (!isCurrent()) return
       const first = initialOwner
         ? freshProjects.find((p) => p.id === initialOwner) ?? null
         : null
@@ -369,8 +372,11 @@ export function useTaskboard(
         }
       } catch (e) {
         if (!(e instanceof AuthEpochStaleError) && isCurrent()) {
+          // 看板 / 列表接口失败要落到带「重试」的错误态，而不是只清空数据让页面停在
+          // 「还没有流水线列」这种错误解释上（审计 T-03）。
           setBoard(null)
           setTickets([])
+          setError(taskboardErrorMessage(e, '加载看板失败'))
         }
       }
     } catch (e) {
@@ -427,6 +433,7 @@ export function useTaskboard(
       if (!a) return
       const gate = (epoch.current += 1)
       const scope = id
+      setError(null)
       try {
         const queryType = type !== undefined ? type || undefined : boardQueryType()
         const [snap, backlog, freshList] = await Promise.all([
@@ -447,10 +454,13 @@ export function useTaskboard(
         }
       } catch (e) {
         if (e instanceof AuthEpochStaleError) return
-        toast(taskboardErrorMessage(e, '加载看板失败'), 'error')
+        // 与 loadInitial 同一落点：错误态 + 重试，而不是几秒后消失的 toast（审计 T-03）。
+        if (mounted.current && epoch.current === gate) {
+          setError(taskboardErrorMessage(e, '加载看板失败'))
+        }
       }
     },
-    [applyBoardSnap, applyListPage, boardQueryType, fetchBacklog, scopedQuery, toast],
+    [applyBoardSnap, applyListPage, boardQueryType, fetchBacklog, scopedQuery],
   )
 
   const selectTicketType = useCallback(

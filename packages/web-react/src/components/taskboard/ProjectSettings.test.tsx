@@ -55,7 +55,9 @@ describe("ProjectSettings workspaceSpec", () => {
     expect(screen.getByTestId("project-workspace-default")).toBeTruthy();
     expect(screen.getByTestId("project-workspace-isolated")).toBeTruthy();
     expect(screen.getByTestId("project-workspace-container_path")).toBeTruthy();
-    expect(screen.getByText(/projects 不能当 cwd/)).toBeTruthy();
+    // 审计 T-14:安全约束改成用户能读懂的说法,不再泄漏 cwd / 环境变量名。
+    expect(screen.getByText(/须位于 workspace\/ 或 repos\/ 之下/)).toBeTruthy();
+    expect(screen.queryByText(/OPENCLAUDE_DEFAULT_WORKSPACE|cwd/)).toBeNull();
     fireEvent.click(screen.getByTestId("project-workspace-container_path"));
     expect(screen.getByTestId("project-workspace-path")).toBeTruthy();
   });
