@@ -1,13 +1,28 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { ChevronRight, FileText } from "lucide-react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useProjectScope } from "../../hooks/useProjectScope";
 import { api, apiErrorMessage } from "../../lib/api";
 import { isWorkScope } from "../../lib/projectScope";
 import { taskboardApi } from "../../lib/taskboard";
 import type { AuthSession, MarketplaceMyAgent, SkillSummary } from "../../lib/types";
-import { useProjectScope } from "../../hooks/useProjectScope";
-import { FileText } from "lucide-react";
+import { cn } from "../../lib/utils";
 import { agentScopeLabels } from "../AgentScopePicker";
-import { Alert, Button, EmptyState, ListSkeleton, useToast } from "../ui";
+import { Alert, Badge, Button, EmptyState, ListSkeleton, Switch, useToast } from "../ui";
+import { isSecretSkill, skillDisplayTitle } from "./skillDisplay";
 
+/**
+ * 项目专属技能：工作项目作用域下，为该项目单独启用一组技能（整份清单一次保存）。
+ *
+ * ── 2026-09 审计改造（M-06）────────────────────────────────────────────────
+ * 1. 非工作作用域**不渲染**：作用域提示已由壳的 ProjectScopeSelect 承担，改造前那句孤零零的
+ *    灰字夹在 PanelHeader 与搜索框之间，读起来像第二段 hint。
+ * 2. 默认**折叠成一行摘要**（名称 + 已启用数 + 展开）：它是技能 Tab 在工作项目下的第一屏内容，
+ *    展开时曾把搜索框与技能列表下推约 250px。
+ * 3. 勾选控件换 Switch + `<label htmlFor>`：原生方框复选框无可访问名、点文字不切换、命中区 ~13px。
+ * 4. 每行显示列表同款展示名（描述首行），slug 降为 caption；「覆盖」这类实现词不再出现。
+ * 5. 脏态：与服务端快照比对，没改动时「保存」禁用；保存失败留在块内 Alert，不再常驻一条说明。
+ * 6. 密钥类技能不再写死 slug，按 isSecretSkill 规则判定（口径见 skillDisplay.ts）。
+ */
 export function ProjectSkillOverlay({
   auth,
   agents,
@@ -19,111 +34,192 @@ export function ProjectSkillOverlay({
   const { scope } = useProjectScope();
   const toast = useToast();
   const workId = scope.workProject?.id ?? "";
+  const [open, setOpen] = useState(false);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
+  /** 服务端最近一次确认过的清单：脏态判定基准。 */
+  const [baseline, setBaseline] = useState<string[]>([]);
   const [version, setVersion] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const uid = useId();
 
-  const load = useCallback(() => {
+  useEffect(() => {
+    void reloadKey;
     if (!workId) return;
+    let cancelled = false;
     setLoading(true);
+    setLoadErr(null);
     void Promise.all([
       api.listSkills(auth).catch(() => [] as SkillSummary[]),
       taskboardApi.getProjectContext(auth, workId),
     ])
       .then(([list, ctx]) => {
+        if (cancelled) return;
         setSkills(list.filter((s) => s.layer === "shared" || s.writable));
-        const overlay = Array.isArray(ctx.skillOverlay)
-          ? (ctx.skillOverlay as string[])
-          : [];
+        const overlay = Array.isArray(ctx.skillOverlay) ? (ctx.skillOverlay as string[]) : [];
         setSelected(overlay);
+        setBaseline(overlay);
         setVersion(typeof ctx.version === "number" ? ctx.version : 0);
       })
-      .catch((e) => toast(apiErrorMessage(e, "加载项目技能失败"), "error"))
-      .finally(() => setLoading(false));
-  }, [auth, workId, toast]);
+      .catch((e) => {
+        if (!cancelled) setLoadErr(apiErrorMessage(e, "加载项目技能失败"));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, workId, reloadKey]);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
-  const excluded = useMemo(
-    () => new Set(["v5-selfhost-cursor-account-pool", "v5-selfhost-cursor-key-rotation", "v5-selfhost-moonshot-k3-key-sync"]),
-    [],
-  );
+  const dirty = useMemo(() => {
+    if (selected.length !== baseline.length) return true;
+    const base = new Set(baseline);
+    return selected.some((n) => !base.has(n));
+  }, [selected, baseline]);
 
-  if (!isWorkScope(scope) || !workId) {
-    return (
-      <div className="px-4 py-3" data-testid="project-skill-overlay-disabled">
-        <p className="text-caption text-muted">选择工作项目后，可为该项目单独启用技能，不影响其他项目。</p>
-      </div>
-    );
-  }
+  const save = useCallback(async () => {
+    if (!dirty || saving) return;
+    setSaving(true);
+    setSaveErr(null);
+    try {
+      const res = await taskboardApi.putProjectContext(auth, workId, {
+        expectedVersion: version,
+        skillNames: selected,
+      });
+      setVersion(res.context.version);
+      setBaseline(selected);
+      toast("已保存项目技能", "success");
+    } catch (e) {
+      // 失败留在发起它的容器里（改造前是一条常驻说明预先解释"可能会失败"）。
+      setSaveErr(
+        apiErrorMessage(e, "保存失败：这个项目的设置刚被别处修改过，请重新读取后再保存"),
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [auth, workId, version, selected, dirty, saving, toast]);
+
+  if (!isWorkScope(scope) || !workId) return null;
+
+  const enabledCount = selected.filter((n) => skills.some((s) => s.name === n && !isSecretSkill(s))).length;
+  const summaryCount = loading ? null : enabledCount;
 
   return (
-    <div className="flex flex-col gap-2 border-t border-border px-4 py-3" data-testid="project-skill-overlay">
-      <div className="flex items-center justify-between gap-2">
-        <h3 className="text-section font-semibold">项目专属技能</h3>
+    <section
+      className="border-t border-border px-4 py-2.5"
+      data-testid="project-skill-overlay"
+      aria-label="项目专属技能"
+    >
+      <div className="flex flex-wrap items-center gap-2">
         <Button
+          variant="ghost"
           size="sm"
-          disabled={saving || loading}
-          onClick={() => {
-            setSaving(true);
-            void taskboardApi
-              .putProjectContext(auth, workId, { expectedVersion: version, skillNames: selected })
-              .then((res) => {
-                setVersion(res.context.version);
-                toast("已保存项目技能", "success");
-              })
-              .catch((e) => toast(apiErrorMessage(e, "保存失败，项目设置可能已被更新，请重试"), "error"))
-              .finally(() => setSaving(false));
-          }}
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-controls={`${uid}-body`}
+          data-testid="project-skill-overlay-toggle"
+          className="-ml-3 gap-1 font-medium"
         >
-          保存
+          <ChevronRight size={14} aria-hidden="true" className={cn("transition-transform", open && "rotate-90")} />
+          项目专属技能
+          {summaryCount !== null && (
+            <Badge tone={summaryCount > 0 ? "accent" : "neutral"} size="sm">
+              已启用 {summaryCount}
+            </Badge>
+          )}
         </Button>
+        {open && (
+          <Button size="sm" className="ml-auto" loading={saving} disabled={!dirty || loading} onClick={() => void save()}>
+            保存
+          </Button>
+        )}
       </div>
-      <p className="text-caption text-muted">这里勾选的技能只对当前项目生效；与全局设置不一致时，以项目内为准。密钥类技能已排除。</p>
-      {loading ? (
-        <ListSkeleton rows={4} />
-      ) : skills.length === 0 ? (
-        <EmptyState icon={FileText} title="没有可勾选的技能" hint="用户技能在管理中心「技能」里创建。" />
-      ) : (
-        <ul className="flex flex-col gap-1">
-          {skills.map((s) => {
-            const blocked = excluded.has(s.name);
-            const on = selected.includes(s.name);
-            return (
-              <li key={s.name} className="flex items-center gap-2 text-body">
-                <input
-                  type="checkbox"
-                  data-testid={`project-skill-${s.name}`}
-                  disabled={blocked}
-                  checked={on && !blocked}
-                  onChange={(e) => {
-                    setSelected((cur) =>
-                      e.target.checked ? [...cur, s.name] : cur.filter((n) => n !== s.name),
-                    );
-                  }}
-                />
-                <span className={blocked ? "text-faint" : ""}>
-                  {s.name}
-                  {on ? " · 覆盖" : ""}
-                  {blocked ? " · 已排除" : ""}
-                  {s.agentIds?.length
-                    ? agents
-                      ? ` · 适用 ${agentScopeLabels(s.agentIds, agents).join("、")}`
-                      : ` · 已限定 ${s.agentIds.length} 个智能体`
-                    : ""}
-                </span>
-              </li>
-            );
-          })}
-        </ul>
+      {open && (
+        <div id={`${uid}-body`} className="mt-1 flex flex-col gap-2">
+          <p className="text-caption text-muted">
+            只对当前项目生效；与全局设置不一致时，以项目内为准。持有账号凭据的密钥类技能不能按项目启用。
+          </p>
+          {saveErr && (
+            <Alert
+              tone="danger"
+              density="compact"
+              onDismiss={() => setSaveErr(null)}
+              action={
+                <Button size="sm" variant="secondary" onClick={reload}>
+                  重新读取
+                </Button>
+              }
+            >
+              {saveErr}
+            </Alert>
+          )}
+          {loading ? (
+            <ListSkeleton rows={3} />
+          ) : loadErr ? (
+            <Alert
+              tone="danger"
+              density="compact"
+              action={
+                <Button size="sm" variant="secondary" onClick={reload}>
+                  重试
+                </Button>
+              }
+            >
+              {loadErr}
+            </Alert>
+          ) : skills.length === 0 ? (
+            <EmptyState icon={FileText} title="没有可启用的技能" hint="先在上方技能列表里创建或从市场安装。" />
+          ) : (
+            <ul className="flex flex-col divide-y divide-border">
+              {skills.map((s) => {
+                const blocked = isSecretSkill(s);
+                const on = selected.includes(s.name) && !blocked;
+                const id = `${uid}-${s.name}`;
+                const { title, caption } = skillDisplayTitle(s);
+                const scopeText = s.agentIds?.length
+                  ? agents
+                    ? `适用 ${agentScopeLabels(s.agentIds, agents).join("、")}`
+                    : `已限定 ${s.agentIds.length} 个智能体`
+                  : null;
+                return (
+                  <li key={s.name} className="flex items-center gap-3 py-2">
+                    <Switch
+                      id={id}
+                      data-testid={`project-skill-${s.name}`}
+                      checked={on}
+                      disabled={blocked}
+                      onCheckedChange={(checked) =>
+                        setSelected((cur) => (checked ? [...cur, s.name] : cur.filter((n) => n !== s.name)))
+                      }
+                    />
+                    <label htmlFor={id} className={cn("min-w-0 flex-1", blocked ? "cursor-not-allowed" : "cursor-pointer")}>
+                      <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                        <span className={cn("truncate text-body", blocked ? "text-faint" : "text-fg")}>{title}</span>
+                        {blocked && (
+                          <Badge tone="neutral" size="sm">
+                            密钥类，不可用于项目
+                          </Badge>
+                        )}
+                      </span>
+                      <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 text-caption text-faint">
+                        {caption && <span className="truncate font-mono">{caption}</span>}
+                        {scopeText && <span>{scopeText}</span>}
+                      </span>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
       )}
-      <Alert tone="info" className="text-caption">
-        技能清单会整体保存。若提示保存失败，说明该项目的设置刚被其他地方修改过，刷新后重试即可，不会只保存一半。
-      </Alert>
-    </div>
+    </section>
   );
 }

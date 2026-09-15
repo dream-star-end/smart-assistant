@@ -84,6 +84,7 @@ const DEFAULT_AGENT: MarketplaceMyAgent = {
 export function SkillEditor({
   auth,
   skillName,
+  displayTitle,
   open,
   onClose,
   onChanged,
@@ -92,6 +93,8 @@ export function SkillEditor({
 }: {
   auth: AuthSession;
   skillName: string;
+  /** 列表里展示的标题（描述首行）。缺省回退 skillName —— 同一个技能在列表 / 工作台 / 确认框里只叫一个名字。 */
+  displayTitle?: string;
   open: boolean;
   onClose: () => void;
   /** 保存/恢复/删文件/合并训练草稿后通知外层刷新列表与正文缓存。 */
@@ -224,11 +227,15 @@ export function SkillEditor({
       Promise.all([
         api.getSkill(auth, skillName),
         api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[]),
+        // 历史版本数随打开就带上:改造前只在切到「历史」页签时才拉,标签「历史（N）」的 N
+        // 会在会话中途凭空出现。失败静默(历史页签自己再拉一次并报错)。
+        api.getSkillHistory(auth, skillName).catch(() => null),
       ])
-        .then(([d, a]) => {
+        .then(([d, a, h]) => {
           if (seq !== loadSeqRef.current) return;
           setDetail(d);
           setAgents(a.length ? a : [DEFAULT_AGENT]);
+          if (h) setHistory(h.history);
           if (mode === "reset" || !dirtyRef.current.has(SKILL_MD)) {
             setDesc(d.description ?? "");
             setBody(d.body ?? "");
@@ -453,8 +460,8 @@ export function SkillEditor({
 
   const removeFile = async (path: string) => {
     const ok = await confirmDialog({
-      title: `删除文件「${path}」?`,
-      body: dirtyRef.current.has(path) ? "该文件有未保存的修改,删除后一并丢失。" : undefined,
+      title: `删除文件「${path}」？`,
+      body: dirtyRef.current.has(path) ? "该文件有未保存的修改，删除后一并丢失。" : undefined,
       confirmText: "删除",
       danger: true,
     });
@@ -475,10 +482,10 @@ export function SkillEditor({
 
   const restore = async (version: string) => {
     const ok = await confirmDialog({
-      title: `恢复到 v${version}?`,
+      title: `恢复到 v${version}？`,
       body: dirtyRef.current.has(SKILL_MD)
-        ? "以新版本号写回该版本正文(现有内容会先存入历史,可再次回滚)。注意:你在「正文」页签未保存的修改会被丢弃。"
-        : "以新版本号写回该版本正文(现有内容会先存入历史,可再次回滚)。",
+        ? "以新版本号写回该版本正文（现有内容会先存入历史，可再次回滚）。注意：你在「正文」页签未保存的修改会被丢弃。"
+        : "以新版本号写回该版本正文（现有内容会先存入历史，可再次回滚）。",
       confirmText: "恢复",
     });
     if (!ok) return;
@@ -502,8 +509,8 @@ export function SkillEditor({
     }
     const list = [...dirtyRef.current].map((p) => (p === SKILL_MD ? "正文" : p));
     const ok = await confirmDialog({
-      title: "放弃未保存的修改?",
-      body: `${list.length > 0 ? `${list.join("、")} ` : "适用智能体 "}的改动尚未保存,关闭后将丢失。`,
+      title: "放弃未保存的修改？",
+      body: `${list.length > 0 ? `${list.join("、")} ` : "适用智能体 "}的改动尚未保存，关闭后将丢失。`,
       confirmText: "放弃",
       danger: true,
     });
@@ -528,11 +535,11 @@ export function SkillEditor({
       onOpenChange={(o) => {
         if (!o) void requestClose();
       }}
-      title={`技能工作台:${skillName}`}
+      title={`技能工作台 · ${displayTitle?.trim() || skillName}`}
       description={
         writable
-          ? "正文 / 文件 / 评测 / 训练优化 都在这里完成。"
-          : "只读技能(市场安装 / 平台内置):内容不可编辑,但可以跑评测。"
+          ? "正文 / 文件 / 评测 / 训练优化都在这里完成。"
+          : "只读技能（市场安装 / 平台内置）：内容不可编辑，但可以跑评测。"
       }
       size="xl"
       mobile="fullscreen"
@@ -610,20 +617,28 @@ export function SkillEditor({
           >
             {!writable && (
               <Alert tone="info" density="compact">
-                这是市场安装 / 平台内置的技能,内容由作者维护,不可编辑。需要按自己的用法改动,
+                这是市场安装 / 平台内置的技能，内容由作者维护，不可编辑。需要按自己的用法改动，
                 可在市场详情页「另存为自建技能」后再来这里编辑。
               </Alert>
             )}
-            <Field label="描述(触发的唯一依据:做什么 + 何时用)">
-              <Input
-                value={desc}
-                disabled={!writable}
-                onChange={(e) => {
-                  setDesc(e.target.value);
-                  markDirty(SKILL_MD);
-                }}
-              />
-            </Field>
+            {/* 只读技能不用 disabled 控件呈现内容:disabled 是 50% 透明、不可聚焦、不可选中复制、
+                触屏内不可滚动 —— "只读但可读"变成"基本读不了"。改为可聚焦的只读文本块。 */}
+            {writable ? (
+              <Field label="描述（触发的唯一依据：做什么 + 何时用）">
+                <Input
+                  value={desc}
+                  onChange={(e) => {
+                    setDesc(e.target.value);
+                    markDirty(SKILL_MD);
+                  }}
+                />
+              </Field>
+            ) : (
+              <div className="flex flex-col gap-1">
+                <span className="text-meta font-medium text-muted">描述</span>
+                <p className="text-body leading-relaxed text-fg">{desc || "（无描述）"}</p>
+              </div>
+            )}
             {agents.length > 0 &&
               (scopeEditable ? (
                 <AgentScopePicker
@@ -641,20 +656,27 @@ export function SkillEditor({
                   适用：<AgentScopeSummary agentIds={detail?.agentIds} agents={agents} />
                 </Card>
               ))}
-            <Field
-              label={`正文(v${detail?.version ?? "?"};保存后旧版自动入历史)`}
-              className="min-h-0 flex-1"
-            >
-              <Textarea
-                value={body}
-                disabled={!writable}
-                onChange={(e) => {
-                  setBody(e.target.value);
-                  markDirty(SKILL_MD);
-                }}
-                className="min-h-[16rem] flex-1 font-mono"
+            {writable ? (
+              <Field
+                label={detail?.version ? `正文（v${detail.version}；保存后旧版自动入历史）` : "正文"}
+                className="min-h-0 flex-1"
+              >
+                <Textarea
+                  value={body}
+                  onChange={(e) => {
+                    setBody(e.target.value);
+                    markDirty(SKILL_MD);
+                  }}
+                  className="min-h-[16rem] flex-1 font-mono"
+                />
+              </Field>
+            ) : (
+              <ReadOnlyText
+                label={detail?.version ? `正文（v${detail.version}）` : "正文"}
+                text={body}
+                className="min-h-0 flex-1"
               />
-            </Field>
+            )}
           </div>
 
           {/* ── 文件 ─────────────────────────────────────────────────────── */}
@@ -681,7 +703,7 @@ export function SkillEditor({
                 {treeOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
               </IconButton>
               <span className="min-w-0 text-meta text-muted">
-                辅助文件:参考资料 / 脚本 / 素材。技能正文在「正文」页签。
+                辅助文件：参考资料 / 脚本 / 素材。技能正文在「正文」页签。
               </span>
             </div>
             {fileErr && (
@@ -775,8 +797,12 @@ export function SkillEditor({
                     title={auxCount > 0 ? "选一个文件开始" : "还没有辅助文件"}
                     hint={
                       auxCount > 0
-                        ? "左侧列表里点任意文件即可编辑;未保存的文件会带一个圆点。"
-                        : "辅助文件放参考资料、脚本与素材,技能运行时按需读取。可在左侧新建。"
+                        ? writable
+                          ? "左侧列表里点任意文件即可编辑；未保存的文件会带一个圆点。"
+                          : "左侧列表里点任意文件即可查看。"
+                        : writable
+                          ? "辅助文件放参考资料、脚本与素材，技能运行时按需读取。可在左侧新建。"
+                          : "辅助文件放参考资料、脚本与素材，技能运行时按需读取。"
                     }
                     action={
                       !treeOpen ? (
@@ -791,7 +817,7 @@ export function SkillEditor({
                     <Skeleton className="h-3.5 w-40" />
                     <Skeleton className="h-64 rounded-lg" />
                   </div>
-                ) : (
+                ) : writable ? (
                   <Field
                     label={
                       <span className="flex items-center gap-1.5">
@@ -807,7 +833,6 @@ export function SkillEditor({
                   >
                     <Textarea
                       value={fileDrafts[selected] ?? ""}
-                      disabled={!writable}
                       onChange={(e) => {
                         putDraft(selected, e.target.value);
                         markDirty(selected);
@@ -815,6 +840,8 @@ export function SkillEditor({
                       className="min-h-[16rem] flex-1 font-mono"
                     />
                   </Field>
+                ) : (
+                  <ReadOnlyText label={selected} text={fileDrafts[selected] ?? ""} className="min-h-0 flex-1" mono />
                 )}
               </div>
             </div>
@@ -870,7 +897,7 @@ export function SkillEditor({
               <EmptyState
                 icon={Clock}
                 title="还没有历史版本"
-                hint="每次保存 SKILL.md 正文都会自动把旧版快照到这里,可一键回滚。"
+                hint="每次保存 SKILL.md 正文都会自动把旧版快照到这里，可一键回滚。"
                 action={
                   writable ? (
                     <Button size="sm" variant="secondary" onClick={() => setTab("body")}>
@@ -893,7 +920,7 @@ export function SkillEditor({
                 </Card>
               ))
             )}
-            <p className="mt-1 text-meta text-muted">历史快照覆盖 SKILL.md 正文;辅助文件不入快照。</p>
+            <p className="mt-1 text-meta text-muted">历史快照覆盖 SKILL.md 正文；辅助文件不入快照。</p>
           </div>
         </>
       )}
@@ -916,6 +943,38 @@ export function SkillEditor({
         </div>
       )}
     </Modal>
+  );
+}
+
+/**
+ * 只读技能的正文 / 辅助文件呈现:可聚焦的滚动区（WCAG 2.1.1）+ 正常对比度 + 可选中复制。
+ * 不用 disabled Textarea:那是 50% 透明、不可聚焦、不可选中、触屏内不可滚的"死"控件。
+ */
+function ReadOnlyText({
+  label,
+  text,
+  className,
+  mono,
+}: {
+  label: string;
+  text: string;
+  className?: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className={cn("flex flex-col gap-1", className)}>
+      <span className={cn("text-meta font-medium text-muted", mono && "font-mono")}>{label}</span>
+      <section
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: 可滚动的只读区必须能被键盘聚焦
+        tabIndex={0}
+        aria-label={label}
+        className="min-h-0 flex-1 overflow-auto rounded-lg bg-code outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <pre className="whitespace-pre-wrap break-words px-3.5 py-2.5 font-mono text-body leading-relaxed text-fg">
+          {text || "（空）"}
+        </pre>
+      </section>
+    </div>
   );
 }
 

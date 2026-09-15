@@ -146,15 +146,15 @@ function CostBody({
         ))}
       </ul>
       <p>
-        预计消耗:<span className="font-medium text-fg">{range}</span>
+        预计消耗：<span className="font-medium text-fg">{range}</span>
         {rates && (
           <span className="text-muted">
-            (按 {rates.displayName} 公开费率估算,实际以账单为准)
+            （按 {rates.displayName} 公开费率估算，实际以账单为准）
           </span>
         )}
       </p>
       {extra}
-      <p className="font-medium text-danger">本操作将消耗你的积分,确认后立即开始。</p>
+      <p className="font-medium text-danger">本操作将消耗你的积分，确认后立即开始。</p>
     </div>
   );
 }
@@ -168,12 +168,12 @@ function UsageLine({ usage, rates, label }: { usage?: SkillRunUsage; rates: Mode
   const credits = rates ? creditsForUsage(usage, rates) : null;
   return (
     <p className="text-meta text-muted">
-      {label ?? "本次消耗"}:输入 {usage.inputTokens.toLocaleString()} / 输出{" "}
-      {usage.outputTokens.toLocaleString()} tokens({usage.turns} 轮)
+      {label ?? "本次消耗"}：输入 {usage.inputTokens.toLocaleString()} / 输出{" "}
+      {usage.outputTokens.toLocaleString()} tokens（{usage.turns} 轮）
       {credits !== null && (
         <>
-          ,折算约 <span className="font-medium text-fg">{fmtCredits(credits)} 积分</span>
-          (实际扣费以账单为准)
+          ，折算约 <span className="font-medium text-fg">{fmtCredits(credits)} 积分</span>
+          （实际扣费以账单为准）
         </>
       )}
     </p>
@@ -282,17 +282,17 @@ export function SkillEvalSection({
   const startRun = async () => {
     const n = cases.length;
     if (n === 0) return setErr("请先添加至少 1 个评测用例");
-    if (dirty) return setErr("有未保存的用例修改,先保存再运行");
+    if (dirty) return setErr("有未保存的用例修改，先保存再运行");
     const range = rates ? fmtCreditRange(estimateEvalRunCredits(n, 2, rates)) : "少量";
     const ok = await confirmDialog({
-      title: `运行评测(${n} 个用例)?`,
+      title: `运行评测（${n} 个用例）？`,
       body: (
         <CostBody
           lines={[
-            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
-            `${n} 个用例 × 2 组对照(有技能 / 无技能)+ 每用例 1 次评分`,
-            "全部在隔离会话中运行,不影响你的正常对话与技能库",
-            "开始后无法中止,请先确认用例无误",
+            `模型：${rates?.displayName ?? SKILL_RUN_MODEL}（平台锁定）`,
+            `${n} 个用例 × 2 组对照（有技能 / 无技能）+ 每用例 1 次评分`,
+            "全部在隔离会话中运行，不影响你的正常对话与技能库",
+            "开始后无法中止，请先确认用例无误",
           ]}
           range={range}
           rates={rates}
@@ -617,13 +617,13 @@ export function SkillEvalSection({
               />
               <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-body text-muted">
                 <Spinner size={14} />
-                {run.status === "grading" ? "评分中" : "评测中"}({run.progress.done}/{run.progress.total} 组)…
+                {run.status === "grading" ? "评分中" : "评测中"}（{run.progress.done}/{run.progress.total} 组）…
                 <span className="text-meta text-muted">本次运行不可中止</span>
               </p>
             </div>
           ) : run.status === "failed" ? (
             <Alert tone="danger" density="compact">
-              评测失败:{run.error}
+              评测失败：{run.error}
             </Alert>
           ) : (
             <EvalResultView run={run} rates={rates} />
@@ -635,7 +635,7 @@ export function SkillEvalSection({
       {/* 上次结果(无进行中 run 时) */}
       {!run && lastRun?.benchmark && (
         <Card tone="sunken" padding="sm" className="flex flex-col gap-1">
-          <p className="text-body font-medium text-fg">上次评测:{lastRun.benchmark.verdict}</p>
+          <p className="text-body font-medium text-fg">上次评测：{lastRun.benchmark.verdict}</p>
           <UsageLine usage={lastRun.usage} rates={rates} label="上次消耗" />
         </Card>
       )}
@@ -703,7 +703,7 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
                 {rs.map((r) => (
                   <span key={r.arm} className="shrink-0 text-caption text-muted">
                     {ARM_LABEL[r.arm]}{" "}
-                    {r.error ? "✗错" : `${r.assertions.filter((a) => a.passed).length}/${r.assertions.length}`}
+                    {r.error ? "出错" : `${r.assertions.filter((a) => a.passed).length}/${r.assertions.length}`}
                   </span>
                 ))}
               </button>
@@ -886,9 +886,16 @@ export function SkillTrainSection({
 
   const discard = async () => {
     if (!runId) return;
-    const ok = await confirmDialog({ title: "放弃本次训练与全部草稿?", confirmText: "放弃", danger: true });
+    const ok = await confirmDialog({ title: "放弃本次训练与全部草稿？", confirmText: "放弃", danger: true });
     if (!ok) return;
-    await api.discardSkillTrainRun(auth, runId).catch(() => {});
+    // 服务端放弃失败就不能清本地 run：否则下次打开工作台又被 pickResumableTrainRun 找回，
+    // 用户看到「刚放弃的东西又回来了」。失败报在原地，run 原样留着可再试。
+    try {
+      await api.discardSkillTrainRun(auth, runId);
+    } catch (e) {
+      setErr(apiErrorMessage(e, "放弃失败"));
+      return;
+    }
     setRunId(null);
     setRun(null);
     setResumeNotice(null);
@@ -1312,7 +1319,7 @@ function TrainDraftView({
       )}
       <div className="flex flex-wrap items-center gap-1.5">
         <FlaskConical size={14} className="shrink-0 text-accent" />
-        <span className="text-body font-medium text-fg">草稿:{d.record.name}</span>
+        <span className="text-body font-medium text-fg">草稿：{d.record.name}</span>
         <Badge tone="accent">{OP_LABEL[d.record.op] ?? d.record.op}</Badge>
         {drafts.length > 1 && <Badge tone="neutral">共 {drafts.length} 份草稿</Badge>}
         {d.evalsJson && <Badge tone="info">附带评测用例</Badge>}
@@ -1328,11 +1335,12 @@ function TrainDraftView({
           ) : null)}
       </div>
 
-      {/* 多份草稿:逐份切换审阅。「看一份、合三份」是这块此前最危险的信息缺口。 */}
+      {/* 多份草稿:逐份切换审阅。「看一份、合三份」是这块此前最危险的信息缺口。
+          横滚而不是宫格:宫格在窄屏三列里长 slug 会被截到只剩 ✓。 */}
       {drafts.length > 1 && (
         <Tabs
           aria-label="切换草稿"
-          layout="grid"
+          layout="scroll"
           value={selected ?? drafts[0].name}
           onValueChange={setSelected}
           items={drafts.map((x) => ({
@@ -1342,7 +1350,7 @@ function TrainDraftView({
         />
       )}
 
-      {d.record.rationale && <p className="text-meta text-muted">理由:{d.record.rationale}</p>}
+      {d.record.rationale && <p className="text-meta text-muted">理由：{d.record.rationale}</p>}
 
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center gap-2">
