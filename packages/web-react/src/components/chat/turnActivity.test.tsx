@@ -1,10 +1,19 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { TodoItem } from "./PinnedTaskTracker";
-import { deriveActivePlanStep, TurnActivity, type TurnActivityInfo } from "./TurnActivity";
+import {
+  deriveActivePlanStep,
+  splitElapsedSeconds,
+  stripElapsedSeconds,
+  TurnActivity,
+  type TurnActivityInfo,
+} from "./TurnActivity";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 function todo(content: string, status: string, activeForm?: string): TodoItem {
   return { content, status, activeForm };
@@ -166,5 +175,61 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
       hasVisibleProcess: true,
     });
     expect(screen.queryByText("正在恢复实时内容…")).not.toBeInTheDocument();
+  });
+});
+
+// M-04:活动行是 aria-live=polite 区域,而文案含每秒变化的「(Ns)」→ 读屏每秒被朗读一次。
+// 现在秒数段包进 aria-hidden 的 span(不进无障碍树),阶段文案文本节点只在阶段切换时才变。
+describe("TurnActivity 读屏播报只跟阶段文案(M-04)", () => {
+  function renderTA(info: Partial<TurnActivityInfo>) {
+    render(<TurnActivity info={{ startedAt: Date.now(), agentName: "助手", ...info }} />);
+  }
+
+  test("splitElapsedSeconds:秒数段被单独切出,拼回去逐字等于原文", () => {
+    const text = "主助手 深度思考中 (40s · 35s 无新数据) · 复杂问题可能需要一两分钟,可随时停止";
+    const segments = splitElapsedSeconds(text);
+    expect(segments.map((s) => s.text).join("")).toBe(text);
+    expect(segments.filter((s) => s.elapsed).map((s) => s.text)).toEqual([" (40s · 35s 无新数据)"]);
+    expect(stripElapsedSeconds(text)).toBe("主助手 深度思考中 · 复杂问题可能需要一两分钟,可随时停止");
+    expect(stripElapsedSeconds("主助手 正在启动引擎 (8s)…")).toBe("主助手 正在启动引擎…");
+    // 重试计数「（2/10）」不是秒数,不能被误剥。
+    expect(stripElapsedSeconds("模型繁忙，正在重试中（2/10）")).toBe("模型繁忙，正在重试中（2/10）");
+    expect(splitElapsedSeconds("主助手 思考中")).toEqual([{ text: "主助手 思考中", elapsed: false }]);
+  });
+
+  test("秒数段对读屏 aria-hidden,可见文案逐字不变", () => {
+    renderTA({ startedAt: Date.now() - 10_000 });
+    const row = screen.getByLabelText("生成中");
+    expect(row).toHaveAttribute("aria-live", "polite");
+    expect(row.textContent).toContain("思考中 (10s)");
+    const hidden = row.querySelector("[data-elapsed]");
+    expect(hidden).not.toBeNull();
+    expect(hidden).toHaveAttribute("aria-hidden", "true");
+    expect(hidden?.textContent).toBe(" (10s)");
+  });
+
+  test("每秒 tick 只改秒数 span 的文本节点,阶段文案的文本节点保持同一引用", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-15T00:00:10Z"));
+    const startedAt = Date.now() - 10_000;
+    renderTA({ startedAt, lastFrameAt: Date.now() });
+    const row = screen.getByLabelText("生成中");
+    const phaseNode = Array.from(row.querySelector(".break-words")!.childNodes).find(
+      (node) => node.nodeType === Node.TEXT_NODE,
+    );
+    expect(phaseNode?.textContent).toBe("助手 思考中");
+    const secondsBefore = row.querySelector("[data-elapsed]")?.textContent;
+
+    act(() => {
+      vi.advanceTimersByTime(3_000);
+    });
+    const phaseNodeAfter = Array.from(row.querySelector(".break-words")!.childNodes).find(
+      (node) => node.nodeType === Node.TEXT_NODE,
+    );
+    // 阶段未变:文本节点未被替换、内容未变(live region 无可播报的变更)。
+    expect(phaseNodeAfter).toBe(phaseNode);
+    expect(phaseNodeAfter?.textContent).toBe("助手 思考中");
+    // 秒数确实在跳,只是跳在 aria-hidden 里。
+    expect(row.querySelector("[data-elapsed]")?.textContent).not.toBe(secondsBefore);
   });
 });
