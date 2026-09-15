@@ -1,5 +1,6 @@
-import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, screen, waitFor } from "@testing-library/react";
 import { type Mock, afterEach, describe, expect, test, vi } from "vitest";
+import { ToastProvider } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
@@ -78,6 +79,8 @@ type ListHarness = {
 async function renderSessionList(opts: {
   confirmResult: boolean;
   promptResult: string | null;
+  /** 包一层 ToastProvider，让失败路径的 toast 文案可在 DOM 上断言。 */
+  withToasts?: boolean;
 }) {
   const harness: ListHarness = {
     socket: {
@@ -124,7 +127,7 @@ async function renderSessionList(opts: {
     onNewSessionReset: () => {},
     onDeleteSession: harness.onDeleteSession,
     onActiveSessionDeleted: harness.onActiveSessionDeleted,
-  }));
+  }), opts.withToasts ? { wrapper: ToastProvider } : undefined);
 
   // 等服务端列表落定(自动选中最近会话也在此后完成)。
   await waitFor(() => expect(result.current.sessions.length).toBe(2));
@@ -196,9 +199,55 @@ describe("useSessionList 删除会话（不可逆）", () => {
     expect(harness.onActiveSessionDeleted).toHaveBeenCalledTimes(1);
     expect(result.current.activeId).toBeUndefined();
   });
+
+  // USL-02：服务端删除失败此前静默，表现为「删了、刷新又复活」。现在告知 + 立刻重拉列表让它回到侧栏。
+  test("服务端删除失败 → 报错 toast 并重拉列表，会话回到侧栏而不是刷新后诡异复活", async () => {
+    const { result, harness } = await renderSessionList({
+      confirmResult: true,
+      promptResult: null,
+      withToasts: true,
+    });
+    harness.deleteSession.mockImplementation(async () => {
+      throw new ApiError({ status: 500, message: "boom" });
+    });
+    const list = api.listSessions as unknown as Mock;
+    const before = list.mock.calls.length;
+    const target = result.current.sessions.find((s) => s.id === "webdropme001")!;
+    await act(async () => {
+      await result.current.deleteSessionConfirm(target);
+    });
+    expect(screen.getByRole("alert").textContent).toContain("删除失败");
+    await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(before));
+    await waitFor(() =>
+      expect(result.current.sessions.map((s) => s.id)).toContain("webdropme001"),
+    );
+  });
 });
 
 describe("useSessionList 重命名会话", () => {
+  // USL-01：服务端失败此前被吞掉，60s 轮询 server-wins 后标题「自己变回去」。现在立刻回滚 + 告知。
+  test("服务端 PATCH 失败 → 列表与 WS service 立刻回滚原标题，并给出失败 toast", async () => {
+    const { result, harness } = await renderSessionList({
+      confirmResult: true,
+      promptResult: "改不成的标题",
+      withToasts: true,
+    });
+    harness.patchSessionTitle.mockImplementation(async () => {
+      throw new ApiError({ status: 500, message: "boom" });
+    });
+    const target = result.current.sessions.find((s) => s.id === "webkeepme001")!;
+    await act(async () => {
+      await result.current.renameSessionPrompt(target);
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.title).toBe("保留的会话");
+    // 先乐观改名、失败后改回：WS service 两次都要同步。
+    expect(harness.socket.renameSession.mock.calls).toEqual([
+      ["webkeepme001", "改不成的标题"],
+      ["webkeepme001", "保留的会话"],
+    ]);
+    expect(screen.getByRole("alert").textContent).toContain("重命名失败");
+  });
+
   test("新标题同时落列表、WS service 与服务端 canonical（少一处都会被盖回）", async () => {
     const { result, harness } = await renderSessionList({
       confirmResult: true,
@@ -705,6 +754,42 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
       expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
     );
     expect(result.current.hasMoreSessions).toBe(false);
+  });
+
+  // S-08：分页失败此前直接 hasMore=false，更早的会话永远拉不到。现在保留 hasMore + 暴露 loadMoreError。
+  test("loadMoreSessions 失败保留 hasMore 并置 loadMoreError；重试成功后清除", async () => {
+    const page = vi
+      .spyOn(api, "listSessionsPage")
+      .mockRejectedValueOnce(new ApiError({ status: 502, message: "bad gateway" }))
+      .mockResolvedValueOnce({
+        sessions: [
+          {
+            id: "webolder0001",
+            title: "更早的一页",
+            agentId: "main",
+            pinned: false,
+            createdAt: 1,
+            lastAt: 1_000,
+            updatedAt: 1_000,
+            messageCount: 1,
+          },
+        ],
+      });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await act(async () => {
+      await result.current.loadMoreSessions();
+    });
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(result.current.loadMoreError).toBe(true);
+    expect(result.current.hasMoreSessions).toBe(true);
+    expect(result.current.loadingMoreSessions).toBe(false);
+
+    await act(async () => {
+      await result.current.loadMoreSessions();
+    });
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(result.current.loadMoreError).toBe(false);
+    expect(result.current.sessions.map((s) => s.id)).toContain("webolder0001");
   });
 
   test("首屏不拉 includeArchived；loadArchivedSessions 才带该参数", async () => {

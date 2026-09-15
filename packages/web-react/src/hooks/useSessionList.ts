@@ -177,6 +177,8 @@ export type UseSessionList = {
   loadMoreSessions: () => Promise<void>;
   hasMoreSessions: boolean;
   loadingMoreSessions: boolean;
+  /** 上一次 loadMoreSessions 失败（hasMore 保持 true 允许重试；侧栏据此显示「点击重试」）。 */
+  loadMoreError: boolean;
   /** 展开「已归档」时用 includeArchived=1 拉取并合并。 */
   loadArchivedSessions: () => Promise<void>;
   loadingArchived: boolean;
@@ -402,7 +404,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                   permissionPrompts: tapeDetail.permissionPrompts,
                 });
               },
-              (query) => api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),
+              (query) =>
+                api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),
             )
             .catch(() => {
               /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */
@@ -515,6 +518,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [serverListSettled, setServerListSettled] = useState(false);
   const [hasMoreSessions, setHasMoreSessions] = useState(true);
   const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
   const [loadingArchived, setLoadingArchived] = useState(false);
   const nextCursorRef = useRef<number | undefined>(undefined);
   const loadMoreInflightRef = useRef(false);
@@ -620,9 +624,16 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: t } : x)));
     if (!demo) {
       cbRef.current.sockRef.current?.renameSession(s.id, t);
-      void api.patchSessionTitle(cbRef.current.authSession, s.id, t).catch(() => {
-        /* 服务端失败:本地已改,下次 listSessions server-wins 盖回旧值,用户可重试;不打断 */
-      });
+      try {
+        await api.patchSessionTitle(cbRef.current.authSession, s.id, t);
+      } catch (e) {
+        // 服务端失败：此前静默吞掉，60s 轮询 server-wins 后标题「自己变回去」（USL-01）。
+        // 现在立刻回滚三个持有方并告知，用户可重试。
+        setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: s.title } : x)));
+        cbRef.current.sockRef.current?.renameSession(s.id, s.title);
+        console.warn("patchSessionTitle failed", e);
+        toast("重命名失败，已恢复原标题", "error");
+      }
     }
   };
 
@@ -644,16 +655,24 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       return next;
     });
     modelSyncRef.current.delete(s.id);
-    if (!demo) {
-      cbRef.current.sockRef.current?.removeSession(s.id);
-      cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
-      // 服务端删除（幂等，best-effort）：否则 reload 后会从 listSessions 复活。
-      void api.deleteSession(cbRef.current.authSession, s.id).catch(() => {});
-    }
     setSessions((c) => c.filter((x) => x.id !== s.id));
     if (s.id === activeId) {
       setActiveId(undefined);
       cbRef.current.onActiveSessionDeleted();
+    }
+    if (!demo) {
+      cbRef.current.sockRef.current?.removeSession(s.id);
+      cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
+      // 服务端删除：失败此前静默（注释自认「reload 后会从 listSessions 复活」，USL-02）。
+      // 本地 socket/IndexedDB 副本已清、不做完整回滚；改为告知 + 立刻重拉列表让会话回到侧栏，
+      // 用户看到的是「删除失败、会话仍在」而不是刷新后诡异复活；再次选中会重拉服务端历史。
+      try {
+        await api.deleteSession(cbRef.current.authSession, s.id);
+      } catch (e) {
+        console.warn("deleteSession failed", e);
+        toast("删除失败，该会话仍保留在云端，已刷新列表", "error");
+        void refreshSessionList();
+      }
     }
   };
 
@@ -789,9 +808,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       setSessions((cur) => upsertSessions(cur, incoming, true));
       nextCursorRef.current = page.nextCursor;
       setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
+      setLoadMoreError(false);
     } catch (e) {
+      // 失败不再把 hasMore 直接置 false（那会让更早的会话永远拉不到、用户以为「就这么多」，S-08）：
+      // 保留 hasMore 允许重试，并暴露 loadMoreError 让侧栏给出「点击重试」。
       console.warn("listSessionsPage failed", e);
-      setHasMoreSessions(false);
+      setLoadMoreError(true);
     } finally {
       loadMoreInflightRef.current = false;
       setLoadingMoreSessions(false);
@@ -890,6 +912,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     archivedFetchedRef.current = false;
     setHasMoreSessions(true);
     setLoadingMoreSessions(false);
+    setLoadMoreError(false);
     setLoadingArchived(false);
     setSessions([]);
     setActiveId(undefined);
@@ -914,6 +937,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     loadMoreSessions,
     hasMoreSessions,
     loadingMoreSessions,
+    loadMoreError,
     loadArchivedSessions,
     loadingArchived,
     searchSessionMessages,
