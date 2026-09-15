@@ -99,7 +99,9 @@ def runtime_projection(container):
             'imageIdLabel': labels.get('com.openclaude.runtime.image_id'),
             'mounts': sorted(mounts, key=lambda m: m['Destination']),
             'entrypoint': config.get('Entrypoint'), 'cmd': config.get('Cmd'),
-            'workingDirectory': config.get('WorkingDir')}
+            'workingDirectory': config.get('WorkingDir'),
+            'privileged': container['HostConfig'].get('Privileged'),
+            'capAdd': container['HostConfig'].get('CapAdd')}
 
 
 def collect(volumes, containers, master_databases):

@@ -58,10 +58,9 @@ def tuple_values(env):
     require(isinstance(image, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}', image))
     require(isinstance(image_id, str) and re.fullmatch(r'sha256:[a-f0-9]{64}', image_id))
     runtime, bundle = env['OC_RUNTIME_RELEASE'], env['OC_PLATFORM_BUNDLE']
-    # Embedded image source needs its own immutable source/metadata adapter.
-    # It is UNKNOWN here, never "legacy" or a guessed release directory.
-    require(isinstance(runtime, str) and runtime)
-    paths.path(runtime)
+    require(isinstance(runtime, str))
+    if runtime:
+        paths.path(runtime)
     require(isinstance(bundle, str))
     if bundle:
         paths.path(bundle)
@@ -109,6 +108,25 @@ def _image_launch(image):
     return result
 
 
+def _writer_layer_unchanged(writer, deadline):
+    """A Docker image ID does not identify the container's writable layer.
+
+    Historical embed-1 explicitly chowns /opt/openclaude to agent. Never infer
+    that its running code matches baked source from labels alone. This reads
+    only daemon diff path metadata, not user file contents, and is retaken
+    before trusting the writer. The real stop barrier is still required.
+    """
+    raw = artifacts._run(['/usr/bin/docker', '--host=unix:///var/run/docker.sock',
+                          'container', 'diff', writer['id']], deadline)
+    protected = [Path(p) for p in ('/opt/openclaude', '/usr/local/lib/openclaude',
+                                   '/usr/local/bin/entrypoint.sh', '/usr/bin/node', '/usr/bin/tini')]
+    for line in raw.decode().splitlines():
+        kind, separator, changed = line.partition(' ')
+        require(separator and kind in {'A', 'C', 'D'})
+        path = paths.path(changed)
+        require(not any(path.is_relative_to(p) or p.is_relative_to(path) for p in protected))
+
+
 def capture_writer_contexts(inv, current, repository, deadline):
     """Bind every retained writer to its ACTUAL immutable image/source.
 
@@ -121,6 +139,9 @@ def capture_writer_contexts(inv, current, repository, deadline):
     for writer in inv['writers']:
         _writer_matches(_inspect('container', writer['id'], deadline), writer)
         projection = writer['runtime']
+        require(projection['privileged'] is False)
+        require(projection['capAdd'] in (None, []))
+        _writer_layer_unchanged(writer, deadline)
         image_id = writer['image']
         if image_id not in cached_images:
             cached_images[image_id] = _image_launch(_inspect('image', image_id, deadline))
@@ -160,6 +181,7 @@ def revalidate_writer_contexts(contexts, deadline):
     for context in contexts:
         writer = context['writer']
         _writer_matches(_inspect('container', writer['id'], deadline), writer)
+        _writer_layer_unchanged(writer, deadline)
         if writer['image'] not in checked_images:
             require(_image_launch(_inspect('image', writer['image'], deadline)) == context['launch'])
             checked_images.add(writer['image'])
@@ -247,7 +269,9 @@ def runtime_snapshot(unit, projection, master, deadline):
 
 def capture_context(unit, master, values, repository, deadline):
     require(unit['projection']['runtimeEnvironment'] == values)
-    code = artifacts.capture(master, values['OC_RUNTIME_RELEASE'], repository, deadline)
+    code = (artifacts.capture(master, values['OC_RUNTIME_RELEASE'], repository, deadline)
+            if values['OC_RUNTIME_RELEASE'] else
+            artifacts.capture_embedded(master, values['OC_RUNTIME_IMAGE_ID'], repository, deadline))
     image = image_snapshot(values, deadline)
     return {'unit': unit, 'tuple': values, 'image': image, 'code': code}
 
@@ -291,7 +315,7 @@ def capture_transition(candidate_master, candidate_runtime, candidate_image, can
     # New unit path overrides ARE included as separate inventory paths.
     require(proposed['projection']['runtimeEnvironment'] == current_values)
     proposed_values = dict(current_values)
-    if candidate_runtime:
+    if candidate_runtime or candidate_image or candidate_image_id or candidate_bundle:
         proposed_values.update(OC_RUNTIME_RELEASE=candidate_runtime,
                                OC_RUNTIME_IMAGE=candidate_image,
                                OC_RUNTIME_IMAGE_ID=candidate_image_id)

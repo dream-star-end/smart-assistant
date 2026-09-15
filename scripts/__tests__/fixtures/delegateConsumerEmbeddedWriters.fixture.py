@@ -9,6 +9,18 @@ labels = image_config['Labels']
 safe()
 out['cases'].append('explicit-baked-legacy-source-accepted-with-real-git-and-b0')
 
+original_transport = mod._run
+def changed_layer(argv, deadline):
+    if argv[:4] == ['/usr/bin/docker', '--host=unix:///var/run/docker.sock', 'container', 'diff']:
+        return b'C /opt/openclaude/packages/storage/receipt.js\n'
+    return original_transport(argv, deadline)
+mod._run = changed_layer
+refused(lambda: check(joint=True), 'unchanged-image-id-cannot-hide-user-modified-baked-source')
+mod._run = original_transport
+container['HostConfig']['Privileged'] = True
+refused(lambda: check(joint=True), 'privileged-writer-cannot-certify-immutable-source')
+container['HostConfig']['Privileged'] = False
+
 labels['oc.runtime.embed_source'] = '0'
 refused(lambda: check(joint=True), 'toolchain-image-label-cannot-certify-baked-source')
 labels['oc.runtime.embed_source'] = '1'

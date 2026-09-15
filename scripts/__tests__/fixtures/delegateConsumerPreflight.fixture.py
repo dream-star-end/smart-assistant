@@ -88,6 +88,10 @@ try:
     original_run = mod._run
     def transport(argv, deadline):
         if argv[0] == '/usr/bin/docker':
+            if argv == ['/usr/bin/docker', '--host=unix:///var/run/docker.sock', 'image', 'inspect', image_id]:
+                # Explicit unknown immutable-image metadata, not an assertion
+                # failure in the old transport when the new adapter is used.
+                return json.dumps([{'Id': image_id, 'Config': {'Labels': {}}}]).encode()
             assert argv == ['/usr/bin/docker', '--host=unix:///var/run/docker.sock', 'image', 'inspect', '--format', '{{.Id}}', image]
             image_requests.append(argv)
             return (image_id + '\n').encode()

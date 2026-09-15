@@ -152,20 +152,17 @@ def capture(master_release, runtime_release, repository, deadline):
 def _capture(master_release, runtime_release, repository, deadline):
     require(os.geteuid() == 0 and 0 < deadline - time.monotonic() <= 30)
     require(all(isinstance(p, str) and p for p in (master_release, runtime_release, repository)))
-    roots = {p: _directory(p) for p in (master_release, runtime_release, repository)}
-    proofs = {}
-    master = Path(master_release)
+    master_proof = capture_master(master_release, repository, deadline)
+    roots = {**master_proof['roots'], runtime_release: _directory(runtime_release)}
+    proofs = {p['path']: p for p in master_proof['inputs']}
     runtime = Path(runtime_release)
-    _, marker = _read(str(master / '.complete'), deadline, proofs)
-    metadata_raw, metadata = _read(str(master / 'deploy/v5/release-metadata.json'), deadline, proofs)
     _, manifest = _read(str(runtime / 'MANIFEST.json'), deadline, proofs, max_bytes=kernel.MAX_METADATA)
     _, flavor = _read(str(runtime / 'flavor.manifest.json'), deadline, proofs)
     # Call the existing whole-artifact digest algorithms, not a new digest or a
     # statement that files matching a manifest already imply trusted capability.
-    master_lib = str(LIB.parent / 'v5-selfhost-master-release-lib.sh')
     runtime_lib = str(LIB.parent / 'v5-runtime-release-lib.sh')
     flavor_lib = str(LIB / 'assert-flavor.sh')
-    for lib in (master_lib, runtime_lib, flavor_lib):
+    for lib in (runtime_lib, flavor_lib):
         _, proof = paths._root_text(lib, deadline)
         proofs[lib] = proof
     # A canonical checkout keeps the original rules in packages/commercial;
@@ -179,11 +176,6 @@ def _capture(master_release, runtime_release, repository, deadline):
                       str(LIB.parent.parent / 'packages/commercial/src/flavor/flavor-rules.json')})
     _read(rules, deadline, proofs)
     _run(['/bin/bash', '-c', '''set -euo pipefail
-die() { exit 2; }
-source "$1"
-assert_master_release_static_gate "$2"
-''', 'consumer-master-verify', master_lib, master_release], deadline)
-    _run(['/bin/bash', '-c', '''set -euo pipefail
 source "$1"
 oc_hotcfg_verify_manifest_full "$2"
 source "$3"
@@ -194,23 +186,56 @@ flavor_parse_manifest "$2/flavor.manifest.json" >/dev/null
     require(manifest.get('sourceCommit') == flavor.get('sourceCommit'))
     require(isinstance(manifest.get('digest'), str) and re.fullmatch(r'[a-f0-9]{12}', manifest['digest']))
     require(runtime.name == 'rel-' + manifest['digest'])
-    master_source, master_meta = _git_metadata(repository, marker.get('sourceCommit'), deadline)
     _, runtime_meta = _git_metadata(repository, flavor.get('sourceCommit'), deadline)
-    # Exact original Git blob, not merely semantically equivalent rewritten JSON.
-    require(metadata_raw == master_source)
-    require(hashlib.sha256(metadata_raw).hexdigest() == marker.get('metadataSha256'))
-    require(_caps(metadata.get('capabilities')) == _caps(master_meta.get('capabilities')))
     require(_caps(manifest.get('capabilities')) == _caps(runtime_meta.get('runtimeCapabilities')))
     # Original B0 remains the only consumer-capability parser/floor oracle.
-    master_floor = kernel.candidate(str(master / 'deploy/v5/release-metadata.json'))
     runtime_floor = kernel.candidate(str(runtime / 'MANIFEST.json'))
-    result = {'master': {'root': master_release, 'sourceCommit': marker['sourceCommit'],
-                        'artifact': marker['artifactSha256'], 'consumer': master_floor,
-                        'admission': _admission(master_meta, master_floor)},
+    result = {'master': master_proof['master'],
               'runtime': {'root': runtime_release, 'sourceCommit': flavor['sourceCommit'],
                           'artifact': manifest['digest'], 'consumer': runtime_floor,
                           'admission': _admission(runtime_meta, runtime_floor)},
               'inputs': list(proofs.values()), 'roots': roots}
+    revalidate(result, deadline)
+    return result
+
+
+def capture_master(master_release, repository, deadline):
+    """The same original master verifier, shared by source and baked tuples."""
+    try:
+        require(os.geteuid() == 0 and 0 < deadline - time.monotonic() <= 30)
+        roots = {p: _directory(p) for p in (master_release, repository)}
+        proofs = {}
+        master = Path(master_release)
+        _, marker = _read(str(master / '.complete'), deadline, proofs)
+        metadata_raw, metadata = _read(str(master / 'deploy/v5/release-metadata.json'), deadline, proofs)
+        lib = str(LIB.parent / 'v5-selfhost-master-release-lib.sh')
+        _, proof = paths._root_text(lib, deadline); proofs[lib] = proof
+        _run(['/bin/bash', '-c', '''set -euo pipefail
+die() { exit 2; }
+source "$1"
+assert_master_release_static_gate "$2"
+''', 'consumer-master-verify', lib, master_release], deadline)
+        source, meta = _git_metadata(repository, marker.get('sourceCommit'), deadline)
+        require(metadata_raw == source)
+        require(hashlib.sha256(metadata_raw).hexdigest() == marker.get('metadataSha256'))
+        require(_caps(metadata.get('capabilities')) == _caps(meta.get('capabilities')))
+        floor = kernel.candidate(str(master / 'deploy/v5/release-metadata.json'))
+        result = {'master': {'root': master_release, 'sourceCommit': marker['sourceCommit'],
+                             'artifact': marker['artifactSha256'], 'consumer': floor,
+                             'admission': _admission(meta, floor)},
+                  'inputs': list(proofs.values()), 'roots': roots}
+        revalidate(result, deadline)
+        return result
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, paths.Unknown, state.Unknown, kernel.Unknown):
+        raise Unknown('unverifiable_consumer_master') from None
+
+
+def capture_embedded(master_release, image_id, repository, deadline):
+    master = capture_master(master_release, repository, deadline)
+    runtime = capture_image_runtime(image_id, repository, deadline)
+    result = {**runtime, 'master': master['master'],
+              'roots': {**master['roots'], **runtime['roots']},
+              'inputs': master['inputs'] + runtime['inputs']}
     revalidate(result, deadline)
     return result
 
@@ -267,7 +292,7 @@ def revalidate(proof, deadline):
     for path, identity in proof['roots'].items():
         require(_directory(path) == identity)
     for value in proof['inputs']:
-        root = proof['runtime']['root']
+        root = proof.get('runtime', {}).get('root')
         limit = kernel.MAX_METADATA if root and value['path'] == str(Path(root) / 'MANIFEST.json') else MAX_BYTES
         require(paths._root_identity(value['path'], max_bytes=limit) == value)
     if 'image' in proof:

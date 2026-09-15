@@ -12,7 +12,7 @@ container = {'Id': 'a' * 64, 'Name': '/oc-v5-u3', 'Image': image_id,
                          'com.openclaude.runtime.image_id': image_id},
                'User': '1000:1000', 'Env': ['HOME=/home/agent', 'PRIVATE_SECRET=never-return-this'],
                'Entrypoint': ['/private/synthetic-entrypoint'], 'Cmd': None, 'WorkingDir': '/opt/openclaude'},
-    'HostConfig': {'RestartPolicy': {'Name': 'no'}},
+    'HostConfig': {'RestartPolicy': {'Name': 'no'}, 'Privileged': False, 'CapAdd': None},
     'Mounts': [{'Type': 'volume', 'Name': volume['Name'], 'Source': str(data),
                 'Destination': inv.DATA_TARGET, 'RW': True},
                {'Type': 'bind', 'Source': str(lr), 'Destination': '/opt/openclaude', 'RW': False},
@@ -32,6 +32,9 @@ def writer_transport(argv, deadline):
     if argv[:4] == ['/usr/bin/docker', '--host=unix:///var/run/docker.sock', 'image', 'inspect'] and len(argv) == 5:
         assert argv[4] == container['Image']
         return json.dumps([{'Id': container['Image'], 'Config': image_config}]).encode()
+    if argv[:4] == ['/usr/bin/docker', '--host=unix:///var/run/docker.sock', 'container', 'diff']:
+        assert argv[4:] == [container['Id']]
+        return b''
     return transport(argv, deadline)
 mod._run = writer_transport
 inv.capture_local = lambda paths, deadline: inv.collect([volume], [container], paths)
