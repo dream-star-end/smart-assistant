@@ -1,8 +1,9 @@
-import { CalendarRange } from 'lucide-react'
+import { CalendarRange, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
+import { useProjectScope } from '../../hooks/useProjectScope'
 import { AuthEpochStaleError } from '../../lib/api'
+import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import {
-  type Project,
   TICKET_STATUS_LABEL,
   type TicketStatus,
   type WeeklyReport,
@@ -11,8 +12,6 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { useProjectScope } from '../../hooks/useProjectScope'
-import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import {
   Button,
   Card,
@@ -20,12 +19,11 @@ import {
   DescriptionRow,
   EmptyState,
   ListSkeleton,
-  ProjectScopeSelect,
   StatCard,
   TimeAgo,
 } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
-import { addDaysYmd } from './CostStatsView'
+import { addDaysYmd, ymdInZone } from './CostStatsView'
 
 function statusLabel(raw: string): string {
   if ((raw as TicketStatus) in TICKET_STATUS_LABEL) {
@@ -34,27 +32,18 @@ function statusLabel(raw: string): string {
   return raw || '空'
 }
 
-export function WeeklyReportView({
-  auth,
-  projectId,
-  projects,
-}: {
-  auth: AuthSession
-  projectId: string | null
-  projects: Project[]
-}) {
+/**
+ * 周报。项目范围只认顶栏那一个 ProjectScopeSelect(审计 T-21);原先的 `projectId` / `projects`
+ * prop 从未参与请求或渲染,已删(审计 T-20)。
+ */
+export function WeeklyReportView({ auth }: { auth: AuthSession }) {
   const { scope } = useProjectScope()
   const workQuery = boardWorkQuery(scope)
   const scopedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
   const [range, setRange] = useState<{ from?: string; to?: string }>({})
-  const [filterProject, setFilterProject] = useState(projectId ?? '')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [report, setReport] = useState<WeeklyReport | null>(null)
-
-  useEffect(() => {
-    setFilterProject(projectId ?? '')
-  }, [projectId])
 
   const load = useCallback(async () => {
     if (!scopedProjectId) {
@@ -92,45 +81,63 @@ export function WeeklyReportView({
     setRange({ from: addDaysYmd(from, delta * 7), to: addDaysYmd(to, delta * 7) })
   }
 
+  // 「下一周」在当前周期已经覆盖到今天时禁用:未来一周没有数据可看(审计 T-21 ②)。
+  const today = ymdInZone()
+  const nextDisabled = !report || report.period.toYmd >= today
+
   return (
     <div
       data-testid="weekly-report"
       className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4"
+      aria-busy={loading || undefined}
     >
       <div>
         <h2 className="text-title font-semibold text-fg">周报</h2>
         <p className="mt-1 text-caption text-muted">
-          周一到周日（上海日历）。此处成本是任务看板统计，不与模型用量 usage_records 加总。
+          按周一到周日（上海时间）统计。这里的成本只算任务面板里 agent 执行的用量，不含对话里的模型用量。
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
+        {/* 上一周 / 区间 / 下一周包成一组,窄屏下不再被换行拆散(审计 T-21 ③)。 */}
+        <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface p-0.5">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-label="上一周"
+            data-testid="weekly-prev"
+            disabled={!report}
+            onClick={() => shiftWeek(-1)}
+          >
+            <ChevronLeft size={14} />
+            <span className="hidden sm:inline">上一周</span>
+          </Button>
+          <span data-testid="weekly-period" className="px-1 text-body font-medium tabular-nums text-fg">
+            {report ? `${report.period.week} · ${report.period.fromYmd} → ${report.period.toYmd}` : '本周'}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-label="下一周"
+            data-testid="weekly-next"
+            disabled={nextDisabled}
+            title={nextDisabled && report ? '已经是最近一周' : undefined}
+            onClick={() => shiftWeek(1)}
+          >
+            <span className="hidden sm:inline">下一周</span>
+            <ChevronRight size={14} />
+          </Button>
+        </div>
         <Button
           type="button"
           size="sm"
-          variant="secondary"
-          aria-label="上一周"
-          data-testid="weekly-prev"
-          onClick={() => shiftWeek(-1)}
+          variant="ghost"
+          loading={loading && !!report}
+          disabled={!scopedProjectId}
+          onClick={() => void load()}
         >
-          上一周
-        </Button>
-        <span data-testid="weekly-period" className="text-body font-medium text-fg">
-          {report
-            ? `${report.period.week}  ${report.period.fromYmd} → ${report.period.toYmd}`
-            : '本周'}
-        </span>
-        <Button
-          type="button"
-          size="sm"
-          variant="secondary"
-          aria-label="下一周"
-          data-testid="weekly-next"
-          onClick={() => shiftWeek(1)}
-        >
-          下一周
-        </Button>
-        <ProjectScopeSelect variant="work" className="w-44" />
-        <Button type="button" size="sm" variant="ghost" onClick={() => void load()}>
+          <RefreshCw size={14} />
           刷新
         </Button>
       </div>
@@ -138,7 +145,7 @@ export function WeeklyReportView({
         <EmptyState
           icon={CalendarRange}
           title={'blocked' in workQuery ? workQuery.blocked : UNBOUND_BOARD_COPY}
-          hint="切换到已绑定看板的工作项目后再查看周报。"
+          hint="在顶栏切换到已绑定看板的工作项目后再查看周报。"
         />
       ) : loading && !report ? (
         <ListSkeleton rows={6} variant="card" />
@@ -217,7 +224,7 @@ export function WeeklyReportView({
             )}
           </Card>
           <Card padding="md" className="flex flex-col gap-2" data-testid="weekly-failed-runs">
-            <h3 className="text-section font-semibold text-fg">失败 run</h3>
+            <h3 className="text-section font-semibold text-fg">失败的执行</h3>
             {report.failedRuns.length === 0 ? (
               <p className="text-caption text-muted">本周没有失败或超时的执行。</p>
             ) : (
@@ -225,7 +232,8 @@ export function WeeklyReportView({
                 <div key={run.runId} className="rounded-lg bg-hover px-3 py-2">
                   <p className="text-body text-fg">
                     {run.identifier}
-                    {run.stageName ? ` · ${run.stageName}` : ''} · {run.status}
+                    {run.stageName ? ` · ${run.stageName}` : ''} ·{' '}
+                    {run.status === 'timeout' ? '超时' : run.status === 'failed' ? '失败' : run.status}
                   </p>
                   {run.error && <p className="text-caption text-danger">{run.error}</p>}
                   <p className="text-caption text-faint">

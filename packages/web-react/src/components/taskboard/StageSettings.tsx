@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronUp, GripVertical, Plus, Workflow } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, AuthEpochStaleError } from '../../lib/api'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AuthEpochStaleError, api } from '../../lib/api'
 import { buildSchedule, cronHuman } from '../../lib/cron'
 import {
   type BoardAgent,
@@ -27,6 +27,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession, PublicModel } from '../../lib/types'
+import { cn } from '../../lib/utils'
 import {
   Badge,
   Button,
@@ -37,12 +38,13 @@ import {
   Input,
   ListSkeleton,
   Select,
-  Sheet,
   Switch,
   Textarea,
+  useConfirm,
   usePrompt,
   useToast,
 } from '../ui'
+import { PanelSheet } from './PanelSheet'
 
 const HOUR_OPTIONS = [
   { value: '', label: '跟随全局' },
@@ -209,25 +211,91 @@ function modelLabel(m: PublicModel): string {
   return typeof m.display_name === 'string' && m.display_name.trim() ? m.display_name : m.id
 }
 
+function sameDraft(a: StageDraft, b: StageDraft): boolean {
+  return (Object.keys(a) as Array<keyof StageDraft>).every((k) => a[k] === b[k])
+}
+
+/** 编辑表单里的一个分组:标题可折叠,默认展开由调用方决定(审计 T-28)。 */
+function EditorSection({
+  title,
+  hint,
+  defaultOpen = true,
+  children,
+}: {
+  title: string
+  hint?: string
+  defaultOpen?: boolean
+  children: ReactNode
+}) {
+  return (
+    <details className="group rounded-lg border border-border" open={defaultOpen}>
+      <summary className="flex cursor-pointer select-none items-center justify-between gap-2 px-3 py-2 text-body font-medium text-fg [&::-webkit-details-marker]:hidden">
+        <span>
+          {title}
+          {hint ? <span className="ml-2 text-caption font-normal text-muted">{hint}</span> : null}
+        </span>
+        <ChevronDown size={14} className="shrink-0 text-faint transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="flex flex-col gap-3 border-t border-border px-3 py-3">{children}</div>
+    </details>
+  )
+}
+
+/**
+ * 单个阶段的编辑表单。
+ *
+ * 草稿保护(审计 T-12):以前任何一次写操作(改名 / 上下移 / 新增阶段)都会 reload → 所有展开的
+ * 编辑器整体 remount,20 个字段的草稿归零。现在:
+ * - 自己维护 `dirty`,父级用 `stage.id` 当 key,不再随重载 remount;
+ * - 外部数据变化时只在**没有未保存修改**的情况下才同步草稿;有修改则给出「载入最新」的提示,
+ *   由用户决定放弃本地修改还是继续;
+ * - 通过 `onDirtyChange` 把脏状态报给父级,关闭抽屉时可以拦截。
+ */
 function StageEditor({
   stage,
   agents,
   models,
   saving,
   onSave,
+  onDirtyChange,
 }: {
   stage: PipelineStage
   agents: BoardAgent[]
   models: PublicModel[]
   saving: boolean
   onSave: (patch: StagePatchInput) => Promise<boolean>
+  onDirtyChange?: (stageId: string, dirty: boolean) => void
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<StageDraft>(() => draftFromStage(stage))
+  // baseline = 当前草稿所依据的服务端版本;draft 与它不同即为「有未保存修改」。
+  const baselineRef = useRef<StageDraft>(draftFromStage(stage))
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  const adoptNextRef = useRef(false)
+  const incoming = useMemo(() => draftFromStage(stage), [stage])
+  const dirty = !sameDraft(draft, baselineRef.current)
+  const stale = dirty && !sameDraft(incoming, baselineRef.current)
 
   useEffect(() => {
-    setDraft(draftFromStage(stage))
-  }, [stage])
+    // 没有本地修改(或刚保存成功)才跟着服务端走;有修改时保留草稿,交给「载入最新」提示。
+    if (adoptNextRef.current || sameDraft(draftRef.current, baselineRef.current)) {
+      adoptNextRef.current = false
+      baselineRef.current = incoming
+      setDraft(incoming)
+    }
+  }, [incoming])
+
+  const stageId = stage.id
+  useEffect(() => {
+    onDirtyChange?.(stageId, dirty)
+  }, [dirty, onDirtyChange, stageId])
+  useEffect(() => () => onDirtyChange?.(stageId, false), [onDirtyChange, stageId])
+
+  const adoptIncoming = () => {
+    baselineRef.current = incoming
+    setDraft(incoming)
+  }
 
   const human = draft.kind === 'human'
   const ai = draft.kind === 'ai'
@@ -264,254 +332,277 @@ function StageEditor({
       toast(error, 'error')
       return
     }
-    await onSave(patch)
+    const ok = await onSave(patch)
+    if (ok) {
+      // 保存成功:当前草稿就是新的基线;父级随后 reload,下一份服务端数据无条件采纳。
+      baselineRef.current = draft
+      adoptNextRef.current = true
+    }
   }
 
+  const toggleRow = (label: string, checked: boolean, onChange: (v: boolean) => void, disabled = false) => (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-meta font-medium text-muted">{label}</span>
+      <Switch aria-label={label} checked={checked} disabled={disabled} onCheckedChange={onChange} />
+    </div>
+  )
+
   return (
-    <div className="flex flex-col gap-3" data-testid={`stage-editor-${stage.id}`}>
-      <Field label="阶段名称" required>
-        <Input
-          aria-label="阶段名称"
-          inputSize="sm"
-          value={draft.name}
-          onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
-        />
-      </Field>
-      <Field label="阶段类型">
-        <Select
-          aria-label="阶段类型"
-          inputSize="sm"
-          value={draft.kind}
-          onValueChange={(v) => setDraft((d) => ({ ...d, kind: v as StageKind }))}
-          options={STAGE_KINDS.map((k) => ({ value: k, label: STAGE_KIND_LABEL[k] }))}
-        />
-      </Field>
-      <Field
-        label="绑定 agent"
-        hint={ai ? '数据来自可绑定 agent 列表，不含隐藏 agent' : '仅 AI 阶段需要绑定 agent'}
-      >
-        <Select
-          aria-label="绑定 agent"
-          inputSize="sm"
-          value={draft.agentId}
-          disabled={!ai}
-          onValueChange={(v) => setDraft((d) => ({ ...d, agentId: v }))}
-          options={agentOptions}
-        />
-      </Field>
-      <Field
-        label="模型"
-        hint={ai ? '留空则沿用该 agent 的默认模型。选项来自 GET /api/public/models。' : '仅 AI 阶段可覆盖模型'}
-      >
-        <Select
-          aria-label="模型覆盖"
-          inputSize="sm"
-          value={draft.model}
-          disabled={!ai}
-          onValueChange={(v) => setDraft((d) => ({ ...d, model: v }))}
-          options={modelOptions}
-        />
-      </Field>
-      <Field
-        label="提示词模板"
-        hint="可用 {{ticket.identifier}} {{ticket.title}} {{ticket.body}} {{last_run.summary}} {{last_run.output}} {{comments}}"
-      >
-        <Textarea
-          aria-label="提示词模板"
-          rows={5}
-          disabled={!ai}
-          value={draft.promptTemplate}
-          onChange={(e) => setDraft((d) => ({ ...d, promptTemplate: e.target.value }))}
-        />
-      </Field>
-      <Field
-        label="巡检表达式"
-        hint={
-          human
-            ? '人工阶段不参与巡检，不能填写巡检表达式。'
-            : cronPreview
-              ? `预览：${cronPreview}`
-              : '5 段 Cron：分 时 日 月 周，例如 */30 9-19 * * 1-5'
-        }
-        error={cronErr ?? undefined}
-      >
-        <Input
-          aria-label="巡检表达式"
-          inputSize="sm"
-          disabled={human}
-          placeholder="*/30 9-19 * * 1-5"
-          value={human ? '' : draft.patrolCron}
-          onChange={(e) => setDraft((d) => ({ ...d, patrolCron: e.target.value }))}
-        />
-      </Field>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-meta font-medium text-muted">启用巡检</span>
-        <Switch
-          aria-label="启用巡检"
-          checked={human ? false : draft.patrolEnabled}
-          disabled={human}
-          onCheckedChange={(v) => setDraft((d) => ({ ...d, patrolEnabled: v }))}
-        />
-      </div>
-      <Field label="准入条件" hint={ENTRY_HINT}>
-        <Textarea
-          aria-label="准入条件"
-          rows={3}
-          value={draft.entryCondition}
-          onChange={(e) => setDraft((d) => ({ ...d, entryCondition: e.target.value }))}
-        />
-      </Field>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-meta font-medium text-muted">成功后自动关单</span>
-        <Switch
-          aria-label="成功后自动关单"
-          checked={draft.autoClose}
-          onCheckedChange={(v) => setDraft((d) => ({ ...d, autoClose: v }))}
-        />
-      </div>
-      <Field
-        label="无活动超时（秒）"
-        hint={`连续无输出达到该值才中断；活跃任务不受 45 分钟总时长限制。上限 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒`}
-      >
-        <Input
-          aria-label="单次超时"
-          type="number"
-          min={1}
-          max={DELEGATE_IDLE_TIMEOUT_MAX_SEC}
-          inputSize="sm"
-          value={draft.timeoutSec}
-          onChange={(e) => setDraft((d) => ({ ...d, timeoutSec: e.target.value }))}
-        />
-      </Field>
-      <Field label="产出要求">
-        <Textarea
-          aria-label="产出要求"
-          rows={3}
-          value={draft.exitChecklist}
-          onChange={(e) => setDraft((d) => ({ ...d, exitChecklist: e.target.value }))}
-        />
-      </Field>
-      <div className="grid grid-cols-2 gap-2">
-        <Field label="成功后">
-          <Select
-            aria-label="成功后"
-            inputSize="sm"
-            value={draft.onSuccess}
-            onValueChange={(v) => setDraft((d) => ({ ...d, onSuccess: v as OnSuccessAction }))}
-            options={ON_SUCCESS_ACTIONS.map((k) => ({ value: k, label: ON_SUCCESS_LABEL[k] }))}
-          />
-        </Field>
-        <Field label="失败后">
-          <Select
-            aria-label="失败后"
-            inputSize="sm"
-            value={draft.onFailure}
-            onValueChange={(v) => setDraft((d) => ({ ...d, onFailure: v as OnFailureAction }))}
-            options={ON_FAILURE_ACTIONS.map((k) => ({ value: k, label: ON_FAILURE_LABEL[k] }))}
-          />
-        </Field>
-      </div>
-      <Field label="工具集" hint="逗号分隔；留空则用 agent 默认">
-        <Input
-          aria-label="工具集"
-          inputSize="sm"
-          value={draft.toolsets}
-          onChange={(e) => setDraft((d) => ({ ...d, toolsets: e.target.value }))}
-        />
-      </Field>
-      <Field label="推理档位">
-        <Select
-          aria-label="推理档位"
-          inputSize="sm"
-          value={draft.effort}
-          onValueChange={(v) => setDraft((d) => ({ ...d, effort: v }))}
-          options={[
-            { value: '', label: '跟随 agent 默认' },
-            ...STAGE_EFFORTS.map((k) => ({ value: k, label: STAGE_EFFORT_LABEL[k] })),
-          ]}
-        />
-      </Field>
-      <Field label="巡检时区">
-        <Input
-          aria-label="巡检时区"
-          inputSize="sm"
-          disabled={human}
-          value={draft.patrolTimezone}
-          onChange={(e) => setDraft((d) => ({ ...d, patrolTimezone: e.target.value }))}
-        />
-      </Field>
-      <div className="grid grid-cols-2 gap-2">
-        <Field label="静默开始">
-          <Select
-            aria-label="阶段静默开始"
-            inputSize="sm"
-            value={draft.quietHoursStart}
-            disabled={human}
-            onValueChange={(v) => setDraft((d) => ({ ...d, quietHoursStart: v }))}
-            options={HOUR_OPTIONS}
-          />
-        </Field>
-        <Field label="静默结束">
-          <Select
-            aria-label="阶段静默结束"
-            inputSize="sm"
-            value={draft.quietHoursEnd}
-            disabled={human}
-            onValueChange={(v) => setDraft((d) => ({ ...d, quietHoursEnd: v }))}
-            options={HOUR_OPTIONS}
-          />
-        </Field>
-      </div>
-      <div className="grid grid-cols-3 gap-2">
-        <Field label="每日上限">
+    <div className="flex flex-col gap-3" data-testid={`stage-editor-${stage.id}`} data-dirty={dirty ? 'true' : undefined}>
+      {stale && (
+        <div
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-warning-soft px-3 py-2 text-caption text-warning"
+          data-testid={`stage-stale-${stage.id}`}
+        >
+          <span>这个阶段刚被别处更新过；你有未保存的修改，保存会覆盖对方的改动。</span>
+          <Button type="button" size="sm" variant="ghost" onClick={adoptIncoming}>
+            放弃我的修改，载入最新
+          </Button>
+        </div>
+      )}
+      <EditorSection title="基础">
+        <Field label="阶段名称" required>
           <Input
-            aria-label="每日执行上限"
+            aria-label="阶段名称"
+            inputSize="sm"
+            value={draft.name}
+            onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
+          />
+        </Field>
+        <Field label="阶段类型">
+          <Select
+            aria-label="阶段类型"
+            inputSize="sm"
+            value={draft.kind}
+            onValueChange={(v) => setDraft((d) => ({ ...d, kind: v as StageKind }))}
+            options={STAGE_KINDS.map((k) => ({ value: k, label: STAGE_KIND_LABEL[k] }))}
+          />
+        </Field>
+        <Field label="准入条件" hint={ENTRY_HINT}>
+          <Textarea
+            aria-label="准入条件"
+            rows={3}
+            value={draft.entryCondition}
+            onChange={(e) => setDraft((d) => ({ ...d, entryCondition: e.target.value }))}
+          />
+        </Field>
+        <Field label="产出要求" hint="这一站做完要交出什么，agent 会据此自检。">
+          <Textarea
+            aria-label="产出要求"
+            rows={3}
+            value={draft.exitChecklist}
+            onChange={(e) => setDraft((d) => ({ ...d, exitChecklist: e.target.value }))}
+          />
+        </Field>
+      </EditorSection>
+      <EditorSection title="执行" hint={ai ? undefined : '仅 AI 阶段需要'} defaultOpen={ai}>
+        <Field
+          label="绑定 agent"
+          hint={ai ? '只列出可绑定的 agent，隐藏 agent 不在其中。' : '仅 AI 阶段需要绑定 agent'}
+        >
+          <Select
+            aria-label="绑定 agent"
+            inputSize="sm"
+            value={draft.agentId}
+            disabled={!ai}
+            onValueChange={(v) => setDraft((d) => ({ ...d, agentId: v }))}
+            options={agentOptions}
+          />
+        </Field>
+        <Field label="模型" hint={ai ? '留空则沿用该 agent 的默认模型。' : '仅 AI 阶段可覆盖模型'}>
+          <Select
+            aria-label="模型覆盖"
+            inputSize="sm"
+            value={draft.model}
+            disabled={!ai}
+            onValueChange={(v) => setDraft((d) => ({ ...d, model: v }))}
+            options={modelOptions}
+          />
+        </Field>
+        <Field
+          label="提示词模板"
+          hint="可用 {{ticket.identifier}} {{ticket.title}} {{ticket.body}} {{last_run.summary}} {{last_run.output}} {{comments}}"
+        >
+          <Textarea
+            aria-label="提示词模板"
+            rows={5}
+            disabled={!ai}
+            value={draft.promptTemplate}
+            onChange={(e) => setDraft((d) => ({ ...d, promptTemplate: e.target.value }))}
+          />
+        </Field>
+        <Field label="工具集" hint="逗号分隔；留空则用 agent 默认">
+          <Input
+            aria-label="工具集"
+            inputSize="sm"
+            value={draft.toolsets}
+            onChange={(e) => setDraft((d) => ({ ...d, toolsets: e.target.value }))}
+          />
+        </Field>
+        <Field label="推理档位">
+          <Select
+            aria-label="推理档位"
+            inputSize="sm"
+            value={draft.effort}
+            onValueChange={(v) => setDraft((d) => ({ ...d, effort: v }))}
+            options={[
+              { value: '', label: '跟随 agent 默认' },
+              ...STAGE_EFFORTS.map((k) => ({ value: k, label: STAGE_EFFORT_LABEL[k] })),
+            ]}
+          />
+        </Field>
+        <Field
+          label="无活动超时（秒）"
+          hint={`连续无输出达到该值才中断；活跃任务不受 45 分钟总时长限制。上限 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒`}
+        >
+          <Input
+            aria-label="单次超时"
             type="number"
             min={1}
+            max={DELEGATE_IDLE_TIMEOUT_MAX_SEC}
             inputSize="sm"
-            value={draft.maxRunsPerDay}
-            onChange={(e) => setDraft((d) => ({ ...d, maxRunsPerDay: e.target.value }))}
+            value={draft.timeoutSec}
+            onChange={(e) => setDraft((d) => ({ ...d, timeoutSec: e.target.value }))}
           />
         </Field>
-        <Field label="重试次数">
+      </EditorSection>
+      <EditorSection
+        title="巡检"
+        hint={human ? '人工阶段无需配置' : undefined}
+        defaultOpen={!human && draft.patrolEnabled}
+      >
+        {toggleRow(
+          '启用巡检',
+          human ? false : draft.patrolEnabled,
+          (v) => setDraft((d) => ({ ...d, patrolEnabled: v })),
+          human,
+        )}
+        <Field
+          label="巡检表达式"
+          hint={
+            human
+              ? '人工阶段不参与巡检，不能填写巡检表达式。'
+              : cronPreview
+                ? `预览：${cronPreview}`
+                : '5 段 Cron：分 时 日 月 周，例如 */30 9-19 * * 1-5'
+          }
+          error={cronErr ?? undefined}
+        >
           <Input
-            aria-label="重试次数"
-            type="number"
-            min={0}
+            aria-label="巡检表达式"
             inputSize="sm"
-            value={draft.maxRetries}
-            onChange={(e) => setDraft((d) => ({ ...d, maxRetries: e.target.value }))}
+            disabled={human}
+            placeholder="*/30 9-19 * * 1-5"
+            value={human ? '' : draft.patrolCron}
+            onChange={(e) => setDraft((d) => ({ ...d, patrolCron: e.target.value }))}
           />
         </Field>
-        <Field label="熔断阈值">
+        <Field label="巡检时区">
           <Input
-            aria-label="熔断阈值"
-            type="number"
-            min={1}
+            aria-label="巡检时区"
             inputSize="sm"
-            value={draft.circuitBreakerThreshold}
-            onChange={(e) => setDraft((d) => ({ ...d, circuitBreakerThreshold: e.target.value }))}
+            disabled={human}
+            value={draft.patrolTimezone}
+            onChange={(e) => setDraft((d) => ({ ...d, patrolTimezone: e.target.value }))}
           />
         </Field>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-meta font-medium text-muted">完成后须我确认</span>
-        <Switch
-          aria-label="完成后须我确认"
-          checked={draft.requireHumanAck}
-          onCheckedChange={(v) => setDraft((d) => ({ ...d, requireHumanAck: v }))}
-        />
-      </div>
-      <div>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="静默开始">
+            <Select
+              aria-label="阶段静默开始"
+              inputSize="sm"
+              value={draft.quietHoursStart}
+              disabled={human}
+              onValueChange={(v) => setDraft((d) => ({ ...d, quietHoursStart: v }))}
+              options={HOUR_OPTIONS}
+            />
+          </Field>
+          <Field label="静默结束">
+            <Select
+              aria-label="阶段静默结束"
+              inputSize="sm"
+              value={draft.quietHoursEnd}
+              disabled={human}
+              onValueChange={(v) => setDraft((d) => ({ ...d, quietHoursEnd: v }))}
+              options={HOUR_OPTIONS}
+            />
+          </Field>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          <Field label="每日上限">
+            <Input
+              aria-label="每日执行上限"
+              type="number"
+              min={1}
+              inputSize="sm"
+              value={draft.maxRunsPerDay}
+              onChange={(e) => setDraft((d) => ({ ...d, maxRunsPerDay: e.target.value }))}
+            />
+          </Field>
+          <Field label="重试次数">
+            <Input
+              aria-label="重试次数"
+              type="number"
+              min={0}
+              inputSize="sm"
+              value={draft.maxRetries}
+              onChange={(e) => setDraft((d) => ({ ...d, maxRetries: e.target.value }))}
+            />
+          </Field>
+          <Field label="熔断阈值">
+            <Input
+              aria-label="熔断阈值"
+              type="number"
+              min={1}
+              inputSize="sm"
+              value={draft.circuitBreakerThreshold}
+              onChange={(e) => setDraft((d) => ({ ...d, circuitBreakerThreshold: e.target.value }))}
+            />
+          </Field>
+        </div>
+      </EditorSection>
+      <EditorSection title="流转">
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="成功后">
+            <Select
+              aria-label="成功后"
+              inputSize="sm"
+              value={draft.onSuccess}
+              onValueChange={(v) => setDraft((d) => ({ ...d, onSuccess: v as OnSuccessAction }))}
+              options={ON_SUCCESS_ACTIONS.map((k) => ({ value: k, label: ON_SUCCESS_LABEL[k] }))}
+            />
+          </Field>
+          <Field label="失败后">
+            <Select
+              aria-label="失败后"
+              inputSize="sm"
+              value={draft.onFailure}
+              onValueChange={(v) => setDraft((d) => ({ ...d, onFailure: v as OnFailureAction }))}
+              options={ON_FAILURE_ACTIONS.map((k) => ({ value: k, label: ON_FAILURE_LABEL[k] }))}
+            />
+          </Field>
+        </div>
+        {toggleRow('成功后自动关单', draft.autoClose, (v) => setDraft((d) => ({ ...d, autoClose: v })))}
+        {toggleRow('完成后须我确认', draft.requireHumanAck, (v) =>
+          setDraft((d) => ({ ...d, requireHumanAck: v })),
+        )}
+      </EditorSection>
+      <div className="sticky bottom-0 -mx-1 flex items-center gap-2 bg-hover/95 px-1 py-2 backdrop-blur">
         <Button
           type="button"
           size="sm"
+          variant="primary"
           loading={saving}
           data-testid={`stage-save-${stage.id}`}
           onClick={() => void save()}
         >
           保存阶段
         </Button>
+        {dirty ? (
+          <span className="text-caption text-muted">有未保存的修改</span>
+        ) : (
+          <span className="text-caption text-faint">没有改动</span>
+        )}
       </div>
     </div>
   )
@@ -522,15 +613,57 @@ export function StageSettings({
   projectId,
   onChanged,
   compact = false,
+  open: openProp,
+  onOpenChange,
+  hideTrigger = false,
 }: {
   auth: AuthSession
   projectId: string | null
   onChanged?: () => void
   compact?: boolean
+  /** 受控打开(TaskboardView 的移动端「配置」菜单 / 看板空态从外部打开)。不传则自管。 */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  /** 由外部提供入口时隐藏自带按钮。 */
+  hideTrigger?: boolean
 }) {
   const toast = useToast()
   const [promptText, promptEl] = usePrompt()
-  const [open, setOpen] = useState(false)
+  const [confirm, confirmEl] = useConfirm()
+  const [openState, setOpenState] = useState(false)
+  const open = openProp ?? openState
+  const setOpen = (next: boolean) => {
+    setOpenState(next)
+    onOpenChange?.(next)
+  }
+  const [dirtyStages, setDirtyStages] = useState<ReadonlySet<string>>(() => new Set())
+  const handleDirty = useCallback((stageId: string, dirty: boolean) => {
+    setDirtyStages((cur) => {
+      if (cur.has(stageId) === dirty) return cur
+      const next = new Set(cur)
+      if (dirty) next.add(stageId)
+      else next.delete(stageId)
+      return next
+    })
+  }, [])
+  // 关闭抽屉前拦一下:有未保存的阶段修改时先问(审计 T-12 ④)。
+  const requestClose = async (next: boolean) => {
+    if (next) {
+      setOpen(true)
+      return
+    }
+    if (dirtyStages.size > 0) {
+      const ok = await confirm({
+        title: '有未保存的阶段修改',
+        body: '关闭后这些修改会丢失。要放弃吗？',
+        confirmText: '放弃修改并关闭',
+        cancelText: '继续编辑',
+        danger: true,
+      })
+      if (!ok) return
+    }
+    setOpen(false)
+  }
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [bundles, setBundles] = useState<PipelineBundle[]>([])
@@ -544,7 +677,6 @@ export function StageSettings({
   const [newStageName, setNewStageName] = useState('')
   const [newStageKind, setNewStageKind] = useState<StageKind>('human')
   const [rename, setRename] = useState<Record<string, string>>({})
-  const [dataGen, setDataGen] = useState(0)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dropTargetId, setDropTargetId] = useState<string | null>(null)
   const epoch = useRef(0)
@@ -579,7 +711,6 @@ export function StageSettings({
       setModels(modelList)
       setRename(Object.fromEntries(details.map((d) => [d.pipeline.id, d.pipeline.name])))
       setExpanded((cur) => cur ?? details[0]?.pipeline.id ?? null)
-      setDataGen((n) => n + 1)
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
       if (mounted.current && epoch.current === gate) {
@@ -745,10 +876,6 @@ export function StageSettings({
       toast('请填写阶段名称', 'error')
       return
     }
-    if (newStageKind === 'ai') {
-      toast('请先建成人工或闸门阶段，再在编辑里改成 AI 并绑定 agent', 'error')
-      return
-    }
     const bundle = bundles.find((b) => b.pipeline.id === pipelineId)
     const ordinal = bundle ? bundle.stages.length : 0
     await runWrite(async () => {
@@ -758,8 +885,9 @@ export function StageSettings({
         ordinal,
       })
       setNewStageName('')
+      // 建好直接展开编辑器:要改成 AI 阶段的,在这里改类型并绑定 agent 即可。
       setEditingStageId(out.stage.id)
-      toast('已新增阶段', 'success')
+      toast('已新增阶段，可以继续在下方完善配置', 'success')
     })
   }
 
@@ -777,6 +905,7 @@ export function StageSettings({
     const p = bundle.pipeline
     const stages = [...bundle.stages].sort((a, b) => a.ordinal - b.ordinal)
     const openPipe = expanded === p.id
+    const renamed = (rename[p.id] ?? p.name).trim() !== p.name
     return (
       <Card
         key={p.id}
@@ -784,52 +913,69 @@ export function StageSettings({
         className="flex flex-col gap-2"
         data-testid={`pipeline-${p.id}`}
       >
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            aria-label={`流水线名称 ${p.name}`}
-            inputSize="sm"
-            className="min-w-[8rem] flex-1"
-            value={rename[p.id] ?? p.name}
-            onChange={(e) => setRename((cur) => ({ ...cur, [p.id]: e.target.value }))}
-          />
-          {p.isDefault ? (
-            <Badge tone="accent" size="sm">
-              默认
+        {/* 头行拆成两行:名字 + 徽章 / 按钮组。以前六个控件挤一行,窄屏下「收起」孤零零掉到第二行(审计 T-28)。 */}
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <Input
+              aria-label={`流水线名称 ${p.name}`}
+              inputSize="sm"
+              className="min-w-0 flex-1"
+              value={rename[p.id] ?? p.name}
+              onChange={(e) => setRename((cur) => ({ ...cur, [p.id]: e.target.value }))}
+            />
+            {p.isDefault && (
+              <Badge tone="accent" size="sm" className="shrink-0">
+                默认
+              </Badge>
+            )}
+            <Badge tone="neutral" size="sm" className="shrink-0">
+              {stages.length} 站
             </Badge>
-          ) : (
+          </div>
+          <div className="flex flex-wrap items-center gap-1">
+            <Button
+              type="button"
+              size="sm"
+              variant={renamed ? 'primary' : 'secondary'}
+              disabled={!renamed || saving}
+              onClick={() => void renamePipe(p.id)}
+            >
+              {renamed ? '保存名称' : '改名'}
+            </Button>
+            {!p.isDefault && (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                data-testid={`pipeline-default-${p.id}`}
+                onClick={() => void setDefaultPipe(p.id)}
+              >
+                设为默认
+              </Button>
+            )}
             <Button
               type="button"
               size="sm"
               variant="ghost"
-              data-testid={`pipeline-default-${p.id}`}
-              onClick={() => void setDefaultPipe(p.id)}
+              data-testid={`pipeline-save-template-${p.id}`}
+              disabled={stages.length === 0 || saving}
+              onClick={() => void saveAsTemplate(p.id, p.name)}
             >
-              设为默认
+              存为模板
             </Button>
-          )}
-          <Button type="button" size="sm" variant="secondary" onClick={() => void renamePipe(p.id)}>
-            改名
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            data-testid={`pipeline-save-template-${p.id}`}
-            disabled={stages.length === 0 || saving}
-            onClick={() => void saveAsTemplate(p.id, p.name)}
-          >
-            存为模板
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            data-testid={`pipeline-toggle-${p.id}`}
-            aria-expanded={openPipe}
-            onClick={() => setExpanded((cur) => (cur === p.id ? null : p.id))}
-          >
-            {openPipe ? '收起' : '展开'}
-          </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="ml-auto"
+              data-testid={`pipeline-toggle-${p.id}`}
+              aria-expanded={openPipe}
+              onClick={() => setExpanded((cur) => (cur === p.id ? null : p.id))}
+            >
+              {openPipe ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              {openPipe ? '收起阶段' : '展开阶段'}
+            </Button>
+          </div>
         </div>
         {openPipe && (
           <div className="flex flex-col gap-2 border-t border-border pt-2">
@@ -843,9 +989,12 @@ export function StageSettings({
                 return (
                   <div
                     key={stage.id}
-                    className={`rounded-lg bg-hover px-3 py-2 ${dragging ? 'opacity-50' : ''} ${
-                      dropTarget ? 'ring-2 ring-accent' : ''
-                    }`}
+                    className={cn(
+                      'rounded-lg bg-hover px-3 py-2',
+                      dragging && 'opacity-50',
+                      dropTarget && 'ring-2 ring-accent',
+                      editing && 'ring-1 ring-border-strong',
+                    )}
                     data-testid={`stage-row-${stage.id}`}
                     data-dragging={dragging ? 'true' : undefined}
                     data-drop-target={dropTarget ? 'true' : undefined}
@@ -869,60 +1018,68 @@ export function StageSettings({
                       void dropStage(p.id, stage.id)
                     }}
                   >
+                    {/* 名字给足最小宽度,按钮组放不下时整体换到下一行右对齐,不再把名字挤成「需求…」(审计 T-28)。 */}
                     <div className="flex flex-wrap items-center gap-1">
                       <span className="inline-flex text-faint" aria-hidden title="拖拽调整顺序">
                         <GripVertical size={14} />
                       </span>
-                      <span className="w-6 text-caption text-faint">{idx + 1}</span>
-                      <span className="min-w-0 flex-1 truncate text-body text-fg">
+                      <span className="w-5 text-caption text-faint">{idx + 1}</span>
+                      <span className="min-w-[8rem] flex-1 truncate text-body text-fg" title={stage.name}>
                         {stage.name}
                       </span>
-                      <Badge size="sm" tone={stage.kind === 'ai' ? 'info' : 'neutral'}>
+                      <Badge size="sm" tone={stage.kind === 'ai' ? 'info' : 'neutral'} className="shrink-0">
                         {STAGE_KIND_LABEL[stage.kind]}
                       </Badge>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        aria-label={`上移 ${stage.name}`}
-                        data-testid={`stage-up-${stage.id}`}
-                        disabled={idx === 0 || saving}
-                        onClick={() => void moveStage(p.id, stage.id, -1)}
-                      >
-                        <ChevronUp size={14} />
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        aria-label={`下移 ${stage.name}`}
-                        data-testid={`stage-down-${stage.id}`}
-                        disabled={idx === stages.length - 1 || saving}
-                        onClick={() => void moveStage(p.id, stage.id, 1)}
-                      >
-                        <ChevronDown size={14} />
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="secondary"
-                        data-testid={`stage-edit-${stage.id}`}
-                        onClick={() =>
-                          setEditingStageId((cur) => (cur === stage.id ? null : stage.id))
-                        }
-                      >
-                        {editing ? '收起编辑' : '编辑'}
-                      </Button>
+                      <div className="ml-auto flex items-center gap-1">
+                        <IconButton
+                          type="button"
+                          size="sm"
+                          shape="square"
+                          variant="ghost"
+                          aria-label={`上移 ${stage.name}`}
+                          data-testid={`stage-up-${stage.id}`}
+                          disabled={idx === 0 || saving}
+                          onClick={() => void moveStage(p.id, stage.id, -1)}
+                        >
+                          <ChevronUp size={14} />
+                        </IconButton>
+                        <IconButton
+                          type="button"
+                          size="sm"
+                          shape="square"
+                          variant="ghost"
+                          aria-label={`下移 ${stage.name}`}
+                          data-testid={`stage-down-${stage.id}`}
+                          disabled={idx === stages.length - 1 || saving}
+                          onClick={() => void moveStage(p.id, stage.id, 1)}
+                        >
+                          <ChevronDown size={14} />
+                        </IconButton>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          data-testid={`stage-edit-${stage.id}`}
+                          aria-expanded={editing}
+                          onClick={() =>
+                            setEditingStageId((cur) => (cur === stage.id ? null : stage.id))
+                          }
+                        >
+                          {editing ? '收起编辑' : '编辑'}
+                        </Button>
+                      </div>
                     </div>
                     {editing && (
                       <div className="mt-3">
+                        {/* key 只用 stage.id:重载不再 remount 编辑器,草稿由 StageEditor 自己守(审计 T-12)。 */}
                         <StageEditor
-                          key={`${stage.id}:${dataGen}`}
+                          key={stage.id}
                           stage={stage}
                           agents={agents}
                           models={models}
                           saving={saving}
                           onSave={(patch) => saveStage(stage.id, patch)}
+                          onDirtyChange={handleDirty}
                         />
                       </div>
                     )}
@@ -930,37 +1087,42 @@ export function StageSettings({
                 )
               })
             )}
-            <div className="flex flex-wrap items-end gap-2 pt-1">
-              <Input
-                aria-label="新阶段名称"
-                inputSize="sm"
-                className="min-w-[8rem] flex-1"
-                placeholder="新阶段名称"
-                value={expanded === p.id ? newStageName : ''}
-                onChange={(e) => setNewStageName(e.target.value)}
-              />
-              <Select
-                aria-label="新阶段类型"
-                className="w-28"
-                inputSize="sm"
-                value={newStageKind}
-                onValueChange={(v) => setNewStageKind(v as StageKind)}
-                options={STAGE_KINDS.filter((k) => k !== 'ai').map((k) => ({
-                  value: k,
-                  label: STAGE_KIND_LABEL[k],
-                }))}
-              />
-              <Button
-                type="button"
-                size="sm"
-                variant="secondary"
-                data-testid={`stage-add-${p.id}`}
-                loading={saving}
-                onClick={() => void addStage(p.id)}
-              >
-                <Plus size={14} />
-                新增阶段
-              </Button>
+            <div className="flex flex-col gap-1 pt-1">
+              <div className="flex flex-wrap items-end gap-2">
+                <Input
+                  aria-label="新阶段名称"
+                  inputSize="sm"
+                  className="min-w-[8rem] flex-1"
+                  placeholder="新阶段名称"
+                  value={expanded === p.id ? newStageName : ''}
+                  onChange={(e) => setNewStageName(e.target.value)}
+                />
+                <Select
+                  aria-label="新阶段类型"
+                  className="w-28"
+                  inputSize="sm"
+                  value={newStageKind}
+                  onValueChange={(v) => setNewStageKind(v as StageKind)}
+                  options={STAGE_KINDS.filter((k) => k !== 'ai').map((k) => ({
+                    value: k,
+                    label: STAGE_KIND_LABEL[k],
+                  }))}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  data-testid={`stage-add-${p.id}`}
+                  loading={saving}
+                  onClick={() => void addStage(p.id)}
+                >
+                  <Plus size={14} />
+                  新增阶段
+                </Button>
+              </div>
+              <p className="text-caption text-muted">
+                要加 AI 阶段：先建成人工或闸门，建好会自动展开编辑，把类型改成 AI 并绑定 agent 即可。
+              </p>
             </div>
           </div>
         )}
@@ -970,13 +1132,13 @@ export function StageSettings({
 
   return (
     <>
-      {compact ? (
+      {hideTrigger ? null : compact ? (
         <IconButton
           type="button"
           shape="square"
           data-testid="stage-settings-open"
-          aria-label="阶段配置"
-          title="阶段配置"
+          aria-label="流水线配置"
+          title="流水线配置"
           disabled={!projectId}
           onClick={() => setOpen(true)}
         >
@@ -995,24 +1157,14 @@ export function StageSettings({
           流水线配置
         </Button>
       )}
-      <Sheet
+      <PanelSheet
         open={open}
-        onOpenChange={setOpen}
-        side="right"
-        srTitle="流水线配置"
-        className="w-[36rem] max-w-[96vw]"
+        onOpenChange={(next) => void requestClose(next)}
+        title="流水线配置"
+        hint="按单据类型分组。默认线决定新建该类型单据时走哪条。阶段顺序可拖拽，也可用上/下移按钮调整。"
+        testId="stage-settings"
       >
-        <div
-          data-testid="stage-settings"
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
-        >
-          <div>
-            <h2 className="text-title font-semibold text-fg">流水线配置</h2>
-            <p className="mt-1 text-caption text-muted">
-              按单据类型分组。默认线决定新建该类型单据时走哪条。阶段顺序可拖拽，也可用上/下移按钮调整。
-            </p>
-          </div>
-          {!projectId ? (
+        {!projectId ? (
             <EmptyState
               icon={Workflow}
               title="请先选择或新建项目"
@@ -1082,9 +1234,9 @@ export function StageSettings({
               </Card>
             </>
           )}
-        </div>
-      </Sheet>
+      </PanelSheet>
       {promptEl}
+      {confirmEl}
     </>
   )
 }

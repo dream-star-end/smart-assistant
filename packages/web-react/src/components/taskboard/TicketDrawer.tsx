@@ -1,3 +1,4 @@
+import { X } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
@@ -20,8 +21,8 @@ import {
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { Markdown } from '../Markdown'
-import { Button, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
-import { TicketTimeline } from './TicketTimeline'
+import { Button, Field, IconButton, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
+import { LOCAL_COMMENT_ID_PREFIX, TicketTimeline } from './TicketTimeline'
 
 function TicketMarkdown({
   children,
@@ -30,12 +31,45 @@ function TicketMarkdown({
   children: string
   testId?: string
 }) {
+  // 正文里的 h1/h2 压到 text-section:它们是单据描述里的小节,不能比单据标题(text-title)还醒目(审计 T-18 ③)。
+  // Markdown 内部的 `.prose h2 { font-size: 1.28em }` 是未分层样式,会压过任何分层 utility,所以这里必须带 `!`。
   return (
     <div
       data-testid={testId}
-      className="text-body text-fg [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-3 [&_blockquote]:text-muted [&_code]:rounded [&_code]:bg-hover [&_code]:px-1 [&_h1]:text-title [&_h2]:text-title [&_h3]:text-section [&_ol]:list-decimal [&_ol]:pl-5 [&_pre]:overflow-x-auto [&_ul]:list-disc [&_ul]:pl-5"
+      className="text-body text-fg [&_.prose]:text-body! [&_.prose_h1]:text-section! [&_.prose_h1]:mt-4! [&_.prose_h1]:mb-1! [&_.prose_h2]:text-section! [&_.prose_h2]:mt-4! [&_.prose_h2]:mb-1! [&_.prose_h3]:text-body! [&_.prose_h3]:mt-3! [&_.prose_h3]:mb-1! [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-3 [&_blockquote]:text-muted [&_code]:rounded [&_code]:bg-hover [&_code]:px-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_pre]:overflow-x-auto [&_ul]:list-disc [&_ul]:pl-5"
     >
       <Markdown readOnly>{children}</Markdown>
+    </div>
+  )
+}
+
+/** 抽屉顶部常驻的一行:编号 + 关闭。移动端贴底抽屉没有 Esc,遮罩只剩顶部 15%,必须有它(审计 T-05)。 */
+function DrawerBar({
+  desktop,
+  label,
+  onClose,
+}: {
+  desktop: boolean
+  label: string
+  onClose: () => void
+}) {
+  return (
+    <div
+      className={`sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 px-4 pt-3 pb-1 ${
+        desktop ? 'bg-sidebar' : 'bg-elevated'
+      }`}
+    >
+      <p className="min-w-0 truncate font-mono text-caption text-faint">{label}</p>
+      <IconButton
+        type="button"
+        size="sm"
+        shape="square"
+        aria-label="关闭"
+        data-testid="ticket-drawer-close"
+        onClick={onClose}
+      >
+        <X size={16} />
+      </IconButton>
     </div>
   )
 }
@@ -54,6 +88,7 @@ export function TicketDrawer({
   onClose,
   onReconcile,
   onTicketUpdated,
+  onDetailLoaded,
   onOpenSession,
 }: {
   auth: AuthSession
@@ -69,6 +104,11 @@ export function TicketDrawer({
   onClose: () => void
   onReconcile: () => void
   onTicketUpdated: (ticket: Ticket) => void
+  /**
+   * 详情拉到后回灌给父级(只读,不触发列表 epoch)。深链打开一张不在当前列表里的单时,
+   * 父级靠它才能算出状态操作按钮(审计 T-30);`onTicketUpdated` 是写路径,不能拿来做这件事。
+   */
+  onDetailLoaded?: (ticket: Ticket) => void
   onOpenSession?: (sessionId: string) => void
 }) {
   const toast = useToast()
@@ -145,6 +185,9 @@ export function TicketDrawer({
     else setEditing(false)
   }, [beginEdit, open, startEditing, ticket?.id])
 
+  const onDetailLoadedRef = useRef(onDetailLoaded)
+  onDetailLoadedRef.current = onDetailLoaded
+
   // ticket.version 是「同一 owner 被外部写入后重新拉详情」的触发器；身份只看显式 ownerLookup。
   // biome-ignore lint/correctness/useExhaustiveDependencies: ticket.version 是 refetch 触发器，删掉会少拉详情
   useEffect(() => {
@@ -162,6 +205,7 @@ export function TicketDrawer({
         if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
         setDetail(fresh.ticket)
         setStageName(fresh.stage?.name ?? null)
+        onDetailLoadedRef.current?.(fresh.ticket)
         let items: TimelineItem[]
         try {
           items = await taskboardApi.listTimeline(auth, requested)
@@ -269,7 +313,7 @@ export function TicketDrawer({
       return
     }
     const optimistic: TicketComment = {
-      id: `local-${Date.now()}`,
+      id: `${LOCAL_COMMENT_ID_PREFIX}${Date.now()}`,
       ticketId: current.id,
       authorKind: 'human',
       author: 'user:default',
@@ -331,12 +375,11 @@ export function TicketDrawer({
     }
   }
 
+  // 来源会话在当前列表里命中、且是网页对话 id(不带冒号的巡检 sessionKey)才可跳转;
+  // 否则按钮真正禁用并用 title 说明,而不是半透明还能点、点了才 toast(审计 T-29)。
+  const originUsable = !!originSessionId && !originSessionId.includes(':')
   const openOrigin = () => {
-    if (!current?.originSessionKey) return
-    if (!originSessionId || originSessionId.includes(':')) {
-      toast('来源会话不在当前列表中，可能已删除或不是网页对话', 'error')
-      return
-    }
+    if (!current?.originSessionKey || !originUsable || !originSessionId) return
     onOpenSession?.(originSessionId)
   }
 
@@ -358,44 +401,54 @@ export function TicketDrawer({
       srTitle={current ? current.identifier : '单据详情'}
       className={desktop ? 'w-[36rem] max-w-[96vw]' : undefined}
     >
+      <DrawerBar
+        desktop={desktop}
+        label={current?.identifier ?? ticketRef ?? '单据详情'}
+        onClose={onClose}
+      />
       {current ? (
         <div
           data-testid="ticket-drawer"
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
+          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4 pt-1"
         >
           <div>
-            <p className="font-mono text-caption text-faint">{current.identifier}</p>
             {editing ? (
-              <div className="mt-2 flex flex-col gap-2">
-                <Input
-                  aria-label="单据标题"
-                  value={draftTitle}
-                  onChange={(e) => setDraftTitle(e.target.value)}
-                />
-                <textarea
-                  aria-label="单据描述"
-                  placeholder="支持 Markdown：标题、列表、代码块、链接"
-                  className="min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
-                  value={draftBody}
-                  onChange={(e) => setDraftBody(e.target.value)}
-                />
-                <div className="flex flex-wrap gap-2">
-                  <Select
-                    aria-label="优先级"
-                    className="w-28"
-                    inputSize="sm"
-                    value={draftPriority}
-                    onValueChange={(v) => setDraftPriority(v as TicketPriority)}
-                    options={TICKET_PRIORITIES.map((p) => ({ value: p, label: p }))}
+              <div className="flex flex-col gap-2" data-testid="ticket-drawer-edit-form">
+                <Field label="标题" required>
+                  <Input
+                    aria-label="单据标题"
+                    value={draftTitle}
+                    onChange={(e) => setDraftTitle(e.target.value)}
                   />
-                  <Select
-                    aria-label="执行者"
-                    className="min-w-[10rem] flex-1"
-                    inputSize="sm"
-                    value={draftAssignee}
-                    onValueChange={setDraftAssignee}
-                    options={assigneeOptions}
+                </Field>
+                <Field label="描述" hint="支持 Markdown：标题、列表、代码块、链接">
+                  <textarea
+                    aria-label="单据描述"
+                    placeholder="写清复现步骤、验收标准、范围内外"
+                    className="min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
+                    value={draftBody}
+                    onChange={(e) => setDraftBody(e.target.value)}
                   />
+                </Field>
+                <div className="grid grid-cols-2 gap-2">
+                  <Field label="优先级">
+                    <Select
+                      aria-label="优先级"
+                      inputSize="sm"
+                      value={draftPriority}
+                      onValueChange={(v) => setDraftPriority(v as TicketPriority)}
+                      options={TICKET_PRIORITIES.map((p) => ({ value: p, label: p }))}
+                    />
+                  </Field>
+                  <Field label="执行者">
+                    <Select
+                      aria-label="执行者"
+                      inputSize="sm"
+                      value={draftAssignee}
+                      onValueChange={setDraftAssignee}
+                      options={assigneeOptions}
+                    />
+                  </Field>
                 </div>
                 <div className="flex flex-wrap gap-1">
                   <Button
@@ -408,7 +461,7 @@ export function TicketDrawer({
                     保存
                   </Button>
                   <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(false)}>
-                    取消
+                    放弃修改
                   </Button>
                 </div>
               </div>
@@ -472,8 +525,8 @@ export function TicketDrawer({
                 variant="ghost"
                 size="sm"
                 data-testid="ticket-drawer-origin-session"
-                aria-disabled={!originSessionId}
-                className={!originSessionId ? 'opacity-50' : undefined}
+                disabled={!originUsable}
+                title={originUsable ? undefined : '来源会话不在当前列表中，可能已删除或不是网页对话'}
                 onClick={openOrigin}
               >
                 回到来源会话
@@ -481,32 +534,34 @@ export function TicketDrawer({
             )}
           </div>
 
-          <div className="flex flex-col gap-2 border-t border-border pt-3">
-            <p className="text-meta font-medium text-muted">评论</p>
-            <textarea
-              aria-label="评论"
-              data-testid="ticket-drawer-comment"
-              className="min-h-20 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
-              placeholder="支持 Markdown，写一条拍板意见"
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-            />
-            <Button
-              type="button"
-              size="sm"
-              loading={commenting}
-              data-testid="ticket-drawer-comment-submit"
-              onClick={() => void submitComment()}
-            >
-              发表评论
-            </Button>
-          </div>
-
           <TicketTimeline
             items={timeline}
             loading={loading}
             stageName={stageName}
             stageById={stageById}
+            composer={
+              <div className="flex flex-col gap-2 pt-1" data-testid="ticket-drawer-composer">
+                <textarea
+                  aria-label="评论"
+                  data-testid="ticket-drawer-comment"
+                  className="min-h-20 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
+                  placeholder="写一条拍板意见，支持 Markdown"
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                />
+                <div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    loading={commenting}
+                    data-testid="ticket-drawer-comment-submit"
+                    onClick={() => void submitComment()}
+                  >
+                    发表评论
+                  </Button>
+                </div>
+              </div>
+            }
           />
         </div>
       ) : (

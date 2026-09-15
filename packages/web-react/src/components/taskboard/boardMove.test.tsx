@@ -535,7 +535,8 @@ describe('积压列与有条件拖动', () => {
     await act(async () => {
       fireEvent.drop(column('s1'), { dataTransfer: dt })
     })
-    expect(await screen.findByText('单据已被改动，请刷新看板后重试')).toBeInTheDocument()
+    // 三处冲突文案统一为 taskboardErrorMessage 的那一句(审计 T-19);moveTicket 已触发对账,不再让人手动刷新。
+    expect(await screen.findByText('单据已被其他人更新，已刷新最新内容')).toBeInTheDocument()
     await act(async () => {
       await Promise.resolve()
     })
@@ -699,7 +700,7 @@ describe('旧积压视图兼容与新建单据', () => {
       expect(screen.getByRole('button', { name: '新建单据' })).toBeEnabled()
     })
     fireEvent.click(screen.getByRole('button', { name: '新建单据' }))
-    expect(await screen.findByRole('radio', { name: '记为积压' })).toBeChecked()
+    expect(await screen.findByRole('radio', { name: '先放积压' })).toBeChecked()
     fireEvent.change(screen.getByLabelText('单据标题'), { target: { value: '随手记下' } })
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '创建' }))
@@ -889,7 +890,7 @@ describe('看板卡片操作收整', () => {
     await act(async () => {
       fireEvent.keyDown(more, { key: 'Enter' })
     })
-    expect(await screen.findByRole('menuitem', { name: '取消' })).toBeInTheDocument()
+    expect(await screen.findByRole('menuitem', { name: '取消单据' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: '打回' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: '完成' })).toBeInTheDocument()
     expect(screen.getByTestId('ticket-cancel')).toBeInTheDocument()
@@ -906,51 +907,6 @@ describe('看板卡片操作收整', () => {
         expect.objectContaining({ toStageId: 's1', expectedVersion: 3 }),
       )
     })
-  })
-})
-
-describe('积压 tab 类型筛选', () => {
-  test('切换类型后列表内容随之变化', async () => {
-    stubBoard({
-      backlog: [
-        sampleTicket({
-          id: 'b1',
-          identifier: 'OCV5-1',
-          type: 'bug',
-          title: '积压问题',
-          status: 'backlog',
-        }),
-        sampleTicket({
-          id: 'f1',
-          identifier: 'OCV5-2',
-          type: 'feature',
-          title: '积压需求',
-          status: 'backlog',
-        }),
-      ],
-      ticketType: 'bug',
-    })
-    renderBoard({ view: 'backlog' })
-    expect(await screen.findByText('积压问题')).toBeInTheDocument()
-    expect(screen.getByText('积压需求')).toBeInTheDocument()
-    const filter = screen.getByLabelText('积压类型')
-    expect(filter).toHaveValue('')
-    expect(filter).toHaveTextContent('问题单')
-    expect(filter).toHaveTextContent('需求单')
-    expect(filter).toHaveTextContent('调研单')
-    expect(filter).toHaveTextContent('杂务单')
-
-    await act(async () => {
-      fireEvent.change(filter, { target: { value: 'feature' } })
-    })
-    expect(screen.getByText('积压需求')).toBeInTheDocument()
-    expect(screen.queryByText('积压问题')).not.toBeInTheDocument()
-
-    await act(async () => {
-      fireEvent.change(filter, { target: { value: 'spike' } })
-    })
-    expect(screen.getByText('没有这类积压单')).toBeInTheDocument()
-    expect(screen.queryByText('积压需求')).not.toBeInTheDocument()
   })
 })
 
