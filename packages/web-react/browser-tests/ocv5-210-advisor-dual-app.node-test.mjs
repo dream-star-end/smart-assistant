@@ -373,15 +373,16 @@ async function dumpPage(page, inbounds, label) {
   return `${label}\ninbounds=${inbounds.length} last=${JSON.stringify(inbounds.at(-1) || null)}\nbody=${body}`;
 }
 
+// 工具卡表头按钮的可及名 = 标签 + 摘要 + 状态(aria-labelledby,tools 审计 T-22),
+// 展开/收起状态由 aria-expanded 表达,不再藏在「展开…详情」文案里。
 function consultCardToggle(page) {
-  return page
-    .getByRole("button", { name: "展开咨询顾问详情" })
-    .or(page.getByRole("button", { name: "收起咨询顾问详情" }));
+  return page.getByRole("button", { name: /咨询顾问/, expanded: false })
+    .or(page.getByRole("button", { name: /咨询顾问/, expanded: true }));
 }
 
 async function expandConsultCard(page) {
-  const expand = page.getByRole("button", { name: "展开咨询顾问详情" });
-  if (await expand.count()) await expand.click();
+  const expand = page.getByRole("button", { name: /咨询顾问/, expanded: false });
+  if (await expand.count()) await expand.first().click();
 }
 
 async function waitForConsultAdvice(page, inbounds) {

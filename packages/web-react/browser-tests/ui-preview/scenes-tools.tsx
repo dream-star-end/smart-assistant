@@ -80,8 +80,9 @@ function ExpandAll({ children }: { children: ReactNode }) {
   useEffect(() => {
     const root = ref.current
     if (!root) return
+    // 表头按钮的可及名已改走 aria-labelledby(T-22),只按 aria-expanded 找折叠的表头。
     const buttons = root.querySelectorAll<HTMLButtonElement>(
-      'button[aria-expanded="false"][aria-label^="展开"]',
+      'button[aria-expanded="false"][aria-labelledby]',
     )
     for (const btn of Array.from(buttons)) btn.click()
   }, [])

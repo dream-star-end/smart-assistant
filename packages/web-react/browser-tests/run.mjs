@@ -1258,9 +1258,20 @@ async function visibleButtonNames(scopeSelector) {
   return page.evaluate((selector) => {
     const scope = document.querySelector(selector);
     if (!scope) throw new Error(`缺少挂载根 ${selector}`);
+    // 可及名按 accname 优先级取:aria-labelledby(工具卡表头,tools 审计 T-22 起) > aria-label > 文本。
+    const nameOf = (node) => {
+      const labelledBy = node.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        return labelledBy
+          .split(/\s+/)
+          .map((id) => document.getElementById(id)?.textContent ?? "")
+          .join(" ");
+      }
+      return node.getAttribute("aria-label") ?? node.textContent ?? "";
+    };
     return Array.from(scope.querySelectorAll("button"))
       .filter((node) => node.getClientRects().length > 0)
-      .map((node) => (node.getAttribute("aria-label") ?? node.textContent ?? "").replace(/\s+/g, " ").trim());
+      .map((node) => nameOf(node).replace(/\s+/g, " ").trim());
   }, scopeSelector);
 }
 async function assertVisibleButtonSet(scopeSelector, expected, label) {
@@ -1286,15 +1297,15 @@ await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录�
     "团队队员卡",
   );
 
-  await assertVisibleButtonSet("#timeline-agent-root", ["收起终端详情"], "通用 ToolCard");
+  // 表头可及名 = 标签 + 摘要 + 状态(T-22 起不再是「收起终端详情」);展开态由 aria-expanded 表达。
+  await assertVisibleButtonSet("#timeline-agent-root", ["终端 printf exact 完成"], "通用 ToolCard");
 });
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
   const root = page.locator("#tool-card-polish-root");
-  const header = root.getByRole("button", {
-    name: /^(?:展开|收起)搜索 AI 市场详情$/,
-  });
+  const header = root.getByRole("button", { name: /^搜索 AI 市场/ });
   await header.waitFor({ state: "visible", timeout: 3000 });
+  if ((await header.getAttribute("aria-expanded")) !== "false") throw new Error("完成态工具卡应默认折叠");
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
 
@@ -1302,11 +1313,32 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   // "浏览器能力 10",触发 strict mode violation = 假红。
   await header.focus();
   await header.press("Enter");
+  if ((await header.getAttribute("aria-expanded")) !== "true") throw new Error("Enter 后表头 aria-expanded 应为 true");
   await root.getByText("浏览器能力 1", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   if (await root.getByText("浏览器能力 9", { exact: true }).count() !== 0) {
     throw new Error("市场列表未按需渐进展示");
   }
-  await root.getByRole("button", { name: /查看更多/ }).click();
+  // 卡内文字型操作(查看更多 / 展开全部 / 收起…)与表头同一 44px 触控标准(tools 审计 T-08)。
+  // 主 harness 是桌面(hover 可用)上下文:用 CDP 临时开触摸仿真 —— Chromium 在触摸仿真下把
+  // primary hover 置为 none、pointer 置为 coarse,`[@media(hover:none)]` 规则即刻生效(Playwright 的
+  // hasTouch 走的就是这条),量一次真实高度再还原;不必另起一个完整 harness 上下文。
+  const more = root.getByRole("button", { name: /查看更多/ });
+  await more.waitFor({ state: "visible", timeout: 3000 });
+  const desktopMore = await more.boundingBox();
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
+    const hoverNone = await page.evaluate(() => window.matchMedia("(hover: none)").matches);
+    if (!hoverNone) throw new Error("触摸仿真未让 (hover: none) 生效,无法测触控高度");
+    const touchMore = await more.boundingBox();
+    if (!touchMore || touchMore.height < TOUCH_MIN) {
+      throw new Error(`触屏下卡内「查看更多」高度=${touchMore?.height ?? 0}px，应至少 44px(桌面 ${desktopMore?.height ?? 0}px)`);
+    }
+  } finally {
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await cdp.detach();
+  }
+  await more.click();
   await root.getByText("浏览器能力 10", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
 
   await header.focus();
@@ -1315,7 +1347,7 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
   // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
-  await assertVisibleButtonSet("#tool-card-polish-root", ["展开搜索 AI 市场详情"], "美化后的工具卡");
+  await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场 browser 完成"], "美化后的工具卡");
 });
 
 await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
@@ -2703,7 +2735,9 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
   const canceled = page.waitForRequest((request) =>
     request.method() === "POST" && request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
   );
-  await page.getByRole("button", { name: "取消" }).click();
+  // exact:true:同页 #interrupted-tool-status-root 的工具卡表头可及名含「已取消」(tools T-22 起
+  // 表头可及名 = 标签 + 摘要 + 状态),子串匹配会撞成 strict mode violation。
+  await page.getByRole("button", { name: "取消", exact: true }).click();
   const request = await canceled;
   if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
   await page.getByText("已取消 · canceled", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
