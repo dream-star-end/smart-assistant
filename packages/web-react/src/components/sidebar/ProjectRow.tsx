@@ -2,8 +2,8 @@ import { ChevronDown, ChevronRight, Folder, MoreHorizontal, Plus } from "lucide-
 import type { DragEvent } from "react";
 import type { ChatProject } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { SessionStatusDot } from "../SessionStatusDot";
 import { PROJECT_COLORS } from "../ProjectSettingsDialog";
+import { SessionStatusDot } from "../SessionStatusDot";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -71,7 +71,8 @@ export function ProjectRow({
   onProjectDrop?: (e: DragEvent) => void;
 }) {
   const canMutate = !immutable;
-  const showMutateMenu = canMutate && Boolean(onRename || onDelete || onOpenSettings || showMoveInMenu);
+  const showMutateMenu =
+    canMutate && Boolean(onRename || onDelete || onOpenSettings || showMoveInMenu);
   const showAssetsOnlyMenu = Boolean(immutable && onOpenAssets);
   const showMenu = showMutateMenu || showAssetsOnlyMenu;
   return (
@@ -103,7 +104,9 @@ export function ProjectRow({
       style={{ height: "100%" }}
       className={cn(
         "group relative flex items-center gap-0.5 rounded-md pr-1 text-section transition-colors",
-        dropActive ? "bg-accent-soft text-fg ring-1 ring-accent/40" : "text-muted hover:bg-hover hover:text-fg",
+        dropActive
+          ? "bg-accent-soft text-fg ring-1 ring-accent/40"
+          : "text-muted hover:bg-hover hover:text-fg",
       )}
     >
       <button
@@ -127,26 +130,29 @@ export function ProjectRow({
         })()}
         <span className="min-w-0 flex-1 truncate">{p.name}</span>
         {collapsed && runningCount > 0 && (
+          // 运行中数做成独立 pill，与右侧总数分开，不再被读成「12」（PR-01）。
           <span
             data-project-running={runningCount}
             title={`${runningCount} 个运行中`}
             aria-label={`${runningCount} 个运行中`}
-            className="flex shrink-0 items-center gap-1"
+            className="flex shrink-0 items-center gap-1 rounded-full bg-info-soft px-1.5 py-px"
           >
             <SessionStatusDot running />
-            <span className="tabular-nums text-caption text-fg">{runningCount}</span>
+            <span className="tabular-nums text-caption text-info">{runningCount}</span>
           </span>
         )}
         <span className="shrink-0 text-caption text-faint">{count}</span>
       </button>
       {onNewSession && (
+        // 触屏下「+」「…」两个 44px 常显按钮会把 268px 抽屉里的项目名挤到只剩 4 个字（PR-02）：
+        // 触屏只留「…」菜单（菜单第一项就是「新建会话」），桌面 hover 仍直达。
         <IconButton
           aria-label={`在 ${p.name} 新建会话`}
           title="新建会话"
           variant="muted"
           size="xs"
           shape="square"
-          className="shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100"
+          className="shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:hidden"
           onClick={onNewSession}
         >
           <Plus size={13} />
@@ -199,7 +205,9 @@ export function ProjectRow({
                 </DropdownMenuItem>
               </>
             )}
-            {(onRename || onOpenSettings || showMoveInMenu) && onDelete && <DropdownMenuSeparator />}
+            {(onRename || onOpenSettings || showMoveInMenu) && onDelete && (
+              <DropdownMenuSeparator />
+            )}
             {onDelete && (
               <DropdownMenuItem destructive onSelect={() => onDelete(p)}>
                 删除

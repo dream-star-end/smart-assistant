@@ -1046,11 +1046,11 @@ describe("Sidebar 会话累计用时与单行布局", () => {
       .getByRole("button", { name: "带模型" })
       .closest("div")!
       .querySelector("[data-session-duration]");
-    expect(duration).toHaveTextContent("10m");
+    expect(duration).toHaveTextContent("10分");
     expect(duration).toHaveAttribute("title", expect.stringContaining("→"));
   });
 
-  it("累计用时按分 / 小时 / 天展示，不再表示距今多久", () => {
+  it("累计用时按分 / 小时 / 天（中文单位）展示，不再表示距今多久", () => {
     const endAt = Date.now() - 7 * 24 * 60 * 60_000;
     renderSidebar({
       sessions: [
@@ -1062,10 +1062,10 @@ describe("Sidebar 会话累计用时与单行布局", () => {
     });
     const duration = (title: string) =>
       screen.getByRole("button", { name: title }).closest("div")!.querySelector("[data-session-duration]");
-    expect(duration("不足一分钟")).toHaveTextContent("1m");
-    expect(duration("五分钟")).toHaveTextContent("5m");
-    expect(duration("两小时")).toHaveTextContent("2h");
-    expect(duration("三天")).toHaveTextContent("3d");
+    expect(duration("不足一分钟")).toHaveTextContent("1分");
+    expect(duration("五分钟")).toHaveTextContent("5分");
+    expect(duration("两小时")).toHaveTextContent("2小时");
+    expect(duration("三天")).toHaveTextContent("3天");
   });
 
   it("运行中的会话从会话创建时刻累计到现在", () => {
@@ -1085,7 +1085,7 @@ describe("Sidebar 会话累计用时与单行布局", () => {
       .getByRole("button", { name: "正在运行" })
       .closest("div")!
       .querySelector("[data-session-duration]");
-    expect(duration).toHaveTextContent("2h");
+    expect(duration).toHaveTextContent("2小时");
     expect(duration).toHaveAttribute("title", expect.stringContaining("现在"));
   });
 });
@@ -1386,5 +1386,302 @@ describe("Sidebar 选择智能体后新建", () => {
   it("不传 onNewWithAgent 时不渲染「选择智能体后新建」", () => {
     renderSidebar();
     expect(screen.queryByRole("button", { name: "选择智能体后新建" })).toBeNull();
+  });
+});
+
+// ── 阶段 B 修复回归（docs/audit/sidebar.md §4）────────────────────────────────
+function flatRowHeight(kind: string, matchText?: string): number | undefined {
+  const rows = [...document.querySelectorAll<HTMLElement>(`[data-flat-kind='${kind}']`)];
+  const row = matchText ? rows.find((r) => r.textContent?.includes(matchText)) : rows[0];
+  return row ? Number.parseInt(row.style.height, 10) : undefined;
+}
+
+describe("Sidebar S-01 空项目提示不再占 108px", () => {
+  const twoEmpty = [
+    project({ id: "p-a", name: "甲", sortOrder: 0 }),
+    project({ id: "p-b", name: "乙", sortOrder: 1 }),
+  ];
+
+  it("别处有会话时，两个空项目的提示各占普通行高且不出现大 CTA", () => {
+    renderSidebar({
+      sessions: [session({ id: "s-out", title: "未分组会话" })],
+      projects: twoEmpty,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onNewInProject: () => {},
+    });
+    const hintRows = [...document.querySelectorAll<HTMLElement>("[data-flat-kind='hint']")];
+    expect(hintRows).toHaveLength(2);
+    for (const row of hintRows) expect(Number.parseInt(row.style.height, 10)).toBe(36);
+    // 空项目里保留行内「新建会话」文字钮（直达 onNewInProject），但不是顶部同款大按钮。
+    const inline = screen.getAllByRole("button", { name: /^新建会话$/ });
+    expect(inline).toHaveLength(3); // 顶部 + 两个行内
+  });
+
+  it("整个列表为空时，只有未分类空态叠加大 CTA（108px）", () => {
+    const onNew = vi.fn();
+    const onNewInProject = vi.fn();
+    renderSidebar({
+      sessions: [],
+      projects: twoEmpty,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onNew,
+      onNewInProject,
+    });
+    const hintRows = [...document.querySelectorAll<HTMLElement>("[data-flat-kind='hint']")];
+    expect(hintRows.map((r) => Number.parseInt(r.style.height, 10))).toEqual([36, 36, 108]);
+    const news = screen.getAllByRole("button", { name: /^新建会话$/ });
+    // [0] 顶部；[1][2] 空项目行内；[3] 未分类大 CTA
+    expect(news).toHaveLength(4);
+    fireEvent.click(news[1]!);
+    expect(onNewInProject).toHaveBeenCalledWith("p-a");
+    fireEvent.click(news[3]!);
+    expect(onNew).toHaveBeenCalledTimes(1);
+  });
+
+  it("空未分类而别处有会话时只显示文字，不再叠按钮", () => {
+    renderSidebar({
+      sessions: [session({ id: "s-in", title: "项目里的会话", projectId: "p-a" })],
+      projects: [project({ id: "p-a", name: "甲" })],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onNewInProject: () => {},
+    });
+    expect(flatRowHeight("hint", "暂无会话")).toBe(36);
+    expect(screen.getAllByRole("button", { name: /^新建会话$/ })).toHaveLength(1);
+  });
+});
+
+describe("Sidebar S-03 项目排序失败回滚", () => {
+  const projects = [
+    project({ id: "p-a", name: "甲", sortOrder: 0 }),
+    project({ id: "p-b", name: "乙", sortOrder: 1 }),
+  ];
+
+  async function moveDownFirst() {
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 甲 更多" }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "下移" }));
+  }
+
+  it("onReorderProjects reject 时顺序回到 props 顺序，且不留下未处理的 rejection", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const onReorderProjects = vi.fn(async () => {
+        throw new Error("server down");
+      });
+      renderSidebar({ sessions: [], projects, onCreateProject: () => {}, onReorderProjects });
+      expect(projectNamesInList()).toEqual(["甲", "乙", "未分类"]);
+      await moveDownFirst();
+      expect(onReorderProjects).toHaveBeenCalledWith(["p-b", "p-a"]);
+      await waitFor(() => expect(projectNamesInList()).toEqual(["甲", "乙", "未分类"]));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("onReorderProjects 成功（或同步回调）时本地顺序立刻生效", async () => {
+    const onReorderProjects = vi.fn(async () => {});
+    renderSidebar({ sessions: [], projects, onCreateProject: () => {}, onReorderProjects });
+    await moveDownFirst();
+    expect(projectNamesInList()).toEqual(["乙", "甲", "未分类"]);
+  });
+});
+
+describe("Sidebar S-12 未知项目的会话落回未分类", () => {
+  it("projectId 不在项目列表里的会话出现在未分类下，而不是从侧栏消失", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "s-orphan", title: "项目已被删的会话", projectId: "p-gone" }),
+        session({ id: "s-in", title: "项目里的会话", projectId: "p-a" }),
+      ],
+      projects: [project({ id: "p-a", name: "甲" })],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    expect(screen.getByRole("button", { name: "项目已被删的会话" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
+    // 未分类计数含孤儿会话
+    expect(screen.getByRole("button", { name: /未分类/ })).toHaveTextContent("1");
+  });
+
+  it("项目列表整体缺失（请求失败为空数组）时，所有分组会话仍可见", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "s-1", title: "会话一", projectId: "p-a" }),
+        session({ id: "s-2", title: "会话二", projectId: "p-b" }),
+      ],
+      projects: [],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    expect(screen.getByRole("button", { name: "会话一" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "会话二" })).toBeInTheDocument();
+  });
+});
+
+describe("Sidebar S-09 底栏最窄宽度", () => {
+  it("220px 时「案例」只留图标，余额用万/亿缩写且精确值在 title", () => {
+    renderSidebar({ width: 220, credits: "1234567", onOpenTutorial: () => {} });
+    const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
+    expect(tutorial).not.toHaveTextContent("案例");
+    const chip = screen.getByText(/^余额 /);
+    expect(chip).toHaveTextContent("余额 123.4万 积分");
+    expect(chip).not.toHaveTextContent("…");
+    expect(chip).toHaveAttribute("title", "余额 1,234,567 积分");
+  });
+
+  it("默认 268px 仍显示「案例」文字", () => {
+    renderSidebar({ width: 268, credits: "1234567", onOpenTutorial: () => {} });
+    expect(screen.getByRole("button", { name: "打开案例展厅" })).toHaveTextContent("案例");
+  });
+});
+
+describe("Sidebar S-02 归档展开态晚到恢复", () => {
+  it("user 晚于侧栏到位时，持久化的展开态仍触发 onLoadArchived", () => {
+    localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");
+    const onLoadArchived = vi.fn();
+    const { rerender } = render(
+      <Sidebar
+        sessions={[]}
+        user={null}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onLoadArchived={onLoadArchived}
+      />,
+    );
+    expect(onLoadArchived).not.toHaveBeenCalled();
+    rerender(
+      <Sidebar
+        sessions={[]}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onLoadArchived={onLoadArchived}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /已归档/ })).toHaveAttribute("aria-expanded", "true");
+    expect(onLoadArchived).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Sidebar S-07 搜索框清除", () => {
+  it("有输入时出现「清除搜索」按钮，点击或按 Escape 都清空并恢复列表", () => {
+    renderSidebar({ sessions: listSessions });
+    const search = screen.getByPlaceholderText("搜索标题或消息");
+    expect(screen.queryByRole("button", { name: "清除搜索" })).toBeNull();
+    fireEvent.change(search, { target: { value: "beta" } });
+    expect(screen.queryByRole("button", { name: "季度复盘 Alpha" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "清除搜索" }));
+    expect(screen.getByRole("button", { name: "季度复盘 Alpha" })).toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "beta" } });
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "季度复盘 Alpha" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "清除搜索" })).toBeNull();
+  });
+
+  it("搜索态标题命中词用 <mark> 高亮（与消息命中一致）", () => {
+    renderSidebar({ sessions: listSessions });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "上线" } });
+    const mark = screen.getByText("上线");
+    expect(mark.tagName).toBe("MARK");
+  });
+});
+
+describe("Sidebar S-08 加载更早会话失败可重试", () => {
+  it("loadMoreError 时显示重试按钮，点击调用 onLoadMore", () => {
+    const onLoadMore = vi.fn();
+    renderSidebar({ sessions: listSessions, hasMore: true, loadMoreError: true, onLoadMore });
+    const retry = screen.getByRole("button", { name: /加载更早会话失败，点击重试/ });
+    fireEvent.click(retry);
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it("加载中优先显示「加载更多…」，无错误时不出现重试", () => {
+    renderSidebar({ sessions: listSessions, hasMore: true, loadingMore: true, loadMoreError: true });
+    expect(screen.getByText("加载更多…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /点击重试/ })).toBeNull();
+  });
+});
+
+describe("Sidebar BB 批量条", () => {
+  it("选中含已归档会话时出现「取消归档」；删除按钮为 danger 语义", () => {
+    localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");
+    const onBatch = vi.fn();
+    renderSidebar({
+      sessions: [
+        session({ id: "s-live", title: "进行中" }),
+        session({ id: "s-arc", title: "已收进箱底", archived: true }),
+      ],
+      onBatch,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "多选" }));
+    expect(screen.queryByRole("button", { name: "取消归档" })).toBeNull();
+    fireEvent.click(screen.getByLabelText("选择 已收进箱底"));
+    fireEvent.click(screen.getByRole("button", { name: "取消归档" }));
+    expect(onBatch).toHaveBeenCalledWith(["s-arc"], "unarchive", undefined);
+  });
+
+  it("批量条固定两行：第一行计数 + 取消，第二行操作按钮全部带可访问名称", () => {
+    renderSidebar({ sessions: listSessions, onBatch: () => {} });
+    fireEvent.click(screen.getByRole("button", { name: "多选" }));
+    const bar = screen.getByTestId("sidebar-batch-bar");
+    expect(bar).toHaveAttribute("role", "toolbar");
+    expect(bar.children).toHaveLength(2);
+    expect(bar.children[0]).toHaveTextContent("已选 0 条");
+    expect(bar.children[0]).toContainElement(screen.getByRole("button", { name: "取消" }));
+    for (const name of ["归档", "移动到项目", "删除"]) {
+      const btn = screen.getByRole("button", { name });
+      expect(bar.children[1]).toContainElement(btn);
+      expect(btn).toBeDisabled();
+    }
+    expect(screen.getByRole("button", { name: "删除" }).className).toContain("text-danger");
+  });
+});
+
+describe("Sidebar S-06 折叠按钮可访问名称", () => {
+  it("默认「折叠侧栏」，App 在移动端抽屉可传 collapseLabel 改成「关闭导航」", () => {
+    const { rerender } = render(
+      <Sidebar
+        sessions={[]}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onCollapse={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "折叠侧栏" })).toBeInTheDocument();
+    rerender(
+      <Sidebar
+        sessions={[]}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onCollapse={() => {}}
+        collapseLabel="关闭导航"
+      />,
+    );
+    expect(screen.getByRole("button", { name: "关闭导航" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "折叠侧栏" })).toBeNull();
   });
 });

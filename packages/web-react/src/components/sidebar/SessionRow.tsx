@@ -1,9 +1,17 @@
-import { Archive, Pin } from "lucide-react";
-import type { ChatProject, Session } from "../../lib/types";
+import {
+  Archive,
+  FolderInput,
+  MoreHorizontal,
+  Pencil,
+  Pin,
+  SquareCheck,
+  Trash2,
+} from "lucide-react";
+import { useRef } from "react";
 import { isSidebarSessionRunning } from "../../lib/sessionStatus";
+import type { ChatProject, Session } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
-import { formatDate } from "../ui/TimeAgo";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -15,9 +23,10 @@ import {
   DropdownMenuTrigger,
   IconButton,
 } from "../ui";
-import { MoreHorizontal } from "lucide-react";
-import { SESSION_DRAG_TYPE } from "./constants";
+import { formatDate } from "../ui/TimeAgo";
 import { formatCompactDuration, sessionDurationWindow } from "./compactDuration";
+import { SESSION_DRAG_TYPE } from "./constants";
+import { HighlightedText } from "./highlight";
 
 export function SessionRow({
   session: s,
@@ -40,13 +49,16 @@ export function SessionRow({
   onToggleSelected,
   onEnterMultiSelect,
   allowDrag,
+  highlightQuery,
 }: {
   session: Session;
   active: boolean;
   projects: ChatProject[];
   indent?: boolean;
   isSending?: (id: string) => boolean;
-  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  liveTerminal?: (
+    id: string,
+  ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
   now: number;
   onSelect: (id: string) => void;
   onRename: (s: Session) => void;
@@ -61,10 +73,15 @@ export function SessionRow({
   onToggleSelected: (id: string) => void;
   onEnterMultiSelect: (id: string) => void;
   allowDrag: boolean;
+  /** 搜索态：标题里的命中词与消息命中一样用 <mark> 标出（S-11）。 */
+  highlightQuery?: string;
 }) {
   const live = liveTerminal?.(s.id);
   const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
   const title = s.title || "新对话";
+  // 「更多」菜单关闭后的焦点归还：鼠标关闭不把焦点拉回 hover 才可见的触发钮（原行为），
+  // 键盘关闭则保留 Radix 默认把焦点还给触发钮，Tab 序列不再从 body 重头开始（SR-02）。
+  const menuViaKeyboardRef = useRef(false);
   const duration = sessionDurationWindow(s, running, now);
   const durationText = duration ? formatCompactDuration(duration.endAt - duration.startAt) : "";
   const durationTitle = duration
@@ -118,7 +135,9 @@ export function SessionRow({
         aria-label={title}
         className="flex h-full min-w-0 flex-1 items-center rounded-md px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <span className={cn("truncate", unread && "font-semibold text-fg")}>{title}</span>
+        <span className={cn("truncate", unread && "font-semibold text-fg")}>
+          {highlightQuery?.trim() ? <HighlightedText text={title} query={highlightQuery} /> : title}
+        </span>
       </button>
       {durationText && (
         <span
@@ -141,8 +160,24 @@ export function SessionRow({
             <MoreHorizontal size={13} />
           </IconButton>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44" onCloseAutoFocus={(e) => e.preventDefault()}>
-          <DropdownMenuItem onSelect={() => onRename(s)}>重命名</DropdownMenuItem>
+        <DropdownMenuContent
+          align="end"
+          className="w-44"
+          onKeyDown={() => {
+            menuViaKeyboardRef.current = true;
+          }}
+          onPointerDown={() => {
+            menuViaKeyboardRef.current = false;
+          }}
+          onCloseAutoFocus={(e) => {
+            if (!menuViaKeyboardRef.current) e.preventDefault();
+            menuViaKeyboardRef.current = false;
+          }}
+        >
+          <DropdownMenuItem onSelect={() => onRename(s)}>
+            <Pencil size={14} className="shrink-0 text-muted" />
+            重命名
+          </DropdownMenuItem>
           {onTogglePin && (
             <DropdownMenuItem onSelect={() => onTogglePin(s)}>
               <Pin size={14} className="shrink-0 text-muted" />
@@ -157,11 +192,12 @@ export function SessionRow({
           )}
           {onMoveToProject && (
             <DropdownMenuSub>
-              <DropdownMenuSubTrigger>移动到项目</DropdownMenuSubTrigger>
+              <DropdownMenuSubTrigger>
+                <FolderInput size={14} className="shrink-0 text-muted" />
+                移动到项目
+              </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="w-44">
-                {projects.length === 0 && (
-                  <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>
-                )}
+                {projects.length === 0 && <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>}
                 {projects.map((p) => (
                   <DropdownMenuItem
                     key={p.id}
@@ -174,15 +210,21 @@ export function SessionRow({
                 {s.projectId && (
                   <>
                     <DropdownMenuSeparator />
-                    <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>移出项目</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>
+                      移出项目
+                    </DropdownMenuItem>
                   </>
                 )}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
           )}
-          <DropdownMenuItem onSelect={() => onEnterMultiSelect(s.id)}>多选</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onEnterMultiSelect(s.id)}>
+            <SquareCheck size={14} className="shrink-0 text-muted" />
+            多选
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem destructive onSelect={() => onDelete(s)}>
+            <Trash2 size={14} className="shrink-0" />
             删除
           </DropdownMenuItem>
         </DropdownMenuContent>

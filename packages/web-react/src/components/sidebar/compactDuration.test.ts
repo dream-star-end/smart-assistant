@@ -2,18 +2,18 @@ import { describe, expect, it } from "vitest";
 import { formatCompactDuration, sessionDurationWindow } from "./compactDuration";
 
 describe("formatCompactDuration", () => {
-  it("小于 1 分钟显示 1m，不出现 0m", () => {
-    expect(formatCompactDuration(0)).toBe("1m");
-    expect(formatCompactDuration(20_000)).toBe("1m");
-    expect(formatCompactDuration(59_999)).toBe("1m");
+  it("小于 1 分钟显示 1分，不出现 0分", () => {
+    expect(formatCompactDuration(0)).toBe("1分");
+    expect(formatCompactDuration(20_000)).toBe("1分");
+    expect(formatCompactDuration(59_999)).toBe("1分");
   });
 
-  it("按分、小时、天紧凑展示", () => {
-    expect(formatCompactDuration(5 * 60_000)).toBe("5m");
-    expect(formatCompactDuration(59 * 60_000)).toBe("59m");
-    expect(formatCompactDuration(2 * 60 * 60_000)).toBe("2h");
-    expect(formatCompactDuration(23 * 60 * 60_000)).toBe("23h");
-    expect(formatCompactDuration(3 * 24 * 60 * 60_000)).toBe("3d");
+  it("按分、小时、天用中文单位紧凑展示（SR-01：中文界面不混英文缩写）", () => {
+    expect(formatCompactDuration(5 * 60_000)).toBe("5分");
+    expect(formatCompactDuration(59 * 60_000)).toBe("59分");
+    expect(formatCompactDuration(2 * 60 * 60_000)).toBe("2小时");
+    expect(formatCompactDuration(23 * 60 * 60_000)).toBe("23小时");
+    expect(formatCompactDuration(3 * 24 * 60 * 60_000)).toBe("3天");
   });
 });
 

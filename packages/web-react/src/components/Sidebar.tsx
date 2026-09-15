@@ -18,19 +18,22 @@ import {
   ShieldCheck,
   Sparkles,
   Store,
+  X,
 } from "lucide-react";
 import {
+  type PointerEvent as ReactPointerEvent,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
-  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { archivedExpandedStorageKey } from "../hooks/useChatProjects";
 import { useProjectScope } from "../hooks/useProjectScope";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
+import { isSidebarSessionRunning } from "../lib/sessionStatus";
 import type {
   ChatProject,
   Session,
@@ -38,9 +41,27 @@ import type {
   SessionSearchHit,
   User,
 } from "../lib/types";
-import { isSidebarSessionRunning } from "../lib/sessionStatus";
-import { cn, formatCredits } from "../lib/utils";
+import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { ThemeToggle } from "./ThemeToggle";
+import { BatchBar } from "./sidebar/BatchBar";
+import { ProjectRow } from "./sidebar/ProjectRow";
+import { SessionRow } from "./sidebar/SessionRow";
+import { VirtualList } from "./sidebar/VirtualList";
+import {
+  DEFAULT_PROJECT_ID,
+  PROJECT_DRAG_TYPE,
+  SEARCH_DEBOUNCE_MS,
+  SIDEBAR_DURATION_TICK_MS,
+  VIRTUALIZE_THRESHOLD,
+} from "./sidebar/constants";
+import { type FlatItem, flattenSidebarItems } from "./sidebar/flattenItems";
+import { HighlightedText } from "./sidebar/highlight";
+import {
+  compareByUpdatedDesc,
+  compareSessionsRunningThenUpdated,
+  partitionProjectsRunningFirst,
+  sortSessionsRunningThenUpdated,
+} from "./sidebar/runningOrder";
 import {
   Avatar,
   Badge,
@@ -52,28 +73,11 @@ import {
   DropdownMenuTrigger,
   IconButton,
 } from "./ui";
-import { BatchBar } from "./sidebar/BatchBar";
-import {
-  DEFAULT_PROJECT_ID,
-  PROJECT_DRAG_TYPE,
-  SEARCH_DEBOUNCE_MS,
-  SIDEBAR_DURATION_TICK_MS,
-  VIRTUALIZE_THRESHOLD,
-} from "./sidebar/constants";
-import { type FlatItem, flattenSidebarItems } from "./sidebar/flattenItems";
-import { HighlightedText } from "./sidebar/highlight";
-import { ProjectRow } from "./sidebar/ProjectRow";
-import {
-  compareByUpdatedDesc,
-  compareSessionsRunningThenUpdated,
-  partitionProjectsRunningFirst,
-  sortSessionsRunningThenUpdated,
-} from "./sidebar/runningOrder";
-import { SessionRow } from "./sidebar/SessionRow";
-import { VirtualList } from "./sidebar/VirtualList";
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
+/** 底栏在此宽度以下进入紧凑态：隐藏「案例」文字只留图标，给昵称 / 余额让位（S-09）。 */
+const FOOTER_COMPACT_WIDTH = 260;
 
 function readArchivedExpanded(userId: string | undefined): boolean {
   if (!userId) return false;
@@ -134,6 +138,11 @@ export type SidebarProps = {
   ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
   socketVersion?: number;
   onCollapse?: () => void;
+  /**
+   * 左上角折叠按钮的可访问名称。桌面默认「折叠侧栏」；App 在移动端抽屉里把同一按钮接成
+   * 「关闭抽屉」时应传「关闭导航」，读屏用户听到的才与实际动作一致（S-06）。
+   */
+  collapseLabel?: string;
   onLogout?: () => void;
   onOpenAccount?: () => void;
   onOpenFeedback?: () => void;
@@ -156,7 +165,8 @@ export type SidebarProps = {
   onOpenProjectSettings?: (p: ChatProject) => void;
   /** 打开某项目的资产面板；default 组传 null。 */
   onOpenProjectAssets?: (projectId: string | null) => void;
-  onReorderProjects?: (orderedIds: string[]) => void;
+  /** 返回 Promise 时，reject 会回滚侧栏本地的乐观排序（S-03）。 */
+  onReorderProjects?: (orderedIds: string[]) => void | Promise<void>;
   width?: number;
   onResizeStart?: (e: ReactPointerEvent) => void;
   resizing?: boolean;
@@ -165,6 +175,8 @@ export type SidebarProps = {
   onLoadMore?: () => void;
   hasMore?: boolean;
   loadingMore?: boolean;
+  /** 上一次「加载更早会话」失败：底部显示「加载失败，点击重试」，不再静默停止（S-08）。 */
+  loadMoreError?: boolean;
   onLoadArchived?: () => void;
   loadingArchived?: boolean;
   onSearchMessages?: (
@@ -200,6 +212,7 @@ export function Sidebar({
   liveTerminal,
   socketVersion,
   onCollapse,
+  collapseLabel = "折叠侧栏",
   onLogout,
   onOpenAccount,
   onOpenFeedback,
@@ -228,6 +241,7 @@ export function Sidebar({
   onLoadMore,
   hasMore,
   loadingMore,
+  loadMoreError,
   onLoadArchived,
   loadingArchived,
   onSearchMessages,
@@ -251,16 +265,27 @@ export function Sidebar({
   useEffect(() => {
     writeArchivedExpanded(userId, archivedExpanded);
   }, [userId, archivedExpanded]);
-  // 仅在挂载时按持久化展开去拉归档列表；之后由点击处理。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only restore of archived list
+  // 持久化的展开态恢复后自动拉一次归档列表。user 常晚于侧栏挂载到位（刷新页面等 /api/me），
+  // 只在 mount 时判一次会出现「已展开 + 计数 0 + 假空态」（S-02）；这里跟随 archivedExpanded，
+  // 点击展开路径自行调用并置位，避免重复请求。
+  const archivedAutoLoadedRef = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: onLoadArchived 经闭包读最新值即可
   useEffect(() => {
-    if (archivedExpanded) onLoadArchived?.();
-  }, []);
+    if (!archivedExpanded || archivedAutoLoadedRef.current) return;
+    archivedAutoLoadedRef.current = true;
+    onLoadArchived?.();
+  }, [archivedExpanded]);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
   const activeSearchProjectId =
     searchProjectId !== undefined ? searchProjectId : projectScope.scope.chatProjectIdForFilter;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
+  // 只有出现在项目列表里的 projectId 才算「有归属」。projectId 指向未知项目的会话
+  // （项目列表请求失败 / 项目在他端被删）一律落回「未分类」，绝不从侧栏消失（S-12）。
+  const knownProjectIds = useMemo(
+    () => new Set(showProjects ? (projects ?? []).map((p) => p.id) : []),
+    [showProjects, projects],
+  );
 
   const runningIds = useMemo(() => {
     void socketVersion;
@@ -321,7 +346,7 @@ export function Sidebar({
     const map = new Map<string, Session[]>();
     if (searching) return map;
     for (const s of filtered) {
-      if (pinnedIds.has(s.id) || !s.projectId) continue;
+      if (pinnedIds.has(s.id) || !s.projectId || !knownProjectIds.has(s.projectId)) continue;
       const list = map.get(s.projectId) || [];
       list.push(s);
       map.set(s.projectId, list);
@@ -329,7 +354,7 @@ export function Sidebar({
     for (const list of map.values())
       list.sort((a, b) => compareSessionsRunningThenUpdated(a, b, runningIds));
     return map;
-  }, [filtered, pinnedIds, searching, runningIds]);
+  }, [filtered, pinnedIds, searching, runningIds, knownProjectIds]);
 
   const ungroupedGroups = useMemo(() => {
     if (searching) {
@@ -340,11 +365,13 @@ export function Sidebar({
       return items.length ? ([["搜索结果", items]] as [string, Session[]][]) : [];
     }
     const list = sortSessionsRunningThenUpdated(
-      filtered.filter((s) => !pinnedIds.has(s.id) && !s.projectId),
+      filtered.filter(
+        (s) => !pinnedIds.has(s.id) && (!s.projectId || !knownProjectIds.has(s.projectId)),
+      ),
       runningIds,
     );
     return list.length ? ([["", list]] as [string, Session[]][]) : [];
-  }, [filtered, pinnedIds, searching, runningIds]);
+  }, [filtered, pinnedIds, searching, runningIds, knownProjectIds]);
 
   useEffect(() => {
     const needle = q.trim();
@@ -401,6 +428,7 @@ export function Sidebar({
         searchRemote,
         localEmpty: filtered.length === 0,
         isRunning: (s) => runningIds.has(s.id),
+        coarsePointer: coarse,
       }),
     [
       searching,
@@ -418,24 +446,42 @@ export function Sidebar({
       searchRemote,
       filtered.length,
       runningIds,
+      coarse,
     ],
   );
 
-  // 空态「暂无会话」行叠加 CTA 按钮,行高同步加高(VirtualList 按 item.height 排 offsets)。
+  // 只有「整个列表为空」的空态行叠加 CTA 按钮并加高(VirtualList 按 item.height 排 offsets)；
+  // 空项目的提示保持普通行高,避免多个空项目把会话挤出视口(S-01)。
   // onNew 是 Sidebar 必传 prop,无需再判存在性。
   const listItems = useMemo(
     () =>
       flatItems.map((it) =>
-        it.kind === "hint" && it.text === "暂无会话"
+        it.kind === "hint" && it.variant === "empty-list"
           ? { ...it, height: EMPTY_HINT_CTA_HEIGHT }
           : it,
       ),
     [flatItems],
   );
 
+  // 数据层（useChatProjects）成功或失败后都会换一份 projects 引用：成功=新顺序、失败=回滚快照。
+  // 无论哪种，本地乐观顺序都已完成使命，清掉即与数据层保持一致（S-03）。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 有意以 projects 引用变化为触发条件
+  useEffect(() => {
+    setOrderOverride(null);
+  }, [projects]);
+
   const emitReorder = (ids: string[]) => {
     setOrderOverride(ids);
-    onReorderProjects?.(ids);
+    if (!onReorderProjects) return;
+    // 回调同步调用（调用方立刻拿到新顺序）；返回 Promise 时接住 reject 回滚本地顺序，
+    // 不再留下 Unhandled promise rejection（S-03）。
+    try {
+      void Promise.resolve(onReorderProjects(ids)).catch(() => {
+        setOrderOverride(null);
+      });
+    } catch {
+      setOrderOverride(null);
+    }
   };
 
   const moveProject = (id: string, dir: -1 | 1) => {
@@ -477,6 +523,10 @@ export function Sidebar({
       onLogout,
   );
 
+  // 底栏余额：默认 268px 下完整千分位数字已被截成「1,234,56…」（S-09），底栏一律用
+  // 万 / 亿 缩写（formatCompactCount），精确值放 title 悬浮；账号菜单里空间充足仍显完整数字。
+  const footerCompact = typeof width === "number" && width < FOOTER_COMPACT_WIDTH;
+  const creditsExact = credits != null ? `${formatCredits(credits)} 积分` : null;
   const userChip = (
     <button
       type="button"
@@ -492,8 +542,11 @@ export function Sidebar({
         <span className="block truncate text-section font-medium text-fg">
           {user?.displayName || "未登录"}
         </span>
-        <span className="block truncate text-caption text-faint">
-          {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
+        <span
+          className="block truncate text-caption text-faint"
+          title={creditsExact ? `余额 ${creditsExact}` : undefined}
+        >
+          {credits != null ? `余额 ${formatCompactCount(credits)} 积分` : "多模型 · 计量计费"}
         </span>
       </span>
     </button>
@@ -501,10 +554,17 @@ export function Sidebar({
 
   const renderFlat = (item: FlatItem) => {
     if (item.kind === "header") {
+      const withAction = item.label === "项目" && Boolean(onCreateProject);
       return (
-        <h2 className="m-0 flex h-full items-end px-3 pb-1 text-caption font-medium uppercase tracking-wide text-faint">
+        <h2
+          className={cn(
+            "m-0 flex h-full px-3 text-caption font-medium uppercase tracking-wide text-faint",
+            // 触屏下带按钮的标题行升到 44px（拍平层同步加高），文字与 44px 按钮垂直居中对齐（S-04）。
+            withAction && coarse ? "items-center" : "items-end pb-1",
+          )}
+        >
           {item.label}
-          {item.label === "项目" && onCreateProject && (
+          {withAction && (
             <IconButton
               aria-label="新建项目"
               variant="muted"
@@ -520,35 +580,46 @@ export function Sidebar({
       );
     }
     if (item.kind === "hint") {
-      const emptyCenter = item.text === "暂无会话" || item.text === "没有匹配的会话";
-      // 空态 CTA:纯文字「暂无会话」对新用户是死胡同;给出与顶部同款 onNew 的直接出口
-      // (onNew 必传,恒可用)。
-      const showNewCta = item.text === "暂无会话";
+      // 整个列表为空：居中大 CTA（新用户唯一出口）。空项目：普通一行 + 行内「新建会话」文字钮，
+      // 保留直达 onNewInProject 的出口但不再占 108px（S-01）。空未分类而别处有会话：顶部按钮已覆盖，只留文字。
+      const emptyList = item.variant === "empty-list";
+      const emptyProject = item.variant === "empty-project";
+      const emptyCenter = emptyList || item.text === "没有匹配的会话";
+      const isSearchHint = item.key.startsWith("search-");
+      const onNewHere =
+        item.projectId && onNewInProject
+          ? () => {
+              const pid = item.projectId;
+              if (pid) onNewInProject(pid);
+            }
+          : onNew;
       return (
         <div
+          // 搜索三态（正在搜索 / 无匹配 / 失败）对读屏播报（S-07）。
+          role={isSearchHint ? "status" : undefined}
+          aria-live={isSearchHint ? "polite" : undefined}
           className={cn(
             "flex h-full items-center px-3 text-body text-faint",
             emptyCenter && "justify-center py-6",
             item.text === "消息搜索失败" && "text-danger",
-            showNewCta && "flex-col items-center gap-2",
+            emptyList && "flex-col items-center gap-2",
+            emptyProject && "gap-2 text-caption",
           )}
         >
           <span>{item.text}</span>
-          {showNewCta && (
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={
-                item.projectId && onNewInProject
-                  ? () => {
-                      const pid = item.projectId;
-                      if (pid) onNewInProject(pid);
-                    }
-                  : onNew
-              }
-            >
+          {emptyList && (
+            <Button variant="secondary" size="sm" onClick={onNewHere}>
               新建会话
             </Button>
+          )}
+          {emptyProject && item.projectId && (
+            <button
+              type="button"
+              onClick={onNewHere}
+              className="rounded-sm text-caption font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              新建会话
+            </button>
           )}
         </div>
       );
@@ -580,6 +651,7 @@ export function Sidebar({
             setSelectedIds((cur) => new Set(cur).add(id));
           }}
           allowDrag={!coarse}
+          highlightQuery={searching ? q : undefined}
         />
       );
     }
@@ -674,7 +746,11 @@ export function Sidebar({
           onClick={() => {
             const next = !archivedExpanded;
             setArchivedExpanded(next);
-            if (next) onLoadArchived?.();
+            if (next) {
+              // 点击路径自行拉取并置位，恢复态 effect 不再重复请求。
+              archivedAutoLoadedRef.current = true;
+              onLoadArchived?.();
+            }
           }}
           className="flex h-full w-full items-center gap-1.5 rounded-md px-2 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -729,7 +805,8 @@ export function Sidebar({
             <IconButton
               data-product-control
               onClick={onCollapse}
-              aria-label="折叠侧栏"
+              aria-label={collapseLabel}
+              title={collapseLabel}
               variant="muted"
               size="sm"
               shape="square"
@@ -807,9 +884,29 @@ export function Sidebar({
               aria-label="搜索标题或消息"
               value={q}
               onChange={(e) => setQ(e.target.value)}
+              onKeyDown={(e) => {
+                // Escape 一键清空，不必手动全选删除才能回到列表（S-07）。
+                if (e.key === "Escape" && q) {
+                  e.preventDefault();
+                  setQ("");
+                }
+              }}
               placeholder="搜索标题或消息"
               className="w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
             />
+            {q && (
+              <IconButton
+                aria-label="清除搜索"
+                title="清除搜索"
+                variant="muted"
+                size="xs"
+                shape="round"
+                className="-mr-1"
+                onClick={() => setQ("")}
+              >
+                <X size={13} />
+              </IconButton>
+            )}
           </label>
           {onBatch && !multiSelect && (
             <button
@@ -828,6 +925,7 @@ export function Sidebar({
         <BatchBar
           count={selectedIds.size}
           projects={orderedProjects}
+          hasArchivedSelected={sessions.some((s) => s.archived && selectedIds.has(s.id))}
           onAction={(action, projectId) => {
             if (selectedIds.size === 0) return;
             onBatch([...selectedIds], action, projectId);
@@ -847,7 +945,20 @@ export function Sidebar({
           className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
         />
       </nav>
-      {loadingMore && <p className="px-3 pb-2 text-center text-caption text-faint">加载更多…</p>}
+      {loadingMore ? (
+        <p className="px-3 pb-2 text-center text-caption text-faint">加载更多…</p>
+      ) : loadMoreError && onLoadMore && !searching ? (
+        // 「加载更早会话」失败不再静默把 hasMore 置 false：给出可重试的出口（S-08）。
+        <div className="px-3 pb-2 text-center">
+          <button
+            type="button"
+            onClick={onLoadMore}
+            className="rounded-md px-2 py-1 text-caption font-medium text-danger outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            加载更早会话失败，点击重试
+          </button>
+        </div>
+      ) : null}
 
       <div
         className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b"
@@ -987,14 +1098,8 @@ export function Sidebar({
             className="h-8 shrink-0 gap-1 px-2 text-faint hover:text-fg"
           >
             <BookOpen size={16} />
-            <span
-              className={cn(
-                "text-caption font-medium",
-                typeof width === "number" && width < 220 && "hidden",
-              )}
-            >
-              案例
-            </span>
+            {/* 窄于 260px 只留图标（原 `width < 220` 低于 SIDEBAR_WIDTH_MIN 恒为 false，S-09）。 */}
+            {!footerCompact && <span className="text-caption font-medium">案例</span>}
           </Button>
         )}
         {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} />}
