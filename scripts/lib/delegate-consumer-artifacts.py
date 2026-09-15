@@ -225,7 +225,7 @@ def revalidate(proof, deadline):
     require(time.monotonic() < deadline)
 
 
-def classify_transition(current, candidate, fallback, inventory, deadline):
+def classify_transition(current, candidate, fallback, inventory, deadline, *, writers=()):
     """Classify trusted in-process captures using the original B0 DB reader.
 
     A compatible_snapshot is NOT permission: if legacy is involved the real
@@ -237,6 +237,9 @@ def classify_transition(current, candidate, fallback, inventory, deadline):
         require(0 < deadline - time.monotonic() <= 30)
         pairs = (current, candidate, fallback)
         for proof in pairs:
+            revalidate(proof, deadline)
+        require(len(writers) == len(inventory['writers']))
+        for proof in writers:
             revalidate(proof, deadline)
         inventory_reader.revalidate(inventory)
         databases = inventory['databases']
@@ -253,16 +256,20 @@ def classify_transition(current, candidate, fallback, inventory, deadline):
         # snapshot cannot make its legacy fallback safe (first-write race).
         may_seal = any(side['admission'] == 'enabled'
                        for proof in (current, candidate) for side in (proof['master'], proof['runtime']))
+        may_seal = may_seal or any(proof['runtime']['admission'] == 'enabled' for proof in writers)
         if may_seal:
             required = max(required, 2)
         for proof in pairs:
+            revalidate(proof, deadline)
+        for proof in writers:
             revalidate(proof, deadline)
         inventory_reader.revalidate(inventory)
         require(time.monotonic() < deadline)
         if floors[1] < required or floors[2] < required:
             return {'status': 'incompatible', 'reason': 'consumer_floor', 'required': required}
         return {'status': 'compatible_snapshot', 'required': required,
-                'requiresQuiescence': 1 in floors, 'databaseCount': len(snapshots)}
+                'requiresQuiescence': 1 in floors or any(p['runtime']['consumer'] == 1 for p in writers),
+                'databaseCount': len(snapshots)}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, paths.Unknown, state.Unknown,
             kernel.Unknown, inventory_reader.Unknown):
         raise Unknown('unverifiable_consumer_transition_snapshot') from None

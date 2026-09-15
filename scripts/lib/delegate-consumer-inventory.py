@@ -81,6 +81,27 @@ def path_environment(values):
     return result
 
 
+def runtime_projection(container):
+    """Only immutable launch/source fields; never retain secret environment.
+
+    Projection alone grants no capability. The preflight binds the exact image
+    ID and ORIGINAL release verifier before using it as a writer declaration.
+    """
+    config = container['Config']
+    labels = config.get('Labels') or {}
+    mounts = []
+    code = Path('/opt/openclaude')
+    for mount in container.get('Mounts') or []:
+        destination = absolute(mount.get('Destination'))
+        if destination.is_relative_to(code) or code.is_relative_to(destination):
+            mounts.append({k: mount.get(k) for k in ('Type', 'Source', 'Destination', 'RW')})
+    return {'release': labels.get('com.openclaude.runtime.release'),
+            'imageIdLabel': labels.get('com.openclaude.runtime.image_id'),
+            'mounts': sorted(mounts, key=lambda m: m['Destination']),
+            'entrypoint': config.get('Entrypoint'), 'cmd': config.get('Cmd'),
+            'workingDirectory': config.get('WorkingDir')}
+
+
 def collect(volumes, containers, master_databases):
     """Internal structured adapter; production capture_local supplies Docker facts.
 
@@ -186,7 +207,8 @@ def _collect(volumes, containers, master_databases):
         require(type(state.get("Pid")) is int and state["Pid"] >= 0)
         require(isinstance(state.get("StartedAt"), str))
         writers.append({"id": cid, "image": container["Image"], "state": state["Status"],
-                        "pid": state["Pid"], "startedAt": state["StartedAt"], "volume": volume_name})
+                        "pid": state["Pid"], "startedAt": state["StartedAt"], "volume": volume_name,
+                        "runtime": runtime_projection(container)})
 
     for path in master_databases:
         absolute(path)

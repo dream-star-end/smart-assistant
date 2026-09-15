@@ -77,6 +77,95 @@ def image_snapshot(values, deadline):
     return values['OC_RUNTIME_IMAGE_ID']
 
 
+def _inspect(kind, identity, deadline):
+    require(kind in {'container', 'image'})
+    require(re.fullmatch(r'[a-f0-9]{64}' if kind == 'container' else r'sha256:[a-f0-9]{64}', identity))
+    raw = artifacts._run(['/usr/bin/docker', '--host=unix:///var/run/docker.sock',
+                          kind, 'inspect', identity], deadline)
+    value = json.loads(raw)
+    require(isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict))
+    require(value[0].get('Id') == identity)
+    return value[0]
+
+
+def _writer_matches(container, writer):
+    require(container.get('Id') == writer['id'] and container.get('Image') == writer['image'])
+    state = container['State']
+    require(state['Status'] == writer['state'] and state['Pid'] == writer['pid'] and
+            state['StartedAt'] == writer['startedAt'])
+    require(container['HostConfig']['RestartPolicy']['Name'] == 'no')
+    require(inventory.runtime_projection(container) == writer['runtime'])
+
+
+def _image_launch(image):
+    config = image.get('Config')
+    require(isinstance(config, dict))
+    result = {'entrypoint': config.get('Entrypoint'), 'cmd': config.get('Cmd'),
+              'workingDirectory': config.get('WorkingDir')}
+    require(isinstance(result['workingDirectory'], str))
+    for key in ('entrypoint', 'cmd'):
+        value = result[key]
+        require(value is None or (isinstance(value, list) and all(isinstance(v, str) for v in value)))
+    return result
+
+
+def capture_writer_contexts(inv, current, repository, deadline):
+    """Bind every retained writer to its ACTUAL immutable image/source.
+
+    Stale containers may legitimately run a different source than master.
+    Their own source declaration still raises the compatibility floor. Docker
+    labels or a desired runtime alone never prove what those writers execute.
+    This is not a stop barrier, process-attestation, or start permit.
+    """
+    result, cached_code, cached_images = [], {}, {}
+    for writer in inv['writers']:
+        _writer_matches(_inspect('container', writer['id'], deadline), writer)
+        projection = writer['runtime']
+        image_id = writer['image']
+        if image_id not in cached_images:
+            cached_images[image_id] = _image_launch(_inspect('image', image_id, deadline))
+        launch = cached_images[image_id]
+        require(all(projection[k] == launch[k] for k in launch))
+        require(projection['imageIdLabel'] is None or projection['imageIdLabel'] == image_id)
+        mounts = projection['mounts']
+        code_mounts = [m for m in mounts if m['Destination'] == '/opt/openclaude']
+        # Embedded source requires its own original immutable-image adapter.
+        # A missing release mount/label is unknown, NOT implicitly legacy.
+        require(len(code_mounts) == 1)
+        mount = code_mounts[0]
+        require(mount['Type'] == 'bind' and mount['RW'] is False)
+        source = str(paths.path(mount['Source']))
+        require(projection['release'] == Path(source).name)
+        for extra in mounts:
+            if extra is mount:
+                continue
+            # Original supervisor intentionally overlays this non-executable
+            # baseline document. Code/dependency overlays cannot inherit the
+            # release's capability or source proof (including eval overlays).
+            require(extra['Destination'] == '/opt/openclaude/AGENTS.md' and
+                    extra['Type'] == 'bind' and extra['RW'] is False)
+        if source not in cached_code:
+            cached_code[source] = artifacts.capture(current['code']['master']['root'], source, repository, deadline)
+        proof = cached_code[source]
+        result.append({'writer': writer, 'launch': launch, 'code': proof})
+    revalidate_writer_contexts(result, deadline)
+    return result
+
+
+def revalidate_writer_contexts(contexts, deadline):
+    checked_images, checked_code = set(), set()
+    for context in contexts:
+        writer = context['writer']
+        _writer_matches(_inspect('container', writer['id'], deadline), writer)
+        if writer['image'] not in checked_images:
+            require(_image_launch(_inspect('image', writer['image'], deadline)) == context['launch'])
+            checked_images.add(writer['image'])
+        source = context['code']['runtime']['root']
+        if source not in checked_code:
+            artifacts.revalidate(context['code'], deadline)
+            checked_code.add(source)
+
+
 def runtime_snapshot(unit, projection, master, deadline):
     """Loaded config is not proof that a running supervisor ate that config.
 
@@ -213,16 +302,19 @@ def capture_transition(candidate_master, candidate_runtime, candidate_image, can
     proposed['projection'] = {**proposed['projection'], 'runtimeEnvironment': proposed_values}
     candidate = capture_context(proposed, candidate_master, proposed_values, repository, deadline)
     inv = inventory.capture_local([loaded['projection']['database'], proposed['projection']['database']], deadline)
-    decision = artifacts.classify_transition(current['code'], candidate['code'], current['code'], inv, deadline)
+    writers = capture_writer_contexts(inv, current, repository, deadline)
+    decision = artifacts.classify_transition(current['code'], candidate['code'], current['code'], inv, deadline,
+                                            writers=[w['code'] for w in writers])
     revalidate_context(current, deadline)
     revalidate_context(candidate, deadline)
     require(paths._show_effective(unit_name, deadline)['plan'] == loaded['unitPlan'])
     require(runtime_snapshot(unit_name, loaded['projection'], current_master, deadline) == running)
     require(link_snapshot(live) == selector)
     inventory.revalidate(inv)
+    revalidate_writer_contexts(writers, deadline)
     require(time.monotonic() < deadline)
     return {'decision': decision, 'current': current, 'candidate': candidate,
-            'inventory': inv, 'selector': selector, 'running': running}
+            'inventory': inv, 'selector': selector, 'running': running, 'writers': writers}
 
 
 def initial(*args, **kwargs):
