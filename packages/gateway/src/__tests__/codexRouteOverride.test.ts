@@ -218,6 +218,7 @@ describe('buildCodexProviderConfigArgs — requiresOpenaiAuth argv', () => {
       '-c', `model_providers.${id}.request_max_retries=1`,
       '-c', `model_providers.${id}.stream_max_retries=5`,
       '-c', `model_providers.${id}.requires_openai_auth=true`,
+      '-c', `model_providers.${id}.supports_websockets=false`,
       '-c', 'preferred_auth_method="chatgpt"',
       '-c', 'disable_response_storage=true',
     ])
@@ -228,6 +229,7 @@ describe('buildCodexProviderConfigArgs — requiresOpenaiAuth argv', () => {
     assert.ok(route)
     const args = buildCodexProviderConfigArgs({} as NodeJS.ProcessEnv, route)
     assert.equal(args.some((a) => a.includes('requires_openai_auth')), false)
+    assert.equal(args.some((a) => a.includes('supports_websockets')), false)
   })
 
   test('env 路径(无 override)恒不带 requires_openai_auth(不新增 env 键)', () => {
@@ -238,6 +240,7 @@ describe('buildCodexProviderConfigArgs — requiresOpenaiAuth argv', () => {
     const args = buildCodexProviderConfigArgs(env, null)
     assert.ok(args.length > 0)
     assert.equal(args.some((a) => a.includes('requires_openai_auth')), false)
+    assert.equal(args.some((a) => a.includes('supports_websockets')), false)
   })
 })
 

@@ -2228,6 +2228,86 @@ describe('stderr PATH_NOT_ALLOWED line buffer', () => {
     assert.equal(aborted, false)
     await runner.shutdown()
   })
+
+  it('webchat aborts on chatgpt.com Responses websocket direct connect', async () => {
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'agent:main:webchat:dm:abc',
+      agentId: 'main',
+      cwd: await mkdtemp(join(tmpdir(), 'codex-aps-ws-')),
+    })
+    const t0 = runner.lastActivityAt
+    await new Promise((r) => setTimeout(r, 5))
+    let abortedName = ''
+    ;(runner as any).currentTurnCompleter = {
+      resolve: () => {},
+      reject: (err: Error) => {
+        abortedName = err.name
+      },
+    }
+    const origShutdown = runner.shutdown.bind(runner)
+    ;(runner as any).shutdown = async () => {}
+    runner.feedStderrForTests(
+      'failed to connect to websocket: IO error: Network unreachable (os error 101), url: wss://chatgpt.com/backend-api/codex/responses\n',
+    )
+    assert.equal(abortedName, 'CodexChatgptWebsocketDirectError')
+    assert.equal(runner.lastActivityAt, t0)
+    await origShutdown()
+  })
+})
+
+describe('interrupt fence', () => {
+  it('marks proc stale and recycleProcKeepQueue shuts it down without dropping queued turns', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    ;(h.runner as any).threadId = 'thr-int'
+    ;(h.runner as any).activeTurnId = 't-int'
+    ;(h.runner as any).initialized = true
+    assert.equal(h.runner.interrupt(), true)
+    assert.equal((h.runner as any).staleProcGeneration, true)
+    let shutdownRejected = false
+    ;(h.runner as any).drain = async () => {}
+    const rec = (h.runner as any).recycleProcKeepQueue('test')
+    ;(h.runner as any).queue.push({
+      prompt: 'keep-me',
+      resolve: () => {},
+      reject: (err: Error) => {
+        shutdownRejected = /shutdown/i.test(err.message)
+      },
+    })
+    await rec
+    assert.equal((h.runner as any).proc, null)
+    assert.equal((h.runner as any).staleProcGeneration, false)
+    assert.equal(shutdownRejected, false)
+    assert.equal((h.runner as any).queue.length, 1)
+    await h.cleanup()
+  })
+
+  it('intentional recycle does not emit exit for a follow-up turn to inherit', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const exits: unknown[] = []
+    h.runner.on('exit', (e) => exits.push(e))
+    ;(h.runner as any).drain = async () => {}
+    await (h.runner as any).recycleProcKeepQueue('test')
+    assert.equal(exits.length, 0)
+    await h.cleanup()
+  })
+
+  it('two chatgpt.com WS stderr lines recycle the proc only once', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    let shutdownCalls = 0
+    const orig = h.runner.shutdown.bind(h.runner)
+    ;(h.runner as any).shutdown = async (opts?: { keepQueuedTurns?: boolean }) => {
+      shutdownCalls += 1
+      return orig(opts)
+    }
+    const ws =
+      'failed to connect to websocket: IO error: Network unreachable (os error 101), url: wss://chatgpt.com/backend-api/codex/responses\n'
+    h.runner.feedStderrForTests(ws)
+    h.runner.feedStderrForTests(ws)
+    await waitFor(() => shutdownCalls >= 1)
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(shutdownCalls, 1)
+    await h.cleanup()
+  })
 })
 
 describe('SubprocessRunner interface parity', () => {

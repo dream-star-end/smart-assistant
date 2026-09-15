@@ -310,7 +310,16 @@ export function buildCodexProviderConfigArgs(
     '-c',
     `model_providers.${providerId}.stream_max_retries=5`,
     ...(requiresOpenaiAuth
-      ? ['-c', `model_providers.${providerId}.requires_openai_auth=true`]
+      ? [
+          '-c',
+          `model_providers.${providerId}.requires_openai_auth=true`,
+          // ChatGPT-auth Responses WS 硬编码 wss://chatgpt.com，不吃 chatgpt_base_url
+          // / model_providers.*.base_url。容器无公网路由 → Network unreachable，
+          // 前端永远停在「正在启动引擎」。自定义 provider 可关 WS，逼回已通的
+          // HTTP POST loopback relay（OCV5-224 / INC-20260915-CODEX-CHATGPT-WS）。
+          '-c',
+          `model_providers.${providerId}.supports_websockets=false`,
+        ]
       : []),
     '-c',
     `preferred_auth_method=${tomlString(authMethod)}`,

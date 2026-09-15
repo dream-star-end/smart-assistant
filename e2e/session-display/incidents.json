@@ -3147,6 +3147,54 @@
           "assertion": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true"
         }
       ]
+    },
+    {
+      "id": "INC-20260915-CODEX-CHATGPT-WS",
+      "occurredAt": "2026-09-15",
+      "severity": "P0",
+      "symptom": "商业版 GPT-6-Astra x6.1/1M 卡死「正在启动引擎」数小时零 token：Codex ChatGPT-auth Responses websocket 直连 wss://chatgpt.com（容器 Network unreachable），stderr 被当成 liveness，USER_CANCELLED 后复用同一死 PID。",
+      "rootFixCommit": "25a5b3c9",
+      "coverageCommits": [
+        "3144c3a9",
+        "2b4af86e"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRelayPathGuard.test.ts",
+          "assertion": "识别 chatgpt.com Responses WS 直连,且不算 activity"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
+          "assertion": "webchat aborts on chatgpt.com Responses websocket direct connect"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
+          "assertion": "webchat session never aborts on PATH_NOT_ALLOWED burst"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
+          "assertion": "marks proc stale and recycleProcKeepQueue shuts it down without dropping queued turns"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRouteOverride.test.ts",
+          "assertion": "official override → 完整 -c 序列含 requires_openai_auth=true"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "upstream_failed: Codex chatgpt.com Responses websocket direct"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-chatgpt-ws.ts",
+          "assertion": "INC-20260915-CODEX-CHATGPT-WS: official provider disables ChatGPT Responses websocket, stderr fail-loud, interrupt recycles hung app-server"
+        }
+      ]
     }
   ]
 }
