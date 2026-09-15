@@ -722,28 +722,44 @@ function waitFor(selector: string, timeoutMs = 4000): Promise<HTMLElement | null
 
 /**
  * 挂载后按顺序等元素出现再点击(面板/抽屉/表单都是组件内部 state,没有受控入口)。
- * 步骤以 `event:` 开头时改为在 document 上派发该事件(如 visibilitychange 触发看板后台对账)。
+ * 步骤前缀:
+ * - `event:<name>` 在 document 上派发该事件(如 visibilitychange 触发看板后台对账);
+ * - `?` 可选步骤:找不到(1.5s)就跳过继续,用于只在某个视口才存在的入口
+ *   (移动端的「配置」菜单在桌面视口没有);
+ * - `menu:` Radix DropdownMenu 的触发器靠 pointerdown 打开,`.click()` 打不开,这里改派发 pointerdown。
  */
 function AutoClick({ selectors, children }: { selectors: string[]; children: ReactNode }) {
   // biome-ignore lint/correctness/useExhaustiveDependencies: selectors 每个场景是常量,只在挂载时跑一次
   useEffect(() => {
     let cancelled = false
     void (async () => {
-      for (const sel of selectors) {
-        if (sel.startsWith('event:')) {
+      for (const raw of selectors) {
+        if (raw.startsWith('event:')) {
           await new Promise((r) => setTimeout(r, 150))
-          document.dispatchEvent(new Event(sel.slice('event:'.length)))
+          document.dispatchEvent(new Event(raw.slice('event:'.length)))
           await new Promise((r) => setTimeout(r, 150))
           continue
         }
-        const el = await waitFor(sel)
+        let sel = raw
+        const optional = sel.startsWith('?')
+        if (optional) sel = sel.slice(1)
+        const menu = sel.startsWith('menu:')
+        if (menu) sel = sel.slice('menu:'.length)
+        // 可选步骤只等 400ms:它对应的入口(移动端菜单)是同步挂载的,没有就是没有;等久了会撞上截图延时。
+        const el = await waitFor(sel, optional ? 400 : 4000)
         if (cancelled) return
         if (!el) {
-          console.warn('[taskboard-preview] auto-click 未找到', sel)
-          return
+          if (!optional) console.warn('[taskboard-preview] auto-click 未找到', sel)
+          continue
         }
-        el.click()
-        await new Promise((r) => setTimeout(r, 80))
+        if (menu) {
+          el.dispatchEvent(
+            new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerType: 'mouse' }),
+          )
+        } else {
+          el.click()
+        }
+        await new Promise((r) => setTimeout(r, 120))
       }
     })()
     return () => {
@@ -752,6 +768,9 @@ function AutoClick({ selectors, children }: { selectors: string[]; children: Rea
   }, [])
   return <>{children}</>
 }
+
+/** 移动端视口下先把顶栏「配置」菜单打开(桌面没有这个菜单,可选步骤直接跳过)。 */
+const OPEN_CONFIG_MENU = '?menu:[data-testid="taskboard-config-menu"]'
 
 function Board({
   view,
@@ -860,7 +879,18 @@ export const taskboardScenes: Scene[] = [
     api: {},
     render: () => {
       installStubs()
-      return <Board view="board" clicks={['[data-testid="taskboard-root"] > header button[aria-expanded="false"]']} />
+      return <Board view="board" clicks={['[data-testid="ticket-create-toggle"]']} />
+    },
+  },
+  {
+    id: 'taskboard-mobile-config-menu',
+    label: '任务面板 · 移动端顶栏「配置」菜单（项目 / 流水线 / 模板 / 护栏收进一个入口）',
+    group: GROUP,
+    viewports: ['mobile'],
+    api: {},
+    render: () => {
+      installStubs()
+      return <Board view="board" clicks={[OPEN_CONFIG_MENU]} />
     },
   },
   {
@@ -884,7 +914,7 @@ export const taskboardScenes: Scene[] = [
   },
   {
     id: 'taskboard-no-pipeline',
-    label: '任务面板 · 项目还没有流水线列',
+    label: '任务面板 · 项目还没有流水线（空态给出配置 / 套用模板两个下一步）',
     group: GROUP,
     viewports: VP,
     api: {},
@@ -938,14 +968,13 @@ export const taskboardScenes: Scene[] = [
   },
   {
     id: 'taskboard-load-error',
-    label: '任务面板 · 看板接口失败(只剩 toast 与误导性空态,无重试)',
+    label: '任务面板 · 看板接口失败(错误态 + 重试)',
     group: GROUP,
     viewports: VP,
     api: {},
     render: () => {
       // 项目列表成功(否则连看板都进不去),看板与单据列表两个接口都挂:
-      // loadInitial 的错误因 selectProject 抢跑而被吞,selectProject 只 toast 一次,
-      // 页面落在「还没有流水线列」上,没有错误态、没有重试入口。
+      // 阶段 B 之后应落在「任务面板加载失败」+「重试」上,而不是「还没有流水线列」。
       const boom = async () => {
         throw new Error('网关 502:上游任务服务暂时不可用')
       }
@@ -964,7 +993,11 @@ export const taskboardScenes: Scene[] = [
       return (
         <Board
           view="board"
-          clicks={['[data-testid="stage-settings-open"]', '[data-testid="stage-edit-stage-build"]']}
+          clicks={[
+            OPEN_CONFIG_MENU,
+            '[data-testid="stage-settings-open"]',
+            '[data-testid="stage-edit-stage-build"]',
+          ]}
         />
       )
     },
@@ -977,7 +1010,7 @@ export const taskboardScenes: Scene[] = [
     api: {},
     render: () => {
       installStubs()
-      return <Board view="board" clicks={['[data-testid="template-library-open"]']} />
+      return <Board view="board" clicks={[OPEN_CONFIG_MENU, '[data-testid="template-library-open"]']} />
     },
   },
   {
@@ -988,24 +1021,24 @@ export const taskboardScenes: Scene[] = [
     api: {},
     render: () => {
       installStubs()
-      return <Board view="board" clicks={['[data-testid="board-settings-open"]']} />
+      return <Board view="board" clicks={[OPEN_CONFIG_MENU, '[data-testid="board-settings-open"]']} />
     },
   },
   {
     id: 'taskboard-project-settings',
-    label: '任务面板 · 编辑项目(工作区 / 上下文 / 记忆 / 已归档)',
+    label: '任务面板 · 管理项目(工作区 / 上下文 / 记忆 / 已归档)',
     group: GROUP,
     viewports: VP,
     api: {},
     render: () => {
       installStubs()
-      // 首屏 projects 因 loadInitial/selectProject 竞态丢失,「管理项目」入口要等一次后台对账才出现
-      // (见审计文档 T-01);这里主动派发 visibilitychange 触发 reconcile,才能点开它。
+      // 阶段 B 之后首屏 projects 不再被竞态丢掉(审计 T-01),「管理项目」入口第一屏就在,
+      // 不需要再靠 visibilitychange 触发对账。
       return (
         <Board
           view="board"
           clicks={[
-            'event:visibilitychange',
+            OPEN_CONFIG_MENU,
             '[data-testid="project-edit-open"]',
             '[data-testid="project-context-preview"]',
           ]}
