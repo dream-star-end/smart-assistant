@@ -618,6 +618,7 @@ export function App() {
     loadMoreSessions,
     hasMoreSessions,
     loadingMoreSessions,
+    loadMoreError,
     loadArchivedSessions,
     loadingArchived,
     searchSessionMessages,
@@ -718,6 +719,8 @@ export function App() {
     activeId: activeId ?? null,
     userId: user?.id ?? null,
     auth: demo ? null : auth,
+    // sidebar-B UUS-01：系统通知点开后落到对应会话（hook 内已 window.focus()）。
+    onNotificationOpen: selectSession,
   });
   const sidebarWidth = useSidebarWidth();
 
@@ -3342,6 +3345,10 @@ export function App() {
     onLoadMore: loadMoreSessions,
     hasMore: hasMoreSessions,
     loadingMore: loadingMoreSessions,
+    // sidebar-B S-08：加载更早会话失败时侧栏底部给「点击重试」。
+    loadMoreError,
+    // sidebar-B S-05：拖宽把手可 Tab 聚焦并用键盘调宽。
+    onResizeKeyDown: sidebarWidth.onResizeKeyDown,
     onLoadArchived: loadArchivedSessions,
     loadingArchived,
     onSearchMessages: searchSessionMessages,
@@ -3439,6 +3446,8 @@ export function App() {
             setMobileNavOpen(false);
           }}
           onCollapse={() => setMobileNavOpen(false)}
+          // sidebar-B S-06：抽屉里同一按钮语义是「关闭导航」，读屏名与桌面「折叠侧栏」区分。
+          collapseLabel="关闭导航"
           onOpenBoard={
             demo || !TASKBOARD_ENABLED
               ? undefined
