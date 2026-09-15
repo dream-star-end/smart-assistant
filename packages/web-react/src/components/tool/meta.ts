@@ -466,11 +466,42 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   if (cli === "oc-market") {
     return humanSummaryToken(invocation?.[1]);
   }
-  if (cli === "oc-memory" && (op === "delegate" || op === "request-review" || op === "delegate-wait")) {
-    // 取不到 goal/draft 就留空，绝不回退到 op 或 `--help` 这类 flag 名。
-    return humanSummaryToken(commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1]);
+  if (cli === "oc-memory") {
+    if (op === "delegate" || op === "request-review" || op === "delegate-wait") {
+      // 取不到 goal/draft 就留空，绝不回退到 op 或 `--help` 这类 flag 名。
+      return humanSummaryToken(commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1]);
+    }
+    // session-search / archival-search 的查询词(位置参数或 --query)。
+    return humanSummaryToken(commandFlag(command, "query") || firstQuotedArg(command) || invocation?.[1]);
+  }
+  // 研究链路 CLI(T-28):折叠态靠查询词/文件名区分多张同类卡。
+  if (cli === "oc-lit" || cli === "oc-litrag" || cli === "oc-cite" || cli === "oc-ingest") {
+    return humanSummaryToken(
+      commandFlag(command, "query") || commandFlag(command, "q") || firstQuotedArg(command) || invocation?.[1],
+    );
+  }
+  if (cli === "oc-report" || cli === "oc-slides" || cli === "oc-poster" || cli === "oc-docx" || cli === "oc-pdf" || cli === "oc-xlsx") {
+    const out = commandFlag(command, "output") || commandShortFlag(command, "o");
+    return out ? shortPath(stripQuotes(out)) : "";
   }
   return "";
+}
+
+/** 短横单字母 flag(`-o path` / `-o=path`)的值;缺值或下一个 token 又是 flag → ""。 */
+function commandShortFlag(command: string, flag: string): string {
+  const match = new RegExp(`(?:^|\\s)-${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command);
+  const value = match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
+  return value.startsWith("-") ? "" : value;
+}
+
+/** 命令里首个带引号的参数(≥2 字符):oc-lit search "词" 这类位置型查询词。 */
+function firstQuotedArg(command: string): string {
+  const m = /["']([^"']{2,})["']/.exec(command);
+  return m ? m[1] : "";
+}
+
+function stripQuotes(value: string): string {
+  return value.replace(/^["']|["']$/g, "");
 }
 
 /** TaskOutput 在等已有后台命令（task_ids / task_id）时标「等待输出」，spawn 结果才叫「子任务结果」。 */
@@ -566,29 +597,27 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       if (cli) return ocCommandSummary(cli as OcCli, cmd);
       return clipOneLine(asStr(input.description) || cmd.split("\n")[0]);
     }
+    // 摘要只放对象(路径 / 模式 / 查询词),动词已由表头标签承担(T-26:「读取文件 · 读取 …」重复)。
     case "Edit":
       return shortPath(input.file_path);
-    case "Read": {
-      const path = shortPath(input.file_path);
-      return path ? `读取 ${path}` : "";
-    }
+    case "Read":
+      return shortPath(input.file_path);
     case "Write":
       return shortPath(input.file_path);
     case "Grep": {
       const q = asStr(input.pattern);
-      return q ? `搜索 "${q}"` : "";
+      return q ? `"${clipOneLine(q, 60)}"` : "";
     }
-    case "Glob": {
-      const q = asStr(input.pattern);
-      return q ? `搜索 ${q}` : "";
-    }
+    case "Glob":
+      return clipOneLine(asStr(input.pattern), 60);
+    // 硬切 slice 会把 …/pulls/1284 显示成 …/pulls/128(T-06),必须带省略号。
     case "WebFetch":
-      return asStr(input.url).slice(0, 60);
+      return clipOneLine(asStr(input.url), 60);
     case "WebSearch":
     case "McpSearch":
     case "search_tool": {
       const q = asStr(input.query);
-      return q ? `搜索 "${clipOneLine(q, 60)}"` : "";
+      return q ? `"${clipOneLine(q, 60)}"` : "";
     }
     case "SearchExtraTools":
       return searchExtraToolsQuery(input).slice(0, 60);
@@ -646,19 +675,20 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "browser_evaluate" || op === "browser_run_code")
       return (asStr(input.code) || asStr(input.function)).replace(/\s+/g, " ").slice(0, 60);
     if (op === "browser_wait_for") return asStr(input.text) || `${(input.time as number) || 0}s`;
-    return op;
+    // 未登记 op:标签已由 resolveToolMeta 人话化,摘要不再重复一遍原始 op(T-28)。
+    return "";
   }
   if (server === "minimax-media") {
     if (op === "text_to_image" || op === "generate_video" || op === "music_generation" || op === "text_to_audio") {
       return (asStr(input.prompt) || asStr(input.text) || asStr(input.lyrics)).slice(0, 60);
     }
     if (op === "query_video_generation") return asStr(input.task_id);
-    return op;
+    return "";
   }
   if (server === "minimax-vision" || server === "openclaude-vision") {
     if (op === "understand_image") return (asStr(input.prompt) || asStr(input.question)).slice(0, 60);
     if (op === "web_search") return asStr(input.query);
-    return op;
+    return "";
   }
   if (server === "openclaude-memory") {
     if (op === "memory") return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
@@ -689,12 +719,16 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
     }
     if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);
-    return op;
+    if (op === "consult_advisor" || op === "request_review" || op === "ask_user") {
+      return (asStr(input.question) || asStr(input.prompt) || asStr(input.goal)).slice(0, 60);
+    }
+    // 未登记 op 不直显内部标识符(T-28):标签已由 resolveToolMeta 人话化,摘要留空。
+    return "";
   }
   if (server === "web-context") {
     if (op === "web_context_extract_url") return asStr(input.url).slice(0, 80);
     if (op === "web_context_parse_file") return shortPath(input.file_path);
-    return op;
+    return "";
   }
   if (server === "scansci-pdf") {
     if (op === "scansci_pdf_search") return asStr(input.query).slice(0, 60);
@@ -706,9 +740,9 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return (asStr(input.identifier) || asStr(input.file_path)).slice(0, 70);
     }
     if (op === "scansci_pdf_parse_list") return shortPath(input.file_path);
-    if (op.includes("health") || op.includes("diagnose") || op.includes("source")) return op;
+    if (op.includes("health") || op.includes("diagnose") || op.includes("source")) return "";
     if (op.includes("vpnsci")) return asStr(input.school) || asStr(input.query) || asStr(input.doi);
-    return op;
+    return "";
   }
   return "";
 }

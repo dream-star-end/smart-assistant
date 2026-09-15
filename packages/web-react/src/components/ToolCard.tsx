@@ -17,69 +17,29 @@
  * 二级分派：按 toolName 走 {@link ToolBody}（builtin / MCP / Codex / generic）。
  * 流式：input 经 normalizeToolForDisplay/resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
+ * 状态：四态 + 受阻 + 取消全部来自 {@link resolveToolStatus}（与详情面板同一权威，T-05）。
  */
 import { Check, ChevronRight, PanelRight } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
-import { ToolInspectOpenContext, useArtifactInspect } from "./tool/context";
+import {
+  ToolHeaderLabelContext,
+  ToolInspectOpenContext,
+  useArtifactInspect,
+  useArtifactInspectActive,
+} from "./tool/context";
 import {
   type ToolLike,
   normalizeToolForDisplay,
 } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
+import { resolveToolStatus } from "./tool/status";
+import { toneTileClass } from "./tool/tone";
 import { Badge, IconButton, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
-
-// 图标底色按工具语义分色(对齐设计稿 .tic.tn-*)。
-const TONE_TILE: Record<string, string> = {
-  accent: "bg-accent-soft text-accent",
-  success: "bg-success-soft text-success",
-  info: "bg-info-soft text-info",
-  warning: "bg-warning-soft text-warning",
-  neutral: "bg-hover text-muted",
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-/** 严格 Cursor 信封：`{ success: <object>, isBackground?: boolean }`，顶层不得有其它键。 */
-function isCursorShellEnvelope(value: Record<string, unknown>): boolean {
-  if (!isRecord(value.success)) return false;
-  const keys = Object.keys(value);
-  if (keys.some((k) => k !== "success" && k !== "isBackground")) return false;
-  if ("isBackground" in value && typeof value.isBackground !== "boolean") return false;
-  return true;
-}
-
-/** Cursor Shell 失败结果：{command, exitCode, stderr, stdout, ...}。 */
-function isShellResultObject(value: Record<string, unknown>): boolean {
-  const keys = new Set(
-    Object.keys(value).map((key) => key.toLowerCase().replaceAll("_", "").replaceAll(" ", "")),
-  );
-  return keys.has("command") && (keys.has("exitcode") || keys.has("stderr") || keys.has("stdout"));
-}
-
-/** 历史 tape 兜底：可解析的 Cursor shell 信封里，只有数字且非 0 的 exitCode 才算错误。 */
-function bashOutputReportsNonzeroExit(output: string): boolean {
-  const trimmed = output.trim();
-  if (!trimmed.startsWith("{")) return false;
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (!isRecord(parsed)) return false;
-    const inner = isCursorShellEnvelope(parsed)
-      ? (parsed.success as Record<string, unknown>)
-      : parsed;
-    if (!isCursorShellEnvelope(parsed) && !isShellResultObject(inner)) return false;
-    const exitRaw = inner.exitCode ?? inner.exit_code;
-    return typeof exitRaw === "number" && Number.isFinite(exitRaw) && exitRaw !== 0;
-  } catch {
-    return false;
-  }
-}
 
 export function ToolCard({
   message,
@@ -95,6 +55,13 @@ export function ToolCard({
   const meta = resolveToolMeta(name, input);
   const Icon = meta.icon;
   const summary = toolSummary(name, input);
+  // 表头各段的 id:按钮可及名走 aria-labelledby 拼「标签 + 摘要 + 错误首行 + 状态」(T-22),
+  // 不再用 aria-label 把按钮内的可见文本全部覆盖掉。
+  const uid = useId();
+  const labelId = `${uid}-label`;
+  const summaryId = `${uid}-summary`;
+  const errorId = `${uid}-error`;
+  const statusId = `${uid}-status`;
 
   // 产物详情列(Codex 式第三列):App 提供 open 才渲染入口;点击把本条 tool 消息
   // 引用交给面板全文渲染。回调同时经 ToolInspectOpenContext 下发给体内截断点。
@@ -104,43 +71,12 @@ export function ToolCard({
     inspectOpen?.({ kind: "tool", message });
   }, [inspectOpen, message]);
   const canInspect = !!inspectOpen;
+  // 面板正在看的就是本条 → 选中态描边(T-18),多卡同列时知道面板对应哪一条。
+  const activeMessage = useArtifactInspectActive();
+  const isActive = canInspect && activeMessage !== null && activeMessage === message;
 
-  const completed = !!renderTool._completed;
-  const outputText = typeof renderTool.output === "string" ? renderTool.output : "";
-  // 部分 CLI 会以 exit 0 返回语义失败（Playwright 的 markdown Error、网页反爬阻断）。
-  // 这些明确形状应进入用户可见状态，而不是显示绿色完成。
-  // 新会话由 gateway 的 exitCode→isError 负责；历史 tape 只认信封里的非 0 exitCode。
-  // 不把 `oc-*: ` 行首前缀当错误：多个 CLI 成功路径也会往 stderr 打这个前缀。
-  const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
-  const reportedError =
-    name === "Bash" &&
-    !isBlocked &&
-    (/^#{1,6}\s*Error\b/m.test(outputText) || bashOutputReportsNonzeroExit(outputText));
-  const hasError = !!renderTool.error || reportedError;
-  // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
-  const isInterruptedHistorical =
-    !completed && renderTool._timelineRecord === true && renderTool._dispatchOutcome === "interrupted";
-  // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
-  const isCancelled = !hasError && (!!renderTool.cancelled || isInterruptedHistorical);
-  const isRunning = !completed && !hasError && !isBlocked && !isCancelled;
-  // 单次工具异常属于助手内部执行过程,助手通常会自行换路径继续:不用大红「失败」恐吓,
-  // 但也不能藏成中性「已结束」—— 用淡危险色「未成功」如实标记,错误首行进表头摘要。
-  const statusLabel = isRunning
-    ? "运行中"
-    : hasError
-      ? "未成功"
-      : isBlocked
-        ? "受阻"
-        : isCancelled
-          ? "已取消"
-          : "完成";
-  // 表头错误摘要:输出首个非空行(剥 markdown # 前缀),截断显示。
-  const errorFirstLine = hasError
-    ? (outputText
-        .split(/\r?\n/)
-        .map((l) => l.replace(/^#{1,6}\s*/, "").trim())
-        .find(Boolean) ?? "")
-    : "";
+  const status = resolveToolStatus(display);
+  const { hasError, isBlocked, isRunning, isCancelled, errorFirstLine } = status;
 
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
@@ -149,12 +85,21 @@ export function ToolCard({
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 未成功的卡也默认展开:错误详情是用户此刻最需要的信息,不该多一次点击。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
-  // 状态只决定首次挂载；之后用户的展开选择始终为权威，流式状态迁移不强制跳动。
-  const isConfirmation = outputText.includes('"confirmation_required"');
-  const [open, setOpen] = useState(() => isRunning || isBlocked || isConfirmation || hasError);
+  const [open, setOpen] = useState(
+    () => isRunning || isBlocked || status.isConfirmation || hasError,
+  );
+  const userToggled = useRef(false);
+  // 挂载时还是「完成/折叠」、随后归并成 error:true 的历史消息,同样按 F1 展开(T-07);
+  // 用户已手动折叠过则尊重用户,不再跳动。
+  useEffect(() => {
+    if (hasError && !userToggled.current) setOpen(true);
+  }, [hasError]);
 
   // 无 body 的卡表头不渲染成 button(L5):没有可展开的内容,不该有可点语义。
   const HeaderTag = hasBody ? ("button" as const) : ("div" as const);
+  const labelledBy = [labelId, summary ? summaryId : "", errorFirstLine ? errorId : "", statusId]
+    .filter(Boolean)
+    .join(" ");
   return (
     <div
       className={cn(
@@ -168,6 +113,7 @@ export function ToolCard({
             : isRunning
               ? "border-accent/25"
               : "border-border hover:border-border-strong",
+        isActive && "ring-1 ring-accent/40",
       )}
     >
       <div className="flex items-stretch">
@@ -175,9 +121,12 @@ export function ToolCard({
         {...(hasBody
           ? {
               type: "button" as const,
-              onClick: () => setOpen((o) => !o),
+              onClick: () => {
+                userToggled.current = true;
+                setOpen((o) => !o);
+              },
               "aria-expanded": open,
-              "aria-label": `${open ? "收起" : "展开"}${meta.label}详情`,
+              "aria-labelledby": labelledBy,
             }
           : {})}
         className={cn(
@@ -188,43 +137,58 @@ export function ToolCard({
         <span
           className={cn(
             "flex size-7 shrink-0 items-center justify-center rounded-lg",
-            TONE_TILE[meta.tone ?? "accent"],
+            toneTileClass(meta.tone),
           )}
         >
           <Icon size={14} />
         </span>
         {/* 窄屏(L7):标题限宽、摘要优先截断,右侧徽章区 shrink-0 保持完整可见。 */}
-        <span className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-semibold text-fg">
+        <span id={labelId} className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-semibold text-fg">
           {meta.label}
         </span>
         {summary && (
-          <span className="min-w-0 truncate font-mono text-xs text-muted" title={summary}>
+          <span
+            id={summaryId}
+            // 有错误首行时,窄屏把整行让给错误(T-11):摘要藏起来,错误首行单独占表头下一行。
+            className={cn(
+              "min-w-0 truncate font-mono text-xs text-muted",
+              errorFirstLine && "hidden sm:inline",
+            )}
+            title={summary}
+          >
             {summary}
           </span>
         )}
         {errorFirstLine && (
-          <span className="min-w-0 truncate text-xs text-danger" title={errorFirstLine}>
+          <span
+            id={errorId}
+            className="hidden min-w-0 truncate text-xs text-danger sm:inline"
+            title={errorFirstLine}
+          >
             {errorFirstLine}
           </span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
           <TokenUsageBadge usage={tokenUsage} />
-          {/* 运行态 spinner 是 aria-hidden，需 sr-only 播报；其余状态均有可见 Badge 文案。 */}
-          {isRunning && <span className="sr-only">{statusLabel}</span>}
-          {isRunning ? (
-            <Spinner size={13} className="text-accent" />
-          ) : hasError ? (
-            <Badge tone="danger">未成功</Badge>
-          ) : isBlocked ? (
-            <Badge tone="warning">受阻</Badge>
-          ) : isCancelled ? (
-            <Badge tone="neutral">已取消</Badge>
-          ) : (
-            <Badge tone="success" className="gap-1.5">
-              <Check size={11} aria-hidden="true" />
-              完成
-            </Badge>
-          )}
+          {/* 状态区 aria-live:运行中→完成/未成功的迁移会被读屏播报(T-22)。
+              运行态 spinner 是 aria-hidden，需 sr-only 播报；其余状态均有可见 Badge 文案。 */}
+          <span id={statusId} aria-live="polite" className="flex items-center">
+            {isRunning && <span className="sr-only">{status.label}</span>}
+            {isRunning ? (
+              <Spinner size={13} className="text-accent" />
+            ) : hasError ? (
+              <Badge tone="danger">{status.label}</Badge>
+            ) : isBlocked ? (
+              <Badge tone="warning">{status.label}</Badge>
+            ) : isCancelled ? (
+              <Badge tone="neutral">{status.label}</Badge>
+            ) : (
+              <Badge tone="success" className="gap-1.5">
+                <Check size={11} aria-hidden="true" />
+                {status.label}
+              </Badge>
+            )}
+          </span>
           {hasBody && (
             <ChevronRight
               size={15}
@@ -240,6 +204,7 @@ export function ToolCard({
             size="sm"
             shape="square"
             aria-label="在详情面板查看"
+            aria-pressed={isActive || undefined}
             title="在详情面板查看"
             onClick={(e) => {
               e.stopPropagation();
@@ -251,10 +216,22 @@ export function ToolCard({
         </div>
       )}
       </div>
+      {/* 窄屏专用:错误首行独立成行(桌面在表头同行,见上;此处 aria-hidden 防读屏重复)。 */}
+      {errorFirstLine && (
+        <div
+          aria-hidden="true"
+          className="truncate px-3 pb-1.5 text-xs text-danger sm:hidden"
+          title={errorFirstLine}
+        >
+          {errorFirstLine}
+        </div>
+      )}
       {open && hasBody && (
         <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
           <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>
-            <ToolBody name={name} input={input} tool={renderTool} />
+            <ToolHeaderLabelContext.Provider value={meta.label}>
+              <ToolBody name={name} input={input} tool={renderTool} />
+            </ToolHeaderLabelContext.Provider>
           </ToolInspectOpenContext.Provider>
         </div>
       )}

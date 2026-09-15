@@ -44,10 +44,21 @@ import { shouldShowDelegateRunning } from "../../lib/chat/ocMemoryCli";
 import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
+import { Badge } from "../ui";
 import { connectorToolCard } from "./connectorCards";
+import { useToolHeaderLabel } from "./context";
 import { ExpandControls, useExpandableSlice } from "./expandable";
 import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
+import { INLINE_SUMMARY_CLS, InlineAction } from "./inlineAction";
 import { detectOcCli, type OcCli } from "./meta";
+import {
+  cursorCliStreams,
+  isShellResultObject,
+  shellResultString,
+  stripCommandEcho,
+  stripExternalEnvelope,
+  unwrapCursorShellEnvelope,
+} from "./shellEnvelope";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
 
@@ -160,6 +171,7 @@ function parseToolData(text: string | null): { data: Record<string, unknown>; pa
 
 // M5:专属卡恒在 ToolCard 内部渲染,外层表头已有图标 + 标签 —— 此处不再重复图标+大标题
 // (双层表头视觉过重)。保留一行轻量状态行:标题弱化为 faint 小字,subtitle(数量/状态)照旧。
+// T-15:标题与表头标签同词(「文献检索」「研究报告」…)时连这行小字也省掉,只留右对齐的 subtitle 徽标。
 // icon 参数保留在签名里(各卡传参不动),仅不渲染。
 function CardShell({ title, subtitle, children }: {
   icon?: ReactNode;
@@ -167,46 +179,60 @@ function CardShell({ title, subtitle, children }: {
   subtitle?: string;
   children: ReactNode;
 }) {
+  const headerLabel = useToolHeaderLabel();
+  const showTitle = !headerLabel || headerLabel !== title;
   return (
     <section className="space-y-2">
-      <div className="flex min-w-0 items-center gap-2">
-        <span className="min-w-0 truncate text-caption font-medium text-faint">{title}</span>
-        {subtitle && (
-          <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption font-medium text-faint">
-            {subtitle}
-          </span>
-        )}
-      </div>
+      {(showTitle || subtitle) && (
+        <div className="flex min-w-0 items-center gap-2">
+          {showTitle && <span className="min-w-0 truncate text-caption font-medium text-faint">{title}</span>}
+          {subtitle && (
+            <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-caption font-medium text-faint">
+              {subtitle}
+            </span>
+          )}
+        </div>
+      )}
       <div>{children}</div>
     </section>
   );
 }
 
+/**
+ * 卡内小徽标:`ui/Badge size="sm"` 的薄封装(T-13)。此前是直角 11px、`bg-danger/10` 透明度底的
+ * 私有 Chip,与表头/其它富卡的药丸 Badge 两套并存;tone 现在走设计 token 的 `-soft` 对
+ * (暗色对比度由 token 守卫)。带 href 时整枚可点,外链图标照旧。
+ */
 function Chip({ children, href, tone }: { children: ReactNode; href?: string; tone?: "danger" | "ok" | "muted" }) {
-  const cls = cn(
-    "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]",
-    tone === "danger"
-      ? "bg-danger/10 text-danger"
-      : tone === "ok"
-        ? "bg-success/10 text-success"
-        : "bg-hover text-faint",
-  );
+  const badgeTone = tone === "danger" ? "danger" : tone === "ok" ? "success" : "neutral";
   if (href && isSafeHttpUrl(href)) {
     return (
-      <a className={cn(cls, "hover:underline")} href={href} target="_blank" rel="noreferrer noopener">
-        {children}
-        <ExternalLink className="size-2.5" />
+      <a
+        className="inline-flex rounded-full outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+        href={href}
+        target="_blank"
+        rel="noreferrer noopener"
+      >
+        <Badge tone={badgeTone} size="sm">
+          {children}
+          <ExternalLink className="size-2.5" aria-hidden="true" />
+        </Badge>
       </a>
     );
   }
-  return <span className={cls}>{children}</span>;
+  return (
+    <Badge tone={badgeTone} size="sm">
+      {children}
+    </Badge>
+  );
 }
 
-/** 渐进披露提示:结果被截断、卡片只展示已加载的前若干条时给用户的一行说明。 */
+/** 渐进披露提示:结果被截断、卡片只展示已加载的前若干条时给用户的一行说明。
+ *  时间线里工具卡在前、回答在后 —— 完整结果在**下方**(T-21)。 */
 function PartialNote({ shown }: { shown: number }) {
   return (
     <div className="mt-2 text-caption text-faint">
-      结果较多,卡片仅展示已加载的前 {shown} 条;完整结果见上方回答。
+      结果较多,卡片仅展示已加载的前 {shown} 条;完整结果见下方回答。
     </div>
   );
 }
@@ -816,7 +842,8 @@ function MarketItems({ items }: { items: MarketItem[] }) {
         <button
           type="button"
           onClick={() => setVisible((value) => value + 12)}
-          className="mt-2.5 min-h-8 rounded-full bg-hover px-3 text-xs font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          // 触屏下与其它卡内操作同一 44px 命中标准(T-08);桌面保持 32px 药丸。
+          className="mt-2.5 min-h-8 rounded-full bg-hover px-3 text-xs font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
         >
           查看更多（还有 {items.length - shown} 项）
         </button>
@@ -1027,8 +1054,12 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
       )}
       {body.length > summary.length && (
         <details className="mt-2">
-          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看抽取全文</summary>
-          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+          <summary className={INLINE_SUMMARY_CLS}>查看抽取全文</summary>
+          <pre
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
+            tabIndex={0}
+            className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
             {body}
           </pre>
         </details>
@@ -1059,82 +1090,14 @@ function firstQuotedArg(command: string): string {
   return m ? m[1] : "";
 }
 
-/** 防御:即便工具输出里混入了 `$ command` 回显行,也剥掉首行——卡片内绝不暴露命令本身。 */
-function stripCommandEcho(text: string): string {
-  return text.replace(/^\s*\$ .*(?:\r?\n|$)/, "").replace(/^\s+/, "");
-}
-
-function stripExternalEnvelope(text: string): string {
-  return text
-    .replace(/^\[外部内容开始[^\n]*\]\s*/u, "")
-    .replace(/\s*\[外部内容结束\]\s*$/u, "")
-    .trim();
-}
-
-function normalizePreviewKey(key: string): string {
-  return key.toLowerCase().replaceAll("_", "").replaceAll(" ", "");
-}
-
-/** 严格 Cursor 信封：`{ success: <object>, isBackground?: boolean }`，顶层不得有其它键。 */
-function isCursorShellEnvelope(value: Record<string, unknown>): boolean {
-  if (!isRecord(value.success)) return false;
-  const keys = Object.keys(value);
-  if (keys.some((k) => k !== "success" && k !== "isBackground")) return false;
-  if ("isBackground" in value && typeof value.isBackground !== "boolean") return false;
-  return true;
-}
-
-/** Cursor CLI 把 Bash 结果包成 `{ success: <shell>, isBackground?: boolean }`。渲染前剥掉信封。 */
-function unwrapCursorShellEnvelope(value: Record<string, unknown>): Record<string, unknown> {
-  if (!isCursorShellEnvelope(value)) return value;
-  return value.success as Record<string, unknown>;
-}
-
-/** Cursor Shell 失败结果：{command, exitCode, stderr, stdout, workingDirectory, signal}。 */
-function isShellResultObject(value: Record<string, unknown>): boolean {
-  const keys = new Set(Object.keys(value).map(normalizePreviewKey));
-  return keys.has("command") && (keys.has("exitcode") || keys.has("stderr") || keys.has("stdout"));
-}
-
-function shellResultString(value: Record<string, unknown>, field: "stdout" | "stderr"): string {
-  for (const key of Object.keys(value)) {
-    if (normalizePreviewKey(key) === field && typeof value[key] === "string" && value[key].trim()) {
-      return value[key] as string;
-    }
-  }
-  return "";
-}
+// Cursor shell 信封的识别/解包(isCursorShellEnvelope / cursorCliStreams / stripCommandEcho …)
+// 已收进 ./shellEnvelope.ts 与 ToolCard 状态判定、BashBody 共用一份(T-03),此处只 import。
 
 function shellResultMessage(value: Record<string, unknown>): string {
   const stderr = shellResultString(value, "stderr");
   if (stderr) return stderr;
   const err = value.error;
   return typeof err === "string" ? err : "";
-}
-
-/** 从 stdout / Cursor 信封 / 裸 shell JSON 取出可展示的 CLI 流。
- *  只有严格信封或 `isShellResultObject` 才解包；带 `stdout` 的普通 JSON 当不透明正文。 */
-function cursorCliStreams(raw: string | null): { stdout: string; stderr: string } {
-  if (!raw) return { stdout: "", stderr: "" };
-  const clean = stripExternalEnvelope(stripCommandEcho(raw)).trim();
-  if (!clean) return { stdout: "", stderr: "" };
-  if (clean.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(clean);
-      if (isRecord(parsed)) {
-        const inner = unwrapCursorShellEnvelope(parsed);
-        if (isCursorShellEnvelope(parsed) || isShellResultObject(inner)) {
-          return {
-            stdout: typeof inner.stdout === "string" ? inner.stdout : "",
-            stderr: typeof inner.stderr === "string" ? inner.stderr : "",
-          };
-        }
-      }
-    } catch {
-      /* 文本预览兜底 */
-    }
-  }
-  return { stdout: clean, stderr: "" };
 }
 
 function friendlyOcFailureText(raw: string): string {
@@ -1199,16 +1162,9 @@ function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
         ))}
       </dl>
       {!showAllFields && entries.length > 6 && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowAllFields(true);
-          }}
-          className="mt-1.5 rounded text-xs text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-        >
+        <InlineAction className="mt-1.5" onClick={() => setShowAllFields(true)}>
           还有 {entries.length - 6} 个字段，展开全部
-        </button>
+        </InlineAction>
       )}
     </>
   );
@@ -1222,10 +1178,12 @@ function OutputDetails({ text, label }: { text: string | null; label: string }) 
   if (!clean) return null;
   return (
     <details className="mt-2">
-      <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
-        {label}
-      </summary>
-      <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+      <summary className={INLINE_SUMMARY_CLS}>{label}</summary>
+      <pre
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
+        tabIndex={0}
+        className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
         {slice.shown}
         {slice.truncated ? "\n…" : null}
       </pre>

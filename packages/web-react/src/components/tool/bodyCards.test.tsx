@@ -73,7 +73,9 @@ describe("consult_advisor 卡", () => {
       />,
     );
     expect(screen.getByText(/实际顾问型号 gpt-6-astra/)).toBeInTheDocument();
-    expect(screen.getByText(/状态 failed/)).toBeInTheDocument();
+    // 内部状态词不外露(T-27):failed → 未成功。
+    expect(screen.getByText(/状态 未成功/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/状态 failed/);
     expect(screen.getByText("partial advice")).toBeInTheDocument();
     expect(screen.getByText(/用量未随工具结果返回/)).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/input_tokens["']?\s*[:=]\s*0/);
@@ -142,7 +144,7 @@ describe("TaskBody 隐藏内部指令", () => {
     expect(document.body.textContent).not.toContain("HOME=");
   });
 
-  test("TaskOutput 空 description → 等待后台命令 + 短 id", () => {
+  test("TaskOutput 空 description → 等待后台命令,不外露内部 call-id(T-27)", () => {
     render(
       <ToolBody
         name="TaskOutput"
@@ -153,8 +155,20 @@ describe("TaskBody 隐藏内部指令", () => {
         tool={tool({ output: "" })}
       />,
     );
-    expect(screen.getByText(/等待后台命令/)).toBeInTheDocument();
-    expect(screen.getByText(/call-7fc87448/)).toBeInTheDocument();
+    expect(screen.getByText("等待后台命令")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("call-7fc87448");
     expect(document.body.textContent).not.toContain("运行子任务");
+  });
+
+  test("Task 有输出时展开体不重复表头那句 description(T-20)", () => {
+    render(
+      <ToolBody
+        name="Task"
+        input={{ description: "调研登录流程", prompt: "internal" }}
+        tool={tool({ output: "结论:根因在 reducer" })}
+      />,
+    );
+    expect(screen.getByText("结论:根因在 reducer")).toBeInTheDocument();
+    expect(screen.queryByText("调研登录流程")).not.toBeInTheDocument();
   });
 });

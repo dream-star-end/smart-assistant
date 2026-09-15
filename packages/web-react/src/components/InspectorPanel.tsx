@@ -11,43 +11,87 @@
  *
  * 数据:target.message 持 ChatSocket 就地 mutate 的消息对象引用,App 随 version 重渲
  * 时面板自然读到最新流式内容(运行中的工具在面板里也会边流边更新)。
+ * 状态徽标与卡片共用 {@link resolveToolStatus}(T-05):卡片「受阻/未成功」面板就不会是「完成/已结束」。
  */
 import { Check, Copy, X } from "lucide-react";
-import { useEffect, useState } from "react";
-import { ToolBody } from "./tool/bodies";
-import { ToolBodyFullContext, type ArtifactInspectTarget } from "./tool/context";
-import { normalizeToolForDisplay } from "./tool/format";
-import { resolveToolMeta, toolSummary } from "./tool/meta";
-import { Badge, IconButton, Spinner } from "./ui";
+import { useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
+import { ToolBody } from "./tool/bodies";
+import {
+  ToolBodyFullContext,
+  ToolHeaderLabelContext,
+  type ArtifactInspectTarget,
+} from "./tool/context";
+import {
+  type DisplayTool,
+  asArr,
+  asStr,
+  normalizeToolForDisplay,
+  stripShellWrapperForDisplay,
+} from "./tool/format";
+import { diffLines } from "./tool/lineDiff";
+import { resolveToolMeta, toolSummary } from "./tool/meta";
+import { parseShellEnvelope } from "./tool/shellEnvelope";
+import { resolveToolStatus } from "./tool/status";
+import { toneTileClass } from "./tool/tone";
+import { Badge, IconButton, Spinner, useToast } from "./ui";
 
-const TONE_TILE: Record<string, string> = {
-  accent: "bg-accent-soft text-accent",
-  success: "bg-success-soft text-success",
-  info: "bg-info-soft text-info",
-  warning: "bg-warning-soft text-warning",
-  neutral: "bg-hover text-muted",
-};
+function codexChangesText(input: Record<string, unknown> | null): string {
+  return asArr(input?.changes)
+    .map((c) => (c && typeof c === "object" ? asStr((c as Record<string, unknown>).diff) : ""))
+    .filter(Boolean)
+    .join("\n");
+}
 
-function inspectorCopyText(target: ArtifactInspectTarget): string {
-  const display = normalizeToolForDisplay(target.message);
-  const parts: string[] = [];
-  if (display.name) parts.push(display.name);
-  const summary = toolSummary(display.name, display.input);
-  if (summary) parts.push(summary);
-  const output = display.tool.output;
-  if (typeof output === "string" && output.trim()) parts.push(output);
-  else if (display.input) {
-    try {
-      parts.push(JSON.stringify(display.input, null, 2));
-    } catch {
-      /* ignore */
-    }
+function formattedInput(input: Record<string, unknown> | null): string {
+  if (!input) return "";
+  try {
+    return JSON.stringify(input, null, 2);
+  } catch {
+    return "";
   }
-  return parts.join("\n\n");
+}
+
+/**
+ * 「复制全文」按工具类型取**面板里实际展示的正文**(T-04):
+ *   - Edit → 行级 diff 文本(与面板 DiffView 同源 diffLines);codex apply_patch 形状取 changes[].diff;
+ *   - Write → 文件内容;
+ *   - Bash → `$ 命令` + 输出(Cursor 信封先解成 stdout/stderr,不复制 JSON 外壳);
+ *   - 其余 → output,没有 output 才回退格式化的 input。
+ * 之前一律优先复制 output:Edit/Write 完成后 output 是 "The file has been updated." 这类状态串,
+ * 面板展示的是 diff,复制到的却是一句废话。
+ */
+export function inspectorCopyText(display: DisplayTool): string {
+  const { name, input, tool } = display;
+  const output = typeof tool.output === "string" ? tool.output : "";
+  switch (name) {
+    case "Edit": {
+      const oldStr = asStr(input?.old_string);
+      const newStr = asStr(input?.new_string);
+      if (oldStr || newStr) {
+        return diffLines(oldStr, newStr)
+          .map((row) => `${row.sign}${row.text}`)
+          .join("\n");
+      }
+      return codexChangesText(input) || output || formattedInput(input);
+    }
+    case "Write":
+      return asStr(input?.content) || codexChangesText(input) || output || formattedInput(input);
+    case "Bash": {
+      const command = stripShellWrapperForDisplay(asStr(input?.command));
+      const env = parseShellEnvelope(output);
+      const streams = env
+        ? [env.stdout, env.stderr].filter(Boolean).join(env.stdout && !env.stdout.endsWith("\n") ? "\n" : "")
+        : output || asStr(tool.bashTail?.tail);
+      return [command ? `$ ${command}` : "", streams].filter(Boolean).join("\n");
+    }
+    default:
+      return output.trim() ? output : formattedInput(input);
+  }
 }
 
 function CopyIconButton({ getText }: { getText: () => string }) {
+  const toast = useToast();
   const [done, setDone] = useState(false);
   return (
     <IconButton
@@ -59,9 +103,11 @@ function CopyIconButton({ getText }: { getText: () => string }) {
         try {
           await navigator.clipboard.writeText(getText());
           setDone(true);
+          toast("已复制全文", "success");
           setTimeout(() => setDone(false), 1500);
         } catch {
-          /* clipboard 不可用：静默 */
+          // 剪贴板不可用(非安全上下文 / 权限拒绝):不能再静默,给用户一个出口(T-19)。
+          toast("复制失败，请手动选中文本复制", "error");
         }
       }}
     >
@@ -70,22 +116,24 @@ function CopyIconButton({ getText }: { getText: () => string }) {
   );
 }
 
-/** 面板内容(头 + 全文体)。桌面 aside 与移动 Sheet 共用。 */
+/** 面板内容(头 + 全文体)。桌面 aside 与移动 Sheet 共用。`titleId` 供外层容器 aria-labelledby。 */
 export function InspectorPanelContent({
   target,
   onClose,
+  titleId,
 }: {
   target: ArtifactInspectTarget;
   onClose: () => void;
+  titleId?: string;
 }) {
   const display = normalizeToolForDisplay(target.message);
   const meta = resolveToolMeta(display.name, display.input);
   const Icon = meta.icon;
   const summary = toolSummary(display.name, display.input);
   const tool = display.tool;
-  const completed = !!tool._completed;
-  const hasError = !!tool.error;
-  const isRunning = !completed && !hasError && !tool.cancelled;
+  const status = resolveToolStatus(display);
+  const fallbackTitleId = useId();
+  const headingId = titleId ?? fallbackTitleId;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-surface">
@@ -93,22 +141,23 @@ export function InspectorPanelContent({
         <span
           className={cn(
             "flex size-7 shrink-0 items-center justify-center rounded-lg",
-            TONE_TILE[meta.tone ?? "accent"],
+            toneTileClass(meta.tone),
           )}
         >
           <Icon size={14} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-body font-semibold text-fg">{meta.label}</span>
-            {isRunning ? (
-              <Spinner size={13} className="text-accent" />
-            ) : hasError ? (
-              <Badge tone="neutral">已结束</Badge>
-            ) : tool.cancelled ? (
-              <Badge tone="neutral">已取消</Badge>
+            <h2 id={headingId} className="text-body font-semibold text-fg">
+              {meta.label}
+            </h2>
+            {status.isRunning ? (
+              <>
+                <span className="sr-only">{status.label}</span>
+                <Spinner size={13} className="text-accent" />
+              </>
             ) : (
-              <Badge tone="success">完成</Badge>
+              <Badge tone={status.tone}>{status.label}</Badge>
             )}
           </div>
           {summary && (
@@ -117,11 +166,12 @@ export function InspectorPanelContent({
             </div>
           )}
         </div>
-        <CopyIconButton getText={() => inspectorCopyText(target)} />
+        <CopyIconButton getText={() => inspectorCopyText(normalizeToolForDisplay(target.message))} />
         <IconButton
           aria-label="关闭详情面板"
           size="sm"
           shape="square"
+          data-inspector-close=""
           onClick={onClose}
         >
           <X size={16} />
@@ -129,14 +179,27 @@ export function InspectorPanelContent({
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 [&>*:first-child]:mt-0">
         <ToolBodyFullContext.Provider value={true}>
-          <ToolBody name={display.name} input={display.input} tool={tool} />
+          <ToolHeaderLabelContext.Provider value={meta.label}>
+            <ToolBody name={display.name} input={display.input} tool={tool} />
+          </ToolHeaderLabelContext.Provider>
         </ToolBodyFullContext.Provider>
       </div>
     </div>
   );
 }
 
-/** 桌面第三列:内联 aside(与 Sidebar/main 并列)。Escape 关闭(让位于已消费的弹层)。 */
+function isEditableTarget(node: EventTarget | null): boolean {
+  if (!(node instanceof HTMLElement)) return false;
+  const tag = node.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || node.isContentEditable;
+}
+
+/**
+ * 桌面第三列:内联 aside(与 Sidebar/main 并列)。
+ * 焦点管理(T-24):打开/切换目标时焦点进面板(关闭按钮),卸载时归还到打开它的那个入口;
+ * Escape 关闭 —— 但焦点在输入框/富文本里时不抢(用户按 Esc 多半是取消输入法或清空,不是关面板),
+ * Radix 弹层已消费的 Escape 也让位。
+ */
 export function InspectorPanel({
   target,
   onClose,
@@ -144,21 +207,54 @@ export function InspectorPanel({
   target: ArtifactInspectTarget;
   onClose: () => void;
 }) {
+  const asideRef = useRef<HTMLElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const titleId = useId();
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Radix 弹层(Dialog/Sheet/Popover)处理过的 Escape 会 preventDefault,不抢。
-      if (e.key === "Escape" && !e.defaultPrevented) onClose();
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (isEditableTarget(e.target) && !asideRef.current?.contains(e.target as Node)) return;
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // 每次换目标(点了另一张卡的入口)都记下当时的焦点元素并把焦点移进面板;
+  // 面板整体卸载时把焦点还给最后那个入口。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: target 只作"换了目标"的触发信号,effect 体内不读它
+  useEffect(() => {
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      !asideRef.current?.contains(active)
+    ) {
+      returnFocusRef.current = active;
+    }
+    const raf = requestAnimationFrame(() => {
+      asideRef.current?.querySelector<HTMLElement>("[data-inspector-close]")?.focus();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [target]);
+
+  useEffect(
+    () => () => {
+      const el = returnFocusRef.current;
+      if (el?.isConnected) el.focus();
+    },
+    [],
+  );
+
   return (
     <aside
-      aria-label="产物详情"
+      ref={asideRef}
+      aria-labelledby={titleId}
       className="flex min-h-0 w-[clamp(20rem,36vw,34rem)] shrink-0 flex-col border-l border-border"
     >
-      <InspectorPanelContent target={target} onClose={onClose} />
+      <InspectorPanelContent target={target} onClose={onClose} titleId={titleId} />
     </aside>
   );
 }
