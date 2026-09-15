@@ -1,7 +1,7 @@
 # A·manage 管理中心 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-manage`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（只审计，不改业务代码）
+- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 27 / 修复 22 / 遗留 5）
 - 结论：**P1 × 1 / P2 × 8 / P3 × 18**，共 27 条。P1 是「未绑定聊天项目」作用域下定时任务
   面板把用户的任务表渲染成「还没有定时任务」空态（`cronBlocked` 算出来了却没渲染）。
 - 跨模块另记 3 条（见 §6），其中 `hooks/useProjectScope` 的作用域重置竞态会让持久化 /
@@ -445,3 +445,84 @@ clip 到**第一个** `[role=dialog]`（外层管理中心壳），mobile 下 `m
 4. **M-06 ③**：排除「密钥类技能」改为按标签 / 名称规则判定，规则口径（`key|secret|token|
    account-pool`）需产品确认，或改由后端在 `SkillSummary` 上下发 `sensitive: true`。
 5. **X-01**：是否本轮由 sidebar-B 修（影响所有带作用域的面板，manage 三个 Tab 都受益）。
+
+---
+
+## 7. 修复记录（阶段 B）
+
+- 分支：`feat/v5-selfhost-audit-manage`（阶段 A 基线 `43a6d52f`）
+- 执行：fable-5-1-20 完成 M-01/02/04/05/06/08/11/13/14/15/16/25/26 及 M-03/07/12/24 的一部分后掉线；
+  fable-5-1-22 接手补齐其余项、修通测试、出 after 截图、归档。
+- 统计：发现 27 / 修复 22（含 2 条部分修复）/ 遗留 5（4 条落在 settings 归属文件，1 条需后端）。
+- 附录 5 件拍板事项的落地口径：① M-01 维持 P1，修法同计划；② ConnectorsTab 四处**未动**（见 §9）；
+  ③ M-23 取「窄屏补待办提示行」方案，**不**恢复 3×2 宫格；④ M-06 ③ 密钥类判定按规则
+  `isSecretSkill`（名称分段 key/secret/token/credential/password/account-pool 或标签 密钥/凭据/secret/credential），
+  后端 `sensitive:true` 记为需后端配合；⑤ X-01 未在本模块动，测试里用聊天项目 token 绕开。
+
+| 编号 | 状态 | 改动（`packages/web-react/src/` 下） | 用例 |
+|---|---|---|---|
+| M-01 | ✅ | `manage/CronPanel.tsx`：`cronBlocked` 成为首选渲染分支 —— `EmptyState`「这个会话组没有绑定工作项目」+「查看全部项目的定时任务」（`setToken("all")`）；该分支下不发 `listCron`、`commitJobs(null)`、隐藏「新建」。 | `CronPanel.test` 「未绑定聊天项目作用域」（断言不调 `listCron`、无「创建第一个」、出口可切回） |
+| M-02 | ✅ | `manage/MemoryPanel.tsx` 用量分区 8 处：`text-body-sm→text-body`、`text-foreground→text-fg`、`bg-surface-subtle→bg-hover`、`text-lg→text-title tabular-nums`。 | `MemoryPanel.test` 「统计卡与表头走设计系统档位」（`innerHTML` 不含三个类名） |
+| M-03 | ✅ | `MemoryUsageSection`（`err` 时只渲染带「重试」的 Alert，不渲染空态）、`ProjectMemorySection`（`loadErr` 取代 toast，Alert + 重试）、`manage/AgentProjectPreview.tsx`（同款 `err` + 重试，不再 toast）。 | `MemoryPanel.test` ×2（用量 / 项目记忆）、`AgentProjectPreview.test` 「读失败渲染带重试的错误条」 |
+| M-04 | ✅ | `manage/IdentityManual.tsx`：读失败改为一行 `Badge`「本实例运行手册」+ 原因 + 行内「重试」（可访问名「重试读取本实例运行手册」，与核心记忆的「重试」分得开）；整块移到核心记忆分区之后（随 M-24）。 | `IdentityManual.test` 「registration read failure degrades to a one-line notice…」（无 `role=alert`、DOM 顺序在页签之后、重试再发一次 `/api/agents`） |
+| M-05 | ✅ | `manage/SkillEditor.tsx`：`writable=false` 时描述用 `<p>`，正文 / 辅助文件用 `ReadOnlyText`（`<section tabIndex=0 aria-label>` + `<pre>`，`bg-code`，可聚焦 / 可选中 / 可滚）。 | `SkillEditor.test` 「只读技能的正文 / 辅助文件以可聚焦的只读文本呈现」 |
+| M-06 | ✅ | `manage/ProjectSkillOverlay.tsx` 重写：非工作作用域不渲染；默认折叠为一行摘要（名称 + 「已启用 N」）；`Switch` + `<label htmlFor>`；每行展示名 + slug caption + 适用；密钥类 `Badge`「密钥类，不可用于项目」并禁用；脏态（与服务端快照比对）无差异时保存禁用；保存失败留在块内 Alert + 「重新读取」；`manage/skillDisplay.ts` 新增 `isSecretSkill`。 | `ProjectSkillOverlay.test` ×6、`skillDisplay.test` `isSecretSkill` ×2 |
+| M-07 | ✅ | `manage/AgentProjectPreview.tsx`（标题「智能体会带着这些项目信息开始对话」、hint、槽名映射 `slotLabel`、`formatBytes`、「这个项目还没有会注入的内容」「该项目关闭了上下文注入」）、`manage/ProjectAssetsManagePanel.tsx`（hint、未绑定空态）、`CronPanel.tsx` 项目 hint 两句。 | `AgentProjectPreview.test` 「不含 API 路径 / 槽名 / 裸字节数」、`ProjectAssetsManagePanel.test` ×2 |
+| M-08 | ✅ | `manage/SkillsPanel.tsx` 行头：容器 `flex-wrap`；标题按钮 `flex-1 basis-48` 独占主宽度；来源徽章 / 只读锁 / slug 降到标题下第二行；编辑 / 删除簇 `max-sm:basis-full max-sm:justify-end`。 | `SkillsPanel.test` 「编辑 / 删除动作簇在窄屏整行换到行头下方」 |
+| M-09 | ⏸ | **遗留**：`components/settings/ConnectorsTab.tsx` 归 settings（settings-B 待领、无 owner），按 PLAYBOOK §8 不越界；修法见 §4，已 `send_to` 指挥官。 | — |
+| M-10 | ✅ | `manage/SkillOptPanel.tsx` `discard`：`discardSkillTrainRun` 失败 → `setErr(放弃失败)` 且**不清**本地 run；成功才清并 toast。 | `SkillOptPanel.test` 「放弃训练草稿:服务端失败时 run 原样留着并报错」 |
+| M-11 | ✅ | `ProjectMemorySection`：`busyId` → 采纳 `loading` / 两键 `disabled`，成功 toast「已采纳 / 已忽略」。 | `MemoryPanel.test` 「采纳 / 忽略在请求在途时进忙态」 |
+| M-12 | ◐ | 全角化：`SkillEditor.tsx` 全部、`SkillsPanel.tsx` 全部、`LibraryPanel.tsx` 3 处、`SkillOptPanel.tsx` 清单所列 7 处 + 放弃确认标题。**遗留**：`SkillOptPanel.tsx` 其余成本确认 / 提示文案约 40 处（该文件既有风格，宜单独一条 `style(v5)` 提交）；`ConnectorsTab.tsx`（settings）。 | 既有 `getByText` 精确匹配用例同步（`SkillEditor.test` / `SkillsPanel.test` / `SkillOptPanel.test`） |
+| M-13 | ✅ | `SkillsPanel.remove(sk)` 确认框标题用展示名、正文「技能标识 slug」；`SkillEditor` 新增 `displayTitle` prop → 标题「技能工作台 · 展示名」。 | `SkillsPanel.test` 「删除确认与工作台标题都用列表同款展示名」、`SkillEditor.test` 「标题用列表同款展示名」 |
+| M-14 | ✅ | 标签改 `#tag` 弱化文字（与「适用」芯片不同形）；`+N` 变按钮可展开 / 收起，去掉 `title`。 | `SkillsPanel.test` 「标签以 # 弱化文字呈现」 |
+| M-15 | ✅ | `NextRunMeta` 精确时刻直接可见（`（MM-DD HH:mm）`），去 `title`；已翻译排程的 Tooltip 触发器 `tabIndex=0` + `aria-label` 含 cron 原串。 | `CronPanel.test` 「已翻译排程的触发器可聚焦且可访问名含 cron 原串」 |
+| M-16 | ✅ | `datetime-local` 加 `min`（`localDateTimeMin()`）；`heartbeat` 行加 `Badge`「心跳探针」。 | `CronPanel.test` 同上 + 「日期时间控件带 min」 |
+| M-17 | ◐ | `manage/LibraryPanel.tsx`：`matchesLibraryQuery`（标题 / 文档 ID 前缀 / 语言标签或代码）；无标题显示「（无标题文档）」；每行「文档 ID」`CopyChip`（8 位前缀，复制完整值）；搜索占位更新。**导出 / 详情**仍需后端（§5）。 | `LibraryPanel.test` ×3 |
+| M-18 / M-20 / M-21 | ⏸ | **遗留**：同 M-09，`ConnectorsTab.tsx` 归 settings。 | — |
+| M-19 | ✅ | `lib/connectors.ts`：`UPSTREAM_FAILED` / `CONNECTION_ERROR` / `EXECUTION_FAILED` / `LOGIN_EXPIRED_ACCOUNT` 四个通用码去掉「微博」，微博措辞只留 `WEIBO_*`。 | 新建 `lib/connectors.test.ts` ×3 |
+| M-22 | ✅ | `manage/OptimizationPanel.tsx`：弹层 `description` 只放分类中文名，`targetId` 收进正文「作用对象：」caption；「审计分片」→「批次」；空态「立即审计」降为 `secondary`。 | `OptimizationPanel.test` ×2 |
+| M-23 | ✅ | `ManageCenter.tsx`：`optimizerPendingCount > 0 && tab !== "optimization"` 时在 Tab 条下补一行可点的「有 N 项优化建议待确认 →」（`md:hidden`，点击切到「优化」）。不动 `ui/Tabs`，不恢复宫格。 | `ManageCenter.test` 「窄屏下有待确认建议时补一行可点的待办提示」 |
+| M-24 | ✅ | `IdentityManual` 移到核心记忆分区之后；「项目资产」「智能体项目上下文预览」移入「项目记忆」页签（`MemoryPanel`），`ManageCenter` 不再在面板外追加。 | `IdentityManual.test`（DOM 顺序）、`MemoryPanel.test` 「项目页签含项目资产」 |
+| M-25 | ✅ | 用户画像 `chars` / `overLimit` 同用 `norm(text).length`。 | `MemoryPanel.test` 「计数与超限判定同一口径」 |
+| M-26 | ✅ | 打开工作台时并行拉 `getSkillHistory`，「历史（N）」首屏即带 N；加载期正文 label 不带 `v?`。 | `SkillEditor.test` 「历史页签计数在打开时就带上」 |
+| M-27 | ✅ | 「✗错」→「出错」；多份草稿 Tabs `layout="scroll"`。 | —（视觉项） |
+
+计划外顺手项：`AgentProjectPreview` 新增 `slotLabel()`、`LibraryPanel` 新增 `shortDocId()` 纯函数（均有用例）；
+`ProjectSkillOverlay` 的加载失败也改为块内 Alert + 重试（原为 toast）。
+
+ui-preview 新增场景 `manage-skills-workscope-open`（把折叠后的项目专属技能块点开，看 after 形态）。
+
+## 8. 验证（阶段 B）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0） |
+| 模块单测 | `npx vitest run src/components/manage src/components/ManageCenter.test.tsx src/lib/connectors.test.ts --maxWorkers=1` | ✅ 14 个文件 / 153 例全绿（阶段 A 基线 127 例，新增 26 例） |
+| 全量 web-react 单测 | `npm test`（`vitest run --maxWorkers=1`） | ✅ 见下方「全量」一行 |
+| 代码风格 | `npx biome check <新建 / 重写的 7 个文件>` | ✅ 绿；既有 manage 文件（含阶段 A 之前）本就不过 biome 格式检查（双引号 + 分号 / 依赖数组），本轮不做整文件格式化，未新增 lint 诊断（`LibraryPanel` 一处 `useOptionalChain` 已改） |
+| 视觉 after | `OC_UI_SCENES=manage-` `node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\manage\after\` | ✅ 49 场景 × 视口 × 主题 = 136 张，`manifest.json` `failures: 0`、`retried: 0`（`unmockedApi` 同阶段 A：`listCronChannels` / `listProjectAssets`） |
+
+全量：`npm test` —— 见提交信息与交付摘要（结果在本节末尾追加）。
+
+after 对照（同名 PNG，`before/` ↔ `after/`）：
+
+- `manage-cron-chatscope--desktop--light` —— 「还没有定时任务 / 创建第一个」假空态 → 「这个会话组没有绑定工作项目」+ 切作用域出口，无「新建」。
+- `manage-memory-usage--desktop--light` —— 标题 / 表头字号回到 13px 档，四张统计卡有底色。
+- `manage-memory--desktop--light` —— 首屏不再是整宽橙色告警；本实例手册在核心记忆列表之后一行。
+- `manage-skill-workbench-readonly--desktop--light` —— 正文由 50% 透明 disabled 控件 → 正常对比度只读块，标题「技能工作台 · …」。
+- `manage-skills-workscope--desktop--light` / `manage-skills-workscope-open--*` —— 首屏还给搜索框与列表；展开后 Switch + 展示名 + slug + 「密钥类，不可用于项目」徽章，保存禁用直到有改动。
+- `manage-memory-workscope-appendix--*` / `manage-memory-workscope-project--*` —— 文案不再含 `/api/project-assets` / `digest` / `facade` / `preview API` / `instructions · 1240B`；两块面板进「项目记忆」页签。
+- `manage-skills-mobile--mobile--light` —— 390px 下标题两行完整可读，动作簇换行到行头下方。
+- `manage-optimization-diff--*` —— 弹层副标题只剩「记忆」，`memory/xhs-…md` 收进「作用对象」行。
+
+**NOT RUN**：`npm run test:browser`（本轮未触碰 Composer / 消息 / 工具卡 / 侧栏交互面）；真机 iOS Safari；真实 OAuth 回跳。
+
+## 9. 遗留
+
+| 项 | 归属 / 原因 | 建议 |
+|---|---|---|
+| M-09（P2）、M-18 / M-20 / M-21（P3） | `components/settings/ConnectorsTab.tsx` 归 settings；settings-B 待领 | 修法已写在 §4（各 1–5 行），交 settings-B 顺手改，或授权 manage 拿锁改 |
+| M-12 余量 | `SkillOptPanel.tsx` 其余 ~40 处半角标点为该文件既有风格 | 单独一条 `style(v5): manage SkillOptPanel 标点全角化` 提交，避免混进逻辑改动 |
+| M-17 导出 / 详情 | 需后端单文档接口与作者 / 年份元数据 | 记入「需后端配合」 |
+| X-01 | `hooks/useProjectScope.tsx` 作用域重置竞态，sidebar 归属 | 待 sidebar-B；本轮 4 个测试文件用聊天项目 token / 直接给定作用域绕开 |
+| M-06 ③ 后端口径 | `SkillSummary.sensitive` 下发 | 需后端配合；前端规则先兜底 |

@@ -1292,6 +1292,29 @@ export const manageAuditScenes: Scene[] = [
     render: () => scoped(CHAT_BOUND.id, [CHAT_BOUND], BOARD_WORK, shell('skills')),
   },
   {
+    // B 阶段（M-06）后该块默认折叠成一行摘要；这条把它点开，看清单的 after 形态。
+    id: 'manage-skills-workscope-open',
+    label: '技能 · 工作项目作用域（项目专属技能块展开：Switch + 展示名 + 密钥类徽章）',
+    group: '管理中心',
+    viewports: ['desktop', 'mobile'],
+    api: {
+      ...skillBase,
+      listSkills: ok(SKILLS_FOR_OVERLAY),
+      getSkillEvals: ok({ evals: { version: 1, cases: [] }, writable: true, lastRun: null }),
+    },
+    render: () =>
+      scoped(
+        CHAT_BOUND.id,
+        [CHAT_BOUND],
+        BOARD_WORK,
+        <AutoClick
+          steps={[{ selector: '[data-testid="project-skill-overlay-toggle"]', delay: 420 }]}
+        >
+          {shell('skills')}
+        </AutoClick>,
+      ),
+  },
+  {
     id: 'manage-memory-workscope',
     label:
       '记忆 · 工作项目作用域（追加项目资产 + Agent 项目上下文预览；核心记忆置空好让追加块进视口）',
