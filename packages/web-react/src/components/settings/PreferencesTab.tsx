@@ -1,5 +1,5 @@
 import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun } from 'lucide-react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
@@ -18,7 +18,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from '../LongContextCostWarning'
-import { Alert, Button, Modal, Switch, useConfirm } from '../ui'
+import { Alert, Button, Modal, Select, Switch, useConfirm } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 
@@ -36,20 +36,27 @@ const uiToServerTheme = (t: Theme): 'light' | 'dark' | 'auto' => (t === 'system'
 // binding/inbound/outbound/proactive 全链缺席,推送尝试被 master 404 静默回退 webchat。
 // 在 v5 微信通道接通前(roadmap P1.2 专项决策)不渲染这两个开关,避免 UI 承诺做不到的事。
 // 偏好字段本身保留(preferences.ts allowlist),将来通道接通再放回渲染。
+//
+// Telegram 同理(审计 SET-05):后端只有管理员告警通道(admin/alertChannels),用户侧没有任何
+// 绑定入口,`notify_telegram` 打开也不会有消息送达 —— 通道接通并有绑定流程前不渲染。
 const NOTIF_FIELDS: { key: keyof PrefsView; label: string; hint?: string }[] = [
-  { key: 'notify_email', label: '邮件通知' },
-  { key: 'notify_telegram', label: 'Telegram 通知' },
+  { key: 'notify_email', label: '邮件通知', hint: '支付到账、订阅到期等重要事件发送到账号邮箱' },
 ]
 
-function isMacPlatform(): boolean {
+export function isMacPlatform(): boolean {
   if (typeof navigator === 'undefined') return false
   return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent)
 }
 
+/** 修饰键按平台显示:macOS / iOS 为 ⌘,其余为 Ctrl(发送键选项与快捷键表共用)。 */
+export function modifierKeyLabel(): string {
+  return isMacPlatform() ? '⌘' : 'Ctrl'
+}
+
 /**
  * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
- * 通知开关。快捷键已拆到独立导航（pane="hotkeys"），展示内置只读说明。
- * 最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
+ * 通知开关。快捷键是独立导航，由 SettingsCenter 直接渲染 `BuiltinHotkeysTable`
+ * （不经过本组件，也不依赖 prefs）。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
  * 主题权威源仍是 useTheme（live + localStorage）；这里只在用户切换时写穿一份到
@@ -65,7 +72,6 @@ export function PreferencesTab({
   onPatch,
   onUpgrade,
   onOpenMemory,
-  pane = 'preferences',
 }: {
   auth: AuthSession
   prefs: PrefsView
@@ -76,8 +82,6 @@ export function PreferencesTab({
   onPatch: (patch: Record<string, unknown>) => Promise<void>
   onUpgrade: () => void
   onOpenMemory: () => void
-  /** 快捷键从偏好拆到独立导航；hotkeys 仍读同一份 prefs。 */
-  pane?: 'preferences' | 'hotkeys'
 }) {
   const [models, setModels] = useState<PublicModel[]>([])
   const [err, setErr] = useState<string | null>(null)
@@ -90,8 +94,9 @@ export function PreferencesTab({
     let alive = true
     api
       .getPublicModels(auth)
-      .then(({ models: m }) => {
-        if (alive) setModels(m)
+      .then((res) => {
+        // 返回体缺 models(旧网关 / 桩)时退化为空列表,而不是让下面的 find 把整页打崩。
+        if (alive) setModels(Array.isArray(res?.models) ? res.models : [])
       })
       .catch(() => {
         /* 模型列表拉取失败不致命：default_model 退化为只读展示当前值 */
@@ -137,10 +142,20 @@ export function PreferencesTab({
     prefs.default_effort && supportedEfforts.includes(prefs.default_effort)
       ? prefs.default_effort
       : ''
-
-  if (pane === 'hotkeys') {
-    return <BuiltinHotkeysTable />
-  }
+  const effortDisabled = models.length > 0 && effortOptions.length === 0
+  const modelOptions = [
+    { value: '', label: '跟随智能体默认' },
+    // 当前值不在可选列表里时（如已下架）仍补一条，避免显示错位
+    ...(prefs.default_model && !models.some((m) => m.id === prefs.default_model)
+      ? [{ value: prefs.default_model, label: prefs.default_model }]
+      : []),
+    ...models.map((m) => ({ value: m.id, label: modelLabel(m) })),
+  ]
+  const effortSelectOptions = [
+    { value: '', label: effortDisabled ? '当前模型不支持' : '跟随模型默认' },
+    ...effortOptions.map((o) => ({ value: o.value, label: o.label })),
+  ]
+  const mod = modifierKeyLabel()
 
   return (
     <div className="flex flex-col">
@@ -182,42 +197,31 @@ export function PreferencesTab({
         <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           对话默认
         </div>
+        {/* 下拉统一走 ui/Select(与 API 接入页同源),不再自绘一套原生 select(审计 SET-21)。 */}
         <label className="flex items-center justify-between gap-3 py-1.5">
           <span className="text-section text-fg">默认模型</span>
           <Select
+            aria-label="默认模型"
+            inputSize="sm"
+            className="w-auto max-w-[55%]"
             value={prefs.default_model ?? ''}
-            onChange={(v) => {
+            onValueChange={(v) => {
               void changeDefaultModel(v)
             }}
-          >
-            <option value="">跟随智能体默认</option>
-            {/* 当前值不在可选列表里时（如已下架）仍补一条，避免显示错位 */}
-            {prefs.default_model && !models.some((m) => m.id === prefs.default_model) && (
-              <option value={prefs.default_model}>{prefs.default_model}</option>
-            )}
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {modelLabel(m)}
-              </option>
-            ))}
-          </Select>
+            options={modelOptions}
+          />
         </label>
         <label className="flex items-center justify-between gap-3 py-1.5">
           <span className="text-section text-fg">思考深度</span>
           <Select
+            aria-label="思考深度"
+            inputSize="sm"
+            className="w-auto max-w-[55%]"
             value={selectedEffort}
-            onChange={(v) => patch({ default_effort: v === '' ? null : v })}
-            disabled={models.length > 0 && effortOptions.length === 0}
-          >
-            <option value="">
-              {models.length > 0 && effortOptions.length === 0 ? '当前模型不支持' : '跟随模型默认'}
-            </option>
-            {effortOptions.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </Select>
+            onValueChange={(v) => patch({ default_effort: v === '' ? null : v })}
+            disabled={effortDisabled}
+            options={effortSelectOptions}
+          />
         </label>
       </div>
 
@@ -232,7 +236,8 @@ export function PreferencesTab({
           {(
             [
               { value: 'enter' as const, label: 'Enter 发送' },
-              { value: 'mod-enter' as const, label: '⌘+Enter 发送' },
+              // 修饰键随平台(审计 SET-20):Windows / Linux 用户看到的是 Ctrl,不是 ⌘。
+              { value: 'mod-enter' as const, label: `${mod}+Enter 发送` },
             ] as const
           ).map((o) => (
             <button
@@ -439,8 +444,9 @@ export function PreferencesTab({
   )
 }
 
-function BuiltinHotkeysTable() {
-  const mod = isMacPlatform() ? '⌘' : 'Ctrl'
+/** 内置快捷键只读表。由 SettingsCenter 的「快捷键」分区直接渲染,不依赖 prefs / 模型列表。 */
+export function BuiltinHotkeysTable() {
+  const mod = modifierKeyLabel()
   const rows: Array<{ keys: string; action: string }> = [
     { keys: `${mod}+K`, action: '搜索会话' },
     { keys: `${mod}+Shift+O`, action: '新建会话' },
@@ -472,28 +478,4 @@ function BuiltinHotkeysTable() {
 function modelLabel(m: PublicModel): string {
   const raw = (m as Record<string, unknown>).label ?? (m as Record<string, unknown>).name
   return typeof raw === 'string' && raw.length > 0 ? raw : m.id
-}
-
-/** 轻量原生 select（无 Select 原语；统一 token 化样式，可访问）。 */
-function Select({
-  value,
-  onChange,
-  children,
-  disabled,
-}: {
-  value: string
-  onChange: (v: string) => void
-  children: ReactNode
-  disabled?: boolean
-}) {
-  return (
-    <select
-      value={value}
-      disabled={disabled}
-      onChange={(e) => onChange(e.target.value)}
-      className="max-w-[55%] rounded-lg border border-border bg-bg px-2.5 py-1.5 text-body text-fg outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-    >
-      {children}
-    </select>
-  )
 }

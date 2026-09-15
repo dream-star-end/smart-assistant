@@ -14,8 +14,9 @@ const preferencesProps = vi.hoisted(() => vi.fn())
 vi.mock('./settings/PreferencesTab', () => ({
   PreferencesTab: (props: unknown) => {
     preferencesProps(props)
-    return <div>{(props as { pane?: string }).pane === 'hotkeys' ? '快捷键页' : '偏好页'}</div>
+    return <div>偏好页</div>
   },
+  BuiltinHotkeysTable: () => <div>快捷键页</div>,
 }))
 vi.mock('./settings/SubscriptionDialog', () => ({ SubscriptionDialog: () => null }))
 vi.mock('./settings/ApiAccessTab', () => ({ ApiAccessTab: () => <div>API 接入页</div> }))
@@ -83,7 +84,8 @@ test('关于分区说明使用 text-caption text-faint，标题保持 text-title
 
 test.each([
   ['preferences', '偏好', '偏好页'],
-  ['account', '账户与计费', '账户页'],
+  // 窄屏（本文件默认视口）账户分区渲染短名「账户」
+  ['account', '账户', '账户页'],
   ['feedback', '反馈', null],
 ] as const)('教程深链 settings.section=%s 打开对应分区', async (section, tabName, panel) => {
   expect(PRODUCT_CAPABILITIES.preferences.destination).toEqual({
@@ -139,22 +141,63 @@ test('设置中心不再有 GitHub / 插件分区，未知 section 回落账户'
   expect(screen.queryByRole('tab', { name: '插件' })).not.toBeInTheDocument()
   expect(screen.queryByRole('button', { name: '绑定/更换仓库' })).not.toBeInTheDocument()
   expect(screen.queryByRole('button', { name: '打开插件' })).not.toBeInTheDocument()
-  expect(screen.getByRole('tab', { name: '账户与计费' })).toHaveAttribute('aria-selected', 'true')
+  // 窄屏宫格里账户分区用短名「账户」（审计 SET-12：长标签会被列宽截断）
+  expect(screen.getByRole('tab', { name: '账户' })).toHaveAttribute('aria-selected', 'true')
   expect(screen.getByText('账户页')).toBeInTheDocument()
 })
 
-test('快捷键分区仍拉同一份 prefs', async () => {
-  vi.spyOn(api, 'getPreferences').mockResolvedValue({ prefs: {} } as never)
+test('窄屏宫格:6 项三列、admin 的 7 项改四列，账户用短名不截断（审计 SET-12）', () => {
+  const plain = render(<SettingsCenter {...base} />)
+  const list6 = screen.getByRole('tablist', { name: '设置分区' })
+  expect(list6).toHaveClass('grid-cols-3')
+  expect(list6).not.toHaveClass('grid-cols-4')
+  expect(screen.getByRole('tab', { name: '账户' })).toBeInTheDocument()
+  expect(screen.queryByRole('tab', { name: '账户与计费' })).not.toBeInTheDocument()
+  plain.unmount()
+
+  render(
+    <SettingsCenter
+      {...base}
+      user={{ id: '2', displayName: '管理员', roles: ['admin'], role: 'admin' }}
+    />,
+  )
+  expect(screen.getByRole('tablist', { name: '设置分区' })).toHaveClass('grid-cols-4')
+  expect(screen.getAllByRole('tab').length).toBe(7)
+})
+
+test('快捷键分区是静态表:不拉 prefs,偏好接口故障也照常渲染', async () => {
+  // 审计 SET-02:此前快捷键复用偏好页的加载链,接口失败时整页只剩「加载偏好失败」。
+  vi.spyOn(api, 'getPreferences').mockRejectedValue(new Error('backend unavailable'))
+  vi.spyOn(api, 'getPublicModels').mockRejectedValue(new Error('backend unavailable'))
   render(<SettingsCenter {...base} initialSection="hotkeys" />)
   expect(await screen.findByText('快捷键页')).toBeInTheDocument()
-  expect(api.getPreferences).toHaveBeenCalled()
+  expect(screen.queryByText('加载偏好失败')).not.toBeInTheDocument()
+  expect(api.getPreferences).not.toHaveBeenCalled()
+  expect(api.getPublicModels).not.toHaveBeenCalled()
+  expect(preferencesProps).not.toHaveBeenCalled()
+})
+
+test('关于页显示构建号与法务入口', () => {
+  const meta = document.createElement('meta')
+  meta.setAttribute('name', 'oc-build')
+  meta.setAttribute('content', 'build-2026.09.15-abc')
+  document.head.appendChild(meta)
+  try {
+    render(<SettingsCenter {...base} initialSection="about" />)
+    expect(screen.getByTestId('about-build')).toHaveTextContent('build-2026.09.15-abc')
+    // 术语与落地页 / 登录页一致：「用户协议」而非「服务条款」
+    expect(screen.getByRole('link', { name: '用户协议' })).toHaveAttribute('href', '/terms')
+    expect(screen.getByRole('link', { name: '隐私政策' })).toHaveAttribute('href', '/privacy')
+  } finally {
+    meta.remove()
+  }
 })
 
 test('「API 接入」分区只对 admin 可见;普通用户深链回落账户页', async () => {
   const first = render(<SettingsCenter {...base} initialSection="api-access" />)
   expect(screen.queryByRole('tab', { name: 'API 接入' })).not.toBeInTheDocument()
   expect(screen.queryByText('API 接入页')).not.toBeInTheDocument()
-  expect(screen.getByRole('tab', { name: '账户与计费' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('tab', { name: '账户' })).toHaveAttribute('aria-selected', 'true')
   expect(screen.getByText('账户页')).toBeInTheDocument()
   first.unmount()
 
