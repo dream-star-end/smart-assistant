@@ -73,7 +73,9 @@ describe("ProjectAssetsPanel", () => {
     renderPanel({ list: [] });
     await waitFor(() => expect(screen.getByText("还没有资产")).toBeTruthy());
     expect(screen.getByText(/设为项目知识的资料/)).toBeTruthy();
-    expect(screen.getByText("已注入 0/20")).toBeTruthy();
+    // PA-01：用户语境用「项目知识」，不再露出实现术语「注入」。
+    expect(screen.getByText("项目知识 0/20")).toBeTruthy();
+    expect(screen.queryByText(/注入/)).toBeNull();
   });
 
   test("加载态", async () => {
@@ -124,8 +126,8 @@ describe("ProjectAssetsPanel", () => {
     await waitFor(() => expect(screen.getByText("brief.md")).toBeTruthy());
     const names = [...document.querySelectorAll("[data-asset-id] .truncate")].map((el) => el.textContent);
     expect(names[0]).toBe("brief.md");
-    expect(screen.getByText("已注入")).toBeTruthy();
-    expect(screen.getByText("已注入 1/20")).toBeTruthy();
+    expect(screen.getByText("项目知识")).toBeTruthy();
+    expect(screen.getByText("项目知识 1/20")).toBeTruthy();
     expect(screen.getAllByText("上传").length).toBeGreaterThan(0);
     expect(screen.getByText("产出")).toBeTruthy();
     expect(screen.getByText("2 KB")).toBeTruthy();

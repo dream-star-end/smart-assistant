@@ -28,6 +28,7 @@ import {
   EmptyState,
   IconButton,
   ListSkeleton,
+  Spinner,
   Switch,
   TimeAgo,
   useConfirm,
@@ -76,16 +77,17 @@ export function ProjectAssetsPanel(props: {
       {confirmEl}
       {promptEl}
 
+      {/* 「注入」是实现术语，用户语境是「项目知识 / 已启用」（PA-01）。 */}
       <p className="text-meta text-muted">
-        设为项目知识的资料，其索引会注入该项目下所有会话。
+        设为项目知识的资料，会作为该项目下所有会话的共享背景知识。
       </p>
 
       <div className="flex flex-wrap items-center gap-2 text-meta">
         <span className="tabular-nums text-fg">
-          已注入 {injected}/{PINNED_INJECT_LIMIT}
+          项目知识 {injected}/{PINNED_INJECT_LIMIT}
         </span>
         {pinnedCount > PINNED_INJECT_LIMIT ? (
-          <span className="text-warning">超过 {PINNED_INJECT_LIMIT} 条时只注入前 {PINNED_INJECT_LIMIT} 条</span>
+          <span className="text-warning">超过 {PINNED_INJECT_LIMIT} 条时只启用前 {PINNED_INJECT_LIMIT} 条</span>
         ) : null}
       </div>
 
@@ -243,7 +245,7 @@ function AssetRow({
             </Badge>
             {asset.pinned ? (
               <Badge size="sm" tone="accent">
-                <Pin size={10} /> 已注入
+                <Pin size={10} /> 项目知识
               </Badge>
             ) : null}
           </div>
@@ -337,9 +339,18 @@ function DownloadControl({
   className?: string;
 }) {
   if (state === "downloading") {
+    // 下载中用 Spinner 而不是文字「…」：后者没有动效，看起来像卡住（PA-02）。
     return (
-      <IconButton aria-label="取消下载" variant="muted" size="sm" shape="square" className={className} onClick={onCancel}>
-        <span className="text-caption">…</span>
+      <IconButton
+        aria-label="取消下载"
+        title="下载中，点击取消"
+        variant="muted"
+        size="sm"
+        shape="square"
+        className={className}
+        onClick={onCancel}
+      >
+        <Spinner size={14} />
       </IconButton>
     );
   }

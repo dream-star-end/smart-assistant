@@ -162,6 +162,55 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  // PS-01：切换看板项目此前直接 setInstructions 覆盖用户已输入的指令（数据丢失）。
+  describe("切换看板项目时的指令回填", () => {
+    const boardId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    function mockBoard(instructions: string) {
+      vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+        { id: boardId, key: "B", name: "Board" } as never,
+      ]);
+      vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 2, instructions });
+    }
+
+    test("已有不同内容 → 不覆盖，先问；「保留当前内容」原文不动", async () => {
+      mockBoard("from-project-md");
+      renderDialog();
+      await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
+      fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
+      const ask = await screen.findByText(/所选看板项目自带的指令与当前内容不同/);
+      expect(ask).toBeTruthy();
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("用中文回答");
+      fireEvent.click(screen.getByRole("button", { name: "保留当前内容" }));
+      expect(screen.queryByText(/所选看板项目自带的指令与当前内容不同/)).toBeNull();
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("用中文回答");
+    });
+
+    test("「用看板指令覆盖」才替换文本域", async () => {
+      mockBoard("from-project-md");
+      renderDialog();
+      await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
+      fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
+      fireEvent.click(await screen.findByRole("button", { name: "用看板指令覆盖" }));
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md");
+      expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
+    });
+
+    test("文本域为空时直接回填，不打扰", async () => {
+      mockBoard("from-project-md");
+      renderDialog({ project: { ...project, instructions: "" } });
+      await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
+      fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
+      await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md"));
+      expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
+    });
+  });
+
+  test("字数计数与标签同行，不再被 footer 遮住（PS-06）", () => {
+    renderDialog();
+    const counter = screen.getByText("5 / 4000");
+    expect(counter.closest("label")).not.toBeNull();
+  });
+
   test("看板列表加载失败：提示+重试，下拉禁用，保存仍可用", async () => {
     vi.spyOn(taskboardApi, "listProjects").mockRejectedValue(new Error("board down"));
     const { onSave } = renderDialog();

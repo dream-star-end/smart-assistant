@@ -1,7 +1,7 @@
 import { Check, GitBranch, Lock, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import { githubErrorText } from "../../lib/github";
+import { describeGithubScopes, githubErrorText } from "../../lib/github";
 import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import type {
   AuthSession,
@@ -242,6 +242,10 @@ export function GithubRepoModal({
     return repos.filter((r) => r.full_name.toLowerCase().includes(q));
   }, [repos, search]);
 
+  // 草稿态（尚未发送首条消息、没有 sessionId）：确认按钮禁用此前无任何提示（GH-02）。
+  const draftNoSession = !sessionId;
+  const draftHint = "先发送一条消息创建会话，再绑定仓库";
+
   return (
     <Modal
       open={open}
@@ -252,9 +256,9 @@ export function GithubRepoModal({
       data-product-feature={PRODUCT_CAPABILITIES.github.id}
       bodyClassName="flex min-h-0 flex-col overflow-hidden p-0"
       footer={
-        <div className="flex w-full justify-between gap-2">
-          <div>
-            {hasBinding && (
+        <div className="flex w-full flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            {hasBinding ? (
               <Button
                 variant="subtle"
                 size="sm"
@@ -263,7 +267,11 @@ export function GithubRepoModal({
               >
                 {unbinding ? "解除中…" : "解除当前绑定"}
               </Button>
-            )}
+            ) : draftNoSession && linked ? (
+              <p aria-live="polite" className="text-caption text-muted">
+                {draftHint}
+              </p>
+            ) : null}
           </div>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="sm" onClick={onClose}>
@@ -273,8 +281,9 @@ export function GithubRepoModal({
               variant="primary"
               size="sm"
               onClick={doConfirm}
+              title={draftNoSession && linked ? draftHint : undefined}
               disabled={
-                !linked || !selRepo || !selBranch || confirming || !sessionId
+                !linked || !selRepo || !selBranch || confirming || draftNoSession
               }
             >
               {confirming ? "绑定中…" : "确认绑定"}
@@ -325,8 +334,8 @@ export function GithubRepoModal({
                   <div className="truncate text-section font-medium text-fg">
                     @{link.login}
                   </div>
-                  <div className="truncate text-caption text-faint">
-                    {link.scopes || "已连接"}
+                  <div className="truncate text-caption text-faint" title={link.scopes || undefined}>
+                    {describeGithubScopes(link.scopes)}
                   </div>
                 </div>
                 {confirmUnlink ? (
@@ -362,9 +371,10 @@ export function GithubRepoModal({
 
           {/* 选仓 + 分支 */}
           {linked && (
-            <div className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden sm:grid-cols-[1.4fr_1fr]">
+            // grid 两列与列容器都要 min-w-0：否则超长仓库名把第一列按内容撑开，分支列右侧被裁掉（GH-01）。
+            <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 gap-0 overflow-hidden sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
               {/* 仓库列 */}
-              <div className="flex min-h-0 flex-col border-border sm:border-r">
+              <div className="flex min-h-0 min-w-0 flex-col border-border sm:border-r">
                 <div className="px-3 pt-3">
                   <div className="relative">
                     <Search
@@ -375,39 +385,42 @@ export function GithubRepoModal({
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
                       placeholder="搜索仓库…"
+                      aria-label="搜索仓库"
                       className="h-9 pl-9 text-body"
                     />
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-2">
                   {reposLoading ? (
-                    <div className="flex items-center justify-center gap-2 py-10 text-body text-faint">
+                    <div aria-live="polite" className="flex items-center justify-center gap-2 py-10 text-body text-faint">
                       <Spinner /> 加载仓库…
                     </div>
                   ) : reposErr ? (
-                    <p className="px-2 py-8 text-center text-body text-danger">
+                    <p role="alert" className="px-2 py-8 text-center text-body text-danger">
                       {reposErr}
                     </p>
                   ) : filteredRepos.length === 0 ? (
-                    <p className="px-2 py-8 text-center text-body text-faint">
+                    <p aria-live="polite" className="px-2 py-8 text-center text-body text-faint">
                       无匹配仓库
                     </p>
                   ) : (
-                    <ul className="flex flex-col gap-0.5">
+                    <ul className="flex flex-col gap-0.5" aria-label="仓库">
                       {filteredRepos.map((r) => {
                         const active = selRepo?.full_name === r.full_name;
                         return (
-                          <li key={r.full_name}>
+                          <li key={r.full_name} className="min-w-0">
                             <button
+                              type="button"
+                              aria-pressed={active}
                               onClick={() => onPickRepo(r)}
                               className={cn(
-                                "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                                "flex w-full min-w-0 items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                                 active
                                   ? "bg-accent-soft text-accent"
                                   : "hover:bg-hover",
                               )}
                             >
-                              <span className="min-w-0 flex-1 truncate text-body">
+                              <span className="min-w-0 flex-1 truncate text-body" title={r.full_name}>
                                 <span className="text-faint">
                                   {r.owner.login}/
                                 </span>
@@ -423,7 +436,7 @@ export function GithubRepoModal({
                                 />
                               )}
                               {active && (
-                                <Check size={14} className="shrink-0" />
+                                <Check size={14} className="shrink-0" aria-hidden />
                               )}
                             </button>
                           </li>
@@ -435,46 +448,48 @@ export function GithubRepoModal({
               </div>
 
               {/* 分支列 */}
-              <div className="flex min-h-0 flex-col border-t border-border sm:border-t-0">
+              <div className="flex min-h-0 min-w-0 flex-col border-t border-border sm:border-t-0">
                 <div className="px-3 pt-3 text-caption font-medium uppercase tracking-wide text-faint">
                   分支
                 </div>
-                <div className="min-h-0 flex-1 overflow-y-auto p-2">
+                <div className="min-h-0 flex-1 overflow-y-auto p-2 pr-2">
                   {!selRepo ? (
                     <p className="px-2 py-8 text-center text-meta text-faint">
                       先选择左侧仓库
                     </p>
                   ) : branchesLoading ? (
-                    <div className="flex items-center justify-center gap-2 py-10 text-body text-faint">
+                    <div aria-live="polite" className="flex items-center justify-center gap-2 py-10 text-body text-faint">
                       <Spinner /> 加载分支…
                     </div>
                   ) : branches.length === 0 ? (
-                    <p className="px-2 py-8 text-center text-meta text-faint">
+                    <p aria-live="polite" className="px-2 py-8 text-center text-meta text-faint">
                       无分支
                     </p>
                   ) : (
-                    <ul className="flex flex-col gap-0.5">
+                    <ul className="flex flex-col gap-0.5" aria-label="分支">
                       {branches.map((b) => {
                         const active = selBranch === b.name;
                         return (
-                          <li key={b.name}>
+                          <li key={b.name} className="min-w-0">
                             <button
+                              type="button"
+                              aria-pressed={active}
                               onClick={() => setSelBranch(b.name)}
                               className={cn(
-                                "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                                "flex w-full min-w-0 items-center gap-2 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                                 active
                                   ? "bg-accent-soft text-accent"
                                   : "hover:bg-hover",
                               )}
                             >
-                              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">
+                              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg" title={b.name}>
                                 {b.name}
                               </span>
                               {b.name === selRepo.default_branch && (
                                 <Badge tone="neutral">default</Badge>
                               )}
                               {active && (
-                                <Check size={14} className="shrink-0" />
+                                <Check size={14} className="shrink-0" aria-hidden />
                               )}
                             </button>
                           </li>

@@ -16,7 +16,11 @@ const SETTINGS_TABS = [
 
 type DialogTab = (typeof SETTINGS_TABS)[number]["value"];
 
-/** 项目色板：key 写入 ChatProject.color，dotClass 用设计 token 背景色。 */
+/**
+ * 项目色板：key 写入 ChatProject.color，dotClass 用设计 token 背景色。
+ * 「墨」例外：`bg-primary` 在深色主题是反色（亮色），色名与所见相反（PS-05）——
+ * 项目色是用户给项目贴的标签，必须跨主题稳定，故用固定深灰而不跟主题反转。
+ */
 export const PROJECT_COLORS: { key: string; label: string; dotClass: string }[] = [
   { key: "accent", label: "靛紫", dotClass: "bg-accent" },
   { key: "info", label: "蓝", dotClass: "bg-info" },
@@ -24,7 +28,7 @@ export const PROJECT_COLORS: { key: string; label: string; dotClass: string }[] 
   { key: "warning", label: "琥珀", dotClass: "bg-warning" },
   { key: "danger", label: "红", dotClass: "bg-danger" },
   { key: "accent-strong", label: "深紫", dotClass: "bg-accent-strong" },
-  { key: "primary", label: "墨", dotClass: "bg-primary" },
+  { key: "primary", label: "墨", dotClass: "bg-[#4b5563]" },
   { key: "muted", label: "灰", dotClass: "bg-muted" },
 ];
 
@@ -70,12 +74,24 @@ export function ProjectSettingsDialog(props: {
   const [contextVersion, setContextVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  /**
+   * 看板项目自带的指令与文本域里用户已写的内容不同：不再直接覆盖（PS-01 数据丢失），
+   * 先挂起等用户选「覆盖 / 保留」。null = 无待决。
+   */
+  const [pendingBoardInstructions, setPendingBoardInstructions] = useState<string | null>(null);
+  /** 本次打开期间用户是否手动改过看板绑定：首次打开（项目已绑看板）沿用看板指令回填的旧行为。 */
+  const boardTouchedRef = useRef(false);
+  /** 文本域当前值的镜像：异步回调里读快照，不把 instructions 放进拉取 effect 的依赖。 */
+  const instructionsRef = useRef(instructions);
+  instructionsRef.current = instructions;
 
   useEffect(() => {
     if (!open) return;
     setTab(assetsOnly ? "assets" : "settings");
     setError("");
     setSaving(false);
+    setPendingBoardInstructions(null);
+    boardTouchedRef.current = false;
     if (project) {
       setName(project.name);
       setColor(project.color ?? null);
@@ -124,6 +140,7 @@ export function ProjectSettingsDialog(props: {
   }, [open, assetsOnly, authSession]);
 
   useEffect(() => {
+    setPendingBoardInstructions(null);
     if (!open || assetsOnly || !authSession || !boardProjectId.trim()) return;
     let cancelled = false;
     void taskboardApi
@@ -131,8 +148,22 @@ export function ProjectSettingsDialog(props: {
       .then((ctx) => {
         if (cancelled) return;
         setContextVersion(typeof ctx.version === "number" ? ctx.version : 0);
-        if (typeof ctx.instructions === "string") setInstructions(ctx.instructions);
-        else if (ctx.instructions === null) setInstructions("");
+        const incoming =
+          typeof ctx.instructions === "string"
+            ? ctx.instructions
+            : ctx.instructions === null
+              ? ""
+              : undefined;
+        if (incoming === undefined) return;
+        // 首次打开（项目已绑看板）：看板指令是权威，直接回填（旧行为）。
+        // 用户在本次打开中手动切换看板：文本域为空或内容一致时直接回填；
+        // 已有不同内容则挂起，交给用户决定覆盖还是保留（PS-01）。
+        const cur = instructionsRef.current;
+        if (!boardTouchedRef.current || cur.trim() === "" || cur === incoming) {
+          setInstructions(incoming);
+        } else {
+          setPendingBoardInstructions(incoming);
+        }
       })
       .catch(() => {
         if (!cancelled) setContextVersion(0);
@@ -252,19 +283,22 @@ export function ProjectSettingsDialog(props: {
           </Field>
 
           <Field label="颜色" hint="可选。无颜色时侧栏只显示名称。">
+            {/* 色块桌面 32px；触屏升到 44px 触控靶（PS-04）。 */}
             <div role="radiogroup" aria-label="项目颜色" className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 role="radio"
                 aria-checked={color === null}
                 aria-label="无颜色"
+                title="无颜色"
                 onClick={() => setColor(null)}
                 className={cn(
-                  "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
+                  "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
                   color === null ? "border-accent ring-2 ring-ring" : "border-border-control hover:border-border-strong",
                 )}
               >
-                <span className="size-4 rounded-full border border-dashed border-border-strong bg-surface" />
+                {/* 虚线圈用 muted 描边：深色下 border-strong 几乎不可见（PS-05）。 */}
+                <span className="size-4 rounded-full border border-dashed border-muted bg-surface" />
               </button>
               {PROJECT_COLORS.map((c) => (
                 <button
@@ -276,7 +310,7 @@ export function ProjectSettingsDialog(props: {
                   title={c.label}
                   onClick={() => setColor(c.key)}
                   className={cn(
-                    "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
+                    "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
                     color === c.key ? "border-accent ring-2 ring-ring" : "border-transparent hover:border-border-strong",
                   )}
                 >
@@ -307,7 +341,10 @@ export function ProjectSettingsDialog(props: {
             <select
               className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm"
               value={boardProjectId}
-              onChange={(e) => setBoardProjectId(e.target.value)}
+              onChange={(e) => {
+                boardTouchedRef.current = true;
+                setBoardProjectId(e.target.value);
+              }}
               aria-label="绑定任务面板项目"
               disabled={!!boardListErr}
             >
@@ -321,7 +358,21 @@ export function ProjectSettingsDialog(props: {
           </Field>
 
           <Field
-            label="自定义指令"
+            label={
+              // 字数计数并入标签行：原来落在文本域下方，默认高度下被 footer 遮住要滚动才见（PS-06）。
+              <span className="flex items-center justify-between gap-2">
+                <span>自定义指令</span>
+                <span
+                  aria-live="polite"
+                  className={cn(
+                    "text-caption font-normal tabular-nums",
+                    instructionsOver ? "text-danger" : "text-faint",
+                  )}
+                >
+                  {instructions.length} / {INSTRUCTIONS_MAX}
+                </span>
+              </span>
+            }
             hint="写入后，该项目下新建与已有会话都会带上这段偏好；平台安全与产品规则始终优先。"
             error={instructionsOver ? `最多 ${INSTRUCTIONS_MAX} 字` : undefined}
           >
@@ -332,14 +383,32 @@ export function ProjectSettingsDialog(props: {
               aria-label="自定义指令"
             />
           </Field>
-          <p
-            className={cn(
-              "text-caption tabular-nums",
-              instructionsOver ? "text-danger" : "text-faint",
-            )}
-          >
-            {instructions.length} / {INSTRUCTIONS_MAX}
-          </p>
+          {pendingBoardInstructions !== null ? (
+            <Alert
+              tone="warning"
+              density="compact"
+              aria-live="polite"
+              action={
+                <span className="flex items-center gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setInstructions(pendingBoardInstructions);
+                      setPendingBoardInstructions(null);
+                    }}
+                  >
+                    用看板指令覆盖
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setPendingBoardInstructions(null)}>
+                    保留当前内容
+                  </Button>
+                </span>
+              }
+            >
+              所选看板项目自带的指令与当前内容不同。保存时以文本域内容为准。
+            </Alert>
+          ) : null}
 
           {error ? (
             <Alert tone="danger" density="compact">
