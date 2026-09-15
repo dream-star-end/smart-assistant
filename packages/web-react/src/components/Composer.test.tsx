@@ -1,7 +1,8 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { Composer } from "./Composer";
+import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
+import { ToastProvider } from "./ui";
 
 afterEach(cleanup);
 
@@ -17,6 +18,8 @@ describe("Composer 控件边框 token", () => {
 });
 
 describe("Composer environment preparing", () => {
+  afterEach(() => vi.useRealTimers());
+
   test("shows a 20s prep progress in the input area", () => {
     render(<Composer onSend={() => {}} environmentPreparing />);
     expect(screen.getByRole("status")).toHaveTextContent("环境准备中，约 20 秒");
@@ -25,6 +28,51 @@ describe("Composer environment preparing", () => {
   test("hides the prep progress by default", () => {
     render(<Composer onSend={() => {}} />);
     expect(screen.queryByText(/环境准备中/)).toBeNull();
+  });
+
+  // C-09:20s 时间假进度走到 100% 后停住、文案仍是「约 20 秒」,慢路径上给的是失真信号。
+  test("超过 20s 后切为不确定态:文案改「仍在准备」,进度条脉动而不是停在 100%", () => {
+    vi.useFakeTimers();
+    render(<Composer onSend={() => {}} environmentPreparing />);
+    const bar = screen.getByTestId("composer-env-prep");
+    expect(bar).toHaveAttribute("data-overdue", "false");
+    act(() => {
+      vi.advanceTimersByTime(ENV_PREP_EXPECTED_MS + 400);
+    });
+    expect(bar).toHaveAttribute("data-overdue", "true");
+    expect(bar).toHaveTextContent("仍在准备环境，请稍候…");
+    expect(bar).not.toHaveTextContent("约 20 秒");
+    expect(bar.querySelector(".animate-pulse")).not.toBeNull();
+  });
+});
+
+// C-02:生成中 Composer 唯一按钮是「停止」,桌面 Enter 排队无反馈、触屏 Enter=换行根本没有排队入口。
+describe("Composer 生成中排队发送", () => {
+  test("busy 且有正文 → 出现「排队发送」并调用 onSend,「停止」仍是唯一 Stop 控件", () => {
+    const onSend = vi.fn();
+    const onStop = vi.fn();
+    render(
+      <ToastProvider>
+        <Composer busy onSend={onSend} onStop={onStop} />
+      </ToastProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "生成中先排上这一条" } });
+    const queue = screen.getByRole("button", { name: "排队发送" });
+    expect(screen.getAllByRole("button", { name: "停止" })).toHaveLength(1);
+    fireEvent.click(queue);
+    expect(onSend).toHaveBeenCalledWith("生成中先排上这一条", undefined, undefined);
+    expect(onStop).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent("已加入队列，本轮结束后发送");
+  });
+
+  test("busy 但空正文 / stopping 态不出现排队按钮", () => {
+    const { rerender } = render(<Composer busy onSend={() => {}} onStop={() => {}} />);
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
+    rerender(<Composer busy stopping onSend={() => {}} onStop={() => {}} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "x" } });
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
   });
 });
 

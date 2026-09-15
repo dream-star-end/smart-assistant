@@ -2,7 +2,20 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
+import {
+  ArrowUp,
+  FileText,
+  ListPlus,
+  Loader2,
+  Mic,
+  Paperclip,
+  Pencil,
+  Plus,
+  RotateCcw,
+  Square,
+  Target,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
@@ -88,24 +101,44 @@ function clipboardImages(data: DataTransfer): File[] {
   return Array.from(data.files).filter((file) => file.type.startsWith("image/"));
 }
 
+/** 时间假进度的预期时长;超过后不再假装「快好了」,切成不确定态(C-09)。 */
+export const ENV_PREP_EXPECTED_MS = 20_000;
+
 function EnvironmentPrepBar() {
   const [pct, setPct] = useState(8);
+  const [overdue, setOverdue] = useState(false);
   useEffect(() => {
     const started = Date.now();
     const id = window.setInterval(() => {
-      const next = Math.min(100, 8 + ((Date.now() - started) / 20_000) * 92);
+      const elapsed = Date.now() - started;
+      const next = Math.min(100, 8 + (elapsed / ENV_PREP_EXPECTED_MS) * 92);
       setPct(next);
-      if (next >= 100) window.clearInterval(id);
+      if (elapsed >= ENV_PREP_EXPECTED_MS) {
+        // 冷启超过预期:进度条停在 100% 却写着「约 20 秒」是失真信号,改为不确定态脉动 + 诚实文案。
+        setOverdue(true);
+        window.clearInterval(id);
+      }
     }, 200);
     return () => window.clearInterval(id);
   }, []);
   return (
-    <div className="px-4 pt-3" data-testid="composer-env-prep" role="status" aria-live="polite">
-      <div className="mb-1.5 text-meta text-muted">环境准备中，约 20 秒</div>
+    <div
+      className="px-4 pt-3"
+      data-testid="composer-env-prep"
+      data-overdue={overdue ? "true" : "false"}
+      role="status"
+      aria-live="polite"
+    >
+      <div className="mb-1.5 text-meta text-muted">
+        {overdue ? "仍在准备环境，请稍候…" : "环境准备中，约 20 秒"}
+      </div>
       <div className="h-1 overflow-hidden rounded-full bg-hover" aria-hidden>
         <div
-          className="h-full rounded-full bg-accent transition-[width] duration-200"
-          style={{ width: `${pct}%` }}
+          className={cn(
+            "h-full rounded-full bg-accent transition-[width] duration-200",
+            overdue && "animate-pulse",
+          )}
+          style={{ width: overdue ? "100%" : `${pct}%` }}
         />
       </div>
     </div>
@@ -555,11 +588,24 @@ export function Composer({
             onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
           {canAttach && (
+            // 键盘可达(C-03):<label> 默认不在 Tab 序列,纯键盘/读屏用户无法触达附件。加 tabIndex/role,
+            // Enter/Space 在 label 自身派发原生 click → 走 label 激活转发到 input(仍是原生路径,
+            // 不是被禁止的合成 input.click();input 的 tabindex=-1 / 非 display:none / 无 accept 三条红线不动)。
             <label
               htmlFor={fileInputId}
               aria-label="添加附件"
               title="添加附件"
+              role="button"
+              tabIndex={disabled ? -1 : 0}
+              aria-disabled={disabled || undefined}
               data-product-feature={PRODUCT_CAPABILITIES.files.id}
+              onKeyDown={(e) => {
+                if (disabled) return;
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.currentTarget.click();
+                }
+              }}
               className={cn(
                 iconButtonVariants({ shape: "square" }),
                 "mb-0.5 cursor-pointer",
@@ -622,7 +668,8 @@ export function Composer({
             <IconButton
               data-product-feature={PRODUCT_CAPABILITIES.files.id}
               aria-label="更多选项"
-              title="附件暂不可用"
+              // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
+              title="会话目标暂不可用"
               disabled
               className="relative mb-0.5"
             >
@@ -700,9 +747,41 @@ export function Composer({
               <Mic size={19} />
             )}
           </IconButton>
-          {stopping && <span className="text-caption text-muted">正在停止…</span>}
+          {/* 「正在停止…」占位符已由 App 传入 placeholder 承载,角落再写一遍是冗余(C-17);
+              这里只保留给读屏的状态播报,不再占视觉位。 */}
+          {stopping && (
+            <output className="sr-only" aria-live="polite">
+              正在停止…
+            </output>
+          )}
           {value.length > 2000 && (
             <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
+          )}
+          {/* 发送键禁用原因不再只放 hover title(触屏无 hover,C-10):可见 caption + role=status。 */}
+          {!busy && (attachFailed || uploading) && (
+            <output
+              data-testid="composer-send-blocked-reason"
+              className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
+            >
+              {attachFailed ? "有附件上传失败" : "附件上传中…"}
+            </output>
+          )}
+          {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
+              → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
+              Stop 控件(T35),本按钮 aria-label 不含「停止」。 */}
+          {busy && !stopping && canSend && !disabled && (
+            <IconButton
+              data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+              aria-label="排队发送"
+              title="本轮结束后自动发送"
+              className="mb-0.5 text-accent"
+              onClick={() => {
+                submit();
+                toast("已加入队列，本轮结束后发送", "info");
+              }}
+            >
+              <ListPlus size={19} />
+            </IconButton>
           )}
           <button
             type="button"
@@ -713,7 +792,9 @@ export function Composer({
                 ? "有附件上传失败，请重试或移除后再发送"
                 : uploading
                   ? "附件上传中"
-                  : undefined
+                  : busy && !stopping
+                    ? "停止生成"
+                    : undefined
             }
             onClick={() => {
               if (busy) {
@@ -821,7 +902,7 @@ export function AttachChip({
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-meta",
+        "flex items-center gap-1.5 rounded-lg border bg-bg py-1.5 pr-1.5 text-meta",
         isImage ? "pl-1.5" : "pl-2.5",
         a.status === "error" ? "border-danger/40" : "border-border",
       )}
@@ -846,17 +927,24 @@ export function AttachChip({
       ) : (
         <FileText size={14} className={cn("shrink-0", a.status === "error" ? "text-danger" : "text-muted")} />
       )}
-      <span className={cn("max-w-[140px] truncate", a.status === "error" ? "text-danger" : "text-fg")}>
-        {a.name}
+      {/* 文件名中段截断(C-18):保留扩展名,同名不同格式的文件仍可分辨;完整名在 title。
+          失败原因就地可见(C-10):触屏没有 hover,只放 title 等于没说。 */}
+      <span className="flex min-w-0 flex-col">
+        <span className={cn("max-w-[160px] whitespace-nowrap", a.status === "error" ? "text-danger" : "text-fg")}>
+          {middleTruncate(a.name, 24)}
+        </span>
+        {a.status === "error" && (
+          <output className="text-caption text-danger">{a.error || "上传失败"}</output>
+        )}
       </span>
-      {/* 上传失败:就地「重试」按钮(复用原 File),移动端触控目标 h-6 足够点按。
+      {/* 上传失败:就地「重试」按钮(复用原 File),触屏下加高到 44px(C-04)。
           替代原来「必须删除 chip 重新选文件」的痛点。 */}
       {a.status === "error" && onRetry && (
         <button
           type="button"
           onClick={onRetry}
           aria-label={`重试上传 ${a.name}`}
-          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-medium text-danger hover:bg-danger/10"
+          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-medium text-danger hover:bg-danger/10 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2.5"
         >
           <RotateCcw size={12} />
           重试
@@ -879,10 +967,23 @@ export function AttachChip({
         type="button"
         onClick={onRemove}
         aria-label={`移除 ${a.name}`}
-        className="flex size-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger"
+        className="flex size-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger [@media(hover:none)]:size-11"
       >
         <X size={13} />
       </button>
     </div>
   );
+}
+
+/** 文件名中段截断:超长时保留开头与结尾(含扩展名),中间用 …(C-18)。max 为字符数下限保证 ≥ 8。 */
+export function middleTruncate(name: string, max = 24): string {
+  const chars = Array.from(name);
+  const limit = Math.max(8, max);
+  if (chars.length <= limit) return name;
+  const dot = name.lastIndexOf(".");
+  // 扩展名(≤ 8 字符,不含点在开头的隐藏文件)整体保留在尾段。
+  const ext = dot > 0 && name.length - dot <= 9 ? name.slice(dot) : "";
+  const tailLen = Math.max(ext.length + 3, Math.floor(limit / 3));
+  const headLen = Math.max(1, limit - tailLen - 1);
+  return `${chars.slice(0, headLen).join("")}…${chars.slice(chars.length - tailLen).join("")}`;
 }

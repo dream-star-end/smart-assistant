@@ -1948,8 +1948,8 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   }
   // 本夹具未接设定目标，「+」按产品契约退化为禁用锚点；不得再出现附件菜单项。
   const mobilePlus = mobilePage.getByRole("button", { name: "更多选项" });
-  if ((await mobilePlus.getAttribute("title")) !== "附件暂不可用") {
-    throw new Error("移动端无目标时「+」应是禁用锚点(title=附件暂不可用)");
+  if ((await mobilePlus.getAttribute("title")) !== "会话目标暂不可用") {
+    throw new Error("移动端无目标时「+」应是禁用锚点(title=会话目标暂不可用;附件早已迁到一级回形针,不再说附件不可用)");
   }
   if (await mobilePlus.isEnabled()) {
     throw new Error("移动端无目标时「+」不应可点");
