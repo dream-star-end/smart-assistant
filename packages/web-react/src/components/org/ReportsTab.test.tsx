@@ -138,6 +138,19 @@ describe("ReportsTab 趋势图（共享 charts，替代手写 CSS 竖条）", ()
     expect(screen.getAllByText("表格可左右滑动查看更多").length).toBeGreaterThan(0);
   });
 
+  test("摘要卡走共用 StatTile，「Token 构成」标题不被 uppercase 改写", async () => {
+    // 审计 SET-27 / SET-37：三处 Stat 各写一份 → 统一 StatTile；小节标题 uppercase 曾把 Token 渲成 TOKEN。
+    mockedGetOrgUsage.mockResolvedValue(report);
+    render(<ReportsTab auth={auth} />);
+    // 「500」在成员 / 模型表里也会出现，锚定 accent 数字行容器再断言。
+    const all = await screen.findAllByText("500");
+    const credits = all.find((el) => el.parentElement?.classList.contains("text-accent"));
+    expect(credits).toBeDefined();
+    expect(credits?.parentElement).toHaveTextContent(/500\s*积分/);
+    expect(screen.getByText("Token 构成")).toHaveClass("normal-case");
+    expect(screen.getByText("Token 构成")).not.toHaveClass("uppercase");
+  });
+
   test("首屏失败可原地重试并恢复完整报表", async () => {
     mockedGetOrgUsage
       .mockRejectedValueOnce(new Error("backend unavailable"))

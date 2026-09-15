@@ -18,6 +18,7 @@ import { cn, formatCredits } from "../../lib/utils";
 import {
   Alert,
   Button,
+  IconButton,
   Input,
   Progress,
   Spinner,
@@ -29,12 +30,12 @@ import {
 import { shortTime } from "./labels";
 import { TablePager, useTablePage } from "./TablePager";
 
-/** 外接端点(相对当前 origin)。CC Switch / Claude Code 的 base URL 都填到这一层,`/v1/*` 由客户端拼。 */
+/** 外接端点(相对当前 origin)。CC Switch / Claude Code 的 base URL 都填到这一层，`/v1/*` 由客户端拼。 */
 export const API_ACCESS_BASE_PATH = "/api/anthropic";
 /**
- * 默认主模型 / 轻量模型的**公开家族 id**(无引擎前缀、无思考档位后缀,2026-09-08)。
- * 思考深度不写进模型名:用户在 Claude Code 里自己用 /effort、--effort、CLAUDE_CODE_EFFORT_LEVEL
- * 或 /model 滑杆设置,服务端按请求携带的 output_config.effort 选档。若用户实际可用列表里没有,退到列表首项。
+ * 默认主模型 / 轻量模型的**公开家族 id**(无引擎前缀、无思考档位后缀，2026-09-08)。
+ * 思考深度不写进模型名：用户在 Claude Code 里自己用 /effort、--effort、CLAUDE_CODE_EFFORT_LEVEL
+ * 或 /model 滑杆设置，服务端按请求携带的 output_config.effort 选档。若用户实际可用列表里没有，退到列表首项。
  */
 const DEFAULT_MAIN_MODEL = "fable-5.1";
 const DEFAULT_OPUS_MODEL = "opus-5";
@@ -42,7 +43,7 @@ const DEFAULT_SONNET_MODEL = "sonnet-5";
 const DEFAULT_HAIKU_MODEL = "haiku-4.5";
 /**
  * 默认接入的模型集合(管理员裁定 2026-09-08):fable 5.1 / opus 5 / opus 4.8 / sonnet 5 /
- * haiku 4.5。也是模型列表拉取失败时的静态说明;真值以 /v1/models 为准,并且教程只展示
+ * haiku 4.5。也是模型列表拉取失败时的静态说明；真值以 /v1/models 为准，并且教程只展示
  * 这个集合与实际可用列表的交集(其它可用家族仍可通过 /v1/models 发现、直接填写使用)。
  */
 const DEFAULT_MODEL_SET: readonly string[] = [
@@ -55,10 +56,10 @@ const DEFAULT_MODEL_SET: readonly string[] = [
 
 /**
  * 教程里"当前可用"要展示的家族清单。
- *   - 列表未加载 / 加载失败 / 为空 → 静态 `DEFAULT_MODEL_SET`(说明性质,真值以 /v1/models 为准);
- *   - 拉到了 → `DEFAULT_MODEL_SET` 与实际可用列表的**交集**,顺序按 DEFAULT_MODEL_SET;
- *   - 交集为空(目录整体换代)→ 退回实际列表,不给用户一份全是不可用 id 的清单。
- * 其它可用家族仍可通过 `/v1/models` 自行发现并直接填写,这里只是"推荐默认集"。
+ *   - 列表未加载 / 加载失败 / 为空 → 静态 `DEFAULT_MODEL_SET`(说明性质，真值以 /v1/models 为准);
+ *   - 拉到了 → `DEFAULT_MODEL_SET` 与实际可用列表的**交集**，顺序按 DEFAULT_MODEL_SET;
+ *   - 交集为空(目录整体换代)→ 退回实际列表，不给用户一份全是不可用 id 的清单。
+ * 其它可用家族仍可通过 `/v1/models` 自行发现并直接填写，这里只是"推荐默认集"。
  */
 export function familyGuideList(available: string[] | null): string[] {
   if (!available || available.length === 0) return [...DEFAULT_MODEL_SET];
@@ -67,18 +68,18 @@ export function familyGuideList(available: string[] | null): string[] {
 }
 /**
  * 随配置一并写给 Claude Code 的额外环境变量。
- * `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`:官方文档 —— 对 Claude Code 不认识的模型 id(经网关 / 自定义
- * 标识)也照常发送 effort 参数。本站模型 id 不在它的内置名单里,不带这一项时部分版本会把用户设的
+ * `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`：官方文档 —— 对 Claude Code 不认识的模型 id(经网关 / 自定义
+ * 标识)也照常发送 effort 参数。本站模型 id 不在它的内置名单里，不带这一项时部分版本会把用户设的
  * 思考深度丢掉、服务端只能落到家族默认档。CC Switch ≥3.16 深链的 `config` 参数会把它保留进 settings。
  */
 const CLAUDE_CODE_EXTRA_ENV: Readonly<Record<string, string>> = {
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: "1",
 };
 const CC_SWITCH_RELEASES = "https://github.com/farion1231/cc-switch/releases";
-/** 稳定的空数组引用(列表未加载时喂给 useTablePage,避免每次渲染换引用)。 */
+/** 稳定的空数组引用(列表未加载时喂给 useTablePage，避免每次渲染换引用)。 */
 const EMPTY_KEYS: ApiKeySummary[] = [];
 
-/** 在可用列表中挑默认模型:首选项在列表里就用它;列表为空/未加载也用它(静态兜底);否则用列表里第一个匹配项。 */
+/** 在可用列表中挑默认模型：首选项在列表里就用它；列表为空/未加载也用它(静态兜底)；否则用列表里第一个匹配项。 */
 export function pickDefaultModel(
   available: string[] | null,
   preferred: string,
@@ -92,16 +93,16 @@ export function pickDefaultModel(
   return available[0]!;
 }
 
-/** 本站密钥格式与服务端生成契约一致;前缀/掩码不能充当完整密钥。 */
+/** 本站密钥格式与服务端生成契约一致；前缀/掩码不能充当完整密钥。 */
 export function isCompleteApiKey(value: string): boolean {
   return /^oc-cc\.[a-z0-9]{8}\.[a-f0-9]{48}$/.test(value.trim());
 }
 
 /**
- * CC Switch「用量查询」脚本(它的 JS-script 路径:`({ request, extractor })`,QuickJS 内跑,
+ * CC Switch「用量查询」脚本(它的 JS-script 路径：`({ request, extractor })`,QuickJS 内跑，
  * `{{baseUrl}}` / `{{apiKey}}` 由 CC Switch 用该供应商的 ANTHROPIC_BASE_URL / AUTH_TOKEN 替换)。
- * 打本站 `GET /v1/usage`,把积分余额与单 key 消耗映射到它 footer 的 remaining / used / total。
- * 深链里以 base64 携带(`usageScript` 参数),手动配置时也可整段贴进它的「自定义」模板。
+ * 打本站 `GET /v1/usage`，把积分余额与单 key 消耗映射到它 footer 的 remaining / used / total。
+ * 深链里以 base64 携带(`usageScript` 参数)，手动配置时也可整段贴进它的「自定义」模板。
  */
 export function buildCcSwitchUsageScript(): string {
   return [
@@ -147,16 +148,16 @@ function base64Utf8(text: string): string {
 }
 
 /**
- * CC Switch 深链(`ccswitch://v1/import`,V1 协议)。必须包含完整 apiKey,否则接收端确认导入时拒绝。
- * 明文只来自本次创建或用户粘贴,绝不从 keyPrefix/掩码构造。
+ * CC Switch 深链(`ccswitch://v1/import`,V1 协议)。必须包含完整 apiKey，否则接收端确认导入时拒绝。
+ * 明文只来自本次创建或用户粘贴，绝不从 keyPrefix/掩码构造。
  *
- * `enabled=true`:导入后立即切换为 Claude Code 当前供应商(CC Switch `ProviderService::switch`)。
- * 不带它,CC Switch 只是把供应商加进列表,`~/.claude/settings.json` 仍指向之前激活的那一个 ——
- * 用户撤销旧 key 再一键导入新 key,本地 Claude Code 仍在用旧 key,表现就是 401。
- * `usageEnabled=true` + `usageScript`:一并带上用量查询脚本并开启(CC Switch 确认框会展示脚本正文)。
+ * `enabled=true`：导入后立即切换为 Claude Code 当前供应商(CC Switch `ProviderService::switch`)。
+ * 不带它，CC Switch 只是把供应商加进列表，`~/.claude/settings.json` 仍指向之前激活的那一个 ——
+ * 用户撤销旧 key 再一键导入新 key，本地 Claude Code 仍在用旧 key，表现就是 401。
+ * `usageEnabled=true` + `usageScript`：一并带上用量查询脚本并开启(CC Switch 确认框会展示脚本正文)。
  * `config`(base64 JSON `{"env":{…}}`):CC Switch 以它的 env 为底、再叠加 URL 参数写 settings,
- * 用来带上 URL 参数表达不了的额外环境变量(`CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`,见 CLAUDE_CODE_EXTRA_ENV)。
- * 旧版 CC Switch(<3.16)会忽略额外 env,只剩标准字段,仍能正常导入。
+ * 用来带上 URL 参数表达不了的额外环境变量(`CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`，见 CLAUDE_CODE_EXTRA_ENV)。
+ * 旧版 CC Switch(<3.16)会忽略额外 env，只剩标准字段，仍能正常导入。
  */
 export function buildCcSwitchDeepLink(input: {
   origin: string;
@@ -195,9 +196,9 @@ export function claudeCodeExtraEnv(): Readonly<Record<string, string>> {
 }
 
 /**
- * API Key 自管:list / create(一次性明文展示)/ rename / 临时禁用 / 单 key 上限 / 撤销。
+ * API Key 自管：list / create(一次性明文展示)/ rename / 临时禁用 / 单 key 上限 / 撤销。
  *
- * commercial-only:admin 角色由父组件先验控制挂载;403 隐藏仍作为角色变更竞态兜底。
+ * commercial-only:admin 角色由父组件先验控制挂载；403 隐藏仍作为角色变更竞态兜底。
  * `onKeysChange` 让父级(消耗统计的 key 下拉)与列表保持同步。
  */
 export function ApiKeysSection({
@@ -232,9 +233,9 @@ export function ApiKeysSection({
     if (keys) onKeysChange?.(keys);
   }, [keys, onKeysChange]);
 
-  // 外接可用模型 = 站内公开模型列表里外接引擎那一部分,按公开**家族** id(无引擎前缀、无档位
-  // 后缀)展示,同家族多个档位折叠成一项 —— 与 GET /api/anthropic/v1/models 同一投影。
-  // 拉取失败不报错,教程退到静态默认值。
+  // 外接可用模型 = 站内公开模型列表里外接引擎那一部分，按公开**家族** id(无引擎前缀、无档位
+  // 后缀)展示，同家族多个档位折叠成一项 —— 与 GET /api/anthropic/v1/models 同一投影。
+  // 拉取失败不报错，教程退到静态默认值。
   useEffect(() => {
     let alive = true;
     api
@@ -257,8 +258,8 @@ export function ApiKeysSection({
     };
   }, [auth]);
 
-  // base URL 取当前页面 origin(quick tunnel 域名会变,不能写死)。模型 id 用公开 id;
-  // 服务端不做 claude-* → 站内模型的别名,ANTHROPIC_MODEL 必须显式指定。
+  // base URL 取当前页面 origin(quick tunnel 域名会变，不能写死)。模型 id 用公开 id;
+  // 服务端不做 claude-* → 站内模型的别名，ANTHROPIC_MODEL 必须显式指定。
   const origin = typeof window === "undefined" ? "" : window.location.origin;
   const endpoint = `${origin}${API_ACCESS_BASE_PATH}`;
   const modelsUrl = `${endpoint}/v1/models`;
@@ -267,7 +268,7 @@ export function ApiKeysSection({
   const mainModel = pickDefaultModel(externalModels, DEFAULT_MAIN_MODEL, /^(fable|opus)-/);
   const opusModel = pickDefaultModel(externalModels, DEFAULT_OPUS_MODEL, /^(opus|fable)-/);
   const sonnetModel = pickDefaultModel(externalModels, DEFAULT_SONNET_MODEL, /^sonnet-/);
-  // 轻量位:haiku 优先;没有就退到 gemini flash,再退到 sonnet。
+  // 轻量位：haiku 优先；没有就退到 gemini flash，再退到 sonnet。
   const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /^haiku-|^gemini-|-flash(-|$)|^sonnet-/);
   const candidateKey = keySource === "new" ? (justCreated?.plaintext ?? "") : existingKey.trim();
   const knownKey = keys?.find(
@@ -276,14 +277,14 @@ export function ApiKeysSection({
   const keyReady = isCompleteApiKey(candidateKey) && !knownKey?.disabledAt;
   const keyPlaceholder = keyReady ? candidateKey : "oc-cc.<你的密钥>";
   const keyHint = knownKey?.disabledAt
-    ? "该密钥已停用,请先在密钥管理中启用。"
+    ? "该密钥已停用，请先在密钥管理中启用。"
     : candidateKey && !isCompleteApiKey(candidateKey)
-      ? "请粘贴完整密钥,不是列表中显示的前缀或掩码。"
+      ? "请粘贴完整密钥，不是列表中显示的前缀或掩码。"
       : keyReady
         ? keySource === "new"
-          ? "已包含刚创建的密钥,可直接导入。"
+          ? "已包含刚创建的密钥，可直接导入。"
           : "已填入完整密钥。有效性以实际请求为准。"
-        : "请先创建新密钥或粘贴已有的完整密钥,再导入。";
+        : "请先创建新密钥或粘贴已有的完整密钥，再导入。";
   const extraEnvLines = Object.entries(CLAUDE_CODE_EXTRA_ENV).map(([k, v]) => `export ${k}=${v}`);
   const claudeCodeSnippet = [
     `export ANTHROPIC_BASE_URL=${endpoint}`,
@@ -315,9 +316,9 @@ export function ApiKeysSection({
     () =>
       buildCcSwitchDeepLink({
         origin,
-        // 必须是 ASCII:CC Switch 用 name 派生供应商 id(`is_alphanumeric` 保留汉字),再把
+        // 必须是 ASCII:CC Switch 用 name 派生供应商 id(`is_alphanumeric` 保留汉字)，再把
         // `%TEMP%\claude_<id>_<pid>.json` 写进 UTF-8 无 BOM 的 .bat 交给 cmd.exe ——含中文时
-        // cmd 会把后续行错位切分(「'g' / '--settings' 不是内部或外部命令」),「打开终端」直接失败。
+        // cmd 会把后续行错位切分(「'g' / '--settings' 不是内部或外部命令」)，「打开终端」直接失败。
         name: BRAND.nameEn,
         apiKey: keyReady ? candidateKey : null,
         model: mainModel,
@@ -327,7 +328,7 @@ export function ApiKeysSection({
       }),
     [origin, candidateKey, keyReady, mainModel, opusModel, sonnetModel, haikuModel],
   );
-  // 教程展示的家族清单:默认集 ∩ 实际可用(见 familyGuideList)。
+  // 教程展示的家族清单：默认集 ∩ 实际可用(见 familyGuideList)。
   const familyList = useMemo(() => familyGuideList(externalModels), [externalModels]);
   // 密钥列表每页 10 条(与用量表同一 TablePager);≤10 条时不渲染翻页控件。
   const keyPage = useTablePage<ApiKeySummary>(keys ?? EMPTY_KEYS);
@@ -342,7 +343,7 @@ export function ApiKeysSection({
       })
       .catch((e) => {
         if (!alive) return;
-        // 403 = admin-only rollout:整段隐藏,普通用户无感。
+        // 403 = admin-only rollout：整段隐藏，普通用户无感。
         if (e instanceof ApiError && e.status === 403) {
           setHidden(true);
           return;
@@ -390,8 +391,8 @@ export function ApiKeysSection({
 
   async function remove(id: string) {
     const ok = await confirmDialog({
-      title: "撤销该 API Key?",
-      body: "使用它的集成将立即失效,不可恢复。如需暂停,请改用「禁用」。",
+      title: "撤销该 API Key？",
+      body: "使用它的集成将立即失效，不可恢复。如需暂停，请改用「禁用」。",
       confirmText: "撤销",
       danger: true,
     });
@@ -432,7 +433,7 @@ export function ApiKeysSection({
       setCopied(true);
     } catch {
       setCopied(false);
-      setErr("复制失败,请手动选择并复制密钥。");
+      setErr("复制失败，请手动选择并复制密钥。");
     }
   }
 
@@ -444,7 +445,7 @@ export function ApiKeysSection({
       setCopiedBlock(kind);
     } catch {
       setCopiedBlock(null);
-      setErr("复制失败,请手动选择并复制配置。");
+      setErr("复制失败，请手动选择并复制配置。");
     }
   }
 
@@ -493,11 +494,12 @@ export function ApiKeysSection({
                   aria-label="新密钥名称"
                   value={label}
                   onChange={(e) => setLabel(e.target.value)}
-                  placeholder="新密钥名称(如 my-cli)"
+                  placeholder="新密钥名称（如 my-cli）"
                   maxLength={64}
                   className="h-auto bg-bg px-3 py-2 text-section"
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") create();
+                    // 中文输入法选词的回车不是提交(审计 SET-24；与 CreateOrgWizard 同一守卫)。
+                    if (e.key === "Enter" && !e.nativeEvent.isComposing) create();
                   }}
                 />
                 <Button
@@ -513,7 +515,7 @@ export function ApiKeysSection({
 
               {keySource === "new" && justCreated && (
                 <Alert tone="warning" className="mb-3 flex flex-col gap-2 text-meta">
-                  <span>请立即复制并妥善保存,关闭后将无法再次查看完整密钥。</span>
+                  <span>请立即复制并妥善保存，关闭后将无法再次查看完整密钥。</span>
                   <div className="flex items-center gap-2">
                     <code className="min-w-0 flex-1 truncate rounded-md bg-bg px-2 py-1 font-mono text-meta text-fg">
                       {justCreated.plaintext}
@@ -527,7 +529,7 @@ export function ApiKeysSection({
 
               {!justCreated && (
                 <p className="text-caption text-muted">
-                  建议按设备命名,例如 MacBook。完整密钥仅在创建时显示。
+                  建议按设备命名，例如 MacBook。完整密钥仅在创建时显示。
                 </p>
               )}
             </div>
@@ -551,7 +553,7 @@ export function ApiKeysSection({
                 aria-invalid={!!candidateKey && !keyReady}
               />
               <p className="text-caption text-muted">
-                密钥仅在本页临时使用,刷新即清除。找不到完整密钥?请切换到「创建新密钥」。
+                密钥仅在本页临时使用，刷新即清除。找不到完整密钥？请切换到「创建新密钥」。
               </p>
             </div>
           )}
@@ -592,15 +594,15 @@ export function ApiKeysSection({
         </div>
         <div className="mt-4 border-t border-accent/15 pt-3 text-caption text-muted">
           <p>
-            导入会将密钥交给本机 CC Switch,并直接切换为 Claude Code 当前供应商、开启用量查询,请勿分享导入链接。
+            导入会将密钥交给本机 CC Switch，并直接切换为 Claude Code 当前供应商、开启用量查询，请勿分享导入链接。
           </p>
           <p className="mt-1">
             导入后请<b>重新打开终端</b>再运行 <code className="font-mono">claude</code>
-            ;若之前手动设置过 <code className="font-mono">ANTHROPIC_API_KEY</code> /{" "}
-            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code> 环境变量,请先清掉,避免旧密钥与新密钥同时发送。
+            ；若之前手动设置过 <code className="font-mono">ANTHROPIC_API_KEY</code> /{" "}
+            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code> 环境变量，请先清掉，避免旧密钥与新密钥同时发送。
           </p>
           <p className="mt-1">
-            还未安装?{" "}
+            还未安装？{" "}
             <a
               href={CC_SWITCH_RELEASES}
               target="_blank"
@@ -626,7 +628,7 @@ export function ApiKeysSection({
                 await navigator.clipboard.writeText(endpoint);
                 setEndpointCopied(true);
               } catch {
-                setErr("复制失败,请手动复制端点地址。");
+                setErr("复制失败，请手动复制端点地址。");
               }
             }}
           >
@@ -654,7 +656,7 @@ export function ApiKeysSection({
           </div>
         ) : !keys || keys.length === 0 ? (
           <p className="py-3 text-center text-meta text-faint">
-            还没有 API Key。在上方「创建新密钥」里起个名(如 MacBook)即可创建第一把。
+            还没有 API Key。在上方「创建新密钥」里起个名（如 MacBook）即可创建第一把。
           </p>
         ) : (
           <>
@@ -680,7 +682,7 @@ export function ApiKeysSection({
 
         <p className="mt-3 flex items-start gap-1.5 text-caption text-faint">
           <ShieldCheck size={14} className="shrink-0" />
-          可随时停用、设置积分上限或撤销,不影响网页对话。
+          可随时停用、设置积分上限或撤销，不影响网页对话。
         </p>
       </section>
 
@@ -693,29 +695,29 @@ export function ApiKeysSection({
         </summary>
         <ol className="mt-2 list-decimal space-y-1 pl-5 text-faint">
           <li>
-            或手动添加:打开 CC Switch → <b>Claude Code</b> 标签 → 右上角 <b>+</b> 添加供应商 →
+            或手动添加：打开 CC Switch → <b>Claude Code</b> 标签 → 右上角 <b>+</b> 添加供应商 →
             预设选「<b>自定义</b>」。
           </li>
           <li>
             名称请用<b>英文</b>(如 <code className="font-mono">{BRAND.nameEn}</code>
-            ,中文名会让 Windows 上的「打开终端」失败);端点地址填{" "}
+            ，中文名会让 Windows 上的「打开终端」失败)；端点地址填{" "}
             <code className="select-all font-mono">{endpoint}</code>;API Key 填{" "}
             <code className="font-mono">oc-cc.…</code> 密钥。
           </li>
           <li>
             点模型输入框旁的「<b>获取模型</b>」(下载图标)即可拉到你可用的模型列表(CC Switch 会请求{" "}
-            <code className="select-all font-mono">{modelsUrl}</code>),选一个作为默认模型;
+            <code className="select-all font-mono">{modelsUrl}</code>)，选一个作为默认模型；
             或直接把下面这段 JSON 贴进它的配置编辑器。
           </li>
           <li>
-            点「添加」并<b>启用</b>该供应商(卡片处于选中态),重新打开终端运行{" "}
+            点「添加」并<b>启用</b>该供应商(卡片处于选中态)，重新打开终端运行{" "}
             <code className="font-mono">claude</code>。
           </li>
         </ol>
         <p className="mt-2 text-caption text-muted">
           {keyReady
-            ? "复制将包含完整密钥,请勿分享配置。已有密钥在预览中已隐藏。"
-            : "以下是配置模板,请先在上方准备密钥。"}
+            ? "复制将包含完整密钥，请勿分享配置。已有密钥在预览中已隐藏。"
+            : "以下是配置模板，请先在上方准备密钥。"}
         </p>
         <div className="mt-2 flex items-start gap-2">
           <pre
@@ -745,10 +747,10 @@ export function ApiKeysSection({
           在 CC Switch 里查看余额与用量
         </summary>
         <p className="mt-2 text-faint">
-          一键导入已自动开启。手动添加的供应商:卡片菜单 →「<b>用量查询</b>」→ 模板选「<b>自定义</b>
+          一键导入已自动开启。手动添加的供应商：卡片菜单 →「<b>用量查询</b>」→ 模板选「<b>自定义</b>
           」→ 把下面脚本整段贴进去 → 开启并「测试」。脚本用该供应商已填的端点与密钥请求{" "}
           <code className="select-all font-mono">GET {usageUrl}</code>
-          ,显示当前可用积分、该密钥累计消耗与上限(无上限时显示 ∞)。
+          ，显示当前可用积分、该密钥累计消耗与上限(无上限时显示 ∞)。
         </p>
         <div className="mt-2 flex items-start gap-2">
           <pre
@@ -777,40 +779,40 @@ export function ApiKeysSection({
         </summary>
         <ul className="mt-2 list-disc space-y-1 pl-5 text-faint">
           <li>
-            <b>401 container identity verification failed</b>:密钥已撤销、已停用,或本机 Claude Code
-            用的不是这把密钥。到 CC Switch 确认<b>当前选中</b>的供应商就是本站、密钥是密钥管理里仍有效的那一把;
+            <b>401 container identity verification failed</b>：密钥已撤销、已停用，或本机 Claude Code
+            用的不是这把密钥。到 CC Switch 确认<b>当前选中</b>的供应商就是本站、密钥是密钥管理里仍有效的那一把；
             撤销旧密钥后必须重新导入或改填新密钥。
           </li>
           <li>
-            <b>Auth conflict: Both a token and an API key are set</b>:系统环境变量里残留了{" "}
+            <b>Auth conflict: Both a token and an API key are set</b>：系统环境变量里残留了{" "}
             <code className="font-mono">ANTHROPIC_API_KEY</code>(或{" "}
-            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code>)。Claude Code 会把两把凭据一起发送,
-            请在系统环境变量 / shell 配置里删掉,只保留 CC Switch 写入的{" "}
-            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code>,然后重开终端。
+            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code>)。Claude Code 会把两把凭据一起发送，
+            请在系统环境变量 / shell 配置里删掉，只保留 CC Switch 写入的{" "}
+            <code className="font-mono">ANTHROPIC_AUTH_TOKEN</code>，然后重开终端。
           </li>
           <li>
-            公司代理:本站端点是普通 HTTPS,与浏览器同路;若浏览器能打开本站但 Claude Code 报连接错误,
+            公司代理：本站端点是普通 HTTPS，与浏览器同路；若浏览器能打开本站但 Claude Code 报连接错误，
             为终端设置 <code className="font-mono">HTTPS_PROXY</code>。401 与代理无关。
           </li>
           <li>
-            CC Switch 的「检测连通」只探测地址可达,不校验密钥;真正的验证以运行{" "}
+            CC Switch 的「检测连通」只探测地址可达，不校验密钥；真正的验证以运行{" "}
             <code className="font-mono">claude</code> 后能回话、或「用量查询」能显示余额为准。
           </li>
           <li>
             <b>「打开终端」报 'g' / '--settings' 不是内部或外部命令</b>(Windows):CC Switch
-            按供应商名生成临时配置路径并写进 .bat,名称含中文时 cmd.exe 会把命令行切错。把该供应商<b>重命名为英文</b>
-            (或删掉后重新一键导入,新链接已改用英文名)即可;
-            也可以不用它的「打开终端」,直接在自己的终端里运行 <code className="font-mono">claude</code>
+            按供应商名生成临时配置路径并写进 .bat，名称含中文时 cmd.exe 会把命令行切错。把该供应商<b>重命名为英文</b>
+            (或删掉后重新一键导入，新链接已改用英文名)即可；
+            也可以不用它的「打开终端」，直接在自己的终端里运行 <code className="font-mono">claude</code>
             (CC Switch 已把配置写进 <code className="font-mono">~/.claude/settings.json</code>)。
           </li>
           <li>
-            <b>启动时提示 "… isn't described by this version's model catalog"</b>:这是 Claude Code
-            对非官方模型名的提示,不影响使用 —— 它只是不知道本站模型的上下文窗口,会按保守值触发自动压缩。
+            <b>启动时提示 "… isn't described by this version's model catalog"</b>：这是 Claude Code
+            对非官方模型名的提示，不影响使用 —— 它只是不知道本站模型的上下文窗口，会按保守值触发自动压缩。
             想消除可在 <code className="font-mono">~/.claude/settings.json</code> 加{" "}
             <code className="font-mono">
               {`"modelPicker":{"options":[{"model":"${mainModel}","behavesAs":"claude-opus-5"}]}`}
             </code>
-            (需 Claude Code ≥ 2.1.242),让它按 Opus 5 的客户端行为处理本站主模型。
+            (需 Claude Code ≥ 2.1.242)，让它按 Opus 5 的客户端行为处理本站主模型。
           </li>
         </ul>
       </details>
@@ -822,12 +824,12 @@ export function ApiKeysSection({
         <summary className="cursor-pointer text-muted">手动接入本地 Claude Code(环境变量)</summary>
         <p className="mt-2 text-faint">
           在本机终端设置以下环境变量后启动 <code className="font-mono">claude</code>
-          。请求经本站 API Key 端点转发,按站内积分计费(余额为 0 或触达单 key 上限时返回 402)。
+          。请求经本站 API Key 端点转发，按站内积分计费(余额为 0 或触达单 key 上限时返回 402)。
         </p>
         <p className="mt-2 text-caption text-muted">
           {keyReady
-            ? "复制将包含完整密钥,请勿分享配置。已有密钥在预览中已隐藏。"
-            : "以下是配置模板,请先在上方准备密钥。"}
+            ? "复制将包含完整密钥，请勿分享配置。已有密钥在预览中已隐藏。"
+            : "以下是配置模板，请先在上方准备密钥。"}
         </p>
         <div className="mt-2 flex items-start gap-2">
           <pre
@@ -849,9 +851,9 @@ export function ApiKeysSection({
         </div>
         <p className="mt-2 text-faint">
           可用模型请求 <code className="select-all font-mono">GET {modelsUrl}</code>
-          (带同一个 API Key)查询,返回 Anthropic / OpenAI 兼容的{" "}
+          (带同一个 API Key)查询，返回 Anthropic / OpenAI 兼容的{" "}
           <code className="font-mono">data[].id</code>
-          。当前可用:
+          。当前可用：
           {familyList.map((f, i) => (
             <span key={f}>
               {i > 0 ? " / " : " "}
@@ -863,22 +865,22 @@ export function ApiKeysSection({
           (带 <code className="font-mono">-fast</code> 的为加速版、双倍计费)。以列表接口返回的为准。
         </p>
         <p className="mt-2 text-faint" data-testid="guide-effort">
-          模型名<b>不含思考深度</b>。思考深度由你在 Claude Code 里自己设置:会话内{" "}
+          模型名<b>不含思考深度</b>。思考深度由你在 Claude Code 里自己设置：会话内{" "}
           <code className="font-mono">/effort</code>(或 <code className="font-mono">/model</code>{" "}
           里的滑杆)、启动参数 <code className="font-mono">--effort low|medium|high|xhigh|max</code>
           、或环境变量 <code className="font-mono">CLAUDE_CODE_EFFORT_LEVEL</code>
-          ;未设置时按 <code className="font-mono">high</code> 运行。服务端按每次请求携带的档位选择对应算力,
-          某家族不提供你选的档位时,自动落到不高于它的最近档位。配置里的{" "}
+          ；未设置时按 <code className="font-mono">high</code> 运行。服务端按每次请求携带的档位选择对应算力，
+          某家族不提供你选的档位时，自动落到不高于它的最近档位。配置里的{" "}
           <code className="font-mono">CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1</code>{" "}
-          让 Claude Code 对本站模型名也发送思考深度,请保留。如需把某个供应商钉死在一个档位,
-          模型名可写成 <code className="font-mono">fable-5.1-high</code> 这种带档位后缀的形式,此时忽略会话内设置。
+          让 Claude Code 对本站模型名也发送思考深度，请保留。如需把某个供应商钉死在一个档位，
+          模型名可写成 <code className="font-mono">fable-5.1-high</code> 这种带档位后缀的形式，此时忽略会话内设置。
         </p>
       </details>
     </div>
   );
 }
 
-/** 上限进度百分比(0..100,字符串大数用 BigInt 精确算,非法项当 0)。 */
+/** 上限进度百分比(0..100，字符串大数用 BigInt 精确算，非法项当 0)。 */
 export function limitPercent(spent: string, limit: string | null): number | null {
   if (limit === null || !/^\d+$/.test(limit) || !/^\d+$/.test(spent)) return null;
   const l = BigInt(limit);
@@ -982,14 +984,18 @@ function ApiKeyRow({
             onCheckedChange={(on) => void onPatch({ disabled: !on })}
           />
         </span>
-        <button
-          type="button"
+        {/* 触控靶下沉进 IconButton(触屏 44px，审计 SET-11);danger 变体保留悬停变红的语义。 */}
+        <IconButton
+          variant="muted"
+          size="md"
+          shape="square"
           onClick={onRemove}
           aria-label="撤销"
-          className="flex size-9 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-danger-soft hover:text-danger focus-visible:ring-2 focus-visible:ring-ring"
+          title="撤销"
+          className="hover:bg-danger-soft hover:text-danger"
         >
           <Trash2 size={14} />
-        </button>
+        </IconButton>
       </div>
 
       <div className="flex flex-wrap items-center gap-2 text-caption text-faint">
@@ -1027,6 +1033,12 @@ function ApiKeyRow({
             {k.creditLimit === null ? "设置上限" : `/ 上限 ${formatCredits(k.creditLimit)}`}
           </button>
         )}
+        {/* 触达上限只把进度条变红不够(色弱 / 扫读看不出，审计 SET-28)，补一句文字。 */}
+        {pct !== null && pct >= 100 && (
+          <span className="rounded bg-danger-soft px-1.5 py-0.5 text-caption text-danger">
+            已达上限
+          </span>
+        )}
         {pct !== null && (
           <Progress
             value={pct}
@@ -1040,6 +1052,7 @@ function ApiKeyRow({
   );
 }
 
+/** 行内小图标按钮(重命名 / 保存 / 取消)。走 ui/IconButton：桌面 28px，触屏自动 44px(审计 SET-11)。 */
 function IconBtn({
   label,
   onClick,
@@ -1052,15 +1065,17 @@ function IconBtn({
   children: React.ReactNode;
 }) {
   return (
-    <button
-      type="button"
+    <IconButton
+      variant="muted"
+      size="sm"
+      shape="square"
       aria-label={label}
       title={label}
       onClick={onClick}
       disabled={disabled}
-      className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-active hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+      className="hover:bg-active"
     >
       {children}
-    </button>
+    </IconButton>
   );
 }

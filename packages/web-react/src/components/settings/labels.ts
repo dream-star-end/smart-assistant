@@ -25,6 +25,44 @@ export function ledgerReasonLabel(reason: string): string {
   return LEDGER_REASON_LABEL[reason] || reason;
 }
 
+/**
+ * 面向用户的流水类型展示(审计 SET-16):未知 reason 不再把后端枚举原文当标题砸给用户,
+ * 显示「其他」并把原值放进 `raw`(调用方挂到 title / 次级文案),可观测性不丢。
+ */
+export function ledgerReasonView(reason: string): { label: string; raw: string | null } {
+  const known = LEDGER_REASON_LABEL[reason];
+  return known ? { label: known, raw: null } : { label: "其他", raw: reason };
+}
+
+/**
+ * 外接 API 请求结果 → 中文(usage_records.status / 审计 terminal_code)。
+ * 后端是开放枚举;未知值回退原文(审计 SET-25:此前除 success 外一律原样展示)。
+ */
+export const API_REQUEST_STATUS_LABEL: Record<string, string> = {
+  success: "成功",
+  ok: "成功",
+  insufficient_credits: "余额不足",
+  credit_limit_exceeded: "超出密钥上限",
+  key_limit_exceeded: "超出密钥上限",
+  rate_limited: "已限流",
+  key_disabled: "密钥已停用",
+  key_revoked: "密钥已撤销",
+  unauthorized: "未授权",
+  forbidden: "无权限",
+  invalid_request: "请求无效",
+  upstream_error: "上游错误",
+  timeout: "超时",
+  cancelled: "已取消",
+  canceled: "已取消",
+  error: "失败",
+  failed: "失败",
+};
+
+export function apiRequestStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return API_REQUEST_STATUS_LABEL[status] || status;
+}
+
 /** 思考深度档位（preferences.default_effort 枚举；具体模型支持集由 API 决定）。 */
 export const EFFORT_OPTIONS: {
   value: "low" | "medium" | "high" | "xhigh" | "max";
