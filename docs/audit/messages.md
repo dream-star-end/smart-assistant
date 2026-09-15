@@ -140,3 +140,78 @@
 ## 7. 需后端配合
 
 无。本轮问题全部可在前端修复。
+
+## 8. 修复记录（阶段 B · t-33「B·messages 消息渲染与时间线修复」）
+
+- 分支 `feat/v5-selfhost-audit-messages`，接着阶段 A 的 `58d3fcc5d` 往下提交；只改归属内文件 + 本文档 + `browser-tests/{run.mjs,cases.json}`。
+- 统计：发现 25 / 修复 22（P2 4/4，P3 18/21）/ 遗留 3（M-21、M-24、M-25，见 §8.3）。
+- 口径：每个逻辑改动配 vitest；触屏折叠属 DOM 交互改动，新增真浏览器用例 T68；视觉改动出 after 截图（§9）。
+
+### 8.1 逐条
+
+| 编号 | 改动 | 文件 | 测试 |
+|---|---|---|---|
+| M-01 | `MessageRenderer` 把 `readOnly` 透传给 `UserCard` / `AssistantCard`；`UserCard` 的「编辑」只在 `cb.onEditResend && !readOnly` 时渲染、「引用」同理；`AssistantCard` / `MessageActions` 在 `readOnly` 下不出引用 / 重新生成 / 反馈，只留复制 / 纯文本 / 朗读 | `MessageRenderer.tsx`、`chat/cards.tsx` | `cards.test.tsx`（无回调不出编辑；readOnly 只留复制；AssistantCard readOnly）、`MessageRenderer.test.tsx`（readOnly 列表 vs 非只读对照） |
+| M-02 | `MarkdownTable`：单元格 `[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap`（覆盖 `.prose{word-break:break-word}` 的继承，标识符不再任意拆行，宽表按 min-content 撑进 `.markdown-table-region` 横滑）；「可左右滑动」提示改为挂载后测 `scrollWidth > clientWidth`（ResizeObserver 跟踪）才显示，滑过即消失（已有）。不动 `styles.css`（shell） | `MarkdownImpl.tsx` | `MarkdownImpl.test.tsx`（溢出才出提示 / 不溢出不出 / 单元格 class）；T25 复跑（宽表仍落在横滑区） |
+| M-03 | 新增 `TouchActionRow`：触屏默认只露一个 44px「更多操作」开关（`aria-expanded`），点开展开整排、可收起；桌面保持 hover 露出。`MessageActions` 的末轮末条助手回复（`showRegen`）默认展开；`UserCard` 动作行同款 | `chat/cards.tsx` | `cards.test.tsx`（折叠 / 展开 / 收起 class 与 aria-expanded、末条默认展开、用户行 44px 开关）；**新增真浏览器 T68**（390×844 hasTouch，`(hover:none)` 生效：开关 ≥44px、整排 display:none、受信点击展开后每个按钮 ≥44px、收起、末条助手默认展开） |
+| M-04 | `TurnActivity` 文案里每秒变化的 `(Ns)` / `(Ns · Ms 无新数据)` 段切成独立 `aria-hidden` span；容器仍是 `aria-live=polite`，但阶段文案文本节点只在阶段切换时才变，读屏不再每秒播报。导出 `splitElapsedSeconds` / `stripElapsedSeconds` | `chat/TurnActivity.tsx` | `turnActivity.test.tsx`（切分逐字可逆、重试计数不误剥、秒数 aria-hidden、假时钟 tick 3s 阶段文本节点同引用） |
+| M-05 | footer 去掉自带 `px-5`（与列表根共用一份内边距），加 `data-testid="timeline-footer"`；空列表早返回分支由外层容器补 px-5 | `MessageRenderer.tsx` | `MessageRenderer.test.tsx`（footer 无 px-5、列表根有）；after 截图 streaming / error-states |
+| M-06 | `Markdown` 新增 `caret` prop；`MarkdownImpl` 加 rehype 插件 `rehypeLiveCaret`，把光标 span 注入**最后一个文本块**（p / 标题 / 末项 li / 引用段 / 表格末格）末尾（`bg-current` 随当前文字色），末块是代码块 / 图片等非文本块时回退到块后单独一行（`data-live-caret-fallback`）。`AssistantCard` / `ThinkingCard`（只挂最后一段）/ demo `Message.tsx` 删掉块后兄弟光标；`ProgressiveMarkdown` 分段时只有尾段带光标 | `Markdown.tsx`、`MarkdownImpl.tsx`、`chat/cards.tsx`、`Message.tsx` | `MarkdownImpl.test.tsx`（caret=false 无光标；段落末尾内联；列表 / 引用 / 表格下钻；代码块回退）；after 截图 assistant-streaming / thinking-live |
+| M-07 | `AgentGroupCard` 折叠摘要图标按 `agentTerminalStatus(m).tone`：success→Check / danger→X / warning→Clock，颜色跟 tone；`DelegateProgressCard` 按 `_isError` 选 X(danger) / Check(success) | `chat/AgentGroupCard.tsx`、`chat/cards.tsx` | 新增 `AgentGroupCard.test.tsx`；`cards.test.tsx`（DelegateProgressCard） |
+| M-08 | `TokenUsageBadge` 可见文案带单位「5.98k token」（数字与单位分两个 span，数字节点仍是纯数字，既有按数字取元素的断言不受影响；估算「约」/ 共享「共」前缀保留）；`AssistantCard` 终态后把 token 并入 `MetaRow`（时间 · 积分 · token · 请求ID 同一行），流式 / 团队编排未终态时仍单独实时显示 | `chat/tokenUsage.tsx`、`chat/cards.tsx` | `tokenUsage.test.ts`、`cards.test.tsx`（同一行；流式单独显示） |
+| M-09 | `USER_STATUS_LABEL` 去掉 `read` / `replied`：历史用户消息不再每条常显「已回复」「已读」；`sending / queued / sent / error` 照常 | `chat/cards.tsx` | `cards.test.tsx` |
+| M-10 | `ThinkingCard` / `AgentGroupCard` 头部按钮加 `aria-expanded` + `aria-controls`（展开时指向正文 `useId`），触屏 `min-h-11` | `chat/cards.tsx`、`chat/AgentGroupCard.tsx` | `cards.test.tsx`、`AgentGroupCard.test.tsx` |
+| M-11 | 待回答 dock 按钮、「查看原始…记录」「继续显示原始记录」、RuntimeEventCard 头部：触屏 `min-h-11`（+ `px-3`） | `MessageRenderer.tsx` | 无逻辑变化；after 截图 find-toolbar |
+| M-12 | `HtmlPreview` 全屏按钮触屏 `size-11`、看源码 `min-h-11`；`OptionsBlock` 选项触屏 `min-h-11`，`blockedByBusy` 且可交互时卡底加 `<output>`「等待当前回合结束后可选择」 | `RichBlocks.tsx` | `RichBlocks.test.tsx`（busy 提示出现 / 非 busy 与已发送不出；触控 class） |
+| M-13 | `TagChip` 触屏 `min-h-11 px-3.5` | `chat/ResponseRating.tsx` | 无逻辑变化 |
+| M-14 | `HtmlPreviewFallback` 改本仓 token：`bg-surface` / `bg-hover` / `text-muted` | `Markdown.tsx` | `Markdown.test.tsx` |
+| M-15 | `JournalHydrationRetry`「重新加载」`text-foreground` → `text-fg` + 常显下划线 + 触屏 `min-h-11` | `chat/HistorySkeleton.tsx` | `historySkeleton.test.tsx` |
+| M-16 | `ReplyQuoteBlock` 助手名走 `BRAND.name`（`Composer.tsx:487` 同款问题属 composer，已在 §3 备注，本轮未越界） | `chat/cards.tsx` | `cards.test.tsx` 改用 `BRAND.name` 断言 |
+| M-17 | 新增 `lib/chat/pure.formatDurationSeconds`（<60s 秒、<60min 「N 分钟」、否则「H 小时 M 分」），`GoalCard` 用时走它（1260s → 21 分钟） | `lib/chat/pure.ts`、`chat/cards.tsx` | `speechLang.test.ts`（纯函数表）、`cards.test.tsx`（GoalCard） |
+| M-18 | `AssistantCard`：`hasError && presentedError.bodyText` 时渲染精简动作行（复制 / 复制纯文本 / 引用，`minimal`），不出朗读 / 重新生成 / 反馈；`MessageActions` 新增 `text` / `minimal` 参数 | `chat/cards.tsx` | `cards.test.tsx`（engine_error 带部分回答；stopped 可复制；纯终止器不出动作行） |
+| M-19 | 新增 `lib/chat/pure.speechLangFor`（汉字数 vs 拉丁词数粗判），`SpeakButton` 用它选 `zh-CN` / `en-US` | `lib/chat/pure.ts`、`chat/cards.tsx` | `speechLang.test.ts` |
+| M-20 | 复制失败（`clipboard.writeText` 拒绝）→ `useToast` 提示 `COPY_FAILED_TOAST`「复制失败，请手动选中文本复制」：`CopyIconButton` / `ReqIdChip` / `CodeBlock` / demo `CopyBtn`（无 Provider 子树里 `useToast` 是 no-op，不抛） | `chat/cards.tsx`、`CodeBlock.tsx`、`Message.tsx` | `cards.test.tsx`、`CodeBlock.test.tsx`（ToastProvider 内 alert 文案） |
+| M-22 | demo 通道：动作条加 `[@media(hover:none)]:opacity-100` + focus-within；按钮触屏 `size-11`、带 title；`UserMessage` 加复制；流式光标同走 `Markdown caret` | `Message.tsx` | 仅 demo，无既有测试；typecheck 覆盖 |
+| M-23 | 回到底部按钮加 `ring-[3px] ring-bg` 页面底色描边，触屏下 `-right-3` 挪进列表根边距 | `MessageRenderer.tsx` | T66 复跑（dock 几何不变）；after 截图 scroll-window mobile |
+
+### 8.2 计划外顺手项
+
+- 阶段 A 遗留在工作树里的半成品（上一手 opus-5-3 掉线前已改了 `cards.tsx` / `pure.ts` 的 M-03/M-09/M-16/M-19/M-20 部分与 `speechLang.test.ts`）经核对后沿用，并补齐了未接线的部分（`formatDurationSeconds` 已导入未使用、`MetaRow` 已收 `tokenUsage` 但 AssistantCard 未传、`MessageActions.minimal` 已加参数未使用）。
+- `MarkdownTable` 的滚动区加 `data-overflowing` 便于测试与截图台判读；`TokenUsageBadge` 单位 span 使用 `font-normal` 与数字区分。
+
+### 8.3 遗留（未修，写明理由）
+
+| 编号 | 理由 | 建议 |
+|---|---|---|
+| M-21 生成中查找不能跳转 | 计划里的「跳转但不 pin」要与 stick-to-bottom / wheelFence（T63/T66 守的滚动篱笆）重新约定谁拥有 scrollTop：`jumpTo` 目前会 `follow.current=false` + `findPin`，生成中若只做前者则新增内容不再跟随、用户找完也回不到底；若两者都不做则匹配行会被流式增长推走。需要一条独立的滚动交互设计 + 新真浏览器用例，不适合在审计修复轮顺手改 | 单独立项：生成中跳转 → 临时 pin 到匹配行、`sending` 结束或用户再滚动时释放 |
+| M-24 `_liveStreamBroken` 无 UI 消费方 | 复核后审计结论部分过时：重连宽限期标记 `_liveStreamBroken` 后 `reconcileVisibleAndInFlight → reconcileSession → startContinuousReconcile` 已把 `_recoveryStatus` 置为 `waiting-service / retrying`，TurnActivity 会显示「正在恢复实时内容…」；真正无提示的是 `outbound.resume_failed → applyResumeFailed → forceSync` 这一段 REST 全量同步窗口。在这里置 `waiting-service` 需要一个「同步完成」的清理钩子（否则状态悬挂到下一帧才被 `resumed` 覆盖），属 socket/useChatSocket 状态机小改 + 428KB `chat.test.ts` 回归，不在本轮小步范围 | 后续在 `useChatSocket.forceSync` 入口置 `waiting-service`、成功路径置 `resumed`（均绕开 `stopping`），补 `persist.test.ts` 用例 |
+| M-25 多标签旧快照覆写 IDB | 审计标注「待验证」，需两标签同会话的真实后端交互复现；本轮全部本地做（d-24），ui-preview / browser-tests 无 WS 后端，无法复现即不动持久层 | 有服务器通道后按 §4 计划先复现，再在 `putSession` 加 `updatedAt/_maxSeq` 版本比较 |
+
+## 9. 验证（阶段 B）
+
+（命令均在 `d:\code\test_project\test123\wt\messages` 工作树内执行）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | 绿（exit 0，≈40s） |
+| 模块 vitest | `cd packages\web-react; npx vitest run <本模块改动到的 15 个测试文件（cards / turnActivity / tokenUsage / AgentGroupCard / TeamPanel / historySkeleton / MessageRenderer / MarkdownImpl / Markdown / RichBlocks / CodeBlock / speechLang / MessageBoundary / ResponseRating / ToolCard）> --maxWorkers=1` | **15 文件 / 411 用例全绿**（46.8s；含 tools 模块的 ToolCard.test 以确认 token 徽章文案改动不影响其断言） |
+| 全部 web-react 单测 | `cd packages\web-react; npm test` | 278 文件 / 3750 用例：277 文件绿、3748 用例绿；唯一失败 `src/lib/tutorialShowcase.test.ts`（2 例，tutorials 模块的落盘产物字节数 / SHA 比对：46755≠46712），在**未改动的主克隆** `v5-selfhost` 上同样失败 → Windows autocrlf 基线问题，与本模块无关 |
+| 真浏览器门 | `cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` 组件门 **68/68 ok**（含新增 T68；T25/T38/T29/T46/T63/T66 复跑通过）。随后 `node --test` 的 16 个文件：并行首跑时 `chat-navigation` 首个子用例 `page.setContent` 4s 冷启超时（负载抖动），**单独重跑 10/10 通过**；`cc-switch-ascii-name`（settings 的 ApiKeysSection + 模型 id 断言 `gemini-3.8-flash` vs `sonnet-5`）单独重跑仍失败，且在**未改动的主克隆** `v5-selfhost` 上同样 2 例失败 → 基线问题，与本模块无关，已在交付里报指挥官 |
+| 代码风格 | `npx biome lint <改动文件>` | 改动文件上无新增诊断（剩余均为基线既有：useTemplate / useExhaustiveDependencies / noArrayIndexKey(cards.tsx 既有 key={i}) 等）；本轮新引入的一处 `role="status"` 按 useSemanticElements 改为 `<output>` |
+| after 截图 | `$env:OC_UI_SHOTS='D:\code\test_project\test123\.audit-tmp\messages\after'; $env:OC_UI_SCENES='messages-'; node browser-tests\ui-preview\shoot.mjs` | 28/28 成功（7 场景 × desktop/mobile × light/dark），`D:\code\test_project\test123\.audit-tmp\messages\after\`（长图切片在 `after\crops\`）；日志 `.audit-tmp\messages\{test-browser,vitest-all,vitest-module}.log` |
+
+### 9.1 before / after 对照要点（逐张 Read 审阅）
+
+| 场景 | before | after |
+|---|---|---|
+| `messages-scroll-window--mobile` | 每条用户消息「已回复」+ 3 个 44px 图标、每条助手 5 个图标，1 行正文配 3 行 chrome | 每条消息只剩一个「···」开关；无「已回复」；回到底部按钮带页面底色描边、挪进边距 |
+| `messages-assistant-streaming--desktop` | 光标落在正文下一行单独一行；footer 活动指示头像比助手头像右移 20px | 光标内联在「…静默窗」末尾同一行；footer 头像与助手头像同一竖线 |
+| `messages-timeline-rich--mobile`（表格切片） | `MessageRendere\nr.tsx`、`风\n险` 被拆行，表格被压进 390px | 标识符完整、表头不折行，表格按内容撑宽落进横滑区，提示「表格可左右滑动」因真溢出而显示 |
+| `messages-timeline-rich--mobile`（meta 切片） | `5.98k` 孤零零一行，下面另一行「55 分钟前 · 1,280 积分 · #…」 | 「55 分钟前 · 1,280 积分 · 5.98k token · #7f3a9c2e」同一行 |
+| `messages-timeline-rich--mobile`（目标卡） | `· 1260s` | `· 21 分钟` |
+| `messages-error-states--desktop` | 「失败」「失败 · 61s」旁绿勾；软提示 / 尾部骨架比时间线多缩进 | 失败摘要为红 ✕；软提示 / 骨架与时间线同列对齐 |
+| `messages-thinking-live` | 光标在思考正文下方单独一行 | 光标在最后一段末尾（muted 色） |
+
+### 9.2 模块 vitest 明细
+
+见 `.audit-tmp\messages\vitest-module.log`；关键新增用例：`cards.test.tsx` +14（M-01/03/07/08/09/10/17/18/20）、`turnActivity.test.tsx` +3（M-04）、`MarkdownImpl.test.tsx` +6（M-02/06）、`MessageRenderer.test.tsx` +3（M-01/05）、`AgentGroupCard.test.tsx` 新建 2（M-07/10）、`tokenUsage.test.ts` +1、`RichBlocks.test.tsx` +2、`historySkeleton.test.tsx` +1、`Markdown.test.tsx` +1、`CodeBlock.test.tsx` +1、`speechLang.test.ts` 新建（M-17/19）。
