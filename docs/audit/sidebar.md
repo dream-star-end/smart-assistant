@@ -250,6 +250,12 @@ node browser-tests\ui-preview\shoot.mjs
 | UCP-01 | 前端串行写 + 只写变更项，未新增批量接口 | 计划已注明需后端配合的路径先走保守方案；本轮不碰后端包。 |
 | ST-01 | 只改 `lib/sessionTitle.ts`（含导出 `EMPTY_SESSION_TITLE`） | `hooks/useChatSocket.ts:524` 属 messages 归属，见 §6.2。 |
 
+### 6.1.1 承接的跨模块请求
+
+| 来源 | 编号 | 改动 | 测试 |
+|---|---|---|---|
+| taskboard-B（fable-5-1-19 / fable-5-1-23） | T-02（P1） | `hooks/useProjectScope.tsx`：新增 `hydrated`（最近一次 `listProjects` **成功**）；找不到的 token 只在 `hydrated && !loading` 时才判真失效回落 `all`。列表未到位、请求失败、未登录三种情况保留 token——对外 `token` 经 `preferredScopeToken` 已是 `all`（UI fail-closed），但 URL `?project=` 与 localStorage 记忆原样保留，列表到位后自动命中；项目已删 / 已归档仍回落并清参数。 | 新增 `hooks/useProjectScope.test.tsx` 4 条（到位前保留 → 到位后 scope=work；真失效回落；请求失败不抹链接、下次成功命中；未登录不校验）；`lib/projectScope.test.ts`、`taskboard.test.tsx`（49）、`UsageTab.test.tsx` 回归绿。 |
+
 ### 6.2 遗留与跨模块接线（集成时处理）
 
 | 项 | 状态 | 说明 |
