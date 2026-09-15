@@ -3154,6 +3154,9 @@
       "severity": "P0",
       "symptom": "商业版 GPT-6-Astra x6.1/1M 卡死「正在启动引擎」数小时零 token：Codex ChatGPT-auth Responses websocket 直连 wss://chatgpt.com（容器 Network unreachable），stderr 被当成 liveness，USER_CANCELLED 后复用同一死 PID。",
       "rootFixCommit": "25a5b3c9",
+      "coverageCommits": [
+        "3144c3a9"
+      ],
       "regressions": [
         {
           "layer": "unit",
