@@ -3788,23 +3788,24 @@ export function App() {
           )}
           {(bannerStack.hidden.length > 0 || bannerStack.canCollapse) && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert
-                tone="info"
-                density="compact"
-                live="off"
-                data-testid="banner-stack-collapsed"
-                action={
+              {/* 折叠条不走 Alert 的 action 槽:那个槽在 <sm 会整行换到第二行右对齐(给「重试」类
+                  动作设计的),折叠条要的是"一行文字 + 行内切换键",在 390px 上两行会把省下来的
+                  高度又吃回去。 */}
+              <Alert tone="info" density="compact" live="off" data-testid="banner-stack-collapsed">
+                <div className="flex items-center justify-between gap-3">
+                  <span>
+                    {bannersExpanded ? "已展开全部提示" : collapsedBannersLabel(bannerStack.hidden.length)}
+                  </span>
                   <Button
                     size="sm"
                     variant="ghost"
+                    className="-my-1.5 -mr-1.5 shrink-0"
                     aria-expanded={bannersExpanded}
                     onClick={() => setBannersExpanded((v) => !v)}
                   >
                     {bannersExpanded ? "收起" : "展开"}
                   </Button>
-                }
-              >
-                {bannersExpanded ? "已展开全部提示" : collapsedBannersLabel(bannerStack.hidden.length)}
+                </div>
               </Alert>
             </div>
           )}

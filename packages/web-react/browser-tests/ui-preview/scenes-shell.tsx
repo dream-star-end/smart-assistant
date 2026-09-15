@@ -118,17 +118,14 @@ function GlobalBanners() {
         )}
         {hidden.length > 0 && (
           <div className="mx-auto mb-2 max-w-3xl px-4">
-            <Alert
-              tone="info"
-              density="compact"
-              live="off"
-              action={
-                <Button size="sm" variant="ghost" aria-expanded={false}>
+            {/* 与 App.tsx 同构:折叠条是"一行文字 + 行内切换键",不走 action 槽(窄屏会换行)。 */}
+            <Alert tone="info" density="compact" live="off">
+              <div className="flex items-center justify-between gap-3">
+                <span>{collapsedBannersLabel(hidden.length)}</span>
+                <Button size="sm" variant="ghost" className="-my-1.5 -mr-1.5 shrink-0" aria-expanded={false}>
                   展开
                 </Button>
-              }
-            >
-              {collapsedBannersLabel(hidden.length)}
+              </div>
             </Alert>
           </div>
         )}
