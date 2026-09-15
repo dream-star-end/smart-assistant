@@ -118,6 +118,19 @@ describe('classifyRunError', () => {
     assert.equal(classifyRunError('getaddrinfo EAI_AGAIN api.anthropic.com').code, 'upstream_failed')
   })
 
+  it('upstream_failed: Codex chatgpt.com Responses websocket direct', () => {
+    assert.equal(
+      classifyRunError(
+        'failed to connect to websocket: IO error: Network unreachable (os error 101), url: wss://chatgpt.com/backend-api/codex/responses',
+      ).code,
+      'upstream_failed',
+    )
+    assert.equal(
+      classifyRunError('CODEX_CHATGPT_WS_DIRECT: Codex Responses websocket bypassed loopback relay').code,
+      'upstream_failed',
+    )
+  })
+
   it('upstream_failed: ACCOUNT_POOL_BUSY', () => {
     // "all accounts busy" 里的 "busy" 不带前置 "model" → 不误判 model_capacity,
     // 仍归 upstream(词族边界回归)。

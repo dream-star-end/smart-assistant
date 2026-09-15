@@ -1103,6 +1103,12 @@ export class CodexAppServerRunner extends EventEmitter {
   private shuttingDown = false
   private spawnEmitted = false
   private initialized = false
+  /**
+   * USER_CANCELLED 只发 turn/interrupt、不杀进程。合作式 summary 到达后
+   * sessionManager 会跳过 shutdown,下一 turn ensureSpawned 会复用已经
+   * websocket/relay 死掉的 PID。置位后下一 ensureSpawned 必须 recycle。
+   */
+  private staleProcGeneration = false
   /** True iff the *current* app-server proc has done thread/start or
    *  thread/resume for this.threadId. Cleared when the proc dies. Distinct
    *  from `initialized` (which tracks the JSON-RPC handshake) — re-spawning
@@ -1633,6 +1639,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
     // **必须先于 proc 存活守卫**:proc 已死但退避 sleep 仍在跑时(如 crash 与 close
     // 之间的窗口),用户 stop 也要能立即中断退避,否则要等满退避才收尾。
+    this.staleProcGeneration = true
     if (this.pendingRetryAbort) {
       this.pendingRetryAbort.abort()
       return true
@@ -2007,7 +2014,34 @@ export class CodexAppServerRunner extends EventEmitter {
    * app-server finished the handshake (preheat + submit race). */
   private _spawnPromise: Promise<void> | null = null
 
+  /**
+   * Kill the current app-server without rejecting already-queued turns.
+   * Used after interrupt (stale hung PID) and after a cooperative USER_CANCELLED
+   * so the next submit cannot reuse a websocket-dead process.
+   */
+  private async recycleProcKeepQueue(reason: string): Promise<void> {
+    const queuedTurns = this.queue
+    this.queue = []
+    try {
+      log.info('codex app-server recycle proc', {
+        sessionKey: this.opts.sessionKey,
+        reason,
+        pid: this.proc?.pid ?? null,
+      })
+      await this.shutdown()
+    } finally {
+      if (queuedTurns.length > 0) {
+        this.queue = queuedTurns.concat(this.queue)
+      }
+      this.staleProcGeneration = false
+    }
+  }
+
   private async ensureSpawned(repoSnap: RepoSnapshot | null, effectiveCwd: string): Promise<void> {
+    if (this.staleProcGeneration && this.proc) {
+      await this.recycleProcKeepQueue('interrupt-fence')
+    }
+    if (!this.proc) this.staleProcGeneration = false
     if (this.proc && !this.proc.killed && this.initialized) return
     const inflight = this._spawnPromise
     if (inflight) return inflight
@@ -3775,7 +3809,8 @@ export class CodexAppServerRunner extends EventEmitter {
       })
     }
     if (result.activityLines > 0) this.lastActivityAt = Date.now()
-    if (result.abort) this.abortTurnForRelayPathDenied()
+    if (result.abortWebsocketDirect) this.abortTurnForChatgptWebsocketDirect()
+    else if (result.abort) this.abortTurnForRelayPathDenied()
   }
 
   /** @internal */
@@ -3791,6 +3826,19 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter = null
     }
     void this.shutdown()
+  }
+
+  private abortTurnForChatgptWebsocketDirect(): void {
+    const err = new Error(
+      'CODEX_CHATGPT_WS_DIRECT: Codex Responses websocket bypassed loopback relay (wss://chatgpt.com); aborting turn',
+    )
+    err.name = 'CodexChatgptWebsocketDirectError'
+    if (this.currentTurnCompleter) {
+      this.currentTurnCompleter.reject(err)
+      this.currentTurnCompleter = null
+    }
+    this.staleProcGeneration = true
+    void this.recycleProcKeepQueue('chatgpt-ws-direct')
   }
 
   private _isZeroBreakdown(b: CodexTokenBreakdown): boolean {
@@ -3902,6 +3950,8 @@ export class CodexAppServerRunner extends EventEmitter {
     log.info('codex app-server turn start', {
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
+      pid: this.proc?.pid ?? null,
+      reusedProc: Boolean(this.proc && this.initialized && !this.staleProcGeneration),
       promptChars: prompt.length,
       effectiveCwd,
       repoBound: this._boundRepoBinding != null,
@@ -4243,6 +4293,9 @@ export class CodexAppServerRunner extends EventEmitter {
             stopReason: 'interrupted',
             terminalCode: 'USER_CANCELLED',
           })
+          // Cooperative turn/interrupt does not kill app-server. Reap now so
+          // the next submit cannot reuse a hung ChatGPT-WS process (OCV5-224).
+          void this.recycleProcKeepQueue('user-cancelled')
         } else {
           this.emitResult({
             durationMs,

@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 import {
   CODEX_RELAY_PATH_DENIED_ABORT_AFTER,
   CodexRelayPathDeniedTracker,
+  isCodexChatgptWebsocketDirectLine,
   isCodexRelayPathDeniedLine,
   shouldAbortOnRelayPathDenied,
 } from '../engine/codexRelayPathGuard.js'
@@ -54,5 +55,21 @@ describe('codexRelayPathGuard', () => {
     const burst = webchat.consume(`${DENIED}\n${DENIED}\n${DENIED}\n`)
     assert.equal(burst.deniedLines, 3)
     assert.equal(burst.abort, false)
+    assert.equal(burst.abortWebsocketDirect, false)
+  })
+
+  it('识别 chatgpt.com Responses WS 直连,且不算 activity', () => {
+    const ws =
+      'failed to connect to websocket: IO error: Network unreachable (os error 101), url: wss://chatgpt.com/backend-api/codex/responses'
+    assert.equal(isCodexChatgptWebsocketDirectLine(ws), true)
+    assert.equal(isCodexChatgptWebsocketDirectLine(DENIED), false)
+    assert.equal(isCodexChatgptWebsocketDirectLine('failed to refresh available models: Connection failed'), false)
+
+    const webchat = new CodexRelayPathDeniedTracker(false)
+    const hit = webchat.consume(`${ws}\n`)
+    assert.equal(hit.websocketDirectLines, 1)
+    assert.equal(hit.activityLines, 0)
+    assert.equal(hit.abort, false)
+    assert.equal(hit.abortWebsocketDirect, true)
   })
 })

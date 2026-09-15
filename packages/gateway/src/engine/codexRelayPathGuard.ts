@@ -4,8 +4,9 @@
  * rmcp worker 退出再重连,stderr 一直刷,若把这些行当成 lastActivityAt,
  * idle timeout 永不触发,taskboard 就会空转撞 50min 租约墙。
  *
- * 本模块按完整行分类,不负责杀进程。abort 仅在 caller 打开 abortEnabled
- * (阶段 / 巡检会话)时成立。
+ * 本模块按完整行分类,不负责杀进程。PATH_NOT_ALLOWED abort 仅在 caller 打开
+ * abortEnabled(阶段 / 巡检会话)时成立。ChatGPT Responses WS 直连是数据面失败,
+ * 对 webchat 也 abort,且不得刷新 idle。
  */
 
 export const CODEX_RELAY_PATH_DENIED_CODE = 'PATH_NOT_ALLOWED'
@@ -25,12 +26,24 @@ export function shouldAbortOnRelayPathDenied(consecutiveDenied: number): boolean
   return consecutiveDenied >= CODEX_RELAY_PATH_DENIED_ABORT_AFTER
 }
 
+/** Codex 0.15x ChatGPT-auth 把 Responses 走硬编码 wss://chatgpt.com,不经 relay。 */
+export function isCodexChatgptWebsocketDirectLine(line: string): boolean {
+  if (!line) return false
+  const lower = line.toLowerCase()
+  if (!lower.includes('failed to connect to websocket') && !lower.includes('network unreachable')) {
+    return false
+  }
+  return line.includes('wss://chatgpt.com') && line.includes('codex/responses')
+}
+
 export interface RelayDeniedConsumeResult {
   completeLines: string[]
   deniedLines: number
   activityLines: number
   consecutiveDenied: number
   abort: boolean
+  websocketDirectLines: number
+  abortWebsocketDirect: boolean
 }
 
 /**
@@ -48,6 +61,7 @@ export class CodexRelayPathDeniedTracker {
     const completeLines: string[] = []
     let deniedLines = 0
     let activityLines = 0
+    let websocketDirectLines = 0
     let nl = this.buf.indexOf('\n')
     while (nl >= 0) {
       const raw = this.buf.slice(0, nl).replace(/\r$/, '')
@@ -59,6 +73,8 @@ export class CodexRelayPathDeniedTracker {
       if (isCodexRelayPathDeniedLine(line)) {
         deniedLines += 1
         this.consecutive += 1
+      } else if (isCodexChatgptWebsocketDirectLine(line)) {
+        websocketDirectLines += 1
       } else {
         activityLines += 1
         this.consecutive = 0
@@ -70,6 +86,8 @@ export class CodexRelayPathDeniedTracker {
       activityLines,
       consecutiveDenied: this.consecutive,
       abort: this.abortEnabled && shouldAbortOnRelayPathDenied(this.consecutive),
+      websocketDirectLines,
+      abortWebsocketDirect: websocketDirectLines > 0,
     }
   }
 
@@ -82,6 +100,8 @@ export class CodexRelayPathDeniedTracker {
         activityLines: 0,
         consecutiveDenied: this.consecutive,
         abort: this.abortEnabled && shouldAbortOnRelayPathDenied(this.consecutive),
+        websocketDirectLines: 0,
+        abortWebsocketDirect: false,
       }
     }
     const leftover = this.buf
