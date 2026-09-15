@@ -472,3 +472,15 @@ cost-authority / ocv5-185 / ocv5-210 系列全绿。
 | Chip 44px 对 manage / market 筛选条的影响 | S-14 跨模块 | 触屏下筛选行约高 8px。需 **manage owner（fable-5-1-20）/ market owner（fable-5-1-19）** 在各自 after 图里确认无换行 / 溢出。 |
 | `EmptyState` 的 `text-[26px]` / `text-[15px]` / `text-[14px]` | S-15 余项 | 按 §5 结论等排版档位专项统一收敛，本轮不新增 token。 |
 | 本机 `core.autocrlf=true` 带来的两处环境噪音 | 环境 | ① `tutorialShowcase.test.ts` 字节 / SHA 断言在 Windows 检出下必红（主克隆同样红）；② `biome format` 对所有 CRLF 工作副本报整文件重排。都不是代码问题；若要在 Windows 上让它们绿，需仓库加 `.gitattributes`（`*.html text eol=lf` 等）—— 属仓库级约定，本轮不动。 |
+
+### 8.1 待 integration 接线（其他模块对 `App.tsx` 的跨归属需求）
+
+这些 prop 由对方分支新增，本分支基于基线**没有它们的类型**，在 `wt\shell` 里接会让 typecheck 转红；
+按指挥官指示只在此登记，合入 integration 分支 `feat/v5-selfhost-ocv5-audit-ux` 时由指挥官顺手接。
+行号以本分支 HEAD `d2f21dd18` 的 `App.tsx` 为准。
+
+| 来源 | 位置（本分支） | 改动 | 目的 |
+|---|---|---|---|
+| sidebar-B S-08（fable-5-1-13） | `App.tsx:630` 附近 `useSessionList({...})` 的返回值解构 | 多解构一项 `loadMoreError` | — |
+| sidebar-B S-08（fable-5-1-13） | `App.tsx:3344` `sidebarProps` 内紧邻 `loadingMore: loadingMoreSessions,` | 加一行 `loadMoreError,` | 加载更早会话失败时侧栏底部显示「加载更早会话失败，点击重试」 |
+| sidebar-B S-06（fable-5-1-13） | `App.tsx:3413-3441` 移动端抽屉 `<Sidebar … onCollapse={() => setMobileNavOpen(false)}` | 加 `collapseLabel="关闭导航"`（桌面内联侧栏 `App.tsx:3375-3400` 的 `onCollapse={() => setCollapsed(true)}` **不动**） | 抽屉里的折叠键读屏文案从「折叠侧栏」改为「关闭导航」 |
