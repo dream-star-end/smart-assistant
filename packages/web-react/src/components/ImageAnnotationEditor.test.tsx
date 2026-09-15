@@ -180,6 +180,60 @@ describe('误触保护确认层(需求 §5)', () => {
   })
 })
 
+// ── 审计 M-12:底栏按钮不得随每次渲染重挂载(焦点会掉回 body)。 ──
+describe('底栏按钮稳定性(M-12)', () => {
+  test('点「放大画布」后按钮仍是同一节点且保持焦点', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const zoomIn = await screen.findByRole('button', { name: '放大画布' })
+    zoomIn.focus()
+    fireEvent.click(zoomIn) // setView → 重渲
+    const after = screen.getByRole('button', { name: '放大画布' })
+    expect(after).toBe(zoomIn)
+    expect(document.activeElement).toBe(zoomIn)
+    expect(screen.getByText('120%')).toBeInTheDocument()
+  })
+
+  test('工具菜单里的选项点选后菜单收起、触发钮回显(提到模块顶层后契约不变)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    fireEvent.click(await screen.findByRole('button', { name: /更多工具/ }))
+    fireEvent.click(screen.getByRole('button', { name: '橡皮' }))
+    expect(screen.queryByRole('button', { name: '橡皮' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /当前：橡皮/ })).toBeInTheDocument()
+  })
+})
+
+// ── 审计 M-11 / M-23:画布区为滑杆让位;提示词框随内容自增高。 ──
+describe('画布区布局与提示词框(M-11 / M-23)', () => {
+  test('画布容器左侧为笔刷滑杆留出 ≥56px 内边距', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const slider = await screen.findByRole('slider', { name: '画笔粗细' })
+    const canvasArea = slider.closest('.flex-1') as HTMLElement
+    expect(canvasArea).toHaveClass('pl-14')
+    expect(canvasArea).not.toHaveClass('px-3')
+  })
+
+  test('提示词框输入多行 → 高度随 scrollHeight 增长并在 112px 封顶', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const ta = (await screen.findByLabelText('希望怎样修改')) as HTMLTextAreaElement
+    // jsdom 不做布局,scrollHeight 恒 0 → 在 textarea 原型上临时给一个可控值。
+    const proto = HTMLTextAreaElement.prototype
+    Object.defineProperty(proto, 'scrollHeight', { get: () => 72, configurable: true })
+    try {
+      fireEvent.change(ta, { target: { value: '第一行\n第二行\n第三行' } })
+      expect(ta.style.height).toBe('72px')
+      Object.defineProperty(proto, 'scrollHeight', { get: () => 400, configurable: true })
+      fireEvent.change(ta, { target: { value: '很多行'.repeat(40) } })
+      expect(ta.style.height).toBe('112px')
+    } finally {
+      Reflect.deleteProperty(proto, 'scrollHeight')
+    }
+  })
+})
+
 // 完整取图 + 画布就绪的测试台:mock 2d ctx / Image / createObjectURL。
 function stubCanvasPipeline(opts: { selection?: boolean } = {}) {
   const alpha = opts.selection ? 255 : 0
