@@ -1,12 +1,12 @@
 /**
- * 阶段 A · shell（应用壳层与设计系统）审计场景。
+ * shell（应用壳层与设计系统）审计场景。
  *
- * 归属任务：A·shell 应用壳层与设计系统审计。这些场景只为**取证**存在 —— 把 App.tsx
- * 里散落在条件分支深处、真机上难以同时凑齐的壳层界面（横幅栈 / 空态 / chunk 兜底 /
- * 原语总览 / 营销主题 token）摆到一张静态页上，好让 desktop/mobile × light/dark 四张图
- * 直接充当问题清单的证据。
+ * 阶段 A 用它取证：把 App.tsx 里散落在条件分支深处、真机上难以同时凑齐的壳层界面
+ * （横幅栈 / 空态 / chunk 兜底 / 原语总览 / 营销主题 token）摆到一张静态页上，
+ * 让 desktop/mobile × light/dark 四张图直接充当问题清单的证据。
+ * 阶段 B 用同一组场景出 after 图与 before 对照（S-03 / S-04 / S-06 / S-09 / S-13 / S-14）。
  *
- * 不包含任何业务逻辑改动：全部渲染真实组件，数据是就地写死的桩。
+ * 全部渲染真实组件，数据是就地写死的桩。
  */
 import { RefreshCw, Trash2, X } from 'lucide-react'
 import type { ReactNode } from 'react'
@@ -29,6 +29,7 @@ import {
   Textarea,
 } from '../../src/components/ui'
 import type { Agent } from '../../src/lib/agents'
+import { type BannerKind, collapsedBannersLabel, resolveBanners } from '../../src/lib/bannerStack'
 import type { Scene } from './types'
 
 const AGENT: Agent = {
@@ -47,59 +48,90 @@ const AGENT: Agent = {
 }
 
 /**
- * 输入框上方的全局横幅栈。App.tsx 3700–3750 把 dormant / TurnCostReminder /
- * 连接状态 / UpdateBanner / ErrorBanner 依次挂在同一个 `composer-safe-b` 容器里，
- * 彼此没有互斥也没有条数上限 —— 这一屏就是它们同时成立时的真实叠放高度。
- * UpdateBanner 走 appUpdate 单例，这里用同构的 Alert 复刻它的视觉，不去改全局状态。
+ * 输入框上方的全局横幅栈。阶段 A 时 App.tsx 把 dormant / TurnCostReminder / 连接状态 /
+ * UpdateBanner / ErrorBanner 依次挂在同一个 `composer-safe-b` 容器里，彼此没有互斥也没有
+ * 条数上限（before 图 390×844 下横幅吃掉 ~560px）。阶段 B（S-06）起由 `resolveBanners`
+ * 统一裁决：按优先级排序、同屏最多 2 条、其余折叠成一行「还有 N 条提示」。
+ * 这一屏用同一个纯函数重放"四条同时成立"的情形；UpdateBanner 走 appUpdate 单例，
+ * 这里用同构的 Alert 复刻它阶段 B 后的视觉（动作进 action 槽、全角标点）。
  */
 function GlobalBanners() {
+  const active: BannerKind[] = ['dormant', 'connection', 'update', 'error']
+  const { visible, hidden } = resolveBanners(active)
+  const show = (k: BannerKind) => visible.includes(k)
   return (
     <div className="flex h-full flex-col bg-bg text-fg">
       <div className="flex min-h-0 flex-1 items-center justify-center px-4 text-center text-meta text-faint">
         对话区（横幅每多一条就少一条消息的可视高度）
       </div>
       <div className="shrink-0 composer-safe-b">
-        <div className="mx-auto mb-2 max-w-3xl px-4">
-          <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
-        </div>
-        <div className="mx-auto mb-2 max-w-3xl px-4">
-          <Alert
-            tone="warning"
-            action={
-              <Button size="sm" variant="secondary">
-                立即重连
-              </Button>
-            }
-          >
-            与服务端的连接已断开，正在重连…
-          </Alert>
-        </div>
-        <div className="mx-auto mb-2 max-w-3xl px-4">
-          <Alert tone="info" icon={<RefreshCw size={16} />}>
-            <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <span>新版本已就绪,刷新页面即可更新。</span>
-              <button
-                type="button"
-                className="font-medium text-accent underline underline-offset-2"
-              >
-                立即刷新
-              </button>
-              <button type="button" className="text-muted underline underline-offset-2">
-                稍后
-              </button>
-            </span>
-          </Alert>
-        </div>
-        <ErrorBanner
-          error={{
-            message: '模型返回超时（上游 504），本轮未产生计费。',
-            requestId: 'req_8f21c0b4d7e94a13',
-            retryText: '帮我把这份周报压缩成三条要点',
-          }}
-          onRetry={() => {}}
-          onDismiss={() => {}}
-          onSwitchModel={() => {}}
-        />
+        {show('error') && (
+          <ErrorBanner
+            error={{
+              message: '模型返回超时（上游 504），本轮未产生计费。',
+              requestId: 'req_8f21c0b4d7e94a13',
+              retryText: '帮我把这份周报压缩成三条要点',
+            }}
+            onRetry={() => {}}
+            onDismiss={() => {}}
+            onSwitchModel={() => {}}
+          />
+        )}
+        {show('connection') && (
+          <div className="mx-auto mb-2 max-w-3xl px-4">
+            <Alert
+              tone="warning"
+              action={
+                <Button size="sm" variant="secondary">
+                  立即重连
+                </Button>
+              }
+            >
+              与服务端的连接已断开，正在重连…
+            </Alert>
+          </div>
+        )}
+        {show('dormant') && (
+          <div className="mx-auto mb-2 max-w-3xl px-4">
+            <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
+          </div>
+        )}
+        {show('update') && (
+          <div className="mx-auto mb-2 max-w-3xl px-4">
+            <Alert
+              tone="info"
+              icon={<RefreshCw size={16} />}
+              action={
+                <>
+                  <Button size="sm" variant="ghost">
+                    稍后
+                  </Button>
+                  <Button size="sm" variant="link">
+                    立即刷新
+                  </Button>
+                </>
+              }
+            >
+              新版本已就绪，刷新页面即可更新。
+            </Alert>
+          </div>
+        )}
+        {hidden.length > 0 && (
+          <div className="mx-auto mb-2 max-w-3xl px-4">
+            <Alert
+              tone="info"
+              density="compact"
+              live="off"
+              action={
+                <Button size="sm" variant="ghost" aria-expanded={false}>
+                  展开
+                </Button>
+              }
+            >
+              {collapsedBannersLabel(hidden.length)}
+            </Alert>
+          </div>
+        )}
         <div className="mx-auto max-w-3xl px-4 pb-3">
           <div className="flex items-end gap-2 rounded-xl2 border border-border-control bg-surface p-3">
             <span className="min-h-[24px] flex-1 text-sm text-faint">和「全能助手」对话…</span>
@@ -290,11 +322,11 @@ function UiKit() {
 }
 
 /**
- * 营销主题（`.congjian-landing`）的语义色对照。该块把 20 个 token 就地重定义了一遍，
- * 但 `--danger` / `--danger-soft`（含编译后的 `--color-danger*`）没有覆盖 ——
- * 于是容器内的错误态会拿 `:root` 的浅色主题红去压近黑底。这一屏就是给那条问题的证据：
- * danger 行与旁边的 success/warning/info 明显不是同一套亮度。
- * 同时 designTokens.test.ts 只解析 `:root` 与 `.dark`，本块没有任何对比度守卫。
+ * 营销主题（`.congjian-landing`）的语义色对照。阶段 A 时该块把 20 个 token 就地重定义了
+ * 一遍，但 `--danger` / `--danger-soft`（含编译后的 `--color-danger*`）没有覆盖 —— 容器内的
+ * 错误态会拿 `:root` 的浅色主题红去压近黑底（before 图里 danger 行与 success/warning/info
+ * 明显不是同一套亮度）。阶段 B（S-04 / S-05）补上了 danger 三件套并把该块纳入
+ * designTokens.test.ts 的对比度守卫；after 图里四行应在同一亮度带。
  */
 function LandingTokens() {
   // 类名必须字面量书写:Tailwind 扫不到运行时拼接出来的 `"text-" + tone`。
@@ -310,7 +342,7 @@ function LandingTokens() {
         <div>
           <h1 className="text-[22px] font-semibold text-fg">营销主题语义色对照</h1>
           <p className="mt-1 text-meta text-muted">
-            `.congjian-landing` 重定义了 20 个 token，唯独漏了 --danger / --danger-soft。
+            `.congjian-landing` 的 info / success / warning / danger 四档应在同一亮度带。
           </p>
         </div>
         {tones.map(({ tone, text }) => (
@@ -388,7 +420,7 @@ export const shellScenes: Scene[] = [
   },
   {
     id: 'shell-landing-tokens',
-    label: '壳层 · 营销主题语义色（--danger 未覆盖）',
+    label: '壳层 · 营销主题语义色四档对照',
     group: '工作区',
     viewports: ['desktop', 'mobile'],
     api: {},
