@@ -12,10 +12,12 @@ import {
 
 /**
  * 空态提示行的变体：
- * - `empty-list`：整个活动列表一条会话都没有（新用户 / 全部归档）——这是唯一值得叠大 CTA 的空态；
+ * - `empty-all`：零会话且零项目（新用户）——整个列表只剩这一块引导（说明 + 新建会话 + 新建项目），
+ *   不再渲染「项目 +」「未分类 0」骨架（审计 S-13）；「已归档」开关照常保留，它是归档会话唯一的入口；
+ * - `empty-list`：整个活动列表一条会话都没有但已有项目（全部归档 / 建了项目还没聊）——未分类空态叠大 CTA；
  * - `empty-project`：某个分组暂无会话但别处有会话——只占一行普通高度，避免多个空项目把会话挤出视口（审计 S-01）。
  */
-export type EmptyHintVariant = "empty-list" | "empty-project";
+export type EmptyHintVariant = "empty-all" | "empty-list" | "empty-project";
 
 export type FlatItem =
   | { kind: "header"; key: string; label: string; height: number }
@@ -149,7 +151,20 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
   // 整个活动列表为空（新用户 / 全部归档）才叠大 CTA；否则空分组只占一行普通提示（S-01）。
   const listEmpty = input.sessions.filter((s) => !s.archived).length === 0;
 
-  if (input.showProjects) {
+  // 零会话且零项目：只渲染一块引导空态，不再摆「项目 +」「未分类 0」骨架（S-13）。
+  // 「已归档」开关在下面照常追加——归档列表按需拉取，此刻计数 0 不代表真没有。
+  const brandNew = listEmpty && (!input.showProjects || input.projects.length === 0);
+  if (brandNew) {
+    items.push({
+      kind: "hint",
+      key: "empty-all",
+      text: "还没有会话",
+      height: HINT_ROW_HEIGHT,
+      variant: "empty-all",
+    });
+  }
+
+  if (!brandNew && input.showProjects) {
     items.push({
       kind: "header",
       key: "h-projects",
@@ -195,35 +210,37 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
     }
   }
 
-  const defaultKids = input.ungroupedGroups.flatMap(([, list]) => list);
-  const defaultCollapsed = input.collapsedProjectIds?.has(DEFAULT_PROJECT_ID) ?? false;
-  items.push({
-    kind: "project",
-    key: `p-${DEFAULT_PROJECT_ID}`,
-    project: virtualDefaultProject(defaultKids.length),
-    count: defaultKids.length,
-    collapsed: defaultCollapsed,
-    runningCount: runningIn(defaultKids, input.isRunning),
-    height: PROJECT_ROW_HEIGHT,
-  });
-  if (!defaultCollapsed) {
-    if (defaultKids.length === 0) {
-      items.push({
-        kind: "hint",
-        key: `p-empty-${DEFAULT_PROJECT_ID}`,
-        text: "暂无会话",
-        height: HINT_ROW_HEIGHT,
-        variant: listEmpty ? "empty-list" : "empty-project",
-      });
-    }
-    for (const s of defaultKids) {
-      items.push({
-        kind: "session",
-        key: `s-${s.id}`,
-        session: s,
-        indent: true,
-        height: SESSION_ROW_HEIGHT,
-      });
+  if (!brandNew) {
+    const defaultKids = input.ungroupedGroups.flatMap(([, list]) => list);
+    const defaultCollapsed = input.collapsedProjectIds?.has(DEFAULT_PROJECT_ID) ?? false;
+    items.push({
+      kind: "project",
+      key: `p-${DEFAULT_PROJECT_ID}`,
+      project: virtualDefaultProject(defaultKids.length),
+      count: defaultKids.length,
+      collapsed: defaultCollapsed,
+      runningCount: runningIn(defaultKids, input.isRunning),
+      height: PROJECT_ROW_HEIGHT,
+    });
+    if (!defaultCollapsed) {
+      if (defaultKids.length === 0) {
+        items.push({
+          kind: "hint",
+          key: `p-empty-${DEFAULT_PROJECT_ID}`,
+          text: "暂无会话",
+          height: HINT_ROW_HEIGHT,
+          variant: listEmpty ? "empty-list" : "empty-project",
+        });
+      }
+      for (const s of defaultKids) {
+        items.push({
+          kind: "session",
+          key: `s-${s.id}`,
+          session: s,
+          indent: true,
+          height: SESSION_ROW_HEIGHT,
+        });
+      }
     }
   }
 

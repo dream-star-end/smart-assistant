@@ -5,11 +5,23 @@ import { ToastProvider, TooltipProvider } from "./ui";
 import { api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { ProjectAsset } from "../lib/types";
-import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
+import { ProjectAssetsPanel, uploadingLabel } from "./ProjectAssetsPanel";
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+});
+
+// PA-03：多文件顺序上传此前只有一行「正在上传…」，无法判断进度。
+describe("uploadingLabel", () => {
+  test("单文件 / 无进度只说正在上传；多文件带「第 N/M 个」", () => {
+    expect(uploadingLabel(null)).toBe("正在上传…");
+    expect(uploadingLabel({ done: 0, total: 1 })).toBe("正在上传…");
+    expect(uploadingLabel({ done: 0, total: 5 })).toBe("正在上传 1/5 个文件…");
+    expect(uploadingLabel({ done: 2, total: 5 })).toBe("正在上传 3/5 个文件…");
+    // 最后一个处理完、状态尚未清空的一瞬不越界到 6/5。
+    expect(uploadingLabel({ done: 5, total: 5 })).toBe("正在上传 5/5 个文件…");
+  });
 });
 
 function asset(partial: Partial<ProjectAsset> & Pick<ProjectAsset, "id" | "name">): ProjectAsset {

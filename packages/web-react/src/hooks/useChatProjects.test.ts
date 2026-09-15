@@ -106,6 +106,82 @@ describe("useChatProjects 列表拉取失败", () => {
   });
 });
 
+// UCP-01：项目排序此前对 N 个项目并发 N 个 PATCH，任一失败再并发 N 个回滚（请求风暴 + 服务端中间态）。
+describe("useChatProjects reorderProjects 串行写入", () => {
+  function setup(initial: ChatProject[]) {
+    vi.spyOn(api, "listChatProjects").mockResolvedValue(initial);
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    return renderHook(
+      () =>
+        useChatProjects({
+          demo: false,
+          auth,
+          authSession: auth,
+          userId: "u1",
+          promptText: async () => null,
+          confirmDialog: async () => true,
+        }),
+      { wrapper: ToastProvider },
+    );
+  }
+
+  test("只 PATCH sortOrder 真变了的项目，且一条接一条串行发出", async () => {
+    const { result } = setup([proj("p-a", 0), proj("p-b", 1), proj("p-c", 2)]);
+    await waitFor(() => expect(result.current.projects).toHaveLength(3));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const patch = vi.spyOn(api, "patchChatProject").mockImplementation(async (_a, id, body) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 0));
+      inFlight -= 1;
+      return { ...proj(id), ...body } as ChatProject;
+    });
+    await act(async () => {
+      // 把 p-c 挪到最前：p-a / p-b 各后移一位，三条都变了。
+      await result.current.reorderProjects(["p-c", "p-a", "p-b"]);
+    });
+    expect(patch).toHaveBeenCalledTimes(3);
+    expect(maxInFlight).toBe(1);
+    expect(patch.mock.calls.map((c) => [c[1], c[2]])).toEqual([
+      ["p-c", { sortOrder: 0 }],
+      ["p-a", { sortOrder: 1 }],
+      ["p-b", { sortOrder: 2 }],
+    ]);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["p-c", "p-a", "p-b"]);
+
+    patch.mockClear();
+    await act(async () => {
+      // 只交换后两位：p-c 位置不变，不再为它发一次无意义的 PATCH。
+      await result.current.reorderProjects(["p-c", "p-b", "p-a"]);
+    });
+    expect(patch.mock.calls.map((c) => c[1])).toEqual(["p-b", "p-a"]);
+  });
+
+  test("中途失败：在失败点停下，只回滚已改成功的那几条，本地顺序恢复并 toast", async () => {
+    const { result } = setup([proj("p-a", 0), proj("p-b", 1), proj("p-c", 2)]);
+    await waitFor(() => expect(result.current.projects).toHaveLength(3));
+    const patch = vi.spyOn(api, "patchChatProject").mockImplementation(async (_a, id, body) => {
+      if (id === "p-a" && body.sortOrder === 1) {
+        throw new ApiError({ status: 500, message: "boom" });
+      }
+      return { ...proj(id), ...body } as ChatProject;
+    });
+    await act(async () => {
+      await expect(result.current.reorderProjects(["p-c", "p-a", "p-b"])).rejects.toThrow("boom");
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    // 正向：p-c 成功、p-a 失败即停，p-b 根本没发；回滚：只回滚 p-c 到原来的 2。
+    expect(patch.mock.calls.map((c) => [c[1], c[2]])).toEqual([
+      ["p-c", { sortOrder: 0 }],
+      ["p-a", { sortOrder: 1 }],
+      ["p-c", { sortOrder: 2 }],
+    ]);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["p-a", "p-b", "p-c"]);
+    expect(screen.getByRole("alert").textContent).toContain("调整项目顺序失败");
+  });
+});
+
 describe("useChatProjects onCreated", () => {
   test("创建成功后 onCreated 收到 created", async () => {
     const created: ChatProject = {

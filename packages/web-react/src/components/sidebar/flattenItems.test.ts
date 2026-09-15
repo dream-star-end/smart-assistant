@@ -56,10 +56,10 @@ describe("flattenSidebarItems empty project hints", () => {
   it("默认未分类空 hint 不带 projectId", () => {
     const items = flattenSidebarItems({
       searching: false,
-      showProjects: false,
+      showProjects: true,
       pinned: [],
-      projects: [],
-      projectSessions: new Map(),
+      projects: [project({ id: "p-work", name: "工作" })],
+      projectSessions: new Map([["p-work", []]]),
       sessions: [],
       ungroupedGroups: [],
       archived: [],
@@ -71,6 +71,56 @@ describe("flattenSidebarItems empty project hints", () => {
     const def = items.find((i) => i.kind === "hint" && i.key === `p-empty-${DEFAULT_PROJECT_ID}`);
     expect(def).toMatchObject({ kind: "hint", text: "暂无会话" });
     expect(def && def.kind === "hint" ? def.projectId : "missing").toBeUndefined();
+  });
+
+  // S-13：零会话零项目此前仍渲染「项目 +」「未分类 0」「已归档 0」骨架，首屏像损坏的列表而不是引导。
+  describe("零会话零项目的引导空态（S-13）", () => {
+    const base = {
+      searching: false,
+      pinned: [],
+      projectSessions: new Map<string, Session[]>(),
+      sessions: [],
+      ungroupedGroups: [] as [string, Session[]][],
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle" as const,
+      localEmpty: true,
+    };
+
+    it("有项目功能但没有项目：只剩一条 empty-all 提示 + 已归档开关", () => {
+      const items = flattenSidebarItems({ ...base, showProjects: true, projects: [] });
+      expect(items.map((i) => i.kind)).toEqual(["hint", "archivedToggle"]);
+      expect(items[0]).toMatchObject({ kind: "hint", key: "empty-all", variant: "empty-all", text: "还没有会话" });
+    });
+
+    it("没有项目功能（showProjects=false）同样走引导空态", () => {
+      const items = flattenSidebarItems({ ...base, showProjects: false, projects: [] });
+      expect(items.map((i) => i.kind)).toEqual(["hint", "archivedToggle"]);
+    });
+
+    it("已展开「已归档」且有归档会话：引导块之下照常列出归档", () => {
+      const arc = session({ id: "s-arc", archived: true });
+      const items = flattenSidebarItems({
+        ...base,
+        showProjects: true,
+        projects: [],
+        archived: [arc],
+        archivedExpanded: true,
+      });
+      expect(items.map((i) => i.kind)).toEqual(["hint", "archivedToggle", "session"]);
+    });
+
+    it("有项目但零会话：不是引导空态，仍是项目头 + 空项目行 + 未分类 empty-list", () => {
+      const items = flattenSidebarItems({
+        ...base,
+        showProjects: true,
+        projects: [project({ id: "p-a", name: "甲" })],
+      });
+      expect(items.some((i) => i.kind === "hint" && i.variant === "empty-all")).toBe(false);
+      expect(items.some((i) => i.kind === "header" && i.label === "项目")).toBe(true);
+      expect(items.some((i) => i.kind === "hint" && i.variant === "empty-list")).toBe(true);
+    });
   });
 
   it("有会话的项目不生成空 hint", () => {

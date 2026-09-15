@@ -4,7 +4,7 @@ import { isVersionConflict, taskboardApi, type Project as BoardProject } from ".
 import type { AuthSession, ChatProject, Session } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
-import { Alert, Button, Field, Input, Modal, Tabs, Textarea } from "./ui";
+import { Alert, Button, Field, Input, Modal, Select, Tabs, Textarea, useConfirm } from "./ui";
 
 const NAME_MAX = 60;
 const INSTRUCTIONS_MAX = 4000;
@@ -84,6 +84,12 @@ export function ProjectSettingsDialog(props: {
   /** 文本域当前值的镜像：异步回调里读快照，不把 instructions 放进拉取 effect 的依赖。 */
   const instructionsRef = useRef(instructions);
   instructionsRef.current = instructions;
+  /**
+   * 脏检查基线（PS-03）：打开时取自 project；首次打开自动回填看板指令时同步更新，
+   * 这样「什么都没改」的用户关闭时不会被误拦。
+   */
+  const baselineRef = useRef({ name: "", color: null as string | null, instructions: "", boardProjectId: "" });
+  const [confirmDiscard, confirmDiscardEl] = useConfirm();
 
   useEffect(() => {
     if (!open) return;
@@ -98,6 +104,12 @@ export function ProjectSettingsDialog(props: {
       setInstructions(project.instructions ?? "");
       setBoardProjectId(project.boardProjectId ?? "");
       setContextVersion(null);
+      baselineRef.current = {
+        name: project.name,
+        color: project.color ?? null,
+        instructions: project.instructions ?? "",
+        boardProjectId: project.boardProjectId ?? "",
+      };
     }
   }, [open, project, assetsOnly]);
 
@@ -161,6 +173,8 @@ export function ProjectSettingsDialog(props: {
         const cur = instructionsRef.current;
         if (!boardTouchedRef.current || cur.trim() === "" || cur === incoming) {
           setInstructions(incoming);
+          // 程序回填不算用户改动：把基线一起挪过去，关闭时不误报「有未保存修改」（PS-03）。
+          if (!boardTouchedRef.current) baselineRef.current.instructions = incoming;
         } else {
           setPendingBoardInstructions(incoming);
         }
@@ -181,9 +195,34 @@ export function ProjectSettingsDialog(props: {
   const instructionsOver = instructions.length > INSTRUCTIONS_MAX;
   const canSave = !nameInvalid && !instructionsOver && !saving;
   const showSettings = !assetsOnly && activeTab === "settings";
+  const base = baselineRef.current;
+  const dirty =
+    !assetsOnly &&
+    (name !== base.name ||
+      color !== base.color ||
+      instructions !== base.instructions ||
+      boardProjectId !== base.boardProjectId);
+
+  /** 关闭（Esc / 遮罩 / 取消）此前没有脏检查，编辑中的名称 / 指令误触即丢（PS-03）。 */
+  const requestClose = () => {
+    if (saving) return;
+    if (!dirty) {
+      onClose();
+      return;
+    }
+    void confirmDiscard({
+      title: "放弃未保存的修改？",
+      body: "名称、颜色、指令或看板绑定有改动尚未保存，关闭后这些改动会丢失。",
+      confirmText: "放弃修改",
+      cancelText: "继续编辑",
+      danger: true,
+    }).then((ok) => {
+      if (ok === true) onClose();
+    });
+  };
 
   const handleOpenChange = (next: boolean) => {
-    if (!next && !saving) onClose();
+    if (!next) requestClose();
   };
 
   const handleSave = async () => {
@@ -258,7 +297,7 @@ export function ProjectSettingsDialog(props: {
       footer={
         showSettings ? (
           <>
-            <Button variant="secondary" onClick={onClose} disabled={saving}>
+            <Button variant="secondary" onClick={requestClose} disabled={saving}>
               取消
             </Button>
             <Button variant="primary" onClick={() => void handleSave()} disabled={!canSave} loading={saving}>
@@ -344,23 +383,21 @@ export function ProjectSettingsDialog(props: {
                 看板列表加载失败
               </Alert>
             ) : null}
-            <select
-              className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm"
+            {/* 与设计系统其它下拉同构（ui/Select），不再手写裸 <select> 类名（PS-02）。 */}
+            <Select
+              inputSize="sm"
               value={boardProjectId}
-              onChange={(e) => {
+              onValueChange={(v) => {
                 boardTouchedRef.current = true;
-                setBoardProjectId(e.target.value);
+                setBoardProjectId(v);
               }}
+              options={[
+                { value: "", label: "不绑定" },
+                ...boardProjects.map((p) => ({ value: p.id, label: `${p.key} · ${p.name}` })),
+              ]}
               aria-label="绑定任务面板项目"
               disabled={!!boardListErr}
-            >
-              <option value="">不绑定</option>
-              {boardProjects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.key} · {p.name}
-                </option>
-              ))}
-            </select>
+            />
           </Field>
 
           <Field
@@ -438,6 +475,8 @@ export function ProjectSettingsDialog(props: {
           登录后才能管理项目资产。
         </Alert>
       )}
+      {/* 放在分区条件之外：切到「资产」Tab 再按 Esc，脏检查确认框也得挂着（PS-03）。 */}
+      {confirmDiscardEl}
     </Modal>
   );
 }

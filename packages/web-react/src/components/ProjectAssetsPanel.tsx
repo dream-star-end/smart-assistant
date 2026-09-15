@@ -15,7 +15,7 @@ import { useSignedDownload } from "./chat/media";
 import { formatBytes } from "../lib/chat/download";
 import type { AuthSession, ProjectAsset, Session } from "../lib/types";
 import { cn } from "../lib/utils";
-import { PINNED_INJECT_LIMIT, useProjectAssets } from "../hooks/useProjectAssets";
+import { PINNED_INJECT_LIMIT, type UploadProgress, useProjectAssets } from "../hooks/useProjectAssets";
 import {
   Alert,
   Badge,
@@ -51,6 +51,7 @@ export function ProjectAssetsPanel(props: {
     loading,
     error,
     uploading,
+    uploadProgress,
     reload,
     uploadFiles,
     setPinned,
@@ -91,7 +92,11 @@ export function ProjectAssetsPanel(props: {
         ) : null}
       </div>
 
-      <UploadDropzone uploading={uploading} onFiles={(files) => void uploadFiles(files)} />
+      <UploadDropzone
+        uploading={uploading}
+        progress={uploadProgress}
+        onFiles={(files) => void uploadFiles(files)}
+      />
 
       {error ? (
         <Alert
@@ -134,11 +139,20 @@ export function ProjectAssetsPanel(props: {
   );
 }
 
+/** 上传态文案：多文件时带「第 N/M 个」进度，单文件只说「正在上传…」（PA-03）。 */
+export function uploadingLabel(progress: UploadProgress | null): string {
+  if (!progress || progress.total <= 1) return "正在上传…";
+  const current = Math.min(progress.done + 1, progress.total);
+  return `正在上传 ${current}/${progress.total} 个文件…`;
+}
+
 function UploadDropzone({
   uploading,
+  progress,
   onFiles,
 }: {
   uploading: boolean;
+  progress: UploadProgress | null;
   onFiles: (files: File[]) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -182,9 +196,10 @@ function UploadDropzone({
         uploading && "pointer-events-none opacity-70",
       )}
     >
-      <Upload size={18} className="shrink-0" />
-      <span className="text-body">
-        {uploading ? "正在上传…" : "点击或拖拽文件到此处上传"}
+      {uploading ? <Spinner size={18} className="shrink-0" /> : <Upload size={18} className="shrink-0" />}
+      {/* 上传期间拖放区不可再投：进度文案用 status 播报，读屏也知道走到第几个（PA-03）。 */}
+      <span className="text-body" role={uploading ? "status" : undefined} aria-live={uploading ? "polite" : undefined}>
+        {uploading ? uploadingLabel(progress) : "点击或拖拽文件到此处上传"}
       </span>
       <span className="text-caption text-faint">可一次选择多个文件，单个失败不影响其它</span>
       <input

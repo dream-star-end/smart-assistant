@@ -295,18 +295,31 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       }
       setProjects(next);
       if (demo || !cbRef.current.auth) return;
-      const ids = [...seen];
+      // 后端没有批量 sortOrder 接口，此前对 N 个项目并发 N 个 PATCH、任一失败再并发 N 个回滚
+      // （请求风暴，且中途部分成功时服务端顺序停在中间态，UCP-01）。现在串行写：
+      // 只 PATCH sortOrder 真变了的项目；在失败点停下，只回滚已经改成功的那几条。
+      const changed = next.filter((p) => byId.get(p.id)?.sortOrder !== p.sortOrder);
+      const done: ChatProject[] = [];
       try {
-        await Promise.all(
-          ids.map((id, i) => api.patchChatProject(cbRef.current.authSession, id, { sortOrder: i })),
-        );
+        for (const p of changed) {
+          await api.patchChatProject(cbRef.current.authSession, p.id, { sortOrder: p.sortOrder });
+          done.push(p);
+        }
       } catch (e) {
         setProjects(snapshot);
-        void Promise.allSettled(
-          snapshot.map((p) =>
-            api.patchChatProject(cbRef.current.authSession, p.id, { sortOrder: p.sortOrder }),
-          ),
-        );
+        void (async () => {
+          for (const p of done) {
+            const prev = byId.get(p.id);
+            if (!prev) continue;
+            try {
+              await api.patchChatProject(cbRef.current.authSession, p.id, {
+                sortOrder: prev.sortOrder,
+              });
+            } catch (rollbackErr) {
+              console.warn("reorderChatProjects rollback failed", rollbackErr);
+            }
+          }
+        })();
         console.warn("reorderChatProjects failed", e);
         toast("调整项目顺序失败，已恢复", "error");
         throw e;

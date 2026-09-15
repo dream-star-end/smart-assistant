@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
@@ -556,8 +556,9 @@ describe("Sidebar 项目分组", () => {
   });
 
   it("无真实项目时仍渲染 default；default 不可重命名、删除、改色或排序", () => {
+    // 零会话零项目走引导空态（S-13）；放一条未分组会话，default 组照常渲染。
     renderSidebar({
-      sessions: [],
+      sessions: [session({ id: "s-loose", title: "未分组会话" })],
       projects: [],
       onCreateProject: () => {},
       onRenameProject: () => {},
@@ -567,7 +568,7 @@ describe("Sidebar 项目分组", () => {
     });
     expect(screen.queryByText("还没有项目")).toBeNull();
     expect(screen.getByRole("button", { name: /未分类/ })).toBeInTheDocument();
-    expect(screen.getByText("暂无会话")).toBeInTheDocument();
+    expect(screen.getByText("未分组会话")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "项目 未分类 更多" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
@@ -576,7 +577,7 @@ describe("Sidebar 项目分组", () => {
   it("default 组菜单只有「项目资产」一项", async () => {
     const onOpenProjectAssets = vi.fn();
     renderSidebar({
-      sessions: [],
+      sessions: [session({ id: "s-loose", title: "未分组会话" })],
       projects: [],
       onCreateProject: () => {},
       onRenameProject: () => {},
@@ -1453,6 +1454,43 @@ describe("Sidebar S-01 空项目提示不再占 108px", () => {
     });
     expect(flatRowHeight("hint", "暂无会话")).toBe(36);
     expect(screen.getAllByRole("button", { name: /^新建会话$/ })).toHaveLength(1);
+  });
+});
+
+// S-13：零会话零项目此前仍渲染「项目 +」「未分类 0」「已归档 0」骨架，首屏像损坏的列表。
+describe("Sidebar S-13 零会话零项目的引导空态", () => {
+  it("只渲染一块引导（说明 + 新建会话 + 新建项目）与「已归档」开关，没有项目头和未分类行", () => {
+    const onNew = vi.fn();
+    const onCreateProject = vi.fn();
+    renderSidebar({ sessions: [], projects: [], onNew, onCreateProject });
+    const block = screen.getByTestId("sidebar-empty-all");
+    expect(block).toHaveTextContent("还没有会话");
+    expect(screen.queryByRole("heading", { name: /项目/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /未分类/ })).toBeNull();
+    expect(screen.queryByText("暂无会话")).toBeNull();
+    expect(screen.getByRole("button", { name: /已归档/ })).toBeInTheDocument();
+
+    fireEvent.click(within(block).getByRole("button", { name: "新建会话" }));
+    expect(onNew).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(block).getByRole("button", { name: "新建项目" }));
+    expect(onCreateProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("没有项目功能时引导块不带「新建项目」", () => {
+    renderSidebar({ sessions: [], projects: undefined, onCreateProject: undefined });
+    const block = screen.getByTestId("sidebar-empty-all");
+    expect(within(block).queryByRole("button", { name: "新建项目" })).toBeNull();
+    expect(within(block).getByRole("button", { name: "新建会话" })).toBeInTheDocument();
+  });
+
+  it("一旦有会话或有项目就回到普通分组结构", () => {
+    renderSidebar({
+      sessions: [session({ id: "s1", title: "第一条" })],
+      projects: [],
+      onCreateProject: () => {},
+    });
+    expect(screen.queryByTestId("sidebar-empty-all")).toBeNull();
+    expect(screen.getByRole("button", { name: /未分类/ })).toBeInTheDocument();
   });
 });
 

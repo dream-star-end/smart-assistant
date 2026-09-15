@@ -78,6 +78,8 @@ import {
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
+/** 零会话零项目的引导空态（图标 + 标题 + 两行说明 + 两个按钮，S-13）。 */
+const EMPTY_ALL_HEIGHT = 200;
 /** 底栏在此宽度以下进入紧凑态：隐藏「案例」文字只留图标，给昵称 / 余额让位（S-09）。 */
 const FOOTER_COMPACT_WIDTH = 260;
 
@@ -462,11 +464,12 @@ export function Sidebar({
   // onNew 是 Sidebar 必传 prop,无需再判存在性。
   const listItems = useMemo(
     () =>
-      flatItems.map((it) =>
-        it.kind === "hint" && it.variant === "empty-list"
-          ? { ...it, height: EMPTY_HINT_CTA_HEIGHT }
-          : it,
-      ),
+      flatItems.map((it) => {
+        if (it.kind !== "hint") return it;
+        if (it.variant === "empty-list") return { ...it, height: EMPTY_HINT_CTA_HEIGHT };
+        if (it.variant === "empty-all") return { ...it, height: EMPTY_ALL_HEIGHT };
+        return it;
+      }),
     [flatItems],
   );
 
@@ -587,6 +590,35 @@ export function Sidebar({
       );
     }
     if (item.kind === "hint") {
+      // 零会话零项目：一块引导（说明 + 新建会话 + 新建项目），不再摆「项目 +」「未分类 0」骨架（S-13）。
+      if (item.variant === "empty-all") {
+        return (
+          <div
+            data-testid="sidebar-empty-all"
+            className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center"
+          >
+            <span className="flex size-10 items-center justify-center rounded-full bg-hover text-faint">
+              <MessageSquareText size={18} />
+            </span>
+            <div className="flex flex-col gap-1">
+              <span className="text-body font-medium text-fg">{item.text}</span>
+              <span className="text-caption text-faint">
+                新建一个会话开始聊天；相关会话多了，可以建项目归到一起。
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="secondary" size="sm" onClick={onNew}>
+                新建会话
+              </Button>
+              {onCreateProject && (
+                <Button variant="ghost" size="sm" onClick={onCreateProject}>
+                  新建项目
+                </Button>
+              )}
+            </div>
+          </div>
+        );
+      }
       // 整个列表为空：居中大 CTA（新用户唯一出口）。空项目：普通一行 + 行内「新建会话」文字钮，
       // 保留直达 onNewInProject 的出口但不再占 108px（S-01）。空未分类而别处有会话：顶部按钮已覆盖，只留文字。
       const emptyList = item.variant === "empty-list";
