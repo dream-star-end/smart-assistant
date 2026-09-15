@@ -2,7 +2,7 @@ import { Check, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, OrgTopupResult } from "../../lib/types";
-import { cn, formatCentsYuan } from "../../lib/utils";
+import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner } from "../ui";
 import { orgErrText } from "./orgShared";
@@ -42,10 +42,25 @@ function gt(a: string, b: string): boolean {
   }
 }
 
+/**
+ * 到账积分 = 到账后余额 − 基线（字符串大数相减）。非法或非正返回 null。
+ * 后端充值契约不下发汇率 / 预估积分（审计 SET-09，需后端配合），前端能给用户的唯一确切数字
+ * 就是这笔实际入账，导出供单测覆盖。
+ */
+export function creditedDelta(after: string, baseline: string): string | null {
+  const norm = (v: string) => (/^-?\d+$/.test(v) ? v : "0");
+  try {
+    const delta = BigInt(norm(after)) - BigInt(norm(baseline));
+    return delta > 0n ? delta.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 type Stage =
   | { kind: "input" }
   | { kind: "qr"; result: OrgTopupResult; amountCents: string; baseline: string }
-  | { kind: "paid"; amountCents: string };
+  | { kind: "paid"; amountCents: string; credited: string | null };
 
 /**
  * 组织充值（三段）：填额 → 扫码 → 到账。金额/积分全程字符串大数（yuanToCents / BigInt，
@@ -144,7 +159,7 @@ export function OrgTopupDialog({
         const now = await api.getOrgBalance(auth);
         if (gt(now, baseline)) {
           stopPoll();
-          setStage({ kind: "paid", amountCents: cents });
+          setStage({ kind: "paid", amountCents: cents, credited: creditedDelta(now, baseline) });
           onPaid();
         }
       } catch {
@@ -235,8 +250,11 @@ export function OrgTopupDialog({
               {creating ? <Spinner size={15} /> : null}
               发起充值
             </Button>
-            <p className="text-caption text-faint">
-              到账积分按平台当前汇率计算，支付成功后即时入账组织钱包。
+            {/* 后端 POST /api/org/topup 不下发汇率与预估积分（审计 SET-09，需后端配合），
+                付款前无法给出确切到账数；先把规则与核对入口说清，到账后再显示实际入账数。 */}
+            <p className="text-caption text-faint" data-testid="org-topup-rate-note">
+              到账积分 = 支付金额 × 平台汇率（以支付时为准，本页暂不预估）。支付成功后即时入账组织钱包，
+              到账数会在本弹层与「概览 → 组织钱包余额」显示。
             </p>
           </div>
         )}
@@ -268,7 +286,11 @@ export function OrgTopupDialog({
             <div className="text-title font-semibold text-fg">
               已到账 {formatCentsYuan(stage.amountCents)}
             </div>
-            <p className="text-meta text-faint">组织钱包余额已更新。</p>
+            <p className="text-meta text-faint" data-testid="org-topup-credited">
+              {stage.credited
+                ? `入账 ${formatCredits(stage.credited)} 积分，组织钱包余额已更新。`
+                : "组织钱包余额已更新。"}
+            </p>
             <Button variant="primary" size="sm" onClick={onClose} className="mt-1">
               完成
             </Button>
