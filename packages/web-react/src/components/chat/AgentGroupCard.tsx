@@ -8,7 +8,7 @@
  */
 import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useId, useState } from "react";
 import { type ChatMessage, type ChildBlock, isServerAuthoredRow } from "../../lib/chat/model";
 import { agentTerminalStatus, reviewVerdictBadge } from "../../lib/chat/render";
 import { cn, groupDigits } from "../../lib/utils";
@@ -203,13 +203,17 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
   const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : [];
   const tokenUsage = delegateTokenUsage(msg);
   const terminalNoChildren = !running && children.length === 0;
+  const bodyId = useId();
 
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
+      {/* 折叠开关暴露展开态(aria-expanded/aria-controls,与 DelegateProgressCard 一致)。 */}
       <button
         type="button"
         onClick={() => setUserCollapsed(!collapsed)}
-        className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left hover:bg-hover"
+        aria-expanded={!collapsed}
+        aria-controls={collapsed ? undefined : bodyId}
+        className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left hover:bg-hover [@media(hover:none)]:min-h-11"
       >
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {running ? <Spinner size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
@@ -239,7 +243,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
       </button>
 
       {!collapsed && (
-        <div className="border-t border-border">
+        <div id={bodyId} className="border-t border-border">
           {children.length === 0 && running && (
             <div className="flex items-center gap-2 px-3.5 py-2.5 text-meta text-faint">
               <Spinner size={12} /> 子智能体启动中…
@@ -260,10 +264,20 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
         </div>
       )}
 
-      {/* 折叠态下展示结果摘要（完成后） */}
+      {/* 折叠态下展示结果摘要(完成后)。图标跟终态 tone 走:成功 ✓ / 失败 ✕ / 超时 ⏱,
+          不再对着「失败 · 61s」徽记画一个绿勾。 */}
       {collapsed && !running && typeof msg._resultPreview === "string" && msg._resultPreview && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
-          <Check size={13} className="mt-0.5 shrink-0 text-success" />
+          <span
+            className={cn(
+              "mt-0.5 shrink-0",
+              status.tone === "danger" ? "text-danger" : status.tone === "warning" ? "text-warning" : "text-success",
+            )}
+            data-testid="agent-summary-icon"
+            data-tone={status.tone}
+          >
+            {status.tone === "success" ? <Check size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
+          </span>
           <span className="line-clamp-2">
             {msg._resultPreview.slice(0, 500)}{msg._resultPreview.length > 500 ? "…" : ""}
           </span>

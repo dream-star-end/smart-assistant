@@ -4,7 +4,18 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ChatInteractionContext } from "../tool/context";
 import { resetSubscribeUiState } from "../settings/SubscriptionDialog";
-import { AssistantCard, type CardCallbacks, type RenderCtx, UserCard } from "./cards";
+import { BRAND } from "../../lib/brand";
+import { ToastProvider } from "../ui";
+import {
+  AssistantCard,
+  type CardCallbacks,
+  COPY_FAILED_TOAST,
+  DelegateProgressCard,
+  GoalCard,
+  type RenderCtx,
+  ThinkingCard,
+  UserCard,
+} from "./cards";
 
 const friction = vi.hoisted(() => ({
   reportClientFriction: vi.fn(() => "eid"),
@@ -140,7 +151,8 @@ describe("消息引用动作与已发送引用块", () => {
       },
     });
     render(<UserCard msg={message} cb={{ onQuote }} />);
-    expect(screen.getByText("从简")).toBeInTheDocument();
+    // 引用块里的助手名走 lib/brand,不再硬编码品牌字面量(白标/换品牌不漏改)。
+    expect(screen.getByText(BRAND.name)).toBeInTheDocument();
     const quoteText = screen.getByText("不会在数据层截断的完整历史回答");
     expect(quoteText).toHaveClass("line-clamp-2");
     fireEvent.click(screen.getByRole("button", { name: "引用" }));
@@ -157,6 +169,249 @@ describe("UserCard 编辑重发", () => {
     expect(btn).toHaveClass("[@media(hover:none)]:size-11");
     fireEvent.click(btn);
     expect(onEditResend).toHaveBeenCalledWith(msg);
+  });
+
+  // M-01:只读面(教程回放 / 后台会话查看器)此前每条用户消息仍渲染一个点了没反应的「编辑」。
+  test("没有 onEditResend 回调时不渲染「编辑」(cb={} 的只读挂载点不再出现死按钮)", () => {
+    render(<UserCard msg={userMsg({ status: "replied" })} cb={{}} />);
+    expect(screen.queryByRole("button", { name: "编辑" })).toBeNull();
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+  });
+
+  test("readOnly 下即使给了回调也不出「编辑」「引用」,只留「复制」", () => {
+    const onEditResend = vi.fn();
+    const onQuote = vi.fn();
+    render(<UserCard msg={userMsg({ status: "replied" })} cb={{ onEditResend, onQuote }} readOnly />);
+    expect(screen.queryByRole("button", { name: "编辑" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "引用" })).toBeNull();
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+  });
+});
+
+describe("AssistantCard readOnly(M-01)", () => {
+  test("只读面动作行只留复制/纯文本/朗读,不出引用、重新生成、反馈", () => {
+    render(
+      <AssistantCard
+        msg={{ id: "a-ro", role: "assistant", text: "回答正文", ts: 1 } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
+        cb={{ onQuote: vi.fn(), onRegenerate: vi.fn(), onFeedback: vi.fn() }}
+        readOnly
+      />,
+    );
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制纯文本" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "引用" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重新生成" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "反馈" })).toBeNull();
+  });
+});
+
+// M-03:触屏下每条消息常显整排 44px 动作图标 → 默认只露一个「更多操作」开关,点开才展开整排。
+// jsdom 无 CSS:开关与整排同时在 DOM 里,这里断言的是开关的存在、展开态与决定显隐的 class。
+describe("触屏动作行折叠(TouchActionRow)", () => {
+  test("历史助手行默认折叠:开关 aria-expanded=false,整排带 hover:none 隐藏 class;点开后展开", () => {
+    render(
+      <AssistantCard
+        msg={{ id: "a-hist", role: "assistant", text: "历史回答", ts: 1 } as ChatMessage}
+        ctx={{ isLast: false, sending: false, inActiveTurn: false, turnFinalAssistant: true }}
+        cb={{ onRegenerate: vi.fn() }}
+      />,
+    );
+    const toggle = screen.getByRole("button", { name: "更多操作" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveClass("[@media(hover:none)]:inline-flex");
+    const copy = screen.getByRole("button", { name: "复制" });
+    const row = copy.parentElement!;
+    expect(row).toHaveClass("[@media(hover:none)]:hidden");
+    expect(row).not.toHaveClass("[@media(hover:none)]:opacity-100");
+
+    fireEvent.click(toggle);
+    const collapse = screen.getByRole("button", { name: "收起操作" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    expect(row).toHaveClass("[@media(hover:none)]:opacity-100");
+    expect(row).not.toHaveClass("[@media(hover:none)]:hidden");
+    // 桌面 hover 露出的 class 保持不变。
+    expect(row).toHaveClass("group-hover:opacity-100");
+
+    fireEvent.click(collapse);
+    expect(screen.getByRole("button", { name: "更多操作" })).toHaveAttribute("aria-expanded", "false");
+    expect(row).toHaveClass("[@media(hover:none)]:hidden");
+  });
+
+  test("末轮末条助手回复(可重新生成的那条)默认展开", () => {
+    render(
+      <AssistantCard
+        msg={{ id: "a-final", role: "assistant", text: "最新回答", ts: 1 } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
+        cb={{ onRegenerate: vi.fn() }}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "重新生成" }).parentElement).toHaveClass(
+      "[@media(hover:none)]:opacity-100",
+    );
+  });
+
+  test("用户行同样默认折叠,开关为 44px 触控靶", () => {
+    render(<UserCard msg={userMsg({ status: "replied" })} cb={{ onEditResend: vi.fn() }} />);
+    const toggle = screen.getByRole("button", { name: "更多操作" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveClass("[@media(hover:none)]:size-11");
+    expect(screen.getByRole("button", { name: "编辑" }).parentElement).toHaveClass("[@media(hover:none)]:hidden");
+  });
+});
+
+describe("UserCard 状态标签(M-09)", () => {
+  test("终态 replied / read 不再显示「已回复」「已读」;过渡态与失败照常", () => {
+    const { rerender } = render(<UserCard msg={userMsg({ status: "replied" })} cb={{}} />);
+    expect(screen.queryByText("已回复")).toBeNull();
+    rerender(<UserCard msg={userMsg({ status: "read" })} cb={{}} />);
+    expect(screen.queryByText("已读")).toBeNull();
+    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
+    expect(screen.getByText("已送达")).toBeInTheDocument();
+    rerender(<UserCard msg={userMsg({ status: "sending" })} cb={{}} />);
+    expect(screen.getByText("发送中")).toBeInTheDocument();
+    rerender(<UserCard msg={userMsg({ status: "queued" })} cb={{}} />);
+    expect(screen.getByText("排队中")).toBeInTheDocument();
+  });
+});
+
+describe("AssistantCard 部分回答的精简动作行(M-18)", () => {
+  test("失败但已产出合法部分回答:正文可见并带复制/纯文本,不出朗读/重新生成/反馈", () => {
+    renderErr(
+      errMsg({
+        _errorCode: "engine_error",
+        text: "这是模型已经写出的前半段回答\n\n[turn failed: upstream closed]",
+        _clientMessageId: "u1",
+      }),
+      { onRegenerate: vi.fn(), onFeedback: vi.fn(), onQuote: vi.fn() },
+    );
+    expect(screen.getByText("这是模型已经写出的前半段回答")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制纯文本" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "引用" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "朗读" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重新生成" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "反馈" })).toBeNull();
+  });
+
+  test("用户主动停止且有部分回答:同样可复制", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    renderErr(errMsg({ _errorCode: "stopped", text: "停止前写出的半截答案" }), { onRegenerate: vi.fn() });
+    expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("停止前写出的半截答案"));
+  });
+
+  test("错误正文只是终止器/内部串(无合法部分回答)时不出动作行", () => {
+    renderErr(errMsg({ _errorCode: "engine_error", text: "[turn failed: boom]" }), {});
+    expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
+  });
+});
+
+describe("token 用量并入 MetaRow(M-08)", () => {
+  test("终态助手行:token 徽章带单位且与时间/积分/请求ID 同一行,不再单独悬在正文下方", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-tok",
+          role: "assistant",
+          text: "回答",
+          ts: Date.now() - 5_000,
+          usage: { traceId: "trace-tok", costCredits: "1280" },
+        } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+        tokenUsage={{ totalTokens: 5_980 }}
+      />,
+    );
+    const badge = screen.getByLabelText("本轮 5,980 token");
+    expect(badge).toHaveTextContent("5.98k token");
+    const metaRow = badge.parentElement!;
+    expect(metaRow.querySelector("time")).not.toBeNull();
+    expect(metaRow).toContainElement(screen.getByLabelText("消耗 1280 积分"));
+    expect(metaRow).toContainElement(screen.getByRole("button", { name: "复制请求ID trace-tok" }));
+  });
+
+  test("流式中 MetaRow 尚未出现,token 用量仍单独实时显示", () => {
+    render(
+      <AssistantCard
+        msg={{ id: "a-live", role: "assistant", text: "生成中的正文", ts: 1 } as ChatMessage}
+        ctx={{ isLast: true, sending: true, inActiveTurn: true }}
+        cb={{}}
+        tokenUsage={{ totalTokens: 256 }}
+      />,
+    );
+    expect(screen.getByLabelText("本轮 256 token")).toBeInTheDocument();
+    expect(document.querySelector("time")).toBeNull();
+  });
+});
+
+describe("剪贴板失败提示(M-20)", () => {
+  test("clipboard.writeText 拒绝时弹 toast,不再静默", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+      configurable: true,
+    });
+    render(
+      <ToastProvider>
+        <UserCard msg={userMsg({ status: "replied", text: "复制我" })} cb={{}} />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(COPY_FAILED_TOAST));
+  });
+});
+
+describe("GoalCard 用时文案(M-17)", () => {
+  test("1260s → 21 分钟;短时长仍显示秒", () => {
+    const { rerender } = render(
+      <GoalCard
+        msg={{ id: "g1", role: "goal", text: "目标", ts: 1, tokensUsed: 10, timeUsedSeconds: 1260 } as ChatMessage}
+      />,
+    );
+    expect(screen.getByText("Token 10 · 21 分钟")).toBeInTheDocument();
+    rerender(
+      <GoalCard
+        msg={{ id: "g1", role: "goal", text: "目标", ts: 1, tokensUsed: 10, timeUsedSeconds: 45 } as ChatMessage}
+      />,
+    );
+    expect(screen.getByText("Token 10 · 45s")).toBeInTheDocument();
+  });
+});
+
+describe("DelegateProgressCard 折叠摘要图标(M-07)", () => {
+  test("失败终态折叠摘要用红 X,成功用绿勾", () => {
+    const base = {
+      id: "d1",
+      role: "delegate-progress",
+      text: "子任务",
+      ts: 1,
+      _completed: true,
+      summary: "修复失败:依赖缺失",
+    } as ChatMessage;
+    const { rerender } = render(<DelegateProgressCard msg={{ ...base, _isError: true } as ChatMessage} />);
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByTestId("delegate-summary-icon")).toHaveClass("text-danger");
+    rerender(<DelegateProgressCard msg={{ ...base, _isError: false } as ChatMessage} />);
+    expect(screen.getByTestId("delegate-summary-icon")).toHaveClass("text-success");
+  });
+});
+
+describe("ThinkingCard 折叠开关可访问性(M-10)", () => {
+  test("头部按钮暴露 aria-expanded / aria-controls,触屏加高 44px", () => {
+    const msgs = [{ id: "t1", role: "thinking", text: "**先看现状**\n再定方案", ts: 1 } as ChatMessage];
+    render(<ThinkingCard msgs={msgs} sig="s1" ctx={{ isLast: false, sending: false }} />);
+    const header = screen.getByRole("button", { name: /已思考/ });
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(header).not.toHaveAttribute("aria-controls");
+    expect(header).toHaveClass("[@media(hover:none)]:min-h-11");
+    fireEvent.click(header);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    const controls = header.getAttribute("aria-controls");
+    expect(controls).toBeTruthy();
+    expect(document.getElementById(controls!)).toHaveTextContent("再定方案");
   });
 });
 
