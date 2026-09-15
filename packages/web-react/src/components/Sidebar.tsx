@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   useEffect,
   useMemo,
@@ -30,6 +31,7 @@ import {
 } from "react";
 import { archivedExpandedStorageKey } from "../hooks/useChatProjects";
 import { useProjectScope } from "../hooks/useProjectScope";
+import { SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN } from "../hooks/useSidebarWidth";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -169,6 +171,8 @@ export type SidebarProps = {
   onReorderProjects?: (orderedIds: string[]) => void | Promise<void>;
   width?: number;
   onResizeStart?: (e: ReactPointerEvent) => void;
+  /** 拖宽把手的键盘处理（useSidebarWidth.onResizeKeyDown）；传入后把手可 Tab 聚焦（S-05）。 */
+  onResizeKeyDown?: (e: ReactKeyboardEvent) => void;
   resizing?: boolean;
   onArchive?: (s: Session) => void;
   onBatch?: (ids: string[], action: SessionBatchAction, projectId?: string | null) => void;
@@ -179,10 +183,12 @@ export type SidebarProps = {
   loadMoreError?: boolean;
   onLoadArchived?: () => void;
   loadingArchived?: boolean;
+  /** 第 4 参 `includeArchived` = 「已归档」是否展开：与标题本地过滤的范围保持一致（S-10）。 */
   onSearchMessages?: (
     q: string,
     signal: AbortSignal,
     projectId?: string | null,
+    includeArchived?: boolean,
   ) => Promise<SessionSearchHit[]>;
   searchProjectId?: string | null;
   virtualizeThreshold?: number;
@@ -235,6 +241,7 @@ export function Sidebar({
   onReorderProjects,
   width,
   onResizeStart,
+  onResizeKeyDown,
   resizing,
   onArchive,
   onBatch,
@@ -383,7 +390,7 @@ export function Sidebar({
     setSearchRemote("loading");
     const ac = new AbortController();
     const timer = window.setTimeout(() => {
-      void onSearchMessages(needle, ac.signal, activeSearchProjectId)
+      void onSearchMessages(needle, ac.signal, activeSearchProjectId, archivedExpanded)
         .then((hits) => {
           if (ac.signal.aborted) return;
           setSearchHits(hits);
@@ -400,7 +407,7 @@ export function Sidebar({
       window.clearTimeout(timer);
       ac.abort();
     };
-  }, [q, onSearchMessages, activeSearchProjectId]);
+  }, [q, onSearchMessages, activeSearchProjectId, archivedExpanded]);
 
   const displayProjects = useMemo(
     () =>
@@ -778,14 +785,22 @@ export function Sidebar({
       style={width != null ? { width } : undefined}
     >
       {onResizeStart && (
+        // WAI-ARIA separator（可聚焦变体）：暴露 valuenow/min/max，键盘 ← → / Home / End 调宽，
+        // title 说明双击复位（S-05）。
         <div
           role="separator"
           aria-orientation="vertical"
           aria-label="调整侧栏宽度"
+          aria-valuenow={typeof width === "number" ? width : undefined}
+          aria-valuemin={SIDEBAR_WIDTH_MIN}
+          aria-valuemax={SIDEBAR_WIDTH_MAX}
+          title="拖动调整宽度，双击复位默认宽度"
+          tabIndex={onResizeKeyDown ? 0 : undefined}
+          onKeyDown={onResizeKeyDown}
           data-testid="sidebar-resize-handle"
           onPointerDown={onResizeStart}
           className={cn(
-            "absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize touch-none md:block",
+            "absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize touch-none outline-none md:block focus-visible:bg-accent/60",
             resizing && "bg-accent/40",
           )}
         />

@@ -820,7 +820,14 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(search).toHaveBeenCalledWith(
       expect.anything(),
       "foo",
-      expect.objectContaining({ projectId: "project-1" }),
+      expect.objectContaining({ projectId: "project-1", includeArchived: false }),
+    );
+    // S-10：「已归档」展开时消息搜索同样纳入归档会话，与标题本地过滤范围一致。
+    await result.current.searchSessionMessages("foo", new AbortController().signal, null, true);
+    expect(search).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "foo",
+      expect.objectContaining({ includeArchived: true, projectId: null }),
     );
 
     vi.spyOn(api, "searchSessions").mockRejectedValue(new DOMException("aborted", "AbortError"));

@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { api } from "../lib/api";
+import { ApiError, api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { taskboardApi } from "../lib/taskboard";
 import type { ChatProject } from "../lib/types";
@@ -203,6 +203,24 @@ describe("ProjectSettingsDialog", () => {
       await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md"));
       expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
     });
+  });
+
+  // PS-07：看板指令版本冲突与普通失败此前同报「保存项目设置失败」。
+  test("绑定态保存遇 409 版本冲突 → 提示重新打开再保存，而不是通用失败文案", async () => {
+    const boardId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+      { id: boardId, key: "B", name: "Board" } as never,
+    ]);
+    vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 2, instructions: "x" });
+    vi.spyOn(taskboardApi, "putProjectContext").mockRejectedValue(
+      new ApiError({ status: 409, message: "version conflict", code: "version_conflict" }),
+    );
+    const { onSave, onClose } = renderDialog({ project: { ...project, boardProjectId: boardId } });
+    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("x"));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("重新打开");
+    expect(onSave).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   test("字数计数与标签同行，不再被 footer 遮住（PS-06）", () => {

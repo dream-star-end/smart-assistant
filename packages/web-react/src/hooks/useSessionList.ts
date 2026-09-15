@@ -182,11 +182,15 @@ export type UseSessionList = {
   /** 展开「已归档」时用 includeArchived=1 拉取并合并。 */
   loadArchivedSessions: () => Promise<void>;
   loadingArchived: boolean;
-  /** 服务端全文搜索（消息命中）。调用方负责防抖与 AbortController。 */
+  /**
+   * 服务端全文搜索（消息命中）。调用方负责防抖与 AbortController。
+   * `includeArchived` 跟随侧栏「已归档」展开态：标题本地过滤已含归档会话时，消息搜索也应能搜到它们（S-10）。
+   */
   searchSessionMessages: (
     q: string,
     signal: AbortSignal,
     projectId?: string | null,
+    includeArchived?: boolean,
   ) => Promise<SessionSearchHit[]>;
   applySessionTerminal: (
     sessId: string,
@@ -850,12 +854,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     q: string,
     signal: AbortSignal,
     projectId?: string | null,
+    includeArchived = false,
   ): Promise<SessionSearchHit[]> => {
     if (demo || !auth || !q.trim()) return [];
     try {
       const res = await api.searchSessions(cbRef.current.authSession, q.trim(), {
         limit: 30,
-        includeArchived: false,
+        includeArchived,
         signal,
         ...(projectId !== undefined ? { projectId } : {}),
       });

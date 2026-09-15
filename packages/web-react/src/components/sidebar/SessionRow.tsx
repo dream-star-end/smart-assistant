@@ -98,15 +98,17 @@ export function SessionRow({
       style={{ height: "100%" }}
       className={cn(
         "group relative flex items-center gap-1 rounded-md pr-1 text-section transition-colors",
-        indent && "pl-1",
+        // 项目内会话缩进从 4px 提到 16px，层级在视觉上可辨（SR-04）。
+        indent && "pl-4",
         active ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
       )}
     >
       {active && (
         <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
       )}
-      {multiSelect ? (
-        <label className="flex h-full min-h-11 min-w-11 shrink-0 items-center justify-center">
+      {/* 多选态复选框放在状态点左侧而不是替换它：勾选时仍能看到运行 / 出错 / 未读（SR-04）。 */}
+      {multiSelect && (
+        <label className="flex h-full min-h-11 min-w-8 shrink-0 items-center justify-center [@media(hover:none)]:min-w-11">
           <input
             type="checkbox"
             checked={selected}
@@ -115,16 +117,15 @@ export function SessionRow({
             className="size-3.5 accent-accent"
           />
         </label>
-      ) : (
-        <span data-session-lead className="flex size-3.5 shrink-0 items-center justify-center">
-          <SessionStatusDot
-            running={running}
-            lastOutcome={live?.lastOutcome ?? s.lastOutcome}
-            lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
-            unread={unread}
-          />
-        </span>
       )}
+      <span data-session-lead className="flex size-3.5 shrink-0 items-center justify-center">
+        <SessionStatusDot
+          running={running}
+          lastOutcome={live?.lastOutcome ?? s.lastOutcome}
+          lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
+          unread={unread}
+        />
+      </span>
       <button
         type="button"
         onClick={() => {

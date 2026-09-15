@@ -1638,6 +1638,27 @@ describe("Sidebar BB 批量条", () => {
     expect(onBatch).toHaveBeenCalledWith(["s-arc"], "unarchive", undefined);
   });
 
+  it("多选态复选框放在状态点左侧而非替换：勾选时仍能看到运行中（SR-04）", () => {
+    renderSidebar({
+      sessions: [session({ id: "s-run", title: "正在跑", runState: "running" })],
+      onBatch: () => {},
+    });
+    fireEvent.click(screen.getByRole("button", { name: "多选" }));
+    expect(screen.getByLabelText("选择 正在跑")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "运行中" })).toBeInTheDocument();
+  });
+
+  it("搜索态下「已归档」展开时消息搜索带 includeArchived=true（S-10）", async () => {
+    localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");
+    const onSearchMessages = vi.fn(
+      async (_q: string, _signal: AbortSignal, _projectId?: string | null, _includeArchived?: boolean) => [],
+    );
+    renderSidebar({ sessions: listSessions, onSearchMessages });
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "beta" } });
+    await waitFor(() => expect(onSearchMessages).toHaveBeenCalled());
+    expect(onSearchMessages.mock.calls[0]![3]).toBe(true);
+  });
+
   it("批量条固定两行：第一行计数 + 取消，第二行操作按钮全部带可访问名称", () => {
     renderSidebar({ sessions: listSessions, onBatch: () => {} });
     fireEvent.click(screen.getByRole("button", { name: "多选" }));
@@ -1652,6 +1673,27 @@ describe("Sidebar BB 批量条", () => {
       expect(btn).toBeDisabled();
     }
     expect(screen.getByRole("button", { name: "删除" }).className).toContain("text-danger");
+  });
+});
+
+describe("Sidebar S-05 拖宽把手可访问性", () => {
+  it("暴露 separator 的 valuenow/min/max，有键盘处理时可聚焦并转发按键", () => {
+    const onResizeKeyDown = vi.fn();
+    renderSidebar({ width: 300, onResizeStart: () => {}, onResizeKeyDown });
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(handle).toHaveAttribute("role", "separator");
+    expect(handle).toHaveAttribute("aria-valuenow", "300");
+    expect(handle).toHaveAttribute("aria-valuemin", "220");
+    expect(handle).toHaveAttribute("aria-valuemax", "460");
+    expect(handle).toHaveAttribute("tabindex", "0");
+    expect(handle).toHaveAttribute("title", expect.stringContaining("双击复位"));
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(onResizeKeyDown).toHaveBeenCalledTimes(1);
+  });
+
+  it("未传键盘处理时把手不进入 Tab 序列", () => {
+    renderSidebar({ width: 300, onResizeStart: () => {} });
+    expect(screen.getByTestId("sidebar-resize-handle")).not.toHaveAttribute("tabindex");
   });
 });
 

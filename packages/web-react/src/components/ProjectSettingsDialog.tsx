@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactElement } from "react";
 import { apiErrorMessage } from "../lib/api";
-import { taskboardApi, type Project as BoardProject } from "../lib/taskboard";
+import { isVersionConflict, taskboardApi, type Project as BoardProject } from "../lib/taskboard";
 import type { AuthSession, ChatProject, Session } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
@@ -213,7 +213,13 @@ export function ProjectSettingsDialog(props: {
       }
       onClose();
     } catch (e) {
-      setError(apiErrorMessage(e, "保存项目设置失败"));
+      // 看板指令 expectedVersion 冲突（他处刚改过）与普通失败此前同报一句话（PS-07）：
+      // 冲突要告诉用户「重新打开再保存」，否则只会反复撞同一个版本号。
+      setError(
+        isVersionConflict(e)
+          ? "看板项目的指令刚被他处修改，请关闭后重新打开本对话框再保存。"
+          : apiErrorMessage(e, "保存项目设置失败"),
+      );
       setSaving(false);
     }
   };
