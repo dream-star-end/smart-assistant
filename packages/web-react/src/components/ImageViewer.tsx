@@ -134,13 +134,19 @@ function deriveDownloadName(alt: string, signPath?: string | null): string {
 
 type ViewerMode = 'view' | 'edit' | 'comment' | 'resize'
 
-/** 底部动作条单项:圆钮 + 中文标签(黑底毛玻璃)。 */
+/**
+ * 底部动作条单项:圆钮 + 中文标签(黑底毛玻璃)。
+ * 不可用时走 aria-disabled 而非原生 disabled(审计 M-13):原生 disabled 会吞掉点击,`title`
+ * 在触屏又不显示 → 用户点「编辑」毫无反馈。现在点下去由 onDisabledClick 给一句原因(轻提示),
+ * 与圈选编辑器「发送」钮的做法一致(ImageAnnotationEditor.tsx aria-disabled + 引导提示)。
+ */
 function ActionButton({
   label,
   icon,
   onClick,
   disabled,
   reason,
+  onDisabledClick,
   featureId,
 }: {
   label: string
@@ -148,19 +154,34 @@ function ActionButton({
   onClick: () => void
   disabled?: boolean
   reason?: string
+  onDisabledClick?: (reason: string) => void
   featureId?: ProductFeatureId
 }) {
   return (
     <button
       type="button"
       data-product-feature={featureId}
-      onClick={onClick}
-      disabled={disabled}
+      onClick={() => {
+        if (disabled) {
+          if (reason) onDisabledClick?.(reason)
+          return
+        }
+        onClick()
+      }}
+      aria-disabled={disabled || undefined}
       title={disabled ? reason : label}
       aria-label={label}
-      className="group/action flex min-w-16 flex-col items-center gap-1.5 outline-none disabled:cursor-not-allowed disabled:opacity-40"
+      className={cn(
+        'group/action flex min-w-16 flex-col items-center gap-1.5 outline-none',
+        disabled && 'cursor-not-allowed opacity-40',
+      )}
     >
-      <span className="flex size-12 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors group-hover/action:bg-white/20">
+      <span
+        className={cn(
+          'flex size-12 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors',
+          !disabled && 'group-hover/action:bg-white/20',
+        )}
+      >
         {icon}
       </span>
       <span className="text-xs font-medium text-white/90">{label}</span>
@@ -242,6 +263,11 @@ export function ImageViewer({
   modeRef.current = mode
   const moreOpenRef = useRef(moreOpen)
   moreOpenRef.current = moreOpen
+  // 子模式(评论 / 调整大小)的 Esc 委托口:Radix 在 document 捕获阶段派发 Esc,永远先于子模式
+  // 输入框自己的 onKeyDown。查看器先问子模式「这次 Esc 你要不要」(取消草稿 / 弹确认 / 提交中吞掉),
+  // 子模式返回 false 才退回浏览态 —— 否则用户想取消一条草稿,整个评论模式连同全部锚点被掐掉
+  // (审计 M-02)。同一时刻只挂一个子模式,共用一个 ref。
+  const subModeEscapeRef = useRef<(() => boolean) | null>(null)
   // initialMode='edit' 时开图直达编辑:每次开图只触发一次(ref 守卫),避免编辑器关闭回
   // view 后又被重新拉回 edit。
   const autoEditRef = useRef(false)
@@ -431,6 +457,8 @@ export function ImageViewer({
   }
 
   const editDisabledReason = submitImageEdit ? undefined : '当前模型不支持图片编辑'
+  const commentDisabledReason = submitImageComment ? undefined : '当前模型不支持图片评论'
+  const resizeDisabledReason = submitImageEdit ? undefined : '当前模型不支持调整大小'
 
   return (
     <>
@@ -456,6 +484,8 @@ export function ImageViewer({
                 setMoreOpen(false)
               } else if (modeRef.current === 'comment' || modeRef.current === 'resize') {
                 e.preventDefault()
+                // 先委托子模式(取消草稿 / 弹「放弃评论」确认 / 提交中吞掉);子模式没接才退回浏览态。
+                if (subModeEscapeRef.current?.()) return
                 setMode('view')
               }
               // view 模式:放行 Radix 关闭整个查看器。
@@ -472,6 +502,7 @@ export function ImageViewer({
                 canSubmit={!!submitImageComment}
                 onBack={() => setMode('view')}
                 onSubmit={handleCommentSubmit}
+                escapeHandlerRef={subModeEscapeRef}
               />
             ) : mode === 'resize' ? (
               <ImageResizeMode
@@ -482,6 +513,7 @@ export function ImageViewer({
                 canSubmit={!!submitImageEdit}
                 onBack={() => setMode('view')}
                 onSubmit={handleSubmit}
+                escapeHandlerRef={subModeEscapeRef}
               />
             ) : (
               <>
@@ -595,20 +627,23 @@ export function ImageViewer({
                     icon={<Pencil size={20} />}
                     disabled={!submitImageEdit}
                     reason={editDisabledReason}
+                    onDisabledClick={flash}
                     onClick={() => void enterEdit()}
                   />
                   <ActionButton
                     label="评论"
                     icon={<MessageCircle size={20} />}
                     disabled={!submitImageComment}
-                    reason={editDisabledReason}
+                    reason={commentDisabledReason}
+                    onDisabledClick={flash}
                     onClick={() => setMode('comment')}
                   />
                   <ActionButton
                     label="调整大小"
                     icon={<Scaling size={20} />}
                     disabled={!submitImageEdit}
-                    reason={editDisabledReason}
+                    reason={resizeDisabledReason}
+                    onDisabledClick={flash}
                     onClick={() => setMode('resize')}
                   />
                 </div>}
