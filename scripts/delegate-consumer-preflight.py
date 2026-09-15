@@ -129,13 +129,15 @@ def capture_writer_contexts(inv, current, repository, deadline):
         require(projection['imageIdLabel'] is None or projection['imageIdLabel'] == image_id)
         mounts = projection['mounts']
         code_mounts = [m for m in mounts if m['Destination'] == '/opt/openclaude']
-        # Embedded source requires its own original immutable-image adapter.
-        # A missing release mount/label is unknown, NOT implicitly legacy.
-        require(len(code_mounts) == 1)
-        mount = code_mounts[0]
-        require(mount['Type'] == 'bind' and mount['RW'] is False)
-        source = str(paths.path(mount['Source']))
-        require(projection['release'] == Path(source).name)
+        require(len(code_mounts) <= 1)
+        mount = code_mounts[0] if code_mounts else None
+        if mount is not None:
+            require(mount['Type'] == 'bind' and mount['RW'] is False)
+            source = str(paths.path(mount['Source']))
+            require(projection['release'] == Path(source).name)
+        else:
+            require(projection['release'] is None)
+            source = image_id
         for extra in mounts:
             if extra is mount:
                 continue
@@ -145,7 +147,8 @@ def capture_writer_contexts(inv, current, repository, deadline):
             require(extra['Destination'] == '/opt/openclaude/AGENTS.md' and
                     extra['Type'] == 'bind' and extra['RW'] is False)
         if source not in cached_code:
-            cached_code[source] = artifacts.capture(current['code']['master']['root'], source, repository, deadline)
+            cached_code[source] = (artifacts.capture(current['code']['master']['root'], source, repository, deadline)
+                                   if mount is not None else artifacts.capture_image_runtime(image_id, repository, deadline))
         proof = cached_code[source]
         result.append({'writer': writer, 'launch': launch, 'code': proof})
     revalidate_writer_contexts(result, deadline)
@@ -160,7 +163,7 @@ def revalidate_writer_contexts(contexts, deadline):
         if writer['image'] not in checked_images:
             require(_image_launch(_inspect('image', writer['image'], deadline)) == context['launch'])
             checked_images.add(writer['image'])
-        source = context['code']['runtime']['root']
+        source = context['code']['runtime'].get('imageId') or context['code']['runtime']['root']
         if source not in checked_code:
             artifacts.revalidate(context['code'], deadline)
             checked_code.add(source)

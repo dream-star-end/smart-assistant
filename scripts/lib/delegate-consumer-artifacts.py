@@ -215,13 +215,63 @@ flavor_parse_manifest "$2/flavor.manifest.json" >/dev/null
     return result
 
 
+def _runtime_image_snapshot(image_id, deadline):
+    require(isinstance(image_id, str) and re.fullmatch(r'sha256:[a-f0-9]{64}', image_id))
+    raw = _run(['/usr/bin/docker', '--host=unix:///var/run/docker.sock', 'image', 'inspect', image_id], deadline)
+    images = json.loads(raw)
+    require(isinstance(images, list) and len(images) == 1 and isinstance(images[0], dict))
+    image = images[0]
+    require(image.get('Id') == image_id and isinstance(image.get('Config'), dict))
+    labels = image['Config'].get('Labels')
+    require(isinstance(labels, dict))
+    keys = ('oc.runtime.embed_source', 'oc.runtime.source_commit', 'oc.runtime.features')
+    require(all(isinstance(labels.get(key), str) for key in keys))
+    return {'id': image_id, 'labels': {key: labels[key] for key in keys}}
+
+
+def capture_image_runtime(image_id, repository, deadline):
+    """Original baked-image labels + exact Git source, never mutable tags.
+
+    Only explicit embed_source=1 can certify baked source. Toolchain labels are
+    not source authority. Feature tokens and the original source metadata must
+    agree on the B0 consumer capability; modern admission also comes from that
+    source. This proves declarations, not that a synthetic build ran its code.
+    """
+    try:
+        require(os.geteuid() == 0 and 0 < deadline - time.monotonic() <= 30)
+        roots = {p: _directory(p) for p in (repository, str(Path(repository) / '.git'),
+                                           str(Path(repository) / '.git/objects'))}
+        image = _runtime_image_snapshot(image_id, deadline)
+        labels = image['labels']
+        require(labels['oc.runtime.embed_source'] == '1')
+        source = labels['oc.runtime.source_commit']
+        _, metadata = _git_metadata(repository, source, deadline)
+        features = labels['oc.runtime.features'].split()
+        declared = _caps(metadata.get('runtimeCapabilities'))
+        floor = kernel.candidate_object({'capabilities': features})
+        require(floor == kernel.candidate_object({'capabilities': declared}))
+        require({v for v in features if v.startswith('delegate-receipt-consumer-')} ==
+                {v for v in declared if v.startswith('delegate-receipt-consumer-')})
+        result = {'runtime': {'root': None, 'imageId': image_id, 'sourceCommit': source,
+                              'artifact': image_id, 'consumer': floor,
+                              'admission': _admission(metadata, floor)},
+                  'inputs': [], 'roots': roots, 'image': image}
+        revalidate(result, deadline)
+        return result
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, paths.Unknown, state.Unknown, kernel.Unknown):
+        raise Unknown('unverifiable_embedded_consumer_source') from None
+
+
 def revalidate(proof, deadline):
     require(time.monotonic() < deadline)
     for path, identity in proof['roots'].items():
         require(_directory(path) == identity)
     for value in proof['inputs']:
-        limit = kernel.MAX_METADATA if value['path'] == str(Path(proof['runtime']['root']) / 'MANIFEST.json') else MAX_BYTES
+        root = proof['runtime']['root']
+        limit = kernel.MAX_METADATA if root and value['path'] == str(Path(root) / 'MANIFEST.json') else MAX_BYTES
         require(paths._root_identity(value['path'], max_bytes=limit) == value)
+    if 'image' in proof:
+        require(_runtime_image_snapshot(proof['image']['id'], deadline) == proof['image'])
     require(time.monotonic() < deadline)
 
 

@@ -96,7 +96,16 @@ def candidate(value):
     finally:
         os.close(fd)
     unchanged(value, identity)
-    obj = json.loads(raw)
+    return candidate_object(json.loads(raw))
+
+
+def candidate_object(obj):
+    """Same capability parser for pinned file and immutable-image adapters.
+
+    This parses a declaration, NOT its authenticity. The file caller above or
+    the root Docker/source adapter must establish that separately. No CLI
+    capability/JSON override is added.
+    """
     require(isinstance(obj, dict))
     caps = obj.get("capabilities")
     require(isinstance(caps, list) and all(isinstance(c, str) for c in caps))
