@@ -82,6 +82,14 @@ export function ProjectScopeProvider({
 }) {
   const [workProjects, setWorkProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(false);
+  /**
+   * 工作项目列表是否「拿到过一份可信的结果」（最近一次 listProjects 成功）。
+   * 冷启 URL 带 ?project=<工作项目 id>（或 localStorage 记忆）时列表尚未到位，
+   * resolveProjectScope 会把找不到的 token 判成 invalid——此前 effect 立即回落 all 并抹掉 URL 参数，
+   * 刷新 / 书签 / 分享链接的看板范围必丢（taskboard 审计 T-02）。列表到位前不做 invalid 判定；
+   * 请求失败同样不判（瞬时故障不该毁掉用户的链接与记忆），下次成功再校验。
+   */
+  const [hydrated, setHydrated] = useState(false);
   const [token, setTokenState] = useState<ProjectScopeToken>(() => tokenFromLocation() ?? "all");
   const refreshEpoch = useRef(0);
 
@@ -90,15 +98,22 @@ export function ProjectScopeProvider({
     if (!auth) {
       setWorkProjects([]);
       setLoading(false);
+      setHydrated(false);
       return [];
     }
     setLoading(true);
     try {
       const rows = await taskboardApi.listProjects(auth);
-      if (refreshEpoch.current === request) setWorkProjects(rows);
+      if (refreshEpoch.current === request) {
+        setWorkProjects(rows);
+        setHydrated(true);
+      }
       return rows;
     } catch {
-      if (refreshEpoch.current === request) setWorkProjects([]);
+      if (refreshEpoch.current === request) {
+        setWorkProjects([]);
+        setHydrated(false);
+      }
       return [];
     } finally {
       if (refreshEpoch.current === request) setLoading(false);
@@ -152,15 +167,18 @@ export function ProjectScopeProvider({
 
   useEffect(() => {
     const preferred = preferredScopeToken(scope);
+    // 只有拿到过可信列表且不在刷新中，找不到的 token 才算真失效（项目已删 / 已归档）→ 回落 all。
+    // 列表未到位 / 请求失败时保留 token：对外 token 经 preferredScopeToken 已是 all，UI 不受影响，
+    // 但 URL 参数与 localStorage 记忆原样保留，列表到位后自动命中（T-02）。
     if (scope.invalid && token !== "all") {
-      setToken("all");
+      if (hydrated && !loading) setToken("all");
       return;
     }
     if (preferred !== token && scope.kind === "work") {
       setTokenState(preferred);
       replaceProjectQuery(preferred);
     }
-  }, [scope, token, setToken]);
+  }, [scope, token, setToken, hydrated, loading]);
 
   const selectOptions = useMemo(
     () => projectScopeSelectOptions({ chatProjects, workProjects }),

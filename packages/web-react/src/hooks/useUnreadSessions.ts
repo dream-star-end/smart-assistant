@@ -107,12 +107,26 @@ function notifyBody(session: UnreadSessionInput): string {
   return "已完成";
 }
 
-function fireNotification(session: UnreadSessionInput): void {
+function fireNotification(
+  session: UnreadSessionInput,
+  onOpen?: (sessionId: string) => void,
+): void {
   if (!notificationSupported()) return;
   try {
     if (Notification.permission !== "granted") return;
-    const n = new Notification(session.title || "会话", { body: notifyBody(session) });
+    const n = new Notification(session.title || "会话", {
+      body: notifyBody(session),
+      // 同一会话的多条通知折叠成一条，点开落点也只有一个。
+      tag: `oc-session-${session.id}`,
+    });
+    // 点通知此前只 close()：通知没有落点（UUS-01）。现在聚焦窗口并把会话 id 交给上层打开。
     n.onclick = () => {
+      try {
+        window.focus();
+      } catch {
+        /* 某些嵌入环境不允许 */
+      }
+      onOpen?.(session.id);
       n.close();
     };
   } catch {
@@ -136,8 +150,12 @@ export function useUnreadSessions(args: {
   activeId: string | null;
   userId: string | null;
   auth?: AuthSession | null;
+  /** 用户点击系统通知：上层据此切到对应会话（App 接 selectSession）。不传则只聚焦窗口。 */
+  onNotificationOpen?: (sessionId: string) => void;
 }): UnreadState {
   const { sessions, activeId, userId, auth } = args;
+  const onNotificationOpenRef = useRef(args.onNotificationOpen);
+  onNotificationOpenRef.current = args.onNotificationOpen;
 
   const [unreadIds, setUnreadIds] = useState<Set<string>>(() => new Set());
   const [notifyPermission, setNotifyPermission] = useState<NotificationPermission | "unsupported">(
@@ -270,7 +288,8 @@ export function useUnreadSessions(args: {
         for (const s of toMark) {
           const viewing =
             typeof document !== "undefined" && !document.hidden && s.id === activeIdRef.current;
-          if (notifyEnabledRef.current && !viewing) fireNotification(s);
+          if (notifyEnabledRef.current && !viewing)
+            fireNotification(s, (id) => onNotificationOpenRef.current?.(id));
         }
       }
     }

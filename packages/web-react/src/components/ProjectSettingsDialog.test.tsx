@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { api } from "../lib/api";
+import { ApiError, api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { taskboardApi } from "../lib/taskboard";
 import type { ChatProject } from "../lib/types";
@@ -162,6 +162,73 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  // PS-01：切换看板项目此前直接 setInstructions 覆盖用户已输入的指令（数据丢失）。
+  describe("切换看板项目时的指令回填", () => {
+    const boardId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    function mockBoard(instructions: string) {
+      vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+        { id: boardId, key: "B", name: "Board" } as never,
+      ]);
+      vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 2, instructions });
+    }
+
+    test("已有不同内容 → 不覆盖，先问；「保留当前内容」原文不动", async () => {
+      mockBoard("from-project-md");
+      renderDialog();
+      await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
+      fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
+      const ask = await screen.findByText(/所选看板项目自带的指令与当前内容不同/);
+      expect(ask).toBeTruthy();
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("用中文回答");
+      fireEvent.click(screen.getByRole("button", { name: "保留当前内容" }));
+      expect(screen.queryByText(/所选看板项目自带的指令与当前内容不同/)).toBeNull();
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("用中文回答");
+    });
+
+    test("「用看板指令覆盖」才替换文本域", async () => {
+      mockBoard("from-project-md");
+      renderDialog();
+      await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
+      fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
+      fireEvent.click(await screen.findByRole("button", { name: "用看板指令覆盖" }));
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md");
+      expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
+    });
+
+    test("文本域为空时直接回填，不打扰", async () => {
+      mockBoard("from-project-md");
+      renderDialog({ project: { ...project, instructions: "" } });
+      await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
+      fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
+      await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md"));
+      expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
+    });
+  });
+
+  // PS-07：看板指令版本冲突与普通失败此前同报「保存项目设置失败」。
+  test("绑定态保存遇 409 版本冲突 → 提示重新打开再保存，而不是通用失败文案", async () => {
+    const boardId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+      { id: boardId, key: "B", name: "Board" } as never,
+    ]);
+    vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 2, instructions: "x" });
+    vi.spyOn(taskboardApi, "putProjectContext").mockRejectedValue(
+      new ApiError({ status: 409, message: "version conflict", code: "version_conflict" }),
+    );
+    const { onSave, onClose } = renderDialog({ project: { ...project, boardProjectId: boardId } });
+    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("x"));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("重新打开");
+    expect(onSave).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test("字数计数与标签同行，不再被 footer 遮住（PS-06）", () => {
+    renderDialog();
+    const counter = screen.getByText("5 / 4000");
+    expect(counter.closest("label")).not.toBeNull();
+  });
+
   test("看板列表加载失败：提示+重试，下拉禁用，保存仍可用", async () => {
     vi.spyOn(taskboardApi, "listProjects").mockRejectedValue(new Error("board down"));
     const { onSave } = renderDialog();
@@ -175,5 +242,64 @@ describe("ProjectSettingsDialog", () => {
       ),
     );
     expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
+  });
+
+  // PS-02：看板绑定此前是裸 <select> + 手写类名，与设计系统其它下拉不一致。
+  test("看板绑定下拉走 ui/Select：选项含「不绑定」与 key · name，仍可按 aria-label 取到", async () => {
+    vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+      { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", key: "B", name: "Board" } as never,
+    ]);
+    renderDialog();
+    const select = screen.getByLabelText("绑定任务面板项目");
+    await waitFor(() => expect(select.querySelectorAll("option")).toHaveLength(2));
+    expect(Array.from(select.querySelectorAll("option")).map((o) => o.textContent)).toEqual([
+      "不绑定",
+      "B · Board",
+    ]);
+    // 与 Input 同构的控件表面（appearance-none + 自绘箭头），不再是手写的 rounded-md/px-2。
+    expect(select.className).toContain("appearance-none");
+    expect(select.className).not.toContain("px-2");
+  });
+
+  // PS-03：关闭（Esc / 遮罩 / 取消）此前无脏检查，编辑中的名称 / 指令误触即丢。
+  describe("关闭前脏检查（PS-03）", () => {
+    test("有未保存改动时按 Esc：先弹确认，「继续编辑」留在弹窗，「放弃修改」才关闭", async () => {
+      const { onClose } = renderDialog();
+      fireEvent.change(screen.getByLabelText("自定义指令"), { target: { value: "改了一段" } });
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(await screen.findByText("放弃未保存的修改？")).toBeTruthy();
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "继续编辑" }));
+      await waitFor(() => expect(screen.queryByText("放弃未保存的修改？")).toBeNull());
+      expect(onClose).not.toHaveBeenCalled();
+      expect(screen.getByLabelText("自定义指令")).toHaveValue("改了一段");
+
+      fireEvent.click(screen.getByRole("button", { name: "取消" }));
+      fireEvent.click(await screen.findByRole("button", { name: "放弃修改" }));
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    });
+
+    test("没有改动：取消直接关闭，不弹确认", async () => {
+      const { onClose } = renderDialog();
+      fireEvent.click(screen.getByRole("button", { name: "取消" }));
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+      expect(screen.queryByText("放弃未保存的修改？")).toBeNull();
+    });
+
+    test("首次打开由看板指令自动回填不算改动：Esc 直接关闭", async () => {
+      const boardId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      vi.spyOn(taskboardApi, "listProjects").mockResolvedValue([
+        { id: boardId, key: "B", name: "Board" } as never,
+      ]);
+      vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({
+        version: 2,
+        instructions: "from-board",
+      });
+      const { onClose } = renderDialog({ project: { ...project, boardProjectId: boardId } });
+      await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-board"));
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+      expect(screen.queryByText("放弃未保存的修改？")).toBeNull();
+    });
   });
 });

@@ -54,9 +54,16 @@ export type UseChatProjectsOptions = {
   onCreated?: (project: ChatProject) => void;
 };
 
+/** 项目列表拉取失败后的自动重试间隔（仅在失败态且标签可见时计时）。 */
+export const PROJECTS_RETRY_MS = 30_000;
+
 export type UseChatProjects = {
   projects: ChatProject[];
   collapsedIds: Set<string>;
+  /** 最近一次列表拉取失败（正在按 PROJECTS_RETRY_MS 自动重试；也可手动 reloadProjects）。 */
+  projectsLoadFailed: boolean;
+  /** 手动重拉项目列表（失败态的重试入口；成功后清失败态）。 */
+  reloadProjects: () => Promise<void>;
   toggleCollapsed: (projectId: string) => void;
   createProjectPrompt: () => Promise<void>;
   renameProjectPrompt: (p: ChatProject) => Promise<void>;
@@ -79,36 +86,82 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   const toast = useToast();
 
   const [projects, setProjects] = useState<ChatProject[]>([]);
+  const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() =>
     userId ? readCollapsed(userId) : new Set(),
   );
+  // 列表请求代数：登出 / 换号 / 卸载后迟到的响应不再写入。
+  const listGenRef = useRef(0);
+  const listInflightRef = useRef(false);
+  const listFailedRef = useRef(false);
 
   useEffect(() => {
     setCollapsedIds(userId ? readCollapsed(userId) : new Set());
   }, [userId]);
 
+  const canList = !demo && Boolean(auth) && Boolean(userId);
+
+  // 项目列表拉取。此前一次失败只 console.warn 且不重试：projectId 指向未知项目的会话
+  // 整个会话期在侧栏消失（S-12）。现在失败 toast 告知 + 暴露失败态 + 可见时按间隔自动重试。
+  const loadProjects = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!canList || listInflightRef.current) return;
+      const gen = listGenRef.current;
+      listInflightRef.current = true;
+      try {
+        const list = await api.listChatProjects(cbRef.current.authSession);
+        if (gen !== listGenRef.current) return;
+        setProjects(
+          list.slice().sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt - b.createdAt),
+        );
+        listFailedRef.current = false;
+        setProjectsLoadFailed(false);
+      } catch (e) {
+        if (gen !== listGenRef.current) return;
+        console.warn("listChatProjects failed", e);
+        // 只在「首次失败」时 toast；自动重试连续失败不刷屏。
+        if (!listFailedRef.current && !opts?.silent) {
+          toast("项目列表加载失败，会自动重试", "error");
+        }
+        listFailedRef.current = true;
+        setProjectsLoadFailed(true);
+      } finally {
+        if (gen === listGenRef.current) listInflightRef.current = false;
+      }
+    },
+    [canList, toast],
+  );
+
   useEffect(() => {
+    listGenRef.current += 1;
+    listInflightRef.current = false;
+    listFailedRef.current = false;
     if (demo) return;
     if (!auth || !userId) {
       setProjects([]);
+      setProjectsLoadFailed(false);
       return;
     }
-    let cancelled = false;
-    api
-      .listChatProjects(cbRef.current.authSession)
-      .then((list) => {
-        if (!cancelled)
-          setProjects(
-            list.slice().sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt - b.createdAt),
-          );
-      })
-      .catch((e) => {
-        console.warn("listChatProjects failed", e);
-      });
-    return () => {
-      cancelled = true;
+    void loadProjects();
+  }, [demo, auth, userId, loadProjects]);
+
+  // 失败态下：标签可见时每 PROJECTS_RETRY_MS 重试一次；切回前台 / 窗口聚焦也立刻重试。成功即停。
+  useEffect(() => {
+    if (!projectsLoadFailed || !canList) return;
+    const tick = () => {
+      if (document.visibilityState === "visible") void loadProjects({ silent: true });
     };
-  }, [demo, auth, userId]);
+    const timer = window.setInterval(tick, PROJECTS_RETRY_MS);
+    document.addEventListener("visibilitychange", tick);
+    window.addEventListener("focus", tick);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+      window.removeEventListener("focus", tick);
+    };
+  }, [projectsLoadFailed, canList, loadProjects]);
+
+  const reloadProjects = useCallback(() => loadProjects(), [loadProjects]);
 
   const toggleCollapsed = useCallback(
     (projectId: string) => {
@@ -242,18 +295,31 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       }
       setProjects(next);
       if (demo || !cbRef.current.auth) return;
-      const ids = [...seen];
+      // 后端没有批量 sortOrder 接口，此前对 N 个项目并发 N 个 PATCH、任一失败再并发 N 个回滚
+      // （请求风暴，且中途部分成功时服务端顺序停在中间态，UCP-01）。现在串行写：
+      // 只 PATCH sortOrder 真变了的项目；在失败点停下，只回滚已经改成功的那几条。
+      const changed = next.filter((p) => byId.get(p.id)?.sortOrder !== p.sortOrder);
+      const done: ChatProject[] = [];
       try {
-        await Promise.all(
-          ids.map((id, i) => api.patchChatProject(cbRef.current.authSession, id, { sortOrder: i })),
-        );
+        for (const p of changed) {
+          await api.patchChatProject(cbRef.current.authSession, p.id, { sortOrder: p.sortOrder });
+          done.push(p);
+        }
       } catch (e) {
         setProjects(snapshot);
-        void Promise.allSettled(
-          snapshot.map((p) =>
-            api.patchChatProject(cbRef.current.authSession, p.id, { sortOrder: p.sortOrder }),
-          ),
-        );
+        void (async () => {
+          for (const p of done) {
+            const prev = byId.get(p.id);
+            if (!prev) continue;
+            try {
+              await api.patchChatProject(cbRef.current.authSession, p.id, {
+                sortOrder: prev.sortOrder,
+              });
+            } catch (rollbackErr) {
+              console.warn("reorderChatProjects rollback failed", rollbackErr);
+            }
+          }
+        })();
         console.warn("reorderChatProjects failed", e);
         toast("调整项目顺序失败，已恢复", "error");
         throw e;
@@ -265,6 +331,8 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   return {
     projects,
     collapsedIds,
+    projectsLoadFailed,
+    reloadProjects,
     toggleCollapsed,
     createProjectPrompt,
     renameProjectPrompt,

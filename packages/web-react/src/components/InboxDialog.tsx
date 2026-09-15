@@ -62,6 +62,15 @@ const LEVEL_ICON_CLASS: Record<InboxLevelTone, string> = {
  * 图片与链接语法、行内代码与代码围栏、以及 HTML 注释（含正文里 `<!-- ob:xxx -->`
  * 防重发 marker，绝不能漏进摘要），折叠空白后截断到 ~120 字。
  */
+/**
+ * 剥掉正文里的 HTML 注释（含 `<!-- ob:xxx -->` 防重发 marker）。展开态正文此前原样交给
+ * `<Markdown>`，注释被当文本渲染成「<!-- ob:release-2026-09 →」一行开发者标记（IB-01）；
+ * 摘要态早已剥掉，两态现在一致。
+ */
+export function stripHtmlComments(md: string): string {
+  return (md || "").replace(/<!--[\s\S]*?-->/g, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 export function stripMarkdownSummary(md: string, max = 120): string {
   const text = (md || "")
     // HTML 注释（含 <!-- ob:xxx --> 防重发 marker）
@@ -297,19 +306,24 @@ export function InboxDialog({
         </div>
       )}
 
-      {/* Tabs：全部 / 未读（切换重拉，unread_only 跟随） */}
+      {/* Tabs：全部 / 未读（切换重拉，unread_only 跟随）；「未读」带数量，切 Tab 前就知道有几条（IB-03） */}
       <div className="border-b border-border px-4 py-2.5">
         <Tabs
           value={tab}
           onValueChange={(v) => setTab(v as InboxTab)}
-          items={TAB_ITEMS}
+          items={TAB_ITEMS.map((t) =>
+            t.value === "unread" && unreadCount > 0
+              ? { ...t, label: `未读 (${unreadCount > 99 ? "99+" : unreadCount})` }
+              : t,
+          )}
           aria-label="站内信筛选"
         />
       </div>
 
-      {/* 列表区 */}
+      {/* 列表区：加载 / 失败 / 空态切换对读屏播报（IB-02） */}
       <div
         data-product-feature={PRODUCT_CAPABILITIES.inbox.id}
+        aria-busy={loading || undefined}
         className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4"
       >
         {!auth ? (
@@ -319,28 +333,38 @@ export function InboxDialog({
             hint="登录后可查看你的站内信。"
           />
         ) : loading ? (
-          <SkeletonRows />
+          <>
+            <p className="sr-only" aria-live="polite">
+              正在加载站内信…
+            </p>
+            <SkeletonRows />
+          </>
         ) : err ? (
-          <div className="flex flex-col items-center gap-3 px-5 py-14 text-center">
+          <div
+            role="alert"
+            className="flex flex-col items-center gap-3 px-5 py-14 text-center"
+          >
             <p className="text-body text-danger">{err}</p>
             <Button variant="secondary" size="sm" onClick={retry}>
               重试
             </Button>
           </div>
         ) : messages.length === 0 ? (
-          tab === "unread" ? (
-            <EmptyState
-              icon={BellOff}
-              title="没有未读消息"
-              hint="你已读完所有消息。"
-            />
-          ) : (
-            <EmptyState
-              icon={Inbox}
-              title="暂无消息"
-              hint="有新的通知、公告或活动会显示在这里。"
-            />
-          )
+          <div aria-live="polite">
+            {tab === "unread" ? (
+              <EmptyState
+                icon={BellOff}
+                title="没有未读消息"
+                hint="你已读完所有消息。"
+              />
+            ) : (
+              <EmptyState
+                icon={Inbox}
+                title="暂无消息"
+                hint="有新的通知、公告或活动会显示在这里。"
+              />
+            )}
+          </div>
         ) : (
           <>
             <ul className="flex flex-col gap-3">
@@ -403,6 +427,7 @@ function InboxItem({
   const meta = INBOX_LEVEL_META[m.level] ?? INBOX_LEVEL_META.info;
   const Icon = LEVEL_ICON[m.level] ?? Bell;
   const summary = useMemo(() => stripMarkdownSummary(m.body_md), [m.body_md]);
+  const body = useMemo(() => stripHtmlComments(m.body_md), [m.body_md]);
   const hasImage = useMemo(
     () => /!\[[^\]]*\]\([^)]*\)|\/api\/inbox-assets\//i.test(m.body_md),
     [m.body_md],
@@ -494,7 +519,7 @@ function InboxItem({
       {expanded && (
         <div className="min-w-0 overflow-hidden border-t border-border bg-surface px-4 py-4 text-[13px] leading-relaxed text-fg sm:px-5">
           <Markdown signMedia readOnly>
-            {m.body_md}
+            {body}
           </Markdown>
         </div>
       )}

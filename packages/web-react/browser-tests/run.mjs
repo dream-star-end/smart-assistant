@@ -2948,7 +2948,8 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
       };
     });
     if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
-    if (activeState.durationText !== "8m" || !activeState.durationTitle.includes("→")) {
+    // 用时改用中文单位（侧栏审计 SR-01：中文界面不混英文缩写 25m/3h/2d），8 分钟 → 「8分」。
+    if (activeState.durationText !== "8分" || !activeState.durationTitle.includes("→")) {
       throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
     }
     if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {

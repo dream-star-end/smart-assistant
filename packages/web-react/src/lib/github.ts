@@ -72,6 +72,41 @@ export function githubErrorText(code: string | null | undefined): string {
   return GITHUB_ERROR_TEXT[code] ?? "操作失败，请重试";
 }
 
+/** OAuth scope 原文 → 用户可读的授权范围（账号栏副标题用；GH-03：不再把 `repo,read:user` 原样露给用户）。 */
+const GITHUB_SCOPE_TEXT: Record<string, string> = {
+  repo: "读写仓库",
+  public_repo: "读写公开仓库",
+  "repo:status": "读取提交状态",
+  "read:user": "读取账号信息",
+  user: "读取账号信息",
+  "user:email": "读取邮箱",
+  workflow: "管理 Actions 工作流",
+  "read:org": "读取组织信息",
+  "admin:repo_hook": "管理仓库 Webhook",
+  "write:repo_hook": "管理仓库 Webhook",
+};
+
+/**
+ * 逗号 / 空格分隔的 scopes 串 → 「读写仓库 · 读取账号信息」。未知 scope 保留原文（比丢掉信息好），
+ * 去重；空串回「已连接」。
+ */
+export function describeGithubScopes(scopes: string | null | undefined): string {
+  const parts = (scopes ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return "已连接";
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of parts) {
+    const text = GITHUB_SCOPE_TEXT[p] ?? p;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+  }
+  return out.join(" · ");
+}
+
 /**
  * 版本门控：本地已知版本严格大于来帧版本则丢弃（防 stale 回滚）。
  * 等于的接受 —— 后端会对同一 selection_version 推 pending→cloning→ready 多次。

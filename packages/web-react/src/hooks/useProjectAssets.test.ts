@@ -151,6 +151,47 @@ describe("useProjectAssets", () => {
     expect(result.current.assets.map((a) => a.id)).toEqual(["ok"]);
   });
 
+  // PA-03：多文件顺序上传此前只有一行「正在上传…」，无法判断进度。
+  test("多文件上传按文件推进 uploadProgress，失败的也计入，结束后清空", async () => {
+    type Uploaded = Awaited<ReturnType<typeof api.uploadFile>>;
+    const first = deferred<Uploaded>();
+    const third = deferred<Uploaded>();
+    vi.spyOn(api, "uploadFile").mockImplementation((_a, file) => {
+      if (file.name === "1.txt") return first.promise;
+      if (file.name === "3.txt") return third.promise;
+      return Promise.reject(new Error("boom"));
+    });
+    vi.spyOn(api, "createProjectAsset").mockImplementation(async (_a, input) =>
+      asset({ id: input.name, name: input.name, createdAt: 1 }),
+    );
+    const { result } = await renderAssets({ list: [] });
+    expect(result.current.uploadProgress).toBeNull();
+    let pending!: Promise<void>;
+    act(() => {
+      pending = result.current.uploadFiles([
+        new File(["1"], "1.txt"),
+        new File(["2"], "2.txt"),
+        new File(["3"], "3.txt"),
+      ]);
+    });
+    expect(result.current.uploading).toBe(true);
+    expect(result.current.uploadProgress).toEqual({ done: 0, total: 3 });
+    await act(async () => {
+      first.resolve({ url: "/api/media/1.txt", digest: "1", size: 1, mimeType: "text/plain" });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    // 1.txt 成功、2.txt 失败都算「已处理」，此刻正在传第 3 个。
+    expect(result.current.uploadProgress).toEqual({ done: 2, total: 3 });
+    expect(result.current.uploading).toBe(true);
+    await act(async () => {
+      third.resolve({ url: "/api/media/3.txt", digest: "3", size: 1, mimeType: "text/plain" });
+      await pending;
+    });
+    expect(result.current.uploading).toBe(false);
+    expect(result.current.uploadProgress).toBeNull();
+    expect(result.current.assets.map((a) => a.id).sort()).toEqual(["1.txt", "3.txt"]);
+  });
+
   test("pin 切换乐观更新与失败回滚", async () => {
     const patch = deferred<ProjectAsset>();
     vi.spyOn(api, "patchProjectAsset").mockReturnValue(patch.promise);
