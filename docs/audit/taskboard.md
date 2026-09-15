@@ -337,3 +337,102 @@
 | 列表 200/页与后端上限 | `LIST_PAGE_SIZE` 与 HTTP/DB 上限锁步（`useTaskboard.ts:260-261` 注释），不动。 |
 | 成本页图表化 | 属新功能而非缺陷；文本卡片可用。 |
 | 存量文件的 biome `format` 差异 | 全部由工作树 `core.autocrlf=true` 的 CRLF 造成，非源码问题；阶段 B 提交时按精确文件 `git add`，git 会在提交时归一为 LF。 |
+
+---
+
+## 6. 修复记录（阶段 B）
+
+- 分支：`feat/v5-selfhost-audit-taskboard`（在阶段 A 的 `6cdb31cdf` 之上）。commit：`42fc60a79` feat(v5) 业务代码 + 测试（21 个文件）、`fe787f009` test(v5) ui-preview 场景、本文档另起一条 docs(v5)。
+- 接手说明：修复代码与本节逐条记录由 fable-5-1-23 完成，其会话在提交前掉线（工作树内 23 个文件未提交）；fable-5-1-19 接手 t-43 后未改业务代码，只做复核（typecheck / vitest / biome / 以当前代码全量重拍 after 截图，见 §7.2）、按文件精确 `git add` 分两条提交并推送、补本节与 §7.2。
+- 结论：**P1 2 条：1 修复 + 1 转 sidebar owner（跨模块）；P2 14 条全部修复；P3 14 条中 12 条修复、2 条部分修复 / 暂缓**（T-28 部分、T-20 保留 shell 归属的类型）。
+- 原则：只改 taskboard 归属文件；`ui/Sheet` 等原语一律不动；所有逻辑改动配 vitest，视觉改动以 after 截图对照。
+- 新增文件：`components/taskboard/PanelSheet.tsx`（四个配置抽屉的统一外壳：桌面右侧 / 移动贴底、头部常驻标题 + 关闭、宽度只定义一次）、`components/taskboard/auditFixes.test.tsx`（本轮回归用例，按 T 编号组织）。
+
+### 6.1 逐条记录
+
+| 编号 | 状态 | 改动 | 测试 |
+|---|---|---|---|
+| **T-01** | 修复 | 删除 `TaskboardView` 里与 `loadInitial` 同 commit 抢跑的 `selectProject(lockedProjectId)` effect，锁定项目只剩 `useTaskboard.loadInitial` 一条加载路径；`loadInitial` 把 `setProjects / setAgents` 提到 `isCurrent()` 守卫之前（只受 `ownsLoading` 约束）；`selectProject` 只留给项目创建 / 归档后的显式切换。 | `auditFixes` T-01：`listProjects` 恰 2 次（Provider + hook）、`getProjectBoard` 恰 1 次、执行者筛选含具名 agent、无需对账即有「管理项目」入口；`taskboard.test` 建项目 / 归档回归。 |
+| **T-02** | 转 sidebar | `useProjectScope.tsx:153-163` 归 sidebar；原 owner fable-5-1-19 不在组内，已 `send_to` 指挥官（消息 dm-mu2tr278-b4q8qf）附文件 / 改法 / 测试要求，请其转给 sidebar-B 认领者；换轮后 sidebar-B 由 fable-5-1-25（现任指挥官）持有，接手时已向其重发同一请求（dm-mu2wtqk7-yij14v）。taskboard 侧对照场景 `taskboard-scope-deeplink-reload` 保留，修后应直接画出看板。 | 由 sidebar 侧补 `projectScope` 用例；本轮 after 截图该场景仍为空态（预期，未修）。 |
+| **T-03** | 修复 | `loadInitial` 内层 catch 与 `selectProject` 的 catch 都 `setError(taskboardErrorMessage(e, '加载看板失败'))`（后者只在仍是最新请求时），错误落到带「重试」的 EmptyState；`selectProject` 开始时 `setError(null)`。`BoardColumns` 无流水线文案改为「这个项目还没有 <类型> 流水线」+「配置流水线 / 套用模板」按钮。 | `auditFixes` T-03：502 → 「任务面板加载失败」+ 错误详情 + 重试 → 成功后画出看板；`getProjectBoard` 恰 2 次。 |
+| **T-04** | 修复 | 状态下拉新增「在途（默认）」（value=`ACTIVE_LIST_STATUSES`）与「全部状态（含已完成 / 已取消）」（value=''）；`countActiveFilters` 不把默认值计入，「全部」计为 1 个筛选；「清除筛选」恢复到默认在途而不是删掉 status。 | `auditFixes` T-04；`taskboard.test` 移动端筛选用例更新（`筛选 2`、清除后带 status）。 |
+| **T-05** | 修复 | 单据抽屉顶部常驻 `DrawerBar`（编号 + 关闭 ×，加载中也有）；四个配置抽屉统一走 `PanelSheet`（标题 + 关闭 ×，`*-close` testid）；新建单据贴底抽屉加关闭 ×；桌面内联新建表单加关闭 ×。未动 `ui/Sheet.tsx`。 | `auditFixes`：抽屉关闭回调、`stage-settings-close` / `template-library-close` / `project-edit-close` / `board-settings-close` 均关得掉。 |
+| **T-06** | 修复 | 抽屉里 `renderActions(ticket, 'full')`（移动端不再退化成「···」），全部动作平铺成带文字按钮；「移动到…」单独做成带文字的 secondary 按钮（`ticket-move-menu`），紧凑「···」只留在看板 / 列表卡。 | `auditFixes` T-05/06/07：窄屏抽屉直接可见「完成」「取消单据」「标记受阻」，无 `ticket-more-actions`。 |
+| **T-07** | 修复 | 「取消」→「取消单据」，「受阻」→「标记受阻」；确认框 `cancelText` 统一为「返回 / 先不移动 / 继续编辑」，不再 [取消][取消单据] 并排；完成确认按钮「标记完成」。 | 同上（断言确认框有「返回」与「取消单据」两个不同按钮）；`boardMove.test` 菜单项文案更新。 |
+| **T-08** | 修复 | `TICKET_STATUS_LABEL` 为唯一权威：`backlog`「积压」、`waiting_human`「待确认」；终态改「已完成 / 已取消」，与动作词「完成 / 取消单据」区分（文案拍板：计划已写明取列头那套并经审批，本轮直接落地，见 §6.3）。 | `auditFixes` T-08。 |
+| **T-09** | 修复 | `TicketCard` meta 重排：紧凑态只留优先级 + 执行者（带机器人图标，`min-w-0 flex-1` 不再被挤成「codin…」）；卡片态分徽章行 / 人员行（执行者、批准人各带图标 + sr-only 前缀）/ 时间 + 操作行。 | after 截图 `taskboard-board-responsive--*`、`taskboard-list-responsive--mobile--*`；`auditFixes` T-15 断言执行者全文。 |
+| **T-10** | 修复 | 移动端顶栏：项目 / 流水线 / 模板 / 护栏四个入口收进一个「配置」DropdownMenu（`taskboard-config-menu`，菜单项保留原 testid），删掉 `text-[10px]` 短标签与误导的「看板」；四个面板改为受控打开（`open/onOpenChange`、`mode/onModeChange`、`hideTrigger`），只挂一份；「列表 / 看板」切换在窄屏只留图标、类型下拉 `w-24`，与 Tabs 同行。首张卡片顶边从 ~430px 提到 ~310px（390×844）。 | `taskboard.test`「窄屏配置入口」：无短标签、菜单五项带完整文字、菜单可开抽屉且抽屉可关；`m4Board.test` 建项目路径改走菜单。新增场景 `taskboard-mobile-config-menu`。 |
+| **T-11** | 修复 | 阶段导航 chip 改 `Button size="sm" shape="pill"`，自动获得 `[@media(hover:none)]:min-h-11`。 | `boardMove.test` 阶段导航用例回归；after 截图。 |
+| **T-12** | 修复 | `StageEditor` 用 `stage.id` 当 key（去掉 `dataGen`），自己维护 `baseline/dirty`：有未保存修改时重载不重置草稿，服务端另有改动则显示「刚被别处更新过」+「载入最新」；保存成功后采纳下一份服务端数据；`onDirtyChange` 上报给父级，关闭抽屉前有脏编辑器先 confirm（继续编辑 / 放弃修改并关闭）。 | `taskboard.test`：409 后草稿保留 + 载入最新；写操作重载后草稿不丢 + 关闭拦截。 |
+| **T-13** | 修复 | 搜索 / 标签输入改本地草稿 + 300ms debounce（`LIST_QUERY_DEBOUNCE_MS`），`compositionstart/end` 期间不发。 | `auditFixes` T-13：连输 3 字符只发 1 次；IME 组合期间不发。 |
+| **T-14** | 修复 | 成本 / 周报首句、护栏说明、项目工作区三种选项（「默认工作区 / 每个项目独立目录 / 指定容器内目录」+ 各自 hint）、路径校验文案、项目上下文（不再显示 `version` 与 JSON，注入槽名映射为「项目说明 / 项目记忆 / 实时 git 状态」+ 字节转 KB）、「预览注入槽」→「预览 agent 将看到的项目信息」、项目记忆说明、模型 hint 去掉接口路径、run 快照折叠进「执行时的项目信息快照」。`RECORDED_COST_LABELS` 钉死文案未改。 | `ProjectSettings.test` 更新为新文案且断言无 `cwd / OPENCLAUDE_DEFAULT_WORKSPACE`；`auditFixes` T-14/T-21 断言无 `tb_project / usage_records`。 |
+| **T-15** | 修复 | 卡片容器去掉 `role="button"/tabIndex`；标题改为真按钮（accessible name = 标题，`data-drag-through` 让 `beginDrag` 放行）；类型图标 `aria-hidden`，紧凑态补 sr-only 类型文字。 | `auditFixes` T-15；`taskboard.test` 图标断言更新。 |
+| **T-16** | 修复 | ① 有流水线、零单据 → 「还没有单据」+「新建第一条单据」，不画 6 个空列；② 无流水线 → 「这个项目还没有 X 流水线」+「配置流水线 / 套用模板」；③ 「还没有项目」+「新建项目」；④ 列表空态分「这个项目还没有单据 / 没有在途的单据 / 没有符合筛选的单据」三种，各给下一步；单列空文案提到 `text-muted`。 | `auditFixes` T-16 四条；after 截图 `taskboard-empty-columns--*`、`taskboard-no-pipeline--*`。 |
+| **T-17** | 修复 | Tabs 传 `mountedPanels={[sectionView]}`，内容容器 `id=taskboard-section-panel-<view> role=tabpanel aria-labelledby`；筛选按钮收起时不落 `aria-controls`；表格操作列 `<th>` 补 sr-only「操作」；看板滚动容器改 `<section aria-label>`；类型图标 `aria-hidden`。 | `auditFixes` T-17 两条。 |
+| **T-18** | 修复 | 评论输入区移到讨论列表之后（`TicketTimeline` 的 `composer` 插槽）；编辑表单四个控件用 `Field label`；正文 Markdown `h1/h2 → text-section`、`h3 → text-body`（`.prose h2` 是未分层样式，需带 `!`）。 | after 截图 `taskboard-ticket-drawer--*`、`taskboard-ticket-drawer-edit--*`；`ownerFence*.test` 回归。 |
+| **T-19** | 修复 | 三处冲突文案统一为 `taskboardErrorMessage` 的「单据已被其他人更新，已刷新最新内容」；`pendingAction` 记录被点的按钮，只有它 `loading`，其余 `disabled`（含「移动到…」）。 | `auditFixes` T-19；`boardMove.test` 冲突文案更新。 |
+| **T-20** | 修复（部分） | 删 `backlog / inbox` 视图分支与 `backlogTypeFilter`（旧值归一到列表）；删 `useTaskboard` 未用 import；删 `CostStatsView / WeeklyReportView` 的 `projects / projectId` prop 与 `filterProject`；删 `addStage` 不可达的 AI 守卫。`BoardViewParam` 的 `inbox/backlog` 类型属 shell，不动。 | typecheck；`boardMove.test` 删除依赖死视图的「积压 tab 类型筛选」用例（其覆盖的批准路径由「旧积压视图归到任务入口」用例保留）。 |
+| **T-21** | 修复 | 去掉工具栏第二个 `ProjectScopeSelect`；「下一周」在周期已覆盖今天时禁用并 title 说明；上一周 / 区间 / 下一周包成一组；刷新按钮带 `loading`、容器 `aria-busy`；StatCard 移到合计之后、分桶之前；`from > to` 时 Field 报错并禁用刷新（不发请求）。 | `auditFixes` T-14/T-21 两条；`m4Board.test` 周报 / 成本用例回归。 |
+| **T-22** | 修复 | 数字字段改字符串草稿（清空不变 0），保存时统一校验；补「每轮巡检最多启动 / 连续失败熔断 / 同一阶段最多打回次数」三个输入；静默开始 = 结束显示「不设静默时段」；「急停巡检」移到独立「紧急」区、描边红而非实心；用量拆成 `DescriptionList` 三行。 | `auditFixes` T-22；`costLegacyFallback.test` 改为断言整块用量。 |
+| **T-23** | 修复 | 「归档」移到底部「危险操作」区（描边红）；项目记忆「废弃」加 `confirm({danger:true})`。 | `auditFixes` T-23。 |
+| **T-24** | 修复 | 桌面列宽 `md:w-[clamp(14rem,calc((100%_-_5.75rem)/6),18rem)]`，1440 下六列排开；阶段列 / 积压列 / 待确认列内隐藏状态徽章（列名已表达），受阻保留；紧凑卡标题 `line-clamp-2`；右侧渐隐加宽并带「→」。 | after 截图 `taskboard-board-responsive--desktop--*`（「体验验收」列已在视口内）。 |
+| **T-25** | 修复 | `PanelSheet` 按 `useMdViewport` 决定 `side`（桌面 right / 移动 bottom），宽度常量 `PANEL_SHEET_WIDTH` 只定义一次；与单据抽屉、新建表单同一范式。 | after 截图各面板 `--mobile--*`。 |
+| **T-26** | 修复 | 桌面内联新建表单加标题「新建单据」+ 说明 + 关闭；类型 / 标题 / 正文用 `Field label`；「下一步」改 `SegmentedControl`（radiogroup）。 | `boardMove.test` 新建用例（radio 名称改「先放积压」）；after 截图 `taskboard-create-form--desktop--*`。 |
+| **T-27** | 修复 | 乐观评论（`local-` 前缀）作者显示「我 · 人」+「发送中…」，回执到达后换成服务端作者。 | `auditFixes` T-27。 |
+| **T-28** | 修复（部分） | 流水线头行拆两行（名字 + 徽章 / 按钮组，「改名」只在名字改动后可用，显示「N 站」）；阶段行名字 `min-w-[8rem]`，按钮组放不下整体换行右对齐；编辑表单分「基础 / 执行 / 巡检 / 流转」四个可折叠分组（执行仅 AI 展开、巡检仅启用时展开），「保存阶段」吸底并显示是否有改动；新建阶段后自动展开编辑。**暂缓**：直接新建 AI 阶段 —— 后端要求 AI 阶段绑定 agent（`buildStagePatch` 同一约束），改为在新建行下方说明两步流程；上 / 下移按钮保留在行内（避免改动 `m4Board.test` 的拖拽排序契约）。 | `taskboard.test` StageSettings 用例回归；after 截图 `taskboard-stage-settings--*`。 |
+| **T-29** | 修复 | 「回到来源会话」`disabled={!originUsable}` + `title` 说明（巡检 sessionKey 也算不可用）。 | `taskboard.test` 来源会话用例改为断言 disabled + title。 |
+| **T-30** | 修复 | `TicketDrawer` 新增只读回调 `onDetailLoaded`；`TaskboardView` 以 `detailTicket` 兜底算 `actions`（不走 `replaceTicket`，避免读路径 bump epoch 打断首屏加载）。 | `auditFixes` T-30。 |
+
+### 6.2 计划外顺手修的
+
+- `ProjectSettings` 编辑态头部的「新建项目」入口改到 `PanelSheet` 头部右侧（原来在滚动正文里）；桌面铅笔按钮 aria-label 由「编辑项目」统一为「管理项目」。
+- 看板「移动到…」在抽屉里可用键盘打开并选择（Radix 菜单），与卡片上的「···」同一套 `runMove`。
+- `WeeklyReportView` 失败 run 状态 `timeout / failed` 显示为中文「超时 / 失败」，分区标题「失败 run」→「失败的执行」。
+
+### 6.3 需要指挥官知悉的取舍
+
+- **T-08 文案**：计划写「先 `ask_decision`（低）」。计划本身已写明推荐值（「积压」「待确认」）并经审批，且按 §G 这属于能自行定、错了改一行即可的选择，故直接落地；顺带把终态改为「已完成 / 已取消」以与动作词区分。如需改回，只动 `lib/taskboard.ts` 的 `TICKET_STATUS_LABEL`。
+- **T-12 与 409**：以前保存遇冲突 → 重读 → 本地编辑被静默丢掉；现在保留本地草稿并提示「刚被别处更新过，保存会覆盖」+「载入最新」。这是有意的行为变化，对应用例已更新。
+- **T-20**：删掉的 `view='backlog'` 分支曾有一条专门用例（按类型筛选积压）；该视图从 URL 不可达（`parseBoardView` 归一为 list），用例随之删除，批准路径由「旧积压视图归到任务入口」用例继续覆盖。
+- **存量 biome**：`lib/taskboard.ts` 与 `ProjectSettings.test.tsx` 各有 1 条阶段 A 前就存在的 `organizeImports` 排序提示（未在本轮触碰的 import 行），未改；`ownerFence.review.test.tsx:354` 存量 lint 同前。
+
+---
+
+## 7. 验证（阶段 B）
+
+均在工作树 `d:\code\test_project\test123\wt\taskboard` 内执行。下表为 fable-5-1-23 修复完成时的结果；接手后以提交内容（`42fc60a79` + `fe787f009`）重跑的复核见 §7.2。
+
+| 命令 | 结果 |
+|---|---|
+| `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0） |
+| `cd packages/web-react; npx vitest run src/components/taskboard src/lib/taskboardFeature.test.ts --maxWorkers=1` | ✅ **10 files / 124 tests passed**（阶段 A 基线 9 / 101：新增 `auditFixes.test.tsx` 23 条 + `taskboard.test.tsx` 1 条，删除 1 条死视图用例） |
+| `npx biome check --formatter-enabled=false <本轮 22 个文件>` | 本轮改动文件 0 条新 lint；剩余 2 条为存量 `organizeImports`（`lib/taskboard.ts:1`、`ProjectSettings.test.tsx:5`，见 §6.3）；`format` 差异同阶段 A（CRLF），提交时由 git 归一 |
+| `node browser-tests/ui-preview/shoot.mjs`（`OC_UI_SCENES=taskboard`，`OC_UI_SHOT_DELAY=1600`） | ✅ **17 场景 × desktop/mobile × light/dark = 66 张**，`failures=0`、`unmockedApi=0` |
+| `npm run test:browser` | `NOT RUN`：任务面板不在作业手册 §3 列出的高频交互面（Composer / 消息 / 工具卡 / 侧栏）内，本轮未改这些面。 |
+
+### 7.1 after 截图
+
+- 目录：`D:\code\test_project\test123\.audit-tmp\taskboard\after\`（仓库外），命名同 before；新增场景 `taskboard-mobile-config-menu`（仅 mobile）。
+- 重点对照（before → after）：
+  - `taskboard-board-responsive--desktop`：6 列全部在 1440 视口内；卡片只剩优先级 + 执行者，受阻卡保留角标 + 徽章。
+  - `taskboard-board-responsive--mobile`：首张卡片顶边 ~430px → ~310px；顶栏只剩项目下拉 + 「配置」，阶段 chip 为 44px 触控靶。
+  - `taskboard-list-responsive--*`：状态下拉显示「在途（默认）」、默认无「清除筛选」；移动卡片人员行完整可读。
+  - `taskboard-ticket-drawer--mobile`：顶部关闭 ×，动作平铺为「标记受阻 / 完成 / 取消单据 / 移动到…」，讨论在评论框之前。
+  - `taskboard-create-form--desktop`：带标题、字段标签与分段选择。
+  - `taskboard-empty-columns--*` / `taskboard-no-pipeline--*` / `taskboard-load-error--*`：三种空态 / 错误态各有下一步按钮。
+  - `taskboard-stage-settings--mobile`、`taskboard-board-settings--mobile`、`taskboard-project-settings--mobile`、`taskboard-template-library--mobile`：贴底抽屉 + 关闭按钮 + 用户语言文案。
+  - `taskboard-scope-deeplink-reload--*`：仍为空态（T-02 属 sidebar，待其修复后复拍）。
+
+### 7.2 接手复核（fable-5-1-19，09-16 00:45–00:55）
+
+接手时发现 8 个源文件 / 测试 / 场景的最后修改时间（00:36）晚于原 after 截图（00:14–00:20），且 `manifest.json` 只剩最后一批 7 个场景，故以提交内容全量重拍一遍 after，保证截图 = 提交代码。
+
+| 命令 | 结果 |
+|---|---|
+| `npm run typecheck --workspace packages/web-react` | ✅ exit 0 |
+| `cd packages/web-react; npx vitest run src/components/taskboard src/lib/taskboardFeature.test.ts --maxWorkers=1` | ✅ 10 files / 124 tests passed（38.4s） |
+| `npx biome check --formatter-enabled=false <本轮 22 个 web-react 文件>` | 0 条新增；仅剩 §6.3 所述 2 条存量 `organizeImports`（`lib/taskboard.ts:1`、`ProjectSettings.test.tsx:5`），本轮未触碰这两行 |
+| `node browser-tests/ui-preview/shoot.mjs`（`OC_UI_SCENES=taskboard`、`OC_UI_SHOT_DELAY=1600`，一次跑完） | ✅ 17 场景 × 主题 / 视口 = 66 张，`failures=0`、`retried=0`、`unmockedApi=0`；`manifest.json`（generatedAt 2026-09-15T16:53Z）现覆盖全部 17 场景 |
+| `npm run test:browser` | `NOT RUN`，理由同上表 |
+| 逐张抽看（Read） | `taskboard-board-responsive--desktop/mobile--light`、`taskboard-ticket-drawer--mobile--light`、`taskboard-load-error--desktop--light`、`taskboard-list-responsive--desktop--light`、`taskboard-mobile-config-menu--mobile--light`、`taskboard-stage-settings--mobile--light`、`taskboard-empty-columns--desktop--dark`：与 §7.1 重点对照描述一致（六列在 1440 内、移动端「配置」菜单、抽屉关闭 × 与平铺动作、错误态带重试、空态带下一步、状态下拉「在途（默认）」） |
+| 改动范围 | `git status` 只含 taskboard 归属文件 + `browser-tests/ui-preview/scenes-taskboard.tsx` + 本文档；`packages/cli/src/index.ts`、`packages/mcp-memory/src/index.ts` 为 `npm ci` 行尾假改动（`git diff` 为空），未提交 |
