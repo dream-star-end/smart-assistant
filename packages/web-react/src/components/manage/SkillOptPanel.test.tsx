@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError, api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
@@ -74,7 +74,40 @@ describe("SkillTrainSection 训练 run 重入", () => {
     expect(await screen.findByText(/发现一个未处理的训练草稿/)).toBeInTheDocument();
     // diff 入口恢复：草稿视图的合并按钮可见。
     expect(await screen.findByText(/合并到技能库/)).toBeInTheDocument();
-    expect(screen.getByText("草稿:coding-suite")).toBeInTheDocument();
+    expect(screen.getByText("草稿：coding-suite")).toBeInTheDocument();
+  });
+
+  test("放弃训练草稿:服务端失败时 run 原样留着并报错,不再吞错清本地后下次又被找回", async () => {
+    vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([DIFF_RUN]);
+    vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(DIFF_RUN);
+    vi.spyOn(api, "listSkillDrafts").mockResolvedValue([DRAFT_SUMMARY]);
+    vi.spyOn(api, "getSkillDraft").mockResolvedValue(DRAFT_DETAIL);
+    const discard = vi
+      .spyOn(api, "discardSkillTrainRun")
+      .mockRejectedValueOnce(new ApiError({ status: 500, message: "训练服务暂不可用", requestId: "r1" }))
+      .mockResolvedValueOnce({ ok: true });
+
+    render(<SkillTrainSection auth={auth} skillName="coding-suite" rates={null} />);
+    await screen.findByText("草稿：coding-suite");
+
+    // 触发按钮与确认框的确认键同名「放弃」:确认键只在弹层里找。
+    const confirmDiscard = async () => {
+      fireEvent.click(screen.getByRole("button", { name: "放弃" }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("button", { name: "放弃" }));
+    };
+
+    await confirmDiscard();
+    // 失败:报在原地,草稿视图仍在。
+    expect(await screen.findByText(/训练服务暂不可用/)).toBeInTheDocument();
+    expect(screen.getByText("草稿：coding-suite")).toBeInTheDocument();
+    expect(discard).toHaveBeenCalledTimes(1);
+
+    // 再试成功:run 卸载,草稿视图消失。
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await confirmDiscard();
+    await waitFor(() => expect(screen.queryByText("草稿：coding-suite")).not.toBeInTheDocument());
+    expect(discard).toHaveBeenCalledTimes(2);
   });
 
   test("合并成功(已扣积分):给出留在原地的成功说明,并通知外层失效正文缓存", async () => {
