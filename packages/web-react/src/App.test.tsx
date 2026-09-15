@@ -379,9 +379,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
     await loginViaUi()
 
-    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    // 侧栏空态有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
-    expect(screen.getByText('暂无会话')).toBeInTheDocument()
+    // sidebar-B S-13 起零会话零项目渲染一块引导空态(data-testid=sidebar-empty-all,「还没有会话」),
+    // 不再是单独的「暂无会话」占位文本。
+    expect(screen.getByTestId('sidebar-empty-all')).toHaveTextContent('还没有会话')
 
     const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/auth/login')
     expect(call).toBeTruthy()
