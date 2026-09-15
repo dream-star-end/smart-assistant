@@ -689,6 +689,10 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
     }
     if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);
+    if (op === "consult_advisor") {
+      const q = (asStr(input.question) || asStr(input.concern)).replace(/\s+/g, " ").trim();
+      return q ? clipOneLine(q, 40) : "";
+    }
     return op;
   }
   if (server === "web-context") {

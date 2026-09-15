@@ -125,7 +125,7 @@ test("actual App new-session advisor/team send materializes session before colla
       await page.addScriptTag({ content: bundle.outputFiles[0].text });
       await page.getByRole("button", { name: /切换智能体/ }).waitFor();
       await page.getByRole("button", { name: /切换智能体/ }).click();
-      await page.getByRole("button", { name: /主模型不切换/ }).click();
+      await page.getByRole("button", { name: /主模型不变/ }).click();
       await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "hidden" });
       await page.getByPlaceholder(/和「全能助手」对话/).fill("顾问首发不要 404");
