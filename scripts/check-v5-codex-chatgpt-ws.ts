@@ -35,7 +35,9 @@ must(runner.includes('abortTurnForChatgptWebsocketDirect'), 'runner must abort o
 must(runner.includes('CodexChatgptWebsocketDirectError'), 'missing CodexChatgptWebsocketDirectError')
 must(runner.includes('staleProcGeneration'), 'interrupt fence flag missing')
 must(runner.includes('recycleProcKeepQueue'), 'recycleProcKeepQueue missing')
-must(runner.includes("void this.recycleProcKeepQueue('user-cancelled')"), 'USER_CANCELLED must recycle proc')
+must(runner.includes('recycleInflight'), 'recycle must be one-shot / join inflight')
+must(runner.includes('keepQueuedTurns'), 'recycle shutdown must keep queued turns')
+must(runner.includes("await this.recycleProcKeepQueue('user-cancelled')"), 'USER_CANCELLED must await recycle')
 must(
   /if \(result\.abortWebsocketDirect\) this\.abortTurnForChatgptWebsocketDirect\(\)/.test(runner),
   'stderr path must abort websocket-direct before PATH_NOT_ALLOWED',
