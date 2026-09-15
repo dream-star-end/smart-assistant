@@ -2456,6 +2456,11 @@ cutover_consumer_preflight() { # <exact selected master release>
   fi
   # Initial rejection only. A compatible snapshot does not replace the later
   # real writer barrier / start allowance. Never pass env-supplied proof JSON.
+  if [[ "${2:-}" == enroll ]]; then
+    args+=(--enroll --quiesce-master --holder-pid "$$" --lock "$SELFHOST_DEPLOY_LOCK"
+      --state "${SURVIVOR_CONSUMER_STATE:-/opt/openclaude/openclaude-v5-selfhost-releases/.consumer-transition.state}"
+      --legacy "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}")
+  fi
   python3 "$SCRIPT_DIR/delegate-consumer-preflight.py" "${args[@]}"
 }
 
@@ -2562,6 +2567,10 @@ cmd_cutover() {
   if [[ "$DRY" != 1 ]]; then
     cutover_arm_survivor "$backup" \
       || die "武装 survivor 失败。尚未覆盖 unit。"
+    # Recompute the selected source/inventory under the actual inherited FD8;
+    # durable enrollment is NOT an allowance to start a consumer.
+    cutover_consumer_preflight "$rel" enroll \
+      || die "consumer 持久登记失败。尚未覆盖 unit。"
     # phase=mutated 必须在覆盖第一个 unit 之前 durable 落盘。
     # 失败则拒绝进入 mutation:survivor 仍为 armed,健康绿不会误回切。
     cutover_persist_phase "mutated" \

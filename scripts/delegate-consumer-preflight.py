@@ -7,6 +7,7 @@ and the full original inventory/B0 oracle. The snapshot must be taken AGAIN
 under the real writer barrier by the later authorization stage.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -23,6 +24,7 @@ artifacts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(artifacts)
 paths = artifacts.paths
 inventory = artifacts.inventory_reader
+cgroups = artifacts._load('consumer_quiesce_cgroups', ROOT / 'lib/delegate-consumer-cgroup.py')
 MASTER = 'openclaude-v5-selfhost.service'
 LIVE = '/opt/openclaude/openclaude-v5-selfhost-live'
 RELEASES = '/opt/openclaude/openclaude-v5-selfhost-releases'
@@ -165,7 +167,7 @@ def revalidate_context(context, deadline):
     require(image_snapshot(context['tuple'], deadline) == context['image'])
 
 
-def initial(candidate_master, candidate_runtime, candidate_image, candidate_image_id,
+def capture_transition(candidate_master, candidate_runtime, candidate_image, candidate_image_id,
             candidate_bundle, deadline, *, repository=REPOSITORY, live=LIVE,
             releases=RELEASES, unit_name=MASTER):
     """Internal explicit-path adapter permits private tests, not CLI overrides.
@@ -219,7 +221,73 @@ def initial(candidate_master, candidate_runtime, candidate_image, candidate_imag
     require(link_snapshot(live) == selector)
     inventory.revalidate(inv)
     require(time.monotonic() < deadline)
-    return decision
+    return {'decision': decision, 'current': current, 'candidate': candidate,
+            'inventory': inv, 'selector': selector, 'running': running}
+
+
+def initial(*args, **kwargs):
+    return capture_transition(*args, **kwargs)['decision']
+
+
+def quiesce_master(snapshot, state_path, owner, deadline):
+    """Stop the original provisioning master and prove its held cgroup dead.
+
+    This is ONE stage, not all-volume writer quiescence or start permission.
+    No container is started or removed. Unknown/inactive-without-live-pin must
+    use the later trusted recovery path, not treat a missing cgroup as empty.
+    """
+    unit = snapshot['current']['unit']['unit']
+    running = snapshot['running']
+    require(running['process'] is not None)
+    record = artifacts.state.read(state_path)
+    require(record['consumer_phase'] == 'quiescing' and int(record['executor_pid']) == owner['pid'])
+    artifacts.state._owner(owner)
+    current = snapshot['current']
+    require(runtime_snapshot(unit, current['unit']['projection'], current['code']['master']['root'], deadline) == running)
+    with cgroups.PinnedCgroup(running['properties']['ControlGroup']) as held:
+        artifacts.state._owner(owner)
+        artifacts._run(['/usr/bin/systemctl', '--system', 'stop', '--', unit], deadline)
+        artifacts.state._owner(owner)
+        stopped = runtime_snapshot(unit, current['unit']['projection'], current['code']['master']['root'], deadline)
+        require(stopped['process'] is None)
+        proof = held.verify_stopped()
+        artifacts.state._owner(owner)
+        artifacts.state.update_phase(state_path, 'consumer-master-stopped')
+        return proof
+
+
+def enroll(args, state_path, legacy, lock_path, pid, *, quiesce=False, **private):
+    """Original FD8 holder enrolls selected immutable intent before mutation.
+
+    Still quiescing: no start authorization, command execution or compensation
+    permission is granted here. Never accept a serialized snapshot from CLI.
+    """
+    owner = artifacts.state.lock.capture_holder(lock_path, pid, 8)
+    artifacts.state._owner(owner)
+    snapshot = capture_transition(*args, **private)
+    if snapshot['decision']['status'] != 'compatible_snapshot':
+        return snapshot['decision']
+    def identity(context):
+        p = context['unit']['projection']
+        return {'master': context['code']['master'], 'runtime': context['code']['runtime'],
+                'tuple': context['tuple'], 'database': p['database'],
+                'unit': {k: p[k] for k in ('workingDirectory', 'argv', 'pathEnvironment')}}
+    descriptor = {'current': identity(snapshot['current']), 'candidate': identity(snapshot['candidate']),
+                  'required': snapshot['decision']['required']}
+    intent = {'schema': 1, 'descriptor': descriptor,
+              'sha256': hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    artifacts.state._owner(owner)
+    result = artifacts.state.begin(state_path, legacy, lock_path, pid, intent=intent)
+    if quiesce:
+        try:
+            quiesce_master(snapshot, state_path, owner, time.monotonic() + 20)
+        except (Unknown, artifacts.Unknown, artifacts.state.Unknown, artifacts.state.lock.Unknown,
+                cgroups.Unknown, OSError, ValueError, TypeError, KeyError):
+            # The service may have stopped even if systemctl timed out. Keep
+            # the durable uncertainty; do not restore/start an unchecked target.
+            artifacts.state.mark_manual(state_path)
+            raise
+    return {'status': 'enrolled_quiescing', 'epoch': result['consumer_epoch'], 'intent': intent['sha256']}
 
 
 def main():
@@ -229,15 +297,27 @@ def main():
     parser.add_argument('--candidate-image', default='')
     parser.add_argument('--candidate-image-id', default='')
     parser.add_argument('--candidate-bundle', default='')
+    parser.add_argument('--enroll', action='store_true')
+    parser.add_argument('--quiesce-master', action='store_true')
+    parser.add_argument('--state')
+    parser.add_argument('--legacy')
+    parser.add_argument('--lock')
+    parser.add_argument('--holder-pid', type=int)
     args = parser.parse_args()
     try:
-        result = initial(args.candidate_master, args.candidate_runtime, args.candidate_image,
-                         args.candidate_image_id, args.candidate_bundle, time.monotonic() + 15)
+        selected = (args.candidate_master, args.candidate_runtime, args.candidate_image,
+                    args.candidate_image_id, args.candidate_bundle, time.monotonic() + 15)
+        if args.enroll:
+            require(args.state and args.legacy and args.lock and args.holder_pid)
+            result = enroll(selected, args.state, args.legacy, args.lock, args.holder_pid, quiesce=args.quiesce_master)
+        else:
+            require(not any((args.state, args.legacy, args.lock, args.holder_pid, args.quiesce_master)))
+            result = initial(*selected)
         # Only bounded verdict/counters leave this process, not env or paths.
         print(json.dumps(result))
-        return 0 if result['status'] == 'compatible_snapshot' else 1
+        return 0 if result['status'] in {'compatible_snapshot', 'enrolled_quiescing'} else 1
     except (Unknown, artifacts.Unknown, paths.Unknown, inventory.Unknown,
-            artifacts.state.Unknown, artifacts.kernel.Unknown, OSError, ValueError,
+            artifacts.state.Unknown, artifacts.state.lock.Unknown, artifacts.kernel.Unknown, cgroups.Unknown, OSError, ValueError,
             TypeError, KeyError, UnicodeError):
         print('consumer preflight unknown; no stop/install/flip permission', file=sys.stderr)
         return 2

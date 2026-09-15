@@ -6,6 +6,7 @@ lock/phase. A missing or replaced group is unknown; parent exit is not emptiness
 No kill, freeze, stop, restart or filesystem mutation is performed here.
 """
 import os
+import errno
 from pathlib import Path
 import stat
 
@@ -85,3 +86,82 @@ def verify_quiescent(proof):
         return current
     except (TypeError, KeyError):
         raise Unknown('unverifiable_cgroup') from None
+
+
+class PinnedCgroup:
+    """A live kernel handle retained across a caller's actual stop operation.
+
+    NOT a serialized empty-group assertion or authorization. On cgroup2,
+    removal kills the kernfs node only after the group is unpopulated; a
+    previously opened cgroup.events then returns ENODEV. A missing pathname
+    alone, nlink, MainPID=0 or an unrecognized read error proves nothing.
+    """
+    def __init__(self, cgroup):
+        require(os.geteuid() == 0)
+        self.cgroup = cgroup
+        self.path, self.identity = _identity(cgroup)
+        self.fd = self.events = -1
+        try:
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            info = os.fstat(self.fd)
+            require([info.st_dev, info.st_ino] == self.identity[-1])
+            self.events = os.open('cgroup.events', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+            self.event_identity = (os.fstat(self.events).st_dev, os.fstat(self.events).st_ino)
+            self._read_events()  # Must be a LIVE readable cgroup at pin time.
+            require(_identity(cgroup)[1] == self.identity)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for key in ('events', 'fd'):
+            value = getattr(self, key, -1)
+            if value >= 0:
+                os.close(value)
+                setattr(self, key, -1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def _read_events(self):
+        require(self.fd >= 0 and self.events >= 0)
+        info = os.fstat(self.events)
+        require((info.st_dev, info.st_ino) == self.event_identity)
+        os.lseek(self.events, 0, os.SEEK_SET)
+        raw = os.read(self.events, 4097)
+        require(len(raw) <= 4096)
+        values = {}
+        for line in raw.decode('ascii').splitlines():
+            key, value = line.split()
+            require(key not in values)
+            values[key] = value
+        require(values.get('populated') in ('0', '1'))
+        return values['populated'] == '1'
+
+    def verify_stopped(self):
+        try:
+            info = os.fstat(self.fd)
+            require([info.st_dev, info.st_ino] == self.identity[-1] and _mount() == info.st_dev)
+            try:
+                populated = self._read_events()
+            except OSError as exc:
+                require(exc.errno == errno.ENODEV)
+                # Only the exact last node may have disappeared; replaced
+                # ancestors/pathnames cannot inherit this dead kernel handle.
+                parent = str(Path(self.cgroup).parent)
+                require(parent != '/' and _identity(parent)[1] == self.identity[:-1])
+                try:
+                    self.path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise Unknown('cgroup_path_reused_after_stop')
+                return {'cgroup': self.cgroup, 'identity': self.identity,
+                        'kind': 'removed_after_live_pin'}
+            require(not populated and _identity(self.cgroup)[1] == self.identity)
+            return {'cgroup': self.cgroup, 'identity': self.identity, 'kind': 'retained_empty'}
+        except (OSError, UnicodeError, ValueError, TypeError, IndexError):
+            raise Unknown('unverifiable_stopped_cgroup') from None

@@ -7,7 +7,7 @@ import subprocess
 
 
 def payload(root):
-    names = ['scripts/delegate-consumer-preflight.py', 'scripts/deploy-v5-selfhost.sh', 'scripts/lib/delegate-consumer-artifacts.py', 'scripts/lib/delegate-consumer-state.py',
+    names = ['scripts/delegate-consumer-preflight.py', 'scripts/deploy-v5-selfhost.sh', 'scripts/lib/delegate-consumer-cgroup.py', 'scripts/lib/delegate-consumer-artifacts.py', 'scripts/lib/delegate-consumer-state.py',
              'scripts/lib/delegate-consumer-lock-owner.py', 'scripts/lib/delegate-consumer-unit-paths.py',
              'scripts/lib/delegate-consumer-inventory.py',
              'scripts/lib/assert-flavor.sh', 'scripts/delegate-consumer-compat.py',

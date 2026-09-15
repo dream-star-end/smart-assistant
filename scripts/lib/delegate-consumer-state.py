@@ -9,6 +9,7 @@ open description. A fresh process may read an interrupted record without making
 it safe to resume. The caller must rebuild inventory/quiescence before recovery.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -24,7 +25,8 @@ spec.loader.exec_module(lock)
 
 MAX_BYTES = 32768
 BASE_KEYS = {'phase', 'executor_pid', 'backup_dir', 'armed_at'}
-KEYS = BASE_KEYS | {'consumer_version', 'consumer_epoch', 'consumer_phase', 'consumer_owner', 'consumer_revision'}
+V1_KEYS = BASE_KEYS | {'consumer_version', 'consumer_epoch', 'consumer_phase', 'consumer_owner', 'consumer_revision'}
+KEYS = V1_KEYS | {'consumer_intent'}
 
 
 class Unknown(Exception):
@@ -99,18 +101,25 @@ def _decode(raw, enrolled):
         key, sep, value = line.partition('=')
         require(sep and key not in values and key in (KEYS if enrolled else BASE_KEYS) and value and '\x00' not in value)
         values[key] = value
-    require(set(values) == (KEYS if enrolled else BASE_KEYS))
+    if enrolled:
+        version = values.get('consumer_version')
+        require(version in {'1', '2'})
+        require(set(values) == (V1_KEYS if version == '1' else KEYS))
+    else:
+        require(set(values) == BASE_KEYS)
     require(re.fullmatch(r'[a-z0-9-]{1,64}', values['phase']))
     require(re.fullmatch(r'[1-9][0-9]{0,12}', values['executor_pid']))
     require(Path(values['backup_dir']).is_absolute())
     if enrolled:
-        require(values['consumer_version'] == '1' and re.fullmatch(r'[0-9a-f]{32}', values['consumer_epoch']))
+        require(re.fullmatch(r'[0-9a-f]{32}', values['consumer_epoch']))
         # This layer cannot assert start-authorized/committed on the strength of
         # phase text. Those require the forthcoming actual caller proof.
         require(values['consumer_phase'] in {'quiescing', 'manual'})
         require(re.fullmatch(r'0|[1-9][0-9]{0,12}', values['consumer_revision']))
         owner = json.loads(values['consumer_owner'])
         require(isinstance(owner, dict) and owner.get('pid') == int(values['executor_pid']))
+        if values['consumer_version'] == '2':
+            _validate_intent(json.loads(values['consumer_intent']))
     return values
 
 
@@ -167,7 +176,22 @@ def read(path):
         os.close(fd)
 
 
-def begin(path, legacy, lock_path, pid):
+def _validate_intent(intent):
+    require(isinstance(intent, dict) and set(intent) == {'schema', 'sha256', 'descriptor'})
+    require(type(intent['schema']) is int and intent['schema'] == 1)
+    descriptor = intent['descriptor']
+    require(isinstance(descriptor, dict) and set(descriptor) == {'current', 'candidate', 'required'})
+    require(type(descriptor['required']) is int and descriptor['required'] in {1, 2})
+    for key in ('current', 'candidate'):
+        value = descriptor[key]
+        require(isinstance(value, dict) and set(value) == {'master', 'runtime', 'tuple', 'unit', 'database'})
+        require(all(isinstance(value[k], dict) for k in ('master', 'runtime', 'tuple', 'unit')))
+        require(isinstance(value['database'], str) and Path(value['database']).is_absolute())
+    raw = json.dumps(descriptor, sort_keys=True, separators=(',', ':')).encode()
+    require(len(raw) <= 16384 and hashlib.sha256(raw).hexdigest() == intent['sha256'])
+
+
+def begin(path, legacy, lock_path, pid, *, intent=None):
     """Enroll the original armed transition, denying starts until real proof.
 
     Existing durable records are never erased/re-enrolled by --arm. A future
@@ -186,6 +210,13 @@ def begin(path, legacy, lock_path, pid):
     values.update(consumer_version='1', consumer_epoch=uuid.uuid4().hex,
                   consumer_phase='quiescing', consumer_owner=json.dumps(proof, separators=(',', ':')),
                   consumer_revision='0')
+    if intent is not None:
+        # Intent binds the verified selected sources/tuple, NOT permission to
+        # stop/start/commit. Only the in-process trusted caller supplies this;
+        # the legacy CLI has no JSON/--verified bypass for it.
+        _validate_intent(intent)
+        values['consumer_version'] = '2'
+        values['consumer_intent'] = json.dumps(intent, sort_keys=True, separators=(',', ':'))
     fd, name = _parent(path)
     try:
         require(_read_at(fd, name, optional=True) is None)
@@ -210,6 +241,22 @@ def update_phase(path, phase):
         values['consumer_revision'] = str(int(values['consumer_revision']) + 1)
         _replace(path, fd, name, old, values, proof)
         return values
+    finally:
+        os.close(fd)
+
+
+def mark_manual(path):
+    """Persist uncertain stop progress; never convert it into a start permit."""
+    fd, name = _parent(path)
+    try:
+        old = _read_at(fd, name)
+        values = _decode(old, True)
+        proof = json.loads(values['consumer_owner'])
+        _owner(proof)
+        values['consumer_phase'] = 'manual'
+        values['phase'] = 'consumer-stop-failed'
+        values['consumer_revision'] = str(int(values['consumer_revision']) + 1)
+        _replace(path, fd, name, old, values, proof)
     finally:
         os.close(fd)
 
