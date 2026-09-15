@@ -4156,6 +4156,25 @@
           "assertion": "{ name: /主模型不变/ }"
         }
       ]
+    },
+    {
+      "id": "INC-20260915-ADVISOR-1M-DUP-PICKER",
+      "occurredAt": "2026-09-15",
+      "severity": "P1",
+      "symptom": "顾问型号下拉把 Codex 标准档与 1M 长窗双子画成同一展示名，GPT-6-Astra/Sol/Terra/Luna 各出现两次，用户无法区分点的是哪条 catalog id。",
+      "rootFixCommit": "a6584a43",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorMode.test.ts",
+          "assertion": "listProvenAdvisorModels hides Codex 1M twins and keeps the standard id"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorMode.test.ts",
+          "assertion": "assertAdvisorModelAllowed canonicalizes Codex 1M twins onto the standard id"
+        }
+      ]
     }
   ]
 }
