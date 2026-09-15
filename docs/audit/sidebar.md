@@ -1,8 +1,8 @@
 # 审计 · sidebar（侧栏 / 会话管理 / 项目 / 站内信 / GitHub 绑定）
 
-- 任务：t-36「A·sidebar 侧栏/会话/项目/站内信/GitHub 审计」（阶段 A，未改业务代码）
+- 任务：t-36「A·sidebar 侧栏/会话/项目/站内信/GitHub 审计」（阶段 A，未改业务代码）；t-37「B·sidebar 修复」（阶段 B，见 §6 / §7）
 - 分支：`feat/v5-selfhost-audit-sidebar`（基线 `210b9967`）
-- 审计人：fable-5-1-19 · 2026-09-15
+- 审计人：fable-5-1-19 · 2026-09-15；阶段 B 接手收尾：fable-5-1-25 · 2026-09-16
 - 口径：`TEAM_PLAYBOOK.md` §5 七项清单 + 严重度 P1/P2/P3
 
 ## 1. 范围与文件清单
@@ -227,3 +227,48 @@ node browser-tests\ui-preview\shoot.mjs
 | `useProjectScope` / `lib/projectScope.ts` | 纯逻辑，单测覆盖完整（`projectScope.test.ts`），走读未发现用户可感知问题。 |
 | 移动端抽屉本身（`App.tsx:3367-3427`） | `Sheet` 已带遮罩 / Escape / 焦点陷阱，宽度 268 / 82vw 合理；抽屉宿主属 shell 归属，本模块只改内联 Sidebar。 |
 | 需后端配合 | UCP-01 若要单请求批量排序需新增 `PATCH /api/chat-projects/reorder`；GH-03 scope 可读映射若要精确需后端返回结构化 scopes。均记为「需后端配合」，前端先做保守方案。 |
+
+## 6. 修复记录（阶段 B · t-37）
+
+- 分支 `feat/v5-selfhost-audit-sidebar`，基线 `210b9967`；阶段 B 共 5 个提交（前三个由 fable-5-1-19 完成，后两个由接手的 fable-5-1-25 完成；他中途掉线时留下的未提交改动已核对、补类型后原样提交为第 4 个）。
+- 提交 subject 一律 `feat(v5)`（决策 d-26），未触碰 changelog.json / apps/windows / 后端包。
+
+| 提交 | 内容 | 覆盖编号 |
+|---|---|---|
+| `17710a62` | 空项目提示不再叠 CTA、排序失败回滚、触控标题行、底栏紧凑、未知项目归未分类；同批：归档展开态晚到恢复、折叠钮 `collapseLabel`、搜索框 ×/Escape/aria-live、标题命中高亮、菜单键盘关闭焦点回归、菜单项统一图标、中文用时单位、运行数 pill、触屏「+」并入菜单、状态点 8px + 出错描环、批量条两行固定 + 删除 danger + 取消归档 | S-01 S-02 S-03 S-04 S-06 S-07 S-09 S-11 S-12① SR-01 SR-02 SR-03 PR-01 PR-02 BB-01 BB-02 BB-03 SD-01 |
+| `85588532` | 重命名 / 删除 / 加载更多失败不再静默（回滚 + toast + 可重试）；项目列表失败 toast + 可见时自动重试 + `reloadProjects` | S-08 USL-01 USL-02 S-12② |
+| `8035d26a` | 看板指令覆盖先问、剥 `<!-- ob:xxx -->`、选仓列表 `min-w-0` 不再裁切、草稿态提示；同批：色块触控 44px、「墨/灰/无颜色」跨主题稳定、字数计数并入标签行、「注入」→「项目知识」、下载中 Spinner、站内信 aria-busy/status + 未读数、scope 可读化 + 搜索框 aria-label + listbox/option 语义、横幅两行 + IconButton 关闭 + role=status + 失败不再双提示 | PS-01 PS-04 PS-05 PS-06 PA-01 PA-02 IB-01 IB-02 IB-03 GH-01 GH-02 GH-03 GH-04 GH-05 RB-01 RB-02 RB-03 |
+| `513c2f39` | 拖宽把手键盘可调（← → / Shift 大步 / Home End，aria-valuenow/min/max，title 说明双击复位）；消息搜索 `includeArchived` 跟随「已归档」展开；多选复选框放状态点左侧 + 项目内缩进 `pl-4`；看板指令 409 版本冲突单独文案；系统通知点开聚焦窗口 + `onNotificationOpen(sessionId)`，同会话通知按 tag 折叠 | S-05 S-10 SR-04 PS-07 UUS-01 |
+| `bc3cef1c` | 零会话零项目只渲染一块引导空态（说明 + 新建会话 + 新建项目，`data-testid=sidebar-empty-all`），不再摆「项目 +」「未分类 0」骨架；看板绑定改用 `ui/Select`；关闭前脏检查（Esc / 遮罩 / 取消 → 「放弃未保存的修改？」，程序回填看板指令不算改动）；项目排序只 PATCH 变了的项目、串行写、失败点停下只回滚已改成功项；多文件上传 `uploadProgress` → 「正在上传 N/M 个文件…」+ Spinner + role=status；空标题回退统一「新对话」；`browser-tests/run.mjs` T41 断言会话用时改为中文单位（SR-01 后的契约，仅此一行） | S-13 PS-02 PS-03 UCP-01 PA-03 ST-01 |
+
+### 6.1 与计划的偏离
+
+| 编号 | 偏离 | 理由 |
+|---|---|---|
+| S-13 | 引导空态保留了「已归档」开关（计划写「隐藏未分类 / 已归档 0」） | 归档列表按需拉取，零活动会话时计数 0 不代表真没有；「已归档」开关是归档会话唯一入口，藏掉会让把全部会话归档的用户无路可走。「项目 +」「未分类 0」两处骨架已按计划隐藏。 |
+| PS-03 | 用 `useConfirm` 二次确认而非直接阻止关闭 | 与仓内其它编辑器（SkillEditor 等）的「放弃修改」交互一致。 |
+| UCP-01 | 前端串行写 + 只写变更项，未新增批量接口 | 计划已注明需后端配合的路径先走保守方案；本轮不碰后端包。 |
+| ST-01 | 只改 `lib/sessionTitle.ts`（含导出 `EMPTY_SESSION_TITLE`） | `hooks/useChatSocket.ts:524` 属 messages 归属，见 §6.2。 |
+
+### 6.2 遗留与跨模块接线（集成时处理）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| S-14「多模型 · 计量计费」副标题 | **未改**（P3） | 需 product owner 拍板个人版 / 自托管是否展示计费文案；侧栏侧未动，`data-product-feature=billing` 能力开关照旧。 |
+| S-05 键盘调宽 | Sidebar / hook 已落，**App 未接** | `App.tsx` `sidebarProps` 需加一行 `onResizeKeyDown: sidebarWidth.onResizeKeyDown`（shell 归属）。接线前把手不进入 Tab 序列，功能对键盘用户仍不可用。 |
+| S-06 抽屉关闭按钮读屏名 | Sidebar 已落 `collapseLabel` prop，**App 未接** | 移动端 `Sheet` 内联侧栏需传 `collapseLabel="关闭导航"`（shell 归属）。 |
+| UUS-01 通知落点 | hook 已落，**App 未接** | `useUnreadSessions({ …, onNotificationOpen: selectSession })`（shell 归属）。未接线时点通知只聚焦窗口。 |
+| ST-01 | `useChatSocket.ts:524` `title \|\| "新会话"` 待改「新对话」 | messages 归属，可在 messages-B 或集成时一行同步。 |
+| `browser-tests/run.mjs` | 只改了 T41 一处断言 | 共享文件，合入 integration 时若与其它分支冲突，以「会话用时 `8分`」为准。 |
+
+## 7. 验证（阶段 B 交付前 · 2026-09-16）
+
+| 门 | 结果 |
+|---|---|
+| `npm run typecheck --workspace packages/web-react` | 绿（`tsc -b` 退出 0） |
+| 模块 vitest（§4.3 清单 + `SessionStatusDot` / `useSidebarWidth` / `useUnreadSessions` / `useRepoBinding` / `useProjectAssets` / `sessionTitle` / `lib/github`，`--maxWorkers=1`） | **17 个文件 252 条全绿**；本轮每个逻辑改动都有对应用例（S-13 ×7、PS-02 ×1、PS-03 ×3、UCP-01 ×2、PA-03 ×2、ST-01 ×1；接手提交 S-05 ×3、S-10 ×2、SR-04 ×1、PS-07 ×1、UUS-01 ×1） |
+| `npx biome lint`（本轮 14 个改动文件） | 无新增诊断；既有 6 条（`role="radio"` 色块、`noLabelWithoutControl`、`noDelete`、`useExhaustiveDependencies`）在改动前的 HEAD 上同样存在，未动。根 `biome.json` 的格式规则（单引号 / 无分号）与 web-react 既有风格不符，包内文件本来就不通过 `biome format`，不作为门。 |
+| `npm run test:browser` · `run.mjs` | **67/67 ok**（第 2 次全量运行）。首次运行 T41 因 SR-01 把用时改成中文单位而失败，已把断言 `8m` → `8分`；T43「移动端首次上滑解除贴底」首次 not ok、重跑 ok，属消息区触控滚动用例、与侧栏无关。 |
+| `npm run test:browser` · `node --test` 阶段 | 73 条：70 pass / 3 fail，**3 条在基线 `210b9967`（wt/media）上同样失败**，与本分支无关：① `cc-switch-ascii-name`（2 子测试：等待超时 + 期望 `gemini-3.8-flash` 实得 `sonnet-5`，settings 归属）；② `ocv5-185-qa`：Windows 下 `symlink packages/protocol → node_modules/@openclaude/protocol` EPERM（未开发者模式），环境限制。日志：`.audit-tmp\sidebar\after\test-browser.log`、`test-browser-2.log`。 |
+| after 截图 | `D:\code\test_project\test123\.audit-tmp\sidebar\after\`：同一组 12 场景 × 2 主题 = 34 张 + `manifest.json` + `shoot-after.log`，`failures=[] unmockedApi=[]`。逐张对照要点：`sidebar-empty`（S-13 引导块替代三处 0 计数骨架）、`sidebar-project-settings` 明暗两版（PS-02 下拉与输入框同构、PS-04/05/06）、`sidebar-multiselect`（SR-04 复选框在状态点左侧、BB-01 两行批量条、BB-02 删除红色）、`sidebar-overview`（SR-04 缩进、PR-01 运行 pill、S-09 底栏 `余额 123.4万`）、`sidebar-narrow-min`（220px 批量条不再折 3 行）、`sidebar-mobile-drawer`（S-04「+」不再溢出）、`sidebar-inbox`（IB-01 无 `<!-- ob:` 残留、IB-03 未读数）、`sidebar-github-linked--desktop`（GH-01 超长仓库名省略号、分支 ✓ 可见）、`sidebar-repo-banner--mobile`（RB-01 两行）。 |
+| 未跑 | 拖拽（会话拖入项目 / 项目排序）与键盘调宽仍未做真浏览器交互验证（NOT RUN）：ui-preview 只出静态截图，`run.mjs` 无对应用例；两者由 vitest 用例覆盖（S-03 回滚、UCP-01 串行、S-05 键盘）。 |
