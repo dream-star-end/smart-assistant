@@ -2244,6 +2244,58 @@ describe('stderr PATH_NOT_ALLOWED line buffer', () => {
     assert.equal(aborted, false)
     await runner.shutdown()
   })
+
+  it('webchat aborts on chatgpt.com Responses websocket direct connect', async () => {
+    const runner = new CodexAppServerRunner({
+      sessionKey: 'agent:main:webchat:dm:abc',
+      agentId: 'main',
+      cwd: await mkdtemp(join(tmpdir(), 'codex-aps-ws-')),
+    })
+    const t0 = runner.lastActivityAt
+    await new Promise((r) => setTimeout(r, 5))
+    let abortedName = ''
+    ;(runner as any).currentTurnCompleter = {
+      resolve: () => {},
+      reject: (err: Error) => {
+        abortedName = err.name
+      },
+    }
+    const origShutdown = runner.shutdown.bind(runner)
+    ;(runner as any).shutdown = async () => {}
+    runner.feedStderrForTests(
+      'failed to connect to websocket: IO error: Network unreachable (os error 101), url: wss://chatgpt.com/backend-api/codex/responses\n',
+    )
+    assert.equal(abortedName, 'CodexChatgptWebsocketDirectError')
+    assert.equal(runner.lastActivityAt, t0)
+    await origShutdown()
+  })
+})
+
+describe('interrupt fence', () => {
+  it('marks proc stale and recycleProcKeepQueue shuts it down without dropping queued turns', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    ;(h.runner as any).threadId = 'thr-int'
+    ;(h.runner as any).activeTurnId = 't-int'
+    ;(h.runner as any).initialized = true
+    assert.equal(h.runner.interrupt(), true)
+    assert.equal((h.runner as any).staleProcGeneration, true)
+    let queuedResolved = false
+    ;(h.runner as any).queue.push({
+      prompt: 'keep-me',
+      resolve: () => {
+        queuedResolved = true
+      },
+      reject: () => {
+        throw new Error('queued turn must not reject on recycle')
+      },
+    })
+    await (h.runner as any).recycleProcKeepQueue('test')
+    assert.equal((h.runner as any).proc, null)
+    assert.equal((h.runner as any).staleProcGeneration, false)
+    assert.equal((h.runner as any).queue.length, 1)
+    assert.equal(queuedResolved, false)
+    await h.cleanup()
+  })
 })
 
 describe('SubprocessRunner interface parity', () => {

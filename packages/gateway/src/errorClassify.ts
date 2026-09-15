@@ -159,7 +159,7 @@ const PATTERNS: Array<{
   //     402/429 分别归 credits/rate_limited(均排在本档之前),不会被本正则劫走。
   //   - ECONNREFUSED / EAI_AGAIN 补齐连接被拒与 DNS 瞬时失败两类网络错误。
   {
-    re: /(?:\b5\d{2}\b|upstream|ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ACCOUNT_POOL_(?:BUSY|UNAVAILABLE)|UPSTREAM_FAILED)/i,
+    re: /(?:\b5\d{2}\b|upstream|ECONNRESET|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|Network unreachable|failed to connect to websocket|CODEX_CHATGPT_WS_DIRECT|ECONNREFUSED|EAI_AGAIN|ACCOUNT_POOL_(?:BUSY|UNAVAILABLE)|UPSTREAM_FAILED)/i,
     code: 'upstream_failed',
     // 文案刻意不绑定具体厂商:同一分类被 CCB/Codex/多提供商路径共用。
     message: '模型服务上游暂时异常，请稍后重试',
