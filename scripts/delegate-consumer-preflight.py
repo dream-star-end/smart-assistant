@@ -7,6 +7,7 @@ and the full original inventory/B0 oracle. The snapshot must be taken AGAIN
 under the real writer barrier by the later authorization stage.
 """
 import argparse
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import importlib.util
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import select
 import stat
 import sys
 import time
@@ -499,6 +501,148 @@ def quiesce_master(snapshot, state_path, owner, deadline):
         return proof
 
 
+def _stopped_master(snapshot, owner, deadline):
+    artifacts.state._owner(owner)
+    current = snapshot['current']
+    loaded = current['unit']
+    require(paths._capture_effective_unit(loaded['unit'], deadline) == loaded)
+    now = runtime_snapshot(loaded['unit'], loaded['projection'], current['code']['master']['root'], deadline)
+    require(now['process'] is None)
+
+
+def _stopped_writer(container, original):
+    frozen = {**original, 'pid': 0, 'state': 'exited'}
+    _writer_matches(container, frozen)
+    state = container['State']
+    require(all(state.get(k) is False for k in ('Running', 'Paused', 'Restarting', 'Dead')))
+    require(container['HostConfig'].get('AutoRemove') is False)
+    return frozen
+
+
+class PinnedWriter:
+    """Bind an actual running local Docker init and its entire kernel subtree.
+
+    This selfhost adapter supports the observed systemd cgroup-v2 driver only.
+    Already exited/created containers without a live retained kernel handle are
+    unknown here, not empty. Recovery must establish separate lifecycle proof;
+    a stopped PID, missing scope, or Docker wait alone is not that proof.
+    """
+    def __init__(self, writer, deadline):
+        self.writer = writer
+        self.proc = self.pidfd = -1
+        self.group = None
+        try:
+            container = _inspect('container', writer['id'], deadline)
+            _writer_matches(container, writer)
+            require(writer['state'] == 'running' and writer['pid'] > 0)
+            require(container['State'].get('Running') is True)
+            require(all(container['State'].get(k) is False for k in ('Paused', 'Restarting', 'Dead')))
+            require(container['HostConfig'].get('AutoRemove') is False)
+            self.proc = os.open('/proc/' + str(writer['pid']), os.O_RDONLY | os.O_DIRECTORY |
+                                os.O_NOFOLLOW | os.O_CLOEXEC)
+            self.pidfd = os.pidfd_open(writer['pid'])
+            self.identity = self._process()
+            group = self.identity[1]
+            require(Path(group).name == 'docker-' + writer['id'] + '.scope')
+            self.group = cgroups.PinnedCgroup(group)
+            require(self._process() == self.identity and not self._dead())
+            _writer_matches(_inspect('container', writer['id'], deadline), writer)
+        except BaseException:
+            self.close()
+            raise
+
+    def _process(self):
+        def read(name):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.proc)
+            try:
+                raw = os.read(fd, 65537); require(len(raw) <= 65536)
+                return raw.decode()
+            finally:
+                os.close(fd)
+        raw = read('stat')
+        fields = raw[raw.rfind(')') + 2:].split()
+        require(len(fields) >= 20 and fields[0] not in {'Z', 'X'})
+        groups = read('cgroup').splitlines()
+        require(len(groups) == 1 and groups[0].startswith('0::'))
+        return fields[19], str(paths.path(groups[0][3:]))
+
+    def _dead(self):
+        poll = select.poll(); poll.register(self.pidfd, select.POLLIN)
+        return bool(poll.poll(0))
+
+    def verify_stopped(self, deadline):
+        frozen = _stopped_writer(_inspect('container', self.writer['id'], deadline), self.writer)
+        require(self._dead())
+        proof = self.group.verify_stopped()
+        return frozen, proof
+
+    def close(self):
+        if self.group is not None:
+            self.group.close(); self.group = None
+        for key in ('proc', 'pidfd'):
+            fd = getattr(self, key, -1)
+            if fd >= 0:
+                os.close(fd); setattr(self, key, -1)
+
+    def __enter__(self): return self
+    def __exit__(self, *args): self.close()
+
+
+def _same_inventory_roots(before, after):
+    require(before['roots'] == after['roots'])
+    def parents(inv):
+        # A real writer may have created its DB just before stop. Preserve the
+        # exact parent identity, then let B0 read the newly created DB's floor.
+        return {p['path']: p['chain'] if p['absent'] else p['chain'][:-1] for p in inv['databases']}
+    require(parents(before) == parents(after))
+
+
+def quiesce_all_writers(snapshot, state_path, owner, deadline):
+    """Original holder stops every pinned writer, retakes inventory and B0.
+
+    No old container is started/unpaused/deleted and no volume is removed.
+    Success remains quiescing, NOT a start allowance. The eventual target
+    authorization must retain this stopped topology until its guarded commit.
+    """
+    _stopped_master(snapshot, owner, deadline)
+    record = artifacts.state.read(state_path)
+    require(record['consumer_phase'] == 'quiescing' and record['phase'] == 'consumer-master-stopped')
+    old = snapshot['inventory']
+    with ExitStack() as stack:
+        # Pin ALL known init processes/subtrees before the first container stop.
+        pinned = [stack.enter_context(PinnedWriter(w, deadline)) for w in old['writers']]
+        stopped, deaths = [], []
+        for writer in pinned:
+            _stopped_master(snapshot, owner, deadline)
+            remaining = deadline - time.monotonic()
+            require(remaining > 2)
+            grace = min(10, int(remaining - 1))
+            artifacts._run(['/usr/bin/docker', '--host=unix:///var/run/docker.sock',
+                            'container', 'stop', '--time', str(grace), writer.writer['id']], deadline)
+            artifacts.state._owner(owner)
+            frozen, proof = writer.verify_stopped(deadline)
+            stopped.append(frozen); deaths.append(proof)
+        _stopped_master(snapshot, owner, deadline)
+        current, candidate = snapshot['current'], snapshot['candidate']
+        fresh = inventory.capture_local([current['unit']['projection']['database'],
+                                          candidate['unit']['projection']['database']], deadline)
+        _same_inventory_roots(old, fresh)
+        require(fresh['writers'] == stopped)
+        contexts = [{**context, 'writer': frozen} for context, frozen in zip(snapshot['writers'], stopped)]
+        require(len(contexts) == len(stopped))
+        revalidate_writer_contexts(contexts, deadline)
+        decision = artifacts.classify_transition(current['code'], candidate['code'], current['code'],
+            fresh, deadline, writers=[w['code'] for w in contexts])
+        require(decision['status'] == 'compatible_snapshot')
+        revalidate_context(current, deadline); revalidate_context(candidate, deadline)
+        require(link_snapshot(snapshot['selector']['path']) == snapshot['selector'])
+        for writer in pinned:
+            writer.verify_stopped(deadline)
+        _stopped_master(snapshot, owner, deadline)
+        artifacts.state.update_phase(state_path, 'consumer-writers-stopped')
+        return {'inventory': fresh, 'deaths': deaths, 'decision': decision}
+
+
 def enroll(args, state_path, legacy, lock_path, pid, *, quiesce=False, **private):
     """Original FD8 holder enrolls selected immutable intent before mutation.
 
@@ -524,6 +668,7 @@ def enroll(args, state_path, legacy, lock_path, pid, *, quiesce=False, **private
     if quiesce:
         try:
             quiesce_master(snapshot, state_path, owner, time.monotonic() + 20)
+            quiesce_all_writers(snapshot, state_path, owner, time.monotonic() + 30)
         except (Unknown, artifacts.Unknown, artifacts.state.Unknown, artifacts.state.lock.Unknown,
                 cgroups.Unknown, OSError, ValueError, TypeError, KeyError):
             # The service may have stopped even if systemctl timed out. Keep

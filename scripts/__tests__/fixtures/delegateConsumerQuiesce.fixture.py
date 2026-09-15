@@ -144,7 +144,7 @@ sys.argv=sys.argv[1:];raise SystemExit(pf.main())
             assert statefile.exists(), 'original caller skipped durable enrollment'
             record = pf.artifacts.state.read(str(statefile))
             assert record['consumer_version'] == '2' and record['consumer_phase'] == 'quiescing'
-            assert record['phase'] == 'consumer-master-stopped'
+            assert record['phase'] == 'consumer-writers-stopped'
             intent = json.loads(record['consumer_intent'])
             assert intent['descriptor']['candidate']['master']['root'] == str(cm)
             assert intent['descriptor']['current']['master']['root'] == str(lm)
