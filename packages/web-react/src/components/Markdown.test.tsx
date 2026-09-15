@@ -44,4 +44,17 @@ describe("Markdown fallback", () => {
     expect(container.querySelector("iframe")).toBeNull();
     expect(container.textContent).toContain("tracker.test");
   });
+
+  // M-14:兜底头部此前用 bg-background / bg-muted/40 / text-muted-foreground,三者都不在 styles.css
+  // 的 @theme 里 → chunk 未到达时无底色、文字色继承。
+  test("HTML 预览兜底只用本仓存在的 token", () => {
+    const text = "```htmlpreview\n<div>hi</div>\n```";
+    const { container } = render(<Markdown>{text}</Markdown>);
+    const header = container.querySelector(".not-prose > div");
+    expect(header).toHaveClass("bg-hover", "text-muted");
+    expect(header?.parentElement).toHaveClass("bg-surface");
+    for (const legacy of ["bg-background", "bg-muted/40", "text-muted-foreground"]) {
+      expect(container.querySelector(`.${legacy.replace("/", "\\/")}`)).toBeNull();
+    }
+  });
 });
