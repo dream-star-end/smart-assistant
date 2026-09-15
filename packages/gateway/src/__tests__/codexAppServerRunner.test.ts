@@ -2279,21 +2279,39 @@ describe('interrupt fence', () => {
     ;(h.runner as any).initialized = true
     assert.equal(h.runner.interrupt(), true)
     assert.equal((h.runner as any).staleProcGeneration, true)
-    let queuedResolved = false
+    let shutdownRejected = false
+    ;(h.runner as any).drain = async () => {}
+    const rec = (h.runner as any).recycleProcKeepQueue('test')
     ;(h.runner as any).queue.push({
       prompt: 'keep-me',
-      resolve: () => {
-        queuedResolved = true
-      },
-      reject: () => {
-        throw new Error('queued turn must not reject on recycle')
+      resolve: () => {},
+      reject: (err: Error) => {
+        shutdownRejected = /shutdown/i.test(err.message)
       },
     })
-    await (h.runner as any).recycleProcKeepQueue('test')
+    await rec
     assert.equal((h.runner as any).proc, null)
     assert.equal((h.runner as any).staleProcGeneration, false)
+    assert.equal(shutdownRejected, false)
     assert.equal((h.runner as any).queue.length, 1)
-    assert.equal(queuedResolved, false)
+    await h.cleanup()
+  })
+
+  it('two chatgpt.com WS stderr lines recycle the proc only once', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    let shutdownCalls = 0
+    const orig = h.runner.shutdown.bind(h.runner)
+    ;(h.runner as any).shutdown = async (opts?: { keepQueuedTurns?: boolean }) => {
+      shutdownCalls += 1
+      return orig(opts)
+    }
+    const ws =
+      'failed to connect to websocket: IO error: Network unreachable (os error 101), url: wss://chatgpt.com/backend-api/codex/responses\n'
+    h.runner.feedStderrForTests(ws)
+    h.runner.feedStderrForTests(ws)
+    await waitFor(() => shutdownCalls >= 1)
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(shutdownCalls, 1)
     await h.cleanup()
   })
 })

@@ -1884,7 +1884,7 @@ export class CodexAppServerRunner extends EventEmitter {
     })
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(opts?: { keepQueuedTurns?: boolean }): Promise<void> {
     // Same transient-shutdown semantics as CodexRunner: kill the current
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
@@ -1904,9 +1904,11 @@ export class CodexAppServerRunner extends EventEmitter {
       this.pendingRetryAbort.abort()
       this.pendingRetryAbort = null
     }
-    const pendingQueue = this.queue
-    this.queue = []
-    for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
+    if (!opts?.keepQueuedTurns) {
+      const pendingQueue = this.queue
+      this.queue = []
+      for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
+    }
     if (this.pendingNativeCompaction) {
       const pending = this.pendingNativeCompaction
       this.pendingNativeCompaction = null
@@ -2048,27 +2050,36 @@ export class CodexAppServerRunner extends EventEmitter {
    * while initialize is pending returned early and could proceed before the
    * app-server finished the handshake (preheat + submit race). */
   private _spawnPromise: Promise<void> | null = null
+  private recycleInflight: Promise<void> | null = null
 
   /**
    * Kill the current app-server without rejecting already-queued turns.
    * Used after interrupt (stale hung PID) and after a cooperative USER_CANCELLED
    * so the next submit cannot reuse a websocket-dead process.
+   * One-shot: overlapping WS stderr / interrupt-fence join the same inflight.
    */
   private async recycleProcKeepQueue(reason: string): Promise<void> {
-    const queuedTurns = this.queue
-    this.queue = []
+    if (this.recycleInflight) return this.recycleInflight
+    const run = this.recycleProcKeepQueueOnce(reason)
+    this.recycleInflight = run
     try {
-      log.info('codex app-server recycle proc', {
-        sessionKey: this.opts.sessionKey,
-        reason,
-        pid: this.proc?.pid ?? null,
-      })
-      await this.shutdown()
+      await run
     } finally {
-      if (queuedTurns.length > 0) {
-        this.queue = queuedTurns.concat(this.queue)
-      }
+      if (this.recycleInflight === run) this.recycleInflight = null
+    }
+  }
+
+  private async recycleProcKeepQueueOnce(reason: string): Promise<void> {
+    log.info('codex app-server recycle proc', {
+      sessionKey: this.opts.sessionKey,
+      reason,
+      pid: this.proc?.pid ?? null,
+    })
+    try {
+      await this.shutdown({ keepQueuedTurns: true })
+    } finally {
       this.staleProcGeneration = false
+      void this.drain()
     }
   }
 
@@ -3882,13 +3893,19 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private abortTurnForChatgptWebsocketDirect(): void {
+    if (this.recycleInflight) return
     const err = new Error(
       'CODEX_CHATGPT_WS_DIRECT: Codex Responses websocket bypassed loopback relay (wss://chatgpt.com); aborting turn',
     )
     err.name = 'CodexChatgptWebsocketDirectError'
     if (this.currentTurnCompleter) {
-      this.currentTurnCompleter.reject(err)
+      const completer = this.currentTurnCompleter
       this.currentTurnCompleter = null
+      try {
+        completer.reject(err)
+      } catch {
+        /* already settled */
+      }
     }
     this.staleProcGeneration = true
     void this.recycleProcKeepQueue('chatgpt-ws-direct')
@@ -4353,7 +4370,9 @@ export class CodexAppServerRunner extends EventEmitter {
           })
           // Cooperative turn/interrupt does not kill app-server. Reap now so
           // the next submit cannot reuse a hung ChatGPT-WS process (OCV5-224).
-          void this.recycleProcKeepQueue('user-cancelled')
+          // Await so session.lock stays held until proc is dead and queued
+          // submits are drained, not rejected as "runner shutdown".
+          await this.recycleProcKeepQueue('user-cancelled')
         } else {
           this.emitResult({
             durationMs,
@@ -4368,6 +4387,7 @@ export class CodexAppServerRunner extends EventEmitter {
         return
       }
     } catch (err) {
+      if (this.recycleInflight) await this.recycleInflight
       // Best-effort drain on the error path too. If turn/start failed
       // before any item/completed arrived this is a no-op; if codex
       // crashed mid-turn after firing item/completed, draining keeps
