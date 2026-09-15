@@ -1974,6 +1974,74 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   }
 });
 
+// ── T68 触屏动作行折叠(messages 审计 M-03)──────────────────────────────────────
+// 触屏没有 hover:此前每条消息下方常显整排 44px 动作图标(助手 5 个、用户 3 个)+ 状态标签,
+// 长会话里 1 行正文配 3 行 chrome。现在触屏默认只露一个「更多操作」开关,点开才展开整排。
+// jsdom 无 CSS 量不出"看得见/看不见",这里在 (hover:none) 真生效的 390×844 上下文里量。
+await check("T68 390px 触屏:动作行默认只露 44px「更多操作」,点开才展开整排,末条助手默认展开", async () => {
+  screenshotPage = mobilePage;
+  const hoverNone = await mobilePage.evaluate(() => matchMedia("(hover: none)").matches);
+  if (!hoverNone) throw new Error("移动上下文未仿真 (hover: none),本用例前提不成立(hasTouch 丢了?)");
+
+  // ① 历史用户行:默认折叠 —— 开关可见且 ≥44px,整排动作(复制)不可见(display:none,不只是透明)。
+  const userRow = mobilePage.getByTestId("user-row").first();
+  const userToggle = userRow.getByRole("button", { name: "更多操作" });
+  await userToggle.waitFor({ state: "visible", timeout: 5000 });
+  const toggleBox = await userToggle.boundingBox();
+  if (!toggleBox || toggleBox.height < TOUCH_MIN || toggleBox.width < TOUCH_MIN) {
+    throw new Error(`「更多操作」开关触控靶不足 44px: ${JSON.stringify(toggleBox)}`);
+  }
+  if ((await userToggle.getAttribute("aria-expanded")) !== "false") {
+    throw new Error("历史用户行的动作行默认应折叠(aria-expanded=false)");
+  }
+  const userCopy = userRow.getByRole("button", { name: "复制", exact: true });
+  if (await userCopy.isVisible()) {
+    throw new Error("触屏下用户行的整排动作在未点开时就常显(M-03 回归)");
+  }
+  const rowActions = await userRow.evaluate((node) => {
+    // 折叠态下整条动作区只该有开关这一排:量开关所在容器的高度。
+    const toggle = node.querySelector('button[aria-label="更多操作"]');
+    const container = toggle?.parentElement;
+    return container ? container.getBoundingClientRect().height : -1;
+  });
+  if (rowActions < 0 || rowActions > 48) {
+    throw new Error(`折叠态动作区应只有一排 44px 开关,实测高度 ${rowActions}px`);
+  }
+
+  // ② 受信点击开关 → 整排展开,每个动作 ≥44px;再点「收起操作」恢复折叠。
+  await userToggle.click();
+  await userCopy.waitFor({ state: "visible", timeout: 3000 });
+  const copyBox = await userCopy.boundingBox();
+  if (!copyBox || copyBox.height < TOUCH_MIN || copyBox.width < TOUCH_MIN) {
+    throw new Error(`展开后动作按钮触控靶不足 44px: ${JSON.stringify(copyBox)}`);
+  }
+  const collapse = userRow.getByRole("button", { name: "收起操作" });
+  if ((await collapse.getAttribute("aria-expanded")) !== "true") {
+    throw new Error("点开后开关应报告 aria-expanded=true");
+  }
+  await collapse.click();
+  await userCopy.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await userRow.getByRole("button", { name: "更多操作" }).getAttribute("aria-expanded")) !== "false") {
+    throw new Error("收起后开关应回到 aria-expanded=false");
+  }
+
+  // ③ 末轮末条助手回复(最常要复制/重新生成的那条)默认展开:「复制纯文本」直接可见且 ≥44px。
+  //    (用「复制纯文本」而非「复制」定位:助手正文里的代码块自带一个「复制」按钮。)
+  const assistantRow = mobilePage
+    .getByTestId("assistant-row")
+    .filter({ hasText: "MOBILE_ASSISTANT_TAIL_MARKER" });
+  const plainCopy = assistantRow.getByRole("button", { name: "复制纯文本" });
+  await plainCopy.waitFor({ state: "visible", timeout: 5000 });
+  const plainBox = await plainCopy.boundingBox();
+  if (!plainBox || plainBox.height < TOUCH_MIN) {
+    throw new Error(`末条助手动作按钮触控靶不足 44px: ${JSON.stringify(plainBox)}`);
+  }
+  const assistantCollapse = assistantRow.getByRole("button", { name: "收起操作" });
+  if ((await assistantCollapse.getAttribute("aria-expanded")) !== "true") {
+    throw new Error("末轮末条助手回复的动作行应默认展开");
+  }
+});
+
 await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹", async () => {
   screenshotPage = mobilePage;
   const scroll = mobilePage.getByTestId("mobile-chat-scroll");

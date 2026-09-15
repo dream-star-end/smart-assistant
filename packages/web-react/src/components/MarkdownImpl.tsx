@@ -12,9 +12,18 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
-import { Children, isValidElement, useState, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import {
+  Children,
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
+import { cn } from "../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
@@ -155,28 +164,127 @@ function rehypeEmbedMedia() {
   }
 }
 
-function MarkdownTable({ children, ...props }: ComponentPropsWithoutRef<"table">) {
-  const [showHint, setShowHint] = useState(true);
-  const dismissHint = () => setShowHint(false);
+/** 单元格不拆词:`.prose{word-break:break-word}` 会把 `MessageRenderer.tsx` / 「风险」这类标识符在任意
+ *  位置拆行,把宽表硬压进 390px 容器,横滑区形同虚设。keep-all 让 CJK 只在标点/空格处换行、拉丁词
+ *  整词换行;表头一律不折行 —— 放不下的宽表按 min-content 撑出容器,落进 .markdown-table-region 横滑。 */
+const TABLE_CELL_CLASS =
+  "[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap";
+
+function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutRef<"table">) {
+  const regionRef = useRef<HTMLElement>(null);
+  // 提示只在表格**真的溢出**(scrollWidth > clientWidth)时出现;此前不溢出也常显,文案与实际不符。
+  const [overflowing, setOverflowing] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const dismissHint = () => setDismissed(true);
+  useEffect(() => {
+    const region = regionRef.current;
+    if (!region) return;
+    const measure = () => setOverflowing(region.scrollWidth > region.clientWidth + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(region);
+    return () => observer.disconnect();
+  }, []);
+  const showHint = overflowing && !dismissed;
 
   return (
     <div className="markdown-table-wrap">
       {showHint && <p className="markdown-table-hint sm:hidden">表格可左右滑动查看更多</p>}
       <section
+        ref={regionRef}
         aria-label="Markdown 表格，可横向滚动"
         // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
         tabIndex={0}
         className="markdown-table-region"
+        data-overflowing={overflowing ? "true" : "false"}
         onPointerDown={dismissHint}
         onScroll={dismissHint}
         onKeyDown={(event) => {
           if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) dismissHint();
         }}
       >
-        <table {...props}>{children}</table>
+        <table {...props} className={cn(TABLE_CELL_CLASS, className)}>
+          {children}
+        </table>
       </section>
     </div>
   );
+}
+
+// ── 流式光标(caret)────────────────────────────────────────────────────────────
+// 光标作为 Markdown 块级容器之后的兄弟节点时,永远落在正文最后一行**下方**单独一行,「正在输入」
+// 的视觉落点与文字脱节。这里用 rehype 把光标 span 注入到最后一个文本块(p / 标题 / 引用 / 列表末项
+// / 表格末格)的末尾,与文字同一行;最后一块是代码块 / 图片等非文本块时,回退到块后单独一行。
+const CARET_CLASS = [
+  "caret-blink",
+  "ml-0.5",
+  "inline-block",
+  "h-[1.1em]",
+  "w-[2px]",
+  "translate-y-[3px]",
+  "bg-current",
+  "align-baseline",
+];
+const CARET_INLINE_HOSTS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th"]);
+const CARET_DESCEND_HOSTS = new Set(["blockquote", "ul", "ol", "table", "tbody", "thead", "tr"]);
+
+function lastElementChild(node: HastNode): HastNode | null {
+  const kids = node.children ?? [];
+  for (let i = kids.length - 1; i >= 0; i--) {
+    const kid = kids[i];
+    if (kid.type === "element") return kid;
+    // 非空白文本收尾(如 root 下直接的文本)→ 没有可下钻的元素
+    if (kid.type === "text" && (kid.value ?? "").trim()) return null;
+  }
+  return null;
+}
+
+/** 找光标应内联进的宿主元素;找不到(末块是 pre / img / 富块等)返回 null。 */
+export function findCaretHost(root: HastNode): HastNode | null {
+  let node = lastElementChild(root);
+  for (let depth = 0; node && depth < 8; depth++) {
+    const tag = node.tagName ?? "";
+    if (CARET_INLINE_HOSTS.has(tag)) {
+      // li / td 里若还有块级子元素(松散列表的 <p> / 嵌套列表),继续下钻到最后一个文本块。
+      const inner = lastElementChild(node);
+      if (inner && (CARET_INLINE_HOSTS.has(inner.tagName ?? "") || CARET_DESCEND_HOSTS.has(inner.tagName ?? ""))) {
+        node = inner;
+        continue;
+      }
+      return node;
+    }
+    if (CARET_DESCEND_HOSTS.has(tag)) {
+      node = lastElementChild(node);
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+function caretElement(): HastNode {
+  return {
+    type: "element",
+    tagName: "span",
+    properties: { className: [...CARET_CLASS], ariaHidden: "true", dataLiveCaret: "true" },
+    children: [],
+  };
+}
+
+function rehypeLiveCaret() {
+  return (tree: HastNode) => {
+    const host = findCaretHost(tree);
+    if (host) {
+      host.children = [...(host.children ?? []), caretElement()];
+      return;
+    }
+    // 回退:块后单独一行(.prose > :last-child 无下边距,不会撑出多余空白)。
+    tree.children = [
+      ...(tree.children ?? []),
+      { type: "element", tagName: "p", properties: { dataLiveCaretFallback: "true" }, children: [caretElement()] },
+    ];
+  };
 }
 
 function hasMarkdownImage(children: ReactNode): boolean {
@@ -190,6 +298,7 @@ export default function MarkdownImpl({
   children,
   signMedia,
   live,
+  caret,
   readOnly,
   blockImages,
 }: MarkdownProps) {
@@ -203,6 +312,8 @@ export default function MarkdownImpl({
           [rehypeKatex, { strict: false, throwOnError: false }],
           // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
           ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
+          // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
+          ...(caret ? [rehypeLiveCaret] : []),
         ]}
         components={{
           pre: ({ children }) => <>{children}</>,

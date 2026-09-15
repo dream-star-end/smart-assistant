@@ -184,6 +184,8 @@ export function TokenUsageBadge({
     : exact.estimated
       ? `${label}估算约 ${full} token`
       : `${label} ${full} token`;
+  // 数字与单位分两个 span:可见文案带单位(「5.98k token」,不再是一个无单位的裸数字),
+  // 数字节点自身文本仍是纯数字,既有按数字取元素的断言/用例不受影响。
   return (
     <span
       key={exact.totalTokens}
@@ -191,7 +193,8 @@ export function TokenUsageBadge({
       title={title}
       aria-label={title}
     >
-      {prefix}{compact}
+      <span>{prefix}{compact}</span>
+      <span className="font-normal"> token</span>
     </span>
   );
 }

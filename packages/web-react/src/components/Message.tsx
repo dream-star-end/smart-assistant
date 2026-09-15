@@ -3,22 +3,29 @@ import { useState } from "react";
 import type { Message as MessageT, ToolCard as ToolCardT } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "./optionsGroup";
-import { Avatar, IconButton } from "./ui";
+import { Avatar, IconButton, useToast } from "./ui";
+
+// demo 通道动作条:桌面 hover 露出;触屏没有 hover,常显并给 44px 触控靶(与 chat/cards 的口径一致)。
+const DEMO_ACTIONS_CLASS =
+  "mt-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100";
 
 function CopyBtn({ text }: { text: string }) {
   const [done, setDone] = useState(false);
+  const toast = useToast();
   return (
     <IconButton
       aria-label="复制"
+      title="复制"
       size="sm"
       shape="square"
+      className="[@media(hover:none)]:size-11"
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(text);
           setDone(true);
           setTimeout(() => setDone(false), 1500);
         } catch {
-          /* ignore */
+          toast("复制失败，请手动选中文本复制", "error");
         }
       }}
     >
@@ -29,10 +36,15 @@ function CopyBtn({ text }: { text: string }) {
 
 export function UserMessage({ content }: { content: string }) {
   return (
-    <div className="flex justify-end animate-in">
+    <div className="group flex flex-col items-end animate-in">
       <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg">
         {content}
       </div>
+      {content && (
+        <div className={DEMO_ACTIONS_CLASS}>
+          <CopyBtn text={content} />
+        </div>
+      )}
     </div>
   );
 }
@@ -61,7 +73,8 @@ export function AssistantMessage({
       <div className="min-w-0 flex-1">
         {message.content ? (
           <OptionsGroupProvider>
-            <Markdown>{message.content}</Markdown>
+            {/* 流式光标由 Markdown 内联到最后一个文本块末尾(与 chat/cards 同一实现)。 */}
+            <Markdown caret={!!streaming}>{message.content}</Markdown>
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : streaming ? (
@@ -71,14 +84,18 @@ export function AssistantMessage({
             <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:400ms]" />
           </div>
         ) : null}
-        {streaming && message.content && (
-          <span className="caret-blink ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[3px] bg-fg" />
-        )}
         {!streaming && message.content && (
-          <div className="mt-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <div className={DEMO_ACTIONS_CLASS}>
             <CopyBtn text={message.content} />
             {onRegenerate && (
-              <IconButton aria-label="重新生成" size="sm" shape="square" onClick={onRegenerate}>
+              <IconButton
+                aria-label="重新生成"
+                title="重新生成"
+                size="sm"
+                shape="square"
+                className="[@media(hover:none)]:size-11"
+                onClick={onRegenerate}
+              >
                 <RotateCcw size={15} />
               </IconButton>
             )}
