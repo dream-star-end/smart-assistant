@@ -498,11 +498,9 @@ ui-preview 新增场景 `manage-skills-workscope-open`（把折叠后的项目�
 |---|---|---|
 | 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0） |
 | 模块单测 | `npx vitest run src/components/manage src/components/ManageCenter.test.tsx src/lib/connectors.test.ts --maxWorkers=1` | ✅ 14 个文件 / 153 例全绿（阶段 A 基线 127 例，新增 26 例） |
-| 全量 web-react 单测 | `npm test`（`vitest run --maxWorkers=1`） | ✅ 见下方「全量」一行 |
+| 全量 web-react 单测 | `npm test`（`vitest run --maxWorkers=1`，699s） | ◐ 279 文件 / 3591 通过 / 147 跳过 / **3 失败均在 manage 之外且与本轮改动无关**：`MessageRenderer.test`（`beforeAll` 载入 MarkdownImpl chunk 超时 10s，用例注释自述全量并行时偶发）、`Markdown.prefetch.test`（同一 chunk 15s 超时）—— 两者**单独复跑 148/148 全绿**；`tutorialShowcase.test`（Windows `autocrlf` 使提交的 `dashboard.html` 字节数 46712→46755，SHA 校验用例，tutorials 归属 / 环境问题） |
 | 代码风格 | `npx biome check <新建 / 重写的 7 个文件>` | ✅ 绿；既有 manage 文件（含阶段 A 之前）本就不过 biome 格式检查（双引号 + 分号 / 依赖数组），本轮不做整文件格式化，未新增 lint 诊断（`LibraryPanel` 一处 `useOptionalChain` 已改） |
 | 视觉 after | `OC_UI_SCENES=manage-` `node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\manage\after\` | ✅ 49 场景 × 视口 × 主题 = 136 张，`manifest.json` `failures: 0`、`retried: 0`（`unmockedApi` 同阶段 A：`listCronChannels` / `listProjectAssets`） |
-
-全量：`npm test` —— 见提交信息与交付摘要（结果在本节末尾追加）。
 
 after 对照（同名 PNG，`before/` ↔ `after/`）：
 
