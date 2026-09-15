@@ -213,8 +213,8 @@ export function ChatHeader({
               <PopoverContent>
                 <p className="text-[12.5px] leading-relaxed text-muted">
                   顾问模式已开启：主模型不切换
-                  {advisorModelLabel ? `；本回合冻结顾问 ${advisorModelLabel}` : ""}
-                  。主模型可通过 consult_advisor 向无工具顾问提问；建议必须自行验证，不能替代审批或正式审查员。咨询按实际顾问型号计费，不承诺更省。
+                  {advisorModelLabel ? `；本回合固定使用 ${advisorModelLabel}` : ""}
+                  。主模型可以向顾问提问；建议必须自行验证，不能替代审批或正式审查。咨询按实际顾问型号计费，不承诺更省。
                 </p>
                 {onDisableAdvisorMode && (
                   <Button

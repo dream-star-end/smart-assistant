@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ADVISOR_PARENT_BLOCK_REASON,
   collaborationPutBody,
   docToUiState,
   isStaleCollabEpoch,
@@ -59,6 +60,20 @@ describe("sendCollabFields", () => {
     });
     expect(sent.blockedReason).toMatch(/尚未证明/);
     expect(sent.collabConfigVersion).toBeUndefined();
+  });
+
+  it("uses human default reason when parent engine is blocked and server omitted reason", () => {
+    const sent = sendCollabFields({
+      agentId: "main",
+      mode: "advisor",
+      advisorModel: "gpt-6-astra",
+      configVersion: "v1:advisor:gpt-6-astra",
+      parentEngine: "grok",
+      advisorConsultParents: ["ccb"],
+    });
+    expect(sent.blockedReason).toBe(ADVISOR_PARENT_BLOCK_REASON);
+    expect(sent.blockedReason).not.toMatch(/CCB|一期/);
+    expect(sent.collabMode).toBe("advisor");
   });
 
   it("blocks advisor send when parent engine is not in GET parents", () => {

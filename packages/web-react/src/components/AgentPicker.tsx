@@ -3,7 +3,12 @@ import { useEffect, useState } from 'react'
 import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
-import { advisorParentCapabilityAllowed } from '../lib/collaborationConfig'
+import {
+  ADVISOR_ENABLED_HINT,
+  ADVISOR_PARENT_BLOCK_REASON,
+  ADVISOR_UNAVAILABLE_REASON,
+  advisorParentCapabilityAllowed,
+} from '../lib/collaborationConfig'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
@@ -71,9 +76,7 @@ export function AgentPicker({
     advisorConsultParents,
     advisorConsultAllowed,
   })
-  const advisorBlockReason =
-    advisorConsultParentReason ||
-    '一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。'
+  const advisorBlockReason = advisorConsultParentReason || ADVISOR_PARENT_BLOCK_REASON
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
   const [loading, setLoading] = useState(false)
 
@@ -190,7 +193,7 @@ export function AgentPicker({
                   顾问
                 </span>
                 <span className="mt-0.5 block text-[11px] leading-snug">
-                  {advisorBlocked ? advisorBlockReason : '主模型不切换；一期仅 CCB 主会话可咨询'}
+                  {advisorBlocked ? advisorBlockReason : ADVISOR_ENABLED_HINT}
                 </span>
               </button>
               <button
@@ -223,27 +226,43 @@ export function AgentPicker({
                 {advisorModels.length > 0 ? (
                   <label className="text-[11.5px] leading-snug text-muted">
                     顾问型号
+                    {advisorModel && !advisorModels.some((row) => row.id === advisorModel) ? (
+                      <span className="mt-1 block text-warning">
+                        已配置的顾问 {advisorModel} 当前不可用，请重新选择。不会自动改成别的型号。
+                      </span>
+                    ) : null}
                     <select
                       className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1 text-[12.5px] text-fg"
-                      value={advisorModel && advisorModels.some((row) => row.id === advisorModel) ? advisorModel : advisorModels[0].id}
-                      onChange={(e) => onAdvisorModelChange?.(e.target.value)}
+                      value={
+                        advisorModel && advisorModels.some((row) => row.id === advisorModel)
+                          ? advisorModel
+                          : ""
+                      }
+                      onChange={(e) => {
+                        if (e.target.value) onAdvisorModelChange?.(e.target.value)
+                      }}
                       data-product-control
                       aria-label="选择顾问型号"
                     >
+                      <option value="" disabled>
+                        {advisorModel && !advisorModels.some((row) => row.id === advisorModel)
+                          ? "请重新选择顾问型号"
+                          : "选择顾问型号"}
+                      </option>
                       {advisorModels.map((row) => (
                         <option key={row.id} value={row.id}>
-                          {row.label}（{row.engine}）
+                          {row.label}
                         </option>
                       ))}
                     </select>
                   </label>
                 ) : (
                   <span className="text-[11.5px] leading-snug text-warning">
-                    {advisorUnavailableReason || "当前没有已证明无工具隔离的顾问型号，不能静默换模。"}
+                    {advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON}
                   </span>
                 )}
                 <span className="text-[11.5px] leading-snug text-muted">
-                  顾问无工具、不改文件、不替代审批或正式审查员。主模型必须用证据验证建议后再交付。咨询按实际顾问型号计费，不承诺更省。
+                  顾问只出主意，不能改文件、跑命令或再派人。主模型必须用证据验证建议后再交付。咨询按实际顾问型号计费，不承诺更省。
                 </span>
               </div>
             )}
@@ -255,7 +274,7 @@ export function AgentPicker({
                   onChange={(e) => onAsDefaultChange(e.target.checked)}
                   data-product-control
                 />
-                同时作为新会话默认（不改当前会话以外的覆盖）
+                同时设为新对话的默认协作方式
               </label>
             )}
             {collabSaveError && (

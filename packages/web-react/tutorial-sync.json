@@ -1,14 +1,14 @@
 {
   "capabilities": {
     "advisor-mode": {
-      "contentHash": "33f068425f5a2f6c42c04e0a03989e63dd95af0639a7dbc829b0bd885b1a55c1",
-      "contentVersion": 3,
+      "contentHash": "f196ea0c9a528bc8eaf6102f4d36e3d73d3e0589f8af66300175037554762ce2",
+      "contentVersion": 4,
       "entryIdentityHash": "24e04eecd3a7f6cfa91bbc293f50dba69adca8cb28e06bbbaded5dbba129407a",
       "mediaHash": "cd76d4e5d826c6da1b0cb941a27cbbfc9871fb031f69987899127460914889e4",
       "mediaKey": "advisor-mode",
       "mediaVersion": 2,
-      "registryHash": "d7b4dec4c98bf12dc0a8ddb1c6a35152df28156ed8ae34d1362a0a9c1c099747",
-      "sourceHash": "76577c529b993a761f370a35a0ed6e8008a4cad84d4eee450312821456d98ec4"
+      "registryHash": "a43187c6e5eaa5a81208f850c4bf9359b52c9b90471566fec12ec2a3a5989a8c",
+      "sourceHash": "444db31a2f35a2152716b532bdac040aed9aa31985a2280a1b154cb60ce3e9ea"
     },
     "agents": {
       "contentHash": "f9adee3d39156abd3aa5beb353bfe217e6cb364b81c083ed7e46cd66e60242b8",
