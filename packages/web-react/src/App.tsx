@@ -1,5 +1,15 @@
 import { createGoalStarter } from "./lib/goalStart";
-import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { appUpdate } from "./lib/appUpdate";
 import {
   type CursorContextTier,
   cursorModelSupportsContextTier,
@@ -42,7 +52,9 @@ import { InboxDialog } from "./components/InboxDialog";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
-import { resolveGlobalHotkey } from "./lib/hotkeys";
+import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
+import { type BannerKind, collapsedBannersLabel, resolveBanners } from "./lib/bannerStack";
+import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
 import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
@@ -228,6 +240,8 @@ const TaskboardView = lazy(() =>
 // 行为退化为按需加载,不比没有预取更差。
 export function prefetchLazyCentersOnIdle(): void {
   const prefetch = () => {
+    // 省流量模式 / 2G 下不在后台下完全部中心(shell 审计 S-16);API 缺席的浏览器照常预取。
+    if (!shouldPrefetchCenters(readNetworkInformation())) return;
     void import("./components/Landing").catch(() => {});
     void import("./components/SettingsCenter").catch(() => {});
     void import("./components/ManageCenter").catch(() => {});
@@ -373,6 +387,10 @@ export function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelSwitchPreparing, setModelSwitchPreparing] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
+  // 输入框上方横幅栈的「展开全部」(shell 审计 S-06)。默认折叠到 MAX_VISIBLE_BANNERS 条。
+  const [bannersExpanded, setBannersExpanded] = useState(false);
+  // UpdateBanner 自己订阅 governor,这里再订一份只为把它算进横幅栈的条数。
+  const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
   // 产物详情列(Codex 式第三列):选中产物是纯 UI 态(切会话/关面板即清),不进 ChatSocket。
@@ -2021,8 +2039,11 @@ export function App() {
       const action = resolveGlobalHotkey(e);
       if (action === "search") {
         e.preventDefault();
+        // 按视口分流(shell 审计 S-01):移动抽屉的 Sheet 带 md:hidden,桌面断点下抽屉与遮罩都是
+        // display:none,但 Radix 模态照常把 <body> 设成 pointer-events:none、其余内容 aria-hidden
+        // —— 桌面按 ⌘K 会把整页点死且看不见任何弹层。桌面只展开内联侧栏,窄屏才开抽屉。
         setCollapsed(false);
-        setMobileNavOpen(true);
+        if (!isMdViewport) setMobileNavOpen(true);
         window.setTimeout(() => {
           const nodes = [...document.querySelectorAll<HTMLInputElement>("[data-sidebar-search]")];
           const visible = nodes.find((el) => el.getClientRects().length > 0) ?? nodes[0];
@@ -2043,7 +2064,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew, inWorkspace, demo, wsMessages.length]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length, isMdViewport]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2979,7 +3000,9 @@ export function App() {
   useEffect(() => {
     if (!inWorkspace) return;
     const onKey = (e: KeyboardEvent) => {
-      if (resolveGlobalHotkey(e, { sending }) === "stop") {
+      // Esc 的第一持有方是打开着的弹层(Radix Dialog / AlertDialog / DropdownMenu):生成中在对话框里
+      // 按 Esc 只该关对话框,不该连带掐掉这一轮(shell 审计 S-02)。按事件时刻的 DOM 判断,不逐个面板维护布尔量。
+      if (resolveGlobalHotkey(e, { sending, dialogOpen: isDialogLayerOpen() }) === "stop") {
         e.preventDefault();
         stopTurn();
       }
@@ -3195,6 +3218,20 @@ export function App() {
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
+
+  // ── 输入框上方的全局横幅栈(shell 审计 S-06)──────────────────────────────
+  // 五种横幅原先各自按条件挂载、互不知情,断线 + 休眠 + 新版本 + 发送失败同时成立时 390px
+  // 屏上横幅吃掉 ~560px。这里先算出"此刻成立的有哪些",交给 resolveBanners 按优先级裁决:
+  // 同屏最多 2 条,其余折叠成一行「还有 N 条提示」。移动端(<md)的连接条走 Composer 的
+  // banner 插槽钉在输入框上方(软键盘不会把它顶走),不进这个栈。
+  const activeBannerKinds: BannerKind[] = [];
+  if (chatError) activeBannerKinds.push("error");
+  if (!gated && connBanner && isMdViewport) activeBannerKinds.push("connection");
+  if (!demo && gate.phase.kind === "dormant") activeBannerKinds.push("dormant");
+  if (!demo && updateBannerVisible) activeBannerKinds.push("update");
+  if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
+  const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
+  const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
 
   // 冷会话加载骨架：切换/深链到本地无缓存会话、getSession 拉取期间显示消息形骨架，
   // 取代「空白 → 突然填满」。meta（messageCount）取自侧栏当前选中会话，metaKnown
@@ -3698,22 +3735,24 @@ export function App() {
               className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
             />
           )}
-          {!demo && gate.phase.kind === "dormant" && (
-            <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
-            </div>
-          )}
-          {!demo && !gated && activeSess?._turnCostReminderCredits && (
-            <div className="mx-auto mb-2 max-w-3xl px-4">
-              <TurnCostReminder
-                credits={activeSess._turnCostReminderCredits}
-              />
-            </div>
+          {/* 以下五条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
+              发送失败 > 连接状态 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
+          {showBanner("error") && chatError && (
+            <ErrorBanner
+              error={chatError}
+              onRetry={() => {
+                const t = chatError.retryText;
+                setChatError(null);
+                send(t);
+              }}
+              onDismiss={() => setChatError(null)}
+              onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
+            />
           )}
           {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。
               移动端(< md)软键盘弹出会压缩可视视口,流式布局里的横幅会被顶出屏幕;改走
               Composer 的 banner 插槽钉在输入框上方,始终可见。桌面(md+)保持原流式位置。 */}
-          {!gated && connBanner && isMdViewport && (
+          {showBanner("connection") && connBanner && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert
                 tone={connBanner.tone}
@@ -3733,19 +3772,42 @@ export function App() {
               </Alert>
             </div>
           )}
+          {showBanner("dormant") && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
+            </div>
+          )}
           {/* 版本更新横幅:仅 governor 判定不能自动软刷时出现(自动刷成功的用户无感)。*/}
-          {!demo && <UpdateBanner />}
-          {chatError && (
-            <ErrorBanner
-              error={chatError}
-              onRetry={() => {
-                const t = chatError.retryText;
-                setChatError(null);
-                send(t);
-              }}
-              onDismiss={() => setChatError(null)}
-              onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}
-            />
+          {showBanner("update") && <UpdateBanner />}
+          {showBanner("cost") && activeSess?._turnCostReminderCredits && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <TurnCostReminder
+                credits={activeSess._turnCostReminderCredits}
+              />
+            </div>
+          )}
+          {(bannerStack.hidden.length > 0 || bannerStack.canCollapse) && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              {/* 折叠条不走 Alert 的 action 槽:那个槽在 <sm 会整行换到第二行右对齐(给「重试」类
+                  动作设计的),折叠条要的是"一行文字 + 行内切换键",在 390px 上两行会把省下来的
+                  高度又吃回去。 */}
+              <Alert tone="info" density="compact" live="off" data-testid="banner-stack-collapsed">
+                <div className="flex items-center justify-between gap-3">
+                  <span>
+                    {bannersExpanded ? "已展开全部提示" : collapsedBannersLabel(bannerStack.hidden.length)}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="-my-1.5 -mr-1.5 shrink-0"
+                    aria-expanded={bannersExpanded}
+                    onClick={() => setBannersExpanded((v) => !v)}
+                  >
+                    {bannersExpanded ? "收起" : "展开"}
+                  </Button>
+                </div>
+              </Alert>
+            </div>
           )}
           <Composer
             onSend={(text, media, replyTo) =>

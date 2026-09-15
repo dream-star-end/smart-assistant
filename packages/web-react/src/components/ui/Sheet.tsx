@@ -24,8 +24,10 @@ const sheetVariants = cva(
         // 贴底:高度按内容自适应到 85dvh 封顶(dvh 收口移动端动态工具栏);底部补安全区,
         // 否则 Home 指示条会压住最后一行操作。底色取 elevated —— 贴底抽屉是浮在正文之上的
         // 临时面板,不是侧栏那种常驻导航面。
+        // overflow-y-auto:内容超过 85dvh 时原语自己兜底可滚(shell 审计 S-17)—— 调用方若
+        // 自带 `min-h-0 flex-1 overflow-y-auto` 的滚动容器,外层不会溢出,不会叠出双滚动条。
         bottom:
-          "inset-x-0 bottom-0 max-h-[85dvh] w-full rounded-t-2xl bg-elevated pb-[env(safe-area-inset-bottom)] data-[state=closed]:translate-y-full data-[state=open]:translate-y-0",
+          "inset-x-0 bottom-0 max-h-[85dvh] w-full overflow-y-auto overscroll-contain rounded-t-2xl bg-elevated pb-[env(safe-area-inset-bottom)] data-[state=closed]:translate-y-full data-[state=open]:translate-y-0",
       },
     },
     defaultVariants: { side: "left" },

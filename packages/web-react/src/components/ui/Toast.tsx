@@ -124,8 +124,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={toast}>
       {children}
-      {/* 顶部居中堆叠，pointer-events 仅落在卡片上，不挡下层交互。 */}
-      <div className="pointer-events-none fixed inset-x-0 top-16 z-[100] flex flex-col items-center gap-2 px-3 header-safe-t">
+      {/* 顶部居中堆叠，pointer-events 仅落在卡片上，不挡下层交互。
+          顶距走 styles.css 的 --oc-toast-top(默认 4rem),不再写死 top-16:轨道要压在 ChatHeader
+          下沿,而头部高度是另一处文件定的,两处各写各的会在头部改高时压上去或悬空(shell 审计 S-20)。 */}
+      <div
+        data-toast-rail
+        className="pointer-events-none fixed inset-x-0 top-[var(--oc-toast-top,4rem)] z-[100] flex flex-col items-center gap-2 px-3 header-safe-t"
+      >
         {items.map((t) => {
           const s = TONE_STYLE[t.tone];
           return (
