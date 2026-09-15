@@ -1,8 +1,10 @@
 # A·shell 应用壳层与设计系统 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-shell`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（只审计，不改业务代码）
+- 阶段：A（审计，`de38a312c`）→ **B（修复，见 §6–§8）**
 - 结论：**P1 × 1 / P2 × 8 / P3 × 11**，共 20 条。P1 是桌面端 `⌘K` 会把整页点死。
+- 阶段 B 结果：**发现 20 / 修复 18 / 暂缓 2**（S-08 等用户拍板；S-20 只做了「顶距解耦」半条，
+  「去掉 toast」等用户拍板）。P1/P2 除 S-08 外全部落地并配测试。
 
 ---
 
@@ -386,3 +388,87 @@ S-01 的取证脚本挂载一个与 `App.tsx:3368` 同构的 `md:hidden` Sheet �
 3. **S-19**：`browser-tests` 纳入类型检查后若暴露他人文件的存量错误，是统一修
    还是分派给各 owner。
 4. **S-20**：去掉主题切换 toast 属产品口味判断，请指挥官确认。
+
+**指挥官裁决（阶段 B 开工前）**：① S-08 本轮暂缓不动；② S-14 做，44px 是本轮统一标准；
+③ S-19 不改主 `tsconfig.json` 的 include，新增独立脚本 `typecheck:preview`，暴露的他人文件
+错误不修、列进交付；④ S-20 「去掉 toast」先不动，`top-16` 与头部高度解耦那半可以做。
+
+---
+
+## 6. 修复记录
+
+阶段 B 在同一分支上小步提交（`de38a312c..1da9a0f2b`，共 15 个 commit，subject 一律
+`feat/refactor/style/test(v5)`，无 `fix(v5)`）。上一任（opus-5-2，已掉线）留下的未提交半成品
+经逐文件 `git diff` 对照本文件 §4 逐条核对、补齐测试与遗漏项后按条目分组提交；本节按 S-xx 记录。
+
+| 编号 | 严重度 | 状态 | 改了哪些文件 | 怎么改 | commit |
+|---|---|---|---|---|---|
+| S-01 | **P1** | ✅ 修复 | `src/App.tsx`、`src/App.test.tsx` | `⌘K` 的 search 分支按 `isMdViewport` 分流：桌面只 `setCollapsed(false)` 展开内联侧栏并聚焦搜索框，窄屏才 `setMobileNavOpen(true)`；effect 依赖补 `isMdViewport`。`useMdViewport` 走 `useSyncExternalStore` 同步读 `matchMedia`，首帧即正确（§4 的风险点已核实）。App.test 补桌面（断言 `body.style.pointerEvents !== "none"`、搜索框拿到焦点、无 `dialog`）与窄屏（抽屉打开且含 `[data-sidebar-search]`）两例。未另加 ui-preview 场景：静态页无法呈现 `pointer-events` 锁死，jsdom 用例已直接断言该状态。 | `561b3aeb5` |
+| S-02 | P2 | ✅ 修复 | `src/lib/hotkeys.ts`、`src/lib/hotkeys.test.ts`、`src/App.tsx` | `resolveGlobalHotkey` 的 `opts` 增 `dialogOpen`，Esc 分支 `sending && !dialogOpen` 才返回 `"stop"`；新增 `isDialogLayerOpen(doc)`（选择器 `[role="dialog"],[role="alertdialog"],[role="menu"]`，比 §4 计划多纳入 DropdownMenu），App 的 Esc effect 在事件时刻调用。测试 +2 例（含 toast 的 `alert`/`status` 不算弹层）。 | `274e11c85`、`561b3aeb5` |
+| S-03 | P2 | ✅ 修复 | `src/styles.css`、`src/components/ui/Button.tsx`、`src/test/designTokens.test.ts` | 新增 `--danger-fg` / `--color-danger-fg`：浅色 `#ffffff`（5.09:1），暗色 `#15151c`（≈6:1）；Button `danger` 变体 `text-white → text-danger-fg`。designTokens.test 新增 `FILL_PAIRS` 契约（primary/accent/danger 各配其 `-fg` ≥ 4.5:1）。after 图 `shell-ui-kit--desktop--dark`：「删除」按钮由白字改深字。 | `ee8b65b25` |
+| S-04 | P2 | ✅ 修复 | `src/styles.css` | `.congjian-landing` 补 `--danger: #ff8d80` / `--danger-soft: rgba(255,141,128,.12)` / `--danger-fg: #0a0b09` 及三条 `--color-*` 双写，与 success/warning 同亮度带。after 图 `shell-landing-tokens--desktop--light`：四档同一亮度带。 | `ee8b65b25` |
+| S-05 | P2 | ✅ 修复 | `src/test/designTokens.test.ts`、`src/styles.css` | `THEMES` 加入 `.congjian-landing`；`tokensOf` 兼容 `rgba()`、跳过 `--color-*` 双写；新增「token 键集合一致」用例（漏写即红）。放开守卫后营销主题 `--faint` 立即转红，`#777d73 → #8a9086`。`.preview-shell` 未纳入（见 §8）。 | `ee8b65b25` |
+| S-06 | P2 | ✅ 修复 | 新增 `src/lib/bannerStack.ts`(+test)、`src/App.tsx`、`browser-tests/ui-preview/scenes-shell.tsx` | `resolveBanners(active, expanded)` 纯函数：优先级 `error > connection > dormant > update > cost`，同屏最多 2 条，其余折叠成「还有 N 条提示」，可展开 / 收起（`canCollapse`）。App 把五条横幅的显隐统一交给它，渲染顺序即优先级；`UpdateBanner` 的可见性另订一份 governor 只为计入条数。折叠条是「一行文字 + 行内切换键」（不走 Alert 的 `action` 槽——该槽在 `<sm` 整行换到第二行，after 第一版就是这样两行）。测试 8 例。after 图 `shell-global-banners--mobile-*`：横幅栈由 ~560px 降到 ~390px，error 恒在最上。 | `bc280a16f`、`561b3aeb5`、`df7b2be2d`、`1da9a0f2b` |
+| S-07 | P2 | ✅ 修复 | `src/components/ui/Alert.tsx`、`src/components/ui/surfaces.test.tsx` | 新增 `live?: "assertive" \| "polite" \| "off"`，默认按 tone 推导：danger/warning → `role="alert"`，info/success → `role="status"`；`"off"` 不进 live region（折叠条用）。视觉类名零变化。测试 4 例。全量 `npm test` 未因 role 变化出现任何回归。 | `1cf118526` |
+| S-08 | P2 | ⏸ 暂缓 | — | 指挥官裁决本轮不动：与 2026-07-02「后退 = 上一个会话」定头交叉，等用户拍板。见 §8。 | — |
+| S-09 | P2 | ✅ 修复 | `src/components/EmptyState.tsx`(+test)、`src/components/ChunkErrorBoundary.tsx`(+test) | 「为这次会话设定目标」→ `Button variant="link" size="sm"`（触屏 `min-h-11` 兜底，视觉仍是文字链接）；兜底屏「刷新」→ `Button variant="primary" size="md" shape="pill"`，`autoFocus` 透传保留。ChunkErrorBoundary.test 重写为 `alertdialog` / `button` 契约（含 autofocus、`location.reload` 调用），并保留原有 `isChunkLoadError` 各文案用例。 | `e5fdf2f78`、`67d540809` |
+| S-10 | P3 | ✅ 修复 | `src/components/EmptyState.tsx`(+test) | `<h1>` → `<h2>`，文档唯一 h1 留给 App 的 sr-only 会话标题。测试断言 EmptyState 内无 level-1 heading。 | `67d540809` |
+| S-11 | P3 | ✅ 修复 | `index.html`、`src/hooks/useTheme.ts`(+test) | 内联脚本两个分支都写 `theme-color`，取值与 `useTheme` 的 `THEME_COLOR`（`#0c0c11` / `#fafafb`）同一对；`useTheme.test` 读 `index.html` 把两处字面量钉在同一条断言里。 | `8ee43e008` |
+| S-12 | P3 | ✅ 修复 | `src/hooks/useTheme.ts`(+test)、`index.html` | `parseTheme` 只认三值、脏值回落 `system`（内联脚本同口径）；`storage` 事件跨标签同步；`localStorage` 读写包 try/catch。测试 5 例。 | `8ee43e008` |
+| S-13 | P3 | ✅ 修复 | `src/components/UpdateBanner.tsx`、新增 `UpdateBanner.test.tsx` | 半角逗号 → 全角；「立即刷新」「稍后」→ `Button`（link / ghost）放进 Alert `action` 槽，删掉手写 `flex-wrap`。测试 2 例。 | `895db90e1` |
+| S-14 | P3 | ✅ 修复 | `src/components/ui/Chip.tsx`、`selection.test.tsx` | `[@media(hover:none)]:min-h-9 → min-h-11`。**跨模块影响**：触屏下 manage / market 筛选条约高 8px，由指挥官转告 owner。after 图 `shell-ui-kit--mobile-*`：Chip 与 Button 同高。 | `65b781271` |
+| S-15 | P3 | ✅ 修复 | `src/components/EmptyState.tsx`(+test) | 起步语卡片补 `type="button"`；任意字号按 §4 结论留给排版档位专项。 | `67d540809` |
+| S-16 | P3 | ✅ 修复 | 新增 `src/lib/prefetchPolicy.ts`(+test)、`src/App.tsx` | `shouldPrefetchCenters(conn)`：`saveData` 或 `effectiveType ∈ {slow-2g, 2g}` → 不预取；API 缺席 → 照常。`readNetworkInformation` 兼容 moz/webkit 前缀。测试 4 例。 | `f20597d54`、`561b3aeb5` |
+| S-17 | P3 | ✅ 修复 | `src/components/ui/Sheet.tsx`、`surfaces.test.tsx` | `bottom` 变体加 `overflow-y-auto overscroll-contain`。测试 2 例（right 变体不受影响）。双滚动条目测见 §7。 | `1cf118526` |
+| S-18 | P3 | ✅ 修复 | `src/components/ChunkErrorBoundary.tsx` | `text-[13px] → text-body`（像素等价，after 图与 before 一致）。 | `e5fdf2f78` |
+| S-19 | P3 | ✅ 修复 | 新增 `tsconfig.browser-tests.json`、`package.json` | 按裁决不动主 `include`；独立 tsconfig 只 include `browser-tests/ui-preview/**`，新增脚本 `npm run typecheck:preview`。**首次运行暴露 `scenes-taskboard.tsx` 3 处存量错误**（见 §8），本轮不修。 | `75ba343cd` |
+| S-20 | P3 | ◐ 半条 | `src/components/ui/Toast.tsx`、`src/styles.css`、新增 `Toast.test.tsx` | 只做「解耦」半条：`top-16 → top-[var(--oc-toast-top,4rem)]`，变量在 `styles.css` 单点定义（= ChatHeader `min-h-14` + 0.5rem）。「去掉主题切换 toast」按裁决不动。Toast.test 钉住类名 + 变量定义，并锁定 error→alert / 其余→status。 | `8c2e580e2` |
+
+计划外顺手处理（均记入上表对应行）：`isDialogLayerOpen` 纳入 `role="menu"`；`useTheme`
+的 `localStorage` 读写包 try/catch；`UpdateBanner` / `EmptyState` / `ChunkErrorBoundary` 三个
+测试文件在上一任重写时删掉的存量用例（MAIN_AGENT starters、兜底卡、`isChunkLoadError` 各文案、
+「正常渲染子树」）已补回，避免覆盖倒退。`--warning` 作填充（§5 末行）核实后**不需要** `--warning-fg`：
+仓内 `bg-warning` 全部是状态点 / 进度条，无文字压在上面。
+
+## 7. 验证
+
+全部在工作树 `d:\code\test_project\test123\wt\shell` 内跑，HEAD = `1da9a0f2b`。
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（半成品接手时、S-20 后、S-06 单行修正后各跑一次） |
+| ui-preview 场景类型检查（S-19 新增） | `cd packages\web-react; npm run typecheck:preview` | ⚠️ `scenes-shell.tsx` 0 错；`scenes-taskboard.tsx` 3 错（他人存量，见 §8） |
+| shell 模块单测 | `npx vitest run src/App.test.tsx src/components/{ChunkErrorBoundary,EmptyState,UpdateBanner}.test.tsx src/components/ui src/hooks src/lib/{hotkeys,bannerStack,prefetchPolicy}.test.ts src/test/designTokens.test.ts --maxWorkers=1` | ✅ 32 文件 / 315 用例全绿（含 Toast.test 与补回的存量用例） |
+| App.test（S-06 单行修正后复跑） | `npx vitest run src/App.test.tsx --maxWorkers=1` | ✅ 47/47 |
+| 全量 web-react 单测 | `cd packages\web-react; npm test` | ✅ 278 文件 / 3608 用例通过；**2 文件失败均为本机环境基线，与本分支无关**：① `src/lib/tutorialShowcase.test.ts` 2 例 —— 断言 `public/tutorials/.../dashboard.html` 字节数与 SHA-256，本机 git `core.autocrlf=true` 检出时把 LF 换成 CRLF（46712 → 46755 字节），在未改动的主克隆 `v5-selfhost` 上复跑**同样失败**；② `src/components/MessageRenderer.test.tsx` `beforeAll` 10s 超时（该文件注释自述「全量并行时首次 import 偶尔耗尽」，且当时 typecheck / biome 在并行跑），**单跑 147/147 全绿** |
+| 真浏览器交互门（App.tsx / 快捷键 / 横幅属高频面） | `cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | 见下方「test:browser」一行 |
+| 代码风格 | `npx biome lint <本轮全部改动文件>` | ✅ 新增 lint 诊断 0：`App.tsx` 14 条 `useExhaustiveDependencies` 与主克隆基线**逐条相同**（只是行号平移），其余文件 0 条。`biome format` 在本机对**任何**已检出文件都报「整文件重排」（`core.autocrlf` 把工作副本变成 CRLF，与 biome 默认 LF 冲突，未改动的 `Badge.tsx` 同样报错），故对 CRLF 文件只跑 lint；本轮**新建**的 LF 文件（bannerStack / prefetchPolicy / useTheme.test / UpdateBanner.test / Toast.test / ChunkErrorBoundary.test / EmptyState.test）`biome format` 全绿 |
+| after 截图 | `OC_UI_SHOTS=...\.audit-tmp\shell\after; OC_UI_SCENES='shell-'; node browser-tests\ui-preview\shoot.mjs` | ✅ 22 张全部成功（S-06 单行修正后 `shell-global-banners` 4 张重出）。逐张 Read 对照 before：`shell-global-banners--mobile-*` 横幅栈 ~560px → ~390px、error 置顶、折叠条一行；`shell-ui-kit--desktop--dark` 「删除」白字 → 深字；`shell-landing-tokens--*` danger 行进入同一亮度带、danger 按钮深字；`shell-ui-kit--mobile-*` Chip 升到 44px 与 Button 同高；`shell-empty-state` / `shell-chunk-error-*` 视觉与 before 一致（S-09/S-18 是命中区与字号档位的结构改动，像素等价） |
+
+**test:browser**（HEAD `1da9a0f2b`，Chrome 153）：`browser-tests/run.mjs` **67/67 全过**（含 T40
+390px 失败轮、T41 密度 token、T20 harness 存活等与横幅 / 壳层相关的用例）；随后的 16 个
+`node --test` 契约文件 **73 例中 70 过、3 不过**，不过的 3 条全部来自同一个套件
+`cc-switch-ascii-name.node-test.mjs`（settings 的 ApiKeysSection：等不到「还没有 API Key」文案 +
+`haikuModel` 期望 `gemini-3.8-flash` 实际 `sonnet-5`），在**未改动的主克隆 `v5-selfhost` 上单跑同样
+2/2 失败**，是基线问题、归 settings owner，与本分支无关。其余 chat-navigation / find-in-session /
+goal-start / draft-auth / composer-draft / human-wait-resume / owner-fence / identity-manual /
+cost-authority / ocv5-185 / ocv5-210 系列全绿。
+
+**未跑 / 未验（`NOT RUN`）**：
+
+- S-17 的「贴底 Sheet 与调用方自带滚动容器是否叠出双滚动条」未在真浏览器目测：`shell-*` 场景
+  不覆盖 InspectorPanel 的窄屏抽屉；`overflow-y-auto` 只在内容溢出 85dvh 时生效，调用方自带
+  `min-h-0 flex-1 overflow-y-auto` 时外层不会溢出，逻辑上不叠。建议 tools owner 在其场景里看一眼。
+- 真机 iOS Safari 仍未复核（本机网络受限，同阶段 A）。
+
+## 8. 遗留
+
+| 项 | 类型 | 说明 / 下一步 |
+|---|---|---|
+| **S-08 面板不进历史栈** | P2 · 暂缓 | 指挥官裁决本轮不动。与 2026-07-02「后退 = 上一个会话」定头交叉，需用户拍板「面板是否应占历史栈」后再按 §4 方案做（`pushState` + `history.state.ocPanel` 标记 + `useAppRoute.test`）。 |
+| **S-20 去掉主题切换 toast** | P3 · 暂缓 | 产品口味判断，等用户拍板。`top-16` 解耦那半已做。 |
+| `.preview-shell` 未纳入对比度守卫 | S-05 余项 | 该块用 `--preview-*` 前缀且 `surface` 是半透明 `rgba`，要先定义「合成到哪个底上」才有意义；`designTokens.test.ts` 的 `THEMES` 注释已写明。建议单列小任务。 |
+| `scenes-taskboard.tsx` 3 处类型错误 | S-19 暴露 · 他人文件 | `npm run typecheck:preview` 报：`(40,3)` / `(68,3)` `PipelineStage` 缺 `model`；`(115,5)` `"close"` 不在 `"advance" \| "wait_human" \| "stay"`。归 **taskboard owner（fable-5-1-23）**，由指挥官分派。清完后可把 `typecheck:preview` 串进 `typecheck` 脚本。 |
+| Chip 44px 对 manage / market 筛选条的影响 | S-14 跨模块 | 触屏下筛选行约高 8px。需 **manage owner（fable-5-1-20）/ market owner（fable-5-1-19）** 在各自 after 图里确认无换行 / 溢出。 |
+| `EmptyState` 的 `text-[26px]` / `text-[15px]` / `text-[14px]` | S-15 余项 | 按 §5 结论等排版档位专项统一收敛，本轮不新增 token。 |
+| 本机 `core.autocrlf=true` 带来的两处环境噪音 | 环境 | ① `tutorialShowcase.test.ts` 字节 / SHA 断言在 Windows 检出下必红（主克隆同样红）；② `biome format` 对所有 CRLF 工作副本报整文件重排。都不是代码问题；若要在 Windows 上让它们绿，需仓库加 `.gitattributes`（`*.html text eol=lf` 等）—— 属仓库级约定，本轮不动。 |
