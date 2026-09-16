@@ -39,6 +39,13 @@ import {
   ImageEditActionsContext,
   type ImageEditSubmit,
 } from './chat/imageEditActions'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui'
+
+/**
+ * 分享 / 复制拿到的是短时效签名 URL(仓内铁律:签名 URL 禁当持久引用),产品目前没有可分享的
+ * 持久地址(需后端出分享令牌,审计 M-25)。前端能做的只有把话说清:它是临时链接、会过期。
+ */
+const TEMP_LINK_COPIED_NOTICE = '已复制临时链接，链接稍后会失效'
 
 // ImageEditSubmit 单一权威在 chat/imageEditActions.tsx(P/V 共用);此处再导出给 comment/resize 复用。
 export type { ImageEditSubmit } from './chat/imageEditActions'
@@ -420,7 +427,7 @@ export function ImageViewer({
     if (nav?.clipboard?.writeText) {
       try {
         await nav.clipboard.writeText(link)
-        flash('已复制链接')
+        flash(TEMP_LINK_COPIED_NOTICE)
         return
       } catch {
         /* fall through */
@@ -447,7 +454,7 @@ export function ImageViewer({
     if (navigator?.clipboard?.writeText) {
       try {
         await navigator.clipboard.writeText(absolute(url))
-        flash('已复制链接')
+        flash(TEMP_LINK_COPIED_NOTICE)
         return
       } catch {
         /* fall through */
@@ -479,6 +486,8 @@ export function ImageViewer({
             // 上层编辑器 Dialog 自己捕获 ESC(topmost layer),这里不会触发。
             onEscapeKeyDown={(e) => {
               // 读 ref(非闭包 state):Radix 绑定的是挂载时闭包,state 会陈旧。
+              // 「更多」已是 Radix 菜单(M-14),开着时它自己是最高层、Esc 到不了这里;这条守卫只兜
+              // 「两份 DismissableLayer 上下文并存」的极端情况,防止 Esc 把菜单和查看器一起关掉。
               if (moreOpenRef.current) {
                 e.preventDefault()
                 setMoreOpen(false)
@@ -551,45 +560,41 @@ export function ImageViewer({
                         <Share2 size={18} />
                       </button>
                     )}
-                    {!readOnly && <div className="relative">
-                      <button
-                        type="button"
-                        aria-label="更多"
-                        title="更多"
-                        aria-expanded={moreOpen}
-                        onClick={() => setMoreOpen((v) => !v)}
-                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
-                      >
-                        <MoreHorizontal size={18} />
-                      </button>
-                      {moreOpen && (
-                        <>
+                    {/* 「更多」走 DropdownMenu 原语(审计 M-14):拿到 menu/menuitem 语义、方向键、
+                        打开即聚焦首项、关闭焦点回触发钮;黑底样式用 className 盖掉原语默认色。
+                        z-[62] 压过查看器自身的 z-[61],否则 Portal 出去的菜单会被查看器盖住。 */}
+                    {!readOnly && (
+                      <DropdownMenu open={moreOpen} onOpenChange={setMoreOpen}>
+                        <DropdownMenuTrigger asChild>
                           <button
                             type="button"
-                            aria-hidden
-                            tabIndex={-1}
-                            className="fixed inset-0 z-10 cursor-default"
-                            onClick={() => setMoreOpen(false)}
-                          />
-                          <div className="absolute right-0 top-12 z-20 flex w-44 flex-col rounded-2xl bg-neutral-900/95 p-1.5 text-sm shadow-float backdrop-blur">
-                            <button
-                              type="button"
-                              onClick={() => void openInTab()}
-                              className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-white hover:bg-white/10"
-                            >
-                              <ArrowUpRight size={16} /> 新标签打开原图
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => void copyLink()}
-                              className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-white hover:bg-white/10"
-                            >
-                              <Link2 size={16} /> 复制链接
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>}
+                            aria-label="更多"
+                            title="更多"
+                            className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+                          >
+                            <MoreHorizontal size={18} />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="end"
+                          sideOffset={8}
+                          className="z-[62] w-44 min-w-0 rounded-2xl border-white/10 bg-neutral-900/95 p-1.5 text-white shadow-float backdrop-blur"
+                        >
+                          <DropdownMenuItem
+                            onSelect={() => void openInTab()}
+                            className="gap-2 rounded-xl px-3 py-2 text-white data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
+                          >
+                            <ArrowUpRight size={16} /> 新标签打开原图
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onSelect={() => void copyLink()}
+                            className="gap-2 rounded-xl px-3 py-2 text-white data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
+                          >
+                            <Link2 size={16} /> 复制临时链接
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
                   </div>
                 </header>
 

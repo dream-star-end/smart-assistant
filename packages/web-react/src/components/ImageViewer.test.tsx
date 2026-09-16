@@ -198,14 +198,22 @@ describe('ImageViewer 全屏查看器', () => {
     expect(hrefs.some((h) => h.includes('signed.test/x.png'))).toBe(true)
   })
 
-  test('分享 → 无 navigator.share 时复制链接降级', async () => {
+  test('分享 → 无 navigator.share 时复制链接降级,并说明是会过期的临时链接(审计 M-25)', async () => {
     const writeText = vi.fn(async () => {})
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
     render(<Harness submitImageEdit={vi.fn()} />)
     fireEvent.click(screen.getByRole('button', { name: '分享' }))
-    await waitFor(() => expect(writeText).toHaveBeenCalled())
-    expect(await screen.findByText('已复制链接')).toBeInTheDocument()
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(SIGNED))
+    expect(await screen.findByText(/已复制临时链接/)).toBeInTheDocument()
+    expect(screen.queryByText('已复制链接')).not.toBeInTheDocument()
   })
+
+  /** Radix DropdownMenu 触发钮在 pointerdown 上开合(不是 click)。 */
+  function openMoreMenu() {
+    const trigger = screen.getByRole('button', { name: '更多' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    return trigger
+  }
 
   test('更多菜单 → 新标签打开原图(手势内开新标签)', async () => {
     const hrefs: string[] = []
@@ -215,9 +223,60 @@ describe('ImageViewer 全屏查看器', () => {
       hrefs.push(this.href)
     })
     render(<Harness submitImageEdit={vi.fn()} peek={() => SIGNED} />)
-    fireEvent.click(screen.getByRole('button', { name: '更多' }))
-    fireEvent.click(screen.getByRole('button', { name: /新标签打开原图/ }))
+    openMoreMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: /新标签打开原图/ }))
     await waitFor(() => expect(hrefs.some((h) => h.includes('signed.test/x.png'))).toBe(true))
+  })
+
+  // ── 审计 M-14 / M-25:「更多」是真菜单(语义 + 方向键 + 焦点管理);复制的是临时链接。 ──
+  describe('「更多」菜单原语(M-14 / M-25)', () => {
+    test('有 menu/menuitem 语义,键盘打开即聚焦首项,方向键在项间移动', async () => {
+      render(<Harness submitImageEdit={vi.fn()} />)
+      const trigger = screen.getByRole('button', { name: '更多' })
+      expect(trigger).toHaveAttribute('aria-haspopup', 'menu')
+      expect(trigger).toHaveAttribute('aria-expanded', 'false')
+      trigger.focus()
+      fireEvent.keyDown(trigger, { key: 'Enter' })
+      expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      const menu = await screen.findByRole('menu')
+      const items = screen.getAllByRole('menuitem')
+      expect(items.map((item) => item.textContent?.trim())).toEqual([
+        '新标签打开原图',
+        '复制临时链接',
+      ])
+      // 键盘打开 → 首项聚焦(鼠标打开时 Radix 按惯例把焦点留在菜单容器上)。
+      await waitFor(() => expect(items[0]).toHaveFocus())
+      expect(menu).toContainElement(items[0])
+      // 方向键由当前聚焦项接住(roving tabindex),所以派给 activeElement。
+      fireEvent.keyDown(items[0], { key: 'ArrowDown' })
+      await waitFor(() => expect(items[1]).toHaveFocus())
+      fireEvent.keyDown(items[1], { key: 'ArrowUp' })
+      await waitFor(() => expect(items[0]).toHaveFocus())
+    })
+
+    test('菜单开着按 Esc 只关菜单、焦点回触发钮,查看器不关', async () => {
+      const onOpenChange = vi.fn()
+      render(<Harness submitImageEdit={vi.fn()} onOpenChange={onOpenChange} />)
+      const trigger = openMoreMenu()
+      await screen.findByRole('menu')
+      fireEvent.keyDown(document.activeElement ?? document, { key: 'Escape' })
+      await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
+      expect(onOpenChange).not.toHaveBeenCalledWith(false)
+      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
+      await waitFor(() => expect(trigger).toHaveFocus())
+      expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    })
+
+    test('「复制临时链接」→ 写剪贴板,并提示链接会失效', async () => {
+      const writeText = vi.fn(async () => {})
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+      render(<Harness submitImageEdit={vi.fn()} />)
+      openMoreMenu()
+      fireEvent.click(await screen.findByRole('menuitem', { name: '复制临时链接' }))
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(SIGNED))
+      expect(await screen.findByText(/已复制临时链接/)).toBeInTheDocument()
+      await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
+    })
   })
 
   test('点编辑 → 打开圈选编辑器(复用 ImageAnnotationEditor)', async () => {
