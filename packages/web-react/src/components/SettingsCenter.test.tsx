@@ -6,7 +6,8 @@ import { BRAND } from '../lib/brand'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { createMemoryAuthSession } from '../lib/authSession'
-import { SettingsCenter } from './SettingsCenter'
+import { appUpdate } from '../lib/appUpdate'
+import { SettingsCenter, fetchServerBuild } from './SettingsCenter'
 
 vi.mock('./settings/AccountTab', () => ({ AccountTab: () => <div>账户页</div> }))
 vi.mock('./settings/UsageTab', () => ({ UsageTab: () => <div>用量页</div> }))
@@ -211,6 +212,111 @@ test('「API 接入」分区只对 admin 可见;普通用户深链回落账户�
   fireEvent.click(tab)
   expect(tab).toHaveAttribute('aria-selected', 'true')
   expect(await screen.findByText('API 接入页')).toBeInTheDocument()
+})
+
+// ── 二期(t-628)· 关于页 ───────────────────────────────────────────────────
+
+const brandIcpSnapshot = BRAND.icp
+
+async function withBuildMeta(build: string, run: () => Promise<void>) {
+  const meta = document.createElement('meta')
+  meta.setAttribute('name', 'oc-build')
+  meta.setAttribute('content', build)
+  document.head.appendChild(meta)
+  try {
+    await run()
+  } finally {
+    meta.remove()
+  }
+}
+
+function htmlWithBuild(build: string | null, attrOrder: 'name-first' | 'content-first' = 'name-first') {
+  const meta =
+    build === null
+      ? ''
+      : attrOrder === 'name-first'
+        ? `<meta name="oc-build" content="${build}">`
+        : `<meta content="${build}" name="oc-build">`
+  return `<!doctype html><html><head><meta charset="utf-8">${meta}<title>x</title></head><body><div id="root"></div></body></html>`
+}
+
+test('关于页:备案占位文案不渲染,真实备案号才出现', () => {
+  try {
+    BRAND.icp = '备案信息更新中'
+    const first = render(<SettingsCenter {...base} initialSection="about" />)
+    expect(screen.queryByText('备案')).toBeNull()
+    expect(document.body.textContent).not.toContain('备案信息更新中')
+    first.unmount()
+
+    BRAND.icp = '赣ICP备2026123456号-1'
+    render(<SettingsCenter {...base} initialSection="about" />)
+    expect(screen.getByText('备案')).toBeInTheDocument()
+    expect(screen.getByText('赣ICP备2026123456号-1')).toBeInTheDocument()
+  } finally {
+    BRAND.icp = brandIcpSnapshot
+  }
+})
+
+test('关于页:没有构建号时不渲染「检查更新」', () => {
+  render(<SettingsCenter {...base} initialSection="about" />)
+  expect(screen.queryByTestId('about-build')).toBeNull()
+  expect(screen.queryByRole('button', { name: '检查更新' })).toBeNull()
+})
+
+test('关于页:检查更新 → 服务端同构建号时提示已是最新,不出现刷新按钮', async () => {
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValue(new Response(htmlWithBuild('build-2026.09.15-abc'), { status: 200 }))
+  await withBuildMeta('build-2026.09.15-abc', async () => {
+    render(<SettingsCenter {...base} initialSection="about" />)
+    fireEvent.click(screen.getByRole('button', { name: '检查更新' }))
+    expect(await screen.findByText('已是最新版本')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '立即刷新' })).toBeNull()
+  })
+  expect(fetchSpy).toHaveBeenCalledWith('/', expect.objectContaining({ cache: 'no-store' }))
+})
+
+test('关于页:检查更新 → 服务端是新构建时给出「立即刷新」,走 appUpdate.reloadNow', async () => {
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    new Response(htmlWithBuild('build-2026.09.16-def'), { status: 200 }),
+  )
+  const reloadNow = vi.spyOn(appUpdate, 'reloadNow').mockImplementation(() => {})
+  await withBuildMeta('build-2026.09.15-abc', async () => {
+    render(<SettingsCenter {...base} initialSection="about" />)
+    fireEvent.click(screen.getByRole('button', { name: '检查更新' }))
+    expect(await screen.findByText(/发现新版本 build-2026\.09\.1/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '立即刷新' }))
+    expect(reloadNow).toHaveBeenCalledTimes(1)
+  })
+})
+
+test('关于页:检查更新失败 / 读不到服务端版本时给出可重试的说明,不抛错', async () => {
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockRejectedValueOnce(new Error('offline'))
+    .mockResolvedValueOnce(new Response(htmlWithBuild(null), { status: 200 }))
+  await withBuildMeta('build-2026.09.15-abc', async () => {
+    render(<SettingsCenter {...base} initialSection="about" />)
+    const btn = screen.getByRole('button', { name: '检查更新' })
+    fireEvent.click(btn)
+    expect(await screen.findByText('检查失败，请检查网络后重试')).toBeInTheDocument()
+    fireEvent.click(btn)
+    expect(await screen.findByText('暂时读不到服务端版本，请稍后再试')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '立即刷新' })).toBeNull()
+  })
+  expect(fetchSpy).toHaveBeenCalledTimes(2)
+})
+
+test('fetchServerBuild:两种属性顺序的 meta 都能读到;非 2xx 抛错', async () => {
+  const ok = (html: string) => async () => new Response(html, { status: 200 })
+  await expect(fetchServerBuild(ok(htmlWithBuild('abc12345')) as typeof fetch)).resolves.toBe('abc12345')
+  await expect(
+    fetchServerBuild(ok(htmlWithBuild('abc12345', 'content-first')) as typeof fetch),
+  ).resolves.toBe('abc12345')
+  await expect(fetchServerBuild(ok(htmlWithBuild(null)) as typeof fetch)).resolves.toBeNull()
+  await expect(
+    fetchServerBuild((async () => new Response('', { status: 503 })) as typeof fetch),
+  ).rejects.toThrow(/503/)
 })
 
 test('偏好首次加载失败可原地重试，成功后恢复完整偏好页', async () => {

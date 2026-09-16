@@ -36,6 +36,26 @@ function boardProjectQuery(
 
 const SESSIONS_PAGE = 20;
 
+/**
+ * 会话明细是 offset 分页(后端契约),翻页期间若有新会话插到前面,下一页会把上一页末尾的行
+ * 再送一遍 —— 结果是同一 session_id 出现两行(React 还会报重复 key)。前端无法改分页语义,
+ * 但可以按 session_id 去重:已在列表里的行跳过,保留首次出现的那份。offset 仍按服务端原始
+ * 行数推进(它是位置游标,不是"去重后的条数")。导出供单测。
+ */
+export function appendSessionRows(
+  prev: readonly UsageSessionRow[],
+  next: readonly UsageSessionRow[],
+): UsageSessionRow[] {
+  const seen = new Set(prev.map((row) => row.session_id));
+  const out = [...prev];
+  for (const row of next) {
+    if (seen.has(row.session_id)) continue;
+    seen.add(row.session_id);
+    out.push(row);
+  }
+  return out;
+}
+
 /** 图表区窗口口径（默认 7d，作用于 stat 卡 + 全部图表）。 */
 const WINDOWS: { value: UsageReportWindow; label: string }[] = [
   { value: "24h", label: "24 小时" },
@@ -147,7 +167,7 @@ export function UsageTab({
       .then((u) => {
         if (!alive) return;
         setData(u);
-        setSessions(u.sessions.rows);
+        setSessions(appendSessionRows([], u.sessions.rows));
         setOffset(u.sessions.rows.length);
         setHasMore(u.sessions.has_more);
       })
@@ -215,7 +235,7 @@ export function UsageTab({
         sessionsOffset: offset,
         ...(boardProjectId ? { boardProjectId } : {}),
       });
-      setSessions((prev) => [...prev, ...u.sessions.rows]);
+      setSessions((prev) => appendSessionRows(prev, u.sessions.rows));
       setOffset((o) => o + u.sessions.rows.length);
       setHasMore(u.sessions.has_more);
     } catch (e) {
