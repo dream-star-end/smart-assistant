@@ -953,6 +953,7 @@ export function Sidebar({
             />
             {q && (
               <IconButton
+                data-product-control
                 aria-label="清除搜索"
                 title="清除搜索"
                 variant="muted"

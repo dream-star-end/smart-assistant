@@ -353,7 +353,7 @@ export function ChatHeader({
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={onExport}>
+                <DropdownMenuItem data-product-control onSelect={onExport}>
                   <Download size={16} className="shrink-0 text-muted" />
                   <span className="flex-1">导出会话</span>
                 </DropdownMenuItem>
