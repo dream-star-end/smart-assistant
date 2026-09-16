@@ -96,3 +96,60 @@
 | H-20 ① `TokenUsageBadge` 流式反复淡入 | `chat/tokenUsage.tsx` 归 messages；messages-B 已收口，记跨模块备注供 messages 二期。 |
 | H-20 ② `text-faint` 暗色对比度 | 设计 token 归 shell；已完成项刻意弱化，且 inline TodoWrite 卡同款，不单独动。 |
 | H-12 计时不精确 | 前端只能取「本页观察」与 `updatedAt` 的较早者；要准需协议 `InflightDelegateSurface` 补 `startedAt`（需后端配合）。 |
+
+## 6. 修复记录（阶段 B · t-836，同人合一）
+
+发现 20 / 修复 17 / 不修 3（H-18 跨模块、H-19 设计取舍、H-20 跨模块备注）。P1 无；P2 7/7 全部落地。
+
+| # | 严重度 | 处置 | 改动 | 测试 |
+|---|---|---|---|---|
+| H-01 | P2 | ✅ 已修 | `PinnedDelegateTracker.tsx` `DelegateRow`：`summary = terminal ? firstLine(resultSummary) : ""`；失败 / 取消 / 被终止用 `text-danger` | `PinnedDelegateTracker.test`「H-01 失败 / 取消 / 被终止的终态同样显示原因」 |
+| H-02 | P2 | ✅ 已修 | 折叠摘要重排：状态标 `shrink-0` → 名字 `hidden sm:inline` → 目标 `min-w-0 flex-1 truncate` → 计时 `hidden sm:inline shrink-0`（移出 truncate）；「停止本轮」窄屏显示为「停止」（`aria-label` 保持全称） | after 截图 `hud-delegate-collapsed--mobile--*`：目标文本可读（before 为 0 字 + 「00:0」） |
+| H-03 | P2 | ✅ 已修 | `summaryItem = latestRunning ?? terminal[0]`；头部计数 `后台任务 N 进行中` / `后台任务 N 已结束` | 「H-03 全部结束后折叠：头部计数 + 摘要回退到最近结束的一条」；既有「N/N」断言同步更新 |
+| H-04 | P2 | ✅ 已修 | 删除 `aria-hidden` 的 chevron `<button>`；chevron 作为切换按钮内的 `aria-hidden` 图标 | 「H-04/05/08/09 头部只有一个切换按钮」：`button[aria-hidden]` 为 0、`aria-expanded` 按钮恰 1 个 |
+| H-05 | P2 | ✅ 已修 | 两枚 HUD 切换按钮共用 `HUD_TOGGLE_CLS = outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring` | 两个测试文件均断言 `focus-visible:ring-inset` |
+| H-06 | P2 | ✅ 已修 | 共用 `HUD_LIST_CLS`：`max-h-[min(13rem,30dvh)] max-sm:max-h-[min(9rem,30dvh)]`（桌面 208px 不变；窄屏 144px ≈ 4 行；横屏按 30% 视口封顶） | after 截图 `hud-stack-expanded--mobile--*`：两枚 HUD 合计占位从约 58% 视口降到约 48%，列表尾部有渐隐 |
+| H-07 | P2 | ✅ 已修 | `StatusMark`：queued → `Circle text-faint`，paused_for_cutover → `Pause text-warning`，每个状态标带 `role="img"` + `title` + `aria-label`（`delegateStateLabel`） | 「H-07 排队中不转圈、有状态可读名；暂停用 warning 标」 |
+| H-08 | P3 | ✅ 已修 | `useId()` 生成列表 id；`aria-controls={expanded ? listId : undefined}` | 两个测试文件：折叠后无 `aria-controls`，展开时指向存在的元素 |
+| H-09 | P3 | ✅ 已修 | 切换按钮内 `sr-only`「展开/折叠任务列表」「展开/折叠后台任务列表」 | `getByRole("button", { name: /折叠任务列表/ })` 等 |
+| H-10 | P3 | ✅ 已修 | 头部「任务 N/M」→「任务列表 N/M」（与 `tool/meta.ts` inline 卡同名） | 既有 8 处断言同步；`browser-tests/run.mjs` T61 断言文案同步（仅此一行） |
+| H-11 | P3 | ✅ 已修 | 自动折叠计时器以 `visible = hasIncomplete && !turnSettled` 为门，不再依赖 `active` | 「H-11 刷新后仍在飞同样 3s 自动折叠」+「手动折叠后不再自动展开；任务集变化才重新展开」 |
+| H-12 | P3 | ◐ 半修 | 计时起点 `min(首次观察, updatedAt)`；`title`「运行时长（自本页观察到该任务起算）」；`formatElapsed` 超 1 小时显示 `h:mm:ss` | 「H-12 计时起点取 min(首次观察, updatedAt)」；精确起点仍需协议 `startedAt`（§8） |
+| H-13 | P3 | ✅ 已修 | 无运行项且终态 ≥ 2 → 头部「全部知道了」，逐个 `onDismiss`，不改 App 接线 | 「H-13 全部知道了逐条调用 onDismiss；有运行项时不出现」 |
+| H-14 | P3 | ✅ 已修 | `useInflightDelegates.ts`：`readDismissedDelegates` / `writeDismissedDelegates`（sessionStorage `oc_inflight_dismissed:<sid>`，上限 64，读写 try/catch）；初始化、换会话、重挂载都回灌，`dismiss` 幂等写入 | `useInflightDelegates.test`「dismissed 持久化」3 例（读写 / 脏数据与不可用存储 / 上限） |
+| H-15 | P3 | ✅ 已修 | 轮询 effect 内加 `visibilitychange` 监听，回到 visible 立即 `pull` | — （纯事件接线；轮询逻辑既有用例未变） |
+| H-16 | P3 | ✅ 已修 | 删 `TodoRow` 的 `compact` 形参 | typecheck |
+| H-17 | P3 | ✅ 已修 | `useHudListOverflow(ref, deps)`：`scrollHeight - clientHeight - scrollTop > 4` → 列表加底部 `mask-image` 渐隐；滚动 / ResizeObserver / 内容变化重量；jsdom 无 ResizeObserver 时只量一次 | after 截图 `hud-task-long--mobile--*`、`hud-delegate-running--desktop--*`：末行渐隐 |
+| H-18 | P3 | ⏸ 不修 | 组件需知道父轮是否在飞，接线在 `App.tsx`（shell），本任务边界不改 | 见 §8 |
+| H-19 | P3 | ⏸ 不修 | 文件头写明「任务集变化即展开」是拍板过的交互；保留 | — |
+| H-20 | P3 | ⏸ 不修 | `tokenUsage.tsx`（messages）/ `--faint` token（shell）归别人 | 见 §8 |
+
+顺手项（计划外、小）：`PinnedDelegateTracker.tsx` 两处、`PinnedTaskTracker.tsx` 一处自动折叠 effect 的 `useExhaustiveDependencies`（`sig` 刻意入依赖）补 `biome-ignore` 说明，改动文件 `biome lint` 归零（基线原有 2 条）。
+`scenes-hud.tsx` 新增 `Collapsed` 包装器与 `hud-stack-expanded` 等 10 个场景，随代码提交。
+
+## 7. 验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（≈30–52s） |
+| 模块单测 | `cd packages\web-react; npx vitest run src/components/chat/PinnedTaskTracker.test.tsx src/components/chat/PinnedDelegateTracker.test.tsx src/hooks/useInflightDelegates.test.ts src/lib/chat/inflightDelegates.test.ts --maxWorkers=1` | ✅ 4 文件 / 55 用例通过（新增 11 例） |
+| 代码风格 | `npx biome lint <本轮 7 个改动文件>` | ✅ 0 诊断（基线 2 条 `useExhaustiveDependencies` 已加说明性 ignore）。`biome format` 在本机对所有已检出文件报整文件重排（仓库 web-react 代码为双引号 + 分号，与根 biome.json 的 single/asNeeded 不一致，与 shell / tools 文档记录一致），不作为门禁 |
+| 真浏览器交互门 | `cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | 见下方「test:browser」一行 |
+| 视觉基线 | `OC_UI_SCENES=hud- node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\hud\{before,after}\` | ✅ before 40 张 / after 40 张（10 场景 × desktop/mobile × light/dark），两份 manifest `failures: []`、`unmockedApi: []`；逐张对照见 §6 各行 |
+
+before / after 逐张对照要点：
+- `hud-delegate-collapsed--mobile`：before「后台任务 3/5 ◌ 质量审查员 00:0 停止本轮」（目标 0 字、计时裁半）→ after「后台任务 3 进行中 ◌ 复核 PinnedDe… 停止」。
+- `hud-delegate-terminal-collapsed--mobile--dark`：before「后台任务 0/3」→ after「后台任务 3 已结束 ✓ 跑 typec… 全部知道了」。
+- `hud-delegate-running--desktop`：失败行 after 多出红色原因行「被 PLAYBOOK §1 拦下…」；排队项由旋转图标改为空心圆。
+- `hud-stack-expanded--mobile`：两枚同时展开的合计占位约 58% → 约 48% 视口，两张列表尾部均出现渐隐提示。
+- 桌面四张 `hud-task-*--desktop`：除头部文案「任务 N/M」→「任务列表 N/M」外零视觉变化（列表上限桌面不变）。
+
+## 8. 遗留
+
+| 项 | 归属 | 说明 |
+|---|---|---|
+| H-18「停止本轮」在父轮已结束时仍显示 | shell（`App.tsx` 接线） | 建议 `onStop={wsSending ? stopTurn : undefined}`（一行）；或给组件加 `turnActive` prop。本分支未动 App.tsx。 |
+| H-12 计时精确起点 | 需后端配合 | `InflightDelegateSurface` 缺 `startedAt`；前端已取 `min(首次观察, updatedAt)` 并在 title 注明。 |
+| H-20 ① `TokenUsageBadge` 流式反复淡入 | messages（`chat/tokenUsage.tsx`） | `key={totalTokens}` + `animate-in` 每次计数变化重放入场动画，HUD 头部在流式期闪动；建议去 key 或仅首次入场动画。 |
+| H-20 ② `text-faint` 暗色对比度 ≈ 3.9:1 | shell（设计 token） | 已完成项刻意弱化，与 inline TodoWrite 卡同款；若要过 AA 需整体调 `--faint`。 |
+| H-19 任务集文案微调也重展开 | 设计取舍 | 保留现行为；若用户反馈弹开过频，可改为仅条数变化时重展开。 |
