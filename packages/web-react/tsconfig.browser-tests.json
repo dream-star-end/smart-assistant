@@ -8,6 +8,10 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
+    // scenes-*-audit.tsx 里 `import … from './scenes-market.tsx'` 的 .tsx 后缀是 shoot.mjs 分组插件
+    // (onResolve /scenes-(manage|market)$/ 劫持无后缀路径)要求的写法,不能去;这里放行带后缀 import
+    // 的类型检查(TS5097)。仅类型检查、noEmit,不影响构建。见 docs/audit/INTEGRATION.md 集成② §3。
+    "allowImportingTsExtensions": true,
     "incremental": false,
     "composite": false
   },
