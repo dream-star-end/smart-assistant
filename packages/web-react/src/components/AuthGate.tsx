@@ -511,12 +511,13 @@ export function AuthGate({
           >
             <label className="flex flex-col gap-1.5">
               <span className="text-body font-medium text-muted">邮箱</span>
+              {/* 占位符给示例格式而不是复读标签(landing L-11,接 QA t-1038 移交);可及名由包裹 <label> 提供。 */}
               <Input
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 type="email"
                 autoComplete="email"
-                placeholder="邮箱"
+                placeholder="name@example.com"
                 className="rounded-xl bg-bg"
               />
             </label>
@@ -533,12 +534,12 @@ export function AuthGate({
                   </button>
                 )}
               </div>
+              {/* 不再放「密码」占位符(L-11):可见标签 + aria-label 已给名,占位符只是复读。 */}
               <PasswordInput
                 fieldLabel="密码"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 autoComplete="current-password"
-                placeholder="密码"
                 aria-label="密码"
                 className="rounded-xl bg-bg"
               />
@@ -607,7 +608,7 @@ export function AuthGate({
                 onChange={(e) => setEmail(e.target.value)}
                 type="email"
                 autoComplete="email"
-                placeholder="邮箱"
+                placeholder="name@example.com"
                 className="rounded-xl bg-bg"
               />
             </label>
