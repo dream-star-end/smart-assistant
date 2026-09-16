@@ -425,11 +425,13 @@ export function ModelSelector({
               modelId: locked.id,
             })
           }
-          className="justify-between text-faint opacity-80"
+          // 锁定态靠锁图标 + 读屏文案表达,不再靠 faint+opacity 降色(a11y-B composer#2:浅色 3.34 / 深色 3.66)。
+          className="justify-between text-muted"
         >
           <span className="flex min-w-0 items-center gap-1.5">
             <Lock size={14} className="shrink-0" aria-hidden />
             <span className="truncate">{labelText}</span>
+            <span className="sr-only">（需升级解锁）</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={locked} />
@@ -453,11 +455,12 @@ export function ModelSelector({
               modelId: row.row.representative.id,
             })
           }
-          className="justify-between text-faint opacity-80"
+          className="justify-between text-muted"
         >
           <span className="flex min-w-0 items-center gap-1.5">
             <Lock size={14} className="shrink-0" aria-hidden />
             <span className="truncate">{row.row.label}</span>
+            <span className="sr-only">（需升级解锁）</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={row.row.representative} />
