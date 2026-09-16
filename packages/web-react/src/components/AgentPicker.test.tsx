@@ -158,6 +158,17 @@ const READINESS_ROWS = [
   },
 ];
 
+describe("AgentPicker 默认智能体徽章", () => {
+  it("「默认」徽章底走 bg-accent-soft(8%)而不是 bg-accent/15:后者把 accent 前景压到 4.40:1(a11y-C)", async () => {
+    renderPicker({}, READINESS_ROWS);
+    await screen.findByRole("button", { name: /科研助手/ });
+    const badge = screen.getAllByText("默认").find((el) => el.classList.contains("text-micro"));
+    expect(badge).toBeTruthy();
+    expect(badge).toHaveClass("bg-accent-soft", "text-accent");
+    expect(badge).not.toHaveClass("bg-accent/15");
+  });
+});
+
 describe("AgentPicker capability readiness", () => {
   // C-06:此前整卡 disabled —— 不可聚焦、读屏读不到原因、也没有任何去授权的入口。
   it("未就绪 Agent 可聚焦(aria-disabled)且读屏能拿到原因,但点击不会 onPick", async () => {

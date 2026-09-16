@@ -145,7 +145,7 @@ export function AgentPicker({
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
               <span className="text-[14.5px] font-semibold text-fg">{defaultAgent.name}</span>
-              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-micro font-medium text-accent">
+              <span className="rounded bg-accent-soft px-1.5 py-0.5 text-micro font-medium text-accent">
                 默认
               </span>
               {defaultActive && <Check size={14} className="text-accent" />}
