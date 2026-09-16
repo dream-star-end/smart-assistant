@@ -252,6 +252,10 @@ test('批量新建:星球选项以 aria-pressed 表达选中态,已配置的不�
 
   fireEvent.click(option)
   expect(option).toHaveAttribute('aria-pressed', 'true')
+  // 选中态勾选框前景走 text-accent-fg,不写死白字(深色 accent 上白字 2.82:1;a11y-C)。
+  const checkBox = option.querySelector('span[aria-hidden="true"]')
+  expect(checkBox).toHaveClass('bg-accent', 'text-accent-fg')
+  expect(checkBox).not.toHaveClass('text-white')
   expect(within(dialog).getByRole('button', { name: /保存并启用 1 条规则/ })).toBeEnabled()
 
   // 芯片本身就是移除按钮(触控靶由 Chip 原语保证),不再是 11px 的 ✕
