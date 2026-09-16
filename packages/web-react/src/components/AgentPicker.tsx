@@ -218,7 +218,11 @@ export function AgentPicker({
                   <Users size={13} />
                   团队
                 </span>
-                <span className="mt-0.5 block text-[11px] leading-snug">队长切 Astra 并委派已安装智能体</span>
+                {/* 审计 C-32:副标题不再手抄内部代号,引擎展示名与下方说明 / ModelSelector 同源
+                    (@openclaude/protocol DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME)。 */}
+                <span className="mt-0.5 block text-[11px] leading-snug">
+                  队长切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 并委派已安装智能体
+                </span>
               </button>
             </div>
             {mode === 'team' && (

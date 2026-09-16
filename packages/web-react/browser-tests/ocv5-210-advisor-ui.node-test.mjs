@@ -207,7 +207,7 @@ test('ocv5-210-advisor-ui: team click keeps team send (old team regression)', as
     const page = await browser.newPage()
     await openHarness(page, port, js)
     await page.getByTestId('open-picker').click()
-    await page.getByRole('button', { name: /队长切 Astra/ }).click()
+    await page.getByRole('button', { name: /队长切换为/ }).click()
     await page.waitForFunction(
       () => document.querySelector('[data-testid="config-version"]')?.textContent === 'v1:team:',
       null,

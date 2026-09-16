@@ -286,7 +286,7 @@ async function openAgentPicker() {
 }
 
 function teamChoice() {
-  return screen.getByRole('button', { name: /队长切 Astra/ })
+  return screen.getByRole('button', { name: /队长切换为/ })
 }
 
 function soloChoice() {
@@ -745,10 +745,10 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
 
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
-    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切 Astra/ })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切换为/ })).not.toBeInTheDocument())
 
     await openAgentPicker()
-    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
     const lastPut = [...fetchMock.mock.calls].reverse().find(
       ([url, init]) =>
         String(url).includes('/api/collaboration-config') &&
@@ -776,7 +776,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       ).toBe(true),
     )
     await openAgentPicker()
-    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
   })
 
   test('unauthenticated App does not GET collaboration-config; login then loads current identity', async () => {
@@ -813,7 +813,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       ),
     )
     await openAgentPicker()
-    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
   })
 
   test('logout drops in-flight collaboration GET so it cannot paint the next identity', async () => {
@@ -963,7 +963,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
     await waitFor(() => expect(screen.getAllByText('A 开场').length).toBeGreaterThan(0))
     await openAgentPicker()
-    expect(await screen.findByRole('button', { name: /队长切 Astra/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
     const asDefaultBox = screen.getByLabelText(/同时作为新会话默认/)
     fireEvent.click(asDefaultBox)
     await waitFor(() => expect(asDefaultBox).toBeChecked())
@@ -971,7 +971,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     try {
     await waitFor(() => expect(casArmed && rereadStarted).toBe(true))
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
-    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切 Astra/ })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切换为/ })).not.toBeInTheDocument())
 
     fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
       button: 0,

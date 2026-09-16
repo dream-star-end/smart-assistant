@@ -142,7 +142,7 @@ test("actual App new-session advisor/team send materializes session before colla
 
       await page.getByRole("button", { name: "新建会话" }).click();
       await page.getByRole("button", { name: /切换智能体/ }).click();
-      await page.getByRole("button", { name: /队长切 Astra/ }).click();
+      await page.getByRole("button", { name: /队长切换为/ }).click();
       await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "hidden" });
       await page.getByPlaceholder(/和「全能助手」对话/).fill("团队首发不要 404");

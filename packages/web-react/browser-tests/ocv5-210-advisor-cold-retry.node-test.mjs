@@ -608,7 +608,7 @@ test("cold App loads original failed turn and precise retry keeps advisor snapsh
     await sessionBtn.waitFor({ timeout: 15_000 });
     await sessionBtn.click();
     await b.page.getByRole("button", { name: /切换智能体/ }).click();
-    await b.page.getByRole("button", { name: /队长切 Astra/ }).click();
+    await b.page.getByRole("button", { name: /队长切换为/ }).click();
     await b.page.keyboard.press("Escape");
     await b.page.getByRole("dialog").waitFor({ state: "hidden" });
     let collabJson;
