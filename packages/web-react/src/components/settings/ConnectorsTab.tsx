@@ -12,7 +12,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api, apiErrorMessage } from '../../lib/api'
 import {
   type ConnectorConnection,
@@ -259,6 +259,8 @@ export function ConnectorsTab({
   const [loading, setLoading] = useState(true)
   /** 顶部 Alert 只承载「整表读不到」这一类全局态；其余反馈就地渲染在卡片内。 */
   const [err, setErr] = useState<string | null>(null)
+  /** 增量目录（声明式 / 运行时 Plugin）降级为空 —— 列表不完整这件事必须对用户可见（M-20）。 */
+  const [degraded, setDegraded] = useState(false)
   const [cardNotice, setCardNotice] = useState<CardNotice | null>(null)
   /** 打开 v1 绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
   const [bindFor, setBindFor] = useState<ConnectorProvider | null>(null);
@@ -277,15 +279,20 @@ export function ConnectorsTab({
   const reload = useCallback(() => {
     let alive = true;
     setErr(null);
+    setDegraded(false)
     // 声明式是增量：各自 catch 降级为空，永不 reject 到 Promise.all；只有 v1 会阻断。
+    // 降级不再只写 console：卡片少一半时用户分不清「没装」还是「没读到」，
+    // 列表顶部给一条 info 提示 + 重试（承接 manage 审计 M-20）。
     const managementP: Promise<DeclarativeManagementResponse> = api
       .getDeclarativeManagement(auth)
       .catch((e) => {
         console.warn('[connectors] 管理聚合加载失败，降级仅显示 v1 连接器', e)
+        if (alive) setDegraded(true)
         return { connectors: [], connections: [] }
       })
     const runtimeP: Promise<PluginManagementResponse> = api.getPluginManagement(auth).catch((e) => {
       console.warn('[plugins] 运行时 Plugin 管理加载失败，降级显示现有连接器', e)
+      if (alive) setDegraded(true)
       return { catalog: [], accounts: [] }
     })
     Promise.all([api.getConnectors(auth), managementP, runtimeP])
@@ -351,7 +358,13 @@ export function ConnectorsTab({
       setSetupRuntimeFor(plugin)
       return
     }
-    setErr('Plugin 尚未安装到当前版本，请返回市场完成安装或更新后重试。')
+    // 「这一个 Plugin 没装到当前版本」是单卡问题，不该占用为「整表读不到」保留的顶层 err
+    // 通道 —— 反馈要渲染在发起它的容器里（承接 manage 审计 M-20）。
+    setCardNotice({
+      slug: autoAuthorizePluginSlug,
+      tone: 'warning',
+      text: `${plugin?.label ?? 'Plugin'}尚未安装到当前版本，请返回市场完成安装或更新后重试。`,
+    })
   }, [
     autoAuthorizePluginSlug,
     loading,
@@ -497,11 +510,13 @@ export function ConnectorsTab({
       try {
         await api.renameConnector(auth, conn.id, displayName);
         reload();
+        // 改完只 reload 的话，用户看不出到底改没改（承接 manage 审计 M-21）。
+        toast(displayName ? "已改名" : "已清空备注名", "success");
       } catch (e) {
         setCardNotice({ slug: conn.provider, tone: "danger", text: errText(e, "重命名失败") });
       }
     },
-    [auth, reload],
+    [auth, reload, toast],
   );
 
   const updateMarketConnector = useCallback(
@@ -823,6 +838,22 @@ export function ConnectorsTab({
           </Alert>
         )}
 
+        {/* 增量目录降级：卡片少一半时说清是「读不到」而不是「没装」，并给重试（M-20）。 */}
+        {degraded && !loading && (
+          <Alert
+            tone="info"
+            density="compact"
+            data-testid="connectors-degraded"
+            action={
+              <Button size="sm" variant="secondary" onClick={retry}>
+                重试
+              </Button>
+            }
+          >
+            部分插件目录暂时读不到，已显示可用部分。
+          </Alert>
+        )}
+
         {loading ? (
           <ListSkeleton rows={3} />
         ) : (
@@ -1053,7 +1084,9 @@ function RuntimePluginCard({
   }
   return (
     <Card className="p-3.5">
-      <div className="flex items-start gap-3">
+      {/* 卡头外层 flex-wrap + 动作簇窄屏整行下沉：390px 下三个按钮不让位会把描述压成
+          每行 6 个字的窄柱、高度翻三倍（承接 manage 审计 M-09）。桌面端不变。 */}
+      <div className="flex flex-wrap items-start gap-3">
         <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
           <Icon size={18} />
         </span>
@@ -1105,7 +1138,7 @@ function RuntimePluginCard({
             </div>
           )}
         </div>
-        <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+        <div className="flex shrink-0 flex-wrap justify-end gap-1.5 max-sm:basis-full max-sm:justify-start max-sm:pt-1">
           {plugin.updateAvailable && (
             <Button
               variant="primary"
@@ -1937,7 +1970,8 @@ function ProviderCard({
   const orphanInstall = management?.installation === "orphan";
   return (
     <Card className="p-3.5">
-      <div className="flex items-start gap-3">
+      {/* 同 RuntimePluginCard：卡头 flex-wrap，动作簇窄屏整行下沉（manage 审计 M-09）。 */}
+      <div className="flex flex-wrap items-start gap-3">
         <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
           <Icon size={18} />
         </span>
@@ -1986,7 +2020,7 @@ function ProviderCard({
             </div>
           )}
         </div>
-        <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+        <div className="flex shrink-0 flex-wrap justify-end gap-1.5 max-sm:basis-full max-sm:justify-start max-sm:pt-1">
           {management?.updateAvailable && onUpdate && (
             <Button
               variant="primary"
@@ -2084,11 +2118,19 @@ function ConnectionRow({
   const [unbinding, setUnbinding] = useState(false);
   const needsRelink = connectorNeedsRelink(conn);
   const hasError = conn.status === "error";
+  /** 「取消」按钮在 mousedown 阶段置真：blur 先于 click，否则失焦提交会把取消变成保存。 */
+  const cancelingRef = useRef(false);
 
   const save = () => {
     setEditing(false);
     const next = name.trim();
     if (next !== conn.displayName) onRename(conn, next);
+  };
+
+  const cancel = () => {
+    cancelingRef.current = false;
+    setName(conn.displayName);
+    setEditing(false);
   };
 
   return (
@@ -2103,11 +2145,17 @@ function ConnectionRow({
               aria-label="备注名"
               className="h-8 max-w-56"
               onKeyDown={(e) => {
-                if (e.key === "Enter") save();
-                if (e.key === "Escape") {
-                  setName(conn.displayName);
-                  setEditing(false);
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) save();
+                if (e.key === "Escape") cancel();
+              }}
+              // 失焦即提交：此前点到别处编辑框还挂着，既不提交也不取消（承接 manage 审计 M-21）。
+              // 点「取消」时 cancelingRef 已在 mousedown 置真，这里让路，不把取消变成保存。
+              onBlur={() => {
+                if (cancelingRef.current) {
+                  cancel();
+                  return;
                 }
+                save();
               }}
               // biome-ignore lint/a11y/noAutofocus: 行内编辑开启即聚焦是预期交互
               autoFocus
@@ -2118,10 +2166,10 @@ function ConnectionRow({
             <IconButton
               size="sm"
               aria-label="取消编辑"
-              onClick={() => {
-                setName(conn.displayName);
-                setEditing(false);
+              onMouseDown={() => {
+                cancelingRef.current = true;
               }}
+              onClick={cancel}
             >
               <X size={14} />
             </IconButton>
@@ -2159,7 +2207,9 @@ function ConnectionRow({
               连接异常
             </Badge>
           )}
-          {conn.accountHint && (
+          {/* 标题已在 displayName 为空时回落显示 accountHint；这里再渲染一遍会让同一串
+              账号提示上下各出一次（承接 manage 审计 M-18）。 */}
+          {conn.displayName && conn.accountHint && (
             <span className="truncate text-caption text-faint">{conn.accountHint}</span>
           )}
           {conn.createdAt && (
