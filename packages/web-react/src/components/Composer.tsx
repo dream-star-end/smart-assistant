@@ -826,10 +826,12 @@ export function Composer({
               )}
               {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
                   → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
-                  Stop 控件(T35),本按钮 aria-label 不含「停止」。 */}
+                  Stop 控件(T35),本按钮 aria-label 不含「停止」。
+                  标记为控件而非 chat-basics 的教程 CTA 入口(data-product-feature):教程正文尚未描述「排队发送」,
+                  新增 feature 入口会触发 check:tutorials 入口身份变化;正文补写并抬版后再恢复(q-1076)。 */}
               {busy && !stopping && canSend && !disabled && (
                 <IconButton
-                  data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+                  data-product-control
                   aria-label="排队发送"
                   title="本轮结束后自动发送"
                   className="text-accent"
