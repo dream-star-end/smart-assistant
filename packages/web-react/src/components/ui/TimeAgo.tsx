@@ -124,9 +124,17 @@ export function TimeAgo({
   if (!date) return <span className={className}>{fallback}</span>;
 
   const text = format === "relative" ? relative(date, now) : absolute(date, format);
+  const full = absolute(date, tooltipFormat);
+  // <time dateTime> 给机器可读的绝对时刻;可见文案之外再挂一段 sr-only 的绝对时间 ——
+  // 此前绝对时间只活在 hover Tooltip 里,读屏 / 键盘 / 触屏用户全都拿不到(a11y 走查 shell#6:
+  // 全站 70 处实例)。刻意**不**给触发器 tabIndex:那会在每张列表页多出几十个无操作的 Tab 停靠点,
+  // 对键盘用户是更大的负担;绝对时间对辅助技术走文本,对鼠标走 Tooltip。
   const body = (
-    <span className={cn("cursor-default tabular-nums", className)}>{text}</span>
+    <time dateTime={date.toISOString()} className={cn("cursor-default tabular-nums", className)}>
+      {text}
+      {text !== full && <span className="sr-only">（{full}）</span>}
+    </time>
   );
   if (!tooltip) return body;
-  return <Tooltip content={absolute(date, tooltipFormat)}>{body}</Tooltip>;
+  return <Tooltip content={full}>{body}</Tooltip>;
 }
