@@ -36,11 +36,15 @@ const TODOS_LONG: TodoItem[] = [
     content:
       "把知识星球自动回复面板（KnowledgePlanetAutomationPanel，811 行，settings-A 与 manage-A 互相推让）单独立项，写清入口、归属与建议优先级",
     status: "in_progress",
-    activeForm: "正在为知识星球自动回复面板补写入口、归属与优先级说明，这一行故意很长用来验证折行与截断",
+    activeForm:
+      "正在为知识星球自动回复面板补写入口、归属与优先级说明，这一行故意很长用来验证折行与截断",
   },
   { content: "评估 ?demo=1 离线演示模式是否仍在使用", status: "pending" },
   { content: "检查 PermissionCard 未决态审批交互是否有专项审计", status: "pending" },
-  { content: "整理薄弱覆盖清单（MessageFeedbackDialog / taskApprovalCard / releaseCards）", status: "pending" },
+  {
+    content: "整理薄弱覆盖清单（MessageFeedbackDialog / taskApprovalCard / releaseCards）",
+    status: "pending",
+  },
   { content: "生成缺口清单并给出 P1/P2/P3 建议", status: "pending" },
   { content: "complete_task 提交交付物", status: "pending" },
   { content: "claim_next_task 领下一条", status: "pending" },
@@ -73,7 +77,12 @@ const DELEGATES_MIXED: InflightDelegateItem[] = [
     liveHint: "Read PinnedDelegateTracker.tsx",
     updatedAt: NOW - 12_000,
   }),
-  delegate({ jobId: "job-queued", agentId: "researcher", goal: "检索 WCAG 2.2 对折叠控件 aria-controls 的要求", state: "queued" }),
+  delegate({
+    jobId: "job-queued",
+    agentId: "researcher",
+    goal: "检索 WCAG 2.2 对折叠控件 aria-controls 的要求",
+    state: "queued",
+  }),
   delegate({
     jobId: "job-done",
     agentId: "coding-assistant",
@@ -122,7 +131,9 @@ const DELEGATES_TERMINAL: InflightDelegateItem[] = [
 function Collapsed({ children }: { children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const buttons = ref.current?.querySelectorAll<HTMLButtonElement>('button[aria-expanded="true"]');
+    const buttons = ref.current?.querySelectorAll<HTMLButtonElement>(
+      'button[aria-expanded="true"]',
+    );
     buttons?.forEach((b) => b.click());
   }, []);
   return <div ref={ref}>{children}</div>;
@@ -133,7 +144,9 @@ function HudStage({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-screen flex-col bg-bg text-fg">
       <div className="min-h-0 flex-1 overflow-auto px-5 py-8">
-        <div className="mx-auto max-w-3xl text-body text-muted">（对话区占位：HUD 钉在下方输入框上方，不随消息流滚走）</div>
+        <div className="mx-auto max-w-3xl text-body text-muted">
+          （对话区占位：HUD 钉在下方输入框上方，不随消息流滚走）
+        </div>
       </div>
       <div className="shrink-0 pb-3">
         {children}
@@ -180,7 +193,11 @@ export const hudScenes: Scene[] = [
     api: {},
     render: () => (
       <HudStage>
-        <PinnedTaskTracker todos={TODOS_LONG} active tokenUsage={{ totalTokens: 1_284_000, estimated: true }} />
+        <PinnedTaskTracker
+          todos={TODOS_LONG}
+          active
+          tokenUsage={{ totalTokens: 1_284_000, estimated: true }}
+        />
       </HudStage>
     ),
   },
@@ -243,7 +260,11 @@ export const hudScenes: Scene[] = [
     render: () => (
       <HudStage>
         <Collapsed>
-          <PinnedDelegateTracker items={DELEGATES_TERMINAL} onDismiss={() => {}} onStop={() => {}} />
+          <PinnedDelegateTracker
+            items={DELEGATES_TERMINAL}
+            onDismiss={() => {}}
+            onStop={() => {}}
+          />
         </Collapsed>
       </HudStage>
     ),
