@@ -84,6 +84,7 @@ after 对照（逐张 Read）：
 - `misc-options-live-ended-pending--desktop--light`：before 流式结束后页脚、高亮、提示全部消失 → after 高亮与「已选」保留、页脚「已作答 1/1」可发送、光标已收。
 - `misc-options-sent--*`：before 「已发送全部选择。」→ after 「已发送全部选择（1 题未答，已一并标注）。」；第一题高亮恢复。
 - `misc-demo-empty--*` / `misc-demo-stream--*`：与 before 一致（D-05 / D-06 为语义与可达性改动，静态图无差）。
+- 指挥官批准 ② 的附加核对：`MarkdownImpl` 记忆化后重拍 messages 的 `messages-timeline-rich` / `messages-assistant-streaming` / `messages-thinking-live`（`.audit-tmp\misc-p3\messages-after\`，12 张），与 messages-B 的 after 图逐张比：流式光标仍内联在正文 / 思考文末尾，富文本渲染无差，仅计时秒数不同。`optionsGroup.test.tsx` 另加直接断言：live 翻转前后选项按钮是同一个 DOM 节点（实例未重挂）。
 
 **NOT RUN**：全量 `npm test`（改动限于 demo / Message / optionsGroup / RichBlocks / MarkdownImpl，其直接与间接使用方的 8 个测试文件已单跑绿；全量门交集成③统一跑）；真机 iOS Safari；真实 `?demo=1` 页面截图（截图台不挂整 App，demo 空态 / 消息流以真组件 + fixture 摆出）。
 

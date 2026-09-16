@@ -131,9 +131,13 @@ describe("OG-02 根因:经真 Markdown 渲染时 caret/live 翻转不得重挂�
     expect(sendUserText).not.toHaveBeenCalled();
     expect(screen.getByText(/已作答/).textContent).toMatch(/1\s*\/\s*1/);
 
+    const pickedBtn = screen.getByText("轻松").closest("button");
     rerender(view(false));
     // 修复前:MarkdownImpl 每次渲染新造 components 函数 → OptionsBlock 被卸载重挂,点选与注册全丢
     expect(await screen.findByText(/已选:轻松/)).toBeInTheDocument();
+    // 直接断言实例未重挂:同一个 DOM 节点还在文档里(重挂会造出新节点)
+    expect(screen.getByText("轻松").closest("button")).toBe(pickedBtn);
+    expect(document.body.contains(pickedBtn)).toBe(true);
     const sendBtn = screen.getByRole("button", { name: "发送选择" });
     expect(sendBtn).toBeEnabled();
     fireEvent.click(sendBtn);
