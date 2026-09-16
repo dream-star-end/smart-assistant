@@ -545,9 +545,9 @@ function CommunityTutorialSubmit({
       </div>
       <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
         {issue && (
-          <p role="status" className="text-caption text-muted">
+          <output className="text-caption text-muted">
             {issue}
-          </p>
+          </output>
         )}
         <Button type="submit" variant="primary" loading={submitting} disabled={!!issue}>
           <Send size={15} /> 提交审核

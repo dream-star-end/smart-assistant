@@ -172,9 +172,9 @@ export function PublishFromSessionDialog({
       footer={
         <>
           {submitIssue && (
-            <p role="status" className="mr-auto self-center text-caption text-muted">
+            <output className="mr-auto self-center text-caption text-muted">
               {submitIssue}
-            </p>
+            </output>
           )}
           <Button variant="secondary" onClick={() => onOpenChange(false)}>
             取消

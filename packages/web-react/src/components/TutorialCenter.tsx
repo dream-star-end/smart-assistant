@@ -482,9 +482,10 @@ export function TutorialCenter({
                     // option 列表,命中 2 条或 0 条页面都看不出任何变化,「没有匹配教程」分支也永不触发。
                     <nav aria-label="搜索结果" className="flex flex-col gap-1">
                       {filteredFeatures.length > 0 && (
-                        <p role="status" className="px-1 text-caption text-faint">
+                        // <output>（隐含 role=status）而非 p[role=status]：跟随仓内 ListSkeleton 的写法。
+                        <output className="block px-1 text-caption text-faint">
                           {filteredFeatures.length} 篇匹配「{query.trim()}」
-                        </p>
+                        </output>
                       )}
                       <TopicList
                         items={filteredFeatures}
@@ -509,11 +510,11 @@ export function TutorialCenter({
                         ))}
                       </select>
                       {featureCategory !== "all" && (
-                        <p role="status" className="mt-1.5 px-1 text-caption text-faint">
+                        <output className="mt-1.5 block px-1 text-caption text-faint">
                           {filteredFeatures.length > 0
                             ? `「${featureCategoryLabel(featureCategory)}」下共 ${filteredFeatures.length} 篇`
                             : `「${featureCategoryLabel(featureCategory)}」下没有教程，换个分类试试。`}
-                        </p>
+                        </output>
                       )}
                     </>
                   )}
@@ -603,11 +604,12 @@ function ViewTab({
       // 触屏下补到 44px 命中高(审计 TU-11),桌面态零变化。
       aria-current={active ? "page" : undefined}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-meta font-semibold outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+        "inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-2 text-meta font-semibold outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring sm:px-3 [@media(hover:none)]:min-h-11",
         active ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
       )}
     >
-      <Icon size={14} /> {children}
+      {/* 390px 下三个页签 + 「帮助与创作」放不下带图标的版本，第三个会被裁掉一半；窄屏只留文字。 */}
+      <Icon size={14} className="max-sm:hidden" /> {children}
     </button>
   );
 }
@@ -795,7 +797,7 @@ function CaseGallery({
       </div>
 
       <div className="mt-7 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="no-scrollbar flex gap-2 overflow-x-auto" role="group" aria-label="案例分类">
+        <fieldset className="no-scrollbar flex min-w-0 gap-2 overflow-x-auto border-0 p-0" aria-label="案例分类">
           <CategoryChip active={category === "all"} onClick={() => setCategory("all")}>
             全部
           </CategoryChip>
@@ -804,7 +806,7 @@ function CaseGallery({
               {item.label}
             </CategoryChip>
           ))}
-        </div>
+        </fieldset>
         <label className="flex h-10 min-w-0 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring sm:w-64 lg:h-9">
           <Search size={15} className="shrink-0 text-faint" />
           <span className="sr-only">搜索案例</span>
@@ -819,9 +821,9 @@ function CaseGallery({
       </div>
 
       {visible.length === 0 ? (
-        <div role="status" className="mt-7 rounded-2xl border border-dashed border-border px-5 py-12 text-center text-section text-faint">
+        <output className="mt-7 block rounded-2xl border border-dashed border-border px-5 py-12 text-center text-section text-faint">
           没有匹配案例，试试“文献”“引用”“回归测试”或清空筛选。
-        </div>
+        </output>
       ) : (
         <section className="mt-6" aria-labelledby="case-template-title">
           <div className="mb-4 flex items-baseline justify-between gap-3">
@@ -831,9 +833,9 @@ function CaseGallery({
             >
               {filtering ? "匹配的案例脚本" : "全部案例脚本"}
             </h2>
-            <p role="status" className="text-caption text-faint">
+            <output className="text-caption text-faint">
               {visible.length} / {items.length} 条
-            </p>
+            </output>
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             {visible.map((item) => (
@@ -1306,9 +1308,9 @@ function ArtifactPreview({
         ) : (
           <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
             <div className="flex h-28 items-end gap-2 border-b border-white/10 pb-2" aria-hidden>
-              {[42, 68, 54, 88, 72, 96, 78].map((height, index) => (
+              {[42, 68, 54, 88, 72, 96, 78].map((height) => (
                 <span
-                  key={index}
+                  key={height}
                   className="flex-1 rounded-t bg-gradient-to-t from-cyan-500/55 to-emerald-300"
                   style={{ height: `${height}%` }}
                 />
@@ -1696,6 +1698,7 @@ function FeatureSidebar({
   const listRef = useRef<HTMLElement>(null);
   // 当前教程不在可见区时把它滚进来(审计 TU-18):用容器 scrollTop 而不是 scrollIntoView,
   // 后者会连 Dialog.Content 一起滚(TU-23)。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: items 变化会重排目录，需要重新对齐当前行的滚动位置
   useEffect(() => {
     const container = listRef.current;
     const row = container?.querySelector<HTMLElement>('[aria-current="page"]');
@@ -1725,9 +1728,9 @@ function FeatureSidebar({
       <nav ref={listRef} aria-label="教程目录" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
         {!activeInList && (
           // 筛选后当前教程不在列表里时给个位置提示,别让高亮凭空消失(审计 TU-18)。
-          <p role="status" className="mx-2 mb-1 rounded-lg bg-accent-soft px-3 py-2 text-caption text-accent">
+          <output className="mx-2 mb-1 block rounded-lg bg-accent-soft px-3 py-2 text-caption text-accent">
             正在看：{capabilityById(activeId).shortTitle}（不在当前筛选内）
-          </p>
+          </output>
         )}
         <TopicList items={items} activeId={activeId} isRead={(id) => tutorialIsRead(progress, id)} onSelect={onSelect} />
       </nav>
@@ -1821,7 +1824,7 @@ function CategoryChip({ active, onClick, children }: { active: boolean; onClick:
 }
 
 function TopicList({ items, activeId, isRead, onSelect }: { items: ProductCapability[]; activeId: ProductFeatureId; isRead: (id: ProductFeatureId) => boolean; onSelect: (id: ProductFeatureId) => void }) {
-  if (items.length === 0) return <p role="status" className="px-4 py-8 text-center text-meta text-faint">没有匹配的教程，换个关键词试试。</p>;
+  if (items.length === 0) return <output className="block px-4 py-8 text-center text-meta text-faint">没有匹配的教程，换个关键词试试。</output>;
   return <div className="flex flex-col gap-0.5">{items.map((item) => { const id = item.id as ProductFeatureId; const Icon = ICONS[item.icon] ?? Sparkles; return <button key={id} type="button" aria-current={id === activeId ? "page" : undefined} onClick={() => onSelect(id)} className={cn("group flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}><span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-surface text-faint shadow-sm group-hover:text-accent"><Icon size={14} /></span><span className="min-w-0 flex-1 truncate text-meta font-medium">{item.shortTitle}</span>{isRead(id) && <Check size={13} className="shrink-0 text-success" aria-label="已读" />}</button>; })}</div>;
 }
 

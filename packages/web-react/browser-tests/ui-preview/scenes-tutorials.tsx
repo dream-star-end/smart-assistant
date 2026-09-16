@@ -278,12 +278,16 @@ type Step = {
 }
 
 function clickByText(label: string): boolean {
-  const nodes = Array.from(document.querySelectorAll<HTMLElement>('button, summary, a[href]'))
+  // [role=menuitem]：DropdownMenu 的菜单项是 div，不是 button（TU-03 之后「案例脚本 / 教程工作室」都在菜单里）。
+  const nodes = Array.from(document.querySelectorAll<HTMLElement>('button, summary, a[href], [role="menuitem"]'))
   const target = nodes.find((node) => (node.textContent ?? '').replace(/\s+/g, ' ').trim().includes(label))
   if (!target) {
     console.warn('[tutorials-scene] 找不到可点击元素：', label)
     return false
   }
+  // Radix DropdownMenu 的触发器在 pointerdown 开启（click 不够）；先发一次 pointerdown 再 click，
+  // 对普通按钮无副作用（阶段 B 把「帮助与创作」换成了 DropdownMenu，TU-03）。
+  target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerType: 'mouse' }))
   target.click()
   return true
 }
@@ -484,7 +488,7 @@ export const tutorialScenes: Scene[] = [
   },
   {
     id: 'tutorials-help-menu-open',
-    label: '教程中心 · 「帮助与创作」下拉展开态（原生 details，无外点关闭）',
+    label: '教程中心 · 「帮助与创作」下拉展开态（阶段 B 起为 DropdownMenu：Esc / 外点可关闭）',
     group: '工作区',
     viewports: both,
     api: {},
