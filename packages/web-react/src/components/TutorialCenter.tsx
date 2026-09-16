@@ -95,6 +95,10 @@ import {
   DropdownMenuTrigger,
   IconButton,
 } from "./ui";
+import { HERO_SURFACE_CLASS } from "./tutorials/heroTheme";
+
+/** 教程中心一级页签。`showcase` 是默认态;后两者可经 `?panel=help&tab=` 深链(TU-17)。 */
+export type TutorialBrowseView = "showcase" | "start" | "cases";
 
 const ICONS: Record<string, LucideIcon> = {
   message: MessageCircle,
@@ -221,6 +225,11 @@ export function TutorialCenter({
   sending = false,
   sessionTitle = "",
   sessionProjectId = null,
+  browseView: browseViewProp,
+  onBrowseViewChange,
+  signatureWorkId: signatureWorkIdProp,
+  onSignatureWorkChange,
+  stepIndex = null,
 }: {
   open: boolean;
   topicId: ProductFeatureId | null;
@@ -230,6 +239,16 @@ export function TutorialCenter({
   onCaseChange?: (id: TutorialCaseId) => void;
   onShowCaseGallery?: () => void;
   onCommunityChange?: (id: string | null) => void;
+  /**
+   * 一级页签（案例展厅 / 快速上手 / 案例脚本）与精选作品详情的受控态（审计 TU-17 / TU-02 深链）：
+   * App 把它们镜像到 `?panel=help&tab=` / `&work=`。不传则退回组件内部 state，ui-preview 与旧调用方零改动。
+   */
+  browseView?: TutorialBrowseView;
+  onBrowseViewChange?: (view: TutorialBrowseView) => void;
+  signatureWorkId?: SignatureWork["id"] | null;
+  onSignatureWorkChange?: (id: SignatureWork["id"] | null) => void;
+  /** 功能教程深链的目标步骤（`?step=`，1 起）：渲染后把该步滚到顶部并落焦点；越界 / 无 topic 时回到正文顶部。 */
+  stepIndex?: number | null;
   caseActionLabel?: string;
   onRunCase?: (item: TutorialCase) => void;
   onClose: () => void;
@@ -244,10 +263,21 @@ export function TutorialCenter({
   sessionProjectId?: string | null;
 }) {
   const [communityOpen, setCommunityOpen] = useState(!!communityId);
-  const [browseView, setBrowseView] = useState<"showcase" | "start" | "cases">("showcase");
+  // 页签与精选作品选中态:传了受控 prop 就以 prop 为准(App 镜像到 URL,TU-17),否则用内部 state。
+  const [browseViewState, setBrowseViewState] = useState<TutorialBrowseView>("showcase");
+  const browseView = browseViewProp ?? browseViewState;
+  const setBrowseView = (view: TutorialBrowseView) => {
+    if (browseViewProp === undefined) setBrowseViewState(view);
+    onBrowseViewChange?.(view);
+  };
   // 精选作品详情的选中态提到这里(审计 TU-02):放在 CaseShowroom 内部时,点导航「案例展厅」没有任何
   // state 变化、页面停在作品详情;现在 clearToBrowse 一并清掉,页签就能回到画廊。
-  const [signatureWorkId, setSignatureWorkId] = useState<SignatureWork["id"] | null>(null);
+  const [signatureWorkIdState, setSignatureWorkIdState] = useState<SignatureWork["id"] | null>(null);
+  const signatureWorkId = signatureWorkIdProp === undefined ? signatureWorkIdState : signatureWorkIdProp;
+  const setSignatureWorkId = (id: SignatureWork["id"] | null) => {
+    if (signatureWorkIdProp === undefined) setSignatureWorkIdState(id);
+    onSignatureWorkChange?.(id);
+  };
   const mode =
     communityId || communityOpen
       ? "community"
@@ -271,7 +301,27 @@ export function TutorialCenter({
   const copyTimer = useRef<number | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const detailRef = useRef<HTMLElement>(null);
-  useEffect(() => { if (detailRef.current) detailRef.current.scrollTop = 0; }, [mode, caseId, topicId, communityId]);
+  // 切视图 / 切篇回到顶部;带 `?step=` 深链打开功能教程时改为把目标步骤滚到顶并落焦点(TU-17),
+  // 键盘 / 读屏用户从链接进来直接停在那一步;越界的 step 找不到节点,自然回退到顶部。
+  useEffect(() => {
+    const container = detailRef.current;
+    if (!container) return;
+    const target =
+      mode === "features" && stepIndex
+        ? container.querySelector<HTMLElement>(`[data-tutorial-step="${stepIndex}"]`)
+        : null;
+    if (!target) {
+      container.scrollTop = 0;
+      return;
+    }
+    // 推后一拍:Radix 的开场自动聚焦在下一次提交才跑(onOpenAutoFocus 已处理开场;这里管的是
+    // 打开后经 popstate / 站内链接换 step 的情况),同步 focus 会被它盖掉。
+    const timer = window.setTimeout(() => {
+      target.scrollIntoView({ block: "start" });
+      target.focus({ preventScroll: true });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [mode, caseId, topicId, communityId, stepIndex]);
 
   const feature = capabilityById(selectedTopicId);
   const topic = tutorialById(selectedTopicId);
@@ -301,8 +351,9 @@ export function TutorialCenter({
       setQuery("");
       setFeatureCategory("all");
       setCommunityOpen(false);
-      setBrowseView("showcase");
-      setSignatureWorkId(null);
+      // 只重置内部 state:受控时由 App 在关闭 / 反灌时自己清,这里再回调会跟 URL 镜像打架。
+      setBrowseViewState("showcase");
+      setSignatureWorkIdState(null);
       return;
     }
     if (communityId) setCommunityOpen(true);
@@ -378,6 +429,16 @@ export function TutorialCenter({
           aria-describedby={undefined}
           onOpenAutoFocus={(event) => {
             event.preventDefault();
+            // 带 `?step=` 深链打开时焦点直接落到目标步骤(TU-17),否则落到对话框本体。
+            const step =
+              mode === "features" && stepIndex
+                ? detailRef.current?.querySelector<HTMLElement>(`[data-tutorial-step="${stepIndex}"]`)
+                : null;
+            if (step) {
+              step.scrollIntoView({ block: "start" });
+              step.focus({ preventScroll: true });
+              return;
+            }
             dialogRef.current?.focus();
           }}
           className="tutorial-shell fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-bg shadow-float focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 lg:left-1/2 lg:w-[min(1180px,calc(100vw-2rem))] lg:-translate-x-1/2"
@@ -566,6 +627,7 @@ export function TutorialCenter({
                   <FeatureDetail
                     feature={feature}
                     topicId={selectedTopicId}
+                    stepIndex={stepIndex}
                     progress={progress}
                     videoFailed={videoFailed}
                     onVideoFailed={(key) => setVideoFailed((current) => ({ ...current, [key]: true }))}
@@ -779,7 +841,7 @@ function CaseGallery({
   const filtering = category !== "all" || query.trim().length > 0;
   return (
     <section className="mx-auto max-w-5xl px-3 pb-12 pt-4 sm:px-7 sm:pt-7">
-      <div className="overflow-hidden rounded-3xl bg-[#07111f] px-5 py-6 text-white sm:px-8 sm:py-8">
+      <div className={cn("overflow-hidden rounded-3xl px-5 py-6 sm:px-8 sm:py-8", HERO_SURFACE_CLASS)} data-tutorial-hero="cases">
         <p className="text-micro font-semibold uppercase tracking-[0.16em] text-cyan-200">
           案例脚本
         </p>
@@ -1087,7 +1149,7 @@ function CaseDetail({
       <CaseMethodDetails item={item} copied={copied} onCopy={onCopy} />
 
       {onRun && (
-        <section className="mt-10 rounded-3xl bg-[#07111f] px-5 py-6 text-white sm:flex sm:items-center sm:justify-between sm:gap-6 sm:px-7">
+        <section className={cn("mt-10 rounded-3xl px-5 py-6 sm:flex sm:items-center sm:justify-between sm:gap-6 sm:px-7", HERO_SURFACE_CLASS)} data-tutorial-hero="case-cta">
           <div>
             <p className="text-micro font-semibold uppercase tracking-[0.14em] text-cyan-200">
               轮到你的任务
@@ -1259,7 +1321,8 @@ function ArtifactPreview({
     <div
       role="img"
       aria-label={`示意：${artifact.title}，${artifact.description}。这是成果类型的示意图，不是本案例的实际产物`}
-      className="relative min-h-[260px] overflow-hidden bg-[#07111f] p-4 text-white sm:min-h-[330px] sm:p-6"
+      className={cn("relative min-h-[260px] overflow-hidden p-4 sm:min-h-[330px] sm:p-6", HERO_SURFACE_CLASS)}
+      data-tutorial-hero="artifact"
     >
       <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-3">
         <div className="flex items-center gap-2">
@@ -1741,6 +1804,7 @@ function FeatureSidebar({
 function FeatureDetail({
   feature,
   topicId,
+  stepIndex = null,
   progress,
   videoFailed,
   onVideoFailed,
@@ -1752,6 +1816,8 @@ function FeatureDetail({
 }: {
   feature: ProductCapability;
   topicId: ProductFeatureId;
+  /** 深链目标步骤(1 起):给那一步加 aria-current,滚动与聚焦由父级 effect 负责。 */
+  stepIndex?: number | null;
   progress: ReturnType<typeof readTutorialProgress>;
   videoFailed: Record<string, boolean>;
   onVideoFailed: (key: string) => void;
@@ -1804,7 +1870,32 @@ function FeatureDetail({
 
       <section className="mt-9">
         <h2 className="text-[19px] font-semibold tracking-tight text-fg">跟着做</h2>
-        <ol className="mt-4 flex flex-col gap-5">{topic.steps.map((step, index) => <li key={step.title} className="flex gap-3.5"><span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-semibold text-white">{index + 1}</span><div><h3 className="text-title font-semibold text-fg">{step.title}</h3><p className="mt-1 text-[13.5px] leading-6 text-muted">{step.body}</p></div></li>)}</ol>
+        {/* 每一步都是深链落点(`?panel=help&topic=…&step=N`,TU-17):tabIndex=-1 让父级把焦点放到这一步,
+            scroll-mt 留出顶部空隙;目标步骤带 aria-current 与浅色底,读屏 / 视觉都知道"链接指的是这一步"。 */}
+        <ol className="mt-4 flex flex-col gap-5">
+          {topic.steps.map((step, index) => {
+            const current = stepIndex === index + 1;
+            return (
+              <li
+                key={step.title}
+                id={`tutorial-step-${index + 1}`}
+                data-tutorial-step={index + 1}
+                tabIndex={-1}
+                aria-current={current ? "step" : undefined}
+                className={cn(
+                  "flex gap-3.5 scroll-mt-4 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  current && "-mx-2 bg-accent-soft/60 px-2 py-2",
+                )}
+              >
+                <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-semibold text-white">{index + 1}</span>
+                <div>
+                  <h3 className="text-title font-semibold text-fg">{step.title}</h3>
+                  <p className="mt-1 text-[13.5px] leading-6 text-muted">{step.body}</p>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
       </section>
 
       {topic.example && <section className="mt-9 rounded-2xl border border-border bg-surface p-4 sm:p-5"><div className="flex items-center justify-between gap-3"><h2 className="text-title font-semibold text-fg">可以直接参考的说法</h2><Button variant="ghost" size="sm" onClick={onCopy}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制示例"}</Button></div><blockquote className="mt-3 border-l-2 border-accent pl-3 text-[13.5px] leading-6 text-muted">{topic.example}</blockquote></section>}
