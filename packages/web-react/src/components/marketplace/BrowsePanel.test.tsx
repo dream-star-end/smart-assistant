@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import { ToastProvider } from "../ui";
 
 // api 网络层全 mock —— 只验证 BrowsePanel 的分区/筛选片行为,不打真实网络。
 const searchMarketplace = vi.fn();
@@ -55,7 +56,9 @@ test("空查询渲染分区视图:平台精选 + 分类分区 + 未分类兜底"
   render(<BrowsePanel auth={auth} />);
 
   expect(await screen.findByPlaceholderText("搜索技能")).toBeInTheDocument();
-  expect(screen.getByText("试试「翻译」「论文」「写作」")).toBeInTheDocument();
+  // 提示词是可点的芯片(K-06),不再是一行带引号的纯文字。
+  expect(screen.getByRole("button", { name: "翻译" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "论文" })).toBeInTheDocument();
   // 分区区头(heading 角色,不与同名 chip 冲突)
   expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();
@@ -285,10 +288,69 @@ test("目录不再硬截断:装满一页给「加载更多」,点击按 +50 重�
   render(<BrowsePanel auth={auth} />);
   await screen.findByRole("heading", { name: "办公文档" });
   expect(searchMarketplace.mock.calls[0][3]).toBe(50);
-  expect(screen.getByText(/共 50 个技能/)).toBeInTheDocument();
+  // 只拉了一页:结果条与分区计数都说「已加载」,不把一页当全量(K-03);「加载更多」在结果条与底部各一枚。
+  expect(screen.getByText(/已加载 50 个技能，还有更多/)).toBeInTheDocument();
+  expect(screen.queryByText(/共 50 个技能/)).not.toBeInTheDocument();
+  expect(screen.getByText("已加载 50")).toBeInTheDocument();
+  expect(screen.getByText("还有更多未加载")).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "加载更多" })).toHaveLength(2);
 
-  fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
+  fireEvent.click(screen.getAllByRole("button", { name: "加载更多" })[0]);
   await waitFor(() => expect(searchMarketplace.mock.calls.at(-1)?.[3]).toBe(100));
+});
+
+test("「加载更多」失败:不写顶部红条,toast 带「重试」就近可见(K-05)", async () => {
+  const many = Array.from({ length: 50 }, (_, i) =>
+    card(`s${i}`, { name: `技能 ${i}`, category: "office-docs" }),
+  );
+  searchMarketplace.mockResolvedValueOnce({ results: many, method: "all" }).mockRejectedValueOnce(new Error("boom"));
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  // toast 走根部 ToastProvider(与 main.tsx 一致);没有 Provider 时 useToast 是空操作。
+  render(
+    <ToastProvider>
+      <BrowsePanel auth={auth} />
+    </ToastProvider>,
+  );
+  await screen.findByRole("heading", { name: "办公文档" });
+  fireEvent.click(screen.getAllByRole("button", { name: "加载更多" }).at(-1) as HTMLElement);
+
+  expect(await screen.findByText("加载更多失败")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+  // 顶部没有 Alert(role=alert 只属于 toast 通道 / 首屏失败),列表仍在。
+  expect(screen.queryByText("加载市场失败")).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();
+});
+
+test("卡片描述两行截断:line-clamp-2 不与 block 同挂,且对辅助技术以 aria-describedby 暴露(K-02 / K-11)", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  const cardBtn = await screen.findByRole("button", { name: /PPT 生成器/ });
+  const descId = cardBtn.getAttribute("aria-describedby");
+  expect(descId).toBeTruthy();
+  const desc = document.getElementById(descId as string) as HTMLElement;
+  expect(desc).toHaveTextContent("d");
+  expect(desc).toHaveClass("line-clamp-2");
+  expect(desc).not.toHaveClass("block");
+  expect(desc).not.toHaveAttribute("aria-hidden");
+  expect(cardBtn).toHaveAccessibleDescription("d");
+});
+
+test("分类筛选片带 aria-pressed;提示词芯片点一下即搜(K-06 / K-07)", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+  expect(screen.getByRole("button", { name: "全部", pressed: true })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "办公文档", pressed: false }));
+  expect(screen.getByRole("button", { name: "办公文档", pressed: true })).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "翻译" }));
+  expect((screen.getByPlaceholderText("搜索技能") as HTMLInputElement).value).toBe("翻译");
+  await waitFor(() => expect(searchMarketplace.mock.calls.at(-1)?.[1]).toBe("翻译"));
 });
 
 test("目录未装满一页 → 不出现「加载更多」", async () => {

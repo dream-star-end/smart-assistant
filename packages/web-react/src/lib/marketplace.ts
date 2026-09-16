@@ -149,6 +149,53 @@ export function validateHumanMeta(d: HumanMetaDraft): string | null {
   return null
 }
 
+// ── 发布草稿落盘（K-01）────────────────────────────────────────────────────
+// 发布表单里的内容（技能正文 / 附属文件 / 商品信息）此前只活在面板生命周期内：Esc、点遮罩、
+// 切到别的中心都会无提示丢掉。草稿按发布类型各落一份 localStorage，下次打开「发布」原样恢复；
+// 提交成功 / 用户主动丢弃时清掉。值里只有用户自己敲的表单内容，不含任何 token。
+
+const PUBLISH_DRAFT_PREFIX = 'oc_v5_market_publish_draft:'
+
+export function publishDraftStorageKey(kind: 'skill' | 'agent' | 'connector'): string {
+  return `${PUBLISH_DRAFT_PREFIX}${kind}`
+}
+
+/**
+ * 读回一份草稿：在 `create()` 的空表单之上覆盖已存字段（新增字段自动补默认值，旧草稿不会因
+ * 表单结构演进而读崩）。存储不可用 / JSON 不合法 / 不是对象 → null。
+ */
+export function loadPublishDraft<T extends object>(key: string, create: () => T): T | null {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const base = create() as Record<string, unknown>
+    const stored = parsed as Record<string, unknown>
+    const next: Record<string, unknown> = { ...base }
+    for (const k of Object.keys(base)) if (k in stored) next[k] = stored[k]
+    return next as T
+  } catch {
+    return null
+  }
+}
+
+export function savePublishDraft(key: string, draft: object): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(draft))
+  } catch {
+    /* quota / private mode：落不了盘只影响恢复，不影响填写 */
+  }
+}
+
+export function clearPublishDraft(key: string): void {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    /* best effort */
+  }
+}
+
 /** 由显示名生成 slug 建议（发布表单联动；与后端 SLUG_RE 对齐）。 */
 export function suggestSlug(name: string): string {
   return name

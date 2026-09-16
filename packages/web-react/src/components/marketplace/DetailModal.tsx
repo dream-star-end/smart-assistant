@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   Target,
   Terminal,
+  ThumbsUp,
   Users,
 } from 'lucide-react'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
@@ -719,8 +720,10 @@ export function DetailModal({
               {actionErr.message}
             </Alert>
           )}
-          <div className="flex flex-wrap items-center justify-end gap-2 max-sm:flex-col-reverse max-sm:flex-nowrap max-sm:[&>*]:w-full">
-            <Button variant="ghost" onClick={onClose}>
+          {/* 窄屏:「关闭」让位给右上 ✕,剩下的动作并排各占一半(改造前三枚全宽按钮竖着堆约 200px,
+              吃掉 ¼ 视口);只把 Button 拉满,Badge 类结果保持自身宽度,不再被拉成一枚假按钮(K-04 / K-20)。 */}
+          <div className="flex flex-wrap items-center justify-end gap-2 max-sm:flex-nowrap max-sm:[&>button]:flex-1">
+            <Button variant="ghost" onClick={onClose} className="max-sm:hidden">
               关闭
             </Button>
             {/* AI 导购次级入口:关市场 → 新会话 → 预填「装好并给上手示例」,发送权仍在用户。 */}
@@ -818,7 +821,7 @@ export function DetailModal({
             )}
           {isPreset && (
             <Alert tone="info" title="平台预设智能体">
-              无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
+              无需安装，所有用户开箱即用；在输入框上方的智能体选择器中直接切换。
             </Alert>
           )}
           {isPreinstalledConnector && (
@@ -906,7 +909,7 @@ export function DetailModal({
                   title={`来自 ${ratingTotal} 次使用反馈`}
                   aria-label={`好评 ${detail.rating.up}，共 ${ratingTotal} 次反馈`}
                 >
-                  👍 {detail.rating.up}/{ratingTotal}
+                  <ThumbsUp size={12} aria-hidden="true" /> {detail.rating.up}/{ratingTotal}
                 </Badge>
               )}
               {bench && (
