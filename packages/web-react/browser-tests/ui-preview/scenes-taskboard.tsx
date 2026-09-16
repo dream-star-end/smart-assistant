@@ -159,8 +159,9 @@ const stages: PipelineStage[] = [
     onFailure: 'retry',
     entryCondition: 'last_run_succeeded',
   }),
+  // 末站闸门:成功后转待我确认(ON_SUCCESS_ACTIONS 没有 'close';typecheck:preview 曾在此报 TS2322)。
   stage(pipeline.id, 3, 'stage-accept', '体验验收', 'gate', {
-    onSuccess: 'close',
+    onSuccess: 'wait_human',
     requireHumanAck: true,
     entryCondition: 'last_run_succeeded && no_open_blockers',
   }),
