@@ -333,6 +333,15 @@ body {
   :where(button:not(:disabled), [role="button"]:not([aria-disabled="true"]), summary, label[for]) {
     cursor: pointer;
   }
+  /* ── placeholder 对比度(a11y 走查 t-762 shell#5):Tailwind v4 preflight 把 ::placeholder 定成
+     `color-mix(currentColor 50%, transparent)`,在白底上只有 3.4:1(#8a8a8d)。ui/Input 走
+     `placeholder:text-faint` 不受影响,但各模块手写的 <input>/<textarea>(taskboard 描述框、
+     评论框等)全都掉回 preflight。这里在 base 层把全站 placeholder 收敛到 --faint(浅 5.8 / 深 5.9),
+     工具类 placeholder:* 仍在 utilities 层,照旧能覆盖。 ── */
+  ::placeholder {
+    color: var(--faint);
+    opacity: 1;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
