@@ -8,7 +8,7 @@
 > 分支 `feat/v5-selfhost-audit-a11y-mod-b`，基线 = integration `be20adaec`（集成③ 5/6），之上 5 个代码提交 + 本文档。
 > 提交 subject 均为 feat / style / docs(v5)，无 fix(v5)（d-26）。
 
-- **统计：t-762 归属本单 10 条（P2 1 / P3 9）→ 修复 10 / 不修 0 / 遗留 0**；顺手 1 处（landing 折叠态 `aria-controls` 悬空引用，同 t-762 manage#2 口径）。
+- **统计：t-762 归属本单 10 条（P2 1 / P3 9）→ 修复 10 / 不修 0 / 遗留 0**；顺手 1 处（landing 折叠态 `aria-controls` 悬空引用，同 t-762 manage#2 口径）。验收通过后又接 QA t-1038 移交 2 条（landing L-11、media M-23）作附录提交，见文末「附录」。
 - **接手说明**：原持有人随名单换轮离队，工作树里留下 11 个源码文件的未提交改动（覆盖全部 10 条）、无测试、无文档、无提交。
   fable-5-1-21 接手后：逐条对照 t-762 原文核对改法 → 补 3 个测试文件的用例 / 断言 → 跑全部验证门 → 出 before / after 量化与截图 → 按模块拆 5 个提交 → 本文档。
 - 本单未改任何 `components/ui/**`、`App.tsx`、`styles.css`，未越界到其他模块自有组件。
@@ -157,3 +157,16 @@ t-762 composer#3 一并点名的 `components/github/RepoPill.tsx`（28px）归 *
 | `cc-switch-ascii-name` 在**未改动的主克隆**单跑（`cc-switch-baseline-mainclone.log`） | 同样 0 / 2 ❌ —— 与 INTEGRATION §5 / media.md §7 登记一致，为基线失败（settings `ApiKeysSection` 模型 id 断言），与本单无关 |
 
 结论：本单改动面上的全部门（typecheck / biome / 模块 vitest / `run.mjs` / `find-in-session` / `ocv5-185-qa`）全绿；唯一红项为登记在册的基线失败。
+
+---
+
+## 附录：接 QA t-1038 移交（t-895 验收通过后，指挥官 01:35 补录）
+
+QA（fable-5-1-24）复核 landing-B / media-B 遗留时发现两条「遗留成立、阻塞已解除」的项，都落在本单持锁文件里，指挥官要求在同一分支补附录提交。**统计更新：修复 10 + 2 = 12。**
+
+| 编号 | 级别 | 状态 | 文件 | 改法 | 验证 | 提交 |
+|---|---|---|---|---|---|---|
+| L-11（landing-B 遗留） | P3 | ✅ | `AuthGate.tsx`、`AuthGate.test.tsx`、`App.test.tsx`（shell，指挥官授权两行） | 原遗留理由「shell 的 `App.test.tsx` 用 `getByPlaceholderText('邮箱')` 锁着」已不成立（App.test 已改 `getByLabelText`）。登录 / 注册邮箱 `placeholder="邮箱"` → `"name@example.com"`（示例格式，不复读标签）；登录密码 `PasswordInput` 去掉 `placeholder="密码"`（可见标签 + `aria-label` 已给名）；找回密码页「注册邮箱」是提示不是复读，保留；注册页密码「至少 N 位」是规则提示，保留。`AuthGate.test` 的 `getByPlaceholderText("邮箱")` ×6 / `("密码")` ×2 → `getByLabelText`；`App.test.tsx:446/478` 两条「登录表单已消失」否定断言 `queryByPlaceholderText('邮箱')` → `queryByLabelText('邮箱')`（否则占位符一改就成空断言） | `AuthGate.test` +1（占位符为示例格式、密码框无同词占位符、注册页同样）；`AuthGate.test + Landing.test` 53 例 ✅；`App.test` 47 例 ✅；typecheck ✅；after 截图 `..\a11y-mod-b\after-L11\auth-{login,register,forgot}--*`（30 张 / 9 场景，0 失败）：邮箱框显示 `name@example.com`、密码框空占位，其余与 before 一致 | `6236dfb08` |
+| M-23（media-B 文档记 ✅ 但未落地） | P3 性能 | ✅ | `ImageAnnotationEditor.tsx`、`ImageAnnotationEditor.test.tsx` | media.md §6.1 写的「hasSelection 改为维护 selectionDirty」在 `2d75dbb45` 里没做，`selectionPresent` 仍是 `useMemo(() => hasSelection(mask), [revision])`——每一笔抬手都对整张 mask `getImageData` 全量扫描。改为 `useState`：画笔抬手 → `true`（pointerDown 即落点，不扫）；**矩形 / 套索 / 擦除抬手 → 扫一次**（比 QA 建议的「非擦除一律 true」多守一层：矩形 / 套索可能拖出零面积，直接置 true 会让「发送」在空 mask 上可用）；撤销 / 重做 `restore` 后扫一次；清空 / 换图 / 卸载 → `false`。`revision` 只留 setter（撤销 / 重做按钮读 ref，需重渲染） | `ImageAnnotationEditor.test` +3：画笔落笔 `getImageData` 零调用且标题变「已选中区域」、撤销回空白快照后扫一次回「圈选要修改的区域」；矩形零面积抬手扫一次、不误报；清空回无选区不扫。既有 16 例不动，19 例 ✅；typecheck ✅ | `986f72b2f` |
+
+附录两笔的 `biome lint` 与主克隆同文件比对：11 / 11 一致，新增诊断 0（`biome-lint-appendix-{base,wt}.txt`）。
