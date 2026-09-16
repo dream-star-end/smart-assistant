@@ -6,7 +6,7 @@
  * 异步 chunk，不进首屏 bundle。新增 markdown 重渲染相关依赖请加在本文件，勿回灌到
  * 同步路径。default export 为 React.lazy 约定。
  */
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -16,6 +16,7 @@ import {
   Children,
   isValidElement,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ComponentPropsWithoutRef,
@@ -302,20 +303,15 @@ export default function MarkdownImpl({
   readOnly,
   blockImages,
 }: MarkdownProps) {
-  return (
-    <div className="prose">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[
-          [rehypeHighlight, { detect: true, ignoreMissing: true }],
-          // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
-          [rehypeKatex, { strict: false, throwOnError: false }],
-          // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
-          ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
-          // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
-          ...(caret ? [rehypeLiveCaret] : []),
-        ]}
-        components={{
+  // `live` 只被 HtmlPreview 读:走 ref 而不进 useMemo 依赖,否则流式结束(live→false)那一次
+  // 重建 components 就把所有富块(OptionsBlock 的点选、HtmlPreview 的 iframe)整个重挂载。
+  const liveRef = useRef(live);
+  liveRef.current = live;
+  // components 里的渲染器是「组件类型」:每次渲染都造新函数 = React 视为新类型 → 富块子树
+  // 逐次卸载重挂(t-839 OG-02 实证:流式结束 caret 翻转,options 点选凭空消失)。按真正影响
+  // 渲染分支的 props 记忆化;`caret` 只影响 rehype 插件,不进这里。
+  const components = useMemo<Components>(
+    () => ({
           pre: ({ children }) => <>{children}</>,
           table: ({ node: _node, ...props }) => <MarkdownTable {...props} />,
           ...(signMedia || blockImages
@@ -361,7 +357,7 @@ export default function MarkdownImpl({
               if (lang === "options")
                 return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} readOnly={readOnly} />;
               if (!readOnly && (lang === "html" || lang === "htmlpreview"))
-                return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} live={live} />;
+                return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} />;
               return (
                 <CodeBlock language={lang}>
                   <span className={className} {...props}>
@@ -425,7 +421,23 @@ export default function MarkdownImpl({
               </a>
             );
           },
-        }}
+    }),
+    [signMedia, blockImages, readOnly],
+  );
+  return (
+    <div className="prose">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[
+          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+          // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
+          [rehypeKatex, { strict: false, throwOnError: false }],
+          // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
+          ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
+          // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
+          ...(caret ? [rehypeLiveCaret] : []),
+        ]}
+        components={components}
       >
         {typeof children === "string" ? normalizeMathDelimiters(children) : children}
       </ReactMarkdown>

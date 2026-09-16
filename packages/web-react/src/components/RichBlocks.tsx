@@ -7,7 +7,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { Maximize2, X } from "lucide-react";
 import { useChatInteraction } from "./tool/context";
 import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
-import { useMemo, useEffect, useId, useRef, useState } from "react";
+import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
  *  快照,若不进依赖,切明暗主题后已渲染的图配色错乱(暗底浅字/浅底暗字)。 */
@@ -167,7 +167,9 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   const parsed = useMemo(() => parseOptionsBlock(code), [code]);
 
   // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
-  useEffect(() => {
+  // 用 layout effect:passive effect 在 commit 之后才跑,中间那帧里块已可点、分组还没数到它,
+  // 点选会误走「单块点击即发」(t-839 OG-01 实证:三题消息第一题被单独发出)。
+  useLayoutEffect(() => {
     if (readOnly || !group || !parsed) return;
     group.register(blockKey, { question: parsed.question, multi: parsed.multi });
     return () => group.unregister(blockKey);
@@ -183,9 +185,10 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送。
   // 流式(live)期间即使目前只注册到 1 块也不走点击即发——长回合中途就会贴卡,
   // 后继 options 的 JSON 也可能还是半截;点选永远可点,发送必须用户显式点页脚。
-  // 非流式单题(或无分组)保持点击即发/块内确认。
+  // 流式期点过、流式结束后也留在聚合模式(点选不丢,由页脚显式发出)。
+  // 非流式单题(或无分组)保持点击即发/块内确认。口径统一取 snapshot.grouped。
   const streaming = groupSnap?.live === true;
-  const grouped = !!group && ((groupSnap?.count ?? 0) >= 2 || streaming);
+  const grouped = !!group && (groupSnap?.grouped ?? false);
   const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
   const sent = sentLocal !== null || (groupSnap?.sent ?? false);
   const sentText = sentLocal ?? (groupEntry?.labels.length ? groupEntry.labels.join("、") : null);
@@ -195,19 +198,23 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
   const blockedByBusy = !!busy && !streaming;
 
   const report = (labels: string[]) => group?.setAnswer(blockKey, labels);
+  // 点击时刻直接读 store:同一 commit 里兄弟块刚注册完、本块还没因快照变化重渲时,
+  // 渲染期算出的 grouped 可能还是旧值(单块),读 store 才不会误走「点击即发」。
+  const groupedNow = () => !!group && group.getSnapshot().grouped;
 
   const choose = (i: number) => {
     if (!interactive || blockedByBusy) return;
     const label = parsed.options[i].label;
+    const inGroup = groupedNow();
     if (parsed.multi) {
       setPicked((p) => {
         const n = new Set(p);
         if (n.has(i)) n.delete(i);
         else n.add(i);
-        if (grouped) report([...n].sort((a, b) => a - b).map((x) => parsed.options[x].label));
+        if (inGroup) report([...n].sort((a, b) => a - b).map((x) => parsed.options[x].label));
         return n;
       });
-    } else if (grouped) {
+    } else if (inGroup) {
       // 聚合模式单选:标记/换选,不发送。
       setPicked(new Set([i]));
       report([label]);
@@ -217,7 +224,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
     }
   };
   const confirmMulti = () => {
-    if (!interactive || blockedByBusy || picked.size === 0 || grouped) return;
+    if (!interactive || blockedByBusy || picked.size === 0 || groupedNow()) return;
     const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label);
     setSentLocal(labels.join("、"));
     sendUserText?.(`我选择:${labels.join("、")}`);
