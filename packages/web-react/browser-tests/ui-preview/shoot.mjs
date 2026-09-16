@@ -170,12 +170,22 @@ const cssFile = builtAssets.find((p) => p.endsWith('.css'))
 if (!cssFile) throw new Error('ui-preview: 预览 production CSS 构建失败(产物里没有 .css)')
 const assetByName = new Map(builtAssets.map((p) => [basename(p), p]))
 
+// 内联进 <script> 的 bundle 必须做 HTML 脚本数据转义。bundle 里只要先出现一个未闭合的 `<!--`
+// (src/lib/thinkingText.ts 剥流式注释的正则 /<!--[\s\S]*$/)、再出现一个 `<script`(src/components/
+// settings/ApiAccessTab.tsx 的注释),HTML 分词器就进入 double-escaped 态,真正的 </script> 不再闭合
+// → 整段脚本静默不执行、无 pageerror、window.__ocScenes 为 undefined,下方 allScenes.filter 直接炸。
+// 是否触发取决于 esbuild 的模块顺序(2026-09-16 加入 scenes-tutorials 后复现),所以"以前没事"不算安全。
+// \x21 在字符串 / 正则(含 u 模式)/ 注释里都等价于 "!",<\/ 同理,转义后语义不变。
+const inlineBundle = readFileSync(bundlePath, 'utf8')
+  .replace(/<!--/g, '<\\x21--')
+  .replace(/<\/script/gi, (match) => `<\\/${match.slice(2)}`)
+
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#fafafb">
 <title>OpenClaude UI 预览台</title>
 <style>${readFileSync(cssFile, 'utf8')}</style>
-</head><body><div id="root"></div><script>${readFileSync(bundlePath, 'utf8')}</script></body></html>`
+</head><body><div id="root"></div><script>${inlineBundle}</script></body></html>`
 
 const CONTENT_TYPES = {
   '.css': 'text/css; charset=utf-8',
