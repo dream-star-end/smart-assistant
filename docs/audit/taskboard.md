@@ -436,3 +436,21 @@
 | `npm run test:browser` | `NOT RUN`，理由同上表 |
 | 逐张抽看（Read） | `taskboard-board-responsive--desktop/mobile--light`、`taskboard-ticket-drawer--mobile--light`、`taskboard-load-error--desktop--light`、`taskboard-list-responsive--desktop--light`、`taskboard-mobile-config-menu--mobile--light`、`taskboard-stage-settings--mobile--light`、`taskboard-empty-columns--desktop--dark`：与 §7.1 重点对照描述一致（六列在 1440 内、移动端「配置」菜单、抽屉关闭 × 与平铺动作、错误态带重试、空态带下一步、状态下拉「在途（默认）」） |
 | 改动范围 | `git status` 只含 taskboard 归属文件 + `browser-tests/ui-preview/scenes-taskboard.tsx` + 本文档；`packages/cli/src/index.ts`、`packages/mcp-memory/src/index.ts` 为 `npm ci` 行尾假改动（`git diff` 为空），未提交 |
+
+---
+
+## 8. 二期（t-630 · 09-16 · fable-5-1-35）· 遗留 P3 收尾
+
+二期的口径是把「本模块归属内可独立完成、不依赖后端 / shell」的遗留落地。阶段 B 已把 P2 14/14、P3 12/14 修完，剩下的逐条复核如下：**可独立完成的只有 1 项（预览台场景的类型错误），已修；其余 2 项部分修复保持原判**。
+
+| 项 | 二期处置 | 依据 |
+|---|---|---|
+| `scenes-taskboard.tsx:163` `onSuccess: 'close'` → TS2322（集成① 在 `typecheck:preview` 登记的 2 处既有错误之一） | **✅ 已修**（`cb6629bd1`）：末站闸门改 `onSuccess: 'wait_human'` | `lib/taskboard.ts:78` `ON_SUCCESS_ACTIONS = ['advance','wait_human','stay']`，`'close'` 不在枚举内；该站 `requireHumanAck: true`，语义就是「成功后转待我确认」。验证：`npx tsc -p tsconfig.browser-tests.json`（shell S-19 的配置，noEmit）在本工作树 **exit 0**；`after-2` 重拍 `taskboard-stage-settings` 4 张全部成功（`D:\code\test_project\test123\.audit-tmp\taskboard\after-2\`）。业务代码零改动 |
+| T-20 `BoardViewParam` 的 `inbox/backlog` 类型 | ⏸ 保持部分修复 | `hooks/useAppRoute.ts` 归 shell；本模块死分支已在阶段 B 删净，剩余只是 shell 侧的类型收口 |
+| T-28 直接新建 AI 阶段 | ⏸ 保持部分修复 | 后端要求 AI 阶段绑定 agent（`buildStagePatch` 同一约束），前端已把两步流程写进新建行说明；单步新建需后端放宽，不在前端范围 |
+| T-02 项目范围深链冷启回落 all | ✅ 已由 sidebar-B 修复（`feat/v5-selfhost-audit-sidebar` `ef872e91a`「sidebar 项目范围深链冷启不再误判失效回落 all（taskboard 审计 T-02）」） | 修在 `useProjectScope`（sidebar 归属）；本分支未合入该提交，`taskboard-scope-deeplink-reload` 场景要在 integration 上复拍才会画出看板，建议归档时在 integration 上补一张 |
+| §5 暂缓 9 项 | — 全部维持 | 触屏拖拽（平台限制）/ `Sheet` 关闭按钮（shell）/ `cronHuman`（manage）/ `RECORDED_COST_LABELS`（protocol 契约）/ 轮询改推送与列表分页（后端）/ 成本图表（新功能）/ biome format（CRLF），无一在本模块可独立落地 |
+
+顺手清理：接手时工作树里有一次 `tsc` 误发射留下的 753 个未跟踪 `.js`（与 `.ts/.tsx` 同名、同一分钟生成，含 `src/components/taskboard/*.test.js`），会被 vitest 当测试文件重复收集，已按「有同名 TS 源 + 同一分钟 mtime」精确删除，未动任何被跟踪文件；`tsconfig.browser-tests.json`（shell S-19 的副本、noEmit）保留在工作树未提交，集成后由 shell 版本覆盖。
+
+二期新增代码改动 0（仅场景 1 行 + 本节），遗留仍为 2 项部分修复（T-20 shell 类型、T-28 后端约束）。
