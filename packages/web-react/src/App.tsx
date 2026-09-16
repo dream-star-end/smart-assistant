@@ -1617,6 +1617,9 @@ export function App() {
         !!navigator.mediaDevices?.getUserMedia &&
         typeof MediaRecorder !== "undefined",
       orgRole: user?.org?.role ?? null,
+      // 商业构建关掉任务面板时「任务面板」教程的 CTA 不再可点却什么都不发生（tutorials TU-32）；
+      // 与下方 runTutorialAction 的 taskboard 分支同一开关。
+      taskboardEnabled: TASKBOARD_ENABLED,
     }),
     [inWorkspace, image2Available, user?.org?.role],
   );
