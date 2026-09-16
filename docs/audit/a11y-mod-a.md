@@ -12,9 +12,9 @@
 
 | 模块 | 改动文件 | 对应条目 |
 |---|---|---|
-| settings / org | `settings/QqBindingCard.tsx`(+test)、`org/MembersTab.tsx`(+test)、`settings/ApiKeysSection.tsx`、`settings/FeedbackTab.tsx`、`org/OrgTopupDialog.tsx`、`settings/UsageTab.tsx` | settings#1 #2 #3 #5 #6 |
+| settings / org | `settings/QqBindingCard.tsx`(+test)、`org/MembersTab.tsx`(+test)、`settings/ApiKeysSection.tsx`、`settings/FeedbackTab.tsx`、`org/OrgTopupDialog.tsx`、`settings/UsageTab.tsx`、`SettingsCenter.tsx`(+test) | settings#1 #2 #3 #5 #6 + QA t-1028 §6 #2 |
 | manage | `manage/SkillsPanel.tsx`(+test)、`manage/ProjectSkillOverlay.tsx`(+test)、`manage/SkillOptPanel.tsx`、`manage/CronPanel.tsx`、`manage/IdentityManual.tsx`、`settings/ConnectorsTab.tsx`（manage 连接器页复用的二维码链接） | manage#1 #2 #3 #4 |
-| market | `marketplace/ReviewPanel.tsx`(+test)、`marketplace/PublishPanel.tsx`(+test) | market#1 #2 + 计划外 1 条 |
+| market | `marketplace/ReviewPanel.tsx`(+test)、`marketplace/PublishPanel.tsx`(+test)、`marketplace/BrowsePanel.tsx`(+test) | market#1 #2 + 计划外 1 条 + QA t-1028 §6 #1 |
 | sidebar | `github/RepoPill.tsx`(+test)、`github/RepoStatusBanner.tsx`、`Sidebar.tsx` | sidebar#1 #2 #4 |
 
 ## 2. 方法与证据
@@ -57,6 +57,13 @@
 |---|---|---|
 | `marketplace/PublishPanel.tsx` SubmitBar「还差 N 项必填 · 查看」的「查看」钮 | 复扫 market-publish-list-mobile 见 22×15.9px（K-21 折叠播报在 t-762 扫描之后才合入，故清单里没有） | 触控档 `min-h-11 px-2` + `inline-flex items-center`，桌面零变化 |
 
+### 接 QA t-1028 §6（指挥官转来的 2 条 P3 a11y nit，纳入本条一并处置）
+
+| # | 位置 | 现象（QA） | 处置 | 验证 |
+|---|---|---|---|---|
+| QA#1 | `marketplace/BrowsePanel.tsx` 分类片容器 `<section aria-label="市场分类">` | `tabIndex={0}` 原为移动端横滚区可键盘聚焦 / 方向键滚动而设；K-12 后 `sm` 起换行不滚，桌面端成了一个什么都不做的 Tab 停靠点 | 已修：本地 `useNarrowViewport()`（`useSyncExternalStore` + `matchMedia("(max-width: 639px)")`，写法照 `hooks/useMdViewport.ts`，断点与 className 里的 `sm:overflow-x-visible` 一致），`tabIndex={narrow ? 0 : undefined}`；窄屏仍可聚焦滚动，桌面不再多一拍 Tab | BrowsePanel.test：桌面（jsdom 桩恒不匹配）无 `tabindex`；新增用例桩 `(max-width: 639px)` 匹配 → `tabindex="0"` |
+| QA#2 | `SettingsCenter.tsx` 关于页「检查更新」的 `<output aria-live="polite">` | 只在有消息时才挂载，首次点击时 live region 与文字同帧出现，NVDA / VoiceOver 可能吞掉第一句播报 | 已修：`<output>` 常驻渲染（无消息时为空），只切文本 | SettingsCenter.test：点击前 `about-update-status` 已在 DOM 且为空、`aria-live=polite`；点击后仍是同一节点、文本切为「已是最新版本」 |
+
 ## 4. 复扫残留（均不在本条范围，逐项归属）
 
 after 扫描 40 场景仍列出的问题，全部核对过来源：
@@ -72,7 +79,7 @@ after 扫描 40 场景仍列出的问题，全部核对过来源：
 |---|---|---|
 | 类型检查 | `npm run typecheck --workspace packages/web-react` | 绿（接手时 ProjectSkillOverlay.test 漏 import `expectAriaControlsResolvable` 报 2 处 TS2304，已补） |
 | 改动文件单测 | `npx vitest run` ProjectSkillOverlay / SkillsPanel / PublishPanel / ReviewPanel（4 文件 52 例）+ QqBindingCard / MembersTab / RepoPill（3 文件 11 例） | 全绿；新增 3 个用例、4 处断言 |
-| 模块单测 | `npx vitest run src/components/{settings,org,manage,marketplace,github,sidebar} + Sidebar/SettingsCenter/OrgCenter/ManageCenter/MarketplaceCenter.test.tsx --maxWorkers=2` | 45 文件 / 613 例全绿，152s（`.audit-tmp\a11y-mod-a\vitest-modules.log`） |
+| 模块单测 | `npx vitest run src/components/{settings,org,manage,marketplace,github,sidebar} + Sidebar/SettingsCenter/OrgCenter/ManageCenter/MarketplaceCenter.test.tsx --maxWorkers=2` | 45 文件 / 613 例全绿，152s（`.audit-tmp\a11y-mod-a\vitest-modules.log`）；接 QA §6 两条后 BrowsePanel / SettingsCenter 2 文件 43 例复跑全绿（+1 用例 +3 断言），typecheck 绿，biome lint 与基线一致 |
 | 代码风格 | `npx biome lint --max-diagnostics=500 <改动文件>` 与主克隆同 HEAD 对比 | 诊断集合完全一致（15 = 15），0 新增；`format` 差异为全仓既有（CRLF / 引号风格），基线同样报出 |
 | 截图 | 28 场景 before / after 各 90 张 | 0 失败；关键对照：`sidebar-repo-banner--desktop--light`（owner/分支实色）、`market-review-reject--desktop--light`（常驻标签「拒绝原因 *」+ 说明）、`manage-skills-mobile--mobile--light`（「+1」命中区变宽）、`settings-full-api-access--desktop--dark`（停用行不再整体发灰、徽章走 Badge） |
 | CDP 复扫 | `scan.mjs` 40 场景 | `ax` 无名控件 0 / 0 场景；`aria-ref-dangling` 0；Tab 走查 0 逃逸 0 缺焦点环；本条列出的 target<44 / contrast 条目全部消失（详见 §3 证据列） |
@@ -81,6 +88,6 @@ after 扫描 40 场景仍列出的问题，全部核对过来源：
 
 ## 6. 遗留与交棒
 
-- 本条 14 项 + 计划外 1 项全部关闭，无遗留。
+- 本条 14 项 + 计划外 1 项 + QA t-1028 §6 转来 2 项全部关闭，无遗留。
 - §4 中 shell 归属项已由 a11y-shell（t-893）在 `feat/v5-selfhost-audit-a11y-shell` 处理（shell#1/#6/#7/#8/#9/#10/#11 已见提交），shell#3 / #4 以其交付为准；合入后建议对 `sidebar-repo-banner`、`settings-full-api-access`、`org-center-members` 三个场景复扫一次确认 Badge / RepoStatusBanner 的 4.3–4.5 归零。
 - `usePrompt`（`components/ui`）本身仍无法给输入框命名——若 shell 侧日后给它加 `label` 参数，ReviewPanel 的 `useRejectReasonPrompt` 可删掉换回。
