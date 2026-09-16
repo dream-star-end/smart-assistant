@@ -595,7 +595,7 @@ node browser-tests\ui-preview\shoot.mjs
 | TU-14 | P3 | ✅ | 删 `CaseSidebar` / `media` / 永不触发分支；`TUTORIAL_SCENARIO_PATHS` 在快速上手底部渲染为 5 张「按场景学习」卡（每卡 4 个章节按钮，已读打勾） | `TutorialCenter.test`「快速上手底部兑现 5 条按场景学习路径」 | `e722bdf5f` |
 | TU-15 | P3 | ✅ | `CaseGallery` 加分类 chip（`fieldset[aria-label=案例分类]`）+ 搜索框 + 「N / 12 条」计数；`tutorialCaseMatches` 接线；空态 `<output>` | `TutorialCenter.test`「案例脚本总览可按分类与关键词筛选」 | `e722bdf5f` |
 | TU-16 | P3 | ✅ | `ArtifactPreview` 顶栏「示意图 · 非本案例实际产物」胶囊；假终端三行改为流程示意（复现 → 定位 → 修复 → 回归）；`aria-label` 前缀「示意：」；标题「你会拿到这些成果」 | `TutorialCenter.test`（含「示意图 · 非本案例实际产物」、`img[name^=示意：]`） | `e722bdf5f` |
-| TU-17 | P3 | ⏸ | 需 shell `useAppRoute` 加 `view=` / `work=`；本模块受控 props 未先做（TU-02 已把 state 提到 `TutorialCenter`，接线成本已降到一层 props），见 §8 / §9 | — | — |
+| TU-17 | P3 | ✅ | **遗留清扫 t-1235 落地（§10）**：`?panel=help&tab=start\|cases`、`&work=planet\|gravity`、`&topic=…&step=N` 三个参数进 URL 并可反灌；`TutorialCenter` 增受控 `browseView` / `signatureWorkId` / `stepIndex` props，App 两处挂载接线；目标步骤滚到顶并落焦点 | `useAppRoute.test`（tab / work / step 解析与往返 4 例）、`TutorialCenter.test`（受控页签 / 作品、step 聚焦与越界 2 例） | §10 |
 | TU-18 | P3 | ✅ | `FeatureSidebar` 目录 `nav` 加 ref，`activeId` 变化时用容器 `scrollTop` 把当前行滚进可见区（不 `scrollIntoView`）；筛选后当前项不在列表时顶部「正在看：xx（不在当前筛选内）」 | jsdom 无布局，提示行走 TU-04 用例路径 | `e722bdf5f` |
 | TU-19 | P3 | ◐ | 快速上手步骤按 `tutorialIsRead` 打勾（绿底 ✓）；侧栏「全部功能」右侧「已读 n/26」。**未改**「停留 0.9s 即已读」的判定（涉及老用户已读数据口径，留待产品定） | 视觉 | `e722bdf5f` |
 | TU-20 | P3 | ◐ | `SnapshotTutorialDetail` 分享链接复制加 `try/catch`，失败走 `useToast` error；`SignatureDetail` / `ShowcaseDetail` 既有失败文案保留。**未**抽成统一 hook | — | `d6eb6ef35` |
@@ -612,7 +612,7 @@ node browser-tests\ui-preview\shoot.mjs
 | TU-31 | P3 | ✅ | 第 4 步 `topicId` → `session-goal`，正文改「方向不对就暂停，改一改目标再继续」（拍板②） | `tutorialJourneys.test`「主线每一步指向不同章节」 | `e722bdf5f` |
 | TU-32 | P3 | ◐ | `TutorialActionContext.taskboardEnabled?`；显式 `false` 时任务面板 CTA `enabled:false` +「当前部署未开启任务面板。」。App 侧 `taskboardEnabled: TASKBOARD_ENABLED` 一行交集成③（§9） | `tutorialSystem.test`「部署关掉任务面板时…」 | `36ba6e6f0` |
 | TU-33 | P3 | ✅ | 顶部搜索 `text-base md:text-body` | — | `e722bdf5f` |
-| TU-34 | P3 | ⏸ | 十余处品牌深蓝 `#07111f / #080e19 / #101624` 未换：改 `bg-fg` 会让 hero 在亮色下成纯黑、暗色下反转成浅底，与图稿 / 精选作品封面的深色调冲突；等 shell `--hero-bg` token（§9） | — | — |
+| TU-34 | P3 | ✅ | **遗留清扫 t-1235 落地（§10）**：新增 `components/tutorials/heroTheme.ts` 模块级 token（`--hero-bg / --hero-fg / --hero-line`，深蓝 / 薄荷 / 海军蓝三组，浅色保留品牌色、暗色抬亮一档 + 1px 描边），`TutorialCenter` ×3、`SignatureShowcases` ×5、`CaseShowroom` ×3、`CaseFieldReportVisual` ×1 共 12 处写死色值全部改走 `bg-(--hero-bg)` 等；`#f3f6ef` 衬底改 `bg-sidebar` | `TutorialCenter.test`「hero 表面走模块级 token」（`[data-tutorial-hero]` 无 `bg-[#…]`）+ 视觉（§10） | §10 |
 | TU-35 | P3 | ✅ | `ReadonlyTextArtifact` 空文本 → 「这份文本成果内容为空。」 | — | `d6eb6ef35` |
 | TU-36 | P3 | ⏸ | `.gitattributes` 归仓库根（集成② 已列入）；本工作树夹具此前已手工 LF 还原，`tutorialShowcase.test` 4/4 绿 | — | — |
 | TU-37 | P3 | ✅ | `scripts/check-v5-tutorials.ts` `collectMarkers`：`const rel = relative(ROOT, file).replaceAll("\\", "/")`（与同文件 `HISTORY_REPO_PATH` 同款；指挥官由集成待办 t-865 转来）。POSIX 上哈希输入不变，CI 无感 | 本机 `npm run check:tutorials` → `OK · 26 capabilities · 12 real-world cases · 26 media pairs`（此前 26 项全报「功能源 / 入口身份变化」） | 追加提交 |
@@ -661,9 +661,9 @@ after 对照（Read 逐张，`before/` ↔ `after/`）：
 
 | 项 | 归属 / 原因 | 建议 |
 |---|---|---|
-| TU-17 深链 `view=` / `work=` | shell `useAppRoute` + `App.tsx` | 本模块 state 已上提，shell 接 `?panel=help&view=&work=` 后本模块只需把 `browseView` / `signatureWorkId` 改受控（一层 props） |
+| ~~TU-17 深链 `view=` / `work=`~~ | ~~shell `useAppRoute` + `App.tsx`~~ | **已由 t-1235 落地**（参数名改 `tab=`，见 §10） |
 | TU-21 CTA 文案五种 + 字面量比较 | 产品口径 + `App.tsx:3117` 传参 | 统一「带着我的材料开始 / 登录后带着材料开始」并加 `requiresLogin` prop；需同批改 3 个组件用例与场景 |
-| TU-34 品牌深蓝 hero | shell token | `styles.css` 加 `--hero-bg / --hero-fg` 后一次替换 |
+| ~~TU-34 品牌深蓝 hero~~ | ~~shell token~~ | **已由 t-1235 落地**（模块级 token `heroTheme.ts`，见 §10；shell 日后收编只需把三个变量搬进 `@theme`） |
 | TU-19 已读判定 0.9s | 产品口径 | 改「停留 ≥ 8s 或滚到 60%」会让老用户已读勾号变少，先问再改 |
 | TU-20 统一复制 hook | 打磨 | 三处复制反馈已各有失败出口，统一 hook 收益小 |
 | TU-24 余量 | 打磨 | 卡片内容模型、焦点交接、跳到正文 |
@@ -674,6 +674,42 @@ after 对照（Read 逐张，`before/` ↔ `after/`）：
 | 对象 | 文件 | 改动 | 为什么 |
 |---|---|---|---|
 | shell | `App.tsx:1589-1600` `tutorialActionContext` | 加 `taskboardEnabled: TASKBOARD_ENABLED` 一行 | TU-32 本模块已支持，未接线前行为与现状一致（按开启处理） |
-| shell | `hooks/useAppRoute.ts`、`App.tsx` | `?panel=help` 增 `view=start\|cases`、`work=planet\|gravity` 并镜像 / 反灌 | TU-17 / TU-02 深链 |
-| shell | `styles.css` | （可选）`--hero-bg / --hero-fg` | TU-34 |
+| ~~shell~~ | ~~`hooks/useAppRoute.ts`、`App.tsx`~~ | ~~`?panel=help` 增 `view=start\|cases`、`work=planet\|gravity` 并镜像 / 反灌~~ → 已由 t-1235 以「必要的路由接线」落地（§10） | TU-17 / TU-02 深链 |
+| ~~shell~~ | ~~`styles.css`~~ | ~~（可选）`--hero-bg / --hero-fg`~~ → t-1235 改为模块级 token，不再需要 shell 改动（§10） | TU-34 |
 | 指挥官 | 仓库根 `.gitattributes` | 教程夹具 `-text` | TU-36 |
+
+## 10. 遗留清扫（t-1235 · fable-5-1-17 · 2026-09-17）
+
+- 分支 `feat/v5-selfhost-audit-leftover-tut`，基于 `feat/v5-selfhost-audit-tut-sync-2 @67b1494ea`（= 集成③ 终点 + t-1046）。
+- 范围：本模块自标「可后做」的 TU-17 与 TU-34 两项；只动 tutorials 自有文件 + 必要的路由接线（`hooks/useAppRoute.ts`、`App.tsx` 两处 `<TutorialCenter>` 挂载与 `useAppRoute` 调用），不碰 `AgentPicker` / `Composer` / `styles.css`。
+- `check:tutorials`：未改任何带 `data-product-feature` 的入口与教程正文，仍为 `OK · 26 capabilities · 12 cases · 26 media pairs`，不需要 accept。
+
+### 10.1 TU-17 教程深链 —— 已落地
+
+| 参数 | 含义 | 互斥 / 回退 |
+|---|---|---|
+| `?panel=help&tab=start` / `tab=cases` | 一级页签「快速上手」/「案例脚本」；案例展厅是默认态，不写参数 | 有 `topic` / `case` / `community` / `work` 时无效并从 URL 清掉；未知值当没有 |
+| `?panel=help&work=planet` / `work=gravity` | 精选作品详情（id 取自 `SIGNATURE_WORKS`） | 优先于 `tab`；有 `topic` / `case` / `community` 时无效；未知 id 回到展厅 |
+| `?panel=help&topic=<id>&step=N` | 功能教程「跟着做」第 N 步（1 起） | 只跟着 `topic`；非正整数 / 越界（找不到节点）回到正文顶部，不报错 |
+
+- **命名取舍**：审计原文写的是 `view=`，但 `?view=` 已被 `/board` 工作区占用，`withBoardParams` 在离开 board 时会把它清掉，两者不能共用；改名 `tab=`，并加用例锁定两者互不干扰。
+- **实现**：`useAppRoute.ts` 新增 `parseTutorialTab / parseTutorialWork / parseTutorialStep`，`withPanelParams` / `tutorialHref` 增第 6 个可选参数 `extras: { tab, work, step }`（旧调用方零改动），`onPopPanel` 多回一个 `extras`，镜像 effect 把三者一并 replaceState；`App.tsx` 增 `tutorialTab / tutorialWork / tutorialStep` 三个 state：boot 解析、登出保留公开深链、popstate 反灌、关闭 / 换篇 / 换案例时清理，两处 `<TutorialCenter>` 传受控 props；`TutorialCenter.tsx` 增 `browseView` / `onBrowseViewChange` / `signatureWorkId` / `onSignatureWorkChange` / `stepIndex`（不传退回内部 state，ui-preview 场景与既有 19 例不改）。
+- **步骤落点**：每步 `<li>` 带 `id="tutorial-step-N"` / `data-tutorial-step` / `tabIndex=-1` / `scroll-mt-4`，目标步骤 `aria-current="step"` + 浅色底；开场经 `onOpenAutoFocus` 直接把焦点放到该步（Radix 的自动聚焦在下一次提交才跑，同步 focus 会被盖掉，故开场与后续换 step 分两路处理），滚动仍在 `main.tutorial-detail` 容器内。
+- **验证**：`useAppRoute.test` +4 例（tab / work / step 解析、往返、互斥、与 board `view=` 不打架）；`TutorialCenter.test` +2 例（受控页签 / 作品回调；`stepIndex=3` 聚焦 + `aria-current`，`stepIndex=42` 不标记不抛错）；`App.test.tsx` 既有用例回归绿。桌面 / 移动共用同一套 DOM 与焦点逻辑，无视口分叉。
+
+### 10.2 TU-34 hero 品牌深蓝 —— 已落地（模块级 token）
+
+- 设计系统里没有等价色，`bg-fg` 会反转；shell 侧加 `@theme` token 需要跨模块改 `styles.css`（a11y-shell 刚改过同一文件）。折中：新增 `components/tutorials/heroTheme.ts`，用 Tailwind v4 任意属性把 `--hero-bg / --hero-fg / --hero-line` 声明在 hero 容器上，消费方只写 `bg-(--hero-bg)` / `from-(--hero-bg)` / `text-(--hero-fg)`。值只在这一个文件出现：深蓝 `#07111f`（暗色 `#141d33`）、薄荷 `#102b29`（暗色 `#17403c`）、海军蓝 `#152442`（暗色 `#1d3160`），暗色统一 1px `--hero-line` 描边。shell 日后若要收编，把三个变量搬进 `styles.css @theme`、删掉 `[--hero-*:…]` 即可，消费方一行不改。
+- 替换点（12 处）：`TutorialCenter.tsx` 案例脚本 hero / 案例详情 CTA / 成果示意图；`SignatureShowcases.tsx` 作品卡底 + 左侧渐变遮罩 + 封面兜底 + 详情 iframe 底 + 白按钮文字（`text-[#101820]` → `text-(--hero-bg)`）；`CaseShowroom.tsx` 薄荷 / 海军蓝结果封面 + 角标 + 截图衬底（`#f3f6ef` → `bg-sidebar`）；`CaseFieldReportVisual.tsx` 图稿底。`CaseArtwork.tsx` 的 SVG 插画调色板是图稿内容不是 UI 表面，按 TU-34 原清单不动。
+- **视觉**：`.audit-tmp\leftover-tut\{before,after}\` 各 108 张（27 场景 × desktop/mobile × light/dark，0 失败）。浅色 hero 与 before 肉眼一致（品牌深蓝保留）；暗色 `tutorials-case-gallery--desktop--dark` / `tutorials-showroom--desktop--dark` / `tutorials-signature-detail--*--dark` 里 hero 卡从页面底色中分出边界（此前几乎同色）。108 张里 60 张与 before 字节相同、48 张不同：含 hero 表面的 7 个场景（showroom / signature-detail / showcase-detail / case-gallery / case-detail(-artifacts / -replay)）是本项改动；其余 `tutorials-feature-*` / `help-menu-open` 的差异来自内嵌演示视频抓帧时刻不同（画面里的光标位置），逐张对照非 UI 改动。
+
+### 10.3 验证汇总
+
+| 项 | 结果 |
+|---|---|
+| typecheck / typecheck:preview | 绿 / 绿 |
+| check:tutorials | OK（未触发漂移） |
+| vitest | App / useAppRoute / TutorialCenter / components/tutorials / lib/tutorial* 共 11 文件 132 例全绿（新增 6 例） |
+| biome lint | 改动 8 文件 + 新增 1 文件诊断集合与基线一致，0 新增 |
+| 截图 | before / after 各 108 张，0 失败，逐张对照见 §10.2 |
+| NOT RUN | `npm test` 全量、`test:browser`（未碰高频交互面；深链焦点逻辑以 jsdom 用例 + 真 Chromium 截图台覆盖）、真机 |
