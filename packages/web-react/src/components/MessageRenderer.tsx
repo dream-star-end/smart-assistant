@@ -1255,11 +1255,31 @@ export function MessageList({
     bumpFindGeneration();
     setFindCursor(0);
   }, [sessionId, bumpFindGeneration]);
+  // 查找条关闭后焦点归位(a11y-B messages#1):查找条是自研路径,不像 Radix 弹层自带 returnFocus,
+  // Esc / 关闭后 Input 直接卸载,焦点掉到 <body>,键盘用户得从页首 Tab 重来。
+  // 在「即将挂载」的这一次渲染里记下焦点来处(Input 的 autoFocus 会在提交阶段抢焦点,useEffect 里已经晚了),
+  // 关闭时若焦点确实掉到了 body,再还回去。
+  const findReturnFocusRef = useRef<HTMLElement | null>(null);
+  const prevFindRef = useRef(find);
+  if (!prevFindRef.current && find && typeof document !== "undefined") {
+    const active = document.activeElement;
+    findReturnFocusRef.current =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+  prevFindRef.current = find;
   useEffect(() => {
     if (!find) {
       bumpFindGeneration();
       setFindQuery("");
       setFindCursor(0);
+      const target = findReturnFocusRef.current;
+      findReturnFocusRef.current = null;
+      if (
+        target?.isConnected &&
+        (document.activeElement === null || document.activeElement === document.body)
+      ) {
+        target.focus({ preventScroll: true });
+      }
     }
   }, [find, bumpFindGeneration]);
   useEffect(() => {

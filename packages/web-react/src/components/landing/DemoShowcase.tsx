@@ -258,7 +258,8 @@ export function DemoShowcase({
                 onClick={() => play(i)}
                 aria-pressed={active}
                 className={cn(
-                  "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-body font-medium transition-colors",
+                  // 触屏 44px 命中(a11y-B landing#2);桌面 34px 胶囊不变。
+                  "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-body font-medium transition-colors [@media(hover:none)]:min-h-11",
                   active
                     ? "border-accent bg-accent-soft text-accent"
                     : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
@@ -426,7 +427,7 @@ export function DemoShowcase({
           <button
             type="button"
             onClick={onTry}
-            className="rounded-full bg-primary px-3.5 py-1.5 text-body font-medium text-primary-fg transition-opacity hover:opacity-90"
+            className="rounded-full bg-primary px-3.5 py-1.5 text-body font-medium text-primary-fg transition-opacity hover:opacity-90 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-4"
           >
             免费试一句
           </button>

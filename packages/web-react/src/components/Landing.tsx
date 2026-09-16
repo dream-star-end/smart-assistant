@@ -20,7 +20,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Theme } from '../hooks/useTheme'
 import { AGENTS } from '../lib/agents'
 import { api } from '../lib/api'
@@ -298,6 +298,10 @@ function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
   )
 }
 
+/** 页脚文字链接:桌面 18.8px 行高照旧,触屏撑到 44px 命中(a11y-B landing#2)。 */
+const FOOTER_LINK_CLS =
+  'text-[#8b9086] hover:text-white [@media(hover:none)]:flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center'
+
 export function Landing(props: {
   onStart: () => void
   onLogin: () => void
@@ -308,13 +312,17 @@ export function Landing(props: {
   const { onStart, onLogin, onCreateOrg, theme, onCycleTheme } = props
   // 窄屏(<md)顶部导航折叠成菜单;点任一锚点 / 按 Esc 收起。桌面端零变化。
   const [menuOpen, setMenuOpen] = useState(false)
+  // Esc 收起折叠导航时把焦点还给菜单按钮(a11y-B landing#1):<nav> 直接卸载,焦点在菜单链接上会掉到 body。
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
   const icp = filedIcp(BRAND.icp)
   const contactEmail = brandContactEmail()
 
   useEffect(() => {
     if (!menuOpen) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenuOpen(false)
+      if (e.key !== 'Escape') return
+      setMenuOpen(false)
+      menuButtonRef.current?.focus()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -353,9 +361,10 @@ export function Landing(props: {
               免费开始
             </Button>
             <IconButton
+              ref={menuButtonRef}
               aria-label={menuOpen ? '收起导航' : '打开导航'}
               aria-expanded={menuOpen}
-              aria-controls="landing-mobile-nav"
+              aria-controls={menuOpen ? 'landing-mobile-nav' : undefined}
               onClick={() => setMenuOpen((open) => !open)}
               className="text-[#b7bbb2] hover:bg-white/8 hover:text-white md:hidden"
             >
@@ -692,7 +701,7 @@ export function Landing(props: {
               <div className="divide-y divide-white/8 border-y border-white/8">
                 {FAQS.map((faq) => (
                   <details key={faq.q} className="group py-5 open:pb-6">
-                    <summary className="flex cursor-pointer list-none items-center justify-between gap-5 text-[15px] font-medium text-[#e7e7e0] outline-none focus-visible:ring-2 focus-visible:ring-[#c7ff64]">
+                    <summary className="flex cursor-pointer list-none items-center justify-between gap-5 text-[15px] font-medium text-[#e7e7e0] outline-none focus-visible:ring-2 focus-visible:ring-[#c7ff64] [@media(hover:none)]:min-h-11">
                       {faq.q}
                       <span className="grid size-7 shrink-0 place-items-center rounded-full border border-white/10 text-[#8f948a] transition-transform group-open:rotate-45">
                         +
@@ -739,29 +748,30 @@ export function Landing(props: {
               <Logo compact />
               <p className="mt-4 max-w-sm text-[13px] leading-6 text-[#8b9086]">{BRAND.intro}</p>
             </div>
+            {/* 页脚链接触屏撑到 44px(a11y-B landing#2):列间距在 hover:none 下收掉,行高由链接自己撑。 */}
             <div className="flex flex-wrap gap-x-12 gap-y-5 text-[12.5px]">
-              <div className="flex flex-col gap-2.5">
+              <div className="flex flex-col gap-2.5 [@media(hover:none)]:gap-0">
                 <span className="font-medium text-[#d8d9d2]">产品</span>
-                <a href="#demo" className="text-[#8b9086] hover:text-white">
+                <a href="#demo" className={FOOTER_LINK_CLS}>
                   产品演示
                 </a>
-                <a href="#capabilities" className="text-[#8b9086] hover:text-white">
+                <a href="#capabilities" className={FOOTER_LINK_CLS}>
                   核心能力
                 </a>
-                <a href="#enterprise" className="text-[#8b9086] hover:text-white">
+                <a href="#enterprise" className={FOOTER_LINK_CLS}>
                   团队版
                 </a>
               </div>
-              <div className="flex flex-col gap-2.5">
+              <div className="flex flex-col gap-2.5 [@media(hover:none)]:gap-0">
                 <span className="font-medium text-[#d8d9d2]">条款</span>
-                <a href="/terms" className="text-[#8b9086] hover:text-white">
+                <a href="/terms" className={FOOTER_LINK_CLS}>
                   用户协议
                 </a>
-                <a href="/privacy" className="text-[#8b9086] hover:text-white">
+                <a href="/privacy" className={FOOTER_LINK_CLS}>
                   隐私政策
                 </a>
                 {contactEmail && (
-                  <a href={`mailto:${contactEmail}`} className="text-[#8b9086] hover:text-white">
+                  <a href={`mailto:${contactEmail}`} className={FOOTER_LINK_CLS}>
                     联系合作
                   </a>
                 )}
@@ -778,7 +788,7 @@ export function Landing(props: {
                 href="https://beian.miit.gov.cn/"
                 target="_blank"
                 rel="noreferrer"
-                className="hover:text-white"
+                className="hover:text-white [@media(hover:none)]:flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center"
               >
                 {icp}
               </a>

@@ -508,7 +508,8 @@ export function Composer({
           aria-label={`会话目标：${visibleGoal.objective}`}
           title={visibleGoal.objective}
           onClick={() => setGoalOpen(true)}
-          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg hover:bg-hover"
+          // 触屏 44px 命中(a11y-B composer#3);桌面 28px 胶囊不变。
+          className="mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg hover:bg-hover [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5"
         >
           <Target
             size={13}
