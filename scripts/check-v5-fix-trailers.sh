@@ -148,6 +148,14 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
     violations=$((violations + 1)); continue
   fi
 
+  # exact immutable trailer mapping — keep byte-aligned with
+  # normalizeImmutableIncidentTrailer in check-v5-incident-regressions.ts
+  if [[ "$sha" == "f496228de43718852cebda8fb9f35eb0e9c3a9c0" && "$trailer" == "OCV5-171 follow-up" ]]; then
+    trailer="INC-20260908-CC-SWITCH-ASCII-NAME"
+  elif [[ "$sha" == "7b2ae241d6445042fb196cfc1ca03c063aab2fb8" && "$trailer" == "OCV5-220 in-flight consult card showed missing-field copy as" ]]; then
+    trailer="INC-20260915-ADVISOR-CONSULT-CARD"
+  fi
+
   if [[ "$trailer" =~ ^none([^A-Za-z0-9]|$) ]]; then
     w="$(waiver_for "$sha8")"
     if [[ -z "$w" ]]; then

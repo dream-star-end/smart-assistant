@@ -156,6 +156,7 @@ import {
 import {
   type CollabMode,
   type CollabUiState,
+  ADVISOR_PARENT_BLOCK_REASON,
   EMPTY_COLLAB_UI,
   advisorParentCapabilityAllowed,
   collaborationPutBody,
@@ -900,9 +901,7 @@ export function App() {
           advisorConsultAllowed: collabUi.advisorConsultAllowed,
         })
       ) {
-        const msg =
-          collabUi.advisorConsultParentReason ||
-          "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
+        const msg = collabUi.advisorConsultParentReason || ADVISOR_PARENT_BLOCK_REASON;
         setCollabSaveError(msg);
         toast(msg, "error");
         return;

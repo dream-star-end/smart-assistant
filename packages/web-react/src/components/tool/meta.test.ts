@@ -145,6 +145,15 @@ describe("toolSummary 摘要 (P5)", () => {
       toolSummary("mcp__openclaude-memory__delegate_wait", { jobId: "dlgjob-abc" }),
     ).toBe("dlgjob-abc");
   });
+  test("MCP memory consult_advisor 摘要用提问，不露蛇形工具名", () => {
+    expect(
+      toolSummary("mcp__openclaude-memory__consult_advisor", {
+        question: "这个方案的事务边界对吗",
+      }),
+    ).toBe("这个方案的事务边界对吗");
+    expect(toolSummary("mcp__openclaude-memory__consult_advisor", {})).toBe("");
+    expect(toolSummary("mcp__openclaude-memory__consult_advisor", {})).not.toBe("consult_advisor");
+  });
   test("MCP memory skill_search / web-context 摘要", () => {
     expect(
       toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" }),

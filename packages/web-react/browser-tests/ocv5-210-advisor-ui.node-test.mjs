@@ -19,7 +19,7 @@ async function openHarness(page, port, js) {
 
 async function chooseAdvisor(page) {
   await page.getByTestId('open-picker').click()
-  await page.getByRole('button', { name: /主模型不切换/ }).click()
+  await page.getByRole('button', { name: /主模型不变/ }).click()
   await page.waitForFunction(
     () => document.querySelector('[data-testid="config-version"]')?.textContent === 'v1:advisor:gpt-6-astra',
     null,
@@ -171,7 +171,7 @@ test('ocv5-210-advisor-ui: PUT 409 rereads and does not swallow', async () => {
     const page = await browser.newPage()
     await openHarness(page, port, js)
     await page.getByTestId('open-picker').click()
-    await page.getByRole('button', { name: /主模型不切换/ }).click()
+    await page.getByRole('button', { name: /主模型不变/ }).click()
     await page.getByTestId('blocked').waitFor()
     assert.match(await page.getByTestId('blocked').innerText(), /配置已被更新/)
   } finally {

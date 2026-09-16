@@ -279,6 +279,7 @@ import {
   ADVISOR_CONSULT_PARENT_ENGINES,
   ADVISOR_CONSULT_PARENT_REASON,
   advisorConsultParentGate,
+  advisorCanonicalModelId,
   assertAdvisorModelAllowed,
   CCB_ADVISOR_PROFILE_VERSION,
   coerceHistoryMessages,
@@ -13575,8 +13576,15 @@ export class Gateway {
         return this.sendJson(res, 200, {
           rev: doc.rev,
           defaultMode: doc.defaultMode,
-          defaultAdvisorModel: doc.defaultAdvisorModel,
-          session: resolved,
+          defaultAdvisorModel: doc.defaultAdvisorModel
+            ? advisorCanonicalModelId(doc.defaultAdvisorModel)
+            : doc.defaultAdvisorModel,
+          session: {
+            ...resolved,
+            advisorModel: resolved.advisorModel
+              ? advisorCanonicalModelId(resolved.advisorModel)
+              : resolved.advisorModel,
+          },
           advisorModels: listed.advisorModels,
           ...this._collaborationCapabilityFields({ sessionId, engine: parentEngine }),
           ...(listed.advisorUnavailableReason
@@ -13613,7 +13621,7 @@ export class Gateway {
     ) {
       return this.sendError(res, 400, 'advisorModel required')
     }
-    const advisorModel =
+    let advisorModel =
       parsed.mode === 'advisor' && typeof parsed.advisorModel === 'string'
         ? parsed.advisorModel.trim()
         : null
@@ -13642,6 +13650,7 @@ export class Gateway {
         const status = listed.advisorUnavailableReason?.startsWith('catalog unavailable') ? 503 : 400
         return this.sendError(res, status, allowed.error)
       }
+      advisorModel = allowed.model
     }
     const expectedRev =
       typeof parsed.expectedRev === 'number' && Number.isInteger(parsed.expectedRev)
@@ -13656,11 +13665,19 @@ export class Gateway {
         expectedRev,
       })
       const listed = await catalogOptions()
+      const resolved = resolveSessionCollab(next, sessionId)
       return this.sendJson(res, 200, {
         rev: next.rev,
         defaultMode: next.defaultMode,
-        defaultAdvisorModel: next.defaultAdvisorModel,
-        session: resolveSessionCollab(next, sessionId),
+        defaultAdvisorModel: next.defaultAdvisorModel
+          ? advisorCanonicalModelId(next.defaultAdvisorModel)
+          : next.defaultAdvisorModel,
+        session: {
+          ...resolved,
+          advisorModel: resolved.advisorModel
+            ? advisorCanonicalModelId(resolved.advisorModel)
+            : resolved.advisorModel,
+        },
         ...this._collaborationCapabilityFields({ sessionId, engine: parentEngine }),
         advisorModels: listed.advisorModels,
         ...(listed.advisorUnavailableReason

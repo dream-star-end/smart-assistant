@@ -7,6 +7,7 @@ import { symlinkSync } from 'node:fs'
 
 import {
   ADVISOR_PREAMBLE,
+  advisorCanonicalModelId,
   assertAdvisorModelAllowed,
   coerceHistoryMessages,
   isAdvisorConsultParentEngine,
@@ -329,6 +330,39 @@ describe('advisorMode snapshot', () => {
     })
     assert.equal(closed.ok, false)
     if (!closed.ok) assert.match(closed.error, /catalog unavailable/)
+  })
+
+  it('listProvenAdvisorModels hides Codex 1M twins and keeps the standard id', () => {
+    const catalog = [
+      { modelId: 'gpt-6-astra', displayName: 'GPT-6-Astra', engine: 'codex', available: true },
+      { modelId: 'gpt-6-astra-1m', displayName: 'GPT-6-Astra', engine: 'codex', available: true },
+      { modelId: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', engine: 'codex', available: true },
+      { modelId: 'gpt-5.6-sol-1m', displayName: 'GPT-5.6-Sol', engine: 'codex', available: true },
+      { modelId: 'qwen3.8-max', displayName: 'Qwen3.8 Max', engine: 'codex', available: true },
+    ]
+    const open = listProvenAdvisorModels({ catalog, provenEngines: ['codex'] })
+    assert.deepEqual(
+      open.advisorModels.map((row) => row.id),
+      ['gpt-6-astra', 'gpt-5.6-sol', 'qwen3.8-max'],
+    )
+  })
+
+  it('listProvenAdvisorModels drops a 1M twin even when the standard id is absent', () => {
+    const catalog = [
+      { modelId: 'gpt-6-astra-1m', displayName: 'GPT-6-Astra', engine: 'codex', available: true },
+    ]
+    const open = listProvenAdvisorModels({ catalog, provenEngines: ['codex'] })
+    assert.deepEqual(open.advisorModels, [])
+    assert.match(open.advisorUnavailableReason ?? '', /没有已证明引擎的可用顾问型号/)
+  })
+
+  it('assertAdvisorModelAllowed canonicalizes Codex 1M twins onto the standard id', () => {
+    assert.equal(advisorCanonicalModelId('gpt-6-astra-1m'), 'gpt-6-astra')
+    assert.equal(advisorCanonicalModelId('gpt-6-astra'), 'gpt-6-astra')
+    const listed = [{ id: 'gpt-6-astra', label: 'GPT-6-Astra', engine: 'codex' }]
+    const allowed = assertAdvisorModelAllowed({ requested: 'gpt-6-astra-1m', advisorModels: listed })
+    assert.equal(allowed.ok, true)
+    if (allowed.ok) assert.equal(allowed.model, 'gpt-6-astra')
   })
 
   it('listProvenAdvisorModels stays empty until an engine is proven', () => {

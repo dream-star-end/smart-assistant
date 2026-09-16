@@ -389,6 +389,34 @@ export function asStr(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
+/** 工具卡耗时：毫秒 → 人话。无效值返回 null。 */
+export function formatToolDuration(ms: number | null | undefined): string | null {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return null;
+  const sec = Math.round(ms / 1000);
+  if (sec < 1) return "不到 1 秒";
+  if (sec < 60) return `${sec} 秒`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return s ? `${m} 分 ${s} 秒` : `${m} 分`;
+}
+
+/** 顾问咨询持久状态 → 人话。未知值原样返回（避免吞掉新状态）。 */
+export function advisorConsultStatusLabel(status: string): string {
+  const key = status.trim().toLowerCase();
+  if (!key) return "";
+  if (key === "settled" || key === "completed" || key === "success") return "已完成";
+  if (key === "failed" || key === "error") return "失败";
+  if (key === "running" || key === "pending" || key === "admitted") return "进行中";
+  if (key === "cancelled" || key === "canceled") return "已取消";
+  // 审计 T-27 曾单独映射的超时态,并进同一张表(发布预演 t-1279 合并)。
+  if (key === "timeout" || key === "timed_out") return "超时";
+  return status;
+}
+
+export function isToolInFlight(tool: ToolLike): boolean {
+  return tool._completed !== true && !tool.error && !tool.cancelled;
+}
+
 /** 安全数组取值（非数组 → []）。*/
 export function asArr(v: unknown): unknown[] {
   return Array.isArray(v) ? v : [];

@@ -52,6 +52,14 @@ export const EMPTY_COLLAB_UI: CollabUiState = {
   advisorConsultParents: [],
 };
 
+/** 父引擎不支持顾问时的默认说明。服务端若返回 advisorConsultParentReason 则优先生效。 */
+export const ADVISOR_PARENT_BLOCK_REASON =
+  "当前模型不能向顾问提问。把顶栏模型换成 GLM 或 MiniMax 后再试。主模型不会被换成别的。";
+
+export const ADVISOR_ENABLED_HINT = "主模型不变，只多一个出主意的顾问";
+
+export const ADVISOR_UNAVAILABLE_REASON = "暂时没有可用的顾问型号，不会自动改成别的。";
+
 export function isCollabMode(value: unknown): value is CollabMode {
   return value === "solo" || value === "advisor" || value === "team";
 }
@@ -148,9 +156,7 @@ export function sendCollabFields(input: {
   if (mode !== "advisor") {
     return { teamMode: mode === "team", collabMode: mode };
   }
-  const parentReason =
-    input.advisorConsultParentReason ||
-    "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
+  const parentReason = input.advisorConsultParentReason || ADVISOR_PARENT_BLOCK_REASON;
   if (
     !advisorParentCapabilityAllowed({
       parentEngine: input.parentEngine,
