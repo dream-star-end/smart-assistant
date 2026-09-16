@@ -21,7 +21,8 @@ import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
-import { clearDraft } from "../lib/composerDraft";
+import { BRAND } from "../lib/brand";
+import { clearDraft, draftExceedsStorage } from "../lib/composerDraft";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -103,6 +104,8 @@ function clipboardImages(data: DataTransfer): File[] {
 
 /** 时间假进度的预期时长;超过后不再假装「快好了」,切成不确定态(C-09)。 */
 export const ENV_PREP_EXPECTED_MS = 20_000;
+/** 语音错误提示的常驻时长(C-19):3s 来不及读完,改 6s 且下一次点麦克风即清除。 */
+export const VOICE_MSG_TTL_MS = 6_000;
 
 function EnvironmentPrepBar() {
   const [pct, setPct] = useState(8);
@@ -152,7 +155,8 @@ export function Composer({
   onStop,
   disabled,
   banner,
-  placeholder = "给从简发消息…",
+  // 品牌名取 lib/brand 单一权威,不写死(M-16)。
+  placeholder = `给${BRAND.name}发消息…`,
   onUpload,
   getVoiceToken,
   prefill,
@@ -241,6 +245,10 @@ export function Composer({
     setAttach({ key: draftKey, items });
   }
   const attachments = attach.items;
+  // 附件件数的同步镜像(C-22):onFiles 若读渲染闭包里的 attachments.length,同一帧内连续两次拖放
+  // 会用同一个旧值算 room,合计可超 MAX_ATTACH(后端才拒)。每次渲染回写真值,onFiles 内就地累加。
+  const attachCountRef = useRef(attachments.length);
+  attachCountRef.current = attachments.length;
   const setAttachments = (next: SetStateAction<OwnedAttach[]>) => {
     setAttach((curr) => {
       const items = typeof next === "function" ? next(curr.items) : next;
@@ -323,12 +331,43 @@ export function Composer({
     // 回填后聚焦输入框
     setTimeout(() => ref.current?.focus(), 0);
   }, []);
+  // 语音错误此前 3s 就消失、且不走 live region,读屏听不到、肉眼也来不及读完(C-19):
+  // 改为 6s 或下一次点麦克风时清除,并在底部以 role=status 播报。
+  const voiceMsgTimerRef = useRef<number | null>(null);
   const onVoiceErr = useCallback((m: string) => {
     setVoiceMsg(m);
-    setTimeout(() => setVoiceMsg(null), 3000);
+    if (voiceMsgTimerRef.current !== null) window.clearTimeout(voiceMsgTimerRef.current);
+    voiceMsgTimerRef.current = window.setTimeout(() => {
+      voiceMsgTimerRef.current = null;
+      setVoiceMsg(null);
+    }, VOICE_MSG_TTL_MS);
   }, []);
+  useEffect(
+    () => () => {
+      if (voiceMsgTimerRef.current !== null) window.clearTimeout(voiceMsgTimerRef.current);
+    },
+    [],
+  );
   const voice = useVoiceInput({ getToken: getVoiceToken, onText: onVoiceText, onError: onVoiceErr });
   const voiceEnabled = voice.supported && !!getVoiceToken;
+  // 不可用原因要说得出来(C-20):触屏没有 hover title,灰掉的麦克风等于没解释。
+  const voiceUnavailableReason = !voice.supported
+    ? "当前浏览器不支持语音输入，请用 HTTPS 打开并允许使用麦克风"
+    : !getVoiceToken
+      ? "语音输入需登录后在正式会话中使用"
+      : null;
+  const onVoiceClick = () => {
+    if (voiceUnavailableReason) {
+      toast(voiceUnavailableReason, "info");
+      return;
+    }
+    if (voiceMsgTimerRef.current !== null) {
+      window.clearTimeout(voiceMsgTimerRef.current);
+      voiceMsgTimerRef.current = null;
+    }
+    setVoiceMsg(null);
+    voice.toggle();
+  };
 
   useEffect(() => {
     const el = ref.current;
@@ -344,6 +383,8 @@ export function Composer({
     .map((a) => a.media as MediaRef);
   // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
   const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading && !attachFailed;
+  // 草稿超过 sessionStorage 上限后只留内存、刷新即丢,此前没有任何预警(C-21)。
+  const draftVolatile = !!draftKey && draftExceedsStorage(value);
 
   // 「+」菜单只保留目标(有 onSetGoal+onGoalAction)。附件已提到工具条一级回形针。
   // 无目标时(如 demo)退化为禁用的「+」按钮,保留原视觉锚点而不弹空菜单。
@@ -422,10 +463,11 @@ export function Composer({
     }
     // 上限守卫前置:超出配额的文件**不上传**(此前 chip 有守卫但 onUpload 无条件执行 →
     // 超限文件白白上传后结果被丢弃),且截断有明确提示而非静默。
-    const room = Math.max(0, MAX_ATTACH - attachments.length);
+    const room = Math.max(0, MAX_ATTACH - attachCountRef.current);
     const arr = picked.slice(0, room);
     const dropped = picked.length - arr.length;
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
+    attachCountRef.current += arr.length;
     for (const file of arr) {
       const id = `att-${nextAttachId++}`;
       const owner: AttachOwner = { key: draftKey, epoch: attachEpoch };
@@ -517,7 +559,7 @@ export function Composer({
           <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
             <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
               <div className="mb-0.5 text-caption font-medium text-muted">
-                正在引用 {replyTo.role === "assistant" ? "从简" : "你"}
+                正在引用 {replyTo.role === "assistant" ? BRAND.name : "你"}
               </div>
               <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
                 {replyTo.text}
@@ -565,271 +607,316 @@ export function Composer({
             ))}
           </div>
         )}
+        {/* 两行式布局(C-01/C-14):第一行 textarea 通栏,第二行工具行(左=附件/「+」/仓库,右=状态/语音/发送)。
+            此前 4 个 44px 按钮与 textarea 同排:390px 下正文只剩约 138px、每行 8 个字;桌面多行草稿时
+            按钮贴底、正文左侧空出一列。桌面也统一两行,附件区/引用块与正文左沿对齐。 */}
         <div
-          className="flex items-end gap-1.5 px-2.5 py-2"
+          className="px-3 pb-2 pt-2.5"
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
-          {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
-              <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
-              合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
-              不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。
-              禁止合成 input.click()。 */}
-          <input
-            data-product-feature={PRODUCT_CAPABILITIES.files.id}
-            id={fileInputId}
-            ref={fileRef}
-            type="file"
-            multiple
-            tabIndex={-1}
-            className="sr-only"
-            // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
-            aria-label="选择附件文件"
-            onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
-          />
-          {canAttach && (
-            // 键盘可达(C-03):<label> 默认不在 Tab 序列,纯键盘/读屏用户无法触达附件。加 tabIndex/role,
-            // Enter/Space 在 label 自身派发原生 click → 走 label 激活转发到 input(仍是原生路径,
-            // 不是被禁止的合成 input.click();input 的 tabindex=-1 / 非 display:none / 无 accept 三条红线不动)。
-            <label
-              htmlFor={fileInputId}
-              aria-label="添加附件"
-              title="添加附件"
-              role="button"
-              tabIndex={disabled ? -1 : 0}
-              aria-disabled={disabled || undefined}
-              data-product-feature={PRODUCT_CAPABILITIES.files.id}
+          <div className="flex px-1" data-testid="composer-input-row">
+            <textarea
+              data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+              ref={ref}
+              rows={1}
+              value={value}
+              disabled={disabled}
+              aria-label="消息输入框"
+              onChange={(e) => setValue(e.target.value)}
+              onPaste={(e) => {
+                if (!onUpload) return;
+                const images = clipboardImages(e.clipboardData);
+                if (images.length === 0) return;
+                e.preventDefault();
+                void onFiles(images);
+              }}
               onKeyDown={(e) => {
-                if (disabled) return;
-                if (e.key === "Enter" || e.key === " ") {
+                if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
                   e.preventDefault();
-                  e.currentTarget.click();
+                  setValue(lastUserText);
+                  requestAnimationFrame(() => {
+                    const el = ref.current;
+                    if (!el) return;
+                    const end = lastUserText.length;
+                    el.setSelectionRange(end, end);
+                  });
+                  return;
+                }
+                // 引用块只能点「×」取消(C-23):textarea 聚焦且不在生成中时 Esc 直接取消引用;
+                // 生成中不拦,让全局 Esc 仍走「停止生成」(lib/hotkeys)。
+                if (e.key === "Escape" && replyTo && onCancelReply && !busy && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  onCancelReply();
+                  return;
+                }
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                  // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
+                  if (coarsePointer) return;
+                  const mod = e.metaKey || e.ctrlKey;
+                  // enter 模式保持原行为：Enter / ⌘+Enter 都发送，仅 Shift+Enter 换行。
+                  const shouldSend = sendKey === "mod-enter" ? mod : !e.shiftKey;
+                  if (!shouldSend) return;
+                  e.preventDefault();
+                  submit();
                 }
               }}
+              enterKeyHint={coarsePointer ? "enter" : "send"}
+              placeholder={placeholder}
               className={cn(
-                iconButtonVariants({ shape: "square" }),
-                "mb-0.5 cursor-pointer",
-                disabled && "pointer-events-none opacity-50",
+                "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1.5 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
+                fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
               )}
-            >
-              <Paperclip size={18} />
-            </label>
-          )}
-          {/* 「+」选项菜单:仅「设定目标」(附件已提到一级回形针)。
-              菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
-              无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
-          {hasPlusMenu ? (
-            <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
-              <DropdownMenuTrigger asChild>
-                <IconButton
-                  data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                  aria-label="更多选项"
-                  title="更多选项"
-                  disabled={disabled}
-                  className="relative mb-0.5"
-                >
-                  <Plus size={20} />
-                  {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
-                      不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
-                  {visibleGoal && (
-                    <span
-                      aria-hidden
-                      data-testid="composer-goal-dot"
-                      className={cn(
-                        "absolute right-1 top-1 size-1.5 rounded-full",
-                        goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                      )}
-                    />
-                  )}
-                </IconButton>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" side="top">
-                {canGoal && (
-                  <DropdownMenuItem
-                    data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
-                    onSelect={() => setGoalOpen(true)}
+            />
+          </div>
+          <div className="mt-1 flex items-center gap-1.5" data-testid="composer-tool-row">
+            {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
+                <label htmlFor> 原生激活。国产内核(鸿蒙/华为/Quark)会把 display:none input 上的
+                合成 click 静默吞掉,原生 label 激活是跨内核唯一可靠路径(实证 61de46e2/de16e2be)。
+                不挂 accept 白名单(会灰掉国产内核选择器),类型判定与准入交给 onFiles/后端。
+                禁止合成 input.click()。 */}
+            <input
+              data-product-feature={PRODUCT_CAPABILITIES.files.id}
+              id={fileInputId}
+              ref={fileRef}
+              type="file"
+              multiple
+              tabIndex={-1}
+              className="sr-only"
+              // 结构红线(T4:type=file/无 accept/非 display:none/tabindex=-1)一项不动。
+              aria-label="选择附件文件"
+              onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
+            />
+            {canAttach && (
+              // 键盘可达(C-03):<label> 默认不在 Tab 序列,纯键盘/读屏用户无法触达附件。加 tabIndex/role,
+              // Enter/Space 在 label 自身派发原生 click → 走 label 激活转发到 input(仍是原生路径,
+              // 不是被禁止的合成 input.click();input 的 tabindex=-1 / 非 display:none / 无 accept 三条红线不动)。
+              <label
+                htmlFor={fileInputId}
+                aria-label="添加附件"
+                title="添加附件"
+                role="button"
+                tabIndex={disabled ? -1 : 0}
+                aria-disabled={disabled || undefined}
+                data-product-feature={PRODUCT_CAPABILITIES.files.id}
+                onKeyDown={(e) => {
+                  if (disabled) return;
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    e.currentTarget.click();
+                  }
+                }}
+                className={cn(
+                  iconButtonVariants({ shape: "square" }),
+                  "cursor-pointer",
+                  disabled && "pointer-events-none opacity-50",
+                )}
+              >
+                <Paperclip size={18} />
+              </label>
+            )}
+            {/* 「+」选项菜单:仅「设定目标」(附件已提到一级回形针)。
+                菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
+                无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
+            {hasPlusMenu ? (
+              <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
+                <DropdownMenuTrigger asChild>
+                  <IconButton
+                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
+                    aria-label="更多选项"
+                    title="更多选项"
+                    disabled={disabled}
+                    className="relative"
                   >
-                    <Target size={16} className="shrink-0 text-muted" />
-                    <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
+                    <Plus size={20} />
+                    {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
+                        不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
                     {visibleGoal && (
                       <span
                         aria-hidden
+                        data-testid="composer-goal-dot"
                         className={cn(
-                          "size-1.5 shrink-0 rounded-full",
+                          "absolute right-1 top-1 size-1.5 rounded-full",
                           goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
                         )}
                       />
                     )}
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          ) : (
-            <IconButton
-              data-product-feature={PRODUCT_CAPABILITIES.files.id}
-              aria-label="更多选项"
-              // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
-              title="会话目标暂不可用"
-              disabled
-              className="relative mb-0.5"
-            >
-              <Plus size={20} />
-              {visibleGoal && (
-                <span
-                  aria-hidden
-                  data-testid="composer-goal-dot"
-                  className={cn(
-                    "absolute right-1 top-1 size-1.5 rounded-full",
-                    goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                  </IconButton>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" side="top">
+                  {canGoal && (
+                    <DropdownMenuItem
+                      data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
+                      onSelect={() => setGoalOpen(true)}
+                    >
+                      <Target size={16} className="shrink-0 text-muted" />
+                      <span className="flex-1">{visibleGoal ? "目标" : "设定目标"}</span>
+                      {visibleGoal && (
+                        <span
+                          aria-hidden
+                          className={cn(
+                            "size-1.5 shrink-0 rounded-full",
+                            goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                          )}
+                        />
+                      )}
+                    </DropdownMenuItem>
                   )}
-                />
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <IconButton
+                data-product-feature={PRODUCT_CAPABILITIES.files.id}
+                aria-label="更多选项"
+                // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
+                title="会话目标暂不可用"
+                disabled
+                className="relative"
+              >
+                <Plus size={20} />
+                {visibleGoal && (
+                  <span
+                    aria-hidden
+                    data-testid="composer-goal-dot"
+                    className={cn(
+                      "absolute right-1 top-1 size-1.5 rounded-full",
+                      goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
+                    )}
+                  />
+                )}
+              </IconButton>
+            )}
+            {/* GitHub 仓库入口从外部底栏并入工具行左侧(与附件/「+」同组,少一层视觉层级);
+                已绑定时 owner/repo 可截断,不挤右侧发送区。 */}
+            {onOpenRepo && (
+              <span className="flex min-w-0 items-center" data-testid="composer-repo-slot">
+                <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
+              </span>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+              {/* 「正在停止…」占位符已由 App 传入 placeholder 承载,角落再写一遍是冗余(C-17);
+                  这里只保留给读屏的状态播报,不再占视觉位。 */}
+              {stopping && (
+                <output className="sr-only" aria-live="polite">
+                  正在停止…
+                </output>
               )}
-            </IconButton>
-          )}
-          <textarea
-            data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-            ref={ref}
-            rows={1}
-            value={value}
-            disabled={disabled}
-            aria-label="消息输入框"
-            onChange={(e) => setValue(e.target.value)}
-            onPaste={(e) => {
-              if (!onUpload) return;
-              const images = clipboardImages(e.clipboardData);
-              if (images.length === 0) return;
-              e.preventDefault();
-              void onFiles(images);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
-                e.preventDefault();
-                setValue(lastUserText);
-                requestAnimationFrame(() => {
-                  const el = ref.current;
-                  if (!el) return;
-                  const end = lastUserText.length;
-                  el.setSelectionRange(end, end);
-                });
-                return;
-              }
-              if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-                // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
-                if (coarsePointer) return;
-                const mod = e.metaKey || e.ctrlKey;
-                // enter 模式保持原行为：Enter / ⌘+Enter 都发送，仅 Shift+Enter 换行。
-                const shouldSend = sendKey === "mod-enter" ? mod : !e.shiftKey;
-                if (!shouldSend) return;
-                e.preventDefault();
-                submit();
-              }
-            }}
-            enterKeyHint={coarsePointer ? "enter" : "send"}
-            placeholder={placeholder}
-            className={cn(
-              "max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
-              fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
-            )}
-          />
-          <IconButton
-            data-product-feature={PRODUCT_CAPABILITIES.voice.id}
-            aria-label={voice.state === "recording" ? "停止录音" : "语音输入"}
-            title={voiceEnabled ? (voice.state === "recording" ? "停止录音" : "语音输入") : "语音输入暂不可用"}
-            disabled={!voiceEnabled || disabled || voice.state === "transcribing"}
-            onClick={voice.toggle}
-            className={cn("mb-0.5", voice.state === "recording" && "text-danger")}
-          >
-            {voice.state === "transcribing" ? (
-              <Loader2 size={19} className="animate-spin" />
-            ) : voice.state === "recording" ? (
-              <Square size={16} className="fill-current" />
-            ) : (
-              <Mic size={19} />
-            )}
-          </IconButton>
-          {/* 「正在停止…」占位符已由 App 传入 placeholder 承载,角落再写一遍是冗余(C-17);
-              这里只保留给读屏的状态播报,不再占视觉位。 */}
-          {stopping && (
-            <output className="sr-only" aria-live="polite">
-              正在停止…
-            </output>
-          )}
-          {value.length > 2000 && (
-            <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
-          )}
-          {/* 发送键禁用原因不再只放 hover title(触屏无 hover,C-10):可见 caption + role=status。 */}
-          {!busy && (attachFailed || uploading) && (
-            <output
-              data-testid="composer-send-blocked-reason"
-              className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
-            >
-              {attachFailed ? "有附件上传失败" : "附件上传中…"}
-            </output>
-          )}
-          {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
-              → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
-              Stop 控件(T35),本按钮 aria-label 不含「停止」。 */}
-          {busy && !stopping && canSend && !disabled && (
-            <IconButton
-              data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-              aria-label="排队发送"
-              title="本轮结束后自动发送"
-              className="mb-0.5 text-accent"
-              onClick={() => {
-                submit();
-                toast("已加入队列，本轮结束后发送", "info");
-              }}
-            >
-              <ListPlus size={19} />
-            </IconButton>
-          )}
-          <button
-            type="button"
-            data-product-control
-            aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
-            title={
-              attachFailed
-                ? "有附件上传失败，请重试或移除后再发送"
-                : uploading
-                  ? "附件上传中"
-                  : busy && !stopping
-                    ? "停止生成"
-                    : undefined
-            }
-            onClick={() => {
-              if (busy) {
-                if (!stopping) onStop?.();
-                return;
-              }
-              submit();
-            }}
-            disabled={stopping || (!canSend && !busy) || disabled}
-            className={cn(
-              "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
-              busy
-                ? "bg-fg text-bg"
-                : canSend
-                  ? "bg-primary text-primary-fg hover:opacity-90"
-                  : "bg-hover text-faint",
-            )}
-          >
-            {stopping ? (
-              <Loader2 size={17} className="animate-spin" />
-            ) : busy ? (
-              <Square size={15} className="fill-current" />
-            ) : (
-              <ArrowUp size={19} />
-            )}
-          </button>
+              {value.length > 2000 && (
+                <span className="text-caption text-faint tabular-nums">{value.length} 字</span>
+              )}
+              {/* 草稿超过 20KB 只留内存、刷新丢失,此前毫无预警(C-21)。 */}
+              {draftVolatile && (
+                <output
+                  data-testid="composer-draft-volatile"
+                  className="hidden text-caption text-warning sm:inline"
+                  title="草稿超过本地保存上限，只保留在内存中；刷新或关闭页面后不再恢复"
+                >
+                  草稿过长，刷新后不保留
+                </output>
+              )}
+              {/* 发送键禁用原因不再只放 hover title(触屏无 hover,C-10):可见 caption + role=status。 */}
+              {!busy && (attachFailed || uploading) && (
+                <output
+                  data-testid="composer-send-blocked-reason"
+                  className={cn("text-caption", attachFailed ? "text-danger" : "text-faint")}
+                >
+                  {attachFailed ? "有附件上传失败" : "附件上传中…"}
+                </output>
+              )}
+              {/* 生成中排队发送(C-02):此前生成中唯一按钮是「停止」,桌面 Enter 排队无反馈,触屏 Enter=换行
+                  → 根本没有排队入口。现在 busy 且有可发内容时给一个次级「排队发送」按钮;「停止」仍是唯一
+                  Stop 控件(T35),本按钮 aria-label 不含「停止」。 */}
+              {busy && !stopping && canSend && !disabled && (
+                <IconButton
+                  data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
+                  aria-label="排队发送"
+                  title="本轮结束后自动发送"
+                  className="text-accent"
+                  onClick={() => {
+                    submit();
+                    toast("已加入队列，本轮结束后发送", "info");
+                  }}
+                >
+                  <ListPlus size={19} />
+                </IconButton>
+              )}
+              {/* 不支持/未登录时不再 disabled 灰掉了事(C-20):保持可聚焦可点,点了用 toast 说明原因。 */}
+              <IconButton
+                data-product-feature={PRODUCT_CAPABILITIES.voice.id}
+                aria-label={voice.state === "recording" ? "停止录音" : "语音输入"}
+                title={voiceUnavailableReason ?? (voice.state === "recording" ? "停止录音" : "语音输入")}
+                aria-disabled={voiceUnavailableReason ? true : undefined}
+                data-voice-unavailable={voiceUnavailableReason ? "true" : undefined}
+                disabled={disabled || voice.state === "transcribing"}
+                onClick={onVoiceClick}
+                className={cn(
+                  voice.state === "recording" && "text-danger",
+                  voiceUnavailableReason && "text-faint",
+                )}
+              >
+                {voice.state === "transcribing" ? (
+                  <Loader2 size={19} className="animate-spin" />
+                ) : voice.state === "recording" ? (
+                  <Square size={16} className="fill-current" />
+                ) : (
+                  <Mic size={19} />
+                )}
+              </IconButton>
+              <button
+                type="button"
+                data-product-control
+                aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+                title={
+                  attachFailed
+                    ? "有附件上传失败，请重试或移除后再发送"
+                    : uploading
+                      ? "附件上传中"
+                      : busy && !stopping
+                        ? "停止生成"
+                        : undefined
+                }
+                onClick={() => {
+                  if (busy) {
+                    if (!stopping) onStop?.();
+                    return;
+                  }
+                  submit();
+                }}
+                disabled={stopping || (!canSend && !busy) || disabled}
+                className={cn(
+                  "flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
+                  busy
+                    ? "bg-fg text-bg"
+                    : canSend
+                      ? "bg-primary text-primary-fg hover:opacity-90"
+                      : "bg-hover text-faint",
+                )}
+              >
+                {stopping ? (
+                  <Loader2 size={17} className="animate-spin" />
+                ) : busy ? (
+                  <Square size={15} className="fill-current" />
+                ) : (
+                  <ArrowUp size={19} />
+                )}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
-      {/* 底部工具条:左=GitHub 仓库绑定入口;右=语音状态(仅录音/转写时显示)。
-          原「内容由 AI 生成」免责声明已移除。 */}
-      {(onOpenRepo || voiceStatus) && (
-        <div className="flex min-h-[30px] items-center gap-2 px-1.5 py-1.5 text-xs">
-          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
-          {voiceStatus && <span className="ml-auto">{voiceStatus}</span>}
-        </div>
+      {/* 语音状态(录音/转写/错误)常驻 live region(C-19):容器随 voiceEnabled 常在、内容变化才被读屏播报;
+          无内容时 sr-only 不占位。GitHub 仓库入口已并入工具行,底栏不再承载它。 */}
+      {voiceEnabled && (
+        <output
+          aria-live="polite"
+          data-testid="composer-voice-status"
+          className={cn(
+            "flex min-h-[30px] items-center justify-end px-1.5 py-1.5 text-xs",
+            !voiceStatus && "sr-only",
+          )}
+        >
+          {voiceStatus}
+        </output>
       )}
 
       {/* 图片附件灯箱:点击缩略图看全图。 */}

@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { AttachChip, Composer, middleTruncate } from "./Composer";
 import type { MediaRef } from "../lib/chat/frames";
@@ -480,6 +481,27 @@ describe("AttachChip（对话框上传图的「编辑」入口 —— 需求 §5
     const btn = screen.getByRole("button", { name: "编辑图片 photo.png" });
     expect(btn).toBeDisabled();
     expect(btn).toHaveAttribute("title", "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型");
+  });
+});
+
+// C-22:onFiles 此前读渲染闭包里的 attachments.length,同一帧内连续两次拖放用同一个旧值算 room,
+// 合计可超 MAX_ATTACH(后端才拒)。外层 act 让两次 drop 之间不重渲染,复现「闭包过期」。
+describe("附件上限竞态(C-22)", () => {
+  test("同一帧内连续两次拖放,合计仍不超过 MAX_ATTACHMENTS_PER_MESSAGE", async () => {
+    const onUpload = vi.fn(async () => ({ kind: "file", url: "/x" }) as MediaRef);
+    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = container.querySelector(".rounded-\\[26px\\]") as HTMLElement;
+    const mk = (i: number) => new File(["x"], `race-${i}.txt`, { type: "text/plain" });
+    const batch = Math.max(1, MAX_ATTACHMENTS_PER_MESSAGE - 1);
+    const dt = (files: File[]) => ({ types: ["Files"], files, dropEffect: "none", items: [] });
+    act(() => {
+      fireEvent.drop(shell, { dataTransfer: dt(Array.from({ length: batch }, (_, i) => mk(i))) });
+      fireEvent.drop(shell, { dataTransfer: dt(Array.from({ length: batch }, (_, i) => mk(batch + i))) });
+    });
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /^移除 race-/ })).toHaveLength(MAX_ATTACHMENTS_PER_MESSAGE),
+    );
+    expect(onUpload).toHaveBeenCalledTimes(MAX_ATTACHMENTS_PER_MESSAGE);
   });
 });
 
