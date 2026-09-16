@@ -160,6 +160,9 @@ describe('误触保护确认层(需求 §5)', () => {
     render(<EditorHarness onOpenChange={onOpenChange} />)
 
     const ta = await screen.findByLabelText('希望怎样修改')
+    // placeholder 在 bg-neutral-900 上 40% 白只有 3.8:1 → 60%(a11y-C)。
+    expect(ta).toHaveClass('placeholder:text-white/60')
+    expect(ta).not.toHaveClass('placeholder:text-white/40')
     fireEvent.change(ta, { target: { value: '把背景换成蓝色' } })
 
     fireEvent.click(screen.getByRole('button', { name: '关闭图片编辑器' }))

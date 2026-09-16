@@ -49,7 +49,11 @@ describe('ImageCommentMode', () => {
     render(<ImageCommentMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
     // 点图打开输入条(占位「描述编辑」)。
     fireEvent.click(screen.getByRole('button', { name: '点按图片添加评论' }))
-    expect(screen.getByPlaceholderText('描述编辑')).toBeInTheDocument()
+    const input = screen.getByPlaceholderText('描述编辑')
+    expect(input).toBeInTheDocument()
+    // placeholder 在深底上 40% 白只有 3.8:1 → 60%(a11y-C,与圈选编辑器同源)。
+    expect(input).toHaveClass('placeholder:text-white/60')
+    expect(input).not.toHaveClass('placeholder:text-white/40')
     fireEvent.change(screen.getByLabelText('描述编辑'), { target: { value: '把天空改蓝' } })
     fireEvent.click(screen.getByRole('button', { name: '确认' }))
     expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()

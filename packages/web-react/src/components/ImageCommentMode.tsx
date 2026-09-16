@@ -361,7 +361,8 @@ export function ImageCommentMode({
               }}
               placeholder="描述编辑"
               maxLength={400}
-              className="min-w-0 flex-1 bg-transparent text-base text-white outline-none placeholder:text-white/40"
+              // 与圈选编辑器同源:40% 白 placeholder 在深底上只有 3.8:1,收到 60%(a11y-C)。
+              className="min-w-0 flex-1 bg-transparent text-base text-white outline-none placeholder:text-white/60"
             />
             <button
               type="button"
