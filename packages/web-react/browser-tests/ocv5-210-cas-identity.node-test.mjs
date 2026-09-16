@@ -153,7 +153,7 @@ test("CAS reread failure after account switch does not send previous team as the
       await page.getByRole("button", { name: /切换智能体/ }).click();
       await page.getByRole("button", { name: /队长切换为/ }).waitFor();
       assert.equal(await page.getByRole("button", { name: /队长切换为/ }).getAttribute("aria-pressed"), "true");
-      await page.getByLabel(/同时作为新会话默认/).check();
+      await page.getByLabel(/同时设为新对话的默认协作方式/).check();
       await page.getByRole("button", { name: /主模型独立完成/ }).click();
       const armedAt = Date.now();
       while (!(casArmed && rereadStarted) && Date.now() - armedAt < 10_000) {
@@ -175,13 +175,13 @@ test("CAS reread failure after account switch does not send previous team as the
       assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
       assert.equal(await page.getByRole("button", { name: /队长切换为/ }).getAttribute("aria-pressed"), "false");
       assert.equal(bLoaded, true, "B collab GET must complete before releasing A");
-      assert.equal(await page.getByLabel(/同时作为新会话默认/).isChecked(), false);
+      assert.equal(await page.getByLabel(/同时设为新对话的默认协作方式/).isChecked(), false);
       const before = calls.filter((row) => row.token === "tok-b").length;
       releaseReread();
       await page.waitForTimeout(400);
       assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
       assert.equal(await page.getByRole("button", { name: /队长切换为/ }).getAttribute("aria-pressed"), "false");
-      assert.equal(await page.getByLabel(/同时作为新会话默认/).isChecked(), false);
+      assert.equal(await page.getByLabel(/同时设为新对话的默认协作方式/).isChecked(), false);
       await page.keyboard.press("Escape");
       await page.getByPlaceholder(/和「全能助手」对话/).fill("B 新消息");
       await page.getByRole("button", { name: "发送" }).click();
@@ -189,7 +189,7 @@ test("CAS reread failure after account switch does not send previous team as the
       const ordinaryBPuts = calls.filter((row) => row.token === "tok-b").slice(before);
       assert.deepEqual(ordinaryBPuts, []);
       await page.getByRole("button", { name: /切换智能体/ }).click();
-      assert.equal(await page.getByLabel(/同时作为新会话默认/).isChecked(), false);
+      assert.equal(await page.getByLabel(/同时设为新对话的默认协作方式/).isChecked(), false);
       await page.getByRole("button", { name: /队长切换为/ }).click();
       const chosenAt = Date.now();
       while (calls.filter((row) => row.token === "tok-b").length <= before && Date.now() - chosenAt < 10_000) {
