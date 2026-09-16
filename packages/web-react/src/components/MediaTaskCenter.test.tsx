@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import type { MediaGenerationJob, VideoProject } from '@openclaude/protocol/mediaGeneration'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createMemoryAuthSession } from '../lib/authSession'
 
@@ -11,7 +11,13 @@ vi.mock('../lib/api', () => ({
   assertAuthResponseCurrent: () => {},
 }))
 
-import { MediaTaskCenter } from './MediaTaskCenter'
+import { MediaTaskCenter, failureSummary, phaseLabel } from './MediaTaskCenter'
+
+/** 危险操作先弹确认层(M-06):在指定标题的对话框里点某个按钮。 */
+async function confirmIn(dialogName: string, action: string | RegExp) {
+  const dialog = await screen.findByRole('dialog', { name: dialogName })
+  fireEvent.click(within(dialog).getByRole('button', { name: action }))
+}
 
 const auth = createMemoryAuthSession(() => {}, 'token')
 
@@ -131,6 +137,12 @@ describe('MediaTaskCenter', () => {
     )
     expect(screen.getByText('任务 3')).toBeInTheDocument()
     expect(screen.getByText('6/20')).toBeInTheDocument()
+    // phase 翻成人话并拼在状态后(M-05);有步数的进度条走原语,读屏能读到百分比(M-18)。
+    expect(screen.getByText('生成中 · 正在生成画面')).toBeInTheDocument()
+    expect(screen.getByRole('progressbar', { name: '生成中 · 正在生成画面 30%' })).toHaveAttribute(
+      'aria-valuenow',
+      '30',
+    )
 
     fireEvent.click(screen.getByRole('button', { name: '加载更早任务' }))
     expect(await screen.findByText('任务 1')).toBeInTheDocument()
@@ -151,20 +163,26 @@ describe('MediaTaskCenter', () => {
         expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRev: 2 }) }),
       ),
     )
+    // 写操作在飞时其余写按钮禁用(M-16),等它落地再点下一个。
+    await waitFor(() => expect(screen.getByRole('button', { name: /重做/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /重做/ }))
+    await confirmIn('重新生成第 1 镜？', '重做这一镜')
     await waitFor(() =>
       expect(fetch).toHaveBeenCalledWith(
         '/api/media-generation/projects/2/shots/2-shot/regenerate',
         expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRev: 2 }) }),
       ),
     )
+    await waitFor(() => expect(screen.getByRole('button', { name: /取消项目/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /取消项目/ }))
+    await confirmIn('取消这个长视频项目？', '取消项目')
     await waitFor(() =>
       expect(fetch).toHaveBeenCalledWith(
         '/api/media-generation/projects/2/cancel',
         expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRev: 2 }) }),
       ),
     )
+    await waitFor(() => expect(screen.getByRole('button', { name: '加载更早项目' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: '加载更早项目' }))
     const renderButton = await screen.findByRole('button', { name: /合成完整视频/ })
     fireEvent.click(renderButton)
@@ -220,6 +238,167 @@ describe('MediaTaskCenter', () => {
     render(<MediaTaskCenter open auth={auth} liveJob={null} onOpenChange={() => {}} />)
     expect(await screen.findByText('本账号暂未开放本地 H3 视频生成。')).toBeInTheDocument()
     expect(fetch).toHaveBeenCalledTimes(1)
+    // 未开放时不再悬着一个空的「单段视频」标题(M-17)。
+    expect(screen.queryByText('单段视频')).not.toBeInTheDocument()
+  })
+
+  test('the drawer has its own close button (mobile overlay is too thin to rely on)', async () => {
+    const onOpenChange = vi.fn()
+    render(<MediaTaskCenter open auth={auth} liveJob={null} onOpenChange={onOpenChange} />)
+    await screen.findByText('任务 2')
+    fireEvent.click(screen.getByRole('button', { name: '关闭视频任务' }))
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  test('phase / error copy is translated for users and raw values stay in tooling slots', async () => {
+    const unknownPhase = job('u', {
+      status: 'running',
+      phase: 'worker_state_flux',
+      queuePosition: null,
+    })
+    const failed = job('f', {
+      status: 'failed',
+      phase: 'upload',
+      queuePosition: null,
+      errorCode: 'H3_OOM',
+      errorMessage: 'CUDA out of memory while allocating 2.1 GiB (worker gpu-h3-02)',
+      prompt: '一只在雪地里奔跑的柴犬',
+    })
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/capabilities')) return response({ available: true })
+      if (url.endsWith('/jobs')) return response({ jobs: [unknownPhase, failed], nextCursor: null })
+      if (url.endsWith('/projects')) return response({ projects: [project('p')], nextCursor: null })
+      throw new Error(`unexpected fetch ${url}`)
+    })
+    render(<MediaTaskCenter open auth={auth} liveJob={null} onOpenChange={() => {}} />)
+    await screen.findByText('一只在雪地里奔跑的柴犬')
+    // 未知 phase 不进正文,只留在 title 里。
+    expect(screen.getByTitle('worker_state_flux')).toHaveTextContent(/^生成中$/)
+    // 失败原因先给人话,服务端原文收进「技术详情」。
+    expect(screen.getByText('显存不足：请缩短视频时长或降低分辨率后重试。')).toBeInTheDocument()
+    expect(screen.getByText('技术详情')).toBeInTheDocument()
+    expect(
+      screen.getByText('H3_OOM · CUDA out of memory while allocating 2.1 GiB (worker gpu-h3-02)'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /复制提示词/ })).toBeInTheDocument()
+    // 项目行不再展示 rev,只留 title。
+    expect(screen.queryByText(/rev 2/)).not.toBeInTheDocument()
+    expect(screen.getByTitle('第 2 版')).toHaveTextContent('1/1 个分镜')
+  })
+
+  test('the standalone heading is hidden when only projects exist', async () => {
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/capabilities')) return response({ available: true })
+      if (url.endsWith('/jobs')) return response({ jobs: [], nextCursor: null })
+      if (url.endsWith('/projects')) return response({ projects: [project('p')], nextCursor: null })
+      throw new Error(`unexpected fetch ${url}`)
+    })
+    render(<MediaTaskCenter open auth={auth} liveJob={null} onOpenChange={() => {}} />)
+    await screen.findByText('项目 p')
+    expect(screen.queryByText('单段视频')).not.toBeInTheDocument()
+    expect(screen.queryByText(/还没有视频任务/)).not.toBeInTheDocument()
+  })
+
+  test('cancelling a job asks first, "再想想" sends nothing, and a confirmed action is sent once', async () => {
+    const running = job('r', { status: 'running', phase: 'sampling', queuePosition: null })
+    let releasePost: (() => void) | null = null
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/capabilities')) return response({ available: true })
+      if (url.endsWith('/jobs')) return response({ jobs: [running], nextCursor: null })
+      if (url.endsWith('/projects')) return response({ projects: [], nextCursor: null })
+      if (init?.method === 'POST') {
+        await new Promise<void>((resolve) => {
+          releasePost = resolve
+        })
+        return response({ ok: true })
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    })
+    render(<MediaTaskCenter open auth={auth} liveJob={null} onOpenChange={() => {}} />)
+    const cancel = await screen.findByRole('button', { name: /取消/ })
+    fireEvent.click(cancel)
+    await confirmIn('取消这个视频任务？', '再想想')
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: '取消这个视频任务？' })).not.toBeInTheDocument(),
+    )
+    expect(fetch).not.toHaveBeenCalledWith(
+      '/api/media-generation/jobs/r/cancel',
+      expect.objectContaining({ method: 'POST' }),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /取消/ }))
+    await confirmIn('取消这个视频任务？', '取消任务')
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        '/api/media-generation/jobs/r/cancel',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    )
+    // 请求在飞:按钮禁用、再点不会重复发(M-16)。
+    const inflight = screen.getByRole('button', { name: /取消/ })
+    expect(inflight).toBeDisabled()
+    fireEvent.click(inflight)
+    const cancelCalls = () =>
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([url]) => String(url) === '/api/media-generation/jobs/r/cancel').length
+    expect(cancelCalls()).toBe(1)
+    await act(async () => {
+      releasePost?.()
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: /取消/ })).toBeEnabled())
+    expect(cancelCalls()).toBe(1)
+  })
+
+  test('background polling does not toggle the refresh button into its loading state', async () => {
+    const setIntervalSpy = vi.spyOn(window, 'setInterval')
+    render(<MediaTaskCenter open auth={auth} liveJob={null} onOpenChange={() => {}} />)
+    await screen.findByText('任务 2') // queued → 有活跃任务 → 挂上 5s 轮询
+    // testing-library 的 waitFor 自己也用 setInterval 轮询,按 5s 这个间隔认出组件挂的那一个。
+    const polls = () => setIntervalSpy.mock.calls.filter(([, ms]) => ms === 5_000)
+    await waitFor(() => expect(polls().length).toBeGreaterThan(0))
+    const tick = polls().at(-1)?.[0] as () => void
+    const releases: Array<() => void> = []
+    vi.mocked(fetch).mockImplementation(async () => {
+      await new Promise<void>((resolve) => {
+        releases.push(resolve)
+      })
+      return response({ jobs: [], nextCursor: null, projects: [] })
+    })
+    act(() => {
+      tick()
+    })
+    await waitFor(() => expect(releases.length).toBeGreaterThan(0))
+    // 轮询请求在飞,「刷新」不进 loading 态。
+    expect(screen.getByRole('button', { name: /刷新/ })).toBeEnabled()
+    await act(async () => {
+      for (const release of releases) release()
+    })
+    setIntervalSpy.mockRestore()
+  })
+
+  test('phaseLabel hides phases that duplicate the status or are unknown', () => {
+    expect(phaseLabel({ status: 'running', phase: 'denoise_step' })).toBe('正在生成画面')
+    expect(phaseLabel({ status: 'queued', phase: 'wait_gpu' })).toBe('等待算力')
+    expect(phaseLabel({ status: 'queued', phase: 'queued' })).toBeNull()
+    expect(phaseLabel({ status: 'completed', phase: 'done' })).toBeNull()
+    expect(phaseLabel({ status: 'running', phase: 'some_internal_state' })).toBeNull()
+    expect(phaseLabel({ status: 'reconnecting', phase: 'reconnecting' })).toBeNull()
+  })
+
+  test('failureSummary maps known codes case-insensitively and falls back to a generic line', () => {
+    expect(failureSummary({ errorCode: 'H3_OOM', errorMessage: 'CUDA OOM' })).toEqual({
+      summary: '显存不足：请缩短视频时长或降低分辨率后重试。',
+      detail: 'H3_OOM · CUDA OOM',
+    })
+    expect(failureSummary({ errorCode: 'weird_code', errorMessage: null })).toEqual({
+      summary: '生成失败，请稍后重试或换个描述再试。',
+      detail: 'weird_code',
+    })
+    expect(failureSummary({ errorCode: null, errorMessage: null })).toBeNull()
   })
 
   test('completed results request a short-lived ticket before rendering media or download links', async () => {
