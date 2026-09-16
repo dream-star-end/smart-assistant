@@ -269,8 +269,13 @@ test('关于页:检查更新 → 服务端同构建号时提示已是最新,不�
     .mockResolvedValue(new Response(htmlWithBuild('build-2026.09.15-abc'), { status: 200 }))
   await withBuildMeta('build-2026.09.15-abc', async () => {
     render(<SettingsCenter {...base} initialSection="about" />)
+    // live region 在点击之前就已挂载(空),之后只切文本 —— 首句播报不会被读屏吞掉(QA t-1028 §6 #2)。
+    const status = screen.getByTestId('about-update-status')
+    expect(status).toHaveAttribute('aria-live', 'polite')
+    expect(status).toBeEmptyDOMElement()
     fireEvent.click(screen.getByRole('button', { name: '检查更新' }))
     expect(await screen.findByText('已是最新版本')).toBeInTheDocument()
+    expect(screen.getByTestId('about-update-status')).toBe(status)
     expect(screen.queryByRole('button', { name: '立即刷新' })).toBeNull()
   })
   expect(fetchSpy).toHaveBeenCalledWith('/', expect.objectContaining({ cache: 'no-store' }))
