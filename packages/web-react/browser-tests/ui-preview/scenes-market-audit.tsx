@@ -328,6 +328,12 @@ export const marketAuditScenes: Scene[] = [
     label: '审核 · 点「拒绝」弹出理由输入框',
     steps: [{ text: '拒绝', delay: 500 }],
   }),
+  // K-27:ui/Checkbox 原语 —— 只勾一行,「全选」进入部分选中(indeterminate,视觉减号、读屏 mixed)。
+  derive('market-review', {
+    id: 'market-review-partial',
+    label: '审核 · 只勾一行 → 「全选」部分选中（Checkbox 原语 indeterminate）',
+    steps: [{ selector: 'input[data-ui="checkbox"][aria-label^="选择 "]', delay: 500 }],
+  }),
 
   // ── 未登录 ──
   {
