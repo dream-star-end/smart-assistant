@@ -1,7 +1,7 @@
 # A·tutorials 教程中心 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-tutorials`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，未改任何业务代码）
+- 阶段：A（审计，未改任何业务代码）→ B（修复，§6–§9；发现 37 / 已修 26 / 部分 6 / 遗留 5；P2 12/12 全修）
 - 结论：**P1 × 0 / P2 × 12 / P3 × 25**，共 37 条。没有阻断主流程的故障：教程中心是只读为主的面，
   真正会"卡住"用户的是三件事——26 篇功能参考在导航里**没有入口**（只能从快速上手的链接绕进去）；
   精选作品详情里点「案例展厅」页签**没反应**；移动端搜索 / 分类筛选**没有任何可见反馈**。其余多为
@@ -563,3 +563,110 @@ node browser-tests\ui-preview\shoot.mjs
 - **教程演示视频 / 海报的内容质量**（26 对 webm/webp）：门禁校验哈希、尺寸、时长、去重与录制来源，
   本轮只核对存在性与兜底路径；画面内容是否过时属媒体重录范畴（`npm run tutorials:media`），不在 UI 审计内。
 - **真后端行为**（投稿审核、快照隐私扫描、blob 内嵌）：无法在本机验证，相关组件只做了表单 / 状态 / 文案层面的审计。
+
+---
+
+## 6. 修复记录（阶段 B）
+
+- 分支：`feat/v5-selfhost-audit-tutorials`（阶段 A 终点 `5bf80f0bc`）；执行：fable-5-1-54（t-53）。
+- 接手说明：fable-5-1-35 21:33 自领后在工作树里留下了**未提交**的阶段 B 改动（`TutorialCenter.tsx` +412/−246、
+  `CaseShowroom` / `CaseArtwork` / `CaseFieldReportVisual`，覆盖 TU-01/02/03/04/10/11/13/14/15/16/18/19/23/24/26/33
+  的代码部分，无用例），22:09 掉线。本手逐条核对后**沿用**，补齐用例与文案常量（`TUTORIAL_PENDING_CAPTURE_LABEL`、
+  `TutorialReplay` 回放区）、删除 `MissionReplay.tsx`、落地 TU-31，作为首个提交 `e722bdf5f`；其余三个提交是本手新做。
+- §5 两个决策点按指挥官拍板落地：① `MissionReplay` 确认只被 `TutorialCenter` 引用且渲染条件不可达 → **删除**（22 KB）；
+  ② 快速上手第 4 步「看执行过程」改指「设定目标」（`session-goal`；`TUTORIAL_QUICKSTART` 不在门禁哈希内，未动目录数据）。
+  其余口径按「最小改动、可回退、不改既有交互约定」自定，见下表。
+
+| 编号 | 严重度 | 状态 | 改动（`packages/web-react/src/` 下） | 用例 | 提交 |
+|---|---|---|---|---|---|
+| TU-01 | P2 | ✅ | `TutorialCenter.tsx`：nav 增「功能参考」页签（`BookOpen`），`lastTopicRef` 记住最近主题，再点回来是上次那篇；搜索框进 header（`TutorialSearch`），<lg 独占第二行 | `TutorialCenter.test`「功能参考有一级入口…」 | `e722bdf5f` |
+| TU-02 | P2 | ✅ | 精选作品选中态上提到 `TutorialCenter`（`signatureWorkId`），`CaseShowroom` 受控（`activeWorkId` / `onActiveWorkChange`，不传退回内部 state）；`clearToBrowse` 一并清空；header 标题随作品。深链 `?work=` 见 §9 | `TutorialCenter.test`「精选作品详情受控…」、`CaseShowroom.test`「can be controlled by the parent」 | `e722bdf5f` |
+| TU-03 | P2 | ✅ | 「帮助与创作」换 `ui/DropdownMenu`（`modal={false}`）+ `HelpMenuItem`（`aria-current`、勾、触屏 44px）；Esc / 外点 / 方向键由 Radix 提供 | `TutorialCenter.test`「…Esc 关闭、menuitem 语义」 | `e722bdf5f` |
+| TU-04 | P2 | ✅ | <lg 有查询时把 `<select>` 换成结果列表（`nav[aria-label=搜索结果]` + `TopicList`，计数「N 篇匹配「q」」，点选清空查询）；分类筛选下给「「分类」下共 N 篇 / 没有教程」；`<select>` `h-11` + 16px；删掉永不触发的空态分支 | `TutorialCenter.test` ×2（命中计数 / 空态） | `e722bdf5f` |
+| TU-05 | P2 | ✅ | `CommunityTutorials.tsx`：`communityTutorialDraftIssue`（标题 4 / 摘要 10 / 正文 40 字）前置到提交按钮（禁用 + `<output>` 旁注原因），`submit` 再拦一次；`Input/Textarea` 加 `required`，`form noValidate` 交给自家提示 | `CommunityTutorials.test`「空表单不能提交…」 | `d6eb6ef35` |
+| TU-06 | P2 | ✅ | 正文 placeholder 改 JS 字符串，真正换行 | 同上（断言 placeholder 含 `\n\n## 准备`、不含字面 `\n`） | `d6eb6ef35` |
+| TU-07 | P2 | ✅ | `catalogError` / `detailError` 分离；目录读失败渲染带「重试」的 `Alert tone=danger`，**不再**渲染空态；空态只在 `loadedOnce` 后出现；加载期 `ListSkeleton variant=card rows=4`（我的发布 `rows=3`） | `CommunityTutorials.test`「目录读失败时给「重试」…」 | `d6eb6ef35` |
+| TU-08 | P2 | ✅ | 撤回先 `useConfirm`（标题「撤回这份教程？」，正文 `withdrawConsequence(status)` 按已上线 / 待审核 / 草稿区分，`danger`），确认后按钮 `loading`、其余禁用；成功 toast「已撤回」 | `CommunityTutorials.test` ×3（已上线确认后调用 / 取消不调用 / 草稿） | `d6eb6ef35` |
+| TU-09 | P2 | ✅ | `CATEGORY_LABEL` 收口到 `lib/tutorialStudio.ts`（`COMMUNITY_CATEGORY_LABEL` / `communityCategoryLabel`），目录卡 / Markdown 详情 / 快照详情三处共用 | `SnapshotTutorialDetail.test`（「科研」且正文不含 `research`） | `d6eb6ef35` |
+| TU-10 | P2 | ✅ | `TUTORIAL_PENDING_CAPTURE_LABEL` = 「任务脚本 · 尚无真实运行记录」；hero「这些是任务脚本，还没有真实运行记录」+「N 条脚本」胶囊；列表标题上方与详情卡头徽章删除，详情只留黄横幅一句；回放区只留 `TutorialReplay` 自己那段（文案改「这个案例还没有真实运行记录…」）；`CaseArtwork`/`CaseFieldReportVisual` 新增 `pendingCapture`：「案例演示」→「示意图稿」、「可核对成果」→「观察记录 · 非平台验证」、`aria-label` 注明数字来自人工观察记录 | `TutorialCenter.test`「…且详情页只说一次」、`TutorialReplay.test`、`tutorialJourneys.test`（文案不含「采集」） | `e722bdf5f` / `36ba6e6f0` |
+| TU-11 | P2 | ✅ | `ViewTab` / `HelpMenuItem` / `CategoryChip` / `TopicList` 行 / 快速上手链接 `[@media(hover:none)]:min-h-11`；`<select>` `h-11`；六处「返回」按钮改 `Button variant=ghost size=sm`（`CaseDetail` / `ShowcaseDetail` / `SignatureDetail` / `CommunityTutorialDetailView` / `SnapshotTutorialDetail`） | 视觉（after mobile 逐张） | `e722bdf5f` / `d6eb6ef35` / `36ba6e6f0` |
+| TU-12 | P2 | ✅ | `SignatureShowcases.tsx` 免责声明 `text-[10px] text-white/40` → `text-caption text-white/75`（`#080e19` 底上 ≈ 11.6:1）；kicker `text-micro` | 视觉 | `36ba6e6f0` |
+| TU-13 | P3 | ✅ | 删除 `components/tutorials/MissionReplay.tsx` 与 `TutorialCenter` 里的 import / `showMissionReplay` 分支（拍板①） | typecheck + 模块 vitest | `e722bdf5f` |
+| TU-14 | P3 | ✅ | 删 `CaseSidebar` / `media` / 永不触发分支；`TUTORIAL_SCENARIO_PATHS` 在快速上手底部渲染为 5 张「按场景学习」卡（每卡 4 个章节按钮，已读打勾） | `TutorialCenter.test`「快速上手底部兑现 5 条按场景学习路径」 | `e722bdf5f` |
+| TU-15 | P3 | ✅ | `CaseGallery` 加分类 chip（`fieldset[aria-label=案例分类]`）+ 搜索框 + 「N / 12 条」计数；`tutorialCaseMatches` 接线；空态 `<output>` | `TutorialCenter.test`「案例脚本总览可按分类与关键词筛选」 | `e722bdf5f` |
+| TU-16 | P3 | ✅ | `ArtifactPreview` 顶栏「示意图 · 非本案例实际产物」胶囊；假终端三行改为流程示意（复现 → 定位 → 修复 → 回归）；`aria-label` 前缀「示意：」；标题「你会拿到这些成果」 | `TutorialCenter.test`（含「示意图 · 非本案例实际产物」、`img[name^=示意：]`） | `e722bdf5f` |
+| TU-17 | P3 | ⏸ | 需 shell `useAppRoute` 加 `view=` / `work=`；本模块受控 props 未先做（TU-02 已把 state 提到 `TutorialCenter`，接线成本已降到一层 props），见 §8 / §9 | — | — |
+| TU-18 | P3 | ✅ | `FeatureSidebar` 目录 `nav` 加 ref，`activeId` 变化时用容器 `scrollTop` 把当前行滚进可见区（不 `scrollIntoView`）；筛选后当前项不在列表时顶部「正在看：xx（不在当前筛选内）」 | jsdom 无布局，提示行走 TU-04 用例路径 | `e722bdf5f` |
+| TU-19 | P3 | ◐ | 快速上手步骤按 `tutorialIsRead` 打勾（绿底 ✓）；侧栏「全部功能」右侧「已读 n/26」。**未改**「停留 0.9s 即已读」的判定（涉及老用户已读数据口径，留待产品定） | 视觉 | `e722bdf5f` |
+| TU-20 | P3 | ◐ | `SnapshotTutorialDetail` 分享链接复制加 `try/catch`，失败走 `useToast` error；`SignatureDetail` / `ShowcaseDetail` 既有失败文案保留。**未**抽成统一 hook | — | `d6eb6ef35` |
+| TU-21 | P3 | ⏸ | CTA 五种文案与「登录后试用」字面量比较未收口：涉及 `App.tsx:3117` 传参与 3 个组件的用例 / 场景文案，属产品口径，见 §8 | — | — |
+| TU-22 | P3 | ◐ | `ArtifactPreview` / `CaseFieldReportVisual` / `TutorialReplay` 的 8–11px 任意字号抬到 `text-micro` / `text-caption` / `text-meta`；`TutorialCenter` 折叠区其余 10.5px 未动（量大、需逐处看 390px） | 视觉（`tutorials-case-detail--mobile` 图稿不溢出） | `e722bdf5f` / `36ba6e6f0` |
+| TU-23 | P3 | ✅ | `<main className="tutorial-detail relative …">` | 仓外探针未复跑（jsdom 无布局）；after 首批 108 张无一被顶出 header | `e722bdf5f` |
+| TU-24 | P3 | ◐ | `ViewTab` `aria-pressed` → `aria-current=page`；`CategoryChip` / 侧栏分类 `aria-pressed`；状态播报统一 `<output>`；分类簇 `fieldset`。**未做**：卡片按钮内容模型（整卡 `<button>` 内嵌块级）、切视图焦点交接、「跳到正文」链接 | `TutorialCenter.test`（menuitem / status 断言） | `e722bdf5f` / `527a514e2` |
+| TU-25 | P3 | ✅ | hero 在子视图 / 详情下收成一行工具栏（`compactHero`，h1 `sr-only` 保留语义）；目录 / 我的发布加载期 `ListSkeleton`；投稿 / 快照 / 撤回成功 `toast`；术语统一「教程工作室」「我的发布」 | `CommunityTutorials.test`（既有 8 例回归） | `d6eb6ef35` |
+| TU-26 | P3 | ✅ | 字节走 `lib/chat/download.formatBytes`（快照成果 / 发布对话框成果）；「提交于」`dateStyle: medium` + `timeStyle: short`；hint 去 `htmlpreview`；「内容版本 N」收进 `data-content-version` | `SnapshotTutorialDetail.test` / `PublishFromSessionDialog.test` / `CommunityTutorials.test`（不含 `:ss`） | `e722bdf5f` / `d6eb6ef35` |
+| TU-27 | P3 | ✅ | `snapshotSubmitIssue`（没有标题 / 摘要不足 10 字 / 无可公开消息）显示在 footer 左侧 `<output>`，主按钮据此禁用 | `PublishFromSessionDialog.test`「主按钮禁用时写明原因…」 | `d6eb6ef35` |
+| TU-28 | P3 | ✅ | `SHOWCASE_IFRAME_SANDBOX`（`allow-scripts allow-downloads allow-popups allow-popups-to-escape-sandbox`，**无** `allow-same-origin`）用于展厅两类 iframe；社区投稿 `HTML_EMBED_SANDBOX` 不动；预览区 `h-[min(70dvh,570px)] bg-surface`，加载期 `Skeleton` 铺满 | `CaseShowroom.test` / `SignatureShowcases.test`（沙箱含 downloads、不含 same-origin）、`tutorialStudio.test` `htmlEmbedSandboxIsSafe` 不变 | `36ba6e6f0` |
+| TU-29 | P3 | ◐ | hero 渐变 `/90` → `/97`，封面 `object-position: 78% center`。after 桌面图里「下一颗星球，由你定义。」仍隐约可见（封面图自带大字，`cover.png` 归资产不动），已明显减弱 | 视觉 | `36ba6e6f0` |
+| TU-30 | P3 | ✅ | `AstropyPatch` 上下文行 `hidden sm:block break-all`，徽章行 `flex-wrap`；390px 下不再重叠 | 视觉（`tutorials-case-detail--mobile`） | `36ba6e6f0` |
+| TU-31 | P3 | ✅ | 第 4 步 `topicId` → `session-goal`，正文改「方向不对就暂停，改一改目标再继续」（拍板②） | `tutorialJourneys.test`「主线每一步指向不同章节」 | `e722bdf5f` |
+| TU-32 | P3 | ◐ | `TutorialActionContext.taskboardEnabled?`；显式 `false` 时任务面板 CTA `enabled:false` +「当前部署未开启任务面板。」。App 侧 `taskboardEnabled: TASKBOARD_ENABLED` 一行交集成③（§9） | `tutorialSystem.test`「部署关掉任务面板时…」 | `36ba6e6f0` |
+| TU-33 | P3 | ✅ | 顶部搜索 `text-base md:text-body` | — | `e722bdf5f` |
+| TU-34 | P3 | ⏸ | 十余处品牌深蓝 `#07111f / #080e19 / #101624` 未换：改 `bg-fg` 会让 hero 在亮色下成纯黑、暗色下反转成浅底，与图稿 / 精选作品封面的深色调冲突；等 shell `--hero-bg` token（§9） | — | — |
+| TU-35 | P3 | ✅ | `ReadonlyTextArtifact` 空文本 → 「这份文本成果内容为空。」 | — | `d6eb6ef35` |
+| TU-36 | P3 | ⏸ | `.gitattributes` 归仓库根（集成② 已列入）；本工作树夹具此前已手工 LF 还原，`tutorialShowcase.test` 4/4 绿 | — | — |
+| TU-37 | P3 | ⏸ | `scripts/check-v5-tutorials.ts` 路径归一化未做（任务书：Windows 下 `check:tutorials` 默认红，标 NOT RUN 不绕）；修法仍是 §4 那一行 `replaceAll("\\", "/")` | — | — |
+
+计划外：
+
+- 窄屏页签：390px 下「案例展厅 / 快速上手 / 功能参考」+「帮助与创作」放不下带图标版本，第三个页签被裁一半（after 首批
+  `tutorials-feature-search-hit--mobile` 暴露）→ `ViewTab` 图标 `max-sm:hidden`、`px-2.5 sm:px-3`（`527a514e2`）。
+- 截图台 `scenes-tutorials.tsx` 的 `clickByText`：Radix 触发器不响应 `click`，先发 `pointerdown` 再 `click`，并识别
+  `[role=menuitem]`——否则所有经「帮助与创作」进入的场景都停在展厅（`527a514e2`）。
+- biome `useSemanticElements`：7 处 `p/div[role=status]` → `<output>`、分类簇 `div[role=group]` → `fieldset`（`527a514e2`）。
+
+## 7. 验证（阶段 B）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0（每次提交前各跑一次） |
+| 模块单测 | `npx vitest run src/components/TutorialCenter.test.tsx src/components/tutorials src/lib/tutorial{Journeys,Studio,Api,System,Showcase}.test.ts --maxWorkers=1` | ✅ 12 文件 / 95 例全绿（阶段 A 基线 12 / 82，其中 `tutorialShowcase` 2 例因 autocrlf 红；本工作树夹具已 LF 还原后 4/4 绿）。新增 13 例：TutorialCenter +6、CaseShowroom +1、CommunityTutorials +3、PublishFromSessionDialog +1、tutorialJourneys +1、tutorialSystem +1；另 4 处既有断言按新文案 / 沙箱更新 |
+| 代码风格 | `npx biome lint` 22 个改动文件（含删除前的对照） | ✅ 阶段 B 新增 0：`TutorialCenter.tsx` 4 → 2（去掉 2 条 `useKeyWithClickEvents`，余 1 `useExhaustiveDependencies` + 1 `noShadowRestrictedNames` 为基线）；`CommunityTutorials.tsx` 1（基线）；其余文件与基线逐条相同或 0；新增 / 重写的 `scenes-tutorials.tsx` 0 |
+| 视觉 after | `OC_UI_SCENES=tutorials`、`OC_UI_SHOT_DELAY=900` → `D:\code\test_project\test123\.audit-tmp\tutorials\after\` | ✅ 27 场景 × desktop/mobile × light/dark = 108 张，`failures: []` / `retried: []` / `unmockedApi: []`（两轮：首轮暴露菜单场景与窄屏页签问题，修后复拍） |
+| 门禁 | `npm run check:tutorials` | **NOT RUN**：未改 `lib/tutorial*Catalog.ts` 与 `public/tutorials` 数据（`TUTORIAL_QUICKSTART` / `TUTORIAL_PENDING_CAPTURE_LABEL` 不在哈希内）；Windows 下该门禁因 TU-37 默认红，任务书要求不绕 |
+| 全量 / 浏览器门 | `npm test` / `npm run test:browser` | **NOT RUN**：改动限于 tutorials 归属 + `lib/tutorialStudio` / `tutorialActions` 纯函数；未触碰 Composer / 消息 / 工具卡 / 侧栏；全量门交集成③ |
+
+after 对照（Read 逐张，`before/` ↔ `after/`）：
+
+- `tutorials-showroom--desktop--light` —— nav 三页签（案例展厅 / 快速上手 / 功能参考）；免责声明由几乎不可读变为清晰可读；封面幽灵字明显减弱。
+- `tutorials-help-menu-open--{desktop,mobile}--light` —— 真菜单（图标 + 两项），390px 下三页签完整不裁切。
+- `tutorials-feature-search-hit--mobile--light` —— 「2 篇匹配「GitHub」」+ 两条结果直接列出（此前与未搜索时逐像素相同）。
+- `tutorials-case-gallery--desktop--light` —— hero 改人话 + 「12 条脚本」；分类 chip + 搜索 + 「12 / 12 条」；卡片徽章「任务脚本 · 尚无真实运行记录」，图稿「示意图稿 / 观察记录 · 非平台验证」。
+- `tutorials-case-detail--mobile--light` —— 横幅只说一次；图稿代码行不再重叠；「返回案例列表」为 Button。
+- `tutorials-quickstart--desktop--light` —— 第 4 步指「设定目标」。
+- `tutorials-studio-submit--desktop--light` —— hero 收成一行；占位符真正换行；hint 带最小字数。
+- `tutorials-studio-error--desktop--light` —— 只有错误条 + 「重试」，不再与空态同屏。
+- `tutorials-studio-mine--desktop--light` —— 「提交于 2026年8月18日 17:12」不带秒。
+- `tutorials-studio-snapshot--desktop--light` —— 分类「编码」而非 `coding`。
+
+## 8. 遗留
+
+| 项 | 归属 / 原因 | 建议 |
+|---|---|---|
+| TU-17 深链 `view=` / `work=` | shell `useAppRoute` + `App.tsx` | 本模块 state 已上提，shell 接 `?panel=help&view=&work=` 后本模块只需把 `browseView` / `signatureWorkId` 改受控（一层 props） |
+| TU-21 CTA 文案五种 + 字面量比较 | 产品口径 + `App.tsx:3117` 传参 | 统一「带着我的材料开始 / 登录后带着材料开始」并加 `requiresLogin` prop；需同批改 3 个组件用例与场景 |
+| TU-34 品牌深蓝 hero | shell token | `styles.css` 加 `--hero-bg / --hero-fg` 后一次替换 |
+| TU-19 已读判定 0.9s | 产品口径 | 改「停留 ≥ 8s 或滚到 60%」会让老用户已读勾号变少，先问再改 |
+| TU-20 统一复制 hook | 打磨 | 三处复制反馈已各有失败出口，统一 hook 收益小 |
+| TU-22 / TU-24 余量 | 打磨 | 折叠区 10.5px 字号、卡片内容模型、焦点交接、跳到正文 |
+| TU-36 `.gitattributes` | 仓库根（集成②） | 已在集成② 清单 |
+| TU-37 门禁路径归一化 | `scripts/check-v5-tutorials.ts` | 一行 `replaceAll("\\", "/")`，CI（POSIX）无感 |
+
+## 9. 跨模块接线（给集成③ / owner）
+
+| 对象 | 文件 | 改动 | 为什么 |
+|---|---|---|---|
+| shell | `App.tsx:1589-1600` `tutorialActionContext` | 加 `taskboardEnabled: TASKBOARD_ENABLED` 一行 | TU-32 本模块已支持，未接线前行为与现状一致（按开启处理） |
+| shell | `hooks/useAppRoute.ts`、`App.tsx` | `?panel=help` 增 `view=start\|cases`、`work=planet\|gravity` 并镜像 / 反灌 | TU-17 / TU-02 深链 |
+| shell | `styles.css` | （可选）`--hero-bg / --hero-fg` | TU-34 |
+| 指挥官 | 仓库根 `.gitattributes` | 教程夹具 `-text` | TU-36 |
