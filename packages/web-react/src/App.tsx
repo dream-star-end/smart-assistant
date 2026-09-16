@@ -103,8 +103,13 @@ import {
   parseSessionPath,
   parseTutorialCase,
   parseTutorialCommunity,
+  parseTutorialStep,
+  parseTutorialTab,
   parseTutorialTopic,
+  parseTutorialWork,
   preferredBoardView,
+  type TutorialTab,
+  type TutorialWorkId,
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
@@ -328,6 +333,11 @@ export function App() {
   const bootTutorialTopic = routingEnabled && !bootTutorialCase && !bootTutorialCommunity
     ? parseTutorialTopic(params)
     : null;
+  // 教程中心一级页签 / 精选作品 / 目标步骤深链（tutorials 审计 TU-17）：解析函数自带互斥，
+  // 有 topic/case/community 时 tab、work 为 null；step 只跟 topic。
+  const bootTutorialTab = routingEnabled ? parseTutorialTab(params) : null;
+  const bootTutorialWork = routingEnabled ? parseTutorialWork(params) : null;
+  const bootTutorialStep = routingEnabled ? parseTutorialStep(params) : null;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -426,6 +436,10 @@ export function App() {
   const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
   const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
   const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(bootTutorialCommunity);
+  // 一级页签（null = 案例展厅，不进 URL）/ 精选作品 / 功能教程目标步骤：镜像到 ?tab= / ?work= / ?step=。
+  const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(bootTutorialTab);
+  const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(bootTutorialWork);
+  const [tutorialStep, setTutorialStep] = useState<number | null>(bootTutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -550,6 +564,9 @@ export function App() {
       setTutorialCase(keepPublicTutorial ? parseTutorialCase(publicQuery) : null);
       setTutorialTopic(keepPublicTutorial ? parseTutorialTopic(publicQuery) : null);
       setTutorialCommunity(keepPublicTutorial ? parseTutorialCommunity(publicQuery) : null);
+      setTutorialTab(keepPublicTutorial ? parseTutorialTab(publicQuery) : null);
+      setTutorialWork(keepPublicTutorial ? parseTutorialWork(publicQuery) : null);
+      setTutorialStep(keepPublicTutorial ? parseTutorialStep(publicQuery) : null);
       setView("home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
@@ -1593,6 +1610,9 @@ export function App() {
     setTutorialTopic(id ?? null);
     setTutorialCase(null);
     setTutorialCommunity(null);
+    setTutorialTab(null);
+    setTutorialWork(null);
+    setTutorialStep(null);
     setTutorialOpen(true);
   }, []);
 
@@ -3050,7 +3070,10 @@ export function App() {
     activeTopic: tutorialOpen ? tutorialTopic : null,
     activeCase: tutorialOpen ? tutorialCase : null,
     activeCommunity: tutorialOpen ? tutorialCommunity : null,
-    onPopPanel: (panel, topic, caseId, communityId) => {
+    activeTutorialTab: tutorialOpen ? tutorialTab : null,
+    activeTutorialWork: tutorialOpen ? tutorialWork : null,
+    activeTutorialStep: tutorialOpen ? tutorialStep : null,
+    onPopPanel: (panel, topic, caseId, communityId, extras) => {
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
@@ -3060,10 +3083,16 @@ export function App() {
         setTutorialTopic(topic);
         setTutorialCase(caseId);
         setTutorialCommunity(communityId);
+        setTutorialTab(extras.tab);
+        setTutorialWork(extras.work);
+        setTutorialStep(extras.step);
       } else {
         setTutorialTopic(null);
         setTutorialCase(null);
         setTutorialCommunity(null);
+        setTutorialTab(null);
+        setTutorialWork(null);
+        setTutorialStep(null);
       }
     },
     workspace: TASKBOARD_ENABLED && boardOpen ? "board" : "chat",
@@ -3122,7 +3151,14 @@ export function App() {
               topicId={tutorialTopic}
               caseId={tutorialCase}
               communityId={tutorialCommunity}
+              browseView={tutorialTab ?? "showcase"}
+              onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
+              signatureWorkId={tutorialWork}
+              onSignatureWorkChange={setTutorialWork}
+              stepIndex={tutorialStep}
               onTopicChange={(id) => {
+                // 用户自己换篇：深链带来的目标步骤不再适用。
+                if (id !== tutorialTopic) setTutorialStep(null);
                 setTutorialTopic(id);
                 setTutorialCase(null);
                 setTutorialCommunity(null);
@@ -3131,17 +3167,20 @@ export function App() {
                 setTutorialCase(id);
                 setTutorialTopic(null);
                 setTutorialCommunity(null);
+                setTutorialStep(null);
               }}
               onShowCaseGallery={() => {
                 setTutorialCase(null);
                 setTutorialTopic(null);
                 setTutorialCommunity(null);
+                setTutorialStep(null);
               }}
               onCommunityChange={(id) => {
                 setTutorialCommunity(id);
                 if (id) {
                   setTutorialTopic(null);
                   setTutorialCase(null);
+                  setTutorialStep(null);
                 }
               }}
               caseActionLabel="登录后试用"
@@ -3163,6 +3202,9 @@ export function App() {
               onClose={() => {
                 setTutorialOpen(false);
                 setTutorialCommunity(null);
+                setTutorialTab(null);
+                setTutorialWork(null);
+                setTutorialStep(null);
               }}
               actionState={() => ({
                 enabled: true,
@@ -4187,7 +4229,14 @@ export function App() {
             topicId={tutorialTopic}
             caseId={tutorialCase}
             communityId={tutorialCommunity}
+            browseView={tutorialTab ?? "showcase"}
+            onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
+            signatureWorkId={tutorialWork}
+            onSignatureWorkChange={setTutorialWork}
+            stepIndex={tutorialStep}
             onTopicChange={(id) => {
+              // 用户自己换篇：深链带来的目标步骤不再适用。
+              if (id !== tutorialTopic) setTutorialStep(null);
               setTutorialTopic(id);
               setTutorialCase(null);
               setTutorialCommunity(null);
@@ -4196,17 +4245,20 @@ export function App() {
               setTutorialCase(id);
               setTutorialTopic(null);
               setTutorialCommunity(null);
+              setTutorialStep(null);
             }}
             onShowCaseGallery={() => {
               setTutorialCase(null);
               setTutorialTopic(null);
               setTutorialCommunity(null);
+              setTutorialStep(null);
             }}
             onCommunityChange={(id) => {
               setTutorialCommunity(id);
               if (id) {
                 setTutorialTopic(null);
                 setTutorialCase(null);
+                setTutorialStep(null);
               }
             }}
             caseActionLabel="带着指令去对话"
@@ -4225,6 +4277,9 @@ export function App() {
             onClose={() => {
               setTutorialOpen(false);
               setTutorialCommunity(null);
+              setTutorialTab(null);
+              setTutorialWork(null);
+              setTutorialStep(null);
             }}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}
