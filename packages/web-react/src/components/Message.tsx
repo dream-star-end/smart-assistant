@@ -72,17 +72,20 @@ export function AssistantMessage({
       </Avatar>
       <div className="min-w-0 flex-1">
         {message.content ? (
-          <OptionsGroupProvider>
+          // live 与 chat/cards 同口径:流式期 options 块禁止隐式发送(demo 下 ChatInteraction 为空,
+          // 块本就不可交互,但契约要一致,别让 demo 通道成为唯一「流式也点击即发」的路径)。
+          <OptionsGroupProvider live={!!streaming}>
             {/* 流式光标由 Markdown 内联到最后一个文本块末尾(与 chat/cards 同一实现)。 */}
             <Markdown caret={!!streaming}>{message.content}</Markdown>
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : streaming ? (
-          <div className="flex items-center gap-1.5 py-1 text-muted">
-            <span className="size-2 animate-pulse rounded-full bg-muted" />
-            <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:200ms]" />
-            <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:400ms]" />
-          </div>
+          // 三点跳动只有视觉,给读屏一个状态名;aria-hidden 掉装饰点。
+          <output aria-live="polite" aria-label="正在生成回复" className="flex items-center gap-1.5 py-1 text-muted">
+            <span aria-hidden className="size-2 animate-pulse rounded-full bg-muted" />
+            <span aria-hidden className="size-2 animate-pulse rounded-full bg-muted [animation-delay:200ms]" />
+            <span aria-hidden className="size-2 animate-pulse rounded-full bg-muted [animation-delay:400ms]" />
+          </output>
         ) : null}
         {!streaming && message.content && (
           <div className={DEMO_ACTIONS_CLASS}>
