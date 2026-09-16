@@ -789,7 +789,8 @@ export function ImageAnnotationEditor({
               title="关闭 (Esc)"
               // 走 requestClose:脏状态先弹确认,空白直接退(需求 §5)。
               onClick={requestClose}
-              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+              // 触屏补到 44px(a11y-B media#2);桌面 40px 圆钮不变。
+              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
             >
               <X size={20} />
             </button>
