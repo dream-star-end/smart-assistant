@@ -155,7 +155,7 @@ TU-37（`scripts/check-v5-tutorials.ts` 标记路径反斜杠进哈希）是脚�
 
 ### 7. 遗留 / 集成③ 范围
 
-- 待合入：settings 二期 `5eac1b807`（3 提交）、tutorials-B、以及其余二期分支（messages2 / taskboard2 待验收，manage2 待领）。
+- 待合入：settings 二期 `5eac1b807`（3 提交）、tutorials-B、以及其余二期分支（messages2 / taskboard2 待验收，manage2 待领）。→ **集成③ 已全部合入**（见下文集成③ §1）。
 - 待接线 / 待办（原登记：composer 排队气泡 `status=queued`、C-32 团队卡文案、media X-M2 / X-M3 / X-M4、`typecheck:preview` 消红、TU-37）→ **已由 t-865 逐条处置，见 §7.1**。
 - 合入 canonical `feat/v5-selfhost` 与 Lease Center 发布需要 v5-dev 通道，本轮不做（决策 d-24）。
 - 各成员分支的合入状态单见 §8。
@@ -177,6 +177,8 @@ TU-37（`scripts/check-v5-tutorials.ts` 标记路径反斜杠进哈希）是脚�
 
 ### 8. 分支合入状态单（指挥官要求 · 集成③ 照单接棒）
 
+> 本单为集成② 交棒时（`1d8eaf769`，2026-09-16 23:15）的快照，保留作接棒依据；**集成③ 合入后的现状见下文「集成③ §8」**。
+
 按 `git merge-base <分支> HEAD` 与 `git rev-list --count HEAD..<分支>` 现算于 integration `1d8eaf769`（2026-09-16 23:15）；12 条分支远端 = 本地。
 
 | 模块分支 `feat/v5-selfhost-audit-*` | 已合入到（合并提交） | 分支现 HEAD | 未合入提交 | 对应任务 / 状态 |
@@ -195,3 +197,121 @@ TU-37（`scripts/check-v5-tutorials.ts` 标记路径反斜杠进哈希）是脚�
 | tutorials | 基线 `210b99678`（**从未合入**） | `d6eb6ef35` | **5** | tutorials-A t-52 已验收 3 提交（`be7ddf00b` 改 `browser-tests/ui-preview` 内联 bundle 转义，harness 共享文件；`5023c70fd` 27 个场景；`5bf80f0bc` 报告）+ tutorials-B t-53 进行中 → 集成③ 待合 |
 
 集成③ 顺序建议：settings（已验收）→ messages2 / taskboard2 / manage2 / market2 按验收先后 → tutorials（A+B 一起；`be7ddf00b` 与 integration 上的截图台外链 bundle 改动同文件，留意三方合并）。每合一条跑 typecheck；合完复跑 §5 四道门，`.gitattributes` 已在，教程夹具不再需要手工重检。
+
+## 集成③（t-631 · 2026-09-16 23:43 – 09-17 01:45 · 合并 / 接线 fable-5-1-54 → 门禁探测 fable-5-1-16 → 拍板落地 / 全量门 / 记录 / 推送 fable-5-1-22）
+
+> 接手说明：fable-5-1-54 按任务书完成 6 步 `--no-ff` 合并、`App.tsx` 接线（`bdf7b4d15`）与 q-979 两处 `data-product-control`（`c034f05d7`）后于 00:05 掉线，全部已提交、未推送；
+> fable-5-1-16 接手复跑 `check:tutorials`、定位入口身份漂移根因并探测修法、开决策卡 q-1043（随当时指挥官掉线未获裁决）、在探测改动下跑完 typecheck / typecheck:preview / `npm test`（00:41–00:53）后掉线；
+> 本会话接手时逐条核对 8 个提交的双亲与 `rev-list HEAD..成员 = 0`、树内无冲突标记、探测改动仅 2 个属性未提交，重开决策卡 q-1076（→ A），随后落地、复跑全量门、写本节并推送。
+
+### 1. 合入顺序与 SHA
+
+起点 `1e4328ac9`（集成② 终点，含 t-865 待办清理）。顺序按 §8 状态单；media-B `8834aca08` 已在集成② `10398baa9` 合入，本轮核对 `git merge-base --is-ancestor` 为真、未合入提交 0。
+
+| 序 | 成员分支 @ HEAD | 合并提交 | 文件 / 行 |
+|---|---|---|---|
+| 1 | settings 二期 t-628 `feat/v5-selfhost-audit-settings@5eac1b807` | `12fc17579` | 6 files, +366/−8 |
+| 2 | messages2 t-629 `feat/v5-selfhost-audit-messages@2abe389a9` | `cd58600e8` | 1 file, +13 |
+| 3 | taskboard2 t-630 `feat/v5-selfhost-audit-taskboard@05dd185df` | `425655631` | 2 files, +20/−1 |
+| 4 | manage2 t-626 `feat/v5-selfhost-audit-manage@6fae01440` | `c761bbd93` | 6 files, +212/−73 |
+| 5 | market2 t-625 `feat/v5-selfhost-audit-market@5391c150a` | `be20adaec` | 14 files, +839/−195 |
+| 6 | tutorials A+B t-52 / t-53 `feat/v5-selfhost-audit-tutorials@02c358655`（A `be7ddf00b…5bf80f0bc` 3 提交 + B `e722bdf5f…02c358655` 6 提交） | `ce767d8ce` | 25 files, +2404/−934 |
+
+六步合计 54 files, +3854/−1211。全部 `git merge --no-ff`，未 rebase / squash；`git rev-list --count HEAD..<成员 HEAD>` 对 6 条均为 0（12 条分支全表见 §8）。
+集成③ 自有提交 5 个：`bdf7b4d15` feat App 接线（§3）、`c034f05d7` chore 入口覆盖补标（§4 q-979）、`29a277b25` chore 两处入口降级（§4 q-1076）、`b249317f4` chore 教程同步快照 accept（§4）、docs 本文。
+
+### 2. 冲突与取舍
+
+前 5 条零重叠（预检同集成②：成员改动集 ∩ integration 自 merge-base 以来改动集 = ∅，合并结果逐文件等于成员版本）。
+**唯一冲突**：tutorials `browser-tests/ui-preview/shoot.mjs` —— tutorials-A `be7ddf00b` 对内联 `<script>` bundle 做 HTML 脚本数据转义（`<!--` / `</script`），
+integration 侧（messages 场景 09-15 首次命中同一问题）已改为经 `page.route` 外链脚本供出、不再内联，两者解决同一件事 → **取 integration 版本**（外链方案覆盖面更广，转义随之不再需要）；
+tutorials 场景文件 `scenes-tutorials.tsx` 不受影响，本轮全量截图 27 个 tutorials 场景 108 张全成（§5），证明取舍无副作用。
+
+### 3. 跨模块接线（各模块文档登记 → 本轮落地）
+
+| 来源 | 登记位置 | 落地 | 用例 | 提交 |
+|---|---|---|---|---|
+| tutorials TU-32 任务面板 CTA 门禁 | tutorials.md §9 ① | `App.tsx` `tutorialActionContext` 加 `taskboardEnabled: TASKBOARD_ENABLED`（与 `runTutorialAction` 的 taskboard 分支同一开关；selfhost 默认开启，行为不变） | tutorials-B `tutorialSystem.test`「部署关掉任务面板时…」；App 侧一行由 `App.test` 回归覆盖 | `bdf7b4d15` |
+| tutorials TU-17 / TU-02 深链 `?panel=help` + `view=start\|cases`、`work=planet\|gravity` | tutorials.md §9 ② | **登记待办**（tutorials-B 自标「可后做」，shell `useAppRoute` + `App.tsx` 解析 / 回写；不在集成③ 完成判据内） | — | — |
+| tutorials TU-34 hero 品牌深蓝 token `--hero-bg / --hero-fg` | tutorials.md §9 ③ | **登记待办**（可选，shell `styles.css`；换 `bg-fg` 会破坏深色 hero，需 token 才能收口） | — | — |
+| tutorials TU-36 教程夹具 `.gitattributes -text` | tutorials.md §9 ④ | **已由集成② `419e0d218` 落地**，本轮核对 `git ls-files --eol` 三份同步文件 `i/lf w/lf attr/-text` | — | — |
+| tutorials TU-37 门禁标记路径归一化 | 集成② §7.1 转 t-53 | 随 tutorials `02c358655` 合入；`check:tutorials` 在 Windows 首次真跑到底，由此暴露 §4 两件事 | `check:tutorials` | `ce767d8ce` |
+| media X-M2 / X-M3 / X-M4 | media.md §6.3 | **已由 t-865 落地**（集成② §7.1），本轮核对 `styles.css` caption token、`Sheet closeButton`、`MediaTaskCenter onReusePrompt` 均在 HEAD | 集成② 已覆盖 | — |
+| settings 二期 关于页「备案」占位判据 | settings.md §9.1 `hasIcpNumber(BRAND.icp)` | **登记可选去重**：settings 侧代码注释标注「集成③ 合入后可改为直接引用 landing `lib/legal.ts` `filedIcp()`」；两处判据一致，非必需，留 owner | — | — |
+| messages2 / taskboard2 / manage2 / market2 | 各 `docs/audit/*.md` 二期小节 | **无 App / shell 接线登记**；manage2 X-03 `cronHuman` 为纯函数，taskboard / tools 侧使用方单测已在成员分支单跑绿 | 全量 `npm test`（§5） | — |
+| `check:tutorials` 入口覆盖 2 处存量漏标 | q-979（fable-5-1-54 开卡，fable-5-1-53 拍板 `fix_in_integ3`） | `ChatHeader.tsx:356` 「导出会话」`DropdownMenuItem`（composer-B `c250a6011` 引入）与 `Sidebar.tsx:955` 「清除搜索」`IconButton`（sidebar `17710a62` 引入）位于 `data-product-entry-scope` 内却无标记 → 照同文件 `ChatHeader.tsx:351` 既有写法补 `data-product-control`。非本轮合入引入，是门禁首次真跑暴露的存量漏标 | `check:tutorials` 入口覆盖转绿 | `c034f05d7` |
+| `check:tutorials` 入口身份变化 2 处 | q-1076（本会话开卡，fable-5-1-18 拍板 A） | 见 §4 | `check:tutorials` 入口身份变化 = 无 | `29a277b25` |
+
+### 4. `check:tutorials` 门禁：入口覆盖 → 教程同步快照漂移（**用户终审请确认**）
+
+**背景。** `scripts/check-v5-tutorials.ts` 在 `check:v5` CI 链里：把带 `data-product-feature` 标记的功能源文件按 JSX 语义进哈希（`sourceHash`）、把入口元素身份（文件 / 组件 / asChild / 条件包裹）进哈希（`entryIdentityHash`），与 `packages/web-react/tutorial-sync.json` 比对；漂移时要求人工确认「26 篇教程仍与功能一致」后 `npm run tutorials:accept`。
+Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项全红）掩盖，**tutorials-B 修好 TU-37 并随本轮合入后，它第一次在本机真跑到底**，于是在 integration 上一次性暴露集成①②③ 合入全部 B 阶段分支的累积结果：
+
+| 时间 | HEAD | 结果 | 处置 |
+|---|---|---|---|
+| 23:55 | `bdf7b4d15` | 入口覆盖 2 红（`integ3-check-tutorials.log`） | q-979 → `c034f05d7` 补两处 `data-product-control` |
+| 23:56 | `c034f05d7` | 「教程同步快照已漂移」：功能源变化 17 项 + 入口身份变化 2 项（agents、chat-basics）；教程正文 / 媒体 / 场景案例 / 能力注册表 / 新增 / 下线均无（`integ3-check-tutorials-2.log`） | q-988 → `accept_in_integ3`（附三条要求：抄检两篇教程、note 注明代确认、17+2 清单进本文） |
+| 00:40 | 探测 | `accept()` 硬规则：普通 accept 要求每个功能源变化的能力**同时改教程正文并抬 `contentVersion`**（17 篇都没改 → 逐条 fail）；`--source-only --ids` 只要存在入口身份变化就整体拒绝 → q-988 的「直接 accept」两条路都堵。根因：composer-B 各新增了第 3 个 `data-product-feature` 入口 —— agents = `AgentPicker` 未就绪智能体卡拆出的独立 `<button aria-disabled>`「前往授权 / 修复所需能力」（C-06）；chat-basics = `Composer` 生成中「排队发送」`IconButton`（C-02）。门禁设计即「新增教程 CTA 入口必须同步教程正文」。把这 2 处 `data-product-feature` 改为 `data-product-control` 后入口身份变化 = 无（`integ3-check-tutorials-probe.log`） | q-1043（fable-5-1-16 开卡，随指挥官掉线未裁）→ **q-1076（本会话重开）→ A `demote_then_source_only`**，拍板人 fable-5-1-18 |
+| 01:10 | `29a277b25` | 两处降级：仍登记为已覆盖控件（入口覆盖校验通过），只不再作为教程 CTA 聚焦目标；默认卡 / textarea / 顶栏 / 侧栏入口不变；UI 零变化；grep 全部 `*.test.*` / `browser-tests/**` 无用例断言这两处属性；代码注释标明原因与恢复条件 | `chore(v5)` 单独提交 |
+| 01:14 | `b249317f4` | `npm run tutorials:accept -- --source-only --ids <17 项> --note "…"` → `tutorials:accept OK · source-only · 17 capability snapshots changed · 0 case`；`check:tutorials OK · 26 capabilities · 12 real-world cases · 26 media pairs · 2390809 B`（`integ3-tutorials-accept.log` / `integ3-check-tutorials-3.log`） | 三份同步文件（`tutorial-sync.json` / `tutorial-sync-history.jsonl` 第 67 条 / `tutorial-sync-history-head.json`）`chore(v5)` 单独提交 |
+
+**17 + 2 漂移清单。**
+
+- 功能源变化（17，全部按 `--source-only` 作「入口 JSX 内部等价重构」接受）：`advisor-mode`, `agents`, `billing-usage`, `chat-basics`, `container-web-preview`, `feedback-support`, `files-media`, `github-repository`, `image-create-edit`, `inbox`, `marketplace-publishing`, `memory-auto-dream`, `models-reasoning`, `preferences`, `sessions-history`, `team-mode`, `voice-input`。来源是各模块 B 阶段对入口元素的 UI/UX / 文案 / 可访问性修改（`aria-*`、触控尺寸、原语替换、文案改写等），未删减能力、未改入口语义；tutorials-A 审计（t-52）亦未发现教程与功能不符。
+- 入口身份变化（2，已由 `29a277b25` 降级消除）：`agents` ← `AgentPicker.tsx` C-06 去授权卡按钮（composer-B `650faa009`）；`chat-basics` ← `Composer.tsx` C-02「排队发送」（composer-B `ace3fcf73`）。
+
+**抄检结果（q-988 要求 ①，fable-5-1-16 首查、本会话复核）。** 两篇教程正文（`lib/tutorialCatalog.ts` `chat-basics` v8 / `agents` v4）引用的入口文案与 HEAD 实际文案逐条一致：侧栏「新建会话」（`Sidebar.tsx:885`）、「选择智能体后新建」（`Sidebar.tsx:892`）、顶栏「切换智能体，当前 {助手名}」（`ChatHeader.tsx:198`）、回形针「添加附件」（`Composer.tsx:696`）、「+」菜单「设定目标」（`Composer.tsx:753`）、全能助手卡「单人 / 顾问 / 团队」（`AgentPicker.tsx:163–207`）。两篇均未引用「队长切换为…」句式（那句在 `team-mode` 正文，C-32 改的是 AgentPicker 副标题，`team-mode` 本轮无正文变化）。
+**唯一不一致**：两篇正文都没有描述 composer-B 新增的「去授权 / 去处理」与「排队发送」两个入口 —— 属内容补充项，不在集成③ 改（q-988 口径），已由指挥官预排 **t-1046 tut-sync-2「tutorials·补写 agents / chat-basics 正文」**：补写并抬 `contentVersion` 后把两处属性恢复为 `data-product-feature`，走普通 `tutorials:accept`（tutorial-sync 模式）。
+
+**note 原文**（`tutorial-sync-history.jsonl` 第 67 条）：「v5 个人版审计 B 阶段各模块 UI/UX 修复致功能源漂移（17 项），教程正文与媒体未变，经各模块审计与 tutorials-A 复核仍一致；composer-B 新增的去授权 / 排队发送两处入口按 q-1076 登记为控件，入口身份不变；由指挥官 fable-5-1-18 代用户确认（q-988 → q-1076），待用户终审」。
+**可逆性**：用户不认可 → `git revert b249317f4 29a277b25` 即回到 accept 前状态（`check:tutorials` 重新报 17+2 漂移，其余门不受影响）。
+
+### 5. 全量门结果（最终 HEAD 源码态 = `b249317f4`）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0（25s，`integ3-typecheck-2.log`；`c034f05d7` 上 `integ3-typecheck.log` 亦绿） |
+| 预览台类型检查 | `npm run typecheck:preview --workspace packages/web-react` | ✅ **exit 0，集成② 登记的 3 红全部消除**：TS5097 ×2 由 t-865 `e0f53688a` 开 `allowImportingTsExtensions`；TS2322 `scenes-taskboard.tsx(163,5)` 随 taskboard2 `cb6629bd1` 合入自消（`integ3-typecheck-preview-2.log`） |
+| 教程门禁 | `npm run check:tutorials` | ✅ OK · 26 capabilities · 12 cases · 26 media pairs（§4；accept 前的三次红见 `integ3-check-tutorials{,-2,-probe}.log`） |
+| web-react 全量单测 | `cd packages\web-react; npm test`（`vitest run`） | ✅ **298 文件 / 4213 例全部通过，0 失败**（fable-5-1-16 00:41 起跑 676s，源码态 = `c034f05d7` + 两处属性降级，与最终 HEAD 源码完全一致，`integ3-vitest-all-2.log`）；本会话在 `b249317f4` 复跑（01:28 起，801s）→ ✅ **298 文件 / 4213 例全部通过，0 失败**（`integ3-vitest-all-3.log`） |
+| 真浏览器门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser`（171s） | `run.mjs` 组件门 **T1–T68 全部 ok**（自检「清单 68 条全部执行」，含 tutorials T38 社区教程、settings T42 短名、C-32 相关 ocv5-210 四用例）。随后 `node --test` 16 文件 73 例：**70 通过 / 3 失败** → `cc-switch-ascii-name` ×2（**基线**，与集成② `integ2-test-browser-2.log` 逐条相同：「还没有 API Key」10s 超时 + 模型 id `gemini-3.8-flash` vs `sonnet-5`）、`ocv5-185-qa` 文件级 1（跑时工作树含尚未提交的两处属性探测改动，用例自带 `git diff --exit-code` 拦截；提交 `29a277b25` 后工作树干净、junction 在，单跑 **15/15 ✅** `integ3-ocv5-185-rerun.log`）。日志 `integ3-test-browser.log` |
+| ui-preview 全量截图 | `OC_UI_SHOTS=…\integration\shots-integ3 node browser-tests\ui-preview\shoot.mjs`（不设 `OC_UI_SCENES`，626s） | ✅ **257 场景 / 854 张，failures=0，retried=0**（集成② 为 227 / 734；新增 tutorials 27 场景 108 张 desktop / mobile × light / dark、manage2 `manage-cron-range`、market2 场景等）；`unmockedApi` = `listCronChannels`、`listProjectAssets`（与集成①② 相同，可选桩）。Read 抽看 `tutorials-quickstart--desktop--light`（第 4 步「设定目标」，拍板②）、`tutorials-showroom--mobile--dark` 渲染正常。日志 `integ3-shoot-all.log`，图 `shots-integ3\` |
+| 代码风格 | `npx biome lint` 集成③ 自有提交触碰的 5 个源文件 | `App.tsx` 14（基线 14，`useExhaustiveDependencies`，集成② §7.1 已登记）、`Composer.tsx` 10（基线 10，与 `wt\composer` 同一 blob 逐条同分布：`noNoninteractiveElementToInteractiveRole` 1 / `useExhaustiveDependencies` 6 / `useSemanticElements` 2 / `useTemplate` 1）、`ChatHeader.tsx` / `Sidebar.tsx` / `AgentPicker.tsx` 0 → **新增 0 条** |
+
+### 6. 已知基线失败（本轮更新）
+
+| 项 | 现象 | 状态 |
+|---|---|---|
+| `browser-tests/cc-switch-ascii-name.node-test.mjs` ×2 | 「还没有 API Key」10s 超时；模型 id 断言 `gemini-3.8-flash` vs `sonnet-5` | 基线（集成①②③ 三轮逐条相同） |
+| `browser-tests/ocv5-185-qa.node-test.mjs` | 用例自带 `git diff --exit-code HEAD -- packages/web-react/src packages/protocol/src` + Windows symlink | 环境项：**工作树必须干净** + `node_modules/@openclaude/protocol` junction；满足后 15/15 绿。本轮全量首跑红即因探测改动未提交 |
+| `typecheck:preview` 3 红 | TS5097 ×2 / TS2322 ×1 | ✅ **已解除**（§5） |
+| `check:tutorials` 快照漂移 17+2 | §4 | ✅ **已 accept**（source-only，指挥官代确认，**待用户终审**） |
+| `MessageRenderer.test.tsx` `beforeAll` 超时 / `App.test.tsx` 15s 超时 | 负载偶发 | 本轮两次全量均未复现 |
+
+### 7. 遗留 / 集成④ 范围
+
+- 待合入（t-896 集成④ 任务书为准）：a11y-shell / a11y-mod-a / a11y-mod-b、permission-card-2、三条 QA 复核的修复分支、t-1046 tut-sync-2。
+- 待办登记：tutorials TU-17 深链与 TU-34 hero token（shell）；settings 备案判据可选去重（owner）；**t-1046 补写 agents / chat-basics 正文并抬版后恢复两处 `data-product-feature`**（§4）。
+- 终审导读：§4 的教程同步快照 accept 由指挥官代用户确认（q-988 → q-1076），归档初稿 / 终稿请列入终审导读。
+- 合入 canonical `feat/v5-selfhost` 与 Lease Center 发布需要 v5-dev 通道，本轮不做（决策 d-24）。
+
+### 8. 分支合入状态单（集成③ 终点现算）
+
+按 `git merge-base --is-ancestor <分支 HEAD> HEAD` 与 `git rev-list --count HEAD..<分支 HEAD>` 现算于 integration `b249317f4`（2026-09-17 01:30）；12 条分支远端 = 本地（`git ls-remote` 逐条核对）。
+
+| 模块分支 `feat/v5-selfhost-audit-*` | 分支 HEAD | 合入到 integration 的合并提交 | 未合入提交 |
+|---|---|---|---|
+| shell | `39697560b` | 集成① 起点 `e6f73dd99` 已含 | 0 |
+| sidebar | `25c775295` | 集成① `3cff04c85`（B）→ 集成② `b41e804ac`（二期） | 0 |
+| tools | `d65c6741e` | 集成② `6fa690d7e` | 0 |
+| landing | `b97adb3fb` | 集成② `6201518b2` | 0 |
+| media | `8834aca08` | 集成② `10398baa9` | 0 |
+| composer | `70d3db8b3` | 集成② `ae0b0cb64` | 0 |
+| settings | `5eac1b807` | 集成② `5e5ed6925`（B + 补丁①）→ **集成③ `12fc17579`**（二期 t-628） | 0 |
+| messages | `2abe389a9` | 集成① `985b3ae57`（B）→ **集成③ `cd58600e8`**（二期 t-629） | 0 |
+| taskboard | `05dd185df` | 集成① `bf8188def`（B）→ **集成③ `425655631`**（二期 t-630） | 0 |
+| manage | `6fae01440` | 集成① `09a13a472`（B）→ **集成③ `c761bbd93`**（二期 t-626） | 0 |
+| market | `5391c150a` | 集成② `ab765669a`（B）→ **集成③ `be20adaec`**（二期 t-625） | 0 |
+| tutorials | `02c358655` | **集成③ `ce767d8ce`**（A t-52 + B t-53，含 TU-37 / TU-22 追加提交） | 0 |
+
+集成④ 接棒：从本轮终点 HEAD 起合入 §7 待合分支；`.gitattributes`、`allowImportingTsExtensions`、junction 均已在；`check:tutorials` 现为绿门，合入 t-1046 后需按 §4 恢复两处 `data-product-feature` 并走普通 `tutorials:accept`。
