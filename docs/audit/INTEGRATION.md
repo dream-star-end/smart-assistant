@@ -156,10 +156,24 @@ TU-37（`scripts/check-v5-tutorials.ts` 标记路径反斜杠进哈希）是脚�
 ### 7. 遗留 / 集成③ 范围
 
 - 待合入：settings 二期 `5eac1b807`（3 提交）、tutorials-B、以及其余二期分支（messages2 / taskboard2 待验收，manage2 待领）。
-- 待接线 / 待办：composer 排队气泡 `status=queued`（messages）、C-32 团队卡文案（shell + QA 同批改 `App.test` 7 处 + ocv5-210 五用例）、media X-M2 / X-M3 / X-M4（shell）、
-  `typecheck:preview` 消红（shell：预览 tsconfig 开 `allowImportingTsExtensions`；taskboard：`scenes-taskboard.tsx(163,5)`）、TU-37 门禁脚本路径归一化（tutorials-B）。
+- 待接线 / 待办（原登记：composer 排队气泡 `status=queued`、C-32 团队卡文案、media X-M2 / X-M3 / X-M4、`typecheck:preview` 消红、TU-37）→ **已由 t-865 逐条处置，见 §7.1**。
 - 合入 canonical `feat/v5-selfhost` 与 Lease Center 发布需要 v5-dev 通道，本轮不做（决策 d-24）。
 - 各成员分支的合入状态单见 §8。
+
+#### 7.1 集成待办清理（t-865 · fable-5-1-52 · 2026-09-16 23:10–23:35，从 `2b23a31a7` 线性提交）
+
+| 待办 | 处置 | 提交 / 证据 |
+|---|---|---|
+| `typecheck:preview` TS5097 ×2（`scenes-manage-audit.tsx` / `scenes-market-audit.tsx` import 带 `.tsx`） | ✅ **已修**：`tsconfig.browser-tests.json` 开 `allowImportingTsExtensions`（已是 `noEmit`，仅类型检查）；`.tsx` 后缀是 `shoot.mjs` 分组插件契约，场景文件不动 | `e0f53688a`；`typecheck:preview` 只剩 TS2322 ×1；`OC_UI_SCENES=media-container-preview` 截图构建 8 张全成 |
+| `typecheck:preview` TS2322 `scenes-taskboard.tsx(163,5)` `"close"` | ⏳ **等集成③**：taskboard2 分支 `05dd185df` 上 `onSuccess` 已全部为 `advance` / `wait_human`（`git show` 核对），合入后自消，未重做 | — |
+| composer 排队气泡 `status=queued`（messages） | ✅ **核对已具备，无需接线**：`chat/cards.tsx` `UserCard` 的 `USER_STATUS_LABEL.queued = "排队中"`，`lib/chat/socket.ts` busy 排队路径把 `userMsg.status` 置 `queued`（`:5148`），Composer C-02「排队发送」→ 时间线用户气泡直接显示「排队中」；`cards.test`「排队中」用例既有 | `cards.test` 绿（本轮 batch 150 例） |
+| composer C-32 团队卡文案（shell + QA） | ✅ **已修**：`AgentPicker` 副标题「队长切 Astra …」→「队长切换为 {`DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME`} 并委派已安装智能体」（与下方说明 / ModelSelector 同源常量）；同批 `App.test.tsx` 7 处 + `ocv5-210-{advisor-ui,advisor-app,advisor-dual-app,advisor-cold-retry,cas-identity}` 9 处匹配器 `/队长切 Astra/` → `/队长切换为/`（只改选择器文本） | `d4b061e37`；`App.test` 47/47；`test:browser` `run.mjs` 68/68 + `node --test` 87 例仅 `cc-switch` 基线红（4 个 advisor 用例全过）；`cas-identity` 单跑 1/1；`composer-agent-picker` 4 张截图核对 390px 一行放下 |
+| media X-M2 `styles.css` preview 字号 | ✅ **已修**：状态胶囊 10px → `var(--text-caption)`；工具坞标签 / 提示条 / 次级按钮 / 错误详情 / 状态说明手抄 11px → caption token；`.preview-error-details summary` 11px/32px → `var(--text-meta)`/44px | `a3af53970`；`designTokens.test` / `ContainerWebPreview.test` 绿；`media-container-preview-*` 8 张（`t865-shots\`） |
+| media X-M3 `Sheet` 可选关闭钮 | ✅ **原语已加**（opt-in，存量零变化）：`closeButton?: boolean` + `closeLabel?: string`，右上 `IconButton` 走 Radix Close。各抽屉是否开启留 owner：`InboxDialog`（sidebar）、`ConnectorsTab` 抽屉（settings）、taskboard `PanelSheet` / `TicketDrawer` / `TaskboardView`（taskboard，t-630 在跑不动）；`MediaTaskCenter` 已自带可后续切换 | `bae5a8673`；新增 `ui/Sheet.test.tsx` 3 例 |
+| media X-M4 `MediaTaskCenter onReusePrompt` | ✅ **已修**：组件加可选 `onReusePrompt`，接线后失败任务「复制提示词」升级为「重新发起」；`App.tsx` 关任务中心 + `setComposerPrefill`（与教程 starterPrompt 同路） | `7d5573a92`；`MediaTaskCenter.test` +1（14/14）；`App.test` 47/47 |
+| tutorials TU-37 门禁脚本路径归一化 | ↗ **已转 t-53**（tutorials-B 在跑；持有人不可见，经指挥官 fable-5-1-53 `send_to` 转交，修法与验证口径已附），本任务不碰教程中心目录 | — |
+
+验证（主克隆，日志 `t865-*.log`）：`typecheck` ✅；`typecheck:preview` 1 红 = TS2322 等集成③；受影响 vitest `Sheet` / `ContainerWebPreview` / `designTokens` / `cards` 150 例 + `MediaTaskCenter` / `AgentPicker` / `App.test` 73 例 ✅；`biome lint` 触碰 8 文件新增 0 条（`App.tsx` 14 条 `useExhaustiveDependencies` 为基线）；`test:browser` 见上表 C-32 行；截图 `media-container-preview` 8 张 + `composer-agent-picker` 4 张。未跑：全量 `npm test`（本轮改动面已被定向用例覆盖，全量留给集成③ 合入后一并跑）。
 
 ### 8. 分支合入状态单（指挥官要求 · 集成③ 照单接棒）
 
