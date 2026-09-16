@@ -36,7 +36,9 @@ describe('ModelSelector 团队模式诚信显示', () => {
       <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,
     )
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
-    expect(trigger.textContent).toContain('团队模式 · GPT-6-Astra')
+    // C-25:顶栏 chip 已写「团队模式」,trigger 改说明实际生效的队长引擎,不再同词两次。
+    expect(trigger.textContent).toContain('队长引擎 · GPT-6-Astra')
+    expect(trigger.textContent).not.toContain('团队模式 · ')
     expect(trigger.textContent).not.toContain('GLM-5.2')
   })
 
@@ -678,9 +680,81 @@ describe('ModelSelector 受控开合', () => {
   })
 })
 
+// C-28:modelSwitchPreparing(压缩上下文切换中)时 trigger 只是禁用,用户不知道在等什么。
+describe('ModelSelector 切换中态', () => {
+  it('loading 且已有选中模型 → spinner + 「切换中…」+ aria-busy;不 loading 时无', () => {
+    const { rerender } = render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} loading />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toBeDisabled()
+    expect(trigger).toHaveAttribute('aria-busy', 'true')
+    expect(trigger).toHaveAttribute('title', '正在切换模型，请稍候')
+    expect(screen.getByTestId('model-trigger-spinner')).toBeInTheDocument()
+    expect(screen.getByTestId('model-trigger-loading')).toHaveTextContent('切换中…')
+    expect(trigger.textContent).toContain('GLM-5.2')
+    rerender(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    expect(screen.queryByTestId('model-trigger-spinner')).toBeNull()
+    expect(screen.queryByTestId('model-trigger-loading')).toBeNull()
+  })
+
+  it('loading 且列表为空 → 仍显示「加载模型…」,不显示「切换中」', () => {
+    render(<ModelSelector models={[]} selectedId={undefined} onSelect={() => {}} loading />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('加载模型…')
+    expect(screen.queryByTestId('model-trigger-loading')).toBeNull()
+  })
+})
+
+// C-29:菜单打开后焦点落在首项,搜索框(≥8 模型才出现)不自动聚焦,键盘用户要多按一次。
+describe('ModelSelector 搜索框自动聚焦', () => {
+  const MANY: PublicModel[] = Array.from({ length: 9 }, (_, i) => ({
+    id: `model-${i}`,
+    display_name: `Model ${i}`,
+  }))
+
+  it('≥8 模型时打开菜单焦点直接落在搜索框', async () => {
+    render(<ModelSelector models={MANY} selectedId="model-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const search = await screen.findByRole('textbox', { name: '搜索模型' })
+    await waitFor(() => expect(document.activeElement).toBe(search))
+  })
+
+  it('<8 模型无搜索框,焦点仍按 Radix 默认落在菜单内', async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
+    await waitFor(() => expect(document.activeElement?.closest('[role="menu"]')).not.toBeNull())
+  })
+})
+
 describe('ModelSelector 最近使用', () => {
   afterEach(() => {
     localStorage.clear()
+  })
+
+  // C-27:切过同家族不同档位后,「最近」会出现与当前选中同一家族的行且带 ✓,与主列表重复。
+  it('与当前选中同一 Cursor 家族的最近记录不进「最近」分组;其它家族照常', async () => {
+    const GROK_MODELS: PublicModel[] = [
+      { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
+      { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'deepseek-v4', display_name: 'DeepSeek-V4' },
+    ]
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['cursor-grok-4.6-low', 'glm-5.2']))
+    render(<ModelSelector models={GROK_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const recentLabel = document.querySelector('[data-recent-group="true"]')
+    expect(recentLabel).toBeTruthy()
+    // 「最近」分组 = 标签之后、分隔线之前的兄弟节点。
+    const recentIds: string[] = []
+    for (let el = recentLabel?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
+      const id = el.getAttribute('data-model-id')
+      if (id) recentIds.push(id)
+    }
+    // 同家族(grok)不出现在最近;glm-5.2 出现。
+    expect(recentIds).toEqual(['glm-5.2'])
+    expect(document.querySelectorAll('[data-recent-group="true"]')).toHaveLength(1)
   })
 
   it('选过的模型出现在「最近」分组', async () => {

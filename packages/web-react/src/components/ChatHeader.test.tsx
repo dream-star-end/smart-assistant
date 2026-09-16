@@ -78,14 +78,17 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(screen.getByText(/不承诺更省/)).toBeInTheDocument();
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
     expect(trigger.textContent).toContain("GLM-5.2");
-    expect(trigger.textContent).not.toContain("团队模式 · GPT-6-Astra");
+    expect(trigger.textContent).not.toContain("GPT-6-Astra");
   });
 
-  it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎", () => {
+  it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎(chip 表达团队模式,trigger 不再重复该词)", () => {
     renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("团队模式 · GPT-6-Astra");
+    // C-25:「顶栏所见 = 实际所发」—— 引擎名必须在 trigger 上;「团队模式」一词只由 chip 承担。
+    expect(trigger.textContent).toContain("队长引擎 · GPT-6-Astra");
+    expect(trigger.textContent).not.toContain("团队模式");
     expect(trigger.textContent).not.toContain("GLM-5.2");
+    expect(screen.getByRole("button", { name: "团队模式已开启" })).toBeInTheDocument();
   });
 
   it("常态下 ModelSelector 仍显示用户自选模型", () => {
