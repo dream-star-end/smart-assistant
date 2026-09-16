@@ -51,4 +51,37 @@ describe('DemoShowcase', () => {
     expect(screen.getByText('动态演示 · 示意数据')).toBeInTheDocument()
     expect(screen.queryByRole('img', { name: /《万劫问仙》/ })).toBeNull()
   })
+
+  // L-01:窗口顶栏图标压在柠檬绿渐变上,前景必须走 token 而不是 text-white。
+  test('窗口顶栏的渐变图标前景走 text-primary-fg', () => {
+    render(<DemoShowcase onTry={() => {}} />)
+    const badge = document.querySelector('.bg-grad-cta')
+    expect(badge).not.toBeNull()
+    expect(badge?.className).toContain('text-primary-fg')
+    expect(badge?.className).not.toMatch(/\btext-white\b/)
+  })
+
+  // L-08:能力 Tab 是切换按钮(type=button,不会在表单里误提交);窄屏右缘有渐隐暗示可滚动。
+  test('能力 Tab 条:按钮显式 type=button,右缘渐隐仅窄屏出现', () => {
+    render(<DemoShowcase onTry={() => {}} />)
+    for (const scenario of DEMO_SCENARIOS) {
+      expect(screen.getByRole('button', { name: scenario.tab })).toHaveAttribute('type', 'button')
+    }
+    const fade = document.querySelector('.bg-gradient-to-l.from-surface')
+    expect(fade).not.toBeNull()
+    expect(fade?.className).toContain('sm:hidden')
+    expect(fade).toHaveAttribute('aria-hidden')
+  })
+
+  // L-08:答案气泡只在 md 起预留完整高度;窄屏随打字自然增长,不留一屏空白。
+  test('答案气泡的撑位段只在 md 起生效', () => {
+    render(<DemoShowcase onTry={() => {}} initialScenarioId="analysis" />)
+    const spacer = document.querySelector('p.invisible')
+    expect(spacer).not.toBeNull()
+    expect(spacer?.className).toContain('hidden')
+    expect(spacer?.className).toContain('md:block')
+    const typed = spacer?.nextElementSibling
+    expect(typed?.className).toContain('md:absolute')
+    expect(typed?.className).not.toMatch(/(^|\s)absolute(\s|$)/)
+  })
 })

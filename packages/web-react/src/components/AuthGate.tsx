@@ -1,14 +1,15 @@
-import { ArrowLeft, ArrowRight, Check, MailCheck } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, Eye, EyeOff, MailCheck } from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { authErrorMessage } from "../lib/api";
 import { BRAND } from "../lib/brand";
+import { cn } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
 import { LEGAL_DOCS, TERMS_VERSION, type LegalKind } from "../lib/legal";
 import { LegalDocBody } from "./LegalPage";
 import { ThemeToggle } from "./ThemeToggle";
 import { TurnstileWidget } from "./TurnstileWidget";
-import { Alert, Button, Input, Modal, Spinner } from "./ui";
+import { Alert, Button, IconButton, Input, type InputProps, Modal, Spinner } from "./ui";
 
 /** 占位 token：canary 开启 TURNSTILE_TEST_BYPASS 时发它即可过（服务端 bypass 接受任意串）。*/
 const BYPASS_TOKEN = "bypass";
@@ -17,6 +18,40 @@ const BYPASS_TOKEN = "bypass";
 export type AuthMode = "login" | "register" | "verify" | "forgot" | "reset";
 
 const MIN_PW = 8;
+
+/**
+ * 带「显示 / 隐藏」切换的密码框。注册与重置都要把密码输两遍,输错只能整段删掉重来,
+ * 移动端尤其难受;切换按钮的可及名带上字段名(显示密码 / 显示确认密码 …),同一表单里
+ * 两枚按钮不会同名。切换不改变 value,也不动 autoComplete —— 密码管理器照常工作。
+ */
+function PasswordInput({
+  fieldLabel,
+  className,
+  ...props
+}: Omit<InputProps, "type"> & { fieldLabel: string }) {
+  const [shown, setShown] = useState(false);
+  return (
+    <div className="relative">
+      <Input
+        {...props}
+        type={shown ? "text" : "password"}
+        className={cn("pr-11", className)}
+      />
+      <IconButton
+        size="sm"
+        variant="muted"
+        shape="square"
+        aria-label={`${shown ? "隐藏" : "显示"}${fieldLabel}`}
+        aria-pressed={shown}
+        onClick={() => setShown((s) => !s)}
+        // 输入框在触屏下 min-h-11,按钮同样升到 44px;竖向居中而不写死 top 值。
+        className="absolute inset-y-0 right-1.5 my-auto"
+      >
+        {shown ? <EyeOff size={16} /> : <Eye size={16} />}
+      </IconButton>
+    </div>
+  );
+}
 
 export function AuthGate({
   onLogin,
@@ -491,10 +526,10 @@ export function AuthGate({
                   </button>
                 )}
               </div>
-              <Input
+              <PasswordInput
+                fieldLabel="密码"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                type="password"
                 autoComplete="current-password"
                 placeholder="密码"
                 aria-label="密码"
@@ -527,7 +562,8 @@ export function AuthGate({
               {busyNow ? (
                 <><Spinner size={17} />正在登录…</>
               ) : loginPending ? (
-                <Spinner size={17} />
+                // 等公开配置就绪的那几百毫秒:按钮不能只剩一枚 spinner(读屏听到空按钮,视觉上也分不清在等什么)。
+                <><Spinner size={17} />正在准备登录…</>
               ) : (
                 <>登录<ArrowRight size={16} /></>
               )}
@@ -580,28 +616,35 @@ export function AuthGate({
                 className="rounded-xl bg-bg"
               />
             </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-body font-medium text-muted">密码</span>
-              <Input
+            {/* 密码字段用 div + htmlFor 而非包裹式 <label>:内含「显示密码」按钮,包裹式 label 会把点击按钮转发成聚焦输入框。 */}
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="register-password" className="text-body font-medium text-muted">
+                密码
+              </label>
+              <PasswordInput
+                id="register-password"
+                fieldLabel="密码"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                type="password"
                 autoComplete="new-password"
                 placeholder={`至少 ${MIN_PW} 位`}
                 className="rounded-xl bg-bg"
               />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <span className="text-body font-medium text-muted">确认密码</span>
-              <Input
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="register-confirm-password" className="text-body font-medium text-muted">
+                确认密码
+              </label>
+              <PasswordInput
+                id="register-confirm-password"
+                fieldLabel="确认密码"
                 value={confirmPw}
                 onChange={(e) => setConfirmPw(e.target.value)}
-                type="password"
                 autoComplete="new-password"
                 placeholder="再输一次密码"
                 className="rounded-xl bg-bg"
               />
-            </label>
+            </div>
 
             <label className="flex items-start gap-2 text-[12.5px] leading-5 text-muted">
               <input
@@ -654,8 +697,9 @@ export function AuthGate({
                 onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
                 inputMode="numeric"
                 autoComplete="one-time-code"
-                placeholder="请输入邮箱里的 6 位验证码"
-                className="rounded-xl bg-bg text-center text-[18px] tracking-[0.4em]"
+                placeholder="输入 6 位验证码"
+                // 0.4em 字距是给 6 位数字排版的,占位文案不能跟着被拉开成「请 输 入 …」。
+                className="rounded-xl bg-bg text-center text-[18px] tracking-[0.4em] placeholder:tracking-normal"
               />
             </label>
 
@@ -754,35 +798,41 @@ export function AuthGate({
           >
             {!resetToken ? (
               <div className="flex flex-col items-center gap-3 py-3 text-center">
-                <p className="text-title text-fg">重置链接无效或缺少 token。</p>
+                <p className="text-title text-fg">重置链接无效或已过期，请从邮件重新打开。</p>
                 <Button variant="secondary" onClick={() => go("forgot")} className="rounded-xl">
                   重新申请重置
                 </Button>
               </div>
             ) : (
               <>
-                <label className="flex flex-col gap-1.5">
-                  <span className="text-body font-medium text-muted">新密码</span>
-                  <Input
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="reset-password" className="text-body font-medium text-muted">
+                    新密码
+                  </label>
+                  <PasswordInput
+                    id="reset-password"
+                    fieldLabel="新密码"
                     value={newPw}
                     onChange={(e) => setNewPw(e.target.value)}
-                    type="password"
                     autoComplete="new-password"
                     placeholder={`至少 ${MIN_PW} 位`}
                     className="rounded-xl bg-bg"
                   />
-                </label>
-                <label className="flex flex-col gap-1.5">
-                  <span className="text-body font-medium text-muted">确认新密码</span>
-                  <Input
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="reset-confirm-password" className="text-body font-medium text-muted">
+                    确认新密码
+                  </label>
+                  <PasswordInput
+                    id="reset-confirm-password"
+                    fieldLabel="确认新密码"
                     value={newPwConfirm}
                     onChange={(e) => setNewPwConfirm(e.target.value)}
-                    type="password"
                     autoComplete="new-password"
                     placeholder="再输一次新密码"
                     className="rounded-xl bg-bg"
                   />
-                </label>
+                </div>
 
                 {errBox}
 
@@ -799,7 +849,8 @@ export function AuthGate({
           </form>
         )}
 
-        <p className="mt-4 text-center text-meta text-faint">全能助手 · 流式对话 · 持久会话</p>
+        {/* 与落地页同一套面向用户的话(多模型 / 长任务 / 成果),不用「流式」「持久会话」这类实现词。 */}
+        <p className="mt-4 text-center text-meta text-faint">多模型协作 · 长任务不中断 · 成果直接可用</p>
       </div>
       </div>
     </div>
@@ -851,7 +902,8 @@ function LegalLinks() {
           if (!open) setOpenDoc(null);
         }}
         title={openDoc ? LEGAL_DOCS[openDoc].title : ""}
-        description={openDoc ? `更新日期:${LEGAL_DOCS[openDoc].updated} · 生效日期:${LEGAL_DOCS[openDoc].updated}` : ""}
+        // 更新日期与生效日期恒为同一个 TERMS_VERSION:只标一次,窄屏也不再把日期折成两行。
+        description={openDoc ? `生效日期：${LEGAL_DOCS[openDoc].updated}` : ""}
         className="max-w-2xl"
       >
         {openDoc && <LegalDocBody kind={openDoc} />}

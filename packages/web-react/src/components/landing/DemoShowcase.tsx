@@ -246,34 +246,42 @@ export function DemoShowcase({
 
   return (
     <div className="mx-auto w-full max-w-4xl">
-      {/* 能力 Tab 条 */}
-      <div className="no-scrollbar -mx-1 mb-3 flex gap-1.5 overflow-x-auto px-1 pb-1 sm:justify-center">
-        {DEMO_SCENARIOS.map((s, i) => {
-          const active = i === idx;
-          return (
-            <button
-              key={s.id}
-              onClick={() => play(i)}
-              aria-pressed={active}
-              className={cn(
-                "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-body font-medium transition-colors",
-                active
-                  ? "border-accent bg-accent-soft text-accent"
-                  : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
-              )}
-            >
-              <s.icon size={14} />
-              {s.tab}
-            </button>
-          );
-        })}
+      {/* 能力 Tab 条:窄屏横向可滚,右缘渐隐暗示「右边还有」(同 BrowsePanel 分类片);sm 起居中放得下,渐隐隐藏。 */}
+      <div className="relative -mx-1 mb-3">
+        <div className="no-scrollbar flex gap-1.5 overflow-x-auto px-1 pb-1 sm:justify-center">
+          {DEMO_SCENARIOS.map((s, i) => {
+            const active = i === idx;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => play(i)}
+                aria-pressed={active}
+                className={cn(
+                  "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-body font-medium transition-colors",
+                  active
+                    ? "border-accent bg-accent-soft text-accent"
+                    : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",
+                )}
+              >
+                <s.icon size={14} />
+                {s.tab}
+              </button>
+            );
+          })}
+        </div>
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-y-0 right-0 w-10 bg-gradient-to-l from-surface to-transparent sm:hidden"
+        />
       </div>
 
       {/* 工作台卡（仿应用窗口）：左对话 / 右成果。md 起定高，打字过程页面零位移。 */}
       <div ref={cardRef} className="overflow-hidden rounded-2xl border border-border bg-surface shadow-float">
         {/* 窗口顶栏 */}
         <div className="flex items-center gap-2 rounded-t-2xl border-b border-border bg-sidebar/60 px-4 py-2.5">
-          <span className="flex size-6 items-center justify-center rounded-lg bg-grad-cta text-white">
+          {/* 前景走 --primary-fg token:落地页作用域的 --grad-cta 是柠檬绿,写死 text-white 会压成 1.3:1。 */}
+          <span className="flex size-6 items-center justify-center rounded-lg bg-grad-cta text-primary-fg">
             <Sparkles size={13} />
           </span>
           <span className="text-body font-medium text-fg">全能助手</span>
@@ -335,7 +343,8 @@ export function DemoShowcase({
               </div>
             )}
 
-            {/* 助手气泡：按完整答案预留高度（invisible 撑位 + 绝对定位覆打），打字零位移 */}
+            {/* 助手气泡:md 起按完整答案预留高度(invisible 撑位 + 绝对定位覆打),打字零位移;
+                窄屏没有定高卡片,预留会在执行步骤下面空出约一屏 —— 改为随打字自然增长。 */}
             <div
               className={cn(
                 "flex justify-start transition-opacity duration-300",
@@ -346,7 +355,7 @@ export function DemoShowcase({
                 <p
                   aria-hidden
                   className={cn(
-                    "invisible whitespace-pre-wrap text-[13.5px] leading-relaxed",
+                    "invisible hidden whitespace-pre-wrap text-[13.5px] leading-relaxed md:block",
                     animated?.mono && "font-mono text-[12px] leading-[1.6]",
                   )}
                 >
@@ -354,7 +363,7 @@ export function DemoShowcase({
                 </p>
                 <p
                   className={cn(
-                    "absolute inset-x-3.5 top-2.5 whitespace-pre-wrap text-[13.5px] leading-relaxed text-fg",
+                    "whitespace-pre-wrap text-[13.5px] leading-relaxed text-fg md:absolute md:inset-x-3.5 md:top-2.5",
                     animated?.mono && "font-mono text-[12px] leading-[1.6]",
                   )}
                 >
@@ -406,6 +415,7 @@ export function DemoShowcase({
                 : "想让它帮你干同样的活？"}
             {ended && (
               <button
+                type="button"
                 onClick={() => play(0)}
                 className="inline-flex items-center gap-1 font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -414,6 +424,7 @@ export function DemoShowcase({
             )}
           </span>
           <button
+            type="button"
             onClick={onTry}
             className="rounded-full bg-primary px-3.5 py-1.5 text-body font-medium text-primary-fg transition-opacity hover:opacity-90"
           >

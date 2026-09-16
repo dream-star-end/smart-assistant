@@ -49,7 +49,7 @@ function enrollErrorCopy(err: unknown): { message: string; deviceLimit: boolean 
       return { message: "本地模式未启用", deviceLimit: false };
     }
     if (err.status === 429 || err.code === "RATE_LIMITED") {
-      return { message: "操作过于频繁", deviceLimit: false };
+      return { message: "操作过于频繁，请稍后再试", deviceLimit: false };
     }
   }
   return { message: apiErrorMessage(err, "确认这台电脑失败"), deviceLimit: false };
@@ -75,7 +75,8 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
   const deepLinkRef = useRef<string | null>(null);
 
   function cancel() {
-    window.location.assign("/");
+    // 与深链同走 enrollNavigation 这条可测缝(测试 spy 它;生产仍是 location.assign)。
+    enrollNavigation.assign("/");
   }
 
   function reopenApp() {
@@ -121,7 +122,17 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
 
           <div className="flex flex-col gap-4 rounded-xl border border-border bg-surface p-5 shadow-soft">
             {!enrollmentId ? (
-              <Alert tone="danger">链接无效</Alert>
+              // 只有一句「链接无效」会把人卡在卡片里:说清怎么办 + 给一个出口。
+              <Alert
+                tone="danger"
+                action={
+                  <Button type="button" variant="secondary" onClick={cancel}>
+                    返回首页
+                  </Button>
+                }
+              >
+                链接无效，请回到 {BRAND.nameEn} 里重新发起「本地模式」登记。
+              </Alert>
             ) : phase === "returning" ? (
               <>
                 <p role="status" className="text-body text-fg">
@@ -144,6 +155,8 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
                   <p className="text-body text-muted">计算机名：{publicName}</p>
                 ) : null}
                 {error ? (
+                  // 设备上限的「去设置解绑」出口:网页端目前没有设备管理页(解绑走桌面端),
+                  // 这里不放一个跳不到位的链接;下方「取消」即回首页的出口。见 docs/audit/landing.md L-16。
                   <Alert tone="danger" data-device-limit={deviceLimit ? "true" : "false"}>
                     {error}
                   </Alert>
