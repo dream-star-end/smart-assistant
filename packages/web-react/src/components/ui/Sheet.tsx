@@ -3,6 +3,7 @@ import { cva } from "class-variance-authority";
 import { X } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { revealFocusedElement } from "./a11y";
 import { IconButton } from "./IconButton";
 
 /**
@@ -79,6 +80,10 @@ export function Sheet({
         />
         <RD.Content
           aria-describedby={undefined}
+          // 抽屉常把 header 与列表放在同一个滚动容器里(MediaTaskCenter 直接给 Content 加 overflow-y-auto);
+          // 列表滚到底后 Tab 回绕到 header 的按钮时,Radix 用 preventScroll 聚焦 → 焦点落在视口外
+          // (a11y 走查 media#1 实测「刷新」rect.y = −432)。这里在 Content 上兜底:目标越出可视区就滚回来。
+          onFocusCapture={revealFocusedElement}
           className={cn(sheetVariants({ side }), className)}
         >
           <RD.Title className="sr-only">{srTitle}</RD.Title>
