@@ -1,7 +1,7 @@
 # A·market AI 市场 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-market`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（只审计，不改业务代码）
+- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 11 / 遗留 15）
 - 结论：**P1 × 1 / P2 × 4 / P3 × 21**，共 26 条（另 1 条 admin 面备注 K-26）。P1 是发布表单草稿随市场弹窗关闭（Esc / 点遮罩）
   **无提示丢失**（代码注释自认技术债）。四条 P2：卡片描述 `line-clamp-2` 被同元素的 `block`
   抵消（卡高失控）、分区视图翻页时分区计数把「已加载」说成「共有」、详情弹层移动端底栏三枚
@@ -340,3 +340,65 @@ node browser-tests\ui-preview\shoot.mjs
 4. **K-23**：详情内加「卸载」是否与「已安装页是卸载唯一权威」的既有决定冲突（`InstalledPanel.tsx:498`
    注释里 API 插件按此原则不重复提供）。
 5. **K-24 / X-01**：`onRequireLogin` 接线由 shell-B 顺手改还是授权 market-B 改 `App.tsx` 一行。
+
+---
+
+## 7. 修复记录（阶段 B）
+
+- 分支：`feat/v5-selfhost-audit-market`（阶段 A 基线 `7240a826`）
+- 统计：发现 26 / 修复 11（P1 ×1、P2 ×4、P3 ×6）/ 遗留 15（全部 P3，理由见 §9）。
+- 接手说明：修复与 after 截图由 fable-5-1-22 完成（09-16 02:00–03:04），但会话离线前未提交、未交付，工作树里
+  全部为未暂存改动。fable-5-1-29 于 09-16 19:00 接手：逐文件复核 diff，重跑 typecheck / 模块 vitest / biome lint、
+  对 6 个关键场景重截 after 图核对后，按 K-01 / 发现页 / 详情与文案 / 文档 四组分别提交并推送（§8 表内为接手复核的结果）。
+- 附录 5 件拍板事项的落地口径（任务自动流转、无显式裁决，按最小改动取值）：① K-01 以**落盘 + 关弹窗时
+  toast 提示已暂存**实现，不做阻断式确认 —— 草稿既然不会丢，每次关市场都弹一次「放弃？」反而是打扰；
+  ② 未向后端提 offset，前端只做诚实呈现；③ K-12 未动（遗留）；④ K-23 未动（与「已安装页是卸载唯一
+  权威」冲突，遗留）；⑤ K-24 未动（接线归 shell，遗留）。
+
+| 编号 | 状态 | 改动（`packages/web-react/src/` 下） | 用例 |
+|---|---|---|---|
+| K-01 | ✅ | `lib/marketplace.ts` 新增 `publishDraftStorageKey / loadPublishDraft / savePublishDraft / clearPublishDraft`；`marketplace/PublishPanel.tsx` `useDraft` 加 `persistKey`：挂载读回（新增字段自动补默认、坏数据当无草稿）、写入 300ms 防抖落盘、写空 / `reset` 后删除，暴露 `restored`；三份草稿按 kind 各落一份 `localStorage`；表单顶部「已恢复上次未提交的草稿」`Alert` + 「丢弃草稿」；新增 `onDirtyChange` 上报；`MarketplaceCenter.tsx` 关弹窗（Esc / 遮罩 / ✕）时若有草稿 toast「发布草稿已暂存，下次打开「发布」可以接着填」，不拦截关闭。 | `PublishPanel.test` ×2（落盘 / 恢复 / 丢弃 / 脏上报；坏数据兜底）、`MarketplaceCenter.test` ×1（干净不提示、脏提示）、`marketplace.test` ×1（存储纯函数） |
+| K-02 | ✅ | `marketplace/BrowsePanel.tsx` 卡片描述去掉 `block`（`display:block` 抵消了 `line-clamp-2` 的 `-webkit-box`）。 | `BrowsePanel.test` 「卡片描述两行截断」 |
+| K-03 | ✅ | `BrowsePanel.tsx`：`Section` 新增 `truncated`，计数徽章改「已加载 N」+ 注脚「还有更多未加载」；结果条「共 N 个」→「已加载 N 个，还有更多」；分区视图的结果条右侧再放一枚「加载更多」（不必滚过全部分区）。 | `BrowsePanel.test` 「目录不再硬截断」改写（断言两处「加载更多」与「已加载」文案） |
+| K-04 / K-20 | ✅ | `marketplace/DetailModal.tsx` footer：「关闭」`max-sm:hidden`（右上 ✕ 已有）；动作容器 `max-sm:flex-nowrap max-sm:[&>button]:flex-1`，去掉 `max-sm:flex-col-reverse` 与 `[&>*]:w-full` —— 窄屏两枚动作并排各占一半，Badge 保持自身宽度。 | `DetailModal.test` 「footer 窄屏契约」 |
+| K-05 | ✅ | `BrowsePanel.tsx` `loadCards` 记录本次是否由「加载更多」触发：失败走 `toast(…, "error", { actionLabel: "重试" })` 就近可见，不写顶部 `err`。 | `BrowsePanel.test` 「加载更多失败」 |
+| K-06 | ✅ | 搜索提示词改为可点 `Chip`（点击 `setQ(word)`）。 | `BrowsePanel.test` 「分类筛选片带 aria-pressed；提示词芯片点一下即搜」 |
+| K-07 | ✅ | `Chip` 加 `aria-pressed={active}`。 | 同上 |
+| K-11 | ✅ | 卡片描述去 `aria-hidden`，改 `id` + button `aria-describedby`；徽章行仍 `aria-hidden`（名字保持短）。 | `BrowsePanel.test` 「卡片描述两行截断…aria-describedby」（`toHaveAccessibleDescription`） |
+| K-16 | ✅ | 详情评分徽章 `👍` → `<ThumbsUp>`（与卡片同款 lucide 图标）。 | `DetailModal.test` 既有评分用例改写 |
+| K-17 | ✅ | 半角标点 4 处：`DetailModal.tsx` 预设说明、`InstalledPanel.tsx` 卸载标题 `？`、原因 hint `；`、分组 hint `：`。 | —（文案） |
+| K-18 | ✅ | `ReviewPanel.tsx` 「2026-07-26提交」→ 日期与「提交」之间补空格。 | —（文案） |
+| K-08 / K-09 / K-10 / K-12 / K-13 / K-14 / K-15 / K-19 / K-21 / K-22 / K-23 / K-24 / K-25 / K-27 | ⏸ | 遗留，见 §9。 | — |
+
+## 8. 验证（阶段 B）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0；接手复核 09-16 19:08 再跑一次仍绿） |
+| 模块单测 | `npx vitest run src/components/marketplace src/components/MarketplaceCenter.test.tsx --maxWorkers=1` | ✅ 接手复核：11 个文件 / 137 例全绿（新增 8 例：MarketplaceCenter +1、BrowsePanel +3、DetailModal +1、PublishPanel +2、marketplace +1，另 2 例既有用例改写；每条逻辑改动有用例，见 §7 表；无 `.only` / `.skip`） |
+| 代码风格 | `npx biome lint <改动的 7 个源文件>` | ✅ 未新增诊断：15 条 `useExhaustiveDependencies` / `noArrayIndexKey` / `noDelete` 全在未触碰的行。`biome check` 另报 format 差异，来源是本机 `core.autocrlf=true` 把工作树检出成 CRLF（未触碰的 `FeaturedPanel.tsx` 同样报），提交时 git 归一为 LF，不是代码问题 |
+| 视觉 after | `OC_UI_SCENES=market-` `node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\market\after\` | ✅ 126 张全部成功（`failures: 0`、`unmockedApi: []`，09-16 03:04）。接手复核对 `market-browse-skill` / `market-browse-search-mobile` / `market-browse-longlist(-more)` / `market-detail-mobile` / `market-detail-agent-mobile` 6 场景重截 18 张到 `…\market\after-takeover\`，全部成功，逐张核对与下文 after 对照描述一致 |
+
+after 对照（同名 PNG，`before/` ↔ `after/`）：
+
+- `market-browse-skill--*` / `market-browse-search-mobile` —— 卡片描述两行截断生效，同排卡片等高，标签行与信号行之间不再空出一截；提示词变成三枚可点芯片。
+- `market-browse-longlist--*` —— 结果条「已加载 50 个技能，还有更多」+ 右侧「加载更多」，各分区计数「已加载 N」+「还有更多未加载」。
+- `market-detail-mobile` / `market-detail-agent-mobile` —— 底栏从三枚竖排全宽按钮变为两枚并排，「已安装」Badge 不再被拉成全宽假按钮。
+- `market-detail--desktop` —— 评分徽章用 ThumbsUp 图标，与其余徽章同一图形语言。
+
+**NOT RUN**：`npm test` 全量（本轮改动限于 marketplace 目录 + 壳 + `lib/marketplace.ts`，模块内 10 文件全绿；全量在 manage-B 已跑过一次、其 3 例既有失败与本模块无关）、`npm run test:browser`（未触碰高频交互面）、真机 iOS、真实审核状态流转。
+
+## 9. 遗留
+
+| 项 | 原因 | 建议 |
+|---|---|---|
+| K-08 / K-09 / K-22（已安装行的动作簇、就绪状态文案、kind 徽章与 slug 描述） | 同一 `CardRow` 结构的三处改动，需连带 `InstalledPanel.test` 重写；本轮预算优先给 P1/P2 | market-B 二期一并做，修法见 §4 |
+| K-10（导入芯片显示名） | 需引入 `manage/skillDisplay` 的 `skillDisplayTitle`，顺手做但要同步 `PublishPanel.test` 里按 slug 找芯片的断言 | 同上 |
+| K-12（桌面端分类片横滚无滚动条） | 换行 vs 箭头需拍板（附录 3） | 拍板后 10 行改动 |
+| K-13（kill-switch 移动端占首屏） | admin 面、低频 | 二期 |
+| K-14 / K-15 / K-19（title-only 解释、Markdown 标题层级、authMode / 动作 id 映射） | 文案与视觉打磨，需逐项核对后端契约字段（`connectorContract.actions[].title` 是否存在） | 二期 |
+| K-21（校验缺项播报占高） | 需要与 SubmitBar 的"缺项即定位"契约一起重设计 | 二期 |
+| K-23（详情内卸载） | 与「已安装页是卸载唯一权威」的既有决定冲突（附录 4），未拍板不动 | 拍板后复用卸载弹层 |
+| K-24 / X-01（未登录「去登录」） | `App.tsx` 接线归 shell | shell-B 补 `onRequireLogin`，本模块再加 prop |
+| K-25 / X-02（offset 分页 / 虚拟化） | 需后端 | 后端提供 offset 后前端改 append |
+| K-27（原生 checkbox） | 需 shell 出 Checkbox 原语 | shell |
