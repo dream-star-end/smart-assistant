@@ -82,6 +82,7 @@ import {
 } from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
 import {
+  ArtifactInspectActiveContext,
   ArtifactInspectContext,
   ChatInteractionContext,
   ToolCardActionsContext,
@@ -3368,6 +3369,9 @@ export function App() {
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
     <ArtifactInspectContext.Provider value={artifactInspect}>
+    {/* tools T-18:详情面板当前查看的那条 tool 消息 → 源卡片选中态。与 open 回调分开成独立 context,
+        面板开合只重渲消费它的 ToolCard,不打穿 MessageList 的 sig-memo(tool/context.ts 注释)。 */}
+    <ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <ProjectScopeProvider
@@ -3924,6 +3928,17 @@ export function App() {
                 openMarketplace("browse", "agent");
               }
         }
+        onOpenPluginAuth={
+          demo
+            ? undefined
+            : (a) => {
+                // composer C-06:未就绪智能体「去授权」→ 管理中心「插件」页;带上第一枚待授权的
+                // Plugin slug 让 ConnectorsTab 直接进入授权(与市场 onOpenConnectors 同一条路)。
+                setPickerOpen(false);
+                setManageAutoAuthorizePluginSlug(a.needsAuthorization?.[0] ?? null);
+                openManage("connectors");
+              }
+        }
         onClose={() => setPickerOpen(false)}
         onPick={(a) => {
           // 切 agent：若当前会话已在 WS service 注册，打跨-agent 污染守卫戳（§11），
@@ -4111,6 +4126,17 @@ export function App() {
               setManageAutoAuthorizePluginSlug(pluginSlug ?? null);
               openManage("connectors");
             }}
+            onRequireLogin={() => {
+              // market K-24 / X-01:未登录空态「去登录」真的去登录,与 ManageCenter 同款契约
+              //(回调自己负责关市场 + 切登录;正常路径进不来,属深链兜底)。
+              setMarketplaceOpen(false);
+              if (demo) {
+                window.location.href = "/";
+                return;
+              }
+              setAuthMode("login");
+              setView("app");
+            }}
             onTabChange={setMarketplaceTab}
             onClose={() => {
               setMarketplaceOpen(false);
@@ -4222,6 +4248,7 @@ export function App() {
     </div>
     </ProjectScopeProvider>
     </ImageEditActionsContext.Provider>
+    </ArtifactInspectActiveContext.Provider>
     </ArtifactInspectContext.Provider>
     </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>
