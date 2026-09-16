@@ -3,6 +3,7 @@ import { ApiError, apiErrorMessage } from "./api";
 import type { ChatMessage } from "./chat/model";
 import { isRenderableChatMessage } from "./chat/sanitizeChatMessages";
 import type {
+  CommunityTutorialCategory,
   CommunityTutorialDetail,
   CommunityTutorialStatus,
   ProjectAsset,
@@ -125,6 +126,59 @@ export function tutorialKindOf(item: { kind?: TutorialKind | null }): TutorialKi
 
 export function canWithdrawCommunityTutorial(status: CommunityTutorialStatus): boolean {
   return status === "draft" || status === "pending" || status === "approved";
+}
+
+/**
+ * 撤回确认框正文：按状态说清后果（审计 TU-08）。已上线会从公开目录下线且没有"恢复"路径，
+ * 待审核只是退出队列；草稿撤回后同样不能再提交这一份。
+ */
+export function withdrawConsequence(status: CommunityTutorialStatus): string {
+  switch (status) {
+    case "approved":
+      return "这份教程会从公开目录下线，其他人将无法再打开；之后要重新发布需再次提交审核。";
+    case "pending":
+      return "这份教程会退出审核队列；之后要发布需重新提交。";
+    default:
+      return "这份草稿会标记为已撤回，不能再继续提交。";
+  }
+}
+
+/** 分类枚举 → 用户可见中文；目录卡 / Markdown 详情 / 快照详情共用，禁止直出 `coding`（审计 TU-09）。 */
+export const COMMUNITY_CATEGORY_LABEL: Record<CommunityTutorialCategory, string> = {
+  research: "科研",
+  coding: "编码",
+  general: "通用",
+};
+
+export function communityCategoryLabel(category: CommunityTutorialCategory | string): string {
+  return COMMUNITY_CATEGORY_LABEL[category as CommunityTutorialCategory] ?? category;
+}
+
+/**
+ * 手写教程表单的提交门槛（审计 TU-05）：与后端最小长度一致，空表单不再靠服务端拒绝才知道。
+ * 返回第一条没过的原因；全部通过返回 null。
+ */
+export function communityTutorialDraftIssue(draft: {
+  title: string;
+  summary: string;
+  bodyMarkdown: string;
+}): string | null {
+  if (draft.title.trim().length < 4) return "标题至少 4 个字";
+  if (draft.summary.trim().length < 10) return "摘要至少 10 个字，说明适合谁、能得到什么";
+  if (draft.bodyMarkdown.trim().length < 40) return "正文至少 40 个字，写清准备、步骤和如何核对结果";
+  return null;
+}
+
+/** 「提交快照审核」禁用时的原因（审计 TU-27）；可提交返回 null。 */
+export function snapshotSubmitIssue(input: {
+  title: string;
+  summary: string;
+  publicMessageCount: number;
+}): string | null {
+  if (!input.title.trim()) return "还没有标题";
+  if (input.summary.trim().length < 10) return "摘要至少 10 个字";
+  if (input.publicMessageCount === 0) return "剥离内部角色后没有可公开的消息";
+  return null;
 }
 
 export function leakReportFromUnknown(value: unknown): TutorialLeakReport | null {

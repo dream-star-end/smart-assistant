@@ -72,6 +72,10 @@ describe('SnapshotTutorialDetail', () => {
     render(<SnapshotTutorialDetail item={item} onBack={() => {}} />)
 
     expect(screen.getByText('作者真实会话快照 / 未经平台三次复跑')).toBeInTheDocument()
+    // 分类用中文标签而不是枚举（TU-09）；字节数走 formatBytes（TU-26）。
+    expect(screen.getByText('科研')).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('research')
+    expect(screen.getAllByText(/text\/html · 12 B/).length).toBe(2)
     expect(screen.getByTestId('snapshot-messages')).toHaveAttribute('data-readonly', 'true')
     expect(screen.getByText('开始分析')).toBeInTheDocument()
     const iframe = document.querySelector('iframe[title="demo.html"]')

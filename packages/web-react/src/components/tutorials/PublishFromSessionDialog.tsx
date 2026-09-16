@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { formatBytes } from "../../lib/chat/download";
 import type { ChatMessage } from "../../lib/chat/model";
 import { api, apiErrorMessage } from "../../lib/api";
 import {
@@ -9,6 +10,7 @@ import {
   mediaSignPathForAsset,
   publicSnapshotMessages,
   sessionOutputAssets,
+  snapshotSubmitIssue,
   tutorialArtifactGuardError,
   tutorialArtifactGuardMessage,
   tutorialPublishErrorMessage,
@@ -57,6 +59,8 @@ export function PublishFromSessionDialog({
   const [assetError, setAssetError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 主按钮禁用时把原因摆在旁边，不让用户对着灰按钮猜（审计 TU-27）。
+  const submitIssue = snapshotSubmitIssue({ title, summary, publicMessageCount: publicMessages.length });
 
   useEffect(() => {
     if (!open) return;
@@ -167,13 +171,18 @@ export function PublishFromSessionDialog({
       description="会做隐私扫描并剥离内部角色，提交后进入「我的发布」等待审核。"
       footer={
         <>
+          {submitIssue && (
+            <p role="status" className="mr-auto self-center text-caption text-muted">
+              {submitIssue}
+            </p>
+          )}
           <Button variant="secondary" onClick={() => onOpenChange(false)}>
             取消
           </Button>
           <Button
             variant="primary"
             loading={submitting}
-            disabled={!title.trim() || summary.trim().length < 10 || publicMessages.length === 0}
+            disabled={submitIssue !== null}
             onClick={() => void submit()}
           >
             提交快照审核
@@ -211,7 +220,7 @@ export function PublishFromSessionDialog({
             options={CATEGORY_OPTIONS}
           />
         </Field>
-        <Field label="补充说明（Markdown）" hint="可选；公开页仍按只读 Markdown 渲染，不会执行 htmlpreview">
+        <Field label="补充说明（Markdown）" hint="可选；公开页按只读 Markdown 渲染，不会执行其中的脚本或网页预览">
           <Textarea
             value={bodyMarkdown}
             rows={6}
@@ -286,7 +295,7 @@ export function PublishFromSessionDialog({
                       <span className="min-w-0">
                         <span className="block truncate text-body font-medium text-fg">{asset.name}</span>
                         <span className="mt-0.5 block text-caption text-faint">
-                          {mime || "未知类型"} · {asset.sizeBytes ?? 0} B
+                          {mime || "未知类型"} · {formatBytes(asset.sizeBytes ?? 0)}
                         </span>
                       </span>
                     </label>
