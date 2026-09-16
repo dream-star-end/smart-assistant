@@ -145,7 +145,9 @@ export function AgentPicker({
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
               <span className="text-[14.5px] font-semibold text-fg">{defaultAgent.name}</span>
-              <span className="rounded bg-accent-soft px-1.5 py-0.5 text-micro font-medium text-accent">
+              {/* 徽章落在本就 bg-accent-soft 着色的默认卡上:soft 叠 soft 在深色只有 4.11:1(bg-accent/15 时 3.89),
+                  改成与 SubscriptionDialog「当前」同款的实底 accent + -fg(浅 6.2 / 深 6.45),尺寸不变(a11y-C)。 */}
+              <span className="rounded bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
                 默认
               </span>
               {defaultActive && <Check size={14} className="text-accent" />}
