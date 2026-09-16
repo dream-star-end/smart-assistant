@@ -66,3 +66,96 @@
 - 待合入：settings-B（`5bce50f48`，已验收）、composer-B（t-35）、media-B（t-51）、market-B（t-47）、tools-B（t-45）、landing / tutorials 两轮、补丁①（t-426）。
 - 集成②需接线：market `onRequireLogin`（App.tsx 一行）、composer-B 可能新增的 `AgentPicker onOpenPluginAuth` 等可选 prop。
 - 合入 canonical `feat/v5-selfhost` 与 Lease Center 发布需要 v5-dev 通道，本轮不做（决策 d-24）。
+
+## 集成②（t-624 · 2026-09-16 21:15–23:10 · 合并 fable-5-1-40 → 接线 / 门 / 记录 fable-5-1-52）
+
+> 接手说明：fable-5-1-40 完成 7 步合并并写好 `App.tsx` / `brand.ts` 接线（未提交）后掉线；本会话接手时先核对了 7 个合并提交的双亲、
+> 工作树无冲突标记、以及「成员侧改动集 ∩ 合并结果 ≠ 成员版本 ⇒ integration 侧必同时改过该文件」（逐文件脚本核对，**无丢改动**），再继续。
+
+### 1. 合入顺序与 SHA
+
+起点 `43b7cd3a4`（集成① 终点）。合入顺序按任务书，media-B / sidebar 二期为指挥官补充。
+
+| 序 | 成员分支 @ HEAD | 合并提交 | 文件 / 行 |
+|---|---|---|---|
+| 1 | settings-B + 补丁① `feat/v5-selfhost-audit-settings@c0efc9c91` | `5e5ed6925` | 49 files, +3394/−958 |
+| 2 | tools-B `feat/v5-selfhost-audit-tools@d65c6741e` | `6fa690d7e` | 29 files, +3906/−521 |
+| 3 | market-B `feat/v5-selfhost-audit-market@1fb99bfcc` | `ab765669a` | 14 files, +1109/−51 |
+| 4 | landing-B `feat/v5-selfhost-audit-landing@b97adb3fb` | `6201518b2` | 18 files, +1604/−175 |
+| 5 | media-B `feat/v5-selfhost-audit-media@8834aca08` | `10398baa9` | 15 files, +2651/−246 |
+| 6 | sidebar 二期 `feat/v5-selfhost-audit-sidebar@25c775295` | `b41e804ac` | 5 files, +144/−10 |
+| 7 | composer-B `feat/v5-selfhost-audit-composer@70d3db8b3` | `ae0b0cb64` | 23 files, +2528/−334 |
+
+全部 `git merge --no-ff`，未 rebase / squash；`git rev-list --count HEAD..<成员 HEAD>` 对 7 条均为 0。
+settings 分支在合入后又推进 3 个提交（`8b2636e94` feat / `c5070e1ee` docs / `5eac1b807` docs = 二期 t-628，已验收），按任务书留给集成③再合一次。
+集成② 自有提交 5 个：`19799c0fe` feat 接线、`f7c08f3eb` test 契约用例、`419e0d218` chore `.gitattributes`、`2a6492774` test 复跑修正、docs 本文。
+
+### 2. 冲突与取舍
+
+**零手工冲突。** 唯一三方合并文件是 `browser-tests/run.mjs`（tools / media / composer 三条分支各自追加了真浏览器用例，
+与 integration 上 sidebar / messages 的改动互不相交），三次均由 git 自动收敛；`test:browser` 的 run.mjs「用例清单 = 实际 T 集合」自检见 §5。
+`App.tsx` 在 7 条分支里都没被成员改动（各模块只加可选 prop、把接线登记给集成），因此没有出现任务书预估的 composer 冲突。
+
+### 3. 跨模块接线（各模块文档登记 → 本轮落地）
+
+| 来源 | 登记位置 | 落地 | 用例 | 提交 |
+|---|---|---|---|---|
+| market K-24 / X-01 未登录「去登录」 | market.md §9 | `App.tsx` `<MarketplaceCenter onRequireLogin>`：关市场 + `setAuthMode("login")` + `setView("app")`，demo 分支回 `/`（与同文件 `<ManageCenter>` 契约一致） | market-B `MarketplaceCenter.test`（K-24 回调）；App 侧为同款一行，由 `App.test` 47 例回归覆盖 | `19799c0fe` |
+| tools T-18 详情面板 ↔ 源卡片选中态 | tools.md §8、`tool/context.ts:95` | `ArtifactInspectContext.Provider` 内再包 `<ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>` | tools-B `tool/context` / `ToolCard` 用例（选中态描边） | `19799c0fe` |
+| composer C-06 未就绪智能体「去授权」 | composer.md §9 | `<AgentPicker onOpenPluginAuth>`：关选择器、`setManageAutoAuthorizePluginSlug(a.needsAuthorization?.[0] ?? null)`、`openManage("connectors")`；demo 下不传。`ManageTab` 无 `"plugins"`，「插件」页 id 即 `connectors`，与市场 `onOpenConnectors` 同一条路 | composer-B `AgentPicker.test`「传入 onOpenPluginAuth 时渲染去授权」 | `19799c0fe` |
+| composer §9 RepoPill 未绑定态 `min-w-0 truncate` | composer.md §9 | **已由 sidebar 二期 `297ad8c94` 做**（含 `github/RepoPill.test` 2 例），随分支合入，集成② 未重复 | — | — |
+| composer 排队气泡 `status=queued` / C-32 团队卡文案 | composer.md §8 §9 | **登记待办**：queued 是 messages 侧时间线新状态（非接线）；C-32 需同批改 `App.test.tsx` 7 处 + `ocv5-210-*.node-test.mjs` 5 个真浏览器用例，超出「≤30 分钟配用例」口径 | — | — |
+| sidebar-B S-05 / S-06 / S-08 / UUS-01 | sidebar.md §6.2、shell.md §8.1 | **集成① `678fe9d38` 已接**；本轮核对 `App.tsx` 现行 `loadMoreError`（解构 + `sidebarProps`）、`onResizeKeyDown`、移动端 `collapseLabel="关闭导航"`、`onNotificationOpen: selectSession` 均在 | 集成① 已覆盖 | — |
+| landing L-02 「联系合作」邮箱 | landing.md §7 | `lib/brand.ts` 抽出 `Brand` 类型、加可选 `contactEmail?: string`（不填值，页脚只在填入后渲染） | typecheck；landing-B `Landing.test` | `19799c0fe` |
+| landing L-11 登录页占位符被 `App.test` 锁定 | landing.md §7 | `App.test.tsx` 4 处 `getByPlaceholderText('邮箱' / '密码')` → `getByLabelText`（含 1 处 `findBy`）；`AuthGate` 不动（邮箱有包裹式 `<label>`、密码有 `aria-label`） | `App.test` 47/47 | `f7c08f3eb` |
+| media X-M1 「更多」菜单用例契约 | media.md §6.3 | `chat/media.test.tsx`「点击缩略图 → 打开全屏查看器」改 `pointerDown` 开 Radix DropdownMenu、`findByRole("menuitem")`、Esc 关菜单后再点「关闭预览」（与 `ImageViewer.test` 同写法） | 该用例本身（合入后全量红 1 例 → 绿） | `f7c08f3eb` |
+| media X-M2 / X-M3 / X-M4 | media.md §6.3 | **登记待办**（shell 侧 `styles.css` 字号档、`Sheet` 可选 `closeButton`、`MediaTaskCenter onReusePrompt`），不在集成② 范围 | — | — |
+| settings-B SET-12 窄屏分区短名 | `SettingsCenter.tsx` `narrowLabel` | `browser-tests/run.mjs` T42：390 宫格按 `narrowLabel` 取 tab，「账户与计费」→「账户」（1440 竖导航仍全名，无需改）。首轮 `test:browser` T42 在此超时，且因 Dialog 没关、视口停在 390 连带 T45 / T49 失败（复跑见 §5） | T42 本身 | `2a6492774` |
+| market 场景 `import './scenes-market.tsx'` | `typecheck:preview` | **不能去后缀**：`shoot.mjs` 的 `ui-preview-scene-groups` 插件用 `onResolve({ filter: /(^|\/)scenes-(manage|market)$/ })` 把**无后缀**的 `./scenes-market` 劫持成分组虚拟模块 `oc-scene-group:market`（只导出 `modules`），带 `.tsx` 后缀才会落到真实文件。本轮先去后缀（`f7c08f3eb`）→ 全量截图构建报 `No matching export … "marketScenes"`，随即还原（`2a6492774`）。TS5097 两处（manage / market 同款）登记为 `typecheck:preview` 基线；要消红应在预览 tsconfig 开 `allowImportingTsExtensions`（仅类型检查、`noEmit`），归 shell | 全量截图构建 | `f7c08f3eb` → `2a6492774` |
+
+### 4. `.gitattributes`（`419e0d218`）
+
+仓根新增（按 `wt/tutorials/docs/audit/tutorials.md` TU-36 建议的四条模式）：
+
+```gitattributes
+packages/web-react/public/tutorials/** -text
+packages/web-react/tutorial-sync*.json -text
+packages/web-react/tutorial-sync-history.jsonl -text
+packages/web-react/tutorial-capture-provenance.json -text
+```
+
+索引本就是 LF（`git ls-files --eol` → `i/lf`），`git add --renormalize` 对索引零变化；主克隆把 22 个受影响文本夹具删掉后 `git checkout --` 重检 → `w/lf`。
+`src/lib/tutorialShowcase.test.ts` 4/4 转绿（集成① 登记的基线失败 ① 撤销）。其它 Windows 工作树只需同样重检一次这几条路径。
+TU-37（`scripts/check-v5-tutorials.ts` 标记路径反斜杠进哈希）是脚本修复，归 tutorials-B。
+
+### 5. 全量门结果
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0 |
+| 预览台类型检查 | `npm run typecheck:preview --workspace packages/web-react` | 3 红，均登记基线：`scenes-manage-audit.tsx(54,30)` / `scenes-market-audit.tsx(20,30)` TS5097（`.tsx` 后缀是 `shoot.mjs` 分组插件要求的写法，见 §3 末行；集成① 时只有 manage 一处）、`scenes-taskboard.tsx(163,5)` TS2322 `"close"`（taskboard 归属） |
+| web-react 全量单测 | `cd packages\web-react; npm test`（`vitest run`，609s） | ✅ **297 文件 / 4161 例全部通过，0 失败**。集成① 的三处基线 / 偶发（tutorialShowcase 字节断言、App.test 契约、MessageRenderer `beforeAll` 超时）本轮均未出现。日志 `integ2-vitest-all.log` |
+| 真浏览器门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | 首跑（`integ2-test-browser.log`）`run.mjs` 65/68：T42 在 390 找「账户与计费」tab 超时（settings-B SET-12 短名，§3），Dialog 未关、视口停 390 → T45 / T49 连带失败；`&&` 链未进 `node --test`。改 T42（`2a6492774`）复跑（`integ2-test-browser-2.log`）：`run.mjs` **T1–T68 全部 ok**（自检「清单 68 条全部执行」）；`node --test` 16 文件 73 例：70 通过 / 3 失败 → `cc-switch-ascii-name`（**基线**）、`ocv5-185-qa`（文件级 + 用例级各计 1，`symlink` EPERM）→ 按指挥官口径在 `packages/web-react/node_modules/@openclaude/protocol` 建 junction（环境项，不入库）后单跑 **15/15 ✅**（`integ2-ocv5-185-rerun.log`）。集成① 需单跑的 `cost-authority` 本轮全量即过 |
+| ui-preview 全量截图 | `OC_UI_SHOTS=…\integration\shots-integ2 node browser-tests\ui-preview\shoot.mjs`（不设 `OC_UI_SCENES`，488s） | ✅ **227 场景 / 734 张，failures=0，retried=0**（集成① 为 118 / 350；新增 settings / landing / media / composer / tools / market-audit 等场景组）；`unmockedApi` = `listCronChannels`、`listProjectAssets`（与集成① 相同，可选桩）。首次构建因 `f7c08f3eb` 去掉 market 场景 import 后缀而失败（§3 末行），还原后重跑。日志 `integ2-shoot-all.log`，图 `shots-integ2\` |
+| 代码风格 | `npx biome lint` 本轮触碰 6 文件 | 与 HEAD 版本逐条对照：既有 20 条（`App.tsx` `useExhaustiveDependencies` ×14、`media.test.tsx` `noDelete` / `noCommaOperator` ×3、`run.mjs` ×3）**新增 0 条**；`App.test.tsx` / `brand.ts` / `scenes-market-audit.tsx` 0 条 |
+
+接线前的定向回归（`integ2-vitest-targeted.log`）：`tutorialShowcase` / `media.test` / `AgentPicker.test` / `MarketplaceCenter.test` / `App.test` 5 文件 89 例，
+其中 `App.test`「authenticated send goes through the real WS engine」一次 15s 超时（紧接 typecheck 之后跑、jsdom 冷启动），单跑 47/47 绿（`integ2-vitest-apptest-rerun.log`），全量再跑亦绿 → 记为负载偶发。
+
+### 6. 已知基线失败（本轮更新）
+
+| 项 | 现象 | 状态 |
+|---|---|---|
+| `src/lib/tutorialShowcase.test.ts` 2 例 | CRLF 字节数 | ✅ **已解除**：`.gitattributes` 后转绿（§4） |
+| `browser-tests/cc-switch-ascii-name.node-test.mjs` | 模型 id 断言 `gemini-3.8-flash` vs `sonnet-5` | 基线（见 §5 真浏览器门） |
+| `browser-tests/ocv5-185-qa.node-test.mjs` | Windows 无符号链接权限 `symlink` EPERM（用例自身容忍 EEXIST） | 环境项：在 `packages/web-react/node_modules/@openclaude/protocol` 预建 junction → `packages/protocol` 后 15/15 绿；无 junction 的机器仍 EPERM |
+| `MessageRenderer.test.tsx` `beforeAll` 超时 | 全量并行偶发 | 本轮未复现 |
+| `App.test.tsx`「authenticated send…」15s 超时 | 定向跑紧随 typecheck 时偶发 1 次 | 负载偶发，单跑 / 全量均绿 |
+| `typecheck:preview` 3 红 | §5 | 基线：TS5097 ×2 由 `shoot.mjs` 分组插件的 import 写法决定（消红方案见 §3 末行，归 shell）；TS2322 ×1 归 taskboard owner |
+
+### 7. 遗留 / 集成③ 范围
+
+- 待合入：settings 二期 `5eac1b807`（3 提交）、tutorials-B、以及其余二期分支（messages2 / taskboard2 待验收，manage2 待领）。
+- 待接线 / 待办：composer 排队气泡 `status=queued`（messages）、C-32 团队卡文案（shell + QA 同批改 `App.test` 7 处 + ocv5-210 五用例）、media X-M2 / X-M3 / X-M4（shell）、
+  `typecheck:preview` 消红（shell：预览 tsconfig 开 `allowImportingTsExtensions`；taskboard：`scenes-taskboard.tsx(163,5)`）、TU-37 门禁脚本路径归一化（tutorials-B）。
+- 合入 canonical `feat/v5-selfhost` 与 Lease Center 发布需要 v5-dev 通道，本轮不做（决策 d-24）。
