@@ -1210,7 +1210,7 @@ await check("T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoun
   await probe.waitFor({ state: "visible", timeout: 3000 });
   // (a) sending=false(刷新形态)下当前轮有未完成任务 → HUD 钉住并显示进度与待办。
   const tracker = probe.locator("[data-testid='hud-refresh-tracker']");
-  await tracker.getByText("任务 1/2", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  await tracker.getByText("任务列表 1/2", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   await tracker.getByText("容器重建后真机验证", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   // (b) 邻居行仍在:用户「继续」与终稿「已处理完毕。」
   await probe.getByText("继续", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
