@@ -531,10 +531,13 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                     // 键盘用户靠焦点触发，读屏用户直接从 aria-label 里听到 cron 原串。
                     <Tooltip content={`Cron：${job.schedule}`}>
                       <span
+                        // role=note:可聚焦却无角色的 span 读屏只念一段文字、不知道这是什么
+                        //(t-762 manage#3);note 表明它是附注而非可操作控件。触屏补 44px 命中高。
+                        role="note"
                         // biome-ignore lint/a11y/noNoninteractiveTabindex: Tooltip 触发器需可聚焦（WCAG 1.4.13）
                         tabIndex={0}
                         aria-label={`${human}，Cron 表达式 ${job.schedule}`}
-                        className="cursor-default rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        className="inline-flex cursor-default items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                       >
                         {human}
                       </span>

@@ -1,5 +1,5 @@
 import { Check, Copy, ExternalLink, Link2, RefreshCw, Unlink } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 
 import { qrDataUrl } from '../../admin/pages/alerts/qr/qr'
 import { type QqBindingStart, type QqBindingStatus, api, apiErrorMessage } from '../../lib/api'
@@ -22,6 +22,10 @@ export function QqBindingCard({
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmDialog, confirmDialogEl] = useConfirm()
+  // 「主动推送到 QQ」开关的可访问名 / 说明:左侧那两行文字就是标签,用 id 连过去而不是再抄一份
+  //(t-762 settings#1:CDP 无障碍树里这枚 Switch 的 name 为空,读屏只播「开关,已开启」)。
+  const pushLabelId = useId()
+  const pushHintId = useId()
 
   const refresh = useCallback(async () => {
     const next = await api.getQqBinding(auth)
@@ -145,12 +149,16 @@ export function QqBindingCard({
         <div className="border-t border-border px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-body text-fg">主动推送到 QQ</div>
-              <div className="mt-0.5 text-caption text-faint">
+              <div id={pushLabelId} className="text-body text-fg">
+                主动推送到 QQ
+              </div>
+              <div id={pushHintId} className="mt-0.5 text-caption text-faint">
                 定时任务与提醒优先发送到已绑定 QQ
               </div>
             </div>
             <Switch
+              aria-labelledby={pushLabelId}
+              aria-describedby={pushHintId}
               checked={prefs.qq_proactive_push !== false}
               onCheckedChange={(checked) => void onPatch({ qq_proactive_push: checked })}
             />

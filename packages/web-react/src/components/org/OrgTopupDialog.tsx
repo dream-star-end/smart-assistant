@@ -231,7 +231,8 @@ export function OrgTopupDialog({
                   type="button"
                   onClick={() => setAmount(y)}
                   className={cn(
-                    "rounded-full border px-3 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                    // 触屏补 44px 命中高(t-762 settings#5:此前 28px);桌面 hover 可用时零变化。
+                    "rounded-full border px-3 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
                     amount === y
                       ? "border-accent bg-accent-soft text-accent"
                       : "border-border bg-surface text-muted hover:border-border-strong hover:text-fg",

@@ -76,7 +76,10 @@ describe('QqBindingCard', () => {
     vi.spyOn(api, 'deleteQqBinding').mockResolvedValue({ ok: true, unbound: true })
     const patch = vi.fn(async () => {})
     render(<QqBindingCard auth={auth} prefs={{}} onPatch={patch} />)
-    const proactive = await screen.findByRole('switch')
+    // 开关的可访问名 / 说明来自左侧那两行文字（aria-labelledby / aria-describedby）：
+    // 此前 CDP 无障碍树里 name 为空，读屏只播「开关，已开启」（t-762 settings#1）。
+    const proactive = await screen.findByRole('switch', { name: '主动推送到 QQ' })
+    expect(proactive).toHaveAccessibleDescription('定时任务与提醒优先发送到已绑定 QQ')
     expect(proactive).toBeChecked()
     fireEvent.click(proactive)
     expect(patch).toHaveBeenCalledWith({ qq_proactive_push: false })

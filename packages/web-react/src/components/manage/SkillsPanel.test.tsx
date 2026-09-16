@@ -143,6 +143,8 @@ describe("SkillsPanel 行头布局与命名一致", () => {
     expect(screen.queryByText("#runbook")).not.toBeInTheDocument();
     const more = screen.getByRole("button", { name: "+2" });
     expect(more).not.toHaveAttribute("title");
+    // 「+2」两个字符桌面只有 12px 宽,触屏点不中(t-762 manage#1):触控档由按钮自己撑到 44×44。
+    expect(more).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
     fireEvent.click(more);
     expect(screen.getByText("#runbook")).toBeInTheDocument();
     expect(screen.getByText("#灰度")).toBeInTheDocument();

@@ -665,7 +665,8 @@ export function UsageTab({
                         type="button"
                         onClick={() => toggleDelegates(row.session_id)}
                         aria-expanded={isOpen}
-                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                        // 触屏补 44px 命中高(t-762 settings#5:此前 22px);桌面 hover 可用时零变化。
+                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                       >
                         含组队 {formatCredits(row.delegate_credits ?? "0")} 积分
                         <span

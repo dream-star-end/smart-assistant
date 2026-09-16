@@ -1,6 +1,6 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import { Check, ChevronRight, FlaskConical, Inbox, ShieldX, Sparkles, X } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { benchmarkSuspect, bundleHasEvals } from "../../lib/marketplace";
 import type {
@@ -21,15 +21,98 @@ import {
   Field,
   Input,
   ListSkeleton,
+  Modal,
   Panel,
   Textarea,
   TimeAgo,
   Tooltip,
   useConfirm,
-  usePrompt,
   useToast,
 } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
+
+type RejectReasonOpts = {
+  title: string;
+  /** 给审核员看的提示,同时经 Field 接成输入框的 aria-describedby。 */
+  body?: ReactNode;
+  placeholder?: string;
+  confirmText?: string;
+  maxLength?: number;
+};
+
+/**
+ * 拒绝理由输入框(单条 / 批量共用)。
+ *
+ * 不走 ui 的 `usePrompt`:它渲染的 Input 只有 placeholder、没有可访问名 —— CDP 无障碍树里
+ * name 为空,读屏 Tab 到只听见「编辑框」;一开始输入 placeholder 就消失,视觉上也没有标签
+ *(t-762 market#1,P2)。这里用 `Field` 给输入框一枚常驻标签「拒绝原因」,提示文字接
+ * aria-describedby,必填由 aria-required 承载;交互(Enter 提交 / 空白不可提交 / Esc 取消)
+ * 与 usePrompt 保持一致。若日后 usePrompt 支持给输入框命名,可换回去。
+ */
+function useRejectReasonPrompt(): [(opts: RejectReasonOpts) => Promise<string | null>, ReactNode] {
+  const [opts, setOpts] = useState<RejectReasonOpts | null>(null);
+  const [value, setValue] = useState("");
+  const resolverRef = useRef<((v: string | null) => void) | null>(null);
+
+  const promptReason = useCallback((o: RejectReasonOpts) => {
+    return new Promise<string | null>((resolve) => {
+      resolverRef.current?.(null);
+      resolverRef.current = resolve;
+      setValue("");
+      setOpts(o);
+    });
+  }, []);
+
+  const settle = (v: string | null) => {
+    resolverRef.current?.(v);
+    resolverRef.current = null;
+    setOpts(null);
+  };
+
+  const submit = () => {
+    const t = value.trim();
+    settle(t.length > 0 ? t : null);
+  };
+
+  const element = (
+    <Modal
+      open={opts !== null}
+      onOpenChange={(open) => {
+        if (!open) settle(null);
+      }}
+      title={opts?.title}
+      footer={
+        <>
+          <Button variant="ghost" onClick={() => settle(null)}>
+            取消
+          </Button>
+          <Button variant="primary" onClick={submit} disabled={value.trim().length === 0}>
+            {opts?.confirmText ?? "拒绝"}
+          </Button>
+        </>
+      }
+    >
+      <Field label="拒绝原因" hint={opts?.body} required>
+        <Input
+          value={value}
+          maxLength={opts?.maxLength ?? 500}
+          placeholder={opts?.placeholder}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          // biome-ignore lint/a11y/noAutofocus: 输入对话框打开即聚焦是预期交互(与 usePrompt 同)
+          autoFocus
+        />
+      </Field>
+    </Modal>
+  );
+
+  return [promptReason, element];
+}
 
 /**
  * 「带 evals」「自报增益存疑」两枚徽章的解释(K-14)。此前只挂在原生 title 上:触屏永远看不到、
@@ -127,7 +210,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
     reviewed: number;
     failures: Array<{ versionId: string; name: string; message?: string }>;
   } | null>(null);
-  const [promptText, promptTextEl] = usePrompt();
+  const [promptText, promptTextEl] = useRejectReasonPrompt();
   const [confirmDialog, confirmEl] = useConfirm();
   const toast = useToast();
 
@@ -163,9 +246,10 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       let note: string | undefined;
       if (decision === "reject") {
         // 拒绝必须给理由:回显到发布者「我的发布」,否则拒绝对发布者是黑盒。
+        // 标题落在动作上、字段名落在「拒绝原因」上,两处不再各说一遍「理由」。
         const reason = await promptText({
-          title: "拒绝理由",
-          body: "理由会展示给发布者，请写明需要修正什么。",
+          title: "拒绝投稿",
+          body: "原因会展示给发布者，请写明需要修正什么。",
           placeholder: "例：正文包含内网地址，请移除后重新提交",
           confirmText: "拒绝",
           maxLength: 500,
@@ -234,7 +318,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       if (decision === "reject") {
         const reason = await promptText({
           title: `批量拒绝 ${versionIds.length} 个投稿`,
-          body: "理由会展示给这些发布者，请写明需要修正什么。",
+          body: "原因会展示给这些发布者，请写明需要修正什么。",
           placeholder: "例：正文包含内网地址，请移除后重新提交",
           confirmText: "批量拒绝",
           maxLength: 500,

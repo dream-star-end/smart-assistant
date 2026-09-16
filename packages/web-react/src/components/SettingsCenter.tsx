@@ -583,11 +583,11 @@ function UpdateCheckRow({ clientBuild }: { clientBuild: string }) {
       >
         检查更新
       </Button>
-      {message && (
-        <output className="break-all text-muted" aria-live="polite" data-testid="about-update-status">
-          {message}
-        </output>
-      )}
+      {/* live region 常驻:只在有消息时才挂载的话,首次点「检查更新」时区域与文字同帧出现,
+          NVDA / VoiceOver 可能收不到这第一句播报(QA t-1028 §6 #2)。这里始终渲染、只切文本。 */}
+      <output className="break-all text-muted" aria-live="polite" data-testid="about-update-status">
+        {message}
+      </output>
       {state.kind === "available" && (
         <Button type="button" size="sm" variant="primary" onClick={() => appUpdate.reloadNow()}>
           立即刷新

@@ -665,7 +665,8 @@ export function Sidebar({
             <button
               type="button"
               onClick={onNewHere}
-              className="rounded-sm text-caption font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              // 行内文字钮桌面只有 16px 高(t-762 sidebar#4):触控档补 44px 命中高与左右内距,桌面零变化。
+              className="inline-flex items-center rounded-sm text-caption font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
             >
               新建会话
             </button>
@@ -971,7 +972,8 @@ export function Sidebar({
               data-product-control
               type="button"
               onClick={() => setMultiSelect(true)}
-              className="h-9 shrink-0 rounded-md px-2 text-caption font-medium text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              // 高度已有触屏 44px,宽度只有 38px(t-762 sidebar#4):触控档再补 44px 最小宽。
+              className="h-9 shrink-0 rounded-md px-2 text-caption font-medium text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
             >
               多选
             </button>
