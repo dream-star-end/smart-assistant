@@ -123,7 +123,8 @@ export function ProjectSkillOverlay({
           size="sm"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          aria-controls={`${uid}-body`}
+          // 折叠区只在展开时挂载:收起态不能留一个指向空气的 IDREF(t-762 manage#2;同 SkillsPanel 写法)。
+          aria-controls={open ? `${uid}-body` : undefined}
           data-testid="project-skill-overlay-toggle"
           className="-ml-3 gap-1 font-medium"
         >
