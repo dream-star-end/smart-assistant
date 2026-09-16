@@ -286,7 +286,7 @@ export function PreferencesTab({
       <div className="border-t border-border px-5 py-4">
         <div className="overflow-hidden rounded-2xl border border-accent/25 bg-gradient-to-br from-accent-soft via-surface to-surface shadow-sm">
           <div className="flex items-start gap-3 px-4 pb-3 pt-4">
-            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-sm">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg shadow-sm">
               <MoonStar size={20} />
             </div>
             <div className="min-w-0 flex-1">
