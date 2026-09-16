@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent }
 import type { Theme } from "../hooks/useTheme";
 import { useMdViewport } from "../hooks/useMdViewport";
 import { api, apiErrorMessage } from "../lib/api";
+import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
 import {
   PRODUCT_CAPABILITIES,
@@ -495,6 +496,107 @@ function currentBuildId(): string | null {
   return value || null;
 }
 
+/**
+ * 备案位只在 brand.ts 填了真实备案号后展示:占位文案(「备案信息更新中」之类)不是法定信息,
+ * 不该出现在「备案」这一栏。判据与 landing 页脚一致——真实备案号必含一串数字(lib/legal.ts
+ * `filedIcp()`,集成合入后可直接改为引用它)。
+ */
+function hasIcpNumber(icp: string): boolean {
+  return /\d{4,}/.test(icp);
+}
+
+const SERVER_BUILD_META_RE =
+  /<meta\s+(?:[^>]*?\s)?name=["']oc-build["'][^>]*?\scontent=["']([^"']+)["']|<meta\s+(?:[^>]*?\s)?content=["']([^"']+)["'][^>]*?\sname=["']oc-build["']/i;
+
+/**
+ * 读服务端当前 index.html 里的同一枚 `<meta name="oc-build">`。版本握手本身是 bridge 在
+ * WS 建连时单向下发的(lib/appUpdate),前端没有「问一下现在是哪个版本」的主动入口;关于页
+ * 的「检查更新」就用这一招补上:no-store 拉一次入口 HTML,把 meta 抠出来比对。导出供单测。
+ */
+export async function fetchServerBuild(fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  const res = await fetchImpl("/", { cache: "no-store", headers: { Accept: "text/html" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  const m = SERVER_BUILD_META_RE.exec(html);
+  const value = (m?.[1] ?? m?.[2] ?? "").trim();
+  return value || null;
+}
+
+type UpdateCheck =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "latest" }
+  | { kind: "available"; build: string }
+  | { kind: "unknown" }
+  | { kind: "failed" };
+
+/**
+ * 关于页「检查更新」:长驻标签页(尤其移动端 webview)手里可能是几小时前的旧 bundle,自动软刷
+ * 只在安全点发生、横幅又只在自动刷失败后出现,用户此前没有任何主动的出口(审计 SET-42 遗留项)。
+ * 发现新版本时的「立即刷新」走 appUpdate.reloadNow(),与更新横幅同一条路(停掉 governor 定时器,
+ * 不动自动 reload 预算)。
+ */
+function UpdateCheckRow({ clientBuild }: { clientBuild: string }) {
+  const [state, setState] = useState<UpdateCheck>({ kind: "idle" });
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  async function check() {
+    setState({ kind: "checking" });
+    try {
+      const server = await fetchServerBuild();
+      if (!alive.current) return;
+      if (!server) setState({ kind: "unknown" });
+      else if (server === clientBuild) setState({ kind: "latest" });
+      else setState({ kind: "available", build: server });
+    } catch {
+      if (alive.current) setState({ kind: "failed" });
+    }
+  }
+
+  const message =
+    state.kind === "checking"
+      ? "正在检查…"
+      : state.kind === "latest"
+        ? "已是最新版本"
+        : state.kind === "available"
+          ? `发现新版本 ${state.build}，刷新页面即可更新`
+          : state.kind === "unknown"
+            ? "暂时读不到服务端版本，请稍后再试"
+            : state.kind === "failed"
+              ? "检查失败，请检查网络后重试"
+              : null;
+
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption">
+      <Button
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => void check()}
+        disabled={state.kind === "checking"}
+      >
+        检查更新
+      </Button>
+      {message && (
+        <output className="break-all text-muted" aria-live="polite" data-testid="about-update-status">
+          {message}
+        </output>
+      )}
+      {state.kind === "available" && (
+        <Button type="button" size="sm" variant="primary" onClick={() => appUpdate.reloadNow()}>
+          立即刷新
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function AboutSection() {
   const build = currentBuildId();
   return (
@@ -516,10 +618,13 @@ function AboutSection() {
           <dt className="shrink-0 text-faint">运营主体</dt>
           <dd className="truncate text-fg">{BRAND.company}</dd>
         </div>
-        <div className="flex items-center justify-between gap-3">
-          <dt className="shrink-0 text-faint">备案</dt>
-          <dd className="truncate text-fg">{BRAND.icp}</dd>
-        </div>
+        {/* 占位文案不上「备案」栏;运营在 brand.ts 填入真实备案号后自动出现(见 hasIcpNumber)。 */}
+        {hasIcpNumber(BRAND.icp) && (
+          <div className="flex items-center justify-between gap-3">
+            <dt className="shrink-0 text-faint">备案</dt>
+            <dd className="truncate text-fg">{BRAND.icp}</dd>
+          </div>
+        )}
         <div className="flex items-center justify-between gap-3">
           <dt className="shrink-0 text-faint">客户端</dt>
           <dd className="truncate text-fg">
@@ -536,6 +641,8 @@ function AboutSection() {
           </div>
         )}
       </dl>
+      {/* 没有构建号(dev / meta 缺失)时版本握手本身就是 inert 的,检查更新也没有比对对象,不渲染。 */}
+      {build && <UpdateCheckRow clientBuild={build} />}
       {/* 法务入口:与落地页同一套 /terms、/privacy 路由(LegalPage),新标签打开不打断当前会话。 */}
       <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t border-border pt-3 text-caption">
         <a

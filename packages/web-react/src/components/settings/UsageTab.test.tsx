@@ -23,7 +23,7 @@ import type {
   UsageResponse,
   UsageSessionRow,
 } from "../../lib/types";
-import { UsageTab, topModelsWithOther } from "./UsageTab";
+import { UsageTab, appendSessionRows, topModelsWithOther } from "./UsageTab";
 
 const projectScopeState = vi.hoisted(() => ({
   kind: "all" as "all" | "work" | "ungrouped" | "chat",
@@ -484,5 +484,49 @@ describe("UsageTab 空态", () => {
     expect(screen.getAllByText("该时段暂无用量数据。").length).toBeGreaterThan(0);
     expect(document.querySelectorAll("canvas")).toHaveLength(0);
     expect(chartConstructed).not.toHaveBeenCalled();
+  });
+});
+
+// 二期(t-628):会话明细是 offset 分页,翻页期间新会话插到前面会让下一页重发上一页末尾的行。
+describe("appendSessionRows(会话明细翻页去重)", () => {
+  test("同 session_id 的行只保留首次出现的那份,其余原样追加", () => {
+    const a = chatRow({ session_id: "s-a", billed_credits: "1" });
+    const b = chatRow({ session_id: "s-b", billed_credits: "2" });
+    const bDup = chatRow({ session_id: "s-b", billed_credits: "999" });
+    const c = chatRow({ session_id: "s-c", billed_credits: "3" });
+    const merged = appendSessionRows([a, b], [bDup, c]);
+    expect(merged.map((r) => r.session_id)).toEqual(["s-a", "s-b", "s-c"]);
+    expect(merged[1].billed_credits).toBe("2");
+  });
+
+  test("同一页内部重复也只留一份;空输入返回空数组", () => {
+    const a = chatRow({ session_id: "s-a" });
+    expect(appendSessionRows([], [a, chatRow({ session_id: "s-a" })])).toHaveLength(1);
+    expect(appendSessionRows([], [])).toEqual([]);
+  });
+});
+
+describe("UsageTab 会话明细翻页", () => {
+  test("下一页重发上一页末尾的会话时只渲染一行,offset 仍按服务端行数推进", async () => {
+    const first = makeResponse([chatRow({ session_id: "uuid-chat-1" }), chatRow({ session_id: "uuid-chat-2" })]);
+    first.sessions.has_more = true;
+    // 第二页把 uuid-chat-2 又送了一遍(它在服务端被新会话顶后了一位)。
+    const second = makeResponse([chatRow({ session_id: "uuid-chat-2" }), chatRow({ session_id: "uuid-chat-3" })]);
+    second.sessions.offset = 2;
+    mockedGetUsage.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("uuid-chat-2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
+    expect(await screen.findByText("uuid-chat-3")).toBeInTheDocument();
+
+    expect(screen.getAllByText("uuid-chat-2")).toHaveLength(1);
+    expect(screen.getAllByText(/^uuid-chat-\d$/)).toHaveLength(3);
+    expect(mockedGetUsage).toHaveBeenLastCalledWith(
+      auth,
+      expect.objectContaining({ sessionsOffset: 2 }),
+    );
+    // has_more=false → 「加载更多」收起
+    expect(screen.queryByRole("button", { name: "加载更多" })).toBeNull();
   });
 });

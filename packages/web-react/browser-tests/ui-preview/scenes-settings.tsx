@@ -8,6 +8,8 @@
  * 全部数据走 api-stub 场景表;金额 / 积分按生产契约保持字符串大数。
  * 组件在 Radix Dialog 里的场景由 shoot.mjs 自动裁到 [role=dialog];裸组件场景整页截图。
  */
+import { useEffect } from 'react'
+
 import { ChatGptProxyDialog } from '../../src/components/ChatGptProxyDialog'
 import { OrgCenter } from '../../src/components/OrgCenter'
 import { SettingsCenter, type SettingsSection } from '../../src/components/SettingsCenter'
@@ -43,6 +45,28 @@ import type { Scene } from './types'
 
 const auth = createMemoryAuthSession(() => {}, 'preview-token')
 const noop = () => {}
+
+/**
+ * 关于页的「版本」行与「检查更新」都读 `<meta name="oc-build">`(生产由 index.html 注入;预览台的
+ * HTML 没有这枚 meta)。渲染前补一枚,场景卸载时撤掉,不影响同一批次里的其他场景(FeedbackTab 也读它)。
+ * 在 render 体里注入是刻意的:AboutSection 在首次渲染时就同步读 meta,effect 里补就晚了。
+ */
+function WithBuildMeta({ build, children }: { build: string; children: React.ReactNode }) {
+  if (!document.querySelector('meta[name="oc-build"]')) {
+    const meta = document.createElement('meta')
+    meta.name = 'oc-build'
+    meta.content = build
+    meta.dataset.previewInjected = 'true'
+    document.head.appendChild(meta)
+  }
+  useEffect(
+    () => () => {
+      document.querySelector('meta[name="oc-build"][data-preview-injected]')?.remove()
+    },
+    [],
+  )
+  return <>{children}</>
+}
 
 // ── 用户形态 ────────────────────────────────────────────────────────────────
 const paidUser: User = {
@@ -1140,6 +1164,17 @@ export const settingsScenes: Scene[] = [
     viewports: ['desktop', 'mobile'],
     api: {},
     render: () => settings('feedback', paidUser),
+  },
+  {
+    // 二期(t-628):关于页带构建号 → 出现「检查更新」;备案位在 brand.ts 仍是占位文案时不渲染。
+    id: 'settings-about-update-check',
+    label: '设置 · 关于(有构建号:版本行 + 检查更新;备案占位不渲染)',
+    group: '工作区',
+    viewports: ['desktop', 'mobile'],
+    api: {},
+    render: () => (
+      <WithBuildMeta build="9f3c2ab7e1d4">{settings('about', paidUser)}</WithBuildMeta>
+    ),
   },
   {
     id: 'settings-subscription-dialog',
