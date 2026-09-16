@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -9,6 +9,8 @@ import {
 } from "../lib/productCapabilities";
 import type { TutorialCaseId } from "../lib/tutorialCaseCatalog";
 import { api } from "../lib/api";
+import { TUTORIAL_PENDING_CAPTURE_LABEL, TUTORIAL_SCENARIO_PATHS } from "../lib/tutorialJourneys";
+import { SIGNATURE_WORKS } from "../lib/tutorialSignatureWorks";
 import { TutorialCenter } from "./TutorialCenter";
 
 afterEach(() => {
@@ -16,6 +18,20 @@ afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
 });
+
+/** radix DropdownMenu Trigger 在 pointerdown 开启（click 不够），jsdom 里直接发。 */
+function openHelpMenu() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: /帮助与创作/ }), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+}
+
+function pickHelpMenu(name: string) {
+  openHelpMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name }));
+}
 
 function Harness({
   initial = PRODUCT_CAPABILITIES.chatBasics.id,
@@ -88,7 +104,7 @@ describe("TutorialCenter", () => {
     expect(screen.getByRole("heading", { name: /让它做给你看/ })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^查看成果：/ })).toHaveLength(2);
     expect(screen.queryByRole("heading", { name: "10 分钟走完第一次任务" })).not.toBeInTheDocument();
-    expect(screen.queryByText("示例待真实运行采集")).not.toBeInTheDocument();
+    expect(screen.queryByText(TUTORIAL_PENDING_CAPTURE_LABEL)).not.toBeInTheDocument();
     expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("已读");
     expect(screen.getByText(/不是完整会话回放/)).toBeInTheDocument();
@@ -98,35 +114,94 @@ describe("TutorialCenter", () => {
     expect(screen.getByRole("heading", { name: /让它做给你看/ })).toBeInTheDocument();
   });
 
-  it("快速上手退到帮助菜单，仍可进入功能详情", () => {
+  it("快速上手是一级页签，仍可进入功能详情", () => {
     render(<CaseHarness />);
-    fireEvent.click(screen.getByText("帮助与创作"));
     fireEvent.click(screen.getByRole("button", { name: "快速上手" }));
     expect(screen.getByRole("heading", { name: "10 分钟走完第一次任务" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "打开步骤：发第一个任务" }));
     expect(screen.getByRole("heading", { name: "开始一场高质量对话" })).toBeInTheDocument();
   });
 
-  it("案例列表与详情都标明示例待真实运行采集", () => {
+  it("快速上手底部兑现 5 条按场景学习路径，点章节即打开功能参考（TU-14）", () => {
     render(<CaseHarness />);
-    fireEvent.click(screen.getByText("帮助与创作"));
-    fireEvent.click(screen.getByRole("button", { name: "案例脚本" }));
-    const pending = screen.getAllByText("示例待真实运行采集");
+    fireEvent.click(screen.getByRole("button", { name: "快速上手" }));
+    for (const path of TUTORIAL_SCENARIO_PATHS) {
+      expect(screen.getByRole("heading", { name: path.title })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("button", { name: /GitHub 仓库/ }));
+    expect(screen.getByRole("heading", { name: "连接 GitHub 仓库协作开发" })).toBeInTheDocument();
+  });
+
+  it("「功能参考」有一级入口，点别的页签后再点它回到上次看的那篇（TU-01）", () => {
+    render(<CaseHarness />);
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "功能参考" }));
+    expect(screen.getByRole("heading", { name: "开始一场高质量对话" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "搜索教程" })).toBeInTheDocument();
+    // 换一篇，再去别处，再回来：应当回到「GitHub 仓库」而不是永远回到默认的「对话入门」。
+    fireEvent.click(screen.getAllByRole("button", { name: /GitHub 仓库/ })[0]);
+    expect(screen.getByRole("heading", { name: "连接 GitHub 仓库协作开发" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "案例展厅" }));
+    expect(screen.getByRole("heading", { name: /让它做给你看/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "功能参考" }));
+    expect(screen.getByRole("heading", { name: "连接 GitHub 仓库协作开发" })).toBeInTheDocument();
+  });
+
+  it("精选作品详情受控于教程中心：点「案例展厅」页签能回到画廊，标题随作品变化（TU-02）", () => {
+    render(<CaseHarness />);
+    fireEvent.click(screen.getByRole("button", { name: SIGNATURE_WORKS[0].action }));
+    expect(screen.getByRole("heading", { level: 1, name: SIGNATURE_WORKS[0].title })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: SIGNATURE_WORKS[0].title })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "案例展厅" }));
+    expect(screen.getByRole("heading", { name: /让它做给你看/ })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "案例展厅" })).toBeInTheDocument();
+  });
+
+  it("「帮助与创作」是真正的菜单：Esc 关闭、菜单项带 menuitem 语义（TU-03）", () => {
+    render(<CaseHarness />);
+    openHelpMenu();
+    expect(screen.getByRole("menuitem", { name: "教程工作室" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "案例脚本" })).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(screen.queryByRole("menuitem", { name: "案例脚本" })).not.toBeInTheDocument();
+  });
+
+  it("案例列表与详情用用户语言声明「尚无真实运行记录」，且详情页只说一次（TU-10）", () => {
+    render(<CaseHarness />);
+    pickHelpMenu("案例脚本");
+    const pending = screen.getAllByText(TUTORIAL_PENDING_CAPTURE_LABEL);
     expect(pending.length).toBeGreaterThanOrEqual(12);
-    expect(screen.getByRole("heading", { name: "这些是待采集的任务脚本" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "这些是任务脚本，还没有真实运行记录" })).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("待采集");
     expect(document.body.textContent).not.toContain("先看完整故事");
     expect(screen.queryByRole("list", { name: "案例结果" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /从 30 篇论文到可追溯证据图谱/ }));
-    expect(screen.getAllByText("示例待真实运行采集").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByRole("heading", { name: "从 30 篇论文到可追溯证据图谱" })).toBeInTheDocument();
+    expect(screen.getAllByText(new RegExp(TUTORIAL_PENDING_CAPTURE_LABEL))).toHaveLength(1);
+    expect(document.body.textContent).not.toContain("待采集");
+    // 成果预览是示意图，不能当成本案例真实产物播报（TU-16）。
+    expect(screen.getByText("示意图 · 非本案例实际产物")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: /^示意：/ })).toBeInTheDocument();
+  });
+
+  it("案例脚本总览可按分类与关键词筛选（TU-15）", () => {
+    render(<CaseHarness />);
+    pickHelpMenu("案例脚本");
+    expect(screen.getByText("12 / 12 条")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "通用" }));
+    expect(screen.getByText("2 / 12 条")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "全部" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索案例" }), { target: { value: "SWE-bench" } });
+    expect(screen.getByText("1 / 12 条")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索案例" }), { target: { value: "不存在的案例" } });
+    expect(screen.getByRole("status")).toHaveTextContent("没有匹配案例");
   });
 
   it("社区 Tab 已改名为教程工作室，并提供四个入口", async () => {
     vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
     render(<CaseHarness />);
-    fireEvent.click(screen.getByText("帮助与创作"));
-    fireEvent.click(screen.getByRole("button", { name: "教程工作室" }));
+    pickHelpMenu("教程工作室");
     expect(await screen.findByRole("heading", { name: "探索教程，或把一次真实会话变成可复用方法" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "探索教程" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "从当前会话生成" })).toBeInTheDocument();
@@ -214,15 +289,30 @@ describe("TutorialCenter", () => {
     );
   });
 
-  it("搜索功能、场景和别名后可直接切换教程", () => {
+  it("搜索功能、场景和别名后可直接切换教程，窄屏也能看到命中计数与结果列表（TU-04）", () => {
     render(<Harness />);
     fireEvent.change(screen.getByRole("searchbox", { name: "搜索教程" }), {
       target: { value: "OAuth 仓库" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /GitHub 仓库/ }));
+    // <lg 的结果列表与桌面侧栏各渲染一份（jsdom 不算 CSS），有查询时命中计数可见。
+    const results = screen.getByRole("navigation", { name: "搜索结果" });
+    expect(results).toHaveTextContent(/\d+ 篇匹配「OAuth 仓库」/);
+    expect(screen.getAllByRole("button", { name: /GitHub 仓库/ }).length).toBeGreaterThanOrEqual(2);
+    fireEvent.click(within(results).getByRole("button", { name: /GitHub 仓库/ }));
     expect(
       screen.getByRole("heading", { name: "连接 GitHub 仓库协作开发" }),
     ).toBeInTheDocument();
+    // 点选后查询清空，回到 <select> 形态。
+    expect(screen.queryByRole("navigation", { name: "搜索结果" })).not.toBeInTheDocument();
+  });
+
+  it("搜索无结果时窄屏与侧栏都给出空态文案，而不是毫无变化（TU-04）", () => {
+    render(<Harness />);
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索教程" }), {
+      target: { value: "不存在的功能关键词" },
+    });
+    expect(screen.getAllByText("没有匹配的教程，换个关键词试试。").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByRole("navigation", { name: "搜索结果" })).not.toHaveTextContent("篇匹配");
   });
 
   it("视频失败时显示同源截图兜底，不留下空白", () => {

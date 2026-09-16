@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Bell,
+  BookOpen,
   Bot,
   Brain,
   Building2,
@@ -45,7 +46,6 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { tutorialHref } from "../hooks/useAppRoute";
 import {
   PRODUCT_CAPABILITIES,
   PRODUCT_CAPABILITY_LIST,
@@ -70,7 +70,9 @@ import {
 import {
   TUTORIAL_PENDING_CAPTURE_LABEL,
   TUTORIAL_QUICKSTART,
+  TUTORIAL_SCENARIO_PATHS,
 } from "../lib/tutorialJourneys";
+import { SIGNATURE_WORKS, type SignatureWork } from "../lib/tutorialSignatureWorks";
 import {
   markTutorialRead,
   readTutorialProgress,
@@ -81,11 +83,18 @@ import type { ChatMessage } from "../lib/chat/model";
 import type { AuthSession } from "../lib/types";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
 import { CommunityTutorials } from "./tutorials/CommunityTutorials";
-import { MissionReplay } from "./tutorials/MissionReplay";
 import { CaseShowroom, ShowcaseDetail } from "./tutorials/CaseShowroom";
 import { showcaseById } from "../lib/tutorialShowcase";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
-import { Badge, Button, IconButton } from "./ui";
+import {
+  Badge,
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  IconButton,
+} from "./ui";
 
 const ICONS: Record<string, LucideIcon> = {
   message: MessageCircle,
@@ -236,6 +245,9 @@ export function TutorialCenter({
 }) {
   const [communityOpen, setCommunityOpen] = useState(!!communityId);
   const [browseView, setBrowseView] = useState<"showcase" | "start" | "cases">("showcase");
+  // 精选作品详情的选中态提到这里(审计 TU-02):放在 CaseShowroom 内部时,点导航「案例展厅」没有任何
+  // state 变化、页面停在作品详情;现在 clearToBrowse 一并清掉,页签就能回到画廊。
+  const [signatureWorkId, setSignatureWorkId] = useState<SignatureWork["id"] | null>(null);
   const mode =
     communityId || communityOpen
       ? "community"
@@ -245,6 +257,12 @@ export function TutorialCenter({
           ? "cases"
           : browseView;
   const selectedTopicId = topicId ?? PRODUCT_CAPABILITIES.chatBasics.id;
+  // 记住最近看过的功能参考主题:点别的页签后 App 侧会把 topicId 清空,再点「功能参考」
+  // 页签要回到上次那一篇而不是永远回到「对话入门」(审计 TU-01)。
+  const lastTopicRef = useRef<ProductFeatureId>(selectedTopicId);
+  useEffect(() => {
+    if (topicId) lastTopicRef.current = topicId;
+  }, [topicId]);
   const [query, setQuery] = useState("");
   const [featureCategory, setFeatureCategory] = useState<ProductFeatureCategory | "all">("all");
   const [progress, setProgress] = useState(() => readTutorialProgress());
@@ -257,14 +275,12 @@ export function TutorialCenter({
 
   const feature = capabilityById(selectedTopicId);
   const topic = tutorialById(selectedTopicId);
-  const media = TUTORIAL_MEDIA[topic.media];
   const cta = actionState(feature);
   const selectedCase = caseId ? TUTORIAL_CASE_BY_ID[caseId] : null;
   const selectedShowcase = showcaseById(caseId);
-  const showMissionReplay =
-    selectedCase != null &&
-    selectedCase.replay.status !== "pending_capture" &&
-    (caseId === "research-bike-demand" || caseId === "coding-swe-bench-fix");
+  const signatureWork = signatureWorkId
+    ? SIGNATURE_WORKS.find((work) => work.id === signatureWorkId) ?? null
+    : null;
 
   const filteredFeatures = useMemo(
     () =>
@@ -278,7 +294,7 @@ export function TutorialCenter({
   const mobileFeatureOptions = filteredFeatures.some((item) => item.id === selectedTopicId)
     ? filteredFeatures
     : [feature, ...filteredFeatures];
-
+  const hasQuery = query.trim().length > 0;
 
   useEffect(() => {
     if (!open) {
@@ -286,6 +302,7 @@ export function TutorialCenter({
       setFeatureCategory("all");
       setCommunityOpen(false);
       setBrowseView("showcase");
+      setSignatureWorkId(null);
       return;
     }
     if (communityId) setCommunityOpen(true);
@@ -316,6 +333,7 @@ export function TutorialCenter({
     setQuery("");
     setCommunityOpen(false);
     setBrowseView(view);
+    setSignatureWorkId(null);
     onCommunityChange(null);
     onShowCaseGallery();
   };
@@ -323,22 +341,33 @@ export function TutorialCenter({
   const showShowroom = () => clearToBrowse("showcase");
   const showStart = () => clearToBrowse("start");
   const showCases = () => clearToBrowse("cases");
+  // 「功能参考」页签(审计 TU-01):26 篇功能参考此前在导航里没有入口,只能从快速上手的链接绕进去。
+  const showFeatures = () => {
+    setQuery("");
+    setCommunityOpen(false);
+    setSignatureWorkId(null);
+    onCommunityChange(null);
+    onTopicChange(lastTopicRef.current);
+  };
 
   const showCommunity = () => {
     setQuery("");
+    setSignatureWorkId(null);
     setCommunityOpen(true);
   };
 
   const headerCopy =
-    mode === "showcase" || (mode === "cases" && selectedShowcase)
-      ? { title: "案例展厅", subtitle: "先看成果，再做一个你的版本" }
-      : mode === "start"
-      ? { title: "快速上手", subtitle: "大约 10 分钟，走完第一次任务" }
-        : mode === "features"
-          ? { title: "功能参考", subtitle: "按功能查找用法" }
-          : mode === "cases"
-            ? { title: "案例脚本", subtitle: "参考材料，不是已完成的案例" }
-            : { title: "教程工作室", subtitle: "探索、手写或从当前会话生成可复用教程" };
+    mode === "showcase" && signatureWork
+      ? { title: signatureWork.title, subtitle: "精选作品 · 可交互 · 非完整会话回放" }
+      : mode === "showcase" || (mode === "cases" && selectedShowcase)
+        ? { title: "案例展厅", subtitle: "先看成果，再做一个你的版本" }
+        : mode === "start"
+          ? { title: "快速上手", subtitle: "大约 10 分钟，走完第一次任务" }
+          : mode === "features"
+            ? { title: "功能参考", subtitle: "按功能查找用法" }
+            : mode === "cases"
+              ? { title: "案例脚本", subtitle: "参考材料，不是已完成的案例" }
+              : { title: "教程工作室", subtitle: "探索、手写或从当前会话生成可复用教程" };
 
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !next && onClose()}>
@@ -353,8 +382,8 @@ export function TutorialCenter({
           }}
           className="tutorial-shell fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-bg shadow-float focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 lg:left-1/2 lg:w-[min(1180px,calc(100vw-2rem))] lg:-translate-x-1/2"
         >
-          <header className="flex shrink-0 items-center gap-3 border-b border-border bg-surface/90 px-3 py-3 backdrop-blur-xl sm:px-5">
-            <div className="flex min-w-0 items-center gap-3">
+          <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-border bg-surface/90 px-3 py-3 backdrop-blur-xl sm:px-5">
+            <div className="order-1 flex min-w-0 flex-1 items-center gap-3 lg:flex-initial">
               <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-xl text-white shadow-sm", mode === "cases" ? "bg-accent" : "bg-grad-cta")}>
                 <Lightbulb size={18} />
               </span>
@@ -368,46 +397,52 @@ export function TutorialCenter({
               </div>
             </div>
             {mode === "features" ? (
-              <>
-                <label className="ml-auto flex h-9 min-w-0 max-w-md flex-1 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring">
-                  <Search size={15} className="shrink-0 text-faint" />
-                  <span className="sr-only">搜索教程</span>
-                  <input
-                    type="search"
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    placeholder="搜索功能、场景或关键词"
-                    className="min-w-0 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint"
-                  />
-                </label>
-
-              </>
-            ) : <div className="ml-auto" />}
+              // 搜索框只有一份 DOM:桌面端与标题同行,<lg 折成 header 的第二行占满宽度,
+              // 窄屏标题不再被它挤成一列(审计 TU-01 / TU-04)。
+              <TutorialSearch
+                query={query}
+                onQueryChange={setQuery}
+                className="order-3 basis-full lg:order-2 lg:ml-auto lg:max-w-md lg:flex-1 lg:basis-auto"
+              />
+            ) : (
+              <div className="order-2 ml-auto hidden lg:block" />
+            )}
             <Dialog.Close asChild>
-              <IconButton aria-label="关闭教程" variant="muted" shape="square">
+              <IconButton aria-label="关闭教程" variant="muted" shape="square" className="order-2 shrink-0 lg:order-3">
                 <X size={18} />
               </IconButton>
             </Dialog.Close>
           </header>
 
-          <nav aria-label="案例与帮助" className="relative z-10 flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2 sm:px-5">
-            <div className="flex min-w-0 items-center gap-1">
+          <nav aria-label="案例与帮助" className="relative z-10 flex shrink-0 items-center justify-between gap-2 border-b border-border bg-surface px-3 py-2 sm:gap-3 sm:px-5">
+            <div className="no-scrollbar flex min-w-0 items-center gap-1 overflow-x-auto">
               <ViewTab active={mode === "showcase" || (mode === "cases" && Boolean(selectedShowcase))} onClick={showShowroom} icon={Sparkles}>
                 案例展厅
               </ViewTab>
               <ViewTab active={mode === "start"} onClick={showStart} icon={Rocket}>
                 快速上手
               </ViewTab>
+              <ViewTab active={mode === "features"} onClick={showFeatures} icon={BookOpen}>
+                功能参考
+              </ViewTab>
             </div>
-            <details className="group relative" onClick={(event) => {
-              if ((event.target as HTMLElement).closest("button")) event.currentTarget.removeAttribute("open");
-            }}>
-              <summary className="cursor-pointer list-none rounded-lg px-3 py-2 text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">帮助与创作 <ChevronDown className="ml-1 inline" size={13} /></summary>
-              <div className="absolute right-0 top-full mt-1 flex w-48 flex-col gap-1 rounded-xl border border-border bg-surface p-2 shadow-float">
-                <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>教程工作室</ViewTab>
-                <ViewTab active={mode === "cases" && !selectedShowcase} onClick={showCases} icon={FileTextIcon}>案例脚本</ViewTab>
-              </div>
-            </details>
+            {/* 「帮助与创作」走 DropdownMenu 原语(审计 TU-03):原生 <details> 没有外点 / Esc 关闭,
+                也没有 menu 语义与方向键;Radix 版本这些都自带,与全站其它下拉一致。 */}
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="sm" className="shrink-0 text-muted hover:text-fg">
+                  帮助与创作 <ChevronDown size={13} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48">
+                <HelpMenuItem active={mode === "community"} onSelect={showCommunity} icon={Waypoints}>
+                  教程工作室
+                </HelpMenuItem>
+                <HelpMenuItem active={mode === "cases" && !selectedShowcase} onSelect={showCases} icon={FileTextIcon}>
+                  案例脚本
+                </HelpMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </nav>
 
           {mode === "features" && (
@@ -442,24 +477,53 @@ export function TutorialCenter({
             <div className="flex min-w-0 flex-1 flex-col bg-bg">
               {mode === "features" && (
                 <div className="border-b border-border bg-surface px-3 py-2 lg:hidden">
-                  <select
-                    aria-label="选择教程"
-                    value={selectedTopicId}
-                    onChange={(event) => onTopicChange(event.target.value as ProductFeatureId)}
-                    className="h-9 w-full rounded-lg border border-border bg-bg px-3 text-body text-fg outline-none focus:ring-2 focus:ring-ring"
-                  >
-                    {mobileFeatureOptions.length > 0 ? (
-                      mobileFeatureOptions.map((item) => (
-                        <option key={item.id} value={item.id}>{item.shortTitle}</option>
-                      ))
-                    ) : (
-                      <option value={selectedTopicId}>没有匹配教程</option>
-                    )}
-                  </select>
+                  {hasQuery ? (
+                    // <lg 有搜索词时,把命中结果直接列出来(审计 TU-04):此前唯一的输出是 <select> 的
+                    // option 列表,命中 2 条或 0 条页面都看不出任何变化,「没有匹配教程」分支也永不触发。
+                    <nav aria-label="搜索结果" className="flex flex-col gap-1">
+                      {filteredFeatures.length > 0 && (
+                        <p role="status" className="px-1 text-caption text-faint">
+                          {filteredFeatures.length} 篇匹配「{query.trim()}」
+                        </p>
+                      )}
+                      <TopicList
+                        items={filteredFeatures}
+                        activeId={selectedTopicId}
+                        isRead={(id) => tutorialIsRead(progress, id)}
+                        onSelect={(id) => {
+                          setQuery("");
+                          onTopicChange(id);
+                        }}
+                      />
+                    </nav>
+                  ) : (
+                    <>
+                      <select
+                        aria-label="选择教程"
+                        value={selectedTopicId}
+                        onChange={(event) => onTopicChange(event.target.value as ProductFeatureId)}
+                        className="h-11 w-full rounded-lg border border-border bg-bg px-3 text-base text-fg outline-none focus:ring-2 focus:ring-ring md:text-body"
+                      >
+                        {mobileFeatureOptions.map((item) => (
+                          <option key={item.id} value={item.id}>{item.shortTitle}</option>
+                        ))}
+                      </select>
+                      {featureCategory !== "all" && (
+                        <p role="status" className="mt-1.5 px-1 text-caption text-faint">
+                          {filteredFeatures.length > 0
+                            ? `「${featureCategoryLabel(featureCategory)}」下共 ${filteredFeatures.length} 篇`
+                            : `「${featureCategoryLabel(featureCategory)}」下没有教程，换个分类试试。`}
+                        </p>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
 
-              <main ref={detailRef} className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
+              {/* relative:让 main 成为所有 absolute 后代(含 sr-only 播报节点)的包含块,否则它们逃到
+                  Dialog.Content 上把 overflow-hidden 的对话框撑出隐藏溢出,scrollIntoView 会把 header
+                  顶出视口(审计 TU-23)。 */}
+              <main ref={detailRef} className="tutorial-detail relative min-h-0 flex-1 overflow-y-auto">
                 {mode === "community" ? (
                   <CommunityTutorials
                     auth={auth}
@@ -473,19 +537,18 @@ export function TutorialCenter({
                     onDetailIdChange={onCommunityChange}
                   />
                 ) : mode === "showcase" ? (
-                  <CaseShowroom onSelect={onCaseChange} onRun={onRunCase} actionLabel={caseActionLabel} />
+                  <CaseShowroom
+                    onSelect={onCaseChange}
+                    onRun={onRunCase}
+                    actionLabel={caseActionLabel}
+                    activeWorkId={signatureWorkId}
+                    onActiveWorkChange={setSignatureWorkId}
+                  />
                 ) : mode === "start" ? (
-                  <QuickstartView onOpenTopic={onTopicChange} />
+                  <QuickstartView onOpenTopic={onTopicChange} progress={progress} />
                 ) : mode === "cases" ? (
                   selectedShowcase ? (
                     <ShowcaseDetail key={selectedShowcase.caseId} item={selectedShowcase} onBack={showShowroom} onRun={onRunCase} actionLabel={caseActionLabel} />
-                  ) : showMissionReplay ? (
-                    <MissionReplay
-                      caseId={caseId}
-                      actionLabel={caseActionLabel}
-                      onCaseChange={onCaseChange}
-                      onRunCase={onRunCase}
-                    />
                   ) : selectedCase ? (
                     <CaseDetail
                       item={selectedCase}
@@ -536,14 +599,65 @@ function ViewTab({
     <button
       type="button"
       onClick={onClick}
-      aria-pressed={active}
+      // 页签用 aria-current 表达「当前所在」,而不是把它当成开关按钮播报(审计 TU-24);
+      // 触屏下补到 44px 命中高(审计 TU-11),桌面态零变化。
+      aria-current={active ? "page" : undefined}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-meta font-semibold outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        "inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-meta font-semibold outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
         active ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
       )}
     >
       <Icon size={14} /> {children}
     </button>
+  );
+}
+
+function HelpMenuItem({
+  active,
+  onSelect,
+  icon: Icon,
+  children,
+}: {
+  active: boolean;
+  onSelect: () => void;
+  icon: LucideIcon;
+  children: React.ReactNode;
+}) {
+  return (
+    <DropdownMenuItem
+      onSelect={onSelect}
+      aria-current={active ? "page" : undefined}
+      className={cn("text-meta font-medium [@media(hover:none)]:min-h-11", active ? "text-fg" : "text-muted")}
+    >
+      <Icon size={14} className={active ? "text-accent" : "text-faint"} />
+      <span className="flex-1">{children}</span>
+      {active && <Check size={14} className="text-accent" aria-hidden />}
+    </DropdownMenuItem>
+  );
+}
+
+function TutorialSearch({
+  query,
+  onQueryChange,
+  className,
+}: {
+  query: string;
+  onQueryChange: (value: string) => void;
+  className?: string;
+}) {
+  return (
+    <label className={cn("flex h-10 min-w-0 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring lg:h-9", className)}>
+      <Search size={15} className="shrink-0 text-faint" />
+      <span className="sr-only">搜索教程</span>
+      <input
+        type="search"
+        value={query}
+        onChange={(event) => onQueryChange(event.target.value)}
+        placeholder="搜索功能、场景或关键词"
+        // 16px 起步:iOS Safari 对 <16px 的输入框聚焦时会放大整页(审计 TU-33);md 起回到正文档位。
+        className="min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-body"
+      />
+    </label>
   );
 }
 
@@ -555,7 +669,13 @@ function PendingCaptureBadge() {
   );
 }
 
-function QuickstartView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) => void }) {
+function QuickstartView({
+  onOpenTopic,
+  progress,
+}: {
+  onOpenTopic: (id: ProductFeatureId) => void;
+  progress: ReturnType<typeof readTutorialProgress>;
+}) {
   return (
     <section className="mx-auto max-w-3xl px-4 pb-12 pt-7 sm:px-7 sm:pt-9">
       <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">
@@ -568,11 +688,19 @@ function QuickstartView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) =
       <ol className="mt-8 flex flex-col gap-4">
         {TUTORIAL_QUICKSTART.steps.map((step, index) => {
           const feature = capabilityById(step.topicId);
+          const done = tutorialIsRead(progress, step.topicId);
           return (
             <li key={step.id} className="rounded-2xl border border-border bg-surface p-4 shadow-sm sm:p-5">
               <div className="flex gap-3.5">
-                <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-grad-cta text-meta font-semibold text-white">
-                  {index + 1}
+                {/* 步骤对应的教程已读就打勾,不再六步永远一个样(审计 TU-19)。 */}
+                <span
+                  className={cn(
+                    "flex size-7 shrink-0 items-center justify-center rounded-full text-meta font-semibold text-white",
+                    done ? "bg-success" : "bg-grad-cta",
+                  )}
+                  aria-label={done ? `第 ${index + 1} 步，已读` : `第 ${index + 1} 步`}
+                >
+                  {done ? <Check size={14} aria-hidden /> : index + 1}
                 </span>
                 <div className="min-w-0 flex-1">
                   <h2 className="text-title font-semibold text-fg">{step.title}</h2>
@@ -581,7 +709,7 @@ function QuickstartView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) =
                     type="button"
                     onClick={() => onOpenTopic(step.topicId)}
                     aria-label={`打开步骤：${step.title}`}
-                    className="mt-3 inline-flex items-center gap-1.5 text-meta font-semibold text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                    className="mt-3 inline-flex items-center gap-1.5 rounded-md text-meta font-semibold text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
                   >
                     查看「{feature.shortTitle}」
                     <ArrowRight size={13} />
@@ -592,84 +720,43 @@ function QuickstartView({ onOpenTopic }: { onOpenTopic: (id: ProductFeatureId) =
           );
         })}
       </ol>
+
+      {/* 5 条「按场景学习」路径此前只有数据和测试、没有渲染(审计 TU-14),在主线之后兑现。 */}
+      <section className="mt-12" aria-labelledby="scenario-paths-title">
+        <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">按场景学习</p>
+        <h2 id="scenario-paths-title" className="mt-1 text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]">
+          走完主线后，挑一条和你工作最像的路
+        </h2>
+        <div className="mt-5 grid gap-3 sm:grid-cols-2">
+          {TUTORIAL_SCENARIO_PATHS.map((path) => (
+            <article key={path.id} className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+              <h3 className="text-title font-semibold text-fg">{path.title}</h3>
+              <p className="mt-1 text-caption leading-5 text-muted">{path.description}</p>
+              <ol className="mt-3 flex flex-col gap-0.5">
+                {path.topicIds.map((topicId, index) => {
+                  const step = capabilityById(topicId);
+                  return (
+                    <li key={topicId}>
+                      <button
+                        type="button"
+                        onClick={() => onOpenTopic(topicId)}
+                        className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                      >
+                        <span className="w-4 shrink-0 text-caption text-faint">{index + 1}</span>
+                        <span className="min-w-0 flex-1 truncate">{step.shortTitle}</span>
+                        {tutorialIsRead(progress, topicId) && (
+                          <Check size={13} className="shrink-0 text-success" aria-label="已读" />
+                        )}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ol>
+            </article>
+          ))}
+        </div>
+      </section>
     </section>
-  );
-}
-
-
-function CaseSidebar({
-  items,
-  activeId,
-  category,
-  onCategoryChange,
-  onSelect,
-  onShowAll,
-}: {
-  items: readonly TutorialCase[];
-  activeId: TutorialCaseId | null;
-  category: TutorialCaseCategory | "all";
-  onCategoryChange: (category: TutorialCaseCategory | "all") => void;
-  onSelect: (id: TutorialCaseId) => void;
-  onShowAll: () => void;
-}) {
-  return (
-    <aside className="hidden w-[292px] shrink-0 flex-col border-r border-border bg-sidebar lg:flex">
-      <div className="flex flex-col gap-1 p-3">
-        <button
-          type="button"
-          onClick={() => { onCategoryChange("all"); onShowAll(); }}
-          className={cn(
-            "rounded-lg px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-            category === "all" && !activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
-          )}
-        >
-          全部案例 <span className="float-right text-faint">{TUTORIAL_CASES.length}</span>
-        </button>
-        {CASE_CATEGORIES.map((item) => (
-          <button
-            type="button"
-            key={item.id}
-            title={item.description}
-            onClick={() => { onCategoryChange(item.id); onShowAll(); }}
-            className={cn(
-              "rounded-lg px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-              category === item.id && !activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
-            )}
-          >
-            {item.label}
-            <span className="float-right text-faint">
-              {TUTORIAL_CASES.filter((entry) => entry.category === item.id).length}
-            </span>
-          </button>
-        ))}
-      </div>
-      <nav aria-label="案例目录" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-        {items.length === 0 ? (
-          <p className="px-4 py-8 text-center text-meta text-faint">没有匹配的案例，换个关键词试试。</p>
-        ) : (
-          <div className="flex flex-col gap-0.5">
-            {items.map((item) => (
-              <a
-                key={item.id}
-                href={tutorialHref(window.location, null, item.id)}
-                aria-current={item.id === activeId ? "page" : undefined}
-                onClick={(event) => {
-                  event.preventDefault();
-                  onSelect(item.id);
-                }}
-                className={cn(
-                  "rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
-                  item.id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
-                )}
-              >
-                <span className="block text-caption font-medium text-accent">{caseCategoryLabel(item.category)} · {item.difficulty}</span>
-                <span className="mt-0.5 block text-[12.5px] font-medium leading-5">{item.title}</span>
-              </a>
-            ))}
-          </div>
-        )}
-      </nav>
-    </aside>
   );
 }
 
@@ -680,54 +767,85 @@ function CaseGallery({
   items: readonly TutorialCase[];
   onSelect: (id: TutorialCaseId) => void;
 }) {
+  // 分类 + 搜索(审计 TU-15):此前 12 张全高卡片一列到底,找案例只能滚;`tutorialCaseMatches`
+  // 早已写好却没有渲染路径,这里接上。
+  const [category, setCategory] = useState<TutorialCaseCategory | "all">("all");
+  const [query, setQuery] = useState("");
+  const visible = items.filter(
+    (item) => (category === "all" || item.category === category) && tutorialCaseMatches(item, query),
+  );
+  const filtering = category !== "all" || query.trim().length > 0;
   return (
     <section className="mx-auto max-w-5xl px-3 pb-12 pt-4 sm:px-7 sm:pt-7">
       <div className="overflow-hidden rounded-3xl bg-[#07111f] px-5 py-6 text-white sm:px-8 sm:py-8">
         <p className="text-micro font-semibold uppercase tracking-[0.16em] text-cyan-200">
           案例脚本
         </p>
+        {/* 「待采集」是采集流水线的内部词,用户看不懂;口径改成人话,且同屏只说一次(审计 TU-10)。 */}
         <h1 className="mt-2 max-w-2xl text-balance text-[25px] font-bold leading-tight tracking-tight sm:text-[34px]">
-          这些是待采集的任务脚本
+          这些是任务脚本，还没有真实运行记录
         </h1>
         <p className="mt-3 max-w-2xl text-[13px] leading-6 text-white/72 sm:text-[14px]">
-          步骤和材料已经写好，但还没有真实运行回放。采集完成前，只把它们当参考，不当成品。
+          步骤和材料已经写好，但还没有真实运行回放。记录补齐前，只把它们当参考，不当成品。
         </p>
         <div className="mt-5 flex flex-wrap gap-2 text-micro font-medium text-white/85 sm:text-caption">
-          <span className="rounded-full bg-white/10 px-3 py-1.5">{TUTORIAL_PENDING_CAPTURE_LABEL}</span>
+          <span className="rounded-full bg-white/10 px-3 py-1.5">{items.length} 条脚本</span>
           <span className="rounded-full bg-white/10 px-3 py-1.5">科研 / 编码 / 通用</span>
         </div>
       </div>
 
-      {items.length === 0 ? (
-        <div className="mt-7 rounded-2xl border border-dashed border-border px-5 py-12 text-center text-section text-faint">
+      <div className="mt-7 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="no-scrollbar flex gap-2 overflow-x-auto" role="group" aria-label="案例分类">
+          <CategoryChip active={category === "all"} onClick={() => setCategory("all")}>
+            全部
+          </CategoryChip>
+          {CASE_CATEGORIES.map((item) => (
+            <CategoryChip key={item.id} active={category === item.id} onClick={() => setCategory(item.id)}>
+              {item.label}
+            </CategoryChip>
+          ))}
+        </div>
+        <label className="flex h-10 min-w-0 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring sm:w-64 lg:h-9">
+          <Search size={15} className="shrink-0 text-faint" />
+          <span className="sr-only">搜索案例</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索案例"
+            className="min-w-0 flex-1 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-body"
+          />
+        </label>
+      </div>
+
+      {visible.length === 0 ? (
+        <div role="status" className="mt-7 rounded-2xl border border-dashed border-border px-5 py-12 text-center text-section text-faint">
           没有匹配案例，试试“文献”“引用”“回归测试”或清空筛选。
         </div>
       ) : (
-        <div className="mt-8 space-y-10">
-          <section aria-labelledby="case-template-title">
-            <div className="mb-4">
-              <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">
-                {TUTORIAL_PENDING_CAPTURE_LABEL}
-              </p>
-              <h2
-                id="case-template-title"
-                className="mt-1 text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]"
-              >
-                全部案例脚本
-              </h2>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              {items.map((item) => (
-                <CaseGalleryCard
-                  key={item.id}
-                  item={item}
-                  onSelect={onSelect}
-                  featured={Boolean(item.fieldReport) && item.replay.status !== "pending_capture"}
-                />
-              ))}
-            </div>
-          </section>
-        </div>
+        <section className="mt-6" aria-labelledby="case-template-title">
+          <div className="mb-4 flex items-baseline justify-between gap-3">
+            <h2
+              id="case-template-title"
+              className="text-[19px] font-semibold tracking-tight text-fg sm:text-[22px]"
+            >
+              {filtering ? "匹配的案例脚本" : "全部案例脚本"}
+            </h2>
+            <p role="status" className="text-caption text-faint">
+              {visible.length} / {items.length} 条
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            {visible.map((item) => (
+              <CaseGalleryCard
+                key={item.id}
+                item={item}
+                onSelect={onSelect}
+                featured={Boolean(item.fieldReport) && item.replay.status !== "pending_capture"}
+              />
+            ))}
+          </div>
+        </section>
       )}
     </section>
   );
@@ -766,7 +884,7 @@ function CaseGalleryCard({
           : "border-border hover:border-accent/40",
       )}
     >
-      <CaseArtwork caseId={item.id} fieldReport={report} />
+      <CaseArtwork caseId={item.id} fieldReport={report} pendingCapture={item.replay.status === "pending_capture"} />
       <div className="p-4 sm:p-5">
         <div className="flex flex-wrap items-center gap-2">
           {item.replay.status === "pending_capture" && <PendingCaptureBadge />}
@@ -851,17 +969,14 @@ function CaseDetail({
       className="mx-auto max-w-4xl px-3 pb-14 pt-3 sm:px-7 sm:pt-5"
       data-case-id={item.id}
     >
-      <button
-        type="button"
-        onClick={onBack}
-        className="inline-flex items-center gap-1.5 rounded-md text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-      >
+      <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2 text-muted hover:text-fg">
         <ArrowLeft size={14} /> 返回案例列表
-      </button>
+      </Button>
 
+      {/* 详情页的「尚无真实运行记录」只在这条横幅说一次;卡头徽章与回放区不再重复(审计 TU-10)。 */}
       {item.replay.status === "pending_capture" && (
         <p className="mt-3 rounded-xl bg-warning-soft px-3 py-2 text-meta font-medium text-warning">
-          {TUTORIAL_PENDING_CAPTURE_LABEL}。当前只展示人工编写的任务脚本，不是真实运行回放。
+          {TUTORIAL_PENDING_CAPTURE_LABEL}。下面是人工编写的任务脚本与观察记录，不是平台验证过的运行回放。
         </p>
       )}
 
@@ -869,11 +984,11 @@ function CaseDetail({
         <CaseArtwork
           caseId={item.id}
           fieldReport={item.fieldReport}
+          pendingCapture={item.replay.status === "pending_capture"}
           className="order-2 md:order-1 md:h-full md:min-h-[340px] md:aspect-auto"
         />
         <div className="order-1 flex flex-col p-4 sm:p-6 md:order-2">
           <div className="flex flex-wrap items-center gap-2">
-            {item.replay.status === "pending_capture" && <PendingCaptureBadge />}
             <span className="rounded-full bg-accent-soft px-2.5 py-1 text-micro font-semibold text-accent">
               {storyLabel} · 案例脚本
             </span>
@@ -1080,11 +1195,12 @@ function ArtifactShowcase({ item }: { item: TutorialCase }) {
       <p className="text-micro font-semibold uppercase tracking-[0.14em] text-accent">
         先看成品
       </p>
+      {/* 预览区是装饰性示意,不是本案例真实产物,标题与图区都要说清(审计 TU-16)。 */}
       <h2
         id="artifact-showcase-title"
         className="mt-1 text-[21px] font-semibold tracking-tight text-fg"
       >
-        这些成果会直接交到你手里
+        你会拿到这些成果
       </h2>
       <div className="mt-5 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm lg:grid lg:grid-cols-[1.35fr_.65fr]">
         <ArtifactPreview item={item} artifactIndex={selectedIndex} />
@@ -1140,7 +1256,7 @@ function ArtifactPreview({
   return (
     <div
       role="img"
-      aria-label={`成果预览：${artifact.title}，${artifact.description}`}
+      aria-label={`示意：${artifact.title}，${artifact.description}。这是成果类型的示意图，不是本案例的实际产物`}
       className="relative min-h-[260px] overflow-hidden bg-[#07111f] p-4 text-white sm:min-h-[330px] sm:p-6"
     >
       <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-3">
@@ -1149,9 +1265,15 @@ function ArtifactPreview({
           <span className="size-2.5 rounded-full bg-amber-300" />
           <span className="size-2.5 rounded-full bg-emerald-400" />
         </div>
-        <span className="rounded-full bg-white/10 px-2.5 py-1 text-micro font-medium text-white/70">
-          {artifact.format}
-        </span>
+        <div className="flex items-center gap-2">
+          {/* 假终端 / 写死柱状图曾被当成真图播报,这里明示「示意」(审计 TU-16)。 */}
+          <span className="rounded-full border border-amber-300/40 bg-amber-300/15 px-2.5 py-1 text-micro font-medium text-amber-100">
+            示意图 · 非本案例实际产物
+          </span>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 text-micro font-medium text-white/70">
+            {artifact.format}
+          </span>
+        </div>
       </div>
       <div className="mt-4 grid min-h-[190px] gap-3 sm:mt-6 sm:grid-cols-[.72fr_1.28fr]">
         <div className="rounded-2xl bg-white/[0.07] p-4">
@@ -1159,31 +1281,31 @@ function ArtifactPreview({
           <p className="mt-3 text-[15px] font-semibold leading-5">
             {artifact.title}
           </p>
-          <p className="mt-2 text-[11px] leading-5 text-white/58">
+          <p className="mt-2 text-caption leading-5 text-white/58">
             {artifact.description}
           </p>
         </div>
         {item.category === "coding" ? (
-          <div className="rounded-2xl border border-white/10 bg-black/25 p-4 font-mono text-[10px] leading-5 sm:text-[11px]">
-            <p className="text-white/35">$ run targeted-test</p>
+          <div className="rounded-2xl border border-white/10 bg-black/25 p-4 font-mono text-micro leading-5 sm:text-caption">
+            <p className="text-white/35">$ 复现 → 定位 → 修复 → 回归</p>
             <p className="mt-2 rounded bg-rose-400/10 px-2 py-1 text-rose-200">
-              − failing behavior reproduced
+              − 先让失败可以稳定复现
             </p>
             <p className="mt-1 rounded bg-emerald-400/10 px-2 py-1 text-emerald-200">
-              + root cause fixed
+              + 再交付最小修改与测试
             </p>
             <div className="mt-4 grid grid-cols-2 gap-2 font-sans">
               <span className="rounded-xl bg-white/[0.06] p-3 text-center text-white/70">
-                最小补丁
+                {artifact.format}
               </span>
               <span className="rounded-xl bg-emerald-400/15 p-3 text-center font-semibold text-emerald-200">
-                测试通过
+                {item.checks.length} 项验收
               </span>
             </div>
           </div>
         ) : (
           <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-            <div className="flex h-28 items-end gap-2 border-b border-white/10 pb-2">
+            <div className="flex h-28 items-end gap-2 border-b border-white/10 pb-2" aria-hidden>
               {[42, 68, 54, 88, 72, 96, 78].map((height, index) => (
                 <span
                   key={index}
@@ -1193,27 +1315,14 @@ function ArtifactPreview({
               ))}
             </div>
             <div className="mt-4 grid grid-cols-3 gap-2">
-              {item.fieldReport?.metrics.slice(0, 3).map((metric) => (
+              {item.artifacts.slice(0, 3).map((entry) => (
                 <span
-                  key={metric.label}
-                  className="rounded-xl bg-white/[0.06] p-2 text-center"
+                  key={entry.title}
+                  className="rounded-xl bg-white/[0.06] p-2 text-center text-micro text-white/60"
                 >
-                  <strong className="block text-body text-white">
-                    {metric.value}
-                  </strong>
-                  <span className="mt-0.5 block text-[8.5px] leading-3 text-white/45">
-                    {metric.label}
-                  </span>
+                  {entry.format}
                 </span>
-              )) ??
-                item.artifacts.slice(0, 3).map((entry) => (
-                  <span
-                    key={entry.title}
-                    className="rounded-xl bg-white/[0.06] p-2 text-center text-[9px] text-white/60"
-                  >
-                    {entry.format}
-                  </span>
-                ))}
+              ))}
             </div>
           </div>
         )}
@@ -1551,9 +1660,7 @@ function CaseMethodDetails({
         ) : (
           <section>
             <h3 className="text-title font-semibold text-fg">运行过程回放</h3>
-            <p className="mt-1.5 text-[12.5px] leading-5 text-warning">
-              {TUTORIAL_PENDING_CAPTURE_LABEL}
-            </p>
+            {/* 待采集态只留 TutorialReplay 自己那一段说明,不再在标题下重复一遍标签(审计 TU-10)。 */}
             <TutorialReplay caseId={item.id} replay={item.replay} />
           </section>
         )}
@@ -1586,17 +1693,42 @@ function FeatureSidebar({
   onCategoryChange: (category: ProductFeatureCategory | "all") => void;
   onSelect: (id: ProductFeatureId) => void;
 }) {
+  const listRef = useRef<HTMLElement>(null);
+  // 当前教程不在可见区时把它滚进来(审计 TU-18):用容器 scrollTop 而不是 scrollIntoView,
+  // 后者会连 Dialog.Content 一起滚(TU-23)。
+  useEffect(() => {
+    const container = listRef.current;
+    const row = container?.querySelector<HTMLElement>('[aria-current="page"]');
+    if (!container || !row) return;
+    const top = row.offsetTop - container.offsetTop;
+    const bottom = top + row.offsetHeight;
+    if (top < container.scrollTop || bottom > container.scrollTop + container.clientHeight) {
+      container.scrollTop = Math.max(0, top - container.clientHeight / 2 + row.offsetHeight / 2);
+    }
+  }, [activeId, items]);
+  const activeInList = items.some((item) => item.id === activeId);
+  const readCount = PRODUCT_CAPABILITY_LIST.filter((item) => tutorialIsRead(progress, item.id as ProductFeatureId)).length;
   return (
     <aside className="hidden w-[292px] shrink-0 flex-col border-r border-border bg-sidebar lg:flex">
       <div className="flex flex-col gap-1 p-3">
-        <button type="button" onClick={() => onCategoryChange("all")} className={cn("rounded-lg px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", category === "all" ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}>全部功能 <span className="float-right text-faint">{PRODUCT_CAPABILITY_LIST.length}</span></button>
+        <button type="button" onClick={() => onCategoryChange("all")} aria-pressed={category === "all"} className={cn("rounded-lg px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", category === "all" ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}>
+          全部功能
+          {/* 总进度(审计 TU-19):此前只有每行一个勾,看不出「读了几篇」。 */}
+          <span className="float-right text-faint">{readCount > 0 ? `已读 ${readCount}/${PRODUCT_CAPABILITY_LIST.length}` : PRODUCT_CAPABILITY_LIST.length}</span>
+        </button>
         {PRODUCT_FEATURE_CATEGORIES.map((item) => (
-          <button type="button" key={item.id} onClick={() => onCategoryChange(item.id)} title={item.description} className={cn("rounded-lg px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", category === item.id ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}>
+          <button type="button" key={item.id} onClick={() => onCategoryChange(item.id)} aria-pressed={category === item.id} title={item.description} className={cn("rounded-lg px-3 py-2 text-left text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", category === item.id ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}>
             {item.label}<span className="float-right text-faint">{PRODUCT_CAPABILITY_LIST.filter((entry) => entry.category === item.id).length}</span>
           </button>
         ))}
       </div>
-      <nav aria-label="教程目录" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+      <nav ref={listRef} aria-label="教程目录" className="no-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        {!activeInList && (
+          // 筛选后当前教程不在列表里时给个位置提示,别让高亮凭空消失(审计 TU-18)。
+          <p role="status" className="mx-2 mb-1 rounded-lg bg-accent-soft px-3 py-2 text-caption text-accent">
+            正在看：{capabilityById(activeId).shortTitle}（不在当前筛选内）
+          </p>
+        )}
         <TopicList items={items} activeId={activeId} isRead={(id) => tutorialIsRead(progress, id)} onSelect={onSelect} />
       </nav>
     </aside>
@@ -1634,8 +1766,8 @@ function FeatureDetail({
         <FeatureIcon feature={feature} className="hidden sm:flex" />
         <div className="min-w-0 flex-1">
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <Badge tone="accent">{featureCategoryLabel(feature.category)}</Badge>
-            <span className="text-caption text-faint">内容版本 {topic.contentVersion}</span>
+            {/* 「内容版本 N」对用户没有含义,收进 data 属性供排障(审计 TU-26)。 */}
+            <Badge tone="accent" data-content-version={topic.contentVersion}>{featureCategoryLabel(feature.category)}</Badge>
             {tutorialIsRead(progress, topicId) && <span className="inline-flex items-center gap-1 text-caption text-success"><Check size={11} /> 已读</span>}
           </div>
           <h1 className="text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">{feature.title}</h1>
@@ -1683,13 +1815,14 @@ function FeatureDetail({
   );
 }
 
+// 分类 chip / 目录行 / 页签都不走 Button 原语,触屏 44px 规则要自己补(审计 TU-11);chip 补选中态语义(TU-24)。
 function CategoryChip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
-  return <button type="button" onClick={onClick} className={cn("shrink-0 rounded-full px-3 py-1.5 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", active ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg")}>{children}</button>;
+  return <button type="button" onClick={onClick} aria-pressed={active} className={cn("shrink-0 rounded-full px-3 py-1.5 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", active ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg")}>{children}</button>;
 }
 
 function TopicList({ items, activeId, isRead, onSelect }: { items: ProductCapability[]; activeId: ProductFeatureId; isRead: (id: ProductFeatureId) => boolean; onSelect: (id: ProductFeatureId) => void }) {
-  if (items.length === 0) return <p className="px-4 py-8 text-center text-meta text-faint">没有匹配的教程，换个关键词试试。</p>;
-  return <div className="flex flex-col gap-0.5">{items.map((item) => { const id = item.id as ProductFeatureId; const Icon = ICONS[item.icon] ?? Sparkles; return <button key={id} type="button" aria-current={id === activeId ? "page" : undefined} onClick={() => onSelect(id)} className={cn("group flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring", id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}><span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-surface text-faint shadow-sm group-hover:text-accent"><Icon size={14} /></span><span className="min-w-0 flex-1 truncate text-meta font-medium">{item.shortTitle}</span>{isRead(id) && <Check size={13} className="shrink-0 text-success" aria-label="已读" />}</button>; })}</div>;
+  if (items.length === 0) return <p role="status" className="px-4 py-8 text-center text-meta text-faint">没有匹配的教程，换个关键词试试。</p>;
+  return <div className="flex flex-col gap-0.5">{items.map((item) => { const id = item.id as ProductFeatureId; const Icon = ICONS[item.icon] ?? Sparkles; return <button key={id} type="button" aria-current={id === activeId ? "page" : undefined} onClick={() => onSelect(id)} className={cn("group flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11", id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg")}><span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-surface text-faint shadow-sm group-hover:text-accent"><Icon size={14} /></span><span className="min-w-0 flex-1 truncate text-meta font-medium">{item.shortTitle}</span>{isRead(id) && <Check size={13} className="shrink-0 text-success" aria-label="已读" />}</button>; })}</div>;
 }
 
 function FeatureIcon({ feature, className }: { feature: ProductCapability; className?: string }) {

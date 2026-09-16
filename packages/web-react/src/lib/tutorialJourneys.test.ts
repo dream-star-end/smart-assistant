@@ -55,7 +55,13 @@ describe("教程主线与场景路径", () => {
     }
   });
 
-  it("待采集声明文案固定，避免入口各自包装成已完成故事", () => {
-    expect(TUTORIAL_PENDING_CAPTURE_LABEL).toBe("示例待真实运行采集");
+  it("「尚无真实运行记录」声明文案固定且用用户语言，避免入口各自包装成已完成故事", () => {
+    expect(TUTORIAL_PENDING_CAPTURE_LABEL).toBe("任务脚本 · 尚无真实运行记录");
+    expect(TUTORIAL_PENDING_CAPTURE_LABEL).not.toMatch(/采集/);
+  });
+
+  it("主线每一步指向不同章节，6 步就覆盖 6 篇（TU-31）", () => {
+    const ids = TUTORIAL_QUICKSTART.steps.map((step) => step.topicId);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });

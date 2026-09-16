@@ -3,27 +3,38 @@ import { cn } from '../../lib/utils'
 
 export function CaseFieldReportVisual({
   report,
+  pendingCapture = false,
   className,
 }: {
   report: TutorialCaseFieldReport
+  /**
+   * 案例尚无真实运行记录时,图稿不能一边说「只是脚本」一边亮「可核对成果」(审计 TU-10):
+   * 指标数字来自 fieldReport 的人工观察记录,保留但加限定词;右上角「案例演示」改为「示意图稿」。
+   */
+  pendingCapture?: boolean
   className?: string
 }) {
   return (
     <div
       role="img"
-      aria-label={`案例成果预览：${report.result}`}
+      aria-label={
+        pendingCapture
+          ? `案例观察记录示意：${report.result}。数字来自人工观察记录，不是平台验证过的运行结果`
+          : `案例成果预览：${report.result}`
+      }
       className={cn(
         'relative isolate aspect-[16/9] overflow-hidden bg-[#07111f] text-white',
         className,
       )}
       data-artwork-kind={report.visual}
+      data-pending-capture={pendingCapture ? 'true' : undefined}
     >
       <div className="absolute inset-x-4 top-3 z-10 flex items-center justify-between gap-2 sm:inset-x-5 sm:top-4">
         <span className="rounded-full border border-emerald-300/35 bg-emerald-400/15 px-2.5 py-1 text-micro font-semibold text-emerald-100 backdrop-blur-sm sm:text-caption">
           {report.visual === 'bike-model-comparison' ? '科研分析成果' : '代码修复成果'}
         </span>
-        <span className="text-[9px] font-medium text-white/70 sm:text-micro">
-          案例演示
+        <span className="text-micro font-medium text-white/70">
+          {pendingCapture ? '示意图稿' : '案例演示'}
         </span>
       </div>
 

@@ -114,14 +114,17 @@ export const CASE_PRESENTATION: Record<TutorialCaseId, CasePresentation> = {
 export function CaseArtwork({
   caseId,
   fieldReport,
+  pendingCapture = false,
   className,
 }: {
   caseId: TutorialCaseId;
   fieldReport?: TutorialCaseFieldReport;
+  /** 案例还没有真实运行记录(replay.status === "pending_capture"):图稿上的口径要跟着收敛(审计 TU-10)。 */
+  pendingCapture?: boolean;
   className?: string;
 }) {
   if (fieldReport) {
-    return <CaseFieldReportVisual report={fieldReport} className={className} />;
+    return <CaseFieldReportVisual report={fieldReport} pendingCapture={pendingCapture} className={className} />;
   }
   const presentation = CASE_PRESENTATION[caseId];
   return (

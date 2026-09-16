@@ -65,6 +65,20 @@ describe('CaseShowroom', () => {
     expect(run).not.toHaveBeenCalled()
     expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled()
   })
+  it('can be controlled by the parent: activeWorkId opens the detail, back / select only report upward (TU-02)', () => {
+    const onActiveWorkChange = vi.fn()
+    const { rerender } = render(<CaseShowroom onSelect={vi.fn()} activeWorkId={SIGNATURE_WORKS[0].id} onActiveWorkChange={onActiveWorkChange} />)
+    expect(screen.getByRole('heading', { name: SIGNATURE_WORKS[0].title })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '返回案例展厅' }))
+    expect(onActiveWorkChange).toHaveBeenCalledWith(null)
+    // 受控：父组件没改 prop 之前仍停在详情；prop 置空后才回画廊。
+    expect(screen.getByRole('heading', { name: SIGNATURE_WORKS[0].title })).toBeInTheDocument()
+    rerender(<CaseShowroom onSelect={vi.fn()} activeWorkId={null} onActiveWorkChange={onActiveWorkChange} />)
+    expect(screen.getByRole('heading', { name: /让它做给你看/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: SIGNATURE_WORKS[1].action }))
+    expect(onActiveWorkChange).toHaveBeenLastCalledWith(SIGNATURE_WORKS[1].id)
+    expect(screen.getByRole('heading', { name: /让它做给你看/ })).toBeInTheDocument()
+  })
   it('restores whichever of the two works was opened', () => {
     render(<CaseShowroom onSelect={vi.fn()} />)
     for (const work of SIGNATURE_WORKS) {
