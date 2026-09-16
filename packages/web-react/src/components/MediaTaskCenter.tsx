@@ -218,8 +218,9 @@ function FailureNote({ job }: { job: MediaGenerationJob }) {
 }
 
 /**
- * 失败任务的恢复入口(审计 M-17)。后端没有 jobs/:id/retry,而「跳回对话预填提示词」要在 App
- * 层接线(跨模块),这里先给最小可用的一步:把提示词复制走,用户回到对话里重新发起即可。
+ * 失败任务的恢复入口(审计 M-17)。后端没有 jobs/:id/retry;App 接了 onReusePrompt 时走「重新发起」
+ * (关抽屉 + 提示词写进 Composer 草稿,见 X-M4),没接线的宿主(demo / 独立挂载)退回这一步:
+ * 把提示词复制走,用户回到对话里重新发起即可。
  */
 function CopyPromptButton({ prompt }: { prompt: string }) {
   const [copied, setCopied] = useState(false)
@@ -236,6 +237,16 @@ function CopyPromptButton({ prompt }: { prompt: string }) {
     <Button size="sm" variant="secondary" onClick={() => void copy()}>
       <Copy size={12} />
       {copied ? '已复制' : '复制提示词'}
+    </Button>
+  )
+}
+
+/** 失败任务「重新发起」(M-17 完整形态):把提示词交还宿主,由宿主关抽屉并预填 Composer。 */
+function ReusePromptButton({ prompt, onReuse }: { prompt: string; onReuse: (prompt: string) => void }) {
+  return (
+    <Button size="sm" variant="secondary" onClick={() => onReuse(prompt)}>
+      <RotateCcw size={12} />
+      重新发起
     </Button>
   )
 }
@@ -298,11 +309,17 @@ export function MediaTaskCenter({
   auth,
   liveJob,
   onOpenChange,
+  onReusePrompt,
 }: {
   open: boolean
   auth: AuthSession | null
   liveJob: MediaGenerationJob | null
   onOpenChange: (open: boolean) => void
+  /**
+   * 失败任务「重新发起」(审计 M-17 / X-M4):宿主负责关抽屉并把提示词写进 Composer 草稿。
+   * 不传则退回「复制提示词」。
+   */
+  onReusePrompt?: (prompt: string) => void
 }) {
   const [jobs, setJobs] = useState<MediaGenerationJob[]>([])
   const [projects, setProjects] = useState<VideoProject[]>([])
@@ -684,7 +701,11 @@ export function MediaTaskCenter({
               <FailureNote job={job} />
               {job.status === 'failed' && job.prompt && (
                 <div className="mt-3">
-                  <CopyPromptButton prompt={job.prompt} />
+                  {onReusePrompt ? (
+                    <ReusePromptButton prompt={job.prompt} onReuse={onReusePrompt} />
+                  ) : (
+                    <CopyPromptButton prompt={job.prompt} />
+                  )}
                 </div>
               )}
               {ACTIVE.has(job.status) && (

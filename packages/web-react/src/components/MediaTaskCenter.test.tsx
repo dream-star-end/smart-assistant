@@ -287,6 +287,39 @@ describe('MediaTaskCenter', () => {
     expect(screen.getByTitle('第 2 版')).toHaveTextContent('1/1 个分镜')
   })
 
+  test('failed job offers 重新发起 when the host wires onReusePrompt (M-17 / X-M4), copy fallback disappears', async () => {
+    const failed = job('f', {
+      status: 'failed',
+      phase: 'upload',
+      queuePosition: null,
+      errorCode: 'H3_OOM',
+      errorMessage: 'CUDA out of memory',
+      prompt: '一只在雪地里奔跑的柴犬',
+    })
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/capabilities')) return response({ available: true })
+      if (url.endsWith('/jobs')) return response({ jobs: [failed], nextCursor: null })
+      if (url.endsWith('/projects')) return response({ projects: [], nextCursor: null })
+      throw new Error(`unexpected fetch ${url}`)
+    })
+    const onReusePrompt = vi.fn()
+    render(
+      <MediaTaskCenter
+        open
+        auth={auth}
+        liveJob={null}
+        onOpenChange={() => {}}
+        onReusePrompt={onReusePrompt}
+      />,
+    )
+    await screen.findByText('一只在雪地里奔跑的柴犬')
+    expect(screen.queryByRole('button', { name: /复制提示词/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重新发起' }))
+    expect(onReusePrompt).toHaveBeenCalledTimes(1)
+    expect(onReusePrompt).toHaveBeenCalledWith('一只在雪地里奔跑的柴犬')
+  })
+
   test('the standalone heading is hidden when only projects exist', async () => {
     vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input)

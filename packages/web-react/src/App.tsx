@@ -4041,6 +4041,12 @@ export function App() {
             auth={auth}
             liveJob={liveMediaJob}
             onOpenChange={setMediaTasksOpen}
+            onReusePrompt={(prompt) => {
+              // media M-17 / X-M4:失败任务「重新发起」→ 关任务中心,提示词写进 Composer 草稿
+              //(与教程 starterPrompt / 编辑重发同一条 prefill 路),用户改一改就能再发。
+              setMediaTasksOpen(false);
+              setComposerPrefill({ text: prompt, nonce: Date.now() });
+            }}
           />
         </LazyBoundary>
       )}
