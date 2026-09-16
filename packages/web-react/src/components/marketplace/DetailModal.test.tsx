@@ -522,11 +522,28 @@ test("信号徽章:usage30d/users30d/安装数/rating 都渲染,rating 文案诚
   expect(await screen.findByText("30天 42 次使用")).toBeInTheDocument();
   expect(screen.getByText("30天 9 人在用")).toBeInTheDocument();
   expect(screen.getByText("已安装 20")).toBeInTheDocument();
-  // 评分徽章 + 诚实旁注,不做「好评率 89%」式背书大字
-  const badge = screen.getByText("👍 8/9");
+  // 评分徽章 + 诚实旁注,不做「好评率 89%」式背书大字;图标走 lucide(ThumbsUp),不再是表情 👍
+  const badge = screen.getByText("8/9");
   expect(badge).toHaveAttribute("title", "来自 9 次使用反馈");
+  expect(badge.querySelector("svg")).not.toBeNull();
+  expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
   expect(screen.getByText("来自 9 次使用反馈")).toBeInTheDocument();
   expect(screen.queryByText(/好评率/)).not.toBeInTheDocument();
+});
+
+test("footer 窄屏契约:「关闭」让位给右上 ✕,动作按钮并排各占一半,Badge 不被拉成全宽(K-04 / K-20)", async () => {
+  getMarketplaceDetail.mockResolvedValue(detail());
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} onAskAiInChat={() => {}} />);
+  const install = await screen.findByRole("button", { name: /安装/ });
+  // 标题栏 ✕ 与 footer「关闭」同名:footer 那枚是有可见文字的。
+  const close = screen.getAllByRole("button", { name: "关闭" }).find((b) => b.textContent?.trim() === "关闭") as HTMLElement;
+  expect(close).toHaveClass("max-sm:hidden");
+  const actions = install.parentElement as HTMLElement;
+  expect(actions.className).toContain("max-sm:[&>button]:flex-1");
+  expect(actions.className).not.toContain("[&>*]:w-full");
+  expect(actions.className).not.toContain("flex-col-reverse");
 });
 
 test("footer「在对话中试用」→ 回调带预填(含名称与 slug),供 AI 装好并给示例", async () => {

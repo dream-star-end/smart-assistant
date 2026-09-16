@@ -497,7 +497,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                           </div>
                           <p className="truncate text-meta text-muted">
                             {r.slug} ·{" "}
-                            <TimeAgo value={r.createdAt} tooltip={false} className="tabular-nums" />
+                            <TimeAgo value={r.createdAt} tooltip={false} className="tabular-nums" />{" "}
                             提交 · 提交者 #{r.submittedBy}
                           </p>
                           {needsReview && (

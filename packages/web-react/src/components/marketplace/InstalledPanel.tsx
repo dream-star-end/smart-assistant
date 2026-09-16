@@ -368,7 +368,7 @@ export function InstalledPanel({
         }}
         title={
           pendingUninstall
-            ? `卸载${pendingUninstall.isAgent ? '智能体' : '技能'}「${pendingUninstall.name}」?`
+            ? `卸载${pendingUninstall.isAgent ? '智能体' : '技能'}「${pendingUninstall.name}」？`
             : undefined
         }
         description={
@@ -401,7 +401,7 @@ export function InstalledPanel({
               {modalErr}
             </Alert>
           )}
-          <Field label="原因（可不说明）" hint="可选;它只用于改进市场内容，不会通知发布者。">
+          <Field label="原因（可不说明）" hint="可选；它只用于改进市场内容，不会通知发布者。">
             <Select
               value={uninstallReason}
               disabled={busy !== null}
@@ -485,7 +485,7 @@ export function InstalledPanel({
       ) : (
         <div className="flex flex-col gap-1 pb-2">
           {agentRows.length > 0 && (
-            <Group title={`智能体（${agentRows.length}）`} hint="人格入口:在输入框上方切换。">
+            <Group title={`智能体（${agentRows.length}）`} hint="人格入口：在输入框上方切换。">
               {agentRows.map(renderRow)}
             </Group>
           )}
