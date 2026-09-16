@@ -49,8 +49,9 @@ export function CaseFieldReportVisual({
               : '先红后绿 + 一行根因修复'}
           </p>
         </div>
+        {/* 尚无真实运行记录时不能一边说「只是脚本」一边亮「可核对成果」（审计 TU-10）。 */}
         <span className="shrink-0 rounded-full bg-white/10 px-2.5 py-1 text-micro font-semibold text-white/85 sm:text-caption">
-          可核对成果
+          {pendingCapture ? '观察记录 · 非平台验证' : '可核对成果'}
         </span>
       </div>
     </div>
@@ -61,7 +62,7 @@ function BikeModelComparison() {
   return (
     <div className="absolute inset-x-5 bottom-4 top-[48px] grid grid-cols-2 gap-3 sm:inset-x-8 sm:bottom-[66px] sm:top-[58px] sm:gap-5">
       <div className="flex flex-col justify-center rounded-xl border border-white/15 bg-white/[0.07] p-3 backdrop-blur-sm sm:p-4">
-        <div className="flex items-center justify-between gap-2 text-[9px] font-semibold text-white/65 sm:text-micro">
+        <div className="flex items-center justify-between gap-2 text-micro font-semibold text-white/65">
           <span>RMSE</span>
           <span>越低越好</span>
         </div>
@@ -71,7 +72,7 @@ function BikeModelComparison() {
         </div>
       </div>
       <div className="flex flex-col justify-center rounded-xl border border-white/15 bg-white/[0.07] p-3 backdrop-blur-sm sm:p-4">
-        <div className="flex items-center justify-between gap-2 text-[9px] font-semibold text-white/65 sm:text-micro">
+        <div className="flex items-center justify-between gap-2 text-micro font-semibold text-white/65">
           <span>测试集 R²</span>
           <span>越高越好</span>
         </div>
@@ -79,7 +80,7 @@ function BikeModelComparison() {
           <MetricNumber label="线性" value="0.714" />
           <MetricNumber label="GBM" value="0.904" accent />
         </div>
-        <div className="mt-2.5 flex items-center gap-1.5 text-[9px] font-medium text-emerald-200 sm:mt-3 sm:text-micro">
+        <div className="mt-2.5 flex items-center gap-1.5 text-micro font-medium text-emerald-200 sm:mt-3">
           <span className="size-1.5 rounded-full bg-emerald-300" />
           34 项复现测试通过
         </div>
@@ -101,7 +102,7 @@ function MetricBar({
 }) {
   return (
     <div>
-      <div className="flex items-center justify-between text-[9px] text-white/75 sm:text-micro">
+      <div className="flex items-center justify-between text-micro text-white/75">
         <span>{label}</span>
         <span>{value}</span>
       </div>
@@ -124,7 +125,7 @@ function MetricNumber({
         accent ? 'border-emerald-300/35 bg-emerald-300/15' : 'border-white/10 bg-white/[0.04]',
       )}
     >
-      <p className="text-[8px] text-white/55 sm:text-[9px]">{label}</p>
+      <p className="text-micro text-white/55">{label}</p>
       <p
         className={cn(
           'mt-0.5 text-title font-bold sm:text-[19px]',
@@ -140,17 +141,18 @@ function MetricNumber({
 function AstropyPatch() {
   return (
     <div className="absolute inset-x-5 bottom-4 top-[48px] overflow-hidden rounded-xl border border-white/15 bg-black/30 font-mono backdrop-blur-sm sm:inset-x-8 sm:bottom-[66px] sm:top-[58px]">
-      <div className="flex items-center gap-1.5 border-b border-white/10 px-3 py-2 text-[8px] text-white/45 sm:text-[9px]">
+      <div className="flex items-center gap-1.5 border-b border-white/10 px-3 py-2 text-micro text-white/45">
         <span className="size-1.5 rounded-full bg-rose-400" />
         <span className="size-1.5 rounded-full bg-amber-300" />
         <span className="size-1.5 rounded-full bg-emerald-400" />
-        <span className="ml-1">astropy/modeling/separable.py</span>
+        <span className="ml-1 truncate">astropy/modeling/separable.py</span>
       </div>
-      <div className="flex h-[calc(100%-29px)] flex-col justify-center px-3 py-2.5 text-[9px] leading-4 sm:h-[calc(100%-33px)] sm:px-4 sm:py-3 sm:text-[11px] sm:leading-5">
-        <p className="truncate text-white/45">cright[-right.shape[0]:, -right.shape[1]:]</p>
+      <div className="flex h-[calc(100%-31px)] flex-col justify-center px-3 py-2.5 text-micro leading-4 sm:h-[calc(100%-33px)] sm:px-4 sm:py-3 sm:text-caption sm:leading-5">
+        {/* 390px 下这行曾 truncate 后与下一行重叠；窄屏隐藏上下文行、≥sm 完整换行显示（审计 TU-30）。 */}
+        <p className="hidden break-all text-white/45 sm:block">cright[-right.shape[0]:, -right.shape[1]:]</p>
         <p className="mt-0.5 rounded bg-rose-400/10 px-1.5 text-rose-200">− = 1</p>
         <p className="mt-1 rounded bg-emerald-400/10 px-1.5 text-emerald-200">+ = right</p>
-        <div className="mt-2 flex gap-2 font-sans text-[8px] font-semibold sm:text-micro">
+        <div className="mt-2 flex flex-wrap gap-2 font-sans text-micro font-semibold">
           <span className="rounded-full bg-rose-400/15 px-2 py-1 text-rose-200">基线 2 failed</span>
           <span className="rounded-full bg-emerald-400/15 px-2 py-1 text-emerald-200">
             修复后 13 passed

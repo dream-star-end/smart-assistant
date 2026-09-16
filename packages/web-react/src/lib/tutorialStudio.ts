@@ -335,7 +335,15 @@ export function isSafeTutorialMediaUrl(url: string | null | undefined): boolean 
   return false;
 }
 
+/** 社区投稿 HTML（不可信）：只给脚本，不给下载 / 弹窗 / 同源。 */
 export const HTML_EMBED_SANDBOX = "allow-scripts";
+
+/**
+ * 展厅两类 iframe（仓内构建产物，可信）的沙箱（审计 TU-28）：看板内「下载可复算 CSV」「World Bank 来源」
+ * 等链接此前点了没反应，放开下载与新窗口；仍**不给** `allow-same-origin`，与社区投稿的口径分开。
+ */
+export const SHOWCASE_IFRAME_SANDBOX =
+  "allow-scripts allow-downloads allow-popups allow-popups-to-escape-sandbox";
 
 export function htmlEmbedSandboxIsSafe(sandbox: string | null | undefined): boolean {
   if (!sandbox) return false;

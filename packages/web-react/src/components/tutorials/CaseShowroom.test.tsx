@@ -33,7 +33,11 @@ describe('CaseShowroom', () => {
     expect(document.querySelector('iframe')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '打开交互看板' }))
     const frame = screen.getByTitle(TUTORIAL_SHOWCASES[0].title + '交互看板')
-    expect(frame).toHaveAttribute('sandbox', 'allow-scripts')
+    // 仓内可信产物：放开下载 / 弹窗让看板内链接有反应，但绝不给同源（TU-28）。
+    expect(frame.getAttribute('sandbox')).toContain('allow-scripts')
+    expect(frame.getAttribute('sandbox')).toContain('allow-downloads')
+    expect(frame.getAttribute('sandbox')).toContain('allow-popups')
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin')
     expect(frame).toHaveAttribute('src', '/tutorials/cases/research-bike-demand/showcase/dashboard.html')
     expect(frame).toHaveAttribute('referrerPolicy', 'no-referrer')
     expect(screen.getByRole('link', { name: '下载分析报告' })).toHaveAttribute('download')

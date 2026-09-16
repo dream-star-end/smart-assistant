@@ -4,8 +4,9 @@ import { ArrowLeft, ArrowRight, ArrowUpRight, Check, Download, ExternalLink, Fil
 import { useEffect, useRef, useState } from 'react'
 import { TUTORIAL_SHOWCASES, showcaseAsset, showcaseTask, type TutorialShowcase } from '../../lib/tutorialShowcase'
 import type { TutorialCase, TutorialCaseId } from '../../lib/tutorialCaseCatalog'
+import { SHOWCASE_IFRAME_SANDBOX } from '../../lib/tutorialStudio'
 import { cn } from '../../lib/utils'
-import { Button } from '../ui'
+import { Button, Skeleton } from '../ui'
 
 type Props = {
   onSelect: (id: TutorialCaseId) => void
@@ -114,10 +115,12 @@ export function ShowcaseDetail({ item, onBack, onRun, actionLabel }: Omit<Props,
           <h2 className="flex items-center gap-2 text-meta font-semibold text-fg"><FileText size={16} /> 先看看，最后做出了什么</h2>
           <a href={showcaseAsset(item, 'dashboard.html')} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-caption text-accent">独立打开看板 <ExternalLink size={13} /></a>
         </div>
-        {preview ? <>
-          {!loaded && <p role="status" className="px-4 py-3 text-caption text-muted">{slow ? '预览加载较慢，可以用上方链接独立打开看板。' : '正在打开交互看板…'}</p>}
-          <iframe title={item.title + '交互看板'} src={showcaseAsset(item, 'dashboard.html')} sandbox="allow-scripts" referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[570px] w-full border-0 bg-[#f5f7fa]" />
-        </> : <div>
+        {preview ? <div className="relative">
+          {/* 加载期用骨架铺满预览区而不是一行灰字 + 白板；高度跟随视口、底色走 token 以适配暗色（审计 TU-28）。 */}
+          {!loaded && <div className="absolute inset-0 flex flex-col gap-3 p-4" aria-hidden><Skeleton className="h-8 w-1/3" /><Skeleton className="min-h-0 flex-1 w-full" /></div>}
+          {!loaded && <p role="status" className="absolute inset-x-0 bottom-3 px-4 text-center text-caption text-muted">{slow ? '预览加载较慢，可以用上方链接独立打开看板。' : '正在打开交互看板…'}</p>}
+          <iframe title={item.title + '交互看板'} src={showcaseAsset(item, 'dashboard.html')} sandbox={SHOWCASE_IFRAME_SANDBOX} referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[min(70dvh,570px)] w-full border-0 bg-surface" />
+        </div> : <div>
           <ResultCover item={item} />
           <div className="flex flex-wrap items-center justify-between gap-3 bg-surface px-5 py-4"><p className="text-meta text-muted">不是截图。切换条件，亲手探索这份数据。</p><Button variant="primary" onClick={() => setPreview(true)}>打开交互看板 <ArrowUpRight size={15} /></Button></div>
         </div>}
