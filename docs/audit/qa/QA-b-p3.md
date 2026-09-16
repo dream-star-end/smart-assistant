@@ -18,11 +18,12 @@
 | 修复记录 vs 代码 | 20 条 + X-01~03 逐条对上；**0 处不符** | 27 条 + X-M1~M4 逐条对上；**1 处不符（M-23 性能半条，文档写 ✅ 实为未做）** | 37 条 + 追加①② 逐条对上；**0 处不符** |
 | P1 / P2 | P2 3/3 ✅ | P1 2/2、P2 11/11 ✅ | P2 12/12 ✅ |
 | P3 处置与文档一致 | ✅（L-11 遗留理由已失效，见 §5-②） | ◐（M-23 勘误，见 §5-③） | ✅ |
-| 阶段 B 验证门（typecheck / 模块 vitest / after 图） | ✅ 复跑全绿 | ✅ 复跑全绿（含 test:browser T30） | ✅ 复跑全绿；**但 integration HEAD 上 `check:tutorials` 红**，非本条引入（§5-①） |
+| 阶段 B 验证门（typecheck / 模块 vitest / after 图） | ✅ 复跑全绿 | ✅ 复跑全绿（含 test:browser T30） | ✅ 复跑全绿；`check:tutorials` 在核对态 `c034f05d7` 上红（集成漂移，非本条引入），已由 q-1076 → A 处置并在新 integration HEAD `b249317f4` 转绿（§5-①） |
 | 集成后回归 | 无 | 无 | 无 |
 
-**❌ / ⚠ 共 3 项**（§5）：① integration HEAD `check:tutorials` 红（集成漂移，归 tut-sync-2）；② landing L-11 遗留理由失效（可做了，
-文件由 t-895 持锁 → 已移交）；③ media M-23 修复记录与代码不符（性能半条未做 → 文档已勘误 + 移交 t-895）。
+**❌ / ⚠ 共 3 项**（§5）：① `check:tutorials` 在 `c034f05d7` 上红 → **已处置**（q-1076 → A：`29a277b25` / `b249317f4`，新 HEAD 绿，QA 复跑取证；
+t-1046 tut-sync-2 补写 agents/chat-basics 正文并抬版后恢复 `data-product-feature`）；② landing L-11 遗留理由失效（可做了，文件由 t-895 持锁 →
+**已移交 t-895，持锁方与指挥官均已同意，验收时追**）；③ media M-23 修复记录与代码不符（性能半条未做 → 文档已勘误 + 移交 t-895）。
 **本轮代码改动 0 处**：三处唯一能动手的地方（`AuthGate.tsx` / `ImageAnnotationEditor.tsx`）此刻都由 t-895 a11y-B 持写锁在改，
 按任务书边界「不碰 a11y-B 正在改的文件」只做移交；文档改动 3 个（本文 + `landing.md` §7.1 一行备注 + `media.md` M-23 行勘误与遗留补记）。
 
@@ -36,7 +37,7 @@
 | 改高频交互面须 `test:browser` 绿 | 未触碰（NOT RUN 理由成立） | ✅ run.mjs 68/68（T30 视频任务中心） | 未触碰 | §4 |
 | after 截图 | ✅ 31 场景 | ✅ 11 场景 | ✅ 27 场景 | `.audit-tmp\qa-b-p3\integ\` |
 | 「修复记录」「验证」两节写进 `docs/audit/<slug>.md` | ✅ §7/§8 | ✅ §6/§7/§8 | ✅ §6/§7/§8/§9 | 三份文档 |
-| 模块门禁（tutorials 独有）`check:tutorials` 绿 | — | — | ✅ 分支 `02c358655` 绿；❌ integration HEAD 红 | §5-① |
+| 模块门禁（tutorials 独有）`check:tutorials` 绿 | — | — | ✅ 分支 `02c358655` 绿；核对态 `c034f05d7` 红 → 新 HEAD `b249317f4` 绿 | §5-① |
 | 提交 subject 不用 `fix(v5)`（d-26） | ✅ | ✅ | ✅ | `git log 210b9967..c034f05d7 --format=%s` 无 `fix(v5)` |
 
 ## 1. t-49 landing-B（20 条 + 3 跨模块）
@@ -160,21 +161,23 @@
 | 代码风格 | `npx biome lint` 三模块 30 个改动文件（27 个基线已有 + 3 个新场景文件），对照 `210b9967` 临时工作树同文件 | ✅ **按「文件 × 规则」逐对比对无新增**：基线 52 → HEAD 41（AuthGate `noLabelWithoutControl` 9→5、DesktopEnrollPage `useSemanticElements` 2→1、DemoShowcase 4→1、TutorialCenter 4→2、ImageResizeMode 1→0，其余逐对相同；`scenes-*.tsx` 0） | `biome-lint-head.log`、`biome-lint-base.log` |
 | 教程门禁（integration HEAD） | `npm run check:tutorials` | ❌ 「教程同步快照已漂移」：功能源变化 17 项（advisor-mode, agents, billing-usage, chat-basics, container-web-preview, feedback-support, files-media, github-repository, image-create-edit, inbox, marketplace-publishing, memory-auto-dream, models-reasoning, preferences, sessions-history, team-mode, voice-input），**入口身份变化 agents / chat-basics**；正文 / 媒体 / 案例 / 注册表均无变化 | `check-tutorials-1.log` |
 | 教程门禁（tutorials-B 分支） | 同上，在 `wt/tutorials` @ `02c358655` | ✅ `OK · 26 capabilities · 12 real-world cases · 26 media pairs · 2390809 B` | `check-tutorials-on-tutorials-branch.log` |
+| 教程门禁（新 integration HEAD，指挥官处置后复跑取证） | 同上，在 `v5-selfhost` @ `b249317f4`（只读运行） | ✅ `OK · 26 capabilities · 12 real-world cases · 26 media pairs · 2390809 B`；夹具 `i/lf w/lf attr/-text` | `check-tutorials-integ-b249317f4.log` |
 | 视觉 | `OC_UI_SCENES=landing-,auth-,legal-,desktop-enroll,media-,tutorials OC_UI_SHOT_DELAY=1200 node browser-tests/ui-preview/shoot.mjs` | ✅ 70 场景（landing 31 / media 11 / tutorials 27 / shell-landing-tokens 1）× light/dark = 258 张，`failures: 0 / retried: 0 / unmockedApi: 0` | `integ\manifest.json`、`shoot-integ.log` |
 
 ## 5. ❌ / ⚠ 项处置
 
-### ① integration HEAD `check:tutorials` 红 —— ❌ 集成漂移，非 tutorials-B 引入，本轮不修
+### ① `check:tutorials` 在核对态 `c034f05d7` 上红 —— 集成漂移，非 tutorials-B 引入；**已由 q-1076 → A 处置，新 HEAD 绿**
 
-- **事实**：tutorials-B 分支自身绿（§4），合入 integration 后红。漂移项全是「功能源 / 入口身份」哈希：17 个能力的 `data-product-feature`
-  标记所在源文件被其它模块的 B 轮改动碰过；`agents` / `chat-basics` 的**入口身份**变化对应 composer-B「去授权入口」（`19799c0fe`）与
+- **事实（QA 核对时）**：tutorials-B 分支自身绿（§4），合入 integration 后红。漂移项全是「功能源 / 入口身份」哈希：17 个能力的 `data-product-feature`
+  标记所在源文件被其它模块的 B 轮改动碰过；`agents` / `chat-basics` 的**入口身份**变化对应 composer-B「去授权卡 / 排队发送」新增入口与
   `c034f05d7`「ChatHeader 导出会话项、Sidebar 清除搜索钮补 `data-product-control`」——标记集合本身变了，门禁要求同步教程正文并提版本，
-  且明确「入口身份变化不可用 `--source-only`」。
-- **为什么不在本轮修**：修法 = 补写 / 校对 agents、chat-basics 两篇教程正文 + 提 `contentVersion` + `npm run tutorials:accept -- --note`
-  改写 `tutorial-sync.json` / history / head 三个受门禁保护的文件。这是内容决策 + 目录数据变更，正是待办池里 **tut-sync-2「tutorials·补写
-  agents/chat-basics 正文（去授权/…）」** 这条活的定义，QA 角色不越权代做；也不能只 accept 不改正文（会把「去授权」前的旧正文当成同步）。
-- **对验收的影响**：tutorials-B 自身的验收标准（分支上门禁绿）成立；**integ4「复跑全量门」前必须由 tut-sync-2 转绿**，否则全量门红。
-  已 `send_to` 指挥官。
+  且明确「入口身份变化不可用 `--source-only`」。QA 判断：这是内容决策 + 受门禁保护的目录数据变更，不越权跑 `tutorials:accept`，只上报。
+- **处置（指挥官，q-1076 拍板选 A，已在 integration 落地）**：`29a277b25` 把 AgentPicker C-06 / Composer C-02 两处新增入口暂降为
+  `data-product-control`（不再作为教程 CTA 入口，消掉 agents / chat-basics 的入口身份变化）+ `b249317f4` `tutorials:accept --source-only`
+  接受 17 项功能源漂移（history 第 67 条，note 标明指挥官代确认、待用户终审，不认可可整条 revert）。**QA 在 `b249317f4` 复跑取证：
+  `check:tutorials OK · 26 capabilities · 12 real-world cases · 26 media pairs`**（§4）。
+- **后续**：t-1046 tut-sync-2 补写 agents / chat-basics 正文并抬 `contentVersion` 后，把两处入口恢复为 `data-product-feature`。
+  tutorials-B 自身的验收标准（分支上门禁绿）成立；integ4 全量门以新 HEAD 为准。
 
 ### ② landing L-11「占位符 = 标签」—— ⚠ 遗留理由已失效，可做；文件由 t-895 持锁 → 移交
 
@@ -187,6 +190,8 @@
   `App.test.tsx:446/478` → `queryByLabelText('邮箱')`。
 - **为什么不在本轮修**：`AuthGate.tsx` 此刻由 t-895 a11y-B（landing 在其范围内）持写锁「接手前任未提交改动」，任务书边界「不碰 a11y-B 正在改的文件」；
   在自己分支改同一文件只会给 integ4 制造冲突。`landing.md` §7.1 已备注。
+- **登记**：**已移交 t-895**（持锁方同意接手，指挥官确认属 landing a11y 范围）；**验收 t-895 时追**这三处（`AuthGate.tsx` 占位符、
+  `AuthGate.test.tsx` 查询、`App.test.tsx:446/478` 否定断言）是否一并落地。
 
 ### ③ media M-23「hasSelection 改为 selectionDirty」—— ❌ 修复记录与代码不符（P3 性能半条未做）→ 文档勘误 + 移交
 
@@ -205,7 +210,8 @@
 - 真容器预览 ready 态 / 评论 / 触屏滚动 / 视口重连、真 Turnstile 挑战 / 邮件验证码 / 桌面深链、教程工作室真后端投稿 / 撤回：本机无 v5 后端、容器与桌面端，
   沿用三份文档的 vitest 契约 + `run.mjs` T16/T17/T30/T38 门。
 - 真机 iOS Safari：以预览台 mobile 视口（390×844、touch）代替。
-- `check:tutorials` 转绿后的复跑：等 tut-sync-2。
+- 新 integration HEAD `b249317f4` 上除 `check:tutorials` 外的其余门（vitest / test:browser / 截图）未复跑：两笔处置提交只动 `AgentPicker.tsx` /
+  `Composer.tsx` 各两处标记属性与三个教程同步快照文件，不在三模块归属内；全量门由 integ4 复跑。
 
 ## 7. 附
 
@@ -226,5 +232,6 @@ tutorials（10）：`tutorials-showroom--desktop--light`、`tutorials-help-menu-
 
 - 仓内：本文；`docs/audit/landing.md` §7.1 L-11 行备注；`docs/audit/media.md` §6.1 M-23 行勘误 + §8 遗留一行。**未改任何业务代码 / 用例 / 场景。**
 - 仓外 `D:\code\test_project\test123\.audit-tmp\qa-b-p3\`：`integ\`（258 PNG + manifest）、`shoot-integ.log`、`typecheck-1.log`、`typecheck-preview-1.log`、
-  `vitest-modules-1.log`、`test-browser-1.log`、`test-results-185\`、`biome-lint-{head,base}.log`、`check-tutorials-1.log`、`check-tutorials-on-tutorials-branch.log`。
+  `vitest-modules-1.log`、`test-browser-1.log`、`test-results-185\`、`biome-lint-{head,base}.log`、`check-tutorials-1.log`、`check-tutorials-on-tutorials-branch.log`、
+  `check-tutorials-integ-b249317f4.log`。
   基线对照用的 detached 工作树 `base-wt` 已 `git worktree remove`。
