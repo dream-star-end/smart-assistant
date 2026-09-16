@@ -81,7 +81,9 @@ export function RepoPill({
           )}
         </>
       ) : (
-        <span className="whitespace-nowrap">关联 GitHub 仓库</span>
+        // 未绑定态文案此前只有 nowrap、不能收缩：放进 Composer 工具行等紧凑容器时会把兄弟元素挤出去
+        // （composer 审计 §9 接线项）。改 min-w-0 + truncate，空间不足时省略号收尾，完整文案在 title。
+        <span className="min-w-0 truncate">关联 GitHub 仓库</span>
       )}
     </button>
   );
