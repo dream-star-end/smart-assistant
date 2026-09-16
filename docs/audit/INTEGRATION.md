@@ -159,3 +159,25 @@ TU-37（`scripts/check-v5-tutorials.ts` 标记路径反斜杠进哈希）是脚�
 - 待接线 / 待办：composer 排队气泡 `status=queued`（messages）、C-32 团队卡文案（shell + QA 同批改 `App.test` 7 处 + ocv5-210 五用例）、media X-M2 / X-M3 / X-M4（shell）、
   `typecheck:preview` 消红（shell：预览 tsconfig 开 `allowImportingTsExtensions`；taskboard：`scenes-taskboard.tsx(163,5)`）、TU-37 门禁脚本路径归一化（tutorials-B）。
 - 合入 canonical `feat/v5-selfhost` 与 Lease Center 发布需要 v5-dev 通道，本轮不做（决策 d-24）。
+- 各成员分支的合入状态单见 §8。
+
+### 8. 分支合入状态单（指挥官要求 · 集成③ 照单接棒）
+
+按 `git merge-base <分支> HEAD` 与 `git rev-list --count HEAD..<分支>` 现算于 integration `1d8eaf769`（2026-09-16 23:15）；12 条分支远端 = 本地。
+
+| 模块分支 `feat/v5-selfhost-audit-*` | 已合入到（合并提交） | 分支现 HEAD | 未合入提交 | 对应任务 / 状态 |
+|---|---|---|---|---|
+| shell | `39697560b`（集成① 起点 `e6f73dd99` 已含） | `39697560b` | 0 | shell-B 已合 |
+| sidebar | `25c775295`（集成② `b41e804ac`；sidebar-B `ef872e91a` 由集成① `3cff04c85`） | `25c775295` | 0 | sidebar-B t-37 / 二期 t-627 已合 |
+| tools | `d65c6741e`（集成② `6fa690d7e`） | `d65c6741e` | 0 | tools-B t-45 已合 |
+| landing | `b97adb3fb`（集成② `6201518b2`） | `b97adb3fb` | 0 | landing-B t-49 已合 |
+| media | `8834aca08`（集成② `10398baa9`） | `8834aca08` | 0 | media-B t-51 已合 |
+| composer | `70d3db8b3`（集成② `ae0b0cb64`） | `70d3db8b3` | 0 | composer-B t-35 已合 |
+| settings | `c0efc9c91`（集成② `5e5ed6925`） | `5eac1b807` | **3** | 二期 t-628 **已验收** → 集成③ 待合 |
+| messages | `d2f84063d`（集成① `985b3ae57`） | `2abe389a9` | **1** | messages2 t-629 待验收 → 集成③ 待合 |
+| taskboard | `0b06f7ce5`（集成① `bf8188def`） | `05dd185df` | **2** | taskboard2 t-630 待验收 → 集成③ 待合 |
+| manage | `af79d7b05`（集成① `09a13a472`） | `6fae01440` | **3** | manage2 t-626 分支已有新提交（进行中）→ 集成③ 以验收结果为准 |
+| market | `1fb99bfcc`（集成② `ab765669a`） | `5391c150a` | **5** | market2 t-625 分支已有新提交（进行中，曾阻塞）→ 集成③ 以验收结果为准 |
+| tutorials | 基线 `210b99678`（**从未合入**） | `d6eb6ef35` | **5** | tutorials-A t-52 已验收 3 提交（`be7ddf00b` 改 `browser-tests/ui-preview` 内联 bundle 转义，harness 共享文件；`5023c70fd` 27 个场景；`5bf80f0bc` 报告）+ tutorials-B t-53 进行中 → 集成③ 待合 |
+
+集成③ 顺序建议：settings（已验收）→ messages2 / taskboard2 / manage2 / market2 按验收先后 → tutorials（A+B 一起；`be7ddf00b` 与 integration 上的截图台外链 bundle 改动同文件，留意三方合并）。每合一条跑 typecheck；合完复跑 §5 四道门，`.gitattributes` 已在，教程夹具不再需要手工重检。
