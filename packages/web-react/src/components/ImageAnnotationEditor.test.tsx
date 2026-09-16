@@ -398,6 +398,27 @@ describe('选区状态维护(M-23)', () => {
     expect(screen.queryByText('已选中区域')).not.toBeInTheDocument()
   })
 
+  test('无选区变化的重渲染(改描述 / 缩放)不重算:getImageData 保持零调用', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    await waitFor(() => expect(screen.getByRole('button', { name: '撤销' })).toBeEnabled())
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+
+    // 与选区无关的状态变化只触发重渲染,不该再碰 mask。
+    fireEvent.change(screen.getByLabelText('希望怎样修改'), { target: { value: '把杯子改成玻璃材质' } })
+    fireEvent.click(screen.getByRole('button', { name: '放大画布' }))
+    fireEvent.click(screen.getByRole('button', { name: '缩小画布' }))
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+  })
+
   test('清空:直接回到无选区,不扫 mask', async () => {
     const ctx = stubCanvasPipeline({ selection: false })
     render(<EditorHarness />)
