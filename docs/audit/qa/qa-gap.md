@@ -3,7 +3,7 @@
 - 复核对象：t-836 HUD 任务列表 / 后台子任务（G-1/G-2）、t-838 知识星球自动回复面板（G-3）、t-839 杂项 P3（G-4 `?demo=1` / G-5 optionsGroup）、t-865 集成待办清理（INTEGRATION §7.1）。
 - 复核基线：工作树 `wt\qa-gap`，分支 `feat/v5-selfhost-audit-qa-gap` = integration `c034f05d7`（集成③ 6/6 之后）+ 三条交付分支干净合入（`0bdc40afc` hud@b1f06f8f5 → `fe35506a1` kp-automation@b0fd16dad → `010b532ee` misc-p3@c834dffa1，无冲突标记）。t-865 的改动已在 integration 上，直接核。
 - 角色：测试 / QA（第二双眼睛）。方法：对照各交付文档 §修复记录 / §验证逐项读代码 diff、复跑门禁与用例、按 d-28 用 ui-preview 截图台重出三组截图逐张看图（截图仓外：`D:\code\test_project\test123\.audit-tmp\qa-gap\shots\{hud,kp,misc}\`，manifest 三组 `failures 0 / unmockedApi 0`）。
-- **结论：核对 61 项，✅ 59 / ❌ 2；两处 ❌ 均已在本分支修复并验证**（§1.18 typecheck:preview 红、§2.14 KP-14 忙态单键）。未发现回归；已声明的遗留项仍开放（§5）。
+- **结论：核对 61 项，✅ 59 / ❌ 2；两处 ❌ 均已在本分支修复并验证**（§1.18 typecheck:preview 红、§2.14 KP-14 忙态单键；修复清单见 §7「QA 直接修复」）。未发现回归；已声明的遗留项仍开放（§5）。指挥官 01:27 验收通过。
 
 ## 1. t-836 · HUD 任务列表 / 后台子任务（G-1/G-2）
 
@@ -119,12 +119,14 @@
 
 **NOT RUN**：全量 `npm test`（改动面已被上述 20 个测试文件覆盖，全量门留 integ4 合入后统一跑）；`.audit-tmp` 截图不入库；真机 iOS Safari。
 
-## 7. 本分支改动（供 integ4 合入）
+## 7. QA 直接修复（文件 / 提交 / 验证，供 t-896 集成④ 合入时点名带上）
 
-| 提交 | 文件 | 内容 |
-|---|---|---|
-| `747596782` `test(v5)` | `browser-tests/ui-preview/scenes-hud.tsx` | 1.18：估算用量改 `ESTIMATED_USAGE: LiveTurnTokenUsageSnapshot` 常量，消 TS2353 |
-| `1db992620` `refactor(v5)` | `src/components/settings/KnowledgePlanetAutomationPanel.tsx`、`.test.tsx` | 2.14：`busyKeys` 集合门控 + 用例补「第一条在飞时第二条点击真的发请求」 |
-| 本文 `docs(v5)` | `docs/audit/qa/qa-gap.md` | 复核报告 |
+指挥官 01:14 要求：两处各自独立提交、subject 点名源任务、不用 `fix(v5)`（d-26）；KP 新增断言须**修前红、修后绿**。
+
+| 源任务 | 提交 | 文件 | 内容 | 验证 |
+|---|---|---|---|---|
+| t-836（§1.18） | `747596782` `test(v5): hud 预览场景估算用量改带类型常量，消 typecheck:preview TS2353` | `packages/web-react/browser-tests/ui-preview/scenes-hud.tsx` | 估算用量改 `ESTIMATED_USAGE: LiveTurnTokenUsageSnapshot` 常量传入，运行时零变化 | 修前 `typecheck:preview` ❌ TS2353 ×1（`typecheck-preview.log`）→ 修后 ✅ 0 错；`typecheck` ✅；`hud-task-long--*` 截图徽标仍为「约1.28m token」；`biome lint` 0 |
+| t-838（§2.14） | `1db992620` `refactor(v5): kp-automation 写操作忙态改按键集合，别的行在飞时本行开关不再静默吞掉点击` | `packages/web-react/src/components/settings/KnowledgePlanetAutomationPanel.tsx`、`KnowledgePlanetAutomationPanel.test.tsx` | `busyKey` 单值 → `busyKeys: ReadonlySet<string>`（`isBusy / beginBusy / endBusy`），toggle 与 delete 只在同一行互斥；用例 KP-14 追加「第一条在飞时点第二条 → `patch` 第二次调用」 | **修前红**：把面板回退到 `010b532ee` 版本单跑该测试文件 → `1 failed / 9 passed`，`AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times`（`vitest-kp-before-fix.log`）；**修后绿**：面板 + `ConnectorsTab` 2 文件 70/70；`typecheck` ✅；`biome lint` 0 |
+| — | `c06947a0c` + 本次 `docs(v5)` | `docs/audit/qa/qa-gap.md` | 复核报告 | — |
 
 合入提示：本分支 = integration `c034f05d7` + hud / kp-automation / misc-p3 三条分支 + 上述提交；三条分支本身尚未合入 integration（集成④范围），整支 fast-forward 合入即可同时带上它们，或按分支单独 cherry 上述三个提交。
