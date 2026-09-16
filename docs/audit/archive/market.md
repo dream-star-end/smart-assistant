@@ -42,7 +42,7 @@
 
 → 正文 §8 验证（阶段 B）。
 
-## 4. 遗留与理由（13 条，全部 P3；二期 t-625 处理中）
+## 4. 遗留与理由（阶段 B 末 13 条全部 P3 → 二期 t-625 落地 10 条，余 K-23 不做 / K-25 / K-27 遗留）
 
 | 项 | 原因 | 建议 / 状态 |
 |---|---|---|
@@ -56,14 +56,14 @@
 | X-01 `App.tsx` 接线 | shell 归属 | ✅ 集成② `19799c0fe` 已接 |
 | K-25 / X-02 offset 分页 / 虚拟化 | 需后端 | 后端提供 offset 后前端改 append |
 | K-27 原生 checkbox | 需 shell 出 Checkbox 原语 | shell |
-| **待补：t-625** | 二期结论 | 任务在跑（fable-5-1-57），落地情况以 `docs/audit/market.md` 二期章节与 complete_task 交付为准 |
+| **二期 t-625 结论** | 上表 K-08 / 09 / 22 / 10 / 12 / 13 / 14 / 15 / 19 / 21 **全部 ✅ 落地**（K-12 取「换行」；K-14 徽章解释改 `Tooltip` + 注脚；K-19 新增 `connectorAuthModeLabel` 等三个人话映射）；K-23 按任务书保持不做；K-25 / K-27 保持遗留（需后端 offset / 需 shell Checkbox） | 提交 `079797abf` `98aa1e9fe` `e065996c1` `5cc56b8e0`，文档 `5391c150a`；新增场景 `market-detail-plugin`；模块单测 11 文件 / 152 例全绿（+14），before / after 各 88 张 failures 0 |
 
-→ 正文 §9 遗留。
+→ 正文 §9 遗留、[§10 二期收尾（t-625）](../market.md#10-二期收尾t-625--遗留-p3)。
 
 ## 5. 分支 / 提交
 
-- 分支 `feat/v5-selfhost-audit-market` @ `1fb99bfcc`（基线 `210b9967`，7 个提交，14 files / +1109 −51）
+- 分支 `feat/v5-selfhost-audit-market` @ `5391c150a`（基线 `210b9967`，12 个提交）
 - 阶段 A：`7240a8261` 审计报告 + `scenes-market-audit.tsx`
 - 阶段 B：`da6fc3bc6` `2b81246ad` `2e58b37bc`；文档 `a96286981`；K-24 `ef4fe9539` + 文档 `1fb99bfcc`
-- 二期：待补（t-625）
-- 集成：`ab765669a`（集成②，@`1fb99bfcc`）；接线 `19799c0fe`（集成②）；集成② `f7c08f3eb` 随契约更新 market 场景 import 后缀
+- 二期（t-625）：`079797abf` `98aa1e9fe` `e065996c1` `5cc56b8e0`；文档 `5391c150a`
+- 集成：`ab765669a`（集成②，B @`1fb99bfcc`）；接线 `19799c0fe`（集成②）；集成② `f7c08f3eb` 随契约更新 market 场景 import 后缀；**`be20adaec`（集成③，二期 @`5391c150a`，14 files +839/−195）**

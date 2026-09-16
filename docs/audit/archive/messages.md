@@ -60,5 +60,5 @@
 - 阶段 A：`901cc3a06` 截图台改外链 bundle + 修移动端整页截图；`58d3fcc5d` 审计报告 + `scenes-messages.tsx`
 - 阶段 B：`6619d78a8` `94fc5a69a` `9d2fd9b4c` `8e990ad12`；文档 `d2f84063d`
 - 二期：`2abe389a9`（文档，t-629）
-- 集成：`985b3ae57`（集成①，合入 @`d2f84063d`）；相关跨模块提交 `09d15400f`（集成①，`useChatSocket` 空标题走 `EMPTY_SESSION_TITLE`，sidebar ST-01）、`091a1a7bb`（settings 补丁①，红卡余额不足文案去手抄价格 SET-15）
-- 待补：t-629 验收结论（当前待验收）
+- 集成：`985b3ae57`（集成①，合入 @`d2f84063d`）；相关跨模块提交 `09d15400f`（集成①，`useChatSocket` 空标题走 `EMPTY_SESSION_TITLE`，sidebar ST-01）、`091a1a7bb`（settings 补丁①，红卡余额不足文案去手抄价格 SET-15）；**`cd58600e8`（集成③，二期文档 @`2abe389a9`，1 file +13）**
+- 二期 t-629 结论：已验收通过。三条遗留（M-21 需独立设计 / M-24 需状态机专项 / M-25 需真后端复现）无一满足「可独立完成」，**代码改动 0**；composer 移交的「排队中」气泡核对为既有代码已满足（`cards.tsx` `USER_STATUS_LABEL.queued`、`socket.ts` `dispatchPayload` 置 `queued`，`cards.test` 有用例）。→ 正文 [§10 二期评估](../messages.md#10-二期评估t-629--09-16--fable-5-1-35)。

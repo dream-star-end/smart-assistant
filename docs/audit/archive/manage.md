@@ -52,15 +52,15 @@
 |---|---|---|
 | M-17 文献库引用导出 / 文档详情 | 需后端配合 | `ResearchLibraryDoc` 无作者 / 年份 / venue，`/api/me/research/library*` 无单文档读接口；前端可做的搜索 / 标识增强已落地 |
 | M-06 ③ `SkillSummary.sensitive` | 需后端配合 | 需后端下发；前端 `isSecretSkill` 规则兜底已就位（`skillDisplay.test`） |
-| **待补：t-626** | 二期验收结论 | 任务仍在跑，以正文 §10.4 与 complete_task 交付为准 |
+| **二期 t-626 结论** | 已完成并验收 | §9 遗留 5 项 → 已修 1（M-12 余量 `0a47b4948`）/ 已由他处闭环 2（M-09/18/20/21 补丁①；X-01 taskboard-B）/ 保持遗留 2（M-17、M-06 ③，均需后端）；计划外承接跨模块 X-03 `cronHuman` 星期 / 小时区间（`26b865e2f`，受益 CronPanel / taskboard StageSettings / tools memoryReminderCards）；文档 `6fae01440` |
 
-已闭环项：M-09 / M-18 / M-20 / M-21（补丁① `138accab4`）、X-01（`ef872e91a` → integration `43b7cd3a4`）、M-12 余量（`0a47b4948`）。→ 正文 §9 遗留、§10.4 仍遗留。
+已闭环项：M-09 / M-18 / M-20 / M-21（补丁① `138accab4`）、X-01（`ef872e91a` → integration `43b7cd3a4`）、M-12 余量（`0a47b4948`）、X-03（`26b865e2f`）。→ 正文 §9 遗留、[§10 二期（t-626）](../manage.md#10-二期t-626-遗留-p3-收尾)、§10.4 仍遗留。
 
 ## 5. 分支 / 提交
 
-- 分支 `feat/v5-selfhost-audit-manage` @ `26b865e2f`（基线 `210b9967`，9 个提交，32 files / +3802 −436）
+- 分支 `feat/v5-selfhost-audit-manage` @ `6fae01440`（基线 `210b9967`，10 个提交）
 - 阶段 A：`43a6d52f5` 审计报告 + `scenes-manage-audit.tsx`
 - 阶段 B：`f51852e15` `18c4ffb3b` `34917f3e4` `45e5d7891`；文档 `ea24dc498` `af79d7b05`
-- 二期：`0a47b4948` `26b865e2f`（t-626，待交付）
+- 二期（t-626）：`0a47b4948` `26b865e2f`；文档 `6fae01440`
 - 相关他分支提交：`138accab4` `9582b5eb5`（settings 补丁①：ConnectorsTab 承接、CronPanel Telegram 收口）
-- 集成：`09a13a472`（集成①，@`af79d7b05`）；二期待集成③
+- 集成：`09a13a472`（集成①，B @`af79d7b05`）；**`c761bbd93`（集成③，二期 @`6fae01440`，6 files +212/−73）**

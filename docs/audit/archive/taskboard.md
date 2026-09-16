@@ -49,9 +49,9 @@
 | T-20 `BoardViewParam` 的 `inbox/backlog` 类型 | 部分修复 · shell 归属 | `hooks/useAppRoute.ts` 属 shell，注释声明「仅保留旧调用兼容」，无功能影响；本模块死分支已删净（集成①记录：不接） |
 | T-28 直接新建 AI 阶段 | 部分修复 · 后端约束 | 后端要求 AI 阶段绑定 agent（`buildStagePatch` 同一约束），前端已把两步流程写进新建行说明 |
 | §5 暂缓 9 项 | 维持 | 平台限制 / 他模块归属 / 需后端 / 非缺陷（其中 `cronHuman` 区间已由 manage 二期 `26b865e2f` 修复） |
-| **待补：t-630** | 二期验收结论 | 当前待验收，以 approve / reject 结果为准 |
+| **二期 t-630 结论** | 已验收通过 | 可独立完成的只有 1 项（`scenes-taskboard.tsx` `onSuccess:'close'` → `'wait_human'`，消集成① 登记的 `typecheck:preview` TS2322，`cb6629bd1`，业务代码零改动）；T-20 / T-28 维持部分修复；T-02 已由 sidebar-B `ef872e91a` 修复；§5 暂缓 9 项全部维持 |
 
-→ 正文 §8 二期。
+→ 正文 [§8 二期](../taskboard.md#8-二期t-630--09-16--fable-5-1-35-遗留-p3-收尾)。
 
 ## 5. 分支 / 提交
 
@@ -59,4 +59,4 @@
 - 阶段 A：`6cdb31cdf` 审计报告 + 重写 `scenes-taskboard.tsx`
 - 阶段 B：`42fc60a79` `fe787f009`；文档 `0b06f7ce5`
 - 二期：`cb6629bd1`；文档 `05dd185df`
-- 集成：`bf8188def`（集成①，@`0b06f7ce5`）、`1ae92b831`（集成①用例更新）；二期待集成③
+- 集成：`bf8188def`（集成①，@`0b06f7ce5`）、`1ae92b831`（集成①用例更新）；**`425655631`（集成③，二期 @`05dd185df`，2 files +20/−1）**
