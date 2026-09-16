@@ -335,7 +335,7 @@ function WizardSteps({ step }: { step: Step | "pay" }) {
                 done
                   ? "bg-success-soft text-success"
                   : active
-                    ? "bg-accent text-white"
+                    ? "bg-accent text-accent-fg"
                     : "bg-hover text-faint",
               )}
             >
@@ -376,7 +376,7 @@ function PlanCard({
         <div className="flex items-center gap-2">
           <span className="text-title font-semibold text-fg">{plan.name}</span>
           {selected && (
-            <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-white">
+            <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
               已选
             </span>
           )}

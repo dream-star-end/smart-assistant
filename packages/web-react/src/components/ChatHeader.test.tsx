@@ -99,8 +99,9 @@ describe("ChatHeader 团队模式指示 chip", () => {
 });
 
 describe("ChatHeader 会话未读角标", () => {
+  // 前景不写死 text-white:深色 accent/danger 是浅色底,白字只有 2.8/3.1:1,走 -fg token(a11y shell#1/#11)。
   const badgeLayoutClass =
-    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none text-white tabular-nums";
+    "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none tabular-nums";
 
   it("无 sessionUnreadCount 时不渲染占位，打开菜单按钮仍在", () => {
     renderHeader({ onOpenMobileNav: () => {} });
@@ -114,10 +115,14 @@ describe("ChatHeader 会话未读角标", () => {
     const sessionBadge = menu.parentElement?.querySelector("[data-testid=session-unread-badge]");
     expect(sessionBadge).toHaveTextContent("3");
     expect(sessionBadge).toHaveClass(...badgeLayoutClass.split(" "));
+    expect(sessionBadge).toHaveClass("bg-accent", "text-accent-fg");
+    expect(sessionBadge).not.toHaveClass("text-white");
     const inboxBtn = screen.getByRole("button", { name: "站内信" });
     const inboxBadge = inboxBtn.parentElement?.querySelector("span");
     expect(inboxBadge).toHaveTextContent("2");
     expect(inboxBadge).toHaveClass(...badgeLayoutClass.split(" "));
+    expect(inboxBadge).toHaveClass("bg-danger", "text-danger-fg");
+    expect(inboxBadge).not.toHaveClass("text-white");
   });
 
   it("折叠态角标挂在「展开侧栏」按钮上", () => {

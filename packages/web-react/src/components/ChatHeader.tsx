@@ -410,8 +410,10 @@ function HeaderCountBadge({
       data-testid={testId}
       aria-label={ariaLabel}
       className={cn(
-        "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none text-white tabular-nums",
-        tone === "accent" ? "bg-accent" : "bg-danger",
+        "pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none tabular-nums",
+        // 前景走 -fg token 而不是写死白字:深色主题 accent #9a8aff / danger #f0666e 都是浅色,
+        // 白字只有 2.8 / 3.1:1;-fg 在深色下取近黑(≥5.9:1),浅色下仍是白(a11y 走查 shell#1/#11)。
+        tone === "accent" ? "bg-accent text-accent-fg" : "bg-danger text-danger-fg",
       )}
     >
       {count > 99 ? "99+" : count}

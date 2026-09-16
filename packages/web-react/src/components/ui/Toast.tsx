@@ -42,6 +42,8 @@ type ToastItem = {
   onAction?: () => void;
   /** 被上限挤掉的 error 条数；有值表示「还有 N 条错误」汇总条。 */
   overflowCount?: number;
+  /** 会自隐的提示(success / info 且无动作)。悬停 / 聚焦时暂停计时,离开后重新计满。 */
+  autoDismiss: boolean;
 };
 
 const MAX_ERROR_TOASTS = 3;
@@ -68,6 +70,23 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setItems((cur) => cur.filter((t) => t.id !== id));
   }, []);
 
+  // 自隐计时的两个开关(a11y 走查 shell#10 / WCAG 2.2.1):鼠标停在提示上、或键盘把焦点移进
+  // 提示里(动作按钮 / 关闭键)时暂停;离开再从头计 3.5s,读得慢的人不会在读到一半时被收走。
+  const schedule = useCallback(
+    (id: number) => {
+      const prev = dismissTimers.current.get(id);
+      if (prev !== undefined) window.clearTimeout(prev);
+      dismissTimers.current.set(id, window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS));
+    },
+    [dismiss],
+  );
+  const pause = useCallback((id: number) => {
+    const timer = dismissTimers.current.get(id);
+    if (timer === undefined) return;
+    window.clearTimeout(timer);
+    dismissTimers.current.delete(id);
+  }, []);
+
   useEffect(() => () => {
     for (const timer of dismissTimers.current.values()) window.clearTimeout(timer);
     dismissTimers.current.clear();
@@ -80,6 +99,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const tone = toneArg ?? "info";
       const id = ++seq.current;
       const actionable = Boolean(options?.actionLabel && options?.onAction);
+      const autoDismiss = tone !== "error" && !actionable;
       setItems((cur) => {
         const item: ToastItem = {
           id,
@@ -87,6 +107,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           tone,
           actionLabel: actionable ? options?.actionLabel : undefined,
           onAction: actionable ? options?.onAction : undefined,
+          autoDismiss,
         };
         if (tone !== "error") return [...cur, item];
         const overflow = cur.find((t) => t.overflowCount != null);
@@ -106,6 +127,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             message: `还有 ${dropped} 条错误`,
             tone: "error",
             overflowCount: dropped,
+            autoDismiss: false,
           });
         }
         return next;
@@ -113,12 +135,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       // 错误提示不自动消失(可达性:屏幕阅读器/慢读用户不会因 3.5s 自隐而错过失败原因;
       // 用户可点 X 关闭)。带动作的提示同理 —— 等着用户做决定的东西不能自己溜走。
       // 其余成功/信息类保持短暂自隐。
-      if (tone !== "error" && !actionable) {
-        const timer = window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
-        dismissTimers.current.set(id, timer);
-      }
+      if (autoDismiss) schedule(id);
     },
-    [dismiss],
+    [schedule],
   );
 
   return (
@@ -139,6 +158,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               // 错误提示用 alert/assertive 立即打断朗读;成功/信息用 status/polite 不打断。
               role={t.tone === "error" ? "alert" : "status"}
               aria-live={t.tone === "error" ? "assertive" : "polite"}
+              data-auto-dismiss={t.autoDismiss ? "true" : undefined}
+              onMouseEnter={t.autoDismiss ? () => pause(t.id) : undefined}
+              onMouseLeave={t.autoDismiss ? () => schedule(t.id) : undefined}
+              onFocusCapture={t.autoDismiss ? () => pause(t.id) : undefined}
+              onBlurCapture={
+                t.autoDismiss
+                  ? (e) => {
+                      // 焦点仍在提示内部(关闭键 ↔ 动作按钮之间移动)不算离开。
+                      if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
+                      schedule(t.id);
+                    }
+                  : undefined
+              }
               className={cn(
                 "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-body font-medium shadow-float backdrop-blur data-[state=open]:animate-in sm:max-w-md",
                 s.cls,
