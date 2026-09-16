@@ -21,9 +21,10 @@
 | 阶段 B 验证门（typecheck / 模块 vitest / after 图） | ✅ 复跑全绿 | ✅ 复跑全绿（含 test:browser T30） | ✅ 复跑全绿；`check:tutorials` 在核对态 `c034f05d7` 上红（集成漂移，非本条引入），已由 q-1076 → A 处置并在新 integration HEAD `b249317f4` 转绿（§5-①） |
 | 集成后回归 | 无 | 无 | 无 |
 
-**❌ / ⚠ 共 3 项**（§5）：① `check:tutorials` 在 `c034f05d7` 上红 → **已处置**（q-1076 → A：`29a277b25` / `b249317f4`，新 HEAD 绿，QA 复跑取证；
-t-1046 tut-sync-2 补写 agents/chat-basics 正文并抬版后恢复 `data-product-feature`）；② landing L-11 遗留理由失效（可做了，文件由 t-895 持锁 →
-**已移交 t-895，持锁方与指挥官均已同意，验收时追**）；③ media M-23 修复记录与代码不符（性能半条未做 → 文档已勘误 + 移交 t-895）。
+**⚠ 共 3 项，均已处置 / 有去向**（§5）：① `check:tutorials` 在复核基线 `c034f05d7` 上红 → ⚠ **已处置**（q-1076 → A，集成③ t-631 后续提交
+`29a277b25` / `b249317f4`；QA 在 `b249317f4` 复跑取证绿；t-1046 tut-sync-2 补写 agents/chat-basics 正文并抬版后恢复 `data-product-feature`，不是转绿前置）；
+② landing L-11 遗留理由失效（可做了，文件由 t-895 持锁 → **已移交 t-895 在其分支以附录 commit 落地，integ4 合入时追**）；
+③ media M-23 修复记录与代码不符（性能半条未做 → 文档已勘误 + **已移交 t-895 附录 commit，integ4 合入时追**）。
 **本轮代码改动 0 处**：三处唯一能动手的地方（`AuthGate.tsx` / `ImageAnnotationEditor.tsx`）此刻都由 t-895 a11y-B 持写锁在改，
 按任务书边界「不碰 a11y-B 正在改的文件」只做移交；文档改动 3 个（本文 + `landing.md` §7.1 一行备注 + `media.md` M-23 行勘误与遗留补记）。
 
@@ -190,7 +191,7 @@ t-1046 tut-sync-2 补写 agents/chat-basics 正文并抬版后恢复 `data-produ
   `App.test.tsx:446/478` → `queryByLabelText('邮箱')`。
 - **为什么不在本轮修**：`AuthGate.tsx` 此刻由 t-895 a11y-B（landing 在其范围内）持写锁「接手前任未提交改动」，任务书边界「不碰 a11y-B 正在改的文件」；
   在自己分支改同一文件只会给 integ4 制造冲突。`landing.md` §7.1 已备注。
-- **登记**：**已移交 t-895**（持锁方同意接手，指挥官确认属 landing a11y 范围）；**验收 t-895 时追**这三处（`AuthGate.tsx` 占位符、
+- **登记**：**已移交 t-895 附录 commit**（持锁方同意接手，指挥官确认属 landing a11y 范围，在 t-895 分支以附录 commit 落地）；**integ4 合入时追**这三处（`AuthGate.tsx` 占位符、
   `AuthGate.test.tsx` 查询、`App.test.tsx:446/478` 否定断言）是否一并落地。
 
 ### ③ media M-23「hasSelection 改为 selectionDirty」—— ❌ 修复记录与代码不符（P3 性能半条未做）→ 文档勘误 + 移交
@@ -200,7 +201,8 @@ t-1046 tut-sync-2 补写 agents/chat-basics 正文并抬版后恢复 `data-produ
   `:93-96 hasSelection` 每次对整张 mask `getImageData` 全量扫描；`rg selectionDirty` 0 命中；提交 `2d75dbb45` 的说明也只列了 textarea 自增高。
   M-23 的 textarea 半条与用例属实。用户可感知影响：低端手机上每一笔抬手扫 ≤2.5M 像素（阶段 A 原判 P3）。
 - **处置**：`media.md` M-23 行改为「◐（QA 勘误）」并在 §8 遗留补一行；改法（`useState` + 非 erase 笔直接置 true、erase / restore 后各扫一次、clear 置 false）
-  已 `send_to` 持锁方 t-895。**不阻塞验收**（P3、且不是回归），但归档汇总时 media 的「修复 25 / 遗留 2」应按「修复 24 + 部分 1 / 遗留 3」计。
+  已 `send_to` 持锁方 t-895，**指挥官已让 t-895 在其分支以附录 commit 落地，integ4 合入时追**。**不阻塞验收**（P3、且不是回归），
+  但归档汇总时 media 的「修复 25 / 遗留 2」应按「修复 24 + 部分 1 / 遗留 3」计（t-895 附录落地后再回到 25 / 2）。
 - **为什么不在本轮修**：`ImageAnnotationEditor.tsx` 同样由 t-895 持写锁（`check_paths` 硬证据）。
 
 ## 6. NOT RUN 与理由
