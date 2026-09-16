@@ -1,11 +1,38 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { api, ApiError } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import {
+  clearPublishDraft,
+  loadPublishDraft,
+  publishDraftStorageKey,
+  savePublishDraft,
+} from "../../lib/marketplace";
 import type { AuthSession } from "../../lib/types";
 import { friendlyRiskFlags } from "./riskFlags";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  localStorage.clear();
+});
+
+test("发布草稿落盘:按 kind 分键,读回时在空表单上覆盖已存字段,数组 / 坏 JSON / 缺键都按无草稿处理", () => {
+  const create = () => ({ name: "", version: "1.0.0", tags: [] as string[] });
+  const key = publishDraftStorageKey("skill");
+  expect(key).not.toBe(publishDraftStorageKey("agent"));
+
+  expect(loadPublishDraft(key, create)).toBeNull();
+  savePublishDraft(key, { name: "学术翻译", extra: "旧字段" });
+  // 已存字段覆盖、缺失字段补默认、多余字段丢弃(表单结构演进时旧草稿不读崩)。
+  expect(loadPublishDraft(key, create)).toEqual({ name: "学术翻译", version: "1.0.0", tags: [] });
+
+  localStorage.setItem(key, "[]");
+  expect(loadPublishDraft(key, create)).toBeNull();
+  localStorage.setItem(key, "{not json");
+  expect(loadPublishDraft(key, create)).toBeNull();
+
+  savePublishDraft(key, create());
+  clearPublishDraft(key);
+  expect(localStorage.getItem(key)).toBeNull();
 });
 
 function session(): AuthSession {

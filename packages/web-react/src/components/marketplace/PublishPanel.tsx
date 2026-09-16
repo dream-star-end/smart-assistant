@@ -9,7 +9,11 @@ import {
   USE_CASE_MAX_LEN,
   USE_CASE_MIN_LEN,
   USE_CASES_MAX,
+  clearPublishDraft,
+  loadPublishDraft,
   marketplaceArtifactKind,
+  publishDraftStorageKey,
+  savePublishDraft,
   suggestSlug,
   validateHumanMeta,
 } from "../../lib/marketplace";
@@ -502,15 +506,24 @@ type DraftApi<T extends object> = {
    * 写入方(技能导入)用:它不碰商品信息,就不该因为用户填了分类而问一句废话。
    */
   isDirty: (keys?: readonly (keyof T & string)[]) => boolean;
+  /** 本次挂载是从 localStorage 恢复的草稿（用户没在这一轮里写过）——表单顶部据此给一条「已恢复」提示。 */
+  restored: boolean;
 };
+
+/** 草稿落盘的防抖间隔：敲字不必每键写一次 localStorage。 */
+const DRAFT_PERSIST_MS = 300;
 
 function useDraft<T extends object>(
   create: () => T,
   interactionFlags: readonly (keyof T & string)[] = NO_INTERACTION_FLAGS,
+  /** 传入即启用落盘（K-01）：挂载时读回、写入时防抖存、reset / 清空后删除。 */
+  persistKey?: string,
 ): DraftApi<T> {
-  const [state, setState] = useState<{ value: T; baseline: T }>(() => {
+  const [state, setState] = useState<{ value: T; baseline: T; restored: boolean }>(() => {
     const v = create();
-    return { value: v, baseline: v };
+    const stored = persistKey ? loadPublishDraft(persistKey, create) : null;
+    // 恢复的内容相对空表单基线就是"脏"的：关弹窗时会提示已暂存，覆盖写前会二次确认。
+    return stored ? { value: stored, baseline: v, restored: true } : { value: v, baseline: v, restored: false };
   });
   const createRef = useRef(create);
   createRef.current = create;
@@ -524,13 +537,13 @@ function useDraft<T extends object>(
   const seed = useCallback((patch: Partial<T> | ((cur: T) => Partial<T>)) => {
     setState((s) => {
       const p = typeof patch === "function" ? patch(s.value) : patch;
-      return { value: { ...s.value, ...p }, baseline: { ...s.baseline, ...p } };
+      return { ...s, value: { ...s.value, ...p }, baseline: { ...s.baseline, ...p } };
     });
   }, []);
   const reset = useCallback(() => {
     setState(() => {
       const v = createRef.current();
-      return { value: v, baseline: v };
+      return { value: v, baseline: v, restored: false };
     });
   }, []);
 
@@ -552,9 +565,20 @@ function useDraft<T extends object>(
     [changed],
   );
 
+  // 落盘：有内容就防抖写一份，写空了 / reset 后删掉 —— 存储里永远只有"值得恢复"的草稿。
+  const dirty = changed.size > 0;
+  useEffect(() => {
+    if (!persistKey) return;
+    const t = window.setTimeout(() => {
+      if (dirty) savePublishDraft(persistKey, state.value);
+      else clearPublishDraft(persistKey);
+    }, DRAFT_PERSIST_MS);
+    return () => window.clearTimeout(t);
+  }, [persistKey, dirty, state.value]);
+
   return useMemo(
-    () => ({ value: state.value, set, seed, reset, isDirty }),
-    [state.value, set, seed, reset, isDirty],
+    () => ({ value: state.value, set, seed, reset, isDirty, restored: state.restored }),
+    [state.value, state.restored, set, seed, reset, isDirty],
   );
 }
 
@@ -592,6 +616,7 @@ export function PublishPanel({
   publishesError = null,
   onRefreshPublishes = () => {},
   onMutePublishTransition = () => {},
+  onDirtyChange,
 }: {
   auth: AuthSession;
   /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
@@ -602,11 +627,19 @@ export function PublishPanel({
   publishesError?: string | null;
   onRefreshPublishes?: () => void;
   onMutePublishTransition?: (versionId: string, muted: boolean) => void;
+  /** 三份草稿任一有未提交内容时为 true —— 市场壳据此在关弹窗时提示「草稿已暂存」。 */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [kind, setKind] = useState<PublishKind>("skill");
-  const skill = useDraft(emptySkillDraft, INTERACTION_FLAGS);
-  const agent = useDraft(emptyAgentDraft, INTERACTION_FLAGS);
-  const connector = useDraft(emptyConnectorDraft);
+  // 草稿按类型各落一份 localStorage（K-01）：关弹窗 / 刷新 / 换中心都不丢，下次打开原样恢复。
+  const skill = useDraft(emptySkillDraft, INTERACTION_FLAGS, publishDraftStorageKey("skill"));
+  const agent = useDraft(emptyAgentDraft, INTERACTION_FLAGS, publishDraftStorageKey("agent"));
+  const connector = useDraft(emptyConnectorDraft, NO_INTERACTION_FLAGS, publishDraftStorageKey("connector"));
+  const anyDirty = skill.isDirty() || agent.isDirty() || connector.isDirty();
+  useEffect(() => {
+    onDirtyChange?.(anyDirty);
+  }, [anyDirty, onDirtyChange]);
+  const current = kind === "skill" ? skill : kind === "agent" ? agent : connector;
   // null = 跟随"有待办自动展开";true/false = 用户或完成态显式指定过。
   const [publishesOpen, setPublishesOpen] = useState<boolean | null>(null);
   const [refill, setRefill] = useState<RefillNotice | null>(null);
@@ -735,6 +768,20 @@ export function PublishPanel({
         aria-labelledby={`publish-kind-tab-${kind}`}
         className="flex flex-col gap-4"
       >
+        {current.restored && current.isDirty() && (
+          <Alert
+            tone="info"
+            density="compact"
+            title="已恢复上次未提交的草稿"
+            action={
+              <Button size="sm" variant="secondary" onClick={() => current.reset()}>
+                丢弃草稿
+              </Button>
+            }
+          >
+            这是你上次没提交就离开时填的内容，可以接着改；不需要就丢弃，重新开始。
+          </Alert>
+        )}
         {refill && refill.kind === kind && (
           <Alert
             tone="warning"

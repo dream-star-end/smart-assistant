@@ -37,6 +37,51 @@ import { PublishPanel } from "./PublishPanel";
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  localStorage.clear();
+});
+
+test("草稿落盘:填写后写入 localStorage,重新挂载原样恢复并给「已恢复」提示,丢弃后清空(K-01)", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  const onDirtyChange = vi.fn();
+
+  const { unmount } = render(<PublishPanel auth={auth} onDirtyChange={onDirtyChange} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  fireEvent.change(screen.getByPlaceholderText("例：学术翻译"), { target: { value: "学术翻译" } });
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  await waitFor(() =>
+    expect(localStorage.getItem("oc_v5_market_publish_draft:skill") ?? "").toContain("学术翻译"),
+  );
+  unmount();
+
+  // 重新挂载(= 关掉市场再打开):内容原样回来,顶部给「已恢复」提示。
+  render(<PublishPanel auth={auth} onDirtyChange={onDirtyChange} />);
+  expect(await screen.findByDisplayValue("学术翻译")).toBeInTheDocument();
+  expect(screen.getByText("已恢复上次未提交的草稿")).toBeInTheDocument();
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "丢弃草稿" }));
+  expect(screen.queryByText("已恢复上次未提交的草稿")).not.toBeInTheDocument();
+  expect((screen.getByPlaceholderText("例：学术翻译") as HTMLInputElement).value).toBe("");
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  await waitFor(() => expect(localStorage.getItem("oc_v5_market_publish_draft:skill")).toBeNull());
+});
+
+test("存储里的旧草稿缺字段 / 不是对象时不会读崩,按空表单起步", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue({ models: [], lockedModels: [] });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  localStorage.setItem("oc_v5_market_publish_draft:skill", JSON.stringify({ name: "只有名字" }));
+  localStorage.setItem("oc_v5_market_publish_draft:agent", "[]");
+
+  render(<PublishPanel auth={auth} />);
+  expect(await screen.findByDisplayValue("只有名字")).toBeInTheDocument();
+  // 缺失字段补默认值:版本号仍是 1.0.0,不是 undefined。
+  expect(screen.getByPlaceholderText("1.0.0")).toHaveValue("1.0.0");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  expect(screen.queryByText("已恢复上次未提交的草稿")).not.toBeInTheDocument();
 });
 
 beforeEach(() => {

@@ -13,7 +13,7 @@ import {
   useMarketplacePublishes,
 } from './marketplace/useMarketplacePublishes'
 import { useMarketplaceRevision } from './marketplace/useMarketplaceRevision'
-import { Alert, Badge, Button, EmptyState, IconButton, Tabs } from './ui'
+import { Alert, Badge, Button, EmptyState, IconButton, Tabs, useToast } from './ui'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
 /** Legacy navigation/storage kind. Connector rows remain wire-compatible in PR1. */
@@ -80,6 +80,14 @@ export function MarketplaceCenter({
   const [browseFocus, setBrowseFocus] = useState<{ slug: string; nonce: number } | null>(null)
   const [publishNotices, setPublishNotices] = useState<MarketplacePublishTransition[]>([])
   const publishNotice = publishNotices[0] ?? null
+  // 发布表单有未提交内容时关弹窗（Esc / 点遮罩 / ✕ / 切中心）：草稿已由 PublishPanel 落盘，
+  // 这里只补一句"已暂存、下次接着填"，不拦截关闭（K-01）。
+  const [publishDirty, setPublishDirty] = useState(false)
+  const toast = useToast()
+  const requestClose = () => {
+    if (publishDirty) toast('发布草稿已暂存，下次打开「发布」可以接着填', 'info')
+    onClose()
+  }
 
   const onPublishTransition = useCallback((transition: MarketplacePublishTransition) => {
     setBrowseRevision((revision) => revision + 1)
@@ -124,7 +132,7 @@ export function MarketplaceCenter({
   const noticeApproved = publishNotice?.publish.status === 'approved'
 
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
+    <Dialog.Root open={open} onOpenChange={(o) => !o && requestClose()}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
@@ -261,6 +269,7 @@ export function MarketplaceCenter({
                       publishesError={publishes.error}
                       onRefreshPublishes={publishes.refresh}
                       onMutePublishTransition={publishes.muteTransition}
+                      onDirtyChange={setPublishDirty}
                     />
                   </div>
                 )}
