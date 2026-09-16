@@ -3,6 +3,9 @@ import {
   benchmarkBadgeLabel,
   benchmarkSuspect,
   bundleHasEvals,
+  connectorActionEffectLabel,
+  connectorActionLabel,
+  connectorAuthModeLabel,
   formatInstallCount,
   groupCardsByCategory,
   marketAskAiPrefill,
@@ -255,5 +258,35 @@ describe('sortFeaturedListings (精选管理排序单一权威)', () => {
     expect(out.map((c) => c.slug)).toEqual(['a', 'b'])
     // 纯函数:不改入参顺序
     expect(input.map((c) => c.slug)).toEqual(['b', 'a'])
+  })
+})
+
+describe('API 插件契约的人向文案 (K-19)', () => {
+  it('authMode 七种后端枚举 + managed_browser / none 都有中文;未知值原样返回不猜', () => {
+    expect(connectorAuthModeLabel('static-token')).toBe('API 密钥（静态令牌）')
+    expect(connectorAuthModeLabel('oauth2-auth-code')).toBe('OAuth 授权登录')
+    expect(connectorAuthModeLabel('token-exchange')).toBe('平台令牌交换')
+    expect(connectorAuthModeLabel('hmac-signing')).toBe('请求签名（HMAC）')
+    expect(connectorAuthModeLabel('oauth1a')).toBe('OAuth 1.0a 授权')
+    expect(connectorAuthModeLabel('imap-smtp')).toBe('邮箱账号密码（IMAP / SMTP）')
+    expect(connectorAuthModeLabel('webdav-basic')).toBe('WebDAV 账号密码')
+    expect(connectorAuthModeLabel('managed_browser')).toBe('平台托管浏览器登录态')
+    expect(connectorAuthModeLabel('none')).toBe('无需认证')
+    expect(connectorAuthModeLabel('saml-future')).toBe('saml-future')
+  })
+
+  it('动作 id 从机器名整理成短语:蛇形 / 驼峰 / 点号都拆开,整理为空时退回原 id', () => {
+    expect(connectorActionLabel('create_post')).toBe('create post')
+    expect(connectorActionLabel('createFollowUp')).toBe('create follow up')
+    expect(connectorActionLabel('pages.search')).toBe('pages search')
+    expect(connectorActionLabel('get-database-rows')).toBe('get database rows')
+    expect(connectorActionLabel('___')).toBe('___')
+  })
+
+  it('effect 只认 read / send,其余一律按最保守的「写入」', () => {
+    expect(connectorActionEffectLabel('read')).toBe('读取')
+    expect(connectorActionEffectLabel('send')).toBe('发送')
+    expect(connectorActionEffectLabel('write')).toBe('写入')
+    expect(connectorActionEffectLabel('delete')).toBe('写入')
   })
 })

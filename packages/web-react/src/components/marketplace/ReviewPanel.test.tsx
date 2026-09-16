@@ -271,3 +271,57 @@ test("折叠态不落悬空 aria-controls:待审详情与 AI 记录都是展开�
   );
   expectAriaControlsResolvable();
 });
+
+test("kill-switch 分区窄屏默认折叠成一行,「展开」才露出输入;sm 起不受影响;slug 输入不再是裸词占位(K-13)", async () => {
+  adminMarketplacePending.mockResolvedValue([]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText(/紧急下架已上架条目/);
+
+  const toggle = screen.getByRole("button", { name: "展开" });
+  // 切换按钮只在窄屏出现(sm:hidden);正文在窄屏默认隐藏(max-sm:hidden),桌面端照常展开
+  expect(toggle).toHaveClass("sm:hidden");
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  const body = document.getElementById(toggle.getAttribute("aria-controls") ?? "");
+  expect(body).not.toBeNull();
+  expect(body).toHaveClass("max-sm:hidden");
+  expectAriaControlsResolvable();
+
+  fireEvent.click(toggle);
+  expect(screen.getByRole("button", { name: "收起" })).toHaveAttribute("aria-expanded", "true");
+  expect(body).not.toHaveClass("max-sm:hidden");
+  // placeholder 从裸词「slug」改成说人话的示例
+  expect(screen.getByLabelText("要下架的条目 slug")).toHaveAttribute(
+    "placeholder",
+    "要下架的条目 slug，如 ppt-master",
+  );
+});
+
+test("「带 evals」「自报增益存疑」的解释不再只挂 title:展开审查区第一行明文可见(K-14)", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({
+      versionId: "1",
+      name: "带评测技能",
+      rawBundle: { "evals/evals.json": '{"version":1,"cases":[]}' },
+      benchmark: { withPassRate: 0.4, withoutPassRate: 0.5, cases: 3 },
+    }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText("带评测技能");
+
+  expect(screen.getByText("带 evals")).not.toHaveAttribute("title");
+  expect(screen.getByText("自报增益存疑")).not.toHaveAttribute("title");
+  // 收起时解释不在正文里(徽章行只放信号)
+  expect(screen.queryByText(/附带 evals\/ 评测用例/)).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("带评测技能"));
+  expect(await screen.findByText("附带 evals/ 评测用例（发布者提供，未复跑验证）")).toBeInTheDocument();
+  expect(
+    screen.getByText("自报实测 50%→40%（3 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证"),
+  ).toBeInTheDocument();
+});

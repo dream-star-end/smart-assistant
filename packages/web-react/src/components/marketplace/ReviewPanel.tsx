@@ -1,6 +1,6 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import { Check, ChevronRight, FlaskConical, Inbox, ShieldX, Sparkles, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { benchmarkSuspect, bundleHasEvals } from "../../lib/marketplace";
 import type {
@@ -24,11 +24,21 @@ import {
   Panel,
   Textarea,
   TimeAgo,
+  Tooltip,
   useConfirm,
   usePrompt,
   useToast,
 } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
+
+/**
+ * 「带 evals」「自报增益存疑」两枚徽章的解释(K-14)。此前只挂在原生 title 上:触屏永远看不到、
+ * 读屏多数不读。现在 hover 走 Tooltip,展开审查区第一行再明文写一遍 —— 审核员在手机上也拿得到。
+ */
+const EVALS_HINT = "附带 evals/ 评测用例（发布者提供，未复跑验证）";
+function benchmarkSuspectHint(b: { withPassRate: number; withoutPassRate: number; cases: number }) {
+  return `自报实测 ${Math.round(b.withoutPassRate * 100)}%→${Math.round(b.withPassRate * 100)}%（${b.cases} 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证`;
+}
 
 /** 人向元数据是否缺失(存量/平台 seed 行没有 category 或 useCases)。 */
 function humanMetaMissing(r: MarketplacePending): boolean {
@@ -421,6 +431,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 const rejecting = busy === `reject:${r.versionId}`;
                 const otherBusy = busy !== null && !approving && !rejecting;
                 const waited = waitedDays(r.createdAt);
+                const hasEvals = bundleHasEvals(r.rawBundle);
+                const suspect = benchmarkSuspect(r.benchmark);
                 // 连接器的批准前置条件:真实功能验收在展开区,未勾选前"批准"不可点。
                 const needsReview = r.kind === "connector" && !connectorVerified.has(r.versionId);
                 return (
@@ -474,25 +486,22 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             {waited >= 1 && <Badge tone="warning">等待 {waited} 天</Badge>}
                             {/* 存量/平台 seed 行缺人向元数据 → 缺陷提示(非阻断,仅提示补齐)。 */}
                             {humanMetaMissing(r) && <Badge tone="warning">人向元数据缺失</Badge>}
-                            {/* 供给凸显:附带 evals/ 评测用例 → 正向信号(鼓励供给,不做质量背书)。 */}
-                            {bundleHasEvals(r.rawBundle) && (
-                              <Badge
-                                tone="info"
-                                title="附带 evals/ 评测用例（发布者提供，未复跑验证）"
-                              >
-                                <FlaskConical size={11} />带 evals
-                              </Badge>
+                            {/* 供给凸显:附带 evals/ 评测用例 → 正向信号(鼓励供给,不做质量背书)。
+                                解释走 Tooltip + 展开区明文,不再是 title-only(K-14)。 */}
+                            {hasEvals && (
+                              <Tooltip content={EVALS_HINT}>
+                                <Badge tone="info">
+                                  <FlaskConical size={11} />带 evals
+                                </Badge>
+                              </Tooltip>
                             )}
                             {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
                             {/* 自报评测黄牌:增益≤0 或通过率<50% 时提示人审留意;数据为发布者
                                 自报、未经平台验证,仅提示不阻断。无 benchmark 不渲染。 */}
-                            {benchmarkSuspect(r.benchmark) && r.benchmark && (
-                              <Badge
-                                tone="warning"
-                                title={`自报实测 ${Math.round(r.benchmark.withoutPassRate * 100)}%→${Math.round(r.benchmark.withPassRate * 100)}%（${r.benchmark.cases} 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证`}
-                              >
-                                自报增益存疑
-                              </Badge>
+                            {suspect && r.benchmark && (
+                              <Tooltip content={benchmarkSuspectHint(r.benchmark)}>
+                                <Badge tone="warning">自报增益存疑</Badge>
+                              </Tooltip>
                             )}
                           </div>
                           <p className="truncate text-meta text-muted">
@@ -559,6 +568,23 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                         id={`review-detail-${r.versionId}`}
                         className="border-t border-border px-3.5 py-3"
                       >
+                        {/* 行头徽章的解释在这里明文再写一遍(K-14):触屏 / 读屏用户也拿得到。 */}
+                        {(hasEvals || (suspect && r.benchmark)) && (
+                          <ul className="mb-2 flex flex-col gap-1 text-meta leading-relaxed text-muted">
+                            {hasEvals && (
+                              <li>
+                                <span className="font-medium text-fg">带 evals：</span>
+                                {EVALS_HINT}
+                              </li>
+                            )}
+                            {suspect && r.benchmark && (
+                              <li>
+                                <span className="font-medium text-fg">自报增益存疑：</span>
+                                {benchmarkSuspectHint(r.benchmark)}
+                              </li>
+                            )}
+                          </ul>
+                        )}
                         <p className="mb-2 text-body text-fg">{r.description}</p>
                         {/* 人向商品元数据:审核要点=分类名实相符、用例与正文一致、效果不夸大。 */}
                         <PendingHumanMeta r={r} />
@@ -805,6 +831,10 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
  * **本面板置顶** —— 它是这里最危险、也最需要在紧急情况下秒到的操作,不该排在
  * 30 条待审队列之后。slug 输入带已上架目录 datalist 提示(技能+智能体+连接器),
  * 确认框回显条目名防误下架。
+ *
+ * 窄屏默认只留标题行 + 「展开」(K-13):说明 + 两个输入 + 全宽红按钮在 390px 上占掉约 300px
+ * 首屏,管理员在手机上打开审核页第一眼是最危险的操作而不是待办。置顶的位置不变 —— 紧急时
+ * 仍是第一行,多一下点击;sm 起照旧全展开。
  */
 function RevokeBox({ auth }: { auth: AuthSession }) {
   const [slug, setSlug] = useState("");
@@ -813,6 +843,8 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   const [msg, setMsg] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
   const [catalog, setCatalog] = useState<MarketplaceCard[]>([]);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const bodyId = useId();
 
   // 拉一次已上架目录做 datalist(两类各拉一页;搜索目录本身有 500 上限,极端时仍可手输)。
   useEffect(() => {
@@ -863,44 +895,63 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   return (
     <div className="rounded-xl border border-danger/30 bg-danger-soft/40 p-3.5">
       {confirmDialogEl}
-      <div className="mb-1 flex items-center gap-1.5 text-body font-medium text-danger">
-        <ShieldX size={15} /> 紧急下架已上架条目（kill-switch）
-      </div>
-      <p className="mb-2 text-caption text-muted">
-        撤销一个已上架条目：所有已安装用户在下次会话同步时被移除。
-      </p>
-      {msg && (
-        <div className="mb-2">
-          <Alert tone={msg.tone} density="compact">
-            {msg.text}
-          </Alert>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-body font-medium text-danger">
+          <ShieldX size={15} /> 紧急下架已上架条目（kill-switch）
         </div>
-      )}
-      <div className="flex flex-col gap-2 md:flex-row">
-        <Input
-          value={slug}
-          onChange={(e) => setSlug(e.target.value)}
-          placeholder="slug"
-          aria-label="要下架的条目 slug"
-          list="revoke-slug-options"
-        />
-        <datalist id="revoke-slug-options">
-          {catalog.map((c) => (
-            <option key={c.slug} value={c.slug}>
-              {c.name}（{c.kind === "agent" ? "智能体" : c.kind === "connector" ? "API 插件" : "技能"}
-              ）
-            </option>
-          ))}
-        </datalist>
-        <Input
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-          placeholder="下架原因（可选）"
-          aria-label="下架原因"
-        />
-        <Button variant="danger" onClick={() => void revoke()} loading={busy} disabled={!slug.trim()}>
-          下架
+        <Button
+          variant="ghost"
+          size="sm"
+          className="sm:hidden"
+          aria-expanded={mobileOpen}
+          aria-controls={bodyId}
+          onClick={() => setMobileOpen((o) => !o)}
+        >
+          {mobileOpen ? "收起" : "展开"}
         </Button>
+      </div>
+      <div id={bodyId} className={cn("mt-1", !mobileOpen && "max-sm:hidden")}>
+        <p className="mb-2 text-caption text-muted">
+          撤销一个已上架条目：所有已安装用户在下次会话同步时被移除。
+        </p>
+        {msg && (
+          <div className="mb-2">
+            <Alert tone={msg.tone} density="compact">
+              {msg.text}
+            </Alert>
+          </div>
+        )}
+        <div className="flex flex-col gap-2 md:flex-row">
+          <Input
+            value={slug}
+            onChange={(e) => setSlug(e.target.value)}
+            placeholder="要下架的条目 slug，如 ppt-master"
+            aria-label="要下架的条目 slug"
+            list="revoke-slug-options"
+          />
+          <datalist id="revoke-slug-options">
+            {catalog.map((c) => (
+              <option key={c.slug} value={c.slug}>
+                {c.name}（
+                {c.kind === "agent" ? "智能体" : c.kind === "connector" ? "API 插件" : "技能"}）
+              </option>
+            ))}
+          </datalist>
+          <Input
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="下架原因（可选）"
+            aria-label="下架原因"
+          />
+          <Button
+            variant="danger"
+            onClick={() => void revoke()}
+            loading={busy}
+            disabled={!slug.trim()}
+          >
+            下架
+          </Button>
+        </div>
       </div>
     </div>
   );
