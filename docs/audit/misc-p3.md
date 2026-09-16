@@ -60,8 +60,8 @@
 
 | 提交 | 内容 | 覆盖 |
 |---|---|---|
-| （见 complete_task 交付） `feat(v5): optionsGroup …` | `optionsGroup.tsx`：Snapshot.grouped / `isOptionsGrouped`、页脚 Button 原语 + live region + 文案；`RichBlocks.tsx`：注册 `useLayoutEffect`、`grouped` 读快照、点击时刻读 store；`MarkdownImpl.tsx`：`components` `useMemo` + `liveRef`；新增 `optionsGroup.test.tsx` 10 例 | OG-01 OG-02 OG-03 OG-04 OG-06 OG-07 |
-| `feat(v5): demo …` | `lib/demo.ts`：`demoReply` 模型名同源、`messageCount` 对齐 fixture、`createdAt`、`DEMO_MESSAGES_BY_SESSION` / `DEMO_DEFAULT_MODEL_NAME`；`Message.tsx`：`live` 透传、流式三点 `<output>`；新增 `demo.test.ts` 4 例；`scenes-misc-p3.tsx` 7 场景 | D-01 D-02 D-03 D-05 D-06 |
+| `5ce25612b` `feat(v5): optionsGroup 多题聚合 · 首帧点选不再隐式发送、流式结束点选不丢、页脚文案与可达性` | `optionsGroup.tsx`：Snapshot.grouped / `isOptionsGrouped`、页脚 Button 原语 + live region + 文案；`RichBlocks.tsx`：注册 `useLayoutEffect`、`grouped` 读快照、点击时刻读 store；`MarkdownImpl.tsx`：`components` `useMemo` + `liveRef`；新增 `optionsGroup.test.tsx` 10 例 | OG-01 OG-02 OG-03 OG-04 OG-06 OG-07 |
+| `592ffcff5` `feat(v5): demo 演示模式 fixture 自洽与流式可达性 + 杂项 P3 审计场景` | `lib/demo.ts`：`demoReply` 模型名同源、`messageCount` 对齐 fixture、`createdAt`、`DEMO_MESSAGES_BY_SESSION` / `DEMO_DEFAULT_MODEL_NAME`；`Message.tsx`：`live` 透传、流式三点 `<output>`；新增 `demo.test.ts` 4 例；`scenes-misc-p3.tsx` 7 场景 | D-01 D-02 D-03 D-05 D-06 |
 
 计划外：无。`MarkdownImpl` 记忆化顺带让 HtmlPreview 在流式结束时不再重建 iframe（既有 `HtmlPreview streaming throttle` 用例全绿）。
 
