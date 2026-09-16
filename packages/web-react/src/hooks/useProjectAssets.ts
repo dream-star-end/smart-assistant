@@ -33,11 +33,16 @@ export type UseProjectAssetsOptions = {
   }) => Promise<boolean | "alt">;
 };
 
+/** 批量上传进度：`done` 为已处理（成功或失败）的文件数，`total` 为本批总数（PA-03）。 */
+export type UploadProgress = { done: number; total: number };
+
 export type UseProjectAssets = {
   assets: ProjectAsset[];
   loading: boolean;
   error: string | null;
   uploading: boolean;
+  /** 上传中按文件推进；空闲时为 null。多文件顺序上传此前只有一行「正在上传…」，无法判断进度（PA-03）。 */
+  uploadProgress: UploadProgress | null;
   reload: () => void;
   uploadFiles: (files: File[]) => Promise<void>;
   setPinned: (id: string, pinned: boolean) => Promise<void>;
@@ -59,6 +64,7 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
@@ -103,7 +109,9 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
       const list = Array.from(files).filter((f) => f && f.size >= 0 && f.name);
       if (list.length === 0) return;
       setUploading(true);
+      setUploadProgress({ done: 0, total: list.length });
       const pid = cbRef.current.projectId;
+      let done = 0;
       for (const file of list) {
         try {
           if (demo) {
@@ -141,9 +149,13 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
         } catch (e) {
           console.warn("createProjectAsset failed", e);
           toast(apiErrorMessage(e, `「${file.name}」上传失败`), "error");
+        } finally {
+          done += 1;
+          setUploadProgress({ done, total: list.length });
         }
       }
       setUploading(false);
+      setUploadProgress(null);
     },
     [demo, toast],
   );
@@ -230,6 +242,7 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
     loading,
     error,
     uploading,
+    uploadProgress,
     reload,
     uploadFiles,
     setPinned,

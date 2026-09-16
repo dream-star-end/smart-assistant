@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, MarketplaceMyAgent, SkillDetail } from "../../lib/types";
+import { TooltipProvider } from "../ui";
 import { SkillEditor } from "./SkillEditor";
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
@@ -259,7 +260,7 @@ describe("技能工作台保存竞态(请求在途继续编辑)", () => {
     await settleSave();
     expect(screen.getByDisplayValue("服务端 v5")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("服务端 v4")).not.toBeInTheDocument();
-    expect(screen.getByText(/正文\(v5;/)).toBeInTheDocument();
+    expect(screen.getByText(/正文（v5；/)).toBeInTheDocument();
   });
 
   test("保存期间没再动过的路径照常清干净(不因为加了快照校验就永远脏)", async () => {
@@ -283,9 +284,9 @@ describe("技能工作台关闭拦截", () => {
 
     // 标题栏 X 与 footer「关闭」同名,取 DOM 中先出现的 X —— 走的是 Radix 的关闭路径。
     fireEvent.click(screen.getAllByRole("button", { name: "关闭" })[0]);
-    expect(await screen.findByText("放弃未保存的修改?")).toBeInTheDocument();
+    expect(await screen.findByText("放弃未保存的修改？")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
-    await waitFor(() => expect(screen.queryByText("放弃未保存的修改?")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("放弃未保存的修改？")).not.toBeInTheDocument());
     expect(onClose).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getAllByRole("button", { name: "关闭" })[0]);
@@ -298,18 +299,51 @@ describe("技能工作台关闭拦截", () => {
     await screen.findByDisplayValue("原始正文");
     fireEvent.click(screen.getAllByRole("button", { name: "关闭" })[0]);
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-    expect(screen.queryByText("放弃未保存的修改?")).not.toBeInTheDocument();
+    expect(screen.queryByText("放弃未保存的修改？")).not.toBeInTheDocument();
   });
 });
 
 describe("技能工作台只读态与触屏可达性", () => {
   test("只读技能:给出「为什么不能改 + 下一步」的说明,不给保存按钮与训练页签", async () => {
     mount({ ...DETAIL, name: "市场技能", writable: false, layer: "hub" });
-    expect(await screen.findByText(/内容由作者维护,不可编辑/)).toBeInTheDocument();
+    expect(await screen.findByText(/内容由作者维护，不可编辑/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^保存/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "训练优化" })).not.toBeInTheDocument();
     // 只读技能仍可评测。
     expect(screen.getByRole("tab", { name: "评测" })).toBeInTheDocument();
+  });
+
+  test("只读技能的正文 / 辅助文件以可聚焦的只读文本呈现,不再是 50% 透明的 disabled 控件", async () => {
+    mount({ ...DETAIL, name: "市场技能", writable: false, layer: "hub" });
+    // 正文:没有任何 textbox(disabled 控件不可聚焦、不可选中复制),换成带可访问名的滚动区。
+    const body = await screen.findByRole("region", { name: /^正文/ });
+    expect(body).toHaveAttribute("tabindex", "0");
+    expect(body).toHaveTextContent("原始正文");
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByText("写作")).toBeInTheDocument();
+
+    // 辅助文件同款。
+    await pickAux(/^a\.md/);
+    const file = await screen.findByRole("region", { name: "references/a.md" });
+    expect(file).toHaveTextContent("references/a.md 服务端内容");
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  test("标题用列表同款展示名,历史页签计数在打开时就带上", async () => {
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({
+      history: [{ version: "2", timestamp: new Date().toISOString() }],
+      writable: true,
+    });
+    vi.spyOn(api, "getSkill").mockResolvedValue(DETAIL);
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    // 历史页签常驻 DOM（hidden）,有历史条目时其 TimeAgo 需要 TooltipProvider 祖先（与 main.tsx 一致）。
+    render(
+      <TooltipProvider>
+        <SkillEditor auth={auth} skillName="写作助手" displayTitle="帮你把草稿改成成稿" open onClose={() => {}} onChanged={() => {}} />
+      </TooltipProvider>,
+    );
+    expect(await screen.findByText("技能工作台 · 帮你把草稿改成成稿")).toBeInTheDocument();
+    expect(await screen.findByRole("tab", { name: "历史（1）" })).toBeInTheDocument();
   });
 
   test("辅助文件删除按钮常驻 DOM(不再靠 hover 才出现 → 触屏可达)", async () => {

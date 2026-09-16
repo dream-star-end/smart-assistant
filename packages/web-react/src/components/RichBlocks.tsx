@@ -236,7 +236,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
               disabled={!interactive || blockedByBusy}
               onClick={() => choose(i)}
               className={
-                "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring " +
+                "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 " +
                 (chosen
                   ? "border-accent bg-accent-soft"
                   : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
@@ -274,6 +274,10 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
         <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
       {!readOnly && !sendUserText && <p className="px-1 text-caption text-faint">(此会话中不可交互)</p>}
+      {/* 新回合进行中历史选项卡不可点:说明原因,而不是只把选项压成 opacity-80 让人干等。 */}
+      {interactive && blockedByBusy && (
+        <output className="block px-1 text-caption text-faint">等待当前回合结束后可选择</output>
+      )}
     </div>
     {parsed.trailing ? (
       <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
@@ -391,7 +395,7 @@ export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
               onClick={() => setFull(true)}
               title="全屏放大"
               aria-label="全屏放大预览"
-              className="rounded-md p-1 text-muted outline-none hover:bg-accent-soft hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex items-center justify-center rounded-md p-1 text-muted outline-none hover:bg-accent-soft hover:text-accent focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
             >
               <Maximize2 size={13} />
             </button>
@@ -399,7 +403,7 @@ export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
           <button
             type="button"
             onClick={() => setShow((s) => !s)}
-            className="rounded-md px-2 py-0.5 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+            className="rounded-md px-2 py-0.5 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
           >
             {show ? "看源码" : "预览"}
           </button>

@@ -1,0 +1,15 @@
+{
+  // ui-preview 场景的独立类型检查(shell 审计 S-19)。
+  // 主 tsconfig 只 include src,预览台场景写错 prop 只能等 shoot.mjs 运行期报错。
+  // 刻意不把 browser-tests 塞进主 include:那会把 .mjs 驱动脚本、baselines/ 下的历史快照
+  // 与各 harness 一起拖进编译单元。范围先收在 ui-preview/**(各模块的场景文件都在这里)。
+  // 跑法:npx tsc -p tsconfig.browser-tests.json
+  // 接线到 `npm run typecheck` 需先清完各 owner 场景文件的存量错误(见 docs/audit/shell.md S-19)。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "composite": false
+  },
+  "include": ["src/vite-env.d.ts", "browser-tests/ui-preview/**/*.ts", "browser-tests/ui-preview/**/*.tsx"]
+}

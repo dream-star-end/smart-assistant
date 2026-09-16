@@ -56,6 +56,20 @@ export interface AlertProps
   onDismiss?: () => void;
   /** 请求 ID:等宽 + select-all,用户报障时一点即可整段复制,省掉"能否给下截图"的来回。 */
   requestId?: string;
+  /**
+   * 读屏播报级别。不传按 tone 推导:danger / warning → `role="alert"`(assertive,打断朗读);
+   * info / success → `role="status"`(polite,读完当前内容再播)。
+   *
+   * 为什么(shell 审计 S-07):原实现无条件 `role="alert"`,而 alert 隐含 aria-live=assertive ——
+   * 挂载即存在的静态说明(「容器已休眠…」)会被当成打断式播报;横幅栈一屏四条就是四次打断。
+   * `"off"` 给纯装饰性的静态说明(不参与 live region)。
+   */
+  live?: "assertive" | "polite" | "off";
+}
+
+/** tone → 默认播报级别。 */
+export function alertLiveFor(tone: AlertProps["tone"]): "assertive" | "polite" {
+  return tone === "danger" || tone === "warning" ? "assertive" : "polite";
 }
 
 export function Alert({
@@ -67,13 +81,16 @@ export function Alert({
   action,
   onDismiss,
   requestId,
+  live,
   children,
   ...props
 }: AlertProps) {
   const hasTrailing = Boolean(action || onDismiss);
+  const liveLevel = live ?? alertLiveFor(tone);
+  const role = liveLevel === "off" ? undefined : liveLevel === "assertive" ? "alert" : "status";
   return (
     <div
-      role="alert"
+      role={role}
       className={cn(
         alertVariants({ tone, density }),
         // 仅在有尾槽时才开启换行:无尾槽的存量调用渲染结果保持一字不差。

@@ -244,6 +244,66 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText("已送达")).toBeInTheDocument();
   });
 
+  // M-01:教程回放 / 后台会话查看器以 readOnly 挂载,此前每条用户消息仍出现可点的死「编辑」。
+  test("readOnly 列表:用户行不出「编辑」「引用」,助手行不出「引用」「重新生成」「反馈」", () => {
+    const cb: CardCallbacks = {
+      onEditResend: vi.fn(),
+      onQuote: vi.fn(),
+      onRegenerate: vi.fn(),
+      onFeedback: vi.fn(),
+    };
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "ro-u", text: "问题", status: "replied" }),
+          mk("assistant", { id: "ro-a", text: "回答" }),
+        ]}
+        sending={false}
+        cb={cb}
+        onRespondPermission={() => {}}
+        readOnly
+      />,
+    );
+    expect(screen.getByText("问题")).toBeInTheDocument();
+    for (const name of ["编辑", "引用", "重新生成", "反馈"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    // 复制仍可用(只读面不禁止留存内容)。
+    expect(screen.getAllByRole("button", { name: "复制" })).toHaveLength(2);
+  });
+
+  test("非只读列表:同一组回调下用户行有「编辑」、助手行有「重新生成」(对照)", () => {
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "rw-u", text: "问题", status: "replied" }),
+          mk("assistant", { id: "rw-a", text: "回答" }),
+        ]}
+        sending={false}
+        cb={{ onEditResend: vi.fn(), onRegenerate: vi.fn() }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "编辑" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
+  });
+
+  // M-05:footer(本轮活动指示 / 软提示 / 尾部骨架)嵌在 px-5 的列表根内又自带 px-5,比时间线多缩进 20px。
+  test("footer 与列表根共用一份内边距,不再双份 px-5", () => {
+    render(
+      <MessageList
+        messages={[mk("user", { id: "pad-u", text: "问题" })]}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const footer = screen.getByTestId("timeline-footer");
+    expect(footer).not.toHaveClass("px-5");
+    expect(footer.closest('[data-testid="timeline-short-list"]')).toHaveClass("px-5");
+    expect(screen.getByTestId("turn-activity-footer")).toBeInTheDocument();
+  });
+
   test("thinking：流式态使用稳定的「思考过程」标题并展开", () => {
     renderMsg(mk("thinking", { text: "推理中..." }), { isLast: true, sending: true });
     expect(screen.getByText("思考过程")).toBeInTheDocument();

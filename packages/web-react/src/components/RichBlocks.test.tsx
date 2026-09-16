@@ -1,3 +1,4 @@
+import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
@@ -114,6 +115,40 @@ describe("OptionsBlock", () => {
     );
     fireEvent.click(screen.getByText("灰度发布"));
     expect(sendUserText).not.toHaveBeenCalled();
+  });
+
+  // M-12:busy 下选项只被压成 opacity-80,用户不知道为什么点不动;触屏下选项/预览按钮不够 44px。
+  it("busy 时说明「等待当前回合结束后可选择」;非 busy / 已发送不出该提示", () => {
+    const sendUserText = vi.fn();
+    const { rerender } = render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("等待当前回合结束后可选择");
+    expect(screen.getByRole("button", { name: /灰度发布/ })).toHaveClass("[@media(hover:none)]:min-h-11");
+    rerender(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: false }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.queryByText("等待当前回合结束后可选择")).toBeNull();
+    fireEvent.click(screen.getByText("灰度发布"));
+    rerender(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    // 已发送(锁定)的卡不再需要解释 busy。
+    expect(screen.queryByText("等待当前回合结束后可选择")).toBeNull();
+  });
+});
+
+describe("HtmlPreview 触控尺寸(M-12)", () => {
+  it("头部「全屏放大」「看源码」在触屏下满足 44px", () => {
+    render(<HtmlPreview code="<div>hi</div>" />);
+    expect(screen.getByRole("button", { name: "全屏放大预览" })).toHaveClass("[@media(hover:none)]:size-11");
+    expect(screen.getByRole("button", { name: "看源码" })).toHaveClass("[@media(hover:none)]:min-h-11");
   });
 });
 

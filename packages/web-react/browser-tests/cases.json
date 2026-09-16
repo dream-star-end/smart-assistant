@@ -269,6 +269,10 @@
     {
       "id": "T67",
       "proves": "真 Chromium 中 local agent-group/问答卡越过所属 user 的坏序（stableSortByTs 仍为 g,q,u,a）经 repair/merge/incremental 自愈为 user 之后，m-recover owner 不贴到第一条 user，缺 owner user 不猜轮，server tape 相对序不变，下一 user 上界生效，连续 merge 幂等；毒序 MessageList 用户气泡在子任务前，修复序用户气泡在子任务后（INC-20260907-PROCESS-CARD-BEFORE-USER）"
+    },
+    {
+      "id": "T68",
+      "proves": "真 Chromium 390×844 触屏上下文((hover:none) 生效、production CSS)中,历史消息的动作行默认只露一个 ≥44px 的「更多操作」开关、整排动作按钮不可见(display:none,不只是透明);受信点击开关后整排展开、每个动作按钮 ≥44px、再点「收起操作」恢复折叠;末轮末条助手回复(可重新生成的那条)默认展开,复制类动作直接可点(messages 审计 M-03:触屏下每条消息常显整排 44px 图标、1 行正文配 3 行 chrome)"
     }
   ]
 }

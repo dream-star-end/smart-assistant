@@ -77,7 +77,9 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
     await page.waitForFunction(() => document.querySelector('[data-testid="cost-coverage-money"]')?.textContent?.includes('未记录'));
     assert.doesNotMatch(await money.textContent(), /\$0/);
     await page.getByTestId('board-settings-open').click();
-    const usageLine=page.getByText(/今天已跑/);
+    // taskboard-B 把护栏设置的用量行改成 DescriptionList(今天已执行 / 正在执行 / 今日花费),
+    // 来源文案不再是单行「今天已跑 …」;按用量块 testid 取整块,provenance 断言不变。
+    const usageLine=page.getByTestId('board-settings-usage');
     await usageLine.waitFor();
     assert.match(await usageLine.textContent(), /1 次有用量但无金额/);
     assert.doesNotMatch(await usageLine.textContent(), /\$0/);

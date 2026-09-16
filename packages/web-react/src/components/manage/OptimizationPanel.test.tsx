@@ -235,6 +235,38 @@ describe('OptimizationPanel 状态与历史', () => {
     expect(within(dialog).queryByRole('button', { name: '忽略' })).not.toBeInTheDocument()
     expect(within(dialog).getAllByRole('button', { name: '关闭' }).length).toBeGreaterThan(0)
   })
+
+  test('建议弹层副标题只放分类名，内部路径收进正文「作用对象」；hero 元信息用「批次」而非「审计分片」', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(
+      idleState({
+        lastSuccessAt: new Date(Date.now() - 3 * 60_000).toISOString(),
+        proposals: [proposal({ targetId: 'memory/xhs-muying-account.md' })],
+      }),
+    )
+    renderPanel()
+    expect(await screen.findByText('5 个批次')).toBeInTheDocument()
+    expect(screen.queryByText(/审计分片/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /合并重复的项目记忆/ }))
+    const dialog = await screen.findByRole('dialog')
+    // 副标题（dialog description）不再拼 targetId。
+    const describedBy = dialog.getAttribute('aria-describedby')
+    const description = describedBy ? document.getElementById(describedBy) : null
+    expect(description?.textContent).toBe('记忆')
+    expect(description?.textContent).not.toMatch(/memory\//)
+    expect(within(dialog).getByText(/作用对象：/)).toBeInTheDocument()
+    expect(within(dialog).getByText('memory/xhs-muying-account.md')).toBeInTheDocument()
+  })
+
+  test('待确认为空时空态里的「立即审计」是次级按钮，不与 hero 的主按钮同屏双主', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(idleState())
+    renderPanel()
+    await screen.findByText('暂无待确认建议')
+    const buttons = screen.getAllByRole('button', { name: /立即审计/ })
+    expect(buttons).toHaveLength(2)
+    const primary = buttons.filter((b) => b.className.includes('bg-primary'))
+    expect(primary).toHaveLength(1)
+  })
 })
 
 describe('OptimizationPanel touch targets', () => {

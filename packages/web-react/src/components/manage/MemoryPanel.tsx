@@ -14,7 +14,9 @@ import type {
   MemoryUsageDashboard,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { AgentProjectPreview } from "./AgentProjectPreview";
 import { IdentityManual, useIdentityManualAuthority } from "./IdentityManual";
+import { ProjectAssetsManagePanel } from "./ProjectAssetsManagePanel";
 import {
   Alert,
   Badge,
@@ -73,6 +75,7 @@ export function MemoryPanel({
 }) {
   const [selected, setSelected] = useState(agentId);
   const [tab, setTab] = useState<"core" | "project" | "profile" | "usage">("core");
+  const { scope } = useProjectScope();
   const manualAuthority = useIdentityManualAuthority(auth);
   // This is a management resource selector, NOT a chat/delegate execution picker.
   // Keep explicitly registered manuals reachable when their canonical install is unavailable.
@@ -105,7 +108,6 @@ export function MemoryPanel({
           ) : undefined
         }
       />
-      {tab === "core" && <IdentityManual key={`manual:${auth.snapshot().epoch}:${effective}`} auth={auth} agentId={effective} authority={manualAuthority} />}
       <div className="min-w-0 overflow-x-auto border-t border-border px-4 py-3">
         <Tabs
           aria-label="记忆分区"
@@ -139,9 +141,29 @@ export function MemoryPanel({
         className="border-t border-border"
       >
         {tab === "core" ? (
-          <CoreMemorySection key={`core:${effective}`} auth={auth} agentId={effective} />
+          <>
+            <CoreMemorySection key={`core:${effective}`} auth={auth} agentId={effective} />
+            {/* 「本实例运行手册」是少数人用的高级能力：放在核心记忆正文之后，不再压在二级页签之上。 */}
+            <IdentityManual
+              key={`manual:${auth.snapshot().epoch}:${effective}`}
+              auth={auth}
+              agentId={effective}
+              authority={manualAuthority}
+            />
+          </>
         ) : tab === "project" ? (
-          <ProjectMemorySection key="project" auth={auth} />
+          <>
+            <ProjectMemorySection key="project" auth={auth} />
+            {/* 项目资产与「智能体会看到什么」都是项目维度的信息，跟项目记忆放同一页签；
+                改造前它们追加在整个 MemoryPanel 之后、不随页签切换，定高壳里要滚过整张
+                核心记忆列表才看得到。 */}
+            {isWorkScope(scope) && (
+              <>
+                <ProjectAssetsManagePanel auth={auth} />
+                <AgentProjectPreview auth={auth} agentId={effective} />
+              </>
+            )}
+          </>
         ) : tab === "profile" ? (
           // 画像共享,用初始 agentId(稳定)做路由参数,与切换器无关。
           <UserProfileSection key="shared:user" auth={auth} agentId={agentId} />
@@ -182,6 +204,11 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
   const [official, setOfficial] = useState<ProjectMemoryItem[]>([]);
   const [leftover, setLeftover] = useState<ProjectMemoryItem[]>([]);
   const [loading, setLoading] = useState(true);
+  // 读失败与空态互斥：改造前失败只闪一条 toast，随后列表落成「还没有项目记忆」——
+  // toast 消失后用户看到的是一个自信的"空"，而不是"没读到"。
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  /** 正在提交采纳 / 忽略的候选 id：对应两个按钮进忙态，防连点重复 POST。 */
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [confirm, confirmEl] = useConfirm();
 
@@ -193,6 +220,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
     }
     let cancelled = false;
     setLoading(true);
+    setLoadErr(null);
     void taskboardApi
       .listProjectMemories(auth, projectId)
       .then((res) => {
@@ -203,7 +231,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
         );
       })
       .catch((e) => {
-        if (!cancelled) toast(apiErrorMessage(e, "加载项目记忆失败"), "error");
+        if (!cancelled) setLoadErr(apiErrorMessage(e, "加载项目记忆失败"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -211,9 +239,27 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
     return () => {
       cancelled = true;
     };
-  }, [auth, projectId, toast, reloadKey]);
+  }, [auth, projectId, reloadKey]);
 
   const reload = useCallback(() => setReloadKey((k) => k + 1), []);
+
+  const decide = useCallback(
+    async (c: ProjectMemoryItem, action: "promote" | "reject") => {
+      const id = c.id ?? "";
+      setBusyId(id);
+      try {
+        if (action === "promote") await taskboardApi.promoteProjectMemory(auth, projectId, id, c.version);
+        else await taskboardApi.rejectProjectMemory(auth, projectId, id, c.version);
+        toast(action === "promote" ? "已采纳" : "已忽略", "success");
+        reload();
+      } catch (e) {
+        toast(apiErrorMessage(e, action === "promote" ? "采纳失败" : "忽略失败"), "error");
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [auth, projectId, reload, toast],
+  );
 
   const discard = useCallback(
     async (item: ProjectMemoryItem) => {
@@ -250,6 +296,18 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
       </p>
       {loading ? (
         <ListSkeleton rows={3} />
+      ) : loadErr ? (
+        <Alert
+          tone="danger"
+          density="compact"
+          action={
+            <Button size="sm" variant="secondary" onClick={reload}>
+              重试
+            </Button>
+          }
+        >
+          {loadErr}
+        </Alert>
       ) : (
         <>
           {official.length === 0 ? (
@@ -293,24 +351,17 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
                   <div className="mt-2 flex gap-2">
                     <Button
                       size="sm"
-                      onClick={() => {
-                        void taskboardApi
-                          .promoteProjectMemory(auth, projectId, c.id ?? "", c.version)
-                          .then(() => reload())
-                          .catch((e) => toast(apiErrorMessage(e, "采纳失败"), "error"));
-                      }}
+                      loading={busyId === (c.id ?? "")}
+                      disabled={busyId !== null}
+                      onClick={() => void decide(c, "promote")}
                     >
                       采纳
                     </Button>
                     <Button
                       size="sm"
                       variant="secondary"
-                      onClick={() => {
-                        void taskboardApi
-                          .rejectProjectMemory(auth, projectId, c.id ?? "", c.version)
-                          .then(() => reload())
-                          .catch((e) => toast(apiErrorMessage(e, "忽略失败"), "error"));
-                      }}
+                      disabled={busyId !== null}
+                      onClick={() => void decide(c, "reject")}
                     >
                       忽略
                     </Button>
@@ -336,8 +387,11 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
   const [value, setValue] = useState<MemoryUsageDashboard | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
   useEffect(() => {
+    void reloadKey;
     let alive = true;
     setLoading(true);
     setErr(null);
@@ -354,7 +408,7 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
     return () => {
       alive = false;
     };
-  }, [auth, agentId, days]);
+  }, [auth, agentId, days, reloadKey]);
 
   const totals = value?.totals;
   const retrievals = value?.byOperation.filter((row) =>
@@ -368,8 +422,8 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
     <div className="flex flex-col gap-4 px-4 py-3.5">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <p className="text-body-sm font-medium text-foreground">记忆在会话里如何被使用</p>
-          <p className="mt-1 text-caption text-muted">直接记录于记忆实现边界，不再从工具文本反推。</p>
+          <p className="text-body font-medium text-fg">记忆在会话里如何被使用</p>
+          <p className="mt-1 text-caption text-muted">按记忆被检索、写入和注入的真实记录统计。</p>
         </div>
         <Select
           aria-label="统计时间范围"
@@ -385,10 +439,23 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
         />
       </div>
 
-      {err && <Alert tone="danger" density="compact">{err}</Alert>}
+      {/* 读失败只给重试出口，不与「还没有可统计的记忆操作」并排 —— 后者读起来像权威结论。 */}
+      {err && (
+        <Alert
+          tone="danger"
+          density="compact"
+          action={
+            <Button size="sm" variant="secondary" onClick={reload}>
+              重试
+            </Button>
+          }
+        >
+          {err}
+        </Alert>
+      )}
       {loading ? (
         <ListSkeleton rows={4} />
-      ) : !value || !totals || totals.events === 0 ? (
+      ) : err ? null : !value || !totals || totals.events === 0 ? (
         <EmptyState
           icon={BarChart3}
           title="还没有可统计的记忆操作"
@@ -412,39 +479,42 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
               ["检索命中率", `${hitRate}%`],
               ["新鲜度风险", totals.freshnessGaps],
             ].map(([label, metric]) => (
-              <div key={String(label)} className="rounded-xl border border-border bg-surface-subtle px-3 py-2.5">
+              // 统计卡走设计系统档位：bg-hover 是面板内「下沉」块的既有底色（改造前写的
+              // bg-surface-subtle / text-foreground / text-body-sm 在 styles.css 里都不存在，
+              // Tailwind 不生成 CSS，卡片只剩描边、字号回落成继承值）。
+              <div key={String(label)} className="rounded-xl border border-border bg-hover px-3 py-2.5">
                 <div className="text-caption text-muted">{label}</div>
-                <div className="mt-1 text-lg font-semibold text-foreground">{metric}</div>
+                <div className="mt-1 text-title font-semibold tabular-nums text-fg">{metric}</div>
               </div>
             ))}
           </div>
 
           <section className="overflow-hidden rounded-xl border border-border">
-            <div className="border-b border-border px-3 py-2 text-body-sm font-medium">按操作</div>
+            <div className="border-b border-border px-3 py-2 text-body font-medium text-fg">按操作</div>
             <div className="divide-y divide-border">
               {value.byOperation.map((row) => (
                 <div key={`${row.operation}:${row.memoryType}`} className="grid grid-cols-[1fr_auto] gap-3 px-3 py-2.5">
                   <div className="min-w-0">
-                    <div className="truncate text-body-sm text-foreground">
+                    <div className="truncate text-body text-fg">
                       {OPERATION_LABELS[row.operation] ?? row.operation}
                     </div>
                     <div className="mt-0.5 text-caption text-muted">
                       {row.sessions} 个会话 · p50 {row.p50Ms}ms · p95 {row.p95Ms}ms
                     </div>
                   </div>
-                  <div className="text-right text-body-sm font-medium text-foreground">{row.events} 次</div>
+                  <div className="text-right text-body font-medium tabular-nums text-fg">{row.events} 次</div>
                 </div>
               ))}
             </div>
           </section>
 
           <section className="overflow-hidden rounded-xl border border-border">
-            <div className="border-b border-border px-3 py-2 text-body-sm font-medium">最近会话</div>
+            <div className="border-b border-border px-3 py-2 text-body font-medium text-fg">最近会话</div>
             <div className="divide-y divide-border">
               {value.recentSessions.slice(0, 20).map((row) => (
                 <div key={row.sessionKey} className="px-3 py-2.5">
                   <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 truncate text-body-sm text-foreground">{row.title}</div>
+                    <div className="min-w-0 truncate text-body text-fg">{row.title}</div>
                     <TimeAgo value={row.lastAt} className="shrink-0 text-caption text-muted" />
                   </div>
                   <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-caption text-muted">
@@ -1681,8 +1751,10 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
 
   const norm = (s: string) => s.replace(/\r\n/g, "\n");
   const dirty = norm(text) !== norm(baseline.text);
-  const chars = norm(text).trim().length;
-  const overLimit = limit > 0 && text.length > limit;
+  // 计数与超限判定用同一口径（归一换行、不 trim）：改造前正常态显示 trim 后长度、
+  // 超限态切成未 trim 的 text.length，跨过限额那一刻数字会跳。
+  const chars = norm(text).length;
+  const overLimit = limit > 0 && chars > limit;
 
   const save = useCallback(async () => {
     // 第二道防线（第一道是"没 loaded 就不渲染编辑器"，所以这条从 UI 走不到）。留着是因为
@@ -1798,14 +1870,14 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
               loading={saving}
               disabled={!dirty || overLimit}
               title={
-                overLimit ? `已超出字符预算（${text.length}/${limit}），请精简后再保存` : undefined
+                overLimit ? `已超出字符预算（${chars}/${limit}），请精简后再保存` : undefined
               }
             >
               {saved ? <Check size={14} /> : null}
               {saved ? "已保存" : "保存"}
             </Button>
             <span className={cn("text-caption", overLimit ? "font-medium text-danger" : "text-muted")}>
-              {overLimit ? text.length : chars}
+              {chars}
               {limit > 0 ? `/${limit}` : ""} 字符
             </span>
             <span className="sr-only" aria-live="polite">

@@ -25,6 +25,9 @@
   --color-bubble: var(--bubble);
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
+  /* 压在 bg-danger 填充块上的前景(Button danger 等)。暗色 --danger 为前景用途调亮过,
+     白字只有 3.07:1,故明暗各配一档,与 --accent-fg / --primary-fg 同族(shell 审计 S-03)。 */
+  --color-danger-fg: var(--danger-fg);
   --color-success: var(--success);
   --color-success-soft: var(--success-soft);
   --color-warning: var(--warning);
@@ -132,6 +135,7 @@
   --bubble: #f4f4f7;
   --danger: #d52430; /* was #e04953 — 4.00:1 */
   --danger-soft: #d5243014;
+  --danger-fg: #ffffff; /* vs --danger 5.09:1 */
   --success: #187f4d; /* was #1fa463 — 3.21:1 */
   --success-soft: #187f4d14;
   --warning: #9e6213; /* was #d9871a — 2.83:1,连大字标准都不够 */
@@ -174,6 +178,7 @@
   --bubble: #1c1c25;
   --danger: #f0666e;
   --danger-soft: #f0666e1f;
+  --danger-fg: #15151c; /* 白字只有 3.07:1;近黑(同 --accent-fg)约 6:1 */
   --success: #3dbe7e;
   --success-soft: #3dbe7e1f;
   --warning: #e0a03a;
@@ -194,6 +199,11 @@ html, body { height: 100%; margin: 0; }
    露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
    末个有效值生效)。iOS Safari 截图/地址栏/键盘显隐时 100dvh 与 visual viewport
    offset 仍会短暂抖动,React 侧用 visualViewport 写入 CSS var 作最终权威。 */
+/* 顶部 toast 轨道的顶距(components/ui/Toast.tsx `top-[var(--oc-toast-top,4rem)]`)。
+   取值 = ChatHeader 的最小高度 min-h-14(3.5rem)+ 0.5rem 呼吸空间;安全区内边距由轨道自己的
+   header-safe-t 再叠一层。原先 Toast.tsx 写死 top-16,与头部高度两处各写各的(shell 审计 S-20):
+   头部改高度时改这里一处即可,不要再去 Toast.tsx 里改 top-*。 */
+:root { --oc-toast-top: 4rem; }
 #root {
   position: fixed;
   top: var(--oc-visual-offset-top, 0px);
@@ -342,7 +352,7 @@ body {
   --border-control: #687064;
   --fg: #f5f4ed;
   --muted: #aeb1a8;
-  --faint: #777d73;
+  --faint: #8a9086; /* was #777d73 — vs surface 4.38 / elevated 4.16,低于 AA(shell 审计 S-05) */
   --accent: #c7ff64;
   --accent-soft: rgba(199, 255, 100, 0.1);
   --accent-strong: #d7ff91;
@@ -350,6 +360,11 @@ body {
   --primary: #c7ff64;
   --primary-fg: #0a0b09;
   --bubble: #1a1d17;
+  /* 错误态原先漏定义,回落 :root 的浅色主题红压在近黑画布上只有 ≈3.9:1,
+     --danger-soft 的 8% 红几乎不可见(shell 审计 S-04)。取与 success/warning/info 同一亮度带的暖红。 */
+  --danger: #ff8d80;
+  --danger-soft: rgba(255, 141, 128, 0.12);
+  --danger-fg: #0a0b09;
   --success: #8de68f;
   --success-soft: rgba(141, 230, 143, 0.1);
   --warning: #f6c66a;
@@ -373,7 +388,7 @@ body {
   --color-border-control: #687064;
   --color-fg: #f5f4ed;
   --color-muted: #aeb1a8;
-  --color-faint: #777d73;
+  --color-faint: #8a9086;
   --color-accent: #c7ff64;
   --color-accent-soft: rgba(199, 255, 100, 0.1);
   --color-accent-strong: #d7ff91;
@@ -381,6 +396,9 @@ body {
   --color-primary: #c7ff64;
   --color-primary-fg: #0a0b09;
   --color-bubble: #1a1d17;
+  --color-danger: #ff8d80;
+  --color-danger-soft: rgba(255, 141, 128, 0.12);
+  --color-danger-fg: #0a0b09;
   --color-success: #8de68f;
   --color-success-soft: rgba(141, 230, 143, 0.1);
   --color-warning: #f6c66a;

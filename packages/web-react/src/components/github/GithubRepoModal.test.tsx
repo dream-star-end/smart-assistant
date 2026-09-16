@@ -96,6 +96,45 @@ describe("GithubRepoModal", () => {
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
   });
 
+  // GH-02：草稿态（无 sessionId）「确认绑定」禁用此前没有任何提示。
+  test("草稿态无 sessionId：给出「先发送一条消息」提示，确认按钮禁用并带 title", async () => {
+    getGithubLink.mockResolvedValue({ linked: true, login: "octocat", scopes: "repo" });
+    listGithubRepos.mockResolvedValue([]);
+    renderModal({ sessionId: undefined });
+    expect(await screen.findByText(/先发送一条消息创建会话/)).toBeInTheDocument();
+    const confirmBtn = screen.getByRole("button", { name: "确认绑定" });
+    expect(confirmBtn).toBeDisabled();
+    expect(confirmBtn).toHaveAttribute("title", expect.stringContaining("先发送一条消息"));
+  });
+
+  test("有 sessionId 时不出现草稿态提示", async () => {
+    getGithubLink.mockResolvedValue({ linked: true, login: "octocat", scopes: "repo" });
+    listGithubRepos.mockResolvedValue([]);
+    renderModal();
+    await screen.findByText("@octocat");
+    expect(screen.queryByText(/先发送一条消息创建会话/)).toBeNull();
+  });
+
+  // GH-03 / GH-04 / GH-05：scope 可读化、搜索框有名、列表按钮语义。
+  test("账号栏 scopes 映射为可读文案；搜索框有 aria-label；仓库按钮 type=button 且选中态 aria-pressed", async () => {
+    getGithubLink.mockResolvedValue({ linked: true, login: "octocat", scopes: "repo,read:user" });
+    listGithubRepos.mockResolvedValue([
+      { owner: { login: "octocat" }, name: "hello", full_name: "octocat/hello", default_branch: "main", private: false },
+      { owner: { login: "octocat" }, name: "world", full_name: "octocat/world", default_branch: "main", private: true },
+    ]);
+    listGithubBranches.mockResolvedValue([{ name: "main", commit: { sha: "a" } }]);
+    renderModal();
+    expect(await screen.findByText("读写仓库 · 读取账号信息")).toBeInTheDocument();
+    expect(screen.queryByText("repo,read:user")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "搜索仓库" })).toBeInTheDocument();
+    const hello = (await screen.findByText("hello")).closest("button")!;
+    expect(hello).toHaveAttribute("type", "button");
+    expect(hello).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(hello);
+    await waitFor(() => expect(hello).toHaveAttribute("aria-pressed", "true"));
+    expect(screen.getByText("world").closest("button")).toHaveAttribute("aria-pressed", "false");
+  });
+
   test("已有绑定：显示「解除当前绑定」", async () => {
     getGithubLink.mockResolvedValue({ linked: true, login: "octocat", scopes: "repo" });
     listGithubRepos.mockResolvedValue([]);

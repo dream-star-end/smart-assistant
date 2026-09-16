@@ -16,11 +16,11 @@ import {
   EmptyState,
   IconButton,
   ListSkeleton,
-  Sheet,
   Switch,
   useConfirm,
   useToast,
 } from '../ui'
+import { PanelSheet } from './PanelSheet'
 
 function typeLabel(type: TicketType | null): string {
   return type ? TICKET_TYPE_LABEL[type] : '通用'
@@ -31,15 +31,28 @@ export function TemplateLibrary({
   projectId,
   onChanged,
   compact = false,
+  open: openProp,
+  onOpenChange,
+  hideTrigger = false,
 }: {
   auth: AuthSession
   projectId: string | null
   onChanged?: () => void
   compact?: boolean
+  /** 受控打开(TaskboardView 的移动端「配置」菜单 / 看板空态从外部打开)。不传则自管。 */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  /** 由外部提供入口时隐藏自带按钮。 */
+  hideTrigger?: boolean
 }) {
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
-  const [open, setOpen] = useState(false)
+  const [openState, setOpenState] = useState(false)
+  const open = openProp ?? openState
+  const setOpen = (next: boolean) => {
+    setOpenState(next)
+    onOpenChange?.(next)
+  }
   const [loading, setLoading] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [items, setItems] = useState<PipelineTemplate[] | null>(null)
@@ -121,7 +134,7 @@ export function TemplateLibrary({
 
   return (
     <>
-      {compact ? (
+      {hideTrigger ? null : compact ? (
         <IconButton
           type="button"
           shape="square"
@@ -144,23 +157,14 @@ export function TemplateLibrary({
           流水线模板
         </Button>
       )}
-      <Sheet
+      <PanelSheet
         open={open}
         onOpenChange={setOpen}
-        side="right"
-        srTitle="流水线模板"
-        className="w-[36rem] max-w-[96vw]"
+        title="流水线模板"
+        hint="内置四条与新建项目时的默认线相同，不能删除。自定义模板可从现有流水线另存。"
+        testId="template-library"
       >
-        <div
-          data-testid="template-library"
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
-        >
-          <div>
-            <h2 className="text-title font-semibold text-fg">流水线模板</h2>
-            <p className="mt-1 text-caption text-muted">
-              内置四条与新建项目时的默认线相同，不能删除。自定义模板可从现有流水线另存。
-            </p>
-          </div>
+        <>
           <div className="flex items-center justify-between gap-3 rounded-lg bg-hover px-3 py-2">
             <span className="text-meta font-medium text-muted">套用时设为该类型默认线</span>
             <Switch
@@ -240,8 +244,8 @@ export function TemplateLibrary({
               )
             })
           )}
-        </div>
-      </Sheet>
+        </>
+      </PanelSheet>
       {confirmEl}
     </>
   )

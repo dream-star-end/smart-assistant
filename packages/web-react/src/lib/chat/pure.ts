@@ -884,6 +884,40 @@ export function findOrCreateStreamingRow<
   return create(messageId ? { id: messageId } : {});
 }
 
+// ═══════════════ 展示层小工具（消息卡片文案） ═══════════════
+
+/** CJK 统一表意文字 + 日文假名 + 谚文 + 全角标点。 */
+const CJK_RE = /[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g;
+
+/**
+ * 朗读语音的语言标签(SpeechSynthesisUtterance.lang)。粗判规则:数 CJK 字符与拉丁**单词**
+ * (一个汉字 ≈ 一个词的信息量,按字母数比会被 `stickToBottom` 这类长标识符带偏):
+ * 汉字数 ≥ 拉丁词数 → `zh-CN`;否则 `en-US`(英文回答用中文语音朗读会逐字母拼读)。
+ * 无汉字也无拉丁词(空文本 / 纯数字标点)回退 zh-CN。
+ */
+export function speechLangFor(text: string): "zh-CN" | "en-US" {
+  const raw = typeof text === "string" ? text : "";
+  const cjk = raw.match(CJK_RE)?.length ?? 0;
+  const latinWords = raw.match(/[A-Za-z][A-Za-z'-]*/g)?.length ?? 0;
+  if (cjk === 0 && latinWords === 0) return "zh-CN";
+  return cjk >= latinWords ? "zh-CN" : "en-US";
+}
+
+/**
+ * 秒数 → 人类可读时长(目标卡「用时」等):<60s → `Ns`;<60min → `N 分钟`(不足 1 分钟部分
+ * 四舍五入,≥30s 进位);≥60min → `H 小时 M 分`(M 为 0 时省略)。非法/负数 → 空串。
+ */
+export function formatDurationSeconds(seconds: unknown): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "";
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const totalMinutes = Math.round(s / 60);
+  if (totalMinutes < 60) return `${totalMinutes} 分钟`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes === 0 ? `${hours} 小时` : `${hours} 小时 ${minutes} 分`;
+}
+
 // 仅供类型引用（确保 block 类型在本模块内被使用，避免 unused import）。
 export type _BlockRef = OutboundContentBlock;
 export type _MsgRef = OutboundMessageWire;

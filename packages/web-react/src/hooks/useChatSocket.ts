@@ -9,6 +9,7 @@ import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
+import { EMPTY_SESSION_TITLE } from "../lib/sessionTitle";
 import type { AuthSession, DurableLiveFrame, DurableLiveFramePage } from "../lib/types";
 import { setPermissionFullInputFetcher } from "../lib/chat/permissionPopupCoordinator";
 
@@ -521,7 +522,8 @@ export function useChatSocket(opts: {
           // 由 socket 侧建行确认后的 persistSessionModel PATCH 收敛。
           await api.putSession(a, sessId, {
             agentId,
-            title: title || "新会话",
+            // sidebar-B ST-01：空标题回退与侧栏/列表/搜索统一为「新对话」（lib/sessionTitle 单一权威）。
+            title: title || EMPTY_SESSION_TITLE,
             messages: [],
             ...(modelId ? { modelId } : {}),
             _baseSyncedAt: 0,

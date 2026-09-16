@@ -379,9 +379,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
     await loginViaUi()
 
-    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    // 侧栏空态有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
-    expect(screen.getByText('暂无会话')).toBeInTheDocument()
+    // sidebar-B S-13 起零会话零项目渲染一块引导空态(data-testid=sidebar-empty-all,「还没有会话」),
+    // 不再是单独的「暂无会话」占位文本。
+    expect(screen.getByTestId('sidebar-empty-all')).toHaveTextContent('还没有会话')
 
     const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/auth/login')
     expect(call).toBeTruthy()
@@ -1055,6 +1057,38 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeInTheDocument()
     expect(screen.getByText('锂金属负极枝晶抑制机理综述')).toBeInTheDocument()
     expect(noFetch).not.toHaveBeenCalled()
+  })
+
+  // shell 审计 S-01:⌘K 原先无条件打开移动端抽屉(Sheet 带 md:hidden)。桌面断点下抽屉不可见,
+  // 但 Radix 模态照常把 <body> 设成 pointer-events:none —— 整页点死且看不见任何弹层。
+  test('⌘K 桌面视口:只展开内联侧栏并聚焦搜索框,不打开移动抽屉(S-01)', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    const realMatchMedia = window.matchMedia
+    window.matchMedia = (q: string) =>
+      ({ ...realMatchMedia(q), media: q, matches: q.includes('min-width: 768px') }) as MediaQueryList
+    try {
+      render(<App />)
+      fireEvent.keyDown(window, { key: 'k', metaKey: true })
+      await waitFor(() => expect(screen.getByLabelText('搜索标题或消息')).toHaveFocus())
+      expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
+      expect(document.body.style.pointerEvents).not.toBe('none')
+    } finally {
+      window.matchMedia = realMatchMedia
+    }
+  })
+
+  test('⌘K 窄屏视口:仍打开会话导航抽屉(抽屉里有自己的搜索框)', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    // setup.ts 的 matchMedia 桩恒 matches=false → 视为 <md
+    render(<App />)
+    expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
+    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    const drawer = await screen.findByRole('dialog', { name: '会话导航' })
+    expect(drawer).toBeInTheDocument()
+    // jsdom 没有布局,两份侧栏(内联 + 抽屉)都在 DOM 里;抽屉里必须有搜索框可供聚焦逻辑挑选
+    expect(drawer.querySelector('[data-sidebar-search]')).not.toBeNull()
   })
 })
 

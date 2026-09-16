@@ -187,12 +187,12 @@ describe("InboxDialog", () => {
     expect(screen.queryByText("全部已读失败，请重试")).not.toBeInTheDocument();
   });
 
-  test("切到「未读」Tab：重新拉取且带 unreadOnly", async () => {
+  test("切到「未读」Tab：重新拉取且带 unreadOnly；Tab 标签带未读数（IB-03）", async () => {
     listInboxMessages.mockResolvedValue({ messages: [mk("1", { read: false })], unread_count: 1 });
     render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);
     await screen.findByText("标题1");
 
-    fireEvent.click(screen.getByRole("tab", { name: "未读" }));
+    fireEvent.click(screen.getByRole("tab", { name: "未读 (1)" }));
 
     await waitFor(() =>
       expect(listInboxMessages).toHaveBeenCalledWith(auth, { limit: 30, unreadOnly: true }),
@@ -223,10 +223,26 @@ describe("InboxDialog", () => {
     expect(screen.getByText("标题0")).toBeInTheDocument();
   });
 
-  test("空态：全部 Tab 显示「暂无消息」", async () => {
+  test("空态：全部 Tab 显示「暂无消息」，未读为 0 时 Tab 不带数字", async () => {
     listInboxMessages.mockResolvedValue({ messages: [], unread_count: 0 });
     render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);
     expect(await screen.findByText("暂无消息")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "未读" })).toBeInTheDocument();
+  });
+
+  // IB-01：展开态正文此前把 <!-- ob:xxx --> 防重发 marker 当文本交给 Markdown 渲染。
+  test("展开正文剥掉 HTML 注释 marker，与摘要态一致", async () => {
+    listInboxMessages.mockResolvedValue({
+      messages: [mk("1", { read: true, body_md: "正文第一段\n\n<!-- ob:release-2026-09 -->" })],
+      unread_count: 0,
+    });
+    render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);
+    await screen.findByText("标题1");
+    fireEvent.click(screen.getByRole("button", { name: /标题1/ }));
+    const rendered = await screen.findByTestId("md-body");
+    expect(rendered).toHaveTextContent("正文第一段");
+    expect(rendered.textContent).not.toContain("ob:");
+    expect(rendered.textContent).not.toContain("<!--");
   });
 
   test("错误态 + 重试：先报错，点重试后成功渲染", async () => {

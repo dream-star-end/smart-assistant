@@ -7,6 +7,7 @@ import {
   Alert,
   Badge,
   Button,
+  CopyChip,
   EmptyState,
   IconButton,
   ListSkeleton,
@@ -20,6 +21,27 @@ import {
 } from '../ui'
 
 const LANG_LABEL: Record<string, string> = { zh: '中文', en: '英文', other: '其他' }
+
+const UNTITLED = '（无标题文档）'
+
+/** 文档 ID 的短形式：列表行里给用户「认得出、复制得走」的 8 位前缀（完整值在复制芯片里）。 */
+export function shortDocId(docId: string): string {
+  return docId.slice(0, 8)
+}
+
+/**
+ * 列表过滤：标题、文档 ID 前缀、语言（中文标签或代码）三者任一命中。
+ * 改造前只匹配标题，`title: null` 的文档永远搜不到；而对话里的证据卡上用户只看得到 docId。
+ */
+export function matchesLibraryQuery(doc: ResearchLibraryDoc, rawQuery: string): boolean {
+  const q = rawQuery.trim().toLowerCase()
+  if (!q) return true
+  if ((doc.title || '').toLowerCase().includes(q)) return true
+  if (doc.docId.toLowerCase().startsWith(q)) return true
+  const lang = doc.lang.toLowerCase()
+  if (lang === q) return true
+  return Boolean(LANG_LABEL[doc.lang]?.includes(q))
+}
 
 /**
  * 上传入口的 input id。**必须走 `<label htmlFor>` 原生激活**：
@@ -106,12 +128,12 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
 
   const remove = useCallback(
     async (doc: ResearchLibraryDoc) => {
-      const title = doc.title || '(无标题文档)'
+      const title = doc.title || UNTITLED
       const ok = await confirmDialog({
-        title: `删除文献「${title}」?`,
+        title: `删除文献「${title}」？`,
         body: (
           <>
-            删除后新的引用核查将无法回查到该文档;已生成的报告不受影响。
+            删除后新的引用核查将无法回查到该文档；已生成的报告不受影响。
             <span className="mt-2 block text-caption text-faint">
               文档 ID：<span className="select-all font-mono">{doc.docId}</span>
             </span>
@@ -134,9 +156,8 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
 
   const filtered = useMemo(() => {
     if (!docs) return []
-    const q = query.trim().toLowerCase()
-    if (!q) return docs
-    return docs.filter((d) => (d.title || '').toLowerCase().includes(q))
+    if (!query.trim()) return docs
+    return docs.filter((d) => matchesLibraryQuery(d, query))
   }, [docs, query])
 
   const total = docs?.length ?? 0
@@ -191,7 +212,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
         <Toolbar
           search={query}
           onSearchChange={setQuery}
-          searchPlaceholder="按标题过滤…"
+          searchPlaceholder="按标题、文档 ID 或语言过滤…"
           count={query.trim() ? filtered.length : null}
           debounceMs={120}
         />
@@ -279,10 +300,8 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
               <li key={d.docId} className="flex items-center gap-3 px-3.5 py-2.5">
                 <BookOpen size={15} className="shrink-0 text-muted" />
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-section font-medium text-fg">
-                    {d.title || '(无标题文档)'}
-                  </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                  <div className="truncate text-section font-medium text-fg">{d.title || UNTITLED}</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                     <Badge tone="neutral" size="sm">
                       {LANG_LABEL[d.lang] ?? d.lang}
                     </Badge>
@@ -292,12 +311,18 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
                     <span className="text-caption text-faint">
                       <TimeAgo value={d.createdAt} format="short" tooltip={false} /> 入库
                     </span>
+                    {/* 文献行没有详情页（需后端单文档接口）：至少让用户把 docId 认出来、复制得走 ——
+                        对话里的证据卡与「引用核查」都是按 docId 回查的。 */}
+                    <span className="inline-flex items-center gap-1 text-caption text-faint">
+                      文档 ID
+                      <CopyChip value={d.docId} label={shortDocId(d.docId)} className="py-0.5 text-caption" />
+                    </span>
                   </div>
                 </div>
                 <IconButton
                   variant="danger"
                   size="sm"
-                  aria-label={`删除文献「${d.title || '(无标题文档)'}」`}
+                  aria-label={`删除文献「${d.title || UNTITLED}」`}
                   title="删除文献"
                   onClick={() => void remove(d)}
                 >

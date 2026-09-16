@@ -1,6 +1,10 @@
 import { Check, Copy, WrapText } from "lucide-react";
 import { type ReactNode, useRef, useState } from "react";
 import { cn } from "../lib/utils";
+import { useToast } from "./ui";
+
+/** 剪贴板不可用(http 非安全上下文 / 权限被拒)时的提示,与 chat/cards 的复制按钮同文案。 */
+const COPY_FAILED_TOAST = "复制失败，请手动选中文本复制";
 
 const WRAP_KEY = "oc_v5_code_wrap";
 
@@ -24,6 +28,7 @@ export function CodeBlock({ language, children }: { language?: string; children:
   const ref = useRef<HTMLElement>(null);
   const [copied, setCopied] = useState(false);
   const [wrap, setWrap] = useState(readCodeWrap);
+  const toast = useToast();
 
   const copy = async () => {
     const text = ref.current?.textContent ?? "";
@@ -32,7 +37,8 @@ export function CodeBlock({ language, children }: { language?: string; children:
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      /* ignore */
+      // 不再静默吞掉:用户得知道复制没成功(无 Provider 的子树里 useToast 是 no-op,不会抛)。
+      toast(COPY_FAILED_TOAST, "error");
     }
   };
 

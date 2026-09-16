@@ -102,4 +102,12 @@ describe("JournalHydrationRetry", () => {
     screen.getByRole("button", { name: "重新加载" }).click();
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
+
+  // M-15:text-foreground 不是本仓 token,按钮颜色回落到父级 text-muted,与说明文字同色不可辨。
+  test("「重新加载」用本仓 token 且常显下划线,与说明文字区分开;触屏 44px", () => {
+    render(<JournalHydrationRetry onRetry={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "重新加载" });
+    expect(button).toHaveClass("text-fg", "underline", "[@media(hover:none)]:min-h-11");
+    expect(button).not.toHaveClass("text-foreground");
+  });
 });

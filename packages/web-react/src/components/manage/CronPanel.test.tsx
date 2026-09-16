@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { ProjectScopeProvider } from "../../hooks/useProjectScope";
 import { ApiError, api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, CronJob } from "../../lib/types";
@@ -12,6 +13,9 @@ const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  localStorage.clear();
+  window.history.replaceState({}, "", "/");
 });
 
 /** TimeAgo / Tooltip 需要 Provider 祖先;Toast 是本面板写成功的唯一回执,必须真挂。 */
@@ -280,6 +284,82 @@ describe("CronPanel 后台对账的顺序栅栏", () => {
     await flush();
     expect(screen.getByText("启用中")).toBeInTheDocument();
     expect(screen.queryByText("已停用")).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * 「会话组」（未绑定看板的聊天项目）作用域下没有可查的任务表。改造前 cronBlocked 只用来跳过
+ * 请求，主体区照常落进「还没有定时任务 / 创建第一个」—— 把用户的任务表渲染成"不存在"（P1）。
+ */
+describe("CronPanel 未绑定聊天项目作用域", () => {
+  const CHAT = { id: "chat_unbound_01", name: "momo 号日常", boardProjectId: null };
+
+  function mountScoped(token: string) {
+    // ProjectScopeProvider 自己拉工作项目列表（原生 fetch，不经 api 代理）。
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    // 作用域走 URL 深链：Provider 在 useState 初始化时同步读 ?project=，首次渲染就是该作用域；
+    // localStorage 里的 token 要等一个 effect 才生效，首帧会以「全部项目」多发一次 listCron。
+    window.history.replaceState({}, "", `/?project=${encodeURIComponent(token)}`);
+    return render(
+      <ToastProvider>
+        <TooltipProvider>
+          <ProjectScopeProvider auth={auth} chatProjects={[CHAT]} userId="u1">
+            <CronPanel auth={auth} />
+          </ProjectScopeProvider>
+        </TooltipProvider>
+      </ToastProvider>,
+    );
+  }
+
+  test("不再渲染假空态：给出「没有绑定工作项目」的解释与切作用域出口，且不发 listCron", async () => {
+    const list = vi.spyOn(api, "listCron").mockResolvedValue([ACTIVE]);
+    mountScoped(CHAT.id);
+
+    expect(await screen.findByText("这个会话组没有绑定工作项目")).toBeInTheDocument();
+    expect(screen.queryByText("还没有定时任务")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "创建第一个定时任务" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /新建/ })).not.toBeInTheDocument();
+    expect(list).not.toHaveBeenCalled();
+
+    // 出口：切回「全部项目」后才真正拉表并显示任务。
+    fireEvent.click(screen.getByRole("button", { name: "查看全部项目的定时任务" }));
+    expect(await screen.findByText("每日早报")).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("CronPanel 行内信息可达性", () => {
+  test("已翻译排程的触发器可聚焦且可访问名含 cron 原串；下次执行的精确时刻直接可见；心跳任务有标识", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([{ ...ACTIVE, heartbeat: true }]);
+    mountPanel();
+
+    const trigger = await screen.findByLabelText("每天 08:00，Cron 表达式 0 8 * * *");
+    expect(trigger).toHaveAttribute("tabindex", "0");
+    // 原串仍不作为可见文本铺在行上（保持列表可扫读），只进可访问名。
+    expect(screen.queryByText("0 8 * * *")).not.toBeInTheDocument();
+    // 精确时刻从 title 升为可见文本：MM-DD HH:mm。
+    expect(screen.getByText(/（\d{2}-\d{2} \d{2}:\d{2}）/)).toBeInTheDocument();
+    expect(screen.getByText("心跳探针")).toBeInTheDocument();
+  });
+
+  test("「某时一次」的日期时间控件带 min，过去的时刻在选择器里就被禁掉", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    mountPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "创建第一个定时任务" }));
+    // 切到「某时一次」：Select 原语渲染为原生 <select>。
+    const modeSelect = document.querySelector("select") as HTMLSelectElement;
+    fireEvent.change(modeSelect, { target: { value: "once" } });
+    const input = await screen.findByLabelText("日期时间");
+    expect(input).toHaveAttribute("type", "datetime-local");
+    expect(input.getAttribute("min")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
   });
 });
 

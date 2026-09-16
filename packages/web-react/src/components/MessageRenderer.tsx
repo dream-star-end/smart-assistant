@@ -249,12 +249,26 @@ export const MessageRenderer = memo(
     }
     switch (messageKind(message)) {
       case "user":
-        return <UserCard msg={message} cb={cb} failurePresentedBelow={failurePresentedBelow} />;
+        // readOnly(教程回放 / 后台会话查看器)透传:只读面不再出现点了没反应的「编辑」「引用」。
+        return (
+          <UserCard
+            msg={message}
+            cb={cb}
+            failurePresentedBelow={failurePresentedBelow}
+            readOnly={readOnly}
+          />
+        );
       case "assistant":
         return (
           <>
             <FirstTextPaintCommitProbe message={message} cb={cb} />
-            <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />
+            <AssistantCard
+              msg={message}
+              ctx={ctx}
+              cb={cb}
+              tokenUsage={tokenUsage}
+              readOnly={readOnly}
+            />
           </>
         );
       case "thinking":
@@ -399,7 +413,7 @@ function ExactTapeRecordDisclosure({
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="text-caption text-faint hover:text-muted"
+        className="text-caption text-faint hover:text-muted [@media(hover:none)]:inline-flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center"
       >
         {open ? `收起原始${label}记录` : `查看原始${label}记录`}
       </button>
@@ -412,7 +426,7 @@ function ExactTapeRecordDisclosure({
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -443,7 +457,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover"
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover [@media(hover:none)]:min-h-11"
       >
         <span className="size-1.5 shrink-0 rounded-full bg-faint" />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
@@ -459,7 +473,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -2132,8 +2146,10 @@ export function MessageList({
       </button>
     </div>
   ) : null;
+  // footer 不再自带 px-5:它嵌在列表根(px-5)内,双份内边距会让本轮活动指示 / 软提示 / 尾部骨架比
+  // 时间线内容多缩进 20px(footer 头像与助手头像不对齐)。空列表早返回分支由外层容器补 px-5。
   const footer = (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 pb-8 pt-4" data-testid="timeline-footer">
       <div data-testid="turn-activity-footer">
         {sending && (
           <div className="flex gap-4">
@@ -2256,7 +2272,7 @@ export function MessageList({
           <button
             key={message.requestId ?? message.id}
             type="button"
-            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent"
+            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             onClick={() => {
               if (message.requestId) reopenPermissionUi(message.requestId);
             }}
@@ -2424,8 +2440,10 @@ export function MessageList({
             data-testid="scroll-to-bottom"
             aria-label="回到底部"
             tabIndex={showScrollToBottom ? 0 : -1}
+            // 移动端 44px 圆钮叠在末行正文/状态标签右侧:加一圈页面底色描边把它从底下的文字里
+            // 抬出来,并在触屏下挪进列表根的 px-5 边距(-right-3),少压 12px 正文。
             className={
-              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float transition-opacity duration-200 [@media(hover:none)]:size-11 " +
+              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float ring-[3px] ring-bg transition-opacity duration-200 [@media(hover:none)]:-right-3 [@media(hover:none)]:size-11 " +
               (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
             }
             onClick={() => {

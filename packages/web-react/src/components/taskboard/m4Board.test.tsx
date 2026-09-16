@@ -265,7 +265,7 @@ describe('成本统计 API 与界面', () => {
       }),
       buckets: [],
     })
-    wrap(<CostStatsView auth={auth} projectId="p1" projects={[sampleProject()]} />)
+    wrap(<CostStatsView auth={auth} />)
     expect(await screen.findByTestId('cost-coverage-tokens')).toHaveTextContent(
       '106,071 token（入 97,519 / 出 8,552）',
     )
@@ -304,7 +304,7 @@ describe('成本统计 API 与界面', () => {
         },
       ],
     })
-    wrap(<CostStatsView auth={auth} projectId={null} projects={[]} />)
+    wrap(<CostStatsView auth={auth} />)
     const money = await screen.findByTestId('cost-coverage-money')
     expect(money).toHaveTextContent('本区间全部无单价，仅有 token 数据')
     expect(money).not.toHaveTextContent('$0')
@@ -314,7 +314,7 @@ describe('成本统计 API 与界面', () => {
 
   test('接口失败给出可读错误而不是白屏', async () => {
     vi.spyOn(taskboardApi, 'getCostStats').mockRejectedValue(new Error('upstream down'))
-    wrap(<CostStatsView auth={auth} projectId="p1" projects={[sampleProject()]} />)
+    wrap(<CostStatsView auth={auth} />)
     expect(await screen.findByText('成本统计加载失败')).toBeInTheDocument()
     expect(screen.getByText(/upstream down|加载成本统计失败/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
@@ -374,7 +374,7 @@ describe('周报界面', () => {
 
   test('展示流转、阶段耗时、缺单价成本、受阻单和失败 run，并可切周/项目', async () => {
     const getWeekly = vi.spyOn(taskboardApi, 'getWeeklyReport').mockResolvedValue(report)
-    wrap(<WeeklyReportView auth={auth} projectId="p1" projects={[sampleProject()]} />)
+    wrap(<WeeklyReportView auth={auth} />)
     await waitFor(() => {
       expect(screen.getByTestId('weekly-period')).toHaveTextContent('2026-W34')
     })
@@ -397,7 +397,7 @@ describe('周报界面', () => {
 
   test('周报接口失败有重试', async () => {
     vi.spyOn(taskboardApi, 'getWeeklyReport').mockRejectedValue(new Error('report down'))
-    wrap(<WeeklyReportView auth={auth} projectId={null} projects={[]} />)
+    wrap(<WeeklyReportView auth={auth} />)
     expect(await screen.findByText('周报加载失败')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
   })
@@ -478,6 +478,12 @@ describe('流水线模板', () => {
         onOpenMobileNav={() => {}}
       />,
     )
+    // jsdom 是窄屏:「新建项目」入口收在顶栏「配置」菜单里(审计 T-10),先用键盘把菜单打开。
+    const configMenu = await screen.findByTestId('taskboard-config-menu')
+    configMenu.focus()
+    await act(async () => {
+      fireEvent.keyDown(configMenu, { key: 'Enter' })
+    })
     fireEvent.click(await screen.findByTestId('project-create-open'))
     await screen.findByTestId('project-templates')
     fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'NEW1' } })
@@ -610,7 +616,7 @@ describe('Taskboard/Cost/Weekly 范围不发全局请求', () => {
     })
 
     scopeState.kind = 'work'
-    wrap(<CostStatsView auth={auth} projectId="p1" projects={[sampleProject()]} />)
+    wrap(<CostStatsView auth={auth} />)
     await waitFor(() => {
       expect(getCost).toHaveBeenCalledWith(auth, expect.objectContaining({ projectId: 'p1' }))
     })
@@ -619,13 +625,13 @@ describe('Taskboard/Cost/Weekly 范围不发全局请求', () => {
     cleanup()
     getCost.mockClear()
     scopeState.kind = 'all'
-    wrap(<CostStatsView auth={auth} projectId={null} projects={[sampleProject()]} />)
+    wrap(<CostStatsView auth={auth} />)
     expect(await screen.findByText('请选择一个工作项目以查看看板')).toBeInTheDocument()
     expect(getCost).not.toHaveBeenCalled()
 
     cleanup()
     scopeState.kind = 'ungrouped'
-    wrap(<WeeklyReportView auth={auth} projectId={null} projects={[]} />)
+    wrap(<WeeklyReportView auth={auth} />)
     expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
     expect(getWeekly).not.toHaveBeenCalled()
 
