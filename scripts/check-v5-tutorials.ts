@@ -405,7 +405,9 @@ function collectMarkers(): Marker[] {
       const pos = sourceFile.getLineAndCharacterOfPosition(
         node.getStart(sourceFile),
       );
-      const rel = relative(ROOT, file);
+      // 与上方 HISTORY_REPO_PATH 同款归一化：标记路径进 sourceHash / entryIdentityHash，
+      // Windows 的反斜杠会让 26 个能力全部报「功能源 / 入口身份变化」（tutorials 审计 TU-37）。
+      const rel = relative(ROOT, file).replaceAll("\\", "/");
       markers.push({
         id,
         file: rel,

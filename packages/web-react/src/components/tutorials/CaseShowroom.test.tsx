@@ -33,7 +33,11 @@ describe('CaseShowroom', () => {
     expect(document.querySelector('iframe')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '打开交互看板' }))
     const frame = screen.getByTitle(TUTORIAL_SHOWCASES[0].title + '交互看板')
-    expect(frame).toHaveAttribute('sandbox', 'allow-scripts')
+    // 仓内可信产物：放开下载 / 弹窗让看板内链接有反应，但绝不给同源（TU-28）。
+    expect(frame.getAttribute('sandbox')).toContain('allow-scripts')
+    expect(frame.getAttribute('sandbox')).toContain('allow-downloads')
+    expect(frame.getAttribute('sandbox')).toContain('allow-popups')
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin')
     expect(frame).toHaveAttribute('src', '/tutorials/cases/research-bike-demand/showcase/dashboard.html')
     expect(frame).toHaveAttribute('referrerPolicy', 'no-referrer')
     expect(screen.getByRole('link', { name: '下载分析报告' })).toHaveAttribute('download')
@@ -64,6 +68,20 @@ describe('CaseShowroom', () => {
     expect(screen.getByRole('button', { name: SIGNATURE_WORKS[1].action })).not.toHaveFocus()
     expect(run).not.toHaveBeenCalled()
     expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled()
+  })
+  it('can be controlled by the parent: activeWorkId opens the detail, back / select only report upward (TU-02)', () => {
+    const onActiveWorkChange = vi.fn()
+    const { rerender } = render(<CaseShowroom onSelect={vi.fn()} activeWorkId={SIGNATURE_WORKS[0].id} onActiveWorkChange={onActiveWorkChange} />)
+    expect(screen.getByRole('heading', { name: SIGNATURE_WORKS[0].title })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '返回案例展厅' }))
+    expect(onActiveWorkChange).toHaveBeenCalledWith(null)
+    // 受控：父组件没改 prop 之前仍停在详情；prop 置空后才回画廊。
+    expect(screen.getByRole('heading', { name: SIGNATURE_WORKS[0].title })).toBeInTheDocument()
+    rerender(<CaseShowroom onSelect={vi.fn()} activeWorkId={null} onActiveWorkChange={onActiveWorkChange} />)
+    expect(screen.getByRole('heading', { name: /让它做给你看/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: SIGNATURE_WORKS[1].action }))
+    expect(onActiveWorkChange).toHaveBeenLastCalledWith(SIGNATURE_WORKS[1].id)
+    expect(screen.getByRole('heading', { name: /让它做给你看/ })).toBeInTheDocument()
   })
   it('restores whichever of the two works was opened', () => {
     render(<CaseShowroom onSelect={vi.fn()} />)

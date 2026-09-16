@@ -347,8 +347,9 @@ export function TutorialReplay({
 
   if (replay.status === "pending_capture" || !sourcePath) {
     return (
-      <p className="mt-1 text-[12.5px] leading-5 text-muted">
-        待真实运行采集。当前只展示经人工编写、可复查的案例步骤，绝不把模拟文字伪装成 Agent 轨迹。
+      // 「待采集」是流水线内部词（审计 TU-10）；字号抬到语义档 text-meta（TU-22）。
+      <p className="mt-1 text-meta leading-5 text-muted">
+        这个案例还没有真实运行记录。当前只展示经人工编写、可复查的案例步骤，不会把模拟文字伪装成智能体轨迹。
       </p>
     );
   }
@@ -357,7 +358,7 @@ export function TutorialReplay({
     ? loadState
     : ({ status: "idle", sourcePath } as const);
   const provenance = (
-    <div className="mt-3 rounded-lg bg-surface px-3 py-2 text-[11px] leading-5 text-faint">
+    <div className="mt-3 rounded-lg bg-surface px-3 py-2 text-caption leading-5 text-faint">
       <p>
         {replay.provenance.repeatRuns} 次独立运行 · {replay.provenance.messageCount} 条真实消息 · 发布 {replay.provenance.release}
       </p>

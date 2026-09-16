@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../lib/api'
 import type {
@@ -150,8 +150,75 @@ describe('CommunityTutorials', () => {
     await screen.findByText(summary.title)
     fireEvent.click(screen.getByRole('button', { name: '我的发布' }))
     expect(await screen.findByText('已上线教程')).toBeInTheDocument()
+    // 撤回先确认（TU-08）：单击不发请求，确认框写清「会从公开目录下线」。
     fireEvent.click(screen.getByRole('button', { name: '撤回' }))
+    const dialog = await screen.findByRole('dialog', { name: '撤回这份教程？' })
+    expect(dialog).toHaveTextContent('会从公开目录下线')
+    expect(api.withdrawCommunityTutorial).not.toHaveBeenCalled()
+    fireEvent.click(within(dialog).getByRole('button', { name: '撤回' }))
     await waitFor(() => expect(api.withdrawCommunityTutorial).toHaveBeenCalledWith(auth, 'approved-1'))
+  })
+
+  it('撤回确认框点「取消」不发请求（TU-08）', async () => {
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [
+        {
+          id: 'pending-1',
+          title: '待审核教程',
+          summary: '可以撤回。',
+          category: 'general',
+          bodyMarkdown: '# 正文',
+          status: 'pending',
+          reviewNote: null,
+          createdAt: '2026-08-12T11:00:00.000Z',
+          reviewedAt: null,
+          publishedAt: null,
+        },
+      ],
+      nextCursor: null,
+    })
+    render(<CommunityTutorials auth={auth} />)
+    await screen.findByText(summary.title)
+    fireEvent.click(screen.getByRole('button', { name: '我的发布' }))
+    expect(await screen.findByText('待审核教程')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '撤回' }))
+    const dialog = await screen.findByRole('dialog', { name: '撤回这份教程？' })
+    expect(dialog).toHaveTextContent('退出审核队列')
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(api.withdrawCommunityTutorial).not.toHaveBeenCalled()
+    // 「提交于」只到分钟，不带秒（TU-26）。
+    expect(screen.getByText(/提交于/)).not.toHaveTextContent(/:\d{2}:\d{2}/)
+  })
+
+  it('空表单不能提交：按钮禁用并写明第一条原因，API 不会被调用（TU-05）', async () => {
+    render(<CommunityTutorials auth={auth} />)
+    await screen.findByText(summary.title)
+    fireEvent.click(screen.getByRole('button', { name: '手写教程' }))
+    const submit = screen.getByRole('button', { name: '提交审核' })
+    expect(submit).toBeDisabled()
+    expect(screen.getByRole('status')).toHaveTextContent('标题至少 4 个字')
+    fireEvent.submit(submit.closest('form') as HTMLFormElement)
+    expect(api.submitCommunityTutorial).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText(/标题/), { target: { value: '足够长的标题' } })
+    expect(screen.getByRole('status')).toHaveTextContent('摘要至少 10 个字')
+    // 正文占位符是真正的多行，不再显示字面 \n（TU-06）。
+    expect(screen.getByLabelText(/教程正文/)).toHaveAttribute('placeholder', expect.stringContaining('\n\n## 准备'))
+    expect(screen.getByLabelText(/教程正文/).getAttribute('placeholder')).not.toContain('\\n')
+  })
+
+  it('目录读失败时给「重试」而不是空态，点重试再请求一次（TU-07）', async () => {
+    vi.mocked(api.listCommunityTutorials)
+      .mockRejectedValueOnce(new Error('502'))
+      .mockResolvedValueOnce({ tutorials: [summary], nextCursor: null })
+    render(<CommunityTutorials />)
+    const retry = await screen.findByRole('button', { name: '重试' })
+    expect(screen.getByText(/加载教程工作室目录失败/)).toBeInTheDocument()
+    expect(screen.queryByText('还没有匹配的教程')).not.toBeInTheDocument()
+    fireEvent.click(retry)
+    expect(await screen.findByText(summary.title)).toBeInTheDocument()
+    expect(api.listCommunityTutorials).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument()
   })
 
   it('深链 initialDetailId 直接打开详情', async () => {
@@ -198,6 +265,8 @@ describe('CommunityTutorials', () => {
     expect(screen.getByText('已下架')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '撤回' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '撤回' }))
+    const dialog = await screen.findByRole('dialog', { name: '撤回这份教程？' })
+    fireEvent.click(within(dialog).getByRole('button', { name: '撤回' }))
     await waitFor(() => expect(api.withdrawCommunityTutorial).toHaveBeenCalledWith(auth, 'draft-1'))
     const takedownCard = screen.getByText('已下架教程').closest('article')
     expect(takedownCard).toBeTruthy()

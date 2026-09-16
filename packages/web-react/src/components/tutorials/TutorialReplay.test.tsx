@@ -215,7 +215,8 @@ describe("TutorialReplay", () => {
         replay={{ status: "pending_capture", disclosure: "尚未采集" }}
       />,
     );
-    expect(screen.getByText(/待真实运行采集/)).toBeInTheDocument();
+    expect(screen.getByText(/还没有真实运行记录/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("采集");
     expect(screen.queryByRole("button", { name: /加载真实完整过程/ })).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
   });

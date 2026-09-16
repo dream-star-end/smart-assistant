@@ -1,13 +1,25 @@
 import { SignatureGallery, SignatureDetail } from './SignatureShowcases'
-import type { SignatureWork } from '../../lib/tutorialSignatureWorks'
+import { SIGNATURE_WORKS, type SignatureWork } from '../../lib/tutorialSignatureWorks'
 import { ArrowLeft, ArrowRight, ArrowUpRight, Check, Download, ExternalLink, FileText } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { TUTORIAL_SHOWCASES, showcaseAsset, showcaseTask, type TutorialShowcase } from '../../lib/tutorialShowcase'
 import type { TutorialCase, TutorialCaseId } from '../../lib/tutorialCaseCatalog'
+import { SHOWCASE_IFRAME_SANDBOX } from '../../lib/tutorialStudio'
 import { cn } from '../../lib/utils'
-import { Button } from '../ui'
+import { Button, Skeleton } from '../ui'
 
-type Props = { onSelect: (id: TutorialCaseId) => void; onRun?: (item: TutorialCase) => void; actionLabel?: string }
+type Props = {
+  onSelect: (id: TutorialCaseId) => void
+  onRun?: (item: TutorialCase) => void
+  actionLabel?: string
+  /**
+   * 精选作品详情的选中态(审计 TU-02)。放在本组件内部时,导航「案例展厅」页签点了没有任何 state
+   * 变化、页面停在作品详情;由 TutorialCenter 持有后,页签与 clearToBrowse 都能把它清回画廊。
+   * 不传则退回组件内部 state(独立使用 / 旧调用方不受影响)。
+   */
+  activeWorkId?: SignatureWork['id'] | null
+  onActiveWorkChange?: (id: SignatureWork['id'] | null) => void
+}
 function ResultCover({ item }: { item: TutorialShowcase }) {
   const mint = item.theme === 'mint'
   const [failed, setFailed] = useState(false)
@@ -27,7 +39,7 @@ function ResultCover({ item }: { item: TutorialShowcase }) {
       <div className="relative my-7 grid grid-cols-3 gap-3" aria-label="实作结果摘要">
         {item.evidence.metrics.slice(0, 3).map((metric) => <div key={metric.label} className="min-w-0 border-l border-white/20 pl-3">
           <strong className={cn('block whitespace-nowrap text-[16px] font-semibold tracking-tight sm:text-[20px]', mint ? 'text-emerald-200' : 'text-sky-200')}>{metric.value}</strong>
-          <span className="mt-2 block text-[11px] leading-5 text-white/65">{metric.label}</span>
+          <span className="mt-2 block text-caption leading-5 text-white/65">{metric.label}</span>
         </div>)}
       </div>
       <div className="relative flex items-center justify-between border-t border-white/15 pt-4 text-caption text-white/65"><span>真实计算 · 数据和报告一起交付</span><ArrowUpRight size={17} /></div>
@@ -35,13 +47,20 @@ function ResultCover({ item }: { item: TutorialShowcase }) {
   )
 }
 
-export function CaseShowroom({ onSelect, onRun, actionLabel }: Props) {
-  const [activeWork, setActiveWork] = useState<SignatureWork | null>(null)
+export function CaseShowroom({ onSelect, onRun, actionLabel, activeWorkId, onActiveWorkChange }: Props) {
+  const [localWorkId, setLocalWorkId] = useState<SignatureWork['id'] | null>(null)
   const [restoreFocusWorkId, setRestoreFocusWorkId] = useState<SignatureWork['id'] | null>(null)
-  if (activeWork) return <SignatureDetail key={activeWork.id} work={activeWork} onBack={() => setActiveWork(null)} onRun={onRun} actionLabel={actionLabel} />
+  const controlled = activeWorkId !== undefined
+  const currentWorkId = controlled ? activeWorkId : localWorkId
+  const setWorkId = (id: SignatureWork['id'] | null) => {
+    if (!controlled) setLocalWorkId(id)
+    onActiveWorkChange?.(id)
+  }
+  const activeWork = currentWorkId ? SIGNATURE_WORKS.find((work) => work.id === currentWorkId) ?? null : null
+  if (activeWork) return <SignatureDetail key={activeWork.id} work={activeWork} onBack={() => setWorkId(null)} onRun={onRun} actionLabel={actionLabel} />
   return (
     <section className="mx-auto max-w-6xl px-4 pb-10 pt-8 sm:px-8 sm:pt-12">
-      <SignatureGallery onSelect={(work) => { setRestoreFocusWorkId(work.id); setActiveWork(work) }} restoreFocusWorkId={restoreFocusWorkId} />
+      <SignatureGallery onSelect={(work) => { setRestoreFocusWorkId(work.id); setWorkId(work.id) }} restoreFocusWorkId={restoreFocusWorkId} />
       <h2 className="text-[24px] font-semibold tracking-tight text-fg">还有这些，能直接用在工作里。</h2>
       <p className="mt-2 text-meta text-muted">从真实数据到可核对的结果。继续探索这些公开数据实作。</p>
       <div className="mt-9 grid gap-6 lg:grid-cols-2">
@@ -86,7 +105,8 @@ export function ShowcaseDetail({ item, onBack, onRun, actionLabel }: Omit<Props,
   }
   return (
     <article className="mx-auto max-w-5xl px-4 pb-12 pt-5 sm:px-8" data-showcase-id={item.caseId}>
-      <button type="button" onClick={onBack} className="inline-flex items-center gap-1.5 rounded text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"><ArrowLeft size={14} /> 返回案例展厅</button>
+      {/* 返回走 Button 原语,触屏自动 44px(审计 TU-11);桌面观感不变。 */}
+      <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2 text-muted hover:text-fg"><ArrowLeft size={14} /> 返回案例展厅</Button>
       <div className="mt-6 flex flex-wrap items-center gap-2 text-caption"><span className="rounded-full bg-accent-soft px-3 py-1 font-medium text-accent">{item.category}</span><span className="text-muted">公开数据实作 · 非完整会话回放</span></div>
       <h1 className="mt-4 max-w-3xl text-balance text-[29px] font-semibold leading-tight tracking-tight text-fg sm:text-[38px]">{item.title}</h1>
       <p className="mt-3 max-w-3xl text-body leading-7 text-muted">{item.lead}</p>
@@ -95,10 +115,12 @@ export function ShowcaseDetail({ item, onBack, onRun, actionLabel }: Omit<Props,
           <h2 className="flex items-center gap-2 text-meta font-semibold text-fg"><FileText size={16} /> 先看看，最后做出了什么</h2>
           <a href={showcaseAsset(item, 'dashboard.html')} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-caption text-accent">独立打开看板 <ExternalLink size={13} /></a>
         </div>
-        {preview ? <>
-          {!loaded && <p role="status" className="px-4 py-3 text-caption text-muted">{slow ? '预览加载较慢，可以用上方链接独立打开看板。' : '正在打开交互看板…'}</p>}
-          <iframe title={item.title + '交互看板'} src={showcaseAsset(item, 'dashboard.html')} sandbox="allow-scripts" referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[570px] w-full border-0 bg-[#f5f7fa]" />
-        </> : <div>
+        {preview ? <div className="relative">
+          {/* 加载期用骨架铺满预览区而不是一行灰字 + 白板；高度跟随视口、底色走 token 以适配暗色（审计 TU-28）。 */}
+          {!loaded && <div className="absolute inset-0 flex flex-col gap-3 p-4" aria-hidden><Skeleton className="h-8 w-1/3" /><Skeleton className="min-h-0 flex-1 w-full" /></div>}
+          {!loaded && <p role="status" className="absolute inset-x-0 bottom-3 px-4 text-center text-caption text-muted">{slow ? '预览加载较慢，可以用上方链接独立打开看板。' : '正在打开交互看板…'}</p>}
+          <iframe title={item.title + '交互看板'} src={showcaseAsset(item, 'dashboard.html')} sandbox={SHOWCASE_IFRAME_SANDBOX} referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[min(70dvh,570px)] w-full border-0 bg-surface" />
+        </div> : <div>
           <ResultCover item={item} />
           <div className="flex flex-wrap items-center justify-between gap-3 bg-surface px-5 py-4"><p className="text-meta text-muted">不是截图。切换条件，亲手探索这份数据。</p><Button variant="primary" onClick={() => setPreview(true)}>打开交互看板 <ArrowUpRight size={15} /></Button></div>
         </div>}

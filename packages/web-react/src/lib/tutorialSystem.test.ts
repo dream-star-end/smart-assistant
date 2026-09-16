@@ -96,6 +96,19 @@ describe("v5 教程单一能力注册表", () => {
       disabledReason: expect.stringContaining("管理员"),
     });
   });
+
+  it("部署关掉任务面板时「任务面板」教程 CTA 不可用并说明原因；未声明按开启处理（TU-32）", () => {
+    const base = { authenticated: true, featureImage2: true, microphone: true, orgRole: "owner" as const };
+    expect(resolveTutorialAction(PRODUCT_CAPABILITIES.taskboard, base).enabled).toBe(true);
+    expect(resolveTutorialAction(PRODUCT_CAPABILITIES.taskboard, { ...base, taskboardEnabled: true }).enabled).toBe(true);
+    expect(resolveTutorialAction(PRODUCT_CAPABILITIES.taskboard, { ...base, taskboardEnabled: false })).toMatchObject({
+      enabled: false,
+      label: "打开任务面板",
+      disabledReason: expect.stringContaining("未开启任务面板"),
+    });
+    // 只影响任务面板这一篇。
+    expect(resolveTutorialAction(PRODUCT_CAPABILITIES.chatBasics, { ...base, taskboardEnabled: false }).enabled).toBe(true);
+  });
 });
 
 describe("v5 真实场景案例注册表", () => {
