@@ -1,8 +1,9 @@
 # A·media 图片 / 媒体 / 容器网页预览 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-media`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，未改任何业务代码）
-- 结论：**P1 × 2 / P2 × 11 / P3 × 14**，共 27 条。两条 P1 都在图片查看器的子模式里：
+- 阶段：A（审计，未改任何业务代码）→ **B（修复，t-51）已完成**：P1 2/2、P2 11/11、P3 12/14 落地，
+  发现 27 / 修复 25 / 遗留 2（M-25 前端半条、M-27 归 shell），修复记录 / 验证 / 遗留见 §6–§8。
+- 阶段 A 结论：**P1 × 2 / P2 × 11 / P3 × 14**，共 27 条。两条 P1 都在图片查看器的子模式里：
   「调整大小」在 data:/缓存命中的图片上永远画不出图；「评论」模式在输入框里按 Esc 会把整个
   评论模式连同已落的全部锚点一起丢掉。
 
@@ -369,3 +370,130 @@ Chromium（Cursor 内置浏览器）里直接验证 `fetch('data:image/svg+xml;u
 | — | `ImageAnnotationEditor.wheelZoom` / `ContainerWebPreview.onWheel` 里的 `event.preventDefault()`（React 对 `wheel` 默认 passive，调用无效） | **不修** | 两处容器都已 `overflow-hidden` + 滚动锁，实际没有可感知后果；改成原生非 passive 监听收益低 |
 | — | `ImageViewer.flash()` 的 `setTimeout` 无卸载清理 | **不修** | React 19 对卸载后 setState 静默；1.8s 定时器无泄漏风险 |
 | — | `containerPreview.ts`、`useContainerPreview.ts` 逻辑层 | **未发现需修项** | 消息校验、重签、回退、心跳、清理路径完整；`send()` 静默返回 false 由上层处理 |
+
+---
+
+## 6. 修复记录（阶段 B · t-51）
+
+- 分支 `feat/v5-selfhost-audit-media`，阶段 A 基线 `f6e1893ba` 之上 8 个提交（subject 均为
+  feat/refactor/style/test/docs(v5)，无 fix(v5)），每次提交后已 push。
+- 交接：阶段 B 的 6 个代码提交（`50c51e6bf` … `62525de1d`）由上一手在本工作树完成并推送；
+  fable-5-1-36 接手时工作树只剩一处未提交改动（`browser-tests/run.mjs` 的 T30 用例随 M-05/M-06
+  更新，+42/−8）。接手后逐条对照 §4 核对 6 个提交、重跑全部验证门，把 T30 用例提交、顺手修掉
+  after 首拍暴露的一处存量布局问题（§6.2），再补本节与 §7/§8。
+- **统计：发现 27 / 修复 25 / 遗留 2**（M-25 只做前端能做的一半、M-27 归 shell，均计入遗留）。
+  P1 2/2、P2 11/11 全部落地；P3 14 条中 12 条落地。
+
+### 6.1 逐条映射（编号 → 状态 → 改动 → 用例 → 提交）
+
+| 编号 | 状态 | 改动（均在 `packages/web-react/src/components/`） | 用例 | 提交 |
+|---|---|---|---|---|
+| M-01 | ✅ | `ImageResizeMode.tsx`：删掉 `useEffect(() => setImgReady(false), [displaySrc])`，就绪态改为「记录已加载的 src」（`loadedSrc === displaySrc`），`onLoad` 读 DOM 的 `src` 属性而非闭包；`<img>` 加 ref 回调 `adoptLoadedImage`，挂载即 `complete && naturalWidth > 0`（data:/缓存命中）直接标就绪 | `ImageResizeMode.test` +4：load 前骨架/透明、load 后显形；挂载已 complete 直接显形；就绪后重渲不回退；重签换 src 回到占位再显形 | `50c51e6bf` |
+| M-02 | ✅ | `ImageCommentMode.tsx` 暴露 `escapeRef`（返回 `boolean`）：有草稿/正在改锚点 → `cancelInput()` 返回 true；有锚点无草稿 → 弹确认层返回 true；空白返回 false。`ImageViewer.tsx` 的 `onEscapeKeyDown` 在 `mode==='comment'` 时先调它，true 就 `preventDefault` 停止，false 才回 view；`ImageResizeMode` 同一 ref 加 `busy` 守卫（提交中不退） | `ImageViewer.test` +2：输入框内 Esc 只取消草稿、锚点保留、仍在评论模式（探针 V-01 翻成断言）；有锚点无草稿 Esc → 确认层，「继续评论」留、「放弃」回 view；无锚点 Esc 回 view（既有用例保留） | `50c51e6bf` |
+| M-03 | ✅ | `ImageCommentMode.tsx` 顶栏 X 走 `requestBack`：有锚点或未确认文字先弹 `role="alertdialog"` 确认层（「放弃这 N 条评论？返回后已添加的标注不会保留。」），空白直接 `onBack()`；与圈选编辑器同口径 | `ImageCommentMode.test` +3：空白点 X 直接退；有锚点点 X 先确认；输入条有未确认文字点 X 也先确认。`ImageViewer.test` +1：有锚点点 X 同样先确认 | `50c51e6bf` |
+| M-04 | ✅ | `MediaTaskCenter.tsx` 顶栏「刷新」旁加 `IconButton aria-label="关闭视频任务"`（触屏 44px），`onClick={() => onOpenChange(false)}`；Sheet 原语层的 `closeButton` 选项作为建议转 shell（§8） | `MediaTaskCenter.test` +1：点关闭 → `onOpenChange(false)` | `b6e3d0c8e` |
+| M-05 | ✅ | `MediaTaskCenter.tsx`：新增 `PHASE_LABEL`（`wait_gpu→等待算力`、`sampling/denoise/denoise_step→正在生成画面`、`upload→正在上传素材`、`compose/rendering→正在合成`…），与 status 同义的 phase（queued/completed/failed/canceled…）与未知值**不显示**，原始 phase 收进 `title`；`rev N` 不进正文、留在 `title`；`ERROR_LABEL` 把 `errorCode` 翻成可行动文案（`h3_oom/oom→显存不足：请缩短视频时长或降低分辨率后重试` 等，大小写不敏感），服务端原文收进「技术详情」`<details>`；`apiCall` 的 `HTTP ${status}` 改为按状态分文案（401/403、404、409、429、5xx） | `MediaTaskCenter.test` +3：phase/error 翻译且原值留在 title；`phaseLabel` 对同义/未知值返回 null；`failureSummary` 大小写不敏感 + 未知 code 走通用兜底 | `b6e3d0c8e` |
+| M-06 | ✅ | `MediaTaskCenter.tsx`：「取消项目」「取消」「重做」三处走 `useConfirm` 确认层（标题「取消这个视频任务？」/「取消整个项目？」/「重做这一镜？」，正文写清后果，`danger`）；进行中用 `pendingPath` ref 挡重复点击，对应按钮转圈、其余写按钮禁用 | `MediaTaskCenter.test` +1：点「取消」→ 确认层；「再想想」不发请求；确认发一次且期间按钮禁用；双击只发一次。浏览器门 T30 同步改写（见 §6.2） | `b6e3d0c8e` |
+| M-07 | ✅ | `ContainerWebPreview.tsx`：`Modal.onEscapeKeyDown` 在焦点位于画布/iframe 上时 `preventDefault` 且不关闭（画布自己的 `onKeyDown` 把 Escape 作为 `preview.key` 转发）；抽出 `requestClose()`：有已写评论或未保存草稿 → 确认层「关闭网页预览？…不会保留。想带走它们，请先点「加入输入框」」，X / 遮罩 / Esc（焦点在控件上）都走它；`submitReview` 不经此处 | `ContainerWebPreview.test` +2：画布聚焦按 Esc → `onClose` 未调用、`send` 收到 `preview.key Escape`；有评论点 X → 确认层，「继续评论」保留 | `113d3ffca` |
+| M-08 | ✅ | `ContainerWebPreview.tsx` `keyboardShortcut` 不再拦 `Tab` / `Shift+Tab`（留给浏览器移焦点到工具坞/顶栏）；`canvas` 的 `aria-label` 追加「按 Tab 离开画面」。按 §5「不拍板前按不转发 Tab 实施」 | `ContainerWebPreview.test` +1：画布上按 Tab → `preventDefault` 未调用、未转发 | `113d3ffca` |
+| M-09 | ✅ | `ContainerWebPreview.tsx`：`pointermove`（`pointerType==='touch'`，累计位移 > 8px 判定拖动）按 ≥50ms 节流把**增量**发成 `preview.wheel`（系数与既有 `*2` 一致）；`pointerup` 只处理「未移动 → click / select」，不再补发总位移；`pointercancel` 清状态。操作/评论两种模式都适用 | `ContainerWebPreview.test` +1：touch down → 3 次 move → up 收到 ≥2 条 `preview.wheel`、0 条 click；小位移 up → 1 条 click | `113d3ffca` |
+| M-10 | ✅ | `ContainerWebPreview.tsx`：全屏态 canvas `object-fill → object-contain`（比例失配留黑边不拉伸），`pointFromPointer` 按可见帧区换算坐标；监听 `visualViewport resize` + `orientationchange`（防抖 300ms），尺寸变化 ≥15% 或设备档（`max-width:767px`）翻转时重新 `readAccessProfile()` 并重连；手动选了模拟器设备时不跟随客户端视口 | `ContainerWebPreview.test` +3：letterbox 而非拉伸 + 坐标映射到可见帧；大幅变化重连、小幅不重连；手动选设备不跟随 | `113d3ffca` |
+| M-11 | ✅ | `ImageAnnotationEditor.tsx` 画布容器左侧为滑杆让位（`pl-14 sm:pl-16`，sm 起左右对称），滑杆保持 `absolute left-2`；<sm 滑杆高 `h-48 → h-40` | `ImageAnnotationEditor.test` +1：容器左内边距 ≥56px。after `media-annotation-editor--mobile--*` 滑杆与图片无重叠 | `2d75dbb45` |
+| M-12 | ✅ | `ImageAnnotationEditor.tsx`：`ToolButton` / `RoundBtn` 提到模块顶层，`tool/setTool/setToolsOpen` 走 props | `ImageAnnotationEditor.test` +2：聚焦「放大画布」点一次仍是同一节点且保持焦点（探针 A-02 翻成断言）；工具菜单契约不变 | `2d75dbb45` |
+| M-13 | ✅ | `ImageViewer.tsx` `ActionButton` 改 `aria-disabled` + 点击 `flash(reason)`（既有轻提示通道），保留 40% 透明视觉；「评论」禁用理由改为「当前模型不支持图片评论」 | `ImageViewer.test` 改 1：无 `submitImageEdit` 时点三动作 → 出现原因文案、不进入子模式 | `50c51e6bf` |
+| M-14 | ✅ | `ImageViewer.tsx`「更多」改用 `components/ui/DropdownMenu` 原语（黑底样式走 className），得到 `menu/menuitem` 语义、方向键、焦点归还；菜单开着时 Esc 只关菜单不关查看器 | `ImageViewer.test` +2 / 改 1：menu/menuitem 语义、键盘打开聚焦首项、方向键移动；菜单开着 Esc 只关菜单、焦点回触发钮；「新标签打开原图」既有用例改为 pointerdown 开 + `menuitem` 查询。⚠ 跨模块契约影响见 §6.3 X-M1 | `0a3594579` |
+| M-15 | ✅ | `ImageCommentMode.tsx` / `ImageResizeMode.tsx`：顶栏 X 补 `[@media(hover:none)]:size-11`；锚点 28px 圆点外包 44px 透明命中区（`before:absolute before:-inset-2`）；输入条删除/确认触屏 `size-11` | `ImageCommentMode.test` +1：锚点命中区 ≥44px、圆点仍 28px | `50c51e6bf` |
+| M-16 | ✅ | `MediaTaskCenter.tsx` 轮询与写操作后的回读走 `refresh(…, { silent: true })`，不碰全局 `loading`；`mutate` 记 `pendingPath` 做 busy 态（与 M-06 合做） | `MediaTaskCenter.test` +1：后台轮询期间「刷新」不进 loading 态；重复点击只发一次 | `b6e3d0c8e` |
+| M-17 | ✅（偏离） | `MediaTaskCenter.tsx`「单段视频」标题只在有内容、或空态卡片要挂在它下面时渲染；失败任务加 `CopyPromptButton`「复制提示词」（后端没有 `jobs/:id/retry`，「跳回对话预填」需 App 接线，见 §6.2/§8） | `MediaTaskCenter.test` +1：只有项目时不渲染「单段视频」标题；账号未开放不悬空标题的断言并入既有「未开放」用例 | `b6e3d0c8e` |
+| M-18 | ✅ | `MediaTaskCenter.tsx` 有步数的进度条走原语（`role="progressbar" aria-valuenow/min/max`）；算力失联横幅用 `<output>`（自带 `role=status`），错误横幅 `role="alert"`；`text-[12.5px]/[12px]/[13px]` 换 `text-caption/text-body` 语义档 | `MediaTaskCenter.test`：进度条 role 与 aria-valuenow 断言（并入 M-05 用例） | `b6e3d0c8e` |
+| M-19 | ✅ | `ContainerWebPreview.tsx` 区分 `disconnected`（`phase==='closed' && !error`）：标题「连接已断开」+ 文案「可能是运行环境进入休眠，或网页已停止。重新连接即可继续；已写的评论仍保留在这里。」+ 主按钮「重新连接」；「诊断详情」summary 升到 `text-meta` + `--preview-muted` + 内联 `minHeight: 44`（`styles.css` 的 11px/32px 归 shell，见 §8） | `ContainerWebPreview.test` +1：正常断开与连接失败文案不同 | `113d3ffca` |
+| M-20 | ✅ | `ContainerWebPreview.tsx` <430px 的「完成」改「加入」；加载期只保留画布中央阶段文案，状态胶囊 `!ready` 时隐藏 | `ContainerWebPreview.test` +1：窄屏提交按钮文案为「加入」；加载期状态胶囊不渲染的断言并入既有加载态用例。after `media-container-preview-loading--mobile` 顶部胶囊消失 | `113d3ffca` |
+| M-21 | ✅ | `ContainerWebPreview.tsx` 评论 textarea `⌘/Ctrl+Enter → onSave`（Enter 仍换行）；`announce()` 同文连播时追加零宽空格 nonce 让 aria-live 真的变化 | `ContainerWebPreview.test` +2：⌘/Ctrl+Enter 保存、Enter 不保存；同一句连播两次 live region 文本仍变化 | `113d3ffca` |
+| M-22 | ✅ | `ContainerWebPreview.tsx` 全屏沉浸态 `pointermove`（鼠标，节流 250ms）→ `keepControlsVisible()`；触屏不走这条（避免与被预览网页手势打架，按 §5 只做桌面） | `ContainerWebPreview.test` +1：mousemove 后控件回来，touch move 不触发 | `113d3ffca` |
+| M-23 | ✅ | `ImageAnnotationEditor.tsx` 提示词 textarea 自增高（`onInput` 设 `style.height`，`max-h-28` 封顶后内滚）；`hasSelection` 改为维护 `selectionDirty`，只在 undo/redo/restore 后扫一次 mask | `ImageAnnotationEditor.test` +1：三行文本后高度增长并在 112px 封顶（性能项无自动测试） | `2d75dbb45` |
+| M-24 | ✅（部分暂缓） | `ImageAnnotationEditor.tsx` 顶栏副标题与 sr-only 帮助文案去掉「每张 50 积分」只留「Image 2」；`ImageResizeMode.tsx` 头注同步。`productCapabilities` 没有价格字段，价格来源留给后端/计费侧（§8） | `ImageAnnotationEditor.test` +1：不再出现「每张 50 积分」 | `62525de1d` |
+| M-25 | ◐ 前端半条 | `ImageViewer.tsx`「复制链接」改名「复制临时链接」，复制后提示「已复制临时链接，链接稍后会失效」；「分享」无 `navigator.share` 时降级为同一提示。持久可分享地址需后端分享令牌（§8） | `ImageViewer.test` +1 / 改 1：「复制临时链接」写剪贴板并提示失效；既有「分享」用例改为断言降级提示说明是临时链接 | `0a3594579` |
+| M-26 | ✅ | `ImageCommentMode.tsx` 落点层键盘触发（`event.detail===0`）落在图片中心 (50%,50%)；上传文件扩展名按 `blob.type` 推导（jpeg → .jpg） | `ImageCommentMode.test` +1：上传件扩展名跟 blob 真实类型；既有两条落点用例断言 `(x: 50%, y: 50%)`（jsdom click 即 detail 0，覆盖键盘路径） | `50c51e6bf` |
+| M-27 | ⏸ 转 shell | `styles.css` 的 preview 10–11px 字号归 shell owner，本模块未动（§8） | — | — |
+
+### 6.2 计划偏离与计划外改动
+
+- **M-17 失败任务「重试」→「复制提示词」**：后端没有 `jobs/:id/retry`；计划里的备选「重新发起跳回对话预填 prompt」
+  要在 `App.tsx` 接线（把提示词写进 Composer 并关掉抽屉），归 shell。本模块先给最小可用的一步：
+  一键把提示词复制走，用户回到对话即可重新发起；接线诉求写进 §8。
+- **M-08 Tab 转发**：按 §5「不拍板前按不转发 Tab 实施」落地，`Ctrl+Shift+Tab` 才转发的备选未做；
+  被预览网页内需要 Tab 导航的场景由用户先点进画布再用方向键/鼠标，如需改口径可后续拍板。
+- **M-22 只做鼠标唤出**：与 §5 一致，触屏顶部边缘手势未做。
+- **M-24 / M-25**：与 §5 一致，只做前端能做的一半（去掉数字 / 改名并提示有效期）。
+- **计划外 ①（顺手修，`3e36d412f`）**：M-01 让主图显形后，after 首拍 `media-image-resize--desktop--*`
+  暴露一处存量布局问题：图片包裹层是 `inline-flex max-h-full`，自身高度不定，里面 `<img>` 的
+  `max-h-full` 解析不出来，1024×640 这类矮视口下 3:2 样图按满宽渲染到 569px 高、被 `overflow-hidden`
+  上下各裁约 90px（标题文字被切）。包裹层改为撑满图片区的 `flex h-full w-full` 容器（本模式没有锚点层，
+  不需要贴合图片）。复拍 `probe-resize-fit\` 6 张全部完整显示，移动端不受影响。同结构的
+  `ImageCommentMode`（`inline-block max-h-full`，需要贴合图片给锚点层定位）在本轮样图下未触发，记入 §8。
+- **计划外 ②（浏览器门用例，`17caf1222`）**：`browser-tests/run.mjs` 的 T30「视频任务中心持久排队、实时进度
+  与跨 worker 取消终态」原断言 `排队中 · queued` / `已取消 · canceled` 依赖协议 phase 原样拼进状态行，
+  M-05 后与 status 同义的 phase 不再显示、M-06 后取消先弹确认。用例改为：状态行不含 `· queued`、
+  生成中显示「生成中 · 正在生成画面」、点「取消」先弹「取消这个视频任务？」，「再想想」不发请求、
+  「取消任务」发一次且请求体仍为 `{}`。
+
+### 6.3 跨模块接线（本模块未动，需 shell / messages / 集成阶段处理）
+
+| 编号 | 文件（owner） | 需要的改动 | 为什么 |
+|---|---|---|---|
+| X-M1 | `src/components/chat/media.test.tsx:120-122`（messages） | 「更多」已是 Radix DropdownMenu：改为 `fireEvent.pointerDown(screen.getByRole("button", { name: "更多" }), { button: 0, pointerType: "mouse" })` 开菜单，`expect(await screen.findByRole("menuitem", { name: /新标签打开原图/ }))`（用例改 async）；或先 `fireEvent.keyDown(trigger, { key: "Escape" })` 关菜单再点「关闭预览」 | M-14 把「更多」从手写浮层换成菜单原语后，该用例按 `role=button` 找菜单项且用 click 开菜单 → 全量 `npm test` 红 1 例（`ZoomableImage 灯箱 > 点击缩略图 → 打开全屏查看器…`）。与 integ1 处理 sidebar-B/taskboard-B 契约更新同类 |
+| X-M2 | `src/styles.css`（shell） | `.preview-error-details summary` 11px/32px → 12px/44px；状态胶囊 10px、工具坞标签/提示条/次级按钮 11px 提到 `text-caption` 档（M-19 / M-27） | 本模块已在 summary 元素上用 `text-meta` + 内联 `minHeight: 44` 顶上，样式表层仍是旧值 |
+| X-M3 | `src/components/ui/Sheet.tsx`（shell，建议） | 给 `Sheet` 原语加可选 `closeButton` | M-04 已在 `MediaTaskCenter` 内自加关闭钮；其他用 Sheet 的抽屉窄屏同样只剩 6vw 遮罩 |
+| X-M4 | `App.tsx`（shell，可选） | 给 `MediaTaskCenter` 传 `onReusePrompt?: (prompt: string) => void`（关抽屉 + 写入 Composer 草稿），组件侧再把「复制提示词」升级为「重新发起」 | M-17 的完整形态；当前先落「复制提示词」，不接线也可用 |
+
+---
+
+## 7. 验证（阶段 B）
+
+全部在 `d:\code\test_project\test123\wt\media` 跑（09-16 20:14–20:37，fable-5-1-36 接手复核；上一手
+19:08–20:11 的 `typecheck-b1..b3` / `vitest-module` / `test-browser-1..3` 日志同在 `..\.audit-tmp\media\`）。
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0（`62525de1d`、`3e36d412f` 各跑一次） |
+| 模块单测 | `npx vitest run src/components/{ImageViewer,ImageAnnotationEditor,ImageCommentMode,ImageResizeMode,MediaTaskCenter,ContainerWebPreview}.test.tsx src/hooks/useContainerPreview.test.tsx src/lib/containerPreview.test.ts --maxWorkers=1` | ✅ 8 文件 / 107 例全绿（阶段 A 基线 8 文件 / 67 例，+40 例：ImageViewer +6、ImageAnnotationEditor +5、ImageCommentMode +5、ImageResizeMode +4、MediaTaskCenter +7、ContainerWebPreview +13；每条逻辑改动有用例，见 §6.1；无 `.only/.skip`） |
+| 全量单测 | `cd packages\web-react; npm test` | ◐ 276 文件 / 3742 例：274 文件 / 3739 例通过，红 3 例 —— `lib/tutorialShowcase.test.ts` 2 例为本机 `core.autocrlf=true` 把 HTML fixture LF→CRLF 的基线失败（shell-B / integ1 已登记，主克隆同红）；`components/chat/media.test.tsx` 1 例为 M-14 契约变化，修法见 §6.3 X-M1（messages 文件，本模块不越界） |
+| 真浏览器门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser`（日志 `..\.audit-tmp\media\test-browser-4.log`） | ✅ `run.mjs` 组件门 **67/67 全过**（含 T16/T17 容器预览沉浸态、T30 视频任务中心）；`node --test` 87 例 85 过 / 2 不过，2 例全在 `cc-switch-ascii-name.node-test.mjs`（settings `ApiKeysSection`，主克隆同红、integ1 登记的基线失败）。另：`ocv5-185-qa` 在本工作树曾因 Windows 无符号链接权限（`EPERM symlink packages/protocol`）报错，是环境问题，手工在 `packages/web-react/node_modules/@openclaude/protocol` 建 junction 后通过；不涉及仓库文件 |
+| 代码风格 | `npx biome lint <13 个改动文件>`，与主克隆 `v5-selfhost` 同文件逐个比对 | ✅ 新增诊断 0：`ImageViewer` 5/5、`ImageAnnotationEditor` 4/4、`ImageCommentMode` 1/1、`ImageResizeMode` 0（基线 1）、`MediaTaskCenter` 0/0、`ContainerWebPreview` 0/0、`ImageResizeMode.test` 1/1、其余 test 0/0、`run.mjs` 3/3（均为基线既有）。`biome check` 的 format / organizeImports 报错为基线既有（这批文件本来就不过 biome format：引号/分号风格），本轮沿用既有风格 |
+| 视觉 after | `OC_UI_SCENES=media-` `node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\media\after\` | ✅ 40 张全部成功（`failures: []`、`retried: []`、`unmockedApi: []`，按 HEAD `3e36d412f` 重拍） |
+
+after 对照（用 Read 逐张看，与 `..\before\` 同名图比）：
+
+- `media-image-resize--{desktop,mobile}--*`（M-01）—— before 四张只有深色骨架；after 主图完整显示，
+  桌面端在 1024×640 下也不再被上下裁切（计划外 ①；`..\probe-resize-fit\` 为修前后对照）。
+- `media-annotation-editor--mobile--*`（M-11 / M-24）—— 笔刷滑杆从压在图片左缘变为图片左侧独立一条，
+  图片右移让位、无重叠；顶栏副标题「Image 2 · 每张 50 积分」→「Image 2」。
+- `media-task-center--{desktop,mobile}--*`（M-04 / M-05 / M-18）—— 顶栏「刷新」右侧出现关闭 X；
+  「已完成 · done」→「已完成」、「生成中 · denoise_step」→「生成中 · 正在生成画面」、
+  「排队中 · wait_gpu」→「排队中 · 等待算力」、项目行「1/3 个分镜 · rev 4」→「1/3 个分镜」。
+- `media-task-center-unavailable--desktop--*`（M-17）—— 「本账号暂未开放」卡片下不再悬着空的「单段视频」标题。
+- `media-container-preview-loading--mobile--*`（M-20）—— 顶部「正在授权」状态胶囊消失，只留画布中央一处。
+- `media-container-preview-error--mobile--*`（M-19）—— 「诊断详情」由 11px 灰字升到 12px `--preview-muted`，命中高 44px。
+- `media-image-viewer*`、`media-image-comment*`、`media-task-center-empty*` —— 外观与 before 一致
+  （M-02/03/13/14/15/26 只改行为与命中区，静态图看不出）。
+
+**未跑（`NOT RUN`）**：真容器预览 ready 态 / 评论 / 触屏滚动 / 视口重连（本机无 v5 后端与容器，
+M-07~M-10 / M-19~M-22 只经 vitest 契约 + `run.mjs` T16/T17 沉浸态门）；真机 iOS Safari；
+`typecheck:preview`（shell-B 新增脚本，不在本分支基线上）。
+
+---
+
+## 8. 遗留
+
+| 项 | 现状 | 下一步 / 归属 |
+|---|---|---|
+| X-M1 `chat/media.test.tsx` 契约更新 | 全量 `npm test` 红 1 例，修法已写在 §6.3 | 集成②合入本分支时一并改（messages 文件），与 integ1 处理 sidebar-B/taskboard-B 同类 |
+| M-27 preview 10–11px 字号；M-19 summary 11px/32px 样式表层 | 本模块用元素级类 + 内联高度顶上 | shell owner 改 `styles.css`（§6.3 X-M2） |
+| M-04 Sheet 原语 `closeButton` | `MediaTaskCenter` 已自加 | shell owner 建议项（§6.3 X-M3） |
+| M-17 失败任务「重新发起」 | 当前「复制提示词」 | 后端若补 `jobs/:id/retry` 则接；否则 App 接 `onReusePrompt`（§6.3 X-M4） |
+| M-25 持久可分享地址 | 已改名「复制临时链接」并提示有效期 | 需后端分享令牌 / 公开链接接口 |
+| M-24 价格来源 | 已去掉硬编码数字 | `productCapabilities` 或计费接口给出价格字段后再显示 |
+| M-09 双指缩放 | 单指滚动已跟手 | 协议 `ContainerPreviewClientMessage` 增加 zoom 消息后再做 |
+| M-08 Tab 转发口径 | 按「不转发」落地 | 若用户需要在被预览网页内 Tab 导航，拍板后加 `Ctrl+Shift+Tab` 转发 |
+| `ImageCommentMode` 图片包裹层 `inline-block max-h-full` | 与计划外 ① 同结构，本轮样图（3:2）未触发；极端竖图 + 矮视口可能裁切 | 需在保持锚点层贴合图片的前提下改为 flex 收缩（`flex-col items-center` + `<img min-h-0>`）并加竖图场景截图验证，建议单独一条小活 |
+| 本机环境 | `ocv5-185-qa` 需 `packages/web-react/node_modules/@openclaude/protocol` junction（Windows 无符号链接权限）；`tutorialShowcase` / `cc-switch-ascii-name` 基线红 | 建议仓库级 `.gitattributes` 与测试脚本改 `symlinkSync(…, 'junction')`，本轮不动 |
