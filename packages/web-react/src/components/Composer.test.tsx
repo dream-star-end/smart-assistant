@@ -28,7 +28,6 @@ describe("Composer 两行式布局", () => {
     for (const el of [
       screen.getByTitle("添加附件"),
       screen.getByRole("button", { name: "更多选项" }),
-      screen.getByRole("button", { name: "关联 GitHub 仓库" }),
       screen.getByRole("button", { name: "语音输入" }),
       screen.getByRole("button", { name: "发送" }),
     ]) {
@@ -36,6 +35,14 @@ describe("Composer 两行式布局", () => {
     }
     // 工具行在输入行之后(视觉上位于下方)。
     expect(inputRow.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // 仓库入口:sm+ 在工具行(hidden sm:flex),<sm 在外壳下方底栏(sm:hidden)—— 390px 生成中 5 个 44px 按钮
+    // 加不可截断的未绑定 pill 会撑爆一行。
+    const pills = screen.getAllByRole("button", { name: "关联 GitHub 仓库" });
+    expect(pills).toHaveLength(2);
+    expect(screen.getByTestId("composer-repo-slot")).toHaveClass("hidden", "sm:flex");
+    expect(toolRow).toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.getByTestId("composer-repo-slot-mobile")).toHaveClass("sm:hidden");
+    expect(toolRow).not.toContainElement(screen.getByTestId("composer-repo-slot-mobile"));
   });
 
   test("品牌名来自 lib/brand,不写死(M-16)", () => {

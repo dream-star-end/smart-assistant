@@ -786,10 +786,11 @@ export function Composer({
                 )}
               </IconButton>
             )}
-            {/* GitHub 仓库入口从外部底栏并入工具行左侧(与附件/「+」同组,少一层视觉层级);
-                已绑定时 owner/repo 可截断,不挤右侧发送区。 */}
+            {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
+                390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
+                (after 截图实测 pill 压在排队键上),窄屏仍放在外壳下方的底栏(见下)。 */}
             {onOpenRepo && (
-              <span className="flex min-w-0 items-center" data-testid="composer-repo-slot">
+              <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
                 <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
               </span>
             )}
@@ -904,8 +905,14 @@ export function Composer({
           </div>
         </div>
       </div>
+      {/* 窄屏底栏:GitHub 仓库入口(sm+ 已并入工具行,这里只在 <sm 渲染)。 */}
+      {onOpenRepo && (
+        <div className="flex min-h-[30px] items-center px-1.5 py-1.5 sm:hidden" data-testid="composer-repo-slot-mobile">
+          <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
+        </div>
+      )}
       {/* 语音状态(录音/转写/错误)常驻 live region(C-19):容器随 voiceEnabled 常在、内容变化才被读屏播报;
-          无内容时 sr-only 不占位。GitHub 仓库入口已并入工具行,底栏不再承载它。 */}
+          无内容时 sr-only 不占位。 */}
       {voiceEnabled && (
         <output
           aria-live="polite"
