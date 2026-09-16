@@ -34,16 +34,16 @@
 
 全量门：集成① 记录 §5（ui-preview 118 场景 350 张）；集成② §5（227 场景 734 张）；集成③ §5（**`npm test` 298 文件 / 4213 例全绿 ×2、`run.mjs` 68/68、ui-preview 257 场景 854 张 failures 0、`typecheck:preview` 3 红全消、`check:tutorials` 转绿**）。已知基线失败（`cc-switch-ascii-name` ×2、`ocv5-185-qa` 需干净工作树 + junction、`MessageRenderer` beforeAll 并行偶发）见各轮 §6。
 
-## 待补占位（t-632 归档初稿已补齐 t-761 时的全部「待补」；下列为终稿 t-897 的「终稿补」项）
+## 待补占位（t-632 归档初稿已补齐 t-761 时的全部「待补」；下列标 **[待集成④]**，终稿 t-897 在集成④ 合入后补）
 
 | 项 | 等什么 |
 |---|---|
-| 补审专项摘要（hud t-836 / kp-automation t-838 / misc-p3 t-839 / 集成待办 t-865 / QA 复核 t-1029）合入 integration | 集成④ t-896；数字见 [SUMMARY.md §4](../SUMMARY.md) |
-| PermissionCard 专审 | permission-card-2（t-837 作废重开） |
-| a11y-B 三条（shell / mod-a / mod-b）与 t-762 走查 | t-893 / t-894 / t-895 |
-| tutorials 补写 agents / chat-basics 正文并恢复两处 `data-product-feature` | t-1046 |
-| QA 复核 B 轮 P3 / 二期 P3 | qa-b-p3 / qa-p3 |
-| 集成④ 记录 + 全量门 | t-896 |
+| 补审专项摘要 `archive/{hud,kp-automation,misc-p3}.md`（t-836 / t-838 / t-839，已验收）+ 集成待办 t-865 + QA 复核 t-1029 | **[待集成④]** t-896 合入后写摘要；数字已在 [SUMMARY.md §3](../SUMMARY.md) |
+| PermissionCard 专审摘要 `archive/permission-card.md`（t-875，已验收，17/17） | **[待集成④]** |
+| a11y 专项摘要 `archive/a11y.md`（t-762 走查 + t-893 / t-894 / t-895，均已验收） | **[待集成④]**；a11y-shell §5 约 10 处同源项待用户拍板新任务或遗留 |
+| tutorials 补写 agents / chat-basics 正文并恢复两处 `data-product-feature` | t-1046 **[待集成④]** |
+| QA 复核 B 轮 P3 / 二期 P3 报告（t-1038 / t-1028，已验收） | **[待集成④]** 随 qa-b-p3 / qa-p3 分支合入 |
+| 集成④ 记录 + 全量门 | t-896 **[待集成④]** |
 
 ## 相关决策
 
