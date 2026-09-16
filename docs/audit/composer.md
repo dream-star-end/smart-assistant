@@ -187,3 +187,103 @@
 | 本模块 vitest（24 个测试文件，`--maxWorkers=2`） | 绿：24 files / 230 tests passed，66s |
 | `npx biome check browser-tests/ui-preview/scenes-composer.tsx` | 绿（已按 biome 整理导入与格式，LF 行尾） |
 | `npm run test:browser` | NOT RUN（A 阶段未改业务代码） |
+
+---
+
+## 6. 修复记录（阶段 B）
+
+> 任务 t-35「B·composer 输入区/会话头/模型与目标修复」。分支 `feat/v5-selfhost-audit-composer`，阶段 B 提交（按时间）：
+> `ace3fcf73` → `7a582c50b` → `c250a6011` → `360c82f50` → `650faa009` → `0a1ba9544` → `3f99a5802`（本文档另有一条 docs 提交）。
+> 三任接力（fable-5-1-20 → fable-5-1-34 → fable-5-1-38），工作树与分支沿用，未重建。
+> 另承接 messages-B 移交的 **M-16**（`Composer.tsx` 品牌名硬编码）。
+
+### 6.1 编号 → 状态 → 改动 → 用例 → 提交
+
+| # | 状态 | 改动 | 用例 | 提交 |
+|---|---|---|---|---|
+| C-01 | ✅ | `Composer.tsx` 工具行拆两行：第一行 textarea 通栏 `w-full`（`data-testid=composer-input-row`），第二行工具行（`composer-tool-row`）左=附件/「+」/仓库（sm+），右=字数/状态/排队发送/语音/发送；按钮去掉 `mb-0.5` 基线补丁 | `Composer.test` 「textarea 独占第一行(父级不含任何按钮)…」 | `360c82f50` |
+| C-02 | ✅ | busy 且 canSend 时增「排队发送」次级键（`ListPlus`，aria-label 不含「停止」），点击 `submit()` + toast「已加入队列，本轮结束后发送」；「停止」仍唯一 Stop 控件 | `Composer.test` 「busy 且有正文 → 出现排队发送…」「busy 但空正文 / stopping 不出现」 | `ace3fcf73` |
+| C-03 | ✅ | 附件 `<label>` 加 `tabIndex=0` `role=button`，Enter/Space → `e.currentTarget.click()`（label 原生激活，非 `input.click()`；T4 三条红线不动） | `composerAttach.test` 「label 可聚焦…Enter/Space 各转发一次 click」「disabled 时退出 Tab 序列」 | `ace3fcf73` |
+| C-04 | ✅ | chip 移除键 `[@media(hover:none)]:size-11`、重试键 `min-h-11`、`gap-1.5` | `composerAttach.test` 「移除 / 重试在触屏下 44px…」 | `ace3fcf73` |
+| C-05 | ✅ | `GoalDialog` 「清除」走 `useConfirm` 二次确认（danger），按钮 `text-danger` | `GoalDialog.test` 「点清除先弹确认;取消不调 onAction…」 | `7a582c50b` |
+| C-06 | ✅ | `AgentPicker` 未就绪卡不再 `disabled`：可聚焦、`aria-disabled` + `aria-describedby` 给原因；新增可选 prop `onOpenPluginAuth?: (agent) => void`，传入时渲染「去授权 / 去处理」且整卡点击跳转（**计划偏离**：说明与按钮就地常显，不再多一跳弹说明） | `AgentPicker.test` 「未就绪 Agent 可聚焦(aria-disabled)…」「传入 onOpenPluginAuth 时渲染去授权…」「能力待修复…去处理」 | `650faa009` |
+| C-07 | ✅ | `ModelSelector` trigger 在 sm+ 追加「· 高」「· Fast」（Cursor 读 canonical id 档位，其它模型读会话偏好；团队模式不显） | `ModelSelector.test` 「触发器在 sm+ 追加当前思考档与 Fast…」「非 Cursor 模型按会话思考偏好…」 | `c250a6011` |
+| C-08 | ✅ | 已选模型 degraded → trigger 前置 `AlertTriangle` + `title` + `data-degraded` | `ModelSelector.test` 「已选模型 degraded → trigger 带警示图标与 title」 | `c250a6011` |
+| C-09 | ✅ | `EnvironmentPrepBar` 20s 后切不确定态（`animate-pulse` + 「仍在准备环境，请稍候…」，`data-overdue`） | `Composer.test` 「超过 20s 后切为不确定态…」 | `ace3fcf73` |
+| C-10 | ✅ | 发送键禁用原因以 `<output data-testid=composer-send-blocked-reason>` 就地可见；chip 失败原因就地第二行 | `composerAttach.test` 「有附件上传失败时工具行显示可见原因…」 | `ace3fcf73` |
+| C-11 | ✅ | `useVoiceInput` connecting / transcribing 各 15s 安全超时（`VOICE_STAGE_TIMEOUT_MS`）→ `fail()` 回 idle；录音阶段不设超时 | 新增 `useVoiceInput.test.ts` 3 条（不回 ready / 不回 polish / 按时到达不误报） | `c250a6011` |
+| C-12 | ✅ | `ChatHeader` 窄屏「更多操作」`DropdownMenu` 承接导出（桌面键 `hidden sm:flex` 不变） | `ChatHeader.test` 「窄屏更多操作菜单承接导出…」「无 onExport 时也不渲染更多操作」 | `c250a6011` |
+| C-13 | ✅ | `AgentScopePicker` 不在列表的选中 id 渲染为「已卸载 · <id 前 8 位>」灰徽章 + 「移除」，不可勾选 | `AgentScopePicker.test` 2 条 | `7a582c50b` |
+| C-14 | ✅ | 随 C-01 两行式布局一并解决（桌面左侧空白列消失） | 同 C-01 | `360c82f50` |
+| C-15 | ✅ | 禁用「+」title 改「会话目标暂不可用」；`browser-tests/run.mjs` T25 断言同步 | T25 | `ace3fcf73` |
+| C-16 | ⏸ 遗留 | 「+」菜单单项直达 —— 计划即定为 `ask_decision`，涉及 T2/T7/T25 用例契约改写，未在 B 阶段默认做 | — | — |
+| C-17 | ✅ | 「正在停止…」角落 caption 删除，仅保留 sr-only `<output aria-live>` 播报（placeholder 由 App 承载） | `Composer.test` 「stopping 态渲染可见正在停止…文案」保持 | `ace3fcf73` |
+| C-18 | ✅ | 文件名中段截断 `middleTruncate(name, 24)` 保留扩展名，完整名在 title | `composerAttach.test` 「middleTruncate…」 | `ace3fcf73` |
+| C-19 | ✅ | 语音错误常驻 6s（`VOICE_MSG_TTL_MS`）或下一次点麦克风清除；`voiceEnabled` 时常驻 `<output aria-live=polite data-testid=composer-voice-status>`（空时 sr-only） | `Composer.test` 「jsdom 无 MediaRecorder…不渲染语音状态 live region」；真机行为见 after 截图 | `360c82f50` |
+| C-20 | ✅ | 不支持 / 未登录时麦克风不再 `disabled`：`aria-disabled` + `data-voice-unavailable`，点击 toast 说明原因 | `Composer.test` 「jsdom 无 MediaRecorder → 麦克风 aria-disabled 但可点,点击 toast 说明原因」 | `360c82f50` |
+| C-21 | ✅ | `composerDraft.draftExceedsStorage()`（与 `writeDraft` 同源按字节判定）；超限时工具行显「草稿过长，刷新后不保留」 | `composerDraft.test` 「draftExceedsStorage 与 writeDraft 字节上限一致」；`Composer.test` 2 条 | `360c82f50` |
+| C-22 | ✅ | `onFiles` 用 `attachCountRef` 同步镜像算 room 并就地累加 | `composerAttach.test` 「同一帧内连续两次拖放,合计仍不超过上限」（突变验证：旧逻辑 14 > 8 必红） | `360c82f50` |
+| C-23 | ✅ | textarea 内 Esc（有引用、非生成中、非 IME 组合）取消引用 | `Composer.test` 「textarea 内按 Esc 取消引用;生成中不拦截」 | `360c82f50` |
+| C-24 | ✅ | `modKeyLabel()` 按平台显示 ⌘ / Ctrl+ | `ChatHeader.test` 「非 Mac 平台显示 Ctrl+F,Mac 显示 ⌘F」 | `c250a6011` |
+| C-25 | ✅ | 团队模式 trigger 前缀「团队模式 · 」→「队长引擎 · 」（chip 表达「团队模式」，trigger 说明实际生效引擎，「顶栏所见 = 实际所发」语义不丢） | `ChatHeader.test` L84 / `ModelSelector.test` 团队态断言同步 | `0a1ba9544` |
+| C-26 | ⏸ 遗留 | 余额「快用完」预警阈值 —— 前端无阈值来源，**需后端配合** | — | — |
+| C-27 | ✅ | 「最近」跳过与当前选中同一 cursor/context 家族的行 | `ModelSelector.test` 「与当前选中同一 Cursor 家族的最近记录不进最近分组」（突变验证通过） | `0a1ba9544` |
+| C-28 | ✅ | `loading` 时 trigger 图标换 spinner、追加「· 切换中…」、`aria-busy`、title「正在切换模型，请稍候」 | `ModelSelector.test` 「loading 且已有选中模型 → spinner + 切换中…」 | `0a1ba9544` |
+| C-29 | ✅ | 有搜索框时菜单打开焦点直接落进搜索框（Radix `DropdownMenu.Content` 不公开 `onOpenAutoFocus`，改镜像 open 状态 + 挂载后接管焦点） | `ModelSelector.test` 「≥8 模型时打开菜单焦点直接落在搜索框」（突变验证通过） | `0a1ba9544` |
+| C-30 | ⏸ 遗留 | Cursor 1M 档位是否要费用确认 —— 计划即定为 `ask_decision`（计费语义问题） | — | — |
+| C-31 | ✅ | blocked → warning 徽记；错误经 `apiErrorMessage`；目标输入换 `ui/Textarea`；表单只在打开时装载，打开期间服务端版本变化：无修改直接同步、有修改只提示 + 「重新载入」，自己发起的状态流转不算「别处更新」；label/控件 `htmlFor` 绑定 | `GoalDialog.test` 「受阻状态用 warning」+ 「打开期间的服务端更新」4 条 | `7a582c50b` `0a1ba9544` |
+| C-32 | ◐ 部分 | 顾问受阻前端兜底文案与顾问卡副标去掉「一期 / CCB」（服务端下发文案仍优先）。**团队卡「队长切 Astra …」未改**：`App.test.tsx`（shell）与 `ocv5-210-*` 5 个真浏览器用例按 `/队长切 Astra/` 取按钮，属跨模块契约，见 §8 | `AgentPicker.test` 顾问相关 3 条按 `/主模型不切换/` 保持 | `650faa009` |
+| C-33 | ✅ | 顾问型号 `<select>` → `ui/Select`（`inputSize=sm`，`htmlFor` 绑定）；首次加载在网格位置放 `ListSkeleton variant=card rows=2`；「同时作为新会话默认」**保留原生 checkbox**（App.test / ocv5-210-cas-identity 按 checkbox 契约 `check()/isChecked()`），只对齐尺寸与触控行高（**计划偏离**：不换 Switch） | `AgentPicker.test` 「列表未返回时网格内渲染骨架…」 | `650faa009` |
+| C-34 | ✅ | `AgentGate` 面板标题 h1 → h2；shortfall 经 `groupDigits` | 新增 `AgentGate.test.tsx` 4 条 | `0a1ba9544` |
+| C-35 | ✅ | `LongContextCostWarning` 合并字符串去空格；`AgentScopePicker` 标题/提示 `<sm` 上下堆叠 | `ModelSelector.test` L496 文案断言保持 | `7a582c50b` `0a1ba9544` |
+| M-16 | ✅ | `Composer.tsx` 品牌名（placeholder 默认值、「正在引用 从简」）改取 `lib/brand` 的 `BRAND.name` | `Composer.test` 「品牌名来自 lib/brand,不写死」 | `360c82f50` |
+
+**统计**：发现 36（P2 13 / P3 22 / 移交 M-16 1）｜修复 32（P2 13 全部 + P3 18 + M-16，含 C-32 部分）｜遗留 4（C-16、C-26、C-30、C-32 团队卡文案）。
+
+### 6.2 计划偏离
+
+1. **RepoPill 位置按视口分流**（4.1 计划写「第二行左侧 回形针 / 「+」/ RepoPill」）：sm+ 按计划并入工具行；`<sm` 仍放外壳下方底栏（原位置）。after 截图实测 390px 生成中工具行 = 5 个 44px 按钮 + 未绑定态不可截断的「关联 GitHub 仓库」pill，一行放不下、pill 压在排队键上（`3f99a5802`）。根因是 `components/github/RepoPill.tsx`（sidebar 归属）未绑定态文案无 `truncate`，见 §8。
+2. **C-06 说明就地常显**而非「点击弹出说明」，少一跳；「去授权」按钮与整卡点击都走 `onOpenPluginAuth`。
+3. **C-33 不换 Switch**：checkbox 是 App.test / ocv5-210 真浏览器用例的既有契约（`check()` / `isChecked()` / `toBeChecked()`）。
+4. **C-29 实现方式**：Radix `DropdownMenu.Content` 类型不含 `onOpenAutoFocus`（typecheck 红），改为镜像 open 状态 + `setTimeout(0)` 接管焦点，Escape / ArrowDown 仍放行到菜单。
+5. **C-25 文案**取「队长引擎 · <引擎>」而非单纯删前缀：删掉前缀后窄屏只剩引擎名，与普通模型无法区分；`ChatHeader.test` 原「团队模式 · GPT-6-Astra」断言按新语义同步（引擎名必须在 trigger 上）。
+6. `ChatHeader.tsx` 两个既有 `<button>` 补了 `type="button"`（biome `useButtonType`，顺手清理，无行为变化）。
+
+## 7. 验证（阶段 B）
+
+均在 `d:\code\test_project\test123\wt\composer`，HEAD `3f99a5802`（代码）。
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | 绿 |
+| 本模块 vitest | `cd packages\web-react; npx vitest run src/components/{Composer,composerAttach,ChatHeader,ModelSelector,GoalDialog,AgentPicker,AgentScopePicker,AgentGate}.test.tsx src/hooks src/lib/{composerDraft,modelPreferences,modelSwitch,recentModels,cursorModelPicker,agents,teamMode,goalStart,chatCreateTemplates,sessionEffort,sessionContextTier}.test.ts --maxWorkers=1` | 绿：**34 files / 350 tests**（A 阶段 24 files / 230 tests → 新增 5 个测试文件、+120 用例） |
+| 突变验证（用例确实咬得住） | C-22 换回旧 `attachments.length` → 14 > 8 红；C-27 去掉同家族 `continue` → 红；C-29 去掉 `focus()` → 红 | 三条均红后恢复 |
+| 真浏览器交互门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` **T1–T67 共 67 条全部 ok**（含本模块红线 T1–T4/T7/T18/T22/T23/T25/T27/T35/T41）；`node --test` 73 条 **70 pass / 3 fail**，3 条失败均与本模块无关且为基线既有：① `cc-switch-ascii-name`（settings `ApiKeysSection`）2 个子用例 —— 在主克隆 `v5-selfhost @ 43b7cd3a4` 上单独复跑同样 2/2 红；② `OCV5-185 real dual Chromium permission QA` —— `EPERM: operation not permitted, symlink`（Windows 无符号链接权限，环境问题） |
+| 代码风格 | `npx biome lint <改动文件>` | 本轮新增代码 0 新告警；`Composer.tsx` 10 条 / `GoalDialog.tsx` 2 条为基线既有（`useExhaustiveDependencies` 等，未动）。`biome check` 的 format 段因本机 `core.autocrlf=true` 工作副本全是 CRLF、且这批文件基线本就非 biome 格式（双引号/分号 vs 配置的单引号/无分号），对所有文件（含未改动）都报格式差异 —— 未执行 `format --write` 以免整文件重排 |
+| after 截图 | `$env:OC_UI_SHOTS='D:\code\test_project\test123\.audit-tmp\composer\after'; $env:OC_UI_SCENES='composer-'; node browser-tests\ui-preview\shoot.mjs` | **10 场景 / 40 张全部成功**，`failures: []`，`unmockedApi: []`；目录 `D:\code\test_project\test123\.audit-tmp\composer\after\`（与 `before\` 同名对照，PNG 不入库） |
+
+after 对照要点（已用 Read 逐张看）：
+- `composer-loaded--mobile`：正文由每行 8 字变为通栏约 20 字，工具按钮全部落到第二行；`composer-loaded--desktop`：正文左沿与引用块对齐，左侧空白列消失；顶栏 trigger 显「队长引擎 · GPT-6-Astra」。
+- `composer-busy--mobile`：生成中第二行为 附件 / 「+」/ **排队发送** / 语音 / 停止，仓库 pill 在外壳下方；`--desktop`：pill 在工具行左侧。
+- `composer-idle--mobile`：顶栏出现「更多操作」（⋯）承接导出；`composer-model-menu--desktop`：trigger「Opus 5 · 高 ×9.0」，菜单打开搜索框已聚焦（焦点环可见）。
+- `composer-agent-picker--desktop`：「数据采集助手 · Plugin 待授权」卡显示「有 1 项插件待授权，完成授权后即可使用」（场景未传 `onOpenPluginAuth`，按设计不出按钮）；顾问型号为设计系统下拉；顾问卡副标不再带「一期 / CCB」。
+- `composer-goal-dialog`：目标输入为 `ui/Textarea`，「清除」danger 色靠右。
+
+## 8. 遗留
+
+| 项 | 处理 | 说明 |
+|---|---|---|
+| C-16 「+」菜单单项直达 | 待 `ask_decision` | 改直达按钮需同步改写 T2 / T7 / T25 真浏览器用例契约；不做是安全默认，故未开卡阻塞本任务 |
+| C-30 Cursor 1M 档位费用确认 | 待 `ask_decision` | 与 GPT 1M（单价 ×1.5）计费语义不同，是否复用同一确认框是产品口径 |
+| C-26 余额预警阈值 | 需后端配合 | 前端无阈值字段；硬编码会与套餐漂移 |
+| C-32 团队卡「队长切 Astra 并委派已安装智能体」 | 跨模块协调 | 文案含内部代号且硬编码，但 `App.test.tsx`（shell，7 处）与 `browser-tests/ocv5-210-{advisor-ui,advisor-app,advisor-dual-app,advisor-cold-retry,cas-identity}.node-test.mjs` 按 `/队长切 Astra/` 取按钮；建议改为 `队长切换为 ${DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} …` 并同批改用例（owner：shell + QA） |
+
+## 9. 跨模块接线（composer 侧只加可选 prop，App.tsx 等由集成②接线）
+
+| 需求 | composer 侧现状 | 对方需做 | owner |
+|---|---|---|---|
+| 未就绪智能体「去授权」 | `AgentPicker` 新增可选 prop `onOpenPluginAuth?: (agent: Agent) => void`；未接线时只显说明、不阻塞合入 | `App.tsx` AgentPicker 处传 `onOpenPluginAuth={() => openManage("plugins")}`（或等价的管理中心插件页入口）一行 | shell / 集成② |
+| 窄屏仓库 pill 可截断 | `Composer` 已按视口分流规避溢出 | `components/github/RepoPill.tsx` 未绑定态 `<span className="whitespace-nowrap">关联 GitHub 仓库</span>` 补 `min-w-0 truncate`，之后 composer 可把 `<sm` 的 pill 也并回工具行 | sidebar |
+| 排队消息的时间线状态 | Composer 只补了入口与 toast（C-02） | `status=queued` 气泡展示（计划 4.2 已移交） | messages |
+| C-26 阈值 | — | 后端在余额接口下发提醒阈值 | 后端 |
+| C-32 团队卡文案 | 见 §8 | 同批改 `App.test.tsx` 与 ocv5-210 用例 | shell + QA |
