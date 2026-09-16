@@ -1,5 +1,5 @@
-import { Check, Loader2, ShieldCheck, Store, Users } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { Check, KeyRound, Loader2, ShieldCheck, Store, Users } from 'lucide-react'
+import { useEffect, useId, useState } from 'react'
 import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
@@ -8,7 +8,7 @@ import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { AgentAvatar } from './AgentAvatar'
-import { Badge, Modal, Switch } from './ui'
+import { Badge, Button, ListSkeleton, Modal, Select, Switch } from './ui'
 
 /**
  * B-positioning agent picker: lists the user's agents from /api/marketplace/my-agents
@@ -42,6 +42,7 @@ export function AgentPicker({
   onToggleTeamMode,
   onCollabModeChange,
   onAdvisorModelChange,
+  onOpenPluginAuth,
 }: {
   open: boolean
   current: Agent
@@ -64,6 +65,11 @@ export function AgentPicker({
   onToggleTeamMode?: (v: boolean) => void
   onCollabModeChange?: (mode: 'solo' | 'advisor' | 'team') => void
   onAdvisorModelChange?: (id: string) => void
+  /**
+   * 未就绪智能体(Plugin 待授权 / 能力待修复)的恢复入口(C-06):传入则卡片内出现「去授权」并可点整卡跳转
+   * (调用方通常接到管理中心插件页);不传则卡片只保留说明,不阻塞合入。
+   */
+  onOpenPluginAuth?: (agent: Agent) => void
 }) {
   const mode = collabMode ?? (teamMode ? 'team' : 'solo')
   const advisorBlocked = !advisorParentCapabilityAllowed({
@@ -71,11 +77,12 @@ export function AgentPicker({
     advisorConsultParents,
     advisorConsultAllowed,
   })
+  // 服务端下发的原因文案优先;前端兜底句不再带「一期 / CCB」这类内部代号(C-32)。
   const advisorBlockReason =
-    advisorConsultParentReason ||
-    '一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。'
+    advisorConsultParentReason || '当前主模型暂不支持咨询顾问。主模型不会因此被切换。'
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
   const [loading, setLoading] = useState(false)
+  const advisorSelectId = useId()
 
   useEffect(() => {
     if (!open || !auth) return
@@ -107,7 +114,8 @@ export function AgentPicker({
       description="全能助手与官方预设助手开箱即用，更多智能体可从市场安装。"
       className="max-w-2xl"
     >
-      {loading && (
+      {/* 已有列表时的重拉只给一行轻提示;首次加载(网格还空着)改在网格位置放骨架卡(见下),避免先空后跳(C-33)。 */}
+      {loading && others.length > 0 && (
         <div className="mb-2 flex items-center gap-2 text-meta text-faint">
           <Loader2 size={13} className="animate-spin" /> 加载你的智能体…
         </div>
@@ -190,7 +198,7 @@ export function AgentPicker({
                   顾问
                 </span>
                 <span className="mt-0.5 block text-[11px] leading-snug">
-                  {advisorBlocked ? advisorBlockReason : '主模型不切换；一期仅 CCB 主会话可咨询'}
+                  {advisorBlocked ? advisorBlockReason : '主模型不切换；仅当前会话支持时可咨询'}
                 </span>
               </button>
               <button
@@ -221,21 +229,26 @@ export function AgentPicker({
             {mode === 'advisor' && (
               <div className="flex flex-col gap-1.5">
                 {advisorModels.length > 0 ? (
-                  <label className="text-[11.5px] leading-snug text-muted">
+                  <label htmlFor={advisorSelectId} className="text-[11.5px] leading-snug text-muted">
                     顾问型号
-                    <select
-                      className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1 text-[12.5px] text-fg"
-                      value={advisorModel && advisorModels.some((row) => row.id === advisorModel) ? advisorModel : advisorModels[0].id}
-                      onChange={(e) => onAdvisorModelChange?.(e.target.value)}
+                    {/* 原生裸 <select> 约 28px 高、样式与设计系统脱节(C-33):换 ui/Select(仍是原生控件,jsdom / 真机可测)。 */}
+                    <Select
+                      id={advisorSelectId}
+                      className="mt-1"
+                      inputSize="sm"
+                      value={
+                        advisorModel && advisorModels.some((row) => row.id === advisorModel)
+                          ? advisorModel
+                          : advisorModels[0].id
+                      }
+                      onValueChange={(id) => onAdvisorModelChange?.(id)}
+                      options={advisorModels.map((row) => ({
+                        value: row.id,
+                        label: `${row.label}（${row.engine}）`,
+                      }))}
                       data-product-control
                       aria-label="选择顾问型号"
-                    >
-                      {advisorModels.map((row) => (
-                        <option key={row.id} value={row.id}>
-                          {row.label}（{row.engine}）
-                        </option>
-                      ))}
-                    </select>
+                    />
                   </label>
                 ) : (
                   <span className="text-[11.5px] leading-snug text-warning">
@@ -248,12 +261,15 @@ export function AgentPicker({
               </div>
             )}
             {onAsDefaultChange && (
-              <label className="flex items-center gap-2 text-[11.5px] text-muted">
+              // 保持原生 checkbox(App.test / ocv5-210 真浏览器用例按 checkbox 契约 check/isChecked),
+              // 只把控件尺寸与触控行高对齐设计系统(C-33)。
+              <label className="flex items-center gap-2 text-[11.5px] text-muted [@media(hover:none)]:min-h-11">
                 <input
                   type="checkbox"
                   checked={!!asDefault}
                   onChange={(e) => onAsDefaultChange(e.target.checked)}
                   data-product-control
+                  className="size-4 shrink-0 cursor-pointer rounded border-border accent-accent"
                 />
                 同时作为新会话默认（不改当前会话以外的覆盖）
               </label>
@@ -284,23 +300,78 @@ export function AgentPicker({
 
       {/* 其它已安装 agent + 市场入口 —— 2 列均匀网格 */}
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        {loading && others.length === 0 && <ListSkeleton variant="card" rows={2} className="contents" />}
         {others.map((a) => {
           const active = a.id === current.id
           const unavailable = a.ready === false
+          const needsAuth = (a.needsAuthorization?.length ?? 0) > 0
+          const whyId = `agent-unavailable-${a.id}`
+          if (unavailable) {
+            // 不可用卡此前整卡 disabled(C-06):不可聚焦、读屏读不到原因、也没有任何去处理的入口。
+            // 现在保持可聚焦(aria-disabled 表达「不能选」),说明文案挂 aria-describedby,并在传入
+            // onOpenPluginAuth 时提供「去授权」—— 整卡点击同样跳转,不会静默无反应。
+            return (
+              <div
+                key={a.id}
+                data-testid={`agent-card-unavailable-${a.id}`}
+                className="flex flex-col overflow-hidden rounded-xl border border-warning/35 bg-warning-soft/25"
+              >
+                <button
+                  type="button"
+                  data-product-feature={PRODUCT_CAPABILITIES.agents.id}
+                  aria-disabled="true"
+                  aria-describedby={whyId}
+                  title={onOpenPluginAuth ? '前往授权 / 修复所需能力' : undefined}
+                  onClick={() => onOpenPluginAuth?.(a)}
+                  className={cn(
+                    'flex w-full items-start gap-3 p-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
+                    onOpenPluginAuth ? 'hover:bg-warning-soft/60' : 'cursor-default',
+                  )}
+                >
+                  <AgentAvatar agent={a} className="size-10 rounded-lg opacity-80 shadow-sm" iconSize={19} />
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
+                      {a.preset && <Badge tone="accent">预设</Badge>}
+                      <Badge tone="warning">{needsAuth ? 'Plugin 待授权' : '能力待修复'}</Badge>
+                    </span>
+                    <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
+                      {a.description}
+                    </span>
+                    <span id={whyId} className="mt-1 block text-[11.5px] leading-snug text-warning">
+                      {needsAuth
+                        ? `有 ${a.needsAuthorization?.length ?? 0} 项插件待授权，完成授权后即可使用`
+                        : '所需能力暂不可用，修复后即可使用'}
+                    </span>
+                  </span>
+                </button>
+                {onOpenPluginAuth && (
+                  <div className="flex justify-end border-t border-warning/25 px-3 py-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      data-product-control
+                      onClick={() => onOpenPluginAuth(a)}
+                    >
+                      <KeyRound size={13} />
+                      {needsAuth ? '去授权' : '去处理'}
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )
+          }
           return (
             <button
               type="button"
               data-product-feature={PRODUCT_CAPABILITIES.agents.id}
               key={a.id}
               onClick={() => onPick(a)}
-              disabled={unavailable}
               className={cn(
-                'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-65',
+                'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
                 active
                   ? 'border-accent bg-accent-soft'
-                  : unavailable
-                    ? 'border-warning/35 bg-warning-soft/25'
-                    : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
+                  : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
               )}
             >
               <AgentAvatar agent={a} className="size-10 rounded-lg shadow-sm" iconSize={19} />
@@ -308,21 +379,11 @@ export function AgentPicker({
                 <span className="flex items-center gap-1.5">
                   <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
                   {a.preset && <Badge tone="accent">预设</Badge>}
-                  {unavailable && (
-                    <Badge tone="warning">
-                      {(a.needsAuthorization?.length ?? 0) > 0 ? 'Plugin 待授权' : '能力待修复'}
-                    </Badge>
-                  )}
                   {active && <Check size={14} className="text-accent" />}
                 </span>
                 <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
                   {a.description}
                 </span>
-                {unavailable && (
-                  <span className="mt-1 block text-[11.5px] leading-snug text-warning">
-                    完成必需能力授权或修复后可使用
-                  </span>
-                )}
               </span>
             </button>
           )
