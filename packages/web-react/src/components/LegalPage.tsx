@@ -1,13 +1,17 @@
 import { ArrowLeft } from "lucide-react";
 import { useEffect } from "react";
+import { useTheme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
-import { LEGAL_DOCS, type LegalKind } from "../lib/legal";
+import { LEGAL_DOCS, type LegalKind, filedIcp } from "../lib/legal";
+import { ThemeToggle } from "./ThemeToggle";
 
 /**
  * 法律文本静态页(/terms 用户协议、/privacy 隐私政策)。
  *
  * 入口:main.tsx 对 location.pathname 的特判(与 App 内 /reset-password 特判同族,
  * 但这里是纯静态页、不需要任何 App 状态,故直接在入口层短路,不进 App 的 hooks)。
+ * 正因不进 <App>,用户已选的主题不会自动落到这一页 —— 本页自己调 useTheme(同一份
+ * localStorage 键 oc_theme),深色用户从登录页新标签打开协议不再被亮色页闪一下。
  * 正文权威源在 lib/legal.ts;本组件只负责渲染,不得内嵌任何条款文案。
  */
 
@@ -37,6 +41,8 @@ export function LegalDocBody({ kind }: { kind: LegalKind }) {
 export function LegalPage({ kind }: { kind: LegalKind }) {
   const doc = LEGAL_DOCS[kind];
   const other: LegalKind = kind === "terms" ? "privacy" : "terms";
+  const { theme, cycle } = useTheme();
+  const icp = filedIcp(BRAND.icp);
 
   useEffect(() => {
     const prev = document.title;
@@ -49,27 +55,39 @@ export function LegalPage({ kind }: { kind: LegalKind }) {
   return (
     <div className="min-h-screen bg-bg text-fg">
       <header className="sticky top-0 z-10 border-b border-border bg-bg/90 backdrop-blur">
-        <div className="mx-auto flex h-14 max-w-3xl items-center justify-between px-5">
+        <div className="mx-auto flex h-14 max-w-3xl items-center justify-between gap-3 px-5">
           <a href="/" className="flex items-center gap-2 text-title font-semibold text-fg hover:text-accent">
             <ArrowLeft size={16} />
             {BRAND.name}
           </a>
-          <a href={`/${other}`} className="text-body text-accent hover:underline">
-            {LEGAL_DOCS[other].title}
-          </a>
+          <div className="flex items-center gap-2">
+            <a href={`/${other}`} className="text-body text-accent hover:underline">
+              {LEGAL_DOCS[other].title}
+            </a>
+            <ThemeToggle theme={theme} onCycle={cycle} />
+          </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-3xl px-5 py-10">
         <h1 className="text-[26px] font-bold tracking-tight">{doc.title}</h1>
-        <p className="mt-2 text-body text-faint">更新日期:{doc.updated} · 生效日期:{doc.updated}</p>
+        {/* 更新日期与生效日期是同一个 TERMS_VERSION,只标一次,免得读者找两者差异。 */}
+        <p className="mt-2 text-body text-faint">生效日期：{doc.updated}</p>
 
         <div className="mt-6">
           <LegalDocBody kind={kind} />
         </div>
 
         <footer className="mt-12 border-t border-border pt-6 text-meta text-faint">
-          © {BRAND.year} {BRAND.company} · {BRAND.icp}
+          © {BRAND.year} {BRAND.company}
+          {icp && (
+            <>
+              {" · "}
+              <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer" className="hover:underline">
+                {icp}
+              </a>
+            </>
+          )}
         </footer>
       </main>
     </div>

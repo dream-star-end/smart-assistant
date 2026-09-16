@@ -69,6 +69,25 @@ describe("DesktopEnrollPage", () => {
     expect(document.body.textContent).toMatch(/链接无效/);
   });
 
+  // L-16:无效链接不能只剩一句话 —— 说清在哪重新发起,并给「返回首页」出口。
+  test("uuid 非法：提示如何重新发起,并有返回首页的出口", () => {
+    go("?enrollment_id=not-a-uuid");
+    const assign = vi.spyOn(enrollNavigation, "assign").mockImplementation(() => {});
+    render(<DesktopEnrollPage auth={auth} />);
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(`请回到 ${BRAND.nameEn} 里重新发起`);
+    fireEvent.click(screen.getByRole("button", { name: "返回首页" }));
+    expect(assign).toHaveBeenCalledWith("/");
+  });
+
+  test("取消走同一条可测导航缝回首页", () => {
+    const assign = vi.spyOn(enrollNavigation, "assign").mockImplementation(() => {});
+    render(<DesktopEnrollPage auth={auth} />);
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(assign).toHaveBeenCalledWith("/");
+    expect(confirmMock).not.toHaveBeenCalled();
+  });
+
   test("已登录可确认：展示品牌文案，不自动确认，计算机名缺省不显示", () => {
     render(<DesktopEnrollPage auth={auth} />);
     expect(
@@ -123,7 +142,7 @@ describe("DesktopEnrollPage", () => {
     [409, "DEVICE_LIMIT", "你已有一台电脑处于本地模式，请先在设置中解绑"],
     [409, "ENROLL_INVALID", `链接已过期，请在 ${BRAND.nameEn} 里重新发起`],
     [404, "NOT_FOUND", "本地模式未启用"],
-    [429, "RATE_LIMITED", "操作过于频繁"],
+    [429, "RATE_LIMITED", "操作过于频繁，请稍后再试"],
   ] as const)("错误码 %s %s 展示指定文案", async (status, code, copy) => {
     confirmMock.mockRejectedValue(
       new ApiError({ status, code, message: "internal english leak" }),

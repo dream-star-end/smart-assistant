@@ -198,6 +198,19 @@ export const landingScenes: Scene[] = [
       </ScrollTo>
     ),
   },
+  {
+    // landing-B L-03:窄屏头部导航折叠成菜单,点开后列出五个分区锚点。
+    id: 'landing-mobile-nav-open',
+    label: '落地页 · 窄屏折叠菜单展开(L-03)',
+    group: '工作区',
+    viewports: ['mobile'],
+    api: landingApi,
+    render: () => (
+      <AutoClick steps={[{ selector: 'button[aria-label="打开导航"]', delay: 500 }]}>
+        <Home />
+      </AutoClick>
+    ),
+  },
 
   // ── 登录 / 注册 / 验证 / 找回 / 重置 ──
   {
@@ -252,6 +265,19 @@ export const landingScenes: Scene[] = [
     group: '工作区',
     api: {},
     render: () => <Gate initialMode="register" allowRegistration={false} />,
+  },
+  {
+    // landing-B L-09:密码 / 确认密码各带一枚「显示密码」切换;这里把第一枚切到显示态。
+    id: 'auth-register-password-shown',
+    label: '注册 · 密码框切到显示态（L-09）',
+    group: '工作区',
+    viewports: ['desktop', 'mobile'],
+    api: {},
+    render: () => (
+      <AutoClick steps={[{ selector: 'button[aria-label="显示密码"]', delay: 400 }]}>
+        <Gate initialMode="register" />
+      </AutoClick>
+    ),
   },
   {
     id: 'auth-verify',

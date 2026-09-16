@@ -9,9 +9,15 @@
  * 注：headless 环境无法完成真实 CF 挑战，本组件仅保证「脚本加载 + render + 回调接线 +
  * 卸载清理」正确；真实挑战的端到端验证待 canary 关闭 bypass 后在浏览器侧确认。
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { cn } from "../lib/utils";
+import { Skeleton } from "./ui";
 
 const SCRIPT_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+
+/** 官方 normal 尺寸 widget 的固定尺寸(300×65):宿主先按它占位,脚本到位后不再把下方的提交按钮往下顶。 */
+const WIDGET_WIDTH_PX = 300;
+const WIDGET_HEIGHT_PX = 65;
 
 /** 官方 window.turnstile 的最小契约（只声明本组件用到的方法）。*/
 type TurnstileApi = {
@@ -96,11 +102,18 @@ export function TurnstileWidget({
   // 回调以 ref 持有，避免 token/expire 变更触发 widget 重建（render 一次即可）。
   const cbRef = useRef({ onToken, onExpire, onError });
   cbRef.current = { onToken, onExpire, onError };
+  // 脚本尚未把 iframe 画进宿主之前,用骨架占住同样的位置(否则登录卡在 widget 出现那一刻向下跳一次);
+  // 加载失败 / 没有 site key 时不再画骨架 —— 那两种情况上层已经给出「验证加载失败 + 重试」。
+  const [phase, setPhase] = useState<"loading" | "rendered" | "failed">("loading");
 
   useEffect(() => {
     let widgetId: string | null = null;
     let cancelled = false;
-    if (!siteKey) return;
+    if (!siteKey) {
+      setPhase("failed");
+      return;
+    }
+    setPhase("loading");
 
     loadTurnstile()
       .then((api) => {
@@ -116,9 +129,12 @@ export function TurnstileWidget({
             cbRef.current.onError?.();
           },
         });
+        setPhase("rendered");
       })
       .catch(() => {
-        if (!cancelled) cbRef.current.onError?.();
+        if (cancelled) return;
+        setPhase("failed");
+        cbRef.current.onError?.();
       });
 
     return () => {
@@ -134,5 +150,16 @@ export function TurnstileWidget({
     // siteKey/theme 变更才重建 widget；回调走 ref 不进 deps。
   }, [siteKey, theme]);
 
-  return <div ref={hostRef} className={className} data-testid="turnstile-widget" />;
+  return (
+    <div
+      className={cn("relative", className)}
+      // 失败态不再占位:上层的错误提示接管这块空间,别留一块 65px 的空白。
+      style={phase === "failed" ? undefined : { minWidth: WIDGET_WIDTH_PX, minHeight: WIDGET_HEIGHT_PX }}
+    >
+      {phase === "loading" && (
+        <Skeleton className="absolute inset-0 rounded-lg" data-testid="turnstile-skeleton" />
+      )}
+      <div ref={hostRef} data-testid="turnstile-widget" />
+    </div>
+  );
 }

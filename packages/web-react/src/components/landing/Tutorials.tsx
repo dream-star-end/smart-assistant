@@ -99,7 +99,6 @@ function StarterChip({ s }: { s: Starter }) {
           })
           .catch(() => {});
       }}
-      title="点击复制"
       className="group flex items-start gap-3 rounded-xl border border-border bg-surface px-4 py-3.5 text-left outline-none transition-[border-color,background-color,transform] duration-200 ease-standard hover:-translate-y-0.5 hover:border-accent/50 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
     >
       <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
@@ -111,11 +110,15 @@ function StarterChip({ s }: { s: Starter }) {
           {copied ? "已复制，去粘贴给它吧 ✓" : `「${s.text}」`}
         </span>
       </span>
-      <span className="mt-1 shrink-0 text-accent">
+      {/* 「可复制」的暗示常驻可见(触屏没有 hover,原生 title 也看不到),hover 只是加亮。 */}
+      <span className="mt-0.5 inline-flex shrink-0 items-center gap-1 text-caption font-medium text-accent">
         {copied ? (
-          <Check size={15} />
+          <Check size={14} />
         ) : (
-          <Copy size={15} className="opacity-0 transition-opacity group-hover:opacity-70" />
+          <>
+            <Copy size={13} className="opacity-70 transition-opacity group-hover:opacity-100" />
+            <span className="opacity-70 transition-opacity group-hover:opacity-100">复制</span>
+          </>
         )}
       </span>
     </button>
@@ -141,7 +144,9 @@ export function Tutorials() {
       <div className="mb-14 grid grid-cols-1 gap-4 sm:grid-cols-3">
         {QUICKSTART.map((s) => (
           <div key={s.n} className="relative rounded-2xl border border-border bg-surface p-6">
-            <span className="flex size-9 items-center justify-center rounded-full bg-grad-cta text-title font-semibold text-white shadow-sm">
+            {/* 前景色走 token 而非写死 text-white:落地页作用域把 --grad-cta 换成了柠檬绿,
+                白字压上去只有约 1.3:1;--primary-fg 在同一作用域被覆盖成深色墨,与 Button primary 一致。 */}
+            <span className="flex size-9 items-center justify-center rounded-full bg-grad-cta text-title font-semibold text-primary-fg shadow-sm">
               {s.n}
             </span>
             <h3 className="mt-4 text-[17px] font-semibold">{s.title}</h3>
@@ -160,7 +165,7 @@ export function Tutorials() {
         </div>
         <a
           href={tutorialHref(window.location)}
-          className="mt-4 inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-grad-cta px-4 py-2.5 text-section font-semibold text-white shadow-sm outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring sm:mt-0"
+          className="mt-4 inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-grad-cta px-4 py-2.5 text-section font-semibold text-primary-fg shadow-sm outline-none transition-transform hover:-translate-y-0.5 focus-visible:ring-2 focus-visible:ring-ring sm:mt-0"
         >
           打开案例展厅
           <ArrowRight size={15} />
