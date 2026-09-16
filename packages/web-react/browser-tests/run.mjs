@@ -2776,7 +2776,11 @@ await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用
 await check("T30 视频任务中心持久排队、实时进度与跨 worker 取消终态", async () => {
   await page.evaluate(() => window.__openMediaTask(true));
   await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
-  await page.getByText("排队中 · queued", { exact: true }).waitFor({ state: "visible" });
+  // 审计 M-05：与 status 同义的 phase（queued/canceled）不再重复拼在状态后面，原始 phase 只留在 title 里排障。
+  await page.getByText("排队中", { exact: true }).first().waitFor({ state: "visible" });
+  if (await page.getByText(/· queued/).count()) {
+    throw new Error("任务状态行仍把协议 phase 枚举原样拼给用户");
+  }
   await page.evaluate(() => window.__pushMediaJob({
     id: "33333333-3333-4333-8333-333333333333",
     requestId: "browser-media-request",
@@ -2800,15 +2804,46 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     updatedAt: "2026-08-05T00:00:01.000Z",
   }));
   await page.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
-  const canceled = page.waitForRequest((request) =>
-    request.method() === "POST" && request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
-  );
-  // exact:true:同页 #interrupted-tool-status-root 的工具卡表头可及名含「已取消」(tools T-22 起
-  // 表头可及名 = 标签 + 摘要 + 状态),子串匹配会撞成 strict mode violation。
-  await page.getByRole("button", { name: "取消", exact: true }).click();
-  const request = await canceled;
-  if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
-  await page.getByText("已取消 · canceled", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  await page.getByText("生成中 · 正在生成画面", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const cancelRequests = [];
+  const onCancelRequest = (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel")
+    ) {
+      cancelRequests.push(request);
+    }
+  };
+  page.on("request", onCancelRequest);
+  try {
+    // 审计 M-06：取消是不可逆操作，先弹确认层；「再想想」不发请求，「取消任务」才发且只发一次。
+    // exact:true:同页 #interrupted-tool-status-root 的工具卡表头可及名含「已取消」(tools T-22 起
+    // 表头可及名 = 标签 + 摘要 + 状态),子串匹配会撞成 strict mode violation。
+    await page.getByRole("button", { name: "取消", exact: true }).click();
+    const confirmDialog = page.getByRole("dialog", { name: "取消这个视频任务？" });
+    await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
+    await confirmDialog.getByRole("button", { name: "再想想" }).click();
+    await confirmDialog.waitFor({ state: "hidden", timeout: 3000 });
+    await page.waitForTimeout(300);
+    if (cancelRequests.length !== 0) throw new Error("「再想想」不该发出取消请求");
+
+    await page.getByRole("button", { name: "取消", exact: true }).click();
+    await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
+    const canceled = page.waitForRequest(
+      (request) =>
+        request.method() === "POST" &&
+        request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
+      { timeout: 5000 },
+    );
+    await confirmDialog.getByRole("button", { name: "取消任务" }).click();
+    const request = await canceled;
+    if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
+  } finally {
+    page.off("request", onCancelRequest);
+  }
+  // M-05 起状态行不再拼协议 phase(原「已取消 · canceled」),只剩「已取消」。
+  await page.getByText("已取消", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
+  if (cancelRequests.length !== 1) throw new Error(`取消请求应只发一次，实际 ${cancelRequests.length} 次`);
   if (await page.getByRole("button", { name: "取消", exact: true }).count()) {
     throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
   }

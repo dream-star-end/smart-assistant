@@ -101,6 +101,68 @@ function hasSelection(canvas: HTMLCanvasElement): boolean {
 export const BRUSH_MIN = 12
 export const BRUSH_MAX = 180
 
+// 工具元数据(触发钮回显当前工具图标 + 菜单列表共用单一权威)。
+const TOOLS: { value: Tool; label: string; icon: React.ReactNode }[] = [
+  { value: 'brush', label: '画笔', icon: <Brush size={18} /> },
+  { value: 'rect', label: '矩形', icon: <Square size={18} /> },
+  { value: 'lasso', label: '套索', icon: <LassoSelect size={18} /> },
+  { value: 'erase', label: '橡皮', icon: <Eraser size={18} /> },
+]
+
+/**
+ * 底栏按钮两件套。**必须**定义在模块顶层:此前写在 ImageAnnotationEditor 函数体内,每次渲染都是
+ * 新的组件类型,任何一次 setState(撤销 / 缩放 / 落一笔)都让整段底栏卸载重挂 —— 焦点掉回 <body>,
+ * 键盘/读屏用户每按一下都要重新找位置(审计 M-12)。
+ */
+function ToolButton({
+  value,
+  label,
+  icon,
+  active,
+  onSelect,
+}: { value: Tool; label: string; icon: React.ReactNode; active: boolean; onSelect: (value: Tool) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(value)}
+      aria-pressed={active}
+      className={cn(
+        'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
+        active ? 'bg-white text-black' : 'text-white hover:bg-white/10',
+      )}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  )
+}
+
+function RoundBtn({
+  label,
+  icon,
+  onClick,
+  disabled,
+}: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex size-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 disabled:opacity-35"
+    >
+      {icon}
+    </button>
+  )
+}
+
+/** 提示词框自增高:单行起步,随内容长到 max-h-28(7rem)封顶后再内滚(审计 M-23)。 */
+function autoGrowTextarea(el: HTMLTextAreaElement) {
+  el.style.height = 'auto'
+  const max = 112 // 与 className 的 max-h-28 一致
+  el.style.height = `${Math.min(el.scrollHeight, max)}px`
+}
+
 /** 左侧竖直锥形笔刷滑杆(粗上细下)。**完整拖动交互**(需求 §3):pointerdown+move 连续跟手,
  * 鼠标/触摸同一路径(pointer 事件统一),拖动时右侧气泡显示当前粗细;命中区 44px 宽(w-11)。
  * 键盘 ↑/↓/←/→ 微调、Home/End 到端点(role=slider)。此前是原生竖向 <input type=range>
@@ -689,54 +751,12 @@ export function ImageAnnotationEditor({
     }
   }
 
-  // 工具元数据(触发钮回显当前工具图标 + 菜单列表共用单一权威)。
-  const TOOLS: { value: Tool; label: string; icon: React.ReactNode }[] = [
-    { value: 'brush', label: '画笔', icon: <Brush size={18} /> },
-    { value: 'rect', label: '矩形', icon: <Square size={18} /> },
-    { value: 'lasso', label: '套索', icon: <LassoSelect size={18} /> },
-    { value: 'erase', label: '橡皮', icon: <Eraser size={18} /> },
-  ]
   const activeTool = TOOLS.find((t) => t.value === tool) ?? TOOLS[0]!
-
-  const ToolButton = ({
-    value,
-    label,
-    icon,
-  }: { value: Tool; label: string; icon: React.ReactNode }) => (
-    <button
-      type="button"
-      // 选完自动收起菜单(需求 §4)。
-      onClick={() => {
-        setTool(value)
-        setToolsOpen(false)
-      }}
-      aria-pressed={tool === value}
-      className={cn(
-        'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
-        tool === value ? 'bg-white text-black' : 'text-white hover:bg-white/10',
-      )}
-    >
-      {icon}
-      <span>{label}</span>
-    </button>
-  )
-
-  const RoundBtn = ({
-    label,
-    icon,
-    onClick,
-    disabled,
-  }: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }) => (
-    <button
-      type="button"
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-      className="flex size-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 disabled:opacity-35"
-    >
-      {icon}
-    </button>
-  )
+  // 选完自动收起菜单(需求 §4)。
+  const selectTool = (value: Tool) => {
+    setTool(value)
+    setToolsOpen(false)
+  }
 
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
@@ -777,7 +797,8 @@ export function ImageAnnotationEditor({
               <Dialog.Title className="text-sm font-semibold">
                 {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
               </Dialog.Title>
-              <span className="text-caption text-white/60">Image 2 · 每张 50 积分</span>
+              {/* 价格不在前端写死(审计 M-24):计费口径归后端/计费侧,前端没有可读的价格字段就不报数。 */}
+              <span className="text-caption text-white/60">Image 2</span>
             </div>
             <button
               type="button"
@@ -812,8 +833,10 @@ export function ImageAnnotationEditor({
               )}
             </button>
           </header>
-          {/* 画布区:左侧竖直笔刷滑杆 + 居中画布 */}
-          <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-3 py-2">
+          {/* 画布区:左侧竖直笔刷滑杆 + 居中画布。左内边距给滑杆让位(8px 边距 + 44px 命中区):
+              画布 max-w-full 从滑杆右侧起算,窄屏满宽图不再被滑杆压住左缘、也不再吃掉那一条的圈选
+              (审计 M-11);sm 起左右对称,画布回到居中。 */}
+          <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden py-2 pl-14 pr-3 sm:px-16">
             {loading && (
               <div className="absolute inset-0 z-20 overflow-hidden">
                 {/* 已缓存缩略图做模糊底图(零请求、禁纯白闪);未命中缓存则退化为纯深色底。 */}
@@ -896,6 +919,7 @@ export function ImageAnnotationEditor({
                 onChange={(e) => {
                   setPrompt(e.target.value)
                   setSubmitHint(null)
+                  autoGrowTextarea(e.currentTarget)
                 }}
                 // 桌面 Enter 提交、Shift+Enter 换行(需求 §5)。
                 onKeyDown={(e) => {
@@ -911,7 +935,7 @@ export function ImageAnnotationEditor({
               />
             </div>
             <p id="image-edit-help" className="sr-only">
-              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。每张 50 积分。
+              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。
             </p>
             <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-2">
               {/* 次级:矩形/套索/橡皮/清空收进「更多工具」——受控开合(需求 §4):选完/点外部/ESC
@@ -942,7 +966,14 @@ export function ImageAnnotationEditor({
                     />
                     <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl bg-neutral-900/95 p-2 text-white shadow-float backdrop-blur">
                       {TOOLS.map((t) => (
-                        <ToolButton key={t.value} value={t.value} label={t.label} icon={t.icon} />
+                        <ToolButton
+                          key={t.value}
+                          value={t.value}
+                          label={t.label}
+                          icon={t.icon}
+                          active={tool === t.value}
+                          onSelect={selectTool}
+                        />
                       ))}
                       <button
                         type="button"

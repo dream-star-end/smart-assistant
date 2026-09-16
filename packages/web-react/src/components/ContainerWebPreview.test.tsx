@@ -441,7 +441,7 @@ describe('ContainerWebPreview immersive UI', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 
-  test('Escape closes one surface at a time and preserves an unfinished comment', () => {
+  test('Escape closes one surface at a time and preserves an unfinished comment', async () => {
     const onClose = vi.fn()
     const view = render(<PreviewHarness onClose={onClose} />)
     fireEvent.click(screen.getByRole('button', { name: '评论' }))
@@ -465,7 +465,12 @@ describe('ContainerWebPreview immersive UI', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     fireEvent.keyDown(document, { key: 'Escape' })
     fireEvent.keyDown(document, { key: 'Escape' })
-    expect(onClose).toHaveBeenCalledTimes(1)
+    // M-07：还有未保存草稿时，最后一层 Esc 不再直接关掉预览，而是先问一句。
+    expect(onClose).not.toHaveBeenCalled()
+    const confirm = await screen.findByRole('dialog', { name: '关闭网页预览？' })
+    expect(confirm).toHaveTextContent('未保存的评论草稿不会保留')
+    fireEvent.click(within(confirm).getByRole('button', { name: '仍然关闭' }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
   })
 
   test('manages confirmed comments in a non-resident drawer with edit and delete', () => {
@@ -666,7 +671,9 @@ describe('ContainerWebPreview immersive UI', () => {
     const view = render(<PreviewHarness />)
     expect(screen.getByRole('button', { name: '评论' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '后退' })).toBeDisabled()
-    expect(screen.getAllByText('正在加载网页')).toHaveLength(2)
+    // M-20：加载期只保留画布中央那一句，状态胶囊不再同屏重复。
+    expect(screen.getByText('正在加载网页')).toBeInTheDocument()
+    expect(document.querySelector('.preview-status-pill')).toBeNull()
 
     previewMock.phase = 'closed'
     previewMock.error = {
@@ -679,5 +686,359 @@ describe('ContainerWebPreview immersive UI', () => {
     const before = previewMock.calls.at(-1)?.reconnectKey ?? 0
     fireEvent.click(screen.getByRole('button', { name: '重新连接' }))
     expect(previewMock.calls.at(-1)?.reconnectKey).toBe(before + 1)
+  })
+
+  test('shows the status pill only once the page is ready', () => {
+    render(<PreviewHarness />)
+    const pill = document.querySelector('.preview-status-pill')
+    expect(pill).not.toBeNull()
+    expect(pill).toHaveTextContent('实时预览')
+  })
+})
+
+/** 危险操作先弹确认层：在指定标题的对话框里点某个按钮。 */
+async function confirmIn(dialogName: string, action: string | RegExp) {
+  const dialog = await screen.findByRole('dialog', { name: dialogName })
+  fireEvent.click(within(dialog).getByRole('button', { name: action }))
+}
+
+/** 模拟远端回了一次元素选中，然后把评论写好并确认。`rerender` 每次都要造新元素，否则 React 会跳过重渲。 */
+function addComment(rerender: () => void, target: Target, text: string) {
+  previewMock.selection = { sequence: (previewMock.selection?.sequence ?? 0) + 1, target }
+  rerender()
+  fireEvent.change(screen.getByRole('textbox', { name: '描述网页修改' }), {
+    target: { value: text },
+  })
+  fireEvent.click(screen.getByRole('button', { name: '添加评论' }))
+}
+
+/** 与组件里 VIEWPORT_REFIT_DEBOUNCE_MS 一致：视口变化防抖 300ms 后才重新适配。 */
+const VIEWPORT_REFIT_WAIT = 300
+
+describe('ContainerWebPreview audit fixes', () => {
+  test('M-07: Escape on the focused canvas goes to the remote page instead of closing the preview', () => {
+    const onClose = vi.fn()
+    render(<PreviewHarness onClose={onClose} />)
+    const canvas = screen.getByLabelText('可交互网页画面')
+    canvas.focus()
+    expect(canvas).toHaveFocus()
+
+    fireEvent.keyDown(canvas, { key: 'Escape' })
+    expect(onClose).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog', { name: '关闭网页预览？' })).not.toBeInTheDocument()
+    expect(previewMock.send).toHaveBeenCalledWith({ type: 'preview.key', key: 'Escape' })
+
+    // 焦点不在画面上（在关闭钮上）时 Esc 才是「关闭预览」；没有评论就直接关。
+    screen.getByRole('button', { name: '关闭网页预览' }).focus()
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  test('M-07: closing with confirmed comments asks first and keeps them on "继续评论"', async () => {
+    const onClose = vi.fn()
+    const view = render(<PreviewHarness onClose={onClose} />)
+    const rerender = () => view.rerender(<PreviewHarness onClose={onClose} />)
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    addComment(rerender, heroTarget, '按钮改成品牌色')
+    addComment(rerender, cardTarget, '卡片加阴影')
+    expect(screen.getByRole('button', { name: '2 条评论' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: '返回操作网页' }))
+    fireEvent.click(screen.getByRole('button', { name: '关闭网页预览' }))
+    const dialog = await screen.findByRole('dialog', { name: '关闭网页预览？' })
+    expect(dialog).toHaveTextContent('已写的 2 条评论不会保留')
+    expect(onClose).not.toHaveBeenCalled()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '继续评论' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: '关闭网页预览？' })).not.toBeInTheDocument(),
+    )
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    expect(screen.getByRole('button', { name: '2 条评论' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: '返回操作网页' }))
+    fireEvent.click(screen.getByRole('button', { name: '关闭网页预览' }))
+    await confirmIn('关闭网页预览？', '仍然关闭')
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+  })
+
+  test('M-08: Tab is left to the browser so keyboard users can leave the canvas', () => {
+    render(<PreviewHarness />)
+    const canvas = screen.getByLabelText('可交互网页画面')
+    canvas.focus()
+    previewMock.send.mockClear()
+
+    expect(fireEvent.keyDown(canvas, { key: 'Tab' })).toBe(true)
+    expect(fireEvent.keyDown(canvas, { key: 'Tab', shiftKey: true })).toBe(true)
+    expect(previewMock.send).not.toHaveBeenCalled()
+    expect(canvas).toHaveAccessibleDescription(/按 Tab 离开画面/)
+
+    // 其余快捷键仍然转发（且拦掉浏览器默认行为）。
+    expect(fireEvent.keyDown(canvas, { key: 'ArrowDown' })).toBe(false)
+    expect(previewMock.send).toHaveBeenCalledWith({ type: 'preview.key', key: 'ArrowDown' })
+  })
+
+  test('M-09: touch drags scroll incrementally while moving and never turn into a click', () => {
+    let clock = 0
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => (clock += 100))
+    try {
+      render(<PreviewHarness />)
+      fireEvent.click(screen.getByRole('button', { name: '移动预览' }))
+      const canvas = screen.getByLabelText('可交互网页画面')
+      setCanvasRect(canvas, 390, 844)
+      previewMock.send.mockClear()
+
+      const touch = (type: 'pointerDown' | 'pointerMove' | 'pointerUp', y: number) =>
+        fireEvent[type](canvas, { pointerId: 7, pointerType: 'touch', clientX: 120, clientY: y })
+      touch('pointerDown', 220)
+      touch('pointerMove', 216) // 4px：还在点按容差内，不滚
+      expect(previewMock.send).not.toHaveBeenCalled()
+      touch('pointerMove', 200)
+      touch('pointerMove', 180)
+      touch('pointerUp', 160)
+
+      const messages = previewMock.send.mock.calls.map(([message]) => message)
+      const wheels = messages.filter((message) => message.type === 'preview.wheel')
+      expect(wheels.length).toBeGreaterThanOrEqual(3)
+      expect(messages.some((message) => message.type === 'preview.pointer')).toBe(false)
+      const total = wheels.reduce(
+        (sum, message) => sum + (message.type === 'preview.wheel' ? message.deltaY : 0),
+        0,
+      )
+      expect(total).toBeCloseTo((220 - 160) * 2)
+      expect(
+        wheels.every((message) => message.type === 'preview.wheel' && message.deltaX === 0),
+      ).toBe(true)
+
+      // 抬手前没有滑动过：还是一次点按。
+      previewMock.send.mockClear()
+      touch('pointerDown', 300)
+      touch('pointerUp', 300)
+      expect(previewMock.send).toHaveBeenCalledTimes(1)
+      expect(previewMock.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'preview.pointer', action: 'click', x: 120, y: 300 }),
+      )
+
+      // 评论模式下滑动也是滚动，不会误触发元素识别。
+      fireEvent.click(screen.getByRole('button', { name: '评论' }))
+      const commentCanvas = screen.getByLabelText('网页画面，点按选择评论元素')
+      setCanvasRect(commentCanvas, 390, 844)
+      previewMock.send.mockClear()
+      fireEvent.pointerDown(commentCanvas, {
+        pointerId: 8,
+        pointerType: 'touch',
+        clientX: 100,
+        clientY: 400,
+      })
+      fireEvent.pointerMove(commentCanvas, {
+        pointerId: 8,
+        pointerType: 'touch',
+        clientX: 100,
+        clientY: 340,
+      })
+      fireEvent.pointerUp(commentCanvas, {
+        pointerId: 8,
+        pointerType: 'touch',
+        clientX: 100,
+        clientY: 320,
+      })
+      const commentMessages = previewMock.send.mock.calls.map(([message]) => message)
+      expect(commentMessages.some((message) => message.type === 'preview.select')).toBe(false)
+      expect(commentMessages.filter((message) => message.type === 'preview.wheel')).toHaveLength(2)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  test('M-10: the canvas letterboxes instead of stretching and maps pointer coordinates to the visible frame', () => {
+    render(<PreviewHarness />)
+    const canvas = screen.getByLabelText('可交互网页画面')
+    expect(canvas).toHaveClass('object-contain')
+    expect(canvas).not.toHaveClass('object-fill')
+
+    // 远端 1280×800 画在 800×800 的元素里：等比缩到 800×500，上下各留 150px 黑边。
+    setCanvasRect(canvas, 800, 800)
+    previewMock.send.mockClear()
+    fireEvent.pointerDown(canvas, {
+      pointerId: 1,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 400,
+      clientY: 400,
+    })
+    expect(previewMock.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'preview.pointer', action: 'down', x: 640, y: 400 }),
+    )
+    fireEvent.pointerUp(canvas, {
+      pointerId: 1,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 0,
+      clientY: 100, // 黑边里：夹到画面顶边
+    })
+    expect(previewMock.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'preview.pointer', action: 'up', x: 0, y: 0 }),
+    )
+  })
+
+  test('M-10: large client viewport changes refit the remote viewport, small ones do not', () => {
+    vi.useFakeTimers()
+    setClientViewport(1280, 800)
+    render(<PreviewHarness />)
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({ width: 1280, height: 800 })
+    const callsBefore = previewMock.calls.length
+
+    // 高度变了 12.5%（< 15%）：不重连，交给 object-contain 的黑边吸收。
+    setClientViewport(1280, 900)
+    fireEvent(window, new Event('resize'))
+    act(() => vi.advanceTimersByTime(VIEWPORT_REFIT_WAIT))
+    expect(previewMock.calls.length).toBe(callsBefore)
+
+    // 宽度变了 25%：防抖后重新量一次，viewport 跟着变。
+    setClientViewport(1600, 900)
+    fireEvent(window, new Event('resize'))
+    fireEvent(window, new Event('resize'))
+    act(() => vi.advanceTimersByTime(VIEWPORT_REFIT_WAIT - 100))
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({ width: 1280, height: 800 })
+    act(() => vi.advanceTimersByTime(100))
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({
+      isMobile: false,
+      width: 1600,
+      height: 900,
+    })
+
+    // 翻到移动端断点（旋转 / 收窄）：设备档一起切换。
+    setClientViewport(390, 844)
+    fireEvent(window, new Event('orientationchange'))
+    act(() => vi.advanceTimersByTime(VIEWPORT_REFIT_WAIT))
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({
+      isMobile: true,
+      width: 390,
+      height: 844,
+    })
+    expect(screen.getByRole('button', { name: '移动预览' })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('M-10: a manually chosen simulator device does not follow client viewport changes', () => {
+    vi.useFakeTimers()
+    setClientViewport(1280, 800)
+    render(<PreviewHarness />)
+    fireEvent.click(screen.getByRole('button', { name: '移动预览' }))
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({ isMobile: true, width: 390 })
+    const callsBefore = previewMock.calls.length
+
+    setClientViewport(1920, 1080)
+    fireEvent(window, new Event('resize'))
+    act(() => vi.advanceTimersByTime(VIEWPORT_REFIT_WAIT))
+    expect(previewMock.calls.length).toBe(callsBefore)
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({ isMobile: true, width: 390 })
+  })
+
+  test('M-19: a clean disconnect is worded differently from a connection failure', () => {
+    previewMock.phase = 'closed'
+    previewMock.ready = null
+    previewMock.error = null
+    const view = render(<PreviewHarness />)
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('连接已断开')
+    expect(alert).toHaveTextContent('重新连接即可继续')
+    expect(alert).not.toHaveTextContent('无法连接网页预览')
+    expect(screen.getByRole('button', { name: '重新连接' })).toBeInTheDocument()
+    const summary = screen.getByText('诊断详情')
+    expect(summary).toHaveClass('text-meta')
+    expect(summary).toHaveStyle({ minHeight: '44px' })
+
+    previewMock.error = { message: 'ticket rejected', retryable: false }
+    view.rerender(<PreviewHarness />)
+    expect(screen.getByRole('alert')).toHaveTextContent('无法连接网页预览')
+    expect(screen.queryByRole('button', { name: '重新连接' })).not.toBeInTheDocument()
+  })
+
+  test('M-20: the narrow-screen submit label says 加入, not 完成', () => {
+    render(<PreviewHarness />)
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    const submit = screen.getByRole('button', { name: /加入输入框/ })
+    expect(submit).toHaveTextContent('加入')
+    expect(submit).not.toHaveTextContent('完成')
+  })
+
+  test('M-21: ⌘/Ctrl+Enter saves the comment draft; plain Enter does not', () => {
+    const view = render(<PreviewHarness />)
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    previewMock.selection = { sequence: 1, target: heroTarget }
+    view.rerender(<PreviewHarness />)
+    const input = screen.getByRole('textbox', { name: '描述网页修改' })
+
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true }) // 空草稿：不保存
+    expect(screen.getByRole('button', { name: '0 条评论' })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '描述网页修改' })).toBeInTheDocument()
+
+    fireEvent.change(input, { target: { value: '改成品牌色' } })
+    fireEvent.keyDown(input, { key: 'Enter' }) // 普通 Enter 仍是换行，不保存
+    expect(screen.getByRole('button', { name: '0 条评论' })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '描述网页修改' })).toHaveValue('改成品牌色')
+
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true })
+    expect(screen.getByRole('button', { name: '1 条评论' })).toBeEnabled()
+    expect(screen.queryByRole('textbox', { name: '描述网页修改' })).not.toBeInTheDocument()
+
+    previewMock.selection = { sequence: 2, target: cardTarget }
+    view.rerender(<PreviewHarness />)
+    const second = screen.getByRole('textbox', { name: '描述网页修改' })
+    fireEvent.change(second, { target: { value: '卡片加阴影' } })
+    fireEvent.keyDown(second, { key: 'Enter', metaKey: true })
+    expect(screen.getByRole('button', { name: '2 条评论' })).toBeEnabled()
+  })
+
+  test('M-21: repeating the same live announcement still changes the live region text', () => {
+    render(<PreviewHarness />)
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    const canvas = screen.getByLabelText('网页画面，点按选择评论元素')
+    setCanvasRect(canvas)
+    const live = document.querySelector('output.sr-only')
+    if (!live) throw new Error('expected the sr-only live region')
+
+    const tap = (id: number) => {
+      fireEvent.pointerDown(canvas, {
+        pointerId: id,
+        pointerType: 'mouse',
+        clientX: 200,
+        clientY: 300,
+      })
+      fireEvent.pointerUp(canvas, {
+        pointerId: id,
+        pointerType: 'mouse',
+        clientX: 200,
+        clientY: 300,
+      })
+    }
+    tap(1)
+    const first = live.textContent
+    expect(first).toContain('正在识别网页元素')
+    tap(2)
+    const second = live.textContent
+    expect(second).toContain('正在识别网页元素')
+    expect(second).not.toBe(first)
+  })
+
+  test('M-22: moving the mouse brings the auto-hidden controls back; touch moves do not', () => {
+    vi.useFakeTimers()
+    setClientViewport(390, 844)
+    render(<PreviewHarness />)
+    const canvas = screen.getByLabelText('可交互网页画面')
+    canvas.focus()
+    act(() => vi.advanceTimersByTime(3_001))
+    expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
+
+    fireEvent.pointerMove(canvas, { pointerId: 1, pointerType: 'touch', clientX: 10, clientY: 10 })
+    expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
+
+    fireEvent.pointerMove(canvas, { pointerId: 2, pointerType: 'mouse', clientX: 10, clientY: 10 })
+    expect(screen.getByRole('button', { name: '关闭网页预览' })).toBeInTheDocument()
+
+    // 鼠标停下来后照旧 3s 收起。
+    act(() => vi.advanceTimersByTime(3_001))
+    expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
   })
 })

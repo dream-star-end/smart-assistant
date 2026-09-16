@@ -133,11 +133,18 @@ describe('ImageViewer 全屏查看器', () => {
     expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
   })
 
-  test('无 submitImageEdit → 三动作优雅降级为禁用', () => {
+  test('无 submitImageEdit → 三动作降级为 aria-disabled,点击给出原因而非静默吞掉(审计 M-13)', async () => {
     render(<Harness />)
     for (const label of ['编辑', '评论', '调整大小']) {
-      expect(screen.getByRole('button', { name: label })).toBeDisabled()
+      expect(screen.getByRole('button', { name: label })).toHaveAttribute('aria-disabled', 'true')
     }
+    // 触屏没有 title 提示:点下去要有一句原因,且不进入子模式。
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    expect(await screen.findByText('当前模型不支持图片评论')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '0 条评论' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '调整大小' }))
+    expect(await screen.findByText('当前模型不支持调整大小')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '调整大小' })).not.toBeInTheDocument()
   })
 
   test('只读外链查看器保留 no-referrer 且不暴露写交互', () => {
@@ -191,14 +198,22 @@ describe('ImageViewer 全屏查看器', () => {
     expect(hrefs.some((h) => h.includes('signed.test/x.png'))).toBe(true)
   })
 
-  test('分享 → 无 navigator.share 时复制链接降级', async () => {
+  test('分享 → 无 navigator.share 时复制链接降级,并说明是会过期的临时链接(审计 M-25)', async () => {
     const writeText = vi.fn(async () => {})
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
     render(<Harness submitImageEdit={vi.fn()} />)
     fireEvent.click(screen.getByRole('button', { name: '分享' }))
-    await waitFor(() => expect(writeText).toHaveBeenCalled())
-    expect(await screen.findByText('已复制链接')).toBeInTheDocument()
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(SIGNED))
+    expect(await screen.findByText(/已复制临时链接/)).toBeInTheDocument()
+    expect(screen.queryByText('已复制链接')).not.toBeInTheDocument()
   })
+
+  /** Radix DropdownMenu 触发钮在 pointerdown 上开合(不是 click)。 */
+  function openMoreMenu() {
+    const trigger = screen.getByRole('button', { name: '更多' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    return trigger
+  }
 
   test('更多菜单 → 新标签打开原图(手势内开新标签)', async () => {
     const hrefs: string[] = []
@@ -208,9 +223,60 @@ describe('ImageViewer 全屏查看器', () => {
       hrefs.push(this.href)
     })
     render(<Harness submitImageEdit={vi.fn()} peek={() => SIGNED} />)
-    fireEvent.click(screen.getByRole('button', { name: '更多' }))
-    fireEvent.click(screen.getByRole('button', { name: /新标签打开原图/ }))
+    openMoreMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: /新标签打开原图/ }))
     await waitFor(() => expect(hrefs.some((h) => h.includes('signed.test/x.png'))).toBe(true))
+  })
+
+  // ── 审计 M-14 / M-25:「更多」是真菜单(语义 + 方向键 + 焦点管理);复制的是临时链接。 ──
+  describe('「更多」菜单原语(M-14 / M-25)', () => {
+    test('有 menu/menuitem 语义,键盘打开即聚焦首项,方向键在项间移动', async () => {
+      render(<Harness submitImageEdit={vi.fn()} />)
+      const trigger = screen.getByRole('button', { name: '更多' })
+      expect(trigger).toHaveAttribute('aria-haspopup', 'menu')
+      expect(trigger).toHaveAttribute('aria-expanded', 'false')
+      trigger.focus()
+      fireEvent.keyDown(trigger, { key: 'Enter' })
+      expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      const menu = await screen.findByRole('menu')
+      const items = screen.getAllByRole('menuitem')
+      expect(items.map((item) => item.textContent?.trim())).toEqual([
+        '新标签打开原图',
+        '复制临时链接',
+      ])
+      // 键盘打开 → 首项聚焦(鼠标打开时 Radix 按惯例把焦点留在菜单容器上)。
+      await waitFor(() => expect(items[0]).toHaveFocus())
+      expect(menu).toContainElement(items[0])
+      // 方向键由当前聚焦项接住(roving tabindex),所以派给 activeElement。
+      fireEvent.keyDown(items[0], { key: 'ArrowDown' })
+      await waitFor(() => expect(items[1]).toHaveFocus())
+      fireEvent.keyDown(items[1], { key: 'ArrowUp' })
+      await waitFor(() => expect(items[0]).toHaveFocus())
+    })
+
+    test('菜单开着按 Esc 只关菜单、焦点回触发钮,查看器不关', async () => {
+      const onOpenChange = vi.fn()
+      render(<Harness submitImageEdit={vi.fn()} onOpenChange={onOpenChange} />)
+      const trigger = openMoreMenu()
+      await screen.findByRole('menu')
+      fireEvent.keyDown(document.activeElement ?? document, { key: 'Escape' })
+      await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
+      expect(onOpenChange).not.toHaveBeenCalledWith(false)
+      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
+      await waitFor(() => expect(trigger).toHaveFocus())
+      expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    })
+
+    test('「复制临时链接」→ 写剪贴板,并提示链接会失效', async () => {
+      const writeText = vi.fn(async () => {})
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+      render(<Harness submitImageEdit={vi.fn()} />)
+      openMoreMenu()
+      fireEvent.click(await screen.findByRole('menuitem', { name: '复制临时链接' }))
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(SIGNED))
+      expect(await screen.findByText(/已复制临时链接/)).toBeInTheDocument()
+      await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
+    })
   })
 
   test('点编辑 → 打开圈选编辑器(复用 ImageAnnotationEditor)', async () => {
@@ -240,6 +306,54 @@ describe('ImageViewer 全屏查看器', () => {
     expect(screen.queryByRole('heading', { name: '0 条评论' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
     expect(onOpenChange).not.toHaveBeenCalledWith(false)
+  })
+
+  // ── 审计 M-02 / M-03:Esc 先委托子模式;有未发送锚点时 X / Esc 先确认,不静默丢弃。 ──
+  describe('评论模式 Esc 分层与脏状态保护', () => {
+    function enterCommentWithAnchor() {
+      fireEvent.click(screen.getByRole('button', { name: '评论' }))
+      fireEvent.click(screen.getByRole('button', { name: '点按图片添加评论' }))
+      fireEvent.change(screen.getByLabelText('描述编辑'), { target: { value: '换成红色' } })
+      fireEvent.keyDown(screen.getByLabelText('描述编辑'), { key: 'Enter' })
+      expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
+    }
+
+    test('输入框里按 Esc 只取消这条草稿:锚点保留、仍在评论模式', () => {
+      render(<Harness submitImageEdit={vi.fn()} submitImageComment={vi.fn()} />)
+      enterCommentWithAnchor()
+      fireEvent.click(screen.getByRole('button', { name: '点按图片添加评论' }))
+      fireEvent.keyDown(screen.getByLabelText('描述编辑'), { key: 'Escape' })
+      expect(screen.queryByLabelText('描述编辑')).not.toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '评论 1' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
+    })
+
+    test('有锚点无草稿按 Esc → 弹「放弃评论」确认;继续评论留在原地,放弃才回浏览态', () => {
+      render(<Harness submitImageEdit={vi.fn()} submitImageComment={vi.fn()} />)
+      enterCommentWithAnchor()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      expect(screen.getByRole('alertdialog', { name: '放弃评论确认' })).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: '继续评论' }))
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
+      // 确认层开着时再按 Esc = 关确认层(逐层退出),不是放弃。
+      fireEvent.keyDown(document, { key: 'Escape' })
+      fireEvent.keyDown(document, { key: 'Escape' })
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      fireEvent.click(screen.getByRole('button', { name: '放弃' }))
+      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
+    })
+
+    test('有锚点点 X → 同样先确认,不直接丢', () => {
+      render(<Harness submitImageEdit={vi.fn()} submitImageComment={vi.fn()} />)
+      enterCommentWithAnchor()
+      fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
+      expect(screen.getByRole('alertdialog', { name: '放弃评论确认' })).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
+    })
   })
 
   test('三模式(编辑/评论/调整大小)均可从查看器底部动作条直达(需求 §2)', () => {
