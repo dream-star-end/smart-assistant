@@ -12,7 +12,12 @@ import {
 import { type ReactNode, useCallback, useEffect, useState } from 'react'
 import { api, apiErrorMessage } from '../../lib/api'
 import { updateAvailable } from '../../lib/marketplace'
-import type { AuthSession, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
+import type {
+  AuthSession,
+  MarketplaceCapabilityReadiness,
+  MarketplaceInstalled,
+  MarketplaceMyAgent,
+} from '../../lib/types'
 import { cn } from '../../lib/utils'
 import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from '../AgentScopePicker'
 import {
@@ -70,6 +75,47 @@ function KindChip({ kind, revoked }: { kind: string; revoked?: boolean }) {
       <Icon size={15} />
     </span>
   )
+}
+
+/**
+ * 智能体组合能力的就绪状态 → **一枚**徽章 + 一句注脚(K-09)。改造前同一行会同时出
+ * 「能力已就绪」success、「可选 Plugin 待授权」warning 和「1/2 项组合能力就绪」灰字,三句互相
+ * 打架;这里按 requirements 的 optional / status 算清楚:必需项决定就绪与否,可选项只做补充说明。
+ */
+export function agentReadinessSummary(readiness: MarketplaceCapabilityReadiness | undefined): {
+  badge: { tone: 'success' | 'warning'; text: string } | null
+  caption: string | null
+} {
+  if (!readiness) return { badge: null, caption: null }
+  const items = readiness.requirements
+  if (items.length === 0) return { badge: null, caption: '不依赖额外 Skill / Plugin' }
+  const readyCount = items.filter((i) => i.status === 'ready').length
+  const caption = `${readyCount}/${items.length} 项组合能力就绪`
+  const onlyAuth = (list: typeof items) => list.every((i) => i.status === 'needs_authorization')
+  if (readiness.ready) {
+    const optionalPending = items.filter((i) => i.optional && i.status !== 'ready')
+    if (optionalPending.length === 0) return { badge: { tone: 'success', text: '能力已就绪' }, caption }
+    return {
+      badge: {
+        tone: 'warning',
+        text: `必需能力已就绪 · ${optionalPending.length} 项可选 ${
+          onlyAuth(optionalPending) ? 'Plugin 待授权' : '能力未就绪'
+        }`,
+      },
+      caption,
+    }
+  }
+  const requiredPending = items.filter((i) => !i.optional && i.status !== 'ready')
+  const n = requiredPending.length || items.length - readyCount
+  return {
+    badge: {
+      tone: 'warning',
+      text: requiredPending.length > 0 && onlyAuth(requiredPending)
+        ? `${n} 项必需 Plugin 待授权`
+        : `${n} 项必需能力未就绪`,
+    },
+    caption,
+  }
 }
 
 /** 分组:同一种类的条目放在一起,段内保持后端的 installed_at DESC 顺序。 */
@@ -243,6 +289,34 @@ export function InstalledPanel({
     const canUpdate = updateAvailable(r)
     const dormant = r.kind === 'skill' && (r.agentIds?.length ?? 0) === 0
     const needsAuthorization = (r.capabilityReadiness?.needsAuthorization.length ?? 0) > 0
+    const readiness = r.kind === 'agent' ? agentReadinessSummary(r.capabilityReadiness) : null
+    const showUpdate = canUpdate && !dormant
+    const showAuthorize = r.kind === 'agent' && needsAuthorization && !!onOpenConnectors
+    const showScope = r.kind === 'skill' && !revoked
+    // 只剩「卸载」一个动作时不再占 CardRow 的操作槽:窄屏下那一槽会独占一整行,
+    // 一枚 32px 的垃圾桶右边挂着 50px 空白(K-08)。并进 meta 行右侧即可。
+    const uninstallOnly = !showUpdate && !showAuthorize && !showScope
+    const uninstallButton = (
+      <Tooltip content={`卸载「${r.name}」`}>
+        <IconButton
+          variant="danger"
+          shape="square"
+          onClick={() => {
+            setModalErr(null)
+            setUninstallReason('prefer_not_say')
+            setPendingUninstall({
+              slug: r.slug,
+              name: r.name,
+              isAgent: r.kind === 'agent',
+            })
+          }}
+          disabled={busy === r.slug}
+          aria-label="卸载"
+        >
+          <Trash2 size={15} />
+        </IconButton>
+      </Tooltip>
+    )
     return (
       <li key={r.slug}>
         <CardRow
@@ -250,20 +324,9 @@ export function InstalledPanel({
           title={r.name}
           meta={
             <>
-              {r.kind === 'agent' ? (
-                <Badge tone="accent">智能体</Badge>
-              ) : (
-                <Badge tone="info">技能</Badge>
-              )}
-              {r.kind === 'agent' && r.capabilityReadiness?.ready === true && (
-                <Badge tone="success">能力已就绪</Badge>
-              )}
-              {r.kind === 'agent' &&
-                r.capabilityReadiness?.ready === true &&
-                needsAuthorization && <Badge tone="warning">可选 Plugin 待授权</Badge>}
-              {r.kind === 'agent' && r.capabilityReadiness?.ready === false && (
-                <Badge tone="warning">{needsAuthorization ? 'Plugin 待授权' : '能力未就绪'}</Badge>
-              )}
+              {/* 种类不再重复挂徽章:行已经按「智能体 / 技能 / API 连接插件」分组,左侧图标芯片
+                  也按种类配色;徽章位留给需要判断的信号(K-22)。 */}
+              {readiness?.badge && <Badge tone={readiness.badge.tone}>{readiness.badge.text}</Badge>}
               <Badge tone="neutral">v{r.version}</Badge>
               {canUpdate &&
                 r.latestVersion &&
@@ -279,72 +342,53 @@ export function InstalledPanel({
               <span className="text-meta text-faint">
                 安装于 <TimeAgo value={r.installedAt} />
               </span>
+              {/* slug 从描述位挪到 meta 行:它对普通用户不是"描述",只是个可核对的标识。 */}
+              <span className="font-mono text-caption text-faint">{r.slug}</span>
+              {uninstallOnly && <span className="ml-auto flex items-center">{uninstallButton}</span>}
             </>
           }
           description={
             revoked
               ? `平台已下架该${r.kind === 'agent' ? '智能体' : '技能'}，将自动从你的会话移除。`
-              : r.slug
+              : undefined
           }
           actions={
-            <>
-              {canUpdate && !dormant && (
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => update(r)}
-                  loading={busy === r.slug}
-                >
-                  {busy === r.slug ? null : <ArrowUpCircle size={14} />}
-                  更新
-                </Button>
-              )}
-              {r.kind === 'agent' && needsAuthorization && onOpenConnectors && (
-                <Button variant="secondary" size="sm" onClick={() => onOpenConnectors()}>
-                  授权 Plugin
-                </Button>
-              )}
-              {r.kind === 'skill' && !revoked && (
-                // 休眠技能唯一可行的下一步就是分配智能体 —— 让它成为行内最显著的操作。
-                <Button
-                  variant={dormant ? 'primary' : 'secondary'}
-                  size="sm"
-                  onClick={() => openScopeEditor(r)}
-                  disabled={busy === r.slug}
-                >
-                  <Settings2 size={14} />
-                  {dormant ? '启用' : '归属'}
-                </Button>
-              )}
-              <Tooltip content={`卸载「${r.name}」`}>
-                <IconButton
-                  variant="danger"
-                  shape="square"
-                  onClick={() => {
-                    setModalErr(null)
-                    setUninstallReason('prefer_not_say')
-                    setPendingUninstall({
-                      slug: r.slug,
-                      name: r.name,
-                      isAgent: r.kind === 'agent',
-                    })
-                  }}
-                  disabled={busy === r.slug}
-                  aria-label="卸载"
-                >
-                  <Trash2 size={15} />
-                </IconButton>
-              </Tooltip>
-            </>
+            uninstallOnly ? undefined : (
+              <>
+                {showUpdate && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => update(r)}
+                    loading={busy === r.slug}
+                  >
+                    {busy === r.slug ? null : <ArrowUpCircle size={14} />}
+                    更新
+                  </Button>
+                )}
+                {showAuthorize && onOpenConnectors && (
+                  <Button variant="secondary" size="sm" onClick={() => onOpenConnectors()}>
+                    授权 Plugin
+                  </Button>
+                )}
+                {showScope && (
+                  // 休眠技能唯一可行的下一步就是分配智能体 —— 让它成为行内最显著的操作。
+                  <Button
+                    variant={dormant ? 'primary' : 'secondary'}
+                    size="sm"
+                    onClick={() => openScopeEditor(r)}
+                    disabled={busy === r.slug}
+                  >
+                    <Settings2 size={14} />
+                    {dormant ? '启用' : '归属'}
+                  </Button>
+                )}
+                {uninstallButton}
+              </>
+            )
           }
         >
-          {r.kind === 'agent' && r.capabilityReadiness && (
-            <p className="text-caption text-faint">
-              {r.capabilityReadiness.requirements.length === 0
-                ? '不依赖额外 Skill / Plugin'
-                : `${r.capabilityReadiness.requirements.filter((item) => item.status === 'ready').length}/${r.capabilityReadiness.requirements.length} 项组合能力就绪`}
-            </p>
-          )}
+          {readiness?.caption && <p className="text-caption text-faint">{readiness.caption}</p>}
           {r.kind === 'skill' && !revoked && (
             <div className="flex flex-wrap items-center gap-1.5 text-meta text-muted">
               <span>适用：</span>
@@ -512,15 +556,14 @@ export function InstalledPanel({
                   <CardRow
                     icon={<KindChip kind="connector" revoked={r.listingState === 'revoked'} />}
                     title={r.name}
-                    description={r.slug}
                     meta={
                       <>
-                        <Badge tone="neutral">API 插件</Badge>
                         <Badge tone="neutral">v{r.version}</Badge>
                         {r.listingState === 'revoked' && <Badge tone="warning">已被下架</Badge>}
                         <span className="text-meta text-faint">
                           安装于 <TimeAgo value={r.installedAt} />
                         </span>
+                        <span className="font-mono text-caption text-faint">{r.slug}</span>
                       </>
                     }
                     actions={
