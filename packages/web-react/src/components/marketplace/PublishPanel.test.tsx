@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TooltipProvider } from "../ui";
 import type { AuthSession, MarketplaceMyPublish } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import { expectAriaControlsResolvable } from "../../test/ariaControls";
 
 const listSkills = vi.fn();
 const listMarketplaceMyPublishes = vi.fn();
@@ -276,6 +277,24 @@ function rejectedRow(over: Partial<MarketplaceMyPublish>): MarketplaceMyPublish 
     ...over,
   };
 }
+
+test("「我的发布」折叠态不落悬空 aria-controls,展开后 IDREF 解析到真实列表(t-762 market#2)", async () => {
+  listSkills.mockResolvedValue([]);
+
+  // 没有待办(审核中 / 未通过)时默认收起 —— 列表根本没挂载,IDREF 不能指向空气。
+  renderPanel(<PublishPanel auth={auth} publishes={[rejectedRow({ status: "approved" })]} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  const toggle = screen.getByRole("button", { name: /我的发布（1）/ });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  expect(toggle).not.toHaveAttribute("aria-controls");
+  expectAriaControlsResolvable();
+
+  fireEvent.click(toggle);
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(toggle).toHaveAttribute("aria-controls", "my-publishes-list");
+  expect(document.getElementById("my-publishes-list")).not.toBeNull();
+  expectAriaControlsResolvable();
+});
 
 test("技能:只改过版本号与标签,载入旧提交前也必须二次确认", async () => {
   listSkills.mockResolvedValue([]);
