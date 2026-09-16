@@ -13,6 +13,7 @@ import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
 import { agentDisplayName } from "../chat/agentNames";
+import { INLINE_SUMMARY_CLS } from "./inlineAction";
 
 export interface FanoutItem {
   index: number;
@@ -64,8 +65,8 @@ function FanoutItemCard({ item }: { item: FanoutItem }) {
   return (
     <li
       className={cn(
-        "rounded-lg border px-3 py-2.5",
-        item.isError ? "border-danger-soft bg-danger-soft/40" : "border-border bg-surface",
+        "rounded-lg border px-3 py-2",
+        item.isError ? "border-danger-soft bg-danger-soft/40" : "border-border/70 bg-surface",
       )}
     >
       <div className="flex min-w-0 items-start gap-2">
@@ -84,8 +85,12 @@ function FanoutItemCard({ item }: { item: FanoutItem }) {
           {item.goal && <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">{item.goal}</p>}
           {item.body && (
             <details className="mt-1">
-              <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看结果</summary>
-              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+              <summary className={INLINE_SUMMARY_CLS}>查看结果</summary>
+              <pre
+                // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
+                tabIndex={0}
+                className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
                 {item.body}
               </pre>
             </details>

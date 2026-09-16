@@ -426,7 +426,9 @@ export function ConnectorConfirmCard({
             <button
               type="button"
               onClick={() => setDetailOpen((o) => !o)}
-              className="mt-2 inline-flex items-center gap-1 text-meta text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              aria-expanded={detailOpen}
+              // 确认前的必读入口:触屏下 ≥44px 命中面积(T-08),桌面仍是行内文字链接。
+              className="mt-2 inline-flex items-center gap-1 rounded text-meta text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
               {detailOpen ? (
                 <ChevronDown className="size-3.5" />

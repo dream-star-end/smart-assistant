@@ -11,6 +11,7 @@ import { type ReactNode, useContext, useState } from 'react'
 import { cn } from '../../lib/utils'
 import { ToolBodyFullContext } from './context'
 import { useHighlighter } from './highlight'
+import { InlineAction } from './inlineAction'
 import { stripAnsi } from './stripAnsi'
 
 /** 全文模式(详情面板)的初始上限:防单条超大 output 打爆渲染,可继续分段展开。 */
@@ -59,10 +60,8 @@ export function useExpandableSlice(text: string, collapsedMax: number): Expandab
   }
 }
 
-const CONTROL_BTN_CLS =
-  'rounded text-xs text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring'
-
-/** 截断态提示 + 展开/继续/收起按钮行。所有截断点共用,保证文案与交互一致。 */
+/** 截断态提示 + 展开/继续/收起按钮行。所有截断点共用,保证文案与交互一致;
+ *  按钮走 InlineAction:触屏下 ≥44px 命中面积(T-08),桌面渲染不变。 */
 export function ExpandControls({ slice }: { slice: ExpandableSlice }) {
   if (!slice.truncated && !slice.expanded) return null
   return (
@@ -70,42 +69,17 @@ export function ExpandControls({ slice }: { slice: ExpandableSlice }) {
       {!slice.expanded && slice.truncated && (
         <>
           <span className="text-faint">已截断</span>
-          <button
-            type="button"
-            className={CONTROL_BTN_CLS}
-            onClick={(e) => {
-              e.stopPropagation()
-              slice.expand()
-            }}
-          >
+          <InlineAction onClick={slice.expand}>
             展开全部（共 {slice.totalChars.toLocaleString()} 字）
-          </button>
+          </InlineAction>
         </>
       )}
       {slice.expanded && slice.truncated && (
-        <button
-          type="button"
-          className={CONTROL_BTN_CLS}
-          onClick={(e) => {
-            e.stopPropagation()
-            slice.showMore()
-          }}
-        >
+        <InlineAction onClick={slice.showMore}>
           继续显示（还有 {slice.remaining.toLocaleString()} 字）
-        </button>
+        </InlineAction>
       )}
-      {slice.expanded && (
-        <button
-          type="button"
-          className={CONTROL_BTN_CLS}
-          onClick={(e) => {
-            e.stopPropagation()
-            slice.collapse()
-          }}
-        >
-          收起
-        </button>
-      )}
+      {slice.expanded && <InlineAction onClick={slice.collapse}>收起</InlineAction>}
     </div>
   )
 }
@@ -113,6 +87,8 @@ export function ExpandControls({ slice }: { slice: ExpandableSlice }) {
 /**
  * 等宽预格式化块 + 截断/展开(替代旧 ClampedPre 的"只截不展")。
  * language 提供时对内容做 highlight.js 着色(hljs 输出已转义,innerHTML 安全)。
+ * 不再设 max-h 嵌套滚动区(T-09):长度由字符上限 + 展开原语控制,时间线里不再出现
+ * 会劫持移动端手势的 320px 小滚动窗。
  */
 export function ExpandablePre({
   text,
@@ -125,7 +101,6 @@ export function ExpandablePre({
   language?: string | null
   className?: string
 }) {
-  const full = useContext(ToolBodyFullContext)
   const slice = useExpandableSlice(stripAnsi(text), max)
   const highlight = useHighlighter(language)
   const html = highlight(slice.shown)
@@ -140,8 +115,7 @@ export function ExpandablePre({
     <>
       <pre
         className={cn(
-          'mt-1.5 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg',
-          !full && 'max-h-80',
+          'mt-1.5 whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg',
           className,
         )}
       >
