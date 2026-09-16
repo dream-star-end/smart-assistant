@@ -193,7 +193,7 @@ import {
   type PrefsView,
   resolveSessionModel,
 } from "./lib/modelPreferences";
-import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
+import { DEMO_MESSAGES, DEMO_MESSAGES_BY_SESSION, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
 import type { LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
@@ -640,7 +640,9 @@ export function App() {
     promptText,
     clearChatError: () => setChatError(null),
     // demo：切会话时换本地 fixture 消息。
-    onDemoSelect: (id) => setMessages(id === DEMO_SESSIONS[0].id ? DEMO_MESSAGES : []),
+    // demo 会话按 id 取 fixture(misc-p3 D-02 接线):目前只有 s1 有消息,其余点开即空态;要给别的会话
+    // 补内容只需往 DEMO_MESSAGES_BY_SESSION 加 fixture 并同步 DEMO_SESSIONS 的 messageCount。
+    onDemoSelect: (id) => setMessages(DEMO_MESSAGES_BY_SESSION[id] ?? []),
     // 新建会话：停 demo 流式回放 + 清空展示消息 + 清错误（原 newSession 前置收尾）。
     onNewSessionReset: () => {
       interrupt();
@@ -3742,7 +3744,8 @@ export function App() {
             <PinnedDelegateTracker
               items={inflightDelegates.items}
               onDismiss={inflightDelegates.dismiss}
-              onStop={stopTurn}
+              // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
+              onStop={wsSending ? stopTurn : undefined}
             />
           )}
           {!demo && !gated && (
