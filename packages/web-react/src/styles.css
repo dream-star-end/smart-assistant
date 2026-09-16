@@ -125,23 +125,27 @@
      是填充用法(bg-danger/… 约 30 处)的 10 倍,故基础色直接取达 AA 的深值,
      不另立 -on-soft 第二套 token。填充块配白字时底色变深,对比度只增不减。
      每个值都同时满足:vs surface(#fff)≥4.5 且 vs 自身 -soft 徽章底 ≥4.5。 */
-  --faint: #6f6f7b; /* was #8b8b97 — 3.37:1,却承载全站说明与引导文案 */
-  --accent: #6c54f0; /* was #6e56f0 — 作徽章前景时 vs soft 底仅 4.45,压 0.4% 明度即达标 */
-  --accent-soft: #6c54f014;
-  --accent-strong: #5a45d6;
+  /* a11y 走查(t-762 shell#3/#4)把口径再推一步:前景不只要 vs 白 ≥4.5,还要 vs「soft 底叠在
+     带色表面上」≥4.5 —— soft 是 8% 透明色,徽章/提示块落在 bg-hover / bg-sidebar / 选中行
+     (#e3e3e6–#ececef)时底色随之变深,原值实测只剩 3.6–4.4。每个值按 HSL 明度逐档压到
+     「vs soft@#ececef ≥4.5」为止(约 -4~-6% 明度),色相饱和度不变;填充块配 -fg 白字对比度只增。 */
+  --faint: #64646f; /* was #6f6f7b — 白底 4.96 但选中行 #e3e3e6 上 3.87;现 4.56 / 白底 5.84 */
+  --accent: #5a3fee; /* was #6c54f0 — vs accent-soft@#ececef 3.88 → 4.71 */
+  --accent-soft: #5a3fee14;
+  --accent-strong: #462ed1; /* 随 accent 同步压暗,保持 hover 比常态深一档 */
   --accent-fg: #ffffff;
   --primary: #17171d;
   --primary-fg: #ffffff;
   --bubble: #f4f4f7;
-  --danger: #d52430; /* was #e04953 — 4.00:1 */
-  --danger-soft: #d5243014;
-  --danger-fg: #ffffff; /* vs --danger 5.09:1 */
-  --success: #187f4d; /* was #1fa463 — 3.21:1 */
-  --success-soft: #187f4d14;
-  --warning: #9e6213; /* was #d9871a — 2.83:1,连大字标准都不够 */
-  --warning-soft: #9e621314;
-  --info: #0c64f4; /* was #3b82f6 — 3.68:1 */
-  --info-soft: #0c64f414;
+  --danger: #bb202a; /* was #d52430 — vs danger-soft@#ececef 3.84 → 4.70 */
+  --danger-soft: #bb202a14;
+  --danger-fg: #ffffff; /* vs --danger 6.26:1 */
+  --success: #157044; /* was #187f4d — vs success-soft@#ececef 3.86 → 4.67 */
+  --success-soft: #15704414;
+  --warning: #8a5511; /* was #9e6213 — vs warning-soft@#ececef 3.85 → 4.73 */
+  --warning-soft: #8a551114;
+  --info: #0a58d8; /* was #0c64f4 — vs info-soft@#ececef 3.87 → 4.68 */
+  --info-soft: #0a58d814;
   /* 焦点环必须是实色:原 #6e56f059(35% alpha)合成后仅 ≈1.6:1,键盘用户
      看不见焦点落在哪。实色后 ≥3:1(WCAG 非文本对比)。 */
   --ring: #5a45d6;
@@ -168,7 +172,7 @@
   --border-control: #64647a;
   --fg: #f2f2f6;
   --muted: #bcbcc7;
-  --faint: #8a8a94; /* was #7e7e87 — vs elevated 4.20; #8a8a94 vs surface 5.32 / elevated 4.95 */
+  --faint: #92929b; /* was #8a8a94 — vs accent-soft@elevated(#2b293f) 4.12 / hover@surface 4.29;现 4.56 / 4.75,vs surface 5.89 */
   --accent: #9a8aff;
   --accent-soft: #9a8aff1f;
   --accent-strong: #ab9cff;
