@@ -14,6 +14,13 @@ import { Alert, Button, IconButton, Input, type InputProps, Modal, Spinner } fro
 /** 占位 token：canary 开启 TURNSTILE_TEST_BYPASS 时发它即可过（服务端 bypass 接受任意串）。*/
 const BYPASS_TOKEN = "bypass";
 
+/**
+ * 行内文字按钮(忘记密码 / 立即注册 / 去登录 / 重新发送 …)的触屏补丁(a11y-B landing#2):
+ * 桌面保持 18–20px 的文字行,hover:none 下撑到 44px 命中并左右加一点内距。
+ */
+const TOUCH_TEXT_BTN =
+  "[@media(hover:none)]:inline-flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center [@media(hover:none)]:px-2";
+
 /** 多模式鉴权表层：登录 / 注册 / 邮箱验证 / 忘记密码 / 重置密码。 */
 export type AuthMode = "login" | "register" | "verify" | "forgot" | "reset";
 
@@ -438,7 +445,7 @@ export function AuthGate({
           <button
             type="button"
             onClick={() => go("forgot")}
-            className="font-medium underline decoration-danger/60 underline-offset-2"
+            className={cn("font-medium underline decoration-danger/60 underline-offset-2", TOUCH_TEXT_BTN)}
           >
             忘记密码？
           </button>
@@ -520,7 +527,7 @@ export function AuthGate({
                   <button
                     type="button"
                     onClick={() => go("forgot")}
-                    className="text-meta text-accent hover:underline"
+                    className={cn("text-meta text-accent hover:underline", TOUCH_TEXT_BTN)}
                   >
                     忘记密码？
                   </button>
@@ -572,7 +579,7 @@ export function AuthGate({
             {allowRegistration && onRegister && (
               <p className="mt-1 text-center text-body text-muted">
                 还没有账号？
-                <button type="button" onClick={() => go("register")} className="ml-1 font-medium text-accent hover:underline">
+                <button type="button" onClick={() => go("register")} className={cn("ml-1 font-medium text-accent hover:underline", TOUCH_TEXT_BTN)}>
                   立即注册
                 </button>
               </p>
@@ -646,12 +653,13 @@ export function AuthGate({
               />
             </div>
 
-            <label className="flex items-start gap-2 text-[12.5px] leading-5 text-muted">
+            {/* 同意条款:触屏下 checkbox 放大到 20px、整行撑到 44px(a11y-B landing#2);桌面 13px 原样。 */}
+            <label className="flex items-start gap-2 text-[12.5px] leading-5 text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center">
               <input
                 type="checkbox"
                 checked={agreeTerms}
                 onChange={(e) => setAgreeTerms(e.target.checked)}
-                className="mt-0.5 accent-[var(--accent,#6d5efc)]"
+                className="mt-0.5 accent-[var(--accent,#6d5efc)] [@media(hover:none)]:mt-0 [@media(hover:none)]:size-5"
               />
               <span>
                 我已阅读并同意<LegalLinks />
@@ -673,7 +681,7 @@ export function AuthGate({
 
             <p className="mt-1 text-center text-body text-muted">
               已有账号？
-              <button type="button" onClick={() => go("login")} className="ml-1 font-medium text-accent hover:underline">
+              <button type="button" onClick={() => go("login")} className={cn("ml-1 font-medium text-accent hover:underline", TOUCH_TEXT_BTN)}>
                 去登录
               </button>
             </p>
@@ -719,7 +727,7 @@ export function AuthGate({
                 type="button"
                 onClick={() => void resendCode()}
                 disabled={cooldown > 0}
-                className="mt-1 text-center text-body text-accent hover:underline disabled:text-faint disabled:no-underline"
+                className={cn("mt-1 text-center text-body text-accent hover:underline disabled:text-faint disabled:no-underline", TOUCH_TEXT_BTN)}
               >
                 {cooldown > 0 ? `重新发送（${cooldown}s）` : "没收到？重新发送验证码"}
               </button>
@@ -778,7 +786,7 @@ export function AuthGate({
 
                 <p className="mt-1 text-center text-body text-muted">
                   想起来了？
-                  <button type="button" onClick={() => go("login")} className="ml-1 font-medium text-accent hover:underline">
+                  <button type="button" onClick={() => go("login")} className={cn("ml-1 font-medium text-accent hover:underline", TOUCH_TEXT_BTN)}>
                     返回登录
                   </button>
                 </p>
