@@ -253,7 +253,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
               <span
                 className={
                   "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-micro " +
-                  (chosen ? "border-accent bg-accent text-white" : "border-border text-transparent")
+                  (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
                 }
               >
                 ✓
@@ -271,7 +271,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
           type="button"
           disabled={picked.size === 0 || blockedByBusy}
           onClick={confirmMulti}
-          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-white transition-opacity disabled:opacity-40"
+          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40"
         >
           确认选择{picked.size > 0 ? `(${picked.size})` : ""}
         </button>

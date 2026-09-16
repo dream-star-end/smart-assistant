@@ -51,6 +51,28 @@ describe("OptionsBlock", () => {
     expect(sendUserText).toHaveBeenCalledWith("我选择:浏览器、网页提取");
   });
 
+  it("已选项勾标与「确认选择」按钮前景走 text-accent-fg,不写死白字(深色 accent 上白字 2.82:1;a11y-C)", () => {
+    const code = JSON.stringify({
+      question: "要哪些能力?",
+      multi: true,
+      options: [{ label: "浏览器" }, { label: "研究检索" }],
+    });
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText: vi.fn() }}>
+        <OptionsBlock code={code} />
+      </ChatInteractionContext.Provider>,
+    );
+    const option = screen.getByText("浏览器").closest("button");
+    expect(option).toBeTruthy();
+    fireEvent.click(option as HTMLButtonElement);
+    const mark = (option as HTMLButtonElement).querySelector("span.size-4");
+    expect(mark).toHaveClass("bg-accent", "text-accent-fg");
+    expect(mark).not.toHaveClass("text-white");
+    const confirm = screen.getByText(/确认选择/).closest("button");
+    expect(confirm).toHaveClass("bg-accent", "text-accent-fg");
+    expect(confirm).not.toHaveClass("text-white");
+  });
+
   it("falls back to source on invalid/partial JSON and to display-only without provider", () => {
     const { container } = render(<OptionsBlock code={'{"question":"半截'} />);
     expect(container.querySelector("pre")).toBeTruthy();
