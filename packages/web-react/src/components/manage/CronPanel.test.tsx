@@ -384,14 +384,43 @@ describe("CronPanel 送达通道由后端下发", () => {
     expect(screen.queryByRole("option", { name: "Telegram" })).not.toBeInTheDocument();
   });
 
-  test("拉取失败回退写死三项", async () => {
+  test("拉取失败只回退网页对话 / 仅记录,不把没有绑定入口的 Telegram 写死摆出来(SET-05)", async () => {
     vi.spyOn(api, "listCron").mockResolvedValue([]);
     vi.spyOn(api, "listCronChannels").mockRejectedValue(new Error("offline"));
     mountPanel();
     fireEvent.click(await screen.findByRole("button", { name: "创建第一个定时任务" }));
     expect(await screen.findByRole("option", { name: "网页对话" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Telegram" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "仅记录" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Telegram" })).not.toBeInTheDocument();
+  });
+
+  test("后端明确下发 telegram 可用时才可选,hint 不再引导去已移除的偏好页开关", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    vi.spyOn(api, "listCronChannels").mockResolvedValue([
+      { value: "webchat", available: true },
+      { value: "telegram", available: true },
+    ]);
+    mountPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "创建第一个定时任务" }));
+    const option = await screen.findByRole("option", { name: "Telegram" });
+    fireEvent.change(option.closest("select") as HTMLSelectElement, {
+      target: { value: "telegram" },
+    });
+    expect(await screen.findByText("结果推送到 Telegram。")).toBeInTheDocument();
+    expect(screen.queryByText(/设置 → 偏好|Telegram 通知/)).not.toBeInTheDocument();
+  });
+
+  test("存量 deliver=telegram 的任务仍按中文标签回显,编辑时保留原值", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([{ ...ACTIVE, deliver: "telegram" }]);
+    vi.spyOn(api, "listCronChannels").mockResolvedValue([
+      { value: "webchat", available: true },
+      { value: "local", available: true },
+    ]);
+    mountPanel();
+    expect(await screen.findByText("Telegram")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: `编辑「${ACTIVE.label}」` }));
+    const option = await screen.findByRole("option", { name: "Telegram" });
+    expect((option.closest("select") as HTMLSelectElement).value).toBe("telegram");
   });
 
   test("deliverLabel 对未知值原样回显", async () => {
