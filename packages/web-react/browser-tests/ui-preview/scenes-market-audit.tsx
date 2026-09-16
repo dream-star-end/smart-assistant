@@ -17,7 +17,7 @@ import type { MarketplaceCard } from '../../src/lib/types'
 import { ApiError } from './api-stub'
 // 带扩展名：shoot.mjs 的 scene-groups 插件会把裸的 `./scenes-market` 重定向到虚拟聚合模块，
 // 这里要的是那份真实文件里导出的场景数组。
-import { marketScenes } from './scenes-market.tsx'
+import { marketScenes } from './scenes-market'
 import type { ApiMockTable, Scene } from './types'
 
 // ── 通用工具 ────────────────────────────────────────────────────────────────

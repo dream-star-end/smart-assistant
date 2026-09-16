@@ -107,7 +107,7 @@ describe("ZoomableImage 灯箱", () => {
     expect(img.className).toContain("max-h-72");
   });
 
-  test("点击缩略图 → 打开全屏查看器:四动作条 + 更多菜单逃生口;关闭收起", () => {
+  test("点击缩略图 → 打开全屏查看器:四动作条 + 更多菜单逃生口;关闭收起", async () => {
     render(<ZoomableImage src={src} alt="拟合曲线" />);
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ }));
     // 全屏查看器展示大图(缩略图 + 查看器两张同 alt)。
@@ -117,10 +117,14 @@ describe("ZoomableImage 灯箱", () => {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
     expect(screen.queryByRole("button", { name: "移除" })).not.toBeInTheDocument();
-    // 「新标签打开原图」逃生口收进更多菜单。
-    fireEvent.click(screen.getByRole("button", { name: "更多" }));
-    expect(screen.getByRole("button", { name: /新标签打开原图/ })).toBeInTheDocument();
-    // 关闭按钮收起查看器。
+    // 「新标签打开原图」逃生口收进更多菜单。media M-14 后「更多」是 Radix DropdownMenu:
+    // pointerDown 开菜单、菜单项 role=menuitem(media.md §6.3 X-M1;与 ImageViewer.test 同一套开合写法)。
+    const more = screen.getByRole("button", { name: "更多" });
+    fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
+    expect(await screen.findByRole("menuitem", { name: /新标签打开原图/ })).toBeInTheDocument();
+    // 先 Esc 关菜单(菜单开着时 DismissableLayer 会吞掉外部点击),再点关闭按钮收起查看器。
+    fireEvent.keyDown(document.activeElement ?? document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "关闭预览" }));
     expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
   });
