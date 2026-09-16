@@ -11,14 +11,14 @@
       "sourceHash": "6d86ac78d9afc64f1228d9f94addb8505d80f339d926e23dda366b422fa67be3"
     },
     "agents": {
-      "contentHash": "f9adee3d39156abd3aa5beb353bfe217e6cb364b81c083ed7e46cd66e60242b8",
-      "contentVersion": 4,
-      "entryIdentityHash": "203b8e169a181478787d663f0f04737dedc8f7c3d0a1f04aeea9136c53f075bb",
+      "contentHash": "c9f6c415de8c42118a21065f8345bc52700a7292eb3f111ebec4dded9b0a464a",
+      "contentVersion": 5,
+      "entryIdentityHash": "4b3c64ebe595fbde375a9373b2897e374a46e803ff14d2150fbbd6b78dd99de7",
       "mediaHash": "da9bdf2bc3b9ed42a1d43e524001916ed74f1b3a104a4a15173184e817964def",
       "mediaKey": "agents",
       "mediaVersion": 4,
       "registryHash": "94e8049f80ed0fcaca43608b1796cdd361d6f8dbb0fcb9a10b3e86121eb5aea6",
-      "sourceHash": "c4704835cf8c66c98349e6f929b301d334b52f978863828d4b00fd220966c08a"
+      "sourceHash": "21c251c629789e74e0635bdf074bd54715563000842020bce406968b3887e4dc"
     },
     "artifacts-download": {
       "contentHash": "3c4e0d07709579bddddd1309d257599c2d4a8aec7e2ba633c4d1480a19402e33",
@@ -41,14 +41,14 @@
       "sourceHash": "b3359abb3f22900f7deab7b72f6c8ab97bcf8594fd20a8ef43e709f4096e163d"
     },
     "chat-basics": {
-      "contentHash": "91cfee2fea6e32979a2e76edb2a03acc7487b491b4713cdeaf8067eefaf75219",
-      "contentVersion": 8,
-      "entryIdentityHash": "13c1fa6f3d375c76739090117af1ea0e4be4e53214ef003d16d5118649e055e1",
+      "contentHash": "70f3d0babb37500180220eecc96da887c496129f815fa295995fa51f93b116f6",
+      "contentVersion": 9,
+      "entryIdentityHash": "f47958dabe3aab233f5365d3fd5aaf45ad479b61028488c26cc80497c18e590f",
       "mediaHash": "e6197264cb7365c92362480087b05e2608ddc3e2e109e8633aeaad53987a4547",
       "mediaKey": "chat-basics",
       "mediaVersion": 4,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "487bbdf1b6c2d193403f2a2f0401781fac77cd3f50c59984874d69e6a6d1df65"
+      "sourceHash": "c724a18fec9130b10a76772590a35bcba67d90f60dbd4173fce1f604001f4154"
     },
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
