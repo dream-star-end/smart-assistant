@@ -371,15 +371,19 @@ test("从我的技能导入:只填过一句话描述也必须先确认(导入会
   getSkill.mockResolvedValue({ body: "# 导入的正文", files: [] });
 
   render(<PublishPanel auth={auth} />);
-  await screen.findByRole("button", { name: "学术翻译" });
+  // 芯片显示的是展示名(描述首行),无障碍名再带上 slug 供核对(K-10)
+  const chip = await screen.findByRole("button", { name: "技能自带描述（学术翻译）" });
+  expect(chip).toHaveTextContent("技能自带描述");
 
   fireEvent.change(screen.getByPlaceholderText(/把中文学术论文翻译成地道英文/), {
     target: { value: "我自己写的描述" },
   });
 
-  fireEvent.click(screen.getByRole("button", { name: "学术翻译" }));
+  fireEvent.click(chip);
 
-  expect(await screen.findByText(/已填写的名称/)).toBeInTheDocument();
+  // 确认框里的名字与芯片一致,不再冒出用户没见过的 slug
+  expect(await screen.findByText("用「技能自带描述」覆盖当前内容？")).toBeInTheDocument();
+  expect(screen.getByText(/已填写的名称/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "取消" }));
   await waitFor(() =>
     expect(screen.getByPlaceholderText(/把中文学术论文翻译成地道英文/)).toHaveValue(
@@ -387,4 +391,43 @@ test("从我的技能导入:只填过一句话描述也必须先确认(导入会
     ),
   );
   expect(getSkill).not.toHaveBeenCalled();
+});
+
+test("导入芯片与管理中心同一套展示名:有描述用描述首行,没描述退回 slug(K-10)", async () => {
+  listSkills.mockResolvedValue([
+    { name: "ppt-master", description: "PPT 一键成稿\n第二行不算", writable: true },
+    { name: "sql-tuning", writable: true },
+  ]);
+
+  render(<PublishPanel auth={auth} />);
+  const ppt = await screen.findByRole("button", { name: "PPT 一键成稿（ppt-master）" });
+  expect(ppt).toHaveTextContent("PPT 一键成稿");
+  expect(ppt).not.toHaveTextContent("第二行不算");
+  // 没有描述的技能只能显示 slug,这时无障碍名就是 slug 本身,不重复
+  expect(screen.getByRole("button", { name: "sql-tuning" })).toHaveTextContent("sql-tuning");
+});
+
+test("底部操作条:缺项超过 3 项折成「还差 N 项必填 · 查看」,点开列全、可收起(K-21)", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+
+  render(<PublishPanel auth={auth} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+
+  // 空表单:6 项缺项 → 折叠,清单不直接铺开
+  const bar = screen.getByText(/还差 6 项必填/);
+  expect(bar).not.toHaveTextContent("显示名称");
+  const toggle = screen.getByRole("button", { name: "查看" });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(toggle);
+  expect(screen.getByText(/还差 6 项必填/)).toHaveTextContent(
+    "还差 6 项必填：显示名称、标识 slug、一句话描述、技能正文、分类、适用场景",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "收起" }));
+  expect(screen.getByText(/还差 6 项必填/)).not.toHaveTextContent("显示名称");
+
+  // 填到只剩 3 项以内 → 直接全列,不再需要「查看」
+  fillBaseFields();
+  expect(screen.getByText(/还差 2 项必填/)).toHaveTextContent("还差 2 项必填：分类、适用场景");
+  expect(screen.queryByRole("button", { name: "查看" })).not.toBeInTheDocument();
 });

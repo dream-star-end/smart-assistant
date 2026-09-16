@@ -1,8 +1,19 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceDetail, MarketplaceMyAgent } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import { TooltipProvider } from "../ui";
+
+/** 审核徽章的解释走 Tooltip(K-14):与 main.tsx / admin 根一样,测试也在根上给 TooltipProvider。 */
+function render(ui: ReactElement) {
+  const view = rtlRender(<TooltipProvider>{ui}</TooltipProvider>);
+  return {
+    ...view,
+    rerender: (next: ReactElement) => view.rerender(<TooltipProvider>{next}</TooltipProvider>),
+  };
+}
 
 const getMarketplaceDetail = vi.fn();
 const listMyAgents = vi.fn();
@@ -524,11 +535,76 @@ test("信号徽章:usage30d/users30d/安装数/rating 都渲染,rating 文案诚
   expect(screen.getByText("已安装 20")).toBeInTheDocument();
   // 评分徽章 + 诚实旁注,不做「好评率 89%」式背书大字;图标走 lucide(ThumbsUp),不再是表情 👍
   const badge = screen.getByText("8/9");
-  expect(badge).toHaveAttribute("title", "来自 9 次使用反馈");
+  // 解释只写在下方明文注脚里,不再另藏一份只有鼠标能看的 title(K-14)
+  expect(badge).not.toHaveAttribute("title");
   expect(badge.querySelector("svg")).not.toBeNull();
   expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
   expect(screen.getByText("来自 9 次使用反馈")).toBeInTheDocument();
   expect(screen.queryByText(/好评率/)).not.toBeInTheDocument();
+});
+
+test("审核背书徽章:解释走 Tooltip(可聚焦触发器)+ 明文注脚,不再是 title-only(K-14)", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({ reviewSource: "manual", benchmark: { withPassRate: 0.8, withoutPassRate: 0.4, cases: 5 } }),
+  );
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+
+  const badge = await screen.findByText("人工审核");
+  expect(badge).not.toHaveAttribute("title");
+  // 键盘用户要能 Tab 到触发器才看得到 Tooltip
+  expect(badge).toHaveAttribute("tabindex", "0");
+  // 触屏 / 读屏:同一句话在徽章下方以明文注脚出现
+  expect(
+    screen.getByText("人工审核：已通过平台危险模式扫描与管理员人工审核。"),
+  ).toBeInTheDocument();
+  // 实测徽章的 title 同样撤掉:注脚已经写明出处
+  expect(screen.getByText("实测 40%→80%")).not.toHaveAttribute("title");
+  expect(screen.getByText("实测 5 个用例，由发布者提供、未经平台验证")).toBeInTheDocument();
+});
+
+test("详细介绍的 Markdown 标题层级不倒挂:容器把 h1–h4 压到段标题同档、正文压回 text-body(K-15)", async () => {
+  getMarketplaceDetail.mockResolvedValue(detail({ humanMd: "## 它适合谁\n\n正文" }));
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+
+  await screen.findByText("详细介绍");
+  const wrap = screen.getByTestId("human-md");
+  // styles.css 的 .prose 是未分层规则,只能用 ! 覆盖;jsdom 不算样式,守住类名契约
+  expect(wrap.className).toContain("[&_:is(h1,h2,h3,h4)]:text-section!");
+  expect(wrap.className).toContain("[&_.prose]:text-body!");
+  expect(wrap).toContainElement(screen.getByTestId("md"));
+});
+
+test("API 插件详情:认证方式与动作范围用人话,不再裸露 authMode 枚举与动作 id(K-19)", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({
+      slug: "notion-sync",
+      kind: "connector",
+      name: "Notion 同步",
+      rawArtifact: "{}",
+      connectorContract: {
+        authMode: "oauth2-auth-code",
+        approvedOrigins: ["https://api.notion.com"],
+        actions: [
+          { id: "search_pages", effect: "read" },
+          { id: "createPage", effect: "write" },
+        ],
+      },
+    }),
+  );
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="notion-sync" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+
+  expect(await screen.findByText("认证方式：OAuth 授权登录")).toBeInTheDocument();
+  expect(screen.getByText("search pages · 读取")).toBeInTheDocument();
+  expect(screen.getByText("create page · 写入")).toBeInTheDocument();
+  expect(screen.queryByText(/oauth2-auth-code/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/search_pages/)).not.toBeInTheDocument();
+  expect(screen.getByText(/已批准网络：/)).toHaveTextContent("https://api.notion.com");
 });
 
 test("footer 窄屏契约:「关闭」让位给右上 ✕,动作按钮并排各占一半,Badge 不被拉成全宽(K-04 / K-20)", async () => {
@@ -729,6 +805,7 @@ test.each([
 
   // 风险与文件清单已合并成同一个「包含内容」块:醒目度由 warning 徽章 + 脚本芯片描边承担
   expect(await screen.findByText(/含 1 个可执行脚本/)).toBeInTheDocument();
-  expect(screen.getByText(expected)).toBeInTheDocument();
+  // 同一句信任文案出现两处:徽章下的明文注脚(K-14)+ 脚本说明;两处口径必须一致
+  expect(screen.getAllByText(expected).length).toBeGreaterThanOrEqual(2);
   expect(screen.queryByText(forbidden)).not.toBeInTheDocument();
 });

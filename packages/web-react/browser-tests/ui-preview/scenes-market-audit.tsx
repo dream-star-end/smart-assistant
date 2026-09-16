@@ -13,7 +13,7 @@
 import { type ReactNode, useEffect } from 'react'
 
 import { MarketplaceCenter } from '../../src/components/MarketplaceCenter'
-import type { MarketplaceCard } from '../../src/lib/types'
+import type { MarketplaceCard, MarketplaceDetail } from '../../src/lib/types'
 import { ApiError } from './api-stub'
 // 带扩展名：shoot.mjs 的 scene-groups 插件会把裸的 `./scenes-market` 重定向到虚拟聚合模块，
 // 这里要的是那份真实文件里导出的场景数组。
@@ -171,6 +171,60 @@ const longListSearch = async (_auth: unknown, _q = '', kind = 'skill', limit = 5
   method: 'all' as const,
 })
 
+// ── API 插件详情：带签名契约（认证方式 / 动作范围 / 已批准网络） ──────────────
+// 既有 scenes-market.tsx 的详情场景只有技能与智能体；插件详情的「平台已签安全范围」块
+// 此前从未被截过图（K-19 把 authMode 枚举与动作 id 原样给用户就是在这里）。
+
+const NOTION_DETAIL: MarketplaceDetail = {
+  slug: 'notion-sync',
+  kind: 'connector',
+  artifactKind: 'plugin',
+  pluginType: 'declarative-http',
+  state: 'active',
+  ownerUserId: '3390',
+  version: '0.9.0',
+  versionId: 'ver_conn_notion_090',
+  name: 'Notion 同步',
+  description:
+    '把对话里的结论、待办与表格写回指定 Notion 数据库，支持只读检索与写入两种授权范围，写入动作每次都会在对话中显式确认。',
+  tags: ['Notion', '知识库', '同步'],
+  artifactHash: 'sha256:5d7b41…',
+  rawArtifact: JSON.stringify(
+    {
+      id: 'notion-sync',
+      label: 'Notion 同步',
+      identity: { authMode: 'oauth2-auth-code' },
+      actions: [
+        { id: 'search_pages', effect: 'read' },
+        { id: 'get_database_rows', effect: 'read' },
+        { id: 'create_page', effect: 'write' },
+        { id: 'append_block_children', effect: 'write' },
+      ],
+    },
+    null,
+    2,
+  ),
+  riskFlags: [],
+  reviewSource: 'manual',
+  installCount: 512,
+  users30d: 147,
+  category: 'office-docs',
+  useCases: ['把会议结论与待办同步进团队知识库', '按数据库条件检索页面并生成摘要'],
+  outcomeExamples: ['说「把这份纪要写进项目库」→ 新建页面、填好属性并回链'],
+  humanMd:
+    '## 它适合谁\n\n需要把对话产出沉淀到 Notion 的团队。\n\n### 授权范围\n\n只读检索与写入分开授权，写入动作每次都会在对话中显式确认。\n',
+  connectorContract: {
+    authMode: 'oauth2-auth-code',
+    approvedOrigins: ['https://api.notion.com'],
+    actions: [
+      { id: 'search_pages', effect: 'read' },
+      { id: 'get_database_rows', effect: 'read' },
+      { id: 'create_page', effect: 'write' },
+      { id: 'append_block_children', effect: 'write' },
+    ],
+  },
+}
+
 // ── 未登录 ─────────────────────────────────────────────────────────────────
 
 function UnauthMarket() {
@@ -237,6 +291,11 @@ export const marketAuditScenes: Scene[] = [
       installMarketplace: fail(409, '该版本已不是当前上架版本，请刷新后重试', 'VERSION_STALE'),
     },
     steps: [{ selector: '[role="dialog"] button.bg-primary', delay: 500 }],
+  }),
+  derive('market-detail', {
+    id: 'market-detail-plugin',
+    label: '详情 · API 插件（平台已签安全范围：认证方式 / 动作 / 已批准网络）',
+    api: { getMarketplaceDetail: () => Promise.resolve(NOTION_DETAIL) },
   }),
 
   // ── 已安装：卸载确认 / 归属编辑 ──

@@ -1,7 +1,7 @@
 # A·market AI 市场 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-market`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 12 / 遗留 14）
+- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 12 / 遗留 14）→ 二期收尾（§10；再修 10，累计修复 22 / 遗留 4：K-23 按拍板不做、K-25 / K-27 / X-01 需后端或 shell）
 - 结论：**P1 × 1 / P2 × 4 / P3 × 21**，共 26 条（另 1 条 admin 面备注 K-26）。P1 是发布表单草稿随市场弹窗关闭（Esc / 点遮罩）
   **无提示丢失**（代码注释自认技术债）。四条 P2：卡片描述 `line-clamp-2` 被同元素的 `block`
   抵消（卡高失控）、分区视图翻页时分区计数把「已加载」说成「共有」、详情弹层移动端底栏三枚
@@ -398,15 +398,61 @@ after 对照（同名 PNG，`before/` ↔ `after/`）：
 
 ## 9. 遗留
 
+> 二期（t-625，§10）已关闭 K-08 / K-09 / K-22 / K-10 / K-12 / K-13 / K-14 / K-15 / K-19 / K-21 十条；下表只剩仍未动的。
+
 | 项 | 原因 | 建议 |
 |---|---|---|
-| K-08 / K-09 / K-22（已安装行的动作簇、就绪状态文案、kind 徽章与 slug 描述） | 同一 `CardRow` 结构的三处改动，需连带 `InstalledPanel.test` 重写；本轮预算优先给 P1/P2 | market-B 二期一并做，修法见 §4 |
-| K-10（导入芯片显示名） | 需引入 `manage/skillDisplay` 的 `skillDisplayTitle`，顺手做但要同步 `PublishPanel.test` 里按 slug 找芯片的断言 | 同上 |
-| K-12（桌面端分类片横滚无滚动条） | 换行 vs 箭头需拍板（附录 3） | 拍板后 10 行改动 |
-| K-13（kill-switch 移动端占首屏） | admin 面、低频 | 二期 |
-| K-14 / K-15 / K-19（title-only 解释、Markdown 标题层级、authMode / 动作 id 映射） | 文案与视觉打磨，需逐项核对后端契约字段（`connectorContract.actions[].title` 是否存在） | 二期 |
-| K-21（校验缺项播报占高） | 需要与 SubmitBar 的"缺项即定位"契约一起重设计 | 二期 |
-| K-23（详情内卸载） | 与「已安装页是卸载唯一权威」的既有决定冲突（附录 4），未拍板不动 | 拍板后复用卸载弹层 |
+| K-23（详情内卸载） | 与「已安装页是卸载唯一权威」的既有决定冲突（附录 4），二期任务书明示保持不做 | 拍板后复用卸载弹层 |
 | X-01（未登录「去登录」的 `App.tsx` 接线；K-24 market 侧已修） | `MarketplaceCenter` 已暴露 `onRequireLogin?: () => void`（§7）；`App.tsx` 归 shell，本模块不动 | 集成②在 `App.tsx` 渲染 `<MarketplaceCenter>` 处补一行 `onRequireLogin={() => { setMarketplaceOpen(false); setAuthMode("login"); setView("app"); }}`（照 ManageCenter 那一行） |
 | K-25 / X-02（offset 分页 / 虚拟化） | 需后端 | 后端提供 offset 后前端改 append |
 | K-27（原生 checkbox） | 需 shell 出 Checkbox 原语 | shell |
+
+## 10. 二期收尾（t-625 · 遗留 P3）
+
+- 分支：仍是 `feat/v5-selfhost-audit-market`（接在 §7 的 `1fb99bfcc` 之后；与 settings2 / sidebar2 / taskboard2 同一口径，
+  二期不另开分支）。接手说明：任务书要求先查本地是否已有前任（fable-5-1-41）的 worktree / 分支进度 —— 核对结果：
+  `wt\market` 工作树干净（HEAD = `1fb99bfcc`，只有 `npm ci` 造成的两处 CRLF 假改动）、无 `feat/v5-selfhost-audit-market2`
+  分支、`.audit-tmp\market2` 不存在，**前任没有留下任何进度**，本轮从零做。
+- 范围：任务书列出的 10 条 P3 全部落地；K-23 按任务书保持不做，K-25 / K-27 保持遗留（需后端 / 需 shell）。
+- 拍板项落地口径：附录 3（K-12 换行 vs 箭头）任务书未明示，取**换行**：桌面端有宽度、换行是零学习成本的方案，箭头
+  还要多两个控件与滚动状态；移动端保持横滚 + 右缘渐隐不变。
+- 顺手的改动（都在 K 号范围内、不越界）：K-14 把评分 / 实测徽章上与注脚重复的 `title` 一并撤掉（同一句话就在下方明文里）；
+  K-15 除标题外把 `.prose` 正文也压回弹层的 `text-body`（此前 15.5px 的介绍正文比 13.5px 的段标题还大，同属层级倒挂）；
+  K-10 的导入确认框标题与"正文没能读到"提示改用与芯片一致的展示名。
+
+| 编号 | 状态 | 改动（`packages/web-react/src/` 下） | 用例 |
+|---|---|---|---|
+| K-08 | ✅ | `marketplace/InstalledPanel.tsx`：只剩「卸载」一个动作的行（无新版本、无待授权的智能体；已下架的技能）不再占 `CardRow` 的 `actions` 槽（窄屏那一槽独占一行、一枚 32px 垃圾桶右边挂 50px 空白），垃圾桶并进 meta 行右侧（`ml-auto`）；有「更新 / 授权 Plugin / 归属 / 启用」作伴时照旧走操作槽。 | `InstalledPanel.test` 「只剩「卸载」一个动作的行…（K-08）」 |
+| K-09 | ✅ | `InstalledPanel.tsx` 新增导出 `agentReadinessSummary(readiness)`：按 `requirements[].optional / status` 算，**一枚**徽章 + 一句注脚 —— 全就绪「能力已就绪」；必需就绪但可选待授权「必需能力已就绪 · N 项可选 Plugin 待授权」；必需未就绪「N 项必需能力未就绪」/「N 项必需 Plugin 待授权」；注脚统一「M/N 项组合能力就绪」，无依赖时只留「不依赖额外 Skill / Plugin」。 | `InstalledPanel.test` `test.each` ×3（全就绪 / 必需就绪+可选待授权 / 2 项必需未就绪；并断言旧版三句不再同时出现） |
+| K-22 | ✅ | `InstalledPanel.tsx`：删掉与分组同名的「智能体 / 技能 / API 插件」kind 徽章（分组标题 + 左侧按种类配色的图标芯片已经说明了种类）；`description` 只在已下架时显示提示，slug 改为 meta 行里的 `font-mono text-caption text-faint`（连接器行同步）。 | `InstalledPanel.test` 「列表按 kind 分组;行内不再重复挂…（K-22）」（改写自既有分组用例） |
+| K-10 | ✅ | `marketplace/PublishPanel.tsx`「从我的技能导入」芯片改用 `manage/skillDisplay.skillDisplayTitle`（描述首行为名、slug 为 caption），与管理中心技能列表同一套展示名；`aria-label` =「展示名（slug）」、`title` 带 slug 供核对；导入确认框标题与"正文没能读到"提示同步用展示名。 | `PublishPanel.test` 「导入芯片与管理中心同一套展示名…（K-10）」+ 既有导入确认用例改写（按新无障碍名找芯片、断言确认框标题） |
+| K-12 | ✅ | `marketplace/BrowsePanel.tsx` 分类片容器 `sm:flex-wrap sm:snap-none sm:overflow-x-visible`，右缘渐隐 `sm:hidden`；`aria-label` 「市场分类，可横向滚动」→「市场分类」（桌面已不横滚）。移动端行为不变。 | `BrowsePanel.test` 「分类筛选片只渲染有条目的分类」补断言（桌面换行类名 + 渐隐 `sm:hidden`） |
+| K-13 | ✅ | `marketplace/ReviewPanel.tsx` `RevokeBox`：窄屏默认只留标题行 + 「展开」（`aria-expanded` / `aria-controls`，正文 `max-sm:hidden`），`sm:` 起照旧全展开、切换按钮 `sm:hidden`；置顶位置不变。slug 输入 placeholder「slug」→「要下架的条目 slug，如 ppt-master」。 | `ReviewPanel.test` 「kill-switch 分区窄屏默认折叠成一行…（K-13）」（含 `expectAriaControlsResolvable`） |
+| K-14 | ✅ | `marketplace/DetailModal.tsx` 审核背书徽章：`title` → `Tooltip`（触发器 `tabIndex=0` 可聚焦，同 manage M-15 写法）+ 徽章下方明文注脚「人工审核：已通过平台危险模式扫描与管理员人工审核。」（四种 reviewSource 各自的文案）；评分 / 实测徽章上与注脚重复的 `title` 撤掉。`ReviewPanel.tsx`「带 evals」「自报增益存疑」：`title` → `Tooltip`，解释另在展开审查区首行明文列出（触屏 / 读屏可达）。 | `DetailModal.test` 「审核背书徽章:解释走 Tooltip…（K-14）」+ 既有 `test.each` reviewSource 用例改写（注脚与脚本说明两处口径一致）+ 既有评分用例改写（无 `title`）；`ReviewPanel.test` 「「带 evals」「自报增益存疑」的解释不再只挂 title…（K-14）」 |
+| K-15 | ✅ | `DetailModal.tsx`「详细介绍」容器加 `HUMAN_MD_PROSE_CLASS`：`[&_.prose]:text-body!` + `[&_:is(h1,h2,h3,h4)]:text-section! font-semibold! mt-3! mb-1!` + `[&_.prose>:first-child]:mt-0!`。必须带 `!`：`styles.css` 的 `.prose` 规则未分层，会压过 `@layer utilities` 里任何后代选择器。结果：段标题 ≥ 介绍内标题 > 正文，不再倒挂。 | `DetailModal.test` 「详细介绍的 Markdown 标题层级不倒挂…（K-15）」（jsdom 不算样式，守类名契约；视觉由 after 图证明） |
+| K-19 | ✅ | `lib/marketplace.ts` 新增 `connectorAuthModeLabel`（后端 `AuthMode` 七种 + `managed_browser` / `none` → 中文，未知值原样）、`connectorActionLabel`（`create_post` / `createFollowUp` / `pages.search` → `create post` / `create follow up` / `pages search`；契约 `projection.ts` 只投影 `id + effect`、没有 title 字段可用）、`connectorActionEffectLabel`（read / send / 其余按「写入」）；`DetailModal.tsx` 插件详情块改用三者，原始值仍在「查看发布者提交的技术声明」里。 | `marketplace.test` ×3；`DetailModal.test` 「API 插件详情:认证方式与动作范围用人话…（K-19）」 |
+| K-21 | ✅ | `PublishPanel.tsx` `SubmitBar`：缺项 > 3 时折成「还差 N 项必填 · 查看」（`aria-expanded`），点开列全并可「收起」；≤3 项照旧直接列全。三张表单（技能 / 智能体 / 插件）共用。 | `PublishPanel.test` 「底部操作条:缺项超过 3 项折成…（K-21）」 |
+| K-23 | ⏸ 不做 | 任务书明示：与「已安装页是卸载唯一权威」既有决定一致，保持不做。 | — |
+| K-25 / K-27 | ⏸ 遗留 | 需后端 offset / 需 shell Checkbox 原语，见 §9。 | — |
+
+预览台场景：`browser-tests/ui-preview/scenes-market-audit.tsx` 新增 `market-detail-plugin`（API 插件详情 · 带签名契约；此前插件详情的
+「平台已签安全范围」块从未被截过图，K-19 的证据只能靠它），随代码提交。
+
+### 10.1 验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0，09-16 22:47） |
+| 模块单测 | `npx vitest run src/components/marketplace src/components/MarketplaceCenter.test.tsx src/lib/marketplace.test.ts --maxWorkers=1` | ✅ 11 文件 / **152 例全绿**（09-16 22:48；§8 时 138 例，+14 = marketplace +3、DetailModal +3、InstalledPanel +4、PublishPanel +2、ReviewPanel +2；另 5 例既有用例按新契约改写）。每条逻辑改动有用例，见上表；无 `.only` / `.skip` |
+| 代码风格 | `npx biome lint <13 个改动文件>` | ✅ 未新增诊断：15 条全部是 §8 已登记的既有 `useExhaustiveDependencies` / `noArrayIndexKey` / `noDelete`（行号因插入而后移，代码未触碰）；新增的 1 条 `suppressions/unused` warning 已通过删掉多余的 biome-ignore 消掉 → 0 warning |
+| 视觉 before / after | `OC_UI_SCENES=market-installed,market-publish,market-browse-skill,market-review,market-detail` → `D:\code\test_project\test123\.audit-tmp\market2\{before,after}\` | ✅ 各 88 张（34 场景 × 主题 × 声明视口），`failures: 0`、`retried: 0`、`unmockedApi: []`；before 在改代码前用旧代码出（仅先加了 `market-detail-plugin` 场景），after 用新代码出，同名 PNG 逐张对照 |
+
+after 对照（同名 PNG，`market2/before/` ↔ `market2/after/`，PNG 不入库）：
+
+- `market-installed-mobile--mobile--*` / `market-installed--desktop--*` —— 「编程助手 Pro」行垃圾桶从独占一行挪到 meta 行右侧，行高约 190 → 170px；「科研调研员」的「智能体 / 能力已就绪 / 可选 Plugin 待授权 / 1/2 项组合能力就绪」四句收成「必需能力已就绪 · 1 项可选 Plugin 待授权」+「1/2 项组合能力就绪」；所有行的 kind 徽章消失、slug 变等宽小字。
+- `market-publish-validation--mobile--*` / `market-publish--mobile--*` —— 底栏从「四行缺项 + 失败原因 + 按钮 ≈130px」变为「还差 6 项必填 · 查看 + 失败原因」一行半（≈70px）；导入芯片 `ppt-master` / `sql-tuning` 变「PPT 一键成稿」「SQL 慢查询优化」，与「三段式纪要」等同一套口径。
+- `market-browse-skill--desktop--*` —— 九个分类片换成两行全部可见（「未分类」落到第二行），右缘渐隐消失；移动端图不变。
+- `market-review-mobile--mobile--*` / `market-review-batch--mobile--*` —— kill-switch 分区折成一行「紧急下架已上架条目（kill-switch） 展开」，待审队列进入首屏；桌面端 `market-review--desktop--*` 全展开、无切换按钮，placeholder 变「要下架的条目 slug，如 ppt-master」。
+- `market-detail--desktop--*` / `market-detail-plugin--*` —— 徽章行下多出「人工审核：已通过平台危险模式扫描与管理员人工审核。」注脚；「详细介绍」内「它适合谁 / 授权范围」从 23px 粗标题降到与段标题同档（13.5px），介绍正文从 15.5px 回到 13px；插件块「认证方式：oauth2-auth-code」→「认证方式：OAuth 授权登录」，`search_pages · 读取` → `search pages · 读取`。暗色 / 移动端同样成立（`market-detail-plugin--mobile--dark` 核对）。
+
+**NOT RUN**：`npm test` 全量（改动限于 marketplace 目录 + `lib/marketplace.ts`，模块内 11 文件全绿；全量门由集成分支统一跑）、`npm run test:browser`（未触碰 Composer / 消息 / 工具卡 / 侧栏）、真机 iOS Safari、Tooltip 的 hover 态截图（预览台静态挂载，无 hover 驱动；Tooltip 用的是全站同一 `ui/Tooltip` 原语，InstalledPanel 已在用）。

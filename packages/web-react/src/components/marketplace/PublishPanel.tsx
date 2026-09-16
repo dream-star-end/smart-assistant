@@ -26,6 +26,7 @@ import type {
   SkillSummary,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { skillDisplayTitle } from "../manage/skillDisplay";
 import {
   Alert,
   Badge,
@@ -287,10 +288,16 @@ const TOOLSET_OPTIONS: { value: string; label: string; hint: string; locked?: bo
   { value: "web_context", label: "网页提取", hint: "抓取网页 / 文档" },
 ];
 
+/** 缺项超过这个数就折成「还差 N 项必填 · 查看」,点开才列全(K-21)。 */
+const MISSING_INLINE_MAX = 3;
+
 /**
  * 常驻底部操作条:左侧实时播报"还差哪几项必填"+ 本次提交的失败原因,右侧主按钮。
  * 提交按钮**不禁用** —— 点击即定位到首个缺项,比一个灰按钮更能推进用户;
  * 未填齐时降为 secondary 做视觉弱化。
+ *
+ * 缺项清单默认只在 ≤3 项时全列:空表单一上来就是 6 项,390px 下播报两行 + 失败原因 +
+ * 按钮吃掉约 130px 表单可视区;超过阈值折成「还差 N 项必填 · 查看」,想看全的人点一下。
  */
 function SubmitBar({
   missing,
@@ -303,12 +310,44 @@ function SubmitBar({
   submitting: boolean;
   onSubmit: () => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const collapsed = missing.length > MISSING_INLINE_MAX && !expanded;
   return (
     <div className="sticky bottom-0 -mx-4 flex flex-wrap items-center justify-between gap-2 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur">
       <div className="min-w-0 flex-1 basis-40">
         {missing.length > 0 ? (
           <p className="text-caption text-warning">
-            还差 {missing.length} 项必填：{missing.join("、")}
+            还差 {missing.length} 项必填
+            {collapsed ? (
+              <>
+                {" · "}
+                <button
+                  type="button"
+                  className="rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-expanded={false}
+                  onClick={() => setExpanded(true)}
+                >
+                  查看
+                </button>
+              </>
+            ) : (
+              <>
+                ：{missing.join("、")}
+                {missing.length > MISSING_INLINE_MAX && (
+                  <>
+                    {" "}
+                    <button
+                      type="button"
+                      className="rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                      aria-expanded={true}
+                      onClick={() => setExpanded(false)}
+                    >
+                      收起
+                    </button>
+                  </>
+                )}
+              </>
+            )}
           </p>
         ) : (
           <p className="text-caption text-faint">{SUBMIT_HINT}</p>
@@ -901,9 +940,11 @@ function SkillPublishForm({
     // 导入会覆盖 IMPORT_OVERWRITES 里的每一个字段(不含商品信息)—— 其中任何一个已被
     // 用户写过就必须先确认,一次误点不能吃掉草稿。字段清单直接来自下面的 draft.set,
     // 两处改一处必改:漏一个就是"用户写的内容被静默替换"。
+    // 确认框与提示里的名字跟芯片一致(展示名),用户刚点的是什么就写什么(K-10)。
+    const shownName = skillDisplayTitle(sk).title;
     if (draft.isDirty(IMPORT_OVERWRITES)) {
       const go = await confirmDialog({
-        title: `用「${sk.name}」覆盖当前内容？`,
+        title: `用「${shownName}」覆盖当前内容？`,
         body: "已填写的名称、标识、描述、标签、正文与附属文件会被这次导入替换，不可撤销。",
         confirmText: "覆盖导入",
         danger: true,
@@ -959,7 +1000,10 @@ function SkillPublishForm({
       loadedCount = loaded.length;
       draft.set({ body: detail.body ?? "", files: loaded });
     } catch {
-      setImportNote({ tone: "warning", text: `「${sk.name}」的正文没能读到，请手动填写技能正文。` });
+      setImportNote({
+        tone: "warning",
+        text: `「${shownName}」的正文没能读到，请手动填写技能正文。`,
+      });
       setImporting(null);
       return;
     }
@@ -1110,19 +1154,26 @@ function SkillPublishForm({
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-1.5">
-                  {mySkills.map((sk) => (
-                    <Button
-                      key={sk.name}
-                      variant="secondary"
-                      size="sm"
-                      shape="pill"
-                      loading={importing === sk.name}
-                      disabled={importing !== null}
-                      onClick={() => void importSkill(sk)}
-                    >
-                      {sk.name}
-                    </Button>
-                  ))}
+                  {/* 芯片用管理中心同一套展示名(描述首行),不再把 slug 当名字混排(K-10);
+                      slug 进 aria-label / title 供核对,与 manage 技能列表口径一致。 */}
+                  {mySkills.map((sk) => {
+                    const shown = skillDisplayTitle(sk);
+                    return (
+                      <Button
+                        key={sk.name}
+                        variant="secondary"
+                        size="sm"
+                        shape="pill"
+                        loading={importing === sk.name}
+                        disabled={importing !== null}
+                        onClick={() => void importSkill(sk)}
+                        aria-label={shown.caption ? `${shown.title}（${sk.name}）` : sk.name}
+                        title={shown.caption}
+                      >
+                        {shown.title}
+                      </Button>
+                    );
+                  })}
                 </div>
               )}
               {importNote && (
