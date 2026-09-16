@@ -191,8 +191,8 @@ B 阶段交付顺序建议：SET-02/03/04（用量与快捷键，纯前端、低
 | SET-32 双份轮询 | **判定不修**：手机跳出收银台后整页重载时订阅弹层已卸载、由 `PendingPaymentRecovery` 接手；bfcache 原页恢复时恢复条不会重读 sessionStorage（`pending` 只在挂载时取一次），两者不会在同一 document 里并存。已把这段判据写进 `SubscriptionDialog.tsx` 轮询 effect 的注释。 |
 | SET-42 更新检查入口 | 关于页只补了版本号与法务链接；「检查更新」属 shell 归属（`lib/appUpdate.ts` / `UpdateBanner`），不越界。 |
 | SET-09 汇率预估 / SET-10 组织改名 | 前端已做到文案与到账数可核对；真正的预估与改名**需后端配合**（`credits_per_yuan` 下发、`PATCH /api/org {name}`），见 §5。 |
-| 跨模块 · `lib/chat/pure.ts:587` 红卡文案 | 硬编码「Lite(¥38/月,4000 积分)」+ ASCII 标点，归属 messages。已 `send_to` messages owner（fable-5-1-26）说明改法；本模块不越界改 `lib/chat/**`。 |
-| 跨模块 · `manage/CronPanel.tsx:64-66` | Telegram 投递项 hint 指向已移除的偏好开关。manage 当前无人持有，已请指挥官代转给 manage 接手人。 |
+| 跨模块 · `lib/chat/pure.ts:587` 红卡文案 | 硬编码「Lite(¥38/月,4000 积分)」+ ASCII 标点，归属 messages。已 `send_to` messages owner（fable-5-1-26）说明改法；本模块不越界改 `lib/chat/**`。**→ 已在补丁①（§8.1 ③）由指挥官授权收口。** |
+| 跨模块 · `manage/CronPanel.tsx:64-66` | Telegram 投递项 hint 指向已移除的偏好开关。manage 当前无人持有，已请指挥官代转给 manage 接手人。**→ 已在补丁①（§8.1 ②）由指挥官授权收口。** |
 | `ConnectorsTab` / `KnowledgePlanetAutomationPanel` 目录迁移 | 仍按 §5：由 manage owner 决定，本轮不动。 |
 
 ## 7. 验证
@@ -221,3 +221,34 @@ B 阶段交付顺序建议：SET-02/03/04（用量与快捷键，纯前端、低
 - `charts.test.tsx`：双 y 轴接线（未标 right 时只有一条轴；标 right 的序列挂 `y1` 且不画第二套网格）（SET-17）。
 
 截图（仓库外）：`D:\code\test_project\test123\.audit-tmp\settings\{before,after}\`（各 27 场景 × desktop/mobile × light/dark = 108 张，`manifest.json` failures 0）；长图切段在 `crops\`（before）与 `crops-after\`（after）。逐张对照已确认：快捷键页不再是错误态、用量空态无假坐标轴、移动端统计卡与表格状态列不再断字竖排、ChatGPT 引导 Tab 标签完整、窄屏设置导航两行无孤项且标签不截断、订阅弹层日期不折行、创建组织向导无 700px 空白且第 3 步高亮、组织成员行邮箱与加入时间分两行、组织报表「Token 构成」大小写正确、可安装技能不再用 ✓。
+
+## 8. 补丁①（t-426）
+
+manage-B / settings-B / messages-B 三条 B 任务互相登记了三处「归别人」的遗留，由本补丁在 settings 分支统一收口。跨归属改动（`components/manage/CronPanel.tsx`、`lib/chat/pure.ts` 及其用例）均由指挥官在 t-426 任务书中显式授权；改前均已 `acquire_file_lock`。基线：先把本分支合入 integration `feat/v5-selfhost-ocv5-audit-ux @ 43b7cd3a4`（含 sidebar/manage/taskboard/messages-B，`dc99a93ca`，无冲突），再改这两个跨模块文件，避免与已合入的 manage-B / messages-B 打架。
+
+### 8.1 三处改动
+
+| # | 来源 | 文件 | 改动 | 用例 | commit |
+|---|---|---|---|---|---|
+| ① | manage 审计 M-09（P2）/ M-18 / M-20 / M-21（P3），修法见 `docs/audit/manage.md` §4 | `components/settings/ConnectorsTab.tsx` | **M-09** `RuntimePluginCard` / `ProviderCard` 卡头外层 `flex-wrap`，动作簇 `max-sm:basis-full max-sm:justify-start max-sm:pt-1` 窄屏整行下沉，桌面不变；**M-18** 元信息行仅 `conn.displayName && conn.accountHint` 时渲染 accountHint（标题已在 displayName 为空时回落显示它）；**M-20** 声明式 / 运行时目录任一读失败 → `degraded` 态，列表顶部 `Alert tone="info"`「部分插件目录暂时读不到，已显示可用部分」+ 重试（`data-testid="connectors-degraded"`）；市场回跳「Plugin 尚未安装到当前版本」改走单卡 `cardNotice`，不再占用为「整表读不到」保留的顶层 `err`；**M-21** 备注名 Input `onBlur` 提交、「取消」按 `mousedown` 置 `cancelingRef` 让路、Enter 忽略 `isComposing`、改名成功 toast「已改名 / 已清空备注名」 | `ConnectorsTab.test.tsx`：收紧「已绑多账号」用例为 accountHint 恰出现 1 次（M-18）；新增 describe「承接 manage 审计」7 例——声明式目录读失败出现可重试提示且重试后重拉目录、运行时目录读失败同样提示 / 正常不出现、市场回跳未安装提示落在卡内且无顶层错误与「去市场」、失焦提交 + toast、未改动失焦不发请求、取消 mousedown 让路不提交、IME 合成 Enter 不提交 | `138accab4` |
+| ② | 本文件 SET-05（Telegram 开关为死开关，已从偏好页移除） | `components/manage/CronPanel.tsx` | `DELIVER_OPTIONS` 加 `fallback` 标记：`/api/cron/channels` 拉不到时的兜底列表只保留「网页对话 / 仅记录」，Telegram 只在后端明确下发 `available` 时出现（二选一里选了「隐藏」）；Telegram hint 改为中性「结果推送到 Telegram。」，不再引导去已不存在的偏好开关；存量 `deliver=telegram` 任务仍按「Telegram」标签回显、编辑保留原值 | `CronPanel.test.tsx`：改写兜底用例（不含 Telegram）；新增「后端下发可用时可选且 hint 不提偏好页 / Telegram 通知」「存量 telegram 任务回显与编辑保留」 | `9582b5eb5` |
+| ③ | 本文件 SET-15（红卡价格硬编码） | `lib/chat/pure.ts` | `insufficientCreditsCopy`：免费 →「免费额度已用完，开通任意订阅套餐（Lite 及以上任一档）即可继续」（CTA 仍「开通 Lite」）；付费 →「本期积分已用完，可购买加量包或升级套餐」。**不再写价格 / 积分数**而非改读 `lib/plans.ts`：该函数在 `BRIDGE_ERROR_MESSAGES` / `ERROR_LABELS` import 时即求值，拿不到后端套餐真值，`plans.ts` 自注是落地页营销展示数据，读它只是把手抄常量换个地方、改价照样漂移；口径对齐 `lib/cursorModelPicker` `lockedModelUnlockNotice` 的「开通任意订阅套餐即可解锁」。标点全角 | `lib/chat/render.test.ts` 同步断言 + 新增「不含货币符号 / 数字 / 半角标点」守卫；`components/chat/cards.test.tsx`、`settings/AccountTab.test.tsx` 同步两处文案 | `091a1a7bb` |
+
+### 8.2 验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（合并后、三处改完各跑一次） |
+| ui-preview 场景类型检查 | `npm run typecheck:preview --workspace packages/web-react` | ⚠ 红，2 处均为 integration 带入的既有错误（`scenes-manage-audit.tsx:54` TS5097、`scenes-taskboard.tsx:163` TS2322），与本补丁无关，integ1 记录里已登记为基线失败 |
+| 涉及目录单测 | `npx vitest run src/components/settings src/components/manage/CronPanel.test.tsx src/lib/chat src/components/chat/cards.test.tsx src/components/MessageRenderer.test.tsx src/lib/plans.test.ts --maxWorkers=1` | ✅ 52 文件 / 1321 用例全绿（其中 ConnectorsTab 60、CronPanel 18；render + cards + AccountTab + MessageRenderer 274 亦分别单跑过） |
+| 代码风格 | `npx biome lint <改动文件>` | 与基线逐文件对比**未新增**诊断（`ConnectorsTab.tsx` 2 error + 1 warning、`CronPanel.tsx` 1、`pure.ts` 2、`cards.test.tsx` 1 均在未触碰的既有行；测试文件 0） |
+| after 截图 | `OC_UI_SCENES='manage-connectors,manage-cron-create,settings-account-free-empty' node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\patch1\after\` | ✅ 9 场景 / 28 张 / failures 0 / retried 0 / unmockedApi 空。已用 Read 逐张看：`manage-connectors-mobile--mobile--light` 微博卡「更新 / 卸载」整行落到描述下方，描述不再被压成窄柱（M-09）；`manage-connectors--desktop--light` 桌面布局不变，邮箱第二账号 `momo.muying@163.com · imap.163.com` 只出现一次（M-18）；`settings-account-free-empty--{desktop,mobile}` 红卡新文案，移动端两行不溢出；`manage-cron-create--mobile` 表单送达方式正常渲染（该场景 api-stub 声明 telegram `available:true`，属后端下发可用的分支；兜底隐藏与 hint 由 vitest 覆盖） |
+| `test:browser` | — | NOT RUN：本补丁未触碰 Composer / 消息渲染路径 / 工具卡 / 侧栏的交互面，`pure.ts` 只改了纯文案常量 |
+
+### 8.3 对 manage.md / messages.md 遗留项的闭环说明
+
+那两份文档在各自分支上，本补丁不改它们，只在此登记：
+
+- `docs/audit/manage.md` §6 修复记录中 **M-09 ⏸ / M-18·M-20·M-21 ⏸**（「遗留：`ConnectorsTab.tsx` 归 settings」）与 §7 X-02 → **已由本补丁 ① 落地**，修法与 manage.md §4 一致，用例见 8.1。
+- `lib/chat/pure.ts` 红卡文案（SET-15）当时是 `send_to` 转交 messages owner，`docs/audit/messages.md` 里没有对应登记条目（合并后核对过）→ **已由本补丁 ③ 落地**，以本文件为闭环记录；messages 归属的 `render.test.ts` / `cards.test.tsx` 仅同步了文案断言，未改行为。
+- 本文件 §6.3 的两条「跨模块」行已回指到这里。
