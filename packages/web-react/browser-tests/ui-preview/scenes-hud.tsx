@@ -12,6 +12,7 @@ import { Composer } from "../../src/components/Composer";
 import { PinnedDelegateTracker } from "../../src/components/chat/PinnedDelegateTracker";
 import { PinnedTaskTracker, type TodoItem } from "../../src/components/chat/PinnedTaskTracker";
 import type { InflightDelegateItem } from "../../src/lib/chat/inflightDelegates";
+import type { LiveTurnTokenUsageSnapshot } from "../../src/lib/chat/model";
 import type { Scene } from "./types";
 
 const NOW = Date.now();
@@ -51,6 +52,13 @@ const TODOS_LONG: TodoItem[] = [
   { content: "raise_hand 待命", status: "pending" },
   { content: "zhimo_chat 挂起", status: "pending" },
 ];
+
+/**
+ * 估算态用量徽标（「约 1.28M token」）。`estimated` 只在 LiveTurnTokenUsageSnapshot 上，
+ * PinnedTaskTracker 的 prop 类型是协议 TurnTokenUsageSnapshot —— 用带类型的常量传入，
+ * 直接写字面量会被多余属性检查拦下（typecheck:preview TS2353，t-1029 复核发现）。
+ */
+const ESTIMATED_USAGE: LiveTurnTokenUsageSnapshot = { totalTokens: 1_284_000, estimated: true };
 
 function delegate(over: Partial<InflightDelegateItem> & { jobId: string }): InflightDelegateItem {
   return {
@@ -193,11 +201,7 @@ export const hudScenes: Scene[] = [
     api: {},
     render: () => (
       <HudStage>
-        <PinnedTaskTracker
-          todos={TODOS_LONG}
-          active
-          tokenUsage={{ totalTokens: 1_284_000, estimated: true }}
-        />
+        <PinnedTaskTracker todos={TODOS_LONG} active tokenUsage={ESTIMATED_USAGE} />
       </HudStage>
     ),
   },
