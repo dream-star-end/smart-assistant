@@ -1,7 +1,7 @@
 # A·landing 落地页 / 登录 / 法务 / 桌面端登记 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-landing`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（只审计，不改业务代码）
+- 阶段：A（只审计，不改业务代码）→ **B（修复）已完成，记录见 §7 修复记录、§8 验证**
 - 结论：**P1 × 0 / P2 × 3 / P3 × 17**，共 20 条。没有阻断主流程的问题：登录 / 注册 / 验证 / 找回 /
   重置五个模式的状态机、Turnstile 三态 fail-closed、多 tab 登出广播、静默续期都经得起读。三条 P2 全在
   公开首页：营销页把设计系统的 CTA 渐变换成了柠檬绿，但三处仍写死 `text-white`，白字压在柠檬绿上
@@ -280,3 +280,105 @@ node browser-tests\ui-preview\shoot.mjs
    （需 App `onStart` 带目标，shell 接线）。
 4. **L-07**：首页保留主题切换（加即时反馈）还是去掉。
 5. **L-15 / X-01**：法务页主题接线由 shell-B 顺手改，还是授权 landing-B 改 `main.tsx` 三行。
+
+> 阶段 B 处置（2026-09-16，landing-B / t-49）：五件事在本模块归属内都有一个不越界、可回退的选项，
+> 未开决策卡，按下表自行拍板并记录；指挥官若另有偏好，每条都是一处改动量。
+>
+> | # | 取舍 | 理由 |
+> |---|---|---|
+> | 1 | 「联系合作」**有邮箱才渲染**（读 `BRAND.contactEmail`，当前 brand.ts 无此字段 → 不渲染）；备案位 **占位不渲染**，真实备案号（`filedIcp()` 判定含 ≥4 位数字）才出现并外链工信部 | 邮箱与备案号都是运营手里的信息，前端不编；一个点不动的"链接"和一句"更新中"比空着更伤可信度 |
+> | 2 | header 下展开一列锚点（最小改动） | 五个锚点一列即可，全屏抽屉对营销页是过度设计 |
+> | 3 | 主 CTA 统一「免费开始」；「浏览智能体市场」→「开始使用，再去市场安装」 | 「免费开始」已是头部用词；不做 `onStart('market')` 接线，不越界改 App |
+> | 4 | 桌面保留（hover title + 切换 toast 已有反馈），**窄屏隐藏** | 触屏看不到 title、页面又不变，只剩困惑；登录页有同一枚开关；顺带给窄屏头部腾出导航按钮的位置 |
+> | 5 | `LegalPage` **自己调 `useTheme()`** 并加 `ThemeToggle`，不动 `main.tsx` | 同一份 `oc_theme` 存储键，效果等价；X-01 对 shell 的诉求降为"可选" |
+
+---
+
+## 7. 修复记录（阶段 B · landing-B / t-49）
+
+分支 `feat/v5-selfhost-audit-landing`，在阶段 A 的 `ecc7a7d2` 之上。**P2 3/3 修复；P3 17 条中 13 条修复、
+2 条部分修复（L-08、L-16）、2 条遗留（L-11、X-02 依赖项）**。每条改动的用例在同名 `*.test.ts(x)` 里，
+编号与 §3 对应。
+
+| 编号 | 处置 | 改动 | 用例 |
+|---|---|---|---|
+| L-01 ✅ | 三处 `text-white` → `text-primary-fg`（落地页作用域下为深色墨，与 `Button primary` 同源） | `landing/Tutorials.tsx`（步骤圆点、「打开案例展厅」）、`landing/DemoShowcase.tsx`（顶栏图标） | `Tutorials.test` 「渐变底上的前景色走 text-primary-fg」；`DemoShowcase.test` 「窗口顶栏的渐变图标前景」 |
+| L-02 ✅ | 「联系合作」有 `BRAND.contactEmail` 才渲染为 `mailto:`；备案位经 `filedIcp()` 判定，占位不渲染、真值外链 `beian.miit.gov.cn`；`LegalPage` 页脚同规则 | `Landing.tsx`、`LegalPage.tsx`、`lib/legal.ts`（新增 `filedIcp`） | `Landing.test` 「从简 Landing 页脚」×3；`LegalPage.test` 「备案占位不进页脚」；`legal.test` 「filedIcp」×2 |
+| L-03 ✅ | 窄屏 `IconButton`（`aria-label` 打开/收起导航、`aria-expanded`、`aria-controls`），header 下展开五个锚点（`min-h-11` 触控靶），点锚点 / Esc 收起；桌面横排与折叠菜单共用 `NAV_LINKS` | `Landing.tsx` | `Landing.test` 「折叠菜单」「桌面导航与折叠菜单指向同一组锚点」 |
+| L-04 ✅ | `lib/legal.ts` 全文标点全角化（，；：（）“”），数字 / 英文 / 网址内部不动；日期行改为单字段「生效日期：」；隐私政策 §九「更新日期」一词随之改为「生效日期」。**`TERMS_VERSION` 不 bump**（排版级修订不改条款语义，文件头注释已写明这条规则） | `lib/legal.ts`、`LegalPage.tsx`、`AuthGate.tsx`（弹窗 description） | `legal.test` 「全文没有夹在中文之间的半角标点」「弯引号」；`LegalPage.test` 「版本日期只标一次」；`AuthGate.test` 「协议弹窗副标题」 |
+| L-05 ✅ | 占位符改「输入 6 位验证码」+ `placeholder:tracking-normal`（字距只作用于输入值） | `AuthGate.tsx` | `AuthGate.test` 「验证码占位符不再被 0.4em 字距拉开」 |
+| L-06 ✅ | 头部 / Hero / 末屏统一「免费开始」；「浏览智能体市场」→「开始使用，再去市场安装」。场景卡「用我的任务试试」与演示区「免费试一句」是语境化次级 CTA，保留 | `Landing.tsx` | `Landing.test` 「导航登录与主行动按钮」（三处均触发 `onStart`）「CTA 文案不许诺点了到不了的地方」 |
+| L-07 ✅ | 主题切换包在 `hidden md:block` 里：桌面保留（title + toast），窄屏收起 | `Landing.tsx` | `Landing.test` 「主题切换仍在，但包裹层只在 md 起显示」 |
+| L-08 ◐ | ② Tab 条右缘渐隐（`sm:hidden`，同 BrowsePanel 写法），Tab 与底部两枚按钮补 `type="button"`；① 答案气泡的 `invisible` 撑位改为 `hidden md:block`、覆打层改 `md:absolute` —— 窄屏随打字自然增长。**执行步骤时间线仍按固定行数预留**（"逐条点亮不位移"是有意设计，未动） | `landing/DemoShowcase.tsx` | `DemoShowcase.test` 「能力 Tab 条」「答案气泡的撑位段只在 md 起生效」 |
+| L-09 ✅ | 抽 `PasswordInput`（`Input` + 尾部 `IconButton` Eye/EyeOff，`aria-pressed`，可及名带字段名：显示密码 / 显示确认密码 / 显示新密码 / 显示确认新密码），五处替换；注册 / 重置的密码标签改 `htmlFor` 关联（包裹式 label 会把点按钮转发成聚焦输入框） | `AuthGate.tsx` | `AuthGate.test` 「密码框显示 / 隐藏」×3 |
+| L-10 ✅ | `loginPending` 分支按钮文案「正在准备登录…」（可见 + 可及名） | `AuthGate.tsx` | `AuthGate.test` 「配置未就绪时的登录按钮」 |
+| L-11 ⏸ | **遗留**。登录页 `placeholder="邮箱" / "密码"` 被 shell 的 `App.test.tsx` 用 `getByPlaceholderText` 锁定（4 处），本模块无权改该文件；改占位符会红掉 shell 的用例。建议 shell 把查询改为 `getByLabelText` 后再回来做 | — | — |
+| L-12 ✅ | 「重置链接无效或缺少 token。」→「重置链接无效或已过期，请从邮件重新打开。」 | `AuthGate.tsx` | `AuthGate.test` 「不泄漏开发者词 token」 |
+| L-13 ✅ | 登录页页脚 → 「多模型协作 · 长任务不中断 · 成果直接可用」（与落地页 hero 勾选项同一套话） | `AuthGate.tsx` | `AuthGate.test` 「页脚卖点」 |
+| L-14 ✅ | 随 L-04 改为单字段，390px 不再折行（见 `auth-legal-modal--mobile` after 图） | `AuthGate.tsx` | 同 L-04 |
+| L-15 ✅ | `LegalPage` 调 `useTheme()`（同一 `oc_theme` 键）并在头部放 `ThemeToggle`；未动 `main.tsx` | `LegalPage.tsx` | `LegalPage.test` 「按已保存的主题偏好挂 dark 类」 |
+| L-16 ◐ | ① 「链接无效」→ 说明在 Clarvy 里重新发起 + `Alert action`「返回首页」；③ 「操作过于频繁」→ 「…，请稍后再试」；④ `cancel()` 改走 `enrollNavigation.assign`（可测缝，生产仍整页跳 `/`）。② **「去设置解绑」未做**：网页端没有设备管理页（后端有 `handleDesktopRevoke`，前端无入口），不放跳不到位的链接；下方「取消」即出口 | `DesktopEnrollPage.tsx` | `DesktopEnrollPage.test` 「提示如何重新发起并有返回首页的出口」「取消走同一条可测导航缝」、`test.each` 429 文案 |
+| L-17 ✅ | `#747970 / #747a70 / #777d73` 小字统一 `#8b9086`（对 `#090a08` ≈ 5.9:1），11px 步骤编号提到 11.5px | `Landing.tsx` | 视觉：`landing-home` / `landing-section-workflow` / `landing-section-footer` after 图 |
+| L-18 ✅ | 接口失败 / 空档位不再显示「¥88/席起」，只显示「按席位计费，随需加席」；拿到档位仍显示最低每席价 | `Landing.tsx` | `Landing.test` 「公开档位不可用时不展示价格」「为空列表时同样不展示价格」「可用时展示最低每席价」（既有） |
+| L-19 ✅ | 复制暗示常驻：图标 + 「复制」文字（opacity 70 → hover 100），去掉 `title` | `landing/Tutorials.tsx` | `Tutorials.test` 「常驻显示「复制」暗示」 |
+| L-20 ✅ | 宿主按官方 300×65 占位 + 加载期 `Skeleton`；无 site key / 脚本失败时撤下骨架并不再占位（上层错误提示接管） | `TurnstileWidget.tsx` | `TurnstileWidget.test`（新建）×2 |
+
+顺手项（计划外、小）：`DemoShowcase` 三枚 `<button>` 补 `type="button"`（biome `useButtonType`）；`legal.ts` 两条无插值模板字面量改普通字符串（biome `noUnusedTemplateLiteral`）。
+
+### 7.1 遗留与需要别人的事
+
+| 项 | 归属 | 说明 |
+|---|---|---|
+| L-11 登录页占位符 = 标签 | shell（`App.test.tsx`） | 见上表；改法已备好（邮箱示例 `name@example.com`、密码留空），等查询方式解耦 |
+| L-16 ② 设备上限「去设置解绑」 | 产品 / 桌面端 | 网页端缺设备管理页；若后续在设置中心补「本地模式设备」分区，这里加一枚 `action` 即可 |
+| X-01 法务页主题接线 | shell | 已由 `LegalPage` 自接，`main.tsx` 不必再动；如 shell 希望入口层统一挂 `.dark`，两者可并存 |
+| X-02 `--grad-cta-fg` token | shell | 本模块用 `text-primary-fg` 兜住；补 token 后三处各换一个类名 |
+| X-03 备案号 / 联系邮箱 | shell + 运营 | `brand.ts` 填入真实 `icp`（含数字）即自动出现；新增 `contactEmail?: string` 字段即出现「联系合作」 |
+| 兜底锚点价 | 产品 | L-18 改为不报价；若产品要常驻锚点价，放 `BRAND` / 构建期常量并加「与 plans 表同步」注释 |
+
+### 7.2 新增 / 修改的场景
+
+`browser-tests/ui-preview/scenes-landing.tsx` 新增 2 个场景（共 31 个）：`landing-mobile-nav-open`（窄屏折叠菜单展开，
+mobile）、`auth-register-password-shown`（注册页第一枚密码框切到显示态，desktop + mobile）。`api-stub.ts` / `types.ts` /
+`shoot.mjs` 未改。
+
+---
+
+## 8. 验证（阶段 B）
+
+全部在 `wt/landing` 工作树内跑；命令见 PLAYBOOK §3。
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0 |
+| 模块单测 | `npx vitest run src/components/Landing.test.tsx src/components/landing src/components/AuthGate.test.tsx src/components/LegalPage.test.tsx src/lib/legal.test.ts src/components/DesktopEnrollPage.test.tsx src/components/TurnstileWidget.test.tsx --maxWorkers=1` | ✅ 9 个文件全绿（`AuthGate.test` 既有 28 例一字未动 + 新增 8 例；`Landing.test` 新增 9 例、改 2 例；`LegalPage.test` 新增 3 例；`DesktopEnrollPage.test` 新增 2 例、改 1 例文案；`Tutorials.test` / `DemoShowcase.test` 各新增 2 / 3 例；`legal.test` / `TurnstileWidget.test` 新建 5 / 2 例）。也包含在下一行的全量里 |
+| 全部 web-react 单测 | `npm test` | ◐ 278 个文件 277 通过、3735 例 3733 通过（600s）。唯一失败 `src/lib/tutorialShowcase.test.ts`（2 例：校验 `public/` 演示资产的字节数与 SHA-256）**在未改动的主克隆 `v5-selfhost` 上同样失败**（本机 `core.autocrlf=true` 改写了文本资产的行尾；tutorials 归属，环境问题），与本轮改动无关 |
+| 代码风格 | `npx biome lint <本轮 17 个文件>` | ✅ 本轮**新增 0 条**。基线上这 8 个源文件原有 18 条既有告警，改后 10 条 —— 顺手修掉 8 条（`useButtonType` × 3、`noUnusedTemplateLiteral` × 1、`noLabelWithoutControl` × 4：密码标签改 `htmlFor`）；余下 10 条是「`<label>` 包裹自定义 `Input`」「`<p role=status>`」等既有模式，不在本轮范围 |
+| after 截图 | `OC_UI_SCENES=landing-,auth-,legal-,desktop-enroll OC_UI_SHOT_DELAY=1200 node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\landing\after` | ✅ 106 张 / 31 场景 × light/dark（29 个既有 + 2 个新增），`manifest.json` `failures: 0`、`retried: 0`、`unmockedApi: []`；关键 12 张已用 Read 逐张看过（§8.1） |
+
+### 8.1 before / after 对照（`…\.audit-tmp\landing\{before,after}\`）
+
+| 问题 | 看这张 | 变化 |
+|---|---|---|
+| L-01 | `landing-section-tutorials--desktop--light.png` | 「1 / 2 / 3」与「打开案例展厅 →」由白字压柠檬绿变为深色墨字，可读 |
+| L-03 / L-07 | `landing-home--mobile--light.png` → `landing-mobile-nav-open--mobile--light.png` | 390px 头部出现 ☰；主题切换在窄屏收起；点开后列出五个分区锚点，行高 44px |
+| L-02 | `landing-section-footer--desktop--light.png` | 页脚不再有「联系合作」纯文本与「备案信息更新中」 |
+| L-08 | `landing-section-demo--mobile--light.png` | Tab 条右缘渐隐；执行步骤下方空白由约一屏缩到只剩固定行数的步骤时间线 |
+| L-05 | `auth-verify--desktop--light.png` | 占位「输入 6 位验证码」正常字距（原「请 输 入 邮 箱 里 的 …」） |
+| L-09 | `auth-register-password-shown--desktop--light.png` | 密码 / 确认密码各带眼睛按钮，第一枚处于显示态 |
+| L-04 / L-14 | `auth-legal-modal--mobile--light.png`、`legal-terms--mobile--dark.png` | 「生效日期：2026-07-10」一行不折；正文全角标点、“本服务”弯引号 |
+| L-15 | `legal-terms--mobile--dark.png` | 法务页头部出现主题切换 |
+| L-16 | `desktop-enroll-invalid--desktop--light.png` | 「链接无效，请回到 Clarvy 里重新发起「本地模式」登记。」+ 返回首页 |
+| L-20 | `auth-login-turnstile-fail--desktop--light.png` | 失败态无 65px 空白（骨架只在加载期出现） |
+| L-17 | 任一 `landing-section-*` | 小字由 `#74797x/#777d73` 提到 `#8b9086` |
+
+### 8.2 未跑（NOT RUN）与理由
+
+- `npm run test:browser`：本轮未触碰 PLAYBOOK §3 列出的高频交互面（Composer / 消息 / 工具卡 / 侧栏）；
+  `browser-tests/run.mjs` 与 `user-contract.node-test.mjs` 里没有真实 `AuthGate` / `Landing` DOM 的用例
+  （user-contract 用的是内联 fixture HTML），跑它对本轮改动没有额外判别力。登录链路的回归靠 shell 的
+  `App.test.tsx`（Landing → AuthGate → 工作区三层，含 `getByPlaceholderText('邮箱'/'密码')` 填表登录）在 `npm test`
+  里覆盖，全绿。
+- 真实 Turnstile 挑战 / 邮件验证码 / 重置邮件 / 桌面深链：需真后端或真桌面端；`TurnstileWidget` 的占位与
+  失败态用 jsdom 手动派发 `<script>` 事件模拟。
+- 真机 iOS Safari：390px 用预览台 mobile 视口（`isMobile + hasTouch`）代替。
