@@ -964,7 +964,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     await waitFor(() => expect(screen.getAllByText('A 开场').length).toBeGreaterThan(0))
     await openAgentPicker()
     expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
-    const asDefaultBox = screen.getByLabelText(/同时作为新会话默认/)
+    const asDefaultBox = screen.getByLabelText(/同时设为新对话的默认协作方式/)
     fireEvent.click(asDefaultBox)
     await waitFor(() => expect(asDefaultBox).toBeChecked())
     fireEvent.click(soloChoice())
@@ -985,7 +985,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     await openAgentPicker()
     expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
     expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
-    expect(screen.getByLabelText(/同时作为新会话默认/)).not.toBeChecked()
+    expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
 
     const putsBeforeRelease = collabPuts.filter((row) => row.token === 'tok-b').length
     releaseReread()
@@ -994,7 +994,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
     expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
     expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
-    expect(screen.getByLabelText(/同时作为新会话默认/)).not.toBeChecked()
+    expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
 
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
     const tb = await screen.findByPlaceholderText('和「全能助手」对话…')
@@ -1006,7 +1006,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const ordinaryBPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
     expect(ordinaryBPuts).toEqual([])
     await openAgentPicker()
-    expect(screen.getByLabelText(/同时作为新会话默认/)).not.toBeChecked()
+    expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
     fireEvent.click(teamChoice())
     await waitFor(() =>
       expect(collabPuts.filter((row) => row.token === 'tok-b').length).toBeGreaterThan(putsBeforeRelease),
