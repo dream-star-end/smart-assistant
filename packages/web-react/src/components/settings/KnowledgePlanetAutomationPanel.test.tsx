@@ -325,8 +325,16 @@ test('只锁正在操作的那一行:切换第一条时第二条的开关仍可�
   fireEvent.click(first)
   await waitFor(() => expect(first).toBeDisabled())
   expect(second).toBeEnabled()
+  // 「可用」必须是真的可用:第一条还在飞时点第二条,请求要发出去,而不是被静默吞掉
+  // (t-1029 复核:单键 busyKey 时这里点了没反应,受控 Switch 不翻、没有任何反馈)。
+  fireEvent.click(second)
+  await waitFor(() => expect(mocks.patchKnowledgePlanetAutomationRule).toHaveBeenCalledTimes(2))
+  expect(mocks.patchKnowledgePlanetAutomationRule).toHaveBeenLastCalledWith(auth, 'acc_1', 'rule_2', {
+    enabled: true,
+  })
   release(rule())
   await waitFor(() => expect(first).toBeEnabled())
+  await waitFor(() => expect(second).toBeEnabled())
 
   mocks.patchKnowledgePlanetAutomationRule.mockRejectedValueOnce(new Error('规则已被删除'))
   fireEvent.click(second)
