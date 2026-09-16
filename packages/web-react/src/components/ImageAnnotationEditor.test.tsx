@@ -204,6 +204,18 @@ describe('底栏按钮稳定性(M-12)', () => {
   })
 })
 
+// ── 审计 M-24:价格不在前端写死 —— 计费口径一改前端就说谎。 ──
+describe('计费文案(M-24)', () => {
+  test('顶栏副标题与读屏帮助文案不再写死「每张 50 积分」', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const title = await screen.findByText('圈选要修改的区域')
+    expect(title.parentElement).toHaveTextContent('Image 2')
+    expect(title.parentElement?.textContent).not.toMatch(/积分/)
+    expect(document.getElementById('image-edit-help')?.textContent).not.toMatch(/积分/)
+  })
+})
+
 // ── 审计 M-11 / M-23:画布区为滑杆让位;提示词框随内容自增高。 ──
 describe('画布区布局与提示词框(M-11 / M-23)', () => {
   test('画布容器左侧为笔刷滑杆留出 ≥56px 内边距', async () => {

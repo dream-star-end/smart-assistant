@@ -797,7 +797,8 @@ export function ImageAnnotationEditor({
               <Dialog.Title className="text-sm font-semibold">
                 {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
               </Dialog.Title>
-              <span className="text-caption text-white/60">Image 2 · 每张 50 积分</span>
+              {/* 价格不在前端写死(审计 M-24):计费口径归后端/计费侧,前端没有可读的价格字段就不报数。 */}
+              <span className="text-caption text-white/60">Image 2</span>
             </div>
             <button
               type="button"
@@ -934,7 +935,7 @@ export function ImageAnnotationEditor({
               />
             </div>
             <p id="image-edit-help" className="sr-only">
-              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。每张 50 积分。
+              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。
             </p>
             <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-2">
               {/* 次级:矩形/套索/橡皮/清空收进「更多工具」——受控开合(需求 §4):选完/点外部/ESC

@@ -1,7 +1,7 @@
 /**
  * 调整大小模式:底部弹出五比例菜单(带示意图标)。选择即合成 [源图 + guide] 并进主对话
  * (需求 B),帧标 mode:'resize' + targetAspect —— P 侧映射为 gateway outpaint 分支重构图。
- * 计费同 50 积分/张(仍走既有 reserve/settle,不新开口径)。
+ * 计费口径与圈选编辑一致(仍走既有 reserve/settle,不新开口径;具体价格由计费侧定,前端不写死)。
  */
 import { type RefObject, useCallback, useEffect, useState } from 'react'
 import { X } from 'lucide-react'
