@@ -48,6 +48,7 @@ export function MarketplaceCenter({
   onCreateInChat,
   onAskAiInChat,
   onOpenConnectors,
+  onRequireLogin,
   onTabChange,
   onClose,
 }: {
@@ -63,6 +64,11 @@ export function MarketplaceCenter({
   onAskAiInChat?: (text: string) => void
   /** 安装连接器后跳到管理中心完成账号绑定。 */
   onOpenConnectors?: (pluginSlug?: string) => void
+  /**
+   * 未登录空态的「去登录」出口(K-24):与 ManageCenter 同款 —— 由壳外(App)负责关市场并切到登录;
+   * 没传时回落为只关弹窗(改造前的行为),按钮文案与行为的错位留给接线补齐。
+   */
+  onRequireLogin?: () => void
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {
@@ -222,7 +228,7 @@ export function MarketplaceCenter({
                 title="登录后即可浏览市场"
                 hint="你安装的技能与智能体会跟随账号同步。"
                 action={
-                  <Button size="sm" variant="primary" onClick={onClose}>
+                  <Button size="sm" variant="primary" onClick={onRequireLogin ?? onClose}>
                     去登录
                   </Button>
                 }

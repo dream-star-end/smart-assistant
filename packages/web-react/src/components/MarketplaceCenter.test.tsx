@@ -222,8 +222,30 @@ test("未登录态给带出口的空态,而不是一行居中灰字", () => {
   );
 
   expect(screen.getByText("登录后即可浏览市场")).toBeInTheDocument();
+  // 没接 onRequireLogin 时保持改造前行为:只关弹窗。
   fireEvent.click(screen.getByRole("button", { name: "去登录" }));
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("未登录「去登录」接了 onRequireLogin 就走它,由壳外负责关市场并切登录(K-24)", () => {
+  const onClose = vi.fn();
+  const onRequireLogin = vi.fn();
+  render(
+    <MarketplaceCenter
+      open
+      tab="browse"
+      auth={null}
+      isAdmin={false}
+      onRequireLogin={onRequireLogin}
+      onTabChange={() => {}}
+      onClose={onClose}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "去登录" }));
+  // 与 ManageCenter 同款契约:回调自己决定关不关(App 里 setXxxOpen(false) + setAuthMode),壳层不重复关。
+  expect(onRequireLogin).toHaveBeenCalledTimes(1);
+  expect(onClose).not.toHaveBeenCalled();
 });
 
 test("四个分区只挂一个面板,其余 tab 不得留悬空 aria-controls", () => {
