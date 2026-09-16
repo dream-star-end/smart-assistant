@@ -5,6 +5,19 @@
 > 背景：t-760 覆盖复查指出 messages-A（t-32）的 `ask-user-question` 场景只含「已解析权限卡」，未决态（待决 / 批准中 / 拒绝 / 超时 / 多卡并发 / 键盘 / 移动端）无人审过。
 > 证据目录（仓库外，PNG 不入库）：`D:\code\test_project\test123\.audit-tmp\permission-card\{before,after-2}\` + `*.log`。
 
+## 0. t-837 声称项核对表（指挥官补发任务书首节）
+
+t-837 在任务库的交付记录异常（assignee 为「派活回执」），需先核它声称的改动是否真落地。核对口径：integration `feat/v5-selfhost-ocv5-audit-ux @ c034f05d7` 与基线 `210b9967`、`docs/audit/**`、全部本地分支。
+
+| 核对项 | 结论 | 证据 |
+|---|---|---|
+| integration 上 `PermissionCard.tsx` / `PermissionCard.test.tsx` 是否有 t-837 的改动 | **无** —— 与基线逐字节相同 | `git log --oneline 210b9967..c034f05d7 -- packages/web-react/src/components/chat/PermissionCard.tsx packages/web-react/src/components/chat/PermissionCard.test.tsx` 为空；`git diff --stat 210b9967 c034f05d7 -- <同两文件>` 为空 |
+| `docs/audit/**` 是否有 PermissionCard 专审文档或 PC-xx 条目 | **无** | `git grep -n -E "PermissionCard\|权限卡\|PC-[0-9]{2}" c034f05d7 -- docs/audit` 仅命中 `messages.md:18`（文件清单）与 `:33`（`messages-ask-user-question` 场景「已解析权限卡」，即 t-760 指出的薄弱点本身）；`git grep -n "t-837" c034f05d7 -- docs` 为空 |
+| 是否有任何分支含 t-837 的提交 | **无** —— 触碰 `PermissionCard.tsx` 的提交只有基线以前的历史与本轮 `2ceeff88f` | `git log --all --oneline -- packages/web-react/src/components/chat/PermissionCard.tsx` |
+| t-837 原持有人留下了什么 | 仅 `wt\permission-card` 工作树内的**未提交**改动（`PermissionCard.tsx` +211/−27、`PermissionCard.test.tsx` +181/−1、未跟踪 `scenes-permission-card.tsx`）与 `.audit-tmp\permission-card\{before,after}` 截图、4 份 vitest 日志；无文档、无提交、未 push | `git status` / 导出记录 `fable-5-1-56-2026-09-16-15-12-30.md`（记录截止于领到 t-837 的任务书，之后的改动只在工作树里） |
+
+结论：**t-837 没有任何声称项落地到 integration，无可核之「声称」**；其工作树里的半成品即本轮 §4 里标注「fable-5-1-56 完成未提交」的 PC-01 / 02 / 04–15，已由本人逐行走读核对（每条改动与其注释、用例一致，且 70 例单测绿）后收口提交，见 §4 与 §5。
+
 ## 1. 范围与文件清单
 
 | 文件 | 角色 | 本轮 |
@@ -52,6 +65,28 @@
 
 统计：17 条 = P2 5（PC-01 / 02 / 04 / 12 / 13）· P3 12。P1 0：待决 → 允许 / 拒绝 → 结清的主链路本身可用；未决态弹框的单例、dismissed 记忆、过期判据、只读 surface、题干截断取回都有既有用例锁定，走读未发现数据错误。
 
+### 3.1 指挥官补发任务书的审计面 · 逐项结论
+
+| 审计面 | 结论 | 证据 / 处置 |
+|---|---|---|
+| 允许 / 拒绝按钮可用态 | ✅ 待决且未提交时可用；`_controlPending`（批准中）、`readOnly`、已结清、题干截断中一律不渲染动作按钮，不是 disabled 灰按钮而是收走（避免「能看不能点」） | `PermissionCard.tsx` `canAnswer = !resolved && !pending && !readOnly && (!expired \|\| livePrompt) && !inputTruncated`；既有用例「只读 surface…」「题干截断…」+ PC-16 用例 |
+| 「记住选择」 | 不适用 —— 组件、协调器、`inbound.permission_response` 协议均无「记住 / 总是允许」语义，前端不能凭空造 | `socket.ts respondPermission` payload 只有 `behavior / message / updatedInput` |
+| 提交中 loading / disabled | ✅ 点「允许 / 拒绝」后 `respondPermission` **同步**置 `_controlPending = true`，卡头切「正在提交…」+ 旋转 loader（PC-16），按钮与弹框同帧收走；Master 回执 `applied` 后 `_resolved / _behavior` 落定 | `socket.ts:5954-5957`、`:5581-5586`；after 图 `approving--*` |
+| 防重复点击 | ✅ 两层：UI 层按钮随 `_controlPending` 消失；socket 层 `controlId = stableControlId("permission", requestId:behavior)` 已在队列即 `return`，同一请求同一动作幂等 | `socket.ts:5941-5942` |
+| 失败重试 | ✅ 由持久化控制队列兜底：控制项落 `_pendingControls`，断线 / 刷新后重放并恢复 `_controlPending`（卡仍显「正在提交…」），无需用户重点；缺的是「长时间无回执」的超时提示，属状态机范围，见 §6 遗留 | `socket.ts:3798-3803`（重放恢复）、`enqueueControl` 重试 |
+| 卡片出现时焦点去向 | ✅ 活提问自动弹框：Radix `Modal` 打开即把焦点圈进对话框（首个可聚焦元素）；关掉后归位到打开它的「审批」按钮（用户手动打开时）；自动弹出无触发元素 → 落回 `body`，见 §6 遗留（需 shell 决定归位目标） | `ui/Modal.tsx` FocusScope；PC-04 用例断言弹框开合 |
+| Tab 顺序 | ✅ 卡：审批 → 拒绝（同一行、DOM 顺序）；普通弹框：关闭 → 参数详情 `<details>` → 拒绝 → 允许；问答弹框：每题一个 Tab 停靠（roving，PC-12）→ 其他输入框（选中时）→ 暂不回答 → 提交 | PC-12 用例断言 `tabindex` 0/-1 分布 |
+| Esc / Enter | ✅ Esc 关弹框 = 只关 UI（记 dismissed，出待答入口条，不批准不拒绝）；Enter 在按钮上按原生语义触发；「其他」输入框 Enter 直接提交（PC-15）；方向键 / Home / End 在选项组内移动（PC-12） | 既有用例「关闭只关 UI，不批准不拒绝，卡片可重开」「用户关掉问答后重挂不再自动弹，手动回答仍可用」+ PC-10/11、PC-12、PC-15 用例 |
+| aria：role | ✅ 弹框 `role=dialog` + `aria-labelledby` 标题（「工具权限请求 / 用户问答 / 退出计划模式」）；选项组 `radiogroup` / `group` + `aria-label=题干`；选项 `role=radio/checkbox` + `aria-checked`；卡头状态 `<output>`（PC-05）；校验提示 `role=alert` + `aria-describedby`（PC-13） | PC-04 / 05 / 12 / 13 用例按 role 查询 |
+| aria-live | ✅ 状态切换 polite（`<output>`）；校验错误 assertive（`role=alert`）；待答入口条是 `Alert tone=warning`（原语 `role=alert`，插入即播报「智能体在等你确认」） | 同上；`ui/Alert.tsx:76` |
+| 按钮名称 | ✅ 「审批 / 回答 / 审阅计划」「拒绝」「允许」「继续规划 / 按此计划执行」「暂不回答，让它继续」「提交」「打开」；卸载 / 关闭走原语 `aria-label="关闭"`；「其他答案」输入框显式 `aria-label` | 用例均按 `getByRole("button", { name })` 查询 |
+| 超时 | ✅ 卡头倒计时（PC-06 / 07）；到点：Host 以精确 deadline 定时器重算，卡退出 `pending` → 弹框卸载、入口条消失，卡显「已过期」；服务端 `permission_settled{timeout}` 到达后转「审批超时，已自动拒绝」。活提问误判过期的 fail-safe 补了说明（PC-03） | 既有「finite deadline countdown…」用例；`settled` 场景「超时」卡 |
+| 撤回（`user_stop` / 断连 / 崩溃） | ✅ 结清原因逐条有中文：本轮已停止 / 连接断开 / 进程异常 / 请求已处理 / 已受理（尚未确认执行） | `settledReasonLabel`；`settled` 场景 10 张卡 |
+| 会话切换 | ✅ Host 的弹框 `key=${sessionId}:${requestId}`，切会话即卸载并 `yieldActiveModal`，另一会话的待决卡按自己的 dismissed / displayed 记忆决定是否弹 | 既有用例「PermissionPromptHost … sessionId」（`PermissionCard.test.tsx:850` 附近） |
+| 多卡同时未决互不干扰 | ✅ 单例弹框：同一时刻只开一个；关掉 A 自动补 B；A 被 B 顶掉后不再静默（PC-04）；入口条标出总数（PC-10）；三卡各自的倒计时 / 摘要独立 | PC-04 / PC-10 用例；`multi-pending-*` 场景 |
+| 移动端 | ✅ 三种弹框 `mobile="sheet"` 贴底；选项 / 按钮 ≥ 44px；卡头 390px 可换行（PC-01）；命令摘要 `break-all` 不横滚 | `*--mobile--*` 24 张 |
+| 深浅色 | ✅ 全部走 token（`text-warning / text-accent / bg-surface` 等），暗色下临期 / 拒绝 / 渐隐层均成立 | `*--dark.png` 26 张，Read 核对 `multi-pending-cards--mobile--dark` |
+
 ## 4. 修复记录（A→B 合一，逐条）
 
 全部在组件层，未改 `permissionPopupCoordinator.ts` / `permissionReconcile.ts` / socket 状态机 / ui 原语 / App 壳层。
@@ -89,7 +124,7 @@
 | 时间线层单测 | `npx vitest run src/components/MessageRenderer.test.tsx --maxWorkers=1 --hookTimeout=60000` | ✅ **147 例全绿**（接手时 1 例因 PC-02 题干双份而红，改为对话框内断言后过；`--hookTimeout` 只为绕开该文件 `beforeAll` 冷启抖动 —— 集成①记录里的已知基线现象；`vitest-5-mr.log`） |
 | chat 目录单测 | `npx vitest run src/components/chat src/lib/chat --maxWorkers=1` | ✅ **60 文件 / 1274 例全绿**（`vitest-6-chat.log`） |
 | 代码风格 | `npx biome lint` 三个改动文件 + HEAD 版本对照 | ✅ `PermissionCard.tsx` 11 条诊断与 HEAD 版本逐条相同（`useExhaustiveDependencies` ×5、`noArrayIndexKey` ×2、`useSemanticElements` / `noAutofocus` / `useNumberNamespace` / `suppressions/unused` 各 1，行号后移、代码未触碰）；`PermissionCard.test.tsx`、`scenes-permission-card.tsx` 0 条 → **新增 0** |
-| 预览台场景类型检查 | `npm run typecheck:preview` | NOT RUN：该脚本与 `tsconfig.browser-tests.json` 是 integration 新增，基线 `210b9967` 上不存在；场景文件由 `shoot.mjs`（esbuild）成功打包出图作为编译证据，合入 integration 后由集成④ 全量门覆盖 |
+| 预览台场景类型检查 | 基线无 `typecheck:preview` 脚本；借 integration `c034f05d7` 的 `tsconfig.browser-tests.json` 临时放进包目录跑 `npx tsc -p tsconfig.browser-tests.json`（跑完即删，未提交） | ◐ `browser-tests/ui-preview/**` **0 错误**（含新场景）；20 条错误全部落在 `../protocol/src/*`（BigInt 字面量 / Set 迭代需 ES2020）与 `@types/request`，是基线分支 `tsconfig.json` 缺 integration 后续 target / 引用调整所致，与场景无关；合入后由集成④ 的 `npm run typecheck:preview` 全量门覆盖（`typecheck-preview.log`） |
 | 真浏览器门 | `$env:OC_E2E_BROWSER=<Chrome>; npm run test:browser` | ✅ `run.mjs` **T1–T67 全部 ok、0 not ok**（含 T13 工具卡触控 / 键盘、T15 活动 turn 中 Ask UI 移动端点选提交、T57 permission live-units、T25 390×844 整页）；`node --test` 73 条 **70 pass / 3 fail**，3 条与基线 `210b9967` 记录逐条相同（`cc-switch-ascii-name` ×2：等待超时 + 期望 `gemini-3.8-flash` 实得 `sonnet-5`，settings 归属；`OCV5-185` Windows 未开发者模式 `symlink EPERM`），非本轮引入（`test-browser.log`） |
 | 视觉 before / after | `OC_UI_SCENES=permission-card OC_UI_SHOT_DELAY=900 node browser-tests/ui-preview/shoot.mjs` | ✅ before 12 场景 48 张 / after-2 13 场景 52 张，两轮 `failures: []`、`retried: []`、`unmockedApi: []`（`before-shoot.log`、`after-2-shoot.log`） |
 
