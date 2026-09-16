@@ -42,8 +42,9 @@
    - `tools-agent-avatar` AgentAvatar 三种来源 × 全站四档尺寸 + agent-group 运行中/完成/失败内嵌工具卡。
    完成态卡片默认折叠，`tools-bodies/mcp/oc-cli` 用场景内 `<ExpandAll>` 在挂载后把表头点开一次（等价用户逐张点开，不改组件语义）。媒体路径经场景内假签名映射到内联 SVG，让截图/生成图缩略图真实渲染。`api-stub.ts` 未改动（本模块不直接调 api）。
 3. 截图：`OC_UI_SCENES=tools node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\tools\before\`，**24 张**（6 场景 × desktop/mobile × light/dark），`manifest.json` 无 failures、无 unmockedApi。超长整页图另切分到 `before\crops\`（每 1800px 一块，另有 `zoom-*.png` 局部放大）逐张用 Read 审看。
+   **截图台版本**：首轮用基线 shoot.mjs 出图后，按指挥官通告合并 integration `feat/v5-selfhost-ocv5-audit-ux @ e6f73dd99`（合并提交 `a139215c8`，含 messages-A 修的 shoot.mjs：移动视口不再 fullPage、`(hover:none)` 仿真在整页图里保留），用新台子**重出全部 24 张**覆盖 `before\`；旧台子那套留在 `before-oldharness\` 仅作对照。§3 里所有「触控 <44px」结论均以**新台子 mobile 图 + 源码里是否存在 `[@media(hover:none)]` 规则**双重核对：T-08 成立（新 mobile 图里卡内文字按钮仍是 16–24px，源码 `CONTROL_BTN_CLS`/`<summary>` 等确无 hover:none 规则）；表头与 `IconButton` 在新图中正确升到 44px，与旧结论一致，无需撤回。
 4. 对可疑渲染用临时探针测试走**完整 ToolCard 路径**（非直接调 `researchToolCard`）取证，探针已删除，DOM 结论见 §3 编号 T-01。
-5. 基线验证：`npm run typecheck --workspace packages/web-react` 绿；`npx vitest run src/components/tool src/components/ToolCard.test.tsx src/components/InspectorPanel.test.tsx --maxWorkers=1` → 19 files / 340 tests 全绿。
+5. 基线验证：`npm run typecheck --workspace packages/web-react` 绿；`npx vitest run src/components/tool src/components/ToolCard.test.tsx src/components/InspectorPanel.test.tsx --maxWorkers=1` → 19 files / 340 tests 全绿；合并 integration 后 `npm run typecheck:preview`（`tsc -p tsconfig.browser-tests.json`）对 `scenes-tools.tsx` **0 错误**（当前剩余 3 个错误全部在 `scenes-taskboard.tsx`，属 taskboard owner）；`npx biome check` 场景文件无报错。
 
 ## 3. 问题清单
 
@@ -175,3 +176,96 @@
 | `InspectorPanel` 桌面 aside 宽度 `clamp(20rem,36vw,34rem)` | 1440 下 518px 合理；<768 已切 Sheet，不需再调 |
 | `GenericBody`/未知 MCP 的 KvList 保留原始键名 | 通用兜底本就用于未登记工具，无法预知语义，只做 T-27 的已知键中文化 |
 | 表头 `title={summary}` 悬停提示 | 触屏无效但桌面有用，保留；移动端全文靠 T-11 的独立错误行 + 展开体 |
+
+## 6. 修复记录（阶段 B）
+
+- 任务：t-45「B·tools 工具卡/智能体过程/检查器修复」（原持有人 fable-5-1-23 施工，fable-5-1-33 → fable-5-1-37 接手收尾；工作树与分支沿用，未重建）。
+- 分支 `feat/v5-selfhost-audit-tools`，基线 `210b9967` → 合 integration `e6f73dd99`（`a139215c8`）→ 阶段 B 三个代码提交：
+  - `769596cec` feat(v5): tools T-01 Grok 输出归一化只对原生名与明确信封形状生效
+  - `c5ee11db4` feat(v5): tools 工具卡/检查器阶段 B 修复(状态单一权威、信封解包、触控靶、a11y、文案)
+  - `e569f9e66` test(v5): tools 浏览器门随表头可及名口径更新,T13 补卡内触控靶断言
+- 新增源码：`tool/status.ts`（状态单一权威）、`tool/shellEnvelope.ts`（Cursor shell 信封解包）、`tool/inlineAction.tsx`（卡内文字操作原语）、`tool/tone.ts`（`TONE_TILE`）；新增测试：`tool/status.test.ts`、`tool/shellEnvelope.test.ts`、`AgentAvatar.test.tsx`。
+- 统计：发现 31（P1 × 1 / P2 × 7 / P3 × 23）+ 跨模块 4；**修复 31 / 31**（P1、P2 全部修完，P3 全部修完）；遗留 0 条本模块问题，跨模块 4 条转 owner / 集成②（见 §8）。
+
+### 6.1 逐条映射（编号 → 状态 → 改动 → 用例 → 提交）
+
+| 编号 | 级别 | 状态 | 改动 | 用例 | 提交 |
+|---|---|---|---|---|---|
+| T-01 | P1 | ✅ | `grokDisplay.ts`：`normalizeGrokToolForDisplay` 只对 Grok 原生名（`GROK_PRODUCT_NAMES` / `mcp__` 形态）生效；`grokProductToolOutput` 对 `output` 的解包限定在 Grok 信封形状（`exit_code`/`stdout`/`stderr` 并存或 `type:"mcp"`、Vec<u8> 字节数组），单独一个 `output/body/markdown/content` 键不再触发 | `grokDisplay.test.ts`（非 Grok 名 + JSON 含 output/body/markdown/content → 原样；Grok 名 + 信封仍解）；`ToolCard.test.tsx`「T-01」组：oc-report `{output,references,coverage,warnings}` 经完整 ToolCard 出产物卡、oc-task `--json` 字段齐全、普通 Bash JSON stdout 原样、Grok 原生名 Vec<u8> 不回退 | `769596cec` |
+| T-02 | P2 | ✅ | 新 `tool/status.ts` `errorSummaryLine`：`confirmation_required` → 「待确认」；Cursor/裸 shell 信封 → stderr 首行或「退出码 N」；其它 JSON → `error`/`error.message`/`message`/`reason`，认不出宁可空；文本 → 首个非标头行，剥 `error:` 前缀，夹 120 字 | `status.test.ts`；`ToolCard.test.tsx`（信封失败表头显示 stderr 首行、oc-connect 不出现 `{"oc_connect"`） | `c5ee11db4` |
+| T-03 | P2 | ✅ | 新 `tool/shellEnvelope.ts`（从 `researchCards.tsx:1074-1138` 抽出 `isCursorShellEnvelope`/`cursorCliStreams`/`stripCommandEcho` 等）；`BashBody` 先 `parseShellEnvelope`：stdout 正常、stderr danger、非 0 退出码末行「退出码 N」，不再裸渲 JSON | `shellEnvelope.test.ts`（严格信封 / 裸 shell 结果 / 只带 stdout 键的普通 JSON 不解）；`ToolCard.test.tsx`（信封 exitCode≠0：不出现 `{"success"`，出现 stderr 文本） | `c5ee11db4` |
+| T-04 | P2 | ✅ | `InspectorPanel.tsx` `inspectorCopyText` 按工具类型取面板实际展示正文：Edit → `diffLines` 文本 / codex `changes[].diff`；Write → `content`；Bash → `$ 命令` + 解信封后的 stdout/stderr；其余 → output，空才回退格式化 input | `InspectorPanel.test.tsx`「复制全文」：复制到 `line-120` 且不含 `The file has been updated.` | `c5ee11db4` |
+| T-05 | P2 | ✅ | `tool/status.ts` `resolveToolStatus(display)` → `{kind,label,tone,hasError,isBlocked,isRunning,isCancelled,isConfirmation,errorFirstLine}`；`ToolCard.tsx` 与 `InspectorPanel.tsx` 都只消费它；面板错误徽标改「未成功」danger、支持「受阻」warning | `status.test.ts`（四态 + 受阻 + 取消 + 历史中断）；`InspectorPanel.test.tsx`（卡「受阻」→ 面板「受阻」、卡「未成功」→ 面板「未成功」） | `c5ee11db4` |
+| T-06 | P3 | ✅ | `meta.ts` WebFetch 摘要改 `clipOneLine(url, 60)`（带省略号） | `meta.test.ts` 长 URL 用例 | `c5ee11db4` |
+| T-07 | P3 | ✅ | `ToolCard.tsx` `useEffect` 监听 `hasError` false→true 时 `setOpen(true)`；用户手动折叠过（`userToggled`）则不动 | `ToolCard.test.tsx` rerender 用例 | `c5ee11db4` |
+| T-08 | P2 | ✅ | 新 `tool/inlineAction.tsx`：`InlineAction`（`[@media(hover:none)]:min-h-11`，默认 stopPropagation）+ `INLINE_SUMMARY_CLS`（`<details><summary>` 用，hover:none 下 `py-3.5`）；替换 `expandable.tsx` 控制行、`bodies.tsx` diff 展开/文件列表展开、`researchCards.tsx` 「查看更多」「还有 N 个字段」「查看抽取全文」、`skillCards.tsx` / `delegateFanoutCard.tsx` / `bodies.tsx` 的 `<summary>`、`connectorCards.tsx` 「查看完整内容」；桌面渲染零变化 | `ToolCard.test.tsx`（展开按钮 className 含 `min-h-11`）；`browser-tests/run.mjs` T13 追加卡内按钮 ≥44px 断言 | `c5ee11db4`、`e569f9e66` |
+| T-09 | P2 | ✅ | `BashBody` 输出改走 `useExpandableSlice`（2000 字 + 展开全部/继续显示/收起，按 stdout/stderr/退出码分段保色）；`ExpandablePre` 去掉 `max-h-80` 嵌套滚动；head 截断文案改「输出过长，已省略开头部分（共 N 字节）」`toLocaleString` | `ToolCard.test.tsx` 长终端输出「展开全部」用例 | `c5ee11db4` |
+| T-10 | P3 | ✅ | `DiffRowView`：全新增/全删除 diff 隐藏空 gutter；`sm:` 以下只显示新行号列；diff 容器 `overflow-x-auto` + `whitespace-pre` 横滑代替折行，容器 `tabIndex=0` 可聚焦 | 既有 diff 用例不变；after mobile 截图对照（§7） | `c5ee11db4` |
+| T-11 | P3 | ✅ | `ToolCard.tsx`：有 `errorFirstLine` 时 `sm:` 以下隐藏 summary，错误首行独立成表头下一行（`aria-hidden` 防重复），`sm:` 以上保持同行 | 既有错误首行断言；after mobile 截图 | `c5ee11db4` |
+| T-12 | P3 | ✅ | `DiffTruncationRow` 合成一行「已显示前 N 行 · 展开全部（共 M 行）· 在详情面板查看全文」，不再叠一行「… (diff 过长，已截断)」 | `InspectorPanel.test.tsx` 截断行用例 | `c5ee11db4` |
+| T-13 | P3 | ✅ | `researchCards.tsx` `Chip` 改为 `ui/Badge size="sm"` 薄封装（ok→success / danger / muted→neutral），带 href 包 `<a>` | `researchCards.test.tsx` 既有文本断言不变 | `c5ee11db4` |
+| T-14 | P3 | ✅ | `skillCards.tsx` / `memoryReminderCards.tsx` / `delegateFanoutCard.tsx` 条目去 `shadow-soft`+`rounded-xl`，改 `rounded-lg border border-border/70 bg-surface px-3 py-2` | 视觉：after 截图 `tools-mcp` | `c5ee11db4` |
+| T-15 | P3 | ✅ | `CardShell` 经 `ToolHeaderLabelContext` 拿表头标签，同词时只保留右对齐 subtitle 徽标 | 视觉：after 截图 `tools-oc-cli` | `c5ee11db4` |
+| T-16 | P3 | ✅ | `StatusLine` 加 `tone`；codex imageGeneration 运行中改 `Spinner` + `text-muted` 行，不再用 success 绿 | 视觉：after 截图 `tools-states` 第 3 卡 | `c5ee11db4` |
+| T-17 | P3 | ✅ | 新 `tool/tone.ts` 导出 `TONE_TILE`/`toneTileClass`，`ToolCard.tsx` 与 `InspectorPanel.tsx` 共用 | typecheck | `c5ee11db4` |
+| T-18 | P3 | ✅（组件侧） | `context.ts` 新 `ArtifactInspectActiveContext` + `useArtifactInspectActive`；`ToolCard.tsx` 命中时 `ring-1 ring-accent/40`、入口按钮 `aria-pressed` | `InspectorPanel.test.tsx`（provider 传 active → 卡有选中类） | `c5ee11db4`；**App.tsx 一行接线待集成②**（§8） |
+| T-19 | P3 | ✅ | `CopyIconButton` 成功/失败都走 `useToast`（「已复制全文」/「复制失败，请手动选中文本复制」） | `InspectorPanel.test.tsx`（clipboard reject → toast 文案） | `c5ee11db4` |
+| T-20 | P3 | ✅ | `TaskBody` 有 output 时不重复 title | `bodyCards.test.tsx` | `c5ee11db4` |
+| T-21 | P3 | ✅ | `PartialNote` 改「完整结果见下方回答」 | 文本 | `c5ee11db4` |
+| T-22 | P2 | ✅ | `ToolCard.tsx` 去 `aria-label`，改 `aria-labelledby` 指向 标签+摘要+错误首行+状态 四段 id；状态区 `aria-live="polite"`（运行中 sr-only 播报） | `ToolCard.test.tsx` 改 `getByRole("button",{name:/读取文件/})`；`run.mjs` 浏览器门与 `scenes-tools.tsx` 随可及名口径更新 | `c5ee11db4`、`e569f9e66` |
+| T-23 | P3 | ✅ | 仍带 `max-h`/`overflow` 的滚动区（diff 容器、技能正文、委派结果 `pre`）加 `tabIndex={0}` + `focus-visible:ring`；`ExpandablePre`/Grep 已无嵌套滚动区无需处理 | — | `c5ee11db4` |
+| T-24 | P3 | ✅ | `InspectorPanel`：标题 `<h2 id>` + aside `aria-labelledby`；打开/换目标时 rAF 聚焦关闭按钮，卸载归还焦点；Escape 在焦点位于输入框/富文本且不在面板内时不抢，Radix 已 preventDefault 的 Escape 让位 | `InspectorPanel.test.tsx` 焦点归还 + Escape 用例 | `c5ee11db4` |
+| T-25 | P3 | ✅ | `AgentAvatar` 加 `overflow-hidden leading-none`；props 增 `name?`：有则 `role="img" aria-label`，否则 `aria-hidden` | 新增 `AgentAvatar.test.tsx` | `c5ee11db4` |
+| T-26 | P3 | ✅ | `meta.ts` Read/Grep/Glob/WebSearch 摘要去动词只留对象 | `meta.test.ts`；`ToolCard.test.tsx` | `c5ee11db4` |
+| T-27 | P3 | ✅ | 已知成功 output 中文映射（`The file has been updated.`→「文件已更新」等，未知降 muted）；`KvList` 键走中文标签表，`output_mode` → 「匹配内容/匹配的文件」；tokens `toLocaleString`；`settled`→「已结算」；后台任务 id 不显示 | `bodyCards.test.tsx`；`ToolCard.test.tsx` | `c5ee11db4` |
+| T-28 | P3 | ✅ | `meta.ts` oc-lit/oc-cite/oc-litrag/oc-ingest 摘要取首个引号参数或 `--query`；consult_advisor/request_review/ask_user 取 `question`；未知 op 走 `humanizeOp` | `meta.test.ts` | `c5ee11db4` |
+| T-29 | P3 | ✅ | `memoryReminderCards.tsx` Badge 改「未成功」；desc 去 `error:` 前缀且与标题同句不重复 | `ToolCard.test.tsx`（`test.each` 调整） | `c5ee11db4` |
+| T-30 | P3 | ✅ | Read 元信息改「从第 N 行起 · 读取 M 行」 | 文本；after 截图 | `c5ee11db4` |
+| T-31 | P3 | ✅ | `GrepFileList` 改名 `FileList`，Glob 输出按行走同款文件列表（>N 条「展开全部（共 N 个文件）」） | `ToolCard.test.tsx` | `c5ee11db4` |
+
+### 6.2 计划偏离说明
+
+| 项 | 计划 | 实际 | 原因 |
+|---|---|---|---|
+| T-08 原语 | 「`InlineAction` 小原语或复用 `ui/Button variant="link"`」 | 新建模块内 `tool/inlineAction.tsx`，未动 `components/ui/**` | `ui/**` 属 shell 归属；`<summary>` 也不能换成 button，需要一份类名常量而非组件 |
+| T-09 展开原语 | 「BashBody 改走 `ExpandablePre`」 | 改走底层 `useExpandableSlice` 自绘分段 | 要在同一段可展开文本里给 stderr / 退出码保留各自颜色，`ExpandablePre` 单色 `pre` 做不到 |
+| T-16 | 「`StatusLine` 加 `tone`（running → muted + Spinner）」 | `StatusLine` 加了 `tone`；运行中另画一行 `Spinner` + 文案 | `StatusLine` 是纯文本行，Spinner 放进去要改所有调用方签名 |
+| T-18 | 「App.tsx 传 `inspectTarget.message`（需 shell owner 一行接线）」 | 组件侧全部落地；App.tsx 未动 | 越界文件，按任务书写进「跨模块接线」交集成②（§8） |
+| T-03 | 「抽到 `tool/shellEnvelope.ts` 共用」 | 同；`researchCards.tsx` 原地删掉私有实现改为 import，留注释指向新模块 | 与计划一致，记录以便追溯 |
+| X-04 | 「`researchCards.test.tsx` 至少一条改经 `<ToolCard>`」 | 未改 `researchCards.test.tsx`，改在 `ToolCard.test.tsx` 新增「T-01」describe（4 例走完整 ToolCard → normalize → researchToolCard 路径） | 集成路径已有守卫，且 `researchCards.test.tsx` 的分派用例本就是单元级，混入渲染路径反而降低定位效率 |
+
+## 7. 验证（阶段 B）
+
+全部在工作树 `d:\code\test_project\test123\wt\tools` 跑（HEAD `e569f9e66` + 本文档）。
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ `tsc -b` 0 错误（23s） |
+| 模块单测 | `cd packages\web-react; npx vitest run src/components/tool src/components/ToolCard.test.tsx src/components/InspectorPanel.test.tsx src/components/AgentAvatar.test.tsx --maxWorkers=1` | ✅ **22 files / 390 tests 全绿**（39s；阶段 A 基线 19 files / 340 tests → +3 文件 / +50 用例） |
+| 真浏览器门 | `cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` 组件门 **67/67 ok**（含工具卡 T6/T12/T13/T21/T36/T41，T13 已带卡内触控靶断言）。随后 `node --test` 16 文件 73 例：**70 通过 / 3 失败**，3 条全部在 `cc-switch-ascii-name.node-test.mjs`（settings 的 `ApiKeysSection`：等不到「还没有 API Key」文案 + 模型 id 断言 `gemini-3.8-flash` vs `sonnet-5`）。在**未改动的主克隆** `v5-selfhost`（integration `43b7cd3a4`）单跑同文件 → 0/2 通过，**基线失败**，`docs/audit/INTEGRATION.md` 已登记，与本模块无关。日志 `D:\code\test_project\test123\.audit-tmp\tools\test-browser.log` |
+| 场景文件类型检查 | `npm run typecheck:preview` | `scenes-tools.tsx` **0 错误**；剩余 3 个错误全部在 `scenes-taskboard.tsx`（taskboard owner，与阶段 A 时相同） |
+| 代码风格 | `npx biome check <阶段 B 改动的 28 个文件>` | 36 条诊断，**与 integration 基线上同一批文件的诊断逐条相同**（format ×20、organizeImports ×10、`noArrayIndexKey` ×3、`run.mjs` 的 `useTemplate` ×2 / `noDelete` ×1，仅行号平移）→ 阶段 B **新增 0 条**；新建的 7 个文件（`inlineAction.tsx`/`shellEnvelope.ts`/`status.ts`/`tone.ts` + 3 个测试）0 诊断。未对既有文件整文件重排以免 diff 噪音 |
+| after 截图 | `$env:OC_UI_SHOTS='D:\code\test_project\test123\.audit-tmp\tools\after'; $env:OC_UI_SCENES='tools'; node browser-tests\ui-preview\shoot.mjs` | ✅ 24 张（6 场景 × desktop/mobile × light/dark）「全部成功」；亮色 12 张按 1800px 切到 `after\crops\` 与 `before\crops\` 逐张对照（下表） |
+
+after / before 对照结论（用 Read 逐张看图）：
+
+| 证据 | 对照 |
+|---|---|
+| `tools-states--desktop--light` part00 | T-16 图片生成运行中由绿字变 spinner + muted；T-26 「读取 …」「搜索 "x"」动词去除 |
+| `tools-states--desktop--light` part01 / `--mobile` part01 | T-02 「终端 · 未成功」表头由 `{"success":{"command"…` 变 `browserType.launch: Executable doesn't exist…`；T-03 展开体由整段 JSON 变 stderr（danger）+「退出码 1」；T-11 mobile 错误首行独立成表头下一行，摘要不再被挤成 `n…` |
+| `tools-oc-cli--desktop--light` part00 | **T-01** 「研究报告」卡由一行路径变完整产物卡（报告已生成 / 12 条参考文献 / 1 处未接地 / report.pdf 下载 + 预览 / report.qmd）；T-28 「文献检索 touch target size mobile」「引用铸造 10.1145/…」表头有了摘要；T-15 卡内重复小标题「文献检索」消失只留「3 篇」；T-13 徽标统一为药丸 Badge |
+| `tools-bodies--mobile--light` part00 / part01 / part02 | T-10 390px diff 单行号列 + 横滑，全新增 diff 无空旧行号列；T-12 截断行合并为「已显示前 60 行 · 展开全部（共 96 行）」；T-08 「已截断 · 展开全部（共 5,432 字）」行在 hover:none 下撑到 44px；T-27 `The file has been updated.` → 「文件已更新」；T-30 「行 1, 70 行」→「从第 1 行起 · 读取 70 行」 |
+| `tools-mcp--desktop--light` part01 | T-14 定时任务 / 技能条目由「圆角 xl + 阴影」卡中卡收成轻边框行，间距收紧 |
+| `tools-inspector--desktop--light` | T-04/T-05 面板头「完成」徽标与卡一致，diff 全文渲染正常（复制全文取 diff 文本由单测守） |
+
+## 8. 遗留
+
+本模块归属文件内**无遗留问题**（31/31 已修）。以下为跨模块 / 需接线项，按任务书交集成②或对应 owner：
+
+| 编号 | 位置（owner） | 状态 | 说明 |
+|---|---|---|---|
+| T-18 接线 | `App.tsx`（shell / 集成②） | ⏸ 待接线 | 在 `ArtifactInspectContext.Provider` 内再包一层 `<ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>`（`tool/context.ts:95` 有注释）；不接线只是没有选中态描边，功能不受影响 |
+| X-01 | `components/chat/delegateProcessList.tsx:132`（messages） | ⏸ 未修 | integration `43b7cd3a4` 上仍是 `h-[min(420px,50vh)]` 固定高，5 步时下方留白 ~200px（P2，建议 `max-h` 代替 `h`） |
+| X-02 | `components/chat/AgentGroupCard.tsx:214,218`（messages） | ◐ 部分 | `aria-expanded` 已在 messages-B 加上；图标底 `size-6` 与 ToolCard `size-7` 仍不一致（P3，可不改） |
+| X-03 | `lib/cron.ts cronHuman`（manage） | ⏸ 未修 | integration 上 `cronHuman` 仍不人话化 `0 8 * * 1-5` 的星期区间，提醒卡显示两遍原始 cron（P3） |
+| 需后端配合 | `delegateFanoutCard.tsx:63` | — | 并行委派子任务名显示 slug（`coding-assistant`），需 mcp-memory 聚合文本带 displayName（§5 已列） |
