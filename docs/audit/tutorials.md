@@ -1,7 +1,7 @@
 # A·tutorials 教程中心 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-tutorials`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，未改任何业务代码）→ B（修复，§6–§9；发现 37 / 已修 26 / 部分 6 / 遗留 5；P2 12/12 全修）
+- 阶段：A（审计，未改任何业务代码）→ B（修复，§6–§9；发现 37 / 已修 28 / 部分 5 / 遗留 4；P2 12/12 全修；另含指挥官追加 2 项）
 - 结论：**P1 × 0 / P2 × 12 / P3 × 25**，共 37 条。没有阻断主流程的故障：教程中心是只读为主的面，
   真正会"卡住"用户的是三件事——26 篇功能参考在导航里**没有入口**（只能从快速上手的链接绕进去）；
   精选作品详情里点「案例展厅」页签**没反应**；移动端搜索 / 分类筛选**没有任何可见反馈**。其余多为
@@ -600,7 +600,7 @@ node browser-tests\ui-preview\shoot.mjs
 | TU-19 | P3 | ◐ | 快速上手步骤按 `tutorialIsRead` 打勾（绿底 ✓）；侧栏「全部功能」右侧「已读 n/26」。**未改**「停留 0.9s 即已读」的判定（涉及老用户已读数据口径，留待产品定） | 视觉 | `e722bdf5f` |
 | TU-20 | P3 | ◐ | `SnapshotTutorialDetail` 分享链接复制加 `try/catch`，失败走 `useToast` error；`SignatureDetail` / `ShowcaseDetail` 既有失败文案保留。**未**抽成统一 hook | — | `d6eb6ef35` |
 | TU-21 | P3 | ⏸ | CTA 五种文案与「登录后试用」字面量比较未收口：涉及 `App.tsx:3117` 传参与 3 个组件的用例 / 场景文案，属产品口径，见 §8 | — | — |
-| TU-22 | P3 | ◐ | `ArtifactPreview` / `CaseFieldReportVisual` / `TutorialReplay` 的 8–11px 任意字号抬到 `text-micro` / `text-caption` / `text-meta`；`TutorialCenter` 折叠区其余 10.5px 未动（量大、需逐处看 390px） | 视觉（`tutorials-case-detail--mobile` 图稿不溢出） | `e722bdf5f` / `36ba6e6f0` |
+| TU-22 | P3 | ✅ | tutorials 归属内全部 ≤ 11.5px 任意字号收敛到语义档：9–11px → `text-caption`（11px），11.5px → `text-meta`；`TutorialCenter.tsx` 33 处（折叠区 / 成果预览 / 卡片元信息）、`CaseFieldReportVisual.tsx` 12 处、`CaseArtwork.tsx` 2 处、`CaseShowroom.tsx` 1 处、`TutorialReplay.tsx` 2 处；`PendingCaptureBadge` 同步。保留 ≥ 12.5px 的标题类任意值与设计系统 `text-micro` 大写 kicker（后者是 token 档位） | 视觉（`tutorials-case-detail / case-gallery --mobile` 图稿与卡片不溢出） | `e722bdf5f` / `36ba6e6f0` / 追加提交 |
 | TU-23 | P3 | ✅ | `<main className="tutorial-detail relative …">` | 仓外探针未复跑（jsdom 无布局）；after 首批 108 张无一被顶出 header | `e722bdf5f` |
 | TU-24 | P3 | ◐ | `ViewTab` `aria-pressed` → `aria-current=page`；`CategoryChip` / 侧栏分类 `aria-pressed`；状态播报统一 `<output>`；分类簇 `fieldset`。**未做**：卡片按钮内容模型（整卡 `<button>` 内嵌块级）、切视图焦点交接、「跳到正文」链接 | `TutorialCenter.test`（menuitem / status 断言） | `e722bdf5f` / `527a514e2` |
 | TU-25 | P3 | ✅ | hero 在子视图 / 详情下收成一行工具栏（`compactHero`，h1 `sr-only` 保留语义）；目录 / 我的发布加载期 `ListSkeleton`；投稿 / 快照 / 撤回成功 `toast`；术语统一「教程工作室」「我的发布」 | `CommunityTutorials.test`（既有 8 例回归） | `d6eb6ef35` |
@@ -615,7 +615,7 @@ node browser-tests\ui-preview\shoot.mjs
 | TU-34 | P3 | ⏸ | 十余处品牌深蓝 `#07111f / #080e19 / #101624` 未换：改 `bg-fg` 会让 hero 在亮色下成纯黑、暗色下反转成浅底，与图稿 / 精选作品封面的深色调冲突；等 shell `--hero-bg` token（§9） | — | — |
 | TU-35 | P3 | ✅ | `ReadonlyTextArtifact` 空文本 → 「这份文本成果内容为空。」 | — | `d6eb6ef35` |
 | TU-36 | P3 | ⏸ | `.gitattributes` 归仓库根（集成② 已列入）；本工作树夹具此前已手工 LF 还原，`tutorialShowcase.test` 4/4 绿 | — | — |
-| TU-37 | P3 | ⏸ | `scripts/check-v5-tutorials.ts` 路径归一化未做（任务书：Windows 下 `check:tutorials` 默认红，标 NOT RUN 不绕）；修法仍是 §4 那一行 `replaceAll("\\", "/")` | — | — |
+| TU-37 | P3 | ✅ | `scripts/check-v5-tutorials.ts` `collectMarkers`：`const rel = relative(ROOT, file).replaceAll("\\", "/")`（与同文件 `HISTORY_REPO_PATH` 同款；指挥官由集成待办 t-865 转来）。POSIX 上哈希输入不变，CI 无感 | 本机 `npm run check:tutorials` → `OK · 26 capabilities · 12 real-world cases · 26 media pairs`（此前 26 项全报「功能源 / 入口身份变化」） | 追加提交 |
 
 计划外：
 
@@ -625,6 +625,14 @@ node browser-tests\ui-preview\shoot.mjs
   `[role=menuitem]`——否则所有经「帮助与创作」进入的场景都停在展厅（`527a514e2`）。
 - biome `useSemanticElements`：7 处 `p/div[role=status]` → `<output>`、分类簇 `div[role=group]` → `fieldset`（`527a514e2`）。
 
+指挥官追加（随 t-53 一并交付，单列）：
+
+| 项 | 来源 | 状态 | 改动 | 验证 |
+|---|---|---|---|---|
+| 追加① TU-37 门禁路径归一化 | 集成待办 t-865 | ✅ | 见上表 TU-37 | `npm run check:tutorials` 本机绿 |
+| 追加② 无障碍走查 t-762 · tutorials P3 字号 | t-762 | ✅ | 见上表 TU-22：`TutorialCenter.tsx`（含点名的成果预览 / 折叠区各处）、`CaseFieldReportVisual.tsx`、`CaseArtwork.tsx` 全部 9–11px 任意字号 → `text-caption` 及以上 | after 复拍 `tutorials-case-detail / case-gallery / showcase-detail / signature-detail` 4 场景 16 张 failures 0，390px 不溢出 |
+| 追加② · ui-preview 场景 | t-762 | ✅（已有） | `browser-tests/ui-preview/scenes-tutorials.tsx` 27 个场景（阶段 A `5023c70fd` 新增、本轮适配 DropdownMenu）随本分支合入 integration 即到位，无需另补 | 全量 `OC_UI_SCENES=tutorials` 108 张 |
+
 ## 7. 验证（阶段 B）
 
 | 项 | 命令 | 结果 |
@@ -633,7 +641,7 @@ node browser-tests\ui-preview\shoot.mjs
 | 模块单测 | `npx vitest run src/components/TutorialCenter.test.tsx src/components/tutorials src/lib/tutorial{Journeys,Studio,Api,System,Showcase}.test.ts --maxWorkers=1` | ✅ 12 文件 / 95 例全绿（阶段 A 基线 12 / 82，其中 `tutorialShowcase` 2 例因 autocrlf 红；本工作树夹具已 LF 还原后 4/4 绿）。新增 13 例：TutorialCenter +6、CaseShowroom +1、CommunityTutorials +3、PublishFromSessionDialog +1、tutorialJourneys +1、tutorialSystem +1；另 4 处既有断言按新文案 / 沙箱更新 |
 | 代码风格 | `npx biome lint` 22 个改动文件（含删除前的对照） | ✅ 阶段 B 新增 0：`TutorialCenter.tsx` 4 → 2（去掉 2 条 `useKeyWithClickEvents`，余 1 `useExhaustiveDependencies` + 1 `noShadowRestrictedNames` 为基线）；`CommunityTutorials.tsx` 1（基线）；其余文件与基线逐条相同或 0；新增 / 重写的 `scenes-tutorials.tsx` 0 |
 | 视觉 after | `OC_UI_SCENES=tutorials`、`OC_UI_SHOT_DELAY=900` → `D:\code\test_project\test123\.audit-tmp\tutorials\after\` | ✅ 27 场景 × desktop/mobile × light/dark = 108 张，`failures: []` / `retried: []` / `unmockedApi: []`（两轮：首轮暴露菜单场景与窄屏页签问题，修后复拍） |
-| 门禁 | `npm run check:tutorials` | **NOT RUN**：未改 `lib/tutorial*Catalog.ts` 与 `public/tutorials` 数据（`TUTORIAL_QUICKSTART` / `TUTORIAL_PENDING_CAPTURE_LABEL` 不在哈希内）；Windows 下该门禁因 TU-37 默认红，任务书要求不绕 |
+| 门禁 | `npm run check:tutorials` | ✅ `OK · 26 capabilities · 12 real-world cases · 26 media pairs · 2390809 B`（TU-37 修后本机首次转绿；未改目录数据，`tutorial-sync.json` 无需 accept） |
 | 全量 / 浏览器门 | `npm test` / `npm run test:browser` | **NOT RUN**：改动限于 tutorials 归属 + `lib/tutorialStudio` / `tutorialActions` 纯函数；未触碰 Composer / 消息 / 工具卡 / 侧栏；全量门交集成③ |
 
 after 对照（Read 逐张，`before/` ↔ `after/`）：
@@ -658,9 +666,8 @@ after 对照（Read 逐张，`before/` ↔ `after/`）：
 | TU-34 品牌深蓝 hero | shell token | `styles.css` 加 `--hero-bg / --hero-fg` 后一次替换 |
 | TU-19 已读判定 0.9s | 产品口径 | 改「停留 ≥ 8s 或滚到 60%」会让老用户已读勾号变少，先问再改 |
 | TU-20 统一复制 hook | 打磨 | 三处复制反馈已各有失败出口，统一 hook 收益小 |
-| TU-22 / TU-24 余量 | 打磨 | 折叠区 10.5px 字号、卡片内容模型、焦点交接、跳到正文 |
+| TU-24 余量 | 打磨 | 卡片内容模型、焦点交接、跳到正文 |
 | TU-36 `.gitattributes` | 仓库根（集成②） | 已在集成② 清单 |
-| TU-37 门禁路径归一化 | `scripts/check-v5-tutorials.ts` | 一行 `replaceAll("\\", "/")`，CI（POSIX）无感 |
 
 ## 9. 跨模块接线（给集成③ / owner）
 

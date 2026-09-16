@@ -358,7 +358,7 @@ export function TutorialReplay({
     ? loadState
     : ({ status: "idle", sourcePath } as const);
   const provenance = (
-    <div className="mt-3 rounded-lg bg-surface px-3 py-2 text-[11px] leading-5 text-faint">
+    <div className="mt-3 rounded-lg bg-surface px-3 py-2 text-caption leading-5 text-faint">
       <p>
         {replay.provenance.repeatRuns} 次独立运行 · {replay.provenance.messageCount} 条真实消息 · 发布 {replay.provenance.release}
       </p>

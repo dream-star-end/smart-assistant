@@ -665,7 +665,7 @@ function TutorialSearch({
 
 function PendingCaptureBadge() {
   return (
-    <span className="rounded-full bg-warning-soft px-2.5 py-1 text-micro font-semibold text-warning">
+    <span className="rounded-full bg-warning-soft px-2.5 py-1 text-caption font-semibold text-warning">
       {TUTORIAL_PENDING_CAPTURE_LABEL}
     </span>
   );
@@ -921,7 +921,7 @@ function CaseGalleryCard({
                 <strong className="block text-title font-bold text-fg">
                   {metric.value}
                 </strong>
-                <span className="mt-1 block text-[9.5px] leading-4 text-faint">
+                <span className="mt-1 block text-caption leading-4 text-faint">
                   {metric.label}
                 </span>
               </li>
@@ -1026,7 +1026,7 @@ function CaseDetail({
               >
                 带着我的材料开始 <ArrowRight size={15} />
               </Button>
-              <p className="mt-2 text-[10.5px] leading-4 text-faint">
+              <p className="mt-2 text-caption leading-4 text-faint">
                 {actionLabel === "登录后试用"
                   ? "登录后会自动带入这套任务方法"
                   : "会新建对话，并带入可修改的开工指令"}
@@ -1164,7 +1164,7 @@ function StoryOverview({ item }: { item: TutorialCase }) {
                 {act.body.map((line) => (
                   <li
                     key={line}
-                    className="flex gap-2 text-[11.5px] leading-5 text-muted"
+                    className="flex gap-2 text-meta leading-5 text-muted"
                   >
                     <Check size={12} className="mt-1 shrink-0 text-success" />
                     {line}
@@ -1228,11 +1228,11 @@ function ArtifactShowcase({ item }: { item: TutorialCase }) {
                   <strong className="text-meta font-semibold text-fg">
                     {entry.title}
                   </strong>
-                  <span className="rounded-full bg-surface px-2 py-0.5 text-[9.5px] text-faint">
+                  <span className="rounded-full bg-surface px-2 py-0.5 text-caption text-faint">
                     {entry.format}
                   </span>
                 </span>
-                <span className="mt-1 block text-[10.5px] leading-4 text-muted">
+                <span className="mt-1 block text-caption leading-4 text-muted">
                   {entry.description}
                 </span>
               </button>
@@ -1347,7 +1347,7 @@ function CaseMethodDetails({
       <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-4 py-4 outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-6 sm:py-5">
         <div>
           <p className="text-title font-semibold text-fg">案例资料与方法</p>
-          <p className="mt-1 text-[10.5px] leading-4 text-faint">
+          <p className="mt-1 text-caption leading-4 text-faint">
             材料来源、完整指令、执行细节、验收方法与边界说明
           </p>
         </div>
@@ -1360,15 +1360,15 @@ function CaseMethodDetails({
         <section className="grid gap-3 sm:grid-cols-3">
           <div className="rounded-2xl bg-sidebar p-4 sm:col-span-2">
             <h3 className="text-caption font-semibold text-faint">案例说明</h3>
-            <p className="mt-1.5 text-[11px] leading-5 text-muted">{item.summary}</p>
+            <p className="mt-1.5 text-caption leading-5 text-muted">{item.summary}</p>
           </div>
           <div className="rounded-2xl bg-sidebar p-4">
             <h3 className="text-caption font-semibold text-faint">适合谁</h3>
-            <p className="mt-1.5 text-[11px] leading-5 text-muted">{item.audience}</p>
+            <p className="mt-1.5 text-caption leading-5 text-muted">{item.audience}</p>
           </div>
           <div className="rounded-2xl bg-sidebar p-4 sm:col-span-3">
             <h3 className="text-caption font-semibold text-faint">完整交付目标</h3>
-            <p className="mt-1.5 text-[11px] leading-5 text-muted">{item.outcome}</p>
+            <p className="mt-1.5 text-caption leading-5 text-muted">{item.outcome}</p>
           </div>
         </section>
 
@@ -1392,10 +1392,10 @@ function CaseMethodDetails({
                 <p className="text-micro font-semibold text-accent">
                   用户遇到的问题
                 </p>
-                <p className="mt-1.5 text-[11px] leading-5 text-muted">
+                <p className="mt-1.5 text-caption leading-5 text-muted">
                   {item.fieldReport.userScene}
                 </p>
-                <p className="mt-2 text-[11px] leading-5 text-muted">
+                <p className="mt-2 text-caption leading-5 text-muted">
                   {item.fieldReport.obstacle}
                 </p>
               </div>
@@ -1403,7 +1403,7 @@ function CaseMethodDetails({
                 <p className="text-micro font-semibold text-accent">
                   使用的材料
                 </p>
-                <p className="mt-1.5 text-[11px] leading-5 text-muted">
+                <p className="mt-1.5 text-caption leading-5 text-muted">
                   {item.fieldReport.input}
                 </p>
                 <p className="mt-2 text-micro text-faint">
@@ -1420,7 +1420,7 @@ function CaseMethodDetails({
                   <p className="text-caption font-semibold text-fg">
                     {index + 1}. {step.title}
                   </p>
-                  <p className="mt-1 text-[10px] leading-4 text-muted">
+                  <p className="mt-1 text-caption leading-4 text-muted">
                     {step.evidence}
                   </p>
                 </li>
@@ -1435,16 +1435,16 @@ function CaseMethodDetails({
                   <strong className="block text-title text-fg">
                     {metric.value}
                   </strong>
-                  <span className="mt-1 block text-[9.5px] leading-4 text-success">
+                  <span className="mt-1 block text-caption leading-4 text-success">
                     {metric.label}
                   </span>
-                  <span className="mt-1 hidden text-[9.5px] leading-4 text-muted sm:block">
+                  <span className="mt-1 hidden text-caption leading-4 text-muted sm:block">
                     {metric.detail}
                   </span>
                 </div>
               ))}
             </div>
-            <p className="mt-3 rounded-xl bg-accent-soft p-3 text-[11px] leading-5 text-fg">
+            <p className="mt-3 rounded-xl bg-accent-soft p-3 text-caption leading-5 text-fg">
               {item.fieldReport.result}
             </p>
           </section>
@@ -1458,10 +1458,10 @@ function CaseMethodDetails({
                 <h4 className="text-meta font-semibold text-fg">
                   {input.title}
                 </h4>
-                <p className="mt-1 text-[11px] leading-5 text-muted">
+                <p className="mt-1 text-caption leading-5 text-muted">
                   {input.description}
                 </p>
-                <p className="mt-2 text-[10.5px] leading-4 text-faint">
+                <p className="mt-2 text-caption leading-4 text-faint">
                   <strong className="text-muted">怎么准备：</strong>
                   {input.preparation}
                 </p>
@@ -1490,7 +1490,7 @@ function CaseMethodDetails({
                   <summary className="cursor-pointer text-micro text-faint outline-none hover:text-muted focus-visible:ring-2 focus-visible:ring-ring">
                     查看固定版本与校验值
                   </summary>
-                  <p className="mt-2 break-all text-[9.5px] leading-4 text-faint">
+                  <p className="mt-2 break-all text-caption leading-4 text-faint">
                     固定版本：{input.revision} · {input.bytes.toLocaleString()}{" "}
                     B<br />
                     SHA-256：{input.sha256}
@@ -1503,7 +1503,7 @@ function CaseMethodDetails({
             {item.requirements.map((requirement) => (
               <li
                 key={requirement}
-                className="flex gap-2 text-[11px] leading-5 text-muted"
+                className="flex gap-2 text-caption leading-5 text-muted"
               >
                 <Check size={12} className="mt-1 shrink-0 text-success" />
                 {requirement}
@@ -1530,7 +1530,7 @@ function CaseMethodDetails({
                   {stage.acceptance.map((criterion) => (
                     <li
                       key={criterion}
-                      className="flex gap-2 text-[11px] leading-5 text-muted"
+                      className="flex gap-2 text-caption leading-5 text-muted"
                     >
                       <Check size={12} className="mt-1 shrink-0 text-success" />
                       {criterion}
@@ -1550,7 +1550,7 @@ function CaseMethodDetails({
               {copied ? "已复制" : "复制指令"}
             </Button>
           </div>
-          <blockquote className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-2xl bg-sidebar p-4 text-[11.5px] leading-6 text-muted">
+          <blockquote className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-2xl bg-sidebar p-4 text-meta leading-6 text-muted">
             {item.starterPrompt}
           </blockquote>
         </section>
@@ -1568,10 +1568,10 @@ function CaseMethodDetails({
                     <Check size={13} className="text-success" />
                     {check.title}
                   </h4>
-                  <p className="mt-1.5 text-[10.5px] leading-5 text-muted">
+                  <p className="mt-1.5 text-caption leading-5 text-muted">
                     {check.method}
                   </p>
-                  <p className="mt-1.5 text-[10.5px] leading-5 text-success">
+                  <p className="mt-1.5 text-caption leading-5 text-success">
                     通过：{check.passCriterion}
                   </p>
                 </article>
@@ -1586,7 +1586,7 @@ function CaseMethodDetails({
               <p className="text-meta font-semibold text-fg">
                 {item.suggestion.agentName}
               </p>
-              <p className="mt-1 text-[10.5px] leading-5 text-muted">
+              <p className="mt-1 text-caption leading-5 text-muted">
                 {item.suggestion.why}
               </p>
               <p className="mt-2 text-micro text-faint">
@@ -1595,7 +1595,7 @@ function CaseMethodDetails({
               </p>
               <div className="mt-3 flex flex-wrap gap-1.5">
                 {item.capabilityIds.map((id) => (
-                  <span key={id} className="rounded-full bg-surface px-2 py-1 text-[9.5px] text-muted">
+                  <span key={id} className="rounded-full bg-surface px-2 py-1 text-caption text-muted">
                     {capabilityById(id).shortTitle}
                   </span>
                 ))}
@@ -1611,7 +1611,7 @@ function CaseMethodDetails({
                   {item.fieldReport.limitations.map((limitation) => (
                     <li
                       key={limitation}
-                      className="text-[10.5px] leading-5 text-muted"
+                      className="text-caption leading-5 text-muted"
                     >
                       • {limitation}
                     </li>
@@ -1636,14 +1636,14 @@ function CaseMethodDetails({
                   >
                     {source.title} <ExternalLink size={11} />
                   </a>
-                  <span className="rounded-full bg-hover px-2 py-0.5 text-[9.5px] text-faint">
+                  <span className="rounded-full bg-hover px-2 py-0.5 text-caption text-faint">
                     {sourceRoleLabel(source.role)}
                   </span>
-                  <span className="rounded-full bg-hover px-2 py-0.5 text-[9.5px] text-faint">
+                  <span className="rounded-full bg-hover px-2 py-0.5 text-caption text-faint">
                     {source.license}
                   </span>
                 </div>
-                <p className="mt-1 text-[10.5px] leading-5 text-muted">
+                <p className="mt-1 text-caption leading-5 text-muted">
                   {source.usageNote}
                 </p>
               </article>
@@ -1655,7 +1655,7 @@ function CaseMethodDetails({
           <section>
             <h3 className="text-title font-semibold text-fg">运行过程回放</h3>
             <TutorialReplay caseId={item.id} replay={item.replay} />
-            <p className="mt-2 text-[10.5px] leading-5 text-faint">
+            <p className="mt-2 text-caption leading-5 text-faint">
               {item.replay.disclosure}
             </p>
           </section>
@@ -1673,7 +1673,7 @@ function CaseMethodDetails({
 
 function StageField({ label, text }: { label: string; text: string }) {
   return (
-    <p className="mt-2 text-[11px] leading-5 text-muted">
+    <p className="mt-2 text-caption leading-5 text-muted">
       <strong className="font-semibold text-fg">{label}：</strong>
       {text}
     </p>

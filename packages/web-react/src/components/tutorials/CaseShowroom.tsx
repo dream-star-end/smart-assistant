@@ -39,7 +39,7 @@ function ResultCover({ item }: { item: TutorialShowcase }) {
       <div className="relative my-7 grid grid-cols-3 gap-3" aria-label="实作结果摘要">
         {item.evidence.metrics.slice(0, 3).map((metric) => <div key={metric.label} className="min-w-0 border-l border-white/20 pl-3">
           <strong className={cn('block whitespace-nowrap text-[16px] font-semibold tracking-tight sm:text-[20px]', mint ? 'text-emerald-200' : 'text-sky-200')}>{metric.value}</strong>
-          <span className="mt-2 block text-[11px] leading-5 text-white/65">{metric.label}</span>
+          <span className="mt-2 block text-caption leading-5 text-white/65">{metric.label}</span>
         </div>)}
       </div>
       <div className="relative flex items-center justify-between border-t border-white/15 pt-4 text-caption text-white/65"><span>真实计算 · 数据和报告一起交付</span><ArrowUpRight size={17} /></div>

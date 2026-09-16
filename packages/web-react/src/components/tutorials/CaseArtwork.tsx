@@ -143,10 +143,10 @@ export function CaseArtwork({
       <span className="absolute inset-x-0 top-0 z-[1] h-20 bg-gradient-to-b from-black/70 to-transparent" />
       <span className="absolute inset-x-0 bottom-0 z-[1] h-24 bg-gradient-to-t from-black/70 to-transparent" />
       <div className="absolute inset-x-4 top-3 z-10 flex items-center justify-between gap-3 sm:inset-x-5 sm:top-4">
-        <span className="rounded-full border border-white/35 bg-black/35 px-2.5 py-1 text-[10px] font-semibold tracking-wide backdrop-blur-sm sm:text-[11px]">
+        <span className="rounded-full border border-white/35 bg-black/35 px-2.5 py-1 text-caption font-semibold tracking-wide backdrop-blur-sm">
           完成后你会得到
         </span>
-        <span className="text-[10px] font-medium text-white sm:text-[11px]">V5 实战</span>
+        <span className="text-caption font-medium text-white">V5 实战</span>
       </div>
       <ArtworkGraphic kind={presentation.kind} />
       <div className="absolute inset-x-4 bottom-3 z-10 sm:inset-x-5 sm:bottom-4">
