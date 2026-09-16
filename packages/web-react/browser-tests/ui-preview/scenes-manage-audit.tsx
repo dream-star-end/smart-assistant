@@ -1143,6 +1143,30 @@ export const manageAuditScenes: Scene[] = [
       </AutoClick>
     ),
   },
+  {
+    id: 'manage-cron-range',
+    label: '定时任务 · 区间排程可读（*/30 9-19 * * 1-5 → 每周一至五 9–19 点每 30 分钟，X-03）',
+    group: '管理中心',
+    viewports: ['desktop', 'mobile'],
+    api: {
+      ...cronBase,
+      listCron: ok([
+        ...CRON_JOBS,
+        {
+          id: 'cron_patrol_workdays',
+          label: '工作日巡检',
+          schedule: '*/30 9-19 * * 1-5',
+          prompt: '工作时间内每半小时巡检一次看板阻塞项，有超时未处理的单据就催办。',
+          deliver: 'webchat',
+          enabled: true,
+          oneshot: false,
+          nextRunAt: agoIso(-20 * MIN),
+          lastRunAt: agoIso(10 * MIN),
+        },
+      ]),
+    },
+    render: () => shell('cron'),
+  },
 
   // ── 技能工作台五页签 ──
   {

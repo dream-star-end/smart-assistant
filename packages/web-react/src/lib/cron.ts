@@ -29,40 +29,84 @@ function parseStep(s: string, max: number): number | null {
   return n >= 1 && n <= max ? n : null;
 }
 
-/** 把 5 段式 cron 翻成中文人类可读；非 5 段、无法明确表达的复杂形态（range/多位 step 等）回退原串。 */
+// 区间（a-b）解析：命中返回 [lo,hi] 内且 a < b 的两端；非区间、越界或倒序（cron 里倒序语义各实现不一）→ null。
+function parseRange(s: string, lo: number, hi: number): [number, number] | null {
+  const m = /^(\d+)-(\d+)$/.exec(s);
+  if (!m) return null;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  return a >= lo && b <= hi && a < b ? [a, b] : null;
+}
+
+/**
+ * 周字段 → 「每周一至五」「每周一、三、五」「每周一至三、六」；`*` → ""（不限星期）；
+ * 含 step / 越界 / 倒序区间 → null（交由 cronHuman 回退原串）。
+ * 巡检类排程「工作日 9–19 点每 30 分钟」（分位步进 30、时位 9-19、周位 1-5）此前因周区间整串回退，
+ * taskboard / tools 审计各记了一笔（X-03）；区间语义在 5 段 cron 里是确定的，翻出来不算臆测。
+ */
+function dowHuman(dow: string): string | null {
+  if (dow === "*") return "";
+  const parts: string[] = [];
+  for (const tok of dow.split(",")) {
+    if (isPlainInt(tok) && Number(tok) <= 6) {
+      parts.push(DAY_NAMES[Number(tok)]);
+      continue;
+    }
+    const r = parseRange(tok, 0, 6);
+    if (!r) return null;
+    parts.push(`${DAY_NAMES[r[0]]}至${DAY_NAMES[r[1]]}`);
+  }
+  return `每周${parts.join("、")}`;
+}
+
+/**
+ * 把 5 段式 cron 翻成中文人类可读；非 5 段、无法明确表达的复杂形态（日/月位 step、倒序区间、
+ * 日与周同时限定等）回退原串。支持：整数、逗号列表、星号斜杠 N 步进（分/时位）、`a-b` 区间（时/周位）。
+ */
 export function cronHuman(cron?: string): string {
   const raw = (cron || "").trim();
   const p = raw.split(/\s+/);
   if (p.length !== 5) return raw;
   const [min, hr, dom, mon, dow] = p;
 
-  // ── 步进（*/N）形态：仅当日/月/周均为 * 时翻译，避免与固定日期/星期组合产生歧义；
-  //    dom/mon/dow 上的 step 不臆测，落到下方复杂字段回退。 ──
-  if (dom === "*" && mon === "*" && dow === "*") {
+  // 周字段先翻：翻不出来（step / 越界 / 倒序）整串回退，下面所有形态都不再臆测。
+  const week = dowHuman(dow);
+  if (week === null) return raw;
+  const weekPrefix = week ? `${week} ` : "";
+
+  // ── 步进（*/N）与时段（a-b）形态：仅当日/月均为 * 时翻译（星期可限定，语义仍确定）；
+  //    dom/mon 上的 step / 区间不臆测，落到下方复杂字段回退。 ──
+  if (dom === "*" && mon === "*") {
     const hrStep = parseStep(hr, 23);
     if (hrStep !== null) {
       // 时位步进：分位 * → 「每 N 小时」；分位整数 → 「每 N 小时的第 M 分」；分位复杂 → 回退。
-      if (min === "*") return `每 ${hrStep} 小时`;
-      if (isPlainInt(min) && Number(min) <= 59) return `每 ${hrStep} 小时的第 ${Number(min)} 分`;
+      if (min === "*") return `${weekPrefix}每 ${hrStep} 小时`;
+      if (isPlainInt(min) && Number(min) <= 59) return `${weekPrefix}每 ${hrStep} 小时的第 ${Number(min)} 分`;
+      return raw;
+    }
+    const hrRange = parseRange(hr, 0, 23);
+    if (hrRange !== null) {
+      // 时段：「每天 / 每周X」+「9–19 点」+ 分位形态（步进 / 每分钟 / 每小时第 M 分）；分位复杂 → 回退。
+      const span = `${week ? weekPrefix : "每天 "}${hrRange[0]}–${hrRange[1]} 点`;
+      const minStep = parseStep(min, 59);
+      if (minStep !== null) return `${span}每 ${minStep} 分钟`;
+      if (min === "*") return `${span}每分钟`;
+      if (isPlainInt(min) && Number(min) <= 59) return `${span}每小时第 ${Number(min)} 分`;
       return raw;
     }
     const minStep = parseStep(min, 59);
-    // 分位步进且时位 * → 「每 N 分钟」（全天）；时位固定 → 歧义，回退不臆测。
-    if (minStep !== null) return hr === "*" ? `每 ${minStep} 分钟` : raw;
+    // 分位步进且时位 * → 「每 N 分钟」（全天）；时位固定单值 → 歧义，回退不臆测。
+    if (minStep !== null) return hr === "*" ? `${weekPrefix}每 ${minStep} 分钟` : raw;
   }
 
-  if (
-    !okField(min, 0, 59) ||
-    !okField(hr, 0, 23) ||
-    !okField(dom, 1, 31) ||
-    !okField(mon, 1, 12) ||
-    !okField(dow, 0, 6, true)
-  ) {
+  if (!okField(min, 0, 59) || !okField(hr, 0, 23) || !okField(dom, 1, 31) || !okField(mon, 1, 12)) {
     return raw; // 复杂/越界字段 → 给原 cron，不臆测
   }
+  // 日与周同时限定：cron 语义是「任一命中即执行」，一句中文说不清 → 回退原串。
+  if (dom !== "*" && week) return raw;
   let when = "";
   if (dom !== "*" && mon !== "*") when = `${mon}月${dom}日 `;
-  else if (dow !== "*") when = `每周${dow.split(",").map((d) => DAY_NAMES[Number(d)] ?? d).join("、")} `;
+  else if (week) when = weekPrefix;
   else if (dom !== "*") when = `每月${dom}日 `;
   else when = "每天 ";
   let time = "";

@@ -134,7 +134,7 @@ describe("SkillTrainSection 训练 run 重入", () => {
 
     await waitFor(() => expect(merge).toHaveBeenCalledWith(auth, "r1"));
     // 合并后整块 run UI 卸载 —— 成功反馈必须落在「卸载后仍然存在」的地方。
-    expect(await screen.findByText(/已合并到技能库,可在「正文」页签查看新版本/)).toBeInTheDocument();
+    expect(await screen.findByText(/已合并到技能库，可在「正文」页签查看新版本/)).toBeInTheDocument();
     expect(onSkillChanged).toHaveBeenCalledTimes(1);
   });
 
@@ -214,7 +214,7 @@ describe("SkillEvalSection AI 生成用例", () => {
 
     // 草稿灌进现有编辑器 → prompt 出现在文本域;提示条出现;保存用例可用(dirty)。
     expect(await screen.findByDisplayValue("把中文摘要翻译成英文")).toBeInTheDocument();
-    expect(screen.getByText("AI 草稿已生成,请审阅修改后保存")).toBeInTheDocument();
+    expect(screen.getByText("AI 草稿已生成，请审阅修改后保存")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /保存用例/ })).toBeEnabled();
   });
 
@@ -239,7 +239,7 @@ describe("SkillEvalSection AI 生成用例", () => {
     // 追加:原有 + 新草稿都在编辑器里。
     expect(await screen.findByDisplayValue("补充任务")).toBeInTheDocument();
     expect(screen.getByDisplayValue("已有任务")).toBeInTheDocument();
-    expect(screen.getByText("AI 草稿已生成,请审阅修改后保存")).toBeInTheDocument();
+    expect(screen.getByText("AI 草稿已生成，请审阅修改后保存")).toBeInTheDocument();
   });
 
   test("生成失败:显示带 note 的错误提示", async () => {
@@ -254,7 +254,7 @@ describe("SkillEvalSection AI 生成用例", () => {
     fireEvent.click(await screen.findByRole("button", { name: /AI 生成用例/ }));
     fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
 
-    expect(await screen.findByText(/AI 生成用例失败:模型输出不是合法 JSON/)).toBeInTheDocument();
+    expect(await screen.findByText(/AI 生成用例失败：模型输出不是合法 JSON/)).toBeInTheDocument();
   });
 
   test("POST 409 → 友好中文提示(有任务在进行中)", async () => {
@@ -268,7 +268,7 @@ describe("SkillEvalSection AI 生成用例", () => {
     fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
 
     expect(
-      await screen.findByText("该技能有评测或生成任务在进行中,请稍后再试"),
+      await screen.findByText("该技能有评测或生成任务在进行中，请稍后再试"),
     ).toBeInTheDocument();
   });
 

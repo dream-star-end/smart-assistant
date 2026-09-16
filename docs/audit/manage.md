@@ -1,7 +1,8 @@
 # A·manage 管理中心 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-manage`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 27 / 修复 22 / 遗留 5）
+- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 27 / 修复 22 / 遗留 5）→ 二期（§10；遗留 5 → 已修 1 / 他处闭环 2 /
+  保持 2 均需后端，另修跨模块转来的 X-03 `cronHuman` 区间）
 - 结论：**P1 × 1 / P2 × 8 / P3 × 18**，共 27 条。P1 是「未绑定聊天项目」作用域下定时任务
   面板把用户的任务表渲染成「还没有定时任务」空态（`cronBlocked` 算出来了却没渲染）。
 - 跨模块另记 3 条（见 §6），其中 `hooks/useProjectScope` 的作用域重置竞态会让持久化 /
@@ -524,3 +525,58 @@ after 对照（同名 PNG，`before/` ↔ `after/`）：
 | M-17 导出 / 详情 | 需后端单文档接口与作者 / 年份元数据 | 记入「需后端配合」 |
 | X-01 | `hooks/useProjectScope.tsx` 作用域重置竞态，sidebar 归属 | 待 sidebar-B；本轮 4 个测试文件用聊天项目 token / 直接给定作用域绕开 |
 | M-06 ③ 后端口径 | `SkillSummary.sensitive` 下发 | 需后端配合；前端规则先兜底 |
+
+---
+
+## 10. 二期（t-626）· 遗留 P3 收尾
+
+- 分支：`feat/v5-selfhost-audit-manage`，接在阶段 B 终点 `af79d7b05`（已合入 integration `43b7cd3a4`）之后；
+  执行：fable-5-1-54（接手自 fable-5-1-36 / -37，二人导出记录里均无本活实际改动，未重建工作树）。
+- 范围：§9 遗留表**逐条处置**——本模块归属内、不依赖后端 / shell 的项落地并配用例；其余保持遗留并写明原因。
+- 口径（任务书授权自定）：只改 PLAYBOOK §8 manage 归属；ConnectorsTab 四条已由补丁① 在 settings 侧承接，
+  不重做；最小改动、可回退、不改既有交互约定；提交 subject 无 `fix(v5)`。
+
+### 10.1 §9 遗留表逐条处置
+
+| 项 | 处置 | 改动 / 依据 | 用例 | 提交 |
+|---|---|---|---|---|
+| M-09（P2）/ M-18 / M-20 / M-21（`ConnectorsTab.tsx`） | ✅ 已闭环（settings 侧） | 补丁① t-426 在 `feat/v5-selfhost-audit-settings` 落地：`138accab4`（窄屏动作簇 `max-sm:basis-full` 下沉、`accountHint` 仅 `displayName` 非空才渲染、目录降级顶部 info + 重试、备注名失焦提交 + 改名 toast）+ `c0efc9c91` 文档，已验收通过。修法与 §4 一致，manage 侧不重做，本表只做状态回指。 | `ConnectorsTab.test` 53 → 60（settings 分支） | —（settings 分支） |
+| M-12 余量（`SkillOptPanel.tsx` 半角标点） | ✅ 已修 | `manage/SkillOptPanel.tsx` 用户可见文案 50 行全角化：成本确认框（运行评测 / AI 生成 / 每日自动回归 / 训练优化 / 修订 / 合并）的标题与正文行、生成 / 训练进度与提示条、用例编辑器 hint / placeholder、diff 审阅「（空）」占位与「行未变更（点击展开）」、错误拼接分隔符 `；`。数字区间（`3~5`、`1~3`）、盲测比值 `a : b : c`、代码注释不动。 | 既有 4 处精确匹配同步（`SkillOptPanel.test`，17 例全绿） | `0a47b4948` |
+| M-17 导出 / 详情 | ⏸ 保持遗留 | 仍需后端：`ResearchLibraryDoc` 无作者 / 年份 / venue，`/api/me/research/library*` 无单文档读接口，`cite.ts` 三种格式缺输入。前端可做的搜索 / 文档 ID 标识已在阶段 B 落地。 | — | — |
+| X-01 作用域重置竞态 | ✅ 已闭环（integration） | taskboard-B 以 T-02 在 `hooks/useProjectScope.tsx` 加 `hydrated`：列表未到位 / 请求失败 / 未登录不再把 token 判失效回落 `all`，已在 integration `43b7cd3a4`。本模块 4 个测试文件用聊天项目 token 绕开的写法仍成立，不必回改。 | `hooks/useProjectScope.test.tsx` ×4（integration） | —（integration） |
+| M-06 ③ `SkillSummary.sensitive` | ⏸ 保持遗留 | 需后端下发；前端 `isSecretSkill` 规则兜底已在阶段 B 落地（`skillDisplay.test` ×2）。 | — | — |
+
+统计：遗留 5 项 → 已修 1 / 已由他处闭环 2 / 保持遗留 2（均需后端）。本模块内可独立完成的只有 M-12 余量，已修 1/1。
+
+### 10.2 计划外：跨模块转来的 manage 归属项
+
+| 项 | 处置 | 改动 | 用例 | 提交 |
+|---|---|---|---|---|
+| X-03 `cronHuman` 区间（taskboard §暂缓表 / tools §8 点名） | ✅ 已修 | `lib/cron.ts` 新增 `parseRange` / `dowHuman`：周位支持 `a-b` 与逗号混排（每周一至五 / 每周一至三、六）；时位支持 `a-b` 时段配分位步进 / `*` / 整数（每周一至五 9–19 点每 30 分钟 / 每天 9–18 点每小时第 0 分 / 每天 9–18 点每分钟）；步进形态允许限定星期（每周一 每 2 小时的第 0 分）。倒序区间、越界、日位固定 + 时段、分位复杂仍回退原串；**日与周同时限定**（cron 语义任一命中即执行）由原先只读日期改为回退原串，不臆测。受益面：`CronPanel` 任务行（原串仍进 Tooltip / aria-label）、taskboard `StageSettings` 巡检 hint、tools `memoryReminderCards`。 | `lib/cron.test`：既有 19 例输出不变，1 例（`0 9 * * 1-5` 回退）按 X-03 改为「每周一至五 09:00」，新增 12 例（6 翻译 + 6 回退） | `26b865e2f` |
+
+ui-preview 新增场景 `manage-cron-range`（`scenes-manage-audit.tsx`，任务表多一条 `*/30 9-19 * * 1-5`「工作日巡检」）。
+
+### 10.3 验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0 |
+| 模块单测 | `npx vitest run src/components/manage src/components/ManageCenter.test.tsx src/lib/{cron,connectors,skillRunCost,skillTrainReentry}.test.ts --maxWorkers=1` | ✅ 17 文件 / 212 例全绿（`cron.test` 50 例含新增 12） |
+| 关联使用方单测 | `npx vitest run src/components/taskboard/taskboard.test.tsx src/components/tool/memoryReminderCards.test.tsx src/components/manage/SkillEditor.test.tsx` | ✅ 全绿（`taskboard.test` 49 例单跑绿；与另三文件合跑一次套件加载失败，复跑即过，与改动无关） |
+| 代码风格 | `npx biome lint` 5 个改动文件 | ✅ 新增 0：`cron.ts` / `cron.test.ts` / `SkillOptPanel.test.tsx` / `scenes-manage-audit.tsx` 0 诊断；`SkillOptPanel.tsx` 9 条 `useExhaustiveDependencies` 与 HEAD 同一 blob（在 wt/settings 同配置复核）逐条相同，本轮未触碰依赖数组 |
+| 视觉 after | `OC_UI_SCENES='manage-skill-workbench-evals,manage-skill-workbench-train-draft,manage-cron-range'`、`OC_UI_SHOT_DELAY=900` → `D:\code\test_project\test123\.audit-tmp\manage\after-2\` | ✅ 12 张（3 场景 × desktop/mobile × light/dark），`failures: []` / `retried: []` / `unmockedApi: []` |
+
+after-2 对照（Read 逐张，`after/` ↔ `after-2/`）：
+
+- `manage-cron-range--desktop--light` —— 新增「工作日巡检」行排程读作「每周一至五 9–19 点每 30 分钟」，与「每天 08:00」「每 30 分钟」同一行式；此前该串只会原样回显。
+- `manage-skill-workbench-evals--desktop--light` —— 验收断言 hint「每行一条，例如：输出为英文且信息无遗漏 / 保留原文数字与单位」全角；其余布局与阶段 B after 一致。
+- `manage-skill-workbench-train-draft--desktop--light` —— diff 折叠行「… 11 行未变更（点击展开）」全角；恢复提示条、评测门结论行式不变。
+
+**NOT RUN**：`npm test` 全量（改动限于 manage 归属 + 纯函数 `cron.ts`，其三个使用方的单测已单跑绿；全量门交集成③ 统一跑）；`npm run test:browser`（未触碰 Composer / 消息 / 工具卡 / 侧栏交互面）；真机 iOS Safari。
+
+### 10.4 仍遗留
+
+| 项 | 归属 / 原因 |
+|---|---|
+| M-17 导出 / 详情 | 需后端单文档接口与作者 / 年份元数据（§5） |
+| M-06 ③ `SkillSummary.sensitive` | 需后端下发；前端规则兜底已就位 |
