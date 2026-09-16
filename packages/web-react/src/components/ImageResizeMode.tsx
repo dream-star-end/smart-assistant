@@ -193,7 +193,10 @@ export function ImageResizeMode({
             </button>
           </div>
         ) : (
-          <div className="relative inline-flex max-h-full max-w-full items-center justify-center">
+          // 包裹层撑满图片区(h-full w-full)而不是贴着图片收缩:inline-flex 包裹自身高度不定,里面 <img>
+          // 的 max-h-full 解析不出来,矮视口桌面端(如 1024×640)会被 overflow-hidden 上下裁掉;M-01 让图
+          // 显形后才看得见这条(阶段 B 顺手修)。本模式没有锚点层,不需要贴合图片。
+          <div className="relative flex h-full w-full items-center justify-center">
             {/* 主图就绪前:已缓存缩略图做模糊底图(占位给容器尺寸);未命中 → 深色骨架。禁纯白闪。
                 shimmer 尊重 reduced-motion(oc-img-skeleton CSS 已处理)。 */}
             {!imgReady &&
