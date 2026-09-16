@@ -504,6 +504,8 @@ export function MembersTab({
               value={inviteEmail}
               onChange={(e) => setInviteEmail(e.target.value)}
               placeholder="成员邮箱"
+              // placeholder 一输入就消失,不是可访问名(t-762 settings#2);与右侧「邀请角色」同款给 aria-label。
+              aria-label="成员邮箱"
               className="h-9 min-w-[12rem] flex-1"
               required
             />

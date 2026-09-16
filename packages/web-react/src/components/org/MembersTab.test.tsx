@@ -113,6 +113,11 @@ describe("MembersTab 成员列表", () => {
     fireEvent.change(roleSelect, { target: { value: "admin" } });
     expect(api.patchOrgMember).toHaveBeenCalledWith(auth, "u1", { org_role: "admin" });
     expect(screen.getByRole("combobox", { name: "邀请角色" })).toHaveValue("member");
+    // 邀请邮箱此前只有 placeholder：一输入就消失，也不是可访问名（t-762 settings#2）。
+    const inviteEmail = screen.getByRole("textbox", { name: "成员邮箱" });
+    expect(inviteEmail).toHaveAttribute("placeholder", "成员邮箱");
+    fireEvent.change(inviteEmail, { target: { value: "new@example.com" } });
+    expect(screen.getByRole("textbox", { name: "成员邮箱" })).toHaveValue("new@example.com");
   });
 
   test("非 owner 的「组织结算」开关禁用并说明原因（审计 SET-40）", async () => {
