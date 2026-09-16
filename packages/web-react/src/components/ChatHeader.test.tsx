@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { MAIN_AGENT } from "../lib/agents";
 import type { PublicModel } from "../lib/types";
-import { ChatHeader } from "./ChatHeader";
+import { ChatHeader, modKeyLabel } from "./ChatHeader";
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(cleanup);
@@ -178,6 +178,45 @@ describe("ChatHeader 导出会话", () => {
     renderHeader({ onExport });
     fireEvent.click(screen.getByRole("button", { name: "导出会话" }));
     expect(onExport).toHaveBeenCalledTimes(1);
+  });
+
+  // C-12:窄屏导出键 hidden sm:flex 直接消失且无溢出菜单承接。
+  it("窄屏「更多操作」菜单承接导出(桌面键 hidden sm:flex,菜单 sm:hidden),菜单项调用 onExport", async () => {
+    const onExport = vi.fn();
+    renderHeader({ onExport });
+    expect(screen.getByRole("button", { name: "导出会话" })).toHaveClass("hidden", "sm:flex");
+    const more = screen.getByRole("button", { name: "更多操作" });
+    expect(more.parentElement).toHaveClass("sm:hidden");
+    fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
+    fireEvent.click(more);
+    const item = await screen.findByRole("menuitem", { name: /导出会话/ });
+    fireEvent.click(item);
+    expect(onExport).toHaveBeenCalledTimes(1);
+  });
+
+  it("无 onExport 时也不渲染「更多操作」", () => {
+    renderHeader();
+    expect(screen.queryByRole("button", { name: "更多操作" })).toBeNull();
+  });
+});
+
+// C-24:查找按钮 title 固定「(⌘F)」,Windows/Linux 用户看到 Mac 符号。
+describe("ChatHeader 快捷键标签平台化", () => {
+  it("非 Mac 平台显示 Ctrl+F,Mac 显示 ⌘F", () => {
+    const original = Object.getOwnPropertyDescriptor(Navigator.prototype, "platform");
+    Object.defineProperty(navigator, "platform", { value: "Win32", configurable: true });
+    Object.defineProperty(navigator, "userAgent", { value: "Mozilla/5.0 (Windows NT 10.0)", configurable: true });
+    expect(modKeyLabel()).toBe("Ctrl+");
+    const { unmount } = renderHeader({ onOpenFind: vi.fn() });
+    expect(screen.getByRole("button", { name: "会话内查找" })).toHaveAttribute("title", "会话内查找 (Ctrl+F)");
+    unmount();
+    Object.defineProperty(navigator, "platform", { value: "MacIntel", configurable: true });
+    expect(modKeyLabel()).toBe("⌘");
+    renderHeader({ onOpenFind: vi.fn() });
+    expect(screen.getByRole("button", { name: "会话内查找" })).toHaveAttribute("title", "会话内查找 (⌘F)");
+    if (original) Object.defineProperty(Navigator.prototype, "platform", original);
+    Reflect.deleteProperty(navigator, "platform");
+    Reflect.deleteProperty(navigator, "userAgent");
   });
 });
 

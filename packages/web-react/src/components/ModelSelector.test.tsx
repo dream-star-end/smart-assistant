@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
+import { EFFORT_OPTIONS } from './settings/labels'
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
 afterEach(() => {
@@ -207,6 +208,61 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-fast="true"]')).toBeNull()
+  })
+
+  // C-07:思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道。
+  it('触发器在 sm+ 追加当前思考档与 Fast(「· 高 · Fast」),团队模式下不显示', () => {
+    const { rerender } = render(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />,
+    )
+    const tier = screen.getByTestId('model-trigger-tier')
+    expect(tier).toHaveTextContent(`· ${EFFORT_OPTIONS.find((o) => o.value === 'high')!.label} · Fast`)
+    expect(tier).toHaveClass('hidden', 'sm:inline')
+    rerender(<ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-low" onSelect={() => {}} />)
+    expect(screen.getByTestId('model-trigger-tier')).toHaveTextContent(
+      `· ${EFFORT_OPTIONS.find((o) => o.value === 'low')!.label}`,
+    )
+    expect(screen.getByTestId('model-trigger-tier').textContent).not.toContain('Fast')
+    rerender(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-low" onSelect={() => {}} teamEngineActive />,
+    )
+    expect(screen.queryByTestId('model-trigger-tier')).toBeNull()
+  })
+
+  it('非 Cursor 模型按会话思考偏好显示档位;无偏好不显示', () => {
+    const { rerender } = render(
+      <ModelSelector
+        models={CURSOR_MODELS}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+        effortSupported={['low', 'high']}
+        effortActive="high"
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-tier')).toHaveTextContent(
+      EFFORT_OPTIONS.find((o) => o.value === 'high')!.label,
+    )
+    rerender(<ModelSelector models={CURSOR_MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    expect(screen.queryByTestId('model-trigger-tier')).toBeNull()
+  })
+})
+
+// C-08:当前模型被后端标 degraded 时 trigger 无任何标识,只有点开菜单才看到。
+describe('ModelSelector 降级模型 trigger 标识', () => {
+  const DEG_MODELS: PublicModel[] = [
+    { id: 'glm-5.2', display_name: 'GLM-5.2', degraded: true },
+    { id: 'deepseek-v4', display_name: 'DeepSeek-V4' },
+  ]
+
+  it('已选模型 degraded → trigger 带警示图标与 title;健康模型无', () => {
+    const { rerender } = render(<ModelSelector models={DEG_MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('data-degraded', 'true')
+    expect(trigger).toHaveAttribute('title', '当前模型暂不可用，点击更换')
+    expect(screen.getByTestId('model-trigger-degraded')).toBeInTheDocument()
+    rerender(<ModelSelector models={DEG_MODELS} selectedId="deepseek-v4" onSelect={() => {}} />)
+    expect(screen.getByRole('button', { name: '选择对话模型' })).not.toHaveAttribute('data-degraded')
+    expect(screen.queryByTestId('model-trigger-degraded')).toBeNull()
   })
 })
 

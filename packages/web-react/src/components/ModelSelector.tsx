@@ -190,6 +190,21 @@ export function ModelSelector({
   const engineLabel = teamEngineLabel(models)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
+  // 思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道(C-07):
+  // trigger 在 sm+ 追加「· 高」「· Fast」。Cursor 家族读 canonical id 上的档位,其它模型读会话偏好。
+  const tierLabel = (() => {
+    if (teamEngineActive) return null
+    const parts: string[] = []
+    if (selectedCursor) {
+      const effort = EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label
+      if (effort) parts.push(effort)
+      if (selectedCursor.fast) parts.push('Fast')
+    } else if (effortSupported && effortSupported.length > 0 && effortActive) {
+      const effort = EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label
+      if (effort) parts.push(effort)
+    }
+    return parts.length > 0 ? parts.join(' · ') : null
+  })()
   const disabled = loading || (models.length === 0 && lockedModels.length === 0)
   const rows = modelPickerRows(models, lockedModels)
   const {
@@ -485,6 +500,9 @@ export function ModelSelector({
             data-product-feature={PRODUCT_CAPABILITIES.models.id}
             disabled={disabled}
             aria-label="选择对话模型"
+            // 当前模型被标降级时 trigger 自身要有标识(C-08),不能只在点开菜单后才看到。
+            title={selectedDegraded && !teamEngineActive ? '当前模型暂不可用，点击更换' : undefined}
+            data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
             className={cn(
               'flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
               'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
@@ -498,7 +516,20 @@ export function ModelSelector({
               <Cpu size={14} className="shrink-0 text-faint" />
             )}
             {teamEngineActive && <span className="hidden sm:inline">{'团队模式 · '}</span>}
+            {selectedDegraded && !teamEngineActive && (
+              <AlertTriangle
+                size={13}
+                className="shrink-0 text-danger"
+                aria-label="当前模型暂不可用"
+                data-testid="model-trigger-degraded"
+              />
+            )}
             <span className="min-w-0 truncate sm:max-w-[180px]">{label}</span>
+            {tierLabel && (
+              <span className="hidden shrink-0 text-faint sm:inline" data-testid="model-trigger-tier">
+                · {tierLabel}
+              </span>
+            )}
             {!teamEngineActive && <CostMark model={selected} />}
             {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
             <ChevronDown size={14} className="shrink-0 text-faint" />

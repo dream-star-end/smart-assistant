@@ -1,5 +1,17 @@
 import type { CursorContextTier } from "@openclaude/protocol";
-import { Bell, ChevronDown, Download, Menu, PanelLeft, PenSquare, Search, ShieldCheck, Users, Wallet } from "lucide-react";
+import {
+  Bell,
+  ChevronDown,
+  Download,
+  Menu,
+  MoreHorizontal,
+  PanelLeft,
+  PenSquare,
+  Search,
+  ShieldCheck,
+  Users,
+  Wallet,
+} from "lucide-react";
 import { useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
@@ -8,7 +20,24 @@ import type { LockedPublicModel, PublicModel } from "../lib/types";
 import { cn, formatCredits } from "../lib/utils";
 import { AgentAvatar } from "./AgentAvatar";
 import { type LockedSelectInfo, ModelSelector, teamEngineLabel } from "./ModelSelector";
-import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  IconButton,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "./ui";
+
+/** 快捷键修饰键按平台显示:Mac 系 ⌘,其余 Ctrl(C-24:Windows/Linux 用户此前看到的是 Mac 符号)。 */
+export function modKeyLabel(): string {
+  if (typeof navigator === "undefined") return "Ctrl+";
+  const platform = `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`;
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘" : "Ctrl+";
+}
 
 export function ChatHeader({
   agent,
@@ -163,6 +192,7 @@ export function ChatHeader({
         </div>
       )}
       <button
+        type="button"
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
         aria-label={`切换智能体，当前${agent.name}`}
@@ -295,7 +325,7 @@ export function ChatHeader({
             data-product-control
             onClick={onOpenFind}
             aria-label="会话内查找"
-            title="会话内查找 (⌘F)"
+            title={`会话内查找 (${modKeyLabel()}F)`}
             shape="square"
           >
             <Search size={18} />
@@ -313,6 +343,24 @@ export function ChatHeader({
             <Download size={18} />
           </IconButton>
         )}
+        {/* 窄屏没有位置放独立导出键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
+        {onExport && (
+          <div className="sm:hidden">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <IconButton data-product-control aria-label="更多操作" title="更多操作" shape="square">
+                  <MoreHorizontal size={18} />
+                </IconButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={onExport}>
+                  <Download size={16} className="shrink-0 text-muted" />
+                  <span className="flex-1">导出会话</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        )}
         {onOpenInbox && (
           <div className="relative">
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
@@ -323,6 +371,7 @@ export function ChatHeader({
         )}
         {credits != null && (
           <button
+            type="button"
             data-product-feature={PRODUCT_CAPABILITIES.billing.id}
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
