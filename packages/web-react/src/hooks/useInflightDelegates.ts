@@ -29,6 +29,58 @@ export function filterVisibleInflightItems(
 }
 
 /**
+ * 「知道了」按会话持久化到 sessionStorage(H-14):刷新后 recency 窗内的终态项不再复活。
+ * 只存 jobId 列表、上限 64 条;存储不可用(隐私模式 / 配额)一律静默,退化成仅内存。
+ */
+const DISMISSED_STORAGE_PREFIX = "oc_inflight_dismissed:";
+const DISMISSED_STORAGE_CAP = 64;
+
+function dismissedStorageKey(sessionId: string): string {
+  return `${DISMISSED_STORAGE_PREFIX}${sessionId}`;
+}
+
+function safeSessionStorage(): Storage | null {
+  try {
+    return typeof window !== "undefined" ? window.sessionStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+export function readDismissedDelegates(
+  sessionId: string | null,
+  storage: Pick<Storage, "getItem"> | null = safeSessionStorage(),
+): Set<string> {
+  if (!sessionId || !storage) return new Set();
+  try {
+    const raw = storage.getItem(dismissedStorageKey(sessionId));
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((v): v is string => typeof v === "string" && v.length > 0));
+  } catch {
+    return new Set();
+  }
+}
+
+export function writeDismissedDelegates(
+  sessionId: string | null,
+  dismissed: ReadonlySet<string>,
+  storage: Pick<Storage, "setItem" | "removeItem"> | null = safeSessionStorage(),
+): void {
+  if (!sessionId || !storage) return;
+  try {
+    const key = dismissedStorageKey(sessionId);
+    if (dismissed.size === 0) {
+      storage.removeItem(key);
+      return;
+    }
+    storage.setItem(key, JSON.stringify([...dismissed].slice(-DISMISSED_STORAGE_CAP)));
+  } catch {
+    // 静默:存储不可用时退化为仅内存。
+  }
+}
+
+/**
  * Composer-pinned inflight delegate snapshot.
  *
  * Fetch once on session enter/switch. Poll every 15s while any item is
@@ -43,12 +95,12 @@ export function useInflightDelegates(opts: {
 }): { items: InflightDelegateItem[]; dismiss: (jobId: string) => void } {
   const { sessionId, messages, enabled, auth } = opts;
   const [rawItems, setRawItems] = useState<InflightDelegateItem[] | null>(null);
-  const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
+  const [dismissed, setDismissed] = useState<Set<string>>(() => readDismissedDelegates(sessionId));
   const [seenSessionId, setSeenSessionId] = useState(sessionId);
   if (sessionId !== seenSessionId) {
     setSeenSessionId(sessionId);
     setRawItems(null);
-    setDismissed(new Set());
+    setDismissed(readDismissedDelegates(sessionId));
   }
   const notFoundRef = useRef(new Set<string>());
   /** jobIds this tab observed non-terminal; their terminal row is always shown until dismissed. */
@@ -57,10 +109,15 @@ export function useInflightDelegates(opts: {
   authRef.current = auth;
   const genRef = useRef(0);
 
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
   const dismiss = useCallback((jobId: string) => {
     setDismissed((prev) => {
+      if (prev.has(jobId)) return prev;
       const next = new Set(prev);
       next.add(jobId);
+      // 幂等写入(StrictMode 双调 updater 也安全);读回见 readDismissedDelegates。
+      writeDismissedDelegates(sessionIdRef.current, next);
       return next;
     });
   }, []);
@@ -94,7 +151,8 @@ export function useInflightDelegates(opts: {
     }
     const myGen = ++genRef.current;
     setRawItems(null);
-    setDismissed(new Set());
+    // 会话内已「知道了」的终态项从 sessionStorage 回灌(H-14),不再随重挂载清零。
+    setDismissed(readDismissedDelegates(sessionId));
     seenLiveRef.current = new Set();
     void pull(sessionId, myGen);
     return () => {
@@ -116,7 +174,15 @@ export function useInflightDelegates(opts: {
       if (document.visibilityState !== "visible") return;
       void pull(sessionId, myGen);
     }, POLL_MS);
-    return () => window.clearInterval(timer);
+    // 回到前台立刻拉一次(H-15):隐藏期跳过的轮询不必再等下一个 15s。
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void pull(sessionId, myGen);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [shouldPoll, sessionId, pull]);
 
   const items = useMemo(() => {

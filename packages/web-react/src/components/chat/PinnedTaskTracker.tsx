@@ -21,12 +21,57 @@
  */
 import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronDown, ChevronUp, Circle, ListChecks, LoaderCircle } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
 import { asArr, asStr, resolveToolInput } from "../tool/format";
 import { TokenUsageBadge } from "./tokenUsage";
 import { currentTurnStartIndex } from "./turnSegment";
+
+/**
+ * 两枚 HUD 共用的头部切换按钮样式(H-05):外层容器 `overflow-hidden rounded-lg` 会把画在
+ * 盒外的浏览器默认 outline 裁掉,键盘焦点看不见 —— 焦点环必须 inset。
+ */
+export const HUD_TOGGLE_CLS =
+  "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";
+
+/**
+ * 两枚 HUD 共用的展开列表高度上限(H-06):桌面维持 13rem(208px);窄屏(<sm)降到 9rem(≈4 行,
+ * 其余靠滚动 + 底部渐隐提示);任何视口再按 30% 视口封顶 —— 两枚同时展开在 390×844 曾吃掉约六成
+ * 屏幕,横屏手机(高 390)直接盖住对话区。
+ */
+export const HUD_LIST_CLS =
+  "flex max-h-[min(13rem,30dvh)] max-sm:max-h-[min(9rem,30dvh)] flex-col gap-1.5 overflow-y-auto border-t border-border px-3 py-2";
+
+/** 列表底部还有内容时的渐隐提示(H-17);滚到底自动消失。 */
+const HUD_LIST_FADE_CLS =
+  "[mask-image:linear-gradient(to_bottom,black_calc(100%-1.75rem),transparent)]";
+
+/**
+ * 列表是否还有未滚到的内容(H-17):挂载 / 内容变化 / 滚动 / 尺寸变化时重新量。
+ * 返回的 fadeCls 直接拼进列表 class,onScroll 挂到列表上。
+ */
+export function useHudListOverflow(
+  ref: RefObject<HTMLElement | null>,
+  deps: readonly unknown[],
+): { fadeCls: string; onScroll: () => void } {
+  const [overflowing, setOverflowing] = useState(false);
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    setOverflowing(el.scrollHeight - el.clientHeight - el.scrollTop > 4);
+  }, [ref]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps 由调用方给出(内容签名),内容变了才重量。
+  useEffect(() => {
+    measure();
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measure, ...deps]);
+  return { fadeCls: overflowing ? HUD_LIST_FADE_CLS : "", onScroll: measure };
+}
 
 export type TodoItem = { content: string; status: string; activeForm?: string };
 
@@ -90,12 +135,12 @@ function isDone(t: TodoItem): boolean {
   return t.status === "completed";
 }
 
-function TodoRow({ t, compact }: { t: TodoItem; compact?: boolean }) {
+function TodoRow({ t }: { t: TodoItem }) {
   const done = t.status === "completed";
   const active = t.status === "in_progress";
   const text = active && t.activeForm ? t.activeForm : t.content;
   return (
-    <div className={cn("flex items-start gap-2", compact ? "text-body" : "text-body")}>
+    <div className="flex items-start gap-2 text-body">
       <span className="mt-px shrink-0">
         {done ? (
           <Check className="size-3.5 text-success" />
@@ -155,6 +200,10 @@ export function PinnedTaskTracker({
   liveActiveRef.current = active;
   // 在飞优先:active 时即使旧行残留终态标记(settled 误报)也不算收口。
   const turnSettled = !active && (endedLiveRef.current || settled);
+  // 渲染门:有未完成任务且本轮未收口(三态见文件头)。刷新后当前轮仍在飞
+  // (openDispatch 恢复 sending 或无终态证据 → turnSettled=false)→ 钉住,保留 d18bd587 行为;
+  // 打开已收口旧会话时 extractLatestTodos 拿不到当前段未完成项,hasIncomplete=false,不会误闪。
+  const visible = hasIncomplete && !turnSettled;
 
   // 任务集变化 / 新 turn 开始 → 重新展开全部、复位用户态。
   useEffect(() => {
@@ -167,18 +216,22 @@ export function PinnedTaskTracker({
     prevActive.current = active;
   }, [sig, active]);
 
-  // 展开后 ~3s 自动折叠(用户未手动干预时)。非运行态不启动计时器,避免旧会话
-  // 隐藏 HUD 时悄悄改变下一轮初始展开状态。
+  // 展开后 ~3s 自动折叠(用户未手动干预时)。以「HUD 可见」为门而非 active(H-11):
+  // 刷新后仍在飞(active=false、settled=false)同样要折叠,否则永久展开占位;
+  // HUD 隐藏时不计时,新任务集 / 新 turn 到来由上面的 effect 重新展开。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: sig 是刻意的——任务集变化要重新起 3s 计时。
   useEffect(() => {
-    if (!active || !expanded || userTouched) return;
+    if (!visible || !expanded || userTouched) return;
     const id = setTimeout(() => setExpanded(false), AUTO_COLLAPSE_MS);
     return () => clearTimeout(id);
-  }, [active, expanded, userTouched, sig]);
+  }, [visible, expanded, userTouched, sig]);
 
-  // 渲染门:有未完成任务且本轮未收口(三态见文件头)。刷新后当前轮仍在飞
-  // (openDispatch 恢复 sending 或无终态证据 → turnSettled=false)→ 钉住,保留 d18bd587 行为;
-  // 打开已收口旧会话时 extractLatestTodos 拿不到当前段未完成项,hasIncomplete=false,不会误闪。
-  if (!hasIncomplete || turnSettled) return null;
+  // aria-controls 只在列表真的渲染时输出(H-08);id 用 useId 防多实例重复。
+  const listId = useId();
+  const listRef = useRef<HTMLDivElement>(null);
+  const overflow = useHudListOverflow(listRef, [sig, expanded, visible]);
+
+  if (!visible) return null;
 
   const toggle = () => {
     setUserTouched(true);
@@ -193,12 +246,17 @@ export function PinnedTaskTracker({
           type="button"
           onClick={toggle}
           aria-expanded={expanded}
-          aria-controls="pinned-task-list"
-          className="flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover"
+          aria-controls={expanded ? listId : undefined}
+          className={cn(
+            "flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-hover",
+            HUD_TOGGLE_CLS,
+          )}
         >
-          <ListChecks className="size-4 shrink-0 text-accent" />
+          <ListChecks className="size-4 shrink-0 text-accent" aria-hidden />
+          {/* 读屏补齐动作名(H-09);术语与 inline 工具卡(tool/meta.ts「任务列表」)一致(H-10)。 */}
+          <span className="sr-only">{expanded ? "折叠任务列表" : "展开任务列表"}</span>
           <span className="shrink-0 text-xs font-medium text-muted">
-            任务 {doneCount}/{total}
+            任务列表 {doneCount}/{total}
           </span>
           {!expanded && activeTodo && (
             <span className="min-w-0 flex-1 truncate text-body text-fg">
@@ -215,16 +273,18 @@ export function PinnedTaskTracker({
           {expanded && <span className="flex-1" />}
           <TokenUsageBadge usage={tokenUsage} />
           {expanded ? (
-            <ChevronDown className="size-4 shrink-0 text-faint" />
+            <ChevronDown className="size-4 shrink-0 text-faint" aria-hidden />
           ) : (
-            <ChevronUp className="size-4 shrink-0 text-faint" />
+            <ChevronUp className="size-4 shrink-0 text-faint" aria-hidden />
           )}
         </button>
         {/* 展开:全部任务 */}
         {expanded && (
           <div
-            id="pinned-task-list"
-            className="flex max-h-52 flex-col gap-1.5 overflow-y-auto border-t border-border px-3 py-2"
+            id={listId}
+            ref={listRef}
+            onScroll={overflow.onScroll}
+            className={cn(HUD_LIST_CLS, overflow.fadeCls)}
           >
             {todos.map((t, i) => (
               <TodoRow key={`${i}-${t.content.slice(0, 24)}`} t={t} />

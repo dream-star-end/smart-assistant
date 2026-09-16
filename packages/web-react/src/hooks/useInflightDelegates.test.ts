@@ -1,6 +1,11 @@
 import { describe, expect, test } from "vitest";
 import type { InflightDelegateItem } from "../lib/chat/inflightDelegates";
-import { filterVisibleInflightItems, TERMINAL_RECENCY_MS } from "./useInflightDelegates";
+import {
+  filterVisibleInflightItems,
+  readDismissedDelegates,
+  TERMINAL_RECENCY_MS,
+  writeDismissedDelegates,
+} from "./useInflightDelegates";
 
 function item(over: Partial<InflightDelegateItem> = {}): InflightDelegateItem {
   return {
@@ -61,5 +66,62 @@ describe("filterVisibleInflightItems", () => {
       now,
     });
     expect(out).toHaveLength(1);
+  });
+});
+
+function memoryStorage(): Storage & { data: Map<string, string> } {
+  const data = new Map<string, string>();
+  return {
+    data,
+    get length() {
+      return data.size;
+    },
+    clear: () => data.clear(),
+    getItem: (k) => data.get(k) ?? null,
+    key: (i) => [...data.keys()][i] ?? null,
+    removeItem: (k) => {
+      data.delete(k);
+    },
+    setItem: (k, v) => {
+      data.set(k, v);
+    },
+  };
+}
+
+describe("dismissed 持久化(H-14)", () => {
+  test("按会话读写;空集合删键;换会话互不串", () => {
+    const storage = memoryStorage();
+    writeDismissedDelegates("s1", new Set(["a", "b"]), storage);
+    expect(readDismissedDelegates("s1", storage)).toEqual(new Set(["a", "b"]));
+    expect(readDismissedDelegates("s2", storage)).toEqual(new Set());
+    writeDismissedDelegates("s1", new Set(), storage);
+    expect(storage.data.size).toBe(0);
+  });
+
+  test("无 sessionId / 存储不可用 / 脏数据 → 退化成空集合,不抛", () => {
+    expect(readDismissedDelegates(null, memoryStorage())).toEqual(new Set());
+    expect(readDismissedDelegates("s1", null)).toEqual(new Set());
+    const storage = memoryStorage();
+    storage.setItem("oc_inflight_dismissed:s1", "{not json");
+    expect(readDismissedDelegates("s1", storage)).toEqual(new Set());
+    storage.setItem("oc_inflight_dismissed:s1", JSON.stringify([1, "", "ok", null]));
+    expect(readDismissedDelegates("s1", storage)).toEqual(new Set(["ok"]));
+    const throwing = {
+      ...memoryStorage(),
+      setItem: () => {
+        throw new Error("quota");
+      },
+    } as unknown as Storage;
+    expect(() => writeDismissedDelegates("s1", new Set(["a"]), throwing)).not.toThrow();
+  });
+
+  test("超过 64 条只保留最近的 64 条", () => {
+    const storage = memoryStorage();
+    const many = new Set(Array.from({ length: 70 }, (_, i) => `job-${i}`));
+    writeDismissedDelegates("s1", many, storage);
+    const back = readDismissedDelegates("s1", storage);
+    expect(back.size).toBe(64);
+    expect(back.has("job-69")).toBe(true);
+    expect(back.has("job-0")).toBe(false);
   });
 });
