@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { extractLatestTodos, PinnedTaskTracker } from "./PinnedTaskTracker";
@@ -151,7 +151,7 @@ describe("PinnedTaskTracker 交互", () => {
   test("初始展开全部 → 3s 后自动折叠成只显示正在执行的一条", () => {
     render(<PinnedTaskTracker todos={TODOS} active={true} />);
     // 初始:全部任务可见 + 进度
-    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 1/3")).toBeInTheDocument();
     expect(screen.getByText("任务一")).toBeInTheDocument();
     expect(screen.getByText("任务三")).toBeInTheDocument();
     // 自动折叠
@@ -186,15 +186,15 @@ describe("PinnedTaskTracker 交互", () => {
 
   test("刷新后当前轮仍有未完成任务 → HUD 钉住(不依赖 sending)", () => {
     render(<PinnedTaskTracker todos={TODOS} active={false} />);
-    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 1/3")).toBeInTheDocument();
     expect(screen.getByText("任务三")).toBeInTheDocument();
   });
 
   test("turn 收口(active true→false 下降沿)后,仍有未完成任务也不再钉住", () => {
     const view = render(<PinnedTaskTracker todos={TODOS} active={true} />);
-    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 1/3")).toBeInTheDocument();
     view.rerender(<PinnedTaskTracker todos={TODOS} active={false} />);
-    expect(screen.queryByText("任务 1/3")).toBeNull();
+    expect(screen.queryByText("任务列表 1/3")).toBeNull();
     expect(screen.queryByText("任务三")).toBeNull();
   });
 
@@ -205,7 +205,7 @@ describe("PinnedTaskTracker 交互", () => {
 
   test("刷新后当前轮仍在飞(active=false、settled=false)→ 继续钉住(保留 d18bd587 行为)", () => {
     render(<PinnedTaskTracker todos={TODOS} active={false} settled={false} />);
-    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 1/3")).toBeInTheDocument();
     expect(screen.getByText("任务三")).toBeInTheDocument();
   });
 
@@ -213,14 +213,48 @@ describe("PinnedTaskTracker 交互", () => {
     const NEW_TODOS = [{ content: "新一轮任务", status: "in_progress" }];
     const view = render(<PinnedTaskTracker todos={TODOS} active={true} />);
     view.rerender(<PinnedTaskTracker todos={TODOS} active={false} />);
-    expect(screen.queryByText("任务 1/3")).toBeNull();
+    expect(screen.queryByText("任务列表 1/3")).toBeNull();
     view.rerender(<PinnedTaskTracker todos={NEW_TODOS} active={true} />);
-    expect(screen.getByText("任务 0/1")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 0/1")).toBeInTheDocument();
     expect(screen.getByText("新一轮任务")).toBeInTheDocument();
   });
 
   test("settled=true 但 active=true(在飞优先,残留终态标记不误报)→ 仍渲染", () => {
     render(<PinnedTaskTracker todos={TODOS} active={true} settled={true} />);
-    expect(screen.getByText("任务 1/3")).toBeInTheDocument();
+    expect(screen.getByText("任务列表 1/3")).toBeInTheDocument();
+  });
+
+  test("H-11 刷新后仍在飞(active=false、settled=false)同样 3s 自动折叠,不再永久展开", () => {
+    render(<PinnedTaskTracker todos={TODOS} active={false} settled={false} />);
+    expect(screen.getByText("任务三")).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(3100); });
+    expect(screen.queryByText("任务三")).toBeNull();
+    expect(screen.getByText("正在做任务二")).toBeInTheDocument();
+  });
+
+  test("H-05/H-08/H-09 切换按钮:可读名、inset 焦点环、aria-controls 只在展开时指向真实列表", () => {
+    render(<PinnedTaskTracker todos={TODOS} active={true} />);
+    const btn = screen.getByRole("button", { name: /折叠任务列表/ });
+    expect(btn).toHaveAttribute("aria-expanded", "true");
+    expect(btn.className).toContain("focus-visible:ring-inset");
+    const listId = btn.getAttribute("aria-controls");
+    expect(listId).toBeTruthy();
+    expect(document.getElementById(listId!)).not.toBeNull();
+    fireEvent.click(btn);
+    const collapsed = screen.getByRole("button", { name: /展开任务列表/ });
+    expect(collapsed).toHaveAttribute("aria-expanded", "false");
+    expect(collapsed).not.toHaveAttribute("aria-controls");
+  });
+
+  test("手动折叠后不再自动展开;任务集变化才重新展开", () => {
+    const view = render(<PinnedTaskTracker todos={TODOS} active={true} />);
+    fireEvent.click(screen.getByRole("button", { name: /折叠任务列表/ }));
+    expect(screen.queryByText("任务三")).toBeNull();
+    act(() => { vi.advanceTimersByTime(5000); });
+    expect(screen.queryByText("任务三")).toBeNull();
+    view.rerender(
+      <PinnedTaskTracker todos={[...TODOS, { content: "任务四", status: "pending" }]} active={true} />,
+    );
+    expect(screen.getByText("任务四")).toBeInTheDocument();
   });
 });
