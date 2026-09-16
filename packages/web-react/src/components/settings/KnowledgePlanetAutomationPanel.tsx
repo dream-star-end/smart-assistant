@@ -232,12 +232,23 @@ export function KnowledgePlanetAutomationPanel({
   const [view, setView] = useState<KnowledgePlanetAutomationView | null>(null)
   const [loading, setLoading] = useState(true)
   /**
-   * 正在进行的写操作:'control'(总开关 / 同意)、'save'(规则表单)、`rule:<id>`(某一行的
-   * 切换 / 删除)。改造前是一个布尔值,切一条规则会把所有行的开关和按钮一起变灰,
-   * 用户分不清是在等还是坏了;按目标记键后只锁住正在操作的那一处。
+   * 正在进行的写操作集合:'control'(总开关 / 同意)、'save'(规则表单)、`toggle:<id>` /
+   * `delete:<id>`(某一行的切换 / 删除)。改造前是一个布尔值,切一条规则会把所有行的开关和
+   * 按钮一起变灰,用户分不清是在等还是坏了;按目标记键后只锁住正在操作的那一处。
+   * 必须是集合而不是单个键:单键时第二行的开关看着可用、点下去却被 `if (busy) return` 静默吞掉
+   * (受控 Switch 不翻、没有任何反馈),比灰掉还糟(t-1029 复核发现)。
    */
-  const [busyKey, setBusyKey] = useState<string | null>(null)
-  const busy = busyKey !== null
+  const [busyKeys, setBusyKeys] = useState<ReadonlySet<string>>(() => new Set())
+  const busy = busyKeys.size > 0
+  const isBusy = (key: string) => busyKeys.has(key)
+  const beginBusy = (key: string) => setBusyKeys((current) => new Set(current).add(key))
+  const endBusy = (key: string) =>
+    setBusyKeys((current) => {
+      if (!current.has(key)) return current
+      const next = new Set(current)
+      next.delete(key)
+      return next
+    })
   const [error, setError] = useState<string | null>(null)
   const [consentOpen, setConsentOpen] = useState(false)
   const [consentChecked, setConsentChecked] = useState(false)
@@ -328,8 +339,8 @@ export function KnowledgePlanetAutomationPanel({
   }
 
   const disableAutomation = async () => {
-    if (busy) return
-    setBusyKey('control')
+    if (isBusy('control')) return
+    beginBusy('control')
     setError(null)
     try {
       await api.setKnowledgePlanetAutomation(auth, account.id, { enabled: false })
@@ -337,7 +348,7 @@ export function KnowledgePlanetAutomationPanel({
     } catch (disableError) {
       setError(errorText(disableError, '关闭无人值守自动回复失败'))
     } finally {
-      setBusyKey(null)
+      endBusy('control')
     }
   }
 
@@ -356,14 +367,14 @@ export function KnowledgePlanetAutomationPanel({
   }
 
   const enableAutomation = async () => {
-    if (!view || !consentChecked || busy) return
+    if (!view || !consentChecked || isBusy('control')) return
     const limit = validateAccountLimit(accountLimit)
     if (!limit.ok) {
       setLimitError(limit.error)
       document.getElementById('kp-automation-account-limit')?.focus()
       return
     }
-    setBusyKey('control')
+    beginBusy('control')
     setConsentError(null)
     setLimitError(null)
     try {
@@ -380,7 +391,7 @@ export function KnowledgePlanetAutomationPanel({
       // 就地报错:弹层还开着,写到面板顶部的 Alert 用户根本看不见。
       setConsentError(errorText(enableError, '开启无人值守自动回复失败'))
     } finally {
-      setBusyKey(null)
+      endBusy('control')
     }
   }
 
@@ -422,7 +433,7 @@ export function KnowledgePlanetAutomationPanel({
   }
 
   const saveRule = async () => {
-    if (!editing || busy) return
+    if (!editing || isBusy('save')) return
     const validated = validateRuleDraft(draft)
     if (!validated.ok) {
       setRuleError(validated.error)
@@ -430,7 +441,7 @@ export function KnowledgePlanetAutomationPanel({
       focusField(validated.field)
       return
     }
-    setBusyKey('save')
+    beginBusy('save')
     setError(null)
     setRuleError(null)
     setInvalidField(null)
@@ -457,13 +468,15 @@ export function KnowledgePlanetAutomationPanel({
     } catch (saveError) {
       setRuleError(errorText(saveError, '保存自动回复规则失败'))
     } finally {
-      setBusyKey(null)
+      endBusy('save')
     }
   }
 
   const toggleRule = async (rule: KnowledgePlanetAutomationRule, enabled: boolean) => {
-    if (busy) return
-    setBusyKey(`toggle:${rule.id}`)
+    const key = `toggle:${rule.id}`
+    // 只挡同一行:别的行在飞不影响这一行,否则开关看着可用、点了却没反应。
+    if (isBusy(key) || isBusy(`delete:${rule.id}`)) return
+    beginBusy(key)
     setError(null)
     try {
       await api.patchKnowledgePlanetAutomationRule(auth, account.id, rule.id, { enabled })
@@ -475,7 +488,7 @@ export function KnowledgePlanetAutomationPanel({
         onAction: () => void toggleRule(rule, enabled),
       })
     } finally {
-      setBusyKey(null)
+      endBusy(key)
     }
   }
 
@@ -486,8 +499,9 @@ export function KnowledgePlanetAutomationPanel({
       confirmText: '删除',
       danger: true,
     })
-    if (!accepted || busy) return
-    setBusyKey(`delete:${rule.id}`)
+    const key = `delete:${rule.id}`
+    if (!accepted || isBusy(key) || isBusy(`toggle:${rule.id}`)) return
+    beginBusy(key)
     setError(null)
     try {
       await api.deleteKnowledgePlanetAutomationRule(auth, account.id, rule.id)
@@ -497,7 +511,7 @@ export function KnowledgePlanetAutomationPanel({
     } catch (deleteError) {
       setError(errorText(deleteError, '删除自动回复规则失败'))
     } finally {
-      setBusyKey(null)
+      endBusy(key)
     }
   }
 
@@ -558,7 +572,7 @@ export function KnowledgePlanetAutomationPanel({
             aria-label="知识星球无人值守自动回复"
             checked={control.enabled}
             disabled={
-              busyKey === 'control' ||
+              isBusy('control') ||
               (!control.enabled &&
                 (!control.available || !manualWriteEnabled || !account.executable))
             }
@@ -629,8 +643,8 @@ export function KnowledgePlanetAutomationPanel({
       ) : (
         <ul className="mt-3 flex flex-col gap-2">
           {view.rules.map((rule) => {
-            const toggling = busyKey === `toggle:${rule.id}`
-            const deleting = busyKey === `delete:${rule.id}`
+            const toggling = isBusy(`toggle:${rule.id}`)
+            const deleting = isBusy(`delete:${rule.id}`)
             const rowBusy = toggling || deleting
             return (
               <li key={rule.id}>
@@ -735,20 +749,20 @@ export function KnowledgePlanetAutomationPanel({
       <Modal
         open={consentOpen}
         onOpenChange={(open) => {
-          if (!open && busyKey !== 'control') closeConsent()
+          if (!open && !isBusy('control')) closeConsent()
         }}
         title="开启无人值守自动回复"
         description="这是独立于手动写入的高风险开关。开启后，AI 会在你离线时自动生成并发布回复，每条回复都会消耗你的模型额度。"
         footer={
           <>
-            <Button variant="ghost" size="sm" disabled={busyKey === 'control'} onClick={closeConsent}>
+            <Button variant="ghost" size="sm" disabled={isBusy('control')} onClick={closeConsent}>
               取消
             </Button>
             <Button
               variant="primary"
               size="sm"
               disabled={!consentChecked}
-              loading={busyKey === 'control'}
+              loading={isBusy('control')}
               onClick={() => void enableAutomation()}
             >
               同意并开启
@@ -801,7 +815,7 @@ export function KnowledgePlanetAutomationPanel({
       <Modal
         open={editing !== null}
         onOpenChange={(open) => {
-          if (!open && busyKey !== 'save') closeRuleForm()
+          if (!open && !isBusy('save')) closeRuleForm()
         }}
         title={editing === 'new' ? '批量添加自动回复规则' : '编辑自动回复规则'}
         description={
@@ -817,14 +831,14 @@ export function KnowledgePlanetAutomationPanel({
               </Alert>
             )}
             <div className="flex justify-end gap-2 max-sm:flex-col-reverse max-sm:[&>button]:w-full">
-              <Button variant="ghost" size="sm" disabled={busyKey === 'save'} onClick={closeRuleForm}>
+              <Button variant="ghost" size="sm" disabled={isBusy('save')} onClick={closeRuleForm}>
                 取消
               </Button>
               <Button
                 variant="primary"
                 size="sm"
                 disabled={editing === 'new' && selectedGroupIds.length === 0}
-                loading={busyKey === 'save'}
+                loading={isBusy('save')}
                 onClick={() => void saveRule()}
               >
                 {editing === 'new' ? `保存并启用 ${selectedGroupIds.length} 条规则` : '保存规则'}
