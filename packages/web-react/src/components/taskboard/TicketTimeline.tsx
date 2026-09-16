@@ -132,7 +132,8 @@ function SystemRun({
         // 快照哈希 / 上下文版本是排障用的技术细节,折叠起来,不再在时间线正文里裸露
         // 「快照 a3f9c1d2e4b5 · 启动 v2。仅审计、不可逐字重放」(审计 T-14)。
         <details className="text-caption text-muted" data-testid="ticket-run-context">
-          <summary className="cursor-pointer select-none text-faint">
+          {/* 触屏 44px 命中(a11y-B taskboard#2):summary 原本只有 16px 行高;桌面不变。 */}
+          <summary className="cursor-pointer select-none text-faint [@media(hover:none)]:py-3.5">
             执行时的项目信息快照
           </summary>
           <p className="mt-1">
@@ -197,7 +198,7 @@ export function TicketTimeline({
       <section data-testid="ticket-system-activity" className="flex flex-col gap-2">
         <button
           type="button"
-          className="flex items-center gap-1.5 text-left text-meta font-medium text-muted"
+          className="flex items-center gap-1.5 text-left text-meta font-medium text-muted [@media(hover:none)]:min-h-11"
           data-testid="ticket-system-toggle"
           aria-expanded={systemOpen}
           onClick={() => setSystemOpen((v) => !v)}

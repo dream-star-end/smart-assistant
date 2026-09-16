@@ -13,7 +13,7 @@ import {
   Undo2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
 import { downloadPercent } from '../lib/chat/download'
 import { getCachedThumbnail } from '../lib/chat/imageBytes'
@@ -328,7 +328,12 @@ export function ImageAnnotationEditor({
   // 时画布尚未画上任何东西,必须用**满画布错误面板 + 重试**覆盖,永不留纯白画布(需求 §1)。
   const [loadError, setLoadError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
-  const [revision, setRevision] = useState(0)
+  // 只为在历史栈(ref)变化后触发重渲染,让撤销 / 重做按钮的 disabled 跟上;值本身不读。
+  const [, setRevision] = useState(0)
+  // 选区有无(media M-23):抬手 / 撤销重做 / 清空 / 换图时**就地**定下来,不再在每次 revision 变化后
+  // 对整张 mask getImageData 全量扫描(每一笔都扫一遍 1280px 级位图)。画笔落笔必有选区不扫;
+  // 矩形 / 套索可能零面积、擦除可能擦空,这三种抬手后扫一次;撤销 / 重做恢复快照后扫一次。
+  const [selectionPresent, setSelectionPresent] = useState(false)
   const [historyPending, setHistoryPending] = useState(false)
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 })
 
@@ -426,6 +431,8 @@ export function ImageAnnotationEditor({
           // camera image. The original stays as compressed bytes for upload.
           imageRef.current = displaySource
           render()
+          // 新 mask 是空白的(M-23)。
+          setSelectionPresent(false)
           setRevision((v) => v + 1)
         } finally {
           URL.revokeObjectURL(url)
@@ -448,6 +455,7 @@ export function ImageAnnotationEditor({
       }
       imageRef.current = null
       sourceBlobRef.current = null
+      setSelectionPresent(false)
     }
   }, [open, source, render, resolveSrc, reloadKey, cacheIdentity])
 
@@ -478,6 +486,8 @@ export function ImageAnnotationEditor({
       ctx.drawImage(bitmap, 0, 0)
       bitmap.close()
       render()
+      // 恢复的快照可能是空白(撤销到第一笔之前)也可能有笔画:扫一次定(M-23)。
+      setSelectionPresent(hasSelection(mask))
       setRevision((v) => v + 1)
     },
     [render],
@@ -522,6 +532,7 @@ export function ImageAnnotationEditor({
       redoRef.current = []
       ctx.clearRect(0, 0, mask.width, mask.height)
       render()
+      setSelectionPresent(false)
       setRevision((v) => v + 1)
     } finally {
       setHistoryPending(false)
@@ -649,6 +660,10 @@ export function ImageAnnotationEditor({
       event.currentTarget.releasePointerCapture(event.pointerId)
     } catch {}
     if (snapshot) {
+      // 选区有无在抬手时就地定(M-23):画笔 pointerDown 即落点,必有选区、不扫;
+      // 矩形 / 套索可能拖出零面积、擦除可能把选区擦空,这三种扫一次 mask。
+      const mask = maskRef.current
+      setSelectionPresent(tool === 'brush' ? true : !!mask && hasSelection(mask))
       const generation = generationRef.current
       setHistoryPending(true)
       void toBlob(snapshot)
@@ -664,10 +679,6 @@ export function ImageAnnotationEditor({
     }
   }
 
-  const selectionPresent = useMemo(() => {
-    void revision
-    return !!maskRef.current && hasSelection(maskRef.current)
-  }, [revision])
   const canSubmit = selectionPresent && prompt.trim().length > 0 && !submitting && !historyPending
 
   // 脏状态 = 有圈选或有描述。关闭时据此决定「确认弹层 or 直接退」(需求 §5 误触保护)。
@@ -789,7 +800,8 @@ export function ImageAnnotationEditor({
               title="关闭 (Esc)"
               // 走 requestClose:脏状态先弹确认,空白直接退(需求 §5)。
               onClick={requestClose}
-              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+              // 触屏补到 44px(a11y-B media#2);桌面 40px 圆钮不变。
+              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
             >
               <X size={20} />
             </button>

@@ -217,7 +217,8 @@ function ReqIdChip({ traceId }: { traceId: string }) {
           toast(COPY_FAILED_TOAST, "error");
         }
       }}
-      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-caption text-faint transition-colors hover:text-muted"
+      // 触屏 44px 命中(a11y-B messages#2);桌面维持 20px 胶囊。
+      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-caption text-faint transition-colors hover:text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
     >
       {copied ? <Check size={11} /> : null}
       {copied ? "已复制" : `#${traceId.slice(0, 8)}`}
@@ -840,7 +841,7 @@ export function AssistantCard({
               </p>
               {presentedError.detail && (
                 <details className="mt-1.5 max-w-full">
-                  <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg">
+                  <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg [@media(hover:none)]:py-3.5">
                     查看请求信息
                   </summary>
                   <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">

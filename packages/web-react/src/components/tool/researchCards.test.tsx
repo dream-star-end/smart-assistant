@@ -358,6 +358,8 @@ describe("其余 oc-* 卡片", () => {
       expect(container.querySelector('a[data-product-feature="artifacts-download"]')).not.toBeNull(),
     );
     expect(screen.getByText("预览")).toBeInTheDocument();
+    // a11y-B tools#1:「预览」链接桌面 26px 高,hover:none 下要撑到 44px 命中(ui-preview 无该卡场景,类名即契约)。
+    expect(screen.getByText("预览").closest("a")?.className).toContain("[@media(hover:none)]:min-h-11");
   });
 
   test("oc-xlsx 相对路径 → 退回提示文案(无任何可点链接)", () => {
@@ -726,7 +728,10 @@ describe("4 个新专属卡", () => {
       </div>,
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
-    expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+    const urlChip = container.querySelector('a[href="https://example.com"]');
+    expect(urlChip).not.toBeNull();
+    // a11y-B tools#1:Chip 链接桌面 20px 高,hover:none 下要撑到 44px 命中(ui-preview 无该卡场景,类名即契约)。
+    expect(urlChip?.className).toContain("[@media(hover:none)]:min-h-11");
     // open 不展示原始 a11y dump。
     expect(container.textContent).not.toContain("huge a11y tree");
   });

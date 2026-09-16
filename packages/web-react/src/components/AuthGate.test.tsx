@@ -23,8 +23,8 @@ afterEach(() => {
 const base = { theme: "light" as const, onCycleTheme: () => {} };
 
 function fill() {
-  fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
-  fireEvent.change(screen.getByPlaceholderText("密码"), { target: { value: "password123" } });
+  fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
+  fireEvent.change(screen.getByLabelText("密码"), { target: { value: "password123" } });
 }
 
 describe("AuthGate — Turnstile gating", () => {
@@ -262,7 +262,7 @@ describe("AuthGate — 注册", () => {
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
 
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
       target: { value: "password123" },
@@ -291,7 +291,7 @@ describe("AuthGate — 注册", () => {
     const onRegister = vi.fn();
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
       target: { value: "password123" },
@@ -314,7 +314,7 @@ describe("AuthGate — 注册", () => {
     const onRegister = vi.fn();
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "different9" } });
     fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
@@ -404,7 +404,7 @@ describe("AuthGate — 协议弹窗", () => {
 describe("AuthGate — 错误文案本地化", () => {
   function fillRegister() {
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
     fireEvent.click(screen.getByRole("checkbox"));
@@ -487,7 +487,7 @@ describe("AuthGate — 邮箱验证", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
     fireEvent.click(screen.getByRole("checkbox"));
@@ -603,7 +603,7 @@ describe("AuthGate — 重置密码", () => {
 describe("AuthGate — 密码框显示 / 隐藏(L-09)", () => {
   test("登录页:切换显示不清空已输入内容,可及名随状态切换", () => {
     render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
-    const pw = screen.getByPlaceholderText("密码");
+    const pw = screen.getByLabelText("密码");
     fireEvent.change(pw, { target: { value: "s3cret-pass" } });
     expect(pw).toHaveAttribute("type", "password");
 
@@ -663,6 +663,24 @@ describe("AuthGate — 文案与占位(L-05 / L-12 / L-13)", () => {
     expect(screen.getByText("多模型协作 · 长任务不中断 · 成果直接可用")).toBeInTheDocument();
     expect(document.body.textContent).not.toContain("流式对话");
     expect(document.body.textContent).not.toContain("持久会话");
+  });
+
+  // L-11(a11y-B 接 QA t-1038 移交):占位符不再复读标签——邮箱给示例格式,密码不放占位符;可及名仍由标签 / aria-label 提供。
+  test("登录 / 注册页邮箱占位符是示例格式而不是「邮箱」,密码框没有与标签同词的占位符", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    expect(screen.getByLabelText("邮箱")).toHaveAttribute("placeholder", "name@example.com");
+    expect(screen.getByLabelText("密码")).not.toHaveAttribute("placeholder");
+    expect(screen.queryByPlaceholderText("邮箱")).toBeNull();
+    expect(screen.queryByPlaceholderText("密码")).toBeNull();
+    cleanup();
+
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onRegister={vi.fn()} initialMode="register" turnstileBypass={true} />,
+    );
+    expect(screen.getByLabelText("邮箱")).toHaveAttribute("placeholder", "name@example.com");
+    expect(screen.queryByPlaceholderText("邮箱")).toBeNull();
+    // 注册页密码占位符是规则提示(「至少 N 位」),不是标签复读,保留。
+    expect(screen.getByLabelText("密码")).toHaveAttribute("placeholder", expect.stringMatching(/^至少 \d+ 位$/));
   });
 });
 

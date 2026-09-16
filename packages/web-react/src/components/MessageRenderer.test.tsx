@@ -3422,4 +3422,70 @@ describe("MessageList 会话内查找", () => {
     expect(scrollIntoView).not.toHaveBeenCalled();
     scroller.remove();
   });
+
+  test("关闭查找条后焦点归还到打开前的元素，而不是掉到 body（a11y-B messages#1）", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    // 模拟顶栏「会话内查找」入口：打开查找条前焦点停在它上面。
+    const opener = document.createElement("button");
+    opener.textContent = "会话内查找";
+    document.body.appendChild(opener);
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+    const followBottomRef = {
+      current: true,
+      correctTo: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const baseProps = {
+      messages: [mk("user", { id: "find-focus-u1", text: "苹果派", status: "sent" as const })],
+      sending: false,
+      cb: {},
+      onRespondPermission: () => {},
+      scrollParent: scroller,
+      followBottomRef,
+    };
+    const { rerender } = render(<MessageList {...baseProps} />, { container: scroller });
+    // 打开查找条：Input 的 autoFocus 在提交阶段抢走焦点。
+    rerender(<MessageList {...baseProps} find={{ onClose: vi.fn() }} />);
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "在会话中查找" }));
+    // Esc / 点关闭钮后 App 把 find 置空：Input 卸载，焦点应回到入口。
+    rerender(<MessageList {...baseProps} />);
+    expect(screen.queryByRole("textbox", { name: "在会话中查找" })).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+    scroller.remove();
+  });
+
+  test("关闭查找条时焦点已被别处接管则不抢回（a11y-B messages#1）", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    const elsewhere = document.createElement("button");
+    document.body.appendChild(elsewhere);
+    opener.focus();
+    const followBottomRef = {
+      current: true,
+      correctTo: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const baseProps = {
+      messages: [mk("user", { id: "find-focus-u2", text: "苹果派", status: "sent" as const })],
+      sending: false,
+      cb: {},
+      onRespondPermission: () => {},
+      scrollParent: scroller,
+      followBottomRef,
+    };
+    const { rerender } = render(<MessageList {...baseProps} />, { container: scroller });
+    rerender(<MessageList {...baseProps} find={{ onClose: vi.fn() }} />);
+    // 用户用鼠标点到了别的控件再关闭查找条：焦点合法地在别处，不应被拽回入口。
+    elsewhere.focus();
+    rerender(<MessageList {...baseProps} />);
+    expect(document.activeElement).toBe(elsewhere);
+    elsewhere.remove();
+    opener.remove();
+    scroller.remove();
+  });
 });

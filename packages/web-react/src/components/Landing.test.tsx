@@ -110,8 +110,15 @@ describe('从简 Landing', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '打开导航' }))
     expect(document.getElementById('landing-mobile-nav')).not.toBeNull()
+    // a11y-B landing#1:焦点停在菜单链接上按 Esc,<nav> 卸载后焦点要回到菜单按钮,不能掉到 body。
+    const firstLink = document.getElementById('landing-mobile-nav')?.querySelector('a')
+    firstLink?.focus()
+    expect(document.activeElement).toBe(firstLink)
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(document.getElementById('landing-mobile-nav')).toBeNull()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: '打开导航' }))
+    // 折叠态 aria-controls 不能指向未渲染的节点(悬空引用),同 manage#2 写法。
+    expect(screen.getByRole('button', { name: '打开导航' })).not.toHaveAttribute('aria-controls')
   })
 
   test('桌面导航与折叠菜单指向同一组锚点', () => {

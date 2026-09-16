@@ -443,7 +443,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 工作区标志(新建会话按钮)直接出现,全程没有点过任何登录 UI。
     // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
-    expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('邮箱')).not.toBeInTheDocument()
     // refresh 走了 cookie(credentials include)。
     const refreshCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/auth/refresh'))
     expect(refreshCall).toBeTruthy()
@@ -475,7 +475,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByRole('button', { name: '登录' })).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0), { timeout: 4_000 })
     expect(refreshCalls).toBe(2)
-    expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('邮箱')).not.toBeInTheDocument()
   })
 
   test('boot repeated transient failures surface a manual recovery action instead of false logout', async () => {
