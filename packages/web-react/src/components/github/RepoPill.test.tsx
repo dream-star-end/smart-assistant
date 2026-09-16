@@ -34,5 +34,13 @@ describe("RepoPill", () => {
     expect(btn).toHaveAttribute("title", "dream-star-end/smart-assistant @ main");
     expect(btn).toHaveTextContent("smart-assistant");
     expect(screen.queryByText("关联 GitHub 仓库")).toBeNull();
+    // owner / 分支段此前 opacity-70/80 压暗：accent 文字落在 accent-soft 底上浅色只剩 2.70:1
+    //（t-762 sidebar#1）。现在用 text-muted 实色分层，不再有任何 opacity-*。
+    const owner = screen.getByText("dream-star-end/");
+    expect(owner).toHaveClass("text-muted");
+    expect(owner.className).not.toMatch(/opacity-/);
+    const branch = screen.getByText("main");
+    expect(branch).toHaveClass("text-muted");
+    expect(branch.className).not.toMatch(/opacity-/);
   });
 });
