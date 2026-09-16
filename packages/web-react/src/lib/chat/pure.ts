@@ -574,19 +574,24 @@ export type InsufficientCreditsCopy = {
   intent: SubscribeIntent;
 };
 
-/** 耗尽文案分层：免费用户引导开通 Lite ¥38，付费用户引导加量包。 */
+/**
+ * 耗尽文案分层：免费用户引导开通订阅（任意一档都够，CTA 落在最低档 Lite），付费用户引导加量包。
+ * 价格 / 积分数**不写进文案**：套餐真值在后端（listSubscriptionPlans），这里是模块级常量、拿不到
+ * 真值，手抄「¥38/月、4000 积分」改价即漂移（settings 审计 SET-15）；口径与
+ * lib/cursorModelPicker 的 lockedModelUnlockNotice「开通任意订阅套餐即可解锁」一致。标点全角。
+ */
 export function insufficientCreditsCopy(paid: boolean): InsufficientCreditsCopy {
   if (paid) {
     return {
       title: "本期积分已用完",
-      message: "本期积分已用完,可购买加量包或升级套餐",
+      message: "本期积分已用完，可购买加量包或升级套餐",
       cta: "购买加量包",
       intent: "pack",
     };
   }
   return {
     title: "免费额度已用完",
-    message: "免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续",
+    message: "免费额度已用完，开通任意订阅套餐（Lite 及以上任一档）即可继续",
     cta: "开通 Lite",
     intent: "lite",
   };

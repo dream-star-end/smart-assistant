@@ -158,7 +158,7 @@ describe("AccountTab 耗尽红条分层", () => {
       />,
     );
     expect(
-      await screen.findByText("免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续"),
+      await screen.findByText("免费额度已用完，开通任意订阅套餐（Lite 及以上任一档）即可继续"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开通 Lite" })).toBeInTheDocument();
     // 红卡已给出主 CTA，套餐行不再重复挂一个开同一弹层的按钮（审计 SET-14）
@@ -176,7 +176,7 @@ describe("AccountTab 耗尽红条分层", () => {
         reloadKey={0}
       />,
     );
-    expect(await screen.findByText("本期积分已用完,可购买加量包或升级套餐")).toBeInTheDocument();
+    expect(await screen.findByText("本期积分已用完，可购买加量包或升级套餐")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "购买加量包" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "升级套餐" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "套餐与加量包" })).not.toBeInTheDocument();
