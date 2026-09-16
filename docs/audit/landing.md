@@ -329,7 +329,7 @@ node browser-tests\ui-preview\shoot.mjs
 
 | 项 | 归属 | 说明 |
 |---|---|---|
-| L-11 登录页占位符 = 标签 | shell（`App.test.tsx`） | 见上表；改法已备好（邮箱示例 `name@example.com`、密码留空），等查询方式解耦 |
+| L-11 登录页占位符 = 标签 | shell（`App.test.tsx`） | 见上表；改法已备好（邮箱示例 `name@example.com`、密码留空），等查询方式解耦。**QA 复核（t-1038，09-17）：阻塞已解除** —— 集成② 已把 `App.test.tsx` 的登录控件查询全部改为 `getByLabelText`，只剩 :446/:478 两条「登录表单已消失」的否定断言仍按占位符查；改法与用例清单已移交正持有 `AuthGate.tsx` 写锁的 t-895 a11y-B 顺手做，详见 `docs/audit/qa/QA-b-p3.md` §1 |
 | L-16 ② 设备上限「去设置解绑」 | 产品 / 桌面端 | 网页端缺设备管理页；若后续在设置中心补「本地模式设备」分区，这里加一枚 `action` 即可 |
 | X-01 法务页主题接线 | shell | 已由 `LegalPage` 自接，`main.tsx` 不必再动；如 shell 希望入口层统一挂 `.dark`，两者可并存 |
 | X-02 `--grad-cta-fg` token | shell | 本模块用 `text-primary-fg` 兜住；补 token 后三处各换一个类名 |
