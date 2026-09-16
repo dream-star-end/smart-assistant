@@ -215,3 +215,16 @@
 ### 9.2 模块 vitest 明细
 
 见 `.audit-tmp\messages\vitest-module.log`；关键新增用例：`cards.test.tsx` +14（M-01/03/07/08/09/10/17/18/20）、`turnActivity.test.tsx` +3（M-04）、`MarkdownImpl.test.tsx` +6（M-02/06）、`MessageRenderer.test.tsx` +3（M-01/05）、`AgentGroupCard.test.tsx` 新建 2（M-07/10）、`tokenUsage.test.ts` +1、`RichBlocks.test.tsx` +2、`historySkeleton.test.tsx` +1、`Markdown.test.tsx` +1、`CodeBlock.test.tsx` +1、`speechLang.test.ts` 新建（M-17/19）。
+
+## 10. 二期评估（t-629 · 09-16 · fable-5-1-35）
+
+二期的任务是把 §8.3 的遗留里「本模块归属内可独立完成、不依赖后端 / shell」的项落地，并评估 composer 移交的「排队中」气泡。逐条复核结论：**三条遗留没有一条满足「可独立完成」**，composer 的请求**既有代码已满足且有用例**——本轮不改代码，只登记结论，避免为了「有改动」去碰有滚动篱笆 / 状态机 / 持久层回归风险的路径。
+
+| 项 | 二期处置 | 依据 |
+|---|---|---|
+| M-21 生成中查找不能跳转 | **保持遗留（需独立设计）** | 「跳转但不 pin」要重新约定 `jumpTo` / stick-to-bottom / wheelFence 三方谁拥有 scrollTop，T63/T66 守着现有篱笆；任一取舍都会改变生成中的跟随行为，不是审计轮里「最小改动、可回退」能覆盖的，需要一条独立的滚动交互设计 + 新真浏览器用例 |
+| M-24 `_liveStreamBroken` 无 UI 消费方 | **保持遗留（状态机小改 + 428KB `chat.test.ts` 回归）** | §8.3 复核已把范围缩到 `outbound.resume_failed → forceSync` 的 REST 全量同步窗口；修法（`forceSync` 入口置 `waiting-service`、成功置 `resumed`、绕开 `stopping`）明确，但落在 `socket.ts` / `useChatSocket.ts` 状态机上，须跑全部 chat 单测 + T29/T46 复跑，二期 150 分钟预算里不适合作为顺手项；建议随下一轮 lib/chat 专项一起做 |
+| M-25 多标签旧快照覆写 IDB | **保持遗留（本轮无法复现）** | d-24 全部本地做，ui-preview / browser-tests 无 WS 后端，两标签同会话的真实交互无法复现；不复现不动持久层 |
+| composer 移交：「排队发送」后消息列表要有「排队中」气泡 | **已满足，无需改动** | `lib/chat/socket.ts` `dispatchPayload()` 对进入离线 / 忙碌队列的用户消息置 `userMsg.status = "queued"`（`:5148`；`tryEnqueueOffline` 路径 `:3768` 同款），`UserCard` 的 `USER_STATUS_LABEL.queued = "排队中"` 渲染为状态标签且排队中不出动作行（`cards.tsx:439,522`）。用例：`cards.test.tsx:274-275`（`status: "queued"` → 「排队中」）；`lib/chat/chat.test.ts` 内 `"queued"` 状态断言 12 处、`deferredPayloadQueue.test.ts` / `durableTurnDispatch.test.ts` 各覆盖入队路径。composer 侧的「排队发送」按钮走同一 `submit()` → `sendMessage` → `dispatchPayload`，气泡自然出现 |
+
+验证（本节只读复核，未改代码）：`git status` 干净（仅 cli / mcp-memory 两个 autocrlf 假 M）；上述行号以分支 HEAD `d2f84063d` 为准。二期新增改动 0，遗留仍为 3（M-21 / M-24 / M-25），建议归档时按「需独立设计 / 需状态机专项 / 需真后端复现」三类登记。
