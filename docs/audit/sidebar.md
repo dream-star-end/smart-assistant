@@ -278,3 +278,50 @@ node browser-tests\ui-preview\shoot.mjs
 | `npm run test:browser` · `node --test` 阶段 | 73 条：70 pass / 3 fail，**3 条在基线 `210b9967`（wt/media）上同样失败**，与本分支无关：① `cc-switch-ascii-name`（2 子测试：等待超时 + 期望 `gemini-3.8-flash` 实得 `sonnet-5`，settings 归属）；② `ocv5-185-qa`：Windows 下 `symlink packages/protocol → node_modules/@openclaude/protocol` EPERM（未开发者模式），环境限制。日志：`.audit-tmp\sidebar\after\test-browser.log`、`test-browser-2.log`。 |
 | after 截图 | `D:\code\test_project\test123\.audit-tmp\sidebar\after\`：同一组 12 场景 × 2 主题 = 34 张 + `manifest.json` + `shoot-after.log`，`failures=[] unmockedApi=[]`。逐张对照要点：`sidebar-empty`（S-13 引导块替代三处 0 计数骨架）、`sidebar-project-settings` 明暗两版（PS-02 下拉与输入框同构、PS-04/05/06）、`sidebar-multiselect`（SR-04 复选框在状态点左侧、BB-01 两行批量条、BB-02 删除红色）、`sidebar-overview`（SR-04 缩进、PR-01 运行 pill、S-09 底栏 `余额 123.4万`）、`sidebar-narrow-min`（220px 批量条不再折 3 行）、`sidebar-mobile-drawer`（S-04「+」不再溢出）、`sidebar-inbox`（IB-01 无 `<!-- ob:` 残留、IB-03 未读数）、`sidebar-github-linked--desktop`（GH-01 超长仓库名省略号、分支 ✓ 可见）、`sidebar-repo-banner--mobile`（RB-01 两行）。 |
 | 未跑 | 拖拽（会话拖入项目 / 项目排序）与键盘调宽仍未做真浏览器交互验证（NOT RUN）：ui-preview 只出静态截图，`run.mjs` 无对应用例；两者由 vitest 用例覆盖（S-03 回滚、UCP-01 串行、S-05 键盘）。 |
+
+---
+
+## 8. 二期 · 遗留 P3 收尾（t-627 · fable-5-1-38 · 2026-09-16）
+
+> 指挥官口径：需产品拍板的项按「最小改动、可回退、不改既有交互约定」自行定并写明理由；App.tsx 接线已登记给集成②，不重复。
+> 分支 `feat/v5-selfhost-audit-sidebar`，接 `ef872e91a` 之后：`297ad8c94`（代码）+ 本文档一条 docs 提交。
+
+### 8.1 §6.2 遗留表逐条处置
+
+| 项 | 归属 | 处置 | 说明 |
+|---|---|---|---|
+| S-14「多模型 · 计量计费」副标题 | sidebar ✅ **已修** | `Sidebar.tsx` 底栏账号 chip 与账号菜单头部：`credits != null` 仍显余额（底栏万/亿缩写、菜单完整数字，行为不变）；无余额时**有邮箱显邮箱、没有就不渲染这一行**，不再写死营销文案 | 自行拍板理由：① 商业化文案出现在个人版 / 自托管 / demo / 未登录四种不计费形态里是审计确认的问题，而「显示余额」这条既有约定一字未动；② 邮箱是账号区本就该有的身份信息，无新增能力开关判断、无新接口；③ 一处文案的替换，可回退。用例：`Sidebar.test.tsx`「S-14 无余额时的账号副标题」3 条（有余额 / 无余额有邮箱 / 无余额无邮箱与未登录 / 账号菜单同规则）。`data-product-feature=billing` 照旧 |
+| S-05 键盘调宽 App 未接 | shell（App.tsx） | ⏸ 保持遗留 | `sidebarProps` 需加 `onResizeKeyDown: sidebarWidth.onResizeKeyDown` 一行；已登记给集成②，本轮不重复 |
+| S-06 抽屉关闭按钮读屏名 App 未接 | shell（App.tsx） | ⏸ 保持遗留 | 移动端 `Sheet` 内联侧栏传 `collapseLabel="关闭导航"`；已登记给集成② |
+| UUS-01 通知落点 App 未接 | shell（App.tsx） | ⏸ 保持遗留 | `useUnreadSessions({ …, onNotificationOpen: selectSession })`；已登记给集成②。未接线时点通知只聚焦窗口，功能不退化 |
+| ST-01 `useChatSocket.ts:524` 「新会话」 | messages（`hooks/useChatSocket.ts`） | ⏸ 保持遗留 | 一行改「新对话」（可直接引用 `lib/sessionTitle.ts` 导出的 `EMPTY_SESSION_TITLE`），归 messages-B / 集成时同步 |
+| `browser-tests/run.mjs` T41 断言 | 共享文件 | ✅ 无需再动 | 已随 `bc3cef1c0` 合入 integration，本轮复跑 T41 ok |
+
+### 8.2 顺手承接（原登记给集成②，本轮已做，集成②不必重复）
+
+| 项 | 改动 | 用例 |
+|---|---|---|
+| `components/github/RepoPill.tsx` 未绑定态文案不可收缩 | `<span className="whitespace-nowrap">关联 GitHub 仓库</span>` → `min-w-0 truncate`，完整文案仍在按钮 `title`。来源：composer 审计 `docs/audit/composer.md` §9（390px 生成中工具行被 pill 撑爆，composer 侧已按视口分流规避；pill 可收缩后 composer 可把 `<sm` 的 pill 并回工具行） | 新增 `github/RepoPill.test.tsx` 2 条（未绑定 class/title/onClick；已绑定 owner/repo 与 aria-label/title） |
+
+### 8.3 §5 暂缓项复核（sidebar 归属内是否还有可独立落地的）
+
+| 项 | 结论 |
+|---|---|
+| `startLink` 直接 `window.location.href` 跳 OAuth | 保持暂缓：改 popup 涉及后端回调地址与 `authBroadcast`（landing 归属），不是本模块可独立完成 |
+| `useSidebarWidth` 按设备持久化 / 触屏禁用拖拽 / `useDelayedConnBanner` / `useProjectScope` / 会话行不显示 `lastMessagePreview` | 均为有意设计或有单测锁定的产品决策，不改 |
+| `InboxDialog.fmtRelativeTime` 与 `ui/TimeAgo` 重复 | 用户可感知结果正确（今天 / 昨天 HH:mm 语义不同），§5-7 口径不处理 |
+| UCP-01 批量排序接口 / GH-03 结构化 scopes | 需后端配合；前端保守方案已在阶段 B 落地（串行写 + 只写变更项；scope 可读映射） |
+
+**统计**：§6.2 遗留 6 条 → sidebar 归属内可独立完成 1 条（S-14）**已修 1/1（100%）**；跨模块 4 条（S-05 / S-06 / UUS-01 → shell，ST-01 → messages）保持遗留并写明接线；1 条（run.mjs）已随合入闭环。另顺手完成集成②登记项 1 条（RepoPill 截断）。
+
+### 8.4 验证（二期）
+
+均在 `d:\code\test_project\test123\wt\sidebar`，代码 HEAD `297ad8c94`。
+
+| 门 | 结果 |
+|---|---|
+| `npm run typecheck --workspace packages/web-react` | 绿 |
+| 模块 vitest（`Sidebar` / `components/sidebar` / `ProjectSettingsDialog` / `ProjectAssetsPanel` / `InboxDialog` / `SessionStatusDot` / `components/github` / `useSessionList` / `useChatProjects` / `useSidebarWidth` / `useUnreadSessions` / `useRepoBinding` / `useProjectAssets` / `useProjectScope` / `sessionTitle` / `github` / `projectScope` / `sessionStatus` / `inboxLevels` / `sidebarCollapsed`，`--maxWorkers=1`） | 绿：**22 files / 290 tests**（阶段 B 17 files / 252 → 新增 `RepoPill.test.tsx` + S-14 用例） |
+| `npx biome lint`（`Sidebar.tsx` `Sidebar.test.tsx` `RepoPill.tsx` `RepoPill.test.tsx`） | 新增代码 0 告警；`Sidebar.test.tsx:938` `noDelete` 为阶段 B 前既有，未动 |
+| `npm run test:browser` | `run.mjs` **T1–T67 共 67 条全部 ok**（含侧栏 T41 密度 / T25 移动整页）；`node --test` 73 条 70 pass / 3 fail，3 条与阶段 B 记录相同、与本模块无关且基线既有（`cc-switch-ascii-name` ×2 settings 归属；`OCV5-185` Windows symlink EPERM）。日志 `.audit-tmp\sidebar\after-2\test-browser.log` |
+| after-2 截图 | `D:\code\test_project\test123\.audit-tmp\sidebar\after-2\`：同一组 12 场景 × 2 主题 = 34 张 + `manifest.json`，`failures=[] unmockedApi=[]`。对照要点：`sidebar-empty--desktop`（S-14：底栏账号「审计预览」下不再有「多模型 · 计量计费」，场景用户无邮箱故只剩一行）；`sidebar-overview`（有余额时底栏仍「余额 123.4万 积分」，无变化）；`sidebar-repo-banner--mobile`（RepoPill 4 态视觉无变化，未绑定 pill 在充足空间下完整显示） |

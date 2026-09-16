@@ -1587,6 +1587,41 @@ describe("Sidebar S-09 底栏最窄宽度", () => {
   });
 });
 
+// S-14：无余额时副标题写死「多模型 · 计量计费」——个人版 / 自托管 / demo 里出现商业化营销文案。
+describe("Sidebar S-14 无余额时的账号副标题", () => {
+  it("有余额仍显示余额；无余额有邮箱显示邮箱，且不再出现「计量计费」", () => {
+    const { unmount } = renderSidebar({ credits: "1234567" });
+    expect(screen.getByText(/^余额 /)).toBeInTheDocument();
+    expect(screen.queryByText(/计量计费/)).toBeNull();
+    unmount();
+    renderSidebar({ credits: null, user: { ...user, email: "me@example.com" } });
+    expect(screen.getByText("me@example.com")).toHaveAttribute("title", "me@example.com");
+    expect(screen.queryByText(/计量计费/)).toBeNull();
+    expect(screen.queryByText(/^余额 /)).toBeNull();
+  });
+
+  it("无余额也无邮箱 / 未登录时不渲染副标题行", () => {
+    const { unmount } = renderSidebar({ credits: null, user: { ...user, email: undefined } });
+    expect(screen.queryByText(/计量计费/)).toBeNull();
+    const chip = screen.getByText("测试用户").parentElement as HTMLElement;
+    expect(chip.querySelectorAll("span.text-caption")).toHaveLength(0);
+    unmount();
+    renderSidebar({ credits: undefined, user: null });
+    expect(screen.getByText("未登录")).toBeInTheDocument();
+    expect(screen.queryByText(/计量计费/)).toBeNull();
+  });
+
+  it("账号菜单头部同一规则：无余额显示邮箱", async () => {
+    renderSidebar({ credits: null, user: { ...user, email: "me@example.com" }, onLogout: () => {} });
+    const trigger = screen.getByRole("button", { name: "账号菜单" });
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" });
+    fireEvent.click(trigger);
+    await screen.findByRole("menu");
+    expect(screen.getAllByText("me@example.com").length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText(/计量计费/)).toBeNull();
+  });
+});
+
 describe("Sidebar S-02 归档展开态晚到恢复", () => {
   it("user 晚于侧栏到位时，持久化的展开态仍触发 onLoadArchived", () => {
     localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");

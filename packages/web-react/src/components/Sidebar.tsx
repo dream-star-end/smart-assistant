@@ -537,6 +537,10 @@ export function Sidebar({
   // 万 / 亿 缩写（formatCompactCount），精确值放 title 悬浮；账号菜单里空间充足仍显完整数字。
   const footerCompact = typeof width === "number" && width < FOOTER_COMPACT_WIDTH;
   const creditsExact = credits != null ? `${formatCredits(credits)} 积分` : null;
+  // 无余额（个人版 / 自托管未接计费、demo、未登录）时副标题此前写死「多模型 · 计量计费」——
+  // 商业化营销文案出现在不计费的部署形态里（S-14）。改为有邮箱显邮箱、没有就不占这一行；
+  // 最小改动、可回退、不引入新的能力开关判断，计费形态下仍显示余额。
+  const accountSubtitle = credits != null ? null : user?.email?.trim() || null;
   const userChip = (
     <button
       type="button"
@@ -552,12 +556,18 @@ export function Sidebar({
         <span className="block truncate text-section font-medium text-fg">
           {user?.displayName || "未登录"}
         </span>
-        <span
-          className="block truncate text-caption text-faint"
-          title={creditsExact ? `余额 ${creditsExact}` : undefined}
-        >
-          {credits != null ? `余额 ${formatCompactCount(credits)} 积分` : "多模型 · 计量计费"}
-        </span>
+        {credits != null ? (
+          <span
+            className="block truncate text-caption text-faint"
+            title={creditsExact ? `余额 ${creditsExact}` : undefined}
+          >
+            {`余额 ${formatCompactCount(credits)} 积分`}
+          </span>
+        ) : accountSubtitle ? (
+          <span className="block truncate text-caption text-faint" title={accountSubtitle}>
+            {accountSubtitle}
+          </span>
+        ) : null}
       </span>
     </button>
   );
@@ -1029,9 +1039,11 @@ export function Sidebar({
                   <p className="truncate text-section font-medium text-fg">
                     {user?.displayName || "未登录"}
                   </p>
-                  <p className="truncate text-caption text-faint">
-                    {credits != null ? `${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
-                  </p>
+                  {credits != null ? (
+                    <p className="truncate text-caption text-faint">{`${formatCredits(credits)} 积分`}</p>
+                  ) : accountSubtitle ? (
+                    <p className="truncate text-caption text-faint">{accountSubtitle}</p>
+                  ) : null}
                 </div>
               </div>
               <DropdownMenuSeparator />
