@@ -644,7 +644,7 @@ body {
   display: flex; min-height: 28px; max-width: calc(100% - 24px); transform: translateX(-50%);
   align-items: center; gap: 7px; white-space: nowrap; padding: 0 10px;
   border: 1px solid var(--preview-border); border-radius: 999px; background: rgba(12, 12, 17, 0.72);
-  color: var(--preview-muted); font-size: 10px; box-shadow: 0 5px 18px rgba(0, 0, 0, 0.16);
+  color: var(--preview-muted); font-size: var(--text-caption); box-shadow: 0 5px 18px rgba(0, 0, 0, 0.16);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
 .preview-loading-state {
@@ -655,7 +655,7 @@ body {
   border-radius: 999px; background: var(--preview-accent-soft); color: var(--preview-accent);
 }
 .preview-state-title { color: var(--preview-muted); font-size: 13px; font-weight: 600; }
-.preview-state-copy { max-width: 320px; color: var(--preview-faint); font-size: 11px; line-height: 1.55; }
+.preview-state-copy { max-width: 320px; color: var(--preview-faint); font-size: var(--text-caption); line-height: 1.55; }
 .preview-error-state {
   display: flex; align-items: center; justify-content: center; overflow-y: auto; padding: 8px;
   background: transparent; text-align: center;
@@ -667,10 +667,13 @@ body {
 }
 .preview-error-title { margin-top: 10px; color: var(--preview-fg); font-size: 15px; font-weight: 650; line-height: 1.35; }
 .preview-error-copy { max-width: 300px; margin: 5px auto 0; color: var(--preview-muted); font-size: 12px; line-height: 1.55; }
-.preview-error-details { max-width: 320px; margin: 7px auto 0; color: var(--preview-faint); font-size: 11px; text-align: left; }
+/* 容器预览字号收编到全站字阶(media 审计 M-19 / M-27,X-M2):状态胶囊 10px → caption,
+   工具坞标签 / 提示条 / 次级按钮 / 错误详情的手抄 11px → caption token;「诊断详情」summary
+   升到 meta(12px)且命中高 44px(与 ContainerWebPreview 元素级 text-meta + minHeight 44 同源)。 */
+.preview-error-details { max-width: 320px; margin: 7px auto 0; color: var(--preview-faint); font-size: var(--text-caption); text-align: left; }
 .preview-error-details summary {
-  display: flex; min-height: 32px; align-items: center; justify-content: center; list-style-position: inside;
-  color: var(--preview-faint); text-align: center; transition: color 150ms var(--ease-standard);
+  display: flex; min-height: 44px; align-items: center; justify-content: center; list-style-position: inside;
+  color: var(--preview-faint); font-size: var(--text-meta); text-align: center; transition: color 150ms var(--ease-standard);
 }
 .preview-error-details summary:hover { color: var(--preview-muted); }
 .preview-error-detail-body {
@@ -715,7 +718,7 @@ body {
 .preview-action-dock { display: flex; align-items: flex-start; gap: clamp(14px, 4vw, 28px); }
 .preview-action-button {
   display: flex; width: 64px; min-height: 68px; flex-direction: column; align-items: center; justify-content: center;
-  gap: 6px; border-radius: 16px; color: var(--preview-muted); font-size: 11px; font-weight: 600;
+  gap: 6px; border-radius: 16px; color: var(--preview-muted); font-size: var(--text-caption); font-weight: 600;
   transition: color 150ms var(--ease-standard), transform 150ms var(--ease-standard);
 }
 .preview-action-button:hover:not(:disabled) { color: var(--preview-fg); }
@@ -752,13 +755,13 @@ body {
 .preview-composer-submit:disabled { cursor: not-allowed; opacity: 0.28; }
 .preview-comment-hint {
   display: flex; min-height: 44px; max-width: min(760px, 100%); align-items: center; justify-content: center; gap: 8px;
-  border-radius: 999px; padding: 4px 15px; color: var(--preview-muted); font-size: 11px; text-align: center;
+  border-radius: 999px; padding: 4px 15px; color: var(--preview-muted); font-size: var(--text-caption); text-align: center;
 }
 .preview-comment-hint button { min-height: 44px; padding: 0 4px; color: var(--preview-accent); font-weight: 700; }
 .preview-comment-editor { width: min(720px, 100%); border-radius: 22px; padding: 14px; }
 .preview-secondary-button {
   display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px;
-  border-radius: 12px; padding: 0 11px; color: var(--preview-muted); font-size: 11px; font-weight: 650;
+  border-radius: 12px; padding: 0 11px; color: var(--preview-muted); font-size: var(--text-caption); font-weight: 650;
 }
 .preview-secondary-button:hover { background: var(--preview-hover); color: var(--preview-fg); }
 .preview-destructive-button { color: #fecaca; }
