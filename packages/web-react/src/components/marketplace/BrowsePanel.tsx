@@ -623,16 +623,17 @@ export function BrowsePanel({
         </div>
       )}
 
-      {/* 分类筛选片:仅浏览态且有分区时渲染,一行可横向滚动(移动端不换行)。
-          右缘渐隐替代改造前那行「左右滑动查看更多分类」的常驻小字 —— 可滚动这件事
-          应该由视觉暗示,而不是占一行去讲。 */}
+      {/* 分类筛选片:仅浏览态且有分区时渲染。移动端一行横向滚动(不换行),右缘渐隐替代
+          改造前那行「左右滑动查看更多分类」的常驻小字 —— 可滚动这件事应该由视觉暗示,而不是
+          占一行去讲。桌面端(sm 起)有宽度就直接换行:此前桌面也横滚、还隐藏了滚动条又没有
+          箭头,鼠标用户根本到不了被右缘截掉的最后一片(K-12)。 */}
       {grouped && (grouped.categories.length > 0 || grouped.uncategorized.length > 0) && (
         <div className="relative">
           <section
-            aria-label="市场分类，可横向滚动"
-            // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动分类必须可由键盘聚焦和滚动。
+            aria-label="市场分类"
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 移动端横向滚动分类必须可由键盘聚焦和滚动。
             tabIndex={0}
-            className="flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden"
+            className="flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible"
           >
             <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
               全部
@@ -650,7 +651,7 @@ export function BrowsePanel({
           </section>
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-surface to-transparent"
+            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-surface to-transparent sm:hidden"
           />
         </div>
       )}
