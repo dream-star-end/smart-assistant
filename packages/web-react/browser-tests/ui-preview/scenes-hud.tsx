@@ -16,6 +16,13 @@ import type { Scene } from "./types";
 
 const NOW = Date.now();
 
+/**
+ * 估算态用量快照。`estimated` 只存在于 TokenUsageBadge 识别的 live 快照形状上，不在协议
+ * `TurnTokenUsageSnapshot` 里；直接写成对象字面量传 prop 会触发 TS2353 多余属性检查
+ * （集成④ typecheck:preview 首次覆盖本文件），改为变量后按结构类型赋值，运行期行为不变。
+ */
+const ESTIMATED_USAGE = { totalTokens: 1_284_000, estimated: true };
+
 const TODOS: TodoItem[] = [
   { content: "读取 PinnedTaskTracker 与 PinnedDelegateTracker 现状", status: "completed" },
   { content: "新增 ui-preview 场景并出 before 截图", status: "completed" },
@@ -196,7 +203,7 @@ export const hudScenes: Scene[] = [
         <PinnedTaskTracker
           todos={TODOS_LONG}
           active
-          tokenUsage={{ totalTokens: 1_284_000, estimated: true }}
+          tokenUsage={ESTIMATED_USAGE}
         />
       </HudStage>
     ),
