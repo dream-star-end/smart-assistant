@@ -342,7 +342,7 @@ export function PreferencesTab({
                 <button
                   type="button"
                   onClick={onUpgrade}
-                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-meta font-medium text-white outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
+                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-meta font-medium text-accent-fg outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   升级到 Max
                 </button>

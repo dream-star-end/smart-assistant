@@ -335,7 +335,7 @@ function WizardSteps({ step }: { step: Step | "pay" }) {
                 done
                   ? "bg-success-soft text-success"
                   : active
-                    ? "bg-accent text-white"
+                    ? "bg-accent text-accent-fg"
                     : "bg-hover text-faint",
               )}
             >

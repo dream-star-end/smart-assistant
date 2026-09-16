@@ -167,7 +167,7 @@ export function TicketCard({
     >
       {ticket.status === 'blocked' && (
         <span
-          className="absolute right-0 top-0 rounded-bl-md rounded-tr-xl bg-danger px-1.5 py-0.5 text-caption font-medium text-white"
+          className="absolute right-0 top-0 rounded-bl-md rounded-tr-xl bg-danger px-1.5 py-0.5 text-caption font-medium text-danger-fg"
           title={ticket.blockedReason || TICKET_STATUS_LABEL.blocked}
         >
           受阻
