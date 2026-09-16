@@ -25,6 +25,18 @@ describe("TimeAgo(全站日期唯一权威)", () => {
     expect(screen.getByText("3 天前")).toBeTruthy();
   });
 
+  it("渲染为 <time dateTime>,并给读屏附带 sr-only 的绝对时间(绝对时间不再只活在 hover Tooltip 里)", () => {
+    const d = new Date(2026, 6, 26, 14, 30, 12);
+    withTooltip(<TimeAgo value={d} />);
+    const el = screen.getByText(/前$|^刚刚$|^\d{4}-\d{2}-\d{2}$/);
+    expect(el.tagName).toBe("TIME");
+    expect(el.getAttribute("datetime")).toBe(d.toISOString());
+    // 可见文案是相对时间,辅助技术读到的是「相对（绝对）」;触发器不加 tabIndex(不制造无操作的 Tab 停靠点)。
+    expect(el.textContent).toContain("（2026-07-26 14:30:12）");
+    expect(el.querySelector(".sr-only")?.textContent).toBe("（2026-07-26 14:30:12）");
+    expect(el.getAttribute("tabindex")).toBeNull();
+  });
+
   it("绝对档是 canonical 的 YYYY-MM-DD HH:mm(不随 locale 抖动)", () => {
     const d = new Date(2026, 6, 26, 14, 30, 12);
     expect(formatDate(d, "datetime")).toBe("2026-07-26 14:30");
