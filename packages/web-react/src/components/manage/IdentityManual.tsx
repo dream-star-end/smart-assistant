@@ -45,7 +45,8 @@ export function IdentityManual({ auth, agentId, authority }: {
         <Badge tone="warning" size="sm">本实例运行手册</Badge>
         <span>{error}</span>
         {/* 可访问名带上对象：同一面板里核心记忆的读失败也有一枚「重试」，读屏按钮列表里要分得开。 */}
-        <Button variant="link" size="sm" className="h-auto px-0" aria-label="重试读取本实例运行手册" onClick={retry}>重试</Button>
+        {/* h-auto 压掉了 Button 自带的触屏 min-h;两个字只有 26px 宽(t-762 manage#4)——触控档补 44px 最小宽高,桌面零变化。 */}
+        <Button variant="link" size="sm" className="h-auto px-0 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11" aria-label="重试读取本实例运行手册" onClick={retry}>重试</Button>
       </section>
     );
   if (!registration) return null;

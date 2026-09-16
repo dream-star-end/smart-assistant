@@ -1884,7 +1884,8 @@ function ManagedBrowserSetupDialog({
                 href={qrUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-1 text-meta text-accent hover:underline"
+                // 触屏补 44px 命中高(t-762 manage#4:此前 18px);桌面 hover 可用时零变化。
+                className="inline-flex items-center gap-1 rounded-sm text-meta text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               >
                 <ExternalLink size={12} /> 单独打开二维码
               </a>

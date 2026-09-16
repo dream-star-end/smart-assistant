@@ -93,7 +93,9 @@ test("分类筛选片只渲染有条目的分类(+全部/未分类)", async () =
   expect(screen.getByRole("button", { name: "数据分析" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "未分类" })).toBeInTheDocument();
   const chips = screen.getByRole("region", { name: "市场分类" });
-  expect(chips).toHaveAttribute("tabindex", "0");
+  // 桌面端(jsdom 桩 matchMedia 恒不匹配 = 宽屏)不再给 tabIndex:K-12 之后这里换行不滚,
+  // 一个可聚焦却什么都不做的容器只是多出一拍 Tab(QA t-1028 §6 #1)。
+  expect(chips).not.toHaveAttribute("tabindex");
   expect(chips).toHaveClass("overflow-x-auto", "snap-x");
   // 桌面端(sm 起)改为换行,不再横滚(K-12):横滚只留给移动端,右缘渐隐也只在移动端出现
   expect(chips).toHaveClass("sm:flex-wrap", "sm:overflow-x-visible", "sm:snap-none");
@@ -103,6 +105,30 @@ test("分类筛选片只渲染有条目的分类(+全部/未分类)", async () =
   expect(screen.queryByText("左右滑动查看更多分类")).not.toBeInTheDocument();
   // 没有条目的分类不出 chip
   expect(screen.queryByRole("button", { name: "编程开发" })).not.toBeInTheDocument();
+});
+
+test("窄屏(sm 以下)分类片容器真的横滚,才给 tabIndex=0 让键盘能聚焦滚动(QA t-1028 §6 #1)", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  const originalMatchMedia = window.matchMedia;
+  window.matchMedia = ((query: string) =>
+    ({
+      matches: query === "(max-width: 639px)",
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as MediaQueryList) as typeof window.matchMedia;
+  try {
+    render(<BrowsePanel auth={auth} />);
+    await screen.findByRole("heading", { name: "平台精选" });
+    expect(screen.getByRole("region", { name: "市场分类" })).toHaveAttribute("tabindex", "0");
+  } finally {
+    window.matchMedia = originalMatchMedia;
+  }
 });
 
 test("选中某个分类筛选片 → 平铺该类,其余分类/区头消失", async () => {

@@ -695,7 +695,8 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
                 type="button"
                 onClick={() => setOpenCase(open ? null : c.id)}
                 aria-expanded={open}
-                aria-controls={panelId}
+                // 用例详情只在展开时挂载:收起态不留悬空 IDREF(t-762 manage#2)。
+                aria-controls={open ? panelId : undefined}
                 className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               >
                 <ChevronRight size={13} className={cn("shrink-0 transition-transform", open && "rotate-90")} />

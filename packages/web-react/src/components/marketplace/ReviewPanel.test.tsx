@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceAiReview, MarketplacePending } from "../../lib/types";
@@ -10,11 +10,13 @@ import { expectAriaControlsResolvable } from "../../test/ariaControls";
 // api 网络层全 mock —— 只验证 ReviewPanel 与契约交互(待审 AI 意见区 + AI 审批记录折叠区)。
 const adminMarketplacePending = vi.fn();
 const adminMarketplaceAiReviews = vi.fn();
+const adminMarketplaceReview = vi.fn();
 const searchMarketplace = vi.fn();
 vi.mock("../../lib/api", () => ({
   api: {
     adminMarketplacePending: (...a: unknown[]) => adminMarketplacePending(...a),
     adminMarketplaceAiReviews: (...a: unknown[]) => adminMarketplaceAiReviews(...a),
+    adminMarketplaceReview: (...a: unknown[]) => adminMarketplaceReview(...a),
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
   },
 }));
@@ -270,6 +272,34 @@ test("折叠态不落悬空 aria-controls:待审详情与 AI 记录都是展开�
     expect(screen.getByRole("button", { name: /示例技能/ })).toHaveAttribute("aria-controls"),
   );
   expectAriaControlsResolvable();
+});
+
+test("拒绝理由输入框有常驻标签「拒绝原因」与说明,不再只靠 placeholder;空白不可提交,填写后原样送到 review(t-762 market#1)", async () => {
+  adminMarketplacePending.mockResolvedValue([pending()]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+  adminMarketplaceReview.mockResolvedValue({ ok: true });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText("示例技能");
+  fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "拒绝投稿" });
+  // 可访问名来自可见 <label>,不是 placeholder:输入后 placeholder 消失,名字仍在。
+  const input = within(dialog).getByRole("textbox", { name: "拒绝原因" });
+  expect(input).toHaveAttribute("placeholder", "例：正文包含内网地址，请移除后重新提交");
+  expect(input).toHaveAttribute("aria-required", "true");
+  expect(input).toHaveAccessibleDescription("原因会展示给发布者，请写明需要修正什么。");
+
+  const confirm = within(dialog).getByRole("button", { name: "拒绝" });
+  expect(confirm).toBeDisabled();
+  fireEvent.change(input, { target: { value: "  正文包含内网地址  " } });
+  expect(within(dialog).getByRole("textbox", { name: "拒绝原因" })).toBeInTheDocument();
+  expect(confirm).toBeEnabled();
+  fireEvent.click(confirm);
+  await waitFor(() =>
+    expect(adminMarketplaceReview).toHaveBeenCalledWith(auth, "1", "reject", "正文包含内网地址"),
+  );
 });
 
 test("kill-switch 分区窄屏默认折叠成一行,「展开」才露出输入;sm 起不受影响;slug 输入不再是裸词占位(K-13)", async () => {

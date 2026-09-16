@@ -56,16 +56,15 @@ export function RepoStatusBanner({
             <span className="min-w-0 truncate font-medium" title={repoLabel}>
               {repoLabel}
             </span>
-            <span className="shrink-0 opacity-80">· {repoStatusText(status)}</span>
+            {/* 状态词与 git 错误原文此前 opacity-80:语义色压在同色 soft 底上只剩浅色 3.13–3.43
+                (t-762 sidebar#2)。去掉透明度,全部用容器的实色;层级靠仓库标签的 font-medium 表达。 */}
+            <span className="shrink-0">· {repoStatusText(status)}</span>
           </div>
           {(status === "pending" || status === "cloning") && (
             <Progress value={progressPct} className="mt-1.5 h-1.5" aria-label="仓库克隆进度" />
           )}
           {status === "failed" && selection.error_message && (
-            <div
-              className="mt-0.5 line-clamp-2 break-words opacity-80"
-              title={selection.error_message}
-            >
+            <div className="mt-0.5 line-clamp-2 break-words" title={selection.error_message}>
               {selection.error_message}
             </div>
           )}

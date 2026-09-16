@@ -323,7 +323,9 @@ function SubmitBar({
                 {" · "}
                 <button
                   type="button"
-                  className="rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                  // 行内文字钮桌面只有一行高(16px);触屏补 44px 命中高与左右内距,桌面零变化
+                  //(t-894 复扫计划外发现:K-21 折叠播报是 t-762 扫描之后才合入的)。
+                  className="inline-flex items-center rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
                   aria-expanded={false}
                   onClick={() => setExpanded(true)}
                 >
@@ -2293,7 +2295,8 @@ function MyPublishes({
         type="button"
         onClick={() => onOpenChange(!isOpen)}
         aria-expanded={isOpen}
-        aria-controls="my-publishes-list"
+        // 列表只在展开时挂载:收起态不能留一个指向空气的 IDREF(t-762 market#2;同 SkillsPanel 写法)。
+        aria-controls={isOpen ? "my-publishes-list" : undefined}
         className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <ChevronRight

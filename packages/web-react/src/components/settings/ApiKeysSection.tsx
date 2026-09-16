@@ -17,6 +17,7 @@ import type { ApiKeyPatch, ApiKeySummary, AuthSession, CreatedApiKey } from "../
 import { cn, formatCredits } from "../../lib/utils";
 import {
   Alert,
+  Badge,
   Button,
   IconButton,
   Input,
@@ -27,6 +28,13 @@ import {
   buttonVariants,
   useConfirm,
 } from "../ui";
+
+/**
+ * 接入指南里几组 FAQ 的 <summary>:原生 list-item 只有一行文字高(16px),触屏点不中
+ *(t-762 settings#5)。触控档补 min-height + 竖向内距;桌面 hover 可用时渲染零变化。
+ */
+const FAQ_SUMMARY_CLASS =
+  "cursor-pointer font-medium text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2";
 import { shortTime } from "./labels";
 import { TablePager, useTablePage } from "./TablePager";
 
@@ -690,7 +698,7 @@ export function ApiKeysSection({
         className="mt-5 rounded-xl border border-border p-3 text-caption"
         data-testid="guide-manual-ccswitch"
       >
-        <summary className="cursor-pointer font-medium text-muted">
+        <summary className={FAQ_SUMMARY_CLASS}>
           手动配置 CC Switch · JSON
         </summary>
         <ol className="mt-2 list-decimal space-y-1 pl-5 text-faint">
@@ -743,7 +751,7 @@ export function ApiKeysSection({
         className="mt-2 rounded-xl border border-border p-3 text-caption"
         data-testid="guide-usage"
       >
-        <summary className="cursor-pointer font-medium text-muted">
+        <summary className={FAQ_SUMMARY_CLASS}>
           在 CC Switch 里查看余额与用量
         </summary>
         <p className="mt-2 text-faint">
@@ -774,7 +782,7 @@ export function ApiKeysSection({
         className="mt-2 rounded-xl border border-border p-3 text-caption"
         data-testid="guide-troubleshoot"
       >
-        <summary className="cursor-pointer font-medium text-muted">
+        <summary className={FAQ_SUMMARY_CLASS}>
           Claude Code 报 401 / Auth conflict 怎么办
         </summary>
         <ul className="mt-2 list-disc space-y-1 pl-5 text-faint">
@@ -821,7 +829,7 @@ export function ApiKeysSection({
         className="mt-2 rounded-xl border border-border p-3 text-caption"
         data-testid="guide-env"
       >
-        <summary className="cursor-pointer text-muted">手动接入本地 Claude Code(环境变量)</summary>
+        <summary className={cn(FAQ_SUMMARY_CLASS, "font-normal")}>手动接入本地 Claude Code(环境变量)</summary>
         <p className="mt-2 text-faint">
           在本机终端设置以下环境变量后启动 <code className="font-mono">claude</code>
           。请求经本站 API Key 端点转发，按站内积分计费(余额为 0 或触达单 key 上限时返回 402)。
@@ -928,9 +936,12 @@ function ApiKeyRow({
 
   return (
     <li
+      // 已停用不再整行 opacity-60(t-762 settings#3):那会把仍可操作的开关 / 上限按钮和「已停用」
+      // 状态文字一起压到 2.3–2.9:1。停用态只降非交互装饰 —— 描边改虚线、主名改 muted,
+      // 控件与状态文字保持实色。
       className={cn(
-        "flex flex-col gap-2 rounded-xl border border-border bg-surface p-3 transition-colors hover:border-accent/30",
-        disabled && "opacity-60",
+        "flex flex-col gap-2 rounded-xl border bg-surface p-3 transition-colors hover:border-accent/30",
+        disabled ? "border-dashed border-border-strong" : "border-border",
       )}
       data-api-key-id={k.id}
     >
@@ -959,14 +970,17 @@ function ApiKeyRow({
             </span>
           ) : (
             <span className="flex items-center gap-1">
-              <span className="truncate text-section text-fg">{k.label}</span>
+              <span className={cn("truncate text-section", disabled ? "text-muted" : "text-fg")}>
+                {k.label}
+              </span>
               <IconBtn label="重命名" onClick={() => startEdit("label")} disabled={busy}>
                 <Pencil size={12} />
               </IconBtn>
+              {/* 用 Badge 原语:warning 前景压 warning-soft 是已按 AA 定过值的组合,不再叠行级 opacity(settings#6)。 */}
               {disabled && (
-                <span className="rounded bg-warning-soft px-1.5 py-0.5 text-caption text-warning">
+                <Badge tone="warning" size="sm">
                   已禁用
-                </span>
+                </Badge>
               )}
             </span>
           )}
@@ -1028,7 +1042,8 @@ function ApiKeyRow({
             type="button"
             onClick={() => startEdit("limit")}
             disabled={busy}
-            className="rounded px-1 text-caption text-muted underline-offset-2 hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+            // 行内文字钮桌面保持一行高;触屏补 44px 命中区与左右内距(t-762 settings#3:此前 16px)。
+            className="inline-flex items-center rounded px-1 text-caption text-muted underline-offset-2 hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
           >
             {k.creditLimit === null ? "设置上限" : `/ 上限 ${formatCredits(k.creditLimit)}`}
           </button>

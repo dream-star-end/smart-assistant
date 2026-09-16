@@ -425,7 +425,9 @@ function SkillRow({
                   type="button"
                   onClick={() => setTagsExpanded((v) => !v)}
                   aria-expanded={tagsExpanded}
-                  className="rounded-sm text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                  // 「+1」两个字符桌面只有 12px 宽,触屏根本点不中(t-762 manage#1):触控档补 44px 最小宽
+                  // 并居中;桌面 hover 可用时只多 4px 内距。
+                  className="inline-flex items-center justify-center rounded-sm px-0.5 text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
                 >
                   {tagsExpanded ? "收起" : `+${tags.length - 3}`}
                 </button>

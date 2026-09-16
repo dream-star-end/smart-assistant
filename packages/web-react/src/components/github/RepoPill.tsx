@@ -65,15 +65,18 @@ export function RepoPill({
       <GithubMark size={14} />
       {sel ? (
         <>
+          {/* owner / 分支 / 状态此前用 opacity-70/80 压暗:accent 文字在 accent-soft 底上被压到
+              浅色 2.70、深色 3.62,不达 AA(t-762 sidebar#1)。改用 text-muted 实色分层:
+              仓库名保持 accent 加粗,其余段落用实色灰,层级还在、对比度回到 ≥4.5。 */}
           <span className="min-w-0 truncate">
-            <span className="opacity-70">{sel.owner}/</span>
+            <span className="text-muted">{sel.owner}/</span>
             <span className="font-semibold">{sel.repo}</span>
           </span>
-          <span className="hidden shrink-0 items-center gap-1 border-l border-accent/25 pl-1.5 text-caption opacity-80 sm:inline-flex">
+          <span className="hidden shrink-0 items-center gap-1 border-l border-accent/25 pl-1.5 text-caption text-muted sm:inline-flex">
             {sel.branch}
           </span>
           {statusText ? (
-            <span className="shrink-0 text-caption opacity-80">· {statusText}</span>
+            <span className="shrink-0 text-caption text-muted">· {statusText}</span>
           ) : (
             dot !== "none" && (
               <span className={cn("size-1.5 shrink-0 rounded-full", DOT_CLASS[dot])} />

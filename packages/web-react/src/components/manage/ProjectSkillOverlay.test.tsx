@@ -6,6 +6,7 @@ import { createMemoryAuthSession } from '../../lib/authSession'
 import type { ResolvedProjectScope } from '../../lib/projectScope'
 import { taskboardApi } from '../../lib/taskboard'
 import type { SkillSummary } from '../../lib/types'
+import { expectAriaControlsResolvable } from '../../test/ariaControls'
 import { ToastProvider } from '../ui'
 import { ProjectSkillOverlay } from './ProjectSkillOverlay'
 
@@ -126,6 +127,20 @@ describe('ProjectSkillOverlay', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'true')
     expect(await screen.findAllByRole('switch')).toHaveLength(3)
     expect(screen.getByRole('button', { name: '保存' })).toBeInTheDocument()
+  })
+
+  test('折叠态不落悬空 aria-controls：清单只在展开时挂载，IDREF 随之增删（t-762 manage#2）', async () => {
+    mount(['writer-pro'])
+    const toggle = await screen.findByRole('button', { name: /项目专属技能/ })
+    expect(toggle).not.toHaveAttribute('aria-controls')
+    expectAriaControlsResolvable()
+
+    fireEvent.click(toggle)
+    await screen.findAllByRole('switch')
+    const controls = toggle.getAttribute('aria-controls')
+    expect(controls).toBeTruthy()
+    expect(document.getElementById(controls as string)).not.toBeNull()
+    expectAriaControlsResolvable()
   })
 
   test('每行显示列表同款展示名 + slug 作补充；点文字即可切换开关', async () => {
