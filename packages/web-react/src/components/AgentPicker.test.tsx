@@ -128,44 +128,97 @@ describe("AgentPicker 三态协作", () => {
   });
 });
 
+const READINESS_ROWS = [
+  {
+    id: "main",
+    slug: "main",
+    name: "全能助手",
+    description: "",
+    installed: true,
+    isDefault: true,
+    capabilityReadiness: {
+      installed: true,
+      ready: true,
+      requirements: [],
+      needsAuthorization: [],
+    },
+  },
+  {
+    id: "research-agent",
+    slug: "research-agent",
+    name: "科研助手",
+    description: "需要检索插件",
+    installed: true,
+    capabilityReadiness: {
+      installed: true,
+      ready: false,
+      requirements: [],
+      needsAuthorization: ["paper-search"],
+    },
+  },
+];
+
 describe("AgentPicker capability readiness", () => {
-  it("保留未就绪 Agent 供用户理解状态，但禁止选择执行", async () => {
+  // C-06:此前整卡 disabled —— 不可聚焦、读屏读不到原因、也没有任何去授权的入口。
+  it("未就绪 Agent 可聚焦(aria-disabled)且读屏能拿到原因,但点击不会 onPick", async () => {
     const onPick = vi.fn();
-    const rows = [
-      {
-        id: "main",
-        slug: "main",
-        name: "全能助手",
-        description: "",
-        installed: true,
-        isDefault: true,
-        capabilityReadiness: {
-          installed: true,
-          ready: true,
-          requirements: [],
-          needsAuthorization: [],
-        },
-      },
-      {
-        id: "research-agent",
-        slug: "research-agent",
-        name: "科研助手",
-        description: "需要检索插件",
-        installed: true,
-        capabilityReadiness: {
-          installed: true,
-          ready: false,
-          requirements: [],
-          needsAuthorization: ["paper-search"],
-        },
-      },
-    ];
-    renderPicker({ onPick }, rows);
+    renderPicker({ onPick }, READINESS_ROWS);
 
     const agent = await screen.findByRole("button", { name: /科研助手/ });
-    expect(agent).toBeDisabled();
+    expect(agent).not.toBeDisabled();
+    expect(agent).toHaveAttribute("aria-disabled", "true");
+    expect(agent).toHaveAccessibleDescription(/1 项插件待授权/);
     expect(screen.getByText("Plugin 待授权")).toBeInTheDocument();
     fireEvent.click(agent);
     expect(onPick).not.toHaveBeenCalled();
+    // 未传 onOpenPluginAuth:只保留说明,不渲染去授权按钮。
+    expect(screen.queryByRole("button", { name: /去授权/ })).toBeNull();
+  });
+
+  it("传入 onOpenPluginAuth 时渲染「去授权」,按钮与整卡点击都带着该 Agent 回调", async () => {
+    const onPick = vi.fn();
+    const onOpenPluginAuth = vi.fn();
+    renderPicker({ onPick, onOpenPluginAuth }, READINESS_ROWS);
+
+    const go = await screen.findByRole("button", { name: /去授权/ });
+    fireEvent.click(go);
+    expect(onOpenPluginAuth).toHaveBeenCalledTimes(1);
+    expect(onOpenPluginAuth.mock.calls[0][0]).toMatchObject({ id: "research-agent", ready: false });
+    fireEvent.click(screen.getByRole("button", { name: /科研助手/ }));
+    expect(onOpenPluginAuth).toHaveBeenCalledTimes(2);
+    expect(onPick).not.toHaveBeenCalled();
+  });
+
+  it("能力待修复(无待授权插件)时按钮文案为「去处理」", async () => {
+    const rows = [
+      READINESS_ROWS[0],
+      {
+        ...READINESS_ROWS[1],
+        id: "broken-agent",
+        name: "待修复助手",
+        capabilityReadiness: { installed: true, ready: false, requirements: [], needsAuthorization: [] },
+      },
+    ];
+    renderPicker({ onOpenPluginAuth: vi.fn() }, rows);
+    expect(await screen.findByText("能力待修复")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /去处理/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /待修复助手/ })).toHaveAccessibleDescription(/所需能力暂不可用/);
+  });
+});
+
+// C-33:首次打开列表未返回前网格是空的,数据到达时卡片突然出现 —— 骨架卡占位避免跳动。
+describe("AgentPicker 加载骨架", () => {
+  it("列表未返回时网格内渲染骨架(role=status 播报加载中),返回后骨架消失", async () => {
+    let resolve!: (rows: unknown[]) => void;
+    listMyAgents.mockReturnValue(
+      new Promise<unknown[]>((r) => {
+        resolve = r;
+      }),
+    );
+    render(<AgentPicker open current={MAIN_AGENT} auth={auth} onClose={() => {}} onPick={() => {}} />);
+    expect(screen.getByRole("status")).toHaveTextContent("加载中…");
+    resolve(READINESS_ROWS);
+    expect(await screen.findByRole("button", { name: /科研助手/ })).toBeInTheDocument();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });

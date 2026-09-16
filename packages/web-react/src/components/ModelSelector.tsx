@@ -12,8 +12,8 @@ import {
   cursorFamilySupportsFast,
   cursorModelById,
 } from '@openclaude/protocol'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Lock, Users } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import {
   availableCursorEfforts,
   contextFamilyHasLong,
@@ -190,6 +190,21 @@ export function ModelSelector({
   const engineLabel = teamEngineLabel(models)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
+  // 思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道(C-07):
+  // trigger 在 sm+ 追加「· 高」「· Fast」。Cursor 家族读 canonical id 上的档位,其它模型读会话偏好。
+  const tierLabel = (() => {
+    if (teamEngineActive) return null
+    const parts: string[] = []
+    if (selectedCursor) {
+      const effort = EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label
+      if (effort) parts.push(effort)
+      if (selectedCursor.fast) parts.push('Fast')
+    } else if (effortSupported && effortSupported.length > 0 && effortActive) {
+      const effort = EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label
+      if (effort) parts.push(effort)
+    }
+    return parts.length > 0 ? parts.join(' · ') : null
+  })()
   const disabled = loading || (models.length === 0 && lockedModels.length === 0)
   const rows = modelPickerRows(models, lockedModels)
   const {
@@ -207,6 +222,16 @@ export function ModelSelector({
   const queryNorm = query.trim().toLowerCase()
   const searching = queryNorm.length > 0
   const showSearch = models.length + lockedModels.length >= 8
+  // 菜单打开时焦点直接落进搜索框(C-29):此前落在首项,键盘用户要多按一次才能开始搜。
+  // Radix DropdownMenu.Content 不公开 onOpenAutoFocus,改为镜像 open 状态、在其挂载聚焦之后接管焦点。
+  const searchRef = useRef<HTMLInputElement>(null)
+  const [menuOpenMirror, setMenuOpenMirror] = useState(false)
+  const menuOpen = open ?? menuOpenMirror
+  useEffect(() => {
+    if (!menuOpen || !showSearch) return
+    const id = window.setTimeout(() => searchRef.current?.focus({ preventScroll: true }), 0)
+    return () => window.clearTimeout(id)
+  }, [menuOpen, showSearch])
   const filteredRows = searching
     ? rows.filter((row) => rowSearchHaystack(row).toLowerCase().includes(queryNorm))
     : null
@@ -230,6 +255,10 @@ export function ModelSelector({
         return false
       })
       if (!row) continue
+      // 与当前选中同一家族的行不进「最近」(C-27):切过同家族不同档位后,主列表里那一行已带 ✓,
+      // 「最近」再出现一次同名同 ✓ 的行只会让人以为是两个模型。
+      if (row.kind === 'cursor-family' && selectedCursor && row.row.family === selectedCursor.family) continue
+      if (row.kind === 'context-family' && selectedContext && row.row.family === selectedContext.family) continue
       const ident =
         row.kind === 'plain'
           ? `plain:${row.model.id}`
@@ -476,6 +505,7 @@ export function ModelSelector({
         open={open}
         onOpenChange={(v) => {
           onOpenChange?.(v)
+          setMenuOpenMirror(v)
           if (!v) setQuery('')
         }}
       >
@@ -485,6 +515,16 @@ export function ModelSelector({
             data-product-feature={PRODUCT_CAPABILITIES.models.id}
             disabled={disabled}
             aria-label="选择对话模型"
+            // 当前模型被标降级时 trigger 自身要有标识(C-08),不能只在点开菜单后才看到。
+            title={
+              loading && selected
+                ? '正在切换模型，请稍候'
+                : selectedDegraded && !teamEngineActive
+                  ? '当前模型暂不可用，点击更换'
+                  : undefined
+            }
+            aria-busy={loading || undefined}
+            data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
             className={cn(
               'flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
               'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
@@ -492,13 +532,42 @@ export function ModelSelector({
               teamEngineActive && 'text-accent hover:text-accent',
             )}
           >
-            {teamEngineActive ? (
+            {/* 切换中(压缩上下文等)此前只是把 trigger 禁用,用户不知道在等什么(C-28):图标换 spinner + 文案。 */}
+            {loading ? (
+              <Loader2
+                size={14}
+                className="shrink-0 animate-spin text-faint"
+                aria-hidden
+                data-testid="model-trigger-spinner"
+              />
+            ) : teamEngineActive ? (
               <Users size={14} className="shrink-0 text-accent" />
             ) : (
               <Cpu size={14} className="shrink-0 text-faint" />
             )}
-            {teamEngineActive && <span className="hidden sm:inline">{'团队模式 · '}</span>}
+            {/* 顶栏已有「团队模式」chip,trigger 再写一遍「团队模式」是同词两次(C-25);这里改说明
+                实际生效的是什么 —— 「队长引擎 · GPT-6-Astra」,「顶栏所见 = 实际所发」的语义不丢。 */}
+            {teamEngineActive && <span className="hidden sm:inline">{'队长引擎 · '}</span>}
+            {selectedDegraded && !teamEngineActive && (
+              <AlertTriangle
+                size={13}
+                className="shrink-0 text-danger"
+                aria-label="当前模型暂不可用"
+                data-testid="model-trigger-degraded"
+              />
+            )}
             <span className="min-w-0 truncate sm:max-w-[180px]">{label}</span>
+            {loading && selected && !teamEngineActive ? (
+              <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
+                · 切换中…
+              </span>
+            ) : (
+              tierLabel && (
+                <span className="hidden shrink-0 text-faint sm:inline" data-testid="model-trigger-tier">
+                  · {tierLabel}
+                </span>
+              )
+            )}
             {!teamEngineActive && <CostMark model={selected} />}
             {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
             <ChevronDown size={14} className="shrink-0 text-faint" />
@@ -513,6 +582,7 @@ export function ModelSelector({
           {showSearch && (
             <div className="shrink-0 px-1.5 pb-1">
               <Input
+                ref={searchRef}
                 inputSize="sm"
                 aria-label="搜索模型"
                 placeholder="搜索模型…"

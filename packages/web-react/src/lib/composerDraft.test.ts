@@ -2,6 +2,8 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   accountDraftKey,
   clearDraft,
+  DRAFT_MAX_BYTES,
+  draftExceedsStorage,
   moveDraft,
   NEW_COMPOSER_DRAFT_KEY,
   readDraft,
@@ -43,6 +45,20 @@ describe("composerDraft", () => {
     const exact = "y".repeat(20 * 1024);
     writeDraft("s1", exact);
     expect(readDraft("s1")).toBe(exact);
+  });
+
+  // C-21:Composer 用它决定是否提示「草稿过长，刷新后不保留」,判定必须与 writeDraft 同源(按字节)。
+  test("draftExceedsStorage 与 writeDraft 的字节上限一致(多字节字符按 UTF-8 计)", () => {
+    expect(DRAFT_MAX_BYTES).toBe(20 * 1024);
+    expect(draftExceedsStorage("")).toBe(false);
+    expect(draftExceedsStorage("y".repeat(20 * 1024))).toBe(false);
+    expect(draftExceedsStorage("y".repeat(20 * 1024 + 1))).toBe(true);
+    // 6827 个汉字 = 20481 字节 > 上限;6826 个 = 20478 字节 ≤ 上限。
+    expect(draftExceedsStorage("中".repeat(6826))).toBe(false);
+    expect(draftExceedsStorage("中".repeat(6827))).toBe(true);
+    const tooLong = "中".repeat(6827);
+    writeDraft("s1", tooLong);
+    expect(sessionStorage.getItem("oc_v5_composer_draft:s1")).toBeNull();
   });
 
   test("存储写满/删除失败时仍保存最新值和清空意图", () => {

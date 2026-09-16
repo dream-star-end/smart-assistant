@@ -1,9 +1,117 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { Composer } from "./Composer";
+import { BRAND } from "../lib/brand";
+import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
+import { ToastProvider } from "./ui";
 
 afterEach(cleanup);
+
+// C-01 / C-14:此前 4 个 44px 按钮与 textarea 同排,390px 下正文只剩约 138px;桌面多行草稿时左侧空出一列。
+describe("Composer 两行式布局", () => {
+  test("textarea 独占第一行(父级不含任何按钮、通栏 w-full),工具按钮全部在第二行", () => {
+    render(
+      <Composer
+        onSend={() => {}}
+        onUpload={async () => ({ kind: "file", url: "/x" })}
+        onOpenRepo={() => {}}
+        onSetGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+      />,
+    );
+    const textarea = screen.getByLabelText("消息输入框");
+    const inputRow = screen.getByTestId("composer-input-row");
+    expect(inputRow).toContainElement(textarea);
+    expect(inputRow.querySelectorAll("button, label, [role='button']")).toHaveLength(0);
+    expect(textarea).toHaveClass("w-full");
+    const toolRow = screen.getByTestId("composer-tool-row");
+    for (const el of [
+      screen.getByTitle("添加附件"),
+      screen.getByRole("button", { name: "更多选项" }),
+      screen.getByRole("button", { name: "语音输入" }),
+      screen.getByRole("button", { name: "发送" }),
+    ]) {
+      expect(toolRow).toContainElement(el);
+    }
+    // 工具行在输入行之后(视觉上位于下方)。
+    expect(inputRow.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // 仓库入口:sm+ 在工具行(hidden sm:flex),<sm 在外壳下方底栏(sm:hidden)—— 390px 生成中 5 个 44px 按钮
+    // 加不可截断的未绑定 pill 会撑爆一行。
+    const pills = screen.getAllByRole("button", { name: "关联 GitHub 仓库" });
+    expect(pills).toHaveLength(2);
+    expect(screen.getByTestId("composer-repo-slot")).toHaveClass("hidden", "sm:flex");
+    expect(toolRow).toContainElement(screen.getByTestId("composer-repo-slot"));
+    expect(screen.getByTestId("composer-repo-slot-mobile")).toHaveClass("sm:hidden");
+    expect(toolRow).not.toContainElement(screen.getByTestId("composer-repo-slot-mobile"));
+  });
+
+  test("品牌名来自 lib/brand,不写死(M-16)", () => {
+    render(<Composer onSend={() => {}} />);
+    expect(screen.getByPlaceholderText(`给${BRAND.name}发消息…`)).toBeInTheDocument();
+  });
+});
+
+// C-23:引用块只能点「×」取消;全局 Esc 被「停止生成」占用,只在不生成时于输入框内接管。
+describe("Composer Esc 取消引用", () => {
+  const replyTo = { messageId: "m1", role: "assistant" as const, text: "被引用的回答" };
+
+  test("textarea 内按 Esc 取消引用;生成中不拦截", () => {
+    const onCancelReply = vi.fn();
+    const { rerender } = render(<Composer onSend={() => {}} replyTo={replyTo} onCancelReply={onCancelReply} />);
+    fireEvent.keyDown(screen.getByLabelText("消息输入框"), { key: "Escape" });
+    expect(onCancelReply).toHaveBeenCalledTimes(1);
+    rerender(<Composer busy onSend={() => {}} onStop={() => {}} replyTo={replyTo} onCancelReply={onCancelReply} />);
+    fireEvent.keyDown(screen.getByLabelText("消息输入框"), { key: "Escape" });
+    expect(onCancelReply).toHaveBeenCalledTimes(1);
+  });
+
+  test("无引用时 Esc 不报错也不调用", () => {
+    const onCancelReply = vi.fn();
+    render(<Composer onSend={() => {}} onCancelReply={onCancelReply} />);
+    fireEvent.keyDown(screen.getByLabelText("消息输入框"), { key: "Escape" });
+    expect(onCancelReply).not.toHaveBeenCalled();
+  });
+});
+
+// C-21:草稿超过 20KB 只留内存、刷新即丢,此前没有任何预警。
+describe("Composer 草稿超限预警", () => {
+  afterEach(() => sessionStorage.clear());
+
+  test("超过 sessionStorage 上限时显示「草稿过长，刷新后不保留」;未超限不显示", () => {
+    render(<Composer onSend={() => {}} draftKey="s-long" />);
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: "a".repeat(3000) } });
+    expect(screen.queryByTestId("composer-draft-volatile")).toBeNull();
+    // 7000 个汉字 ≈ 21KB > 20KB。
+    fireEvent.change(ta, { target: { value: "啊".repeat(7000) } });
+    expect(screen.getByTestId("composer-draft-volatile")).toHaveTextContent("草稿过长，刷新后不保留");
+    expect(sessionStorage.getItem("oc_v5_composer_draft:s-long")).toBeNull();
+  });
+
+  test("无 draftKey(不持久化)时不提示", () => {
+    render(<Composer onSend={() => {}} />);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "啊".repeat(7000) } });
+    expect(screen.queryByTestId("composer-draft-volatile")).toBeNull();
+  });
+});
+
+// C-20:不支持 MediaRecorder / 未登录时麦克风只是灰掉,触屏没有 title,用户不知道为什么。
+describe("Composer 语音不可用原因", () => {
+  test("jsdom 无 MediaRecorder → 麦克风 aria-disabled 但可点,点击 toast 说明原因", () => {
+    render(
+      <ToastProvider>
+        <Composer onSend={() => {}} getVoiceToken={() => "tok"} />
+      </ToastProvider>,
+    );
+    const mic = screen.getByRole("button", { name: "语音输入" });
+    expect(mic).toHaveAttribute("aria-disabled", "true");
+    expect(mic).not.toBeDisabled();
+    fireEvent.click(mic);
+    expect(screen.getByRole("status")).toHaveTextContent("不支持语音输入");
+    // 不支持时不渲染语音状态 live region(voiceEnabled=false)。
+    expect(screen.queryByTestId("composer-voice-status")).toBeNull();
+  });
+});
 
 describe("Composer 控件边框 token", () => {
   test("外壳非聚焦用 border-border-control，聚焦用 border-border-strong，不用分隔线 border-border", () => {
@@ -17,6 +125,8 @@ describe("Composer 控件边框 token", () => {
 });
 
 describe("Composer environment preparing", () => {
+  afterEach(() => vi.useRealTimers());
+
   test("shows a 20s prep progress in the input area", () => {
     render(<Composer onSend={() => {}} environmentPreparing />);
     expect(screen.getByRole("status")).toHaveTextContent("环境准备中，约 20 秒");
@@ -25,6 +135,51 @@ describe("Composer environment preparing", () => {
   test("hides the prep progress by default", () => {
     render(<Composer onSend={() => {}} />);
     expect(screen.queryByText(/环境准备中/)).toBeNull();
+  });
+
+  // C-09:20s 时间假进度走到 100% 后停住、文案仍是「约 20 秒」,慢路径上给的是失真信号。
+  test("超过 20s 后切为不确定态:文案改「仍在准备」,进度条脉动而不是停在 100%", () => {
+    vi.useFakeTimers();
+    render(<Composer onSend={() => {}} environmentPreparing />);
+    const bar = screen.getByTestId("composer-env-prep");
+    expect(bar).toHaveAttribute("data-overdue", "false");
+    act(() => {
+      vi.advanceTimersByTime(ENV_PREP_EXPECTED_MS + 400);
+    });
+    expect(bar).toHaveAttribute("data-overdue", "true");
+    expect(bar).toHaveTextContent("仍在准备环境，请稍候…");
+    expect(bar).not.toHaveTextContent("约 20 秒");
+    expect(bar.querySelector(".animate-pulse")).not.toBeNull();
+  });
+});
+
+// C-02:生成中 Composer 唯一按钮是「停止」,桌面 Enter 排队无反馈、触屏 Enter=换行根本没有排队入口。
+describe("Composer 生成中排队发送", () => {
+  test("busy 且有正文 → 出现「排队发送」并调用 onSend,「停止」仍是唯一 Stop 控件", () => {
+    const onSend = vi.fn();
+    const onStop = vi.fn();
+    render(
+      <ToastProvider>
+        <Composer busy onSend={onSend} onStop={onStop} />
+      </ToastProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "生成中先排上这一条" } });
+    const queue = screen.getByRole("button", { name: "排队发送" });
+    expect(screen.getAllByRole("button", { name: "停止" })).toHaveLength(1);
+    fireEvent.click(queue);
+    expect(onSend).toHaveBeenCalledWith("生成中先排上这一条", undefined, undefined);
+    expect(onStop).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent("已加入队列，本轮结束后发送");
+  });
+
+  test("busy 但空正文 / stopping 态不出现排队按钮", () => {
+    const { rerender } = render(<Composer busy onSend={() => {}} onStop={() => {}} />);
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
+    rerender(<Composer busy stopping onSend={() => {}} onStop={() => {}} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "x" } });
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
   });
 });
 

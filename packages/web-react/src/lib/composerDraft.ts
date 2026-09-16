@@ -1,5 +1,13 @@
 const PREFIX = "oc_v5_composer_draft:";
 const MAX_BYTES = 20 * 1024;
+/** sessionStorage 草稿上限(字节)。超过只留内存、刷新不保留;Composer 据此给用户预警(C-21)。 */
+export const DRAFT_MAX_BYTES = MAX_BYTES;
+
+/** 草稿是否已超过本地保存上限(与 writeDraft 的判定同源)。UTF-8 单字符最多 4 字节,不可能超限时不真算。 */
+export function draftExceedsStorage(text: string): boolean {
+  if (text.length * 4 <= MAX_BYTES) return false;
+  return new Blob([text]).size > MAX_BYTES;
+}
 export const NEW_COMPOSER_DRAFT_KEY = "new";
 // Storage has a size/quota limit; keep rejected drafts in this tab's memory so a
 // session switch cannot restore an older saved prefix. These do not survive reload.
