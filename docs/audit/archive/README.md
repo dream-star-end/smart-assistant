@@ -24,6 +24,19 @@
 
 「已修 / 遗留」以各模块正文修复记录 / 遗留章节为准，摘要只转录计数；跨模块转出项在对方模块的摘要里登记闭环状态。
 
+## 专项与 QA 索引（覆盖复查 t-760 之后立项；均已验收，分支尚未合入 integration **[待集成④]**）
+
+| 专项 | 任务 | 分支 @ HEAD | 发现 | 已修 | 遗留 | 摘要 | 正文（合入后） |
+|---|---|---|---|---|---|---|---|
+| HUD 任务列表 / 后台子任务（G-1 / G-2） | t-836 + QA t-1029 | `feat/v5-selfhost-audit-hud` @ `b1f06f8f5`（QA 修复 `747596782` 在 qa-gap） | 20（P2 7 · P3 13） | 17 + ◐1 | H-18 shell 一行 · H-12 需后端 · H-20 messages / shell · H-19 取舍 | [hud.md](./hud.md) | `../hud.md` |
+| 知识星球自动回复面板（G-3） | t-838 + QA t-1029 | `feat/v5-selfhost-audit-kp-automation` @ `b0fd16dad`（QA 修复 `1db992620` 在 qa-gap） | 19（P1 1 · P2 7 · P3 11） | 17 | KP-18 / 19 不修有判据；弹层形态 / Checkbox 归 shell | [kp-automation.md](./kp-automation.md) | `../kp-automation.md` |
+| 杂项 P3：`?demo=1` + optionsGroup（G-4 / G-5） | t-839 + QA t-1029 | `feat/v5-selfhost-audit-misc-p3` @ `c834dffa1` | 18（P2 2 · P3 16） | 12 | D-02 余项 / D-08 shell · OG-05 / OG-09 messages · D-04 / D-09 产品 | [misc-p3.md](./misc-p3.md) | `../misc-p3.md` |
+| PermissionCard 未决态审批交互 | t-875（t-837 作废重开） | `feat/v5-selfhost-audit-permission-card` @ `8a3179896` | 17（P2 5 · P3 12） | 17 | 弹框关闭焦点归位（shell）· 提交超时（状态机） | [permission-card.md](./permission-card.md) | `../permission-card.md` |
+| a11y 专项：走查 + 三条修复单 | t-762 → t-893 / t-894 / t-895 | `-a11y-shell` @ `4930707cc` · `-a11y-mod-a` @ `475e3e6c7` · `-a11y-mod-b` @ `9710a3b24` | 35（P2 9 · P3 26） | 35 + 顺手 2 + QA nit 2 + 附录 2（L-11 · M-23） | a11y-shell §5 约 10 处同源项待定 | [a11y.md](./a11y.md) | `../a11y-shell.md` `../a11y-mod-a.md` `../a11y-mod-b.md` |
+| QA 复核三轮 | t-1028 / t-1038 / t-1029 | `-qa-p3` @ `3e640a85d` · `-qa-b-p3` @ `0ac949b2e` · `-qa-gap` @ `c1734aac6` | 核对 37 / 84 / 61 项 | ❌ 0 / 1（勘误 + 移交）/ 2（已修） | — | [qa.md](./qa.md) | `../qa/QA-p3-tail.md` `../qa/QA-b-p3.md` `../qa/qa-gap.md` |
+| 集成待办清理 | t-865 | integration `e0f53688a` `d4b061e37` `a3af53970` `bae5a8673` `7d5573a92`，记录 `1e4328ac9` | 7 项待办 | 5 修 + 1 核对已具备 + 1 转 t-53 | — | — | [../INTEGRATION.md](../INTEGRATION.md) 集成② §7.1 |
+| tutorials 正文补写（q-1076 闭环） | t-1046 | `feat/v5-selfhost-audit-tutorials` @ `67b1494ea`（`e798c3123` feat + INTEGRATION 勾销） | — | agents / chat-basics 正文补写 + 抬版，两处 `data-product-feature` 恢复，普通 `tutorials:accept`（history 第 68 条） | — | — | `../tutorials.md` / [../INTEGRATION.md](../INTEGRATION.md) 集成③ §4 |
+
 ## 集成分支合入记录（`feat/v5-selfhost-ocv5-audit-ux`）
 
 | 轮次 | 任务 · 执行 | 起点 / 合并提交 | 接线 · 用例 · 记录 |
@@ -38,12 +51,10 @@
 
 | 项 | 等什么 |
 |---|---|
-| 补审专项摘要 `archive/{hud,kp-automation,misc-p3}.md`（t-836 / t-838 / t-839，已验收）+ 集成待办 t-865 + QA 复核 t-1029 | **[待集成④]** t-896 合入后写摘要；数字已在 [SUMMARY.md §3](../SUMMARY.md) |
-| PermissionCard 专审摘要 `archive/permission-card.md`（t-875，已验收，17/17） | **[待集成④]** |
-| a11y 专项摘要 `archive/a11y.md`（t-762 走查 + t-893 / t-894 / t-895，均已验收） | **[待集成④]**；a11y-shell §5 约 10 处同源项待用户拍板新任务或遗留 |
-| tutorials 补写 agents / chat-basics 正文并恢复两处 `data-product-feature` | t-1046 **[待集成④]** |
-| QA 复核 B 轮 P3 / 二期 P3 报告（t-1038 / t-1028，已验收） | **[待集成④]** 随 qa-b-p3 / qa-p3 分支合入 |
-| 集成④ 记录 + 全量门 | t-896 **[待集成④]** |
+| 专项 / QA 摘要 `archive/{hud,kp-automation,misc-p3,permission-card,a11y,qa}.md` | 已预写（t-897 预备）；正文链接在分支合入 integration 后生效 **[待集成④]** |
+| a11y-shell §5 约 10 处模块内同源项 | 用户拍板：新任务或遗留 **[待集成④]** |
+| 集成④ 记录 + 全量门 + 各分支合并提交 | t-896 **[待集成④]**（本表与 SUMMARY §4 / §9 随之更新） |
+| tutorials 正文补写 t-1046 | 已完成 `67b1494ea`，随集成④ 合入后在 SUMMARY §7-1 更新 q-1076 闭环状态 **[待集成④]** |
 
 ## 相关决策
 
