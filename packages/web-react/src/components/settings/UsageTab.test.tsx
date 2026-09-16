@@ -236,7 +236,8 @@ describe("UsageTab 图表化窗口口径", () => {
     expect(await screen.findByText("42")).toBeInTheDocument();
     expect(screen.getAllByText("12.3万").length).toBeGreaterThan(0);
     expect(screen.getAllByText("7,890").length).toBeGreaterThan(0);
-    expect(screen.getByText("888 积分")).toBeInTheDocument();
+    // StatTile 把数字与单位拆成两个 span(数字绝不从中间断行),按数字本体断言。
+    expect(screen.getAllByText("888").length).toBeGreaterThan(0);
     const trendTable = screen.getByRole("table", { name: "积分消耗趋势，近 7 天" });
     expect(within(trendTable).getByRole("cell", { name: "688 积分" })).toBeInTheDocument();
   });
@@ -442,14 +443,46 @@ describe("UsageTab 会话标题与口径说明", () => {
     ).toBeInTheDocument();
   });
 
-  test("未绑定聊天项目用量给人话说明并可去项目设置", async () => {
+  test("未绑定聊天项目:回落到全部项目照常出数据,并给人话说明可去项目设置", async () => {
+    // 审计 SET-04:之前这一态不请求、整页只剩提示,文案却说"按全部项目统计"。
     projectScopeState.kind = "chat";
     const onOpenProjectSettings = vi.fn();
     render(<UsageTab auth={auth} onOpenProjectSettings={onOpenProjectSettings} />);
     expect(
-      await screen.findByText("当前聊天项目还没绑定任务看板,用量按全部项目统计"),
+      await screen.findByText("当前聊天项目还没绑定任务看板，以下按全部项目统计。"),
     ).toBeInTheDocument();
+    // 请求按「全部项目」发出(不带 boardProjectId),数据照常渲染。
+    expect(mockedGetUsage).toHaveBeenCalledWith(auth, { sessionsLimit: 20 });
+    expect(mockedGetReport).toHaveBeenCalledWith(auth, "7d");
+    expect(await screen.findByText("累计请求")).toBeInTheDocument();
+    expect(screen.getByText("uuid-chat-1")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "去项目设置" }));
     expect(onOpenProjectSettings).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("UsageTab 空态", () => {
+  test("窗口内全 0:四张图都走文字空态,不挂 canvas 画假坐标轴", async () => {
+    // 审计 SET-03:此前趋势 / 请求两张图对全 0 数据仍挂 canvas,chart.js 画出 0–1.0 小数刻度。
+    const zero = makeReport("7d");
+    zero.summary = {
+      requests: "0",
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      credits: "0",
+    };
+    zero.trend = zero.trend.map((p) => ({ ...p, requests: "0", credits: "0" }));
+    zero.models = [];
+    mockedGetReport.mockResolvedValue(zero);
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("累计请求")).toBeInTheDocument();
+    expect(screen.getAllByText("该时段暂无积分消耗数据。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("该时段暂无请求数据。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("该时段暂无模型用量。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("该时段暂无用量数据。").length).toBeGreaterThan(0);
+    expect(document.querySelectorAll("canvas")).toHaveLength(0);
+    expect(chartConstructed).not.toHaveBeenCalled();
   });
 });

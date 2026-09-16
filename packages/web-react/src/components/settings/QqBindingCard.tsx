@@ -53,6 +53,19 @@ export function QqBindingCard({
     [binding?.entry_url],
   )
 
+  // 复制失败要有提示，而不是红控制台（审计 SET-23）：非安全上下文 navigator.clipboard 是 undefined，
+  // 直接 .writeText 会同步抛；权限被拒则 reject。两种都兜到同一句提示，绑定码本身仍可手抄。
+  async function copyBindCommand(text: string) {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1_500)
+    } catch {
+      setCopied(false)
+      setError('复制失败，请手动输入上面的绑定命令。')
+    }
+  }
+
   async function start() {
     setBusy(true)
     setError(null)
@@ -172,11 +185,8 @@ export function QqBindingCard({
               <div className="mt-4 text-meta font-medium text-fg">2. 向机器人发送</div>
               <button
                 type="button"
-                onClick={() => {
-                  void navigator.clipboard.writeText(`/bind ${binding.bind_code}`)
-                  setCopied(true)
-                  window.setTimeout(() => setCopied(false), 1_500)
-                }}
+                aria-label="复制绑定命令"
+                onClick={() => void copyBindCommand(`/bind ${binding.bind_code}`)}
                 className="mt-2 flex items-center justify-between rounded-xl border border-border bg-elevated px-3 py-3 font-mono text-title font-semibold tracking-wider text-fg"
               >
                 <span>/bind {binding.bind_code}</span>

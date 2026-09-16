@@ -14,16 +14,22 @@ import { agentDisplayName } from "../chat/agentNames";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { Alert, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
+import { StatTile } from "./StatTile";
 
+/**
+ * 项目范围 → 用量查询参数。
+ * `notice`:范围选了「当前聊天项目」但它还没绑看板 → 无法按项目过滤,**回落到全部项目**并
+ * 在页顶说明(审计 SET-04:之前这一态直接不请求、整页只剩一条提示,文案却说"按全部项目统计")。
+ */
 function boardProjectQuery(
   kind: string,
   workId: string | undefined,
-): { boardProjectId?: string; blocked?: string } {
+): { boardProjectId?: string; notice?: string } {
   if (kind === "ungrouped") return { boardProjectId: "none" };
   if (kind === "work" && workId) return { boardProjectId: workId };
   if (kind === "chat") {
     if (workId) return { boardProjectId: workId };
-    return { blocked: "当前聊天项目还没绑定任务看板,用量按全部项目统计" };
+    return { notice: "当前聊天项目还没绑定任务看板，以下按全部项目统计。" };
   }
   return {};
 }
@@ -134,12 +140,6 @@ export function UsageTab({
   // 全生命周期：首屏拉一次（会话首页 + 摘要 + 缓存 + 节省）。
   useEffect(() => {
     let alive = true;
-    if (scopeQuery.blocked) {
-      setLoading(false);
-      setData(null);
-      setErr(null);
-      return;
-    }
     setLoading(true);
     setErr(null);
     api
@@ -160,17 +160,11 @@ export function UsageTab({
     return () => {
       alive = false;
     };
-  }, [auth, usageReloadTick, boardProjectId, scopeQuery.blocked]);
+  }, [auth, usageReloadTick, boardProjectId]);
 
   // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
     let alive = true;
-    if (scopeQuery.blocked) {
-      setReportLoading(false);
-      setReport(null);
-      setReportErr(null);
-      return;
-    }
     setReportLoading(true);
     setReportErr(null);
     setReport(null);
@@ -190,7 +184,7 @@ export function UsageTab({
     return () => {
       alive = false;
     };
-  }, [auth, window, reportReloadTick, boardProjectId, scopeQuery.blocked]);
+  }, [auth, window, reportReloadTick, boardProjectId]);
 
   // 会话标题：与用量首屏解耦，缺 listSessions / 失败均静默。
   useEffect(() => {
@@ -243,6 +237,10 @@ export function UsageTab({
   // 两个首屏请求都完成后 canvas 才会挂载；把这个可见性边沿纳入图表 effect 依赖，
   // 避免 report 先返回时 useChart 因 ref=null no-op，随后仅 loading 变化却永不重画。
   const chartReady = !loading && !reportLoading && report !== null;
+  // 全 0 序列不画图(审计 SET-03):chart.js 对全 0 数据会画出 0–1.0 的小数刻度空图,
+  // 与同页「按模型 / Token 构成」两张卡的文字空态不一致。
+  const creditTrendHasData = creditTrend.some((v) => v > 0);
+  const requestTrendHasData = requestTrend.some((v) => v > 0);
 
   const creditRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<HTMLCanvasElement>(null);
@@ -296,6 +294,8 @@ export function UsageTab({
     [report, window, chartReady],
   );
 
+  const scopeNotice = scopeQuery.notice;
+
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
@@ -317,25 +317,6 @@ export function UsageTab({
         >
           重试
         </Button>
-      </div>
-    );
-  }
-  if (scopeQuery.blocked) {
-    return (
-      <div className="px-5 py-4">
-        <Alert
-          tone="warning"
-          className="text-meta"
-          action={
-            onOpenProjectSettings ? (
-              <Button size="sm" variant="secondary" onClick={onOpenProjectSettings}>
-                去项目设置
-              </Button>
-            ) : undefined
-          }
-        >
-          {scopeQuery.blocked}
-        </Alert>
       </div>
     );
   }
@@ -369,11 +350,25 @@ export function UsageTab({
             className="ml-auto"
           />
         </div>
-        {scope.kind !== "all" && (
+        {scopeNotice ? (
+          <Alert
+            tone="warning"
+            className="text-meta"
+            action={
+              onOpenProjectSettings ? (
+                <Button size="sm" variant="secondary" onClick={onOpenProjectSettings}>
+                  去项目设置
+                </Button>
+              ) : undefined
+            }
+          >
+            {scopeNotice}
+          </Alert>
+        ) : scope.kind !== "all" ? (
           <p className="text-caption text-muted">
             按会话当时所属项目统计，后续移动会话不改写历史；组队成员的消耗计入发起会话。
           </p>
-        )}
+        ) : null}
       </div>
 
       {reportLoading ? (
@@ -411,14 +406,10 @@ export function UsageTab({
                 近 {REPORT_WINDOW_NOUN[window]}
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <Stat label="请求数" value={groupDigits(rs.requests)} />
-                <Stat
-                  label="消耗积分"
-                  value={`${formatCredits(rs.credits)} 积分`}
-                  accent
-                />
-                <Stat label="输入 token" value={formatCompactCount(rs.input_tokens)} />
-                <Stat label="输出 token" value={formatCompactCount(rs.output_tokens)} />
+                <StatTile label="请求数" value={groupDigits(rs.requests)} />
+                <StatTile label="消耗积分" value={formatCredits(rs.credits)} unit="积分" accent />
+                <StatTile label="输入 token" value={formatCompactCount(rs.input_tokens)} />
+                <StatTile label="输出 token" value={formatCompactCount(rs.output_tokens)} />
               </div>
             </div>
 
@@ -475,7 +466,13 @@ export function UsageTab({
                   emptyText: "该时段暂无积分消耗数据。",
                 }}
               >
-                <canvas ref={creditRef} />
+                {creditTrendHasData ? (
+                  <canvas ref={creditRef} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-meta text-faint">
+                    该时段暂无积分消耗数据。
+                  </div>
+                )}
               </ChartCard>
               <ChartCard
                 title="请求次数"
@@ -490,7 +487,13 @@ export function UsageTab({
                   emptyText: "该时段暂无请求数据。",
                 }}
               >
-                <canvas ref={requestRef} />
+                {requestTrendHasData ? (
+                  <canvas ref={requestRef} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-meta text-faint">
+                    该时段暂无请求数据。
+                  </div>
+                )}
               </ChartCard>
               <ChartCard
                 title="按模型积分构成"
@@ -683,13 +686,16 @@ export function UsageTab({
             </ul>
             {hasMore && (
               <div className="pt-2 text-center">
-                <button
+                {/* 与账户页流水的「加载更多」同一原语,触屏下自动补到 44px(审计 SET-11)。 */}
+                <Button
+                  variant="ghost"
+                  size="sm"
                   onClick={loadMore}
                   disabled={loadingMore}
-                  className="text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                  className="text-muted"
                 >
                   {loadingMore ? "加载中…" : "加载更多"}
-                </button>
+                </Button>
               </div>
             )}
             {/[1-9]/.test(data.legacy_unattributed.requests) && (
@@ -699,22 +705,6 @@ export function UsageTab({
             )}
           </>
         )}
-      </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
-  return (
-    <div className="rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="text-caption text-faint">{label}</div>
-      <div
-        className={cn(
-          "mt-0.5 text-[16px] font-semibold tabular-nums",
-          accent ? "text-accent" : "text-fg",
-        )}
-      >
-        {value}
       </div>
     </div>
   );

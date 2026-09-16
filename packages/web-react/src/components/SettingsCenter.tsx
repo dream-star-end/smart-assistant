@@ -20,7 +20,7 @@ import { cn } from "../lib/utils";
 import { AccountTab } from "./settings/AccountTab";
 import { ApiAccessTab } from "./settings/ApiAccessTab";
 import { FeedbackTab } from "./settings/FeedbackTab";
-import { PreferencesTab } from "./settings/PreferencesTab";
+import { BuiltinHotkeysTable, PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Button, Modal, Spinner, Tabs } from "./ui";
@@ -30,13 +30,20 @@ export type SettingsSection = SettingsDestinationSection;
 type SectionDef = {
   id: SettingsSection;
   label: string;
+  /** 窄屏宫格列宽只有 ~80px，长标签在这里会被省略号截断（审计 SET-12），给它一个短名。 */
+  narrowLabel?: string;
   featureId?: ProductFeatureId;
   /** 仅 admin 可见(API key 管理面当前 admin-only rollout)。 */
   adminOnly?: boolean;
 };
 
 const PERSONAL: SectionDef[] = [
-  { id: "account", label: "账户与计费", featureId: PRODUCT_CAPABILITIES.billing.id },
+  {
+    id: "account",
+    label: "账户与计费",
+    narrowLabel: "账户",
+    featureId: PRODUCT_CAPABILITIES.billing.id,
+  },
   { id: "usage", label: "用量", featureId: PRODUCT_CAPABILITIES.billing.id },
   { id: "api-access", label: "API 接入", adminOnly: true },
   { id: "preferences", label: "偏好", featureId: PRODUCT_CAPABILITIES.preferences.id },
@@ -115,7 +122,8 @@ export function SettingsCenter({
   const [prefsErr, setPrefsErr] = useState<string | null>(null);
   const [prefsReloadTick, setPrefsReloadTick] = useState(0);
 
-  const needsPreferences = section === "preferences" || section === "hotkeys";
+  // 只有偏好页真的读 prefs;快捷键是静态表,不该被偏好接口的加载 / 失败挡住(审计 SET-02)。
+  const needsPreferences = section === "preferences";
 
   useEffect(() => {
     if (open) {
@@ -211,10 +219,12 @@ export function SettingsCenter({
                 onValueChange={(v) => setSection(v as SettingsSection)}
                 items={sections.map((s) => ({
                   value: s.id,
-                  label: s.label,
+                  label: s.narrowLabel ?? s.label,
                   featureId: s.featureId,
                 }))}
-                className="[&_[role=tab]]:px-3"
+                // 三列宫格放 7 个分区(admin 多一个「API 接入」)会在第三行剩一个孤项;
+                // 超过 6 项时改四列(4+3),6 项保持 3+3(审计 SET-12)。
+                className={cn("[&_[role=tab]]:px-3", sections.length > 6 && "grid-cols-4")}
               />
             </div>
           )}
@@ -300,9 +310,14 @@ function VerticalNav({
     >
       {groups.map((group) => (
         <div key={group.label}>
-          <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
-            {group.label}
-          </div>
+          {/* 只有一个分组时分组标题是多余层级(审计 SET-41);多组才需要区分。 */}
+          {groups.length > 1 ? (
+            <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
+              {group.label}
+            </div>
+          ) : (
+            <div className="pt-1" aria-hidden />
+          )}
           {group.items.map((it) => {
             const selected = it.id === value;
             const index = ids.indexOf(it.id);
@@ -408,7 +423,10 @@ function SettingsPanel({
     return <ApiAccessTab auth={auth} />;
   }
 
-  if (section === "preferences" || section === "hotkeys") {
+  // 快捷键是内置只读表,不依赖 prefs,直接渲染(审计 SET-02)。
+  if (section === "hotkeys") return <BuiltinHotkeysTable />;
+
+  if (section === "preferences") {
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.preferences.id}>
         {prefsLoading || !prefs ? (
@@ -436,7 +454,6 @@ function SettingsPanel({
             onPatch={onPatch}
             onUpgrade={onUpgrade}
             onOpenMemory={onOpenMemory}
-            pane={section === "hotkeys" ? "hotkeys" : "preferences"}
           />
         )}
       </div>
@@ -471,7 +488,15 @@ function SettingsPanel({
   );
 }
 
+/** 构建号来自 index.html 的 `<meta name="oc-build">`(FeedbackTab 同源);缺失时不显示该行。 */
+function currentBuildId(): string | null {
+  if (typeof document === "undefined") return null;
+  const value = document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content.trim();
+  return value || null;
+}
+
 function AboutSection() {
+  const build = currentBuildId();
   return (
     <div className="px-5 py-5">
       <div className="flex items-center gap-3">
@@ -501,7 +526,35 @@ function AboutSection() {
             {BRAND.name} Web · © {BRAND.year}
           </dd>
         </div>
+        {/* 反馈排障要对齐构建号,关于页是用户最容易找到它的地方(审计 SET-42)。 */}
+        {build && (
+          <div className="flex items-center justify-between gap-3">
+            <dt className="shrink-0 text-faint">版本</dt>
+            <dd className="truncate font-mono text-fg" data-testid="about-build">
+              {build}
+            </dd>
+          </div>
+        )}
       </dl>
+      {/* 法务入口:与落地页同一套 /terms、/privacy 路由(LegalPage),新标签打开不打断当前会话。 */}
+      <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t border-border pt-3 text-caption">
+        <a
+          href="/terms"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+        >
+          用户协议
+        </a>
+        <a
+          href="/privacy"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+        >
+          隐私政策
+        </a>
+      </div>
     </div>
   );
 }

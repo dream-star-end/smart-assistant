@@ -527,7 +527,9 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       onRegenerate: vi.fn(),
       resolveRetryTarget: () => retryableUser,
     });
-    expect(screen.getByText("免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续")).toBeInTheDocument();
+    expect(
+      screen.getByText("免费额度已用完，开通任意订阅套餐（Lite 及以上任一档）即可继续"),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开通 Lite" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
@@ -541,7 +543,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       subscriptionPaid: true,
       getToken,
     });
-    expect(screen.getByText("本期积分已用完,可购买加量包或升级套餐")).toBeInTheDocument();
+    expect(screen.getByText("本期积分已用完，可购买加量包或升级套餐")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "购买加量包" }));
     expect(onTopUp).toHaveBeenCalledTimes(1);
     expect(friction.reportClientFriction).toHaveBeenCalledWith(

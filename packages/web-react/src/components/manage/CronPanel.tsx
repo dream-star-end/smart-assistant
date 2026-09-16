@@ -53,24 +53,37 @@ import {
   useToast,
 } from "../ui";
 
-/** 送达方式。hint 常驻在表单里 —— 「仅记录」这个词用户无从判断结果去了哪里。 */
+/**
+ * 送达方式。hint 常驻在表单里 —— 「仅记录」这个词用户无从判断结果去了哪里。
+ * `fallback`：拉不到 /api/cron/channels 时是否进兜底列表。Telegram 不进 —— 个人版用户侧没有
+ * Telegram 绑定入口，偏好页的「Telegram 通知」开关也已随 settings 审计 SET-05 一并移除，把它写死
+ * 摆出来等于承诺一件做不到的事；只有后端明确下发 available 才展示，hint 也不再引导去一个不存在的开关。
+ * 存量 deliver=telegram 的任务仍按这里的 label 回显、编辑时仍可保留原值（见 deliverOptions 补项）。
+ */
 const DELIVER_OPTIONS = [
   {
     value: "webchat",
     label: "网页对话",
     hint: "结果会作为一条新消息出现在网页对话里。",
+    fallback: true,
   },
   {
     value: "telegram",
     label: "Telegram",
-    hint: "结果推送到你绑定的 Telegram —— 需先在「设置 → 偏好」里打开 Telegram 通知。",
+    hint: "结果推送到 Telegram。",
+    fallback: false,
   },
-  { value: "local", label: "仅记录", hint: "只写进智能体的记录，不会主动通知你。" },
+  {
+    value: "local",
+    label: "仅记录",
+    hint: "只写进智能体的记录，不会主动通知你。",
+    fallback: true,
+  },
 ] as const;
 
-const FALLBACK_DELIVER_SELECT: Array<{ value: string; label: string }> = DELIVER_OPTIONS.map(
-  (o) => ({ value: o.value, label: o.label }),
-);
+const FALLBACK_DELIVER_SELECT: Array<{ value: string; label: string }> = DELIVER_OPTIONS.filter(
+  (o) => o.fallback,
+).map((o) => ({ value: o.value, label: o.label }));
 
 function deliverCopy(value: string): { label: string; hint?: string } {
   return DELIVER_OPTIONS.find((o) => o.value === value) ?? { label: value };
@@ -253,7 +266,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [showRest, setShowRest] = useState(false);
-  /** 拉取失败保持写死三项;成功后只展示 available 通道。 */
+  /** 拉取失败只保留兜底两项（网页对话 / 仅记录）;成功后只展示 available 通道。 */
   const [deliverSelect, setDeliverSelect] = useState(FALLBACK_DELIVER_SELECT);
   const [confirmDialog, confirmDialogEl] = useConfirm();
   const toast = useToast();

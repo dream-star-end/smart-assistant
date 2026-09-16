@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, HupiCreateResult, MySubscription } from "../../lib/types";
 import { resetSubscribeUiState, SubscriptionDialog } from "./SubscriptionDialog";
-import { TopupDialog } from "./TopupDialog";
 
 const friction = vi.hoisted(() => ({
   reportClientFrictionOnce: vi.fn(() => "eid"),
@@ -83,23 +82,8 @@ afterEach(() => {
   });
 });
 
+// TopupDialog（旧充值弹层）零引用，已随审计 SET-43 删除；个人版充值/订阅统一走 SubscriptionDialog。
 describe("个人支付弹窗的手机路径", () => {
-  test("积分充值下单后只展示手机支付跳转，不加载二维码", async () => {
-    apiMocks.listPlans.mockResolvedValue([
-      { code: "test", label: "测试充值", amountCents: "3800", credits: "4000" },
-    ]);
-    apiMocks.createHupiOrder.mockResolvedValue(order);
-
-    render(<TopupDialog open auth={auth} onClose={() => {}} onPaid={() => {}} />);
-    fireEvent.click(await screen.findByRole("button", { name: /测试充值/ }));
-
-    expect(await screen.findByTestId("mobile-payment-link")).toHaveAttribute(
-      "href",
-      order.mobileUrl,
-    );
-    expect(screen.queryByRole("img")).not.toBeInTheDocument();
-  });
-
   test("订阅下单后只展示手机支付跳转，不加载二维码", async () => {
     apiMocks.listSubscriptionPlans.mockResolvedValue([
       { code: "free", name: "免费版", priceCents: "0", monthlyCredits: "300", periodDays: 30, tier: 0 },

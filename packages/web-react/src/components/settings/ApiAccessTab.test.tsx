@@ -782,9 +782,12 @@ describe("ApiKeyUsagePanel · 消耗统计", () => {
     render(<ApiKeyUsagePanel auth={auth} keys={KEYS} />);
     await waitFor(() => expect(api.getApiKeyUsage).toHaveBeenCalledWith(auth, "7d", undefined));
 
-    const credits = await screen.findByText("1,234 积分");
-    expect(credits).toHaveClass("text-accent");
-    const statGrid = credits.closest<HTMLElement>(".grid")!;
+    // StatTile 把数字与单位拆成两个 span(数字整体不换行,审计 SET-06);accent 落在数字行容器上。
+    // 「1,234」在按密钥表里也会出现,先锚定 stat 宫格再取。
+    const statGrid = (await screen.findByText("请求数")).closest<HTMLElement>(".grid")!;
+    const credits = within(statGrid).getByText("1,234");
+    expect(credits.parentElement).toHaveClass("text-accent");
+    expect(credits.parentElement).toHaveTextContent(/1,234\s*积分/);
     expect(within(statGrid).getByText("42")).toBeInTheDocument();
     expect(within(statGrid).getByText("12万")).toBeInTheDocument();
 

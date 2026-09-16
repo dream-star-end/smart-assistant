@@ -10,7 +10,7 @@ import {
 } from "../../lib/orgBilling";
 import type { AuthSession, OrgPayResult, OrgPlan } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
-import { Alert, Button, Input, Spinner, useToast } from "../ui";
+import { Alert, Button, IconButton, Input, Spinner, useToast } from "../ui";
 import { orgErrText } from "./orgShared";
 import { OrgPaySuccess, OrgPayQr } from "./OrgPayQr";
 
@@ -92,7 +92,7 @@ export function CreateOrgWizard({
         note: `${plan.name} · ${seats} 席`,
       });
     } catch (e) {
-      setErr(orgErrText(e, "发起开通失败,请稍后重试。"));
+      setErr(orgErrText(e, "发起开通失败，请稍后重试。"));
     } finally {
       setCreating(false);
     }
@@ -100,22 +100,26 @@ export function CreateOrgWizard({
 
   const onPaid = useCallback(() => {
     setPhase({ kind: "done" });
-    toast("组织创建成功,欢迎使用企业版!", "success");
+    toast("组织创建成功，欢迎使用企业版！", "success");
   }, [toast]);
 
   // ── 扫码到账段 ──
+  // 进度指示器在这一段也要渲染，否则第 3 步「支付」永远不会显示为进行中（审计 SET-35）。
   if (phase.kind === "qr") {
     return (
-      <div className="px-5 py-5">
-        <OrgPayQr
-          auth={auth}
-          order={phase.order}
-          amountCents={phase.totalCents}
-          note={phase.note}
-          onPaid={onPaid}
-          onBack={() => setPhase({ kind: "form" })}
-          backLabel="改配置"
-        />
+      <div className="flex flex-col">
+        <WizardSteps step="pay" />
+        <div className="px-5 py-5">
+          <OrgPayQr
+            auth={auth}
+            order={phase.order}
+            amountCents={phase.totalCents}
+            note={phase.note}
+            onPaid={onPaid}
+            onBack={() => setPhase({ kind: "form" })}
+            backLabel="改配置"
+          />
+        </div>
       </div>
     );
   }
@@ -125,7 +129,7 @@ export function CreateOrgWizard({
       <div className="px-5 py-5">
         <OrgPaySuccess
           title="组织已创建"
-          subtitle="席位积分已入组织期内池,现在可以邀请成员、共享技能了。"
+          subtitle="席位积分已入组织期内池，现在可以邀请成员、共享技能了。"
           onDone={onCreated}
           doneLabel="进入组织"
         />
@@ -161,12 +165,14 @@ export function CreateOrgWizard({
                     setStep("plan");
                   }
                 }}
-                placeholder="例如:某某科技有限公司"
+                placeholder="例如：某某科技有限公司"
                 maxLength={60}
                 autoFocus
               />
+              {/* 组织中心没有改名入口、后端也没有 rename 接口（审计 SET-10，需后端配合）：
+                  不再承诺「可稍后修改」，如实说明并给出变更途径。 */}
               <p className="mt-1.5 text-caption text-faint">
-                将作为组织在平台内的显示名,可稍后在组织中心修改。
+                将作为组织在平台内的显示名。创建后暂不支持自助修改，如需变更请联系客服。
               </p>
             </div>
             <div className="flex items-center justify-end gap-2">
@@ -289,12 +295,10 @@ export function CreateOrgDialog({
           <div className="flex items-center justify-between gap-3 px-5 py-4">
             <Dialog.Title className="text-title font-semibold text-fg">创建组织</Dialog.Title>
             <Dialog.Close asChild>
-              <button
-                aria-label="关闭"
-                className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-              >
+              {/* 走 ui/IconButton：自带 type="button" 与触屏 44px 命中（审计 SET-11，与 OrgCenter 同款）。 */}
+              <IconButton variant="muted" size="md" shape="square" aria-label="关闭">
                 <X size={17} />
-              </button>
+              </IconButton>
             </Dialog.Close>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
@@ -306,16 +310,20 @@ export function CreateOrgDialog({
   );
 }
 
-/** 三步进度指示。 */
-function WizardSteps({ step }: { step: Step }) {
+/** 三步进度指示（"pay" = 扫码到账段，前两步均已完成）。 */
+function WizardSteps({ step }: { step: Step | "pay" }) {
   const items: { key: Step | "pay"; label: string }[] = [
     { key: "name", label: "组织名" },
     { key: "plan", label: "选档 · 席位" },
     { key: "pay", label: "支付" },
   ];
-  const activeIdx = step === "name" ? 0 : 1;
+  const activeIdx = step === "name" ? 0 : step === "plan" ? 1 : 2;
   return (
-    <div className="flex items-center gap-2 border-b border-border px-5 py-3 text-meta">
+    <div
+      className="flex items-center gap-2 border-b border-border px-5 py-3 text-meta"
+      data-testid="create-org-steps"
+      data-active-step={items[activeIdx].key}
+    >
       {items.map((it, i) => {
         const done = i < activeIdx;
         const active = i === activeIdx;
@@ -398,6 +406,9 @@ export function SeatPicker({
   min?: number;
 }) {
   const lo = min ?? plan.minSeats;
+  // 步进按钮桌面 32px；触屏（hover:none）升到 44px 命中标准（审计 SET-11），输入框同步升高对齐。
+  const stepBtnCls =
+    "flex size-8 items-center justify-center rounded-md border border-border text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40 [@media(hover:none)]:size-11";
   return (
     <div className="flex items-center justify-between gap-3">
       <span className="text-meta text-muted">{label}</span>
@@ -407,7 +418,7 @@ export function SeatPicker({
           aria-label="减少席位"
           disabled={seats <= lo}
           onClick={() => onChange(seats - 1)}
-          className="flex size-8 items-center justify-center rounded-md border border-border text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
+          className={stepBtnCls}
         >
           <Minus size={14} />
         </button>
@@ -421,13 +432,13 @@ export function SeatPicker({
             onChange(Number.isFinite(n) ? n : lo);
           }}
           aria-label={label}
-          className="h-8 w-16 rounded-md border border-border bg-surface text-center text-title tabular-nums text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+          className="h-8 w-16 rounded-md border border-border bg-surface text-center text-title tabular-nums text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring [@media(hover:none)]:h-11"
         />
         <button
           type="button"
           aria-label="增加席位"
           onClick={() => onChange(seats + 1)}
-          className="flex size-8 items-center justify-center rounded-md border border-border text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+          className={stepBtnCls}
         >
           <Plus size={14} />
         </button>
