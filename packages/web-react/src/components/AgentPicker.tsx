@@ -314,8 +314,8 @@ export function AgentPicker({
             // 不可用卡此前整卡 disabled(C-06):不可聚焦、读屏读不到原因、也没有任何去处理的入口。
             // 现在保持可聚焦(aria-disabled 表达「不能选」),说明文案挂 aria-describedby,并在传入
             // onOpenPluginAuth 时提供「去授权」—— 整卡点击同样跳转,不会静默无反应。
-            // 标记为控件而非 agents 的教程 CTA 入口(data-product-feature):教程正文尚未描述「去授权」
-            // 入口,新增 feature 入口会触发 check:tutorials 入口身份变化;正文补写并抬版后再恢复(q-1076)。
+            // 作为 agents 的教程 CTA 入口登记(data-product-feature):教程正文「按任务而不是名字选择」
+            // 已描述待授权 / 待修复卡与「去授权 / 去处理」(t-1046,agents v5),q-1076 的临时降级到此恢复。
             return (
               <div
                 key={a.id}
@@ -324,7 +324,7 @@ export function AgentPicker({
               >
                 <button
                   type="button"
-                  data-product-control
+                  data-product-feature={PRODUCT_CAPABILITIES.agents.id}
                   aria-disabled="true"
                   aria-describedby={whyId}
                   title={onOpenPluginAuth ? '前往授权 / 修复所需能力' : undefined}
