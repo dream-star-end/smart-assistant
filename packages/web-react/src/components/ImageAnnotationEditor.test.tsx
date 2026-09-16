@@ -348,3 +348,72 @@ test('圈选后未写描述点发送:给引导提示并聚焦输入框(不静默
   expect(document.body.textContent).toMatch(/请先(在图片上圈选|描述想要的修改)/)
 })
 })
+
+// ── 审计 M-23(a11y-B 接 QA t-1038 移交):选区有无就地维护,不再每一笔抬手后对整张 mask 全量扫描。 ──
+describe('选区状态维护(M-23)', () => {
+  // getImageData 桩恒返 alpha=0:若实现仍靠扫描判定,画笔落笔后标题不会变成「已选中区域」。
+  test('画笔落一笔:不扫 mask 即判定有选区;撤销回到空白快照:扫一次并回到无选区', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ close: () => {} })))
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    await waitFor(() => expect(ctx.drawImage).toHaveBeenCalled())
+    expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument()
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+    // 画笔路径零扫描。
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+
+    // 历史序列化结算后「撤销」可用 → 恢复到落笔前的空白快照 → 扫一次(alpha=0)→ 回到无选区。
+    const undo = screen.getByRole('button', { name: '撤销' })
+    await waitFor(() => expect(undo).toBeEnabled())
+    fireEvent.click(undo)
+    await waitFor(() => expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument())
+    expect(ctx.getImageData).toHaveBeenCalledTimes(1)
+  })
+
+  test('矩形工具零面积抬手:扫一次 mask 定选区,不误报「已选中」', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    fireEvent.click(screen.getByRole('button', { name: /更多工具/ }))
+    fireEvent.click(screen.getByRole('button', { name: '矩形' }))
+
+    // 只按下抬起、没有拖动:矩形零面积,mask 仍是空白。
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    expect(ctx.getImageData).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument()
+    expect(screen.queryByText('已选中区域')).not.toBeInTheDocument()
+  })
+
+  test('清空:直接回到无选区,不扫 mask', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '撤销' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /更多工具/ }))
+    fireEvent.click(screen.getByRole('button', { name: '清空' }))
+    await waitFor(() => expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument())
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+  })
+})
