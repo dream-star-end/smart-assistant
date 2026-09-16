@@ -22,7 +22,15 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { reportClientFrictionBatch } from "../../lib/clientFriction";
 import {
@@ -55,6 +63,26 @@ const UNCAT = "__uncategorized__";
 
 /** 目录每页条数。搜索/切类目时回到一页,点「加载更多」按页递增。 */
 const PAGE_SIZE = 50;
+
+/**
+ * 分类片容器只在 `sm` 以下横向滚动(与 className 里的 `sm:overflow-x-visible` 同一断点)。
+ * 横滚区要能被键盘聚焦才能用方向键滚,所以窄屏给 tabIndex=0;桌面端 K-12 之后是换行、
+ * 不滚,再留 tabIndex 就成了一个什么都不做的 Tab 停靠点(QA t-1028 §6 #1)。
+ * 写法照 hooks/useMdViewport.ts;jsdom / SSR 默认 false(= 桌面,不给 tabIndex)。
+ */
+const NARROW_QUERY = "(max-width: 639px)";
+function subscribeNarrow(onChange: () => void): () => void {
+  if (typeof window.matchMedia !== "function") return () => {};
+  const mq = window.matchMedia(NARROW_QUERY);
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+}
+function getNarrowSnapshot(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia(NARROW_QUERY).matches;
+}
+function useNarrowViewport(): boolean {
+  return useSyncExternalStore(subscribeNarrow, getNarrowSnapshot, () => false);
+}
 
 /** 类目切换(与顶层 Tabs 同一套原语,不再是本页第三种横向控件)。value=存储层 kind。 */
 const KIND_TABS: TabItem[] = [
@@ -352,6 +380,7 @@ export function BrowsePanel({
   onOpenConnectors?: (pluginSlug?: string) => void;
 }) {
   const toast = useToast();
+  const narrow = useNarrowViewport();
   const [q, setQ] = useState("");
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -631,8 +660,9 @@ export function BrowsePanel({
         <div className="relative">
           <section
             aria-label="市场分类"
+            // 只在窄屏(真的横滚时)可聚焦;桌面换行不滚,不留无意义的 Tab 停靠点(QA t-1028 §6 #1)。
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 移动端横向滚动分类必须可由键盘聚焦和滚动。
-            tabIndex={0}
+            tabIndex={narrow ? 0 : undefined}
             className="flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible"
           >
             <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
