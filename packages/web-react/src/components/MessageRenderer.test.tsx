@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { createSession, type ChatMessage } from "../lib/chat/model";
 import type { OutboundMessageWire } from "../lib/chat/frames";
@@ -712,8 +712,8 @@ describe("permission 审批", () => {
       }),
       { onRespond, sending: true },
     );
-    // 自动弹出答题框（modal portal）。
-    expect(screen.getByText("选择颜色？")).toBeInTheDocument();
+    // 自动弹出答题框（modal portal）。题干同时出现在时间线卡的待决摘要里（PermissionCard PC-02），按对话框内断言。
+    expect(within(screen.getByRole("dialog", { name: "用户问答" })).getByText("选择颜色？")).toBeInTheDocument();
     fireEvent.click(screen.getByText("红"));
     fireEvent.click(screen.getByRole("button", { name: "提交" }));
     expect(onRespond).toHaveBeenCalledTimes(1);

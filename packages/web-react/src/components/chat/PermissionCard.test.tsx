@@ -26,6 +26,7 @@ import {
   PENDING_PERMISSION_TTL_MS,
   PermissionCard,
   PermissionPromptHost,
+  formatPermissionRemaining,
   isAwaitingPermissionPrompt,
   permissionHasExpired,
   resetPermissionAutoOpenMemory,
@@ -383,7 +384,8 @@ describe("PermissionCard 工具展示(F5/M7)", () => {
     );
     expect(screen.getByText(/完整问题仍在加载/)).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
-    await waitFor(() => expect(screen.getByText("长问题还在吗？")).toBeInTheDocument());
+    // 取回后题干同时出现在时间线卡的待决摘要(PC-02)与答题框里,按「至少一处」断言。
+    await waitFor(() => expect(screen.getAllByText("长问题还在吗？").length).toBeGreaterThan(0));
     fireEvent.click(screen.getByText("是"));
     fireEvent.click(screen.getByRole("button", { name: "提交" }));
     expect(onRespond).toHaveBeenCalledTimes(1);
@@ -902,6 +904,245 @@ describe("问答跳过语义", () => {
       behavior: "deny",
       message: "User skipped",
     });
+  });
+});
+
+describe("未决态专审(PC-xx · t-875)", () => {
+  test("PC-02 待决权限卡露出命令摘要;问答卡露出第一题题干与题数;已结清卡不再重复摘要", () => {
+    const { rerender } = render(
+      <PermissionCard msg={bashPermMsg({ requestId: "req-sum" })} onRespond={vi.fn()} livePrompt={false} />,
+    );
+    expect(screen.getByTestId("permission-pending-summary")).toHaveTextContent("npm run build");
+    rerender(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-sum-aq",
+          inputJson: {
+            questions: [
+              { question: "第一题在卡上可见吗?", options: [{ label: "是" }] },
+              { question: "第二题", options: [{ label: "是" }] },
+            ],
+          },
+        })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    const q = screen.getByTestId("permission-pending-question");
+    expect(q).toHaveTextContent("第一题在卡上可见吗?");
+    expect(q).toHaveTextContent("共 2 题");
+    rerender(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-sum-done", _resolved: true, _behavior: "allow" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.queryByTestId("permission-pending-summary")).toBeNull();
+  });
+
+  test("PC-06 剩余时长 ≥ 90 分钟按小时说,分钟档不变", () => {
+    expect(formatPermissionRemaining(25 * 60_000)).toBe("约 25 分钟内有效");
+    expect(formatPermissionRemaining(89 * 60_000)).toBe("约 89 分钟内有效");
+    expect(formatPermissionRemaining(90 * 60_000)).toBe("约 2 小时内有效");
+    expect(formatPermissionRemaining(DETACHED_ASK_USER_TTL_MS)).toBe("约 24 小时内有效");
+    render(
+      <PermissionCard
+        msg={askMsg({ requestId: "req-hours", _askUserExpiresAt: Date.now() + DETACHED_ASK_USER_TTL_MS })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.getByText("约 24 小时内有效")).toBeInTheDocument();
+  });
+
+  test("PC-05 卡头状态是 status 区域,文案保持「等待审批…」", () => {
+    render(<PermissionCard msg={bashPermMsg({ requestId: "req-status" })} onRespond={vi.fn()} livePrompt={false} />);
+    expect(screen.getByRole("status")).toHaveTextContent("等待审批…");
+  });
+
+  test("PC-10/11 待答入口:单条不再重复「· 打开」,多条标出待处理数", () => {
+    const one = bashPermMsg({ requestId: "req-bar-1", id: "p-bar-1" });
+    const two = bashPermMsg({ requestId: "req-bar-2", id: "p-bar-2" });
+    const { rerender } = render(<PermissionPromptHost messages={[one]} onRespond={vi.fn()} sending />);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.getByTestId("pending-approval-bar")).toHaveTextContent(/^智能体在等你确认打开$/);
+    rerender(<PermissionPromptHost messages={[one, two]} onRespond={vi.fn()} sending />);
+    // 第二条自动弹出;关掉后 bar 计数 2。
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.getByTestId("pending-approval-bar")).toHaveTextContent("共 2 项待处理");
+  });
+
+  test("PC-04 被顶掉的活提问在另一条答完后仍有待答入口,不会静默", () => {
+    const a = bashPermMsg({ requestId: "req-displaced-a", id: "p-a" });
+    const b = askMsg({ requestId: "req-displaced-b", id: "p-b" });
+    const respond = vi.fn();
+    const { rerender } = render(<PermissionPromptHost messages={[a, b]} onRespond={respond} sending />);
+    // A 先自动弹出;用户点了 B 卡的「审批」→ singleton 切到 B,A 被顶掉但没被标 dismissed。
+    expect(screen.getByRole("dialog", { name: "工具权限请求" })).toBeInTheDocument();
+    act(() => reopenPermissionUi("req-displaced-b"));
+    expect(screen.getByRole("dialog", { name: "用户问答" })).toBeInTheDocument();
+    // B 作答完成 → 只剩 A:A 已「展示过」不再自动弹,但必须有 bar 兜底。
+    rerender(
+      <PermissionPromptHost
+        messages={[a, { ...b, _resolved: true, _behavior: "allow" }]}
+        onRespond={respond}
+        sending
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("pending-approval-bar")).toHaveAttribute("data-request-id", "req-displaced-a");
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    expect(screen.getByRole("dialog", { name: "工具权限请求" })).toBeInTheDocument();
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  test("PC-12 单选题方向键在选项间移动并选中,roving tabindex 只留一个 Tab 停靠点", () => {
+    render(<PermissionCard msg={askMsg({ requestId: "req-arrows" })} onRespond={vi.fn()} livePrompt />);
+    const group = screen.getByRole("radiogroup");
+    const radios = screen.getAllByRole("radio");
+    // 未选时只有第一项可 Tab。
+    expect(radios[0]).toHaveAttribute("tabindex", "0");
+    expect(radios[1]).toHaveAttribute("tabindex", "-1");
+    radios[0].focus();
+    fireEvent.keyDown(group, { key: "ArrowDown" });
+    expect(radios[1]).toHaveFocus();
+    expect(radios[1]).toHaveAttribute("aria-checked", "true");
+    expect(radios[1]).toHaveAttribute("tabindex", "0");
+    expect(radios[0]).toHaveAttribute("tabindex", "-1");
+    fireEvent.keyDown(group, { key: "Home" });
+    expect(radios[0]).toHaveFocus();
+    expect(radios[0]).toHaveAttribute("aria-checked", "true");
+    fireEvent.keyDown(group, { key: "End" });
+    // 末项是「其他(自行输入)」:选中后出现输入框。
+    expect(screen.getByRole("radio", { name: /其他/ })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByLabelText("其他答案")).toBeInTheDocument();
+  });
+
+  test("PC-12 多选题方向键只移焦点不改勾选,各项都可 Tab", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-arrows-multi",
+          inputJson: {
+            questions: [
+              { question: "选能力", multiSelect: true, options: [{ label: "检索" }, { label: "生成" }] },
+            ],
+          },
+        })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    const boxes = screen.getAllByRole("checkbox");
+    expect(boxes.every((b) => b.getAttribute("tabindex") === "0")).toBe(true);
+    boxes[0].focus();
+    fireEvent.keyDown(screen.getByRole("group", { name: "选能力" }), { key: "ArrowRight" });
+    expect(boxes[1]).toHaveFocus();
+    expect(boxes[1]).toHaveAttribute("aria-checked", "false");
+  });
+
+  test("PC-13 未答就提交:错误以 alert 播报、焦点落到该题第一项,作答后提示消失", () => {
+    const onRespond = vi.fn();
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-alert",
+          inputJson: {
+            questions: [
+              { question: "第一题", options: [{ label: "A1" }, { label: "A2" }] },
+              { question: "第二题", options: [{ label: "B1" }] },
+            ],
+          },
+        })}
+        onRespond={onRespond}
+        livePrompt
+      />,
+    );
+    fireEvent.click(screen.getByRole("radio", { name: /^A1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "提交" }));
+    expect(onRespond).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("请先回答此题");
+    expect(screen.getByRole("radio", { name: /^B1/ })).toHaveFocus();
+    expect(screen.getByRole("radiogroup", { name: "第二题" })).toHaveAttribute("aria-describedby");
+    fireEvent.click(screen.getByRole("radio", { name: /^B1/ }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    // 多题带序号。
+    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+  });
+
+  test("PC-03 活提问过期 fail-safe:卡头「已过期」旁补说明,「审批」仍可点;历史过期卡不出这行", () => {
+    const { rerender } = render(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-failsafe", _askUserExpiresAt: Date.now() - 1000 })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("已过期");
+    expect(screen.getByTestId("permission-expired-failsafe")).toHaveTextContent(/仍可作答/);
+    expect(screen.getByRole("button", { name: "审批" })).toBeInTheDocument();
+    rerender(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-failsafe", _askUserExpiresAt: Date.now() - 1000 })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.queryByTestId("permission-expired-failsafe")).toBeNull();
+    expect(screen.getByText("提问已过期，无法再作答")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "审批" })).toBeNull();
+  });
+
+  test("PC-16 批准中:状态图标换成旋转 loader,按钮已收走且不弹框", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-approving", _controlPending: true })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("正在提交…");
+    expect(status.querySelector("svg")).toHaveClass("animate-spin");
+    expect(screen.queryByRole("button", { name: "审批" })).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // 等待态仍是静止时钟,不转。
+    cleanup();
+    render(<PermissionCard msg={bashPermMsg({ requestId: "req-waiting" })} onRespond={vi.fn()} livePrompt={false} />);
+    expect(screen.getByRole("status").querySelector("svg")).not.toHaveClass("animate-spin");
+  });
+
+  test("PC-17 ExitPlanMode 卡头不再连写两遍「退出计划模式」(标题 + 工具片);普通权限卡工具片照旧", () => {
+    render(
+      <PermissionCard
+        msg={bashPermMsg({
+          requestId: "req-plan-chip",
+          toolName: "ExitPlanMode",
+          text: "ExitPlanMode",
+          inputJson: { plan: "## 目标\n翻译文档", planFilePath: ".claude/plans/x.md" },
+        })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.getAllByText("退出计划模式")).toHaveLength(1);
+    cleanup();
+    render(<PermissionCard msg={bashPermMsg({ requestId: "req-bash-chip" })} onRespond={vi.fn()} livePrompt={false} />);
+    expect(screen.getByText("权限请求")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
+  test("PC-15 「其他」输入框回车即提交", () => {
+    const onRespond = vi.fn();
+    render(<PermissionCard msg={askMsg({ requestId: "req-enter" })} onRespond={onRespond} livePrompt />);
+    fireEvent.click(screen.getByRole("radio", { name: /其他/ }));
+    const input = screen.getByLabelText("其他答案");
+    fireEvent.change(input, { target: { value: "混合玩法" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond.mock.calls[0][0].updatedInput.answers).toEqual({ "多人在线的玩法形态选哪种?": "混合玩法" });
   });
 });
 
