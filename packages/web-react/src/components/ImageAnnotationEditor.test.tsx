@@ -166,7 +166,11 @@ describe('误触保护确认层(需求 §5)', () => {
     expect(screen.getByRole('alertdialog', { name: '放弃编辑确认' })).toBeInTheDocument()
     expect(onOpenChange).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: '放弃' }))
+    // 危险主键前景走 text-danger-fg:沉浸台恒为深色,深色 --danger #f0666e 上白字只有 3.07:1(a11y-C)。
+    const discard = screen.getByRole('button', { name: '放弃' })
+    expect(discard).toHaveClass('bg-danger', 'text-danger-fg')
+    expect(discard).not.toHaveClass('text-white')
+    fireEvent.click(discard)
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
 

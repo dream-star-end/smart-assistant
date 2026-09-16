@@ -1054,7 +1054,7 @@ export function ImageAnnotationEditor({
                       setConfirmClose(false)
                       onOpenChange(false)
                     }}
-                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-white transition-opacity hover:opacity-90"
+                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-danger-fg transition-opacity hover:opacity-90"
                   >
                     放弃
                   </button>

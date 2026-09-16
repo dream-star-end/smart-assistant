@@ -142,7 +142,11 @@ describe('ImageCommentMode', () => {
       expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
       expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
       fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
-      fireEvent.click(screen.getByRole('button', { name: '放弃' }))
+      // 危险主键前景走 text-danger-fg:沉浸台恒为深色,深色 --danger #f0666e 上白字只有 3.07:1(a11y-C)。
+      const discard = screen.getByRole('button', { name: '放弃' })
+      expect(discard).toHaveClass('bg-danger', 'text-danger-fg')
+      expect(discard).not.toHaveClass('text-white')
+      fireEvent.click(discard)
       expect(onBack).toHaveBeenCalledTimes(1)
     })
 
