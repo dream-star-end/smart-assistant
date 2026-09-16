@@ -1,7 +1,7 @@
 # A·market AI 市场 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-market`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 11 / 遗留 15）
+- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 12 / 遗留 14）
 - 结论：**P1 × 1 / P2 × 4 / P3 × 21**，共 26 条（另 1 条 admin 面备注 K-26）。P1 是发布表单草稿随市场弹窗关闭（Esc / 点遮罩）
   **无提示丢失**（代码注释自认技术债）。四条 P2：卡片描述 `line-clamp-2` 被同元素的 `block`
   抵消（卡高失控）、分区视图翻页时分区计数把「已加载」说成「共有」、详情弹层移动端底栏三枚
@@ -346,14 +346,19 @@ node browser-tests\ui-preview\shoot.mjs
 ## 7. 修复记录（阶段 B）
 
 - 分支：`feat/v5-selfhost-audit-market`（阶段 A 基线 `7240a826`）
-- 统计：发现 26 / 修复 11（P1 ×1、P2 ×4、P3 ×6）/ 遗留 15（全部 P3，理由见 §9）。
+- 统计：发现 26 / 修复 12（P1 ×1、P2 ×4、P3 ×7）/ 遗留 14（全部 P3，理由见 §9）。
 - 接手说明：修复与 after 截图由 fable-5-1-22 完成（09-16 02:00–03:04），但会话离线前未提交、未交付，工作树里
   全部为未暂存改动。fable-5-1-29 于 09-16 19:00 接手：逐文件复核 diff，重跑 typecheck / 模块 vitest / biome lint、
-  对 6 个关键场景重截 after 图核对后，按 K-01 / 发现页 / 详情与文案 / 文档 四组分别提交并推送（§8 表内为接手复核的结果）。
-- 附录 5 件拍板事项的落地口径（任务自动流转、无显式裁决，按最小改动取值）：① K-01 以**落盘 + 关弹窗时
-  toast 提示已暂存**实现，不做阻断式确认 —— 草稿既然不会丢，每次关市场都弹一次「放弃？」反而是打扰；
-  ② 未向后端提 offset，前端只做诚实呈现；③ K-12 未动（遗留）；④ K-23 未动（与「已安装页是卸载唯一
-  权威」冲突，遗留）；⑤ K-24 未动（接线归 shell，遗留）。
+  对 6 个关键场景重截 after 图核对后，按 K-01 / 发现页 / 详情与文案 / 文档 四组分别提交（`da6fc3bc6` / `2b81246ad` /
+  `2e58b37bc` / `a96286981`），但**未推送、未交付**即离线。fable-5-1-35 于 09-16 19:30 再接手：核对这 4 个提交与本表
+  逐条一致、工作树无残留改动；按指挥官拍板 ⑤ 补 K-24 可选 prop + 用例；重跑 typecheck / 模块 vitest（含 `lib/marketplace.test`）/
+  biome lint、补截 `market-unauth` 与 `market-browse-skill` after 图核对；推送并交付。
+- 附录 5 件拍板事项的落地口径（① – ④ 任务自动流转、无显式裁决，按最小改动取值；⑤ 由指挥官在接手任务书里明示）：
+  ① K-01 以**落盘 + 关弹窗时 toast 提示已暂存**实现，不做阻断式确认 —— 草稿既然不会丢，每次关市场都弹一次
+  「放弃？」反而是打扰；② 未向后端提 offset，前端只做诚实呈现；③ K-12 未动（遗留）；④ K-23 未动（与「已安装页
+  是卸载唯一权威」冲突，遗留）；⑤ K-24：**market 侧给 `MarketplaceCenter` 加可选 prop `onRequireLogin?: () => void`**
+  （有则「去登录」调它、由壳外负责关市场并切登录，与 `ManageCenter` 同款契约；没传保持只关弹窗），`App.tsx` 那一行
+  归 shell、由集成②接线，本模块不改 `App.tsx`。
 
 | 编号 | 状态 | 改动（`packages/web-react/src/` 下） | 用例 |
 |---|---|---|---|
@@ -368,16 +373,17 @@ node browser-tests\ui-preview\shoot.mjs
 | K-16 | ✅ | 详情评分徽章 `👍` → `<ThumbsUp>`（与卡片同款 lucide 图标）。 | `DetailModal.test` 既有评分用例改写 |
 | K-17 | ✅ | 半角标点 4 处：`DetailModal.tsx` 预设说明、`InstalledPanel.tsx` 卸载标题 `？`、原因 hint `；`、分组 hint `：`。 | —（文案） |
 | K-18 | ✅ | `ReviewPanel.tsx` 「2026-07-26提交」→ 日期与「提交」之间补空格。 | —（文案） |
-| K-08 / K-09 / K-10 / K-12 / K-13 / K-14 / K-15 / K-19 / K-21 / K-22 / K-23 / K-24 / K-25 / K-27 | ⏸ | 遗留，见 §9。 | — |
+| K-24 | ✅（market 侧） | `MarketplaceCenter.tsx` 新增可选 prop `onRequireLogin?: () => void`；未登录空态「去登录」`onClick={onRequireLogin ?? onClose}` —— 接了就走它（与 `ManageCenter` 同款：回调自己负责关市场 + 切登录，壳层不重复关），没接保持只关弹窗。`App.tsx` 接线归 shell（X-01），待集成②补一行。 | `MarketplaceCenter.test` +1（接了 `onRequireLogin`：被调 1 次、`onClose` 不被调）；既有未登录用例保留「没接则只关弹窗」断言 |
+| K-08 / K-09 / K-10 / K-12 / K-13 / K-14 / K-15 / K-19 / K-21 / K-22 / K-23 / K-25 / K-27 | ⏸ | 遗留，见 §9。 | — |
 
 ## 8. 验证（阶段 B）
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0；接手复核 09-16 19:08 再跑一次仍绿） |
-| 模块单测 | `npx vitest run src/components/marketplace src/components/MarketplaceCenter.test.tsx --maxWorkers=1` | ✅ 接手复核：11 个文件 / 137 例全绿（新增 8 例：MarketplaceCenter +1、BrowsePanel +3、DetailModal +1、PublishPanel +2、marketplace +1，另 2 例既有用例改写；每条逻辑改动有用例，见 §7 表；无 `.only` / `.skip`） |
-| 代码风格 | `npx biome lint <改动的 7 个源文件>` | ✅ 未新增诊断：15 条 `useExhaustiveDependencies` / `noArrayIndexKey` / `noDelete` 全在未触碰的行。`biome check` 另报 format 差异，来源是本机 `core.autocrlf=true` 把工作树检出成 CRLF（未触碰的 `FeaturedPanel.tsx` 同样报），提交时 git 归一为 LF，不是代码问题 |
-| 视觉 after | `OC_UI_SCENES=market-` `node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\market\after\` | ✅ 126 张全部成功（`failures: 0`、`unmockedApi: []`，09-16 03:04）。接手复核对 `market-browse-skill` / `market-browse-search-mobile` / `market-browse-longlist(-more)` / `market-detail-mobile` / `market-detail-agent-mobile` 6 场景重截 18 张到 `…\market\after-takeover\`，全部成功，逐张核对与下文 after 对照描述一致 |
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（exit 0；接手复核 09-16 19:08 再跑一次仍绿；fable-5-1-35 加 K-24 后 19:35 再跑仍绿） |
+| 模块单测 | `npx vitest run src/components/marketplace src/components/MarketplaceCenter.test.tsx --maxWorkers=1` + `npx vitest run src/lib/marketplace.test.ts --maxWorkers=1` | ✅ 09-16 19:36 / 19:40（fable-5-1-35，含 K-24 用例）：`components/marketplace/**` + `MarketplaceCenter.test` 10 个文件 / 109 例全绿，`lib/marketplace.test` 1 个文件 / 29 例全绿（合计 11 文件 / 138 例；较 19:11 那次 137 例 +1 = K-24 新用例）。新增 9 例：MarketplaceCenter +2、BrowsePanel +3、DetailModal +1、PublishPanel +2、marketplace +1，另 2 例既有用例改写；每条逻辑改动有用例，见 §7 表；无 `.only` / `.skip` |
+| 代码风格 | `npx biome lint <改动的 9 个源文件>` | ✅ 未新增诊断（`MarketplaceCenter.tsx` / `.test.tsx` 19:38 复跑：0 条）；其余 7 个文件 15 条 `useExhaustiveDependencies` / `noArrayIndexKey` / `noDelete` 全在未触碰的行。`biome check` 另报 **format / organizeImports**，经把工作树文件转 LF 后复跑核实：`MarketplaceCenter.tsx` 的 2 处 format 命中（`onCreateInChat={…}` 换行、`<div className="contents" …>` 折行）与 `MarketplaceCenter.test.tsx` 的整文件引号 / 分号风格、两文件的 import 顺序**全部是阶段 A 基线就有的既有差异**（这两个文件本来就不过 `biome format`，与 §5 备注的 `scenes-market.tsx` 同类），本轮新增行沿用文件既有风格，未引入新差异 |
+| 视觉 after | `OC_UI_SCENES=market-` `node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\market\after\` | ✅ 126 张全部成功（`failures: 0`、`unmockedApi: []`，09-16 03:04）。接手复核对 `market-browse-skill` / `market-browse-search-mobile` / `market-browse-longlist(-more)` / `market-detail-mobile` / `market-detail-agent-mobile` 6 场景重截 18 张到 `…\market\after-takeover\`，全部成功，逐张核对与下文 after 对照描述一致。fable-5-1-35 加 K-24 后对 `market-unauth` / `market-browse-skill` 重截 8 张到 `…\market\after-k24\`（全部成功）：未登录空态与「去登录」按钮外观不变（K-24 只改行为、需 App 接线后才可见），`market-browse-skill` 与 `after-takeover` 一致 |
 
 after 对照（同名 PNG，`before/` ↔ `after/`）：
 
@@ -385,6 +391,8 @@ after 对照（同名 PNG，`before/` ↔ `after/`）：
 - `market-browse-longlist--*` —— 结果条「已加载 50 个技能，还有更多」+ 右侧「加载更多」，各分区计数「已加载 N」+「还有更多未加载」。
 - `market-detail-mobile` / `market-detail-agent-mobile` —— 底栏从三枚竖排全宽按钮变为两枚并排，「已安装」Badge 不再被拉成全宽假按钮。
 - `market-detail--desktop` —— 评分徽章用 ThumbsUp 图标，与其余徽章同一图形语言。
+- `market-unauth--*`（`after-k24/`）—— 与 before 一致：K-24 在 market 侧只加了出口回调，未登录空态外观不变；
+  「去登录」真正跳到登录要等 `App.tsx` 接上 `onRequireLogin`（X-01）。
 
 **NOT RUN**：`npm test` 全量（本轮改动限于 marketplace 目录 + 壳 + `lib/marketplace.ts`，模块内 10 文件全绿；全量在 manage-B 已跑过一次、其 3 例既有失败与本模块无关）、`npm run test:browser`（未触碰高频交互面）、真机 iOS、真实审核状态流转。
 
@@ -399,6 +407,6 @@ after 对照（同名 PNG，`before/` ↔ `after/`）：
 | K-14 / K-15 / K-19（title-only 解释、Markdown 标题层级、authMode / 动作 id 映射） | 文案与视觉打磨，需逐项核对后端契约字段（`connectorContract.actions[].title` 是否存在） | 二期 |
 | K-21（校验缺项播报占高） | 需要与 SubmitBar 的"缺项即定位"契约一起重设计 | 二期 |
 | K-23（详情内卸载） | 与「已安装页是卸载唯一权威」的既有决定冲突（附录 4），未拍板不动 | 拍板后复用卸载弹层 |
-| K-24 / X-01（未登录「去登录」） | `App.tsx` 接线归 shell | shell-B 补 `onRequireLogin`，本模块再加 prop |
+| X-01（未登录「去登录」的 `App.tsx` 接线；K-24 market 侧已修） | `MarketplaceCenter` 已暴露 `onRequireLogin?: () => void`（§7）；`App.tsx` 归 shell，本模块不动 | 集成②在 `App.tsx` 渲染 `<MarketplaceCenter>` 处补一行 `onRequireLogin={() => { setMarketplaceOpen(false); setAuthMode("login"); setView("app"); }}`（照 ManageCenter 那一行） |
 | K-25 / X-02（offset 分页 / 虚拟化） | 需后端 | 后端提供 offset 后前端改 append |
 | K-27（原生 checkbox） | 需 shell 出 Checkbox 原语 | shell |
