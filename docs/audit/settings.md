@@ -252,3 +252,48 @@ manage-B / settings-B / messages-B 三条 B 任务互相登记了三处「归别
 - `docs/audit/manage.md` §6 修复记录中 **M-09 ⏸ / M-18·M-20·M-21 ⏸**（「遗留：`ConnectorsTab.tsx` 归 settings」）与 §7 X-02 → **已由本补丁 ① 落地**，修法与 manage.md §4 一致，用例见 8.1。
 - `lib/chat/pure.ts` 红卡文案（SET-15）当时是 `send_to` 转交 messages owner，`docs/audit/messages.md` 里没有对应登记条目（合并后核对过）→ **已由本补丁 ③ 落地**，以本文件为闭环记录；messages 归属的 `render.test.ts` / `cards.test.tsx` 仅同步了文案断言，未改行为。
 - 本文件 §6.3 的两条「跨模块」行已回指到这里。
+
+## 9. 二期（t-628）· 遗留 P3 收尾
+
+> 分支 `feat/v5-selfhost-audit-settings`，接续补丁① `c0efc9c91`（已含 integration `43b7cd3a4`）· 修复人：fable-5-1-40 · 2026-09-16
+> 口径：把 §5「建议不修 / 暂缓」与 §6.3「遗留 / 不修」两张表合成一张遗留表逐条处置；**本模块归属内、不依赖后端 / shell
+> 就能独立完成的项全部落地并配用例**，其余保持遗留并写明归属。需产品拍板的项按「最小改动、可回退、不改既有交互约定」自行定并写明理由，未开决策卡。
+
+### 9.1 逐条状态
+
+| 项 | 来源 | 二期处置 | 状态 |
+|---|---|---|---|
+| SET-42 ② 「检查更新」入口 | §6.3 | 关于页「版本」行下新增 `UpdateCheckRow`：`fetchServerBuild()` 以 `cache: "no-store"` 拉一次入口 HTML（`/`），抠出同一枚 `<meta name="oc-build">` 与客户端比对 —— 同 → 「已是最新版本」；不同 → 「发现新版本 {build}，刷新页面即可更新」+「立即刷新」（走 `appUpdate.reloadNow()`，与更新横幅同一条路：停 governor 定时器、不动自动 reload 预算）；读不到 meta / 请求失败各有一句可重试的说明。没有构建号（dev / meta 缺失）时整行不渲染 —— 那时版本握手本身就是 inert 的。**只调用 `lib/appUpdate` 的公开 `reloadNow()`，未改 shell 任何文件** | ✅ 已修 |
+| 关于页「备案」占位文案 | §5 末行 | `hasIcpNumber(BRAND.icp)`（真实备案号必含 ≥4 位数字）为假时不渲染「备案」行；运营在 `brand.ts` 填真值即自动出现。判据与 landing-B 页脚一致（landing 分支 `lib/legal.ts` `filedIcp()`，集成③ 合入后可改为直接引用，已在代码注释里标出） | ✅ 已修 |
+| 会话用量「加载更多」offset 分页重复 / 漏行 | §5 | 新增纯函数 `appendSessionRows(prev, next)` 按 `session_id` 去重（保留首次出现的行；首屏与翻页都过它），offset 仍按服务端原始行数推进。**重复行**（翻页期间新会话插到前面把上一页末尾顶进下一页）前端已消除；**漏行**是 offset 分页语义，仍需后端改游标分页 | ◐ 前端可做的部分已修 |
+| SET-14 免费用户能否买加量包（§4 风险注「需确认 `buyPack` 后端行为」） | §4 | 读 `packages/commercial/src/http/subscription.ts` `handleBuyPack`：下单前 `ensureFreeSubscription(user.id)`，加量包进免费订阅的期内桶 → **允许**。B 阶段红卡「开通 Lite + 加量包」与弹层脚注「加量包仅在当前套餐有效期内可用」（免费订阅也有周期）都成立，无需改动 | ✅ 判定关闭（无代码改动） |
+| SET-32 恢复条与订阅弹层双份轮询 | §6.3 | 维持「不修」：两者不会在同一 document 里并存（整页重载 → 弹层已卸载；bfcache 恢复 → 恢复条不重读 sessionStorage），判据已写在 `SubscriptionDialog.tsx` 轮询 effect 注释 | — 不修（有判据） |
+| SET-09 组织充值汇率预估 | §5 / §6.3 | 前端能做的（填额段说明 + 到账段实际入账数）B 阶段已做；真正的预估需后端在 `GET /api/org/plans` 或新端点下发 `credits_per_yuan` | ⏸ 遗留 · 需后端 |
+| SET-10 组织改名 | §5 / §6.3 | 文案已不再承诺；真实改名需后端 `PATCH /api/org {name}` + 前端入口 | ⏸ 遗留 · 需后端 |
+| `ConnectorsTab.tsx` / `KnowledgePlanetAutomationPanel.tsx` 目录迁移 | §5 / §6.3 | 只被 `ManageCenter` 渲染，迁移牵动 manage 的 import 与 `scenes-manage`；由 manage owner 决定 | ⏸ 遗留 · 跨模块 |
+| Auto-Dream 卡片提及供应商细节 / 营销风格 | §5 | 产品决策，不在 UX 审计范围 | — 不修 |
+| `ApiKeysSection` 深链把完整密钥放进 `ccswitch://` URL | §5 | CC Switch V1 协议要求，页面已有「请勿分享导入链接」提示 | — 不修（设计如此） |
+| 备案号真值 / `brand.ts` 联系邮箱 | §5 | `lib/brand.ts` 归 shell，值由运营提供；前端两处（关于页、landing 页脚）都已做到「占位不渲染、真值自动出现」 | ⏸ 遗留 · shell + 运营 |
+
+统计：遗留表 11 项全部有明确处置；**本模块内可独立完成的 4 项（SET-42 ②、备案占位、分页去重、SET-14 判定）4/4 落地（100%，≥ 80%）**；需后端 2、跨模块 2、不修 3。
+
+### 9.2 改动文件
+
+- `src/components/SettingsCenter.tsx`：`hasIcpNumber()`、`fetchServerBuild()`（导出供单测）、`UpdateCheckRow`；`AboutSection` 备案行条件渲染 + 版本行下挂检查更新。
+- `src/components/settings/UsageTab.tsx`：`appendSessionRows()`（导出）；首屏与 `loadMore` 均经它合并。
+- `src/components/SettingsCenter.test.tsx`：新增 6 例（备案占位 / 真值；无构建号不渲染检查更新；同版本「已是最新」；新版本「立即刷新」→ `appUpdate.reloadNow`；失败与读不到 meta 两种说明；`fetchServerBuild` 两种属性顺序 + 非 2xx 抛错）。
+- `src/components/settings/UsageTab.test.tsx`：新增 3 例（`appendSessionRows` 去重 / 同页重复 / 空输入；翻页重发上一页末尾会话时只渲染一行且 offset 按服务端行数推进）。
+- `browser-tests/ui-preview/scenes-settings.tsx`：新增场景 `settings-about-update-check`（`WithBuildMeta` 在渲染前注入 `<meta name="oc-build">`，卸载时撤掉，不影响同批次其他场景）。
+
+未动：`App.tsx`、`components/ui/**`、`lib/chat/**`、`lib/appUpdate.ts`、`lib/brand.ts`；补丁① 改过的 `ConnectorsTab` / `CronPanel` / `pure.ts` 未回退。
+
+### 9.3 验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0 |
+| 模块单测 | `npx vitest run src/components/settings src/components/org src/components/payment src/components/SettingsCenter.test.tsx src/components/ChatGptProxyDialog.test.tsx src/components/OrgCenter.test.tsx src/components/charts.test.tsx src/lib/orgBilling.test.ts src/lib/pendingPayment.test.ts src/lib/plans.test.ts --maxWorkers=1` | ✅ 21 文件 / 269 例全绿（含新增 9 例） |
+| 代码风格 | `npx biome lint` 四个改动文件 + 场景文件 | ✅ 本轮**新增 0 条**：`SettingsCenter.tsx:237 noNoninteractiveTabindex`、`UsageTab.tsx:161/186 useExhaustiveDependencies`、`UsageTab.test.tsx:314-316 noDelete` 均在未触碰的既有行（`git diff -U0` 核对 hunk 范围）；`scenes-settings.tsx` 0 条 |
+| ui-preview 场景类型检查 | `npm run typecheck:preview --workspace packages/web-react` | ⚠ 仍只有补丁① 记录过的 2 处 integration 既有错误（`scenes-manage-audit.tsx:54` TS5097、`scenes-taskboard.tsx:163` TS2322），本轮场景未新增 |
+| after-2 截图 | `OC_UI_SCENES='settings-about-update-check,workspace-settings-about' OC_UI_SHOT_DELAY=1200 node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\settings\after-2\` | ✅ 2 场景 / 8 张 / failures 0。已用 Read 看：`settings-about-update-check--desktop--light` 版本行 `9f3c2ab7e1d4` 下出现「检查更新」，「备案」行不再显示占位文案；`--mobile--dark` 同，按钮触控高度 44px；`workspace-settings-about--*`（无构建号）不出现检查更新，备案占位同样不渲染 |
+| NOT RUN | `npm run test:browser`（未触碰高频交互面）；真实服务端版本比对（本地无后端，`fetchServerBuild` 用 `Response` 桩覆盖同版本 / 新版本 / 无 meta / 非 2xx 四分支）；web-react 全量 `npm test`（本轮改动只落在 settings 目录与两个用例文件，模块套件 269 例已覆盖；landing-B 交付时跑过一次全量，唯一红的 `tutorialShowcase.test.ts` 在基线主克隆同样红，见 remember mem-595） | — |
