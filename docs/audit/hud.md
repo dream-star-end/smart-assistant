@@ -134,7 +134,7 @@
 | 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿（≈30–52s） |
 | 模块单测 | `cd packages\web-react; npx vitest run src/components/chat/PinnedTaskTracker.test.tsx src/components/chat/PinnedDelegateTracker.test.tsx src/hooks/useInflightDelegates.test.ts src/lib/chat/inflightDelegates.test.ts --maxWorkers=1` | ✅ 4 文件 / 55 用例通过（新增 11 例） |
 | 代码风格 | `npx biome lint <本轮 7 个改动文件>` | ✅ 0 诊断（基线 2 条 `useExhaustiveDependencies` 已加说明性 ignore）。`biome format` 在本机对所有已检出文件报整文件重排（仓库 web-react 代码为双引号 + 分号，与根 biome.json 的 single/asNeeded 不一致，与 shell / tools 文档记录一致），不作为门禁 |
-| 真浏览器交互门 | `cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | 见下方「test:browser」一行 |
+| 真浏览器交互门 | `cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` 组件门 **T1–T67 共 67 条全部 ok**（自检「清单 67 条全部执行」；含 HUD 用例 T61「刷新后 HUD 仍钉住」——首跑因 H-10 文案改名 not ok，同步 T61 断言后复跑 ok）。随后 `node --test` 16 文件：2 处失败均为**基线 / 环境既有**、与本模块无关：① `cc-switch-ascii-name`（settings `ApiKeysSection` 模型 id 断言，INTEGRATION.md §5 / composer / sidebar 均记为基线）；② `ocv5-185-qa`（Windows `symlink` EPERM；按集成②口径在 `packages/web-react/node_modules/@openclaude/protocol` 预建 junction 后单跑 **15/15 ✅**，环境项不入库）。 |
 | 视觉基线 | `OC_UI_SCENES=hud- node browser-tests/ui-preview/shoot.mjs` → `D:\code\test_project\test123\.audit-tmp\hud\{before,after}\` | ✅ before 40 张 / after 40 张（10 场景 × desktop/mobile × light/dark），两份 manifest `failures: []`、`unmockedApi: []`；逐张对照见 §6 各行 |
 
 before / after 逐张对照要点：
