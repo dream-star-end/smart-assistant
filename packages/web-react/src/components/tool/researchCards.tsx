@@ -208,7 +208,8 @@ function Chip({ children, href, tone }: { children: ReactNode; href?: string; to
   if (href && isSafeHttpUrl(href)) {
     return (
       <a
-        className="inline-flex rounded-full outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+        // 触屏 44px 命中(a11y-B tools#1):链接外框在 hover:none 下撑高、Badge 视觉不变。
+        className="inline-flex items-center rounded-full outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
         href={href}
         target="_blank"
         rel="noreferrer noopener"
@@ -541,7 +542,7 @@ function ArtifactPreviewLink({ src }: { src: string }) {
       href={signed}
       target="_blank"
       rel="noreferrer noopener"
-      className="inline-flex items-center gap-1 rounded bg-accent-soft px-2 py-1 text-meta text-accent hover:underline"
+      className="inline-flex items-center gap-1 rounded bg-accent-soft px-2 py-1 text-meta text-accent hover:underline [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
     >
       预览
       <ExternalLink className="size-3" />
