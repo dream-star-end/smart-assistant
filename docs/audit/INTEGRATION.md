@@ -465,3 +465,100 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | release-rehearsal | `c1fdc935e` | t-1279 发布预演（canonical `3b7c38b9d` 试合） | 8 | 未推（**不合入**） |
 
 下一步：集成⑤（t-1237 前置）从本轮终点起按上表合入 + t-1348 gzip 修复，复跑全量门（`build` 必须绿）；归档终稿 t-897 从集成⑤ 终点起更新 `docs/audit/SUMMARY.md` 与 `archive/*` 的 `[待集成④]` 标记；release-prep t-1237 以 canonical `f1952819f` 重做试合。
+
+## 集成⑤（t-1237 · 2026-09-18 01:45 – 02:15 · 合并 / 门 / 记录 / 推送 fable-5-1-4）
+
+> 执行人说明：t-1237 在待办池解锁时被宿主自动领到 fable-5-1-3 名下，而他在交付 t-1567 后已离线；组内在线只剩指挥官 fable-5-1-4 与 fable-5-1-6（t-1598 发布准备预演），用户 02:0x 明示「全权负责，端到端部署上线，不用问我 / 现在就你和另外一个会话了，都不要停」（决策 d-1603），故由指挥官**代执行**本轮合并、门与记录；任务记录仍挂在 fable-5-1-3 名下，以本段为实际交付。
+> 起点 `c97a750f8`（集成④ 终点）。任务书 6 条 + 指挥官追加 2 条（t-1575 首屏回归修复、t-1236 QA 报告），共 **8 步 `--no-ff` 合并**、1 个 `chore` accept、1 个 docs（本段）。主克隆 `v5-selfhost` 上操作（d-24），`git log --format=%s c97a750f8..HEAD` 全为 merge / refactor / chore / docs（d-26，无 `fix(v5)`），未 rebase / squash / force-push，未碰 `changelog.json`。
+> 前置：fable-5-1-2 的集成⑤预演 `feat/v5-selfhost-audit-integ5-rehearsal@b6b78e876`（t-1503：6 条已合、typecheck ✅、**build ❌ 475.2KB**）→ 指挥官逐合并点二分归因（§3）→ t-1575 修复分支；QA 集成④ t-1236（fable-5-1-6，docs/audit/qa/qa-integ4.md，三道门由 fable-5-1-3 t-1567 实跑）结论「可进集成⑤，阻断 0；必带 budget-fix + t-1575」。预演分支**不合入**。
+
+### 1. 合入顺序与 SHA
+
+| 序 | 成员分支 @ HEAD（任务） | 合并提交 | 文件 / 行 | 备注 |
+|---|---|---|---|---|
+| 1 | `feat/v5-selfhost-audit-budget-fix@65019b5dc`（t-1348 首屏 gzip 预算修复：点开才需要的覆盖层改 `React.lazy`，阈值 471040 未动） | `ec09ed419` | 12 files, +323/−142 | `App.tsx` 三方自动合并 |
+| 2 | `feat/v5-selfhost-audit-qa-a11y@eed1f3989`（t-1232 QA 复核 a11y-B 三条 + PermissionCard，含两处 QA 修复） | `c701daac9` | 5 files, +222/−4 | 零重叠 |
+| 3 | `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`（t-1234 market K-27 `ui/Checkbox` 原语 / settings 备案判据去重 / misc-p3 D-02·D-08 接线） | `7cae5427f` | 18 files, +659/−85 | 零重叠 |
+| 4 | `feat/v5-selfhost-audit-leftover-tut@69e18aa93`（t-1235 tutorials TU-17 深链 + TU-34 hero token） | `c4a516697` | 10 files, +529/−28 | 引入首屏回归（§3），由第 5 步修正 |
+| 5 | `feat/v5-selfhost-audit-leftover-tut-budget@a947662bb`（t-1575 `useAppRoute` 深链校验改用零依赖 `tutorialSignatureWorkIds`，不再静态导入 `tutorialSignatureWorks→tutorialCaseCatalog`） | `10e1348fb` | 4 files, +50/−5 | 紧跟第 4 步；useAppRoute chunk 30.7KB → 2.0KB |
+| 6 | `feat/v5-selfhost-audit-a11y-c@c35fd00c6`（t-1233 a11y-C 跨模块同源项：§5 13 项 7 修 / 5 同批闭环 / 1 不修 + 复扫补修 2；含 t-1344 第四手复核 `ea9348b2b`） | `ecf912b88` | 17 files, +312/−14 | **唯一冲突** `RichBlocks.test.tsx`，见 §2 |
+| 7 | `feat/v5-selfhost-audit-archive@35e3ec7c9`（t-897 归档终稿预写 +1，纯文档；集成④ 合入 `a38a093bf` 后前进的那一笔） | `b6da4ef8d` | 1 file, +19/−13 | — |
+| 8 | `feat/v5-selfhost-audit-qa-integ4@31a8a92d6`（t-1236 QA 集成④ 最终 HEAD 独立复核报告 `docs/audit/qa/qa-integ4.md`，纯文档） | `936d44e85` | 1 file, +153 | — |
+
+八步合计（`git diff --shortstat c97a750f8 HEAD`，含 accept）**64 files, +2269/−292**，43 个提交。`git rev-list --count HEAD..<成员 HEAD>` 对 8 条均为 **0**；`git grep -l '^<<<<<<< ' HEAD -- packages docs` 为空。集成⑤ 自有提交：`91358ce54` chore 教程同步快照 accept（§4）、docs 本段。
+
+### 2. 冲突与取舍
+
+- **`packages/web-react/src/components/RichBlocks.test.tsx`（a11y-c ↔ leftover-shell）**：两条分支在 `OptionsBlock` 的同一 describe 末尾各新增一条用例——leftover-shell 的「demo 演示模式文案（D-08）」与 a11y-C 的「已选项勾标 / 确认按钮 `text-accent-fg`」→ **两条全部保留**，先 D-08 后 a11y-C（与预演 t-1503 的解法一致）；合并后该文件 `vitest` 25/25 绿。`RichBlocks.tsx` 本体三方自动合并（reason 文案与 `text-accent-fg` 同时在）。
+- 其余 7 步零冲突（`App.tsx` 在第 1 步三方自动合并：budget-fix 的 `React.lazy` 拆分与集成④ 接线不同 hunk）。
+
+### 3. 首屏 gzip 预算回归（本轮专项，由集成⑤预演暴露）
+
+预演树 `b6b78e876`（6 条合完）`vite build` ❌ **475.2KB > 460.0KB**，而 budget-fix 单独为 445.5KB。指挥官在自己的 worktree 上对预演分支逐合并点 detached 构建（脚本与日志 `.audit-tmp\release-rehearsal\bisect-integ5-first-screen.ps1` / `integ5-bisect\SUMMARY.txt`）：
+
+| 合并点 | 首屏闭包 gzip | 变化 |
+|---|---|---|
+| `c1ef51a44` + budget-fix | 446.8KB ✅ | — |
+| `537595a1e` + qa-a11y | 446.8KB ✅ | 0 |
+| `b6c56be2d` + leftover-shell | 447.3KB ✅ | +0.5KB（styles） |
+| **`586131c42` + leftover-tut** | **475.2KB ❌** | **`useAppRoute-*.js` 1.7KB → 30.7KB** |
+| `6952c72ff` + a11y-c / `b6b78e876` + archive | 475.2KB ❌ | 0 |
+
+根因：leftover-tut `3fee24a58`（TU-17 深链）在 `hooks/useAppRoute.ts`（入口静态闭包）新增 `import { SIGNATURE_WORKS } from '../lib/tutorialSignatureWorks'`，只为校验 `&work=planet|gravity`，却把 `tutorialSignatureWorks → tutorialCaseCatalog`（教程案例数据）整个拖进首屏（`vite.config.ts:77-87` 的历史注释正警告过「useAppRoute 拖教程案例数据」）。修复 t-1575（`a947662bb`，第 5 步）：新增零依赖 `lib/tutorialSignatureWorkIds.ts`（`SIGNATURE_WORK_IDS = ['planet','gravity']` + 类型），`useAppRoute` 改引它，`SignatureWork.id` 反向以该类型约束，另加 `tutorialSignatureWorkIds.test.ts` 断言两表集合相等防漂移。合入后 integration `build` ✅ **447.8KB（余量 12.2KB）**，见 §5。
+
+### 4. `check:tutorials`：合入后一次功能源漂移（source-only accept，**待用户终审**）
+
+| 时间 | HEAD | 结果 | 处置 |
+|---|---|---|---|
+| 01:50 | `936d44e85`（8 步合并） | 「功能源变化: agents, billing-usage」；能力注册表 / 入口身份 / 正文 / 媒体 / 案例 / 新增能力 / 待确认下线均无（`.audit-tmp\integration\integ5\check-tutorials-1.log`）；纯预演树 `b6b78e876` 同一份漂移（`.audit-tmp\leftover-tut-budget\check-tutorials-pure-b6b78e876.log`），与 t-1575 无关 | 按 q-1227 口径（a11y / 样式改动致、入口身份无变）`--source-only` 接受 |
+| 01:52 | `91358ce54` | `npm run tutorials:accept -- --source-only --ids agents,billing-usage --note "集成⑤：source-only 接受 agents / billing-usage 功能源漂移（a11y-C AgentPicker·OrgSubscribeDialog、budget-fix SubscriptionDialog 等 className/lazy 改动致；t-1237）"` → `OK · source-only · 2 capability snapshots changed · 0 case snapshots changed`；`check:tutorials OK · 26 capabilities · 12 real-world cases · 26 media pairs`（`tutorials-accept.log` / `check-tutorials-2.log`） | `chore(v5)` 单独提交 `91358ce54`（三份同步文件，history **第 70 条**） |
+
+漂移来源：`agents` 功能源含 `AgentPicker.tsx`（a11y-C #5「默认」徽章 `bg-accent + text-accent-fg`）；`billing-usage` 功能源含 `SubscriptionDialog.tsx`（budget-fix `React.lazy` 拆分）/ `OrgSubscribeDialog.tsx`（a11y-C #1「当前」徽章）。均为 className / 加载方式改动，无用户可见文案增删，入口身份变化 0。**可逆性**：`git revert 91358ce54` 回到 accept 前。终审导读应列：集成③ §4 17 项（q-1076）、t-1046 普通 accept（第 68 条）、集成④ §4 1 项（q-1227，第 69 条）、本轮 2 项（第 70 条）。
+
+### 5. 全量门结果（最终源码态 HEAD = `91358ce54`；主克隆；脚本 `.audit-tmp\integration\integ5\run-gates.ps1`，汇总 `GATES-SUMMARY.txt`，各步 `*.log`）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0（29s） |
+| 预览台类型检查 | `npm run typecheck:preview --workspace packages/web-react` | ✅ exit 0（19s） |
+| 教程门禁 | `npm run check:tutorials` | ✅ OK · 26 / 12 / 26（§4） |
+| **首屏 gzip 预算（`build`）** | `npm run build --workspace packages/web-react`（`tsc -b && vite build`） | ✅ **exit 0**，5108 modules；首屏 modulepreload 闭包 **13 chunk gzip 447.8KB（458555 B）< 预算 460.0KB，余量 12.2KB**：`main` 130.0KB、`tapePayload` 122.9KB、`styles` 77.9KB、`react-vendor` 55.3KB、`radix-vendor` 29.9KB、`lucide-vendor` 17.7KB、`media` 5.2KB、`viewport-shared` 2.9KB、`useAppRoute` 2.0KB…（`vite-build.log` / `measure-first-screen.log`）。集成④ 的 471.4KB ❌ 由 t-1348 + t-1575 转绿 |
+| web-react 全量单测 | `cd packages\web-react; npx vitest run --maxWorkers=2` | ✅ **305 文件 / 4306 例全部通过，0 失败**（339s，`vitest-full.log`）。集成④ 302 / 4279 → +3 文件（`org/OrgSubscribeDialog.test.tsx`、`ui/Checkbox.test.tsx`、`lib/tutorialSignatureWorkIds.test.ts`）/ +27 例 |
+| 真浏览器门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` **68 全过（清单 68 条全部执行）**；`node --test` 87 例 **85 通过 / 2 失败** = `cc-switch-ascii-name` ×2（基线，与集成①②③④逐条相同）；146s（`test-browser-2.log`；首跑 `test-browser.log` 因未设 `OC_E2E_BROWSER` 环境错误 exit 2，非代码问题） |
+| 代码风格 | `npx biome check --line-ending=crlf <52 个改动源文件>` HEAD vs 基线 `c97a750f8` 逐文件对比（`biome-compare.ps1` / `biome-compare.txt`） | **lint 规则新增 0 条**；5 条 `format` 差异全在本轮新增文件（`heroTheme.ts` / `ui/Checkbox.tsx` / `ui/Checkbox.test.tsx` / `hooks/useAppRoute.test.ts` / `scenes-market-audit.tsx`）= Windows 工作树 CRLF 与 formatter 行尾判定的差异，`git ls-files --eol` 显示 blob 为 `i/lf`，Linux CI 不受影响；既有文件计数逐一相同 |
+| ui-preview 全量截图 + a11y 复扫 | 集成④ 同口径（`shoot.mjs` 301 场景 / `scan.mjs` + compare） | **第二拍**：本段提交时尚未跑（两人在线、t-1268 优先），随后在 detached 工作树上补跑并以 docs(v5) 追加结论；t-1236 / t-1524 的 52 张截图抽样（新增阻断 0）与 a11y-C 的 288 场景复扫（白字压 accent 4 → 0）已覆盖本轮改动面 |
+
+### 6. 已知基线失败（本轮更新）
+
+| 项 | 现象 | 状态 |
+|---|---|---|
+| `browser-tests/cc-switch-ascii-name.node-test.mjs` ×2 | 「还没有 API Key」超时 / 模型 id 断言 | 基线（五轮逐条相同） |
+| `packages/web-react` `npm run build` 首屏 gzip 预算 | 集成④ 471.4KB ❌ → 预演 475.2KB ❌ | ✅ **本轮已解**：447.8KB（t-1348 + t-1575） |
+| `check:tutorials` 快照漂移 | agents / billing-usage 2 项 | ✅ 已 `--source-only` accept（§4，**待用户终审**） |
+| `test:browser` 环境 | 未设 `OC_E2E_BROWSER` 时找不到 Chrome | 环境项，命令带 env 即可 |
+
+### 7. 遗留 / 后续范围
+
+- **待用户终审**：四笔教程同步快照 accept（集成③ 17 项 / t-1046 / 集成④ 1 项 / 本轮 2 项）；归档终稿 t-897（持有人 fable-5-1-7 离线，待重派）。
+- **a11y 同源遗留**：`TutorialCenter.tsx:387`「案例」模式头部图标块 `bg-accent text-white`（a11y-c.md §3 已给一行改法，归 tutorials）。
+- biome `format` 5 个新文件（§5）：如需消掉，在 Linux 或以 `--line-ending=lf` 跑 `biome format --write`，与逻辑无关。
+- 截图 / a11y 第二拍（§5 末行）。
+- **不合入**：`integ5-rehearsal@b6b78e876`（t-1503 预演，6 个 `rehearsal:` 合并）、`release-rehearsal@a4452c7b6`（t-1279 发布预演 + `docs/audit/RELEASE.md` v2.1，RELEASE.md 由 t-1268 带入）、`release-prep-rehearsal`（t-1598，进行中）。
+- **canonical**：`origin/feat/v5-selfhost` = `f1952819f`（比集成④时记录再 +1：`feat(v5): wire Sand-usable Cursor families into the picker`，含迁移 0281）；服务器 live 已是 `f1952819f` 且 0281 已 apply（RELEASE.md v2.1 §2.2b）。t-1268 从本轮终点合 canonical，7 处冲突解法见 RELEASE.md §1.2 / §3（AgentPicker.tsx 需叠回 a11y-C 改动）。
+
+### 8. 分支合入状态单（集成⑤ 终点现算）
+
+集成④ §8 的 24 条：HEAD 只前进未回退，`rev-list --count HEAD..<分支>` 仍全为 0（不再重列）。本轮新合入 8 条：
+
+| 分支 `feat/v5-selfhost-audit-*` | 分支 HEAD | 合并提交 | 未合入提交 | 远端 |
+|---|---|---|---|---|
+| budget-fix | `65019b5dc` | **集成⑤ `ec09ed419`** | 0 | = 本地 |
+| qa-a11y | `eed1f3989` | **集成⑤ `c701daac9`** | 0 | = 本地 |
+| leftover-shell | `7e7c7e43b` | **集成⑤ `7cae5427f`** | 0 | = 本地 |
+| leftover-tut | `69e18aa93` | **集成⑤ `c4a516697`** | 0 | = 本地 |
+| leftover-tut-budget | `a947662bb` | **集成⑤ `10e1348fb`** | 0 | = 本地 |
+| a11y-c | `c35fd00c6` | **集成⑤ `ecf912b88`** | 0 | = 本地 |
+| archive | `35e3ec7c9` | **集成⑤ `b6da4ef8d`** | 0 | = 本地 |
+| qa-integ4 | `31a8a92d6` | **集成⑤ `936d44e85`** | 0 | = 本地 |
+
+下一步：**t-1268 发布准备**——integration 合 canonical `f1952819f`（RELEASE.md §3.1 命令 + t-1598 实测解法），复跑全量门（build ≤ 460KB），把 `docs/audit/RELEASE.md` 带进 integration，push；随后 canonical `--ff-only` + push，服务器按 RELEASE.md §4 执行（t-1269）。
