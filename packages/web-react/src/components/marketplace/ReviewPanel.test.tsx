@@ -252,6 +252,50 @@ test("触控靶:待审勾选框、AI 记录折叠头、功能验收确认都由�
   );
 });
 
+test("K-27:审核面三处勾选框都走 ui/Checkbox 原语;「全选」部分勾选时为 indeterminate(读屏 mixed)", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({ versionId: "1", name: "技能甲" }),
+    pending({
+      versionId: "2",
+      kind: "connector",
+      name: "某 API 插件",
+      manifest: { proposedSecurityDecision: {} },
+      rawBundle: { "evals/case.md": "case" },
+    }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  const all = (await screen.findByRole("checkbox", { name: "全选" })) as HTMLInputElement;
+  const rowA = screen.getByRole("checkbox", { name: "选择 技能甲" });
+  const rowB = screen.getByRole("checkbox", { name: "选择 某 API 插件" });
+  // 展开连接器审查区,把第三处(功能验收确认)也挂出来。
+  fireEvent.click(screen.getByRole("button", { name: /某 API 插件/ }));
+  const verify = await screen.findByRole("checkbox", { name: /真实功能验收/ });
+  for (const box of [all, rowA, rowB, verify]) {
+    // 原语标记:不再是裸 <input className="accent-accent">,视觉与 Switch / Chip 同一套。
+    expect(box).toHaveAttribute("data-ui", "checkbox");
+    expect(box.className).not.toContain("accent-accent");
+    expect(box.closest("label")).toHaveClass("[@media(hover:none)]:min-h-11");
+  }
+
+  // 全无 → 未选;勾一行 → 部分选中(indeterminate / mixed);再勾一行 → 全选。
+  expect(all).not.toBeChecked();
+  expect(all.indeterminate).toBe(false);
+  fireEvent.click(rowA);
+  expect(all).toBePartiallyChecked();
+  expect(all.indeterminate).toBe(true);
+  fireEvent.click(rowB);
+  expect(all).toBeChecked();
+  expect(all.indeterminate).toBe(false);
+  // 点「全选」文字即全部取消(label 关联由原语保证)。
+  fireEvent.click(screen.getByText("全选"));
+  expect(rowA).not.toBeChecked();
+  expect(rowB).not.toBeChecked();
+  expect(all).not.toBeChecked();
+});
+
 test("折叠态不落悬空 aria-controls:待审详情与 AI 记录都是展开才挂载", async () => {
   adminMarketplacePending.mockResolvedValue([pending()]);
   adminMarketplaceAiReviews.mockResolvedValue([]);

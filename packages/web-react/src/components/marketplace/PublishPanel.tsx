@@ -31,6 +31,7 @@ import {
   Alert,
   Badge,
   Button,
+  Checkbox,
   Field,
   IconButton,
   Input,
@@ -1763,25 +1764,26 @@ function AgentPublishForm({
               {TOOLSET_OPTIONS.map((t) => {
                 const checked = d.toolsets.includes(t.value);
                 return (
-                  <label
+                  // K-27:ui/Checkbox 原语;卡片式外观仍由这里的 className 决定(原语只管控件 + 触控靶)。
+                  // 「必选」项 disabled 但不压暗:它是已勾定的事实,不是不可用的选项。
+                  <Checkbox
                     key={t.value}
                     className={cn(
-                      "flex items-center gap-2 rounded-lg border px-3 py-2 text-body transition-colors [@media(hover:none)]:min-h-11",
+                      "flex items-center rounded-lg border px-3 py-2 transition-colors",
                       checked ? "border-accent/50 bg-accent-soft text-fg" : "border-border text-muted",
-                      t.locked ? "cursor-not-allowed" : "cursor-pointer",
+                      t.locked && "opacity-100",
                     )}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={t.locked}
-                      onChange={() => toggleToolset(t.value)}
-                      className="accent-accent"
-                    />
-                    <span className="font-medium">{t.label}</span>
-                    <span className="text-caption text-faint">{t.hint}</span>
-                    {t.locked && <Badge size="sm">必选</Badge>}
-                  </label>
+                    checked={checked}
+                    disabled={t.locked}
+                    onChange={() => toggleToolset(t.value)}
+                    label={
+                      <span className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{t.label}</span>
+                        <span className="text-caption text-faint">{t.hint}</span>
+                        {t.locked && <Badge size="sm">必选</Badge>}
+                      </span>
+                    }
+                  />
                 );
               })}
             </div>

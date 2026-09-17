@@ -25,8 +25,9 @@ import type { ApiMockTable, Scene } from './types'
 const fail = (status: number, message: string, code?: string) => () =>
   Promise.reject(new ApiError({ status, message, code, requestId: 'req_audit_9b3e2c11' }))
 
-/** 挂载后按顺序模拟点击（selector 或按钮文案子串），把静态预览台推进到二级状态。 */
-type ClickStep = { selector?: string; text?: string; delay?: number }
+/** 挂载后按顺序模拟点击（selector 或按钮文案子串），把静态预览台推进到二级状态。
+ *  `scroll`：点击前先把目标滚进视口（长表单里折叠在首屏之下的区块，截图才拍得到）。 */
+type ClickStep = { selector?: string; text?: string; delay?: number; scroll?: boolean }
 
 function findClickTarget(step: ClickStep): HTMLElement | null {
   if (step.selector) return document.querySelector<HTMLElement>(step.selector)
@@ -56,6 +57,7 @@ function AutoClick({ steps, children }: { steps: ClickStep[]; children: ReactNod
         if (cancelled) return
         const target = findClickTarget(step)
         if (target) {
+          if (step.scroll) target.scrollIntoView({ block: 'center' })
           target.click()
           return
         }
@@ -317,6 +319,13 @@ export const marketAuditScenes: Scene[] = [
     steps: [{ text: '发布到市场', delay: 500 }],
   }),
 
+  // K-27:发布智能体的工具集勾选卡(ui/Checkbox 原语;「核心」必选项已勾且禁用),滚到该区块再拍。
+  derive('market-publish-agent', {
+    id: 'market-publish-agent-toolsets',
+    label: '发布智能体 · 工具集勾选卡（Checkbox 原语，必选项禁用不压暗）',
+    steps: [{ selector: 'label:has(input[data-ui="checkbox"][disabled])', scroll: true, delay: 600 }],
+  }),
+
   // ── 审核：全选进入批量态 / 拒绝理由输入框 ──
   derive('market-review', {
     id: 'market-review-batch',
@@ -327,6 +336,12 @@ export const marketAuditScenes: Scene[] = [
     id: 'market-review-reject',
     label: '审核 · 点「拒绝」弹出理由输入框',
     steps: [{ text: '拒绝', delay: 500 }],
+  }),
+  // K-27:ui/Checkbox 原语 —— 只勾一行,「全选」进入部分选中(indeterminate,视觉减号、读屏 mixed)。
+  derive('market-review', {
+    id: 'market-review-partial',
+    label: '审核 · 只勾一行 → 「全选」部分选中（Checkbox 原语 indeterminate）',
+    steps: [{ selector: 'input[data-ui="checkbox"][aria-label^="选择 "]', delay: 500 }],
   }),
 
   // ── 未登录 ──

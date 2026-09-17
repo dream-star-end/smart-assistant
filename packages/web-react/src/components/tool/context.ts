@@ -58,7 +58,20 @@ export function useToolCardActions(): ToolCardActions {
 export type ChatInteraction = {
   sendUserText?: (text: string) => void;
   busy?: boolean;
+  /**
+   * 没有 sendUserText 时,交互块拿它向用户解释「为什么点不了」(misc-p3 D-08):
+   * "demo" = ?demo=1 演示模式(离线 fixture,没有真实会话可投递)。
+   * 不传 = 历史 / 只读等一般情形,交互块用通用文案。
+   */
+  reason?: ChatInteractionUnavailableReason;
 };
+
+export type ChatInteractionUnavailableReason = "demo";
+
+/** 交互块在没有发送能力时给用户看的一句话;按 reason 分,不写死在各个块里。 */
+export function chatInteractionUnavailableText(reason?: ChatInteractionUnavailableReason): string {
+  return reason === "demo" ? "(演示模式仅供浏览,登录后可在真实会话中点选)" : "(此会话中不可交互)";
+}
 
 export const ChatInteractionContext = createContext<ChatInteraction>({});
 

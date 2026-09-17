@@ -1059,6 +1059,33 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     expect(noFetch).not.toHaveBeenCalled()
   })
 
+  // misc-p3 D-02:demo 会话按 id 取本地 fixture。此前 onDemoSelect 只认 s1、其余会话既标着有消息
+  // 又点开一片空白(还先出历史骨架);现在 s2–s6 是干净空会话,切回 s1 恢复两条消息,全程零网络。
+  test('demo 切换会话按 id 取 fixture:其余会话为空会话且不出历史骨架,切回 s1 恢复消息(D-02)', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    const noFetch = vi.fn(() => {
+      throw new Error('demo mode must not hit the network')
+    })
+    vi.stubGlobal('fetch', noFetch as unknown as typeof fetch)
+
+    render(<App />)
+    expect(screen.getByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('锂金属负极枝晶抑制机理综述'))
+    await waitFor(() =>
+      expect(screen.queryByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeNull(),
+    )
+    // 空会话:不是「有 N 条消息但还没到」的骨架,也不是加载中。
+    expect(screen.queryByLabelText('正在加载会话历史')).toBeNull()
+    expect(screen.queryByTestId('partial-history-skeleton')).toBeNull()
+
+    fireEvent.click(screen.getByText('把商业版重做成 ChatGPT 风格'))
+    await waitFor(() =>
+      expect(screen.getByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument(),
+    )
+    expect(noFetch).not.toHaveBeenCalled()
+  })
+
   // shell 审计 S-01:⌘K 原先无条件打开移动端抽屉(Sheet 带 md:hidden)。桌面断点下抽屉不可见,
   // 但 Radix 模态照常把 <body> 设成 pointer-events:none —— 整页点死且看不见任何弹层。
   test('⌘K 桌面视口:只展开内联侧栏并聚焦搜索框,不打开移动抽屉(S-01)', async () => {

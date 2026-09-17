@@ -249,9 +249,15 @@ test('关于页:备案占位文案不渲染,真实备案号才出现', () => {
     first.unmount()
 
     BRAND.icp = '赣ICP备2026123456号-1'
-    render(<SettingsCenter {...base} initialSection="about" />)
+    const second = render(<SettingsCenter {...base} initialSection="about" />)
     expect(screen.getByText('备案')).toBeInTheDocument()
     expect(screen.getByText('赣ICP备2026123456号-1')).toBeInTheDocument()
+    second.unmount()
+
+    // 判据与 landing 页脚 / 法务页同源(lib/legal.ts filedIcp):首尾空白一并归一,三处展示口径一致。
+    BRAND.icp = '  赣公网安备 36010002000123号  '
+    render(<SettingsCenter {...base} initialSection="about" />)
+    expect(screen.getByText('赣公网安备 36010002000123号')).toBeInTheDocument()
   } finally {
     BRAND.icp = brandIcpSnapshot
   }
