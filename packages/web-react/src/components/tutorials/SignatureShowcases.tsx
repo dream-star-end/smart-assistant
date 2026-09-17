@@ -3,13 +3,15 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { SIGNATURE_WORKS, signatureAsset, signatureTask, type SignatureWork } from '../../lib/tutorialSignatureWorks'
 import type { TutorialCase } from '../../lib/tutorialCaseCatalog'
 import { SHOWCASE_IFRAME_SANDBOX } from '../../lib/tutorialStudio'
+import { cn } from '../../lib/utils'
 import { Button } from '../ui'
+import { HERO_SURFACE_CLASS, HERO_THEME_VARS } from './heroTheme'
 
 type RunProps = { onRun?: (item: TutorialCase) => void; actionLabel?: string }
 function WorkCover({ work }: { work: SignatureWork }) {
   const [failed, setFailed] = useState(false)
   // objectPosition 78%：封面图左侧自带「下一颗星球，由你定义。」大字与参数面板，桌面态会从渐变里透出来与正文标题叠成幽灵字（审计 TU-29）。
-  return failed ? <div className="flex h-full items-center justify-center bg-[#101624] p-8 text-center text-lg text-white">{work.subtitle}</div> : <img className="h-full w-full object-cover" style={{ objectPosition: '78% center' }} src={signatureAsset(work, 'cover.png')} alt={work.title + '真实运行画面'} loading="lazy" width={1440} height={900} onError={() => setFailed(true)} />
+  return failed ? <div className={cn('flex h-full items-center justify-center p-8 text-center text-lg', HERO_THEME_VARS, 'bg-(--hero-bg) text-(--hero-fg)')}>{work.subtitle}</div> : <img className="h-full w-full object-cover" style={{ objectPosition: '78% center' }} src={signatureAsset(work, 'cover.png')} alt={work.title + '真实运行画面'} loading="lazy" width={1440} height={900} onError={() => setFailed(true)} />
 }
 export function SignatureGallery({ onSelect, restoreFocusWorkId }: { onSelect: (work: SignatureWork) => void; restoreFocusWorkId?: SignatureWork['id'] | null }) {
   const entries = useRef(new Map<SignatureWork['id'], HTMLButtonElement>())
@@ -25,14 +27,15 @@ export function SignatureGallery({ onSelect, restoreFocusWorkId }: { onSelect: (
     <h1 className="mt-4 max-w-3xl text-balance text-[34px] font-semibold leading-[1.15] tracking-tight text-fg sm:text-[48px]">别只问 AI。<br />让它做给你看。</h1>
     <p className="mt-4 max-w-2xl text-body leading-7 text-muted">下一颗星球，一场引力实验。这里展示的不是功能清单，是可以点进去、亲手改变的真实作品。</p>
     <div className="mt-8 space-y-6">
-      {SIGNATURE_WORKS.map((work, index) => <article key={work.id} className="relative isolate overflow-hidden rounded-3xl border border-white/10 bg-[#080e19] text-white">
+      {/* 品牌深蓝底与左侧渐变遮罩都走 hero 模块级 token(TU-34):浅色仍是深蓝,暗色下抬亮 + 描边,卡片不再与页面底色融成一片。 */}
+      {SIGNATURE_WORKS.map((work, index) => <article key={work.id} className={cn('relative isolate overflow-hidden rounded-3xl', HERO_SURFACE_CLASS)} data-tutorial-hero="signature">
         <div className="relative h-[230px] overflow-hidden sm:absolute sm:inset-0 sm:h-auto"><WorkCover work={work} /></div>
-        <div className="pointer-events-none absolute inset-0 hidden bg-gradient-to-r from-[#080e19] via-[#080e19]/97 to-transparent sm:block" />
+        <div className="pointer-events-none absolute inset-0 hidden bg-gradient-to-r from-(--hero-bg) via-(--hero-bg)/97 to-transparent sm:block" />
         <div className="relative flex min-h-[260px] flex-col justify-center p-6 sm:min-h-[430px] sm:max-w-[59%] sm:p-10">
           <p className="font-mono text-micro tracking-[.16em] sm:text-xs" style={{ color: work.color }}>0{index + 1} / {work.kicker}</p>
           <h2 className="mt-4 text-balance text-[27px] font-semibold leading-tight tracking-tight sm:text-[36px]">{work.title}</h2>
           <p className="mt-4 max-w-md text-meta leading-7 text-white/65">{work.subtitle}</p>
-          <div className="mt-7"><button type="button" ref={(node) => { if (node) entries.current.set(work.id, node); else entries.current.delete(work.id) }} onClick={() => onSelect(work)} className="inline-flex min-h-11 items-center gap-3 rounded-full bg-white px-5 py-3 text-meta font-semibold text-[#101820] transition hover:bg-white/85 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"><Play size={15} fill="currentColor" />{work.action}<ArrowRight size={15} /></button></div>
+          <div className="mt-7"><button type="button" ref={(node) => { if (node) entries.current.set(work.id, node); else entries.current.delete(work.id) }} onClick={() => onSelect(work)} className="inline-flex min-h-11 items-center gap-3 rounded-full bg-white px-5 py-3 text-meta font-semibold text-(--hero-bg) transition hover:bg-white/85 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"><Play size={15} fill="currentColor" />{work.action}<ArrowRight size={15} /></button></div>
           {/* 这行正是「别把它当成会话回放」的声明，却曾是整卡最不可读的一行（10px / 40% 白，≈3.3:1）；抬到 caption + 75% 白过 AA（审计 TU-12）。 */}
           <p className="mt-4 text-caption text-white/75">原创代码实作 · 画面来自实际运行 · 非完整会话回放</p>
         </div>
@@ -51,7 +54,7 @@ export function SignatureDetail({ work, onBack, onRun, actionLabel }: RunProps &
     {/* 返回走 Button 原语，触屏自动 44px（审计 TU-11）。 */}
     <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2 text-muted hover:text-fg"><ArrowLeft size={15} />返回案例展厅</Button>
     <div className="mt-6 flex flex-wrap items-center justify-between gap-3"><div><p className="font-mono text-caption text-accent">{work.kicker}</p><h1 ref={heading} tabIndex={-1} className="mt-2 text-[26px] font-semibold tracking-tight text-fg outline-none sm:text-[34px]">{work.title}</h1></div><a className="inline-flex items-center gap-2 text-meta text-accent" href={signatureAsset(work, 'index.html')} target="_blank" rel="noopener noreferrer">全屏独立体验 <ExternalLink size={15} /></a></div>
-    <div className="mt-6 overflow-hidden rounded-2xl border border-border bg-[#080e19]">
+    <div className={cn('mt-6 overflow-hidden rounded-2xl', HERO_THEME_VARS, 'border border-border bg-(--hero-bg)')}>
       {!loaded && <p role="status" className="p-4 text-meta text-white/70">{slow ? '设备加载较慢，可点“全屏独立体验”；三维作品需要 WebGL。' : '正在打开真实作品…'}</p>}
       {/* 仓内静态资产（可信）：放开下载与新窗口，作品内「保存画面 / 来源」链接才有反应；仍不给 allow-same-origin（审计 TU-28）。社区投稿的 HTML_EMBED_SANDBOX 不动。 */}
       <iframe title={work.title + '可交互作品'} src={signatureAsset(work, 'index.html')} sandbox={SHOWCASE_IFRAME_SANDBOX} referrerPolicy="no-referrer" onLoad={() => setLoaded(true)} className="h-[min(70dvh,480px)] w-full border-0 sm:h-[780px]" />
