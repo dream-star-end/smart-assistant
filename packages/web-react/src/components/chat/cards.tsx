@@ -44,7 +44,9 @@ import {
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
-import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../settings/SubscriptionDialog";
+// 从 lib 取(不是 settings/SubscriptionDialog):红卡在首屏同步渲染,静态引订阅弹窗会把弹窗 +
+// 支付入口一并钉进入口闭包(2026-09-17 first-screen-budget 超限修复)。
+import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../../lib/subscribeIntent";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";

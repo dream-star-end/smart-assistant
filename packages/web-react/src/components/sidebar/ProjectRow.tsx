@@ -1,8 +1,8 @@
 import { ChevronDown, ChevronRight, Folder, MoreHorizontal, Plus } from "lucide-react";
 import type { DragEvent } from "react";
+import { PROJECT_COLORS } from "../../lib/projectColors";
 import type { ChatProject } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { PROJECT_COLORS } from "../ProjectSettingsDialog";
 import { SessionStatusDot } from "../SessionStatusDot";
 import {
   DropdownMenu,
