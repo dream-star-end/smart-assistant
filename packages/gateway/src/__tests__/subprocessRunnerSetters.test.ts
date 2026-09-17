@@ -309,7 +309,7 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
     assert.equal(resolveCcbSubagentModel('grok-build'), DEFAULT_CCB_SUBAGENT_MODEL)
   })
 
-  it('cursor-* parents fall back to the CCB sub-agent default (glm-5.3-zai) — a member of the platform aux set the turn-lease gate admits', () => {
+  it('cursor-* parents fall back to the CCB sub-agent default (glm-5.3) — a member of the platform aux set the turn-lease gate admits', () => {
     // egress modelAuthorityGate allowed set = {lease.canonicalModel} ∪ PLATFORM_AUX_MODEL_IDS
     // (= [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL]). The pin
     // is decoupled from the secondary utility model (deepseek stays the
@@ -322,20 +322,20 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
     delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
     delete process.env.OPENCLAUDE_SECONDARY_MODEL
     try {
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3')
       assert.deepEqual(
         _buildCcbSubagentModelEnv({ sessionModel: 'cursor-fable-5.1-high', routing: 'settings-default' }),
-        { CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.3-zai' },
+        { CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.3' },
       )
       // Secondary-utility override does NOT move the sub-agent pin any more.
       process.env.OPENCLAUDE_SECONDARY_MODEL = 'deepseek-v4-lite'
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3')
       assert.equal(_buildSecondaryUtilityModelEnv().ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-lite')
       // Dedicated ops override for the sub-agent pin still works (must be routable).
       process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'deepseek-v4-flash'
       assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
       process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'haiku'
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3')
     } finally {
       if (prevSub === undefined) delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
       else process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = prevSub

@@ -23,8 +23,8 @@ import {
 import { applyModelDefaultEffort, type ProxyBody } from "../http/proxy/shared.js";
 
 describe("effortMetaForModel — protocol 推导适用性", () => {
-  it("ark glm-5.2/5.3:白名单 high/max", () => {
-    for (const model of ["glm-5.2", "glm-5.3", "glm-5.3-zai"]) {
+  it("ark glm-5.2 / zai glm-5.3-zai:白名单 high/max", () => {
+    for (const model of ["glm-5.2", "glm-5.3-zai"]) {
       assert.deepEqual(effortMetaForModel(model), { applicable: true, allowed: ["high", "max"] });
     }
   });
@@ -36,8 +36,8 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
       });
     }
   });
-  it("capability-zero 静态(strip output_config):kimi/qwen/minimax → 不适用", () => {
-    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "deepseek-v4-flash-opencode-go", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max", "MiniMax-M3"]) {
+  it("capability-zero 静态(strip output_config):kimi/qwen/minimax/scnet → 不适用", () => {
+    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "deepseek-v4-flash-opencode-go", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max", "MiniMax-M3", "glm-5.3", "glm-5.3-flash"]) {
       assert.deepEqual(effortMetaForModel(m), { applicable: false, allowed: [] }, m);
     }
   });
@@ -62,6 +62,7 @@ describe("provider ops 派生枚举", () => {
     assert.ok(opsProviderIds().includes("moonshot"));
     assert.ok(opsProviderIds().includes("bailian"));
     assert.ok(opsProviderIds().includes("zai"));
+    assert.ok(opsProviderIds().includes("scnet"));
   });
 });
 
