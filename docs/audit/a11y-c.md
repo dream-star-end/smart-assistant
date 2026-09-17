@@ -113,6 +113,14 @@
 - **CDP 复扫**（`.audit-tmp\a11y\scan.mjs`，`OC_REPO=wt\a11y-c`，288 场景 → `t1344-scan\`、`t1344-scan.log`，约 8.5 min）：288 / 288，渲染失败 0；汇总 cL 47 / cD 70 / t44 166 / t24 377 / names 11 / ax 1 / tabBad 13。`t1344-compare.mjs`（→ `t1344-compare.txt`）：对比度 fg/bg 组合 35 → 29，**新增 0**、清零 6（与 §2.1 同一组）；「白字压 bg-accent / bg-danger」4 → **0**；对比度 / 触控 / 无名控件任一指标相对基线上升的场景 **0**。唯一逐场景差异是 `tutorials-help-menu-open` tabBad 1 → 2：本轮 Tab 走查把 Radix FocusScope 护栏 `<span>`（`html > body > span`，0×0、`tabindex=0`、invisible）多计了一次（i=0 与 i=2 为同一元素），与 a11y-shell §4.5 记录的同场景计数抖动同源，`report.mjs` 本就把 `focusable-invisible` 排除在问题外；tutorials 不在本分支改动面内，非回归。
 - **git**：本文提交后 `git push -u origin feat/v5-selfhost-audit-a11y-c`（HTTPS + 代理，非 force）→ origin HEAD == 本地 HEAD；`git status -sb` 除 2 个行尾假改动外干净（最终 SHA 见 complete_task 交付）。
 
+### 2.3 t-1233 收尾补门：真浏览器交互门（fable-5-1-5，2026-09-18 00:3x–00:4x）
+
+接手状态：t-1233 从待办池领到时 `wt\a11y-c` 已在 `361f59b1f`、origin 同步，fable-5-1-3 正以 t-1344 在同一工作树跑 §2.2 复核；故本手不改代码、不重复 §2.2 已跑的门，只补一项前三手都没跑过的门：本分支改到 `AgentPicker`（Composer）与 `RichBlocks`（消息面），按任务书 ③ / d-28 属高频交互面，`npm run test:browser` 必跑。等 §2.2 的 288 场景复扫进程退出后再启动，避免两套 Chromium 抢 CPU。
+
+- **test:browser**（`cd packages\web-react; $env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser`，代码 HEAD `12275f27a`，日志 `.audit-tmp\a11y-c\t1233-test-browser.log`）：`run.mjs` 组件门 **68 / 68 全过**（自检「清单 68 条全部执行」；含 Composer T1–T4 / T22 / T23 / T35、消息面 T8–T12 / T18 / T21 / T68、工具卡 T13、T41 密度 token 明暗主题）；随后 `node --test` 16 文件 73 例：**70 过 / 3 败**，3 败与 INTEGRATION §5 集成①②③登记的基线逐条相同、与本分支改动无关：`cc-switch-ascii-name` ×2（settings `ApiKeysSection` 等「还没有 API Key」10s 超时 + 模型 id 断言 `gemini-3.8-flash` vs `sonnet-5`，未改动的主克隆同红）、`ocv5-185-qa` ×1（Windows `symlinkSync packages/protocol → node_modules/@openclaude/protocol` EPERM，环境项）。**无新增失败**。
+- 只读复核：`git grep text-white` 全 `src`，与实底 `bg-accent` / `bg-danger` 同行的只剩 `TutorialCenter.tsx:387`（见 §3 补记）；`bg-grad-cta text-white`（Button gradient / Avatar brand / Sidebar / TeamPanel 等）与 `bg-black/xx` 上的白字不属本类。§1 表 13 项与 a11y-shell §5 表 13 行逐条对得上；8 个用例文件的 className 断言（`text-accent-fg` ×7 / `text-danger-fg` ×2 / `placeholder:text-white/60` ×2）与 `before\` / `after\` 各 60 张截图均在。
+- 本手代码改动 0；文档提交见 §4。
+
 ---
 
 ## 3. 复扫后仍有命中但不属本条的项（逐条理由）
@@ -126,12 +134,15 @@
 
 另：`ContainerWebPreview.tsx:1345/1403/1775` 有同类 `text-white/35` 写法，但预览场景（加载 / 错误态）里这些元素未渲染、复扫未命中，本条按「复扫命中」口径未动，留给 media owner 顺手收。
 
+另（t-1233 收尾补记）：`TutorialCenter.tsx:387` 教程中心头部图标块 `text-white` + `mode === "cases" ? "bg-accent" : "bg-grad-cta"`——「案例」模式下是白图标压实底 accent（深色 2.82 <3:1），与 shell#1 同根因；但它不在 a11y-shell §5 清单里，复扫也未命中（`<svg>` 图标不是文本节点，扫描器不计），且归 tutorials（本条边界外），按「§5 清单 + 复扫命中」口径不动。一行改法：`mode === "cases" ? "bg-accent text-accent-fg" : "bg-grad-cta text-white"`（`text-accent-fg` 不能直接套到 `bg-grad-cta` 分支上），留给 tutorials owner / 集成⑤ 顺手收。
+
 ---
 
 ## 4. 交付清单
 
-- 分支 `feat/v5-selfhost-audit-a11y-c`，代码 HEAD `12275f27a`（本文档的两个 `docs(v5)` 提交紧随其后，最终 SHA 与 origin HEAD 见 complete_task 交付），基线见文首；本条自有提交 10 个（7 代码 + 1 用例格式化 + 2 文档，均 `style(v5)` / `docs(v5)`，未碰 changelog.json）：
-  `b591e64b6` settings/org/manage 三处 `-fg`｜`59e66773f` messages RichBlocks 勾标 + 确认键｜`00b86b565` kp-automation 勾选框｜`5533e0503` media 两处「放弃」危险键｜`abb246fdb` composer 「默认」徽章底 soft｜`c0c9059a1` media 两处 placeholder｜`faa6e8b26` composer 「默认」徽章改实底 + `-fg`（复扫修正）｜`12275f27a` OrgSubscribeDialog.test 按 biome.json 格式化（收尾）｜`361f59b1f` 交付文档（第三手）｜本次收尾复核文档提交（第四手，t-1344）。
+- 分支 `feat/v5-selfhost-audit-a11y-c`，代码 HEAD `12275f27a`（本文档的三个 `docs(v5)` 提交紧随其后，最终 SHA 与 origin HEAD 见 complete_task 交付），基线见文首；本条自有提交 11 个（7 代码 + 1 用例格式化 + 3 文档，均 `style(v5)` / `docs(v5)`，未碰 changelog.json）：
+  `b591e64b6` settings/org/manage 三处 `-fg`｜`59e66773f` messages RichBlocks 勾标 + 确认键｜`00b86b565` kp-automation 勾选框｜`5533e0503` media 两处「放弃」危险键｜`abb246fdb` composer 「默认」徽章底 soft｜`c0c9059a1` media 两处 placeholder｜`faa6e8b26` composer 「默认」徽章改实底 + `-fg`（复扫修正）｜`12275f27a` OrgSubscribeDialog.test 按 biome.json 格式化（收尾）｜`361f59b1f` 交付文档（第三手）｜`ea9348b2b` 收尾复核文档（第四手，t-1344）｜本次 test:browser 补门 + 遗留登记文档提交（t-1233 收尾，fable-5-1-5）。
+- 未做（最少可交付口径）：相关模块 md 回写——同一清单已在 `a11y-shell.md` §5 按 owner 列出，本条处置以本文 §1 为准，模块文档的交叉引用交集成⑤ / 归档终稿统一登记。
 - 改动文件（16 + 本文）：`OrgSubscribeDialog.tsx` + `OrgSubscribeDialog.test.tsx`（新）、`OptimizationPanel.tsx` + `.test.tsx`、`ApiKeysSection.tsx` + `ApiAccessTab.test.tsx`、`RichBlocks.tsx` + `.test.tsx`、`KnowledgePlanetAutomationPanel.tsx` + `.test.tsx`、`ImageCommentMode.tsx` + `.test.tsx`、`ImageAnnotationEditor.tsx` + `.test.tsx`、`AgentPicker.tsx` + `.test.tsx`、`docs/audit/a11y-c.md`。
 - 未改：token 值、`components/ui/**`、`chat/PermissionCard.tsx`、任何分支合入。
-- 仓库外产物：`.audit-tmp\a11y-c\{scan-before, scan-after, list.mjs, list-before.txt, list-after.txt, before, after, typecheck.log, vitest-targets.log, biome-*.txt, shoot-*.log}`；收尾轮 `finish-{typecheck,vitest-targets,vitest-full}.log`、`finish-biome-*.txt`、`finish-scan\`、`finish-scan.log`、`finish-compare.mjs`、`finish-compare.txt`；第四手 `t1344-{typecheck,vitest-targets,scan}.log`、`t1344-biome\{base,head}`、`t1344-biome-{base,head}.txt`、`t1344-biome-{base,head}-counts.txt`、`t1344-biome-count.mjs`、`t1344-scan\`、`t1344-compare.mjs`、`t1344-compare.txt`。
+- 仓库外产物：`.audit-tmp\a11y-c\{scan-before, scan-after, list.mjs, list-before.txt, list-after.txt, before, after, typecheck.log, vitest-targets.log, biome-*.txt, shoot-*.log}`；收尾轮 `finish-{typecheck,vitest-targets,vitest-full}.log`、`finish-biome-*.txt`、`finish-scan\`、`finish-scan.log`、`finish-compare.mjs`、`finish-compare.txt`；第四手 `t1344-{typecheck,vitest-targets,scan}.log`、`t1344-biome\{base,head}`、`t1344-biome-{base,head}.txt`、`t1344-biome-{base,head}-counts.txt`、`t1344-biome-count.mjs`、`t1344-scan\`、`t1344-compare.mjs`、`t1344-compare.txt`；t-1233 收尾 `t1233-test-browser.log`。
