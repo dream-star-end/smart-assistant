@@ -1,10 +1,15 @@
 import { useEffect, useId, useRef, useState, type ReactElement } from "react";
 import { apiErrorMessage } from "../lib/api";
+import { PROJECT_COLORS } from "../lib/projectColors";
 import { isVersionConflict, taskboardApi, type Project as BoardProject } from "../lib/taskboard";
 import type { AuthSession, ChatProject, Session } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
 import { Alert, Button, Field, Input, Modal, Select, Tabs, Textarea, useConfirm } from "./ui";
+
+// 色板定义已下沉到 lib/projectColors(侧栏首屏同步渲染要用,不能反向把本对话框拖进入口闭包);
+// 此处 re-export 供既有引用(测试等)继续使用。
+export { PROJECT_COLORS } from "../lib/projectColors";
 
 const NAME_MAX = 60;
 const INSTRUCTIONS_MAX = 4000;
@@ -15,22 +20,6 @@ const SETTINGS_TABS = [
 ] as const;
 
 type DialogTab = (typeof SETTINGS_TABS)[number]["value"];
-
-/**
- * 项目色板：key 写入 ChatProject.color，dotClass 用设计 token 背景色。
- * 「墨」例外：`bg-primary` 在深色主题是反色（亮色），色名与所见相反（PS-05）——
- * 项目色是用户给项目贴的标签，必须跨主题稳定，故用固定深灰而不跟主题反转。
- */
-export const PROJECT_COLORS: { key: string; label: string; dotClass: string }[] = [
-  { key: "accent", label: "靛紫", dotClass: "bg-accent" },
-  { key: "info", label: "蓝", dotClass: "bg-info" },
-  { key: "success", label: "绿", dotClass: "bg-success" },
-  { key: "warning", label: "琥珀", dotClass: "bg-warning" },
-  { key: "danger", label: "红", dotClass: "bg-danger" },
-  { key: "accent-strong", label: "深紫", dotClass: "bg-accent-strong" },
-  { key: "primary", label: "墨", dotClass: "bg-[#4b5563]" },
-  { key: "muted", label: "灰", dotClass: "bg-muted" },
-];
 
 export function ProjectSettingsDialog(props: {
   open: boolean;

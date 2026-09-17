@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
 import MarkdownImpl from './MarkdownImpl'
 
@@ -41,7 +41,7 @@ describe('MarkdownImpl readOnly', () => {
     expect(container.textContent).toContain('[本地图片]')
   })
 
-  test('只读链接图片只开灯箱，并保留 lazy loading 与全链路 no-referrer', () => {
+  test('只读链接图片只开灯箱，并保留 lazy loading 与全链路 no-referrer', async () => {
     const { container } = render(
       <MarkdownImpl signMedia readOnly>
         {'[**![外链](//cdn.test/image.png)**](https://report.test)'}
@@ -63,8 +63,9 @@ describe('MarkdownImpl readOnly', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: '放大查看 外链' }))
 
+    // 查看器是懒块(首屏预算):首开要等模块解析后大图才挂上。
+    await waitFor(() => expect(screen.getAllByAltText('外链').length).toBeGreaterThanOrEqual(2))
     const images = screen.getAllByAltText('外链')
-    expect(images.length).toBeGreaterThanOrEqual(2)
     for (const image of images) expect(image).toHaveAttribute('referrerpolicy', 'no-referrer')
     expect(screen.getByRole('button', { name: '下载' })).toBeInTheDocument()
     for (const action of ['编辑', '评论', '调整大小', '分享', '更多']) {
