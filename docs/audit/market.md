@@ -1,7 +1,7 @@
 # A·market AI 市场 · 审计报告
 
 - 分支：`feat/v5-selfhost-audit-market`（基线 `210b9967892b3624fb3984f69d2174e4a641b33d`）
-- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 12 / 遗留 14）→ 二期收尾（§10；再修 10，累计修复 22 / 遗留 4：K-23 按拍板不做、K-25 / K-27 / X-01 需后端或 shell）
+- 阶段：A（审计，§1–§6）→ B（修复，§7–§9；发现 26 / 修复 12 / 遗留 14）→ 二期收尾（§10；再修 10，累计修复 22 / 遗留 4：K-23 按拍板不做、K-25 / K-27 / X-01 需后端或 shell）→ 遗留清扫（§11；K-27 由 t-1234 出 `ui/Checkbox` 原语后落地，X-01 的 App 接线已由集成② `19799c0fe` 做掉，余 K-23 不做 / K-25 需后端）
 - 结论：**P1 × 1 / P2 × 4 / P3 × 21**，共 26 条（另 1 条 admin 面备注 K-26）。P1 是发布表单草稿随市场弹窗关闭（Esc / 点遮罩）
   **无提示丢失**（代码注释自认技术债）。四条 P2：卡片描述 `line-clamp-2` 被同元素的 `block`
   抵消（卡高失控）、分区视图翻页时分区计数把「已加载」说成「共有」、详情弹层移动端底栏三枚
@@ -313,7 +313,7 @@ node browser-tests\ui-preview\shoot.mjs
 | 项 | 理由 |
 |---|---|
 | **`/api/marketplace/search` offset 分页** | 现契约只有 `limit`（`lib/api.ts:3492`），前端只能全量重拉；**需后端配合**。本轮只做 K-03 的诚实呈现。 |
-| **`ui/` Checkbox 原语** | 审核面原生 checkbox 功能与可访问性完整（K-27）；统一视觉需 shell 出原语，不在本模块内造第二套。 |
+| **`ui/` Checkbox 原语** | 审核面原生 checkbox 功能与可访问性完整（K-27）；统一视觉需 shell 出原语，不在本模块内造第二套。→ 原语已由遗留清扫 t-1234 提供并接入，见 §11。 |
 | **FeaturedPanel（精选管理）** | 仅 `src/admin/**` 使用（PLAYBOOK §9 不在范围），本轮只确认既有场景截图无阻断。 |
 | **发布审核状态实时通知（`useMarketplacePublishes` 轮询 → 顶部 Alert）** | 需真后端状态流转；代码审阅：通知留在滚动区外、多条计数、CTA 切分类并聚焦，未见问题。 |
 | **`scenes-market.tsx` 本身的格式** | 与 `scenes-manage.tsx` 同样不过 biome 格式检查；不混进审计分支。 |
@@ -405,7 +405,7 @@ after 对照（同名 PNG，`before/` ↔ `after/`）：
 | K-23（详情内卸载） | 与「已安装页是卸载唯一权威」的既有决定冲突（附录 4），二期任务书明示保持不做 | 拍板后复用卸载弹层 |
 | X-01（未登录「去登录」的 `App.tsx` 接线；K-24 market 侧已修） | `MarketplaceCenter` 已暴露 `onRequireLogin?: () => void`（§7）；`App.tsx` 归 shell，本模块不动 | 集成②在 `App.tsx` 渲染 `<MarketplaceCenter>` 处补一行 `onRequireLogin={() => { setMarketplaceOpen(false); setAuthMode("login"); setView("app"); }}`（照 ManageCenter 那一行） |
 | K-25 / X-02（offset 分页 / 虚拟化） | 需后端 | 后端提供 offset 后前端改 append |
-| K-27（原生 checkbox） | 需 shell 出 Checkbox 原语 | shell |
+| ~~K-27（原生 checkbox）~~ | ~~需 shell 出 Checkbox 原语~~ | **已由遗留清扫 t-1234 落地**（新增 `ui/Checkbox` 原语 + 四处接入，见 §11 与 [leftover-shell.md](./leftover-shell.md)） |
 
 ## 10. 二期收尾（t-625 · 遗留 P3）
 
@@ -433,7 +433,8 @@ after 对照（同名 PNG，`before/` ↔ `after/`）：
 | K-19 | ✅ | `lib/marketplace.ts` 新增 `connectorAuthModeLabel`（后端 `AuthMode` 七种 + `managed_browser` / `none` → 中文，未知值原样）、`connectorActionLabel`（`create_post` / `createFollowUp` / `pages.search` → `create post` / `create follow up` / `pages search`；契约 `projection.ts` 只投影 `id + effect`、没有 title 字段可用）、`connectorActionEffectLabel`（read / send / 其余按「写入」）；`DetailModal.tsx` 插件详情块改用三者，原始值仍在「查看发布者提交的技术声明」里。 | `marketplace.test` ×3；`DetailModal.test` 「API 插件详情:认证方式与动作范围用人话…（K-19）」 |
 | K-21 | ✅ | `PublishPanel.tsx` `SubmitBar`：缺项 > 3 时折成「还差 N 项必填 · 查看」（`aria-expanded`），点开列全并可「收起」；≤3 项照旧直接列全。三张表单（技能 / 智能体 / 插件）共用。 | `PublishPanel.test` 「底部操作条:缺项超过 3 项折成…（K-21）」 |
 | K-23 | ⏸ 不做 | 任务书明示：与「已安装页是卸载唯一权威」既有决定一致，保持不做。 | — |
-| K-25 / K-27 | ⏸ 遗留 | 需后端 offset / 需 shell Checkbox 原语，见 §9。 | — |
+| K-25 | ⏸ 遗留 | 需后端 offset，见 §9。 | — |
+| K-27 | ✅（遗留清扫 t-1234，§11） | 二期时保持遗留（需 shell Checkbox 原语）；t-1234 新增 `ui/Checkbox` 后接入四处，见 §11。 | `ReviewPanel.test` +1、`PublishPanel.test` +1、`ui/Checkbox.test` 9 例 |
 
 预览台场景：`browser-tests/ui-preview/scenes-market-audit.tsx` 新增 `market-detail-plugin`（API 插件详情 · 带签名契约；此前插件详情的
 「平台已签安全范围」块从未被截过图，K-19 的证据只能靠它），随代码提交。
@@ -456,3 +457,12 @@ after 对照（同名 PNG，`market2/before/` ↔ `market2/after/`，PNG 不入�
 - `market-detail--desktop--*` / `market-detail-plugin--*` —— 徽章行下多出「人工审核：已通过平台危险模式扫描与管理员人工审核。」注脚；「详细介绍」内「它适合谁 / 授权范围」从 23px 粗标题降到与段标题同档（13.5px），介绍正文从 15.5px 回到 13px；插件块「认证方式：oauth2-auth-code」→「认证方式：OAuth 授权登录」，`search_pages · 读取` → `search pages · 读取`。暗色 / 移动端同样成立（`market-detail-plugin--mobile--dark` 核对）。
 
 **NOT RUN**：`npm test` 全量（改动限于 marketplace 目录 + `lib/marketplace.ts`，模块内 11 文件全绿；全量门由集成分支统一跑）、`npm run test:browser`（未触碰 Composer / 消息 / 工具卡 / 侧栏）、真机 iOS Safari、Tooltip 的 hover 态截图（预览台静态挂载，无 hover 驱动；Tooltip 用的是全站同一 `ui/Tooltip` 原语，InstalledPanel 已在用）。
+
+## 11. 遗留清扫（t-1234 · K-27 · 2026-09-17）
+
+- 分支 `feat/v5-selfhost-audit-leftover-shell`（基于 integration 集成④ 终点 `2d2b5cafc`），交付文档 [leftover-shell.md](./leftover-shell.md)（评估 / 改法 / 用例 / AX 与触控靶量化 / before-after 逐张对照都在那里，本节只记 market 侧结论）。
+- **K-27 ✅**：shell 侧新增 `components/ui/Checkbox.tsx`（`959735722`；保留原生 `<input type=checkbox>` 只换视觉，label 即可访问名称、`description` 走 `aria-describedby`、`indeterminate` 走 DOM 属性读屏 mixed、触屏外层 label `min-h-11`（无文字再补 `min-w-11`）撑 44×44、桌面零变化），market 四处接入（`ffac63718`）：`ReviewPanel` 「全选」（`indeterminate` 改由 prop 驱动，删手写 ref）/ 逐行「选择 {name}」（`aria-label`，触控靶由原语自带）/ 连接器「真实功能验收」确认；`PublishPanel` 智能体工具集勾选卡（卡片外观仍由调用方 className，「必选」项 disabled 但不压暗）。功能、可访问名称、键盘与触控靶与二期时一致，只收掉「方框 vs 药丸」的视觉漂移。
+- 场景：`scenes-market-audit.tsx` 新增 `market-review-partial`（只勾一行 → 全选部分选中）与 `market-publish-agent-toolsets`（`ClickStep` 新增 `scroll` 标志把首屏之下的工具集区块滚进视口；`dc404359b`）。
+- 验证（HEAD `3aba642ca`）：typecheck / typecheck:preview 绿；`ui/Checkbox.test` 9 例 + `ReviewPanel.test` +1 + `PublishPanel.test` +1（与 `MarketplaceCenter.test` 等同批 6 文件 / 92 例全绿）；biome 与基线逐文件同分布、新增 0；CDP AX 扫描 28 个 checkbox 全部有名、`mixed` 正确、移动端 label 高 44px；before 22 / after 30 张 0 失败。已核对的唯一布局差异：`market-review--desktop--*`「站点批量抓取」行第 4 枚徽章折到第二行（控件 13 → 16px 使该行窄 3px，`flex-wrap` 既定行为，其余行不变），不算回归。
+- 未入图：连接器「真实功能验收」确认框只在展开 API 插件行时出现，现有场景未展开该行，靠 `ReviewPanel.test` 覆盖。
+- 累计：发现 26 / 修复 23 / 遗留 2（K-23 按拍板不做、K-25 需后端）；X-01 的 `App.tsx` 接线已由集成② `19799c0fe` 落地（INTEGRATION.md 集成② §3），§9 表保留的是二期时的状态，归档终稿同步。
