@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
 import { TICKET_TYPES, type TicketType } from '../lib/taskboard'
 import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseId'
+import { SIGNATURE_WORKS, type SignatureWork } from '../lib/tutorialSignatureWorks'
 import type { Session } from '../lib/types'
 
 /**
@@ -24,6 +25,9 @@ import type { Session } from '../lib/types'
  * - 面板深链 `?panel=settings|market|manage|org|help`：boot 由 App 在 useState 初始化时读取
  *   （parsePanelParam）；教程另带稳定 `case` 或兼容旧版的 `topic`。打开/关闭经本 hook replaceState 同步回 query
  *   （面板不压栈，且保留其他无关 query）。
+ *   教程中心的一级页签 `tab=start|cases`（案例展厅为默认、不写）、精选作品 `work=planet|gravity`、
+ *   功能教程的目标步骤 `step=<1..>` 同样只在 `panel=help` 下出现（tutorials 审计 TU-17 / TU-02）。
+ *   叫 `tab` 而不是审计里写的 `view`：`?view=` 已被 /board 工作区占用，离开 board 的镜像 effect 会把它清掉。
  * - 工作区视图 `chat | board`：board 时路径为 `/board`（与会话路径并列，不是 ?panel=）。
  *   对话 ↔ 任务面板用 pushState（后退回到上一位置）。`?view=board|list|inbox|cost|weekly|backlog`、
  *   `?ticket=<identifier>` 与 `?ticketType=bug|feature|spike|chore` 走 replaceState，复用「保留无关 query」语义；离开 /board 时清掉。
@@ -164,17 +168,66 @@ export function parseTutorialCase(sp: URLSearchParams): TutorialCaseId | null {
   return parseTutorialCaseId(sp.get('case'))
 }
 
-/** 保留其他 query；community/case/topic 互斥；无选择即案例总览；离开 help 时三者都清理。 */
+/** 教程中心一级页签里需要进 URL 的两个：案例展厅是默认态，不写参数。 */
+export type TutorialTab = 'start' | 'cases'
+/** 精选作品 id（`planet` / `gravity`），来源 tutorialSignatureWorks。 */
+export type TutorialWorkId = SignatureWork['id']
+/** 功能教程「跟着做」里的目标步骤（1 起算）；上限只是防御，越界由教程中心回退到顶部。 */
+const TUTORIAL_STEP_MAX = 99
+const TUTORIAL_WORK_IDS: ReadonlySet<string> = new Set(SIGNATURE_WORKS.map((work) => work.id))
+
+/** `?panel=help&tab=` → 一级页签；非 help / 与 community·case·topic·work 同在 / 未知值返回 null。 */
+export function parseTutorialTab(sp: URLSearchParams): TutorialTab | null {
+  if (parsePanelParam(sp) !== 'help') return null
+  if (parseTutorialCommunity(sp) || parseTutorialCase(sp) || parseTutorialTopic(sp)) return null
+  if (parseTutorialWork(sp)) return null
+  const v = sp.get('tab')
+  return v === 'start' || v === 'cases' ? v : null
+}
+
+/** `?panel=help&work=` → 精选作品 id；非 help / 与 community·case·topic 同在 / 未知 id 返回 null。 */
+export function parseTutorialWork(sp: URLSearchParams): TutorialWorkId | null {
+  if (parsePanelParam(sp) !== 'help') return null
+  if (parseTutorialCommunity(sp) || parseTutorialCase(sp) || parseTutorialTopic(sp)) return null
+  const v = sp.get('work')
+  return v && TUTORIAL_WORK_IDS.has(v) ? (v as TutorialWorkId) : null
+}
+
+/** `?panel=help&topic=…&step=` → 目标步骤序号（1 起）；没有 topic、非正整数或越界返回 null。 */
+export function parseTutorialStep(sp: URLSearchParams): number | null {
+  if (!parseTutorialTopic(sp)) return null
+  const raw = sp.get('step')
+  if (!raw || !/^\d{1,2}$/.test(raw)) return null
+  const n = Number(raw)
+  return n >= 1 && n <= TUTORIAL_STEP_MAX ? n : null
+}
+
+/** help 面板除 topic / case / community 之外的可选定位：页签、精选作品、目标步骤。 */
+export type TutorialPanelExtras = {
+  tab?: TutorialTab | null
+  work?: TutorialWorkId | null
+  step?: number | null
+}
+
+/**
+ * 保留其他 query；community/case/topic 互斥；无选择即案例总览；离开 help 时全部清理。
+ * `extras`：`work` 只在没有 community/case/topic 时写（作品详情本身就是案例展厅页签，故不再写 tab）；
+ * `tab` 只在没有 work 时写；`step` 只跟着 topic 走。
+ */
 export function withPanelParams(
   input: URLSearchParams,
   panel: PanelParam | null,
   topic?: ProductFeatureId | null,
   caseId?: TutorialCaseId | null,
   communityId?: string | null,
+  extras?: TutorialPanelExtras,
 ): URLSearchParams {
   const next = new URLSearchParams(input)
   if (panel) next.set('panel', panel)
   else next.delete('panel')
+  next.delete('tab')
+  next.delete('work')
+  next.delete('step')
   if (panel === 'help' && communityId) {
     next.set('community', communityId)
     next.delete('case')
@@ -187,10 +240,18 @@ export function withPanelParams(
     next.set('topic', topic)
     next.delete('case')
     next.delete('community')
+    const step = extras?.step
+    if (step && Number.isInteger(step) && step >= 1 && step <= TUTORIAL_STEP_MAX) {
+      next.set('step', String(step))
+    }
   } else {
     next.delete('case')
     next.delete('topic')
     next.delete('community')
+    if (panel === 'help') {
+      if (extras?.work && TUTORIAL_WORK_IDS.has(extras.work)) next.set('work', extras.work)
+      else if (extras?.tab === 'start' || extras?.tab === 'cases') next.set('tab', extras.tab)
+    }
   }
   return next
 }
@@ -204,6 +265,7 @@ export function tutorialHref(
   topic?: ProductFeatureId | null,
   caseId?: TutorialCaseId | null,
   communityId?: string | null,
+  extras?: TutorialPanelExtras,
 ): string {
   const query = withPanelParams(
     new URLSearchParams(locationLike.search),
@@ -211,6 +273,7 @@ export function tutorialHref(
     topic,
     caseId,
     communityId,
+    extras,
   ).toString()
   return `${locationLike.pathname}${query ? `?${query}` : ''}${locationLike.hash}`
 }
@@ -238,12 +301,19 @@ export type UseAppRouteOptions = {
   activeCase?: TutorialCaseId | null
   /** help 打开时的社区教程公开 id；与 case/topic 互斥。 */
   activeCommunity?: string | null
+  /** help 打开且停在一级页签「快速上手 / 案例脚本」时（案例展厅 = null，不进 URL）。 */
+  activeTutorialTab?: TutorialTab | null
+  /** help 打开且停在精选作品详情时的作品 id。 */
+  activeTutorialWork?: TutorialWorkId | null
+  /** help 打开某篇功能教程时的目标步骤（深链 `step=`，1 起）；无则 null。 */
+  activeTutorialStep?: number | null
   /** popstate 反灌面板/query（外部 help 深链恢复时使用）。 */
   onPopPanel?: (
     panel: PanelParam | null,
     topic: ProductFeatureId | null,
     caseId: TutorialCaseId | null,
     communityId: string | null,
+    extras: { tab: TutorialTab | null; work: TutorialWorkId | null; step: number | null },
   ) => void
   /** 当前工作区。缺省 chat，保持旧调用方零改动。 */
   workspace?: WorkspaceView
@@ -266,6 +336,7 @@ export type UseAppRouteOptions = {
 export function useAppRoute(opts: UseAppRouteOptions): void {
   const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts
   const { activePanel, activeTopic, activeCase, activeCommunity } = opts
+  const { activeTutorialTab, activeTutorialWork, activeTutorialStep } = opts
   // 回调/最新值经 ref 镜像（App 每渲染传新闭包；popstate 监听只挂一次仍读最新）。
   const cbRef = useRef(opts)
   cbRef.current = opts
@@ -282,6 +353,11 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
         parseTutorialTopic(query),
         parseTutorialCase(query),
         parseTutorialCommunity(query),
+        {
+          tab: parseTutorialTab(query),
+          work: parseTutorialWork(query),
+          step: parseTutorialStep(query),
+        },
       )
       const id = parseSessionPath(location.pathname)
       if (id) {
@@ -373,11 +449,24 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
   useEffect(() => {
     if (!enabled) return
     const current = new URLSearchParams(location.search)
-    const next = withPanelParams(current, activePanel, activeTopic, activeCase, activeCommunity)
+    const next = withPanelParams(current, activePanel, activeTopic, activeCase, activeCommunity, {
+      tab: activeTutorialTab,
+      work: activeTutorialWork,
+      step: activeTutorialStep,
+    })
     const q = next.toString()
     if (q === current.toString()) return
     history.replaceState({}, '', location.pathname + (q ? `?${q}` : '') + location.hash)
-  }, [enabled, activePanel, activeTopic, activeCase, activeCommunity])
+  }, [
+    enabled,
+    activePanel,
+    activeTopic,
+    activeCase,
+    activeCommunity,
+    activeTutorialTab,
+    activeTutorialWork,
+    activeTutorialStep,
+  ])
 
   // board → ?view= / ?ticket= / ?ticketType=（replaceState；离开 /board 时清参数）。
   // 与 withPanelParams 一样只改自己的键，campaign / panel 等无关 query 原样保留。

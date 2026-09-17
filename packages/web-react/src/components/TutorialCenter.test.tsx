@@ -157,6 +157,102 @@ describe("TutorialCenter", () => {
     expect(screen.getByRole("dialog", { name: "案例展厅" })).toBeInTheDocument();
   });
 
+  it("一级页签与精选作品可受控：browseView / signatureWorkId 由外部给定并回调，页签切换不再只活在内部 state（TU-17）", () => {
+    const onBrowseViewChange = vi.fn();
+    const onSignatureWorkChange = vi.fn();
+    const { rerender } = render(
+      <TutorialCenter
+        open
+        topicId={null}
+        browseView="start"
+        onBrowseViewChange={onBrowseViewChange}
+        signatureWorkId={null}
+        onSignatureWorkChange={onSignatureWorkChange}
+        onTopicChange={() => {}}
+        onClose={() => {}}
+        actionState={() => ({ enabled: true, label: "回到功能位置" })}
+        onRunAction={() => {}}
+      />,
+    );
+    // 直接落在快速上手，不需要先点页签（`?panel=help&tab=start`）。
+    expect(screen.getByRole("heading", { name: "10 分钟走完第一次任务" })).toBeInTheDocument();
+    pickHelpMenu("案例脚本");
+    expect(onBrowseViewChange).toHaveBeenLastCalledWith("cases");
+    // 受控：父级没改 prop 前视图不动；父级改成作品详情后直接渲染那件作品（`&work=planet`）。
+    expect(screen.getByRole("heading", { name: "10 分钟走完第一次任务" })).toBeInTheDocument();
+    rerender(
+      <TutorialCenter
+        open
+        topicId={null}
+        browseView="showcase"
+        onBrowseViewChange={onBrowseViewChange}
+        signatureWorkId={SIGNATURE_WORKS[0].id}
+        onSignatureWorkChange={onSignatureWorkChange}
+        onTopicChange={() => {}}
+        onClose={() => {}}
+        actionState={() => ({ enabled: true, label: "回到功能位置" })}
+        onRunAction={() => {}}
+      />,
+    );
+    expect(screen.getByRole("heading", { level: 1, name: SIGNATURE_WORKS[0].title })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "返回案例展厅" }));
+    expect(onSignatureWorkChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it("功能教程带 step 深链：目标步骤标 aria-current 并拿到焦点，越界的 step 不抛错也不标记（TU-17）", async () => {
+    const { rerender } = render(
+      <TutorialCenter
+        open
+        topicId={PRODUCT_CAPABILITIES.chatBasics.id}
+        stepIndex={3}
+        onTopicChange={() => {}}
+        onClose={() => {}}
+        actionState={() => ({ enabled: true, label: "回到功能位置" })}
+        onRunAction={() => {}}
+      />,
+    );
+    const steps = screen.getAllByRole("listitem").filter((li) => li.hasAttribute("data-tutorial-step"));
+    expect(steps.length).toBeGreaterThanOrEqual(4);
+    const target = steps.find((li) => li.getAttribute("data-tutorial-step") === "3");
+    expect(target).toBeDefined();
+    expect(target).toHaveAttribute("aria-current", "step");
+    expect(target).toHaveAttribute("id", "tutorial-step-3");
+    // 开场自动聚焦（Radix 下一次提交才跑）与本组件的 step 聚焦都落到这一步，而不是对话框本体。
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    expect(steps.filter((li) => li.getAttribute("aria-current") === "step")).toHaveLength(1);
+
+    rerender(
+      <TutorialCenter
+        open
+        topicId={PRODUCT_CAPABILITIES.chatBasics.id}
+        stepIndex={42}
+        onTopicChange={() => {}}
+        onClose={() => {}}
+        actionState={() => ({ enabled: true, label: "回到功能位置" })}
+        onRunAction={() => {}}
+      />,
+    );
+    expect(document.querySelector('[aria-current="step"]')).toBeNull();
+  });
+
+  it("hero 表面走模块级 token：品牌深蓝不再以写死的十六进制出现在 className 里（TU-34）", () => {
+    render(<CaseHarness />);
+    const heroes = document.querySelectorAll<HTMLElement>("[data-tutorial-hero]");
+    expect(heroes.length).toBeGreaterThan(0);
+    for (const hero of heroes) {
+      expect(hero.className).toMatch(/\[--hero-bg:#/);
+      expect(hero.className).toMatch(/dark:\[--hero-bg:#/);
+      expect(hero.className).toContain("bg-(--hero-bg)");
+      expect(hero.className).not.toMatch(/bg-\[#[0-9a-f]{6}\]/i);
+    }
+    // 案例脚本总览的 hero 同样不再写死。
+    pickHelpMenu("案例脚本");
+    const casesHero = document.querySelector<HTMLElement>('[data-tutorial-hero="cases"]');
+    expect(casesHero).not.toBeNull();
+    expect(casesHero?.className).toContain("bg-(--hero-bg)");
+    expect(casesHero?.className).not.toMatch(/bg-\[#/);
+  });
+
   it("「帮助与创作」是真正的菜单：Esc 关闭、菜单项带 menuitem 语义（TU-03）", () => {
     render(<CaseHarness />);
     openHelpMenu();
