@@ -65,7 +65,7 @@ export const DELIBERATION_PANEL_SIZE_DEFAULT = 3
 export const DELIBERATION_PANEL_PREFERENCE = [
   'gpt-6-astra',
   'grok-build',
-  'glm-5.3-zai',
+  'glm-5.3',
   'deepseek-v4-pro',
   'kimi-k3',
   'qwen3.8-max',

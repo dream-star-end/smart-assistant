@@ -314,7 +314,7 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
     // (= [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL]). The pin
     // is decoupled from the secondary utility model (deepseek stays the
     // ANTHROPIC_SMALL_FAST_MODEL); OPENCLAUDE_SECONDARY_MODEL no longer moves it.
-    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'glm-5.3-zai')
+    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'glm-5.3')
     assert.equal(DEFAULT_SECONDARY_UTILITY_MODEL, 'deepseek-v4-flash')
     assert.notEqual(DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL)
     const prevSub = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL

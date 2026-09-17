@@ -67,7 +67,13 @@ export function getAuthorityModelCapabilities(
  *  精确匹配,大小写不敏感；disabled-thinking 的型号差异由 master proxy 处理。 */
 export function isArkGlmModel(model: string): boolean {
   const m = model.trim().toLowerCase()
-  return m === 'glm-5.1' || m === 'glm-5.2' || m === 'glm-5.3'
+  return m === 'glm-5.1' || m === 'glm-5.2'
+}
+
+/** 超算互联网 Token Plan GLM。平台 canonical 小写,上游字面量 GLM-5.3 / GLM-5.3-Flash。 */
+export function isScnetGlmModel(model: string): boolean {
+  const m = model.trim().toLowerCase()
+  return m === 'glm-5.3' || m === 'glm-5.3-flash'
 }
 
 /** 智谱国际版 Z.AI Coding Plan 的平台 alias。与火山 Ark 的 glm-5.3 是同一品牌型号、
@@ -133,6 +139,7 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
     isMiniMaxM3Model(model) ||
     isArkGlmModel(model) ||
     isZaiGlm53Model(model) ||
+    isScnetGlmModel(model) ||
     isOpencodeGoModel(model) ||
     isArkPlanKimiModel(model) ||
     isArkPlanKimiK3Model(model) ||
@@ -163,11 +170,12 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   {
     matches: (m) => {
       const model = m.trim().toLowerCase()
-      return model === 'glm-5.2' || model === 'glm-5.3'
+      return model === 'glm-5.2'
     },
     contextWindow: 1_000_000,
   },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
+  { matches: isScnetGlmModel, contextWindow: 1_000_000 },
   { matches: isZaiGlm53Model, contextWindow: 1_000_000 },
   // DeepSeek alias 与历史 qwen3.7 均为 1M；direct DeepSeek 由上面的精确表独立处理。
   { matches: isOpencodeGoModel, contextWindow: 1_000_000 },

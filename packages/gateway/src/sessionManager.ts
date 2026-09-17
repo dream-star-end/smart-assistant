@@ -4744,7 +4744,7 @@ export class SessionManager {
         // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
         // 最后兜底用 glm-5.3-zai(平台默认、v5 合法的静态 key 模型)。
         // 不再硬编码 claude-opus-4-7 —— Claude 官方模型已下线,那会造出非法默认 → spawn 失败。
-        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3-zai'
+        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3'
       }
       if (toolsetsChanged) {
         maybeSetToolsets.call(session.runner, desiredToolsets)

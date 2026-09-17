@@ -2143,6 +2143,8 @@ export async function registerCommercial(
           ark: cfg.ARK_CODING_PLAN_KEY,
           // 2026-08-15:智谱国际版 Z.AI GLM Coding Plan(glm-5.3-zai)。
           zai: cfg.ZAI_CODING_PLAN_KEY,
+          // 2026-09-17:超算互联网 Token Plan(glm-5.3 / glm-5.3-flash)。
+          scnet: cfg.SCNET_TOKEN_PLAN_KEY,
           // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。个人订阅配额,缺 key 命中时 503。
           opencodego: cfg.OPENCODE_GO_API_KEY,
           // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。

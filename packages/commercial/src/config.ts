@@ -615,6 +615,15 @@ export const commercialConfigSchema = z
      */
     ZAI_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
+     * 超算互联网 Token Plan key(2026-09-17 接入 glm-5.3 / glm-5.3-flash)。
+     * - Anthropic Messages:https://api.scnet.cn/api/llm/anthropic/v1/messages
+     * - Authorization Bearer；上游字面量 GLM-5.3 / GLM-5.3-Flash
+     * - 只存在于 master/egress EnvironmentFile，绝不注入用户容器或写入 git
+     * - 未配置 → 503 SCNET_NOT_CONFIGURED + reject 'scnet_config'
+     * - 聊天里出现过的 key 上线前必须在控制台旋转
+     */
+    SCNET_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。

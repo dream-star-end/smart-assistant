@@ -1,8 +1,9 @@
 // 静态 key 文本 provider 注册表 —— 平台持有静态 API key、按 model id 路由到第三方
 // Anthropic 兼容上游(不占 OAuth 账号池)的 provider 的单一权威声明。
 //
-// 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.3 + glm-5.2/5.1 兼容存量)、
-// 智谱国际版 Z.AI Coding Plan(glm-5.3-zai 平台 alias)、
+// 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.2/5.1 兼容存量)、
+// 智谱国际版 Z.AI Coding Plan(glm-5.3-zai 平台 alias,执行面将退役)、
+// 超算互联网 Token Plan scnet(glm-5.3 / glm-5.3-flash)、
 // OpenCode Go(Zen 网关 Go 档,DeepSeek V4 Flash 平台 alias + Qwen3.7 兼容存量)、
 // Ark Agent Plan Kimi(kimi-k2.7-code,与 minimax 同订阅同 key,2026-07-06)。
 //
@@ -24,6 +25,7 @@ export type StaticProviderId =
   | 'minimax'
   | 'ark'
   | 'zai'
+  | 'scnet'
   | 'opencodego'
   | 'kimi'
   | 'ark-k3'
@@ -182,23 +184,15 @@ const ARK: StaticKeyProviderSpec = {
   upstreamEndpoint: 'https://ark.cn-beijing.volces.com/api/coding/v1/messages',
   matchesRoute(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'glm-5.1' || m === 'glm-5.2' || m === 'glm-5.3'
+    return m === 'glm-5.1' || m === 'glm-5.2'
   },
-  inboundModelIds: ['glm-5.3', 'glm-5.2', 'glm-5.1'],
+  inboundModelIds: ['glm-5.2', 'glm-5.1'],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'glm-5.1'
-      ? 'glm-5.1'
-      : m === 'glm-5.2'
-        ? 'glm-5.2'
-        : m === 'glm-5.3'
-          ? 'glm-5.3'
-          : null
+    return m === 'glm-5.1' ? 'glm-5.1' : m === 'glm-5.2' ? 'glm-5.2' : null
   },
   stripHeaders: ['anthropic-beta'],
-  // glm 三代都支持 enabled+budget；但 glm-5.3 的 disabled 会 400，故只对该上游
-  // 字面量删 disabled 参数，不能改变仍支持 disabled 的 glm-5.1/5.2。
-  stripDisabledThinkingModels: ['glm-5.3'],
+  // glm-5.1/5.2 支持 disabled。glm-5.3 已迁 scnet。
   // Ark 只识别 output_config.effort；其余 firstParty-only 字段在边界剥离。
   stripBodyFields: ['context_management', 'service_tier'],
   // 上游接受 low/medium/high/max，产品仍只开放高/最高。
@@ -231,6 +225,36 @@ const ZAI_CODING_PLAN: StaticKeyProviderSpec = {
   maxInputTokens: 1_000_000,
   // 官方 Cline 配置要求关闭图片；红/蓝对照探针把红图也回答为蓝，证明兼容端点没有
   // 可靠消费图像内容。按纯文本接入并由 understand_image 工具兜底。
+  supportsVision: false,
+}
+
+const SCNET_TOKEN_PLAN: StaticKeyProviderSpec = {
+  id: 'scnet',
+  // 超算互联网 Token Plan Anthropic 兼容端点。2026-09-17 生产网络探活:
+  // GLM-5.3 / GLM-5.3-Flash 普通 200、SSE 200、tool_use 200;thinking.enabled 200;
+  // thinking.disabled → 400 code 10013,故 stripDisabledThinking。
+  // 上游字面量大小写敏感(小写 glm-5.3 → 422 Model Not Exist)。
+  // 鉴权 Bearer(官方 /v1/models 拒 x-api-key)。
+  upstreamEndpoint: 'https://api.scnet.cn/api/llm/anthropic/v1/messages',
+  matchesRoute(modelId) {
+    const m = modelId.toLowerCase()
+    return m === 'glm-5.3' || m === 'glm-5.3-flash'
+  },
+  inboundModelIds: ['glm-5.3', 'glm-5.3-flash'],
+  canonicalizeForPricing(modelId) {
+    const m = modelId.toLowerCase()
+    return m === 'glm-5.3' || m === 'glm-5.3-flash' ? m : null
+  },
+  upstreamModelForRequest(modelId) {
+    const m = modelId.toLowerCase()
+    if (m === 'glm-5.3') return 'GLM-5.3'
+    if (m === 'glm-5.3-flash') return 'GLM-5.3-Flash'
+    return modelId
+  },
+  stripHeaders: ['anthropic-beta'],
+  stripDisabledThinking: true,
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  maxInputTokens: 1_000_000,
   supportsVision: false,
 }
 
@@ -409,6 +433,7 @@ export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   MINIMAX,
   ARK,
   ZAI_CODING_PLAN,
+  SCNET_TOKEN_PLAN,
   OPENCODE_GO,
   ARK_PLAN_KIMI,
   ARK_PLAN_KIMI_K3,
@@ -421,6 +446,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   minimax: MINIMAX,
   ark: ARK,
   zai: ZAI_CODING_PLAN,
+  scnet: SCNET_TOKEN_PLAN,
   opencodego: OPENCODE_GO,
   kimi: ARK_PLAN_KIMI,
   'ark-k3': ARK_PLAN_KIMI_K3,

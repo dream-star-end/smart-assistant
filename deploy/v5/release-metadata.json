@@ -158,7 +158,8 @@
     "0274_desktop_tunnel_owners",
     "0275_restore_ccb_provider_check",
     "0276_grok_account_usage_columns",
-    "0277_api_key_usage_and_controls"
+    "0277_api_key_usage_and_controls",
+    "0282_scnet_glm53_flash"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

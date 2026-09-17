@@ -41,18 +41,27 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(mm.matchesRoute('minimax-m3'), true)
     assert.equal(mm.matchesRoute('minimax-m2'), false)
   })
-  it('ark(glm-5.1 + glm-5.2 + glm-5.3)精确,大小写不敏感', () => {
+  it('ark(glm-5.1 + glm-5.2)精确,大小写不敏感;glm-5.3 已迁 scnet', () => {
     const ark = getStaticProvider('ark')
     assert.equal(ark.matchesRoute('glm-5.1'), true)
     assert.equal(ark.matchesRoute('GLM-5.1'), true)
     assert.equal(ark.matchesRoute('glm-5.2'), true)
     assert.equal(ark.matchesRoute('GLM-5.2'), true)
-    assert.equal(ark.matchesRoute('glm-5.3'), true)
-    assert.equal(ark.matchesRoute('GLM-5.3'), true)
+    assert.equal(ark.matchesRoute('glm-5.3'), false)
+    assert.equal(ark.matchesRoute('GLM-5.3'), false)
     assert.equal(ark.matchesRoute('glm-5'), false)
     assert.equal(ark.matchesRoute('glm-5.4'), false)
   })
-  it('zai 只匹配独立 glm-5.3-zai alias，不抢 Ark glm-5.3', () => {
+  it('scnet 匹配 glm-5.3 / glm-5.3-flash，不抢 zai alias', () => {
+    const scnet = getStaticProvider('scnet')
+    assert.equal(scnet.matchesRoute('glm-5.3'), true)
+    assert.equal(scnet.matchesRoute('GLM-5.3'), true)
+    assert.equal(scnet.matchesRoute('glm-5.3-flash'), true)
+    assert.equal(scnet.matchesRoute('GLM-5.3-Flash'), true)
+    assert.equal(scnet.matchesRoute('glm-5.3-zai'), false)
+    assert.equal(scnet.matchesRoute('glm-5.2'), false)
+  })
+  it('zai 只匹配独立 glm-5.3-zai alias，不抢 scnet glm-5.3', () => {
     const zai = getStaticProvider('zai')
     assert.equal(zai.matchesRoute('glm-5.3-zai'), true)
     assert.equal(zai.matchesRoute('GLM-5.3-ZAI'), true)
@@ -118,7 +127,8 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('MiniMax-M3')?.id, 'minimax')
     assert.equal(findRouteProviderForModel('glm-5.1')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
-    assert.equal(findRouteProviderForModel('glm-5.3')?.id, 'ark')
+    assert.equal(findRouteProviderForModel('glm-5.3')?.id, 'scnet')
+    assert.equal(findRouteProviderForModel('glm-5.3-flash')?.id, 'scnet')
     assert.equal(findRouteProviderForModel('glm-5.3-zai')?.id, 'zai')
     assert.equal(findRouteProviderForModel('deepseek-v4-flash-opencode-go')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
@@ -138,10 +148,11 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
   it('deepseek direct 只放 Pro(Flash 已统一归 OpenCode Go)', () => {
     assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], ['deepseek-v4-pro'])
   })
-  it('minimax 1 项 / ark 3 项 / opencodego Flash canonical+alias + 2 个历史 Qwen', () => {
+  it('minimax 1 项 / ark 2 项 / scnet 2 项 / opencodego Flash canonical+alias + 2 个历史 Qwen', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
-    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.3', 'glm-5.2', 'glm-5.1'])
+    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.2', 'glm-5.1'])
     assert.deepEqual([...getStaticProvider('zai').inboundModelIds], ['glm-5.3-zai'])
+    assert.deepEqual([...getStaticProvider('scnet').inboundModelIds], ['glm-5.3', 'glm-5.3-flash'])
     assert.deepEqual([...getStaticProvider('opencodego').inboundModelIds], [
       'deepseek-v4-flash-opencode-go',
       'deepseek-v4-flash',
@@ -157,10 +168,11 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
       'deepseek-v4-pro',
       'MiniMax-M3',
-      'glm-5.3',
       'glm-5.2',
       'glm-5.1',
       'glm-5.3-zai',
+      'glm-5.3',
+      'glm-5.3-flash',
       'deepseek-v4-flash-opencode-go',
       'deepseek-v4-flash',
       'qwen3.7-max',
@@ -186,15 +198,22 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(mm.canonicalizeForPricing('MiniMax-M3'), 'MiniMax-M3')
     assert.equal(mm.canonicalizeForPricing('claude-x'), null)
   })
-  it('ark → glm-5.1 / glm-5.2 / glm-5.3(各自原样)', () => {
+  it('ark → glm-5.1 / glm-5.2(各自原样)', () => {
     const ark = getStaticProvider('ark')
     assert.equal(ark.canonicalizeForPricing('GLM-5.1'), 'glm-5.1')
     assert.equal(ark.canonicalizeForPricing('glm-5.1'), 'glm-5.1')
     assert.equal(ark.canonicalizeForPricing('GLM-5.2'), 'glm-5.2')
     assert.equal(ark.canonicalizeForPricing('glm-5.2'), 'glm-5.2')
-    assert.equal(ark.canonicalizeForPricing('GLM-5.3'), 'glm-5.3')
-    assert.equal(ark.canonicalizeForPricing('glm-5.3'), 'glm-5.3')
+    assert.equal(ark.canonicalizeForPricing('GLM-5.3'), null)
     assert.equal(ark.canonicalizeForPricing('glm-5.4'), null)
+  })
+  it('scnet pricing 保持平台小写 id；transport 改写为上游大小写字面量', () => {
+    const scnet = getStaticProvider('scnet')
+    assert.equal(scnet.canonicalizeForPricing('GLM-5.3'), 'glm-5.3')
+    assert.equal(scnet.canonicalizeForPricing('glm-5.3-flash'), 'glm-5.3-flash')
+    assert.equal(scnet.upstreamModelForRequest?.('glm-5.3'), 'GLM-5.3')
+    assert.equal(scnet.upstreamModelForRequest?.('GLM-5.3-FLASH'), 'GLM-5.3-Flash')
+    assert.equal(scnet.stripDisabledThinking, true)
   })
   it('zai pricing 保持平台 alias；legacy transport 精确改写为上游 glm-5.3', () => {
     const zai = getStaticProvider('zai')
@@ -383,9 +402,10 @@ describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
 })
 
 describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜底)', () => {
-  it('kimi provider-wide；ark 仅 glm-5.3 model-scoped', () => {
+  it('kimi 与 scnet provider-wide；ark 不再钉 glm-5.3', () => {
     assert.equal(getStaticProvider('kimi').stripDisabledThinking, true)
-    assert.deepEqual(getStaticProvider('ark').stripDisabledThinkingModels, ['glm-5.3'])
+    assert.equal(getStaticProvider('scnet').stripDisabledThinking, true)
+    assert.equal(getStaticProvider('ark').stripDisabledThinkingModels, undefined)
     assert.equal(getStaticProvider('deepseek').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('minimax').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('ark').stripDisabledThinking, undefined)
@@ -440,6 +460,7 @@ describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
     assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
     assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
     assert.equal(getStaticProvider('zai').supportsVision ?? false, false)
+    assert.equal(getStaticProvider('scnet').supportsVision ?? false, false)
     // opencodego 2026-07-05 实测 image block → 400 InvalidParameter,纯文本接入。
     assert.equal(getStaticProvider('opencodego').supportsVision ?? false, false)
     // kimi 2026-07-06 实测 image block → 400 InvalidParameter(同 lane 的 M3 反而是多模态)。
