@@ -1,20 +1,22 @@
 # v5 个人版（selfhost）发布预演 + 运行手册草稿（t-1279）
 
-> 状态：**草稿 v2 · 预演分支 `feat/v5-selfhost-audit-release-rehearsal` @ `f6572abb6`**。本文件由发布预演任务 t-1279 产出（初稿 fable-5-1-34 @ `c1fdc935e`，09-17 04:xx；**09-18 00:3x 由 fable-5-1-4 接手复核并更新**），给 t-1268「发布准备」/ t-1269「发布执行」接棒。
-> 边界（已守住）：**未推 canonical、未动 integration、未登录服务器**；试合只发生在预演分支；本机到 38.55.252.217 / 186.244.238.121 的 22 端口只拿到 SSH banner、密钥未授权，全部服务器步骤均为「照本宣科」而非实跑。
+> 状态：**草稿 v2.1 · 预演分支 `feat/v5-selfhost-audit-release-rehearsal` @ `31c3e15c3`**。本文件由发布预演任务 t-1279 产出（初稿 fable-5-1-34 @ `c1fdc935e`，09-17 04:xx；**09-18 00:3x–01:0x 由 fable-5-1-4 接手复核并更新**），给 t-1268「发布准备」/ t-1269「发布执行」接棒。
+> 边界（已守住）：**未推 canonical、未动 integration、服务器只读**（v2.1 起按指挥官 fable-5-1-8 指令用 `ssh -o BatchMode=yes -o ConnectTimeout=15 root@38.55.252.217` 做了两轮只读核对：git status / readlink / systemctl / curl / df / SELECT / `--status`，**没有 fetch、checkout、--preflight、--deploy、删除**；命令脚本与原始输出见附录 C）。试合只发生在预演分支。
 > 出处标注约定：`deploy-v5-selfhost.sh:L` = `scripts/deploy-v5-selfhost.sh` 行号；`master-lib:L` = `scripts/v5-selfhost-master-release-lib.sh` 行号；`AGENTS.md §…`、`hotfix-checklist Step …` = `docs/hotfix-deploy-checklist.md`；`PLAYBOOK §…` = `docs/V5_DEV_PLAYBOOK.md`。行号按预演分支 `c1fdc935e` 标注；`f6572abb6` 追合的三方（canonical `f1952819f`、budget-fix `65019b5dc`、integration `c97a750f8`）**都没碰 `scripts/**`**，行号仍然有效。
 >
 > **v2 相对初稿的变化（接棒先看这里）**：
 > 1. **canonical 又前进了 1 提交**：`origin/feat/v5-selfhost` = `f1952819f`（OCV5-225，含 **DB 迁移 0281 + 破坏性 DDL**），发布口径从「纯前端、无迁移」变成「含迁移、需 `OC_V5_ALLOW_BREAKING_MIGRATION=1`」→ 新增 **R0**、C5/C10/C11、U7/U8、§4.0 只读 SQL 前置、§4.4/§4.5 HAS_MIGRATION=1 判据、§5.3 两行。
 > 2. **integration 前进到 `c97a750f8`**（只多 1 条 docs 提交），§1.2 七处冲突与解法**原样适用**（实测 merge-tree 同集合）。
 > 3. **R1 修复已就位**：budget-fix `65019b5dc`（t-1348）预合进预演分支后 `npm run build` ✅ 447.3KB / 余量 12.7KB；但它**尚未进 integration**，等集成⑤。
-> 4. 全部门在 `f6572abb6` 上复跑一遍（§1.3b）：typecheck / typecheck:preview / check:tutorials / lint:migration-order / test:protocol(engineModels) / vitest 9 文件 295 用例 / build / trailer 门全绿；`cursorCliWrapper.test.ts` 55 红为 Windows 假阳性（R9）。
+> 4. 全部门在 `f6572abb6` 上复跑一遍（§1.3b）：typecheck / typecheck:preview / check:tutorials / lint:migration-order / test:protocol(engineModels) / vitest 9 文件 295 用例 / build / trailer 门全绿；`cursorCliWrapper.test.ts` 55 红为 Windows 假阳性（R9）。无 budget-fix 的对照基点 `c009a1c04` build 实测 **❌ 471.9KB**（指挥官要的红数值）。
+> 5. **v2.1 服务器只读实测（09-18 00:56 UTC+8）改写了 R0 的结论**：现网 live **已经是 `f1952819f`**（boss 09-17 08:25Z 人工 train 提交，前 4 次失败），`schema_migrations` **已含 0281**，三条前置行 active+enabled → 本次发布迁移门预期 **`HAS_MIGRATION=0`，不需要 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**（只在「回滚到 rel-3b7c38b9d 后再发」或「canonical 再带新迁移」时复议）。磁盘 `/` 87%、余 26.6 GiB（≥ 8 GiB 门过）；master / egress slotA / 个人版全 active，18790 与 18789 healthz 均 200，无 open train。→ §2.2 实测表、§4.0 前值、§4.1 判据修正（`spa dist` / `.complete` MISSING 是预期）、§4.4/§4.5 改回 HAS_MIGRATION=0 主线。
+> 6. 预演分支追平 integration HEAD `c97a750f8`（`31c3e15c3`，纯 docs，零冲突），分支现在**字面等于** integration HEAD + canonical HEAD + budget-fix + 本手册。
 
 ## 0. 结论速览（接棒先读）
 
 | # | 级别 | 结论 | 谁来处理 |
 |---|---|---|---|
-| **R0** | **P1 必读（v2 新增）** | **canonical 已前进**：`origin/feat/v5-selfhost` = `f1952819f`（= `3b7c38b9d` + 1 提交 `feat(v5): wire Sand-usable Cursor families into the picker`，OCV5-225，boss 09-17 14:46，ff 关系）。对预演分支追合**零冲突**（`c009a1c04`，9 文件 +673/−18），但它把发布口径从「纯前端 + 无迁移」改成「**含 DB 迁移 + 破坏性 DDL**」：新增 `packages/commercial/src/db/migrations/0281_cursor_sand_usable_families.sql`（334 行，`order-dependency: 0280_cursor_haiku_45`）并登记进 `deploy/v5/release-metadata.json` requiredMigrations（第 162 条）；其 L248-249 `ALTER TABLE cursor_external_usage_audit DROP CONSTRAINT IF EXISTS …` 命中 selfhost 迁移门的 `ALTER … DROP` 分类（`sql_file_has_breaking_ddl` master-lib:756-775；`classify_pending_migration_file` :846-855 默认 `die`）→ **`--deploy` 与 `--deploy --dry-run` 都必须带 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**，否则 STEP 3 就停（迁移文件头 L18-20 作者已写明「deploy with OC_V5_ALLOW_BREAKING_MIGRATION=1」）。HAS_MIGRATION 预期 0→1：STEP 6b 在翻转同一把锁内 `npx --no-install tsx packages/commercial/src/db/migrate.ts` 当场 apply（master-lib:1146-1158，`PGOPTIONS=-c openclaude.migration_profile=v5-selfhost`；deploy-v5-selfhost.sh:2598-2609），失败 → `cutover_compensate migration-apply`，不翻转、**不回滚 schema**。0281 自带三条 `RAISE EXCEPTION` 前置（L40-57：`cursor-grok-4.6-high` / `cursor-gemini-3.8-flash-high` / `cursor-haiku-4.5` 必须 active+enabled）——本机无法验证 selfhost DB，§4.0 新增只读 SQL。同提交还动了 `packages/protocol/src/engineModels.ts`（master + runtime-release 两轴，PLAYBOOK §4.1 :340/:342）、`packages/commercial/agent-sandbox/platform-runtime/bin/oc-cursor.sh`（platform bundle 轴，:343）、`.github/integ-tiers/nightly-4.txt`（CI）。subject 是 `feat(v5)`，trailer 门不受影响（复跑 PASS）。 | 指挥官：① 拍板是否以 `OC_V5_ALLOW_BREAKING_MIGRATION=1` 放行 0281（会打 ⚠ 写入日志，master-lib:850）；② 发布执行者先跑 §4.0 两条只读 SQL；③ §3 的 canonical 期望值按 `f1952819f` 核对，若再前进重做 §1.1 merge-tree。 |
+| **R0** | **v2.1：已被现网吸收（v2 时为 P1）** | **v2.1 服务器只读实测（09-18 00:56，§2.2 实测表 / §4.0 前值）：现网 live = `rel-f1952819f-20260917-082520`（`.complete.sourceCommit` = f1952819f，Lease Center train `tr-20260917T082515Z` committed 08:43Z），工作树 HEAD = f1952819f 且干净；`schema_migrations` 已含 `0280` 与 `0281`（max = 0281），`cursor-grok-4.6-high` / `cursor-gemini-3.8-flash-high` / `cursor-haiku-4.5` 均 active+enabled。因此对本次发布（候选 = integration + canonical，live..候选的 `**/migrations/**` diff 为空、DB 缺口为空）迁移门预期 `HAS_MIGRATION=0`，**不需要 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**；下文分析保留，仅在 live 回滚到 rel-3b7c38b9d 后再发（git diff 会再含 0281）或 canonical 再带新迁移时重新生效。** 原 v2 结论——**canonical 已前进**：`origin/feat/v5-selfhost` = `f1952819f`（= `3b7c38b9d` + 1 提交 `feat(v5): wire Sand-usable Cursor families into the picker`，OCV5-225，boss 09-17 14:46，ff 关系）。对预演分支追合**零冲突**（`c009a1c04`，9 文件 +673/−18），但它把发布口径从「纯前端 + 无迁移」改成「**含 DB 迁移 + 破坏性 DDL**」：新增 `packages/commercial/src/db/migrations/0281_cursor_sand_usable_families.sql`（334 行，`order-dependency: 0280_cursor_haiku_45`）并登记进 `deploy/v5/release-metadata.json` requiredMigrations（第 162 条）；其 L248-249 `ALTER TABLE cursor_external_usage_audit DROP CONSTRAINT IF EXISTS …` 命中 selfhost 迁移门的 `ALTER … DROP` 分类（`sql_file_has_breaking_ddl` master-lib:756-775；`classify_pending_migration_file` :846-855 默认 `die`）→ **`--deploy` 与 `--deploy --dry-run` 都必须带 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**，否则 STEP 3 就停（迁移文件头 L18-20 作者已写明「deploy with OC_V5_ALLOW_BREAKING_MIGRATION=1」）。HAS_MIGRATION 预期 0→1：STEP 6b 在翻转同一把锁内 `npx --no-install tsx packages/commercial/src/db/migrate.ts` 当场 apply（master-lib:1146-1158，`PGOPTIONS=-c openclaude.migration_profile=v5-selfhost`；deploy-v5-selfhost.sh:2598-2609），失败 → `cutover_compensate migration-apply`，不翻转、**不回滚 schema**。0281 自带三条 `RAISE EXCEPTION` 前置（L40-57：`cursor-grok-4.6-high` / `cursor-gemini-3.8-flash-high` / `cursor-haiku-4.5` 必须 active+enabled）——本机无法验证 selfhost DB，§4.0 新增只读 SQL。同提交还动了 `packages/protocol/src/engineModels.ts`（master + runtime-release 两轴，PLAYBOOK §4.1 :340/:342）、`packages/commercial/agent-sandbox/platform-runtime/bin/oc-cursor.sh`（platform bundle 轴，:343）、`.github/integ-tiers/nightly-4.txt`（CI）。subject 是 `feat(v5)`，trailer 门不受影响（复跑 PASS）。 | v2.1：① 放行拍板**不再需要**（只在回滚后再发时复议）；② §4.0 两条只读 SQL 已实测通过，发布当天再跑一遍即可；③ §3 的 canonical 期望值按 `f1952819f` 核对，若再前进重做 §1.1 merge-tree；④ 服务器已在 f1952819f，`git merge --ff-only` 到 `<REL>` 一定成立。 |
 | R1 | **P1 阻断 → 修复已就位，待集成⑤合入** | **integration 分支单独仍过不了生产构建**：`npm run build --workspace packages/web-react`（= `--deploy` 的 `build_frontend`，deploy-v5-selfhost.sh:1109-1128）在 vite `first-screen-budget` 插件处 fail。首屏闭包 gzip：基线 210b99678 = 455.9KB ✅ → canonical 3b7c38b9d = 456.4KB ✅ → **integration 2d2b5cafc = 471.4KB ❌**（超 460.0KB 预算 11.4KB）→ 预演 c1fdc935e = 471.7KB ❌；integration 现 HEAD `c97a750f8` 相对 2d2b5cafc 只多 1 条 docs 提交、`vite.config.ts` 未变，结论不变。增量在 main chunk +7.7KB、tapePayload +5.4KB、styles +1.3KB，是审计改动撑爆入口静态闭包，**与 canonical 提交无关**。**修复**：t-1348 已交付在 `feat/v5-selfhost-audit-budget-fix@65019b5dc`（`77e1f35dc` 把点开才需要的覆盖层改 `React.lazy` 移出入口静态闭包；阈值 471040 **未上调**），`git merge-base --is-ancestor 65019b5dc c97a750f8` = **否，尚未进 integration**（等集成⑤）。预演分支已预合（`f6572abb6`；对 c97a750f8 与 canonical 均零冲突，App.tsx 自动合并）并实跑 build → **✅ exit 0，built in 18.84s；首屏闭包 13 chunk gzip 447.3KB（458056 B），余量 12.7KB**（main 129.8 / tapePayload 123.2 / styles 77.6KB；比 budget-fix 自报的 445.5KB 多 1.8KB = canonical picker/protocol 增量）。 | 指挥官：集成⑤把 budget-fix 合进 integration 后**在 integration 上复跑 `npm run build`**（§3.2 C1），绿了才 ff canonical；此前服务器 `--deploy` 必死在 `build_master_release`（live 不动）。 |
 | R2 | P2（canonical 自带） | canonical `7b2ae241d` 把勾选框文案改成「同时设为新对话的默认协作方式」，但 **未同步** `packages/web-react/src/App.test.tsx`（4 处）与 `browser-tests/ocv5-210-cas-identity.node-test.mjs`（4 处）仍查旧文案「同时作为新会话默认」→ canonical 自己的 web-react 单测 `App.test.tsx > stale CAS reread after logout…` 就是红的（纯 3b7c38b9d 检出上 grep 可证）。预演分支 `c1fdc935e` 已对齐 8 处。 | 合 canonical 时带上 `c1fdc935e`（或等价改动）。 |
 | R3 | P2（canonical 自带） | `scripts/check-v5-incident-regressions.ts` 在纯 canonical 3b7c38b9d 上就 **FAIL**：`INC-20260915-ADVISOR-1M-DUP-PICKER: 没有 browser/live-e2e/deploy-gate 证据时必须写 proofPending{reason,since}`（规则 :306-315，基线 210b99678 起未变；数据是 canonical `3b7c38b9d` 新增的 incidents.json 条目，只登记了两条 unit 层回归）。**selfhost `--deploy` 不跑这道 TS 门**（只跑 bash trailer 门，见 R5），所以不阻断部署；但 CI `check:v5`（含 `check:v5:incidents`）会红。 | canonical 维护者：给该事故补 proof 层证据或写 `proofPending`（注意 `PROOF_PENDING_BASELINE = 11` 棘轮，:39）。 |
@@ -39,7 +41,9 @@
 | **integration 本地 HEAD（v2 复核时；= 2d2b5cafc + 1 条 docs 提交 `c97a750f8 docs(v5): 集成④收尾…`）** | `feat/v5-selfhost-ocv5-audit-ux`（本地 == `origin/…-audit-ux`） | `c97a750f8707b4ec09983cd2326dd7d8697be7b8` |
 | **canonical 上游（v2 复核时；= 3b7c38b9d + 1 提交，ff）** | `origin/feat/v5-selfhost` | `f1952819f8b9f515b97c1a68d2da413522047781` |
 | 预演分支 v2 · 追合 canonical f1952819f（零冲突） | merge commit（parents = c1fdc935e, f1952819f） | `c009a1c04` |
-| **预演分支 v2 HEAD · 预合 budget-fix 65019b5dc（零冲突，验证 R1）** | `feat/v5-selfhost-audit-release-rehearsal` | `f6572abb6` |
+| 预演分支 v2 · 预合 budget-fix 65019b5dc（零冲突，验证 R1；§1.3b 全部门在此基点跑） | merge commit（parents = c009a1c04, 65019b5dc） | `f6572abb6` |
+| 预演分支 v2 · 本手册 v2 提交 | docs(v5) | `6aed3bddf` |
+| **预演分支 v2.1 HEAD · 追平 integration HEAD c97a750f8（纯 docs，零冲突）** | `feat/v5-selfhost-audit-release-rehearsal`（已推 origin） | `31c3e15c3`（+ 本次 v2.1 docs 提交，见 git log） |
 
 > v2 核对：`git diff --stat 2d2b5cafc c97a750f8 -- <§1.2 七个文件> packages/web-react/vite.config.ts` **为空** → `d02cc7c5d` 的解法对 c97a750f8 可原样复用；`git merge-tree --write-tree --name-only c97a750f8 3b7c38b9d` → 树 `ce7a98ba7` + **同样 7 个路径**（exit 1）；`git merge-tree --write-tree --name-only c1fdc935e f1952819f` → 树 `dbd3d42c4`，**无冲突**（exit 0）；`git merge-tree --write-tree --name-only c1fdc935e 65019b5dc` → 树 `e836c9b60`，无冲突（exit 0）。
 
@@ -120,6 +124,7 @@ git diff --name-only --diff-filter=U  # 应为空后再 commit
 | commercial 单测（canonical 改 `cursorCliWrapper.test.ts`） | `npx tsx --test --test-force-exit packages/commercial/src/__tests__/cursorCliWrapper.test.ts` | ❌ 55/57 · **Windows 假阳性**（R9），Linux 复跑 |
 | 受影响模块 vitest（v1 的 7 文件 + budget-fix 触碰的 `MarkdownImpl.test.tsx`、`chat/media.test.tsx`） | `cd packages\web-react; npx vitest run … --maxWorkers=1` | ✅ `Test Files 9 passed (9) · Tests 295 passed (295)` 102s |
 | **生产构建（R1 门）** | `npm run build --workspace packages/web-react` | ✅ **exit 0，`built in 18.84s`** |
+| 生产构建 · **无 budget-fix 对照**（`c009a1c04` = 2d2b5cafc + 3b7c38b9d + f1952819f，同工作树 `git checkout --detach` 实跑后切回） | 同上 | ❌ `首屏(index.html modulepreload 闭包,15 个 chunk)gzip 471.9KB 超过预算 460.0KB`（比 c1fdc935e 的 471.7KB 再 +0.2KB = f1952819f 增量；日志 `gates-head-2/vite-build-c009a1c04-no-budgetfix.log`）→ **集成⑤不合 budget-fix 就发，服务器必死在 build_master_release** |
 | 首屏体量复算（仓库外脚本，同 vite 插件口径） | `node .audit-tmp\release-rehearsal\measure-first-screen.mjs packages\web-react\dist 471040` | ✅ `首屏闭包 13 个 chunk, gzip 合计 447.3KB (458056 B); 预算 460.0KB (471040 B); 余量 12.7KB` |
 | Incident trailer 门 | `bash scripts/check-v5-fix-trailers.sh --repo . --head HEAD` | ✅ `PASS: 起点 e490e22af2cf, 冻结 tip 18 条, 检查 45 条 fix(v5) 提交`（f1952819f 是 feat(v5)，不入检查集） |
 | 未跑 | `test:commercial:integ`（0281 的 `migration0281CursorSandUsableFamilies.integ.test.ts`、`migrate.integ.test.ts` 需要 PG）、`test:browser`、gateway 单测（v1 已证与 canonical 字节一致） | **NOT RUN**：本机无 PG / Linux 环境；CI 或服务器复跑（U5） |
@@ -146,7 +151,7 @@ git diff --name-only --diff-filter=U  # 应为空后再 commit
 | C2 | `scripts/check-v5-fix-trailers.sh --head <目标 SHA>` PASS | deploy-v5-selfhost.sh:1951-1972、:2013；`check-v5-fix-trailers.sh:24-26` 用法 | ✅ 在 c1fdc935e 上 PASS；integration 再动过后**重跑** |
 | C3 | 目标 SHA 已在 `origin/feat/v5-selfhost` 上（服务器只 `git fetch` + ff） | `oc-lease.sh` register 阶段「sha 必须已在远端分支上」；PLAYBOOK §4.2 pinned SHA 须是 HEAD 或祖先 | 待 §3 |
 | C4 | 提交 subject 无 `fix(v5)`（审计侧）；canonical 自带的两条 fix(v5) trailer 合法 | 决策 d-26；`check-v5-fix-trailers.sh:16-19` | ✅（R5） |
-| C5 | **（v2 改写）** canonical `f1952819f` 带 `packages/commercial/src/db/migrations/0281_cursor_sand_usable_families.sql` 并登记 requiredMigrations → 服务器 STEP 3 迁移门**预期 HAS_MIGRATION=1**（DB 缺口 + live..候选 git diff 双判）；0281 含 `ALTER TABLE … DROP CONSTRAINT`（L248-249）→ `classify_pending_migration_file` 默认 `die`，**必须 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**；apply 由 STEP 6b `run_migrations_from_release` 在翻转同一把锁内做，需 `$rel/node_modules`（build_master_release 产物自带）与 `/etc/openclaude/commercial-v5-selfhost.env` 的 DB URL | master-lib:756-775（breaking 分类）、:792-822（DB 缺口只读比对，`sudo -u postgres psql`）、:824-856（分类 + 放行开关）、:862-925（门主体）、:1146-1158（runner）；deploy-v5-selfhost.sh:2495-2505、:2598-2609 | ⚠ 审计侧仍无 migrations（`git diff --name-only 210b99678 c97a750f8 -- '**/migrations/**'` 为空）；canonical 侧 +1。本机 `lint:migration-order` ✅。放行与前置核对 → U7 / U8 |
+| C5 | **（v2 改写）** canonical `f1952819f` 带 `packages/commercial/src/db/migrations/0281_cursor_sand_usable_families.sql` 并登记 requiredMigrations → 服务器 STEP 3 迁移门**预期 HAS_MIGRATION=1**（DB 缺口 + live..候选 git diff 双判）；0281 含 `ALTER TABLE … DROP CONSTRAINT`（L248-249）→ `classify_pending_migration_file` 默认 `die`，**必须 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**；apply 由 STEP 6b `run_migrations_from_release` 在翻转同一把锁内做，需 `$rel/node_modules`（build_master_release 产物自带）与 `/etc/openclaude/commercial-v5-selfhost.env` 的 DB URL | master-lib:756-775（breaking 分类）、:792-822（DB 缺口只读比对，`sudo -u postgres psql`）、:824-856（分类 + 放行开关）、:862-925（门主体）、:1146-1158（runner）；deploy-v5-selfhost.sh:2495-2505、:2598-2609 | **v2.1 实测：服务器 live 已是 f1952819f、`schema_migrations` 已含 0281 → 本次 live..候选 diff 无 migrations、DB 缺口为空 → 预期 HAS_MIGRATION=0，不需 env**（备线见 §4.4）。审计侧仍无 migrations（`git diff --name-only 210b99678 c97a750f8 -- '**/migrations/**'` 为空）；本机 `lint:migration-order` ✅ |
 | C10 | **（v2 新增）** `platform-runtime/bin/oc-cursor.sh` 有变 → `--deploy` 会重建 platform bundle；默认**拷工作树**，服务器工作树必须干净，否则加 `--allow-dirty --platform-from-head` | deploy-v5-selfhost.sh:30-36、:1982-1998；PLAYBOOK §4.1 :343 | 待服务器 `git status -sb`（§4.0） |
 | C11 | **（v2 新增）** `packages/protocol/src/engineModels.ts` 有变 → master 进程 + runtime source release 两轴都要新制品；`--deploy` 一次构建三面已覆盖，无需额外动作 | PLAYBOOK §4.1 :340、:342；deploy-v5-selfhost.sh:2014-2022 | ✅ `test:protocol` engineModels 14/14；runtime-release 由 `build_runtime_release` 从 HEAD archive |
 | C6 | 依赖未变（`package-lock.json` 无 diff）→ 不需要 `--force-npm-ci`；注意 `ensure_node_modules` 见到 `node_modules` 目录**就跳过 `npm ci`**（deploy-v5-selfhost.sh:1094-1107），若将来 lock 变了必须 `--force-npm-ci` | deploy-v5-selfhost.sh:437、:1094-1107 | ✅ 仅 `packages/web-react/package.json` 加了 `typecheck:preview` 脚本 |
@@ -173,18 +178,36 @@ git diff --name-only --diff-filter=U  # 应为空后再 commit
 | S13 | `python3` 可用（仅迁移门分类 breaking DDL 时用；本次预期无迁移） | master-lib:756-758 |
 | S14 | 生效面：`packages/gateway/**`（canonical advisorMode.ts / server.ts）= runtime source release 轴 → `--deploy` 从 HEAD `git archive` 构建 runtime-release 并写四元组；`packages/web-react/**` = master release 内 `dist`；`docs/**` / `scripts/**` 随 release 树走，无运行时效果 | PLAYBOOK §4.1 矩阵 :338-345；deploy-v5-selfhost.sh:27-29、:1454、:2021-2026 |
 
+#### 2.2b v2.1 服务器只读实测（09-18 00:56 UTC+8 = 09-17 16:56Z，`ssh -o BatchMode=yes -o ConnectTimeout=15 root@38.55.252.217`，hostname `v3-dev-sg`，up 2d 7h；原始输出附录 C）
+
+| # | 实测 | 结论 |
+|---|---|---|
+| S1 | `/opt/openclaude/openclaude-v5-selfhost` 存在，分支 `feat/v5-selfhost...origin/feat/v5-selfhost`，HEAD = **`f1952819f`**（= canonical 现 HEAD；服务器本地 `origin/feat/v5-selfhost` 也已是 f1952819f，说明有人 09-17 fetch 过） | ✅ 发布时只需 fetch + ff 到 `<REL>` |
+| S2 | docker psql jq curl openssl rsync git ss systemctl iptables npm python3 bun node 全部 `command -v` ok；jq-1.7、git 2.43.0（≥2.38，`merge-tree --write-tree` 可用）、node v20.20.2；bun 在 `/usr/bin/bun`（`/usr/local/bin/bun --version` 无输出，但 09-17 08:25Z 的 `--deploy` 已在同机过了 `preflight_common`，`OC_BUN_BIN` 解析无碍；执行前 `ls -l /usr/local/bin/bun $(command -v bun)` 看一眼） | ✅ |
+| S4 / S8 | `/etc/openclaude/secrets.env`（1725B，600，09-15）与 `/etc/openclaude/commercial-v5-selfhost.env`（5873B，600，09-17 08:41）都在；env 内 `OC_RUNTIME_IMAGE=…slim`、`OC_RUNTIME_RELEASE=/var/lib/openclaude-v5-selfhost/runtime-releases/rel-60955d1c847c`、`OC_PLATFORM_BUNDLE=/var/lib/openclaude-v5-selfhost/platform/bundles/0e4b6b137992`、`OC_CONTROL_PLANE_LEADER=1`、`OC_SESSIONS_STORE=pg` | ✅（ARK key 非空与否未读文件内容，`--deploy` 自己会判） |
+| S5 | `openclaude.service`（v3 dev — sg，个人版）active；`127.0.0.1:18789/healthz` = **200** | ✅ 红线基线绿 |
+| S6 / S7 / S8 | 镜像 `openclaude/openclaude-runtime:v5-cli-codex0153-grok105-zcode381-slim` 在本机；`openclaude-v5-net` 存在，子网 `172.31.0.0/16`；live symlink → `rel-f1952819f-20260917-082520` | ✅ |
+| S9 | `git status --porcelain | wc -l` = **0**（干净）→ 不需要 `--allow-dirty`；C10 的 platform bundle 会吃干净树 | ✅ |
+| S10 | `/dev/vda1` 194G 用 168G 余 **27G（87%）**，`free_GiB=26.6` ≥ 8 | ✅ 门过；t-1455 的 ≤85% 目标还差 ~2%。只读观察：`openclaude-v5-selfhost-releases/` 下有 09-17 4 次失败 train 留下的 `rel-f1952819f-20260917-{064741,071018,072935,074953}` 各 181M（apparent）≈ 724M，加 `rel-3b7c38b9d-20260915-073032` 1.5G（当前 `.prev-release`，**别删**）——可交 t-1455 评估，本单未动 |
+| S11 | `oc-lease.sh status --resource deploy:selfhost`：trains 最近 5 条全是 09-17 manual（4 failed「deploy 进程退出 rc=1 未到 committed」+ 最后 `tr-20260917T082515Z-d93950a17ac5` **committed** live=rel-f1952819f-20260917-082520，08:43:36Z）；`deploy proc: none`；权威事实 origin tip = live committed_sha = f1952819f | ✅ 无 open train |
+| S12 | `/run/openclaude-v5-selfhost/`：`deploy.lock`（0B，flock 文件本身存在是常态）、`cutover-survivor.committed`、`cutover-survivor.state`、`cutover-grace-until`、`lease-worker.lock` | ✅ 无持锁进程 |
+| S13 | python3 ok | ✅ |
+| 现网健康 | `127.0.0.1:18790/healthz` = 200；`GET /` 的 `oc-build` = **`12a3050edf56a441`**（= `<OLD_BUILD>`）；units：master `openclaude-v5-selfhost.service` active，egress `slotA` active / `slotB` inactive / `serving=slotA`，hostnet / ccb-proxy / sshgate / cursor-proxy / boot-guard active，`selfheal-tunnel` active，`lease-worker.timer` 与 `watch.timer` 每 30s | ✅ |
+| 迁移（U7） | `schema_migrations` 含 **`0280_cursor_haiku_45` 与 `0281_cursor_sand_usable_families`**，`max(version)` = 0281；`cursor-gemini-3.8-flash-high` / `cursor-grok-4.6-high` / `cursor-haiku-4.5` 均 `active` / `enabled=t` | ✅ → 本次 HAS_MIGRATION 预期 0（R0 v2.1） |
+| `--status` | 见 §4.1 实测段；`spa dist: MISSING` / `.complete: MISSING` 是**工作树**指标（:1879-1888），release 制下为预期 | ✅ |
+
 ### 2.3 本机无法满足、需服务器或用户的项
 
 | # | 项 | 说明 |
 |---|---|---|
-| U1 | SSH 到 v5-dev（38.55.252.217 / 186.244.238.121:22） | 本机拿到 banner 但密钥未授权（任务书明令不要尝试登录）。§4 全部由有通道的会话/用户执行。决策 d-24 亦如此约定。 |
+| U1 | SSH 到 v5-dev（38.55.252.217 / 186.244.238.121:22） | **v2.1 已解（只读）**：本机 `ssh -o BatchMode=yes root@38.55.252.217` 密钥可用（d-1326 通道），两轮只读核对已跑通；写操作（fetch/checkout/--deploy）仍按 d-1326/d-1450 由指挥官代批的会话执行。初稿时点「密钥未授权」已过时。 |
 | U2 | 推 canonical `origin/feat/v5-selfhost` | 决策 d-24：「合入 canonical 与 Lease Center 发布需要 v5-dev 访问,留给有服务器通道的会话/用户」；成员只推自己的分支。 |
 | U3 | R1 修复 | 需指挥官拍板方案，shell owner 落地；不在 t-1279 边界（不改业务代码）。 |
 | U4 | R3 修复 | canonical 侧 incidents.json 数据问题，非本组文件归属。 |
 | U5 | gateway 单测、`check:v5:incidents`、`test:browser` 在 Linux 上的真结果 | 本机 Windows 假阳性/未跑；服务器或 CI 复跑。 |
-| U6 | `--deploy --dry-run` 的真实计划输出、DB 缺口比对、磁盘/端口/unit 现状 | 只能在服务器上看。 |
-| U7 | **（v2）0281 在 selfhost DB 上的前置**：`schema_migrations` 是否已有 `0280_cursor_haiku_45`、尚无 `0281_…`；`model_catalog`/`model_pricing` 里 `cursor-grok-4.6-high`、`cursor-gemini-3.8-flash-high`、`cursor-haiku-4.5` 是否 active+enabled（0281 L40-57 三条 `RAISE EXCEPTION`） | 只读 SQL 在 §4.0；不满足 → STEP 6b apply 失败 → `补偿: reason=migration-apply`，live 不动。注意早期 Cursor 家族迁移（0210/0220/0222/0247）按 `openclaude.migration_profile = 'v5-selfhost'` 分叉过，selfhost DB 的行状态不能想当然。 |
-| U8 | **（v2）`OC_V5_ALLOW_BREAKING_MIGRATION=1` 的拍板**：0281 的 `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` 是换 CHECK（放宽 `cursor_external_usage_audit.model_id` 白名单），不是删表删列，作者已自注要放行；但放行会 ⚠ 写进部署日志（master-lib:850） | 指挥官按 d-1326/d-1450 代批或 `ask_decision`；发布执行者在 §4.4/§4.5 命令前加该 env。 |
+| U6 | `--deploy --dry-run` 的真实计划输出、DB 缺口比对、磁盘/端口/unit 现状 | **v2.1 部分已解**：磁盘/端口/unit/DB 现状见 §2.2b；`--deploy --dry-run` 本单未跑（属发布执行者动作，留给 t-1269；dry-run 不加锁 :404-405）。 |
+| U7 | **（v2）0281 在 selfhost DB 上的前置**：`schema_migrations` 是否已有 `0280_cursor_haiku_45`、尚无 `0281_…`；`model_catalog`/`model_pricing` 里 `cursor-grok-4.6-high`、`cursor-gemini-3.8-flash-high`、`cursor-haiku-4.5` 是否 active+enabled（0281 L40-57 三条 `RAISE EXCEPTION`） | **v2.1 已解 ✅**：实测 `schema_migrations` 已含 0280 与 0281，三条前置行 active+enabled（§2.2b）。原判据保留：不满足 → STEP 6b apply 失败 → `补偿: reason=migration-apply`，live 不动。早期 Cursor 家族迁移（0210/0220/0222/0247）按 `openclaude.migration_profile = 'v5-selfhost'` 分叉过，所以当时不能想当然——现在已实测。 |
+| U8 | **（v2）`OC_V5_ALLOW_BREAKING_MIGRATION=1` 的拍板**：0281 的 `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` 是换 CHECK（放宽 `cursor_external_usage_audit.model_id` 白名单），不是删表删列，作者已自注要放行；但放行会 ⚠ 写进部署日志（master-lib:850） | **v2.1 不再需要**：live 已是 f1952819f 且 0281 已 apply → 本次 HAS_MIGRATION=0。只在「回滚到 rel-3b7c38b9d 后再发布」或「canonical 再带迁移」时按 d-1326/d-1450 由指挥官代批。 |
 | U9 | **（v2）`test:commercial:unit`（含 cursorCliWrapper）在 Linux 上的真结果** | 本机 Windows 假阳性（R9）；CI 或服务器复跑。 |
 
 ## 3. 本地步骤（canonical ff 与 push；由有通道者执行）
@@ -262,19 +285,23 @@ df -Pk /opt/openclaude | awk 'NR==2{print $4/1024/1024 " GiB free"}'  # 判据�
 # ── v2 新增：迁移 0281 只读前置（U7；两条都是 SELECT，不写盘）──
 sudo -u postgres psql -X -d openclaude_v5_selfhost -tAc "SELECT version FROM schema_migrations WHERE version IN ('0280_cursor_haiku_45','0281_cursor_sand_usable_families') ORDER BY 1"
 #   判据：只回 0280_cursor_haiku_45 → 0281 未 apply，§4.4/§4.5 预期 HAS_MIGRATION=1，需要 OC_V5_ALLOW_BREAKING_MIGRATION=1（U8）
-#         两条都回 → 0281 已 apply（有人先跑过）；HAS_MIGRATION 仍会由 live..候选 git diff 判成 1、分类仍要求放行（master-lib:887-916），apply 阶段由 migrate.ts 按 schema_migrations 记账跳过（常规 runner 语义，本机未实跑验证）
+#         两条都回（**v2.1 实测即此**）→ 0281 已 apply；只要 live 仍是 f1952819f（或其后代），live..候选 git diff 无 migrations → HAS_MIGRATION=0，不加 env
+#             若 live 已被回滚到 rel-3b7c38b9d 再发：git diff 3b7c38b9d..<REL> 会再含 0281 → HAS_MIGRATION=1 且分类要求放行（master-lib:887-916），apply 由 migrate.ts 按记账跳过（常规 runner 语义，未实跑）
 #         连 0280 都没有 → 停：selfhost DB 落后于 canonical 3b7c38b9d 的 requiredMigrations，先搞清 live 是哪个 release
 sudo -u postgres psql -X -d openclaude_v5_selfhost -tAc "SELECT c.model_id, c.state, p.enabled FROM model_catalog c JOIN model_pricing p USING (model_id) WHERE c.engine='cursor' AND c.model_id IN ('cursor-grok-4.6-high','cursor-gemini-3.8-flash-high','cursor-haiku-4.5') ORDER BY 1"
-#   判据：3 行，state=active、enabled=t（0281 L40-57 三条 RAISE EXCEPTION 的前置）；缺任何一行 → STEP 6b 必败（补偿、不翻转），先停下问 canonical 维护者
+#   判据：3 行，state=active、enabled=t（0281 L40-57 三条 RAISE EXCEPTION 的前置；v2.1 实测 3 行全 active|t）；缺任何一行 → STEP 6b 必败（补偿、不翻转），先停下问 canonical 维护者
 ```
+
+**v2.1 实测前值（09-18 00:56 UTC+8，直接抄进 §6）**：`<OLD_HEAD>` = `f1952819f8b9f515b97c1a68d2da413522047781`（工作树干净，porcelain 0 行）；`<OLD_REL>` = `/opt/openclaude/openclaude-v5-selfhost-releases/rel-f1952819f-20260917-082520`（`.complete`：schemaVersion 2，sourceCommit f1952819f，builtAt 20260917-082520，metadataSha256 `acc556eb…`，artifactSha256 `a4ef67b2…`）；`<OLD_PREV>` = `…/rel-3b7c38b9d-20260915-073032`；`<OLD_BUILD>`（`GET /` 的 oc-build）= `12a3050edf56a441`；`OC_RUNTIME_RELEASE` = `…/runtime-releases/rel-60955d1c847c`；`OC_PLATFORM_BUNDLE` = `…/platform/bundles/0e4b6b137992`；lease：无 open train，`deploy proc: none`；磁盘 26.6 GiB 可用（87%）。发布当天这些值若变了，说明中间有人发过，先 `git log <OLD_HEAD>..HEAD` 看清再走。
 
 ### 4.1 `--status`（前）
 
 ```bash
 scripts/deploy-v5-selfhost.sh --status
 ```
-预期（deploy-v5-selfhost.sh:1847-1911）：`worktree:` / `HEAD:` / `live: …-live → <OLD_REL>` / `prev: <OLD_PREV>` / `env: … present mode=600|640` / `OC_RUNTIME_IMAGE=…slim` / `OC_RUNTIME_RELEASE=…` / `OC_PLATFORM_BUNDLE=…` / `unit master: active` / `unit egress: … serving=<slotA|slotB|legacy>` / `unit hostnet|ccb-proxy|sshgate: active` / `spa dist: present` / `.complete: present <sha>` / `personal: active` / `net: openclaude-v5-net 存在` / `pg: openclaude_v5_selfhost 存在` / `port 18790: listen · 18892: listen · 18789: listen`。
+预期（deploy-v5-selfhost.sh:1847-1911）：`worktree:` / `HEAD:` / `live: …-live → <OLD_REL>` / `prev: <OLD_PREV>` / `env: … present mode=600|640` / `OC_RUNTIME_IMAGE=…slim` / `OC_RUNTIME_RELEASE=…` / `OC_PLATFORM_BUNDLE=…` / `unit master: active` / `unit egress: … serving=<slotA|slotB|legacy>` / `unit hostnet|ccb-proxy|sshgate: active` / **`spa dist: MISSING` / `.complete: MISSING`（v2.1 修正：这两项看的是工作树 `$REPO_ROOT/packages/web-react/dist/index.html` 与 `$REPO_ROOT/.complete`，:1879-1888；release 制流程前端不吃工作树，MISSING 是预期，权威在 `<OLD_REL>/.complete`）** / `personal: active` / `net: openclaude-v5-net 存在` / `pg: openclaude_v5_selfhost 存在` / `port 18790: listen · 18892: listen · 18789: listen`。
 判据：master/egress/personal 全 active；live 非 MISSING/dangling；把整段输出贴进 §6。
+v2.1 实测（09-18 00:56）：`HEAD: f1952819f` / `live → rel-f1952819f-20260917-082520` / `prev: rel-3b7c38b9d-20260915-073032` / `env present mode=600` / `unit master: active` / `unit egress: legacy=inactive slotA=active slotB=inactive serving=slotA tcp_migrate_req=1` / hostnet·ccb-proxy·sshgate·tunnel active / `spa dist: MISSING` / `.complete: MISSING` / `OC_SESSIONS_STORE=pg` / `personal: active` / net·pg 存在 / 18790·18892·18789 listen —— 全部符合判据。
 
 ### 4.2 `--smoke`（前 · 现网健康基线）
 
@@ -282,7 +309,7 @@ scripts/deploy-v5-selfhost.sh --status
 scripts/deploy-v5-selfhost.sh --smoke
 ```
 预期（:1789-1845）：`✓ /healthz 200 + controlPlaneEnabled + leadership.state=leader` → `✓ GET / 返回 SPA index.html(oc-build=<hash> src=<OLD_REL>/packages/web-react/dist/index.html)` → SSH 规则断言 → `✓ 个人版 openclaude.service 仍 active 且 :18789 仍 200` → `✓ smoke 通过`。
-判据：exit 0。**现网本来就不健康 → 先按 AGENTS.md「只读诊断边界」（:19-27）定位，不要拿发布当修复。**
+判据：exit 0。**现网本来就不健康 → 先按 AGENTS.md「只读诊断边界」（:19-27）定位，不要拿发布当修复。** v2.1 只读实测（未跑 `--smoke` 本身）：18790 healthz 200、18789 healthz 200、`GET /` oc-build = `12a3050edf56a441`（`<OLD_BUILD>`）。
 
 ### 4.3 关于 `--preflight`（R7）
 
@@ -299,22 +326,27 @@ git fetch origin feat/v5-selfhost
 git rev-parse origin/feat/v5-selfhost        # 判据：== <REL>（§3.3）
 git merge --ff-only origin/feat/v5-selfhost  # 判据：Fast-forward；HEAD == <REL>。拒绝 ff（本地有私提交）→ 停，先搞清是谁的提交
 git rev-parse HEAD
-OC_V5_ALLOW_BREAKING_MIGRATION=1 scripts/deploy-v5-selfhost.sh --deploy --dry-run   # v2：0281 含 ALTER…DROP CONSTRAINT，不带此 env 会在 STEP 3 die（U8 拍板后再加）
+scripts/deploy-v5-selfhost.sh --deploy --dry-run
+# v2.1：live 已是 f1952819f 且 0281 已 apply → 预期 HAS_MIGRATION=0，**不加** OC_V5_ALLOW_BREAKING_MIGRATION。
+#       只有 §4.0 第一条 SQL / live 情形变了（回滚到 rel-3b7c38b9d 后再发、或 canonical 再带迁移）才改成：
+#       OC_V5_ALLOW_BREAKING_MIGRATION=1 scripts/deploy-v5-selfhost.sh --deploy --dry-run
 ```
 预期（:1974-2031，dry-run 不加锁 :404-405）：`══ v5 selfhost --deploy(…) ══` → `preflight_common` 静默通过 → `── 脏工作树三面语义 ──` → `── Incident trailer 门(HEAD=<REL 前 12>,构建前 fail-closed) ──` + `✓ [fix-trailers] PASS: …` → `── source=<REL> 构建三面制品(失败则 live 不动) ──` 各步 `[dry-run] …` → `── 进入 --cutover 翻转窗口 …` 的 `STEP 1..10 [dry-run]` 计划 → `✓ --cutover --dry-run 执行计划结束(未改 unit / 未切 symlink / 未重启 / 未迁库 / 未武装真 survivor)`。
-判据：exit 0；trailer 门 PASS；**`STEP 3 迁移门`（v2 改写）预期打印 `迁移门: DB 缺口 HAS_MIGRATION=1 missing:` + `0281_cursor_sand_usable_families` → `⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行: packages/commercial/src/db/migrations/0281_cursor_sand_usable_families.sql (ALTER ... DROP)` → `✓ 迁移门: 分类通过(含 migration 时 apply 必须与翻转同一把锁、同一窗口)` → `HAS_MIGRATION=1 → apply 与翻转必须同一把锁、同一窗口` + `[dry-run] 对着 <rel> 跑 migration runner(失败则不翻转,不回滚 schema)`**（master-lib:874-885、:920-921；deploy-v5-selfhost.sh:2495-2502）。若打印的 missing 不止 0281、或出现 `迁移门: … 未列入 … requiredMigrations` / `命中破坏性 DDL(…)。默认拒绝` → 停：前者说明 selfhost DB 落后（U7 第三种情形），后者说明 env 没带上；若 HAS_MIGRATION=0，回头看 §4.0 第一条 SQL 是否两条都在。`工作区不干净` die → 决定是否加 `--allow-dirty --platform-from-head`（C10：oc-cursor.sh 有变，platform bundle 别吃脏树）。
+判据：exit 0；trailer 门 PASS；**`STEP 3 迁移门`（v2.1 主线）预期打印 `迁移门: requiredMigrations 均已在 schema_migrations` → `迁移门: HAS_MIGRATION=0` → `HAS_MIGRATION=0,跳过 apply`**（master-lib:883-884、:923；deploy-v5-selfhost.sh:2503-2504）。**备线（仅 live 已回滚到 3b7c38b9d 或 canonical 再带迁移时）**：`迁移门: DB 缺口 HAS_MIGRATION=1 missing:` / `迁移门: live..候选 git diff 含 **/migrations/**` + `0281_…` → 带 env 时 `⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行: … (ALTER ... DROP)` → `✓ 迁移门: 分类通过(…)` → `HAS_MIGRATION=1 → apply 与翻转必须同一把锁、同一窗口` + `[dry-run] 对着 <rel> 跑 migration runner(失败则不翻转,不回滚 schema)`（master-lib:874-885、:920-921；:2495-2502）；不带 env 则 `命中破坏性 DDL(…)。默认拒绝` die。**主线下若意外看到 HAS_MIGRATION=1 → 停**，回 §4.0 看 live 与 SQL 是不是变了；missing 列出不止 0281 → selfhost DB 落后（U7 第三种情形）。`工作区不干净` die → 决定是否加 `--allow-dirty --platform-from-head`（C10：oc-cursor.sh 有变，platform bundle 别吃脏树；v2.1 实测干净）。
 
 ### 4.5 `--deploy`（真发布；持锁；单次 15–30 分钟量级：vite + runtime + platform 三面构建 + 翻转）
 
 ```bash
-OC_V5_ALLOW_BREAKING_MIGRATION=1 scripts/deploy-v5-selfhost.sh --deploy 2>&1 | tee /opt/openclaude/tmp/deploy-selfhost-$(date -u +%Y%m%dT%H%M%SZ).log
-# 有别人的脏文件时：OC_V5_ALLOW_BREAKING_MIGRATION=1 scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
-# v2：env 前缀是 0281 的 ALTER…DROP CONSTRAINT 分类放行（U8），只对本次含 0281 的发布有效；下次没有 breaking 迁移就不要带
+scripts/deploy-v5-selfhost.sh --deploy 2>&1 | tee /opt/openclaude/tmp/deploy-selfhost-$(date -u +%Y%m%dT%H%M%SZ).log
+# 有别人的脏文件时：scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
+# v2.1：主线不带 OC_V5_ALLOW_BREAKING_MIGRATION（live=f1952819f、0281 已 apply → HAS_MIGRATION=0）。
+#       只有 §4.4 dry-run 真打出 HAS_MIGRATION=1 且 missing/diff 只含 0281、并经指挥官代批（U8）时，才加前缀：
+#       OC_V5_ALLOW_BREAKING_MIGRATION=1 scripts/deploy-v5-selfhost.sh --deploy …
 ```
 预期顺序与判据（:1974-2031 → :2444-2700）：
 1. `⚠ 人工发布已登记为 manual train tr-…`（:1362）。
 2. `✓ [fix-trailers] PASS`；`── source=<REL> 构建三面制品 ──`；`✓ web-react dist oc-build=<NEW_BUILD>`（:1127，记下 `<NEW_BUILD>`）；`✓ master release=/opt/openclaude/openclaude-v5-selfhost-releases/rel-…`（:2019，记 `<NEW_REL>`）；runtime-release / platform bundle 构建完成。**这一段任何 die 都不会改现网**（:2014「失败则 live 不动」）。R1 若未修，就死在这里：`✗ web-react 构建失败。补救: 看上方 tsc/vite 输出…`。
-3. `══ v5 selfhost --cutover DRY=0 JOINT=1 log=/opt/openclaude/tmp/cutover-<ts>.log ══`，STEP 1 持锁 → STEP 2 `✓ 静态门通过 <NEW_REL> sourceCommit=<REL 前 9> digest=…`、`✓ tsx 自检通过`、`unit snapshot=…` → **STEP 3 迁移门（v2）`DB 缺口 HAS_MIGRATION=1 missing: 0281_cursor_sand_usable_families` + `⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行` + `✓ 迁移门: 分类通过`** → STEP 4 `backup=<BREAKGLASS>/unit-backups/pre-cutover-<ts>` 与 `.prev-release=<OLD_REL>` → STEP 5 装 unit + `daemon-reload` → STEP 6 grace 标记 → **STEP 6b（v2）`含 migration: 当场 apply(与下一步翻转同一把锁、同一窗口)`：在 `<NEW_REL>` 里 `npx --no-install tsx packages/commercial/src/db/migrate.ts`（`COMMERCIAL_AUTO_MIGRATE=1`，`PGOPTIONS=-c openclaude.migration_profile=v5-selfhost`，master-lib:1146-1158），期望 migrate.ts 输出中 0281 applied；phase → `migrated`** → STEP 7 `原子挂 live symlink … → <NEW_REL>` → STEP 8 `joint: oc_hotcfg_activate_saga 写四元组 + restart + smoke` → `✓ --cutover 完成 live → <NEW_REL>` → `🎫 lease train tr-… → committed` → `✓ --deploy 完成 live → <NEW_REL>`。
+3. `══ v5 selfhost --cutover DRY=0 JOINT=1 log=/opt/openclaude/tmp/cutover-<ts>.log ══`，STEP 1 持锁 → STEP 2 `✓ 静态门通过 <NEW_REL> sourceCommit=<REL 前 9> digest=…`、`✓ tsx 自检通过`、`unit snapshot=…` → **STEP 3 迁移门（v2.1 主线）`requiredMigrations 均已在 schema_migrations` + `HAS_MIGRATION=0` + `HAS_MIGRATION=0,跳过 apply`**（备线 =1 时：`DB 缺口/git diff … 0281_cursor_sand_usable_families` + `⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行` + `✓ 迁移门: 分类通过`）→ STEP 4 `backup=<BREAKGLASS>/unit-backups/pre-cutover-<ts>` 与 `.prev-release=<OLD_REL>`（v2.1：= rel-f1952819f-20260917-082520）→ STEP 5 装 unit + `daemon-reload` → STEP 6 grace 标记 → **STEP 6b（只在 HAS_MIGRATION=1 的备线出现）`含 migration: 当场 apply(与下一步翻转同一把锁、同一窗口)`：在 `<NEW_REL>` 里 `npx --no-install tsx packages/commercial/src/db/migrate.ts`（`COMMERCIAL_AUTO_MIGRATE=1`，`PGOPTIONS=-c openclaude.migration_profile=v5-selfhost`，master-lib:1146-1158）；phase → `migrated`** → STEP 7 `原子挂 live symlink … → <NEW_REL>` → STEP 8 `joint: oc_hotcfg_activate_saga 写四元组 + restart + smoke` → `✓ --cutover 完成 live → <NEW_REL>` → `🎫 lease train tr-… → committed` → `✓ --deploy 完成 live → <NEW_REL>`。
 4. 判据：最后两行必须同时出现；exit 0。出现 `补偿: reason=…` 即进入 §5.1 自动回滚路径，看它的一级/二级结论（**v2：`reason=migration-apply` = 0281 在 DB 上 RAISE EXCEPTION 或 runner 出错，live 未动、schema 未回滚（DO 块本身原子）→ 看 cutover 日志里 0281 的报错文案对照 U7**）；出现 `.manual-recovery-required` → §5.3。
 
 ### 4.6 `--smoke`（后）
@@ -363,7 +395,7 @@ canonical 第 7 提交（OCV5-225，`f1952819f`，依赖 0281 已 apply）：
 
 ```bash
 cd /opt/openclaude/openclaude-v5-selfhost
-PREV=$(tr -d '[:space:]' </opt/openclaude/openclaude-v5-selfhost-releases/.prev-release); echo "$PREV"   # 判据：== <OLD_REL>，不是 none
+PREV=$(tr -d '[:space:]' </opt/openclaude/openclaude-v5-selfhost-releases/.prev-release); echo "$PREV"   # 判据：== <OLD_REL>（v2.1：发布成功后应为 rel-f1952819f-20260917-082520），不是 none
 PREV_SHA=$(jq -r .sourceCommit "$PREV/.complete"); echo "$PREV_SHA"                                        # 判据：== <OLD_HEAD>
 # 静态门要求候选 sourceCommit == 工作树 HEAD（master-lib:691-712，expected 来自 cutover_expected_source_commit → source_commit = HEAD，deploy-v5-selfhost.sh:2434-2441、:1309-1311）
 git checkout --detach "$PREV_SHA"
@@ -405,8 +437,8 @@ scripts/deploy-v5-selfhost.sh --status                                 # 判据�
 - 前值：<OLD_HEAD> `…` / <OLD_REL> `rel-…` / <OLD_PREV> `rel-…`
 - 前置门（§2.1）：build ✅ · trailer ✅ · typecheck ✅ · typecheck:preview ✅ · check:tutorials ✅ · vitest ✅ · check:v5:incidents ✅/❌(说明)
 - §4.0 oc-lease status：无 open train ✅ · 磁盘 <n> GiB ✅
-- §4.0 迁移只读前置（v2）：schema_migrations 有 0280 / 无 0281 ✅ · 三条前置行 active+enabled ✅
-- 迁移（v2）：HAS_MIGRATION=1 · `OC_V5_ALLOW_BREAKING_MIGRATION=1` 放行（U8 批准人 / 决策号：…）· STEP 6b 0281 applied ✅（cutover 日志行：…）
+- §4.0 迁移只读前置（v2.1）：schema_migrations 含 0280 与 0281 ✅（v2.1 实测已含）· 三条前置行 active+enabled ✅
+- 迁移（v2.1 主线）：HAS_MIGRATION=0 ✅ · 未带 `OC_V5_ALLOW_BREAKING_MIGRATION`（若走了备线：=1 · 放行批准人 / 决策号：… · STEP 6b 0281 applied ✅ · cutover 日志行：…）
 - §4.1 --status（前）：<粘贴>
 - §4.2 --smoke（前）：✅ oc-build=<old>
 - §4.4 --deploy --dry-run：✅ trailer PASS · HAS_MIGRATION=0 · 脏树：无/--allow-dirty --platform-from-head
@@ -455,7 +487,8 @@ scripts/deploy-v5-selfhost.sh --status                                 # 判据�
 - `merge-1.log`（真实 merge 的 7 处 CONFLICT 输出）、`check-tutorials-1.log` / `tutorials-accept.log` / `check-tutorials-2.log`（§1.2 5-7 三步）、`app-test-failure.txt` / `grep-checkbox.txt`（R2 现场）、`canonical-trailers.txt`、`canonical-tutorial-diff.txt`、`incident-entry.json`。
 - `gates-head/SUMMARY.txt` + 各门 `*.log`（§1.3 全部结果，HEAD c1fdc935e）；`gates-head/fix-trailers.log`（R5）；`gates-head/vite-build.log`（R1 现场）；`gates-head/first-screen-bisect.txt`（R1 归因四基点）。
 - `canon-3b7c38b9d\`（纯 canonical 临时 detached worktree，用完 `git worktree remove` 清掉）；`jqbin\jq.exe`（jq-1.7.1）；`run-gates-head.ps1` / `bisect-first-screen.ps1` / `measure-first-screen.mjs`（复跑脚本）。
-- **v2**：`gates-head-2/SUMMARY.txt` + 各门 `*.log`（§1.3b 全部结果，HEAD f6572abb6；`vite-build.log` 含 `built in 18.84s`、`measure-first-screen.log` 含 447.3KB 明细、`commercial-cursorCliWrapper.log` 为 R9 现场）；`run-gates-head-2.ps1`（复跑脚本，比 v1 多 lint:migration-order / test:protocol / cursorCliWrapper / build / 首屏复算 / trailer 门）。
+- **v2**：`gates-head-2/SUMMARY.txt` + 各门 `*.log`（§1.3b 全部结果，HEAD f6572abb6；`vite-build.log` 含 `built in 18.84s`、`measure-first-screen.log` 含 447.3KB 明细、`commercial-cursorCliWrapper.log` 为 R9 现场）；`gates-head-2/vite-build-c009a1c04-no-budgetfix.log`（无 budget-fix 对照 471.9KB ❌ 现场）；`run-gates-head-2.ps1`（复跑脚本，比 v1 多 lint:migration-order / test:protocol / cursorCliWrapper / build / 首屏复算 / trailer 门）。
+- **v2.1 服务器只读核对**：`server-readonly-check.sh`（发到服务器 `bash -s` 执行的只读脚本：git status / rev-parse / readlink / systemctl list-units / curl healthz / df / command -v / ls env / docker inspect·images / oc-lease status / ls /run 锁目录 / 三条 SELECT / `--status`）与原始输出 `server-readonly-check.out.txt`、`server-readonly-check-2.out.txt`（trains 段、`.complete` 内容、release 目录体量）。
 
 ## 附录 D · 相关文档对本手册的适用性
 
