@@ -68,13 +68,13 @@ const BOOT_TIMEOUT = 60_000;
 /** J1-J4 的总防挂预算；进入 J5 后改由 TURN_WAIT_TIMEOUT 单独计时。 */
 const PRE_J5_TIMEOUT = 240_000;
 /**
- * 旅程固定使用平台自有的 Codex/Luna 模型。双引擎真 turn 矩阵已经单独验证
+ * 旅程固定使用官方 Grok Build（grok-build）。Codex/Luna 额度耗尽或 catalog disabled 时不能再钉 luna。双引擎真 turn 矩阵已经单独验证
  * CCB/DeepSeek；UI/附件门若继续选择同一个 provider 模型，会在该 provider 被健康
  * 系统降级时卡死在“禁用模型不可点击”，重复前一道模型门并把 J1-J5 误判成前端
  * 回归。固定 Luna 仍通过真实模型选择器和真实 J5 回复验证完整用户路径，同时避免
  * 旅程继承 canary 账号历史会话的粘滞模型。
  */
-const JOURNEY_MODEL_ID = "gpt-5.6-luna";
+const JOURNEY_MODEL_ID = "grok-build";
 /**
  * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
  * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件
