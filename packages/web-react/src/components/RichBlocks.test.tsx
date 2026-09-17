@@ -51,6 +51,27 @@ describe("OptionsBlock", () => {
     expect(sendUserText).toHaveBeenCalledWith("我选择:浏览器、网页提取");
   });
 
+  it("demo 演示模式:没有发送能力时说清是「演示模式仅供浏览」,而不是笼统的「不可交互」(D-08)", () => {
+    render(
+      <ChatInteractionContext.Provider value={{ reason: "demo" }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    // 选项仍以卡片呈现(演示要看得到形态),但不可点、且原因写明是演示模式。
+    expect(screen.getByText("选一个部署方式?")).toBeTruthy();
+    expect(screen.getByText(/演示模式仅供浏览/)).toBeTruthy();
+    expect(screen.queryByText(/此会话中不可交互/)).toBeNull();
+    // 一般无 provider / 无 reason 的只读情形仍是通用文案。
+    cleanup();
+    render(
+      <ChatInteractionContext.Provider value={{}}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByText(/此会话中不可交互/)).toBeTruthy();
+    expect(screen.queryByText(/演示模式/)).toBeNull();
+  });
+
   it("falls back to source on invalid/partial JSON and to display-only without provider", () => {
     const { container } = render(<OptionsBlock code={'{"question":"半截'} />);
     expect(container.querySelector("pre")).toBeTruthy();

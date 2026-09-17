@@ -341,6 +341,41 @@ test("智能体:只改过工具集,载入旧提交前也必须二次确认", asy
   );
 });
 
+test("K-27:智能体工具集勾选卡走 ui/Checkbox 原语;「必选」项已勾且禁用、不压暗", async () => {
+  listSkills.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  renderPanel(<PublishPanel auth={auth} publishes={[]} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  await screen.findByPlaceholderText("例：法律顾问");
+
+  const browser = screen.getByRole("checkbox", { name: /浏览器/ });
+  expect(browser).toHaveAttribute("data-ui", "checkbox");
+  expect(browser.className).not.toContain("accent-accent");
+  // 卡片式外观仍在调用方的 label 上:未勾 → 边框 + 次级字色;勾上 → 强调边框 + 浅底。
+  const card = browser.closest("label") as HTMLElement;
+  expect(card).toHaveClass("rounded-lg", "border", "text-muted");
+  fireEvent.click(browser);
+  expect(browser).toBeChecked();
+  expect(card).toHaveClass("bg-accent-soft", "text-fg");
+
+  // 「必选」工具集:已勾、禁用、带徽章,且不像不可用选项那样压暗。
+  const locked = screen.getAllByRole("checkbox").filter((b) => (b as HTMLInputElement).disabled);
+  expect(locked.length).toBeGreaterThan(0);
+  for (const box of locked) {
+    expect(box).toBeChecked();
+    expect(box).toHaveAttribute("data-ui", "checkbox");
+    const lockedCard = box.closest("label") as HTMLElement;
+    expect(lockedCard.className).toContain("opacity-100");
+    expect(lockedCard).toHaveTextContent("必选");
+  }
+});
+
 test("智能体:模型是系统自动选中的默认项,空白表单不该被当成「已填写」", async () => {
   listSkills.mockResolvedValue([]);
   getPublicModels.mockResolvedValue({

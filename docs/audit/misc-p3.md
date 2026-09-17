@@ -31,13 +31,13 @@
 | 编号 | 位置 | 现象 | 严重度 | 处置 |
 |---|---|---|---|---|
 | D-01 | `lib/demo.ts` `demoReply` | 回复写死「将由 **MiniMax-M3** 等模型实时流式生成」，而 demo 默认选中的是 `DEMO_MODELS[0]`（GLM-5.3），选择器与回复文案打架 | P3 | ✅ `demoReply(text, modelName = DEMO_DEFAULT_MODEL_NAME)`，默认取 `DEMO_MODELS[0].display_name`；App 不改调用 |
-| D-02 | `lib/demo.ts` `DEMO_SESSIONS` | `messageCount` 4/8/12/6/9/5 与 fixture 不符：s1 实际 2 条，s2–s6 点开是空会话却标着有消息；`App` 的历史骨架按 `knownMessageCount>0` 先画骨架再落空 | P3 | ✅ s1 → 2，其余 → 0（点开即空态、不再先出骨架）；新增 `DEMO_MESSAGES_BY_SESSION`（App `onDemoSelect` 可一行改为 `DEMO_MESSAGES_BY_SESSION[id] ?? []`，见 §6） |
+| D-02 | `lib/demo.ts` `DEMO_SESSIONS` | `messageCount` 4/8/12/6/9/5 与 fixture 不符：s1 实际 2 条，s2–s6 点开是空会话却标着有消息；`App` 的历史骨架按 `knownMessageCount>0` 先画骨架再落空 | P3 | ✅ s1 → 2，其余 → 0（点开即空态、不再先出骨架）；新增 `DEMO_MESSAGES_BY_SESSION`（App `onDemoSelect` 可一行改为 `DEMO_MESSAGES_BY_SESSION[id] ?? []`，见 §6）。**余项已闭环**：集成④ `4a2745283` 把 `App.tsx` `onDemoSelect` 接成按 id 取 fixture；遗留清扫 t-1234 `3aba642ca` 补 `App.test` 用例（切 s2 空会话不出骨架、切回 s1 恢复、零 fetch），见 [leftover-shell.md](./leftover-shell.md) §3.1 |
 | D-03 | `lib/demo.ts` `DEMO_SESSIONS` | 缺 `createdAt`（`Session.createdAt` 是侧栏用时起点），demo 会话行的用时位空 | P3 | ✅ 每条补 `createdAt`（相对当前时刻，早于 `updatedAt`） |
 | D-04 | `lib/demo.ts` `DEMO_USER.displayName = "rqmn"` | 演示账号用了真人 handle，公开演示截图里语义不明 | P3 | — 不修：可能是有意的演示 / 营销口味，记给产品 |
 | D-05 | `components/Message.tsx` `AssistantMessage` | `OptionsGroupProvider` 未传 `live`，与 `chat/cards.tsx` 契约不一致：demo 流式期 options 块会按非流式处理（demo 下 `ChatInteraction={}` 块本就不可交互，故无可见后果，但 demo 通道不该是唯一「流式也点击即发」的路径） | P3 | ✅ `live={!!streaming}` |
 | D-06 | `components/Message.tsx` 流式三点 | 只有视觉动画，读屏拿不到「正在生成」状态 | P3 | ✅ 外层改 `<output aria-live="polite" aria-label="正在生成回复">`，装饰点 `aria-hidden` |
 | D-07 | `App.tsx` demo 分支（只审） | `onOpenGoal` demo 下缺省 → 空会话页无「设定目标」链接；`image2Available / ratingsEnabled / mediaGateEnabled` 恒 false → 对应入口隐藏；`onRetrySend / onQuote / onContinueInterrupted` 缺省 → 卡片动作隐藏。逐条核对入口随能力一起消失，**自洽** | — | 只审无发现（截图 `misc-demo-empty` 佐证空态无目标链接） |
-| D-08 | `App.tsx:2381` demo 下 `ChatInteractionContext` 为 `{}` | 回复里若出现 options / 交互块，块内文案是「(此会话中不可交互)」，没说明是因为演示模式 | P3 | ⏸ 遗留（shell）：建议 demo 下传 `{ sendUserText: undefined, reason: "demo" }` 或在 `RichBlocks` 文案区分（需 `ChatInteraction` 加字段，跨 messages） |
+| D-08 | `App.tsx:2381` demo 下 `ChatInteractionContext` 为 `{}` | 回复里若出现 options / 交互块，块内文案是「(此会话中不可交互)」，没说明是因为演示模式 | P3 | ✅ **遗留清扫 t-1234 落地**（`3aba642ca`）：`tool/context.ts` `ChatInteraction` 加可选 `reason`（当前仅 `"demo"`）+ `chatInteractionUnavailableText(reason)`；`RichBlocks` `OptionsBlock` 无发送能力时按 reason 取文案（demo →「(演示模式仅供浏览,登录后可在真实会话中点选)」，其余仍「(此会话中不可交互)」）；`App.tsx` demo 分支传 `{ reason: "demo" }`。`RichBlocks.test` +1。见 [leftover-shell.md](./leftover-shell.md) §3.2 |
 | D-09 | `components/Message.tsx` `UserMessage` | 气泡 `text-[15.5px]` 任意字号、`max-w-[78%]` | P3 | — 不修：shell S-15 口径「排版档位专项统一收敛，不为单点新增 token」 |
 
 ### 3.2 OG · optionsGroup 多题聚合
@@ -54,7 +54,7 @@
 | OG-08 | `RichBlocks.tsx` 非流式单块 | 点击即发（无确认） | — | 设计如此（正文头注释「保留最顺手的路径」），有回归用例锁定；不改 |
 | OG-09 | `optionsGroup.tsx` `markSent()` 后 `sendUserText` 若失败 | 组已锁定、无恢复入口 | P3 | ⏸ 遗留：`sendUserText` 目前无返回值 / 失败通道（`ChatInteraction` 契约，messages），需先有失败回调再谈解锁 |
 
-统计：D 9（修 5 · 不修 2 · 只审 1 · 遗留 1）；OG 9（修 7 · 设计不改 1 · 遗留 1）。P2 2/2 修复。
+统计：D 9（修 5 · 不修 2 · 只审 1 · 遗留 1）；OG 9（修 7 · 设计不改 1 · 遗留 1）。P2 2/2 修复。→ 遗留清扫后（t-1234，2026-09-17）：D-08 落地、D-02 余项闭环，D 侧遗留 0；OG-05 / OG-09 仍归 messages。
 
 ## 4. 修复记录
 
@@ -92,8 +92,8 @@ after 对照（逐张 Read）：
 
 | 项 | 归属 | 说明 |
 |---|---|---|
-| D-02 余项：demo 其余会话点开为空 | shell（`App.tsx:643` `onDemoSelect`） | 一行改为 `setMessages(DEMO_MESSAGES_BY_SESSION[id] ?? [])`；要让 s2–s6 有内容再往 `DEMO_MESSAGES_BY_SESSION` 补 fixture 并同步 `messageCount` |
-| D-08 demo 下交互块「(此会话中不可交互)」未说明原因 | shell + messages | `ChatInteraction` 加 `reason` 或 demo 下专用文案 |
+| ~~D-02 余项：demo 其余会话点开为空~~ | ~~shell（`App.tsx:643` `onDemoSelect`）~~ | **已闭环**：集成④ `4a2745283` 接线 `setMessages(DEMO_MESSAGES_BY_SESSION[id] ?? [])`，t-1234 `3aba642ca` 补 `App.test` 用例（[leftover-shell.md](./leftover-shell.md) §3.1）。要让 s2–s6 有内容仍是往 `DEMO_MESSAGES_BY_SESSION` 补 fixture 并同步 `messageCount`（内容项，非缺陷） |
+| ~~D-08 demo 下交互块「(此会话中不可交互)」未说明原因~~ | ~~shell + messages~~ | **已由 t-1234 落地**（`ChatInteraction.reason` + `chatInteractionUnavailableText`，`3aba642ca`；[leftover-shell.md](./leftover-shell.md) §3.2） |
 | OG-05 发送文本半角标点 | messages（单独立项） | 需同批改 `cards.test` / `RichBlocks.test` / `persist.test` 断言与历史数据口径 |
 | OG-09 发送失败后组锁定无恢复 | messages | `ChatInteraction.sendUserText` 需失败通道 |
 | D-04 `DEMO_USER.displayName="rqmn"` · D-09 气泡任意字号 | 产品 / 排版专项 | 不修，见 §3.1 |

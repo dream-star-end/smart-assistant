@@ -81,6 +81,7 @@ import {
   ChatInteractionContext,
   ToolCardActionsContext,
   type ArtifactInspectTarget,
+  type ChatInteraction,
 } from "./components/tool/context";
 import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
 import { Sidebar } from "./components/Sidebar";
@@ -2407,9 +2408,10 @@ export function App() {
     [demo, openManage],
   );
 
-  // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示)。
-  const chatInteraction = useMemo(
-    () => (demo ? {} : { sendUserText: (t: string) => send(t), busy: sending }),
+  // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
+  // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。
+  const chatInteraction = useMemo<ChatInteraction>(
+    () => (demo ? { reason: "demo" } : { sendUserText: (t: string) => send(t), busy: sending }),
     [demo, send, sending],
   );
 
