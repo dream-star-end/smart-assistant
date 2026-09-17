@@ -10,10 +10,10 @@
 |---|---|
 | 目标 | 对 v5 个人版（selfhost，`packages/web-react` 用户端）全部页面 / 模块做 UI/UX、功能正确性、交互友好性审计，审出的问题直接改代码落地（P1 / P2 必修，P3 量力而行并登记遗留），指挥官验收、合入 integration 后统一归档给用户终审 |
 | 时间跨度 | 2026-09-15（基线 `210b9967`、决策 d-24/26/28）→ 2026-09-17 01:45（集成③ 终点 `36bb9a677`）；集成④与终稿在后 |
-| 任务数 | 协同组任务库 **54 条**（含 A 审计 12 · B 修复 12 · 二期 / 补丁 6 · 覆盖复查与补审专项 · a11y 专项 · QA 复核 3 · 集成 4 · 归档 3；作废条 t-837 不计入统计） |
+| 任务数 | 协同组任务库 **54 条**（截至集成③：A 审计 12 · B 修复 12 · 二期 / 补丁 6 · 覆盖复查与补审专项 · a11y 专项 · QA 复核 3 · 集成 4 · 归档 3；作废条 t-837 不计入统计）；集成③ 后用户又授权新增 6 条（t-1232 QA·复核 a11y-B×3 + PermissionCard · t-1233 a11y-C 同源项清扫 · t-1234 遗留清扫 shell / market / settings / App · t-1235 遗留清扫 tutorials TU-17 / TU-34 · t-1236 QA·集成④ 独立复核 · t-1237 集成⑤）→ **60 条** **[待集成④]** |
 | 12 模块审出 | **359 条**（P1 8 · P2 108 · P3 243），P1 8/8 全部关闭；补审专项另审出 HUD 20 · 知识星球 19 · 杂项 P3 18 · PermissionCard 17 · a11y 走查归属三条修复单 35（11 + 14 + 10） |
 | 合入量（按 INTEGRATION 集成①②③ 合入表逐行相加） | 17 个 `--no-ff` 合并提交：集成① 4 条 123 files +13,855/−2,401 · 集成② 7 条 153 files +15,336/−2,295 · 集成③ 6 条 54 files +3,854/−1,211 → **330 files，+33,045 / −5,907**（跨轮同文件重复计；不含集成① 起点已含的 shell-B、各轮自有接线 / 用例 / 记录提交、集成待办 t-865） |
-| 集成状态 | 12 条模块分支在集成③ 终点「未合入提交 = 0」，远端 = 本地；已验收未合入 7 条分支见 §4 **[待集成④]** |
+| 集成状态 | 12 条模块分支在集成③ 终点「未合入提交 = 0」，远端 = 本地；已验收未合入 8 条分支见 §4；集成④（t-896）在跑、集成⑤（t-1237）待前置 **[待集成④]** |
 | 结果一句话 | 主流程无阻断项残留；P2 按各模块正文声明全部落地（shell 2 条设计取舍暂缓等用户拍板）；P3 以「本模块内可独立完成即做」为口径，未做的逐条有归属与理由（§5）；全量门在集成③ 终点全绿（§8） |
 
 ## 2. 方法与口径
@@ -50,7 +50,7 @@
 | 知识星球自动回复面板（G-3） | t-838 | `kp-automation.md` **[待集成④]** | 19（1 · 7 · 11） | 17（P1 / P2 全部；P3 9）/ 0 / 2 不修有判据（KP-18 · KP-19）+ 弹层形态 / Checkbox 原语归 shell | t-1029：核对 16 项 ✅ 15 / ❌ 1（KP-14 忙态单键静默吞点击 → `1db992620` 已修，用例修前红修后绿）；单测 70 例、截图 56 张复核 | 未合入 `feat/v5-selfhost-audit-kp-automation@b0fd16dad` **[待集成④]** | P1「同意并开启」失败错误写到弹层背后 + 上限不校验 → 就地报错与 1–30 校验；规则行 CardRow、字段级校验、运行记录可读、空态与文案 |
 | 杂项 P3：`?demo=1` 演示模式 + optionsGroup 多题聚合（G-4 / G-5） | t-839 | `misc-p3.md` **[待集成④]** | 18 = D 9 + OG 9（0 · 2 · 16） | 12 = D 5 + OG 7（P2 2/2）/ 0 / D-02 余项 · D-08 shell；OG-05 · OG-09 messages；D-04 · D-09 产品 / 排版专项 | t-1029：核对 12 项全 ✅；MarkdownImpl 记忆化闭包审读无陈旧依赖；messages 使用方单测 167 + 150 例、`run.mjs` 68/68 无回归 | 未合入 `feat/v5-selfhost-audit-misc-p3@c834dffa1` **[待集成④]** | 首帧点选不再隐式发送、流式结束点选不丢（根因 `MarkdownImpl` 每次渲染新造渲染器导致富块整体重挂，受益含 HtmlPreview iframe）；demo fixture 自洽、流式三点可读屏 |
 | PermissionCard 未决态审批交互（t-760 薄弱点） | t-875（t-837 作废重开） | `permission-card.md` **[待集成④]** | 17（0 · 5 · 12） | 17 / 0 / 0 | 首节核对 t-837 声称项：**无任何落地**（工作树半成品由 t-875 逐行走读后收口） | 已验收，未合入 `feat/v5-selfhost-audit-permission-card@8a3179896` **[待集成④]** | 卡头可换行 + 待决摘要、被顶掉活提问的待答入口、问答选项组方向键 / Home / End 与校验播报、批准中 loader、过期 fail-safe 说明；13 个预览场景 |
-| a11y 专项：键盘 / 焦点 / 无障碍走查 → 三条修复单 | t-762 走查 → t-893 shell / t-894 mod-a / t-895 mod-b | `a11y-shell.md` · `a11y-mod-a.md` · `a11y-mod-b.md` **[待集成④]**；走查产物仓外 `.audit-tmp\a11y\DELIVERABLE.md` | 走查归属三单 **35**：shell 11（P2 2 · P3 9）· mod-a 14（P2 6 · P3 8）· mod-b 10（P2 1 · P3 9） | shell 11 / 11 · mod-a 14 / 14 + 顺手 1 + QA nit 2 · mod-b 10 / 10 + 顺手 1 + 附录 2（L-11 · M-23）/ 0 / a11y-shell §5 约 10 处模块内同源项（opacity 降色、`bg-accent text-white` 等）→ **待定：新任务或遗留 [待集成④]** | 复扫 257 场景：浅色对比度 <4.5 文本命中 356 → 58、深色 111 → 81、移动端 44px 触控命中 493 → 419（a11y-shell）；mod-a CDP 复扫无名控件 0、悬空 `aria-controls` 0 | 已验收，未合入 `-a11y-shell@4930707cc` · `-a11y-mod-a@475e3e6c7` · `-a11y-mod-b@8110d0eea` **[待集成④]** | 设计系统层：`text-accent-fg / danger-fg` 替代硬编码白字、浅色代码高亮四组色值 ≥4.8:1、`--faint` / 语义色压暗、全站 `::placeholder`、`TimeAgo` 渲染 `<time>`、Modal 正文可键盘滚动、Sheet 焦点回绕滚回可视区、DropdownMenu / SegmentedControl / Switch 触屏 44px、Toast 悬停暂停；模块内：无名控件补名、悬空引用、触控档、opacity 改实色 |
+| a11y 专项：键盘 / 焦点 / 无障碍走查 → 三条修复单 | t-762 走查 → t-893 shell / t-894 mod-a / t-895 mod-b | `a11y-shell.md` · `a11y-mod-a.md` · `a11y-mod-b.md` **[待集成④]** · [archive/a11y.md](./archive/a11y.md)；走查产物仓外 `.audit-tmp\a11y\DELIVERABLE.md` | 走查归属三单 **35**：shell 11（P2 2 · P3 9）· mod-a 14（P2 6 · P3 8）· mod-b 10（P2 1 · P3 9） | shell 11 / 11 · mod-a 14 / 14 + 顺手 1 + QA nit 2 · mod-b 10 / 10 + 顺手 1 + 附录 2（L-11 · M-23）= 12 / 0 / a11y-shell §5 约 10 处模块内同源项（opacity 降色、`bg-accent text-white` 等）→ 用户已授权新开 **t-1233 a11y-C 同源项清扫** **[待集成④]** | 复扫 257 场景：浅色对比度 <4.5 文本命中 356 → 58、深色 111 → 81、移动端 44px 触控命中 493 → 419（a11y-shell）；mod-a CDP 复扫无名控件 0、悬空 `aria-controls` 0；独立 QA 复核 t-1232 待做 | 已验收，未合入 `-a11y-shell@4930707cc` · `-a11y-mod-a@475e3e6c7` · `-a11y-mod-b@9710a3b24`（附录 `85a7aea54` M-23 契约用例 + docs）**[待集成④]** | 设计系统层：`text-accent-fg / danger-fg` 替代硬编码白字、浅色代码高亮四组色值 ≥4.8:1、`--faint` / 语义色压暗、全站 `::placeholder`、`TimeAgo` 渲染 `<time>`、Modal 正文可键盘滚动、Sheet 焦点回绕滚回可视区、DropdownMenu / SegmentedControl / Switch 触屏 44px、Toast 悬停暂停；模块内：无名控件补名、悬空引用、触控档、opacity 改实色 |
 
 归属表勘误（t-839 §7，供 PLAYBOOK §8 修订）：`components/optionsGroup.tsx` → messages；`components/chat/researchEvidence.tsx` → tools；`components/mathDelimiters.ts` → messages。
 
@@ -63,11 +63,12 @@
 | `feat/v5-selfhost-audit-qa-b-p3@0ac949b2e` | t-1038 | `qa/QA-b-p3.md` + `landing.md` L-11 备注 + `media.md` M-23 勘误：landing-B / media-B / tutorials-B 复核，1 处不符（M-23）已勘误并移交 t-895 | 纯文档；与 a11y-mod-b 的 `media.md` / `landing.md` 改动同文件，留意合并 |
 | `feat/v5-selfhost-audit-a11y-shell@4930707cc` | t-893 | shell#1–11 全修（token / 原语层，8 + 1 提交）+ `a11y-shell.md` | 触碰 `styles.css` / `components/ui/**`，建议先合 |
 | `feat/v5-selfhost-audit-a11y-mod-a@475e3e6c7` | t-894 | settings / org / manage / market / sidebar 14 条 + 顺手 1 + QA nit 2 + `a11y-mod-a.md` | — |
-| `feat/v5-selfhost-audit-a11y-mod-b@8110d0eea` | t-895 | media / messages / tools / taskboard / landing / composer 10 条 + 顺手 1 + 附录 L-11 `6236dfb08` / M-23 `986f72b2f` + `a11y-mod-b.md` | 基线为集成③ 5/6 `be20adaec`，含 `App.test` / `AuthGate.test` 选择器改写 |
+| `feat/v5-selfhost-audit-a11y-mod-b@9710a3b24` | t-895 | media / messages / tools / taskboard / landing / composer 10 条 + 顺手 1 + 附录 L-11 `6236dfb08` / M-23 `986f72b2f` `85a7aea54` + `a11y-mod-b.md` | 基线为集成③ 5/6 `be20adaec`，含 `App.test` / `AuthGate.test` 选择器改写 |
 | `feat/v5-selfhost-audit-permission-card@8a3179896` | t-875 | PC-01…PC-17 全修 + 13 个预览场景 + `permission-card.md` | 基于 `210b9967`，含截图台外链 bundle 提交 `3f2c40ad9`（与 integration 同源方案，留意同文件） |
-| `feat/v5-selfhost-audit-archive`（本分支） | t-632 | 本文 + `archive/` 更新（含 archive-prep `591c4cb70` 合并） | 纯文档 |
+| `feat/v5-selfhost-audit-tutorials@67b1494ea` | t-1046 tut-sync-2 | `e798c3123` agents / chat-basics 正文补写「去授权 / 去处理」「排队发送」入口并抬版（v5 / v9），恢复 `AgentPicker` / `Composer` 两处 `data-product-feature`，普通 `tutorials:accept`（history 第 68 条）；`128cbc713` / `67b1494ea` INTEGRATION 集成③ §4 / §7 / §8 勾销待办 | 基于 integration `36bb9a677`；q-1076 闭环 |
+| `feat/v5-selfhost-audit-archive`（本分支） | t-632 / t-897 预写 | 本文 + `archive/` 更新（含 archive-prep `591c4cb70` 合并、6 份专项摘要） | 纯文档 |
 
-在跑 / 待领：t-1046 tut-sync-2（补写 agents / chat-basics 正文并抬 `contentVersion` 后恢复两处 `data-product-feature`，走普通 `tutorials:accept`）；t-896 集成④；t-897 归档终稿。
+在跑 / 待领 **[待集成④]**：t-896 集成④（fable-5-1-24，本地已合 7 支 `d2afaaa20`，按 q-1227 → A 补合 tut-sync-2 / qa-* / archive）；用户新授权 t-1232 QA·复核 a11y-B×3 + PermissionCard · t-1233 a11y-C 同源项清扫 · t-1234 遗留清扫 shell / market / settings / App · t-1235 遗留清扫 tutorials TU-17 / TU-34 · t-1236 QA·集成④ 独立复核（等 t-896）· t-1237 集成⑤（等上述全部）；t-897 归档终稿（等 t-1237）。
 
 ## 5. 遗留清单（逐条带归属与原因）
 
@@ -101,7 +102,9 @@
 | messages M-21 / M-24 | 生成中查找不能跳转；`_liveStreamBroken` 无 UI 消费方 | 需独立滚动交互设计；需 lib/chat 状态机专项 |
 | settings | ConnectorsTab / KnowledgePlanetAutomationPanel 目录迁移；备案判据去重 | manage owner 决定；可选 |
 | composer C-16 / C-26 / C-30 | 见 composer 正文遗留节 | shell / 产品 |
-| a11y-shell §5 | 约 10 处模块内同源项：`OrgSubscribeDialog` / `OptimizationPanel` / `ApiKeysSection` 图标块 `bg-accent text-white`、`AgentPicker`「默认」`bg-accent/15`、`ModelSelector` 锁定行 opacity、`optionsGroup` / `RichBlocks` 勾选框白字、media 沉浸式 `bg-danger text-white`、`RepoPill` opacity、`KnowledgePlanetAutomationPanel:700` 勾选态白字 | **待定：新任务或遗留**（指挥官正请用户拍板）**[待集成④]**；其中 RepoPill / ApiKeysSection 部分已由 a11y-mod-a 落地 |
+| a11y-shell §5 | 约 10 处模块内同源项：`OrgSubscribeDialog` / `OptimizationPanel` / `ApiKeysSection` 图标块 `bg-accent text-white`、`AgentPicker`「默认」`bg-accent/15`、`optionsGroup` / `RichBlocks` 勾选框白字、media 沉浸式 `bg-danger text-white`、`KnowledgePlanetAutomationPanel:700` 勾选态白字（`ModelSelector` 锁定行 / `MediaTaskCenter` header / `RepoPill` 已由 t-895 / t-894 落地） | 用户已授权 → **t-1233 a11y-C 同源项清扫** **[待集成④]** |
+| 本表 shell / market / settings / App 归属项（H-18 一行、K-27 / kp Checkbox、D-02 余项 / D-08、C-16 / C-26 / C-30、settings 迁移与去重等） | — | 用户已授权 → **t-1234 遗留清扫 shell / market / settings / App**，以其任务书为准 **[待集成④]** |
+| tutorials TU-17 深链 / TU-34 hero token | — | 用户已授权 → **t-1235 遗留清扫 tutorials TU-17 / TU-34** **[待集成④]** |
 
 ### 5.3 产品口径 / 设计取舍（先问再改）
 
@@ -125,7 +128,8 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 
 ## 7. 终审导读（需用户过目 / 确认）
 
-1. **教程同步快照 accept（q-988 → q-1076，指挥官代用户确认）**。TU-37 修好后 `check:tutorials` 在 Windows 首次真跑到底，一次性暴露 B 阶段各模块对入口元素的 UI/UX 修改导致的 17 项功能源哈希漂移 + 2 项入口身份变化。处置：两处新入口降级为控件（UI 零变化）+ source-only accept（`tutorial-sync-history.jsonl` 第 67 条 note 注明「待用户终审」）。抄检两篇教程正文引用的入口文案与 HEAD 逐条一致；唯一不一致是正文未描述这两个新入口 → t-1046 补写后恢复。**不认可 → `git revert b249317f4 29a277b25`**，其余门不受影响。详见 [INTEGRATION.md 集成③ §4](./INTEGRATION.md)。
+1. **教程同步快照 accept（q-988 → q-1076，指挥官代用户确认）**。TU-37 修好后 `check:tutorials` 在 Windows 首次真跑到底，一次性暴露 B 阶段各模块对入口元素的 UI/UX 修改导致的 17 项功能源哈希漂移 + 2 项入口身份变化。处置：两处新入口降级为控件（UI 零变化）+ source-only accept（`tutorial-sync-history.jsonl` 第 67 条 note 注明「待用户终审」）。抄检两篇教程正文引用的入口文案与 HEAD 逐条一致；唯一不一致是正文未描述这两个新入口 → **t-1046 已补写并恢复**（`e798c3123`：agents v5 / chat-basics v9 抬版，两处 `data-product-feature` 恢复，普通 `tutorials:accept`，history 第 68 条；随集成④ 合入 **[待集成④]**），q-1076 闭环。**不认可 → `git revert b249317f4 29a277b25`**（合入 t-1046 后需连带 revert `e798c3123`），其余门不受影响。详见 [INTEGRATION.md 集成③ §4](./INTEGRATION.md)。
+   - **q-1227（集成④，指挥官代确认）[待集成④]**：集成④ 合入 a11y / permission-card / QA 分支后 `check:tutorials` 再报 `github-repository` 功能源漂移（入口元素 UI/UX 修改所致，教程正文不变），按 q-1227 → A 做一次 `--source-only` accept；与 q-1076 同一性质，可逆法相同（revert 对应 accept 提交）。终稿以 INTEGRATION.md 集成④ §4 为准。
 2. **3 条基线红（与本轮改动无关，三轮集成逐条相同）**：`browser-tests/cc-switch-ascii-name.node-test.mjs` ×2（settings `ApiKeysSection` 模型 id 断言 `expected 'gemini-3.8-flash' / actual 'sonnet-5'` + 「还没有 API Key」10s 超时）；`ocv5-185-qa.node-test.mjs` ×1（Windows `symlinkSync` EPERM / 用例自带 `git diff --exit-code` 要求干净工作树，满足环境后单跑 15/15 绿）。是否要在本轮之外修 cc-switch 基线，请拍板。
 3. **NOT RUN 汇总**：真机 iOS Safari / Android（全部模块）；读屏实机（NVDA / VoiceOver，a11y 以 CDP AX 树与 jsdom 断言替代）；真后端行为（登录 / 注册 / 支付回跳 / OAuth / 投稿 / 撤回 / WS 多标签 / 服务端版本比对 / 知识星球写接口 / 分享令牌）—— 本轮无 v5-dev 通道，全部以 api-stub 场景与单测桩覆盖；各模块 `npm test` 全量与 `test:browser` 在成员分支多为 NOT RUN（非高频面），由集成①②③ 在 integration 统一跑（§8.1）。
 4. **越界改动**（均经指挥官批准并在交付单列）：t-839 改 messages 归属 `RichBlocks.tsx`（OptionsBlock 注册改 `useLayoutEffect`、聚合判定读快照）与 `MarkdownImpl.tsx`（`components` `useMemo`，根因：每次渲染新造渲染器致富块整体重挂）；t-1029 改 settings 归属 `KnowledgePlanetAutomationPanel.tsx`（忙态改按键集合）；t-865 / 集成轮的 App 接线与原语扩展（`Sheet closeButton` opt-in、`MediaTaskCenter onReusePrompt`）。
@@ -192,12 +196,12 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 | `feat/v5-selfhost-audit-market` | `5391c150a` | 模块 |
 | `feat/v5-selfhost-audit-landing` | `b97adb3fb` | 模块 |
 | `feat/v5-selfhost-audit-media` | `8834aca08` | 模块 |
-| `feat/v5-selfhost-audit-tutorials` | `02c358655` | 模块 |
+| `feat/v5-selfhost-audit-tutorials` | `02c358655`（A+B，集成③ 已合）→ `67b1494ea`（t-1046 tut-sync-2，**[待集成④]**） | 模块 |
 | `feat/v5-selfhost-audit-hud` | `b1f06f8f5` | 专项 **[待集成④]** |
 | `feat/v5-selfhost-audit-kp-automation` | `b0fd16dad` | 专项 **[待集成④]** |
 | `feat/v5-selfhost-audit-misc-p3` | `c834dffa1` | 专项 **[待集成④]** |
 | `feat/v5-selfhost-audit-permission-card` | `8a3179896` | 专项 **[待集成④]** |
-| `feat/v5-selfhost-audit-a11y-shell` / `-a11y-mod-a` / `-a11y-mod-b` | `4930707cc` / `475e3e6c7` / `8110d0eea` | a11y **[待集成④]** |
+| `feat/v5-selfhost-audit-a11y-shell` / `-a11y-mod-a` / `-a11y-mod-b` | `4930707cc` / `475e3e6c7` / `9710a3b24` | a11y **[待集成④]** |
 | `feat/v5-selfhost-audit-qa-p3` / `-qa-b-p3` / `-qa-gap` | `3e640a85d` / `0ac949b2e` / `c1734aac6` | QA **[待集成④]** |
 | `feat/v5-selfhost-audit-archive-prep` | `591c4cb70` | 归档摘要（已合入本分支 `ac0db7c35`） |
 | `feat/v5-selfhost-audit-archive` | 本分支 | SUMMARY.md + archive/ **[待集成④]** |
@@ -220,7 +224,9 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 | §3 landing / media 行 | L-11 `6236dfb08`、M-23 `986f72b2f` 合入后去掉标记 |
 | §3 HUD / 知识星球 / 杂项 P3 / PermissionCard / a11y 行 | 审计文档链接改为 integration 路径；a11y-shell §5 同源项拍板结果 |
 | §5.2 H-18 / a11y-shell §5 | 集成④ 是否落地 H-18 一行接线；同源项新任务 or 遗留 |
-| §7-1 | t-1046 补写正文 + 恢复 `data-product-feature` + 普通 `tutorials:accept` 后更新状态 |
-| §8.1 | 集成④ 终点全量门 |
+| §7-1 | t-1046 已完成（`67b1494ea`），合入后去标记；q-1227 accept 提交号与 INTEGRATION 集成④ §4 链接 |
+| §8.1 | 集成④ / 集成⑤ 终点全量门 |
 | §8.2 permission-card 行 | 合入后全量结果 |
-| `archive/` | 新增 `archive/{hud,kp-automation,misc-p3,permission-card,a11y}.md` 摘要 + README 索引行 |
+| §1 / §3 / §4 / §5 | 新增 6 条任务（t-1232 ~ t-1237）的结论：QA 复核 a11y-B×3 + PermissionCard、a11y-C 同源项清扫、shell / market / settings / App 与 tutorials 遗留清扫、集成④ 独立复核、集成⑤ 合入记录；§5 对应遗留行随之关闭或改归属 |
+| `archive/` | 已预写 `archive/{hud,kp-automation,misc-p3,permission-card,a11y,qa}.md`（a38a093bf），合入后把正文链接改为 integration 路径；新增 t-1233 / t-1234 / t-1235 摘要 |
+| 全文 | 终稿把 **[待集成④]** 统一换成集成④ / 集成⑤ 事实 |
