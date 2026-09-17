@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
 import { TICKET_TYPES, type TicketType } from '../lib/taskboard'
 import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseId'
-import { SIGNATURE_WORKS, type SignatureWork } from '../lib/tutorialSignatureWorks'
+import { SIGNATURE_WORK_IDS, type SignatureWorkId } from '../lib/tutorialSignatureWorkIds'
 import type { Session } from '../lib/types'
 
 /**
@@ -170,11 +170,15 @@ export function parseTutorialCase(sp: URLSearchParams): TutorialCaseId | null {
 
 /** 教程中心一级页签里需要进 URL 的两个：案例展厅是默认态，不写参数。 */
 export type TutorialTab = 'start' | 'cases'
-/** 精选作品 id（`planet` / `gravity`），来源 tutorialSignatureWorks。 */
-export type TutorialWorkId = SignatureWork['id']
+/**
+ * 精选作品 id（`planet` / `gravity`）。只取轻量的 `tutorialSignatureWorkIds`，**不要**改回 import
+ * `tutorialSignatureWorks`：它会把 tutorialCaseCatalog 拖进入口静态闭包，撞 first-screen-budget 门
+ * （集成⑤预演实测 useAppRoute chunk 1.7KB → 30.7KB gzip）。
+ */
+export type TutorialWorkId = SignatureWorkId
 /** 功能教程「跟着做」里的目标步骤（1 起算）；上限只是防御，越界由教程中心回退到顶部。 */
 const TUTORIAL_STEP_MAX = 99
-const TUTORIAL_WORK_IDS: ReadonlySet<string> = new Set(SIGNATURE_WORKS.map((work) => work.id))
+const TUTORIAL_WORK_IDS: ReadonlySet<string> = new Set<string>(SIGNATURE_WORK_IDS)
 
 /** `?panel=help&tab=` → 一级页签；非 help / 与 community·case·topic·work 同在 / 未知值返回 null。 */
 export function parseTutorialTab(sp: URLSearchParams): TutorialTab | null {
