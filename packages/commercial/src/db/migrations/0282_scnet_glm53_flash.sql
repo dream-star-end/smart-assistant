@@ -85,8 +85,10 @@ CREATE OR REPLACE FUNCTION fn_model_catalog_capability(p_model_id TEXT) RETURNS 
       '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "medium"}, "ccb": {"capability_zero": false, "supports_thinking": false}}'::jsonb
     WHEN lower(p_model_id) = 'minimax-m3' THEN
       '{"supports_vision": true, "reasoning": {"supported": [], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
-    WHEN lower(p_model_id) IN ('glm-5.1', 'glm-5.2', 'glm-5.3', 'glm-5.3-zai', 'glm-5.3-flash') THEN
+    WHEN lower(p_model_id) IN ('glm-5.1', 'glm-5.2', 'glm-5.3-zai') THEN
       '{"supports_vision": false, "reasoning": {"supported": ["high", "max"], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
+    WHEN lower(p_model_id) IN ('glm-5.3', 'glm-5.3-flash') THEN
+      '{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
     WHEN lower(p_model_id) IN ('deepseek-v4-flash','deepseek-v4-flash-opencode-go','qwen3.7-max','qwen3.7-plus','kimi-k2.7-code') THEN
       '{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}, "ccb": {"capability_zero": true, "supports_thinking": true}}'::jsonb
     ELSE
@@ -100,7 +102,7 @@ DECLARE
   v_new_entry BIGINT;
   v_profile JSONB := '{
     "supports_vision": false,
-    "reasoning": { "supported": ["high", "max"], "codex_model_default": null },
+    "reasoning": { "supported": [], "codex_model_default": null },
     "ccb": { "capability_zero": true, "supports_thinking": true }
   }'::jsonb;
   v_glm53 model_catalog%ROWTYPE;
