@@ -23,14 +23,17 @@ import { parseShellEnvelope } from "./shellEnvelope";
 import { parseSearchExtraToolsResult, searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
+  advisorConsultStatusLabel,
   asArr,
   asStr,
   clampStr,
   detectShellFileWrites,
+  formatToolDuration,
   formatValue,
   isInternalSubtaskInput,
   isOpaqueArgToolName,
   isSafeHttpUrl,
+  isToolInFlight,
   parseCodexTypeName,
   safeSubtaskDescription,
   shortPath,
@@ -1258,32 +1261,44 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
           ? tool.durationMs
           : null;
     const usage = parsed?.usage;
-    // 内部状态词不外露(T-27):settled→已结算,error/failed→未成功,timeout→超时;其余原词兜底。
-    const statusLabel =
-      status === "settled"
-        ? "已结算"
-        : status === "error" || status === "failed"
-          ? "未成功"
-          : status === "timeout"
-            ? "超时"
-            : status;
+    // 合并取舍(发布预演 t-1279):整块取 canonical OCV5-220 —— 进行中 / 已结束两态、人话时长、
+    // 状态词经 advisorConsultStatusLabel 人话化(审计 T-27 的诉求由它兑现;timeout → 超时补进该函数)。
+    const question = asStr(input?.question);
+    const concern = asStr(input?.concern);
+    const running = isToolInFlight(tool);
+    const statusLabel = running ? "" : advisorConsultStatusLabel(status);
+    const durationLabel = formatToolDuration(duration);
+    const doneBits = [
+      model ? `顾问 ${model}` : null,
+      statusLabel || null,
+      durationLabel,
+    ].filter(Boolean);
     body = (
       <div className="mt-1.5 space-y-1.5 text-xs leading-relaxed text-fg">
+        {question ? (
+          <div>
+            <div className="text-faint">问了什么</div>
+            <div className="whitespace-pre-wrap text-fg">{question}</div>
+          </div>
+        ) : null}
+        {concern ? <div className="text-muted">关注点：{concern}</div> : null}
         <div className="text-muted">
-          {model ? `实际顾问型号 ${model}` : "实际顾问型号未随工具结果返回"}
-          {statusLabel ? ` · 状态 ${statusLabel}` : ""}
-          {duration != null ? ` · ${Math.round(duration).toLocaleString()} ms` : " · 耗时未返回"}
+          {running
+            ? `顾问思考中${durationLabel ? ` · 已用时 ${durationLabel}` : ""}`
+            : doneBits.length > 0
+              ? doneBits.join(" · ")
+              : "顾问已结束"}
         </div>
-        {err && status && status !== "settled" ? <div className="text-danger">{err}</div> : null}
+        {err ? <div className="text-danger">{err}</div> : null}
         {advice ? <PromptBlock>{advice}</PromptBlock> : null}
-        {usage == null ? (
-          <div className="text-faint">顾问用量未随工具结果返回，主/顾问分项以账户用量明细为准。</div>
-        ) : (
+        {!running && usage == null ? (
+          <div className="text-faint">顾问用量未返回，主/顾问分项以账户用量明细为准。</div>
+        ) : !running && usage != null ? (
           <KvList obj={typeof usage === "object" && usage ? (usage as Record<string, unknown>) : { usage }} />
-        )}
+        ) : null}
       </div>
     );
-    suppressOutput = !!advice || !!status;
+    suppressOutput = running || !!advice || !!status || !!err;
   } else {
     body = <KvList obj={input} />;
   }

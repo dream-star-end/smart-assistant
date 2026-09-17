@@ -193,7 +193,7 @@ export const PRODUCT_CAPABILITIES = {
   },
   advisorMode: {
     id: "advisor-mode",
-    title: "给全能助手配一个无工具顾问",
+    title: "给全能助手配一个只出主意的顾问",
     shortTitle: "顾问模式",
     category: "extend",
     icon: "users",

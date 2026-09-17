@@ -719,10 +719,19 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
     }
     if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);
-    if (op === "consult_advisor" || op === "request_review" || op === "ask_user") {
+    // 合并取舍(发布预演 t-1279):consult_advisor 取 canonical OCV5-220 的写法(question → concern,压成一行
+    // 截 40 字),再补上审计侧的 prompt / goal 兜底;request_review / ask_user 保留审计分支。
+    if (op === "consult_advisor") {
+      const q = (asStr(input.question) || asStr(input.concern) || asStr(input.prompt) || asStr(input.goal))
+        .replace(/\s+/g, " ")
+        .trim();
+      return q ? clipOneLine(q, 40) : "";
+    }
+    if (op === "request_review" || op === "ask_user") {
       return (asStr(input.question) || asStr(input.prompt) || asStr(input.goal)).slice(0, 60);
     }
-    // 未登记 op 不直显内部标识符(T-28):标签已由 resolveToolMeta 人话化,摘要留空。
+    // 未登记 op 不直显内部标识符(T-28):标签已由 resolveToolMeta 人话化,摘要留空。canonical 这里
+    // `return op` 会把蛇形名漏到折叠态摘要,与 meta.test「不直显内部标识符」冲突,取审计侧。
     return "";
   }
   if (server === "web-context") {

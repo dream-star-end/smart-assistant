@@ -427,7 +427,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     const ctxB = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
     const a = await bootPage(ctxA, origin, js);
     await a.page.getByRole("button", { name: /切换智能体/ }).click();
-    await a.page.getByRole("button", { name: /主模型不切换/ }).click();
+    await a.page.getByRole("button", { name: /主模型不变/ }).click();
     await a.page.keyboard.press("Escape");
     await a.page.getByRole("dialog").waitFor({ state: "hidden" });
     await a.page.getByPlaceholder(/和「全能助手」对话/).fill(USER_TEXT);
@@ -445,7 +445,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     await waitForConsultAdvice(a.page, inbounds);
     const cardText = await a.page.locator("body").innerText();
     assert.match(cardText, /实际顾问型号 gpt-6-astra/);
-    assert.match(cardText, /用量未随工具结果返回/);
+    assert.match(cardText, /用量未返回/);
     assert.equal(cardText.includes("input_tokens"), false);
     assert.match(cardText, /GLM-5\.2/);
     const inbound = inbounds.at(-1);
@@ -518,7 +518,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     const afterReload = await a2.page.locator("body").innerText();
     assert.match(afterReload, /实际顾问型号 gpt-6-astra/);
     assert.match(afterReload, new RegExp(ADVICE));
-    assert.match(afterReload, /用量未随工具结果返回/);
+    assert.match(afterReload, /用量未返回/);
 
     await a2.page.getByRole("button", { name: "新建会话" }).click();
     await a2.page.getByRole("button", { name: /切换智能体/ }).click();

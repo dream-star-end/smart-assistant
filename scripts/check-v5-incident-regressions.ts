@@ -418,10 +418,19 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
 // imported-history exemption. The full SHA binds the original tree and message;
 // the mapped ID must still satisfy ALL ordinary manifest/proof/lineage checks.
 function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
-  return sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
+  if (
+    sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
     && trailer === "OCV5-171 follow-up"
-    ? "INC-20260908-CC-SWITCH-ASCII-NAME"
-    : trailer;
+  ) {
+    return "INC-20260908-CC-SWITCH-ASCII-NAME";
+  }
+  if (
+    sha === "7b2ae241d6445042fb196cfc1ca03c063aab2fb8"
+    && trailer === "OCV5-220 in-flight consult card showed missing-field copy as"
+  ) {
+    return "INC-20260915-ADVISOR-CONSULT-CARD";
+  }
+  return trailer;
 }
 
 function checkTrailerClosure(): number {

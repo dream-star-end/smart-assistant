@@ -559,7 +559,7 @@ async function dumpPage(page, inbounds, httpLog, label) {
 
 async function chooseAdvisor(page) {
   await page.getByRole("button", { name: /切换智能体/ }).click();
-  await page.getByRole("button", { name: /主模型不切换/ }).click();
+  await page.getByRole("button", { name: /主模型不变/ }).click();
   await page.keyboard.press("Escape");
   await page.getByRole("dialog").waitFor({ state: "hidden" });
 }

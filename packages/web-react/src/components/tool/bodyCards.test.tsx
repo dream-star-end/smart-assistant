@@ -57,7 +57,7 @@ describe("imageView 缩略图最小显示尺寸", () => {
 });
 
 describe("consult_advisor 卡", () => {
-  test("保留型号/状态/部分建议，未知用量不填 0", () => {
+  test("保留型号/人话状态/提问与建议，未知用量不填 0", () => {
     render(
       <ToolBody
         name="mcp__openclaude-memory__consult_advisor"
@@ -67,18 +67,71 @@ describe("consult_advisor 卡", () => {
             advice: "partial advice",
             status: "failed",
             advisorModel: "gpt-6-astra",
-            error: "failed",
+            error: "quota exceeded",
+            durationMs: 45000,
           }),
         })}
       />,
     );
-    expect(screen.getByText(/实际顾问型号 gpt-6-astra/)).toBeInTheDocument();
-    // 内部状态词不外露(T-27):failed → 未成功。
-    expect(screen.getByText(/状态 未成功/)).toBeInTheDocument();
-    expect(document.body.textContent).not.toMatch(/状态 failed/);
+    // 合并取舍(发布预演 t-1279):卡片文案以 canonical OCV5-220 为准(顾问 <型号> · 失败 · 45 秒);
+    // 审计 T-27「内部状态词不外露」的断言保留(不出现 failed / settled 原词)。
+    expect(screen.getByText("why red?")).toBeInTheDocument();
+    expect(screen.getByText(/顾问 gpt-6-astra/)).toBeInTheDocument();
+    expect(screen.getByText(/失败/)).toBeInTheDocument();
+    expect(screen.getByText(/45 秒/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/状态 failed|\bfailed\b/);
     expect(screen.getByText("partial advice")).toBeInTheDocument();
-    expect(screen.getByText(/用量未随工具结果返回/)).toBeInTheDocument();
+    expect(screen.getByText("quota exceeded")).toBeInTheDocument();
+    expect(screen.getByText(/用量未返回/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("settled");
+    expect(document.body.textContent).not.toContain("状态 failed");
     expect(document.body.textContent).not.toMatch(/input_tokens["']?\s*[:=]\s*0/);
+  });
+
+  test("进行中显示思考中+已用时+提问，不写未返回", () => {
+    render(
+      <ToolBody
+        name="mcp__openclaude-memory__consult_advisor"
+        input={{ question: "边界对吗？", concern: "事务范围" }}
+        tool={tool({ _completed: false, output: null, durationMs: 12000 })}
+      />,
+    );
+    expect(screen.getByText("边界对吗？")).toBeInTheDocument();
+    expect(screen.getByText(/关注点：事务范围/)).toBeInTheDocument();
+    expect(screen.getByText(/顾问思考中/)).toBeInTheDocument();
+    expect(screen.getByText(/已用时 12 秒/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("未随工具结果返回");
+    expect(document.body.textContent).not.toContain("用量未返回");
+  });
+
+  test("settled 显示已完成；无 status 时错误仍可见", () => {
+    const { rerender } = render(
+      <ToolBody
+        name="mcp__openclaude-memory__consult_advisor"
+        input={{ question: "ok?" }}
+        tool={tool({
+          output: JSON.stringify({
+            advice: "ship it",
+            status: "settled",
+            advisorModel: "gpt-6-astra",
+            durationMs: 90000,
+          }),
+        })}
+      />,
+    );
+    expect(screen.getByText(/已完成/)).toBeInTheDocument();
+    expect(screen.getByText(/1 分 30 秒/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("settled");
+    rerender(
+      <ToolBody
+        name="mcp__openclaude-memory__consult_advisor"
+        input={{ question: "ok?" }}
+        tool={tool({
+          output: JSON.stringify({ error: "upstream 429" }),
+        })}
+      />,
+    );
+    expect(screen.getByText("upstream 429")).toBeInTheDocument();
   });
 });
 
