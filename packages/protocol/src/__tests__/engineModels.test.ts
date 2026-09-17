@@ -121,8 +121,8 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    // 60 + cursor-haiku-4.5 (2026-09-08)
-    assert.equal(CURSOR_ENGINE_MODELS.length, 61)
+    // 61 + 10 luna Sand + 1 gemini-3.1-pro (2026-09-17)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 72)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -213,6 +213,18 @@ describe('Cursor engine model authority', () => {
     assert.equal(findCursorEngineModel('sonnet-5', 'high', false)?.upstreamModel, 'claude-sonnet-5-thinking-high')
     assert.equal(cursorCredentialModelFamily('cursor-gemini-3.8-flash-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('gemini-3.8-flash-low'), 'other_models')
+    assert.equal(cursorFamilySupportsFast('gpt-5.6-luna-sand'), true)
+    assert.deepEqual(cursorFamilyEfforts('gpt-5.6-luna-sand'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.equal(
+      findCursorEngineModel('gpt-5.6-luna-sand', 'high', false)?.upstreamModel,
+      'gpt-5.6-luna-high',
+    )
+    assert.equal(cursorCredentialModelFamily('cursor-gpt-5.6-luna-high'), 'other_models')
+    assert.equal(cursorFamilyHasEffortAxis('gemini-3.1-pro'), false)
+    assert.equal(findCursorEngineModel('gemini-3.1-pro', null, false)?.upstreamModel, 'gemini-3.1-pro')
+    assert.equal(cursorCredentialModelFamily('cursor-gemini-3.1-pro'), 'other_models')
+    assert.equal(publicCursorFamilyModelId('cursor-gpt-5.6-luna-high-fast'), 'gpt-5.6-luna-sand-fast')
+    assert.equal(cursorModelIdFromPublic('gpt-5.6-luna'), null)
   })
 
   test('public id strips the engine prefix and round-trips back to the internal id', () => {
@@ -242,7 +254,7 @@ describe('Cursor engine model authority', () => {
   test('family-level public ids drop the effort suffix but keep the fast axis', () => {
     // Every family that carries an effort axis is family-addressable; auto / composer are not.
     assert.deepEqual([...CURSOR_EFFORT_FAMILIES].sort(), [
-      'fable-5', 'fable-5.1', 'gemini-3.8-flash', 'grok-4.5', 'grok-4.6', 'opus-4.8', 'opus-5', 'sonnet-5',
+      'fable-5', 'fable-5.1', 'gemini-3.8-flash', 'gpt-5.6-luna-sand', 'grok-4.5', 'grok-4.6', 'opus-4.8', 'opus-5', 'sonnet-5',
     ])
     assert.equal(cursorFamilyHasEffortAxis('fable-5.1'), true)
     assert.equal(cursorFamilyHasEffortAxis('auto'), false)
