@@ -293,7 +293,7 @@ export function OptimizationPanel({
         className="rounded-2xl border-accent/20 bg-gradient-to-br from-accent-soft via-surface to-surface"
       >
         <div className="flex items-start gap-3">
-          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-white">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg">
             <MoonStar size={19} />
           </span>
           <div className="min-w-0 flex-1">

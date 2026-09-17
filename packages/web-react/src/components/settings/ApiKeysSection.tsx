@@ -473,7 +473,7 @@ export function ApiKeysSection({
         data-testid="guide-ccswitch"
       >
         <div className="mb-4 flex items-start gap-3">
-          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-white">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg">
             <PlugZap size={20} />
           </span>
           <div className="min-w-0 flex-1">
