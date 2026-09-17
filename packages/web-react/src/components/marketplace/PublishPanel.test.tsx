@@ -438,11 +438,15 @@ test("底部操作条:缺项超过 3 项折成「还差 N 项必填 · 查看」
   expect(bar).not.toHaveTextContent("显示名称");
   const toggle = screen.getByRole("button", { name: "查看" });
   expect(toggle).toHaveAttribute("aria-expanded", "false");
+  // 触控靶两边都要 ≥44:t-894 只补了高(38×44 仍被复扫命中),QA t-1232 补宽;「收起」同一副类(QA)。
+  expect(toggle).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
   fireEvent.click(toggle);
   expect(screen.getByText(/还差 6 项必填/)).toHaveTextContent(
     "还差 6 项必填：显示名称、标识 slug、一句话描述、技能正文、分类、适用场景",
   );
-  fireEvent.click(screen.getByRole("button", { name: "收起" }));
+  const collapse = screen.getByRole("button", { name: "收起" });
+  expect(collapse).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
+  fireEvent.click(collapse);
   expect(screen.getByText(/还差 6 项必填/)).not.toHaveTextContent("显示名称");
 
   // 填到只剩 3 项以内 → 直接全列,不再需要「查看」

@@ -230,7 +230,9 @@ function PermissionInputSummary({
       )}
       {json && json !== "{}" && (
         <details open={!hasStructured}>
-          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+          {/* 触屏下 summary 只有一行字高(16px,QA t-1232 复扫 permission-card-settled ×6 / pending-modal ×1):
+              与 media#2 / messages#2 / taskboard#2 同一约定,hover:none 时补 py-3.5 撑到 44px,桌面零变化。 */}
+          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:py-3.5">
             查看完整参数
           </summary>
           <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-muted">
