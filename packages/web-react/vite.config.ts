@@ -83,6 +83,12 @@ function forbidTaskboardEntryImport(): Plugin {
  * 动态 import taskboardApi 仍测得 451.1KB gzip,吃掉原 20KB 余量并超 449.0KB 门
  * (train tr-20260910T104907Z)。新阈值取 451.1KB 上取整到 10KB = 471040(460.0KB),
  * 约 9KB 余量;仍不许把教程目录/admin 域量级的大模块静态接进入口。
+ * 2026-09-17 v5 个人版审计 B 轮合入后 integration 实测 471.4KB(超 11.4KB;main +7.7KB /
+ * tapePayload +5.4KB / styles +1.3KB),**阈值不动**,改把「点开才需要」的覆盖层移出入口静态闭包:
+ * ImageViewer 三模式(含 ImageAnnotationEditor)、InboxDialog / GithubRepoModal /
+ * MessageFeedbackDialog / ProjectSettingsDialog(+ProjectAssetsPanel)改 React.lazy,订阅意图 /
+ * 项目色板两处小常量下沉到 lib 以断开红卡 / 侧栏对弹窗的静态边 → 实测 445.5KB(余 14.5KB)。
+ * 详见 docs/audit/shell.md §9。
  * 纯函数与单测在 src/lib/firstScreenBudget。
  */
 const FIRST_SCREEN_GZIP_BUDGET = 471040;
