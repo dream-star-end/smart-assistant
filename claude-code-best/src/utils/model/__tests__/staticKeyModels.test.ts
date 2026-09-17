@@ -11,6 +11,7 @@ import {
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
   isOpencodeQwenModel,
+  isScnetGlmModel,
   isZaiGlm53Model,
   getStaticModelContextWindow,
   getAuthorityModelCapabilities,
@@ -41,17 +42,28 @@ describe("signed execution descriptor override", () => {
 });
 
 describe("isArkGlmModel", () => {
-  test("精确匹配 glm-5.1 + glm-5.2 + glm-5.3,大小写/空白不敏感", () => {
+  test("精确匹配 glm-5.1 + glm-5.2；glm-5.3 已迁 scnet", () => {
     expect(isArkGlmModel("glm-5.1")).toBe(true);
     expect(isArkGlmModel("GLM-5.1")).toBe(true);
     expect(isArkGlmModel("  glm-5.1  ")).toBe(true);
     expect(isArkGlmModel("glm-5.2")).toBe(true);
     expect(isArkGlmModel("GLM-5.2")).toBe(true);
     expect(isArkGlmModel("  glm-5.2  ")).toBe(true);
-    expect(isArkGlmModel("glm-5.3")).toBe(true);
-    expect(isArkGlmModel(" GLM-5.3 ")).toBe(true);
+    expect(isArkGlmModel("glm-5.3")).toBe(false);
+    expect(isArkGlmModel(" GLM-5.3 ")).toBe(false);
     expect(isArkGlmModel("glm-5")).toBe(false);
     expect(isArkGlmModel("glm-5.4")).toBe(false);
+  });
+});
+
+describe("isScnetGlmModel", () => {
+  test("精确匹配 glm-5.3 / glm-5.3-flash", () => {
+    expect(isScnetGlmModel("glm-5.3")).toBe(true);
+    expect(isScnetGlmModel(" GLM-5.3 ")).toBe(true);
+    expect(isScnetGlmModel("glm-5.3-flash")).toBe(true);
+    expect(isScnetGlmModel("GLM-5.3-FLASH")).toBe(true);
+    expect(isScnetGlmModel("glm-5.3-zai")).toBe(false);
+    expect(isScnetGlmModel("glm-5.2")).toBe(false);
   });
 });
 

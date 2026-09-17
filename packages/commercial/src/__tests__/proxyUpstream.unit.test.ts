@@ -161,11 +161,27 @@ describe("selectUpstreamRoute", () => {
       if (r.kind === "static") assert.equal(r.provider.id, "minimax");
     }
   });
-  test("glm-5.1 / glm-5.2 / glm-5.3(大小写不敏感) → static/ark", () => {
-    for (const m of ["glm-5.1", "GLM-5.1", "glm-5.2", "GLM-5.2", "glm-5.3", "GLM-5.3"]) {
+  test("glm-5.1 / glm-5.2(大小写不敏感) → static/ark", () => {
+    for (const m of ["glm-5.1", "GLM-5.1", "glm-5.2", "GLM-5.2"]) {
       const r = selectUpstreamRoute(m);
       assert.equal(r.kind, "static");
       if (r.kind === "static") assert.equal(r.provider.id, "ark");
+    }
+  });
+  test("glm-5.3 / glm-5.3-flash(大小写不敏感) → static/scnet，transport 用上游字面量", () => {
+    const cases: Array<[string, string]> = [
+      ["glm-5.3", "GLM-5.3"],
+      ["GLM-5.3", "GLM-5.3"],
+      ["glm-5.3-flash", "GLM-5.3-Flash"],
+      ["GLM-5.3-FLASH", "GLM-5.3-Flash"],
+    ];
+    for (const [model, upstream] of cases) {
+      const r = selectUpstreamRoute(model);
+      assert.equal(r.kind, "static", model);
+      if (r.kind === "static") {
+        assert.equal(r.provider.id, "scnet", model);
+        assert.equal(r.upstreamModel, upstream, model);
+      }
     }
   });
   test("glm-5.3-zai 只走 static/zai，并把 transport model 改写为 glm-5.3", () => {
@@ -558,7 +574,10 @@ describe("pickUpstream — Ark disabled thinking 型号差异", () => {
   async function cleanse(model: string): Promise<unknown> {
     const sched = makeScheduler({});
     const res = await pickUpstream(
-      { scheduler: sched.scheduler, staticProviderKeys: { ark: "k" } },
+      {
+        scheduler: sched.scheduler,
+        staticProviderKeys: { ark: "k", scnet: "k" },
+      },
       bodyFor(model),
       selectUpstreamRoute(model),
       log,

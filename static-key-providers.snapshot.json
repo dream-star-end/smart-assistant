@@ -26,7 +26,6 @@
     {
       "id": "ark",
       "inboundModelIds": [
-        "glm-5.3",
         "glm-5.2",
         "glm-5.1"
       ],
@@ -43,6 +42,18 @@
       ],
       "maxInputTokens": 1000000,
       "upstreamEndpoint": "https://api.z.ai/api/anthropic/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 1000000,
+      "supportsVision": false
+    },
+    {
+      "id": "scnet",
+      "inboundModelIds": [
+        "glm-5.3",
+        "glm-5.3-flash"
+      ],
+      "maxInputTokens": 1000000,
+      "upstreamEndpoint": "https://api.scnet.cn/api/llm/anthropic/v1/messages",
       "capabilityZero": true,
       "contextWindow": 1000000,
       "supportsVision": false

@@ -739,8 +739,8 @@ describe("ModelCatalogCache", () => {
 // ─── 平台次级模型(BLOCKER 2026-07-12)────────────────────────────────────
 
 describe("platformAuxModels —— 平台次级模型", () => {
-  // 第二个 aux 成员:CCB 内置 Agent 子 agent 的默认钉(2026-09-03 加入)。
-  const ZAI = entry({ entryId: 10, modelId: DEFAULT_CCB_SUBAGENT_MODEL, providerId: "zai" });
+  // 第二个 aux 成员:CCB 内置 Agent 子 agent 的默认钉(2026-09-17 起 glm-5.3/scnet)。
+  const SUBAGENT = entry({ entryId: 10, modelId: DEFAULT_CCB_SUBAGENT_MODEL, providerId: "scnet" });
   const SORTED_AUX = [...PLATFORM_AUX_MODEL_IDS].sort();
 
   test("权威源 = gateway DEFAULT_SECONDARY_UTILITY_MODEL + DEFAULT_CCB_SUBAGENT_MODEL(不另抄字面量;deepseek 必须在首位)", () => {
@@ -753,7 +753,7 @@ describe("platformAuxModels —— 平台次级模型", () => {
       DEFAULT_CCB_SUBAGENT_MODEL,
     ]);
     assert.equal(DEFAULT_SECONDARY_UTILITY_MODEL, "deepseek-v4-flash");
-    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, "glm-5.3-zai");
+    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, "glm-5.3");
     assert.equal(
       _buildSecondaryUtilityModelEnv().ANTHROPIC_SMALL_FAST_MODEL,
       PLATFORM_AUX_MODEL_IDS[0],
@@ -763,14 +763,14 @@ describe("platformAuxModels —— 平台次级模型", () => {
 
   test("catalog active + 有价 → 返回 canonical id 集合(去重排序)", () => {
     const flash = entry({ entryId: 9, modelId: DEFAULT_SECONDARY_UTILITY_MODEL, providerId: "deepseek" });
-    const s = snap({ entries: [GLM, flash, ZAI] });
+    const s = snap({ entries: [GLM, flash, SUBAGENT] });
     assert.deepEqual(platformAuxModels(s), SORTED_AUX);
   });
 
   test("alias 归一:声明的 id 若是 alias,返回 canonical", () => {
     const flash = entry({ entryId: 9, modelId: "deepseek-flash-canonical", providerId: "deepseek" });
     const s = snap({
-      entries: [GLM, flash, ZAI],
+      entries: [GLM, flash, SUBAGENT],
       aliases: [[DEFAULT_SECONDARY_UTILITY_MODEL, 9]],
       pricing: [price("glm-5.2"), price("deepseek-flash-canonical"), price(DEFAULT_CCB_SUBAGENT_MODEL)],
     });
@@ -785,18 +785,18 @@ describe("platformAuxModels —— 平台次级模型", () => {
       state: "disabled",
     });
     assert.throws(
-      () => platformAuxModels(snap({ entries: [GLM, disabled, ZAI] })),
+      () => platformAuxModels(snap({ entries: [GLM, disabled, SUBAGENT] })),
       PlatformAuxModelUnavailableError,
     );
     // 整行缺失(catalog 里根本没有这个模型)——两员任一缺失都拒
-    assert.throws(() => platformAuxModels(snap({ entries: [GLM, ZAI] })), PlatformAuxModelUnavailableError);
+    assert.throws(() => platformAuxModels(snap({ entries: [GLM, SUBAGENT] })), PlatformAuxModelUnavailableError);
     assert.throws(() => platformAuxModels(snap({ entries: [GLM, flash] })), PlatformAuxModelUnavailableError);
     assert.throws(() => platformAuxModels(snap({ entries: [GLM] })), PlatformAuxModelUnavailableError);
   });
 
   test("aux active 但**无价格行** → 抛(免费旁路不允许:计费与可用性不分裂)", () => {
     const flash = entry({ entryId: 9, modelId: DEFAULT_SECONDARY_UTILITY_MODEL });
-    const s = snap({ entries: [GLM, flash, ZAI], pricing: [price("glm-5.2"), price(DEFAULT_CCB_SUBAGENT_MODEL)] });
+    const s = snap({ entries: [GLM, flash, SUBAGENT], pricing: [price("glm-5.2"), price(DEFAULT_CCB_SUBAGENT_MODEL)] });
     assert.throws(() => platformAuxModels(s), PlatformAuxModelUnavailableError);
   });
 
@@ -808,7 +808,7 @@ describe("platformAuxModels —— 平台次级模型", () => {
       providerId: "codex",
     });
     assert.throws(
-      () => platformAuxModels(snap({ entries: [GLM, wrongEngine, ZAI] })),
+      () => platformAuxModels(snap({ entries: [GLM, wrongEngine, SUBAGENT] })),
       PlatformAuxModelUnavailableError,
     );
   });
@@ -820,7 +820,7 @@ describe("platformAuxModels —— 平台次级模型", () => {
       capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION + 1,
     });
     assert.throws(
-      () => platformAuxModels(snap({ entries: [GLM, future, ZAI] })),
+      () => platformAuxModels(snap({ entries: [GLM, future, SUBAGENT] })),
       UnknownCapabilitySchemaError,
     );
   });

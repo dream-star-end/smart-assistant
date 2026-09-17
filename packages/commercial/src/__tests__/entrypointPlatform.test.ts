@@ -93,8 +93,8 @@ describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
     assert.equal(main.displayName, "全能助手");
     assert.equal(main.toolsets, undefined, "main declares no toolsets (matches legacy inline shape)");
     const hr = byId("hidden-reviewer");
-    assert.equal(hr.model, "glm-5.3-zai");
-    assert.equal(hr.provider, "zai");
+    assert.equal(hr.model, "glm-5.3");
+    assert.equal(hr.provider, "scnet");
     assert.equal(hr.persona, "personas/hidden-reviewer.md");
     assert.equal(hr.forcePersona, true, "裁决词汇必须每 boot 强制刷新");
     assert.equal(hr.permissionMode, "bypassPermissions");

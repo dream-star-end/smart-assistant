@@ -105,5 +105,11 @@ describe("STATIC_PROVIDER_META 完整性", () => {
       rejectMetricLabel: "zai_config",
       egress: "direct",
     });
+    assert.deepEqual(STATIC_PROVIDER_META.scnet, {
+      keyConfigField: "SCNET_TOKEN_PLAN_KEY",
+      notConfiguredHttpCode: "SCNET_NOT_CONFIGURED",
+      rejectMetricLabel: "scnet_config",
+      egress: "direct",
+    });
   });
 });

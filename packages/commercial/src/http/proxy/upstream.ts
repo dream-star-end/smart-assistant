@@ -117,6 +117,7 @@ const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
   "minimax",
   "ark",
   "zai",
+  "scnet",
   "opencodego",
   "kimi",
   "ark-k3",

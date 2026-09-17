@@ -591,6 +591,8 @@ export type ProxyRejectReason =
   | "bailian_config"
   // 智谱国际版 Z.AI Coding Plan(glm-5.3-zai):缺 ZAI_CODING_PLAN_KEY 时独立打点。
   | "zai_config"
+  // 超算互联网 Token Plan(glm-5.3 / glm-5.3-flash):缺 SCNET_TOKEN_PLAN_KEY 时独立打点。
+  | "scnet_config"
   // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)
   | "ark_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader
