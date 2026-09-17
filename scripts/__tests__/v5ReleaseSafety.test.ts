@@ -7543,7 +7543,7 @@ wait $!
       /const deadline = Date\.now\(\) \+ TURN_WAIT_TIMEOUT;/,
       'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
     )
-    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "gpt-5.6-luna";')
+    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "grok-build";')
     // 选模逻辑已抽到共享 helper(selfhost 契约门共用);不变量不变:真实选择器 → 菜单项 → 触发器回显,
     // 且必须在附件上传/首次 UI 发送之前生效。canary 侧断言"调用 helper 并传固定模型",helper 侧断言顺序。
     const helperSource = await readFile(path.join(root, 'scripts/lib/journey-browser.mjs'), 'utf8')
