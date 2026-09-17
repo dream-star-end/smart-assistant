@@ -74,7 +74,7 @@ describe("ChatHeader 团队模式指示 chip", () => {
     const chip = screen.getByRole("button", { name: "顾问模式已开启" });
     expect(chip.textContent).toContain("gpt-6-astra");
     fireEvent.click(chip);
-    expect(screen.getByText(/本回合冻结顾问 gpt-6-astra/)).toBeInTheDocument();
+    expect(screen.getByText(/本回合固定使用 gpt-6-astra/)).toBeInTheDocument();
     expect(screen.getByText(/不承诺更省/)).toBeInTheDocument();
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
     expect(trigger.textContent).toContain("GLM-5.2");

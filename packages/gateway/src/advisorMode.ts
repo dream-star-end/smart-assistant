@@ -5,6 +5,8 @@ import {
   ADVISOR_AGENT_ID,
   type CollaborationMode,
   DEFAULT_ADVISOR_MODEL,
+  contextFamilyByModelId,
+  isCodexLongContextModel,
 } from '@openclaude/protocol'
 import type { MessageLike } from '@openclaude/storage'
 import { isPathWithinRoot } from './pathAcl.js'
@@ -94,12 +96,19 @@ export type AdvisorCatalogModel = {
 
 export type AdvisorModelOption = { id: string; label: string; engine: string; providerId?: string }
 
+/** Map Codex 1M twins onto the standard catalog id used in the advisor picker. */
+export function advisorCanonicalModelId(modelId: string): string {
+  const requested = modelId.trim()
+  if (!isCodexLongContextModel(requested)) return requested
+  return contextFamilyByModelId(requested)?.standardId ?? requested
+}
+
 export function assertAdvisorModelAllowed(input: {
   requested: string
   advisorModels: readonly AdvisorModelOption[]
   unavailableReason?: string
 }): { ok: true; model: string } | { ok: false; error: string } {
-  const requested = input.requested.trim()
+  const requested = advisorCanonicalModelId(input.requested)
   if (input.advisorModels.length === 0) {
     return { ok: false, error: input.unavailableReason || '顾问型号目录不可用或尚未证明' }
   }
@@ -171,6 +180,7 @@ export function listProvenAdvisorModels(input: {
   for (const row of input.catalog) {
     if (row.available === false) continue
     if (row.engine === 'codex' && proven.has('codex')) {
+      if (isCodexLongContextModel(row.modelId)) continue
       const key = `${row.engine}:${row.modelId}`
       if (seen.has(key)) continue
       seen.add(key)

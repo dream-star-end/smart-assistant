@@ -842,13 +842,12 @@ describe('oc-cursor wrapper', () => {
       })
       assert.equal(result.status, 0, result.stderr)
     }
-    // Only the three catalogued 3.8 efforts are allowlisted: no Fast twin,
-    // no xhigh, and no other Gemini generation (3.7 / 3.6 / 3.1 Pro).
+    // Only catalogued Gemini ids are allowlisted: no 3.8 Fast/xhigh twins,
+    // and no unprobed generations (3.7). 3.1 Pro is a separate Sand family.
     for (const model of [
       'gemini-3.8-flash-high-fast',
       'gemini-3.8-flash-xhigh',
       'gemini-3.7-flash-high',
-      'gemini-3.1-pro',
     ]) {
       const blocked = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
         cwd: f.dir,
@@ -858,6 +857,31 @@ describe('oc-cursor wrapper', () => {
       assert.equal(blocked.status, 2, model)
       assert.match(blocked.stderr, /model is not allowlisted/)
     }
+  })
+
+  test('accepts Sand-probed Haiku 4.5, Gemini 3.1 Pro and GPT-5.6 Luna ids', () => {
+    const f = fixture()
+    for (const model of [
+      'claude-haiku-4-5',
+      'gemini-3.1-pro',
+      'gpt-5.6-luna-low',
+      'gpt-5.6-luna-high-fast',
+      'gpt-5.6-luna-max',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, `${model}: ${result.stderr}`)
+    }
+    const blocked = spawnSync(f.wrapper, ['--model', 'gpt-5.6-luna-none', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(blocked.status, 2)
+    assert.match(blocked.stderr, /model is not allowlisted/)
   })
 
   test('does not assume an undocumented Cursor API-key prefix', () => {

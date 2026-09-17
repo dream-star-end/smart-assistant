@@ -269,6 +269,8 @@ export type CursorEngineFamilyId =
   | 'fable-5.1'
   | 'sonnet-5'
   | 'gemini-3.8-flash'
+  | 'gemini-3.1-pro'
+  | 'gpt-5.6-luna-sand'
   | 'grok-4.5'
   | 'haiku-4.5'
 
@@ -835,6 +837,112 @@ export const CURSOR_ENGINE_MODELS = [
     effort: null,
     fast: false,
   },
+  // GPT-5.6 Luna via Cursor Sand (probed 2026-09-17: family PASS). Official
+  // AvailableModels exposes none/low/medium/high/xhigh/max × fast at 272k.
+  // Skip `none` (not in PLATFORM_REASONING_EFFORTS). Family id is
+  // `gpt-5.6-luna-sand` so family-level public ids cannot collide with Codex
+  // `gpt-5.6-luna`.
+  {
+    id: 'cursor-gpt-5.6-luna-low',
+    displayName: 'GPT-5.6 Luna Low',
+    upstreamModel: 'gpt-5.6-luna-low',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-low-fast',
+    displayName: 'GPT-5.6 Luna Low Fast',
+    upstreamModel: 'gpt-5.6-luna-low-fast',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'low',
+    fast: true,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-medium',
+    displayName: 'GPT-5.6 Luna Medium',
+    upstreamModel: 'gpt-5.6-luna-medium',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-medium-fast',
+    displayName: 'GPT-5.6 Luna Medium Fast',
+    upstreamModel: 'gpt-5.6-luna-medium-fast',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'medium',
+    fast: true,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-high',
+    displayName: 'GPT-5.6 Luna High',
+    upstreamModel: 'gpt-5.6-luna-high',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-high-fast',
+    displayName: 'GPT-5.6 Luna High Fast',
+    upstreamModel: 'gpt-5.6-luna-high-fast',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'high',
+    fast: true,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-xhigh',
+    displayName: 'GPT-5.6 Luna Extra High',
+    upstreamModel: 'gpt-5.6-luna-xhigh',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-xhigh-fast',
+    displayName: 'GPT-5.6 Luna Extra High Fast',
+    upstreamModel: 'gpt-5.6-luna-xhigh-fast',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'xhigh',
+    fast: true,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-max',
+    displayName: 'GPT-5.6 Luna Max',
+    upstreamModel: 'gpt-5.6-luna-max',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'max',
+    fast: false,
+  },
+  {
+    id: 'cursor-gpt-5.6-luna-max-fast',
+    displayName: 'GPT-5.6 Luna Max Fast',
+    upstreamModel: 'gpt-5.6-luna-max-fast',
+    family: 'gpt-5.6-luna-sand',
+    familyLabel: 'GPT-5.6 Luna Sand',
+    effort: 'max',
+    fast: true,
+  },
+  // Gemini 3.1 Pro via Cursor Sand (probed 2026-09-17: family PASS). Official
+  // directory has a single slug `gemini-3.1-pro` (no effort/Fast axis).
+  {
+    id: 'cursor-gemini-3.1-pro',
+    displayName: 'Gemini 3.1 Pro',
+    upstreamModel: 'gemini-3.1-pro',
+    family: 'gemini-3.1-pro',
+    familyLabel: 'Gemini 3.1 Pro',
+    effort: null,
+    fast: false,
+  },
 ] as const
 
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
@@ -1094,7 +1202,14 @@ export function cursorCredentialModelFamily(
 export function cursorFamilyDefaultEffort(
   family: CursorEngineFamilyId,
 ): PlatformReasoningEffort | null {
-  if (family === 'auto' || family === 'composer-2.5' || family === 'haiku-4.5') return null
+  if (
+    family === 'auto' ||
+    family === 'composer-2.5' ||
+    family === 'haiku-4.5' ||
+    family === 'gemini-3.1-pro'
+  ) {
+    return null
+  }
   return 'high'
 }
 
