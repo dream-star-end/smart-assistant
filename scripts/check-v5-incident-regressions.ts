@@ -420,6 +420,10 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // ancestors are exempted; commits after this tip still go through the trailer
   // gate one by one.
   "839ad442098f8e68e0b9fd2b0e8f01519334031e",
+  // 2026-09-19 chase: selfhost b019bfb00 (stuck restore banner) is on
+  // origin/feat/v5-selfhost and cannot be amended. Freeze this tip so the
+  // imported fix(v5) passes check:v5:incidents; later commits still gate.
+  "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
