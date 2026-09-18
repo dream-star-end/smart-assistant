@@ -412,6 +412,10 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 格式非法,源提交不可改写,只豁免其不可变祖先。之后的新提交仍逐条走 trailer 门
   // (已 mutation 验证:tip 之上再加一条坏 trailer 的 fix(v5) 仍会红)。
   "8ab8a57c82eee96028fe4d9b1015d3593c9e9334",
+  // 2026-09-19: selfhost rel-b019bfb00-20260918-182002 is live (restore-banner
+  // fix(v5) shipped without Incident trailer). Freeze this tip only; cherry-picks
+  // after it still go through the trailer gate (OCV5-224 registered separately).
+  "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
