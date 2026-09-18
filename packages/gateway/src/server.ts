@@ -150,6 +150,8 @@ import {
   type SkillEvalsFile,
   type AgentDef,
   type AgentsConfig,
+  type McpServerConfig,
+  validateAgentPatch,
   MemoryDir,
   MEMORY_FILE_RE,
   readUserProfile,
@@ -176,7 +178,8 @@ import {
   syncMarketplaceHub,
   updateAgentsConfig,
   isMarketplacePersonaTarget,
-  writeConfig,
+  updateConfig,
+  ConfigValidationError,
   getUsageSummary,
   queryEvents,
   listClientSessions,
@@ -2644,13 +2647,32 @@ export class Gateway {
       }
       this._agentsConfigCache = await readAgentsConfig()
       this._agentsConfigMtime = mtime
+      this._syncAgentsConfigSnapshot(this._agentsConfigCache)
       return this._agentsConfigCache
     } catch {
       // File doesn't exist or stat failed — fall through to fresh read
       this._agentsConfigCache = await readAgentsConfig()
       this._agentsConfigMtime = 0
+      this._syncAgentsConfigSnapshot(this._agentsConfigCache)
       return this._agentsConfigCache
     }
+  }
+
+  // CFG-10:agents.yaml 只有一份内存权威 —— mtime 缓存刷新是唯一触发点。刷新时同步替换
+  // 构造期快照 deps.agentsConfig(Router / /v1 目标解析 / /api/file cwd 白名单都从它取)并
+  // router.reload(),于是 CLI `agents add`、手改 yaml、市场同步(另一进程写)也能热生效,
+  // 不再只有 API 写回那条路才刷新。Router 保持同步 API,不改异步。
+  private _syncAgentsConfigSnapshot(cfg: AgentsConfig): void {
+    if (this.deps.agentsConfig === cfg) return
+    this.deps.agentsConfig = cfg
+    this.router?.reload(cfg)
+  }
+
+  /** API 写回 agents.yaml 后调用:写回的对象即新权威,顺带失效 mtime 缓存(下次读走磁盘 mtime 重新对齐)。 */
+  private _adoptWrittenAgentsConfig(cfg: AgentsConfig): void {
+    this._agentsConfigCache = null
+    this._agentsConfigMtime = 0
+    this._syncAgentsConfigSnapshot(cfg)
   }
 
   // ── User-facing projection of the agents config (single authority) ──
@@ -5969,32 +5991,36 @@ export class Gateway {
       }
     }
     if (url.pathname === '/api/config') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
+      // CFG-17:只读投影,只认 GET。CFG-04:先把 body 整个构造好再发,不再先 writeHead(200)
+      // 再取值 —— 否则 config 缺字段时客户端收到的是「200 + 空体」而不是可诊断的错误。
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      const cfg = this.deps.config
       const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
         []
-      const activeProvider = this.deps.config.provider
-      for (const srv of this.deps.config.mcpServers ?? []) {
+      const activeProvider = cfg.provider
+      for (const srv of cfg.mcpServers ?? []) {
         if (srv.enabled === false) continue
         if (srv.provider && srv.provider !== activeProvider) continue
         activeMcps.push({ id: srv.id, label: srv.label, provider: srv.provider, tools: srv.tools })
       }
-      const authInfo: Record<string, any> = { mode: this.deps.config.auth.mode }
-      if (this.deps.config.auth.claudeOAuth?.accessToken) {
+      const authInfo: Record<string, any> = { mode: cfg.auth.mode }
+      if (cfg.auth.claudeOAuth?.accessToken) {
         authInfo.claudeOAuth = {
           active: true,
-          expiresAt: this.deps.config.auth.claudeOAuth.expiresAt,
+          expiresAt: cfg.auth.claudeOAuth.expiresAt,
         }
       }
-      res.end(
-        JSON.stringify({
-          gateway: { bind: this.deps.config.gateway.bind, port: this.deps.config.gateway.port },
-          defaults: this.deps.config.defaults,
-          channels: Object.keys(this.deps.config.channels),
-          provider: activeProvider,
-          auth: authInfo,
-          mcpServers: activeMcps,
-        }),
-      )
+      this.sendJson(res, 200, {
+        gateway: { bind: cfg.gateway.bind, port: cfg.gateway.port },
+        defaults: cfg.defaults,
+        channels: Object.keys(cfg.channels ?? {}),
+        provider: activeProvider,
+        auth: authInfo,
+        mcpServers: activeMcps,
+      })
       return
     }
     if (url.pathname === '/api/agents') {
@@ -7900,7 +7926,8 @@ export class Gateway {
       res.end('not found')
       return
     }
-    const agentCwds = this.deps.agentsConfig.agents
+    // CFG-10:cwd 白名单取 mtime 缓存的最新快照(手改 yaml / CLI / 市场同步后即刻生效),不再读构造期旧快照。
+    const agentCwds = (await this._getAgentsConfig()).agents
       .map((a) => a.cwd)
       .filter((c): c is string => !!c)
     // V3 multi-tenant: resolve the caller's docker-volume {uploads, generated}
@@ -8103,7 +8130,8 @@ export class Gateway {
       res.end('not found')
       return
     }
-    const agentCwds = this.deps.agentsConfig.agents
+    // CFG-10:同上,cwd 白名单从最新快照取。
+    const agentCwds = (await this._getAgentsConfig()).agents
       .map((a) => a.cwd)
       .filter((c): c is string => !!c)
     // User-scoped allowlist predicate: limit to **this request's** resolved
@@ -8687,6 +8715,22 @@ export class Gateway {
     }
   }
 
+  // CFG-06:/api/agents(/:id) 的响应投影。agents[].mcpServers[].env 是第三方 key 的载体
+  // (subprocessRunner 原样注入子进程),与 /api/config 对全局 mcpServers 的脱敏对齐:
+  // 值不出容器,只回 envKeys 供 UI/诊断看「配了哪些变量」。其余字段原样。
+  private _projectAgentForApi(agent: AgentDef): Omit<AgentDef, 'mcpServers'> & {
+    mcpServers?: Array<Omit<McpServerConfig, 'env'> & { envKeys?: string[] }>
+  } {
+    if (!Array.isArray(agent.mcpServers)) return agent
+    return {
+      ...agent,
+      mcpServers: agent.mcpServers.map((srv) => {
+        const { env, ...rest } = srv
+        return env && typeof env === 'object' ? { ...rest, envKeys: Object.keys(env) } : rest
+      }),
+    }
+  }
+
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -8694,7 +8738,7 @@ export class Gateway {
       // 枚举面:走用户可见投影(隐藏系统 agent 已剔除、default 已收敛)。
       const view = await this._getAgentsConfigUserView()
       this.sendJson(res, 200, {
-        agents: view.agents,
+        agents: view.agents.map((a) => this._projectAgentForApi(a)),
         default: view.default,
         routes: view.routes,
         identityCompat: await fetchIdentityCompatProjection(),
@@ -8704,16 +8748,24 @@ export class Gateway {
     if (req.method === 'POST') {
       // 建 agent 是 mutation 面:必须读/写全量 config(不能用投影视图,否则写回
       // agents.yaml 会把隐藏系统 agent 一并删掉)。保留 id 拒绝仍用 predicate 看全量。
-      const body = await this.readJsonBody<Partial<AgentDef>>(req)
-      if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
+      const rawBody = await this.readJsonBody<Partial<AgentDef>>(req)
+      if (!rawBody.id || !/^[a-zA-Z0-9_-]+$/.test(rawBody.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
         return
       }
-      if (isHiddenSystemAgentId(body.id)) {
+      if (isHiddenSystemAgentId(rawBody.id)) {
         this.sendError(res, 403, 'agent id is reserved')
         return
       }
-      const id = body.id
+      // CFG-05/07:字段级校验(permissionMode 枚举 / toolsets string[] / mcpServers 形状 /
+      // persona 限 HOME / cwd 非根非系统目录),非法 400 不落盘;只对新写入生效。
+      const patch = validateAgentPatch(rawBody)
+      if (!patch.ok) {
+        this.sendError(res, 400, patch.error)
+        return
+      }
+      const body = patch.value
+      const id = rawBody.id
       const identityProjection = await fetchIdentityCompatProjection()
       if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id || profile.canonicalAgentId === id)) {
         return this.sendJson(res, 409, { error: '此身份由已登记的兼容关系管理，不能新建为独立 Agent。', code: 'IDENTITY_COMPAT_MANAGED' })
@@ -8735,20 +8787,20 @@ export class Gateway {
           provider: body.provider ?? defaultAgent?.provider,
           cwd: body.cwd ?? defaultAgent?.cwd,
           toolsets: body.toolsets,
+          ...(body.mcpServers ? { mcpServers: body.mcpServers } : {}),
         }
         cfg.agents.push(agent)
         return agent
       })
       if (!agent) return this.sendError(res, 409, 'agent already exists')
-      this.deps.agentsConfig = cfg
-      await mkdir(paths.agentSessionsDir(body.id), { recursive: true })
+      // 写回即新权威:同步快照 + 路由热更新(CFG-10 单一权威入口)
+      this._adoptWrittenAgentsConfig(cfg)
+      await mkdir(paths.agentSessionsDir(id), { recursive: true })
       // Seed an empty persona file if missing
       try {
-        await writeFile(paths.agentClaudeMd(body.id), `# Agent: ${body.id}\n\n`, { flag: 'wx' })
+        await writeFile(paths.agentClaudeMd(id), `# Agent: ${id}\n\n`, { flag: 'wx' })
       } catch {}
-      // 热更新路由
-      this.router.reload(cfg)
-      this.sendJson(res, 201, { agent })
+      this.sendJson(res, 201, { agent: this._projectAgentForApi(agent) })
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -8767,7 +8819,7 @@ export class Gateway {
       const cfg = await readAgentsConfig()
       const agent = cfg.agents.find((a) => a.id === id)
       if (!agent) return this.sendError(res, 404, 'agent not found')
-      this.sendJson(res, 200, { agent })
+      this.sendJson(res, 200, { agent: this._projectAgentForApi(agent) })
       return
     }
     if (req.method === 'PUT' || req.method === 'DELETE') {
@@ -8775,7 +8827,20 @@ export class Gateway {
       if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id)) {
         return this.sendJson(res, 409, { error: '此条目仅保留本实例运行手册；执行配置由关联市场 Agent 管理。', code: 'IDENTITY_COMPAT_MANAGED' })
       }
-      const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
+      // CFG-05/07:PUT 走 storage.validateAgentPatch 做字段级校验,非法 400 且不落盘。
+      // 展示类字段(displayName / avatarEmoji / greeting)允许传空串表示「清除」——从校验体里
+      // 摘出单独处理,其余字段(含非法 permissionMode / 非数组 toolsets / 畸形 mcpServers /
+      // HOME 外 persona / 根目录 cwd)一律拒绝。
+      const rawBody =
+        req.method === 'PUT' ? await this.readJsonBody<Record<string, unknown>>(req) : {}
+      const clearKeys = (['displayName', 'avatarEmoji', 'greeting'] as const).filter(
+        (k) => rawBody[k] === '',
+      )
+      const toValidate: Record<string, unknown> = { ...rawBody }
+      for (const k of clearKeys) delete toValidate[k]
+      const patch = validateAgentPatch(toValidate)
+      if (!patch.ok) return this.sendError(res, 400, patch.error)
+      const body: Partial<AgentDef> = patch.value
       const { config: cfg, result } = await updateAgentsConfig(async (cfg) => {
         const idx = cfg.agents.findIndex((a) => a.id === id)
         if (idx < 0) return { status: 404, body: { error: 'agent not found' } }
@@ -8803,12 +8868,10 @@ export class Gateway {
         if (body.provider !== undefined) agent.provider = body.provider
         if (body.toolsets !== undefined) agent.toolsets = body.toolsets
         if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
-        return { status: 200, body: { agent } }
+        for (const k of clearKeys) delete agent[k]
+        return { status: 200, body: { agent: this._projectAgentForApi(agent) } }
       })
-      if (result.status === 200) {
-        this.deps.agentsConfig = cfg
-        this.router.reload(cfg)
-      }
+      if (result.status === 200) this._adoptWrittenAgentsConfig(cfg)
       this.sendJson(res, result.status, result.body)
       return
     }
@@ -17126,24 +17189,19 @@ export class Gateway {
         token_type?: string
       }
 
-      // Save to config (keyed by provider)
-      const config = await readConfig()
-      if (config) {
-        const oauthData = {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token ?? '',
-          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-          scope: tokens.scope ?? prov.scopes,
-        }
-        if (providerKey === 'claude') {
-          config.auth.claudeOAuth = oauthData
-          config.auth.mode = 'subscription'
-        }
-        await writeConfig(config)
-        this.deps.config = config
-        this.sessions.updateConfig(config)
-        this.log.info('oauth tokens saved', { provider: providerKey })
+      // Save to config (keyed by provider)。CFG-02:走 storage.updateConfig 事务(内核锁 + tmp + rename),
+      // 不再 readConfig → 改 → writeConfig 裸写;CFG-10:写回后只把 auth 段同步进 deps.config,
+      // 不整体替换(避免把磁盘上手改的其他字段悄悄拉进内存)。
+      const oauthData = {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token ?? '',
+        expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        scope: tokens.scope ?? prov.scopes,
       }
+      const persisted = await this._persistOAuthCredential(providerKey, oauthData, {
+        setSubscriptionMode: providerKey === 'claude',
+      })
+      if (persisted) this.log.info('oauth tokens saved', { provider: providerKey })
 
       this.sendJson(res, 200, {
         ok: true,
@@ -17229,19 +17287,15 @@ export class Gateway {
       }
 
       const tokens = (await tokenRes.json()) as any
-      const config = await readConfig()
-      if (config) {
-        const refreshed = {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token ?? oauth.refreshToken,
-          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-          scope: tokens.scope ?? oauth.scope,
-        }
-        if (providerKey === 'claude') config.auth.claudeOAuth = refreshed
-        else (config.auth as any)[`${providerKey}OAuth`] = refreshed
-        await writeConfig(config)
-        this.deps.config = config
-        this.sessions.updateConfig(config)
+      const refreshed = {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token ?? oauth.refreshToken,
+        expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        scope: tokens.scope ?? oauth.scope,
+      }
+      // CFG-02:≤10min 一次的高频写入方,必须走事务式原子写(见 _persistOAuthCredential)。
+      const persisted = await this._persistOAuthCredential(providerKey, refreshed)
+      if (persisted) {
         this.log.info('oauth token refreshed', {
           provider: providerKey,
           expiresInSec: tokens.expires_in,
@@ -17249,6 +17303,37 @@ export class Gateway {
       }
     } catch (err) {
       this.log.error('oauth refresh error', { provider: providerKey }, err)
+    }
+  }
+
+  /**
+   * CFG-02 / CFG-10:OAuth 凭据落盘的唯一入口。锁内读-改-写(storage.updateConfig:内核文件锁 +
+   * tmp + rename),崩溃/断电不会留下半截 openclaude.json;写回成功后只把 `auth` 段同步进
+   * `deps.config` 并通知 SessionManager,不整体替换内存配置。openclaude.json 不存在
+   * (ConfigValidationError MISSING)时与旧行为一致:跳过持久化并打 warn,返回 false。
+   */
+  private async _persistOAuthCredential(
+    providerKey: string,
+    credential: { accessToken: string; refreshToken: string; expiresAt: number; scope: string },
+    opts: { setSubscriptionMode?: boolean } = {},
+  ): Promise<boolean> {
+    try {
+      const { config } = await updateConfig((cfg) => {
+        if (providerKey === 'claude') cfg.auth.claudeOAuth = credential
+        else (cfg.auth as any)[`${providerKey}OAuth`] = credential
+        if (opts.setSubscriptionMode) cfg.auth.mode = 'subscription'
+      })
+      this.deps.config.auth = config.auth
+      this.sessions.updateConfig(this.deps.config)
+      return true
+    } catch (err) {
+      if (err instanceof ConfigValidationError && err.code === 'MISSING') {
+        this.log.warn('oauth credential not persisted: openclaude.json missing', {
+          provider: providerKey,
+        })
+        return false
+      }
+      throw err
     }
   }
 

@@ -138,6 +138,11 @@ export function SettingsCenter({
     } else {
       setSection("account");
       setSubOpen(false);
+      // 关闭即丢弃偏好快照:下次打开偏好页重新拉取,别的标签页 / 设备改过的偏好不会被这里的
+      // 陈旧副本盖住(审计 CFG-23;快捷键等静态分区不受影响)。
+      setPrefs(null);
+      setAutoDream(null);
+      setPrefsErr(null);
     }
   }, [open, initialSection, subscribeOpenSignal, sections]);
 
@@ -169,10 +174,15 @@ export function SettingsCenter({
     };
   }, [open, demo, auth, needsPreferences, prefs, onPreferencesChange, prefsReloadTick]);
 
+  // 连续两次 patch 的响应可能乱序到达(网络抖动 / 后端排队);只有最后一次发出的 patch 才有权
+  // 覆盖快照,晚到的旧响应直接丢弃(审计 CFG-23)。错误仍向调用方抛出,由 PreferencesTab 展示。
+  const patchSeq = useRef(0);
   const patchPref = useCallback(
     async (patch: Record<string, unknown>) => {
       if (!auth) return;
+      const seq = ++patchSeq.current;
       const snap = await api.patchPreferences(auth, patch);
+      if (seq !== patchSeq.current) return;
       const next = extractPrefs(snap);
       setPrefs(next);
       setAutoDream(extractAutoDreamFeature(snap));

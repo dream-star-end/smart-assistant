@@ -9,6 +9,8 @@ export * from './engine/registry.js'
 export * from './engine/ccbAdapter.js'
 export * from './router.js'
 export * from './auth.js'
+// 监听地址/端口的 env 覆盖解析(cli onboard 复用同一套端口校验,CFG-12)。
+export * from './gatewayBind.js'
 export * from './cron.js'
 export * from './ccbMessageParser.js'
 export * from './eventBus.js'

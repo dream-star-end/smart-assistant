@@ -1,15 +1,21 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  type CommercialHook,
   Gateway,
   log,
-  makeV3WechatOutboundAdapter,
   makeV3QqbotOutboundAdapter,
+  makeV3WechatOutboundAdapter,
   readV3WechatOutboundConfig,
-  type CommercialHook,
 } from '@openclaude/gateway'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
-import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
+import {
+  ConfigValidationError,
+  type OpenClaudeConfig,
+  paths,
+  readAgentsConfigWithWarnings,
+  readConfigWithWarnings,
+} from '@openclaude/storage'
 
 export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   let gw: Gateway | null = null
@@ -24,10 +30,7 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
 
   // Fatal crash handler: structured log, best-effort graceful shutdown, then exit(1).
   // A hard-deadline timer guarantees we exit even if shutdown hangs.
-  const emergencyExit = (
-    kind: 'uncaughtException' | 'unhandledRejection',
-    err: unknown,
-  ): void => {
+  const emergencyExit = (kind: 'uncaughtException' | 'unhandledRejection', err: unknown): void => {
     // Ensure any natural event-loop drain after this point yields exit code 1.
     process.exitCode = 1
 
@@ -96,12 +99,28 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     log.info('gateway: routing fetch via HTTP_PROXY (EnvHttpProxyAgent)')
   }
 
-  const config = await readConfig()
-  if (!config) {
+  // 配置加载(CFG-04):致命项(JSON 非法 / version≠1 / port 非法)给可读原因后 exit 1,
+  // 不再让 JSON.parse / TypeError 的裸栈当启动报错;缺字段已在 storage 层填默认,这里只把 warnings 打出来。
+  let parsedConfig: Awaited<ReturnType<typeof readConfigWithWarnings>>
+  try {
+    parsedConfig = await readConfigWithWarnings()
+  } catch (err) {
+    if (err instanceof ConfigValidationError) {
+      console.error(`[cli] 配置文件不可用(${paths.config}):${err.message}`)
+      console.error('[cli] 修正后重试,或备份该文件后重跑 `openclaude onboard`')
+      process.exit(1)
+    }
+    throw err
+  }
+  if (!parsedConfig) {
     console.error('未找到配置。请先运行 `openclaude onboard`')
     process.exit(1)
   }
-  const agentsConfig = await readAgentsConfig()
+  const config = parsedConfig.config
+  for (const w of parsedConfig.warnings) log.warn(`config: openclaude.json ${w}`)
+  const agentsParsed = await readAgentsConfigWithWarnings()
+  const agentsConfig = agentsParsed.config
+  for (const w of agentsParsed.warnings) log.warn(`config: agents.yaml ${w}`)
   const here = fileURLToPath(new URL('.', import.meta.url))
   // 静态前端按 runtime channel 分流(底层权威 = OC_RUNTIME_CHANNEL,与 commercial
   // getRuntimeChannel() 同源;此处只做"服务哪套产物 + 用哪种缓存语义"的纯路径决策,
@@ -153,7 +172,7 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   // 走自己的 dispatcher → container 链路。broker 未启用(WECHAT_BROKER_ENABLED!=1
   // / personal / commercial 未挂)时 override 为 undefined,manager 走 legacy
   // ctx.dispatch 原路径,行为不变。
-  const wxCfg = (config.channels as any).wechat
+  const wxCfg = config.channels.wechat
   if (wxCfg?.enabled) {
     try {
       const mod = await import('@openclaude/channel-wechat')
@@ -174,7 +193,8 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   }
 
   // Telegram (optional): enabled when channels.telegram.enabled = true AND token is provided
-  const tgCfg = (config.channels as any).telegram
+  // 类型已与 pairing 命令写出的字段对齐(botToken / mentionRequired,CFG-09),不再 `as any`。
+  const tgCfg = config.channels.telegram
   if (tgCfg?.enabled) {
     const token = tgCfg.botToken || process.env.OPENCLAUDE_TELEGRAM_BOT_TOKEN
     if (!token) {

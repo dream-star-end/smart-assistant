@@ -1,5 +1,11 @@
 import { mkdir, writeFile } from 'node:fs/promises'
-import { paths, readAgentsConfig, updateAgentsConfig } from '@openclaude/storage'
+import {
+  AGENT_ID_RE,
+  paths,
+  readAgentsConfig,
+  updateAgentsConfig,
+  validateAgentPatch,
+} from '@openclaude/storage'
 
 export async function agentsList(): Promise<void> {
   const cfg = await readAgentsConfig()
@@ -15,7 +21,27 @@ export async function agentsList(): Promise<void> {
   }
 }
 
+/** CLI 与 POST /api/agents 共用同一套 id / 字段校验(CFG-14):`../x` 之类的 id 在这里就拒。 */
+export function validateAgentsAddInput(
+  id: string,
+  opts: { model?: string },
+): { ok: true } | { ok: false; error: string } {
+  if (typeof id !== 'string' || !AGENT_ID_RE.test(id)) {
+    return { ok: false, error: `invalid agent id "${id}" (use only a-z 0-9 _ -)` }
+  }
+  const patch = validateAgentPatch({
+    id,
+    ...(opts.model !== undefined ? { model: opts.model } : {}),
+  })
+  return patch.ok ? { ok: true } : { ok: false, error: patch.error }
+}
+
 export async function agentsAdd(id: string, opts: { model?: string }): Promise<void> {
+  const check = validateAgentsAddInput(id, opts)
+  if (!check.ok) {
+    console.error(`✗ ${check.error}`)
+    process.exit(1)
+  }
   const { result: added } = await updateAgentsConfig((cfg) => {
     if (cfg.agents.some((a) => a.id === id)) return false
     cfg.agents.push({ id, model: opts.model, persona: paths.agentClaudeMd(id) })

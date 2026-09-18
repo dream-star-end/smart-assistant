@@ -74,10 +74,11 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   // only when served by the master singleton; proxied to a user's own container they
   // operate on that user's isolated volume/session state.
   {
-    // v5 纯市场模型:用户不能自建容器内 agent(其它 agent 一律走市场安装,由
-    // syncMarketplaceHub 直写 agents.yaml)。故砍掉唯一的创建路径 POST /api/agents,
-    // 只保留 GET(列表)。这样容器里无 source 标记的非 main agent 只可能是已退役的平台
-    // 幽灵 seed → listCollaboratorAgents 的 marketplace-source 过滤可证明完备。
+    // v5 纯市场模型:**bridge 路径**(商业版容器)不放行 POST /api/agents —— 容器内其它 agent
+    // 一律走市场安装(syncMarketplaceHub 直写 agents.yaml),这样容器里无 source 标记的非 main
+    // agent 只可能是已退役的平台幽灵 seed → listCollaboratorAgents 的 marketplace-source 过滤
+    // 可证明完备。注意这只是 bridge 白名单的封禁:server.ts handleAgentsCollection 仍实现 POST,
+    // selfhost 用户经本地 accessToken / JWT 仍可自建 agent(指挥官拍板 2026-09-18,CFG-18)。
     label: '/api/agents',
     re: /^\/api\/agents$/,
     methods: M('GET'),
