@@ -1150,6 +1150,8 @@ export type SkillSummary = {
   layer?: string;
   writable?: boolean;
   agentIds?: string[];
+  /** 注入菜单排序提示（越大越靠前，[-100,100]）；后端 view() 返回，前端只读展示（S-09）。 */
+  priority?: number;
 };
 
 /** 评测用例(skill 目录 evals/evals.json)。 */
