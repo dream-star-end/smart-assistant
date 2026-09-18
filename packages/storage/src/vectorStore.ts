@@ -419,10 +419,36 @@ export interface HybridSessionResult {
   vecRank: number | null
 }
 
+/** 实际生效的会话检索模式:向量侧真正参与了融合才是 hybrid,否则如实报 bm25。 */
+export type SessionRetrievalMode = 'hybrid' | 'bm25'
+
+export interface HybridSessionSearchOutcome {
+  results: HybridSessionResult[]
+  /**
+   * 'hybrid' 仅当向量表非空且 embed + KNN 都成功;provider 缺失 / 向量库未初始化 /
+   * sessions_vec 为空 / embed 失败 → 'bm25'。调用方上报 retrievalMode 应以此为准
+   * (MSC MEM-04:此前按「有 provider 即 hybrid」上报,而 sessions_vec 在生产里恒空)。
+   */
+  retrievalMode: SessionRetrievalMode
+  /** 本次是否真的调用了 provider.embed(空向量表会跳过,省一次网络调用)。 */
+  embedded: boolean
+}
+
+/** sessions_vec 是否至少有一行。vec0 虚表支持普通 SELECT … LIMIT 1;表缺失/查询失败按空处理。 */
+function sessionsVecHasRows(db: Database.Database): boolean {
+  try {
+    return db.prepare('SELECT id FROM sessions_vec LIMIT 1').get() !== undefined
+  } catch {
+    return false
+  }
+}
+
 /**
  * Hybrid search on sessions: BM25 + Vector + RRF fusion.
  *
  * Falls back to BM25-only if embedding provider is unavailable or errors.
+ * Thin wrapper over {@link hybridSessionSearchDetailed} that keeps the historical
+ * results-only signature.
  */
 export async function hybridSessionSearch(
   query: string,
@@ -430,12 +456,28 @@ export async function hybridSessionSearch(
   limit = 5,
   agentId?: string,
 ): Promise<HybridSessionResult[]> {
+  return (await hybridSessionSearchDetailed(query, provider, limit, agentId)).results
+}
+
+/**
+ * Hybrid session search that also reports which retrieval mode actually ran.
+ *
+ * The vector leg is skipped entirely (no `provider.embed` network call) when the
+ * vector store is not ready or `sessions_vec` has no rows — an empty KNN can only
+ * ever degrade RRF to plain BM25, so paying an embed for it is pure waste.
+ */
+export async function hybridSessionSearchDetailed(
+  query: string,
+  provider: EmbeddingProvider | null,
+  limit = 5,
+  agentId?: string,
+): Promise<HybridSessionSearchOutcome> {
   const db = await getSessionsDb()
   const fetchLimit = limit * 4
 
   // 1. BM25 search (existing logic from searchSessions)
   const cleanQuery = literalFtsQuery(query)
-  if (!cleanQuery && !provider) return []
+  if (!cleanQuery && !provider) return { results: [], retrievalMode: 'bm25', embedded: false }
 
   const agentFilter = agentId ? 'AND m.agent_id = ?' : ''
   const bm25Params = agentId ? [cleanQuery, agentId, fetchLimit] : [cleanQuery, fetchLimit]
@@ -470,12 +512,18 @@ export async function hybridSessionSearch(
     bm25Deduped.push(r)
   }
 
-  // 2. Vector search
+  // 2. Vector search — only when there is something to search against. An empty
+  //    sessions_vec (no writer wired up in production, see indexPipeline) must not
+  //    cost an embed round-trip, and must not be reported as hybrid.
   let vecResults: Array<{ id: string; distance: number }> = []
-  if (provider && isVecReady() && query.trim()) {
+  let embedded = false
+  let vectorLegOk = false
+  if (provider && isVecReady() && query.trim() && sessionsVecHasRows(db)) {
     try {
+      embedded = true
       const [queryVec] = await provider.embed([query], 'query')
       vecResults = await searchSessionsByVector(queryVec, agentId, fetchLimit)
+      vectorLegOk = true
     } catch {
       // Fall back to BM25-only
     }
@@ -536,7 +584,7 @@ export async function hybridSessionSearch(
     }
   }
 
-  return fused.slice(0, limit).map(c => {
+  const results = fused.slice(0, limit).map(c => {
     const meta = metaMap.get(c.id)
     return {
       sessionId: c.id,
@@ -551,4 +599,5 @@ export async function hybridSessionSearch(
       vecRank: c.vecRank,
     }
   })
+  return { results, retrievalMode: vectorLegOk ? 'hybrid' : 'bm25', embedded }
 }

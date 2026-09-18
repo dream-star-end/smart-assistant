@@ -48,6 +48,13 @@ export interface ScanResult {
  * user.md(见 memoryDir.renderForInjection / userProfile)。
  */
 export function scanMemoryContent(content: string): ScanResult {
+  // 入参守卫(MSC MEM-08):路由层把 JSON body 原样透传,content 可能是数字/对象/null。
+  // 这里是所有写路径(memoryDir.write / applyBatchCas / applyAutoAdds / writeUserProfile /
+  // projectMemoryDir.prepareCandidateBody)的共同入口,早返回 ok:false 让调用方走可控的
+  // 400 分支,而不是 `content.includes is not a function` 变成 500。
+  if (typeof content !== 'string') {
+    return { ok: false, reason: `content must be a string (got ${content === null ? 'null' : typeof content})` }
+  }
   for (const ch of INVISIBLE_CHARS) {
     if (content.includes(ch)) {
       return {

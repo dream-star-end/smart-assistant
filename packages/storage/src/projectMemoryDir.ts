@@ -287,6 +287,20 @@ export class ProjectMemoryDir {
     return { ok: true, file, sha256: sha, bytes: stored.length }
   }
 
+  /**
+   * Remove one candidate carrier file (ledger-driven retention, MSC MEM-11).
+   * Official memory/ and MEMORY.md are never touched; a missing file is a no-op.
+   * Returns whether a file was actually unlinked.
+   */
+  async removeCandidateFile(file: string): Promise<boolean> {
+    const target = this.candidateFile(file)
+    return this.withLock(async () => {
+      if (!existsSync(target)) return false
+      await rm(target, { force: true })
+      return true
+    })
+  }
+
   async copyCandidateToOfficial(
     candidateFile: string,
     officialSlug: string,

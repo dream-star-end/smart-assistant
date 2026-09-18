@@ -24,6 +24,16 @@ export const PROJECT_MEMORY_LEDGER_SCHEMA_VERSION = 1
 /** Promote actor written by the automatic path, so audits can tell it from a user. */
 export const AUTO_PROMOTE_ACTOR = 'auto-promote'
 
+/**
+ * How many already-promoted candidates (row + carrier file) to keep per slug.
+ *
+ * Every same-slug rewrite creates a candidate and auto-promotes it, so without a
+ * retention policy `tb_project_memory_candidate` and `memory-candidates/` grow
+ * linearly forever (MSC MEM-11). Only `status='promoted'` rows are pruned — pending /
+ * conflict / rejected rows and every `tb_project_memory_event` audit row are kept.
+ */
+export const PROMOTED_CANDIDATE_RETAIN_PER_SLUG = 5
+
 export const PROJECT_MEMORY_LEDGER_DDL = `
 CREATE TABLE IF NOT EXISTS tb_project_memory_event (
   id TEXT PRIMARY KEY,
@@ -516,6 +526,7 @@ export class ProjectMemoryLedger {
           `UPDATE tb_project_memory_candidate SET status = 'promoted', updated_at = ? WHERE id = ?`,
         )
         .run(Date.now(), candidate.id)
+      await this.prunePromotedCandidates(projectId, candidate.slug)
       return { ok: true, official: existing, idempotent: true }
     }
     const dir = new ProjectMemoryDir(projectId)
@@ -596,7 +607,45 @@ export class ProjectMemoryLedger {
     await incrementProjectContextVersion(projectId).catch(() => {})
     const official = this.getOfficial(projectId, candidate.slug)
     if (!official) throw new Error('official upsert vanished')
+    await this.prunePromotedCandidates(projectId, candidate.slug)
     return { ok: true, official }
+  }
+
+  /**
+   * Retention for promoted candidates of one slug (MSC MEM-11): keep the newest
+   * `keep` rows (by updated_at, then created_at), delete older rows and — when no
+   * other candidate row still references the same carrier file — the file under
+   * memory-candidates/. Audit events, official rows and non-promoted candidates
+   * are never touched; file removal is best effort (the row is already gone, so a
+   * leftover file is inert: injection / project-search only trust ledger rows).
+   */
+  private async prunePromotedCandidates(
+    projectId: string,
+    slug: string,
+    keep = PROMOTED_CANDIDATE_RETAIN_PER_SLUG,
+  ): Promise<void> {
+    const retain = Math.max(0, Math.floor(keep))
+    const rows = this.db
+      .prepare(
+        `SELECT id, file FROM tb_project_memory_candidate
+         WHERE project_id = ? AND slug = ? AND status = 'promoted'
+         ORDER BY updated_at DESC, created_at DESC, rowid DESC`,
+      )
+      .all(projectId, slug) as Array<{ id: string; file: string }>
+    const stale = rows.slice(retain)
+    if (stale.length === 0) return
+    const del = this.db.prepare('DELETE FROM tb_project_memory_candidate WHERE project_id = ? AND id = ?')
+    this.db.transaction(() => {
+      for (const row of stale) del.run(projectId, row.id)
+    })()
+    const stillReferenced = this.db.prepare(
+      'SELECT 1 FROM tb_project_memory_candidate WHERE project_id = ? AND file = ? LIMIT 1',
+    )
+    const dir = new ProjectMemoryDir(projectId)
+    for (const row of stale) {
+      if (stillReferenced.get(projectId, row.file)) continue
+      await dir.removeCandidateFile(row.file).catch(() => {})
+    }
   }
 
   reject(opts: {

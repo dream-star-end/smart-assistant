@@ -1,6 +1,6 @@
 /**
  * MSC 记忆子系统深审(docs/audit/msc-memory.md)阶段 A 红灯复现用例。
- * 每个用例对应审计文档 §4 的一条问题;阶段 B 修复后应全部转绿,届时删掉 TODO 标记。
+ * 每个用例对应审计文档 §4 的一条问题;阶段 B(t-1982)已全部修复转绿,现作为回归门保留。
  *
  * Run: npx tsx --test packages/storage/src/__tests__/mscMemoryAudit.test.ts
  */
@@ -52,7 +52,7 @@ async function countReadFiles<T>(fn: () => Promise<T>): Promise<{ result: T; rea
 }
 
 describe('MSC-memory 阶段 A 红灯用例', () => {
-  // TODO(msc-memory): 阶段 B 修复 MEM-03 —— prompt 热路径不应逐条全文读每个被索引文件;
+  // 阶段 B 已修复(t-1982) MEM-03 —— prompt 热路径不应逐条全文读每个被索引文件;
   // 过期判定只对进入注入的前 maxLines 行做(或把 expires 带进索引行 / 用 stat 缓存),
   // 修复后 readFile 次数应 ≤ maxLines + 1(索引本身)。
   it('MEM-03 renderForInjectionReadonly 的 readFile 次数不应超过 maxLines+1', async () => {
@@ -71,7 +71,7 @@ describe('MSC-memory 阶段 A 红灯用例', () => {
     )
   })
 
-  // TODO(msc-memory): 阶段 B 修复 MEM-09 —— indexRow 把 frontmatter.name 原样拼进
+  // 阶段 B 已修复(t-1982) MEM-09 —— indexRow 把 frontmatter.name 原样拼进
   // `- [name](memory/<file>)`,name 含 `](memory/x.md)` 时对账解析出的文件名被劫持。
   // 修复后 name 中的 `]`/`(`/`)` 应被转义或替换,首个 `](memory/…)` 必须指回真实文件。
   it('MEM-09 索引行的链接目标必须是真实文件,不能被 name 劫持', async () => {
@@ -90,7 +90,7 @@ describe('MSC-memory 阶段 A 红灯用例', () => {
     assert.equal(target, 'good.md', `索引行链接指向 ${target},应指向 good.md`)
   })
 
-  // TODO(msc-memory): 阶段 B 修复 MEM-08 —— write / writeUserProfile 收到非字符串 content
+  // 阶段 B 已修复(t-1982) MEM-08 —— write / writeUserProfile 收到非字符串 content
   // 时 scanMemoryContent 直接 TypeError(路由层变 500);应返回 { ok:false, error }。
   it('MEM-08 非字符串 content 应返回 ok:false 而不是抛 TypeError', async () => {
     const md = new MemoryDir('bad-type')
@@ -107,7 +107,7 @@ describe('MSC-memory 阶段 A 红灯用例', () => {
     assert.equal(u?.ok, false)
   })
 
-  // TODO(msc-memory): 阶段 B 修复 MEM-04 —— sessions_vec 在生产里没有写入方(indexPipeline
+  // 阶段 B 已修复(t-1982) MEM-04 —— sessions_vec 在生产里没有写入方(indexPipeline
   // 无调用者),hybridSessionSearch 仍对空向量表付出一次 embed() 网络调用。修复后:向量表为空
   // 时跳过 embed(或补齐写入方),且调用方上报的 retrievalMode 与实际一致。
   it('MEM-04 sessions_vec 为空时 hybridSessionSearch 不应调用 provider.embed', async () => {

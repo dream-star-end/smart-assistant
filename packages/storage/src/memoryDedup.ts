@@ -7,7 +7,6 @@
 import { MemoryDir } from './memoryDir.js'
 import { isStrongLexicalDocument } from './memoryLexical.js'
 import { isMemoryExpired } from './memoryTtl.js'
-import { parseMemoryFrontmatter } from './memoryFrontmatter.js'
 import { paths } from './paths.js'
 import { readUserProfile } from './userProfile.js'
 
@@ -40,17 +39,16 @@ export async function findStrongLexicalMemory(args: {
     // Profile is optional for dedup.
   }
 
+  // 单次快照(一次屏障 + 一次锁 + 每文件读一次)拿到元信息与全文;此前是 list() 后再逐条
+  // read(),2N 次读盘 + N+1 次跨进程锁(MSC MEM-10)。entry.expires 即 frontmatter.expires。
   const dir = new MemoryDir(args.agentId)
-  for (const meta of await dir.list()) {
-    const read = await dir.read(meta.file)
-    if (!read) continue
-    const { fm } = parseMemoryFrontmatter(read.content)
-    if (isMemoryExpired(fm.expires, args.today, ttlWarn, meta.file)) continue
-    if (isStrongLexicalDocument(query, read.content)) {
+  for (const entry of await dir.listWithContent()) {
+    if (isMemoryExpired(entry.expires, args.today, ttlWarn, entry.file)) continue
+    if (isStrongLexicalDocument(query, entry.content)) {
       return {
         hit: true,
-        path: `${dir.dirPath()}/${meta.file}`,
-        label: `${meta.name} (${meta.type})`,
+        path: `${dir.dirPath()}/${entry.file}`,
+        label: `${entry.name} (${entry.type})`,
       }
     }
   }

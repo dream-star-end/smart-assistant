@@ -56,6 +56,12 @@ export interface MemoryFileMeta {
   size: number
 }
 
+/** `listWithContent()` 的条目:元信息 + 全文 + 与 `read()` 同口径的内容指纹 version。 */
+export interface MemoryFileEntry extends MemoryFileMeta {
+  content: string
+  version: string
+}
+
 export type MemoryAutoAddResult =
   | { ok: true; created: string[] }
   | { ok: false; error: string; reason: 'exists' | 'forbidden' | 'index_mutated' | 'invalid' }
@@ -103,11 +109,23 @@ export interface MemorySharedBarrierOptions {
   retryDelayMs?: number
 }
 
+/** 单行摘要(name: message,截 200 字符),供并入超时错误 message。 */
+function summarizeError(err: unknown): string {
+  const text = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  return oneLine.length > 200 ? `${oneLine.slice(0, 199)}…` : oneLine
+}
+
 export class MemoryBarrierTimeoutError extends Error {
   readonly code = 'MEMORY_BARRIER_TIMEOUT'
 
+  /**
+   * message 会并入 `lastError` 的摘要(MSC MEM-06):屏障超时的真因往往是批次日志损坏
+   * (recoverBatchLocked 的 JSON.parse SyntaxError)之类**每次重试都失败**的错误,只报
+   * 「timed out」会把排障引向锁竞争。`lastError` 属性仍保留原始错误供程序化判别。
+   */
   constructor(message: string, readonly lastError?: unknown) {
-    super(message)
+    super(lastError === undefined ? message : `${message}; last error: ${summarizeError(lastError)}`)
     this.name = 'MemoryBarrierTimeoutError'
   }
 }
@@ -130,6 +148,20 @@ function firstNonEmptyLine(body: string): string {
 
 function ttlWarn(message: string): void {
   process.stderr.write(`[memory-ttl] ${message}\n`)
+}
+
+/**
+ * 索引行链接文本(`- [name](memory/<file>)` 里的 name)消毒:半角 `[ ] ( )` 换成全角,
+ * 使 name 里再也拼不出 `](memory/…)`;换行压平。仅影响索引行渲染,不改记忆文件本身。
+ */
+export function sanitizeIndexLinkText(name: string): string {
+  return name
+    .replace(/\r?\n/g, ' ')
+    .replace(/\[/g, '［')
+    .replace(/\]/g, '］')
+    .replace(/\(/g, '（')
+    .replace(/\)/g, '）')
+    .trim()
 }
 
 /** ascii 化 kebab slug(中文标题会被清空 → 由调用方兜底 'mem')。 */
@@ -439,15 +471,24 @@ export class MemoryDir {
 
   // ── 列表 / 读 / 写 / 删 ──────────────────────────────────────────────
 
-  /** 锁内目录快照；调用方负责先完成迁移/批恢复。 */
+  /** 锁内目录快照(仅元信息)；调用方负责先完成迁移/批恢复。 */
   private async listLocked(): Promise<MemoryFileMeta[]> {
+    return (await this.listLockedWithContent()).map((entry) => entry.meta)
+  }
+
+  /**
+   * 锁内目录快照 + 每条全文。listLocked 本来就要读全文解析 frontmatter,这里把正文一并
+   * 交出去,让需要正文的批处理(自动写去重探针)不必再逐条 read() 二次读盘 + 逐条取锁
+   * (MSC MEM-10)。
+   */
+  private async listLockedWithContent(): Promise<Array<{ meta: MemoryFileMeta; content: string }>> {
     let names: string[] = []
     try {
       names = await readdir(this.dirPath())
     } catch {
       return []
     }
-    const out: MemoryFileMeta[] = []
+    const out: Array<{ meta: MemoryFileMeta; content: string }> = []
     for (const name of names) {
       if (!MEMORY_FILE_RE.test(name)) continue
       const full = join(this.dirPath(), name)
@@ -466,17 +507,20 @@ export class MemoryDir {
       }
       const { fm, body } = parseMemoryFrontmatter(raw)
       out.push({
-        file: name,
-        name: fm.name || name.replace(/\.md$/i, ''),
-        description: fm.description || firstNonEmptyLine(body),
-        type: fm.type || 'project',
-        ...(fm.expires ? { expires: fm.expires } : {}),
-        ...(fm.source ? { source: fm.source } : {}),
-        mtimeMs: st.mtimeMs,
-        size: st.size,
+        meta: {
+          file: name,
+          name: fm.name || name.replace(/\.md$/i, ''),
+          description: fm.description || firstNonEmptyLine(body),
+          type: fm.type || 'project',
+          ...(fm.expires ? { expires: fm.expires } : {}),
+          ...(fm.source ? { source: fm.source } : {}),
+          mtimeMs: st.mtimeMs,
+          size: st.size,
+        },
+        content: raw,
       })
     }
-    out.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    out.sort((a, b) => b.meta.mtimeMs - a.meta.mtimeMs)
     return out
   }
 
@@ -489,6 +533,22 @@ export class MemoryDir {
     return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       return this.listLocked()
+    })
+  }
+
+  /**
+   * 一次屏障 + 一次锁读出全部记忆(元信息 + 全文),给需要正文的批处理用(自动写去重探针
+   * memoryDedup)。与 `list()` 同一快照口径(mtime 倒序、非法名跳过);相比 list() + 逐条
+   * read(),读盘减半、跨进程锁从 N+1 次降到 1 次(MSC MEM-10)。
+   */
+  async listWithContent(): Promise<MemoryFileEntry[]> {
+    return this.withSharedBarrier(async () => {
+      await this.ensureMigratedLocked()
+      return (await this.listLockedWithContent()).map(({ meta, content }) => ({
+        ...meta,
+        content,
+        version: sha16(content),
+      }))
     })
   }
 
@@ -747,6 +807,14 @@ export class MemoryDir {
         return { ok: false, error: `duplicate memory file: ${row.file}`, reason: 'invalid' }
       }
       seen.add(row.file)
+      // 盖章前先守卫类型(MEM-08):stampAutoMemoryFrontmatter 会先解析 frontmatter,非字符串直接 TypeError。
+      if (typeof row.content !== 'string') {
+        return {
+          ok: false,
+          error: `rejected: content must be a string (got ${typeof row.content})`,
+          reason: 'invalid',
+        }
+      }
       const content = stampAutoMemoryFrontmatter(row.content, today, {
         warn: ttlWarn,
         context: row.file,
@@ -866,7 +934,11 @@ export class MemoryDir {
 
   private indexRow(meta: { file: string; name: string; description: string }): string {
     // 整行 ≤ 150 字符:先算前缀,余量给钩子;超出截断加省略号。
-    const prefix = `- [${meta.name}](memory/${meta.file}) — `
+    // name 先经 sanitizeIndexLinkText:索引行的解析方(reconcile / 注入过滤 / 模型阅读)都以
+    // **首个** `](memory/<file>)` 为链接目标,name 里若原样保留 `]`/`(`/`)`,一条精心命名的
+    // 记忆就能把链接劫持到别的文件(MSC MEM-09)。
+    const label = sanitizeIndexLinkText(meta.name) || meta.file.replace(/\.md$/i, '')
+    const prefix = `- [${label}](memory/${meta.file}) — `
     const budget = Math.max(0, 150 - prefix.length)
     let hook = (meta.description || meta.name || '').replace(/\n/g, ' ').trim()
     if (hook.length > budget) hook = `${hook.slice(0, Math.max(0, budget - 1)).trimEnd()}…`
@@ -930,58 +1002,58 @@ export class MemoryDir {
   }
 
   /**
-   * Drop index rows whose target file has a valid `expires` before `today`.
-   * Unreadable / missing files stay (readonly drift tolerance). Invalid
-   * expires stay (fail-open) and emit a warn.
+   * Is this index row's target file expired (valid `expires` before `today`)?
+   * Unreadable / missing files count as live (readonly drift tolerance). Invalid
+   * expires stay (fail-open) and emit a warn. Rows without a valid file link are live.
    */
-  private async dropExpiredIndexLines(indexText: string, today: string): Promise<string> {
-    const out: string[] = []
-    for (const line of indexText.split('\n')) {
-      const match = line.match(/\]\(memory\/([^)]+)\)/)
-      if (!match) {
-        out.push(line)
-        continue
-      }
-      const file = match[1]
-      if (!MEMORY_FILE_RE.test(file)) {
-        out.push(line)
-        continue
-      }
-      try {
-        const raw = await readFile(join(this.dirPath(), file), 'utf-8')
-        const { fm } = parseMemoryFrontmatter(raw)
-        if (isMemoryExpired(fm.expires, today, ttlWarn, file)) continue
-      } catch {
-        // Keep dead links / unreadable files. Expiry only applies when we can read.
-      }
-      out.push(line)
+  private async isIndexLineExpired(line: string, today: string): Promise<boolean> {
+    const match = line.match(/\]\(memory\/([^)]+)\)/)
+    if (!match) return false
+    const file = match[1]
+    if (!MEMORY_FILE_RE.test(file)) return false
+    try {
+      const raw = await readFile(join(this.dirPath(), file), 'utf-8')
+      const { fm } = parseMemoryFrontmatter(raw)
+      return isMemoryExpired(fm.expires, today, ttlWarn, file)
+    } catch {
+      return false // Keep dead links / unreadable files. Expiry only applies when we can read.
     }
-    return out.join('\n')
   }
 
   /**
-   * 把索引文本滤成可注入正文:跳过 marker/空行,逐行 scan,超 cap 按行边界截断。
-   * 两条注入路径共用,保证截断/扫描口径一致。
+   * 把索引文本滤成可注入正文:跳过 marker/空行,逐行 scan,剔除已过期行,超 cap 按行边界截断。
+   * 两条注入路径共用,保证截断/扫描/过期口径一致。
+   *
+   * 过期校验要读盘,所以**边选边校验、选满即停**:只对真正会进入注入的前 maxLines 行读文件
+   * (外加被判过期而跳过的行),而不是先对全部索引行逐文件读盘再截断(MSC MEM-03:600 条记忆
+   * 每 turn 601 次 readFile)。选满后仍有候选行 → 视为截断,附提示行(不再读盘去判断剩余行
+   * 是否全部过期,这点不精确换热路径 IO 上界 = maxLines)。
    */
-  private formatIndexLinesForInjection(
+  private async selectIndexLinesForInjection(
     indexText: string,
     maxChars: number,
     maxLines: number,
-  ): string | null {
+    today: string,
+  ): Promise<string | null> {
     const kept: string[] = []
+    let overflow = false
     for (const line of indexText.split('\n')) {
       const t = line.trim()
       if (t === '' || t === MEMDIR_INDEX_MARKER) continue
       if (!scanMemoryContent(line).ok) continue // 读侧权威扫描:剔除注入行
+      if (kept.length >= maxLines) {
+        overflow = true
+        break
+      }
+      if (await this.isIndexLineExpired(line, today)) continue
       kept.push(line)
     }
     if (kept.length === 0) return null
     const notice = '\n…（索引已截断，用 `oc-memory core-search` 查完整列表）'
-    const lineLimited = kept.length > maxLines ? kept.slice(0, maxLines) : kept
-    let result = lineLimited.join('\n')
-    if (kept.length <= maxLines && result.length <= maxChars) return result
+    const result = kept.join('\n')
+    if (!overflow && result.length <= maxChars) return result
     const budget = Math.max(0, maxChars - notice.length)
-    return this.truncateAtLine(lineLimited, budget) + notice
+    return this.truncateAtLine(kept, budget) + notice
   }
 
   /**
@@ -1002,8 +1074,7 @@ export class MemoryDir {
       await this.ensureMigratedLocked()
       const indexText = await this.reconcileIndexLocked()
       const today = opts?.today ?? memoryCalendarDate()
-      const filtered = await this.dropExpiredIndexLines(indexText, today)
-      return this.formatIndexLinesForInjection(filtered, maxChars, maxLines)
+      return this.selectIndexLinesForInjection(indexText, maxChars, maxLines, today)
     })
   }
 
@@ -1024,8 +1095,7 @@ export class MemoryDir {
     try {
       const raw = await readFile(this.indexPath(), 'utf-8')
       const today = opts?.today ?? memoryCalendarDate()
-      const filtered = await this.dropExpiredIndexLines(normalizeEol(raw), today)
-      return this.formatIndexLinesForInjection(filtered, maxChars, maxLines)
+      return await this.selectIndexLinesForInjection(normalizeEol(raw), maxChars, maxLines, today)
     } catch {
       return null
     }
