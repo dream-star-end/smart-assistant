@@ -683,6 +683,71 @@ describe("MemoryPanel · 用户画像（单文本编辑）", () => {
     expect(put.mock.calls[1][4]).toBe("u2"); // 冲突刷新出的最新 version
   });
 
+  // MSC MEM-01:limit 只对 <!-- oc-user-always --> 注入块生效;全文长度不再禁用保存。
+  test("MEM-01：全文超过 limit 但常驻注入块很小 → 保存不禁用，预算条按注入块计", async () => {
+    mockIndex([]);
+    const always = "简洁回答";
+    const big = `${"背景资料".repeat(1500)}\n<!-- oc-user-always:start -->\n${always}\n<!-- oc-user-always:end -->`;
+    expect(big.length).toBeGreaterThan(4000);
+    vi.spyOn(api, "getMemory").mockResolvedValue({
+      target: "user",
+      text: big,
+      version: "u1",
+      charCount: big.length,
+      alwaysCharCount: always.length,
+      limit: 4000,
+    });
+    const put = vi.spyOn(api, "putMemory").mockResolvedValue({ ok: true, version: "u2", alwaysCharCount: 9 });
+
+    renderPanel();
+    openProfileTab();
+    const box = (await screen.findByRole("textbox", { name: "用户画像" })) as HTMLTextAreaElement;
+    // 未改动:显示服务端回的注入块字数;全文字数只展示
+    expect(screen.getByText(`常驻注入 ${always.length}/4000`)).toBeInTheDocument();
+    expect(screen.getByText(`${big.length} 字符`)).toBeInTheDocument();
+    expect(screen.queryByText(/已超出字符预算/)).not.toBeInTheDocument();
+
+    // 改动后(仍 >4000 全文)保存按钮可用,并真的发出 PUT
+    fireEvent.change(box, { target: { value: `${big} 补充` } });
+    const save = screen.getByRole("button", { name: "保存" });
+    expect(save).not.toBeDisabled();
+    fireEvent.click(save);
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put.mock.calls[0][3]).toBe(`${big} 补充`);
+  });
+
+  test("MEM-01：常驻注入块本身超预算 → 只警示会被截断，仍可保存", async () => {
+    mockIndex([]);
+    mockUser("称呼：dx");
+    const put = vi.spyOn(api, "putMemory").mockResolvedValue({ ok: true, version: "u2" });
+
+    renderPanel();
+    openProfileTab();
+    const box = (await screen.findByDisplayValue("称呼：dx")) as HTMLTextAreaElement;
+    const huge = `<!-- oc-user-always:start -->\n${"多".repeat(4500)}\n<!-- oc-user-always:end -->`;
+    fireEvent.change(box, { target: { value: huge } });
+    // 编辑中本地实时算注入块长度
+    const budget = screen.getByText("常驻注入 4500/4000");
+    expect(budget).toHaveClass("text-danger");
+    expect(budget).toHaveAttribute("title", expect.stringContaining("超出部分注入时会被截断"));
+    const save = screen.getByRole("button", { name: "保存" });
+    expect(save).not.toBeDisabled();
+    fireEvent.click(save);
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+  });
+
+  test("MEM-01：没有常驻注入块时明确标出，不按全文禁用保存", async () => {
+    mockIndex([]);
+    mockUser("背景".repeat(3000)); // 6000 字全文,无 always 块
+    renderPanel();
+    openProfileTab();
+    const box = (await screen.findByRole("textbox", { name: "用户画像" })) as HTMLTextAreaElement;
+    expect(screen.getByText("无常驻注入块")).toBeInTheDocument();
+    expect(screen.getByText("6000 字符")).toBeInTheDocument();
+    fireEvent.change(box, { target: { value: `${box.value}x` } });
+    expect(screen.getByRole("button", { name: "保存" })).not.toBeDisabled();
+  });
+
   test("画像加载失败给出重试出口", async () => {
     mockIndex([]);
     const get = vi.spyOn(api, "getMemory").mockRejectedValue(new ApiError({ status: 500, message: "boom" }));
@@ -888,20 +953,30 @@ describe("MemoryPanel · 读失败不再与空态并排", () => {
 });
 
 describe("MemoryPanel · 用户画像字数口径", () => {
-  test("计数与超限判定同一口径：超过限额时显示的数字与 title 里的一致，不会跳", async () => {
+  // MSC MEM-01 之后:limit 只对 oc-user-always 注入块生效,全文字数纯展示、不参与超限判定,
+  // 保存也不再因长度禁用。这里锁住「全文计数口径不跳(归一换行、不 trim)」+「跨过 limit 也不禁用」。
+  test("全文计数不 trim、跨过 limit 不跳也不禁用保存；注入块预算单独显示", async () => {
     mockIndex([]);
     vi.spyOn(api, "getMemory").mockResolvedValue({ target: "user", text: "abc", version: "u1", limit: 5 });
     renderPanel();
     openProfileTab();
     const box = (await screen.findByDisplayValue("abc")) as HTMLTextAreaElement;
-    expect(screen.getByText(/^3\/5 字符$/)).toBeInTheDocument();
+    expect(screen.getByText(/^3 字符$/)).toBeInTheDocument();
+    expect(screen.getByText("无常驻注入块")).toBeInTheDocument();
 
-    // 首尾空白也算字符（后端按 limit 比较的是原文长度）：改造前正常态 trim 后计数、超限态又换成
-    // text.length，跨过限额那一刻数字会跳。
+    // 首尾空白也算字符;全文 7 > limit 5 时既不变色也不禁用保存(全文不是预算对象)
     fireEvent.change(box, { target: { value: " abcde " } });
-    expect(screen.getByText(/^7\/5 字符$/)).toBeInTheDocument();
+    expect(screen.getByText(/^7 字符$/)).toBeInTheDocument();
     const save = screen.getByRole("button", { name: "保存" });
-    expect(save).toBeDisabled();
-    expect(save).toHaveAttribute("title", expect.stringContaining("（7/5）"));
+    expect(save).not.toBeDisabled();
+    expect(save).not.toHaveAttribute("title");
+
+    // 注入块预算与全文计数分离:块 6 字 > limit 5 → 预算条变 danger 但仍可保存
+    fireEvent.change(box, {
+      target: { value: "前言\n<!-- oc-user-always:start -->\nabcdef\n<!-- oc-user-always:end -->" },
+    });
+    const budget = screen.getByText("常驻注入 6/5");
+    expect(budget).toHaveClass("text-danger");
+    expect(screen.getByRole("button", { name: "保存" })).not.toBeDisabled();
   });
 });

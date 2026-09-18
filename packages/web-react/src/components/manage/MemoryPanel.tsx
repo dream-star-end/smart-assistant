@@ -1693,11 +1693,33 @@ function NewMemoryFileDialog({
 
 // ── 用户画像（单文本编辑 + 409） ─────────────────────────────────────────────
 
+const USER_ALWAYS_START = "<!-- oc-user-always:start -->";
+const USER_ALWAYS_END = "<!-- oc-user-always:end -->";
+
+/**
+ * user.md 里会被注入 prompt 的 `oc-user-always` 块（单个合法块，trim 后）的字符数；无块 / 块非法 → 0。
+ * 与后端 promptSlots.userProfileAlwaysCharCount 同口径：编辑期间本地实时算，落盘后以服务端回的
+ * `alwaysCharCount` 为准。只有这一段受注入预算 `limit` 约束；全文长度不是保存上限。
+ */
+export function countUserAlwaysChars(text: string): number {
+  if (text.split(USER_ALWAYS_START).length - 1 !== 1) return 0;
+  if (text.split(USER_ALWAYS_END).length - 1 !== 1) return 0;
+  const start = text.indexOf(USER_ALWAYS_START);
+  const end = text.indexOf(USER_ALWAYS_END);
+  if (start < 0 || end <= start) return 0;
+  const body = text.slice(start + USER_ALWAYS_START.length, end);
+  if (body.includes(USER_ALWAYS_START) || body.includes(USER_ALWAYS_END)) return 0;
+  return body.trim().length;
+}
+
 function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: string }) {
   const [text, setText] = useState("");
   // baseline = 最近一次已知的服务端权威态（text + 乐观锁 version），冲突后刷新到最新。
   const [baseline, setBaseline] = useState<{ text: string; version: string }>({ text: "", version: "" });
-  const [limit, setLimit] = useState(0); // 字符预算（来自 GET）；0 = 不强制。
+  // 注入预算（来自 GET，对 oc-user-always 块生效）；0 = 未知/不展示。**不是**保存上限（MEM-01）。
+  const [limit, setLimit] = useState(0);
+  // 服务端算的 always 块字符数（GET/PUT 回传）；null = 旧后端没回，本地算。
+  const [serverAlwaysChars, setServerAlwaysChars] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   /**
    * 本轮 GET 真的成功过 —— 渲染编辑器的**唯一**许可。
@@ -1736,6 +1758,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
         setText(t);
         setBaseline({ text: t, version: d.version ?? "" });
         setLimit(typeof d.limit === "number" ? d.limit : 0);
+        setServerAlwaysChars(typeof d.alwaysCharCount === "number" ? d.alwaysCharCount : null);
         setLoaded(true);
       })
       .catch((e) => {
@@ -1751,10 +1774,13 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
 
   const norm = (s: string) => s.replace(/\r\n/g, "\n");
   const dirty = norm(text) !== norm(baseline.text);
-  // 计数与超限判定用同一口径（归一换行、不 trim）：改造前正常态显示 trim 后长度、
-  // 超限态切成未 trim 的 text.length，跨过限额那一刻数字会跳。
+  // 全文计数（归一换行、不 trim）只做展示：memdir 下画像存多少都不拒，保存永不因长度禁用。
   const chars = norm(text).length;
-  const overLimit = limit > 0 && chars > limit;
+  // 注入预算只对 oc-user-always 块计（MEM-01）：未改动时用服务端回的数，编辑中本地实时算（同口径）。
+  const alwaysChars = !dirty && serverAlwaysChars !== null ? serverAlwaysChars : countUserAlwaysChars(norm(text));
+  const hasAlwaysBlock = alwaysChars > 0;
+  // 超预算 = 注入时会被截断的提示，不阻止保存。
+  const alwaysOverLimit = limit > 0 && alwaysChars > limit;
 
   const save = useCallback(async () => {
     // 第二道防线（第一道是"没 loaded 就不渲染编辑器"，所以这条从 UI 走不到）。留着是因为
@@ -1771,6 +1797,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
       const res = await api.putMemory(auth, agentId, "user", text, baseline.version || undefined);
       if (res.ok) {
         setBaseline({ text, version: res.version });
+        setServerAlwaysChars(typeof res.alwaysCharCount === "number" ? res.alwaysCharCount : null);
         setServerLatest(null);
         setSaved(true);
         setTimeout(() => setSaved(false), 1500);
@@ -1778,6 +1805,9 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
       }
       // 版本冲突:刷新基线到服务端最新态(下次 PUT 带新 version 才写得进),保留用户当前编辑。
       setBaseline({ text: res.conflict.text, version: res.conflict.version });
+      setServerAlwaysChars(
+        typeof res.conflict.alwaysCharCount === "number" ? res.conflict.alwaysCharCount : null,
+      );
       setServerLatest(res.conflict.text);
       setNotice("智能体在你编辑期间更新了用户画像。再次保存将以你的版本为准；也可以放弃当前修改、载入最新内容。");
     } catch (e) {
@@ -1862,24 +1892,26 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
             placeholder="例如：称呼、职业背景、常用项目与偏好、沟通风格…"
             className="min-h-32 resize-y"
           />
-          <div className="flex items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={save}
-              loading={saving}
-              disabled={!dirty || overLimit}
-              title={
-                overLimit ? `已超出字符预算（${chars}/${limit}），请精简后再保存` : undefined
-              }
-            >
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="primary" size="sm" onClick={save} loading={saving} disabled={!dirty}>
               {saved ? <Check size={14} /> : null}
               {saved ? "已保存" : "保存"}
             </Button>
-            <span className={cn("text-caption", overLimit ? "font-medium text-danger" : "text-muted")}>
-              {chars}
-              {limit > 0 ? `/${limit}` : ""} 字符
-            </span>
+            <span className="text-caption text-muted">{chars} 字符</span>
+            {limit > 0 && (
+              <span
+                className={cn("text-caption", alwaysOverLimit ? "font-medium text-danger" : "text-muted")}
+                title={
+                  hasAlwaysBlock
+                    ? alwaysOverLimit
+                      ? `常驻注入块超出注入预算（${alwaysChars}/${limit}），超出部分注入时会被截断；仍可保存`
+                      : `只有 <!-- oc-user-always:start/end --> 块会注入到每轮提示词，预算 ${limit} 字符`
+                    : "画像里没有 <!-- oc-user-always:start/end --> 块：全文仅供检索，不会注入到每轮提示词"
+                }
+              >
+                {hasAlwaysBlock ? `常驻注入 ${alwaysChars}/${limit}` : "无常驻注入块"}
+              </span>
+            )}
             <span className="sr-only" aria-live="polite">
               {saved ? "已保存" : ""}
             </span>
