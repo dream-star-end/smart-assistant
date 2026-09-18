@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSchedule, cronHuman, scheduleToPreset } from "./cron";
+import { buildSchedule, cronHuman, describeNextRun, scheduleToPreset } from "./cron";
 
 describe("cronHuman", () => {
   it("每天定点", () => expect(cronHuman("0 9 * * *")).toBe("每天 09:00"));
@@ -17,8 +17,23 @@ describe("cronHuman", () => {
   it("时位步进且分位 * → 每 N 小时", () => expect(cronHuman("* */6 * * *")).toBe("每 6 小时"));
   it("时位步进带分钟 0 → 每 N 小时的第 0 分(不臆测收整)", () =>
     expect(cronHuman("0 */2 * * *")).toBe("每 2 小时的第 0 分"));
+  // ── 区间（a-b）支持：周位 / 时位（X-03：巡检排程此前整串回退）──
+  it("周区间 → 每周一至五", () => expect(cronHuman("0 9 * * 1-5")).toBe("每周一至五 09:00"));
+  it("周区间 + 单日混排", () => expect(cronHuman("0 9 * * 1-3,6")).toBe("每周一至三、六 09:00"));
+  it("巡检排程：分位步进 + 时段 + 周区间", () =>
+    expect(cronHuman("*/30 9-19 * * 1-5")).toBe("每周一至五 9–19 点每 30 分钟"));
+  it("时段 + 分位整数 → 每小时第 M 分", () => expect(cronHuman("0 9-18 * * *")).toBe("每天 9–18 点每小时第 0 分"));
+  it("时段 + 分位 * → 每分钟", () => expect(cronHuman("* 9-18 * * *")).toBe("每天 9–18 点每分钟"));
+  it("分位步进 + 周区间（时位 *）", () => expect(cronHuman("*/30 * * * 1-5")).toBe("每周一至五 每 30 分钟"));
+  it("时位步进 + 单个星期", () => expect(cronHuman("0 */2 * * 1")).toBe("每周一 每 2 小时的第 0 分"));
   // ── 无法明确表达的复杂形态 → 回退原串，不臆测 ──
-  it("range 字段回退", () => expect(cronHuman("0 9 * * 1-5")).toBe("0 9 * * 1-5"));
+  it("周区间倒序回退", () => expect(cronHuman("0 9 * * 5-1")).toBe("0 9 * * 5-1"));
+  it("周区间越界回退", () => expect(cronHuman("0 9 * * 1-9")).toBe("0 9 * * 1-9"));
+  it("时段倒序回退", () => expect(cronHuman("*/30 19-9 * * *")).toBe("*/30 19-9 * * *"));
+  it("时段 + 固定日回退", () => expect(cronHuman("*/15 9-18 1 * *")).toBe("*/15 9-18 1 * *"));
+  it("时段 + 分位复杂回退", () => expect(cronHuman("1-5 9-18 * * *")).toBe("1-5 9-18 * * *"));
+  it("日与周同时限定回退（任一命中即执行，一句说不清）", () =>
+    expect(cronHuman("0 8 15 6 1")).toBe("0 8 15 6 1"));
   it("分位步进 + 固定时位回退(歧义)", () => expect(cronHuman("*/15 9 * * *")).toBe("*/15 9 * * *"));
   it("时位步进 + 固定日回退", () => expect(cronHuman("0 */2 15 * *")).toBe("0 */2 15 * *"));
   it("日位 step 回退", () => expect(cronHuman("0 9 */2 * *")).toBe("0 9 */2 * *"));
@@ -78,5 +93,40 @@ describe("scheduleToPreset", () => {
     expect(scheduleToPreset("99 9 * * *")).toBeNull();
     expect(scheduleToPreset("")).toBeNull();
     expect(scheduleToPreset(undefined)).toBeNull();
+  });
+});
+
+describe("describeNextRun", () => {
+  const now = Date.parse("2026-09-07T12:00:00.000Z");
+
+  it("future → 下次 + 绝对 title", () => {
+    const at = new Date(now + 2 * 60 * 60_000).toISOString();
+    const d = describeNextRun(at, now);
+    expect(d.kind).toBe("future");
+    expect(d.label).toBe("下次");
+    expect(d.title).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+
+  it("overdue < 5min → 即将执行", () => {
+    const at = new Date(now - 2 * 60_000).toISOString();
+    const d = describeNextRun(at, now);
+    expect(d).toMatchObject({ kind: "soon", label: "即将执行" });
+    expect(d.title).toBeTruthy();
+  });
+
+  it("overdue ≥ 5min → 已过点 · 原定 HH:mm", () => {
+    const past = new Date(now - 90 * 60_000);
+    const d = describeNextRun(past.toISOString(), now);
+    const hh = String(past.getHours()).padStart(2, "0");
+    const mm = String(past.getMinutes()).padStart(2, "0");
+    expect(d.kind).toBe("overdue");
+    expect(d.label).toBe(`已过点 · 原定 ${hh}:${mm}`);
+    expect(d.title).toContain(`${hh}:${mm}`);
+  });
+
+  it("missing nextRunAt → 下次时间未知", () => {
+    expect(describeNextRun(null, now)).toEqual({ kind: "unknown", label: "下次时间未知" });
+    expect(describeNextRun(undefined, now)).toEqual({ kind: "unknown", label: "下次时间未知" });
+    expect(describeNextRun("", now)).toEqual({ kind: "unknown", label: "下次时间未知" });
   });
 });

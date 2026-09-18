@@ -280,11 +280,12 @@ export function InvoicesTab({
                         checked ? "border-accent/50 bg-accent-soft" : "border-border hover:bg-hover",
                       )}
                     >
+                      {/* 整行 label 即命中区；复选框本体 16px 在触屏上难看清也难点准，升到 20px（审计 SET-11）。 */}
                       <input
                         type="checkbox"
                         checked={checked}
                         onChange={() => toggleOrder(pk)}
-                        className="size-4 shrink-0 accent-[var(--accent,#6d5efc)]"
+                        className="size-5 shrink-0 accent-[var(--accent,#6d5efc)]"
                       />
                       <span className="min-w-0 flex-1">
                         <span className="block truncate font-mono text-meta text-fg">

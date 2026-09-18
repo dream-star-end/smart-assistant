@@ -47,6 +47,9 @@ function fixture(): {
   const auth = join(authDir, 'api-key')
   const capture = join(dir, 'capture')
   const binDir = join(dir, 'bin')
+  const home = join(dir, 'home')
+  const ocHome = join(home, '.openclaude')
+  mkdirSync(ocHome, { recursive: true })
   mkdirSync(authDir)
   mkdirSync(capture)
   mkdirSync(binDir)
@@ -69,7 +72,7 @@ if [ "\${OC_CURSOR_TEST_STDERR:-0}" = 1 ]; then
   printf 'FAKE_DEBUG_LINE\\n' >&2
 fi
 if [ -L "$HOME/.config/cursor/chats" ]; then
-  readlink "$HOME/.config/cursor/chats" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+  /usr/bin/readlink "$HOME/.config/cursor/chats" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
 elif [ -e "$HOME/.config/cursor/chats" ]; then
   printf '%s\\n' "not-symlink" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
 else
@@ -96,6 +99,7 @@ if [ -n "\${OC_CURSOR_TEST_FAIL_ON_KEY:-}" ] && [ "\${CURSOR_API_KEY}" = "\${OC_
 fi
 if [ "\${OC_CURSOR_TEST_SLEEP:-0}" = 1 ]; then
   trap 'printf term > "$OC_CURSOR_TEST_CAPTURE/term"; exit 143' TERM
+  : > "$OC_CURSOR_TEST_CAPTURE/ready"
   while :; do sleep 1; done
 fi
 if [ "\${OC_CURSOR_TEST_ORPHAN:-0}" = 1 ]; then
@@ -189,6 +193,8 @@ esac
     capture,
     env: {
       ...process.env,
+      HOME: home,
+      OPENCLAUDE_HOME: ocHome,
       PATH: `${binDir}:${process.env.PATH ?? ''}`,
       OC_CURSOR_TEST_CAPTURE: capture,
       OC_CURSOR_ALLOW_LEGACY_POOL: '1',
@@ -510,9 +516,11 @@ describe('oc-cursor wrapper', () => {
       env: { ...f.env, OC_CURSOR_TEST_SLEEP: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'child-routes')); i += 1) {
+    // Opening child-routes precedes printf; ready follows the write and TERM trap.
+    for (let i = 0; i < 100 && !existsSync(join(f.capture, 'ready')); i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20))
     }
+    assert.ok(existsSync(join(f.capture, 'ready')), 'first CLI did not become ready')
     assert.equal(readFileSync(join(f.capture, 'child-routes'), 'utf8').trim(), 'direct')
 
     const second = spawn(f.wrapper, ['--', 'switch attempt'], {
@@ -834,13 +842,12 @@ describe('oc-cursor wrapper', () => {
       })
       assert.equal(result.status, 0, result.stderr)
     }
-    // Only the three catalogued 3.8 efforts are allowlisted: no Fast twin,
-    // no xhigh, and no other Gemini generation (3.7 / 3.6 / 3.1 Pro).
+    // Only catalogued Gemini ids are allowlisted: no 3.8 Fast/xhigh twins,
+    // and no unprobed generations (3.7). 3.1 Pro is a separate Sand family.
     for (const model of [
       'gemini-3.8-flash-high-fast',
       'gemini-3.8-flash-xhigh',
       'gemini-3.7-flash-high',
-      'gemini-3.1-pro',
     ]) {
       const blocked = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
         cwd: f.dir,
@@ -850,6 +857,31 @@ describe('oc-cursor wrapper', () => {
       assert.equal(blocked.status, 2, model)
       assert.match(blocked.stderr, /model is not allowlisted/)
     }
+  })
+
+  test('accepts Sand-probed Haiku 4.5, Gemini 3.1 Pro and GPT-5.6 Luna ids', () => {
+    const f = fixture()
+    for (const model of [
+      'claude-haiku-4-5',
+      'gemini-3.1-pro',
+      'gpt-5.6-luna-low',
+      'gpt-5.6-luna-high-fast',
+      'gpt-5.6-luna-max',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, `${model}: ${result.stderr}`)
+    }
+    const blocked = spawnSync(f.wrapper, ['--model', 'gpt-5.6-luna-none', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(blocked.status, 2)
+    assert.match(blocked.stderr, /model is not allowlisted/)
   })
 
   test('does not assume an undocumented Cursor API-key prefix', () => {
@@ -936,10 +968,13 @@ describe('oc-cursor wrapper', () => {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       const homeFile = join(f.capture, 'home')
+      // Startup output precedes trap installation; Stop waits for the trap itself.
+      const readyFile = join(f.capture, 'ready')
       for (let i = 0; i < 40; i += 1) {
-        if (spawnSync('test', ['-f', homeFile]).status === 0) break
+        if (existsSync(readyFile)) break
         await new Promise((resolveReady) => setTimeout(resolveReady, 50))
       }
+      assert.ok(existsSync(readyFile), 'fake CLI did not install its TERM trap')
       assert.equal(spawnSync('test', ['-f', homeFile]).status, 0, 'fake CLI did not start')
       child.kill('SIGTERM')
       const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(

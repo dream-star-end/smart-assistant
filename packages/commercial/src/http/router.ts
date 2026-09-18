@@ -20,6 +20,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 // request logger. master HTTP segment is the ONLY commercial path that reads
 // X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
 import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
+import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
@@ -247,6 +248,8 @@ import { dispatchPluginsRoute } from './plugins.js'
 import {
   handleCreateMyApiKey,
   handleGetMyApiKeyUsage,
+  handleListMyApiKeyUsageRecent,
+  handleListMyApiKeyMessages,
   handleListMyApiKeys,
   handleRevokeMyApiKey,
   handleUpdateMyApiKey,
@@ -322,6 +325,7 @@ import {
   handleDesktopTokenMint,
   handleDesktopTokenRefresh,
 } from './desktopEnroll.js'
+import { handleDesktopBootstrap, handleDesktopRuntimeManifest } from './desktopBootstrap.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
 import { dispatchOrgRoute } from './org/routes.js'
@@ -438,6 +442,11 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // ─── host agent RCE 面 ───
   // /api/agents GET(列表 host agents)+ POST(创建 host agent);两者都不该给 user
   { re: /^\/api\/agents$/, label: '/api/agents' },
+  { re: /^\/api\/collaboration-config$/, label: '/api/collaboration-config' },
+  // Advisor consult is container-local authenticated MCP (parent turn token +
+  // invocation). It is not a commercial browser/host proxy surface. All methods
+  // are denied for ordinary users so a leaked path cannot execute on the host.
+  { re: /^\/api\/agents\/advisor\/consult$/, label: '/api/agents/advisor/consult' },
   // /api/agents/:id GET/PUT/DELETE —— 读 host agent 元信息、改 model/persona、删 agent
   { re: /^\/api\/agents\/[^/]+$/, label: '/api/agents/:id' },
   // /api/agents/:id/persona GET/PUT —— 读/写 host agent CLAUDE.md
@@ -697,6 +706,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/desktop/enroll/start', handler: handleDesktopEnrollStart },
     { method: 'POST', path: '/api/desktop/enroll/confirm', handler: handleDesktopEnrollConfirm },
     { method: 'POST', path: '/api/desktop/enroll/finish', handler: handleDesktopEnrollFinish },
+    { method: 'GET', path: '/api/desktop/bootstrap', handler: handleDesktopBootstrap },
+    { method: 'GET', path: '/api/desktop/runtime-manifest', handler: handleDesktopRuntimeManifest },
     { method: 'POST', path: '/api/desktop/token', handler: handleDesktopTokenMint },
     { method: 'POST', path: '/api/desktop/token/refresh', handler: handleDesktopTokenRefresh },
     { method: 'POST', path: '/api/desktop/revoke', handler: handleDesktopRevoke },
@@ -742,6 +753,11 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/me/api-keys', handler: handleListMyApiKeys },
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
     { method: 'GET', path: '/api/me/api-keys/usage', handler: handleGetMyApiKeyUsage },
+    //   GET    /api/me/api-keys/usage/recent → 最近明细游标分页(admin;window / key_id / before / limit)
+    //   注册在 `/usage` 之后,两者同为 exact path,互不吞噬。
+    { method: 'GET', path: '/api/me/api-keys/usage/recent', handler: handleListMyApiKeyUsageRecent },
+    //   GET    /api/me/api-keys/messages  → 0279 外接请求用户消息审计(admin;key_id / before / limit / errors_only)
+    { method: 'GET', path: '/api/me/api-keys/messages', handler: handleListMyApiKeyMessages },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
     { method: 'PATCH', pathPrefix: '/api/me/api-keys/', handler: handleUpdateMyApiKey },
     // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
@@ -1603,6 +1619,8 @@ export const COMMERCIAL_PRE_ROUTE_PATHS: readonly {
 }[] = [
   { path: '/api/anthropic/v1/messages', kind: 'exact', requiresPrefix: true },
   { path: '/api/anthropic/v1/messages/count_tokens', kind: 'exact', requiresPrefix: true },
+  { path: '/api/anthropic/v1/models', kind: 'exact', requiresPrefix: true },
+  { path: '/api/anthropic/v1/usage', kind: 'exact', requiresPrefix: true },
   { path: '/api/file', kind: 'prefix', requiresPrefix: false },
   { path: '/api/media/', kind: 'prefix', requiresPrefix: false },
 ]
@@ -1699,6 +1717,51 @@ export function createCommercialHandler(
     //     而**不是** 404。部署故障不该伪装成"用户 URL 写错了",保留运维可见性。
     // count_tokens 同样进 external proxy(handler 内按 allowCountTokens 决定是否放行);
     // 前缀 `/api/anthropic` 剥掉后交给 handler 自己的白名单。
+    // 2026-09-07 外接模型发现:`GET /api/anthropic/v1/models`(Anthropic / OpenAI 兼容
+    // list 形状,公开 id 无引擎前缀)。给本地 Claude Code / CC Switch「获取模型」用。
+    // 2026-09-08 外接用量:`GET /api/anthropic/v1/usage`(余额 + 单 key 消耗,给 CC Switch
+    // 「用量查询」脚本用)。两者鉴权都走与 /v1/messages 同一条 API key 链(见
+    // http/proxy/externalModels.ts / externalUsage.ts),不做 UA 门控。装配失败语义与
+    // messages 一致:未注入 → 503 EXTERNAL_PROXY_UNAVAILABLE。
+    const externalReadOnly =
+      path === '/api/anthropic/v1/models'
+        ? { route: '__cc_external_models__', handler: deps.externalApiKeyModels }
+        : path === '/api/anthropic/v1/usage'
+          ? { route: '__cc_external_usage__', handler: deps.externalApiKeyUsage }
+          : null
+    if (externalReadOnly) {
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const mdLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
+        requestId,
+        route: externalReadOnly.route,
+        method,
+        path,
+        clientIp: clientIpOf(req),
+      })
+      if (!externalReadOnly.handler) {
+        mdLog.error('cc_external_readonly_not_assembled')
+        sendError(
+          res,
+          503,
+          'EXTERNAL_PROXY_UNAVAILABLE',
+          'external api key endpoint not available',
+          requestId,
+        )
+        incrGatewayRequest(externalReadOnly.route, method, res.statusCode)
+        return true
+      }
+      req.headers[REQUEST_ID_HEADER] = requestId
+      try {
+        await externalReadOnly.handler(req, res)
+      } catch (err) {
+        handleError(err, res, requestId, mdLog)
+      }
+      incrGatewayRequest(externalReadOnly.route, method, res.statusCode)
+      return true
+    }
+
     if (
       method === 'POST' &&
       (path === '/api/anthropic/v1/messages' || path === '/api/anthropic/v1/messages/count_tokens')
@@ -1833,6 +1896,14 @@ export function createCommercialHandler(
               selfHostId: selfHostIdForProxy,
               getHostById: computePoolGetHostById,
               tunnelDial: defaultTunnelDial,
+              lookupCollabSessionParent: async ({ uid, sessionId }) => {
+                const row = await getClientSessionCollabParent(sessionId, `c:${uid.toString()}`)
+                if (!row) return null
+                return {
+                  agentId: row.agentId,
+                  ...(row.modelId ? { modelId: row.modelId } : {}),
+                }
+              },
             },
             BigInt(claims.sub),
           )

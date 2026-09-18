@@ -4,6 +4,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceMyPublish } from "../lib/types";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { expectAriaControlsResolvable } from "../test/ariaControls";
+import { ToastProvider } from "./ui";
 
 const monitor = vi.hoisted(() => ({
   emit: null as null | ((transition: { previousStatus: "pending"; publish: MarketplaceMyPublish }) => void),
@@ -65,7 +66,17 @@ vi.mock("./marketplace/BrowsePanel", () => ({
   ),
 }));
 vi.mock("./marketplace/InstalledPanel", () => ({ InstalledPanel: () => <div>installed</div> }));
-vi.mock("./marketplace/PublishPanel", () => ({ PublishPanel: () => <div>publish</div> }));
+// 假发布面板暴露 onDirtyChange:验证壳层在"草稿有内容时关弹窗"给出暂存提示(K-01)。
+vi.mock("./marketplace/PublishPanel", () => ({
+  PublishPanel: ({ onDirtyChange }: { onDirtyChange?: (dirty: boolean) => void }) => (
+    <div>
+      publish
+      <button type="button" onClick={() => onDirtyChange?.(true)}>
+        mark-dirty
+      </button>
+    </div>
+  ),
+}));
 vi.mock("./marketplace/ReviewPanel", () => ({ ReviewPanel: () => <div>review</div> }));
 
 import { MarketplaceCenter } from "./MarketplaceCenter";
@@ -95,6 +106,31 @@ afterEach(() => {
   vi.clearAllMocks();
   monitor.emit = null;
   monitor.catalogChange = null;
+});
+
+test("发布草稿有内容时按 Esc 关弹窗:仍关闭(草稿已落盘),并 toast 提示已暂存(K-01)", () => {
+  const onClose = vi.fn();
+  render(
+    <ToastProvider>
+      <MarketplaceCenter
+        open
+        tab="publish"
+        auth={auth}
+        isAdmin={false}
+        onTabChange={() => {}}
+        onClose={onClose}
+      />
+    </ToastProvider>,
+  );
+  // 干净表单按 Esc:直接关,不提示。
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText(/发布草稿已暂存/)).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "mark-dirty" }));
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  expect(onClose).toHaveBeenCalledTimes(2);
+  expect(screen.getByText(/发布草稿已暂存，下次打开「发布」可以接着填/)).toBeInTheDocument();
 });
 
 test("目录 revision 变化会刷新跨客户端市场和发布状态", () => {
@@ -186,8 +222,30 @@ test("未登录态给带出口的空态,而不是一行居中灰字", () => {
   );
 
   expect(screen.getByText("登录后即可浏览市场")).toBeInTheDocument();
+  // 没接 onRequireLogin 时保持改造前行为:只关弹窗。
   fireEvent.click(screen.getByRole("button", { name: "去登录" }));
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("未登录「去登录」接了 onRequireLogin 就走它,由壳外负责关市场并切登录(K-24)", () => {
+  const onClose = vi.fn();
+  const onRequireLogin = vi.fn();
+  render(
+    <MarketplaceCenter
+      open
+      tab="browse"
+      auth={null}
+      isAdmin={false}
+      onRequireLogin={onRequireLogin}
+      onTabChange={() => {}}
+      onClose={onClose}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "去登录" }));
+  // 与 ManageCenter 同款契约:回调自己决定关不关(App 里 setXxxOpen(false) + setAuthMode),壳层不重复关。
+  expect(onRequireLogin).toHaveBeenCalledTimes(1);
+  expect(onClose).not.toHaveBeenCalled();
 });
 
 test("四个分区只挂一个面板,其余 tab 不得留悬空 aria-controls", () => {

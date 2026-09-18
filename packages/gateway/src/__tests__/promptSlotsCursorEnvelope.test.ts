@@ -38,6 +38,7 @@ const MCP_TOOLS = [
   'delete_reminder',
   'send_to_agent',
   'present_options',
+  'present_task_approval',
 ]
 
 function utf8(s: string): number {

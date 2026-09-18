@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -82,7 +82,7 @@ describe('engine hook command stays on the fail-open runner', () => {
       .hooks.PreToolUse[0]
     assert.match(pre.hooks[0].command, /efficiencyHookRunner\.cjs/)
     assert.match(pre.hooks[0].command, /--protocol=ccb/)
-    assert.equal(pre.hooks[0].timeout, 3)
+    assert.equal(pre.hooks[0].timeout, 4)
     assert.doesNotMatch(pre.hooks[0].command, /sleep_ge_60|while true/)
 
     const hooks = buildCursorEfficiencyHooks('deny') as {
@@ -90,7 +90,7 @@ describe('engine hook command stays on the fail-open runner', () => {
     }
     assert.match(hooks.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
     assert.equal(hooks.hooks.beforeShellExecution[0].failClosed, false)
-    assert.equal(hooks.hooks.beforeShellExecution[0].timeout, 3)
+    assert.equal(hooks.hooks.beforeShellExecution[0].timeout, 4)
     assert.ok(resolveEfficiencyHookCommand('ccb', 'warn')?.includes('efficiencyHookRunner.cjs'))
   })
 })
@@ -104,6 +104,7 @@ describe('four hook-chain faults all fail-open with a signal', () => {
     assert.match(out.stderr, /nonzero_exit|tsx_missing|spawn_error|timeout/)
     assert.ok(failOpenCount() > before)
     assert.match(auditText(), /"event":"fail_open"/)
+    assert.match(auditText(), /"elapsedMs":\d+/)
   })
 
   it('nonzero inner exit → allow + audit + counter', () => {
@@ -128,7 +129,11 @@ describe('four hook-chain faults all fail-open with a signal', () => {
   })
 
   it('hung inner script times out quickly → allow + audit + counter', () => {
-    const script = writeFixture('hang.cjs', 'setInterval(() => {}, 1000);\n')
+    const pidFile = join(TEST_HOME, 'hang.pid')
+    const script = writeFixture(
+      'hang.cjs',
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+    )
     const before = failOpenCount()
     const out = runRunner({ protocol: 'cursor', script, timeoutMs: 250 })
     assertAllowed('cursor', out.stdout, out.status)
@@ -136,6 +141,92 @@ describe('four hook-chain faults all fail-open with a signal', () => {
     assert.match(out.stderr, /timeout/)
     assert.ok(failOpenCount() > before)
     assert.match(auditText(), /timeout/)
+
+    // Regression: the hung inner must not be left behind as an orphan. Before
+    // the fix, the timeout path called finishFail() without the child, so the
+    // SIGKILL branch was dead code and one `node hang.cjs` leaked per run.
+    assert.ok(existsSync(pidFile), 'inner should have started and written its pid')
+    const innerPid = Number(readFileSync(pidFile, 'utf8'))
+    let alive = true
+    for (let i = 0; i < 40 && alive; i++) {
+      try {
+        process.kill(innerPid, 0)
+        spawnSync('sleep', ['0.05'])
+      } catch {
+        alive = false
+      }
+    }
+    if (alive) {
+      try {
+        process.kill(innerPid, 'SIGKILL')
+      } catch {
+        /* cleanup is best-effort */
+      }
+    }
+    assert.equal(alive, false, `inner pid ${innerPid} still alive after runner timeout`)
+  })
+})
+
+describe('precompiled inner is preferred over tsx', () => {
+  it('same-dir efficiencyPreToolHook.js is selected, allow JSON, no fail_open', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-eff-precompiled-'))
+    const home = mkdtempSync(join(tmpdir(), 'oc-eff-precompiled-home-'))
+    copyFileSync(RUNNER, join(dir, 'efficiencyHookRunner.cjs'))
+    writeFileSync(
+      join(dir, 'efficiencyPreToolHook.js'),
+      [
+        "'use strict'",
+        "const used = process.execArgv.includes('--conditions=openclaude-precompiled')",
+        'process.stdout.write(JSON.stringify({',
+        '  hookSpecificOutput: {',
+        "    hookEventName: 'PreToolUse',",
+        "    permissionDecision: 'allow',",
+        "    additionalContext: used ? 'precompiled' : 'plain'",
+        '  }',
+        "}) + '\\n')",
+      ].join('\n'),
+    )
+    const beforeAudit = existsSync(join(home, '.efficiency-guard', 'audit.jsonl'))
+      ? readFileSync(join(home, '.efficiency-guard', 'audit.jsonl'), 'utf8')
+      : ''
+    const result = spawnSync(process.execPath, [join(dir, 'efficiencyHookRunner.cjs'), '--protocol=ccb', '--mode=warn'], {
+      encoding: 'utf8',
+      input: '{"tool_name":"Bash","tool_input":{"command":"ls"}}\n',
+      timeout: 8000,
+      env: { ...process.env, OPENCLAUDE_HOME: home },
+    })
+    assertAllowed('ccb', result.stdout ?? '', result.status)
+    const obj = JSON.parse((result.stdout ?? '').trim())
+    assert.equal(obj.hookSpecificOutput.additionalContext, 'precompiled')
+    assert.doesNotMatch(result.stderr ?? '', /fail-open/)
+    const auditPath = join(home, '.efficiency-guard', 'audit.jsonl')
+    const afterAudit = existsSync(auditPath) ? readFileSync(auditPath, 'utf8') : ''
+    assert.equal(afterAudit.slice(beforeAudit.length), '', 'must not append fail_open')
+  })
+
+  it('only .ts next to a copied runner still runs through tsx', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-eff-tsx-fallback-'))
+    const home = mkdtempSync(join(tmpdir(), 'oc-eff-tsx-home-'))
+    copyFileSync(RUNNER, join(dir, 'efficiencyHookRunner.cjs'))
+    writeFileSync(
+      join(dir, 'efficiencyPreToolHook.ts'),
+      'process.stdout.write(JSON.stringify({permission:"allow",agent_message:"tsx-fallback"})+"\\n")\n',
+    )
+    const nodeModules = join(SRC_DIR, '../../../node_modules')
+    symlinkSync(nodeModules, join(dir, 'node_modules'))
+    const result = spawnSync(process.execPath, [join(dir, 'efficiencyHookRunner.cjs'), '--protocol=cursor', '--mode=warn'], {
+      encoding: 'utf8',
+      input: '{"command":"true"}\n',
+      timeout: 8000,
+      env: {
+        ...process.env,
+        OPENCLAUDE_HOME: home,
+        OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS: '4000',
+      },
+    })
+    assertAllowed('cursor', result.stdout ?? '', result.status)
+    assert.equal(JSON.parse((result.stdout ?? '').trim()).agent_message, 'tsx-fallback')
+    assert.doesNotMatch(result.stderr ?? '', /fail-open/)
   })
 })
 

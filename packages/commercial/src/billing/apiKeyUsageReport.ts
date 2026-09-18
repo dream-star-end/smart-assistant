@@ -1,5 +1,6 @@
 /**
- * 外接 API key 消耗报表数据层 —— GET /api/me/api-keys/usage 的数据源(0277)。
+ * 外接 API key 消耗报表数据层 —— GET /api/me/api-keys/usage(0277)与
+ * GET /api/me/api-keys/usage/recent(游标分页最近明细)的数据源。
  *
  * 与 billing/usageReport.ts **同范式**(summary + 趋势 + 按模型,generate_series 补零,
  * 大数 ::text),差异只在:
@@ -82,6 +83,91 @@ export function parseApiKeyIdQuery(raw: string | null): { ok: true; keyId: strin
 }
 
 export const API_KEY_USAGE_RECENT_LIMIT = 50;
+/** GET /api/me/api-keys/usage/recent 的默认 / 最大页大小(与 0279 审计端点同口径)。 */
+export const USAGE_RECENT_PAGE_DEFAULT_LIMIT = 50;
+export const USAGE_RECENT_PAGE_MAX_LIMIT = 200;
+
+export interface ApiKeyUsageRecentPage {
+  window: UsageWindow;
+  /** 钉到单 key 时回显,否则 null。 */
+  key_id: string | null;
+  entries: ApiKeyUsageRecentRow[];
+  /** 下一页游标(传回 `before=`);null = 已到底。 */
+  next_before: string | null;
+}
+
+/**
+ * 最近明细的游标分页(0280 后续)。
+ *
+ * 与 {@link getApiKeyUsageReport} 的 `recent` 段**同一 SQL 形状**(同一 `whereFor("u.", false)`
+ * 谓词:不过滤 status,让失败/被拒的请求也在列;同一 LEFT JOIN 取 label),差别只有两处:
+ *   - 排序键收敛成单列 `u.id DESC` —— 游标语义必须与排序键严格一致,`created_at DESC, id DESC`
+ *     的复合排序无法用单值 `before` 精确切分(同一毫秒多行会漏/重);usage_records.id 单调递增,
+ *     `id DESC` 与 `created_at DESC` 在实践中同序。
+ *   - `before` = `u.id < $n`,多取一行判断是否还有下一页。
+ *
+ * user_id 双重限定(`u.user_id = $1` + 可选 `u.api_key_id = $n`)—— 别人的 key_id 只会得到空集,
+ * 不泄漏存在性。keyId / beforeId 均须由 caller 经 {@link parseApiKeyIdQuery} 校验。
+ */
+export async function listApiKeyUsageRecent(
+  userId: string,
+  window: UsageWindow,
+  keyId: string | null,
+  opts: { beforeId?: string | null; limit?: number } = {},
+): Promise<ApiKeyUsageRecentPage> {
+  if (keyId !== null && !KEY_ID_RE.test(keyId)) {
+    throw new Error("listApiKeyUsageRecent: keyId must be validated by caller");
+  }
+  const beforeId = opts.beforeId ?? null;
+  if (beforeId !== null && !KEY_ID_RE.test(beforeId)) {
+    throw new Error("listApiKeyUsageRecent: beforeId must be validated by caller");
+  }
+  const limit = Math.min(
+    Math.max(1, Math.floor(opts.limit ?? USAGE_RECENT_PAGE_DEFAULT_LIMIT)),
+    USAGE_RECENT_PAGE_MAX_LIMIT,
+  );
+  const spec = WINDOW_SPEC[window];
+  const params: (string | number)[] = [userId, spec.hours];
+  let where =
+    `WHERE u.user_id = $1 AND u.api_key_id IS NOT NULL` +
+    ` AND u.created_at >= NOW() - ($2::int * INTERVAL '1 hour')`;
+  if (keyId !== null) {
+    params.push(keyId);
+    where += ` AND u.api_key_id = $${params.length}::bigint`;
+  }
+  if (beforeId !== null) {
+    params.push(beforeId);
+    where += ` AND u.id < $${params.length}::bigint`;
+  }
+  params.push(limit + 1);
+  const res = await query<ApiKeyUsageRecentRow>(
+    `SELECT u.id::text                 AS id,
+            u.created_at::text         AS created_at,
+            u.api_key_id::text         AS api_key_id,
+            k.label                    AS label,
+            u.model                    AS model,
+            u.input_tokens::text       AS input_tokens,
+            u.output_tokens::text      AS output_tokens,
+            u.cache_read_tokens::text  AS cache_read_tokens,
+            u.cache_write_tokens::text AS cache_write_tokens,
+            u.cost_credits::text       AS cost_credits,
+            u.status                   AS status
+       FROM usage_records u
+       LEFT JOIN user_api_keys k ON k.id = u.api_key_id
+      ${where}
+      ORDER BY u.id DESC
+      LIMIT $${params.length}`,
+    params,
+  );
+  const rows = res.rows;
+  const entries = rows.slice(0, limit);
+  return {
+    window,
+    key_id: keyId,
+    entries,
+    next_before: rows.length > limit ? (entries[entries.length - 1]?.id ?? null) : null,
+  };
+}
 
 export async function getApiKeyUsageReport(
   userId: string,

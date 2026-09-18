@@ -110,6 +110,48 @@ describe("SkillsPanel 来源可辨与只读语义", () => {
   });
 });
 
+describe("SkillsPanel 行头布局与命名一致", () => {
+  test("编辑 / 删除动作簇在窄屏整行换到行头下方,标题不再被压成两行截断", async () => {
+    mountPanel();
+    const edit = await screen.findByRole("button", { name: "编辑 写作助手" });
+    const actions = edit.parentElement as HTMLElement;
+    expect(actions.className).toContain("max-sm:basis-full");
+    expect(actions.className).toContain("max-sm:justify-end");
+    // 行头容器允许换行,标题按钮有最小宽度基准。
+    expect(actions.parentElement?.className).toContain("flex-wrap");
+  });
+
+  test("删除确认与工作台标题都用列表同款展示名(描述首行),slug 只作补充", async () => {
+    vi.spyOn(api, "deleteSkill").mockResolvedValue({ ok: true });
+    mountPanel({
+      skills: [{ name: "writer-pro", description: "帮你把草稿改成成稿\n第二行不进标题", writable: true, layer: "shared", agentIds: [] }],
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "删除 writer-pro" }));
+    expect(await screen.findByText("删除技能「帮你把草稿改成成稿」？")).toBeInTheDocument();
+    expect(screen.getByText(/技能标识 writer-pro/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑 writer-pro" }));
+    expect(await screen.findByText("技能工作台 · 帮你把草稿改成成稿")).toBeInTheDocument();
+  });
+
+  test("标签以 # 弱化文字呈现,与「适用」智能体芯片不同形;超过 3 个可点开而不是塞进 title", async () => {
+    mountPanel({
+      skills: [{ name: "tagged", description: "带很多标签", writable: true, layer: "shared", agentIds: [], tags: ["部署", "运维", "v5", "runbook", "灰度"] }],
+    });
+    await screen.findByText("#部署");
+    expect(screen.queryByText("#runbook")).not.toBeInTheDocument();
+    const more = screen.getByRole("button", { name: "+2" });
+    expect(more).not.toHaveAttribute("title");
+    // 「+2」两个字符桌面只有 12px 宽,触屏点不中(t-762 manage#1):触控档由按钮自己撑到 44×44。
+    expect(more).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
+    fireEvent.click(more);
+    expect(screen.getByText("#runbook")).toBeInTheDocument();
+    expect(screen.getByText("#灰度")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "收起" })).toBeInTheDocument();
+  });
+});
+
 describe("SkillsPanel 未配评测提示", () => {
   test("自建可写技能且无评测用例:展开后出现「未配评测」入口", async () => {
     mountPanel();
@@ -147,7 +189,7 @@ describe("SkillsPanel 未配评测提示", () => {
     await expandRow("写作助手");
     fireEvent.click(await screen.findByRole("button", { name: /未配评测/ }));
 
-    expect(await screen.findByText("技能工作台:写作助手")).toBeInTheDocument();
+    expect(await screen.findByText("技能工作台 · 写作助手")).toBeInTheDocument();
     expect(await screen.findByRole("tab", { name: "评测" })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -172,7 +214,7 @@ describe("SkillsPanel 行内预览只做轻量摘要", () => {
     render(<SkillsPanel auth={auth} />);
     await expandRow("写作助手");
 
-    expect(await screen.findByText(/仅显示前 20 行,共 30 行/)).toBeInTheDocument();
+    expect(await screen.findByText(/仅显示前 20 行，共 30 行/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /在工作台中打开/ })).toBeInTheDocument();
     // 评测 / 训练优化不再是行内二级页签。
     expect(screen.queryByRole("button", { name: "评测" })).not.toBeInTheDocument();

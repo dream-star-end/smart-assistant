@@ -9,6 +9,7 @@ import type {
   OrgUsageWindow,
 } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
+import { StatTile } from "../settings/StatTile";
 import { Alert, Button, Spinner, Tabs } from "../ui";
 import { orgErrText } from "./orgShared";
 
@@ -194,15 +195,16 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
         <>
           {/* 摘要卡片 */}
           <div className="grid grid-cols-2 gap-2 px-5 py-4">
-            <Stat label="总请求数" value={groupDigits(s.requests)} />
-            <Stat label="扣费" value={`${formatCredits(s.credits)} 积分`} accent />
-            <Stat label="输入 token" value={formatCompactCount(s.input_tokens)} />
-            <Stat label="输出 token" value={formatCompactCount(s.output_tokens)} />
+            <StatTile label="总请求数" value={groupDigits(s.requests)} />
+            <StatTile label="扣费" value={formatCredits(s.credits)} unit="积分" accent />
+            <StatTile label="输入 token" value={formatCompactCount(s.input_tokens)} />
+            <StatTile label="输出 token" value={formatCompactCount(s.output_tokens)} />
           </div>
 
           {/* token 构成堆叠条 */}
           <div className="border-t border-border px-5 py-4">
-            <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+            {/* normal-case：小节标题的 uppercase 会把「Token」渲成「TOKEN」，与个人版同名图表卡不一致（审计 SET-37）。 */}
+            <div className="pb-2 text-caption font-medium normal-case tracking-wide text-faint">
               Token 构成
             </div>
             {tokenTotal === "0" ? (
@@ -294,22 +296,6 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
           />
         </>
       )}
-    </div>
-  );
-}
-
-function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
-  return (
-    <div className="rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="text-caption text-faint">{label}</div>
-      <div
-        className={cn(
-          "mt-0.5 text-[16px] font-semibold tabular-nums",
-          accent ? "text-accent" : "text-fg",
-        )}
-      >
-        {value}
-      </div>
     </div>
   );
 }

@@ -8,13 +8,14 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { Info, Sparkles } from "lucide-react";
+import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -42,6 +43,7 @@ import {
   createRowGeometryWarmup,
   measureMountedRowHeight,
   measuredRangePx,
+  overscanPx,
   paintWindowEnabled,
   rowHeightEstimatePx,
   selectPaintRange,
@@ -71,10 +73,12 @@ import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import {
   PermissionCard,
+  PermissionPromptHost,
   type PermissionRespond,
   isAwaitingPermissionPrompt,
 } from "./chat/PermissionCard";
-import { ToolCardSlot } from "./chat/toolCardSlot";
+import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
+import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
 import {
@@ -87,7 +91,16 @@ import {
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
-import { Alert, Avatar, Spinner } from "./ui";
+import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
+import { cn } from "../lib/utils";
+import {
+  findMatches,
+  locateFindMatch,
+  stepMatch,
+  timelineMessageKey,
+  type FindMatch,
+  type FindRenderLookupItem,
+} from "./chat/findInSession";
 import {
   delegateTokenUsage,
   displayCallTokenUsage,
@@ -168,6 +181,8 @@ type RendererProps = {
   failurePresentedBelow?: boolean;
   /** 初始尾部 locator：跳过 600px IO，进会话即兑付正文。 */
   eagerPayload?: boolean;
+  /** MessageList owns PermissionPromptHost; timeline cards must not mount a second modal. */
+  hostedPermission?: boolean;
 };
 
 export const MessageRenderer = memo(
@@ -189,6 +204,7 @@ export const MessageRenderer = memo(
     readOnly = false,
     failurePresentedBelow = false,
     eagerPayload = false,
+    hostedPermission = false,
   }: RendererProps) {
     const ctx = {
       isLast,
@@ -233,12 +249,26 @@ export const MessageRenderer = memo(
     }
     switch (messageKind(message)) {
       case "user":
-        return <UserCard msg={message} cb={cb} failurePresentedBelow={failurePresentedBelow} />;
+        // readOnly(教程回放 / 后台会话查看器)透传:只读面不再出现点了没反应的「编辑」「引用」。
+        return (
+          <UserCard
+            msg={message}
+            cb={cb}
+            failurePresentedBelow={failurePresentedBelow}
+            readOnly={readOnly}
+          />
+        );
       case "assistant":
         return (
           <>
             <FirstTextPaintCommitProbe message={message} cb={cb} />
-            <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />
+            <AssistantCard
+              msg={message}
+              ctx={ctx}
+              cb={cb}
+              tokenUsage={tokenUsage}
+              readOnly={readOnly}
+            />
           </>
         );
       case "thinking":
@@ -313,6 +343,7 @@ export const MessageRenderer = memo(
             onRespond={onRespondPermission}
             readOnly={readOnly}
             livePrompt={live}
+            renderMode={hostedPermission ? "card" : "both"}
           />
         );
       }
@@ -382,7 +413,7 @@ function ExactTapeRecordDisclosure({
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="text-caption text-faint hover:text-muted"
+        className="text-caption text-faint hover:text-muted [@media(hover:none)]:inline-flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center"
       >
         {open ? `收起原始${label}记录` : `查看原始${label}记录`}
       </button>
@@ -395,7 +426,7 @@ function ExactTapeRecordDisclosure({
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -426,7 +457,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover"
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover [@media(hover:none)]:min-h-11"
       >
         <span className="size-1.5 shrink-0 rounded-full bg-faint" />
         <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
@@ -442,7 +473,7 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
             <button
               type="button"
               onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
             >
               继续显示原始记录
             </button>
@@ -627,6 +658,9 @@ function DeferredTapeRecordCard({
                 _historyPageLoadedFrom: message._historyPageLoadedFrom,
                 _historyPageKey: message._historyPageKey,
                 _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+                _continuationOfTurnKey: record._continuationOfTurnKey ?? message._continuationOfTurnKey,
+                _delegateRunId: record._delegateRunId ?? message._delegateRunId,
+                _turnKey: record._turnKey ?? message._turnKey,
               };
           const final = isLast && index === records.length - 1;
           const recordIsFinalAssistant = turnFinalAssistant === true &&
@@ -654,6 +688,7 @@ function DeferredTapeRecordCard({
               onRespondPermission={onRespondPermission}
               readOnly={readOnly}
               failurePresentedBelow={failurePresentedBelow}
+              hostedPermission
             />
           );
         })}
@@ -980,6 +1015,14 @@ function coalesceTeam(
 // top reveals already-resident rows; server history still uses the explicit
 // hasMore / loadOlder button (scroll never issues a network page).
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
+
+export function shouldShowScrollToBottom(
+  following: boolean | undefined,
+  messageCount: number,
+  distance = Number.POSITIVE_INFINITY,
+): boolean {
+  return messageCount > 0 && following === false && distance > 80;
+}
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 
@@ -990,8 +1033,7 @@ function defaultTailStart(length: number): number {
 function renderItemKey(item: RenderItem): string {
   try {
     if (item.kind === "single") {
-      const key = item.m?._timelineUnitKey ?? item.m?.id;
-      return typeof key === "string" && key.length > 0 ? key : "single-missing";
+      return timelineMessageKey(item.m);
     }
     const key = item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
     return typeof key === "string" && key.length > 0 ? key : item.kind;
@@ -999,6 +1041,71 @@ function renderItemKey(item: RenderItem): string {
     return "corrupt-item";
   }
 }
+
+function findLookupItems(items: RenderItem[]): FindRenderLookupItem[] {
+  return items.map((item) => {
+    if (item.kind === "single") {
+      const key = renderItemKey(item);
+      return { key, memberKeys: [timelineMessageKey(item.m)] };
+    }
+    return {
+      key: renderItemKey(item),
+      memberKeys: item.members.map((member) => timelineMessageKey(member)),
+    };
+  });
+}
+
+function escapeFindSelector(key: string): string {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(key)
+    : key.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function findToolbarEl(scroller: HTMLElement): HTMLElement | null {
+  const input = scroller.querySelector('[aria-label="在会话中查找"]');
+  if (!(input instanceof HTMLElement)) return null;
+  let node: HTMLElement | null = input;
+  while (node && node !== scroller) {
+    const pos = typeof getComputedStyle === "function" ? getComputedStyle(node).position : node.style.position;
+    if (pos === "sticky" || pos === "fixed") return node;
+    node = node.parentElement;
+  }
+  const wrap = input.closest("div");
+  return wrap instanceof HTMLElement ? wrap : null;
+}
+
+function findViewTop(scroller: HTMLElement): number {
+  const view = scroller.getBoundingClientRect();
+  const bar = findToolbarEl(scroller)?.getBoundingClientRect() ?? null;
+  return bar && bar.height > 0 ? bar.bottom : view.top;
+}
+
+function findTargetVisible(el: HTMLElement, scroller: HTMLElement): boolean {
+  const row = el.getBoundingClientRect();
+  const view = scroller.getBoundingClientRect();
+  const top = findViewTop(scroller);
+  return row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1;
+}
+
+function eventInFindToolbar(scroller: HTMLElement, target: EventTarget | null): boolean {
+  const bar = findToolbarEl(scroller);
+  return !!(bar && target instanceof Node && bar.contains(target));
+}
+
+function findPaintNeighborhood(clientHeight: number, estimatePx: number): number {
+  const extraPx = overscanPx(clientHeight);
+  return Math.max(PAINT_MIN_ITEMS, Math.ceil(extraPx / Math.max(1, estimatePx)));
+}
+
+/** Wait long enough for the 200ms wheel quiet fence plus a few layout frames. */
+const FIND_ALIGN_BUDGET_MS = 1200;
+const FIND_ALIGN_STABLE_FRAMES = 3;
+
+type FindPinState = {
+  gen: number;
+  renderIndex: number;
+  renderKey: string;
+};
 
 function lastUserItemIndex(items: RenderItem[]): number {
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -1050,6 +1157,7 @@ export function MessageList({
   historyGeneration = "legacy",
   sessionId,
   followBottomRef,
+  find,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -1083,12 +1191,17 @@ export function MessageList({
    */
   followBottomRef?: {
     current: boolean;
+    jumpToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
     scrollToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
     correctTo?: (
       el: { scrollTop: number; scrollHeight: number; clientHeight: number },
       nextTop: number,
     ) => void;
+    /** Consume a leftover keyboard/wheel mark. Does not clear fences. */
+    releaseUserIntent?: () => void;
   };
+  /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
+  find?: { onClose: () => void };
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -1116,11 +1229,196 @@ export function MessageList({
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
   followBottomRefBox.current = followBottomRef;
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findCursor, setFindCursor] = useState(0);
+  const [findPin, setFindPin] = useState<FindPinState | null>(null);
+  const findGenRef = useRef(0);
+  const findPinRef = useRef<FindPinState | null>(null);
+  findPinRef.current = findPin;
+  const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
+  const findMatchesList = useMemo(
+    () => (find ? findMatches(messages, findQuery) : []),
+    [find, messages, findQuery],
+  );
+  const findHitKeys = useMemo(() => new Set(findMatchesList.map((m) => m.key)), [findMatchesList]);
+  const bumpFindGeneration = useCallback(() => {
+    findGenRef.current += 1;
+    findPinRef.current = null;
+    setFindPin((prev) => (prev ? null : prev));
+  }, []);
+  useEffect(() => {
+    setFindCursor(0);
+    bumpFindGeneration();
+  }, [findQuery, bumpFindGeneration]);
+  useEffect(() => {
+    bumpFindGeneration();
+    setFindCursor(0);
+  }, [sessionId, bumpFindGeneration]);
+  // 查找条关闭后焦点归位(a11y-B messages#1):查找条是自研路径,不像 Radix 弹层自带 returnFocus,
+  // Esc / 关闭后 Input 直接卸载,焦点掉到 <body>,键盘用户得从页首 Tab 重来。
+  // 在「即将挂载」的这一次渲染里记下焦点来处(Input 的 autoFocus 会在提交阶段抢焦点,useEffect 里已经晚了),
+  // 关闭时若焦点确实掉到了 body,再还回去。
+  const findReturnFocusRef = useRef<HTMLElement | null>(null);
+  const prevFindRef = useRef(find);
+  if (!prevFindRef.current && find && typeof document !== "undefined") {
+    const active = document.activeElement;
+    findReturnFocusRef.current =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+  prevFindRef.current = find;
+  useEffect(() => {
+    if (!find) {
+      bumpFindGeneration();
+      setFindQuery("");
+      setFindCursor(0);
+      const target = findReturnFocusRef.current;
+      findReturnFocusRef.current = null;
+      if (
+        target?.isConnected &&
+        (document.activeElement === null || document.activeElement === document.body)
+      ) {
+        target.focus({ preventScroll: true });
+      }
+    }
+  }, [find, bumpFindGeneration]);
+  useEffect(() => {
+    if (sending) bumpFindGeneration();
+  }, [sending, bumpFindGeneration]);
+  useEffect(() => {
+    const pin = findPinRef.current;
+    if (!pin) return;
+    const stillHit = findMatchesList.some((match) => match.key === pin.renderKey);
+    if (!stillHit) bumpFindGeneration();
+  }, [findMatchesList, bumpFindGeneration]);
+  useEffect(() => {
+    const scroller = scrollParent;
+    if (!scroller) return;
+    const cancelIfFindPending = (event?: Event) => {
+      // Find-chrome edit/button/tap may keep the generation; real wheel/touchmove
+      // must invalidate even when event.target is inside the toolbar.
+      if (
+        event
+        && event.type !== "wheel"
+        && event.type !== "touchmove"
+        && eventInFindToolbar(scroller, event.target)
+      ) return;
+      if (findPinRef.current) bumpFindGeneration();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
+      if (eventInFindToolbar(scroller, event.target)) return;
+      const gutter = scroller.offsetWidth - scroller.clientWidth;
+      const edge = Math.max(gutter, 12);
+      const rect = scroller.getBoundingClientRect();
+      const inScrollbar = event.clientX >= rect.right - edge - 1;
+      if (inScrollbar) cancelIfFindPending();
+    };
+    scroller.addEventListener("wheel", cancelIfFindPending, { passive: true });
+    scroller.addEventListener("touchmove", cancelIfFindPending, { passive: true });
+    scroller.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      scroller.removeEventListener("wheel", cancelIfFindPending);
+      scroller.removeEventListener("touchmove", cancelIfFindPending);
+      scroller.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [scrollParent, bumpFindGeneration]);
+  useLayoutEffect(() => {
+    const pin = findPin;
+    const scroller = scrollParent;
+    const follow = followBottomRef;
+    if (!pin || !scroller || !follow) return;
+    const gen = pin.gen;
+    let frame = 0;
+    let stable = 0;
+    const started = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const tick = () => {
+      frame = 0;
+      if (findGenRef.current !== gen || findPinRef.current?.gen !== gen) return;
+      const esc = escapeFindSelector(pin.renderKey);
+      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      if (el instanceof HTMLElement) {
+        const row = el.getBoundingClientRect();
+        follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
+        if (findGenRef.current !== gen) return;
+        if (findTargetVisible(el, scroller)) {
+          stable += 1;
+          if (stable >= FIND_ALIGN_STABLE_FRAMES) {
+            if (findGenRef.current === gen) {
+              lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(scroller);
+              findPinRef.current = null;
+              setFindPin((prev) => (prev && prev.gen === gen ? null : prev));
+              const settle = (left: number) => {
+                if (left <= 0 || findGenRef.current !== gen) return;
+                requestAnimationFrame(() => {
+                  if (findGenRef.current !== gen) return;
+                  const node = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+                  if (node instanceof HTMLElement) {
+                    const next = node.getBoundingClientRect();
+                    follow.correctTo?.(scroller, scroller.scrollTop + (next.top - findViewTop(scroller)));
+                  }
+                  settle(left - 1);
+                });
+              };
+              settle(8);
+            }
+            return;
+          }
+        } else {
+          stable = 0;
+        }
+      } else {
+        stable = 0;
+      }
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (now - started > FIND_ALIGN_BUDGET_MS) {
+        if (findGenRef.current === gen) {
+          findPinRef.current = null;
+          setFindPin((prev) => (prev && prev.gen === gen ? null : prev));
+        }
+        return;
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [findPin, scrollParent, followBottomRef, windowVersion]);
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el || !followBottomRef) {
+      setShowScrollToBottom(false);
+      return;
+    }
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      // Store only visibility, not pixel distance: scrolling within the same
+      // state must not force the whole MessageList to re-render every frame.
+      setShowScrollToBottom(shouldShowScrollToBottom(
+        followBottomRef.current, messages.length, el.scrollHeight - el.clientHeight - el.scrollTop,
+      ));
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(sync);
+    };
+    sync();
+    el.addEventListener("scroll", schedule, { passive: true });
+    // Viewport/keyboard or content changes need not produce a scroll event.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    observer?.observe(el);
+    if (listRootRef.current) observer?.observe(listRootRef.current);
+    return () => {
+      el.removeEventListener("scroll", schedule);
+      observer?.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [scrollParent, followBottomRef, sessionId, messages.length]);
   const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
   const visibleKeysRef = useRef<string[]>([]);
   const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
   const eagerMediaKeysRef = useRef<Set<string> | null>(null);
-  const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
   const lastPaintSpanRef = useRef({ start: -1, end: -1 });
   const pinStartRef = useRef<number | undefined>(undefined);
   // INC-20260905-TIMELINE-BLANK probe state (passive; never writes scrollTop).
@@ -1154,6 +1452,8 @@ export function MessageList({
     eagerMediaKeysRef.current = null;
     lastViewportAnchorRef.current = null;
     lastPaintSpanRef.current = { start: -1, end: -1 };
+    findGenRef.current += 1;
+    findPinRef.current = null;
   }
 
   useEffect(() => {
@@ -1579,7 +1879,7 @@ export function MessageList({
       lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(scroller);
     };
     const follow = () => {
-      if (viewportPreserveLockRef.current) return;
+      if (viewportPreserveLockRef.current || findPinRef.current) return;
       if (followBottomRef.current) {
         followBottomRef.scrollToBottom?.(scroller);
         recapture();
@@ -1668,32 +1968,40 @@ export function MessageList({
   let paintEnd = visibleItems.length;
   const estimatePx = rowHeightEstimatePx(rowHeightCacheRef.current);
   if (paintOn && scrollParent) {
-    const followBottom = followBottomRef?.current === true;
-    const keyAt = (index: number) => itemKey(visibleItems[index]);
-    const desired = computePaintRange({
-      count: visibleItems.length,
-      scrollTop: scrollParent.scrollTop,
-      clientHeight: scrollParent.clientHeight,
-      followBottom,
-      keyAt,
-      heights: rowHeightCacheRef.current,
-      pinStart: pinPaintStart,
-      estimatePx,
-    });
-    const chosen = selectPaintRange({
-      prev: paintRange,
-      next: desired,
-      followBottom,
-      count: visibleItems.length,
-      scrollTop: scrollParent.scrollTop,
-      clientHeight: scrollParent.clientHeight,
-      keyAt,
-      heights: rowHeightCacheRef.current,
-      pinStart: pinPaintStart,
-      estimatePx,
-    });
-    paintStart = chosen.start;
-    paintEnd = chosen.end;
+    const pin = findPin;
+    const visIdx = pin ? pin.renderIndex - windowStart : -1;
+    if (pin && visIdx >= 0 && visIdx < visibleItems.length) {
+      const extra = findPaintNeighborhood(scrollParent.clientHeight, estimatePx);
+      paintStart = Math.max(0, visIdx - extra);
+      paintEnd = Math.min(visibleItems.length, visIdx + 1 + extra);
+    } else {
+      const followBottom = followBottomRef?.current === true;
+      const keyAt = (index: number) => itemKey(visibleItems[index]);
+      const desired = computePaintRange({
+        count: visibleItems.length,
+        scrollTop: scrollParent.scrollTop,
+        clientHeight: scrollParent.clientHeight,
+        followBottom,
+        keyAt,
+        heights: rowHeightCacheRef.current,
+        pinStart: pinPaintStart,
+        estimatePx,
+      });
+      const chosen = selectPaintRange({
+        prev: paintRange,
+        next: desired,
+        followBottom,
+        count: visibleItems.length,
+        scrollTop: scrollParent.scrollTop,
+        clientHeight: scrollParent.clientHeight,
+        keyAt,
+        heights: rowHeightCacheRef.current,
+        pinStart: pinPaintStart,
+        estimatePx,
+      });
+      paintStart = chosen.start;
+      paintEnd = chosen.end;
+    }
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
   blankProbeStateRef.current = { paintStart, paintEnd, sending, messagesLength: messages.length };
@@ -1735,6 +2043,7 @@ export function MessageList({
       follow &&
       follow.current !== true &&
       !viewportPreserveLockRef.current &&
+      !findPinRef.current &&
       lastViewportAnchorRef.current &&
       typeof follow.correctTo === "function"
     ) {
@@ -1825,6 +2134,7 @@ export function MessageList({
           readOnly={readOnly}
           failurePresentedBelow={failurePresentedBelow}
           eagerPayload={eagerPayloadKeysRef.current?.has(rowId) === true}
+          hostedPermission
         />
       </MessageBoundary>
     );
@@ -1856,8 +2166,10 @@ export function MessageList({
       </button>
     </div>
   ) : null;
+  // footer 不再自带 px-5:它嵌在列表根(px-5)内,双份内边距会让本轮活动指示 / 软提示 / 尾部骨架比
+  // 时间线内容多缩进 20px(footer 头像与助手头像不对齐)。空列表早返回分支由外层容器补 px-5。
   const footer = (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 pb-8 pt-4" data-testid="timeline-footer">
       <div data-testid="turn-activity-footer">
         {sending && (
           <div className="flex gap-4">
@@ -1884,6 +2196,23 @@ export function MessageList({
     </div>
   );
 
+  // Keep hooks before both the ref-binding and empty-activity early returns.
+  const pendingSig = messages
+    .filter((message) => message.role === "permission")
+    .map((message) => `${message.requestId}:${message._resolved}:${message._controlPending}:${message._inputTruncated}`)
+    .join("|");
+  const pendingPrompts = useMemo(
+    () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
+    [pendingSig, readOnly, messages],
+  );
+  const requestIdByToolUseId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const message of pendingPrompts) {
+      if (message.requestId && message.toolUseId) map.set(message.toolUseId, message.requestId);
+    }
+    return map;
+  }, [pendingPrompts]);
+
   // App/admin pass an explicit null during the callback-ref's first commit.
   // Do not mount the transcript in that frame; omitted/undefined remains the
   // lightweight test/non-scroll surface contract.
@@ -1904,13 +2233,161 @@ export function MessageList({
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
+  const findCurrent =
+    findMatchesList.length === 0
+      ? -1
+      : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
+  const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const jumpTo = (match: FindMatch) => {
+    const follow = followBottomRef;
+    const scroller = scrollParent;
+    if (!follow || !scroller) return;
+    const target = locateFindMatch(findLookupItems(renderItems), match);
+    const gen = findGenRef.current + 1;
+    findGenRef.current = gen;
+    if (!target) {
+      findPinRef.current = null;
+      setFindPin(null);
+      return;
+    }
+    follow.current = false;
+    follow.releaseUserIntent?.();
+    if (target.renderIndex < windowStart) {
+      beginViewportPreserve();
+      startOverrideRef.current = target.renderIndex;
+      setWindowVersion((value) => value + 1);
+    }
+    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey };
+    findPinRef.current = pin;
+    setFindPin(pin);
+    const esc = escapeFindSelector(target.renderKey);
+    const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+    if (el instanceof HTMLElement) {
+      const row = el.getBoundingClientRect();
+      follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
+    }
+  };
+  const goFind = (dir: 1 | -1) => {
+    if (sending || findMatchesList.length === 0) return;
+    const next = stepMatch(findMatchesList, findCurrent, dir);
+    if (next < 0) return;
+    setFindCursor(next);
+    const match = findMatchesList[next];
+    if (match) jumpTo(match);
+  };
+  const stopFindKeys = (event: { stopPropagation: () => void }) => {
+    event.stopPropagation();
+  };
   return (
+    <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
+    <>
+    <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
+    {pendingPrompts.length > 0 ? (
+      <div
+        data-testid="pending-permission-dock"
+        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-2 bg-bg/95 px-5 py-2"
+      >
+        <span className="text-caption text-muted">待回答</span>
+        {pendingPrompts.map((message) => (
+          <button
+            key={message.requestId ?? message.id}
+            type="button"
+            className="rounded-full bg-accent-soft px-2.5 py-1 text-caption text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            onClick={() => {
+              if (message.requestId) reopenPermissionUi(message.requestId);
+            }}
+          >
+            {message.toolName === "AskUserQuestion"
+              ? "打开提问"
+              : message.toolName === "ExitPlanMode"
+                ? "打开计划"
+                : "打开审批"}
+          </button>
+        ))}
+      </div>
+    ) : null}
+    {find ? (
+      <div
+        className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2"
+        onKeyDown={stopFindKeys}
+        onPointerDown={stopFindKeys}
+        onTouchStart={stopFindKeys}
+      >
+        <Input
+          aria-label="在会话中查找"
+          autoFocus
+          inputSize="sm"
+          value={findQuery}
+          onChange={(e) => setFindQuery(e.target.value)}
+          onKeyDown={(e) => {
+            stopFindKeys(e);
+            if (e.key === "Escape") {
+              e.preventDefault();
+              find.onClose();
+              return;
+            }
+            if (e.key === "Enter") {
+              e.preventDefault();
+              goFind(e.shiftKey ? -1 : 1);
+            }
+          }}
+          className="min-w-0 flex-1"
+        />
+        <span className="shrink-0 text-caption tabular-nums text-muted">
+          {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
+        </span>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="上一处"
+          title={sending ? "生成中暂不可跳转" : "上一处"}
+          disabled={sending || findMatchesList.length === 0}
+          onKeyDown={(event) => {
+            stopFindKeys(event);
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              goFind(-1);
+            }
+          }}
+          onClick={() => goFind(-1)}
+        >
+          <ChevronUp size={16} />
+        </IconButton>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="下一处"
+          title={sending ? "生成中暂不可跳转" : "下一处"}
+          disabled={sending || findMatchesList.length === 0}
+          onKeyDown={(event) => {
+            stopFindKeys(event);
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              goFind(1);
+            }
+          }}
+          onClick={() => goFind(1)}
+        >
+          <ChevronDown size={16} />
+        </IconButton>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="关闭查找"
+          onKeyDown={stopFindKeys}
+          onClick={find.onClose}
+        >
+          <X size={16} />
+        </IconButton>
+      </div>
+    ) : null}
     <div
       ref={listRootRef}
       className="mx-auto max-w-3xl space-y-4 px-5 py-8"
       data-testid="timeline-short-list"
       data-timeline-window-count={visibleItems.length}
       data-timeline-paint-count={paintedItems.length}
+      data-find-pin={findPin?.renderKey ?? ""}
     >
       {historyControl}
       {paintStart > 0 ? (
@@ -1940,12 +2417,15 @@ export function MessageList({
         return (
           <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
             <div
-              className={
+              className={cn(
                 liveRow
                   ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
-                  : "chat-virtual-item chat-timeline-row"
-              }
+                  : "chat-virtual-item chat-timeline-row",
+                find && findCurrentKey === key && "ring-1 ring-accent/60",
+                find && findCurrentKey !== key && findHitKeys.has(key) && "bg-accent-soft/30",
+              )}
               data-chat-virtual-key={key}
+              data-find-current={find && findCurrentKey === key ? "" : undefined}
               style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}
@@ -1961,6 +2441,49 @@ export function MessageList({
         />
       ) : null}
       {footer}
+      {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
+          **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
+          挂载/卸载,按钮自身 52px 就是 scrollHeight 的一部分:滑回底部 → following
+          翻真 → 按钮卸载 → scrollHeight 收缩 → 浏览器 clamp scrollTop → 篱笆仍在
+          (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
+          几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
+          -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
+      {followBottomRef?.jumpToBottom && messages.length > 0 && (
+        <div
+          aria-hidden={!showScrollToBottom}
+          data-testid="scroll-to-bottom-dock"
+          data-visible={showScrollToBottom ? "true" : "false"}
+          className="sticky bottom-4 z-10 -mt-4 h-0 overflow-visible"
+        >
+          <button
+            type="button"
+            data-testid="scroll-to-bottom"
+            aria-label="回到底部"
+            tabIndex={showScrollToBottom ? 0 : -1}
+            // 移动端 44px 圆钮叠在末行正文/状态标签右侧:加一圈页面底色描边把它从底下的文字里
+            // 抬出来,并在触屏下挪进列表根的 px-5 边距(-right-3),少压 12px 正文。
+            className={
+              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float ring-[3px] ring-bg transition-opacity duration-200 [@media(hover:none)]:-right-3 [@media(hover:none)]:size-11 " +
+              (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
+            }
+            onClick={() => {
+              if (!scrollParent || !followBottomRef?.jumpToBottom) return;
+              pendingExpandCorrectionRef.current = null;
+              viewportPreserveLockRef.current = false;
+              lastViewportAnchorRef.current = null;
+              followBottomRef.jumpToBottom(scrollParent);
+              setShowScrollToBottom(shouldShowScrollToBottom(
+                followBottomRef.current, messages.length,
+                scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
+              ));
+            }}
+          >
+            <ChevronDown size={18} />
+          </button>
+        </div>
+      )}
     </div>
+    </>
+    </PermissionToolReopenContext.Provider>
   );
 }

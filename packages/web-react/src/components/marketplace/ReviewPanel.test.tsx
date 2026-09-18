@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceAiReview, MarketplacePending } from "../../lib/types";
@@ -10,11 +10,13 @@ import { expectAriaControlsResolvable } from "../../test/ariaControls";
 // api 网络层全 mock —— 只验证 ReviewPanel 与契约交互(待审 AI 意见区 + AI 审批记录折叠区)。
 const adminMarketplacePending = vi.fn();
 const adminMarketplaceAiReviews = vi.fn();
+const adminMarketplaceReview = vi.fn();
 const searchMarketplace = vi.fn();
 vi.mock("../../lib/api", () => ({
   api: {
     adminMarketplacePending: (...a: unknown[]) => adminMarketplacePending(...a),
     adminMarketplaceAiReviews: (...a: unknown[]) => adminMarketplaceAiReviews(...a),
+    adminMarketplaceReview: (...a: unknown[]) => adminMarketplaceReview(...a),
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
   },
 }));
@@ -250,6 +252,50 @@ test("触控靶:待审勾选框、AI 记录折叠头、功能验收确认都由�
   );
 });
 
+test("K-27:审核面三处勾选框都走 ui/Checkbox 原语;「全选」部分勾选时为 indeterminate(读屏 mixed)", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({ versionId: "1", name: "技能甲" }),
+    pending({
+      versionId: "2",
+      kind: "connector",
+      name: "某 API 插件",
+      manifest: { proposedSecurityDecision: {} },
+      rawBundle: { "evals/case.md": "case" },
+    }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  const all = (await screen.findByRole("checkbox", { name: "全选" })) as HTMLInputElement;
+  const rowA = screen.getByRole("checkbox", { name: "选择 技能甲" });
+  const rowB = screen.getByRole("checkbox", { name: "选择 某 API 插件" });
+  // 展开连接器审查区,把第三处(功能验收确认)也挂出来。
+  fireEvent.click(screen.getByRole("button", { name: /某 API 插件/ }));
+  const verify = await screen.findByRole("checkbox", { name: /真实功能验收/ });
+  for (const box of [all, rowA, rowB, verify]) {
+    // 原语标记:不再是裸 <input className="accent-accent">,视觉与 Switch / Chip 同一套。
+    expect(box).toHaveAttribute("data-ui", "checkbox");
+    expect(box.className).not.toContain("accent-accent");
+    expect(box.closest("label")).toHaveClass("[@media(hover:none)]:min-h-11");
+  }
+
+  // 全无 → 未选;勾一行 → 部分选中(indeterminate / mixed);再勾一行 → 全选。
+  expect(all).not.toBeChecked();
+  expect(all.indeterminate).toBe(false);
+  fireEvent.click(rowA);
+  expect(all).toBePartiallyChecked();
+  expect(all.indeterminate).toBe(true);
+  fireEvent.click(rowB);
+  expect(all).toBeChecked();
+  expect(all.indeterminate).toBe(false);
+  // 点「全选」文字即全部取消(label 关联由原语保证)。
+  fireEvent.click(screen.getByText("全选"));
+  expect(rowA).not.toBeChecked();
+  expect(rowB).not.toBeChecked();
+  expect(all).not.toBeChecked();
+});
+
 test("折叠态不落悬空 aria-controls:待审详情与 AI 记录都是展开才挂载", async () => {
   adminMarketplacePending.mockResolvedValue([pending()]);
   adminMarketplaceAiReviews.mockResolvedValue([]);
@@ -270,4 +316,86 @@ test("折叠态不落悬空 aria-controls:待审详情与 AI 记录都是展开�
     expect(screen.getByRole("button", { name: /示例技能/ })).toHaveAttribute("aria-controls"),
   );
   expectAriaControlsResolvable();
+});
+
+test("拒绝理由输入框有常驻标签「拒绝原因」与说明,不再只靠 placeholder;空白不可提交,填写后原样送到 review(t-762 market#1)", async () => {
+  adminMarketplacePending.mockResolvedValue([pending()]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+  adminMarketplaceReview.mockResolvedValue({ ok: true });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText("示例技能");
+  fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "拒绝投稿" });
+  // 可访问名来自可见 <label>,不是 placeholder:输入后 placeholder 消失,名字仍在。
+  const input = within(dialog).getByRole("textbox", { name: "拒绝原因" });
+  expect(input).toHaveAttribute("placeholder", "例：正文包含内网地址，请移除后重新提交");
+  expect(input).toHaveAttribute("aria-required", "true");
+  expect(input).toHaveAccessibleDescription("原因会展示给发布者，请写明需要修正什么。");
+
+  const confirm = within(dialog).getByRole("button", { name: "拒绝" });
+  expect(confirm).toBeDisabled();
+  fireEvent.change(input, { target: { value: "  正文包含内网地址  " } });
+  expect(within(dialog).getByRole("textbox", { name: "拒绝原因" })).toBeInTheDocument();
+  expect(confirm).toBeEnabled();
+  fireEvent.click(confirm);
+  await waitFor(() =>
+    expect(adminMarketplaceReview).toHaveBeenCalledWith(auth, "1", "reject", "正文包含内网地址"),
+  );
+});
+
+test("kill-switch 分区窄屏默认折叠成一行,「展开」才露出输入;sm 起不受影响;slug 输入不再是裸词占位(K-13)", async () => {
+  adminMarketplacePending.mockResolvedValue([]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText(/紧急下架已上架条目/);
+
+  const toggle = screen.getByRole("button", { name: "展开" });
+  // 切换按钮只在窄屏出现(sm:hidden);正文在窄屏默认隐藏(max-sm:hidden),桌面端照常展开
+  expect(toggle).toHaveClass("sm:hidden");
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  const body = document.getElementById(toggle.getAttribute("aria-controls") ?? "");
+  expect(body).not.toBeNull();
+  expect(body).toHaveClass("max-sm:hidden");
+  expectAriaControlsResolvable();
+
+  fireEvent.click(toggle);
+  expect(screen.getByRole("button", { name: "收起" })).toHaveAttribute("aria-expanded", "true");
+  expect(body).not.toHaveClass("max-sm:hidden");
+  // placeholder 从裸词「slug」改成说人话的示例
+  expect(screen.getByLabelText("要下架的条目 slug")).toHaveAttribute(
+    "placeholder",
+    "要下架的条目 slug，如 ppt-master",
+  );
+});
+
+test("「带 evals」「自报增益存疑」的解释不再只挂 title:展开审查区第一行明文可见(K-14)", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({
+      versionId: "1",
+      name: "带评测技能",
+      rawBundle: { "evals/evals.json": '{"version":1,"cases":[]}' },
+      benchmark: { withPassRate: 0.4, withoutPassRate: 0.5, cases: 3 },
+    }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText("带评测技能");
+
+  expect(screen.getByText("带 evals")).not.toHaveAttribute("title");
+  expect(screen.getByText("自报增益存疑")).not.toHaveAttribute("title");
+  // 收起时解释不在正文里(徽章行只放信号)
+  expect(screen.queryByText(/附带 evals\/ 评测用例/)).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("带评测技能"));
+  expect(await screen.findByText("附带 evals/ 评测用例（发布者提供，未复跑验证）")).toBeInTheDocument();
+  expect(
+    screen.getByText("自报实测 50%→40%（3 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证"),
+  ).toBeInTheDocument();
 });

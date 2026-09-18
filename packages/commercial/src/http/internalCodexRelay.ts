@@ -125,6 +125,8 @@ export interface CodexRelayBindingRow {
   state: string
   provider: string | null
   accountStatus: string | null
+  /** Bound account's account_groups id. Null when unbound or the join missed. */
+  accountGroupId?: bigint | null
 }
 
 export interface CodexRelayDb {
@@ -732,12 +734,14 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
         state: string
         provider: string | null
         account_status: string | null
+        account_group_id: string | null
       }>(
         `SELECT ac.codex_account_id::text AS codex_account_id,
                 ac.user_id::text AS user_id,
                 ac.state,
                 ca.provider,
-                ca.status AS account_status
+                ca.status AS account_status,
+                ca.group_id::text AS account_group_id
            FROM agent_containers ac -- state selected above; handler rejects non-active
            LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
           WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'`,
@@ -751,6 +755,7 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
         state: row.state,
         provider: row.provider,
         accountStatus: row.account_status,
+        accountGroupId: row.account_group_id == null ? null : BigInt(row.account_group_id),
       }
     },
   }

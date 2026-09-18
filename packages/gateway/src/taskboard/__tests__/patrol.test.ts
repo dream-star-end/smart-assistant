@@ -36,6 +36,7 @@ import {
   STAGE_PROJECT_CONTEXT_MAX_CHARS,
   STAGE_PROJECT_CONTEXT_TRUNC,
   resetSharedPatrolState,
+  mergeRunUsage,
 } from '../patrol.js'
 import { alignedLeaseTtlMs } from '../domain.js'
 import { assertTransition } from '../stateMachine.js'
@@ -909,3 +910,11 @@ function seedReadyAi(
   })
   return { ticket, stage, projectId: project.id, pipelineId: pipeline.id }
 }
+
+
+it('OCV5-179 backfill precision stays bound to its amount source', () => {
+  const known = { tokensIn: 10, tokensOut: 1, costUsd: 2, costImprecise: null }
+  assert.equal(mergeRunUsage(known, { tokensIn: null, tokensOut: null, costUsd: 9, costImprecise: false }).costImprecise, null)
+  assert.equal(mergeRunUsage({ ...known, costUsd: null, costImprecise: true }, { tokensIn: null, tokensOut: null, costUsd: 9 }).costImprecise, null)
+  assert.equal(mergeRunUsage({ ...known, costUsd: null }, { tokensIn: null, tokensOut: null, costUsd: 9, costImprecise: true }).costImprecise, true)
+})

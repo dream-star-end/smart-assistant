@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "workId": "planet",
+  "kind": "original-interactive-code",
+  "authorship": "Created in OpenClaude for OCV5-172; not a third-party replay",
+  "rendering": "Browser-rendered cover, not an AI illustration",
+  "fullConversationReplay": false,
+  "files": [
+    {
+      "path": "/tutorials/showcase-works/planet/index.html",
+      "bytes": 12226,
+      "sha256": "b856b5f430eae547f502d1890cbbd4035ec0ab78a4b9527f363f66dab21a1ad5"
+    },
+    {
+      "path": "/tutorials/showcase-works/planet/source.zip",
+      "bytes": 5940,
+      "sha256": "99bf20524e8897be835eac13649a46ea436f6019f148ae58354fe38589628954"
+    },
+    {
+      "path": "/tutorials/showcase-works/planet/cover.png",
+      "bytes": 413793,
+      "sha256": "e8293125f3d545bebeb991cc2e37c90e2d45560da21cb550d6bd5705396ad3c5"
+    }
+  ],
+  "sourceFiles": [
+    "index.html"
+  ],
+  "limitations": "Procedural sphere shading and approximate atmosphere; no surface landing or observational data."
+}

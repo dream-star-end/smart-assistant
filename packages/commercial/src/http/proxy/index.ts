@@ -66,7 +66,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { findRouteProviderForModel, isCursorEngineModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -326,7 +326,11 @@ export function makeAnthropicProxyHandler(
       identity = await deps.identity.resolve(req, ctx);
     } catch (err) {
       if (err instanceof IdentityError) {
-        reqLog.warn("proxy_identity_failed", { errcode: err.code });
+        // `detail` 只进 server log(如 `unknown or revoked api key prefix=xxxx` /
+        // `user-agent not allowed …`),客户端仍拿统一 401 文案。2026-09-08 起补上:
+        // 一线排障(用户报 401)之前只有 errcode=API_KEY_INVALID,分不清是 key 撤销
+        // 还是 UA 不对,现在 prefix 可直接对到 user_api_keys 行。message 不含 secret。
+        reqLog.warn("proxy_identity_failed", { errcode: err.code, detail: err.message });
         incrAnthropicProxyReject("identity");
         sendJsonError(
           res,
@@ -478,25 +482,66 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 4a) cursor-* 引擎模型(仅 external API-key 实例注入 cursorExternal)。
+      // 4a) 引擎模型(仅 external API-key 实例注入 cursorExternal)。
       // 放在 authority gate 之前:gate 对 engine!=='ccb' 的模型一律 not_available,
       // 而这条路径的可用性由 cursorExternal 自己按 pricing.enabled + authorize + 账号池判定。
       // 授权/余额/账号选择/relay/settle/post-commit 全在 cursorExternal.handle 内完成;
       // 仍在本 try/finally 内 → releaseSlot 照常。
-      if (deps.cursorExternal && isCursorEngineModel(body.model)) {
-        await deps.cursorExternal.handle({
-          req,
-          res,
-          requestId,
-          uid,
-          identity,
-          body,
-          authorize: (p) => deps.identity.authorize(identity, p, body.model),
-          appendCostCredits: deps.appendCostCredits,
-          broadcastToUser: deps.broadcastToUser,
-          userLog,
-        });
-        return;
+      //
+      // 对外模型 id **不带引擎前缀、也不带思考档位**(2026-09-08):第三方客户端发
+      // 家族 id `fable-5.1`,思考深度由客户端自己决定(Claude Code 的 /effort、--effort、
+      // CLAUDE_CODE_EFFORT_LEVEL 会随请求带 `output_config.effort`),这里按
+      // 家族 + 请求 effort 解析成内部变体 `cursor-fable-5.1-<effort>` 走计费/授权/日志;
+      // 家族不提供的档位(或该变体在本部署被禁用)就近取不高于它的档位,没带 effort
+      // 用家族默认(high)。带档位后缀的公开 id(`fable-5.1-high`)和旧内部 id 仍接受,
+      // 且**钉死**档位(管理员现有配置不中断)。客户端原始写法保留在 requestedModel,
+      // 供错误文案 / 响应 `model` 回显使用,保证对外面不出现内部 id。Sand relay 编码
+      // 时不透传 output_config/thinking,所以这里不需要剥离。**只在注入 cursorExternal
+      // 的实例做**(容器 internal proxy 不认公开 id,行为零变化)。
+      if (deps.cursorExternal) {
+        const outputConfig = body.output_config;
+        const requestedEffort =
+          outputConfig !== null && typeof outputConfig === "object" && !Array.isArray(outputConfig)
+            ? (outputConfig as Record<string, unknown>).effort
+            : undefined;
+        // Claude Code auto-mode 安全分类器是"侧查询"(max_tokens≤64 + stop_sequences +
+        // 无工具,只回 yes/no):按家族默认 high 跑会想 13–52s,客户端判分类器超时 →
+        // 拒绝 Bash / 子代理。识别到就强制该家族最低档(2026-09-08,用户拍板)。
+        const sideQuery = isClassifierSideQuery(body);
+        const resolved = resolveCursorPublicModel(
+          body.model,
+          requestedEffort,
+          (internalId: string) => deps.pricing.get(internalId)?.enabled === true,
+          { sideQuery },
+        );
+        if (resolved) {
+          const requestedModel = body.model;
+          body.model = resolved.internalId;
+          if (resolved.effortSource !== "pinned") {
+            userLog.info("proxy_cursor_effort_resolved", {
+              requestedModel,
+              model: resolved.internalId,
+              effort: resolved.effort,
+              effortSource: resolved.effortSource,
+            });
+          }
+          await deps.cursorExternal.handle({
+            req,
+            res,
+            requestId,
+            uid,
+            identity,
+            body,
+            requestedModel,
+            effort: resolved.effort,
+            effortSource: resolved.effortSource,
+            authorize: (p) => deps.identity.authorize(identity, p, body.model),
+            appendCostCredits: deps.appendCostCredits,
+            broadcastToUser: deps.broadcastToUser,
+            userLog,
+          });
+          return;
+        }
       }
 
       // 4b) 模型执行权威 gate(模型权威批次 · 方案 §1.2/§4)。

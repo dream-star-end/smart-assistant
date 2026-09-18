@@ -22,6 +22,9 @@ import {
   DURABLE_TURN_DISPATCH_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_FIELD,
+  DISPATCH_AUTHORITY_FIELD,
+  computeDispatchRequestHash,
+  verifyDispatchAuthority,
   verifyAuthority,
   verifyTurnLease,
   assertLeaseMatchesAuthority,
@@ -54,8 +57,10 @@ import {
   type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
+import { buildAgentModelSnapshot, type AgentModelResolver } from "../ws/agentModelAuthority.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
+import { detectScanSciPaperIntent } from "../ws/paperIntentHint.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
 import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import {
@@ -207,12 +212,14 @@ interface Rig {
   epochAtSign: { value: bigint; fail?: boolean };
   receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }>;
   deferredPoolErrors: Error[];
+  dispatchValidationErrors: Error[];
 }
 
 async function startRig(opts: {
   /** 容器是否 attest(false = 旧 release / 旧 env,不广播 capability)。 */
   attest: "yes" | "no-capability" | "silent";
   authorityOn?: boolean;
+  loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   attestTimeoutMs?: number;
   fenceFails?: boolean;
   /** 容器 attest 前的人为延迟(测缓冲与重放)。 */
@@ -239,6 +246,8 @@ async function startRig(opts: {
     attemptNo: number;
   };
   receiptState?: "queued" | "rejected";
+  /** OCV5-187: verify the actual signed WS body before issuing a receipt. */
+  verifyDispatchReceipt?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
@@ -258,6 +267,7 @@ async function startRig(opts: {
   const keyIdsMode = opts.keyIds ?? "real";
   const receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }> = [];
   const deferredPoolErrors: Error[] = [];
+  const dispatchValidationErrors: Error[] = [];
   let admittedForAuthorityBinding: TurnDispatchRow | null = null;
   let authorityBinding: {
     authority_turn_id: string;
@@ -283,6 +293,9 @@ async function startRig(opts: {
   const defaultDurablePgPool = opts.durableDispatch && opts.pgPool === undefined
     ? {
         query: async (sql: string, params: unknown[] = []) => {
+          if (opts.verifyDispatchReceipt && /SELECT model_id FROM client_sessions/.test(sql)) {
+            return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+          }
           if (/SELECT status FROM users WHERE id/.test(sql)) return { rows: [] };
           if (/FROM github_session_workspaces/.test(sql)) return { rows: [] };
           if (/(INSERT INTO|UPDATE) turn_traces/.test(sql)) return { rows: [], rowCount: 0 };
@@ -293,6 +306,18 @@ async function startRig(opts: {
               assert.equal(params[0], d.dispatchId);
               assert.equal(params[1], d.leaseEpoch);
               receiptCasCalls.push({ dispatchId: d.dispatchId, leaseEpoch: d.leaseEpoch });
+              if (opts.verifyDispatchReceipt) {
+                assert.equal(d.status, "admitted");
+                d.status = "accepted";
+                d.acceptedAt = params[2] as Date;
+                // Mirror the SQL RETURNING row rather than acknowledging a
+                // no-op CAS (cron success requires durable accepted evidence).
+                const row = Object.fromEntries(Object.entries(d).map(([key, value]) => [
+                  key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+                  typeof value === "bigint" ? value.toString() : value,
+                ]));
+                return { rows: [row], rowCount: 1 };
+              }
               return { rows: [], rowCount: 0 };
             } catch (err) {
               deferredPoolErrors.push(err as Error);
@@ -428,6 +453,26 @@ async function startRig(opts: {
         if (parsed?.type === "inbound.message") {
           const d = admittedForAuthorityBinding ?? opts.receiptIdentity ?? null;
           assert.ok(d, "dispatch receipt must follow an admitted dispatch");
+          if (opts.verifyDispatchReceipt) {
+            try {
+              const frame = JSON.parse(raw);
+              const signed = verifyDispatchAuthority(
+                frame[DISPATCH_AUTHORITY_FIELD], signer.publicKeyring(), Date.now(),
+              );
+              assert.ok(admittedForAuthorityBinding);
+              assert.equal(signed.dispatchId, d.dispatchId);
+              assert.equal(signed.sessionId, frame.peer.id);
+              assert.equal(signed.clientMessageId, frame.clientMessageId);
+              assert.equal(signed.payloadHash, admittedForAuthorityBinding.requestHash);
+              assert.equal(
+                signed.payloadHash, computeDispatchRequestHash(frame.content),
+                "OCV5-187 signed dispatch hash must match the actual WS content",
+              );
+            } catch (err) {
+              dispatchValidationErrors.push(err as Error);
+              return; // A rejected body must never receive a success receipt.
+            }
+          }
           ws.send(JSON.stringify({
             type: "outbound.control.turn_dispatch_receipt",
             sessionId: d.sessionId,
@@ -464,6 +509,7 @@ async function startRig(opts: {
 
   const bridge = createUserChatBridge({
     jwtSecret: JWT_SECRET,
+    ...(opts.loadAgentModelResolver ? { loadAgentModelResolver: opts.loadAgentModelResolver } : {}),
     resolveContainerEndpoint: async () => ({
       host: "127.0.0.1",
       port: containerPort,
@@ -526,6 +572,7 @@ async function startRig(opts: {
     epochAtSign,
     receiptCasCalls,
     deferredPoolErrors,
+    dispatchValidationErrors,
   };
 }
 
@@ -1145,6 +1192,137 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
     },
   };
 }
+
+describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
+  const cases = [
+    { name: "paper intent", text: "请下载论文 https://doi.org/10.1038/s41586-024-00001-0", paper: true },
+    { name: "technical callback false positive", text: "Find comparison risk review results. The delegated task is complete.", paper: true },
+    { name: "ordinary callback", text: "子任务已完成，请继续整理结果。", paper: false },
+  ];
+
+  for (const [index, sample] of cases.entries()) {
+    test(`OCV5-187 cron-origin ${sample.name}: original text, signed hash and accepted receipt agree`, async () => {
+      assert.equal(detectScanSciPaperIntent(sample.text) !== null, sample.paper);
+      const admissions: AdmitUserTurnInput[] = [];
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, verifyDispatchReceipt: true,
+        admitUserTurn: async (input) => {
+          admissions.push(input);
+          return fakeAdmittedDispatch(input);
+        },
+      });
+      let client: WebSocket | undefined;
+      let injection: ReturnType<UserChatBridgeHandler["injectCronOriginTurn"]> | undefined;
+      try {
+        client = await openClient(rig.port);
+        await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+        const clientMessageId = `dlgcb-ocv5-187-${index}`;
+        injection = rig.bridge.injectCronOriginTurn({
+          uid: BigInt(UID), sessionId: `sess-callback-${index}`,
+          clientMessageId, agentId: "main", text: sample.text,
+        });
+        await waitFor(() => rig.containerSeen.some((raw) => raw.includes(clientMessageId)));
+        assert.deepEqual(rig.dispatchValidationErrors, [], "signed WS body must validate before receipt");
+        const result = await injection;
+        assert.equal(result.kind, "injected", "success requires the accepted CAS RETURNING row");
+        assert.equal(admissions.length, 1);
+        assert.equal(admissions[0]!.model, "glm-5.2", "preserve the origin session model");
+        const frames = rig.containerSeen.map((raw) => JSON.parse(raw))
+          .filter((frame) => frame.type === "inbound.message" && frame.clientMessageId === clientMessageId);
+        assert.equal(frames.length, 1, "a callback is forwarded exactly once");
+        assert.deepEqual(frames[0].content, { text: sample.text });
+        assert.equal(frames[0].model, "glm-5.2");
+        assert.equal(admissions[0]!.requestHash, computeDispatchRequestHash({ text: sample.text }));
+        assert.equal(rig.receiptCasCalls.length, 1);
+        assert.deepEqual(rig.deferredPoolErrors, []);
+      } finally {
+        client?.terminate();
+        await stopRig(rig);
+        await injection;
+      }
+    });
+  }
+
+  test("OCV5-187 browser paper hint stays before admission even with forged cron-origin fields", async () => {
+    const text = cases[0]!.text;
+    const admissions: AdmitUserTurnInput[] = [];
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, verifyDispatchReceipt: true,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    let client: WebSocket | undefined;
+    try {
+      client = await openClient(rig.port);
+      client.send(inboundFrame({
+        clientMessageId: "browser-ocv5-187", content: { text },
+        ingress: "cron_origin", isCronOriginDispatch: true,
+        idempotencyKey: "cron-origin:browser-ocv5-187",
+      }));
+      await waitFor(() => rig.containerSeen.some((raw) => raw.includes("browser-ocv5-187")));
+      assert.deepEqual(rig.dispatchValidationErrors, []);
+      const frame = firstInbound(rig.containerSeen);
+      const content = frame.content as { text: string; displayText: string };
+      assert.notEqual(content.text, text, "browser paper hint remains active");
+      assert.ok(content.text.startsWith(text));
+      assert.equal(content.displayText, text);
+      assert.equal(admissions.length, 1);
+      assert.equal(admissions[0]!.message.text, text, "persist the user's unmodified display text");
+      assert.equal(admissions[0]!.requestHash, computeDispatchRequestHash(content));
+      await waitFor(() => rig.receiptCasCalls.length === 1);
+      assert.deepEqual(rig.deferredPoolErrors, []);
+    } finally {
+      client?.terminate();
+      await stopRig(rig);
+    }
+  });
+});
+
+describe("bridge SESSION_DELETED admit wire (OCV5-180 C)", () => {
+  test("session_deleted admit is SESSION_DELETED, not retryable, and never starts container work", async () => {
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      admitUserTurn: async () => {
+        admitCalls += 1;
+        return { kind: "session_deleted" };
+      },
+      hasCompletedClientTurn: async () => false,
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const fc = frameCollector(ws);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-deleted-admit",
+          idempotencyKey: "web:cm-deleted-admit:0",
+          peer: { id: "sess-deleted-admit", kind: "dm" },
+        }),
+      );
+      const error = await fc.next();
+      assert.equal(error.type, "error");
+      assert.equal(error.code, "SESSION_DELETED");
+      assert.equal(error.retryable, false);
+      assert.equal(error.action, "new_session");
+      assert.match(String(error.message), /deleted/i);
+      assert.equal(admitCalls, 1);
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(
+        rig.containerSeen.some((raw) => {
+          try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }),
+        false,
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
 
 describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", () => {
   test("已有 completed assistant 行 → dedup ack 且 admitUserTurn 从未被调用(无孤儿 dispatch)", async () => {
@@ -2213,4 +2391,113 @@ describe("M7 drain 窗口:有 admitted dispatch → max(billing, dispatch)（非
       await stopRig(rig);
     }
   });
+});
+
+
+test("OCV5-179: inferred marketplace auto is signed AND forwarded as a concrete model", async () => {
+  // A stale container defaults.model must never decide this auto turn.
+  const map = buildAgentModelSnapshot(
+    [{ slug: "auto-agent", rawManifest: JSON.stringify({ model: "auto" }) } as never], [],
+    new Map([["main", { model: "glm-5.2", provider: "zhipu" }]]),
+  );
+  const rig = await startRig({ attest: "yes", loadAgentModelResolver: async () => id => map.get(id) ?? null });
+  try {
+    const ws = await openClient(rig.port);
+    ws.send(inboundFrame({ agentId: "auto-agent", model: undefined }));
+    await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
+    const f = firstInbound(rig.containerSeen);
+    const bundle = f[MODEL_AUTHORITY_FIELD] as { authority: string; lease: string };
+    const authority = verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now());
+    assert.equal(authority.canonicalModel, "glm-5.2");
+    assert.equal(f.model, "glm-5.2", "concrete frame model outranks container agent:auto/defaults.model");
+    ws.close();
+  } finally {
+    await stopRig(rig);
+  }
+});
+
+const identityProfile = { profileId: 'uid3-butler-unification', legacyAgentId: 'butler', canonicalAgentId: 'personal-butler', localPersonaPath: 'agents/butler/CLAUDE.md', localSkillStorageId: 'butler' };
+for (const requestedId of ['butler', 'personal-butler']) {
+  test(`OCV5-179 identity: ${requestedId} explicit model cannot bypass fresh unavailable authority`, async () => {
+    const resolver = (() => 'glm-5.2') as AgentModelResolver;
+    resolver.isIdentityRegistered = (id) => id === "butler" || id === "personal-butler";
+    resolver.authorizeExecution = async () => { throw new Error('COMPAT_NOT_READY'); };
+    const rig = await startRig({ attest: 'yes', loadAgentModelResolver: async () => resolver });
+    try {
+      const ws = await openClient(rig.port);
+      const received: string[] = [];
+      ws.on('message', data => received.push(data.toString()));
+      const closed = new Promise<void>(resolve => ws.once('close', () => resolve()));
+      ws.send(inboundFrame({ agentId: requestedId, model: 'glm-5.2' }));
+      await Promise.race([closed, waitFor(() => received.some(s => s.includes('UNRESOLVED_AGENT_MODEL')))]);
+      assert.ok(received.some(s => s.includes('UNRESOLVED_AGENT_MODEL')));
+      assert.equal(rig.containerSeen.some(s => s.includes('inbound.message')), false, 'unavailable identity must not reach the runner');
+    } finally { await stopRig(rig); }
+  });
+}
+
+test('OCV5-179 identity: signed model uses returned execution snapshot, raw routing stays legacy, warm revocation rejects', async () => {
+  let ready = true;
+  const resolver = (() => 'gpt-5.6-sol') as AgentModelResolver; // deliberately stale display projection
+  resolver.isIdentityRegistered = (id) => id === "butler" || id === "personal-butler";
+  resolver.isRuntimeDenied = () => true; // must not override this frame's fresh positive authority
+  resolver.authorizeExecution = async (requestedId) => {
+    if (!ready) throw new Error('COMPAT_AUTHORITY_UNAVAILABLE');
+    return { identity: { requestedId, executionAgentId: 'personal-butler', profile: identityProfile, status: 'registered-ready' }, model: 'glm-5.2' };
+  };
+  const rig = await startRig({ attest: 'yes', loadAgentModelResolver: async () => resolver });
+  try {
+    const ws = await openClient(rig.port);
+    ws.send(inboundFrame({ agentId: 'butler', model: undefined, clientMessageId: 'identity-first', peer: {id: 'legacy-peer', kind: 'dm'} }));
+    await waitFor(() => rig.containerSeen.some(s => s.includes(MODEL_AUTHORITY_FIELD)));
+    const frame = firstInbound(rig.containerSeen);
+    assert.equal(frame.agentId, 'butler', 'raw owner/key routing is not canonicalized');
+    assert.equal((frame.peer as { id: string }).id, 'legacy-peer');
+    assert.equal(frame.model, 'glm-5.2');
+    const bundle = frame[MODEL_AUTHORITY_FIELD] as {authority: string};
+    assert.equal(verifyAuthority(bundle.authority, rig.signer.publicKeyring(), Date.now()).canonicalModel, 'glm-5.2');
+    const before = rig.containerSeen.filter(s => s.includes('inbound.message')).length;
+    ready = false;
+    const received: string[] = [];
+    ws.on('message', data => received.push(data.toString()));
+    ws.send(inboundFrame({ agentId: 'butler', model: 'glm-5.2', clientMessageId: 'identity-second', peer: {id: 'legacy-peer', kind: 'dm'} }));
+    await waitFor(() => received.some(s => s.includes('UNRESOLVED_AGENT_MODEL')));
+    assert.equal(rig.containerSeen.filter(s => s.includes('inbound.message')).length, before, 'warm explicit-model turn is freshly gated');
+    ws.close();
+  } finally { await stopRig(rig); }
+});
+
+
+test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer, and cleanup prevents late forwarding', async () => {
+  let release!: () => void;
+  const slow = new Promise<void>(resolve => { release = resolve; });
+  const calls: string[] = [];
+  const resolver = (() => 'glm-5.2') as AgentModelResolver;
+  resolver.isIdentityRegistered = (id) => id === 'butler' || id === 'personal-butler';
+  resolver.authorizeExecution = async (requestedId) => {
+    calls.push(requestedId);
+    if (calls.length === 1) await slow;
+    return {identity: {requestedId, executionAgentId: 'personal-butler', profile: identityProfile, status: 'registered-ready'}, model:'glm-5.2'};
+  };
+  const rig = await startRig({attest:'yes',loadAgentModelResolver:async()=>resolver});
+  try {
+    const ws = await openClient(rig.port);
+    const peer = {id:'same-legacy-peer',kind:'dm'};
+    ws.send(inboundFrame({agentId:'butler',clientMessageId:'slow-first',peer}));
+    await waitFor(()=>calls.length===1);
+    ws.send(inboundFrame({agentId:'personal-butler',clientMessageId:'fast-second',peer}));
+    // A control frame remains responsive while execution readiness is pending.
+    ws.send(JSON.stringify({type:'hello',peer}));
+    await waitFor(()=>rig.containerSeen.some(s=>s.includes('hello')));
+    assert.deepEqual(calls,['butler'], 'second same-peer readiness must not start ahead of first');
+    assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false);
+    const closed = new Promise<void>(resolve=>ws.once('close',()=>resolve()));
+    ws.close();
+    await closed;
+    release();
+    await slow;
+    await new Promise(resolve=>setTimeout(resolve,75));
+    assert.deepEqual(calls,['butler'], 'closed bridge must not start the queued readiness read');
+    assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false,'late readiness must not execute after cleanup');
+  } finally {release();await stopRig(rig);}
 });

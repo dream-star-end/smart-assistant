@@ -5,6 +5,7 @@
  */
 
 import { cursorCredentialModelFamily } from "@openclaude/protocol";
+import { expiryProximityFactor, quotaHeadroom, resetProximityFactor } from "./poolWeight.js";
 
 export const CURSOR_QUOTA_CLASSES = ["unknown", "other_ok", "cursor_only"] as const;
 export type CursorQuotaClass = (typeof CURSOR_QUOTA_CLASSES)[number];
@@ -205,24 +206,20 @@ export interface CursorSlotWeightInputs {
 
 export function computeCursorSlotWeight(input: CursorSlotWeightInputs, now: Date): number {
   if (input.sandAccessState && /BLOCKED/i.test(input.sandAccessState)) return CURSOR_SLOT_WEIGHT_MIN;
-  const pct = input.sandUsagePct;
-  const headroom = pct === null || !Number.isFinite(pct)
-    ? 0.5
-    : Math.max(0.02, Math.min(1, (100 - pct) / 100));
-  const hours = (d: Date | null): number | null => {
-    if (!d) return null;
-    const ms = d.getTime() - now.getTime();
-    return Number.isFinite(ms) ? ms / 3_600_000 : null;
-  };
-  const resetH = hours(input.sandNextResetAt);
-  const resetFactor = resetH === null ? 1 : resetH < 24 ? 1.5 : resetH < 72 ? 1.2 : 1;
-  const expiryH = hours(input.billingCycleEnd);
-  const expiryFactor = expiryH === null
-    ? 1
-    : expiryH <= 0
-      ? 0.2
-      : expiryH < 72 ? 1.5 : expiryH < 168 ? 1.2 : 1;
-  const raw = Math.round(headroom * resetFactor * expiryFactor * 1000);
+  // Cursor NULL policy: never-observed usage is 0.5 (half-neutral), unlike the
+  // scheduler's 1.0 — a fresh Cursor account is not assumed to be empty.
+  // Historical edges kept exactly: non-finite (±Infinity/NaN) → unknown 0.5;
+  // a negative pct was clamped to full headroom (1.0), not treated as unknown.
+  const pct = input.sandUsagePct === null || !Number.isFinite(input.sandUsagePct)
+    ? null
+    : Math.max(0, input.sandUsagePct);
+  const headroom = quotaHeadroom(pct, { unknown: 0.5 });
+  const raw = Math.round(
+    headroom
+      * resetProximityFactor(input.sandNextResetAt, now)
+      * expiryProximityFactor(input.billingCycleEnd, now)
+      * 1000,
+  );
   return Math.max(CURSOR_SLOT_WEIGHT_MIN, Math.min(CURSOR_SLOT_WEIGHT_MAX, raw));
 }
 

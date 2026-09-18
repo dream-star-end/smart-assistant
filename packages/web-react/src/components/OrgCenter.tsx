@@ -5,7 +5,7 @@ import { api } from "../lib/api";
 import { canManageOrgBilling } from "../lib/orgBilling";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { AuthSession, OrgRole, OrgSubscriptionInfo, User } from "../lib/types";
-import { Tabs } from "./ui";
+import { IconButton, Tabs } from "./ui";
 import { CreateOrgWizard } from "./org/CreateOrgWizard";
 import { InvoicesTab } from "./org/InvoicesTab";
 import { MembersTab } from "./org/MembersTab";
@@ -126,20 +126,23 @@ export function OrgCenter({
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="oc-center-dialog fixed left-1/2 z-50 flex h-[min(85vh,46rem)] h-[min(85dvh,46rem)] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
+          data-testid="org-center-dialog"
+          // 五分区内容多、要定高让内部滚动；创建向导只有一两个输入框，定高会留下 700px 空白
+          // （审计 SET-34），改为按内容自适应、只封顶。不走 cn()：twMerge 会把 vh 回退类当重复项吞掉。
+          className={`oc-center-dialog fixed left-1/2 z-50 flex w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in ${
+            showWizard
+              ? "max-h-[min(85vh,46rem)] max-h-[min(85dvh,46rem)]"
+              : "h-[min(85vh,46rem)] h-[min(85dvh,46rem)]"
+          }`}
         >
           <div className="flex items-center justify-between gap-3 px-5 py-4">
             <Dialog.Title className="min-w-0 truncate text-title font-semibold text-fg">
               {showWizard ? "创建组织" : (user?.org?.name ?? "组织")}
             </Dialog.Title>
             <Dialog.Close asChild>
-              <button
-                type="button"
-                aria-label="关闭"
-                className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
-              >
+              <IconButton variant="muted" size="md" shape="square" aria-label="关闭">
                 <X size={17} />
-              </button>
+              </IconButton>
             </Dialog.Close>
           </div>
 

@@ -406,6 +406,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         resolveResumeFallback: opts.resolveResumeFallback,
         model: opts.model,
         persona: opts.persona,
+        identityCompat: opts.identityCompat,
         // 安全 gate(见文件头):engine 路由后任意 provider 的 agent 都可能落到
         // codex 底座,这里强制 'codex-native' 让 promptSlots 的 literature scrub
         // 与 GPT understand_image 提示段按 codex 语义生效,不受 agents.yaml 摆布。
@@ -581,6 +582,15 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       const pendingGoal = this._pendingGoalMessage
       this._pendingGoalMessage = null
       parser.parse(pendingGoal as unknown as SdkMessage)
+    }
+    if (params.consultTurn && params.turnKey) {
+      this.kernel.setConsultTurn({
+        turnKey: params.turnKey,
+        turnIndex: params.consultTurn.turnIndex,
+        configVersion: params.consultTurn.configVersion,
+      })
+    } else {
+      this.kernel.setConsultTurn(undefined)
     }
     let submitted: Promise<void>
     try {

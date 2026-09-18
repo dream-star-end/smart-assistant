@@ -1,5 +1,5 @@
 import { Check, Copy, ExternalLink, Link2, RefreshCw, Unlink } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 
 import { qrDataUrl } from '../../admin/pages/alerts/qr/qr'
 import { type QqBindingStart, type QqBindingStatus, api, apiErrorMessage } from '../../lib/api'
@@ -22,6 +22,10 @@ export function QqBindingCard({
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmDialog, confirmDialogEl] = useConfirm()
+  // 「主动推送到 QQ」开关的可访问名 / 说明:左侧那两行文字就是标签,用 id 连过去而不是再抄一份
+  //(t-762 settings#1:CDP 无障碍树里这枚 Switch 的 name 为空,读屏只播「开关,已开启」)。
+  const pushLabelId = useId()
+  const pushHintId = useId()
 
   const refresh = useCallback(async () => {
     const next = await api.getQqBinding(auth)
@@ -52,6 +56,19 @@ export function QqBindingCard({
     () => (binding?.entry_url ? qrDataUrl(binding.entry_url, 220) : null),
     [binding?.entry_url],
   )
+
+  // 复制失败要有提示，而不是红控制台（审计 SET-23）：非安全上下文 navigator.clipboard 是 undefined，
+  // 直接 .writeText 会同步抛；权限被拒则 reject。两种都兜到同一句提示，绑定码本身仍可手抄。
+  async function copyBindCommand(text: string) {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1_500)
+    } catch {
+      setCopied(false)
+      setError('复制失败，请手动输入上面的绑定命令。')
+    }
+  }
 
   async function start() {
     setBusy(true)
@@ -132,12 +149,16 @@ export function QqBindingCard({
         <div className="border-t border-border px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-body text-fg">主动推送到 QQ</div>
-              <div className="mt-0.5 text-caption text-faint">
+              <div id={pushLabelId} className="text-body text-fg">
+                主动推送到 QQ
+              </div>
+              <div id={pushHintId} className="mt-0.5 text-caption text-faint">
                 定时任务与提醒优先发送到已绑定 QQ
               </div>
             </div>
             <Switch
+              aria-labelledby={pushLabelId}
+              aria-describedby={pushHintId}
               checked={prefs.qq_proactive_push !== false}
               onCheckedChange={(checked) => void onPatch({ qq_proactive_push: checked })}
             />
@@ -172,11 +193,8 @@ export function QqBindingCard({
               <div className="mt-4 text-meta font-medium text-fg">2. 向机器人发送</div>
               <button
                 type="button"
-                onClick={() => {
-                  void navigator.clipboard.writeText(`/bind ${binding.bind_code}`)
-                  setCopied(true)
-                  window.setTimeout(() => setCopied(false), 1_500)
-                }}
+                aria-label="复制绑定命令"
+                onClick={() => void copyBindCommand(`/bind ${binding.bind_code}`)}
                 className="mt-2 flex items-center justify-between rounded-xl border border-border bg-elevated px-3 py-3 font-mono text-title font-semibold tracking-wider text-fg"
               >
                 <span>/bind {binding.bind_code}</span>

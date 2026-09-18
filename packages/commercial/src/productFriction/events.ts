@@ -39,12 +39,46 @@ export interface ProductFrictionEvent {
   lineNo?: number | null;
   colNo?: number | null;
   errorFingerprint?: string | null;
+  /** Bounded card tone (0278). Invalid values are stored as NULL. */
+  presentation?: "red" | "yellow" | "soft" | "banner" | "placeholder" | null;
+  /** Bounded snake token (0278 CHECK `^[a-z0-9_]{1,32}$`). Invalid → NULL. */
+  path?: string | null;
+  /** Bounded snake token (0278 CHECK `^[a-z0-9_]{1,48}$`). Invalid → NULL. */
+  reason?: string | null;
 }
 
 function clampText(value: string | null | undefined, max: number): string | null {
   if (!value) return null;
   return value.slice(0, max);
 }
+
+const PRESENTATIONS = new Set(["red", "yellow", "soft", "banner", "placeholder"]);
+/** Must match 0278 CHECK and clientErrors whitelist character-for-character. */
+const FRICTION_PATH_RE = /^[a-z0-9_]{1,32}$/;
+const FRICTION_REASON_RE = /^[a-z0-9_]{1,48}$/;
+
+function sanitizePresentation(
+  value: ProductFrictionEvent["presentation"],
+): ProductFrictionEvent["presentation"] {
+  return value && PRESENTATIONS.has(value) ? value : null;
+}
+
+function sanitizePath(value: string | null | undefined): string | null {
+  const clamped = clampText(value, 32);
+  return clamped && FRICTION_PATH_RE.test(clamped) ? clamped : null;
+}
+
+function sanitizeReason(value: string | null | undefined): string | null {
+  const clamped = clampText(value, 48);
+  return clamped && FRICTION_REASON_RE.test(clamped) ? clamped : null;
+}
+
+/**
+ * Same predicate as the outcome CASE that actually adopts EXCLUDED.outcome.
+ * presentation/path/reason only latest-non-null-win when this is true, so a
+ * late failed(decision_timeout) cannot rewrite a recovered/cancelled row.
+ */
+const ADOPT_EXCLUDED_OUTCOME_SQL = `(product_friction_events.outcome NOT IN ('recovered','succeeded','abandoned','cancelled') AND (product_friction_events.outcome='pending' OR (product_friction_events.outcome='failed' AND EXCLUDED.outcome IN ('recovered','succeeded','abandoned','cancelled'))))`;
 
 export function productFrictionEventKey(input: Pick<ProductFrictionEvent, "correlation" | "surface" | "stage">): string {
   return createHash("sha256")
@@ -76,9 +110,9 @@ export async function recordProductFrictionEvent(
        (event_key, user_id, surface, stage, code, outcome, attempts, latency_ms,
         model, provider, client_build, browser_family, device_class, trace_id,
         session_id, entity_slug, error_name, script_ref, line_no, col_no,
-        error_fingerprint, recovered_at)
+        error_fingerprint, presentation, path, reason, recovered_at)
      VALUES ($1,$2,$3,$4,$5,$6::varchar,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-             $17,$18,$19,$20,$21,
+             $17,$18,$19,$20,$21,$22,$23,$24,
              CASE WHEN $6::varchar IN ('recovered','succeeded') THEN NOW() ELSE NULL END)
      ON CONFLICT (event_key) DO UPDATE SET
        outcome = CASE
@@ -107,6 +141,9 @@ export async function recordProductFrictionEvent(
        line_no = COALESCE(product_friction_events.line_no, EXCLUDED.line_no),
        col_no = COALESCE(product_friction_events.col_no, EXCLUDED.col_no),
        error_fingerprint = COALESCE(product_friction_events.error_fingerprint, EXCLUDED.error_fingerprint),
+       presentation = CASE WHEN ${ADOPT_EXCLUDED_OUTCOME_SQL} THEN COALESCE(EXCLUDED.presentation, product_friction_events.presentation) ELSE product_friction_events.presentation END,
+       path = CASE WHEN ${ADOPT_EXCLUDED_OUTCOME_SQL} THEN COALESCE(EXCLUDED.path, product_friction_events.path) ELSE product_friction_events.path END,
+       reason = CASE WHEN ${ADOPT_EXCLUDED_OUTCOME_SQL} THEN COALESCE(EXCLUDED.reason, product_friction_events.reason) ELSE product_friction_events.reason END,
        recovered_at = CASE
          WHEN product_friction_events.outcome IN ('recovered','succeeded','abandoned','cancelled')
            THEN product_friction_events.recovered_at
@@ -136,6 +173,9 @@ export async function recordProductFrictionEvent(
       clampLine(input.lineNo),
       clampLine(input.colNo),
       clampText(input.errorFingerprint, 16),
+      sanitizePresentation(input.presentation),
+      sanitizePath(input.path),
+      sanitizeReason(input.reason),
     ],
     runner,
   );

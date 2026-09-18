@@ -135,6 +135,30 @@ describe('commercial prompt queue dispatch grant', () => {
       },
     }
     assert.deepEqual(parsePromptQueueDispatchRequest(withModelSwitch), withModelSwitch)
+    const withCollab = {
+      ...request,
+      item: {
+        ...request.item,
+        requestedExecution: {
+          ...request.item.requestedExecution,
+          collabMode: 'advisor' as const,
+          advisorModel: 'gpt-6-astra',
+          collabConfigVersion: 'v1:advisor:gpt-6-astra',
+          teamMode: false,
+        },
+      },
+    }
+    assert.deepEqual(parsePromptQueueDispatchRequest(withCollab), withCollab)
+    assert.equal(
+      parsePromptQueueDispatchRequest({
+        ...withCollab,
+        item: {
+          ...withCollab.item,
+          requestedExecution: { ...withCollab.item.requestedExecution, collabMode: 'panel' },
+        },
+      }),
+      null,
+    )
     assert.equal(parsePromptQueueDispatchRequest({
       ...withModelSwitch,
       item: {

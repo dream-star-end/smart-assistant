@@ -70,15 +70,21 @@ export async function truncateAllForTest(
 export async function resetTestSchemaForTest(
   runner: QueryRunner = getPool() as unknown as QueryRunner,
 ): Promise<void> {
-  const dbResult = await runner.query<{ db: string }>("SELECT current_database() AS db");
-  const db = dbResult.rows[0]?.db;
-  if (!db || !SAFE_DB_NAME.test(db)) {
-    throw new Error(
-      `resetTestSchemaForTest refuses to run against non-test database: ${JSON.stringify(db)}`,
-    );
-  }
-  await query("DROP SCHEMA public CASCADE", [], runner);
-  await query("CREATE SCHEMA public", [], runner);
+  // One server statement keeps the guard and both DDL operations on the same
+  // connection, even for a Pool runner. Failure rolls back the DROP; an outer
+  // transaction keeps ownership of its COMMIT/ROLLBACK.
+  await query(`
+    DO $reset_test_schema$
+    BEGIN
+      IF pg_catalog.current_database() !~ '_test$' THEN
+        RAISE EXCEPTION 'resetTestSchemaForTest refuses to run against non-test database: %',
+          pg_catalog.to_json(pg_catalog.current_database())::text;
+      END IF;
+      DROP SCHEMA IF EXISTS public CASCADE;
+      CREATE SCHEMA public;
+    END
+    $reset_test_schema$;
+  `, [], runner);
 }
 
 // ───────────────────────────────────────────────────────────────────────

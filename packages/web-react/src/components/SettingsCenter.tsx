@@ -3,7 +3,9 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent }
 import type { Theme } from "../hooks/useTheme";
 import { useMdViewport } from "../hooks/useMdViewport";
 import { api, apiErrorMessage } from "../lib/api";
+import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
+import { filedIcp } from "../lib/legal";
 import {
   PRODUCT_CAPABILITIES,
   type ProductFeatureId,
@@ -20,8 +22,7 @@ import { cn } from "../lib/utils";
 import { AccountTab } from "./settings/AccountTab";
 import { ApiAccessTab } from "./settings/ApiAccessTab";
 import { FeedbackTab } from "./settings/FeedbackTab";
-import { PreferencesTab } from "./settings/PreferencesTab";
-import { SettingsRow } from "./settings/SettingsRow";
+import { BuiltinHotkeysTable, PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 import { Avatar, Button, Modal, Spinner, Tabs } from "./ui";
@@ -31,24 +32,26 @@ export type SettingsSection = SettingsDestinationSection;
 type SectionDef = {
   id: SettingsSection;
   label: string;
+  /** 窄屏宫格列宽只有 ~80px，长标签在这里会被省略号截断（审计 SET-12），给它一个短名。 */
+  narrowLabel?: string;
   featureId?: ProductFeatureId;
   /** 仅 admin 可见(API key 管理面当前 admin-only rollout)。 */
   adminOnly?: boolean;
 };
 
 const PERSONAL: SectionDef[] = [
-  { id: "account", label: "账户与计费", featureId: PRODUCT_CAPABILITIES.billing.id },
+  {
+    id: "account",
+    label: "账户与计费",
+    narrowLabel: "账户",
+    featureId: PRODUCT_CAPABILITIES.billing.id,
+  },
   { id: "usage", label: "用量", featureId: PRODUCT_CAPABILITIES.billing.id },
   { id: "api-access", label: "API 接入", adminOnly: true },
   { id: "preferences", label: "偏好", featureId: PRODUCT_CAPABILITIES.preferences.id },
   { id: "hotkeys", label: "快捷键" },
   { id: "feedback", label: "反馈", featureId: PRODUCT_CAPABILITIES.feedback.id },
   { id: "about", label: "关于" },
-];
-
-const WORKSPACE: SectionDef[] = [
-  { id: "github", label: "GitHub" },
-  { id: "plugins", label: "插件" },
 ];
 
 function isAdminUser(user: User | null): boolean {
@@ -61,13 +64,9 @@ function useVisibleSections(user: User | null) {
   return useMemo(() => {
     const keep = (s: SectionDef) => !s.adminOnly || admin;
     const personal = PERSONAL.filter(keep);
-    const workspace = WORKSPACE.filter(keep);
     return {
-      sections: [...personal, ...workspace],
-      groups: [
-        { label: "个人", items: personal },
-        { label: "工作区", items: workspace },
-      ],
+      sections: personal,
+      groups: [{ label: "个人", items: personal }],
     };
   }, [admin]);
 }
@@ -87,8 +86,7 @@ export function SettingsCenter({
   onRefreshMe,
   onPreferencesChange,
   onOpenMemory,
-  onOpenManage,
-  onOpenRepo,
+  onOpenProjectSettings,
   feedbackContext,
   initialSection = "account",
   subscribeOpenSignal = 0,
@@ -103,10 +101,11 @@ export function SettingsCenter({
   onRefreshMe?: () => void;
   onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
   onOpenMemory: () => void;
-  /** 插件深链：先关设置再打开管理中心 connectors。 */
+  /** 保留给 App 装配；GitHub/插件已从设置分区移除，教程深链走 openRepo/openManage。 */
   onOpenManage?: () => void;
-  /** GitHub 深链：先关设置再打开对话区绑定。 */
   onOpenRepo?: () => void;
+  /** 用量页 facade 未绑定：关设置后打开当前聊天项目设置。 */
+  onOpenProjectSettings?: () => void;
   feedbackContext?: { sessionId: string | null; requestId: string | null };
   initialSection?: SettingsSection;
   /** Increment to programmatically open SubscriptionDialog on the account tab. */
@@ -125,7 +124,8 @@ export function SettingsCenter({
   const [prefsErr, setPrefsErr] = useState<string | null>(null);
   const [prefsReloadTick, setPrefsReloadTick] = useState(0);
 
-  const needsPreferences = section === "preferences" || section === "hotkeys";
+  // 只有偏好页真的读 prefs;快捷键是静态表,不该被偏好接口的加载 / 失败挡住(审计 SET-02)。
+  const needsPreferences = section === "preferences";
 
   useEffect(() => {
     if (open) {
@@ -216,14 +216,17 @@ export function SettingsCenter({
               <Tabs
                 aria-label="设置分区"
                 idBase="settings"
+                layout="grid"
                 value={section}
                 onValueChange={(v) => setSection(v as SettingsSection)}
                 items={sections.map((s) => ({
                   value: s.id,
-                  label: s.label,
+                  label: s.narrowLabel ?? s.label,
                   featureId: s.featureId,
                 }))}
-                className="[&_[role=tab]]:px-3"
+                // 三列宫格放 7 个分区(admin 多一个「API 接入」)会在第三行剩一个孤项;
+                // 超过 6 项时改四列(4+3),6 项保持 3+3(审计 SET-12)。
+                className={cn("[&_[role=tab]]:px-3", sections.length > 6 && "grid-cols-4")}
               />
             </div>
           )}
@@ -253,8 +256,9 @@ export function SettingsCenter({
               ledgerReload={ledgerReload}
               onRefreshMe={onRefreshMe}
               feedbackContext={feedbackContext}
-              onOpenManage={onOpenManage ? () => leaveTo(onOpenManage) : undefined}
-              onOpenRepo={onOpenRepo ? () => leaveTo(onOpenRepo) : undefined}
+              onOpenProjectSettings={
+                onOpenProjectSettings ? () => leaveTo(onOpenProjectSettings) : undefined
+              }
             />
           </div>
         </div>
@@ -308,9 +312,14 @@ function VerticalNav({
     >
       {groups.map((group) => (
         <div key={group.label}>
-          <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
-            {group.label}
-          </div>
+          {/* 只有一个分组时分组标题是多余层级(审计 SET-41);多组才需要区分。 */}
+          {groups.length > 1 ? (
+            <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
+              {group.label}
+            </div>
+          ) : (
+            <div className="pt-1" aria-hidden />
+          )}
           {group.items.map((it) => {
             const selected = it.id === value;
             const index = ids.indexOf(it.id);
@@ -361,8 +370,7 @@ function SettingsPanel({
   ledgerReload,
   onRefreshMe,
   feedbackContext,
-  onOpenManage,
-  onOpenRepo,
+  onOpenProjectSettings,
 }: {
   section: SettingsSection;
   auth: AuthSession | null;
@@ -381,8 +389,7 @@ function SettingsPanel({
   ledgerReload: number;
   onRefreshMe?: () => void;
   feedbackContext?: { sessionId: string | null; requestId: string | null };
-  onOpenManage?: () => void;
-  onOpenRepo?: () => void;
+  onOpenProjectSettings?: () => void;
 }) {
   if (!auth) {
     return <p className="px-5 py-10 text-center text-body text-faint">请先登录。</p>;
@@ -405,7 +412,7 @@ function SettingsPanel({
   if (section === "usage") {
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
-        <UsageTab auth={auth} />
+        <UsageTab auth={auth} onOpenProjectSettings={onOpenProjectSettings} />
       </div>
     );
   }
@@ -418,7 +425,10 @@ function SettingsPanel({
     return <ApiAccessTab auth={auth} />;
   }
 
-  if (section === "preferences" || section === "hotkeys") {
+  // 快捷键是内置只读表,不依赖 prefs,直接渲染(审计 SET-02)。
+  if (section === "hotkeys") return <BuiltinHotkeysTable />;
+
+  if (section === "preferences") {
     return (
       <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.preferences.id}>
         {prefsLoading || !prefs ? (
@@ -446,7 +456,6 @@ function SettingsPanel({
             onPatch={onPatch}
             onUpgrade={onUpgrade}
             onOpenMemory={onOpenMemory}
-            pane={section === "hotkeys" ? "hotkeys" : "preferences"}
           />
         )}
       </div>
@@ -467,38 +476,121 @@ function SettingsPanel({
 
   if (section === "about") return <AboutSection />;
 
-  if (section === "github") {
-    return (
-      <div className="px-5 py-5">
-        <SettingsRow
-          title="GitHub 仓库"
-          description="在当前对话输入区绑定或更换仓库。设置页不维护 live 分支，只提供入口。"
-          action={
-            <Button size="sm" variant="secondary" onClick={onOpenRepo} disabled={!onOpenRepo}>
-              绑定/更换仓库
-            </Button>
-          }
-        />
-      </div>
-    );
-  }
-
+  // 未知分区（含已删的 github/plugins）回落账户页。
   return (
-    <div className="px-5 py-5">
-      <SettingsRow
-        title="插件与连接器"
-        description="浏览器和外部账号仍在管理中心编辑，这里只提供入口。"
-        action={
-          <Button size="sm" variant="secondary" onClick={onOpenManage} disabled={!onOpenManage}>
-            打开插件
-          </Button>
-        }
+    <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.billing.id}>
+      <AccountTab
+        auth={auth}
+        user={user}
+        onManageSub={onManageSub}
+        reloadKey={ledgerReload}
+        onRefreshMe={onRefreshMe}
       />
     </div>
   );
 }
 
+/** 构建号来自 index.html 的 `<meta name="oc-build">`(FeedbackTab 同源);缺失时不显示该行。 */
+function currentBuildId(): string | null {
+  if (typeof document === "undefined") return null;
+  const value = document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content.trim();
+  return value || null;
+}
+
+const SERVER_BUILD_META_RE =
+  /<meta\s+(?:[^>]*?\s)?name=["']oc-build["'][^>]*?\scontent=["']([^"']+)["']|<meta\s+(?:[^>]*?\s)?content=["']([^"']+)["'][^>]*?\sname=["']oc-build["']/i;
+
+/**
+ * 读服务端当前 index.html 里的同一枚 `<meta name="oc-build">`。版本握手本身是 bridge 在
+ * WS 建连时单向下发的(lib/appUpdate),前端没有「问一下现在是哪个版本」的主动入口;关于页
+ * 的「检查更新」就用这一招补上:no-store 拉一次入口 HTML,把 meta 抠出来比对。导出供单测。
+ */
+export async function fetchServerBuild(fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  const res = await fetchImpl("/", { cache: "no-store", headers: { Accept: "text/html" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  const m = SERVER_BUILD_META_RE.exec(html);
+  const value = (m?.[1] ?? m?.[2] ?? "").trim();
+  return value || null;
+}
+
+type UpdateCheck =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "latest" }
+  | { kind: "available"; build: string }
+  | { kind: "unknown" }
+  | { kind: "failed" };
+
+/**
+ * 关于页「检查更新」:长驻标签页(尤其移动端 webview)手里可能是几小时前的旧 bundle,自动软刷
+ * 只在安全点发生、横幅又只在自动刷失败后出现,用户此前没有任何主动的出口(审计 SET-42 遗留项)。
+ * 发现新版本时的「立即刷新」走 appUpdate.reloadNow(),与更新横幅同一条路(停掉 governor 定时器,
+ * 不动自动 reload 预算)。
+ */
+function UpdateCheckRow({ clientBuild }: { clientBuild: string }) {
+  const [state, setState] = useState<UpdateCheck>({ kind: "idle" });
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  async function check() {
+    setState({ kind: "checking" });
+    try {
+      const server = await fetchServerBuild();
+      if (!alive.current) return;
+      if (!server) setState({ kind: "unknown" });
+      else if (server === clientBuild) setState({ kind: "latest" });
+      else setState({ kind: "available", build: server });
+    } catch {
+      if (alive.current) setState({ kind: "failed" });
+    }
+  }
+
+  const message =
+    state.kind === "checking"
+      ? "正在检查…"
+      : state.kind === "latest"
+        ? "已是最新版本"
+        : state.kind === "available"
+          ? `发现新版本 ${state.build}，刷新页面即可更新`
+          : state.kind === "unknown"
+            ? "暂时读不到服务端版本，请稍后再试"
+            : state.kind === "failed"
+              ? "检查失败，请检查网络后重试"
+              : null;
+
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption">
+      <Button
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => void check()}
+        disabled={state.kind === "checking"}
+      >
+        检查更新
+      </Button>
+      {/* live region 常驻:只在有消息时才挂载的话,首次点「检查更新」时区域与文字同帧出现,
+          NVDA / VoiceOver 可能收不到这第一句播报(QA t-1028 §6 #2)。这里始终渲染、只切文本。 */}
+      <output className="break-all text-muted" aria-live="polite" data-testid="about-update-status">
+        {message}
+      </output>
+      {state.kind === "available" && (
+        <Button type="button" size="sm" variant="primary" onClick={() => appUpdate.reloadNow()}>
+          立即刷新
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function AboutSection() {
+  const build = currentBuildId();
   return (
     <div className="px-5 py-5">
       <div className="flex items-center gap-3">
@@ -518,17 +610,51 @@ function AboutSection() {
           <dt className="shrink-0 text-faint">运营主体</dt>
           <dd className="truncate text-fg">{BRAND.company}</dd>
         </div>
-        <div className="flex items-center justify-between gap-3">
-          <dt className="shrink-0 text-faint">备案</dt>
-          <dd className="truncate text-fg">{BRAND.icp}</dd>
-        </div>
+        {/* 占位文案不上「备案」栏;运营在 brand.ts 填入真实备案号后自动出现。判据与 landing 页脚 /
+            法务页同源:lib/legal.ts filedIcp()(真实备案号必含一串数字,就位才返回),不再各写一份。 */}
+        {filedIcp(BRAND.icp) && (
+          <div className="flex items-center justify-between gap-3">
+            <dt className="shrink-0 text-faint">备案</dt>
+            <dd className="truncate text-fg">{filedIcp(BRAND.icp)}</dd>
+          </div>
+        )}
         <div className="flex items-center justify-between gap-3">
           <dt className="shrink-0 text-faint">客户端</dt>
           <dd className="truncate text-fg">
             {BRAND.name} Web · © {BRAND.year}
           </dd>
         </div>
+        {/* 反馈排障要对齐构建号,关于页是用户最容易找到它的地方(审计 SET-42)。 */}
+        {build && (
+          <div className="flex items-center justify-between gap-3">
+            <dt className="shrink-0 text-faint">版本</dt>
+            <dd className="truncate font-mono text-fg" data-testid="about-build">
+              {build}
+            </dd>
+          </div>
+        )}
       </dl>
+      {/* 没有构建号(dev / meta 缺失)时版本握手本身就是 inert 的,检查更新也没有比对对象,不渲染。 */}
+      {build && <UpdateCheckRow clientBuild={build} />}
+      {/* 法务入口:与落地页同一套 /terms、/privacy 路由(LegalPage),新标签打开不打断当前会话。 */}
+      <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t border-border pt-3 text-caption">
+        <a
+          href="/terms"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+        >
+          用户协议
+        </a>
+        <a
+          href="/privacy"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+        >
+          隐私政策
+        </a>
+      </div>
     </div>
   );
 }

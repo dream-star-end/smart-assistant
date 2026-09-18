@@ -160,13 +160,20 @@ describe('误触保护确认层(需求 §5)', () => {
     render(<EditorHarness onOpenChange={onOpenChange} />)
 
     const ta = await screen.findByLabelText('希望怎样修改')
+    // placeholder 在 bg-neutral-900 上 40% 白只有 3.8:1 → 60%(a11y-C)。
+    expect(ta).toHaveClass('placeholder:text-white/60')
+    expect(ta).not.toHaveClass('placeholder:text-white/40')
     fireEvent.change(ta, { target: { value: '把背景换成蓝色' } })
 
     fireEvent.click(screen.getByRole('button', { name: '关闭图片编辑器' }))
     expect(screen.getByRole('alertdialog', { name: '放弃编辑确认' })).toBeInTheDocument()
     expect(onOpenChange).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: '放弃' }))
+    // 危险主键前景走 text-danger-fg:沉浸台恒为深色,深色 --danger #f0666e 上白字只有 3.07:1(a11y-C)。
+    const discard = screen.getByRole('button', { name: '放弃' })
+    expect(discard).toHaveClass('bg-danger', 'text-danger-fg')
+    expect(discard).not.toHaveClass('text-white')
+    fireEvent.click(discard)
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
 
@@ -177,6 +184,72 @@ describe('误触保护确认层(需求 §5)', () => {
     fireEvent.click(await screen.findByRole('button', { name: '关闭图片编辑器' }))
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
     expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+})
+
+// ── 审计 M-12:底栏按钮不得随每次渲染重挂载(焦点会掉回 body)。 ──
+describe('底栏按钮稳定性(M-12)', () => {
+  test('点「放大画布」后按钮仍是同一节点且保持焦点', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const zoomIn = await screen.findByRole('button', { name: '放大画布' })
+    zoomIn.focus()
+    fireEvent.click(zoomIn) // setView → 重渲
+    const after = screen.getByRole('button', { name: '放大画布' })
+    expect(after).toBe(zoomIn)
+    expect(document.activeElement).toBe(zoomIn)
+    expect(screen.getByText('120%')).toBeInTheDocument()
+  })
+
+  test('工具菜单里的选项点选后菜单收起、触发钮回显(提到模块顶层后契约不变)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    fireEvent.click(await screen.findByRole('button', { name: /更多工具/ }))
+    fireEvent.click(screen.getByRole('button', { name: '橡皮' }))
+    expect(screen.queryByRole('button', { name: '橡皮' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /当前：橡皮/ })).toBeInTheDocument()
+  })
+})
+
+// ── 审计 M-24:价格不在前端写死 —— 计费口径一改前端就说谎。 ──
+describe('计费文案(M-24)', () => {
+  test('顶栏副标题与读屏帮助文案不再写死「每张 50 积分」', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const title = await screen.findByText('圈选要修改的区域')
+    expect(title.parentElement).toHaveTextContent('Image 2')
+    expect(title.parentElement?.textContent).not.toMatch(/积分/)
+    expect(document.getElementById('image-edit-help')?.textContent).not.toMatch(/积分/)
+  })
+})
+
+// ── 审计 M-11 / M-23:画布区为滑杆让位;提示词框随内容自增高。 ──
+describe('画布区布局与提示词框(M-11 / M-23)', () => {
+  test('画布容器左侧为笔刷滑杆留出 ≥56px 内边距', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const slider = await screen.findByRole('slider', { name: '画笔粗细' })
+    const canvasArea = slider.closest('.flex-1') as HTMLElement
+    expect(canvasArea).toHaveClass('pl-14')
+    expect(canvasArea).not.toHaveClass('px-3')
+  })
+
+  test('提示词框输入多行 → 高度随 scrollHeight 增长并在 112px 封顶', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response))
+    render(<EditorHarness />)
+    const ta = (await screen.findByLabelText('希望怎样修改')) as HTMLTextAreaElement
+    // jsdom 不做布局,scrollHeight 恒 0 → 在 textarea 原型上临时给一个可控值。
+    const proto = HTMLTextAreaElement.prototype
+    Object.defineProperty(proto, 'scrollHeight', { get: () => 72, configurable: true })
+    try {
+      fireEvent.change(ta, { target: { value: '第一行\n第二行\n第三行' } })
+      expect(ta.style.height).toBe('72px')
+      Object.defineProperty(proto, 'scrollHeight', { get: () => 400, configurable: true })
+      fireEvent.change(ta, { target: { value: '很多行'.repeat(40) } })
+      expect(ta.style.height).toBe('112px')
+    } finally {
+      Reflect.deleteProperty(proto, 'scrollHeight')
+    }
   })
 })
 
@@ -281,4 +354,94 @@ test('圈选后未写描述点发送:给引导提示并聚焦输入框(不静默
   fireEvent.click(sendBtn)
   expect(document.body.textContent).toMatch(/请先(在图片上圈选|描述想要的修改)/)
 })
+})
+
+// ── 审计 M-23(a11y-B 接 QA t-1038 移交):选区有无就地维护,不再每一笔抬手后对整张 mask 全量扫描。 ──
+describe('选区状态维护(M-23)', () => {
+  // getImageData 桩恒返 alpha=0:若实现仍靠扫描判定,画笔落笔后标题不会变成「已选中区域」。
+  test('画笔落一笔:不扫 mask 即判定有选区;撤销回到空白快照:扫一次并回到无选区', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ close: () => {} })))
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    await waitFor(() => expect(ctx.drawImage).toHaveBeenCalled())
+    expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument()
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+    // 画笔路径零扫描。
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+
+    // 历史序列化结算后「撤销」可用 → 恢复到落笔前的空白快照 → 扫一次(alpha=0)→ 回到无选区。
+    const undo = screen.getByRole('button', { name: '撤销' })
+    await waitFor(() => expect(undo).toBeEnabled())
+    fireEvent.click(undo)
+    await waitFor(() => expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument())
+    expect(ctx.getImageData).toHaveBeenCalledTimes(1)
+  })
+
+  test('矩形工具零面积抬手:扫一次 mask 定选区,不误报「已选中」', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    fireEvent.click(screen.getByRole('button', { name: /更多工具/ }))
+    fireEvent.click(screen.getByRole('button', { name: '矩形' }))
+
+    // 只按下抬起、没有拖动:矩形零面积,mask 仍是空白。
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    expect(ctx.getImageData).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument()
+    expect(screen.queryByText('已选中区域')).not.toBeInTheDocument()
+  })
+
+  test('无选区变化的重渲染(改描述 / 缩放)不重算:getImageData 保持零调用', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    await waitFor(() => expect(screen.getByRole('button', { name: '撤销' })).toBeEnabled())
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+
+    // 与选区无关的状态变化只触发重渲染,不该再碰 mask。
+    fireEvent.change(screen.getByLabelText('希望怎样修改'), { target: { value: '把杯子改成玻璃材质' } })
+    fireEvent.click(screen.getByRole('button', { name: '放大画布' }))
+    fireEvent.click(screen.getByRole('button', { name: '缩小画布' }))
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+  })
+
+  test('清空:直接回到无选区,不扫 mask', async () => {
+    const ctx = stubCanvasPipeline({ selection: false })
+    render(<EditorHarness />)
+    const canvas = await waitFor(() => {
+      const c = document.querySelector('canvas')
+      if (!c) throw new Error('canvas 未就绪')
+      return c as HTMLCanvasElement
+    })
+    fireEvent.pointerDown(canvas, { pointerType: 'mouse', button: 0, pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerUp(canvas, { pointerType: 'mouse', pointerId: 1 })
+    expect(screen.getByText('已选中区域')).toBeInTheDocument()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '撤销' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /更多工具/ }))
+    fireEvent.click(screen.getByRole('button', { name: '清空' }))
+    await waitFor(() => expect(screen.getByText('圈选要修改的区域')).toBeInTheDocument())
+    expect(ctx.getImageData).not.toHaveBeenCalled()
+  })
 })

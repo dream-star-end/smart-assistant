@@ -93,6 +93,24 @@ test('有待确认建议时「优化」Tab 挂计数徽标，为 0 则不渲染�
   expect(screen.getByRole('tab', { name: '优化' })).toBeInTheDocument()
 })
 
+test('窄屏下有待确认建议时补一行可点的待办提示，选中「优化」或计数为 0 时不渲染', () => {
+  const onTabChange = vi.fn<(t: ManageTab) => void>()
+  const { unmount } = renderShell({ optimizerPendingCount: 3, onTabChange })
+  // 390px 下第 6 个「优化」Tab 连同徽标整个在横滚视口外 —— 这一行是窄屏唯一能看见的信号。
+  const hint = screen.getByRole('button', { name: /有 3 项优化建议待确认/ })
+  expect(hint).toHaveClass('md:hidden')
+  fireEvent.click(hint)
+  expect(onTabChange).toHaveBeenCalledWith('optimization')
+  unmount()
+
+  renderShell({ optimizerPendingCount: 3, tab: 'optimization' })
+  expect(screen.queryByRole('button', { name: /项优化建议待确认/ })).not.toBeInTheDocument()
+  cleanup()
+
+  renderShell({ optimizerPendingCount: 0 })
+  expect(screen.queryByRole('button', { name: /项优化建议待确认/ })).not.toBeInTheDocument()
+})
+
 test('未登录态是带出口的空态，而不是一行灰字', () => {
   const onRequireLogin = vi.fn()
   renderShell({ onRequireLogin })

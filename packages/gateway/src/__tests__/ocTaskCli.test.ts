@@ -8,9 +8,15 @@ import { describe, test } from 'node:test'
 import {
   TASK_CLI_EXIT,
   TASK_CLI_SCHEMA_VERSION,
+  buildNdjsonLines,
+  createStreamWriter,
   exitCodeForHttp,
+  isEpipe,
   planTaskCommand,
   resolveTaskboardEndpoint,
+  slimListItem,
+  slimListPayload,
+  splitListPayload,
   wrapError,
   wrapSuccess,
 } from '../ocTaskCli.js'
@@ -299,6 +305,9 @@ describe('planTaskCommand', () => {
       method: 'GET',
       path: '/tickets',
       query: { projectId: 'OCV5', status: 'ready,running', q: 'login' },
+      // OCV5-165: list 默认瘦身、非 ndjson
+      ndjson: false,
+      slim: true,
     })
   })
 })
@@ -321,5 +330,212 @@ describe('exit codes + schemaVersion', () => {
     })
     assert.equal(wrapError('nope', 'validation').schemaVersion, TASK_CLI_SCHEMA_VERSION)
     assert.equal(JSON.stringify(wrapSuccess({ a: 1 })).includes('\n'), false)
+  })
+})
+
+/** 造 n 张带长 body 的卡,复现宽列表溢出 64KiB 管道缓冲的场景。 */
+function fatTickets(n: number, bodyLen = 2000) {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `id-${i}`,
+    identifier: `OCV5-${100 + i}`,
+    title: `ticket ${i}`,
+    status: 'open',
+    version: 1,
+    // 带引号/换行/中文/反斜杠:截断时最容易断在字符串中间的形状
+    body: `第${i}行说明 "quoted" \\ 反斜杠\n${'长'.repeat(bodyLen)}`,
+  }))
+}
+
+const PIPE_BUF = 65536
+
+describe('ticket list — 64KiB stdout truncation (OCV5-165)', () => {
+  test('plan: --ndjson / --full 映射到 ndjson+slim,默认 slim 开、ndjson 关', () => {
+    const dflt = planTaskCommand(['ticket', 'list', '--limit', '50'])
+    assert.equal(dflt.kind, 'request')
+    assert.equal((dflt as any).ndjson, false)
+    assert.equal((dflt as any).slim, true)
+
+    const nd = planTaskCommand(['ticket', 'list', '--limit', '50', '--ndjson'])
+    assert.equal((nd as any).ndjson, true)
+    assert.equal((nd as any).slim, true)
+
+    const full = planTaskCommand(['ticket', 'list', '--full'])
+    assert.equal((full as any).slim, false)
+
+    // --ndjson/--full 是布尔旗,不能被吞成 --limit 的值
+    assert.deepEqual((planTaskCommand(['ticket', 'list', '--ndjson']) as any).query, {})
+  })
+
+  test('60 张长 body 卡:ndjson 每行独立可 parse,且逐行都在管道缓冲以内', () => {
+    const payload = { items: fatTickets(60), total: 60 }
+    const lines = buildNdjsonLines(payload, { slim: false })
+
+    assert.equal(lines.length, 61) // 1 meta + 60 item
+    const meta = JSON.parse(lines[0])
+    assert.equal(meta.kind, 'meta')
+    assert.equal(meta.count, 60)
+    assert.equal(meta.total, 60)
+    assert.equal(meta.itemsKey, 'items')
+    assert.equal(meta.schemaVersion, TASK_CLI_SCHEMA_VERSION)
+
+    // 关键不变量:每一行都能单独 JSON.parse,没有跨行的字符串
+    for (let i = 1; i < lines.length; i++) {
+      const rec = JSON.parse(lines[i])
+      assert.equal(rec.kind, 'item')
+      assert.equal(rec.item.identifier, `OCV5-${100 + (i - 1)}`)
+      assert.ok(rec.item.body.includes('"quoted"'))
+      assert.equal(lines[i].includes('\n'), false)
+      assert.ok(Buffer.byteLength(lines[i], 'utf8') < PIPE_BUF)
+    }
+
+    // 整体确实超过 64KiB —— 正是单块 JSON 会被截断的规模
+    const whole = Buffer.byteLength(lines.join('\n'), 'utf8')
+    assert.ok(whole > PIPE_BUF, `expected >64KiB, got ${whole}`)
+  })
+
+  test('ndjson 截断只损失最后一行,前缀仍全部可用(单块 JSON 则整份报废)', () => {
+    const payload = { items: fatTickets(60), total: 60 }
+    const nd = `${buildNdjsonLines(payload, { slim: false }).join('\n')}\n`
+
+    // 模拟内核管道在 65536 字节处硬切
+    const cut = Buffer.from(nd, 'utf8').subarray(0, PIPE_BUF).toString('utf8')
+    const complete = cut.split('\n').slice(0, -1) // 丢弃最后一行(可能不完整)
+    assert.ok(complete.length > 1)
+    for (const line of complete) JSON.parse(line) // 不抛 = 全部可用
+
+    // 对照:同样数据的单块 JSON 被切后整份不可解析(线上那条 listError)
+    const blob = JSON.stringify(wrapSuccess(payload))
+    const blobCut = Buffer.from(blob, 'utf8').subarray(0, PIPE_BUF).toString('utf8')
+    assert.throws(() => JSON.parse(blobCut), /JSON|Unterminated|Unexpected/)
+  })
+
+  test('slim 默认:去掉 body 换成 bodyBytes,50 张卡落回 64KiB 以内', () => {
+    const payload = { items: fatTickets(50), total: 50 }
+    assert.ok(Buffer.byteLength(JSON.stringify(wrapSuccess(payload)), 'utf8') > PIPE_BUF)
+
+    const slim = slimListPayload(payload) as any
+    const encoded = Buffer.byteLength(JSON.stringify(wrapSuccess(slim)), 'utf8')
+    assert.ok(encoded < PIPE_BUF, `slim should fit one pipe buffer, got ${encoded}`)
+
+    const first = slim.items[0]
+    assert.equal('body' in first, false)
+    assert.equal(typeof first.bodyBytes, 'number')
+    assert.ok(first.bodyBytes > 0)
+    // 定位用的字段一个都不能丢
+    assert.equal(first.identifier, 'OCV5-100')
+    assert.equal(first.status, 'open')
+    assert.equal(first.version, 1)
+    assert.equal(slim.total, 50) // 信封保持原样
+  })
+
+  test('slimListItem: null 重字段不产出 Bytes;非对象原样返回', () => {
+    assert.deepEqual(slimListItem({ id: 'a', body: null, outputMd: undefined }), {
+      id: 'a',
+      body: null,
+      outputMd: undefined,
+    })
+    const withComments = slimListItem({ id: 'a', comments: [{ body: 'hi' }] }) as any
+    assert.equal('comments' in withComments, false)
+    assert.ok(withComments.commentsBytes > 0)
+    assert.equal(slimListItem('plain'), 'plain')
+    assert.equal(slimListItem(null), null)
+  })
+
+  test('splitListPayload 认 items/tickets/裸数组,并把其余键留给信封', () => {
+    assert.deepEqual(splitListPayload({ items: [1], total: 9 }), {
+      key: 'items',
+      items: [1],
+      envelope: { total: 9 },
+    })
+    assert.equal(splitListPayload({ tickets: [1, 2] }).key, 'tickets')
+    assert.deepEqual(splitListPayload([1, 2]), { key: null, items: [1, 2], envelope: {} })
+    assert.deepEqual(splitListPayload({ ok: true }), { key: null, items: [], envelope: {} })
+  })
+})
+
+/** 可注入的假 stdout:能按需在第 N 次 write 上模拟 EPIPE(先 emit 'error' 再回调)。 */
+function fakeStream(opts: { failAt?: number; code?: string } = {}) {
+  const written: string[] = []
+  const listeners: ((err: NodeJS.ErrnoException) => void)[] = []
+  let n = 0
+  return {
+    written,
+    /** 没有 listener 的 'error' 在真实 node 里 = uncaught crash,这里用它断言我们挂了 listener。 */
+    get hasErrorListener() {
+      return listeners.length > 0
+    },
+    on(_event: 'error', cb: (err: NodeJS.ErrnoException) => void) {
+      listeners.push(cb)
+    },
+    write(chunk: string, cb: (err?: Error | null) => void) {
+      n += 1
+      if (opts.failAt != null && n >= opts.failAt) {
+        const err = Object.assign(new Error('write EPIPE'), { code: opts.code ?? 'EPIPE' })
+        // 真实 stream 的顺序:先 emit 'error',再走 write callback
+        for (const l of listeners) l(err)
+        cb(err)
+        return false
+      }
+      written.push(chunk)
+      cb(null)
+      return true
+    },
+  }
+}
+
+describe('EPIPE safety — 读端提前关闭不得 crash (OCV5-165 返工1)', () => {
+  test('createStreamWriter 建时就挂上 stdout error listener', () => {
+    const st = fakeStream()
+    assert.equal(st.hasErrorListener, false)
+    createStreamWriter(st)
+    // 缺这个 listener,node 会把 'error' 当 uncaught exception 直接 crash
+    assert.equal(st.hasErrorListener, true)
+  })
+
+  test('writeLines 遇 EPIPE 立即停写,不再对断掉的管道写剩余行', async () => {
+    const st = fakeStream({ failAt: 2 }) // 第 2 行开始断
+    const w = createStreamWriter(st)
+    const lines = Array.from({ length: 60 }, (_, i) => JSON.stringify({ i }))
+
+    const ok = await w.writeLines(lines) // 不抛
+    assert.equal(ok, false)
+    assert.equal(w.broken, true)
+    assert.equal(w.fatal, null)
+    // 关键:只写成功了第 1 行,后面 59 行没有继续硬写
+    assert.equal(st.written.length, 1)
+  })
+
+  test('管道断后继续 write 静默返回 false,不抛', async () => {
+    const st = fakeStream({ failAt: 1 })
+    const w = createStreamWriter(st)
+    assert.equal(await w.write('a\n'), false)
+    assert.equal(await w.write('b\n'), false)
+    assert.equal(await w.writeJson({ a: 1 }), false)
+    assert.equal(st.written.length, 0)
+    assert.equal(w.broken, true)
+  })
+
+  test('非 EPIPE 的写错误照常上抛(不能被当成正常收尾吞掉)', async () => {
+    const st = fakeStream({ failAt: 1, code: 'ENOSPC' })
+    const w = createStreamWriter(st)
+    await assert.rejects(() => w.write('x\n'), /write EPIPE|ENOSPC/)
+    assert.equal(w.broken, false)
+    assert.equal((w.fatal as NodeJS.ErrnoException | null)?.code, 'ENOSPC')
+  })
+
+  test('正常流:全部写出且 broken 保持 false', async () => {
+    const st = fakeStream()
+    const w = createStreamWriter(st)
+    assert.equal(await w.writeLines(['a', 'b', 'c']), true)
+    assert.deepEqual(st.written, ['a\n', 'b\n', 'c\n'])
+    assert.equal(w.broken, false)
+  })
+
+  test('isEpipe 只认 code=EPIPE', () => {
+    assert.equal(isEpipe(Object.assign(new Error('x'), { code: 'EPIPE' })), true)
+    assert.equal(isEpipe(Object.assign(new Error('x'), { code: 'ENOSPC' })), false)
+    assert.equal(isEpipe(new Error('plain')), false)
+    assert.equal(isEpipe(null), false)
+    assert.equal(isEpipe(undefined), false)
   })
 })

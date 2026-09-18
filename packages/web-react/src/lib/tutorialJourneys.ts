@@ -1,7 +1,10 @@
 import type { ProductFeatureId } from "./productCapabilities";
 
-/** 案例卡片与详情页统一使用的待采集声明，禁止把 pending_capture 包装成已完成故事。 */
-export const TUTORIAL_PENDING_CAPTURE_LABEL = "示例待真实运行采集";
+/**
+ * 案例卡片与详情页统一使用的「尚无真实运行记录」声明，禁止把 pending_capture 包装成已完成故事。
+ * 用用户语言而不是采集流水线的内部词（"待采集"），审计 TU-10。
+ */
+export const TUTORIAL_PENDING_CAPTURE_LABEL = "任务脚本 · 尚无真实运行记录";
 
 export type TutorialQuickstartStep = {
   id: string;
@@ -49,8 +52,9 @@ export const TUTORIAL_QUICKSTART = {
     {
       id: "watch-process",
       title: "看执行过程",
-      body: "运行时看思考、工具卡和进度。方向不对再停止或追问，不要反复催促。",
-      topicId: "chat-basics",
+      // 此前与第 1 步同指「对话入门」，6 步只覆盖 5 篇（审计 TU-31）；「方向不对就调整」对应的是会话目标那一篇。
+      body: "运行时看思考、工具卡和进度。方向不对就暂停，改一改目标再继续，不要反复催促。",
+      topicId: "session-goal",
     },
     {
       id: "take-delivery",

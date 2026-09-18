@@ -22,7 +22,15 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { reportClientFrictionBatch } from "../../lib/clientFriction";
 import {
@@ -46,6 +54,7 @@ import {
   ListSkeleton,
   type TabItem,
   Tabs,
+  useToast,
 } from "../ui";
 import { DetailModal } from "./DetailModal";
 
@@ -54,6 +63,26 @@ const UNCAT = "__uncategorized__";
 
 /** 目录每页条数。搜索/切类目时回到一页,点「加载更多」按页递增。 */
 const PAGE_SIZE = 50;
+
+/**
+ * 分类片容器只在 `sm` 以下横向滚动(与 className 里的 `sm:overflow-x-visible` 同一断点)。
+ * 横滚区要能被键盘聚焦才能用方向键滚,所以窄屏给 tabIndex=0;桌面端 K-12 之后是换行、
+ * 不滚,再留 tabIndex 就成了一个什么都不做的 Tab 停靠点(QA t-1028 §6 #1)。
+ * 写法照 hooks/useMdViewport.ts;jsdom / SSR 默认 false(= 桌面,不给 tabIndex)。
+ */
+const NARROW_QUERY = "(max-width: 639px)";
+function subscribeNarrow(onChange: () => void): () => void {
+  if (typeof window.matchMedia !== "function") return () => {};
+  const mq = window.matchMedia(NARROW_QUERY);
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+}
+function getNarrowSnapshot(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia(NARROW_QUERY).matches;
+}
+function useNarrowViewport(): boolean {
+  return useSyncExternalStore(subscribeNarrow, getNarrowSnapshot, () => false);
+}
 
 /** 类目切换(与顶层 Tabs 同一套原语,不再是本页第三种横向控件)。value=存储层 kind。 */
 const KIND_TABS: TabItem[] = [
@@ -145,7 +174,9 @@ function CardTile({
   const restTags = card.tags.length - tags.length;
   const stateLabel = canUpdate ? "有新版本" : inst ? "已安装" : null;
   // 整卡是一个 button:不给显式名的话,读屏会把描述+全部徽章+评分连读成几十字的按钮名。
+  // 描述走 aria-describedby(而不是 aria-hidden):名字短、描述仍可听 —— 它是装不装的主要依据。
   const ariaLabel = [card.name, catLabel, identity, stateLabel].filter(Boolean).join("，");
+  const descId = useId();
   const hasSignals = Boolean(rating || inUseLabel || bench);
 
   return (
@@ -154,6 +185,7 @@ function CardTile({
         type="button"
         onClick={() => onOpen(card.slug)}
         aria-label={ariaLabel}
+        aria-describedby={descId}
         className={cn(
           cardVariants({ padding: "md", interactive: true }),
           "flex h-full w-full flex-col gap-2 bg-elevated text-left",
@@ -177,10 +209,12 @@ function CardTile({
                 <ShieldCheck size={13} className="shrink-0 text-success" aria-hidden="true" />
               ) : null}
             </div>
-            {/* button 内只允许 phrasing content —— 原 <p> 属结构违规,换成 block span。 */}
+            {/* button 内只允许 phrasing content —— 用 span 而非 <p>。
+                不能再叠 `block`:它的 display:block 会盖掉 line-clamp 的 -webkit-box,
+                两行截断随即失效,卡高跟着描述长度失控(K-02)。 */}
             <span
-              className="mt-0.5 line-clamp-2 block text-meta leading-snug text-muted"
-              aria-hidden="true"
+              id={descId}
+              className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted"
             >
               {card.description}
             </span>
@@ -254,6 +288,7 @@ function Section({
   title,
   blurb,
   count,
+  truncated,
   icon: Icon,
   iconClassName,
   cards,
@@ -263,6 +298,8 @@ function Section({
   title: string;
   blurb?: string;
   count: number;
+  /** 目录只拉了一页:分区计数只是"已加载"的成员数,不能当"共有"说(K-03)。 */
+  truncated?: boolean;
   icon: LucideIcon;
   iconClassName?: string;
   cards: MarketplaceCard[];
@@ -272,14 +309,15 @@ function Section({
   return (
     <section className="flex flex-col gap-2.5">
       <div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <Icon size={13} className={cn("shrink-0 text-faint", iconClassName)} aria-hidden="true" />
           <h3 className="text-caption font-semibold uppercase tracking-[0.06em] text-muted">
             {title}
           </h3>
           <Badge tone="neutral" size="sm">
-            {count}
+            {truncated ? `已加载 ${count}` : count}
           </Badge>
+          {truncated && <span className="text-caption text-faint">还有更多未加载</span>}
         </div>
         {/* 分区说明在窄屏隐藏:每个分区多一行就多吃 16px,而 390px 屏上光是必需控件
             (Tabs/类目/搜索/分类片)已经占掉近一半高度。 */}
@@ -341,6 +379,8 @@ export function BrowsePanel({
   onGoPublish?: () => void;
   onOpenConnectors?: (pluginSlug?: string) => void;
 }) {
+  const toast = useToast();
+  const narrow = useNarrowViewport();
   const [q, setQ] = useState("");
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -374,9 +414,15 @@ export function BrowsePanel({
     setLimit(PAGE_SIZE);
   }, [kind, debouncedQ]);
 
-  const loadCards = useCallback(
+  /** 本次加载是不是「加载更多」触发的:失败要就近报（toast + 重试），而不是写到列表顶部的红条。 */
+  const loadMoreRef = useRef(false);
+
+  // 显式标注类型:回调体内部要引用 loadCards 自己(失败 toast 的「重试」),否则类型推断成环。
+  const loadCards: (showLoading: boolean) => Promise<void> = useCallback(
     async (showLoading: boolean) => {
       const seq = ++cardRequestSeq.current;
+      const fromLoadMore = loadMoreRef.current;
+      loadMoreRef.current = false;
       if (showLoading) {
         setLoading(true);
         setErr(null);
@@ -392,14 +438,28 @@ export function BrowsePanel({
         if (seq !== cardRequestSeq.current) return;
         // 用户主动触发的加载才报错;窗口重新聚焦时的静默校准失败只留轻量标记 ——
         // 「什么都没点却跳出一条红色报错」是改造前最打扰的一处。
-        if (showLoading) setErr(apiErrorMessage(cause, "加载市场失败"));
+        if (fromLoadMore) {
+          // 用户此刻在列表底部,顶部的 Alert 早已滚出视口(K-05):toast 带重试就近可见。
+          toast(apiErrorMessage(cause, "加载更多失败"), "error", {
+            actionLabel: "重试",
+            onAction: () => {
+              loadMoreRef.current = true;
+              void loadCards(true);
+            },
+          });
+        } else if (showLoading) setErr(apiErrorMessage(cause, "加载市场失败"));
         else setStale(true);
       } finally {
         if (seq === cardRequestSeq.current) setLoading(false);
       }
     },
-    [auth, debouncedQ, kind, limit],
+    [auth, debouncedQ, kind, limit, toast],
   );
+
+  const loadMore = () => {
+    loadMoreRef.current = true;
+    setLimit((n) => n + PAGE_SIZE);
+  };
 
   // revision 变化=别人刚发布/下架触发的后台校准,不是本人的动作 —— 走静默路径,
   // 失败也不该在安静浏览的用户面前弹红条。用户自己的动作(首次进入/改查询词/切类目/
@@ -554,13 +614,7 @@ export function BrowsePanel({
               aria-label={`搜索${noun}`}
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder={
-                kind === "agent"
-                  ? "搜索智能体（试试「写作」「编程」「研究」）…"
-                  : kind === "connector"
-                    ? "搜索插件（试试「文档」「代码」「沟通」）…"
-                    : "搜索技能（试试「翻译」「论文」「写作」）…"
-              }
+              placeholder={`搜索${noun}`}
               className="pl-9"
             />
           </div>
@@ -581,17 +635,35 @@ export function BrowsePanel({
           )}
         </div>
       </div>
+      {!q && (
+        // 提示词做成可点的芯片:改造前是一行纯文字,三个带引号的词看着像能点,点了没反应(K-06)。
+        <div className="flex flex-wrap items-center gap-1.5 px-4 pb-1.5 text-caption text-faint">
+          <span>试试</span>
+          {(kind === "agent"
+            ? ["写作", "编程", "研究"]
+            : kind === "connector"
+              ? ["文档", "代码", "沟通"]
+              : ["翻译", "论文", "写作"]
+          ).map((word) => (
+            <Chip key={word} active={false} onClick={() => setQ(word)}>
+              {word}
+            </Chip>
+          ))}
+        </div>
+      )}
 
-      {/* 分类筛选片:仅浏览态且有分区时渲染,一行可横向滚动(移动端不换行)。
-          右缘渐隐替代改造前那行「左右滑动查看更多分类」的常驻小字 —— 可滚动这件事
-          应该由视觉暗示,而不是占一行去讲。 */}
+      {/* 分类筛选片:仅浏览态且有分区时渲染。移动端一行横向滚动(不换行),右缘渐隐替代
+          改造前那行「左右滑动查看更多分类」的常驻小字 —— 可滚动这件事应该由视觉暗示,而不是
+          占一行去讲。桌面端(sm 起)有宽度就直接换行:此前桌面也横滚、还隐藏了滚动条又没有
+          箭头,鼠标用户根本到不了被右缘截掉的最后一片(K-12)。 */}
       {grouped && (grouped.categories.length > 0 || grouped.uncategorized.length > 0) && (
         <div className="relative">
           <section
-            aria-label="市场分类，可横向滚动"
-            // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动分类必须可由键盘聚焦和滚动。
-            tabIndex={0}
-            className="flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden"
+            aria-label="市场分类"
+            // 只在窄屏(真的横滚时)可聚焦;桌面换行不滚,不留无意义的 Tab 停靠点(QA t-1028 §6 #1)。
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 移动端横向滚动分类必须可由键盘聚焦和滚动。
+            tabIndex={narrow ? 0 : undefined}
+            className="flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible"
           >
             <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
               全部
@@ -609,7 +681,7 @@ export function BrowsePanel({
           </section>
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-surface to-transparent"
+            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-surface to-transparent sm:hidden"
           />
         </div>
       )}
@@ -696,9 +768,9 @@ export function BrowsePanel({
                 </Badge>
               </>
             ) : (
+              // 只拉了一页时说「已加载」而不是「共」:分区计数与这里都不能把一页当全量(K-03)。
               <p className="text-caption text-faint">
-                共 {cards.length} 个{noun}
-                {truncated ? "（可继续加载更多）" : ""}
+                {truncated ? `已加载 ${cards.length} 个${noun}，还有更多` : `共 ${cards.length} 个${noun}`}
               </p>
             )}
             {selectedCat !== null && (
@@ -711,6 +783,12 @@ export function BrowsePanel({
                 返回全部
               </Button>
             )}
+            {truncated && selectedCat === null && !debouncedQ && (
+              // 分区视图的「加载更多」同时放在结果条右侧:用户不必滚过全部分区才发现还有下一页。
+              <Button size="sm" variant="ghost" className="ml-auto shrink-0" loading={loading} onClick={loadMore}>
+                加载更多
+              </Button>
+            )}
           </div>
 
           {sections && selectedCat === null ? (
@@ -721,6 +799,7 @@ export function BrowsePanel({
                   title="平台精选"
                   blurb={`平台为你挑选的优质${noun}`}
                   count={sections.featured.length}
+                  truncated={truncated}
                   icon={Star}
                   iconClassName="text-accent"
                   cards={sections.featured}
@@ -734,6 +813,7 @@ export function BrowsePanel({
                   title={c.label}
                   blurb={c.blurb}
                   count={c.cards.length}
+                  truncated={truncated}
                   icon={sectionIcon(c.id)}
                   cards={c.cards}
                   installed={installed}
@@ -745,6 +825,7 @@ export function BrowsePanel({
                   title="未分类"
                   blurb="暂未归类的条目"
                   count={sections.uncategorized.length}
+                  truncated={truncated}
                   icon={Layers}
                   cards={sections.uncategorized}
                   installed={installed}
@@ -764,13 +845,7 @@ export function BrowsePanel({
           {/* 目录不再硬截断:装满一页就给出口,否则第 51 个商品对用户等于不存在。 */}
           {truncated && (
             <div className="px-4 pb-5">
-              <Button
-                variant="secondary"
-                size="sm"
-                className="w-full"
-                loading={loading}
-                onClick={() => setLimit((n) => n + PAGE_SIZE)}
-              >
+              <Button variant="secondary" size="sm" className="w-full" loading={loading} onClick={loadMore}>
                 加载更多
               </Button>
             </div>
@@ -805,6 +880,8 @@ function Chip({
     <button
       type="button"
       onClick={onClick}
+      // 选中态不能只靠颜色:读屏 / 高对比模式要从 aria-pressed 拿到"当前筛选是哪个"(K-07)。
+      aria-pressed={active}
       className={cn(
         // 触控靶:这排 chip 在横向滚动条里,26px 高时手指几乎点不中(要么误触邻项、要么触发横滑)。
         "shrink-0 snap-start whitespace-nowrap rounded-full border px-3 py-1 text-meta font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-4",

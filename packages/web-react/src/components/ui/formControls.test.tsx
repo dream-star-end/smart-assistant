@@ -102,7 +102,9 @@ test("Switch 触控靶伪元素", () => {
   expect(cls).toContain("h-6"); // 视觉轨道不变粗
   expect(cls).toContain("[@media(hover:none)]:relative");
   expect(cls).toContain("[@media(hover:none)]:before:absolute");
-  expect(cls).toContain("[@media(hover:none)]:before:-inset-y-2.5");
+  // 包含块是 padding 边(border-2 内缩 2px):20 + 2×12 = 44px;-inset-y-2.5 只有 40px(a11y shell#9)。
+  expect(cls).toContain("[@media(hover:none)]:before:-inset-y-3");
+  expect(cls).not.toContain("before:-inset-y-2.5");
 });
 
 test("Select: 受控 + placeholder + 选项 disabled + 与 Input 同构", () => {

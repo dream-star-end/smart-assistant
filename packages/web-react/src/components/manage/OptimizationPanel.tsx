@@ -293,7 +293,7 @@ export function OptimizationPanel({
         className="rounded-2xl border-accent/20 bg-gradient-to-br from-accent-soft via-surface to-surface"
       >
         <div className="flex items-start gap-3">
-          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-white">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg">
             <MoonStar size={19} />
           </span>
           <div className="min-w-0 flex-1">
@@ -349,7 +349,7 @@ export function OptimizationPanel({
                   <span aria-hidden="true">·</span>
                   <span>{state.sessionsReviewed} 个会话</span>
                   <span aria-hidden="true">·</span>
-                  <span>{state.pagesReviewed} 个审计分片</span>
+                  <span>{state.pagesReviewed} 个批次</span>
                 </>
               )}
             </p>
@@ -484,7 +484,8 @@ export function OptimizationPanel({
               title="暂无待确认建议"
               hint="完成新会话后每周会自动审计，也可以现在就运行一次。"
               action={
-                <Button variant="primary" loading={running} onClick={() => void runNow()}>
+                // hero 卡里已经有一枚 primary「立即审计」，空态这枚降为 secondary：同屏不出现两个同名主按钮。
+                <Button variant="secondary" loading={running} onClick={() => void runNow()}>
                   {!running && <Play size={14} />}
                   立即审计
                 </Button>
@@ -702,7 +703,9 @@ function ProposalDiffModal({
       open
       onOpenChange={(open) => !open && !busy && onClose()}
       title={proposal.title}
-      description={`${CATEGORY_LABELS[proposal.category] ?? proposal.category} · ${proposal.targetId}`}
+      // 副标题只放分类中文名；targetId 是内部存储路径（memory/xxx.md、settings/effort），
+      // 收进正文一行 caption，不再顶在标题下面。
+      description={CATEGORY_LABELS[proposal.category] ?? proposal.category}
       size="lg"
       // 子模态起步与父壳同宽，桌面端再放大；改造前 max-w-4xl 比父壳 max-w-2xl 还宽，
       // 弹出时会"胀出"底层弹窗边界，层级关系看着是反的。
@@ -760,7 +763,14 @@ function ProposalDiffModal({
           {error}
         </Alert>
       )}
-      <p className="mb-4 text-body leading-relaxed text-muted">{proposal.reason}</p>
+      <div className="mb-4 flex flex-col gap-1">
+        <p className="text-body leading-relaxed text-muted">{proposal.reason}</p>
+        {proposal.targetId && (
+          <p className="text-caption text-faint">
+            作用对象：<span className="select-all font-mono">{proposal.targetId}</span>
+          </p>
+        )}
+      </div>
       {proposal.error && (
         <Alert tone="warning" density="compact" className="mb-3">
           {proposal.error}

@@ -21,7 +21,8 @@
 import { describe, test, beforeEach, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, chownSync, existsSync, readFileSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -640,6 +641,85 @@ describe("resolveV5CursorAuthMount", () => {
     return dir;
   }
 
+  const member = { uid: 4, runtimeChannel: "v5" as const, useRemote: false, credentialUids: "4" };
+
+  test("empty managed pool keeps the directory mount across 0→1→0→1 atomic publication", () => {
+    const dir = makeAuthDir();
+    const key = pathJoin(dir, "api-key");
+    try {
+      rmSync(key);
+      assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), null, "unmanaged empty directory stays rejected");
+      writeFileSync(pathJoin(dir, ".account-pool-owned"), "1\n", { mode: 0o600 });
+      const inode = statSync(dir).ino;
+      for (const value of [null, "crsr_first\n", null, "crsr_second\n"]) {
+        if (value === null) rmSync(key, { force: true });
+        else {
+          writeFileSync(`${key}.tmp`, value, { mode: 0o600 });
+          renameSync(`${key}.tmp`, key);
+        }
+        const mount = resolveV5CursorAuthMount({ ...member, authDir: dir });
+        assert.equal(mount, dir, "temporary empty pool must not remove the bind source");
+        assert.equal(statSync(mount!).ino, inode, "publication never replaces the mounted directory");
+        assert.equal(existsSync(pathJoin(mount!, "api-key")), value !== null);
+        if (value !== null) assert.equal(readFileSync(pathJoin(mount!, "api-key"), "utf8"), value);
+      }
+      rmSync(key);
+      for (const options of [{ ...member, uid: 5 }, { ...member, runtimeChannel: "v3" as const }, { ...member, useRemote: true }]) {
+        assert.equal(resolveV5CursorAuthMount({ ...options, authDir: dir }), null);
+      }
+      chmodSync(dir, 0o755);
+      assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), null);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const variant of ["symlink", "dangling-symlink", "directory", "fifo", "public", "non-root", "wrong-content"] as const) {
+    test(`empty managed pool rejects ${variant} ownership marker`, () => {
+      const dir = makeAuthDir();
+      const marker = pathJoin(dir, ".account-pool-owned");
+      try {
+        rmSync(pathJoin(dir, "api-key"));
+        if (variant === "symlink" || variant === "dangling-symlink") {
+          const target = pathJoin(dir, "marker-target");
+          if (variant === "symlink") writeFileSync(target, "1\n", { mode: 0o600 });
+          symlinkSync(target, marker);
+        } else if (variant === "directory") mkdirSync(marker, { mode: 0o700 });
+        else if (variant === "fifo") execFileSync("mkfifo", [marker]);
+        else {
+          writeFileSync(marker, variant === "wrong-content" ? "2\n" : "1\n", { mode: 0o600 });
+          if (variant === "public") chmodSync(marker, 0o644);
+          if (variant === "non-root") chownSync(marker, 65534, 65534);
+        }
+        assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), null);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("valid managed marker cannot excuse an existing unsafe or dangling key", () => {
+    const dir = makeAuthDir();
+    const key = pathJoin(dir, "api-key");
+    const marker = pathJoin(dir, ".account-pool-owned");
+    try {
+      writeFileSync(marker, "1\n", { mode: 0o600 });
+      chmodSync(key, 0o644);
+      assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), null);
+      rmSync(key);
+      symlinkSync(pathJoin(dir, "absent-key"), key);
+      assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), null);
+      rmSync(key);
+      mkdirSync(key, { mode: 0o700 });
+      assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), null);
+      rmSync(key, { recursive: true });
+      chmodSync(marker, 0o400);
+      assert.equal(resolveV5CursorAuthMount({ ...member, authDir: dir }), dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("accepts only configured local V5 credential members and strict root-only metadata", () => {
     const dir = makeAuthDir();
     try {
@@ -1085,6 +1165,42 @@ describe("provisionV3Container", () => {
       else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
       if (savedFlag === undefined) delete process.env.OC_RESEARCH_WORKSPACE;
       else process.env.OC_RESEARCH_WORKSPACE = savedFlag;
+    }
+  });
+
+  test("v5 empty managed Cursor pool provisions the same read-only bind before a key is ready", async () => {
+    const keys = ["OC_RUNTIME_CHANNEL", "OC_V5_CURSOR_OWNER_UID", "OC_V5_CURSOR_CREDENTIAL_UIDS", "OC_V5_CURSOR_AUTH_DIR"] as const;
+    const saved = new Map(keys.map((key) => [key, process.env[key]]));
+    const dir = mkdtempSync(pathJoin(tmpdir(), "oc-cursor-empty-provision-"));
+    chmodSync(dir, 0o700);
+    writeFileSync(pathJoin(dir, ".account-pool-owned"), "1\n", { mode: 0o600 });
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_V5_CURSOR_OWNER_UID = "4";
+      process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "4";
+      process.env.OC_V5_CURSOR_AUTH_DIR = dir;
+      assert.equal(existsSync(pathJoin(dir, "api-key")), false, "reproduce preparation-time empty pool");
+      const captured = makeDocker();
+      await provisionV3Container({
+        docker: captured.docker,
+        pool: pool as unknown as Pool,
+        image: TEST_IMAGE,
+        selfHostId: TEST_HOST,
+        randomIp: () => "172.31.5.45",
+        randomSecret: fixedSecret("e".repeat(64)),
+      }, 4);
+      assert.equal(captured.captured.containersCreated.length, 1);
+      const opts = captured.captured.containersCreated[0]!;
+      assert.deepEqual(opts.HostConfig?.Binds?.filter((bind) => bind.includes(V5_CURSOR_AUTH_RO_MOUNT)), [`${dir}:${V5_CURSOR_AUTH_RO_MOUNT}:ro`]);
+      assert.ok(!(opts.Env ?? []).some((entry) => entry.includes("CURSOR") || entry.includes(dir)));
+      assert.equal(captured.captured.started, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      for (const key of keys) {
+        const previous = saved.get(key);
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }
     }
   });
 

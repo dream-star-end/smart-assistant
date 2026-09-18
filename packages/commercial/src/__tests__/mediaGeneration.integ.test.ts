@@ -670,6 +670,60 @@ describe('media generation durable queue and projects', () => {
     assert.equal(current?.current_compose_job_id, null)
   })
 
+  for (const kind of ['jobs', 'projects'] as const) {
+    for (const precision of ['microseconds', 'timestamp ties'] as const) {
+      test(`${kind} history preserves ${precision} across every page boundary`, async (t) => {
+        if (!maybe(t)) return
+        const stamps = precision === 'microseconds'
+          ? ['946900', '946500', '946200', '945800']
+          : ['946500', '946500', '946500', '946500']
+        for (let index = 0; index < stamps.length; index += 1) {
+          const row = kind === 'jobs'
+            ? await createMediaJob({
+                userId: '1', requestId: `precise-job-${index}`, prompt: `job ${index}`,
+                options: { durationSeconds: 5 },
+              })
+            : await service().createVideoProject('1', {
+                requestId: `precise-project-${index}`, title: `project ${index}`,
+                shots: [{ prompt: `shot ${index}`, durationSeconds: 5 }],
+              })
+          const table = kind === 'jobs' ? 'media_generation_jobs' : 'video_projects'
+          const column = kind === 'jobs' ? 'created_at' : 'updated_at'
+          await pool!.query(`UPDATE ${table} SET ${column}=$1::timestamptz WHERE id=$2`,
+            [`2026-09-07T10:33:24.${stamps[index]}Z`, row.id])
+        }
+        const table = kind === 'jobs' ? 'media_generation_jobs' : 'video_projects'
+        const column = kind === 'jobs' ? 'created_at' : 'updated_at'
+        const expected = (await pool!.query<{ id: string }>(
+          `SELECT id FROM ${table} WHERE user_id=1 ORDER BY ${column} DESC,id DESC`,
+        )).rows.map((row) => row.id)
+        assert.equal(expected.length, 4)
+        for (const pageSize of [1, 2, 3]) {
+          const seen: string[] = []
+          const timestamps: string[] = []
+          let cursor: string | undefined
+          for (let pageIndex = 0; pageIndex < 5; pageIndex += 1) {
+            const page = kind === 'jobs'
+              ? await listJobs('1', cursor, pageSize)
+              : await listProjects('1', cursor, pageSize)
+            const rows = 'jobs' in page ? page.jobs : page.projects
+            assert.equal(rows.length, Math.min(pageSize, expected.length - seen.length))
+            assert.ok(rows.every((row) => !Object.hasOwn(row, 'cursor_at')))
+            seen.push(...rows.map((row) => row.id))
+            if (page.nextCursor === null) break
+            const decoded = JSON.parse(Buffer.from(page.nextCursor, 'base64url').toString('utf8'))
+            timestamps.push(decoded[0])
+            assert.equal(decoded[1], rows.at(-1)!.id)
+            cursor = page.nextCursor
+          }
+          assert.deepEqual(seen, expected)
+          for (const timestamp of timestamps) assert.match(timestamp, /\.\d{6}Z$/)
+          assert.equal(new Set(seen).size, expected.length)
+        }
+      })
+    }
+  }
+
   test('job and project history paginate without truncation and cancellation is CAS guarded', async (t) => {
     if (!maybe(t)) return
     for (let index = 0; index < 4; index += 1) {

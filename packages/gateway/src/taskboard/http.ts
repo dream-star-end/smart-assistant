@@ -75,6 +75,7 @@ import {
   type TaskboardUsage,
   getSettings,
   getUsage,
+  getUsageWithReferenceCosts,
   updateSettings,
 } from './db/settings.js'
 import {
@@ -2670,7 +2671,7 @@ async function handleListAgents(res: ServerResponse, ctx: TaskboardHttpContext):
 }
 
 function handleGetSettings(res: ServerResponse, db: TaskboardDb): void {
-  sendJson(res, 200, { ...getSettings(db), usage: getUsage(db) })
+  sendJson(res, 200, { ...getSettings(db), usage: getUsageWithReferenceCosts(db) })
 }
 
 function handlePatchSettings(
@@ -2698,7 +2699,7 @@ function handlePatchSettings(
   if (typeof body.maxRunsPerTick === 'number') patch.maxRunsPerTick = body.maxRunsPerTick
   if (typeof body.patrolPaused === 'boolean') patch.patrolPaused = body.patrolPaused
   const settings = updateSettings(db, patch)
-  sendJson(res, 200, { ok: true, ...settings, usage: getUsage(db) })
+  sendJson(res, 200, { ok: true, ...settings, usage: getUsageWithReferenceCosts(db) })
 }
 
 // ── M4:成本统计 / 周报 / 流水线模板 ─────────────────────────────────────────

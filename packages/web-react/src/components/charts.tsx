@@ -260,7 +260,34 @@ export type LineSeries = {
   colorToken?: string;
   /** 填充到 x 轴（面积图）。 */
   fill?: boolean;
+  /**
+   * 挂在哪条 y 轴：缺省 left（共用 `y`）。量级差几个数量级的序列（如充值收入 vs 日扣费）
+   * 同轴会把小的压成一条线，标 right 让它走右侧独立刻度 `y1`（审计 SET-17）。
+   */
+  axis?: "left" | "right";
 };
+
+/** 序列里有任一条标了 right → 在 houseScales 基础上补一条右侧 y1（不画网格，避免两套横线交错）。 */
+function scalesWithRightAxis(
+  theme: ChartTheme,
+  series: LineSeries[],
+  opts?: { stacked?: boolean; hideX?: boolean },
+) {
+  const base = houseScales(theme, opts);
+  if (!series.some((s) => s.axis === "right")) return base;
+  return {
+    ...base,
+    y1: {
+      position: "right" as const,
+      beginAtZero: true,
+      grid: { drawOnChartArea: false },
+      border: { display: false },
+      ticks: { color: theme.text, font: { size: 11 }, maxTicksLimit: 6, padding: 6 },
+    },
+  };
+}
+
+const yAxisIdOf = (s: LineSeries) => (s.axis === "right" ? "y1" : "y");
 
 /** 折线/面积趋势图。 */
 export function lineConfig(
@@ -277,6 +304,7 @@ export function lineConfig(
         return {
           label: s.label,
           data: s.data,
+          yAxisID: yAxisIdOf(s),
           borderColor: c,
           backgroundColor: s.fill ? withAlpha(c, theme.isDark ? 0.18 : 0.12) : c,
           fill: s.fill ?? false,
@@ -297,7 +325,7 @@ export function lineConfig(
         legend: { display: !single, ...houseLegend(theme) },
         tooltip: houseTooltip(theme),
       },
-      scales: houseScales(theme),
+      scales: scalesWithRightAxis(theme, o.series),
     },
   };
 }
@@ -322,6 +350,7 @@ export function barConfig(
         return {
           label: s.label,
           data: s.data,
+          yAxisID: yAxisIdOf(s),
           backgroundColor: single ? withAlpha(c, theme.isDark ? 0.85 : 0.9) : c,
           borderRadius: 5,
           borderSkipped: false,
@@ -339,7 +368,7 @@ export function barConfig(
         legend: { display: !single, ...houseLegend(theme) },
         tooltip: houseTooltip(theme),
       },
-      scales: houseScales(theme, { stacked: o.stacked }),
+      scales: scalesWithRightAxis(theme, o.series, { stacked: o.stacked }),
     },
   };
 }

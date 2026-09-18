@@ -6,10 +6,10 @@
  * format 层归一化为 native builtin/MCP 工具。
  */
 import { Sparkles, FileText } from "lucide-react";
-import { useContext, useMemo, useState, type ReactNode } from "react";
+import { lazy, Suspense, useContext, useMemo, useState, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { SignedImg } from "../chat/media";
-import { Badge, Button } from "../ui";
+import { Badge, Button, Spinner } from "../ui";
 import { ExpandControls, ExpandablePre, FULL_TEXT_CAP, useExpandableSlice } from "./expandable";
 import { languageForPath, useHighlighter } from "./highlight";
 import { diffLines, type DiffRow as LineDiffRow } from "./lineDiff";
@@ -18,17 +18,22 @@ import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from 
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
 import { renderMcpResourcesCard } from "./mcpResourceCards";
 import { ToolBodyFullContext, ToolInspectOpenContext, useToolCardActions } from "./context";
+import { INLINE_SUMMARY_CLS, InlineAction } from "./inlineAction";
+import { parseShellEnvelope } from "./shellEnvelope";
 import { parseSearchExtraToolsResult, searchExtraToolsQuery } from "../../lib/chat/extraTool";
 import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
+  advisorConsultStatusLabel,
   asArr,
   asStr,
   clampStr,
   detectShellFileWrites,
+  formatToolDuration,
   formatValue,
   isInternalSubtaskInput,
   isOpaqueArgToolName,
   isSafeHttpUrl,
+  isToolInFlight,
   parseCodexTypeName,
   safeSubtaskDescription,
   shortPath,
@@ -39,40 +44,142 @@ import { parseMcpName } from "./meta";
 import { researchToolCard, safeArtifactSrc, WebSearchResultsCard } from "./researchCards";
 import { renderReleaseJobCard } from "./releaseCards";
 
+const TaskApprovalCard = lazy(() =>
+  import("./taskApprovalCard").then((m) => ({ default: m.TaskApprovalCard })),
+);
+
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
 
 // ── 共用原语 ──────────────────────────────────────────────────────────────
 
+/** 等宽块共用类:pre-wrap + break-words,内容再长也不产生横向滚动,纵向由字符上限 + 展开原语控制。 */
+const PRE_CLS =
+  "mt-1.5 whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg";
+
 /**
- * 等宽预格式化块（终端输出 / 文件内容 / 代码）。
+ * 等宽预格式化块（引用串 / 代码）。
  * 无边框——卡壳本身（ToolCard 的 border-t 体区）已是容器，再加边框会变"框中框"（设计 `.out` 即无边框）。
- * 仅用 bg-code 这层极淡表面做区隔。
+ * 仅用 bg-code 这层极淡表面做区隔。不再设 max-h 嵌套滚动区(T-09):时间线里的嵌套滚动在移动端
+ * 会劫持手势,长度一律靠调用方的字符上限 + 「展开全部」控制。
  */
 function Pre({ children, className }: { children: ReactNode; className?: string }) {
-  // 全文模式(详情列)不设 max-height:滚动交给面板容器,内容一屏到底。
-  const full = useContext(ToolBodyFullContext);
-  return (
-    <pre
-      className={cn(
-        "mt-1.5 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
-        !full && "max-h-80",
-        className,
-      )}
-    >
-      {children}
-    </pre>
-  );
+  return <pre className={cn(PRE_CLS, className)}>{children}</pre>;
 }
 
 function FileMeta({ children }: { children: ReactNode }) {
   return <div className="mt-1.5 text-xs text-faint">{children}</div>;
 }
 
-function StatusLine({ text, error }: { text: string; error?: boolean }) {
+type StatusTone = "success" | "danger" | "muted";
+
+/** 一行状态文案。tone 表达语义色:success 完成 / danger 失败 / muted **进行中**(T-16:进行中 ≠ 成功,不用绿)。 */
+function StatusLine({ text, error, tone }: { text: string; error?: boolean; tone?: StatusTone }) {
   if (!text) return null;
-  return <div className={cn("mt-1.5 text-xs", error ? "text-danger" : "text-success")}>{text}</div>;
+  const resolved: StatusTone = tone ?? (error ? "danger" : "success");
+  return (
+    <div
+      className={cn(
+        "mt-1.5 text-xs",
+        resolved === "danger" ? "text-danger" : resolved === "muted" ? "text-muted" : "text-success",
+      )}
+    >
+      {text}
+    </div>
+  );
 }
+
+// ── 用户面文案(T-27:不把英文开发者术语/原始字段名泄漏到卡片里)──
+
+/** 工具成功回执的已知英文状态串 → 中文;未知原样返回(由调用方降为弱化色)。 */
+const KNOWN_STATUS_OUTPUT: Record<string, string> = {
+  "the file has been updated.": "文件已更新",
+  "the file has been created.": "文件已创建",
+  "file created successfully": "文件已创建",
+  "file created successfully.": "文件已创建",
+  "file updated successfully": "文件已更新",
+  "file updated successfully.": "文件已更新",
+  "file written successfully": "文件已写入",
+  "file written successfully.": "文件已写入",
+  "successfully replaced": "已替换",
+};
+
+/** 成功状态行:已知英文回执映射中文,未知保持原文。返回 {text, known}。 */
+function humanizeStatusOutput(raw: string): { text: string; known: boolean } {
+  const trimmed = raw.trim();
+  const hit = KNOWN_STATUS_OUTPUT[trimmed.toLowerCase()];
+  if (hit) return { text: hit, known: true };
+  // "The file /a/b.ts has been updated successfully." 这类带路径的变体:去掉路径后再查一次。
+  const m = /^the file .* has been (updated|created)( successfully)?\.?$/i.exec(trimmed);
+  if (m) return { text: m[1].toLowerCase() === "created" ? "文件已创建" : "文件已更新", known: true };
+  return { text: raw, known: false };
+}
+
+/** KvList 已知参数键的中文标签;未知键把下划线换成空格,不再直显 snake_case。 */
+const KV_KEY_LABELS: Record<string, string> = {
+  url: "地址",
+  prompt: "提示词",
+  query: "查询",
+  results: "结果数",
+  allowed_domains: "允许的域名",
+  blocked_domains: "屏蔽的域名",
+  file_path: "文件",
+  path: "路径",
+  pattern: "模式",
+  command: "命令",
+  description: "说明",
+  note: "说明",
+  summary: "摘要",
+  max_chars: "最大字数",
+  limit: "上限",
+  offset: "起始",
+  model: "模型",
+  question: "问题",
+  text: "文本",
+  language: "语言",
+  timeout: "超时",
+  glob: "文件匹配",
+  size: "尺寸",
+  style: "风格",
+  quality: "质量",
+  n: "数量",
+  count: "数量",
+  status: "状态",
+  reason: "原因",
+  name: "名称",
+  title: "标题",
+  id: "编号",
+  version: "版本",
+  tags: "标签",
+  format: "格式",
+  duration: "时长",
+  voice_id: "音色",
+  aspect_ratio: "画幅",
+  resolution: "分辨率",
+  usage: "用量",
+  input_tokens: "输入 token",
+  output_tokens: "输出 token",
+  total_tokens: "总 token",
+  "tokens before": "压缩前 token",
+  "tokens after": "压缩后 token",
+};
+
+function kvKeyLabel(key: string): string {
+  return KV_KEY_LABELS[key] ?? key.replace(/_/g, " ");
+}
+
+/** 数字型值做千分位分组(token 数 / 字节数),其余走 formatValue。 */
+function kvValueText(v: unknown): string {
+  if (typeof v === "number" && Number.isFinite(v) && Number.isInteger(v)) return v.toLocaleString();
+  return formatValue(v);
+}
+
+/** Grep output_mode 原词 → 中文。 */
+const OUTPUT_MODE_LABELS: Record<string, string> = {
+  content: "匹配内容",
+  files_with_matches: "匹配的文件",
+  count: "匹配计数",
+};
 
 function PromptBlock({ children }: { children: ReactNode }) {
   return (
@@ -92,8 +199,8 @@ function KvList({ obj, skip, maxValueLen = 240 }: { obj: Input; skip?: string[];
     <div className="mt-1.5 flex flex-col gap-1 text-xs">
       {rows.map(([k, v]) => (
         <div key={k} className="flex gap-2">
-          <span className="shrink-0 font-medium text-faint">{k}</span>
-          <span className="min-w-0 break-words font-mono text-muted">{clampStr(formatValue(v), maxValueLen)}</span>
+          <span className="shrink-0 font-medium text-faint">{kvKeyLabel(k)}</span>
+          <span className="min-w-0 break-words font-mono text-muted">{clampStr(kvValueText(v), maxValueLen)}</span>
         </div>
       ))}
     </div>
@@ -141,39 +248,69 @@ const MAX_DIFF_LINES = 60;
 /** 全文模式的 diff 行数安全上限(渲染保护,不是产品截断)。 */
 const MAX_DIFF_LINES_FULL = 4000;
 
-/** diff 截断行:有 inspect 回调时整行可点(去详情列看全文),否则纯提示。 */
-function DiffTruncationRow() {
+/**
+ * diff 截断行(T-12):一行里并排「展开全部（共 N 行）」与(有 inspect 回调时)「在详情面板查看全文」。
+ * 此前是两行 —— 一行按钮 + 一行 `… (diff 过长，已截断)` 纯提示,语义重复叠在一起。
+ */
+function DiffTruncationRow({
+  shown,
+  total,
+  onShowAll,
+}: {
+  shown: number;
+  total: number;
+  onShowAll?: () => void;
+}) {
   const open = useContext(ToolInspectOpenContext);
-  if (!open) return <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>;
   return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        open();
-      }}
-      className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-    >
-      … diff 过长，在详情面板查看全文
-    </button>
+    <div className="flex flex-wrap items-center gap-x-3 border-t border-border/60 px-3 py-1">
+      <span className="text-faint">已显示前 {shown.toLocaleString()} 行</span>
+      {onShowAll && (
+        <InlineAction onClick={onShowAll}>展开全部（共 {total.toLocaleString()} 行）</InlineAction>
+      )}
+      {open && <InlineAction onClick={open}>在详情面板查看全文</InlineAction>}
+    </div>
   );
 }
 
-/** diff 单行:行号(旧/新)+ 符号 + 内容(可选 hljs 着色;hljs 输出已转义)。 */
-function DiffRowView({ row, html }: { row: LineDiffRow; html: string | null }) {
+/** diff 容器:窄屏 `whitespace-pre` + 横向滚动(与 Markdown 代码块一致,T-10),sm 以上保持折行;
+ *  可横滑的容器要能聚焦,键盘用户才能滚(T-23)。 */
+function DiffContainer({ children }: { children: ReactNode }) {
+  return (
+    <div
+      // biome-ignore lint/a11y/noNoninteractiveTabindex: 可横向滚动的容器必须能聚焦,键盘用户才能滚动(T-23)
+      tabIndex={0}
+      className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      {children}
+    </div>
+  );
+}
+
+const GUTTER_CLS =
+  "w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-[10.5px] leading-relaxed text-faint";
+
+/** diff 单行:行号(旧/新)+ 符号 + 内容(可选 hljs 着色;hljs 输出已转义)。
+ *  gutters:全新增/全删除 diff 隐藏恒空的那一列;窄屏只保留新行号列(T-10:390px 下 92px 固定 gutter
+ *  把内容区挤到 ~230px)。 */
+function DiffRowView({
+  row,
+  html,
+  gutters,
+}: {
+  row: LineDiffRow;
+  html: string | null;
+  gutters: { old: boolean; new: boolean };
+}) {
   return (
     <div
       className={cn(
-        "flex",
+        "flex w-max min-w-full sm:w-auto",
         row.sign === "-" ? "bg-danger-soft" : row.sign === "+" ? "bg-success-soft" : undefined,
       )}
     >
-      <span className="w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-[10.5px] leading-relaxed text-faint">
-        {row.oldNo ?? ""}
-      </span>
-      <span className="w-9 shrink-0 select-none border-r border-border/60 pr-1.5 text-right text-[10.5px] leading-relaxed text-faint">
-        {row.newNo ?? ""}
-      </span>
+      {gutters.old && <span className={cn(GUTTER_CLS, gutters.new && "hidden sm:block")}>{row.oldNo ?? ""}</span>}
+      {gutters.new && <span className={GUTTER_CLS}>{row.newNo ?? ""}</span>}
       <span
         className={cn(
           "w-5 shrink-0 select-none text-center",
@@ -184,7 +321,7 @@ function DiffRowView({ row, html }: { row: LineDiffRow; html: string | null }) {
       </span>
       <span
         className={cn(
-          "min-w-0 flex-1 whitespace-pre-wrap break-words pr-3",
+          "min-w-0 flex-1 whitespace-pre pr-3 sm:whitespace-pre-wrap sm:break-words",
           row.sign === "-" ? "text-danger" : row.sign === "+" ? "text-success" : "text-muted",
         )}
       >
@@ -210,25 +347,93 @@ function DiffView({ oldStr, newStr, path }: { oldStr: string; newStr: string; pa
   const maxLines = full || showAll ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
   const truncated = rows.length > maxLines;
   const highlight = useHighlighter(languageForPath(path ?? null));
+  // 全新增(Write / 空 old_string)没有旧行号,全删除没有新行号:恒空的 gutter 不占位。
+  const gutters = useMemo(
+    () => ({
+      old: rows.some((r) => r.oldNo !== null),
+      new: rows.some((r) => r.newNo !== null),
+    }),
+    [rows],
+  );
   return (
-    <div className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed">
+    <DiffContainer>
       {rows.slice(0, maxLines).map((r, i) => (
-        <DiffRowView key={`${i}-${r.sign}`} row={r} html={highlight(r.text)} />
+        <DiffRowView key={`${i}-${r.sign}`} row={r} html={highlight(r.text)} gutters={gutters} />
       ))}
       {truncated && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowAll(true);
-          }}
-          className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        >
-          展开全部（共 {rows.length} 行）
-        </button>
+        <DiffTruncationRow
+          shown={maxLines}
+          total={rows.length}
+          onShowAll={showAll ? undefined : () => setShowAll(true)}
+        />
       )}
-      {truncated && <DiffTruncationRow />}
-    </div>
+    </DiffContainer>
+  );
+}
+
+type TerminalSegment = { text: string; tone: "stdout" | "stderr" | "exit" };
+
+/**
+ * 单个"终端块":`$ 命令` + 输出合一渲染在同一个 pre 内(消除"命令一框 + 输出一框"的嵌套方框感)。
+ *   - Cursor 信封 `{success:{stdout,stderr,exitCode}}` 先解包(T-03):stdout 正常、stderr 危险色、
+ *     非 0 退出码末行「退出码 N」—— 不再把整段 JSON 当输出裸渲染;
+ *   - 输出接 F4 展开原语(T-09):默认 2000 字 + 「展开全部 / 继续显示 / 收起」,不再是 320px 的
+ *     嵌套滚动区(终端是最高频工具,却曾是唯一没有「展开全部」的体)。
+ * 命令行不计入截断:审计用途下命令要完整可见(heredoc 写文件尤其如此)。
+ */
+function TerminalBlock({ command, output }: { command: string; output: string | null }) {
+  const segments = useMemo<TerminalSegment[]>(() => {
+    if (!output) return [];
+    const env = parseShellEnvelope(output);
+    if (!env) return [{ text: output, tone: "stdout" }];
+    const segs: TerminalSegment[] = [];
+    if (env.stdout) segs.push({ text: env.stdout, tone: "stdout" });
+    if (env.stderr) {
+      const needsBreak = env.stdout && !env.stdout.endsWith("\n");
+      segs.push({ text: `${needsBreak ? "\n" : ""}${env.stderr}`, tone: "stderr" });
+    }
+    if (env.exitCode !== null && env.exitCode !== 0) {
+      const last = segs[segs.length - 1];
+      const needsBreak = last && !last.text.endsWith("\n");
+      segs.push({ text: `${needsBreak ? "\n" : ""}退出码 ${env.exitCode}`, tone: "exit" });
+    }
+    return segs;
+  }, [output]);
+  const joined = useMemo(() => segments.map((s) => s.text).join(""), [segments]);
+  const slice = useExpandableSlice(joined, 2000);
+  // 把已显示的字符数按段切回去,stderr / 退出码保持各自的颜色。
+  const nodes: ReactNode[] = [];
+  let remaining = slice.shown.length;
+  for (const seg of segments) {
+    if (remaining <= 0) break;
+    const part = seg.text.length > remaining ? seg.text.slice(0, remaining) : seg.text;
+    remaining -= part.length;
+    nodes.push(
+      seg.tone === "stdout" ? (
+        part
+      ) : (
+        <span key={`${seg.tone}-${nodes.length}`} className="text-danger">
+          {part}
+        </span>
+      ),
+    );
+  }
+  if (!command && nodes.length === 0) return null;
+  return (
+    <>
+      <Pre>
+        {command && (
+          <>
+            <span className="text-success">$ </span>
+            {command}
+            {nodes.length > 0 ? "\n" : ""}
+          </>
+        )}
+        {nodes}
+        {slice.truncated ? "\n…" : null}
+      </Pre>
+      <ExpandControls slice={slice} />
+    </>
   );
 }
 
@@ -253,7 +458,6 @@ function BashBody({ input, tool }: BodyProps) {
     (out.startsWith("Command running in background with ID:") ||
       out.startsWith("Command was manually backgrounded by user with ID:") ||
       out.includes("was moved to the background with ID:"));
-  // 单个"终端块"：$ 命令 + 输出合一渲染在同一个 Pre 内（消除"命令一框 + 输出一框"的嵌套方框感）。
   let outText: string | null = null;
   let headTruncated = false;
   let totalBytes = 0;
@@ -267,8 +471,10 @@ function BashBody({ input, tool }: BodyProps) {
     outText = out;
   }
   if (!command && !outText) return null;
+  const headNote = headTruncated ? (
+    <FileMeta>输出过长，已省略开头部分（共 {totalBytes.toLocaleString()} 字节）</FileMeta>
+  ) : null;
   if (fileWrite) {
-    const auditCommand = fileWrite.rawCommand;
     const status = tool.error
       ? "写入文件命令失败"
       : tool._completed
@@ -276,7 +482,7 @@ function BashBody({ input, tool }: BodyProps) {
         : "正在写入文件…";
     return (
       <>
-        <StatusLine text={status} error={tool.error} />
+        <StatusLine text={status} error={tool.error} tone={tool.error || tool._completed ? undefined : "muted"} />
         <div className={cn("mt-1.5 rounded-md px-3 py-2 text-xs", tool.error ? "bg-danger-soft" : "bg-success-soft")}>
           <div className={cn("font-medium", tool.error ? "text-danger" : "text-success")}>文件</div>
           <ul className="mt-1 flex flex-col gap-0.5">
@@ -287,34 +493,16 @@ function BashBody({ input, tool }: BodyProps) {
             ))}
           </ul>
         </div>
-        {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
+        {headNote}
         <FileMeta>原始终端命令</FileMeta>
-        <Pre>
-          {auditCommand && (
-            <>
-              <span className="text-success">$ </span>
-              {auditCommand}
-              {outText ? "\n" : ""}
-            </>
-          )}
-          {outText}
-        </Pre>
+        <TerminalBlock command={fileWrite.rawCommand} output={outText} />
       </>
     );
   }
   return (
     <>
-      {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
-      <Pre>
-        {command && (
-          <>
-            <span className="text-success">$ </span>
-            {command}
-            {outText ? "\n" : ""}
-          </>
-        )}
-        {outText}
-      </Pre>
+      {headNote}
+      <TerminalBlock command={command} output={outText} />
     </>
   );
 }
@@ -357,12 +545,12 @@ function UnifiedDiffView({ diff }: { diff: string }) {
   const lines = diff.replace(/\n$/, "").split("\n");
   const truncated = lines.length > maxLines;
   return (
-    <div className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed">
+    <DiffContainer>
       {lines.slice(0, maxLines).map((line, i) => (
         <div
           key={`${i}-${line.slice(0, 24)}`}
           className={cn(
-            "whitespace-pre-wrap break-words px-3 py-px",
+            "w-max min-w-full whitespace-pre px-3 py-px sm:w-auto sm:whitespace-pre-wrap sm:break-words",
             line.startsWith("+")
               ? "bg-success-soft text-success"
               : line.startsWith("-")
@@ -374,19 +562,13 @@ function UnifiedDiffView({ diff }: { diff: string }) {
         </div>
       ))}
       {truncated && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowAll(true);
-          }}
-          className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        >
-          展开全部（共 {lines.length} 行）
-        </button>
+        <DiffTruncationRow
+          shown={maxLines}
+          total={lines.length}
+          onShowAll={showAll ? undefined : () => setShowAll(true)}
+        />
       )}
-      {truncated && <DiffTruncationRow />}
-    </div>
+    </DiffContainer>
   );
 }
 
@@ -446,19 +628,27 @@ function EditBody({ input, tool }: BodyProps) {
       {(oldStr || newStr) && (
         <DiffView oldStr={oldStr} newStr={newStr} path={asStr(input?.file_path)} />
       )}
-      {out && <StatusLine text={out.slice(0, tool.error ? 300 : 200)} error={tool.error} />}
+      {out && <ResultStatusLine output={out} error={tool.error} max={tool.error ? 300 : 200} />}
     </>
   );
 }
 
+/** Edit/Write 的回执行:失败原样 danger;成功时已知英文回执映射中文,未知回执降为弱化色(T-27)。 */
+function ResultStatusLine({ output, error, max }: { output: string; error?: boolean; max: number }) {
+  if (error) return <StatusLine text={output.slice(0, max)} error />;
+  const { text, known } = humanizeStatusOutput(output);
+  return <StatusLine text={text.slice(0, max)} tone={known ? "success" : "muted"} />;
+}
+
 function ReadBody({ input, tool }: BodyProps) {
   const parts: string[] = [];
-  if (input?.offset != null && input.offset !== "") parts.push(`行 ${String(input.offset)}`);
-  if (input?.limit != null && input.limit !== "") parts.push(`${String(input.limit)} 行`);
+  // 「行 1, 70 行」语义含糊(T-30)→「从第 1 行起 · 读取 70 行」。
+  if (input?.offset != null && input.offset !== "") parts.push(`从第 ${String(input.offset)} 行起`);
+  if (input?.limit != null && input.limit !== "") parts.push(`读取 ${String(input.limit)} 行`);
   const out = tool.output;
   return (
     <>
-      {parts.length > 0 && <FileMeta>{parts.join(", ")}</FileMeta>}
+      {parts.length > 0 && <FileMeta>{parts.join(" · ")}</FileMeta>}
       {out && <ExpandablePre text={out} max={2000} language={languageForPath(asStr(input?.file_path))} />}
     </>
   );
@@ -477,7 +667,7 @@ function WriteBody({ input, tool }: BodyProps) {
       {content && (
         <ExpandablePre text={content} max={500} language={languageForPath(asStr(input?.file_path))} />
       )}
-      {out && <StatusLine text={out.slice(0, 200)} error={tool.error} />}
+      {out && <ResultStatusLine output={out} error={tool.error} max={200} />}
     </>
   );
 }
@@ -528,17 +718,11 @@ function markLine(line: string, re: RegExp): ReactNode {
 
 /** Grep 内容输出:按 pattern 高亮命中(M2),截断可展开(F4)。 */
 function GrepOutput({ text, pattern }: { text: string; pattern: string }) {
-  const full = useContext(ToolBodyFullContext);
   const slice = useExpandableSlice(text, 2000);
   const re = useMemo(() => grepPatternRegex(pattern), [pattern]);
   return (
     <>
-      <pre
-        className={cn(
-          "mt-1.5 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
-          !full && "max-h-80",
-        )}
-      >
+      <pre className={PRE_CLS}>
         {re
           ? slice.shown.split("\n").map((line, i) => (
               <span key={`${i}-${line.slice(0, 16)}`}>
@@ -554,13 +738,17 @@ function GrepOutput({ text, pattern }: { text: string; pattern: string }) {
   );
 }
 
-/** Grep files_with_matches 输出 → 文件列表(M2)。 */
-function GrepFileList({ text }: { text: string }) {
+/** 逐行路径输出 → 文件列表(Grep files_with_matches 与 Glob 同款,T-31)。 */
+function FileList({ text }: { text: string }) {
   const [showAll, setShowAll] = useState(false);
-  const files = text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const files = Array.from(
+    new Set(
+      text
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean),
+    ),
+  );
   if (files.length === 0) return null;
   const limit = showAll ? files.length : 30;
   return (
@@ -574,16 +762,9 @@ function GrepFileList({ text }: { text: string }) {
         ))}
       </ul>
       {files.length > limit && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowAll(true);
-          }}
-          className="mt-1 rounded text-xs text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          展开全部（共 {files.length} 个文件）
-        </button>
+        <InlineAction className="mt-1" onClick={() => setShowAll(true)}>
+          展开全部（共 {files.length.toLocaleString()} 个文件）
+        </InlineAction>
       )}
     </div>
   );
@@ -592,16 +773,17 @@ function GrepFileList({ text }: { text: string }) {
 function GrepBody({ input, tool }: BodyProps) {
   const parts: string[] = [];
   if (input?.path) parts.push(shortPath(input.path));
-  if (input?.glob) parts.push(`glob: ${asStr(input.glob)}`);
-  if (input?.output_mode) parts.push(asStr(input.output_mode));
+  if (input?.glob) parts.push(`文件匹配 ${asStr(input.glob)}`);
+  const mode = asStr(input?.output_mode);
+  if (mode) parts.push(OUTPUT_MODE_LABELS[mode] ?? mode.replace(/_/g, " "));
   const out = tool.output;
-  const filesMode = asStr(input?.output_mode) === "files_with_matches";
+  const filesMode = mode === "files_with_matches";
   return (
     <>
       {parts.length > 0 && <FileMeta>{parts.join(" · ")}</FileMeta>}
       {out &&
         (filesMode ? (
-          <GrepFileList text={out} />
+          <FileList text={out} />
         ) : (
           <GrepOutput text={out} pattern={asStr(input?.pattern)} />
         ))}
@@ -609,12 +791,21 @@ function GrepBody({ input, tool }: BodyProps) {
   );
 }
 
+/** Glob 输出是逐行路径:与 Grep 文件列表同一呈现(T-31),不再是一坨等宽全路径文本。 */
 function GlobBody({ input, tool }: BodyProps) {
   const out = tool.output;
+  // 每一行都像路径(含分隔符或扩展名)才按文件列表呈现;"No files found" 这类提示保持文本块。
+  const isPathList =
+    !!out &&
+    out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .every((l) => /[\\/]|\.\w+$/.test(l));
   return (
     <>
       {input?.path && <FileMeta>{shortPath(input.path)}</FileMeta>}
-      {out && <ExpandablePre text={out} max={2000} />}
+      {out && (isPathList ? <FileList text={out} /> : <ExpandablePre text={out} max={2000} />)}
     </>
   );
 }
@@ -829,7 +1020,12 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
     return (
       <>
         {prompt && <PromptBlock>{prompt}</PromptBlock>}
-        {running && <StatusLine text="图片生成中，通常需要几十秒，请稍候…" />}
+        {running && (
+          <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted">
+            <Spinner size={12} className="text-accent" />
+            <span>图片生成中，通常需要几十秒，请稍候…</span>
+          </div>
+        )}
         {failed && <StatusLine text="生成失败" error />}
         {!running && !failed && <StatusLine text="图片已生成" />}
         {savedPath && !failed && <FileMeta>{shortPath(savedPath)}</FileMeta>}
@@ -941,8 +1137,12 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
       </div>
       {body && (
         <details>
-          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
-          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+          <summary className={INLINE_SUMMARY_CLS}>查看技能正文</summary>
+          <pre
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
+            tabIndex={0}
+            className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
             {body}
           </pre>
         </details>
@@ -950,6 +1150,19 @@ function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
       <OutputBlock output={tool.output} />
     </div>
   );
+}
+
+function parseJsonObjectSafe(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
@@ -1023,6 +1236,69 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
     const title =
       safeSubtaskDescription({ description: asStr(input?.goal) || asStr(input?.message) }) || "运行子任务";
     body = <div className="mt-1.5 text-xs text-muted">{title}</div>;
+  } else if (op === "present_task_approval") {
+    const ticketId = asStr(input?.id) || asStr(input?.identifier);
+    if (ticketId && !tool.error) {
+      body = (
+        <Suspense fallback={<div className="mt-1.5 text-caption text-faint">加载审批卡…</div>}>
+          <TaskApprovalCard id={ticketId} prompt={asStr(input?.prompt) || undefined} />
+        </Suspense>
+      );
+      suppressOutput = true;
+    } else {
+      body = <KvList obj={input} />;
+    }
+  } else if (op === "consult_advisor") {
+    const parsed = parseJsonObjectSafe(tool.outputJson ?? tool.output);
+    const advice = asStr(parsed?.advice) || asStr(parsed?.result) || "";
+    const model = asStr(parsed?.model) || asStr(parsed?.advisorModel) || asStr(input?.model);
+    const status = asStr(parsed?.status);
+    const err = asStr(parsed?.error);
+    const duration =
+      typeof parsed?.durationMs === "number"
+        ? parsed.durationMs
+        : typeof tool.durationMs === "number"
+          ? tool.durationMs
+          : null;
+    const usage = parsed?.usage;
+    // 合并取舍(发布预演 t-1279):整块取 canonical OCV5-220 —— 进行中 / 已结束两态、人话时长、
+    // 状态词经 advisorConsultStatusLabel 人话化(审计 T-27 的诉求由它兑现;timeout → 超时补进该函数)。
+    const question = asStr(input?.question);
+    const concern = asStr(input?.concern);
+    const running = isToolInFlight(tool);
+    const statusLabel = running ? "" : advisorConsultStatusLabel(status);
+    const durationLabel = formatToolDuration(duration);
+    const doneBits = [
+      model ? `顾问 ${model}` : null,
+      statusLabel || null,
+      durationLabel,
+    ].filter(Boolean);
+    body = (
+      <div className="mt-1.5 space-y-1.5 text-xs leading-relaxed text-fg">
+        {question ? (
+          <div>
+            <div className="text-faint">问了什么</div>
+            <div className="whitespace-pre-wrap text-fg">{question}</div>
+          </div>
+        ) : null}
+        {concern ? <div className="text-muted">关注点：{concern}</div> : null}
+        <div className="text-muted">
+          {running
+            ? `顾问思考中${durationLabel ? ` · 已用时 ${durationLabel}` : ""}`
+            : doneBits.length > 0
+              ? doneBits.join(" · ")
+              : "顾问已结束"}
+        </div>
+        {err ? <div className="text-danger">{err}</div> : null}
+        {advice ? <PromptBlock>{advice}</PromptBlock> : null}
+        {!running && usage == null ? (
+          <div className="text-faint">顾问用量未返回，主/顾问分项以账户用量明细为准。</div>
+        ) : !running && usage != null ? (
+          <KvList obj={typeof usage === "object" && usage ? (usage as Record<string, unknown>) : { usage }} />
+        ) : null}
+      </div>
+    );
+    suppressOutput = running || !!advice || !!status || !!err;
   } else {
     body = <KvList obj={input} />;
   }
@@ -1240,13 +1516,14 @@ function shortBackgroundTaskId(input: Input): string {
 
 function TaskBody({ input, tool, name }: BodyProps & { name?: string }) {
   const desc = safeSubtaskDescription(input);
-  const waitId = shortBackgroundTaskId(input);
-  const title =
-    desc ||
-    (waitId ? `等待后台命令 · ${waitId}` : name === "TaskOutput" ? "等待后台命令" : "运行子任务");
+  // 后台命令的内部 call-id 对用户没有价值(T-27),只标「等待后台命令」。
+  const waiting = name === "TaskOutput" || !!shortBackgroundTaskId(input);
+  const title = desc || (waiting ? "等待后台命令" : "运行子任务");
+  // 有输出时表头摘要已经是同一句 description,展开体不再重复一遍(T-20);无输出才用标题占位。
+  const hasOutput = typeof tool.output === "string" && tool.output.trim().length > 0;
   return (
     <>
-      <div className="mt-1.5 text-xs text-muted">{title}</div>
+      {(!hasOutput || !desc) && <div className="mt-1.5 text-xs text-muted">{title}</div>}
       <OutputBlock output={tool.output} />
     </>
   );

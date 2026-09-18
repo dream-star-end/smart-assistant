@@ -1,3 +1,4 @@
+import { resolveRuntimeExecutionAgent } from '@openclaude/storage'
 // Cron — periodic self-reflection jobs for the learning loop.
 //
 // Jobs are defined in ~/.openclaude/cron.yaml:
@@ -86,7 +87,10 @@ import {
 } from './delegateCronIdempotency.js'
 import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protocol'
 import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
-import type { DelegateJobStore } from './delegateJobs.js'
+import {
+  DELEGATE_LEASE_HEARTBEAT_MS,
+  type DelegateJobStore,
+} from './delegateJobs.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -348,6 +352,14 @@ interface CronRunDurabilityHooks {
   consumeOccurrence(): Promise<void>
   /** Cross the fail-closed boundary immediately before submit can run tools. */
   markSubmitStarted?(): Promise<void>
+  /**
+   * Start the execution-scope lease heartbeat. Must run immediately before
+   * the local `sessions.submit` call, never from claim/persist. Throws when
+   * the scheduler is already stopped so the caller cannot submit.
+   */
+  beginExecutionHeartbeat?(): void
+  /** Stop the execution-scope heartbeat. Sync; call before destroy/archive. */
+  endExecutionHeartbeat?(): void
   /** Append-only, fsynced observation tape. */
   recordEvent?(event: unknown): void
   /** Persist the immutable archived result before delivery. */
@@ -789,6 +801,116 @@ export function backfillCronOccurrenceDelegateJobs(
   return n
 }
 
+export type CronDelegateHeartbeat = {
+  /** Stop beating. Idempotent; safe from any `finally`. */
+  stop: () => void
+  /** Test/observability seam: beats actually delivered so far. */
+  beats: () => number
+}
+
+/** Thrown when local execution must not start (stopped scheduler or lost fence). */
+export class CronExecutionRejectedError extends Error {
+  readonly code: 'SCHEDULER_STOPPED' | 'FENCE_REJECTED'
+  constructor(
+    message = 'cron scheduler is stopped',
+    code: 'SCHEDULER_STOPPED' | 'FENCE_REJECTED' = 'SCHEDULER_STOPPED',
+  ) {
+    super(message)
+    this.name = 'CronExecutionRejectedError'
+    this.code = code
+  }
+}
+
+/**
+ * OCV5-164: real liveness heartbeat for a claimed cron occurrence.
+ *
+ * The heartbeat-timeout reaper judges `last_activity_at`, and a cron row has
+ * no runner-attached 15s interval like `_runDelegateTaskCore` does. Protocol
+ * events cannot stand in for one: `tool_use_detected` is consumed inside
+ * sessionManager and never reaches `onEvent`, so a legitimate long tool call
+ * (host/Bash/npm test) produces zero events for far longer than the 30min
+ * timeout while the session's own stdout watchdog still considers it alive.
+ * Beating on a timer keeps the durable row's liveness aligned with the
+ * session-level idle policy instead of a weaker signal.
+ *
+ * A failed touch means the fence is gone or the row already went terminal
+ * (e.g. the reaper won): stop beating and interrupt the child session, the
+ * same closeout the delegate path performs on `casHeartbeat` failure — so we
+ * never leave "ledger says failed, subprocess still running".
+ */
+export function startCronDelegateHeartbeat(args: {
+  store: DelegateJobStore
+  jobId: string
+  fence: { claimToken: string; fencingEpoch: number }
+  sessionKey?: string
+  intervalMs?: number
+  interrupt?: (sessionKey: string) => boolean | void
+  log?: { warn: (msg: string, meta?: Record<string, unknown>) => void }
+  setIntervalFn?: typeof setInterval
+  clearIntervalFn?: typeof clearInterval
+}): CronDelegateHeartbeat {
+  const intervalMs = args.intervalMs ?? DELEGATE_LEASE_HEARTBEAT_MS
+  const setIntervalFn = args.setIntervalFn ?? setInterval
+  const clearIntervalFn = args.clearIntervalFn ?? clearInterval
+  const capturedSessionKey = args.sessionKey
+  let beats = 0
+  let timer: ReturnType<typeof setInterval> | null = null
+  let closed = false
+  const stop = (): void => {
+    if (closed) return
+    closed = true
+    if (timer) {
+      clearIntervalFn(timer)
+      timer = null
+    }
+  }
+  const closeout = (reason: string): void => {
+    if (closed) return
+    stop()
+    if (!capturedSessionKey) {
+      args.log?.warn('cron delegate heartbeat lost fence; child sessionKey missing', {
+        jobId: args.jobId,
+        reason,
+      })
+      return
+    }
+    let interrupted: boolean | void = false
+    try {
+      interrupted = args.interrupt?.(capturedSessionKey)
+    } catch (err) {
+      args.log?.warn('cron delegate heartbeat interrupt failed', {
+        jobId: args.jobId,
+        sessionKey: capturedSessionKey,
+        reason,
+        errorClass: stableCronErrorClass(err),
+      })
+      return
+    }
+    args.log?.warn('cron delegate heartbeat lost fence; interrupted child session', {
+      jobId: args.jobId,
+      sessionKey: capturedSessionKey,
+      reason,
+      interrupted: interrupted === true,
+    })
+  }
+  timer = setIntervalFn(() => {
+    if (closed) return
+    beats += 1
+    let ok = false
+    try {
+      ok = args.store.touchActivity(args.jobId, args.fence)
+    } catch {
+      // A transient sqlite error must not kill a healthy occurrence; the next
+      // beat retries and the reaper is still the backstop. Do not treat the
+      // throw as a successful touch and do not close out as a fence reject.
+      return
+    }
+    if (!ok) closeout('touch_activity_rejected')
+  }, intervalMs)
+  timer.unref?.()
+  return { stop, beats: () => beats }
+}
+
 async function loadOccurrenceRecords(): Promise<CronOccurrenceRecord[]> {
   if (!existsSync(OCCURRENCE_DIR)) return []
   const records: CronOccurrenceRecord[] = []
@@ -1128,10 +1250,29 @@ export function frequencyQuotaError(
 export class CronScheduler {
   /** OCV5-22 phase 0: optional shared job store. Unset = today's occurrence JSON is still the execution right. */
   public delegateJobs?: DelegateJobStore
+  /**
+   * OCV5-164 cron liveness heartbeat cadence. Production keeps the 15s lease
+   * beat; tests shorten it so a real interval can be exercised without a
+   * 15s wall-clock wait. Not an env knob — the reaper's timeout is.
+   */
+  public delegateHeartbeatMs: number = DELEGATE_LEASE_HEARTBEAT_MS
+  /**
+   * Test seam: injected clock for the execution heartbeat. Production keeps
+   * the real timers. Not an env knob.
+   */
+  public heartbeatSetInterval: typeof setInterval = setInterval
+  public heartbeatClearInterval: typeof clearInterval = clearInterval
+  /**
+   * Test seam: awaited after origin-session claim/ACK and before archive.
+   * Production unset. Lets tests prove origin creates no local heartbeat
+   * while archive is still pending.
+   */
+  public afterOriginClaim?: () => void | Promise<void>
   private timer: NodeJS.Timeout | null = null
   private bootTickTimer: NodeJS.Timeout | null = null
   private stopped = false
   private running = false
+  private readonly activeHeartbeats = new Set<CronDelegateHeartbeat>()
   /** Reference to last-active-channel map for heartbeat session routing.
    *  Shape must stay in sync with Gateway's `lastActiveChannel` — the
    *  `userId` field was added so gateway can route heartbeats per-user. */
@@ -1280,9 +1421,38 @@ export class CronScheduler {
     this.timer = null
     if (this.bootTickTimer) clearTimeout(this.bootTickTimer)
     this.bootTickTimer = null
+    this.stopExecutionHeartbeats()
+  }
+
+  /** Test/observability: how many execution heartbeats are currently armed. */
+  get activeExecutionHeartbeatCount(): number {
+    return this.activeHeartbeats.size
+  }
+
+  private registerExecutionHeartbeat(hb: CronDelegateHeartbeat): CronDelegateHeartbeat {
+    this.activeHeartbeats.add(hb)
+    return {
+      stop: () => {
+        hb.stop()
+        this.activeHeartbeats.delete(hb)
+      },
+      beats: hb.beats,
+    }
+  }
+
+  private stopExecutionHeartbeats(): void {
+    for (const hb of [...this.activeHeartbeats]) {
+      try {
+        hb.stop()
+      } catch {
+        // Shutdown must still clear the set even if one stop throws.
+      }
+    }
+    this.activeHeartbeats.clear()
   }
 
   private async tick(): Promise<void> {
+    if (this.stopped) return
     this.running = true
     try {
       const file = await ensureCronFile()
@@ -1443,6 +1613,7 @@ export class CronScheduler {
       }
       try {
         for (const job of file.jobs ?? []) {
+          if (this.stopped) break
           const existingRetry = this.retryState.get(job.id)
           if (job.enabled === false && !(job.oneshot && existingRetry)) continue
           // A persisted retry owns its original occurrence even after the
@@ -1458,6 +1629,7 @@ export class CronScheduler {
           }
           let cronClaimFence: { claimToken: string; fencingEpoch: number } | undefined
           let cronDelegateJobId: string | undefined
+          let cronHeartbeat: CronDelegateHeartbeat | undefined
           let outcome: CronRunOutcome
           if (existingRetry?.phase === 'delivery') {
             outcome = await this.retryArchivedDelivery(job, existingRetry)
@@ -1568,6 +1740,55 @@ export class CronScheduler {
                       lastRunDirty = false
                     }
                   },
+                  beginExecutionHeartbeat: () => {
+                    if (this.stopped) {
+                      throw new CronExecutionRejectedError()
+                    }
+                    if (!(isDelegateSmEnabled() && this.delegateJobs && cronClaimFence)) return
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    const jobId = record?.delegateJobId ?? cronDelegateJobId
+                    if (!jobId) return
+                    const sessionKey =
+                      record?.sessionKey ??
+                      `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`
+                    // Confirm the claim-time fence still owns the durable row
+                    // immediately before submit. No await sits between this
+                    // CAS and sessions.submit. A stale owner must not start
+                    // work or interrupt the new owner's session.
+                    let owned = false
+                    try {
+                      owned = this.delegateJobs.touchActivity(jobId, cronClaimFence)
+                    } catch (err) {
+                      logger.warn(`job ${job.id} execution fence touch failed`, {
+                        jobId: job.id,
+                        errorClass: stableCronErrorClass(err),
+                      })
+                      throw err
+                    }
+                    if (!owned) {
+                      throw new CronExecutionRejectedError(
+                        'cron execution fence is no longer valid',
+                        'FENCE_REJECTED',
+                      )
+                    }
+                    cronHeartbeat = this.registerExecutionHeartbeat(
+                      startCronDelegateHeartbeat({
+                        store: this.delegateJobs,
+                        jobId,
+                        fence: cronClaimFence,
+                        sessionKey,
+                        intervalMs: this.delegateHeartbeatMs,
+                        interrupt: (key) => this.sessions.interrupt(key),
+                        log: logger,
+                        setIntervalFn: this.heartbeatSetInterval,
+                        clearIntervalFn: this.heartbeatClearInterval,
+                      }),
+                    )
+                  },
+                  endExecutionHeartbeat: () => {
+                    cronHeartbeat?.stop()
+                    cronHeartbeat = undefined
+                  },
                   recordEvent: (event) => {
                     const record = readOccurrence(deliveryContext.deliveryId)
                     if (!record || record.state !== 'executing') return
@@ -1626,6 +1847,12 @@ export class CronScheduler {
                 // submit may have started, replaying a fresh isolated session
                 // can duplicate non-idempotent tool side effects.
                 outcome = { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
+              } finally {
+                // OCV5-164: execution is over on every path (success, throw,
+                // terminal failure). Stop beating before settle so the row's
+                // liveness cannot outlive the work it represents.
+                cronHeartbeat?.stop()
+                cronHeartbeat = undefined
               }
             }
           }
@@ -1773,6 +2000,9 @@ export class CronScheduler {
       // Fire-and-forget; personal version (no master env) no-ops.
       this.maybePushCronIndex(file)
     } finally {
+      // Tick-level fallback: any leaked execution heartbeat must not outlive
+      // the tick, including throw paths that skipped the per-job finally.
+      this.stopExecutionHeartbeats()
       this.running = false
     }
   }
@@ -1925,6 +2155,9 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
     }
+    if (this.stopped) {
+      return { kind: 'terminal_failure', code: 'SCHEDULER_STOPPED' }
+    }
     const dlgJobId = this.resolveCronDelegateJobId(job, deliveryContext)
     const dlgSnap =
       dlgJobId && this.delegateJobs ? this.delegateJobs.snapshotOf(dlgJobId) : undefined
@@ -1940,6 +2173,10 @@ export class CronScheduler {
       if (injectAcked) {
         result = { kind: 'injected' }
       } else {
+        // This is a NEW scheduled execution even when it resumes an old parent.
+        // Already-ACKed delivery recovery above is not a new execution and must
+        // remain settleable after uninstall/readiness loss.
+        await resolveRuntimeExecutionAgent({ id: job.agent })
         if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
         if (!useLegacyLeg) {
           result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
@@ -1999,6 +2236,9 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
     }
+    // Origin-session does not own a local execution heartbeat. The original
+    // conversation keeps SessionManager liveness; this path only injects/ACKs.
+    if (this.afterOriginClaim) await this.afterOriginClaim()
     if (
       !isDelegateNotifierEffective() &&
       result.kind === 'injected' &&
@@ -2154,7 +2394,8 @@ export class CronScheduler {
     // (会被 CODEX_BILLING_GUARD 100% fail-closed 拒)。这里显式解析出非 codex 执行模型,
     // 与 agent 交互态默认(可能是 gpt-5.5=codex)解耦;非 codex agent 返回 undefined,
     // 沿用原默认(行为不变)。同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
-    const cronRoute = resolveSyntheticTurnModel(agent, this.config.defaults.model)
+    const executionAgent = (await resolveRuntimeExecutionAgent(agent)).agent
+    const cronRoute = resolveSyntheticTurnModel(executionAgent, this.config.defaults.model)
     // ── 模型权威 §3:cron 是**无 envelope 的本地路径** ────────────────────────
     // flag 开(托管)→ 判定源换成 master 的 per-uid catalog 投影:归一 / 可用性(active)/
     // engine **全取投影**,容器镜像里 baked 的两张表不再参与(它们与 catalog 必然漂移)。
@@ -2166,7 +2407,7 @@ export class CronScheduler {
     let cronExec: LocalExecutionDecision | undefined
     try {
       cronExec = await resolveLocalExecutionIfEnforced({
-        agent,
+        agent: executionAgent,
         kind: 'synthetic',
         model: cronRoute?.model,
         defaultModel: this.config.defaults.model,
@@ -2196,7 +2437,7 @@ export class CronScheduler {
     try {
       session = await this.sessions.getOrCreate({
         sessionKey,
-        agent,
+        agent: executionAgent,
         ...(cronModel ? { model: cronModel } : {}),
         ...localExecutionOverride(cronExec),
         channel: 'cron',
@@ -2263,6 +2504,10 @@ export class CronScheduler {
       return { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
     }
     try {
+      if (this.stopped) {
+        throw new CronExecutionRejectedError()
+      }
+      durability.beginExecutionHeartbeat?.()
       await this.sessions.submit(
         session,
         job.prompt,
@@ -2278,9 +2523,21 @@ export class CronScheduler {
     } catch (err) {
       submitError = err
     } finally {
+      // Execution scope ends as soon as submit settles (success, throw, or
+      // shutdown reject). Stop the lease heartbeat synchronously before any
+      // destroy/archive await so a hung destroy cannot keep renewing.
+      try {
+        durability.endExecutionHeartbeat?.()
+      } catch (err) {
+        logger.warn(`job ${job.id} endExecutionHeartbeat failed`, {
+          jobId: job.id,
+          errorClass: stableCronErrorClass(err),
+        })
+      }
       // All jobs use isolated sessions — always destroy, even if submit()
       // threw, otherwise the subprocess + resume-map entry would leak until
-      // the eviction loop catches it on the next sweep.
+      // the eviction loop catches it on the next sweep. begin/end hook
+      // failures still take this path.
       await this.sessions
         .destroySession(sessionKey)
         .catch((err) =>
@@ -2289,6 +2546,23 @@ export class CronScheduler {
             errorClass: stableCronErrorClass(err),
           }),
         )
+    }
+    if (submitError instanceof CronExecutionRejectedError) {
+      logger.warn(`job ${job.id} skipped submit`, {
+        jobId: job.id,
+        code: submitError.code,
+      })
+      return { kind: 'terminal_failure', code: submitError.code }
+    }
+    if (
+      typeof submitError === 'object' &&
+      submitError !== null &&
+      ((submitError as { code?: unknown }).code === 'SCHEDULER_STOPPED' ||
+        (submitError as { code?: unknown }).code === 'FENCE_REJECTED')
+    ) {
+      const code = (submitError as { code: 'SCHEDULER_STOPPED' | 'FENCE_REJECTED' }).code
+      logger.warn(`job ${job.id} skipped submit`, { jobId: job.id, code })
+      return { kind: 'terminal_failure', code }
     }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')

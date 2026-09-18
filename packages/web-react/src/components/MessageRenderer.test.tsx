@@ -1,12 +1,14 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { createSession, type ChatMessage } from "../lib/chat/model";
 import type { OutboundMessageWire } from "../lib/chat/frames";
 import { applyOutboundMessage } from "../lib/chat/reducer";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
-import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
+import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS, shouldShowScrollToBottom } from "./MessageRenderer";
+import { AgentGroupCard } from "./chat/AgentGroupCard";
+import * as AgentGroupMod from "./chat/AgentGroupCard";
 import * as MarkdownMod from "./Markdown";
 import { PAINT_MIN_ITEMS } from "../lib/chat/timelinePaint";
 import { createStickToBottomController } from "./chat/stickToBottom";
@@ -240,6 +242,66 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     renderMsg(mk("user", { text: "提问", status: "sent" }));
     expect(screen.getByText("提问")).toBeInTheDocument();
     expect(screen.getByText("已送达")).toBeInTheDocument();
+  });
+
+  // M-01:教程回放 / 后台会话查看器以 readOnly 挂载,此前每条用户消息仍出现可点的死「编辑」。
+  test("readOnly 列表:用户行不出「编辑」「引用」,助手行不出「引用」「重新生成」「反馈」", () => {
+    const cb: CardCallbacks = {
+      onEditResend: vi.fn(),
+      onQuote: vi.fn(),
+      onRegenerate: vi.fn(),
+      onFeedback: vi.fn(),
+    };
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "ro-u", text: "问题", status: "replied" }),
+          mk("assistant", { id: "ro-a", text: "回答" }),
+        ]}
+        sending={false}
+        cb={cb}
+        onRespondPermission={() => {}}
+        readOnly
+      />,
+    );
+    expect(screen.getByText("问题")).toBeInTheDocument();
+    for (const name of ["编辑", "引用", "重新生成", "反馈"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    // 复制仍可用(只读面不禁止留存内容)。
+    expect(screen.getAllByRole("button", { name: "复制" })).toHaveLength(2);
+  });
+
+  test("非只读列表:同一组回调下用户行有「编辑」、助手行有「重新生成」(对照)", () => {
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "rw-u", text: "问题", status: "replied" }),
+          mk("assistant", { id: "rw-a", text: "回答" }),
+        ]}
+        sending={false}
+        cb={{ onEditResend: vi.fn(), onRegenerate: vi.fn() }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "编辑" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
+  });
+
+  // M-05:footer(本轮活动指示 / 软提示 / 尾部骨架)嵌在 px-5 的列表根内又自带 px-5,比时间线多缩进 20px。
+  test("footer 与列表根共用一份内边距,不再双份 px-5", () => {
+    render(
+      <MessageList
+        messages={[mk("user", { id: "pad-u", text: "问题" })]}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const footer = screen.getByTestId("timeline-footer");
+    expect(footer).not.toHaveClass("px-5");
+    expect(footer.closest('[data-testid="timeline-short-list"]')).toHaveClass("px-5");
+    expect(screen.getByTestId("turn-activity-footer")).toBeInTheDocument();
   });
 
   test("thinking：流式态使用稳定的「思考过程」标题并展开", () => {
@@ -650,8 +712,8 @@ describe("permission 审批", () => {
       }),
       { onRespond, sending: true },
     );
-    // 自动弹出答题框（modal portal）。
-    expect(screen.getByText("选择颜色？")).toBeInTheDocument();
+    // 自动弹出答题框（modal portal）。题干同时出现在时间线卡的待决摘要里（PermissionCard PC-02），按对话框内断言。
+    expect(within(screen.getByRole("dialog", { name: "用户问答" })).getByText("选择颜色？")).toBeInTheDocument();
     fireEvent.click(screen.getByText("红"));
     fireEvent.click(screen.getByRole("button", { name: "提交" }));
     expect(onRespond).toHaveBeenCalledTimes(1);
@@ -779,6 +841,69 @@ describe("permission 审批", () => {
     );
     expect(screen.getByText("本轮已停止，提问已关闭")).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("同数组 live push 出现 dock；settle 后消失；dock 重开不发 permission_response", async () => {
+    const onRespond = vi.fn();
+    const messages: ChatMessage[] = [
+      mk("user", { id: "u-live", text: "问", ts: Date.now() }),
+    ];
+    const view = render(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    messages.push(
+      mk("permission", {
+        id: "p-live",
+        toolName: "Bash",
+        requestId: "req-live-arr",
+        _resolved: false,
+        inputPreview: "ls",
+        ts: Date.now(),
+      }),
+    );
+    view.rerender(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    messages[1]!._resolved = true;
+    messages[1]!._behavior = "allow";
+    view.rerender(
+      <MessageList messages={messages} sending cb={{}} onRespondPermission={onRespond} />,
+    );
+    expect(screen.queryByTestId("pending-permission-dock")).toBeNull();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  test("权限卡被虚拟化卸载时 dock 仍打开同一请求且不 decide", async () => {
+    const onRespond = vi.fn();
+    const filler = Array.from({ length: 120 }, (_, i) =>
+      mk("assistant", { id: `fill-${i}`, text: `正文 ${i}`, ts: Date.now() - 120_000 + i }),
+    );
+    const pending = mk("permission", {
+      id: "p-offscreen",
+      toolName: "Bash",
+      requestId: "req-offscreen",
+      _resolved: false,
+      inputPreview: "ls",
+      ts: Date.now(),
+    });
+    render(
+      <MessageList
+        messages={[pending, ...filler]}
+        sending
+        cb={{}}
+        onRespondPermission={onRespond}
+      />,
+    );
+    expect(screen.getByTestId("pending-permission-dock")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByTestId("pending-permission-dock").querySelector("button")!);
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
+    expect(onRespond).not.toHaveBeenCalled();
   });
 
   test("AskUserQuestion 已提交 → 展示问答摘要", () => {
@@ -1529,10 +1654,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
   });
 
   test("无归档时不造客户端 100 条总量上限", () => {
-    const { container } = renderList(users(130));
+    renderList(users(130));
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
-    expect(container.querySelector("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
   test("统一时间线保留最新思考、工具和回答，完成态思考默认折叠且可完整展开", () => {
@@ -1932,8 +2057,8 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
   });
 
   test("本地翻尽 + 无归档 → 无按钮", () => {
-    const { container } = renderList(users(3), { archivedCount: 0 });
-    expect(container.querySelector("button")).toBeNull();
+    renderList(users(3), { archivedCount: 0 });
+    expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
   test("云端加载中 → 原位禁用按钮并给出明确反馈", () => {
@@ -2848,6 +2973,51 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     vi.unstubAllGlobals();
     scroller.remove();
   });
+
+  test("deferred late-delegate card keeps owner after Range body expand", async () => {
+    const ownerTurn = "a".repeat(64);
+    const continuationTurn = "c".repeat(64);
+    const seen: ChatMessage[] = [];
+    const real = AgentGroupCard;
+    const spy = vi.spyOn(AgentGroupMod, "AgentGroupCard").mockImplementation((props) => {
+      seen.push(props.msg);
+      return real(props);
+    });
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
+      mk("agent-group", {
+        id: "srv-late-agentgroup-dlg-late-1",
+        text: "晚到子任务正文",
+      }),
+    ]);
+    render(
+      <MessageRenderer
+        message={mk("agent-group", {
+          id: "srv-late-agentgroup-dlg-late-1",
+          text: "",
+          _payloadDeferred: true,
+          _payloadBytes: 1_100_000,
+          _turnTapeId: "late-tape",
+          _recordOrdinal: 0,
+          _continuationOfTurnKey: ownerTurn,
+          _delegateRunId: "dlg-late-1",
+          _turnKey: continuationTurn,
+        })}
+        sig="late-deferred"
+        isLast={false}
+        sending={false}
+        inActiveTurn={false}
+        cb={{ onFetchTapeRecordPayload }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(await screen.findByText("晚到子任务正文")).toBeInTheDocument();
+    expect(onFetchTapeRecordPayload).toHaveBeenCalled();
+    const expanded = seen.at(-1);
+    expect(expanded?._continuationOfTurnKey).toBe(ownerTurn);
+    expect(expanded?._delegateRunId).toBe("dlg-late-1");
+    expect(expanded?._turnKey).toBe(continuationTurn);
+    spy.mockRestore();
+  });
 });
 
 describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {
@@ -3084,5 +3254,238 @@ describe("流式指针按 messageId 换行（A4）", () => {
     const asst = s.messages.filter((m) => m.role === "assistant");
     expect(asst).toHaveLength(1);
     expect(asst[0].text).toBe("Hello");
+  });
+});
+
+describe("主时间线回到底部 FAB", () => {
+  test("shouldShowScrollToBottom 仅在离底且有消息时为真", () => {
+    expect(shouldShowScrollToBottom(false, 2)).toBe(true);
+    expect(shouldShowScrollToBottom(true, 2)).toBe(false);
+    expect(shouldShowScrollToBottom(undefined, 2)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 0)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 2, 8)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 2, 0)).toBe(false);
+    expect(shouldShowScrollToBottom(false, 2, 81)).toBe(true);
+  });
+
+  test("离底时按钮可见，贴底时仍挂载但不可见不可点，点击调用显式 jumpToBottom", async () => {
+    const jumpToBottom = vi.fn(() => { followBottomRef.current = true; scroller.scrollTop = 500; });
+    const followBottomRef = {
+      current: false,
+      jumpToBottom,
+      scrollToBottom: vi.fn(),
+    };
+    const scroller = document.createElement("div");
+    Object.defineProperties(scroller, { scrollHeight: { value: 1000 }, clientHeight: { value: 500 } });
+    document.body.appendChild(scroller);
+    const rows = [
+      mk("user", { id: "fab-u1", text: "问题", status: "replied" }),
+      mk("assistant", { id: "fab-a1", text: "回答" }),
+    ];
+    const view = render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    const btn = screen.getByTestId("scroll-to-bottom");
+    expect(btn).toHaveAttribute("aria-label", "回到底部");
+    expect(btn).toHaveAttribute("tabindex", "0");
+    expect(btn.className).not.toContain("pointer-events-none");
+    expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "true");
+    jumpToBottom.mockClear();
+    fireEvent.click(btn);
+    expect(jumpToBottom).toHaveBeenCalledTimes(1);
+    expect(jumpToBottom).toHaveBeenCalledWith(scroller);
+    expect(followBottomRef.current).toBe(true);
+
+    followBottomRef.current = true;
+    view.rerender(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+    );
+    fireEvent.scroll(scroller);
+    // 贴底后按钮**仍在 DOM 里**:它是滚动内容(ResizeObserver root)的子节点,随
+    // following 挂载/卸载会改 scrollHeight → 浏览器 clamp → 被判成用户离底 → 再挂载,
+    // 几何自激(2026-09-07 回弹复现根因)。只允许切 opacity/pointer-events。
+    await waitFor(() => {
+      expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("data-visible", "false");
+    });
+    const hidden = screen.getByTestId("scroll-to-bottom");
+    expect(hidden.className).toContain("pointer-events-none");
+    expect(hidden.className).toContain("opacity-0");
+    expect(hidden).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("scroll-to-bottom-dock")).toHaveAttribute("aria-hidden", "true");
+    scroller.remove();
+  });
+
+  test("按钮容器零高度且抵消 space-y 间距：following 翻转不改变滚动内容几何", () => {
+    const followBottomRef = { current: false, jumpToBottom: vi.fn() };
+    const scroller = document.createElement("div");
+    Object.defineProperties(scroller, { scrollHeight: { value: 1000 }, clientHeight: { value: 500 } });
+    document.body.appendChild(scroller);
+    const rows = [
+      mk("user", { id: "fab-geo-u1", text: "问题", status: "replied" }),
+      mk("assistant", { id: "fab-geo-a1", text: "回答" }),
+    ];
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    const dock = screen.getByTestId("scroll-to-bottom-dock");
+    // 列表根是 space-y-4:任何新增的流内子节点都会给前一个兄弟加 16px 下边距。
+    // dock 自身 h-0 + -mt-4 把这 16px 抵消回去,总高与没有按钮时完全一致。
+    expect(dock.className).toContain("h-0");
+    expect(dock.className).toContain("-mt-4");
+    expect(dock.className).toContain("sticky");
+    const btn = screen.getByTestId("scroll-to-bottom");
+    // 按钮脱离文档流(absolute),不参与父级高度计算。
+    expect(btn.className).toContain("absolute");
+    expect(dock.parentElement).toBe(screen.getByTestId("timeline-short-list"));
+    scroller.remove();
+  });
+
+  test("无 controller（followBottomRef 缺省）时不渲染按钮容器", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[mk("assistant", { id: "fab-noctl-a1", text: "回答" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(screen.queryByTestId("scroll-to-bottom-dock")).toBeNull();
+    expect(screen.queryByTestId("scroll-to-bottom")).toBeNull();
+    scroller.remove();
+  });
+});
+
+describe("MessageList 会话内查找", () => {
+  test("输入 query 计数正确、命中行有 data-find-current；下一处走 correctTo 且不调用 scrollIntoView", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    const followBottomRef = {
+      current: true,
+      correctTo: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const rows = [
+      mk("user", { id: "find-u1", text: "苹果派", status: "sent" }),
+      mk("assistant", { id: "find-a1", text: "苹果很好吃" }),
+      mk("user", { id: "find-u2", text: "香蕉", status: "sent" }),
+      mk("tool", { id: "find-t1", text: "苹果工具", toolName: "Bash" }),
+    ];
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        find={{ onClose: vi.fn() }}
+      />,
+      { container: scroller },
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "在会话中查找" }), {
+      target: { value: "苹果" },
+    });
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    const current = scroller.querySelector("[data-find-current]");
+    expect(current).toHaveAttribute("data-chat-virtual-key", "find-u1");
+    fireEvent.click(screen.getByRole("button", { name: "下一处" }));
+    expect(followBottomRef.current).toBe(false);
+    expect(followBottomRef.correctTo).toHaveBeenCalled();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    scroller.remove();
+  });
+
+  test("关闭查找条后焦点归还到打开前的元素，而不是掉到 body（a11y-B messages#1）", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    // 模拟顶栏「会话内查找」入口：打开查找条前焦点停在它上面。
+    const opener = document.createElement("button");
+    opener.textContent = "会话内查找";
+    document.body.appendChild(opener);
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+    const followBottomRef = {
+      current: true,
+      correctTo: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const baseProps = {
+      messages: [mk("user", { id: "find-focus-u1", text: "苹果派", status: "sent" as const })],
+      sending: false,
+      cb: {},
+      onRespondPermission: () => {},
+      scrollParent: scroller,
+      followBottomRef,
+    };
+    const { rerender } = render(<MessageList {...baseProps} />, { container: scroller });
+    // 打开查找条：Input 的 autoFocus 在提交阶段抢走焦点。
+    rerender(<MessageList {...baseProps} find={{ onClose: vi.fn() }} />);
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "在会话中查找" }));
+    // Esc / 点关闭钮后 App 把 find 置空：Input 卸载，焦点应回到入口。
+    rerender(<MessageList {...baseProps} />);
+    expect(screen.queryByRole("textbox", { name: "在会话中查找" })).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+    scroller.remove();
+  });
+
+  test("关闭查找条时焦点已被别处接管则不抢回（a11y-B messages#1）", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    const elsewhere = document.createElement("button");
+    document.body.appendChild(elsewhere);
+    opener.focus();
+    const followBottomRef = {
+      current: true,
+      correctTo: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+    const baseProps = {
+      messages: [mk("user", { id: "find-focus-u2", text: "苹果派", status: "sent" as const })],
+      sending: false,
+      cb: {},
+      onRespondPermission: () => {},
+      scrollParent: scroller,
+      followBottomRef,
+    };
+    const { rerender } = render(<MessageList {...baseProps} />, { container: scroller });
+    rerender(<MessageList {...baseProps} find={{ onClose: vi.fn() }} />);
+    // 用户用鼠标点到了别的控件再关闭查找条：焦点合法地在别处，不应被拽回入口。
+    elsewhere.focus();
+    rerender(<MessageList {...baseProps} />);
+    expect(document.activeElement).toBe(elsewhere);
+    elsewhere.remove();
+    opener.remove();
+    scroller.remove();
   });
 });

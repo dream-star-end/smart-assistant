@@ -2,28 +2,32 @@ import { ExternalLink, KeyRound, RefreshCw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api, type ChatGptProxyAccess, type ChatGptProxyCredential } from "../lib/api";
 import type { AuthSession } from "../lib/types";
+import { shortTime } from "./settings/labels";
 import { Alert, Button, buttonVariants, CopyChip, Modal, Spinner, Tabs, useConfirm } from "./ui";
 
 type Enabled = Extract<ChatGptProxyAccess, { enabled: true }>;
 
 type GuideTab = "chrome" | "firefox" | "switchy";
 
+// 标签要能在 390px 的三列宫格里放下(审计 SET-08：「Chrome / Edge」「SwitchyOmega」曾被截成省略号);
+// 完整名称由各段引导正文第一句给出。
 const GUIDE_TABS: { value: GuideTab; label: string }[] = [
-  { value: "chrome", label: "Chrome / Edge" },
+  { value: "chrome", label: "Chrome" },
   { value: "firefox", label: "Firefox" },
-  { value: "switchy", label: "SwitchyOmega" },
+  { value: "switchy", label: "Switchy" },
 ];
 
+/** 与设置中心其它页同一时间格式「M月D日 HH:mm」(审计 SET-29：此前 toLocaleString 带秒且随浏览器语言变)。 */
 function formatTime(iso: string | null): string {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+  const s = shortTime(iso);
+  return s || "—";
 }
 
 /**
- * 「ChatGPT 直连」面板:展示平台下发的鉴权 HTTPS 代理 + PAC 地址,以及本账号的代理凭据。
+ * 「ChatGPT 直连」面板：展示平台下发的鉴权 HTTPS 代理 + PAC 地址，以及本账号的代理凭据。
  *
- * 密码明文只在生成 / 轮换的那一次响应里出现,面板关闭即丢;忘了就重新生成。
+ * 密码明文只在生成 / 轮换的那一次响应里出现，面板关闭即丢；忘了就重新生成。
  * 未授权账号不会拿到 enabled:true —— 调用方(App)只在 enabled 时挂载本组件与菜单入口。
  */
 export function ChatGptProxyDialog({
@@ -78,8 +82,8 @@ export function ChatGptProxyDialog({
   const issue = async () => {
     if (access?.hasCredential) {
       const ok = await confirm({
-        title: "重新生成凭据?",
-        body: "旧密码立即失效,所有已配置该密码的浏览器需要重新填写。",
+        title: "重新生成凭据？",
+        body: "旧密码立即失效，所有已配置该密码的浏览器需要重新填写。",
         confirmText: "重新生成",
       });
       if (ok !== true) return;
@@ -102,8 +106,8 @@ export function ChatGptProxyDialog({
 
   const revoke = async () => {
     const ok = await confirm({
-      title: "吊销凭据?",
-      body: "吊销后当前密码立即失效,ChatGPT 直连将无法使用,直到重新生成。",
+      title: "吊销凭据？",
+      body: "吊销后当前密码立即失效，ChatGPT 直连将无法使用，直到重新生成。",
       confirmText: "吊销",
       danger: true,
     });
@@ -123,11 +127,11 @@ export function ChatGptProxyDialog({
       onOpenChange={onOpenChange}
       className="max-w-lg"
       title="ChatGPT 直连"
-      description="用你自己的浏览器,经平台代理访问 chatgpt.com。仅 ChatGPT 相关域名走代理,其余网站不受影响。"
+      description="用你自己的浏览器，经平台代理访问 chatgpt.com。仅 ChatGPT 相关域名走代理，其余网站不受影响。"
       footer={
         access ? (
           <div className="flex w-full items-center justify-between gap-2">
-            <span className="text-caption text-muted">配置完成后打开:</span>
+            <span className="text-caption text-muted">配置完成后打开：</span>
             <a
               href={access.homeUrl}
               target="_blank"
@@ -174,7 +178,7 @@ export function ChatGptProxyDialog({
                 {issued ? (
                   <div className="space-y-1">
                     <CopyChip value={issued.password} />
-                    <p className="text-caption text-warning">密码只显示这一次,请立即复制保存。</p>
+                    <p className="text-caption text-warning">密码只显示这一次，请立即复制保存。</p>
                   </div>
                 ) : access.hasCredential ? (
                   <span className="text-caption text-muted">
@@ -217,56 +221,55 @@ export function ChatGptProxyDialog({
               {guide === "chrome" && (
                 <>
                   <li>
-                    打开系统代理设置(Chrome / Edge 使用系统代理):Windows「设置 → 网络和 Internet →
-                    代理 → 使用设置脚本」;macOS「系统设置 → 网络 → 详细信息 → 代理 →
-                    自动代理配置」。
+                    Chrome / Edge 使用系统代理：Windows「设置 → 网络和 Internet → 代理 →
+                    使用设置脚本」；macOS「系统设置 → 网络 → 详细信息 → 代理 → 自动代理配置」。
                   </li>
                   <li>
-                    脚本地址填上面的 <span className="font-mono">PAC 地址</span>,保存。
+                    脚本地址填上面的 <span className="font-mono">PAC 地址</span>，保存。
                   </li>
                   <li>
-                    访问 chatgpt.com 时浏览器会弹出代理登录框,填写上面的<strong>用户名</strong>与
+                    访问 chatgpt.com 时浏览器会弹出代理登录框，填写上面的<strong>用户名</strong>与
                     <strong>密码</strong>并勾选记住。
                   </li>
-                  <li>之后只有 ChatGPT 相关域名经代理转发,其余网站直连。</li>
+                  <li>之后只有 ChatGPT 相关域名经代理转发，其余网站直连。</li>
                 </>
               )}
               {guide === "firefox" && (
                 <>
                   <li>Firefox「设置 → 常规 → 网络设置 → 设置…」。</li>
                   <li>
-                    选「自动代理配置的 URL(PAC)」,填上面的{" "}
-                    <span className="font-mono">PAC 地址</span>,确定。
+                    选「自动代理配置的 URL（PAC）」，填上面的{" "}
+                    <span className="font-mono">PAC 地址</span>，确定。
                   </li>
                   <li>
                     访问 chatgpt.com 时按提示输入<strong>用户名</strong>与<strong>密码</strong>
-                    ,可勾选「使用密码管理器记住」。
+                    ，可勾选「使用密码管理器记住」。
                   </li>
                 </>
               )}
               {guide === "switchy" && (
                 <>
-                  <li>安装 Proxy SwitchyOmega 扩展,新建「代理服务器」情景模式。</li>
+                  <li>安装 Proxy SwitchyOmega 扩展，新建「代理服务器」情景模式。</li>
                   <li>
-                    协议选 <strong>HTTPS</strong>,服务器 / 端口填上面的<strong>代理服务器</strong>
-                    ;点击右侧锁图标填写<strong>用户名</strong>与<strong>密码</strong>。
+                    协议选 <strong>HTTPS</strong>，服务器 / 端口填上面的<strong>代理服务器</strong>
+                    ；点击右侧锁图标填写<strong>用户名</strong>与<strong>密码</strong>。
                   </li>
                   <li>
-                    在「自动切换」里添加规则:<span className="font-mono">*.chatgpt.com</span>、
+                    在「自动切换」里添加规则：<span className="font-mono">*.chatgpt.com</span>、
                     <span className="font-mono">*.openai.com</span>、
                     <span className="font-mono">*.oaistatic.com</span>、
                     <span className="font-mono">*.oaiusercontent.com</span> →
-                    该情景;默认情景保持「直接连接」。
+                    该情景；默认情景保持「直接连接」。
                   </li>
                   <li>
-                    或者更省事:新建「PAC 情景模式」,PAC 网址填上面的{" "}
-                    <span className="font-mono">PAC 地址</span>,再在 PAC 情景里设置凭据。
+                    或者更省事：新建「PAC 情景模式」，PAC 网址填上面的{" "}
+                    <span className="font-mono">PAC 地址</span>，再在 PAC 情景里设置凭据。
                   </li>
                 </>
               )}
             </ol>
             <p className="mt-3 text-caption text-muted">
-              代理只放行 ChatGPT 及其登录依赖域名的 443 端口,不能作为通用代理使用。
+              代理只放行 ChatGPT 及其登录依赖域名的 443 端口，不能作为通用代理使用。
             </p>
           </section>
         </div>

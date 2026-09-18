@@ -39,6 +39,13 @@ import {
   ImageEditActionsContext,
   type ImageEditSubmit,
 } from './chat/imageEditActions'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui'
+
+/**
+ * 分享 / 复制拿到的是短时效签名 URL(仓内铁律:签名 URL 禁当持久引用),产品目前没有可分享的
+ * 持久地址(需后端出分享令牌,审计 M-25)。前端能做的只有把话说清:它是临时链接、会过期。
+ */
+const TEMP_LINK_COPIED_NOTICE = '已复制临时链接，链接稍后会失效'
 
 // ImageEditSubmit 单一权威在 chat/imageEditActions.tsx(P/V 共用);此处再导出给 comment/resize 复用。
 export type { ImageEditSubmit } from './chat/imageEditActions'
@@ -134,13 +141,19 @@ function deriveDownloadName(alt: string, signPath?: string | null): string {
 
 type ViewerMode = 'view' | 'edit' | 'comment' | 'resize'
 
-/** 底部动作条单项:圆钮 + 中文标签(黑底毛玻璃)。 */
+/**
+ * 底部动作条单项:圆钮 + 中文标签(黑底毛玻璃)。
+ * 不可用时走 aria-disabled 而非原生 disabled(审计 M-13):原生 disabled 会吞掉点击,`title`
+ * 在触屏又不显示 → 用户点「编辑」毫无反馈。现在点下去由 onDisabledClick 给一句原因(轻提示),
+ * 与圈选编辑器「发送」钮的做法一致(ImageAnnotationEditor.tsx aria-disabled + 引导提示)。
+ */
 function ActionButton({
   label,
   icon,
   onClick,
   disabled,
   reason,
+  onDisabledClick,
   featureId,
 }: {
   label: string
@@ -148,19 +161,34 @@ function ActionButton({
   onClick: () => void
   disabled?: boolean
   reason?: string
+  onDisabledClick?: (reason: string) => void
   featureId?: ProductFeatureId
 }) {
   return (
     <button
       type="button"
       data-product-feature={featureId}
-      onClick={onClick}
-      disabled={disabled}
+      onClick={() => {
+        if (disabled) {
+          if (reason) onDisabledClick?.(reason)
+          return
+        }
+        onClick()
+      }}
+      aria-disabled={disabled || undefined}
       title={disabled ? reason : label}
       aria-label={label}
-      className="group/action flex min-w-16 flex-col items-center gap-1.5 outline-none disabled:cursor-not-allowed disabled:opacity-40"
+      className={cn(
+        'group/action flex min-w-16 flex-col items-center gap-1.5 outline-none',
+        disabled && 'cursor-not-allowed opacity-40',
+      )}
     >
-      <span className="flex size-12 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors group-hover/action:bg-white/20">
+      <span
+        className={cn(
+          'flex size-12 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors',
+          !disabled && 'group-hover/action:bg-white/20',
+        )}
+      >
         {icon}
       </span>
       <span className="text-xs font-medium text-white/90">{label}</span>
@@ -242,6 +270,11 @@ export function ImageViewer({
   modeRef.current = mode
   const moreOpenRef = useRef(moreOpen)
   moreOpenRef.current = moreOpen
+  // 子模式(评论 / 调整大小)的 Esc 委托口:Radix 在 document 捕获阶段派发 Esc,永远先于子模式
+  // 输入框自己的 onKeyDown。查看器先问子模式「这次 Esc 你要不要」(取消草稿 / 弹确认 / 提交中吞掉),
+  // 子模式返回 false 才退回浏览态 —— 否则用户想取消一条草稿,整个评论模式连同全部锚点被掐掉
+  // (审计 M-02)。同一时刻只挂一个子模式,共用一个 ref。
+  const subModeEscapeRef = useRef<(() => boolean) | null>(null)
   // initialMode='edit' 时开图直达编辑:每次开图只触发一次(ref 守卫),避免编辑器关闭回
   // view 后又被重新拉回 edit。
   const autoEditRef = useRef(false)
@@ -394,7 +427,7 @@ export function ImageViewer({
     if (nav?.clipboard?.writeText) {
       try {
         await nav.clipboard.writeText(link)
-        flash('已复制链接')
+        flash(TEMP_LINK_COPIED_NOTICE)
         return
       } catch {
         /* fall through */
@@ -421,7 +454,7 @@ export function ImageViewer({
     if (navigator?.clipboard?.writeText) {
       try {
         await navigator.clipboard.writeText(absolute(url))
-        flash('已复制链接')
+        flash(TEMP_LINK_COPIED_NOTICE)
         return
       } catch {
         /* fall through */
@@ -431,6 +464,8 @@ export function ImageViewer({
   }
 
   const editDisabledReason = submitImageEdit ? undefined : '当前模型不支持图片编辑'
+  const commentDisabledReason = submitImageComment ? undefined : '当前模型不支持图片评论'
+  const resizeDisabledReason = submitImageEdit ? undefined : '当前模型不支持调整大小'
 
   return (
     <>
@@ -451,11 +486,15 @@ export function ImageViewer({
             // 上层编辑器 Dialog 自己捕获 ESC(topmost layer),这里不会触发。
             onEscapeKeyDown={(e) => {
               // 读 ref(非闭包 state):Radix 绑定的是挂载时闭包,state 会陈旧。
+              // 「更多」已是 Radix 菜单(M-14),开着时它自己是最高层、Esc 到不了这里;这条守卫只兜
+              // 「两份 DismissableLayer 上下文并存」的极端情况,防止 Esc 把菜单和查看器一起关掉。
               if (moreOpenRef.current) {
                 e.preventDefault()
                 setMoreOpen(false)
               } else if (modeRef.current === 'comment' || modeRef.current === 'resize') {
                 e.preventDefault()
+                // 先委托子模式(取消草稿 / 弹「放弃评论」确认 / 提交中吞掉);子模式没接才退回浏览态。
+                if (subModeEscapeRef.current?.()) return
                 setMode('view')
               }
               // view 模式:放行 Radix 关闭整个查看器。
@@ -472,6 +511,7 @@ export function ImageViewer({
                 canSubmit={!!submitImageComment}
                 onBack={() => setMode('view')}
                 onSubmit={handleCommentSubmit}
+                escapeHandlerRef={subModeEscapeRef}
               />
             ) : mode === 'resize' ? (
               <ImageResizeMode
@@ -482,6 +522,7 @@ export function ImageViewer({
                 canSubmit={!!submitImageEdit}
                 onBack={() => setMode('view')}
                 onSubmit={handleSubmit}
+                escapeHandlerRef={subModeEscapeRef}
               />
             ) : (
               <>
@@ -519,45 +560,41 @@ export function ImageViewer({
                         <Share2 size={18} />
                       </button>
                     )}
-                    {!readOnly && <div className="relative">
-                      <button
-                        type="button"
-                        aria-label="更多"
-                        title="更多"
-                        aria-expanded={moreOpen}
-                        onClick={() => setMoreOpen((v) => !v)}
-                        className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
-                      >
-                        <MoreHorizontal size={18} />
-                      </button>
-                      {moreOpen && (
-                        <>
+                    {/* 「更多」走 DropdownMenu 原语(审计 M-14):拿到 menu/menuitem 语义、方向键、
+                        打开即聚焦首项、关闭焦点回触发钮;黑底样式用 className 盖掉原语默认色。
+                        z-[62] 压过查看器自身的 z-[61],否则 Portal 出去的菜单会被查看器盖住。 */}
+                    {!readOnly && (
+                      <DropdownMenu open={moreOpen} onOpenChange={setMoreOpen}>
+                        <DropdownMenuTrigger asChild>
                           <button
                             type="button"
-                            aria-hidden
-                            tabIndex={-1}
-                            className="fixed inset-0 z-10 cursor-default"
-                            onClick={() => setMoreOpen(false)}
-                          />
-                          <div className="absolute right-0 top-12 z-20 flex w-44 flex-col rounded-2xl bg-neutral-900/95 p-1.5 text-sm shadow-float backdrop-blur">
-                            <button
-                              type="button"
-                              onClick={() => void openInTab()}
-                              className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-white hover:bg-white/10"
-                            >
-                              <ArrowUpRight size={16} /> 新标签打开原图
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => void copyLink()}
-                              className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-white hover:bg-white/10"
-                            >
-                              <Link2 size={16} /> 复制链接
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>}
+                            aria-label="更多"
+                            title="更多"
+                            className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
+                          >
+                            <MoreHorizontal size={18} />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="end"
+                          sideOffset={8}
+                          className="z-[62] w-44 min-w-0 rounded-2xl border-white/10 bg-neutral-900/95 p-1.5 text-white shadow-float backdrop-blur"
+                        >
+                          <DropdownMenuItem
+                            onSelect={() => void openInTab()}
+                            className="gap-2 rounded-xl px-3 py-2 text-white data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
+                          >
+                            <ArrowUpRight size={16} /> 新标签打开原图
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onSelect={() => void copyLink()}
+                            className="gap-2 rounded-xl px-3 py-2 text-white data-[highlighted]:bg-white/10 [@media(hover:none)]:min-h-11"
+                          >
+                            <Link2 size={16} /> 复制临时链接
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
                   </div>
                 </header>
 
@@ -595,20 +632,23 @@ export function ImageViewer({
                     icon={<Pencil size={20} />}
                     disabled={!submitImageEdit}
                     reason={editDisabledReason}
+                    onDisabledClick={flash}
                     onClick={() => void enterEdit()}
                   />
                   <ActionButton
                     label="评论"
                     icon={<MessageCircle size={20} />}
                     disabled={!submitImageComment}
-                    reason={editDisabledReason}
+                    reason={commentDisabledReason}
+                    onDisabledClick={flash}
                     onClick={() => setMode('comment')}
                   />
                   <ActionButton
                     label="调整大小"
                     icon={<Scaling size={20} />}
                     disabled={!submitImageEdit}
-                    reason={editDisabledReason}
+                    reason={resizeDisabledReason}
+                    onDisabledClick={flash}
                     onClick={() => setMode('resize')}
                   />
                 </div>}

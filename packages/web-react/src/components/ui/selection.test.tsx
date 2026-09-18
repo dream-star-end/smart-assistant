@@ -40,6 +40,13 @@ describe("Chip", () => {
     fireEvent.click(screen.getByRole("button", { name: "禁" }));
     expect(onClick).not.toHaveBeenCalled();
   });
+
+  it("触屏触控靶与 Button / IconButton 同一标准:44px(shell 审计 S-14)", () => {
+    render(<Chip>筛</Chip>);
+    const cls = screen.getByRole("button", { name: "筛" }).className;
+    expect(cls).toContain("[@media(hover:none)]:min-h-11");
+    expect(cls).not.toContain("min-h-9");
+  });
 });
 
 const OPTS = [

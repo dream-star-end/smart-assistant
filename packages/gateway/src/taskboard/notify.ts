@@ -1,3 +1,5 @@
+import { formatRecordedCostTotal } from '@openclaude/protocol'
+import { queryCostStats, type CostTotals } from './db/costStats.js'
 // Taskboard 通知打通 —— 复用 cron onDeliver 瀑布,不做微信+站内信双发。
 //
 // 铁律(CORRECTIONS §1.5 / v3InboxPost.ts:10-11):成功通道不再推站内信。
@@ -122,6 +124,7 @@ export interface DigestStats {
   runs: number
   /** null = 当日 run 全部没有成本字段,文案降级为「成本未统计」。 */
   costUsd: number | null
+  cost?: CostTotals
 }
 
 interface DeferredAwait {
@@ -407,7 +410,13 @@ export function formatDigestMessage(stats: DigestStats): { title: string; bodyMd
       : stats.blocked.map((t) => t.identifier).join('、') + (stats.blocked.length >= 8 ? ' 等' : '')
   const fused =
     stats.fusedStages.length === 0 ? '无' : stats.fusedStages.map((s) => s.name).join('、')
-  const cost = stats.costUsd == null ? '成本未统计' : `成本 $${stats.costUsd.toFixed(4)}`
+  const cost = stats.cost
+    ? stats.cost.priced.runCount > 0
+      ? `${formatRecordedCostTotal(stats.cost.costUsd, stats.cost.amounts)}${stats.cost.unpriced.runCount > 0 ? `；另有 ${stats.cost.unpriced.runCount} 次有用量但无金额` : ''}${stats.cost.unknownRunCount > 0 ? `；${stats.cost.unknownRunCount} 次费用未记录` : ''}`
+      : stats.cost.unpriced.runCount > 0
+        ? `参考费用未计价：${stats.cost.unpriced.runCount} 次有用量但无金额${stats.cost.unknownRunCount > 0 ? `；${stats.cost.unknownRunCount} 次费用未记录` : ''}`
+        : '参考费用未记录（不代表免费）'
+    : stats.costUsd == null ? '参考费用未记录' : formatRecordedCostTotal(stats.costUsd)
   const trouble = stats.blocked.length > 0 || stats.fusedStages.length > 0
   const closing = trouble ? '有站点出事，请打开任务面板处理。' : '没有受阻或熔断，自动化运转正常。'
   const bodyMd = [
@@ -469,16 +478,7 @@ export function collectDigestStats(
         LIMIT 12`,
     )
     .all() as { id: string; name: string }[]
-  const usage = db
-    .prepare(
-      `SELECT COUNT(*) AS runs,
-              COUNT(cost_usd) AS cost_n,
-              COALESCE(SUM(cost_usd), 0) AS cost_sum
-         FROM tb_ticket_run
-        WHERE created_at >= ? AND created_at < ?
-          AND status != 'skipped'`,
-    )
-    .get(start, end) as { runs: number; cost_n: number; cost_sum: number }
+  const cost = queryCostStats(db, { fromMs: start, toMs: end, timeZone }).totals
   return {
     date,
     completed,
@@ -486,8 +486,9 @@ export function collectDigestStats(
     waitingHuman,
     blocked,
     fusedStages,
-    runs: usage.runs,
-    costUsd: usage.cost_n > 0 ? usage.cost_sum : null,
+    runs: cost.runCount,
+    costUsd: cost.priced.runCount > 0 ? cost.costUsd : null,
+    cost,
   }
 }
 

@@ -4003,6 +4003,11 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && node scripts/check-v5-callback-payload-hash.mjs"; then
+    echo "✗ pinned callback payload hash WS proof failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts"; then
     echo "✗ pinned cron submit durability boundary gate failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null

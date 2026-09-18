@@ -40,6 +40,7 @@ export const DELEGATE_FAILURE_CLASSES = [
   'capacity_timeout',
   'capacity_queue_full',
   'idle_timeout',
+  'heartbeat_timeout',
   'grok_route_denied',
   'grok_relay_path',
   'grok_route_expired',
@@ -63,6 +64,7 @@ export const DELEGATE_JOB_KINDS = [
   'cron',
   'taskboard',
   'ccb_local',
+  'advisor',
 ] as const
 
 export type DelegateJobKind = (typeof DELEGATE_JOB_KINDS)[number]

@@ -1315,7 +1315,18 @@ test('OCV5-121 delayed original submit silently drains after exact cancellation'
   const { SessionManager } = await import('../sessionManager.js')
   const { CcbAdapter } = await import('../engine/ccbAdapter.js')
   const { EventEmitter } = await import('node:events')
-  const rawRunner = Object.assign(new EventEmitter(), { isRunning: true, lastActivityAt: Date.now() })
+  const rawRunner = Object.assign(new EventEmitter(), {
+    isRunning: true,
+    lastActivityAt: Date.now(),
+    consultTurnBinding: undefined as
+      | { turnKey: string; turnIndex: number; configVersion: string }
+      | undefined,
+    setConsultTurn(
+      binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+    ) {
+      this.consultTurnBinding = binding
+    },
+  })
   const adapter = new CcbAdapter({} as never, rawRunner as never)
   const { cancelQueuedTurnDispatchExact } = await import('@openclaude/storage')
   const { setV3MasterSinkSingleton } = await import('../v3MasterSink.js')

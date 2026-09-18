@@ -23,6 +23,7 @@ import { api, apiErrorMessage } from "../../lib/api";
 import {
   buildSchedule,
   cronHuman,
+  describeNextRun,
   SCHEDULE_MODE_LABELS,
   type ScheduleMode,
   scheduleToPreset,
@@ -52,24 +53,37 @@ import {
   useToast,
 } from "../ui";
 
-/** 送达方式。hint 常驻在表单里 —— 「仅记录」这个词用户无从判断结果去了哪里。 */
+/**
+ * 送达方式。hint 常驻在表单里 —— 「仅记录」这个词用户无从判断结果去了哪里。
+ * `fallback`：拉不到 /api/cron/channels 时是否进兜底列表。Telegram 不进 —— 个人版用户侧没有
+ * Telegram 绑定入口，偏好页的「Telegram 通知」开关也已随 settings 审计 SET-05 一并移除，把它写死
+ * 摆出来等于承诺一件做不到的事；只有后端明确下发 available 才展示，hint 也不再引导去一个不存在的开关。
+ * 存量 deliver=telegram 的任务仍按这里的 label 回显、编辑时仍可保留原值（见 deliverOptions 补项）。
+ */
 const DELIVER_OPTIONS = [
   {
     value: "webchat",
     label: "网页对话",
     hint: "结果会作为一条新消息出现在网页对话里。",
+    fallback: true,
   },
   {
     value: "telegram",
     label: "Telegram",
-    hint: "结果推送到你绑定的 Telegram —— 需先在「设置 → 偏好」里打开 Telegram 通知。",
+    hint: "结果推送到 Telegram。",
+    fallback: false,
   },
-  { value: "local", label: "仅记录", hint: "只写进智能体的记录，不会主动通知你。" },
+  {
+    value: "local",
+    label: "仅记录",
+    hint: "只写进智能体的记录，不会主动通知你。",
+    fallback: true,
+  },
 ] as const;
 
-const FALLBACK_DELIVER_SELECT: Array<{ value: string; label: string }> = DELIVER_OPTIONS.map(
-  (o) => ({ value: o.value, label: o.label }),
-);
+const FALLBACK_DELIVER_SELECT: Array<{ value: string; label: string }> = DELIVER_OPTIONS.filter(
+  (o) => o.fallback,
+).map((o) => ({ value: o.value, label: o.label }));
 
 function deliverCopy(value: string): { label: string; hint?: string } {
   return DELIVER_OPTIONS.find((o) => o.value === value) ?? { label: value };
@@ -168,6 +182,39 @@ function deliverLabel(v: string): string {
   return deliverCopy(v).label;
 }
 
+/** `datetime-local` 的 `min`：设备本地此刻，`YYYY-MM-DDTHH:mm`（该控件不认时区与秒）。 */
+function localDateTimeMin(now = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}T${p(now.getHours())}:${p(now.getMinutes())}`;
+}
+
+/**
+ * 下次执行：相对时间 + 精确时刻**都直接可见**。改造前精确时刻只塞在 `title` 里 ——
+ * 触屏永远看不到、键盘聚焦不到、读屏基本不读，等于只给鼠标用户。
+ */
+function NextRunMeta({ nextRunAt }: { nextRunAt: string | number | null | undefined }) {
+  const desc = describeNextRun(nextRunAt, Date.now());
+  const exact = desc.title ? <span className="text-faint">（{desc.title.slice(5)}）</span> : null;
+  if (desc.kind === "future") {
+    return (
+      <span className="text-muted">
+        {desc.label} <TimeAgo value={nextRunAt} tooltip={false} /> {exact}
+      </span>
+    );
+  }
+  if (desc.kind === "overdue") {
+    return <span className="text-warning">{desc.label}</span>;
+  }
+  if (desc.kind === "soon") {
+    return (
+      <span className="text-muted">
+        {desc.label} {exact}
+      </span>
+    );
+  }
+  return <span className="text-faint">{desc.label}</span>;
+}
+
 /** 表单预填种子：空态预设 chip 与「再跑一次」共用。 */
 type FormSeed = {
   mode?: ScheduleMode;
@@ -194,11 +241,13 @@ type FormSeed = {
  * 写成功后 `reconcile()` 在后台静默重拉（不动 loading）只为回填后端算的 nextRunAt。
  */
 export function CronPanel({ auth }: { auth: AuthSession }) {
-  const { scope } = useProjectScope();
-  const cronBlocked =
-    scope.kind === "chat" && !scope.workProject
-      ? "当前是未绑定的聊天项目，定时任务不能按该 facade 过滤。"
-      : null;
+  const { scope, setToken } = useProjectScope();
+  /**
+   * 未绑定看板的聊天项目（「会话组」）：定时任务按工作项目归属，这个作用域下**没有可查的表**。
+   * 改造前这条判定算出来只用来跳过请求，主体区照常落进「还没有定时任务 / 创建第一个」空态 ——
+   * 用户的任务表被渲染成"不存在"，还被邀请重建（P1）。现在它是第一优先的渲染分支。
+   */
+  const cronBlocked = scope.kind === "chat" && !scope.workProject;
   const boardProjectId =
     scope.kind === "ungrouped" ? "none" : scope.workProject?.id;
   const [jobs, setJobs] = useState<CronJob[] | null>(null);
@@ -217,7 +266,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [showRest, setShowRest] = useState(false);
-  /** 拉取失败保持写死三项;成功后只展示 available 通道。 */
+  /** 拉取失败只保留兜底两项（网页对话 / 仅记录）;成功后只展示 available 通道。 */
   const [deliverSelect, setDeliverSelect] = useState(FALLBACK_DELIVER_SELECT);
   const [confirmDialog, confirmDialogEl] = useConfirm();
   const toast = useToast();
@@ -259,9 +308,9 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     setLoading(true);
     setErr(null);
     if (cronBlocked) {
-      setLoading(false)
-      commitJobs([])
-      return
+      setLoading(false);
+      commitJobs(null);
+      return;
     }
     api
       .listCron(auth, boardProjectId ? { boardProjectId } : undefined)
@@ -478,31 +527,34 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-meta text-fg">
                 {human &&
                   (translated ? (
+                    // 触发器必须可聚焦、原始表达式必须进可访问名：Tooltip 只对鼠标悬停开口，
+                    // 键盘用户靠焦点触发，读屏用户直接从 aria-label 里听到 cron 原串。
                     <Tooltip content={`Cron：${job.schedule}`}>
-                      <span className="cursor-default">{human}</span>
+                      <span
+                        // role=note:可聚焦却无角色的 span 读屏只念一段文字、不知道这是什么
+                        //(t-762 manage#3);note 表明它是附注而非可操作控件。触屏补 44px 命中高。
+                        role="note"
+                        // biome-ignore lint/a11y/noNoninteractiveTabindex: Tooltip 触发器需可聚焦（WCAG 1.4.13）
+                        tabIndex={0}
+                        aria-label={`${human}，Cron 表达式 ${job.schedule}`}
+                        className="inline-flex cursor-default items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+                      >
+                        {human}
+                      </span>
                     </Tooltip>
                   ) : (
                     <code className="font-mono">{human}</code>
                   ))}
-                {status === "active" && job.nextRunAt ? (
-                  <span className="text-muted">
-                    {/* nextRunAt 是未来时刻,但它会过期:调度器落后、容器没起、任务卡住时,
-                        后端回填的这个值可能已经落在过去。此时若照常渲染相对时间,用户会看到
-                        「下次 2 小时前」这种自相矛盾的话。过期一律说「即将执行」——
-                        它既诚实(确实该跑了还没跑)又不制造困惑。 */}
-                    {new Date(job.nextRunAt).getTime() <= Date.now() ? (
-                      "即将执行"
-                    ) : (
-                      <>
-                        下次 <TimeAgo value={job.nextRunAt} />
-                      </>
-                    )}
-                  </span>
-                ) : null}
+                {status === "active" ? <NextRunMeta nextRunAt={job.nextRunAt} /> : null}
               </div>
               {/* 三级：属性与历史。 */}
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-faint">
                 {job.oneshot && status !== "done" && <Badge size="sm">一次性</Badge>}
+                {job.heartbeat && (
+                  <Badge size="sm" tone="neutral">
+                    心跳探针
+                  </Badge>
+                )}
                 {job.resume === "origin-session" && (
                   <Badge size="sm" tone="accent">
                     续跑本对话
@@ -592,18 +644,33 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         title="定时任务"
         hint="让智能体到点主动干活，并把结果按你选的方式推送。"
         action={
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => (creating ? setCreating(false) : startCreate())}
-          >
-            {creating ? <X size={14} /> : <Plus size={14} />}
-            {creating ? "取消" : "新建"}
-          </Button>
+          cronBlocked ? undefined : (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => (creating ? setCreating(false) : startCreate())}
+            >
+              {creating ? <X size={14} /> : <Plus size={14} />}
+              {creating ? "取消" : "新建"}
+            </Button>
+          )
         }
       />
 
-      {creating && (
+      {cronBlocked && (
+        <EmptyState
+          icon={Clock}
+          title="这个会话组没有绑定工作项目"
+          hint="定时任务按工作项目归属。切到「全部项目」或某个工作项目，就能查看和创建定时任务。"
+          action={
+            <Button variant="secondary" size="sm" onClick={() => setToken("all")}>
+              查看全部项目的定时任务
+            </Button>
+          }
+        />
+      )}
+
+      {!cronBlocked && creating && (
         <div className="px-4 pb-3">
           <Card tone="sunken">
             <CronForm
@@ -634,7 +701,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         </div>
       )}
 
-      {loading && jobs === null ? (
+      {cronBlocked ? null : loading && jobs === null ? (
         <div className="px-4 pb-4">
           <ListSkeleton rows={3} />
         </div>
@@ -909,6 +976,8 @@ function CronForm({
                 type="datetime-local"
                 inputSize="sm"
                 value={at}
+                // 原生选择器直接把过去的时刻灰掉，而不是选完再被「该时间已过去」打回。
+                min={localDateTimeMin()}
                 onChange={(e) => setAt(e.target.value)}
               />
             </Field>
@@ -1008,8 +1077,8 @@ function CronForm({
           label="项目"
           hint={
             projectMode === "fixed"
-              ? "创建时固定到当前工作项目；目标缺失或归档则失败并写审计，不会静默退到全局。"
-              : "随会话移动：触发时按来源会话当时归属解析。"
+              ? "固定到当前工作项目；项目被归档或删除后，任务会失败并记录原因，不会悄悄改到别的项目上。"
+              : "随会话移动：由触发它的那个会话当时所属的项目决定。"
           }
         >
           <Select

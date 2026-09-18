@@ -92,6 +92,7 @@ describe('createDelegateEngineBillingClient', () => {
       parentTurnKey: 'c'.repeat(64),
     })
     assert.equal(admission.requestId, 'a'.repeat(32))
+    assert.equal('route' in admission, false)
     assert.deepEqual(JSON.parse(posted), {
       model: 'grok-build',
       engine: 'grok',
@@ -101,6 +102,26 @@ describe('createDelegateEngineBillingClient', () => {
       parentSessionId: 'web-parent',
       parentTurnKey: 'c'.repeat(64),
     })
+  })
+
+  it('forwards advisor route metadata from admit without requiring it', async () => {
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      fetcher: (async () =>
+        response(200, {
+          requestId: 'a'.repeat(32),
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+          route: { kind: 'official_oauth', groupId: '9' },
+        })) as any,
+    })
+    const admission = await client.admit({
+      model: 'gpt-6-astra',
+      engine: 'codex',
+      agentId: 'advisor',
+      delegateAgentId: 'advisor',
+      sessionKey: 'advisor:' + 'a'.repeat(64) + ':advc-test',
+    })
+    assert.deepEqual(admission.route, { kind: 'official_oauth', groupId: '9' })
   })
 
   it('rejects a non-hex admission requestId', async () => {
@@ -149,13 +170,47 @@ describe('createDelegateEngineBillingClient', () => {
     assert.equal(calls[1]?.body.requestId, requestId)
   })
 
+  it('ordinary delegate 2xx does not accumulate consult receipts', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-dlg-bill-w4-'))
+    const queuePath = join(dir, 'queue.json')
+    const client = createDelegateEngineBillingClient({
+      env: ENV,
+      queuePath,
+      startupRecovery: false,
+      fetcher: (async () => response(200, { ok: true })) as never,
+    })
+    await client.settle({
+      requestId: 'd'.repeat(32),
+      engineSessionId: `oceng-${'e'.repeat(48)}`,
+      status: 'success',
+      durationMs: 9,
+      delegateAgentId: 'auditor',
+    })
+    let receipts: unknown[] = []
+    try {
+      const queue = JSON.parse(await readFile(queuePath, 'utf8')) as {
+        pending: unknown[]
+        settledReceipts?: unknown[]
+      }
+      assert.equal(queue.pending.length, 0)
+      receipts = queue.settledReceipts ?? []
+    } catch (err) {
+      assert.equal((err as NodeJS.ErrnoException).code, 'ENOENT')
+    }
+    assert.equal(receipts.length, 0)
+  })
+
   it('queues a failed live settle and retries the same requestId once', async () => {
     const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-bill-')), 'queue.json')
     let settlePosts = 0
+    const settledIds: string[] = []
     const client = createDelegateEngineBillingClient({
       env: ENV,
       queuePath,
       retryMs: 60_000,
+      onSettled: (row) => {
+        settledIds.push(row.requestId)
+      },
       fetcher: (async (url: string) => {
         const path = new URL(url).pathname
         if (path.endsWith('/settle')) {
@@ -174,6 +229,7 @@ describe('createDelegateEngineBillingClient', () => {
       delegateAgentId: 'auditor',
     }
     await assert.rejects(() => client.settle(billing), /HTTP_500/)
+    assert.deepEqual(settledIds, [])
     const queued = JSON.parse(await readFile(queuePath, 'utf8')) as {
       pending: Array<{ requestId: string }>
     }
@@ -181,6 +237,7 @@ describe('createDelegateEngineBillingClient', () => {
     assert.equal(queued.pending[0]?.requestId, billing.requestId)
     await client.retryPending?.()
     assert.equal(settlePosts, 2)
+    assert.deepEqual(settledIds, [billing.requestId])
     const drained = JSON.parse(await readFile(queuePath, 'utf8')) as { pending: unknown[] }
     assert.deepEqual(drained.pending, [])
     await client.retryPending?.()

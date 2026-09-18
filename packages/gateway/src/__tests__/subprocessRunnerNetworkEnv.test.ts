@@ -35,6 +35,18 @@ describe('buildCcbSpawnProcessEnv', () => {
     assert.equal(got.TZ, 'Asia/Tokyo')
   })
 
+  // OCV5-166:用户面时区 OC_USER_TZ 与出口对齐的 OPENCLAUDE_CCB_TZ 正交 —— 子进程 TZ 只认后者。
+  // 新增用例(不改上面的 Tokyo 锁),防以后有人把 `*TZ` 一锅端进 env.TZ。
+  it('keeps the egress TZ even when the user-facing OC_USER_TZ is present', () => {
+    const got = buildCcbSpawnProcessEnv({
+      ANTHROPIC_BASE_URL: 'http://172.31.0.1:18892',
+      OPENCLAUDE_CCB_TZ: 'Asia/Tokyo',
+      OC_USER_TZ: 'America/New_York',
+    })
+    assert.equal(got.TZ, 'Asia/Tokyo')
+    assert.equal(got.OC_USER_TZ, 'America/New_York') // 原样透传,不翻译成 TZ
+  })
+
   it('fails closed if proxy credentials, internal bypass, or timezone are invalid', () => {
     const base = {
       ANTHROPIC_BASE_URL: 'http://172.31.0.1:18892',

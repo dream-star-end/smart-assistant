@@ -441,6 +441,14 @@ describe('CcbAdapter — modelAuthority 透传', () => {
     const seen: Array<TurnModelAuthority | undefined> = []
     const fakeRunner = new (class extends EventEmitter {
       lastActivityAt = Date.now()
+      consultTurnBinding:
+        | { turnKey: string; turnIndex: number; configVersion: string }
+        | undefined
+      setConsultTurn(
+        binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+      ): void {
+        this.consultTurnBinding = binding
+      }
       async submit(
         _input: unknown,
         _requestId?: string,

@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-// V5 P0/P1 事故回归锁。判据:manifest 里登记的每条证据,必须是**真的会跑、真的断言
+// V5 P0/P1/P2 事故回归锁。判据:manifest 里登记的每条证据,必须是**真的会跑、真的断言
 // 了那件事**的产物 —— 而不是一个存在的文件名。
 //
 // 2026-07-26 审计实锤(本文件此前只做 existsSync,于是):
@@ -241,7 +241,7 @@ for (const incident of manifest.incidents) {
   if (ids.has(incident.id)) fail(`duplicate id ${incident.id}`);
   ids.add(incident.id);
   if (!/^2026-[0-9]{2}-[0-9]{2}$/.test(incident.occurredAt)) fail(`${incident.id}: invalid occurredAt`);
-  if (incident.severity !== "P0" && incident.severity !== "P1") fail(`${incident.id}: severity must be P0/P1`);
+  if (incident.severity !== "P0" && incident.severity !== "P1" && incident.severity !== "P2") fail(`${incident.id}: severity must be P0/P1/P2`);
   if (!incident.symptom?.trim()) fail(`${incident.id}: symptom is required`);
 
   const lineageCommits = [incident.rootFixCommit, ...(incident.coverageCommits ?? [])];
@@ -403,7 +403,43 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 含 d3ac73b5f Grok Build 周额度权重/663df73a3 API 接入分区 + 0277/反合商业 3f50647c4(#562-#564);
   // 只豁免其不可变祖先,禁止 amend 源提交。
   "0a7068cd04ec05a50881c2359a507de21a077262",
+  // 2026-09-08 正向同步冻结 tip:selfhost 01885e894 已上线(曾为 live sourceCommit);
+  // 只豁免其不可变祖先(含 2803a91e7 trailer 格式非法、090702dfe 声明 none 无 waiver 两条已上线提交);
+  // 禁止 amend 源提交;后续新提交仍逐条走 trailer 门。
+  "01885e894269b2d03346732a0ab41a450ecf2613",
+  // 2026-09-08 selfhost 8ab8a57c8 已上线(rel-8ab8a57c8-20260908-125444,live sourceCommit);
+  // 其祖先 f496228de(OCV5-171 CC Switch ASCII provider 名)trailer 写成 "OCV5-171 follow-up"
+  // 格式非法,源提交不可改写,只豁免其不可变祖先。之后的新提交仍逐条走 trailer 门
+  // (已 mutation 验证:tip 之上再加一条坏 trailer 的 fix(v5) 仍会红)。
+  "8ab8a57c82eee96028fe4d9b1015d3593c9e9334",
+  // 2026-09-19 full forward sync freeze: selfhost 839ad4420 is live
+  // (rel-839ad4420-20260918-161252, live sourceCommit). The batch imports 626
+  // selfhost commits (OCV5-158..OCV5-225, web-react a11y/UI audit, apps/windows
+  // desktop, 0278/0279 migrations); several fix(v5) sources predate this gate and
+  // cannot be amended because they are already shipped. Only their immutable
+  // ancestors are exempted; commits after this tip still go through the trailer
+  // gate one by one.
+  "839ad442098f8e68e0b9fd2b0e8f01519334031e",
 ] as const;
+
+// OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
+// imported-history exemption. The full SHA binds the original tree and message;
+// the mapped ID must still satisfy ALL ordinary manifest/proof/lineage checks.
+function normalizeImmutableIncidentTrailer(sha: string, trailer: string): string {
+  if (
+    sha === "f496228de43718852cebda8fb9f35eb0e9c3a9c0"
+    && trailer === "OCV5-171 follow-up"
+  ) {
+    return "INC-20260908-CC-SWITCH-ASCII-NAME";
+  }
+  if (
+    sha === "7b2ae241d6445042fb196cfc1ca03c063aab2fb8"
+    && trailer === "OCV5-220 in-flight consult card showed missing-field copy as"
+  ) {
+    return "INC-20260915-ADVISOR-CONSULT-CARD";
+  }
+  return trailer;
+}
 
 function checkTrailerClosure(): number {
   const start = resolveTrailerGateStart();
@@ -478,7 +514,7 @@ function checkTrailerClosure(): number {
     const touched = commitFiles(sha);
     if (!touched.some((file) => TRAILER_GATE_SURFACES.some((prefix) => file.startsWith(prefix)))) continue;
     checked += 1;
-    const trailer = /^Incident:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
+    let trailer = /^Incident:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
     if (!trailer) {
       const waiver = waivers.get(sha.slice(0, 8));
       const incident = manifest.incidents.find((item) =>
@@ -503,6 +539,11 @@ function checkTrailerClosure(): number {
       if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
       continue;
     }
+    const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);
+    if (normalizedTrailer !== trailer) {
+      process.stdout.write(`[incident-regressions] exact immutable trailer mapping ${sha}: ${trailer} → ${normalizedTrailer} (ordinary closure required)\n`);
+    }
+    trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
       fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
     }
@@ -522,7 +563,7 @@ for (const note of pendingRunners) {
   process.stdout.write(`[incident-regressions] pending-runner: ${note}\n`);
 }
 process.stdout.write(
-  `[incident-regressions] PASS: ${manifest.incidents.length} P0/P1 incidents, ${linked.size} regression artifacts, `
+  `[incident-regressions] PASS: ${manifest.incidents.length} P0/P1/P2 incidents, ${linked.size} regression artifacts, `
   + `assertion debt ${assertionDebt}/${ASSERTION_DEBT_BASELINE}, proofPending ${proofPending}/${PROOF_PENDING_BASELINE}, `
   + `trailer-closure checked ${trailerChecked} fix(v5) commits, fixed live matrix locked\n`,
 );

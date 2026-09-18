@@ -1,8 +1,9 @@
 import * as RD from "@radix-ui/react-dialog";
 import { cva, type VariantProps } from "class-variance-authority";
 import { X } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useRef } from "react";
 import { cn } from "../../lib/utils";
+import { revealFocusedElement, useScrollBodyTabbable } from "./a11y";
 import { IconButton } from "./IconButton";
 
 /** 桌面宽度档。默认 md = 改造前的 max-w-lg。 */
@@ -112,6 +113,8 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   onOpenAutoFocus?: RD.DialogContentProps["onOpenAutoFocus"];
   /** Controlled dialogs opened by an external action can explicitly restore that action's focus. */
   onCloseAutoFocus?: RD.DialogContentProps["onCloseAutoFocus"];
+  /** 教程/产品能力锚点，透传到 role=dialog 节点。 */
+  "data-product-feature"?: string;
 }
 
 /**
@@ -137,18 +140,27 @@ export function Modal({
   onEscapeKeyDown,
   onOpenAutoFocus,
   onCloseAutoFocus,
+  "data-product-feature": dataProductFeature,
 }: ModalProps) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
   const hasDescription = Boolean(title && description);
+  // 正文滚动区:只在「溢出且没有可聚焦子孙」时进入 Tab 序(a11y shell#7),让纯文本长内容也能键盘滚动。
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const bodyTabbable = useScrollBodyTabbable(bodyRef, open);
   return (
     <RD.Root open={open} onOpenChange={onOpenChange}>
       <RD.Portal>
         <RD.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
+          {...(dataProductFeature
+            ? { "data-product-feature": dataProductFeature }
+            : {})}
           onEscapeKeyDown={onEscapeKeyDown}
           onOpenAutoFocus={onOpenAutoFocus}
           onCloseAutoFocus={onCloseAutoFocus}
+          // Tab 回绕时 Radix 用 preventScroll 聚焦,目标若滚出了弹层可视区要自己滚回来(a11y shell#8)。
+          onFocusCapture={revealFocusedElement}
           className={cn(modalContentVariants({ size, fixedHeight, mobile }), className)}
         >
           {title ? (
@@ -182,7 +194,14 @@ export function Modal({
               {toolbar}
             </div>
           )}
-          <div className={cn("min-h-0 flex-1 overflow-y-auto px-5 py-4", bodyClassName)}>
+          <div
+            ref={bodyRef}
+            tabIndex={bodyTabbable ? 0 : undefined}
+            className={cn(
+              "min-h-0 flex-1 overflow-y-auto px-5 py-4 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              bodyClassName,
+            )}
+          >
             {children}
           </div>
           {footer && (

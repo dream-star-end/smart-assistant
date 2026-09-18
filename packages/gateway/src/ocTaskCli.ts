@@ -34,6 +34,12 @@ project  list [--include-archived]
          create --key KEY --name NAME [--description TEXT] [--workspace PATH] [--labels a,b]
 ticket   list [--project-id ID] [--status S] [--type T] [--priority P] [--assignee A]
               [--stage-id ID] [--label L] [--q Q] [--limit N] [--offset N]
+              [--ndjson] [--full]
+              default output drops each ticket's \`body\` (replaced by bodyBytes) so
+              wide listings stay small; --full restores it.
+              stdout may be a 64KiB pipe: with --limit >8 use --ndjson (one ticket
+              per line, streamed) or redirect to a file, else a single-blob JSON
+              can reach the reader cut mid-string.
          get <idOrIdent>
          create --project-id ID --type bug|feature|spike|chore --title TITLE
                 [--body MD] [--priority P0-P3] [--severity S] [--labels a,b] [--assignee A]
@@ -190,6 +196,10 @@ export type TaskCliPlan =
       body?: unknown
       /** ticket get 额外拉评论,动手前必须看返工要求。 */
       extraGets?: string[]
+      /** 逐条流式输出(每行一个 item),避免单块写被 64KiB 管道缓冲截断。 */
+      ndjson?: boolean
+      /** 省略每条 item 的重字段(body/comments),只留 <field>Bytes 计数。 */
+      slim?: boolean
     }
 
 function usage(message = TASK_CLI_USAGE): TaskCliPlan {
@@ -199,7 +209,13 @@ function usage(message = TASK_CLI_USAGE): TaskCliPlan {
 function request(
   method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
   path: string,
-  opts: { query?: Record<string, string>; body?: unknown; extraGets?: string[] } = {},
+  opts: {
+    query?: Record<string, string>
+    body?: unknown
+    extraGets?: string[]
+    ndjson?: boolean
+    slim?: boolean
+  } = {},
 ): TaskCliPlan {
   return { kind: 'request', method, path, ...opts }
 }
@@ -260,7 +276,12 @@ function planTicket(
         const v = optionalFlag(flags, flag)
         if (v) query[q] = v
       }
-      return request('GET', '/tickets', { query })
+      // 默认瘦身:宽列表只用来找卡,body 交给 `ticket get`。--full 恢复原样。
+      return request('GET', '/tickets', {
+        query,
+        ndjson: flags.ndjson === 'true',
+        slim: flags.full !== 'true',
+      })
     }
     case 'get': {
       const id = positional[0]
@@ -458,6 +479,82 @@ export function wrapSuccess(payload: unknown): Record<string, unknown> {
   return { schemaVersion: TASK_CLI_SCHEMA_VERSION, data: payload }
 }
 
+/**
+ * 宽列表里按体积排前几名的字段。省掉正文后 50 张卡从 ~105KB 降到几 KB,
+ * 但保留 `<field>Bytes` 让调用方知道「这里本来有东西,去 ticket get 拿」。
+ */
+export const LIST_HEAVY_FIELDS = ['body', 'comments', 'outputMd'] as const
+
+/** 去掉重字段,换成字节数。非对象原样返回。 */
+export function slimListItem(item: unknown): unknown {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+  const src = item as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(src)) {
+    if ((LIST_HEAVY_FIELDS as readonly string[]).includes(k) && v != null) {
+      const text = typeof v === 'string' ? v : JSON.stringify(v)
+      out[`${k}Bytes`] = Buffer.byteLength(text, 'utf8')
+      continue
+    }
+    out[k] = v
+  }
+  return out
+}
+
+/**
+ * 从 list 响应里摘出条目数组(服务端用 `items`,历史上也见过 `tickets`/裸数组),
+ * 其余键作为信封留给 ndjson 的头行。
+ */
+export function splitListPayload(payload: unknown): {
+  key: string | null
+  items: unknown[]
+  envelope: Record<string, unknown>
+} {
+  if (Array.isArray(payload)) return { key: null, items: payload, envelope: {} }
+  if (payload && typeof payload === 'object') {
+    const rec = payload as Record<string, unknown>
+    for (const key of ['items', 'tickets', 'data']) {
+      if (Array.isArray(rec[key])) {
+        const envelope: Record<string, unknown> = {}
+        for (const [k, v] of Object.entries(rec)) if (k !== key) envelope[k] = v
+        return { key, items: rec[key] as unknown[], envelope }
+      }
+    }
+  }
+  return { key: null, items: [], envelope: {} }
+}
+
+/**
+ * NDJSON 行序列:第一行是信封(`kind:"meta"`),随后每张卡一行。
+ * 每行都能独立 JSON.parse —— 这是 64KB 截断下唯一还能救的形状:
+ * 读端丢的只会是最后一行,前面 N-1 行仍然完整可用。
+ */
+export function buildNdjsonLines(payload: unknown, opts: { slim?: boolean } = {}): string[] {
+  const { key, items, envelope } = splitListPayload(payload)
+  const lines: string[] = [
+    JSON.stringify({
+      schemaVersion: TASK_CLI_SCHEMA_VERSION,
+      kind: 'meta',
+      itemsKey: key,
+      count: items.length,
+      slim: opts.slim === true,
+      ...envelope,
+    }),
+  ]
+  for (const item of items) {
+    lines.push(JSON.stringify({ kind: 'item', item: opts.slim ? slimListItem(item) : item }))
+  }
+  return lines
+}
+
+/** 对 list 响应整体套用瘦身,保持信封结构不变。 */
+export function slimListPayload(payload: unknown): unknown {
+  const { key, items } = splitListPayload(payload)
+  const slimmed = items.map(slimListItem)
+  if (key == null) return Array.isArray(payload) ? slimmed : payload
+  return { ...(payload as Record<string, unknown>), [key]: slimmed }
+}
+
 export function wrapError(error: string, code?: string): Record<string, unknown> {
   const out: Record<string, unknown> = {
     schemaVersion: TASK_CLI_SCHEMA_VERSION,
@@ -474,8 +571,110 @@ export function exitCodeForHttp(status: number, apiCode?: string): number {
   return TASK_CLI_EXIT.api
 }
 
-function writeJson(obj: unknown): void {
-  process.stdout.write(`${JSON.stringify(obj)}\n`)
+/**
+ * 写 stdout 并等它真的落地。
+ *
+ * 根因(OCV5-165):stdout 指向管道时是**异步**的,内核管道缓冲只有 64KiB。
+ * 原实现在 `main()` 里直接 `process.exit(code)`,进程在超出 64KiB 的尾部被
+ * flush 之前就没了 —— 读端拿到的 JSON 正好在 65536 字节处断在字符串中间
+ * (butler weekly-kpi 的 `Unterminated string ... char 52350` 就是这个)。
+ * 重定向到文件时 stdout 是同步的,所以同一条命令写文件 105KB 完好无损。
+ */
+export interface WritableLike {
+  write(chunk: string, cb: (err?: Error | null) => void): unknown
+  on(event: 'error', listener: (err: NodeJS.ErrnoException) => void): unknown
+}
+
+export function isEpipe(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === 'EPIPE'
+}
+
+export interface StreamWriter {
+  /** 写一段;返回 false 表示管道已断、本次(及后续)被跳过。 */
+  write(chunk: string): Promise<boolean>
+  writeJson(obj: unknown): Promise<boolean>
+  /** 逐行写;管道一断立即停,不再对断了的管道写剩下 N 行。 */
+  writeLines(lines: string[]): Promise<boolean>
+  readonly broken: boolean
+  readonly fatal: NodeJS.ErrnoException | null
+}
+
+/**
+ * 把 stdout 包成「EPIPE 安全」的写入器。
+ *
+ * 为什么必须显式监听 `'error'`:`process.stdout.write(chunk, cb)` 的 cb 拿到 err 之前,
+ * stream 自身会先 emit `'error'`;没有 listener 的 `'error'` 在 node 里就是
+ * **uncaught exception** → 直接 crash(`node:events:497 throw er`)。
+ * 所以 `| head -1` 这类读端提前关闭的场景,只包 promise 的 reject 是兜不住的
+ * (OCV5-165 返工 1 实测:`--ndjson --full | head -1` pipestatus=1、stderr 18 行)。
+ *
+ * 约定:**EPIPE 视为正常收尾**(读端不要了),退出码保持命令本身的码(成功即 0),
+ * 与 `head`/`yes` 等 coreutils 管道行为一致;非 EPIPE 的写错误记进 `fatal` 上抛。
+ */
+export function createStreamWriter(stream: WritableLike): StreamWriter {
+  let broken = false
+  let fatal: NodeJS.ErrnoException | null = null
+
+  stream.on('error', (err) => {
+    if (isEpipe(err)) broken = true
+    else fatal = err
+  })
+
+  const w: StreamWriter = {
+    get broken() {
+      return broken
+    },
+    get fatal() {
+      return fatal
+    },
+    async write(chunk: string): Promise<boolean> {
+      if (broken) return false // 管道已断:静默跳过,别再往里写
+      if (fatal) throw fatal
+      const err = await new Promise<Error | null | undefined>((resolve) => {
+        try {
+          stream.write(chunk, resolve)
+        } catch (e) {
+          resolve(e as Error) // 极端情况:write 同步抛
+        }
+      })
+      if (err) {
+        if (isEpipe(err)) {
+          broken = true
+          return false
+        }
+        fatal = err as NodeJS.ErrnoException
+        throw err
+      }
+      if (fatal) throw fatal // 'error' 事件在 cb 之后到
+      return !broken
+    },
+    async writeJson(obj: unknown): Promise<boolean> {
+      return w.write(`${JSON.stringify(obj)}\n`)
+    },
+    async writeLines(lines: string[]): Promise<boolean> {
+      for (const line of lines) {
+        if (!(await w.write(`${line}\n`))) return false // 断了就立刻停
+      }
+      return true
+    },
+  }
+  return w
+}
+
+/** 进程级 stdout 写入器(懒建,建时即挂 'error' listener)。 */
+let stdoutWriter: StreamWriter | null = null
+function out(): StreamWriter {
+  if (!stdoutWriter) stdoutWriter = createStreamWriter(process.stdout as unknown as WritableLike)
+  return stdoutWriter
+}
+
+async function writeJson(obj: unknown): Promise<void> {
+  await out().writeJson(obj)
+}
+
+/** 逐行写 NDJSON,每行独立成条;背压由 write 的 callback 承担,EPIPE 立即止写。 */
+async function writeNdjson(lines: string[]): Promise<void> {
+  await out().writeLines(lines)
 }
 
 function writeErr(msg: string): void {
@@ -552,7 +751,7 @@ function apiErrorText(json: unknown, fallback: string): { error: string; code?: 
 async function execute(plan: Extract<TaskCliPlan, { kind: 'request' }>): Promise<number> {
   const resolved = resolveTaskboardEndpoint()
   if (!resolved.ok) {
-    writeJson(wrapError(resolved.error))
+    await writeJson(wrapError(resolved.error))
     writeErr(resolved.error)
     return TASK_CLI_EXIT.unreachable
   }
@@ -562,13 +761,13 @@ async function execute(plan: Extract<TaskCliPlan, { kind: 'request' }>): Promise
   })
   if (primary.unreachable) {
     const msg = apiErrorText(primary.json, 'gateway unreachable').error
-    writeJson(wrapError(msg))
+    await writeJson(wrapError(msg))
     writeErr(msg)
     return TASK_CLI_EXIT.unreachable
   }
   if (!primary.ok) {
     const { error, code } = apiErrorText(primary.json, `HTTP ${primary.status}`)
-    writeJson(wrapError(error, code))
+    await writeJson(wrapError(error, code))
     writeErr(`${primary.status} ${code ?? ''} ${error}`.trim())
     return exitCodeForHttp(primary.status, code)
   }
@@ -587,35 +786,57 @@ async function execute(plan: Extract<TaskCliPlan, { kind: 'request' }>): Promise
       payload = { ...(payload as Record<string, unknown>), ...extras }
     }
   }
-  writeJson(wrapSuccess(payload))
+  if (plan.ndjson) {
+    await writeNdjson(buildNdjsonLines(payload, { slim: plan.slim }))
+    return TASK_CLI_EXIT.ok
+  }
+  await writeJson(wrapSuccess(plan.slim ? slimListPayload(payload) : payload))
   return TASK_CLI_EXIT.ok
 }
 
 export async function runTaskCli(argv: string[]): Promise<number> {
   const [cmd] = argv
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
-    process.stdout.write(`${TASK_CLI_USAGE}\n`)
+    await out().write(`${TASK_CLI_USAGE}\n`)
     return TASK_CLI_EXIT.ok
   }
   const plan = planTaskCommand(argv)
   if (plan.kind === 'usage') {
-    writeJson(wrapError(plan.message))
+    await writeJson(wrapError(plan.message))
     writeErr(plan.message)
     return TASK_CLI_EXIT.usage
   }
   return execute(plan)
 }
 
+/**
+ * 设置退出码而**不**调用 `process.exit()`:让 node 把 stdout 排空后自然退出。
+ * `process.exit()` 会丢掉管道里还没 flush 的部分(见 createStreamWriter 的根因注释)。
+ */
+function finish(code: number): void {
+  process.exitCode = code
+}
+
 async function main(): Promise<void> {
+  out() // 先建写入器 = 先挂 stdout 'error' listener,早于任何写
   const code = await runTaskCli(process.argv.slice(2))
-  process.exit(code)
+  // 读端提前关闭(`| head -1`)不是本命令的失败:按 coreutils 惯例仍以本身的码收尾。
+  finish(code)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((e) => {
+  main().catch(async (e) => {
+    if (isEpipe(e)) {
+      finish(TASK_CLI_EXIT.ok) // 读端不要了,不是错误
+      return
+    }
     const msg = e instanceof Error ? e.message : String(e)
-    writeJson(wrapError(msg))
+    try {
+      await writeJson(wrapError(msg))
+    } catch {
+      /* stdout 已断(EPIPE):错误仍走 stderr */
+    }
     writeErr(msg)
-    process.exit(TASK_CLI_EXIT.unreachable)
+    finish(TASK_CLI_EXIT.unreachable)
   })
 }

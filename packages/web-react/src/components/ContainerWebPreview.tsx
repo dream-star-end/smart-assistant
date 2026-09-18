@@ -49,7 +49,7 @@ import { type ContainerWebAnnotation, buildContainerWebReviewPrompt } from '../l
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
-import { Modal } from './ui'
+import { Modal, useConfirm } from './ui'
 
 type ToolMode = 'interact' | 'comment'
 type PreviewSurface = 'none' | 'textComposer' | 'commentsDrawer' | 'draftEditor'
@@ -90,6 +90,26 @@ const PHASE_LABEL: Record<string, string> = {
 }
 const MAX_ANNOTATIONS = 20
 const CONTROLS_AUTO_HIDE_MS = 3_000
+/** 触屏:位移超过这个值才算拖动(否则是点按)。 */
+const TOUCH_DRAG_SLOP = 8
+/** 触屏拖动 → 远端滚动的放大系数(与改造前 pointerup 一次性换算的 `*2` 一致)。 */
+const TOUCH_SCROLL_GAIN = 2
+/** 鼠标移动唤出控件的节流(审计 M-22)。 */
+const MOUSE_REVEAL_THROTTLE_MS = 250
+/** 客户端视口变化 → 重新适配远端视口:防抖与「算得上变化」的阈值(审计 M-10)。 */
+const VIEWPORT_REFIT_DEBOUNCE_MS = 300
+const VIEWPORT_REFIT_RATIO = 0.15
+
+type PointerGesture = {
+  id: number
+  x: number
+  y: number
+  type: string
+  /** 触屏拖动:上一次已换算成滚动的位置;pointerup 只补发这之后的余量。 */
+  lastX: number
+  lastY: number
+  dragging: boolean
+}
 
 function readAccessProfile(sourceUrl: string): AccessProfile {
   if (typeof window === 'undefined') {
@@ -139,7 +159,11 @@ export function ContainerWebPreview({
   const [annotations, setAnnotations] = useState<ContainerWebAnnotation[]>([])
   const [draft, setDraft] = useState<CommentDraft | null>(null)
   const [selectionHint, setSelectionHint] = useState<string | null>(null)
-  const [announcement, setAnnouncement] = useState('')
+  // nonce 让「连续两次同一句」也能被读屏播报:aria-live 只在文本真的变了才念(审计 M-21)。
+  const [announcement, setAnnouncementState] = useState({ text: '', nonce: 0 })
+  const setAnnouncement = useCallback((text: string) => {
+    setAnnouncementState((current) => ({ text, nonce: current.nonce + 1 }))
+  }, [])
   const [textInput, setTextInput] = useState('')
   const [frameStats, setFrameStats] = useState<FrameStats | null>(null)
   const [controlsVisible, setControlsVisible] = useState(true)
@@ -162,8 +186,11 @@ export function ContainerWebPreview({
   const frameTimesRef = useRef<number[]>([])
   const lastStatsAtRef = useRef(0)
   const lastInteractionAtRef = useRef<number | null>(null)
-  const pointerStartRef = useRef<{ id: number; x: number; y: number; type: string } | null>(null)
+  const pointerStartRef = useRef<PointerGesture | null>(null)
   const lastPointerMoveAtRef = useRef(0)
+  const lastMouseRevealAtRef = useRef(0)
+  const closeConfirmPendingRef = useRef(false)
+  const [confirm, confirmEl] = useConfirm()
   const textComposingRef = useRef(false)
   const annotationsRef = useRef(annotations)
   const draftRef = useRef(draft)
@@ -344,11 +371,51 @@ export function ContainerWebPreview({
     setAnnotations([])
     setDraft(null)
     setSelectionHint(null)
-    setAnnouncement('')
+    setAnnouncementState({ text: '', nonce: 0 })
     setTextInput('')
     setFrameStats(null)
     setReconnectKey((value) => value + 1)
   }, [accessProfile.sourceUrl, clearControlsTimer, sourceUrl])
+
+  // 客户端视口只在挂载时量过一次:手机旋转 / iOS 地址栏与键盘收放 / 桌面改窗口后,远端帧比例
+  // 与容器比例不再一致(审计 M-10)。这里防抖监听;只有设备档翻转或尺寸变化超过阈值才重新
+  // 量一次并让 viewport 变化触发重连 —— 小幅变化交给 object-contain 的黑边吸收,不打断远端页面。
+  // 用户手动切到「另一台设备」模拟(device !== accessProfile.device)时不跟随客户端变化。
+  useEffect(() => {
+    if (!open || typeof window === 'undefined') return
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const refit = () => {
+      timer = null
+      if (accessProfile.sourceUrl !== sourceUrl || device !== accessProfile.device) return
+      const next = readAccessProfile(sourceUrl)
+      const current = accessProfile.viewport
+      const widthDelta = Math.abs(next.viewport.width - current.width) / current.width
+      const heightDelta = Math.abs(next.viewport.height - current.height) / current.height
+      const flipped = next.device !== accessProfile.device
+      if (!flipped && widthDelta < VIEWPORT_REFIT_RATIO && heightDelta < VIEWPORT_REFIT_RATIO)
+        return
+      frameTimesRef.current = []
+      pendingFrameRef.current = null
+      setFrameStats(null)
+      setAccessProfile(next)
+      setDevice(next.device)
+      setAnnouncement('画面尺寸已变化，正在重新适配网页预览')
+    }
+    const schedule = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(refit, VIEWPORT_REFIT_DEBOUNCE_MS)
+    }
+    const visualViewport = window.visualViewport
+    window.addEventListener('resize', schedule)
+    window.addEventListener('orientationchange', schedule)
+    visualViewport?.addEventListener('resize', schedule)
+    return () => {
+      if (timer) clearTimeout(timer)
+      window.removeEventListener('resize', schedule)
+      window.removeEventListener('orientationchange', schedule)
+      visualViewport?.removeEventListener('resize', schedule)
+    }
+  }, [accessProfile, device, open, setAnnouncement, sourceUrl])
 
   useEffect(() => {
     const event = session.selection
@@ -380,7 +447,7 @@ export function ContainerWebPreview({
     )
     setSurface('draftEditor')
     setAnnouncement(currentDraft ? '已重新选择评论元素' : '已选择元素，请描述希望怎样修改')
-  }, [session.selection])
+  }, [session.selection, setAnnouncement])
 
   useEffect(() => {
     const event = session.resolved
@@ -445,18 +512,50 @@ export function ContainerWebPreview({
     setAnnouncement('正在重新连接网页预览')
   }
 
+  /**
+   * 客户端坐标 → 远端视口坐标。画面用 object-contain 铺在元素里(审计 M-10),元素比例与远端
+   * 视口比例不一致时两侧 / 上下会有黑边,坐标要按实际画面区换算,否则点哪儿都偏。
+   * 比例一致(非全屏态容器就是按远端比例撑开的)时退化为整元素等比映射,与改造前一致。
+   */
   const pointFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
     const rect = event.currentTarget.getBoundingClientRect()
+    const scale = Math.min(rect.width / viewport.width, rect.height / viewport.height)
+    const contentWidth = scale > 0 ? viewport.width * scale : rect.width
+    const contentHeight = scale > 0 ? viewport.height * scale : rect.height
+    const offsetX = rect.left + (rect.width - contentWidth) / 2
+    const offsetY = rect.top + (rect.height - contentHeight) / 2
     return {
       x: Math.max(
         0,
-        Math.min(viewport.width, ((event.clientX - rect.left) / rect.width) * viewport.width),
+        Math.min(viewport.width, ((event.clientX - offsetX) / contentWidth) * viewport.width),
       ),
       y: Math.max(
         0,
-        Math.min(viewport.height, ((event.clientY - rect.top) / rect.height) * viewport.height),
+        Math.min(viewport.height, ((event.clientY - offsetY) / contentHeight) * viewport.height),
       ),
     }
+  }
+
+  /** 触屏拖动:把上次换算点到当前点的增量发成一次远端滚动(审计 M-09)。 */
+  const flushTouchScroll = (gesture: PointerGesture, point: { x: number; y: number }) => {
+    const dx = point.x - gesture.lastX
+    const dy = point.y - gesture.lastY
+    gesture.lastX = point.x
+    gesture.lastY = point.y
+    if (dx === 0 && dy === 0) return
+    sendControl({
+      type: 'preview.wheel',
+      deltaX: -dx * TOUCH_SCROLL_GAIN,
+      deltaY: -dy * TOUCH_SCROLL_GAIN,
+    })
+  }
+
+  /** 评论模式点按:让远端按坐标识别元素。 */
+  const selectAt = (point: { x: number; y: number }) => {
+    session.send({ type: 'preview.select', ...point })
+    const message = '正在识别网页元素…'
+    setSelectionHint(message)
+    setAnnouncement(message)
   }
 
   const onPointerDown = (event: ReactPointerEvent<HTMLElement>) => {
@@ -466,7 +565,14 @@ export function ContainerWebPreview({
       event.currentTarget.setPointerCapture(event.pointerId)
     } catch {}
     const point = pointFromPointer(event)
-    pointerStartRef.current = { id: event.pointerId, ...point, type: event.pointerType }
+    pointerStartRef.current = {
+      id: event.pointerId,
+      ...point,
+      type: event.pointerType,
+      lastX: point.x,
+      lastY: point.y,
+      dragging: false,
+    }
     if (mode === 'interact' && event.pointerType !== 'touch') {
       sendControl({
         type: 'preview.pointer',
@@ -478,7 +584,23 @@ export function ContainerWebPreview({
   }
 
   const onPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
-    if (!ready || mode !== 'interact' || event.pointerType === 'touch') return
+    if (!ready) return
+    if (event.pointerType === 'touch') {
+      // 手指滑动过程中就跟着滚,不再等抬手一次性跳滚(审计 M-09)。操作 / 评论两种模式都适用。
+      const gesture = pointerStartRef.current
+      if (!gesture || gesture.id !== event.pointerId) return
+      const point = pointFromPointer(event)
+      if (!gesture.dragging) {
+        if (Math.hypot(point.x - gesture.x, point.y - gesture.y) <= TOUCH_DRAG_SLOP) return
+        gesture.dragging = true
+      }
+      const now = performance.now()
+      if (now - lastPointerMoveAtRef.current < 50) return
+      lastPointerMoveAtRef.current = now
+      flushTouchScroll(gesture, point)
+      return
+    }
+    if (mode !== 'interact') return
     const now = performance.now()
     if (now - lastPointerMoveAtRef.current < 50) return
     lastPointerMoveAtRef.current = now
@@ -493,29 +615,23 @@ export function ContainerWebPreview({
     try {
       event.currentTarget.releasePointerCapture(event.pointerId)
     } catch {}
-    if (mode === 'comment') {
-      if (event.pointerType === 'touch' && start) {
-        const dx = point.x - start.x
-        const dy = point.y - start.y
-        if (Math.hypot(dx, dy) > 8) {
-          sendControl({ type: 'preview.wheel', deltaX: -dx * 2, deltaY: -dy * 2 })
-          return
-        }
-      }
-      session.send({ type: 'preview.select', ...point })
-      const message = '正在识别网页元素…'
-      setSelectionHint(message)
-      setAnnouncement(message)
-      return
-    }
     if (event.pointerType === 'touch' && start) {
-      const dx = point.x - start.x
-      const dy = point.y - start.y
-      if (Math.hypot(dx, dy) > 8) {
-        sendControl({ type: 'preview.wheel', deltaX: -dx * 2, deltaY: -dy * 2 })
+      const moved =
+        start.dragging || Math.hypot(point.x - start.x, point.y - start.y) > TOUCH_DRAG_SLOP
+      if (moved) {
+        // 拖动:只补发最后一段没来得及发的余量,不重复整段位移。
+        flushTouchScroll(start, point)
+        return
+      }
+      if (mode === 'comment') {
+        selectAt(point)
       } else {
         sendControl({ type: 'preview.pointer', action: 'click', ...point, button: 'left' })
       }
+      return
+    }
+    if (mode === 'comment') {
+      selectAt(point)
       return
     }
     sendControl({
@@ -676,6 +792,39 @@ export function ContainerWebPreview({
     focusSoon(() => commentCountRef.current)
   }
 
+  /**
+   * 关闭统一入口(审计 M-07):评论只活在组件 state 里,关掉就没了。有已写评论或未保存草稿时
+   * 先确认;X、遮罩、Esc(焦点不在画面上时)都走这里。`submitReview` 是把评论带走再关,不经此处。
+   */
+  const requestClose = () => {
+    const count = annotationsRef.current.length
+    const hasDraft = Boolean(draftRef.current?.comment.trim())
+    if (count === 0 && !hasDraft) {
+      onClose()
+      return
+    }
+    if (closeConfirmPendingRef.current) return
+    closeConfirmPendingRef.current = true
+    const what =
+      count > 0 ? `已写的 ${count} 条评论${hasDraft ? '和未保存的草稿' : ''}` : '未保存的评论草稿'
+    void confirm({
+      title: '关闭网页预览？',
+      body: `${what}不会保留。想带走它们，请先点「加入输入框」。`,
+      confirmText: '仍然关闭',
+      cancelText: '继续评论',
+      danger: true,
+    }).then((choice) => {
+      closeConfirmPendingRef.current = false
+      if (choice === true) onClose()
+    })
+  }
+
+  /** 焦点在远端画面上:键盘事件属于被预览的网页,不该同时当成本弹层的快捷键。 */
+  const previewSurfaceHasFocus = () => {
+    const active = document.activeElement
+    return Boolean(active && (active === canvasRef.current || active === iframeRef.current))
+  }
+
   const visibleTargets = useMemo(() => {
     if (mode !== 'comment') return []
     const items: Array<{
@@ -718,7 +867,7 @@ export function ContainerWebPreview({
   return (
     <Modal
       open={open}
-      onOpenChange={(next) => !next && onClose()}
+      onOpenChange={(next) => !next && requestClose()}
       onEscapeKeyDown={(event) => {
         const activeSurface = surfaceRef.current
         if (activeSurface !== 'none') {
@@ -734,7 +883,15 @@ export function ContainerWebPreview({
         if (modeRef.current === 'comment') {
           event.preventDefault()
           leaveCommentMode()
+          return
         }
+        // 操作模式、焦点在画面上:Esc 是给被预览网页的(关它的下拉 / 弹层),不关整个预览
+        // (审计 M-07)。画布自己的 onKeyDown 会把它转发出去;想关预览先 Tab 到控件或点 X。
+        if (previewSurfaceHasFocus()) {
+          event.preventDefault()
+          return
+        }
+        // 其余情况交给 Radix 走 onOpenChange(false) → requestClose(),有评论时会先确认。
       }}
       onOpenAutoFocus={(event) => {
         event.preventDefault()
@@ -754,6 +911,14 @@ export function ContainerWebPreview({
         className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden"
         data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}
         data-controls-visible={controlsVisible}
+        onPointerMove={(event) => {
+          // 沉浸态下鼠标一动控件就回来(桌面通用预期,审计 M-22);触屏不走这条,避免和被预览网页的手势打架。
+          if (event.pointerType !== 'mouse' || !controlsAutoHideEligible) return
+          const now = performance.now()
+          if (now - lastMouseRevealAtRef.current < MOUSE_REVEAL_THROTTLE_MS) return
+          lastMouseRevealAtRef.current = now
+          keepControlsVisible()
+        }}
       >
         <div className="preview-ambient pointer-events-none absolute inset-0" />
 
@@ -770,7 +935,7 @@ export function ContainerWebPreview({
               <button
                 ref={closeButtonRef}
                 type="button"
-                onClick={onClose}
+                onClick={requestClose}
                 aria-label="关闭网页预览"
                 title="关闭 (Esc)"
                 className="preview-icon-button"
@@ -894,7 +1059,8 @@ export function ContainerWebPreview({
                 className="preview-primary-button"
               >
                 <span className="hidden min-[430px]:inline">加入输入框</span>
-                <span className="min-[430px]:hidden">完成</span>
+                {/* 窄屏缩写也要说清动作是「加入」而不是「完成」—— 它只预填,不发送(审计 M-20)。 */}
+                <span className="min-[430px]:hidden">加入</span>
                 <Send size={15} />
               </button>
             </div>
@@ -921,7 +1087,8 @@ export function ContainerWebPreview({
             fillsClientViewport && 'absolute inset-0 p-0 sm:p-0',
           )}
         >
-          {!hasError && (!ready || controlsVisible) && (
+          {/* 加载期画布中央已有同一句阶段文案,状态胶囊只在 ready 后出现,不再同屏两处重复(审计 M-20)。 */}
+          {!hasError && ready && controlsVisible && (
             <PreviewStatus
               phase={session.phase}
               ready={ready}
@@ -989,9 +1156,11 @@ export function ContainerWebPreview({
                 ref={canvasRef}
                 tabIndex={ready ? 0 : -1}
                 aria-label={mode === 'comment' ? '网页画面，点按选择评论元素' : '可交互网页画面'}
+                aria-describedby="container-preview-canvas-help"
                 aria-disabled={!ready}
                 className={cn(
-                  'block size-full touch-none select-none object-fill outline-none',
+                  // object-contain:容器比例与远端帧比例不一致时留黑边而不是拉伸(审计 M-10);坐标换算见 pointFromPointer。
+                  'block size-full touch-none select-none object-contain outline-none',
                   mode === 'comment' && ready ? 'cursor-crosshair' : 'cursor-default',
                 )}
                 onPointerDown={onPointerDown}
@@ -1004,6 +1173,8 @@ export function ContainerWebPreview({
                 onWheel={onWheel}
                 onKeyDown={(event) => {
                   if (!ready || mode !== 'interact' || event.nativeEvent.isComposing) return
+                  // Tab / Shift+Tab 留给浏览器移焦点:否则键盘用户进了画布就出不来(审计 M-08)。
+                  if (event.key === 'Tab') return
                   const key = keyboardShortcut(event)
                   if (!key) return
                   event.preventDefault()
@@ -1011,6 +1182,9 @@ export function ContainerWebPreview({
                 }}
               />
             )}
+            <span id="container-preview-canvas-help" className="sr-only">
+              画面聚焦时按键会发送给网页，Esc 也是；按 Tab 离开画面回到预览控件。
+            </span>
 
             {visibleTargets.map(({ key, target, label, active, missing, annotation }) => (
               <div
@@ -1069,6 +1243,8 @@ export function ContainerWebPreview({
 
             {hasError && (
               <PreviewError
+                // 服务端正常断开(容器休眠 / 网页停了)与「从未连上」是两回事,文案分开(审计 M-19)。
+                variant={session.error ? 'error' : 'disconnected'}
                 detail={session.error?.message ?? '网页预览连接已断开'}
                 retryable={session.error?.retryable ?? true}
                 onRetry={() =>
@@ -1261,9 +1437,12 @@ export function ContainerWebPreview({
         )}
 
         <output aria-live="polite" className="sr-only">
-          {announcement}
+          {/* 同一句连播两次时用零宽空格让文本真的变一下,aria-live 才会再念(审计 M-21)。 */}
+          {announcement.text}
+          {announcement.nonce % 2 === 1 ? '\u200b' : ''}
         </output>
       </div>
+      {confirmEl}
     </Modal>
   )
 }
@@ -1299,25 +1478,37 @@ function PreviewStatus({
   )
 }
 
+const PREVIEW_ERROR_COPY = {
+  error: {
+    title: '无法连接网页预览',
+    copy: '运行环境可能仍在启动，或网页服务暂时不可用。请确认网页已运行后重试。',
+  },
+  disconnected: {
+    title: '连接已断开',
+    copy: '可能是运行环境进入休眠，或网页已停止。重新连接即可继续；已写的评论仍保留在这里。',
+  },
+} as const
+
 function PreviewError({
+  variant,
   detail,
   retryable,
   onRetry,
 }: {
+  variant: keyof typeof PREVIEW_ERROR_COPY
   detail: string
   retryable: boolean
   onRetry: () => void
 }) {
+  const copy = PREVIEW_ERROR_COPY[variant]
   return (
     <div role="alert" className="preview-error-state absolute inset-0">
       <div className="preview-error-content">
         <span className="preview-error-icon">
           <CircleAlert size={21} />
         </span>
-        <h2 className="preview-error-title">无法连接网页预览</h2>
-        <p className="preview-error-copy">
-          运行环境可能仍在启动，或网页服务暂时不可用。请确认网页已运行后重试。
-        </p>
+        <h2 className="preview-error-title">{copy.title}</h2>
+        <p className="preview-error-copy">{copy.copy}</p>
         {retryable && (
           <button type="button" onClick={onRetry} className="preview-primary-button mx-auto mt-3.5">
             <RefreshCw size={16} />
@@ -1325,7 +1516,11 @@ function PreviewError({
           </button>
         )}
         <details className="preview-error-details group">
-          <summary>诊断详情</summary>
+          {/* 12px + 44px 触控高:styles.css 的 .preview-error-details summary 写死了 11px/32px,
+              归 shell owner(审计 M-19/M-27),这里先用元素自身的字号类与内联高度顶上。 */}
+          <summary className="text-meta" style={{ minHeight: 44, color: 'var(--preview-muted)' }}>
+            诊断详情
+          </summary>
           <p className="preview-error-detail-body">{detail}</p>
         </details>
       </div>
@@ -1407,6 +1602,7 @@ function CommentEditor({
   onDelete?: () => void
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const canSave = Boolean(draft.comment.trim()) && !draft.targetMissing
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => textareaRef.current?.focus())
@@ -1443,6 +1639,13 @@ function CommentEditor({
           value={draft.comment}
           maxLength={2_000}
           onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            // ⌘/Ctrl+Enter 保存(审计 M-21);Enter 本身仍是换行。
+            if (event.key !== 'Enter' || !(event.metaKey || event.ctrlKey)) return
+            if (event.nativeEvent.isComposing) return
+            event.preventDefault()
+            if (canSave) onSave()
+          }}
           aria-label="描述网页修改"
           placeholder="例如：按钮改成品牌色，文案改为“立即开始”，移动端占满一行。"
           className="mt-3 min-h-20 w-full resize-none bg-transparent text-sm leading-6 text-white outline-none placeholder:text-white/30"
@@ -1466,9 +1669,10 @@ function CommentEditor({
           </div>
           <button
             type="button"
-            disabled={!draft.comment.trim() || draft.targetMissing}
+            disabled={!canSave}
             onClick={onSave}
             aria-label={draft.editingId ? '保存评论' : '添加评论'}
+            title="⌘/Ctrl + Enter"
             className="preview-primary-button"
           >
             <Check size={15} />

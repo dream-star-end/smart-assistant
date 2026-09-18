@@ -574,19 +574,24 @@ export type InsufficientCreditsCopy = {
   intent: SubscribeIntent;
 };
 
-/** 耗尽文案分层：免费用户引导开通 Lite ¥38，付费用户引导加量包。 */
+/**
+ * 耗尽文案分层：免费用户引导开通订阅（任意一档都够，CTA 落在最低档 Lite），付费用户引导加量包。
+ * 价格 / 积分数**不写进文案**：套餐真值在后端（listSubscriptionPlans），这里是模块级常量、拿不到
+ * 真值，手抄「¥38/月、4000 积分」改价即漂移（settings 审计 SET-15）；口径与
+ * lib/cursorModelPicker 的 lockedModelUnlockNotice「开通任意订阅套餐即可解锁」一致。标点全角。
+ */
 export function insufficientCreditsCopy(paid: boolean): InsufficientCreditsCopy {
   if (paid) {
     return {
       title: "本期积分已用完",
-      message: "本期积分已用完,可购买加量包或升级套餐",
+      message: "本期积分已用完，可购买加量包或升级套餐",
       cta: "购买加量包",
       intent: "pack",
     };
   }
   return {
     title: "免费额度已用完",
-    message: "免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续",
+    message: "免费额度已用完，开通任意订阅套餐（Lite 及以上任一档）即可继续",
     cta: "开通 Lite",
     intent: "lite",
   };
@@ -759,6 +764,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
   service_restart: "服务正在更新，本轮已中断，请重试。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
+  session_deleted: "这个会话已被删除。请新建会话继续；在这里重试不会把它找回来。从回收站恢复后即可正常发送。",
   durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击重试。",
   stopped: "本轮生成已停止。",
   user_cancelled: "本轮已取消。",
@@ -852,6 +858,15 @@ export const EXPECTED_TURN_ERR_CODES: ReadonlySet<string> = EXPECTED_TURN_ERROR_
  */
 export const REPORT_EXEMPT_TURN_ERR_CODES: ReadonlySet<string> = REPORT_EXEMPT_TURN_ERROR_CODES;
 
+/**
+ * 问题卡呈现色：与 cards.tsx errorTone 同源。
+ * waived 或 taxonomy.expected===true → yellow（warning 卡）；否则 red（danger 卡）。
+ */
+export function problemCardPresentation(code: string, waived: boolean): "red" | "yellow" {
+  if (waived || turnErrorSemantics(normalizeTurnErrorCode(code)).expected === true) return "yellow";
+  return "red";
+}
+
 // ═══════════════ 流式行身份（server canonical id upsert，websocket.js:606）═══════════════
 
 /**
@@ -872,6 +887,40 @@ export function findOrCreateStreamingRow<
     if (existing) return existing;
   }
   return create(messageId ? { id: messageId } : {});
+}
+
+// ═══════════════ 展示层小工具（消息卡片文案） ═══════════════
+
+/** CJK 统一表意文字 + 日文假名 + 谚文 + 全角标点。 */
+const CJK_RE = /[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g;
+
+/**
+ * 朗读语音的语言标签(SpeechSynthesisUtterance.lang)。粗判规则:数 CJK 字符与拉丁**单词**
+ * (一个汉字 ≈ 一个词的信息量,按字母数比会被 `stickToBottom` 这类长标识符带偏):
+ * 汉字数 ≥ 拉丁词数 → `zh-CN`;否则 `en-US`(英文回答用中文语音朗读会逐字母拼读)。
+ * 无汉字也无拉丁词(空文本 / 纯数字标点)回退 zh-CN。
+ */
+export function speechLangFor(text: string): "zh-CN" | "en-US" {
+  const raw = typeof text === "string" ? text : "";
+  const cjk = raw.match(CJK_RE)?.length ?? 0;
+  const latinWords = raw.match(/[A-Za-z][A-Za-z'-]*/g)?.length ?? 0;
+  if (cjk === 0 && latinWords === 0) return "zh-CN";
+  return cjk >= latinWords ? "zh-CN" : "en-US";
+}
+
+/**
+ * 秒数 → 人类可读时长(目标卡「用时」等):<60s → `Ns`;<60min → `N 分钟`(不足 1 分钟部分
+ * 四舍五入,≥30s 进位);≥60min → `H 小时 M 分`(M 为 0 时省略)。非法/负数 → 空串。
+ */
+export function formatDurationSeconds(seconds: unknown): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "";
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const totalMinutes = Math.round(s / 60);
+  if (totalMinutes < 60) return `${totalMinutes} 分钟`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes === 0 ? `${hours} 小时` : `${hours} 小时 ${minutes} 分`;
 }
 
 // 仅供类型引用（确保 block 类型在本模块内被使用，避免 unused import）。

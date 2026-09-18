@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * Experimental community ZCode CLI adapter (zcode.cjs 0.16.3).
  * Not an official standalone CLI. Adapter never reads or logs the Coding Plan
@@ -572,6 +573,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
+        identityCompat: this.opts.identityCompat?.assets,
         provider: 'zcode',
         model: this.currentModel,
         availableMcpTools,
@@ -599,6 +601,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       })
       return assembleZcodePrompt(platform.content || '', input, this.platformGoal)
     } catch {
+      if (this.opts.identityCompat?.assets) throw new Error('COMPAT_CONFIG_CONFLICT: identity prompt assembly failed')
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
@@ -1047,6 +1050,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     this.cleanupArtifacts(ctx)
     try {
       ctx.artifacts = createZcodePlatformArtifacts({
+      identityCompat: this.opts.identityCompat,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         gatewayPort: this.opts.config.gateway.port,
@@ -1088,6 +1092,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     ctx.zcodeSessionId = this.nativeId
     if (this.nativeId) args.push('--resume', this.nativeId)
     const env: NodeJS.ProcessEnv = {
+      ...identityCompatEnvironment(this.opts.identityCompat),
+      OC_AGENT_ID: this.opts.agentId,
+      OPENCLAUDE_AGENT_ID: this.opts.agentId,
+      OC_SESSION_KEY: this.opts.sessionKey,
       PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
       HOME: process.env.HOME,
       TERM: 'dumb',

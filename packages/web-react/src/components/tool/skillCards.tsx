@@ -12,6 +12,7 @@
 import { Sparkles } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { Badge, Button } from "../ui";
+import { INLINE_SUMMARY_CLS } from "./inlineAction";
 
 // ── 解析(纯函数,可单测)──────────────────────────────────────────────────
 
@@ -161,7 +162,8 @@ function SourceBadge({ source }: { source?: SkillSource }) {
 
 function SkillCard({ entry }: { entry: SkillEntry }) {
   return (
-    <li className="rounded-xl border border-border bg-elevated px-3 py-2.5 shadow-soft">
+    // 条目已在 ToolCard(边框 + 体区底色)内,再套 rounded-xl + 阴影就是三层卡中卡(T-14):收成轻边框行。
+    <li className="rounded-lg border border-border/70 bg-surface px-3 py-2">
       <div className="flex items-start gap-2.5">
         <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
           <Sparkles size={14} />
@@ -293,8 +295,12 @@ function SkillViewInner({ v }: { v: SkillViewParse }) {
       </div>
       {v.body && (
         <details>
-          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">查看技能正文</summary>
-          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+          <summary className={INLINE_SUMMARY_CLS}>查看技能正文</summary>
+          <pre
+            // biome-ignore lint/a11y/noNoninteractiveTabindex: 有 max-h 的滚动区要能聚焦,键盘才能滚(T-23)
+            tabIndex={0}
+            className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
             {v.body}
           </pre>
         </details>

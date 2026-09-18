@@ -24,6 +24,11 @@ import {
   PERMANENT_AUDIT_TABLES,
   PERMANENT_OPS_LEDGER_TABLES,
 } from "./auditRetention.js";
+import {
+  isBoundedReadTimeout,
+  withBoundedReadOnly,
+  type BoundedReadPool,
+} from "../db/boundedReadOnly.js";
 
 export type RetentionDisposition =
   | { kind: "ttl" }
@@ -293,3 +298,95 @@ function buildRetentionRegistry(): Readonly<Record<string, RetentionDisposition>
 /** 全表 retention 离场语义单一权威(模块加载即校验无重复登记)。 */
 export const RETENTION_REGISTRY: Readonly<Record<string, RetentionDisposition>> =
   buildRetentionRegistry();
+
+/** Creation source is independent of retention; metadata never grants permanent identity. */
+export interface HistoricalManualTable {
+  source: "historical-manual";
+  owner: string;
+  evidence: string;
+}
+
+/** Exact historical presence exceptions, not a prefix/regex backup allowlist.
+ * Creation SQL is not known; do not manufacture this table on fresh installs.
+ * Permanent identity continues to come only from PERMANENT_OPS_LEDGER_TABLES.
+ */
+export const HISTORICAL_MANUAL_TABLES: Readonly<Record<string, HistoricalManualTable>> = Object.freeze({
+  model_pricing_0903_cw_backup: Object.freeze({
+    source: "historical-manual" as const,
+    owner: "selfhost-ops",
+    evidence: "OCV5-180 C live-table audit; permanent registration 3ec290e1; presence contract approved 2026-09-09. Creation SQL unverified.",
+  }),
+});
+
+/** Fail closed on stale/invalid metadata; all other registered tables are migration-owned. */
+export function buildFreshRetentionTables(
+  registry: Readonly<Record<string, RetentionDisposition>> = RETENTION_REGISTRY,
+  historical: Readonly<Record<string, HistoricalManualTable>> = HISTORICAL_MANUAL_TABLES,
+  ttlTables: readonly string[] = AUDIT_RETENTION_POLICIES.map((p) => p.table),
+): readonly string[] {
+  const ttl = new Set(ttlTables);
+  for (const [table, meta] of Object.entries(historical)) {
+    if (!Object.hasOwn(registry, table)) {
+      throw new Error(`[retentionRegistry] historical source is not registered: ${table}`);
+    }
+    if (registry[table]?.kind !== "permanent-ledger" || ttl.has(table)) {
+      throw new Error(`[retentionRegistry] historical source must already be permanent-ledger and not TTL: ${table}`);
+    }
+    if (meta?.source !== "historical-manual" ||
+        typeof meta.owner !== "string" || !meta.owner.trim() ||
+        typeof meta.evidence !== "string" || !meta.evidence.trim()) {
+      throw new Error(`[retentionRegistry] invalid historical source/owner/evidence: ${table}`);
+    }
+  }
+  return Object.freeze(Object.keys(registry).filter((table) => !Object.hasOwn(historical, table)).sort());
+}
+
+/** Derived from the full registry and validated on module load, never a second table inventory. */
+export const FRESH_RETENTION_TABLES = buildFreshRetentionTables();
+
+/** Fresh schema rejects unknown physical tables and missing migration-owned tables.
+ * Live coverage below deliberately still uses the FULL registry, not this fresh subset.
+ */
+export function compareFreshRetentionCoverage(dbTables: Iterable<string>): {
+  undeclared: string[];
+  phantom: string[];
+} {
+  const physical = new Set(dbTables);
+  return {
+    undeclared: [...physical].filter((table) => !Object.hasOwn(RETENTION_REGISTRY, table)).sort(),
+    phantom: FRESH_RETENTION_TABLES.filter((table) => !physical.has(table)),
+  };
+}
+
+/**
+ * Live-only coverage: public base tables present in `pool` but missing from
+ * RETENTION_REGISTRY. Read-only; never DROP/TTL. Handmade live tables such as
+ * model_pricing_0903_cw_backup must be claimed as permanent-ledger so this
+ * returns []. Timeouts/errors must not be reported as an empty (green) set.
+ */
+export async function auditLiveRetentionCoverage(
+  pool: BoundedReadPool,
+  options?: { statementTimeoutMs?: number },
+): Promise<{ unregistered: string[] | null; unknown: boolean; reason?: string }> {
+  try {
+    return await withBoundedReadOnly(pool, options?.statementTimeoutMs ?? 5_000, async (client) => {
+      const live = await client.query<{ table_name: string }>(
+        `SELECT table_name
+           FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
+      );
+      const registered = new Set(Object.keys(RETENTION_REGISTRY));
+      const unregistered = live.rows
+        .map((row) => row.table_name)
+        .filter((name) => !registered.has(name))
+        .sort();
+      return { unregistered, unknown: false as const };
+    });
+  } catch (err) {
+    return {
+      unregistered: null,
+      unknown: true,
+      reason: isBoundedReadTimeout(err) ? "timeout" : ((err as Error)?.message ?? String(err)),
+    };
+  }
+}

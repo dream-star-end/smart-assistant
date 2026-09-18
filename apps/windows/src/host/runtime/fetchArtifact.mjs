@@ -50,7 +50,10 @@ export function createArtifactTlsOptions({ url, spkiPin, publicOrigin, caPem }) 
     minVersion: 'TLSv1.3',
     maxVersion: 'TLSv1.3',
   }
-  if (spkiPin) {
+  // Public-origin artifacts use the system trust store. Host 18445 SPKI pin +
+  // device CA would replace Node's default CAs and fail Let's Encrypt
+  // (and pin-mismatch the public leaf). Pin/CA apply only to non-public origins.
+  if (!samePublic && spkiPin) {
     opts.checkServerIdentity = createSpkiPinChecker(spkiPin)
     if (caPem) opts.ca = caPem
   }

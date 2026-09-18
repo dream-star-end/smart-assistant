@@ -9,7 +9,11 @@ import {
   USE_CASE_MAX_LEN,
   USE_CASE_MIN_LEN,
   USE_CASES_MAX,
+  clearPublishDraft,
+  loadPublishDraft,
   marketplaceArtifactKind,
+  publishDraftStorageKey,
+  savePublishDraft,
   suggestSlug,
   validateHumanMeta,
 } from "../../lib/marketplace";
@@ -22,10 +26,12 @@ import type {
   SkillSummary,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { skillDisplayTitle } from "../manage/skillDisplay";
 import {
   Alert,
   Badge,
   Button,
+  Checkbox,
   Field,
   IconButton,
   Input,
@@ -283,10 +289,16 @@ const TOOLSET_OPTIONS: { value: string; label: string; hint: string; locked?: bo
   { value: "web_context", label: "网页提取", hint: "抓取网页 / 文档" },
 ];
 
+/** 缺项超过这个数就折成「还差 N 项必填 · 查看」,点开才列全(K-21)。 */
+const MISSING_INLINE_MAX = 3;
+
 /**
  * 常驻底部操作条:左侧实时播报"还差哪几项必填"+ 本次提交的失败原因,右侧主按钮。
  * 提交按钮**不禁用** —— 点击即定位到首个缺项,比一个灰按钮更能推进用户;
  * 未填齐时降为 secondary 做视觉弱化。
+ *
+ * 缺项清单默认只在 ≤3 项时全列:空表单一上来就是 6 项,390px 下播报两行 + 失败原因 +
+ * 按钮吃掉约 130px 表单可视区;超过阈值折成「还差 N 项必填 · 查看」,想看全的人点一下。
  */
 function SubmitBar({
   missing,
@@ -299,12 +311,48 @@ function SubmitBar({
   submitting: boolean;
   onSubmit: () => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const collapsed = missing.length > MISSING_INLINE_MAX && !expanded;
   return (
     <div className="sticky bottom-0 -mx-4 flex flex-wrap items-center justify-between gap-2 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur">
       <div className="min-w-0 flex-1 basis-40">
         {missing.length > 0 ? (
           <p className="text-caption text-warning">
-            还差 {missing.length} 项必填：{missing.join("、")}
+            还差 {missing.length} 项必填
+            {collapsed ? (
+              <>
+                {" · "}
+                <button
+                  type="button"
+                  // 行内文字钮桌面只有一行高(16px);触屏补 44px 命中高与左右内距,桌面零变化
+                  //(t-894 复扫计划外发现:K-21 折叠播报是 t-762 扫描之后才合入的)。
+                  // 两个字只有 38px 宽,触控靶要两边都 ≥44:再补 min-w-11(QA t-1232 复扫 market-publish* ×5 仍命中 38×44)。
+                  className="inline-flex items-center justify-center rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:px-2"
+                  aria-expanded={false}
+                  onClick={() => setExpanded(true)}
+                >
+                  查看
+                </button>
+              </>
+            ) : (
+              <>
+                ：{missing.join("、")}
+                {missing.length > MISSING_INLINE_MAX && (
+                  <>
+                    {" "}
+                    <button
+                      type="button"
+                      // 与「查看」同一副触控档:展开态的「收起」此前完全没补(QA t-1232)。
+                      className="inline-flex items-center justify-center rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:px-2"
+                      aria-expanded={true}
+                      onClick={() => setExpanded(false)}
+                    >
+                      收起
+                    </button>
+                  </>
+                )}
+              </>
+            )}
           </p>
         ) : (
           <p className="text-caption text-faint">{SUBMIT_HINT}</p>
@@ -502,15 +550,24 @@ type DraftApi<T extends object> = {
    * 写入方(技能导入)用:它不碰商品信息,就不该因为用户填了分类而问一句废话。
    */
   isDirty: (keys?: readonly (keyof T & string)[]) => boolean;
+  /** 本次挂载是从 localStorage 恢复的草稿（用户没在这一轮里写过）——表单顶部据此给一条「已恢复」提示。 */
+  restored: boolean;
 };
+
+/** 草稿落盘的防抖间隔：敲字不必每键写一次 localStorage。 */
+const DRAFT_PERSIST_MS = 300;
 
 function useDraft<T extends object>(
   create: () => T,
   interactionFlags: readonly (keyof T & string)[] = NO_INTERACTION_FLAGS,
+  /** 传入即启用落盘（K-01）：挂载时读回、写入时防抖存、reset / 清空后删除。 */
+  persistKey?: string,
 ): DraftApi<T> {
-  const [state, setState] = useState<{ value: T; baseline: T }>(() => {
+  const [state, setState] = useState<{ value: T; baseline: T; restored: boolean }>(() => {
     const v = create();
-    return { value: v, baseline: v };
+    const stored = persistKey ? loadPublishDraft(persistKey, create) : null;
+    // 恢复的内容相对空表单基线就是"脏"的：关弹窗时会提示已暂存，覆盖写前会二次确认。
+    return stored ? { value: stored, baseline: v, restored: true } : { value: v, baseline: v, restored: false };
   });
   const createRef = useRef(create);
   createRef.current = create;
@@ -524,13 +581,13 @@ function useDraft<T extends object>(
   const seed = useCallback((patch: Partial<T> | ((cur: T) => Partial<T>)) => {
     setState((s) => {
       const p = typeof patch === "function" ? patch(s.value) : patch;
-      return { value: { ...s.value, ...p }, baseline: { ...s.baseline, ...p } };
+      return { ...s, value: { ...s.value, ...p }, baseline: { ...s.baseline, ...p } };
     });
   }, []);
   const reset = useCallback(() => {
     setState(() => {
       const v = createRef.current();
-      return { value: v, baseline: v };
+      return { value: v, baseline: v, restored: false };
     });
   }, []);
 
@@ -552,9 +609,20 @@ function useDraft<T extends object>(
     [changed],
   );
 
+  // 落盘：有内容就防抖写一份，写空了 / reset 后删掉 —— 存储里永远只有"值得恢复"的草稿。
+  const dirty = changed.size > 0;
+  useEffect(() => {
+    if (!persistKey) return;
+    const t = window.setTimeout(() => {
+      if (dirty) savePublishDraft(persistKey, state.value);
+      else clearPublishDraft(persistKey);
+    }, DRAFT_PERSIST_MS);
+    return () => window.clearTimeout(t);
+  }, [persistKey, dirty, state.value]);
+
   return useMemo(
-    () => ({ value: state.value, set, seed, reset, isDirty }),
-    [state.value, set, seed, reset, isDirty],
+    () => ({ value: state.value, set, seed, reset, isDirty, restored: state.restored }),
+    [state.value, state.restored, set, seed, reset, isDirty],
   );
 }
 
@@ -592,6 +660,7 @@ export function PublishPanel({
   publishesError = null,
   onRefreshPublishes = () => {},
   onMutePublishTransition = () => {},
+  onDirtyChange,
 }: {
   auth: AuthSession;
   /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
@@ -602,11 +671,19 @@ export function PublishPanel({
   publishesError?: string | null;
   onRefreshPublishes?: () => void;
   onMutePublishTransition?: (versionId: string, muted: boolean) => void;
+  /** 三份草稿任一有未提交内容时为 true —— 市场壳据此在关弹窗时提示「草稿已暂存」。 */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [kind, setKind] = useState<PublishKind>("skill");
-  const skill = useDraft(emptySkillDraft, INTERACTION_FLAGS);
-  const agent = useDraft(emptyAgentDraft, INTERACTION_FLAGS);
-  const connector = useDraft(emptyConnectorDraft);
+  // 草稿按类型各落一份 localStorage（K-01）：关弹窗 / 刷新 / 换中心都不丢，下次打开原样恢复。
+  const skill = useDraft(emptySkillDraft, INTERACTION_FLAGS, publishDraftStorageKey("skill"));
+  const agent = useDraft(emptyAgentDraft, INTERACTION_FLAGS, publishDraftStorageKey("agent"));
+  const connector = useDraft(emptyConnectorDraft, NO_INTERACTION_FLAGS, publishDraftStorageKey("connector"));
+  const anyDirty = skill.isDirty() || agent.isDirty() || connector.isDirty();
+  useEffect(() => {
+    onDirtyChange?.(anyDirty);
+  }, [anyDirty, onDirtyChange]);
+  const current = kind === "skill" ? skill : kind === "agent" ? agent : connector;
   // null = 跟随"有待办自动展开";true/false = 用户或完成态显式指定过。
   const [publishesOpen, setPublishesOpen] = useState<boolean | null>(null);
   const [refill, setRefill] = useState<RefillNotice | null>(null);
@@ -735,6 +812,20 @@ export function PublishPanel({
         aria-labelledby={`publish-kind-tab-${kind}`}
         className="flex flex-col gap-4"
       >
+        {current.restored && current.isDirty() && (
+          <Alert
+            tone="info"
+            density="compact"
+            title="已恢复上次未提交的草稿"
+            action={
+              <Button size="sm" variant="secondary" onClick={() => current.reset()}>
+                丢弃草稿
+              </Button>
+            }
+          >
+            这是你上次没提交就离开时填的内容，可以接着改；不需要就丢弃，重新开始。
+          </Alert>
+        )}
         {refill && refill.kind === kind && (
           <Alert
             tone="warning"
@@ -854,9 +945,11 @@ function SkillPublishForm({
     // 导入会覆盖 IMPORT_OVERWRITES 里的每一个字段(不含商品信息)—— 其中任何一个已被
     // 用户写过就必须先确认,一次误点不能吃掉草稿。字段清单直接来自下面的 draft.set,
     // 两处改一处必改:漏一个就是"用户写的内容被静默替换"。
+    // 确认框与提示里的名字跟芯片一致(展示名),用户刚点的是什么就写什么(K-10)。
+    const shownName = skillDisplayTitle(sk).title;
     if (draft.isDirty(IMPORT_OVERWRITES)) {
       const go = await confirmDialog({
-        title: `用「${sk.name}」覆盖当前内容？`,
+        title: `用「${shownName}」覆盖当前内容？`,
         body: "已填写的名称、标识、描述、标签、正文与附属文件会被这次导入替换，不可撤销。",
         confirmText: "覆盖导入",
         danger: true,
@@ -912,7 +1005,10 @@ function SkillPublishForm({
       loadedCount = loaded.length;
       draft.set({ body: detail.body ?? "", files: loaded });
     } catch {
-      setImportNote({ tone: "warning", text: `「${sk.name}」的正文没能读到，请手动填写技能正文。` });
+      setImportNote({
+        tone: "warning",
+        text: `「${shownName}」的正文没能读到，请手动填写技能正文。`,
+      });
       setImporting(null);
       return;
     }
@@ -1063,19 +1159,26 @@ function SkillPublishForm({
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-1.5">
-                  {mySkills.map((sk) => (
-                    <Button
-                      key={sk.name}
-                      variant="secondary"
-                      size="sm"
-                      shape="pill"
-                      loading={importing === sk.name}
-                      disabled={importing !== null}
-                      onClick={() => void importSkill(sk)}
-                    >
-                      {sk.name}
-                    </Button>
-                  ))}
+                  {/* 芯片用管理中心同一套展示名(描述首行),不再把 slug 当名字混排(K-10);
+                      slug 进 aria-label / title 供核对,与 manage 技能列表口径一致。 */}
+                  {mySkills.map((sk) => {
+                    const shown = skillDisplayTitle(sk);
+                    return (
+                      <Button
+                        key={sk.name}
+                        variant="secondary"
+                        size="sm"
+                        shape="pill"
+                        loading={importing === sk.name}
+                        disabled={importing !== null}
+                        onClick={() => void importSkill(sk)}
+                        aria-label={shown.caption ? `${shown.title}（${sk.name}）` : sk.name}
+                        title={shown.caption}
+                      >
+                        {shown.title}
+                      </Button>
+                    );
+                  })}
                 </div>
               )}
               {importNote && (
@@ -1661,25 +1764,26 @@ function AgentPublishForm({
               {TOOLSET_OPTIONS.map((t) => {
                 const checked = d.toolsets.includes(t.value);
                 return (
-                  <label
+                  // K-27:ui/Checkbox 原语;卡片式外观仍由这里的 className 决定(原语只管控件 + 触控靶)。
+                  // 「必选」项 disabled 但不压暗:它是已勾定的事实,不是不可用的选项。
+                  <Checkbox
                     key={t.value}
                     className={cn(
-                      "flex items-center gap-2 rounded-lg border px-3 py-2 text-body transition-colors [@media(hover:none)]:min-h-11",
+                      "flex items-center rounded-lg border px-3 py-2 transition-colors",
                       checked ? "border-accent/50 bg-accent-soft text-fg" : "border-border text-muted",
-                      t.locked ? "cursor-not-allowed" : "cursor-pointer",
+                      t.locked && "opacity-100",
                     )}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={t.locked}
-                      onChange={() => toggleToolset(t.value)}
-                      className="accent-accent"
-                    />
-                    <span className="font-medium">{t.label}</span>
-                    <span className="text-caption text-faint">{t.hint}</span>
-                    {t.locked && <Badge size="sm">必选</Badge>}
-                  </label>
+                    checked={checked}
+                    disabled={t.locked}
+                    onChange={() => toggleToolset(t.value)}
+                    label={
+                      <span className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{t.label}</span>
+                        <span className="text-caption text-faint">{t.hint}</span>
+                        {t.locked && <Badge size="sm">必选</Badge>}
+                      </span>
+                    }
+                  />
                 );
               })}
             </div>
@@ -2195,7 +2299,8 @@ function MyPublishes({
         type="button"
         onClick={() => onOpenChange(!isOpen)}
         aria-expanded={isOpen}
-        aria-controls="my-publishes-list"
+        // 列表只在展开时挂载:收起态不能留一个指向空气的 IDREF(t-762 market#2;同 SkillsPanel 写法)。
+        aria-controls={isOpen ? "my-publishes-list" : undefined}
         className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <ChevronRight

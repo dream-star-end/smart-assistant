@@ -85,6 +85,9 @@ export const TURN_ERROR_TAXONOMY = {
   auth_error: { retryable: false, cta: 'relogin' },
   service_restart: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
+  /** Soft-deleted conversation. Same-peer retry cannot revive it; restore from
+   * the recycle bin (or start a new session) is the only recovery. */
+  session_deleted: { retryable: false, cta: 'new_session', expected: true, reportable: false },
   /** bridge bindAuthorityTurnDispatch 失败(含 cron-origin 未收养成功)。手动重试走新 dispatch。 */
   durable_dispatch_unavailable: { retryable: true, cta: 'retry' },
   stopped: { retryable: false, cta: 'none', expected: true, reportable: false },
@@ -166,6 +169,7 @@ const LEGACY_CODE_ALIASES: Record<string, TurnErrorCode> = {
   CODEX_ERROR: 'engine_error',
   INSUFFICIENT_CREDITS: 'insufficient_credits',
   DURABLE_DISPATCH_UNAVAILABLE: 'durable_dispatch_unavailable',
+  SESSION_DELETED: 'session_deleted',
   ERR_INSUFFICIENT_CREDITS: 'insufficient_credits',
   UNAUTHORIZED_MODEL: 'unauthorized_model',
   MAINTENANCE: 'maintenance',

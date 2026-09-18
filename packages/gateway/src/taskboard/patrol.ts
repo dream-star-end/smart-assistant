@@ -251,6 +251,7 @@ export async function lookupUsageFromSessionLog(
     tokensIn: summary.totalInputTokens,
     tokensOut: summary.totalOutputTokens,
     costUsd: summary.totalCostUsd,
+    costImprecise: null, // usage_log has no provenance; never infer precision from USD.
   }
 }
 
@@ -272,7 +273,8 @@ export function mergeRunUsage(
     tokensIn: base.tokensIn ?? extra.tokensIn,
     tokensOut: base.tokensOut ?? extra.tokensOut,
     costUsd: base.costUsd ?? extra.costUsd,
-    costImprecise: base.costImprecise ?? extra.costImprecise,
+    // Keep provenance attached to the amount it describes, not another source.
+    costImprecise: base.costUsd != null ? base.costImprecise ?? null : extra.costImprecise ?? null,
   }
 }
 

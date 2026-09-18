@@ -1,4 +1,4 @@
-import { Copy, ExternalLink } from "lucide-react";
+import { Copy, ExternalLink, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { savePendingPayment, type PendingPayment } from "../../lib/pendingPayment";
@@ -88,8 +88,15 @@ export function HupijiaoPaymentEntry({
   const client = paymentClientKind();
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
+  // 二维码是第三方图片，加载失败时不能只剩一张裂图（审计 SET-31）：给出说明与「重新获取」。
+  const [qrFailed, setQrFailed] = useState(false);
   const remaining = expiresAt ? remainingPaymentMs(expiresAt, now) : null;
   const expired = remaining === 0;
+
+  // 换了订单（重新下单）→ 新的二维码 URL，失败态复位。
+  useEffect(() => {
+    setQrFailed(false);
+  }, [qrcodeUrl]);
 
   useEffect(() => {
     if (!expiresAt) return;
@@ -221,6 +228,28 @@ export function HupijiaoPaymentEntry({
     );
   }
 
+  if (qrFailed) {
+    return (
+      <div className="flex w-full flex-col items-center gap-2">
+        {meta}
+        <Alert tone="warning" className="w-full text-meta" data-testid="payment-qr-failed">
+          二维码加载失败，请检查网络后重新获取；若已完成支付，到账后会自动确认。
+        </Alert>
+        {onReorder ? (
+          <Button
+            variant="secondary"
+            size="md"
+            className="w-full"
+            data-testid="payment-qr-retry"
+            onClick={() => onReorder()}
+          >
+            <RefreshCw size={16} /> 重新获取二维码
+          </Button>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <>
       {meta}
@@ -232,6 +261,7 @@ export function HupijiaoPaymentEntry({
           width={200}
           height={200}
           className="size-[200px] object-contain"
+          onError={() => setQrFailed(true)}
         />
       </div>
       <div className="flex items-center gap-1.5 text-meta text-faint">

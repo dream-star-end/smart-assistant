@@ -16,9 +16,7 @@ export type SettingsDestinationSection =
   | "preferences"
   | "hotkeys"
   | "feedback"
-  | "about"
-  | "github"
-  | "plugins";
+  | "about";
 export type MarketplaceDestinationTab = "browse" | "installed" | "publish";
 export type MarketplaceDestinationKind = "skill" | "agent" | "connector";
 export type OrgDestinationSection = "overview" | "members" | "skills" | "reports" | "invoices";
@@ -190,6 +188,16 @@ export const PRODUCT_CAPABILITIES = {
     category: "extend",
     icon: "users",
     aliases: ["并行", "委派", "队长", "审查", "多 Agent", "团队"],
+    destination: { kind: "agent-picker" },
+    requirements: ["authenticated"],
+  },
+  advisorMode: {
+    id: "advisor-mode",
+    title: "给全能助手配一个只出主意的顾问",
+    shortTitle: "顾问模式",
+    category: "extend",
+    icon: "users",
+    aliases: ["顾问", "咨询", "第二意见", "advisor"],
     destination: { kind: "agent-picker" },
     requirements: ["authenticated"],
   },

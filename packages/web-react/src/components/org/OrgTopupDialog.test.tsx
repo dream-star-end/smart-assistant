@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../../lib/authSession";
-import { OrgTopupDialog, yuanToCents } from "./OrgTopupDialog";
+import { creditedDelta, OrgTopupDialog, yuanToCents } from "./OrgTopupDialog";
 
 const apiMocks = vi.hoisted(() => ({
   orgTopup: vi.fn(),
@@ -10,6 +10,11 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../lib/api", () => ({ api: apiMocks }));
+vi.mock("../../lib/clientFriction", () => ({
+  reportClientFrictionOnce: vi.fn(() => "eid"),
+  reportClientFriction: vi.fn(() => "eid"),
+  resetClientFrictionOnceForTests: vi.fn(),
+}));
 
 afterEach(() => {
   cleanup();
@@ -52,6 +57,57 @@ describe("yuanToCents（元 → 分，纯字符串/BigInt，禁浮点）", () =>
     expect(yuanToCents("1,000")).toBeNull();
     expect(yuanToCents("1e3")).toBeNull();
   });
+});
+
+describe("creditedDelta（到账积分 = 到账后余额 − 基线，字符串大数）", () => {
+  test("正常增长返回差值", () => {
+    expect(creditedDelta("1500", "1000")).toBe("500");
+    expect(creditedDelta("9007199254740993", "1")).toBe("9007199254740992");
+  });
+  test("未增长 / 非法 → null", () => {
+    expect(creditedDelta("1000", "1000")).toBeNull();
+    expect(creditedDelta("900", "1000")).toBeNull();
+    expect(creditedDelta("abc", "1000")).toBeNull();
+  });
+});
+
+test("填额段说明到账规则与核对入口（后端未下发汇率，审计 SET-09）", () => {
+  render(
+    <OrgTopupDialog
+      open
+      auth={createMemoryAuthSession(() => {}, "t")}
+      baselineCredits="1000"
+      onClose={() => {}}
+      onPaid={() => {}}
+    />,
+  );
+  expect(screen.getByTestId("org-topup-rate-note")).toHaveTextContent("到账积分 = 支付金额 × 平台汇率");
+  expect(screen.getByTestId("org-topup-rate-note")).toHaveTextContent("概览 → 组织钱包余额");
+});
+
+test("到账后显示实际入账积分数", async () => {
+  apiMocks.orgTopup.mockResolvedValue({
+    orderNo: "org-topup-2",
+    qr: "https://pay.test/qr.png",
+    mobileUrl: null,
+  });
+  // 下单时基线 1000，首个轮询 tick 即读到 6000 → 入账 5000。
+  apiMocks.getOrgBalance.mockResolvedValueOnce("1000").mockResolvedValue("6000");
+  const onPaid = vi.fn();
+  render(
+    <OrgTopupDialog
+      open
+      auth={createMemoryAuthSession(() => {}, "t")}
+      baselineCredits="1000"
+      onClose={() => {}}
+      onPaid={onPaid}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "¥500" }));
+  fireEvent.click(screen.getByRole("button", { name: "发起充值" }));
+  expect(await screen.findByText("已到账 ¥500.00")).toBeInTheDocument();
+  expect(screen.getByTestId("org-topup-credited")).toHaveTextContent("入账 5,000 积分");
+  expect(onPaid).toHaveBeenCalledTimes(1);
 });
 
 test("组织充值下单后把 mobileUrl 透传到手机支付入口", async () => {

@@ -62,6 +62,9 @@ export interface PromptQueueDetail {
     modelSwitchId?: string
     effortLevel?: string | null
     teamMode?: boolean
+    collabMode?: 'solo' | 'advisor' | 'team'
+    advisorModel?: string
+    collabConfigVersion?: string
     contextTier?: CursorContextTier
   }
   deliveryIntent?: {
@@ -481,7 +484,7 @@ function assertOwner(value: unknown, expected: PromptQueueWireOwner, userId: str
 
 function assertRequestedExecution(value: unknown, agentId: string): void {
   const execution = record(value, 'requestedExecution')
-  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode', 'contextTier'], 'requestedExecution')
+  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier'], 'requestedExecution')
   if (execution.agentId !== agentId) invalidResponse('requestedExecution.agentId mismatch')
   if (execution.model !== undefined && typeof execution.model !== 'string')
     invalidResponse('requestedExecution.model invalid')
@@ -498,6 +501,20 @@ function assertRequestedExecution(value: unknown, agentId: string): void {
   }
   if (execution.teamMode !== undefined && typeof execution.teamMode !== 'boolean') {
     invalidResponse('requestedExecution.teamMode invalid')
+  }
+  if (
+    execution.collabMode !== undefined &&
+    execution.collabMode !== 'solo' &&
+    execution.collabMode !== 'advisor' &&
+    execution.collabMode !== 'team'
+  ) {
+    invalidResponse('requestedExecution.collabMode invalid')
+  }
+  if (execution.advisorModel !== undefined && typeof execution.advisorModel !== 'string') {
+    invalidResponse('requestedExecution.advisorModel invalid')
+  }
+  if (execution.collabConfigVersion !== undefined && typeof execution.collabConfigVersion !== 'string') {
+    invalidResponse('requestedExecution.collabConfigVersion invalid')
   }
   if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) {
     invalidResponse('requestedExecution.contextTier invalid')

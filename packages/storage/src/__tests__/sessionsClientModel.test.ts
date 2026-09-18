@@ -24,6 +24,7 @@ process.env.OPENCLAUDE_HOME = testHome
 const {
   deleteClientSession,
   getClientSession,
+  getClientSessionCollabParent,
   getClientSessionPartial,
   getSessionsDb,
   listClientSessions,
@@ -131,5 +132,28 @@ describe('client_sessions.model_id(会话级模型选择)', () => {
     await deleteClientSession('sess-model-4', USER)
     const deleted = await setClientSessionModel('sess-model-4', USER, 'kimi-k3')
     assert.equal(deleted.ok, false)
+  })
+})
+
+describe('getClientSessionCollabParent(lightweight, no tape)', () => {
+  beforeEach(clearTables)
+
+  it('returns owner/agent/model for the bound user and misses others', async () => {
+    await upsertClientSession(
+      baseSession('collab-parent-1', {
+        modelId: 'glm-5.2',
+        messages: [{ id: 'm1', role: 'user', text: 'do not hydrate', ts: 1 }],
+      }),
+      0,
+    )
+    const mine = await getClientSessionCollabParent('collab-parent-1', USER)
+    assert.deepEqual(mine, {
+      sessionId: 'collab-parent-1',
+      userId: USER,
+      agentId: 'main',
+      modelId: 'glm-5.2',
+    })
+    assert.equal(await getClientSessionCollabParent('collab-parent-1', 'c:other'), null)
+    assert.equal(await getClientSessionCollabParent('missing', USER), null)
   })
 })

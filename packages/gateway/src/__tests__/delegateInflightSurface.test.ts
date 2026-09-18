@@ -1,3 +1,6 @@
+import { installDelegateSandbox } from './helpers/delegateSandbox.js'
+const sandbox = installDelegateSandbox()
+
 /**
  * OCV5-22 R2: session-level inflight surface.
  *

@@ -1,12 +1,13 @@
-import { Coins } from 'lucide-react'
+import { Coins, RefreshCw } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
+import { useProjectScope } from '../../hooks/useProjectScope'
 import { AuthEpochStaleError } from '../../lib/api'
+import { boardWorkQuery } from '../../lib/projectScope'
 import {
   COST_GROUP_BY,
   COST_GROUP_BY_LABEL,
   type CostGroupBy,
   type CostStatsResult,
-  type Project,
   formatCostMoneyLine,
   formatCount,
   formatTokenUsage,
@@ -14,9 +15,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { useProjectScope } from '../../hooks/useProjectScope'
-import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
-import { Button, Card, EmptyState, Field, Input, ListSkeleton, ProjectScopeSelect, Select, StatCard } from '../ui'
+import { Button, Card, EmptyState, Field, Input, ListSkeleton, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
 const TZ = 'Asia/Shanghai'
@@ -40,15 +39,11 @@ export function addDaysYmd(ymd: string, delta: number): string {
   return `${yy}-${mm}-${dd}`
 }
 
-export function CostStatsView({
-  auth,
-  projectId,
-  projects,
-}: {
-  auth: AuthSession
-  projectId: string | null
-  projects: Project[]
-}) {
+/**
+ * 成本统计。项目范围只认顶栏那一个 ProjectScopeSelect(以前工具栏里还挂着第二个,同一全局 scope
+ * 一屏两个选择器,审计 T-21);原先的 `projectId` / `projects` prop 从未参与请求或渲染,已删(审计 T-20)。
+ */
+export function CostStatsView({ auth }: { auth: AuthSession }) {
   const { scope } = useProjectScope()
   const workQuery = boardWorkQuery(scope)
   const scopedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
@@ -56,20 +51,16 @@ export function CostStatsView({
   const [from, setFrom] = useState(() => addDaysYmd(today, -6))
   const [to, setTo] = useState(today)
   const [groupBy, setGroupBy] = useState<CostGroupBy>('day')
-  const [filterProject, setFilterProject] = useState(projectId ?? '')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [stats, setStats] = useState<CostStatsResult | null>(null)
-
-  useEffect(() => {
-    setFilterProject(projectId ?? '')
-  }, [projectId])
+  const rangeInvalid = Boolean(from && to && from > to)
 
   const load = useCallback(async () => {
-    if (!scopedProjectId) {
+    if (!scopedProjectId || rangeInvalid) {
       setLoading(false)
       setError(null)
-      setStats(null)
+      if (!scopedProjectId) setStats(null)
       return
     }
     setLoading(true)
@@ -90,7 +81,7 @@ export function CostStatsView({
     } finally {
       setLoading(false)
     }
-  }, [auth, from, groupBy, scopedProjectId, to])
+  }, [auth, from, groupBy, rangeInvalid, scopedProjectId, to])
 
   useEffect(() => {
     void load()
@@ -100,20 +91,22 @@ export function CostStatsView({
     <div
       data-testid="cost-stats"
       className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4"
+      aria-busy={loading || undefined}
     >
       <div>
         <h2 className="text-title font-semibold text-fg">成本统计</h2>
         <p className="mt-1 text-caption text-muted">
-          任务看板 tb_project 自身统计，不含模型用量 usage_records。先看 token。美元只计有单价的执行；Cursor / Grok 等路由常把成本记成 0，不能当成没花钱。
+          只统计任务面板里 agent 执行的用量，不含你在对话里的模型用量。先看 token；部分模型路线不回传单价，金额只作参考、不代表免费。
         </p>
       </div>
       <div className="flex flex-wrap items-end gap-2">
-        <Field label="从" className="w-auto">
+        <Field label="从" className="w-auto" error={rangeInvalid ? '起始日不能晚于结束日' : undefined}>
           <Input
             aria-label="成本起始日"
             type="date"
             inputSize="sm"
             value={from}
+            max={to || undefined}
             onChange={(e) => setFrom(e.target.value)}
           />
         </Field>
@@ -123,6 +116,7 @@ export function CostStatsView({
             type="date"
             inputSize="sm"
             value={to}
+            min={from || undefined}
             onChange={(e) => setTo(e.target.value)}
           />
         </Field>
@@ -135,15 +129,24 @@ export function CostStatsView({
             options={COST_GROUP_BY.map((k) => ({ value: k, label: COST_GROUP_BY_LABEL[k] }))}
           />
         </Field>
-        <Field label="项目" className="min-w-[10rem]">
-          <ProjectScopeSelect variant="work" className="w-full" />
-        </Field>
-        <Button type="button" size="sm" variant="secondary" onClick={() => void load()}>
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          loading={loading && !!stats}
+          disabled={rangeInvalid || !scopedProjectId}
+          onClick={() => void load()}
+        >
+          <RefreshCw size={14} />
           刷新
         </Button>
       </div>
       {'blocked' in workQuery ? (
-        <EmptyState icon={Coins} title={UNBOUND_BOARD_COPY} hint="切换到已绑定看板的工作项目后再查看成本。" />
+        <EmptyState
+          icon={Coins}
+          title={workQuery.blocked}
+          hint="在顶栏切换到已绑定看板的工作项目后再查看成本。"
+        />
       ) : loading && !stats ? (
         <ListSkeleton rows={5} variant="card" />
       ) : error ? (
@@ -170,6 +173,23 @@ export function CostStatsView({
             </div>
             <CostCoverageBlock totals={stats.totals} />
           </Card>
+          {/* 合计之后、分桶之前:先看整体构成再看明细(审计 T-21 ⑤)。 */}
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+            <StatCard
+              label="有记录金额的执行"
+              value={formatCount(stats.totals.priced.runCount)}
+              hint={formatTokenUsage(stats.totals.priced.tokensIn, stats.totals.priced.tokensOut)}
+            />
+            <StatCard
+              label="没有单价的执行"
+              value={formatCount(stats.totals.unpriced.runCount)}
+              hint={formatTokenUsage(
+                stats.totals.unpriced.tokensIn,
+                stats.totals.unpriced.tokensOut,
+              )}
+              tone={stats.totals.unpriced.runCount > 0 ? 'warning' : 'neutral'}
+            />
+          </div>
           {stats.buckets.length === 0 ? (
             <EmptyState
               icon={Coins}
@@ -212,22 +232,6 @@ export function CostStatsView({
               ))}
             </div>
           )}
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-            <StatCard
-              label="有单价"
-              value={formatCount(stats.totals.priced.runCount)}
-              hint={formatTokenUsage(stats.totals.priced.tokensIn, stats.totals.priced.tokensOut)}
-            />
-            <StatCard
-              label="无单价"
-              value={formatCount(stats.totals.unpriced.runCount)}
-              hint={formatTokenUsage(
-                stats.totals.unpriced.tokensIn,
-                stats.totals.unpriced.tokensOut,
-              )}
-              tone={stats.totals.unpriced.runCount > 0 ? 'warning' : 'neutral'}
-            />
-          </div>
         </>
       )}
     </div>

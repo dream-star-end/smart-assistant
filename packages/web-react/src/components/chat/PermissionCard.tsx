@@ -5,18 +5,34 @@
  *    (Bash→命令、文件类→路径、浏览器→URL/动作),其余回落可折叠的格式化 JSON。
  *  - 审批 modal：普通工具 allow/deny；AskUserQuestion 走专用答题（单选/多选/其他/预览），
  *    提交把 `{ answers, annotations }` 经 updatedInput 回送（gateway 白名单校验）。
- *    ExitPlanMode 走计划确认框（markdown 计划书 + 按此执行/继续规划），不能无决策关掉。
+ *    ExitPlanMode 走计划确认框（markdown 计划书 + 按此执行/继续规划）；
+ *    关闭/收起只关 UI，不批准也不拒绝，卡片和待答入口可重开。
  *    modal 窄屏均为贴底 sheet(mobile="sheet")。
  *  - 全部经 props.onRespond（= useChatSocket.respondPermission，已绑 sessId）。
  */
-import { Check, Clock, HelpCircle, ShieldCheck, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, Check, Clock, HelpCircle, LoaderCircle, ShieldCheck, X } from "lucide-react";
+import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ChatMessage } from "../../lib/chat/model";
+import { isRecoveryTurnClientMessageId } from "../../lib/chat/pure";
 import { cn } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { asStr } from "../tool/format";
+import {
+  activeModalRequest,
+  dismissPermissionUi,
+  isDocumentForeground,
+  isPermissionUiDismissed,
+  markPermissionDisplayed,
+  reopenPermissionUi,
+  resetPermissionPopupCoordinator,
+  shouldAutoOpenPermission,
+  subscribePermissionCoordinator,
+  yieldActiveModal,
+  fetchPermissionFullInput,
+} from "../../lib/chat/permissionPopupCoordinator";
 import { resolveToolMeta, toolSummary } from "../tool/meta";
-import { Button, Modal } from "../ui";
+import { Alert, Button, Modal } from "../ui";
 
 export type PermissionRespond = (p: {
   requestId: string;
@@ -64,19 +80,12 @@ function isDetachedAskUserCard(msg: ChatMessage): boolean {
   );
 }
 
-/** Page-session memory of requestIds the user dismissed without answering.
- *  Live prompts must re-open after a timeline remount (CCB still waits);
- *  only an explicit close without allow/deny suppresses the next auto-open.
- *  ExitPlanMode never enters this set — the engine cannot proceed until the
- *  user picks 按此计划执行 / 继续规划. Refresh clears the set. */
-const dismissedPermissionRequestIds = new Set<string>();
-
 export function resetPermissionAutoOpenMemory(): void {
-  dismissedPermissionRequestIds.clear();
+  resetPermissionPopupCoordinator();
 }
 
 function rememberDismissedPermissionRequest(requestId: string | undefined): void {
-  if (requestId) dismissedPermissionRequestIds.add(requestId);
+  if (requestId) dismissPermissionUi(requestId);
 }
 
 export function isExitPlanModeTool(toolName: string | undefined): boolean {
@@ -92,18 +101,50 @@ export function extractExitPlanMarkdown(input: Record<string, unknown> | null | 
 
 /** Prefer the server-carried absolute expiry; fall back to ts + role TTL for
  *  old rows that never received `_askUserExpiresAt`. */
-export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolean {
+function permissionExpiresAt(msg: ChatMessage): number {
   const expiresAt = msg._askUserExpiresAt;
-  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
-    return now >= expiresAt;
-  }
-  if (!Number.isFinite(msg.ts)) return false;
-  // Blocking prompts (detached ask_user, ExitPlanMode) are not subject to the
-  // 30-minute idle TTL on the server either (gateway `BLOCKING_USER_INPUT_TOOLS`).
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) return expiresAt;
+  if (!Number.isFinite(msg.ts)) return Infinity;
   const ttlMs = isDetachedAskUserCard(msg) || isExitPlanModeTool(msg.toolName)
-    ? DETACHED_ASK_USER_TTL_MS
-    : PENDING_PERMISSION_TTL_MS;
-  return now - msg.ts > ttlMs;
+    ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
+  return msg.ts + ttlMs;
+}
+
+export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolean {
+  return now >= permissionExpiresAt(msg);
+}
+
+function permissionRemainingMs(msg: ChatMessage, now: number): number {
+  const expiresAt = permissionExpiresAt(msg);
+  return Number.isFinite(expiresAt) ? Math.max(0, expiresAt - now) : 0;
+}
+
+/** 剩余时长文案(审计 PC-06):≥ 90 分钟按小时说(detached ask_user 的 24h 不再显示「约 1440 分钟」)。 */
+export function formatPermissionRemaining(remainingMs: number): string {
+  const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+  if (minutes >= 90) return `约 ${Math.ceil(minutes / 60)} 小时内有效`;
+  return `约 ${minutes} 分钟内有效`;
+}
+
+/**
+ * 待决卡的一行摘要(审计 PC-02):不开审批框也能看到智能体到底要做什么。
+ * 与 PermissionInputSummary 同一套字段优先级(命令 > 文件 > 地址 > 内容 > meta 摘要),只取一条。
+ */
+function compactRequestSummary(
+  toolName: string,
+  input: Record<string, unknown> | null,
+): { kind: "command"; value: string } | { kind: "row"; label: string; value: string } | null {
+  const command = asStr(input?.command);
+  if (command) return { kind: "command", value: command };
+  const filePath = asStr(input?.file_path) || asStr(input?.path) || asStr(input?.notebook_path);
+  if (filePath) return { kind: "row", label: "文件", value: filePath };
+  const url = asStr(input?.url);
+  if (url) return { kind: "row", label: "地址", value: url };
+  const prompt = asStr(input?.prompt) || asStr(input?.query) || asStr(input?.text);
+  if (prompt) return { kind: "row", label: "内容", value: prompt };
+  const metaSummary = toolSummary(toolName, input);
+  if (metaSummary) return { kind: "row", label: "操作", value: metaSummary };
+  return null;
 }
 
 /** A prompt the runtime is (as far as this browser can tell) still blocked on:
@@ -189,7 +230,9 @@ function PermissionInputSummary({
       )}
       {json && json !== "{}" && (
         <details open={!hasStructured}>
-          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+          {/* 触屏下 summary 只有一行字高(16px,QA t-1232 复扫 permission-card-settled ×6 / pending-modal ×1):
+              与 media#2 / messages#2 / taskboard#2 同一约定,hover:none 时补 py-3.5 撑到 44px,桌面零变化。 */}
+          <summary className="cursor-pointer rounded text-caption text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:py-3.5">
             查看完整参数
           </summary>
           <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta text-muted">
@@ -206,6 +249,7 @@ export function PermissionCard({
   onRespond,
   readOnly = false,
   livePrompt = true,
+  renderMode = "both",
 }: {
   msg: ChatMessage;
   onRespond: PermissionRespond;
@@ -215,105 +259,257 @@ export function PermissionCard({
    *  只展示记录，绝不自动弹。默认 true 只为单卡单测保持「活卡挂载即弹」语义；
    *  列表层（MessageRenderer）始终传入 `inActiveTurn && sending`。 */
   livePrompt?: boolean;
+  /** card = 时间线记录；modal = 数据驱动弹窗宿主；both = 单测默认。 */
+  renderMode?: "card" | "modal" | "both";
 }) {
-  const questions = useMemo(() => asAskUserQuestion(msg), [msg]);
+  const questions = useMemo(() => asAskUserQuestion(msg), [msg, msg.inputJson, msg._inputTruncated]);
   const resolved = !!msg._resolved;
   const pending = msg._controlPending === true;
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
+  const [fullReady, setFullReady] = useState(() => msg._inputTruncated !== true);
   const isExitPlan = isExitPlanModeTool(msg.toolName);
   const input = permissionInput(msg);
   const planMarkdown = isExitPlan ? extractExitPlanMarkdown(input) : "";
+  const inputTruncated = msg._inputTruncated === true && !fullReady;
 
+  const [now, setNow] = useState(() => Date.now());
+  // Read the current clock for gating; Host's exact deadline must not use a stale display tick.
   const expired = !resolved && permissionHasExpired(msg);
-  const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt);
+  const remainingMs = !resolved && !expired ? permissionRemainingMs(msg, now) : 0;
+  const remainingUrgent = remainingMs > 0 && remainingMs < 2 * 60_000;
+  const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt) && !inputTruncated;
 
-  // 自动弹窗：仅活提问。时间线重挂会丢掉 useState(open)，必须再弹，
-  // 否则 CCB waitingForUserInput 会卡死而用户看不到确认框。
-  // 用户主动关掉（问答/普通权限）才记入 dismissed 集，阻止下一次自动弹。
   useEffect(() => {
-    if (!livePrompt || resolved || pending || readOnly || expired) return;
+    if (resolved) return;
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), remainingUrgent ? 1000 : 15_000);
+    return () => window.clearInterval(id);
+  }, [resolved, remainingUrgent, msg.requestId, msg.ts, msg._askUserExpiresAt]);
+
+  useEffect(() => {
+    const requestId = msg.requestId;
+    if (msg._inputTruncated !== true || !requestId) {
+      setFullReady(true);
+      return;
+    }
+    setFullReady(false);
+    let cancelled = false;
+    void fetchPermissionFullInput(requestId).then((full) => {
+      if (cancelled || !full) return;
+      if (msg.requestId !== requestId) return;
+      msg.inputJson = full;
+      msg._inputTruncated = false;
+      setFullReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [msg, msg.requestId, msg._inputTruncated]);
+
+  // 自动弹窗：仅前台活提问。后台挂载不记已弹；真正展示后才 mark。
+  // 关掉只关 UI，不批准/拒绝。未加载完整输入前不打开可答表单。
+  useEffect(() => {
+    if (renderMode === "card") return;
+    if (!livePrompt || resolved || pending || readOnly || expired || inputTruncated) return;
     const requestId = msg.requestId;
     if (!requestId) return;
-    if (!isExitPlan && dismissedPermissionRequestIds.has(requestId)) return;
+    if (!shouldAutoOpenPermission({ requestId, livePrompt })) return;
     setOpen(true);
-  }, [resolved, pending, readOnly, expired, livePrompt, isExitPlan, msg.requestId]);
+  }, [resolved, pending, readOnly, expired, livePrompt, inputTruncated, msg.requestId]);
+
+  useEffect(() => {
+    // Timeline cards are card-only and must not auto-open or occupy the slot
+    // (T3: visibilitychange would markDisplayed with no modal).
+    if (renderMode === "card") return;
+    if (!livePrompt || resolved || pending || readOnly || expired) return;
+    const onVis = () => {
+      const requestId = msg.requestId;
+      if (!requestId || !shouldAutoOpenPermission({ requestId, livePrompt })) return;
+      setOpen(true);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId, renderMode]);
+
+  useEffect(() => {
+    if (renderMode === "card") return;
+    if (open && isDocumentForeground() && msg.requestId) {
+      markPermissionDisplayed(msg.requestId);
+    }
+  }, [open, msg.requestId, renderMode]);
+
+  useEffect(() => {
+    return subscribePermissionCoordinator(() => {
+      const requestId = msg.requestId;
+      if (!requestId) return;
+      const active = activeModalRequest();
+      if (active && active !== requestId) {
+        setOpen(false);
+        return;
+      }
+      if (renderMode === "card") return;
+      if (shouldAutoOpenPermission({ requestId, livePrompt })) setOpen(true);
+    });
+  }, [livePrompt, msg.requestId, renderMode]);
+
+  useEffect(() => {
+    if (resolved && msg.requestId && renderMode !== "card") {
+      yieldActiveModal(msg.requestId);
+    }
+  }, [resolved, msg.requestId, renderMode]);
+
+  useEffect(() => {
+    const requestId = msg.requestId;
+    return () => {
+      // Timeline cards are card-only and must not yield on virtualization
+      // unmount (T5). Host/modal and standalone both-mode cards yield so a
+      // settled or replaced request cannot occupy the singleton slot.
+      if (requestId && renderMode !== "card") yieldActiveModal(requestId);
+    };
+  }, [msg.requestId, renderMode]);
 
   const handleDismissableOpenChange = (next: boolean) => {
     if (!next) rememberDismissedPermissionRequest(msg.requestId);
     setOpen(next);
   };
 
+  // Standalone compatibility only. Real timeline cards and modal instances do
+  // not own the pinned entry: PermissionPromptHost survives virtualization.
+  const showPendingBar = renderMode === "both" && canAnswer && livePrompt &&
+    !expired && !open && !isExitPlan && isPermissionUiDismissed(msg.requestId);
+
   // 状态图标(M7):lucide 替代 emoji。等待→Clock / 已允许→Check / 已拒绝→X。
-  const StatusIcon = !resolved ? Clock : behavior === "allow" ? Check : X;
-  const statusIconCls = !resolved ? "text-muted" : behavior === "allow" ? "text-success" : "text-danger";
-  const statusText = !resolved
-    ? pending
-      ? "正在提交…"
-      : expired
-        ? "已过期"
-        : questions
-          ? "等待回答…"
-          : isExitPlan
-            ? "等待确认计划…"
-            : "等待审批…"
-    : behavior === "allow"
-      ? questions
-        ? "已提交"
-        : isExitPlan
-          ? "已确认计划"
-          : "已允许"
-      : questions
-        ? "已跳过"
-        : isExitPlan
-          ? "继续规划"
-          : "已拒绝";
-  const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : "deny";
+  // 批准中(PC-16):本地已点允许、等 Master 回执的窗口里按钮已收走,只剩一行「正在提交…」灰字,
+  // 与「等待审批…」同一枚静止时钟看不出还在动;换成与 HUD 同款的旋转 LoaderCircle。
+  const StatusIcon = !resolved ? (pending ? LoaderCircle : Clock) : behavior === "allow" ? Check : X;
+  const statusIconCls = !resolved
+    ? pending ? "animate-spin text-accent" : "text-muted"
+    : behavior === "allow" ? "text-success" : "text-danger";
+  let statusText = "等待审批…";
+  if (!resolved) {
+    if (pending) statusText = "正在提交…";
+    else if (expired) statusText = "已过期";
+    else if (inputTruncated) statusText = "正在加载完整问题…";
+    else if (questions) statusText = "等待回答…";
+    else if (isExitPlan) statusText = "等待确认计划…";
+  } else if (behavior === "allow") {
+    statusText = questions ? "已提交" : isExitPlan ? "已确认计划" : "已允许";
+  } else if (behavior === "deny") {
+    statusText = questions ? "已跳过" : isExitPlan ? "继续规划" : "已拒绝";
+  } else {
+    statusText = "已受理";
+  }
+  const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : behavior === "deny" ? "deny" : "neutral";
 
   // 工具中文标签 + 图标(F5):resolveToolMeta 单一权威;无 toolName → 「未知工具」。
   const meta = msg.toolName ? resolveToolMeta(msg.toolName, input) : null;
   const toolLabel = meta ? meta.label : "未知工具";
   const ToolIcon = meta?.icon ?? null;
+  const pendingSummary = !resolved && !questions && !isExitPlan
+    ? compactRequestSummary(msg.toolName || "", input)
+    : null;
 
+  const showCard = renderMode !== "modal";
+  const showModal = renderMode !== "card";
   return (
     <div
-      data-testid="permission-card"
+      data-testid={showCard ? "permission-card" : "permission-modal-host"}
+      data-permission-request={msg.requestId}
       className={cn(
-        "rounded-lg border bg-surface animate-in",
+        showCard && "rounded-lg border bg-surface animate-in",
         tone === "allow" && "border-success/40",
         tone === "deny" && "border-danger/40",
         tone === "neutral" && "border-accent/40",
       )}
     >
-      <div className="flex items-center gap-2.5 px-3.5 py-2.5">
+      {showCard ? <>
+      {/* 卡头(审计 PC-01):390px 下标题 / 工具片 / 状态 / 倒计时四段挤一行会把「退出计划模式」竖排、
+          把工具片截成半个字。改成可换行:标题与工具片不折字,状态 + 倒计时 ml-auto 整组挤不下就整组换到下一行右对齐。 */}
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-3.5 py-2.5">
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {questions ? <HelpCircle size={14} /> : <ShieldCheck size={14} />}
         </span>
-        <span className="text-body font-medium text-fg">
+        <span className="whitespace-nowrap text-body font-medium text-fg">
           {questions ? "用户问答" : isExitPlan ? "退出计划模式" : "权限请求"}
         </span>
-        {!questions && (
-          <span className="inline-flex min-w-0 items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-meta text-muted">
+        {/* ExitPlanMode 的工具标签与卡标题是同一句「退出计划模式」(PC-17):一行里连写两遍,窄屏还要为它折行,去掉工具片。 */}
+        {!questions && !isExitPlan && (
+          <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded bg-hover px-1.5 py-0.5 text-meta text-muted">
             {ToolIcon && <ToolIcon size={12} aria-hidden="true" className="shrink-0" />}
             <span className="truncate">{toolLabel}</span>
           </span>
         )}
-        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-meta text-muted">
-          <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
-          {statusText}
+        {/* 状态 + 倒计时作为一组 ml-auto 右靠:挤不下时整组换到下一行仍右对齐,而不是倒计时单独掉到左下角。 */}
+        <span className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2.5 gap-y-1">
+          {/* <output>(隐含 role=status,PC-05):等待审批 → 正在提交 → 已允许 的状态切换让读屏用户也能听到。 */}
+          <output className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-meta text-muted">
+            <StatusIcon size={13} aria-hidden="true" className={statusIconCls} />
+            {statusText}
+          </output>
+          {remainingMs > 0 && (
+            <span
+              className={cn(
+                "flex shrink-0 items-center gap-1 whitespace-nowrap text-meta",
+                remainingUrgent ? "font-medium text-warning" : "text-muted",
+              )}
+              title={remainingUrgent ? "即将过期，请尽快处理" : undefined}
+            >
+              {/* 临期不只靠颜色(PC-07):补一枚警示图标。 */}
+              {remainingUrgent && <AlertTriangle size={12} aria-hidden="true" className="shrink-0" />}
+              {formatPermissionRemaining(remainingMs)}
+            </span>
+          )}
         </span>
       </div>
+
+      {/* 待决摘要(PC-02):问答卡露出第一题题干,普通权限卡露出命令 / 文件 / 地址一行 ——
+          不打开审批框也知道智能体在等什么;历史里的过期卡同样受益。 */}
+      {!resolved && !isExitPlan && !inputTruncated && (questions ? (
+        <div
+          data-testid="permission-pending-question"
+          className="border-t border-border px-3.5 py-2 text-body text-fg"
+        >
+          <span className="line-clamp-2">{questions[0].question}</span>
+          {questions.length > 1 && (
+            <span className="mt-0.5 block text-caption text-faint">共 {questions.length} 题</span>
+          )}
+        </div>
+      ) : pendingSummary ? (
+        <div data-testid="permission-pending-summary" className="border-t border-border px-3.5 py-2">
+          {pendingSummary.kind === "command" ? (
+            <pre className="line-clamp-2 whitespace-pre-wrap break-all font-mono text-meta text-fg">
+              <span className="text-success">$ </span>
+              {pendingSummary.value.slice(0, 400)}
+            </pre>
+          ) : (
+            <div className="flex gap-2 text-meta">
+              <span className="shrink-0 font-medium text-faint">{pendingSummary.label}</span>
+              <span className="min-w-0 truncate font-mono text-muted">{pendingSummary.value}</span>
+            </div>
+          )}
+        </div>
+      ) : null)}
 
       {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
       {canAnswer && (
         <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
-          <Button size="sm" variant="accent" shape="pill" onClick={() => setOpen(true)}>
+          <Button
+            size="sm"
+            variant="accent"
+            shape="pill"
+            onClick={() => {
+              if (msg.requestId) reopenPermissionUi(msg.requestId);
+              setOpen(true);
+            }}
+          >
             {questions ? "回答" : isExitPlan ? "审阅计划" : "审批"}
           </Button>
           {!questions && !isExitPlan && (
+            // 拒绝是不可撤销动作,却长得像一段灰字(PC-08):改成描边按钮,触屏 44px 由 Button 原语兜底。
             <Button
               size="sm"
-              variant="ghost"
+              variant="secondary"
               shape="pill"
               onClick={() => onRespond({ requestId: msg.requestId!, behavior: "deny" })}
             >
@@ -332,13 +528,28 @@ export function PermissionCard({
           提问已过期，无法再作答
         </div>
       )}
+      {/* 活提问的过期 fail-safe(PC-03):按本机时钟已过 TTL 但仍留着「审批」入口(时钟偏差时服务端可能还在等)。
+          此前卡头写「已过期」、下面却挂着可点的按钮,两句自相矛盾;补一行说明把这层「可能」讲清楚。 */}
+      {!resolved && !readOnly && expired && livePrompt && canAnswer && (
+        <div
+          data-testid="permission-expired-failsafe"
+          className="border-t border-border px-3.5 py-2 text-caption text-faint"
+        >
+          按本机时间已超过等待时限；若智能体仍在等待（时钟可能有偏差），仍可作答。
+        </div>
+      )}
 
       {!resolved && isExitPlan && planMarkdown && (
         <div
           data-testid="exit-plan-preview"
-          className="max-h-28 overflow-hidden border-t border-border px-3.5 py-2 text-meta text-muted"
+          className="relative max-h-28 overflow-hidden border-t border-border px-3.5 py-2 text-meta text-muted"
         >
           <Markdown>{planMarkdown}</Markdown>
+          {/* 预览被 max-h 截断时给一层渐隐(PC-09),而不是一刀切断;完整计划在「审阅计划」里。 */}
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-surface to-transparent"
+          />
         </div>
       )}
 
@@ -375,11 +586,21 @@ export function PermissionCard({
           {settledReasonLabel(msg._settledReason)}
         </div>
       )}
+      </> : null}
+      {inputTruncated && !resolved && (
+        <div
+          data-testid="permission-input-loading"
+          className="border-t border-border px-3.5 py-2 text-caption text-faint"
+        >
+          完整问题仍在加载，加载完成前不能提交。
+        </div>
+      )}
 
       {/* 审批 modal */}
-      {canAnswer &&
+      {showModal && canAnswer &&
         (questions ? (
           <AskUserQuestionModal
+            key={msg.requestId}
             open={open}
             onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
@@ -389,8 +610,9 @@ export function PermissionCard({
           />
         ) : isExitPlan ? (
           <ExitPlanModeModal
+            key={msg.requestId}
             open={open}
-            onOpenChange={setOpen}
+            onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
             plan={planMarkdown}
             planFilePath={asStr(input?.planFilePath)}
@@ -398,6 +620,7 @@ export function PermissionCard({
           />
         ) : (
           <GenericPermissionModal
+            key={msg.requestId}
             open={open}
             onOpenChange={handleDismissableOpenChange}
             requestId={msg.requestId!}
@@ -409,12 +632,110 @@ export function PermissionCard({
             onRespond={onRespond}
           />
         ))}
+      {showPendingBar && <PendingApprovalBar requestId={msg.requestId!} onReopen={() => {
+        reopenPermissionUi(msg.requestId!);
+        setOpen(true);
+      }} />}
     </div>
+  );
+}
+
+/** Presentation only; click bubbles from the button exactly once. */
+function PendingApprovalBar({
+  requestId,
+  onReopen,
+  count = 1,
+}: {
+  requestId: string;
+  onReopen: () => void;
+  /** 本会话还在等的提问总数(PC-10):多卡并发时告诉用户不止这一条。 */
+  count?: number;
+}) {
+  const bar = (
+    <Alert tone="warning" density="compact" data-testid="pending-approval-bar"
+      data-request-id={requestId} className="cursor-pointer" onClick={onReopen}
+      action={<Button size="sm" variant="secondary">打开</Button>}>
+      {/* 正文不再重复按钮字样「· 打开」(PC-11)。 */}
+      {count > 1 ? `智能体在等你确认 · 共 ${count} 项待处理` : "智能体在等你确认"}
+    </Alert>
+  );
+  const slot = typeof document !== "undefined" ? document.getElementById("pending-approval-bar-slot") : null;
+  return slot ? createPortal(bar, slot) : bar;
+}
+
+export function PermissionPromptHost({
+  messages,
+  onRespond,
+  readOnly = false,
+  sending = false,
+  sessionId,
+}: {
+  messages: ChatMessage[];
+  onRespond: PermissionRespond;
+  readOnly?: boolean;
+  sending?: boolean;
+  sessionId?: string;
+}) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => subscribePermissionCoordinator(() => {
+    setTick((n) => n + 1);
+  }), []);
+  useEffect(() => {
+    const onVis = () => setTick((n) => n + 1);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+  // One deadline, not polling; use exactly the card's expiry boundary.
+  useEffect(() => {
+    if (readOnly) return;
+    const now = Date.now();
+    const next = Math.min(...messages.filter((m) => isAwaitingPermissionPrompt(m, now)).map(permissionExpiresAt));
+    if (!Number.isFinite(next)) return;
+    const timer = setTimeout(() => setTick((n) => n + 1), Math.min(next - now, 2_147_483_647));
+    return () => clearTimeout(timer);
+  }, [messages, readOnly, tick]);
+  if (readOnly) return null;
+  const pending = messages.filter(
+    (message) =>
+      message.role === "permission" &&
+      isAwaitingPermissionPrompt(message) &&
+      typeof message.requestId === "string" &&
+      message.requestId.length > 0,
+  );
+  const active = activeModalRequest();
+  const activeMsg = pending.find((message) => message.requestId === active);
+  const isLive = (message: ChatMessage) =>
+    sending || isRecoveryTurnClientMessageId(message._turnOwnerId);
+  const autoMsg = pending.find((message) =>
+    isLive(message) && shouldAutoOpenPermission({ requestId: message.requestId!, livePrompt: true }),
+  );
+  const msg = activeMsg ?? autoMsg;
+  // 没有弹框在开时的待答入口。除了用户主动关掉的,还要接住**被顶掉的活提问**(PC-04):
+  // A 自动弹出后用户点了 B 卡的「审批」,A 的弹框被 singleton 收掉但没记 dismissed;
+  // 答完 B 之后 A 已被标「展示过」不再自动弹 —— 没有这条兜底就只剩时间线里一张静默的卡。
+  const minimized = !msg ? pending.find((message) =>
+    !isExitPlanModeTool(message.toolName) &&
+    (isPermissionUiDismissed(message.requestId) || isLive(message))
+  ) : undefined;
+  return (
+    <>
+    {msg && <PermissionCard
+      key={`${sessionId ?? ""}:${msg.requestId}`}
+      msg={msg}
+      onRespond={onRespond}
+      livePrompt
+      renderMode="modal"
+    />}
+    {minimized && <PendingApprovalBar requestId={minimized.requestId!} count={pending.length}
+      onReopen={() => reopenPermissionUi(minimized.requestId!, sessionId)} />}
+    </>
   );
 }
 
 function settledReasonLabel(reason: string): string {
   switch (reason) {
+    case "accepted":
+      return "已受理（尚未确认执行）";
     case "timeout":
       return "审批超时，已自动拒绝";
     case "disconnect":
@@ -483,7 +804,7 @@ function GenericPermissionModal({
       }
     >
       <div className="space-y-2.5">
-        <div className="inline-flex items-center gap-1.5 rounded bg-hover px-2 py-1 text-sm text-fg">
+        <div className="inline-flex items-center gap-1.5 rounded bg-hover px-2 py-1 text-body text-fg">
           {ToolIcon && <ToolIcon size={14} aria-hidden="true" className="shrink-0 text-muted" />}
           {toolLabel}
         </div>
@@ -520,16 +841,12 @@ function ExitPlanModeModal({
   return (
     <Modal
       open={open}
-      onOpenChange={(next) => {
-        if (next) onOpenChange(true);
-      }}
+      onOpenChange={onOpenChange}
       mobile="sheet"
       size="lg"
       fixedHeight
-      hideClose
-      onEscapeKeyDown={(event) => event.preventDefault()}
       title="退出计划模式"
-      description="请审阅计划后再决定是否开始执行。关掉窗口不会取消等待。"
+      description="关掉窗口不会批准或拒绝计划，执行侧仍在等待。可从卡片或待答入口重新打开。"
       footer={
         <>
           <Button variant="ghost" onClick={() => decide("deny")}>
@@ -550,7 +867,7 @@ function ExitPlanModeModal({
             <Markdown>{plan}</Markdown>
           </div>
         ) : (
-          <p data-testid="exit-plan-missing" className="text-sm text-muted">
+          <p data-testid="exit-plan-missing" className="text-body text-muted">
             计划文件已写好，但这次审批请求没有带上正文。批准后模型会按计划文件执行。
           </p>
         )}
@@ -586,12 +903,33 @@ function AskUserQuestionModal({
     return init;
   });
   const [error, setError] = useState<number | null>(null);
+  const sectionRefs = useRef<(HTMLElement | null)[]>([]);
 
-  const setQ = (qtext: string, next: Partial<QState>) =>
+  useEffect(() => {
+    const init: Record<string, QState> = {};
+    for (const q of questions) init[q.question] = { selected: [], other: "" };
+    setState(init);
+    setError(null);
+  }, [requestId]);
+
+  // 校验失败时把焦点送到出错那题的第一个选项并滚进视口(PC-13):此前只有一圈红边,
+  // 读屏用户听不到、三题的长表单里也看不见。
+  useEffect(() => {
+    if (error === null) return;
+    const section = sectionRefs.current[error];
+    if (!section) return;
+    section.scrollIntoView?.({ block: "nearest" });
+    section.querySelector<HTMLElement>('[role="radio"],[role="checkbox"]')?.focus();
+  }, [error]);
+
+  const setQ = (qtext: string, next: Partial<QState>) => {
     setState((s) => ({ ...s, [qtext]: { ...s[qtext], ...next } }));
+    // 用户一动作就撤掉错误提示,不必等再次点提交。
+    setError(null);
+  };
 
   const toggle = (q: AqQuestion, label: string) => {
-    const cur = state[q.question];
+    const cur = state[q.question] ?? { selected: [], other: "" };
     if (q.multiSelect) {
       const has = cur.selected.includes(label);
       setQ(q.question, { selected: has ? cur.selected.filter((l) => l !== label) : [...cur.selected, label] });
@@ -600,12 +938,39 @@ function AskUserQuestionModal({
     }
   };
 
+  // 选项组键盘导航(PC-12,WAI-ARIA radiogroup / group 模式):方向键在选项间移动焦点,
+  // 单选题移动即选中;Home / End 到首末。此前每个选项都是独立 Tab 停靠点,三题十二项要按十二次 Tab。
+  const onOptionsKeyDown = (q: AqQuestion) => (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const forward = e.key === "ArrowDown" || e.key === "ArrowRight";
+    const backward = e.key === "ArrowUp" || e.key === "ArrowLeft";
+    if (!forward && !backward && e.key !== "Home" && e.key !== "End") return;
+    const items = Array.from(
+      e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"],[role="checkbox"]'),
+    );
+    if (items.length === 0) return;
+    const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+    let next = idx;
+    if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = items.length - 1;
+    else if (forward) next = idx < 0 ? 0 : (idx + 1) % items.length;
+    else next = idx <= 0 ? items.length - 1 : idx - 1;
+    e.preventDefault();
+    items[next].focus();
+    if (!q.multiSelect) items[next].click();
+  };
+  /** 单选题只让「已选 / 无选择时的第一项」进 Tab 序列(roving tabindex);多选题按 checkbox 惯例各自可 Tab。 */
+  const optionTabIndex = (q: AqQuestion, qs: QState, label: string, first: boolean) => {
+    if (q.multiSelect) return 0;
+    if (qs.selected.length === 0) return first ? 0 : -1;
+    return qs.selected.includes(label) ? 0 : -1;
+  };
+
   const submit = () => {
     const answers: Record<string, string> = {};
     const annotations: Record<string, { preview: string }> = {};
     for (let i = 0; i < questions.length; i++) {
       const q = questions[i];
-      const qs = state[q.question];
+      const qs = state[q.question] ?? { selected: [], other: "" };
       if (qs.selected.length === 0) {
         setError(i);
         return;
@@ -657,7 +1022,7 @@ function AskUserQuestionModal({
               onOpenChange(false);
             }}
           >
-            跳过
+            暂不回答，让它继续
           </Button>
           <Button variant="accent" onClick={submit}>
             提交
@@ -667,26 +1032,42 @@ function AskUserQuestionModal({
     >
       <div className="space-y-5">
         {questions.map((q, idx) => {
-          const qs = state[q.question];
+          const qs = state[q.question] ?? { selected: [], other: "" };
           const hasPreview = !q.multiSelect && (q.options ?? []).some((o) => !!o.preview);
           const safeOptions = (q.options ?? []).filter((o) => o && o.label !== OTHER);
           const showOther = !hasPreview && !q.multiSelect;
           const preview = qs.selected[0]
             ? safeOptions.find((o) => o.label === qs.selected[0])?.preview
             : undefined;
+          const errorId = `aq-error-${idx}`;
           return (
             <section
               key={idx}
+              ref={(el) => {
+                sectionRefs.current[idx] = el;
+              }}
               className={cn("space-y-2", error === idx && "rounded-lg ring-2 ring-danger ring-offset-2 ring-offset-elevated")}
             >
-              {q.header && <div className="text-caption font-medium uppercase tracking-wide text-faint">{q.header}</div>}
+              {/* 多题时给序号(PC-14):底部只写「共 N 题」,滚到中间不知道答到第几题。 */}
+              {(q.header || questions.length > 1) && (
+                <div className="flex items-baseline justify-between gap-2 text-caption font-medium text-faint">
+                  <span className="uppercase tracking-wide">{q.header}</span>
+                  {questions.length > 1 && (
+                    <span className="shrink-0 tabular-nums">
+                      {idx + 1} / {questions.length}
+                    </span>
+                  )}
+                </div>
+              )}
               <div className="text-title font-medium text-fg">{q.question}</div>
               <div
                 className="grid gap-1.5"
                 role={q.multiSelect ? "group" : "radiogroup"}
                 aria-label={q.question}
+                aria-describedby={error === idx ? errorId : undefined}
+                onKeyDown={onOptionsKeyDown(q)}
               >
-                {safeOptions.map((opt) => {
+                {safeOptions.map((opt, optIdx) => {
                   const sel = qs.selected.includes(opt.label);
                   return (
                     <button
@@ -694,9 +1075,10 @@ function AskUserQuestionModal({
                       key={opt.label}
                       role={q.multiSelect ? "checkbox" : "radio"}
                       aria-checked={sel}
+                      tabIndex={optionTabIndex(q, qs, opt.label, optIdx === 0)}
                       onClick={() => toggle(q, opt.label)}
                       className={cn(
-                        "flex items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                        "flex min-h-11 items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
                         sel ? "border-accent bg-accent-soft" : "border-border bg-surface hover:bg-hover",
                       )}
                     >
@@ -724,9 +1106,10 @@ function AskUserQuestionModal({
                     type="button"
                     role="radio"
                     aria-checked={qs.selected.includes(OTHER)}
+                    tabIndex={optionTabIndex(q, qs, OTHER, safeOptions.length === 0)}
                     onClick={() => toggle(q, OTHER)}
                     className={cn(
-                      "flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
+                      "flex min-h-11 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors",
                       qs.selected.includes(OTHER)
                         ? "border-accent bg-accent-soft"
                         : "border-border bg-surface hover:bg-hover",
@@ -750,6 +1133,12 @@ function AskUserQuestionModal({
                   value={qs.other}
                   autoFocus
                   onChange={(e) => setQ(q.question, { other: e.target.value })}
+                  // 输入框里回车直接提交(PC-15),不必再去找底部按钮。
+                  onKeyDown={(e) => {
+                    if (e.key !== "Enter") return;
+                    e.preventDefault();
+                    submit();
+                  }}
                   // placeholder 不构成可访问名(探针 label=null),读屏需要显式名字。
                   aria-label="其他答案"
                   placeholder="输入你的答案…"
@@ -761,7 +1150,11 @@ function AskUserQuestionModal({
                   {preview}
                 </pre>
               )}
-              {error === idx && <div className="text-meta text-danger">请先回答此题</div>}
+              {error === idx && (
+                <div id={errorId} role="alert" className="text-meta text-danger">
+                  请先回答此题
+                </div>
+              )}
             </section>
           );
         })}

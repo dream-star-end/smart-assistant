@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
+import { ChatSocket } from './lib/chat/socket'
 import { ToastProvider } from './components/ui'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
 import { setAuthHint } from './lib/authHint'
@@ -107,6 +108,25 @@ const AGENT_OPEN_202 = {
   home_volume: 'h1',
 }
 
+function collabDoc(over: Record<string, unknown> = {}) {
+  return {
+    rev: 0,
+    defaultMode: 'solo',
+    defaultAdvisorModel: 'gpt-6-astra',
+    session: {
+      mode: 'solo',
+      advisorModel: null,
+      configVersion: 'v1:solo:',
+      source: 'default',
+    },
+    advisorModels: [{ id: 'gpt-6-astra', label: 'GPT-6-Astra', engine: 'codex' }],
+    advisorConsultParents: ['ccb'],
+    advisorConsultAllowed: true,
+    parentEngine: 'ccb',
+    ...over,
+  }
+}
+
 /**
  * 按 URL 路由的 fetch mock。默认：login OK、模型 OK、agent 状态 ready。
  * overrides 可注入 unsubscribed 状态 / open 应答 / 让 open 后状态翻转为 ready。
@@ -117,15 +137,80 @@ function routedFetch(over?: {
   open?: unknown
   models?: unknown
   preferences?: unknown
+  collaboration?: Record<string, unknown>
 }) {
   let opened = false
-  return vi.fn(async (url: string) => {
+  let collab = collabDoc(over?.collaboration)
+  return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
+    const method = (init?.method ?? 'GET').toUpperCase()
     if (u.includes('/api/auth/refresh')) return REFRESH_401
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+    if (u.includes('/api/collaboration-config') && method === 'PUT') {
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        mode?: string
+        advisorModel?: string | null
+        sessionId?: string
+        asDefault?: boolean
+      }
+      const mode = body.mode === 'advisor' || body.mode === 'team' ? body.mode : 'solo'
+      const advisorModel = mode === 'advisor' ? body.advisorModel || 'gpt-6-astra' : null
+      collab = collabDoc({
+        rev: Number(collab.rev ?? 0) + 1,
+        defaultMode: body.asDefault ? mode : collab.defaultMode,
+        defaultAdvisorModel:
+          body.asDefault && mode === 'advisor' ? advisorModel : collab.defaultAdvisorModel,
+        session: {
+          mode,
+          advisorModel,
+          configVersion: mode === 'advisor' ? `v1:advisor:${advisorModel}` : `v1:${mode}:`,
+          source: body.sessionId ? 'session' : 'default',
+        },
+      })
+      return okJson(collab)
+    }
+    if (u.includes('/api/collaboration-config')) return okJson(collab)
     if (u.includes('/api/public/models')) return okJson(over?.models ?? MODELS)
     if (u.includes('/api/me/preferences')) return okJson(over?.preferences ?? { prefs: {} })
+    // `/api/me` 是前缀；更具体的 usage/report、subscription 必须先匹配，
+    // 否则 AccountTab 会把 {user} 当成 UsageReport，ledger 缺失即崩。
+    if (u.includes('/api/me/usage/report'))
+      return okJson({
+        window: '30d',
+        summary: {
+          requests: '0',
+          input_tokens: '0',
+          output_tokens: '0',
+          cache_read_tokens: '0',
+          cache_write_tokens: '0',
+          credits: '0',
+        },
+        trend: [],
+        models: [],
+        ledger: { trend: [], by_reason: [] },
+      })
+    if (u.includes('/api/me/usage'))
+      return okJson({ ledger: { rows: [], next_before: null } })
+    if (u.includes('/api/subscription'))
+      return okJson({
+        ok: true,
+        data: {
+          subscription: {
+            plan_code: 'free',
+            plan_name: 'Free',
+            status: 'active',
+            period_start: '2026-01-01T00:00:00.000Z',
+            period_end: '2026-02-01T00:00:00.000Z',
+            period_credits: '0',
+            monthly_credits: '0',
+            price_cents: '0',
+            tier: 0,
+            paid: false,
+          },
+          balance: { wallet: '300', period: '0', total: '300' },
+        },
+      })
     if (u.includes('/api/agent/open')) {
       opened = true
       return over?.open ?? okJson(AGENT_OPEN_202, 202)
@@ -153,21 +238,59 @@ afterEach(() => {
   cleanup()
   imageByteCache.clear()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   window.history.replaceState({}, '', '/')
+  sessionStorage.removeItem('oc_v5_pending_case')
 })
 
-async function loginViaUi() {
+const LOGIN_B = okJson({
+  user: {
+    id: 'u2',
+    email: 'b@c.com',
+    email_verified: true,
+    role: 'user',
+    display_name: 'Bob',
+    avatar_url: null,
+    credits: '300',
+    created_at: '2026-01-01T00:00:00.000Z',
+  },
+  access_token: 'tok-b',
+  access_exp: 1234,
+  refresh_exp: 5678,
+  remember: false,
+})
+
+async function loginViaUi(email = 'a@b.com') {
   // 启动静默续期期间是 splash(无 Landing):等 refresh 401 落定、Landing 出现再点。
   const landingLogin = await screen.findByRole('button', { name: '登录' })
   fireEvent.click(landingLogin) // Landing 登录 → AuthGate
-  fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
-  fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
+  fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: email } })
+  fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
   // 正常路径等公开配置（turnstile_bypass）就绪后提交；异常路径另有“点一次后自动恢复”用例。
   const submit = screen.getByRole('button', { name: '登录' })
   await waitFor(() => expect(submit).not.toBeDisabled())
   await act(async () => {
     fireEvent.click(submit)
   })
+}
+
+function requestToken(init?: RequestInit): string {
+  const raw = (init?.headers as Record<string, string> | undefined)?.authorization
+    ?? (init?.headers as Record<string, string> | undefined)?.Authorization
+    ?? ''
+  return String(raw).replace(/^Bearer\s+/i, '')
+}
+
+async function openAgentPicker() {
+  fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+}
+
+function teamChoice() {
+  return screen.getByRole('button', { name: /队长切换为/ })
+}
+
+function soloChoice() {
+  return screen.getByRole('button', { name: /主模型独立完成/ })
 }
 
 describe('Aurora v5 skeleton — landing (de-branded)', () => {
@@ -208,12 +331,17 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     // boot 静默续期场景：模拟「登录过的浏览器」（oc_auth_hint），否则匿名访客不再发 refresh。
     setAuthHint()
-    render(<ToastProvider><App /></ToastProvider>)
+    // 连接状态也可合法使用 alert；邀请失败校验不能要求全页只有一个提示。
+    render(<><div role="alert" aria-label="连接状态">连接中…</div><ToastProvider><App /></ToastProvider></>)
     fireEvent.click(await screen.findByRole('button', { name: '接受邀请' }))
 
-    const alert = await screen.findByRole('alert')
+    const alert = (await screen.findByText('接受组织邀请失败（追踪号 req-org-invite）')).closest('[role="alert"]')
+    expect(alert).toBeInTheDocument()
+    expect(alert).toHaveAttribute('aria-live', 'assertive')
     expect(alert).toHaveTextContent('接受组织邀请失败（追踪号 req-org-invite）')
     expect(alert).not.toHaveTextContent('database unavailable')
+    expect(document.body).not.toHaveTextContent('database unavailable')
+    expect(screen.getByRole('alert', { name: '连接状态' })).toHaveTextContent('连接中…')
   })
 
   test('登录与退出清空图片 Blob 缓存，跨账号相同容器路径不得复用', async () => {
@@ -251,9 +379,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
     await loginViaUi()
 
-    // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
+    // 侧栏空态有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
-    expect(screen.getByText('暂无会话')).toBeInTheDocument()
+    // sidebar-B S-13 起零会话零项目渲染一块引导空态(data-testid=sidebar-empty-all,「还没有会话」),
+    // 不再是单独的「暂无会话」占位文本。
+    expect(screen.getByTestId('sidebar-empty-all')).toHaveTextContent('还没有会话')
 
     const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/auth/login')
     expect(call).toBeTruthy()
@@ -278,8 +408,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: '登录' }))
-    fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
-    fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
 
     await waitFor(() => expect(configCalls).toBe(1))
     const login = screen.getByRole('button', { name: '登录' })
@@ -313,7 +443,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 工作区标志(新建会话按钮)直接出现,全程没有点过任何登录 UI。
     // 侧栏空态(暂无会话)有顶部+空态 CTA 两个「新建会话」按钮,断言任一存在即工作区可见。
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
-    expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('邮箱')).not.toBeInTheDocument()
     // refresh 走了 cookie(credentials include)。
     const refreshCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/auth/refresh'))
     expect(refreshCall).toBeTruthy()
@@ -345,7 +475,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByRole('button', { name: '登录' })).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0), { timeout: 4_000 })
     expect(refreshCalls).toBe(2)
-    expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('邮箱')).not.toBeInTheDocument()
   })
 
   test('boot repeated transient failures surface a manual recovery action instead of false logout', async () => {
@@ -398,15 +528,21 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
   test('login error localizes the backend code to friendly Chinese (no raw English / trace id)', async () => {
     // 生产实况：后端 message 是英文 "invalid credentials" + x-request-id 头（追踪号来源）。
-    const invalidCreds = {
+    // 登录 401 必须是独立响应对象：catch-all 复用同一 401 会被 callWithRefresh 打 fence，
+    // beginIdentity 后 throwApi 会把 INVALID_CREDENTIALS 误报成 AuthEpochStaleError 英文。
+    const login401 = () => ({
       ok: false,
       status: 401,
       headers: { get: (h: string) => (h === 'x-request-id' ? '0f0ac9caa' : null) },
       json: async () => ({ error: { code: 'INVALID_CREDENTIALS', message: 'invalid credentials' } }),
-    }
+    })
     fetchMock = vi.fn(async (url: string) => {
-      if (String(url).includes('/api/auth/refresh')) return REFRESH_401
-      return String(url).includes('/api/public/config') ? PUBLIC_CONFIG : invalidCreds
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/auth/login')) return login401()
+      if (u.includes('/api/collaboration-config')) return okJson(collabDoc())
+      return okJson({})
     }) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
@@ -416,7 +552,9 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     // 红条展示友好中文；绝不把后端英文 message / 追踪号怼给用户。
     await waitFor(() => expect(screen.getByText('邮箱或密码错误')).toBeInTheDocument())
     expect(screen.queryByText(/invalid credentials/)).toBeNull()
+    expect(screen.queryByText(/auth identity changed/)).toBeNull()
     expect(screen.queryByText(/追踪号/)).toBeNull()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/auth/login'))).toBe(true)
   })
 
   test('Landing「免费开始」进入注册表单（register）', async () => {
@@ -466,7 +604,10 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(chatLike.length).toBe(0)
   })
 
-  test('fresh conversation can create its server row and set GoalState before the first turn', async () => {
+  test.each([false, true])('goal auto-start keeps its session/model when navigation during save=%s', async (navigate) => {
+    const sendSpy = vi.spyOn(ChatSocket.prototype, 'sendMessage')
+    let releaseSave!: () => void
+    const saveGate = new Promise<void>((resolve) => { releaseSave = resolve })
     const base = routedFetch()
     const mutations: string[] = []
     const sessionBodies: Array<Record<string, unknown>> = []
@@ -490,6 +631,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       }
       if (/\/api\/session-goals\/[^/]+$/.test(u) && method === 'PUT') {
         mutations.push('goal')
+        if (navigate) await saveGate
         const sessionId = decodeURIComponent(u.slice(u.lastIndexOf('/') + 1))
         return okJson({
           goal: {
@@ -540,24 +682,35 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
       target: { value: '先设目标再执行' },
     })
-    fireEvent.click(screen.getByRole('button', { name: '开始目标' }))
+    fireEvent.click(screen.getByRole('button', { name: '设置并开始' }))
 
     await waitFor(() => expect(mutations).toContain('goal'))
     expect(mutations.indexOf('session')).toBeLessThan(mutations.indexOf('goal'))
     expect(sessionBodies[0]?.modelId).toBe('gpt-5.6-terra')
     expect(modelTrigger.textContent).toContain('GPT-5.6-Terra')
-    expect(screen.getAllByText('先设目标再执行').length).toBeGreaterThan(0)
     expect(screen.queryByText(/会话尚未创建成功/)).toBeNull()
 
-    // 已被 Goal 提前建行的空会话首发时，真实首消息标题还要 PATCH 回服务端；否则刷新会回退。
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    if (navigate) {
+      fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+      fireEvent.click(screen.getAllByRole('button', { name: /新建会话/ })[0]!)
+      await act(async () => { releaseSave() })
+    }
+    // No extra "start" message is needed; the goal itself becomes the first prompt/title.
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
-    const composer = screen.getByPlaceholderText('和「全能助手」对话…')
-    fireEvent.change(composer, { target: { value: '首条消息成为会话标题' } })
-    fireEvent.click(screen.getByRole('button', { name: '发送' }))
     await waitFor(() => expect(
-      patchBodies.some((body) => body.title === '首条消息成为会话标题'),
+      patchBodies.some((body) => body.title === '先设目标再执行'),
     ).toBe(true))
+    expect(sendSpy).toHaveBeenCalledTimes(1)
+    const savedGoalUrl = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).includes('/api/session-goals/') && (init as RequestInit)?.method === 'PUT',
+    )?.[0]
+    expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessId: decodeURIComponent(String(savedGoalUrl).split('/').at(-1)!),
+      model: 'gpt-5.6-terra',
+      text: '先设目标再执行',
+    }))
+    if (!navigate) await waitFor(() => expect(screen.getAllByTestId('user-row')).toHaveLength(1))
+    else expect(screen.queryAllByTestId('user-row')).toHaveLength(0)
   })
 
   test('team mode switch persists while reopening the agent picker', async () => {
@@ -566,34 +719,328 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     await loginViaUi()
+    const ta = await screen.findByPlaceholderText('和「全能助手」对话…')
+    await waitFor(() => expect(ta).not.toBeDisabled())
+    fireEvent.change(ta, { target: { value: '开场' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    })
+    await waitFor(() => expect(screen.getAllByText('开场').length).toBeGreaterThan(0))
+    await openAgentPicker()
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
 
-    fireEvent.click(await screen.findByRole('button', { name: /全能助手/ }))
-    const sw = await screen.findByRole('switch', { name: '启用团队模式' })
-    expect(sw).not.toBeChecked()
-
-    fireEvent.click(sw)
-    expect(sw).toBeChecked()
+    fireEvent.click(teamChoice())
+    await waitFor(() => expect(teamChoice()).toHaveAttribute('aria-pressed', 'true'))
     expect(localStorage.getItem('oc_v5_team_mode')).toBe('1')
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          String(url).includes('/api/collaboration-config') &&
+          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+      )
+      expect(put).toBeTruthy()
+      expect(JSON.parse(String((put![1] as RequestInit).body))).toEqual(
+        expect.objectContaining({ mode: 'team' }),
+      )
+    })
 
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
-    await waitFor(() =>
-      expect(screen.queryByRole('switch', { name: '启用团队模式' })).not.toBeInTheDocument(),
-    )
+    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切换为/ })).not.toBeInTheDocument())
 
-    fireEvent.click(screen.getByRole('button', { name: /全能助手/ }))
-    expect(await screen.findByRole('switch', { name: '启用团队模式' })).toBeChecked()
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
+    const lastPut = [...fetchMock.mock.calls].reverse().find(
+      ([url, init]) =>
+        String(url).includes('/api/collaboration-config') &&
+        ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+    )
+    expect(JSON.parse(String((lastPut![1] as RequestInit).body)).mode).toBe('team')
   })
 
-  test('team mode restores from localStorage after a fresh App mount', async () => {
+  test('team mode restores from server config after a fresh App mount', async () => {
     localStorage.setItem('oc_v5_team_mode', '1')
-    fetchMock = routedFetch()
+    fetchMock = routedFetch({
+      collaboration: collabDoc({
+        defaultMode: 'team',
+        session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'default' },
+      }),
+    })
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
     await loginViaUi()
 
-    fireEvent.click(await screen.findByRole('button', { name: /全能助手/ }))
-    expect(await screen.findByRole('switch', { name: '启用团队模式' })).toBeChecked()
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).includes('/api/collaboration-config')),
+      ).toBe(true),
+    )
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('unauthenticated App does not GET collaboration-config; login then loads current identity', async () => {
+    const calls: string[] = []
+    const base = routedFetch()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      calls.push(`${method} ${String(url)}`)
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/collaboration-config')) {
+        return okJson(
+          collabDoc({
+            session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'default' },
+            defaultMode: 'team',
+          }),
+        )
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await screen.findByRole('button', { name: '登录' })
+    expect(calls.filter((row) => row.includes('/api/collaboration-config'))).toEqual([])
+
+    await loginViaUi()
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await waitFor(() =>
+      expect(calls.filter((row) => row.startsWith('GET ') && row.includes('/api/collaboration-config')).length).toBeGreaterThan(
+        0,
+      ),
+    )
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('logout drops in-flight collaboration GET so it cannot paint the next identity', async () => {
+    let release!: () => void
+    const hang = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let collabGets = 0
+    const base = routedFetch()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/collaboration-config') && method === 'GET') {
+        collabGets += 1
+        const thisGet = collabGets
+        if (thisGet === 1) await hang
+        return okJson(
+          collabDoc({
+            session: {
+              mode: thisGet === 1 ? 'team' : 'solo',
+              advisorModel: null,
+              configVersion: thisGet === 1 ? 'v1:team:' : 'v1:solo:',
+              source: 'default',
+            },
+            defaultMode: thisGet === 1 ? 'team' : 'solo',
+          }),
+        )
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() => expect(collabGets).toBe(1))
+    fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
+      button: 0,
+      pointerType: 'mouse',
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
+    await loginViaUi()
+    await waitFor(() => expect(collabGets).toBeGreaterThan(1))
+    release()
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await openAgentPicker()
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  test('stale CAS reread after logout cannot restore previous team into the next identity', { timeout: 45_000 }, async () => {
+    let releaseReread!: () => void
+    const hangReread = new Promise<void>((resolve) => {
+      releaseReread = resolve
+    })
+    let casArmed = false
+    let rereadStarted = false
+    let bLoaded = false
+    const collabPuts: Array<{ token: string; body: Record<string, unknown> }> = []
+    const base = routedFetch({
+      models: {
+        models: [
+          ...MODELS.models,
+          { id: 'glm-5.2', display_name: 'GLM-5.2', engine: 'ccb' },
+        ],
+      },
+    })
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const token = requestToken(init)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/auth/login')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { email?: string }
+        return body.email === 'b@c.com' ? LOGIN_B : LOGIN_OK
+      }
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/me') && !u.includes('/api/me/')) {
+        if (token === 'tok-b') {
+          return okJson({ user: { id: 'u2', email: 'b@c.com', role: 'user', display_name: 'Bob', credits: '300' } })
+        }
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      if (/\/api\/sessions\/[^/]+$/.test(u) && method === 'PUT') return okJson({ ok: true, applied: true })
+      if (u.includes('/api/collaboration-config') && method === 'PUT') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+        collabPuts.push({ token, body })
+        if (body.mode === 'solo' && body.asDefault === true) {
+          casArmed = true
+          return errJson(409, { error: 'cas conflict' })
+        }
+        return okJson(
+          collabDoc({
+            rev: 2,
+            session: {
+              mode: body.mode,
+              advisorModel: null,
+              configVersion: `v1:${String(body.mode)}:`,
+              source: body.sessionId ? 'session' : 'default',
+            },
+          }),
+        )
+      }
+      if (u.includes('/api/collaboration-config') && method === 'GET') {
+        if (casArmed && token === 'tok-1') {
+          rereadStarted = true
+          await hangReread
+          return okJson(
+            collabDoc({
+              session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'session' },
+              defaultMode: 'team',
+            }),
+          )
+        }
+        if (token === 'tok-b') {
+          bLoaded = true
+          return okJson(
+            collabDoc({
+              session: { mode: 'solo', advisorModel: null, configVersion: 'v1:solo:', source: 'default' },
+              defaultMode: 'solo',
+            }),
+          )
+        }
+        return okJson(
+          collabDoc({
+            session: { mode: 'team', advisorModel: null, configVersion: 'v1:team:', source: 'default' },
+            defaultMode: 'team',
+          }),
+        )
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi('a@b.com')
+    const ta = await screen.findByPlaceholderText('和「全能助手」对话…')
+    await waitFor(() => expect(ta).not.toBeDisabled())
+    fireEvent.change(ta, { target: { value: 'A 开场' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    })
+    await waitFor(() => expect(screen.getAllByText('A 开场').length).toBeGreaterThan(0))
+    await openAgentPicker()
+    expect(await screen.findByRole('button', { name: /队长切换为/ })).toHaveAttribute('aria-pressed', 'true')
+    const asDefaultBox = screen.getByLabelText(/同时设为新对话的默认协作方式/)
+    fireEvent.click(asDefaultBox)
+    await waitFor(() => expect(asDefaultBox).toBeChecked())
+    fireEvent.click(soloChoice())
+    try {
+    await waitFor(() => expect(casArmed && rereadStarted).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /队长切换为/ })).not.toBeInTheDocument())
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
+      button: 0,
+      pointerType: 'mouse',
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
+    await loginViaUi('b@c.com')
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await waitFor(() => expect(bLoaded).toBe(true))
+    await openAgentPicker()
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
+
+    const putsBeforeRelease = collabPuts.filter((row) => row.token === 'tok-b').length
+    releaseReread()
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    const tb = await screen.findByPlaceholderText('和「全能助手」对话…')
+    fireEvent.change(tb, { target: { value: 'B 新消息' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    })
+    await waitFor(() => expect(screen.getAllByText('B 新消息').length).toBeGreaterThan(0))
+    const ordinaryBPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
+    expect(ordinaryBPuts).toEqual([])
+    await openAgentPicker()
+    expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
+    fireEvent.click(teamChoice())
+    await waitFor(() =>
+      expect(collabPuts.filter((row) => row.token === 'tok-b').length).toBeGreaterThan(putsBeforeRelease),
+    )
+    const actual = collabPuts.filter((row) => row.token === 'tok-b').at(-1)!
+    expect(actual.token).toBe('tok-b')
+    expect(actual.body.mode).toBe('team')
+    expect(actual.body.asDefault).not.toBe(true)
+    expect(actual.body.sessionId).toBeTruthy()
+    } finally {
+      releaseReread()
+    }
+  })
+
+  test('server collaboration config wins over legacy localStorage team flag', async () => {
+    localStorage.setItem('oc_v5_team_mode', '1')
+    fetchMock = routedFetch({
+      collaboration: collabDoc({
+        defaultMode: 'solo',
+        session: { mode: 'solo', advisorModel: null, configVersion: 'v1:solo:', source: 'default' },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).includes('/api/collaboration-config')),
+      ).toBe(true),
+    )
+    await openAgentPicker()
+    expect(soloChoice()).toHaveAttribute('aria-pressed', 'true')
+    expect(teamChoice()).toHaveAttribute('aria-pressed', 'false')
   })
 })
 
@@ -610,6 +1057,65 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeInTheDocument()
     expect(screen.getByText('锂金属负极枝晶抑制机理综述')).toBeInTheDocument()
     expect(noFetch).not.toHaveBeenCalled()
+  })
+
+  // misc-p3 D-02:demo 会话按 id 取本地 fixture。此前 onDemoSelect 只认 s1、其余会话既标着有消息
+  // 又点开一片空白(还先出历史骨架);现在 s2–s6 是干净空会话,切回 s1 恢复两条消息,全程零网络。
+  test('demo 切换会话按 id 取 fixture:其余会话为空会话且不出历史骨架,切回 s1 恢复消息(D-02)', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    const noFetch = vi.fn(() => {
+      throw new Error('demo mode must not hit the network')
+    })
+    vi.stubGlobal('fetch', noFetch as unknown as typeof fetch)
+
+    render(<App />)
+    expect(screen.getByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('锂金属负极枝晶抑制机理综述'))
+    await waitFor(() =>
+      expect(screen.queryByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeNull(),
+    )
+    // 空会话:不是「有 N 条消息但还没到」的骨架,也不是加载中。
+    expect(screen.queryByLabelText('正在加载会话历史')).toBeNull()
+    expect(screen.queryByTestId('partial-history-skeleton')).toBeNull()
+
+    fireEvent.click(screen.getByText('把商业版重做成 ChatGPT 风格'))
+    await waitFor(() =>
+      expect(screen.getByText(/帮我把商业版聊天界面基于 ChatGPT 的设计语言完全重做/)).toBeInTheDocument(),
+    )
+    expect(noFetch).not.toHaveBeenCalled()
+  })
+
+  // shell 审计 S-01:⌘K 原先无条件打开移动端抽屉(Sheet 带 md:hidden)。桌面断点下抽屉不可见,
+  // 但 Radix 模态照常把 <body> 设成 pointer-events:none —— 整页点死且看不见任何弹层。
+  test('⌘K 桌面视口:只展开内联侧栏并聚焦搜索框,不打开移动抽屉(S-01)', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    const realMatchMedia = window.matchMedia
+    window.matchMedia = (q: string) =>
+      ({ ...realMatchMedia(q), media: q, matches: q.includes('min-width: 768px') }) as MediaQueryList
+    try {
+      render(<App />)
+      fireEvent.keyDown(window, { key: 'k', metaKey: true })
+      await waitFor(() => expect(screen.getByLabelText('搜索标题或消息')).toHaveFocus())
+      expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
+      expect(document.body.style.pointerEvents).not.toBe('none')
+    } finally {
+      window.matchMedia = realMatchMedia
+    }
+  })
+
+  test('⌘K 窄屏视口:仍打开会话导航抽屉(抽屉里有自己的搜索框)', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    // setup.ts 的 matchMedia 桩恒 matches=false → 视为 <md
+    render(<App />)
+    expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
+    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    const drawer = await screen.findByRole('dialog', { name: '会话导航' })
+    expect(drawer).toBeInTheDocument()
+    // jsdom 没有布局,两份侧栏(内联 + 抽屉)都在 DOM 里;抽屉里必须有搜索框可供聚焦逻辑挑选
+    expect(drawer.querySelector('[data-sidebar-search]')).not.toBeNull()
   })
 })
 
@@ -1164,22 +1670,70 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     render(<App />)
     expect(
-      await screen.findByRole('heading', { name: '公开数据到可复现的单车需求分析' }, { timeout: 15000 }),
+      await screen.findByRole('heading', { name: '一堆出行数据，变成看得懂的需求规律。' }, { timeout: 15000 }),
     ).toBeInTheDocument()
-    expect(screen.getByText(/当前只展示人工编写的任务脚本，不是真实运行回放/)).toBeInTheDocument()
+    expect(screen.getByText(/公开数据实作 · 非完整会话回放/)).toBeInTheDocument()
     expect(
       screen.queryByRole('heading', { name: '你不用守着它。回来时，过程和成果都还在。' }),
     ).not.toBeInTheDocument()
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).toContain('case=research-bike-demand')
 
-    fireEvent.click(screen.getByRole('button', { name: /带着我的材料开始.*登录后试用/ }))
+    fireEvent.click(screen.getByRole('button', { name: /登录后做我的版本/ }))
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: '欢迎使用 从简' })).toBeInTheDocument(),
     )
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).not.toContain('panel=help')
     expect(window.location.search).not.toContain('case=')
+  }, 30000)
+
+  test('未登录跑案例后登录会带入指令且不自动发送', async () => {
+    await preloadLazyPanels()
+    sessionStorage.removeItem('oc_v5_pending_case')
+    window.history.replaceState(
+      {},
+      '',
+      '/?campaign=docs&panel=help&case=research-bike-demand',
+    )
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    )
+    expect(
+      await screen.findByRole('heading', { name: '一堆出行数据，变成看得懂的需求规律。' }, { timeout: 15000 }),
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /登录后做我的版本/ }))
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: '欢迎使用 从简' })).toBeInTheDocument(),
+    )
+    const pending = JSON.parse(sessionStorage.getItem('oc_v5_pending_case') || 'null') as {
+      caseId?: string
+      starterPrompt?: string
+    } | null
+    expect(pending?.caseId).toBe('research-bike-demand')
+    expect(typeof pending?.starterPrompt).toBe('string')
+    expect((pending?.starterPrompt ?? '').length).toBeGreaterThan(20)
+
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
+    const submit = screen.getByRole('button', { name: '登录' })
+    await waitFor(() => expect(submit).not.toBeDisabled())
+    await act(async () => {
+      fireEvent.click(submit)
+    })
+
+    await waitFor(() => expect(sessionStorage.getItem('oc_v5_pending_case')).toBeNull(), {
+      timeout: 15000,
+    })
+    const box = await screen.findByPlaceholderText('和「全能助手」对话…', {}, { timeout: 15000 })
+    expect(box).toHaveValue(pending!.starterPrompt)
+    expect(screen.getByText('已带入案例指令，不会自动发送')).toBeInTheDocument()
+    sessionStorage.removeItem('oc_v5_pending_case')
   }, 30000)
 
   test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {
@@ -1282,5 +1836,59 @@ describe('Aurora v5 — P7 最小路由', () => {
     )
     expect(window.location.search).not.toContain('community=')
     expect(window.location.search).not.toContain('panel=help')
+  })
+})
+
+describe('Aurora v5 — desktop enroll 特判', () => {
+  const ENROLL_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+  test('/desktop/enroll 未登录：走 AuthGate，不进 Landing/工作区', async () => {
+    window.history.replaceState({}, '', `/desktop/enroll?enrollment_id=${ENROLL_ID}`)
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    expect(await screen.findByLabelText('邮箱')).toBeInTheDocument()
+    expect(screen.getByLabelText('密码')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '确认这台电脑' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /新建会话/ })).not.toBeInTheDocument()
+    expect(window.location.pathname).toBe('/desktop/enroll')
+  })
+
+  test('/desktop/enroll 已登录：渲染确认页，不进工作区', async () => {
+    window.history.replaceState({}, '', `/desktop/enroll?enrollment_id=${ENROLL_ID}`)
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_OK
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me')) {
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    setAuthHint()
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '确认这台电脑' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '确认这台电脑' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /新建会话/ })).not.toBeInTheDocument()
+    expect(window.location.pathname).toBe('/desktop/enroll')
+  })
+
+  test('?demo=1 不启用 /desktop/enroll 特判', async () => {
+    window.history.replaceState({}, '', `/desktop/enroll?demo=1&enrollment_id=${ENROLL_ID}`)
+    vi.stubGlobal('fetch', () => {
+      throw new Error('demo mode must not hit the network')
+    })
+    render(<App />)
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    expect(screen.queryByRole('heading', { name: '确认这台电脑' })).not.toBeInTheDocument()
   })
 })

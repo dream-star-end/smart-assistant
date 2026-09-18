@@ -69,6 +69,11 @@ const NOT_PROXIED_ON_PURPOSE: readonly { re: RegExp; reason: string }[] = [
       '同上:同步 delegate 是个人版 REST 入口。商业版的组队 = main 队长 turn 内自主' +
       'delegate_task,由 turn 管线记账,不经这条路。',
   },
+  {
+    re: /^\/api\/agents\/advisor\/consult$/,
+    reason:
+      '本一期仅 selfhost/container-local authenticated MCP，须原 parent turn token + invocation，非商业前端代理入口。',
+  },
 ]
 
 /** 路径级可达性判定:任一常见 method 命中即算"这条路径被认领"。 */

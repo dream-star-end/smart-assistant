@@ -99,6 +99,36 @@ describe("useRepoBinding", () => {
     expect(hook.result.current.selection).toMatchObject({ status: "cloning" });
   });
 
+  // RB-03：failed 状态帧此前 toast + 横幅双重提示；现在失败原因落进 selection 由横幅就地展示，不再 toast。
+  test("failed 帧把错误原因写进 selection 供横幅展示，且不再另弹 toast", async () => {
+    getRepoSelection.mockResolvedValue({
+      selected: true,
+      owner: "o",
+      repo: "r",
+      branch: "main",
+      status: "cloning",
+      selection_version: 5,
+    } as RepoSelection);
+    const { hook, toast } = setup();
+    await waitFor(() => expect(hook.result.current.selection?.selected).toBe(true));
+    act(() => {
+      hook.result.current.onRepoStatus({
+        type: "outbound.control.session_repo_status",
+        sessionId: "s1",
+        selectionVersion: 5,
+        status: "failed",
+        errorCode: "clone_failed",
+      });
+    });
+    expect(hook.result.current.selection).toMatchObject({
+      status: "failed",
+      error_code: "clone_failed",
+      error_message: "仓库克隆失败，请稍后重试",
+    });
+    expect(hook.result.current.showBanner).toBe(true);
+    expect(toast).not.toHaveBeenCalled();
+  });
+
   test("非当前会话的 status 帧不动当前 UI", async () => {
     getRepoSelection.mockResolvedValue({
       selected: true,

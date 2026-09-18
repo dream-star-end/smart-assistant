@@ -1,5 +1,6 @@
-import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun, X } from 'lucide-react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
@@ -17,7 +18,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from '../LongContextCostWarning'
-import { Alert, Button, Input, Modal, Switch, useConfirm } from '../ui'
+import { Alert, Button, Modal, Select, Switch, useConfirm } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 
@@ -35,17 +36,27 @@ const uiToServerTheme = (t: Theme): 'light' | 'dark' | 'auto' => (t === 'system'
 // binding/inbound/outbound/proactive 全链缺席,推送尝试被 master 404 静默回退 webchat。
 // 在 v5 微信通道接通前(roadmap P1.2 专项决策)不渲染这两个开关,避免 UI 承诺做不到的事。
 // 偏好字段本身保留(preferences.ts allowlist),将来通道接通再放回渲染。
+//
+// Telegram 同理(审计 SET-05):后端只有管理员告警通道(admin/alertChannels),用户侧没有任何
+// 绑定入口,`notify_telegram` 打开也不会有消息送达 —— 通道接通并有绑定流程前不渲染。
 const NOTIF_FIELDS: { key: keyof PrefsView; label: string; hint?: string }[] = [
-  { key: 'notify_email', label: '邮件通知' },
-  { key: 'notify_telegram', label: 'Telegram 通知' },
+  { key: 'notify_email', label: '邮件通知', hint: '支付到账、订阅到期等重要事件发送到账号邮箱' },
 ]
 
-const MAX_HOTKEYS = 32
+export function isMacPlatform(): boolean {
+  if (typeof navigator === 'undefined') return false
+  return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent)
+}
+
+/** 修饰键按平台显示:macOS / iOS 为 ⌘,其余为 Ctrl(发送键选项与快捷键表共用)。 */
+export function modifierKeyLabel(): string {
+  return isMacPlatform() ? '⌘' : 'Ctrl'
+}
 
 /**
  * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
- * 通知开关。快捷键已拆到独立导航（pane="hotkeys"），仍读写同一份 prefs。
- * 最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
+ * 通知开关。快捷键是独立导航，由 SettingsCenter 直接渲染 `BuiltinHotkeysTable`
+ * （不经过本组件，也不依赖 prefs）。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
  * 主题权威源仍是 useTheme（live + localStorage）；这里只在用户切换时写穿一份到
@@ -61,7 +72,6 @@ export function PreferencesTab({
   onPatch,
   onUpgrade,
   onOpenMemory,
-  pane = 'preferences',
 }: {
   auth: AuthSession
   prefs: PrefsView
@@ -72,21 +82,21 @@ export function PreferencesTab({
   onPatch: (patch: Record<string, unknown>) => Promise<void>
   onUpgrade: () => void
   onOpenMemory: () => void
-  /** 快捷键从偏好拆到独立导航；hotkeys 仍读同一份 prefs。 */
-  pane?: 'preferences' | 'hotkeys'
 }) {
   const [models, setModels] = useState<PublicModel[]>([])
   const [err, setErr] = useState<string | null>(null)
   const [optimizerConsentOpen, setOptimizerConsentOpen] = useState(false)
   const [optimizerConsentSaving, setOptimizerConsentSaving] = useState(false)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
+  const composerPrefs = useLocalComposerPrefs()
 
   useEffect(() => {
     let alive = true
     api
       .getPublicModels(auth)
-      .then(({ models: m }) => {
-        if (alive) setModels(m)
+      .then((res) => {
+        // 返回体缺 models(旧网关 / 桩)时退化为空列表,而不是让下面的 find 把整页打崩。
+        if (alive) setModels(Array.isArray(res?.models) ? res.models : [])
       })
       .catch(() => {
         /* 模型列表拉取失败不致命：default_model 退化为只读展示当前值 */
@@ -132,21 +142,20 @@ export function PreferencesTab({
     prefs.default_effort && supportedEfforts.includes(prefs.default_effort)
       ? prefs.default_effort
       : ''
-
-  if (pane === 'hotkeys') {
-    return (
-      <div className="flex flex-col">
-        {err && (
-          <div className="px-5 pt-3">
-            <Alert tone="danger" className="text-meta">
-              {err}
-            </Alert>
-          </div>
-        )}
-        <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
-      </div>
-    )
-  }
+  const effortDisabled = models.length > 0 && effortOptions.length === 0
+  const modelOptions = [
+    { value: '', label: '跟随智能体默认' },
+    // 当前值不在可选列表里时（如已下架）仍补一条，避免显示错位
+    ...(prefs.default_model && !models.some((m) => m.id === prefs.default_model)
+      ? [{ value: prefs.default_model, label: prefs.default_model }]
+      : []),
+    ...models.map((m) => ({ value: m.id, label: modelLabel(m) })),
+  ]
+  const effortSelectOptions = [
+    { value: '', label: effortDisabled ? '当前模型不支持' : '跟随模型默认' },
+    ...effortOptions.map((o) => ({ value: o.value, label: o.label })),
+  ]
+  const mod = modifierKeyLabel()
 
   return (
     <div className="flex flex-col">
@@ -188,50 +197,96 @@ export function PreferencesTab({
         <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           对话默认
         </div>
+        {/* 下拉统一走 ui/Select(与 API 接入页同源),不再自绘一套原生 select(审计 SET-21)。 */}
         <label className="flex items-center justify-between gap-3 py-1.5">
           <span className="text-section text-fg">默认模型</span>
           <Select
+            aria-label="默认模型"
+            inputSize="sm"
+            className="w-auto max-w-[55%]"
             value={prefs.default_model ?? ''}
-            onChange={(v) => {
+            onValueChange={(v) => {
               void changeDefaultModel(v)
             }}
-          >
-            <option value="">跟随智能体默认</option>
-            {/* 当前值不在可选列表里时（如已下架）仍补一条，避免显示错位 */}
-            {prefs.default_model && !models.some((m) => m.id === prefs.default_model) && (
-              <option value={prefs.default_model}>{prefs.default_model}</option>
-            )}
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {modelLabel(m)}
-              </option>
-            ))}
-          </Select>
+            options={modelOptions}
+          />
         </label>
         <label className="flex items-center justify-between gap-3 py-1.5">
           <span className="text-section text-fg">思考深度</span>
           <Select
+            aria-label="思考深度"
+            inputSize="sm"
+            className="w-auto max-w-[55%]"
             value={selectedEffort}
-            onChange={(v) => patch({ default_effort: v === '' ? null : v })}
-            disabled={models.length > 0 && effortOptions.length === 0}
-          >
-            <option value="">
-              {models.length > 0 && effortOptions.length === 0 ? '当前模型不支持' : '跟随模型默认'}
-            </option>
-            {effortOptions.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </Select>
+            onValueChange={(v) => patch({ default_effort: v === '' ? null : v })}
+            disabled={effortDisabled}
+            options={effortSelectOptions}
+          />
         </label>
+      </div>
+
+      {/* 输入：仅本设备 */}
+      <div className="border-t border-border px-5 py-4">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+          输入
+        </div>
+        <p className="pb-3 text-meta text-muted">仅本设备生效</p>
+        <div className="pb-2 text-section text-fg">发送键</div>
+        <div className="mb-3 grid grid-cols-2 gap-2">
+          {(
+            [
+              { value: 'enter' as const, label: 'Enter 发送' },
+              // 修饰键随平台(审计 SET-20):Windows / Linux 用户看到的是 Ctrl,不是 ⌘。
+              { value: 'mod-enter' as const, label: `${mod}+Enter 发送` },
+            ] as const
+          ).map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => composerPrefs.setSendKey(o.value)}
+              aria-pressed={composerPrefs.sendKey === o.value}
+              className={cn(
+                'flex items-center justify-center rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                composerPrefs.sendKey === o.value
+                  ? 'border-accent bg-accent-soft text-accent'
+                  : 'border-border text-muted hover:bg-hover hover:text-fg',
+              )}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+        <div className="pb-2 text-section text-fg">字号</div>
+        <div className="grid grid-cols-2 gap-2">
+          {(
+            [
+              { value: 'default' as const, label: '默认' },
+              { value: 'large' as const, label: '大' },
+            ] as const
+          ).map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => composerPrefs.setFontSize(o.value)}
+              aria-pressed={composerPrefs.fontSize === o.value}
+              className={cn(
+                'flex items-center justify-center rounded-xl border px-3 py-3 text-body outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                composerPrefs.fontSize === o.value
+                  ? 'border-accent bg-accent-soft text-accent'
+                  : 'border-border text-muted hover:bg-hover hover:text-fg',
+              )}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Max+ 特色功能：V5 原生后台记忆整理（默认关闭，真实调用按实际积分计费）。 */}
       <div className="border-t border-border px-5 py-4">
         <div className="overflow-hidden rounded-2xl border border-accent/25 bg-gradient-to-br from-accent-soft via-surface to-surface shadow-sm">
           <div className="flex items-start gap-3 px-4 pb-3 pt-4">
-            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-sm">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg shadow-sm">
               <MoonStar size={20} />
             </div>
             <div className="min-w-0 flex-1">
@@ -287,7 +342,7 @@ export function PreferencesTab({
                 <button
                   type="button"
                   onClick={onUpgrade}
-                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-meta font-medium text-white outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
+                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-meta font-medium text-accent-fg outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   升级到 Max
                 </button>
@@ -389,101 +444,33 @@ export function PreferencesTab({
   )
 }
 
-/** 自定义快捷键（hotkeys: 动作名 → 按键，最多 32 条，键/值 ≤ 64 字符）。 */
-function HotkeysEditor({
-  hotkeys,
-  onPatch,
-}: {
-  hotkeys: Record<string, string>
-  onPatch: (p: Record<string, unknown>) => Promise<void>
-}) {
-  const [name, setName] = useState('')
-  const [combo, setCombo] = useState('')
-  const [err, setErr] = useState<string | null>(null)
-  const entries = Object.entries(hotkeys)
-
-  async function add() {
-    const k = name.trim()
-    const v = combo.trim()
-    setErr(null)
-    if (!k || !v) return
-    if (k.length > 64 || v.length > 64) {
-      setErr('名称与按键均需 ≤ 64 字符。')
-      return
-    }
-    if (!(k in hotkeys) && entries.length >= MAX_HOTKEYS) {
-      setErr(`最多 ${MAX_HOTKEYS} 个快捷键。`)
-      return
-    }
-    await onPatch({ hotkeys: { ...hotkeys, [k]: v } })
-    setName('')
-    setCombo('')
-  }
-
-  async function remove(k: string) {
-    const next = { ...hotkeys }
-    delete next[k]
-    // 删空 → 整字段删除（null）；否则提交剩余全集（hotkeys 在顶层是单 key，整体替换）
-    await onPatch({ hotkeys: entries.length === 1 ? null : next })
-  }
-
+/** 内置快捷键只读表。由 SettingsCenter 的「快捷键」分区直接渲染,不依赖 prefs / 模型列表。 */
+export function BuiltinHotkeysTable() {
+  const mod = modifierKeyLabel()
+  const rows: Array<{ keys: string; action: string }> = [
+    { keys: `${mod}+K`, action: '搜索会话' },
+    { keys: `${mod}+Shift+O`, action: '新建会话' },
+    { keys: 'Esc', action: '停止生成（生成中）' },
+    { keys: 'Enter / Shift+Enter', action: '发送 / 换行（桌面）' },
+    { keys: `${mod}+V`, action: '粘贴图片为附件' },
+    { keys: `${mod}+F`, action: '会话内查找' },
+    { keys: '↑(空输入框)', action: '编辑上一条' },
+  ]
   return (
-    <div className="border-t border-border px-5 py-4">
+    <div className="px-5 py-4">
       <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-        自定义快捷键
+        内置快捷键
       </div>
-      {err && (
-        <Alert tone="warning" className="mb-2 text-meta">
-          {err}
-        </Alert>
-      )}
-      {entries.length === 0 ? (
-        <p className="pb-2 text-meta text-faint">还没有自定义快捷键。</p>
-      ) : (
-        <ul className="mb-2 flex flex-col gap-1">
-          {entries.map(([k, v]) => (
-            <li key={k} className="flex items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-hover">
-              <span className="min-w-0 flex-1 truncate text-body text-fg">{k}</span>
-              <kbd className="rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-caption text-muted">
-                {v}
-              </kbd>
-              <button
-                onClick={() => remove(k)}
-                aria-label={`删除 ${k}`}
-                className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint outline-none hover:bg-danger-soft hover:text-danger focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X size={13} />
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      <div className="flex items-center gap-2">
-        <Input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="动作名"
-          maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-body"
-        />
-        <Input
-          value={combo}
-          onChange={(e) => setCombo(e.target.value)}
-          placeholder="如 Ctrl+K"
-          maxLength={64}
-          className="h-auto bg-bg px-3 py-2 text-body"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') add()
-          }}
-        />
-        <button
-          onClick={add}
-          disabled={!name.trim() || !combo.trim()}
-          className="shrink-0 rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-        >
-          添加
-        </button>
-      </div>
+      <ul className="flex flex-col gap-1">
+        {rows.map((row) => (
+          <li key={row.action} className="flex items-center gap-3 rounded-lg px-2 py-1.5">
+            <kbd className="shrink-0 rounded-md border border-border bg-bg px-1.5 py-0.5 font-mono text-caption text-muted">
+              {row.keys}
+            </kbd>
+            <span className="min-w-0 flex-1 text-body text-fg">{row.action}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }
@@ -491,28 +478,4 @@ function HotkeysEditor({
 function modelLabel(m: PublicModel): string {
   const raw = (m as Record<string, unknown>).label ?? (m as Record<string, unknown>).name
   return typeof raw === 'string' && raw.length > 0 ? raw : m.id
-}
-
-/** 轻量原生 select（无 Select 原语；统一 token 化样式，可访问）。 */
-function Select({
-  value,
-  onChange,
-  children,
-  disabled,
-}: {
-  value: string
-  onChange: (v: string) => void
-  children: ReactNode
-  disabled?: boolean
-}) {
-  return (
-    <select
-      value={value}
-      disabled={disabled}
-      onChange={(e) => onChange(e.target.value)}
-      className="max-w-[55%] rounded-lg border border-border bg-bg px-2.5 py-1.5 text-body text-fg outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-    >
-      {children}
-    </select>
-  )
 }

@@ -7,8 +7,8 @@
 //   本文件把"真浏览器受信事件"前置到 CI:凡动 Composer 等高频交互面,合并前必过。
 //
 // 用例(每条都是曾经/可能的生产回归形态):
-//   T1 点「+」→「添加附件」→ filechooser 真实弹出(post-dispatch activation 存活);
-//   T2 附件菜单随后正常关闭(preventDefault 不至于让菜单常驻);
+//   T1 点工具条回形针「添加附件」label → filechooser 真实弹出(一级入口,不经「+」菜单);
+//   T2 「+」菜单不再含「添加附件」,回形针 label 常驻且点开菜单可关掉;
 //   T3 选文件后 chip 出现且非 error 态(onUpload stub → done);
 //   T4 file input 结构红线:type=file / 无 accept / 计算样式非 display:none / tabindex=-1
 //      (国产内核约束 61de46e2/de16e2be 的真浏览器断言);
@@ -191,7 +191,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-short"]{min-height:80px}
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
   #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="process-card-owner-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -270,6 +270,15 @@ const serveBuiltAsset = (route, request) => {
 };
 // 先注册 catch-all,再注册 harness 页:playwright 后注册者优先,harness URL 命中专用处理。
 await page.route("**/*", serveBuiltAsset);
+await page.route("**/api/agents", (route, request) => {
+  if (request.method() !== "GET") return route.fallback();
+  return route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    // T34 is the ordinary main-memory scenario, without an identity registration.
+    body: JSON.stringify({ agents: [{ id: "main", name: "全能助手" }], default: "main" }),
+  });
+});
 await page.route("**/api/agents/main/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/agents/main/memory/memory" && request.method() === "GET") {
@@ -550,9 +559,8 @@ async function check(name, fn) {
 
 const primaryComposer = page.locator("#root");
 const plusButton = primaryComposer.getByRole("button", { name: "更多选项" });
-// DropdownMenuContent renders in a body-level portal. Scope only the trigger
-// to the primary composer; the menu item itself must be located from the page.
-const attachItem = page.getByText("添加附件");
+// 附件已是工具条一级 <label htmlFor>，禁止再点「+」菜单里的「添加附件」。
+const attachLabel = primaryComposer.locator('label[aria-label="添加附件"]');
 
 await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回执", async () => {
   const memoryRoot = page.locator("#memory-report-root");
@@ -568,20 +576,28 @@ await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回
   }
 });
 
-await check("T1 点「+」→「添加附件」→ filechooser 真实弹出", async () => {
-  await plusButton.click();
-  await attachItem.waitFor({ state: "visible", timeout: 3000 });
+await check("T1 点工具条回形针「添加附件」→ filechooser 真实弹出", async () => {
+  await attachLabel.waitFor({ state: "visible", timeout: 3000 });
   const [chooser] = await Promise.all([
     page.waitForEvent("filechooser", { timeout: 3000 }),
-    attachItem.click(),
+    attachLabel.click(),
   ]);
   const probe = join(outDir, "attach-probe.txt");
   writeFileSync(probe, "browser-tests attach probe\n");
   await chooser.setFiles(probe);
 });
 
-await check("T2 附件菜单随后正常关闭(不常驻)", async () => {
-  await attachItem.waitFor({ state: "hidden", timeout: 3000 });
+await check("T2 「+」菜单不再含「添加附件」且不常驻挡住输入区", async () => {
+  await attachLabel.waitFor({ state: "visible", timeout: 3000 });
+  await plusButton.click();
+  const menuAttach = page.getByRole("menuitem", { name: "添加附件" });
+  if (await menuAttach.count() !== 0) {
+    throw new Error("「+」菜单仍残留「添加附件」项");
+  }
+  const goalItem = page.getByRole("menuitem", { name: "设定目标" });
+  await goalItem.waitFor({ state: "visible", timeout: 3000 });
+  await page.keyboard.press("Escape");
+  await goalItem.waitFor({ state: "hidden", timeout: 3000 });
 });
 
 await check("T3 选文件后 chip 出现且非 error 态(stub 上传 → done)", async () => {
@@ -1194,7 +1210,7 @@ await check("T61 刷新后 HUD 仍钉住且畸形 agent-group 只落 MessageBoun
   await probe.waitFor({ state: "visible", timeout: 3000 });
   // (a) sending=false(刷新形态)下当前轮有未完成任务 → HUD 钉住并显示进度与待办。
   const tracker = probe.locator("[data-testid='hud-refresh-tracker']");
-  await tracker.getByText("任务 1/2", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  await tracker.getByText("任务列表 1/2", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   await tracker.getByText("容器重建后真机验证", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   // (b) 邻居行仍在:用户「继续」与终稿「已处理完毕。」
   await probe.getByText("继续", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
@@ -1242,9 +1258,20 @@ async function visibleButtonNames(scopeSelector) {
   return page.evaluate((selector) => {
     const scope = document.querySelector(selector);
     if (!scope) throw new Error(`缺少挂载根 ${selector}`);
+    // 可及名按 accname 优先级取:aria-labelledby(工具卡表头,tools 审计 T-22 起) > aria-label > 文本。
+    const nameOf = (node) => {
+      const labelledBy = node.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        return labelledBy
+          .split(/\s+/)
+          .map((id) => document.getElementById(id)?.textContent ?? "")
+          .join(" ");
+      }
+      return node.getAttribute("aria-label") ?? node.textContent ?? "";
+    };
     return Array.from(scope.querySelectorAll("button"))
       .filter((node) => node.getClientRects().length > 0)
-      .map((node) => (node.getAttribute("aria-label") ?? node.textContent ?? "").replace(/\s+/g, " ").trim());
+      .map((node) => nameOf(node).replace(/\s+/g, " ").trim());
   }, scopeSelector);
 }
 async function assertVisibleButtonSet(scopeSelector, expected, label) {
@@ -1270,15 +1297,15 @@ await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录�
     "团队队员卡",
   );
 
-  await assertVisibleButtonSet("#timeline-agent-root", ["收起终端详情"], "通用 ToolCard");
+  // 表头可及名 = 标签 + 摘要 + 状态(T-22 起不再是「收起终端详情」);展开态由 aria-expanded 表达。
+  await assertVisibleButtonSet("#timeline-agent-root", ["终端 printf exact 完成"], "通用 ToolCard");
 });
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
   const root = page.locator("#tool-card-polish-root");
-  const header = root.getByRole("button", {
-    name: /^(?:展开|收起)搜索 AI 市场详情$/,
-  });
+  const header = root.getByRole("button", { name: /^搜索 AI 市场/ });
   await header.waitFor({ state: "visible", timeout: 3000 });
+  if ((await header.getAttribute("aria-expanded")) !== "false") throw new Error("完成态工具卡应默认折叠");
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
 
@@ -1286,11 +1313,32 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   // "浏览器能力 10",触发 strict mode violation = 假红。
   await header.focus();
   await header.press("Enter");
+  if ((await header.getAttribute("aria-expanded")) !== "true") throw new Error("Enter 后表头 aria-expanded 应为 true");
   await root.getByText("浏览器能力 1", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   if (await root.getByText("浏览器能力 9", { exact: true }).count() !== 0) {
     throw new Error("市场列表未按需渐进展示");
   }
-  await root.getByRole("button", { name: /查看更多/ }).click();
+  // 卡内文字型操作(查看更多 / 展开全部 / 收起…)与表头同一 44px 触控标准(tools 审计 T-08)。
+  // 主 harness 是桌面(hover 可用)上下文:用 CDP 临时开触摸仿真 —— Chromium 在触摸仿真下把
+  // primary hover 置为 none、pointer 置为 coarse,`[@media(hover:none)]` 规则即刻生效(Playwright 的
+  // hasTouch 走的就是这条),量一次真实高度再还原;不必另起一个完整 harness 上下文。
+  const more = root.getByRole("button", { name: /查看更多/ });
+  await more.waitFor({ state: "visible", timeout: 3000 });
+  const desktopMore = await more.boundingBox();
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
+    const hoverNone = await page.evaluate(() => window.matchMedia("(hover: none)").matches);
+    if (!hoverNone) throw new Error("触摸仿真未让 (hover: none) 生效,无法测触控高度");
+    const touchMore = await more.boundingBox();
+    if (!touchMore || touchMore.height < TOUCH_MIN) {
+      throw new Error(`触屏下卡内「查看更多」高度=${touchMore?.height ?? 0}px，应至少 44px(桌面 ${desktopMore?.height ?? 0}px)`);
+    }
+  } finally {
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await cdp.detach();
+  }
+  await more.click();
   await root.getByText("浏览器能力 10", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
 
   await header.focus();
@@ -1299,7 +1347,7 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
   // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
-  await assertVisibleButtonSet("#tool-card-polish-root", ["展开搜索 AI 市场详情"], "美化后的工具卡");
+  await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场 browser 完成"], "美化后的工具卡");
 });
 
 await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
@@ -1902,9 +1950,10 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
     );
   }
 
-  // ③ 顶栏四个入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
+  // ③ 顶栏入口全在视口内(挤爆时最先被推出去的是右侧查找/铃铛)。
   const headerEntries = [
     ["打开菜单", "汉堡(唯一的移动侧栏入口)"],
+    ["会话内查找", "会话内查找"],
     ["站内信", "站内信"],
     ["账户与计费", "余额"],
     ["选择对话模型", "模型选择器"],
@@ -1922,11 +1971,24 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if ((await mobilePage.evaluate(() => window.__mobilePage.navOpens)) !== 1) {
     throw new Error("移动端汉堡点了没反应(侧栏抽屉打不开)");
   }
-  await mobilePage.getByRole("button", { name: "更多选项" }).click();
-  const attach = mobilePage.getByRole("menuitem", { name: "添加附件" });
-  await attach.waitFor({ state: "visible", timeout: 3000 });
-  await mobilePage.keyboard.press("Escape");
-  await attach.waitFor({ state: "hidden", timeout: 3000 });
+  const mobileAttach = mobilePage.locator('label[aria-label="添加附件"]');
+  await mobileAttach.waitFor({ state: "visible", timeout: 3000 });
+  const attachBox = await mobileAttach.boundingBox();
+  if (!attachBox) throw new Error("移动端添加附件入口不可见");
+  if (attachBox.x < 0 || attachBox.x + attachBox.width > 390 + 1) {
+    throw new Error(`移动端添加附件被挤出视口: x=${Math.round(attachBox.x)} w=${Math.round(attachBox.width)}`);
+  }
+  // 本夹具未接设定目标，「+」按产品契约退化为禁用锚点；不得再出现附件菜单项。
+  const mobilePlus = mobilePage.getByRole("button", { name: "更多选项" });
+  if ((await mobilePlus.getAttribute("title")) !== "会话目标暂不可用") {
+    throw new Error("移动端无目标时「+」应是禁用锚点(title=会话目标暂不可用;附件早已迁到一级回形针,不再说附件不可用)");
+  }
+  if (await mobilePlus.isEnabled()) {
+    throw new Error("移动端无目标时「+」不应可点");
+  }
+  if (await mobilePage.getByRole("menuitem", { name: "添加附件" }).count() !== 0) {
+    throw new Error("移动端仍出现「添加附件」菜单项");
+  }
 
   const box = await mobilePage.getByRole("textbox").boundingBox();
   if (!box) throw new Error("输入框不可见");
@@ -1941,6 +2003,74 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   const sends = await mobilePage.evaluate(() => window.__mobilePage.sends);
   if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {
     throw new Error(`移动端发送结果漂移: ${JSON.stringify(sends)}`);
+  }
+});
+
+// ── T68 触屏动作行折叠(messages 审计 M-03)──────────────────────────────────────
+// 触屏没有 hover:此前每条消息下方常显整排 44px 动作图标(助手 5 个、用户 3 个)+ 状态标签,
+// 长会话里 1 行正文配 3 行 chrome。现在触屏默认只露一个「更多操作」开关,点开才展开整排。
+// jsdom 无 CSS 量不出"看得见/看不见",这里在 (hover:none) 真生效的 390×844 上下文里量。
+await check("T68 390px 触屏:动作行默认只露 44px「更多操作」,点开才展开整排,末条助手默认展开", async () => {
+  screenshotPage = mobilePage;
+  const hoverNone = await mobilePage.evaluate(() => matchMedia("(hover: none)").matches);
+  if (!hoverNone) throw new Error("移动上下文未仿真 (hover: none),本用例前提不成立(hasTouch 丢了?)");
+
+  // ① 历史用户行:默认折叠 —— 开关可见且 ≥44px,整排动作(复制)不可见(display:none,不只是透明)。
+  const userRow = mobilePage.getByTestId("user-row").first();
+  const userToggle = userRow.getByRole("button", { name: "更多操作" });
+  await userToggle.waitFor({ state: "visible", timeout: 5000 });
+  const toggleBox = await userToggle.boundingBox();
+  if (!toggleBox || toggleBox.height < TOUCH_MIN || toggleBox.width < TOUCH_MIN) {
+    throw new Error(`「更多操作」开关触控靶不足 44px: ${JSON.stringify(toggleBox)}`);
+  }
+  if ((await userToggle.getAttribute("aria-expanded")) !== "false") {
+    throw new Error("历史用户行的动作行默认应折叠(aria-expanded=false)");
+  }
+  const userCopy = userRow.getByRole("button", { name: "复制", exact: true });
+  if (await userCopy.isVisible()) {
+    throw new Error("触屏下用户行的整排动作在未点开时就常显(M-03 回归)");
+  }
+  const rowActions = await userRow.evaluate((node) => {
+    // 折叠态下整条动作区只该有开关这一排:量开关所在容器的高度。
+    const toggle = node.querySelector('button[aria-label="更多操作"]');
+    const container = toggle?.parentElement;
+    return container ? container.getBoundingClientRect().height : -1;
+  });
+  if (rowActions < 0 || rowActions > 48) {
+    throw new Error(`折叠态动作区应只有一排 44px 开关,实测高度 ${rowActions}px`);
+  }
+
+  // ② 受信点击开关 → 整排展开,每个动作 ≥44px;再点「收起操作」恢复折叠。
+  await userToggle.click();
+  await userCopy.waitFor({ state: "visible", timeout: 3000 });
+  const copyBox = await userCopy.boundingBox();
+  if (!copyBox || copyBox.height < TOUCH_MIN || copyBox.width < TOUCH_MIN) {
+    throw new Error(`展开后动作按钮触控靶不足 44px: ${JSON.stringify(copyBox)}`);
+  }
+  const collapse = userRow.getByRole("button", { name: "收起操作" });
+  if ((await collapse.getAttribute("aria-expanded")) !== "true") {
+    throw new Error("点开后开关应报告 aria-expanded=true");
+  }
+  await collapse.click();
+  await userCopy.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await userRow.getByRole("button", { name: "更多操作" }).getAttribute("aria-expanded")) !== "false") {
+    throw new Error("收起后开关应回到 aria-expanded=false");
+  }
+
+  // ③ 末轮末条助手回复(最常要复制/重新生成的那条)默认展开:「复制纯文本」直接可见且 ≥44px。
+  //    (用「复制纯文本」而非「复制」定位:助手正文里的代码块自带一个「复制」按钮。)
+  const assistantRow = mobilePage
+    .getByTestId("assistant-row")
+    .filter({ hasText: "MOBILE_ASSISTANT_TAIL_MARKER" });
+  const plainCopy = assistantRow.getByRole("button", { name: "复制纯文本" });
+  await plainCopy.waitFor({ state: "visible", timeout: 5000 });
+  const plainBox = await plainCopy.boundingBox();
+  if (!plainBox || plainBox.height < TOUCH_MIN) {
+    throw new Error(`末条助手动作按钮触控靶不足 44px: ${JSON.stringify(plainBox)}`);
+  }
+  const assistantCollapse = assistantRow.getByRole("button", { name: "收起操作" });
+  if ((await assistantCollapse.getAttribute("aria-expanded")) !== "true") {
+    throw new Error("末轮末条助手回复的动作行应默认展开");
   }
 });
 
@@ -2056,22 +2186,86 @@ await check("T63 滚轮连续上滑期间 controller 不写 scrollTop，无回�
   const y = Math.round(box.y + box.height / 2);
   await mobilePage.mouse.move(x, y);
   const before = await scroll.evaluate((node) => node.scrollTop);
-  // 连续 12 次滚轮上滑,间隔短于 quiet window,模拟一次真实的滚轮/触控板手势。
+  // 连续发出 12 次真实滚轮上滑。校正与真实 scroll 事件同步，不能用 Node 的
+  // wait40 + 多次跨进程调用推断手势还活跃（实际曾到 303ms，已合法 quiet）。
   // 每一步都记下 scrollTop:任何一步位置比上一步更靠下(回弹)即失败。
   const tops = [];
-  for (let i = 0; i < 12; i += 1) {
-    await mobilePage.mouse.wheel(0, -120);
-    await mobilePage.waitForTimeout(40);
-    const s = await scroll.evaluate((node) => ({
-      top: node.scrollTop,
-      fence: window.__mobilePage.wheelFence,
-      writes: window.__mobilePage.programmaticWrites,
-    }));
-    // 上方行从 200px 估高变真实高度时 RO 要求校正;篱笆期间必须挂起而不是写。
-    await mobilePage.evaluate(() => window.__mobilePage.attemptViewportCorrection(24));
-    if (!s.fence) throw new Error(`第 ${i + 1} 次滚轮后篱笆未保持: ${JSON.stringify(s)}`);
-    if (s.writes !== 0) throw new Error(`滚轮期间出现程序化 scrollTop 写入: ${JSON.stringify(s)}`);
-    tops.push(s.top);
+  await scroll.evaluate((node) => {
+    const samples = [];
+    const waiters = new Map();
+    let pending = null;
+    let closed = false;
+    const onWheel = (event) => { pending = { trusted: event.isTrusted, at: performance.now() }; };
+    const onScroll = () => {
+      if (!pending) return;
+      const input = pending;
+      pending = null;
+      // Installed after React's native scroll listener and attachWheelFence.
+      // Observe the real scroll after its transient intent mark was consumed,
+      // then attempt RO-style correction in this same browser microtask.
+      queueMicrotask(() => {
+        if (closed) return;
+        const s = {
+          top: node.scrollTop,
+          fence: window.__mobilePage.wheelFence,
+          writes: window.__mobilePage.programmaticWrites,
+          trusted: input.trusted,
+          inputToScrollMs: performance.now() - input.at,
+        };
+        window.__mobilePage.attemptViewportCorrection(24);
+        s.writesAfterCorrection = window.__mobilePage.programmaticWrites;
+        const index = samples.push(s) - 1;
+        const waiter = waiters.get(index);
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          waiters.delete(index);
+          waiter.resolve(s);
+        }
+      });
+    };
+    node.addEventListener("wheel", onWheel, { passive: true });
+    node.addEventListener("scroll", onScroll, { passive: true });
+    window.__t63Gesture = {
+      samples,
+      take(index) {
+        if (samples[index]) return Promise.resolve(samples[index]);
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            waiters.delete(index);
+            reject(new Error(`真实滚轮未产生 scroll 样本: step=${index + 1}, observed=${samples.length}`));
+          }, 5000);
+          waiters.set(index, { resolve, reject, timer });
+        });
+      },
+      cleanup() {
+        closed = true;
+        node.removeEventListener("wheel", onWheel);
+        node.removeEventListener("scroll", onScroll);
+        for (const waiter of waiters.values()) {
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error("滚轮探针已结束"));
+        }
+        delete window.__t63Gesture;
+      },
+    };
+  });
+  try {
+    for (let i = 0; i < 12; i += 1) {
+      const [s] = await Promise.all([
+        mobilePage.evaluate((index) => window.__t63Gesture.take(index), i),
+        mobilePage.mouse.wheel(0, -120),
+      ]);
+      if (!s.trusted) throw new Error(`滚轮不是浏览器受信输入: ${JSON.stringify(s)}`);
+      if (!s.fence) throw new Error(`第 ${i + 1} 次滚轮后篱笆未保持: ${JSON.stringify(s)}`);
+      if (s.writes !== 0) throw new Error(`滚轮期间出现程序化 scrollTop 写入: ${JSON.stringify(s)}`);
+      if (s.writesAfterCorrection !== 0) throw new Error(`篱笆内校正写入了 scrollTop: ${JSON.stringify(s)}`);
+      tops.push(s.top);
+    }
+    const samples = await mobilePage.evaluate(() => window.__t63Gesture.samples);
+    if (samples.length !== 12) throw new Error(`真实滚轮样本数不符: ${samples.length}`);
+    console.log(`[T63 real scroll samples] ${JSON.stringify(samples)}`);
+  } finally {
+    await mobilePage.evaluate(() => window.__t63Gesture?.cleanup());
   }
   for (let i = 1; i < tops.length; i += 1) {
     if (tops[i] > tops[i - 1] + 1) {
@@ -2162,6 +2356,115 @@ await check("T65 上滑与底部占位收起合并进同一 scroll 事件时不�
     throw new Error(`占位收起后追加内容把视口拉回底部: ${JSON.stringify({ after, afterGrow })}`);
   }
   if (afterGrow.following) throw new Error("追加内容后错误恢复贴底态");
+});
+await check("T66 回到底部按钮不参与滚动几何：滚轮回底时 following 只翻一次、无 clamp 回弹、按钮只切可见", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 1200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 80);
+  // 贴底态:dock 常驻挂载(它是 RO root 的子节点),只是不可见;记下此时的 scrollHeight。
+  const dock = mobilePage.getByTestId("scroll-to-bottom-dock");
+  const dockCount = await dock.count();
+  if (dockCount !== 1) throw new Error(`贴底时 dock 未常驻挂载: count=${dockCount}`);
+  const atBottom = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+    dockVisible: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible"),
+    dockHeight: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getBoundingClientRect().height,
+  }));
+  if (!atBottom.following || Math.abs(atBottom.top - atBottom.max) > 2) {
+    throw new Error(`T66 前置未贴底: ${JSON.stringify(atBottom)}`);
+  }
+  if (atBottom.dockVisible !== "false") throw new Error(`贴底时按钮应不可见: ${JSON.stringify(atBottom)}`);
+  if (atBottom.dockHeight !== 0) throw new Error(`dock 必须零高度: ${JSON.stringify(atBottom)}`);
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可滚轮几何");
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + box.height / 2);
+  await mobilePage.mouse.move(x, y);
+  // 上滑 4 tick 离底 → 按钮出现。scrollHeight 不得因按钮出现而变化。
+  for (let i = 0; i < 4; i += 1) {
+    await mobilePage.mouse.wheel(0, -120);
+    await mobilePage.waitForTimeout(40);
+  }
+  await mobilePage.waitForFunction(
+    () => document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible") === "true",
+    null,
+    { timeout: 2000 },
+  );
+  const away = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    following: window.__mobilePage.following,
+    fence: window.__mobilePage.wheelFence,
+  }));
+  if (away.following) throw new Error(`上滑后仍贴底: ${JSON.stringify(away)}`);
+  if (away.height !== atBottom.height) {
+    throw new Error(`按钮出现改变了 scrollHeight: ${atBottom.height} → ${away.height}`);
+  }
+  const btn = mobilePage.getByTestId("scroll-to-bottom");
+  const btnBox = await btn.boundingBox();
+  if (!btnBox || btnBox.width < 30) throw new Error(`离底后按钮不可见: ${JSON.stringify(btnBox)}`);
+  if (btnBox.y + btnBox.height > box.y + box.height + 1) {
+    throw new Error(`按钮溢出滚动区底边: btn=${JSON.stringify(btnBox)} scroll=${JSON.stringify(box)}`);
+  }
+  // 篱笆仍在(离上次输入 <200ms)时滚轮回底。旧实现:following 翻真 → 按钮卸载 →
+  // scrollHeight -52 → clamp scroll 事件带 hadUserIntent → 判成离底 → following 再翻假
+  // → 按钮再挂载 …… 用户看到的是每次回底都弹一下。现在 following 只允许翻一次。
+  await mobilePage.evaluate(() => { window.__mobilePage.followingFlips = 0; window.__mobilePage.programmaticWrites = 0; });
+  const tops = [];
+  for (let i = 0; i < 8; i += 1) {
+    await mobilePage.mouse.wheel(0, 120);
+    await mobilePage.waitForTimeout(40);
+    tops.push(await scroll.evaluate((node) => node.scrollTop));
+  }
+  await mobilePage.waitForTimeout(WHEEL_QUIET_MS + 200);
+  const back = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    max: node.scrollHeight - node.clientHeight,
+    following: window.__mobilePage.following,
+    flips: window.__mobilePage.followingFlips,
+    fence: window.__mobilePage.wheelFence,
+    writes: window.__mobilePage.programmaticWrites,
+    dockVisible: document.querySelector('[data-testid="scroll-to-bottom-dock"]')?.getAttribute("data-visible"),
+    dockCount: document.querySelectorAll('[data-testid="scroll-to-bottom-dock"]').length,
+  }));
+  if (back.fence) throw new Error(`回底静止后篱笆未释放: ${JSON.stringify(back)}`);
+  if (Math.abs(back.top - back.max) > 2) throw new Error(`滚轮回底未到底: ${JSON.stringify(back)}`);
+  if (!back.following) throw new Error(`回底后未恢复贴底: ${JSON.stringify(back)}`);
+  if (back.flips !== 1) {
+    throw new Error(`回底过程 following 翻转 ${back.flips} 次(应恰好 1 次): tops=${tops.join(",")} ${JSON.stringify(back)}`);
+  }
+  if (back.height !== atBottom.height) {
+    throw new Error(`回底后 scrollHeight 变化(按钮参与了几何): ${atBottom.height} → ${back.height}`);
+  }
+  for (let i = 1; i < tops.length; i += 1) {
+    if (tops[i] < tops[i - 1] - 1) {
+      throw new Error(`滚轮回底途中被向上夹回: step ${i} ${tops[i - 1]} → ${tops[i]} (all=${tops.join(",")})`);
+    }
+  }
+  if (back.writes !== 0) throw new Error(`回底期间出现程序化写入: ${JSON.stringify(back)}`);
+  if (back.dockCount !== 1 || back.dockVisible !== "false") {
+    throw new Error(`回底后按钮应仍挂载但不可见: ${JSON.stringify(back)}`);
+  }
+  // 贴底后追加内容仍跟随(following 真的稳定为 true,不是巧合落底)。
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    dist: node.scrollHeight - node.scrollTop - node.clientHeight,
+    following: window.__mobilePage.following,
+  }));
+  if (!afterGrow.following || afterGrow.dist > 2) {
+    throw new Error(`回底后追加内容未跟随: ${JSON.stringify(afterGrow)}`);
+  }
 });
 screenshotPage = page;
 
@@ -2473,7 +2776,11 @@ await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用
 await check("T30 视频任务中心持久排队、实时进度与跨 worker 取消终态", async () => {
   await page.evaluate(() => window.__openMediaTask(true));
   await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
-  await page.getByText("排队中 · queued", { exact: true }).waitFor({ state: "visible" });
+  // 审计 M-05：与 status 同义的 phase（queued/canceled）不再重复拼在状态后面，原始 phase 只留在 title 里排障。
+  await page.getByText("排队中", { exact: true }).first().waitFor({ state: "visible" });
+  if (await page.getByText(/· queued/).count()) {
+    throw new Error("任务状态行仍把协议 phase 枚举原样拼给用户");
+  }
   await page.evaluate(() => window.__pushMediaJob({
     id: "33333333-3333-4333-8333-333333333333",
     requestId: "browser-media-request",
@@ -2497,13 +2804,46 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     updatedAt: "2026-08-05T00:00:01.000Z",
   }));
   await page.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
-  const canceled = page.waitForRequest((request) =>
-    request.method() === "POST" && request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
-  );
-  await page.getByRole("button", { name: "取消" }).click();
-  const request = await canceled;
-  if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
-  await page.getByText("已取消 · canceled", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  await page.getByText("生成中 · 正在生成画面", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const cancelRequests = [];
+  const onCancelRequest = (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel")
+    ) {
+      cancelRequests.push(request);
+    }
+  };
+  page.on("request", onCancelRequest);
+  try {
+    // 审计 M-06：取消是不可逆操作，先弹确认层；「再想想」不发请求，「取消任务」才发且只发一次。
+    // exact:true:同页 #interrupted-tool-status-root 的工具卡表头可及名含「已取消」(tools T-22 起
+    // 表头可及名 = 标签 + 摘要 + 状态),子串匹配会撞成 strict mode violation。
+    await page.getByRole("button", { name: "取消", exact: true }).click();
+    const confirmDialog = page.getByRole("dialog", { name: "取消这个视频任务？" });
+    await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
+    await confirmDialog.getByRole("button", { name: "再想想" }).click();
+    await confirmDialog.waitFor({ state: "hidden", timeout: 3000 });
+    await page.waitForTimeout(300);
+    if (cancelRequests.length !== 0) throw new Error("「再想想」不该发出取消请求");
+
+    await page.getByRole("button", { name: "取消", exact: true }).click();
+    await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
+    const canceled = page.waitForRequest(
+      (request) =>
+        request.method() === "POST" &&
+        request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
+      { timeout: 5000 },
+    );
+    await confirmDialog.getByRole("button", { name: "取消任务" }).click();
+    const request = await canceled;
+    if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
+  } finally {
+    page.off("request", onCancelRequest);
+  }
+  // M-05 起状态行不再拼协议 phase(原「已取消 · canceled」),只剩「已取消」。
+  await page.getByText("已取消", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
+  if (cancelRequests.length !== 1) throw new Error(`取消请求应只发一次，实际 ${cancelRequests.length} 次`);
   if (await page.getByRole("button", { name: "取消", exact: true }).count()) {
     throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
   }
@@ -2745,7 +3085,8 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
       };
     });
     if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
-    if (activeState.durationText !== "8m" || !activeState.durationTitle.includes("→")) {
+    // 用时改用中文单位（侧栏审计 SR-01：中文界面不混英文缩写 25m/3h/2d），8 分钟 → 「8分」。
+    if (activeState.durationText !== "8分" || !activeState.durationTitle.includes("→")) {
       throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
     }
     if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
@@ -2763,8 +3104,15 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
       throw new Error(`管理中心仍占侧栏主区(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: "打开使用教程" }).count() !== 1) {
-      throw new Error(`底栏教程图标丢失(${theme})`);
+    const gallery = sidebar.getByRole("button", { name: "打开案例展厅", exact: true });
+    if (await gallery.count() !== 1) {
+      throw new Error(`底栏案例展厅入口不唯一或丢失(${theme})`);
+    }
+    await gallery.waitFor({ state: "visible", timeout: 3000 });
+    const galleryOpens = await page.evaluate(() => window.__densityGalleryOpens);
+    await gallery.click();
+    if (await page.evaluate(() => window.__densityGalleryOpens) !== galleryOpens + 1) {
+      throw new Error(`案例展厅入口没有精确触发一次打开(${theme})`);
     }
     if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
       throw new Error(`底栏主题开关丢失(${theme})`);
@@ -2920,8 +3268,9 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     throw new Error("设置壳探针默认就把 Dialog 打开了，会盖住其余 harness");
   }
 
+  // settings-B SET-12:390 三列宫格用 narrowLabel 短名,「账户与计费」在窄屏读作「账户」(1440 竖导航仍是全名)。
   const SECTIONS = [
-    ["账户与计费", "当前套餐"],
+    ["账户", "当前套餐"],
     ["用量", "会话用量明细"],
     ["偏好", "外观主题"],
     ["反馈", "反馈内容"],
@@ -3272,6 +3621,69 @@ await check("T51 Weibo 错误码提示重新扫码且图文失败建议纯文字
   if (!result.mediaUpload.includes("纯文字")) {
     throw new Error(`WEIBO_WRITE_MEDIA_UPLOAD 未建议纯文字:${JSON.stringify(result)}`);
   }
+});
+
+await check("T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且 MessageList 红绿对照", async () => {
+  await page.evaluate(() => window.__mountProcessCardOwnerProbe());
+  const result = await page.evaluate(() => window.__processCardOwner);
+  if (JSON.stringify(result.sortIds) !== JSON.stringify(["g", "q", "u", "a"])) {
+    throw new Error(`T67 毒序对照丢失(stableSortByTs 应变坏):${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.repairedIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 repair 未把过程卡移到所属 user 之后:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.mergeIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 mergeFullServerWins 未自愈:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.incrementalIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 applyServerIncremental 未自愈:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.cachedIds) !== JSON.stringify(["g", "q"])) {
+    throw new Error(`T67 未覆盖 toStored 剥离 timeline user 的原点:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.cacheReloadIds) !== JSON.stringify(["u", "g", "a", "q"])) {
+    throw new Error(`T67 正确内存经缓存、重载、full merge 后越过 owner:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.recoverIds) !== JSON.stringify([
+    "u-first",
+    "m-recover-3hev56n0kpyl1",
+    "g-recover",
+    "a-recover",
+  ])) {
+    throw new Error(`T67 m-recover owner 贴到了别的 user:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.missingOwnerIds) !== JSON.stringify(["g-archived", "u2", "a2"])) {
+    throw new Error(`T67 missing owner 被猜到别轮:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.serverTapeIds) !== JSON.stringify(["g-server", "u1", "think1", "a1"])) {
+    throw new Error(`T67 server tape 相对顺序被改写:${JSON.stringify(result)}`);
+  }
+  if (JSON.stringify(result.nextUserBoundIds) !== JSON.stringify(["u1", "g1", "a1", "u2"])) {
+    throw new Error(`T67 下一 user 上界未生效:${JSON.stringify(result)}`);
+  }
+  if (!result.cleanUnchanged || !result.idempotent) {
+    throw new Error(`T67 正确序被改写或 merge 不幂等:${JSON.stringify(result)}`);
+  }
+  const poisonKeys = await page.evaluate(() =>
+    [...document.querySelectorAll("#process-card-owner-poison [data-chat-virtual-key]")]
+      .map((node) => node.getAttribute("data-chat-virtual-key")));
+  const repairedKeys = await page.evaluate(() =>
+    [...document.querySelectorAll("#process-card-owner-repaired [data-chat-virtual-key]")]
+      .map((node) => node.getAttribute("data-chat-virtual-key")));
+  const poisonUser = poisonKeys.indexOf("u");
+  const poisonGroup = poisonKeys.indexOf("g");
+  if (poisonUser < 0 || poisonGroup < 0 || poisonGroup >= poisonUser) {
+    throw new Error(`T67 毒序 MessageList 未把子任务渲在 user 前:${JSON.stringify(poisonKeys)}`);
+  }
+  const repairedUser = repairedKeys.indexOf("u");
+  const repairedGroup = repairedKeys.indexOf("g");
+  if (repairedUser < 0 || repairedGroup < 0 || repairedGroup <= repairedUser) {
+    throw new Error(`T67 修复序 MessageList 用户气泡未在子任务前:${JSON.stringify(repairedKeys)}`);
+  }
+  await page.getByText("BROWSER_CARD_OWNER_USER", { exact: true }).first().waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
 });
 
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {

@@ -64,6 +64,15 @@ class FakeCcbRunner extends EventEmitter {
   startCalls = 0;
   startDelayMs = 0;
   readonly submittedInputs: unknown[] = [];
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined;
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding;
+  }
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
     super();

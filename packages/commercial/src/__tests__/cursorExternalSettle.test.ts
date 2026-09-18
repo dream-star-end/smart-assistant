@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   CURSOR_SETTLE_SURCHARGE_ENV,
+  captureCursorPricingBasis,
   cursorSettleMultiplier,
+  freezePreparedCursorSettlePlan,
   mapCursorReportedUsage,
   parseCursorSettleSurcharge,
+  planCursorAccountUsageBump,
   planCursorExternalSettle,
 } from "../billing/cursorExternalSettle.js";
 import type { ModelPricing } from "../billing/pricing.js";
@@ -265,5 +268,63 @@ describe("planCursorExternalSettle", () => {
         else process.env[CURSOR_SETTLE_SURCHARGE_ENV] = prev;
       }
     });
+  });
+});
+
+describe("planCursorAccountUsageBump", () => {
+  test("success bumps success_count and clears last_error, never touches health/status", () => {
+    const plan = planCursorAccountUsageBump({ success: true });
+    assert.equal(plan.lastError, null);
+    assert.match(plan.sql, /success_count = success_count \+ 1/);
+    assert.match(plan.sql, /last_error = NULL/);
+    assert.match(plan.sql, /provider = 'cursor'/);
+    assert.doesNotMatch(plan.sql, /health_score|status =|cooldown_until/);
+  });
+
+  test("failure bumps fail_count and records the sanitized terminal code in last_error", () => {
+    const plan = planCursorAccountUsageBump({ success: false, terminalCode: "AUTH_UNAVAILABLE" });
+    assert.equal(plan.lastError, "cursor_AUTH_UNAVAILABLE");
+    assert.match(plan.sql, /fail_count = fail_count \+ 1/);
+    assert.match(plan.sql, /last_error = \$2/);
+    assert.doesNotMatch(plan.sql, /health_score|status =|cooldown_until/);
+  });
+
+  test("failure without a terminal code falls back to engine_error; odd characters are stripped", () => {
+    assert.equal(planCursorAccountUsageBump({ success: false }).lastError, "cursor_engine_error");
+    assert.equal(planCursorAccountUsageBump({ success: false, terminalCode: null }).lastError, "cursor_engine_error");
+    assert.equal(
+      planCursorAccountUsageBump({ success: false, terminalCode: "QUOTA; drop table--" }).lastError,
+      "cursor_QUOTAdroptable--",
+    );
+  });
+});
+
+describe("pricingBasis freeze", () => {
+  test("replay uses captured surcharge, not a later env/catalog change", () => {
+    const fable = pricing({
+      model_id: "cursor-fable-5.1-high",
+      multiplier: "1.000",
+      input_per_mtok: 1500n,
+      output_per_mtok: 7500n,
+    });
+    const usage = { input_tokens: 1000, output_tokens: 500, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const basis = captureCursorPricingBasis(fable, { [CURSOR_SETTLE_SURCHARGE_ENV]: "1.000" });
+    const original = planCursorExternalSettle({ engineStatus: "success", usage, pricingBasis: basis });
+    const drifted = pricing({
+      model_id: "cursor-fable-5.1-high",
+      multiplier: "9.000",
+      input_per_mtok: 999999n,
+      output_per_mtok: 999999n,
+    });
+    const replay = planCursorExternalSettle({
+      engineStatus: "success",
+      usage,
+      pricing: drifted,
+      pricingBasis: basis,
+    });
+    assert.equal(replay.costCredits, original.costCredits);
+    const frozen = freezePreparedCursorSettlePlan(original);
+    assert.match(frozen.costCredits, /^-?\d+$/);
+    assert.equal(JSON.parse(frozen.snapshotJson).model_id, "cursor-fable-5.1-high");
   });
 });

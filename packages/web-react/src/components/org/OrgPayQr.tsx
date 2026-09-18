@@ -7,15 +7,15 @@ import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button } from "../ui";
 
 const POLL_INTERVAL_MS = 3000;
-/** 轮询上限(防悬挂):超时停轮询,提示已支付则稍后核对。 */
+/** 轮询上限(防悬挂)：超时停轮询，提示已支付则稍后核对。 */
 const POLL_MAX_MS = 5 * 60 * 1000;
 
 /**
- * 企业席位订单「扫码 + 到账」段(创建向导 / 订阅 / 加席共用,单一权威)。
- * 到账判定 = 轮询 GET /api/payment/orders/:order_no(api.getOrder),status→'paid' 即到账;
- * expired/canceled 停轮询提示。轮询在到账 / 超时 / 卸载(cleanup)时统一清定时器,无悬挂。
+ * 企业席位订单「扫码 + 到账」段(创建向导 / 订阅 / 加席共用，单一权威)。
+ * 到账判定 = 轮询 GET /api/payment/orders/:order_no(api.getOrder),status→'paid' 即到账；
+ * expired/canceled 停轮询提示。轮询在到账 / 超时 / 卸载(cleanup)时统一清定时器，无悬挂。
  *
- * `onPaid` 须稳定引用(调用方 useCallback),否则效果重启会重置轮询计时。
+ * `onPaid` 须稳定引用(调用方 useCallback)，否则效果重启会重置轮询计时。
  */
 export function OrgPayQr({
   auth,
@@ -28,7 +28,7 @@ export function OrgPayQr({
 }: {
   auth: AuthSession;
   order: OrgPayResult;
-  /** 应付金额(分,字符串大数);用于大字展示。 */
+  /** 应付金额(分，字符串大数)；用于大字展示。 */
   amountCents: string;
   /** 订单用途文案(如「订阅 企业标准 · 5 席」)。 */
   note: string;
@@ -54,7 +54,7 @@ export function OrgPayQr({
       if (inflight || cancelled) return;
       if (Date.now() - startedAt > POLL_MAX_MS) {
         stop();
-        if (!cancelled) setErr("等待超时,若已支付请稍后在组织中心查看到账。");
+        if (!cancelled) setErr("等待超时，若已支付请稍后在组织中心查看到账。");
         return;
       }
       inflight = true;
@@ -66,10 +66,10 @@ export function OrgPayQr({
           onPaid();
         } else if (o.status === "expired" || o.status === "canceled" || o.status === "cancelled") {
           stop();
-          setErr("订单已失效,请返回重新发起。");
+          setErr("订单已失效，请返回重新发起。");
         }
       } catch {
-        // 单次轮询失败不致命(网络抖动 / 端点暂不可用),下个 tick 继续。
+        // 单次轮询失败不致命(网络抖动 / 端点暂不可用)，下个 tick 继续。
       } finally {
         inflight = false;
       }

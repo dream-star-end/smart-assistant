@@ -119,6 +119,8 @@ FORCE_NPM_CI=0
 MODE=""
 CUTOVER_RELEASE=""
 DEPLOY_BUILT_RELEASE=""
+# Internal invocation provenance; never inherit an expected source from the environment.
+DEPLOY_BUILT_SOURCE_COMMIT=""
 CUTOVER_JOINT=0
 CUTOVER_TUPLE_BUNDLE=""
 # Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
@@ -126,6 +128,11 @@ CUTOVER_TUPLE_BUNDLE=""
 LEASE_TRAIN_ID=""
 LEASE_TARGET_SHA=""
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
+# Incident trailer 发布前快检(2026-09-09):selfhost 此前从不跑 trailer 门,坏 trailer 一律
+# 上线后才被 CI 发现,已上线源提交不可 amend,只能一次次冻结 tip(已冻 18 条)。这里在构建
+# 三面制品之前 fail-closed;规则与 check-v5-incident-regressions.ts 逐条对齐(有单测交叉对拍)。
+# 豁免只给真·止血:OC_V5_SKIP_TRAILER_GATE=1(会打 ⚠ 并写进 deploy 日志,不静默)。
+FIX_TRAILER_GATE="$SCRIPT_DIR/check-v5-fix-trailers.sh"
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -423,6 +430,9 @@ usage() {
   --lease-train=ID --target-sha=SHA
                         仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
                         人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
+  env OC_V5_SKIP_TRAILER_GATE=1
+                        仅配合 --deploy:跳过构建前的 Incident trailer 门(scripts/check-v5-fix-trailers.sh)。
+                        仅限止血;会打 ⚠ 留痕,CI check:v5:incidents 仍会红,事后必须补 waiver / 冻结 tip。
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
   --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
 
@@ -869,6 +879,13 @@ OC_PROJECT_CONTEXT=1
 # on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
 OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
 OC_CLAUDE_CODE_TZ=Asia/Tokyo
+# 用户面时区(OCV5-166)—— 与上面的 OC_CLAUDE_CODE_TZ **正交**,不要混改。
+#   OC_CLAUDE_CODE_TZ : 引擎子进程 TZ,跟随日本出口 IP,是风控一致性控制;
+#   OC_USER_TZ        : 用户真实所在地。两处消费:① 外接 ApiKey 路径的 system-reminder
+#                       追加「用户本地日期+UTC 偏移」;② 注入容器 env(docker Create.Env),
+#                       容器 gateway envProbe 渲染成 ENV slot 的 user_tz= 行给网页/cron 会话。
+#                       不改子进程 TZ、不参与选路;非缺省值改后需重建容器才进 PID1。
+OC_USER_TZ=Asia/Shanghai
 # 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
 # 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
 # token 明文不得进 git。上线无需改本文件,下一次容器重建即带上 supervisor 注入的 env。
@@ -960,6 +977,7 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
+  ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
   ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
   ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
@@ -1293,8 +1311,8 @@ source_commit() {
 }
 
 # ── Lease Center train 账本(OCV5-131)────────────────────────────────────────
-# 三面制品都 `git archive HEAD`;固定发布对象的方式是要求 HEAD 精确等于 --target-sha,
-# 不满足就 fail-closed(不做"archive 某个非 HEAD sha"的半套改造)。
+# 入口要求捕获的 HEAD 与已验证 train target 相同；之后三面传同一 immutable SHA。
+# 只有 platform-from-head 路径可跨共享 HEAD 前进继续切流，工作树 platform 仍走旧 strict 门。
 lease_train_enabled() { [[ -n "$LEASE_TRAIN_ID" || -f "$LEASE_LIB" ]]; }
 
 lease_train_load_lib() {
@@ -1308,7 +1326,8 @@ lease_train_begin() {
   lease_train_load_lib || { [[ -z "$LEASE_TRAIN_ID" ]] && return 0; die "缺 $LEASE_LIB,无法校验 --lease-train"; }
   [[ "$DRY" == 1 ]] && return 0
   lease_init_db
-  local head; head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  local head="${1:-$(source_commit)}"
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || die "列车 source 不是 40 位 commit SHA"
   if [[ -n "$LEASE_TRAIN_ID" ]]; then
     lease_valid_train_id "$LEASE_TRAIN_ID" || die "非法 --lease-train=$LEASE_TRAIN_ID"
     [[ "$head" == "$LEASE_TARGET_SHA" ]] \
@@ -1597,19 +1616,67 @@ egress_slot_flip() {
     return 1
   fi
   egress_wait_shared_port || return 1
-  # 新槽已接管共享口 → 摘旧槽。socket 与 service 一起 stop:只停 service 会留下一个
+  # 新槽已接管共享口 → 摘旧槽。socket 与 service 都要停:只停 service 会留下一个
   # 没人 accept 的 listener(systemd 会按需再拉起),连接会卡在它的 backlog 里。
-  # --no-block:旧槽 drain 自己的在飞流(≤31min),不阻塞发布。
+  #
+  # 2026-09-07 实发(tr-…081722Z / tr-…091334Z 两班 `cutover smoke: egress-health 失败`):
+  # `systemctl stop --no-block old.socket old.service` 一条命令下去,service 有
+  # Requires=socket,systemd 把 socket 的 stop job **排在 service stop 之后**;service 收到
+  # SIGTERM 后 server.close() 摘掉自己的 fd,但 .socket 单元在 service 整个 drain 期间
+  # (≤31min)仍持有同一 reuseport 组里的 listener → 内核继续按哈希把约一半新连接分给这个
+  # 没人 accept 的 fd(ss 里 users:(("systemd",pid=1)) 独占、Recv-Q 递增),连接卡到超时。
+  # 沙箱复现:drain 期 12 次探活 5 成功 7 超时;先关 socket 再停 service 则 12/12。
+  # 所以必须**先阻塞关旧 .socket**(--job-mode=ignore-dependencies 绕开 Requires 反向传播,
+  # 关 socket 是毫秒级、不等 drain),再 --no-block 停 service 让它只 drain 在飞流。
   if [[ -n "$cur" ]]; then
     old_sock="$(egress_slot_unit "$cur" socket)"
     old_svc="$(egress_slot_unit "$cur" service)"
-    echo "  egress: 新槽 $target 就绪,stop --no-block 旧槽 $cur(后台 drain)" >&2
-    systemctl stop --no-block "$old_sock" "$old_svc" || return 1
+    echo "  egress: 新槽 $target 就绪,先关旧槽 $cur 的共享 listener(.socket),再 stop --no-block 其 service(后台 drain)" >&2
+    systemctl stop --job-mode=ignore-dependencies "$old_sock" || return 1
+    systemctl stop --no-block "$old_svc" || return 1
     systemctl disable "$old_sock" "$old_svc" >/dev/null 2>&1 || true
   fi
   systemctl enable "$new_sock" "$new_svc" >/dev/null 2>&1 || true
-  # 旧槽 close() 后共享口必须仍可连(reuseport 组里还有新槽)。
-  egress_wait_shared_port
+  # 旧槽 close() 后共享口必须仍可连(reuseport 组里还有新槽),且 reuseport 组里不得再有
+  # 只由 systemd 持有(无 service 进程 accept)的孤儿 listener —— 那正是上面的黑洞形态。
+  egress_wait_shared_port || return 1
+  egress_assert_no_orphan_listener
+}
+
+# reuseport 组里「只有 systemd(pid 1)持有、没有任何 service 进程 accept」的 listener =
+# 黑洞:内核仍会把新连接哈希到它,永远没人 accept。翻转后必须为 0。
+# ss 非 0 / 空输出 / 无法解析的 listener 集合一律 fail-closed:不能先过滤再把
+# 「零孤儿」当成成功(OCV5-161:ss rc=2 或空表曾让 HTTP 重试在黑洞上假绿)。
+egress_assert_no_orphan_listener() {
+  local ss_out ss_rc=0 line listeners=0
+  ss_out="$(ss -Hltnp "sport = :${V5_EGRESS_PORT}" 2>/dev/null)" || ss_rc=$?
+  if (( ss_rc != 0 )); then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 失败 rc=${ss_rc},无法证明无孤儿 listener" >&2
+    return 1
+  fi
+  if [[ -z "${ss_out//[$' \t\r\n']/}" ]]; then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 输出为空,无法证明无孤儿 listener" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[$' \t\r']/}" ]] && continue
+    if ! grep -q '^LISTEN' <<<"$line" || ! grep -Eq ":${V5_EGRESS_PORT}([[:space:]]|$)" <<<"$line"; then
+      echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 输出不是有效 listener 集合" >&2
+      printf '%s\n' "$ss_out" >&2
+      return 1
+    fi
+    if ! grep -Eq 'users:\((\([^)]*\),)*\("node",pid=[0-9]+' <<<"$line"; then
+      echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 存在无 node 持有者的 listener" >&2
+      ss -ltnp "sport = :${V5_EGRESS_PORT}" >&2 || true
+      return 1
+    fi
+    listeners=$((listeners + 1))
+  done <<<"$ss_out"
+  if (( listeners < 1 )); then
+    echo "  ✗ egress 共享口 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} ss 未解析出有效 listener,无法证明无孤儿" >&2
+    return 1
+  fi
+  return 0
 }
 
 egress_slot_flip_then_master_restart() {
@@ -1876,6 +1943,34 @@ explain_dirty_semantics() {
   fi
 }
 
+# 发布前 Incident trailer 快检。放在 lease_train_begin 之后、构建之前:
+#   · 之后 —— 失败要经 EXIT trap 把本班 train 记 failed(worker 对同 target 不自动重发,
+#     不会像 0274 迁移门那样每 15min 烧一班);
+#   · 之前 —— 十几分钟的 vite/runtime/platform 构建一下都不跑,几秒内红。
+# 只查 HEAD 已提交历史(git show <sha>:path),工作区脏文件与 --allow-dirty 无关。
+assert_fix_trailers() {
+  local head="$1"
+  if [[ "${OC_V5_SKIP_TRAILER_GATE:-0}" == 1 ]]; then
+    log "  ⚠ OC_V5_SKIP_TRAILER_GATE=1:跳过 Incident trailer 门(仅限止血;CI check:v5:incidents 仍会红,事后必须补 waiver/冻结)"
+    return 0
+  fi
+  [[ -x "$FIX_TRAILER_GATE" ]] || die "缺 $FIX_TRAILER_GATE(或不可执行)。补救: git checkout -- scripts/check-v5-fix-trailers.sh;止血可 OC_V5_SKIP_TRAILER_GATE=1。"
+  log "── Incident trailer 门(HEAD=${head:0:12},构建前 fail-closed) ──"
+  local rc=0 out
+  out="$("$FIX_TRAILER_GATE" --repo "$REPO_ROOT" --head "$head" 2>&1)" || rc=$?
+  case "$rc" in
+    0) log "  ${out##*$'\n'}" ;;
+    2) log "  ⚠ trailer 门不可判(rc=2),放行但请人工核对:"; log "$out" ;;
+    *) die "Incident trailer 门拒绝发布(rc=$rc):
+$out
+补救:
+  在源提交 trailer 写 Incident: INC-YYYYMMDD-SLUG 并登记 e2e/session-display/incidents.json
+  或 Incident: none (<理由>) + e2e/session-display/incident-waivers.json
+  已上线不可改写的提交才走 check-v5-incident-regressions.ts 的 IMPORTED_TRAILER_HISTORY_TIPS
+  真·止血: OC_V5_SKIP_TRAILER_GATE=1 scripts/deploy-v5-selfhost.sh --deploy …(会留痕)" ;;
+  esac
+}
+
 cmd_deploy() {
   local sha dirty
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
@@ -1914,9 +2009,10 @@ $dirty
   refresh_ccb_proxy_path
   ensure_model_authority
   sha="$(source_commit)"
-  lease_train_begin
-  log "── HEAD=$sha 构建三面制品(失败则 live 不动) ──"
-  build_master_release
+  lease_train_begin "$sha"
+  assert_fix_trailers "$sha"
+  log "── source=$sha 构建三面制品(失败则 live 不动) ──"
+  build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
   if [[ "$DRY" != 1 ]]; then
     [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "缺 .complete: $BUILT_MASTER_RELEASE"
@@ -1926,6 +2022,7 @@ $dirty
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
+  DEPLOY_BUILT_SOURCE_COMMIT="$sha"
   CUTOVER_JOINT=1
   log "── 进入 --cutover 翻转窗口(同一套状态机,不是第二份逻辑) release=$DEPLOY_BUILT_RELEASE ──"
   cmd_cutover
@@ -1976,10 +2073,17 @@ cutover_smoke_against_release() { # <rel>
   [[ "$got_build" == "$expected_build" ]] \
     || { cutover_fail "cutover smoke: GET / oc-build=$got_build 不等于 release dist $expected_build"; return 1; }
   cutover_clog "  ✓ GET / oc-build=$got_build 匹配 release dist"
-  local eg
-  eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
-  echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1 \
-    || { cutover_fail "cutover smoke: egress-health 失败"; return 1; }
+  # egress-health:5 次 × 2s 有界重试。单次 curl 丢一条连接就否掉整班 20 分钟的列车
+  # 不成比例;真缺陷(孤儿 listener 黑洞)由 egress_slot_flip 末尾的
+  # egress_assert_no_orphan_listener 与下面的双槽拓扑断言兜住,这里的重试不会把它盖掉。
+  local eg eg_ok=0
+  for i in $(seq 1 5); do
+    eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
+    if echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1; then eg_ok=1; break; fi
+    cutover_clog "  egress-health 未通,重试 $i/5"
+    sleep 2
+  done
+  [[ "$eg_ok" == 1 ]] || { cutover_fail "cutover smoke: egress-health 失败"; return 1; }
   cutover_clog "  ✓ egress-health ok (slot=$(echo "$eg" | jq -r '.slot // "legacy"') mode=$(echo "$eg" | jq -r '.listenMode // "self_bind"') serving=$(egress_describe_topology))"
   # 双槽下额外要求:恰有一个槽 active(翻转后旧槽 deactivating 不算 active)且共享口
   # 应答就来自它 —— 防「新槽私有口绿、共享口仍全由旧槽应答」的假绿。
@@ -2325,6 +2429,18 @@ SQL
   cutover_clog "  ✓ model authority cutover marker 已按 DB→env 顺序绑定 exact live tuple"
 }
 
+# Only an internally built, from-head invocation owns a pinned expected source.
+# Legacy worktree-platform deploy and standalone cutover keep their current-HEAD gate.
+cutover_expected_source_commit() {
+  if [[ -n "${DEPLOY_BUILT_RELEASE:-}" && "${PLATFORM_FROM_HEAD:-0}" == 1 ]]; then
+    [[ "${DEPLOY_BUILT_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || die "本次构建缺已验证 sourceCommit,拒绝切流"
+    printf "%s\n" "$DEPLOY_BUILT_SOURCE_COMMIT"
+  else
+    source_commit
+  fi
+}
+
 cmd_cutover() {
   local rel head backup prev_val live_now expected_build step unit_snap
   CUTOVER_MUTATED=0
@@ -2342,7 +2458,7 @@ cmd_cutover() {
   fi
   : >"$CUTOVER_LOG"
   cutover_clog "══ v5 selfhost --cutover DRY=$DRY JOINT=${CUTOVER_JOINT:-0} log=$CUTOVER_LOG ══"
-  head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  head="$(cutover_expected_source_commit)" || die "无法确定本次切流 sourceCommit"
 
   step=1
   if [[ "$DRY" == 1 ]]; then

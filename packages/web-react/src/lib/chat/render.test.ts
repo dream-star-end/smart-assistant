@@ -283,17 +283,25 @@ describe("insufficientCreditsCopy 分层", () => {
   test("免费/付费两种文案与 CTA", () => {
     expect(insufficientCreditsCopy(false)).toEqual({
       title: "免费额度已用完",
-      message: "免费额度已用完,开通 Lite(¥38/月,4000 积分)即可继续",
+      message: "免费额度已用完，开通任意订阅套餐（Lite 及以上任一档）即可继续",
       cta: "开通 Lite",
       intent: "lite",
     });
     expect(insufficientCreditsCopy(true)).toEqual({
       title: "本期积分已用完",
-      message: "本期积分已用完,可购买加量包或升级套餐",
+      message: "本期积分已用完，可购买加量包或升级套餐",
       cta: "购买加量包",
       intent: "pack",
     });
     expect(friendlyBridgeErrorMessage("insufficient_credits")).toBe(insufficientCreditsCopy(false).message);
+  });
+
+  test("文案不写死价格 / 积分数,标点全角(settings 审计 SET-15)", () => {
+    for (const paid of [false, true]) {
+      const { title, message } = insufficientCreditsCopy(paid);
+      // 不出现货币符号、数字、半角逗号 / 括号 —— 套餐真值在后端,前端常量改价即漂移
+      expect(`${title}${message}`).not.toMatch(/[¥$0-9,()]/);
+    }
   });
 });
 

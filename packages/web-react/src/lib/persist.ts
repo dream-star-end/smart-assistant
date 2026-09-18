@@ -1437,6 +1437,101 @@ export function mergeTimelineHistoryPage(
   return stableSortByTs([...add, ...local]);
 }
 
+/**
+ * OCV5-180 B1 — relocate exact late-delegate agent-group records onto their
+ * owner turn. Continuation tapes keep their own `_turnKey` after hydrate, so
+ * without this pass a T1 card that landed after T2 would render in T2's
+ * segment. Owner missing from the loaded page: keep the card resident so a
+ * later explicit page can reveal the owner (same residency as bash-tail
+ * auxiliaries). Same runId already on the owner turn: drop the continuation
+ * duplicate. Idempotent.
+ */
+export function reconcileLateDelegateAgentGroups(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  const lateIndexes: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      message?.role === "agent-group" &&
+      typeof message._continuationOfTurnKey === "string" &&
+      message._continuationOfTurnKey.length > 0
+    ) {
+      lateIndexes.push(i);
+    }
+  }
+  if (lateIndexes.length === 0) return messages;
+
+  const ownerLastIndex = new Map<string, number>();
+  const ownerRunIds = new Map<string, Set<string>>();
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!message) continue;
+    if (
+      typeof message._continuationOfTurnKey === "string" &&
+      message._continuationOfTurnKey.length > 0
+    ) continue;
+    const turnKey = message._turnKey;
+    if (typeof turnKey !== "string" || turnKey.length === 0) continue;
+    ownerLastIndex.set(turnKey, i);
+    if (message.role === "agent-group") {
+      const runId = agentGroupRunId(message);
+      if (runId) {
+        const set = ownerRunIds.get(turnKey) ?? new Set<string>();
+        set.add(runId);
+        ownerRunIds.set(turnKey, set);
+      }
+    }
+  }
+
+  const drop = new Set<number>();
+  const move = new Set<number>();
+  for (const index of lateIndexes) {
+    const message = messages[index]!;
+    const owner = message._continuationOfTurnKey!;
+    const runId = agentGroupRunId(message);
+    if (runId && ownerRunIds.get(owner)?.has(runId)) {
+      drop.add(index);
+      continue;
+    }
+    if (ownerLastIndex.has(owner)) move.add(index);
+  }
+  if (drop.size === 0 && move.size === 0) return messages;
+
+  const movesByOwner = new Map<string, ChatMessage[]>();
+  for (const index of move) {
+    const message = messages[index]!;
+    const owner = message._continuationOfTurnKey!;
+    const list = movesByOwner.get(owner) ?? [];
+    list.push(message);
+    movesByOwner.set(owner, list);
+  }
+  for (const list of movesByOwner.values()) {
+    list.sort((a, b) => {
+      const ts = (typeof a.ts === "number" ? a.ts : 0) - (typeof b.ts === "number" ? b.ts : 0);
+      if (ts !== 0) return ts;
+      return a.id.localeCompare(b.id);
+    });
+  }
+
+  const skip = new Set<number>([...drop, ...move]);
+  const next: ChatMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (skip.has(i)) continue;
+    const message = messages[i]!;
+    next.push(message);
+    const turnKey = message._turnKey;
+    if (typeof turnKey === "string" && ownerLastIndex.get(turnKey) === i) {
+      const extras = movesByOwner.get(turnKey);
+      if (extras) next.push(...extras);
+    }
+  }
+  if (next.length === messages.length && next.every((message, index) => message === messages[index])) {
+    return messages;
+  }
+  return next;
+}
+
 type TimelineBashTailCandidate = {
   tail: BashTail;
   evidence: TimelineBashTailEvidence;

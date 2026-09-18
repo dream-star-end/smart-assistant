@@ -112,6 +112,13 @@ export function createStickToBottomController() {
 
   const endWheelFence = () => {
     wheelFence.current = false;
+    // The fence releases only once the user has been idle for the quiet window
+    // and the scroller is at rest. A transient input mark still standing here
+    // was never consumed by a scroll event — a wheel tick delivered at the
+    // bottom boundary, or a key that did not scroll — and would otherwise keep
+    // bottom pinning suspended until some unrelated scroll event clears it
+    // (stream stops following right after the user wheels back to the bottom).
+    writeSuspended.current = false;
   };
 
   const scrollToBottom = (el: StickScroller) => {
@@ -120,6 +127,15 @@ export function createStickToBottomController() {
       following.current = false;
       return;
     }
+    el.scrollTop = maxScrollTop(el);
+    recordWrite(el);
+  };
+
+  // An explicit user command is not an automatic pin. It supersedes the old
+  // upward gesture (including touchend's momentum fence) and its write baseline.
+  // Keep scrollToBottom/correctTo guarded; only this command may reset intent.
+  const jumpToBottom = (el: StickScroller) => {
+    reset();
     el.scrollTop = maxScrollTop(el);
     recordWrite(el);
   };
@@ -195,6 +211,7 @@ export function createStickToBottomController() {
       following.current = value;
     },
     scrollToBottom,
+    jumpToBottom,
     correctTo,
   };
 
@@ -212,6 +229,7 @@ export function createStickToBottomController() {
     beginWheelFence,
     endWheelFence,
     scrollToBottom,
+    jumpToBottom,
     correctTo,
     onScroll,
   };

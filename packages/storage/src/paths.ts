@@ -140,6 +140,10 @@ export const paths = {
   sessionsDb: join(HOME, 'sessions.db'),
   // Taskboard (V5 selfhost): independent SQLite, same directory as sessions.db.
   taskboardDb: join(HOME, 'taskboard.db'),
+  // OCV5-210 advisor-mode: per-uid volume config (no PG / prefs JSONB).
+  collaborationConfig: join(HOME, 'collaboration-config.json'),
+  collaborationConfigLock: join(HOME, 'collaboration-config.json.lock'),
+  advisorConsultsDb: join(HOME, 'advisor-consults.db'),
   // Phase 0.2: durable outbox for server-authored messages that couldn't be
   // written to sessions.db immediately (disk full, SQLite BUSY, crash mid-write).
   // Replayed on gateway startup. JSONL format, one queued write per line.

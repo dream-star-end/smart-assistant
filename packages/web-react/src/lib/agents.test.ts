@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { DEFAULT_AGENT, MAIN_AGENT, agentById, agentFromApiRow } from './agents'
+import { DEFAULT_AGENT, MAIN_AGENT, PRESET_STARTERS, agentById, agentFromApiRow } from './agents'
 
 test('DEFAULT_AGENT is the 全能助手 with backend id main (B-positioning)', () => {
   expect(DEFAULT_AGENT.id).toBe('main')
@@ -39,4 +39,13 @@ test('agentFromApiRow maps a market agent (emoji + installed) and folds default�
 
   // a row flagged default (or id main) collapses to the canonical MAIN_AGENT
   expect(agentFromApiRow({ id: 'main', name: 'x', isDefault: true })).toBe(MAIN_AGENT)
+})
+
+test('agentFromApiRow 给平台预设 id 配 starters，未知 id 无 starters', () => {
+  for (const id of ['coding-assistant', 'office-assistant', 'research-assistant', 'general-assistant'] as const) {
+    const agent = agentFromApiRow({ id, name: id })
+    expect(agent.starters).toEqual(PRESET_STARTERS[id])
+    expect(agent.starters).toHaveLength(3)
+  }
+  expect(agentFromApiRow({ id: 'unknown-market-bot', name: 'x' }).starters).toBeUndefined()
 })

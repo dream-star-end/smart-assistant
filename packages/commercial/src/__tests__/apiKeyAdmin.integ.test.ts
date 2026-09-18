@@ -173,16 +173,36 @@ function summaryOf(r: UserApiKeyRow) {
   };
 }
 
+/**
+ * `usage_records` 的 fake 行(只含 usage/recent 分页端点要用的列)。
+ * `created_at` 用相对"现在"的小时数表达,便于测窗口过滤。
+ */
+interface UsageRecordRow {
+  id: string;
+  user_id: string;
+  api_key_id: string | null;
+  model: string;
+  status: string;
+  /** 距今多少小时前(0 = 刚刚)。 */
+  hoursAgo: number;
+  input_tokens?: string;
+  output_tokens?: string;
+  cost_credits?: string;
+}
+
 interface FakePoolHandle {
   pool: Pool;
   table: Map<string, UserApiKeyRow>;
   queries: { sql: string; params: unknown[] }[];
   /** 强制塞一行(测试边缘 case,如手工种 revoked row)。 */
   upsert(row: UserApiKeyRow): void;
+  /** 种 usage_records 行(usage/recent 分页端点用)。 */
+  seedUsage(row: UsageRecordRow): void;
 }
 
 function buildFakePool(): FakePoolHandle {
   const table = new Map<string, UserApiKeyRow>();
+  const usage: UsageRecordRow[] = [];
   let nextId = 100n;
   const queries: { sql: string; params: unknown[] }[] = [];
 
@@ -198,6 +218,89 @@ function buildFakePool(): FakePoolHandle {
       // maintenance_mode = false(无 row → DEFAULTS)
       return { rows: [], rowCount: 0 };
     }
+    // ─── usage/recent 游标分页(listApiKeyUsageRecent)────────────────────
+    //
+    // 按 SQL 形状匹配:FROM usage_records u + ORDER BY u.id DESC。参数序是
+    // $1 user_id, $2 hours,后跟可选 key_id / before,末位恒为 limit+1。
+    // 这里在内存里复刻同一谓词(窗口 / key / before / **不过滤 status**)与排序,
+    // 让 next_before 连续性、失败行可见性等断言真的走 handler → 数据层 → SQL 形状。
+    if (/FROM\s+usage_records\s+u/i.test(trimmed) && /ORDER\s+BY\s+u\.id\s+DESC/i.test(trimmed)) {
+      const userId = params[0] as string;
+      const hours = Number(params[1]);
+      const keyIdx = trimmed.match(/u\.api_key_id\s*=\s*\$(\d+)::bigint/i);
+      const beforeIdx = trimmed.match(/u\.id\s*<\s*\$(\d+)::bigint/i);
+      const keyId = keyIdx ? (params[Number(keyIdx[1]) - 1] as string) : null;
+      const before = beforeIdx ? (params[Number(beforeIdx[1]) - 1] as string) : null;
+      const limitPlusOne = Number(params[params.length - 1]);
+      const rows = usage
+        .filter((r) => r.user_id === userId && r.api_key_id !== null)
+        .filter((r) => r.hoursAgo <= hours)
+        .filter((r) => (keyId === null ? true : r.api_key_id === keyId))
+        .filter((r) => (before === null ? true : BigInt(r.id) < BigInt(before)))
+        .sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1))
+        .slice(0, limitPlusOne)
+        .map((r) => ({
+          id: r.id,
+          created_at: new Date(Date.now() - r.hoursAgo * 3600_000).toISOString(),
+          api_key_id: r.api_key_id,
+          label: r.api_key_id === null ? null : (table.get(r.api_key_id)?.label ?? null),
+          model: r.model,
+          input_tokens: r.input_tokens ?? "0",
+          output_tokens: r.output_tokens ?? "0",
+          cache_read_tokens: "0",
+          cache_write_tokens: "0",
+          cost_credits: r.cost_credits ?? "0",
+          status: r.status,
+        }));
+      return { rows, rowCount: rows.length };
+    }
+
+    // ─── GET /api/me/api-keys/usage 报表的五段查询 ────────────────────────
+    //
+    // 本文件只用它验"/usage 返回体形状没被 /usage/recent 改动",不验聚合数值:
+    // summary / trend / by_key / by_model 返空,recent 段用同一份内存数据(按
+    // created_at DESC 排,固定前 50 条 —— 即前端的第一页)。
+    if (/FROM\s+usage_records\s+u/i.test(trimmed) && /ORDER\s+BY\s+u\.created_at\s+DESC/i.test(trimmed)) {
+      const userId = params[0] as string;
+      const hours = Number(params[1]);
+      const keyId = /\$3::bigint/i.test(trimmed) ? (params[2] as string) : null;
+      const rows = usage
+        .filter((r) => r.user_id === userId && r.api_key_id !== null)
+        .filter((r) => r.hoursAgo <= hours)
+        .filter((r) => (keyId === null ? true : r.api_key_id === keyId))
+        .sort((a, b) => a.hoursAgo - b.hoursAgo)
+        .slice(0, 50)
+        .map((r) => ({
+          id: r.id,
+          created_at: new Date(Date.now() - r.hoursAgo * 3600_000).toISOString(),
+          api_key_id: r.api_key_id,
+          label: r.api_key_id === null ? null : (table.get(r.api_key_id)?.label ?? null),
+          model: r.model,
+          input_tokens: r.input_tokens ?? "0",
+          output_tokens: r.output_tokens ?? "0",
+          cache_read_tokens: "0",
+          cache_write_tokens: "0",
+          cost_credits: r.cost_credits ?? "0",
+          status: r.status,
+        }));
+      return { rows, rowCount: rows.length };
+    }
+    if (head.startsWith("SELECT COUNT(*)::TEXT") && /FROM\s+usage_records/i.test(trimmed)) {
+      return {
+        rows: [{
+          requests: "0", input_tokens: "0", output_tokens: "0",
+          cache_read_tokens: "0", cache_write_tokens: "0", credits: "0",
+        }],
+        rowCount: 1,
+      };
+    }
+    if (/generate_series/i.test(trimmed) && /FROM\s+usage_records/i.test(trimmed)) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (/FROM\s+usage_records/i.test(trimmed) && /GROUP\s+BY\s+(u\.api_key_id|model)/i.test(trimmed)) {
+      return { rows: [], rowCount: 0 };
+    }
+
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) return { rows: [], rowCount: 1 };
     if (head.startsWith("UPDATE REQUEST_FINALIZE_JOURNAL")) return { rows: [], rowCount: 1 };
     if (head.startsWith("INSERT INTO USAGE_RECORDS")) return { rows: [{ id: "1" }], rowCount: 1 };
@@ -360,6 +463,7 @@ function buildFakePool(): FakePoolHandle {
     table,
     queries,
     upsert(row) { table.set(row.id, row); },
+    seedUsage(row) { usage.push(row); },
   };
 }
 
@@ -1166,5 +1270,243 @@ describe("0277 — PATCH /api/me/api-keys/:id + 上限 402 + 禁用 401 + settle
     const userJwt = await h.jwtFor(USER_A_ID, "user");
     const nonAdmin = await runReq(h, { method: "GET", url: "/api/me/api-keys/usage", headers: { authorization: `Bearer ${userJwt}` } });
     assert.equal(nonAdmin.statusCode, 403);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/me/api-keys/usage/recent — 最近明细游标分页
+//
+// `/usage` 的 recent 段固定前 50 条,是前端的第一页;本端点提供后续页。
+// 断言的不变量:
+//   1. 分页连续 — 两页不重叠、不遗漏,next_before 恒等于本页最后一行 id;
+//   2. 参数校验 — before 非法 / limit 超上限 → 400 INVALID_USAGE_QUERY;
+//   3. 授权 — 无 JWT 401 / 非 admin 403 / 别人的 key_id 空集(不泄漏存在性);
+//   4. **失败请求也在列** — status ≠ success 的行不能被过滤掉(排障靠它)。
+// ════════════════════════════════════════════════════════════════════════════
+
+interface RecentPageBody {
+  window: string;
+  key_id: string | null;
+  entries: { id: string; status: string; api_key_id: string | null; label: string | null }[];
+  next_before: string | null;
+}
+
+/** 种 n 条属于 keyId 的 usage 行,id 从 startId 递增(窗口内)。 */
+function seedRecent(
+  fp: FakePoolHandle,
+  userId: string,
+  keyId: string,
+  ids: number[],
+  over: Partial<UsageRecordRow> = {},
+): void {
+  for (const id of ids) {
+    fp.seedUsage({
+      id: String(id),
+      user_id: userId,
+      api_key_id: keyId,
+      model: "cursor-haiku-4.5",
+      status: "success",
+      hoursAgo: 1,
+      cost_credits: "7",
+      ...over,
+    });
+  }
+}
+
+describe("GET /api/me/api-keys/usage/recent — 游标分页", () => {
+  test("分页 + next_before:连续两页不重叠不遗漏,到底后 next_before=null", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+    // 先建一把真 key(拿到真 id,label 从 user_api_keys JOIN 出来)。
+    const created = await runReq(h, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { label: "pager" },
+    });
+    assert.equal(created.statusCode, 201);
+    const keyId = (created.bodyJson() as { id: string }).id;
+    // 5 条:id 1001..1005。
+    seedRecent(h.fp, USER_A_ID, keyId, [1001, 1002, 1003, 1004, 1005]);
+
+    const p1 = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage/recent?window=7d&limit=2",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(p1.statusCode, 200, p1.bodyText());
+    const b1 = p1.bodyJson() as RecentPageBody;
+    assert.equal(b1.window, "7d");
+    assert.equal(b1.key_id, null);
+    assert.deepEqual(b1.entries.map((e) => e.id), ["1005", "1004"]);
+    assert.equal(b1.next_before, "1004", "next_before = 本页最后一行 id");
+    // label 从 user_api_keys JOIN 出来,不是客户端传的。
+    assert.equal(b1.entries[0]!.label, "pager");
+
+    const p2 = await runReq(h, {
+      method: "GET",
+      url: `/api/me/api-keys/usage/recent?window=7d&limit=2&before=${b1.next_before}`,
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    const b2 = p2.bodyJson() as RecentPageBody;
+    assert.deepEqual(b2.entries.map((e) => e.id), ["1003", "1002"]);
+    assert.equal(b2.next_before, "1002");
+    // 不重叠。
+    const overlap = b2.entries.filter((e) => b1.entries.some((x) => x.id === e.id));
+    assert.deepEqual(overlap, []);
+
+    const p3 = await runReq(h, {
+      method: "GET",
+      url: `/api/me/api-keys/usage/recent?window=7d&limit=2&before=${b2.next_before}`,
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    const b3 = p3.bodyJson() as RecentPageBody;
+    assert.deepEqual(b3.entries.map((e) => e.id), ["1001"]);
+    assert.equal(b3.next_before, null, "最后一页 next_before 必须为 null");
+    // 三页并起来 = 全部 5 条,无遗漏。
+    const all = [...b1.entries, ...b2.entries, ...b3.entries].map((e) => e.id);
+    assert.deepEqual(all, ["1005", "1004", "1003", "1002", "1001"]);
+  });
+
+  test("before / limit / window / key_id 非法 → 400 INVALID_USAGE_QUERY", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+    for (const qs of [
+      "?before=abc",
+      "?before=0",
+      "?before=-1",
+      "?before=1%20OR%201%3D1",
+      "?limit=201",
+      "?limit=0",
+      "?limit=abc",
+      "?window=1y",
+      "?key_id=abc",
+    ]) {
+      const r = await runReq(h, {
+        method: "GET",
+        url: `/api/me/api-keys/usage/recent${qs}`,
+        headers: { authorization: `Bearer ${jwt}` },
+      });
+      assert.equal(r.statusCode, 400, `${qs} → ${r.bodyText()}`);
+      assert.equal((r.bodyJson() as { error: { code: string } }).error.code, "INVALID_USAGE_QUERY", qs);
+    }
+    // 上限本身合法。
+    const ok = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage/recent?limit=200",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(ok.statusCode, 200, ok.bodyText());
+  });
+
+  test("无 JWT → 401;非 admin → 403;别人的 key_id → 空集(不泄漏存在性)", async () => {
+    const h = await buildHarness();
+    const jwtA = await h.jwtFor(USER_A_ID);
+    const createdA = await runReq(h, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${jwtA}` },
+      body: { label: "a-key" },
+    });
+    const keyA = (createdA.bodyJson() as { id: string }).id;
+    seedRecent(h.fp, USER_A_ID, keyA, [2001, 2002]);
+
+    const noJwt = await runReq(h, { method: "GET", url: "/api/me/api-keys/usage/recent" });
+    assert.equal(noJwt.statusCode, 401);
+
+    const userJwt = await h.jwtFor(USER_A_ID, "user");
+    const nonAdmin = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage/recent",
+      headers: { authorization: `Bearer ${userJwt}` },
+    });
+    assert.equal(nonAdmin.statusCode, 403);
+    assert.equal((nonAdmin.bodyJson() as { error: { code: string } }).error.code, "ADMIN_ONLY");
+
+    // UID_B(也是 admin)钉 UID_A 的 key_id:200 但空集 —— 与"该 key 不存在"不可区分。
+    const jwtB = await h.jwtFor(USER_B_ID);
+    const cross = await runReq(h, {
+      method: "GET",
+      url: `/api/me/api-keys/usage/recent?key_id=${keyA}`,
+      headers: { authorization: `Bearer ${jwtB}` },
+    });
+    assert.equal(cross.statusCode, 200, cross.bodyText());
+    const crossBody = cross.bodyJson() as RecentPageBody;
+    assert.deepEqual(crossBody.entries, []);
+    assert.equal(crossBody.next_before, null);
+    assert.equal(crossBody.key_id, keyA, "key_id 原样回显,不代表它存在");
+    // UID_A 自己钉同一 key → 有数据。
+    const own = await runReq(h, {
+      method: "GET",
+      url: `/api/me/api-keys/usage/recent?key_id=${keyA}`,
+      headers: { authorization: `Bearer ${jwtA}` },
+    });
+    assert.equal((own.bodyJson() as RecentPageBody).entries.length, 2);
+  });
+
+  test("失败请求(status≠success)也出现在列表;窗口外的行不出现", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+    const created = await runReq(h, {
+      method: "POST",
+      url: "/api/me/api-keys",
+      headers: { authorization: `Bearer ${jwt}` },
+      body: { label: "mixed" },
+    });
+    const keyId = (created.bodyJson() as { id: string }).id;
+    seedRecent(h.fp, USER_A_ID, keyId, [3001]);
+    seedRecent(h.fp, USER_A_ID, keyId, [3002], { status: "error", cost_credits: "0" });
+    seedRecent(h.fp, USER_A_ID, keyId, [3003], { status: "billing_failed", cost_credits: "0" });
+    // 10 天前 —— 24h/7d 窗口都不该看到它。
+    seedRecent(h.fp, USER_A_ID, keyId, [3004], { hoursAgo: 240 });
+
+    const r = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage/recent?window=7d&limit=50",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(r.statusCode, 200, r.bodyText());
+    const body = r.bodyJson() as RecentPageBody;
+    assert.deepEqual(body.entries.map((e) => e.id), ["3003", "3002", "3001"]);
+    assert.deepEqual(
+      body.entries.map((e) => e.status),
+      ["billing_failed", "error", "success"],
+      "失败/计费失败的行必须在列(0 积分也要能看到;status 词表以 0002 CHECK 为准)",
+    );
+    // 30d 窗口才带出 10 天前那条。
+    const wide = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage/recent?window=30d&limit=50",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.deepEqual((wide.bodyJson() as RecentPageBody).entries.map((e) => e.id), [
+      "3004", "3003", "3002", "3001",
+    ]);
+  });
+
+  test("路由:exact `/usage/recent` 不被 `/usage` 或 DELETE/PATCH 的 pathPrefix 吞", async () => {
+    const h = await buildHarness();
+    const jwt = await h.jwtFor(USER_A_ID);
+    // `/usage` 与 `/usage/recent` 是两个不同的返回体形状 —— 拿形状区分命中了谁。
+    const recent = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage/recent",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(recent.statusCode, 200, recent.bodyText());
+    const rb = recent.bodyJson() as Record<string, unknown>;
+    assert.ok(Array.isArray(rb.entries), "usage/recent 返 entries");
+    assert.ok(!("summary" in rb), "不能落到 /usage 的报表 handler");
+    assert.ok("next_before" in rb);
+
+    const report = await runReq(h, {
+      method: "GET",
+      url: "/api/me/api-keys/usage",
+      headers: { authorization: `Bearer ${jwt}` },
+    });
+    assert.equal(report.statusCode, 200, report.bodyText());
+    const pb = report.bodyJson() as Record<string, unknown>;
+    assert.ok("summary" in pb && Array.isArray(pb.recent), "/usage 仍是报表形状(recent 前 50 条)");
+    assert.ok(!("next_before" in pb), "/usage 返回体不变,不引入分页字段");
   });
 });

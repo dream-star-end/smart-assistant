@@ -23,8 +23,8 @@ afterEach(() => {
 const base = { theme: "light" as const, onCycleTheme: () => {} };
 
 function fill() {
-  fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
-  fireEvent.change(screen.getByPlaceholderText("密码"), { target: { value: "password123" } });
+  fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
+  fireEvent.change(screen.getByLabelText("密码"), { target: { value: "password123" } });
 }
 
 describe("AuthGate — Turnstile gating", () => {
@@ -175,6 +175,83 @@ describe("AuthGate — Turnstile gating", () => {
   });
 });
 
+describe("AuthGate — Turnstile 失败态与登录中文案", () => {
+  test("空 siteKey：显示验证加载失败，重试走 onRetryPublicConfig，不放行无 token 登录", () => {
+    const onLogin = vi.fn();
+    const retry = vi.fn();
+    render(
+      <AuthGate
+        {...base}
+        onLogin={onLogin}
+        onRetryPublicConfig={retry}
+        turnstileBypass={false}
+        turnstileSiteKey=""
+      />,
+    );
+    fill();
+    expect(screen.getByText("验证加载失败")).toBeInTheDocument();
+    const login = screen.getByRole("button", { name: "登录" });
+    expect(login).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(onLogin).not.toHaveBeenCalled();
+  });
+
+  test("widget onError：显示验证加载失败，重试 remount widget", async () => {
+    const renderWidget = vi.fn(
+      (
+        _el: HTMLElement,
+        opts: {
+          "error-callback"?: () => void;
+        },
+      ) => {
+        opts["error-callback"]?.();
+        return "widget-err";
+      },
+    );
+    window.turnstile = {
+      render: renderWidget,
+      remove: vi.fn(),
+      reset: vi.fn(),
+    };
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} turnstileBypass={false} turnstileSiteKey="0xSITEKEY" />,
+    );
+    expect(await screen.findByText("验证加载失败")).toBeInTheDocument();
+    const before = renderWidget.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(renderWidget.mock.calls.length).toBeGreaterThan(before));
+    expect(screen.getByRole("button", { name: "登录" })).toBeDisabled();
+  });
+
+  test("timeout-callback 同时当失败：显示验证加载失败", async () => {
+    window.turnstile = {
+      render: (
+        _el: HTMLElement,
+        opts: {
+          "timeout-callback"?: () => void;
+        },
+      ) => {
+        opts["timeout-callback"]?.();
+        return "widget-timeout";
+      },
+      remove: vi.fn(),
+      reset: vi.fn(),
+    };
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} turnstileBypass={false} turnstileSiteKey="0xSITEKEY" />,
+    );
+    expect(await screen.findByText("验证加载失败")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "登录" })).toBeDisabled();
+  });
+
+  test("busyNow 登录按钮文案为正在登录…", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} loading />);
+    fill();
+    expect(screen.getByRole("button", { name: /正在登录/ })).toBeInTheDocument();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 多模式：注册 / 邮箱验证 / 忘记密码 / 重置密码。
 // ---------------------------------------------------------------------------
@@ -185,7 +262,7 @@ describe("AuthGate — 注册", () => {
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
 
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
       target: { value: "password123" },
@@ -214,7 +291,7 @@ describe("AuthGate — 注册", () => {
     const onRegister = vi.fn();
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
       target: { value: "password123" },
@@ -237,7 +314,7 @@ describe("AuthGate — 注册", () => {
     const onRegister = vi.fn();
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "different9" } });
     fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
@@ -327,7 +404,7 @@ describe("AuthGate — 协议弹窗", () => {
 describe("AuthGate — 错误文案本地化", () => {
   function fillRegister() {
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
     fireEvent.click(screen.getByRole("checkbox"));
@@ -410,7 +487,7 @@ describe("AuthGate — 邮箱验证", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
-    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "a@b.com" } });
     fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
     fireEvent.click(screen.getByRole("checkbox"));
@@ -515,5 +592,119 @@ describe("AuthGate — 重置密码", () => {
     render(<AuthGate {...base} onLogin={vi.fn()} onConfirmReset={vi.fn()} initialMode="reset" />);
     expect(screen.getByText(/重置链接无效/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /重新申请重置/ })).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09 landing-B 表层打磨(docs/audit/landing.md L-05 / L-09 / L-10 / L-12 / L-13 / L-14)。
+// 上面的状态机 / Turnstile 门控契约一字未动;这里只覆盖新增的交互与文案。
+// ---------------------------------------------------------------------------
+
+describe("AuthGate — 密码框显示 / 隐藏(L-09)", () => {
+  test("登录页:切换显示不清空已输入内容,可及名随状态切换", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    const pw = screen.getByLabelText("密码");
+    fireEvent.change(pw, { target: { value: "s3cret-pass" } });
+    expect(pw).toHaveAttribute("type", "password");
+
+    fireEvent.click(screen.getByRole("button", { name: "显示密码" }));
+    expect(pw).toHaveAttribute("type", "text");
+    expect(pw).toHaveValue("s3cret-pass");
+    expect(screen.getByRole("button", { name: "隐藏密码" })).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "隐藏密码" }));
+    expect(pw).toHaveAttribute("type", "password");
+    expect(pw).toHaveValue("s3cret-pass");
+    // 登录按钮可及名唯一性红线不受新按钮影响
+    expect(screen.getByRole("button", { name: "登录" })).toBeInTheDocument();
+  });
+
+  test("注册页:两枚密码框各有一枚切换按钮,且可及名不同名;标签经 htmlFor 关联", () => {
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onRegister={vi.fn()} initialMode="register" turnstileBypass={true} />,
+    );
+    expect(screen.getByRole("button", { name: "显示密码" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "显示确认密码" })).toBeInTheDocument();
+    expect(screen.getByLabelText("密码")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("确认密码")).toHaveAttribute("type", "password");
+    expect(screen.getByRole("button", { name: /创建账号/ })).toBeInTheDocument();
+  });
+
+  test("重置页:新密码 / 确认新密码同样可切换", () => {
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onConfirmReset={vi.fn()} initialMode="reset" resetToken="tok_1" />,
+    );
+    expect(screen.getByRole("button", { name: "显示新密码" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "显示确认新密码" })).toBeInTheDocument();
+    expect(screen.getByLabelText("新密码")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("确认新密码")).toHaveAttribute("type", "password");
+  });
+});
+
+describe("AuthGate — 文案与占位(L-05 / L-12 / L-13)", () => {
+  test("验证码占位符不再被 0.4em 字距拉开", () => {
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onVerifyEmail={vi.fn()} initialMode="verify" turnstileBypass={true} />,
+    );
+    const code = screen.getByPlaceholderText("输入 6 位验证码");
+    expect(code.className).toContain("tracking-[0.4em]");
+    expect(code.className).toContain("placeholder:tracking-normal");
+    expect(screen.queryByPlaceholderText(/请输入邮箱里的/)).toBeNull();
+  });
+
+  test("重置链接缺失时的提示不泄漏开发者词 token", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} onConfirmReset={vi.fn()} initialMode="reset" />);
+    expect(screen.getByText("重置链接无效或已过期，请从邮件重新打开。")).toBeInTheDocument();
+    expect(document.body.textContent?.toLowerCase()).not.toContain("token");
+  });
+
+  test("登录页页脚卖点用面向用户的话,不用「流式对话 / 持久会话」", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    expect(screen.getByText("多模型协作 · 长任务不中断 · 成果直接可用")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("流式对话");
+    expect(document.body.textContent).not.toContain("持久会话");
+  });
+
+  // L-11(a11y-B 接 QA t-1038 移交):占位符不再复读标签——邮箱给示例格式,密码不放占位符;可及名仍由标签 / aria-label 提供。
+  test("登录 / 注册页邮箱占位符是示例格式而不是「邮箱」,密码框没有与标签同词的占位符", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    expect(screen.getByLabelText("邮箱")).toHaveAttribute("placeholder", "name@example.com");
+    expect(screen.getByLabelText("密码")).not.toHaveAttribute("placeholder");
+    expect(screen.queryByPlaceholderText("邮箱")).toBeNull();
+    expect(screen.queryByPlaceholderText("密码")).toBeNull();
+    cleanup();
+
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onRegister={vi.fn()} initialMode="register" turnstileBypass={true} />,
+    );
+    expect(screen.getByLabelText("邮箱")).toHaveAttribute("placeholder", "name@example.com");
+    expect(screen.queryByPlaceholderText("邮箱")).toBeNull();
+    // 注册页密码占位符是规则提示(「至少 N 位」),不是标签复读,保留。
+    expect(screen.getByLabelText("密码")).toHaveAttribute("placeholder", expect.stringMatching(/^至少 \d+ 位$/));
+  });
+});
+
+describe("AuthGate — 配置未就绪时的登录按钮(L-10)", () => {
+  test("点过登录后按钮显示「正在准备登录…」而不是只剩一枚 spinner", () => {
+    const retry = vi.fn();
+    render(<AuthGate {...base} onLogin={vi.fn()} onRetryPublicConfig={retry} />);
+    fill();
+    const submit = screen.getByRole("button", { name: "登录" });
+    fireEvent.click(submit);
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(submit).toBeDisabled();
+    expect(submit).toHaveTextContent("正在准备登录…");
+    expect(submit).toHaveAccessibleName(/正在准备登录/);
+  });
+});
+
+describe("AuthGate — 协议弹窗副标题(L-04 / L-14)", () => {
+  test("只标一次生效日期(全角冒号),不再重复更新日期", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("link", { name: "《用户协议》" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(`生效日期：${TERMS_VERSION}`)).toBeInTheDocument();
+    expect(dialog.textContent).not.toContain("更新日期");
+    expect(dialog.textContent).not.toContain(`生效日期:${TERMS_VERSION}`);
   });
 });

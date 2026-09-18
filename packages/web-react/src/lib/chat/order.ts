@@ -2,9 +2,11 @@
  * Browser-only transcript order repair.
  *
  * Older IndexedDB snapshots can contain client-owned process cards after the
- * durable terminal assistant row of the same turn.  That shape is stable
- * under an empty incremental sync, so repair it from turn identity rather
- * than wall-clock timestamps or a global "all cards follow user" rule.
+ * durable terminal assistant row of the same turn, or before the owner user
+ * they belong to.  Both shapes are stable under an empty incremental sync, so
+ * repair them from turn identity rather than wall-clock timestamps or a
+ * global "all cards follow user" rule.
+ * INC-20260907-PROCESS-CARD-BEFORE-USER
  */
 import type { ChatMessage } from "./model";
 import {
@@ -22,10 +24,28 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+function isLocalClientOwnedCard(message: ChatMessage): boolean {
+  return PROCESS_ROLES.has(message.role) && message._source !== "server";
+}
+
 function isLocalProcessRow(message: ChatMessage, nowMs: number): boolean {
-  return PROCESS_ROLES.has(message.role) &&
-    message._source !== "server" &&
-    !isOpenPermissionPrompt(message, nowMs);
+  return isLocalClientOwnedCard(message) && !isOpenPermissionPrompt(message, nowMs);
+}
+
+/**
+ * Prefer an explicit `_turnOwnerId` that names a user in this snapshot.
+ * Legacy exact `_clientMessageId` is accepted only when that user is present.
+ * A stamped owner whose user is not paged in is not rewritten onto another
+ * turn — the card stays put until its owner row is loaded.
+ */
+function presentOwnerId(message: ChatMessage, userIds: Set<string>): string | undefined {
+  if (nonEmptyString(message._turnOwnerId)) {
+    return userIds.has(message._turnOwnerId) ? message._turnOwnerId : undefined;
+  }
+  if (nonEmptyString(message._clientMessageId) && userIds.has(message._clientMessageId)) {
+    return message._clientMessageId;
+  }
+  return undefined;
 }
 
 function isTurnTerminalCandidate(message: ChatMessage): boolean {
@@ -110,22 +130,50 @@ export function sinkOpenPermissionPrompts(
   nowMs: number = Date.now(),
 ): ChatMessage[] {
   if (messages.length < 2) return messages;
-  const out: ChatMessage[] = [];
-  let carried: ChatMessage[] = [];
-  for (const m of messages) {
-    if (m?.role === "user") {
-      if (carried.length > 0) { out.push(...carried); carried = []; }
-      out.push(m);
-      continue;
+  const ownerEnd = new Map<string, number>();
+  let currentUserId: string | undefined;
+  for (let index = 0; index < messages.length; index++) {
+    const m = messages[index];
+    if (m?.role === "user" && nonEmptyString(m.id)) {
+      if (currentUserId) ownerEnd.set(currentUserId, index);
+      currentUserId = m.id;
     }
-    if (m && isOpenPermissionPrompt(m, nowMs)) {
-      carried.push(m);
-      continue;
-    }
-    out.push(m);
   }
-  if (carried.length > 0) out.push(...carried);
-  return out.every((m, index) => m === messages[index]) ? messages : out;
+  if (currentUserId) ownerEnd.set(currentUserId, messages.length);
+  const userIds = new Set(ownerEnd.keys());
+  const pendingAt = new Map<number, ChatMessage[]>();
+  const moved = new Set<ChatMessage>();
+  currentUserId = undefined;
+  // Collect before emitting: a late prompt can belong to a turn whose end
+  // was already passed. A one-pass flush silently loses such prompts.
+  for (const m of messages) {
+    if (m?.role === "user" && nonEmptyString(m.id)) {
+      currentUserId = m.id;
+      continue;
+    }
+    if (!m || !isOpenPermissionPrompt(m, nowMs)) continue;
+    let ownerId = presentOwnerId(m, userIds);
+    if (!ownerId) {
+      // A known but absent owner is a paged-out turn, not an unowned prompt.
+      if (nonEmptyString(m._turnOwnerId) || nonEmptyString(m._clientMessageId)) continue;
+      ownerId = currentUserId;
+    }
+    if (!ownerId) continue;
+    const end = ownerEnd.get(ownerId);
+    if (end === undefined) continue;
+    const pending = pendingAt.get(end) ?? [];
+    pending.push(m);
+    pendingAt.set(end, pending);
+    moved.add(m);
+  }
+  if (moved.size === 0) return messages;
+  const out: ChatMessage[] = [];
+  for (let index = 0; index <= messages.length; index++) {
+    const pending = pendingAt.get(index);
+    if (pending) out.push(...pending);
+    if (index < messages.length && !moved.has(messages[index])) out.push(messages[index]);
+  }
+  return out.length === messages.length && out.every((m, index) => m === messages[index]) ? messages : out;
 }
 
 /**
@@ -155,7 +203,95 @@ export function repairPostFinalProcessOrder(
   nowMs: number = Date.now(),
 ): ChatMessage[] {
   if (messages.length === 0) return messages;
-  return sinkOpenPermissionPrompts(repairProcessCardsBeforeTerminal(messages, nowMs), nowMs);
+  return sinkOpenPermissionPrompts(
+    repairProcessCardsBeforeTerminal(
+      clampProcessCardsToOwnerUserBounds(messages),
+      nowMs,
+    ),
+    nowMs,
+  );
+}
+
+/**
+ * Local client-owned agent-group / delegate-progress / permission cards may
+ * not sit before their present owner user, or past the next user after that
+ * owner.  Only out-of-bounds cards move; in-turn tool/assistant interleaving
+ * and server-authored tape rows stay.  Missing owners (pagination) are left
+ * alone.  INC-20260907-PROCESS-CARD-BEFORE-USER
+ */
+function clampProcessCardsToOwnerUserBounds(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length < 2) return messages;
+
+  const userIndex = new Map<string, number>();
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message?.role === "user" && nonEmptyString(message.id) && !userIndex.has(message.id)) {
+      userIndex.set(message.id, index);
+    }
+  }
+  if (userIndex.size === 0) return messages;
+
+  const userIds = new Set(userIndex.keys());
+  const userIndices = [...userIndex.values()];
+  const nextUserIndex = new Map(userIndices.map((lo, index) =>
+    [lo, userIndices[index + 1] ?? messages.length] as const));
+  const hiFor = (lo: number): number => nextUserIndex.get(lo) ?? messages.length;
+
+  const tooEarly = new Map<string, ChatMessage[]>();
+  const tooLate = new Map<string, ChatMessage[]>();
+  const moved = new Set<ChatMessage>();
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (!message || !isLocalClientOwnedCard(message)) continue;
+    const ownerId = presentOwnerId(message, userIds);
+    if (!ownerId) continue;
+    const lo = userIndex.get(ownerId);
+    if (lo === undefined) continue;
+    const hi = hiFor(lo);
+    if (index < lo) {
+      moved.add(message);
+      const cards = tooEarly.get(ownerId) ?? [];
+      cards.push(message);
+      tooEarly.set(ownerId, cards);
+    } else if (index >= hi) {
+      moved.add(message);
+      const cards = tooLate.get(ownerId) ?? [];
+      cards.push(message);
+      tooLate.set(ownerId, cards);
+    }
+  }
+  if (moved.size === 0) return messages;
+
+  const lateByHi = new Map<number, string[]>();
+  for (const ownerId of tooLate.keys()) {
+    const hi = hiFor(userIndex.get(ownerId)!);
+    const owners = lateByHi.get(hi) ?? [];
+    owners.push(ownerId);
+    lateByHi.set(hi, owners);
+  }
+
+  const emitLate = (hi: number, out: ChatMessage[]): void => {
+    const owners = lateByHi.get(hi);
+    if (!owners) return;
+    for (const ownerId of owners) {
+      const cards = tooLate.get(ownerId);
+      if (cards) out.push(...cards);
+    }
+  };
+
+  const repaired: ChatMessage[] = [];
+  for (let index = 0; index < messages.length; index++) {
+    emitLate(index, repaired);
+    const message = messages[index];
+    if (moved.has(message)) continue;
+    repaired.push(message);
+    if (message?.role === "user" && nonEmptyString(message.id)) {
+      const cards = tooEarly.get(message.id);
+      if (cards) repaired.push(...cards);
+    }
+  }
+  emitLate(messages.length, repaired);
+  return repaired;
 }
 
 function repairProcessCardsBeforeTerminal(messages: ChatMessage[], nowMs: number): ChatMessage[] {

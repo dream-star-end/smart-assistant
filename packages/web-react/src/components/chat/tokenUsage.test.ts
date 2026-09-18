@@ -1,8 +1,13 @@
-import { describe, expect, test } from "vitest";
+import "@testing-library/jest-dom/vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, test } from "vitest";
 import {
   formatCompactTokenCount,
   groupedCallTokenUsage,
+  TokenUsageBadge,
 } from "./tokenUsage";
+
+afterEach(cleanup);
 
 describe("tokenUsage 紧凑展示", () => {
   test.each([
@@ -26,5 +31,17 @@ describe("tokenUsage 紧凑展示", () => {
       shared: true,
       totalTokens: 123_456,
     });
+  });
+
+  // M-08:徽章此前只是一个无单位的裸数字(5.98k),仅 title 可解释。
+  test("徽章可见文案带单位,数字节点自身仍是纯数字,估算/共享前缀保留", () => {
+    const { rerender } = render(TokenUsageBadge({ usage: { totalTokens: 5_980 } }));
+    const badge = screen.getByLabelText("本轮 5,980 token");
+    expect(badge).toHaveTextContent("5.98k token");
+    expect(screen.getByText("5.98k")).toBeInTheDocument();
+    rerender(TokenUsageBadge({ usage: { totalTokens: 128, estimated: true } }));
+    expect(screen.getByLabelText("本轮估算约 128 token")).toHaveTextContent("约128 token");
+    rerender(TokenUsageBadge({ usage: { totalTokens: 64, shared: true, callId: "c1" }, label: "子 Agent 合计" }));
+    expect(screen.getByText("共64")).toBeInTheDocument();
   });
 });

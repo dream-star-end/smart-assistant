@@ -28,6 +28,21 @@ afterEach(() => {
 });
 
 let __objUrlSeq = 0;
+/** 真 URL 构造器(模块加载时捕获,早于任何 stub)。 */
+const RealURL = URL;
+/**
+ * URL 桩:jsdom 未实现 createObjectURL,桩成可辨识值 —— 但必须**保留真构造器**:
+ * 查看器(ImageViewer)是懒块(首屏预算),vitest 运行时解析动态 import 要 `new URL(...)`,
+ * 旧写法 `{ ...URL, createObjectURL }` 把全局 URL 换成普通对象,懒块一加载即 "URL is not a constructor"。
+ */
+function stubObjectUrl(createObjectURL: () => string) {
+  const createObjectURLMock = vi.fn(createObjectURL);
+  vi.stubGlobal(
+    "URL",
+    Object.assign(class extends RealURL {}, { createObjectURL: createObjectURLMock, revokeObjectURL: vi.fn() }),
+  );
+  return createObjectURLMock;
+}
 /** 流式 image Response(缩略 fetch 用):默认 1KB webp。 */
 function streamImageResponse(size = 1024): Response {
   let done = false;
@@ -58,12 +73,8 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 beforeEach(() => {
   imageByteCache.clear();
   __objUrlSeq = 0;
-  // 渐进加载完成后 blob→objectURL:jsdom 未实现 createObjectURL,桩成可辨识值。
-  vi.stubGlobal("URL", {
-    ...URL,
-    createObjectURL: vi.fn(() => `blob:obj-${++__objUrlSeq}`),
-    revokeObjectURL: vi.fn(),
-  });
+  // 渐进加载完成后 blob→objectURL:jsdom 未实现 createObjectURL,桩成可辨识值(见 stubObjectUrl)。
+  stubObjectUrl(() => `blob:obj-${++__objUrlSeq}`);
   // 缩略/原图渐进 fetch 默认成功(个别用例可再 vi.stubGlobal 覆盖)。
   vi.stubGlobal("fetch", vi.fn(async () => streamImageResponse()));
 });
@@ -107,20 +118,24 @@ describe("ZoomableImage 灯箱", () => {
     expect(img.className).toContain("max-h-72");
   });
 
-  test("点击缩略图 → 打开全屏查看器:四动作条 + 更多菜单逃生口;关闭收起", () => {
+  test("点击缩略图 → 打开全屏查看器:四动作条 + 更多菜单逃生口;关闭收起", async () => {
     render(<ZoomableImage src={src} alt="拟合曲线" />);
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ }));
-    // 全屏查看器展示大图(缩略图 + 查看器两张同 alt)。
-    expect(screen.getAllByAltText("拟合曲线").length).toBeGreaterThanOrEqual(2);
+    // 全屏查看器展示大图(缩略图 + 查看器两张同 alt)。查看器是懒块(首屏预算),首开要等模块解析。
+    await waitFor(() => expect(screen.getAllByAltText("拟合曲线").length).toBeGreaterThanOrEqual(2));
     // 底部三动作条(圆钮 + 中文标签;「移除」已下线)。
     for (const label of ["编辑", "评论", "调整大小"]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
     expect(screen.queryByRole("button", { name: "移除" })).not.toBeInTheDocument();
-    // 「新标签打开原图」逃生口收进更多菜单。
-    fireEvent.click(screen.getByRole("button", { name: "更多" }));
-    expect(screen.getByRole("button", { name: /新标签打开原图/ })).toBeInTheDocument();
-    // 关闭按钮收起查看器。
+    // 「新标签打开原图」逃生口收进更多菜单。media M-14 后「更多」是 Radix DropdownMenu:
+    // pointerDown 开菜单、菜单项 role=menuitem(media.md §6.3 X-M1;与 ImageViewer.test 同一套开合写法)。
+    const more = screen.getByRole("button", { name: "更多" });
+    fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
+    expect(await screen.findByRole("menuitem", { name: /新标签打开原图/ })).toBeInTheDocument();
+    // 先 Esc 关菜单(菜单开着时 DismissableLayer 会吞掉外部点击),再点关闭按钮收起查看器。
+    fireEvent.keyDown(document.activeElement ?? document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "关闭预览" }));
     expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
   });
@@ -329,8 +344,7 @@ describe("SignedFileCard 点击时签名(410 死循环根因)", () => {
       } as unknown as Response;
     });
     vi.stubGlobal("fetch", fetchMock);
-    const createObjectURL = vi.fn(() => "blob:should-not-save");
-    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+    const createObjectURL = stubObjectUrl(() => "blob:should-not-save");
 
     render(
       <MediaSignProvider sign={sign}>
@@ -477,7 +491,8 @@ describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", (
       </MediaSignProvider>,
     );
     fireEvent.click(screen.getByRole("button", { name: /放大查看/ })); // 开查看器 → 现签并拉原图
-    fireEvent.click(screen.getByRole("button", { name: "下载" })); // 点下载 → pending 复用同一原图 fetch
+    // 查看器是懒块:等模块解析、顶栏出现后再点下载 → pending 复用同一原图 fetch
+    fireEvent.click(await screen.findByRole("button", { name: "下载" }));
     await waitFor(() => expect(hrefs.length).toBeGreaterThan(0));
     expect(hrefs.some((h) => h.startsWith("blob:"))).toBe(true);
     // 气泡缩略 + 查看器原图各一次；下载本身不得再产生第三个网络请求。

@@ -114,7 +114,8 @@ function ReminderJobCard({ job }: { job: ReminderJob }) {
   const human = job.schedule ? cronHuman(job.schedule) : "自定义时间";
   const Icon = job.isSystem ? Settings : Clock;
   return (
-    <li className="rounded-xl border border-border bg-elevated px-3 py-2.5 shadow-soft">
+    // 条目已在 ToolCard 内,不再套 rounded-xl + 阴影的第三层卡(T-14)。
+    <li className="rounded-lg border border-border/70 bg-surface px-3 py-2">
       <div className="flex items-start gap-2.5">
         <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
           <Icon size={14} />
@@ -186,7 +187,8 @@ function statusTone(ok: boolean | undefined): "success" | "danger" | "neutral" {
 function parseReminderStatus(op: string, input: Record<string, unknown> | null, output?: string | null, error?: boolean) {
   const text = String(output || "").trim();
   const ok = error || /^error:/i.test(text) ? false : text ? true : undefined;
-  const failureText = ok === false ? text || "工具执行失败" : "";
+  // 失败原因去掉 `error:` 前缀(T-29):标题已经说了「失败」,前缀是给模型看的,不是给人看的。
+  const failureText = ok === false ? text.replace(/^error:\s*/i, "") || "工具执行失败" : "";
   if (op === "create_reminder") {
     const id = /ID:\s*`([^`]+)`/.exec(text)?.[1];
     const schedule = /计划:\s*`([^`]+)`/.exec(text)?.[1] || asStr(input?.schedule);
@@ -229,8 +231,10 @@ function parseReminderStatus(op: string, input: Record<string, unknown> | null, 
 export function ReminderStatusCard({ op, input, output, error }: { op: string; input: Record<string, unknown> | null; output?: string | null; error?: boolean }) {
   const status = parseReminderStatus(op, input, output, error);
   const Icon = status.icon;
+  // desc 与标题同句(如「创建提醒失败」)时不重复第二遍(T-29)。
+  const desc = status.desc && status.desc.trim() !== status.title ? status.desc : "";
   return (
-    <div className={cn("rounded-xl border px-3 py-2.5", status.ok === false ? "border-danger-soft bg-danger-soft/40" : "border-border bg-elevated")}>
+    <div className={cn("rounded-lg border px-3 py-2", status.ok === false ? "border-danger-soft bg-danger-soft/40" : "border-border/70 bg-surface")}>
       <div className="flex items-start gap-2.5">
         <span className={cn("mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg", status.ok === false ? "bg-danger-soft text-danger" : "bg-accent-soft text-accent")}>
           <Icon size={14} />
@@ -238,9 +242,10 @@ export function ReminderStatusCard({ op, input, output, error }: { op: string; i
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-body font-semibold text-fg">{status.title}</span>
-            <Badge tone={statusTone(status.ok)}>{status.ok === false ? "失败" : "完成"}</Badge>
+            {/* 与 ToolCard F1 口径一致:「未成功」而非「失败」(T-29)。 */}
+            <Badge tone={statusTone(status.ok)}>{status.ok === false ? "未成功" : "完成"}</Badge>
           </div>
-          {status.desc && <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-snug text-muted">{status.desc}</p>}
+          {desc && <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-snug text-muted">{desc}</p>}
           <div className="mt-1 flex flex-wrap gap-1.5">
             {status.schedule && <SmallMeta icon={<CalendarClock size={11} />}>{cronHuman(status.schedule)}</SmallMeta>}
             {status.schedule && <SmallMeta>{status.schedule}</SmallMeta>}

@@ -27,8 +27,16 @@ class FakeCcbKernel extends EventEmitter {
   effortLevel: string | undefined
   toolsets: string[] | undefined
   executionTarget = { kind: 'local' as const }
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
   get isRunning() {
     return true
+  }
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
   }
   async submit(): Promise<void> {
     this.submitted = true
@@ -83,8 +91,16 @@ class FakeCodexKernel extends EventEmitter {
   lastActivityAt = Date.now()
   model: string | undefined = 'gpt-5.6-sol'
   effortLevel: string | undefined
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
   get isRunning() {
     return true
+  }
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
   }
   async submit(
     _input: unknown,
@@ -349,5 +365,44 @@ describe('prompt queue execution through real engine adapters', () => {
     assert.equal(mutexReleased, true)
     assert.equal(session._activeClientTurnCount, 0)
     assert.equal(session._currentTurnKey, undefined)
+  })
+
+  test('Codex kernel records consult binding then clears it on an ordinary turn', async () => {
+    const kernel = new FakeCodexKernel()
+    const adapter = new CodexAdapter(
+      {
+        sessionKey: 'queue-consult-bind',
+        agentId: 'main',
+        agentBaseDir: process.cwd(),
+        model: 'gpt-5.6-sol',
+      } as EngineCreateOpts,
+      kernel as unknown as CodexAppServerRunner,
+    )
+    try {
+      await adapter.submitTurn({
+        input: 'consult',
+        turnKey: 'tk-c',
+        consultTurn: { turnIndex: 7, configVersion: 'cv-c' },
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      }).submitted
+      assert.deepEqual(kernel.consultTurnBinding, {
+        turnKey: 'tk-c',
+        turnIndex: 7,
+        configVersion: 'cv-c',
+      })
+      kernel.finish()
+      await adapter.submitTurn({
+        input: 'plain',
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      }).submitted
+      assert.equal(kernel.consultTurnBinding, undefined)
+      kernel.finish()
+    } finally {
+      await adapter.shutdown().catch(() => {})
+    }
   })
 })

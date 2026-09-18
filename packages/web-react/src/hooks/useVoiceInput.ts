@@ -54,7 +54,15 @@ type Run = {
   stopSent: boolean;
   finished: boolean;
   alive: boolean;
+  /** 安全超时句柄(connecting 等 ready / transcribing 等 polish):服务端不回包时兜底回 idle。 */
+  timer: number | null;
 };
+
+/**
+ * 客户端安全超时(C-11):此前 stop 后进入「正在转写…」,若服务端不回 polish/error(网络抖动、WS 半开)
+ * 状态永久卡在 transcribing、麦克风持续禁用,本会话语音不可再用。connecting 等 ready 同理。
+ */
+export const VOICE_STAGE_TIMEOUT_MS = 15_000;
 
 export function useVoiceInput({
   getToken,
@@ -81,6 +89,10 @@ export function useVoiceInput({
     if (!r) return;
     r.alive = false;
     r.finished = true;
+    if (r.timer !== null) {
+      window.clearTimeout(r.timer);
+      r.timer = null;
+    }
     try {
       if (r.recorder && r.recorder.state === "recording") r.recorder.stop();
     } catch {
@@ -110,6 +122,19 @@ export function useVoiceInput({
     [onError, cleanup],
   );
 
+  /** 给当前 run 上一个阶段超时;到点仍未终态(finished)→ 按超时失败收尾。重复调用会先清掉上一个。 */
+  const armStageTimeout = useCallback(
+    (r: Run, msg: string) => {
+      if (r.timer !== null) window.clearTimeout(r.timer);
+      r.timer = window.setTimeout(() => {
+        r.timer = null;
+        if (ref.current !== r || !r.alive || r.finished) return;
+        fail(msg);
+      }, VOICE_STAGE_TIMEOUT_MS);
+    },
+    [fail],
+  );
+
   const start = useCallback(async () => {
     if (!supported || !getToken) return;
     const token = getToken();
@@ -127,9 +152,11 @@ export function useVoiceInput({
       stopSent: false,
       finished: false,
       alive: true,
+      timer: null,
     };
     ref.current = r;
     setState("connecting");
+    armStageTimeout(r, "语音服务连接超时，请重试");
 
     let stream: MediaStream;
     try {
@@ -204,11 +231,17 @@ export function useVoiceInput({
         try {
           rec.start(150);
           setState("recording");
+          // 录音阶段由用户控制时长,不设超时。
+          if (r.timer !== null) {
+            window.clearTimeout(r.timer);
+            r.timer = null;
+          }
         } catch {
           fail("录音启动失败");
         }
       } else if (msg.type === "stopping" || msg.type === "polish_start") {
         setState("transcribing");
+        armStageTimeout(r, "语音识别超时，请重试");
       } else if (msg.type === "polish") {
         const text = (msg.text || msg.rawText || "").trim();
         r.finished = true;
@@ -230,7 +263,7 @@ export function useVoiceInput({
         setState("idle");
       }
     };
-  }, [supported, getToken, onText, onError, cleanup, fail]);
+  }, [supported, getToken, onText, onError, cleanup, fail, armStageTimeout]);
 
   const stop = useCallback(() => {
     const r = ref.current;
@@ -239,6 +272,8 @@ export function useVoiceInput({
       return;
     }
     setState("transcribing");
+    // 等 polish 的阶段超时:服务端不回包不能让麦克风永久禁用。
+    armStageTimeout(r, "语音识别超时，请重试");
     const rec = r.recorder;
     if (rec && rec.state === "recording") {
       try {
@@ -268,7 +303,7 @@ export function useVoiceInput({
     } catch {
       /* ignore */
     }
-  }, [cleanup]);
+  }, [cleanup, armStageTimeout]);
 
   const toggle = useCallback(() => {
     if (state === "idle") void start();

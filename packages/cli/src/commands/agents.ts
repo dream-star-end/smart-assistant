@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises'
-import { paths, readAgentsConfig, writeAgentsConfig } from '@openclaude/storage'
+import { paths, readAgentsConfig, updateAgentsConfig } from '@openclaude/storage'
 
 export async function agentsList(): Promise<void> {
   const cfg = await readAgentsConfig()
@@ -16,13 +16,15 @@ export async function agentsList(): Promise<void> {
 }
 
 export async function agentsAdd(id: string, opts: { model?: string }): Promise<void> {
-  const cfg = await readAgentsConfig()
-  if (cfg.agents.find((a) => a.id === id)) {
+  const { result: added } = await updateAgentsConfig((cfg) => {
+    if (cfg.agents.some((a) => a.id === id)) return false
+    cfg.agents.push({ id, model: opts.model, persona: paths.agentClaudeMd(id) })
+    return true
+  })
+  if (!added) {
     console.error(`agent ${id} already exists`)
     process.exit(1)
   }
-  cfg.agents.push({ id, model: opts.model, persona: paths.agentClaudeMd(id) })
-  await writeAgentsConfig(cfg)
   await mkdir(paths.agentSessionsDir(id), { recursive: true })
   await writeFile(paths.agentClaudeMd(id), `# Agent: ${id}\n\nYou are a helpful assistant.\n`, {
     flag: 'wx',

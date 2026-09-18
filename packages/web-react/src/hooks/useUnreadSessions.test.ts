@@ -21,6 +21,7 @@ type Args = {
   activeId: string | null;
   userId: string | null;
   auth?: ReturnType<typeof createMemoryAuthSession> | null;
+  onNotificationOpen?: (sessionId: string) => void;
 };
 
 function hook(initial: Args) {
@@ -216,6 +217,47 @@ describe("useUnreadSessions", () => {
     expect(result.current.notifyEnabled).toBe(false);
     expect(result.current.notifyPermission).toBe("denied");
     expect(localStorage.getItem(unreadNotifyStorageKey("u1"))).toBe("0");
+  });
+
+  // UUS-01：系统通知 onclick 此前只 close()，点了没有落点。
+  test("点击系统通知：聚焦窗口并把会话 id 交给 onNotificationOpen", () => {
+    const created: Array<{ title: string; options?: NotificationOptions; onclick: (() => void) | null; close: () => void }> = [];
+    class FakeNotification {
+      static permission: NotificationPermission = "granted";
+      static requestPermission = vi.fn(async () => "granted" as const);
+      close = vi.fn();
+      onclick: (() => void) | null = null;
+      constructor(
+        public title: string,
+        public options?: NotificationOptions,
+      ) {
+        created.push(this);
+      }
+    }
+    vi.stubGlobal("Notification", FakeNotification);
+    const focus = vi.spyOn(window, "focus").mockImplementation(() => {});
+    localStorage.setItem(unreadNotifyStorageKey("u1"), "1");
+    const onNotificationOpen = vi.fn();
+    const { rerender } = hook({
+      sessions: [{ id: "s1", title: "调研", runState: "running" }],
+      activeId: "other",
+      userId: "u1",
+      onNotificationOpen,
+    });
+    rerender({
+      sessions: [{ id: "s1", title: "调研", runState: "idle", lastOutcome: "completed" }],
+      activeId: "other",
+      userId: "u1",
+      onNotificationOpen,
+    });
+    expect(created).toHaveLength(1);
+    expect(created[0]!.options?.tag).toBe("oc-session-s1");
+    act(() => {
+      created[0]!.onclick?.();
+    });
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(onNotificationOpen).toHaveBeenCalledWith("s1");
+    expect(created[0]!.close).toHaveBeenCalledTimes(1);
   });
 
   test("乐观已读在服务端确认前不闪回", () => {

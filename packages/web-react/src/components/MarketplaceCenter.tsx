@@ -13,7 +13,7 @@ import {
   useMarketplacePublishes,
 } from './marketplace/useMarketplacePublishes'
 import { useMarketplaceRevision } from './marketplace/useMarketplaceRevision'
-import { Alert, Badge, Button, EmptyState, IconButton, Tabs } from './ui'
+import { Alert, Badge, Button, EmptyState, IconButton, Tabs, useToast } from './ui'
 
 export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
 /** Legacy navigation/storage kind. Connector rows remain wire-compatible in PR1. */
@@ -48,6 +48,7 @@ export function MarketplaceCenter({
   onCreateInChat,
   onAskAiInChat,
   onOpenConnectors,
+  onRequireLogin,
   onTabChange,
   onClose,
 }: {
@@ -63,6 +64,11 @@ export function MarketplaceCenter({
   onAskAiInChat?: (text: string) => void
   /** 安装连接器后跳到管理中心完成账号绑定。 */
   onOpenConnectors?: (pluginSlug?: string) => void
+  /**
+   * 未登录空态的「去登录」出口(K-24):与 ManageCenter 同款 —— 由壳外(App)负责关市场并切到登录;
+   * 没传时回落为只关弹窗(改造前的行为),按钮文案与行为的错位留给接线补齐。
+   */
+  onRequireLogin?: () => void
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {
@@ -80,6 +86,14 @@ export function MarketplaceCenter({
   const [browseFocus, setBrowseFocus] = useState<{ slug: string; nonce: number } | null>(null)
   const [publishNotices, setPublishNotices] = useState<MarketplacePublishTransition[]>([])
   const publishNotice = publishNotices[0] ?? null
+  // 发布表单有未提交内容时关弹窗（Esc / 点遮罩 / ✕ / 切中心）：草稿已由 PublishPanel 落盘，
+  // 这里只补一句"已暂存、下次接着填"，不拦截关闭（K-01）。
+  const [publishDirty, setPublishDirty] = useState(false)
+  const toast = useToast()
+  const requestClose = () => {
+    if (publishDirty) toast('发布草稿已暂存，下次打开「发布」可以接着填', 'info')
+    onClose()
+  }
 
   const onPublishTransition = useCallback((transition: MarketplacePublishTransition) => {
     setBrowseRevision((revision) => revision + 1)
@@ -124,7 +138,7 @@ export function MarketplaceCenter({
   const noticeApproved = publishNotice?.publish.status === 'approved'
 
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
+    <Dialog.Root open={open} onOpenChange={(o) => !o && requestClose()}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
@@ -214,7 +228,7 @@ export function MarketplaceCenter({
                 title="登录后即可浏览市场"
                 hint="你安装的技能与智能体会跟随账号同步。"
                 action={
-                  <Button size="sm" variant="primary" onClick={onClose}>
+                  <Button size="sm" variant="primary" onClick={onRequireLogin ?? onClose}>
                     去登录
                   </Button>
                 }
@@ -261,6 +275,7 @@ export function MarketplaceCenter({
                       publishesError={publishes.error}
                       onRefreshPublishes={publishes.refresh}
                       onMutePublishTransition={publishes.muteTransition}
+                      onDirtyChange={setPublishDirty}
                     />
                   </div>
                 )}

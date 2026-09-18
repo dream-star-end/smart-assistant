@@ -3,11 +3,21 @@ import {
   DEFAULT_PROJECT_ID,
   DEFAULT_PROJECT_NAME,
   GROUP_HEADER_HEIGHT,
+  GROUP_HEADER_HEIGHT_TOUCH,
   HINT_ROW_HEIGHT,
   PROJECT_ROW_HEIGHT,
   SEARCH_HIT_HEIGHT,
   SESSION_ROW_HEIGHT,
 } from "./constants";
+
+/**
+ * 空态提示行的变体：
+ * - `empty-all`：零会话且零项目（新用户）——整个列表只剩这一块引导（说明 + 新建会话 + 新建项目），
+ *   不再渲染「项目 +」「未分类 0」骨架（审计 S-13）；「已归档」开关照常保留，它是归档会话唯一的入口；
+ * - `empty-list`：整个活动列表一条会话都没有但已有项目（全部归档 / 建了项目还没聊）——未分类空态叠大 CTA；
+ * - `empty-project`：某个分组暂无会话但别处有会话——只占一行普通高度，避免多个空项目把会话挤出视口（审计 S-01）。
+ */
+export type EmptyHintVariant = "empty-all" | "empty-list" | "empty-project";
 
 export type FlatItem =
   | { kind: "header"; key: string; label: string; height: number }
@@ -21,7 +31,14 @@ export type FlatItem =
       runningCount: number;
       height: number;
     }
-  | { kind: "hint"; key: string; text: string; height: number }
+  | {
+      kind: "hint";
+      key: string;
+      text: string;
+      height: number;
+      projectId?: string;
+      variant?: EmptyHintVariant;
+    }
   | { kind: "searchHit"; key: string; hit: SessionSearchHit; height: number }
   | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number };
 
@@ -42,6 +59,8 @@ export type FlattenInput = {
   localEmpty: boolean;
   /** 组内运行中计数（折叠项目行提示）；缺省视为 0。排序在调用方完成。 */
   isRunning?: (s: Session) => boolean;
+  /** 触屏（hover:none）：带按钮的分组标题行升到 44px，给触控靶留位（S-04）。 */
+  coarsePointer?: boolean;
 };
 
 function virtualDefaultProject(count: number): ChatProject {
@@ -67,15 +86,26 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
 
   if (input.searching) {
     for (const [label, list] of input.ungroupedGroups) {
-      if (label) items.push({ kind: "header", key: `h-${label}`, label, height: GROUP_HEADER_HEIGHT });
+      if (label)
+        items.push({ kind: "header", key: `h-${label}`, label, height: GROUP_HEADER_HEIGHT });
       for (const s of list) {
         items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
       }
     }
     if (input.searchRemote === "loading") {
-      items.push({ kind: "hint", key: "search-loading", text: "正在搜索消息…", height: HINT_ROW_HEIGHT });
+      items.push({
+        kind: "hint",
+        key: "search-loading",
+        text: "正在搜索消息…",
+        height: HINT_ROW_HEIGHT,
+      });
     } else if (input.searchRemote === "error") {
-      items.push({ kind: "hint", key: "search-error", text: "消息搜索失败", height: HINT_ROW_HEIGHT });
+      items.push({
+        kind: "hint",
+        key: "search-error",
+        text: "消息搜索失败",
+        height: HINT_ROW_HEIGHT,
+      });
     } else if (input.searchRemote === "empty" && input.searchHits.length === 0) {
       items.push({
         kind: "hint",
@@ -92,11 +122,21 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
         height: GROUP_HEADER_HEIGHT,
       });
       for (const hit of input.searchHits) {
-        items.push({ kind: "searchHit", key: `hit-${hit.sessionId}-${hit.matchedAt}`, hit, height: SEARCH_HIT_HEIGHT });
+        items.push({
+          kind: "searchHit",
+          key: `hit-${hit.sessionId}-${hit.matchedAt}`,
+          hit,
+          height: SEARCH_HIT_HEIGHT,
+        });
       }
     }
     if (items.length === 0 && input.localEmpty) {
-      items.push({ kind: "hint", key: "search-empty", text: "没有匹配的会话", height: HINT_ROW_HEIGHT });
+      items.push({
+        kind: "hint",
+        key: "search-empty",
+        text: "没有匹配的会话",
+        height: HINT_ROW_HEIGHT,
+      });
     }
     return items;
   }
@@ -108,8 +148,30 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
     }
   }
 
-  if (input.showProjects) {
-    items.push({ kind: "header", key: "h-projects", label: "项目", height: GROUP_HEADER_HEIGHT });
+  // 整个活动列表为空（新用户 / 全部归档）才叠大 CTA；否则空分组只占一行普通提示（S-01）。
+  const listEmpty = input.sessions.filter((s) => !s.archived).length === 0;
+
+  // 零会话且零项目：只渲染一块引导空态，不再摆「项目 +」「未分类 0」骨架（S-13）。
+  // 「已归档」开关在下面照常追加——归档列表按需拉取，此刻计数 0 不代表真没有。
+  const brandNew = listEmpty && (!input.showProjects || input.projects.length === 0);
+  if (brandNew) {
+    items.push({
+      kind: "hint",
+      key: "empty-all",
+      text: "还没有会话",
+      height: HINT_ROW_HEIGHT,
+      variant: "empty-all",
+    });
+  }
+
+  if (!brandNew && input.showProjects) {
+    items.push({
+      kind: "header",
+      key: "h-projects",
+      label: "项目",
+      // 「项目」标题行右侧有「新建项目」IconButton：触屏下按钮升到 44px，行高同步（S-04）。
+      height: input.coarsePointer ? GROUP_HEADER_HEIGHT_TOUCH : GROUP_HEADER_HEIGHT,
+    });
     for (const p of input.projects) {
       const kids = input.projectSessions.get(p.id) ?? [];
       const count = input.sessions.filter((s) => s.projectId === p.id && !s.archived).length;
@@ -125,37 +187,60 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       });
       if (!collapsed) {
         if (kids.length === 0) {
-          items.push({ kind: "hint", key: `p-empty-${p.id}`, text: "暂无会话", height: HINT_ROW_HEIGHT });
+          items.push({
+            kind: "hint",
+            key: `p-empty-${p.id}`,
+            text: "暂无会话",
+            height: HINT_ROW_HEIGHT,
+            variant: "empty-project",
+            // 默认项目不带 projectId，空态 CTA 走顶部 onNew；真实项目带上以便 onNewInProject。
+            ...(p.id !== DEFAULT_PROJECT_ID ? { projectId: p.id } : {}),
+          });
         }
         for (const s of kids) {
-          items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: SESSION_ROW_HEIGHT });
+          items.push({
+            kind: "session",
+            key: `s-${s.id}`,
+            session: s,
+            indent: true,
+            height: SESSION_ROW_HEIGHT,
+          });
         }
       }
     }
   }
 
-  const defaultKids = input.ungroupedGroups.flatMap(([, list]) => list);
-  const defaultCollapsed = input.collapsedProjectIds?.has(DEFAULT_PROJECT_ID) ?? false;
-  items.push({
-    kind: "project",
-    key: `p-${DEFAULT_PROJECT_ID}`,
-    project: virtualDefaultProject(defaultKids.length),
-    count: defaultKids.length,
-    collapsed: defaultCollapsed,
-    runningCount: runningIn(defaultKids, input.isRunning),
-    height: PROJECT_ROW_HEIGHT,
-  });
-  if (!defaultCollapsed) {
-    if (defaultKids.length === 0) {
-      items.push({
-        kind: "hint",
-        key: `p-empty-${DEFAULT_PROJECT_ID}`,
-        text: "暂无会话",
-        height: HINT_ROW_HEIGHT,
-      });
-    }
-    for (const s of defaultKids) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: SESSION_ROW_HEIGHT });
+  if (!brandNew) {
+    const defaultKids = input.ungroupedGroups.flatMap(([, list]) => list);
+    const defaultCollapsed = input.collapsedProjectIds?.has(DEFAULT_PROJECT_ID) ?? false;
+    items.push({
+      kind: "project",
+      key: `p-${DEFAULT_PROJECT_ID}`,
+      project: virtualDefaultProject(defaultKids.length),
+      count: defaultKids.length,
+      collapsed: defaultCollapsed,
+      runningCount: runningIn(defaultKids, input.isRunning),
+      height: PROJECT_ROW_HEIGHT,
+    });
+    if (!defaultCollapsed) {
+      if (defaultKids.length === 0) {
+        items.push({
+          kind: "hint",
+          key: `p-empty-${DEFAULT_PROJECT_ID}`,
+          text: "暂无会话",
+          height: HINT_ROW_HEIGHT,
+          variant: listEmpty ? "empty-list" : "empty-project",
+        });
+      }
+      for (const s of defaultKids) {
+        items.push({
+          kind: "session",
+          key: `s-${s.id}`,
+          session: s,
+          indent: true,
+          height: SESSION_ROW_HEIGHT,
+        });
+      }
     }
   }
 
@@ -168,9 +253,19 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
   });
   if (input.archivedExpanded) {
     if (input.archivedLoading) {
-      items.push({ kind: "hint", key: "archived-loading", text: "正在加载已归档…", height: HINT_ROW_HEIGHT });
+      items.push({
+        kind: "hint",
+        key: "archived-loading",
+        text: "正在加载已归档…",
+        height: HINT_ROW_HEIGHT,
+      });
     } else if (input.archived.length === 0) {
-      items.push({ kind: "hint", key: "archived-empty", text: "没有已归档的会话", height: HINT_ROW_HEIGHT });
+      items.push({
+        kind: "hint",
+        key: "archived-empty",
+        text: "没有已归档的会话",
+        height: HINT_ROW_HEIGHT,
+      });
     }
     for (const s of input.archived) {
       items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });

@@ -292,3 +292,17 @@ lease_body_train_alert() { # <train_id> <status> <reason>
 - 发车已暂停(open train 占位)。人工确认 survivor 状态后:\`oc-lease train resolve --id $1 --as committed|failed --reason ...\`
 EOF
 }
+
+# Session callback transport shared by registration validation and delivery.
+# Never source the full secrets env or leak its contents into logs/argv.
+lease_callback_post() { # <suffix: empty|/validate> <json>
+  local url="${OC_V5_LEASE_CALLBACK_URL:-http://127.0.0.1:18894/internal/v3/lease-callback}" secret
+  [[ "$url" =~ ^http://(127\.0\.0\.1|\[::1\]):[0-9]+/internal/v3/lease-callback$ ]] || {
+    echo 'invalid callback URL (direct loopback control endpoint required)' >&2; return 2;
+  }
+  secret="$(sed -nE 's/^OC_LEASE_CALLBACK_SECRET="?([0-9a-f]{64})"?$/\1/p' "${OC_V5_LEASE_CALLBACK_SECRET_FILE:-/etc/openclaude/commercial-v5-selfhost.env}" 2>/dev/null | head -1)"
+  [[ -n "$secret" ]] || { echo 'missing/invalid OC_LEASE_CALLBACK_SECRET (64 lowercase hex)' >&2; return 2; }
+  printf '%s' "$2" | curl --noproxy '*' -sS -m 20 \
+    --config <(printf 'header = "X-OC-Lease-Secret: %s"\n' "$secret") \
+    -H 'Content-Type: application/json' -w '\n%{http_code}' --data-binary @- "$url$1"
+}

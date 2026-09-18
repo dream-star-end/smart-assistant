@@ -7,8 +7,20 @@ import {
   CURSOR_CONTEXT_TIERS,
   CURSOR_CONTEXT_TIER_FAMILIES,
   CURSOR_CONTEXT_TIER_WINDOW,
+  CLASSIFIER_SIDE_QUERY_MAX_TOKENS,
+  CURSOR_EFFORT_FAMILIES,
+  CURSOR_ENGINE_ID_PREFIX,
   CURSOR_ENGINE_MODELS,
   CURSOR_ENGINE_MODEL_IDS,
+  cursorFamilyHasEffortAxis,
+  cursorFamilyPublicLabel,
+  cursorModelIdFromPublic,
+  isClassifierSideQuery,
+  parseCursorFamilyPublicId,
+  parsePlatformReasoningEffort,
+  publicCursorFamilyModelId,
+  publicCursorModelId,
+  resolveCursorPublicModel,
   DEFAULT_CURSOR_CONTEXT_TIER,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
@@ -109,7 +121,8 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    assert.equal(CURSOR_ENGINE_MODELS.length, 60)
+    // 61 + 10 luna Sand + 1 gemini-3.1-pro (2026-09-17)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 72)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -200,6 +213,205 @@ describe('Cursor engine model authority', () => {
     assert.equal(findCursorEngineModel('sonnet-5', 'high', false)?.upstreamModel, 'claude-sonnet-5-thinking-high')
     assert.equal(cursorCredentialModelFamily('cursor-gemini-3.8-flash-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('gemini-3.8-flash-low'), 'other_models')
+    assert.equal(cursorFamilySupportsFast('gpt-5.6-luna-sand'), true)
+    assert.deepEqual(cursorFamilyEfforts('gpt-5.6-luna-sand'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.equal(
+      findCursorEngineModel('gpt-5.6-luna-sand', 'high', false)?.upstreamModel,
+      'gpt-5.6-luna-high',
+    )
+    assert.equal(cursorCredentialModelFamily('cursor-gpt-5.6-luna-high'), 'other_models')
+    assert.equal(cursorFamilyHasEffortAxis('gemini-3.1-pro'), false)
+    assert.equal(findCursorEngineModel('gemini-3.1-pro', null, false)?.upstreamModel, 'gemini-3.1-pro')
+    assert.equal(cursorCredentialModelFamily('cursor-gemini-3.1-pro'), 'other_models')
+    assert.equal(publicCursorFamilyModelId('cursor-gpt-5.6-luna-high-fast'), 'gpt-5.6-luna-sand-fast')
+    assert.equal(cursorModelIdFromPublic('gpt-5.6-luna'), null)
+  })
+
+  test('public id strips the engine prefix and round-trips back to the internal id', () => {
+    assert.equal(publicCursorModelId('cursor-fable-5.1-high'), 'fable-5.1-high')
+    assert.equal(publicCursorModelId('cursor-grok-4.6-high-fast'), 'grok-4.6-high-fast')
+    // Non-cursor ids pass through untouched so mixed lists need no branching.
+    assert.equal(publicCursorModelId('gpt-5.6-sol'), 'gpt-5.6-sol')
+    assert.equal(publicCursorModelId('cursor-not-a-model'), 'cursor-not-a-model')
+    for (const id of CURSOR_ENGINE_MODEL_IDS) {
+      const pub = publicCursorModelId(id)
+      assert.equal(pub.startsWith(CURSOR_ENGINE_ID_PREFIX), false)
+      assert.equal(cursorModelIdFromPublic(pub), id)
+      assert.equal(cursorModelIdFromPublic(id), id)
+    }
+    // Public ids are unique — no two distinct internal ids collapse onto the same external name.
+    assert.equal(
+      new Set(CURSOR_ENGINE_MODEL_IDS.map(publicCursorModelId)).size,
+      new Set(CURSOR_ENGINE_MODEL_IDS).size,
+    )
+    assert.equal(cursorModelIdFromPublic('gpt-5.6-sol'), null)
+    assert.equal(cursorModelIdFromPublic('fable-5.1-high --force'), null)
+    assert.equal(cursorModelIdFromPublic(''), null)
+    assert.equal(cursorModelIdFromPublic(null), null)
+    assert.equal(cursorModelIdFromPublic(undefined), null)
+  })
+
+  test('family-level public ids drop the effort suffix but keep the fast axis', () => {
+    // Every family that carries an effort axis is family-addressable; auto / composer are not.
+    assert.deepEqual([...CURSOR_EFFORT_FAMILIES].sort(), [
+      'fable-5', 'fable-5.1', 'gemini-3.8-flash', 'gpt-5.6-luna-sand', 'grok-4.5', 'grok-4.6', 'opus-4.8', 'opus-5', 'sonnet-5',
+    ])
+    assert.equal(cursorFamilyHasEffortAxis('fable-5.1'), true)
+    assert.equal(cursorFamilyHasEffortAxis('auto'), false)
+    assert.equal(cursorFamilyHasEffortAxis('composer-2.5'), false)
+    // Haiku 4.5 (2026-09-08): single Sand tier `claude-haiku-4-5`, no thinking axis → public id is the family.
+    assert.equal(cursorFamilyHasEffortAxis('haiku-4.5'), false)
+    assert.equal(publicCursorFamilyModelId('cursor-haiku-4.5'), 'haiku-4.5')
+    assert.equal(cursorModelIdFromPublic('haiku-4.5'), 'cursor-haiku-4.5')
+    assert.equal(findCursorEngineModel('haiku-4.5', null, false)?.upstreamModel, 'claude-haiku-4-5')
+    assert.deepEqual(resolveCursorPublicModel('haiku-4.5', 'max'), {
+      internalId: 'cursor-haiku-4.5', family: 'haiku-4.5', effort: null, fast: false, effortSource: 'pinned',
+    })
+    assert.equal(cursorCredentialModelFamily('cursor-haiku-4.5'), 'other_models')
+
+    assert.equal(publicCursorFamilyModelId('cursor-fable-5.1-high'), 'fable-5.1')
+    assert.equal(publicCursorFamilyModelId('cursor-fable-5.1-low'), 'fable-5.1')
+    assert.equal(publicCursorFamilyModelId('cursor-grok-4.6-xhigh-fast'), 'grok-4.6-fast')
+    assert.equal(publicCursorFamilyModelId('cursor-grok-4.6-low'), 'grok-4.6')
+    assert.equal(publicCursorFamilyModelId('cursor-gemini-3.8-flash-medium'), 'gemini-3.8-flash')
+    // Families without an effort axis keep their single public id.
+    assert.equal(publicCursorFamilyModelId('cursor-auto'), 'auto')
+    assert.equal(publicCursorFamilyModelId('cursor-composer-2.5-fast'), 'composer-2.5-fast')
+    // Non-cursor ids pass through untouched.
+    assert.equal(publicCursorFamilyModelId('gpt-6-astra'), 'gpt-6-astra')
+    assert.equal(publicCursorFamilyModelId('cursor-not-a-model'), 'cursor-not-a-model')
+    // The external surface never leaks the engine name or a thinking-depth suffix.
+    for (const id of CURSOR_ENGINE_MODEL_IDS) {
+      const pub = publicCursorFamilyModelId(id)
+      assert.equal(pub.startsWith(CURSOR_ENGINE_ID_PREFIX), false)
+      assert.equal(/-(low|medium|high|xhigh|max)(-fast)?$/.test(pub), false, pub)
+    }
+
+    assert.equal(cursorFamilyPublicLabel('fable-5.1', false), 'Fable 5.1')
+    assert.equal(cursorFamilyPublicLabel('grok-4.6', true), 'Grok 4.6 Fast')
+    assert.equal(cursorFamilyPublicLabel('auto', false), 'Cursor Auto')
+
+    assert.deepEqual(parseCursorFamilyPublicId('fable-5.1'), { family: 'fable-5.1', fast: false })
+    assert.deepEqual(parseCursorFamilyPublicId('grok-4.6-fast'), { family: 'grok-4.6', fast: true })
+    // `-fast` only where the family really has fast variants.
+    assert.equal(parseCursorFamilyPublicId('fable-5.1-fast'), null)
+    // Effort-suffixed ids, engine-prefixed ids and non-effort families are not family ids.
+    assert.equal(parseCursorFamilyPublicId('fable-5.1-high'), null)
+    assert.equal(parseCursorFamilyPublicId('cursor-fable-5.1'), null)
+    assert.equal(parseCursorFamilyPublicId('auto'), null)
+    assert.equal(parseCursorFamilyPublicId('composer-2.5'), null)
+    assert.equal(parseCursorFamilyPublicId('gpt-6-astra'), null)
+    assert.equal(parseCursorFamilyPublicId(''), null)
+    assert.equal(parseCursorFamilyPublicId(undefined), null)
+  })
+
+  test('isClassifierSideQuery matches Claude Code auto-mode classifier shape only', () => {
+    // yoloClassifier.ts stage 1: max_tokens 64, stop_sequences ['</block>'], no tools.
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: ['</block>'] }), true)
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: ['</block>'], tools: [] }), true)
+    // alwaysOnThinking padding (+2048) still under the cap? No — 2112 > 512; that path only exists for ant builds.
+    assert.equal(isClassifierSideQuery({ max_tokens: 256, stop_sequences: ['</block>'] }), true)
+    // Ordinary chat turn: big max_tokens, no stop_sequences, tools present.
+    assert.equal(isClassifierSideQuery({ max_tokens: 32000, tools: [{ name: 'Bash' }] }), false)
+    assert.equal(isClassifierSideQuery({ max_tokens: 32000, stop_sequences: ['x'] }), false)
+    // Small max_tokens alone is not enough (short chat replies are legitimate).
+    assert.equal(isClassifierSideQuery({ max_tokens: 64 }), false)
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: [] }), false)
+    // Tools present → not a classifier (legacy tool-based classifier is out of scope; it sets tool_choice).
+    assert.equal(isClassifierSideQuery({ max_tokens: 64, stop_sequences: ['</block>'], tools: [{ name: 'x' }] }), false)
+    assert.equal(isClassifierSideQuery({}), false)
+    assert.equal(CLASSIFIER_SIDE_QUERY_MAX_TOKENS, 512)
+  })
+
+  test('parsePlatformReasoningEffort accepts the five platform levels case-insensitively', () => {
+    assert.equal(parsePlatformReasoningEffort('low'), 'low')
+    assert.equal(parsePlatformReasoningEffort(' XHigh '), 'xhigh')
+    assert.equal(parsePlatformReasoningEffort('max'), 'max')
+    // Claude Code's `auto` and non-strings are "no preference", not an error.
+    assert.equal(parsePlatformReasoningEffort('auto'), undefined)
+    assert.equal(parsePlatformReasoningEffort('ultra'), undefined)
+    assert.equal(parsePlatformReasoningEffort(3), undefined)
+    assert.equal(parsePlatformReasoningEffort(undefined), undefined)
+    assert.equal(parsePlatformReasoningEffort(null), undefined)
+  })
+
+  test('resolveCursorPublicModel maps family + client effort to one internal variant', () => {
+    // Family id + effort the family offers → honoured verbatim.
+    assert.deepEqual(resolveCursorPublicModel('fable-5.1', 'low'), {
+      internalId: 'cursor-fable-5.1-low', family: 'fable-5.1', effort: 'low', fast: false, effortSource: 'request',
+    })
+    assert.deepEqual(resolveCursorPublicModel('fable-5.1', 'max'), {
+      internalId: 'cursor-fable-5.1-max', family: 'fable-5.1', effort: 'max', fast: false, effortSource: 'request',
+    })
+    assert.deepEqual(resolveCursorPublicModel('grok-4.6-fast', 'xhigh'), {
+      internalId: 'cursor-grok-4.6-xhigh-fast', family: 'grok-4.6', effort: 'xhigh', fast: true, effortSource: 'request',
+    })
+    // No client effort → family default (high).
+    assert.deepEqual(resolveCursorPublicModel('sonnet-5', undefined), {
+      internalId: 'cursor-sonnet-5-high', family: 'sonnet-5', effort: 'high', fast: false, effortSource: 'default',
+    })
+    // Claude Code `auto` / garbage → treated as "no preference".
+    assert.equal(resolveCursorPublicModel('sonnet-5', 'auto')?.internalId, 'cursor-sonnet-5-high')
+    assert.equal(resolveCursorPublicModel('sonnet-5', 'auto')?.effortSource, 'default')
+    // Level the family does not offer → highest offered at or below it.
+    assert.deepEqual(resolveCursorPublicModel('gemini-3.8-flash', 'max'), {
+      internalId: 'cursor-gemini-3.8-flash-high', family: 'gemini-3.8-flash', effort: 'high', fast: false, effortSource: 'clamped',
+    })
+    assert.equal(resolveCursorPublicModel('grok-4.6', 'max')?.internalId, 'cursor-grok-4.6-xhigh')
+    assert.equal(resolveCursorPublicModel('grok-4.6', 'max')?.effortSource, 'clamped')
+    // grok-4.5 only ships `high`: anything, including `low`, lands on high.
+    assert.equal(resolveCursorPublicModel('grok-4.5', 'low')?.internalId, 'cursor-grok-4.5-high')
+    assert.equal(resolveCursorPublicModel('grok-4.5', 'low')?.effortSource, 'clamped')
+    assert.equal(resolveCursorPublicModel('grok-4.5', 'high')?.effortSource, 'request')
+
+    // Effort-suffixed public id or internal id → pinned; client effort is ignored.
+    assert.deepEqual(resolveCursorPublicModel('fable-5.1-high', 'low'), {
+      internalId: 'cursor-fable-5.1-high', family: 'fable-5.1', effort: 'high', fast: false, effortSource: 'pinned',
+    })
+    assert.equal(resolveCursorPublicModel('cursor-fable-5.1-xhigh', 'low')?.internalId, 'cursor-fable-5.1-xhigh')
+    assert.deepEqual(resolveCursorPublicModel('auto', 'max'), {
+      internalId: 'cursor-auto', family: 'auto', effort: null, fast: false, effortSource: 'pinned',
+    })
+    assert.equal(resolveCursorPublicModel('composer-2.5-fast', 'low')?.internalId, 'cursor-composer-2.5-fast')
+
+    // Deployment-disabled variants are skipped: max off → xhigh; default high off → medium.
+    const without = (...ids: string[]) => (id: string) => !ids.includes(id)
+    assert.deepEqual(resolveCursorPublicModel('fable-5.1', 'max', without('cursor-fable-5.1-max')), {
+      internalId: 'cursor-fable-5.1-xhigh', family: 'fable-5.1', effort: 'xhigh', fast: false, effortSource: 'clamped',
+    })
+    assert.equal(
+      resolveCursorPublicModel('fable-5.1', undefined, without('cursor-fable-5.1-high'))?.internalId,
+      'cursor-fable-5.1-medium',
+    )
+    // Nothing below the target → lowest offered.
+    assert.equal(
+      resolveCursorPublicModel('fable-5.1', 'low', without('cursor-fable-5.1-low'))?.internalId,
+      'cursor-fable-5.1-medium',
+    )
+    // Whole family disabled → null (caller falls through to unknown-model handling).
+    assert.equal(resolveCursorPublicModel('grok-4.5', 'high', () => false), null)
+    // Pinned ids do not consult availability — the caller's pricing gate reports them.
+    assert.equal(resolveCursorPublicModel('fable-5.1-high', undefined, () => false)?.internalId, 'cursor-fable-5.1-high')
+
+    // Claude Code auto-mode classifier side-query → lowest offered level, regardless of client effort / default.
+    assert.deepEqual(resolveCursorPublicModel('fable-5.1', 'high', () => true, { sideQuery: true }), {
+      internalId: 'cursor-fable-5.1-low', family: 'fable-5.1', effort: 'low', fast: false, effortSource: 'classifier',
+    })
+    assert.equal(resolveCursorPublicModel('sonnet-5', undefined, () => true, { sideQuery: true })?.internalId, 'cursor-sonnet-5-low')
+    // lowest *offered*: low disabled → medium.
+    assert.equal(
+      resolveCursorPublicModel('fable-5.1', 'max', without('cursor-fable-5.1-low'), { sideQuery: true })?.internalId,
+      'cursor-fable-5.1-medium',
+    )
+    // Pinned ids stay pinned even for side-queries (explicit `-high` means high).
+    assert.equal(resolveCursorPublicModel('fable-5.1-high', 'low', () => true, { sideQuery: true })?.effortSource, 'pinned')
+
+    // Unknown ids → null.
+    assert.equal(resolveCursorPublicModel('gpt-6-astra', 'high'), null)
+    assert.equal(resolveCursorPublicModel('fable-5.1-fast', 'high'), null)
+    assert.equal(resolveCursorPublicModel('fable-5.1 --force', 'high'), null)
+    assert.equal(resolveCursorPublicModel('', 'high'), null)
+    assert.equal(resolveCursorPublicModel(null, 'high'), null)
   })
 })
 

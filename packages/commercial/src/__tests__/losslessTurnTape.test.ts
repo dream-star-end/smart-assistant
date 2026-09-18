@@ -732,6 +732,110 @@ describe("materializeLosslessTurn", () => {
     }), /does not match requestId/);
   });
 
+  test("OCV5-189 keeps a background delegate card whose billing points at an earlier turn of the same session", () => {
+    // Real shape from session webmts0diug8rfqdp turn 3 (2026-09-08): the auditor
+    // admitted during turn 2 finished while the `dlgcb-*` continuation turn 3
+    // was active, so its team card drained into turn 3's tape carrying turn 2's
+    // parentTurnKey. Materialization must accept it; only the session boundary
+    // and the 64-hex shape stay strict.
+    const sessionId = "webmts0diug8rfqdp";
+    const previousTurnKey = "2".repeat(64);
+    const currentTurnKey = "6".repeat(64);
+    const crossTurnBilling = {
+      requestId: "56ed9556ee7b302a595efdd95b227c5f",
+      turnKey: "1".repeat(64),
+      parentTurnKey: previousTurnKey,
+      parentSessionId: sessionId,
+      delegateAgentId: "auditor",
+      engineSessionId: `oceng-${"a".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 1200,
+      usage: { input_tokens: 223518, output_tokens: 3135, cache_read_input_tokens: 634752 },
+    };
+    const sameTurnBilling = {
+      ...crossTurnBilling,
+      requestId: "ce123a3b2922ed2393ce7728e17540f0",
+      turnKey: "9".repeat(64),
+      parentTurnKey: currentTurnKey,
+      engineSessionId: `oceng-${"b".repeat(48)}`,
+    };
+    const base = {
+      sessionId,
+      agentId: "main",
+      turnIndex: 3,
+      clientMessageId: "dlgcb-dlgjob-mts1x4i2-085aeadc6c20-1",
+      status: "completed" as const,
+      turnKey: currentTurnKey,
+      requestId: "818701759fb7fa7731170135d41352de",
+      text: "根因已修复并合入，211 项定向测试通过。",
+      createdAt: 1_788_837_723_365,
+      engineBilling: {
+        requestId: "818701759fb7fa7731170135d41352de",
+        turnKey: currentTurnKey,
+        engineSessionId: `oceng-${"c".repeat(48)}`,
+        status: "success" as const,
+        durationMs: 2_814_087,
+        usage: { input_tokens: 859261, output_tokens: 48810, cache_read_input_tokens: 8314752 },
+      },
+    };
+    const turn = materializeLosslessTurn({
+      ...base,
+      agentGroups: [
+        {
+          runId: "dlg-mts1q3a2-939dd8d9",
+          agentId: "auditor",
+          goal: "OCV5-187 方案审",
+          status: "ok",
+          completedAt: 1_788_834_542_000,
+          engineBillings: [crossTurnBilling],
+        },
+        {
+          runId: "dlg-mts2f9xf-54267afc",
+          agentId: "auditor",
+          goal: "OCV5-187 diff 审",
+          status: "ok",
+          completedAt: 1_788_835_753_000,
+          engineBillings: [sameTurnBilling],
+        },
+      ],
+    });
+    // Cross-turn billing survives byte-for-byte: settlement attributes cost by
+    // the billing's own parentTurnKey, so the earlier turn is still credited.
+    const materializedCrossTurn = turn.engineBillings[1];
+    assert.equal(materializedCrossTurn?.parentTurnKey, previousTurnKey);
+    assert.deepEqual(turn.engineBillings, [base.engineBilling, crossTurnBilling, sameTurnBilling]);
+    const groups = turn.records.filter((record) => record.role === "agent-group");
+    assert.equal(groups.length, 2);
+    assert.deepEqual(groups[0]!.payload.engineBillings, [crossTurnBilling]);
+
+    // The session boundary is still a hard rejection.
+    assert.throws(() => materializeLosslessTurn({
+      ...base,
+      agentGroups: [{
+        runId: "dlg-foreign",
+        agentId: "auditor",
+        goal: "x",
+        status: "ok",
+        completedAt: 1,
+        engineBillings: [{ ...crossTurnBilling, parentSessionId: "webmt-some-other-session" }],
+      }],
+    }), /agentGroups\[0\]\.engineBillings\[0\] parent locator is invalid/);
+    // A delegate billing without any parent turn locator is still rejected.
+    const { parentTurnKey: _dropped, ...orphanBilling } = crossTurnBilling;
+    void _dropped;
+    assert.throws(() => materializeLosslessTurn({
+      ...base,
+      agentGroups: [{
+        runId: "dlg-orphan",
+        agentId: "auditor",
+        goal: "x",
+        status: "ok",
+        completedAt: 1,
+        engineBillings: [orphanBilling],
+      }],
+    }), /agentGroups\[0\]\.engineBillings\[0\] parent locator is invalid/);
+  });
+
   test("retains the cursor engine discriminator and rejects unknown engines", () => {
     const sessionId = "web-lossless-cursor";
     const cursorBilling = {
@@ -978,5 +1082,279 @@ describe("losslessBillingAnchorId vs materializeLosslessTurn", () => {
       });
       assert.equal(turn.billingAnchorId, expected, `turnIndex=${payload.turnIndex}`);
     }
+  });
+});
+
+// ── OCV5-180 B1 — restricted agent-group continuation (late delegate card) ──
+
+describe("OCV5-180 B1: agent-group continuation tapes", () => {
+  const OWNER_TURN_KEY = "b".repeat(64);
+  const baseContinuation = {
+    sessionId: "web-lossless-late",
+    agentId: "late_0123456789abcdef01234567",
+    turnIndex: 6,
+    status: "completed" as const,
+    turnKey: "c".repeat(64),
+    continuationOfTurnKey: OWNER_TURN_KEY,
+    text: "",
+    createdAt: 1_783_945_000_000,
+  };
+  const ownerBilling = (over: Record<string, unknown> = {}) => ({
+    requestId: "d".repeat(32),
+    engineSessionId: `oceng-${"e".repeat(48)}`,
+    status: "success",
+    durationMs: 42,
+    turnKey: OWNER_TURN_KEY,
+    parentTurnKey: OWNER_TURN_KEY,
+    parentSessionId: "web-lossless-late",
+    delegateAgentId: "coding-assistant",
+    usage: { input_tokens: 3, output_tokens: 4 },
+    ...over,
+  });
+
+  test("accepts a late delegate group whose billings point at the owner turn", () => {
+    const turn = materializeLosslessTurn({
+      ...baseContinuation,
+      agentGroups: [{
+        runId: "dlg-late-1",
+        agentId: "coding-assistant",
+        goal: "晚到子任务",
+        status: "ok",
+        completedAt: 1_783_945_000_001,
+        engineBillings: [ownerBilling()],
+      }],
+    });
+    const card = turn.records.find((r) => r.payload.role === "agent-group");
+    assert.ok(card, "agent-group card materializes from a continuation tape");
+    assert.equal(card!.payload._delegateRunId, "dlg-late-1");
+    assert.equal(card!.payload.status, "completed");
+    assert.equal(card!.payload._continuationOfTurnKey, OWNER_TURN_KEY);
+    // no assistant text is invented for the continuation
+    assert.equal(turn.records.some((r) => r.payload.role === "assistant"), false);
+  });
+
+  test("rejects billing whose parentTurnKey is the continuation’s own key, not the owner", () => {
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        ...baseContinuation,
+        agentGroups: [{
+          runId: "dlg-late-2",
+          agentId: "coding-assistant",
+          goal: "x",
+          status: "ok",
+          completedAt: 1,
+          engineBillings: [ownerBilling({ parentTurnKey: baseContinuation.turnKey })],
+        }],
+      }),
+      /parent locator is invalid/,
+    );
+  });
+
+  test("rejects continuation billing whose parentTurnKey is a third turn", () => {
+    assert.throws(() => parseLosslessTurnPayload({
+      ...baseContinuation,
+      agentGroups: [{
+        runId: "dlg-late-third",
+        agentId: "coding-assistant",
+        goal: "x",
+        status: "ok",
+        completedAt: 1,
+        engineBillings: [ownerBilling({ parentTurnKey: "f".repeat(64) })],
+      }],
+    }), /parent locator is invalid/);
+  });
+
+  test("same-session root compatibility preserves earlier-turn billing without a root billing", () => {
+    const billing = ownerBilling();
+    const root = {
+      sessionId: baseContinuation.sessionId,
+      agentId: "main",
+      turnIndex: 7,
+      status: "completed",
+      turnKey: baseContinuation.turnKey,
+      text: "next turn",
+      createdAt: baseContinuation.createdAt,
+      agentGroups: [{
+        runId: "dlg-root-previous",
+        agentId: "coding-assistant",
+        goal: "x",
+        status: "ok",
+        completedAt: 1,
+        engineBillings: [billing],
+      }],
+    };
+    assert.notEqual(billing.parentTurnKey, root.turnKey);
+    assert.equal(billing.parentSessionId, root.sessionId);
+    const turn = materializeLosslessTurn(root);
+    assert.deepEqual(turn.engineBillings, [billing]);
+    const record = turn.records.find((r) => r.role === "agent-group");
+    assert.ok(record);
+    assert.deepEqual(record.payload.engineBillings, [billing]);
+    assert.equal(turn.payload.continuationOfTurnKey, undefined);
+  });
+
+  test("root and continuation reject missing session, missing parent and malformed parent locators", () => {
+    for (const continuation of [false, true]) {
+      for (const invalid of [
+        { parentSessionId: undefined },
+        { parentTurnKey: undefined },
+        { parentTurnKey: "not-a-turn-key" },
+      ]) {
+        assert.throws(() => parseLosslessTurnPayload({
+          ...baseContinuation,
+          ...(continuation ? {} : { agentId: "main", continuationOfTurnKey: undefined, text: "root" }),
+          agentGroups: [{
+            runId: "dlg-invalid-locator",
+            agentId: "coding-assistant",
+            goal: "x",
+            status: "ok",
+            completedAt: 1,
+            engineBillings: [ownerBilling(invalid)],
+          }],
+        }), /parent locator is invalid|parentTurnKey is invalid/);
+      }
+    }
+  });
+
+  test("rejects cross-session billing locator", () => {
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        ...baseContinuation,
+        agentGroups: [{
+          runId: "dlg-late-3",
+          agentId: "coding-assistant",
+          goal: "x",
+          status: "ok",
+          completedAt: 1,
+          engineBillings: [ownerBilling({ parentSessionId: "other-session" })],
+        }],
+      }),
+      /parent locator is invalid/,
+    );
+  });
+
+  test("rejects runtimeEvents mixed into an agent-group continuation", () => {
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        ...baseContinuation,
+        agentGroups: [{
+          runId: "dlg-late-4",
+          agentId: "coding-assistant",
+          goal: "x",
+          status: "ok",
+          completedAt: 1,
+        }],
+        runtimeEvents: [{ ordinal: 1, observedAt: 2, source: "ccb", payload: { type: "tail" } }],
+      }),
+      /agent-group continuation must contain only completed agentGroups/,
+    );
+  });
+
+  test("rejects empty agentGroups, text, requestId and duplicate requestId on the branch", () => {
+    assert.throws(
+      () => parseLosslessTurnPayload({ ...baseContinuation, agentGroups: [] }),
+      /agent-group continuation must contain only completed agentGroups/,
+    );
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        ...baseContinuation,
+        text: "late text",
+        agentGroups: [{
+          runId: "dlg-late-5",
+          agentId: "coding-assistant",
+          goal: "x",
+          status: "ok",
+          completedAt: 1,
+        }],
+      }),
+      /agent-group continuation must contain only completed agentGroups/,
+    );
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        ...baseContinuation,
+        requestId: "a".repeat(32),
+        agentGroups: [{
+          runId: "dlg-late-6",
+          agentId: "coding-assistant",
+          goal: "x",
+          status: "ok",
+          completedAt: 1,
+        }],
+      }),
+      /agent-group continuation must contain only completed agentGroups/,
+    );
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        ...baseContinuation,
+        agentGroups: [
+          {
+            runId: "dlg-late-7",
+            agentId: "coding-assistant",
+            goal: "x",
+            status: "ok",
+            completedAt: 1,
+            engineBillings: [ownerBilling(), ownerBilling()],
+          },
+        ],
+      }),
+      /duplicate engine billing requestId/,
+    );
+  });
+
+  test("root tape rejects a delegate billing from another session", () => {
+    assert.throws(
+      () => parseLosslessTurnPayload({
+        sessionId: "web-lossless-root",
+        agentId: "main",
+        turnIndex: 2,
+        status: "completed",
+        turnKey: TURN_KEY,
+        text: "answer",
+        createdAt: 1_783_946_000_000,
+        agentGroups: [{
+          runId: "dlg-root-x",
+          agentId: "coding-assistant",
+          goal: "x",
+          status: "ok",
+          completedAt: 1,
+          engineBillings: [ownerBilling()],
+        }],
+      }),
+      /parent locator is invalid/,
+    );
+  });
+
+  test("root tape with a duplicated group requestId is rejected; a single group passes", () => {
+    const billed = {
+      runId: "dlg-root-dup",
+      agentId: "coding-assistant",
+      goal: "root group",
+      status: "ok" as const,
+      completedAt: 1_783_945_000_001,
+      engineBillings: [ownerBilling({ parentTurnKey: OWNER_TURN_KEY, turnKey: OWNER_TURN_KEY })],
+    };
+    const root = {
+      sessionId: "web-lossless-late",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed" as const,
+      turnKey: OWNER_TURN_KEY,
+      text: "root answer",
+      createdAt: 1_783_945_000_000,
+    };
+    materializeLosslessTurn({ ...root, agentGroups: [billed] });
+    assert.throws(
+      () => materializeLosslessTurn({ ...root, agentGroups: [billed, billed] }),
+      /duplicate engine billing requestId/,
+    );
+  });
+
+  test("old writer compat: runtimeEvents-only continuation still parses (no agentGroups)", () => {
+    const payload = parseLosslessTurnPayload({
+      ...baseContinuation,
+      runtimeEvents: [{ ordinal: 1, observedAt: 2, source: "ccb", payload: { type: "tail" } }],
+    });
+    assert.equal(payload.continuationOfTurnKey, OWNER_TURN_KEY);
+    assert.equal(payload.agentGroups, undefined);
   });
 });

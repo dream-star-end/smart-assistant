@@ -1,9 +1,11 @@
 import { ArrowLeft, Copy, ExternalLink } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { formatBytes } from "../../lib/chat/download";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   HTML_EMBED_SANDBOX,
   artifactKind,
+  communityCategoryLabel,
   communityTutorialShareUrl,
   deriveTutorialArtifacts,
   fetchSnapshotPageMessages,
@@ -14,7 +16,7 @@ import {
 import type { CommunityTutorialDetail, TutorialArtifact } from "../../lib/types";
 import { Markdown } from "../Markdown";
 import { MessageList } from "../MessageRenderer";
-import { Alert, Badge, Button } from "../ui";
+import { Alert, Badge, Button, useToast } from "../ui";
 
 function snapshotChatMessages(item: CommunityTutorialDetail): ChatMessage[] {
   const snapshot = item.snapshot;
@@ -41,6 +43,7 @@ export function SnapshotTutorialDetail({
   const [pageLoading, setPageLoading] = useState(false);
   const [pageRetry, setPageRetry] = useState(0);
   const [copied, setCopied] = useState(false);
+  const toast = useToast();
   const shareUrl = communityTutorialShareUrl(item.id);
   const artifacts = useMemo(() => deriveTutorialArtifacts(item), [item]);
   const messages = inlineMessages.length > 0 ? inlineMessages : pageMessages;
@@ -73,25 +76,28 @@ export function SnapshotTutorialDetail({
     };
   }, [item.snapshot, inlineMessages.length, pageRetry, pageUrls.join("|")]);
 
-  const copyShare = () => {
-    void navigator.clipboard?.writeText(shareUrl).then(() => {
+  // 复制失败不再是未处理的 rejection（非安全上下文 / 权限拒绝时用户会以为已复制），审计 TU-20。
+  const copyShare = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
-    });
+    } catch {
+      toast("复制失败，请从地址栏手动复制链接", "error");
+    }
   };
 
   return (
     <article className="mx-auto mt-5 w-full max-w-5xl rounded-3xl border border-border bg-surface p-5 shadow-sm sm:p-8">
-      <button
-        type="button"
-        onClick={onBack}
-        className="inline-flex items-center gap-1.5 text-meta text-muted hover:text-fg"
-      >
+      {/* 返回走 Button 原语，触屏自动 44px（审计 TU-11）。 */}
+      <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2 text-muted hover:text-fg">
         <ArrowLeft size={14} /> 返回探索教程
-      </button>
+      </Button>
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <Badge tone="accent">会话快照</Badge>
-        <Badge tone="neutral">{item.category}</Badge>
+        {/* 分类不直出 `coding` 枚举（审计 TU-09）。 */}
+        <Badge tone="neutral">{communityCategoryLabel(item.category)}</Badge>
         <span className="text-caption text-faint">
           {item.authorName} · {new Date(item.publishedAt).toLocaleDateString("zh-CN")}
         </span>
@@ -102,7 +108,7 @@ export function SnapshotTutorialDetail({
         这是作者一次真实会话的脱敏快照，不是平台三次独立复跑后的官方验证案例。
       </Alert>
       <div className="mt-4">
-        <Button variant="secondary" size="sm" onClick={copyShare}>
+        <Button variant="secondary" size="sm" onClick={() => void copyShare()}>
           <Copy size={14} /> {copied ? "已复制分享链接" : "复制分享链接"}
         </Button>
       </div>
@@ -174,7 +180,7 @@ function TutorialArtifactView({ artifact }: { artifact: TutorialArtifact }) {
         <div>
           <h3 className="text-body font-semibold text-fg">{artifact.name}</h3>
           <p className="text-caption text-faint">
-            {artifact.mime} · {artifact.bytes} B
+            {artifact.mime} · {formatBytes(artifact.bytes)}
           </p>
         </div>
         {safeDownload && (
@@ -245,6 +251,8 @@ function ReadonlyTextArtifact({ url }: { url: string }) {
 
   if (failed) return <p className="text-meta text-faint">文本成果暂时无法内嵌预览。</p>;
   if (text == null) return <p className="text-meta text-faint">正在加载文本成果…</p>;
+  // 204 / 空文件：一个空 <pre> 看起来像没加载出来（审计 TU-35）。
+  if (text.trim().length === 0) return <p className="text-meta text-faint">这份文本成果内容为空。</p>;
   return (
     <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-xl bg-sidebar p-3 text-meta text-muted">
       {text}

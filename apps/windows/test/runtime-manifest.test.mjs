@@ -9,8 +9,11 @@ import {
   ManifestError,
   applyManifestEnvOverlay,
   defaultBakeManifestPath,
+  isPlaceholderManifest,
   loadRuntimeManifest,
   parseRuntimeManifest,
+  resolveRuntimeManifest,
+  shouldDownloadRuntimeArtifact,
 } from '../src/host/runtime/manifest.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -127,4 +130,119 @@ test('bake placeholder artifacts share one https origin', () => {
   for (const item of parsed.artifacts) {
     assert.equal(new URL(item.url).origin, origin)
   }
+})
+
+function jsonResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async text() {
+      return typeof body === 'string' ? body : JSON.stringify(body)
+    },
+  }
+}
+
+test('remote runtime-manifest is adopted when schema and origin match', async () => {
+  const remote = validDoc({
+    artifacts: [
+      {
+        os: 'linux',
+        arch: 'x64',
+        url: 'https://claudeai.chat/runtime/ccb.bin',
+        sha256: 'ab'.repeat(32),
+        size: 12,
+        version: '1.2.3',
+      },
+    ],
+  })
+  const resolved = await resolveRuntimeManifest({
+    bakePath,
+    remoteUrl: 'https://claudeai.chat/api/desktop/runtime-manifest',
+    accessToken: 'jwt-test',
+    publicOrigin: 'https://claudeai.chat',
+    expectedOs: 'linux',
+    expectedArch: 'x64',
+    env: {},
+    fetchImpl: async (url, init) => {
+      assert.equal(url, 'https://claudeai.chat/api/desktop/runtime-manifest')
+      assert.equal(init.headers.authorization, 'Bearer jwt-test')
+      return jsonResponse(200, remote)
+    },
+  })
+  assert.equal(resolved.source, 'remote')
+  assert.equal(resolved.available, true)
+  assert.equal(resolved.selected.url, 'https://claudeai.chat/runtime/ccb.bin')
+  assert.equal(shouldDownloadRuntimeArtifact(resolved), true)
+})
+
+test('remote runtime-manifest schema mismatch is rejected then bake is used', async () => {
+  const resolved = await resolveRuntimeManifest({
+    bakePath,
+    remoteUrl: 'https://claudeai.chat/api/desktop/runtime-manifest',
+    publicOrigin: 'https://claudeai.chat',
+    expectedOs: 'windows',
+    expectedArch: 'x64',
+    env: {},
+    fetchImpl: async () => jsonResponse(200, { v: 2, engine: 'ccb', artifacts: [] }),
+  })
+  assert.equal(resolved.source, 'bake')
+  assert.equal(resolved.available, false)
+  assert.equal(isPlaceholderManifest(resolved), true)
+  assert.equal(shouldDownloadRuntimeArtifact(resolved), false)
+})
+
+test('remote artifact origin outside allowlist is rejected', async () => {
+  const remote = validDoc({
+    artifacts: [
+      {
+        os: 'linux',
+        arch: 'x64',
+        url: 'https://evil.example/ccb.bin',
+        sha256: 'ab'.repeat(32),
+      },
+    ],
+  })
+  await assert.rejects(
+    () => fetchRemoteOrThrow(remote),
+    (err) => err instanceof ManifestError && err.code === 'ORIGIN_NOT_ALLOWED',
+  )
+})
+
+async function fetchRemoteOrThrow(remote) {
+  const { fetchRemoteRuntimeManifest } = await import('../src/host/runtime/manifest.mjs')
+  return fetchRemoteRuntimeManifest({
+    url: 'https://claudeai.chat/api/desktop/runtime-manifest',
+    publicOrigin: 'https://claudeai.chat',
+    expectedOs: 'linux',
+    expectedArch: 'x64',
+    env: {},
+    fetchImpl: async () => jsonResponse(200, remote),
+  })
+}
+
+test('resolveRuntimeManifest falls back to bake when remote fetch fails', async () => {
+  const resolved = await resolveRuntimeManifest({
+    bakePath,
+    remoteUrl: 'https://claudeai.chat/api/desktop/runtime-manifest',
+    publicOrigin: 'https://claudeai.chat',
+    expectedOs: 'windows',
+    expectedArch: 'x64',
+    env: {},
+    fetchImpl: async () => jsonResponse(503, { error: 'down' }),
+  })
+  assert.equal(resolved.source, 'bake')
+  assert.equal(shouldDownloadRuntimeArtifact(resolved), false)
+})
+
+test('placeholder bake does not download', async () => {
+  const resolved = await resolveRuntimeManifest({
+    bakePath,
+    expectedOs: 'windows',
+    expectedArch: 'x64',
+    env: {},
+  })
+  assert.equal(resolved.source, 'bake')
+  assert.equal(resolved.reason, 'placeholder-bake')
+  assert.equal(shouldDownloadRuntimeArtifact(resolved), false)
+  assert.equal(resolved.selected.url.includes('example.invalid'), true)
 })

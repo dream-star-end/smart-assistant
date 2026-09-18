@@ -277,6 +277,93 @@ describe("AuditPage", () => {
     expect(screen.getByText("NO_OUTPUT")).toBeTruthy();
     expect(screen.getAllByText("IMAGE_UPSTREAM_RATE_LIMITED").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("workspace_timeout")).toBeTruthy();
+    expect(screen.getByText("问题卡")).toBeTruthy();
+    expect(screen.getByText("近窗没有问题卡事件。")).toBeTruthy();
+  });
+
+  test("问题卡区块有数据时渲染漏斗与裁决", async () => {
+    adminGet.mockImplementation((path: string) => {
+      if (path === "/product-friction") {
+        return Promise.resolve({
+          ...PRODUCT_FRICTION,
+          problemCards: {
+            // 与 commercial audit.ts 真实返回同形：双窗对象，行内不带 window（前端展平时补）。
+            funnel: {
+              last_24h: [{
+                code: "upstream_failed",
+                path: "immediate",
+                reason: "",
+                presentation: "red",
+                shown: "4",
+                recovered: "1",
+                failed: "2",
+                cancelled: "0",
+                pending: "1",
+                affected_users: "2",
+                p50_recover_ms: 1200,
+              }],
+              last_7d: [{
+                code: "engine_error",
+                path: "decision_declined",
+                reason: "checkpoint_unsafe",
+                presentation: "red",
+                shown: "9",
+                recovered: "0",
+                failed: "9",
+                cancelled: "0",
+                pending: "0",
+                affected_users: "3",
+                p50_recover_ms: null,
+              }],
+            },
+            decisions: [{ code: "upstream_failed", outcome: "failed", reason: "checkpoint_unsafe", count: 3 }],
+            jobs: [{ code: "upstream_failed", outcome: "recovered", reason: null, count: 2 }],
+            fallbacks: [{ code: "interrupted", reason: "visible_fallback", count: 1 }],
+          },
+        });
+      }
+      if (path === "/audit") return Promise.resolve({ rows: [ADMIN_ROW], next_before: null });
+      return Promise.resolve({ rows: [], next_before: null });
+    });
+
+    renderPage(<AuditPage />);
+    await screen.findByText("user.patch");
+    fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
+
+    expect(await screen.findByText("问题卡")).toBeTruthy();
+    expect(screen.getAllByText("upstream_failed").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("immediate")).toBeTruthy();
+    // 双窗对象被展平：24h 与 7d 各一行，window 标由前端补齐。
+    expect(screen.getByText("24h")).toBeTruthy();
+    expect(screen.getByText("7d")).toBeTruthy();
+    expect(screen.getByText("engine_error")).toBeTruthy();
+    expect(screen.getAllByText("checkpoint_unsafe").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("visible_fallback")).toBeTruthy();
+    expect(screen.getByText("1200ms")).toBeTruthy();
+    expect(screen.queryByText("近窗没有问题卡事件。")).toBeNull();
+  });
+
+  test("问题卡字段缺失时显示空态且不崩", async () => {
+    adminGet.mockImplementation((path: string) => {
+      if (path === "/product-friction") {
+        return Promise.resolve({
+          ...PRODUCT_FRICTION,
+          problemCards: {},
+        });
+      }
+      if (path === "/audit") return Promise.resolve({ rows: [ADMIN_ROW], next_before: null });
+      return Promise.resolve({ rows: [], next_before: null });
+    });
+
+    renderPage(<AuditPage />);
+    await screen.findByText("user.patch");
+    fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
+
+    expect(await screen.findByText("问题卡")).toBeTruthy();
+    expect(screen.getByText("近窗没有问题卡事件。")).toBeTruthy();
+    expect(screen.getByText("暂无裁决")).toBeTruthy();
+    expect(screen.getByText("暂无任务")).toBeTruthy();
+    expect(screen.getByText("暂无占位")).toBeTruthy();
   });
 
   test("请求ID反查成功 → 弹卡片展示归属信息", async () => {

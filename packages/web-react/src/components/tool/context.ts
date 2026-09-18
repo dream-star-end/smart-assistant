@@ -10,6 +10,7 @@
  */
 import { createContext, useContext } from "react";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
+import type { Ticket } from "../../lib/taskboard";
 import type { ToolLike } from "./format";
 
 export type ToolCardActions = {
@@ -30,6 +31,17 @@ export type ToolCardActions = {
     getDetail: (id: string) => Promise<ConnectorConfirmationDetail>;
     decide: (id: string, decision: "approve" | "deny") => Promise<ConnectorDecisionResult>;
   };
+  /**
+   * 任务单对话审批卡：详情 GET + 通过/打回。动作走用户浏览器鉴权,
+   * 与任务面板 inbox 同一套 /api/board(人是闸门)。demo/未登录不注入。
+   */
+  taskApproval?: {
+    getTicket: (id: string) => Promise<Ticket>;
+    approve: (id: string, expectedVersion: number) => Promise<{ ticket: Ticket }>;
+    reject: (id: string, expectedVersion: number, reason: string) => Promise<{ ticket: Ticket }>;
+  };
+  /** 打开任务面板(可选定位到 identifier)。 */
+  onOpenTaskboard?: (identifier?: string) => void;
 };
 
 export const ToolCardActionsContext = createContext<ToolCardActions>({});
@@ -46,7 +58,20 @@ export function useToolCardActions(): ToolCardActions {
 export type ChatInteraction = {
   sendUserText?: (text: string) => void;
   busy?: boolean;
+  /**
+   * 没有 sendUserText 时,交互块拿它向用户解释「为什么点不了」(misc-p3 D-08):
+   * "demo" = ?demo=1 演示模式(离线 fixture,没有真实会话可投递)。
+   * 不传 = 历史 / 只读等一般情形,交互块用通用文案。
+   */
+  reason?: ChatInteractionUnavailableReason;
 };
+
+export type ChatInteractionUnavailableReason = "demo";
+
+/** 交互块在没有发送能力时给用户看的一句话;按 reason 分,不写死在各个块里。 */
+export function chatInteractionUnavailableText(reason?: ChatInteractionUnavailableReason): string {
+  return reason === "demo" ? "(演示模式仅供浏览,登录后可在真实会话中点选)" : "(此会话中不可交互)";
+}
 
 export const ChatInteractionContext = createContext<ChatInteraction>({});
 
@@ -72,6 +97,32 @@ export const ArtifactInspectContext = createContext<ArtifactInspect>({});
 
 export function useArtifactInspect(): ArtifactInspect {
   return useContext(ArtifactInspectContext);
+}
+
+/**
+ * 当前正在详情面板里查看的那条 tool 消息(tools 审计 T-18 选中态)。
+ *
+ * 刻意与 {@link ArtifactInspectContext} 分开:open 回调引用稳定(App 里 `useMemo(…, [])`),
+ * 才不会打穿 MessageList 的 sig-memo;而「当前查看的是哪条」会随面板开合变化。拆成独立
+ * context 后,面板开合只让消费它的 ToolCard 重渲,不动 open 回调那条链。
+ * App 接线:`<ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>`;
+ * 无 provider(测试/独立挂载)= 无选中态。
+ */
+export const ArtifactInspectActiveContext = createContext<ToolLike | null>(null);
+
+export function useArtifactInspectActive(): ToolLike | null {
+  return useContext(ArtifactInspectActiveContext);
+}
+
+/**
+ * 工具卡表头当前显示的标签文案(「文献检索」「研究报告」…)。
+ * 专属卡的 CardShell 据此判断自己的小标题是否与表头重复(T-15):重复则只保留右侧
+ * subtitle 徽标,不再在卡内再写一遍同词标题。无 provider(直接渲染专属卡)= 照常显示标题。
+ */
+export const ToolHeaderLabelContext = createContext<string>("");
+
+export function useToolHeaderLabel(): string {
+  return useContext(ToolHeaderLabelContext);
 }
 
 /**

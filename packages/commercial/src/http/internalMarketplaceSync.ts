@@ -22,6 +22,8 @@ import { marketplaceArtifactHash } from '@openclaude/storage'
 import { canonicalBundleJson } from '../marketplace/bundle.js'
 import { platformPresetAgentSlugs } from '../marketplace/platformPresets.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
+import type { FlavorIdentity } from '../flavor/assertFlavor.js'
+import { projectIdentityCompat, registeredIdentityCompatProfiles } from '../identity/identityCompat.js'
 
 export const MARKETPLACE_SYNC_PATH = '/internal/v3/marketplace/sync'
 
@@ -39,6 +41,10 @@ export type MarketplaceSyncHandler = (
 export interface MarketplaceSyncDeps {
   identityRepo: ContainerIdentityRepo
   logger?: Logger
+  /** Boot-verified deployment identity, never supplied by the HTTP caller. */
+  flavorIdentity?: FlavorIdentity
+  loadRuntimeSnapshot?: typeof loadMarketplaceRuntimeSnapshot
+  loadPresetSlugs?: typeof platformPresetAgentSlugs
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, requestId: string): void {
@@ -74,12 +80,18 @@ export function makeMarketplaceSyncHandler(deps: MarketplaceSyncDeps): Marketpla
     try {
       // agents = 平台预设(current approved,evergreen)∪ 用户已装;同 slug 预设优先。
       // 与 my-agents 的合并规则一致 —— 预设对所有用户容器恒下发,无需安装。
-      const presetSlugs = await platformPresetAgentSlugs()
+      const presetSlugs = await (deps.loadPresetSlugs ?? platformPresetAgentSlugs)()
       // Skill feed + Agent readiness 必须来自同一个 PG 快照；否则并发卸载/撤销会
       // 短暂下发“Agent 仍可执行、必需 Skill 已消失”的撕裂组合。
-      const { skills, agentSets } = await loadMarketplaceRuntimeSnapshot(
+      const snapshot = await (deps.loadRuntimeSnapshot ?? loadMarketplaceRuntimeSnapshot)(
         identity.userId,
         presetSlugs,
+      )
+      const { skills, agentSets } = snapshot
+      const identityCompat = projectIdentityCompat(
+        identity.userId,
+        registeredIdentityCompatProfiles(deps.flavorIdentity, identity.userId),
+        snapshot,
       )
       // bundle 完整性:master 侧对 canonical JSON 计算 hash,容器侧独立复算比对。
       const skillsOut = skills.map((sk) => {
@@ -87,7 +99,7 @@ export function makeMarketplaceSyncHandler(deps: MarketplaceSyncDeps): Marketpla
         return { ...sk, bundleHash: marketplaceArtifactHash(canonicalBundleJson(sk.bundle)) }
       })
       const agents = [...agentSets.presets, ...agentSets.installed]
-      sendJson(res, 200, { skills: skillsOut, agents }, requestId)
+      sendJson(res, 200, { skills: skillsOut, agents, identityCompat }, requestId)
     } catch (err) {
       log
         .child({ requestId, uid: identity.userId })

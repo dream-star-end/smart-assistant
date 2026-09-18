@@ -4,6 +4,7 @@ export const CURSOR_HIDDEN_DELEGATE_TOOLS = [
   'delegate_task',
   'delegate_tasks',
   'request_review',
+  'consult_advisor',
 ] as const
 
 export type CursorHiddenDelegateTool = (typeof CURSOR_HIDDEN_DELEGATE_TOOLS)[number]
@@ -64,6 +65,13 @@ export function cursorDelegateCliHint(name = 'delegate_task'): string {
       'Cursor MCP 已不再提供 request_review（60 秒硬超时，模型经常不等就交卷）。',
       '请立刻用 Bash 阻塞送审，不要再调 MCP：',
       '  oc-memory request-review --draft "<完整答复草稿>"',
+    ].join('\n')
+  }
+  if (name === 'consult_advisor') {
+    return [
+      'Cursor MCP 不提供 consult_advisor（60 秒硬超时）。',
+      '请用 Bash（invocation 必须由引擎注入 OPENCLAUDE_CONSULT_INVOCATION，禁止自行 mint）：',
+      '  oc-memory consult-advisor --question "<疑问或关注点>" [--concern "<补充>"]',
     ].join('\n')
   }
   if (name === 'delegate_tasks') {

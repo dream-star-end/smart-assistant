@@ -122,7 +122,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
-    fireEvent.click(screen.getByLabelText("展开读取文件详情"));
+    // 表头可及名 = 标签 + 摘要 + 状态(aria-labelledby,T-22),不再是覆盖一切的「展开读取文件详情」。
+    fireEvent.click(screen.getByRole("button", { name: /读取文件 …\/sessions\/webmt9\/out\.log 完成/ }));
     const pre = document.querySelector("pre");
     expect(pre?.textContent).toContain("保留未就绪 Agent");
     expect(pre?.textContent).toContain("GoalDialog.test.tsx");
@@ -161,7 +162,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /详情/ }));
+    fireEvent.click(screen.getByRole("button", { name: /custom_hardcap_probe/ }));
     // 默认截断,尾部 marker 不可见
     expect(document.body.textContent).not.toContain(marker);
     // 展开全部 → 首屏 256KB,仍有剩余 → 继续显示 → 完整内容可达
@@ -639,8 +640,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     expect(screen.getByText("网页提取")).toBeInTheDocument();
     expect(screen.getByText("未成功")).toBeInTheDocument();
-    // F1:未成功默认展开,参数与错误文本免点击可见
-    expect(screen.getByText("url")).toBeInTheDocument();
+    // F1:未成功默认展开,参数与错误文本免点击可见(参数键走中文标签表,T-27)
+    expect(screen.getByText("地址")).toBeInTheDocument();
+    expect(screen.getByText("最大字数")).toBeInTheDocument();
     expect(screen.getAllByText("https://example.com").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/Invalid IP address/).length).toBeGreaterThanOrEqual(1);
   });
@@ -680,10 +682,18 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("网页搜索")).toBeInTheDocument();
+    // 折叠摘要只放查询词(动词由标签承担,T-26);展开后仍须保留完整查询和结果数。
+    expect(screen.getByText('"OpenClaude v5"')).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: /网页搜索/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("OpenClaude v5")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("results")).toBeInTheDocument();
+    expect(screen.getByText("结果数")).toBeInTheDocument();
     expect(screen.getByText("3")).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("结果数")).not.toBeInTheDocument();
   });
 
   test("Codex plan/todo_list 复用 TodoWrite 列表", () => {
@@ -866,11 +876,13 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     expect(screen.getByText("压缩上下文")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("tokens before")).toBeInTheDocument();
-    expect(screen.getByText("12000")).toBeInTheDocument();
-    expect(screen.getByText("tokens after")).toBeInTheDocument();
-    expect(screen.getByText("7000")).toBeInTheDocument();
+    // 键中文化 + 数字千分位(T-27)
+    expect(screen.getByText("压缩前 token")).toBeInTheDocument();
+    expect(screen.getByText("12,000")).toBeInTheDocument();
+    expect(screen.getByText("压缩后 token")).toBeInTheDocument();
+    expect(screen.getByText("7,000")).toBeInTheDocument();
     expect(screen.getByText("已压缩")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("tokens before");
   });
 
   test("Codex dynamicToolCall builtin 复用原生 Bash body", () => {
@@ -1025,10 +1037,14 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
-    expect(screen.getByText("未成功")).toBeInTheDocument();
-    // F1:未成功默认展开,错误标题与 raw error 免点击可见
+    // 表头徽标与卡内徽标口径一致,都是「未成功」(T-29:不再一处「未成功」一处「失败」)。
+    expect(screen.getAllByText("未成功").length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("失败")).not.toBeInTheDocument();
+    // F1:未成功默认展开,错误标题与原因免点击可见;原因去掉给模型看的 `error:` 前缀(T-29)。
     expect(screen.getByText(title)).toBeInTheDocument();
-    expect(document.body.textContent || "").toContain(output);
+    const reason = output.replace(/^error:\s*/i, "");
+    expect(document.body.textContent || "").toContain(reason);
+    expect(document.body.textContent || "").not.toContain("error:");
     if (misleading) expect(document.body.textContent || "").not.toContain(misleading);
   });
 
@@ -1162,7 +1178,9 @@ describe("codex fileChange(apply_patch)的 Write/Edit 卡", () => {
     );
     fireEvent.click(screen.getByRole("button"));
     expect(document.querySelector("pre")?.textContent).toContain("export const x = 1;");
-    expect(screen.getByText("File created successfully")).toBeInTheDocument();
+    // 已知英文回执映射中文(T-27)
+    expect(screen.getByText("文件已创建")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("File created successfully");
   });
 });
 
@@ -1501,6 +1519,281 @@ describe("缺陷 #8：Cursor 工具卡正文不得退化成字面 Bash", () => {
     fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(/UNIQUE_STDOUT_MARKER/)).toBeInTheDocument();
     expect(screen.queryByText("Bash")).not.toBeInTheDocument();
+  });
+});
+
+describe("T-01:Grok 输出归一化不再吞掉非 Grok 工具的结构化 JSON(完整 ToolCard 路径)", () => {
+  test("oc-report 的 {output, references, warnings} 经 ToolCard 仍渲染成产物卡", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-report --schema s --manifest m -o /home/agent/out/report.pdf" },
+          output: JSON.stringify({
+            output: "/home/agent/out/report.pdf",
+            references: 12,
+            coverage: { verifiedClaims: 11, totalClaims: 12 },
+            warnings: ["第 3 段未接地"],
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("研究报告")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /研究报告/ }));
+    expect(screen.getByText("报告已生成")).toBeInTheDocument();
+    expect(screen.getByText("12 条参考文献")).toBeInTheDocument();
+    expect(screen.getByText(/1 处未接地\/红标/)).toBeInTheDocument();
+    expect(screen.getAllByText("report.pdf").length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("oc-task --json 的 {title, status, body} 不被折成只剩 body", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-task ticket get OCV5-312 --json" },
+          output: JSON.stringify({
+            identifier: "OCV5-312",
+            title: "tools 卡片触控靶",
+            status: "waiting_human",
+            body: "正文文字",
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /任务单据/ }));
+    expect(screen.getByText("tools 卡片触控靶")).toBeInTheDocument();
+    expect(screen.getByText("OCV5-312")).toBeInTheDocument();
+    expect(screen.getByText("正文文字")).toBeInTheDocument();
+  });
+
+  test("普通 Bash 的 JSON stdout 含 output 键时按原样显示,不替换成字段值", () => {
+    const raw = JSON.stringify({ id: "job-1", output: "done", status: "ok" });
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "curl -s https://api.example/job" },
+          output: raw,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain('"id":"job-1"');
+    expect(pre?.textContent).toContain('"status":"ok"');
+  });
+
+  test("Grok 原生名 + Vec<u8> 信封仍解码为正文(历史 tape 修复不回退)", () => {
+    const bytes = Array.from(new TextEncoder().encode("grok-stdout-line\n"));
+    render(
+      <ToolCard
+        message={{
+          toolName: "run_terminal_command",
+          inputJson: { command: "ls" },
+          outputJson: { output: bytes, exit_code: 0 },
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    expect(document.querySelector("pre")?.textContent).toContain("grok-stdout-line");
+  });
+});
+
+describe("T-02/T-03:Cursor shell 信封的表头摘要与展开体", () => {
+  const envelope = JSON.stringify({
+    success: {
+      command: "npm test",
+      exitCode: 1,
+      stdout: "1 passed\n",
+      stderr: "FAIL src/a.test.ts\nAssertionError: expected 1 to be 2",
+    },
+    isBackground: false,
+  });
+
+  test("表头错误摘要取 stderr 首行,不露 JSON;展开体拆成 stdout / stderr / 退出码", () => {
+    render(<ToolCard message={{ toolName: "Bash", inputJson: { command: "npm test" }, output: envelope, _completed: true }} />);
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    const header = screen.getByRole("button", { name: /终端/ });
+    expect(header).toHaveAccessibleName(/FAIL src\/a\.test\.ts/);
+    expect(header.textContent).not.toContain('{"success"');
+    // 未成功默认展开:展开体是解包后的流,不是 JSON 外壳
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("$ npm test");
+    expect(pre?.textContent).toContain("1 passed");
+    expect(pre?.textContent).toContain("AssertionError: expected 1 to be 2");
+    expect(pre?.textContent).toContain("退出码 1");
+    expect(pre?.textContent).not.toContain('"success"');
+    expect(pre?.textContent).not.toContain("isBackground");
+    // stderr 段用危险色
+    expect(screen.getByText(/AssertionError/).className).toContain("text-danger");
+  });
+
+  test("oc-connect 确认触发的表头摘要是固定文案「待确认」,不是原始 JSON", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-connect call imap send_mail --to a@b.c" },
+          output: JSON.stringify({ oc_connect: { type: "confirmation_required", id: "cf_1" } }),
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    const header = screen.getByRole("button", { name: /调用应用连接/ });
+    expect(header).toHaveAccessibleName(/待确认/);
+    expect(header.textContent).not.toContain("oc_connect");
+    expect(header.textContent).not.toContain("confirmation_required");
+  });
+
+  test("成功信封(exitCode 0)展开体只显示 stdout,不显示退出码行", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "true" },
+          output: JSON.stringify({ success: { command: "true", exitCode: 0, stdout: "all good\n", stderr: "" }, isBackground: false }),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("all good");
+    expect(pre?.textContent).not.toContain("退出码");
+    expect(pre?.textContent).not.toContain('"success"');
+  });
+});
+
+describe("T-09:终端输出接展开原语,不再是嵌套滚动区", () => {
+  test("长 stdout 默认 2000 字截断 + 「展开全部」可见全部;pre 无 max-h 嵌套滚动", () => {
+    const marker = "TERMINAL_TAIL_MARKER";
+    const output = `${"y".repeat(3000)}\n${marker}`;
+    render(<ToolCard message={{ toolName: "Bash", inputJson: { command: "cat big.log" }, output, _completed: true }} />);
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    const pre = document.querySelector("pre");
+    expect(pre?.className).not.toContain("max-h-80");
+    expect(pre?.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /展开全部/ }));
+    expect(document.querySelector("pre")?.textContent).toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "收起" }));
+    expect(document.querySelector("pre")?.textContent).not.toContain(marker);
+  });
+
+  test("bashTail 头部截断提示用千分位数字、中文标点", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "npm run build" },
+          output: "Command running in background with ID: bg-1",
+          bashTail: { tail: "…tail…", truncatedHead: true, totalBytes: 48213 },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText(/输出过长，已省略开头部分（共 48,213 字节）/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("head 已截断");
+  });
+});
+
+describe("T-08:卡内文字型操作在触屏下有 44px 命中面积", () => {
+  test("展开全部 / 收起 / 展开全部（文件）按钮都带 hover:none 下的 min-h-11", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Grep",
+          inputJson: { pattern: "x", output_mode: "files_with_matches" },
+          output: Array.from({ length: 40 }, (_, i) => `/a/b/file-${i}.ts`).join("\n"),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /搜索内容/ }));
+    const more = screen.getByRole("button", { name: /展开全部（共 40 个文件）/ });
+    expect(more.className).toContain("[@media(hover:none)]:min-h-11");
+    // 摘要键中文化:output_mode 不再直显 files_with_matches
+    expect(document.body.textContent).toContain("匹配的文件");
+    expect(document.body.textContent).not.toContain("files_with_matches");
+  });
+});
+
+describe("T-22/T-07:表头可及名、状态播报与迟到错误", () => {
+  test("表头按钮 aria-labelledby 拼出标签 + 摘要 + 状态;状态区 aria-live=polite", () => {
+    const { container } = render(
+      <ToolCard message={{ toolName: "Bash", inputJson: { command: "pwd" }, _completed: true, output: "/home" }} />,
+    );
+    const header = screen.getByRole("button", { name: "终端 pwd 完成" });
+    expect(header).not.toHaveAttribute("aria-label");
+    expect(header).toHaveAttribute("aria-labelledby");
+    expect(container.querySelector('[aria-live="polite"]')?.textContent).toContain("完成");
+  });
+
+  test("运行中:状态区含 sr-only 运行中,完成后 live 区文案切到完成", () => {
+    const running = { toolName: "Bash", inputJson: { command: "sleep 1" }, _completed: false };
+    const { rerender, container } = render(<ToolCard message={running} />);
+    expect(container.querySelector('[aria-live="polite"]')?.textContent).toContain("运行中");
+    rerender(<ToolCard message={{ ...running, _completed: true, output: "ok" }} />);
+    expect(container.querySelector('[aria-live="polite"]')?.textContent).toContain("完成");
+  });
+
+  test("挂载时完成折叠、随后归并成 error 的历史卡会按 F1 自动展开(T-07)", () => {
+    const base = { toolName: "Write", inputJson: { file_path: "/a", content: "x" }, _completed: true, output: "ok" };
+    const { rerender } = render(<ToolCard message={base} />);
+    expect(screen.queryByText("x")).not.toBeInTheDocument();
+    rerender(<ToolCard message={{ ...base, error: true, output: "denied" }} />);
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain("x");
+  });
+
+  test("用户手动折叠过的卡,迟到的 error 不再强制弹开", () => {
+    const base = { toolName: "Write", inputJson: { file_path: "/a", content: "x" }, _completed: false };
+    const { rerender } = render(<ToolCard message={base} />);
+    // 运行中默认展开 → 用户手动收起
+    fireEvent.click(screen.getByRole("button", { name: /写入文件/ }));
+    expect(document.querySelector("pre")).toBeNull();
+    rerender(<ToolCard message={{ ...base, _completed: true, error: true, output: "denied" }} />);
+    expect(document.querySelector("pre")).toBeNull();
+  });
+
+  test("窄屏错误首行:表头内一份(sm 以上显示)+ 表头下一份(sm 以下显示,aria-hidden)", () => {
+    const { container } = render(
+      <ToolCard message={{ toolName: "Write", inputJson: { file_path: "/a" }, error: true, _completed: true, output: "denied" }} />,
+    );
+    const inHeader = container.querySelector('[id$="-error"]');
+    expect(inHeader?.className).toContain("sm:inline");
+    const below = container.querySelector('[aria-hidden="true"].sm\\:hidden');
+    expect(below?.textContent).toBe("denied");
+  });
+});
+
+describe("T-26/T-31:表头摘要去重复动词;Glob 走文件列表", () => {
+  test("Read/Grep/Glob 表头摘要只放对象", () => {
+    render(<ToolCard message={{ toolName: "Read", inputJson: { file_path: "/x/y/z/App.tsx" }, _completed: true, output: "a" }} />);
+    expect(screen.getByRole("button", { name: "读取文件 …/y/z/App.tsx 完成" })).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("读取 …");
+  });
+
+  test("Glob 输出按文件列表呈现(与 Grep 同款),非路径输出保持文本块", () => {
+    render(
+      <ToolCard
+        message={{ toolName: "Glob", inputJson: { pattern: "**/*.tsx" }, output: "/a/b/c.tsx\n/a/b/d.tsx", _completed: true }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /搜索文件/ }));
+    expect(document.querySelectorAll("li").length).toBe(2);
+    expect(screen.getByText("…/a/b/c.tsx")).toBeInTheDocument();
+    cleanup();
+    render(<ToolCard message={{ toolName: "Glob", inputJson: { pattern: "*.nope" }, output: "No files found", _completed: true }} />);
+    fireEvent.click(screen.getByRole("button", { name: /搜索文件/ }));
+    expect(document.querySelectorAll("li").length).toBe(0);
+    expect(document.querySelector("pre")?.textContent).toContain("No files found");
   });
 });
 

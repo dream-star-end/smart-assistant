@@ -56,6 +56,9 @@ describe("client friction normalization", () => {
       lineNo: null,
       colNo: null,
       errorFingerprint: null,
+      presentation: null,
+      path: null,
+      reason: null,
     });
     assert.equal(JSON.stringify(normalized).includes("DO_NOT_PERSIST"), false);
   });
@@ -199,6 +202,86 @@ describe("client friction normalization", () => {
     assert.equal(normalized.browserFamily, null);
     assert.equal(normalized.deviceClass, "unknown");
     assert.equal(normalized.entitySlug, null);
+  });
+
+  test("problem_card correlation with colon is accepted and outranks event_id", () => {
+    const normalized = normalizeClientFrictionReport({
+      event_id: "event_1",
+      correlation: "sess-abc:cmid-with:colons_1",
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "pending",
+    }, "fallback");
+    assert.equal(normalized.correlation, "sess-abc:cmid-with:colons_1");
+    assert.equal(normalized.surface, "chat");
+    assert.equal(normalized.stage, "problem_card");
+  });
+
+  test("correlation is ignored outside chat/problem_card and falls back to event_id", () => {
+    const normalized = normalizeClientFrictionReport({
+      event_id: "event_1",
+      correlation: "sess-abc:cmid-should-be-ignored",
+      surface: "chat",
+      stage: "recovery",
+      code: "upstream_failed",
+      outcome: "failed",
+    }, "fallback");
+    assert.equal(normalized.correlation, "event_1");
+  });
+
+  test("presentation/path/reason accept CHECK-identical tokens and drop illegal ones without rejecting the report", () => {
+    const accepted = normalizeClientFrictionReport({
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "failed",
+      presentation: "red",
+      path: "decision_timeout",
+      reason: "not_recoverable",
+    }, "fallback");
+    assert.equal(accepted.presentation, "red");
+    assert.equal(accepted.path, "decision_timeout");
+    assert.equal(accepted.reason, "not_recoverable");
+
+    const dropped = normalizeClientFrictionReport({
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "failed",
+      presentation: "purple",
+      path: "Decision-Timeout",
+      reason: "has spaces",
+    }, "fallback");
+    assert.equal(dropped.code, "upstream_failed");
+    assert.equal(dropped.outcome, "failed");
+    assert.equal(dropped.presentation, null);
+    assert.equal(dropped.path, null);
+    assert.equal(dropped.reason, null);
+
+    const omitted = normalizeClientFrictionReport({
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "pending",
+    }, "fallback");
+    assert.equal(omitted.presentation, null);
+    assert.equal(omitted.path, null);
+    assert.equal(omitted.reason, null);
+  });
+
+  test("illegal path does not reject the whole report", () => {
+    const normalized = normalizeClientFrictionReport({
+      event_id: "event_keep",
+      surface: "chat",
+      stage: "problem_card",
+      code: "upstream_failed",
+      outcome: "failed",
+      path: "/private/conversation",
+    }, "fallback");
+    assert.equal(normalized.correlation, "event_keep");
+    assert.equal(normalized.code, "upstream_failed");
+    assert.equal(normalized.path, null);
   });
 
   test("persist failures expose bounded structure without leaking raw database detail", () => {

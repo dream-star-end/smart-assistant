@@ -1,0 +1,62 @@
+<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AURELIA · 你的下一颗星球</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:#030711;color:#eaf6ff;font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif}body{min-height:100svh}canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none}button,input,select{font:inherit}button,select{color:inherit;border:1px solid #ffffff24;background:#101c2bcc;border-radius:10px;padding:10px 13px;cursor:pointer}button:hover{border-color:#7be5df}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #8ff3df;outline-offset:4px}button[aria-pressed=true]{background:#d2ffee;color:#082126}.ui{position:relative;pointer-events:none;min-height:100svh;padding:32px 42px;display:flex;flex-direction:column;justify-content:space-between;gap:20px}.ui button,.ui input,.ui select,.ui details{pointer-events:auto}.top{display:flex;justify-content:space-between;align-items:flex-start}.brand{letter-spacing:.32em;font-size:13px;font-weight:700}.status{font:11px monospace;letter-spacing:.12em;color:#8cb0c2}.intro{margin-top:56px;max-width:470px}small{font:11px monospace;color:#98c6c7;letter-spacing:.14em}h1{font-size:clamp(38px,5.6vw,76px);font-weight:500;letter-spacing:-.06em;line-height:1.05;margin:20px 0}h1 span{color:#9de5d9}.intro p{font-size:14px;line-height:1.9;color:#a2b8c8;max-width:290px}.bottom{display:grid;grid-template-columns:1fr 350px;gap:30px;align-items:end;margin-top:180px}.coordinates{font:11px/2 monospace;letter-spacing:.14em;color:#a7c5d5}.controls{background:linear-gradient(130deg,#142433db,#071322ee);border:1px solid #a6e5ff29;border-radius:20px;padding:20px;backdrop-filter:blur(15px)}label{display:block;font-size:12px;color:#bdcfda;margin:17px 0 7px}.row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}select{flex:1;width:100%;min-width:130px}input[type=range]{width:100%;accent-color:#a0edda}output{font:11px monospace;float:right;color:#a1e7d6}.note{font-size:10px;line-height:1.7;color:#7894a9;margin-top:18px;max-width:470px}.hint{font-size:12px;color:#cee4ee;margin-bottom:14px}.notice{font-size:11px;color:#aac0cd;min-height:1.5em}
+@media(max-width:650px){.ui{padding:24px 22px}.intro{margin-top:30px}.intro p{max-width:230px}.bottom{grid-template-columns:1fr;margin-top:275px;gap:18px}.coordinates{display:none}.controls{padding:18px}.status{max-width:115px;font-size:10px;text-align:right}h1{font-size:44px}.note{font-size:10px}.hint{margin-top:0}}
+</style><canvas id="space" aria-label="可拖动旋转、缩放的三维程序化星球"></canvas><div class="ui">
+<div><header class="top"><div class="brand">AURELIA<span style="color:#78929e"> / 01</span></div><div class="status">PROCEDURAL WORLDS<br><span id="renderState">正在初始化 WebGL</span></div></header><section class="intro"><small>AN IDEA. AN ENTIRE WORLD.</small><h1>下一颗星球，<br><span>由你定义。</span></h1><p>拖动改变视角。移动太阳，看昼夜穿过海岸线。换一个种子，发现从未存在过的大陆。</p></section></div>
+<div class="bottom"><div><p class="hint">拖动旋转 · 滚轮缩放 · 空格发现新世界</p><div class="coordinates">SECTOR 07 / SYNTHETIC ATLAS<br><span id="worldCode">WORLD SEED 017</span><br>GENERATED IN YOUR BROWSER</div><p class="note">原创程序化三维作品 · 球面射线求交、分形地形与近似大气光照。不是天文观测，不是可登陆的真实地形地图。所有画面在本机计算，无外部模型或数据请求。</p></div><section class="controls" aria-label="星球控制"><div class="row"><select id="biome" aria-label="星球类型"><option value="0">Aurelia · 海洋行星</option><option value="1">Ember · 赤红荒原</option><option value="2">Nivalis · 冰封世界</option></select><button id="new">新世界 ↗</button></div>
+<label for="sun">太阳位置 <output id="sunValue">35°</output></label><input id="sun" type="range" min="-180" max="180" value="35"><label for="water">海平面 <output id="waterValue">48%</output></label><input id="water" type="range" min="20" max="80" value="48"><label for="distance">观察距离 <output id="distanceValue">3.2 R</output></label><input id="distance" type="range" min="2.2" max="5" value="3.2" step=".05"><div class="row" style="margin-top:14px"><button id="rotation" aria-pressed="true">暂停自转</button><button id="reset">重置视角</button><button id="capture">保存此刻</button></div><p class="notice" id="notice" role="status"></p></section></div></div>
+<script id="fragment" type="x-shader/x-fragment">precision highp float;
+uniform vec2 resolution;uniform float yaw,pitch,dist,seed,sun,water,biome,phase,mobile;
+float hash(vec3 p){return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453);}
+float noise(vec3 p){vec3 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fbm(vec3 p){float v=0.,a=.5;for(int i=0;i<5;i++){v+=a*noise(p);p=p*2.03+vec3(3.7,1.8,7.2);a*=.5;}return v;}
+mat3 ry(float a){float c=cos(a),s=sin(a);return mat3(c,0,-s,0,1,0,s,0,c);}
+mat3 rx(float a){float c=cos(a),s=sin(a);return mat3(1,0,0,0,c,s,0,-s,c);}
+void main(){
+vec2 uv=(gl_FragCoord.xy-.5*resolution)/resolution.y;uv.x-=mix(.23,0.,mobile);uv.y-=mix(.055,.09,mobile);
+vec3 ro=vec3(0,0,dist),rd=normalize(vec3(uv*2.,-1.85));
+float neb=fbm(vec3(uv*2.4,7.1));vec3 col=vec3(.008,.016,.038)+vec3(.015,.035,.07)*pow(neb,3.);
+vec2 cell=floor(gl_FragCoord.xy/3.);col+=vec3(.42,.61,.8)*step(.9986,hash(vec3(cell,11.)))*pow(hash(vec3(cell,12.)),2.);
+float b=dot(ro,rd),c=dot(ro,ro)-1.,h=b*b-c;vec3 light=normalize(vec3(sin(sun),.35,cos(sun)));
+float nearT=-b;vec3 closest=ro+rd*nearT;float rimDist=length(closest);
+if(h>0.){
+float t=-b-sqrt(h);vec3 pos=ro+rd*t,n=normalize(pos),q=ry(yaw+phase)*rx(pitch)*pos;
+float terrain=fbm(q*2.8+vec3(seed*.37,seed*.11,seed*.21));float land=smoothstep(water-.008,water+.022,terrain);
+float altitude=clamp((terrain-water)*4.,0.,1.),snow=smoothstep(.67,.94,abs(q.y)+altitude*.45);
+vec3 ocean=mix(vec3(.006,.04,.12),vec3(.02,.25,.31),smoothstep(water-.12,water,terrain));
+vec3 ground=mix(vec3(.075,.21,.13),vec3(.35,.36,.22),altitude);ground=mix(ground,vec3(.79,.85,.81),snow);vec3 base=mix(ocean,ground,land);
+if(biome>.5&&biome<1.5)base=mix(mix(vec3(.14,.027,.02),vec3(.62,.22,.10),terrain),vec3(.85,.57,.29),smoothstep(.55,.75,terrain));
+if(biome>1.5)base=mix(mix(vec3(.025,.1,.19),vec3(.58,.78,.83),land),vec3(.82,.93,.92),snow);
+float diff=max(dot(n,light),0.),clouds=smoothstep(.60,.72,fbm(q*6.+vec3(phase*.2,8.,seed*.02)));base=mix(base,vec3(.91,.94,.97),clouds*.73);col=base*(.065+1.65*diff);
+col+=vec3(.55,.83,1.)*pow(max(dot(reflect(-light,n),-rd),0.),55.)*(1.-land)*.9;
+col+=vec3(.10,.42,.80)*pow(1.-max(dot(n,-rd),0.),3.3)*(.17+.83*diff);
+float city=step(.84,noise(q*190.+seed))*step(water+.025,terrain)*(1.-snow)*(1.-clouds)*(1.-smoothstep(-.2,.12,dot(n,light)));
+if(biome<.5)col+=vec3(1.,.48,.12)*city*.23;
+}else if(rimDist<1.14&&nearT>0.)col+=vec3(.09,.38,.81)*exp(-(rimDist-1.)*26.)*.65*(.08+max(dot(normalize(closest),light),0.));
+col=pow(vec3(1.)-exp(-col*1.3),vec3(.92));gl_FragColor=vec4(col,1.);
+}</script><script>
+const canvas=document.querySelector('#space'),gl=canvas.getContext('webgl',{antialias:false,preserveDrawingBuffer:true});
+if(!gl){document.querySelector('#renderState').textContent='WebGL 不可用';document.querySelector('.controls').innerHTML='<p role="alert">此设备暂不支持 WebGL。请使用启用硬件加速的浏览器；本页不会以静态图伪装可交互效果。</p>';}
+else{
+function shader(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+try{
+const program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}'));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,document.querySelector('#fragment').textContent));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));gl.useProgram(program);
+const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);const attr=gl.getAttribLocation(program,'p');gl.enableVertexAttribArray(attr);gl.vertexAttribPointer(attr,2,gl.FLOAT,false,0,0);
+const loc={};for(const n of ['resolution','yaw','pitch','dist','seed','sun','water','biome','phase','mobile'])loc[n]=gl.getUniformLocation(program,n);
+const state={yaw:.2,pitch:.12,dist:3.2,seed:17,sun:.61,water:.48,biome:0,phase:0,rotate:!matchMedia('(prefers-reduced-motion: reduce)').matches};const $=id=>document.getElementById(id);
+function rotation(){ $('rotation').textContent=state.rotate?'暂停自转':'开启自转';$('rotation').setAttribute('aria-pressed',String(state.rotate));}rotation();
+function setRange(id,key,factor,format){$(id).oninput=()=>{state[key]=Number($(id).value)*factor;$(id+'Value').textContent=format($(id).value);};}
+setRange('sun','sun',Math.PI/180,v=>v+'°');setRange('water','water',.01,v=>v+'%');setRange('distance','dist',1,v=>Number(v).toFixed(1)+' R');
+$('biome').onchange=()=>{state.biome=Number($('biome').value);$('notice').textContent=$('biome').selectedOptions[0].text;};
+function world(){state.seed+=37;$('worldCode').textContent='WORLD SEED '+String(state.seed).padStart(3,'0');$('notice').textContent='已生成新地形 · 种子 '+state.seed;}
+$('new').onclick=world;$('rotation').onclick=()=>{state.rotate=!state.rotate;rotation();};$('reset').onclick=()=>{Object.assign(state,{yaw:.2,pitch:.12,dist:3.2});$('distance').value='3.2';$('distanceValue').textContent='3.2 R';};
+$('capture').onclick=()=>{try{const a=document.createElement('a');a.download='aurelia-'+state.seed+'.png';a.href=canvas.toDataURL('image/png');a.click();$('notice').textContent='已导出当前星球画面';}catch{$('notice').textContent='当前浏览器限制下载，请独立打开作品后保存。';}};
+let drag=null;canvas.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY};canvas.setPointerCapture(e.pointerId);};canvas.onpointermove=e=>{if(drag){state.yaw+=(e.clientX-drag.x)*.006;state.pitch=Math.max(-1.4,Math.min(1.4,state.pitch+(e.clientY-drag.y)*.006));drag={x:e.clientX,y:e.clientY};}};canvas.onpointerup=canvas.onpointercancel=()=>drag=null;
+canvas.addEventListener('wheel',e=>{e.preventDefault();state.dist=Math.max(2.2,Math.min(5,state.dist+e.deltaY*.002));$('distance').value=String(state.dist);$('distanceValue').textContent=state.dist.toFixed(1)+' R';},{passive:false});
+document.addEventListener('keydown',e=>{if(e.code==='Space'&&!/INPUT|SELECT|BUTTON/.test(document.activeElement.tagName)){e.preventDefault();world();}});
+window.__planet={state,rendered:0};let last=performance.now();
+function draw(now){const dt=Math.min((now-last)/1000,.05);last=now;if(!document.hidden){if(state.rotate)state.phase+=dt*.06;const ratio=Math.min(devicePixelRatio,1.5),w=Math.round(innerWidth*ratio),h=Math.round(innerHeight*ratio);if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;gl.viewport(0,0,w,h);}gl.uniform2f(loc.resolution,w,h);for(const k of ['yaw','pitch','dist','seed','sun','water','biome','phase'])gl.uniform1f(loc[k],state[k]);gl.uniform1f(loc.mobile,innerWidth<650?1:0);gl.drawArrays(gl.TRIANGLES,0,6);window.__planet.rendered++;}requestAnimationFrame(draw);}
+$('renderState').textContent='LIVE / GPU RENDER';canvas.addEventListener('webglcontextlost',e=>{e.preventDefault();$('renderState').textContent='渲染中断，请刷新';$('notice').textContent='GPU 上下文丢失。请刷新或更换浏览器。';});requestAnimationFrame(draw);
+}catch(e){document.querySelector('#renderState').textContent='渲染初始化失败';document.querySelector('#notice').textContent='当前设备无法编译效果，请更换浏览器。';console.error(e);}
+}</script></html>

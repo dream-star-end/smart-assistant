@@ -266,6 +266,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
   "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
   "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
+  "openclaude-memory:consult_advisor": { icon: ShieldCheck, label: "咨询顾问" },
   "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
   "openclaude-memory:present_options": { icon: ListChecks, label: "投递选项卡" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
@@ -275,6 +276,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:task_list": { icon: ListChecks, label: "任务单列表" },
   "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
   "openclaude-memory:task_approve": { icon: ListChecks, label: "批准任务单" },
+  "openclaude-memory:present_task_approval": { icon: ShieldCheck, label: "任务审批卡" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -464,11 +466,42 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   if (cli === "oc-market") {
     return humanSummaryToken(invocation?.[1]);
   }
-  if (cli === "oc-memory" && (op === "delegate" || op === "request-review" || op === "delegate-wait")) {
-    // 取不到 goal/draft 就留空，绝不回退到 op 或 `--help` 这类 flag 名。
-    return humanSummaryToken(commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1]);
+  if (cli === "oc-memory") {
+    if (op === "delegate" || op === "request-review" || op === "delegate-wait") {
+      // 取不到 goal/draft 就留空，绝不回退到 op 或 `--help` 这类 flag 名。
+      return humanSummaryToken(commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1]);
+    }
+    // session-search / archival-search 的查询词(位置参数或 --query)。
+    return humanSummaryToken(commandFlag(command, "query") || firstQuotedArg(command) || invocation?.[1]);
+  }
+  // 研究链路 CLI(T-28):折叠态靠查询词/文件名区分多张同类卡。
+  if (cli === "oc-lit" || cli === "oc-litrag" || cli === "oc-cite" || cli === "oc-ingest") {
+    return humanSummaryToken(
+      commandFlag(command, "query") || commandFlag(command, "q") || firstQuotedArg(command) || invocation?.[1],
+    );
+  }
+  if (cli === "oc-report" || cli === "oc-slides" || cli === "oc-poster" || cli === "oc-docx" || cli === "oc-pdf" || cli === "oc-xlsx") {
+    const out = commandFlag(command, "output") || commandShortFlag(command, "o");
+    return out ? shortPath(stripQuotes(out)) : "";
   }
   return "";
+}
+
+/** 短横单字母 flag(`-o path` / `-o=path`)的值;缺值或下一个 token 又是 flag → ""。 */
+function commandShortFlag(command: string, flag: string): string {
+  const match = new RegExp(`(?:^|\\s)-${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command);
+  const value = match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
+  return value.startsWith("-") ? "" : value;
+}
+
+/** 命令里首个带引号的参数(≥2 字符):oc-lit search "词" 这类位置型查询词。 */
+function firstQuotedArg(command: string): string {
+  const m = /["']([^"']{2,})["']/.exec(command);
+  return m ? m[1] : "";
+}
+
+function stripQuotes(value: string): string {
+  return value.replace(/^["']|["']$/g, "");
 }
 
 /** TaskOutput 在等已有后台命令（task_ids / task_id）时标「等待输出」，spawn 结果才叫「子任务结果」。 */
@@ -540,6 +573,11 @@ function delegateTasksSummary(input: Record<string, unknown>): string {
   return firstGoal ? `${head}: ${firstGoal.slice(0, 40)}` : head;
 }
 
+/** 折叠表头单行截断：超出 max 字加省略号。 */
+function clipOneLine(text: string, max = 40): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
 /** 工具卡 header 行的紧凑摘要（文件路径 / 命令 / 查询等）。 */
 export function toolSummary(name: string, input: Record<string, unknown> | null): string {
   if (!input) return "";
@@ -557,24 +595,30 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       // oc-* CLI 只展示解析后的动作/对象，不回显原始 shell 命令及 params。
       const cli = detectOcCli(cmd);
       if (cli) return ocCommandSummary(cli as OcCli, cmd);
-      return (asStr(input.description) || cmd.split("\n")[0]).slice(0, 60);
+      return clipOneLine(asStr(input.description) || cmd.split("\n")[0]);
     }
+    // 摘要只放对象(路径 / 模式 / 查询词),动词已由表头标签承担(T-26:「读取文件 · 读取 …」重复)。
     case "Edit":
       return shortPath(input.file_path);
     case "Read":
       return shortPath(input.file_path);
     case "Write":
       return shortPath(input.file_path);
-    case "Grep":
-      return `/${asStr(input.pattern)}/`;
+    case "Grep": {
+      const q = asStr(input.pattern);
+      return q ? `"${clipOneLine(q, 60)}"` : "";
+    }
     case "Glob":
-      return asStr(input.pattern);
+      return clipOneLine(asStr(input.pattern), 60);
+    // 硬切 slice 会把 …/pulls/1284 显示成 …/pulls/128(T-06),必须带省略号。
     case "WebFetch":
-      return asStr(input.url).slice(0, 60);
+      return clipOneLine(asStr(input.url), 60);
     case "WebSearch":
     case "McpSearch":
-    case "search_tool":
-      return asStr(input.query).slice(0, 60);
+    case "search_tool": {
+      const q = asStr(input.query);
+      return q ? `"${clipOneLine(q, 60)}"` : "";
+    }
     case "SearchExtraTools":
       return searchExtraToolsQuery(input).slice(0, 60);
     case "ExecuteExtraTool":
@@ -631,19 +675,20 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "browser_evaluate" || op === "browser_run_code")
       return (asStr(input.code) || asStr(input.function)).replace(/\s+/g, " ").slice(0, 60);
     if (op === "browser_wait_for") return asStr(input.text) || `${(input.time as number) || 0}s`;
-    return op;
+    // 未登记 op:标签已由 resolveToolMeta 人话化,摘要不再重复一遍原始 op(T-28)。
+    return "";
   }
   if (server === "minimax-media") {
     if (op === "text_to_image" || op === "generate_video" || op === "music_generation" || op === "text_to_audio") {
       return (asStr(input.prompt) || asStr(input.text) || asStr(input.lyrics)).slice(0, 60);
     }
     if (op === "query_video_generation") return asStr(input.task_id);
-    return op;
+    return "";
   }
   if (server === "minimax-vision" || server === "openclaude-vision") {
     if (op === "understand_image") return (asStr(input.prompt) || asStr(input.question)).slice(0, 60);
     if (op === "web_search") return asStr(input.query);
-    return op;
+    return "";
   }
   if (server === "openclaude-memory") {
     if (op === "memory") return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
@@ -670,16 +715,29 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "skill_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
     if (op === "task_create") return asStr(input.title);
-    if (op === "task_update" || op === "task_comment" || op === "task_get" || op === "task_approve") {
+    if (op === "task_update" || op === "task_comment" || op === "task_get" || op === "task_approve" || op === "present_task_approval") {
       return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
     }
     if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);
-    return op;
+    // 合并取舍(发布预演 t-1279):consult_advisor 取 canonical OCV5-220 的写法(question → concern,压成一行
+    // 截 40 字),再补上审计侧的 prompt / goal 兜底;request_review / ask_user 保留审计分支。
+    if (op === "consult_advisor") {
+      const q = (asStr(input.question) || asStr(input.concern) || asStr(input.prompt) || asStr(input.goal))
+        .replace(/\s+/g, " ")
+        .trim();
+      return q ? clipOneLine(q, 40) : "";
+    }
+    if (op === "request_review" || op === "ask_user") {
+      return (asStr(input.question) || asStr(input.prompt) || asStr(input.goal)).slice(0, 60);
+    }
+    // 未登记 op 不直显内部标识符(T-28):标签已由 resolveToolMeta 人话化,摘要留空。canonical 这里
+    // `return op` 会把蛇形名漏到折叠态摘要,与 meta.test「不直显内部标识符」冲突,取审计侧。
+    return "";
   }
   if (server === "web-context") {
     if (op === "web_context_extract_url") return asStr(input.url).slice(0, 80);
     if (op === "web_context_parse_file") return shortPath(input.file_path);
-    return op;
+    return "";
   }
   if (server === "scansci-pdf") {
     if (op === "scansci_pdf_search") return asStr(input.query).slice(0, 60);
@@ -691,9 +749,9 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return (asStr(input.identifier) || asStr(input.file_path)).slice(0, 70);
     }
     if (op === "scansci_pdf_parse_list") return shortPath(input.file_path);
-    if (op.includes("health") || op.includes("diagnose") || op.includes("source")) return op;
+    if (op.includes("health") || op.includes("diagnose") || op.includes("source")) return "";
     if (op.includes("vpnsci")) return asStr(input.school) || asStr(input.query) || asStr(input.doi);
-    return op;
+    return "";
   }
   return "";
 }

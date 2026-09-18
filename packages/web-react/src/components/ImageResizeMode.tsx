@@ -1,9 +1,9 @@
 /**
  * 调整大小模式:底部弹出五比例菜单(带示意图标)。选择即合成 [源图 + guide] 并进主对话
  * (需求 B),帧标 mode:'resize' + targetAspect —— P 侧映射为 gateway outpaint 分支重构图。
- * 计费同 50 积分/张(仍走既有 reserve/settle,不新开口径)。
+ * 计费口径与圈选编辑一致(仍走既有 reserve/settle,不新开口径;具体价格由计费侧定,前端不写死)。
  */
-import { useEffect, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useState } from 'react'
 import { X } from 'lucide-react'
 import { apiErrorMessage } from '../lib/api'
 import { downloadPercent } from '../lib/chat/download'
@@ -60,6 +60,7 @@ export function ImageResizeMode({
   canSubmit,
   onBack,
   onSubmit,
+  escapeHandlerRef,
 }: {
   src: string
   alt: string
@@ -72,21 +73,40 @@ export function ImageResizeMode({
   canSubmit: boolean
   onBack: () => void
   onSubmit: (value: ImageEditSubmit) => Promise<void>
+  /**
+   * 宿主(ImageViewer)的 Esc 委托口:Radix 在 document 捕获阶段派发 Esc,宿主先问本组件
+   * 「这次 Esc 你要不要」——提交中返回 true(吞掉,不退出),否则 false(宿主退回浏览态)。
+   */
+  escapeHandlerRef?: RefObject<(() => boolean) | null>
 }) {
   const [busy, setBusy] = useState<ImageAspectRatio | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loadError, setLoadError] = useState(false)
   // 合成取原图进度百分比(null = 命中缓存/无 Content-Length → 显示「提交…」而非数字)。
   const [loadPercent, setLoadPercent] = useState<number | null>(null)
-  // 展示图是否已解码就绪:就绪前用缩略底图/骨架占位(禁纯白闪)。
-  const [imgReady, setImgReady] = useState(false)
   // 加载期即时底图:已缓存缩略图(气泡/查看器已下载)的 objectURL。未命中 → null。
   const [thumbUrl, setThumbUrl] = useState<string | null>(null)
   // 展示态 src:重试时重签后更新它,让 <img> 真正换新 URL 重载(见 ImageCommentMode 同款说明)。
   const [displaySrc, setDisplaySrc] = useState(src)
   useEffect(() => setDisplaySrc(src), [src])
-  // 换图(含重试重签)→ 重置就绪态,重新走占位底图。
-  useEffect(() => setImgReady(false), [displaySrc])
+  // 展示图就绪 = 「已加载完成的那张 src」恰好是当前 displaySrc。此前用一个布尔 + effect 复位:
+  // data:/blob:/已进 HTTP 缓存的图会在挂载后的 passive effect **之前**就触发 onLoad,复位 effect
+  // 随即把 true 覆写回 false,之后再无 load 事件 → 图永远不显示(审计 M-01)。按 src 记录就没有
+  // 时序问题:换图/重试时 displaySrc 一变,就绪态自然回落,不需要任何 effect。
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null)
+  const imgReady = loadedSrc !== null && loadedSrc === displaySrc
+  // 浏览器同步命中缓存时 <img> 挂上就已 complete,load 事件可能早于 React 绑定监听 —— ref 回调兜底。
+  const adoptLoadedImage = useCallback((el: HTMLImageElement | null) => {
+    if (el?.complete && el.naturalWidth > 0) setLoadedSrc(el.getAttribute('src'))
+  }, [])
+  // 宿主 Esc 委托:提交中吞掉 Esc(退出会让在途的合成/提交失去可见进度,见 escapeHandlerRef 说明)。
+  useEffect(() => {
+    if (!escapeHandlerRef) return
+    escapeHandlerRef.current = () => busy != null
+    return () => {
+      escapeHandlerRef.current = null
+    }
+  }, [escapeHandlerRef, busy])
   // 从共享 LRU 取已缓存缩略图字节造 objectURL 做底图;卸载/换身份 revoke 防泄漏。
   useEffect(() => {
     const thumb = getCachedThumbnail(cacheIdentity)
@@ -148,12 +168,12 @@ export function ImageResizeMode({
           type="button"
           aria-label="返回预览"
           onClick={onBack}
-          className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+          className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
         >
           <X size={20} />
         </button>
         <h2 className="text-sm font-semibold text-white">调整大小</h2>
-        <span className="size-10" aria-hidden />
+        <span className="size-10 [@media(hover:none)]:size-11" aria-hidden />
       </header>
 
       {/* 图片 */}
@@ -173,7 +193,10 @@ export function ImageResizeMode({
             </button>
           </div>
         ) : (
-          <div className="relative inline-flex max-h-full max-w-full items-center justify-center">
+          // 包裹层撑满图片区(h-full w-full)而不是贴着图片收缩:inline-flex 包裹自身高度不定,里面 <img>
+          // 的 max-h-full 解析不出来,矮视口桌面端(如 1024×640)会被 overflow-hidden 上下裁掉;M-01 让图
+          // 显形后才看得见这条(阶段 B 顺手修)。本模式没有锚点层,不需要贴合图片。
+          <div className="relative flex h-full w-full items-center justify-center">
             {/* 主图就绪前:已缓存缩略图做模糊底图(占位给容器尺寸);未命中 → 深色骨架。禁纯白闪。
                 shimmer 尊重 reduced-motion(oc-img-skeleton CSS 已处理)。 */}
             {!imgReady &&
@@ -188,11 +211,13 @@ export function ImageResizeMode({
               ) : (
                 <div className="oc-img-skeleton h-64 w-64 max-w-full rounded-lg" aria-hidden />
               ))}
-            {/* 主图:就绪前覆盖在底图上且透明(避免半载闪),onLoad 后转 static 显形定尺寸。 */}
+            {/* 主图:就绪前覆盖在底图上且透明(避免半载闪),onLoad 后转 static 显形定尺寸。
+                就绪态按「哪张 src 已加载」记录(读 DOM 属性而非闭包,晚到的旧图 load 不会误标新图)。 */}
             <img
+              ref={adoptLoadedImage}
               src={displaySrc}
               alt={alt}
-              onLoad={() => setImgReady(true)}
+              onLoad={(e) => setLoadedSrc(e.currentTarget.getAttribute('src'))}
               onError={() => setLoadError(true)}
               draggable={false}
               className={cn(
