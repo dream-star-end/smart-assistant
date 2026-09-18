@@ -222,15 +222,28 @@ export function ProjectSettingsDialog(props: {
       const boundId = boardProjectId.trim() === "" ? null : boardProjectId.trim();
       if (boundId && authSession) {
         const expected = contextVersion ?? 0;
-        await taskboardApi.putProjectContext(authSession, boundId, {
+        const saved = await taskboardApi.putProjectContext(authSession, boundId, {
           expectedVersion: expected,
           instructions: instructions.trim() === "" ? null : instructions,
         });
-        await onSave({
-          name: nameTrim,
-          color,
-          boardProjectId: boundId,
-        });
+        // 两阶段保存(审计 CFG-23):看板指令已落盘、版本号已前进。先把新版本记下来并把指令基线
+        // 挪到已保存内容,这样第二步 onSave 失败后用户重试时不会再拿旧 expectedVersion 撞 409,
+        // 也不会被误报「刚被他处修改」。
+        if (typeof saved?.context?.version === "number") setContextVersion(saved.context.version);
+        baselineRef.current.instructions = instructions;
+        try {
+          await onSave({
+            name: nameTrim,
+            color,
+            boardProjectId: boundId,
+          });
+        } catch (e) {
+          setError(
+            `看板项目指令已保存，但项目名称 / 颜色 / 绑定未能保存：${apiErrorMessage(e, "保存项目设置失败")}。请重试「保存」。`,
+          );
+          setSaving(false);
+          return;
+        }
       } else {
         await onSave({
           name: nameTrim,

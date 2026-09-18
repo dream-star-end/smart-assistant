@@ -1,6 +1,8 @@
 /** Collaboration config wire types and UI helpers for solo/advisor/team. */
+import { type CollaborationMode, isCollaborationMode } from "@openclaude/protocol";
 
-export type CollabMode = "solo" | "advisor" | "team";
+/** 词汇表单一权威在 protocol/collaboration.ts(CFG-20);前端只取别名,不再手写第二份枚举。 */
+export type CollabMode = CollaborationMode;
 
 export type AdvisorModelOption = {
   id: string;
@@ -61,7 +63,7 @@ export const ADVISOR_ENABLED_HINT = "主模型不变，只多一个出主意的�
 export const ADVISOR_UNAVAILABLE_REASON = "暂时没有可用的顾问型号，不会自动改成别的。";
 
 export function isCollabMode(value: unknown): value is CollabMode {
-  return value === "solo" || value === "advisor" || value === "team";
+  return isCollaborationMode(value);
 }
 
 export function docToUiState(doc: CollaborationConfigDoc): CollabUiState {
