@@ -4173,8 +4173,14 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/advisorMode.test.ts",
           "assertion": "assertAdvisorModelAllowed canonicalizes Codex 1M twins onto the standard id"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-advisor-1m-dup-picker.ts",
+          "assertion": "listProvenAdvisorModels skips Codex 1M twins and assertAdvisorModelAllowed canonicalizes via advisorCanonicalModelId"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260915-CODEX-CHATGPT-WS",
