@@ -125,6 +125,19 @@ export type SkillScopeMode = 'runtime' | 'management'
 
 export interface SkillSaveOptions {
   agentIds?: string[]
+  /**
+   * S-01 乐观并发:调用方 pin 的「期望当前版本」。与写入时的权威版本不符则 save 返回
+   * `{ok:false, conflict:{currentVersion}}`、**不快照不覆盖**,让调用方重载后再存。
+   * 省略 = 旧行为(后写者胜),兼容不带版本的旧客户端 / restore() 内部调用。
+   */
+  expectedVersion?: string
+}
+
+/** save() 结果:conflict 仅在 expectedVersion 与当前权威版本不符时出现(currentVersion=null 表示技能已不存在)。 */
+export interface SkillSaveResult {
+  ok: boolean
+  error?: string
+  conflict?: { currentVersion: string | null }
 }
 
 export interface SkillSearchResult extends SkillMetadata {
@@ -1192,7 +1205,7 @@ export class SkillStore {
     meta: SkillFrontmatter,
     body: string,
     options: SkillSaveOptions = {},
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<SkillSaveResult> {
     const v = validateSkillName(meta.name)
     if (!v.ok) return { ok: false, error: v.error }
     try {
@@ -1246,6 +1259,11 @@ export class SkillStore {
     const now = new Date().toISOString()
     const isNew = !existsSync(skillMd)
 
+    // S-01 乐观并发:调用方 pin 了 expectedVersion 但技能已不存在(被并发删除等)→ 冲突。
+    if (isNew && typeof options.expectedVersion === 'string') {
+      return { ok: false, conflict: { currentVersion: null } }
+    }
+
     // Snapshot old version before overwriting
     let prevVersion = '1.0.0'
     if (!isNew) {
@@ -1253,6 +1271,10 @@ export class SkillStore {
       if (!oldRaw) return { ok: false, error: 'failed to read existing skill for snapshot' }
       const { meta: oldMeta } = parseFrontmatter(oldRaw)
       prevVersion = oldMeta.version && isValidVersion(oldMeta.version) ? oldMeta.version : '1.0.0'
+      // S-01 乐观并发:与当前权威版本不符 → 拒写(不快照、不覆盖),返回 currentVersion 让调用方重载。
+      if (typeof options.expectedVersion === 'string' && prevVersion !== options.expectedVersion) {
+        return { ok: false, conflict: { currentVersion: prevVersion } }
+      }
       // Save snapshot to history/<version>.md — write via resolved path
       const historyDir = join(skillDir, 'history')
       await mkdir(historyDir, { recursive: true })
@@ -1338,6 +1360,11 @@ export class SkillStore {
     if (!v.ok) return { ok: false, error: v.error }
     if (!/^[a-zA-Z0-9._/-]{1,128}$/.test(relPath) || relPath.includes('..') || relPath.startsWith('/')) {
       return { ok: false, error: 'invalid aux file path' }
+    }
+    // S-06:SKILL.md 走 save()(带版本快照),history/ 是快照区 —— 都不能经辅助文件接口写入
+    // (否则绕过历史快照直接改正文)。与 deleteAuxFile 同款守卫,保持存储层原语自洽。
+    if (relPath === 'SKILL.md' || relPath.startsWith('history/')) {
+      return { ok: false, error: 'SKILL.md/history 不可经辅助文件接口写入' }
     }
     const skillDir = join(this.writeRoot, name)
     if (!existsSync(join(skillDir, 'SKILL.md'))) {
