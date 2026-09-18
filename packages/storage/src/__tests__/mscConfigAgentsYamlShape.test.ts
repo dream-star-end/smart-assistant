@@ -1,11 +1,9 @@
 /**
  * msc-config 阶段 A 审计用例:agents.yaml 读取的 shape 契约。
  *
- * readAgentsConfig() 只在 ENOENT 时给默认值;文件存在但内容为空 / 缺 agents 键时,
- * parseYaml 的结果(null / 缺字段对象)被原样 `as AgentsConfig` 返回,下游
- * `cfg.agents.find(...)` 直接 TypeError(见 docs/audit/msc-config.md CFG-01 / CFG-02)。
- *
- * 红灯用例标注 TODO(msc-config): 阶段 B 修复(在 readAgentsConfig 内做 shape 归一)。
+ * 阶段 A 红灯:readAgentsConfig() 只在 ENOENT 时给默认值;文件存在但内容为空 / 缺 agents 键时,
+ * parseYaml 的结果(null / 缺字段对象)被原样 `as AgentsConfig` 返回,下游 `cfg.agents.find(...)`
+ * 直接 TypeError(docs/audit/msc-config.md CFG-03)。阶段 B 由 normalizeAgentsConfig 归一后转绿。
  * 运行:npx tsx --test packages/storage/src/__tests__/mscConfigAgentsYamlShape.test.ts
  */
 import assert from 'node:assert/strict'
@@ -16,11 +14,16 @@ import { after, test } from 'node:test'
 
 const home = await mkdtemp(join(tmpdir(), 'msc-config-yaml-shape-'))
 process.env.OPENCLAUDE_HOME = home
-const { readAgentsConfig, updateAgentsConfig } = await import('../config.js')
+const {
+  normalizeAgentsConfig,
+  readAgentsConfig,
+  readAgentsConfigWithWarnings,
+  updateAgentsConfig,
+} = await import('../config.js')
 const { paths } = await import('../paths.js')
 after(() => rm(home, { recursive: true, force: true }))
 
-// TODO(msc-config): 阶段 B 修复 —— 空文件应与 ENOENT 同语义(返回 bootstrap 默认),而不是 null。
+// 空文件与 ENOENT 同语义(返回 bootstrap 默认),而不是 null。
 test('empty agents.yaml resolves to the bootstrap default instead of null', async () => {
   await writeFile(paths.agentsYaml, '')
   const cfg = await readAgentsConfig()
@@ -29,7 +32,7 @@ test('empty agents.yaml resolves to the bootstrap default instead of null', asyn
   assert.equal(typeof cfg.default, 'string')
 })
 
-// TODO(msc-config): 阶段 B 修复 —— 缺 agents / routes 键时补空数组,default 缺失时补首个 agent。
+// 缺 agents / routes 键时补数组(agents 空则补 main),default 缺失或指向不存在的 agent 时回首个 agent。
 test('agents.yaml missing agents/routes keys is normalized to arrays', async () => {
   await writeFile(paths.agentsYaml, 'default: main\n')
   const cfg = await readAgentsConfig()
@@ -38,6 +41,22 @@ test('agents.yaml missing agents/routes keys is normalized to arrays', async () 
   // 事务入口不能因为 shape 问题在回调里 TypeError
   const { result } = await updateAgentsConfig((c) => c.agents.some((a) => a.id === 'main'))
   assert.equal(typeof result, 'boolean')
+})
+
+test('default pointing at a ghost agent falls back to the first configured agent with a warning', async () => {
+  await writeFile(
+    paths.agentsYaml,
+    'agents:\n  - id: main\n  - id: coder\ndefault: ghost\nroutes: []\n',
+  )
+  const { config, warnings } = await readAgentsConfigWithWarnings()
+  assert.equal(config.default, 'main')
+  assert.ok(warnings.some((w) => /ghost/.test(w)))
+  const { config: fromNull, warnings: w2 } = normalizeAgentsConfig(null)
+  assert.deepEqual(
+    fromNull.agents.map((a) => a.id),
+    ['main'],
+  )
+  assert.equal(w2.length, 1)
 })
 
 // 回归锁(当前已满足):写回保留 schema 外字段(agent 级 + 顶层),marketplace 归属标记不丢。
