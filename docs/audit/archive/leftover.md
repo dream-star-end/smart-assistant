@@ -1,7 +1,7 @@
-# 集成④ 后遗留清扫 + 发布阻断修复 · 归档摘要（t-1234 / t-1235 / t-1348）
+# 集成④ 后遗留清扫 + 发布阻断修复 · 归档摘要（t-1234 / t-1235 / t-1348 / t-1575）
 
-> 三条都是集成④（`2d2b5cafc` 源码态）之后、用户 09-17 授权（d-1450）下新开的任务，均已验收、分支已推远端、**待集成⑤（t-1237）合入**。正文：`docs/audit/leftover-shell.md`（t-1234，分支 `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`）、[`docs/audit/tutorials.md`](../tutorials.md) §10（t-1235，分支 `-leftover-tut@69e18aa93`）、[`docs/audit/shell.md`](../shell.md) §9（t-1348，分支 `-budget-fix@65019b5dc`）；前两份正文在各自分支上，合入集成⑤ 后可在 integration 读。本文只做摘要与索引。
-> 口径：三条都只做「本轮审计已登记、当时因缺原语 / 属跨模块接线 / 发布门禁才没做」的项；无新增审计清单，计数并入原模块（market / settings / misc-p3 / tutorials / shell）。
+> 前三条是集成④（`2d2b5cafc` 源码态）之后、用户 09-17 授权（d-1450）下新开的任务，第四条 t-1575 是集成⑤预演（t-1503）暴露的首屏回归修复；四条均已验收、分支已推远端，并由集成⑤ 8 步合并带入 integration（`7cae5427f` / `c4a516697` / `ec09ed419` / `10e1348fb`；集成⑤ 任务 t-1237 在任务库尚未验收闭合，见 SUMMARY §4.3）。正文：[`docs/audit/leftover-shell.md`](../leftover-shell.md)（t-1234，分支 `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`）、[`docs/audit/tutorials.md`](../tutorials.md) §10（t-1235，分支 `-leftover-tut@69e18aa93`）、[`docs/audit/shell.md`](../shell.md) §9（t-1348，分支 `-budget-fix@65019b5dc`）、[`docs/audit/INTEGRATION.md`](../INTEGRATION.md) 集成⑤ §3（t-1575，分支 `-leftover-tut-budget@a947662bb`，无独立正文）。本文只做摘要与索引。
+> 口径：四条都只做「本轮审计已登记、当时因缺原语 / 属跨模块接线 / 发布门禁才没做」的项或其引入的回归；无新增审计清单，计数并入原模块（market / settings / misc-p3 / tutorials / shell）。
 
 ## 1. t-1234 · 遗留清扫 shell / market / settings / App（fable-5-1-52 接手收口）
 
@@ -43,14 +43,28 @@
 | 验证（`wt\budget-fix`） | `npm run build` ✅ exit 0（= `deploy-v5-selfhost.sh --deploy` 的 `build_frontend` 同款）· typecheck ✅ · 触及模块单测 15 文件 / 303 例 ✅ · **全量 `npm test` 302 文件 / 4279 例全部通过**（10m41s）· `test:browser` `run.mjs` 68/68（含 T13 工具卡、T14 消息反馈弹窗焦点归还、T16/T17 全屏预览、T25/T68 390px），`node --test` 70/73 → 提交后 `ocv5-185-qa` 单跑 15/15，余 cc-switch ×2 基线 · biome 新增 0（新建两 LF 文件 0 诊断）。**NOT RUN**：ui-preview 截图（零视觉改动，只改加载时序）、慢网首开体感（懒块首开多一次 chunk 拉取，已由空闲预取 + `DialogFallback` 对冲，未在节流网络实测） |
 | 后续可拆候选（供下次逼近预算） | 专项工具卡体 `tool/{researchCards,connectorCards,…}` ≈18KB（需 tools owner 评估首帧占位）· `lib/taskboard.ts` ≈3.3KB（常量下沉 + 动态 import）· `@openclaude/protocol` + `@sinclair/typebox` ≈30KB（要改 `packages/protocol` 导出结构，PLAYBOOK §9 范围外）· `PermissionCard` ≈5.7KB（活动 turn 高频面，保守不动） |
 
-- 提交：`77e1f35dc` refactor（12 files, +323 −142）· `65019b5dc` docs（`shell.md` §9 +62 行）；分支 `feat/v5-selfhost-audit-budget-fix@65019b5dc`，远端 = 本地，待集成⑤。**发布前 `npm run build` 必须过，集成⑤ 合入本分支后复跑 build 是发布门**（INTEGRATION 集成④ §6 / §7）。
+- 提交：`77e1f35dc` refactor（12 files, +323 −142）· `65019b5dc` docs（`shell.md` §9 +62 行）；分支 `feat/v5-selfhost-audit-budget-fix@65019b5dc`，远端 = 本地；集成⑤ 第 1 步 `ec09ed419` 合入（`App.tsx` 三方自动合并）。**发布前 `npm run build` 必须过，集成⑤ 合入本分支后复跑 build 是发布门**（INTEGRATION 集成④ §6 / §7）→ 集成⑤ 源码态 `91358ce54` 实测 ✅ 447.8KB（§4）。
 
-## 4. 分支 / 集成状态（09-18 00:3x 现算）
+## 4. t-1575 · 集成⑤阻断 · leftover-tut 深链把教程案例数据拖进首屏（指挥官二分归因 → 修复分支 `leftover-tut-budget`）
 
-| 分支 `feat/v5-selfhost-audit-*` | HEAD | 任务 | 相对 integration `c97a750f8` 未合入 | 远端 |
-|---|---|---|---|---|
-| leftover-shell | `7e7c7e43b` | t-1234 | 6（5 代码 + 1 docs） | = 本地 |
-| leftover-tut | `69e18aa93` | t-1235 | 3（2 代码 + 1 docs） | = 本地 |
-| budget-fix | `65019b5dc` | t-1348 | 2（1 代码 + 1 docs） | = 本地 |
+> 集成⑤预演 t-1503（fable-5-1-2，`feat/v5-selfhost-audit-integ5-rehearsal@b6b78e876`：6 条待合分支试合、typecheck ✅）`npm run build` ❌ **475.2KB > 460.0KB**，而 budget-fix 单独为 445.5KB。指挥官 fable-5-1-4 对预演分支逐合并点 detached 构建（脚本 / 日志 `.audit-tmp\release-rehearsal\bisect-integ5-first-screen.ps1`、`integ5-bisect\SUMMARY.txt`）：`c1ef51a44`+budget-fix 446.8KB ✅ → `537595a1e`+qa-a11y 446.8KB → `b6c56be2d`+leftover-shell 447.3KB → **`586131c42`+leftover-tut 475.2KB ❌（`useAppRoute-*.js` 1.7KB → 30.7KB gzip）** → `6952c72ff`+a11y-c / `b6b78e876`+archive 475.2KB。QA t-1236 同时把它登记为 B-2「集成⑤ 必修」。
 
-三支基点：leftover-shell / budget-fix 基于集成④ 源码态 `2d2b5cafc`（零重叠预期）；leftover-tut 基于 `tut-sync-2@67b1494ea`（集成③ 终点 + t-1046，集成④ 已含），`App.tsx` / `useAppRoute.ts` 与 leftover-shell 的 `App.tsx` 一处、budget-fix 的 `App.tsx` 大改同文件，**集成⑤ 合入时留意三方合并**（各自 hunk 不同：D-08 一行 / lazy 改造 / tutorial 三个 state）。
+| 项 | 结论 |
+|---|---|
+| 根因 | leftover-tut `3fee24a58`（TU-17 深链）在入口静态闭包 `hooks/useAppRoute.ts` 新增 `import { SIGNATURE_WORKS } from '../lib/tutorialSignatureWorks'`，只为校验 `&work=planet\|gravity`，却把 `tutorialSignatureWorks → tutorialCaseCatalog`（教程案例数据）整个拖进首屏（`vite.config.ts:77-87` 历史注释正警告过「useAppRoute 拖教程案例数据」） |
+| 修法 | 新增零依赖 `lib/tutorialSignatureWorkIds.ts`（`SIGNATURE_WORK_IDS = ['planet','gravity']` + 类型），`useAppRoute` 改引它；`SignatureWork.id` 反向以该类型约束；新增 `tutorialSignatureWorkIds.test.ts` 断言两表集合相等防漂移。4 files, +50/−5，`useAppRoute` chunk 30.7KB → **2.0KB** |
+| 验证 | 集成⑤ 第 5 步紧跟 leftover-tut 合入后 integration `build` ✅ **447.8KB（458555 B），余量 12.2KB**（INTEGRATION 集成⑤ §5）；`tutorialSignatureWorkIds.test.ts` 计入集成⑤ vitest 305 文件 / 4306 例全绿。**NOT RUN**（本摘要作者）：分支自跑门的日志未单列，以集成⑤ §5 合并树结果为准 |
+| 顺带发现 | 集成⑤ 合完 7 条后 `check:tutorials` 报 `agents / billing-usage` 功能源漂移（a11y-C / budget-fix / leftover-shell 的 className / lazy 改动致，与 t-1575 无关）→ 集成⑤ 以 `--source-only` accept（`91358ce54`，history 第 70 条，**待用户终审**）；发布预演 t-1598 据此写下「教程门两段式」口径（RELEASE.md §3.1b） |
+
+- 分支 `feat/v5-selfhost-audit-leftover-tut-budget@a947662bb`（`refactor(v5)` 1 笔，基于 leftover-tut `69e18aa93`），远端 = 本地；集成⑤ 第 5 步 `10e1348fb` 合入。
+
+## 5. 分支 / 集成状态（09-18 00:3x 现算 → 09-18 21:xx 按 integration `aeae1d72e` 复核）
+
+| 分支 `feat/v5-selfhost-audit-*` | HEAD | 任务 | 相对 `c97a750f8` 未合入（00:3x） | 集成⑤ 合并提交 | 相对 `aeae1d72e` 未合入（21:xx） | 远端 |
+|---|---|---|---|---|---|---|
+| leftover-shell | `7e7c7e43b` | t-1234 | 6（5 代码 + 1 docs） | 3/8 `7cae5427f`（18 files, +659/−85，零重叠） | 0 | = 本地 |
+| leftover-tut | `69e18aa93` | t-1235 | 3（2 代码 + 1 docs） | 4/8 `c4a516697`（10 files, +529/−28；引入首屏回归，第 5 步修正） | 0 | = 本地 |
+| leftover-tut-budget | `a947662bb` | t-1575 | 1（代码） | 5/8 `10e1348fb`（4 files, +50/−5） | 0 | = 本地 |
+| budget-fix | `65019b5dc` | t-1348 | 2（1 代码 + 1 docs） | 1/8 `ec09ed419`（12 files, +323/−142；`App.tsx` 三方自动合并） | 0 | = 本地 |
+
+四支基点：leftover-shell / budget-fix 基于集成④ 源码态 `2d2b5cafc`（零重叠预期，实测零冲突）；leftover-tut 基于 `tut-sync-2@67b1494ea`，leftover-tut-budget 基于 leftover-tut；`App.tsx` 在集成⑤ 第 1 步三方自动合并（budget-fix lazy 改造与集成④ 接线不同 hunk），其余步零冲突（集成⑤ 唯一冲突在 a11y-c 的 `RichBlocks.test.tsx`，两条用例全保留）。集成⑤ 任务 t-1237 的验收闭合与全量门下半场见 SUMMARY §4.3。

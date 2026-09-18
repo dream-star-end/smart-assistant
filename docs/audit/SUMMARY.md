@@ -1,20 +1,20 @@
 # v5 个人版审计 · 总览（SUMMARY · 终稿，t-897）
 
-> 给用户终审的**唯一入口**：总览 → 方法 → 按模块一节（含集成④ 后新交付）→ 集成④ 合入记录与集成⑤ 待合清单 → 遗留清单 → 决策与口径 → 终审导读 → 验证门 → 分支 / 提交总表 → 评审入口 → 终稿口径。每个数字都能在各模块正文 `docs/audit/<slug>.md`、归档摘要 `docs/audit/archive/<slug>.md` 或 `docs/audit/INTEGRATION.md` 找到出处；每个 SHA 都可 `git cat-file -e` 核实（t-632 初稿与 t-897 终稿各逐个核过一遍）。
+> 给用户终审的**唯一入口**：总览 → 方法 → 按模块一节（含集成④ 后新交付、预演与发布前置）→ 集成④ 合入记录、集成⑤ 合入状态与集成⑤ / 发布线预留章节 → 遗留清单 → 决策与口径 → 终审导读 → 验证门 → 分支 / 提交总表 → 评审入口 → 终稿口径。30 分钟版终审导读单页见 [`FINAL-REVIEW.md`](./FINAL-REVIEW.md)。每个数字都能在各模块正文 `docs/audit/<slug>.md`、归档摘要 `docs/audit/archive/<slug>.md`、`docs/audit/INTEGRATION.md` 或 `docs/audit/RELEASE.md` 找到出处；每个 SHA 都可 `git cat-file -e` 核实（t-632 初稿与 t-897 各阶段逐个核过）。
 > 只汇总不复制正文（q-786 口径）；未跑的验证一律标 **NOT RUN**。
-> 版本：**终稿**，基于 integration **`c97a750f8`**（集成④ 终点，2026-09-17 23:28 已 push；源码态 `2d2b5cafc`），并带入归档分支 `feat/v5-selfhost-audit-archive@35e3ec7c9` 的初稿同步提交。集成⑤（t-1237）**尚未开始**：集成④ 之后已验收的 6 条分支在本文以「待集成⑤」为状态列出（§4.2），其数字来自各自交付文档与分支现算，不是占位。
+> 版本：**终稿 · 阶段①草稿（2026-09-18 21:xx）**，分支 `feat/v5-selfhost-audit-archive-final`：基于 integration `c97a750f8`（集成④ 终点，09-17 23:28 已 push；源码态 `2d2b5cafc`）+ 归档分支 `archive@35e3ec7c9` 的初稿同步提交 + **对齐合并 integration `aeae1d72e`**（09-18 02:2x 已 push；含集成⑤ 8 步合并、canonical `f1952819f` 合入与 `RELEASE.md` v2.2）。集成⑤（t-1237）/ 发布准备（t-1268）/ 发布执行（t-1269）三条**在任务库尚未验收闭合**（09-18 20:49 账本：integ5 在跑、release-prep / release-deploy 阻塞、集成⑤ 全量门下半场 integ5-gate2 阻塞），本文对它们只登记 `git` 可核的事实并预留章节（§4.3–§4.5，TODO 字段留阶段②）；各模块表里的「待集成⑤」保留为**任务口径**——其合并提交已在 integration（§4.2 / §4.3），阶段② 定稿时统一翻转。
 
 ## 1. 总览
 
 | 项 | 内容 |
 |---|---|
 | 目标 | 对 v5 个人版（selfhost，`packages/web-react` 用户端）全部页面 / 模块做 UI/UX、功能正确性、交互友好性审计，审出的问题直接改代码落地（P1 / P2 必修，P3 量力而行并登记遗留），指挥官验收、合入 integration 后统一归档给用户终审；用户 09-17 授权后目标延伸为经集成⑤ 全量门 → 合并 canonical 上游 → push 回 canonical → 服务器 v3-dev-sg 端到端上线（d-1326 / d-1450，发布线不在本归档范围） |
-| 时间跨度 | 2026-09-15（基线 `210b9967`、决策 d-24/26/28）→ 2026-09-17 23:28（集成④ 终点 `c97a750f8` 推送）；集成④ 之后当日又交付 6 条分支（§4.2），本文现算截至 2026-09-18 00:3x |
-| 任务数 | 协同组任务库 **68 条**（09-18 00:20 宿主现算：已完成 57 · 在跑 1 · 待领 9 · 阻塞 1；作废条 t-837 不计入统计）。本归档覆盖其中审计线：集成③ 前 **54 条**（A 审计 12 · B 修复 12 · 二期 / 补丁 6 · 覆盖复查与补审专项 · a11y 专项 · QA 复核 3 · 集成 4 · 归档 3）+ 集成③ 后用户授权 **6 条**（t-1232 QA·复核 a11y-B×3 + PermissionCard ✅ · t-1233 a11y-C 同源项清扫 ✅ 已交付（四手收尾，t-1344 独立复核）· t-1234 遗留清扫 shell / market / settings / App ✅ · t-1235 遗留清扫 tutorials ✅ · t-1236 QA·集成④ 独立复核 待领 · t-1237 集成⑤ 待前置）+ 发布阻断 **t-1348** 首屏预算修复 ✅；其余为发布线（t-1279 预演 · 磁盘核查 · release-prep · release-deploy）与持有人离线后的收尾 / 替身单，不计入归档统计（数量以任务库为准） |
-| 12 模块审出 | **359 条**（P1 8 · P2 108 · P3 243），P1 8/8 全部关闭；补审专项另审出 HUD 20 · 知识星球 19 · 杂项 P3 18 · PermissionCard 17 · a11y 走查归属三条修复单 35（11 + 14 + 10）→ a11y-C 承接同源项清单 13 |
-| 合入量 | **29 个 `--no-ff` 合并提交**：集成① 4 条 123 files +13,855/−2,401 · 集成② 7 条 153 files +15,336/−2,295 · 集成③ 6 条 54 files +3,854/−1,211 · **集成④ 12 条 125 files +7,783/−654** → 合计 **455 files，+40,828 / −6,561**（跨轮同文件重复计；不含集成① 起点已含的 shell-B、各轮自有接线 / 用例 / 记录提交、集成待办 t-865） |
-| 集成状态 | 集成④ 终点 **24 条成员分支「未合入提交 = 0」**（12 模块 + hud / kp-automation / misc-p3 / permission-card / a11y ×3 / tut-sync-2 / qa ×3 / archive@`a38a093bf`），远端 = 本地（`git ls-remote` 逐条核）；集成④ 之后新交付、**待集成⑤** 6 条：qa-a11y +2 · a11y-c +18 · leftover-tut +3 · leftover-shell +6 · budget-fix +2 · archive-final（本分支）；2 条预演分支不合入（§4.2） |
-| 结果一句话 | 主流程无阻断项残留；P2 按各模块正文声明全部落地（shell 2 条设计取舍暂缓等用户拍板）；P3 以「本模块内可独立完成即做」为口径，未做的逐条有归属与理由（§5），其中集成③ 登记的跨模块遗留（H-18 / K-27 Checkbox / D-02·D-08 / TU-17·TU-34 / 备案判据 / a11y 同源项）已在集成④ 接线与 t-1233 ~ t-1235 全部落地；集成④ 终点全量门 typecheck / preview / `check:tutorials` / `npm test` 302 文件 4279 例 / `run.mjs` 68 / 截图 1026 张 / a11y 复扫 全绿，**唯一红 `build` 首屏 gzip 预算 471.4KB > 460.0KB 已由 t-1348 修到 445.5KB（待集成⑤ 合入后转绿，发布门）**（§8） |
+| 时间跨度 | 2026-09-15（基线 `210b9967`、决策 d-24/26/28）→ 2026-09-17 23:28（集成④ 终点 `c97a750f8` 推送）→ 2026-09-18 01:45–02:2x（集成⑤ 8 步合并 + canonical `f1952819f` 合入，integration `aeae1d72e` 推送）；本文现算截至 2026-09-18 21:xx（阶段①） |
+| 任务数 | 协同组任务库 **75 条**（09-18 20:49 宿主现算：已完成 69 · 在跑 2 · 阻塞 4 · 待领 0；作废条 t-837 不计入统计）。本归档覆盖其中审计线：集成③ 前 **54 条**（A 审计 12 · B 修复 12 · 二期 / 补丁 6 · 覆盖复查与补审专项 · a11y 专项 · QA 复核 3 · 集成 4 · 归档 3）+ 集成③ 后用户授权 **6 条**（t-1232 QA·复核 a11y-B×3 + PermissionCard ✅ · t-1233 a11y-C 同源项清扫 ✅（四手收尾，t-1344 独立复核 ✅）· t-1234 遗留清扫 shell / market / settings / App ✅ · t-1235 遗留清扫 tutorials ✅ · t-1236 QA·集成④ 独立复核 ✅（分工单 t-1512 → t-1567 三道门、t-1524 截图 + 状态单 ✅）· t-1237 集成⑤ **未闭合**）+ 发布阻断 **t-1348** 首屏预算修复 ✅ + 集成⑤阻断 **t-1575** 首屏回归修复 ✅ + 预演三条（t-1279 发布预演 ✅ · t-1503 集成⑤预演 ✅ · t-1598 发布准备预演 ✅）+ 发布前置 **t-1455** 磁盘清理 ✅（§3.2）；集成④ 收尾单 t-1334 计入集成④。发布线 t-1268 / t-1269 与 disk-prep 在跑 / 阻塞，预留 §4.4 / §4.5；持有人离线后的收尾 / 替身单不单列（数量以任务库为准） |
+| 12 模块审出 | **359 条**（P1 8 · P2 108 · P3 243），P1 8/8 全部关闭；补审专项另审出 HUD 20 · 知识星球 19 · 杂项 P3 18 · PermissionCard 17 · a11y 走查归属三条修复单 35（11 + 14 + 10）→ a11y-C 承接同源项清单 13；QA 五轮核对 37 / 84 / 61 / 58 项 + 集成④ 终点独立复核，累计 ❌ 3（t-1038 1 处勘误 + 移交后由 t-895 落地、t-1029 2 处 QA 直接修），新增阻断 0 |
+| 合入量 | **37 个 `--no-ff` 合并提交**：集成① 4 条 123 files +13,855/−2,401 · 集成② 7 条 153 files +15,336/−2,295 · 集成③ 6 条 54 files +3,854/−1,211 · 集成④ 12 条 125 files +7,783/−654（前四轮合计 455 files，+40,828 / −6,561，跨轮同文件重复计）· **集成⑤ 8 条 `git diff --shortstat c97a750f8..` 64 files +2,269/−292（含 accept，按合并树差量计，与前四轮逐条累加口径不同）**；不含集成① 起点已含的 shell-B、各轮自有接线 / 用例 / 记录提交、集成待办 t-865。另 release-prep 合入 canonical `f1952819f` 上游 7 提交（`57ad2c823`），属上游内容不计入审计合入量 |
+| 集成状态 | 集成④ 终点 **24 条成员分支「未合入提交 = 0」**（QA t-1236 两次独立复算 24/24）；**集成⑤ 8 步合并已在 integration**（`ec09ed419` … `936d44e85`，源码态 `91358ce54`，记录 `9103ce7b4`），8 条 `rev-list --count` 均 0，远端 = 本地；随后 release-prep `57ad2c823`（canonical `f1952819f`）+ R2 `04ba13b2e` + RELEASE.md v2.2 `aeae1d72e` = integration 现 HEAD。**任务库口径**：t-1237 / t-1268 / t-1269 未验收闭合；集成⑤ 全量门下半场（ui-preview 全量截图 + a11y 复扫）未跑（integ5-gate2 阻塞）；canonical `--ff-only` / push 未做，且远端 canonical 09-18 又前进 1 提交到 **`97f128d2b`**（integration 未含，release-prep 需重核，§4.4）；本分支 archive-final（纯文档）待合入；4 条预演分支不合入（§4.2） |
+| 结果一句话 | 主流程无阻断项残留；P2 按各模块正文声明全部落地（shell 2 条设计取舍暂缓等用户拍板）；P3 以「本模块内可独立完成即做」为口径，未做的逐条有归属与理由（§5），其中集成③ 登记的跨模块遗留（H-18 / K-27 Checkbox / D-02·D-08 / TU-17·TU-34 / 备案判据 / a11y 同源项）已在集成④ 接线与 t-1233 ~ t-1235 全部落地并随集成⑤ 进入 integration；集成④ 终点全量门 typecheck / preview / `check:tutorials` / `npm test` 302 文件 4279 例 / `run.mjs` 68 / 截图 1026 张 / a11y 复扫 全绿，唯一红 `build` 首屏 gzip 471.4KB > 460.0KB **已由 t-1348 + t-1575 在集成⑤ 源码态 `91358ce54` 转绿 447.8KB（余量 12.2KB），合 canonical 后 `04ba13b2e` 448.3KB（余量 11.7KB）**；集成⑤ 全量门上半场（typecheck / preview / tutorials / build / `npm test` 305 文件 4306 例 / `run.mjs` 68 / biome）全绿，下半场截图 + a11y 复扫待跑（§4.3 / §8.1b） |
 
 ## 2. 方法与口径
 
@@ -30,7 +30,7 @@
 
 ## 3. 按模块一节
 
-计数口径：「审出」= 阶段 A 清单（P1 · P2 · P3）；「修复 / 部分 / 遗留」= 各正文修复记录与遗留章节（✅ / ◐ / 仍开放的本模块归属项）；「QA 复核」= t-1028（二期 P3，`qa/QA-p3-tail.md`）/ t-1038（B 轮 P3，`qa/QA-b-p3.md`）/ t-1029（缺口补审，`qa/qa-gap.md`）/ t-1232（a11y-B×3 + PermissionCard，`qa/QA-a11y.md`）的结论，前三份随集成④ 合入，第四份待集成⑤。数字抽查：shell / tools / media / market / taskboard / settings 六份正文结论行与本表一致（t-632）；终稿另抽 hud / permission-card / tutorials §10 / leftover-shell 四份与 §3 / §3.1 一致。
+计数口径：「审出」= 阶段 A 清单（P1 · P2 · P3）；「修复 / 部分 / 遗留」= 各正文修复记录与遗留章节（✅ / ◐ / 仍开放的本模块归属项）；「QA 复核」= t-1028（二期 P3，`qa/QA-p3-tail.md`）/ t-1038（B 轮 P3，`qa/QA-b-p3.md`）/ t-1029（缺口补审，`qa/qa-gap.md`）/ t-1232（a11y-B×3 + PermissionCard，`qa/QA-a11y.md`）/ t-1236（集成④ 终点，`qa/qa-integ4.md`）的结论，前三份随集成④ 合入，后两份随集成⑤ 合入。**状态列的「待集成⑤」= 任务口径**（t-1237 未验收闭合）：对应分支已由集成⑤ 8 步 `--no-ff` 合入 integration，合并提交见 §4.2 / §4.3，阶段② 定稿时统一翻转。数字抽查：shell / tools / media / market / taskboard / settings 六份正文结论行与本表一致（t-632）；终稿另抽 hud / permission-card / tutorials §10 / leftover-shell 四份与 §3 / §3.1 一致。
 
 | 模块 | 任务 | 审计文档 | 审出（P1 · P2 · P3） | 修复 / 部分 / 遗留 | QA 复核 | 集成状态 | 一句结论 |
 |---|---|---|---|---|---|---|---|
@@ -54,19 +54,29 @@
 
 归属表勘误（t-839 §7，供 PLAYBOOK §8 修订）：`components/optionsGroup.tsx` → messages；`components/chat/researchEvidence.tsx` → tools；`components/mathDelimiters.ts` → messages。
 
-### 3.1 集成④ 之后新交付（用户 09-17 授权 · 均已验收 · 待集成⑤）
+### 3.1 集成④ 之后新交付（用户 09-17 授权 · 均已验收 · 已由集成⑤ 8 步合入 integration，t-1237 任务未闭合）
 
-| 任务 | 内容 | 审出 / 处置 | 验证摘要 | 分支 @ HEAD | 摘要 / 正文 |
+| 任务 | 内容 | 审出 / 处置 | 验证摘要 | 分支 @ HEAD（集成⑤ 合并提交） | 摘要 / 正文 |
 |---|---|---|---|---|---|
-| t-1232 QA·复核 a11y-B×3 + PermissionCard | 第四轮 QA（fable-5-1-23 起稿 → fable-5-1-35 接手独立重做） | 核对 58 项：✅ 57 / ◐ 1 / ❌ 0，四条**全部通过**；QA 直接修 2 处（`77a93d9e1`：`PublishPanel`「查看 / 收起」`min-w-11`、`PermissionCard` summary `py-3.5`，修前红修后绿） | typecheck / preview ✅；全量 `npm test` 302/302 文件（`MessageRenderer.test` 冷启超时单跑 152/152）；`run.mjs` 68/68；截图 20 场景 74 张 0 失败；CDP 复扫 301 场景，共同 257 场景回归 0；`merge-tree` 试合无冲突 | `feat/v5-selfhost-audit-qa-a11y@eed1f3989`（+2） | [archive/qa.md](./archive/qa.md) §4 · `qa/QA-a11y.md`（分支） |
-| t-1233 a11y-C 跨模块同源项清扫 | a11y-shell §5 清单 13 项 + 复扫补修 2（fable-5-1-38 代码 → fable-5-1-55 收尾复核 → 指挥官 fable-5-1-50 成文 push `361f59b1f` → fable-5-1-3 第四手独立复核 t-1344 `ea9348b2b` → fable-5-1-5 补 `test:browser` 门 + 遗留登记 `c35fd00c6`，t-1233 交付） | 已修 7 项 / 9 处 className（`b591e64b6` `59e66773f` `00b86b565` `5533e0503` `abb246fdb` `faa6e8b26`）+ 补修 2（`c0c9059a1`）；同批闭环 5；不修 1（WCAG 例外）；用例格式化 `12275f27a`；16 文件仅 className（11 处 + 4 行注释）+ 用例断言；收尾补记 `TutorialCenter.tsx:387` 同根因白图标（tutorials 归属，一行改法登记 §5.2） | typecheck ✅；8 用例文件 121 例 ✅（三手复现）；biome 新增 0（两手按「文件 × 规则」比对 37 = 37）；CDP 复扫 288 场景三轮：白字压 accent / danger 4 → **0**，cL 49→47 / cD 77→70，逐场景上升 0（第四手 `tutorials-help-menu-open` tabBad 1→2 为 Radix 护栏 span 计数抖动，非回归）；截图 60 对尺寸相同；**`test:browser` `run.mjs` 68/68 + `node --test` 70/73（3 基线）**；**NOT RUN 全量 `npm test`**（交集成⑤） | `feat/v5-selfhost-audit-a11y-c@c35fd00c6`（+18 = 11 自有 + 7 对齐合并；远端 = 本地） | [archive/a11y.md](./archive/a11y.md) §6 · `a11y-c.md`（分支） |
-| t-1234 遗留清扫 shell / market / settings / App | K-27 `ui/Checkbox` 原语 + market 四处接入；settings 备案判据改引 `filedIcp()`；misc-p3 D-02 用例 / D-08 `ChatInteraction.reason`（前任 5 提交 → fable-5-1-52 复核成文） | 4/4 落地；不加依赖、既有原语零改动、`App.tsx` 只动 D-08 一处 | typecheck / preview ✅；相关 6 文件 92 例 + `App.test` 48/48 ✅；biome 新增 0；CDP AX 28 checkbox 全部有名、mixed 正确、移动端 label 44px；截图 before 22 / after 30 张 0 失败；**NOT RUN** 全量 / `test:browser`（非高频面） | `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`（+6） | [archive/leftover.md](./archive/leftover.md) §1 · `leftover-shell.md`（分支） |
-| t-1235 遗留清扫 tutorials TU-17 / TU-34 | 深链 `?panel=help&tab= / work= / topic=&step=` 进 URL 可反灌（`view=` 改 `tab=` 避开 `/board`）；模块级 hero token `heroTheme.ts` 替 12 处写死色值 | 2/2 落地；`check:tutorials` 无漂移不需 accept | typecheck / preview ✅；11 文件 132 例 ✅（+6）；biome 新增 0；截图 27 场景 before / after 各 108 张 0 失败；**NOT RUN** 全量 / `test:browser` | `feat/v5-selfhost-audit-leftover-tut@69e18aa93`（+3） | [archive/leftover.md](./archive/leftover.md) §2 · [tutorials.md](./tutorials.md) §10 |
-| t-1348 发布阻断·首屏 gzip 预算超限修复 | 集成④ `build` 红 471.4KB > 460.0KB → 8 处「点开才需要」的覆盖层 `React.lazy` / 常量下沉（首屏可见组件不 lazy），阈值不动 | 修后 **445.5KB**，`npm run build` exit 0，净减 25.9KB；越界触及 messages / settings / sidebar 三处机械改动已单列 | `build` ✅；typecheck ✅；15 文件 303 例 ✅；**全量 `npm test` 302 / 4279 ✅**；`run.mjs` 68/68 + `ocv5-185` 15/15；biome 新增 0；**NOT RUN** 截图（零视觉改动）、慢网首开体感 | `feat/v5-selfhost-audit-budget-fix@65019b5dc`（+2） | [archive/leftover.md](./archive/leftover.md) §3 · [shell.md](./shell.md) §9 |
-| t-1236 QA·集成④ 最终 HEAD 独立复核 | — | **待领**（截至 09-18 00:3x 无产出） | — | — | — |
-| t-1237 集成⑤ | 合入上表 5 支 + 本归档分支，复跑全量门（`build` 必须绿） | **待前置**（qa-integ4 t-1236 等） | — | — | INTEGRATION 集成④ §7 / §8 待合清单 |
+| t-1232 QA·复核 a11y-B×3 + PermissionCard | 第四轮 QA（fable-5-1-23 起稿 → fable-5-1-35 接手独立重做） | 核对 58 项：✅ 57 / ◐ 1 / ❌ 0，四条**全部通过**；QA 直接修 2 处（`77a93d9e1`：`PublishPanel`「查看 / 收起」`min-w-11`、`PermissionCard` summary `py-3.5`，修前红修后绿） | typecheck / preview ✅；全量 `npm test` 302/302 文件（`MessageRenderer.test` 冷启超时单跑 152/152）；`run.mjs` 68/68；截图 20 场景 74 张 0 失败；CDP 复扫 301 场景，共同 257 场景回归 0；`merge-tree` 试合无冲突 | `feat/v5-selfhost-audit-qa-a11y@eed1f3989`（+2；集成⑤ 2/8 `c701daac9`） | [archive/qa.md](./archive/qa.md) §4 · [qa/QA-a11y.md](./qa/QA-a11y.md) |
+| t-1233 a11y-C 跨模块同源项清扫 | a11y-shell §5 清单 13 项 + 复扫补修 2（fable-5-1-38 代码 → fable-5-1-55 收尾复核 → 指挥官 fable-5-1-50 成文 push `361f59b1f` → fable-5-1-3 第四手独立复核 t-1344 `ea9348b2b` → fable-5-1-5 补 `test:browser` 门 + 遗留登记 `c35fd00c6`，t-1233 交付） | 已修 7 项 / 9 处 className（`b591e64b6` `59e66773f` `00b86b565` `5533e0503` `abb246fdb` `faa6e8b26`）+ 补修 2（`c0c9059a1`）；同批闭环 5；不修 1（WCAG 例外）；用例格式化 `12275f27a`；16 文件仅 className（11 处 + 4 行注释）+ 用例断言；收尾补记 `TutorialCenter.tsx:387` 同根因白图标（tutorials 归属，一行改法登记 §5.2） | typecheck ✅；8 用例文件 121 例 ✅（三手复现）；biome 新增 0（两手按「文件 × 规则」比对 37 = 37）；CDP 复扫 288 场景三轮：白字压 accent / danger 4 → **0**，cL 49→47 / cD 77→70，逐场景上升 0（第四手 `tutorials-help-menu-open` tabBad 1→2 为 Radix 护栏 span 计数抖动，非回归）；截图 60 对尺寸相同；**`test:browser` `run.mjs` 68/68 + `node --test` 70/73（3 基线）**；**NOT RUN 全量 `npm test`**（交集成⑤） | `feat/v5-selfhost-audit-a11y-c@c35fd00c6`（+18 = 11 自有 + 7 对齐合并；远端 = 本地；集成⑤ 6/8 `ecf912b88`，唯一冲突 `RichBlocks.test.tsx` 两条用例全保留） | [archive/a11y.md](./archive/a11y.md) §6 · [a11y-c.md](./a11y-c.md) |
+| t-1234 遗留清扫 shell / market / settings / App | K-27 `ui/Checkbox` 原语 + market 四处接入；settings 备案判据改引 `filedIcp()`；misc-p3 D-02 用例 / D-08 `ChatInteraction.reason`（前任 5 提交 → fable-5-1-52 复核成文） | 4/4 落地；不加依赖、既有原语零改动、`App.tsx` 只动 D-08 一处 | typecheck / preview ✅；相关 6 文件 92 例 + `App.test` 48/48 ✅；biome 新增 0；CDP AX 28 checkbox 全部有名、mixed 正确、移动端 label 44px；截图 before 22 / after 30 张 0 失败；**NOT RUN** 全量 / `test:browser`（非高频面） | `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`（+6；集成⑤ 3/8 `7cae5427f`） | [archive/leftover.md](./archive/leftover.md) §1 · [leftover-shell.md](./leftover-shell.md) |
+| t-1235 遗留清扫 tutorials TU-17 / TU-34 | 深链 `?panel=help&tab= / work= / topic=&step=` 进 URL 可反灌（`view=` 改 `tab=` 避开 `/board`）；模块级 hero token `heroTheme.ts` 替 12 处写死色值 | 2/2 落地；`check:tutorials` 无漂移不需 accept | typecheck / preview ✅；11 文件 132 例 ✅（+6）；biome 新增 0；截图 27 场景 before / after 各 108 张 0 失败；**NOT RUN** 全量 / `test:browser` | `feat/v5-selfhost-audit-leftover-tut@69e18aa93`（+3；集成⑤ 4/8 `c4a516697`） | [archive/leftover.md](./archive/leftover.md) §2 · [tutorials.md](./tutorials.md) §10 |
+| t-1348 发布阻断·首屏 gzip 预算超限修复 | 集成④ `build` 红 471.4KB > 460.0KB → 8 处「点开才需要」的覆盖层 `React.lazy` / 常量下沉（首屏可见组件不 lazy），阈值不动 | 修后 **445.5KB**，`npm run build` exit 0，净减 25.9KB；越界触及 messages / settings / sidebar 三处机械改动已单列 | `build` ✅；typecheck ✅；15 文件 303 例 ✅；**全量 `npm test` 302 / 4279 ✅**；`run.mjs` 68/68 + `ocv5-185` 15/15；biome 新增 0；**NOT RUN** 截图（零视觉改动）、慢网首开体感 | `feat/v5-selfhost-audit-budget-fix@65019b5dc`（+2；集成⑤ 1/8 `ec09ed419`） | [archive/leftover.md](./archive/leftover.md) §3 · [shell.md](./shell.md) §9 |
+| t-1575 集成⑤阻断·leftover-tut 深链把教程案例数据拖进首屏 | 集成⑤预演树 `b6b78e876` `build` ❌ 475.2KB；指挥官逐合并点二分归因到 leftover-tut `3fee24a58`：`useAppRoute.ts` 静态 `import SIGNATURE_WORKS` 把 `tutorialSignatureWorks → tutorialCaseCatalog` 拖进入口闭包（`useAppRoute` chunk 1.7 → 30.7KB）；QA t-1236 同登记为 B-2 集成⑤ 必修 | 1/1：新增零依赖 `lib/tutorialSignatureWorkIds.ts`（id 表 + 类型），`useAppRoute` 改引它，`SignatureWork.id` 反向受类型约束，`tutorialSignatureWorkIds.test.ts` 断言两表集合相等；4 files +50/−5，`useAppRoute` 2.0KB | 集成⑤ 第 5 步紧跟合入后 integration `build` ✅ **447.8KB / 余量 12.2KB**（INTEGRATION 集成⑤ §3 / §5）；新增用例计入集成⑤ vitest 305 / 4306；**NOT RUN**（归档作者）分支自跑门日志未单列 | `feat/v5-selfhost-audit-leftover-tut-budget@a947662bb`（+1；集成⑤ 5/8 `10e1348fb`） | [archive/leftover.md](./archive/leftover.md) §4 · [INTEGRATION.md](./INTEGRATION.md) 集成⑤ §3 |
+| t-1236 QA·集成④ 最终 HEAD `c97a750f8` 独立复核（分工：三道门实跑 fable-5-1-3 t-1567 代 t-1512 · 截图抽样 + §8 状态单 fable-5-1-3 t-1524 · 二次复算 / 登记核对 / 合成关单 fable-5-1-6） | 对 INTEGRATION 集成④ §5 / §7 / §8 逐项独立核；报告 §0 如实点出「任务书要求 QA 本人跑三道门，实际按指挥官安排分工、各自留日志」 | 三道门 + 三附加门与集成④ 登记**逐条一致，新增红 0**（唯二红 = `cc-switch-ascii-name` ×2 基线；`build` ❌ 471.4KB 已知红数值相同）；§8 状态单 **24/24** 无漂移（两次独立计算）；截图 13 场景 52 张**新增阻断 0**（K-1…K-5 = a11y-c / qa-a11y / leftover-shell 已修待合，O-5 为场景构造问题）；source-only 登记 67 / 68 / 69 与 history 一致、入口身份变化 0；**P1 0 / P2 0 / P3 8**（5 已修待合 + O-1 / O-2 / O-3 观感登记）+ 工具项 2 + 已知 2（B-1 budget-fix、**B-2 → t-1575**）；QA 直接修 0。**结论：可进集成⑤，阻断 0；必带 budget-fix + t-1575** | typecheck ✅ · `typecheck:preview` ✅ · `check:tutorials` ✅ 26 / 12 / 26 · vitest **302 文件 / 4279 例 / 0 失败**（`--maxWorkers=2` 376s，无 timeout）· `run.mjs` 68 全过 + `node --test` 87 例 85 / 2 · `build` ❌ 471.4KB（R1）；主克隆只读 `git status` 前后逐字一致；日志 `.audit-tmp\qa-integ4\t1567-*.log`、截图 `shots\` 52 张 + `manifest` failures 0 | `feat/v5-selfhost-audit-qa-integ4@31a8a92d6`（+1，纯文档；集成⑤ 8/8 `936d44e85`） | [archive/qa.md](./archive/qa.md) §5 · [qa/qa-integ4.md](./qa/qa-integ4.md) |
+| t-1237 集成⑤ | 8 步 `--no-ff` 合入上表 6 支 + t-1575 + qa-integ4，source-only accept `91358ce54`，记录 `9103ce7b4`，已推 integration（指挥官 fable-5-1-4 代执行 01:45–02:15） | **任务未验收闭合**：账本在跑（fable-5-1-35 接手），全量门下半场 integ5-gate2 阻塞 | 上半场全绿（build 447.8KB · vitest 305 / 4306 · `run.mjs` 68 · biome 新增 0）；下半场截图 + a11y 复扫**未跑** | integration `9103ce7b4`（源码态 `91358ce54`） | **§4.3 预留** · [archive/release.md](./archive/release.md) §5 · [INTEGRATION.md](./INTEGRATION.md) 集成⑤ |
 
-## 4. 集成④ 合入记录与集成⑤ 待合清单
+### 3.2 预演与发布前置（已完成 · 结论以文档带入，预演分支不合入）
+
+| 任务 | 内容 | 结论 | 验证摘要 | 分支 @ HEAD | 摘要 / 正文 |
+|---|---|---|---|---|---|
+| t-1279 发布预演 + 运行手册（fable-5-1-34 初稿 → fable-5-1-4 v2 / v2.1） | canonical `3b7c38b9d` → `f1952819f` 试合 integration 集成④ 源码态；服务器只读实测；RELEASE.md §0–§6 + 附录 | **7 处冲突**（4 源码 + 3 `tutorial-sync*`）解法 `d02cc7c5d`；R2 canonical 8 处旧测试文案漂移 `c1fdc935e`；R0 canonical `f1952819f` 带迁移 0281（破坏性 DDL）→ v2.1 实测 live 已是 `f1952819f`、0281 已 apply → **`HAS_MIGRATION=0` 不需放行开关**；R3 canonical 侧 incident-regressions FAIL 不阻断 selfhost；磁盘 87% 余 26.6 GiB 门过；无 open train | v2 全门（typecheck / preview / tutorials / `lint:migration-order` 283 支 · 161 条 / `test:protocol` 14/14 / vitest 9 文件 295 例 / build ✅ 447.3KB 余量 12.7KB / trailer PASS）；无 budget-fix 对照 ❌ 471.9KB；`cursorCliWrapper.test` 55/57 Windows 假阳性；**NOT RUN** `test:browser`、commercial integ（需 PG） | `feat/v5-selfhost-audit-release-rehearsal@a4452c7b6`（初稿 `c1fdc935e`；不合入，手册由 t-1268 带入） | [archive/release.md](./archive/release.md) §1 · [RELEASE.md](./RELEASE.md) |
+| t-1503 集成⑤预演（fable-5-1-2） | 从 `c97a750f8` 以 `rehearsal:` 合并试合 6 条待合分支 | 合并顺序与唯一冲突（`RichBlocks.test.tsx` 两条用例全保留）被集成⑤ 沿用；**`build` ❌ 475.2KB** → 指挥官二分归因（`586131c42` + leftover-tut 一步从 447.3 跳到 475.2KB）→ t-1575 | typecheck ✅；build ❌（数值）；纯预演树 `check:tutorials` 报 `agents / billing-usage` 漂移（集成⑤ 处置） | `feat/v5-selfhost-audit-integ5-rehearsal@b6b78e876`（未推；不合入） | [archive/release.md](./archive/release.md) §2 · [INTEGRATION.md](./INTEGRATION.md) 集成⑤ §3 |
+| t-1598 发布准备预演（fable-5-1-6，RELEASE.md v2.2 §3.1b） | 集成⑤预期树 `fc5c4f075`（`b6b78e876` + t-1575 + qa-integ4）实合 canonical `f1952819f` | 同 7 处冲突，实解 **`b96cb194f`**（正式 release-prep 重放取此 SHA，替代 `d02cc7c5d`：叠 a11y-C「默认」徽章 3 行）；**教程门两段式**（先在集成⑤树 `--source-only --ids agents,billing-usage`，再合 canonical 普通 accept `advisor-mode`） | typecheck ✅ · preview ✅ · tutorials ✅ · `lint:migration-order` ✅ · `test:protocol` 14/14 · vitest **27 文件 547 例** ✅ · build ✅ **448.3KB / 余量 11.7KB** · trailer PASS；**NOT RUN** `test:browser`、gateway / commercial 单测、commercial integ | `feat/v5-selfhost-audit-release-prep-rehearsal@e75749dd0`（不合入） | [archive/release.md](./archive/release.md) §3 · [RELEASE.md](./RELEASE.md) §3.1b |
+| t-1455 发布前置·v3-dev-sg 磁盘核查与安全清理 | 服务器 `/` 盘 94%（09-17 d-1326）→ 87%（09-18 00:56 只读实测，S10 ≥ 8 GiB 门过）→ **76%**（d-1603 登记） | ≤ 85% 目标达；`.prev-release` `rel-3b7c38b9d-20260915-073032` 保留为回滚点 | **NOT RUN**（归档作者）：本机无服务器通道未复核现值；清理明细待指挥官交付摘要（阶段②） | —（服务器操作） | [archive/release.md](./archive/release.md) §4 · [RELEASE.md](./RELEASE.md) §2.2b S10 |
+
+## 4. 集成④ 合入记录、集成⑤ 合入状态与集成⑤ / 发布线预留章节
 
 ### 4.1 集成④（t-896，`36bb9a677` → `c97a750f8`；执行 fable-5-1-24 → 收尾 fable-5-1-52）
 
@@ -87,19 +97,51 @@
 
 自有提交：`d2afaaa20` test（scenes-hud TS2353，后被 #9 覆盖）· `4a2745283` feat App 接线（hud H-18 `onStop` 条件化、misc-p3 D-02 demo 会话按 id 取 fixture）· `2d2b5cafc` chore 教程同步快照 `--source-only` accept 1 项（q-1227 → A，§7-1）· `c97a750f8` docs 记录。合计 125 files, +7783/−654；`git rev-list --count HEAD..<成员 HEAD>` 12 条均为 0，合并完整性 LOST = 0，五处三方合并逐文件对照无丢失；全部 subject 无 `fix(v5)`，未 rebase / squash / force-push。远端：`git ls-remote` = 本地 `c97a750f8`（快进 `36bb9a677..c97a750f8`，集成④ 全部 81 个提交）。详见 [INTEGRATION.md 集成④](./INTEGRATION.md)。
 
-### 4.2 集成⑤ 待合清单（t-1237 前置；09-18 00:3x 按 `git rev-list --count c97a750f8..<分支>` 现算）
+### 4.2 集成⑤ 合入状态（09-18 00:3x 待合清单按 `c97a750f8..<分支>` 现算 → 09-18 21:xx 按 integration `aeae1d72e` 复核）
 
-| 分支 `feat/v5-selfhost-audit-*` @ HEAD | 任务 | 未合入 | 远端 | 合入提示 |
-|---|---|---|---|---|
-| `qa-a11y@eed1f3989` | t-1232 | 2 | = 本地 | `77a93d9e1` 4 文件 + 报告；`merge-tree` 试合 `2d2b5cafc` 无冲突 |
-| `a11y-c@c35fd00c6` | t-1233（已交付；t-1344 第四手复核 `ea9348b2b`） | 18（11 自有 + 7 对齐合并） | = 本地 | 基线 `36bb9a677` + a11y-shell / mod-a / mod-b / kp-automation / misc-p3 / tut-sync-2 / qa-gap 七支对齐合并（与集成④ 内容相同，预期零冲突）；全量 `npm test` 交集成⑤ |
-| `leftover-tut@69e18aa93` | t-1235 | 3 | = 本地 | 基于 `tut-sync-2@67b1494ea`；`App.tsx` / `useAppRoute.ts` 与下两支同文件不同 hunk，留意三方合并 |
-| `leftover-shell@7e7c7e43b` | t-1234 | 6 | = 本地 | 基于 `2d2b5cafc`；`App.tsx` 一处（D-08） |
-| `budget-fix@65019b5dc` | t-1348 | 2 | = 本地 | 基于 `2d2b5cafc`；`App.tsx` lazy 改造较大；**合入后 `npm run build` 必须绿（发布门）** |
-| `archive-final`（本分支，§9） | t-897 | 本轮 docs 提交 + 已带入 `archive@35e3ec7c9` | 交付时推送 | 纯文档（`SUMMARY.md` + `archive/`）；`archive` 分支不必再单独合入 |
-| ~~`integ4-rehearsal@522c24988`~~ / ~~`release-rehearsal@c1fdc935e`~~ | 集成④ 预演 / t-1279 发布预演 | 8 / 8 | 未推 | **不合入**：前者 8 个 `rehearsal:` 合并；后者 canonical `3b7c38b9d` 试合 `2d2b5cafc` 的 7 处冲突解法与普通 `tutorials:accept` 第 70 条，结论供 release-prep 以 canonical `f1952819f` 重做核对 |
+| 分支 `feat/v5-selfhost-audit-*` @ HEAD | 任务 | 00:3x 未合入 | 集成⑤ 合并提交（序 / 文件 · 行） | 21:xx `rev-list --count aeae1d72e..` | 远端 | 备注 |
+|---|---|---|---|---|---|---|
+| `budget-fix@65019b5dc` | t-1348 | 2 | 1/8 **`ec09ed419`**（12, +323/−142） | 0 | = 本地 | `App.tsx` 三方自动合并；**发布门** build 转绿（§4.3） |
+| `qa-a11y@eed1f3989` | t-1232 | 2 | 2/8 **`c701daac9`**（5, +222/−4） | 0 | = 本地 | 零重叠 |
+| `leftover-shell@7e7c7e43b` | t-1234 | 6 | 3/8 **`7cae5427f`**（18, +659/−85） | 0 | = 本地 | 零重叠 |
+| `leftover-tut@69e18aa93` | t-1235 | 3 | 4/8 **`c4a516697`**（10, +529/−28） | 0 | = 本地 | 引入首屏回归（§3 / §3.1 t-1575），第 5 步修正 |
+| `leftover-tut-budget@a947662bb` | t-1575（00:3x 尚未立项） | — | 5/8 **`10e1348fb`**（4, +50/−5） | 0 | = 本地 | `useAppRoute` chunk 30.7 → 2.0KB |
+| `a11y-c@c35fd00c6` | t-1233（t-1344 第四手复核 `ea9348b2b`） | 18（11 自有 + 7 对齐合并） | 6/8 **`ecf912b88`**（17, +312/−14） | 0 | = 本地 | **集成⑤ 唯一冲突** `RichBlocks.test.tsx`（D-08 用例 ↔ `text-accent-fg` 用例同位）两条全保留，与 t-1503 预演解法一致 |
+| `archive@35e3ec7c9` | t-632 / t-761 / t-897 预写 | 1 | 7/8 **`b6da4ef8d`**（1, +19/−13） | 0 | = 本地 | 本分支 archive-final 已带入同一提交（`e01791796`） |
+| `qa-integ4@31a8a92d6` | t-1236（00:3x 待领） | — | 8/8 **`936d44e85`**（1, +153） | 0 | = 本地 | 纯文档 |
+| `archive-final`（本分支，§9） | t-897 | 本轮 docs 提交 | **待合入** | 阶段① 提交数见 §9 | 阶段① 推送 | 纯文档（`SUMMARY.md` / `FINAL-REVIEW.md` / `archive/`）；已对齐合并 `aeae1d72e`，合入 integration 预期零冲突；`archive` 分支不必再单独合入 |
+| ~~`integ4-rehearsal@522c24988`~~ · ~~`integ5-rehearsal@b6b78e876`~~ · ~~`release-rehearsal@a4452c7b6`~~ · ~~`release-prep-rehearsal@e75749dd0`~~ | 集成④ 预演 / t-1503 / t-1279 / t-1598 | 8 / 6 / — / — | — | — | 前两条未推，后两条已推 | **不合入**：结论已进 INTEGRATION.md 集成⑤（合入顺序、冲突解法、首屏二分）与 RELEASE.md（7 处冲突解法 `b96cb194f`、教程门两段式、门数值） |
 
-集成⑤ 之后（不在本归档范围，按 d-1326 / d-1450 由指挥官全权推进）：release-prep（integration 合并 canonical `feat/v5-selfhost@f1952819f`，基线之后上游 7 提交：OCV5-220 顾问卡 / OCV5-223 Codex 1M 双胞胎 / Sand 家族接入选择器）→ release-deploy（push canonical + 服务器 `/opt/openclaude/openclaude-v5-selfhost` `deploy-v5-selfhost.sh --preflight/--deploy/--smoke`；服务器 `/` 盘 94% 的磁盘核查 disk-prep 在跑）。
+八步合计 `git diff --shortstat c97a750f8..936d44e85` 64 files, +2269/−292，43 提交；`git grep -l '^<<<<<<< '` 为空；自有提交 `91358ce54` chore（source-only accept，§7-1）、`9103ce7b4` docs。集成⑤ 之后的发布线在 §4.4 / §4.5 预留。
+
+### 4.3 【预留 · 阶段②填】集成⑤（t-1237 · 起点 `c97a750f8` · 指挥官 fable-5-1-4 代执行 01:45–02:15 → 账本由 fable-5-1-35 接手）
+
+> 任务在待办池解锁时被宿主自动领到已离线的 fable-5-1-3 名下，组内在线只剩指挥官与 fable-5-1-6，用户 02:0x「全权负责……都不要停」（d-1603）→ 指挥官代执行合并 / 门 / 记录 / 推送；记录 [INTEGRATION.md 集成⑤](./INTEGRATION.md)（`9103ce7b4`）。**验收未闭合**：账本 integ5 在跑、全量门下半场 integ5-gate2 阻塞。本节只登记 `git` 事实，结论字段留 TODO。
+
+| 项 | 已核事实（09-18 21:xx，integration `aeae1d72e`） |
+|---|---|
+| 合并 | 8 步 `--no-ff`（§4.2 表）；`rev-list --count` 对 8 条成员 HEAD 均 0；未 rebase / squash / force-push；subject 无 `fix(v5)` |
+| 冲突 | 唯一 `RichBlocks.test.tsx`（a11y-c ↔ leftover-shell），两条用例全保留，合并后该文件 vitest 25/25；`App.tsx` 第 1 步三方自动合并 |
+| 首屏回归专项 | 预演树 475.2KB ❌ → 二分归因 leftover-tut（`useAppRoute` 1.7 → 30.7KB）→ t-1575 `a947662bb` 第 5 步合入 → **`build` ✅ 447.8KB（458555 B），余量 12.2KB**（§3.1 / archive/leftover.md §4） |
+| `check:tutorials` | 8 步合完报 `agents / billing-usage` 功能源漂移（a11y-C `AgentPicker` / `OrgSubscribeDialog`、budget-fix `SubscriptionDialog` className / lazy 改动致；入口身份 0 变化）→ `--source-only` accept **`91358ce54`**（history 第 70 条，**待用户终审**，§7-1；可逆 `git revert 91358ce54`） |
+| 全量门 · 上半场（源码态 `91358ce54`；`.audit-tmp\integration\integ5\GATES-SUMMARY.txt`） | typecheck ✅ 29s · `typecheck:preview` ✅ 19s · `check:tutorials` ✅ 26 / 12 / 26 · **`build` ✅** 5108 modules，13 chunk 447.8KB · **`npm test` 305 文件 / 4306 例全部通过**（集成④ 302 / 4279 → +3 文件 `OrgSubscribeDialog.test` / `ui/Checkbox.test` / `tutorialSignatureWorkIds.test`，+27 例；`--maxWorkers=2` 339s）· `test:browser` `run.mjs` 68 全过 + `node --test` 87 例 85 / 2（`cc-switch-ascii-name` ×2 基线，五轮逐条相同）· biome 52 个改动源文件 HEAD vs `c97a750f8` **lint 新增 0**（5 条 `format` 差异全在本轮新增文件，为 Windows 工作树 CRLF 与 formatter 判定差异，blob 为 `i/lf`） |
+| 全量门 · 下半场 | ui-preview 全量截图（≥ 301 场景）+ a11y 复扫（`scan.mjs` + compare vs 集成④）：**未跑**（集成⑤段 §5「第二拍」；t-1236 / t-1524 52 张抽样与 a11y-C 288 场景复扫已覆盖本轮改动面，但不替代全量） |
+| 状态单 | 集成④ 24 条仍 0；本轮 8 条见 §4.2；远端 = 本地 |
+
+- TODO（阶段②）：□ 下半场截图张数 / failures / 九项 a11y 指标 vs 集成④ 1026 张 · 301 场景 □ 集成⑤ 终点 HEAD 与验收结论、关单人 □ `[待集成⑤]` 状态全量翻转（§3 / §3.1 / §5.2 / §9 与 `archive/*.md`）□ 若 fable-5-1-35 补跑门后数值有变，以其记录为准回写本节。
+
+### 4.4 【预留 · 阶段②填】发布准备（t-1268 · integration 合 canonical + 门 + canonical ff / push）
+
+> 已核事实（[RELEASE.md §3.1c](./RELEASE.md)，fable-5-1-6 接任指挥官后代执行 09-18 02:1x–02:2x；fable-5-1-4 起合并遇 7 处冲突后掉线，接任者按 §3.1b 逐字重放）：**`57ad2c823`** merge canonical `feat/v5-selfhost@f1952819f`（parents `9103ce7b4` / `f1952819f`；4 源码文件 `git checkout b96cb194f --`，3 个 `tutorial-sync*` `--ours` 后普通 accept `advisor-mode` = history **第 71 条**）→ `04ba13b2e` cherry-pick R2 `c1fdc935e` → **`aeae1d72e`** RELEASE.md v2.2 + §3.1c = `<INT>`，已推 origin。门（HEAD `04ba13b2e`，`.audit-tmp\release-deploy\gates-int\`）：typecheck ✅ · preview ✅ · `check:tutorials` ✅ · `lint:migration-order` ✅ 283 支 · 161 条 · `test:protocol` 14/14 · vitest **29 文件 583 例** ✅ · `build` ✅ **448.3KB（459061 B）≤ 460.0KB，余量 11.7KB**（与 t-1598 预演逐字节相同）· trailer ✅ PASS；**NOT RUN** `test:browser`、gateway / commercial 单测、commercial integ（服务器 / CI 复跑）。
+> **未做**：§3.3 canonical `--ff-only` + push。`git ls-remote`（09-18 21:xx）：`origin/feat/v5-selfhost` = **`97f128d2b`**（`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`，`f1952819f` 之后上游又 +1），integration 未含 → 发布准备需以 `97f128d2b` 重做 §1.1 `merge-tree` 冲突核对与 §3.2 门后再 ff / push。账本：release-prep 阻塞（等 integ5）。
+
+- TODO（阶段②）：□ 合入 `97f128d2b`（或更新）的合并提交 / 冲突集合 / 门复跑数值 □ `<INT>` 终值、`<REL>` □ push 时间与 `git rev-parse origin/feat/v5-selfhost == <REL>` □ history 条数终值 □ t-1268 验收结论。
+
+### 4.5 【预留 · 阶段②填】发布执行（t-1269 · 服务器 `/opt/openclaude/openclaude-v5-selfhost`，root@38.55.252.217 v3-dev-sg，[RELEASE.md §4](./RELEASE.md)）
+
+> 已知前置：live = `rel-f1952819f-20260917-082520`（sourceCommit `f1952819f`），`schema_migrations` 已含 0281 → 预期 `HAS_MIGRATION=0`、不加 `OC_V5_ALLOW_BREAKING_MIGRATION`；磁盘 76%（t-1455，§3.2）；`--preflight` 为首装门不在 live 实例上跑（d-1603 ④）；不可逆动作由指挥官代批（d-1326 / d-1603）；个人版 `openclaude.service` / 18789 / Redis db0 不碰。账本：release-deploy 阻塞（等 release-prep）；disk-prep 在跑。**未开始。**
+
+- TODO（阶段②，按 RELEASE.md §6 发布记录模板）：□ §4.0 前值（`<OLD_HEAD>` / `<OLD_REL>` / `<OLD_PREV>` / `<OLD_BUILD>` / runtime-release / platform bundle / lease / 磁盘）□ `git fetch` + `--ff-only` 到 `<REL>` □ `--status` / `--smoke` 前值 □ `--deploy --dry-run` 计划（HAS_MIGRATION 实值）□ `--deploy` 结果（`rel-<REL>-<ts>`、耗时、补偿与否）□ `--smoke` / `--status` 后值 □ §4.8 浏览器功能验证 □ 回滚点 □ t-1269 验收结论 □ 用户是否在发布前叫停（§7-7）。
 
 ## 5. 遗留清单（逐条带归属与原因）
 
@@ -144,7 +186,10 @@
 | permission-card | 自动弹框关闭后焦点落 `document.body`；「正在提交…」无超时 / 重试 | ⏸ shell 接 `Modal onCloseAutoFocus` 一行；协调器 / `lib/chat` 状态机 |
 | QA t-1232 观察项（P3 nit） | `KnowledgePlanetAutomationPanel`「从当前账号已加入的星球中选择」316×42 · `PublishPanel` `MyPublishes` 折叠钮 322×42 · `RepoStatusBanner:85` 关闭钮 `opacity-70` | ⏸ kp-automation / market / sidebar owner，各一行 `min-h-11` / `text-muted` |
 | a11y-C 顺带 | `ContainerWebPreview.tsx:1345/1403/1775` `text-white/35`（预览场景未渲染未命中） | ⏸ media owner 顺手 |
-| 首屏预算 | 下次逼近 460KB 时的可拆候选：专项工具卡体 ≈18KB · `lib/taskboard.ts` ≈3.3KB · `@openclaude/protocol` + typebox ≈30KB（需改 `packages/protocol` 导出，PLAYBOOK §9 范围外）· `PermissionCard` ≈5.7KB | 登记，`shell.md` §9.4 |
+| 首屏预算 | 下次逼近 460KB 时的可拆候选：专项工具卡体 ≈18KB · `lib/taskboard.ts` ≈3.3KB · `@openclaude/protocol` + typebox ≈30KB（需改 `packages/protocol` 导出，PLAYBOOK §9 范围外）· `PermissionCard` ≈5.7KB；集成⑤ 后余量 12.2KB、合 canonical 后 11.7KB | 登记，`shell.md` §9.4；`vite.config.ts:77-87` 已有「useAppRoute 别拖教程案例数据」注释（t-1575 重申） |
+| QA t-1236 观感项（P3，不阻断） | O-1 hud `PinnedTaskTracker` / `PinnedDelegateTracker` 到 max-height 末行裁半行、无渐隐 · O-2 permission-card 命令块 `break-all` 把 `diff` 拆成 `d\|iff` · O-3 `Composer` textarea 达 max-height 底边裁半行 | ⏸ hud / permission-card / composer owner 各一行（渐隐遮罩或整行吸附 / `overflow-wrap:anywhere` / 底部内边距），`qa/qa-integ4.md` §7 |
+| QA t-1236 工具·场景项（非产品缺陷） | O-4 `scenes-kp-automation.tsx` `kp-automation-new-picker` 星球选择器 Popover 未入图 · O-5 `scenes-workspace.tsx:45,86` `workspace-chat-density` 把 `<Sidebar>` 行内固定并开 mobile 视口，390px 主列被挤到 ~100px | ⏸ 场景加 clip 覆盖 / 改 `viewports: ['desktop']` 或换 App 壳组合；不改产品代码 |
+| 集成⑤ biome `format` | 5 个本轮新增文件（`heroTheme.ts` / `ui/Checkbox.tsx` / `ui/Checkbox.test.tsx` / `hooks/useAppRoute.test.ts` / `scenes-market-audit.tsx`）在 Windows 工作树按 CRLF 判定报 format 差异，blob 为 LF | ⏸ 如需消掉在 Linux 或 `--line-ending=lf` 跑 `biome format --write`，与逻辑无关（INTEGRATION 集成⑤ §7） |
 
 ### 5.3 产品口径 / 设计取舍（先问再改）
 
@@ -162,26 +207,31 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 | d-26（git） | 提交 subject 禁 `fix(v5)`，改用 `feat / refactor / style / test / docs(v5)`；不碰 `changelog.json` | 全部提交 |
 | d-28（ui） | UI 审计以 ui-preview 截图台为主要证据，每模块 before / after 各一套 | 全部审计 / 修复 / QA 的证据形态 |
 | d-1326（release） | 用户 09-17 03:5x「目标是端到端部署上线……你全权负责」：push integration → canonical 与服务器 `deploy-v5-selfhost.sh --deploy` 两项不可逆动作由指挥官代批，成员 `request_action_approval` / `ask_decision` 由指挥官 resolve；发布通道 root@38.55.252.217（v3-dev-sg）SSH 密钥已验证；服务器 `/` 盘 94% 需先核查 | 发布线 t-1237 / t-1268 / t-1269 |
-| d-1450（release） | 用户 09-17 22:5x 在线再次确认「全权负责，尽快搞完上线」；持有人离线的超时原单由指挥官改派在线成员在原 id 下交付；僵尸替身单 t-1334 不交付 | 集成④ 收尾、a11y-C / QA-a11y 接手链、本归档终稿 |
+| d-1450（release，已被 d-1603 替代） | 用户 09-17 22:5x 在线再次确认「全权负责，尽快搞完上线」；持有人离线的超时原单由指挥官改派在线成员在原 id 下交付；僵尸替身单 t-1334 不交付 | 集成④ 收尾、a11y-C / QA-a11y 接手链、本归档终稿 |
+| d-1603（release） | 用户 09-18 02:0x 对新指挥官 fable-5-1-4 重申「全权负责，端到端部署上线，不用问我」：沿用 d-1326 / d-1450 全部口径（push canonical 与服务器 `--deploy` 由指挥官代批，不再向用户确认）；人手不足可 `spawn_session` 补位；服务器现状 live = `rel-f1952819f-20260917-082520`、0281 已 apply → 本次 `HAS_MIGRATION=0`；磁盘 76%（t-1455）；发布序列以 RELEASE.md v2.1+ 为准，`--preflight` 是首装门不在 live 实例上跑；红线不变（个人版 18789 / Redis db0 不碰、不 force-push、禁 `fix(v5)`） | 集成⑤ 由指挥官代执行（§4.3）、release-prep / release-deploy（§4.4 / §4.5） |
+| 集成⑤ source-only accept（指挥官 fable-5-1-4 按 q-1227 口径代确认，**待用户终审**） | `91358ce54`：`agents / billing-usage` 2 项功能源漂移（a11y-C / budget-fix / leftover-shell 的 className / lazy 改动致，入口身份 0 变化）`--source-only` 接受，history 第 70 条 | **必列终审导读**（§7-1） |
+| release-prep 普通 accept（上游内容） | `57ad2c823` 内 `advisor-mode` 注册表 / 功能源 / 正文变化 = canonical OCV5-220 顾问卡文案 v4，普通 `tutorials:accept`，history 第 71 条 | 列入导读供知悉（上游变更，非审计侧） |
 | q-786 | 归档摘要落 `docs/audit/archive/`，摘要 + 索引不复制正文，SHA 逐个核存在 | t-761 / t-632 / t-897 |
 | q-979 → `fix_in_integ3` | `check:tutorials` 入口覆盖两处存量漏标（ChatHeader「导出会话」、Sidebar「清除搜索」）在集成③ 补 `data-product-control` | `c034f05d7` |
 | q-988 → `accept_in_integ3` | 教程同步快照 17 + 2 漂移在集成③ accept，附抄检 / note / 清单三条要求 | 引出 q-1076 |
 | q-1076 → A `demote_then_source_only`（fable-5-1-18 拍板，**代用户确认**） | composer-B 新增的「去授权」「排队发送」两处 `data-product-feature` 降级为 `data-product-control`（`29a277b25`）+ `tutorials:accept --source-only --ids <17 项>`（`b249317f4`） | **必列终审导读**（§7-1） |
 | q-1227 → A（fable-5-1-18 拍板，**代用户确认**） | 集成④ 合入范围追加 tut-sync-2 / qa-gap / qa-p3 / qa-b-p3 / archive 五支；`scenes-hud.tsx` 冲突取 qa-gap；凡 a11y / 样式改动引起、入口身份无变、正文与 UI 文案抄检一致的功能源漂移统一 `--source-only` 接受（`2d2b5cafc`，`github-repository` 1 项） | **必列终审导读**（§7-1） |
 
-## 7. 终审导读（需用户过目 / 确认）
+## 7. 终审导读（需用户过目 / 确认；30 分钟单页版见 [FINAL-REVIEW.md](./FINAL-REVIEW.md)）
 
-1. **教程同步快照 accept 三笔（指挥官代用户确认，可逆）**。TU-37 修好后 `check:tutorials` 在 Windows 首次真跑到底，一次性暴露 B 阶段各模块对入口元素的 UI/UX 修改导致的功能源哈希漂移：
+1. **教程同步快照 accept 四笔（指挥官代用户确认，可逆）**。TU-37 修好后 `check:tutorials` 在 Windows 首次真跑到底，一次性暴露 B 阶段各模块对入口元素的 UI/UX 修改导致的功能源哈希漂移：
    - **集成③ q-988 → q-1076 → A**：17 项功能源漂移 + 2 项入口身份变化 → 两处新入口降级为控件（`29a277b25`，UI 零变化）+ `--source-only` accept（`b249317f4`，`tutorial-sync-history.jsonl` 第 67 条 note「待用户终审」）。抄检两篇教程正文引用的入口文案与 HEAD 逐条一致；唯一不一致（正文未描述这两个新入口）→ **t-1046 已补写并恢复**（`e798c3123`：agents v5 / chat-basics v9 抬版，两处 `data-product-feature` 恢复，普通 `tutorials:accept`，history 第 68 条），随集成④ `96eb0eadf` 合入，q-1076 闭环。详见 [INTEGRATION.md 集成③ §4](./INTEGRATION.md)。
    - **集成④ q-1227 → A**：合入 a11y 三支后 `check:tutorials` 再报 `github-repository` 功能源漂移 1 项——哈希覆盖 `RepoPill` / `RepoStatusBanner` / `Sidebar`，改动全部来自 a11y-mod-a `036a2f3dd` 的 opacity → 实色，无任何用户可见文案增删、入口身份不变、正文 / 媒体未动 → `--source-only` accept（`2d2b5cafc`，history 第 69 条，note 注明「由指挥官 fable-5-1-18 代用户确认，待用户终审」）。详见 [INTEGRATION.md 集成④ §4](./INTEGRATION.md)。
-   - **不认可怎么退**：集成④ 一笔 `git revert 2d2b5cafc`（`check:tutorials` 重新报 github-repository 1 项，其余门不受影响）；集成③ 一笔 `git revert b249317f4 29a277b25`（合入 t-1046 后需连带 revert `e798c3123`）。
-   - 提示：release-prep 试合 canonical 上游时预演分支曾需再做一次普通 accept（第 70 条，未合入）；正式 release-prep 若再出现，仍按同一口径列入发布记录。
+   - **集成⑤ → `91358ce54`（指挥官 fable-5-1-4 按 q-1227 口径代确认）**：8 步合完 `check:tutorials` 报 `agents / billing-usage` 功能源漂移 2 项——哈希覆盖 `AgentPicker.tsx`（a11y-C「默认」徽章 `text-accent-fg`）、`SubscriptionDialog.tsx`（budget-fix `React.lazy` 拆分）、`OrgSubscribeDialog.tsx`（a11y-C「当前」徽章），均为 className / 加载方式改动，无用户可见文案增删、入口身份变化 0 → `--source-only` accept（history 第 70 条）。详见 [INTEGRATION.md 集成⑤ §4](./INTEGRATION.md)。
+   - **不认可怎么退**：集成⑤ 一笔 `git revert 91358ce54`；集成④ 一笔 `git revert 2d2b5cafc`（`check:tutorials` 重新报 github-repository 1 项，其余门不受影响）；集成③ 一笔 `git revert b249317f4 29a277b25`（合入 t-1046 后需连带 revert `e798c3123`）。
+   - 提示：release-prep `57ad2c823` 合 canonical `f1952819f` 时按预演口径做了一次**普通** accept（`advisor-mode` 注册表 / 功能源 / 正文 = 上游 OCV5-220 顾问卡文案 v4，history 第 71 条）——这是接受上游内容变更的例行动作，非审计侧改动，列出供知悉；发布准备重合 `97f128d2b` 时若再出现，仍按同一口径列入发布记录。
 2. **2 条基线红（与本轮改动无关，四轮集成逐条相同）**：`browser-tests/cc-switch-ascii-name.node-test.mjs` ×2（settings `ApiKeysSection` 模型 id 断言 `expected 'gemini-3.8-flash' / actual 'sonnet-5'` + 「还没有 API Key」10s 超时；基线 `210b9967` 同样红）。`ocv5-185-qa` 在工作树干净 + junction 就位时 15/15 绿（集成④ / t-1348 均绿），已不算红。是否要在本轮之外修 cc-switch 基线，请拍板。
 3. **NOT RUN 汇总**：真机 iOS Safari / Android（全部模块）；读屏实机（NVDA / VoiceOver，a11y 以 CDP AX 树与 jsdom 断言替代）；真后端行为（登录 / 注册 / 支付回跳 / OAuth / 投稿 / 撤回 / WS 多标签 / 服务端版本比对 / 知识星球写接口 / 分享令牌）—— 本轮无 v5-dev 通道，全部以 api-stub 场景与单测桩覆盖；各模块 `npm test` 全量与 `test:browser` 在成员分支多为 NOT RUN（非高频面），由集成①②③④ 在 integration 统一跑（§8.1）；集成④ 之后的 a11y-C / leftover-shell / leftover-tut 全量 `npm test` NOT RUN（leftover 两支 `test:browser` 亦 NOT RUN，非高频面；a11y-C 已补跑 68/68），交集成⑤ 合并树统一跑（budget-fix 已自跑全量 302 / 4279 ✅）；慢网首开体感（t-1348 懒块）未在节流网络实测。
 4. **越界改动**（均经指挥官批准并在交付单列）：t-839 改 messages 归属 `RichBlocks.tsx`（OptionsBlock 注册改 `useLayoutEffect`、聚合判定读快照）与 `MarkdownImpl.tsx`（`components` `useMemo`，根因：每次渲染新造渲染器致富块整体重挂）；t-1029 改 settings 归属 `KnowledgePlanetAutomationPanel.tsx`（忙态改按键集合）；t-865 / 集成轮的 App 接线与原语扩展（`Sheet closeButton` opt-in、`MediaTaskCenter onReusePrompt`）；t-895 附录改 shell `App.test` / `AuthGate.test` 两行选择器（L-11）；t-1232 QA 直接修 market `PublishPanel` / `PermissionCard` 各一处 className（`77a93d9e1`）；t-1233 a11y-C `12275f27a` 仅格式化自己新增的用例；t-1348 触及 messages（`chat/media.tsx` / `cards.tsx` / `MarkdownImpl.test`）、settings（`SubscriptionDialog`）、sidebar（`ProjectRow`）——改 import / 抽常量 re-export / 测试等待方式，不改业务行为。
 5. **设计取舍待拍板**：shell S-08 / S-20；market K-12 二期取「换行」（非箭头）；tutorials TU-13 删 `MissionReplay` / TU-31 第 4 步改指「设定目标」已按指挥官拍板落地；TU-17 深链参数名 `view=` 改 `tab=`（与 `/board` 冲突，t-1235）；HUD H-19 保留既有交互；t-1348 选 A 方案拆动态 import 而非上调阈值；市场审核面 checkbox 16px 导致 1440 宽一行第 4 枚徽章折行（`flex-wrap` 既定行为，接受）。
 6. **需后端配合项**（§5.1）本轮一律未动，请决定是否另开后端专项。
-7. **发布门与发布线**：集成④ 终点 `build` 首屏 gzip 471.4KB > 460.0KB 为红（非基线），t-1348 已修到 445.5KB（阈值不动）——**集成⑤ 合入 budget-fix 后 `npm run build` 必须绿才可发布**。发布线（release-prep 合并 canonical `f1952819f` 上游 7 提交 → push canonical → 服务器 deploy）按 d-1326 / d-1450 由指挥官代批推进，不可逆动作两项（push canonical、`--deploy`）在用户授权范围内；服务器 `/` 盘 94% 需先清理（disk-prep 在跑）。终审若要在发布前叫停，请在 t-1237 集成⑤ 完成、release-deploy 开始前说。
+7. **发布门与发布线**：集成④ 终点 `build` 首屏 gzip 471.4KB > 460.0KB 为红（非基线）→ t-1348 修到 445.5KB（阈值不动）→ 集成⑤ 合入 leftover-tut 又冲到 475.2KB（预演暴露）→ t-1575 修回 → **集成⑤ 源码态 `91358ce54` `build` ✅ 447.8KB、合 canonical 后 `04ba13b2e` ✅ 448.3KB（余量 11.7KB）**，发布门已绿。发布线现状（§4.3–§4.5）：集成⑤ 8 步已在 integration 但任务未验收、全量门下半场（截图 + a11y 复扫）未跑；release-prep 已合 canonical `f1952819f` 并过门，但 **canonical ff / push 未做**，且远端 canonical 又前进到 `97f128d2b` 需重核；release-deploy 未开始；不可逆动作两项（push canonical、`--deploy`）按 d-1326 / d-1603 在用户授权范围内由指挥官代批；服务器 live 已是 `f1952819f`、0281 已 apply、磁盘 76%。**终审若要在发布前叫停，请在 release-deploy（t-1269）开始前说。**
+8. **本归档的阶段状态**：本文为阶段①草稿——集成③ 之后到 09-18 21:xx 全部已 done 任务已归入，集成⑤ / 发布线三章预留 TODO；阶段② 在 t-1237 / t-1268 / t-1269 交付后填齐并 `complete_task`。阶段① 未能自证的两处：t-1455 清理明细（服务器侧，等指挥官交付摘要）、集成⑤ 下半场门（未跑）。
 
 ## 8. 验证门汇总
 
@@ -200,6 +250,21 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 | `biome lint`（集成④ 自有提交触碰文件） | `App.tsx` 14 = 基线 14（`useExhaustiveDependencies`），`scenes-hud.tsx` 0 → 新增 0；各成员分支 biome 对照均报新增 0 |
 
 历史：集成③ 终点（`b249317f4`）typecheck / preview / `check:tutorials` ✅、`npm test` 298 / 4213 ×2、`run.mjs` 68 + `node --test` 70/73、截图 257 / 854 failures 0；集成② 227 / 734；集成① 118 / 350（各轮 INTEGRATION §5）。
+
+### 8.1b 集成⑤ 上半场 · 发布准备门（记录值转录自 INTEGRATION.md 集成⑤ §5 与 RELEASE.md §3.1c；t-1237 / t-1268 任务未验收，阶段② 补下半场与终值）
+
+| 门 | 集成⑤ 源码态 `91358ce54`（01:5x–02:1x，主克隆，`.audit-tmp\integration\integ5\`） | 发布准备 `04ba13b2e`（= `91358ce54` + canonical `f1952819f` + R2；02:1x–02:2x，`.audit-tmp\release-deploy\gates-int\`） | QA t-1236 / t-1567 独立实跑 `c97a750f8`（对照） |
+|---|---|---|---|
+| typecheck / `typecheck:preview` | ✅ 29s / ✅ 19s | ✅ 29s / ✅ 17s | ✅ / ✅ |
+| `check:tutorials` | ✅ 26 / 12 / 26（accept `91358ce54` 后，第 70 条） | ✅ 26 / 12 / 26（普通 accept `advisor-mode` 后，第 71 条） | ✅ 26 / 12 / 26 |
+| **`build` 首屏 gzip** | **✅ 447.8KB（458555 B）/ 13 chunk / 余量 12.2KB**（集成④ 471.4KB ❌ → t-1348 + t-1575） | **✅ 448.3KB（459061 B）/ 13 chunk / 余量 11.7KB**（与 t-1598 预演逐字节相同） | ❌ 471.4KB（R1 已知红，数值与集成④ 登记逐个相同） |
+| web-react vitest | **全量 305 文件 / 4306 例 ✅**（339s，+3 文件 / +27 例） | 目标集合 29 文件 583 例 ✅（80s；全量 NOT RUN） | **全量 302 / 4279 ✅**（376s） |
+| `test:browser` | `run.mjs` 68 全过；`node --test` 87 例 85 / 2（cc-switch 基线） | NOT RUN（服务器 / CI 复跑） | `run.mjs` 68 全过；87 例 85 / 2 |
+| `lint:migration-order` / `test:protocol` | —（本轮无迁移 / 协议改动） | ✅ 283 支 · 161 条 / ✅ 14/14（canonical 0281 与 `engineModels.ts`） | — |
+| Incident trailer 门 | — | ✅ PASS（起点 `e490e22af2cf`，冻结 tip 18，检查 45 条 `fix(v5)`） | — |
+| biome | 52 文件 lint 新增 0（5 format 差异 = 新文件 CRLF 判定） | — | — |
+| ui-preview 全量截图 / a11y 复扫 | **未跑（下半场，integ5-gate2 阻塞）** | — | 抽样 13 场景 52 张新增阻断 0（不替代全量） |
+| gateway / commercial 单测、`test:commercial:integ` | — | NOT RUN（Windows 假阳性 R6 / R9；integ 需 PG） | — |
 
 ### 8.2 各模块 / 专项交付时的验证（转录，NOT RUN 如实保留）
 
@@ -232,13 +297,18 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 | leftover-shell t-1234 | ✅ + `typecheck:preview` ✅ | ✅ 6 文件 92 例 + `App.test` 48/48 | NOT RUN（非高频面；CDP AX 脚本替代） | ✅ 22 / 30 张 | 全量（交集成⑤）、真机、真实 `?demo=1` 整页 |
 | leftover-tut t-1235 | ✅ + `typecheck:preview` ✅ + `check:tutorials` ✅ | ✅ 11 文件 132 例 | NOT RUN（非高频面） | ✅ 108 / 108 张 | 全量（交集成⑤）、真机 |
 | budget-fix t-1348 | ✅ + **`build` ✅ 445.5KB** | ✅ 15 文件 303 例 + **全量 302 / 4279** | ✅ 68/68；`ocv5-185` 15/15 | NOT RUN（零视觉改动） | 慢网首开体感 |
+| leftover-tut-budget t-1575 | ✅（集成⑤ 合并树） | ✅ 新增 `tutorialSignatureWorkIds.test.ts`，计入集成⑤ 305 / 4306 | ✅ 集成⑤ 68/68 | NOT RUN（零视觉改动） | 分支自跑门日志未单列（以集成⑤ §5 为准） |
+| QA t-1236 / t-1567 / t-1524（主克隆 `c97a750f8` 只读） | ✅ + `typecheck:preview` ✅ + `check:tutorials` ✅ | ✅ 全量 302 / 4279 / 0 失败 | ✅ 68/68；`node --test` 85/87 | ✅ 13 场景 52 张 failures 0（逐张 Read） | biome、ui-preview 全量、a11y 全量（有集成④ §5 记录 + t-1524 / t-1344 侧证） |
+| 发布预演 t-1279（预演分支 `f6572abb6` / v2.1） | ✅ + preview ✅ + tutorials ✅ + `lint:migration-order` ✅ + `test:protocol` 14/14 + **`build` ✅ 447.3KB** | ✅ 9 文件 295 例 | NOT RUN | — | `test:browser`、commercial integ（需 PG）、`cursorCliWrapper.test` 55/57 Windows 假阳性 |
+| 发布准备预演 t-1598（`addb87bd1`） | ✅ + preview ✅ + tutorials ✅ + `lint:migration-order` ✅ + `test:protocol` 14/14 + **`build` ✅ 448.3KB** + trailer PASS | ✅ 27 文件 547 例 | NOT RUN | — | `test:browser`、gateway / commercial 单测、commercial integ |
+| 集成⑤ t-1237（`91358ce54`）/ 发布准备 t-1268（`04ba13b2e`） | 见 §8.1b | 见 §8.1b | 见 §8.1b | **集成⑤ 下半场未跑** | 任务未验收，阶段② 回写 |
 
 ## 9. 分支 / 提交总表
 
-| 分支 | HEAD（本地 = 远端，09-18 00:3x `git ls-remote` 核对） | 用途 / 状态 |
+| 分支 | HEAD（本地 = 远端，09-18 21:xx `git ls-remote` 核对） | 用途 / 状态 |
 |---|---|---|
-| `feat/v5-selfhost`（canonical） | `f1952819f`（基线 `210b9967` 之后上游 7 提交，本轮未推进；release-prep 试合以此为准） | 基线 / 发布目标 |
-| `feat/v5-selfhost-ocv5-audit-ux` | **`c97a750f8`** | integration（集成①②③④）；集成⑤ 待做 |
+| `feat/v5-selfhost`（canonical，远端） | **`97f128d2b`**（`f1952819f` + 1：`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`，09-18 上游推进）；`f1952819f`（基线 `210b9967` 之后上游 7 提交）已由 release-prep `57ad2c823` 合入 integration，`97f128d2b` **未合** | 基线 / 发布目标；release-prep 需重核（§4.4） |
+| `feat/v5-selfhost-ocv5-audit-ux` | **`aeae1d72e`**（集成④ 终点 `c97a750f8` → 集成⑤ 源码态 `91358ce54` / 记录 `9103ce7b4` → canonical 合入 `57ad2c823` → R2 `04ba13b2e` → RELEASE.md v2.2 `aeae1d72e`） | integration（集成①②③④⑤ + 发布准备）；t-1237 / t-1268 任务未闭合；未 push canonical |
 | `feat/v5-selfhost-audit-shell` | `39697560b` | 模块（集成① 起点已含） |
 | `feat/v5-selfhost-audit-messages` | `2abe389a9` | 模块（集成①③） |
 | `feat/v5-selfhost-audit-composer` | `70d3db8b3` | 模块（集成②） |
@@ -260,28 +330,31 @@ kp-automation KP-18（骨架）/ KP-19（重拉星球列表）；settings SET-32
 | `feat/v5-selfhost-audit-qa-p3` / `-qa-b-p3` / `-qa-gap` | `3e640a85d` / `0ac949b2e` / `c1734aac6` | QA（集成④ `4f93f6990` / `f605df89f` / `902ade6e8`） |
 | `feat/v5-selfhost-audit-archive-prep` | `591c4cb70` | 归档摘要 t-761（已合入 archive 分支 `ac0db7c35`） |
 | `feat/v5-selfhost-audit-archive` | `35e3ec7c9`（`a38a093bf` 集成④ `b23955208`；+1 已带入本分支） | SUMMARY 初稿 + archive/ 预写（t-632 / t-897 预写） |
-| `feat/v5-selfhost-audit-qa-a11y` | `eed1f3989` | QA t-1232，**待集成⑤** |
-| `feat/v5-selfhost-audit-a11y-c` | `c35fd00c6` | a11y-C t-1233（含 t-1344 复核），**待集成⑤** |
-| `feat/v5-selfhost-audit-leftover-shell` | `7e7c7e43b` | t-1234，**待集成⑤** |
-| `feat/v5-selfhost-audit-leftover-tut` | `69e18aa93` | t-1235，**待集成⑤** |
-| `feat/v5-selfhost-audit-budget-fix` | `65019b5dc` | t-1348，**待集成⑤**（发布门） |
-| `feat/v5-selfhost-audit-archive-final`（本分支） | 基于 `c97a750f8` + 合并 `35e3ec7c9`（`e01791796`）+ 本轮 docs 提交（见 complete_task 交付） | 归档终稿 t-897，**待集成⑤**（纯文档） |
-| `feat/v5-selfhost-audit-integ4-rehearsal` / `-release-rehearsal` | `522c24988` / `c1fdc935e`（未推） | 预演，**不合入** |
+| `feat/v5-selfhost-audit-qa-a11y` | `eed1f3989` | QA t-1232；集成⑤ 2/8 `c701daac9`（任务口径「待集成⑤」= t-1237 未闭合，下同） |
+| `feat/v5-selfhost-audit-a11y-c` | `c35fd00c6` | a11y-C t-1233（含 t-1344 复核）；集成⑤ 6/8 `ecf912b88` |
+| `feat/v5-selfhost-audit-leftover-shell` | `7e7c7e43b` | t-1234；集成⑤ 3/8 `7cae5427f` |
+| `feat/v5-selfhost-audit-leftover-tut` | `69e18aa93` | t-1235；集成⑤ 4/8 `c4a516697` |
+| `feat/v5-selfhost-audit-leftover-tut-budget` | `a947662bb` | t-1575；集成⑤ 5/8 `10e1348fb` |
+| `feat/v5-selfhost-audit-budget-fix` | `65019b5dc` | t-1348；集成⑤ 1/8 `ec09ed419`（发布门，集成⑤ build ✅ 447.8KB） |
+| `feat/v5-selfhost-audit-qa-integ4` | `31a8a92d6` | QA t-1236（t-1512 / t-1524 / t-1567 分工）；集成⑤ 8/8 `936d44e85` |
+| `feat/v5-selfhost-audit-archive-final`（本分支） | 基于 `c97a750f8` + 合并 `archive@35e3ec7c9`（`e01791796`）+ 承接 fable-5-1-24 未提交稿 `867e241e1` + 对齐合并 integration `aeae1d72e`（`9836216db`）+ 阶段① docs 提交（HEAD 见 send_to / complete_task 交付） | 归档终稿 t-897 阶段①，**待合入 integration**（纯文档；合入预期零冲突） |
+| `feat/v5-selfhost-audit-integ4-rehearsal` / `-integ5-rehearsal` | `522c24988` / `b6b78e876`（均未推） | 集成④ / 集成⑤ 预演（t-1503），**不合入** |
+| `feat/v5-selfhost-audit-release-rehearsal` / `-release-prep-rehearsal` | `a4452c7b6`（初稿 `c1fdc935e`，v2.1）/ `e75749dd0`（v2.2）（均已推） | 发布预演 t-1279 / 发布准备预演 t-1598，**不合入**（RELEASE.md 由 t-1268 `aeae1d72e` 带入） |
 
-集成合并提交一览：集成① `3cff04c85` `09a13a472` `bf8188def` `985b3ae57`（记录 `43b7cd3a4`）；集成② `5e5ed6925` `6fa690d7e` `ab765669a` `6201518b2` `10398baa9` `b41e804ac` `ae0b0cb64`（接线 `19799c0fe` · 用例 `f7c08f3eb` · `.gitattributes` `419e0d218` · `2a6492774` · 记录 `1d8eaf769` / `2b23a31a7` · 集成待办 t-865 `e0f53688a` `d4b061e37` `a3af53970` `bae5a8673` `7d5573a92` 记录 `1e4328ac9`）；集成③ `12fc17579` `cd58600e8` `425655631` `c761bbd93` `be20adaec` `ce767d8ce`（接线 `bdf7b4d15` · q-979 `c034f05d7` · q-1076 `29a277b25` `b249317f4` · 记录 `36bb9a677`）；**集成④ `2c1d659d2` `d83d4a368` `bf940d804` `015522b66` `15f816145` `68f031ba6` `80e757d95` `96eb0eadf` `902ade6e8` `4f93f6990` `f605df89f` `b23955208`（test `d2afaaa20` · 接线 `4a2745283` · q-1227 accept `2d2b5cafc` · 记录 `c97a750f8`）**。
+集成合并提交一览：集成① `3cff04c85` `09a13a472` `bf8188def` `985b3ae57`（记录 `43b7cd3a4`）；集成② `5e5ed6925` `6fa690d7e` `ab765669a` `6201518b2` `10398baa9` `b41e804ac` `ae0b0cb64`（接线 `19799c0fe` · 用例 `f7c08f3eb` · `.gitattributes` `419e0d218` · `2a6492774` · 记录 `1d8eaf769` / `2b23a31a7` · 集成待办 t-865 `e0f53688a` `d4b061e37` `a3af53970` `bae5a8673` `7d5573a92` 记录 `1e4328ac9`）；集成③ `12fc17579` `cd58600e8` `425655631` `c761bbd93` `be20adaec` `ce767d8ce`（接线 `bdf7b4d15` · q-979 `c034f05d7` · q-1076 `29a277b25` `b249317f4` · 记录 `36bb9a677`）；集成④ `2c1d659d2` `d83d4a368` `bf940d804` `015522b66` `15f816145` `68f031ba6` `80e757d95` `96eb0eadf` `902ade6e8` `4f93f6990` `f605df89f` `b23955208`（test `d2afaaa20` · 接线 `4a2745283` · q-1227 accept `2d2b5cafc` · 记录 `c97a750f8`）；**集成⑤ `ec09ed419` `c701daac9` `7cae5427f` `c4a516697` `10e1348fb` `ecf912b88` `b6da4ef8d` `936d44e85`（source-only accept `91358ce54` · 记录 `9103ce7b4`）；发布准备 `57ad2c823`（canonical `f1952819f`）· R2 `04ba13b2e` · RELEASE.md v2.2 `aeae1d72e`**。
 
 ## 10. 评审入口
 
-- 仓库：`https://github.com/dream-star-end/smart-assistant`，分支同名（§9）；本地主克隆 `d:\code\test_project\test123\v5-selfhost`（当前检出 integration `c97a750f8`），工作树 `d:\code\test_project\test123\wt\<slug>`。
-- 文档（integration `c97a750f8` 上均可读，除标「分支」者）：本文 → [archive/README.md](./archive/README.md)（12 模块 + 专项 / QA / 遗留清扫索引、集成①–④ 合入记录、集成⑤ 待合清单）→ `archive/<slug>.md`（归档摘要，新增 [archive/leftover.md](./archive/leftover.md)）→ `<slug>.md`（正文）；专项与 QA 正文 [hud.md](./hud.md) / [kp-automation.md](./kp-automation.md) / [misc-p3.md](./misc-p3.md) / [permission-card.md](./permission-card.md) / [a11y-shell.md](./a11y-shell.md) / [a11y-mod-a.md](./a11y-mod-a.md) / [a11y-mod-b.md](./a11y-mod-b.md) / `qa/QA-p3-tail.md` / `qa/QA-b-p3.md` / `qa/qa-gap.md`；集成记录 [INTEGRATION.md](./INTEGRATION.md)（集成①–④）；待集成⑤ 分支上的正文：`qa/QA-a11y.md`（qa-a11y）、`a11y-c.md`（a11y-c）、`leftover-shell.md`（leftover-shell）、`tutorials.md` §10（leftover-tut）、`shell.md` §9（budget-fix）。
-- 截图（仓外，不入库）：`D:\code\test_project\test123\.audit-tmp\<slug>\{before,after}\`；集成③ 全量 854 张 `.audit-tmp\integration\shots-integ3\`；**集成④ 全量 1026 张 `.audit-tmp\integration\shots-integ4\`**；QA `.audit-tmp\qa-p3\shots\`（126）/ `qa-b-p3\integ\`（258）/ `qa-gap\shots\`（120）/ `qa-a11y\shots\`（74）；a11y 走查 `.audit-tmp\a11y\`，集成④ 复扫 `.audit-tmp\integration\a11y-integ4\`，a11y-C `.audit-tmp\a11y-c\{before,after,scan-*,finish-scan}`；leftover-shell `.audit-tmp\leftover-shell\`（含 CDP AX 脚本 `ax-checkbox.mjs`）；leftover-tut `.audit-tmp\leftover-tut\`；budget-fix 归因脚本 `.audit-tmp\budget-fix\attribute-first-screen.mjs`。
-- 日志（仓外）：`.audit-tmp\integration\integ4-*.log`、`integ4-final-gates.summary.txt`；各模块 / QA / 专项 `.audit-tmp\<slug>\*.log`。
-- 作业口径：`d:\code\test_project\test123\TEAM_PLAYBOOK.md`（仓外）；决策 d-24 / d-26 / d-28 / d-1326 / d-1450；决策卡 q-786 / q-979 / q-988 / q-1076 / q-1227（§6）。
+- 仓库：`https://github.com/dream-star-end/smart-assistant`，分支同名（§9）；本地主克隆 `d:\code\test_project\test123\v5-selfhost`，工作树 `d:\code\test_project\test123\wt\<slug>`（本归档在 `wt\archive-final`）。
+- 文档（本分支 = integration `aeae1d72e` + 归档提交，以下路径**全部在树内**）：**[FINAL-REVIEW.md](./FINAL-REVIEW.md)（30 分钟终审导读）** → 本文 → [archive/README.md](./archive/README.md)（12 模块 + 专项 / QA / 遗留清扫 / 预演与发布线索引、集成①–⑤ 合入记录、集成⑤ 合入状态）→ `archive/<slug>.md`（归档摘要；新增 [archive/leftover.md](./archive/leftover.md)、[archive/release.md](./archive/release.md)）→ `<slug>.md`（正文）；专项与 QA 正文 [hud.md](./hud.md) / [kp-automation.md](./kp-automation.md) / [misc-p3.md](./misc-p3.md) / [permission-card.md](./permission-card.md) / [a11y-shell.md](./a11y-shell.md) / [a11y-mod-a.md](./a11y-mod-a.md) / [a11y-mod-b.md](./a11y-mod-b.md) / [a11y-c.md](./a11y-c.md) / [leftover-shell.md](./leftover-shell.md) / [qa/QA-p3-tail.md](./qa/QA-p3-tail.md) / [qa/QA-b-p3.md](./qa/QA-b-p3.md) / [qa/qa-gap.md](./qa/qa-gap.md) / [qa/QA-a11y.md](./qa/QA-a11y.md) / [qa/qa-integ4.md](./qa/qa-integ4.md)；集成记录 [INTEGRATION.md](./INTEGRATION.md)（集成①–⑤）；发布手册 [RELEASE.md](./RELEASE.md)（v2.2：预演、前置清单、本地步骤、服务器命令序列、回滚、发布记录模板）。
+- 截图（仓外，不入库）：`D:\code\test_project\test123\.audit-tmp\<slug>\{before,after}\`；集成③ 全量 854 张 `.audit-tmp\integration\shots-integ3\`；**集成④ 全量 1026 张 `.audit-tmp\integration\shots-integ4\`**；QA `.audit-tmp\qa-p3\shots\`（126）/ `qa-b-p3\integ\`（258）/ `qa-gap\shots\`（120）/ `qa-a11y\shots\`（74）/ **`qa-integ4\shots\`（52，集成④ 终点抽样）**；a11y 走查 `.audit-tmp\a11y\`，集成④ 复扫 `.audit-tmp\integration\a11y-integ4\`，a11y-C `.audit-tmp\a11y-c\{before,after,scan-*,finish-scan}`；leftover-shell `.audit-tmp\leftover-shell\`（含 CDP AX 脚本 `ax-checkbox.mjs`）；leftover-tut `.audit-tmp\leftover-tut\`；budget-fix 归因脚本 `.audit-tmp\budget-fix\attribute-first-screen.mjs`；集成⑤ 下半场截图 / 复扫目录待跑后登记。
+- 日志（仓外）：`.audit-tmp\integration\integ4-*.log`、`integ4-final-gates.summary.txt`；**集成⑤ `.audit-tmp\integration\integ5\`（`run-gates.ps1` / `GATES-SUMMARY.txt` / `vite-build.log` / `vitest-full.log` / `test-browser-2.log` / `biome-compare.txt` / `check-tutorials-*.log`）**；首屏二分 `.audit-tmp\release-rehearsal\integ5-bisect\SUMMARY.txt`；QA 集成④ `.audit-tmp\qa-integ4\t1567-*.log`；发布预演 `.audit-tmp\release-rehearsal\gates-head-2\`、`.audit-tmp\release-prep-rehearsal\gates\SUMMARY.txt`、发布准备 `.audit-tmp\release-deploy\gates-int\`；各模块 / QA / 专项 `.audit-tmp\<slug>\*.log`。
+- 作业口径：`d:\code\test_project\test123\TEAM_PLAYBOOK.md`（仓外）；决策 d-24 / d-26 / d-28 / d-1326 / d-1450 / d-1603；决策卡 q-786 / q-979 / q-988 / q-1076 / q-1227（§6）。
 
-## 11. 终稿口径与本次更新说明（t-897）
+## 11. 终稿口径与本次更新说明（t-897 · 阶段①）
 
-- 基点：integration `c97a750f8`（集成④ 终点）开 worktree `wt\archive-final`，分支 `feat/v5-selfhost-audit-archive-final`，先 `--no-ff` 合入归档分支 `archive@35e3ec7c9`（`e01791796`，集成④ 未带上的 1 个初稿同步提交），再在其上更新。
-- 更新范围（纯文档，只动 `docs/audit/SUMMARY.md` 与 `docs/audit/archive/`）：初稿里全部「等集成④ 再填」的标记行与 `archive/` 的占位行逐处换成集成④ 事实（合并提交、接线、全量门、截图 / a11y 复扫、q-1227）；按 t-1232 / t-1233 / t-1234 / t-1235 / t-1348 五条交付更新 §1 / §3 / §3.1 / §4.2 / §5 / §7 / §8.2 / §9，`archive/a11y.md` 增 §6 a11y-C / §7 QA、`archive/qa.md` 增 §4 t-1232、新增 `archive/leftover.md`、`archive/README.md` 增专项 / 待合清单 / 集成④ 行；12 模块摘要里的「待集成③」等过期状态与 K-27 / TU-17 / TU-34 / L-11 / M-23 / M-27 / C-32 / 备案判据行改为落地事实。
-- 信息源：`INTEGRATION.md` 集成④ 全部小节；`qa/QA-a11y.md`、`a11y-c.md`、`leftover-shell.md`、`tutorials.md` §10、`shell.md` §9（各自分支 `git show`）；任务库账本（09-18 00:20）；`git log / diff / ls-remote / rev-list` 现算。统计排除作废条 t-837（正文见 `archive/permission-card.md` 文首）。
-- 核对：本文与 `archive/*.md` 引用的全部短 SHA 逐个 `git cat-file -e <sha>^{commit}`（结果见 complete_task 交付）；初稿用过的占位词（「等集成④」标记、「等终稿」占位）在 `SUMMARY.md` + `archive/` 全文检索为 0 命中；集成⑤ 及之后的状态一律写成「待集成⑤ / 待领 / 在跑」的事实描述。
-- 集成⑤ 完成后若要再出一版：只需把 §1 集成状态、§3.1 / §4.2 的「待集成⑤」改成合并提交、§8.1 换成集成⑤ 终点全量门（`build` 必须绿）、§9 integration HEAD；数字口径不变。
+- 基点：integration `c97a750f8`（集成④ 终点）开 worktree `wt\archive-final`，分支 `feat/v5-selfhost-audit-archive-final`，先 `--no-ff` 合入归档分支 `archive@35e3ec7c9`（`e01791796`）；原持有人 fable-5-1-24 在其上完成的集成④ 事实回填与 5 条交付登记因离线未提交，由接手人（fable-5-1-32）原样提交为 `867e241e1`（承接稿，00:3x 事实），再 `--no-ff` 对齐合并 integration `aeae1d72e`（`9836216db`，零冲突、无自有改动），在其上做阶段① 更新。**主工作树未动**（fable-5-1-35 在做集成⑤ 收尾），`INTEGRATION.md` 未改。
+- 阶段① 更新范围（纯文档，只动 `docs/audit/SUMMARY.md`、新增 `docs/audit/FINAL-REVIEW.md`、`docs/audit/archive/{README,qa,leftover,release}.md`）：① §1 / §3 / §3.1 按 t-1236（含 t-1512 / t-1524 / t-1567）、t-1575 补齐，新增 §3.2 预演与发布前置（t-1279 / t-1503 / t-1598 / t-1455）；② §4.2 改为「集成⑤ 合入状态」（每支的集成⑤ 合并提交 + `rev-list aeae1d72e..` 复核），新增 §4.3 集成⑤ / §4.4 发布准备 / §4.5 发布执行三章**预留**（只登记 `git` 事实，TODO 字段留阶段②）；③ §5.2 增 QA t-1236 观感 / 场景项与集成⑤ biome format；§6 增 d-1603、第 70 / 71 条 accept；§7 accept 三笔 → 四笔、§7-7 发布门现状、§7-8 阶段状态；§8.1b 集成⑤ 上半场 · 发布准备门；§9 / §10 按 `aeae1d72e` 与 canonical `97f128d2b` 更新；④ `archive/qa.md` 增 §5 t-1236、`archive/leftover.md` 增 §4 t-1575、新增 `archive/release.md`、`archive/README.md` 增专项行 / 集成⑤ 行 / 合入状态表 / 决策；⑤ 新增 `FINAL-REVIEW.md` 终审导读单页。**各模块摘要（`archive/<12 模块>.md` 等）本阶段未改**，其「待集成⑤」为任务口径，阶段② 统一翻转。
+- 信息源：`INTEGRATION.md` 集成④ / 集成⑤ 全部小节；`RELEASE.md` v2.2（§0 / §1.3b / §2.2b / §3.1b / §3.1c）；`qa/qa-integ4.md`、`qa/QA-a11y.md`、`a11y-c.md`、`leftover-shell.md`、`tutorials.md` §10、`shell.md` §9（对齐合并后树内直读）；任务库账本（09-18 20:49）、决策 d-1603 / d-1700、任务书 t-897（指挥官 fable-5-1-31）；`git log / diff / ls-remote / rev-list / merge-base` 现算。统计排除作废条 t-837（正文见 `archive/permission-card.md` 文首）。
+- 核对（阶段①，结果见 send_to 进度报告）：本文 + `FINAL-REVIEW.md` + `archive/*.md` 引用的全部短 SHA 逐个 `git cat-file -e <sha>^{commit}`；导读与本文的相对路径逐个存在；初稿用过的三个占位词在 `SUMMARY.md` + `FINAL-REVIEW.md` + `archive/` 全文检索 0 命中（检索词列在 send_to 报告里，此处不写以免自命中；预留章节的 `TODO` 字段是任务书要求的显式留空，不算占位）；与 `INTEGRATION.md` 集成⑤ §5 / `RELEASE.md` §3.1c 的 HEAD 与门数值逐项一致（447.8KB / 305 · 4306 / 448.3KB / 29 · 583 / trailer PASS）。
+- 阶段② 收口清单：□ §4.3 下半场门 + 验收 □ §4.4 canonical `97f128d2b` 重核 / push □ §4.5 发布记录 □ 「待集成⑤」全量翻转（§3 / §3.1 / §5.2 / §9、`archive/*.md`）□ t-1455 清理明细 □ §1 任务数 / 时间跨度终值 □ `FINAL-REVIEW.md` 状态行改「已上线 / 未上线」□ `complete_task(taskId="t-897")`。

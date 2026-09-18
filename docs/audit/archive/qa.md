@@ -1,6 +1,6 @@
-# QA 复核三轮 · 归档摘要（t-1028 二期 P3 / t-1038 B 轮 P3 / t-1029 缺口补审）
+# QA 复核五轮 · 归档摘要（t-1028 二期 P3 / t-1038 B 轮 P3 / t-1029 缺口补审 / t-1232 a11y-B + PermissionCard / t-1236 集成④ 终点）
 
-> 正文：[`docs/audit/qa/QA-p3-tail.md`](../qa/QA-p3-tail.md)（t-1028）、[`docs/audit/qa/QA-b-p3.md`](../qa/QA-b-p3.md)（t-1038）、[`docs/audit/qa/qa-gap.md`](../qa/qa-gap.md)（t-1029），三支已随集成④ `4f93f6990` / `f605df89f` / `902ade6e8` 合入 integration；第四轮 t-1232 `docs/audit/qa/QA-a11y.md`（分支 `feat/v5-selfhost-audit-qa-a11y@eed1f3989`）待集成⑤，见 §4。本文只做摘要与索引。
+> 正文：[`docs/audit/qa/QA-p3-tail.md`](../qa/QA-p3-tail.md)（t-1028）、[`docs/audit/qa/QA-b-p3.md`](../qa/QA-b-p3.md)（t-1038）、[`docs/audit/qa/qa-gap.md`](../qa/qa-gap.md)（t-1029），三支已随集成④ `4f93f6990` / `f605df89f` / `902ade6e8` 合入 integration；第四轮 t-1232 [`docs/audit/qa/QA-a11y.md`](../qa/QA-a11y.md)（分支 `feat/v5-selfhost-audit-qa-a11y@eed1f3989`）与第五轮 t-1236 [`docs/audit/qa/qa-integ4.md`](../qa/qa-integ4.md)（分支 `feat/v5-selfhost-audit-qa-integ4@31a8a92d6`）由集成⑤ `c701daac9` / `936d44e85` 合入（集成⑤ 任务 t-1237 在任务库尚未验收闭合，见 SUMMARY §4.3），见 §4 / §5。本文只做摘要与索引。
 > 角色：测试 / QA「第二双眼睛」，对照被复核任务的验收标准逐项定位到 integration 代码行，复跑门禁，按 d-28 用截图台重出截图逐张看图；发现不合格项直接修（t-1029）或在任务书边界内移交（t-1038）。三轮核对态均为 integration `c034f05d7`（集成③ 6/6 之后、q-979 之后）。
 
 ## 1. t-1028 · 二期 P3 收尾复核（market2 t-625 / manage2 t-626 / sidebar2 t-627 / settings2 t-628）
@@ -49,13 +49,27 @@
 - **QA 直接修 `77a93d9e1`**（`style(v5)`，4 文件 +27 −4）：① `PublishPanel` 「查看 / 收起」两钮 `[@media(hover:none)]:min-h-11 min-w-11 px-2`（`PublishPanel.test` K-21 用例补断言，修前红）；② `PermissionCard` `<summary>查看完整参数` `[@media(hover:none)]:py-3.5`（`PermissionCard.test` +1，71 例，修前红）。修后复扫 21 场景：`permission-card-settled` t44 6→0、`pending-modal` 1→0、`market-publish*` 4 场景各 1→0；其余指标与修前逐项相同。
 - 验证：typecheck ✅、`typecheck:preview` ✅；全量 `npm test` 301/302 文件绿 4127 例（唯一红 `MessageRenderer.test` `beforeAll` 10s 冷启超时 = 基线抖动，单独 `--hookTimeout=60000` 复跑 152/152 绿 → 合计 302/302）；`test:browser` `run.mjs` 68/68、`node --test` 70/73（3 红与基线逐条相同：cc-switch ×2、ocv5-185 symlink EPERM）；截图 20 场景 74 张 failures 0，逐张 Read 9 张关键图；CDP 复扫 301 场景 0 渲染失败，共同 257 场景 vs t-893 after：cL 58→44、cD 81→69、t44 419→163、names 16→11、ax 3→1、tabBad 13→12，**逐场景回归 0**（a11y-mod-a / mod-b 修复在合入态量化成立）；`git merge-tree` 试合 integration `2d2b5cafc` 无冲突。
 - 观察项 7 条（不阻断，QA 未越界改）：a11y-shell §5 同源项 12 处当时全部未落地 → 转 a11y-C（已处置，[a11y.md](./a11y.md) §6）；kp「从当前账号已加入的星球中选择」316×42、market `MyPublishes` 折叠钮 322×42（P3 nit，各归属 owner）；`RepoStatusBanner:85` 关闭钮 `opacity-70`（sidebar nit）；`ModelSelector` CostMark 深色 4.36 出现在禁用行（exempt）；读屏实机 NOT RUN 保持；建议集成⑤ 全量门沿用「全量 + `MessageRenderer.test` 单独 `--hookTimeout=60000` 复跑」两步口径。
-- 分支 `feat/v5-selfhost-audit-qa-a11y` @ `eed1f3989`（`77a93d9e1` 代码 · `eed1f3989` 报告），远端 = 本地，待集成⑤（只带入 4 文件 + 报告）。
+- 分支 `feat/v5-selfhost-audit-qa-a11y` @ `eed1f3989`（`77a93d9e1` 代码 · `eed1f3989` 报告），远端 = 本地；集成⑤ 第 2 步 `c701daac9` 合入（5 files, +222/−4，零重叠）。
 
-## 5. 分支 / 集成
+## 5. t-1236 · 集成④ 最终 HEAD `c97a750f8` 独立复核（含分工单 t-1512 → t-1567 三道门实跑、t-1524 截图抽样 + 状态单）
+
+- 复核对象：integration 集成④ 终点 `c97a750f8`（源码态 `2d2b5cafc`），即 INTEGRATION.md 集成④ §5 / §7 / §8 登记的对象；工作树 `wt\qa-integ4`，分支 = `c97a750f8` + 报告一笔（不碰 integration / canonical）。
+- 分工（指挥官 fable-5-1-4 01:12 口径，原执行人 fable-5-1-1 离线；报告 §0 已如实点出「任务书要求 QA 本人复跑三道门，实际由同组 QA 成员分工、各自留日志」）：三道门独立实跑 = fable-5-1-3 **t-1567**（代 t-1512，主克隆只读，01:15–01:26，`git status` 前后逐字一致）；截图抽样 + §8 状态单 = fable-5-1-3 **t-1524**；状态单二次复算 / source-only 登记核对 / 报告合成关单 = fable-5-1-6（t-1236）。
+- **三道门 + 三道附加门与集成④ §5 登记逐条一致，新增红 0**：typecheck ✅ · `typecheck:preview` ✅ · `check:tutorials` ✅ 26 / 12 / 26 · vitest **302 文件 / 4279 例 / 0 失败**（`--maxWorkers=2` 376s，无 timeout / retry）· `test:browser` `run.mjs` 68 全过 + `node --test` 87 例 85 / 2（唯二红 = `cc-switch-ascii-name` ×2 基线；`ocv5-185-qa` ok）· `build` ❌ 471.4KB > 460.0KB（R1 已知红，8 个大块数值逐个相同，非新增）。对照：fable-5-1-1 00:53 在新建工作树 `node --test` 73 例 70/3，第 3 败 = `OCV5-185`（无 protocol junction 的环境项）。
+- **§8 状态单 24/24 无漂移**（t-1524 与 t-1236 两次独立计算相同）：24 条文档 SHA `merge-base --is-ancestor c97a750f8` 全 0；23 条 tip == 文档 SHA 且 `rev-list --count` 0；唯一非 0 archive tip `35e3ec7c9` +1（纯文档，已登记）；24 条远端 == 本地。待集成⑤ 表复算：qa-a11y +2 · a11y-c `c35fd00c6` +18 · leftover-tut +3 · leftover-shell +6 · archive +1 · budget-fix +2 → 应合 6 条 / 32 提交；不合入 integ4-rehearsal +8、release-rehearsal（tip 前进到 `6aed3bddf`）。
+- **截图抽样 13 场景 / 14 id / 52 张，新增阻断 0**（主克隆只读出图，`manifest` failures 0；52 张逐张 Read）：H-18 `onStop` 接线在 `hud-delegate-running` 生效；深色对比新增 0（K-1 `AgentPicker`「默认」徽章 4.11:1 / K-2 `RichBlocks` 勾标白字 2.82:1 / K-3 `OrgSubscribeDialog`「当前」徽章 2.82:1 = a11y-C 已修待合）；触控新增 0（K-4 PermissionCard summary / K-5 `ui/Checkbox` 20px = qa-a11y / leftover-shell 已修待合）；O-5 `workspace-chat-density` 390px 主列被挤是**场景构造问题**（`scenes-workspace.tsx:45` 把 `<Sidebar>` 行内固定并开 mobile 视口），非产品缺陷。
+- source-only 登记核对：`tutorial-sync-history.jsonl` 69 条，第 67（q-1076 17 项 source-only）/ 68（t-1046 普通 accept）/ 69（q-1227 github-repository source-only，`identityChanged: []`）与集成③ §4 / 集成④ §4 逐条一致，入口身份变化 0。
+- 问题清单：**P1 0 / P2 0 / P3 8**（K-1…K-5 已修待合 5 + O-1 hud 列表末行裁半行无渐隐 / O-2 permission-card 命令块 `break-all` 拆词 / O-3 Composer textarea 达 max-height 裁半行 观感 3，登记各 owner）+ 工具·场景项 2（O-4 kp 星球选择器 Popover 未入图 / O-5）+ 已知 2（B-1 首屏 gzip R1 = budget-fix；**B-2 集成⑤预演树 `b6b78e876` build 475.2KB，leftover-tut 把 `useAppRoute` chunk 1.7 → 30.7KB，集成⑤ 必修** → t-1575）。QA 直接修复 0。
+- **结论：可进集成⑤，阻断项 0；集成⑤ 必带 budget-fix `65019b5dc`（B-1）+ t-1575（B-2），合入后 `build` 必须转绿；三笔教程 accept 随归档终稿交用户终审。**
+- 产物（仓外 `.audit-tmp\qa-integ4\`）：`qa-integ4-report.md`、`t1567-summary.txt` + 六门日志 `t1567-*.log`、`shots\*.png` + `manifest.json` + `shots-review.md`、`status-check.md`、`ls-remote-heads.txt`。
+- 分支 `feat/v5-selfhost-audit-qa-integ4` @ `31a8a92d6`（`c97a750f8` + 报告 1 笔），远端 = 本地；集成⑤ 第 8 步 `936d44e85` 合入（1 file, +153）。
+
+## 6. 分支 / 集成
 
 | 分支 | HEAD | 内容 | 集成 |
 |---|---|---|---|
 | `feat/v5-selfhost-audit-qa-p3` | `3e640a85d` | `qa/QA-p3-tail.md` | ✅ 集成④ `4f93f6990`（1 file, +125） |
 | `feat/v5-selfhost-audit-qa-b-p3` | `0ac949b2e` | `qa/QA-b-p3.md` + `landing.md` / `media.md` 勘误 | ✅ 集成④ `f605df89f`（3 files, +242/−2；与 a11y-mod-b 同文件未冲突） |
 | `feat/v5-selfhost-audit-qa-gap` | `c1734aac6` | `qa/qa-gap.md` + 2 处修复 + hud / kp-automation / misc-p3 三支合并 | ✅ 集成④ `902ade6e8`（4 files, +192/−41；`scenes-hud.tsx` 唯一冲突取 qa-gap 版本 `747596782`，指挥官 q-1227 预先指定） |
-| `feat/v5-selfhost-audit-qa-a11y` | `eed1f3989` | `qa/QA-a11y.md` + 2 处 QA 修复 `77a93d9e1`（`PublishPanel` / `PermissionCard` 各 + test） | 待集成⑤（+2，远端 = 本地） |
+| `feat/v5-selfhost-audit-qa-a11y` | `eed1f3989` | `qa/QA-a11y.md` + 2 处 QA 修复 `77a93d9e1`（`PublishPanel` / `PermissionCard` 各 + test） | 集成⑤ 2/8 `c701daac9`（5 files, +222/−4；t-1237 任务未闭合，见 SUMMARY §4.3） |
+| `feat/v5-selfhost-audit-qa-integ4` | `31a8a92d6` | `qa/qa-integ4.md`（t-1236；t-1512 / t-1524 / t-1567 分工产物在仓外 `.audit-tmp\qa-integ4\`） | 集成⑤ 8/8 `936d44e85`（1 file, +153；同上） |
