@@ -466,10 +466,10 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 
 下一步：集成⑤（t-1237 前置）从本轮终点起按上表合入 + t-1348 gzip 修复，复跑全量门（`build` 必须绿）；归档终稿 t-897 从集成⑤ 终点起更新 `docs/audit/SUMMARY.md` 与 `archive/*` 的 `[待集成④]` 标记；release-prep t-1237 以 canonical `f1952819f` 重做试合。
 
-## 集成⑤（t-1237 · 2026-09-18 01:45 – 02:15 · 合并 / 门 / 记录 / 推送 fable-5-1-4 → 03:10 – 03:35 第二拍截图 / a11y fable-5-1-24 → 20:54 – 21:4x 收尾：全量门复跑 / 门阻断修复 / 记录 / 推送 fable-5-1-35）
+## 集成⑤（t-1237 · 2026-09-18 01:45 – 02:15 · 合并 / 门 / 记录 / 推送 fable-5-1-4 → 03:10 – 03:35 第二拍截图 / a11y fable-5-1-24 → 20:54 – 21:4x 收尾：全量门复跑 / 门阻断修复 / 记录 / 推送 fable-5-1-35 → 21:4x – 22:2x 按指挥官修订合入 canonical `97f128d2b` + 全量门 r4 / RELEASE v2.3 / 推送 fable-5-1-35）
 
 > 执行人说明：t-1237 在待办池解锁时被宿主自动领到 fable-5-1-3 名下，而他在交付 t-1567 后已离线；组内在线只剩指挥官 fable-5-1-4 与 fable-5-1-6（t-1598 发布准备预演），用户 02:0x 明示「全权负责，端到端部署上线，不用问我 / 现在就你和另外一个会话了，都不要停」（决策 d-1603），故由指挥官**代执行**本轮合并、门与记录；任务记录仍挂在 fable-5-1-3 名下，以本段为实际交付。
-> 收尾说明（fable-5-1-35，t-1237 于 20:4x 由用户拍板从离线的 fable-5-1-24 名下收回改派）：接手时 `git ls-remote` 实测 origin `feat/v5-selfhost-ocv5-audit-ux` 已在 `aeae1d72e`（= 本段 docs `9103ce7b4` + t-1268 由指挥官 fable-5-1-6 代执行的 3 个提交 `57ad2c823` canonical `f1952819f` 合并 / `04ba13b2e` R2 / `aeae1d72e` RELEASE.md v2.2），本地 = 远端，8 条成员分支 `rev-list` 仍全 0；§5 末行的「第二拍」已由 fable-5-1-24 于 03:10–03:35 在 detached 工作树 `wt\integ5-gate`（同一树 `3ea8b4f09`）跑完两遍（r1 / r2）但只落在仓库外 `.audit-tmp\integ5-rehearsal\gate-second-half.md`（t-1535），未登记进本文。收尾在同一工作树、同一树哈希上把**全量门整套复跑一遍**（含第二拍），结果登记为 §9；唯一新红（`test:browser` 顾问卡文案断言，canonical 合并带入）按 R2 口径以 `test(v5)` 修正后复跑转绿。
+> 收尾说明（fable-5-1-35，t-1237 于 20:4x 由用户拍板从离线的 fable-5-1-24 名下收回改派）：接手时 `git ls-remote` 实测 origin `feat/v5-selfhost-ocv5-audit-ux` 已在 `aeae1d72e`（= 本段 docs `9103ce7b4` + t-1268 由指挥官 fable-5-1-6 代执行的 3 个提交 `57ad2c823` canonical `f1952819f` 合并 / `04ba13b2e` R2 / `aeae1d72e` RELEASE.md v2.2），本地 = 远端，8 条成员分支 `rev-list` 仍全 0；§5 末行的「第二拍」已由 fable-5-1-24 于 03:10–03:35 在 detached 工作树 `wt\integ5-gate`（同一树 `3ea8b4f09`）跑完两遍（r1 / r2）但只落在仓库外 `.audit-tmp\integ5-rehearsal\gate-second-half.md`（t-1535），未登记进本文。收尾在同一工作树、同一树哈希上把**全量门整套复跑一遍**（含第二拍），结果登记为 §9；唯一新红（`test:browser` 顾问卡文案断言，canonical 合并带入）按 R2 口径以 `test(v5)` 修正后复跑转绿。随后按指挥官 fable-5-1-31 21:4x 的任务书修订（d-1832 口径）把又前进的 canonical `97f128d2b` `--no-ff` 合入 integration（`0ec2838ea`，零冲突）并在合完的树上再跑一遍完整全量门（§9.6，r4），RELEASE.md 升 v2.3（§3.1d）。
 > 起点 `c97a750f8`（集成④ 终点）。任务书 6 条 + 指挥官追加 2 条（t-1575 首屏回归修复、t-1236 QA 报告），共 **8 步 `--no-ff` 合并**、1 个 `chore` accept、1 个 docs（本段）。主克隆 `v5-selfhost` 上操作（d-24），`git log --format=%s c97a750f8..HEAD` 全为 merge / refactor / chore / docs（d-26，无 `fix(v5)`），未 rebase / squash / force-push，未碰 `changelog.json`。
 > 前置：fable-5-1-2 的集成⑤预演 `feat/v5-selfhost-audit-integ5-rehearsal@b6b78e876`（t-1503：6 条已合、typecheck ✅、**build ❌ 475.2KB**）→ 指挥官逐合并点二分归因（§3）→ t-1575 修复分支；QA 集成④ t-1236（fable-5-1-6，docs/audit/qa/qa-integ4.md，三道门由 fable-5-1-3 t-1567 实跑）结论「可进集成⑤，阻断 0；必带 budget-fix + t-1575」。预演分支**不合入**。
 
@@ -527,7 +527,7 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | web-react 全量单测 | `cd packages\web-react; npx vitest run --maxWorkers=2` | ✅ **305 文件 / 4306 例全部通过，0 失败**（339s，`vitest-full.log`）。集成④ 302 / 4279 → +3 文件（`org/OrgSubscribeDialog.test.tsx`、`ui/Checkbox.test.tsx`、`lib/tutorialSignatureWorkIds.test.ts`）/ +27 例 |
 | 真浏览器门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` **68 全过（清单 68 条全部执行）**；`node --test` 87 例 **85 通过 / 2 失败** = `cc-switch-ascii-name` ×2（基线，与集成①②③④逐条相同）；146s（`test-browser-2.log`；首跑 `test-browser.log` 因未设 `OC_E2E_BROWSER` 环境错误 exit 2，非代码问题） |
 | 代码风格 | `npx biome check --line-ending=crlf <52 个改动源文件>` HEAD vs 基线 `c97a750f8` 逐文件对比（`biome-compare.ps1` / `biome-compare.txt`） | **lint 规则新增 0 条**；5 条 `format` 差异全在本轮新增文件（`heroTheme.ts` / `ui/Checkbox.tsx` / `ui/Checkbox.test.tsx` / `hooks/useAppRoute.test.ts` / `scenes-market-audit.tsx`）= Windows 工作树 CRLF 与 formatter 行尾判定的差异，`git ls-files --eol` 显示 blob 为 `i/lf`，Linux CI 不受影响；既有文件计数逐一相同 |
-| ui-preview 全量截图 + a11y 复扫 | 集成④ 同口径（`shoot.mjs` 301 场景 / `scan.mjs` + compare） | ~~**第二拍**：本段提交时尚未跑（两人在线、t-1268 优先），随后在 detached 工作树上补跑并以 docs(v5) 追加结论~~ → ✅ **已补跑三遍并登记于 §9**（fable-5-1-24 r1 02:52 / r2 03:15；fable-5-1-35 r3 21:04–21:23，树 `aeae1d72e` = 本段源码态 + canonical 合并）：截图 **303 场景 / 1034 张 / `failures: 0`**（三遍同值）；a11y **303 场景 0 渲染失败**，共同 301 场景九项指标**只降不升**（r2 的 misc +1 为工具噪声，r3 未复现），逐场景真回归 **1 条 P3**（`tutorials-case-gallery` 深色字幕 4.16，§9.3-A，不阻断）；t-1236 / t-1524 的 52 张截图抽样（新增阻断 0）与 a11y-C 的 288 场景复扫（白字压 accent 4 → 0）先期已覆盖本轮改动面 |
+| ui-preview 全量截图 + a11y 复扫 | 集成④ 同口径（`shoot.mjs` 301 场景 / `scan.mjs` + compare） | ~~**第二拍**：本段提交时尚未跑（两人在线、t-1268 优先），随后在 detached 工作树上补跑并以 docs(v5) 追加结论~~ → ✅ **已补跑四遍并登记于 §9 / §9.6**（fable-5-1-24 r1 02:52 / r2 03:15；fable-5-1-35 r3 21:04–21:23，树 `aeae1d72e` = 本段源码态 + canonical `f1952819f` 合并；r4 21:54–22:14，树 `0ec2838ea` = 再合 canonical `97f128d2b`）：截图 **303 场景 / 1034 张 / `failures: 0`**（三遍同值）；a11y **303 场景 0 渲染失败**，共同 301 场景九项指标**只降不升**（r2 的 misc +1 为工具噪声，r3 未复现），逐场景真回归 **1 条 P3**（`tutorials-case-gallery` 深色字幕 4.16，§9.3-A，不阻断）；t-1236 / t-1524 的 52 张截图抽样（新增阻断 0）与 a11y-C 的 288 场景复扫（白字压 accent 4 → 0）先期已覆盖本轮改动面 |
 
 ### 6. 已知基线失败（本轮更新）
 
@@ -549,7 +549,7 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 - **a11y 同源遗留（第二拍新发现 1 条，P3，不阻断）**：`tutorials/CaseFieldReportVisual.tsx:131`「GBM」指标字幕 `text-white/55`（11px）在暗色下压 leftover-tut `04006714f`（TU-34）抬亮后的 hero 底 `#2d4953`，ratio **4.16 < 4.5**（集成④ 同元素压写死的 `#07111f` 未命中）；一行改 `text-white/70` 或 hero `-fg` token，owner tutorials。同因漂移（before 已命中、非回归）：`tutorials-case-detail*` 的 `ArtifactPreview2 text-white/35` 命令行字幕 `#5d6268/#050d17` → `#636772/#0f1626`（3.21）。
 - **截图台竞态（工具项，不阻断）**：`scenes-taskboard.tsx` `taskboard-stage-settings` 桌面端 `?menu:` + 两次点击链（≈≥640ms）> `shoot.mjs` `OC_UI_SHOT_DELAY` 400ms，r1 / r3 捕到「开发实现」编辑器展开（场景意图）、r2 捕到收起态；harness `failures 0` 不感知。建议该场景按视口跳过 `?menu:` 步或提高该组 delay，owner taskboard。`.audit-tmp\a11y\scan.mjs`（仓库外）`scroll-region-not-focusable` 对原生可聚焦 `textarea` 误报（r2 misc +1），建议排除原生可聚焦元素。
 - **不合入**：`integ5-rehearsal@b6b78e876`（t-1503 预演，6 个 `rehearsal:` 合并）、`release-rehearsal@a4452c7b6`（t-1279 发布预演 + `docs/audit/RELEASE.md` v2.1，RELEASE.md 由 t-1268 带入）、`release-prep-rehearsal@e75749dd0`（t-1598）。
-- **canonical**：本段提交时 `origin/feat/v5-selfhost` = `f1952819f`（比集成④时记录再 +1：`feat(v5): wire Sand-usable Cursor families into the picker`，含迁移 0281）；服务器 live 已是 `f1952819f` 且 0281 已 apply（RELEASE.md v2.1 §2.2b）。t-1268 已由指挥官代执行把 `f1952819f` 合进 integration（`57ad2c823`，7 处冲突解法见 RELEASE.md §1.2 / §3.1b / §3.1c）。**收尾 21:0x `git ls-remote` 实测 canonical 又前进到 `97f128d2b`**（+1：`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`），`rev-list --count integration..origin/feat/v5-selfhost` = 1，t-1268 push canonical 前需再合这一笔并复跑门（本轮不做，边界）。
+- **canonical**：本段提交时 `origin/feat/v5-selfhost` = `f1952819f`（比集成④时记录再 +1：`feat(v5): wire Sand-usable Cursor families into the picker`，含迁移 0281）；服务器 live 已是 `f1952819f` 且 0281 已 apply（RELEASE.md v2.1 §2.2b）。t-1268 已由指挥官代执行把 `f1952819f` 合进 integration（`57ad2c823`，7 处冲突解法见 RELEASE.md §1.2 / §3.1b / §3.1c）。**收尾 21:0x `git ls-remote` 实测 canonical 又前进到 `97f128d2b`**（+1：`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`，只碰 gateway 4 文件 + `scripts/check-v5-cursor-sand-inference.ts`，无 migrations）→ **21:4x 已按指挥官修订 `--no-ff` 合入 integration = `0ec2838ea`（merge-tree 与实合均零冲突），合完树上全量门 r4 全绿（§9.6，RELEASE.md §3.1d）**；此后 `rev-list --count integration..origin/feat/v5-selfhost` = 0。t-1268 剩余 = §3.3 canonical `--ff-only` + push（执行前再 `fetch` 确认 canonical 仍是 `97f128d2b`）→ t-1269 服务器序列。
 
 ### 8. 分支合入状态单（集成⑤ 终点现算）
 
@@ -567,7 +567,7 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | qa-integ4 | `31a8a92d6` | **集成⑤ `936d44e85`** | 0 | = 本地 |
 
 下一步：**t-1268 发布准备**——integration 合 canonical `f1952819f`（RELEASE.md §3.1 命令 + t-1598 实测解法），复跑全量门（build ≤ 460KB），把 `docs/audit/RELEASE.md` 带进 integration，push；随后 canonical `--ff-only` + push，服务器按 RELEASE.md §4 执行（t-1269）。
-> 收尾时（§9）核对：上句前半已由指挥官代执行落地（`57ad2c823` / `04ba13b2e` / `aeae1d72e`，已在 origin integration）；剩余 = 再合 canonical 新增的 `97f128d2b`（§7 末条）→ 复跑门 → canonical `--ff-only` + push → t-1269。
+> 收尾时（§9）核对：上句前半已由指挥官代执行落地（`57ad2c823` / `04ba13b2e` / `aeae1d72e`，已在 origin integration）；canonical 新增的 `97f128d2b` 也已在收尾合入（`0ec2838ea`，§9.6）并全门复绿；**剩余 = RELEASE.md §3.3 canonical `--ff-only` + push → t-1269 服务器序列**。
 
 ### 9. 收尾：全量门复跑（含第二拍）· 门阻断修复 · 推送（fable-5-1-35 · 20:54 – 21:4x）
 
@@ -618,6 +618,33 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | 提交 | 内容 |
 |---|---|
 | `e322522a6` `test(v5)` | `browser-tests/ocv5-210-advisor-dual-app.node-test.mjs` 3 处断言 `/实际顾问型号 gpt-6-astra/` → `/顾问 gpt-6-astra/`（+5 / −3，含 2 行取舍注释） |
-| 本 docs 提交 | INTEGRATION.md 集成⑤：标题接手链、收尾说明、§5 末行、§6 +2 行、§7 更新、§8 下一步核对、§9 |
+| `f3b3a0ad5` `docs(v5)` | INTEGRATION.md 集成⑤：标题接手链、收尾说明、§5 末行、§6 +2 行、§7 更新、§8 下一步核对、§9.1–9.5（21:3x 已推，`ls-remote` 核对 origin = `f3b3a0ad5`） |
+| **`0ec2838ea`** `merge(v5)` | 合入 canonical `feat/v5-selfhost@97f128d2b`（parents `f3b3a0ad5` / `97f128d2b`；零冲突；详见 §9.6 与 RELEASE.md §3.1d） |
+| 本 docs 提交 | RELEASE.md v2.3（状态行、变化第 8 条、§3.1d、§3.2 前言）+ INTEGRATION.md 集成⑤（标题、收尾说明、§7 canonical 条、§8 核对、§9.5、§9.6） |
 
-推送：`git push origin feat/v5-selfhost-ocv5-audit-ux`（fast-forward，`aeae1d72e` → 本 docs 提交），推后 `git ls-remote` 核对见 complete_task 交付。未合 canonical、未 push canonical、未碰服务器（t-1268 / t-1269 边界）。
+推送：`git push origin feat/v5-selfhost-ocv5-audit-ux`（fast-forward），推后 `git ls-remote` 核对见 complete_task 交付。未 ff / 未 push canonical、未碰服务器（t-1268 §3.3 / t-1269 边界）。
+
+#### 9.6 合入 canonical `97f128d2b` 后的全量门（r4 · HEAD `0ec2838ea` · 树 `e13d1a5b3` · 21:44 – 22:14 · 脚本 `.audit-tmp\integration\integ5-final-2\run-gates-final-2.ps1`）
+
+- 触发：指挥官 fable-5-1-31 21:4x 修订任务书——`git ls-remote origin feat/v5-selfhost` = `97f128d2b`（`f1952819f` + 1：`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`），integration 未含，要求按 RELEASE.md §1.1 `merge-tree` 预览后 `--no-ff` 合入并在合完的树上跑完整全量门。
+- 变更面：5 文件 +86 / −3，全在 `packages/gateway/src/**`（`__tests__/cursorSandRelay.test.ts` / `engine/cursorSandAdapter.ts` / `engine/cursorSandRelay.ts` / `index.ts`）+ `scripts/check-v5-cursor-sand-inference.ts`；**无 web-react、无 migrations**（`git diff --name-only HEAD origin/feat/v5-selfhost -- '**/migrations/**'` 为空，RELEASE R0 不变）。
+- 预览 / 实合：`git merge-tree --write-tree --name-only f3b3a0ad5 origin/feat/v5-selfhost` → `e13d1a5b3` exit 0（零冲突）；`git merge --no-ff origin/feat/v5-selfhost` → **`0ec2838ea`**（ort，树 = 预览值）；`--diff-filter=U` 为空、冲突标记 0；`check:tutorials` 直接 OK，无需 accept。
+- 门（首行含 HEAD / TREE 的日志与 `GATES-SUMMARY.txt` 在同目录）：
+
+| 门 | r4 结果 | vs r3（`aeae1d72e`，§9.2） |
+|---|---|---|
+| typecheck / `tsc -b --force` | ✅ exit 0（1s 缓存）/ ✅ exit 0（39s） | 同 |
+| typecheck:preview | ✅ exit 0（22s） | 同 |
+| check:tutorials | ✅ OK 26 · 12 · 26 | 同 |
+| check-migration-order（RELEASE §3.2） | ✅ 283 支 · requiredMigrations 161 条完整有序 | 新增项（同 §3.1c） |
+| protocol `engineModels.test.ts`（RELEASE §3.2） | ✅ 14 / 14 | 新增项（同 §3.1c） |
+| build + 首屏 gzip | ✅ exit 0；**13 chunk 448.3KB（459061 B）≤ 460.0KB，余量 11.7KB** | 逐字节同（web-react 源码未变） |
+| vitest 全量 | ✅ **305 文件 / 4311 例全过**（387s） | 同 |
+| test:browser | ✅ `run.mjs` 68 全过；`node --test` **87 / 85 / 2 = cc-switch 基线**（113s；junction 已在，`e322522a6` 已在树上） | 同（首跑即绿） |
+| ui-preview 全量截图 | ✅ **303 场景 / 1034 张 / failures 0 / retried 0**（685s），unmockedApi 2 | 同 |
+| a11y 复扫 vs 集成④ | ✅ 303 场景 0 渲染失败；共同 301 九项 cL 49→47 / cD 77→71 / t24 385→385 / t44 174→161 / names 11→11 / ax 1→1 / tabBad 12→12 / click 192→192 / misc 317→317，改善 15 / 回归 1（§9.3-A） | **逐项同值** |
+| biome（`f3b3a0ad5..HEAD` 5 文件，临时 worktree 基线） | ✅ 新增 0 | — |
+| Incident trailer（RELEASE §3.2） | ✅ `PASS: 起点 e490e22af2cf, 冻结 tip 18 条, 检查 45 条 fix(v5) 提交` | 新增项（同 §3.1c） |
+| 未跑 | gateway / commercial 单测（Windows 假阳性 R6 / R9；本次上游恰只改 gateway，`cursorSandRelay.test.ts` 由 Linux CI / 服务器复跑）、`test:commercial:integ`（需 PG） | 同 RELEASE §3.1c 口径 |
+
+**判定**：合 canonical `97f128d2b` 后十一道门全绿（`test:browser` 仅剩五轮相同的 2 条基线红），首屏 448.3KB ≤ 460KB；integration 现已包含 canonical HEAD，`rev-list --count integration..origin/feat/v5-selfhost` = 0，RELEASE.md §3.3 的 ff 条件成立。产物：`.audit-tmp\integration\integ5-final-2\`（`shots-integ5\` 1034 PNG + manifest、`a11y\results\` 303 JSON、`a11y-compare.log`、`test-browser.log`、`trailer.log`、`biome-compare.txt`、`test-results\`）。

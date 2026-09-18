@@ -1,6 +1,6 @@
 # v5 个人版（selfhost）发布预演 + 运行手册草稿（t-1279）
 
-> 状态：**草稿 v2.2 · 预演分支 `feat/v5-selfhost-audit-release-rehearsal` @ `31c3e15c3`（v2.1）+ 集成⑤树实测分支 `feat/v5-selfhost-audit-release-prep-rehearsal`（v2.2，§3.1b）**。本文件由发布预演任务 t-1279 产出（初稿 fable-5-1-34 @ `c1fdc935e`，09-17 04:xx；**09-18 00:3x–01:0x 由 fable-5-1-4 接手复核并更新**），给 t-1268「发布准备」/ t-1269「发布执行」接棒。
+> 状态：**草稿 v2.3 · 预演分支 `feat/v5-selfhost-audit-release-rehearsal` @ `31c3e15c3`（v2.1）+ 集成⑤树实测分支 `feat/v5-selfhost-audit-release-prep-rehearsal`（v2.2，§3.1b）+ integration 实做 §3.1c（v2.2，canonical `f1952819f`）/ §3.1d（v2.3，canonical `97f128d2b`）**。本文件由发布预演任务 t-1279 产出（初稿 fable-5-1-34 @ `c1fdc935e`，09-17 04:xx；**09-18 00:3x–01:0x 由 fable-5-1-4 接手复核并更新**；09-18 21:4x fable-5-1-35 于 t-1237 收尾时升 v2.3），给 t-1268「发布准备」/ t-1269「发布执行」接棒。
 > 边界（已守住）：**未推 canonical、未动 integration、服务器只读**（v2.1 起按指挥官 fable-5-1-8 指令用 `ssh -o BatchMode=yes -o ConnectTimeout=15 root@38.55.252.217` 做了两轮只读核对：git status / readlink / systemctl / curl / df / SELECT / `--status`，**没有 fetch、checkout、--preflight、--deploy、删除**；命令脚本与原始输出见附录 C）。试合只发生在预演分支。
 > 出处标注约定：`deploy-v5-selfhost.sh:L` = `scripts/deploy-v5-selfhost.sh` 行号；`master-lib:L` = `scripts/v5-selfhost-master-release-lib.sh` 行号；`AGENTS.md §…`、`hotfix-checklist Step …` = `docs/hotfix-deploy-checklist.md`；`PLAYBOOK §…` = `docs/V5_DEV_PLAYBOOK.md`。行号按预演分支 `c1fdc935e` 标注；`f6572abb6` 追合的三方（canonical `f1952819f`、budget-fix `65019b5dc`、integration `c97a750f8`）**都没碰 `scripts/**`**，行号仍然有效。
 >
@@ -12,6 +12,7 @@
 > 5. **v2.1 服务器只读实测（09-18 00:56 UTC+8）改写了 R0 的结论**：现网 live **已经是 `f1952819f`**（boss 09-17 08:25Z 人工 train 提交，前 4 次失败），`schema_migrations` **已含 0281**，三条前置行 active+enabled → 本次发布迁移门预期 **`HAS_MIGRATION=0`，不需要 `OC_V5_ALLOW_BREAKING_MIGRATION=1`**（只在「回滚到 rel-3b7c38b9d 后再发」或「canonical 再带新迁移」时复议）。磁盘 `/` 87%、余 26.6 GiB（≥ 8 GiB 门过）；master / egress slotA / 个人版全 active，18790 与 18789 healthz 均 200，无 open train。→ §2.2 实测表、§4.0 前值、§4.1 判据修正（`spa dist` / `.complete` MISSING 是预期）、§4.4/§4.5 改回 HAS_MIGRATION=0 主线。
 > 6. 预演分支追平 integration HEAD `c97a750f8`（`31c3e15c3`，纯 docs，零冲突），分支现在**字面等于** integration HEAD + canonical HEAD + budget-fix + 本手册。
 > 7. **v2.2（t-1598 · fable-5-1-6 · 09-18 01:4x–02:0x）**：在 `wt\release-prep-rehearsal`（分支 `feat/v5-selfhost-audit-release-prep-rehearsal`）用**集成⑤预期树**（`b6b78e876` + t-1575 `a947662bb` + qa-integ4 `31a8a92d6` = `fc5c4f075`）实合 canonical `f1952819f`：同样 7 处冲突、实解并全门绿（vitest 27 文件 547 例、build 448.3KB / 余量 11.7KB、trailer PASS）。**两处口径变化**：① `AgentPicker.tsx` 在集成⑤树上已叠 a11y-c「默认」徽章改动，重放时 `git checkout b96cb194f -- <4 文件>`（不再是 `d02cc7c5d`）；② 教程门要**两段式**——集成⑤树自身的 agents / billing-usage 功能源漂移必须在合 canonical **之前**用 `--source-only --ids agents,billing-usage` 接受，否则合并树上普通 accept 与 source-only 都过不了。全部见 **§3.1b**。
+> 8. **v2.3（t-1237 收尾 · fable-5-1-35 · 09-18 21:3x–22:2x）**：**canonical 第三次前进**——`git ls-remote origin feat/v5-selfhost` = **`97f128d2b`**（= `f1952819f` + 1 提交 `feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`，只碰 `packages/gateway` 4 文件 + `scripts/check-v5-cursor-sand-inference.ts`，**无 web-react、无 migrations**，R0 迁移门结论不变）。已在 integration 工作树 `wt\integ5-gate` 上 `--no-ff` 实合为 **`0ec2838ea`**（merge-tree 预览与实合均**零冲突**，§3.1d），并在合完的树上把**完整**全量门跑齐——首次含 `test:browser`（上一版「未跑」项）、ui-preview 全量截图、a11y 复扫对比集成④（§3.1d 门表）。`test:browser` 在合 canonical 后的树上首跑暴露 1 条真红：canonical 自带的 `ocv5-210-advisor-dual-app` 用例仍断言旧文案「实际顾问型号」，与 §1.2 #2 取 canonical OCV5-220 卡片文案「顾问 <型号>」不一致 → `test(v5)` `e322522a6` 对齐（R2 同类，见 INTEGRATION.md 集成⑤ §6 / §9）。**§3.3 的 `<INT>` 现为 §3.1d 记录的 HEAD**；推 canonical 前仍要 `git fetch && git rev-parse origin/feat/v5-selfhost` 确认没有第四次前进。
 
 ## 0. 结论速览（接棒先读）
 
@@ -305,7 +306,34 @@ git cherry-pick c1fdc935e          # R2（或 addb87bd1，同内容）
 - 门（HEAD `04ba13b2e`，脚本 `.audit-tmp\release-deploy\run-gates-int.ps1`，日志 `gates-int\`）：typecheck ✅ 0（29s）/ typecheck:preview ✅ 0（17s）/ check:tutorials ✅ OK 26·12·26 / lint:migration-order ✅ 283 支·161 条 / test:protocol engineModels ✅ 14/14 / vitest（§3.2 集合 + 本文 27 文件集合）✅ **29 文件 583 例全过**（80s）/ build ✅ exit 0（5108 modules，`built in 2.50s`）/ 首屏 **13 chunk gzip 448.3KB（459061 B）≤ 460.0KB，余量 11.7KB**（与 §3.1b 预演逐字节相同）/ trailer ✅ `PASS: 起点 e490e22af2cf, 冻结 tip 18 条, 检查 45 条 fix(v5) 提交`。未跑：test:browser、gateway / commercial 单测、commercial integ（同 §1.3b / §3.1b，服务器 / CI 复跑）。
 - 树内 `git grep -l '^<<<<<<< ' HEAD -- packages docs` = 0；`git diff --name-only --diff-filter=U` 为空。
 
-3.2 复跑门（全部 exit 0 才继续；v2 在预演 f6572abb6 上同口径全绿，见 §1.3b；v2.2 在集成⑤预期树 × canonical 的 `addb87bd1` 上同样全绿，见 §3.1b；t-1268 实做在 integration `04ba13b2e` 上全绿，见 §3.1c）：
+### 3.1d t-1237 收尾实做记录（integration 工作树 `wt\integ5-gate` · 09-18 21:3x–22:2x · fable-5-1-35 · canonical 第三次前进 `97f128d2b`）
+
+- 起点：integration `feat/v5-selfhost-ocv5-audit-ux` = `f3b3a0ad5`（= §3.1c 的 `aeae1d72e` + `e322522a6` `test(v5)` dual-app 断言对齐 + `f3b3a0ad5` `docs(v5)` INTEGRATION.md 集成⑤ §9；21:3x 已推，`git ls-remote` 核对本地 = 远端）。`git fetch origin` → `origin/feat/v5-selfhost` = **`97f128d2b`**（`f1952819f` + 1：`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`，5 文件 +86/−3 = `packages/gateway/src/__tests__/cursorSandRelay.test.ts` / `engine/cursorSandAdapter.ts` / `engine/cursorSandRelay.ts` / `index.ts` + `scripts/check-v5-cursor-sand-inference.ts`）；`git diff --name-only HEAD origin/feat/v5-selfhost -- '**/migrations/**'` **为空** → R0 结论不变（`HAS_MIGRATION=0`）。
+- 预览：`git merge-tree --write-tree --name-only f3b3a0ad5 origin/feat/v5-selfhost` → 树 `e13d1a5b3`，**exit 0 零冲突**（上游未碰 web-react，§1.2 七个路径均不在本次变更面）。
+- 实合：`git merge --no-ff origin/feat/v5-selfhost -F <msg>` → **`0ec2838ea`** `merge(v5): 合入 canonical feat/v5-selfhost@97f128d2b 到 integration（集成⑤收尾 …）`（parents = `f3b3a0ad5`, `97f128d2b`；`Merge made by the 'ort' strategy`，树 = 预览的 `e13d1a5b3`）。无需 `tutorials:accept`（`check:tutorials` 直接 OK，history 仍止于第 71 条）；`git diff --name-only --diff-filter=U` 为空；`git grep -l '^<<<<<<< ' HEAD -- packages docs` = 0。
+- 门（HEAD `0ec2838ea`，树 `e13d1a5b3`；脚本 `.audit-tmp\integration\integ5-final-2\run-gates-final-2.ps1`，汇总 `GATES-SUMMARY.txt`，各步 `*.log` 首行含 HEAD / TREE / 命令 / 起止；**首次在 integration × canonical 树上把 `test:browser` / 全量截图 / a11y 一并跑齐**）：
+
+| 门 | 命令（工作树根，另注明除外） | 结果 |
+|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react`；另 `cd packages\web-react; npx tsc -b --force` | ✅ exit 0（缓存 1s）/ ✅ 无缓存 exit 0（39s） |
+| ui-preview 场景类型 | `npm run typecheck:preview --workspace packages/web-react` | ✅ exit 0（22s） |
+| 教程同步门 | `npm run check:tutorials` | ✅ `OK · 26 capabilities · 12 real-world cases · 26 media pairs · 2390809 B`（3s，无新漂移） |
+| 迁移编号 / 登记门 | `npx tsx scripts/check-migration-order.ts` | ✅ `283 支迁移（其中 66 支在基线 0217 之后新增），requiredMigrations 161 条登记完整且有序` |
+| protocol 单测 | `npx tsx --test packages/protocol/src/__tests__/engineModels.test.ts` | ✅ 14 / 14 |
+| 生产构建（R1 门） | `npm run build --workspace packages/web-react` | ✅ exit 0（4s，rolldown 热缓存；web-react 源码与 `aeae1d72e` 字节相同） |
+| 首屏体积复算 | `node .audit-tmp\release-rehearsal\measure-first-screen.mjs packages\web-react\dist 471040` | ✅ **首屏闭包 13 chunk，gzip 合计 448.3KB（459061 B）≤ 预算 460.0KB（471040 B），余量 11.7KB**（与 §3.1b / §3.1c 逐字节相同） |
+| web-react **全量** vitest | `cd packages\web-react; npx vitest run --maxWorkers=2` | ✅ **305 文件 / 4311 例全过**（387s；§3.1c 的 29 文件 583 例为其子集） |
+| **真浏览器门（上一版「未跑」）** | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | ✅ `run.mjs` **68 全过（清单 68 条全部执行）**；`node --test` **87 例 85 通过 / 2 失败 = `cc-switch-ascii-name` ×2（集成①–⑤ 五轮相同基线）**（113s）。前置：Windows 非管理员 shell 下 `ocv5-185-qa` 的 `symlinkSync` 报 EPERM，需在 `packages\web-react\node_modules\@openclaude\protocol` 预建 Junction → `packages\protocol`（gitignore 内，见 INTEGRATION.md 集成⑤ §6）；`ocv5-210-advisor-dual-app` 旧断言已由 `e322522a6` 对齐（同 R2 类） |
+| ui-preview 全量截图 | `cd packages\web-react; OC_UI_SHOTS=…\integ5-final-2\shots-integ5 node browser-tests\ui-preview\shoot.mjs` | ✅ **303 场景 / 1034 张 / `failures: 0` / `retried: 0`**（685s），`unmockedApi` = `listCronChannels` / `listProjectAssets`（同集成②③④⑤） |
+| a11y 复扫 + 对比集成④ | `OC_REPO=wt/integ5-gate OC_A11Y_OUT=…\integ5-final-2\a11y\results node .audit-tmp\a11y\scan.mjs` → `compare-integ5.mjs`（before = `.audit-tmp\integration\a11y-integ4\results`，集成④ `2d2b5cafc` 301 场景） | ✅ **303 场景 0 渲染失败**；共同 301 场景九项 before → after：cL 49 → 47、cD 77 → 71、t24 385 → 385、t44 174 → 161、names 11 → 11、ax 1 → 1、tabBad 12 → 12、click 192 → 192、misc 317 → 317——**只降不升**；逐场景改善 15、回归 1（`tutorials-case-gallery` cD 0 → 1 = P3 字幕对比度 4.16，leftover-tut TU-34 抬亮底色所致，INTEGRATION.md 集成⑤ §7 / §9.3-A，不阻断）。与合 canonical 前的 r3（`aeae1d72e`）**逐项同值** |
+| 代码风格 | `biome check --line-ending=crlf` 对 `f3b3a0ad5..HEAD` 改动的 5 个 ts 文件，HEAD vs 临时 detached 工作树 `f3b3a0ad5` 逐文件计数（`biome-compare.txt`） | ✅ **新增 0** |
+| Incident trailer 门 | `& 'C:\Program Files\Git\bin\bash.exe' -lc 'export PATH="/d/code/test_project/test123/.audit-tmp/release-rehearsal/jqbin:$PATH"; cd /d/code/test_project/test123/wt/integ5-gate && scripts/check-v5-fix-trailers.sh --repo . --head HEAD'` | ✅ `PASS: 起点 e490e22af2cf, 冻结 tip 18 条, 检查 45 条 fix(v5) 提交`（`trailer.log`） |
+| 未跑 | gateway / commercial 单测（Windows 假阳性 R6 / R9；本次上游恰好只改 gateway，其 `cursorSandRelay.test.ts` +52 行在 Linux CI / 服务器复跑）、`test:commercial:integ`（需 PG） | 同 §1.3b / §3.1c：服务器 / CI 复跑（U5） |
+
+- 提交链（本节所在 docs 提交 = 新 `<INT>`，SHA 见 INTEGRATION.md 集成⑤ §9.5 与 complete_task 交付）：`f3b3a0ad5` → **`0ec2838ea`**（canonical merge）→ docs v2.3（本文 + INTEGRATION.md 集成⑤ §9.6）。push 到 origin `feat/v5-selfhost-ocv5-audit-ux` 后 `git ls-remote` 核对。
+- 边界：未 ff / 未 push canonical `feat/v5-selfhost`，未碰服务器——留给 t-1268 / t-1269（§3.3 / §4）。§3.3 执行前照旧 `git fetch origin && git rev-parse origin/feat/v5-selfhost`，必须仍是 `97f128d2b`；再前进则回 §1.1 merge-tree。
+
+3.2 复跑门（全部 exit 0 才继续；v2 在预演 f6572abb6 上同口径全绿，见 §1.3b；v2.2 在集成⑤预期树 × canonical 的 `addb87bd1` 上同样全绿，见 §3.1b；t-1268 实做在 integration `04ba13b2e` 上全绿，见 §3.1c；**v2.3 在 integration × canonical `97f128d2b` 的 `0ec2838ea` 上连同 `test:browser` / 全量截图 / a11y 一并全绿，见 §3.1d**）：
 
 ```powershell
 npm run typecheck --workspace packages/web-react
