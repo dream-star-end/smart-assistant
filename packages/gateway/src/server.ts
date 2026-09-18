@@ -326,6 +326,7 @@ import {
   parseGraderJson,
 } from './skillEval.js'
 import { SkillEvalGenJobStore, type SkillEvalGenRun } from './skillEvalGenJobs.js'
+import { readSkillRunRetentionEnv } from './skillJobRetention.js'
 import {
   MAX_SESSION_EXCERPTS,
   SESSION_EXCERPT_MAX_CHARS,
@@ -2473,9 +2474,9 @@ export class Gateway {
   private _runLog = new RunLog()
   // SkillOpt training: async run registry (state machine + per-skill/global concurrency
   // cap). Drafts staged via skill_propose; merge promotes them to the authoritative lib.
-  private skillTrainJobs = new SkillTrainJobStore({ maxConcurrent: 2 })
-  private skillEvalJobs = new SkillEvalJobStore({ maxConcurrent: 1 })
-  private skillEvalGenJobs = new SkillEvalGenJobStore({ maxConcurrent: 1 })
+  private skillTrainJobs = new SkillTrainJobStore({ maxConcurrent: 2, ...readSkillRunRetentionEnv() })
+  private skillEvalJobs = new SkillEvalJobStore({ maxConcurrent: 1, ...readSkillRunRetentionEnv() })
+  private skillEvalGenJobs = new SkillEvalGenJobStore({ maxConcurrent: 1, ...readSkillRunRetentionEnv() })
   private skillDrafts = new SkillDraftStore()
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
@@ -2851,9 +2852,15 @@ export class Gateway {
       },
     })
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
-    void this.skillTrainJobs.loadAll(Date.now())
-    void this.skillEvalJobs.loadAll(Date.now())
-    void this.skillEvalGenJobs.loadAll(Date.now())
+    // S-02:重启载入落盘 run 后立刻收敛一次(清掉重启前累积的过期终态 run),再起周期 janitor。
+    void Promise.all([
+      this.skillTrainJobs.loadAll(Date.now()),
+      this.skillEvalJobs.loadAll(Date.now()),
+      this.skillEvalGenJobs.loadAll(Date.now()),
+    ])
+      .then(() => this._pruneSkillJobs())
+      .catch(() => {})
+    this._startSkillJobJanitor()
     // P3:技能每日自动回归(严格 opt-in:仅 evals.json 里 autoRegression=true 的技能;
     // 开启入口在管理中心且强制确认每日消耗 —— 平台绝不静默烧用户积分)。
     this._startSkillAutoRegression()
@@ -9180,7 +9187,7 @@ export class Gateway {
       if (!AUX_PREFIXES.some((p) => path.startsWith(p)))
         return this.sendError(res, 400, `path 须位于 ${AUX_PREFIXES.join(' | ')} 之下`)
       if (Buffer.byteLength(content, 'utf8') > 64 * 1024)
-        return this.sendError(res, 400, '单文件上限 64KB')
+        return this.sendError(res, 413, '单文件上限 64KB')
       if (path === 'evals/evals.json') {
         const parsed = parseSkillEvalsJson(content)
         if (!parsed.ok) {
@@ -9293,6 +9300,7 @@ export class Gateway {
         body?: string
         tags?: string[]
         agentIds?: unknown
+        expectedVersion?: string
       }>(req)
       const hasDescription = Object.prototype.hasOwnProperty.call(body, 'description')
       const hasBody = Object.prototype.hasOwnProperty.call(body, 'body')
@@ -9310,11 +9318,43 @@ export class Gateway {
         this.sendJson(res, 200, { ok: true })
         return
       }
+      // S-05 体量守卫(仅本处理器,不改通用 readJsonBody):正文/描述显式上限,超限 413。
+      const MAX_SKILL_BODY_BYTES = 512 * 1024
+      const MAX_SKILL_DESC_BYTES = 8 * 1024
+      if (hasBody && typeof body.body === 'string' && Buffer.byteLength(body.body, 'utf8') > MAX_SKILL_BODY_BYTES) {
+        return this.sendError(res, 413, `正文超出上限 ${Math.floor(MAX_SKILL_BODY_BYTES / 1024)}KB`)
+      }
+      if (
+        hasDescription &&
+        typeof body.description === 'string' &&
+        Buffer.byteLength(body.description, 'utf8') > MAX_SKILL_DESC_BYTES
+      ) {
+        return this.sendError(res, 413, `描述超出上限 ${Math.floor(MAX_SKILL_DESC_BYTES / 1024)}KB`)
+      }
+      // S-04 部分更新:未提供的字段保持当前值(先读权威再回填),不再把缺省写空。
+      let current: Awaited<ReturnType<typeof store.view>> = null
+      if (!hasDescription || !hasBody || !hasTags) {
+        current = await store.view(skillName, undefined, { includePlatform: false })
+      }
+      const cur = current && typeof current !== 'string' ? current : null
+      const description = hasDescription ? (body.description ?? '') : (cur?.description ?? '')
+      const nextBody = hasBody ? (body.body ?? '') : (cur?.body ?? '')
+      const tags = hasTags ? body.tags : cur?.tags
+      // S-01 乐观并发:透传 expectedVersion;冲突回 409 带 currentVersion,不覆盖并发改动。
       const r = await store.save(
-        { name: skillName, description: body.description ?? '', tags: body.tags },
-        body.body ?? '',
-        agentIds ? { agentIds } : undefined,
+        { name: skillName, description, tags },
+        nextBody,
+        {
+          ...(agentIds ? { agentIds } : {}),
+          ...(typeof body.expectedVersion === 'string' ? { expectedVersion: body.expectedVersion } : {}),
+        },
       )
+      if (r.conflict) {
+        return this.sendJson(res, 409, {
+          error: 'skill version conflict',
+          conflict: { currentVersion: r.conflict.currentVersion },
+        })
+      }
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
       this.sendJson(res, 200, { ok: true })
       return
@@ -10373,6 +10413,29 @@ export class Gateway {
 
   // ── P3:技能每日自动回归(opt-in)────────────────────────────────────────
   private _skillRegressionTimer: ReturnType<typeof setInterval> | null = null
+  private _skillJobJanitorTimer: ReturnType<typeof setInterval> | null = null
+
+  // S-02:周期清理三个技能 job 注册表(内存 + 落盘)的过期/超量终态 run。永不动活跃 run
+  // 与 diff_ready 训练 run(草稿待处理)。默认 7d / 每技能最新 20 条 / 上限 500,env 可调。
+  private _pruneSkillJobs(): void {
+    const now = Date.now()
+    try {
+      const evalN = this.skillEvalJobs.prune(now)
+      const genN = this.skillEvalGenJobs.prune(now)
+      const trainN = this.skillTrainJobs.prune(now)
+      if (evalN + genN + trainN > 0) {
+        this.log.info('skill job retention prune', { eval: evalN, gen: genN, train: trainN })
+      }
+    } catch (err) {
+      this.log.warn('skill job retention prune failed', {}, err)
+    }
+  }
+
+  private _startSkillJobJanitor(): void {
+    const { janitorMs } = readSkillRunRetentionEnv()
+    this._skillJobJanitorTimer = setInterval(() => this._pruneSkillJobs(), janitorMs)
+    this._skillJobJanitorTimer.unref?.()
+  }
 
   private _startSkillAutoRegression(): void {
     // 检查间隔 1h(可 env 缩短供 e2e),真正执行按「距上次 ≥22h」判定 —— 每技能每日至多一轮。
