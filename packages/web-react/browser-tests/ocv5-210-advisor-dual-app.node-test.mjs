@@ -444,7 +444,9 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.equal(trackerStop, 0, "advisor consult must not add a second Stop");
     await waitForConsultAdvice(a.page, inbounds);
     const cardText = await a.page.locator("body").innerText();
-    assert.match(cardText, /实际顾问型号 gpt-6-astra/);
+    // 合并取舍(发布准备 t-1268 / 集成⑤收尾):卡片文案以 canonical OCV5-220 为准(顾问 <型号> · 状态 · 时长),
+    // 与 bodyCards.test 同口径;canonical 自带的「实际顾问型号」旧断言随之对齐。
+    assert.match(cardText, /顾问 gpt-6-astra/);
     assert.match(cardText, /用量未返回/);
     assert.equal(cardText.includes("input_tokens"), false);
     assert.match(cardText, /GLM-5\.2/);
@@ -491,7 +493,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     await expandConsultCard(a.page);
     const afterTeamSwitch = await a.page.locator("body").innerText();
     assert.match(afterTeamSwitch, new RegExp(ADVICE));
-    assert.match(afterTeamSwitch, /实际顾问型号 gpt-6-astra/);
+    assert.match(afterTeamSwitch, /顾问 gpt-6-astra/);
 
     const beforeRetry = inbounds.length;
     await a.page.getByRole("button", { name: "重试" }).first().click();
@@ -516,7 +518,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
       throw new Error(`${err.message}\n${await dumpPage(a2.page, inbounds, "after-reload")}`);
     }
     const afterReload = await a2.page.locator("body").innerText();
-    assert.match(afterReload, /实际顾问型号 gpt-6-astra/);
+    assert.match(afterReload, /顾问 gpt-6-astra/);
     assert.match(afterReload, new RegExp(ADVICE));
     assert.match(afterReload, /用量未返回/);
 
