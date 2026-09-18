@@ -5962,32 +5962,36 @@ export class Gateway {
       }
     }
     if (url.pathname === '/api/config') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
+      // CFG-17:只读投影,只认 GET。CFG-04:先把 body 整个构造好再发,不再先 writeHead(200)
+      // 再取值 —— 否则 config 缺字段时客户端收到的是「200 + 空体」而不是可诊断的错误。
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      const cfg = this.deps.config
       const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
         []
-      const activeProvider = this.deps.config.provider
-      for (const srv of this.deps.config.mcpServers ?? []) {
+      const activeProvider = cfg.provider
+      for (const srv of cfg.mcpServers ?? []) {
         if (srv.enabled === false) continue
         if (srv.provider && srv.provider !== activeProvider) continue
         activeMcps.push({ id: srv.id, label: srv.label, provider: srv.provider, tools: srv.tools })
       }
-      const authInfo: Record<string, any> = { mode: this.deps.config.auth.mode }
-      if (this.deps.config.auth.claudeOAuth?.accessToken) {
+      const authInfo: Record<string, any> = { mode: cfg.auth.mode }
+      if (cfg.auth.claudeOAuth?.accessToken) {
         authInfo.claudeOAuth = {
           active: true,
-          expiresAt: this.deps.config.auth.claudeOAuth.expiresAt,
+          expiresAt: cfg.auth.claudeOAuth.expiresAt,
         }
       }
-      res.end(
-        JSON.stringify({
-          gateway: { bind: this.deps.config.gateway.bind, port: this.deps.config.gateway.port },
-          defaults: this.deps.config.defaults,
-          channels: Object.keys(this.deps.config.channels),
-          provider: activeProvider,
-          auth: authInfo,
-          mcpServers: activeMcps,
-        }),
-      )
+      this.sendJson(res, 200, {
+        gateway: { bind: cfg.gateway.bind, port: cfg.gateway.port },
+        defaults: cfg.defaults,
+        channels: Object.keys(cfg.channels ?? {}),
+        provider: activeProvider,
+        auth: authInfo,
+        mcpServers: activeMcps,
+      })
       return
     }
     if (url.pathname === '/api/agents') {

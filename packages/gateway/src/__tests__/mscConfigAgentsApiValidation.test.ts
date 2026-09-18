@@ -150,6 +150,19 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
     })
   })
 
+  // CFG-17(阶段 B):/api/config 是只读投影,非 GET 一律 405;body 先构造再发,不再「200 + 空体」。
+  it('non-GET /api/config is rejected with 405 and never returns a half-written 200', async () => {
+    await withServer(async (base) => {
+      for (const method of ['PUT', 'POST', 'DELETE']) {
+        const res = await json(base, method, '/api/config', { gateway: { port: 1 } })
+        assert.equal(res.status, 405, `${method} expected 405, got ${res.status}: ${res.text}`)
+      }
+      const ok = await json(base, 'GET', '/api/config')
+      assert.equal(ok.status, 200, ok.text)
+      assert.equal(ok.body.gateway?.port, 0)
+    })
+  })
+
   // TODO(msc-config): 阶段 B 修复 —— agent 级 mcpServers[].env 是凭据载体,列表/详情面必须脱敏。
   it('GET /api/agents and GET /api/agents/:id do not expose per-agent mcpServers env values', async () => {
     await withServer(async (base) => {
