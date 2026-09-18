@@ -178,7 +178,8 @@ import {
   syncMarketplaceHub,
   updateAgentsConfig,
   isMarketplacePersonaTarget,
-  writeConfig,
+  updateConfig,
+  ConfigValidationError,
   getUsageSummary,
   queryEvents,
   listClientSessions,
@@ -17108,24 +17109,19 @@ export class Gateway {
         token_type?: string
       }
 
-      // Save to config (keyed by provider)
-      const config = await readConfig()
-      if (config) {
-        const oauthData = {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token ?? '',
-          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-          scope: tokens.scope ?? prov.scopes,
-        }
-        if (providerKey === 'claude') {
-          config.auth.claudeOAuth = oauthData
-          config.auth.mode = 'subscription'
-        }
-        await writeConfig(config)
-        this.deps.config = config
-        this.sessions.updateConfig(config)
-        this.log.info('oauth tokens saved', { provider: providerKey })
+      // Save to config (keyed by provider)。CFG-02:走 storage.updateConfig 事务(内核锁 + tmp + rename),
+      // 不再 readConfig → 改 → writeConfig 裸写;CFG-10:写回后只把 auth 段同步进 deps.config,
+      // 不整体替换(避免把磁盘上手改的其他字段悄悄拉进内存)。
+      const oauthData = {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token ?? '',
+        expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        scope: tokens.scope ?? prov.scopes,
       }
+      const persisted = await this._persistOAuthCredential(providerKey, oauthData, {
+        setSubscriptionMode: providerKey === 'claude',
+      })
+      if (persisted) this.log.info('oauth tokens saved', { provider: providerKey })
 
       this.sendJson(res, 200, {
         ok: true,
@@ -17211,19 +17207,15 @@ export class Gateway {
       }
 
       const tokens = (await tokenRes.json()) as any
-      const config = await readConfig()
-      if (config) {
-        const refreshed = {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token ?? oauth.refreshToken,
-          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-          scope: tokens.scope ?? oauth.scope,
-        }
-        if (providerKey === 'claude') config.auth.claudeOAuth = refreshed
-        else (config.auth as any)[`${providerKey}OAuth`] = refreshed
-        await writeConfig(config)
-        this.deps.config = config
-        this.sessions.updateConfig(config)
+      const refreshed = {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token ?? oauth.refreshToken,
+        expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        scope: tokens.scope ?? oauth.scope,
+      }
+      // CFG-02:≤10min 一次的高频写入方,必须走事务式原子写(见 _persistOAuthCredential)。
+      const persisted = await this._persistOAuthCredential(providerKey, refreshed)
+      if (persisted) {
         this.log.info('oauth token refreshed', {
           provider: providerKey,
           expiresInSec: tokens.expires_in,
@@ -17231,6 +17223,37 @@ export class Gateway {
       }
     } catch (err) {
       this.log.error('oauth refresh error', { provider: providerKey }, err)
+    }
+  }
+
+  /**
+   * CFG-02 / CFG-10:OAuth 凭据落盘的唯一入口。锁内读-改-写(storage.updateConfig:内核文件锁 +
+   * tmp + rename),崩溃/断电不会留下半截 openclaude.json;写回成功后只把 `auth` 段同步进
+   * `deps.config` 并通知 SessionManager,不整体替换内存配置。openclaude.json 不存在
+   * (ConfigValidationError MISSING)时与旧行为一致:跳过持久化并打 warn,返回 false。
+   */
+  private async _persistOAuthCredential(
+    providerKey: string,
+    credential: { accessToken: string; refreshToken: string; expiresAt: number; scope: string },
+    opts: { setSubscriptionMode?: boolean } = {},
+  ): Promise<boolean> {
+    try {
+      const { config } = await updateConfig((cfg) => {
+        if (providerKey === 'claude') cfg.auth.claudeOAuth = credential
+        else (cfg.auth as any)[`${providerKey}OAuth`] = credential
+        if (opts.setSubscriptionMode) cfg.auth.mode = 'subscription'
+      })
+      this.deps.config.auth = config.auth
+      this.sessions.updateConfig(this.deps.config)
+      return true
+    } catch (err) {
+      if (err instanceof ConfigValidationError && err.code === 'MISSING') {
+        this.log.warn('oauth credential not persisted: openclaude.json missing', {
+          provider: providerKey,
+        })
+        return false
+      }
+      throw err
     }
   }
 
