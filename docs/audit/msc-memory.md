@@ -2,7 +2,7 @@
 
 - 分支：`feat/v5-selfhost-msc-memory`（基线 `aeae1d72ee8fa01475eebf016278841c96b91056`），工作树 `wt\msc-memory`
 - 任务：t-1696「A·memory 记忆子系统全栈深审」；作业口径 `TEAM_PLAYBOOK_MSC.md` §4.1 / §5 / §6
-- 阶段：A（审计，只出文档 + 纯测试红灯用例；**未改任何业务代码**）
+- 阶段：A（审计，只出文档 + 纯测试红灯用例；**未改任何业务代码**）→ **B 已完成**（t-1982，§8–§10：发现 10 / 修复 10 / 遗留 0 条问题级项，另承接 2 条跨子系统归属项）
 - 结论：**P1 × 0 / P2 × 8 / P3 × 2**，共 10 条（storage + gateway 核心层，每条带 file:line + 复现脚本 / 红灯用例证据）。Auto-Dream / mcp-memory / web 三层完成数据流速写 + §5 八项清单核查，未在本轮额外新增行级问题（深度与覆盖说明见 §7）。
 - 上一轮界面层审计（`docs/audit/manage.md` M-02/M-03/M-04/M-11/M-24/M-25）已把记忆面板的纯视觉 / 文案 / 空态互斥问题修完，本轮不重复；本轮只审数据正确性、契约、错误处理、安全、性能、状态机、测试、配置默认值。
 
@@ -285,3 +285,54 @@ IdentityManual/AgentProjectPreview/ProjectAssetsManagePanel:手册入口 / 项�
 6. **状态机与前端行为**：编辑器乐观并发 version + 409 三方合并、项目记忆 official/candidate/deprecated 三态、梦境报告轮询，已核 · 逻辑自洽（MemoryPanel.tsx / projectMemoryLedger.ts）。**问题**：MEM-01（overLimit 误禁用保存）。
 7. **测试覆盖**：storage 87/87、web 56/56 通过；gateway 核心 62/67、mcp 35/36、autoDream 39/63 的失败**全为 Windows 环境因素**（symlink EPERM / realpath 大小写 / path-sep / fsync EPERM），Linux 待复核。**缺口**：MEM-01/06/10/11/13 无专门用例（阶段 B 补；本轮已就位 MEM-03/04/05/08/09 六个红灯）。
 8. **配置与默认值**：注入 cap（`MEMORY_INDEX_INJECT_MAX_*`、`USER_PROFILE_INJECT_MAX_CHARS`、`PROJECT_ASSETS_INJECT_*` promptSlots.ts:370-378）单一权威、`EMBEDDING_*` env（embedding.ts）、TTL 默认 today+30（autoMemoryWrite）已核 · 合理。**关联问题**：MEM-01（cap 被 UI 误用作全文限额）。
+
+---
+
+## 8. 修复记录（阶段 B · t-1982）
+
+- 分支 `feat/v5-selfhost-msc-memory`，基于阶段 A 提交 `fecbbed7d`；工作树 `wt\msc-memory`；执行者 fable-5-1-59。
+- 拍板口径（任务书随附）：MEM-01 GET 增 `alwaysCharCount` 且 UI 不再禁用保存；MEM-04 空表跳过 embed 且 retrievalMode 如实报 bm25；MEM-05 改用 http.ts readJsonBody 413/400；通用 readJsonBody 默认 4 MB 上限 → 413、坏 JSON → 400；MEM-11 每 slug 保留最新 5 条已 promote 候选，不动 schema 不删审计事件。
+- 统计：**发现 10（P2 × 8 / P3 × 2）/ 修复 10 / 遗留 0**；另完成 2 条跨子系统归属项（server.ts 通用 `readJsonBody`、skills S-08）。每条改动配测试；阶段 A 的 6 条红灯全部转绿并保留为回归门（`TODO(msc-memory)` 标记已清）。
+- 共享文件（server.ts / api.ts / types.ts）各自单独 commit，只改记忆段 + 本次授权的 `readJsonBody` 通用改动；未碰 skills / config 段、未改 DB schema / 迁移编号、未删审计事件、未接线 indexPipeline、未加依赖、未在主克隆改代码。
+
+| 编号 | 改动文件 | 怎么改的 | 测试 |
+|---|---|---|---|
+| MEM-01 | gateway `promptSlots.ts`（新导出 `userProfileAlwaysCharCount`，与 `buildUserSlot` 共用 `extractUserAlwaysBlock`）；`server.ts` `handleMemory` GET 200 / PUT 200 / PUT 409 conflict 三处加 `alwaysCharCount`（`charCount` 仍为全文长度，仅展示）；web `types.ts`（`MemoryDocResponse` / `PutMemoryResult` / `MemoryConflict` 加可选 `alwaysCharCount`）、`api.ts`（`putMemory` 透传）、`MemoryPanel.tsx`（`UserProfileSection`：保存按钮只看 `dirty`；新增 `countUserAlwaysChars` 本地同口径实时算注入块长度，未改动时以服务端 `alwaysCharCount` 为准；预算条改为「N 字符 · 常驻注入 a/limit」/「无常驻注入块」，超预算只变 danger + title 提示会被截断，不禁用） | 全文 >4000 但 always 块很小时不再拦保存；预算语义与实际注入（只取 always 块）一致 | gateway `promptSlotsSkillDraftArm.test.ts`「MEM-01 userProfileAlwaysCharCount」×2；`memoryRoutes.test.ts`「MEM-01：GET / PUT / 409 都回 alwaysCharCount」；web `MemoryPanel.test.tsx` 新增 3 条 MEM-01 用例 + 改写「用户画像字数口径」1 条（旧断言编码的正是被移除的行为） |
+| MEM-03 | storage `memoryDir.ts`：`dropExpiredIndexLines` + `formatIndexLinesForInjection` 合并为 `selectIndexLinesForInjection`（边选边校验、选满 `maxLines` 即停；`isIndexLineExpired` 只对进入注入的行读盘）。`renderForInjection` / `renderForInjectionReadonly` 共用 | 热路径 readFile 上界从「全部索引行」降到 `maxLines`（+ 被判过期跳过的行）；过期行仍剔除；选满后仍有候选 → 视为截断附提示行（不再读盘判断剩余是否全过期，文档化的精度取舍） | 红灯 `mscMemoryAudit` MEM-03（300 条 / maxLines 50 → reads ≤ 51）转绿；既有 `promptSlotsMemory.test.ts` 截断 / 过期 / 死链 / 磁盘冻结 12 条全绿 |
+| MEM-04 | storage `vectorStore.ts`：新增 `hybridSessionSearchDetailed` 返回 `{ results, retrievalMode, embedded }`，`sessionsVecHasRows`（`SELECT id FROM sessions_vec LIMIT 1`）为空 / 向量库未就绪 / embed 失败 → 跳过向量腿、报 `bm25`；`hybridSessionSearch` 保持原签名薄包装。mcp-memory `memoryTools.ts` `handleSessionSearch` 改用 detailed 结果上报 `retrievalMode` 与文案里的模式 | 空表不再付一次 embed 网络调用；telemetry 不再把纯 BM25 报成 hybrid | 红灯 `mscMemoryAudit` MEM-04（embed=0）转绿；`mscMemoryPhaseB`「retrievalMode=bm25 / embedded=false」；mcp-memory 既有 200 条用例绿 |
+| MEM-05 | gateway `taskboard/projectMemoryHttp.ts`：删掉自带无上限 `readJson`，`dispatchProjectMemory` 增参 `readJson: ProjectMemoryJsonReader` 由路由注入；`taskboard/http.ts` 调用点一行传入自己的 `readJsonBody`（带 `TASKBOARD_MAX_BODY_BYTES`，抛 BodyTooLargeError / InvalidJsonError → `mapHttpError` 413 / 400）。不引入 http.ts ↔ projectMemoryHttp.ts 循环依赖 | 项目记忆 POST 与其余 /api/board 路由 413 / 400 契约一致；超大 body 不再无界读入落盘 | 红灯 `projectMemoryHttpBodyLimit` ×2 转绿（顺手修了该用例 Windows 下 sqlite 句柄未关导致 afterEach `rmSync` EBUSY 的 hookFailed）；既有 `projectMemoryHttp.test.ts` 5 条绿 |
+| MEM-06 | storage `memoryDir.ts`：`MemoryBarrierTimeoutError` 构造时把 `lastError` 摘要（`name: message`，单行截 200）并入 message；`lastError` 属性保留 | 「barrier timed out」直接带出真因（如 `SyntaxError: Expected property name…`） | `mscMemoryPhaseB`「批次日志损坏时 message 带真因摘要」 |
+| MEM-08 | storage `memoryShared.ts` `scanMemoryContent` 顶部 `typeof content !== 'string'` → `{ ok:false, reason }`（`write` / `applyBatchCas` / `writeUserProfile` / `prepareCandidateBody` 的共同入口）；`memoryDir.applyAutoAdds` 在盖章前另加类型守卫（`stampAutoMemoryFrontmatter` 会先解析 frontmatter） | 畸形入参回可控 400 分支，不再 TypeError → 500 | 红灯 `mscMemoryAudit` MEM-08 转绿；`mscMemoryPhaseB`「applyBatchCas / applyAutoAdds 非字符串」 |
+| MEM-09 | storage `memoryDir.ts`：新导出 `sanitizeIndexLinkText`（半角 `[ ] ( )` → 全角、换行压平、trim），`indexRow` 用它渲染 name，空则回落文件名 stem | name 再也拼不出 `](memory/…)`，首个链接必指真实文件；只影响索引行渲染，不改记忆文件 | 红灯 `mscMemoryAudit` MEM-09 转绿；`mscMemoryPhaseB`「注入渲染与再次对账后链接目标始终是真实文件」+ 纯函数用例 |
+| MEM-10 | storage `memoryDir.ts`：`listLocked` 拆出 `listLockedWithContent`，新增公开 `listWithContent(): MemoryFileEntry[]`（元信息 + 全文 + version，一次屏障 + 一次锁）；`memoryDedup.ts` 改用它，去掉 `list()` + 逐条 `read()` | 去重探针读盘 2N → N、跨进程锁 N+1 → 1；强命中 / 过期跳过语义不变 | `mscMemoryPhaseB`「N=60 readFile ≤ N+5」「强命中语义不变」「过期不参与去重」 |
+| MEM-11 | storage `projectMemoryLedger.ts`：常量 `PROMOTED_CANDIDATE_RETAIN_PER_SLUG = 5`；`promote()` 两条成功路径末尾调 `prunePromotedCandidates(projectId, slug)`：按 `updated_at, created_at, rowid` 倒序保留最新 5 条 `status='promoted'` 行，其余事务内删行，无其它行引用的候选文件再删；`projectMemoryDir.ts` 新增 `removeCandidateFile`（锁内、幂等）。pending / conflict / rejected 行、official 行、`tb_project_memory_event` 全部不动，schema 不动 | 候选行 / 文件不再随改写次数线性增长 | `mscMemoryPhaseB`「同 slug 改写 12 次后候选 ≤ 5 / official 恒 1 / 事件 12+12+11 不删」「pending 与其它 slug 不受影响」；既有 B5「v1→v2→v3 每个候选可读」仍绿 |
+| MEM-13 | gateway `memoryTurnObserver.ts`：`isSharedMemoryDir`（现导出）改为「memory/ 的 realpath 是否落在 `realpath(paths.agentDir(id))` 目录树内」（`isPathInside` 用 `path.relative`），不再裸比较 `realpath !== 词法路径` | HOME 经 junction / symlink / 8.3 短名 / macOS `/var` 时不再把独占目录全部误标 `attribution:'ambiguous'`；真共享链接仍判共享 | 新 `memoryTurnObserverSharedDir.test.ts`（junction HOME）×4；既有 `memoryTurnObserver.test.ts`「not a symlink 保持 literal attribution」在 Windows TEMP 8.3 短路径下**由红转绿**（阶段 A 记录的第 3 个失败） |
+| 通用 readJsonBody | 新模块 gateway `httpJsonBody.ts`（`readBodyBounded` / `readJsonBodyBounded` 默认 `DEFAULT_JSON_BODY_MAX_BYTES = 4 MB` / `JsonBodyTooLargeError`(413) / `JsonBodyInvalidError`(400) / `jsonBodyErrorStatus`）；`server.ts` `readJsonBody` 委托它，`sendInternalError` 先按 `jsonBodyErrorStatus` 回 413 `payload too large` / 400 `invalid json body` 再落 500（所有 `readJsonBody` 调用点经路由 `.catch(sendInternalError)` 统一得到 4xx，无需逐点改）。超限时 `req.resume()` 丢弃剩余字节不掐连接（与 taskboard/http.ts 口径一致，保证客户端收得到 413）；空 body 仍 `{}` | 15 处 `readJsonBody` 调用点（agents / memory / skills / skill-drafts 等）统一有界、坏 JSON 不再 500 | 新 `httpJsonBody.test.ts`（真 node:http：200 / 空 body / 400 / 413 / 恰等上限 / 状态映射）×7；`memoryRoutes.test.ts`「readJsonBody 委托 + sendInternalError 先 4xx 再 500」×2 |
+| S-08 | gateway `promptSlots.ts` `buildSkillsSlot` draft arm：`raw.match(/^description:\s*(.+)$/m)` + 剥双引号 → `parseFrontmatter(raw).meta.description`（与 skillStore 写侧同源，只看 frontmatter 段、去 CR、单双引号都剥） | 正文里的 `description:` 行不再被误读、CRLF 尾巴 / 单引号值解析正确；草稿读不到仍保持现版描述 | 新 `promptSlotsSkillDraftArm.test.ts` ×4 |
+
+## 9. 验证（阶段 B）
+
+工作树 `wt\msc-memory`，Node 22.22.0，Windows；日志在仓库外 `D:\code\test_project\test123\.audit-tmp\msc-memory\phaseB-*.log`。
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 阶段 A 红灯（6 条） | `npx tsx --test packages/storage/src/__tests__/mscMemoryAudit.test.ts`；`npx tsx --test --test-concurrency=1 packages/gateway/src/taskboard/__tests__/projectMemoryHttpBodyLimit.test.ts` | ✅ 4/4 + 2/2 **全部转绿**（阶段 A 为 0/4 + 0/2） |
+| 阶段 B 新增用例 | `mscMemoryPhaseB.test.ts`（10）、`httpJsonBody.test.ts`（7）、`memoryTurnObserverSharedDir.test.ts`（4）、`promptSlotsSkillDraftArm.test.ts`（6）、`memoryRoutes.test.ts` 新增 3 条 | ✅ 全绿（与红灯 + `promptSlotsMemory` + `projectMemoryHttp` 同批：65/65） |
+| 全仓类型检查 | `npx tsc --build`（含 `--force` 全量复跑） | ✅ exit 0 |
+| web-react 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0（45s） |
+| storage 既有记忆相关单测 | `npx tsx --test <archivalSearch autoMemoryWrite embeddingConfig memoryDir memoryTtl memoryTurnPolicy memoryUsage projectMemoryDir userProfile skillEmbedding sessionsDbServerAppendDedupe projectContextMigrate>` | ⚠ 89/90：唯一失败 `projectContextMigrate`「safe-down backup uses project-relative paths」为 Windows 路径分隔符断言（`projects\…` vs `projects/…`），**在基线主克隆 aeae1d72e 上同样失败**（`baseline-projectContextMigrate.log`），与本轮改动无关 → **NOT RUN（Windows 基线）**。阶段 A 清单里的 11 个文件 87/87 全绿 |
+| gateway 记忆相关单测 | `npx tsx --test --test-concurrency=1 <memoryRoutes memoryTurnObserver memoryTurnObserverSharedDir memoryTurnPolicyLease memoryUsageReporter mcpMemoryEntry projectContextPreview projectContextSlot projectAssetsSlot promptSlotsMemory promptSlotsSkillDraftArm promptSlotsCursorEnvelope promptSlotsIdentityCompat frozenProjectContext gatewayProjectContextHttp projectAssetCollector projectAssetHttp projectAssetRoutes httpJsonBody skillTrainJobs + taskboard/projectMemoryHttp + projectMemoryHttpBodyLimit>` | ⚠ 98/111：13 个失败**全部为 Windows 环境因素且在基线上同样失败**（`baseline-gateway-compat-train.log`）：`mcpMemoryEntry` ×2（`/` 分隔符断言）、`memoryTurnObserver` ×2（`symlinkSync` EPERM）、`promptSlotsIdentityCompat` ×7（`symlink` EPERM）、`skillTrainJobs` ×2（同类）→ **NOT RUN（Windows 基线）**。阶段 A 记录的 `memoryTurnObserver` 第 3 个失败（TEMP 8.3 短路径误判共享）**已由 MEM-13 修复转绿** |
+| mcp-memory 单测 | `npx tsx --test packages/mcp-memory/src/__tests__/*.test.ts` | ⚠ 200/201：唯一失败 `ocMemoryCli`「covers help…」为 Windows 路径分隔符断言（与阶段 A 一致）→ **NOT RUN（Windows 基线）** |
+| web-react 单测 | `cd packages/web-react; npx vitest run src/components/manage/MemoryPanel.test.tsx --maxWorkers=1` | ✅ 36/36（含新增 3 条 + 改写 1 条） |
+| 代码风格 | `npx biome check <改到的 24 个文件>` | ✅ **新增诊断 0**：5 个新文件 0 诊断；既有文件与基线主克隆逐文件对比诊断数持平或减少（仓库既有大量 format / organizeImports 基线诊断未顺手格式化，避免整文件重排污染共享文件 diff） |
+| 复现脚本 | 阶段 A 的 8 个脚本（`.audit-tmp\msc-memory\repro\*.ts`）未重跑：其断言已全部固化为上述 node:test 用例 | — |
+
+**NOT RUN 汇总**：本机无可运行 v5 后端（PG / 容器 / 模型 Key 在服务器），HTTP 路由结论来自代码阅读 + 内存 http 服务器测试（`httpJsonBody.test.ts` / `projectMemoryHttpBodyLimit.test.ts`）+ `memoryRoutes.test.ts` 的 server.ts 源码契约断言；Auto-Dream 四件套 `autoDream*.test.ts` 未重跑（阶段 A 已定为 Windows `fsync` EPERM 环境失败，本轮未改这四个文件）；上述 Windows 基线失败用例预期在 Linux 通过但未在 Linux 复跑。
+
+## 10. 遗留（阶段 B）
+
+- **问题级遗留：0**。MEM-01/03/04/05/06/08/09/10/11/13 全部修复；两条跨子系统归属项（通用 `readJsonBody`、S-08）完成。
+- **精度取舍（已文档化，非缺陷）**：MEM-03 选满 `maxLines` 后若仍有候选行即附「索引已截断」提示，不再读盘判断剩余行是否全部过期——以此换热路径 IO 上界 = `maxLines`。
+- **S-08 的另一半（skills owner）**：`skillStore.parseFrontmatter` 的 `stripQuotes` 只剥引号、不反转义 JSON（`formatFrontmatter` 写侧用 `JSON.stringify`），含 `\"` / `\n` 的描述在**所有**读侧（不只 draft arm）仍保留反斜杠；本轮按拍板只把 promptSlots 改为与 skillStore 同源解析，`skillStore.ts` 属 skills 归属未动，建议 skills owner 在 `stripQuotes` 对 `"…"` 走 `JSON.parse` 回退。
+- **需专项（沿用 §7）**：`indexPipeline` / `reranker` / `contextPacker` 无生产调用者，是否启用向量 / 重排 / 打包链属产品决策；MEM-04 本轮只做「诚实上报 + 空表不 embed」，未接线写入方。MEM-11 的历史 candidate 行清理（存量库里已累积的 promoted 候选）会在该 slug 下一次 promote 时被顺带收敛到 5 条，无需迁移；若要一次性全量清理需专项脚本。
+- **既有 UI 文案**：`MemoryPanel` 用户画像预算条改为「N 字符 · 常驻注入 a/limit | 无常驻注入块」，属功能语义修正而非视觉打磨；未出截图（本轮口径不审像素）。
