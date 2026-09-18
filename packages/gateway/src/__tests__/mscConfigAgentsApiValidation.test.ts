@@ -7,7 +7,8 @@
  *     (CFG-08);
  *   - GET /api/config 不回 accessToken / OAuth token / MCP env(回归锁,当前已满足)。
  *
- * 红灯用例标注 TODO(msc-config): 阶段 B 修复。
+ * 阶段 B(t-1868 / t-1962)已把上述红灯全部转绿并补齐 persona / cwd / mcpServers 形状 / POST /
+ * /api/config 405 / 外部写入热生效用例;编号以 docs/audit/msc-config.md §4 为准(CFG-05/06/07)。
  * 运行:npx tsx --test --test-concurrency=1 packages/gateway/src/__tests__/mscConfigAgentsApiValidation.test.ts
  */
 import * as assert from 'node:assert/strict'

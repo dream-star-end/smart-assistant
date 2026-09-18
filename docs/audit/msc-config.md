@@ -263,3 +263,56 @@ env：OPENCLAUDE_HOME(paths.ts:4) · OPENCLAUDE_GATEWAY_BIND/PORT(gatewayBind) �
 | agents.yaml 写回丢注释/键序 | **不修，文档写明** | `yaml.stringify(parse())` 语义；保注释需换 `parseDocument` 往返，收益低风险高 |
 | `/api/me/preferences` 服务端 | **范围外** | 不在 gateway 实现（master），本轮只审 web 消费侧 |
 | `gateway.users` 密码管理 CLI | **范围外/专项** | 与 CFG-08 同属多用户专项 |
+
+---
+
+# 阶段 B · 修复记录 / 验证 / 遗留
+
+> 任务：t-1868「B·config 配置子系统修复」+ 续做 t-1962（fable-5-1-38 掉线后由指挥官 fable-5-1-36 / fable-5-1-63 接手代做）· 分支 `feat/v5-selfhost-msc-config` · 基线 `aeae1d72e`
+> 统计：**发现 25 / 修复 21 / 遗留 4**（CFG-08 最小收口改为「只告警」、CFG-11 暂缓、CFG-07 之 mcpServers.command 范围未收紧、CFG-24 不修）· 新增测试 9 文件 64 例，阶段 A 5 条红灯全部转绿
+> 指挥官拍板（阶段 B 开工前，对应 §7 的 ask_decision 项）：CFG-07 只做「persona 限 HOME + cwd 非根/非系统目录 + 形状校验」这一无争议部分，`mcpServers.command` 允许范围不收紧；CFG-08 单/多用户鉴权语义**零变化**，只在 `doctor` 对 `gateway.users` 遗留模式告警；CFG-11 暂缓（仅容器模式生效，selfhost 不受影响）；CFG-16 onboard 默认模型改取 `SELFHOST_FALLBACK_MODEL`（= sessionManager 兜底 `glm-5.3-zai`，web 不动）；CFG-18 保留 `POST /api/agents`，只改 `bridgeApiAllowlist` 注释使其与实现一致。
+
+## 8. 修复记录
+
+按提交顺序；`server.ts` 按 §6 末尾的规划拆成 4 个独立 commit（每段先 `acquire_file_lock`）。
+
+| commit | 层 | 覆盖问题 | 改了什么 |
+|---|---|---|---|
+| `a7471fdb9` | storage | CFG-02/03/04/05/07/09/15/16 | `config.ts`：新增 `parseOpenClaudeConfig(raw) → {config, warnings}`（`version`≠1 / `port` 非 1-65535 致命，其余缺字段填默认 + warning，未知键透传）；`writeConfig` 改 `acquireKernelFileLock(paths.config+'.lock')` + `tmp-<pid>-<rand>` + `rename`；新增 `updateConfig(fn)` 读-改-写事务（与 `updateAgentsConfig` 同构）；`readAgentsConfig` 过 `normalizeAgentsConfig`（空文件 / 缺 `agents`·`routes` 键 / `default` 指向 ghost → 归一 + warn）；新增 `validateAgentPatch`（permissionMode 五枚举、toolsets `string[]`、mcpServers 形状、persona 限 HOME、cwd 非根非系统目录）供 API 与 CLI 复用；`telegram` 类型对齐运行时字段（`botToken` / `mentionRequired`）；`credentials.ts` 的 `channel` / `accountId` 过 `^[A-Za-z0-9_-]{1,64}$`；新增 `SELFHOST_FALLBACK_MODEL` 常量 |
+| `9a80e302c` | cli | CFG-01/04/09/12/13/14/16 | `onboard.ts`：重跑改深合并（`users` / OAuth / `mcpServers` / `provider` / `terminal` / `telegram` / `defaults.permissionMode` 全保留，agents.yaml 已存在则不碰），端口 / authMode 校验，重跑默认脱敏 token，默认模型取 `SELFHOST_FALLBACK_MODEL`，persona 写相对路径；`doctor.ts`：新增纯函数 `doctorConfigFindings`（归一 warnings + `default` / persona 一致性 + `gateway.users` 遗留模式告警）；`agents.ts`：`agents add` 复用 `AGENT_ID_RE` / `validateAgentPatch`；`gateway.ts`：启动时致命项可读报错 + warnings 日志，`channels` 去 `as any`；`gateway/index.ts` 导出 `gatewayBind` |
+| `6c3705d24` | gateway | CFG-18/21/22 | `auth.ts`：`verifyJwt` 要求 `exp` 为有限数且 `userId` 为非空字符串（单 token 模式零变化）；`advisorConfigStore.ts`：`deleteSession` 校验 id，`markEngineProven` 超长先报 `VALIDATION`；`bridgeApiAllowlist.ts` 注释改为「仅 bridge 路径封禁 POST /api/agents，本地 token 路径保留」 |
+| `d1f780c6c` | web-react | CFG-19/20/23 | `lib/identityCompat.ts`：`expectedUserId` 取已认证 JWT `sub`，拿不到不调 parse；`lib/collaborationConfig.ts`：`CollabMode` 复用 protocol `CollaborationMode` / `isCollaborationMode`；`SettingsCenter.tsx`：关闭即丢弃偏好快照、重开重拉，`patchPref` 加序列号丢弃乱序旧响应；`ProjectSettingsDialog.tsx`：两阶段保存先推进 `contextVersion` 再 `onSave`，失败提示区分两段。fable-5-1-38 遗留的未提交工作区改动，指挥官验证后代提 |
+| `941811be0` | server.ts ① | CFG-04/17 | `/api/config` 只认 `GET`（其余 405）；响应 body 先构造再 `sendJson`，不再先 `writeHead(200)` 再取值造成「200 + 空体」 |
+| `69837c868` | server.ts ② | CFG-05/06/07 | `POST` / `PUT /api/agents` 接入 `storage.validateAgentPatch`，非法 400 不落盘（展示类字段空串 = 清除）；GET 列表 / 详情 / POST / PUT 响应把 `agents[].mcpServers[].env` 投影为 `envKeys`（与 `/api/config` 脱敏形态对齐，磁盘原值不动；已 grep web 无消费 `env` 值） |
+| `091cbb4ea` | server.ts ③ | CFG-02（openclaude.json 侧）/ CFG-10 | OAuth 回调与 ≤10min 定时刷新的凭据落盘改走 `storage.updateConfig` 事务，新增唯一入口 `_persistOAuthCredential`；写回后只把 `auth` 段同步进 `deps.config`（不整体替换内存配置）；`openclaude.json` 缺失时跳过并 warn（与旧行为一致） |
+| `e9b10af47` | server.ts ④ | CFG-10 | agents.yaml 单一内存权威：`_getAgentsConfig` 的 mtime 缓存刷新成为唯一触发点，刷新时 `_syncAgentsConfigSnapshot` 同步替换 `deps.agentsConfig` 并 `router.reload`（CLI / 手改 / 市场同步的外部写入也热生效）；`/api/file` 与 media 的 cwd 白名单改从最新快照取；API 写回统一走 `_adoptWrittenAgentsConfig`。Router 保持同步 API，未改异步（比 §6 计划保守） |
+| （本次） | docs / test | — | 本节三段；`mscConfigAgentsApiValidation.test.ts` 文件头的阶段 A 红灯说明更新为阶段 B 状态 |
+
+新增 / 转绿的测试（共 9 文件 64 例）：`storage/__tests__/mscConfigOpenclaudeJson.test.ts`（20：五组畸形输入归一、`writeConfig` 无 tmp 残留 / 事务 / 未知键保留、`validateAgentPatch`、credentials 段校验）、`mscConfigAgentsYamlShape.test.ts`（4：阶段 A 红灯 #1 #2 转绿 + ghost default 归一）、`cli/__tests__/onboard.test.ts`（7：真 HOME 非交互重跑全保留 / 首装路径不变 / 端口·authMode 校验）、`agentsDoctor.test.ts`（8：`agents add` id 校验、`doctorConfigFindings`）、`gateway/__tests__/mscConfigAgentsApiValidation.test.ts`（8：阶段 A 红灯 #2 #3 #4 转绿 + persona / cwd / mcpServers 形状 / POST / `/api/config` 405 / 外部写入热生效）、`mscConfigAuthAndAdvisorStore.test.ts`（6）、`mscConfigOAuthPersist.test.ts`（2：未知字段保留 / 无 tmp 残留 / 只同步 auth / 缺文件不凭空创建）、`web-react/lib/identityCompat.test.ts`（6）、`components/mscConfigSettingsStateMachine.test.tsx`（3：乱序 patch 丢弃、重开重拉、两阶段保存）。
+
+## 9. 验证（09-18 23:3x，Windows 11 / Node 22.22.0 / 工作树 `wt\msc-config` @ `e9b10af47`）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| 全仓类型检查 | `npx tsc --build` | **PASS**（exit 0） |
+| web-react 类型检查 | `npm run typecheck --workspace packages/web-react` | **PASS** |
+| storage 单测（全包 56 文件） | `npx tsx --test <packages\storage\src\**\*.test.ts>` | 538 例：**510 pass / 26 fail / 2 cancelled**。26 fail + 2 cancelled 全部为 **Windows 环境项且与基线一致**：`identityCompatAssets` ×16（symlink EPERM）、`projectContext` cwd allowlist ×1 与 `skillStore` ×1+2（symlink EPERM）、`kernelFileLock` ×2、`projectContextMigrate` ×1、`skillDraftStore` ×5 —— 后三组在基线工作树 `wt\msc-memory`（aeae1d72e + 纯文档提交）复跑得到**完全相同的 8 条失败**。本轮两个新文件 `mscConfigOpenclaudeJson` / `mscConfigAgentsYamlShape` 全绿 |
+| cli 单测 | `npx tsx --test <packages\cli\src\__tests__\*.test.ts>` | 15 / 15 **PASS**（本轮之前 cli 包零测试） |
+| gateway 相关单测（10 文件） | `npx tsx --test --test-concurrency=1 mscConfig*.test.ts advisorConfigStore bridgeApiAllowlist collaborationConfigHttp envProbe gatewayBind localBridgeAuth pathAcl` | 73 例：**69 pass / 4 fail**；4 条 fail = `envProbe` ×1、`pathAcl` ×2（+1 父级）POSIX 路径断言，阶段 A 已列 **NOT RUN（Windows）**，与基线一致。三个 msc-config 文件 + advisorConfigStore + bridgeApiAllowlist + collaborationConfigHttp 全绿 |
+| web-react 单测 | `npx vitest run identityCompat.test.ts mscConfigSettingsStateMachine.test.tsx SettingsCenter.test.tsx ProjectSettingsDialog.test.tsx PreferencesTab.test.tsx AccountTab.test.tsx collaborationConfig.test.ts --maxWorkers=1` | 7 文件 **84 / 84 PASS** |
+| biome（新增文件） | `biome check <9 个新测试文件>` | **0 error**（按 LF 内容核；Windows 工作区 autocrlf 产生的 CRLF 会让 formatter 误报，已用 `git -c core.autocrlf=false archive` 导出后对照） |
+| biome（既有改动文件） | 基线 vs HEAD 逐文件对照（同上导出法） | **无新增诊断**；顺手消掉 5 条 pre-existing（`config.ts` / `advisorConfigStore.ts` / `cli/gateway.ts` 的 organizeImports+format、`auth.ts` `gateway/index.ts` format）；剩余 `ProjectSettingsDialog.tsx` ×4、`SettingsCenter.tsx` ×3、`collaborationConfig.ts` / `identityCompat.ts` format 均为基线既有，未做全文件重排（同 skills 轮口径） |
+| biome（server.ts） | `biome check --files-max-size=2097152 packages/gateway/src/server.ts` 基线 vs HEAD | lint 剖面**完全一致**：34 条 / 10 种规则同计数（useTemplate 7、noDelete 7、useOptionalChain 5 …），4 段改动未引入新违规。⚠ 见 §10 第 5 条：HEAD 的 `server.ts` 已越过 biome `files.maxSize` 1 MiB |
+| 阶段 A 红灯 | `TODO(msc-config)` 标记 | 5 条红灯全部转绿；测试文件内不再有待修标记 |
+
+`npm ci` 后 `packages/cli/src/index.ts`、`packages/mcp-memory/src/index.ts` 的 `M` 是 autocrlf 假改动，未提交（手册 §2）。
+
+## 10. 遗留
+
+1. **CFG-08 多用户边界**：按拍板只做 `doctor` 告警（`gateway.users` 非空时提示「遗留模式：原始 accessToken 仍可直通」）；`checkHttpAuth` / `login` / JWT 密钥派生 / token 轮换均未动 → **需专项**（同 §7）。
+2. **CFG-11 展示面投影缓存**：暂缓。仅容器模式（三件套 env 齐全）触发，selfhost 不受影响；放开前需确认 `identityCompatRuntime.ts` 文件头「Never a display/sync cache」的安全语义可对展示面放松。
+3. **CFG-07 之 `mcpServers.command` 允许范围**：只做了形状校验（`id` / `command` 字符串、`args string[]`、`env Record<string,string>`），未限定命令白名单；persona 限 HOME、cwd 非根 / 非系统目录已落地。多用户模式开启后此项需与 CFG-08 一并处理。
+4. **CFG-24**（`efficiencyHookConfig` win32 tmp 名）不修；Windows 上 NOT RUN 的既有测试（symlink EPERM / POSIX 路径断言）不修；agents.yaml 写回丢注释 / 键序不修（`yaml.stringify(parse())` 语义，本文档已写明）。
+5. **新发现 · `server.ts` 越过 biome `files.maxSize`**：基线 1,044,171 B → HEAD 1,049,188 B（LF 计），超过 biome 默认上限 1,048,576 B，`biome check packages`（`npm run lint`）对该文件改为报「file too large」并**跳过全部 lint / format / organizeImports**。memory 阶段 B 还会继续加行。建议 integration 合入时在 `biome.json` 加 `"files": { "maxSize": 2097152 }`（或拆分 server.ts —— 需专项）；本轮未改共享配置，留指挥官在 integration 上决定。
+6. **既有文件的 pre-existing biome format 差异**未重排（避免无关大 diff）；`ProjectSettingsDialog.tsx` 两处 `useSemanticElements`、`SettingsCenter.tsx` 一处 `noNoninteractiveTabindex` 为上一轮 UI 审计（SET-12）的有意写法，未动。
+7. **文档未同步项**：`openclaude.json` / `agents.yaml` 的字段级默认值与致命项口径（§2.1 表 + `parseOpenClaudeConfig`）尚未落到用户可见文档（`docs/` 配置说明）；`/api/agents` 响应 `mcpServers[].env → envKeys` 的契约变化需在前端接入 agent 级 MCP 编辑面时注意（当前 web 无消费）。
