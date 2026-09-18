@@ -466,9 +466,10 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 
 下一步：集成⑤（t-1237 前置）从本轮终点起按上表合入 + t-1348 gzip 修复，复跑全量门（`build` 必须绿）；归档终稿 t-897 从集成⑤ 终点起更新 `docs/audit/SUMMARY.md` 与 `archive/*` 的 `[待集成④]` 标记；release-prep t-1237 以 canonical `f1952819f` 重做试合。
 
-## 集成⑤（t-1237 · 2026-09-18 01:45 – 02:15 · 合并 / 门 / 记录 / 推送 fable-5-1-4）
+## 集成⑤（t-1237 · 2026-09-18 01:45 – 02:15 · 合并 / 门 / 记录 / 推送 fable-5-1-4 → 03:10 – 03:35 第二拍截图 / a11y fable-5-1-24 → 20:54 – 21:4x 收尾：全量门复跑 / 门阻断修复 / 记录 / 推送 fable-5-1-35）
 
 > 执行人说明：t-1237 在待办池解锁时被宿主自动领到 fable-5-1-3 名下，而他在交付 t-1567 后已离线；组内在线只剩指挥官 fable-5-1-4 与 fable-5-1-6（t-1598 发布准备预演），用户 02:0x 明示「全权负责，端到端部署上线，不用问我 / 现在就你和另外一个会话了，都不要停」（决策 d-1603），故由指挥官**代执行**本轮合并、门与记录；任务记录仍挂在 fable-5-1-3 名下，以本段为实际交付。
+> 收尾说明（fable-5-1-35，t-1237 于 20:4x 由用户拍板从离线的 fable-5-1-24 名下收回改派）：接手时 `git ls-remote` 实测 origin `feat/v5-selfhost-ocv5-audit-ux` 已在 `aeae1d72e`（= 本段 docs `9103ce7b4` + t-1268 由指挥官 fable-5-1-6 代执行的 3 个提交 `57ad2c823` canonical `f1952819f` 合并 / `04ba13b2e` R2 / `aeae1d72e` RELEASE.md v2.2），本地 = 远端，8 条成员分支 `rev-list` 仍全 0；§5 末行的「第二拍」已由 fable-5-1-24 于 03:10–03:35 在 detached 工作树 `wt\integ5-gate`（同一树 `3ea8b4f09`）跑完两遍（r1 / r2）但只落在仓库外 `.audit-tmp\integ5-rehearsal\gate-second-half.md`（t-1535），未登记进本文。收尾在同一工作树、同一树哈希上把**全量门整套复跑一遍**（含第二拍），结果登记为 §9；唯一新红（`test:browser` 顾问卡文案断言，canonical 合并带入）按 R2 口径以 `test(v5)` 修正后复跑转绿。
 > 起点 `c97a750f8`（集成④ 终点）。任务书 6 条 + 指挥官追加 2 条（t-1575 首屏回归修复、t-1236 QA 报告），共 **8 步 `--no-ff` 合并**、1 个 `chore` accept、1 个 docs（本段）。主克隆 `v5-selfhost` 上操作（d-24），`git log --format=%s c97a750f8..HEAD` 全为 merge / refactor / chore / docs（d-26，无 `fix(v5)`），未 rebase / squash / force-push，未碰 `changelog.json`。
 > 前置：fable-5-1-2 的集成⑤预演 `feat/v5-selfhost-audit-integ5-rehearsal@b6b78e876`（t-1503：6 条已合、typecheck ✅、**build ❌ 475.2KB**）→ 指挥官逐合并点二分归因（§3）→ t-1575 修复分支；QA 集成④ t-1236（fable-5-1-6，docs/audit/qa/qa-integ4.md，三道门由 fable-5-1-3 t-1567 实跑）结论「可进集成⑤，阻断 0；必带 budget-fix + t-1575」。预演分支**不合入**。
 
@@ -526,7 +527,7 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | web-react 全量单测 | `cd packages\web-react; npx vitest run --maxWorkers=2` | ✅ **305 文件 / 4306 例全部通过，0 失败**（339s，`vitest-full.log`）。集成④ 302 / 4279 → +3 文件（`org/OrgSubscribeDialog.test.tsx`、`ui/Checkbox.test.tsx`、`lib/tutorialSignatureWorkIds.test.ts`）/ +27 例 |
 | 真浏览器门 | `$env:OC_E2E_BROWSER='C:\Program Files\Google\Chrome\Application\chrome.exe'; npm run test:browser` | `run.mjs` **68 全过（清单 68 条全部执行）**；`node --test` 87 例 **85 通过 / 2 失败** = `cc-switch-ascii-name` ×2（基线，与集成①②③④逐条相同）；146s（`test-browser-2.log`；首跑 `test-browser.log` 因未设 `OC_E2E_BROWSER` 环境错误 exit 2，非代码问题） |
 | 代码风格 | `npx biome check --line-ending=crlf <52 个改动源文件>` HEAD vs 基线 `c97a750f8` 逐文件对比（`biome-compare.ps1` / `biome-compare.txt`） | **lint 规则新增 0 条**；5 条 `format` 差异全在本轮新增文件（`heroTheme.ts` / `ui/Checkbox.tsx` / `ui/Checkbox.test.tsx` / `hooks/useAppRoute.test.ts` / `scenes-market-audit.tsx`）= Windows 工作树 CRLF 与 formatter 行尾判定的差异，`git ls-files --eol` 显示 blob 为 `i/lf`，Linux CI 不受影响；既有文件计数逐一相同 |
-| ui-preview 全量截图 + a11y 复扫 | 集成④ 同口径（`shoot.mjs` 301 场景 / `scan.mjs` + compare） | **第二拍**：本段提交时尚未跑（两人在线、t-1268 优先），随后在 detached 工作树上补跑并以 docs(v5) 追加结论；t-1236 / t-1524 的 52 张截图抽样（新增阻断 0）与 a11y-C 的 288 场景复扫（白字压 accent 4 → 0）已覆盖本轮改动面 |
+| ui-preview 全量截图 + a11y 复扫 | 集成④ 同口径（`shoot.mjs` 301 场景 / `scan.mjs` + compare） | ~~**第二拍**：本段提交时尚未跑（两人在线、t-1268 优先），随后在 detached 工作树上补跑并以 docs(v5) 追加结论~~ → ✅ **已补跑三遍并登记于 §9**（fable-5-1-24 r1 02:52 / r2 03:15；fable-5-1-35 r3 21:04–21:23，树 `aeae1d72e` = 本段源码态 + canonical 合并）：截图 **303 场景 / 1034 张 / `failures: 0`**（三遍同值）；a11y **303 场景 0 渲染失败**，共同 301 场景九项指标**只降不升**（r2 的 misc +1 为工具噪声，r3 未复现），逐场景真回归 **1 条 P3**（`tutorials-case-gallery` 深色字幕 4.16，§9.3-A，不阻断）；t-1236 / t-1524 的 52 张截图抽样（新增阻断 0）与 a11y-C 的 288 场景复扫（白字压 accent 4 → 0）先期已覆盖本轮改动面 |
 
 ### 6. 已知基线失败（本轮更新）
 
@@ -536,15 +537,19 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | `packages/web-react` `npm run build` 首屏 gzip 预算 | 集成④ 471.4KB ❌ → 预演 475.2KB ❌ | ✅ **本轮已解**：447.8KB（t-1348 + t-1575） |
 | `check:tutorials` 快照漂移 | agents / billing-usage 2 项 | ✅ 已 `--source-only` accept（§4，**待用户终审**） |
 | `test:browser` 环境 | 未设 `OC_E2E_BROWSER` 时找不到 Chrome | 环境项，命令带 env 即可 |
+| `browser-tests/ocv5-210-advisor-dual-app.node-test.mjs`「实际顾问型号 gpt-6-astra」×3（收尾 §9 首跑发现） | canonical 合并 `57ad2c823` 取 OCV5-220 卡片文案「顾问 <型号> · 状态 · 时长」（`bodies.tsx:1272`，t-1279 取舍，`bodyCards.test` 已同步），但 canonical 自带的浏览器用例仍断言旧文案「实际顾问型号 <型号>」，双方同文故合并无冲突、静默带入；t-1268 未跑 `test:browser`（RELEASE.md §3.1c「未跑」）故此前未暴露 | ✅ **收尾已解**：`test(v5)` `e322522a6` 把 3 处断言对齐为 `/顾问 gpt-6-astra/`（纯测试改动，同 R2 `04ba13b2e` 口径），定向 + 全量复跑绿（§9.2） |
+| `browser-tests/ocv5-185-qa.node-test.mjs` `EPERM: operation not permitted, symlink … node_modules/@openclaude/protocol`（收尾 §9 首跑） | 用例 `ensureProtocolShim()` 用 `symlinkSync` 建目录符号链接，Windows 非管理员 shell 无 `SeCreateSymbolicLinkPrivilege`（同机 `New-Item -ItemType SymbolicLink` 实测「需要管理员权限」，Junction 可建） | 环境项：在工作树 `packages\web-react\node_modules\@openclaude\protocol` 预建 **Junction** → `packages\protocol`（gitignore 内），用例走 `EEXIST` 分支后 15/15 绿；集成④ §6 已登记同类「需 junction」 |
 
 ### 7. 遗留 / 后续范围
 
 - **待用户终审**：四笔教程同步快照 accept（集成③ 17 项 / t-1046 / 集成④ 1 项 / 本轮 2 项）；归档终稿 t-897（持有人 fable-5-1-7 离线，待重派）。
 - **a11y 同源遗留**：`TutorialCenter.tsx:387`「案例」模式头部图标块 `bg-accent text-white`（a11y-c.md §3 已给一行改法，归 tutorials）。
 - biome `format` 5 个新文件（§5）：如需消掉，在 Linux 或以 `--line-ending=lf` 跑 `biome format --write`，与逻辑无关。
-- 截图 / a11y 第二拍（§5 末行）。
-- **不合入**：`integ5-rehearsal@b6b78e876`（t-1503 预演，6 个 `rehearsal:` 合并）、`release-rehearsal@a4452c7b6`（t-1279 发布预演 + `docs/audit/RELEASE.md` v2.1，RELEASE.md 由 t-1268 带入）、`release-prep-rehearsal`（t-1598，进行中）。
-- **canonical**：`origin/feat/v5-selfhost` = `f1952819f`（比集成④时记录再 +1：`feat(v5): wire Sand-usable Cursor families into the picker`，含迁移 0281）；服务器 live 已是 `f1952819f` 且 0281 已 apply（RELEASE.md v2.1 §2.2b）。t-1268 从本轮终点合 canonical，7 处冲突解法见 RELEASE.md §1.2 / §3（AgentPicker.tsx 需叠回 a11y-C 改动）。
+- ~~截图 / a11y 第二拍（§5 末行）~~ → **已补跑三遍并登记（§9）**。
+- **a11y 同源遗留（第二拍新发现 1 条，P3，不阻断）**：`tutorials/CaseFieldReportVisual.tsx:131`「GBM」指标字幕 `text-white/55`（11px）在暗色下压 leftover-tut `04006714f`（TU-34）抬亮后的 hero 底 `#2d4953`，ratio **4.16 < 4.5**（集成④ 同元素压写死的 `#07111f` 未命中）；一行改 `text-white/70` 或 hero `-fg` token，owner tutorials。同因漂移（before 已命中、非回归）：`tutorials-case-detail*` 的 `ArtifactPreview2 text-white/35` 命令行字幕 `#5d6268/#050d17` → `#636772/#0f1626`（3.21）。
+- **截图台竞态（工具项，不阻断）**：`scenes-taskboard.tsx` `taskboard-stage-settings` 桌面端 `?menu:` + 两次点击链（≈≥640ms）> `shoot.mjs` `OC_UI_SHOT_DELAY` 400ms，r1 / r3 捕到「开发实现」编辑器展开（场景意图）、r2 捕到收起态；harness `failures 0` 不感知。建议该场景按视口跳过 `?menu:` 步或提高该组 delay，owner taskboard。`.audit-tmp\a11y\scan.mjs`（仓库外）`scroll-region-not-focusable` 对原生可聚焦 `textarea` 误报（r2 misc +1），建议排除原生可聚焦元素。
+- **不合入**：`integ5-rehearsal@b6b78e876`（t-1503 预演，6 个 `rehearsal:` 合并）、`release-rehearsal@a4452c7b6`（t-1279 发布预演 + `docs/audit/RELEASE.md` v2.1，RELEASE.md 由 t-1268 带入）、`release-prep-rehearsal@e75749dd0`（t-1598）。
+- **canonical**：本段提交时 `origin/feat/v5-selfhost` = `f1952819f`（比集成④时记录再 +1：`feat(v5): wire Sand-usable Cursor families into the picker`，含迁移 0281）；服务器 live 已是 `f1952819f` 且 0281 已 apply（RELEASE.md v2.1 §2.2b）。t-1268 已由指挥官代执行把 `f1952819f` 合进 integration（`57ad2c823`，7 处冲突解法见 RELEASE.md §1.2 / §3.1b / §3.1c）。**收尾 21:0x `git ls-remote` 实测 canonical 又前进到 `97f128d2b`**（+1：`feat(v5): send Cursor Sand Direct to api2 as 3.21.12 sand-desktop`），`rev-list --count integration..origin/feat/v5-selfhost` = 1，t-1268 push canonical 前需再合这一笔并复跑门（本轮不做，边界）。
 
 ### 8. 分支合入状态单（集成⑤ 终点现算）
 
@@ -562,3 +567,57 @@ Windows 上该门禁此前被 TU-37（标记路径反斜杠进哈希 → 26 项�
 | qa-integ4 | `31a8a92d6` | **集成⑤ `936d44e85`** | 0 | = 本地 |
 
 下一步：**t-1268 发布准备**——integration 合 canonical `f1952819f`（RELEASE.md §3.1 命令 + t-1598 实测解法），复跑全量门（build ≤ 460KB），把 `docs/audit/RELEASE.md` 带进 integration，push；随后 canonical `--ff-only` + push，服务器按 RELEASE.md §4 执行（t-1269）。
+> 收尾时（§9）核对：上句前半已由指挥官代执行落地（`57ad2c823` / `04ba13b2e` / `aeae1d72e`，已在 origin integration）；剩余 = 再合 canonical 新增的 `97f128d2b`（§7 末条）→ 复跑门 → canonical `--ff-only` + push → t-1269。
+
+### 9. 收尾：全量门复跑（含第二拍）· 门阻断修复 · 推送（fable-5-1-35 · 20:54 – 21:4x）
+
+#### 9.1 树与前置核对
+
+| 项 | 值 |
+|---|---|
+| 工作树 / 分支 | `wt\integ5-gate`（fable-5-1-24 的 detached 树，接手时仅 autocrlf 两处假 `M`、无 stash、reflog 单条；收尾时 `git checkout feat/v5-selfhost-ocv5-audit-ux` 附着到 integration 分支，同一提交）；`node_modules/@openclaude/protocol` junction → 本树 ✅；Node v22.22.0 |
+| 门所在源码态 | `aeae1d72e`（tree **`3ea8b4f094aa6e109da4548671576d008ff4c3a4`**，与 fable-5-1-24 r1 / r2 完全同树）= 本段 `91358ce54` / `9103ce7b4` + `57ad2c823`（canonical `f1952819f` 合并）+ `04ba13b2e`（R2）+ `aeae1d72e`（RELEASE.md v2.2）。`merge-base --is-ancestor` `9103ce7b4` / `f1952819f` / t-1575 `a947662bb` → integration 均为真 |
+| 成员分支 | `rev-list --count integration..<分支>`：budget-fix `65019b5dc` / qa-a11y `eed1f3989` / leftover-shell `7e7c7e43b` / leftover-tut `69e18aa93` / leftover-tut-budget `a947662bb` / a11y-c `c35fd00c6`（远端同值）/ archive `35e3ec7c9` / qa-integ4 `31a8a92d6` **全为 0**；`integ5-rehearsal@b6b78e876` = 6（预演，不合入）；`git grep -l '^<<<<<<< '` 于 `packages docs` = 0 |
+| 远端 | `git ls-remote --heads origin`（21:0x）：`feat/v5-selfhost-ocv5-audit-ux` = `aeae1d72e`（= 本地，无未推提交；主克隆只配了 canonical 一条 fetch refspec，`origin/…audit-ux` 跟踪引用停在陈旧的 `9103ce7b4`，核对一律用 `ls-remote`）；`feat/v5-selfhost`（canonical）= **`97f128d2b`**（§7 末条） |
+| 与集成④ 终点差 | `git diff --shortstat c97a750f8 aeae1d72e` = 97 files, +3986 / −401；`rev-list --count` = 54（含 `--no-ff` 带入的成员提交与 canonical 上游 7 提交） |
+
+#### 9.2 全量门（r3 = 本人实跑；r1 / r2 = fable-5-1-24 `gate-second-half.md`；脚本 `.audit-tmp\integration\integ5-final\run-gates-final.ps1`，汇总 `GATES-SUMMARY.txt`，各步 `*.log` 首行含 HEAD / TREE / 命令 / 起止时间）
+
+| 门 | 命令（cwd 工作树根） | r3 结果 | 交叉核对 |
+|---|---|---|---|
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ exit 0（1s，`tsbuildinfo` 命中 02:51 的同树缓存）；**`npx tsc -b --force` 无缓存复跑 ✅ exit 0（50s，`typecheck-force.log`）** | §5 ✅ 29s（`91358ce54`）；RELEASE §3.1c ✅ 29s（`04ba13b2e`） |
+| 预览台类型检查 | `npm run typecheck:preview --workspace packages/web-react` | ✅ exit 0（34s） | §5 ✅ 19s |
+| 教程门禁 | `npm run check:tutorials` | ✅ `OK · 26 capabilities · 12 real-world cases · 26 media pairs`（4s）；无新漂移（§4 的 accept 第 70 条仍为最后一条） | §5 ✅ 同值 |
+| **首屏 gzip 预算（`build`）** | `npm run build --workspace packages/web-react` → `node .audit-tmp\release-rehearsal\measure-first-screen.mjs packages\web-react\dist 471040` | ✅ exit 0（31s，5108 modules，`built in 24.11s`）；**首屏闭包 13 chunk gzip 合计 448.3KB（459061 B）≤ 预算 460.0KB（471040 B），余量 11.7KB**：`main` 130.0 / `tapePayload` 123.2 / `styles` 78.0 / `react-vendor` 55.3 / `radix-vendor` 29.9 / `lucide-vendor` 17.7 / `media` 5.2 / `viewport-shared` 2.9 / `useAppRoute` 2.0 / `optionsGroup` 1.7 / `Markdown` 1.2 / `sanitizeChatMessages` 0.8 / `rolldown-runtime` 0.4 | r1 / r2 **448.3KB 同一组数值**；RELEASE v2.2 §3.1c 同值；§5（合 canonical 前）447.8KB；集成④ 471.4KB ❌ → 绿 |
+| web-react 全量单测 | `cd packages\web-react; npx vitest run --maxWorkers=2` | ✅ **305 文件 / 4311 例全部通过，0 失败**（393s，`vitest-full.log`） | §5 305 / 4306 → +5 例（canonical 合并 + R2 `App.test` 对齐） |
+| 真浏览器门 | `$env:OC_E2E_BROWSER=…chrome.exe; npm run test:browser` | **首跑**（`test-browser.log`，21:02）：`run.mjs` **68 全过**；`node --test` 73 例 69 通过 / **4 失败** = 基线 `cc-switch-ascii-name` ×2 + **`ocv5-185-qa` EPERM symlink（环境）** + **`ocv5-210-advisor-dual-app` 断言漂移（真红，§6）**。→ 预建 junction + `test(v5)` `e322522a6` 修正 3 处断言 → **定向复跑** `node --test ocv5-185-qa + ocv5-210-advisor-dual-app` ✅ **16 / 16**（29s，`test-browser-targeted-2.log`）→ **全量复跑**（`test-browser-2.log`，21:27–21:29）：`run.mjs` **68 全过**；`node --test` **87 例 85 通过 / 2 失败 = `cc-switch-ascii-name` ×2（基线，与集成①②③④⑤逐条相同）**，125s | §5 68 全过 + 85 / 2 基线（`91358ce54`）；RELEASE §3.1c **未跑**（本轮首次在合 canonical 后的树上实跑） |
+| ui-preview 全量截图 | `cd packages\web-react; OC_UI_SHOTS=…\integ5-final\shots-integ5; 不设 OC_UI_SCENES; node browser-tests\ui-preview\shoot.mjs` | ✅ exit 0（680s）；**303 场景 / 1034 张 / `failures: 0` / `retried: 0`**；`unmockedApi` = `listCronChannels` / `listProjectAssets`（同集成②③④）。与 r2 逐张字节比对 **883 / 1034 一致**、151 张差异（动效 / 光标 / 时序类，r1↔r2 为 130 张同类）。Read 抽看 5 张：`org-subscribe-dialog--desktop--dark`「当前」徽章浅紫底深字；`misc-options-partial--mobile--dark` 已选项浅紫圆底深勾（集成④唯一肉眼残留已消）；`composer-agent-picker--desktop--light`「默认」徽章 / 顾问三卡 / 「同时设为新对话的默认协作方式」canonical 文案；`market-review-partial--desktop--light` K-27 `indeterminate` 全选正确、kill-switch 禁用「下架」；`taskboard-stage-settings--desktop--light` 捕到「开发实现」编辑器展开态（场景意图，见 §7 竞态项） | r1 / r2 303 / 1034 / 0 / 0 同值；集成④ 301 / 1026 → +2 场景（`market-publish-agent-toolsets`、`market-review-partial`）+8 张 |
+| a11y 复扫 + 对比 | `OC_REPO=wt/integ5-gate OC_A11Y_OUT=…\integ5-final\a11y\results node .audit-tmp\a11y\scan.mjs`；对比 `.audit-tmp\integ5-rehearsal\a11y\compare-integ5.mjs`（before = `.audit-tmp\integration\a11y-integ4\results` 集成④ `2d2b5cafc` 301 场景；`OC_A11Y_AFTER` 指向 r3）；汇总 `report.mjs` | ✅ exit 0（488s）；**303 场景 0 渲染失败**。共同 301 场景九项（before → r3）：cL 49 → **47**、cD 77 → **71**、t24 385 → 385、t44 174 → **161**、names 11 → 11、ax 1 → 1、tabBad 12 → 12、click 192 → 192、misc 317 → **317**——**只降不升，无一项上升**。逐场景改善 15、**回归 1**（`tutorials-case-gallery` cD 0 → 1，§9.3-A，P3）。仅 after 有的 2 个新场景：`market-publish-agent-toolsets` t24 1；`market-review-partial` cL 1 / cD 1 / t24 6 / click 2。t-762 九条 P2 合计 0；`shell#1` 深色 `bg-accent + text-white` 4 → **0**；a11y-C / QA-a11y 清单靶向 12 → **0** | r2：同九项且 misc 317 → 318（+1 = `taskboard-stage-settings` textarea 工具噪声，r1 / r3 均未复现）、回归 2（含该噪声）；r1 回归 1；三遍的唯一真回归同为 §9.3-A |
+| 代码风格 | `biome check --line-ending=crlf` 对 `91358ce54..HEAD` 改动的 20 个 web-react `.ts/.tsx/.mjs`（canonical 合并 + R2 触碰面），HEAD 工作树 vs 临时 detached 工作树 `91358ce54` 逐文件计数（`biome-compare-2.txt`，`biome-head2.log` / `biome-base2.log`） | **新增 0**（20 文件 base = head 逐一相同；现存计数为既有 `format` / `organizeImports` / `useLiteralKeys` 项，canonical 上游自带）。首次尝试的 stdin 方法（`biome-compare.txt` 记 NEW+40）为方法伪差（stdin 模式输出格式不同、基线计为 0），作废 | §5：集成⑤ 52 文件 vs `c97a750f8` lint 新增 0 |
+
+**判定**：八道门全绿（`test:browser` 仅剩五轮相同的 2 条基线红），首屏 448.3KB ≤ 460KB；集成⑤ 8 条分支 + t-1575 修复全部在树上；无冲突标记。
+
+#### 9.3 异常清单（r1 / r2 / r3 汇总）
+
+| # | 项 | 级别 | 处置 |
+|---|---|---|---|
+| A | `tutorials-case-gallery` 深色「GBM」字幕 `#a1adb1/#2d4953` 4.16 < 4.5（`MetricNumber < BikeModelComparison < CaseFieldReportVisual`，`text-white/55`，11px） | P3 · 真回归（三遍一致） | 归因 leftover-tut `04006714f`（TU-34 hero token 抬亮暗色底）；一行修法见 §7；owner tutorials；装饰性字幕，不阻断 |
+| B | `taskboard-stage-settings` misc 0 → 1（仅 r2） | 工具噪声 | `scroll-region-not-focusable` 命中原生可聚焦 `textarea`（同集成④基线 `composer-loaded` 同类），折行差异为字体 / 布局 settle 时序；r1 / r3 = 0；不改产品代码 |
+| C | `taskboard-stage-settings--desktop--*` 三遍画面不同（r1 / r3 展开、r2 收起） | 场景竞态 | 点击链 > shot delay，见 §7；owner taskboard；harness 不感知 |
+| D | `ocv5-210-advisor-dual-app` 3 处「实际顾问型号」断言 | 真红 · 已解 | `test(v5)` `e322522a6`，§6 |
+| E | `ocv5-185-qa` EPERM symlink | 环境 · 已绕 | 预建 junction，§6 |
+| F | `test:browser` 产生的 `packages/web-react/test-results/`（18 文件，未被 gitignore） | 产物 | 未入库，移至 `.audit-tmp\integration\integ5-final\test-results\` |
+| G | canonical 又前进 `97f128d2b` | 说明 | t-1268 边界，§7 末条 |
+
+#### 9.4 产物（均在 `D:\code\test_project\test123\.audit-tmp\integration\integ5-final\`，仓库外）
+
+`run-gates-final.ps1` / `GATES-SUMMARY.txt`；`typecheck.log` / `typecheck-force.log` / `typecheck-preview.log` / `check-tutorials.log` / `vite-build.log` / `measure-first-screen.log` / `vitest-full.log`；`test-browser.log`（首跑 4 红）/ `test-browser-targeted-2.log` / `test-browser-2.log`（全量复跑）；`shoot-all.log` + `shots-integ5\`（1034 PNG + `manifest.json`）；`a11y-scan.log` + `a11y\results\`（303 JSON + `_summary.json`）/ `a11y-compare.log` / `a11y-report.log`；`biome-compare-2.txt` + `biome-head2.log` / `biome-base2.log`（作废的 `biome-compare.txt` / `biome-base.log` 保留）；`dual-app-fix.diff` / `commit-test-fix.txt`；`canon\`（canonical / 集成⑤态相关文件导出，归因用）。r1 / r2 产物见 `.audit-tmp\integ5-rehearsal\`（`gate-second-half.md` §7）。
+
+#### 9.5 提交与推送
+
+| 提交 | 内容 |
+|---|---|
+| `e322522a6` `test(v5)` | `browser-tests/ocv5-210-advisor-dual-app.node-test.mjs` 3 处断言 `/实际顾问型号 gpt-6-astra/` → `/顾问 gpt-6-astra/`（+5 / −3，含 2 行取舍注释） |
+| 本 docs 提交 | INTEGRATION.md 集成⑤：标题接手链、收尾说明、§5 末行、§6 +2 行、§7 更新、§8 下一步核对、§9 |
+
+推送：`git push origin feat/v5-selfhost-ocv5-audit-ux`（fast-forward，`aeae1d72e` → 本 docs 提交），推后 `git ls-remote` 核对见 complete_task 交付。未合 canonical、未 push canonical、未碰服务器（t-1268 / t-1269 边界）。
