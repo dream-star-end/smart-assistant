@@ -19,7 +19,16 @@ const { handleTaskboardApi, TASKBOARD_MAX_BODY_BYTES } = await import('../http.j
 const { openTaskboardDb } = await import('../db/index.js')
 
 const dirs: string[] = [testHome]
+const openDbs: Array<ReturnType<typeof openTaskboardDb>> = []
 afterEach(() => {
+  // 先关 DB 再删目录:Windows 上 sqlite 句柄未关会让 rmSync 抛 EBUSY(hookFailed 掩盖真实断言结果)。
+  while (openDbs.length) {
+    try {
+      openDbs.pop()?.close()
+    } catch {
+      /* already closed */
+    }
+  }
   while (dirs.length) {
     const dir = dirs.pop()
     if (dir) rmSync(dir, { recursive: true, force: true })
@@ -29,7 +38,9 @@ afterEach(() => {
 function freshDb() {
   const dir = mkdtempSync(join(tmpdir(), 'oc-tb-pmem-body-'))
   dirs.push(dir)
-  return openTaskboardDb(join(dir, 'taskboard.db'))
+  const db = openTaskboardDb(join(dir, 'taskboard.db'))
+  openDbs.push(db)
+  return db
 }
 
 async function withServer(
@@ -66,7 +77,7 @@ async function post(base: string, path: string, rawBody: string) {
 }
 
 describe('MSC-memory 阶段 A 红灯用例 · 项目记忆 HTTP body', () => {
-  // TODO(msc-memory): 阶段 B 修复 MEM-05 —— dispatchProjectMemory 改用 http.ts 的 readJsonBody
+  // 阶段 B 已修复(t-1982) MEM-05 —— dispatchProjectMemory 改用 http.ts 的 readJsonBody
   // (带 TASKBOARD_MAX_BODY_BYTES),超限应 413,与 taskboard 其余路由一致。
   it('MEM-05 超过 TASKBOARD_MAX_BODY_BYTES 的项目记忆 POST 应 413', async () => {
     const db = freshDb()
@@ -95,7 +106,7 @@ describe('MSC-memory 阶段 A 红灯用例 · 项目记忆 HTTP body', () => {
     })
   })
 
-  // TODO(msc-memory): 阶段 B 修复 MEM-05 —— 畸形 JSON 应映射为 400(InvalidJsonError),不是 500。
+  // 阶段 B 已修复(t-1982) MEM-05 —— 畸形 JSON 应映射为 400(InvalidJsonError),不是 500。
   it('MEM-05 畸形 JSON 的项目记忆 POST 应 400 而不是 500', async () => {
     const db = freshDb()
     await withServer({ db, actor: 'human' }, async (base) => {

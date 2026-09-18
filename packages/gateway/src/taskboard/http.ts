@@ -693,7 +693,7 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
-  if (await dispatchProjectMemory(req, res, url, method, db, actor)) return
+  if (await dispatchProjectMemory(req, res, url, method, db, actor, readJsonBody)) return
 
   const projectItem = path.match(/^\/api\/board\/projects\/([^/]+)$/)
   if (projectItem) {

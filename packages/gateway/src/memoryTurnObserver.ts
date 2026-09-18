@@ -1,5 +1,5 @@
 import { readdir, realpath, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { isAbsolute, join, relative } from 'node:path'
 
 import type { ToolCalledEvent, TurnCompletedEvent } from '@openclaude/protocol'
 import {
@@ -50,10 +50,30 @@ async function resolveMemoryDirRealPath(dirPath: string): Promise<string | null>
   }
 }
 
-async function isSharedMemoryDir(agentId: string): Promise<boolean> {
+/** `child` 是否落在 `root` 目录树内(含相等);两边都应是已 realpath 的绝对路径。 */
+function isPathInside(root: string, child: string): boolean {
+  const rel = relative(root, child)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+/**
+ * 记忆目录是否是「指向别处的共享符号链接」(多 agent 共用一份 memory/ → 快照 diff 归因
+ * 不清,事件要盖 attribution:'ambiguous')。
+ *
+ * 判据是 **realpath 后是否仍在本 agent 目录树内**,而不是 `realpath !== 词法路径` 的裸字符串
+ * 比较(MSC MEM-13):HOME 本身经过 symlink / junction / Windows 8.3 短名 / macOS `/var`→
+ * `/private/var` 时,所有 agent 的 realpath 都与词法路径不同,裸比较会把独占目录一律误判为
+ * 共享,让整份用量遥测的归属信号失真。agent 根目录也 realpath 后再比前缀,两边口径一致。
+ */
+export async function isSharedMemoryDir(agentId: string): Promise<boolean> {
   const dirPath = new MemoryDir(agentId).dirPath()
   const dirRealPath = await resolveMemoryDirRealPath(dirPath)
-  const shared = dirRealPath != null && dirRealPath !== dirPath
+  let shared = false
+  if (dirRealPath != null) {
+    const agentRoot = paths.agentDir(agentId)
+    const agentRootReal = (await resolveMemoryDirRealPath(agentRoot)) ?? agentRoot
+    shared = !isPathInside(agentRootReal, dirRealPath)
+  }
   logSharedMemoryDirOnce(agentId, dirPath, dirRealPath, shared)
   return shared
 }

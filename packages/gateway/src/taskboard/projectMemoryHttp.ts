@@ -220,6 +220,15 @@ export function isProjectMemoryPath(path: string): boolean {
   return /^\/api\/board\/projects\/[^/]+\/memories(\/|$)/.test(path)
 }
 
+/**
+ * Bounded JSON body reader injected by the taskboard router (http.ts `readJsonBody`):
+ * enforces TASKBOARD_MAX_BODY_BYTES and throws the router's BodyTooLargeError /
+ * InvalidJsonError so `mapHttpError` answers 413 / 400 exactly like every other
+ * /api/board route. This module used to ship its own unbounded reader whose
+ * JSON.parse failure surfaced as 500 (MSC MEM-05).
+ */
+export type ProjectMemoryJsonReader = (req: IncomingMessage) => Promise<Record<string, unknown>>
+
 export async function dispatchProjectMemory(
   req: IncomingMessage,
   res: ServerResponse,
@@ -227,6 +236,7 @@ export async function dispatchProjectMemory(
   method: string,
   db: TaskboardDb,
   actor: Actor,
+  readJson: ProjectMemoryJsonReader,
 ): Promise<boolean> {
   const path = url.pathname
   const listOrCreate = path.match(/^\/api\/board\/projects\/([^/]+)\/memories$/)
@@ -260,18 +270,6 @@ export async function dispatchProjectMemory(
     return true
   }
   return false
-}
-
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
-  const raw = Buffer.concat(chunks).toString('utf8')
-  if (!raw.trim()) return {}
-  const parsed: unknown = JSON.parse(raw)
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new TaskboardValidationError('request body must be an object')
-  }
-  return parsed as Record<string, unknown>
 }
 
 export type { CandidateStatus }

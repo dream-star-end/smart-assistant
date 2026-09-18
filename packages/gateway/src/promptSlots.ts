@@ -42,6 +42,7 @@ import {
   isProjectContextEnabled,
   loadFrozenProjectContext,
   frozenProjectDigests,
+  parseFrontmatter,
   paths,
   type FrozenProjectContext,
   readAgentsConfig,
@@ -388,6 +389,17 @@ function extractUserAlwaysBlock(text: string): string | null {
   const body = text.slice(start + USER_ALWAYS_START.length, end)
   if (body.includes(USER_ALWAYS_START) || body.includes(USER_ALWAYS_END)) return null
   return body.trim() || null
+}
+
+/**
+ * user.md 里**会被注入**的那部分(单个合法 `oc-user-always` 块,trim 后)的字符数;无块 /
+ * 块非法 → 0。memory/user API 把它作为 `alwaysCharCount` 回给 UI,与 `limit`
+ * (USER_PROFILE_INJECT_MAX_CHARS)同口径比较——全文长度 charCount 只是展示,不是预算
+ * (MSC MEM-01)。与 buildUserSlot 共用 extractUserAlwaysBlock,单一权威。
+ */
+export function userProfileAlwaysCharCount(text: string): number {
+  if (typeof text !== 'string') return 0
+  return extractUserAlwaysBlock(text)?.length ?? 0
 }
 
 function buildPromptSkillStore(
@@ -794,8 +806,11 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   if (ctx.skillEvalDraft) {
     try {
       const raw = readFileSync(`${ctx.skillEvalDraft.dir}/SKILL.md`, 'utf-8')
-      const m = raw.match(/^description:\s*(.+)$/m)
-      const desc = m ? m[1].trim().replace(/^"|"$/g, '') : null
+      // 与 skillStore 同一解析器读草稿 frontmatter(skills 审计 S-08):此前用
+      // /^description:\s*(.+)$/m 裸正则 + 只剥双引号,会把正文里的 `description:` 行、
+      // CRLF 尾巴、单引号值一起读错;parseFrontmatter 只看 frontmatter 段且与写侧同源。
+      const draftDesc = parseFrontmatter(raw).meta.description
+      const desc = typeof draftDesc === 'string' && draftDesc.trim() ? draftDesc.trim() : null
       if (desc) {
         skillList = skillList.map((s) =>
           s.name === ctx.skillEvalDraft?.name ? { ...s, description: desc } : s,
