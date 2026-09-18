@@ -3136,7 +3136,9 @@ export const api = {
   updateSkill: (
     a: AuthSession,
     name: string,
-    body: { description?: string; body?: string; tags?: string[]; agentIds?: string[] },
+    // expectedVersion(S-01 乐观并发):带上则版本不符时后端回 409(skill version conflict),
+    // 前端提示重载并保留草稿;省略则维持旧的后写者胜行为(兼容旧调用)。
+    body: { description?: string; body?: string; tags?: string[]; agentIds?: string[]; expectedVersion?: string },
   ) =>
     jsonOrThrow<{ ok: boolean }>(
       callWithRefresh(a, (t) =>
