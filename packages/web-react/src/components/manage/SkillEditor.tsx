@@ -36,7 +36,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, apiErrorMessage } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import type { ModelRates } from "../../lib/skillRunCost";
 import type { AuthSession, MarketplaceMyAgent, SkillDetail } from "../../lib/types";
 import { cn } from "../../lib/utils";
@@ -384,6 +384,8 @@ export function SkillEditor({
             description: submittedDesc.trim(),
             body: submittedBody,
             tags: detail?.tags,
+            // S-01 乐观并发:带上加载时的版本;若被其他地方改过,后端回 409,草稿保留。
+            expectedVersion: detail?.version,
             ...(scopeEditable ? { agentIds: submittedScope } : {}),
           });
           savedSkillMd = true;
@@ -399,7 +401,12 @@ export function SkillEditor({
         }
       } catch (e) {
         failedPaths.push(p);
-        firstErr = firstErr ?? apiErrorMessage(e, `保存 ${p === SKILL_MD ? "正文" : p} 失败`);
+        // S-01:版本冲突(409)给出可操作提示,且不清 dirty —— 本地草稿保留,重载后再存。
+        const msg =
+          e instanceof ApiError && e.status === 409
+            ? "该技能已被其他地方修改，请重新加载后再保存（你的改动已保留）"
+            : apiErrorMessage(e, `保存 ${p === SKILL_MD ? "正文" : p} 失败`);
+        firstErr = firstErr ?? msg;
       }
     }
 
@@ -656,6 +663,11 @@ export function SkillEditor({
                   适用：<AgentScopeSummary agentIds={detail?.agentIds} agents={agents} />
                 </Card>
               ))}
+            {typeof detail?.priority === "number" && (
+              <p className="text-meta text-muted">
+                注入排序优先级：{detail.priority}（越大越靠前；在 SKILL.md frontmatter 的 priority 字段维护）
+              </p>
+            )}
             {writable ? (
               <Field
                 label={detail?.version ? `正文（v${detail.version}；保存后旧版自动入历史）` : "正文"}

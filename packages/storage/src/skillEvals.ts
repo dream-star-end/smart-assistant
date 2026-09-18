@@ -10,7 +10,10 @@
  *    积分的行为都必须用户显式开启(boss 红线:不静默扣费)。
  */
 
-export const MAX_EVAL_CASES = 8
+import { MAX_EVAL_CASES } from '@openclaude/protocol'
+
+// 评测用例上限的单一权威 = protocol/skillLimits.ts（storage/gateway/web 同源，防跨层漂移，见 msc-skills.md · S-03）。
+export { MAX_EVAL_CASES }
 export const MAX_EVAL_ASSERTIONS = 8
 export const MAX_EVAL_PROMPT_CHARS = 4000
 export const MAX_EVAL_ASSERTION_CHARS = 500

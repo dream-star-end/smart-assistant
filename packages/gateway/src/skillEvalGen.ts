@@ -151,7 +151,7 @@ ${m.description ? `描述:${m.description}\n` : ''}
 ${truncate(m.skillMd, SKILL_MD_MAX_CHARS)}
 ${existing}${usage}
 ## 你的任务
-生成 3-5 个评测用例。每个用例:
+生成 3-${MAX_EVAL_CASES} 个评测用例。每个用例:
 - prompt:一句到一段的真实任务措辞(像用户真会这么说),必要时含最小上下文;不要提"技能/评测"字样。
 - assertions:2-6 条可**客观判定**的验收断言,每条能独立判 PASS/FAIL,且 PASS 必须能在输出里找到具体证据;避免"看起来不错/质量高"这类主观词。
 - expectedOutput(可选):简短的参考答案要点,作为软参照。

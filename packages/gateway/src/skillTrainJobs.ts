@@ -13,10 +13,11 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import { paths, validateSkillName } from '@openclaude/storage'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
+import { SKILL_RUN_RETENTION_DEFAULTS, selectRunsToEvict } from './skillJobRetention.js'
 
 /** Same shape as SkillTrainJobStore.newRunId() output; guards path construction. */
 const VALID_RUN_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/
@@ -114,14 +115,31 @@ export interface StartGuard {
   reason?: string
 }
 
+/** 可淘汰的终态:合并/放弃/失败。queued/running(活跃)与 diff_ready(草稿待处理,已付费)永不淘汰。 */
+const TRAIN_EVICTABLE: ReadonlySet<SkillTrainStatus> = new Set(['merged', 'discarded', 'failed'])
+
 export class SkillTrainJobStore {
   private readonly runs = new Map<string, SkillTrainRun>()
   private readonly maxConcurrent: number
   private readonly onChange: SkillTrainRunChange
+  private readonly retentionMs: number
+  private readonly keepPerSkill: number
+  private readonly maxEntries: number
 
-  constructor(opts: { maxConcurrent?: number; onChange?: SkillTrainRunChange } = {}) {
+  constructor(
+    opts: {
+      maxConcurrent?: number
+      onChange?: SkillTrainRunChange
+      retentionMs?: number
+      keepPerSkill?: number
+      maxEntries?: number
+    } = {},
+  ) {
     this.maxConcurrent = Math.max(1, opts.maxConcurrent ?? 2)
     this.onChange = opts.onChange ?? (() => {})
+    this.retentionMs = opts.retentionMs ?? SKILL_RUN_RETENTION_DEFAULTS.retentionMs
+    this.keepPerSkill = opts.keepPerSkill ?? SKILL_RUN_RETENTION_DEFAULTS.keepPerSkill
+    this.maxEntries = opts.maxEntries ?? SKILL_RUN_RETENTION_DEFAULTS.maxEntries
   }
 
   /** New run id (caller may also pass one). */
@@ -426,6 +444,43 @@ export class SkillTrainJobStore {
    * symlinked `~/.openclaude/skill-drafts` from redirecting reads/writes outside HOME
    * (mirrors SkillDraftStore.resolveDraftsRoot's containment model).
    */
+  /**
+   * S-02:淘汰过期/超量的终态训练 run(merged/discarded/failed)——内存 + 落盘 run 目录一并清。
+   * **永不动 queued/running(活跃)与 diff_ready(草稿待用户处理,已付费)**;每技能保留最新
+   * keepPerSkill 条。null skillName(自动选目标)归一到同一分组键。返回淘汰条数。
+   */
+  prune(now: number): number {
+    const evict = selectRunsToEvict(
+      [...this.runs.values()].map((r) => ({
+        id: r.runId,
+        skillKey: r.skillName ?? '(auto)',
+        finishedAt: r.finishedAt ?? r.updatedAt ?? r.startedAt,
+        evictable: TRAIN_EVICTABLE.has(r.status),
+      })),
+      { now, retentionMs: this.retentionMs, keepPerSkill: this.keepPerSkill, maxEntries: this.maxEntries },
+    )
+    for (const id of evict) {
+      this.runs.delete(id)
+      void this._rmRunDir(id)
+    }
+    return evict.size
+  }
+
+  private async _rmRunDir(runId: string): Promise<void> {
+    try {
+      if (!VALID_RUN_ID_RE.test(runId)) return
+      const root = this._safeRoot()
+      if (!root) return
+      const dir = paths.skillDraftRunDir(runId)
+      if (!existsSync(dir)) return
+      const real = await realpath(dir)
+      if (real !== root && !real.startsWith(root + sep)) return
+      await rm(real, { recursive: true, force: true })
+    } catch {
+      /* best-effort;下轮重试 */
+    }
+  }
+
   private _safeRoot(): string | null {
     const root = existsSync(paths.skillDraftsDir)
       ? realpathSync(paths.skillDraftsDir)

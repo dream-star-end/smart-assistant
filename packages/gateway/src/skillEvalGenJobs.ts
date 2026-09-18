@@ -11,10 +11,11 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import { paths, type SkillEvalCase } from '@openclaude/storage'
 import { type SkillEvalUsage, emptyUsage } from './skillEval.js'
+import { SKILL_RUN_RETENTION_DEFAULTS, selectRunsToEvict } from './skillJobRetention.js'
 
 /** 落盘文件名:gen-<uuid>.json。runId 本身即 `gen-<uuid>`,故文件名 = `${runId}.json`。 */
 const GEN_FILE_RE = /^(gen-[a-zA-Z0-9_-]{1,128})\.json$/
@@ -43,9 +44,22 @@ const ACTIVE: ReadonlySet<SkillEvalGenStatus> = new Set(['running'])
 export class SkillEvalGenJobStore {
   private readonly runs = new Map<string, SkillEvalGenRun>()
   private readonly maxConcurrent: number
+  private readonly retentionMs: number
+  private readonly keepPerSkill: number
+  private readonly maxEntries: number
 
-  constructor(opts: { maxConcurrent?: number } = {}) {
+  constructor(
+    opts: {
+      maxConcurrent?: number
+      retentionMs?: number
+      keepPerSkill?: number
+      maxEntries?: number
+    } = {},
+  ) {
     this.maxConcurrent = Math.max(1, opts.maxConcurrent ?? 1)
+    this.retentionMs = opts.retentionMs ?? SKILL_RUN_RETENTION_DEFAULTS.retentionMs
+    this.keepPerSkill = opts.keepPerSkill ?? SKILL_RUN_RETENTION_DEFAULTS.keepPerSkill
+    this.maxEntries = opts.maxEntries ?? SKILL_RUN_RETENTION_DEFAULTS.maxEntries
   }
 
   static newRunId(): string {
@@ -159,6 +173,42 @@ export class SkillEvalGenJobStore {
       } catch {
         /* 损坏的落盘文件跳过 */
       }
+    }
+  }
+
+  /**
+   * S-02:淘汰过期/超量的终态生成 job(done/failed)——内存 + 落盘 gen-<id>.json 一并清。
+   * 永不动 running;每技能保留最新 keepPerSkill 条。返回淘汰条数。
+   */
+  prune(now: number): number {
+    const evict = selectRunsToEvict(
+      [...this.runs.values()].map((r) => ({
+        id: r.runId,
+        skillKey: r.skillName,
+        finishedAt: r.finishedAt ?? r.updatedAt ?? r.startedAt,
+        evictable: !ACTIVE.has(r.status),
+      })),
+      { now, retentionMs: this.retentionMs, keepPerSkill: this.keepPerSkill, maxEntries: this.maxEntries },
+    )
+    for (const id of evict) {
+      this.runs.delete(id)
+      void this._rmRunFile(id)
+    }
+    return evict.size
+  }
+
+  private async _rmRunFile(runId: string): Promise<void> {
+    try {
+      if (!VALID_RUN_ID_RE.test(runId)) return
+      const root = this._safeRoot()
+      if (!root) return
+      const file = join(root, `${runId}.json`)
+      if (!existsSync(file)) return
+      const real = await realpath(file)
+      if (!real.startsWith(root + sep)) return
+      await rm(real, { force: true })
+    } catch {
+      /* best-effort;下轮重试 */
     }
   }
 

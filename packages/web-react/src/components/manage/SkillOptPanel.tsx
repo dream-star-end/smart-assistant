@@ -40,6 +40,7 @@ import {
   type ModelRates,
 } from "../../lib/skillRunCost";
 import { pickResumableTrainRun } from "../../lib/skillTrainReentry";
+import { MAX_EVAL_CASES } from "@openclaude/protocol";
 import type {
   AuthSession,
   SkillDraftDetail,
@@ -341,7 +342,7 @@ export function SkillEvalSection({
       // 灌进现有编辑器 state(唯一编辑权威;不旁路造第二份草稿 state)。已有用例=追加,
       // 尊重 5 条上限(与「加用例」同一不变量),超出部分裁掉。
       setCases((prev) => {
-        const room = Math.max(0, 5 - prev.length);
+        const room = Math.max(0, MAX_EVAL_CASES - prev.length);
         return room > 0 ? [...prev, ...drafted.slice(0, room)] : prev;
       });
       setDirty(true);
@@ -456,7 +457,7 @@ export function SkillEvalSection({
         <div className="flex items-center gap-1.5">
           <span className="text-meta font-medium text-muted">评测用例</span>
           <Badge tone="neutral" size="sm">
-            {cases.length}/5
+            {cases.length}/{MAX_EVAL_CASES}
           </Badge>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
@@ -464,7 +465,7 @@ export function SkillEvalSection({
             <Button
               variant="ghost"
               size="sm"
-              disabled={cases.length >= 5}
+              disabled={cases.length >= MAX_EVAL_CASES}
               onClick={() => {
                 setCases((cs) => [...cs, { id: `case-${cs.length + 1}`, prompt: "", assertions: "" }]);
                 setDirty(true);
@@ -480,7 +481,7 @@ export function SkillEvalSection({
               size="sm"
               loading={generating}
               onClick={startGenerate}
-              disabled={!!running || cases.length >= 5}
+              disabled={!!running || cases.length >= MAX_EVAL_CASES}
             >
               {generating ? null : <Sparkles size={13} />}
               补充生成
