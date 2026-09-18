@@ -228,6 +228,11 @@ try {
   // INC-20260909-CURSOR-EMPTY-POOL-MOUNT: execute the real root-filesystem
   // transitions and production provision path. Docker/PG are substituted here;
   // diagnostics/cursor-auth-mount-smoke.ts separately tests an actual Docker bind.
+  // GitHub Actions (and any non-root CI) cannot chown or mkdir /run; skip the
+  // mount runner there. selfhost deploy-gate still executes it as root.
+  if (typeof process.getuid === "function" && process.getuid() !== 0) {
+    console.log("[cursor-auth-mount] SKIP — mount contracts need root chown/bind; CI uid is unprivileged")
+  } else {
   const mountResult = spawnSync(process.execPath, [
     '--import', 'tsx', '--test', '--test-reporter=tap',
     '--test-name-pattern=resolveV5CursorAuthMount|v5 empty managed Cursor',
@@ -257,6 +262,7 @@ try {
     'v5 empty managed Cursor pool provisions the same read-only bind before a key is ready',
   ]) assert.ok(mountOutcomes.includes(name), `required mount contract did not execute: ${name}`)
   console.log('[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)')
+  }
 } finally {
   rmSync(sandbox, { recursive: true, force: true })
 }
