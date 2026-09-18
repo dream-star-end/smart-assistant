@@ -5,6 +5,7 @@ import { useMdViewport } from "../hooks/useMdViewport";
 import { api, apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
+import { filedIcp } from "../lib/legal";
 import {
   PRODUCT_CAPABILITIES,
   type ProductFeatureId,
@@ -496,15 +497,6 @@ function currentBuildId(): string | null {
   return value || null;
 }
 
-/**
- * 备案位只在 brand.ts 填了真实备案号后展示:占位文案(「备案信息更新中」之类)不是法定信息,
- * 不该出现在「备案」这一栏。判据与 landing 页脚一致——真实备案号必含一串数字(lib/legal.ts
- * `filedIcp()`,集成合入后可直接改为引用它)。
- */
-function hasIcpNumber(icp: string): boolean {
-  return /\d{4,}/.test(icp);
-}
-
 const SERVER_BUILD_META_RE =
   /<meta\s+(?:[^>]*?\s)?name=["']oc-build["'][^>]*?\scontent=["']([^"']+)["']|<meta\s+(?:[^>]*?\s)?content=["']([^"']+)["'][^>]*?\sname=["']oc-build["']/i;
 
@@ -618,11 +610,12 @@ function AboutSection() {
           <dt className="shrink-0 text-faint">运营主体</dt>
           <dd className="truncate text-fg">{BRAND.company}</dd>
         </div>
-        {/* 占位文案不上「备案」栏;运营在 brand.ts 填入真实备案号后自动出现(见 hasIcpNumber)。 */}
-        {hasIcpNumber(BRAND.icp) && (
+        {/* 占位文案不上「备案」栏;运营在 brand.ts 填入真实备案号后自动出现。判据与 landing 页脚 /
+            法务页同源:lib/legal.ts filedIcp()(真实备案号必含一串数字,就位才返回),不再各写一份。 */}
+        {filedIcp(BRAND.icp) && (
           <div className="flex items-center justify-between gap-3">
             <dt className="shrink-0 text-faint">备案</dt>
-            <dd className="truncate text-fg">{BRAND.icp}</dd>
+            <dd className="truncate text-fg">{filedIcp(BRAND.icp)}</dd>
           </div>
         )}
         <div className="flex items-center justify-between gap-3">

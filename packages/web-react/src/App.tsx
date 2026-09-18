@@ -28,10 +28,7 @@ import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportM
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
-import {
-  ImageAnnotationEditor,
-  type ImageAnnotationSource,
-} from "./components/ImageAnnotationEditor";
+import type { ImageAnnotationSource } from "./components/ImageAnnotationEditor";
 import {
   type ImageCommentSubmit,
   type ImageEditActions,
@@ -46,9 +43,7 @@ import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { sessionHistorySurface } from "./lib/chat/historyLoadState";
 import { UpdateBanner } from "./components/UpdateBanner";
-import { GithubRepoModal } from "./components/github/GithubRepoModal";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
-import { InboxDialog } from "./components/InboxDialog";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
@@ -74,7 +69,6 @@ import { createStickToBottomController } from "./components/chat/stickToBottom";
 import { attachWheelFence } from "./components/chat/wheelFence";
 import { currentTurnSettled, turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
-import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
 import {
   type RatingEntry,
   type ResponseRatingCtx,
@@ -87,10 +81,10 @@ import {
   ChatInteractionContext,
   ToolCardActionsContext,
   type ArtifactInspectTarget,
+  type ChatInteraction,
 } from "./components/tool/context";
 import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
 import { Sidebar } from "./components/Sidebar";
-import { ProjectSettingsDialog } from "./components/ProjectSettingsDialog";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
@@ -103,8 +97,13 @@ import {
   parseSessionPath,
   parseTutorialCase,
   parseTutorialCommunity,
+  parseTutorialStep,
+  parseTutorialTab,
   parseTutorialTopic,
+  parseTutorialWork,
   preferredBoardView,
+  type TutorialTab,
+  type TutorialWorkId,
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
@@ -156,6 +155,7 @@ import {
 import {
   type CollabMode,
   type CollabUiState,
+  ADVISOR_PARENT_BLOCK_REASON,
   EMPTY_COLLAB_UI,
   advisorParentCapabilityAllowed,
   collaborationPutBody,
@@ -234,6 +234,23 @@ const ChatGptProxyDialog = lazy(() =>
 const TaskboardView = lazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
+// 2026-09-17 首屏体量门(first-screen-budget)超限修复:下列对话框/编辑器都是「点开才需要」的
+// 覆盖层,此前静态 import 把它们(连同 ImageViewer 三模式、ProjectAssetsPanel 等)钉在入口静态
+// 闭包里。改 React.lazy 后由渲染点的挂载闸(useMountedOnce / 条件挂载)控制首次下载;打开过
+// 一次即常驻,状态保留与关闭语义与原先「始终挂载、按 open 显隐」一致。
+const ImageAnnotationEditor = lazy(() =>
+  import("./components/ImageAnnotationEditor").then((m) => ({ default: m.ImageAnnotationEditor })),
+);
+const GithubRepoModal = lazy(() =>
+  import("./components/github/GithubRepoModal").then((m) => ({ default: m.GithubRepoModal })),
+);
+const InboxDialog = lazy(() => import("./components/InboxDialog").then((m) => ({ default: m.InboxDialog })));
+const MessageFeedbackDialog = lazy(() =>
+  import("./components/chat/MessageFeedbackDialog").then((m) => ({ default: m.MessageFeedbackDialog })),
+);
+const ProjectSettingsDialog = lazy(() =>
+  import("./components/ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
+);
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
@@ -250,6 +267,8 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/OrgCenter").catch(() => {});
     void import("./components/TutorialCenter").catch(() => {});
     void import("./components/MediaTaskCenter").catch(() => {});
+    // 全屏图片查看器(含圈选编辑/评论/调整大小)也是懒块:时间线里点图即开,预热后首开零延迟。
+    void import("./components/ImageViewer").catch(() => {});
     if (TASKBOARD_ENABLED) {
       void import("./components/taskboard/TaskboardView").catch(() => {});
     }
@@ -285,6 +304,15 @@ function DialogFallback() {
       <span className="sr-only">加载中</span>
     </div>
   );
+}
+
+/** 懒加载对话框的挂载闸:首次 open 之前不挂载(不下载 chunk);打开过一次后常驻返回 true,
+ *  保持与原先「始终挂载、按 open 显隐」相同的状态保留/关闭语义。渲染期 setState 是 React
+ *  认可的「由 props 派生状态」写法,只在 open 首次翻真时触发一次。 */
+function useMountedOnce(open: boolean): boolean {
+  const [mounted, setMounted] = useState(open);
+  if (open && !mounted) setMounted(true);
+  return mounted || open;
 }
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
@@ -328,6 +356,11 @@ export function App() {
   const bootTutorialTopic = routingEnabled && !bootTutorialCase && !bootTutorialCommunity
     ? parseTutorialTopic(params)
     : null;
+  // 教程中心一级页签 / 精选作品 / 目标步骤深链（tutorials 审计 TU-17）：解析函数自带互斥，
+  // 有 topic/case/community 时 tab、work 为 null；step 只跟 topic。
+  const bootTutorialTab = routingEnabled ? parseTutorialTab(params) : null;
+  const bootTutorialWork = routingEnabled ? parseTutorialWork(params) : null;
+  const bootTutorialStep = routingEnabled ? parseTutorialStep(params) : null;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -404,7 +437,9 @@ export function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
+  const messageFeedbackMounted = useMountedOnce(messageFeedback !== null);
   const [inboxOpen, setInboxOpen] = useState(false);
+  const inboxMounted = useMountedOnce(inboxOpen);
   const [findOpen, setFindOpen] = useState(false);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
   // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
@@ -414,6 +449,7 @@ export function App() {
   const [chatGptProxyOpen, setChatGptProxyOpen] = useState(false);
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
+  const repoModalMounted = useMountedOnce(repoModalOpen);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>(DEFAULT_MANAGE_TAB);
   const [manageAutoAuthorizePluginSlug, setManageAutoAuthorizePluginSlug] = useState<
@@ -426,6 +462,10 @@ export function App() {
   const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
   const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
   const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(bootTutorialCommunity);
+  // 一级页签（null = 案例展厅，不进 URL）/ 精选作品 / 功能教程目标步骤：镜像到 ?tab= / ?work= / ?step=。
+  const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(bootTutorialTab);
+  const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(bootTutorialWork);
+  const [tutorialStep, setTutorialStep] = useState<number | null>(bootTutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -550,6 +590,9 @@ export function App() {
       setTutorialCase(keepPublicTutorial ? parseTutorialCase(publicQuery) : null);
       setTutorialTopic(keepPublicTutorial ? parseTutorialTopic(publicQuery) : null);
       setTutorialCommunity(keepPublicTutorial ? parseTutorialCommunity(publicQuery) : null);
+      setTutorialTab(keepPublicTutorial ? parseTutorialTab(publicQuery) : null);
+      setTutorialWork(keepPublicTutorial ? parseTutorialWork(publicQuery) : null);
+      setTutorialStep(keepPublicTutorial ? parseTutorialStep(publicQuery) : null);
       setView("home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
@@ -682,6 +725,8 @@ export function App() {
 
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
   const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
+  const projectSettingsOpen = projectSettings !== null || ungroupedAssetsOpen;
+  const projectSettingsMounted = useMountedOnce(projectSettingsOpen);
 
   const {
     projects,
@@ -900,9 +945,7 @@ export function App() {
           advisorConsultAllowed: collabUi.advisorConsultAllowed,
         })
       ) {
-        const msg =
-          collabUi.advisorConsultParentReason ||
-          "一期仅 CCB 主会话可咨询顾问。主模型不会因此被切换。";
+        const msg = collabUi.advisorConsultParentReason || ADVISOR_PARENT_BLOCK_REASON;
         setCollabSaveError(msg);
         toast(msg, "error");
         return;
@@ -1595,6 +1638,9 @@ export function App() {
     setTutorialTopic(id ?? null);
     setTutorialCase(null);
     setTutorialCommunity(null);
+    setTutorialTab(null);
+    setTutorialWork(null);
+    setTutorialStep(null);
     setTutorialOpen(true);
   }, []);
 
@@ -2381,9 +2427,10 @@ export function App() {
     [demo, openManage],
   );
 
-  // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示)。
-  const chatInteraction = useMemo(
-    () => (demo ? {} : { sendUserText: (t: string) => send(t), busy: sending }),
+  // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
+  // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。
+  const chatInteraction = useMemo<ChatInteraction>(
+    () => (demo ? { reason: "demo" } : { sendUserText: (t: string) => send(t), busy: sending }),
     [demo, send, sending],
   );
 
@@ -3052,7 +3099,10 @@ export function App() {
     activeTopic: tutorialOpen ? tutorialTopic : null,
     activeCase: tutorialOpen ? tutorialCase : null,
     activeCommunity: tutorialOpen ? tutorialCommunity : null,
-    onPopPanel: (panel, topic, caseId, communityId) => {
+    activeTutorialTab: tutorialOpen ? tutorialTab : null,
+    activeTutorialWork: tutorialOpen ? tutorialWork : null,
+    activeTutorialStep: tutorialOpen ? tutorialStep : null,
+    onPopPanel: (panel, topic, caseId, communityId, extras) => {
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
@@ -3062,10 +3112,16 @@ export function App() {
         setTutorialTopic(topic);
         setTutorialCase(caseId);
         setTutorialCommunity(communityId);
+        setTutorialTab(extras.tab);
+        setTutorialWork(extras.work);
+        setTutorialStep(extras.step);
       } else {
         setTutorialTopic(null);
         setTutorialCase(null);
         setTutorialCommunity(null);
+        setTutorialTab(null);
+        setTutorialWork(null);
+        setTutorialStep(null);
       }
     },
     workspace: TASKBOARD_ENABLED && boardOpen ? "board" : "chat",
@@ -3124,7 +3180,14 @@ export function App() {
               topicId={tutorialTopic}
               caseId={tutorialCase}
               communityId={tutorialCommunity}
+              browseView={tutorialTab ?? "showcase"}
+              onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
+              signatureWorkId={tutorialWork}
+              onSignatureWorkChange={setTutorialWork}
+              stepIndex={tutorialStep}
               onTopicChange={(id) => {
+                // 用户自己换篇：深链带来的目标步骤不再适用。
+                if (id !== tutorialTopic) setTutorialStep(null);
                 setTutorialTopic(id);
                 setTutorialCase(null);
                 setTutorialCommunity(null);
@@ -3133,17 +3196,20 @@ export function App() {
                 setTutorialCase(id);
                 setTutorialTopic(null);
                 setTutorialCommunity(null);
+                setTutorialStep(null);
               }}
               onShowCaseGallery={() => {
                 setTutorialCase(null);
                 setTutorialTopic(null);
                 setTutorialCommunity(null);
+                setTutorialStep(null);
               }}
               onCommunityChange={(id) => {
                 setTutorialCommunity(id);
                 if (id) {
                   setTutorialTopic(null);
                   setTutorialCase(null);
+                  setTutorialStep(null);
                 }
               }}
               caseActionLabel="登录后试用"
@@ -3165,6 +3231,9 @@ export function App() {
               onClose={() => {
                 setTutorialOpen(false);
                 setTutorialCommunity(null);
+                setTutorialTab(null);
+                setTutorialWork(null);
+                setTutorialStep(null);
               }}
               actionState={() => ({
                 enabled: true,
@@ -3996,49 +4065,61 @@ export function App() {
         </LazyBoundary>
       )}
 
-      {!demo && auth && (
-        <MessageFeedbackDialog
-          open={messageFeedback !== null}
-          auth={auth}
-          sessionId={activeId ?? null}
-          context={messageFeedback}
-          returnFocus={messageFeedbackTriggerRef.current}
-          onOpenChange={(open) => {
-            if (!open) setMessageFeedback(null);
-          }}
-        />
+      {/* 下列对话框是懒块(见顶部 lazy 声明):首次打开前不挂载;打开过后常驻,open 显隐语义同前。
+          DialogFallback 只在首次拉块的空窗出现。 */}
+      {!demo && auth && messageFeedbackMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <MessageFeedbackDialog
+            open={messageFeedback !== null}
+            auth={auth}
+            sessionId={activeId ?? null}
+            context={messageFeedback}
+            returnFocus={messageFeedbackTriggerRef.current}
+            onOpenChange={(open) => {
+              if (!open) setMessageFeedback(null);
+            }}
+          />
+        </LazyBoundary>
       )}
 
-      <ProjectSettingsDialog
-        project={projectSettings}
-        assetsOnly={ungroupedAssetsOpen}
-        open={projectSettings !== null || ungroupedAssetsOpen}
-        onClose={() => {
-          setProjectSettings(null);
-          setUngroupedAssetsOpen(false);
-        }}
-        onSave={async (patch) => {
-          if (!projectSettings) return;
-          await updateProject(projectSettings.id, patch);
-        }}
-        demo={demo}
-        auth={auth}
-        authSession={authRef.current}
-        sessions={sessions}
-        onOpenSession={(sessionId) => {
-          setProjectSettings(null);
-          setUngroupedAssetsOpen(false);
-          setBoardOpen(false);
-          selectSession(sessionId);
-        }}
-      />
+      {projectSettingsMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ProjectSettingsDialog
+            project={projectSettings}
+            assetsOnly={ungroupedAssetsOpen}
+            open={projectSettingsOpen}
+            onClose={() => {
+              setProjectSettings(null);
+              setUngroupedAssetsOpen(false);
+            }}
+            onSave={async (patch) => {
+              if (!projectSettings) return;
+              await updateProject(projectSettings.id, patch);
+            }}
+            demo={demo}
+            auth={auth}
+            authSession={authRef.current}
+            sessions={sessions}
+            onOpenSession={(sessionId) => {
+              setProjectSettings(null);
+              setUngroupedAssetsOpen(false);
+              setBoardOpen(false);
+              selectSession(sessionId);
+            }}
+          />
+        </LazyBoundary>
+      )}
 
-      <InboxDialog
-        open={inboxOpen}
-        auth={auth}
-        onClose={() => setInboxOpen(false)}
-        onUnreadChange={inbox.refreshUnread}
-      />
+      {inboxMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <InboxDialog
+            open={inboxOpen}
+            auth={auth}
+            onClose={() => setInboxOpen(false)}
+            onUnreadChange={inbox.refreshUnread}
+          />
+        </LazyBoundary>
+      )}
 
       {!demo && mediaTasksOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
@@ -4063,17 +4144,21 @@ export function App() {
         </LazyBoundary>
       )}
 
-      <GithubRepoModal
-        open={repoModalOpen}
-        auth={auth}
-        sessionId={activeId}
-        selection={repo.selection}
-        onClose={() => setRepoModalOpen(false)}
-        onConfirm={repo.confirm}
-        onUnbind={repo.unbind}
-        onAccountUnlinked={repo.refresh}
-        toast={toast}
-      />
+      {repoModalMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <GithubRepoModal
+            open={repoModalOpen}
+            auth={auth}
+            sessionId={activeId}
+            selection={repo.selection}
+            onClose={() => setRepoModalOpen(false)}
+            onConfirm={repo.confirm}
+            onUnbind={repo.unbind}
+            onAccountUnlinked={repo.refresh}
+            toast={toast}
+          />
+        </LazyBoundary>
+      )}
 
       {manageOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
@@ -4190,7 +4275,14 @@ export function App() {
             topicId={tutorialTopic}
             caseId={tutorialCase}
             communityId={tutorialCommunity}
+            browseView={tutorialTab ?? "showcase"}
+            onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
+            signatureWorkId={tutorialWork}
+            onSignatureWorkChange={setTutorialWork}
+            stepIndex={tutorialStep}
             onTopicChange={(id) => {
+              // 用户自己换篇：深链带来的目标步骤不再适用。
+              if (id !== tutorialTopic) setTutorialStep(null);
               setTutorialTopic(id);
               setTutorialCase(null);
               setTutorialCommunity(null);
@@ -4199,17 +4291,20 @@ export function App() {
               setTutorialCase(id);
               setTutorialTopic(null);
               setTutorialCommunity(null);
+              setTutorialStep(null);
             }}
             onShowCaseGallery={() => {
               setTutorialCase(null);
               setTutorialTopic(null);
               setTutorialCommunity(null);
+              setTutorialStep(null);
             }}
             onCommunityChange={(id) => {
               setTutorialCommunity(id);
               if (id) {
                 setTutorialTopic(null);
                 setTutorialCase(null);
+                setTutorialStep(null);
               }
             }}
             caseActionLabel="带着指令去对话"
@@ -4228,6 +4323,9 @@ export function App() {
             onClose={() => {
               setTutorialOpen(false);
               setTutorialCommunity(null);
+              setTutorialTab(null);
+              setTutorialWork(null);
+              setTutorialStep(null);
             }}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}
@@ -4236,12 +4334,18 @@ export function App() {
       )}
       {confirmDialogEl}
       {promptTextEl}
-      <ImageAnnotationEditor
-        source={imageAnnotationSource}
-        open={!!imageAnnotationSource}
-        onOpenChange={(next) => !next && setImageAnnotationSource(null)}
-        onSubmit={submitImageEdit}
-      />
+      {/* 圈选编辑器是懒块:有 source 才挂载(编辑器自身在 !open 时即重置全部状态、无退场动画,
+          条件挂载与原先常驻+open 显隐等价);关闭即卸载,下次打开走已缓存的模块。 */}
+      {imageAnnotationSource && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ImageAnnotationEditor
+            source={imageAnnotationSource}
+            open
+            onOpenChange={(next) => !next && setImageAnnotationSource(null)}
+            onSubmit={submitImageEdit}
+          />
+        </LazyBoundary>
+      )}
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>
           <ContainerWebPreview

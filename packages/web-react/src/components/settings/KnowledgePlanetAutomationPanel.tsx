@@ -957,7 +957,7 @@ export function KnowledgePlanetAutomationPanel({
                               className={cn(
                                 'flex size-4 shrink-0 items-center justify-center rounded border',
                                 selected
-                                  ? 'border-accent bg-accent text-white'
+                                  ? 'border-accent bg-accent text-accent-fg'
                                   : 'border-border bg-surface',
                               )}
                             >

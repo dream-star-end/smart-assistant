@@ -170,7 +170,7 @@ export function OrgSubscribeDialog({
                             <div className="flex items-center gap-2">
                               <span className="text-title font-semibold text-fg">{p.name}</span>
                               {isCurrent && (
-                                <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-white">
+                                <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
                                   当前
                                 </span>
                               )}

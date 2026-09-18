@@ -209,6 +209,17 @@ describe('OptimizationPanel 状态与历史', () => {
     expect(screen.getByRole('button', { name: '重新审计' })).toBeInTheDocument()
   })
 
+  test('hero 图标块前景走 text-accent-fg:深色 accent 是浅色底,白色图标只有 2.82:1(非文本也要 ≥3:1;a11y-C)', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(idleState())
+
+    renderPanel()
+
+    const heading = await screen.findByRole('heading', { name: /Auto.Dream 全面审计/ })
+    const icon = heading.closest('.flex.items-start')?.querySelector('span.size-10')
+    expect(icon).toHaveClass('bg-accent', 'text-accent-fg')
+    expect(icon).not.toHaveClass('text-white')
+  })
+
   test('已处理建议带处理时间，且以只读态复用同一个弹层', async () => {
     vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(
       idleState({

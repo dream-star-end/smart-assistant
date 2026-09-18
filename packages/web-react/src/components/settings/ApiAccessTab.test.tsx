@@ -469,6 +469,10 @@ describe("ApiAccessTab · 密钥列表与自管", () => {
     expect(screen.getByRole("switch", { name: "禁用该密钥" })).toBeChecked();
     expect(screen.getByRole("switch", { name: "启用该密钥" })).not.toBeChecked();
     expect(screen.getByText(/用 CC Switch 一键接入/)).toBeInTheDocument();
+    // 教程头图标块前景走 text-accent-fg:深色 accent 是浅色底,白色图标只有 2.82:1(非文本也要 ≥3:1;a11y-C)。
+    const guideIcon = screen.getByTestId("guide-ccswitch").querySelector("span.size-10");
+    expect(guideIcon).toHaveClass("bg-accent", "text-accent-fg");
+    expect(guideIcon).not.toHaveClass("text-white");
     expect(screen.getByText(/手动接入本地 Claude Code/)).toBeInTheDocument();
     // 2026-09-08:用量查询教程 + 401 / Auth conflict 排查。
     const usageGuide = screen.getByTestId("guide-usage");

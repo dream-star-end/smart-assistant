@@ -1,5 +1,6 @@
 import type { TutorialCaseFieldReport } from '../../lib/tutorialCaseCatalog'
 import { cn } from '../../lib/utils'
+import { HERO_SURFACE_CLASS } from './heroTheme'
 
 export function CaseFieldReportVisual({
   report,
@@ -22,8 +23,10 @@ export function CaseFieldReportVisual({
           ? `案例观察记录示意：${report.result}。数字来自人工观察记录，不是平台验证过的运行结果`
           : `案例成果预览：${report.result}`
       }
+      // 图稿底色走 hero 模块级 token(TU-34):浅色仍是品牌深蓝,暗色下抬亮并描边,不再与页面底色同色。
       className={cn(
-        'relative isolate aspect-[16/9] overflow-hidden bg-[#07111f] text-white',
+        'relative isolate aspect-[16/9] overflow-hidden',
+        HERO_SURFACE_CLASS,
         className,
       )}
       data-artwork-kind={report.visual}

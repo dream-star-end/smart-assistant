@@ -341,6 +341,41 @@ test("智能体:只改过工具集,载入旧提交前也必须二次确认", asy
   );
 });
 
+test("K-27:智能体工具集勾选卡走 ui/Checkbox 原语;「必选」项已勾且禁用、不压暗", async () => {
+  listSkills.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  renderPanel(<PublishPanel auth={auth} publishes={[]} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  await screen.findByPlaceholderText("例：法律顾问");
+
+  const browser = screen.getByRole("checkbox", { name: /浏览器/ });
+  expect(browser).toHaveAttribute("data-ui", "checkbox");
+  expect(browser.className).not.toContain("accent-accent");
+  // 卡片式外观仍在调用方的 label 上:未勾 → 边框 + 次级字色;勾上 → 强调边框 + 浅底。
+  const card = browser.closest("label") as HTMLElement;
+  expect(card).toHaveClass("rounded-lg", "border", "text-muted");
+  fireEvent.click(browser);
+  expect(browser).toBeChecked();
+  expect(card).toHaveClass("bg-accent-soft", "text-fg");
+
+  // 「必选」工具集:已勾、禁用、带徽章,且不像不可用选项那样压暗。
+  const locked = screen.getAllByRole("checkbox").filter((b) => (b as HTMLInputElement).disabled);
+  expect(locked.length).toBeGreaterThan(0);
+  for (const box of locked) {
+    expect(box).toBeChecked();
+    expect(box).toHaveAttribute("data-ui", "checkbox");
+    const lockedCard = box.closest("label") as HTMLElement;
+    expect(lockedCard.className).toContain("opacity-100");
+    expect(lockedCard).toHaveTextContent("必选");
+  }
+});
+
 test("智能体:模型是系统自动选中的默认项,空白表单不该被当成「已填写」", async () => {
   listSkills.mockResolvedValue([]);
   getPublicModels.mockResolvedValue({
@@ -438,11 +473,15 @@ test("底部操作条:缺项超过 3 项折成「还差 N 项必填 · 查看」
   expect(bar).not.toHaveTextContent("显示名称");
   const toggle = screen.getByRole("button", { name: "查看" });
   expect(toggle).toHaveAttribute("aria-expanded", "false");
+  // 触控靶两边都要 ≥44:t-894 只补了高(38×44 仍被复扫命中),QA t-1232 补宽;「收起」同一副类(QA)。
+  expect(toggle).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
   fireEvent.click(toggle);
   expect(screen.getByText(/还差 6 项必填/)).toHaveTextContent(
     "还差 6 项必填：显示名称、标识 slug、一句话描述、技能正文、分类、适用场景",
   );
-  fireEvent.click(screen.getByRole("button", { name: "收起" }));
+  const collapse = screen.getByRole("button", { name: "收起" });
+  expect(collapse).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
+  fireEvent.click(collapse);
   expect(screen.getByText(/还差 6 项必填/)).not.toHaveTextContent("显示名称");
 
   // 填到只剩 3 项以内 → 直接全列,不再需要「查看」

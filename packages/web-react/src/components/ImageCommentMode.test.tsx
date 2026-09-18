@@ -49,7 +49,11 @@ describe('ImageCommentMode', () => {
     render(<ImageCommentMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
     // 点图打开输入条(占位「描述编辑」)。
     fireEvent.click(screen.getByRole('button', { name: '点按图片添加评论' }))
-    expect(screen.getByPlaceholderText('描述编辑')).toBeInTheDocument()
+    const input = screen.getByPlaceholderText('描述编辑')
+    expect(input).toBeInTheDocument()
+    // placeholder 在深底上 40% 白只有 3.8:1 → 60%(a11y-C,与圈选编辑器同源)。
+    expect(input).toHaveClass('placeholder:text-white/60')
+    expect(input).not.toHaveClass('placeholder:text-white/40')
     fireEvent.change(screen.getByLabelText('描述编辑'), { target: { value: '把天空改蓝' } })
     fireEvent.click(screen.getByRole('button', { name: '确认' }))
     expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
@@ -142,7 +146,11 @@ describe('ImageCommentMode', () => {
       expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
       expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
       fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
-      fireEvent.click(screen.getByRole('button', { name: '放弃' }))
+      // 危险主键前景走 text-danger-fg:沉浸台恒为深色,深色 --danger #f0666e 上白字只有 3.07:1(a11y-C)。
+      const discard = screen.getByRole('button', { name: '放弃' })
+      expect(discard).toHaveClass('bg-danger', 'text-danger-fg')
+      expect(discard).not.toHaveClass('text-white')
+      fireEvent.click(discard)
       expect(onBack).toHaveBeenCalledTimes(1)
     })
 

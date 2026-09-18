@@ -16,6 +16,7 @@ import {
   Badge,
   Button,
   Card,
+  Checkbox,
   CopyChip,
   EmptyState,
   Field,
@@ -463,18 +464,15 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
             )}
 
             <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
-              <label className="flex items-center gap-2 text-body text-muted [@media(hover:none)]:min-h-11">
-                <input
-                  type="checkbox"
-                  className="accent-accent"
-                  checked={allSelected}
-                  ref={(el) => {
-                    if (el) el.indeterminate = selectedVisibleIds.length > 0 && !allSelected;
-                  }}
-                  onChange={(e) => toggleAll(e.currentTarget.checked)}
-                />
-                全选
-              </label>
+              {/* K-27:ui/Checkbox 原语(此前原生 accent-accent 方块与 Switch / Chip 视觉语言不一致);
+                  部分勾选 → indeterminate(读屏 mixed、视觉减号),触控靶由原语的 label 自带。 */}
+              <Checkbox
+                label="全选"
+                className="items-center text-muted"
+                checked={allSelected}
+                indeterminate={selectedVisibleIds.length > 0 && !allSelected}
+                onChange={(e) => toggleAll(e.currentTarget.checked)}
+              />
               <span className="text-meta text-faint">已选 {selectedVisibleIds.length}</span>
               {selectedHasConnector && (
                 // 禁用原因不能只写在 native title:disabled 元素多数浏览器不触发它,触屏则完全无从呈现。
@@ -529,17 +527,15 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                   >
                     <div className="flex flex-wrap items-start gap-2 px-3.5 py-3">
                       {/* 触控靶必须挂在**真正接收点击的元素**上:裸 checkbox 的命中区只有
-                          十几像素,而卡片的 px-3.5/py-3 扩的是卡片、不是 input。故用 label
-                          包住它撑到 44×44(点 label 即切换)。桌面端 hover 可用,渲染零变化。 */}
-                      <label className="flex shrink-0 items-start justify-center [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11">
-                        <input
-                          type="checkbox"
-                          className="mt-1 accent-accent"
-                          checked={selected.has(r.versionId)}
-                          onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
-                          aria-label={`选择 ${r.name}`}
-                        />
-                      </label>
+                          十几像素,而卡片的 px-3.5/py-3 扩的是卡片、不是 input。ui/Checkbox 的外层
+                          就是 label,无文字时自带 44×44(点 label 即切换);桌面端渲染零变化。 */}
+                      <Checkbox
+                        className="shrink-0"
+                        controlClassName="mt-1"
+                        checked={selected.has(r.versionId)}
+                        onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
+                        aria-label={`选择 ${r.name}`}
+                      />
                       <button
                         type="button"
                         onClick={() => setOpen(isOpen ? null : r.versionId)}
@@ -698,23 +694,21 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                                 }
                               />
                             </Field>
-                            {/* label 即点击目标:窄屏折行不保证够 44px,显式兜底。 */}
-                            <label className="flex items-start gap-2 text-meta leading-relaxed text-fg [@media(hover:none)]:min-h-11">
-                              <input
-                                type="checkbox"
-                                className="mt-0.5 accent-accent"
-                                checked={connectorVerified.has(r.versionId)}
-                                onChange={(e) =>
-                                  setConnectorVerified((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.currentTarget.checked) next.add(r.versionId);
-                                    else next.delete(r.versionId);
-                                    return next;
-                                  })
-                                }
-                              />
-                              我已使用隔离测试账号完成绑定、身份探针及声明动作的真实功能验收。
-                            </label>
+                            {/* label 即点击目标:窄屏折行不保证够 44px,原语的 min-h-11 兜底。 */}
+                            <Checkbox
+                              className="flex text-meta leading-relaxed"
+                              controlClassName="mt-0.5"
+                              label="我已使用隔离测试账号完成绑定、身份探针及声明动作的真实功能验收。"
+                              checked={connectorVerified.has(r.versionId)}
+                              onChange={(e) =>
+                                setConnectorVerified((prev) => {
+                                  const next = new Set(prev);
+                                  if (e.currentTarget.checked) next.add(r.versionId);
+                                  else next.delete(r.versionId);
+                                  return next;
+                                })
+                              }
+                            />
                           </div>
                         )}
                         {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。

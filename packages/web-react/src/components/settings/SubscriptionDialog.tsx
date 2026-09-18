@@ -1,42 +1,28 @@
 import { ArrowUpCircle, Check, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import type { SubscribeIntent } from "../../lib/chat/pure";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { TOPUP_PACK } from "../../lib/plans";
+import {
+  type SubscribeIntent,
+  consumeSubscribeIntent,
+  rememberSubscriptionPaid,
+} from "../../lib/subscribeIntent";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner, useConfirm } from "../ui";
 
+// 预选意图 / 最近已付费 的模块级状态已下沉到 lib/subscribeIntent(首屏同步渲染的红卡从那里读,
+// 不再把本弹窗拖进入口闭包);此处 re-export 供 AccountTab / 测试等既有引用继续使用。
 export type { SubscribeIntent };
-
-let pendingSubscribeIntent: SubscribeIntent | null = null;
-let knownSubscriptionPaid: boolean | null = null;
-
-/** 红卡/账户条在打开订阅弹窗前预选 Lite 或加量包。 */
-export function requestSubscribeIntent(intent: SubscribeIntent): void {
-  pendingSubscribeIntent = intent;
-}
-
-export function consumeSubscribeIntent(): SubscribeIntent | null {
-  const intent = pendingSubscribeIntent;
-  pendingSubscribeIntent = null;
-  return intent;
-}
-
-export function rememberSubscriptionPaid(paid: boolean): void {
-  knownSubscriptionPaid = paid;
-}
-
-export function lastKnownSubscriptionPaid(): boolean | null {
-  return knownSubscriptionPaid;
-}
-
-export function resetSubscribeUiState(): void {
-  pendingSubscribeIntent = null;
-  knownSubscriptionPaid = null;
-}
+export {
+  consumeSubscribeIntent,
+  lastKnownSubscriptionPaid,
+  rememberSubscriptionPaid,
+  requestSubscribeIntent,
+  resetSubscribeUiState,
+} from "../../lib/subscribeIntent";
 
 function litePlanOf(plans: SubscriptionPlanWire[]): SubscriptionPlanWire | undefined {
   return (

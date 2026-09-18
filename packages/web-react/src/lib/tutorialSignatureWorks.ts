@@ -1,8 +1,10 @@
 import { TUTORIAL_CASE_BY_ID, type TutorialCase } from './tutorialCaseCatalog'
+import type { SignatureWorkId } from './tutorialSignatureWorkIds'
 
 /** Original deliverables, not another tutorial-case registry or a replay claim. */
 export type SignatureWork = {
-  id: 'planet' | 'gravity'
+  /** 与 tutorialSignatureWorkIds.SIGNATURE_WORK_IDS 同源（首屏闭包只 import 那份轻量表）。 */
+  id: SignatureWorkId
   title: string
   kicker: string
   subtitle: string

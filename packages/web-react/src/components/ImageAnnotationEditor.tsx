@@ -943,7 +943,8 @@ export function ImageAnnotationEditor({
                 rows={1}
                 maxLength={1200}
                 placeholder="描述想要的修改，例如：把杯子改成透明玻璃材质"
-                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-white outline-none placeholder:text-white/40"
+                // placeholder 40% 白叠在 bg-neutral-900 上只有 3.8:1(a11y-C 复扫);60% ≈ 7:1,仍比正文淡一档。
+                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-white outline-none placeholder:text-white/60"
               />
             </div>
             <p id="image-edit-help" className="sr-only">
@@ -1054,7 +1055,7 @@ export function ImageAnnotationEditor({
                       setConfirmClose(false)
                       onOpenChange(false)
                     }}
-                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-white transition-opacity hover:opacity-90"
+                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-danger-fg transition-opacity hover:opacity-90"
                   >
                     放弃
                   </button>

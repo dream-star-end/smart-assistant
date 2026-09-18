@@ -31,6 +31,7 @@ import {
   Alert,
   Badge,
   Button,
+  Checkbox,
   Field,
   IconButton,
   Input,
@@ -325,7 +326,8 @@ function SubmitBar({
                   type="button"
                   // 行内文字钮桌面只有一行高(16px);触屏补 44px 命中高与左右内距,桌面零变化
                   //(t-894 复扫计划外发现:K-21 折叠播报是 t-762 扫描之后才合入的)。
-                  className="inline-flex items-center rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
+                  // 两个字只有 38px 宽,触控靶要两边都 ≥44:再补 min-w-11(QA t-1232 复扫 market-publish* ×5 仍命中 38×44)。
+                  className="inline-flex items-center justify-center rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:px-2"
                   aria-expanded={false}
                   onClick={() => setExpanded(true)}
                 >
@@ -340,7 +342,8 @@ function SubmitBar({
                     {" "}
                     <button
                       type="button"
-                      className="rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                      // 与「查看」同一副触控档:展开态的「收起」此前完全没补(QA t-1232)。
+                      className="inline-flex items-center justify-center rounded-sm underline underline-offset-2 outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:px-2"
                       aria-expanded={true}
                       onClick={() => setExpanded(false)}
                     >
@@ -1761,25 +1764,26 @@ function AgentPublishForm({
               {TOOLSET_OPTIONS.map((t) => {
                 const checked = d.toolsets.includes(t.value);
                 return (
-                  <label
+                  // K-27:ui/Checkbox 原语;卡片式外观仍由这里的 className 决定(原语只管控件 + 触控靶)。
+                  // 「必选」项 disabled 但不压暗:它是已勾定的事实,不是不可用的选项。
+                  <Checkbox
                     key={t.value}
                     className={cn(
-                      "flex items-center gap-2 rounded-lg border px-3 py-2 text-body transition-colors [@media(hover:none)]:min-h-11",
+                      "flex items-center rounded-lg border px-3 py-2 transition-colors",
                       checked ? "border-accent/50 bg-accent-soft text-fg" : "border-border text-muted",
-                      t.locked ? "cursor-not-allowed" : "cursor-pointer",
+                      t.locked && "opacity-100",
                     )}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={t.locked}
-                      onChange={() => toggleToolset(t.value)}
-                      className="accent-accent"
-                    />
-                    <span className="font-medium">{t.label}</span>
-                    <span className="text-caption text-faint">{t.hint}</span>
-                    {t.locked && <Badge size="sm">必选</Badge>}
-                  </label>
+                    checked={checked}
+                    disabled={t.locked}
+                    onChange={() => toggleToolset(t.value)}
+                    label={
+                      <span className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{t.label}</span>
+                        <span className="text-caption text-faint">{t.hint}</span>
+                        {t.locked && <Badge size="sm">必选</Badge>}
+                      </span>
+                    }
+                  />
                 );
               })}
             </div>

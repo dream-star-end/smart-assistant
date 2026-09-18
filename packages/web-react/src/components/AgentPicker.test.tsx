@@ -69,7 +69,7 @@ describe("AgentPicker 三态协作", () => {
   it("onCollabModeChange 时渲染单人/顾问/团队三选一", async () => {
     const onCollabModeChange = vi.fn();
     renderPicker({ onCollabModeChange, collabMode: "solo" });
-    const advisor = await screen.findByRole("button", { name: /主模型不切换/ });
+    const advisor = await screen.findByRole("button", { name: /主模型不变/ });
     fireEvent.click(advisor);
     expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
   });
@@ -78,7 +78,7 @@ describe("AgentPicker 三态协作", () => {
     const onCollabModeChange = vi.fn();
     const onToggleTeamMode = vi.fn();
     renderPicker({ onCollabModeChange, onToggleTeamMode, collabMode: "solo" });
-    fireEvent.click(await screen.findByRole("button", { name: /主模型不切换/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /主模型不变/ }));
     expect(onCollabModeChange).toHaveBeenCalledTimes(1);
     expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
     expect(onToggleTeamMode).not.toHaveBeenCalled();
@@ -92,9 +92,9 @@ describe("AgentPicker 三态协作", () => {
       advisorConsultParents: ["ccb"],
       parentEngine: "codex",
       advisorConsultAllowed: false,
-      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+      advisorConsultParentReason: "当前模型不能向顾问提问。把顶栏模型换成 GLM 或 MiniMax 后再试。",
     });
-    const advisor = await screen.findByRole("button", { name: /一期仅 CCB/ });
+    const advisor = await screen.findByRole("button", { name: /换成 GLM 或 MiniMax/ });
     expect(advisor).toBeDisabled();
     fireEvent.click(advisor);
     expect(onCollabModeChange).not.toHaveBeenCalled();
@@ -108,9 +108,9 @@ describe("AgentPicker 三态协作", () => {
       advisorConsultParents: ["ccb"],
       parentEngine: "ccb",
       advisorConsultAllowed: false,
-      advisorConsultParentReason: "一期仅 CCB 主会话可咨询顾问。",
+      advisorConsultParentReason: "当前模型不能向顾问提问。把顶栏模型换成 GLM 或 MiniMax 后再试。",
     });
-    const advisor = await screen.findByRole("button", { name: /主模型不切换/ });
+    const advisor = await screen.findByRole("button", { name: /主模型不变/ });
     expect(advisor).not.toBeDisabled();
     fireEvent.click(advisor);
     expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
@@ -125,6 +125,25 @@ describe("AgentPicker 三态协作", () => {
     });
     expect(await screen.findByText(/尚未证明无工具隔离/)).toBeInTheDocument();
     expect(screen.queryByLabelText("选择顾问型号")).toBeNull();
+  });
+
+  it("已配置顾问不在目录时警告并保持空选，不静默显示第一项", async () => {
+    const onAdvisorModelChange = vi.fn();
+    renderPicker({
+      onCollabModeChange: () => {},
+      onAdvisorModelChange,
+      collabMode: "advisor",
+      advisorModel: "MiniMax-M3",
+      advisorModels: [
+        { id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" },
+        { id: "kimi-k2.7-code", label: "Kimi", engine: "ccb" },
+      ],
+    });
+    expect(await screen.findByText(/MiniMax-M3 当前不可用/)).toBeInTheDocument();
+    const select = screen.getByLabelText("选择顾问型号") as HTMLSelectElement;
+    expect(select.value).toBe("");
+    expect(select.value).not.toBe("gpt-6-astra");
+    expect(onAdvisorModelChange).not.toHaveBeenCalled();
   });
 });
 
@@ -157,6 +176,19 @@ const READINESS_ROWS = [
     },
   },
 ];
+
+describe("AgentPicker 默认智能体徽章", () => {
+  it("「默认」徽章走实底 accent + text-accent-fg:它落在本就 accent-soft 着色的卡上,soft 叠 soft 深色只有 4.1:1、bg-accent/15 只有 3.9(a11y-C)", async () => {
+    renderPicker({}, READINESS_ROWS);
+    await screen.findByRole("button", { name: /科研助手/ });
+    const badge = screen.getAllByText("默认").find((el) => el.classList.contains("text-micro"));
+    expect(badge).toBeTruthy();
+    expect(badge).toHaveClass("bg-accent", "text-accent-fg");
+    expect(badge).not.toHaveClass("bg-accent/15");
+    expect(badge).not.toHaveClass("bg-accent-soft");
+    expect(badge).not.toHaveClass("text-white");
+  });
+});
 
 describe("AgentPicker capability readiness", () => {
   // C-06:此前整卡 disabled —— 不可聚焦、读屏读不到原因、也没有任何去授权的入口。

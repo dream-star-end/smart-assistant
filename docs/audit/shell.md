@@ -484,3 +484,65 @@ cost-authority / ocv5-185 / ocv5-210 系列全绿。
 | sidebar-B S-08（fable-5-1-13） | `App.tsx:630` 附近 `useSessionList({...})` 的返回值解构 | 多解构一项 `loadMoreError` | — |
 | sidebar-B S-08（fable-5-1-13） | `App.tsx:3344` `sidebarProps` 内紧邻 `loadingMore: loadingMoreSessions,` | 加一行 `loadMoreError,` | 加载更早会话失败时侧栏底部显示「加载更早会话失败，点击重试」 |
 | sidebar-B S-06（fable-5-1-13） | `App.tsx:3413-3441` 移动端抽屉 `<Sidebar … onCollapse={() => setMobileNavOpen(false)}` | 加 `collapseLabel="关闭导航"`（桌面内联侧栏 `App.tsx:3375-3400` 的 `onCollapse={() => setCollapsed(true)}` **不动**） | 抽屉里的折叠键读屏文案从「折叠侧栏」改为「关闭导航」 |
+
+## 9. 发布阻断修复 · 首屏 gzip 预算超限（t-1348，2026-09-17）
+
+分支 `feat/v5-selfhost-audit-budget-fix`（自 integration `2d2b5cafc` 切出，工作树 `wt\budget-fix`）。
+指挥官拍板 **A 优先**（拆动态 import，目标 ≤455KB）、90 分钟不达标转 B（上调阈值）。
+**结果：A 方案达标，`FIRST_SCREEN_GZIP_BUDGET = 471040` 不动。**
+
+### 9.1 修前 / 修后（口径 = `vite.config.ts` first-screen-budget 插件：index.html modulepreload 闭包 gzip level 9 求和）
+
+| 基点 | 首屏闭包 gzip | 与预算 460.0KB（471040 B）的关系 |
+|---|---|---|
+| 基线 `210b99678` | 455.9KB | 余 4.1KB（发布预演 t-1279 实测） |
+| canonical `3b7c38b9d` | 456.4KB | 余 3.6KB（同上） |
+| **integration `2d2b5cafc`（修前）** | **471.4KB** | **超 11.4KB，`npm run build` exit 1**（main 139.4 / tapePayload 125.5 / styles 75.1 / react-vendor 55.3 / radix-vendor 29.9 / media 17.7 / lucide-vendor 17.7 / viewport-shared 2.9 …，15 个 chunk） |
+| **本分支（修后）** | **445.5KB（456204 B）** | **余 14.5KB，`npm run build` exit 0**；≤455KB 目标达成（main 129.0 / tapePayload 122.7 / styles 77.5 / react-vendor 55.3 / radix-vendor 29.9 / lucide-vendor 17.7 / media 5.1 / viewport-shared 2.9 …，13 个 chunk） |
+
+净减 **25.9KB gzip**。归因方法：用 `sourcemap: "hidden"` 产出的 `.map` 把闭包内每个 chunk 的生成字节
+按源文件归因（`@jridgewell/trace-mapping` 解码，按 chunk 的 gzip/raw 比例折算；脚本在仓库外
+`.audit-tmp\budget-fix\attribute-first-screen.mjs`，不入库），再筛出「入口静态可达、但只有点开才需要」的模块。
+
+### 9.2 拆分点（全部是覆盖层 / 点开才出现的面；**首屏可见组件一个都没 lazy**）
+
+| # | 改动 | 文件 | 省下（gzip，估算） |
+|---|---|---|---|
+| 1 | 全屏图片查看器 `ImageViewer`（含 `ImageAnnotationEditor` 圈选编辑 / `ImageCommentMode` / `ImageResizeMode` 三模式）改 `React.lazy`：`ZoomableImage` 首次点开才挂载（挂载闸 `viewerMounted`，打开过后常驻，`open` 显隐语义同前），外套 `LazyBoundary`（chunk 拉取期空 fallback；发版后旧标签页拉不到旧 chunk → 「刷新」兜底）。缩略图 / 签名 / 下载 / 时间线渲染仍同步 | `components/chat/media.tsx` | ≈11.5KB（media chunk 17.7 → 5.1KB） |
+| 2 | `App.tsx` 顶层圈选编辑器 `ImageAnnotationEditor` 改 `React.lazy` + 有 `source` 才挂载（编辑器自身 `!open` 即重置全部状态、无退场动画，条件挂载与常驻等价）；`ImageAnnotationSource` 改 `import type` | `App.tsx` | （与 #1 同一 chunk） |
+| 3 | `InboxDialog` / `GithubRepoModal` / `MessageFeedbackDialog` / `ProjectSettingsDialog`（连带 `ProjectAssetsPanel`）改 `React.lazy`，渲染点用新增的 `useMountedOnce(open)` 挂载闸：首次 open 前不挂载（不下载），打开过后常驻，四个对话框此前的效果都以 `open` 门控、`!open` 即复位，行为等价；首开空窗铺与既有懒对话框同款的 `DialogFallback` | `App.tsx` | ≈10.2KB（Inbox 2.5 + inboxLevels 0.1 / GithubRepo 2.4 / Feedback 1.3 / ProjectSettings 2.0 + AssetsPanel 1.9） |
+| 4 | 订阅弹窗的「预选意图 / 最近已付费」模块级状态下沉到新建 `lib/subscribeIntent.ts`；`chat/cards.tsx` 红卡改从 lib 取，`settings/SubscriptionDialog.tsx` 改为 import + re-export（`AccountTab` / 三个测试文件的既有引用零改动）。此前红卡（首屏同步渲染）静态引订阅弹窗，把弹窗 + `HupijiaoPaymentEntry` 支付入口一并钉进闭包 | 新增 `lib/subscribeIntent.ts`；`components/chat/cards.tsx`、`components/settings/SubscriptionDialog.tsx` | ≈4.6KB（SubscriptionDialog 2.2 + HupijiaoPaymentEntry chunk 2.4） |
+| 5 | 项目色板 `PROJECT_COLORS` 下沉到新建 `lib/projectColors.ts`；侧栏 `ProjectRow` 改从 lib 取，`ProjectSettingsDialog` re-export（测试引用不变）。否则 #3 的 ProjectSettingsDialog 会被侧栏这条静态边拽回闭包 | 新增 `lib/projectColors.ts`；`components/sidebar/ProjectRow.tsx`、`components/ProjectSettingsDialog.tsx` | （使 #3 生效） |
+| 6 | 空闲期预取清单加入 `ImageViewer` chunk（沿用 `prefetchLazyCentersOnIdle` 的 saveData / 2G 门控），时间线点图首开零延迟 | `App.tsx` | — |
+| 7 | 测试适配：`media.test.tsx` 的 URL 桩改为**保留真构造器**的子类（旧写法 `{ ...URL, createObjectURL }` 让 vitest 解析动态 import 时 `new URL` 抛 "URL is not a constructor"，懒块一加载即进错误边界），开查看器后的断言改 `waitFor` / `findByRole`；`MarkdownImpl.test.tsx` 同理改 `waitFor` | `components/chat/media.test.tsx`、`components/MarkdownImpl.test.tsx` | — |
+| 8 | 阈值注释补 2026-09-17 实测与取舵（数值不动） | `vite.config.ts` | — |
+
+越界说明：#1 / #4 / #5 / #7 触及 messages（media / cards / MarkdownImpl.test）、settings（SubscriptionDialog）、
+sidebar（ProjectRow）归属文件，均为「改一行 import / 抽一个常量 + re-export / 测试等待方式」的机械改动，
+不改任何业务行为；任务书允许改动清单外的文件已在交付里点出，由集成⑤合入时一并过目。
+
+### 9.3 验证（工作树 `wt\budget-fix`，2026-09-17）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 生产构建（= `deploy-v5-selfhost.sh --deploy` 的 `build_frontend` 同款） | `npm run build --workspace packages/web-react` | ✅ exit 0；first-screen-budget 门 445.5KB ≤ 460.0KB（另用同口径「只报告不 fail」的临时配置复算 = 456204 B，与门一致） |
+| 类型检查 | `npm run typecheck --workspace packages/web-react` | ✅ 绿 |
+| 触及模块单测 | `npx vitest run media / MarkdownImpl / ProjectSettingsDialog / cards / PaymentDialogs / AccountTab / InboxDialog / GithubRepoModal / MessageFeedbackDialog / ImageViewer / firstScreenBudget / components/sidebar` | ✅ 15 文件 / 303 用例（URL 桩修正后全绿） |
+| 全量 web-react 单测 | `cd packages\web-react; npm test` | ✅ **302 文件 / 4279 用例全部通过**（10m41s） |
+| 真浏览器交互门（时间线媒体 / 消息反馈弹窗 / 侧栏属高频面） | `$env:OC_E2E_BROWSER='…\chrome.exe'; npm run test:browser` | ✅ `browser-tests/run.mjs` **68/68**（含 T13 工具卡、T14 消息反馈弹窗焦点归还、T16/T17 全屏预览、T25/T68 390px）；`node --test` 契约 73 例 70 过 / 3 不过：① `cc-switch-ascii-name` 2 例 = 已知基线问题（settings ApiKeysSection，主克隆同样红，见 §7 与 RELEASE.md）；② `ocv5-185-qa` 1 例 = 该套件先 `git diff --exit-code HEAD -- packages/web-react/src` 要求工作树干净，当时改动尚未提交所致，**提交后单跑该文件复核见下一行** |
+| `ocv5-185-qa` 复跑（代码提交 `77e1f35dc` 后） | `node --test browser-tests/ocv5-185-qa.node-test.mjs` | ✅ **15/15**（T1–T14 双 Chromium 权限 QA 全过。注：该套件 `ensureProtocolShim` 用 `symlinkSync` 建 `packages/web-react/node_modules/@openclaude/protocol`，Windows 无符号链接权限时报 EPERM，先手工建同路径 junction 即可，与代码无关） |
+| 代码风格 | `npx biome check <本轮改动文件>`（与主克隆 `2d2b5cafc` 同文件逐条对照） | ✅ 新增 lint 诊断 0（`App.tsx` 14 条 `useExhaustiveDependencies`、`media.tsx` / `cards.tsx` 等的 a11y / format 诊断均为基线存量，行号平移）；新建的两个 LF 文件 `biome check` 0 诊断 |
+
+**未跑 / 未验（`NOT RUN`）**：
+
+- ui-preview before/after 截图：本轮零视觉改动（只改加载时序），未出图；`test:browser` 68 例已覆盖时间线 / 弹窗 / 390px 的真浏览器渲染。
+- 慢网首开体感：懒块首开多一次 chunk 拉取（ImageViewer ≈7KB、对话框各 1–4KB gzip），已由空闲预取（查看器）与 `DialogFallback`（对话框）对冲，未在节流网络下实测。
+
+### 9.4 遗留 / 后续可拆（供下一次逼近预算时取用）
+
+| 候选 | 闭包内体量（gzip 估算） | 说明 |
+|---|---|---|
+| `components/tool/{researchCards,connectorCards,skillCards,memoryReminderCards,releaseCards,grokDisplay}` 等专项工具卡体 | ≈18KB | 走 `tool/bodies.tsx` 注册表按工具类型懒加载可再省一大块，但工具卡在带工具调用的会话里属首屏可见，需 tools owner 评估首帧回退占位 |
+| `lib/taskboard.ts` | ≈3.3KB | 经 `useAppRoute`（`TICKET_TYPES` 常量）与 `useProjectScope`（`taskboardApi.listProjects`）静态进闭包；常量下沉 + 动态 import 即可拆 |
+| `@openclaude/protocol` 运行时 + `@sinclair/typebox` | ≈30KB（styles chunk） | 客户端只用到 protocol 的少数常量 / 类型，但 barrel 把全部 TypeBox schema 构造一并带进来；要拆得改 `packages/protocol` 导出结构，超出本轮范围（PLAYBOOK §9） |
+| `components/chat/PermissionCard` | ≈5.7KB | 只在有待决审批时渲染，可 lazy；但它是活动 turn 的高频交互面，本轮按「首屏可见组件不 lazy」保守不动 |

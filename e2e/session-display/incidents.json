@@ -4132,6 +4132,49 @@
           "assertion": "[cursor-sand-box-classify] PASS — Box transport faults classify as recoverable upstream outage in both gateway retry seams"
         }
       ]
+    },
+    {
+      "id": "INC-20260915-ADVISOR-CONSULT-CARD",
+      "occurredAt": "2026-09-15",
+      "severity": "P1",
+      "symptom": "顾问咨询进行中工具卡显示三行「未随工具结果返回」像失败；已配置顾问不在目录时下拉静默回落第一项；用户可见文案充满一期/CCB 黑话，非 CCB 主模型不知道如何解锁。",
+      "rootFixCommit": "7b2ae241",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/tool/bodyCards.test.tsx",
+          "assertion": "进行中显示思考中+已用时+提问，不写未返回"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/AgentPicker.test.tsx",
+          "assertion": "已配置顾问不在目录时警告并保持空选，不静默显示第一项"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-ui.node-test.mjs",
+          "assertion": "{ name: /主模型不变/ }"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260915-ADVISOR-1M-DUP-PICKER",
+      "occurredAt": "2026-09-15",
+      "severity": "P1",
+      "symptom": "顾问型号下拉把 Codex 标准档与 1M 长窗双子画成同一展示名，GPT-6-Astra/Sol/Terra/Luna 各出现两次，用户无法区分点的是哪条 catalog id。",
+      "rootFixCommit": "a6584a43",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorMode.test.ts",
+          "assertion": "listProvenAdvisorModels hides Codex 1M twins and keeps the standard id"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorMode.test.ts",
+          "assertion": "assertAdvisorModelAllowed canonicalizes Codex 1M twins onto the standard id"
+        }
+      ]
     }
   ]
 }

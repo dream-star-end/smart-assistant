@@ -5,7 +5,7 @@
  */
 import * as Dialog from "@radix-ui/react-dialog";
 import { Maximize2, X } from "lucide-react";
-import { useChatInteraction } from "./tool/context";
+import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
 import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
 import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
@@ -158,7 +158,7 @@ function parseOptionsBlock(
 }
 
 export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: boolean }) {
-  const { sendUserText, busy } = useChatInteraction();
+  const { sendUserText, busy, reason } = useChatInteraction();
   const group = useOptionsGroup();
   const groupSnap = useOptionsGroupSnapshot();
   const blockKey = useId();
@@ -253,7 +253,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
               <span
                 className={
                   "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-micro " +
-                  (chosen ? "border-accent bg-accent text-white" : "border-border text-transparent")
+                  (chosen ? "border-accent bg-accent text-accent-fg" : "border-border text-transparent")
                 }
               >
                 ✓
@@ -271,7 +271,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
           type="button"
           disabled={picked.size === 0 || blockedByBusy}
           onClick={confirmMulti}
-          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-white transition-opacity disabled:opacity-40"
+          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-accent-fg transition-opacity disabled:opacity-40"
         >
           确认选择{picked.size > 0 ? `(${picked.size})` : ""}
         </button>
@@ -280,7 +280,10 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
         <p className="px-1 text-caption text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
-      {!readOnly && !sendUserText && <p className="px-1 text-caption text-faint">(此会话中不可交互)</p>}
+      {/* 没有发送能力时说清原因:demo 是「演示模式仅供浏览」,不再笼统一句「此会话中不可交互」(D-08)。 */}
+      {!readOnly && !sendUserText && (
+        <p className="px-1 text-caption text-faint">{chatInteractionUnavailableText(reason)}</p>
+      )}
       {/* 新回合进行中历史选项卡不可点:说明原因,而不是只把选项压成 opacity-80 让人干等。 */}
       {interactive && blockedByBusy && (
         <output className="block px-1 text-caption text-faint">等待当前回合结束后可选择</output>

@@ -1134,6 +1134,21 @@ describe("未决态专审(PC-xx · t-875)", () => {
     expect(screen.getByText("终端")).toBeInTheDocument();
   });
 
+  test("QA t-1232 「查看完整参数」summary 触屏补 44px 高(已结清卡与普通审批框共用 PermissionInputSummary)", () => {
+    const { rerender } = render(
+      <PermissionCard
+        msg={bashPermMsg({ requestId: "req-summary-touch", _resolved: true, _behavior: "allow" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.getByText("查看完整参数")).toHaveClass("[@media(hover:none)]:py-3.5");
+    rerender(<PermissionCard msg={bashPermMsg({ requestId: "req-summary-touch-live" })} onRespond={vi.fn()} livePrompt />);
+    // 活提问自动弹出的普通审批框里同一枚 summary。
+    expect(screen.getByRole("dialog", { name: "工具权限请求" })).toBeInTheDocument();
+    expect(screen.getByText("查看完整参数")).toHaveClass("[@media(hover:none)]:py-3.5");
+  });
+
   test("PC-15 「其他」输入框回车即提交", () => {
     const onRespond = vi.fn();
     render(<PermissionCard msg={askMsg({ requestId: "req-enter" })} onRespond={onRespond} livePrompt />);
