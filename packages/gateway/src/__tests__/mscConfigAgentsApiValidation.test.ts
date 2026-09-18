@@ -69,6 +69,7 @@ async function json(
 }
 
 describe('msc-config · /api/agents & /api/config configuration surface', () => {
+  let lastGateway: { deps: { agentsConfig: { agents: any[] } } } | null = null
   async function withServer(fn: (base: string) => Promise<void>): Promise<void> {
     await writeAgentsConfig({
       agents: [
@@ -114,6 +115,7 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
       } as never,
       agentsConfig,
     })
+    lastGateway = gw as unknown as { deps: { agentsConfig: { agents: any[] } } }
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
       ;(
         gw as unknown as { handleHttp: (r: IncomingMessage, s: ServerResponse) => void }
@@ -208,7 +210,11 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
       const after = (await readAgentsConfig()).agents.find((a) => a.id === 'coder')
       assert.equal(after?.permissionMode, 'plan')
       assert.equal(after?.displayName, undefined, 'empty string must clear displayName')
-      assert.equal(after?.mcpServers?.[0]?.env?.SEARCH_API_KEY, MCP_SECRET, 'env untouched by unrelated PUT')
+      assert.equal(
+        after?.mcpServers?.[0]?.env?.SEARCH_API_KEY,
+        MCP_SECRET,
+        'env untouched by unrelated PUT',
+      )
     })
   })
 
@@ -234,11 +240,45 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
       const onDisk = (await readAgentsConfig()).agents.find((a) => a.id === 'coder')
       assert.equal(onDisk?.toolsets, undefined, 'invalid toolsets must not be persisted')
       const bad = await json(base, 'PUT', '/api/agents/coder', { mcpServers: { id: 'x' } })
-      assert.equal(bad.status, 400, `non-array mcpServers expected 400, got ${bad.status}: ${bad.text}`)
+      assert.equal(
+        bad.status,
+        400,
+        `non-array mcpServers expected 400, got ${bad.status}: ${bad.text}`,
+      )
       const badEntry = await json(base, 'PUT', '/api/agents/coder', {
         mcpServers: [{ id: 'x', command: '' }],
       })
-      assert.equal(badEntry.status, 400, `empty command expected 400, got ${badEntry.status}: ${badEntry.text}`)
+      assert.equal(
+        badEntry.status,
+        400,
+        `empty command expected 400, got ${badEntry.status}: ${badEntry.text}`,
+      )
+    })
+  })
+
+  // CFG-10(阶段 B):agents.yaml 单一内存权威 —— 外部写入(CLI / 手改 / 市场同步)经 mtime 缓存刷新
+  // 后,构造期快照 deps.agentsConfig(Router / /v1 / /api/file cwd 白名单的来源)同步换新。
+  it('external agents.yaml edits refresh deps.agentsConfig via the mtime cache (single authority)', async () => {
+    await withServer(async (base) => {
+      const gwOf = async () => {
+        // 通过一次枚举请求触发 _getAgentsConfig;拿 Gateway 实例看快照。
+        const list = await json(base, 'GET', '/api/agents')
+        assert.equal(list.status, 200, list.text)
+        return list
+      }
+      await gwOf()
+      await new Promise((r) => setTimeout(r, 25))
+      const newCwd = process.platform === 'win32' ? 'C:\\work\\coder' : '/home/agent/coder'
+      const before = await readAgentsConfig()
+      await writeAgentsConfig({
+        ...before,
+        agents: before.agents.map((a) => (a.id === 'coder' ? { ...a, cwd: newCwd } : a)),
+      })
+      const list = await gwOf()
+      assert.equal(list.body.agents.find((a: any) => a.id === 'coder')?.cwd, newCwd)
+      // 快照亦已同步(不是只有枚举面热、白名单面冷)
+      const snapshot = lastGateway?.deps.agentsConfig.agents.find((a: any) => a.id === 'coder')
+      assert.equal(snapshot?.cwd, newCwd, 'deps.agentsConfig must follow the mtime-cache refresh')
     })
   })
 
@@ -247,7 +287,10 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
     await withServer(async (base) => {
       const bad = await json(base, 'POST', '/api/agents', { id: 'newbie', permissionMode: 'yolo' })
       assert.equal(bad.status, 400, `expected 400, got ${bad.status}: ${bad.text}`)
-      assert.equal((await readAgentsConfig()).agents.some((a) => a.id === 'newbie'), false)
+      assert.equal(
+        (await readAgentsConfig()).agents.some((a) => a.id === 'newbie'),
+        false,
+      )
       const ok = await json(base, 'POST', '/api/agents', {
         id: 'newbie',
         permissionMode: 'acceptEdits',

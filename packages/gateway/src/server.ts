@@ -2646,13 +2646,32 @@ export class Gateway {
       }
       this._agentsConfigCache = await readAgentsConfig()
       this._agentsConfigMtime = mtime
+      this._syncAgentsConfigSnapshot(this._agentsConfigCache)
       return this._agentsConfigCache
     } catch {
       // File doesn't exist or stat failed — fall through to fresh read
       this._agentsConfigCache = await readAgentsConfig()
       this._agentsConfigMtime = 0
+      this._syncAgentsConfigSnapshot(this._agentsConfigCache)
       return this._agentsConfigCache
     }
+  }
+
+  // CFG-10:agents.yaml 只有一份内存权威 —— mtime 缓存刷新是唯一触发点。刷新时同步替换
+  // 构造期快照 deps.agentsConfig(Router / /v1 目标解析 / /api/file cwd 白名单都从它取)并
+  // router.reload(),于是 CLI `agents add`、手改 yaml、市场同步(另一进程写)也能热生效,
+  // 不再只有 API 写回那条路才刷新。Router 保持同步 API,不改异步。
+  private _syncAgentsConfigSnapshot(cfg: AgentsConfig): void {
+    if (this.deps.agentsConfig === cfg) return
+    this.deps.agentsConfig = cfg
+    this.router?.reload(cfg)
+  }
+
+  /** API 写回 agents.yaml 后调用:写回的对象即新权威,顺带失效 mtime 缓存(下次读走磁盘 mtime 重新对齐)。 */
+  private _adoptWrittenAgentsConfig(cfg: AgentsConfig): void {
+    this._agentsConfigCache = null
+    this._agentsConfigMtime = 0
+    this._syncAgentsConfigSnapshot(cfg)
   }
 
   // ── User-facing projection of the agents config (single authority) ──
@@ -7900,7 +7919,8 @@ export class Gateway {
       res.end('not found')
       return
     }
-    const agentCwds = this.deps.agentsConfig.agents
+    // CFG-10:cwd 白名单取 mtime 缓存的最新快照(手改 yaml / CLI / 市场同步后即刻生效),不再读构造期旧快照。
+    const agentCwds = (await this._getAgentsConfig()).agents
       .map((a) => a.cwd)
       .filter((c): c is string => !!c)
     // V3 multi-tenant: resolve the caller's docker-volume {uploads, generated}
@@ -8103,7 +8123,8 @@ export class Gateway {
       res.end('not found')
       return
     }
-    const agentCwds = this.deps.agentsConfig.agents
+    // CFG-10:同上,cwd 白名单从最新快照取。
+    const agentCwds = (await this._getAgentsConfig()).agents
       .map((a) => a.cwd)
       .filter((c): c is string => !!c)
     // User-scoped allowlist predicate: limit to **this request's** resolved
@@ -8765,14 +8786,13 @@ export class Gateway {
         return agent
       })
       if (!agent) return this.sendError(res, 409, 'agent already exists')
-      this.deps.agentsConfig = cfg
+      // 写回即新权威:同步快照 + 路由热更新(CFG-10 单一权威入口)
+      this._adoptWrittenAgentsConfig(cfg)
       await mkdir(paths.agentSessionsDir(id), { recursive: true })
       // Seed an empty persona file if missing
       try {
         await writeFile(paths.agentClaudeMd(id), `# Agent: ${id}\n\n`, { flag: 'wx' })
       } catch {}
-      // 热更新路由
-      this.router.reload(cfg)
       this.sendJson(res, 201, { agent: this._projectAgentForApi(agent) })
       return
     }
@@ -8844,10 +8864,7 @@ export class Gateway {
         for (const k of clearKeys) delete agent[k]
         return { status: 200, body: { agent: this._projectAgentForApi(agent) } }
       })
-      if (result.status === 200) {
-        this.deps.agentsConfig = cfg
-        this.router.reload(cfg)
-      }
+      if (result.status === 200) this._adoptWrittenAgentsConfig(cfg)
       this.sendJson(res, result.status, result.body)
       return
     }

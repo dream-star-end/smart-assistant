@@ -19,7 +19,7 @@ before(() => {
   process.env.OC_MODEL_AUTHORITY = '0'
 })
 after(() => {
-  if (saved === undefined) delete process.env.OC_MODEL_AUTHORITY
+  if (saved === undefined) process.env.OC_MODEL_AUTHORITY = undefined
   else process.env.OC_MODEL_AUTHORITY = saved
 })
 
