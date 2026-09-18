@@ -4,9 +4,10 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
 import { paths, type SkillEvalCase } from '@openclaude/storage'
+import { SKILL_RUN_RETENTION_DEFAULTS, selectRunsToEvict } from './skillJobRetention.js'
 import type {
   SkillEvalArm,
   SkillEvalBenchmark,
@@ -53,9 +54,22 @@ export function armsForMode(mode: SkillEvalMode): SkillEvalArm[] {
 export class SkillEvalJobStore {
   private readonly runs = new Map<string, SkillEvalRun>()
   private readonly maxConcurrent: number
+  private readonly retentionMs: number
+  private readonly keepPerSkill: number
+  private readonly maxEntries: number
 
-  constructor(opts: { maxConcurrent?: number } = {}) {
+  constructor(
+    opts: {
+      maxConcurrent?: number
+      retentionMs?: number
+      keepPerSkill?: number
+      maxEntries?: number
+    } = {},
+  ) {
     this.maxConcurrent = Math.max(1, opts.maxConcurrent ?? 1)
+    this.retentionMs = opts.retentionMs ?? SKILL_RUN_RETENTION_DEFAULTS.retentionMs
+    this.keepPerSkill = opts.keepPerSkill ?? SKILL_RUN_RETENTION_DEFAULTS.keepPerSkill
+    this.maxEntries = opts.maxEntries ?? SKILL_RUN_RETENTION_DEFAULTS.maxEntries
   }
 
   static newRunId(): string {
@@ -175,6 +189,43 @@ export class SkillEvalJobStore {
         }
         this.runs.set(parsed.runId, parsed)
       } catch {}
+    }
+  }
+
+  /**
+   * S-02:淘汰过期/超量的终态 run(done/failed)——内存 + 落盘一并清。永不动活跃 run
+   * (queued/running/grading);每技能保留最新 keepPerSkill 条。由 server.ts 周期调用 +
+   * 启动 loadAll 后调一次(把重启前累积的旧 run 一次性收敛)。返回淘汰条数。
+   */
+  prune(now: number): number {
+    const evict = selectRunsToEvict(
+      [...this.runs.values()].map((r) => ({
+        id: r.runId,
+        skillKey: r.skillName,
+        finishedAt: r.finishedAt ?? r.updatedAt ?? r.startedAt,
+        evictable: !ACTIVE.has(r.status),
+      })),
+      { now, retentionMs: this.retentionMs, keepPerSkill: this.keepPerSkill, maxEntries: this.maxEntries },
+    )
+    for (const id of evict) {
+      this.runs.delete(id)
+      void this._rmRunDir(id)
+    }
+    return evict.size
+  }
+
+  private async _rmRunDir(runId: string): Promise<void> {
+    try {
+      if (!VALID_RUN_ID_RE.test(runId)) return
+      const root = this._safeRoot()
+      if (!root) return
+      const dir = paths.skillEvalRunDir(runId)
+      if (!existsSync(dir)) return
+      const real = await realpath(dir)
+      if (real !== root && !real.startsWith(root + sep)) return
+      await rm(real, { recursive: true, force: true })
+    } catch {
+      /* best-effort;下轮重试 */
     }
   }
 
