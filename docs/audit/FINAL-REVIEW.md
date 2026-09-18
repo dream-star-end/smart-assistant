@@ -61,9 +61,9 @@
 
 | 环节 | 现状（09-18 21:xx，`git` 可核） | 待填 |
 |---|---|---|
-| 集成⑤ t-1237（21:4x 改版为「集成⑤收尾」） | 8 步合并 + accept + 记录已在 integration（`9103ce7b4`），上半场门全绿（§4）；**任务未验收**；下半场截图 / a11y 复扫有仓外产物但未入 INTEGRATION.md；收尾 = 再合 canonical `97f128d2b`（本机试合无冲突）+ 完整全量门 + INTEGRATION / RELEASE v2.3 + push integration，执行 fable-5-1-35 | 下半场终值、验收结论 → [SUMMARY.md §4.3](./SUMMARY.md) |
-| 发布准备 t-1268 | integration 已合 canonical `f1952819f`（`57ad2c823`），门全绿 448.3KB，RELEASE.md v2.2 就位（`aeae1d72e`）；**canonical ff / push 未做**；远端 canonical 又前进到 `97f128d2b`（gateway Sand 改动，无 migrations），并入集成⑤收尾 | `<REL>`、push 时间 → [SUMMARY.md §4.4](./SUMMARY.md) |
-| 发布执行 t-1269 | 未开始。**服务器 09-18 21:34 只读实测**：live 已是另一组部署的 `97f128d2b`（`rel-97f128d2b-20260918-120201`，12:02Z），回滚点 `rel-f1952819f-…`；工作树干净、service active、18790 200、无 open train、迁移 0281 已 apply（预期 `HAS_MIGRATION=0`）、磁盘 77% 余 46G → **前置就绪，阻断 0**；不可逆动作由指挥官代批（d-1326 / d-1832），与 Sand 组错开发布窗口 | §4.0 前值（按新基线）→ dry-run → `--deploy` → smoke 后值 → 发布记录 → [SUMMARY.md §4.5](./SUMMARY.md) · [RELEASE.md §4 / §6](./RELEASE.md) |
+| 集成⑤收尾 t-1237 | **21:43 验收通过**：integration `f3b3a0ad5` 已 push；八道门全绿——build 448.3KB ≤ 460KB、vitest 305 文件 / 4311 例、截图 303 场景 / 1034 张 / 0 失败、a11y 九项 vs 集成④ 只降不升（1 条 P3 字幕对比度回归登记不阻断）、`test:browser` 仅剩 2 条基线红、biome 新增 0；顺手修了 canonical 带入的 1 条旧断言真红（纯测试） | 归档回填 → [SUMMARY.md §4.3](./SUMMARY.md) |
+| 发布准备 t-1908（代 t-1268） | integration 已合 canonical `f1952819f`（`57ad2c823`），RELEASE.md v2.2 就位；剩：合 canonical `97f128d2b`（gateway Sand 改动、无 migrations，本机试合无冲突）→ 门 → RELEASE.md v2.3 → push integration；**canonical ff / push 未做**（fable-5-1-35 在做） | `<INT>` / `<REL>`、push 时间 → [SUMMARY.md §4.4](./SUMMARY.md) |
+| 发布执行 t-1892（代 t-1269） | 未开始。**服务器 09-18 21:34 只读实测**：live 已是另一组部署的 `97f128d2b`（`rel-97f128d2b-20260918-120201`，12:02Z）；工作树干净、service active、18790 200、无 open train、迁移 0281 已 apply（预期 `HAS_MIGRATION=0`）、磁盘 77% 余 46G → **前置就绪，阻断 0**；本组部署后的回滚点 = 当前 live；旧 `rel-*` 不清（留你定）；不可逆动作由指挥官代批（d-1326 / d-1936），与 Sand 组错开窗口 | §4.0 前值（按新基线）→ dry-run → `--deploy` → smoke 后值 → 发布记录 → [SUMMARY.md §4.5](./SUMMARY.md) · [RELEASE.md §4 / §6](./RELEASE.md) |
 
 **如果你要在发布前叫停，请在 t-1269 开始前说**；发布后回滚路径见 [RELEASE.md §5](./RELEASE.md)（自动补偿 / 手动回 `rel-*` / 失败矩阵）。
 
