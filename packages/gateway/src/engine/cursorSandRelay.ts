@@ -5,6 +5,13 @@
  * translated to Cursor's real Sand surface:
  *   POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream
  *   x-cursor-client-type: sand
+ *   x-cursor-client-source: sand-desktop
+ *   x-cursor-client-version: 3.21.12  (Direct; Grok Bot Box is opt-in)
+ *
+ * Direct Stream (default for the product adapter) uses the account session
+ * JWT on api2. The Grok Bot Box relay remains available for tests/rollback
+ * (`directStream: false` + `boxAccountId`) but that identity cannot run
+ * Claude families (`unavailable for Grok Bot inference`).
  *
  * The relay is loopback-only and route-token scoped. Cursor credentials are
  * read from the root-owned account mount for each auth cache generation and
@@ -38,6 +45,10 @@ import { CursorSandBoxError, CursorSandBoxResolver, cursorSandBoxHeaders, cursor
 
 const log = createLogger({ module: 'cursorSandRelay' })
 const DEFAULT_UPSTREAM = 'https://api2.cursor.sh'
+/** Cursor 3.21.12 Sand desktop identity. Direct api2 Stream accepts Claude
+ * families with this pair; Grok Bot 0.24.0/0.44.0 Box does not. */
+export const CURSOR_SAND_DIRECT_CLIENT_VERSION = '3.21.12'
+export const CURSOR_SAND_DIRECT_CLIENT_SOURCE = 'sand-desktop'
 /**
  * Upstream body-read liveness. undici's global dispatcher defaults to
  * `bodyTimeout=300s`; a Sand inference that stays silent for five minutes
@@ -141,6 +152,11 @@ interface RelayDeps {
   machineId?: string | null
   upstreamBaseUrl?: string
   clientVersion?: string
+  /**
+   * Skip Grok Bot Box and POST InferenceService/Stream to api2 with the
+   * account JWT. Product adapter sets this true. Box tests omit it.
+   */
+  directStream?: boolean
   now?: () => number
   /** Max silence between upstream frames before the relay gives up (ms). */
   upstreamStallMs?: number
@@ -1369,6 +1385,7 @@ export class CursorSandRelay {
   private readonly passthrough: RelayPassthrough | null
   private readonly upstreamLabel: string
   private readonly boxResolver?: CursorSandBoxResolver
+  private readonly directStream: boolean
   private readonly boxResponses = new WeakMap<Response, CursorSandBoxConnection>()
   private readonly requestStats = { messages: 0, inferenceAttempts: 0, toolCorrections: 0, passthroughAttempts: 0 }
 
@@ -1398,10 +1415,13 @@ export class CursorSandRelay {
       )),
       upstreamBaseUrl: (deps.upstreamBaseUrl ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
       clientVersion: deps.clientVersion
-        ?? (this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
+        ?? (deps.directStream
+          ? CURSOR_SAND_DIRECT_CLIENT_VERSION
+          : this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
       now: deps.now ?? Date.now,
       upstreamStallMs: deps.upstreamStallMs ?? upstreamStallMs(),
     }
+    this.directStream = deps.directStream === true
     if (deps.boxAccountId !== undefined) this.boxResolver = new CursorSandBoxResolver({
       accountId: deps.boxAccountId, credentialKind: this.credentialKind,
       fetchImpl: (url, init) => this.fetchUpstream(url, init), readPolicy: deps.readBoxPolicy, now: this.deps.now,
@@ -1673,6 +1693,7 @@ export class CursorSandRelay {
       'content-type': 'application/connect+proto',
       'connect-protocol-version': '1',
       'x-cursor-client-type': 'sand',
+      'x-cursor-client-source': CURSOR_SAND_DIRECT_CLIENT_SOURCE,
       'x-cursor-client-version': this.deps.clientVersion,
       'x-ghost-mode': 'true',
       'x-request-id': invocationId,
@@ -1687,7 +1708,7 @@ export class CursorSandRelay {
       body: new Uint8Array(connectEnvelope(bytes)),
       signal,
     }
-    const box = await this.boxResolver?.resolve(token, this.machineId, signal)
+    const box = this.directStream ? null : await this.boxResolver?.resolve(token, this.machineId, signal)
     let response: Response
     try {
       this.requestStats.inferenceAttempts++
