@@ -1,7 +1,15 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { createConnection } from 'node:net'
-import { resolve } from 'node:path'
-import { paths, probeSessionsDb, readAgentsConfig, readConfig } from '@openclaude/storage'
+import { isAbsolute, resolve } from 'node:path'
+import {
+  type AgentsConfig,
+  ConfigValidationError,
+  type OpenClaudeConfig,
+  paths,
+  probeSessionsDb,
+  readAgentsConfigWithWarnings,
+  readConfigWithWarnings,
+} from '@openclaude/storage'
 
 /** 脱敏展示 accessToken:前 4 位 + … + 后 4 位。完整值需 --show-token。 */
 export function maskAccessToken(token: string): string {
@@ -9,6 +17,56 @@ export function maskAccessToken(token: string): string {
   // 短 token 不足以留首尾 4 位时只留首 2 位,避免脱敏后反而泄露大半内容。
   if (token.length <= 12) return `${token.slice(0, 2)}…`
   return `${token.slice(0, 4)}…${token.slice(-4)}`
+}
+
+export type DoctorFinding = { level: 'ok' | 'warn' | 'fail'; line: string }
+
+/**
+ * 配置面的纯诊断(CFG-13):把归一 warnings、agents.yaml 一致性、persona 文件存在性、
+ * 多用户遗留模式(指挥官拍板 CFG-08:accessToken 仍可直通,只告警)整理成可打印的 findings。
+ * 纯函数,便于单测;IO(文件存在性)由调用方以 `personaExists` 注入。
+ */
+export function doctorConfigFindings(input: {
+  config: OpenClaudeConfig
+  configWarnings: string[]
+  agents: AgentsConfig
+  agentsWarnings: string[]
+  personaExists: (path: string) => boolean
+}): DoctorFinding[] {
+  const out: DoctorFinding[] = []
+  for (const w of input.configWarnings) out.push({ level: 'warn', line: `openclaude.json: ${w}` })
+  for (const w of input.agentsWarnings) out.push({ level: 'warn', line: `agents.yaml: ${w}` })
+  if (!input.config.gateway.accessToken) {
+    out.push({
+      level: 'fail',
+      line: 'gateway.accessToken 为空:任何客户端都无法登录,重跑 `openclaude onboard`',
+    })
+  }
+  if (input.config.gateway.users?.length) {
+    out.push({
+      level: 'warn',
+      line: `gateway.users 配置了 ${input.config.gateway.users.length} 个用户:多用户模式为遗留能力,原始 accessToken 仍可直接通过 API 鉴权(身份 default)`,
+    })
+  }
+  const defaultAgent = input.agents.agents.find((a) => a.id === input.agents.default)
+  if (!defaultAgent) {
+    out.push({
+      level: 'fail',
+      line: `agents.yaml: default "${input.agents.default}" 不在 agents 列表中`,
+    })
+  }
+  for (const agent of input.agents.agents) {
+    const persona = agent.persona ?? paths.agentClaudeMd(agent.id)
+    const abs = isAbsolute(persona) ? persona : resolve(paths.home, persona)
+    if (!input.personaExists(abs)) {
+      out.push({
+        level: 'warn',
+        line: `agent ${agent.id}: persona 文件不存在 ${abs}(首个会话会以空 persona 启动)`,
+      })
+    }
+  }
+  if (out.length === 0) out.push({ level: 'ok', line: '配置 schema 与 agents.yaml 一致性检查通过' })
+  return out
 }
 
 /** TCP 探测 gateway 端口是否在监听(bind 0.0.0.0/:: 时用回环地址探测)。 */
@@ -30,16 +88,27 @@ function probeGatewayPort(bind: string, port: number): Promise<boolean> {
 
 export async function doctor(opts: { showToken?: boolean } = {}): Promise<void> {
   console.log('OpenClaude doctor\n')
-  const cfg = await readConfig()
-  if (!cfg) {
+  let parsed: Awaited<ReturnType<typeof readConfigWithWarnings>>
+  try {
+    parsed = await readConfigWithWarnings()
+  } catch (err) {
+    if (err instanceof ConfigValidationError) {
+      console.error('✗ 配置文件不可用:', err.message)
+      console.error('  → 修正后重试,或备份该文件后重跑 `openclaude onboard`')
+      process.exit(1)
+    }
+    throw err
+  }
+  if (!parsed) {
     console.error('✗ 未找到配置 (', paths.config, ')')
     console.error('  → 运行 `openclaude onboard`')
     process.exit(1)
   }
+  const cfg = parsed.config
   console.log('✓ 配置文件:', paths.config)
 
   const ccbDir = resolve(cfg.auth.claudeCodePath)
-  if (!existsSync(ccbDir)) {
+  if (!cfg.auth.claudeCodePath || !existsSync(ccbDir)) {
     console.error('✗ Claude Code Best 路径不存在:', ccbDir)
     process.exit(1)
   }
@@ -52,10 +121,29 @@ export async function doctor(opts: { showToken?: boolean } = {}): Promise<void> 
   }
   console.log('✓ CCB 入口:', entry)
 
-  const agents = await readAgentsConfig()
+  const agentsParsed = await readAgentsConfigWithWarnings()
+  const agents = agentsParsed.config
   console.log(`✓ Agents: ${agents.agents.map((a) => a.id).join(', ')} (default: ${agents.default})`)
 
   let failed = false
+
+  // ── 配置 schema / 一致性诊断(CFG-13)──
+  for (const f of doctorConfigFindings({
+    config: cfg,
+    configWarnings: parsed.warnings,
+    agents,
+    agentsWarnings: agentsParsed.warnings,
+    personaExists: (p) => existsSync(p),
+  })) {
+    if (f.level === 'fail') {
+      failed = true
+      console.error(`✗ ${f.line}`)
+    } else if (f.level === 'warn') {
+      console.warn(`⚠ ${f.line}`)
+    } else {
+      console.log(`✓ ${f.line}`)
+    }
+  }
 
   // ── sessions.db 可打开性(复用 gateway /healthz 同一探针)──
   try {
