@@ -1,6 +1,6 @@
 # kp-automation · 知识星球自动回复面板 · 归档摘要（t-838，覆盖复查缺口 G-3）
 
-> 正文：`docs/audit/kp-automation.md`（随 `feat/v5-selfhost-audit-kp-automation` 合入后可读 **[待集成④]**）。本文只做摘要与索引。
+> 正文：[`docs/audit/kp-automation.md`](../kp-automation.md)（已随集成④ `d83d4a368` 合入 integration，2026-09-17）。本文只做摘要与索引。
 > 任务：t-838「知识星球自动回复面板 审计+修复（G-3）」，A→B 同人合一（settings-A 与 manage-A 互相推让，面板本体此前从未被审）；QA 复核 t-1029（[qa.md](./qa.md)）。
 > 分支 `feat/v5-selfhost-audit-kp-automation`，HEAD `b0fd16dad`，基线 `210b9967`；QA 修复 `1db992620` 在 `feat/v5-selfhost-audit-qa-gap`。
 > 范围：`components/settings/KnowledgePlanetAutomationPanel.tsx`（唯一改动的业务文件，801 → 1035 行）+ 新增 `.test.tsx`（370 行）+ `scenes-kp-automation.tsx`（14 场景）。
@@ -41,11 +41,12 @@
 |---|---|---|
 | KP-18 骨架加载态 / KP-19 编辑重拉星球列表 | 不修有判据 | 见正文 §6 |
 | 表单弹层改 `Modal mobile="sheet"` | shell 统一决定 | 全站设置类弹层均为居中形态 |
-| 同意勾选框 / 星球选项的 Checkbox 原语 | shell（`ui/` 尚无 Checkbox） | 与 market K-27 同口径 |
-| `KnowledgePlanetAutomationPanel.tsx:700` 勾选态 `bg-accent text-white` 深色对比度 | a11y-shell §5 同源项 | 待定：新任务或遗留 **[待集成④]** |
+| 同意勾选框 / 星球选项的 Checkbox 原语 | shell（`ui/` 尚无 Checkbox） | 与 market K-27 同口径 → shell 原语 `ui/Checkbox` 已由遗留清扫 t-1234 `959735722` 新增（待集成⑤）；本面板同意勾选换用原语属后续建议（manage / settings owner，需另出 before / after），未做 |
+| `KnowledgePlanetAutomationPanel.tsx:700`（a11y-C 基线 `:960`）勾选态 `bg-accent text-white` 深色对比度 | a11y-shell §5 同源项 | ✅ a11y-C t-1233 `00b86b565` 改 `text-accent-fg`（2.82 → 6.45），KP-05/06 用例补断言；分支 `feat/v5-selfhost-audit-a11y-c@c35fd00c6`，待集成⑤ |
+| 「从当前账号已加入的星球中选择」钮触屏 316×42 | kp-automation P3 nit | QA t-1232 §7 #2 复扫指出（差 2px）；a11y-C 按「对比度命中」口径未动，仍开放 |
 
 ## 5. 分支 / 提交
 
 - `feat/v5-selfhost-audit-kp-automation` @ `b0fd16dad`：`9c5ca666a` `2517de4c1` `b0fd16dad`
 - QA 修复：`feat/v5-selfhost-audit-qa-gap` `1db992620`
-- 集成：**[待集成④]**
+- 集成：✅ 集成④ `d83d4a368`（4 files, +1525/−283，零重叠）；QA 修复随 qa-gap `902ade6e8`。集成④ 全量门：`npm test` 302 / 4279（`KnowledgePlanetAutomationPanel.test` 为 +4 测试文件之一）、截图 301 场景含 kp 14 场景 failures 0、a11y 复扫 kp 14 场景命中均为禁用按钮（WCAG 例外）+ 勾选态白字（a11y-C 已修，待集成⑤）

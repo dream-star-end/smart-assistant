@@ -17,6 +17,7 @@
 ## 2. 修复情况
 
 - 阶段 B（t-53）：37 条中 **✅ 28 / ◐ 部分 5（TU-19 / 20 / 24 / 29 / 32）/ ⏸ 4（TU-17 / 21 / 34 需 shell 或产品口径，TU-36 已由集成② 在仓根落地）**；P2 12/12 全部落地。
+- 遗留清扫 t-1235（2026-09-17，分支 `feat/v5-selfhost-audit-leftover-tut@69e18aa93`，待集成⑤）：TU-17 / TU-34 两条 ⏸ → ✅（§4），新增 6 例、before / after 各 108 张、`check:tutorials` 无漂移；仍 ⏸ 的只剩 TU-21（产品口径）。
   - `e722bdf5f`：TU-01/02/03/04/10/11/13/14/15/16/18/19/22/23/24/26/31/33（沿用前任未提交改动并补齐用例；删 22 KB `MissionReplay`，拍板①；快速上手第 4 步改指「设定目标」，拍板②）
   - `d6eb6ef35`：TU-05/06/07/08/09/11/20/25/26/27/35（教程工作室表单门槛、错误态、撤回确认、分类标签）
   - `36ba6e6f0`：TU-10/11/12/22/28/29/30/32（免责声明对比度、展厅 iframe 沙箱、图稿口径、任务面板 CTA 门禁）
@@ -50,10 +51,11 @@
 
 | 项 | 归属 / 原因 |
 |---|---|
-| TU-17 深链 `view=` / `work=` | shell `useAppRoute` + `App.tsx`（本模块 state 已上提，接线成本一层 props）；集成③ 登记待办 |
+| TU-17 深链 `view=` / `work=` | ✅ 已由遗留清扫 t-1235 落地（`3fee24a58`：`?panel=help&tab=start\|cases`、`&work=planet\|gravity`、`&topic=…&step=N` 进 URL 并可反灌，`useAppRoute` + `App.tsx` 两处挂载接线，目标步骤滚顶落焦；参数名 `view=` 因与 `/board` 冲突改 `tab=`）；分支 `feat/v5-selfhost-audit-leftover-tut@69e18aa93`，待集成⑤；摘要见 [leftover.md](./leftover.md)，正文 [§10](../tutorials.md) |
 | TU-21 CTA 五种文案 + 字面量比较 | 产品口径 + `App.tsx` 传参，需同批改 3 个组件用例与场景 |
-| TU-34 品牌深蓝 hero | shell token `--hero-bg / --hero-fg`；集成③ 登记待办（可选） |
+| TU-34 品牌深蓝 hero | ✅ 已由遗留清扫 t-1235 落地（`04006714f`：模块级 token `components/tutorials/heroTheme.ts`（`--hero-bg / --hero-fg / --hero-line`，暗色抬亮 + 描边），12 处写死色值改走 `bg-(--hero-bg)`，不再需要 shell 改 `styles.css`）；待集成⑤ |
 | TU-19 已读判定 0.9s | 产品口径（改口径会让老用户已读勾号变少，先问再改） |
+| `TutorialCenter.tsx:387` 头部图标块「案例」模式白图标压实底 `bg-accent`（深色 2.82 <3:1） | a11y-C t-1233 收尾补记（`a11y-c.md` §3）：同 shell#1 根因，不在 a11y-shell §5 清单、复扫不计 `<svg>`；一行改法 `mode === "cases" ? "bg-accent text-accent-fg" : "bg-grad-cta text-white"`，留 tutorials owner / 集成⑤ 顺手 |
 | TU-20 统一复制 hook / TU-24 余量（卡片内容模型、焦点交接、跳到正文）/ TU-29 封面幽灵字 | 打磨，部分修复保留 |
 | TU-32 App 侧 `taskboardEnabled` 一行 | ✅ 已由集成③ `bdf7b4d15` 接线 |
 | TU-36 `.gitattributes` | ✅ 集成② `419e0d218` |

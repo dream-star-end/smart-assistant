@@ -1,6 +1,6 @@
 # permission-card · 会话内权限审批卡 未决态审批交互 · 归档摘要（t-875，t-837 作废重开）
 
-> 正文：`docs/audit/permission-card.md`（随 `feat/v5-selfhost-audit-permission-card` 合入后可读 **[待集成④]**）。本文只做摘要与索引。
+> 正文：[`docs/audit/permission-card.md`](../permission-card.md)（已随集成④ `015522b66` 合入 integration，2026-09-17）；QA 复核 t-1232 [`docs/audit/qa/QA-a11y.md`](../qa/QA-a11y.md) §4（分支 `feat/v5-selfhost-audit-qa-a11y@eed1f3989`，待集成⑤）。本文只做摘要与索引。
 > 任务：t-875「PermissionCard·未决态审批交互 专审+修复（重开，接 t-837）」，A→B 同人合一；执行 fable-5-1-56（场景 / before / PC-01…15 代码与用例，未提交即离线）→ fable-5-1-52（无改动）→ fable-5-1-23 接手收口。
 > 背景：t-760 覆盖复查指出 messages-A 的 `ask-user-question` 场景只含「已解析权限卡」，未决态（待决 / 批准中 / 拒绝 / 超时 / 多卡并发 / 键盘 / 移动端）无人审过。
 > 分支 `feat/v5-selfhost-audit-permission-card`，HEAD `8a3179896`，基线 `210b9967`。**归档统计排除 t-837**：正文 §0 核对表结论 —— t-837 没有任何声称项落地到 integration（`PermissionCard.tsx` 与基线逐字节相同、无文档、无提交），其工作树半成品由 t-875 逐行走读后收口。
@@ -30,10 +30,12 @@ P1 0：待决 → 允许 / 拒绝 → 结清主链路可用；弹框单例、dis
 | 组件单测 | ✅ `PermissionCard.test` 70 例（基线 57 → +13） |
 | 时间线层 / chat 目录 | ✅ `MessageRenderer.test` 147 例；`src/components/chat` + `src/lib/chat` 60 文件 / 1274 例 |
 | `biome lint` | ✅ 新增 0（`PermissionCard.tsx` 11 条与 HEAD 逐条相同） |
-| 预览台类型检查 | ◐ 基线分支无 `typecheck:preview` 脚本；借 integration 配置临时跑，`browser-tests/ui-preview/**` 0 错，20 条落在 `../protocol/src` 为基线 tsconfig 差异 → 合入后由集成④ 全量门覆盖 **[待集成④]** |
+| 预览台类型检查 | ◐ 基线分支无 `typecheck:preview` 脚本；借 integration 配置临时跑，`browser-tests/ui-preview/**` 0 错，20 条落在 `../protocol/src` 为基线 tsconfig 差异 → ✅ 集成④ 终点 `typecheck:preview` exit 0（`scenes-permission-card.tsx` 0 错） |
 | `test:browser` | ✅ `run.mjs` T1–T67 全部 ok；`node --test` 70/73（基线 cc-switch ×2 + ocv5-185 symlink） |
 | 视觉 | ✅ before 12 场景 48 张 / after-2 13 场景 52 张，failures 0 |
-| NOT RUN | `npm test` 全量（交集成④）、真机、读屏实机 |
+| 集成④ 全量门（合入后） | ✅ `npm test` 302 文件 / 4279 例（`PermissionCard.test` +13）；`run.mjs` 68/68（含 T57 permission live-units、T15 Ask UI 移动端）；截图 301 场景含 permission-card 13 场景 failures 0；a11y 复扫 13 场景 cL / cD / names / ax / tabBad 全 0，仅 `t44` 8（`查看完整参数` summary，QA t-1232 已修）+ misc（历史结清卡只读摘要区，非问题） |
+| QA 复核 t-1232（独立第二双眼睛 fable-5-1-35） | ✅ PC-01…PC-17 **17 / 17 在 integration HEAD 定位到 file:line 并有用例**；`permissionPopupCoordinator.ts` / `permissionReconcile.ts` 相对基线零 diff 与文档一致；QA 直接修 1 处本交付漏项：`PermissionInputSummary` `<summary>查看完整参数` 触屏只有 16px 高 → `77a93d9e1` 补 `[@media(hover:none)]:py-3.5`（`PermissionCard.test` 71 例，修前红修后绿；复扫 settled 6→0 / pending-modal 1→0） |
+| NOT RUN | 真机、读屏实机 |
 
 ## 4. 遗留与理由
 
@@ -46,4 +48,5 @@ P1 0：待决 → 允许 / 拒绝 → 结清主链路可用；弹框单例、dis
 ## 5. 分支 / 提交
 
 - `feat/v5-selfhost-audit-permission-card` @ `8a3179896`：`3f2c40ad9` `292ed1bad` `2ceeff88f` `4680572c1` `8a3179896`
-- 集成：**[待集成④]**（基于 `210b9967`；`3f2c40ad9` 与 integration 截图台改动同文件，留意合并）
+- 集成：✅ 集成④ `015522b66`（5 files, +1248/−37；`MessageRenderer.test.tsx` 三方自动合并，`shoot.mjs` 与 integration 同一改动无差异）；集成④ 终点 `rev-list HEAD..8a3179896` = 0
+- QA 修复：`feat/v5-selfhost-audit-qa-a11y` `77a93d9e1`（t-1232，待集成⑤）

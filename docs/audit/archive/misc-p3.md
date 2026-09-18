@@ -1,6 +1,6 @@
 # 杂项 P3 · `?demo=1` 演示模式 + optionsGroup 多题聚合 · 归档摘要（t-839，覆盖复查缺口 G-4 / G-5）
 
-> 正文：`docs/audit/misc-p3.md`（随 `feat/v5-selfhost-audit-misc-p3` 合入后可读 **[待集成④]**）。本文只做摘要与索引。
+> 正文：[`docs/audit/misc-p3.md`](../misc-p3.md)（已随集成④ `bf940d804` 合入 integration，2026-09-17；t-1234 在 leftover-shell 分支另回写 D-02 / D-08 状态，待集成⑤）。本文只做摘要与索引。
 > 任务：t-839，轻审 + 修复同人合一（fable-5-1-55）；QA 复核 t-1029（[qa.md](./qa.md)）。
 > 分支 `feat/v5-selfhost-audit-misc-p3`，HEAD `c834dffa1`（基线 `210b9967`，开工先合入 integration `1d8eaf769` 对齐 `Message.tsx` / `RichBlocks.tsx` 基线）。
 > 范围：`lib/demo.ts`（+test）、`components/Message.tsx`、`components/optionsGroup.tsx`（+test）、`scenes-misc-p3.tsx`（7 场景）；越界（指挥官批准）：`components/RichBlocks.tsx` OptionsBlock 3 处、`components/MarkdownImpl.tsx` `components` 记忆化。`App.tsx` demo 分支约 60 处只审不改。
@@ -39,14 +39,15 @@
 
 | 项 | 归属 | 说明 |
 |---|---|---|
-| D-02 余项：demo 其余会话点开为空 | shell `App.tsx` `onDemoSelect` | 一行改 `DEMO_MESSAGES_BY_SESSION[id] ?? []` |
-| D-08 demo 下交互块未说明原因 | shell + messages | `ChatInteraction` 加 `reason` |
-| OG-05 发送文本半角标点 | messages 单独立项 | 同批改 `cards.test` / `RichBlocks.test` / `persist.test` 与历史数据口径 |
-| OG-09 发送失败后组锁定无恢复 | messages | `sendUserText` 需失败通道 |
+| D-02 余项：demo 其余会话点开为空 | shell `App.tsx` `onDemoSelect` | ✅ 集成④ `4a2745283` 接线 `setMessages(DEMO_MESSAGES_BY_SESSION[id] ?? [])`；t-1234 `3aba642ca` 补 `App.test`「demo 切换会话按 id 取 fixture」用例锁定（待集成⑤） |
+| D-08 demo 下交互块未说明原因 | shell + messages | ✅ 遗留清扫 t-1234 `3aba642ca`：`ChatInteraction.reason?: "demo"` + `chatInteractionUnavailableText()`「(演示模式仅供浏览,登录后可在真实会话中点选)」，`RichBlocks` `OptionsBlock` 按 reason 取文案，`App.tsx` demo 分支传 `{ reason: "demo" }`；`RichBlocks.test` +1；分支 `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`，待集成⑤ |
+| OG-05 发送文本半角标点 | messages 单独立项 | 同批改 `cards.test` / `RichBlocks.test` / `persist.test` 与历史数据口径；仍开放 |
+| OG-09 发送失败后组锁定无恢复 | messages | `sendUserText` 需失败通道；仍开放 |
 | D-04 `DEMO_USER.displayName="rqmn"` · D-09 气泡任意字号 | 产品 / 排版专项 | 不修 |
-| `optionsGroup.tsx:173` / `RichBlocks.tsx:249,267` 勾选框 `bg-accent text-white` | a11y-shell §5 同源项 | 待定 **[待集成④]** |
+| `optionsGroup.tsx:173` / `RichBlocks.tsx:249,267`（a11y-C 基线 `:256,:274`）勾选框 `bg-accent text-white` | a11y-shell §5 同源项 | ✅ a11y-C t-1233 `59e66773f` 两处改 `text-accent-fg`（`optionsGroup` 页脚已由本任务改 `Button` 原语自带 `-fg`），`RichBlocks.test` +1；集成④ a11y 复扫 `misc-options-*` 残留 ×3 即此项，随集成⑤ 合入后应归零 |
 
 ## 5. 分支 / 提交
 
 - `feat/v5-selfhost-audit-misc-p3` @ `c834dffa1`：`5ce25612b` `592ffcff5` `f76d0fcb6` `89ab0edd5` `c834dffa1`（另含 integration `1d8eaf769` 合并）
-- 集成：**[待集成④]**
+- 集成：✅ 集成④ `bf940d804`（9 files, +676/−51，零重叠）；D-02 接线 `4a2745283`。集成④ 全量门：`npm test` 302 / 4279（`optionsGroup.test` / `demo.test` 为 +4 测试文件之二）、`run.mjs` 68/68、截图 301 场景含 misc-p3 7 场景 failures 0
+- 后续：D-08 由 t-1234 `3aba642ca`、勾选框白字由 a11y-C `59e66773f` 落地，均待集成⑤

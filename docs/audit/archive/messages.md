@@ -3,7 +3,7 @@
 > 正文：[`docs/audit/messages.md`](../messages.md)（模块负责人维护；本文只做摘要与索引，不复制原文）。
 > 任务：t-32「A·messages 审计」→ t-33「B·messages 修复」→ t-629「二期·messages 遗留 P3 收尾」（**待验收**，交于 09-16 20:58）。
 > 分支 `feat/v5-selfhost-audit-messages`，HEAD `2abe389a9`，基线 `210b9967`。
-> 集成：messages-B（@`d2f84063d`）已由集成① `985b3ae57` 合入；二期 `2abe389a9`（仅文档）待集成③。
+> 集成：messages-B（@`d2f84063d`）已由集成① `985b3ae57` 合入；二期 `2abe389a9`（仅文档）由集成③ `cd58600e8` 合入；misc-p3 越界改动（`RichBlocks.tsx` / `MarkdownImpl.tsx`）随集成④ `bf940d804`、a11y-mod-b messages#1/#2 随集成④ `80e757d95` 合入；a11y-C `59e66773f`（选项块勾标 / 确认键 `-fg`）与 t-1234 `3aba642ca`（D-08 演示模式文案）待集成⑤。
 
 ## 1. 审出问题（P1 0 / P2 4 / P3 21，共 25）
 

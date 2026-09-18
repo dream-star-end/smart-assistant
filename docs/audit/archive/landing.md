@@ -43,7 +43,7 @@
 
 | 项 | 归属 | 理由 / 状态 |
 |---|---|---|
-| L-11 登录页占位符 = 标签 | shell（`App.test.tsx`） | 占位符被 shell 的 `App.test` 用 `getByPlaceholderText('邮箱'/'密码')` 锁定，本模块不越界；**集成② `f7c08f3eb` 已把 App.test 登录控件改按标签取**，后续可改占位符 |
+| L-11 登录页占位符 = 标签 | shell（`App.test.tsx`） | 占位符被 shell 的 `App.test` 用 `getByPlaceholderText('邮箱'/'密码')` 锁定，本模块不越界；**集成② `f7c08f3eb` 已把 App.test 登录控件改按标签取** → QA t-1038 指出遗留理由已失效并移交 → **✅ a11y-mod-b t-895 附录 `6236dfb08` 落地**（登录 / 注册页邮箱占位符改 `name@example.com`、密码框去同词占位；找回密码页「注册邮箱」是提示不是复读，保留），随集成④ `80e757d95` 合入；QA t-1232 复核 ✅ |
 | L-16 ② 设备上限「去设置解绑」 | 产品 / 桌面端 | 网页端缺设备管理页；设置中心若补「本地模式设备」分区，这里加一枚 `action` 即可 |
 | X-01 法务页主题接线 | shell | 已由 `LegalPage` 自接 `useTheme`，`main.tsx` 不必再动 |
 | X-02 `--grad-cta-fg` token | shell | 本模块用 `text-primary-fg` 兜住；补 token 后三处各换一个类名 |

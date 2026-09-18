@@ -1,6 +1,6 @@
 # QA 复核三轮 · 归档摘要（t-1028 二期 P3 / t-1038 B 轮 P3 / t-1029 缺口补审）
 
-> 正文：`docs/audit/qa/QA-p3-tail.md`（t-1028）、`docs/audit/qa/QA-b-p3.md`（t-1038）、`docs/audit/qa/qa-gap.md`（t-1029），随 `feat/v5-selfhost-audit-qa-p3` / `-qa-b-p3` / `-qa-gap` 合入后可读 **[待集成④]**。本文只做摘要与索引。
+> 正文：[`docs/audit/qa/QA-p3-tail.md`](../qa/QA-p3-tail.md)（t-1028）、[`docs/audit/qa/QA-b-p3.md`](../qa/QA-b-p3.md)（t-1038）、[`docs/audit/qa/qa-gap.md`](../qa/qa-gap.md)（t-1029），三支已随集成④ `4f93f6990` / `f605df89f` / `902ade6e8` 合入 integration；第四轮 t-1232 `docs/audit/qa/QA-a11y.md`（分支 `feat/v5-selfhost-audit-qa-a11y@eed1f3989`）待集成⑤，见 §4。本文只做摘要与索引。
 > 角色：测试 / QA「第二双眼睛」，对照被复核任务的验收标准逐项定位到 integration 代码行，复跑门禁，按 d-28 用截图台重出截图逐张看图；发现不合格项直接修（t-1029）或在任务书边界内移交（t-1038）。三轮核对态均为 integration `c034f05d7`（集成③ 6/6 之后、q-979 之后）。
 
 ## 1. t-1028 · 二期 P3 收尾复核（market2 t-625 / manage2 t-626 / sidebar2 t-627 / settings2 t-628）
@@ -42,10 +42,20 @@
 - 已确认仍开放的遗留：H-18 `App.tsx:3745` `onStop` 一行接线（shell）、H-12 / H-20、D-02 余项 / D-08、OG-05 / OG-09。
 - 分支 `feat/v5-selfhost-audit-qa-gap` @ `c1734aac6`（`747596782` `1db992620` 代码；`c06947a0c` `c1734aac6` 文档，含 §7「QA 直接修复」）。
 
-## 4. 分支 / 集成
+## 4. t-1232 · a11y-B 三条 + PermissionCard 交付复核（t-893 / t-894 / t-895 / t-875）
+
+- 复核态：integration `b23955208`（集成④ 12/12 之后），工作树 `wt\qa-a11y` 独立 `npm ci`；起稿 fable-5-1-23（permission-card 交付人，随名单换轮离队，报告未提交）→ **fable-5-1-35 接手**，§1–§3 file:line 全部按 HEAD 抽查复核、§4 permission-card 独立重做（利益申明：接手人未参与四条交付）。
+- **核对 58 项：✅ 57 / ◐ 1 / ❌ 0，四条全部通过**：t-893 shell#1–11 11/11（`styles.css` token 行号、`ui/a11y.ts` / `Modal` / `Sheet` / `TimeAgo` / `Toast` 逐处定位）；t-894 14 + 计划外 1 + QA nit 2 = 17 → 16 ✅ / 1 ◐（计划外 SubmitBar「查看」只补 `min-h-11`，复扫 5 处仍 `38×44`）；t-895 10 + 顺手 1 + 附录 L-11 / M-23 = 13/13；t-875 PC-01…17 17/17（`permissionPopupCoordinator.ts` / `permissionReconcile.ts` 相对基线零 diff）。
+- **QA 直接修 `77a93d9e1`**（`style(v5)`，4 文件 +27 −4）：① `PublishPanel` 「查看 / 收起」两钮 `[@media(hover:none)]:min-h-11 min-w-11 px-2`（`PublishPanel.test` K-21 用例补断言，修前红）；② `PermissionCard` `<summary>查看完整参数` `[@media(hover:none)]:py-3.5`（`PermissionCard.test` +1，71 例，修前红）。修后复扫 21 场景：`permission-card-settled` t44 6→0、`pending-modal` 1→0、`market-publish*` 4 场景各 1→0；其余指标与修前逐项相同。
+- 验证：typecheck ✅、`typecheck:preview` ✅；全量 `npm test` 301/302 文件绿 4127 例（唯一红 `MessageRenderer.test` `beforeAll` 10s 冷启超时 = 基线抖动，单独 `--hookTimeout=60000` 复跑 152/152 绿 → 合计 302/302）；`test:browser` `run.mjs` 68/68、`node --test` 70/73（3 红与基线逐条相同：cc-switch ×2、ocv5-185 symlink EPERM）；截图 20 场景 74 张 failures 0，逐张 Read 9 张关键图；CDP 复扫 301 场景 0 渲染失败，共同 257 场景 vs t-893 after：cL 58→44、cD 81→69、t44 419→163、names 16→11、ax 3→1、tabBad 13→12，**逐场景回归 0**（a11y-mod-a / mod-b 修复在合入态量化成立）；`git merge-tree` 试合 integration `2d2b5cafc` 无冲突。
+- 观察项 7 条（不阻断，QA 未越界改）：a11y-shell §5 同源项 12 处当时全部未落地 → 转 a11y-C（已处置，[a11y.md](./a11y.md) §6）；kp「从当前账号已加入的星球中选择」316×42、market `MyPublishes` 折叠钮 322×42（P3 nit，各归属 owner）；`RepoStatusBanner:85` 关闭钮 `opacity-70`（sidebar nit）；`ModelSelector` CostMark 深色 4.36 出现在禁用行（exempt）；读屏实机 NOT RUN 保持；建议集成⑤ 全量门沿用「全量 + `MessageRenderer.test` 单独 `--hookTimeout=60000` 复跑」两步口径。
+- 分支 `feat/v5-selfhost-audit-qa-a11y` @ `eed1f3989`（`77a93d9e1` 代码 · `eed1f3989` 报告），远端 = 本地，待集成⑤（只带入 4 文件 + 报告）。
+
+## 5. 分支 / 集成
 
 | 分支 | HEAD | 内容 | 集成 |
 |---|---|---|---|
-| `feat/v5-selfhost-audit-qa-p3` | `3e640a85d` | `qa/QA-p3-tail.md` | **[待集成④]** |
-| `feat/v5-selfhost-audit-qa-b-p3` | `0ac949b2e` | `qa/QA-b-p3.md` + `landing.md` / `media.md` 勘误 | **[待集成④]**（与 a11y-mod-b 同文件，留意合并） |
-| `feat/v5-selfhost-audit-qa-gap` | `c1734aac6` | `qa/qa-gap.md` + 2 处修复 + hud / kp-automation / misc-p3 三支合并 | **[待集成④]**（整支 ff 可带上三条专项） |
+| `feat/v5-selfhost-audit-qa-p3` | `3e640a85d` | `qa/QA-p3-tail.md` | ✅ 集成④ `4f93f6990`（1 file, +125） |
+| `feat/v5-selfhost-audit-qa-b-p3` | `0ac949b2e` | `qa/QA-b-p3.md` + `landing.md` / `media.md` 勘误 | ✅ 集成④ `f605df89f`（3 files, +242/−2；与 a11y-mod-b 同文件未冲突） |
+| `feat/v5-selfhost-audit-qa-gap` | `c1734aac6` | `qa/qa-gap.md` + 2 处修复 + hud / kp-automation / misc-p3 三支合并 | ✅ 集成④ `902ade6e8`（4 files, +192/−41；`scenes-hud.tsx` 唯一冲突取 qa-gap 版本 `747596782`，指挥官 q-1227 预先指定） |
+| `feat/v5-selfhost-audit-qa-a11y` | `eed1f3989` | `qa/QA-a11y.md` + 2 处 QA 修复 `77a93d9e1`（`PublishPanel` / `PermissionCard` 各 + test） | 待集成⑤（+2，远端 = 本地） |

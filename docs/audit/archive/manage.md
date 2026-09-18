@@ -3,7 +3,7 @@
 > 正文：[`docs/audit/manage.md`](../manage.md)（模块负责人维护；本文只做摘要与索引，不复制原文）。
 > 任务：t-38「A·manage 审计」→ t-39「B·manage 修复」→ 补丁① t-426（在 settings 分支承接 ConnectorsTab 四条）→ t-626「二期·manage 遗留 P3 收尾」（**在跑**，fable-5-1-54）。
 > 分支 `feat/v5-selfhost-audit-manage`，HEAD `26b865e2f`，基线 `210b9967`。
-> 集成：manage-B（@`af79d7b05`）由集成① `09a13a472` 合入；二期提交 `0a47b4948` `26b865e2f` 待集成③。
+> 集成：manage-B（@`af79d7b05`）由集成① `09a13a472` 合入；二期提交 `0a47b4948` `26b865e2f` 由集成③ `c761bbd93` 合入（QA t-1028 复核 6 ✅ / 0 ❌）；a11y-mod-a manage 四条随集成④ `68f031ba6`；a11y-C `b591e64b6`（`OptimizationPanel` 图标块 `-fg`）待集成⑤。
 
 ## 1. 审出问题（P1 1 / P2 8 / P3 18，共 27；另跨模块 3 条）
 

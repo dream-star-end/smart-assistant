@@ -3,7 +3,7 @@
 > 正文：[`docs/audit/taskboard.md`](../taskboard.md)（模块负责人维护；本文只做摘要与索引，不复制原文）。
 > 任务：t-42「A·taskboard 审计」→ t-43「B·taskboard 修复」→ t-630「二期·taskboard 遗留 P3 收尾」（**待验收**，交于 09-16 21:30）。
 > 分支 `feat/v5-selfhost-audit-taskboard`，HEAD `05dd185df`，基线 `210b9967`。
-> 集成：taskboard-B（@`0b06f7ce5`）由集成① `bf8188def` 合入（集成① `1ae92b831` 随契约更新 `cost-authority` 用例）；二期 `cb6629bd1` `05dd185df` 待集成③。
+> 集成：taskboard-B（@`0b06f7ce5`）由集成① `bf8188def` 合入（集成① `1ae92b831` 随契约更新 `cost-authority` 用例）；二期 `cb6629bd1` `05dd185df` 由集成③ `425655631` 合入（仅场景 1 行，消 `typecheck:preview` TS2322）；a11y-mod-b taskboard#2 随集成④ `80e757d95` 合入。
 
 ## 1. 审出问题（P1 2 / P2 14 / P3 14，共 30）
 

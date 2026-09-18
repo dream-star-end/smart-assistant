@@ -3,7 +3,7 @@
 > 正文：[`docs/audit/settings.md`](../settings.md)（模块负责人维护；本文只做摘要与索引，不复制原文）。
 > 任务：t-40「A·settings 审计」→ t-41「B·settings 修复」→ t-426「补丁①·settings ConnectorsTab 承接 manage M-09/18/20/21 等」→ t-628「二期·settings 遗留 P3 收尾」（已完成）。
 > 分支 `feat/v5-selfhost-audit-settings`，HEAD `5eac1b807`，基线 `210b9967`（补丁①起合入过 integration `43b7cd3a4`）。
-> 集成：settings-B + 补丁①（@`c0efc9c91`）由集成② `5e5ed6925` 合入；二期 `8b2636e94`…`5eac1b807` 待集成③。
+> 集成：settings-B + 补丁①（@`c0efc9c91`）由集成② `5e5ed6925` 合入；二期 `8b2636e94`…`5eac1b807` 由集成③ `12fc17579` 合入（QA t-1028 复核 11 ✅ / 0 ❌）。
 
 ## 1. 审出问题（P1 0 / P2 12 / P3 31，共 43）
 
@@ -54,7 +54,7 @@
 | SET-09 组织充值汇率预估 | 需后端配合 | `POST /api/org/topup` 契约无汇率 / 预估字段，需 `GET /api/org/plans` 下发 `credits_per_yuan`；前端已做填额说明 + 到账实际入账数 |
 | SET-10 组织改名 | 需后端配合 | 无 `PATCH /api/org {name}`；文案已不再承诺 |
 | `ConnectorsTab` / `KnowledgePlanetAutomationPanel` 目录迁移 | 跨模块（manage 决定） | 文件在 `components/settings/` 但只被 ManageCenter 使用，迁移牵动 manage import 与场景 |
-| 备案号真值 / `brand` 字段 | 跨模块（shell `lib/brand.ts`）| 运营填值即可；关于页已按 `hasIcpNumber()` 条件渲染 |
+| 备案号真值 / `brand` 字段 | 跨模块（shell `lib/brand.ts`）| 运营填值即可；关于页已按 `hasIcpNumber()` 条件渲染 → **✅ 遗留清扫 t-1234 `74026e020` 删本地 `hasIcpNumber`，改引 `lib/legal` `filedIcp()`**（关于页 / landing 页脚 / 法务页判据同源；集成③ §7「备案判据可选去重」待办闭环，待集成⑤） |
 | SET-32 双份轮询 · Auto-Dream 卡片文案 · `ApiKeysSection` 深链含密钥 | 不修 | 有判据 / 产品决策 / CC Switch V1 协议要求 |
 
 → 正文 §6.3、§9.1。
@@ -66,4 +66,4 @@
 - 阶段 B：`32804b476` `d3201a8a8` `a8f1d93ca` `df6b2c106` `5bce50f48`
 - 补丁①：`dc99a93ca`（合入 integration `43b7cd3a4` 对齐基线）`138accab4` `9582b5eb5` `091a1a7bb`；文档 `c0efc9c91`
 - 二期：`8b2636e94`；文档 `c5070e1ee` `5eac1b807`
-- 集成：`5e5ed6925`（集成②，@`c0efc9c91`）；二期待集成③
+- 集成：`5e5ed6925`（集成②，@`c0efc9c91`）；二期 `12fc17579`（集成③，@`5eac1b807`）；a11y-mod-a settings 五条 + QA nit 2 随集成④ `68f031ba6`；a11y-C `b591e64b6`（`ApiKeysSection` 图标块 `-fg`）与 t-1234 `74026e020` 待集成⑤

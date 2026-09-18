@@ -1,6 +1,6 @@
 # HUD · 任务列表 / 后台子任务 · 归档摘要（t-836，覆盖复查缺口 G-1 / G-2）
 
-> 正文：`docs/audit/hud.md`（随 `feat/v5-selfhost-audit-hud` 合入 integration 后可读 **[待集成④]**；此前在 `wt\hud\docs\audit\hud.md` / `wt\qa-gap`）。本文只做摘要与索引。
+> 正文：[`docs/audit/hud.md`](../hud.md)（已随集成④ `2c1d659d2` 合入 integration，2026-09-17）。本文只做摘要与索引。
 > 任务：t-836「HUD·任务列表/后台子任务 审计+修复（G-1/G-2）」，A→B 同人合一；QA 复核 t-1029（[qa.md](./qa.md)）。
 > 分支 `feat/v5-selfhost-audit-hud`，HEAD `b1f06f8f5`，基线 `210b9967`；QA 修复 `747596782` 在 `feat/v5-selfhost-audit-qa-gap`。
 > 范围：`components/chat/PinnedTaskTracker.tsx` / `PinnedDelegateTracker.tsx`、`hooks/useInflightDelegates.ts`、`lib/chat/inflightDelegates.ts`（App 接线只读）。
@@ -39,14 +39,14 @@
 
 | 项 | 归属 | 说明 |
 |---|---|---|
-| H-18「停止本轮」父轮结束仍显示 | shell（`App.tsx` 接线） | 一行 `onStop={wsSending ? stopTurn : undefined}`；集成③ 终点 `App.tsx:3745` 仍无条件传 **[待集成④]** |
-| H-12 计时精确起点 | 需后端 `InflightDelegateSurface.startedAt` | 前端半修到位 |
-| H-20 ① `TokenUsageBadge` 流式重放入场动画 | messages `chat/tokenUsage.tsx` | 建议去 key 或仅首次动画 |
-| H-20 ② `text-faint` 暗色对比度 | shell token | a11y-shell t-893 已压暗 `--faint`，合入后复核 |
+| H-18「停止本轮」父轮结束仍显示 | shell（`App.tsx` 接线） | ✅ **集成④ `4a2745283` 已落地**：`PinnedDelegateTracker` `onStop={wsSending ? stopTurn : undefined}`（`wsSending = !demo && chat.isSending(activeId)`），`PinnedDelegateTracker.test` 既有契约 + `App.test` 回归 |
+| H-12 计时精确起点 | 需后端 `InflightDelegateSurface.startedAt` | 前端半修到位；仍开放（§5.1 需后端） |
+| H-20 ① `TokenUsageBadge` 流式重放入场动画 | messages `chat/tokenUsage.tsx` | 建议去 key 或仅首次动画；仍开放 |
+| H-20 ② `text-faint` 暗色对比度 | shell token | ✅ a11y-shell t-893 `d30ed780e` 压暗 `--faint`（深 `#92929b`），随集成④ `15f816145` 合入；集成④ a11y 复扫 hud 10 场景对比度命中 0 |
 | H-19 文案微调也重展开 | 设计取舍 | 保留 |
 
 ## 5. 分支 / 提交
 
 - `feat/v5-selfhost-audit-hud` @ `b1f06f8f5`：`d09934912` `9e6c29ad8` `6811df3ee` `983cb2a97` `b1f06f8f5`
 - QA 修复：`feat/v5-selfhost-audit-qa-gap` `747596782`
-- 集成：**[待集成④]**（qa-gap 分支整支 ff 可带上）
+- 集成：✅ 集成④ `2c1d659d2`（9 files, +959/−90；`run.mjs` T61 一行三方合并）；QA 修复随 qa-gap `902ade6e8` 合入（`scenes-hud.tsx` 唯一冲突取 qa-gap 版本）；H-18 接线 `4a2745283`。集成④ 终点 `rev-list HEAD..b1f06f8f5` = 0。集成④ 全量门：`npm test` 302 文件 / 4279 例（hud +11）、`run.mjs` 68/68、截图 301 场景含 hud 10 场景 failures 0、a11y 复扫 hud 10 场景全 0（仅 `hud-task-long` misc 1 = 长列表滚动区）

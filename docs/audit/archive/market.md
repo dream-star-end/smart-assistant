@@ -42,7 +42,7 @@
 
 → 正文 §8 验证（阶段 B）。
 
-## 4. 遗留与理由（阶段 B 末 13 条全部 P3 → 二期 t-625 落地 10 条，余 K-23 不做 / K-25 / K-27 遗留）
+## 4. 遗留与理由（阶段 B 末 13 条全部 P3 → 二期 t-625 落地 10 条，余 K-23 不做 / K-25 需后端；K-27 已由 t-1234 落地，待集成⑤）
 
 | 项 | 原因 | 建议 / 状态 |
 |---|---|---|
@@ -55,7 +55,7 @@
 | K-23 详情内卸载 | 与「已安装页是卸载唯一权威」既有决定冲突 | 拍板后复用卸载弹层 |
 | X-01 `App.tsx` 接线 | shell 归属 | ✅ 集成② `19799c0fe` 已接 |
 | K-25 / X-02 offset 分页 / 虚拟化 | 需后端 | 后端提供 offset 后前端改 append |
-| K-27 原生 checkbox | 需 shell 出 Checkbox 原语 | shell |
+| K-27 原生 checkbox | 需 shell 出 Checkbox 原语 | ✅ 已由遗留清扫 t-1234 落地：shell 新增 `ui/Checkbox` 原语 `959735722`，market 审核面 / 发布页四处接入 `ffac63718`，补场景 `market-review-partial` / `market-publish-agent-toolsets` `dc404359b`（分支 `feat/v5-selfhost-audit-leftover-shell@7e7c7e43b`，待集成⑤；摘要见 [leftover.md](./leftover.md)） |
 | **二期 t-625 结论** | 上表 K-08 / 09 / 22 / 10 / 12 / 13 / 14 / 15 / 19 / 21 **全部 ✅ 落地**（K-12 取「换行」；K-14 徽章解释改 `Tooltip` + 注脚；K-19 新增 `connectorAuthModeLabel` 等三个人话映射）；K-23 按任务书保持不做；K-25 / K-27 保持遗留（需后端 offset / 需 shell Checkbox） | 提交 `079797abf` `98aa1e9fe` `e065996c1` `5cc56b8e0`，文档 `5391c150a`；新增场景 `market-detail-plugin`；模块单测 11 文件 / 152 例全绿（+14），before / after 各 88 张 failures 0 |
 
 → 正文 §9 遗留、[§10 二期收尾（t-625）](../market.md#10-二期收尾t-625--遗留-p3)。
