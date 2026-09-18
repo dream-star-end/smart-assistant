@@ -11,7 +11,7 @@ import type {
 import type { EngineCreateOpts } from './registry.js'
 import { CcbAdapter } from './ccbAdapter.js'
 import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
-import { CursorSandRelay } from './cursorSandRelay.js'
+import { CURSOR_SAND_DIRECT_CLIENT_VERSION, CursorSandRelay } from './cursorSandRelay.js'
 import { isCursorSandBoxError } from './cursorSandBox.js'
 import {
   recordCursorCredentialResult,
@@ -92,6 +92,8 @@ export class CursorSandAdapter extends CcbAdapter {
       keyFingerprint: selection.keyFingerprint,
       credentialKind: selection.credentialKind,
       machineId: selection.machineId,
+      directStream: true,
+      clientVersion: CURSOR_SAND_DIRECT_CLIENT_VERSION,
     })
     this.submitDelegate = submitDelegate
     this.recordResult = recordResult ?? ((result) => recordCursorCredentialResult({

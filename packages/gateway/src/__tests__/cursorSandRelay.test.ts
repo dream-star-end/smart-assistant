@@ -10,6 +10,8 @@ import { test } from 'node:test'
 import protobuf from 'protobufjs'
 import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
 import {
+  CURSOR_SAND_DIRECT_CLIENT_SOURCE,
+  CURSOR_SAND_DIRECT_CLIENT_VERSION,
   CURSOR_SAND_NON_RETRYABLE_SUFFIX,
   CursorSandRelay,
   classifyUpstreamReadFailure,
@@ -1143,6 +1145,7 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     assert.equal(url, 'https://api2.cursor.sh/aiserver.v1.InferenceService/Stream')
     const headers = new Headers(init.headers)
     assert.equal(headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
     assert.equal(headers.get('x-cursor-client-version'), 'cli-2026.08.11-e8db854')
     assert.equal(headers.get('content-type'), 'application/connect+proto')
     const body = Buffer.from(init.body as Uint8Array)
@@ -1571,10 +1574,59 @@ test('session credential is sent as Bearer with x-cursor-checksum and skips the 
     // readApiKey returns the raw slot bytes (trailing newline); Bearer must be the trimmed token.
     assert.equal(inference.headers.get('authorization'), `Bearer ${token.trim()}`)
     assert.equal(inference.headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(inference.headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
     assert.equal(inference.headers.get('x-cursor-client-version'), CURSOR_SESSION_CLIENT_VERSION)
     const checksum = inference.headers.get('x-cursor-checksum')
     assert.equal(checksum, cursorSessionChecksum(machineId, 1_700_000_000_000))
     assert.ok(checksum?.endsWith(machineId))
+  } finally {
+    await relay.close()
+  }
+})
+
+test('directStream skips Box and talks to api2 as Cursor 3.21.12 sand-desktop', async () => {
+  const machineId = 'abcdefghijklmnopqrstuvwxyz'
+  const token = sessionJwt(Math.floor(Date.now() / 1000) + 30 * 86400)
+  const seen: { url: string; headers: Headers }[] = []
+  const fetchImpl: typeof fetch = async (input, init) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) })
+    return new Response(Buffer.concat([responseFrame('textPart', { text: 'SAND_OK' }), envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from(`${token}\n`),
+    credentialKind: 'session',
+    machineId,
+    boxAccountId: '15',
+    directStream: true,
+    now: () => 1_700_000_000_000,
+    readBoxPolicy: () => {
+      throw new Error('directStream must not read Box policy')
+    },
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-opus-5-low', stream: false, max_tokens: 64,
+        messages: [{ role: 'user', content: 'Reply with exactly SAND_OK.' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(seen.length, 1)
+    assert.equal(seen.some((call) => call.url.includes('GrokBotService') || call.url.includes('cursorvm.com')), false)
+    const inference = seen[0]!
+    assert.equal(inference.url, 'https://api2.cursor.sh/aiserver.v1.InferenceService/Stream')
+    assert.equal(inference.headers.get('authorization'), `Bearer ${token.trim()}`)
+    assert.equal(inference.headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(inference.headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
+    assert.equal(inference.headers.get('x-cursor-client-version'), CURSOR_SAND_DIRECT_CLIENT_VERSION)
+    assert.equal(inference.headers.get('x-cursor-checksum'), cursorSessionChecksum(machineId, 1_700_000_000_000))
   } finally {
     await relay.close()
   }

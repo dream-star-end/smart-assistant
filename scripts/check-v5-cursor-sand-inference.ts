@@ -24,6 +24,12 @@ const selfhostRelease = readFileSync(resolve(root, 'scripts/v5-selfhost-master-r
 
 assert.match(relay, /\/aiserver\.v1\.InferenceService\/Stream/)
 assert.match(relay, /'x-cursor-client-type': 'sand'/)
+assert.match(relay, /CURSOR_SAND_DIRECT_CLIENT_VERSION = '3\.21\.12'/)
+assert.match(relay, /CURSOR_SAND_DIRECT_CLIENT_SOURCE = 'sand-desktop'/)
+assert.match(relay, /this\.directStream \? null : await this\.boxResolver\?\.resolve/)
+assert.match(adapter, /directStream: true/)
+assert.match(adapter, /clientVersion: CURSOR_SAND_DIRECT_CLIENT_VERSION/)
+assert.match(tests, /directStream skips Box and talks to api2 as Cursor 3\.21\.12 sand-desktop/)
 assert.doesNotMatch(relay, /agent\.v1\.AgentService\/Run/)
 assert.doesNotMatch(relay, /startsWith\('claude-fable-5'\)/)
 assert.match(inferenceProto, /Struct parameters = 3;/)
