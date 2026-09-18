@@ -5,16 +5,16 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { acquireKernelFileLock, paths } from '@openclaude/storage'
 import {
   type CollaborationMode,
   collabConfigVersionOf,
   isCollaborationMode,
 } from '@openclaude/protocol'
+import { acquireKernelFileLock, paths } from '@openclaude/storage'
 import {
   CCB_ADVISOR_PROFILE_VERSION,
-  parseProvenCcbModels,
   type ProvenCcbAdvisorModel,
+  parseProvenCcbModels,
 } from './advisorMode.js'
 
 export const COLLAB_CONFIG_FORMAT = 1 as const
@@ -145,7 +145,12 @@ export function parseCollaborationConfigDoc(raw: unknown): CollaborationConfigDo
 export function resolveSessionCollab(
   doc: CollaborationConfigDoc,
   sessionId: string | undefined,
-): { mode: CollaborationMode; advisorModel: string | null; configVersion: string; source: 'session' | 'default' } {
+): {
+  mode: CollaborationMode
+  advisorModel: string | null
+  configVersion: string
+  source: 'session' | 'default'
+} {
   if (sessionId && doc.sessions[sessionId]) {
     const row = doc.sessions[sessionId]
     return {
@@ -179,7 +184,10 @@ export class AdvisorConfigStore {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
       if (code === 'ENOENT') return emptyCollaborationConfig()
-      throw new CollaborationConfigError('CORRUPT', `cannot read collaboration config: ${String(err)}`)
+      throw new CollaborationConfigError(
+        'CORRUPT',
+        `cannot read collaboration config: ${String(err)}`,
+      )
     }
     try {
       return parseCollaborationConfigDoc(JSON.parse(text))
@@ -235,6 +243,10 @@ export class AdvisorConfigStore {
   }
 
   async deleteSession(sessionId: string): Promise<CollaborationConfigDoc> {
+    // 与 putSession 同口径校验(CFG-21):非法 id 不该进锁 + 读盘 + 写盘的事务。
+    if (!isSessionId(sessionId)) {
+      throw new CollaborationConfigError('VALIDATION', 'session id invalid')
+    }
     return this.mutate(undefined, (doc) => {
       delete doc.sessions[sessionId]
       return doc
@@ -292,9 +304,14 @@ export class AdvisorConfigStore {
 
   async markEngineProven(engine: string): Promise<CollaborationConfigDoc> {
     const id = engine.trim()
-    if (!id) throw new CollaborationConfigError('VALIDATION', 'engine invalid')
+    // 长度上限与 parseCollaborationConfigDoc 的 provenEngines 校验同值;在这里先拒,调用方拿到的是
+    // VALIDATION 而不是写后才冒出来的 CORRUPT(CFG-21)。
+    if (!id || id.length > 32) throw new CollaborationConfigError('VALIDATION', 'engine invalid')
     if (id === 'ccb') {
-      throw new CollaborationConfigError('VALIDATION', 'ccb advisors must be marked per model/provider')
+      throw new CollaborationConfigError(
+        'VALIDATION',
+        'ccb advisors must be marked per model/provider',
+      )
     }
     return this.mutate(undefined, (doc) => {
       if (!doc.provenEngines.includes(id)) doc.provenEngines = [...doc.provenEngines, id]

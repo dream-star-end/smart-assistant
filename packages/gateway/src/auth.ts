@@ -18,13 +18,15 @@ export function checkToken(provided: string | null | undefined, expected: string
 
 const SCRYPT_KEYLEN = 64
 const SCRYPT_COST = 16384 // N
-const SCRYPT_BLOCK = 8    // r
+const SCRYPT_BLOCK = 8 // r
 const SCRYPT_PARALLEL = 1 // p
 
 export function hashPassword(password: string): string {
   const salt = randomBytes(16).toString('hex')
   const derived = scryptSync(password, salt, SCRYPT_KEYLEN, {
-    N: SCRYPT_COST, r: SCRYPT_BLOCK, p: SCRYPT_PARALLEL,
+    N: SCRYPT_COST,
+    r: SCRYPT_BLOCK,
+    p: SCRYPT_PARALLEL,
   })
   return `${salt}:${derived.toString('hex')}`
 }
@@ -33,7 +35,9 @@ export function verifyPassword(password: string, hash: string): boolean {
   const [salt, key] = hash.split(':')
   if (!salt || !key) return false
   const derived = scryptSync(password, salt, SCRYPT_KEYLEN, {
-    N: SCRYPT_COST, r: SCRYPT_BLOCK, p: SCRYPT_PARALLEL,
+    N: SCRYPT_COST,
+    r: SCRYPT_BLOCK,
+    p: SCRYPT_PARALLEL,
   })
   try {
     return timingSafeEqual(derived, Buffer.from(key, 'hex'))
@@ -68,9 +72,16 @@ export function verifyJwt(token: string, secret: string): JwtPayload | null {
   }
   if (diff !== 0) return null
   try {
-    const payload = JSON.parse(Buffer.from(body, 'base64url').toString()) as JwtPayload
-    if (payload.exp && payload.exp < Date.now() / 1000) return null // expired
-    return payload
+    const payload = JSON.parse(
+      Buffer.from(body, 'base64url').toString(),
+    ) as Partial<JwtPayload> | null
+    // 形状即契约(CFG-22):signJwt 恒带 30 天 exp 与非空 userId;缺 exp 的载荷过去会被当成
+    // 「永不过期」放行,只有密钥泄露时才可利用,但纵深防御不应留这条口子。
+    if (!payload || typeof payload !== 'object') return null
+    if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp)) return null
+    if (typeof payload.userId !== 'string' || payload.userId === '') return null
+    if (payload.exp < Date.now() / 1000) return null // expired
+    return { userId: payload.userId, exp: payload.exp }
   } catch {
     return null
   }
