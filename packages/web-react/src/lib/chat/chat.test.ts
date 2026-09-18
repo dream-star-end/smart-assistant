@@ -9790,6 +9790,105 @@ describe("ChatSocket 正在恢复上一轮 banner self-clear", () => {
     sock.stop();
   });
 
+  /** 真 final 帧走 reducer 的 onFinal 路径，**不经过** clearSendingState。
+   *  此前 dismissStaleRestoreBanner 只挂在 clearSendingState 上，正常成功收尾
+   *  后没有任何一处重估状态条 → 恢复条一直钉到用户手动刷新（用户报障截图）。*/
+  test("真 final 帧收尾后恢复条自动消失（不经 clearSendingState）", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-final";
+    ws.open(); // onopen 快照到在飞会话 → arm 30s 安全网
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        peer: { id: "s1", kind: "dm" },
+        clientMessageId: "u-final",
+        frameSeq: 1,
+        isFinal: true,
+        ts: Date.now(),
+        blocks: [{ kind: "text", text: "done", messageId: "srv-1" }],
+      }),
+    });
+    await flushStatus();
+
+    expect(session._sendingInFlight).toBe(false);
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  /** 侧栏里任意一条注水残留的 in-flight（turn 早已在服务端收尾、本 tab 永不会
+   *  再收到它的终态帧）不得钉死横幅：收口判据只看「钉横幅时的归属会话」。*/
+  test("其他会话残留 in-flight 不钉死横幅：只看归属会话", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const viewing = sock.ensureSession("s-viewing", "main");
+    viewing._sendingInFlight = true;
+    viewing._activeClientMessageId = "u-current";
+    ws.open();
+    await flushStatus();
+    // 注水复原的旧会话：_sendingInFlight 为真，但它不属于本次恢复条的归属集合。
+    const stale = sock.ensureSession("s-other-stale", "main");
+    stale._sendingInFlight = true;
+    stale._activeClientMessageId = "u-stale-from-hydration";
+
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    (sock as unknown as { clearSendingState(sess: typeof viewing): void }).clearSendingState(viewing);
+    await flushStatus();
+
+    expect(stale._sendingInFlight).toBe(true); // 残留仍在，但不再有钉住权
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  /** 归属会话仍在等终态时，横幅必须留住——修复不能把它摘早了。*/
+  test("归属会话仍在飞时，横幅保持不动", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const a = sock.ensureSession("s-a", "main");
+    a._sendingInFlight = true;
+    a._activeClientMessageId = "u-a";
+    const b = sock.ensureSession("s-b", "main");
+    b._sendingInFlight = true;
+    b._activeClientMessageId = "u-b";
+    ws.open(); // 两条都进归属集合
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    (sock as unknown as { clearSendingState(sess: typeof a): void }).clearSendingState(a);
+    await flushStatus();
+    // b 仍在等终态 → 横幅必须留住
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    (sock as unknown as { clearSendingState(sess: typeof b): void }).clearSendingState(b);
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
   test("套接字已断时收口恢复条，不谎称已连接", async () => {
     vi.useFakeTimers();
     const sock = makeSocket();

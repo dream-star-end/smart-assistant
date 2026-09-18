@@ -821,6 +821,10 @@ export class ChatSocket {
   // ── 重连 reconcile（§4）──
   private reconnectInFlightSet: Set<string> | null = null;
   private reconnectInFlightTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 恢复条的归属集合：钉上「正在恢复上一轮」时，仍在等终态的那批会话。
+   *  收口判据必须只看这批会话——用全量 sessions 判会让任意一条注水残留的
+   *  in-flight（其 turn 早已在服务端收尾、本 tab 永不再收到终态帧）永久钉死横幅。*/
+  private restoreBannerOwners: Set<string> | null = null;
   private reconnectReconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── durable dispatch journal / per-session FIFO ──
@@ -1712,7 +1716,15 @@ export class ChatSocket {
    */
   private dismissStaleRestoreBanner(): void {
     if (this.statusLabel !== "正在恢复上一轮…") return;
-    if ([...this.sessions.values()].some((session) => session._sendingInFlight)) return;
+    // 只有「钉这条横幅时确实在等终态、且至今仍在等」的会话才有资格继续钉住它。
+    const owners = this.restoreBannerOwners;
+    if (owners) {
+      for (const sessId of [...owners]) {
+        if (!this.sessions.get(sessId)?._sendingInFlight) owners.delete(sessId);
+      }
+      if (owners.size > 0) return;
+      this.restoreBannerOwners = null;
+    }
     if (this.ws?.readyState === 1) {
       const [label, cls] = onopenSetInitialStatus(this.offlineQueue.length);
       this.setStatus(label, cls);
@@ -1857,6 +1869,10 @@ export class ChatSocket {
         if (!isCronOrHeartbeat) this.finishDispatch(sess.id, clientMessageId);
         // 生成中排队的后续消息:本轮 final 已清 _sendingInFlight → 顺序发出下一条。
         if (!isCronOrHeartbeat) this.kickQueuedDrainIfIdle();
+        // 正常终态同样要收口「正在恢复上一轮」。reducer 在 final/error 路径直接清
+        // _sendingInFlight（不经 clearSendingState），此前没有任何一处重估状态条，
+        // 横幅会一直钉到用户手动刷新。
+        if (!isCronOrHeartbeat) this.dismissStaleRestoreBanner();
         // turn 收尾：落地完成轮（reload 不丢；游标 + 完整 tape durable）。
         this.deps.persistSession?.(sess.id);
         // 真终态到达时 lossless tape 已完成，立即做一次精确 REST 对账，让
@@ -1987,7 +2003,13 @@ export class ChatSocket {
             }
             return;
           }
-          if (this.statusCls !== "connected") this.setStatus("正在恢复上一轮…", "connecting");
+          if (this.statusCls !== "connected") {
+            // 登记归属：这批会话收尾后必须由 dismissStaleRestoreBanner 自行摘掉横幅。
+            this.restoreBannerOwners = new Set(
+              [...snapped].filter((sessId) => this.sessions.get(sessId)?._sendingInFlight),
+            );
+            this.setStatus("正在恢复上一轮…", "connecting");
+          }
         }, 30000);
       } else {
         this.reconnectInFlightSet = null;
@@ -2293,6 +2315,9 @@ export class ChatSocket {
             if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
             else this.clearThinkingSafety(sess.id);
           }
+          // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
+          // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
+          this.dismissStaleRestoreBanner();
         }
         return;
       }
@@ -2315,6 +2340,9 @@ export class ChatSocket {
             if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
             else this.clearThinkingSafety(sess.id);
           }
+          // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
+          // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
+          this.dismissStaleRestoreBanner();
           this.deps.persistSession?.(sess.id);
         }
         return;
