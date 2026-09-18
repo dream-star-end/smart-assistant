@@ -991,19 +991,32 @@ export type MemoryDocResponse = {
   text: string;
   /** 乐观锁版本；后端权威。缺省（旧后端）时前端按空串处理，不参与冲突检测。 */
   version?: string;
+  /** 全文字符数：仅展示，**不是**保存上限（画像存多少都不拒）。 */
   charCount?: number;
+  /**
+   * 会被注入 prompt 的 `<!-- oc-user-always:start/end -->` 块的字符数（trim 后）；无块 / 块非法为 0。
+   * 与 `limit` 同口径：只有这一段受注入预算约束，超出部分注入时被截断。缺省（旧后端）时前端本地计算。
+   */
+  alwaysCharCount?: number;
+  /** 注入预算（对 always 块生效），后端权威 = USER_PROFILE_INJECT_MAX_CHARS。 */
   limit?: number;
 };
 
 /** 用户画像写入冲突（后端 409：智能体在用户编辑期间改动了画像）。 */
-export type MemoryConflict = { text: string; version: string; charCount: number; limit: number };
+export type MemoryConflict = {
+  text: string;
+  version: string;
+  charCount: number;
+  alwaysCharCount?: number;
+  limit: number;
+};
 
 /**
  * PUT 用户画像结果：成功带新 version（更新基线），或 409 冲突数据（刷新基线后以用户版本为准）。
  * 用判别式 `ok` 分流，让上层无需 catch 也能区分「写成功」与「版本冲突」。
  */
 export type PutMemoryResult =
-  | { ok: true; version: string; charCount?: number; limit?: number }
+  | { ok: true; version: string; charCount?: number; alwaysCharCount?: number; limit?: number }
   | { ok: false; conflict: MemoryConflict };
 
 // ── 核心记忆 memdir（GET/PUT/DELETE /api/agents/:id/memory/{memory,files/:file}） ──
