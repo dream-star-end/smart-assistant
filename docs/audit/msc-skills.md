@@ -223,3 +223,47 @@ web UI hard cap          = 5
 | 真实模型 / PG 端到端评测（eval run/训练会话真跑） | **NOT RUN**：本机无 v5 后端（PG/容器/模型 Key 在服务器，见 PLAYBOOK §1） |
 
 > 说明：上述两处 node:test 失败在基线（未改代码）即存在，属 Windows 平台限制（symlink 权限 / realpath 大小写），符合 PLAYBOOK §3「Windows 上确实跑不起来 → 标 NOT RUN + 原因」。强制门（`tsc --build`、web typecheck）均绿，未因本轮新增文件变红（新增仅 md，无 .ts 入库）。
+
+---
+
+## 阶段 B · 修复记录（t-1848）
+
+指挥官预拍板（免 ask_decision）执行。P2 全修，P3 修 4 条，S-07/S-08 遗留。
+
+| 编号 | 改动 | 测试 |
+|---|---|---|
+| **S-01** 乐观并发 | 新增 `protocol` 无关；`storage/skillStore.ts`：`SkillSaveOptions.expectedVersion?` + `SkillSaveResult.conflict`，save() 在快照前比对当前版本，不符即 `{ok:false,conflict:{currentVersion}}`（**不快照不覆盖**），省略则旧行为。`server.ts` PUT `/api/skills/:name` 透传 expectedVersion，冲突回 **409** `{error,conflict:{currentVersion}}`。`api.ts` updateSkill 增 `expectedVersion?`。`SkillEditor.tsx` 保存带 `detail.version`，409 提示「已被其他地方修改，请重新加载（草稿已保留）」且不清 dirty。 | `storage/__tests__/skillStoreConcurrency.test.ts`（陈旧写被拒且不覆盖并发改动 / 省略=旧行为 / 技能不存在→currentVersion:null / 正确版本可存）|
+| **S-02** job 保留 | 新增 `gateway/skillJobRetention.ts`（纯选择器 `selectRunsToEvict` + `readSkillRunRetentionEnv`）。三个 store（eval/eval-gen/train）加 `retentionMs/keepPerSkill/maxEntries` 构造项与 `prune(now)`：淘汰过期/超量**终态** run（内存 + 落盘一并清）。**永不动活跃 run 与 train 的 diff_ready（草稿待处理）**。`server.ts` loadAll 后收敛一次 + 起周期 janitor（默认 7d/每技能 20 条/上限 500/6h 扫，`OPENCLAUDE_SKILL_RUN_*` 可调）。 | `gateway/__tests__/skillJobRetention.test.ts`（策略：不动活跃 / 过期淘汰 / 每技能 keep-floor / maxEntries 兜底）+ `skillEvalJobsPrune.test.ts`（store 接线：内存+磁盘淘汰、活跃与最新保留）|
+| **S-03** 上限单一权威 | 新增 `protocol/src/skillLimits.ts` 导出 `MAX_EVAL_CASES=8` + `protocol/src/index.ts` re-export；`storage/skillEvals.ts` 改为从 protocol 导入并 re-export；`gateway/skillEvalGen.ts` 生成 prompt 文案改用常量；`web/SkillOptPanel.tsx` 4 处硬编码 5 → `MAX_EVAL_CASES`（从 `@openclaude/protocol` 导入）。 | `web/skillEvalCap.test.ts`（web 与后端同源 =8、非旧值 5）|
+| **S-04** 部分更新 | `server.ts` PUT：未提供的字段先 `view()` 回填当前值再 save，不再把缺省写空（显式空串仍按原校验）。 | 由 tsc + S-01 测试路径覆盖；服务器处理器端到端需真后端 → 见遗留说明 |
+| **S-05** 体量守卫 | `server.ts` PUT 对 body(512KB)/description(8KB) 显式上限超限 **413**；aux 文件 64KB 守卫由 400 改 **413** 对齐。**未改通用 `readJsonBody`**（归 memory owner）。 | 同 S-04（处理器级，需真后端跑；已由 tsc 保证类型/编译）|
+| **S-06** saveAuxFile 守卫 | `storage/skillStore.ts` `saveAuxFile` 与 `deleteAuxFile` 同款拒 `SKILL.md`/`history/`（绕过版本快照）。 | `skillStoreConcurrency.test.ts`（拒 SKILL.md / 拒 history/ / evals/ 仍可写）|
+| **S-09** priority | `types.ts` `SkillSummary.priority?`；`SkillEditor.tsx` 正文页只读展示注入排序优先级（不做编辑）。 | tsc + 既有 SkillEditor vitest 绿 |
+
+## 阶段 B · 验证
+
+| 命令 | 结果 |
+|---|---|
+| `npx tsc --build` | **PASS**（exit 0） |
+| `npm run typecheck --workspace packages/web-react` | **PASS**（exit 0） |
+| `npx tsx --test packages/storage/src/__tests__/skillEvals.test.ts` | **PASS** 3/3 |
+| `npx tsx --test packages/storage/src/__tests__/skillStoreConcurrency.test.ts` | **PASS** 7/7（S-01/S-06）|
+| `npx tsx --test --test-concurrency=1 packages/gateway/src/__tests__/skillJobRetention.test.ts` | **PASS** 6/6（S-02 策略）|
+| `npx tsx --test --test-concurrency=1 packages/gateway/src/__tests__/skillEvalJobsPrune.test.ts` | **PASS** 1/1（S-02 接线）|
+| `npx tsx --test --test-concurrency=1 packages/gateway/src/__tests__/skillEvalJobs.test.ts` | **PASS**（全通过）|
+| `cd packages/web-react; npx vitest run …skillEvalCap / SkillOptPanel / SkillEditor …` | **PASS** 30/30（3 文件）|
+| `npx biome check <本轮新增文件>` | **PASS**（`--write` 规范化后 0 error）|
+| `npx biome check <本轮改动的既有文件>` | 仅 **pre-existing format** 差异（**无新增 lint 规则违规**）；未做全文件重排——基线即非 biome-format-clean（实证：`git show HEAD:…/skillEvalJobs.ts` 单文件 biome 即 2 个 format error；web-react 通篇双引号本就与 biome 单引号配置相悖，`biome check packages` 非本仓强制绿门），重排会产生大量无关噪声。 |
+| storage `skillStore.test.ts`（symlink 组）/ gateway `skillTrainJobs.test.ts`(durability) / `skillEvalGen.test.ts`(reload) | **NOT RUN（环境限制）**：Windows symlink 权限 / realpath 大小写，基线即失败，非本轮引入 |
+| 真实模型 / PG 端到端（eval/训练真跑、S-04/S-05 处理器行为） | **NOT RUN**：本机无 v5 后端 |
+
+不传 expectedVersion 的旧调用方（restore()/merge()/MCP skill_save）行为不变（storage 测试已断言「省略=旧行为」）。
+
+## 阶段 B · 遗留
+
+- **S-04/S-05 处理器级测试**：server.ts 单体无逐 handler 单测桩（需起真 gateway + PG），本机跑不了 → 标 NOT RUN，改动已由 `tsc --build` 保类型正确、并由 S-01 的 store 层测试覆盖底层 save 语义。建议阶段 C 或有后端环境时补 e2e。
+- **S-07**（hub 自带用例喂进评测的信任/自评虚高）：低优先，**未做**——彻底方案（发布侧用例审核 / grader 沙箱）跨 marketplace 子系统，属 §4.5 范围外，建议专项。
+- **S-08**（draft-arm 描述解析不反转义）：`promptSlots.ts` 属 memory owner（§4.1），未擅改；`mcp-memory/src/index.ts` 自段亦为纯展示、低优先，本轮未改 → 记为遗留，建议随 memory 侧一并用 `parseFrontmatter` 归一。
+- **S-10**（embedding provider 单例）：暂缓（运维低频，重启即生效）。
+- **S-11**（`clawhubClient` 测试 / 更多 store prune 覆盖）：不阻塞；已补 selectRunsToEvict + 一个 store 接线测试，clawhubClient 建议专项补。
+- **既有文件 biome format**：pre-existing 非 biome-format-clean，未在本轮重排（避免无关大 diff）。
