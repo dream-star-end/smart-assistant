@@ -1122,7 +1122,11 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     structuredOutputSchema,
   } = input
   const args: string[] = [
-    runtime === 'bun' ? 'run' : '--experimental-strip-types',
+    ...(runtime === 'bun'
+      ? ['run']
+      : Number(process.versions.node.split('.')[0]) >= 22
+        ? ['--experimental-strip-types']
+        : []),
     entry,
     '-p',
     '--input-format=stream-json',

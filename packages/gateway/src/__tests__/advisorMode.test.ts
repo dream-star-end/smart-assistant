@@ -108,8 +108,14 @@ describe('advisorMode snapshot', () => {
     assert.deepEqual(fromQuestion, ['/home/agent/.openclaude/generated/other.txt'])
   })
 
-  it('does not treat untrusted web/shell mentions as file authorization', async () => {
+  it('does not treat untrusted web/shell mentions as file authorization', async (t) => {
     const root = '/home/agent/.openclaude/generated'
+    try {
+      await mkdir(root, { recursive: true })
+    } catch {
+      t.skip('requires writable /home/agent/.openclaude/generated')
+      return
+    }
     const authorized = join(root, 'ocv5-210-e4-this-task.txt')
     const sentinel = join(root, 'ocv5-210-e4-other-task-sentinel.txt')
     await writeFile(authorized, 'THIS_TASK_PRODUCT')
@@ -160,8 +166,14 @@ describe('advisorMode snapshot', () => {
     assert.equal(prompt.includes('THIS_TASK_PRODUCT'), true)
   })
 
-  it('Write/Edit content is not a target path; Read/Write file_path is', async () => {
+  it('Write/Edit content is not a target path; Read/Write file_path is', async (t) => {
     const root = '/home/agent/.openclaude/generated'
+    try {
+      await mkdir(root, { recursive: true })
+    } catch {
+      t.skip('requires writable /home/agent/.openclaude/generated')
+      return
+    }
     const output = join(root, 'ocv5-210-m6-own-output.txt')
     const sentinel = join(root, 'ocv5-210-m6-other-task-sentinel.txt')
     await writeFile(output, 'THIS_TASK_WRITE_PRODUCT')

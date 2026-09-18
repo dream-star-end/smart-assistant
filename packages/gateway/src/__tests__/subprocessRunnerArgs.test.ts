@@ -109,8 +109,13 @@ describe('buildCcbCliArgs', () => {
 
   it('uses --experimental-strip-types instead of `run` for non-bun runtimes', () => {
     const args = buildCcbCliArgs({ ...BASE, runtime: 'node' })
-    assert.equal(args[0], '--experimental-strip-types')
-    assert.equal(args[1], 'src/entrypoints/cli.tsx')
+    const major = Number(process.versions.node.split('.')[0])
+    if (major >= 22) {
+      assert.equal(args[0], '--experimental-strip-types')
+      assert.equal(args[1], 'src/entrypoints/cli.tsx')
+    } else {
+      assert.equal(args[0], 'src/entrypoints/cli.tsx')
+    }
   })
 
   it('appends optional flags in the documented order when provided', () => {
