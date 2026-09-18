@@ -35,6 +35,8 @@ function extractMethodBody(source: string, methodName: string): string {
 const handleMemory = extractMethodBody(SERVER_TS, 'handleMemory')
 const handleMemoryFile = extractMethodBody(SERVER_TS, 'handleMemoryFile')
 const handleAutoDreamReport = extractMethodBody(SERVER_TS, 'handleAutoDreamReport')
+const readJsonBody = extractMethodBody(SERVER_TS, 'readJsonBody')
+const sendInternalError = extractMethodBody(SERVER_TS, 'sendInternalError')
 
 describe('handleMemory(memdir)', () => {
   it('user 目标底层换 userProfile(读/写),结构不变', () => {
@@ -47,6 +49,34 @@ describe('handleMemory(memdir)', () => {
     assert.match(handleMemory, /sendJson\(\s*res\s*,\s*409\s*,/)
     // GET 仍回 target 字段
     assert.match(handleMemory, /target,/)
+  })
+
+  it('MEM-01:GET / PUT / 409 都回 alwaysCharCount(只算注入块),与 limit 同口径', () => {
+    const hits = handleMemory.match(/alwaysCharCount: userProfileAlwaysCharCount\(/g) ?? []
+    assert.equal(hits.length, 3, 'GET 200 / PUT 200 / PUT 409 conflict 三处都要带 alwaysCharCount')
+    assert.match(handleMemory, /alwaysCharCount: userProfileAlwaysCharCount\(r\.conflict\.current\)/)
+    // charCount 仍是全文长度(展示用),两者并存
+    assert.match(handleMemory, /charCount: text\.length/)
+    assert.match(SERVER_TS, /import \{ USER_PROFILE_INJECT_MAX_CHARS, userProfileAlwaysCharCount \} from '\.\/promptSlots\.js'/)
+  })
+})
+
+describe('通用 readJsonBody(4 MB 上限 / 413 / 400)', () => {
+  it('readJsonBody 委托 httpJsonBody.readJsonBodyBounded,不再自己无上限拼 chunk', () => {
+    assert.match(readJsonBody, /return readJsonBodyBounded<T>\(req\)/)
+    assert.doesNotMatch(readJsonBody, /for await \(const chunk of req\)/, '无上限整段读入的旧实现必须移除')
+    assert.doesNotMatch(readJsonBody, /throw new Error\('invalid json body'\)/)
+    assert.match(SERVER_TS, /import \{ jsonBodyErrorStatus, readJsonBodyBounded \} from '\.\/httpJsonBody\.js'/)
+  })
+
+  it('sendInternalError 先把 body 类错误映射成 413 / 400,再落 500', () => {
+    assert.match(sendInternalError, /jsonBodyErrorStatus\(err\)/)
+    assert.match(sendInternalError, /'payload too large'/)
+    assert.match(sendInternalError, /'invalid json body'/)
+    // 500 兜底仍在,且顺序在映射之后
+    const mapIdx = sendInternalError.indexOf('jsonBodyErrorStatus(err)')
+    const fallbackIdx = sendInternalError.indexOf("this.sendJson(res, 500, { error: 'internal error' })")
+    assert.ok(mapIdx >= 0 && fallbackIdx > mapIdx, '先映射 4xx 再 500 兜底')
   })
 
   it('memory 目标 GET 返回 index 三元组 + GET 前 ensureMigrated', () => {

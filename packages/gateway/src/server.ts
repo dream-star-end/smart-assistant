@@ -544,7 +544,8 @@ import {
   delegateNotifyLatencyMs,
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
-import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
+import { USER_PROFILE_INJECT_MAX_CHARS, userProfileAlwaysCharCount } from './promptSlots.js'
+import { jsonBodyErrorStatus, readJsonBodyBounded } from './httpJsonBody.js'
 import { matchBridgeApiAllowlist, parseTrustedCollabParentHeaders } from './bridgeApiAllowlist.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
@@ -7771,20 +7772,28 @@ export class Gateway {
   /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处
    *  `sendError(res, 500, String(err))` 会把容器内部路径/栈回显给客户端。 */
   private sendInternalError(res: ServerResponse, err: unknown): void {
+    // readJsonBody 的请求体类错误是客户端问题,不是 500:超限 → 413、坏 JSON → 400
+    // (httpJsonBody.ts;所有 readJsonBody 调用点经路由兜底 .catch 落到这里统一映射)。
+    const bodyStatus = jsonBodyErrorStatus(err)
+    if (bodyStatus !== null) {
+      if (!res.headersSent) {
+        this.sendJson(res, bodyStatus, {
+          error: bodyStatus === 413 ? 'payload too large' : 'invalid json body',
+        })
+      }
+      return
+    }
     // eslint-disable-next-line no-console
     console.error('[gateway] internal error:', err)
     this.sendJson(res, 500, { error: 'internal error' })
   }
+  /**
+   * 通用 JSON body 读取:默认 4 MB 上限(超限抛 JsonBodyTooLargeError → 413)、坏 JSON 抛
+   * JsonBodyInvalidError(→ 400)、空 body → {}。实现与错误类型见 httpJsonBody.ts;
+   * 状态码映射在 sendInternalError。历史上这里无上限整段读入且坏 JSON 变 500(MSC 审计)。
+   */
   private async readJsonBody<T = any>(req: IncomingMessage): Promise<T> {
-    const chunks: Buffer[] = []
-    for await (const chunk of req) chunks.push(chunk as Buffer)
-    const raw = Buffer.concat(chunks).toString('utf-8')
-    if (!raw) return {} as T
-    try {
-      return JSON.parse(raw) as T
-    } catch {
-      throw new Error('invalid json body')
-    }
+    return readJsonBodyBounded<T>(req)
   }
 
   /**
@@ -8874,7 +8883,11 @@ export class Gateway {
         this.sendJson(res, 200, {
           text,
           charCount: text.length,
-          // memdir 下无写侧硬预算;limit = 注入侧 cap(user.md 实际会被注入的上限),
+          // 真正会被注入 prompt 的只有 <!-- oc-user-always --> 块(buildUserSlot),limit 也只对
+          // 它生效;全文长度 charCount 仅供展示,不是保存上限(MSC MEM-01:UI 此前拿全文比 limit
+          // 禁用保存)。无 always 块 / 块非法 → 0。单一权威 = promptSlots.userProfileAlwaysCharCount。
+          alwaysCharCount: userProfileAlwaysCharCount(text),
+          // memdir 下无写侧硬预算;limit = 注入侧 cap(always 块实际会被注入的上限),
           // 仍是 UI 预算条唯一有意义的界。单一权威 = promptSlots.USER_PROFILE_INJECT_MAX_CHARS。
           limit: USER_PROFILE_INJECT_MAX_CHARS,
           // 乐观并发指纹:UI 拿到后随 PUT 回传,后端锁内重读比对防覆盖并发写入。
@@ -8898,13 +8911,14 @@ export class Gateway {
           this.sendJson(res, 200, {
             ok: true,
             charCount: text.length,
+            alwaysCharCount: userProfileAlwaysCharCount(text),
             limit: USER_PROFILE_INJECT_MAX_CHARS,
             version,
           })
           return
         }
         // 版本冲突(面板打开期间被别的进程写过)→ 409 + 当前盘上内容/版本,交由前端三方合并。
-        // conflict 结构对齐历史:{ text, version, charCount, limit }。三态 union 用 'conflict' in r 判别。
+        // conflict 结构对齐历史:{ text, version, charCount, limit }(+ alwaysCharCount)。三态 union 用 'conflict' in r 判别。
         if ('conflict' in r) {
           return this.sendJson(res, 409, {
             error: 'memory conflict',
@@ -8912,6 +8926,7 @@ export class Gateway {
               text: r.conflict.current,
               version: r.conflict.version,
               charCount: r.conflict.current.length,
+              alwaysCharCount: userProfileAlwaysCharCount(r.conflict.current),
               limit: USER_PROFILE_INJECT_MAX_CHARS,
             },
           })
