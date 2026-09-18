@@ -150,6 +150,8 @@ import {
   type SkillEvalsFile,
   type AgentDef,
   type AgentsConfig,
+  type McpServerConfig,
+  validateAgentPatch,
   MemoryDir,
   MEMORY_FILE_RE,
   readUserProfile,
@@ -8684,6 +8686,22 @@ export class Gateway {
     }
   }
 
+  // CFG-06:/api/agents(/:id) 的响应投影。agents[].mcpServers[].env 是第三方 key 的载体
+  // (subprocessRunner 原样注入子进程),与 /api/config 对全局 mcpServers 的脱敏对齐:
+  // 值不出容器,只回 envKeys 供 UI/诊断看「配了哪些变量」。其余字段原样。
+  private _projectAgentForApi(agent: AgentDef): Omit<AgentDef, 'mcpServers'> & {
+    mcpServers?: Array<Omit<McpServerConfig, 'env'> & { envKeys?: string[] }>
+  } {
+    if (!Array.isArray(agent.mcpServers)) return agent
+    return {
+      ...agent,
+      mcpServers: agent.mcpServers.map((srv) => {
+        const { env, ...rest } = srv
+        return env && typeof env === 'object' ? { ...rest, envKeys: Object.keys(env) } : rest
+      }),
+    }
+  }
+
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -8691,7 +8709,7 @@ export class Gateway {
       // 枚举面:走用户可见投影(隐藏系统 agent 已剔除、default 已收敛)。
       const view = await this._getAgentsConfigUserView()
       this.sendJson(res, 200, {
-        agents: view.agents,
+        agents: view.agents.map((a) => this._projectAgentForApi(a)),
         default: view.default,
         routes: view.routes,
         identityCompat: await fetchIdentityCompatProjection(),
@@ -8701,16 +8719,24 @@ export class Gateway {
     if (req.method === 'POST') {
       // 建 agent 是 mutation 面:必须读/写全量 config(不能用投影视图,否则写回
       // agents.yaml 会把隐藏系统 agent 一并删掉)。保留 id 拒绝仍用 predicate 看全量。
-      const body = await this.readJsonBody<Partial<AgentDef>>(req)
-      if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
+      const rawBody = await this.readJsonBody<Partial<AgentDef>>(req)
+      if (!rawBody.id || !/^[a-zA-Z0-9_-]+$/.test(rawBody.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
         return
       }
-      if (isHiddenSystemAgentId(body.id)) {
+      if (isHiddenSystemAgentId(rawBody.id)) {
         this.sendError(res, 403, 'agent id is reserved')
         return
       }
-      const id = body.id
+      // CFG-05/07:字段级校验(permissionMode 枚举 / toolsets string[] / mcpServers 形状 /
+      // persona 限 HOME / cwd 非根非系统目录),非法 400 不落盘;只对新写入生效。
+      const patch = validateAgentPatch(rawBody)
+      if (!patch.ok) {
+        this.sendError(res, 400, patch.error)
+        return
+      }
+      const body = patch.value
+      const id = rawBody.id
       const identityProjection = await fetchIdentityCompatProjection()
       if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id || profile.canonicalAgentId === id)) {
         return this.sendJson(res, 409, { error: '此身份由已登记的兼容关系管理，不能新建为独立 Agent。', code: 'IDENTITY_COMPAT_MANAGED' })
@@ -8732,20 +8758,21 @@ export class Gateway {
           provider: body.provider ?? defaultAgent?.provider,
           cwd: body.cwd ?? defaultAgent?.cwd,
           toolsets: body.toolsets,
+          ...(body.mcpServers ? { mcpServers: body.mcpServers } : {}),
         }
         cfg.agents.push(agent)
         return agent
       })
       if (!agent) return this.sendError(res, 409, 'agent already exists')
       this.deps.agentsConfig = cfg
-      await mkdir(paths.agentSessionsDir(body.id), { recursive: true })
+      await mkdir(paths.agentSessionsDir(id), { recursive: true })
       // Seed an empty persona file if missing
       try {
-        await writeFile(paths.agentClaudeMd(body.id), `# Agent: ${body.id}\n\n`, { flag: 'wx' })
+        await writeFile(paths.agentClaudeMd(id), `# Agent: ${id}\n\n`, { flag: 'wx' })
       } catch {}
       // 热更新路由
       this.router.reload(cfg)
-      this.sendJson(res, 201, { agent })
+      this.sendJson(res, 201, { agent: this._projectAgentForApi(agent) })
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -8764,7 +8791,7 @@ export class Gateway {
       const cfg = await readAgentsConfig()
       const agent = cfg.agents.find((a) => a.id === id)
       if (!agent) return this.sendError(res, 404, 'agent not found')
-      this.sendJson(res, 200, { agent })
+      this.sendJson(res, 200, { agent: this._projectAgentForApi(agent) })
       return
     }
     if (req.method === 'PUT' || req.method === 'DELETE') {
@@ -8772,7 +8799,20 @@ export class Gateway {
       if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id)) {
         return this.sendJson(res, 409, { error: '此条目仅保留本实例运行手册；执行配置由关联市场 Agent 管理。', code: 'IDENTITY_COMPAT_MANAGED' })
       }
-      const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
+      // CFG-05/07:PUT 走 storage.validateAgentPatch 做字段级校验,非法 400 且不落盘。
+      // 展示类字段(displayName / avatarEmoji / greeting)允许传空串表示「清除」——从校验体里
+      // 摘出单独处理,其余字段(含非法 permissionMode / 非数组 toolsets / 畸形 mcpServers /
+      // HOME 外 persona / 根目录 cwd)一律拒绝。
+      const rawBody =
+        req.method === 'PUT' ? await this.readJsonBody<Record<string, unknown>>(req) : {}
+      const clearKeys = (['displayName', 'avatarEmoji', 'greeting'] as const).filter(
+        (k) => rawBody[k] === '',
+      )
+      const toValidate: Record<string, unknown> = { ...rawBody }
+      for (const k of clearKeys) delete toValidate[k]
+      const patch = validateAgentPatch(toValidate)
+      if (!patch.ok) return this.sendError(res, 400, patch.error)
+      const body: Partial<AgentDef> = patch.value
       const { config: cfg, result } = await updateAgentsConfig(async (cfg) => {
         const idx = cfg.agents.findIndex((a) => a.id === id)
         if (idx < 0) return { status: 404, body: { error: 'agent not found' } }
@@ -8800,7 +8840,8 @@ export class Gateway {
         if (body.provider !== undefined) agent.provider = body.provider
         if (body.toolsets !== undefined) agent.toolsets = body.toolsets
         if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
-        return { status: 200, body: { agent } }
+        for (const k of clearKeys) delete agent[k]
+        return { status: 200, body: { agent: this._projectAgentForApi(agent) } }
       })
       if (result.status === 200) {
         this.deps.agentsConfig = cfg

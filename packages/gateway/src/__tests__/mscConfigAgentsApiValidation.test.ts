@@ -163,19 +163,56 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
     })
   })
 
-  // TODO(msc-config): 阶段 B 修复 —— agent 级 mcpServers[].env 是凭据载体,列表/详情面必须脱敏。
+  // CFG-06(阶段 B 已修):agent 级 mcpServers[].env 是凭据载体,列表/详情面投影为 envKeys。
   it('GET /api/agents and GET /api/agents/:id do not expose per-agent mcpServers env values', async () => {
     await withServer(async (base) => {
       const list = await json(base, 'GET', '/api/agents')
       assert.equal(list.status, 200, list.text)
       assert.ok(!list.text.includes(MCP_SECRET), 'GET /api/agents leaked mcpServers[].env')
+      const coder = list.body.agents.find((a: any) => a.id === 'coder')
+      assert.deepEqual(coder?.mcpServers?.[0]?.envKeys, ['SEARCH_API_KEY'])
+      assert.equal(coder?.mcpServers?.[0]?.env, undefined)
+      assert.equal(coder?.mcpServers?.[0]?.command, 'npx')
       const item = await json(base, 'GET', '/api/agents/coder')
       assert.equal(item.status, 200, item.text)
       assert.ok(!item.text.includes(MCP_SECRET), 'GET /api/agents/:id leaked mcpServers[].env')
+      // 投影只在响应层:磁盘上的 env 原样保留(subprocessRunner 仍能注入)。
+      const onDisk = (await readAgentsConfig()).agents.find((a) => a.id === 'coder')
+      assert.equal(onDisk?.mcpServers?.[0]?.env?.SEARCH_API_KEY, MCP_SECRET)
     })
   })
 
-  // TODO(msc-config): 阶段 B 修复 —— permissionMode 必须在 5 个合法枚举内,否则 400,不落盘。
+  // CFG-07(阶段 B 已修,无争议部分):persona 限 HOME 内、cwd 非根非系统目录;只对新写入生效。
+  it('PUT /api/agents/:id rejects persona outside OPENCLAUDE_HOME and root/system cwd with 400', async () => {
+    await withServer(async (base) => {
+      const outside = process.platform === 'win32' ? 'C:\\evil\\CLAUDE.md' : '/etc/evil/CLAUDE.md'
+      const p = await json(base, 'PUT', '/api/agents/coder', { persona: outside })
+      assert.equal(p.status, 400, `persona outside HOME expected 400, got ${p.status}: ${p.text}`)
+      const root = process.platform === 'win32' ? 'C:\\' : '/'
+      const c = await json(base, 'PUT', '/api/agents/coder', { cwd: root })
+      assert.equal(c.status, 400, `root cwd expected 400, got ${c.status}: ${c.text}`)
+      const rel = await json(base, 'PUT', '/api/agents/coder', { cwd: 'relative/dir' })
+      assert.equal(rel.status, 400, `relative cwd expected 400, got ${rel.status}: ${rel.text}`)
+      const onDisk = (await readAgentsConfig()).agents.find((a) => a.id === 'coder')
+      assert.equal(onDisk?.persona, undefined)
+      assert.equal(onDisk?.cwd, undefined)
+      // 合法值照常落盘:HOME 内 persona + 合法 permissionMode;空串清除展示类字段。
+      const ok = await json(base, 'PUT', '/api/agents/coder', {
+        persona: join(home, 'agents', 'coder', 'CLAUDE.md'),
+        permissionMode: 'plan',
+        displayName: 'Coder',
+      })
+      assert.equal(ok.status, 200, ok.text)
+      const cleared = await json(base, 'PUT', '/api/agents/coder', { displayName: '' })
+      assert.equal(cleared.status, 200, cleared.text)
+      const after = (await readAgentsConfig()).agents.find((a) => a.id === 'coder')
+      assert.equal(after?.permissionMode, 'plan')
+      assert.equal(after?.displayName, undefined, 'empty string must clear displayName')
+      assert.equal(after?.mcpServers?.[0]?.env?.SEARCH_API_KEY, MCP_SECRET, 'env untouched by unrelated PUT')
+    })
+  })
+
+  // CFG-05(阶段 B 已修):permissionMode 必须在 5 个合法枚举内,否则 400,不落盘。
   it('PUT /api/agents/:id rejects an out-of-enum permissionMode with 400 and leaves agents.yaml untouched', async () => {
     await withServer(async (base) => {
       const res = await json(base, 'PUT', '/api/agents/coder', { permissionMode: 'yolo' })
@@ -189,13 +226,38 @@ describe('msc-config · /api/agents & /api/config configuration surface', () => 
     })
   })
 
-  // TODO(msc-config): 阶段 B 修复 —— toolsets / mcpServers 需做 shape 校验(string[] / McpServerConfig[])。
+  // CFG-05(阶段 B 已修):toolsets / mcpServers 做 shape 校验(string[] / McpServerConfig[])。
   it('PUT /api/agents/:id rejects a non-array toolsets with 400 and leaves agents.yaml untouched', async () => {
     await withServer(async (base) => {
       const res = await json(base, 'PUT', '/api/agents/coder', { toolsets: 'coding' })
       assert.equal(res.status, 400, `expected 400, got ${res.status}: ${res.text}`)
       const onDisk = (await readAgentsConfig()).agents.find((a) => a.id === 'coder')
       assert.equal(onDisk?.toolsets, undefined, 'invalid toolsets must not be persisted')
+      const bad = await json(base, 'PUT', '/api/agents/coder', { mcpServers: { id: 'x' } })
+      assert.equal(bad.status, 400, `non-array mcpServers expected 400, got ${bad.status}: ${bad.text}`)
+      const badEntry = await json(base, 'PUT', '/api/agents/coder', {
+        mcpServers: [{ id: 'x', command: '' }],
+      })
+      assert.equal(badEntry.status, 400, `empty command expected 400, got ${badEntry.status}: ${badEntry.text}`)
+    })
+  })
+
+  // CFG-05(阶段 B):POST /api/agents 同样走 validateAgentPatch;创建响应亦脱敏。
+  it('POST /api/agents validates fields and returns the projected agent', async () => {
+    await withServer(async (base) => {
+      const bad = await json(base, 'POST', '/api/agents', { id: 'newbie', permissionMode: 'yolo' })
+      assert.equal(bad.status, 400, `expected 400, got ${bad.status}: ${bad.text}`)
+      assert.equal((await readAgentsConfig()).agents.some((a) => a.id === 'newbie'), false)
+      const ok = await json(base, 'POST', '/api/agents', {
+        id: 'newbie',
+        permissionMode: 'acceptEdits',
+        mcpServers: [{ id: 'm', command: 'npx', env: { K: MCP_SECRET } }],
+      })
+      assert.equal(ok.status, 201, ok.text)
+      assert.ok(!ok.text.includes(MCP_SECRET), 'POST response leaked mcpServers[].env')
+      assert.deepEqual(ok.body.agent?.mcpServers?.[0]?.envKeys, ['K'])
+      const onDisk = (await readAgentsConfig()).agents.find((a) => a.id === 'newbie')
+      assert.equal(onDisk?.mcpServers?.[0]?.env?.K, MCP_SECRET)
     })
   })
 })
