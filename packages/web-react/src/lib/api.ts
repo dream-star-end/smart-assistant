@@ -2842,6 +2842,7 @@ export const api = {
             text: c.text,
             version: String(c.version ?? ""),
             charCount: Number(c.charCount ?? 0),
+            ...(typeof c.alwaysCharCount === "number" ? { alwaysCharCount: c.alwaysCharCount } : {}),
             limit: Number(c.limit ?? 0),
           },
         };
@@ -2853,9 +2854,16 @@ export const api = {
       ok: boolean;
       version: string;
       charCount?: number;
+      alwaysCharCount?: number;
       limit?: number;
     }>(res);
-    return { ok: true, version: out.version, charCount: out.charCount, limit: out.limit };
+    return {
+      ok: true,
+      version: out.version,
+      charCount: out.charCount,
+      alwaysCharCount: out.alwaysCharCount,
+      limit: out.limit,
+    };
   },
 
   /** 取某 agent 的核心记忆索引 + 文件列表（GET /api/agents/:id/memory/memory）。
