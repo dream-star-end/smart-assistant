@@ -22,6 +22,7 @@
  */
 import {
   type EmbeddingProvider,
+  type HybridSessionResult,
   MemoryDir,
   ProjectMemoryDir,
   ProjectMemoryLedger,
@@ -32,7 +33,7 @@ import {
   getEmbeddingProvider,
   getSessionsDb,
   hybridArchivalSearch,
-  hybridSessionSearch,
+  hybridSessionSearchDetailed,
   initVectorStore,
   isEmbeddingAvailable,
   loadSessionTurns,
@@ -590,25 +591,38 @@ export async function handleSessionSearch(
   const searchAgentId = args.agentId ?? ctx.agentId
   const limit = args.limit ?? 5
 
-  // Use hybrid search (BM25 + vector) when embedding is available, else BM25-only
-  const hits = ctx.embeddingProvider
-    ? await hybridSessionSearch(args.query, ctx.embeddingProvider, limit, searchAgentId)
-    : (await searchSessions(args.query, limit, searchAgentId)).map((h) => ({
-        ...h,
-        bm25Rank: null as number | null,
-        vecRank: null as number | null,
-      }))
+  // Use hybrid search (BM25 + vector) when embedding is available, else BM25-only.
+  // retrievalMode 以 storage 实际跑出来的为准:sessions_vec 为空 / 向量库未就绪 / embed
+  // 失败时 storage 会跳过向量腿并报 'bm25',不再按「有 provider 即 hybrid」上报(MSC MEM-04)。
+  let retrievalMode: 'hybrid' | 'bm25' = 'bm25'
+  let hits: HybridSessionResult[]
+  if (ctx.embeddingProvider) {
+    const outcome = await hybridSessionSearchDetailed(
+      args.query,
+      ctx.embeddingProvider,
+      limit,
+      searchAgentId,
+    )
+    hits = outcome.results
+    retrievalMode = outcome.retrievalMode
+  } else {
+    hits = (await searchSessions(args.query, limit, searchAgentId)).map((h) => ({
+      ...h,
+      bm25Rank: null as number | null,
+      vecRank: null as number | null,
+    }))
+  }
 
   if (hits.length === 0) {
     const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
     return toolOk(`No past sessions match "${args.query}"${scope}.`, {
       outcome: 'no_match',
-      retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+      retrievalMode,
       resultCount: 0,
     })
   }
   const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
-  const mode = ctx.embeddingProvider ? 'hybrid' : 'BM25'
+  const mode = retrievalMode === 'hybrid' ? 'hybrid' : 'BM25'
   const lines: string[] = [
     `Found ${hits.length} past sessions matching "${args.query}"${scope} (${mode}):`,
     '',
@@ -638,7 +652,7 @@ export async function handleSessionSearch(
   }
   return toolOk(lines.join('\n'), {
     outcome: 'hit',
-    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    retrievalMode,
     resultCount: hits.length,
     topMatchKey: hits[0]?.sessionId,
   })
