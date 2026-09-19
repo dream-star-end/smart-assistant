@@ -820,7 +820,9 @@ test('resume with no stdout retries the same turn without --resume', { timeout: 
   await writeFile(fake, `#!/usr/bin/env node
 const fs = require('node:fs')
 const argv = process.argv.slice(2)
-fs.appendFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify(argv) + '\\n')
+const capturePath = process.env.FAKE_GROK_CAPTURE
+fs.appendFileSync(capturePath, JSON.stringify(argv) + '\\n')
+try { fs.fsyncSync(fs.openSync(capturePath, 'r+')) } catch {}
 if (argv.includes('--resume')) {
   setInterval(() => {}, 1000)
   return
@@ -848,8 +850,10 @@ console.log(JSON.stringify({
       routeToken: TOKEN,
     })
     adapter.on('error', () => {})
-    const spawns: Array<{ resumed?: boolean }> = []
-    adapter.on('spawn', (info: { resumed?: boolean }) => { spawns.push(info) })
+    const spawns: Array<{ resumed?: boolean; argv?: string[] }> = []
+    const sessionIds: string[] = []
+    adapter.on('spawn', (info: { resumed?: boolean; argv?: string[] }) => { spawns.push(info) })
+    adapter.on('session_id', (id: string) => { sessionIds.push(id) })
     const run = adapter.submitTurn({
       input: 'resume then hang',
       requestId: REQUEST_ID,
@@ -863,24 +867,60 @@ console.log(JSON.stringify({
     assert.ok(summary)
     assert.equal(summary.isError, false)
     assert.equal(summary.staleResumeId, false)
-    assert.equal(adapter.nativeSessionId, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+    // Cold-start prompt skipped PG tape. Do not pin later turns to the empty
+    // native session the retry minted.
+    assert.equal(adapter.nativeSessionId, null)
+    assert.deepEqual(sessionIds, [])
     assert.ok(spawns.length >= 2, `expected resume then cold spawn, got ${JSON.stringify(spawns)}`)
     assert.equal(spawns[0]?.resumed, true)
     assert.equal(spawns.at(-1)?.resumed, false)
-    const captured = (await readFile(capture, 'utf8').catch(() => ''))
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[])
-    if (captured.length >= 2) {
-      assert.equal(captured[0]?.includes('--resume'), true)
-      assert.equal(captured.at(-1)?.includes('--resume'), false)
-    }
+    assert.equal(spawns[0]?.argv?.includes('--resume'), true)
+    assert.equal(spawns.at(-1)?.argv?.includes('--resume'), false)
   } finally {
     _internals.setProcessKeepaliveTestHooks(null)
     restoreEnv('OC_GROK_CLI_BIN', previousBin)
     restoreEnv('OPENCLAUDE_HOME', previousHome)
     restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('crash without end does not flag staleResumeId and drops nativeId', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-crash-no-end-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  await writeFile(fake, `#!/usr/bin/env node
+process.exit(1)
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const run = adapter.submitTurn({
+      input: 'crash',
+      requestId: REQUEST_ID,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+    assert.ok(summary)
+    assert.equal(summary.isError, true)
+    assert.equal(summary.staleResumeId, false)
+    assert.equal(summary.stopReason !== 'interrupted', true)
+    assert.equal(adapter.nativeSessionId, null)
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
     await rm(dir, { recursive: true, force: true })
   }
 })

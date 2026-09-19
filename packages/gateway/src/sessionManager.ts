@@ -6884,12 +6884,12 @@ export class SessionManager {
 
         if (
           session.providerTag === 'grok' &&
-          !session.runner.nativeSessionId &&
-          result?.stopReason === 'interrupted'
+          !session.runner.nativeSessionId
         ) {
-          // Grok native sessions are dirtied by mid-turn SIGINT (incomplete
-          // tools on disk). Drop the resume-map head so the next submit does
-          // not --resume that id; OpenClaude history injection fills the gap.
+          // Grok native sessions are dirtied by interrupt, crash without
+          // `end`, or a hung `--resume` that was cold-started without PG
+          // tape. Drop the resume-map head so the next submit does not
+          // --resume that id; OpenClaude history injection fills the gap.
           this._forgetResumeEntry(session.sessionKey)
           session.ccbSessionId = null
           session._historicalContextInjected = false

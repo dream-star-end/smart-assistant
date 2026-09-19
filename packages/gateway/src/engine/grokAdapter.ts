@@ -310,6 +310,10 @@ interface GrokTurnContext {
   sawEnd: boolean
   spawnedWithResume: boolean
   resumeRetried: boolean
+  /** Watchdog dropped a hung `--resume` and will cold-start this turn. The
+   *  prompt was built for native resume (no PG tape). Do not commit a new
+   *  native session id even if the retry `end`s successfully. */
+  droppedNativeResume: boolean
   replacingProc: boolean
   spawnGeneration: number
   firstStdoutTimer: NodeJS.Timeout | null
@@ -416,6 +420,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       sawEnd: false,
       spawnedWithResume: false,
       resumeRetried: false,
+      droppedNativeResume: false,
       replacingProc: false,
       spawnGeneration: 0,
       firstStdoutTimer: null,
@@ -593,7 +598,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       try { proc.unref() } catch { /* already detached */ }
       return
     }
-    this.emit('spawn', { resumed: resume })
+    this.emit('spawn', { resumed: resume, argv: [...args] })
     this.ensureProcessKeepalive()
     this.armFirstStdoutWatchdog(ctx)
 
@@ -632,7 +637,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       if (ctx.spawnGeneration !== generation) return
       if (ctx.replacingProc) {
         ctx.procClosed = true
-        return
+        // Stop during the replacement window: do not leave the turn hanging
+        // for a second spawn that retryResumeWithoutNative will skip.
+        if (!ctx.interrupted || ctx.terminal || ctx.abandoned) return
+        ctx.replacingProc = false
       }
       if (this.active === ctx) this.stopProcessKeepalive()
       this.clearFirstStdoutTimer(ctx)
@@ -689,8 +697,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private async retryResumeWithoutNative(ctx: GrokTurnContext): Promise<void> {
-    if (this.active !== ctx || ctx.terminal || ctx.abandoned || ctx.sawStdout || ctx.resumeRetried) return
+    if (this.active !== ctx || ctx.terminal || ctx.abandoned || ctx.sawStdout || ctx.resumeRetried || ctx.interrupted) return
     ctx.resumeRetried = true
+    ctx.droppedNativeResume = true
     ctx.replacingProc = true
     this.clearFirstStdoutTimer(ctx)
     this.stopProcessKeepalive()
@@ -704,7 +713,13 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     await waitForCloseWithin(
       new Promise<void>((resolve) => {
         const poll = (): void => {
-          if (ctx.procClosed || ctx.spawnGeneration !== generation || ctx.abandoned || ctx.terminal) {
+          if (
+            ctx.procClosed
+            || ctx.spawnGeneration !== generation
+            || ctx.abandoned
+            || ctx.terminal
+            || ctx.interrupted
+          ) {
             resolve()
             return
           }
@@ -714,7 +729,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }),
       shutdownTimeoutMs('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS),
     )
-    if (this.active !== ctx || ctx.terminal || ctx.abandoned) return
+    if (this.active !== ctx || ctx.terminal || ctx.abandoned || ctx.interrupted) {
+      ctx.replacingProc = false
+      return
+    }
     ctx.replacingProc = false
     ctx.proc = null
     ctx.procClosed = false
@@ -907,7 +925,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ctx.sawEnd = true
       this.clearFirstStdoutTimer(ctx)
       const sessionId = typeof event.sessionId === 'string' ? event.sessionId : null
-      if (ctx.interrupted) {
+      if (ctx.interrupted || ctx.droppedNativeResume) {
+        // Hung --resume cold-starts reuse a prompt that skipped PG tape.
+        // Committing the new native id would pin later turns to an empty
+        // Grok session and permanently skip history injection.
         this.forgetDirtyNativeSession()
       } else if (sessionId) {
         this.nativeId = sessionId
@@ -1109,7 +1130,11 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         : 1,
       isError,
       ...(isError ? { errorKind: authError(ctx.errorDetail!) ? 'auth' as const : 'other' as const, errorDetail: ctx.errorDetail! } : {}),
-      staleResumeId: !ctx.sawEnd && !ctx.interrupted,
+      // Grok has no CCB-style "session ID not found" refusal. A crash / no
+      // `end` is dirty native state, not a stale-resume-id signal. Borrowing
+      // that flag trips sessionManager's STALE_RESUME_ID short-circuit and
+      // never reaches the Grok resume-map eviction.
+      staleResumeId: false,
       phantomSignals: { ...EMPTY_SIGNALS },
     })
   }
