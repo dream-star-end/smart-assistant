@@ -7834,7 +7834,18 @@ wait $!
       bootUses.length === 2,
       `BOOT_TIMEOUT 只应用于 J1 首屏落地(goto + 首个 click),当前传参 ${bootUses.length} 处`,
     )
-    assert.match(source, /getByLabel\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
+    assert.match(
+      source,
+      /getByRole\("textbox", \{ name: "邮箱", exact: true \}\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/,
+      "J1 email must be an exact textbox locator",
+    )
+    assert.match(
+      source,
+      /getByRole\("textbox", \{ name: "密码", exact: true \}\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/,
+      "J1 password must be an exact textbox; getByLabel(password) also matches the show-password button",
+    )
+    assert.doesNotMatch(source, /getByLabel\("邮箱"\)/)
+    assert.doesNotMatch(source, /getByLabel\("密码"\)/)
   })
 
   test('E2E journey seeds oc_auth_hint after API login cookie and before authed root reload', async () => {
