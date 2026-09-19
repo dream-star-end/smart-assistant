@@ -7215,14 +7215,13 @@ smoke_turn_canary() { # <pinned master release> [port] [model] [cost-evidence-mo
 }
 
 # ══════════ 双引擎真 turn 矩阵(2026-07-26;审计 13)══════════
-# 旧 deploy lane 的真 turn 只跑 v5-smoke-turn-canary.mjs 默认模型(gpt-5.6-sol / codex 引擎),
-# CCB(claude)引擎在 deploy 与 --dist 通道零真 turn 覆盖 —— 与 canary 的固定 live 矩阵
-# (Codex/gpt-5.6-luna + CCB/deepseek-v4-flash)不对齐。此处对齐成双引擎各一 turn。
+# 真 turn 矩阵默认 grok-build(grok 引擎)+ deepseek-v4-flash(CCB)。
+# 不再默认消耗 GPT 额度;Codex 引擎覆盖改由显式 V5_TURN_MODELS 打开。
 # 稳定 lane 每个 turn 仍严格要求三信号(exactText='2' + isFinal + cost_charged)。
 # 只有 0% candidate/promote-candidate 的 deepseek-v4-flash 因 cost-event 必然投旧 active，
 # 才允许用同一 smoke session 的精确 usage+ledger 闭环替代 live cost frame；finalize
 # 交接 control VIP 后仍必须回到 live frame，不能把 candidate 拓扑例外扩散到稳定态。
-V5_TURN_ENGINE_MATRIX_DEFAULT="gpt-5.6-sol deepseek-v4-flash"
+V5_TURN_ENGINE_MATRIX_DEFAULT="grok-build deepseek-v4-flash"
 smoke_turn_matrix() { # <pinned master release> [port] [lane]
   local release="$1" port="${2:-$ACTIVE_PORT}" lane="${3:-stable}" model models cost_evidence_mode
   if [[ "${V5_SMOKE_TURN:-1}" != 1 ]]; then

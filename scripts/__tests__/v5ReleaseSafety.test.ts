@@ -8196,7 +8196,7 @@ wait $!
   test('real-turn canary ignores foreign recovery frames but still fails its own exact error', async () => {
     const success = await runTurnCanaryFixture('foreign-then-success')
     assert.equal(success.code, 0, success.stderr || success.stdout)
-    assert.match(success.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true via=ws/)
+    assert.match(success.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/)
 
     const ownError = await runTurnCanaryFixture('own-error')
     assert.equal(ownError.code, 1, ownError.stdout)
@@ -8214,7 +8214,7 @@ wait $!
   test('real-turn canary accepts tape assistant text when CCB final+cost omit WS blocks', async () => {
     const tapeOk = await runTurnCanaryFixture('ccb-final-cost-tape-text')
     assert.equal(tapeOk.code, 0, tapeOk.stderr || tapeOk.stdout)
-    assert.match(tapeOk.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true via=tape/)
+    assert.match(tapeOk.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=tape/)
 
     const empty = await runTurnCanaryFixture('ccb-final-cost-empty-session')
     assert.equal(empty.code, 1, empty.stdout)

@@ -1,7 +1,7 @@
 // Pure contract policy: importing this module never starts a browser or reads secrets.
 export const TOTAL_TIMEOUT = 240_000;
 export const CASES = ["C1 cold UI login without auth hint", "C2 collapsed model reaches outbound request", "C3 one model per engine"];
-export function parseModels(value = "gpt-5.6-sol,deepseek-v4-flash") {
+export function parseModels(value = "grok-build,deepseek-v4-flash") {
   const models = value.split(",").map((x) => x.trim());
   if (!models.length || models.some((x) => !/^[a-zA-Z0-9._-]+$/.test(x)) || new Set(models).size !== models.length) throw new Error("Invalid/duplicate contract models");
   return models;
