@@ -193,8 +193,9 @@ try {
     // 这一步用 BOOT_TIMEOUT:它是整个门里唯一紧贴"服务刚重启"执行的 UI 等待,
     // 落地页又是 lazy 组件,boot 未落定时 DOM 里根本没有可点的「登录」(见常量注释)。
     await page.getByText("登录", { exact: true }).first().click({ timeout: BOOT_TIMEOUT });
-    await page.getByPlaceholder("邮箱").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    await page.getByPlaceholder("密码").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // AuthGate L-11: visible label is 邮箱/密码; placeholders are example format, not the label.
+    await page.getByLabel("邮箱").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await page.getByLabel("密码").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
 
     // ── 2026-07-26 安全整改后的形态断言 ──────────────────────────────────
     // 生产已把全局 TURNSTILE_TEST_BYPASS 摘掉(改账号级白名单),真实用户必须看到
