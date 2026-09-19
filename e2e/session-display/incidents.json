@@ -4289,6 +4289,28 @@
       "coverageCommits": [
         "419183882"
       ]
+    },
+    {
+      "id": "INC-20260920-CC-BETA-THINKING-COUNT",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "OCV5-236 上线后官方 CC 能打，Opus 5 很高再被 18892 拦：anthropic-beta thinking-token-count-2026-05-13 不在 ALLOWED_BETA_VALUES，账号 cooldown，前台「模型繁忙」。",
+      "rootFixCommit": "6b22b40da",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "thinking-token-count-2026-05-13 单值 → 通过"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "oauth + thinking-token-count 多值 → 全过"
+        }
+      ],
+      "coverageCommits": [
+        "6b22b40da"
+      ]
     }
   ]
 }
