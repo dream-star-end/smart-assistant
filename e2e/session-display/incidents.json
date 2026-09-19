@@ -4252,7 +4252,15 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
           "assertion": "does not keepalive-refresh activity before the first stdout byte"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "crash without end does not flag staleResumeId and drops nativeId"
         }
+      ],
+      "coverageCommits": [
+        "929970ac9"
       ]
     }
   ]
