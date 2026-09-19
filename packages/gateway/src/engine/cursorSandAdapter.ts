@@ -38,6 +38,11 @@ function appendNoProxy(current: string | undefined, ...hosts: string[]): string 
   return values.join(',')
 }
 
+/** Product default is Grok Bot Box. Direct api2 is opt-in (`OC_CURSOR_SAND_DIRECT_STREAM=1`). */
+export function cursorSandProductDirectStream(env: NodeJS.Dict<string> = process.env): boolean {
+  return env.OC_CURSOR_SAND_DIRECT_STREAM === '1'
+}
+
 /** CCB-compatible stream adapter with Cursor external billing/session identity. */
 export class CursorSandAdapter extends CcbAdapter {
   override readonly engineId = 'cursor'
@@ -85,6 +90,7 @@ export class CursorSandAdapter extends CcbAdapter {
     this.providerEnv = providerEnv
     this.selection = selection
     this.sessionKey = opts.sessionKey
+    const directStream = cursorSandProductDirectStream()
     this.relay = relay ?? new CursorSandRelay({
       credentialName: selection.keyName,
       boxAccountId: selection.accountId,
@@ -92,8 +98,8 @@ export class CursorSandAdapter extends CcbAdapter {
       keyFingerprint: selection.keyFingerprint,
       credentialKind: selection.credentialKind,
       machineId: selection.machineId,
-      directStream: true,
-      clientVersion: CURSOR_SAND_DIRECT_CLIENT_VERSION,
+      directStream,
+      ...(directStream ? { clientVersion: CURSOR_SAND_DIRECT_CLIENT_VERSION } : {}),
     })
     this.submitDelegate = submitDelegate
     this.recordResult = recordResult ?? ((result) => recordCursorCredentialResult({
