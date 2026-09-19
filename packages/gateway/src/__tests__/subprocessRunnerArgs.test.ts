@@ -393,4 +393,9 @@ describe('buildOfficialClaudeCliArgs', () => {
     ]) assert.equal(args.includes(flag), false, `${flag} must be absent`)
     assert.ok(hasFlagWithValue(args, '--permission-prompt-tool', 'stdio'))
   })
+
+  it('passes through catalog CCB model ids the same way as Cursor Sand ids', () => {
+    const args = buildOfficialClaudeCliArgs({ model: 'glm-5.3-zai' })
+    assert.ok(hasFlagWithValue(args, '--model', 'glm-5.3-zai'))
+  })
 })

@@ -862,9 +862,9 @@ export interface SubprocessRunnerOpts {
     credentialKind: 'api_key' | 'session'
     machineId: string | null
   }
-  /** Agent-loop implementation. Omitted is the established CCB path. The
-   * official CLI lane is intentionally limited to Cursor Sand's loopback
-   * relay; generic CCB/provider migration is outside this switch. */
+  /** Agent-loop implementation. Omitted follows `resolveCcbHarness` (CCB
+   * unless `OC_CCB_OFFICIAL_CC=1`). Official-cc is either Cursor Sand
+   * loopback (`authorityEngine=cursor`) or the engine=ccb Anthropic proxy. */
   harness?: 'ccb' | 'official-cc'
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
@@ -1027,6 +1027,59 @@ export function isOfficialClaudeCursorSandLoopbackEnv(
 ): boolean {
   return OFFICIAL_CC_CURSOR_SAND_LOOPBACK_RE.test(env.ANTHROPIC_BASE_URL ?? '')
     && env.ANTHROPIC_AUTH_TOKEN === 'cursor-sand-loopback'
+}
+
+/** Master/container flag: engine=ccb models spawn stock Claude Code instead of
+ * claude-code-best. Cursor Sand keeps its own `OC_CURSOR_SAND_OFFICIAL_CC`. */
+export function ccbOfficialCcEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OC_CCB_OFFICIAL_CC === '1'
+}
+
+/** Explicit `opts.harness` wins; otherwise `OC_CCB_OFFICIAL_CC=1` selects the
+ * stock CLI. Default remains CCB. */
+export function resolveCcbHarness(
+  optsHarness: 'ccb' | 'official-cc' | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): 'ccb' | 'official-cc' {
+  if (optsHarness === 'ccb' || optsHarness === 'official-cc') return optsHarness
+  return ccbOfficialCcEnabled(env) ? 'official-cc' : 'ccb'
+}
+
+/** Fail-closed spawn gates for official-cc. Cursor still requires the Sand
+ * loopback override; engine=ccb uses the same Anthropic proxy as CCB.
+ * Hermetic advisor and remote-ssh stay on CCB. */
+export function assertOfficialCcSpawnPreconditions(opts: {
+  authorityEngine?: 'ccb' | 'cursor'
+  providerEnvOverride?: Record<string, string>
+  hermeticNoTools?: boolean
+  executionTarget?: { kind?: string } | null
+}): void {
+  if (opts.hermeticNoTools || opts.executionTarget?.kind === 'remote') {
+    throw new Error('OFFICIAL_CC_REQUIRES_LOCAL_NON_HERMETIC')
+  }
+  if (opts.authorityEngine === 'cursor' && !opts.providerEnvOverride) {
+    throw new Error('OFFICIAL_CC_REQUIRES_LOCAL_CURSOR_SAND_LOOPBACK')
+  }
+}
+
+/** Spawn-time env for official-cc on the engine=ccb proxy lane. Stock CLI has
+ * no `update_environment_variables`; headers must be present at process start. */
+export function buildOfficialCcProxySpawnEnv(input: {
+  headers: TurnUpstreamHeaders | undefined
+  usageAttribution?: UsageAttributionTag
+  turnKey?: string
+  executionDescriptorEnv: string
+}): Record<string, string> {
+  return {
+    ..._buildAnthropicCustomHeadersEnv(input.headers),
+    ..._buildCcbUsageAttributionEnv(input.usageAttribution, input.turnKey),
+    [MODEL_EXECUTION_DESCRIPTOR_ENV]: input.executionDescriptorEnv,
+    CLAUDE_CODE_MAX_RETRIES: '0',
+  }
+}
+
+export function officialCcProxySpawnFingerprint(vars: Record<string, string>): string {
+  return JSON.stringify(vars)
 }
 
 /**
@@ -1292,6 +1345,10 @@ export class SubprocessRunner extends EventEmitter {
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
   private officialAbortResultObserved = false
+  /** engine=ccb official-cc: headers applied at next spawn (stock CLI cannot
+   * hot-update env). Cursor Sand official-cc leaves this unset. */
+  private pendingOfficialSpawnEnv: Record<string, string> | null = null
+  private spawnedOfficialHeaderFingerprint: string | undefined
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
 
@@ -1463,20 +1520,17 @@ export class SubprocessRunner extends EventEmitter {
     // retry immediately and re-throw, burning CPU.
     try {
     const { config } = this.opts
-    const harness = this.opts.harness ?? 'ccb'
+    const harness = resolveCcbHarness(this.opts.harness)
     let binaryDir: string
     let command: string
     let ccbEntry: string | undefined
     let ccbRuntime: string | undefined
     if (harness === 'official-cc') {
-      if (
-        this.opts.authorityEngine !== 'cursor'
-        || !this.opts.providerEnvOverride
-        || this.opts.hermeticNoTools
-        || this.opts.executionTarget?.kind === 'remote'
-      ) {
+      try {
+        assertOfficialCcSpawnPreconditions(this.opts)
+      } catch (err) {
         this.starting = false
-        throw new Error('OFFICIAL_CC_REQUIRES_LOCAL_CURSOR_SAND_LOOPBACK')
+        throw err
       }
       command = process.env.OPENCLAUDE_OFFICIAL_CLAUDE_PATH?.trim() || '/usr/local/bin/claude'
       if (!isAbsolute(command)) {
@@ -1645,7 +1699,7 @@ export class SubprocessRunner extends EventEmitter {
     if (this.opts.providerEnvOverride) {
       Object.assign(finalizedProviderEnv, this.opts.providerEnvOverride)
     }
-    if (harness === 'official-cc') {
+    if (harness === 'official-cc' && this.opts.authorityEngine === 'cursor') {
       if (!isOfficialClaudeCursorSandLoopbackEnv(finalizedProviderEnv)) {
         this.starting = false
         this._boundRepoBinding = null
@@ -1753,6 +1807,9 @@ export class SubprocessRunner extends EventEmitter {
                 CLAUDE_CODE_UNATTENDED_RETRY: '0',
               }
             : {}),
+          ...(harness === 'official-cc' && this.pendingOfficialSpawnEnv
+            ? this.pendingOfficialSpawnEnv
+            : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children
@@ -1785,6 +1842,11 @@ export class SubprocessRunner extends EventEmitter {
     })
     this.resolveOutputDrain = resolveThisDrain
     this.spawnedExecutionDescriptor = this.currentExecutionDescriptor
+    if (resolveCcbHarness(this.opts.harness) === 'official-cc' && this.pendingOfficialSpawnEnv) {
+      this.spawnedOfficialHeaderFingerprint = officialCcProxySpawnFingerprint(
+        this.pendingOfficialSpawnEnv,
+      )
+    }
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
     // manager's per-CCB cost-tracker reset) run strictly before any 'message'
     // or 'session_id' event of the new process can arrive.
@@ -2121,7 +2183,21 @@ export class SubprocessRunner extends EventEmitter {
     this.currentExecutionDescriptorEnv = runtime.descriptor
       ? JSON.stringify(runtime.descriptor)
       : ''
-    const harness = this.opts.harness ?? 'ccb'
+    const harness = resolveCcbHarness(this.opts.harness)
+    const officialCcProxyLane = harness === 'official-cc' && this.opts.authorityEngine !== 'cursor'
+    if (officialCcProxyLane) {
+      const spawnEnv = buildOfficialCcProxySpawnEnv({
+        headers: runtime.headers,
+        usageAttribution: this.opts.usageAttribution,
+        turnKey,
+        executionDescriptorEnv: this.currentExecutionDescriptorEnv,
+      })
+      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv)
+      if (this.proc && this.spawnedOfficialHeaderFingerprint !== fingerprint) {
+        await this.shutdown()
+      }
+      this.pendingOfficialSpawnEnv = spawnEnv
+    }
     const envUpdateLine = harness === 'ccb'
       ? _buildUpdateEnvStdinLine(
           {
@@ -2167,19 +2243,30 @@ export class SubprocessRunner extends EventEmitter {
    * live query and every subsequent `/v1/messages` call reads the new header.
    */
   async updateTurnLease(leaseEnvelope: string): Promise<void> {
-    if ((this.opts.harness ?? 'ccb') === 'official-cc') {
+    if (resolveCcbHarness(this.opts.harness) === 'official-cc') {
       if (
-        this.opts.authorityEngine !== 'cursor'
-        || !this.opts.providerEnvOverride
-        || !isOfficialClaudeCursorSandLoopbackEnv(this.opts.providerEnvOverride)
+        this.opts.authorityEngine === 'cursor'
+        && this.opts.providerEnvOverride
+        && isOfficialClaudeCursorSandLoopbackEnv(this.opts.providerEnvOverride)
       ) {
+        // CcbAdapter still renews the master lease to prove control-plane
+        // liveness. The stock CLI cannot hot-apply env changes, and the bound
+        // loopback Cursor relay does not consume this header, so there is no
+        // subprocess write in this narrowly-scoped lane.
+        void leaseEnvelope
+        return
+      }
+      if (this.opts.authorityEngine === 'cursor') {
         throw new Error('OFFICIAL_CC_LEASE_NOOP_OUTSIDE_CURSOR_SAND')
       }
-      // CcbAdapter still renews the master lease to prove control-plane
-      // liveness. The stock CLI cannot hot-apply env changes, and the bound
-      // loopback Cursor relay does not consume this header, so there is no
-      // subprocess write in this narrowly-scoped lane.
-      void leaseEnvelope
+      // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the new lease
+      // and invalidate the spawn fingerprint so the next submit recycles.
+      const headerEnv = _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope })
+      this.pendingOfficialSpawnEnv = {
+        ...(this.pendingOfficialSpawnEnv ?? {}),
+        ...headerEnv,
+      }
+      this.spawnedOfficialHeaderFingerprint = undefined
       return
     }
     const envUpdateLine = _buildUpdateEnvStdinLine(
@@ -2857,6 +2944,7 @@ export class SubprocessRunner extends EventEmitter {
       proc.once('close', () => {
         if (this.proc === proc) this.proc = null
         this.spawnedExecutionDescriptor = undefined
+        this.spawnedOfficialHeaderFingerprint = undefined
         this.closed = true
         this.shuttingDown = false
         this._boundRepoBinding = null
@@ -2866,6 +2954,7 @@ export class SubprocessRunner extends EventEmitter {
     }
     if (this.proc === proc) this.proc = null
     this.spawnedExecutionDescriptor = undefined
+    this.spawnedOfficialHeaderFingerprint = undefined
     this.closed = true
     this.shuttingDown = false
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。

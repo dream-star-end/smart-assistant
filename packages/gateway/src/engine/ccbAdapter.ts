@@ -24,6 +24,7 @@ import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.
 import type { ExecutionTarget } from '../remoteTarget.js'
 import {
   SubprocessRunner,
+  resolveCcbHarness,
   type PermissionResponse,
   type SdkMessage,
 } from '../subprocessRunner.js'
@@ -352,6 +353,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   private readonly runner: SubprocessRunner
   private readonly harness: 'ccb' | 'official-cc'
+  private readonly authorityEngine: 'ccb' | 'cursor'
 
   /**
    * stdout 路由目标 = 最近一次 submitTurn 的 turn 上下文。turn 结束后**保留**
@@ -386,8 +388,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
-    this.harness = opts.harness ?? 'ccb'
-    this.runner = runnerOverride ?? new SubprocessRunner(opts)
+    this.harness = resolveCcbHarness(opts.harness)
+    this.authorityEngine = opts.authorityEngine ?? 'ccb'
+    this.runner = runnerOverride ?? new SubprocessRunner({ ...opts, harness: this.harness })
     // 常驻 stdout 路由(每 session 恰一个,替代旧 per-turn 'message' 闭包链)。
     // 'activity' 先于 parse emit —— 对位旧 handleMessage 里 timer.refresh() 在
     // parser.parse 之前的顺序,且对 parser 会忽略的消息(system init 等)同样计活。
@@ -503,7 +506,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
       // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。
       sessionTotals: asCcbSessionTotals(params.sessionTotals),
-      costMode: this.harness === 'official-cc' ? 'external' : 'native',
+      costMode: this.harness === 'official-cc' && this.authorityEngine === 'cursor'
+        ? 'external'
+        : 'native',
     })
     const ctx: CcbTurnContext = {
       parser,
