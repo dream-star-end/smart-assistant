@@ -1,7 +1,7 @@
 // Pure contract policy: importing this module never starts a browser or reads secrets.
 export const TOTAL_TIMEOUT = 240_000;
 export const CASES = ["C1 cold UI login without auth hint", "C2 collapsed model reaches outbound request", "C3 one model per engine"];
-export function parseModels(value = "gpt-5.6-sol,deepseek-v4-flash") {
+export function parseModels(value = "grok-build,deepseek-v4-flash") {
   const models = value.split(",").map((x) => x.trim());
   if (!models.length || models.some((x) => !/^[a-zA-Z0-9._-]+$/.test(x)) || new Set(models).size !== models.length) throw new Error("Invalid/duplicate contract models");
   return models;
@@ -13,7 +13,7 @@ export function parseOptions(env) {
   if (!/^[^\s@]+@[^\s@]+$/.test(email)) throw new Error("Invalid canary email");
   const cost = env.V5_CONTRACT_COST ?? "dry";
   if (!["dry", "live"].includes(cost)) throw new Error("V5_CONTRACT_COST must be dry or live");
-  const model = parseModels(env.V5_CONTRACT_MODEL_ID ?? "gpt-5.6-luna");
+  const model = parseModels(env.V5_CONTRACT_MODEL_ID ?? "grok-build");
   if (model.length !== 1) throw new Error("Expected one collapsed model");
   return { base: base.origin, email, passwordFile: env.V5_CANARY_PASSWORD_FILE || "/etc/openclaude/selfhost-canary.password", cost, model: model[0], models: parseModels(env.V5_CONTRACT_MODELS) };
 }
