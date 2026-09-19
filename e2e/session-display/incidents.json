@@ -4226,6 +4226,34 @@
           "assertion": "INC-20260915-CODEX-CHATGPT-WS: official provider disables ChatGPT Responses websocket, stderr fail-loud, interrupt recycles hung app-server"
         }
       ]
+    },
+    {
+      "id": "INC-20260919-GROK-RESUME-HANG",
+      "occurredAt": "2026-09-19",
+      "severity": "P1",
+      "symptom": "Grok 4.6 卡在「正在恢复会话」数小时无正文：容器重建或用户停止打断正在跑的工具后，下一轮 --resume 同一份写脏的 native 会话，CLI 卡在 session_create；keepalive 把 15min 空闲看门狗续掉。",
+      "rootFixCommit": "c19f7d5d",
+      "proofPending": {
+        "reason": "unit coverage on grokAdapter first-stdout watchdog, nativeId drop, and keepalive gate; live proof after user-container rebuild",
+        "since": "2026-09-19"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "interrupt without end drops nativeId so the next turn does not --resume"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "resume with no stdout retries the same turn without --resume"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "does not keepalive-refresh activity before the first stdout byte"
+        }
+      ]
     }
   ]
 }
