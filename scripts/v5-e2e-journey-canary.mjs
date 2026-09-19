@@ -194,8 +194,10 @@ try {
     // 落地页又是 lazy 组件,boot 未落定时 DOM 里根本没有可点的「登录」(见常量注释)。
     await page.getByText("登录", { exact: true }).first().click({ timeout: BOOT_TIMEOUT });
     // AuthGate L-11: visible label is 邮箱/密码; placeholders are example format, not the label.
-    await page.getByLabel("邮箱").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    await page.getByLabel("密码").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // Default getByLabel on the password field is substring and also matches the show-password toggle
+    // (8c20469c1 J1: strict mode violation, 2 elements). Pin textbox + exact.
+    await page.getByRole("textbox", { name: "邮箱", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await page.getByRole("textbox", { name: "密码", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
 
     // ── 2026-07-26 安全整改后的形态断言 ──────────────────────────────────
     // 生产已把全局 TURNSTILE_TEST_BYPASS 摘掉(改账号级白名单),真实用户必须看到
