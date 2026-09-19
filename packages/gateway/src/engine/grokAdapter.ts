@@ -57,9 +57,20 @@ const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
 const PROCESS_KEEPALIVE_INTERVAL_MIN_MS = 5_000
 const PROCESS_KEEPALIVE_INTERVAL_MAX_MS = 120_000
+const FIRST_STDOUT_DEFAULT_MS = 90_000
+const FIRST_STDOUT_MIN_MS = 20
+const FIRST_STDOUT_MAX_MS = 600_000
 
 type GrokProcessKeepaliveTestHooks = {
   intervalMs?: number
+  firstStdoutMs?: number
+}
+
+interface GrokLaunchSpec {
+  cwd: string
+  env: NodeJS.ProcessEnv
+  bin: string
+  promptFile: string
 }
 
 let processKeepaliveTestHooks: GrokProcessKeepaliveTestHooks | null = null
@@ -77,6 +88,18 @@ function parseProcessKeepaliveIntervalMs(): number {
 
 function resolvedProcessKeepaliveIntervalMs(): number {
   return processKeepaliveTestHooks?.intervalMs ?? parseProcessKeepaliveIntervalMs()
+}
+
+function parseFirstStdoutMs(): number {
+  const raw = process.env.OPENCLAUDE_GROK_FIRST_STDOUT_MS
+  if (!raw) return FIRST_STDOUT_DEFAULT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return FIRST_STDOUT_DEFAULT_MS
+  return Math.min(FIRST_STDOUT_MAX_MS, Math.max(FIRST_STDOUT_MIN_MS, Math.floor(parsed)))
+}
+
+function resolvedFirstStdoutMs(): number {
+  return processKeepaliveTestHooks?.firstStdoutMs ?? parseFirstStdoutMs()
 }
 
 function isPidAlive(pid: number | undefined): boolean {
@@ -283,6 +306,14 @@ interface GrokTurnContext {
   errorDetail: string | null
   lastUsage: ReturnType<typeof grokUsage>
   resolveSummary: (summary: TurnSummary | null) => void
+  sawStdout: boolean
+  sawEnd: boolean
+  spawnedWithResume: boolean
+  resumeRetried: boolean
+  replacingProc: boolean
+  spawnGeneration: number
+  firstStdoutTimer: NodeJS.Timeout | null
+  launchSpec: GrokLaunchSpec | null
 }
 
 function cleanupPromptDir(ctx: GrokTurnContext): void {
@@ -381,6 +412,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       errorDetail: null,
       lastUsage: grokUsage({}),
       resolveSummary,
+      sawStdout: false,
+      sawEnd: false,
+      spawnedWithResume: false,
+      resumeRetried: false,
+      replacingProc: false,
+      spawnGeneration: 0,
+      firstStdoutTimer: null,
+      launchSpec: null,
     }
     this.active = ctx
     this.lastActivityAt = Date.now()
@@ -466,20 +505,6 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       throw err
     }
     ctx.promptDir = promptDir
-    const args = [
-      '--agent', 'grok-build',
-      '--model', GROK_UPSTREAM_MODEL,
-      '--prompt-file', promptFile,
-      '--output-format', 'streaming-json',
-      '--always-approve',
-      '--no-subagents',
-      '--no-memory',
-      '--cwd', cwd,
-    ]
-    if (this.nativeId) args.push('--resume', this.nativeId)
-    if (this.currentEffort && ['low', 'medium', 'high'].includes(this.currentEffort)) {
-      args.push('--reasoning-effort', this.currentEffort)
-    }
     const isolatedEnv = buildCodexEnv()
     for (const key of Object.keys(isolatedEnv)) {
       if (key.startsWith('XAI_') || key.startsWith('GROK_') || key.startsWith('CODEX_')) {
@@ -517,14 +542,47 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
+    ctx.launchSpec = { cwd, env, bin, promptFile }
+    this.spawnGrokChild(ctx, { resume: Boolean(this.nativeId) })
+  }
+
+  private grokCliArgs(ctx: GrokTurnContext, resume: boolean): string[] {
+    const spec = ctx.launchSpec
+    if (!spec) throw new Error('GROK_LAUNCH_SPEC_MISSING')
+    const args = [
+      '--agent', 'grok-build',
+      '--model', GROK_UPSTREAM_MODEL,
+      '--prompt-file', spec.promptFile,
+      '--output-format', 'streaming-json',
+      '--always-approve',
+      '--no-subagents',
+      '--no-memory',
+      '--cwd', spec.cwd,
+    ]
+    if (resume && this.nativeId) args.push('--resume', this.nativeId)
+    if (this.currentEffort && ['low', 'medium', 'high'].includes(this.currentEffort)) {
+      args.push('--reasoning-effort', this.currentEffort)
+    }
+    return args
+  }
+
+  private spawnGrokChild(ctx: GrokTurnContext, opts: { resume: boolean }): void {
+    const spec = ctx.launchSpec
+    if (!spec) throw new Error('GROK_LAUNCH_SPEC_MISSING')
+    const resume = opts.resume && Boolean(this.nativeId)
+    const args = this.grokCliArgs(ctx, resume)
     let proc: ChildProcessByStdio<null, Readable, Readable>
     try {
-      proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+      proc = spawn(spec.bin, args, { cwd: spec.cwd, env: spec.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     } catch (err) {
       cleanupPromptDir(ctx)
       throw err
     }
     ctx.proc = proc
+    ctx.procClosed = false
+    ctx.sawStdout = false
+    ctx.spawnedWithResume = resume
+    const generation = ++ctx.spawnGeneration
     if (ctx.abandoned) {
       // shutdown() gave up on this turn while we were still composing the
       // prompt. Nobody will read this process and it carries the turn's route
@@ -535,14 +593,15 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       try { proc.unref() } catch { /* already detached */ }
       return
     }
-    this.emit('spawn', { resumed: this.nativeId !== null })
+    this.emit('spawn', { resumed: resume })
     this.ensureProcessKeepalive()
+    this.armFirstStdoutWatchdog(ctx)
 
     let stdoutBuffer = ''
     proc.stdout.setEncoding('utf8')
     proc.stdout.on('data', (chunk: string) => {
-      this.lastActivityAt = Date.now()
-      this.emit('activity')
+      if (ctx.spawnGeneration !== generation) return
+      this.noteStdout(ctx)
       stdoutBuffer += chunk
       for (;;) {
         const newline = stdoutBuffer.indexOf('\n')
@@ -554,12 +613,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
     proc.stderr.setEncoding('utf8')
     proc.stderr.on('data', (chunk: string) => {
-      this.lastActivityAt = Date.now()
-      this.emit('activity')
+      if (ctx.spawnGeneration !== generation) return
       ctx.stderr += chunk
     })
     proc.once('error', (err) => {
+      if (ctx.spawnGeneration !== generation) return
+      if (ctx.replacingProc) return
       if (this.active === ctx) this.stopProcessKeepalive()
+      this.clearFirstStdoutTimer(ctx)
       cleanupPromptDir(ctx)
       // An abandoned turn has already been finalized and `active` has moved on;
       // surfacing this would report a later turn as failed.
@@ -568,7 +629,13 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
+      if (ctx.spawnGeneration !== generation) return
+      if (ctx.replacingProc) {
+        ctx.procClosed = true
+        return
+      }
       if (this.active === ctx) this.stopProcessKeepalive()
+      this.clearFirstStdoutTimer(ctx)
       cleanupPromptDir(ctx)
       // shutdown() may have already given up on this process and finalized
       // the turn, in which case `active` belongs to a later turn that this
@@ -578,6 +645,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
       ctx.resolveDrain?.()
       ctx.resolveDrain = null
+      if (!ctx.sawEnd) this.forgetDirtyNativeSession()
       const crashed = !ctx.interrupted && code !== 0
       if (!ctx.terminal) {
         const detail = ctx.errorDetail || ctx.stderr.trim() || `grok exited with code ${String(code)}`
@@ -586,6 +654,75 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('exit', { code, signal, crashed })
       if (this.active === ctx) this.active = null
     })
+  }
+
+  private noteStdout(ctx: GrokTurnContext): void {
+    if (ctx.abandoned || ctx.terminal) return
+    if (!ctx.sawStdout) {
+      ctx.sawStdout = true
+      this.clearFirstStdoutTimer(ctx)
+      this.ensureProcessKeepalive()
+    }
+    this.lastActivityAt = Date.now()
+    this.emit('activity')
+  }
+
+  private forgetDirtyNativeSession(): void {
+    this.nativeId = null
+  }
+
+  private clearFirstStdoutTimer(ctx: GrokTurnContext): void {
+    if (!ctx.firstStdoutTimer) return
+    clearTimeout(ctx.firstStdoutTimer)
+    ctx.firstStdoutTimer = null
+  }
+
+  private armFirstStdoutWatchdog(ctx: GrokTurnContext): void {
+    this.clearFirstStdoutTimer(ctx)
+    if (!ctx.spawnedWithResume || ctx.resumeRetried || ctx.sawStdout) return
+    const ms = resolvedFirstStdoutMs()
+    if (ms <= 0) return
+    ctx.firstStdoutTimer = setTimeout(() => {
+      void this.retryResumeWithoutNative(ctx)
+    }, ms)
+    ctx.firstStdoutTimer.unref()
+  }
+
+  private async retryResumeWithoutNative(ctx: GrokTurnContext): Promise<void> {
+    if (this.active !== ctx || ctx.terminal || ctx.abandoned || ctx.sawStdout || ctx.resumeRetried) return
+    ctx.resumeRetried = true
+    ctx.replacingProc = true
+    this.clearFirstStdoutTimer(ctx)
+    this.stopProcessKeepalive()
+    this.forgetDirtyNativeSession()
+    log.warn('grok resume produced no stdout; retrying without --resume', {
+      sessionKey: this.opts.sessionKey,
+    })
+    const dying = ctx.proc
+    const generation = ctx.spawnGeneration
+    if (dying && !dying.killed) killProcessGroup(dying, 'SIGKILL')
+    await waitForCloseWithin(
+      new Promise<void>((resolve) => {
+        const poll = (): void => {
+          if (ctx.procClosed || ctx.spawnGeneration !== generation || ctx.abandoned || ctx.terminal) {
+            resolve()
+            return
+          }
+          setTimeout(poll, 20)
+        }
+        poll()
+      }),
+      shutdownTimeoutMs('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS),
+    )
+    if (this.active !== ctx || ctx.terminal || ctx.abandoned) return
+    ctx.replacingProc = false
+    ctx.proc = null
+    ctx.procClosed = false
+    try {
+      this.spawnGrokChild(ctx, { resume: false })
+    } catch (err) {
+      this.finishError(ctx, String(err))
+    }
   }
 
   /** P0-2:输入含图片等二进制 block 时,除 prompt 占位替换外,再向用户发一条
@@ -767,8 +904,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     if (type === 'end') {
       if (event.usage && typeof event.usage === 'object') ctx.lastUsage = grokUsage(event)
+      ctx.sawEnd = true
+      this.clearFirstStdoutTimer(ctx)
       const sessionId = typeof event.sessionId === 'string' ? event.sessionId : null
-      if (sessionId) {
+      if (ctx.interrupted) {
+        this.forgetDirtyNativeSession()
+      } else if (sessionId) {
         this.nativeId = sessionId
         this.emit('session_id', sessionId)
       }
@@ -968,7 +1109,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         : 1,
       isError,
       ...(isError ? { errorKind: authError(ctx.errorDetail!) ? 'auth' as const : 'other' as const, errorDetail: ctx.errorDetail! } : {}),
-      staleResumeId: false,
+      staleResumeId: !ctx.sawEnd && !ctx.interrupted,
       phantomSignals: { ...EMPTY_SIGNALS },
     })
   }
@@ -981,6 +1122,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
 
   private forceEnd(ctx: GrokTurnContext): void {
     if (this.active === ctx) this.stopProcessKeepalive()
+    this.clearFirstStdoutTimer(ctx)
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolveSummary(null)
@@ -1010,11 +1152,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         this.stopProcessKeepalive()
         return
       }
-      // Official Grok can think or wait on the first API round-trip for minutes
-      // with no stdout. Cursor already keeps lastActivityAt fresh while the
-      // parent PID is alive; without that, grok-build dies at the 15-minute
-      // idle watchdog and then auto-recovers into a thinking-forever loop.
-      // The 12h logical-turn cap still bounds a genuinely stuck CLI.
+      // After the first stdout byte, official Grok can think for minutes with
+      // no further JSON. Keepalive then prevents the 15-minute idle watchdog
+      // from killing a live CLI. Before first stdout a --resume hang is not
+      // thinking: do not refresh activity, so liveness can still fire, and the
+      // first-stdout watchdog can cold-start without --resume.
+      if (!ctx.sawStdout) return
       this.lastActivityAt = Date.now()
       this.emit('activity')
     } catch {
@@ -1026,6 +1169,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const ctx = this.active
     if (!ctx?.proc || ctx.proc.killed) return false
     ctx.interrupted = true
+    if (!ctx.sawEnd) this.forgetDirtyNativeSession()
+    this.clearFirstStdoutTimer(ctx)
     killProcessGroup(ctx.proc, 'SIGINT')
     return true
   }
@@ -1095,6 +1240,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     detail: string,
   ): void {
     if (this.active === ctx) this.stopProcessKeepalive()
+    this.clearFirstStdoutTimer(ctx)
+    if (!ctx.sawEnd) this.forgetDirtyNativeSession()
     cleanupPromptDir(ctx)
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)
@@ -1150,6 +1297,7 @@ export const _internals = {
   PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS,
   PROCESS_KEEPALIVE_INTERVAL_MIN_MS,
   PROCESS_KEEPALIVE_INTERVAL_MAX_MS,
+  FIRST_STDOUT_DEFAULT_MS,
   setProcessKeepaliveTestHooks(hooks: GrokProcessKeepaliveTestHooks | null): void {
     processKeepaliveTestHooks = hooks
   },
