@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /** First-class adapter for the pinned official Cursor Agent CLI.
  * Authentication remains exclusively inside the account-scoped oc-cursor
  * launcher; this adapter neither reads nor transports credentials. */
@@ -636,6 +637,8 @@ Subagents have no user-facing UI — decide yourself, or present numbered
 options as plain text and end the turn; the user's next message carries
 the answer.
 
+When a task ticket needs the user's approval or sign-off (backlog or waiting_human), call MCP \`present_task_approval\` with the panel identifier and end the turn. The conversation shows an approval card; the user's click updates the ticket as themselves. Do not send the user to the task panel. Do not use \`present_options\` or \`task_approve\` to stand in for human confirmation.
+
 Use OpenClaude's storage channels as their sections direct: Core memory through
 \`oc-memory core-search\` plus the exact platform memory files, session/archival
 recall through the \`oc-memory\` CLI, and skills/reminders through the
@@ -663,6 +666,7 @@ const OPENCLAUDE_MEMORY_MCP_TOOLS = [
   'delete_reminder',
   'send_to_agent',
   'present_options',
+  'present_task_approval',
 ] as const
 
 const CURSOR_SAFE_ENV_KEYS = [
@@ -1352,6 +1356,7 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 }
 
 interface CursorMemoryMcpConfigInput {
+  identityCompat?: IdentityCompatRuntimeContext
   launch: McpMemoryLaunch
   tokenFile: string
   delegateContextFile: string
@@ -1369,6 +1374,8 @@ interface CursorMemoryMcpConfigInput {
 function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<string, unknown> {
   const env: Record<string, string> = {
     OPENCLAUDE_AGENT_ID: input.agentId,
+    OC_AGENT_ID: input.agentId,
+    ...identityCompatEnvironment(input.identityCompat),
     ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
@@ -1913,6 +1920,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
+        identityCompat: this.opts.identityCompat?.assets,
         provider: 'cursor',
         model: this.currentModel,
         repoSnapshot: repoSnapshot ?? undefined,
@@ -1955,6 +1963,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // every present/future credential name. The MCP child receives only its
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
+      Object.assign(env, identityCompatEnvironment(this.opts.identityCompat), { OPENCLAUDE_AGENT_ID: this.opts.agentId })
       if (this.opts.cursorCredentialSelection) {
         env.OPENCLAUDE_CURSOR_SELECTED_KEY = this.opts.cursorCredentialSelection.keyName
         env.OPENCLAUDE_CURSOR_POOL_GENERATION = this.opts.cursorCredentialSelection.poolGeneration
@@ -1981,6 +1990,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         )
         chmodSync(contextFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
+          identityCompat: this.opts.identityCompat,
           launch: mcpLaunch,
           tokenFile,
           delegateContextFile: contextFile,

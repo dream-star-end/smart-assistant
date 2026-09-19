@@ -209,6 +209,17 @@ describe('OptimizationPanel 状态与历史', () => {
     expect(screen.getByRole('button', { name: '重新审计' })).toBeInTheDocument()
   })
 
+  test('hero 图标块前景走 text-accent-fg:深色 accent 是浅色底,白色图标只有 2.82:1(非文本也要 ≥3:1;a11y-C)', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(idleState())
+
+    renderPanel()
+
+    const heading = await screen.findByRole('heading', { name: /Auto.Dream 全面审计/ })
+    const icon = heading.closest('.flex.items-start')?.querySelector('span.size-10')
+    expect(icon).toHaveClass('bg-accent', 'text-accent-fg')
+    expect(icon).not.toHaveClass('text-white')
+  })
+
   test('已处理建议带处理时间，且以只读态复用同一个弹层', async () => {
     vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(
       idleState({
@@ -234,6 +245,38 @@ describe('OptimizationPanel 状态与历史', () => {
     expect(within(dialog).queryByRole('button', { name: /确认并应用/ })).not.toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: '忽略' })).not.toBeInTheDocument()
     expect(within(dialog).getAllByRole('button', { name: '关闭' }).length).toBeGreaterThan(0)
+  })
+
+  test('建议弹层副标题只放分类名，内部路径收进正文「作用对象」；hero 元信息用「批次」而非「审计分片」', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(
+      idleState({
+        lastSuccessAt: new Date(Date.now() - 3 * 60_000).toISOString(),
+        proposals: [proposal({ targetId: 'memory/xhs-muying-account.md' })],
+      }),
+    )
+    renderPanel()
+    expect(await screen.findByText('5 个批次')).toBeInTheDocument()
+    expect(screen.queryByText(/审计分片/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /合并重复的项目记忆/ }))
+    const dialog = await screen.findByRole('dialog')
+    // 副标题（dialog description）不再拼 targetId。
+    const describedBy = dialog.getAttribute('aria-describedby')
+    const description = describedBy ? document.getElementById(describedBy) : null
+    expect(description?.textContent).toBe('记忆')
+    expect(description?.textContent).not.toMatch(/memory\//)
+    expect(within(dialog).getByText(/作用对象：/)).toBeInTheDocument()
+    expect(within(dialog).getByText('memory/xhs-muying-account.md')).toBeInTheDocument()
+  })
+
+  test('待确认为空时空态里的「立即审计」是次级按钮，不与 hero 的主按钮同屏双主', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(idleState())
+    renderPanel()
+    await screen.findByText('暂无待确认建议')
+    const buttons = screen.getAllByRole('button', { name: /立即审计/ })
+    expect(buttons).toHaveLength(2)
+    const primary = buttons.filter((b) => b.className.includes('bg-primary'))
+    expect(primary).toHaveLength(1)
   })
 })
 

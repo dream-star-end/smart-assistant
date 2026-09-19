@@ -1,8 +1,9 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { AttachChip, Composer } from "./Composer";
+import { AttachChip, Composer, middleTruncate } from "./Composer";
 import type { MediaRef } from "../lib/chat/frames";
 
 afterEach(cleanup);
@@ -40,10 +41,9 @@ function openPlusMenu(): void {
 describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFor> 激活）", () => {
   test("附件项是 label[for]，绑定 file input：input 非 display:none、type=file、无 accept", () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} />);
-    openPlusMenu();
-    const label = screen.getByText("添加附件").closest("label");
-    expect(label).not.toBeNull();
-    const forId = label!.getAttribute("for");
+    const label = screen.getByTitle("添加附件");
+    expect(label.tagName).toBe("LABEL");
+    const forId = label.getAttribute("for");
     expect(forId).toBeTruthy();
     const input = document.getElementById(forId as string) as HTMLInputElement | null;
     expect(input).not.toBeNull();
@@ -57,8 +57,7 @@ describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFo
 
   test("点击附件 label 原生转发一次 click 到 file input（Radix 未吞掉默认激活）", () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} />);
-    openPlusMenu();
-    const label = screen.getByText("添加附件").closest("label") as HTMLLabelElement;
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
     const input = document.getElementById(label.getAttribute("for") as string) as HTMLInputElement;
     const clickSpy = vi.fn();
     input.addEventListener("click", clickSpy);
@@ -72,15 +71,14 @@ describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFo
    *  htmlFor 按 tree scope 解析不到 input → 选择器不弹(真机 Chromium 实证 0 转发)。
    *  上面的"转发"测试在 jsdom 恒绿测不出(jsdom 的 label control 查找走 ownerDocument
    *  而非 root tree,detached 也能转发)——所以这里直接锁 detach 本身:
-   *  点击当下 label 必须仍 connected(即 onSelect 已 preventDefault),菜单随后异步关闭。 */
+   *  点击当下 label 必须仍 connected。附件入口已迁到工具条常驻 label,不再随菜单卸载。 */
   test("点击附件项后 label 在激活窗口内保持挂载（select 已拦截），菜单随后异步关闭", async () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} />);
-    openPlusMenu();
-    const label = screen.getByText("添加附件").closest("label") as HTMLLabelElement;
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
     fireEvent.click(label);
     // click 派发结束的同步时刻:label 必须还在 DOM(原生激活依赖此窗口)。
     expect(label.isConnected).toBe(true);
-    // 菜单不常驻:宏任务后正常关闭。
+    // 工具条 label 常驻,菜单里不再有「添加附件」文案。
     await waitFor(() => expect(screen.queryByText("添加附件")).toBeNull());
   });
 });
@@ -200,7 +198,7 @@ describe("Composer 目标 chip", () => {
     );
     const chip = screen.getByTestId("composer-goal-chip");
     expect(chip).toHaveTextContent("迁移并验证");
-    expect(chip).toHaveTextContent("进行中");
+    expect(chip).toHaveTextContent("已启用");
     fireEvent.click(chip);
     expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
   });
@@ -297,6 +295,108 @@ describe("消息引用 Composer 预览", () => {
   });
 });
 
+// C-03:「添加附件」是 <label>,不在 Tab 序列;file input 又 tabindex=-1 → 纯键盘/读屏用户无法触达附件。
+describe("附件入口键盘可达(C-03)", () => {
+  test("label 可聚焦(tabindex=0, role=button),Enter / Space 经 label 原生激活各转发一次 click 到 file input", () => {
+    render(<Composer onSend={() => {}} onUpload={uploadStub} />);
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
+    expect(label).toHaveAttribute("tabindex", "0");
+    expect(label).toHaveAttribute("role", "button");
+    const input = document.getElementById(label.getAttribute("for") as string) as HTMLInputElement;
+    // T4 结构红线原样:input 仍 tabindex=-1、sr-only、无 accept。
+    expect(input.getAttribute("tabindex")).toBe("-1");
+    expect(input.className).toContain("sr-only");
+    expect(input.hasAttribute("accept")).toBe(false);
+    const clickSpy = vi.fn();
+    input.addEventListener("click", clickSpy);
+    fireEvent.keyDown(label, { key: "Enter" });
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(label, { key: " " });
+    expect(clickSpy).toHaveBeenCalledTimes(2);
+    fireEvent.keyDown(label, { key: "a" });
+    expect(clickSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("disabled 时 label 退出 Tab 序列且键盘不触发", () => {
+    render(<Composer onSend={() => {}} onUpload={uploadStub} disabled />);
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
+    expect(label).toHaveAttribute("tabindex", "-1");
+    expect(label).toHaveAttribute("aria-disabled", "true");
+    const input = document.getElementById(label.getAttribute("for") as string) as HTMLInputElement;
+    const clickSpy = vi.fn();
+    input.addEventListener("click", clickSpy);
+    fireEvent.keyDown(label, { key: "Enter" });
+    expect(clickSpy).not.toHaveBeenCalled();
+  });
+});
+
+// C-04 / C-10 / C-18:chip 内「×」24px、「重试」24px 触控目标;失败原因只在 title;长文件名尾截断丢扩展名。
+describe("AttachChip 触控尺寸、失败原因与文件名截断", () => {
+  const errored = {
+    id: "att-9",
+    name: "一个名字特别长的设计稿终稿最终版真的最终版.sketch",
+    size: 2048,
+    kind: "file" as const,
+    status: "error" as const,
+    error: "文件超过 20 MB",
+    file: new File(["x"], "x.sketch"),
+  };
+
+  test("移除 / 重试在触屏下 44px;失败原因就地可见;文件名中段截断保留扩展名", () => {
+    render(<AttachChip a={errored} onRemove={() => {}} onRetry={() => {}} />);
+    expect(screen.getByRole("button", { name: `移除 ${errored.name}` })).toHaveClass("[@media(hover:none)]:size-11");
+    expect(screen.getByLabelText(`重试上传 ${errored.name}`)).toHaveClass("[@media(hover:none)]:min-h-11");
+    expect(screen.getByRole("status")).toHaveTextContent("文件超过 20 MB");
+    const shown = screen.getByText(/…/).textContent ?? "";
+    expect(shown.endsWith(".sketch")).toBe(true);
+    expect(shown.length).toBeLessThan(errored.name.length);
+    // 完整名仍在 title 里可查。
+    expect(screen.getByTitle("文件超过 20 MB")).toBeInTheDocument();
+  });
+
+  test("非失败态不出失败原因;短文件名不截断", () => {
+    render(
+      <AttachChip
+        a={{ id: "att-1", name: "report.pdf", size: 12, kind: "file", status: "done" }}
+        onRemove={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+  });
+
+  test("middleTruncate:超长保留头尾与扩展名,短名原样,无扩展名也能截", () => {
+    expect(middleTruncate("report.pdf", 24)).toBe("report.pdf");
+    const long = middleTruncate("一个名字特别长的设计稿终稿最终版真的最终版.sketch", 24);
+    expect(long.endsWith(".sketch")).toBe(true);
+    expect(long).toContain("…");
+    expect(Array.from(long).length).toBeLessThanOrEqual(25);
+    const noExt = middleTruncate("a".repeat(60), 24);
+    expect(noExt).toContain("…");
+    expect(Array.from(noExt).length).toBeLessThanOrEqual(25);
+  });
+});
+
+// C-10:发送键禁用原因此前只在 hover title,触屏看不到。
+describe("发送键禁用原因可见(C-10)", () => {
+  test("有附件上传失败时工具行显示可见原因,发送后不显示", async () => {
+    const onSend = vi.fn();
+    const upload = vi.fn(async () => {
+      throw new Error("网络错误");
+    });
+    render(<Composer onSend={onSend} onUpload={upload} />);
+    const label = screen.getByTitle("添加附件") as HTMLLabelElement;
+    const input = document.getElementById(label.getAttribute("for") as string) as HTMLInputElement;
+    const file = new File(["x"], "fail.txt", { type: "text/plain" });
+    Object.defineProperty(input, "files", { value: [file], configurable: true });
+    fireEvent.change(input);
+    await waitFor(() => expect(screen.getByLabelText("重试上传 fail.txt")).toBeInTheDocument());
+    expect(screen.getByTestId("composer-send-blocked-reason")).toHaveTextContent("有附件上传失败");
+    fireEvent.click(screen.getByRole("button", { name: "移除 fail.txt" }));
+    expect(screen.queryByTestId("composer-send-blocked-reason")).toBeNull();
+  });
+});
+
 describe("AttachChip（附件 chip 上传失败重试）", () => {
   test("error 态且持有 File + onRetry → 显示「重试」，点击回调复用重传入口", () => {
     const onRetry = vi.fn();
@@ -381,6 +481,27 @@ describe("AttachChip（对话框上传图的「编辑」入口 —— 需求 §5
     const btn = screen.getByRole("button", { name: "编辑图片 photo.png" });
     expect(btn).toBeDisabled();
     expect(btn).toHaveAttribute("title", "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型");
+  });
+});
+
+// C-22:onFiles 此前读渲染闭包里的 attachments.length,同一帧内连续两次拖放用同一个旧值算 room,
+// 合计可超 MAX_ATTACH(后端才拒)。外层 act 让两次 drop 之间不重渲染,复现「闭包过期」。
+describe("附件上限竞态(C-22)", () => {
+  test("同一帧内连续两次拖放,合计仍不超过 MAX_ATTACHMENTS_PER_MESSAGE", async () => {
+    const onUpload = vi.fn(async () => ({ kind: "file", url: "/x" }) as MediaRef);
+    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = container.querySelector(".rounded-\\[26px\\]") as HTMLElement;
+    const mk = (i: number) => new File(["x"], `race-${i}.txt`, { type: "text/plain" });
+    const batch = Math.max(1, MAX_ATTACHMENTS_PER_MESSAGE - 1);
+    const dt = (files: File[]) => ({ types: ["Files"], files, dropEffect: "none", items: [] });
+    act(() => {
+      fireEvent.drop(shell, { dataTransfer: dt(Array.from({ length: batch }, (_, i) => mk(i))) });
+      fireEvent.drop(shell, { dataTransfer: dt(Array.from({ length: batch }, (_, i) => mk(batch + i))) });
+    });
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /^移除 race-/ })).toHaveLength(MAX_ATTACHMENTS_PER_MESSAGE),
+    );
+    expect(onUpload).toHaveBeenCalledTimes(MAX_ATTACHMENTS_PER_MESSAGE);
   });
 });
 

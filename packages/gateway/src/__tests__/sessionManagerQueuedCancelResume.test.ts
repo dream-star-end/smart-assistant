@@ -141,9 +141,24 @@ for (const resetNativeSession of [false, true]) {
       const f = await fixture(t)
       let release!: () => void
       f.session.lock = new Promise<void>(resolve => { release = resolve })
+      // submit first awaits authenticated identity preparation. Observe the real
+      // queue admission instead of assuming the public async call locks inline.
+      let admitted!: () => void
+      const atQueueAdmission = new Promise<void>(resolve => { admitted = resolve })
+      const executions = f.m._promptQueueExecutions as Set<unknown>
+      const originalAdd = executions.add.bind(executions)
+      t.mock.method(executions, 'add', (session: unknown) => {
+        const result = originalAdd(session)
+        if (session === f.session) admitted()
+        return result
+      })
       let failure: unknown
       const observed = f.submit(f.ctx, { resetNativeSession }).catch(error => { failure = error })
       try {
+        await Promise.race([
+          atQueueAdmission,
+          observed.then(() => { throw failure ?? new Error('submit ended before queue admission') }),
+        ])
         assert.equal(f.session._activeTurnCount, 1)
         assert.deepEqual(f.calls, [])
         assert.equal((await cancelQueuedTurnDispatchExact(f.ctx)).applied, true)

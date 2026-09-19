@@ -1,6 +1,6 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import { Check, ChevronRight, FlaskConical, Inbox, ShieldX, Sparkles, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import { benchmarkSuspect, bundleHasEvals } from "../../lib/marketplace";
 import type {
@@ -16,19 +16,113 @@ import {
   Badge,
   Button,
   Card,
+  Checkbox,
   CopyChip,
   EmptyState,
   Field,
   Input,
   ListSkeleton,
+  Modal,
   Panel,
   Textarea,
   TimeAgo,
+  Tooltip,
   useConfirm,
-  usePrompt,
   useToast,
 } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
+
+type RejectReasonOpts = {
+  title: string;
+  /** 给审核员看的提示,同时经 Field 接成输入框的 aria-describedby。 */
+  body?: ReactNode;
+  placeholder?: string;
+  confirmText?: string;
+  maxLength?: number;
+};
+
+/**
+ * 拒绝理由输入框(单条 / 批量共用)。
+ *
+ * 不走 ui 的 `usePrompt`:它渲染的 Input 只有 placeholder、没有可访问名 —— CDP 无障碍树里
+ * name 为空,读屏 Tab 到只听见「编辑框」;一开始输入 placeholder 就消失,视觉上也没有标签
+ *(t-762 market#1,P2)。这里用 `Field` 给输入框一枚常驻标签「拒绝原因」,提示文字接
+ * aria-describedby,必填由 aria-required 承载;交互(Enter 提交 / 空白不可提交 / Esc 取消)
+ * 与 usePrompt 保持一致。若日后 usePrompt 支持给输入框命名,可换回去。
+ */
+function useRejectReasonPrompt(): [(opts: RejectReasonOpts) => Promise<string | null>, ReactNode] {
+  const [opts, setOpts] = useState<RejectReasonOpts | null>(null);
+  const [value, setValue] = useState("");
+  const resolverRef = useRef<((v: string | null) => void) | null>(null);
+
+  const promptReason = useCallback((o: RejectReasonOpts) => {
+    return new Promise<string | null>((resolve) => {
+      resolverRef.current?.(null);
+      resolverRef.current = resolve;
+      setValue("");
+      setOpts(o);
+    });
+  }, []);
+
+  const settle = (v: string | null) => {
+    resolverRef.current?.(v);
+    resolverRef.current = null;
+    setOpts(null);
+  };
+
+  const submit = () => {
+    const t = value.trim();
+    settle(t.length > 0 ? t : null);
+  };
+
+  const element = (
+    <Modal
+      open={opts !== null}
+      onOpenChange={(open) => {
+        if (!open) settle(null);
+      }}
+      title={opts?.title}
+      footer={
+        <>
+          <Button variant="ghost" onClick={() => settle(null)}>
+            取消
+          </Button>
+          <Button variant="primary" onClick={submit} disabled={value.trim().length === 0}>
+            {opts?.confirmText ?? "拒绝"}
+          </Button>
+        </>
+      }
+    >
+      <Field label="拒绝原因" hint={opts?.body} required>
+        <Input
+          value={value}
+          maxLength={opts?.maxLength ?? 500}
+          placeholder={opts?.placeholder}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          // biome-ignore lint/a11y/noAutofocus: 输入对话框打开即聚焦是预期交互(与 usePrompt 同)
+          autoFocus
+        />
+      </Field>
+    </Modal>
+  );
+
+  return [promptReason, element];
+}
+
+/**
+ * 「带 evals」「自报增益存疑」两枚徽章的解释(K-14)。此前只挂在原生 title 上:触屏永远看不到、
+ * 读屏多数不读。现在 hover 走 Tooltip,展开审查区第一行再明文写一遍 —— 审核员在手机上也拿得到。
+ */
+const EVALS_HINT = "附带 evals/ 评测用例（发布者提供，未复跑验证）";
+function benchmarkSuspectHint(b: { withPassRate: number; withoutPassRate: number; cases: number }) {
+  return `自报实测 ${Math.round(b.withoutPassRate * 100)}%→${Math.round(b.withPassRate * 100)}%（${b.cases} 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证`;
+}
 
 /** 人向元数据是否缺失(存量/平台 seed 行没有 category 或 useCases)。 */
 function humanMetaMissing(r: MarketplacePending): boolean {
@@ -117,7 +211,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
     reviewed: number;
     failures: Array<{ versionId: string; name: string; message?: string }>;
   } | null>(null);
-  const [promptText, promptTextEl] = usePrompt();
+  const [promptText, promptTextEl] = useRejectReasonPrompt();
   const [confirmDialog, confirmEl] = useConfirm();
   const toast = useToast();
 
@@ -153,9 +247,10 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       let note: string | undefined;
       if (decision === "reject") {
         // 拒绝必须给理由:回显到发布者「我的发布」,否则拒绝对发布者是黑盒。
+        // 标题落在动作上、字段名落在「拒绝原因」上,两处不再各说一遍「理由」。
         const reason = await promptText({
-          title: "拒绝理由",
-          body: "理由会展示给发布者，请写明需要修正什么。",
+          title: "拒绝投稿",
+          body: "原因会展示给发布者，请写明需要修正什么。",
           placeholder: "例：正文包含内网地址，请移除后重新提交",
           confirmText: "拒绝",
           maxLength: 500,
@@ -224,7 +319,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       if (decision === "reject") {
         const reason = await promptText({
           title: `批量拒绝 ${versionIds.length} 个投稿`,
-          body: "理由会展示给这些发布者，请写明需要修正什么。",
+          body: "原因会展示给这些发布者，请写明需要修正什么。",
           placeholder: "例：正文包含内网地址，请移除后重新提交",
           confirmText: "批量拒绝",
           maxLength: 500,
@@ -369,18 +464,15 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
             )}
 
             <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
-              <label className="flex items-center gap-2 text-body text-muted [@media(hover:none)]:min-h-11">
-                <input
-                  type="checkbox"
-                  className="accent-accent"
-                  checked={allSelected}
-                  ref={(el) => {
-                    if (el) el.indeterminate = selectedVisibleIds.length > 0 && !allSelected;
-                  }}
-                  onChange={(e) => toggleAll(e.currentTarget.checked)}
-                />
-                全选
-              </label>
+              {/* K-27:ui/Checkbox 原语(此前原生 accent-accent 方块与 Switch / Chip 视觉语言不一致);
+                  部分勾选 → indeterminate(读屏 mixed、视觉减号),触控靶由原语的 label 自带。 */}
+              <Checkbox
+                label="全选"
+                className="items-center text-muted"
+                checked={allSelected}
+                indeterminate={selectedVisibleIds.length > 0 && !allSelected}
+                onChange={(e) => toggleAll(e.currentTarget.checked)}
+              />
               <span className="text-meta text-faint">已选 {selectedVisibleIds.length}</span>
               {selectedHasConnector && (
                 // 禁用原因不能只写在 native title:disabled 元素多数浏览器不触发它,触屏则完全无从呈现。
@@ -421,6 +513,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 const rejecting = busy === `reject:${r.versionId}`;
                 const otherBusy = busy !== null && !approving && !rejecting;
                 const waited = waitedDays(r.createdAt);
+                const hasEvals = bundleHasEvals(r.rawBundle);
+                const suspect = benchmarkSuspect(r.benchmark);
                 // 连接器的批准前置条件:真实功能验收在展开区,未勾选前"批准"不可点。
                 const needsReview = r.kind === "connector" && !connectorVerified.has(r.versionId);
                 return (
@@ -433,17 +527,15 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                   >
                     <div className="flex flex-wrap items-start gap-2 px-3.5 py-3">
                       {/* 触控靶必须挂在**真正接收点击的元素**上:裸 checkbox 的命中区只有
-                          十几像素,而卡片的 px-3.5/py-3 扩的是卡片、不是 input。故用 label
-                          包住它撑到 44×44(点 label 即切换)。桌面端 hover 可用,渲染零变化。 */}
-                      <label className="flex shrink-0 items-start justify-center [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11">
-                        <input
-                          type="checkbox"
-                          className="mt-1 accent-accent"
-                          checked={selected.has(r.versionId)}
-                          onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
-                          aria-label={`选择 ${r.name}`}
-                        />
-                      </label>
+                          十几像素,而卡片的 px-3.5/py-3 扩的是卡片、不是 input。ui/Checkbox 的外层
+                          就是 label,无文字时自带 44×44(点 label 即切换);桌面端渲染零变化。 */}
+                      <Checkbox
+                        className="shrink-0"
+                        controlClassName="mt-1"
+                        checked={selected.has(r.versionId)}
+                        onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
+                        aria-label={`选择 ${r.name}`}
+                      />
                       <button
                         type="button"
                         onClick={() => setOpen(isOpen ? null : r.versionId)}
@@ -474,30 +566,27 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             {waited >= 1 && <Badge tone="warning">等待 {waited} 天</Badge>}
                             {/* 存量/平台 seed 行缺人向元数据 → 缺陷提示(非阻断,仅提示补齐)。 */}
                             {humanMetaMissing(r) && <Badge tone="warning">人向元数据缺失</Badge>}
-                            {/* 供给凸显:附带 evals/ 评测用例 → 正向信号(鼓励供给,不做质量背书)。 */}
-                            {bundleHasEvals(r.rawBundle) && (
-                              <Badge
-                                tone="info"
-                                title="附带 evals/ 评测用例（发布者提供，未复跑验证）"
-                              >
-                                <FlaskConical size={11} />带 evals
-                              </Badge>
+                            {/* 供给凸显:附带 evals/ 评测用例 → 正向信号(鼓励供给,不做质量背书)。
+                                解释走 Tooltip + 展开区明文,不再是 title-only(K-14)。 */}
+                            {hasEvals && (
+                              <Tooltip content={EVALS_HINT}>
+                                <Badge tone="info">
+                                  <FlaskConical size={11} />带 evals
+                                </Badge>
+                              </Tooltip>
                             )}
                             {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
                             {/* 自报评测黄牌:增益≤0 或通过率<50% 时提示人审留意;数据为发布者
                                 自报、未经平台验证,仅提示不阻断。无 benchmark 不渲染。 */}
-                            {benchmarkSuspect(r.benchmark) && r.benchmark && (
-                              <Badge
-                                tone="warning"
-                                title={`自报实测 ${Math.round(r.benchmark.withoutPassRate * 100)}%→${Math.round(r.benchmark.withPassRate * 100)}%（${r.benchmark.cases} 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证`}
-                              >
-                                自报增益存疑
-                              </Badge>
+                            {suspect && r.benchmark && (
+                              <Tooltip content={benchmarkSuspectHint(r.benchmark)}>
+                                <Badge tone="warning">自报增益存疑</Badge>
+                              </Tooltip>
                             )}
                           </div>
                           <p className="truncate text-meta text-muted">
                             {r.slug} ·{" "}
-                            <TimeAgo value={r.createdAt} tooltip={false} className="tabular-nums" />
+                            <TimeAgo value={r.createdAt} tooltip={false} className="tabular-nums" />{" "}
                             提交 · 提交者 #{r.submittedBy}
                           </p>
                           {needsReview && (
@@ -559,6 +648,23 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                         id={`review-detail-${r.versionId}`}
                         className="border-t border-border px-3.5 py-3"
                       >
+                        {/* 行头徽章的解释在这里明文再写一遍(K-14):触屏 / 读屏用户也拿得到。 */}
+                        {(hasEvals || (suspect && r.benchmark)) && (
+                          <ul className="mb-2 flex flex-col gap-1 text-meta leading-relaxed text-muted">
+                            {hasEvals && (
+                              <li>
+                                <span className="font-medium text-fg">带 evals：</span>
+                                {EVALS_HINT}
+                              </li>
+                            )}
+                            {suspect && r.benchmark && (
+                              <li>
+                                <span className="font-medium text-fg">自报增益存疑：</span>
+                                {benchmarkSuspectHint(r.benchmark)}
+                              </li>
+                            )}
+                          </ul>
+                        )}
                         <p className="mb-2 text-body text-fg">{r.description}</p>
                         {/* 人向商品元数据:审核要点=分类名实相符、用例与正文一致、效果不夸大。 */}
                         <PendingHumanMeta r={r} />
@@ -588,23 +694,21 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                                 }
                               />
                             </Field>
-                            {/* label 即点击目标:窄屏折行不保证够 44px,显式兜底。 */}
-                            <label className="flex items-start gap-2 text-meta leading-relaxed text-fg [@media(hover:none)]:min-h-11">
-                              <input
-                                type="checkbox"
-                                className="mt-0.5 accent-accent"
-                                checked={connectorVerified.has(r.versionId)}
-                                onChange={(e) =>
-                                  setConnectorVerified((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.currentTarget.checked) next.add(r.versionId);
-                                    else next.delete(r.versionId);
-                                    return next;
-                                  })
-                                }
-                              />
-                              我已使用隔离测试账号完成绑定、身份探针及声明动作的真实功能验收。
-                            </label>
+                            {/* label 即点击目标:窄屏折行不保证够 44px,原语的 min-h-11 兜底。 */}
+                            <Checkbox
+                              className="flex text-meta leading-relaxed"
+                              controlClassName="mt-0.5"
+                              label="我已使用隔离测试账号完成绑定、身份探针及声明动作的真实功能验收。"
+                              checked={connectorVerified.has(r.versionId)}
+                              onChange={(e) =>
+                                setConnectorVerified((prev) => {
+                                  const next = new Set(prev);
+                                  if (e.currentTarget.checked) next.add(r.versionId);
+                                  else next.delete(r.versionId);
+                                  return next;
+                                })
+                              }
+                            />
                           </div>
                         )}
                         {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。
@@ -805,6 +909,10 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
  * **本面板置顶** —— 它是这里最危险、也最需要在紧急情况下秒到的操作,不该排在
  * 30 条待审队列之后。slug 输入带已上架目录 datalist 提示(技能+智能体+连接器),
  * 确认框回显条目名防误下架。
+ *
+ * 窄屏默认只留标题行 + 「展开」(K-13):说明 + 两个输入 + 全宽红按钮在 390px 上占掉约 300px
+ * 首屏,管理员在手机上打开审核页第一眼是最危险的操作而不是待办。置顶的位置不变 —— 紧急时
+ * 仍是第一行,多一下点击;sm 起照旧全展开。
  */
 function RevokeBox({ auth }: { auth: AuthSession }) {
   const [slug, setSlug] = useState("");
@@ -813,6 +921,8 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   const [msg, setMsg] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
   const [catalog, setCatalog] = useState<MarketplaceCard[]>([]);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const bodyId = useId();
 
   // 拉一次已上架目录做 datalist(两类各拉一页;搜索目录本身有 500 上限,极端时仍可手输)。
   useEffect(() => {
@@ -863,44 +973,63 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   return (
     <div className="rounded-xl border border-danger/30 bg-danger-soft/40 p-3.5">
       {confirmDialogEl}
-      <div className="mb-1 flex items-center gap-1.5 text-body font-medium text-danger">
-        <ShieldX size={15} /> 紧急下架已上架条目（kill-switch）
-      </div>
-      <p className="mb-2 text-caption text-muted">
-        撤销一个已上架条目：所有已安装用户在下次会话同步时被移除。
-      </p>
-      {msg && (
-        <div className="mb-2">
-          <Alert tone={msg.tone} density="compact">
-            {msg.text}
-          </Alert>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-body font-medium text-danger">
+          <ShieldX size={15} /> 紧急下架已上架条目（kill-switch）
         </div>
-      )}
-      <div className="flex flex-col gap-2 md:flex-row">
-        <Input
-          value={slug}
-          onChange={(e) => setSlug(e.target.value)}
-          placeholder="slug"
-          aria-label="要下架的条目 slug"
-          list="revoke-slug-options"
-        />
-        <datalist id="revoke-slug-options">
-          {catalog.map((c) => (
-            <option key={c.slug} value={c.slug}>
-              {c.name}（{c.kind === "agent" ? "智能体" : c.kind === "connector" ? "API 插件" : "技能"}
-              ）
-            </option>
-          ))}
-        </datalist>
-        <Input
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-          placeholder="下架原因（可选）"
-          aria-label="下架原因"
-        />
-        <Button variant="danger" onClick={() => void revoke()} loading={busy} disabled={!slug.trim()}>
-          下架
+        <Button
+          variant="ghost"
+          size="sm"
+          className="sm:hidden"
+          aria-expanded={mobileOpen}
+          aria-controls={bodyId}
+          onClick={() => setMobileOpen((o) => !o)}
+        >
+          {mobileOpen ? "收起" : "展开"}
         </Button>
+      </div>
+      <div id={bodyId} className={cn("mt-1", !mobileOpen && "max-sm:hidden")}>
+        <p className="mb-2 text-caption text-muted">
+          撤销一个已上架条目：所有已安装用户在下次会话同步时被移除。
+        </p>
+        {msg && (
+          <div className="mb-2">
+            <Alert tone={msg.tone} density="compact">
+              {msg.text}
+            </Alert>
+          </div>
+        )}
+        <div className="flex flex-col gap-2 md:flex-row">
+          <Input
+            value={slug}
+            onChange={(e) => setSlug(e.target.value)}
+            placeholder="要下架的条目 slug，如 ppt-master"
+            aria-label="要下架的条目 slug"
+            list="revoke-slug-options"
+          />
+          <datalist id="revoke-slug-options">
+            {catalog.map((c) => (
+              <option key={c.slug} value={c.slug}>
+                {c.name}（
+                {c.kind === "agent" ? "智能体" : c.kind === "connector" ? "API 插件" : "技能"}）
+              </option>
+            ))}
+          </datalist>
+          <Input
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="下架原因（可选）"
+            aria-label="下架原因"
+          />
+          <Button
+            variant="danger"
+            onClick={() => void revoke()}
+            loading={busy}
+            disabled={!slug.trim()}
+          >
+            下架
+          </Button>
+        </div>
       </div>
     </div>
   );

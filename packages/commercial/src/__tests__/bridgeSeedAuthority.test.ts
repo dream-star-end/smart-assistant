@@ -179,14 +179,15 @@ function makeResolverLoader(
   env: NodeJS.ProcessEnv,
   platformRoot: string | undefined,
   rig: { order: string[]; resolverOpts: Array<{ bundleRev?: string }> },
+  flavor?: "commercial" | "selfhost",
 ) {
   return async (_uid: bigint, opts: { bundleRev?: string }) => {
     rig.order.push("resolver");
     rig.resolverOpts.push(opts);
-    const seedExecutions = seedAuthorityByRevEnabled(env)
+    const seedExecutions = seedAuthorityByRevEnabled(env, flavor)
       ? await seedAgentModels(opts.bundleRev, platformRoot)
       : undefined;
-    const snapshot = buildAgentModelSnapshot([], [], seedExecutions);
+    const snapshot = buildAgentModelSnapshot([{ slug: "auto-agent", rawManifest: JSON.stringify({ model: "auto" }) } as never], [], seedExecutions);
     return (agentId: string) => snapshot.get(agentId) ?? null;
   };
 }
@@ -197,6 +198,7 @@ async function startRig(opts: {
   platformRoot?: string;
   /** OC_SEED_AUTHORITY_BY_REV 的值(不传 = 未设 = 旧路径)。 */
   flag?: string;
+  flavor?: "commercial" | "selfhost";
 }): Promise<Rig> {
   const order: string[] = [];
   const resolverOpts: Array<{ bundleRev?: string }> = [];
@@ -233,7 +235,7 @@ async function startRig(opts: {
         return true;
       };
     },
-    loadAgentModelResolver: makeResolverLoader(env, opts.platformRoot, { order, resolverOpts }),
+    loadAgentModelResolver: makeResolverLoader(env, opts.platformRoot, { order, resolverOpts }, opts.flavor),
     containerConnectTimeoutMs: 1500,
     heartbeatIntervalMs: 0,
   });
@@ -433,6 +435,32 @@ describe(
         assert.equal(await closed, CLOSE_BRIDGE.PRODUCT_POLICY);
       } finally {
         await stopRig(rig);
+      }
+    });
+
+    test("OCV5-179 selfhost defaults on: two live connection revisions keep distinct auto defaults", async () => {
+      const newer = buildBundle(SEED_YAML_V2.replace(DECLARED_MAIN_MODEL, "glm-5.2"));
+      const oldRig = await startRig({ flavor: "selfhost", bundleRev: bundle.rev, platformRoot: bundle.platformRoot });
+      const newRig = await startRig({ flavor: "selfhost", bundleRev: newer.rev, platformRoot: newer.platformRoot });
+      try {
+        const oldClient = await openClient(oldRig.port);
+        const newClient = await openClient(newRig.port);
+        oldClient.ws.send(agentFrame("auto-agent"));
+        newClient.ws.send(agentFrame("auto-agent"));
+        await waitFor(() => oldRig.checkedModels.length > 0 && newRig.checkedModels.length > 0);
+        assert.equal(oldRig.checkedModels[0], DECLARED_MAIN_MODEL);
+        assert.equal(newRig.checkedModels[0], "glm-5.2");
+        // Miss-triggered refresh uses the old connection's captured rev, not latest.
+        oldClient.ws.send(agentFrame("missing-agent"));
+        await waitFor(() => oldRig.resolverOpts.length >= 2);
+        assert.ok(oldRig.resolverOpts.every(o => o.bundleRev === bundle.rev));
+        assert.ok(newRig.resolverOpts.every(o => o.bundleRev === newer.rev));
+        oldClient.ws.close();
+        newClient.ws.close();
+      } finally {
+        await stopRig(oldRig);
+        await stopRig(newRig);
+        rmSync(newer.platformRoot, { recursive: true, force: true });
       }
     });
 

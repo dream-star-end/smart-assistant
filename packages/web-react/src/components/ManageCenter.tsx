@@ -9,10 +9,6 @@ import { OptimizationPanel } from "./manage/OptimizationPanel";
 import { SkillsPanel } from "./manage/SkillsPanel";
 import { ConnectorsTab } from "./settings/ConnectorsTab";
 import { Badge, Button, EmptyState, Modal, ProjectScopeSelect, Tabs } from "./ui";
-import { AgentProjectPreview } from "./manage/AgentProjectPreview";
-import { ProjectAssetsManagePanel } from "./manage/ProjectAssetsManagePanel";
-import { isWorkScope } from "../lib/projectScope";
-import { useProjectScope } from "../hooks/useProjectScope";
 
 export type { ManageTab };
 
@@ -69,7 +65,6 @@ export function ManageCenter({
   /** 未登录态 CTA：关闭本壳并把用户送到登录页。省略则空态只剩说明。 */
   onRequireLogin?: () => void;
 }) {
-  const { scope } = useProjectScope();
   const items = MANAGE_TABS.map((t) => ({
     value: t.id,
     featureId: t.featureId,
@@ -118,6 +113,21 @@ export function ManageCenter({
             onValueChange={(v) => onTabChange(v as ManageTab)}
             items={items}
           />
+          {/* 390px 下六个 Tab 单行横滚，第 6 个「优化」—— 唯一带待办徽标的分区 —— 整个在视口外，
+              徽标信号等于没有。窄屏补一行可点的待办提示（md 起 Tab 条放得下，隐藏）；
+              不恢复 3×2 宫格（占两行首屏、热区摊薄，移动端审计后弃用）。 */}
+          {optimizerPendingCount > 0 && tab !== "optimization" && (
+            <button
+              type="button"
+              onClick={() => onTabChange("optimization")}
+              className="flex w-full items-center justify-between gap-2 rounded-md bg-accent-soft px-3 py-2 text-left text-meta text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring md:hidden [@media(hover:none)]:min-h-11"
+            >
+              <span>
+                有 {optimizerPendingCount > 99 ? "99+" : optimizerPendingCount} 项优化建议待确认
+              </span>
+              <span aria-hidden="true">→</span>
+            </button>
+          )}
         </div>
       }
       // 面板自带内距（PanelHeader px-4 + 正文 px-5），壳体不再叠一层。
@@ -151,13 +161,9 @@ export function ManageCenter({
           <>
             {tab === "memory" && (
               <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
+                {/* 工作项目作用域下的「项目资产」「智能体项目上下文预览」由 MemoryPanel 在
+                    「项目记忆」页签内渲染（改造前追加在整个面板之后、不随页签切换）。 */}
                 <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
-                {isWorkScope(scope) ? (
-                  <>
-                    <ProjectAssetsManagePanel auth={auth} />
-                    <AgentProjectPreview auth={auth} agentId={agentId} />
-                  </>
-                ) : null}
               </div>
             )}
             {tab === "skills" && (

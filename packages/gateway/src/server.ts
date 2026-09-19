@@ -1,3 +1,5 @@
+import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
+import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import {
   constants as fsConstants,
@@ -57,6 +59,9 @@ import {
   ZCODE_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   AGENT_MODEL_AUTO,
+  ADVISOR_AGENT_ID,
+  normalizeCollabMode,
+  collabConfigVersionOf,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
   AUTHORITY_TURN_MAX_LIFETIME_MS,
@@ -99,7 +104,10 @@ import {
 } from './errorClassify.js'
 import { parseCreditBudgetFen } from './creditExhaustion.js'
 import {
+  CONSULT_INVOCATION_HEADER,
   DELEGATE_CONTEXT_HEADER,
+  hashConsultTurnToken,
+  inspectConsultTurnToken,
   verifyDelegateContextToken,
 } from './delegateContext.js'
 import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
@@ -166,7 +174,8 @@ import {
   getMemoryUsageDashboard,
   recordMemoryUsageEvent,
   syncMarketplaceHub,
-  writeAgentsConfig,
+  updateAgentsConfig,
+  isMarketplacePersonaTarget,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -257,9 +266,40 @@ import {
   filterUserVisibleByAgentField,
   filterUserVisibleRoutesForManagement,
   isHiddenSystemAgentId,
+  isTeamReviewExecution,
   userVisibleDefaultAgentId,
 } from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
+import {
+  advisorPreamble,
+  advisorExecutionFromSnapshotJson,
+  buildAdvisorSnapshot,
+  collectAuthorizedArtifacts,
+  formatAdvisorConsultPrompt,
+  ADVISOR_CONSULT_PARENT_ENGINES,
+  ADVISOR_CONSULT_PARENT_REASON,
+  advisorConsultParentGate,
+  advisorCanonicalModelId,
+  assertAdvisorModelAllowed,
+  CCB_ADVISOR_PROFILE_VERSION,
+  coerceHistoryMessages,
+  historyFromSessionMessages,
+  isAdvisorConsultParentEngine,
+  isAdvisorEngineOpen,
+  isCcbAdvisorModelProven,
+  listProvenAdvisorModels,
+  matchConsultIdentity,
+  openAdvisorEngines,
+  parentAuthorizedArtifactTexts,
+  stripAdvisorPreambleFromInjected,
+  type AdvisorConsultExecution,
+} from './advisorMode.js'
+import { AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
+import {
+  AdvisorConfigStore,
+  CollaborationConfigError,
+  resolveSessionCollab,
+} from './advisorConfigStore.js'
 import type {
   GatewayEngineErrorEvent,
   GatewayStreamEvent,
@@ -402,6 +442,8 @@ import {
   DelegateJobStore,
   DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
   DELEGATE_LEASE_HEARTBEAT_MS,
+  DELEGATE_REAP_INTERVAL_MS,
+  resolveDelegateHeartbeatTimeoutMs,
   resolveDelegateJobTtlMs,
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
@@ -439,7 +481,10 @@ import {
   isJobTerminalFailure,
   parseParentEngine,
 } from './jobTerminal.js'
-import { openDelegateDurableDb } from './delegateDurable.js'
+import {
+  openDelegateDurableDb,
+  resolveDelegateLedgerRetentionMs,
+} from './delegateDurable.js'
 import {
   nextDelegateReconcileAt,
   reconcileDelegateJobsOnBoot,
@@ -476,6 +521,8 @@ import {
   type DelegateEngineBillingAdmission,
   type DelegateEngineBillingClient,
 } from './delegateEngineBilling.js'
+import { parseAdvisorAdmitRoute, type AdvisorAdmitRouteOk } from './advisorCodexRoute.js'
+import type { DelegateOwnerTurnLocator } from './delegateLateCompletion.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
@@ -498,7 +545,7 @@ import {
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
-import { matchBridgeApiAllowlist } from './bridgeApiAllowlist.js'
+import { matchBridgeApiAllowlist, parseTrustedCollabParentHeaders } from './bridgeApiAllowlist.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
@@ -510,6 +557,7 @@ import {
 } from './sessionRepoWorkspace.js'
 import {
   SessionManager,
+  isCommercialManagedRuntime,
   lookupRecentTerminal,
   parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
@@ -1930,6 +1978,7 @@ type DelegateGateBlock =
  *  review pass 直接构造)。把委派执行核心与 HTTP req/res 解耦,让编排能内部直调同一路径
  *  拿到结构化结果(verdict/output),不必伪造 req/res。 */
 interface RunDelegateInput {
+  allowSelf?: boolean
   targetAgentId: string
   goal: string
   context?: string
@@ -2322,6 +2371,93 @@ export function _pendingPermissionCatchupFrames(
     })
   }
   return frames
+}
+
+const PERMISSION_LOOKUP_MAX_IDS = 16
+
+export function parsePermissionLookupQuery(raw: string | null | undefined): string[] {
+  if (typeof raw !== 'string' || raw === '') return []
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const part of raw.split(',')) {
+    const id = part.trim()
+    if (id === '' || seen.has(id) || id.length > 200) continue
+    seen.add(id)
+    ids.push(id)
+    if (ids.length >= PERMISSION_LOOKUP_MAX_IDS) break
+  }
+  return ids
+}
+
+type RuntimePermissionSnapshotItem = {
+  requestId: string
+  clientMessageId: string | null
+  toolUseId: string | null
+  toolName: string
+  inputJson: Record<string, unknown>
+  status: 'pending'
+  behavior: null
+  reason: null
+  answers: null
+  expiresAt: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** SQLite / no-PG session GET: project still-answerable runtime pending entries.
+ *  Never forges responded/cancelled/expired — those require PG. Completeness is
+ *  therefore `unavailable` so the client will not treat absence as "all answered". */
+export function projectRuntimePermissionSnapshot(
+  pending: ReadonlyMap<string, PendingPermissionCatchupEntry>,
+  sessionId: string,
+  userId: string,
+  nowMs: number = Date.now(),
+): {
+  items: RuntimePermissionSnapshotItem[]
+  completeness: 'unavailable'
+  source: 'runtime'
+} {
+  const items: RuntimePermissionSnapshotItem[] = []
+  const userColon = `${userId}:`
+  const userPipe = `${userId}|`
+  for (const [requestId, entry] of pending) {
+    if (entry.peer?.id !== sessionId) continue
+    if (typeof entry.peerKey !== 'string' ||
+      !(entry.peerKey.startsWith(userColon) || entry.peerKey.startsWith(userPipe))) continue
+    if (!(typeof entry.expiresAt === 'number' && entry.expiresAt > nowMs)) continue
+    items.push({
+      requestId,
+      clientMessageId: entry.clientMessageId ?? null,
+      toolUseId: entry.toolUseId ?? null,
+      toolName: entry.toolName,
+      inputJson: entry.input,
+      status: 'pending',
+      behavior: null,
+      reason: null,
+      answers: null,
+      expiresAt: entry.expiresAt,
+      createdAt: nowMs,
+      updatedAt: nowMs,
+    })
+  }
+  return { items, completeness: 'unavailable', source: 'runtime' }
+}
+
+export function attachPermissionSnapshotIfMissing<T extends {
+  id: string
+  userId?: string
+  permissionPrompts?: unknown
+}>(
+  session: T,
+  pending: ReadonlyMap<string, PendingPermissionCatchupEntry>,
+  userId: string,
+  nowMs: number = Date.now(),
+): T {
+  if (session.permissionPrompts != null) return session
+  return {
+    ...session,
+    permissionPrompts: projectRuntimePermissionSnapshot(pending, session.id, userId, nowMs),
+  }
 }
 
 export class Gateway {
@@ -5602,28 +5738,34 @@ export class Gateway {
         // 400: storage treats them as a revision mismatch and returns a full
         // payload, which self-heals old clients without a coordinated cutover.
         const sinceHistoryRevision = _parseHistoryRevisionCursor(historyRevisionRaw)
+        const permissionLookupIds = parsePermissionLookupQuery(url.searchParams.get('permission_lookup'))
         const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
         if (useIncremental) {
           getClientSessionPartial(sessId, userId, sinceSeq, {
             view: 'timeline',
             sinceHistoryRevision,
+            ...(permissionLookupIds.length > 0 ? { permissionLookupIds } : {}),
           })
             .then((s) => {
               if (!s) {
                 this.sendJson(res, 404, { error: 'not found' })
                 return
               }
+              const stamped = attachPermissionSnapshotIfMissing(s, this._pendingPermissions, userId)
               this.sendJson(res, 200, {
-                ...s,
-                timelineCursor: s.timelineCursor
-                  ? encodeClientTimelineCursor(s.timelineCursor)
+                ...stamped,
+                timelineCursor: stamped.timelineCursor
+                  ? encodeClientTimelineCursor(stamped.timelineCursor)
                   : null,
               })
               this._preheatSessionOnOpen(sessId, userId, s)
             })
             .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         } else {
-          getClientSession(sessId, userId, { view: 'timeline' })
+          getClientSession(sessId, userId, {
+            view: 'timeline',
+            ...(permissionLookupIds.length > 0 ? { permissionLookupIds } : {}),
+          })
             .then((s) => {
               if (!s) {
                 this.sendJson(res, 404, { error: 'not found' })
@@ -5643,15 +5785,16 @@ export class Gateway {
               // 更早历史"入口与"还有 N 条"计数、以及 mergeFullServerWins 的水位保留判定。
               // 显式 stamp(不依赖 ...s 的 truthy/falsey,对齐 Codex review #6 语义)。
               const archivedCount = s.archivedCount ?? 0
+              const stamped = attachPermissionSnapshotIfMissing(s, this._pendingPermissions, userId)
               this.sendJson(res, 200, {
-                ...s,
+                ...stamped,
                 isPartial: false,
                 totalMessageCount: messages.length + archivedCount,
                 maxSeq: s.timelineSnapshotMaxSeq ?? maxSeq,
                 archivedCount,
                 archivedThroughSeq: s.archivedThroughSeq ?? 0,
-                timelineCursor: s.timelineCursor
-                  ? encodeClientTimelineCursor(s.timelineCursor)
+                timelineCursor: stamped.timelineCursor
+                  ? encodeClientTimelineCursor(stamped.timelineCursor)
                   : null,
               })
               this._preheatSessionOnOpen(sessId, userId, s)
@@ -5806,7 +5949,14 @@ export class Gateway {
       }
       if (req.method === 'DELETE') {
         deleteClientSession(sessId, userId)
-          .then(() => this.sendJson(res, 200, { ok: true }))
+          .then(async () => {
+            try {
+              await this.advisorConfigStore().deleteSession(sessId)
+            } catch {
+              /* config cleanup is best-effort; session row is already gone */
+            }
+            this.sendJson(res, 200, { ok: true })
+          })
           .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
         return
       }
@@ -6094,6 +6244,15 @@ export class Gateway {
     // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
     if (url.pathname === '/api/delegate/wait') {
       this.handleDelegateWait(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
+    // ── Advisor consult (dedicated; never /delegate) ──
+    if (url.pathname === '/api/agents/advisor/consult' && req.method === 'POST') {
+      this.handleConsultAdvisor(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
+    if (url.pathname === '/api/collaboration-config') {
+      this.handleCollaborationConfig(req, res, url).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Synchronous task delegation ──
@@ -8531,13 +8690,13 @@ export class Gateway {
         agents: view.agents,
         default: view.default,
         routes: view.routes,
+        identityCompat: await fetchIdentityCompatProjection(),
       })
       return
     }
     if (req.method === 'POST') {
       // 建 agent 是 mutation 面:必须读/写全量 config(不能用投影视图,否则写回
       // agents.yaml 会把隐藏系统 agent 一并删掉)。保留 id 拒绝仍用 predicate 看全量。
-      const cfg = await readAgentsConfig()
       const body = await this.readJsonBody<Partial<AgentDef>>(req)
       if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
@@ -8547,26 +8706,33 @@ export class Gateway {
         this.sendError(res, 403, 'agent id is reserved')
         return
       }
-      if (cfg.agents.find((a) => a.id === body.id)) {
-        this.sendError(res, 409, 'agent already exists')
-        return
+      const id = body.id
+      const identityProjection = await fetchIdentityCompatProjection()
+      if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id || profile.canonicalAgentId === id)) {
+        return this.sendJson(res, 409, { error: '此身份由已登记的兼容关系管理，不能新建为独立 Agent。', code: 'IDENTITY_COMPAT_MANAGED' })
       }
-      // Inherit provider/permissionMode/cwd from request or sensible defaults
-      const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
-      const agent: AgentDef = {
-        id: body.id,
-        model: body.model ?? this.deps.config.defaults.model,
-        persona: paths.agentClaudeMd(body.id),
-        permissionMode:
-          body.permissionMode ??
-          defaultAgent?.permissionMode ??
-          this.deps.config.defaults.permissionMode,
-        provider: body.provider ?? defaultAgent?.provider,
-        cwd: body.cwd ?? defaultAgent?.cwd,
-        toolsets: body.toolsets,
-      }
-      cfg.agents.push(agent)
-      await writeAgentsConfig(cfg)
+      const { config: cfg, result: agent } = await updateAgentsConfig((cfg) => {
+        if (cfg.agents.find((a) => a.id === id)) {
+          return null
+        }
+        // Inherit provider/permissionMode/cwd from request or sensible defaults
+        const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
+        const agent: AgentDef = {
+          id: id,
+          model: body.model ?? this.deps.config.defaults.model,
+          persona: paths.agentClaudeMd(id),
+          permissionMode:
+            body.permissionMode ??
+            defaultAgent?.permissionMode ??
+            this.deps.config.defaults.permissionMode,
+          provider: body.provider ?? defaultAgent?.provider,
+          cwd: body.cwd ?? defaultAgent?.cwd,
+          toolsets: body.toolsets,
+        }
+        cfg.agents.push(agent)
+        return agent
+      })
+      if (!agent) return this.sendError(res, 409, 'agent already exists')
       this.deps.agentsConfig = cfg
       await mkdir(paths.agentSessionsDir(body.id), { recursive: true })
       // Seed an empty persona file if missing
@@ -8590,43 +8756,53 @@ export class Gateway {
     id: string,
   ): Promise<void> {
     if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
-    const cfg = await readAgentsConfig()
-    const idx = cfg.agents.findIndex((a) => a.id === id)
-    if (idx < 0) return this.sendError(res, 404, 'agent not found')
-    const agent = cfg.agents[idx]
     if (req.method === 'GET') {
+      const cfg = await readAgentsConfig()
+      const agent = cfg.agents.find((a) => a.id === id)
+      if (!agent) return this.sendError(res, 404, 'agent not found')
       this.sendJson(res, 200, { agent })
       return
     }
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<Partial<AgentDef>>(req)
-      if (body.model !== undefined) agent.model = body.model
-      if (body.persona !== undefined) agent.persona = body.persona
-      if (body.cwd !== undefined) agent.cwd = body.cwd
-      if (body.permissionMode !== undefined) agent.permissionMode = body.permissionMode
-      if (body.displayName !== undefined) agent.displayName = body.displayName
-      if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
-      if (body.greeting !== undefined) agent.greeting = body.greeting
-      if (body.provider !== undefined) agent.provider = body.provider
-      if (body.toolsets !== undefined) agent.toolsets = body.toolsets
-      if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
-      cfg.agents[idx] = agent
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.router.reload(cfg)
-      this.sendJson(res, 200, { agent })
-      return
-    }
-    if (req.method === 'DELETE') {
-      if (cfg.default === id) {
-        this.sendError(res, 400, 'cannot delete default agent')
-        return
+    if (req.method === 'PUT' || req.method === 'DELETE') {
+      const identityProjection = await fetchIdentityCompatProjection()
+      if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id)) {
+        return this.sendJson(res, 409, { error: '此条目仅保留本实例运行手册；执行配置由关联市场 Agent 管理。', code: 'IDENTITY_COMPAT_MANAGED' })
       }
-      cfg.agents.splice(idx, 1)
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.router.reload(cfg)
-      this.sendJson(res, 200, { ok: true })
+      const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
+      const { config: cfg, result } = await updateAgentsConfig(async (cfg) => {
+        const idx = cfg.agents.findIndex((a) => a.id === id)
+        if (idx < 0) return { status: 404, body: { error: 'agent not found' } }
+        const agent = cfg.agents[idx]
+        // Provenance comes from the locked server state, never from the request.
+        if (agent.source === 'marketplace') return { status: 409, body: {
+          error: '此 Agent 由 AI 市场管理，请在市场源端修改或卸载。',
+          code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
+        } }
+        if (req.method === 'DELETE') {
+          if (cfg.default === id) return { status: 400, body: { error: 'cannot delete default agent' } }
+          cfg.agents.splice(idx, 1)
+          return { status: 200, body: { ok: true } }
+        }
+        if (body.persona !== undefined && await isMarketplacePersonaTarget(cfg, body.persona)) {
+          return { status: 409, body: { error: '人格文件由 AI 市场管理，不能作为本地编辑目标。', code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace' } }
+        }
+        if (body.model !== undefined) agent.model = body.model
+        if (body.persona !== undefined) agent.persona = body.persona
+        if (body.cwd !== undefined) agent.cwd = body.cwd
+        if (body.permissionMode !== undefined) agent.permissionMode = body.permissionMode
+        if (body.displayName !== undefined) agent.displayName = body.displayName
+        if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
+        if (body.greeting !== undefined) agent.greeting = body.greeting
+        if (body.provider !== undefined) agent.provider = body.provider
+        if (body.toolsets !== undefined) agent.toolsets = body.toolsets
+        if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
+        return { status: 200, body: { agent } }
+      })
+      if (result.status === 200) {
+        this.deps.agentsConfig = cfg
+        this.router.reload(cfg)
+      }
+      this.sendJson(res, result.status, result.body)
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -8655,9 +8831,22 @@ export class Gateway {
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<{ text?: string }>(req)
       const text = typeof body.text === 'string' ? body.text : ''
-      await mkdir(dirname(personaPath), { recursive: true })
-      await writeFile(personaPath, text, { mode: 0o600 })
-      this.sendJson(res, 200, { ok: true, path: personaPath })
+      const { result } = await updateAgentsConfig(async (current) => {
+        const currentAgent = current.agents.find((a) => a.id === id)
+        if (!currentAgent) return { status: 404, body: { error: 'agent not found' } }
+        if (currentAgent.source === 'marketplace') return { status: 409, body: {
+          error: '此 Agent 的人格由 AI 市场管理，请在市场源端修改。',
+          code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
+        } }
+        const currentPath = currentAgent.persona ?? paths.agentClaudeMd(id)
+        if (await isMarketplacePersonaTarget(current, currentPath)) {
+          return { status: 409, body: { error: '人格文件由 AI 市场管理，请在市场源端修改。', code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace' } }
+        }
+        await mkdir(dirname(currentPath), { recursive: true })
+        await writeFile(currentPath, text, { mode: 0o600 })
+        return { status: 200, body: { ok: true, path: currentPath } }
+      })
+      this.sendJson(res, result.status, result.body)
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -8904,7 +9093,8 @@ export class Gateway {
   ): Promise<void> {
     if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const store = buildAgentSkillStore(agentId)
+    const identity = await resolveRuntimeExecutionAgent({ id: agentId })
+    const store = buildAgentSkillStore(identity.agent.id, identity.context.assets ? { profile: identity.context.assets.profile } : undefined)
     // User-facing surface: never enumerate platform baseline/seed skills.
     const list = await store.list({ includePlatform: false })
     this.sendJson(res, 200, { skills: list })
@@ -8918,7 +9108,8 @@ export class Gateway {
     skillName: string,
   ): Promise<void> {
     if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    const store = buildAgentSkillStore(agentId)
+    const identity = await resolveRuntimeExecutionAgent({ id: agentId })
+    const store = buildAgentSkillStore(identity.agent.id, identity.context.assets ? { profile: identity.context.assets.profile } : undefined)
     if (req.method === 'GET') {
       // User-facing read: platform skills resolve to 404, never leak their body.
       const v = await store.view(skillName, undefined, { includePlatform: false })
@@ -10741,7 +10932,10 @@ export class Gateway {
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
-    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
+    const identityProjection = await fetchIdentityCompatProjection()
+    const targetIdentity = identityProjection ? resolveIdentityCompat(targetAgentId, identityProjection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
+    const targetAgent = cfg.agents.find((a) => a.id === (targetIdentity?.executionAgentId ?? targetAgentId))
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
     const sessionKey = `agent:${targetAgentId}:inter:dm:${sourceAgent || 'system'}`
@@ -10853,6 +11047,11 @@ export class Gateway {
   /** 2026-09-04 团队模式 — 委派 runId → 实际执行型号(有界 FIFO 512)。审查任务书据此给
    *  panel 成员标注视角型号;DurableAgentGroup 本身不带 model 字段,不改 wire 契约。 */
   private _delegateModelByRunId: Map<string, string> | undefined
+  /** OCV5-180 B1 — 委派 runId → 冻结的 exact owner locator(launch 时快照)。
+   *  完成收尾时按它判定:owner turn 未 seal → 内存缓冲随 owner tape;已 seal /
+   *  owner 会话不在内存 → 持久晚到 continuation。有界 FIFO 512,使用处惰性 ??=
+   *  (同 _delegateModelByRunId,prototype 脚手架兼容)。 */
+  private _delegateOwnerByRunId: Map<string, DelegateOwnerTurnLocator> | undefined
   /** hidden 审查员串行委派熔断(见 PerTurnDelegationGuard 注释)。gateway 是容器内
    *  单进程,内存计数即权威。 */
   private _hiddenDelegateGuard = new PerTurnDelegationGuard()
@@ -10865,6 +11064,9 @@ export class Gateway {
    *  (_interruptDelegationsForParent)对"还没 spawn、只在排队"的委派经此打断。
    *  测试脚手架 Object.create(Gateway.prototype) 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateQueueWaiters: Map<string, () => void> | undefined
+  /** Advisor consult AbortController keyed by child session. Stop during
+   *  getOrCreate/submit must prevent a later submit on the aborted child. */
+  private _advisorConsultAborts: Map<string, AbortController> | undefined
   /** 排队复查间隔;测试覆写加速,生产走 DELEGATE_QUEUE_POLL_DEFAULT_MS。 */
   private _delegateQueuePollMs: number | undefined
   /** SM queue wait clock; tests inject a fake monotonic source. */
@@ -10872,6 +11074,13 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  private _advisorConsults: AdvisorConsultStore | undefined
+  private _consultBillingHookBound: boolean | undefined
+  private _consultBillingProjecting: boolean | undefined
+  private _consultBillingRetryTimer: ReturnType<typeof setTimeout> | undefined
+  private _consultBillingRetryMs: number | undefined
+  private _advisorConsultWaitMs: number | undefined
+  private _advisorConfig: AdvisorConfigStore | undefined
   /** Test seam for engine-reported delegate admit/settle/abandon. */
   private _delegateEngineBilling: DelegateEngineBillingClient | undefined
   /** Test seam: grok relay route mint(默认 grok-build 优先 → mint 失败回落 glm 的用例注入)。 */
@@ -10882,6 +11091,8 @@ export class Gateway {
   private _delegateReconcileReady = false
   private _delegateDurablePath: string | undefined
   private _delegateReconcileTimer: ReturnType<typeof setTimeout> | undefined
+  /** OCV5-164 heartbeat-timeout reaper + ledger retention janitor. */
+  private _delegateReapTimer: ReturnType<typeof setInterval> | undefined
   private _notifyRetryTimer: ReturnType<typeof setTimeout> | undefined
   private _engineNotifier: DefaultEngineNotifier | undefined
   /** R2 session-level inflight projection. Lazy; flag-off never opens the db. */
@@ -10919,6 +11130,7 @@ export class Gateway {
       const filled = backfillCronOccurrenceDelegateJobs(store)
       if (filled > 0) this.log.info('cron occurrence delegateJobId backfill', { filled })
       this._armDelegateReconcileFollowup(store, queueWaitMs)
+      this._armDelegateReaper(store)
       this._delegateReconcileReady = true
       if (isDelegateNotifierEffective()) {
         void this._retryDelegateNotifies().finally(() => this._armNotifyRetryScheduler())
@@ -11053,6 +11265,72 @@ export class Gateway {
       this._armDelegateReconcileFollowup(this._delegateJobs, queueWaitMs)
     }, delay)
     this._delegateReconcileTimer.unref()
+  }
+
+  /**
+   * OCV5-164: periodic heartbeat-timeout reaper + ledger retention janitor.
+   *
+   * The boot reconciler only judges `owner_lease_until`, and it defers
+   * indefinitely while the parent session still holds a runner object — so a
+   * row that stopped making progress never reaches a terminal state and keeps
+   * occupying delegate capacity. This interval closes that hole using
+   * `last_activity_at`, then interrupts the child so the ledger and the
+   * subprocess agree.
+   *
+   * Scope note: for `kind=delegate` the interrupt also unwinds
+   * `_runDelegateTaskCore`, whose `finally` releases the Grok relay lease.
+   * `kind=cron` never mints such a lease, so reaping a cron row frees delegate
+   * capacity — not a Grok slot.
+   *
+   * Fencing: `reapStaleRunning` skips rows a *live* other instance owns, so
+   * running two masters cannot double-reap; retention pruning is idempotent.
+   */
+  private _armDelegateReaper(store: DelegateJobStore): void {
+    if (this._delegateReapTimer) return
+    const timeoutMs = resolveDelegateHeartbeatTimeoutMs()
+    const retentionMs = resolveDelegateLedgerRetentionMs()
+    const tick = () => {
+      try {
+        for (const { job, idleSec } of store.reapStaleRunning({ timeoutMs })) {
+          // Settling the ledger row does not stop the child. Interrupt it here
+          // (the same closeout the delegate lease path performs when
+          // casHeartbeat fails), otherwise the row reads `failed` while the
+          // subprocess keeps running and, for cron-origin-inject, the origin
+          // has already been told the job failed.
+          let interrupted = false
+          if (job.sessionKey) {
+            try {
+              interrupted = this.sessions.interrupt(job.sessionKey) === true
+            } catch (err) {
+              this.log.warn(
+                'delegate_heartbeat_timeout_interrupt_failed',
+                { jobId: job.id, sessionKey: job.sessionKey },
+                err as Error,
+              )
+            }
+          }
+          this.log.warn('delegate_heartbeat_timeout_reaped', {
+            jobId: job.id,
+            kind: job.kind,
+            agentId: job.agentId,
+            sessionKey: job.sessionKey,
+            idleSec,
+            failureClass: job.failureClass,
+            interrupted,
+          })
+        }
+      } catch (err) {
+        this.log.warn('delegate heartbeat reaper failed', {}, err as Error)
+      }
+      try {
+        const pruned = store.pruneRetiredLedger({ retentionMs })
+        if (pruned > 0) this.log.info('delegate ledger pruned', { pruned, retentionMs })
+      } catch (err) {
+        this.log.warn('delegate ledger prune failed', {}, err as Error)
+      }
+    }
+    this._delegateReapTimer = setInterval(tick, DELEGATE_REAP_INTERVAL_MS)
+    this._delegateReapTimer.unref?.()
   }
 
   private _delegateRunnerIdle(job: DelegateJobSnapshot): boolean {
@@ -11623,9 +11901,15 @@ export class Gateway {
     parentSessionKey?: unknown
     sourceAgent?: unknown
   }): DelegateProgressRouting | null {
+    const parent = typeof args.parentSessionKey === 'string' ? this.sessions.getByKey(args.parentSessionKey) : undefined
+    const profile = parent?._identityCompat?.assets?.profile
+    if (profile && parent?.userId && process.env.OC_USER_ID && parent.userId !== process.env.OC_USER_ID) return null
+    const sourceAgent = profile && parent?.agentId === profile.canonicalAgentId &&
+      typeof args.sourceAgent === 'string' && [profile.legacyAgentId, profile.canonicalAgentId].includes(args.sourceAgent)
+      ? profile.canonicalAgentId : args.sourceAgent
     return resolveDelegateProgressRouting({
       parentSessionKey: args.parentSessionKey,
-      sourceAgent: args.sourceAgent,
+      sourceAgent,
       maxDepth: 5,
       getSession: (key) => {
         const s = this.sessions.getByKey(key)
@@ -11657,7 +11941,8 @@ export class Gateway {
     const parent = this.sessions.getByKey(args.parentSessionKey)
     if (!parent) return null
     if (parent.channel !== 'webchat' && parent.channel !== 'delegate') return null
-    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent) {
+    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent &&
+      !(parent._identityCompat?.assets && [parent._identityCompat.assets.profile.legacyAgentId, parent._identityCompat.assets.profile.canonicalAgentId].includes(args.sourceAgent) && parent.agentId === parent._identityCompat.assets.profile.canonicalAgentId)) {
       return null
     }
     return {
@@ -11752,14 +12037,17 @@ export class Gateway {
     for (const childSessionKey of [...childSessionKeys]) {
       attempted++
       const descendantInterrupted = this._interruptDelegationsForParent(childSessionKey, visited)
+      this._advisorConsultAborts?.get(childSessionKey)?.abort()
       // 还在资源闸排队等待的委派(尚未 spawn,session 不存在):唤醒并中止其等待,
       // 否则 Stop 级联对它不可达,要干等到排队超时。
       const abortQueuedWait = this._delegateQueueWaiters?.get(childSessionKey)
       if (abortQueuedWait) {
         abortQueuedWait()
-        childSessionKeys.delete(childSessionKey)
         interrupted = true
-        continue
+        if (!this.sessions.getByKey(childSessionKey)) {
+          childSessionKeys.delete(childSessionKey)
+          continue
+        }
       }
       if (!this.sessions.getByKey(childSessionKey)) {
         childSessionKeys.delete(childSessionKey)
@@ -11775,6 +12063,1634 @@ export class Gateway {
       ok: interrupted,
     })
     return interrupted
+  }
+
+  private advisorConsultStore(): AdvisorConsultStore {
+    const store = (this._advisorConsults ??= new AdvisorConsultStore())
+    const billing = this._delegateEngineBilling ?? defaultDelegateEngineBilling
+    this._ensureConsultBillingProjection(store, billing)
+    return store
+  }
+
+  private _ensureConsultBillingProjection(
+    store: AdvisorConsultStore,
+    billing: typeof defaultDelegateEngineBilling,
+  ): void {
+    if (this._consultBillingProjecting) return
+    this._consultBillingProjecting = true
+    const retryMsRaw = Number(this._consultBillingRetryMs)
+    const retryMs = Number.isFinite(retryMsRaw) && retryMsRaw > 0 ? retryMsRaw : 250
+    void Promise.resolve(billing.projectConsults?.(store))
+      .catch((err) => {
+        this.log.warn('advisor_consult_billing_projection_failed', {
+          err: String((err as Error)?.message ?? err),
+        })
+        if (this._consultBillingRetryTimer) return
+        this._consultBillingRetryTimer = setTimeout(() => {
+          this._consultBillingRetryTimer = undefined
+          this._consultBillingProjecting = false
+          this._ensureConsultBillingProjection(store, billing)
+        }, retryMs)
+        this._consultBillingRetryTimer.unref?.()
+      })
+      .finally(() => {
+        this._consultBillingProjecting = false
+      })
+  }
+
+  private advisorConfigStore(): AdvisorConfigStore {
+    return (this._advisorConfig ??= new AdvisorConfigStore())
+  }
+
+  private _liveMainSessionForClient(sessionId: string, userId: string): AgentSession | undefined {
+    const live = this.sessions.getByKey(`agent:main:webchat:dm:${sessionId}`)
+    if (!live || live.agentId !== 'main') return undefined
+    if (String(live.userId ?? '') !== String(userId)) return undefined
+    return live
+  }
+
+  private async _catalogEngineForModel(modelId: string | undefined): Promise<string | undefined> {
+    if (!modelId) return undefined
+    try {
+      const view = await getLocalCatalogView()
+      const canonical = view.canonicalize(modelId)
+      return view.models.find((row) => row.modelId === canonical || row.modelId === modelId)?.engine
+    } catch {
+      return undefined
+    }
+  }
+
+  private async _loadClientSession(sessionId: string, userId: string) {
+    return getClientSession(sessionId, userId)
+  }
+
+  private async _parentEngineForCollabSession(input: {
+    sessionId: string
+    userId: string
+    req: IncomingMessage
+    url: URL
+  }): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
+    const bridgeVerified = this.checkBridgeBypass(input.req, input.url)
+    if (bridgeVerified) {
+      const trusted = parseTrustedCollabParentHeaders(input.req.headers as Record<string, unknown>)
+      if (!trusted || trusted.sessionId !== input.sessionId) return { missing: true }
+      const fromCatalog = await this._catalogEngineForModel(trusted.modelId)
+      return { missing: false, agentId: trusted.agentId, engine: fromCatalog }
+    }
+    const live = this._liveMainSessionForClient(input.sessionId, input.userId)
+    let stored: { agentId?: string; modelId?: string } | null | undefined
+    try {
+      stored = await this._loadClientSession(input.sessionId, input.userId)
+    } catch {
+      stored = undefined
+    }
+    if (!stored && !live) return { missing: true }
+    const agentId = stored?.agentId || live?.agentId
+    if (agentId !== 'main') {
+      return { missing: false, agentId, engine: undefined }
+    }
+    const storedModel = typeof stored?.modelId === 'string' ? stored.modelId.trim() : ''
+    const modelId = storedModel || (typeof live?.model === 'string' ? live.model : undefined)
+    const fromCatalog = await this._catalogEngineForModel(modelId)
+    const engine = fromCatalog || (!storedModel ? live?.providerTag : undefined) || undefined
+    return { missing: false, agentId, engine }
+  }
+
+  private _projectAdvisorConsultSettled(billing: { requestId?: string }): void {
+    const requestId = typeof billing.requestId === 'string' ? billing.requestId : ''
+    if (!requestId || !this._advisorConsults) return
+    this._advisorConsults.projectOneReceipt(requestId)
+  }
+
+  private _collaborationCapabilityFields(input: {
+    sessionId?: string
+    engine?: string
+  }): Record<string, unknown> {
+    const gate = advisorConsultParentGate(input.engine)
+    return {
+      advisorConsultParents: [...ADVISOR_CONSULT_PARENT_ENGINES],
+      advisorConsultParentReason: ADVISOR_CONSULT_PARENT_REASON,
+      ...(input.engine ? { parentEngine: input.engine } : {}),
+      ...(input.sessionId
+        ? { advisorConsultAllowed: gate.allowed }
+        : {}),
+    }
+  }
+
+  private _consultWaitMs(): number {
+    const raw = Number(this._advisorConsultWaitMs)
+    return Number.isFinite(raw) && raw > 0 ? raw : 30_000
+  }
+
+  private _adviceFromConsult(record: {
+    advice?: string | null
+    jobId?: string | null
+  }): string {
+    if (typeof record.advice === 'string' && record.advice) return record.advice
+    if (!record.jobId) return ''
+    const view = this._ensureDelegateJobStore().get(record.jobId)
+    const body = view.status === 'done' || view.status === 'failed' ? view.body : undefined
+    return typeof body?.advice === 'string' ? body.advice : ''
+  }
+
+  private _consultJobFailedState(view: {
+    status: string
+    state?: string
+    failure_class?: string
+    httpStatus?: number
+  }): 'failed' | 'cancelled' | null {
+    if (view.status === 'expired') return 'failed'
+    if (view.status === 'failed') {
+      return view.state === 'cancelled' || view.failure_class === 'cancelled' ? 'cancelled' : 'failed'
+    }
+    if (view.status === 'done' && (view.failure_class || (typeof view.httpStatus === 'number' && view.httpStatus >= 400))) {
+      return view.failure_class === 'cancelled' ? 'cancelled' : 'failed'
+    }
+    return null
+  }
+
+  private _advisorSessionKey(record: { originTurnKey: string; consultId: string }): string {
+    return `advisor:${record.originTurnKey}:${record.consultId}`
+  }
+
+  private _consultStillLive(record: { originTurnKey: string; consultId: string; jobId?: string | null }): boolean {
+    const key = this._advisorSessionKey(record)
+    if (this._advisorConsultAborts?.has(key)) return true
+    const children = this._activeDelegationsByParent
+    if (children) {
+      for (const set of children.values()) {
+        if (set.has(key)) return true
+      }
+    }
+    const view = record.jobId && this._delegateJobs ? this._delegateJobs.get(record.jobId) : undefined
+    return view?.status === 'running' || view?.status === 'queued'
+  }
+
+  private _closeStaleConsult(
+    record: import('./advisorConsultStore.js').AdvisorConsultRecord,
+  ): import('./advisorConsultStore.js').AdvisorConsultRecord {
+    const terminal = new Set(['settled', 'settle_pending', 'completed', 'failed', 'cancelled', 'admission_unknown'])
+    if (terminal.has(record.state)) return record
+    if (this._consultStillLive(record)) return record
+    const jobs = this._delegateJobs
+    const view = record.jobId && jobs ? jobs.get(record.jobId) : undefined
+    if (view && (view.status === 'running' || view.status === 'queued')) return record
+    const advice = this._adviceFromConsult(record)
+    const ccb = advisorExecutionFromSnapshotJson(record.snapshotJson)?.engine === 'ccb'
+    if (ccb) {
+      const failed = view ? this._consultJobFailedState(view) : 'failed'
+      const state = failed ?? 'failed'
+      return this.advisorConsultStore().update(record.consultId, { state, advice: advice || null })
+    }
+    if (view?.status === 'done' && !this._consultJobFailedState(view) && advice) {
+      return this.advisorConsultStore().update(record.consultId, { state: 'settled', advice })
+    }
+    const failed = view ? this._consultJobFailedState(view) : 'failed'
+    const state = failed ?? 'failed'
+    return this.advisorConsultStore().update(record.consultId, { state, advice: advice || null })
+  }
+
+  private _presentConsultBody(
+    current: import('./advisorConsultStore.js').AdvisorConsultRecord,
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    const advice = this._adviceFromConsult(current)
+    const ccb = advisorExecutionFromSnapshotJson(current.snapshotJson)?.engine === 'ccb'
+    return {
+      status: current.state,
+      consultId: current.consultId,
+      jobId: current.jobId,
+      requestId: current.billingRequestId,
+      invocationId: current.invocationId,
+      advisorModel: current.advisorModel,
+      advice: advice || undefined,
+      reused: true,
+      recoverable: true,
+      ...(current.state === 'completed' || ccb ? { billingMode: 'proxy' } : {}),
+      error:
+        current.state === 'failed' || current.state === 'cancelled'
+          ? current.state
+          : current.state === 'settle_pending'
+            ? 'settle_pending'
+            : undefined,
+      ...extra,
+    }
+  }
+
+  private async _presentExistingConsult(input: {
+    record: import('./advisorConsultStore.js').AdvisorConsultRecord
+    question: string
+    concern: string
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    const { record } = input
+    if (!matchConsultIdentity(record, { question: input.question, concern: input.concern })) {
+      return { status: 409, body: { error: 'invocation 与 question/concern 不一致' } }
+    }
+    if (record.state === 'admission_unknown') {
+      return {
+        status: 503,
+        body: {
+          error: '顾问准入不确定，不重复 admit',
+          consultId: record.consultId,
+          state: 'admission_unknown',
+          reused: true,
+        },
+      }
+    }
+    const terminal = new Set(['settled', 'settle_pending', 'completed', 'failed', 'cancelled'])
+    const ccbConsult = advisorExecutionFromSnapshotJson(record.snapshotJson)?.engine === 'ccb'
+    const deadline = Date.now() + this._consultWaitMs()
+    let current = record
+    while (Date.now() <= deadline) {
+      current = this.advisorConsultStore().findById(current.consultId) ?? current
+      const advice = this._adviceFromConsult(current)
+      if (terminal.has(current.state) || (advice && !ccbConsult)) {
+        return { status: 200, body: this._presentConsultBody(current) }
+      }
+      if (current.jobId) {
+        const jobs = this._ensureDelegateJobStore()
+        const view = await jobs.wait(current.jobId, Math.min(5_000, Math.max(0, deadline - Date.now())))
+        current = this.advisorConsultStore().findById(current.consultId) ?? current
+        const failed = this._consultJobFailedState(view)
+        if (failed) {
+          current = this.advisorConsultStore().update(current.consultId, {
+            state: failed,
+            advice: this._adviceFromConsult(current) || null,
+          })
+          return { status: 200, body: this._presentConsultBody(current) }
+        }
+        const waitedAdvice =
+          this._adviceFromConsult(current) ||
+          ((view.status === 'done' || view.status === 'failed') && typeof view.body?.advice === 'string'
+            ? view.body.advice
+            : '')
+        if (waitedAdvice || terminal.has(current.state)) {
+          if (waitedAdvice && !terminal.has(current.state) && !ccbConsult) {
+            current = this.advisorConsultStore().update(current.consultId, {
+              state: 'settled',
+              advice: waitedAdvice,
+            })
+          }
+          return { status: 200, body: this._presentConsultBody(current, { advice: waitedAdvice || undefined }) }
+        }
+        if (view.status === 'expired') {
+          current = this._closeStaleConsult(current)
+          if (terminal.has(current.state)) {
+            return { status: 200, body: this._presentConsultBody(current) }
+          }
+        }
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+    }
+    current = this.advisorConsultStore().findById(record.consultId) ?? record
+    if (terminal.has(current.state) || (this._adviceFromConsult(current) && !ccbConsult)) {
+      return { status: 200, body: this._presentConsultBody(current) }
+    }
+    if (!this._consultStillLive(current)) {
+      current = this._closeStaleConsult(current)
+      if (terminal.has(current.state) || (this._adviceFromConsult(current) && !ccbConsult)) {
+        return { status: 200, body: this._presentConsultBody(current) }
+      }
+    }
+    return {
+      status: 202,
+      body: {
+        status: 'pending',
+        consultId: current.consultId,
+        jobId: current.jobId,
+        requestId: current.billingRequestId,
+        invocationId: current.invocationId,
+        reused: true,
+        recoverable: true,
+      },
+    }
+  }
+
+  private async _freezeAdvisorTurn(
+    requested: string,
+  ): Promise<{ ok: true; advisorModel: string } | { ok: false; error: string }> {
+    try {
+      const collabDoc = this.advisorConfigStore().read()
+      const proven = [...openAdvisorEngines(), ...(collabDoc.provenEngines ?? [])]
+      const view = await getLocalCatalogView()
+      const listed = listProvenAdvisorModels({
+        catalog: view.models,
+        provenEngines: proven,
+        provenCcbModels: collabDoc.provenCcbModels,
+      })
+      const allowed = assertAdvisorModelAllowed({
+        requested,
+        advisorModels: listed.advisorModels,
+        unavailableReason: listed.advisorUnavailableReason,
+      })
+      if (!allowed.ok) return allowed
+      return { ok: true, advisorModel: allowed.model }
+    } catch (err) {
+      return {
+        ok: false,
+        error: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
+      }
+    }
+  }
+
+  private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!isEngineLocalTurnExempt()) return this.sendError(res, 404, 'advisor consult is selfhost only')
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: { question?: unknown; concern?: unknown }
+    try {
+      parsed = JSON.parse(body) as { question?: unknown; concern?: unknown }
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const question = typeof parsed.question === 'string' ? parsed.question.trim() : ''
+    const concern = typeof parsed.concern === 'string' ? parsed.concern.trim() : ''
+    if (!question) return this.sendError(res, 400, 'question 必填')
+    const contextRaw = req.headers[DELEGATE_CONTEXT_HEADER]
+    const token = Array.isArray(contextRaw) ? contextRaw[0] : contextRaw
+    const inspected = inspectConsultTurnToken(typeof token === 'string' ? token : undefined)
+    if (!inspected) {
+      return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+    }
+    const claims = inspected.claims
+    const invocationRaw = req.headers[CONSULT_INVOCATION_HEADER]
+    const invocationId = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim()
+    if (!invocationId || !/^[A-Za-z0-9:_-]{8,128}$/.test(invocationId)) {
+      return this.sendError(res, 400, 'x-openclaude-consult-invocation required')
+    }
+    const userId = String(this.getUserId(req) ?? '')
+    if (!userId) return this.sendError(res, 401, 'missing user')
+    const store = this.advisorConsultStore()
+    const existing = store.findByInvocation({
+      userId,
+      originTurnKey: claims.turnKey,
+      invocationId,
+    })
+    if (existing) {
+      if (existing.sessionKey !== claims.sessionKey || existing.configVersion !== claims.configVersion) {
+        return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+      }
+      const presentedReceipt = hashConsultTurnToken(String(token))
+      const storedReceipt = typeof existing.tokenReceipt === 'string' ? existing.tokenReceipt.trim() : ''
+      const receiptMatches = storedReceipt.length > 0 && storedReceipt === presentedReceipt
+      // HMAC-ok: live process may present a same-user row. If a receipt was
+      // recorded, it must still be the exact original token hash (no remint).
+      // HMAC-fail: only the exact stored receipt recovers; no-receipt rows 401.
+      if (inspected.hmacOk) {
+        if (storedReceipt && !receiptMatches) {
+          return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+        }
+      } else if (!receiptMatches) {
+        return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+      }
+      const presented = await this._presentExistingConsult({ record: existing, question, concern })
+      return this.sendJson(res, presented.status, presented.body)
+    }
+    if (!inspected.hmacOk) {
+      return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
+    }
+    const parent = this.sessions?.getByKey(claims.sessionKey)
+    if (!parent || parent.agentId !== 'main' || parent._collabModeTurn !== 'advisor' || !parent._advisorTurn) {
+      return this.sendError(res, 409, '当前回合不是顾问模式，无法咨询')
+    }
+    if (!isAdvisorConsultParentEngine(parent.providerTag)) {
+      return this.sendError(res, 409, ADVISOR_CONSULT_PARENT_REASON)
+    }
+    if (parent._currentTurnKey !== claims.turnKey) {
+      return this.sendError(res, 409, '原回合已结束，不能再发起新的顾问咨询')
+    }
+    if (String(parent.userId ?? '') && String(parent.userId) !== userId) {
+      return this.sendError(res, 401, 'missing user')
+    }
+    const snap = parent.runner.getPartialSnapshot()
+    const currentTools = snap.completedTools?.map((tool) => ({
+      name: tool.toolName,
+      input: tool.inputJson,
+      result: typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output ?? ''),
+      completed: tool.completed !== false,
+    }))
+    const frozen = {
+      userId,
+      sessionKey: claims.sessionKey,
+      originTurnKey: claims.turnKey,
+      originTurnIndex: claims.turnIndex,
+      configVersion: claims.configVersion,
+      advisorModel: parent._advisorTurn.advisorModel,
+      userTask: parent._currentTurnUserText ?? '',
+      constraints: parent._injectedTurnConstraints,
+      currentTools,
+      peerId: parent.peerId,
+    }
+    const consultId = mintConsultId()
+    const advisorSessionKey = `advisor:${frozen.originTurnKey}:${consultId}`
+    const abort = new AbortController()
+    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
+    const unregisterEarly = this._registerActiveDelegation(frozen.sessionKey, advisorSessionKey)
+    const originIntact = (): boolean => {
+      if (abort.signal.aborted) return false
+      const live = this.sessions?.getByKey(frozen.sessionKey)
+      if (!live) return false
+      if (live._currentTurnKey !== frozen.originTurnKey) return false
+      if (live._collabModeTurn !== 'advisor') return false
+      return true
+    }
+    const releaseEarly = (): void => {
+      this._advisorConsultAborts?.delete(advisorSessionKey)
+      unregisterEarly?.()
+    }
+    let handedToSpawn = false
+    let recordedConsultId: string | undefined
+    try {
+    let historyRecords: ReturnType<typeof historyFromSessionMessages>['records']
+    let historyMissing: string[] = []
+    try {
+      const page = await this._loadConsultHistoryTape(frozen.peerId, frozen.userId, frozen.originTurnKey)
+      if (page?.records) {
+        const hist = historyFromSessionMessages(page.records, { hasMore: page.nextCursor != null })
+        historyRecords = hist.records
+        historyMissing = hist.missing
+      }
+    } catch {
+      /* sqlite stub returns null; PG errors fall through to client session */
+    }
+    if (!historyRecords) {
+      try {
+        const tape = await this._loadClientSession(frozen.peerId, frozen.userId)
+        const hist = historyFromSessionMessages(coerceHistoryMessages(tape?.messages), {
+          archivedThroughSeq: tape?.archivedThroughSeq,
+          hasMore: tape?.timelineHasMore,
+        })
+        historyRecords = hist.records
+        historyMissing = [...historyMissing, ...hist.missing]
+      } catch {
+        historyMissing = ['history_tape']
+      }
+    }
+    if (!originIntact()) {
+      releaseEarly()
+      return this.sendJson(res, 409, {
+        error: abort.signal.aborted ? 'parent Stop' : '原回合已结束，不能再发起新的顾问咨询',
+        state: 'cancelled',
+      })
+    }
+    const snapshot = buildAdvisorSnapshot({
+      question,
+      concern,
+      advisorModel: frozen.advisorModel,
+      source: {
+        userTask: frozen.userTask,
+        injectedConstraints: frozen.constraints,
+        historyRecords,
+        currentTools: frozen.currentTools,
+        authorizedArtifacts: collectAuthorizedArtifacts({
+          generatedRoot: paths.generatedDir,
+          mentioned: parentAuthorizedArtifactTexts({
+            userTask: frozen.userTask,
+            currentTools: frozen.currentTools,
+          }),
+        }),
+      },
+    })
+    for (const item of historyMissing) {
+      if (!snapshot.missing.includes(item)) snapshot.missing.push(item)
+    }
+    const snapshotJson = JSON.stringify(snapshot)
+    const inserted = store.insertNew({
+      consultId,
+      invocationId,
+      userId: frozen.userId,
+      sessionKey: frozen.sessionKey,
+      clientSessionId: frozen.peerId,
+      originTurnKey: frozen.originTurnKey,
+      originTurnIndex: frozen.originTurnIndex,
+      configVersion: frozen.configVersion,
+      evidenceVersion: hashEvidence(snapshotJson),
+      advisorModel: frozen.advisorModel,
+      question,
+      concern,
+      snapshotJson,
+      jobId: null,
+      billingRequestId: null,
+      state: 'accepted',
+      tokenReceipt: hashConsultTurnToken(String(token)),
+    })
+    recordedConsultId = inserted.record.consultId
+    if (inserted.reused) {
+      releaseEarly()
+      const presented = await this._presentExistingConsult({
+        record: inserted.record,
+        question,
+        concern,
+      })
+      return this.sendJson(res, presented.status, presented.body)
+    }
+    const resolvedExec = await this._resolveAdvisorConsultExecution(frozen.advisorModel)
+    if (!resolvedExec.ok) {
+      releaseEarly()
+      store.update(inserted.record.consultId, { state: 'failed' })
+      return this.sendJson(res, resolvedExec.status, {
+        error: resolvedExec.error,
+        consultId: inserted.record.consultId,
+      })
+    }
+    snapshot.execution = resolvedExec.value
+    store.update(inserted.record.consultId, { snapshotJson: JSON.stringify(snapshot) })
+    if (resolvedExec.value.engine === 'ccb') {
+      if (!originIntact()) {
+        releaseEarly()
+        store.update(inserted.record.consultId, { state: 'cancelled' })
+        return this.sendJson(res, 409, { error: 'parent Stop', state: 'cancelled', consultId })
+      }
+      handedToSpawn = true
+      const spawned = await this._spawnCcbAdvisorConsult({
+        consultId: inserted.record.consultId,
+        parent,
+        originTurnKey: frozen.originTurnKey,
+        snapshot,
+        execution: resolvedExec.value,
+        abort,
+        unregister: unregisterEarly,
+      })
+      return this.sendJson(res, 200, {
+        status: spawned.state,
+        consultId: inserted.record.consultId,
+        jobId: spawned.jobId,
+        advice: spawned.advice,
+        advisorModel: frozen.advisorModel,
+        billingMode: 'proxy',
+        missing: snapshot.missing,
+        truncated: snapshot.truncated,
+        error: spawned.error,
+      })
+    }
+    const proven = this.advisorConfigStore().read().provenEngines
+    if (!isAdvisorEngineOpen('codex', process.env, proven)) {
+      releaseEarly()
+      store.update(inserted.record.consultId, { state: 'failed' })
+      return this.sendJson(res, 503, {
+        error: '顾问引擎尚未完成无工具证明，不能咨询',
+        consultId: inserted.record.consultId,
+      })
+    }
+    if (!originIntact()) {
+      releaseEarly()
+      store.update(inserted.record.consultId, { state: 'cancelled' })
+      return this.sendJson(res, 409, { error: 'parent Stop', state: 'cancelled', consultId })
+    }
+    store.update(inserted.record.consultId, { state: 'admission_attempt' })
+    const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
+    let admission: DelegateEngineBillingAdmission
+    try {
+      admission = await billingApi.admit({
+        model: frozen.advisorModel,
+        engine: 'codex',
+        agentId: ADVISOR_AGENT_ID,
+        delegateAgentId: ADVISOR_AGENT_ID,
+        sessionKey: advisorSessionKey,
+        parentSessionId: frozen.peerId,
+        parentTurnKey: frozen.originTurnKey,
+      })
+    } catch (err) {
+      releaseEarly()
+      store.update(inserted.record.consultId, { state: 'admission_unknown' })
+      return this.sendJson(res, 503, {
+        error: `顾问准入不确定，不重复 admit: ${String((err as Error)?.message ?? err)}`,
+        consultId: inserted.record.consultId,
+        state: 'admission_unknown',
+      })
+    }
+    if (!originIntact()) {
+      try {
+        await billingApi.abandon(admission.requestId)
+        store.update(inserted.record.consultId, {
+          state: 'cancelled',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 409, {
+          error: 'parent Stop',
+          state: 'cancelled',
+          consultId: inserted.record.consultId,
+          requestId: admission.requestId,
+        })
+      } catch {
+        store.update(inserted.record.consultId, {
+          state: 'admission_unknown',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 503, {
+          error: '已准入但父回合已停止，abandon 不确定',
+          consultId: inserted.record.consultId,
+          state: 'admission_unknown',
+          requestId: admission.requestId,
+        })
+      }
+    }
+    const parsedRoute = parseAdvisorAdmitRoute(admission.route)
+    const codexRoute = parsedRoute.ok
+      ? this._advisorConsultRouteOverride(parsedRoute.route, frozen.advisorModel)
+      : null
+    if (!codexRoute) {
+      try {
+        await billingApi.abandon(admission.requestId)
+        store.update(inserted.record.consultId, {
+          state: 'failed',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 503, {
+          error: '顾问路由不可用，已按原 requestId abandon',
+          consultId: inserted.record.consultId,
+          state: 'failed',
+          requestId: admission.requestId,
+        })
+      } catch {
+        store.update(inserted.record.consultId, {
+          state: 'admission_unknown',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 503, {
+          error: '已准入但顾问路由不可用，abandon 不确定',
+          consultId: inserted.record.consultId,
+          state: 'admission_unknown',
+          requestId: admission.requestId,
+        })
+      }
+    }
+    try {
+      store.update(inserted.record.consultId, {
+        state: 'admitted',
+        billingRequestId: admission.requestId,
+      })
+    } catch (err) {
+      try {
+        await billingApi.abandon(admission.requestId)
+      } catch {
+        store.update(inserted.record.consultId, {
+          state: 'admission_unknown',
+          billingRequestId: admission.requestId,
+        })
+        releaseEarly()
+        return this.sendJson(res, 503, {
+          error: '已准入但绑定落盘失败，已尝试 abandon',
+          consultId: inserted.record.consultId,
+          state: 'admission_unknown',
+        })
+      }
+      store.update(inserted.record.consultId, { state: 'failed' })
+      releaseEarly()
+      return this.sendError(res, 500, 'consult persist after admit failed')
+    }
+    handedToSpawn = true
+    const spawned = await this._spawnAdvisorConsult({
+      consultId: inserted.record.consultId,
+      parent,
+      originTurnKey: frozen.originTurnKey,
+      snapshot,
+      requestId: admission.requestId,
+      billingApi,
+      abort,
+      unregister: unregisterEarly,
+      codexRoute,
+    })
+    return this.sendJson(res, 200, {
+      status: spawned.state,
+      consultId: inserted.record.consultId,
+      requestId: admission.requestId,
+      jobId: spawned.jobId,
+      advice: spawned.advice,
+      advisorModel: frozen.advisorModel,
+      ...(spawned.usage ? { usage: spawned.usage } : {}),
+      missing: snapshot.missing,
+      truncated: snapshot.truncated,
+      error: spawned.error,
+    })
+    } catch (err) {
+      if (recordedConsultId) {
+        const rec = store.findById(recordedConsultId)
+        if (
+          rec &&
+          !rec.billingRequestId &&
+          (rec.state === 'accepted' || rec.state === 'admission_attempt')
+        ) {
+          try {
+            store.update(recordedConsultId, { state: 'failed' })
+          } catch {
+            /* best-effort close of a never-admitted row */
+          }
+        }
+      }
+      return this.sendError(res, 500, String((err as Error)?.message ?? err))
+    } finally {
+      if (!handedToSpawn) releaseEarly()
+    }
+  }
+
+  private async _loadConsultHistoryTape(peerId: string, userId: string, turnKey: string) {
+    return listTurnTapeRecords(peerId, userId, turnKey, 0, 80)
+  }
+
+  private async _resolveAdvisorConsultExecution(
+    advisorModel: string,
+  ): Promise<
+    | { ok: true; value: AdvisorConsultExecution }
+    | { ok: false; error: string; status: number }
+  > {
+    const store = this.advisorConfigStore().read()
+    if (!isModelAuthorityRequired()) {
+      const baked = resolveEngine(advisorModel, { id: ADVISOR_AGENT_ID })
+      if (baked === 'codex' && isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
+        return {
+          ok: true,
+          value: { modelId: advisorModel, engine: 'codex', providerId: 'codex' },
+        }
+      }
+    }
+    try {
+      const view = await getLocalCatalogView()
+      const row = view.resolve(view.canonicalize(advisorModel))
+      if (!row || row.available === false) {
+        return { ok: false, status: 400, error: '顾问型号不在当前 catalog' }
+      }
+      if (row.engine === 'ccb') {
+        const providerId = (row.providerId ?? '').trim()
+        if (
+          !isCcbAdvisorModelProven({
+            modelId: row.modelId,
+            providerId,
+            provenCcbModels: store.provenCcbModels,
+          })
+        ) {
+          return { ok: false, status: 503, error: '该 CCB 顾问型号尚未完成无工具证明' }
+        }
+        return {
+          ok: true,
+          value: {
+            modelId: row.modelId,
+            engine: 'ccb',
+            providerId,
+            profileVersion: CCB_ADVISOR_PROFILE_VERSION,
+          },
+        }
+      }
+      if (row.engine === 'codex') {
+        if (!isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
+          return { ok: false, status: 503, error: '顾问引擎尚未完成无工具证明，不能咨询' }
+        }
+        return {
+          ok: true,
+          value: {
+            modelId: row.modelId,
+            engine: 'codex',
+            providerId: (row.providerId ?? 'codex').trim() || 'codex',
+          },
+        }
+      }
+      return { ok: false, status: 409, error: '顾问型号引擎不是已证明的 Codex 或 CCB' }
+    } catch (err) {
+      // Authority mode: catalog failure is always fail-closed.
+      // Non-authority Codex already returned via baked resolveEngine above;
+      // CCB/unknown must not inherit a proven Codex engine.
+      return {
+        ok: false,
+        status: 503,
+        error: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
+      }
+    }
+  }
+
+  private async _spawnCcbAdvisorConsult(input: {
+    consultId: string
+    parent: AgentSession
+    originTurnKey: string
+    snapshot: ReturnType<typeof buildAdvisorSnapshot>
+    execution: AdvisorConsultExecution
+    abort?: AbortController
+    unregister?: (() => void) | null
+  }): Promise<{
+    state: string
+    advice: string
+    jobId?: string
+    error?: string
+  }> {
+    const consultStore = this.advisorConsultStore()
+    const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
+    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
+    const unregister =
+      input.unregister ?? this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
+    const abort = input.abort ?? new AbortController()
+    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
+    let slotHeld = false
+    let jobId: string | undefined
+    let jobs: DelegateJobStore | undefined
+    let advice = ''
+    let toolViolation = false
+    const cancelIfAborted = async (): Promise<{
+      state: string
+      advice: string
+      jobId?: string
+      error?: string
+    } | null> => {
+      const liveParent = this.sessions?.getByKey(input.parent.sessionKey)
+      const originGone =
+        abort.signal.aborted ||
+        !liveParent ||
+        liveParent._currentTurnKey !== input.originTurnKey
+      if (!originGone) return null
+      consultStore.update(input.consultId, {
+        state: 'cancelled',
+        advice: advice || null,
+      })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        const spawnFailFence =
+          spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : undefined
+        jobs.fail(jobId, {
+          failureClass: 'cancelled',
+          detail: 'parent Stop',
+          httpStatus: 409,
+          body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
+          nextState: 'cancelled',
+          ...(spawnFailFence ?? {}),
+        })
+      }
+      return { state: 'cancelled', advice, jobId, error: 'parent Stop' }
+    }
+    try {
+    const cfg = await this._getAgentsConfig()
+    const abortedBeforeSpawn = await cancelIfAborted()
+    if (abortedBeforeSpawn) return abortedBeforeSpawn
+    const sourceAgent =
+      cfg.agents.find((row) => row.id === 'main') ??
+      cfg.agents.find((row) => row.id === cfg.default)
+    if (!sourceAgent) throw new Error('advisor source agent missing')
+    const agent: AgentDef = {
+      ...sourceAgent,
+      id: ADVISOR_AGENT_ID,
+      model: input.execution.modelId,
+      provider: undefined,
+      runnerKind: undefined,
+      persona: undefined,
+      cwd: undefined,
+      mcpServers: [],
+      toolsets: [],
+    }
+    const execution = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'turn',
+      model: input.execution.modelId,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    const engine = execution?.engine ?? 'ccb'
+    if (engine !== 'ccb' || input.execution.engine !== 'ccb') {
+      throw new Error('顾问引擎未开放或型号不是已证明的 CCB 顾问')
+    }
+    jobs = this._ensureDelegateJobStore()
+    const gate = await this._waitForDelegateCapacity({
+      sessionKey: advisorSessionKey,
+      parentBucketKey: input.parent.sessionKey,
+      isReview: false,
+    })
+    if (gate.status !== 'ok') {
+      const state = gate.status === 'aborted' ? 'cancelled' : 'failed'
+      consultStore.update(input.consultId, { state })
+      return {
+        state,
+        advice: '',
+        error: `顾问资源闸未放行: ${gate.status}`,
+      }
+    }
+    slotHeld = true
+    const abortedAfterQueue = await cancelIfAborted()
+    if (abortedAfterQueue) return abortedAfterQueue
+    const created = jobs.create(ADVISOR_AGENT_ID, {
+      sessionKey: advisorSessionKey,
+      parentSessionKey: input.parent.sessionKey,
+      queued: false,
+      kind: 'advisor',
+      callback: 'stdout-wait',
+      idempotencyKey: input.consultId,
+    })
+    if ('error' in created) {
+      throw new Error('too many in-flight advisor jobs')
+    }
+    jobId = created.jobId
+    consultStore.update(input.consultId, { jobId, state: 'spawned' })
+    const abortedBeforeCreate = await cancelIfAborted()
+    if (abortedBeforeCreate) return abortedBeforeCreate
+    const session = await this.sessions.getOrCreate({
+      sessionKey: advisorSessionKey,
+      agent,
+      ...localExecutionOverride(execution),
+      channel: 'advisor',
+      peerId: input.parent.peerId,
+      userId: input.parent.userId,
+      hermeticNoTools: true,
+      advisorExecutionLock: input.execution,
+      usageAttribution: {
+        mode: 'delegate',
+        delegateAgentId: ADVISOR_AGENT_ID,
+        parentSessionId: input.parent.peerId,
+        parentTurnKey: input.originTurnKey,
+      },
+    })
+    const abortedAfterCreate = await cancelIfAborted()
+    if (abortedAfterCreate) return abortedAfterCreate
+    let error: string | undefined
+    let cancelCode: string | undefined
+    const originConsultId = input.consultId
+    const lockToolViolation = (): void => {
+      if (toolViolation) return
+      toolViolation = true
+      try {
+        session.runner.interrupt()
+      } catch {
+        /* interrupt is best-effort; finally still destroys the session */
+      }
+    }
+    try {
+      await this.sessions.submit(
+        session,
+        formatAdvisorConsultPrompt(input.snapshot),
+        (e) => {
+          const latest = consultStore.findById(originConsultId)
+          if (
+            latest &&
+            (latest.state === 'completed' ||
+              latest.state === 'failed' ||
+              latest.state === 'cancelled' ||
+              latest.originTurnKey !== input.originTurnKey)
+          ) {
+            return
+          }
+          if (e.kind === 'error') {
+            error = e.error
+            const code = (e as { errorCode?: string }).errorCode
+            if (code === 'USER_CANCELLED') cancelCode = code
+          }
+          if (toolViolation) return
+          const eventKind = (e as { kind?: string }).kind
+          if (eventKind === 'tool_use_detected' || eventKind === 'permission_request') {
+            lockToolViolation()
+            return
+          }
+          if (e.kind === 'block' && (e.block.kind === 'tool_use' || e.block.kind === 'tool_result')) {
+            lockToolViolation()
+            return
+          }
+          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
+        },
+        undefined,
+        input.execution.modelId,
+        undefined,
+        undefined,
+        undefined,
+        {
+          automaticRetryState: {
+            rootClientMessageId: input.consultId,
+            attempt: 0,
+            max: 0,
+          },
+        },
+      )
+    } catch (err) {
+      const code = (err as { errorCode?: string })?.errorCode
+      if (code === 'USER_CANCELLED') cancelCode = code
+      error = String((err as Error)?.message ?? err)
+    }
+    const cancelled =
+      !toolViolation && (cancelCode === 'USER_CANCELLED' || abort.signal.aborted)
+    const jobSnap = jobs.snapshotOf(jobId)
+    const fence =
+      jobSnap?.claimToken
+        ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
+        : undefined
+    if (cancelled) {
+      consultStore.update(input.consultId, { state: 'cancelled', advice: advice || null })
+      jobs.fail(jobId, {
+        failureClass: 'cancelled',
+        detail: 'parent Stop',
+        httpStatus: 409,
+        body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
+        nextState: 'cancelled',
+        ...(fence ?? {}),
+      })
+      return { state: 'cancelled', advice, jobId, error: 'parent Stop' }
+    }
+    if (toolViolation || error || !advice.trim()) {
+      const detail = toolViolation
+        ? '顾问发出了工具或权限事件，不能作为无工具完成'
+        : error || '顾问未返回非空建议'
+      consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
+      jobs.fail(jobId, {
+        failureClass: 'child_error',
+        detail,
+        httpStatus: 500,
+        body: { ok: false, error: detail, advice, consultId: input.consultId },
+        ...(fence ?? {}),
+      })
+      return { state: 'failed', advice, jobId, error: detail }
+    }
+    consultStore.update(input.consultId, { state: 'completed', advice })
+    jobs.complete(
+      jobId,
+      {
+        httpStatus: 200,
+        body: { ok: true, advice, consultId: input.consultId, billingMode: 'proxy' },
+      },
+      fence,
+    )
+    return { state: 'completed', advice, jobId }
+    } catch (err) {
+      const detail = String((err as Error)?.message ?? err)
+      consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        jobs.fail(jobId, {
+          failureClass: 'child_error',
+          detail,
+          httpStatus: 500,
+          body: { ok: false, error: detail, advice, consultId: input.consultId },
+          ...(spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : {}),
+        })
+      }
+      return { state: 'failed', advice, jobId, error: detail }
+    } finally {
+      this._advisorConsultAborts?.delete(advisorSessionKey)
+      unregister?.()
+      if (slotHeld) this._releaseDelegateSlot(slotOpts)
+      await this.sessions.destroySession(advisorSessionKey).catch(() => {})
+    }
+  }
+
+  private _advisorConsultRouteOverride(
+    route: AdvisorAdmitRouteOk,
+    model: string,
+  ): import('./engine/codexShared.js').CodexProviderConfigOverride | null {
+    const port = this.deps.config.gateway.port
+    if (route.kind === 'official_oauth') {
+      return _buildSafeCodexRouteOverride({
+        agent: { id: ADVISOR_AGENT_ID },
+        model,
+        rawRoute: { kind: 'official_oauth' },
+        officialRelayPort: port,
+      })
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+    return _buildSafeCodexRouteOverride({
+      agent: { id: ADVISOR_AGENT_ID },
+      model,
+      rawRoute: {
+        baseUrl: `http://127.0.0.1:${port}${V3_CODEX_RELAY_PREFIX}/route/${route.token}`,
+        modelProvider: route.modelProvider,
+        providerName: route.providerName ?? null,
+        wireApi: route.wireApi ?? 'responses',
+        preferredAuthMethod: route.preferredAuthMethod ?? 'apikey',
+        disableResponseStorage: route.disableResponseStorage ?? true,
+      },
+      officialRelayPort: port,
+    })
+  }
+
+  private async _spawnAdvisorConsult(input: {
+    consultId: string
+    parent: AgentSession
+    originTurnKey: string
+    snapshot: ReturnType<typeof buildAdvisorSnapshot>
+    requestId: string
+    billingApi: typeof defaultDelegateEngineBilling
+    abort?: AbortController
+    unregister?: (() => void) | null
+    codexRoute: import('./engine/codexShared.js').CodexProviderConfigOverride
+  }): Promise<{
+    state: string
+    advice: string
+    jobId?: string
+    error?: string
+    usage?: DurableCodexBilling['usage']
+  }> {
+    const consultStore = this.advisorConsultStore()
+    const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
+    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
+    const unregister =
+      input.unregister ?? this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
+    const abort = input.abort ?? new AbortController()
+    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
+    let slotHeld = false
+    let jobId: string | undefined
+    let jobs: DelegateJobStore | undefined
+    let liveBilling: DurableCodexBilling | null = null
+    let advice = ''
+    let settleError: string | undefined
+    const cancelIfAborted = async (): Promise<{
+      state: string
+      advice: string
+      jobId?: string
+      error?: string
+    } | null> => {
+      const liveParent = this.sessions?.getByKey(input.parent.sessionKey)
+      const originGone =
+        abort.signal.aborted ||
+        !liveParent ||
+        liveParent._currentTurnKey !== input.originTurnKey
+      if (!originGone) return null
+      if (!liveBilling) await input.billingApi.abandon(input.requestId).catch(() => {})
+      consultStore.update(input.consultId, {
+        state: liveBilling ? 'settle_pending' : 'cancelled',
+        advice: advice || null,
+      })
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        const spawnFailFence =
+          spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : undefined
+        jobs.fail(jobId, {
+          failureClass: 'cancelled',
+          detail: 'parent Stop',
+          httpStatus: 409,
+          body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
+          nextState: 'cancelled',
+          ...(spawnFailFence ?? {}),
+        })
+      }
+      return {
+        state: liveBilling ? 'settle_pending' : 'cancelled',
+        advice,
+        jobId,
+        error: 'parent Stop',
+      }
+    }
+    try {
+    const cfg = await this._getAgentsConfig()
+    const abortedBeforeSpawn = await cancelIfAborted()
+    if (abortedBeforeSpawn) return abortedBeforeSpawn
+    const sourceAgent =
+      cfg.agents.find((row) => row.id === 'main') ??
+      cfg.agents.find((row) => row.id === cfg.default)
+    if (!sourceAgent) throw new Error('advisor source agent missing')
+    const agent: AgentDef = {
+      ...sourceAgent,
+      id: ADVISOR_AGENT_ID,
+      model: input.snapshot.advisorModel,
+      provider: undefined,
+      runnerKind: undefined,
+      persona: undefined,
+      cwd: undefined,
+      mcpServers: [],
+      toolsets: [],
+    }
+    const execution = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'turn',
+      model: input.snapshot.advisorModel,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    const engine = execution?.engine ?? 'codex'
+    if (
+      engine !== 'codex' ||
+      !isAdvisorEngineOpen('codex', process.env, this.advisorConfigStore().read().provenEngines)
+    ) {
+      throw new Error('顾问引擎未开放或型号不是已证明的 Codex 顾问')
+    }
+    jobs = this._ensureDelegateJobStore()
+    const gate = await this._waitForDelegateCapacity({
+      sessionKey: advisorSessionKey,
+      parentBucketKey: input.parent.sessionKey,
+      isReview: false,
+    })
+    if (gate.status !== 'ok') {
+      await input.billingApi.abandon(input.requestId).catch(() => {})
+      const state = gate.status === 'aborted' ? 'cancelled' : 'failed'
+      consultStore.update(input.consultId, { state })
+      return {
+        state,
+        advice: '',
+        error: `顾问资源闸未放行: ${gate.status}`,
+      }
+    }
+    slotHeld = true
+    const abortedAfterQueue = await cancelIfAborted()
+    if (abortedAfterQueue) return abortedAfterQueue
+    const created = jobs.create(ADVISOR_AGENT_ID, {
+      sessionKey: advisorSessionKey,
+      parentSessionKey: input.parent.sessionKey,
+      queued: false,
+      kind: 'advisor',
+      callback: 'stdout-wait',
+      idempotencyKey: input.consultId,
+    })
+    if ('error' in created) {
+      throw new Error('too many in-flight advisor jobs')
+    }
+    jobId = created.jobId
+    consultStore.update(input.consultId, { jobId, state: 'admitted' })
+    const abortedBeforeCreate = await cancelIfAborted()
+    if (abortedBeforeCreate) return abortedBeforeCreate
+    const session = await this.sessions.getOrCreate({
+      sessionKey: advisorSessionKey,
+      agent,
+      ...localExecutionOverride(execution),
+      channel: 'advisor',
+      peerId: input.parent.peerId,
+      userId: input.parent.userId,
+      hermeticNoTools: true,
+      usageAttribution: {
+        mode: 'delegate',
+        delegateAgentId: ADVISOR_AGENT_ID,
+        parentSessionId: input.parent.peerId,
+        parentTurnKey: input.originTurnKey,
+      },
+    })
+    const abortedAfterCreate = await cancelIfAborted()
+    if (abortedAfterCreate) return abortedAfterCreate
+    consultStore.update(input.consultId, { state: 'spawned', jobId })
+    let error: string | undefined
+    let cancelCode: string | undefined
+    let settleTask: Promise<void> | undefined
+    const originConsultId = input.consultId
+    try {
+      await this.sessions.submit(
+        session,
+        formatAdvisorConsultPrompt(input.snapshot),
+        (e) => {
+          if (e.kind === 'codex_billing') {
+            const billing = { ...e } as DurableCodexBilling & { kind?: string }
+            delete billing.kind
+            liveBilling = billing
+            settleTask = input.billingApi.settle(billing).catch((settleErr) => {
+              settleError = String((settleErr as Error)?.message ?? settleErr)
+              this.log.warn('advisor_engine_billing_settle_failed', {
+                consultId: input.consultId,
+                requestId: billing.requestId,
+                err: settleError,
+              })
+            })
+            return
+          }
+          const latest = consultStore.findById(originConsultId)
+          if (
+            latest &&
+            (latest.state === 'settled' ||
+              latest.state === 'failed' ||
+              latest.state === 'cancelled' ||
+              latest.originTurnKey !== input.originTurnKey)
+          ) {
+            return
+          }
+          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
+          if (e.kind === 'error') {
+            error = e.error
+            const code = (e as { errorCode?: string }).errorCode
+            if (code === 'USER_CANCELLED') cancelCode = code
+          }
+        },
+        undefined,
+        input.snapshot.advisorModel,
+        input.requestId,
+        undefined,
+        undefined,
+        { codexRoute: input.codexRoute },
+      )
+    } catch (err) {
+      const code = (err as { errorCode?: string })?.errorCode
+      if (code === 'USER_CANCELLED') cancelCode = code
+      error = String((err as Error)?.message ?? err)
+    }
+    if (advice) {
+      try {
+        consultStore.update(input.consultId, { advice })
+      } catch {
+        /* projection retries from settledReceipts once advice is durable */
+      }
+    }
+    if (settleTask) await settleTask
+    // Only project after an authoritative 2xx for this requestId. Advice or
+    // observed usage is not payment evidence.
+    if (!settleError && liveBilling && advice) {
+      try {
+        consultStore.projectOneReceipt(input.requestId)
+      } catch {
+        /* keep settle_pending / spawned until receipt-driven auto-retry */
+      }
+    }
+    const jobSnap = jobs.snapshotOf(jobId)
+    const fence =
+      jobSnap?.claimToken
+        ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
+        : undefined
+    const cancelled = cancelCode === 'USER_CANCELLED'
+    const usage = (liveBilling as DurableCodexBilling | null)?.usage
+    if (!liveBilling) {
+      await input.billingApi.abandon(input.requestId).catch(() => {})
+      const state = cancelled ? 'cancelled' : 'failed'
+      consultStore.update(input.consultId, { state, advice: advice || null })
+      jobs.fail(jobId, {
+        failureClass: cancelled ? 'cancelled' : 'child_error',
+        detail: error || 'missing billing frame',
+        httpStatus: cancelled ? 409 : 500,
+        body: { ok: false, error, advice, consultId: input.consultId },
+        ...(cancelled ? { nextState: 'cancelled' as const } : {}),
+        ...(fence ?? {}),
+      })
+      return {
+        state,
+        advice,
+        jobId,
+        error: error || '顾问未产生计费帧（401 或未完成推理不算无工具 PASS）',
+      }
+    }
+    if (settleError) {
+      consultStore.update(input.consultId, {
+        state: 'settle_pending',
+        billingRequestId: input.requestId,
+        advice,
+      })
+      jobs.complete(
+        jobId,
+        {
+          httpStatus: 200,
+          body: { ok: true, advice, consultId: input.consultId, settlePending: true },
+        },
+        fence,
+      )
+      return {
+        state: 'settle_pending',
+        advice,
+        jobId,
+        ...(usage ? { usage } : {}),
+        error: `计费 settle 失败，保留 pending 与原 owner: ${settleError}`,
+      }
+    }
+    const state = cancelled ? 'cancelled' : error ? 'failed' : 'settled'
+    consultStore.update(input.consultId, { state, advice })
+    if (cancelled || error) {
+      jobs.fail(jobId, {
+        failureClass: cancelled ? 'cancelled' : 'child_error',
+        detail: error || 'cancelled',
+        httpStatus: cancelled ? 409 : 500,
+        body: { ok: false, error, advice, consultId: input.consultId },
+        ...(cancelled ? { nextState: 'cancelled' as const } : {}),
+        ...(fence ?? {}),
+      })
+    } else {
+      jobs.complete(
+        jobId,
+        { httpStatus: 200, body: { ok: true, advice, consultId: input.consultId } },
+        fence,
+      )
+    }
+    return { state, advice, jobId, error, ...(usage ? { usage } : {}) }
+    } catch (err) {
+      const detail = String((err as Error)?.message ?? err)
+      const observed = Boolean(liveBilling)
+      const current = consultStore.findById(input.consultId)
+      if (observed || current?.state === 'settled' || current?.state === 'settle_pending') {
+        const inheritSettled = current?.state === 'settled' && !settleError
+        try {
+          consultStore.update(input.consultId, {
+            state: inheritSettled ? 'settled' : 'settle_pending',
+            billingRequestId: input.requestId,
+            advice: advice || current?.advice || null,
+          })
+        } catch {
+          /* keep HTTP advice even if the local projection write fails again */
+        }
+        if (jobs && jobId) {
+          const spawnFailSnap = jobs.snapshotOf(jobId)
+          const spawnFailFence =
+            spawnFailSnap?.claimToken
+              ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+              : undefined
+          try {
+            jobs.complete(
+              jobId,
+              {
+                httpStatus: 200,
+                body: {
+                  ok: true,
+                  advice,
+                  consultId: input.consultId,
+                  settlePending: !inheritSettled,
+                },
+              },
+              spawnFailFence,
+            )
+          } catch {
+            /* job already terminal */
+          }
+        }
+        return {
+          state: inheritSettled ? 'settled' : 'settle_pending',
+          advice,
+          jobId,
+          error: detail,
+        }
+      }
+      await input.billingApi.abandon(input.requestId).catch(() => {})
+      try {
+        consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
+      } catch {
+        /* persist best-effort */
+      }
+      if (jobs && jobId) {
+        const spawnFailSnap = jobs.snapshotOf(jobId)
+        const spawnFailFence =
+          spawnFailSnap?.claimToken
+            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
+            : undefined
+        jobs.fail(jobId, {
+          failureClass: 'child_error',
+          detail,
+          httpStatus: 500,
+          body: { ok: false, error: detail, consultId: input.consultId },
+          ...(spawnFailFence ?? {}),
+        })
+      }
+      return { state: 'failed', advice: '', jobId, error: detail }
+    } finally {
+      this._advisorConsultAborts?.delete(advisorSessionKey)
+      unregister?.()
+      if (slotHeld) this._releaseDelegateSlot(slotOpts)
+      await this.sessions.destroySession(advisorSessionKey).catch(() => {})
+    }
+  }
+
+  private async handleCollaborationConfig(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    if (!isEngineLocalTurnExempt()) {
+      return this.sendError(res, 404, 'collaboration-config is selfhost only')
+    }
+    const userId = this.getUserId(req)
+    // Selfhost ACCESS / container-proxy / static MCP resolve to 'default' after
+    // outer checkHttpAuth (or a valid bridge nonce). That identity owns this
+    // uid-volume config; do not remap it onto another uid or treat it as anonymous.
+    if (!userId) return this.sendError(res, 401, 'unauthorized')
+    const store = this.advisorConfigStore()
+    const provenNow = () => {
+      const doc = store.read()
+      return {
+        provenEngines: [...openAdvisorEngines(), ...doc.provenEngines],
+        provenCcbModels: doc.provenCcbModels,
+      }
+    }
+    const catalogOptions = async () => {
+      try {
+        const view = await getLocalCatalogView()
+        const proven = provenNow()
+        return listProvenAdvisorModels({
+          catalog: view.models,
+          provenEngines: proven.provenEngines,
+          provenCcbModels: proven.provenCcbModels,
+        })
+      } catch (err) {
+        return {
+          advisorModels: [] as Array<{ id: string; label: string; engine: string }>,
+          advisorUnavailableReason: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
+        }
+      }
+    }
+    if (req.method === 'GET') {
+      try {
+        const doc = store.read()
+        const sessionId = url.searchParams.get('sessionId') ?? undefined
+        let parentEngine: string | undefined
+        if (sessionId) {
+          const parent = await this._parentEngineForCollabSession({ sessionId, userId, req, url })
+          if (parent.missing) return this.sendError(res, 404, 'session not found')
+          if (parent.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
+          parentEngine = parent.engine
+        }
+        const resolved = resolveSessionCollab(doc, sessionId)
+        const listed = await catalogOptions()
+        return this.sendJson(res, 200, {
+          rev: doc.rev,
+          defaultMode: doc.defaultMode,
+          defaultAdvisorModel: doc.defaultAdvisorModel
+            ? advisorCanonicalModelId(doc.defaultAdvisorModel)
+            : doc.defaultAdvisorModel,
+          session: {
+            ...resolved,
+            advisorModel: resolved.advisorModel
+              ? advisorCanonicalModelId(resolved.advisorModel)
+              : resolved.advisorModel,
+          },
+          advisorModels: listed.advisorModels,
+          ...this._collaborationCapabilityFields({ sessionId, engine: parentEngine }),
+          ...(listed.advisorUnavailableReason
+            ? { advisorUnavailableReason: listed.advisorUnavailableReason }
+            : {}),
+        })
+      } catch (err) {
+        if (err instanceof CollaborationConfigError && err.code === 'CORRUPT') {
+          return this.sendError(res, 500, 'collaboration config unreadable; original file left intact')
+        }
+        throw err
+      }
+    }
+    if (req.method !== 'PUT') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: {
+      sessionId?: unknown
+      mode?: unknown
+      advisorModel?: unknown
+      expectedRev?: unknown
+      asDefault?: unknown
+    }
+    try {
+      parsed = JSON.parse(body) as typeof parsed
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    if (parsed.mode !== 'solo' && parsed.mode !== 'advisor' && parsed.mode !== 'team') {
+      return this.sendError(res, 400, 'mode must be solo|advisor|team')
+    }
+    if (
+      parsed.mode === 'advisor' &&
+      (typeof parsed.advisorModel !== 'string' || !parsed.advisorModel.trim())
+    ) {
+      return this.sendError(res, 400, 'advisorModel required')
+    }
+    let advisorModel =
+      parsed.mode === 'advisor' && typeof parsed.advisorModel === 'string'
+        ? parsed.advisorModel.trim()
+        : null
+    const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined
+    let parentEngine: string | undefined
+    if (sessionId) {
+      const parent = await this._parentEngineForCollabSession({ sessionId, userId, req, url })
+      if (parent.missing) return this.sendError(res, 404, 'session not found')
+      if (parent.agentId !== 'main') return this.sendError(res, 400, 'collaboration config is main-only')
+      parentEngine = parent.engine
+      if (parsed.mode === 'advisor') {
+        const gate = advisorConsultParentGate(parentEngine)
+        if (!gate.allowed) {
+          return this.sendError(res, 409, gate.reason || ADVISOR_CONSULT_PARENT_REASON)
+        }
+      }
+    }
+    if (parsed.mode === 'advisor') {
+      const listed = await catalogOptions()
+      const allowed = assertAdvisorModelAllowed({
+        requested: advisorModel ?? '',
+        advisorModels: listed.advisorModels,
+        unavailableReason: listed.advisorUnavailableReason,
+      })
+      if (!allowed.ok) {
+        const status = listed.advisorUnavailableReason?.startsWith('catalog unavailable') ? 503 : 400
+        return this.sendError(res, status, allowed.error)
+      }
+      advisorModel = allowed.model
+    }
+    const expectedRev =
+      typeof parsed.expectedRev === 'number' && Number.isInteger(parsed.expectedRev)
+        ? parsed.expectedRev
+        : undefined
+    try {
+      const next = await store.putIntent({
+        sessionId,
+        asDefault: parsed.asDefault === true,
+        mode: parsed.mode,
+        advisorModel,
+        expectedRev,
+      })
+      const listed = await catalogOptions()
+      const resolved = resolveSessionCollab(next, sessionId)
+      return this.sendJson(res, 200, {
+        rev: next.rev,
+        defaultMode: next.defaultMode,
+        defaultAdvisorModel: next.defaultAdvisorModel
+          ? advisorCanonicalModelId(next.defaultAdvisorModel)
+          : next.defaultAdvisorModel,
+        session: {
+          ...resolved,
+          advisorModel: resolved.advisorModel
+            ? advisorCanonicalModelId(resolved.advisorModel)
+            : resolved.advisorModel,
+        },
+        ...this._collaborationCapabilityFields({ sessionId, engine: parentEngine }),
+        advisorModels: listed.advisorModels,
+        ...(listed.advisorUnavailableReason
+          ? { advisorUnavailableReason: listed.advisorUnavailableReason }
+          : {}),
+      })
+    } catch (err) {
+      if (err instanceof CollaborationConfigError) {
+        const status = err.code === 'CAS' ? 409 : err.code === 'VALIDATION' ? 400 : 500
+        return this.sendError(res, status, err.message)
+      }
+      throw err
+    }
   }
 
   private async handleDelegateTask(
@@ -11796,6 +13712,9 @@ export class Gateway {
         400,
         'agentId 只能是平台成员 id(如 coding-assistant)。型号请用 body.model,例如 cursor-grok-4.6-high-fast',
       )
+    }
+    if (targetAgentId === ADVISOR_AGENT_ID) {
+      return this.sendError(res, 403, 'consult_advisor 只能走 /api/agents/advisor/consult，不能用 delegate')
     }
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
@@ -11858,9 +13777,14 @@ export class Gateway {
       : typeof sourceAgent === 'string'
         ? sourceAgent
         : undefined
+    const identityProjection = await fetchIdentityCompatProjection()
+    const callerExecutionId = identityProjection && sourceAgentId
+      ? resolveIdentityCompat(sourceAgentId, identityProjection).executionAgentId : sourceAgentId
+    const targetIdentity = identityProjection ? resolveIdentityCompat(targetAgentId, identityProjection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
     const selfCheck = rejectSelfDelegate({
-      callerAgentId: sourceAgentId,
-      targetAgentId,
+      callerAgentId: callerExecutionId,
+      targetAgentId: targetIdentity?.executionAgentId ?? targetAgentId,
       allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
     })
     if (!selfCheck.ok) return this.sendError(res, 400, selfCheck.error)
@@ -11874,6 +13798,7 @@ export class Gateway {
       targetAgentId,
       sourceAgent: sourceAgentId || 'system',
       idempotencyKey,
+      identityProjection,
     })
     this._forgetEvictedDelegateResumes(resume.evictedKeys)
     if (!resume.ok) {
@@ -11898,6 +13823,7 @@ export class Gateway {
       ? this._resolveDelegateProgressTarget({ parentSessionKey, sourceAgent: sourceAgentId })?.target
       : undefined
     const runInput: RunDelegateInput = {
+      allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
       targetAgentId,
       goal,
       context: typeof context === 'string' ? context : undefined,
@@ -11930,7 +13856,7 @@ export class Gateway {
       const store = this._ensureDelegateJobStore()
       const slotOpts = {
         parentBucketKey: parentSessionKey,
-        isReview: isHiddenSystemAgentId(targetAgentId),
+        isReview: isTeamReviewExecution(targetAgentId),
       }
       if (sm) {
         const admit = this._admitDelegateCreate(resume.sessionKey, slotOpts)
@@ -12300,7 +14226,7 @@ export class Gateway {
 
     // 队长自主送审(2026-07-07):目标是隐藏审查员 ⇒ 一律按审查语义执行(资源闸保留槽/
     // 免 per-parent 桶/回传不封顶/结构化 verdict)。单一权威 = 目标身份,不采信调用方自报。
-    if (!isReview && isHiddenSystemAgentId(targetAgentId)) {
+    if (!isReview && isTeamReviewExecution(targetAgentId)) {
       isReview = true
       const parent =
         typeof parentSessionKey === 'string' && parentSessionKey
@@ -12321,14 +14247,16 @@ export class Gateway {
       //     不影响任何闸/计费 → 采信无风险;非法值回落 execution。
       //   - 用户原始需求仍取服务端权威快照,不采信模型自报。
       reviewMode = parseTeamReviewMode(input.reviewMode)
-      const evidence: ReviewEvidenceItem[] = (parent._pendingAgentGroups ?? []).map((g) => ({
-        runId: g.runId,
-        agentId: g.agentId,
-        model: this._delegateModelByRunId?.get(g.runId),
-        goal: g.goal,
-        status: g.status,
-        resultSummary: g.resultSummary,
-      }))
+      const evidence: ReviewEvidenceItem[] = (parent._pendingAgentGroups ?? []).map(
+        (entry) => ({
+          runId: entry.group.runId,
+          agentId: entry.group.agentId,
+          model: this._delegateModelByRunId?.get(entry.group.runId),
+          goal: entry.group.goal,
+          status: entry.group.status,
+          resultSummary: entry.group.resultSummary,
+        }),
+      )
       context = buildTeamReviewContext({
         mode: reviewMode,
         userTask: parent._currentTurnUserText ?? '',
@@ -12378,7 +14306,7 @@ export class Gateway {
       typeof parentSessionKey === 'string' && parentSessionKey
         ? parentSessionKey
         : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
-    if (isHiddenSystemAgentId(targetAgentId)) {
+    if (isTeamReviewExecution(targetAgentId)) {
       const hiddenLimit = resolveHiddenDelegationsPerTurn()
       if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
         this.log.warn('delegate_hidden_limit', {
@@ -12412,7 +14340,16 @@ export class Gateway {
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
-    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
+    const identityProjection = await fetchIdentityCompatProjection()
+    const targetIdentity = identityProjection ? resolveIdentityCompat(targetAgentId, identityProjection) : undefined
+    if (targetIdentity) assertIdentityCompatReady(targetIdentity)
+    const coreSelfCheck = rejectSelfDelegate({
+      callerAgentId: typeof sourceAgent === 'string' && identityProjection ? resolveIdentityCompat(sourceAgent, identityProjection).executionAgentId : sourceAgent,
+      targetAgentId: targetIdentity?.executionAgentId ?? targetAgentId,
+      allowSelf: input.allowSelf === true || (!input.resumable && sourceAgent === targetAgentId),
+    })
+    if (!coreSelfCheck.ok) return { kind: 'rejected', httpStatus: 400, message: coreSelfCheck.error }
+    const targetAgent = cfg.agents.find((a) => a.id === (targetIdentity?.executionAgentId ?? targetAgentId))
     if (!targetAgent) return { kind: 'rejected', httpStatus: 404, message: `agent "${targetAgentId}" not found` }
 
     // Resolve the delegated member's toolsets the same way the normal message
@@ -12428,7 +14365,7 @@ export class Gateway {
     // tool-arg controlled), so a marketplace agent can't spoof a privileged caller.
     // An undefined caller toolset = the trusted platform default (main) → no cap.
     const callerAgent =
-      typeof sourceAgent === 'string' ? cfg.agents.find((a) => a.id === sourceAgent) : undefined
+      typeof sourceAgent === 'string' ? cfg.agents.find((a) => a.id === (identityProjection ? resolveIdentityCompat(sourceAgent, identityProjection).executionAgentId : sourceAgent)) : undefined
     const callerToolsets = Array.isArray(callerAgent?.toolsets) ? callerAgent.toolsets : undefined
     const delegateIntentText = [goal, context].filter(Boolean).join('\n')
     const resolvedToolsets = resolveDelegateToolsets(
@@ -12509,6 +14446,35 @@ export class Gateway {
     })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    // OCV5-180 B1 — launch 时冻结 exact owner locator {parentSessionId, parentTurnKey,
+    // turnIndex}:本次委派的完成卡只允许归属该 turn。收集时若 owner 已 seal(或父会话
+    // 已不在内存),凭此 locator 走持久晚到 continuation,不再依赖可变会话状态。
+    // parentSessionId 用与 owner turn tape 相同的 webchat client session id
+    // (= progressTarget.peerId),保证账务 locator 与 tape sessionId 一致。
+    const delegateOwnerLocator: DelegateOwnerTurnLocator | undefined = progressTarget
+      ? (() => {
+          const ownerSession = this.sessions.getByKey(progressTarget.sessionKey)
+          const ownerTurnKey = ownerSession?._currentTurnKey
+          if (!ownerSession || !ownerTurnKey) return undefined
+          return {
+            parentSessionId: progressTarget.peerId,
+            parentTurnKey: ownerTurnKey,
+            turnIndex:
+              ownerSession._currentTurnIndex ??
+              (Number.isSafeInteger(ownerSession.turns)
+                ? Math.max(1, ownerSession.turns + 1)
+                : 1),
+          }
+        })()
+      : undefined
+    if (delegateOwnerLocator) {
+      const map = (this._delegateOwnerByRunId ??= new Map())
+      map.set(progressRunId, delegateOwnerLocator)
+      if (map.size > 512) {
+        const first = map.keys().next().value
+        if (first !== undefined) map.delete(first)
+      }
+    }
     // 2026-09-04 团队模式:记录本次委派实际执行型号(runId → model),供审查任务书标注
     // panel 成员视角(审议模式)。有界 Map(FIFO 512)—— 只服务本 turn 内的审查,不需持久。
     {
@@ -12660,6 +14626,7 @@ export class Gateway {
       },
     })
     if (gate.status !== 'ok') {
+      this._delegateOwnerByRunId?.delete(progressRunId)
       unregisterDelegation?.()
       const waitedS = gate.status === 'queue_full' ? 0 : Math.round(gate.waitedMs / 1000)
       let httpStatus: number
@@ -13469,8 +15436,33 @@ export class Gateway {
       // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
       ...(verdict ? { verdict } : {}),
     }
+    // OCV5-180 B1 — exact-owner 交付用本 invocation 冻结的 locator 闭包,
+    // 不把 FIFO Map 当归属权威。progressTarget 存在但 launch 未能冻结 owner
+    // 时不得 ownerless 写入当前(可能已是 T2) turn。
+    const deliverDelegateGroupCard = (): void => {
+      if (!progressTarget) return
+      if (!delegateOwnerLocator) {
+        this.log.warn('delegate card dropped: missing frozen owner locator', {
+          runId: progressRunId,
+        })
+        return
+      }
+      const buffered = this.sessions.bufferPendingAgentGroup(
+        progressTarget.sessionKey,
+        durableGroup,
+        delegateOwnerLocator,
+      )
+      if (!buffered) {
+        this.sessions.deliverLateDelegateAgentGroup({
+          owner: delegateOwnerLocator,
+          group: durableGroup,
+          sessionKey: progressTarget.sessionKey,
+        })
+      }
+    }
+    this._delegateOwnerByRunId?.delete(progressRunId)
     if (progressTarget && !nestedProgress) {
-      this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+      deliverDelegateGroupCard()
     } else if (nestedProgress && delegateParent) {
       const directParent = this.sessions.getByKey(delegateParent.sessionKey)
       if (durableGroup.engineBillings && directParent?._durableDelegateEngineBillings) {
@@ -13505,8 +15497,9 @@ export class Gateway {
         if (durableGroup.transcript) parentTranscript.push(...durableGroup.transcript)
       } else if (progressTarget) {
         // A broken/old direct-parent collector must degrade to a separate
-        // durable card, never to silent loss.
-        this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, durableGroup)
+        // durable card, never to silent loss. Same exact-owner contract: the
+        // degraded top-level card still belongs to the frozen owner turn.
+        deliverDelegateGroupCard()
       }
     }
     if (isDelegateInflightSurfaceEffective()) {
@@ -13962,8 +15955,9 @@ export class Gateway {
       return
     }
     const cfg = await this._getAgentsConfig()
-    const agent = cfg.agents.find((a) => a.id === task.agent)
-    if (!agent) return
+    const requestedAgent = cfg.agents.find((a) => a.id === task.agent)
+    if (!requestedAgent) return
+    const agent = (await resolveRuntimeExecutionAgent(requestedAgent, cfg)).agent
     const sessionKey = `agent:${task.agent}:task:${taskId}:${Date.now()}`
     // 合成首帧路由字段补齐(同 cron):定时任务的会话首帧绕过 master bridge 计费编排,
     // 落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
@@ -14192,6 +16186,10 @@ export class Gateway {
     if (this._delegateReconcileTimer) {
       clearTimeout(this._delegateReconcileTimer)
       this._delegateReconcileTimer = undefined
+    }
+    if (this._delegateReapTimer) {
+      clearInterval(this._delegateReapTimer)
+      this._delegateReapTimer = undefined
     }
     if (this._notifyRetryTimer) {
       clearTimeout(this._notifyRetryTimer)
@@ -18298,13 +20296,20 @@ export class Gateway {
       } as OutboundMessage, adapter)
       return
     }
+    const executionIdentityProjection = await fetchIdentityCompatProjection()
+    const frameIdentity = frame.agentId && executionIdentityProjection
+      ? resolveIdentityCompat(frame.agentId, executionIdentityProjection) : undefined
+    if (frameIdentity) assertIdentityCompatReady(frameIdentity)
+    if (frameIdentity?.profile && !cfg.agents.some((a) => a.id === frameIdentity.executionAgentId)) {
+      throw new Error('COMPAT_CONFIG_CONFLICT: canonical agent missing')
+    }
     if (frame.agentId) {
       // Unknown agentId → demote to the default agent (全能助手), NEVER a personaless
       // {id} (which would run with no persona/toolsets/model). After the sync above a
       // genuinely-installed market agent is present; anything still unknown is treated
       // as not-installed and safely resolved to the least-privileged default.
       const ag =
-        cfg.agents.find((a) => a.id === frame.agentId) ??
+        cfg.agents.find((a) => a.id === (frameIdentity?.executionAgentId ?? frame.agentId)) ??
         cfg.agents.find((a) => a.id === cfg.default) ??
         cfg.agents.find((a) => a.id === 'main') ?? { id: 'main' }
       agent = ag
@@ -18315,6 +20320,7 @@ export class Gateway {
       sessionKey = routed.sessionKey
       agent = routed.agent
     }
+    agent = (await resolveRuntimeExecutionAgent(agent, cfg, executionIdentityProjection)).agent
     if (isHiddenSystemAgentId(agent.id)) {
       const hiddenAgentUserId: string =
         typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
@@ -18493,6 +20499,12 @@ export class Gateway {
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
+    const inboundCollabMode = !isEngineLocalTurnExempt()
+      ? normalizeCollabMode({ teamMode })
+      : normalizeCollabMode({
+          collabMode: (frame as { collabMode?: unknown }).collabMode,
+          teamMode,
+        })
 
     // v5 codex route 消费链(A1):master bridge 注入的 `__oc_codex_route` →
     // 严格校验(_buildSafeCodexRouteOverride)→ submit opts.codexRoute →
@@ -19414,6 +21426,69 @@ export class Gateway {
 
       finalText = lines.join('\n')
     }
+    const requestedAdvisorModel =
+      typeof (frame as { advisorModel?: unknown }).advisorModel === 'string'
+        ? (frame as { advisorModel: string }).advisorModel.trim()
+        : ''
+    let frozenAdvisorModel = requestedAdvisorModel
+    let advisorTurnAllowed = false
+    if (inboundCollabMode === 'advisor' && agent.id === 'main' && !adapter) {
+      const freeze = requestedAdvisorModel
+        ? await this._freezeAdvisorTurn(requestedAdvisorModel)
+        : { ok: false as const, error: 'advisorModel required' }
+      if (freeze.ok) {
+        const parentEngine = resolveEngine(
+          safeModelForRouting ?? agent.model,
+          agent,
+          turnAuthority !== undefined
+            ? { canonicalModel: turnAuthority.canonicalModel, engine: turnAuthority.engine }
+            : undefined,
+        )
+        if (!isAdvisorConsultParentEngine(parentEngine)) {
+          const _engineUserId: string =
+            typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+          this.log.warn('advisor_parent_engine_unsupported', {
+            sessionKey,
+            parentEngine,
+          })
+          const rejectFrames = _earlyRejectErrorFrames({
+            sessionKey,
+            channel: frame.channel,
+            peer: frame.peer,
+            userId: _engineUserId,
+            traceId: turnTraceId,
+            code: 'upstream_failed',
+            message: ADVISOR_CONSULT_PARENT_REASON,
+            legacyErrorText: `[error] advisor parent engine unsupported: ${parentEngine}`,
+          })
+          for (const f of rejectFrames) this.deliver(f, adapter)
+          return
+        }
+        advisorTurnAllowed = true
+        frozenAdvisorModel = freeze.advisorModel
+        finalText = advisorPreamble('advisor') + finalText
+      } else {
+        const _errUserId: string =
+          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+        this.log.warn('advisor_model_rejected', {
+          sessionKey,
+          requested: requestedAdvisorModel,
+          error: freeze.error,
+        })
+        const rejectFrames = _earlyRejectErrorFrames({
+          sessionKey,
+          channel: frame.channel,
+          peer: frame.peer,
+          userId: _errUserId,
+          traceId: turnTraceId,
+          code: 'upstream_failed',
+          message: `顾问模式无法启动：${freeze.error}`,
+          legacyErrorText: `[error] advisor mode rejected: ${freeze.error}`,
+        })
+        for (const f of rejectFrames) this.deliver(f, adapter)
+        return
+      }
+    }
     // 团队模式(v5 轻量组队):main 队长这一轮前置"组队引导"——列出可委派的已安装 agent
     // + 让它自主判断是否 delegate_task 组队(简单任务自己答)。turn 级,开关中途切立即生效;
     // 放在 media 拼接之后,确保带附件时引导也在。委派本身走内置 delegate_task,无需改工具。
@@ -19486,7 +21561,26 @@ export class Gateway {
     // engine persist 之前完成,走正常归因/drain)。此处只 stash 两个服务端权威快照,
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
+    session._collabModeTurn = agent.id === 'main' && !adapter ? inboundCollabMode : 'solo'
+    const inboundConfigVersion = collabConfigVersionOf({
+      mode: advisorTurnAllowed ? 'advisor' : session._collabModeTurn,
+      advisorModel: frozenAdvisorModel,
+    })
+    session._advisorTurn =
+      advisorTurnAllowed
+        ? { advisorModel: frozenAdvisorModel, configVersion: inboundConfigVersion }
+        : undefined
     session._currentTurnUserText = text ?? ''
+    {
+      const userText = text ?? ''
+      let injected = payload
+      if (userText && payload.endsWith(userText)) {
+        injected = payload.slice(0, payload.length - userText.length)
+      } else if (payload === userText) {
+        injected = ''
+      }
+      session._injectedTurnConstraints = stripAdvisorPreambleFromInjected(injected).trim() || undefined
+    }
     // Fire-and-forget shadow hook. It receives the turn's already-resolved agent,
     // canonical trace id and raw text only long enough to hash/rank them; no result
     // is fed back into prompt assembly or execution.
@@ -21877,7 +23971,7 @@ const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
   '/api/sessions/read-all',
-  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
+  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/collaboration-config', '/api/search',
   '/api/cron', '/api/cron/channels', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',

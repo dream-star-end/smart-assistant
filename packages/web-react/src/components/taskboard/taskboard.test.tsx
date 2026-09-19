@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
@@ -7,6 +7,7 @@ import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import { ApiError, api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
+  ACTIVE_LIST_STATUSES,
   LAST_PROJECT_STORAGE_KEY,
   type PipelineStage,
   type Project,
@@ -123,13 +124,13 @@ describe('workspaceWantPath', () => {
 })
 
 describe('任务列表移动端布局', () => {
-  test('默认用卡片展示并收起高级筛选，可一键清除但保留搜索词', () => {
+  test('默认用卡片展示并收起高级筛选，可一键清除但保留搜索词（清除回到默认在途）', () => {
     const onQueryChange = vi.fn()
     render(
       <TooltipProvider>
         <TicketListView
           tickets={[sampleTicket()]}
-          query={{ q: '登录', type: 'bug', priority: 'P0' }}
+          query={{ q: '登录', type: 'bug', priority: 'P0', status: ACTIVE_LIST_STATUSES }}
           onQueryChange={onQueryChange}
           onOpenTicket={() => {}}
         />
@@ -139,12 +140,13 @@ describe('任务列表移动端布局', () => {
     expect(screen.getByTestId('ticket-list-cards')).toBeInTheDocument()
     expect(screen.queryByTestId('ticket-list-advanced-filters')).not.toBeInTheDocument()
 
+    // 默认的「在途」状态不算用户加的筛选,只数 type + priority。
     fireEvent.click(screen.getByRole('button', { name: '筛选 2' }))
     expect(screen.getByTestId('ticket-list-advanced-filters')).toBeInTheDocument()
     expect(screen.getByLabelText('按优先级筛选')).toHaveDisplayValue('P0 紧急')
 
     fireEvent.click(screen.getByRole('button', { name: '清除筛选' }))
-    expect(onQueryChange).toHaveBeenCalledWith({ q: '登录' })
+    expect(onQueryChange).toHaveBeenCalledWith({ q: '登录', status: ACTIVE_LIST_STATUSES })
   })
 })
 
@@ -258,7 +260,8 @@ describe('TicketCard 类型 / 优先级映射', () => {
     expect(screen.getByText('P1')).toBeInTheDocument()
     expect(screen.getByText('research')).toHaveAttribute('title', 'research')
     expect(screen.getAllByText('受阻').length).toBeGreaterThan(0)
-    expect(screen.getByLabelText('需求单')).toBeInTheDocument()
+    // 类型图标对读屏隐藏(类型由徽章表达),不再是一个无 role 的带 aria-label 的 span(审计 T-17 ⑤)。
+    expect(screen.getByTitle('需求单')).toHaveAttribute('aria-hidden', 'true')
   })
 
   test('取消卡降透明并划线标题', () => {
@@ -614,20 +617,20 @@ describe('TicketDrawer 详情', () => {
     expect(String(onOpenSession.mock.calls[0]?.[0])).not.toContain(':')
   })
 
-  test('来源会话：列表找不到则不调用 onOpenSession，并给出中文说明', async () => {
+  test('来源会话：列表找不到则按钮真正禁用，并用 title 给出中文说明', async () => {
     const ticket = sampleTicket({
       originSessionKey: 'agent:main:webchat:dm:webabc12345',
     })
     mockDrawerApis(ticket)
     const { onOpenSession } = renderDrawer(ticket, { sessionIds: [] })
     const btn = await screen.findByTestId('ticket-drawer-origin-session')
+    // 审计 T-29:不再是半透明还能点、点了才 toast。
+    expect(btn).toBeDisabled()
+    expect(btn).toHaveAttribute('title', '来源会话不在当前列表中，可能已删除或不是网页对话')
     await act(async () => {
       fireEvent.click(btn)
     })
     expect(onOpenSession).not.toHaveBeenCalled()
-    expect(
-      await screen.findByText('来源会话不在当前列表中，可能已删除或不是网页对话'),
-    ).toBeInTheDocument()
   })
 
   test('巡检 sessionKey 不能当来源会话 id', async () => {
@@ -660,8 +663,9 @@ describe('TicketDrawer 详情', () => {
     await waitFor(() => {
       expect(screen.getByText('发表评论失败')).toBeInTheDocument()
     })
-    const timeline = screen.getByTestId('ticket-timeline')
-    expect(timeline.textContent).not.toContain('先别合')
+    // 评论输入区现在位于讨论列表之后、同在时间线容器里(审计 T-18 ①),只看已渲染的条目。
+    const items = screen.queryAllByTestId('ticket-timeline-item')
+    expect(items.some((el) => el.textContent?.includes('先别合'))).toBe(false)
     expect((screen.getByTestId('ticket-drawer-comment') as HTMLTextAreaElement).value).toBe(
       '先别合',
     )
@@ -762,7 +766,7 @@ describe('TicketDrawer 详情', () => {
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
   })
 
-  test('run 明细在成本旁显示不精确提示', async () => {
+  test('run 明细不把有用量但金额为零展示成免费', async () => {
     const ticket = sampleTicket()
     const run = sampleRun({
       status: 'succeeded',
@@ -778,7 +782,8 @@ describe('TicketDrawer 详情', () => {
     await act(async () => {
       fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
     })
-    expect(await screen.findByText(/\$0\.0000（不精确）/)).toBeInTheDocument()
+    expect(await screen.findByText(/有用量但无金额/)).toBeInTheDocument()
+    expect(screen.queryByText(/\$0\.0000/)).not.toBeInTheDocument()
   })
 })
 
@@ -897,7 +902,7 @@ describe('BoardSettingsPanel', () => {
     })
     expect(await screen.findByText('急停全部巡检？')).toBeInTheDocument()
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '取消' }))
+      fireEvent.click(screen.getByRole('button', { name: '返回' }))
     })
     expect(patch).not.toHaveBeenCalled()
   })
@@ -944,6 +949,15 @@ function mockEmptyBoard() {
     columns: [],
     inbox: [],
     backlog: { tickets: [] },
+  })
+}
+
+/** 窄屏(jsdom)下顶栏的「配置」下拉:Radix 菜单用键盘打开最稳。 */
+async function openConfigMenu() {
+  const trigger = await screen.findByTestId('taskboard-config-menu')
+  trigger.focus()
+  await act(async () => {
+    fireEvent.keyDown(trigger, { key: 'Enter' })
   })
 }
 
@@ -1088,11 +1102,16 @@ describe('任务面板项目范围切换', () => {
       })
       expect(screen.getByTestId('taskboard-root')).toBeInTheDocument()
       expect(screen.queryByText('此页面加载出错')).not.toBeInTheDocument()
-      if (token === 'all' || token === 'none') {
+      if (token === 'all') {
+        expect(await screen.findByText('请选择一个工作项目以查看看板')).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: '选择工作项目' })).toBeInTheDocument()
+      } else if (token === 'none') {
         expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: '选择工作项目' })).toBeNull()
       } else {
         await waitFor(() => {
           expect(screen.queryByText('该会话项目未绑定看板')).not.toBeInTheDocument()
+          expect(screen.queryByText('请选择一个工作项目以查看看板')).not.toBeInTheDocument()
         })
       }
     }
@@ -1121,7 +1140,9 @@ describe('项目管理', () => {
     renderBoard()
     expect(await screen.findByText('该会话项目未绑定看板')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByTestId('project-create-open'))
+    // jsdom 是窄屏:项目 / 流水线 / 模板 / 护栏四个入口收在「配置」菜单里(审计 T-10)。
+    await openConfigMenu()
+    fireEvent.click(await screen.findByTestId('project-create-open'))
     await screen.findByTestId('project-create')
     fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'ocv5' } })
     fireEvent.change(screen.getByTestId('project-name'), { target: { value: 'V5 自用' } })
@@ -1291,7 +1312,7 @@ describe('流水线 / 阶段配置', () => {
     )
   })
 
-  test('保存遇 409 时提示并重读', async () => {
+  test('保存遇 409 时提示并重读；本地草稿不再被静默丢掉，可一键载入最新', async () => {
     const { pipeline, stage } = mockStageApis()
     const listPipelines = vi.spyOn(taskboardApi, 'listPipelines')
     const getPipeline = vi.spyOn(taskboardApi, 'getPipeline')
@@ -1301,7 +1322,12 @@ describe('流水线 / 阶段配置', () => {
     await openStageEditor()
     const pipelinesBefore = listPipelines.mock.calls.length
     const getBefore = getPipeline.mock.calls.length
-    fireEvent.change(screen.getByLabelText('提示词模板'), { target: { value: '会被丢掉的本地值' } })
+    // 服务端在我们编辑期间改了这个阶段;重读后返回的是对方的版本。
+    getPipeline.mockResolvedValue({
+      pipeline,
+      stages: [{ ...stage, promptTemplate: '对方改过的模板', updatedAt: 2 }],
+    })
+    fireEvent.change(screen.getByLabelText('提示词模板'), { target: { value: '我的本地修改' } })
     await act(async () => {
       fireEvent.click(screen.getByTestId('stage-save-s1'))
     })
@@ -1309,9 +1335,45 @@ describe('流水线 / 阶段配置', () => {
     await waitFor(() => {
       expect(listPipelines.mock.calls.length).toBeGreaterThan(pipelinesBefore)
       expect(getPipeline.mock.calls.length).toBeGreaterThan(getBefore)
-      expect(screen.getByLabelText('提示词模板')).toHaveValue(stage.promptTemplate ?? '')
     })
     expect(getPipeline).toHaveBeenCalledWith(auth, pipeline.id)
+    // 审计 T-12:重载不再 remount 编辑器,我的草稿还在,并提示对方改过、可载入最新。
+    expect(screen.getByLabelText('提示词模板')).toHaveValue('我的本地修改')
+    const stale = await screen.findByTestId('stage-stale-s1')
+    expect(stale).toHaveTextContent('刚被别处更新过')
+    fireEvent.click(within(stale).getByRole('button', { name: /载入最新/ }))
+    expect(screen.getByLabelText('提示词模板')).toHaveValue('对方改过的模板')
+    expect(screen.queryByTestId('stage-stale-s1')).not.toBeInTheDocument()
+  })
+
+  test('写操作重载后，已展开的阶段编辑器不丢草稿；关闭抽屉前会拦一下', async () => {
+    const { pipeline, stage } = mockStageApis()
+    const s2 = sampleStage({ id: 's2', pipelineId: pipeline.id, name: '自验', ordinal: 1 })
+    vi.spyOn(taskboardApi, 'getPipeline').mockResolvedValue({ pipeline, stages: [stage, s2] })
+    const reorder = vi
+      .spyOn(taskboardApi, 'reorderStages')
+      .mockResolvedValue({ ok: true, items: [s2, stage] })
+    await openStageEditor()
+    fireEvent.change(screen.getByLabelText('阶段名称'), { target: { value: '改了名字还没保存' } })
+    expect(screen.getByTestId('stage-editor-s1')).toHaveAttribute('data-dirty', 'true')
+    // 点另一个阶段的「上移」触发 reload:以前整个编辑器 remount、草稿归零(审计 T-12)。
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('stage-up-s2'))
+    })
+    await waitFor(() => expect(reorder).toHaveBeenCalledTimes(1))
+    expect(screen.getByLabelText('阶段名称')).toHaveValue('改了名字还没保存')
+    // 关闭抽屉:有未保存修改先确认;「继续编辑」留下,「放弃修改并关闭」才关。
+    fireEvent.click(screen.getByTestId('stage-settings-close'))
+    expect(await screen.findByText('有未保存的阶段修改')).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '继续编辑' }))
+    })
+    expect(screen.getByTestId('stage-settings')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('stage-settings-close'))
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: '放弃修改并关闭' }))
+    })
+    await waitFor(() => expect(screen.queryByTestId('stage-settings')).not.toBeInTheDocument())
   })
 
   test('listPipelines / patchStage / listAgents 走真实端点', async () => {
@@ -1374,6 +1436,30 @@ describe('流水线 / 阶段配置', () => {
     ).toEqual({
       orderedIds: ['s2', 's1'],
     })
+  })
+})
+
+describe('TaskboardView 窄屏配置入口', () => {
+  test('窄屏下四个配置入口收进「配置」菜单，带完整文字，没有 10px 短标签（审计 T-10）', async () => {
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([sampleProject()])
+    mockEmptyBoard()
+    renderBoard()
+    const toolbar = await screen.findByTestId('taskboard-responsive-toolbar')
+    expect(within(toolbar).queryByText('阶段')).not.toBeInTheDocument()
+    expect(within(toolbar).queryByText('看板')).not.toBeInTheDocument()
+    expect(toolbar.querySelector('.text-\\[10px\\]')).toBeNull()
+    await waitFor(() => expect(screen.getByLabelText('项目范围')).toHaveValue('p1'))
+    await openConfigMenu()
+    expect(await screen.findByTestId('project-edit-open')).toHaveTextContent('管理项目')
+    expect(screen.getByTestId('project-create-open')).toHaveTextContent('新建项目')
+    expect(screen.getByTestId('stage-settings-open')).toHaveTextContent('流水线配置')
+    expect(screen.getByTestId('template-library-open')).toHaveTextContent('流水线模板')
+    expect(screen.getByTestId('board-settings-open')).toHaveTextContent('护栏设置')
+    // 菜单项能打开对应抽屉,抽屉自带关闭按钮(审计 T-05)。
+    fireEvent.click(screen.getByTestId('board-settings-open'))
+    expect(await screen.findByTestId('board-settings')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('board-settings-close'))
+    await waitFor(() => expect(screen.queryByTestId('board-settings')).not.toBeInTheDocument())
   })
 })
 

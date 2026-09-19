@@ -28,7 +28,15 @@
 // Ported from NousResearch/hermes-agent tools/skills_tool.py.
 
 import { createHash, randomUUID } from 'node:crypto'
-import { type Dir, type Dirent, type Stats, existsSync, realpathSync, statSync } from 'node:fs'
+import {
+  type Dir,
+  type Dirent,
+  type Stats,
+  existsSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from 'node:fs'
 import {
   lstat,
   mkdir,
@@ -42,8 +50,10 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import type { IdentityCompatProfile } from '@openclaude/protocol'
 import { hashSkillTree, loadProjectSkillFileMap } from './projectSkillLedger.js'
 import { paths } from './paths.js'
+import { IdentityAssetsError, isIdentityAssetsError } from './identityCompatAssets.js'
 
 export const MAX_SKILL_NAME_LENGTH = 64
 export const MAX_SKILL_DESCRIPTION_LENGTH = 1024
@@ -401,6 +411,25 @@ function compareSemver(a: string, b: string): number {
   return 0
 }
 
+/**
+ * A4 identity-compat asset wiring for a specialized agent's store.
+ *
+ * The profile MUST be the master-resolver-validated IdentityCompatProfile
+ * (protocol layer 1); the store never guesses registrations. When set:
+ *   - the store runs as the CANONICAL execution id (authorization, agent-seed,
+ *     project and hub scope checks all stay canonical);
+ *   - the ONLY private read/write target becomes
+ *     `agents/<localSkillStorageId>/skills` — the registered legacy namespace.
+ *     The canonical agent's own private dir is NOT read; a same-named skill
+ *     there is a precise COMPAT_SKILL_CONFLICT, never a scan-order override;
+ *   - shared-scope visibility additionally recognizes `localSkillStorageId`
+ *     for THIS registered pair only (hub stays canonical-authorized — market
+ *     readiness is not widened by the asset alias).
+ */
+export interface SkillStoreCompatOptions {
+  profile: IdentityCompatProfile
+}
+
 export interface SkillStoreOptions {
   /**
    * Optional read-only platform baseline skills directory. When set, entries here
@@ -459,6 +488,11 @@ export interface SkillStoreOptions {
    * the per-agent agent-seed layer is NOT loaded. Requires sharedDir.
    */
   aggregateLegacy?: boolean
+  /**
+   * A4 identity-compat assets (see SkillStoreCompatOptions). Explicit opt-in;
+   * absent = pre-A4 behavior, byte-for-byte.
+   */
+  compat?: SkillStoreCompatOptions
 }
 
 export class SkillStore {
@@ -483,7 +517,10 @@ export class SkillStore {
   private readonly sharedWritable: boolean
   /** Runtime filters shared/hub by agent scope; management sees all. */
   private readonly scopeMode: SkillScopeMode
-  /** Absolute write target: shared (when sharedRoot set) else per-agent legacy dir. */
+  /** A4 identity-compat wiring, or null (pre-A4 behavior). */
+  private readonly compat: SkillStoreCompatOptions | null
+  /** Absolute write target: shared (when sharedRoot set) else per-agent legacy dir
+   * (with compat: the registered localSkillStorageId dir, never the canonical's). */
   private readonly writeRoot: string
 
   constructor(agentId: string, opts: SkillStoreOptions = {}) {
@@ -569,14 +606,92 @@ export class SkillStore {
     this.sharedWritable = opts.sharedWritable !== false
     this.scopeMode = opts.scopeMode ?? 'runtime'
     this.writesToShared = this.sharedRoot != null && this.sharedWritable
+    this.compat = opts.compat ?? null
+
+    if (this.compat) {
+      const p = this.compat.profile
+      if (agentId !== p.canonicalAgentId) {
+        throw new IdentityAssetsError(
+          'COMPAT_CONFIG_CONFLICT',
+          `compat skill store must run as canonical '${p.canonicalAgentId}' (got '${agentId}'); legacy '${p.legacyAgentId}' is not an execution identity`,
+        )
+      }
+      if (!VALID_AGENT_ID_RE.test(p.localSkillStorageId)) {
+        throw new IdentityAssetsError(
+          'COMPAT_CONFIG_CONFLICT',
+          `invalid localSkillStorageId: ${p.localSkillStorageId}`,
+        )
+      }
+      if (this.aggregateLegacy || agentId === resolveDefaultAgentId()) {
+        throw new IdentityAssetsError(
+          'COMPAT_CONFIG_CONFLICT',
+          'compat skill store is only for specialized (non-aggregate) agents, not the default aggregator',
+        )
+      }
+      if (this.writesToShared) {
+        throw new IdentityAssetsError(
+          'COMPAT_CONFIG_CONFLICT',
+          'compat store private write target must be the registered legacy dir, not the shared root',
+        )
+      }
+    }
 
     // Write target: shared if available+writable, else per-agent legacy dir (back-compat).
-    this.writeRoot = this.writesToShared ? (this.sharedRoot as string) : paths.agentSkillsDir(agentId)
+    // With compat: the registered localSkillStorageId dir — the canonical's own
+    // private dir must never become a second write source.
+    this.writeRoot = this.writesToShared
+      ? (this.sharedRoot as string)
+      : this.compat
+        ? paths.agentSkillsDir(this.compat.profile.localSkillStorageId)
+        : paths.agentSkillsDir(agentId)
   }
 
-  /** Legacy roots: per-agent dir, or every agent's dir in aggregate mode. */
+  /** Canonical agent's own private skills root, when it exists (compat conflict detection only). */
+  private compatCanonicalPrivateRoot(): string | null {
+    if (!this.compat) return null
+    const root = paths.agentSkillsDir(this.compat.profile.canonicalAgentId)
+    return existsSync(root) ? root : null
+  }
+
+  /**
+   * Fail-closed same-name guard between the canonical agent's own private dir
+   * and the registered legacy private dir. Any overlap is a precise
+   * COMPAT_SKILL_CONFLICT — never a scan-order pick, silent shadow or
+   * capability loss. With `name`, checks just that skill (save/view/delete);
+   * without it, checks every name in the canonical private dir (list).
+   */
+  private assertNoCompatSkillConflict(name?: string): void {
+    if (!this.compat) return
+    const canonicalRoot = this.compatCanonicalPrivateRoot()
+    if (!canonicalRoot) return
+    const registeredRoot = paths.agentSkillsDir(this.compat.profile.localSkillStorageId)
+    const names = name ? [name] : readdirSyncDirs(canonicalRoot)
+    const conflicts = names.filter(
+      (n) =>
+        existsSync(join(canonicalRoot, n, 'SKILL.md')) &&
+        existsSync(join(registeredRoot, n, 'SKILL.md')),
+    )
+    if (conflicts.length > 0) {
+      throw new IdentityAssetsError(
+        'COMPAT_SKILL_CONFLICT',
+        `same-named private skill(s) exist in both the canonical private dir and the registered legacy dir: ${conflicts.join(', ')} (${canonicalRoot} vs ${registeredRoot}); resolve explicitly — no scan-order override, no silent overwrite`,
+      )
+    }
+  }
+
+  /** Legacy roots: per-agent dir, or every agent's dir in aggregate mode.
+   * With compat: the registered legacy namespace replaces the canonical's own
+   * dir as the (sole) private legacy layer. */
   private async legacyRoots(): Promise<Array<{ root: string; agentId: string }>> {
     if (!this.aggregateLegacy) {
+      if (this.compat) {
+        return [
+          {
+            root: paths.agentSkillsDir(this.compat.profile.localSkillStorageId),
+            agentId: this.compat.profile.localSkillStorageId,
+          },
+        ]
+      }
       return [{ root: paths.agentSkillsDir(this.agentId), agentId: this.agentId }]
     }
     const agentsDir = paths.agentsDir
@@ -601,6 +716,7 @@ export class SkillStore {
   }
 
   async list(opts: SkillViewOptions = {}): Promise<SkillMetadata[]> {
+    this.assertNoCompatSkillConflict()
     const includePlatform = opts.includePlatform !== false
     const result: SkillMetadata[] = []
     const seen = new Set<string>()
@@ -629,7 +745,8 @@ export class SkillStore {
     if (this.sharedRoot) {
       push(await this.scanRoot(this.sharedRoot, 'user', 'shared', this.sharedWritable))
     }
-    // 4) legacy per-agent (read-only; write-fallback when no sharedRoot)
+    // 4) legacy per-agent (read-only; write-fallback when no sharedRoot). With
+    // compat the single legacy root IS the registered write target → writable.
     const legacyWritable = !this.writesToShared
     for (const legacyRoot of await this.legacyRoots()) {
       push(
@@ -637,7 +754,7 @@ export class SkillStore {
           legacyRoot.root,
           'user',
           'legacy',
-          legacyWritable && legacyRoot.agentId === this.agentId,
+          this.compat ? legacyWritable : legacyWritable && legacyRoot.agentId === this.agentId,
           legacyRoot.agentId,
         ),
       )
@@ -730,8 +847,15 @@ export class SkillStore {
   private scopeAllows(layer: SkillLayer, agentIds: readonly string[]): boolean {
     if (this.scopeMode === 'management') return true
     if (layer === 'project') return agentIds.includes(this.agentId)
-    if (layer !== 'shared' && layer !== 'hub') return true
-    return agentIds.includes(this.agentId)
+    if (layer === 'shared') {
+      // Compat recognizes the registered legacy storage id for the SHARED layer
+      // only (old scope assignments keep working). Hub stays canonical-only:
+      // market readiness is never widened by the asset alias.
+      if (agentIds.includes(this.agentId)) return true
+      return Boolean(this.compat && agentIds.includes(this.compat.profile.localSkillStorageId))
+    }
+    if (layer === 'hub') return agentIds.includes(this.agentId)
+    return true
   }
 
   private projectOverlayTreeOk(name: string): boolean {
@@ -823,6 +947,7 @@ export class SkillStore {
     const includePlatform = opts.includePlatform !== false
     const v = validateSkillName(name)
     if (!v.ok) return null
+    this.assertNoCompatSkillConflict(name)
     // Read priority: baseline > agent-seed > shared > legacy.
     // User-management views skip the platform layers so a platform skill's name
     // resolves to null (→ 404) instead of leaking its body — symmetric with list().
@@ -885,7 +1010,7 @@ export class SkillStore {
           legacyRoot.root,
           'user',
           'legacy',
-          legacyWritable && legacyRoot.agentId === this.agentId,
+          this.compat ? legacyWritable : legacyWritable && legacyRoot.agentId === this.agentId,
           legacyRoot.agentId,
         )
       }
@@ -1070,6 +1195,12 @@ export class SkillStore {
   ): Promise<{ ok: boolean; error?: string }> {
     const v = validateSkillName(meta.name)
     if (!v.ok) return { ok: false, error: v.error }
+    try {
+      this.assertNoCompatSkillConflict(meta.name)
+    } catch (err) {
+      if (isIdentityAssetsError(err)) return { ok: false, error: err.message }
+      throw err
+    }
     let requestedAgentIds: string[] | undefined
     if (options.agentIds !== undefined) {
       const scopeCheck = validateSkillAgentScope(options.agentIds)
@@ -1369,6 +1500,9 @@ export class SkillStore {
   async delete(name: string): Promise<{ ok: boolean; error?: string; note?: string }> {
     const v = validateSkillName(name)
     if (!v.ok) return { ok: false, error: v.error }
+    // Compat: refuse to delete the registered copy while a same-named canonical
+    // private skill exists — that would leave an ambiguous, silently-shifted name.
+    this.assertNoCompatSkillConflict(name)
 
     const baselineExists = await this.rootHas(this.baselineRoot, name)
     const seedExists = await this.rootHas(this.agentSeedRoot, name)
@@ -1405,6 +1539,17 @@ export class SkillStore {
       return { ok: true, note: 'removed legacy residue' }
     }
     return { ok: true }
+  }
+}
+
+/** Top-level skill-directory names under `rootDir` (used by the compat conflict scan). */
+function readdirSyncDirs(rootDir: string): string[] {
+  try {
+    return readdirSync(rootDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)
+  } catch {
+    return []
   }
 }
 
@@ -1475,8 +1620,9 @@ export function buildRunSkillStore(opts: {
   agentId: string
   projectId?: string | null
   projectSkillFiles?: ReadonlyMap<string, ReadonlyMap<string, string>>
+  compat?: SkillStoreCompatOptions
 }): SkillStore {
-  const store = buildAgentSkillStore(opts.agentId)
+  const store = buildAgentSkillStore(opts.agentId, opts.compat)
   const projectId = typeof opts.projectId === 'string' ? opts.projectId.trim() : ''
   if (!projectId) return store
   const projectDir = paths.projectSkillsDir(projectId)
@@ -1496,15 +1642,28 @@ export function buildRunSkillStore(opts: {
       hubDir,
       projectDir,
       projectSkillFiles,
+      compat: opts.compat,
     })
-  } catch {
+  } catch (err) {
+    // Never swallow a compat conflict, and never fall back to a store whose
+    // write target stopped being the registered legacy namespace.
+    if (isIdentityAssetsError(err)) throw err
     return store
   }
 }
 
-export function buildAgentSkillStore(agentId: string): SkillStore {
+export function buildAgentSkillStore(agentId: string, compat?: SkillStoreCompatOptions): SkillStore {
   const baselineDir = resolveBaselineSkillsDirFromEnv()
   const hubDir = join(paths.hubDir, 'skills')
+
+  if (compat && agentId === resolveDefaultAgentId()) {
+    // The default aggregator sees every agent's skills anyway; a compat profile
+    // for it is a wiring error, not a silent pass-through.
+    throw new IdentityAssetsError(
+      'COMPAT_CONFIG_CONFLICT',
+      'compat skill store is only for specialized agents, not the default aggregator',
+    )
+  }
 
   if (agentId === resolveDefaultAgentId()) {
     // Default/generalist agent → aggregate view (same wiring as buildUserSkillStore).
@@ -1528,6 +1687,7 @@ export function buildAgentSkillStore(agentId: string): SkillStore {
   // Specialized agent → baseline + seed + assigned shared skills + its own
   // per-agent skills. Shared is read-only here; self-authored skill_save writes to
   // agents/<id>/skills and remains private unless the user later changes ownership.
+  // With compat: the private read/write layer is the registered legacy namespace.
   const agentSeedDir = paths.agentSeedSkillsDir(agentId)
   const sharedDir = paths.sharedSkillsDir
   try {
@@ -1537,16 +1697,23 @@ export function buildAgentSkillStore(agentId: string): SkillStore {
       sharedDir,
       sharedWritable: false,
       hubDir,
+      compat,
     })
-  } catch {
+  } catch (err) {
+    if (isIdentityAssetsError(err)) throw err
     try {
       return new SkillStore(agentId, {
         agentSeedDir,
         sharedDir,
         sharedWritable: false,
         hubDir,
+        compat,
       })
-    } catch {
+    } catch (err2) {
+      if (isIdentityAssetsError(err2)) throw err2
+      // Compat must not degrade to a store that writes into the canonical's own
+      // private dir — that would create the forbidden second write source.
+      if (compat) throw err2
       return new SkillStore(agentId)
     }
   }

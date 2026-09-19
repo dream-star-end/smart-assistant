@@ -125,6 +125,33 @@ describe('PublishFromSessionDialog', () => {
     expect(onSubmitted).toHaveBeenCalledWith({ strippedRoles: ['system'] })
   })
 
+  it('主按钮禁用时写明原因，条件满足后原因消失（TU-27）；成果大小用可读单位（TU-26）', async () => {
+    render(
+      <PublishFromSessionDialog
+        open
+        onOpenChange={() => {}}
+        auth={auth}
+        sessionId="sess-1"
+        sessionTitle="公开数据分析"
+        messages={messages}
+        onSubmitted={() => {}}
+      />,
+    )
+    await screen.findByLabelText('勾选成果 report.md')
+    expect(screen.getByText(/text\/markdown · 24 B/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '提交快照审核' })).toBeDisabled()
+    expect(screen.getByRole('status')).toHaveTextContent('摘要至少 10 个字')
+    fireEvent.change(screen.getByLabelText(/标题/), { target: { value: '' } })
+    expect(screen.getByRole('status')).toHaveTextContent('还没有标题')
+    fireEvent.change(screen.getByLabelText(/标题/), { target: { value: '公开数据分析' } })
+    fireEvent.change(screen.getByLabelText(/摘要/), {
+      target: { value: '把一次真实会话变成可复查的教程快照。' },
+    })
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '提交快照审核' })).toBeEnabled()
+    expect(document.body.textContent).not.toContain('htmlpreview')
+  })
+
   it('勾选成果时携带权威源路径供服务端精确改写', async () => {
     render(
       <PublishFromSessionDialog

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -207,16 +207,20 @@ test('official structured failures set nonzero exit without interpreting or chan
   }
 })
 
-async function waitForCall(log: string, command: string): Promise<void> {
+async function waitForFixtureSignal(ready: () => boolean, message: string): Promise<void> {
   const deadline = Date.now() + 5_000
   while (Date.now() < deadline) {
-    if (existsSync(log) && readFileSync(log, 'utf8').split('\n').some((line) => {
-      const fields = line.split('\t')
-      return fields[0] === 'start' && fields[4] === command
-    })) return
+    if (ready()) return
     await new Promise((resolveWait) => setTimeout(resolveWait, 20))
   }
-  assert.fail(`CLI did not start ${command}`)
+  assert.fail(message)
+}
+
+async function waitForCall(log: string, command: string): Promise<void> {
+  await waitForFixtureSignal(() => existsSync(log) && readFileSync(log, 'utf8').split('\n').some((line) => {
+    const fields = line.split('\t')
+    return fields[0] === 'start' && fields[4] === command
+  }), `CLI did not start ${command}`)
 }
 
 test('help/version bypass a held browser lock without activity or reaper side effects', async () => {
@@ -254,6 +258,12 @@ test('per-Agent flock serializes commands and detached reaper closes only after 
     const holding = run(f.launcher, ['hold'], env)
     await waitForCall(f.log, 'hold')
     const waiting = run(f.launcher, ['snapshot'], env)
+    // spawn alone does not mean the second launcher has registered its queue entry.
+    const agentState = join(f.state, readdirSync(f.state)[0]!)
+    await waitForFixtureSignal(
+      () => readdirSync(agentState).some((name) => /^pending\.[1-9]\d*$/.test(name)),
+      'second command did not register pending activity',
+    )
     await new Promise((resolveWait) => setTimeout(resolveWait, 100))
     assert.ok(!readFileSync(f.log, 'utf8').split('\n').some((line) =>
       line.startsWith('start\t') && line.split('\t')[4] === 'snapshot'))

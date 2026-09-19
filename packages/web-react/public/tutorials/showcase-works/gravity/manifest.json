@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "workId": "gravity",
+  "kind": "original-interactive-code",
+  "authorship": "Created in OpenClaude for OCV5-172; not a third-party replay",
+  "rendering": "Browser-rendered cover, not an AI illustration",
+  "fullConversationReplay": false,
+  "files": [
+    {
+      "path": "/tutorials/showcase-works/gravity/index.html",
+      "bytes": 10903,
+      "sha256": "c4507bf805461118fa7d25bb5dc6cd3c98d8bffb2f373f93990ef9e07e7b158e"
+    },
+    {
+      "path": "/tutorials/showcase-works/gravity/physics.js",
+      "bytes": 1649,
+      "sha256": "46d4782f7ea97d2ea9f324850386bd8f7b67586665696ad39132a47ec1470905"
+    },
+    {
+      "path": "/tutorials/showcase-works/gravity/physics.mjs",
+      "bytes": 1614,
+      "sha256": "ef00c2226703ca6c9faa14f57b57dba9c866d8fddee10866dacaa67227d128d2"
+    },
+    {
+      "path": "/tutorials/showcase-works/gravity/source.zip",
+      "bytes": 6816,
+      "sha256": "a092f86c54ceb6bd2a7b47ece93772fefcd0f8506340f7ac2a12d01fdbbe39b8"
+    },
+    {
+      "path": "/tutorials/showcase-works/gravity/cover.png",
+      "bytes": 106103,
+      "sha256": "eb3e13dfe2e6114e715c26fc50984b0e43df152cddb3466925604dd372354219"
+    }
+  ],
+  "sourceFiles": [
+    "index.html",
+    "physics.js",
+    "physics.mjs"
+  ],
+  "limitations": "2D softened Newtonian teaching model; dimensionless G=1; epsilon=.025; dt=.002 velocity Verlet; not collision or relativity simulation."
+}

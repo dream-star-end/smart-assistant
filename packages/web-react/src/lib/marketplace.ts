@@ -149,6 +149,53 @@ export function validateHumanMeta(d: HumanMetaDraft): string | null {
   return null
 }
 
+// ── 发布草稿落盘（K-01）────────────────────────────────────────────────────
+// 发布表单里的内容（技能正文 / 附属文件 / 商品信息）此前只活在面板生命周期内：Esc、点遮罩、
+// 切到别的中心都会无提示丢掉。草稿按发布类型各落一份 localStorage，下次打开「发布」原样恢复；
+// 提交成功 / 用户主动丢弃时清掉。值里只有用户自己敲的表单内容，不含任何 token。
+
+const PUBLISH_DRAFT_PREFIX = 'oc_v5_market_publish_draft:'
+
+export function publishDraftStorageKey(kind: 'skill' | 'agent' | 'connector'): string {
+  return `${PUBLISH_DRAFT_PREFIX}${kind}`
+}
+
+/**
+ * 读回一份草稿：在 `create()` 的空表单之上覆盖已存字段（新增字段自动补默认值，旧草稿不会因
+ * 表单结构演进而读崩）。存储不可用 / JSON 不合法 / 不是对象 → null。
+ */
+export function loadPublishDraft<T extends object>(key: string, create: () => T): T | null {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const base = create() as Record<string, unknown>
+    const stored = parsed as Record<string, unknown>
+    const next: Record<string, unknown> = { ...base }
+    for (const k of Object.keys(base)) if (k in stored) next[k] = stored[k]
+    return next as T
+  } catch {
+    return null
+  }
+}
+
+export function savePublishDraft(key: string, draft: object): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(draft))
+  } catch {
+    /* quota / private mode：落不了盘只影响恢复，不影响填写 */
+  }
+}
+
+export function clearPublishDraft(key: string): void {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    /* best effort */
+  }
+}
+
 /** 由显示名生成 slug 建议（发布表单联动；与后端 SLUG_RE 对齐）。 */
 export function suggestSlug(name: string): string {
   return name
@@ -176,6 +223,50 @@ export function marketAskAiPrefill(q: string): string {
  */
 export function marketTrySkillPrefill(name: string, slug: string): string {
   return `请帮我安装市场技能「${name}」(slug: ${slug}),装好后告诉我它能帮我做什么、给一个上手示例。`
+}
+
+// ── API 插件详情的人向文案（K-19） ────────────────────────────────────────
+// 签名契约（connectorContract）里的 authMode 是后端枚举（commercial/connectors/spec/types.ts 的
+// 七种 + marketplaceDb 给受控浏览器 / 无认证插件的 managed_browser / none），动作 id 是发布者起的
+// 机器名（create_post / listCustomers）。详情页此前把两者原样给用户；这里统一翻成人话，
+// 没见过的值**原样返回、不猜**（后端新增枚举时用户看到的是原词而不是错译）。
+
+const CONNECTOR_AUTH_MODE_LABEL: Record<string, string> = {
+  'static-token': 'API 密钥（静态令牌）',
+  'oauth2-auth-code': 'OAuth 授权登录',
+  'token-exchange': '平台令牌交换',
+  'hmac-signing': '请求签名（HMAC）',
+  oauth1a: 'OAuth 1.0a 授权',
+  'imap-smtp': '邮箱账号密码（IMAP / SMTP）',
+  'webdav-basic': 'WebDAV 账号密码',
+  managed_browser: '平台托管浏览器登录态',
+  none: '无需认证',
+}
+
+/** authMode 枚举 → 用户能读懂的认证方式；未知值原样返回。 */
+export function connectorAuthModeLabel(authMode: string): string {
+  return CONNECTOR_AUTH_MODE_LABEL[authMode] ?? authMode
+}
+
+/**
+ * 动作 id → 可读短语：`create_post` / `createFollowUp` / `pages.search` →
+ * `create post` / `create follow up` / `pages search`。契约里没有 title/label 字段
+ * （projection.ts 只投影 id + effect），只能从机器名整理；整理后为空时退回原 id。
+ */
+export function connectorActionLabel(id: string): string {
+  const spaced = id
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_\-./:]+/g, ' ')
+    .trim()
+    .toLowerCase()
+  return spaced || id
+}
+
+/** 动作 effect → 中文；未知值按最保守的「写入」对待（与详情页既有判定一致）。 */
+export function connectorActionEffectLabel(effect: string): string {
+  if (effect === 'read') return '读取'
+  if (effect === 'send') return '发送'
+  return '写入'
 }
 
 /**

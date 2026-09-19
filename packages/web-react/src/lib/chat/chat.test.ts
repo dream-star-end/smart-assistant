@@ -24,6 +24,7 @@ import {
   lastRealUserTurn,
   computeTypingLabel,
   isPlatedAssistantMessage,
+  problemCardPresentation,
   STALE_WARN_MS,
 } from "./pure";
 import {
@@ -3312,6 +3313,31 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
       expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
     },
   );
+
+  test("legacy SESSION_DELETED paints a non-retryable card and does not auto-recover", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "hello", { status: "sending", ts: 1 });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = user.id;
+    const scheduleAutomaticRecovery = vi.fn();
+    applyLegacyBridgeError(
+      s,
+      {
+        type: "error",
+        code: "SESSION_DELETED",
+        message: "This conversation was deleted. Start a new one; retrying here will not bring it back.",
+        clientMessageId: user.id,
+        retryable: false,
+        action: "new_session",
+      } as never,
+      { scheduleAutomaticRecovery },
+    );
+    expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+    expect(s._sendingInFlight).toBe(false);
+    const card = s.messages.find((m) => m._errorCode);
+    expect(card?._errorCode).toBe("session_deleted");
+    expect(card?.text).toContain("删除");
+  });
 
   test("无 clientMessageId 的取消只检查最近用户行，不改动更早的排队消息", () => {
     for (const legacy of [false, true]) {
@@ -7156,6 +7182,290 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
   });
 });
 
+describe("ChatSocket problem card reporting", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  type ProblemCardCall = {
+    sessionId: string;
+    rootCmid: string;
+    code: string;
+    outcome: string;
+    path: string;
+    presentation: string;
+    reason?: string;
+    attempts?: number;
+    traceId?: string;
+  };
+
+  function problemCardFixture(sessId: string, opts: { masterOwns?: boolean; code?: string } = {}) {
+    const reports: ProblemCardCall[] = [];
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({
+      syncSession: async () => {},
+      reportProblemCard: (p) => { reports.push({ ...p }); },
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    if (opts.masterOwns !== false) {
+      ws.onmessage?.({
+        data: JSON.stringify({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" }),
+      });
+    }
+    sock.sendMessage({ sessId, agentId: "main", text: "long task", model: "kimi-k3-ark" });
+    const session = sock.sessions.get(sessId)!;
+    const user = session.messages.find((m) => m.role === "user")!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
+    }) });
+    ws.sent.length = 0;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
+      code: opts.code ?? "upstream_failed", message: "boom", frameSeq: 1, ts: Date.now(),
+    }) });
+    return { sock, ws, session, user, reports };
+  }
+
+  test("legacy owner reports one failed/immediate/red", () => {
+    const { sock, user, reports } = problemCardFixture("s-pc-legacy", { masterOwns: false });
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      sessionId: "s-pc-legacy",
+      rootCmid: user.id,
+      code: "upstream_failed",
+      outcome: "failed",
+      path: "immediate",
+      presentation: "red",
+    });
+    sock.stop();
+  });
+
+  test("expected code immediate uses presentation yellow", () => {
+    const { sock, reports } = problemCardFixture("s-pc-yellow", { masterOwns: false, code: "model_capacity" });
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      code: "model_capacity",
+      outcome: "failed",
+      path: "immediate",
+      presentation: "yellow",
+    });
+    sock.stop();
+  });
+
+  test("master-owner recoverable code pending/deferred then recovered on clean child final", () => {
+    const { sock, ws, session, user, reports } = problemCardFixture("s-pc-recover", { code: "model_capacity" });
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      outcome: "pending",
+      path: "deferred",
+      presentation: "soft",
+      rootCmid: user.id,
+      code: "model_capacity",
+      attempts: 1,
+    });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-pc-recover", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: true,
+      rootClientMessageId: user.id, mode: "checkpoint", attempt: 1, max: 10,
+    }) });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: "s-pc-recover", kind: "dm" },
+      clientMessageId: "m-recover-pc1",
+      recovery: {
+        automatic: true, mode: "checkpoint", sourceClientMessageId: user.id, rootClientMessageId: user.id,
+        attempt: 1, max: 10, agentId: "main", model: "kimi-k3-ark",
+      },
+    }) });
+    expect(session.messages.at(-1)).toMatchObject({ id: "m-recover-pc1", _automaticRecovery: true });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.message", sessionKey: "agent:main:webchat:dm:s-pc-recover", channel: "webchat",
+      peer: { id: "s-pc-recover", kind: "dm" }, clientMessageId: "m-recover-pc1", isFinal: true,
+      frameSeq: 2, ts: Date.now(), blocks: [{ kind: "text", text: "recovered answer" }],
+    }) });
+    expect(reports.map((r) => `${r.outcome}/${r.path}`)).toEqual([
+      "pending/deferred",
+      "recovered/recovery_adopted",
+    ]);
+    expect(reports[1]).toMatchObject({
+      rootCmid: user.id,
+      code: "model_capacity",
+      presentation: "soft",
+      attempts: 1,
+    });
+    sock.stop();
+  });
+
+  test("decision_declined reports reason and does not also report decision_timeout", () => {
+    const { sock, ws, reports } = problemCardFixture("s-pc-decline");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-pc-decline", kind: "dm" },
+      sourceClientMessageId: reports[0]?.rootCmid, errorCode: "upstream_failed",
+      scheduled: false, reason: "checkpoint_unsafe",
+    }) });
+    expect(reports.filter((r) => r.outcome === "failed")).toEqual([
+      expect.objectContaining({
+        path: "decision_declined",
+        reason: "checkpoint_unsafe",
+        presentation: "red",
+      }),
+    ]);
+    vi.advanceTimersByTime(60_000);
+    expect(reports.filter((r) => r.path === "decision_timeout")).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("20s grace timeout reports one failed/decision_timeout", () => {
+    const { sock, reports } = problemCardFixture("s-pc-dtimeout");
+    vi.advanceTimersByTime(19_999);
+    expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(reports.filter((r) => r.outcome === "failed")).toEqual([
+      expect.objectContaining({ path: "decision_timeout", presentation: "red" }),
+    ]);
+    sock.stop();
+  });
+
+  test("scheduled:true then 30s without ack reports adoption_timeout", () => {
+    const { sock, ws, user, reports } = problemCardFixture("s-pc-atimeout");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: "s-pc-atimeout", kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "upstream_failed", scheduled: true,
+      rootClientMessageId: user.id, mode: "checkpoint", attempt: 1, max: 10,
+    }) });
+    vi.advanceTimersByTime(29_999);
+    expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(reports.filter((r) => r.outcome === "failed")).toEqual([
+      expect.objectContaining({ path: "adoption_timeout" }),
+    ]);
+    sock.stop();
+  });
+
+  test("recoverySkipped ack reports failed/recovery_skipped", () => {
+    const { sock, ws, user, reports } = problemCardFixture("s-pc-skip");
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: false, recoverySkipped: true, recoverySkippedReason: "stale_tape",
+      peer: { id: "s-pc-skip", kind: "dm" }, clientMessageId: "m-recover-skip-pc",
+      sourceClientMessageId: user.id,
+    }) });
+    expect(reports.filter((r) => r.outcome === "failed")).toEqual([
+      expect.objectContaining({ path: "recovery_skipped" }),
+    ]);
+    sock.stop();
+  });
+
+  test("soft-state Stop reports only cancelled/stop_fenced", () => {
+    const { sock, reports } = problemCardFixture("s-pc-stop");
+    sock.stopTurn("s-pc-stop");
+    expect(reports.map((r) => `${r.outcome}/${r.path}`)).toEqual([
+      "pending/deferred",
+      "cancelled/stop_fenced",
+    ]);
+    expect(reports.some((r) => r.outcome === "failed")).toBe(false);
+    sock.stop();
+  });
+
+  test("same key reports once; different paths each report once", () => {
+    const { sock, ws, session, user, reports } = problemCardFixture("s-pc-dedupe", { masterOwns: false });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: "s-pc-dedupe", kind: "dm" }, clientMessageId: user.id,
+      code: "upstream_failed", message: "boom again", frameSeq: 2, ts: Date.now(),
+    }) });
+    expect(reports.filter((r) => r.path === "immediate")).toHaveLength(1);
+    sock.stop();
+
+    const second = problemCardFixture("s-pc-paths");
+    vi.advanceTimersByTime(20_000);
+    expect(second.reports.map((r) => `${r.outcome}/${r.path}`)).toEqual([
+      "pending/deferred",
+      "failed/decision_timeout",
+    ]);
+    second.sock.stop();
+    expect(session.id).toBe("s-pc-dedupe");
+  });
+
+  test("stopped / user_cancelled / REPORT_EXEMPT codes are not reported", () => {
+    const stopped = problemCardFixture("s-pc-stopped", { masterOwns: false, code: "stopped" });
+    expect(stopped.reports).toHaveLength(0);
+    stopped.sock.stop();
+
+    const exempt = problemCardFixture("s-pc-exempt", { masterOwns: false, code: "insufficient_credits" });
+    expect(exempt.reports).toHaveLength(0);
+    exempt.sock.stop();
+
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const reports: ProblemCardCall[] = [];
+    const sock = makeSocket({
+      syncSession: async () => {},
+      reportProblemCard: (p) => { reports.push({ ...p }); },
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s-pc-uc", agentId: "main", text: "hi", model: "kimi-k3-ark" });
+    const session = sock.sessions.get("s-pc-uc")!;
+    const user = session.messages.find((m) => m.role === "user")!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack", admitted: true, peer: { id: "s-pc-uc", kind: "dm" }, clientMessageId: user.id,
+    }) });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: "s-pc-uc", kind: "dm" }, clientMessageId: user.id,
+      code: "upstream_failed", detail: "本轮已由用户停止。", message: "cancelled", frameSeq: 1, ts: Date.now(),
+    }) });
+    expect(reports).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("historical hydration with an error card does not report", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const reports: ProblemCardCall[] = [];
+    const sock = makeSocket({ reportProblemCard: (p) => { reports.push({ ...p }); } });
+    sock.applyServerMessages("s-pc-hydrate", "main", [
+      {
+        id: "u-hist", role: "user", text: "q", ts: 1, status: "error",
+        _source: "server", _seq: 1, _orderSeq: 1,
+      },
+      {
+        id: "a-hist", role: "assistant", text: "err", ts: 2,
+        _errorCode: "upstream_failed", _clientMessageId: "u-hist",
+        _source: "server", _seq: 2, _orderSeq: 2,
+      },
+    ] as ChatMessage[], true, 2);
+    expect(reports).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("paintDeferredTerminalError early-return on adopted lineage does not report failed", () => {
+    const { sock, session, user, reports } = problemCardFixture("s-pc-adopted");
+    session.messages.push({
+      id: "m-recover-already",
+      role: "user",
+      text: "retry",
+      ts: Date.now(),
+      _automaticRecovery: true,
+      _recoveryOfClientMessageId: user.id,
+    } as ChatMessage);
+    vi.advanceTimersByTime(20_000);
+    expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
+    expect(reports.map((r) => `${r.outcome}/${r.path}`)).toEqual(["pending/deferred"]);
+    sock.stop();
+  });
+
+  test("problemCardPresentation matches cards.tsx errorTone mapping", () => {
+    expect(problemCardPresentation("model_capacity", false)).toBe("yellow");
+    expect(problemCardPresentation("upstream_failed", false)).toBe("red");
+    expect(problemCardPresentation("upstream_failed", true)).toBe("yellow");
+    expect(problemCardPresentation("insufficient_credits", false)).toBe("yellow");
+    expect(problemCardPresentation("unknown_code_xyz", false)).toBe("red");
+  });
+});
+
 describe("ChatSocket 1008 auth recovery", () => {
   afterEach(() => {
     FakeWS.instances = [];
@@ -9476,6 +9786,105 @@ describe("ChatSocket 正在恢复上一轮 banner self-clear", () => {
 
     await vi.advanceTimersByTimeAsync(30_000);
     expect(sock.getSnapshot().status.label).not.toBe("正在恢复上一轮…");
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  /** 真 final 帧走 reducer 的 onFinal 路径，**不经过** clearSendingState。
+   *  此前 dismissStaleRestoreBanner 只挂在 clearSendingState 上，正常成功收尾
+   *  后没有任何一处重估状态条 → 恢复条一直钉到用户手动刷新（用户报障截图）。*/
+  test("真 final 帧收尾后恢复条自动消失（不经 clearSendingState）", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-final";
+    ws.open(); // onopen 快照到在飞会话 → arm 30s 安全网
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        peer: { id: "s1", kind: "dm" },
+        clientMessageId: "u-final",
+        frameSeq: 1,
+        isFinal: true,
+        ts: Date.now(),
+        blocks: [{ kind: "text", text: "done", messageId: "srv-1" }],
+      }),
+    });
+    await flushStatus();
+
+    expect(session._sendingInFlight).toBe(false);
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  /** 侧栏里任意一条注水残留的 in-flight（turn 早已在服务端收尾、本 tab 永不会
+   *  再收到它的终态帧）不得钉死横幅：收口判据只看「钉横幅时的归属会话」。*/
+  test("其他会话残留 in-flight 不钉死横幅：只看归属会话", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const viewing = sock.ensureSession("s-viewing", "main");
+    viewing._sendingInFlight = true;
+    viewing._activeClientMessageId = "u-current";
+    ws.open();
+    await flushStatus();
+    // 注水复原的旧会话：_sendingInFlight 为真，但它不属于本次恢复条的归属集合。
+    const stale = sock.ensureSession("s-other-stale", "main");
+    stale._sendingInFlight = true;
+    stale._activeClientMessageId = "u-stale-from-hydration";
+
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    (sock as unknown as { clearSendingState(sess: typeof viewing): void }).clearSendingState(viewing);
+    await flushStatus();
+
+    expect(stale._sendingInFlight).toBe(true); // 残留仍在，但不再有钉住权
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  /** 归属会话仍在等终态时，横幅必须留住——修复不能把它摘早了。*/
+  test("归属会话仍在飞时，横幅保持不动", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const a = sock.ensureSession("s-a", "main");
+    a._sendingInFlight = true;
+    a._activeClientMessageId = "u-a";
+    const b = sock.ensureSession("s-b", "main");
+    b._sendingInFlight = true;
+    b._activeClientMessageId = "u-b";
+    ws.open(); // 两条都进归属集合
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    (sock as unknown as { clearSendingState(sess: typeof a): void }).clearSendingState(a);
+    await flushStatus();
+    // b 仍在等终态 → 横幅必须留住
+    expect(sock.getSnapshot().status.label).toBe("正在恢复上一轮…");
+
+    (sock as unknown as { clearSendingState(sess: typeof b): void }).clearSendingState(b);
+    await flushStatus();
     expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
     sock.stop();
   });

@@ -1,0 +1,3 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import{finalAssistantText}from'./smoke-final-text.mjs';
+test('commentary before Read is not part of final-answer oracle',()=>{const summary={assistantText:'I will read.\n\nVALUE',assistantSegments:[{index:0,text:'I will read.'},{index:1,text:'VALUE'}]};assert.equal(finalAssistantText(summary),'VALUE');assert.notEqual(summary.assistantText,'VALUE')});
+test('legacy text-only summary and empty summary remain strict',()=>{assert.equal(finalAssistantText({assistantText:'VALUE'}),'VALUE');assert.equal(finalAssistantText(null),'')});

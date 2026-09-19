@@ -112,10 +112,27 @@ export function createApprovalBridge({
     async inspectOutbound(data, { sendJson } = {}) {
       const frame = parseGatewayWsJson(data)
       const request = permissionRequestFromFrame(frame)
-      if (!request) return { intercepted: false, frame }
+      if (!request) return { intercepted: false, frame, forward: true }
+      const classified = classify(request)
       const response = await handleRequest(request)
       if (typeof sendJson === 'function') sendJson(response)
-      return { intercepted: true, frame, request, response }
+      return {
+        intercepted: true,
+        frame,
+        request,
+        response,
+        classified,
+        forward: classified.needsApproval !== true,
+      }
     },
   }
+}
+
+/** W-R2-2: keep needsApproval permission_request off the product tunnel. */
+export function shouldForwardGatewayFrame(data, isBinary, classify = classifyPermissionFrame) {
+  if (isBinary) return true
+  const frame = parseGatewayWsJson(data)
+  const request = permissionRequestFromFrame(frame)
+  if (!request) return true
+  return classify(request).needsApproval !== true
 }

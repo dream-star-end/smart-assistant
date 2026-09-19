@@ -17,6 +17,7 @@ import type { Mailer, MailMessage } from "../auth/mail.js";
 import { confirmPasswordReset, requestPasswordReset } from "../auth/verify.js";
 import { patchUser } from "../admin/users.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
+import { prepareAuthRowResetForTest } from "./helpers/authRows.js";
 
 /**
  * T-14 集成:登录 + Refresh + Logout 端到端打通真 Postgres。
@@ -30,6 +31,7 @@ const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
+let resetAuthRows: (() => Promise<void>) | undefined;
 
 const JWT_SECRET = "x".repeat(64); // ≥32 bytes
 
@@ -69,6 +71,7 @@ before(async () => {
   setPoolOverride(pool);
   await resetTestSchemaForTest();
   await runMigrations();
+  resetAuthRows = await prepareAuthRowResetForTest();
   // 预热 dummy hash 一次性,后面测试看到的 timing 才公平
   await warmupLoginDummyHash();
 });
@@ -82,7 +85,8 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await query("TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  assert.ok(resetAuthRows, "real auth fixture setup must finish before each case");
+  await resetAuthRows();
 });
 
 function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {

@@ -145,6 +145,15 @@ describe("toolSummary 摘要 (P5)", () => {
       toolSummary("mcp__openclaude-memory__delegate_wait", { jobId: "dlgjob-abc" }),
     ).toBe("dlgjob-abc");
   });
+  test("MCP memory consult_advisor 摘要用提问，不露蛇形工具名", () => {
+    expect(
+      toolSummary("mcp__openclaude-memory__consult_advisor", {
+        question: "这个方案的事务边界对吗",
+      }),
+    ).toBe("这个方案的事务边界对吗");
+    expect(toolSummary("mcp__openclaude-memory__consult_advisor", {})).toBe("");
+    expect(toolSummary("mcp__openclaude-memory__consult_advisor", {})).not.toBe("consult_advisor");
+  });
   test("MCP memory skill_search / web-context 摘要", () => {
     expect(
       toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" }),
@@ -158,6 +167,43 @@ describe("toolSummary 摘要 (P5)", () => {
   });
   test("input 为 null → 空摘要", () => {
     expect(toolSummary("Bash", null)).toBe("");
+  });
+  test("Bash 长命令截断为 40 字加省略号", () => {
+    const cmd = "a".repeat(50);
+    expect(toolSummary("Bash", { command: cmd })).toBe(`${"a".repeat(40)}…`);
+    expect(toolSummary("Bash", { command: cmd }).length).toBe(41);
+  });
+  test("Read 显示路径", () => {
+    // T-26:表头标签已是「读取文件」,摘要只放对象,不再「读取文件 · 读取 …」重复动词。
+    expect(toolSummary("Read", { file_path: "src/App.tsx" })).toBe("src/App.tsx");
+    expect(toolSummary("Grep", { pattern: "useToast" })).toBe('"useToast"');
+    expect(toolSummary("Glob", { pattern: "**/*.tsx" })).toBe("**/*.tsx");
+    expect(toolSummary("WebSearch", { query: "OpenClaude v5" })).toBe('"OpenClaude v5"');
+  });
+  test("WebFetch 长 URL 截断带省略号,不硬切成错误 URL(T-06)", () => {
+    const url = "https://github.com/dream-star-end/openclaude-v5-selfhost/pulls/1284";
+    const summary = toolSummary("WebFetch", { url });
+    expect(summary.endsWith("…")).toBe(true);
+    expect(summary).toBe(`${url.slice(0, 60)}…`);
+    expect(toolSummary("WebFetch", { url: "https://x.com/a" })).toBe("https://x.com/a");
+  });
+  test("研究链路 oc-* 摘要取查询词/文件名,折叠态能区分同类卡(T-28)", () => {
+    expect(toolSummary("Bash", { command: 'oc-lit search "transformer attention"' })).toBe("transformer attention");
+    expect(toolSummary("Bash", { command: "oc-cite verify doi:10.1000/x" })).toBe("doi:10.1000/x");
+    expect(toolSummary("Bash", { command: "oc-ingest parse paper.pdf" })).toBe("paper.pdf");
+    expect(toolSummary("Bash", { command: 'oc-litrag query "问题" --docs doc_x' })).toBe("问题");
+    expect(toolSummary("Bash", { command: 'oc-memory session-search "触控靶 44px"' })).toBe("触控靶 44px");
+    expect(toolSummary("Bash", { command: "oc-report --schema s -o /home/agent/out/report.pdf" })).toBe(
+      "…/agent/out/report.pdf",
+    );
+    expect(toolSummary("Bash", { command: "oc-lit --help" })).toBe("");
+  });
+  test("MCP 未登记 op / consult_advisor 摘要不直显内部标识符(T-28)", () => {
+    expect(toolSummary("mcp__openclaude-memory__consult_advisor", { question: "要不要统一 44px?" })).toBe(
+      "要不要统一 44px?",
+    );
+    expect(toolSummary("mcp__openclaude-memory__some_new_op", { foo: 1 })).toBe("");
+    expect(toolSummary("mcp__browser__browser_future_op", { foo: 1 })).toBe("");
   });
 });
 
@@ -226,6 +272,9 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     );
     expect(resolveToolMeta("mcp__openclaude-memory__task_create").label).toBe("创建任务单");
     expect(resolveToolMeta("mcp__openclaude-memory__task_get").label).toBe("查看任务单");
+    expect(resolveToolMeta("mcp__openclaude-memory__present_task_approval").label).toBe(
+      "任务审批卡",
+    );
     expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe(
       "登录 500",
     );

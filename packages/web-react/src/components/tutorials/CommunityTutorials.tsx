@@ -16,9 +16,12 @@ import type { ChatMessage } from '../../lib/chat/model'
 import { api, apiErrorMessage } from '../../lib/api'
 import {
   canWithdrawCommunityTutorial,
+  communityCategoryLabel,
+  communityTutorialDraftIssue,
   snapshotPublishGate,
   snapshotPublishGateMessage,
   tutorialKindOf,
+  withdrawConsequence,
 } from '../../lib/tutorialStudio'
 import type {
   AuthSession,
@@ -31,7 +34,7 @@ import type {
   TutorialLeakReport,
 } from '../../lib/types'
 import { Markdown } from '../Markdown'
-import { Alert, Badge, Button, Field, Input, Select, Textarea } from '../ui'
+import { Alert, Badge, Button, Field, Input, ListSkeleton, Select, Textarea, useConfirm, useToast } from '../ui'
 import { PublishFromSessionDialog } from './PublishFromSessionDialog'
 import { SnapshotTutorialDetail } from './SnapshotTutorialDetail'
 
@@ -42,10 +45,11 @@ const CATEGORY_OPTIONS = [
   { value: 'general', label: '通用' },
 ]
 
-const CATEGORY_LABEL: Record<CommunityTutorialCategory, string> = {
-  research: '科研',
-  coding: '编码',
-  general: '通用',
+/** 「提交于」只到分钟：精确到秒对用户没有含义（审计 TU-26）。 */
+function formatSubmittedAt(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  return date.toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
 }
 
 const STATUS_META: Record<
@@ -102,12 +106,17 @@ export function CommunityTutorials({
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [selected, setSelected] = useState<CommunityTutorialDetail | null>(null)
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // 目录读失败与正文读失败分开（审计 TU-07）：此前共用一个 error，详情失败会压在目录上，
+  // 目录失败又与「还没有匹配的教程」空态同屏。
+  const [catalogError, setCatalogError] = useState<string | null>(null)
+  const [detailError, setDetailError] = useState<string | null>(null)
+  const [loadedOnce, setLoadedOnce] = useState(false)
+  const toast = useToast()
 
   const loadCatalog = useCallback(
     async (cursor: string | null, append = false) => {
       setLoading(true)
-      setError(null)
+      setCatalogError(null)
       try {
         const result = await api.listCommunityTutorials({
           cursor,
@@ -117,9 +126,10 @@ export function CommunityTutorials({
         setItems((current) => (append ? [...current, ...result.tutorials] : result.tutorials))
         setNextCursor(result.nextCursor)
       } catch (cause) {
-        setError(apiErrorMessage(cause, '加载社区教程失败'))
+        setCatalogError(apiErrorMessage(cause, '加载教程工作室目录失败'))
       } finally {
         setLoading(false)
+        setLoadedOnce(true)
       }
     },
     [filters],
@@ -132,12 +142,12 @@ export function CommunityTutorials({
   const openDetail = async (id: string, syncRoute = true) => {
     setView('catalog')
     setLoading(true)
-    setError(null)
+    setDetailError(null)
     try {
       setSelected(await api.getCommunityTutorial(id))
       if (syncRoute) onDetailIdChange?.(id)
     } catch (cause) {
-      setError(apiErrorMessage(cause, '加载教程正文失败'))
+      setDetailError(apiErrorMessage(cause, '加载教程正文失败'))
     } finally {
       setLoading(false)
     }
@@ -158,7 +168,7 @@ export function CommunityTutorials({
   const switchView = (next: CommunityView) => {
     setSelected(null)
     onDetailIdChange?.(null)
-    setError(null)
+    setDetailError(null)
     setGateNotice(null)
     if (next !== 'catalog' && !auth) {
       onRequireLogin?.()
@@ -170,7 +180,7 @@ export function CommunityTutorials({
   const openSnapshot = () => {
     setSelected(null)
     onDetailIdChange?.(null)
-    setError(null)
+    setDetailError(null)
     if (!auth) {
       onRequireLogin?.()
       return
@@ -183,20 +193,26 @@ export function CommunityTutorials({
     setSnapshotOpen(true)
   }
 
+  // 子视图 / 详情里 hero 收成一行工具栏（审计 TU-25）：两行说明只在目录首屏有意义，
+  // 在表单、我的发布和正文上方各顶 120–350px 只是把内容往下推。
+  const compactHero = view !== 'catalog' || selected !== null
+
   return (
     <section className="mx-auto flex min-h-full w-full max-w-6xl flex-col px-3 pb-12 pt-4 sm:px-7 sm:pt-7">
-      <div className="rounded-3xl border border-accent/20 bg-surface p-5 shadow-sm sm:p-7">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+      <div className={compactHero ? 'rounded-2xl border border-border bg-surface px-4 py-3 shadow-sm' : 'rounded-3xl border border-accent/20 bg-surface p-5 shadow-sm sm:p-7'}>
+        <div className={compactHero ? 'flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between' : 'flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between'}>
           <div>
             <p className="text-caption font-semibold uppercase tracking-widest text-accent">
               教程工作室
             </p>
-            <h1 className="mt-2 text-heading font-bold text-fg">
+            <h1 className={compactHero ? 'sr-only' : 'mt-2 text-heading font-bold text-fg'}>
               探索教程，或把一次真实会话变成可复用方法
             </h1>
-            <p className="mt-2 max-w-2xl text-body leading-6 text-muted">
-              可以手写 Markdown，也可以从当前已结束的会话生成交互快照。审核通过后进入公开目录。
-            </p>
+            {!compactHero && (
+              <p className="mt-2 max-w-2xl text-body leading-6 text-muted">
+                可以手写 Markdown，也可以从当前已结束的会话生成交互快照。审核通过后进入公开目录。
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
             <Button
@@ -235,9 +251,9 @@ export function CommunityTutorials({
         </div>
       </div>
 
-      {error && (
+      {detailError && (
         <Alert tone="danger" className="mt-4">
-          {error}
+          {detailError}
         </Alert>
       )}
       {gateNotice && (
@@ -265,6 +281,7 @@ export function CommunityTutorials({
           messages={sessionMessages}
           onSubmitted={(report) => {
             setLeakReport(report ?? null)
+            toast('快照已提交审核，可在「我的发布」查看进度', 'success')
             setView('mine')
           }}
         />
@@ -316,7 +333,19 @@ export function CommunityTutorials({
             </Button>
           </form>
 
-          {items.length === 0 && !loading ? (
+          {catalogError ? (
+            // 读失败时不渲染空态（否则像"目录是空的"），并给出可点的重试出口（审计 TU-07）。
+            <Alert tone="danger" className="mt-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <span>{catalogError}</span>
+                <Button variant="secondary" size="sm" loading={loading} onClick={() => void loadCatalog(null, false)}>
+                  重试
+                </Button>
+              </div>
+            </Alert>
+          ) : loading && items.length === 0 ? (
+            <ListSkeleton variant="card" rows={4} className="mt-5" />
+          ) : items.length === 0 && loadedOnce ? (
             <div className="mt-5 rounded-2xl border border-dashed border-border p-10 text-center">
               <BookOpen size={28} className="mx-auto text-faint" />
               <p className="mt-3 text-body font-medium text-fg">还没有匹配的教程</p>
@@ -333,7 +362,7 @@ export function CommunityTutorials({
                 >
                   <div className="flex items-center justify-between gap-3">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge tone="accent">{CATEGORY_LABEL[item.category]}</Badge>
+                      <Badge tone="accent">{communityCategoryLabel(item.category)}</Badge>
                       {tutorialKindOf(item) === 'snapshot' && (
                         <Badge tone="neutral">
                           <Sparkles size={11} /> 会话快照
@@ -366,7 +395,13 @@ export function CommunityTutorials({
           )}
         </div>
       ) : view === 'submit' && auth ? (
-        <CommunityTutorialSubmit auth={auth} onSubmitted={() => setView('mine')} />
+        <CommunityTutorialSubmit
+          auth={auth}
+          onSubmitted={() => {
+            toast('教程已提交审核，通过后会进入公开目录', 'success')
+            setView('mine')
+          }}
+        />
       ) : view === 'mine' && auth ? (
         <MyCommunityTutorials auth={auth} />
       ) : null}
@@ -383,15 +418,12 @@ function CommunityTutorialDetailView({
 }) {
   return (
     <article className="mx-auto mt-5 w-full max-w-4xl rounded-3xl border border-border bg-surface p-5 shadow-sm sm:p-8">
-      <button
-        type="button"
-        onClick={onBack}
-        className="inline-flex items-center gap-1.5 text-meta text-muted hover:text-fg"
-      >
+      {/* 返回走 Button 原语，触屏自动 44px（审计 TU-11）。 */}
+      <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2 text-muted hover:text-fg">
         <ArrowLeft size={14} /> 返回探索教程
-      </button>
+      </Button>
       <div className="mt-5 flex flex-wrap items-center gap-2">
-        <Badge tone="accent">{CATEGORY_LABEL[item.category]}</Badge>
+        <Badge tone="accent">{communityCategoryLabel(item.category)}</Badge>
         <span className="text-caption text-faint">
           {item.authorName} · {new Date(item.publishedAt).toLocaleDateString('zh-CN')}
         </span>
@@ -419,9 +451,15 @@ function CommunityTutorialSubmit({
   })
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // 提交门槛前置（审计 TU-05）：此前只有必填星号，空标题 / 空正文能直接提交，等服务端拒绝才看到一条泛化错误。
+  const issue = communityTutorialDraftIssue(draft)
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
+    if (issue) {
+      setError(issue)
+      return
+    }
     setSubmitting(true)
     setError(null)
     try {
@@ -436,6 +474,7 @@ function CommunityTutorialSubmit({
 
   return (
     <form
+      noValidate
       onSubmit={(event) => void submit(event)}
       className="mx-auto mt-5 w-full max-w-3xl rounded-3xl border border-border bg-surface p-5 shadow-sm sm:p-7"
     >
@@ -449,9 +488,10 @@ function CommunityTutorialSubmit({
         </Alert>
       )}
       <div className="mt-5 grid gap-5">
-        <Field label="标题" hint={`${draft.title.length}/100`} required>
+        <Field label="标题" hint={`${draft.title.length}/100；至少 4 个字`} required>
           <Input
             value={draft.title}
+            required
             minLength={4}
             maxLength={100}
             onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))}
@@ -460,11 +500,12 @@ function CommunityTutorialSubmit({
         </Field>
         <Field
           label="摘要"
-          hint={`${draft.summary.length}/280；说明适合谁、能得到什么结果`}
+          hint={`${draft.summary.length}/280；至少 10 个字，说明适合谁、能得到什么结果`}
           required
         >
           <Textarea
             value={draft.summary}
+            required
             minLength={10}
             maxLength={280}
             rows={3}
@@ -484,11 +525,12 @@ function CommunityTutorialSubmit({
         </Field>
         <Field
           label="教程正文"
-          hint={`${draft.bodyMarkdown.length}/50000；建议写清准备、步骤、结果和注意事项`}
+          hint={`${draft.bodyMarkdown.length}/50000；至少 40 个字，建议写清准备、步骤、结果和注意事项`}
           required
         >
           <Textarea
             value={draft.bodyMarkdown}
+            required
             minLength={40}
             maxLength={50000}
             rows={16}
@@ -496,12 +538,18 @@ function CommunityTutorialSubmit({
             onChange={(event) =>
               setDraft((current) => ({ ...current, bodyMarkdown: event.target.value }))
             }
-            placeholder="# 要解决的问题\n\n## 准备\n\n## 操作步骤\n\n## 如何核对结果"
+            // JS 字符串才有真正的换行；写在 JSX 属性字符串里 `\n` 会原样显示（审计 TU-06）。
+            placeholder={'# 要解决的问题\n\n## 准备\n\n## 操作步骤\n\n## 如何核对结果'}
           />
         </Field>
       </div>
-      <div className="mt-6 flex justify-end">
-        <Button type="submit" variant="primary" loading={submitting}>
+      <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
+        {issue && (
+          <output className="text-caption text-muted">
+            {issue}
+          </output>
+        )}
+        <Button type="submit" variant="primary" loading={submitting} disabled={!!issue}>
           <Send size={15} /> 提交审核
         </Button>
       </div>
@@ -514,6 +562,9 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [withdrawingId, setWithdrawingId] = useState<string | null>(null)
+  const [confirm, confirmElement] = useConfirm()
+  const toast = useToast()
 
   const load = useCallback(
     async (cursor: string | null, append = false) => {
@@ -524,7 +575,7 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
         setItems((current) => (append ? [...current, ...result.tutorials] : result.tutorials))
         setNextCursor(result.nextCursor)
       } catch (cause) {
-        setError(apiErrorMessage(cause, '加载我的投稿失败'))
+        setError(apiErrorMessage(cause, '加载我的发布失败'))
       } finally {
         setLoading(false)
       }
@@ -536,20 +587,35 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
     void load(null, false)
   }, [load])
 
-  const withdraw = async (id: string) => {
+  // 撤回是不可逆的危险操作：先确认、再发请求、按钮进忙态（审计 TU-08）。
+  const withdraw = async (item: CommunityTutorialMine) => {
+    const ok = await confirm({
+      title: '撤回这份教程？',
+      body: <p className="text-body text-muted">{withdrawConsequence(item.status)}</p>,
+      confirmText: '撤回',
+      danger: true,
+    })
+    if (ok !== true) return
     setError(null)
+    setWithdrawingId(item.id)
     try {
-      await api.withdrawCommunityTutorial(auth, id)
+      await api.withdrawCommunityTutorial(auth, item.id)
+      toast('已撤回', 'success')
       await load(null, false)
     } catch (cause) {
       setError(apiErrorMessage(cause, '撤回失败'))
+    } finally {
+      setWithdrawingId(null)
     }
   }
 
   return (
     <div className="mx-auto mt-5 w-full max-w-4xl">
+      {confirmElement}
       {error && <Alert tone="danger">{error}</Alert>}
-      {items.length === 0 && !loading ? (
+      {loading && items.length === 0 ? (
+        <ListSkeleton rows={3} />
+      ) : items.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-border p-10 text-center text-body text-faint">
           你还没有发布。
         </div>
@@ -569,7 +635,7 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
                       <Badge tone={meta.tone}>
                         <Icon size={12} /> {meta.label}
                       </Badge>
-                      <Badge tone="neutral">{CATEGORY_LABEL[item.category]}</Badge>
+                      <Badge tone="neutral">{communityCategoryLabel(item.category)}</Badge>
                       {tutorialKindOf(item) === 'snapshot' && (
                         <Badge tone="accent">
                           <Sparkles size={11} /> 会话快照
@@ -580,7 +646,13 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
                     <p className="mt-1 text-body leading-6 text-muted">{item.summary}</p>
                   </div>
                   {canWithdrawCommunityTutorial(item.status) && (
-                    <Button variant="ghost" size="sm" onClick={() => void withdraw(item.id)}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      loading={withdrawingId === item.id}
+                      disabled={withdrawingId !== null}
+                      onClick={() => void withdraw(item)}
+                    >
                       撤回
                     </Button>
                   )}
@@ -595,7 +667,7 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
                   </Alert>
                 )}
                 <p className="mt-4 text-caption text-faint">
-                  提交于 {new Date(item.createdAt).toLocaleString('zh-CN')}
+                  提交于 {formatSubmittedAt(item.createdAt)}
                 </p>
               </article>
             )

@@ -1,3 +1,4 @@
+import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
@@ -48,6 +49,49 @@ describe("OptionsBlock", () => {
     fireEvent.click(screen.getByText("网页提取"));
     fireEvent.click(screen.getByText(/确认选择/));
     expect(sendUserText).toHaveBeenCalledWith("我选择:浏览器、网页提取");
+  });
+
+  it("demo 演示模式:没有发送能力时说清是「演示模式仅供浏览」,而不是笼统的「不可交互」(D-08)", () => {
+    render(
+      <ChatInteractionContext.Provider value={{ reason: "demo" }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    // 选项仍以卡片呈现(演示要看得到形态),但不可点、且原因写明是演示模式。
+    expect(screen.getByText("选一个部署方式?")).toBeTruthy();
+    expect(screen.getByText(/演示模式仅供浏览/)).toBeTruthy();
+    expect(screen.queryByText(/此会话中不可交互/)).toBeNull();
+    // 一般无 provider / 无 reason 的只读情形仍是通用文案。
+    cleanup();
+    render(
+      <ChatInteractionContext.Provider value={{}}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByText(/此会话中不可交互/)).toBeTruthy();
+    expect(screen.queryByText(/演示模式/)).toBeNull();
+  });
+
+  it("已选项勾标与「确认选择」按钮前景走 text-accent-fg,不写死白字(深色 accent 上白字 2.82:1;a11y-C)", () => {
+    const code = JSON.stringify({
+      question: "要哪些能力?",
+      multi: true,
+      options: [{ label: "浏览器" }, { label: "研究检索" }],
+    });
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText: vi.fn() }}>
+        <OptionsBlock code={code} />
+      </ChatInteractionContext.Provider>,
+    );
+    const option = screen.getByText("浏览器").closest("button");
+    expect(option).toBeTruthy();
+    fireEvent.click(option as HTMLButtonElement);
+    const mark = (option as HTMLButtonElement).querySelector("span.size-4");
+    expect(mark).toHaveClass("bg-accent", "text-accent-fg");
+    expect(mark).not.toHaveClass("text-white");
+    const confirm = screen.getByText(/确认选择/).closest("button");
+    expect(confirm).toHaveClass("bg-accent", "text-accent-fg");
+    expect(confirm).not.toHaveClass("text-white");
   });
 
   it("falls back to source on invalid/partial JSON and to display-only without provider", () => {
@@ -114,6 +158,40 @@ describe("OptionsBlock", () => {
     );
     fireEvent.click(screen.getByText("灰度发布"));
     expect(sendUserText).not.toHaveBeenCalled();
+  });
+
+  // M-12:busy 下选项只被压成 opacity-80,用户不知道为什么点不动;触屏下选项/预览按钮不够 44px。
+  it("busy 时说明「等待当前回合结束后可选择」;非 busy / 已发送不出该提示", () => {
+    const sendUserText = vi.fn();
+    const { rerender } = render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("等待当前回合结束后可选择");
+    expect(screen.getByRole("button", { name: /灰度发布/ })).toHaveClass("[@media(hover:none)]:min-h-11");
+    rerender(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: false }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.queryByText("等待当前回合结束后可选择")).toBeNull();
+    fireEvent.click(screen.getByText("灰度发布"));
+    rerender(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    // 已发送(锁定)的卡不再需要解释 busy。
+    expect(screen.queryByText("等待当前回合结束后可选择")).toBeNull();
+  });
+});
+
+describe("HtmlPreview 触控尺寸(M-12)", () => {
+  it("头部「全屏放大」「看源码」在触屏下满足 44px", () => {
+    render(<HtmlPreview code="<div>hi</div>" />);
+    expect(screen.getByRole("button", { name: "全屏放大预览" })).toHaveClass("[@media(hover:none)]:size-11");
+    expect(screen.getByRole("button", { name: "看源码" })).toHaveClass("[@media(hover:none)]:min-h-11");
   });
 });
 

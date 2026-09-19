@@ -8,6 +8,7 @@ import {
   getDefaultVertexRegion,
   getVertexRegionForModel,
   isBareMode,
+  isOpenClaudeAdvisorHermetic,
   shouldMaintainProjectWorkingDir,
   getClaudeConfigHomeDir,
 } from '../envUtils'
@@ -293,6 +294,22 @@ describe('isBareMode', () => {
     delete process.env.CLAUDE_CODE_SIMPLE
     // argv doesn't have --bare by default
     expect(isBareMode()).toBe(false)
+  })
+})
+
+describe('isOpenClaudeAdvisorHermetic', () => {
+  const saved = process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC
+    else process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC = saved
+  })
+  test('true only for the advisor hermetic env flag', () => {
+    delete process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC
+    expect(isOpenClaudeAdvisorHermetic()).toBe(false)
+    process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC = '1'
+    expect(isOpenClaudeAdvisorHermetic()).toBe(true)
+    process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC = '0'
+    expect(isOpenClaudeAdvisorHermetic()).toBe(false)
   })
 })
 

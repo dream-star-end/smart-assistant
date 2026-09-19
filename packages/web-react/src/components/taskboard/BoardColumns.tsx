@@ -1,9 +1,9 @@
-import { Archive, Columns3 } from 'lucide-react'
+import { Archive, Columns3, Plus, Workflow } from 'lucide-react'
 import { type DragEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import type { BoardColumn, Ticket } from '../../lib/taskboard'
 import { collectInboxTickets, stageColumnTickets } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
-import { Badge, EmptyState } from '../ui'
+import { Badge, Button, EmptyState } from '../ui'
 import { TicketCard } from './TicketCard'
 import {
   BACKLOG_DROP_ID,
@@ -22,6 +22,9 @@ export function BoardColumns({
   renderActions,
   onMove,
   ticketTypeLabel,
+  onCreateTicket,
+  onOpenStageSettings,
+  onOpenTemplates,
 }: {
   columns: BoardColumn[]
   backlogTickets?: Ticket[]
@@ -30,11 +33,16 @@ export function BoardColumns({
   renderActions?: (ticket: Ticket) => ReactNode
   onMove?: (ticket: Ticket, toStageId: string | null) => void
   ticketTypeLabel?: string
+  /** 空态「新建单据」的下一步入口(审计 T-16)。 */
+  onCreateTicket?: () => void
+  /** 没有流水线时的两个下一步:去配置 / 套用模板(审计 T-03 / T-16)。 */
+  onOpenStageSettings?: () => void
+  onOpenTemplates?: () => void
 }) {
   const [dragging, setDragging] = useState<Ticket | null>(null)
   const [hoverDropId, setHoverDropId] = useState<string | null>(null)
   const overflowCleanup = useRef<(() => void) | null>(null)
-  const scroller = useRef<HTMLDivElement | null>(null)
+  const scroller = useRef<HTMLElement | null>(null)
   const [overflow, setOverflow] = useState({ left: false, right: false })
   const [activeDropId, setActiveDropId] = useState(BACKLOG_DROP_ID)
 
@@ -42,7 +50,7 @@ export function BoardColumns({
   const originDropId = dragging ? homeDropId(dragging) : null
   const waitingTickets = collectInboxTickets({ inbox: inboxTickets, columns })
 
-  const scrollerRef = (el: HTMLDivElement | null) => {
+  const scrollerRef = (el: HTMLElement | null) => {
     overflowCleanup.current?.()
     overflowCleanup.current = null
     scroller.current = el
@@ -82,7 +90,9 @@ export function BoardColumns({
 
   const beginDrag = (ticket: Ticket, e: DragEvent) => {
     const target = e.target as HTMLElement | null
-    if (target?.closest('select, button, a, input, textarea, label')) {
+    // 卡片标题现在是个真按钮(读屏可达,见 TicketCard),从它上面起拖仍要放行;
+    // 其余控件(批准 / 更多操作 / 下拉)保持禁止起拖。
+    if (target?.closest('select, button:not([data-drag-through]), a, input, textarea, label')) {
       e.preventDefault()
       return
     }
@@ -135,11 +145,13 @@ export function BoardColumns({
     onMove(ticket, stageIdFromDropId(dropId))
   }
 
+  // 列名已经表达了状态(积压列 / 待确认列 / 阶段列),卡片上不再重复画状态徽章;受阻仍保留。
   const renderCard = (ticket: Ticket) => (
     <TicketCard
       key={ticket.id}
       ticket={ticket}
       compact
+      hideStatus
       onOpen={onOpenTicket}
       actions={renderActions?.(ticket)}
       draggable={!!onMove && (ticket.allowedMoves?.length ?? 0) > 0}
@@ -150,11 +162,58 @@ export function BoardColumns({
   )
 
   if (columns.length === 0 && backlogTickets.length === 0 && waitingTickets.length === 0) {
+    // 项目已选但没有流水线:说清是「这个项目还没有 X 流水线」,并给出两个下一步,
+    // 而不是「选一个项目后…」这种与现状相反的解释(审计 T-03 / T-16 ②)。
     return (
       <EmptyState
         icon={Columns3}
-        title="还没有流水线列"
-        hint="选一个项目后，单据会按当前流水线阶段分列。"
+        title={`这个项目还没有${ticketTypeLabel ?? ''}流水线`}
+        hint="配置流水线或套用一条模板后，单据会按阶段分列显示。"
+        action={
+          onOpenStageSettings || onOpenTemplates ? (
+            <div className="flex flex-wrap justify-center gap-2">
+              {onOpenStageSettings && (
+                <Button type="button" data-testid="board-empty-configure" onClick={onOpenStageSettings}>
+                  <Workflow size={14} />
+                  配置流水线
+                </Button>
+              )}
+              {onOpenTemplates && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  data-testid="board-empty-templates"
+                  onClick={onOpenTemplates}
+                >
+                  套用模板
+                </Button>
+              )}
+            </div>
+          ) : undefined
+        }
+      />
+    )
+  }
+
+  const stageTicketCount = columns.reduce(
+    (sum, col) => sum + stageColumnTickets(col.tickets).length,
+    0,
+  )
+  if (stageTicketCount === 0 && backlogTickets.length === 0 && waitingTickets.length === 0) {
+    // 项目零单据:不画 6 个空列让人对着一排最低对比度的灰框猜下一步(审计 T-16 ①)。
+    return (
+      <EmptyState
+        icon={Columns3}
+        title="还没有单据"
+        hint={`流水线已就位（${columns.map((c) => c.stage.name).join(' → ')}）。新建第一条单据后，它会出现在积压里或直接进入第一站。`}
+        action={
+          onCreateTicket ? (
+            <Button type="button" data-testid="board-empty-create" onClick={onCreateTicket}>
+              <Plus size={14} />
+              新建第一条单据
+            </Button>
+          ) : undefined
+        }
       />
     )
   }
@@ -182,27 +241,26 @@ export function BoardColumns({
       >
         {navItems.map((item) => {
           const active = activeDropId === item.id
+          // 走 Button 原语拿触控靶(触屏 ≥44px),不再手写 36px 的裸 button(审计 T-11)。
           return (
-            <button
+            <Button
               key={item.id}
               type="button"
+              size="sm"
+              shape="pill"
+              variant={active ? 'accent' : 'secondary'}
               aria-current={active ? 'page' : undefined}
               aria-label={`查看${item.label}，${item.count}条单据`}
-              className={cn(
-                'inline-flex min-h-9 shrink-0 items-center gap-1 rounded-full border px-3 text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                active
-                  ? 'border-accent bg-accent-soft text-accent'
-                  : 'border-border bg-surface text-muted',
-              )}
+              className="shrink-0 gap-1 px-3 text-caption"
               onClick={() => jumpToColumn(item.id)}
             >
               <span>{item.label}</span>
-              <span className="text-faint">{item.count}</span>
-            </button>
+              <span className={active ? 'opacity-80' : 'text-faint'}>{item.count}</span>
+            </Button>
           )
         })}
       </nav>
-      <div
+      <section
         ref={scrollerRef}
         data-testid="board-columns-scroller"
         data-overflow-left={overflow.left ? 'true' : undefined}
@@ -275,7 +333,7 @@ export function BoardColumns({
             </BoardColumnFrame>
           )
         })}
-      </div>
+      </section>
       {overflow.left && (
         <div
           aria-hidden
@@ -286,8 +344,10 @@ export function BoardColumns({
         <div
           data-testid="board-overflow-hint"
           aria-hidden
-          className="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-bg to-transparent"
-        />
+          className="pointer-events-none absolute inset-y-0 right-0 flex w-16 items-center justify-end bg-gradient-to-l from-bg via-bg/80 to-transparent pr-1 text-faint"
+        >
+          <span className="text-body">→</span>
+        </div>
       )}
     </div>
   )
@@ -299,7 +359,7 @@ function ColumnEmpty({ children }: { children: ReactNode }) {
       data-testid="column-empty"
       className="flex min-h-[10rem] flex-1 items-center justify-center rounded-lg border border-dashed border-border bg-hover px-3 py-6"
     >
-      <p className="text-center text-meta text-faint">{children}</p>
+      <p className="text-center text-meta text-muted">{children}</p>
     </div>
   )
 }
@@ -399,7 +459,9 @@ function BoardColumnFrame({
       onDrop={handleDrop}
       onDragLeave={handleDragLeave}
       className={cn(
-        'flex w-[calc(100vw-2rem)] max-w-[20rem] shrink-0 snap-start flex-col rounded-xl md:w-72 md:max-w-none md:snap-none',
+        // 桌面列宽随容器伸缩(14–18rem):1440px 视口下六列尽量排开,不再固定 288px 把最后一列
+        // 整个推到视口外(审计 T-24);仍溢出时右侧有渐隐 + 箭头提示。
+        'flex w-[calc(100vw-2rem)] max-w-[20rem] shrink-0 snap-start flex-col rounded-xl md:w-[clamp(14rem,calc((100%_-_5.75rem)/6),18rem)] md:max-w-none md:snap-none',
         backlog || inbox || empty
           ? 'border border-dashed border-border bg-hover'
           : 'border border-transparent bg-bg',

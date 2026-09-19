@@ -97,8 +97,13 @@ describe("slot relay", () => {
     assert.deepEqual((await client.broadcastToUsers(["1", "2", "3", "4"], { ok: true })).sort(), ["1", "2", "3"]);
     assert.ok(sentA.length > 0 && sentB.length > 0);
 
-    const peerDown = createSlotRelayClient({ secret: "secret", ports: [portA, 9], requestTimeoutMs: 50, totalBudgetMs: 150 });
+    // Exercise an actual peer failure without racing the healthy peer against a
+    // 50 ms performance deadline. The separate half-open test owns that budget.
+    let resetHits = 0;
+    const resetPort = await listen((req) => { resetHits += 1; req.socket.destroy(); });
+    const peerDown = createSlotRelayClient({ secret: "secret", ports: [portA, resetPort] });
     assert.deepEqual((await peerDown.onlineUserSubset(["1", "3"])).sort(), ["1"]);
+    assert.equal(resetHits, 1, "the unavailable peer must really receive and reset the request");
   });
 
   test("cost broadcast 在仅候选槽持有 WS 时仍投递到候选槽", async () => {

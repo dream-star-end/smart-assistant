@@ -20,6 +20,12 @@ export type MarkdownProps = {
    * 稳定占位,生成结束（false）再一次性挂载渲染。缺省 false（历史/静态消息立即渲染）。
    */
   live?: boolean;
+  /**
+   * 流式光标:在正文**最后一个文本块末尾**内联渲染一枚闪烁光标(rehype 注入,随当前文字色),
+   * 「正在输入」的落点与文字同一行;最后一块是代码块/表格等非文本块时回退到块后单独一行。
+   * 由调用方按「本条消息正在流式」传入;缺省 false。
+   */
+  caret?: boolean;
   /** 站内信/后台预览等只读上下文：仅渲染站内资产/外链图，禁 HTML 执行与聊天交互。 */
   readOnly?: boolean;
   /** 完全禁用正文图片加载；用于公开投稿等不可信内容，避免远程像素追踪。 */
@@ -65,9 +71,11 @@ function PlainFallbackText({ children }: { children: string }) {
 }
 
 function HtmlPreviewFallback({ code, live }: { code: string; live?: boolean }) {
+  // 只用本仓 @theme 里存在的 token(bg-surface / bg-hover / text-muted);此前的 bg-background /
+  // bg-muted/40 / text-muted-foreground 不在 styles.css 里,chunk 未到达时头部无底色、文字色继承。
   return (
-    <div className="not-prose my-3 overflow-hidden rounded-lg border border-border bg-background shadow-sm">
-      <div className="border-b border-border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground">
+    <div className="not-prose my-3 overflow-hidden rounded-lg border border-border bg-surface shadow-sm">
+      <div className="border-b border-border bg-hover px-3 py-2 text-xs font-medium text-muted">
         HTML {live ? "预览(生成中)" : "预览"}
       </div>
       {live ? (
@@ -129,6 +137,7 @@ export const Markdown = memo(function Markdown({
   children,
   signMedia,
   live,
+  caret,
   readOnly,
   blockImages,
 }: MarkdownProps) {
@@ -139,6 +148,7 @@ export const Markdown = memo(function Markdown({
         <MarkdownImpl
           signMedia={signMedia}
           live={live}
+          caret={caret}
           readOnly={readOnly}
           blockImages={blockImages}
         >

@@ -4003,6 +4003,11 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && node scripts/check-v5-callback-payload-hash.mjs"; then
+    echo "✗ pinned callback payload hash WS proof failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts"; then
     echo "✗ pinned cron submit durability boundary gate failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
@@ -4020,6 +4025,11 @@ build_release() {
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts"; then
     echo "✗ pinned Codex ChatGPT websocket hang gate (INC-20260915-CODEX-CHATGPT-WS) failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-advisor-1m-dup-picker.ts"; then
+    echo "✗ pinned advisor 1M twin picker gate (INC-20260915-ADVISOR-1M-DUP-PICKER) failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
@@ -6800,7 +6810,7 @@ smoke() {
   #     先例,idleSweep/alert/refreshEventsSweep 等同列;smoke 校验 healthz.schedulers
   #     必须是本名单子集,加白名单即可,不改 domain)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep cursorExternalApiOutbox"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do

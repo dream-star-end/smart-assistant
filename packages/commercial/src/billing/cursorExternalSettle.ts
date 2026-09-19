@@ -57,8 +57,72 @@ export function cursorSettleMultiplier(
   return surcharge === "1.000" ? null : surcharge;
 }
 
-function applyCursorSettleMultiplier(pricing: ModelPricing): { pricing: ModelPricing; surcharge: string | null } {
-  const surcharge = cursorSettleMultiplier(pricing.model_id);
+/** Frozen pricing fields captured before the model call. Rates are decimal
+ * strings so the intent file never contains bigint. `settleSurcharge` is the
+ * effective surcharge at capture (`null` = none), not a second catalog multiply. */
+export interface CursorPricingBasis {
+  modelId: string;
+  displayName: string;
+  inputPerMtok: string;
+  outputPerMtok: string;
+  cacheReadPerMtok: string;
+  cacheWritePerMtok: string;
+  catalogMultiplier: string;
+  settleSurcharge: string | null;
+  capturedAt: string;
+}
+
+/** Once-generated plan stored on the ready record. Recovery must not re-read
+ * catalog/env; `costCredits` is a decimal string (JSON cannot hold bigint). */
+export interface PreparedCursorSettlePlan {
+  settleStatus: "success" | "error";
+  costCredits: string;
+  snapshotJson: string;
+}
+
+export function captureCursorPricingBasis(
+  pricing: ModelPricing,
+  env: NodeJS.ProcessEnv = process.env,
+  capturedAt: Date = new Date(),
+): CursorPricingBasis {
+  return {
+    modelId: pricing.model_id,
+    displayName: pricing.display_name,
+    inputPerMtok: pricing.input_per_mtok.toString(),
+    outputPerMtok: pricing.output_per_mtok.toString(),
+    cacheReadPerMtok: pricing.cache_read_per_mtok.toString(),
+    cacheWritePerMtok: pricing.cache_write_per_mtok.toString(),
+    catalogMultiplier: pricing.multiplier,
+    settleSurcharge: cursorSettleMultiplier(pricing.model_id, env),
+    capturedAt: capturedAt.toISOString(),
+  };
+}
+
+export function modelPricingFromBasis(basis: CursorPricingBasis): ModelPricing {
+  return {
+    model_id: basis.modelId,
+    display_name: basis.displayName,
+    input_per_mtok: BigInt(basis.inputPerMtok),
+    output_per_mtok: BigInt(basis.outputPerMtok),
+    cache_read_per_mtok: BigInt(basis.cacheReadPerMtok),
+    cache_write_per_mtok: BigInt(basis.cacheWritePerMtok),
+    multiplier: basis.catalogMultiplier,
+    enabled: true,
+    sort_order: 0,
+    visibility: "public",
+    extra_system_prompt: null,
+    default_effort: null,
+    updated_at: new Date(basis.capturedAt),
+  };
+}
+
+function applyCursorSettleMultiplier(
+  pricing: ModelPricing,
+  capturedSurcharge?: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): { pricing: ModelPricing; surcharge: string | null } {
+  const surcharge =
+    capturedSurcharge !== undefined ? capturedSurcharge : cursorSettleMultiplier(pricing.model_id, env);
   if (surcharge === null) return { pricing, surcharge: null };
   return {
     pricing: { ...pricing, multiplier: composeMultiplier(pricing.multiplier, surcharge) },
@@ -86,10 +150,25 @@ export function mapCursorReportedUsage(usage: unknown): TokenUsage {
  * UI but never debit (operator decision 2026-09-02). */
 export const CURSOR_HISTORICAL_BACKFILL_WAIVER = "historical_backfill_no_charge" as const;
 
+export function freezePreparedCursorSettlePlan(plan: {
+  settleStatus: "success" | "error";
+  costCredits: bigint;
+  snapshotJson: string;
+}): PreparedCursorSettlePlan {
+  return {
+    settleStatus: plan.settleStatus,
+    costCredits: plan.costCredits.toString(),
+    snapshotJson: plan.snapshotJson,
+  };
+}
+
 export function planCursorExternalSettle(args: {
   engineStatus: CursorEngineStatus;
   usage: TokenUsage;
-  pricing: ModelPricing;
+  /** Live catalog row. Ignored when `pricingBasis` is provided. */
+  pricing?: ModelPricing;
+  /** Execution-time rates/surcharge; recovery must pass this instead of re-reading catalog/env. */
+  pricingBasis?: CursorPricingBasis | null;
   terminalCode?: string | null;
   /** Record the would-have-charged amount but settle at 0 credits. */
   zeroCharge?: boolean;
@@ -98,7 +177,16 @@ export function planCursorExternalSettle(args: {
   costCredits: bigint;
   snapshotJson: string;
 } {
-  const { pricing: effectivePricing, surcharge } = applyCursorSettleMultiplier(args.pricing);
+  const catalogPricing = args.pricingBasis
+    ? modelPricingFromBasis(args.pricingBasis)
+    : args.pricing;
+  if (!catalogPricing) {
+    throw new TypeError("planCursorExternalSettle requires pricing or pricingBasis");
+  }
+  const { pricing: effectivePricing, surcharge } = applyCursorSettleMultiplier(
+    catalogPricing,
+    args.pricingBasis ? args.pricingBasis.settleSurcharge : undefined,
+  );
   const { cost_credits, snapshot } = computeCost(args.usage, effectivePricing);
   const engineOk = args.engineStatus === "success";
   // A user-initiated Stop is not an engine failure: the tokens the engine
@@ -119,7 +207,7 @@ export function planCursorExternalSettle(args: {
     ...snapshot,
     cursor_status: args.engineStatus,
     ...(surcharge !== null
-      ? { cursor_settle_multiplier: surcharge, catalog_multiplier: args.pricing.multiplier }
+      ? { cursor_settle_multiplier: surcharge, catalog_multiplier: catalogPricing.multiplier }
       : {}),
     ...(args.terminalCode ? { cursor_terminal_code: args.terminalCode } : {}),
     ...(userCancelled ? { charged_on_user_cancel: true } : {}),
@@ -136,27 +224,60 @@ export function planCursorExternalSettle(args: {
   return { settleStatus, costCredits, snapshotJson };
 }
 
+/**
+ * What a settled Cursor turn writes back onto its account row.
+ *
+ * Stats + visibility only. Deliberately NOT routed through
+ * AccountHealthTracker: health_score / status / cooldown_until feed the
+ * cursorMaterializer whitelist (`eligibleCursorRows`), and a burst of Sand
+ * 504s or a service_restart SIGKILL must not un-materialize a key for every
+ * user (the 2026-09-04 "sessions scattered across accounts" incident was
+ * exactly a false slot-fail cascade). The container-side wrapper keeps its
+ * own 600s rotation cooldown for that.
+ *
+ * What *was* missing is any admin-visible trace: a Cursor account could fail
+ * 200 turns in a row and the accounts table showed nothing but a counter.
+ * `last_error` now carries the last terminal code (`cursor_<code>`) so the
+ * "最近出错" chip lights up like it does for CCB/Grok rows, and a success
+ * clears it — same contract as `health.onSuccess`, minus the health mutation.
+ */
+export function planCursorAccountUsageBump(args: {
+  success: boolean;
+  terminalCode?: string | null;
+}): { sql: string; lastError: string | null } {
+  if (args.success) {
+    return {
+      sql: `UPDATE claude_accounts
+               SET success_count = success_count + 1,
+                   last_used_at = NOW(),
+                   last_error = NULL,
+                   updated_at = NOW()
+             WHERE id = $1 AND provider = 'cursor'`,
+      lastError: null,
+    };
+  }
+  const code = (args.terminalCode ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return {
+    sql: `UPDATE claude_accounts
+             SET fail_count = fail_count + 1,
+                 last_used_at = NOW(),
+                 last_error = $2,
+                 updated_at = NOW()
+           WHERE id = $1 AND provider = 'cursor'`,
+    lastError: `cursor_${code || "engine_error"}`,
+  };
+}
+
 async function bumpCursorAccountUsageCounts(
   pool: Pool,
   accountId: bigint,
   success: boolean,
+  terminalCode: string | null,
 ): Promise<void> {
-  // Stats-only. Do NOT call health.onSuccess/onFailure: those mutate
-  // health_score / last_error / status / cooldown and can drop a key from
-  // the cursor materializer whitelist.
+  const plan = planCursorAccountUsageBump({ success, terminalCode });
   await pool.query(
-    success
-      ? `UPDATE claude_accounts
-            SET success_count = success_count + 1,
-                last_used_at = NOW(),
-                updated_at = NOW()
-          WHERE id = $1 AND provider = 'cursor'`
-      : `UPDATE claude_accounts
-            SET fail_count = fail_count + 1,
-                last_used_at = NOW(),
-                updated_at = NOW()
-          WHERE id = $1 AND provider = 'cursor'`,
-    [accountId.toString()],
+    plan.sql,
+    plan.lastError === null ? [accountId.toString()] : [accountId.toString(), plan.lastError],
   );
 }
 
@@ -185,17 +306,33 @@ export async function settleCursorExternalUsage(args: {
   zeroCharge?: boolean;
   /** 0277: external API key attribution (usage_records.api_key_id + spent_credits). */
   apiKeyId?: bigint | null;
+  /** Execution-time pricing snapshot. When set, catalog/env are not re-read. */
+  pricingBasis?: CursorPricingBasis | null;
+  /** Sealed plan from the ready record. Skips planner/catalog/env entirely. */
+  preparedPlan?: PreparedCursorSettlePlan | null;
 }): Promise<SettleResult | null> {
-  const pricing = args.pricing.get(args.modelId);
-  if (pricing === null) return null;
   const usage = mapCursorReportedUsage(args.usage);
-  const plan = planCursorExternalSettle({
-    engineStatus: args.engineStatus,
-    usage,
-    pricing,
-    terminalCode: args.terminalCode ?? null,
-    zeroCharge: args.zeroCharge === true,
-  });
+  let plan: { settleStatus: "success" | "error"; costCredits: bigint; snapshotJson: string };
+  if (args.preparedPlan) {
+    plan = {
+      settleStatus: args.preparedPlan.settleStatus,
+      costCredits: BigInt(args.preparedPlan.costCredits),
+      snapshotJson: args.preparedPlan.snapshotJson,
+    };
+  } else {
+    const pricing = args.pricingBasis
+      ? modelPricingFromBasis(args.pricingBasis)
+      : args.pricing.get(args.modelId);
+    if (pricing === null) return null;
+    plan = planCursorExternalSettle({
+      engineStatus: args.engineStatus,
+      usage,
+      pricing,
+      pricingBasis: args.pricingBasis ?? null,
+      terminalCode: args.terminalCode ?? null,
+      zeroCharge: args.zeroCharge === true,
+    });
+  }
   const accountId = args.accountId ?? null;
   const settled = await settleUsageAndLedger(args.pool, {
     userId: args.userId,
@@ -216,9 +353,17 @@ export async function settleCursorExternalUsage(args: {
     attemptNo: args.attemptNo ?? null,
     apiKeyId: args.apiKeyId ?? null,
   });
-  if (accountId !== null) {
+  const shouldBump =
+    accountId !== null
+    && (args.preparedPlan ? settled.commitDisposition === "new_commit" : true);
+  if (shouldBump) {
     try {
-      await bumpCursorAccountUsageCounts(args.pool, accountId, plan.settleStatus === "success");
+      await bumpCursorAccountUsageCounts(
+        args.pool,
+        accountId,
+        plan.settleStatus === "success",
+        args.terminalCode ?? null,
+      );
     } catch {
       // usage_records.account_id already committed; counts are best-effort.
     }

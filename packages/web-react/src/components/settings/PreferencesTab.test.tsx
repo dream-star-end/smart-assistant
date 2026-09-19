@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import { api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import type { AuthSession } from '../../lib/types'
-import { PreferencesTab } from './PreferencesTab'
+import { BuiltinHotkeysTable, PreferencesTab } from './PreferencesTab'
 
 vi.mock('./QqBindingCard', () => ({ QqBindingCard: () => null }))
 
@@ -185,5 +185,90 @@ describe('PreferencesTab · Auto-Dream', () => {
 
     expect(screen.getByText('Auto‑Dream 当前暂不可用，功能已安全暂停。')).toBeInTheDocument()
     expect(screen.queryByText(/模型当前不可用/)).not.toBeInTheDocument()
+  })
+})
+
+describe('BuiltinHotkeysTable · 快捷键只读表', () => {
+  test('独立渲染内置说明,不发任何请求,没有可编辑 input', () => {
+    const models = vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
+    render(<BuiltinHotkeysTable />)
+    expect(screen.getByText('搜索会话')).toBeInTheDocument()
+    expect(screen.getByText('新建会话')).toBeInTheDocument()
+    expect(screen.getByText('停止生成（生成中）')).toBeInTheDocument()
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('动作名')).not.toBeInTheDocument()
+    expect(models).not.toHaveBeenCalled()
+  })
+
+  test('修饰键随平台:非 mac 显示 Ctrl', () => {
+    // jsdom 的 navigator.platform 为空串,isMacPlatform 走 userAgent 判定 → 非 mac。
+    render(<BuiltinHotkeysTable />)
+    expect(screen.getByText('Ctrl+K')).toBeInTheDocument()
+    expect(screen.queryByText('⌘+K')).not.toBeInTheDocument()
+  })
+})
+
+describe('PreferencesTab · 通知分区', () => {
+  test('不渲染 Telegram 开关(用户侧无绑定通道),邮件通知带说明', async () => {
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{ notify_email: true, notify_telegram: true }}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    )
+    expect(await screen.findByText('邮件通知')).toBeInTheDocument()
+    expect(screen.getByText(/发送到账号邮箱/)).toBeInTheDocument()
+    expect(screen.queryByText('Telegram 通知')).not.toBeInTheDocument()
+  })
+
+  test('模型列表返回体缺 models 时退化为空列表而不崩', async () => {
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({} as never)
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{ default_model: 'cursor-x' }}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    )
+    const select = await screen.findByRole('combobox', { name: '默认模型' })
+    expect(select).toHaveValue('cursor-x')
+  })
+})
+
+describe('PreferencesTab · 输入分区', () => {
+  test('偏好首屏渲染「输入」分区与本设备说明', async () => {
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{}}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    )
+    expect(await screen.findByText('输入')).toBeInTheDocument()
+    expect(screen.getByText('仅本设备生效')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Enter 发送' })).toBeInTheDocument()
+    // 修饰键随平台(审计 SET-20);jsdom 非 mac → Ctrl。
+    expect(screen.getByRole('button', { name: 'Ctrl+Enter 发送' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '⌘+Enter 发送' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '默认' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '大' })).toBeInTheDocument()
   })
 })

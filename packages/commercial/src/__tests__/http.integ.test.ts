@@ -14,6 +14,7 @@ import { setSystemSetting } from "../admin/systemSettings.js";
 import { _resetAllowRegistrationCacheForTests } from "../http/handlers.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
+import { prepareAuthRowResetForTest } from "./helpers/authRows.js";
 
 /**
  * T-16 集成:把 createCommercialHandler 装到一个真 http.Server 上,跑端到端
@@ -50,6 +51,7 @@ class CapturingMailer implements Mailer {
 }
 
 let pgAvailable = false;
+let resetAuthRows: (() => Promise<void>) | undefined;
 let redis: IORedis | null = null;
 let server: Server | null = null;
 let baseUrl = "";
@@ -95,6 +97,15 @@ before(async () => {
     setPoolOverride(pool);
     await resetTestSchemaForTest();
     await runMigrations();
+    resetAuthRows = await prepareAuthRowResetForTest(async (client) => {
+      // These were in the original TRUNCATE closure, but survive user DELETE.
+      await client.query("DELETE FROM feedback");
+      await client.query("DELETE FROM system_settings");
+      await client.query("DELETE FROM product_friction_events");
+      // 0235 adds an indirect users → agent_containers → turn_traces FK.
+      // SET NULL retains these rows; the original TRUNCATE CASCADE did not.
+      await client.query("DELETE FROM turn_traces");
+    });
     await warmupLoginDummyHash();
     // 2026-05-25:DEFAULTS.allow_registration 翻 false(生产关停)。这套 HTTP
     // 集成 case 大量用 POST /api/auth/register 走打通流;handler 前置门会先于
@@ -161,14 +172,9 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable || !redis) return;
-  await query("TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
-  // 2026-07-26:上面这条 TRUNCATE ... CASCADE 会**连带清空 system_settings** ——
-  // 它有 `updated_by BIGINT REFERENCES users(id)`(0016_system_settings.sql),
-  // 而 PG 的 TRUNCATE CASCADE 会把所有引用被截断表的表一起截断。before 钩子里那次
-  // "单次设置全套共享"的 allow_registration=true 因此活不过第一个 beforeEach。
-  // 2026-05-25 DEFAULTS.allow_registration 翻 false 之后,本文件所有走 register 的
-  // case 就一直 403 REGISTRATION_DISABLED —— 两个月没人发现,因为整个 integ 层
-  // 在 CI/deploy/playbook 三处都不跑(2026-07-26 门禁审计)。种子挪到这里。
+  assert.ok(resetAuthRows, "real HTTP fixture setup must finish before each case");
+  await resetAuthRows();
+  // The complete original FK closure is empty; restore the per-case setting only now.
   await seedAllowRegistration();
   await redis.flushdb();
   mailer.sent.length = 0;

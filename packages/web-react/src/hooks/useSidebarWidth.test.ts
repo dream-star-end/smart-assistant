@@ -109,6 +109,35 @@ describe("useSidebarWidth", () => {
     expect(document.body.style.userSelect).toBe("");
   });
 
+  // S-05：拖宽把手此前无键盘处理，键盘用户无法调宽。
+  test("键盘：← → 按步进调宽并落盘，Shift 大步，Home/End 到最小/最大，其他键不拦截", () => {
+    const { result } = renderHook(() => useSidebarWidth());
+    const key = (k: string, shiftKey = false) => {
+      const preventDefault = vi.fn();
+      act(() => {
+        result.current.onResizeKeyDown({
+          key: k,
+          shiftKey,
+          preventDefault,
+        } as unknown as import("react").KeyboardEvent);
+      });
+      return preventDefault;
+    };
+    expect(key("ArrowRight")).toHaveBeenCalledTimes(1);
+    expect(result.current.width).toBe(SIDEBAR_WIDTH_DEFAULT + 16);
+    expect(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)).toBe(String(SIDEBAR_WIDTH_DEFAULT + 16));
+    key("ArrowLeft", true);
+    expect(result.current.width).toBe(SIDEBAR_WIDTH_DEFAULT + 16 - 64);
+    key("Home");
+    expect(result.current.width).toBe(SIDEBAR_WIDTH_MIN);
+    key("ArrowLeft");
+    expect(result.current.width).toBe(SIDEBAR_WIDTH_MIN); // 夹在最小值
+    key("End");
+    expect(result.current.width).toBe(SIDEBAR_WIDTH_MAX);
+    expect(key("Tab")).not.toHaveBeenCalled();
+    expect(result.current.width).toBe(SIDEBAR_WIDTH_MAX);
+  });
+
   test("卸载清理监听与 body 样式", () => {
     ensurePointerCapture();
     const removeSpy = vi.spyOn(document, "removeEventListener");

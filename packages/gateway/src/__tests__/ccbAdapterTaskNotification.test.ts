@@ -15,6 +15,15 @@ import type { EngineCreateOpts } from '../engine/registry.js'
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now()
   submitted: Array<{ input: unknown; requestId?: string }> = []
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
+  }
 
   async submit(
     input: string | Array<{ type: string; [key: string]: unknown }>,
@@ -150,5 +159,29 @@ describe('CcbAdapter task_notification_delivered routing', () => {
     }
     assert.equal(orphan.length, 1)
     assert.equal(orphan[0]!.taskId, 'agt-ack')
+  })
+})
+
+describe('CcbAdapter consult-turn binding on injected runner', () => {
+  test('records consult binding then clears it on an ordinary turn', async () => {
+    const { adapter, runner } = makeAdapter()
+    const events: EngineEvent[] = []
+    const consult = beginTurn(adapter, events, {
+      turnKey: 'turn-consult-1',
+      consultTurn: { turnIndex: 2, configVersion: 'cfg-v1' },
+    })
+    await consult.submitted
+    assert.deepEqual(runner.consultTurnBinding, {
+      turnKey: 'turn-consult-1',
+      turnIndex: 2,
+      configVersion: 'cfg-v1',
+    })
+    runner.msg(resultRow())
+    consult.end()
+    const ordinary = beginTurn(adapter, events)
+    await ordinary.submitted
+    assert.equal(runner.consultTurnBinding, undefined)
+    runner.msg(resultRow())
+    ordinary.end()
   })
 })

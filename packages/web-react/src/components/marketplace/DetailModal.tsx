@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   Target,
   Terminal,
+  ThumbsUp,
   Users,
 } from 'lucide-react'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
@@ -17,6 +18,9 @@ import { api, apiErrorMessage } from '../../lib/api'
 import { reportClientFriction } from '../../lib/clientFriction'
 import {
   benchmarkBadgeLabel,
+  connectorActionEffectLabel,
+  connectorActionLabel,
+  connectorAuthModeLabel,
   formatInstallCount,
   marketTrySkillPrefill,
 } from '../../lib/marketplace'
@@ -31,7 +35,16 @@ import type {
 import { cn } from '../../lib/utils'
 import { AgentScopePicker, agentScopeLabels, normalizeAgentScope } from '../AgentScopePicker'
 import { Markdown } from '../Markdown'
-import { Alert, Badge, Button, EmptyState, Modal, Skeleton, cardVariants } from '../ui'
+import { Alert, Badge, Button, EmptyState, Modal, Skeleton, Tooltip, cardVariants } from '../ui'
+
+/**
+ * 「详细介绍」里 Markdown 的字号收口(K-15)。styles.css 的 `.prose` 规则是**未分层**的
+ * (h1 1.5em / h2 1.28em / 正文 15.5px),会压过 Tailwind `@layer utilities` 里任何后代
+ * 选择器 —— 不加 `!` 写多具体都盖不住。这里把正文压回弹层的 text-body、把 h1–h4 全部
+ * 压到段标题同档(text-section),层级不再倒挂:段标题 ≥ 介绍内标题 > 正文。
+ */
+const HUMAN_MD_PROSE_CLASS =
+  '[&_.prose]:text-body! [&_.prose>:first-child]:mt-0! [&_:is(h1,h2,h3,h4)]:text-section! [&_:is(h1,h2,h3,h4)]:font-semibold! [&_:is(h1,h2,h3,h4)]:mt-3! [&_:is(h1,h2,h3,h4)]:mb-1!'
 
 /**
  * 段标题 —— 全弹层只有三级字号:段标题(text-section semibold fg)/ 正文(text-body fg)/
@@ -719,8 +732,10 @@ export function DetailModal({
               {actionErr.message}
             </Alert>
           )}
-          <div className="flex flex-wrap items-center justify-end gap-2 max-sm:flex-col-reverse max-sm:flex-nowrap max-sm:[&>*]:w-full">
-            <Button variant="ghost" onClick={onClose}>
+          {/* 窄屏:「关闭」让位给右上 ✕,剩下的动作并排各占一半(改造前三枚全宽按钮竖着堆约 200px,
+              吃掉 ¼ 视口);只把 Button 拉满,Badge 类结果保持自身宽度,不再被拉成一枚假按钮(K-04 / K-20)。 */}
+          <div className="flex flex-wrap items-center justify-end gap-2 max-sm:flex-nowrap max-sm:[&>button]:flex-1">
+            <Button variant="ghost" onClick={onClose} className="max-sm:hidden">
               关闭
             </Button>
             {/* AI 导购次级入口:关市场 → 新会话 → 预填「装好并给上手示例」,发送权仍在用户。 */}
@@ -818,7 +833,7 @@ export function DetailModal({
             )}
           {isPreset && (
             <Alert tone="info" title="平台预设智能体">
-              无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
+              无需安装，所有用户开箱即用；在输入框上方的智能体选择器中直接切换。
             </Alert>
           )}
           {isPreinstalledConnector && (
@@ -867,10 +882,19 @@ export function DetailModal({
                   官方
                 </Badge>
               ) : null}
-              <Badge tone="neutral" title={scriptReviewCopy(detail.reviewSource)}>
-                <ShieldCheck size={12} aria-hidden="true" />
-                {reviewBadgeLabel(detail.reviewSource)}
-              </Badge>
+              {/* 审核背书的解释不再只挂原生 title(触屏看不到、读屏多数不读):hover / 键盘聚焦
+                  走 Tooltip,下方注脚再明文写一遍,三类用户都拿得到(K-14)。 */}
+              <Tooltip content={scriptReviewCopy(detail.reviewSource)}>
+                <Badge
+                  tone="neutral"
+                  // Tooltip 触发器必须可聚焦,键盘用户才能看到解释(同 manage M-15 的写法)。
+                  tabIndex={0}
+                  className="outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ShieldCheck size={12} aria-hidden="true" />
+                  {reviewBadgeLabel(detail.reviewSource)}
+                </Badge>
+              </Tooltip>
               {isMarketplaceCategoryId(detail.category) && (
                 <Badge tone="info">
                   <Layers size={12} aria-hidden="true" />{' '}
@@ -903,31 +927,28 @@ export function DetailModal({
               {detail.rating && (
                 <Badge
                   tone="neutral"
-                  title={`来自 ${ratingTotal} 次使用反馈`}
                   aria-label={`好评 ${detail.rating.up}，共 ${ratingTotal} 次反馈`}
                 >
-                  👍 {detail.rating.up}/{ratingTotal}
+                  <ThumbsUp size={12} aria-hidden="true" /> {detail.rating.up}/{ratingTotal}
                 </Badge>
               )}
-              {bench && (
-                <Badge tone="info" title={bench.title}>
-                  {bench.label}
-                </Badge>
+              {bench && <Badge tone="info">{bench.label}</Badge>}
+            </div>
+            {/* 免责与出处落地成明文注脚 —— 详情页正是用户最容易把自报数据当平台背书的地方。
+                评分 / 实测的 title 已删:同一句话就在这里,不必再藏一份只有鼠标能看的。 */}
+            <div className="flex flex-col gap-0.5">
+              <p className="text-meta text-faint">
+                {reviewBadgeLabel(detail.reviewSource)}：{scriptReviewCopy(detail.reviewSource)}
+              </p>
+              {detail.rating && (
+                <p className="text-meta text-faint">来自 {ratingTotal} 次使用反馈</p>
+              )}
+              {bench && detail.benchmark && (
+                <p className="text-meta text-faint">
+                  实测 {detail.benchmark.cases} 个用例，由发布者提供、未经平台验证
+                </p>
               )}
             </div>
-            {/* 免责与出处落地成明文注脚 —— 详情页正是用户最容易把自报数据当平台背书的地方。 */}
-            {(detail.rating || bench) && (
-              <div className="flex flex-col gap-0.5">
-                {detail.rating && (
-                  <p className="text-meta text-faint">来自 {ratingTotal} 次使用反馈</p>
-                )}
-                {bench && detail.benchmark && (
-                  <p className="text-meta text-faint">
-                    实测 {detail.benchmark.cases} 个用例，由发布者提供、未经平台验证
-                  </p>
-                )}
-              </div>
-            )}
           </div>
 
           {/* ② 它能帮你做什么 */}
@@ -953,7 +974,10 @@ export function DetailModal({
           {humanMd && (
             <Section>
               <SectionTitle className="mb-1.5">详细介绍</SectionTitle>
-              <div className="text-body leading-relaxed text-fg">
+              <div
+                data-testid="human-md"
+                className={cn('text-body leading-relaxed text-fg', HUMAN_MD_PROSE_CLASS)}
+              >
                 <Markdown>{humanMd}</Markdown>
               </div>
             </Section>
@@ -986,14 +1010,15 @@ export function DetailModal({
               >
                 {detail.connectorContract ? (
                   <>
+                    {/* authMode 枚举与动作 id 是开发者词汇,翻成人话再给用户(K-19);
+                        原始值仍在下方「发布者提交的技术声明」里,想核对的人能找到。 */}
                     <div className="text-body text-fg">
-                      认证方式：{detail.connectorContract.authMode}
+                      认证方式：{connectorAuthModeLabel(detail.connectorContract.authMode)}
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {detail.connectorContract.actions.map((a) => (
                         <Badge key={a.id} tone={a.effect === 'read' ? 'neutral' : 'warning'}>
-                          {a.id} ·{' '}
-                          {a.effect === 'read' ? '读取' : a.effect === 'send' ? '发送' : '写入'}
+                          {connectorActionLabel(a.id)} · {connectorActionEffectLabel(a.effect)}
                         </Badge>
                       ))}
                     </div>

@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -32,12 +33,30 @@ import { buildPromptContext } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
-import { type TerminalBackend, createBackend } from './terminalBackend.js'
-import { issueDelegateContextToken } from './delegateContext.js'
+import { type SpawnOpts, type TerminalBackend, createBackend } from './terminalBackend.js'
+import { issueConsultTurnToken, issueDelegateContextToken } from './delegateContext.js'
+import {
+  CCB_ADVISOR_HERMETIC_ENV,
+  CCB_ADVISOR_PROFILE_VERSION,
+  type AdvisorConsultExecution,
+} from './advisorMode.js'
 
 export { renderCcbGoalPrompt }
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
+
+export type CcbSpawnForTests = (opts: SpawnOpts) => ChildProcessWithoutNullStreams
+let ccbSpawnForTests: CcbSpawnForTests | null = null
+export function __setCcbSpawnForTests(fn: CcbSpawnForTests | null): void {
+  ccbSpawnForTests = fn
+}
+
+export function isCcbAdvisorHermeticProfile(opts: {
+  hermeticNoTools?: boolean
+  agentId?: string
+}): boolean {
+  return Boolean(opts.hermeticNoTools && opts.agentId === 'advisor')
+}
 
 const guardedStdin = new WeakSet<object>()
 function guardStdinErrors(stdin: { on?: (event: 'error', fn: (err: Error) => void) => unknown } | null | undefined): void {
@@ -607,6 +626,42 @@ async function resolveTurnRuntime(
   }
 }
 
+export class AdvisorExecutionLockError extends Error {
+  readonly code = 'ADVISOR_EXECUTION_LOCK_MISMATCH' as const
+  constructor(message: string) {
+    super(message)
+    this.name = 'AdvisorExecutionLockError'
+  }
+}
+
+export async function assertCcbAdvisorCatalogLock(input: {
+  lock: AdvisorConsultExecution | undefined
+  model: string | undefined
+  env?: NodeJS.ProcessEnv
+}): Promise<{ modelId: string; providerId: string; engine: 'ccb' }> {
+  const lock = input.lock
+  if (!lock || lock.engine !== 'ccb' || lock.profileVersion !== CCB_ADVISOR_PROFILE_VERSION) {
+    throw new AdvisorExecutionLockError('ccb advisor requires a frozen model/provider/profile lock')
+  }
+  const client = getModelCatalogClient()
+  if (!client.configured) {
+    throw new AdvisorExecutionLockError('ccb advisor catalog ticket unavailable')
+  }
+  const view = await client.getView()
+  const canonical = view.canonicalize(input.model || lock.modelId)
+  const row = view.resolve(canonical)
+  if (!row || row.engine !== 'ccb' || row.available === false) {
+    throw new AdvisorExecutionLockError('ccb advisor model missing from current catalog projection')
+  }
+  const providerId = (row.providerId ?? '').trim()
+  if (row.modelId !== lock.modelId || providerId !== lock.providerId) {
+    throw new AdvisorExecutionLockError(
+      'ccb advisor catalog ticket does not match frozen model/provider',
+    )
+  }
+  return { modelId: row.modelId, providerId, engine: 'ccb' }
+}
+
 export interface HostSpawnProviderEnvInput {
   /** 已解析的执行模型(sessionManager.executionModel;可能 undefined=沿用 CCB 默认)。 */
   model: string | undefined
@@ -782,6 +837,7 @@ export interface SubprocessRunnerOpts {
    *  会被 effectiveAddDir(由 getRepoSnapshot 返的 workspaceDir)覆盖。 */
   agentBaseDir: string
   config: OpenClaudeConfig
+  identityCompat?: IdentityCompatRuntimeContext
   persona?: string // 注入 system prompt 的文件
   model?: string
   /** Platform-owned per-adapter provider route. Never populated from user or
@@ -897,6 +953,11 @@ export interface SubprocessRunnerOpts {
   skillEvalDraft?: { name: string; dir: string }
   /** V5 Auto-Dream one-shot isolation profile (CCB only). */
   hermeticNoTools?: boolean
+  /**
+   * Frozen CCB advisor execution. Required when hermeticNoTools && agentId==='advisor';
+   * last catalog ticket at spawn/submit must match model+provider+profile.
+   */
+  advisorExecutionLock?: AdvisorConsultExecution
   /** CCB --json-schema contract. Currently used only by the hermetic Auto-Dream turn. */
   structuredOutputSchema?: Readonly<Record<string, unknown>>
 }
@@ -1061,7 +1122,11 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     structuredOutputSchema,
   } = input
   const args: string[] = [
-    runtime === 'bun' ? 'run' : '--experimental-strip-types',
+    ...(runtime === 'bun'
+      ? ['run']
+      : Number(process.versions.node.split('.')[0]) >= 22
+        ? ['--experimental-strip-types']
+        : []),
     entry,
     '-p',
     '--input-format=stream-json',
@@ -1222,6 +1287,8 @@ export class SubprocessRunner extends EventEmitter {
   /** True once we force-killed due to stderr overflow; prevents double-kill. */
   private overflowKilled = false
   private sessionDir: string | null = null
+  private advisorHomeDir: string | null = null
+  private advisorConfigDir: string | null = null
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
   private delegateContextFile: string | null = null
   private platformGoal: GoalStateSnapshot | null = null
@@ -1589,11 +1656,22 @@ export class SubprocessRunner extends EventEmitter {
         throw new Error('OFFICIAL_CC_CURSOR_SAND_LOOPBACK_BINDING_INVALID')
       }
     }
+    if (isCcbAdvisorHermeticProfile(this.opts)) {
+      try {
+        await assertCcbAdvisorCatalogLock({
+          lock: this.opts.advisorExecutionLock,
+          model: this.opts.model,
+        })
+      } catch (err) {
+        this.starting = false
+        this._boundRepoBinding = null
+        throw err
+      }
+    }
 
     let proc: ReturnType<TerminalBackend['spawn']>
     try {
-      const backend: TerminalBackend = createBackend(this.opts.config.terminal)
-      proc = backend.spawn({
+      const spawnOpts: SpawnOpts = {
           command,
           args,
           ccbBinaryDir: binaryDir,
@@ -1607,8 +1685,11 @@ export class SubprocessRunner extends EventEmitter {
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
           ...finalizedProviderEnv,
+          OC_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          OC_AGENT_ID: this.opts.agentId,
+          ...identityCompatEnvironment(this.opts.identityCompat),
           ...(this.delegateContextFile
             ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: this.delegateContextFile }
             : {}),
@@ -1617,6 +1698,7 @@ export class SubprocessRunner extends EventEmitter {
           // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
           // gateway-process env doesn't bleed into spawned CCBs.
           CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
+          ...(this.opts.hermeticNoTools ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
           // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
           // here to strip run_in_background from Bash/Agent/PowerShell tool
           // schemas (visibility band-aid for Opus 4.7 over-using background
@@ -1661,10 +1743,26 @@ export class SubprocessRunner extends EventEmitter {
           // `_buildCcbSpawnTraceEnv` JSDoc。
           ..._buildCcbSpawnTraceEnv(this.opts.traceId),
           [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
+          ...(isCcbAdvisorHermeticProfile(this.opts)
+            ? {
+                ...(this.advisorHomeDir ? { HOME: this.advisorHomeDir } : {}),
+                ...(this.advisorConfigDir ? { CLAUDE_CONFIG_DIR: this.advisorConfigDir } : {}),
+                ...(this.advisorHomeDir
+                  ? {
+                      XDG_CONFIG_HOME: resolve(this.advisorHomeDir, '.config'),
+                      XDG_CACHE_HOME: resolve(this.advisorHomeDir, '.cache'),
+                    }
+                  : {}),
+                [CCB_ADVISOR_HERMETIC_ENV]: '1',
+                CLAUDE_CODE_UNATTENDED_RETRY: '0',
+              }
+            : {}),
         },
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children
-      })
+      }
+      const backend: TerminalBackend = createBackend(this.opts.config.terminal)
+      proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)
     } catch (err) {
       this.starting = false
       // 见 449 catch 同理:spawn 抛错时 binding 字段已置位,清掉保不变量。
@@ -2006,11 +2104,21 @@ export class SubprocessRunner extends EventEmitter {
       process.env,
       this.opts.authorityEngine ?? 'ccb',
     )
+    if (isCcbAdvisorHermeticProfile(this.opts)) {
+      await assertCcbAdvisorCatalogLock({
+        lock: this.opts.advisorExecutionLock,
+        model: this.opts.model,
+      })
+    }
     if (
       this.proc &&
       shouldRecycleForVisionCapability(this.spawnedExecutionDescriptor, runtime.descriptor)
     ) {
       // vision 决定 spawn-time prompt/upload fallback；长驻进程不能只靠 stdin env 热改。
+      await this.shutdown()
+    }
+    if (this.pendingConsultRespawn) {
+      this.pendingConsultRespawn = false
       await this.shutdown()
     }
     this.currentExecutionDescriptor = runtime.descriptor
@@ -2028,6 +2136,9 @@ export class SubprocessRunner extends EventEmitter {
             // withRetry loop is per API call, so leaving it enabled can exceed the
             // remaining turn budget after tools or a browser recovery hop.
             CLAUDE_CODE_MAX_RETRIES: '0',
+            ...(isCcbAdvisorHermeticProfile(this.opts)
+              ? { CLAUDE_CODE_UNATTENDED_RETRY: '0', [CCB_ADVISOR_HERMETIC_ENV]: '1' }
+              : {}),
           },
         )
       : null
@@ -2221,6 +2332,19 @@ export class SubprocessRunner extends EventEmitter {
         JSON.stringify({ apiKeyHelper: `printf '%s' "$ANTHROPIC_AUTH_TOKEN"` }),
         { mode: 0o600 },
       )
+      if (isCcbAdvisorHermeticProfile(this.opts)) {
+        const homeDir = resolve(sessionDir, 'home')
+        const configDir = resolve(sessionDir, 'claude-config')
+        mkdirSync(homeDir, { recursive: true, mode: 0o700 })
+        mkdirSync(configDir, { recursive: true, mode: 0o700 })
+        mkdirSync(resolve(homeDir, '.config'), { recursive: true, mode: 0o700 })
+        mkdirSync(resolve(homeDir, '.cache'), { recursive: true, mode: 0o700 })
+        this.advisorHomeDir = homeDir
+        this.advisorConfigDir = configDir
+      } else {
+        this.advisorHomeDir = null
+        this.advisorConfigDir = null
+      }
       return {
         mcpConfigFile: mcpPath,
         settingsFile: settingsPath,
@@ -2295,6 +2419,7 @@ export class SubprocessRunner extends EventEmitter {
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
+        identityCompat: this.opts.identityCompat?.assets,
         provider: effectiveProvider,
         model: this.opts.model,
         modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
@@ -2360,6 +2485,7 @@ export class SubprocessRunner extends EventEmitter {
         modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'ccb' })
       }
     } catch (err) {
+      if (this.opts.identityCompat?.assets) throw err
       runnerLog.warn(
         'failed to build extra prompt',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
@@ -2398,6 +2524,8 @@ export class SubprocessRunner extends EventEmitter {
           args: mcpLaunch.args,
           env: {
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          OC_AGENT_ID: this.opts.agentId,
+          ...identityCompatEnvironment(this.opts.identityCompat),
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
             // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
             // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill
@@ -2602,22 +2730,47 @@ export class SubprocessRunner extends EventEmitter {
     if (this.sessionDir) {
       try { rmSync(this.sessionDir, { recursive: true, force: true }) } catch {}
       this.sessionDir = null
+      this.advisorHomeDir = null
+      this.advisorConfigDir = null
     }
     this.delegateContextFile = null
+  }
+
+  private consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
+  private pendingConsultRespawn = false
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    const prev = this.consultTurnBinding?.turnKey
+    this.consultTurnBinding = binding
+    if (binding && prev && prev !== binding.turnKey && this.proc) {
+      this.pendingConsultRespawn = true
+    }
   }
 
   /** Refresh caller binding at the actual turn boundary, not process spawn. */
   private refreshDelegateContext(): void {
     if (!this.delegateContextFile) return
-    writeFileSync(
-      this.delegateContextFile,
-      `${issueDelegateContextToken({
-        agentId: this.opts.agentId,
-        sessionKey: this.opts.sessionKey,
-        depth: this.opts.delegationDepth ?? 0,
-      })}\n`,
-      { mode: 0o600 },
-    )
+    const consult = this.consultTurnBinding
+    const token = consult
+      ? issueConsultTurnToken({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          depth: this.opts.delegationDepth ?? 0,
+          turnKey: consult.turnKey,
+          turnIndex: consult.turnIndex,
+          collabMode: 'advisor',
+          configVersion: consult.configVersion,
+        })
+      : issueDelegateContextToken({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          depth: this.opts.delegationDepth ?? 0,
+        })
+    writeFileSync(this.delegateContextFile, `${token}\n`, { mode: 0o600 })
   }
 
   /** Forward a fully-drained child exit only while that exact child still owns

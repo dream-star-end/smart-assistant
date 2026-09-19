@@ -30,6 +30,7 @@ export type LintCode =
   | 'bash_count'
   | 'tool_count'
   | 'fanout'
+  | 'fable_direct_edit'
 
 export interface LintHit {
   code: LintCode
@@ -42,6 +43,7 @@ export interface TurnGuardState {
   bashCount: number
   consecutiveReadProbes: number
   delegatedThisTurn: boolean
+  editWriteCount: number
   emitted: Set<LintCode>
 }
 
@@ -61,12 +63,26 @@ export interface EfficiencySessionState {
   _efficiencyPendingHits?: LintHit[]
   _efficiencyBudget?: VerificationBudget
   sessionKey?: string
+  model?: string
 }
 
 export const DEFAULT_VERIFICATION_BUDGET_MS = 15 * 60_000
 export const DEFAULT_BASH_COUNT_WARN = 24
 export const DEFAULT_TOOL_COUNT_WARN = 80
 export const FANOUT_READ_PROBE_THRESHOLD = 3
+/** Fable/Opus Edit+Write count in one turn before reminding to delegate grok-build. */
+export const DEFAULT_FABLE_MUTATION_WARN = 3
+const EDIT_WRITE_TOOLS = new Set([
+  'Write',
+  'Edit',
+  'StrReplace',
+  'NotebookEdit',
+  'MultiEdit',
+  'write',
+  'edit',
+  'search_replace',
+  'str_replace',
+])
 /** 命令中带此标记则单次豁免拦截(仍写审计日志)。 */
 export const EFFICIENCY_ESCAPE_TOKEN = 'OC_EFFICIENCY_ALLOW'
 
@@ -116,8 +132,36 @@ export function createTurnGuardState(): TurnGuardState {
     bashCount: 0,
     consecutiveReadProbes: 0,
     delegatedThisTurn: false,
+    editWriteCount: 0,
     emitted: new Set(),
   }
+}
+
+export function fableMutationWarnThreshold(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.OPENCLAUDE_FABLE_MUTATION_WARN)
+  return Number.isFinite(raw) && raw >= 1 ? Math.trunc(raw) : DEFAULT_FABLE_MUTATION_WARN
+}
+
+/** Fable/Opus family models that must delegate write work to grok-build. */
+export function isDesignFamilyModel(model: string | undefined | null): boolean {
+  if (!model) return false
+  const m = model.toLowerCase()
+  if (m.includes('grok')) return false
+  return (
+    /(?:^|[/._-])(?:cursor-)?fable(?:[/._-]|$)/.test(m) ||
+    /(?:^|[/._-])(?:cursor-|claude-)?opus(?:[/._-]|$)/.test(m)
+  )
+}
+
+function isEditWriteTool(tool: { name: string; input?: Record<string, unknown> }): boolean {
+  let name = tool.name
+  if (/^execute[-_]?extra[-_]?tool$/i.test(name)) {
+    const inner = tool.input?.tool_name ?? tool.input?.toolName
+    if (typeof inner === 'string' && inner) name = inner
+  }
+  const bare = name.startsWith('mcp__') ? name.slice(name.lastIndexOf('__') + 2) : name
+  if (EDIT_WRITE_TOOLS.has(bare)) return true
+  return /^(Write|Edit|StrReplace|NotebookEdit|MultiEdit|write|search_replace)$/i.test(bare)
 }
 
 export function emptyVerificationBudget(): VerificationBudget {
@@ -182,6 +226,8 @@ export function suggestAlternative(hit: LintHit): string {
       return '替代: 后台跑任务并 `tail` 日志,不要 `while true` + renew/heartbeat'
     case 'local_file_via_shell':
       return '替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`'
+    case 'fable_direct_edit':
+      return '替代: `delegate_task`/`oc-memory delegate --model grok-build --allow-self` 把写码交给 Grok Build'
     default:
       return hit.message
   }
@@ -284,6 +330,7 @@ export function observeToolUse(
   state: TurnGuardState,
   tool: { name: string; input?: Record<string, unknown> },
   mode: GuardMode = 'warn',
+  model?: string,
 ): LintHit[] {
   if (mode === 'off') return []
   const hits: LintHit[] = []
@@ -293,6 +340,22 @@ export function observeToolUse(
   if (command) {
     state.bashCount++
     hits.push(...lintBashCommand(command, mode))
+  }
+
+  if (isEditWriteTool(tool) && isDesignFamilyModel(model)) {
+    state.editWriteCount++
+    if (
+      state.editWriteCount >= fableMutationWarnThreshold() &&
+      !state.emitted.has('fable_direct_edit')
+    ) {
+      state.emitted.add('fable_direct_edit')
+      hits.push({
+        code: 'fable_direct_edit',
+        action: 'warn',
+        message:
+          `Fable/Opus 本轮已 ${state.editWriteCount} 次 Edit/Write。按委派纪律应 delegate grok-build 执行写码，不要继续本模型落地。`,
+      })
+    }
   }
 
   if (isDelegateTool(tool)) {
@@ -460,7 +523,7 @@ export function applyEfficiencyToolObservation(
   if (mode === 'off') return []
   const state = (session._efficiencyTurn ??= createTurnGuardState())
   state.toolCount = toolCount
-  const hits = observeToolUse(state, tool, mode)
+  const hits = observeToolUse(state, tool, mode, session.model)
   if (hits.length) {
     session._efficiencyPendingHits = [...(session._efficiencyPendingHits ?? []), ...hits]
   }

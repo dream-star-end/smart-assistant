@@ -47,7 +47,9 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "../http/anthropicProxy.js";
-import { makeApiKeyIdentityStrategy } from "../auth/apiKeyIdentity.js";
+import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "../auth/apiKeyIdentity.js";
+import { makeExternalModelsHandler } from "../http/proxy/externalModels.js";
+import { makeExternalUsageHandler } from "../http/proxy/externalUsage.js";
 import type {
   ApiKeyRepo,
   ApiKeyRow,
@@ -519,6 +521,17 @@ interface HarnessOpts {
   poolOverride?: FakePoolOverride;
   /** 完全不注入 externalApiKeyProxy(测试 503 EXTERNAL_PROXY_UNAVAILABLE)。 */
   omitExternalProxy?: boolean;
+  /** 完全不注入 externalApiKeyModels(测试 GET /v1/models 的 503 降级)。 */
+  omitExternalModels?: boolean;
+  /** 完全不注入 externalApiKeyUsage(测试 GET /v1/usage 的 503 降级)。 */
+  omitExternalUsage?: boolean;
+  /** GET /v1/usage 的余额读取(默认 12345n)。 */
+  usageBalance?: bigint;
+  /**
+   * 追加到 pricing 的额外目录行(GET /v1/models 用例注入 cursor-* 行;默认 harness
+   * 只有 FIXED_MODEL 一行,该行不是 cursor 引擎,models 列表会是空)。
+   */
+  extraPricing?: ModelPricing[];
   /** 覆盖 user authz(默认:user role + 已授权 FIXED_MODEL)。 */
   authz?: { role: "user" | "admin"; grantedModelIds: ReadonlySet<string> };
   /**
@@ -540,6 +553,32 @@ interface HarnessOpts {
   phase6AccountUuidEnforce?: "off" | "fail_open" | "fail_closed";
   /** Phase 6 H6:fake scheduler 返回的 account_uuid(默认 null)。 */
   schedulerAccountUuid?: string | null;
+  /**
+   * 注入 fake cursorExternal route(默认不注入,与容器 internal proxy 一致)。
+   * 用来验 proxy 4a 的公开 id → 内部变体解析(家族 + output_config.effort),
+   * fake 只记录 handle() 入参并回 200,不走真实 relay。
+   */
+  cursorExternal?: import("../http/proxy/cursorExternal.js").CursorExternalRoute;
+}
+
+/** 最小 fake cursorExternal:记录每次 handle() 的 model / requestedModel / body,回 200 空 JSON。 */
+function buildFakeCursorExternal() {
+  const calls: Array<{ model: string; requestedModel: string | undefined; outputConfig: unknown }> = [];
+  const route: import("../http/proxy/cursorExternal.js").CursorExternalRoute = {
+    async handle(args) {
+      calls.push({
+        model: args.body.model,
+        requestedModel: args.requestedModel,
+        outputConfig: args.body.output_config,
+      });
+      args.res.statusCode = 200;
+      args.res.setHeader("content-type", "application/json");
+      args.res.end(JSON.stringify({ ok: true, model: args.requestedModel ?? args.body.model }));
+    },
+    async close() {},
+    _cooledAccountIds: () => [],
+  };
+  return { route, calls };
 }
 
 function buildHarness(opts: HarnessOpts = {}) {
@@ -552,7 +591,7 @@ function buildHarness(opts: HarnessOpts = {}) {
   const effectivePricing: ModelPricing = opts.pricingOverride
     ? { ...FIXED_PRICING, ...opts.pricingOverride }
     : FIXED_PRICING;
-  const pricing = buildFakePricing([effectivePricing]);
+  const pricing = buildFakePricing([effectivePricing, ...(opts.extraPricing ?? [])]);
   const apiKeyRepoSpy = buildApiKeyRepoSpy();
 
   // logger sink:每条 JSON line parse 后存 logEvents,让测试可断言 log msg/code。
@@ -570,15 +609,56 @@ function buildHarness(opts: HarnessOpts = {}) {
   // strategy 内 admin gate 会 reject 非 admin 即使 secret 验对了。既有 happy
   // 用例(token 合法 + model 已授权 → 200)默认 admin 即可保持绿,**单独**
   // Phase 6 负面用例显式 opts.authz={role:"user"} 触发 401。
-  const apiKeyStrategy = makeApiKeyIdentityStrategy({
+  const loadUserModelAuthz = async () => opts.authz ?? {
+    role: "admin" as const,
+    grantedModelIds: new Set<string>([FIXED_MODEL]),
+  };
+  const apiKeyIdentityDeps = {
     repo: apiKeyRepoSpy.repo,
     pricing,
-    loadUserModelAuthz: async () => opts.authz ?? {
-      role: "admin",
-      grantedModelIds: new Set<string>([FIXED_MODEL]),
-    },
+    loadUserModelAuthz,
     now: opts.now,
-  });
+  };
+  const apiKeyStrategy = makeApiKeyIdentityStrategy(apiKeyIdentityDeps);
+
+  // GET /api/anthropic/v1/models:与 production index.ts 相同的装配 —— 复用同一条
+  // API key 校验链,但不做 UA 门控(CC Switch「获取模型」用自家 HTTP client)。
+  const externalApiKeyModels = opts.omitExternalModels
+    ? undefined
+    : makeExternalModelsHandler({
+        resolveIdentity: (req) =>
+          resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        pricing,
+        loadUserModelAuthz,
+        ownedBy: "clarvy",
+        logger: testLogger,
+      });
+
+  // GET /api/anthropic/v1/usage:与 production index.ts 相同的装配 —— 同一条 key 校验链,
+  // 不做 UA 门控;余额 / 窗口统计通过 seam 注入(不走真实 DB)。
+  const externalApiKeyUsage = opts.omitExternalUsage
+    ? undefined
+    : makeExternalUsageHandler({
+        resolveIdentity: (req) =>
+          resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        repo: {
+          list: async () => [
+            {
+              id: FIXED_API_KEY_ID,
+              label: "cc-cli-laptop",
+              keyPrefix: FIXED_PREFIX,
+              createdAt: new Date("2026-05-18T00:00:00Z"),
+              lastUsedAt: null,
+              disabledAt: null,
+              creditLimit: null,
+              spentCredits: 0n,
+            },
+          ],
+        },
+        readBalance: async () => opts.usageBalance ?? 12345n,
+        readWindow: async () => ({ requests: "2", credits: "40", input_tokens: "100", output_tokens: "20" }),
+        logger: testLogger,
+      });
 
   const externalApiKeyProxy: AnthropicProxyHandler | undefined = opts.omitExternalProxy
     ? undefined
@@ -615,6 +695,7 @@ function buildHarness(opts: HarnessOpts = {}) {
           opts.phase6AccountUuidEnforce === undefined
             ? undefined
             : async () => opts.phase6AccountUuidEnforce!,
+        cursorExternal: opts.cursorExternal,
       });
 
   // 极简 CommercialHttpDeps — 只装与 Phase 3 adapter 相关的字段。其它都标 undefined,
@@ -627,6 +708,8 @@ function buildHarness(opts: HarnessOpts = {}) {
     pricing,
     preCheckRedis: preCheckSpy.redis,
     externalApiKeyProxy,
+    externalApiKeyModels,
+    externalApiKeyUsage,
   };
 
   const handler = createCommercialHandler(deps, { logger: testLogger });
@@ -1004,6 +1087,428 @@ describe("503 degraded — externalApiKeyProxy 未注入 → EXTERNAL_PROXY_UNAV
     assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
     assert.equal(h.preCheckSpy.reserveCalls.length, 0);
     assert.equal(h.schedulerSpy.pickCalls, 0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (7.1) GET /api/anthropic/v1/models — 外接模型发现(2026-09-07)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 与 /v1/messages 共用 API key 校验链(resolveApiKeyIdentity),差异只有两点:
+//   - 不做 UA 门控(CC Switch「获取模型」是自家 HTTP client,不是 claude-cli);
+//   - 额外接受 `x-api-key` 头(CC Switch anthropic 格式的供应商用它)。
+// 响应必须是 Anthropic + OpenAI 双兼容 list,公开 id 是**家族级**(无 `cursor-` 前缀、
+// 无思考档位后缀 —— 思考深度由客户端 output_config.effort 决定,2026-09-08),且全文
+// 不出现 "cursor" 字样(产品硬要求)。
+
+const MODELS_URL = "/api/anthropic/v1/models";
+const CURSOR_ROWS: ModelPricing[] = [
+  { ...FIXED_PRICING, model_id: "cursor-fable-5.1-high", display_name: "Fable 5.1 High", sort_order: 10 },
+  // same family, second variant → folds into the one `fable-5.1` row
+  { ...FIXED_PRICING, model_id: "cursor-fable-5.1-low", display_name: "Fable 5.1 Low", sort_order: 12 },
+  { ...FIXED_PRICING, model_id: "cursor-gemini-3.8-flash-low", display_name: "Gemini 3.8 Flash Low", sort_order: 20 },
+  // disabled → must not be listed
+  { ...FIXED_PRICING, model_id: "cursor-opus-5-high", display_name: "Opus 5 High", sort_order: 5, enabled: false },
+  // admin-only visibility → listed for admin (default authz), hidden for plain user without grant
+  { ...FIXED_PRICING, model_id: "cursor-sonnet-5-high", display_name: "Sonnet 5 High", sort_order: 15, visibility: "admin" },
+];
+
+describe("GET /api/anthropic/v1/models — 模型发现(API key 鉴权,无 UA 门控)", () => {
+  test("Bearer key + 非 claude-cli UA → 200 双形状 list,公开 id 为家族级,全文无 cursor / 档位", async () => {
+    const h = buildHarness({ extraPricing: CURSOR_ROWS });
+    const res = await h.run({
+      url: MODELS_URL,
+      method: "GET",
+      body: undefined,
+      headers: { "user-agent": "CC-Switch/3.9.0 tauri" },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(res.responseHeaders["cache-control"], "no-store");
+    const body = res.bodyJson() as {
+      object: string;
+      data: Array<{ id: string; type: string; object: string; display_name: string; owned_by: string; created: number; created_at: string }>;
+      has_more: boolean;
+      first_id: string | null;
+      last_id: string | null;
+    };
+    assert.equal(body.object, "list");
+    assert.equal(body.has_more, false);
+    // sort_order 升序;同家族两个变体折叠成一行;disabled 行不出现;admin visibility 对 admin 可见;
+    // 非 cursor 引擎(FIXED_MODEL)不出现
+    assert.deepEqual(body.data.map((d) => d.id), ["fable-5.1", "sonnet-5", "gemini-3.8-flash"]);
+    assert.equal(body.first_id, "fable-5.1");
+    assert.equal(body.last_id, "gemini-3.8-flash");
+    assert.deepEqual(body.data.map((d) => d.display_name), ["Fable 5.1", "Sonnet 5", "Gemini 3.8 Flash"]);
+    for (const d of body.data) {
+      assert.equal(d.type, "model");
+      assert.equal(d.object, "model");
+      assert.equal(d.owned_by, "clarvy");
+      assert.equal(typeof d.created, "number");
+      assert.equal(typeof d.created_at, "string");
+    }
+    assert.doesNotMatch(res.bodyText(), /cursor/i);
+    assert.doesNotMatch(res.bodyText(), /"id":"[^"]*-(low|medium|high|xhigh|max)"/);
+    // 鉴权链走了一次 findByPrefix;touchLastUsed 不调(默认 bump 是 no-op,列表不算"使用")
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 1);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 0);
+    // 零账务副作用
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.schedulerSpy.pickCalls, 0);
+  });
+
+  test("x-api-key 头(无 Authorization)同样鉴权成功", async () => {
+    const h = buildHarness({ extraPricing: CURSOR_ROWS });
+    // run() 总会注入 Bearer;这里直接手搓 req 以确保只有 x-api-key
+    const req = new MockReq({
+      url: MODELS_URL,
+      method: "GET",
+      headers: { "x-api-key": FIXED_TOKEN, "user-agent": "CC-Switch/3.9.0" },
+    });
+    const res = new MockRes();
+    await h.handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    const body = res.bodyJson() as { data: Array<{ id: string }> };
+    assert.ok(body.data.some((d) => d.id === "fable-5.1"));
+  });
+
+  test("role=user + 无 grant → admin-visibility 行被过滤(canUseModel 生效)", async () => {
+    // 注意:Phase 6 admin-only rollout 的 Layer 2 gate 在 resolveApiKeyIdentity 里对
+    // role=user 直接 401 —— 所以 authz 过滤只能用 admin role + deniedModelIds 来验。
+    const h = buildHarness({
+      extraPricing: CURSOR_ROWS,
+      authz: {
+        role: "admin",
+        grantedModelIds: new Set<string>(),
+        deniedModelIds: new Set<string>(["cursor-sonnet-5-high"]),
+      } as unknown as HarnessOpts["authz"],
+    });
+    const res = await h.run({ url: MODELS_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    const body = res.bodyJson() as { data: Array<{ id: string }> };
+    assert.deepEqual(body.data.map((d) => d.id), ["fable-5.1", "gemini-3.8-flash"]);
+  });
+
+  test("缺 key / 坏 key / 未知 prefix → 401 UNAUTHORIZED,与 /v1/messages 同一泛化文案", async () => {
+    const h = buildHarness({ extraPricing: CURSOR_ROWS });
+    // 缺 key
+    {
+      const req = new MockReq({ url: MODELS_URL, method: "GET", headers: {} });
+      const res = new MockRes();
+      await h.handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+      assert.equal(res.statusCode, 401);
+      assert.equal(readErrCode(res), "UNAUTHORIZED");
+      const j = res.bodyJson() as { error: { message: string } };
+      assert.equal(j.error.message, "container identity verification failed");
+    }
+    // 坏格式(普通 JWT)
+    {
+      const res = await h.run({
+        url: MODELS_URL,
+        method: "GET",
+        body: undefined,
+        headers: { authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig" },
+      });
+      assert.equal(res.statusCode, 401);
+      assert.equal(readErrCode(res), "UNAUTHORIZED");
+    }
+    // 未知 prefix
+    {
+      h.apiKeyRepoSpy.setRow(null);
+      const res = await h.run({ url: MODELS_URL, method: "GET", body: undefined });
+      assert.equal(res.statusCode, 401);
+      assert.equal(readErrCode(res), "UNAUTHORIZED");
+    }
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+  });
+
+  test("POST /v1/models → 405 METHOD_NOT_ALLOWED(在鉴权之前)", async () => {
+    const h = buildHarness({ extraPricing: CURSOR_ROWS });
+    const res = await h.run({ url: MODELS_URL, method: "POST" });
+    assert.equal(res.statusCode, 405);
+    assert.equal(readErrCode(res), "METHOD_NOT_ALLOWED");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+
+  test("未注入 externalApiKeyModels → 503 EXTERNAL_PROXY_UNAVAILABLE,不进鉴权", async () => {
+    const h = buildHarness({ omitExternalModels: true });
+    const res = await h.run({ url: MODELS_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 503);
+    assert.equal(readErrCode(res), "EXTERNAL_PROXY_UNAVAILABLE");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+
+  test("maintenance_mode=true → 503 MAINTENANCE(闸门在 models 路由之前)", async () => {
+    const h = buildHarness({
+      extraPricing: CURSOR_ROWS,
+      poolOverride: { maintenanceMode: true },
+    });
+    const res = await h.run({ url: MODELS_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "MAINTENANCE");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (7.1b) POST /v1/messages — 家族 id + output_config.effort → 内部变体(2026-09-08)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 对外模型名不带思考档位:Claude Code 用户在 cc 里自己设 /effort、--effort、
+// CLAUDE_CODE_EFFORT_LEVEL,请求带 output_config.effort;proxy 4a 解析成内部
+// `cursor-<family>-<effort>` 变体交给 cursorExternal(计费/授权键)。requestedModel
+// 保留客户端原话供回显。这里用 fake cursorExternal 只验解析,不走 relay。
+
+const EFFORT_ROWS: ModelPricing[] = (["low", "medium", "high", "xhigh", "max"] as const).map((effort, i) => ({
+  ...FIXED_PRICING,
+  model_id: `cursor-fable-5.1-${effort}`,
+  display_name: `Fable 5.1 ${effort}`,
+  sort_order: 10 + i,
+}));
+
+describe("POST /v1/messages — 公开家族 id + output_config.effort → 内部变体", () => {
+  function harnessWithEffort(extraPricing: ModelPricing[] = EFFORT_ROWS) {
+    const fake = buildFakeCursorExternal();
+    const h = buildHarness({ extraPricing, cursorExternal: fake.route });
+    return { h, fake };
+  }
+
+  test("fable-5.1 + effort=low → cursor-fable-5.1-low;requestedModel 保留 fable-5.1", async () => {
+    const { h, fake } = harnessWithEffort();
+    const res = await h.run({ body: { ...minBody("fable-5.1"), output_config: { effort: "low" } } });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-low");
+    assert.equal(fake.calls[0]!.requestedModel, "fable-5.1");
+    // 客户端可见回显是原话,不是内部 id
+    assert.doesNotMatch(res.bodyText(), /cursor/i);
+    // 解析日志带 effortSource=request(pinned 不打)
+    const ev = h.logEvents.find((e) => e.msg === "proxy_cursor_effort_resolved");
+    assert.ok(ev, "proxy_cursor_effort_resolved logged");
+    assert.equal(ev!.effort, "low");
+    assert.equal(ev!.effortSource, "request");
+    assert.equal(ev!.model, "cursor-fable-5.1-low");
+    // 不进旧 oauth 路径:scheduler / preCheck 都没被碰
+    assert.equal(h.schedulerSpy.pickCalls, 0);
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+  });
+
+  test("fable-5.1 不带 effort → 家族默认 high(effortSource=default)", async () => {
+    const { h, fake } = harnessWithEffort();
+    const res = await h.run({ body: minBody("fable-5.1") });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-high");
+    const ev = h.logEvents.find((e) => e.msg === "proxy_cursor_effort_resolved");
+    assert.equal(ev!.effortSource, "default");
+  });
+
+  test("effort=max 但 max 变体在本部署禁用 → 就近取 xhigh(effortSource=clamped)", async () => {
+    const rows = EFFORT_ROWS.map((r) => (r.model_id === "cursor-fable-5.1-max" ? { ...r, enabled: false } : r));
+    const { h, fake } = harnessWithEffort(rows);
+    const res = await h.run({ body: { ...minBody("fable-5.1"), output_config: { effort: "max" } } });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-xhigh");
+    const ev = h.logEvents.find((e) => e.msg === "proxy_cursor_effort_resolved");
+    assert.equal(ev!.effortSource, "clamped");
+    assert.equal(ev!.effort, "xhigh");
+  });
+
+  test("Claude Code 的 effort=auto / 未知值 → 视作未指定,走家族默认", async () => {
+    const { h, fake } = harnessWithEffort();
+    const res = await h.run({ body: { ...minBody("fable-5.1"), output_config: { effort: "auto" } } });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-high");
+  });
+
+  test("带档位后缀的公开 id(fable-5.1-low)钉死档位,忽略 output_config.effort;旧内部 id 同理", async () => {
+    const { h, fake } = harnessWithEffort();
+    const a = await h.run({ body: { ...minBody("fable-5.1-low"), output_config: { effort: "max" } } });
+    assert.equal(a.statusCode, 200, `status=${a.statusCode}; body=${a.bodyText()}`);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-low");
+    assert.equal(fake.calls[0]!.requestedModel, "fable-5.1-low");
+    const b = await h.run({ body: { ...minBody("cursor-fable-5.1-xhigh"), output_config: { effort: "low" } } });
+    assert.equal(b.statusCode, 200);
+    assert.equal(fake.calls[1]!.model, "cursor-fable-5.1-xhigh");
+    // pinned 不打解析日志
+    assert.equal(h.logEvents.filter((e) => e.msg === "proxy_cursor_effort_resolved").length, 0);
+  });
+
+  test("Claude Code auto-mode 分类器侧查询(max_tokens 64 + stop_sequences + 无工具)→ 强制最低档 low,effortSource=classifier", async () => {
+    const { h, fake } = harnessWithEffort();
+    // effort 随主对话是 high,但分类器形状优先 → low;effort/effortSource 一并传给 cursorExternal(审计用)。
+    const res = await h.run({
+      body: {
+        ...minBody("fable-5.1"),
+        max_tokens: 64,
+        stop_sequences: ["</block>"],
+        temperature: 0,
+        output_config: { effort: "high" },
+      },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(fake.calls[0]!.model, "cursor-fable-5.1-low");
+    assert.equal(fake.calls[0]!.requestedModel, "fable-5.1");
+    const ev = h.logEvents.find((e) => e.msg === "proxy_cursor_effort_resolved");
+    assert.equal(ev!.effortSource, "classifier");
+    assert.equal(ev!.effort, "low");
+    // 同形状但带工具 → 不是分类器,照常走请求档位。
+    const res2 = await h.run({
+      body: {
+        ...minBody("fable-5.1"),
+        max_tokens: 64,
+        stop_sequences: ["</block>"],
+        tools: [{ name: "Read", input_schema: { type: "object" } }],
+        output_config: { effort: "high" },
+      },
+    });
+    assert.equal(res2.statusCode, 200);
+    assert.equal(fake.calls[1]!.model, "cursor-fable-5.1-high");
+  });
+
+  test("家族 id 但整族都未在 pricing 启用 → 不进 cursorExternal,落回既有 unknown-model 路径", async () => {
+    // pricing 里没有任何 cursor-sonnet-5-* 行
+    const { h, fake } = harnessWithEffort();
+    const res = await h.run({ body: { ...minBody("sonnet-5"), output_config: { effort: "high" } } });
+    assert.equal(fake.calls.length, 0);
+    assert.notEqual(res.statusCode, 200);
+    assert.doesNotMatch(res.bodyText(), /cursor/i);
+  });
+
+  test("未注入 cursorExternal → 公开 id 不被识别(容器 internal proxy 零变化)", async () => {
+    const h = buildHarness({ extraPricing: EFFORT_ROWS });
+    const res = await h.run({ body: { ...minBody("fable-5.1"), output_config: { effort: "low" } } });
+    assert.notEqual(res.statusCode, 200);
+    assert.equal(h.schedulerSpy.pickCalls, 0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (7.2) GET /api/anthropic/v1/usage — 外接余额 / 单 key 消耗(2026-09-08)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 给 CC Switch「用量查询」脚本用。与 /v1/models 同一条 key 校验链、同样不做 UA 门控、
+// 同 503 装配失败语义。只读:不打上游、不动积分、不 bump last_used_at。
+
+const USAGE_URL = "/api/anthropic/v1/usage";
+
+describe("GET /api/anthropic/v1/usage — 外接余额(API key 鉴权,无 UA 门控)", () => {
+  test("Bearer key + 非 claude-cli UA → 200 no-store,余额 / key 快照 / 30d 窗口,全文无 cursor", async () => {
+    const h = buildHarness();
+    const res = await h.run({
+      url: USAGE_URL,
+      method: "GET",
+      body: undefined,
+      headers: { "user-agent": "cc-switch/usage" },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(res.responseHeaders["cache-control"], "no-store");
+    const body = res.bodyJson() as {
+      object: string; unit: string;
+      balance: { spendable: string };
+      key: { id: string; label: string | null; key_prefix: string | null; spent_credits: string; credit_limit: string | null; remaining_limit: string | null; is_valid: boolean };
+      window: { range: string; requests: string; credits: string };
+    };
+    assert.equal(body.object, "usage");
+    assert.equal(body.unit, "credits");
+    assert.equal(body.balance.spendable, "12345");
+    assert.equal(body.key.id, FIXED_API_KEY_ID.toString());
+    assert.equal(body.key.label, "cc-cli-laptop");
+    assert.equal(body.key.key_prefix, `oc-cc.${FIXED_PREFIX}`);
+    assert.equal(body.key.credit_limit, null);
+    assert.equal(body.key.is_valid, true);
+    assert.equal(body.window.range, "30d");
+    assert.equal(body.window.requests, "2");
+    assert.doesNotMatch(res.bodyText(), /cursor/i);
+    // 只读:不 bump last_used_at
+    assert.equal(h.apiKeyRepoSpy.touchLastUsedCalls.length, 0);
+    assert.ok(h.logEvents.some((e) => e.msg === "external_usage_listed"));
+  });
+
+  test("x-api-key 头也能过;余额为 0 → is_valid=false", async () => {
+    const h = buildHarness({ usageBalance: 0n });
+    const res = await h.run({
+      url: USAGE_URL,
+      method: "GET",
+      body: undefined,
+      headers: { authorization: "", "x-api-key": FIXED_TOKEN, "user-agent": "cc-switch/usage" },
+    });
+    assert.equal(res.statusCode, 200, `status=${res.statusCode}; body=${res.bodyText()}`);
+    const body = res.bodyJson() as { balance: { spendable: string }; key: { is_valid: boolean } };
+    assert.equal(body.balance.spendable, "0");
+    assert.equal(body.key.is_valid, false);
+  });
+
+  test("无 key → 401 泛化文案 + log external_usage_identity_failed{errcode=MISSING_API_KEY, detail}", async () => {
+    const h = buildHarness();
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined, headers: { authorization: "" } });
+    assert.equal(res.statusCode, 401);
+    const j = res.bodyJson() as { error: { code: string; message: string } };
+    assert.equal(j.error.code, "UNAUTHORIZED");
+    assert.equal(j.error.message, "container identity verification failed");
+    const ev = h.logEvents.find((e) => e.msg === "external_usage_identity_failed");
+    assert.ok(ev);
+    assert.equal(ev!.errcode, "MISSING_API_KEY");
+    assert.equal(typeof ev!.detail, "string");
+  });
+
+  test("已撤销 key → 401(anti-enum 同文案),server log detail 含 prefix", async () => {
+    const h = buildHarness();
+    h.apiKeyRepoSpy.setRow(null);
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 401);
+    const ev = h.logEvents.find((e) => e.msg === "external_usage_identity_failed");
+    assert.equal(ev?.errcode, "API_KEY_INVALID");
+    assert.match(String(ev?.detail), new RegExp(`prefix=${FIXED_PREFIX}`));
+  });
+
+  test("POST /v1/usage → 405 METHOD_NOT_ALLOWED(在鉴权之前)", async () => {
+    const h = buildHarness();
+    const res = await h.run({ url: USAGE_URL, method: "POST" });
+    assert.equal(res.statusCode, 405);
+    assert.equal(readErrCode(res), "METHOD_NOT_ALLOWED");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+
+  test("未注入 externalApiKeyUsage → 503 EXTERNAL_PROXY_UNAVAILABLE,不进鉴权", async () => {
+    const h = buildHarness({ omitExternalUsage: true });
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 503);
+    assert.equal(readErrCode(res), "EXTERNAL_PROXY_UNAVAILABLE");
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 0);
+  });
+
+  test("maintenance_mode=true → 503 MAINTENANCE(闸门在 usage 路由之前)", async () => {
+    const h = buildHarness({ poolOverride: { maintenanceMode: true } });
+    const res = await h.run({ url: USAGE_URL, method: "GET", body: undefined });
+    assert.equal(res.statusCode, 503, `status=${res.statusCode}; body=${res.bodyText()}`);
+    assert.equal(readErrCode(res), "MAINTENANCE");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// (7.3) 双凭据头(2026-09-08):Claude Code 两头都发时,形似本站的那一头胜出
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("POST /v1/messages — Authorization 残留别家 key + x-api-key 本站 key", () => {
+  test("Authorization: Bearer sk-ant-* + x-api-key: oc-cc.* → 身份通过(不再 401)", async () => {
+    const h = buildHarness();
+    const res = await h.run({
+      headers: { authorization: "Bearer sk-ant-api03-legacy", "x-api-key": FIXED_TOKEN },
+    });
+    assert.notEqual(res.statusCode, 401, `body=${res.bodyText()}`);
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls.length, 1);
+    assert.equal(h.apiKeyRepoSpy.findByPrefixCalls[0], FIXED_PREFIX);
+  });
+
+  test("proxy_identity_failed 日志带 detail(server-only),响应文案不变", async () => {
+    const h = buildHarness();
+    h.apiKeyRepoSpy.setRow(null);
+    const res = await h.run();
+    assert.equal(res.statusCode, 401);
+    const ev = h.logEvents.find((e) => e.msg === "proxy_identity_failed");
+    assert.equal(ev?.errcode, "API_KEY_INVALID");
+    assert.match(String(ev?.detail), /unknown or revoked api key prefix=/);
+    assert.doesNotMatch(res.bodyText(), /prefix=/);
   });
 });
 

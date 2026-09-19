@@ -38,9 +38,6 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
   SkillDraftStore,
-  type SkillStore,
-  buildAgentSkillStore,
-  buildRunSkillStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
   searchSkillMetadata,
@@ -62,6 +59,7 @@ import {
   rewriteSelfDelegateErrorForMcp,
 } from './delegateArgs.js'
 import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
+import { buildMcpSkillStore } from './skillStoreContext.js'
 import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
@@ -72,12 +70,15 @@ import {
 } from './delegateCursorFastPath.js'
 import { formatSendToAgentStart } from './sendToAgent.js'
 import {
+  CONSULT_INVOCATION_HEADER,
   describeDelegateTransportError,
   gatewayDelegateHeaders,
   gatewayBaseUrl,
   postJsonToGateway,
   readGatewayToken,
 } from './gatewayClient.js'
+import { resolveConsultInvocationId } from './consultInvocation.js'
+import { consultAdvisorUntilAdvice, formatConsultAdvisorToolPayload } from './consultAdvisorClient.js'
 import {
   askUserHttpTimeoutMs,
   askUserToolPostedFallback,
@@ -105,6 +106,10 @@ import {
   shouldListPresentOptions,
 } from './presentOptions.js'
 import {
+  handlePresentTaskApproval,
+  shouldListPresentTaskApproval,
+} from './presentTaskApproval.js'
+import {
   cursorDelegateCliHint,
   delegateWaitDisabledText,
   filterListedDelegateTools,
@@ -130,14 +135,9 @@ const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
+const consumePresentTaskApprovalCall = createPresentOptionsCallBudget(4)
 
-function buildSkillStore(): SkillStore {
-  const projectId = (process.env.OPENCLAUDE_PROJECT_ID ?? '').trim()
-  if (projectId) return buildRunSkillStore({ agentId: AGENT_ID, projectId })
-  return buildAgentSkillStore(AGENT_ID)
-}
-
-const skills = buildSkillStore()
+const skills = buildMcpSkillStore()
 
 // ── Skill-eval arm 控制(评测隔离会话专用,普通会话两个 env 均缺省) ──
 // EXCLUDE:'without' 基线 —— 目标技能对本会话完全不可见(list/search/view 全隐藏,
@@ -223,6 +223,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListPresentOptions(ENGINE_ID, DELEGATION_DEPTH)) {
     base = base.filter((t) => t.name !== 'present_options')
   }
+  if (!shouldListPresentTaskApproval(DELEGATION_DEPTH)) {
+    base = base.filter((t) => t.name !== 'present_task_approval')
+  }
   base = filterListedDelegateTools(base, ENGINE_ID)
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
@@ -276,6 +279,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateWait(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
+      case 'consult_advisor':
+        return await handleConsultAdvisor(args as any, req)
       case 'task_create':
         return await handleTaskCreate(args as any)
       case 'task_update':
@@ -299,6 +304,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           delegationDepth: DELEGATION_DEPTH,
         })
         return result.ok ? toolOk(result.message) : toolError(result.message)
+      }
+      case 'present_task_approval': {
+        if (!consumePresentTaskApprovalCall()) {
+          return toolError('present_task_approval 每回合最多调用 4 次')
+        }
+        return await handlePresentTaskApproval(args, {
+          delegationDepth: DELEGATION_DEPTH,
+        })
       }
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
@@ -836,6 +849,42 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
       `[mcp-memory] ask_user gateway call failed: ${describeDelegateTransportError(err)}\n`,
     )
     return askUserToolPostedFallback()
+  }
+}
+
+async function handleConsultAdvisor(
+  args: { question?: string; concern?: string },
+  req: { params?: { _meta?: unknown }; id?: unknown },
+) {
+  const question = typeof args?.question === 'string' ? args.question.trim() : ''
+  if (!question) return toolError('question 必填')
+  const concern = typeof args?.concern === 'string' ? args.concern.trim() : ''
+  const invocation = resolveConsultInvocationId({
+    mcpMeta: req?.params?._meta,
+    jsonRpcId: req?.id,
+  })
+  if (!invocation.ok) return toolError(invocation.error)
+  const headers = {
+    ...gatewayDelegateHeaders(),
+    [CONSULT_INVOCATION_HEADER]: invocation.invocationId,
+  }
+  try {
+    const result = await consultAdvisorUntilAdvice({
+      post: () =>
+        postJsonToGateway(`${gatewayBaseUrl()}/api/agents/advisor/consult`, {
+          headers,
+          body: JSON.stringify({ question, ...(concern ? { concern } : {}) }),
+          timeoutMs: 10 * 60_000,
+        }),
+    })
+    const payload = formatConsultAdvisorToolPayload({
+      ok: result.ok,
+      text: result.text,
+      parsed: result.parsed,
+    })
+    return result.ok ? toolOk(payload) : toolError(payload)
+  } catch (err: unknown) {
+    return toolError(`consult_advisor transport: ${describeDelegateTransportError(err)}`)
   }
 }
 

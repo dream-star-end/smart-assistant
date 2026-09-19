@@ -1,10 +1,12 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Package } from "lucide-react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Alert } from "./Alert";
 import { Badge } from "./Badge";
 import { Card, CardRow } from "./Card";
 import { ListSkeleton } from "./ListSkeleton";
 import { EmptyState, Panel, PanelHeader } from "./Panel";
+import { Sheet } from "./Sheet";
 import { Toolbar } from "./Toolbar";
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
@@ -131,5 +133,86 @@ describe("ui surfaces", () => {
     render(<Toolbar title="只读" actions={<button type="button">刷新</button>} />);
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.getByRole("button", { name: "刷新" })).toBeTruthy();
+  });
+});
+
+/**
+ * Alert 的读屏播报级别(shell 审计 S-07):原实现无条件 role="alert"(隐含 assertive),
+ * 挂载即存在的静态说明会被当成打断式播报。现在按 tone 推导,调用方可显式覆盖。
+ */
+describe("Alert live region", () => {
+  it("danger / warning 默认 role=alert(assertive),info / success 默认 role=status(polite)", () => {
+    render(
+      <>
+        <Alert tone="danger">d</Alert>
+        <Alert tone="warning">w</Alert>
+        <Alert tone="info">i</Alert>
+        <Alert tone="success">s</Alert>
+      </>,
+    );
+    expect(screen.getByText("d").closest('[role="alert"]')).not.toBeNull();
+    expect(screen.getByText("w").closest('[role="alert"]')).not.toBeNull();
+    expect(screen.getByText("i").closest('[role="status"]')).not.toBeNull();
+    expect(screen.getByText("s").closest('[role="status"]')).not.toBeNull();
+    expect(screen.getAllByRole("alert")).toHaveLength(2);
+    expect(screen.getAllByRole("status")).toHaveLength(2);
+  });
+
+  it("未传 tone 时等于 info → status", () => {
+    render(<Alert>默认</Alert>);
+    expect(screen.getByRole("status").textContent).toContain("默认");
+  });
+
+  it("显式 live 覆盖默认:info 可升为 assertive,danger 可降为 polite,off 不进 live region", () => {
+    const { container } = render(
+      <>
+        <Alert tone="info" live="assertive">
+          urgent
+        </Alert>
+        <Alert tone="danger" live="polite">
+          calm
+        </Alert>
+        <Alert tone="info" live="off">
+          静态说明
+        </Alert>
+      </>,
+    );
+    expect(screen.getByText("urgent").closest('[role="alert"]')).not.toBeNull();
+    expect(screen.getByText("calm").closest('[role="status"]')).not.toBeNull();
+    const still = screen.getByText("静态说明").closest("div.rounded-lg");
+    expect(still).not.toBeNull();
+    expect(still?.getAttribute("role")).toBeNull();
+    expect(container.querySelectorAll("[role]")).toHaveLength(2);
+  });
+
+  it("视觉类名不因 live 而变(role 变化零视觉差)", () => {
+    render(<Alert tone="info">x</Alert>);
+    const cls = screen.getByRole("status").className;
+    expect(cls).toContain("bg-info-soft");
+    expect(cls).toContain("px-4 py-3 text-sm");
+  });
+});
+
+/** Sheet 贴底变体自带滚动容器(shell 审计 S-17):内容超过 85dvh 不再被裁掉且滚不到。 */
+describe("Sheet bottom variant", () => {
+  it("side=bottom 的内容容器带 max-h + overflow-y-auto", () => {
+    render(
+      <Sheet open onOpenChange={() => {}} side="bottom" srTitle="贴底">
+        <p>内容</p>
+      </Sheet>,
+    );
+    const cls = screen.getByRole("dialog").className;
+    expect(cls).toContain("max-h-[85dvh]");
+    expect(cls).toContain("overflow-y-auto");
+    expect(cls).toContain("overscroll-contain");
+  });
+
+  it("side=right 不受影响(侧栏抽屉沿用调用方自己的滚动容器)", () => {
+    render(
+      <Sheet open onOpenChange={() => {}} side="right" srTitle="右侧">
+        <p>内容</p>
+      </Sheet>,
+    );
+    expect(screen.getByRole("dialog").className).not.toContain("overflow-y-auto");
   });
 });

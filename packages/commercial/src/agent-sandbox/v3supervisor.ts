@@ -50,7 +50,7 @@
 
 import type Docker from "dockerode";
 import { randomBytes, createHash, createHmac } from "node:crypto";
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
@@ -263,6 +263,22 @@ export function resolveV5LocalCcbTransportEnv(
 }
 
 /**
+ * 用户面时区透传(OCV5-166)。合法 IANA 名 → `["OC_USER_TZ=<tz>"]`;缺省/空白/非法 → `[]`
+ * (不抛:这是 UX 提示,不是安全边界;容器侧 envProbe 会回落 Asia/Shanghai)。
+ * 与 resolveV5LocalCcbTransportEnv 的 OPENCLAUDE_CCB_TZ 刻意分开:那个绑出口,这个绑用户。
+ */
+export function resolveUserTimeZoneEnv(raw: string | undefined): string[] {
+  const tz = raw?.trim() ?? "";
+  if (!tz || tz.length > 64 || !/^[A-Za-z0-9_+\-/]+$/.test(tz)) return [];
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz }).format();
+  } catch {
+    return [];
+  }
+  return [`OC_USER_TZ=${tz}`];
+}
+
+/**
  * 容器内 OpenClaude gateway 监听端口(默认 18789,见 personal-version
  * `packages/storage/src/config.ts`,容器侧 entrypoint.ts bootstrap config 也是这个值)。
  */
@@ -383,6 +399,8 @@ export interface V5CursorAuthMountOptions {
  * Resolve the host Cursor auth directory only for an explicitly configured
  * local V5 credential member. Invalid or incomplete configuration is fail-closed: the
  * Agent container still starts, but no Cursor credential is mounted.
+ * An already managed pool keeps its directory mounted while empty, so a later
+ * account activation/preparation can publish credentials without a container rebuild.
  */
 export function resolveV5CursorAuthMount(
   options: V5CursorAuthMountOptions,
@@ -410,7 +428,27 @@ export function resolveV5CursorAuthMount(
     }
 
     const keyPath = pathJoin(normalized, "api-key");
-    const keyStat = lstatSync(keyPath);
+    let keyStat;
+    try {
+      keyStat = lstatSync(keyPath);
+    } catch (error) {
+      // Only an absent key is a legitimate empty pool. Never let the marker
+      // excuse an existing malformed key, a symlink, or any other I/O error.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      const markerPath = pathJoin(normalized, ".account-pool-owned");
+      const markerStat = lstatSync(markerPath);
+      const markerMode = markerStat.mode & 0o777;
+      if (
+        !markerStat.isFile()
+        || markerStat.isSymbolicLink()
+        || markerStat.uid !== 0
+        || (markerMode !== 0o400 && markerMode !== 0o600)
+        || markerStat.size !== 2
+        || realpathSync(markerPath) !== markerPath
+        || readFileSync(markerPath, "utf8") !== "1\n"
+      ) return null;
+      return normalized;
+    }
     const keyMode = keyStat.mode & 0o777;
     if (
       !keyStat.isFile()
@@ -2792,6 +2830,10 @@ export async function provisionV3Container(
         noProxy: process.env.NO_PROXY,
       }),
     );
+    // OCV5-166:用户面时区,与上面出口对齐的 OPENCLAUDE_CCB_TZ **正交**。容器 gateway 的
+    // envProbe 把它渲染进 ENV prompt slot(user_tz=…),让模型不再把子进程 `date` 当用户
+    // 时间。只透传合法 IANA 名;缺省/非法不注入,容器侧自行回落 Asia/Shanghai。
+    env.push(...resolveUserTimeZoneEnv(process.env.OC_USER_TZ));
     const promptQueueEnabled = getRuntimeChannel() === "v5" && isPromptQueueV1Enabled();
     if (promptQueueEnabled) {
       // Both halves of the container-side strict gate are server-authored.

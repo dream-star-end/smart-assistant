@@ -12,6 +12,14 @@ describe('bridge API allowlist', () => {
 
   it('allows only selected per-container management routes for commercial proxy', () => {
     assert.equal(matchCommercialContainerApiProxy('/api/agents', 'GET')?.label, '/api/agents')
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/collaboration-config', 'GET')?.label,
+      '/api/collaboration-config',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/collaboration-config', 'PUT')?.label,
+      '/api/collaboration-config',
+    )
     // v5 纯市场:不允许经容器代理创建容器内 agent(其它 agent 一律走市场安装)。POST 被砍。
     assert.equal(matchCommercialContainerApiProxy('/api/agents', 'POST'), null)
     assert.equal(

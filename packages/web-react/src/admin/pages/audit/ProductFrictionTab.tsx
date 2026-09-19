@@ -29,6 +29,53 @@ type EventWindow = {
   latest_occurrence: string | null;
   trace: { total: number; with_trace: number; missing_trace: number };
 };
+type ProblemCardFunnelRow = {
+  code?: string;
+  path?: string;
+  reason?: string;
+  presentation?: string;
+  shown?: number | string;
+  recovered?: number | string;
+  failed?: number | string;
+  cancelled?: number | string;
+  pending?: number | string;
+  affected_users?: number | string;
+  p50_recover_ms?: number | string | null;
+  window?: "24h" | "7d" | string;
+};
+type ProblemCardDecisionRow = {
+  code?: string;
+  outcome?: string;
+  reason?: string;
+  count?: number | string;
+};
+type ProblemCardFallbackRow = {
+  code?: string;
+  reason?: string;
+  count?: number | string;
+};
+/** 服务端 `problemCards.funnel` 是 `{ last_24h, last_7d }` 双窗对象（audit.ts）；也兼容扁平数组。 */
+type ProblemCardFunnelPayload =
+  | ProblemCardFunnelRow[]
+  | { last_24h?: ProblemCardFunnelRow[]; last_7d?: ProblemCardFunnelRow[] };
+type ProblemCardsPayload = {
+  funnel?: ProblemCardFunnelPayload;
+  decisions?: ProblemCardDecisionRow[];
+  jobs?: ProblemCardDecisionRow[];
+  fallbacks?: ProblemCardFallbackRow[];
+};
+
+/** 把双窗对象展平为带 `window` 标的行；已是数组则原样（缺 window 不补）。 */
+export function flattenProblemCardFunnel(funnel: ProblemCardFunnelPayload | null | undefined): ProblemCardFunnelRow[] {
+  if (!funnel) return [];
+  if (Array.isArray(funnel)) return funnel;
+  const d1 = Array.isArray(funnel.last_24h) ? funnel.last_24h : [];
+  const d7 = Array.isArray(funnel.last_7d) ? funnel.last_7d : [];
+  return [
+    ...d1.map((r) => ({ ...r, window: r.window ?? "24h" })),
+    ...d7.map((r) => ({ ...r, window: r.window ?? "7d" })),
+  ];
+}
 type ProductFrictionResponse = {
   generated_at: string;
   windows: { operational_days: number; funnel_days: number };
@@ -45,6 +92,7 @@ type ProductFrictionResponse = {
   orders: CountRow[];
   github: CountRow[];
   ratings: CountRow[];
+  problemCards?: ProblemCardsPayload | null;
 };
 
 const n = (value: string | undefined) => Number(value ?? 0);
@@ -59,6 +107,48 @@ const eventColumns: Column<EventRow>[] = [
   { key: "recovered_7d", title: "已恢复", align: "right", cellClassName: "tabular-nums" },
   { key: "pending_7d", title: "进行中", align: "right", cellClassName: "tabular-nums" },
   { key: "affected_users_7d", title: "影响用户", align: "right", cellClassName: "tabular-nums" },
+];
+
+function presentationTone(value: string | undefined): "danger" | "warning" | "info" | "success" | "neutral" {
+  if (value === "red") return "danger";
+  if (value === "yellow") return "warning";
+  if (value === "soft") return "info";
+  if (value === "placeholder") return "neutral";
+  return "neutral";
+}
+
+const problemCardFunnelColumns: Column<ProblemCardFunnelRow>[] = [
+  { key: "code", title: "错误码", render: (r) => <span className="font-mono text-meta">{r.code ?? "—"}</span> },
+  { key: "path", title: "路径", render: (r) => <span className="font-mono text-meta">{r.path ?? "—"}</span> },
+  { key: "reason", title: "原因", render: (r) => <span className="font-mono text-meta">{r.reason || "—"}</span> },
+  {
+    key: "presentation", title: "呈现",
+    render: (r) => <Badge tone={presentationTone(r.presentation)}>{r.presentation ?? "—"}</Badge>,
+  },
+  { key: "window", title: "窗口" },
+  { key: "shown", title: "展示", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.shown == null ? undefined : String(r.shown)) },
+  { key: "recovered", title: "已恢复", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.recovered == null ? undefined : String(r.recovered)) },
+  { key: "failed", title: "失败", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.failed == null ? undefined : String(r.failed)) },
+  { key: "cancelled", title: "取消", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.cancelled == null ? undefined : String(r.cancelled)) },
+  { key: "pending", title: "进行中", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.pending == null ? undefined : String(r.pending)) },
+  { key: "affected_users", title: "用户", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.affected_users == null ? undefined : String(r.affected_users)) },
+  {
+    key: "p50_recover_ms", title: "恢复 p50", align: "right", cellClassName: "tabular-nums",
+    render: (r) => r.p50_recover_ms == null || r.p50_recover_ms === "" ? "—" : `${n(String(r.p50_recover_ms))}ms`,
+  },
+];
+
+const problemCardDecisionColumns: Column<ProblemCardDecisionRow>[] = [
+  { key: "code", title: "错误码", render: (r) => <span className="font-mono text-meta">{r.code ?? "—"}</span> },
+  { key: "outcome", title: "结果", render: (r) => <Badge tone={r.outcome === "failed" ? "danger" : r.outcome === "recovered" ? "success" : "neutral"}>{r.outcome ?? "—"}</Badge> },
+  { key: "reason", title: "原因", render: (r) => <span className="font-mono text-meta">{r.reason || "—"}</span> },
+  { key: "count", title: "计数", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.count == null ? undefined : String(r.count)) },
+];
+
+const problemCardFallbackColumns: Column<ProblemCardFallbackRow>[] = [
+  { key: "code", title: "错误码", render: (r) => <span className="font-mono text-meta">{r.code ?? "—"}</span> },
+  { key: "reason", title: "原因", render: (r) => <span className="font-mono text-meta">{r.reason || "—"}</span> },
+  { key: "count", title: "计数", align: "right", cellClassName: "tabular-nums", render: (r) => n(r.count == null ? undefined : String(r.count)) },
 ];
 
 const modelColumns: Column<ModelRow>[] = [
@@ -176,6 +266,7 @@ export function ProductFrictionTab() {
         <h3 className="text-body font-semibold text-fg">恢复感知事件</h3>
         <DataTable columns={eventColumns} rows={data?.events ?? []} rowKey={(r) => `${r.surface}:${r.stage}:${r.code}`} loading={loading} emptyHint="只有出现摩擦或恢复时才记录，不写成功心跳。" />
       </section>
+      <ProblemCardsSection cards={data?.problemCards} loading={loading} />
       <div className="grid gap-3 lg:grid-cols-2">
         <SourceCard title="模型失败分类（7 天）" rows={data?.model_failures ?? []} fields={[{ key: "failures_1d", label: "24 小时" }, { key: "failures_7d", label: "7 天" }, { key: "affected_users_7d", label: "用户" }]} />
         <SourceCard title="图片旅程状态（7 天）" rows={data?.images ?? []} fields={[{ key: "records", label: "记录" }, { key: "affected_users", label: "用户" }]} />
@@ -185,6 +276,58 @@ export function ProductFrictionTab() {
         <SourceCard title="响应评分（30 天）" rows={data?.ratings ?? []} fields={[{ key: "ratings", label: "评分" }, { key: "missing_reason", label: "缺原因" }, { key: "missing_trace", label: "缺追踪" }]} />
       </div>
     </div>
+  );
+}
+
+function ProblemCardsSection({ cards, loading }: { cards?: ProblemCardsPayload | null; loading: boolean }) {
+  const funnel = flattenProblemCardFunnel(cards?.funnel);
+  const decisions = Array.isArray(cards?.decisions) ? cards.decisions : [];
+  const jobs = Array.isArray(cards?.jobs) ? cards.jobs : [];
+  const fallbacks = Array.isArray(cards?.fallbacks) ? cards.fallbacks : [];
+  return (
+    <section className="flex flex-col gap-3">
+      <h3 className="text-body font-semibold text-fg">问题卡</h3>
+      <DataTable
+        columns={problemCardFunnelColumns}
+        rows={funnel}
+        rowKey={(r, i) => `${r.window ?? ""}:${r.code ?? ""}:${r.path ?? ""}:${r.reason ?? ""}:${r.presentation ?? ""}:${i}`}
+        loading={loading}
+        emptyTitle="暂无问题卡"
+        emptyHint="近窗没有问题卡事件。"
+      />
+      <div className="grid gap-3 lg:grid-cols-3">
+        <div className="flex flex-col gap-2">
+          <h4 className="text-meta font-medium text-fg">恢复裁决</h4>
+          <DataTable
+            columns={problemCardDecisionColumns}
+            rows={decisions}
+            rowKey={(r, i) => `decision:${r.code ?? ""}:${r.outcome ?? ""}:${r.reason ?? ""}:${i}`}
+            loading={loading}
+            emptyTitle="暂无裁决"
+          />
+        </div>
+        <div className="flex flex-col gap-2">
+          <h4 className="text-meta font-medium text-fg">恢复任务</h4>
+          <DataTable
+            columns={problemCardDecisionColumns}
+            rows={jobs}
+            rowKey={(r, i) => `job:${r.code ?? ""}:${r.outcome ?? ""}:${r.reason ?? ""}:${i}`}
+            loading={loading}
+            emptyTitle="暂无任务"
+          />
+        </div>
+        <div className="flex flex-col gap-2">
+          <h4 className="text-meta font-medium text-fg">可见占位</h4>
+          <DataTable
+            columns={problemCardFallbackColumns}
+            rows={fallbacks}
+            rowKey={(r, i) => `fallback:${r.code ?? ""}:${r.reason ?? ""}:${i}`}
+            loading={loading}
+            emptyTitle="暂无占位"
+          />
+        </div>
+      </div>
+    </section>
   );
 }
 

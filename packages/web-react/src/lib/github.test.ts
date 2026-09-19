@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  describeGithubScopes,
   estimateCloningProgress,
   formatRepoLabel,
   githubErrorText,
@@ -8,6 +9,24 @@ import {
   VERSION_SENTINEL_CLEARED,
 } from "./github";
 import type { RepoSelection } from "./types";
+
+// GH-03：账号栏副标题不再直接输出 OAuth scope 原文。
+describe("describeGithubScopes", () => {
+  test("已知 scope 映射成可读文案并用 · 连接", () => {
+    expect(describeGithubScopes("repo,read:user")).toBe("读写仓库 · 读取账号信息");
+  });
+
+  test("空格分隔 / 重复 / 未知 scope：去重、未知保留原文", () => {
+    expect(describeGithubScopes("repo public_repo repo custom:thing")).toBe(
+      "读写仓库 · 读写公开仓库 · custom:thing",
+    );
+  });
+
+  test("空串或缺省回「已连接」", () => {
+    expect(describeGithubScopes("")).toBe("已连接");
+    expect(describeGithubScopes(undefined)).toBe("已连接");
+  });
+});
 
 describe("estimateCloningProgress", () => {
   test("单调上升、封顶 90%", () => {

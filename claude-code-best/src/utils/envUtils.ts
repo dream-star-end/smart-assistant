@@ -64,6 +64,11 @@ export function isBareMode(): boolean {
   )
 }
 
+/** OpenClaude CCB advisor hermetic profile: process-level MCP assembly deny. */
+export function isOpenClaudeAdvisorHermetic(): boolean {
+  return isEnvTruthy(process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC)
+}
+
 /**
  * Parses an array of environment variable strings into a key-value object
  * @param envVars Array of strings in KEY=VALUE format

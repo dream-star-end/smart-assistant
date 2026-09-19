@@ -119,9 +119,11 @@ export function JournalHydrationRetry({ onRetry }: { onRetry: () => void }) {
       data-testid="journal-hydration-retry"
     >
       <span className="min-w-0 text-xs">实时内容未完全加载，已显示已有记录。</span>
+      {/* text-foreground 不是本仓 token(会回落到父级 text-muted,与说明文字同色):改 text-fg +
+          常显下划线,让动作按钮看得出是可点的;触屏下加高到 44px。 */}
       <button
         type="button"
-        className="shrink-0 text-xs text-foreground underline-offset-2 hover:underline"
+        className="shrink-0 text-xs font-medium text-fg underline underline-offset-2 hover:text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
         onClick={onRetry}
       >
         重新加载

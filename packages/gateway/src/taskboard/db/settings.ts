@@ -1,3 +1,4 @@
+import { queryCostStats, type CostTotals } from './costStats.js'
 // Taskboard 全局护栏 settings DAO。
 //
 // 设计意图:
@@ -28,7 +29,9 @@ export interface TaskboardSettings {
 
 export interface TaskboardUsage {
   runsToday: number
+  /** Legacy guardrail counter: calculation unchanged. */
   costTodayUsd: number
+  referenceCostsToday?: CostTotals
   activeRuns: number
   unpricedRunsToday: number
 }
@@ -177,6 +180,14 @@ export function getUsage(db: TaskboardDb, now = Date.now()): TaskboardUsage {
     costTodayUsd: today.cost,
     activeRuns: active.n,
     unpricedRunsToday: today.unpriced,
+  }
+}
+
+/** Display projection only: patrol/guardrail admission keeps its original two queries. */
+export function getUsageWithReferenceCosts(db: TaskboardDb, now = Date.now()): TaskboardUsage {
+  return {
+    ...getUsage(db, now),
+    referenceCostsToday: queryCostStats(db, { fromMs: startOfLocalDayMs(now), toMs: now + 1 }).totals,
   }
 }
 

@@ -11,7 +11,11 @@
  *  - ≥2 个块(流式或非流式)→ 逐题点选只记录(单选可换选),GroupFooter 显示
  *    「已作答 x/y」,至少答 1 题即可「发送选择」,未答的题标成「(未答)」,
  *    聚合成一条回复一次发出;流式期页脚发送按钮同样可用;
+ *  - 流式期点选过但没发,流式结束后(哪怕只有 1 块)页脚**留着**,点选不丢、仍由用户显式发出;
  *  - 发送后整组锁定。
+ *
+ * 块的「注册」必须在 layout effect 里做(RichBlocks.OptionsBlock):passive effect 会在
+ * commit 之后才跑,中间那帧里块已可点、分组却还没数到它,点选会误走「单块点击即发」。
  *
  * 本模块刻意轻量(不进 MarkdownImpl 懒加载 chunk 也无妨):Message.tsx 每条
  * assistant 消息包一个 Provider(store 挂 useRef,随消息实例存活),RichBlocks 的
@@ -20,6 +24,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { useChatInteraction } from "./tool/context";
+import { Button } from "./ui";
 
 export interface OptionsGroupEntry {
   key: string;
@@ -37,6 +42,18 @@ interface Snapshot {
   answered: number;
   /** 本条消息是否仍在流式生成。live 期间禁止隐式发送,页脚必须出现。 */
   live: boolean;
+  /**
+   * 本组是否处于「聚合作答」模式(点选只记录,由页脚显式发送):≥2 块、流式期、
+   * 或**已有未发送的点选**。最后一条是为了流式期点选后流式结束(单块)不把页脚收掉
+   * 让点选凭空消失 —— 用户在 live 期被禁止隐式发送,结束后仍应能显式发出。
+   * OptionsBlock 与 Footer 都读这一个字段,避免两边各算一遍口径漂移。
+   */
+  grouped: boolean;
+}
+
+/** 与 Snapshot.grouped 同一口径的纯函数,便于单测与调用方推导。 */
+export function isOptionsGrouped(count: number, live: boolean, answered: number): boolean {
+  return count >= 2 || live || answered >= 1;
 }
 
 export interface OptionsGroupStore {
@@ -54,16 +71,25 @@ export function createOptionsGroupStore(initialLive = false): OptionsGroupStore 
   let order = 0;
   let sent = false;
   let live = initialLive;
-  let snapshot: Snapshot = { entries: [], sent: false, count: 0, answered: 0, live: initialLive };
+  let snapshot: Snapshot = {
+    entries: [],
+    sent: false,
+    count: 0,
+    answered: 0,
+    live: initialLive,
+    grouped: isOptionsGrouped(0, initialLive, 0),
+  };
   const listeners = new Set<() => void>();
   const emit = () => {
     const list = [...entries.values()].sort((a, b) => a.order - b.order);
+    const answered = list.filter((e) => e.labels.length > 0).length;
     snapshot = {
       entries: list,
       sent,
       count: list.length,
-      answered: list.filter((e) => e.labels.length > 0).length,
+      answered,
       live,
+      grouped: isOptionsGrouped(list.length, live, answered),
     };
     for (const cb of listeners) cb();
   };
@@ -149,31 +175,49 @@ export function OptionsGroupFooter() {
     return `我的选择:\n${lines.join("\n")}`;
   }, [snap]);
   // 没有已解析的 options 块时不渲染空页脚(避免思考过程出现「已作答 0/0」)。
-  // 流式期只要有 ≥1 块就必须出页脚(禁止点击即发);非流式只在 ≥2 块时出页脚。
-  const showFooter = !!snap && snap.count >= 1 && (snap.live || snap.count >= 2);
+  // 流式期只要有 ≥1 块就必须出页脚(禁止点击即发);非流式 ≥2 块出页脚;
+  // 单块流式结束后若还有未发送的点选,页脚留着让用户显式发出(见 Snapshot.grouped)。
+  const showFooter = !!snap && snap.count >= 1 && snap.grouped;
   if (!store || !snap || !showFooter || !sendUserText) return null;
-  if (snap.sent)
-    return <p className="mt-1.5 text-caption text-faint">已发送全部选择。</p>;
+  if (snap.sent) {
+    const missing = snap.count - snap.answered;
+    return (
+      <p className="mt-1.5 text-caption text-faint">
+        {missing > 0 ? `已发送全部选择（${missing} 题未答，已一并标注）。` : "已发送全部选择。"}
+      </p>
+    );
+  }
   const ready = snap.answered >= 1;
+  const unanswered = snap.count - snap.answered;
   // 生产里 busy===sending===live;流式期忽略 busy,否则长回合发不出选择。
   const blockedByBusy = !!busy && !snap.live;
+  const hint = !ready
+    ? "每题点选后一次性发送"
+    : blockedByBusy
+      ? "等待当前回合结束后可发送"
+      : unanswered > 0
+        ? `未答的 ${unanswered} 题会标为「未答」一并发出`
+        : null;
   return (
-    <div className="mt-2 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3.5 py-2.5">
-      <span className="text-meta text-muted">
+    <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 rounded-xl border border-border bg-surface px-3.5 py-2.5">
+      {/* 计数走 live region:读屏用户点选后能听到进度,而不是只看得见。 */}
+      <output aria-live="polite" className="min-w-0 text-meta text-muted">
         已作答 <span className="font-medium text-fg">{snap.answered}</span> / {snap.count} 题
-        {!ready ? <span className="text-faint"> —— 每题点选后一次性发送</span> : null}
-      </span>
-      <button
+        {hint ? <span className="text-faint"> —— {hint}</span> : null}
+      </output>
+      <Button
         type="button"
+        variant="accent"
+        size="sm"
         disabled={!ready || blockedByBusy}
+        title={blockedByBusy ? "等待当前回合结束后可发送" : undefined}
         onClick={() => {
           store.markSent();
           sendUserText(text);
         }}
-        className="rounded-lg bg-accent px-3.5 py-1.5 text-meta font-medium text-white transition-opacity disabled:opacity-40"
       >
         发送选择
-      </button>
+      </Button>
     </div>
   );
 }

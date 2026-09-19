@@ -77,11 +77,51 @@ const DYNAMIC_INTENT_RULES: ReadonlyArray<{ kind: string; re: RegExp }> = [
   { kind: 'direct_status', re: /(?:healthz|systemd|release|runtime|线上|现网|运行中)/i },
 ]
 
+const EFFICIENCY_GUARD_BLOCK_RE = /<oc-efficiency-guard>[\s\S]*?<\/oc-efficiency-guard>/g
+
+// Copied locally to avoid importing gateway/web-react (cycle risk).
+// Sources:
+//   packages/gateway/src/sessionManager.ts TRANSIENT_RETRY_INPUT
+//   packages/commercial/src/db/pgSessionsBackend.ts ~1824
+//   packages/web-react/src/lib/chat/pure.ts INTERRUPTED_CONTINUE_PROMPT
+// For the interrupted-continue prompt, only the stem through 「从断点继续。」 is
+// required; call sites may append variant boilerplate after that.
+export const RECOVERY_CONTINUATION_PREFIXES: readonly string[] = [
+  '上一条消息因上游瞬时错误中断，请继续完成该任务。',
+  '继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。',
+]
+
+// Official full recovery prompt (same sources as above). Matched first so the
+// known tail — which contains `release` / live-status wording — is not treated
+// as user text when no extra utterance is appended.
+const OFFICIAL_INTERRUPTED_CONTINUE_PROMPT =
+  '继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。这是一条断点续接指令，不是重放原始请求：不要重新执行已经完成的步骤，不要重复已经输出的内容。若中断前有外部写操作或部署操作，先查询其当前可观察状态（如 release 指针、进程、日志、健康检查或目标资源）并据此继续。只有在无法通过查询区分成功或失败、且重复执行可能造成不可逆后果时，才明确说明具体无法确认的操作和风险，并仅询问完成任务所必需的决定；不要泛泛要求用户再说“继续”。'
+
+function continuationPrefixesForMatch(): string[] {
+  return [OFFICIAL_INTERRUPTED_CONTINUE_PROMPT, ...RECOVERY_CONTINUATION_PREFIXES]
+    .filter((value, index, all) => all.indexOf(value) === index)
+    .sort((a, b) => b.length - a.length)
+}
+
+export function stripSystemInjectedPrefix(text: string): string {
+  let remaining = text.replace(EFFICIENCY_GUARD_BLOCK_RE, '').trim()
+  for (const prefix of continuationPrefixesForMatch()) {
+    if (remaining === prefix) return ''
+    if (remaining.startsWith(prefix)) {
+      remaining = remaining.slice(prefix.length).trim()
+      break
+    }
+  }
+  return remaining
+}
+
 let privacyKeyValue: string | null = null
 let privacyKeyLoading: Promise<string> | null = null
 
 export function classifyCurrentFactIntent(text: string): { current: boolean; kind: string | null } {
-  const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').slice(0, 8_000)
+  const remaining = stripSystemInjectedPrefix(text)
+  if (!remaining) return { current: false, kind: null }
+  const normalized = remaining.normalize('NFKC').replace(/\s+/g, ' ').slice(0, 8_000)
   for (const rule of DYNAMIC_INTENT_RULES) {
     if (rule.re.test(normalized)) return { current: true, kind: rule.kind }
   }

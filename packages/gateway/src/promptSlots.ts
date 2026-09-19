@@ -51,6 +51,9 @@ import {
   listPinnedProjectAssetsForSession,
   type ProjectAsset,
   stripProjectAssetControlChars,
+  assertIdentityCompatExecution,
+  type IdentityCompatAssets,
+  type SkillStoreCompatOptions,
 } from '@openclaude/storage'
 import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
@@ -120,6 +123,15 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 - Codex: 调用原生 \`request_user_input\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
 - Cursor: 优先调用 MCP \`present_options\`(一次一题,一条回复最多 4 次;工具立刻返回,卡面由适配器注入)。工具列表没有它时,才在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
+
+## 需要用户决策时
+
+提问要让用户不看代码、不翻上下文也能拍板,所有引擎、所有提问通道(原生 Ask 工具 / options 卡 / 纯文字编号)都适用:
+- **说人话**:先用一两句讲清「现在卡在哪、为什么需要你选」;不堆 SHA、文件路径、内部术语,必须用时顺带一句白话解释。
+- **讲影响**:每个选项都写明选了会怎样——改哪些东西、影响到谁、可逆还是不可逆、大致耗时或成本。
+- **给推荐**:能判断就把推荐项放第一位并标「(推荐)」,附一句理由;确实拿不准就说明缺哪条信息,不要把问题原样甩回去。
+- 只问真正需要用户拍板的事;可逆、低风险的琐碎选择自己定,在回复里说明即可。
+- 任务单要人批准(backlog)或验收(waiting_human)时,调用 MCP \`present_task_approval\`(id 用面板返回的 identifier)。工具立刻返回并在对话里贴审批卡;用户点「通过/批准」或「打回」会以用户本人身份改单据。不要让用户去打开任务面板,不要用选择题卡或 \`task_approve\` 代替人确认过站。调用后立刻结束本回合。子 agent 环境会 skipped。一条回复最多 4 张。\`done\` 永远不属于 AI。
 
 ## 子 Agent 与并行处理
 
@@ -280,6 +292,17 @@ export interface PromptSlotContext {
    * false = 整段不注入。
    */
   delegateModelCatalog?: DelegateModelSectionInput | null | false
+  /**
+   * A4 identity-compat assets: the master-resolver-validated profile resolved
+   * into local assets by resolveIdentityCompatAssets() at a safe boundary.
+   * Presence switches THIS context's SOUL assembly and skill store to the
+   * registered compat projection (persona decided by the profile, not by
+   * requestedId; private skill assets from the registered legacy namespace).
+   * Absent = pre-A4 behavior, byte-for-byte — normal and hermetic default
+   * paths are unchanged. Structural conflicts throw (fail-closed), they are
+   * never silently downgraded to a single-source persona.
+   */
+  identityCompat?: IdentityCompatAssets
 }
 
 export interface PromptSlot {
@@ -301,12 +324,14 @@ export const PLATFORM_MCP_TOOL_NAMES = [
   'delegate_task',
   'delegate_tasks',
   'request_review',
+  'consult_advisor',
   'task_create',
   'task_update',
   'task_comment',
   'task_list',
   'task_get',
   'task_approve',
+  'present_task_approval',
 ] as const
 
 function hasMcpTool(ctx: Pick<PromptSlotContext, 'availableMcpTools'>, name: string): boolean {
@@ -365,14 +390,26 @@ function extractUserAlwaysBlock(text: string): string | null {
   return body.trim() || null
 }
 
-function buildPromptSkillStore(agentId: string, projectId?: string | null): SkillStore {
-  if (projectId) return buildRunSkillStore({ agentId, projectId })
-  return buildAgentSkillStore(agentId)
+function buildPromptSkillStore(
+  agentId: string,
+  projectId?: string | null,
+  compat?: SkillStoreCompatOptions,
+): SkillStore {
+  if (projectId) return buildRunSkillStore({ agentId, projectId, compat })
+  return buildAgentSkillStore(agentId, compat)
 }
 
 // ── Individual slot builders ──
 
 export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
+  // A4 identity-compat: the profile (not requestedId) decides the persona. Both
+  // request entries share the same resolved assets → identical SOUL bytes; an
+  // unregistered SOUL.md can never preempt (resolver + fresh buildSoul reject),
+  // and wiring mistakes (agentId ≠ canonical) throw instead of overlaying.
+  if (ctx.identityCompat) {
+    assertIdentityCompatExecution(ctx.identityCompat, ctx.agentId)
+    return { name: 'SOUL', content: ctx.identityCompat.buildSoul().content }
+  }
   // Try SOUL.md first, then CLAUDE.md
   const soulPath = paths.agentDir(ctx.agentId) ? `${paths.agentDir(ctx.agentId)}/SOUL.md` : null
   let raw = ''
@@ -722,12 +759,19 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   if (ctx.provider === 'cursor') {
     return { name: 'SKILLS', content: CURSOR_SKILLS_COMPACT }
   }
+  // A4 identity-compat: explicit opt-in only — the store keeps canonical as the
+  // authorization identity and reads/writes private skills from the registered
+  // legacy namespace. Structural conflicts throw (fail-closed).
+  const compat: SkillStoreCompatOptions | undefined = ctx.identityCompat
+    ? { profile: ctx.identityCompat.profile }
+    : undefined
   const frozenSkills = ctx.frozenProjectContext?.skills
   const skillStore = frozenSkills
-    ? buildAgentSkillStore(ctx.agentId)
+    ? buildAgentSkillStore(ctx.agentId, compat)
     : buildPromptSkillStore(
         ctx.agentId,
         ctx.projectId ?? ctx.projectContext?.boardProjectId,
+        compat,
       )
   let skillList = await skillStore.list()
   if (frozenSkills) {

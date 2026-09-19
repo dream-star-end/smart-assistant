@@ -218,6 +218,30 @@ export const MAIN_AGENT: Agent = {
 
 export const DEFAULT_AGENT = MAIN_AGENT
 
+/** 平台预设助手欢迎页起步语。id 与 seedPlatformAgents slug 对齐；未知 id 不编造。 */
+export const PRESET_STARTERS: Record<string, string[]> = {
+  'coding-assistant': [
+    '帮我读懂这个仓库的结构，并指出我该从哪改',
+    '这段报错怎么复现、根因是什么',
+    '给这个函数补一组有意义的测试',
+  ],
+  'office-assistant': [
+    '把下面的周报要点整理成一份可下载的周报',
+    '根据这段会议记录写纪要和待办',
+    '帮我做一份 10 页的汇报 PPT 大纲',
+  ],
+  'research-assistant': [
+    '帮我检索这个题目的近期文献并列出可溯源综述提纲',
+    '把这篇论文的方法、结论和局限拆清楚',
+    '帮我把研究问题拆成可验证的假设',
+  ],
+  'general-assistant': [
+    '帮我把这件事拆成可执行的步骤',
+    '用一句话说明你现在能帮我做什么',
+    '把下面材料整理成要点，并标出待明确的信息',
+  ],
+}
+
 export function agentById(_id?: string): Agent {
   // The picker is data-driven (/api/marketplace/my-agents); this legacy fallback
   // never resolves the Landing-only AGENTS list, so the old hardcoded agents can't
@@ -247,6 +271,7 @@ export function agentFromApiRow(row: {
     preset: row.preset,
     ready: row.capabilityReadiness?.ready ?? true,
     needsAuthorization: row.capabilityReadiness?.needsAuthorization ?? [],
+    starters: PRESET_STARTERS[row.id],
   }
 }
 

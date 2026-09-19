@@ -8,7 +8,10 @@ import {
   parsePanelParam,
   parseTutorialCase,
   parseTutorialCommunity,
+  parseTutorialStep,
+  parseTutorialTab,
   parseTutorialTopic,
+  parseTutorialWork,
   preferredBoardView,
   tutorialHref,
   withBoardParams,
@@ -115,6 +118,89 @@ describe('教程 URL 深链', () => {
     expect(closed.has('panel')).toBe(false)
     expect(closed.has('community')).toBe(false)
     expect(closed.get('campaign')).toBe('summer')
+  })
+
+  it('tab= 只认 start / cases 且只在 help 下生效；案例展厅是默认态不写参数（TU-17）', () => {
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=start'))).toBe('start')
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=cases'))).toBe('cases')
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=showcase'))).toBeNull()
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=nope'))).toBeNull()
+    expect(parseTutorialTab(new URLSearchParams('panel=settings&tab=start'))).toBeNull()
+    // 有 topic / case / community / work 时页签由它们决定，tab 无效。
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=start&topic=chat-basics'))).toBeNull()
+    expect(parseTutorialTab(new URLSearchParams('panel=help&tab=start&work=planet'))).toBeNull()
+
+    const start = withPanelParams(new URLSearchParams('campaign=summer'), 'help', null, null, null, {
+      tab: 'start',
+    })
+    expect(start.get('tab')).toBe('start')
+    expect(start.get('campaign')).toBe('summer')
+    const showcase = withPanelParams(start, 'help', null, null, null, { tab: null })
+    expect(showcase.has('tab')).toBe(false)
+    // 进入某篇功能教程：tab 让位给 topic。
+    const topic = withPanelParams(start, 'help', PRODUCT_CAPABILITIES.github.id, null, null, { tab: 'start' })
+    expect(topic.get('topic')).toBe('github-repository')
+    expect(topic.has('tab')).toBe(false)
+    // 离开 help 全清。
+    expect(withPanelParams(start, 'settings').has('tab')).toBe(false)
+  })
+
+  it('work= 只认精选作品 id，优先于 tab、让位给 topic / case / community（TU-17 / TU-02）', () => {
+    expect(parseTutorialWork(new URLSearchParams('panel=help&work=planet'))).toBe('planet')
+    expect(parseTutorialWork(new URLSearchParams('panel=help&work=gravity'))).toBe('gravity')
+    expect(parseTutorialWork(new URLSearchParams('panel=help&work=moon'))).toBeNull()
+    expect(parseTutorialWork(new URLSearchParams('panel=help&work=planet&case=research-bike-demand'))).toBeNull()
+    expect(parseTutorialWork(new URLSearchParams('panel=market&work=planet'))).toBeNull()
+
+    const work = withPanelParams(new URLSearchParams('campaign=summer'), 'help', null, null, null, {
+      tab: 'cases',
+      work: 'planet',
+    })
+    expect(work.get('work')).toBe('planet')
+    expect(work.has('tab')).toBe(false)
+    const backToGallery = withPanelParams(work, 'help', null, null, null, { work: null })
+    expect(backToGallery.has('work')).toBe(false)
+    const caseLink = withPanelParams(work, 'help', null, 'coding-swe-bench-fix', null, { work: 'planet' })
+    expect(caseLink.get('case')).toBe('coding-swe-bench-fix')
+    expect(caseLink.has('work')).toBe(false)
+    expect(tutorialHref({ pathname: '/', search: '', hash: '' }, null, null, null, { work: 'gravity' })).toBe(
+      '/?panel=help&work=gravity',
+    )
+  })
+
+  it('step= 只跟着 topic 走：正整数进 URL，越界 / 非数字 / 无 topic 一律忽略（TU-17）', () => {
+    expect(parseTutorialStep(new URLSearchParams('panel=help&topic=chat-basics&step=3'))).toBe(3)
+    expect(parseTutorialStep(new URLSearchParams('panel=help&topic=chat-basics&step=0'))).toBeNull()
+    expect(parseTutorialStep(new URLSearchParams('panel=help&topic=chat-basics&step=abc'))).toBeNull()
+    expect(parseTutorialStep(new URLSearchParams('panel=help&topic=chat-basics&step=100'))).toBeNull()
+    expect(parseTutorialStep(new URLSearchParams('panel=help&step=3'))).toBeNull()
+    expect(parseTutorialStep(new URLSearchParams('panel=help&case=research-bike-demand&step=3'))).toBeNull()
+
+    const link = tutorialHref(
+      { pathname: '/s/keep', search: '?campaign=summer', hash: '' },
+      PRODUCT_CAPABILITIES.chatBasics.id,
+      null,
+      null,
+      { step: 3 },
+    )
+    expect(link).toBe('/s/keep?campaign=summer&panel=help&topic=chat-basics&step=3')
+    // 换到案例 / 关闭 help 时 step 跟着 topic 一起清掉；非法 step 不写。
+    const sp = new URLSearchParams(link.slice(link.indexOf('?')))
+    expect(withPanelParams(sp, 'help', null, 'coding-swe-bench-fix').has('step')).toBe(false)
+    expect(withPanelParams(sp, null).has('step')).toBe(false)
+    expect(
+      withPanelParams(sp, 'help', PRODUCT_CAPABILITIES.chatBasics.id, null, null, { step: 0 }).has('step'),
+    ).toBe(false)
+  })
+
+  it('教程 tab= 与任务面板 ?view= 互不干扰：board 的清理只动自己的键（TU-17 命名取舍）', () => {
+    const both = withBoardParams(
+      new URLSearchParams('panel=help&tab=start&view=list'),
+      null,
+    )
+    expect(both.get('tab')).toBe('start')
+    expect(both.has('view')).toBe(false)
+    expect(parseBoardView(new URLSearchParams('panel=help&tab=start'), 'board')).toBe('board')
   })
 })
 

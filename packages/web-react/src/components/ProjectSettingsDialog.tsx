@@ -1,10 +1,15 @@
 import { useEffect, useId, useRef, useState, type ReactElement } from "react";
 import { apiErrorMessage } from "../lib/api";
-import { taskboardApi, type Project as BoardProject } from "../lib/taskboard";
+import { PROJECT_COLORS } from "../lib/projectColors";
+import { isVersionConflict, taskboardApi, type Project as BoardProject } from "../lib/taskboard";
 import type { AuthSession, ChatProject, Session } from "../lib/types";
 import { cn } from "../lib/utils";
 import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
-import { Alert, Button, Field, Input, Modal, Tabs, Textarea } from "./ui";
+import { Alert, Button, Field, Input, Modal, Select, Tabs, Textarea, useConfirm } from "./ui";
+
+// 色板定义已下沉到 lib/projectColors(侧栏首屏同步渲染要用,不能反向把本对话框拖进入口闭包);
+// 此处 re-export 供既有引用(测试等)继续使用。
+export { PROJECT_COLORS } from "../lib/projectColors";
 
 const NAME_MAX = 60;
 const INSTRUCTIONS_MAX = 4000;
@@ -15,18 +20,6 @@ const SETTINGS_TABS = [
 ] as const;
 
 type DialogTab = (typeof SETTINGS_TABS)[number]["value"];
-
-/** 项目色板：key 写入 ChatProject.color，dotClass 用设计 token 背景色。 */
-export const PROJECT_COLORS: { key: string; label: string; dotClass: string }[] = [
-  { key: "accent", label: "靛紫", dotClass: "bg-accent" },
-  { key: "info", label: "蓝", dotClass: "bg-info" },
-  { key: "success", label: "绿", dotClass: "bg-success" },
-  { key: "warning", label: "琥珀", dotClass: "bg-warning" },
-  { key: "danger", label: "红", dotClass: "bg-danger" },
-  { key: "accent-strong", label: "深紫", dotClass: "bg-accent-strong" },
-  { key: "primary", label: "墨", dotClass: "bg-primary" },
-  { key: "muted", label: "灰", dotClass: "bg-muted" },
-];
 
 export function ProjectSettingsDialog(props: {
   open: boolean;
@@ -66,34 +59,81 @@ export function ProjectSettingsDialog(props: {
   const [instructions, setInstructions] = useState("");
   const [boardProjectId, setBoardProjectId] = useState<string>("");
   const [boardProjects, setBoardProjects] = useState<BoardProject[]>([]);
+  const [boardListErr, setBoardListErr] = useState<string | null>(null);
   const [contextVersion, setContextVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  /**
+   * 看板项目自带的指令与文本域里用户已写的内容不同：不再直接覆盖（PS-01 数据丢失），
+   * 先挂起等用户选「覆盖 / 保留」。null = 无待决。
+   */
+  const [pendingBoardInstructions, setPendingBoardInstructions] = useState<string | null>(null);
+  /** 本次打开期间用户是否手动改过看板绑定：首次打开（项目已绑看板）沿用看板指令回填的旧行为。 */
+  const boardTouchedRef = useRef(false);
+  /** 文本域当前值的镜像：异步回调里读快照，不把 instructions 放进拉取 effect 的依赖。 */
+  const instructionsRef = useRef(instructions);
+  instructionsRef.current = instructions;
+  /**
+   * 脏检查基线（PS-03）：打开时取自 project；首次打开自动回填看板指令时同步更新，
+   * 这样「什么都没改」的用户关闭时不会被误拦。
+   */
+  const baselineRef = useRef({ name: "", color: null as string | null, instructions: "", boardProjectId: "" });
+  const [confirmDiscard, confirmDiscardEl] = useConfirm();
 
   useEffect(() => {
     if (!open) return;
     setTab(assetsOnly ? "assets" : "settings");
     setError("");
     setSaving(false);
+    setPendingBoardInstructions(null);
+    boardTouchedRef.current = false;
     if (project) {
       setName(project.name);
       setColor(project.color ?? null);
       setInstructions(project.instructions ?? "");
       setBoardProjectId(project.boardProjectId ?? "");
       setContextVersion(null);
+      baselineRef.current = {
+        name: project.name,
+        color: project.color ?? null,
+        instructions: project.instructions ?? "",
+        boardProjectId: project.boardProjectId ?? "",
+      };
     }
   }, [open, project, assetsOnly]);
+
+  const loadBoardList = () => {
+    if (!authSession) return;
+    setBoardListErr(null);
+    return taskboardApi
+      .listProjects(authSession)
+      .then((items) => {
+        setBoardProjects(items);
+        setBoardListErr(null);
+      })
+      .catch((e) => {
+        setBoardProjects([]);
+        setBoardListErr(apiErrorMessage(e, "看板列表加载失败"));
+      });
+  };
 
   useEffect(() => {
     if (!open || assetsOnly || !authSession) return;
     let cancelled = false;
+    setBoardListErr(null);
     void taskboardApi
       .listProjects(authSession)
       .then((items) => {
-        if (!cancelled) setBoardProjects(items);
+        if (!cancelled) {
+          setBoardProjects(items);
+          setBoardListErr(null);
+        }
       })
-      .catch(() => {
-        if (!cancelled) setBoardProjects([]);
+      .catch((e) => {
+        if (!cancelled) {
+          setBoardProjects([]);
+          setBoardListErr(apiErrorMessage(e, "看板列表加载失败"));
+        }
       });
     return () => {
       cancelled = true;
@@ -101,6 +141,7 @@ export function ProjectSettingsDialog(props: {
   }, [open, assetsOnly, authSession]);
 
   useEffect(() => {
+    setPendingBoardInstructions(null);
     if (!open || assetsOnly || !authSession || !boardProjectId.trim()) return;
     let cancelled = false;
     void taskboardApi
@@ -108,8 +149,24 @@ export function ProjectSettingsDialog(props: {
       .then((ctx) => {
         if (cancelled) return;
         setContextVersion(typeof ctx.version === "number" ? ctx.version : 0);
-        if (typeof ctx.instructions === "string") setInstructions(ctx.instructions);
-        else if (ctx.instructions === null) setInstructions("");
+        const incoming =
+          typeof ctx.instructions === "string"
+            ? ctx.instructions
+            : ctx.instructions === null
+              ? ""
+              : undefined;
+        if (incoming === undefined) return;
+        // 首次打开（项目已绑看板）：看板指令是权威，直接回填（旧行为）。
+        // 用户在本次打开中手动切换看板：文本域为空或内容一致时直接回填；
+        // 已有不同内容则挂起，交给用户决定覆盖还是保留（PS-01）。
+        const cur = instructionsRef.current;
+        if (!boardTouchedRef.current || cur.trim() === "" || cur === incoming) {
+          setInstructions(incoming);
+          // 程序回填不算用户改动：把基线一起挪过去，关闭时不误报「有未保存修改」（PS-03）。
+          if (!boardTouchedRef.current) baselineRef.current.instructions = incoming;
+        } else {
+          setPendingBoardInstructions(incoming);
+        }
       })
       .catch(() => {
         if (!cancelled) setContextVersion(0);
@@ -127,9 +184,34 @@ export function ProjectSettingsDialog(props: {
   const instructionsOver = instructions.length > INSTRUCTIONS_MAX;
   const canSave = !nameInvalid && !instructionsOver && !saving;
   const showSettings = !assetsOnly && activeTab === "settings";
+  const base = baselineRef.current;
+  const dirty =
+    !assetsOnly &&
+    (name !== base.name ||
+      color !== base.color ||
+      instructions !== base.instructions ||
+      boardProjectId !== base.boardProjectId);
+
+  /** 关闭（Esc / 遮罩 / 取消）此前没有脏检查，编辑中的名称 / 指令误触即丢（PS-03）。 */
+  const requestClose = () => {
+    if (saving) return;
+    if (!dirty) {
+      onClose();
+      return;
+    }
+    void confirmDiscard({
+      title: "放弃未保存的修改？",
+      body: "名称、颜色、指令或看板绑定有改动尚未保存，关闭后这些改动会丢失。",
+      confirmText: "放弃修改",
+      cancelText: "继续编辑",
+      danger: true,
+    }).then((ok) => {
+      if (ok === true) onClose();
+    });
+  };
 
   const handleOpenChange = (next: boolean) => {
-    if (!next && !saving) onClose();
+    if (!next) requestClose();
   };
 
   const handleSave = async () => {
@@ -159,7 +241,13 @@ export function ProjectSettingsDialog(props: {
       }
       onClose();
     } catch (e) {
-      setError(apiErrorMessage(e, "保存项目设置失败"));
+      // 看板指令 expectedVersion 冲突（他处刚改过）与普通失败此前同报一句话（PS-07）：
+      // 冲突要告诉用户「重新打开再保存」，否则只会反复撞同一个版本号。
+      setError(
+        isVersionConflict(e)
+          ? "看板项目的指令刚被他处修改，请关闭后重新打开本对话框再保存。"
+          : apiErrorMessage(e, "保存项目设置失败"),
+      );
       setSaving(false);
     }
   };
@@ -198,7 +286,7 @@ export function ProjectSettingsDialog(props: {
       footer={
         showSettings ? (
           <>
-            <Button variant="secondary" onClick={onClose} disabled={saving}>
+            <Button variant="secondary" onClick={requestClose} disabled={saving}>
               取消
             </Button>
             <Button variant="primary" onClick={() => void handleSave()} disabled={!canSave} loading={saving}>
@@ -229,19 +317,22 @@ export function ProjectSettingsDialog(props: {
           </Field>
 
           <Field label="颜色" hint="可选。无颜色时侧栏只显示名称。">
+            {/* 色块桌面 32px；触屏升到 44px 触控靶（PS-04）。 */}
             <div role="radiogroup" aria-label="项目颜色" className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 role="radio"
                 aria-checked={color === null}
                 aria-label="无颜色"
+                title="无颜色"
                 onClick={() => setColor(null)}
                 className={cn(
-                  "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
+                  "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
                   color === null ? "border-accent ring-2 ring-ring" : "border-border-control hover:border-border-strong",
                 )}
               >
-                <span className="size-4 rounded-full border border-dashed border-border-strong bg-surface" />
+                {/* 虚线圈用 muted 描边：深色下 border-strong 几乎不可见（PS-05）。 */}
+                <span className="size-4 rounded-full border border-dashed border-muted bg-surface" />
               </button>
               {PROJECT_COLORS.map((c) => (
                 <button
@@ -253,7 +344,7 @@ export function ProjectSettingsDialog(props: {
                   title={c.label}
                   onClick={() => setColor(c.key)}
                   className={cn(
-                    "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
+                    "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11",
                     color === c.key ? "border-accent ring-2 ring-ring" : "border-transparent hover:border-border-strong",
                   )}
                 >
@@ -267,23 +358,53 @@ export function ProjectSettingsDialog(props: {
             label="绑定任务面板项目"
             hint="绑定后，聊天与看板 stage 共用项目指令、资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；仓库 clone 就绪时会话会切到仓库快照（允许覆盖）。"
           >
-            <select
-              className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm"
+            {boardListErr ? (
+              <Alert
+                tone="danger"
+                density="compact"
+                className="mb-2"
+                action={
+                  <Button size="sm" variant="secondary" onClick={() => void loadBoardList()}>
+                    重试
+                  </Button>
+                }
+              >
+                看板列表加载失败
+              </Alert>
+            ) : null}
+            {/* 与设计系统其它下拉同构（ui/Select），不再手写裸 <select> 类名（PS-02）。 */}
+            <Select
+              inputSize="sm"
               value={boardProjectId}
-              onChange={(e) => setBoardProjectId(e.target.value)}
+              onValueChange={(v) => {
+                boardTouchedRef.current = true;
+                setBoardProjectId(v);
+              }}
+              options={[
+                { value: "", label: "不绑定" },
+                ...boardProjects.map((p) => ({ value: p.id, label: `${p.key} · ${p.name}` })),
+              ]}
               aria-label="绑定任务面板项目"
-            >
-              <option value="">不绑定</option>
-              {boardProjects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.key} · {p.name}
-                </option>
-              ))}
-            </select>
+              disabled={!!boardListErr}
+            />
           </Field>
 
           <Field
-            label="自定义指令"
+            label={
+              // 字数计数并入标签行：原来落在文本域下方，默认高度下被 footer 遮住要滚动才见（PS-06）。
+              <span className="flex items-center justify-between gap-2">
+                <span>自定义指令</span>
+                <span
+                  aria-live="polite"
+                  className={cn(
+                    "text-caption font-normal tabular-nums",
+                    instructionsOver ? "text-danger" : "text-faint",
+                  )}
+                >
+                  {instructions.length} / {INSTRUCTIONS_MAX}
+                </span>
+              </span>
+            }
             hint="写入后，该项目下新建与已有会话都会带上这段偏好；平台安全与产品规则始终优先。"
             error={instructionsOver ? `最多 ${INSTRUCTIONS_MAX} 字` : undefined}
           >
@@ -294,14 +415,32 @@ export function ProjectSettingsDialog(props: {
               aria-label="自定义指令"
             />
           </Field>
-          <p
-            className={cn(
-              "text-caption tabular-nums",
-              instructionsOver ? "text-danger" : "text-faint",
-            )}
-          >
-            {instructions.length} / {INSTRUCTIONS_MAX}
-          </p>
+          {pendingBoardInstructions !== null ? (
+            <Alert
+              tone="warning"
+              density="compact"
+              aria-live="polite"
+              action={
+                <span className="flex items-center gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setInstructions(pendingBoardInstructions);
+                      setPendingBoardInstructions(null);
+                    }}
+                  >
+                    用看板指令覆盖
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setPendingBoardInstructions(null)}>
+                    保留当前内容
+                  </Button>
+                </span>
+              }
+            >
+              所选看板项目自带的指令与当前内容不同。保存时以文本域内容为准。
+            </Alert>
+          ) : null}
 
           {error ? (
             <Alert tone="danger" density="compact">
@@ -325,6 +464,8 @@ export function ProjectSettingsDialog(props: {
           登录后才能管理项目资产。
         </Alert>
       )}
+      {/* 放在分区条件之外：切到「资产」Tab 再按 Esc，脏检查确认框也得挂着（PS-03）。 */}
+      {confirmDiscardEl}
     </Modal>
   );
 }

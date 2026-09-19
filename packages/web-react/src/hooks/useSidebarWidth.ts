@@ -1,9 +1,19 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 export const SIDEBAR_WIDTH_DEFAULT = 268;
 export const SIDEBAR_WIDTH_MIN = 220;
 export const SIDEBAR_WIDTH_MAX = 460;
 export const SIDEBAR_WIDTH_STORAGE_KEY = "oc_v5_sidebar_width";
+/** 键盘调宽步长（← / →）；按住 Shift 走大步。 */
+export const SIDEBAR_WIDTH_KEY_STEP = 16;
+export const SIDEBAR_WIDTH_KEY_STEP_LARGE = 64;
 
 const PERSIST_THROTTLE_MS = 80;
 
@@ -31,13 +41,15 @@ function writeStoredWidth(width: number): void {
 }
 
 /**
- * 侧栏宽度：Pointer Events 拖拽 + localStorage 持久化。
+ * 侧栏宽度：Pointer Events 拖拽 + 键盘（← → 步进，Home/End 最小/最大，Shift 大步）+ localStorage 持久化。
  * 窄屏是否采用返回值由调用方决定。
  */
 export function useSidebarWidth(): {
   width: number;
   resizing: boolean;
   onResizeStart: (e: ReactPointerEvent) => void;
+  /** 把手的键盘处理（S-05：separator 模式要求键盘可调）。 */
+  onResizeKeyDown: (e: ReactKeyboardEvent) => void;
 } {
   const [width, setWidth] = useState(readStoredWidth);
   const [resizing, setResizing] = useState(false);
@@ -178,6 +190,30 @@ export function useSidebarWidth(): {
     document.addEventListener("pointercancel", cancel);
   }, []);
 
+  const onResizeKeyDown = useCallback((e: ReactKeyboardEvent) => {
+    const step = e.shiftKey ? SIDEBAR_WIDTH_KEY_STEP_LARGE : SIDEBAR_WIDTH_KEY_STEP;
+    let next: number;
+    switch (e.key) {
+      case "ArrowLeft":
+        next = widthRef.current - step;
+        break;
+      case "ArrowRight":
+        next = widthRef.current + step;
+        break;
+      case "Home":
+        next = SIDEBAR_WIDTH_MIN;
+        break;
+      case "End":
+        next = SIDEBAR_WIDTH_MAX;
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    endDrag(false);
+    applyWidth(next, "flush");
+  }, []);
+
   useEffect(
     () => () => {
       endDrag(true);
@@ -185,5 +221,5 @@ export function useSidebarWidth(): {
     [],
   );
 
-  return { width, resizing, onResizeStart };
+  return { width, resizing, onResizeStart, onResizeKeyDown };
 }

@@ -225,3 +225,221 @@ describe('chatgpt proxy server', () => {
     entitled = true
   })
 })
+
+/**
+ * Upstream whose CONNECT handshake is held until the test releases it, so the
+ * proxy sits in the pending (reserved, pre-200) phase under test control.
+ * Tracks the real server-side sockets, not just proxy-internal counters.
+ */
+function startHoldingUpstream(): Promise<{
+  port: number
+  close(): void
+  heldCount(): number
+  liveCount(): number
+  waitForHeld(n: number, timeoutMs?: number): Promise<void>
+  rejectOldest(): void
+  acceptAll(): void
+}> {
+  const held: Socket[] = []
+  const live = new Set<Socket>()
+  interface HeldWaiter {
+    n: number
+    resolve: () => void
+    timer: ReturnType<typeof setTimeout>
+  }
+  const waiters: HeldWaiter[] = []
+  const poke = () => {
+    while (waiters.length > 0 && held.length >= waiters[0].n) {
+      const w = waiters.shift()
+      if (!w) break
+      clearTimeout(w.timer)
+      w.resolve()
+    }
+  }
+  const server = createNetServer((socket: Socket) => {
+    live.add(socket)
+    socket.on('close', () => live.delete(socket))
+    let buf = ''
+    const onData = (chunk: Buffer) => {
+      buf += chunk.toString('latin1')
+      const end = buf.indexOf('\r\n\r\n')
+      if (end === -1) return
+      socket.off('data', onData)
+      held.push(socket)
+      poke()
+    }
+    socket.on('data', onData)
+  })
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as { port: number }).port
+      resolve({
+        port,
+        close: () => server.close(),
+        heldCount: () => held.length,
+        liveCount: () => live.size,
+        waitForHeld(n: number, timeoutMs = 5_000): Promise<void> {
+          return new Promise((res, rej) => {
+            const w: HeldWaiter = {
+              n,
+              resolve: () => res(),
+              timer: setTimeout(() => {
+                const idx = waiters.indexOf(w)
+                if (idx >= 0) waiters.splice(idx, 1)
+                rej(new Error(`upstream held only ${held.length}/${n} CONNECTs`))
+              }, timeoutMs),
+            }
+            waiters.push(w)
+            poke()
+          })
+        },
+        rejectOldest(): void {
+          const s = held.shift()
+          if (!s) return
+          s.write('HTTP/1.1 502 Refused\r\nContent-Length: 0\r\n\r\n')
+          setTimeout(() => s.destroy(), 20)
+        },
+        acceptAll(): void {
+          for (const s of held.splice(0)) {
+            s.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+            // Active-tunnel sockets keep echoing; client-aborted ones will be
+            // destroyed by the proxy and disappear from `live` on their own.
+            s.on('data', (c: Buffer) => s.write(c.toString('utf8').toUpperCase()))
+          }
+        },
+      })
+    })
+  })
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms))
+}
+
+describe('chatgpt proxy cap reservation (pending + active)', () => {
+  let dir: string
+  let upstream: Awaited<ReturnType<typeof startHoldingUpstream>>
+  let proxy: ChatGptProxyServer
+  let port: number
+
+  before(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'oc-cgp-cap-'))
+    const { cert, key } = selfSignedCert(dir)
+    upstream = await startHoldingUpstream()
+    proxy = createChatGptProxyServer({
+      publicHost: 'proxy.example.test',
+      port: 0,
+      tlsCertPath: cert,
+      tlsKeyPath: key,
+      upstream: new URL(`http://127.0.0.1:${upstream.port}`),
+      verifyCredential: async (uid, secret) => secret === `secret-for-${uid}`,
+      resolveUserRole: async (uid) => (uid === 7 ? 'user' : null),
+      getEntitlement: async () => ({ assembled: true, allowlist: [7] }),
+      listenHost: '127.0.0.1',
+    })
+    port = (await proxy.listen()).port
+  })
+
+  after(async () => {
+    await proxy.close()
+    upstream.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('client close during pending keeps reservation; 65th 429; release frees; no double count', async () => {
+    const connectLine = `CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\nProxy-Authorization: ${basic('u7', 'secret-for-7')}\r\n\r\n`
+    // 64 concurrent CONNECTs, upstream handshakes all held pending.
+    const clients: TLSSocket[] = []
+    for (let i = 0; i < 64; i++) {
+      const socket = tlsConnect({ host: '127.0.0.1', port, rejectUnauthorized: false }, () => {
+        socket.write(connectLine)
+      })
+      clients.push(socket)
+    }
+    await upstream.waitForHeld(64)
+    assert.equal(proxy.activeTunnels(), 64)
+    assert.equal(upstream.liveCount(), 64)
+
+    // All clients go away while the upstreams are still pending: reservations
+    // must be held and the real upstream sockets must stay open (no early
+    // release that would let new CONNECTs pile the cap).
+    for (const c of clients) c.destroy()
+    await sleep(150)
+    assert.equal(proxy.activeTunnels(), 64)
+    assert.equal(upstream.liveCount(), 64)
+    assert.equal(upstream.heldCount(), 64)
+
+    // The 65th CONNECT for the same user is rejected while the 64 old
+    // upstreams have not reached a terminal state.
+    const r65 = await tlsRequest(port, connectLine)
+    assert.equal(r65.status, 429)
+    r65.socket.destroy()
+
+    // One upstream settles by refusing: its reservation is released exactly
+    // once, and a new CONNECT is admitted into the freed slot.
+    upstream.rejectOldest()
+    await sleep(100)
+    assert.equal(proxy.activeTunnels(), 63)
+    const r66 = tlsRequest(port, connectLine)
+    await upstream.waitForHeld(64)
+    assert.equal(proxy.activeTunnels(), 64)
+
+    // Settle everything: client-gone tunnels get their late success, which
+    // must destroy the actual upstream socket and never acknowledge/pipe.
+    upstream.acceptAll()
+    const ok66 = await r66
+    assert.equal(ok66.status, 200)
+    await sleep(200)
+    // Only r66 survives (single count — success did not double-reserve).
+    assert.equal(proxy.activeTunnels(), 1)
+    assert.equal(upstream.liveCount(), 1)
+
+    // Closing the active client still releases the active tunnel.
+    ok66.socket.destroy()
+    await sleep(100)
+    assert.equal(proxy.activeTunnels(), 0)
+    assert.equal(upstream.liveCount(), 0)
+  })
+
+  test('upstream failure during pending releases the reservation without 200', async () => {
+    const connectLine = `CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\nProxy-Authorization: ${basic('u7', 'secret-for-7')}\r\n\r\n`
+    // Upstream handshake failure tears the client connection down without any
+    // 200/pipe; detect closure plus whatever bytes made it out.
+    const closed = new Promise<number>((resolve) => {
+      const socket = tlsConnect({ host: '127.0.0.1', port, rejectUnauthorized: false }, () => {
+        socket.write(connectLine)
+      })
+      let buf = ''
+      socket.on('data', (c: Buffer) => {
+        buf += c.toString('latin1')
+      })
+      socket.once('close', () => resolve(Number(/^HTTP\/1\.1 (\d{3})/.exec(buf)?.[1] ?? 0)))
+    })
+    await upstream.waitForHeld(1)
+    assert.equal(proxy.activeTunnels(), 1)
+    upstream.rejectOldest()
+    const status = await closed
+    assert.equal(status, 0)
+    await sleep(100)
+    assert.equal(proxy.activeTunnels(), 0)
+    assert.equal(upstream.liveCount(), 0)
+  })
+
+  test('client close + 10s upstream timeout releases reservation and real socket', async () => {
+    const connectLine = `CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\nProxy-Authorization: ${basic('u7', 'secret-for-7')}\r\n\r\n`
+    const socket = tlsConnect({ host: '127.0.0.1', port, rejectUnauthorized: false }, () => {
+      socket.write(connectLine)
+    })
+    await upstream.waitForHeld(1)
+    assert.equal(proxy.activeTunnels(), 1)
+    assert.equal(upstream.liveCount(), 1)
+    socket.destroy()
+    await sleep(150)
+    // Reservation and the real upstream socket stay until the 10s bound.
+    assert.equal(proxy.activeTunnels(), 1)
+    assert.equal(upstream.liveCount(), 1)
+    await sleep(10_500)
+    assert.equal(proxy.activeTunnels(), 0)
+    assert.equal(upstream.liveCount(), 0)
+  })
+})

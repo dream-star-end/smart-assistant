@@ -96,6 +96,58 @@ describe('ImageResizeMode', () => {
     expect(value.clientJobId).toMatch(/^[0-9a-f]{32}$/)
   })
 
+  // ── 审计 M-01:就绪态不能被挂载 effect 覆写;缓存命中(挂载即 complete)也要显形。 ──
+  describe('主图就绪态(M-01)', () => {
+    test('load 前骨架占位 + 主图透明;load 后显形、骨架撤下', () => {
+      render(<ImageResizeMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
+      const img = screen.getByAltText('风景')
+      expect(img).toHaveClass('opacity-0')
+      expect(document.querySelector('.oc-img-skeleton')).toBeInTheDocument()
+      fireEvent.load(img)
+      expect(img).toHaveClass('opacity-100')
+      expect(img).not.toHaveClass('opacity-0')
+      expect(document.querySelector('.oc-img-skeleton')).not.toBeInTheDocument()
+    })
+
+    test('挂载时图片已 complete(data:/缓存命中)→ 不等 load 事件直接显形', () => {
+      // 浏览器同步命中缓存:<img> 挂上就 complete 且有自然尺寸,load 事件可能早于 React 绑定监听。
+      const complete = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'complete')
+      const naturalWidth = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'naturalWidth')
+      Object.defineProperty(HTMLImageElement.prototype, 'complete', { get: () => true, configurable: true })
+      Object.defineProperty(HTMLImageElement.prototype, 'naturalWidth', { get: () => 1200, configurable: true })
+      try {
+        render(<ImageResizeMode {...baseProps} src="data:image/png;base64,iVBORw0KGgo=" canSubmit onSubmit={vi.fn()} />)
+        expect(screen.getByAltText('风景')).toHaveClass('opacity-100')
+        expect(document.querySelector('.oc-img-skeleton')).not.toBeInTheDocument()
+      } finally {
+        if (complete) Object.defineProperty(HTMLImageElement.prototype, 'complete', complete)
+        if (naturalWidth) Object.defineProperty(HTMLImageElement.prototype, 'naturalWidth', naturalWidth)
+      }
+    })
+
+    test('就绪后任意重渲不回退(无 effect 复位)', () => {
+      const { rerender } = render(<ImageResizeMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
+      fireEvent.load(screen.getByAltText('风景'))
+      rerender(<ImageResizeMode {...baseProps} canSubmit={false} onSubmit={vi.fn()} />)
+      expect(screen.getByAltText('风景')).toHaveClass('opacity-100')
+    })
+
+    test('重试重签换 src → 回到占位,新图 load 后再显形', async () => {
+      const resolveSrc = vi.fn(async () => 'https://signed.test/y.png')
+      render(<ImageResizeMode {...baseProps} resolveSrc={resolveSrc} canSubmit onSubmit={vi.fn()} />)
+      fireEvent.error(screen.getByAltText('风景'))
+      fireEvent.click(screen.getByRole('button', { name: '重试' }))
+      const img = await waitFor(() => {
+        const el = screen.getByAltText('风景')
+        expect(el).toHaveAttribute('src', 'https://signed.test/y.png')
+        return el
+      })
+      expect(img).toHaveClass('opacity-0')
+      fireEvent.load(img)
+      expect(img).toHaveClass('opacity-100')
+    })
+  })
+
   test('渲染失败:图片 onError → 加载失败回退 + 重试', () => {
     render(<ImageResizeMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
     fireEvent.error(screen.getByAltText('风景'))

@@ -128,3 +128,37 @@ describe("agentModelAuthority — 阶段 B(flag=1:seed = 该容器 bundle rev �
     );
   });
 });
+
+
+describe("OCV5-179 selfhost seed single authority", () => {
+  test("trusted selfhost flavor defaults on; commercial/unscoped keep compatibility", async () => {
+    assert.equal(seedAuthorityByRevEnabled({}, "selfhost"), true);
+    assert.equal(seedAuthorityByRevEnabled({}, "commercial"), false);
+    assert.equal(seedAuthorityByRevEnabled({}), false);
+    assert.equal(seedAuthorityByRevEnabled({ OC_SEED_AUTHORITY_BY_REV: "0" }, "selfhost"), false);
+    assert.equal(seedAuthorityByRevEnabled({ OC_SEED_AUTHORITY_BY_REV: "1" }, "commercial"), true);
+    // The preceding assert prevents the old implementation from reaching a real DB.
+    await assert.rejects(loadAgentModelResolverForUser(3n, { env: {}, flavor: "selfhost" }),
+      (err: unknown) => err instanceof SeedDeclarationError && err.code === "SeedRevInvalid");
+  });
+
+  test("marketplace auto and seed main share the connection's revision, including refresh", () => {
+    const oldSeed = new Map([["main", { model: "glm-5.1", provider: "ark" }]]);
+    const newSeed = new Map([["main", { model: "deepseek-v4-pro", provider: "opencodego" }]]);
+    const old = buildAgentModelSnapshot([installed("auto-agent", "auto")], [], oldSeed);
+    const fresh = buildAgentModelSnapshot([installed("auto-agent", "auto")], [], newSeed);
+    const refreshedOld = buildAgentModelSnapshot([], [installed("auto-agent", "auto")], oldSeed);
+    assert.equal(old.get("auto-agent"), "glm-5.1");
+    assert.equal(fresh.get("auto-agent"), "deepseek-v4-pro");
+    assert.equal(refreshedOld.get("auto-agent"), "glm-5.1");
+  });
+
+  test("missing/empty/auto main in a declared revision never falls back to master constant", () => {
+    for (const seed of [new Map<string, SeedAgentExecution>(),
+      new Map([["main", { model: "", provider: "ark" }]]),
+      new Map([["main", { model: "auto", provider: "ark" }]])]) {
+      assert.throws(() => buildAgentModelSnapshot([installed("auto-agent", "auto")], [], seed),
+        (err: unknown) => err instanceof SeedDeclarationError && err.code === "SeedSchemaInvalid");
+    }
+  });
+});

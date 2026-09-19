@@ -12,8 +12,8 @@ import {
   cursorFamilySupportsFast,
   cursorModelById,
 } from '@openclaude/protocol'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Lock, Users } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import {
   availableCursorEfforts,
   contextFamilyHasLong,
@@ -30,6 +30,7 @@ import {
 } from '../lib/cursorModelPicker'
 import type { PreferenceEffort } from '../lib/modelPreferences'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
+import { readRecentModels, writeRecentModel } from '../lib/recentModels'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { cn } from '../lib/utils'
 import {
@@ -47,6 +48,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  Input,
   useConfirm,
 } from './ui'
 
@@ -79,9 +81,9 @@ function promoLabelOf(model: { promo_label?: unknown } | undefined): string | un
   return typeof value === 'string' && value.trim() ? value : undefined
 }
 
-function PromoBadge({ label }: { label?: string }) {
+function PromoBadge({ label, className }: { label?: string; className?: string }) {
   if (!label) return null
-  return <Badge tone="warning">{label}</Badge>
+  return <Badge tone="warning" className={className}>{label}</Badge>
 }
 
 export type LockedSelectInfo = {
@@ -106,6 +108,16 @@ function lockedPlainLabel(model: LockedPublicModel): string {
 export function teamEngineLabel(models: PublicModel[]): string {
   const m = models.find((x) => x.id === DEFAULT_CODEX_ENGINE_MODEL)
   return m ? modelLabel(m) : DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME
+}
+
+function rowSearchHaystack(row: ReturnType<typeof modelPickerRows>[number]): string {
+  if (row.kind === 'plain') return `${modelLabel(row.model)} ${row.model.id}`
+  if (row.kind === 'locked-plain') return `${lockedPlainLabel(row.model)} ${row.model.id}`
+  if (row.kind === 'cursor-family' || row.kind === 'context-family') {
+    const members = row.row.members.map((m) => `${modelLabel(m)} ${m.id}`).join(' ')
+    return `${row.row.label} ${members}`
+  }
+  return `${row.row.label} ${row.row.representative.id}`
 }
 
 function triggerLabel(
@@ -147,6 +159,8 @@ export function ModelSelector({
   onSelectEffort,
   contextTier,
   onSelectContextTier,
+  open,
+  onOpenChange,
 }: {
   models: PublicModel[]
   lockedModels?: LockedPublicModel[]
@@ -165,6 +179,8 @@ export function ModelSelector({
    */
   contextTier?: CursorContextTier | null
   onSelectContextTier?: (tier: CursorContextTier) => void
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorModelById(selectedId)
@@ -174,6 +190,21 @@ export function ModelSelector({
   const engineLabel = teamEngineLabel(models)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
+  // 思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道(C-07):
+  // trigger 在 sm+ 追加「· 高」「· Fast」。Cursor 家族读 canonical id 上的档位,其它模型读会话偏好。
+  const tierLabel = (() => {
+    if (teamEngineActive) return null
+    const parts: string[] = []
+    if (selectedCursor) {
+      const effort = EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label
+      if (effort) parts.push(effort)
+      if (selectedCursor.fast) parts.push('Fast')
+    } else if (effortSupported && effortSupported.length > 0 && effortActive) {
+      const effort = EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label
+      if (effort) parts.push(effort)
+    }
+    return parts.length > 0 ? parts.join(' · ') : null
+  })()
   const disabled = loading || (models.length === 0 && lockedModels.length === 0)
   const rows = modelPickerRows(models, lockedModels)
   const {
@@ -187,6 +218,59 @@ export function ModelSelector({
     if (selectedInCollapsed) setCollapsedOpen(true)
   }, [selectedInCollapsed])
   const showCollapsedGroup = collapsedRows.length > 0
+  const [query, setQuery] = useState('')
+  const queryNorm = query.trim().toLowerCase()
+  const searching = queryNorm.length > 0
+  const showSearch = models.length + lockedModels.length >= 8
+  // 菜单打开时焦点直接落进搜索框(C-29):此前落在首项,键盘用户要多按一次才能开始搜。
+  // Radix DropdownMenu.Content 不公开 onOpenAutoFocus,改为镜像 open 状态、在其挂载聚焦之后接管焦点。
+  const searchRef = useRef<HTMLInputElement>(null)
+  const [menuOpenMirror, setMenuOpenMirror] = useState(false)
+  const menuOpen = open ?? menuOpenMirror
+  useEffect(() => {
+    if (!menuOpen || !showSearch) return
+    const id = window.setTimeout(() => searchRef.current?.focus({ preventScroll: true }), 0)
+    return () => window.clearTimeout(id)
+  }, [menuOpen, showSearch])
+  const filteredRows = searching
+    ? rows.filter((row) => rowSearchHaystack(row).toLowerCase().includes(queryNorm))
+    : null
+  const listRows = searching ? (filteredRows ?? []) : visibleRows
+  const listCollapsed = searching ? [] : collapsedRows
+  const listShowCollapsed = searching ? false : showCollapsedGroup
+  const [, setRecentTick] = useState(0)
+  const recentRows = (() => {
+    if (searching) return [] as typeof rows
+    const seen = new Set<string>()
+    const out: typeof rows = []
+    for (const id of readRecentModels()) {
+      if (id === selectedId) continue
+      if (!models.some((m) => m.id === id)) continue
+      if (lockedModels.some((m) => m.id === id)) continue
+      const row = rows.find((item) => {
+        if (item.kind === 'plain') return item.model.id === id
+        if (item.kind === 'cursor-family' || item.kind === 'context-family') {
+          return item.row.members.some((m) => m.id === id)
+        }
+        return false
+      })
+      if (!row) continue
+      // 与当前选中同一家族的行不进「最近」(C-27):切过同家族不同档位后,主列表里那一行已带 ✓,
+      // 「最近」再出现一次同名同 ✓ 的行只会让人以为是两个模型。
+      if (row.kind === 'cursor-family' && selectedCursor && row.row.family === selectedCursor.family) continue
+      if (row.kind === 'context-family' && selectedContext && row.row.family === selectedContext.family) continue
+      const ident =
+        row.kind === 'plain'
+          ? `plain:${row.model.id}`
+          : row.kind === 'cursor-family' || row.kind === 'context-family'
+            ? `${row.kind}:${row.row.family}`
+            : `other:${id}`
+      if (seen.has(ident)) continue
+      seen.add(ident)
+      out.push(row)
+    }
+    return out
+  })()
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
@@ -222,13 +306,19 @@ export function ModelSelector({
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
 
+  const rememberAndSelect = (id: string) => {
+    writeRecentModel(id)
+    setRecentTick((n) => n + 1)
+    onSelect(id)
+  }
+
   const selectCursor = (
     family: CursorEngineFamilyId,
     members: PublicModel[],
     next?: { effort?: PlatformReasoningEffort | null; fast?: boolean },
   ) => {
     const id = resolveCursorPickerSelection(members, family, selectedId, next)
-    if (id) onSelect(id)
+    if (id) rememberAndSelect(id)
   }
 
   const selectContext = async (
@@ -247,20 +337,20 @@ export function ModelSelector({
       })
       if (!confirmed) return
     }
-    onSelect(id)
+    rememberAndSelect(id)
   }
 
-  const renderRow = (row: (typeof rows)[number]) => {
+  const renderRow = (row: (typeof rows)[number], keyPrefix = '') => {
     if (row.kind === 'plain') {
       const m = row.model
       const active = m.id === selectedId
       const degraded = isDegraded(m)
       return (
         <DropdownMenuItem
-          key={m.id}
+          key={`${keyPrefix}${m.id}`}
           data-model-id={m.id}
           disabled={degraded}
-          onSelect={degraded ? undefined : () => onSelect(m.id)}
+          onSelect={degraded ? undefined : () => rememberAndSelect(m.id)}
           className="justify-between"
         >
           <span className="truncate">{modelLabel(m)}</span>
@@ -289,7 +379,7 @@ export function ModelSelector({
       const degraded = row.row.members.every(isDegraded)
       return (
         <DropdownMenuItem
-          key={row.row.family}
+          key={`${keyPrefix}${row.row.family}`}
           data-model-id={representative}
           data-context-family={row.row.family}
           disabled={degraded}
@@ -324,7 +414,7 @@ export function ModelSelector({
       const labelText = lockedPlainLabel(locked)
       return (
         <DropdownMenuItem
-          key={`locked-${locked.id}`}
+          key={`${keyPrefix}locked-${locked.id}`}
           data-model-id={locked.id}
           data-locked="true"
           onSelect={() =>
@@ -335,11 +425,13 @@ export function ModelSelector({
               modelId: locked.id,
             })
           }
-          className="justify-between text-faint opacity-80"
+          // 锁定态靠锁图标 + 读屏文案表达,不再靠 faint+opacity 降色(a11y-B composer#2:浅色 3.34 / 深色 3.66)。
+          className="justify-between text-muted"
         >
           <span className="flex min-w-0 items-center gap-1.5">
             <Lock size={14} className="shrink-0" aria-hidden />
             <span className="truncate">{labelText}</span>
+            <span className="sr-only">（需升级解锁）</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={locked} />
@@ -351,7 +443,7 @@ export function ModelSelector({
     if (row.kind === 'locked-cursor-family') {
       return (
         <DropdownMenuItem
-          key={`locked-family-${row.row.family}`}
+          key={`${keyPrefix}locked-family-${row.row.family}`}
           data-model-id={row.row.representative.id}
           data-cursor-family={row.row.family}
           data-locked="true"
@@ -363,11 +455,12 @@ export function ModelSelector({
               modelId: row.row.representative.id,
             })
           }
-          className="justify-between text-faint opacity-80"
+          className="justify-between text-muted"
         >
           <span className="flex min-w-0 items-center gap-1.5">
             <Lock size={14} className="shrink-0" aria-hidden />
             <span className="truncate">{row.row.label}</span>
+            <span className="sr-only">（需升级解锁）</span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={row.row.representative} />
@@ -384,7 +477,7 @@ export function ModelSelector({
     const degraded = row.row.members.every(isDegraded)
     return (
       <DropdownMenuItem
-        key={row.row.family}
+        key={`${keyPrefix}${row.row.family}`}
         data-model-id={representative}
         data-cursor-family={row.row.family}
         disabled={degraded}
@@ -411,30 +504,76 @@ export function ModelSelector({
 
   return (
     <>
-      <DropdownMenu>
+      <DropdownMenu
+        open={open}
+        onOpenChange={(v) => {
+          onOpenChange?.(v)
+          setMenuOpenMirror(v)
+          if (!v) setQuery('')
+        }}
+      >
         <DropdownMenuTrigger asChild>
           <button
             type="button"
             data-product-feature={PRODUCT_CAPABILITIES.models.id}
             disabled={disabled}
             aria-label="选择对话模型"
+            // 当前模型被标降级时 trigger 自身要有标识(C-08),不能只在点开菜单后才看到。
+            title={
+              loading && selected
+                ? '正在切换模型，请稍候'
+                : selectedDegraded && !teamEngineActive
+                  ? '当前模型暂不可用，点击更换'
+                  : undefined
+            }
+            aria-busy={loading || undefined}
+            data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
             className={cn(
-              'flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
+              'flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
               'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
               'disabled:pointer-events-none disabled:opacity-50',
               teamEngineActive && 'text-accent hover:text-accent',
             )}
           >
-            {teamEngineActive ? (
-              <Users size={14} className="text-accent" />
+            {/* 切换中(压缩上下文等)此前只是把 trigger 禁用,用户不知道在等什么(C-28):图标换 spinner + 文案。 */}
+            {loading ? (
+              <Loader2
+                size={14}
+                className="shrink-0 animate-spin text-faint"
+                aria-hidden
+                data-testid="model-trigger-spinner"
+              />
+            ) : teamEngineActive ? (
+              <Users size={14} className="shrink-0 text-accent" />
             ) : (
-              <Cpu size={14} className="text-faint" />
+              <Cpu size={14} className="shrink-0 text-faint" />
             )}
-            {teamEngineActive && <span className="hidden sm:inline">{'团队模式 · '}</span>}
-            <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">{label}</span>
+            {/* 顶栏已有「团队模式」chip,trigger 再写一遍「团队模式」是同词两次(C-25);这里改说明
+                实际生效的是什么 —— 「队长引擎 · GPT-6-Astra」,「顶栏所见 = 实际所发」的语义不丢。 */}
+            {teamEngineActive && <span className="hidden sm:inline">{'队长引擎 · '}</span>}
+            {selectedDegraded && !teamEngineActive && (
+              <AlertTriangle
+                size={13}
+                className="shrink-0 text-danger"
+                aria-label="当前模型暂不可用"
+                data-testid="model-trigger-degraded"
+              />
+            )}
+            <span className="min-w-0 truncate sm:max-w-[180px]">{label}</span>
+            {loading && selected && !teamEngineActive ? (
+              <span className="shrink-0 text-faint" data-testid="model-trigger-loading">
+                · 切换中…
+              </span>
+            ) : (
+              tierLabel && (
+                <span className="hidden shrink-0 text-faint sm:inline" data-testid="model-trigger-tier">
+                  · {tierLabel}
+                </span>
+              )
+            )}
             {!teamEngineActive && <CostMark model={selected} />}
-            {!teamEngineActive && <PromoBadge label={selectedPromo} />}
-            <ChevronDown size={14} className="text-faint" />
+            {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
+            <ChevronDown size={14} className="shrink-0 text-faint" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -443,6 +582,21 @@ export function ModelSelector({
           className="flex max-h-[80vh] min-w-[15rem] flex-col"
         >
           <DropdownMenuLabel className="shrink-0">对话模型</DropdownMenuLabel>
+          {showSearch && (
+            <div className="shrink-0 px-1.5 pb-1">
+              <Input
+                ref={searchRef}
+                inputSize="sm"
+                aria-label="搜索模型"
+                placeholder="搜索模型…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Escape' && e.key !== 'ArrowDown') e.stopPropagation()
+                }}
+              />
+            </div>
+          )}
           {teamEngineActive && (
             <div
               role="note"
@@ -472,8 +626,19 @@ export function ModelSelector({
             </div>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {visibleRows.map(renderRow)}
-            {showCollapsedGroup && (
+            {recentRows.length > 0 && (
+              <>
+                <DropdownMenuLabel data-recent-group="true">最近</DropdownMenuLabel>
+                {recentRows.map((row) => renderRow(row, 'recent-'))}
+                <DropdownMenuSeparator />
+              </>
+            )}
+            {searching && listRows.length === 0 ? (
+              <div className="px-2 py-3 text-caption text-faint">无匹配模型</div>
+            ) : (
+              listRows.map((row) => renderRow(row))
+            )}
+            {listShowCollapsed && (
               <>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -494,10 +659,10 @@ export function ModelSelector({
                     <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
                   </span>
                   <span className="text-caption font-normal text-faint">
-                    {collapsedRows.length} 个
+                    {listCollapsed.length} 个
                   </span>
                 </DropdownMenuItem>
-                {collapsedOpen && collapsedRows.map(renderRow)}
+                {collapsedOpen && listCollapsed.map((row) => renderRow(row))}
               </>
             )}
           </div>

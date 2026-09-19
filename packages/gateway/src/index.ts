@@ -48,10 +48,20 @@ export {
 // (serveMessages) to run cursor-* models for local Claude Code clients.
 export {
   CursorSandRelay,
+  CURSOR_SAND_DIRECT_CLIENT_VERSION,
+  CURSOR_SAND_DIRECT_CLIENT_SOURCE,
+  classifyRelayTerminalCode,
   isSandRoutableModel,
+  isNonRetryableUpstreamReason,
+  stripNonRetryableMarker,
+  describeUpstreamError,
   type CursorSandServeResult,
   type CursorSandUsage,
   type RelayCredentialKind,
+  type UpstreamErrorInfo,
+  type ServeMessagesOptions,
+  type UsageEvidence,
+  type TerminalEvidence,
 } from './engine/cursorSandRelay.js'
 export {
   ZcodeAdapter,

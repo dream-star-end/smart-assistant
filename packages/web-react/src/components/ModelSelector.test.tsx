@@ -3,9 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
+import { EFFORT_OPTIONS } from './settings/labels'
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  localStorage.clear()
+})
 
 const MODELS: PublicModel[] = [
   { id: 'glm-5.2', display_name: 'GLM-5.2' },
@@ -32,7 +36,9 @@ describe('ModelSelector 团队模式诚信显示', () => {
       <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,
     )
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
-    expect(trigger.textContent).toContain('团队模式 · GPT-6-Astra')
+    // C-25:顶栏 chip 已写「团队模式」,trigger 改说明实际生效的队长引擎,不再同词两次。
+    expect(trigger.textContent).toContain('队长引擎 · GPT-6-Astra')
+    expect(trigger.textContent).not.toContain('团队模式 · ')
     expect(trigger.textContent).not.toContain('GLM-5.2')
   })
 
@@ -204,6 +210,61 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-fast="true"]')).toBeNull()
+  })
+
+  // C-07:思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道。
+  it('触发器在 sm+ 追加当前思考档与 Fast(「· 高 · Fast」),团队模式下不显示', () => {
+    const { rerender } = render(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />,
+    )
+    const tier = screen.getByTestId('model-trigger-tier')
+    expect(tier).toHaveTextContent(`· ${EFFORT_OPTIONS.find((o) => o.value === 'high')!.label} · Fast`)
+    expect(tier).toHaveClass('hidden', 'sm:inline')
+    rerender(<ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-low" onSelect={() => {}} />)
+    expect(screen.getByTestId('model-trigger-tier')).toHaveTextContent(
+      `· ${EFFORT_OPTIONS.find((o) => o.value === 'low')!.label}`,
+    )
+    expect(screen.getByTestId('model-trigger-tier').textContent).not.toContain('Fast')
+    rerender(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-low" onSelect={() => {}} teamEngineActive />,
+    )
+    expect(screen.queryByTestId('model-trigger-tier')).toBeNull()
+  })
+
+  it('非 Cursor 模型按会话思考偏好显示档位;无偏好不显示', () => {
+    const { rerender } = render(
+      <ModelSelector
+        models={CURSOR_MODELS}
+        selectedId="glm-5.2"
+        onSelect={() => {}}
+        effortSupported={['low', 'high']}
+        effortActive="high"
+      />,
+    )
+    expect(screen.getByTestId('model-trigger-tier')).toHaveTextContent(
+      EFFORT_OPTIONS.find((o) => o.value === 'high')!.label,
+    )
+    rerender(<ModelSelector models={CURSOR_MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    expect(screen.queryByTestId('model-trigger-tier')).toBeNull()
+  })
+})
+
+// C-08:当前模型被后端标 degraded 时 trigger 无任何标识,只有点开菜单才看到。
+describe('ModelSelector 降级模型 trigger 标识', () => {
+  const DEG_MODELS: PublicModel[] = [
+    { id: 'glm-5.2', display_name: 'GLM-5.2', degraded: true },
+    { id: 'deepseek-v4', display_name: 'DeepSeek-V4' },
+  ]
+
+  it('已选模型 degraded → trigger 带警示图标与 title;健康模型无', () => {
+    const { rerender } = render(<ModelSelector models={DEG_MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveAttribute('data-degraded', 'true')
+    expect(trigger).toHaveAttribute('title', '当前模型暂不可用，点击更换')
+    expect(screen.getByTestId('model-trigger-degraded')).toBeInTheDocument()
+    rerender(<ModelSelector models={DEG_MODELS} selectedId="deepseek-v4" onSelect={() => {}} />)
+    expect(screen.getByRole('button', { name: '选择对话模型' })).not.toHaveAttribute('data-degraded')
+    expect(screen.queryByTestId('model-trigger-degraded')).toBeNull()
   })
 })
 
@@ -410,6 +471,12 @@ describe('ModelSelector GPT/Kimi 上下文档', () => {
     expect(trigger.textContent).toContain('x11.3')
   })
 
+  it('trigger 保留 CostMark', () => {
+    render(<ModelSelector models={MODELS} selectedId="gpt-5.6-sol" onSelect={() => {}} />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('x11.3')
+  })
+
   it('菜单收成 Kimi K3 一行，1M 开关改写 canonical id', async () => {
     const onSelect = vi.fn()
     render(<ModelSelector models={MODELS} selectedId="k3-256k" onSelect={onSelect} />)
@@ -566,5 +633,148 @@ describe('ModelSelector 「更多 GPT 模型」折叠组(2026-09-05 Terra/Luna)'
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-collapsed-group]')).toBeNull()
     expect(screen.queryByText('更多 GPT 模型')).toBeNull()
+  })
+})
+
+const SEARCH_MODELS: PublicModel[] = Array.from({ length: 8 }, (_, i) => ({
+  id: `plain-search-${i}`,
+  display_name: i === 3 ? 'Zebra Unique' : `Alpha ${i}`,
+}))
+
+describe('ModelSelector 搜索', () => {
+  it('≥8 模型时渲染搜索框，输入后只剩匹配项', async () => {
+    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const input = await screen.findByLabelText('搜索模型')
+    fireEvent.change(input, { target: { value: 'Zebra' } })
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent('Zebra Unique')
+    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(false)
+  })
+
+  it('无匹配时显示「无匹配模型」', async () => {
+    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const input = await screen.findByLabelText('搜索模型')
+    fireEvent.change(input, { target: { value: 'no-such-model-zzz' } })
+    expect(screen.getByText('无匹配模型')).toBeInTheDocument()
+    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
+  })
+
+  it('<8 模型不渲染搜索框', async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.queryByLabelText('搜索模型')).toBeNull()
+  })
+})
+
+describe('ModelSelector 受控开合', () => {
+  it('open 受控为 true 时菜单按 prop 打开', async () => {
+    render(
+      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} open />,
+    )
+    const items = await screen.findAllByRole('menuitem')
+    expect(items.some((i) => i.textContent?.includes('DeepSeek-V4'))).toBe(true)
+  })
+})
+
+// C-28:modelSwitchPreparing(压缩上下文切换中)时 trigger 只是禁用,用户不知道在等什么。
+describe('ModelSelector 切换中态', () => {
+  it('loading 且已有选中模型 → spinner + 「切换中…」+ aria-busy;不 loading 时无', () => {
+    const { rerender } = render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} loading />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toBeDisabled()
+    expect(trigger).toHaveAttribute('aria-busy', 'true')
+    expect(trigger).toHaveAttribute('title', '正在切换模型，请稍候')
+    expect(screen.getByTestId('model-trigger-spinner')).toBeInTheDocument()
+    expect(screen.getByTestId('model-trigger-loading')).toHaveTextContent('切换中…')
+    expect(trigger.textContent).toContain('GLM-5.2')
+    rerender(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    expect(screen.queryByTestId('model-trigger-spinner')).toBeNull()
+    expect(screen.queryByTestId('model-trigger-loading')).toBeNull()
+  })
+
+  it('loading 且列表为空 → 仍显示「加载模型…」,不显示「切换中」', () => {
+    render(<ModelSelector models={[]} selectedId={undefined} onSelect={() => {}} loading />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('加载模型…')
+    expect(screen.queryByTestId('model-trigger-loading')).toBeNull()
+  })
+})
+
+// C-29:菜单打开后焦点落在首项,搜索框(≥8 模型才出现)不自动聚焦,键盘用户要多按一次。
+describe('ModelSelector 搜索框自动聚焦', () => {
+  const MANY: PublicModel[] = Array.from({ length: 9 }, (_, i) => ({
+    id: `model-${i}`,
+    display_name: `Model ${i}`,
+  }))
+
+  it('≥8 模型时打开菜单焦点直接落在搜索框', async () => {
+    render(<ModelSelector models={MANY} selectedId="model-0" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const search = await screen.findByRole('textbox', { name: '搜索模型' })
+    await waitFor(() => expect(document.activeElement).toBe(search))
+  })
+
+  it('<8 模型无搜索框,焦点仍按 Radix 默认落在菜单内', async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
+    await waitFor(() => expect(document.activeElement?.closest('[role="menu"]')).not.toBeNull())
+  })
+})
+
+describe('ModelSelector 最近使用', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  // C-27:切过同家族不同档位后,「最近」会出现与当前选中同一家族的行且带 ✓,与主列表重复。
+  it('与当前选中同一 Cursor 家族的最近记录不进「最近」分组;其它家族照常', async () => {
+    const GROK_MODELS: PublicModel[] = [
+      { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
+      { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'deepseek-v4', display_name: 'DeepSeek-V4' },
+    ]
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['cursor-grok-4.6-low', 'glm-5.2']))
+    render(<ModelSelector models={GROK_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const recentLabel = document.querySelector('[data-recent-group="true"]')
+    expect(recentLabel).toBeTruthy()
+    // 「最近」分组 = 标签之后、分隔线之前的兄弟节点。
+    const recentIds: string[] = []
+    for (let el = recentLabel?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
+      const id = el.getAttribute('data-model-id')
+      if (id) recentIds.push(id)
+    }
+    // 同家族(grok)不出现在最近;glm-5.2 出现。
+    expect(recentIds).toEqual(['glm-5.2'])
+    expect(document.querySelectorAll('[data-recent-group="true"]')).toHaveLength(1)
+  })
+
+  it('选过的模型出现在「最近」分组', async () => {
+    const onSelect = vi.fn()
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const target = items.find((i) => i.textContent?.includes('DeepSeek-V4'))
+    expect(target).toBeTruthy()
+    if (target) fireEvent.click(target)
+    expect(onSelect).toHaveBeenCalledWith('deepseek-v4')
+
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const recentLabel = await screen.findByText('最近')
+    expect(recentLabel).toBeInTheDocument()
+    expect(document.querySelector('[data-recent-group="true"]')).toBeTruthy()
+    const recentItem = document.querySelector('[data-recent-group="true"]')
+      ?.parentElement
+      ?.querySelector('[data-model-id="deepseek-v4"]')
+    expect(recentItem).toBeTruthy()
+    expect(recentItem?.textContent).toContain('DeepSeek-V4')
   })
 })

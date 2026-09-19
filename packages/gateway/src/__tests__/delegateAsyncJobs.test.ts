@@ -1,3 +1,6 @@
+import { installDelegateSandbox } from './helpers/delegateSandbox.js'
+const sandbox = installDelegateSandbox()
+
 /**
  * Gateway HTTP: `/delegate` async job + `/delegate/wait` long-poll.
  * Drives real handleDelegateTask / handleDelegateWait on an Object.create
@@ -47,7 +50,7 @@ const PARENT_KEY = 'agent:main:webchat:dm:wsess-async-delegate'
 
 function makeGateway(holdSubmit = false): any {
   const agent = { id: 'main', provider: 'anthropic', model: 'glm-5.2' }
-  const gw = Object.create(Gateway.prototype) as any
+  const gw = sandbox.trackGateway(Object.create(Gateway.prototype) as any)
   gw._shuttingDown = false
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
@@ -105,7 +108,7 @@ function makeGateway(holdSubmit = false): any {
     bufferPendingAgentGroup: () => true,
   }
   gw.deliver = () => {}
-  return gw
+  return sandbox.trackGateway(gw)
 }
 
 async function call(

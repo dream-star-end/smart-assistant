@@ -1949,6 +1949,45 @@ export interface ClientSession {
     lastFrameAt: number | null
     model?: string
   }
+  /** Optional permission/ask-user snapshot from Master PG turn_permission_requests
+   *  (PG session GET only). SQLite/old clients omit the field. `responded` means
+   *  the control was accepted, not that the tool executed. Completeness:
+   *  complete = page covers the recent window; truncated = older cards need
+   *  requestId lookup; unavailable = no PG / timeout — absence is not "all answered". */
+  permissionPrompts?: {
+    items: Array<{
+      requestId: string
+      clientMessageId: string | null
+      toolUseId: string | null
+      toolName: string
+      inputJson: Record<string, unknown>
+      inputTruncated?: boolean
+      status: 'pending' | 'responded' | 'cancelled' | 'expired'
+      behavior: 'allow' | 'deny' | null
+      reason: string | null
+      answers: Record<string, string> | null
+      expiresAt: number
+      createdAt: number
+      updatedAt: number
+    }>
+    completeness: 'complete' | 'truncated' | 'unavailable'
+    source: 'pg' | 'runtime'
+    lookups?: Array<{
+      requestId: string
+      clientMessageId: string | null
+      toolUseId: string | null
+      toolName: string
+      inputJson: Record<string, unknown>
+      inputTruncated?: boolean
+      status: 'pending' | 'responded' | 'cancelled' | 'expired'
+      behavior: 'allow' | 'deny' | null
+      reason: string | null
+      answers: Record<string, string> | null
+      expiresAt: number
+      createdAt: number
+      updatedAt: number
+    }>
+  }
 }
 
 /**
@@ -2806,6 +2845,8 @@ export type ClientSessionReadOptions = {
   view?: 'exact' | 'timeline'
   /** Revision paired with `sinceSeq`; missing/mismatch forces a full read. */
   sinceHistoryRevision?: number
+  /** Bounded requestIds for exact permission-prompt lookup (PG only). */
+  permissionLookupIds?: string[]
 }
 
 /**
@@ -5220,6 +5261,36 @@ async function _sqliteGetClientSession(
   }
 }
 
+/** Lightweight parent identity for collaboration-config. Never selects messages/tape. */
+export type ClientSessionCollabParent = {
+  sessionId: string
+  userId: string
+  agentId: string
+  modelId?: string
+}
+
+async function _sqliteGetClientSessionCollabParent(
+  sessionId: string,
+  userId: string,
+): Promise<ClientSessionCollabParent | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT id, user_id, agent_id, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessionId, userId) as {
+    id: string
+    user_id: string
+    agent_id: string
+    model_id: string | null
+  } | undefined
+  if (!row) return null
+  return {
+    sessionId: row.id,
+    userId: row.user_id,
+    agentId: row.agent_id,
+    ...(row.model_id ? { modelId: row.model_id } : {}),
+  }
+}
+
 async function _sqliteClassifyClientSessions(
   refs: readonly ClientSessionLifecycleRef[],
 ): Promise<ClientSessionLifecycle[]> {
@@ -7150,6 +7221,7 @@ const sqliteBackend = {
   sweepUsageAggregationGc: _sqliteSweepUsageAggregationGc,
   listClientSessions: _sqliteListClientSessions,
   getClientSession: _sqliteGetClientSession,
+  getClientSessionCollabParent: _sqliteGetClientSessionCollabParent,
   classifyClientSessions: _sqliteClassifyClientSessions,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
@@ -7278,6 +7350,9 @@ export const listClientSessions: ClientSessionsBackend['listClientSessions'] =
 
 export const getClientSession: ClientSessionsBackend['getClientSession'] =
   (...args) => getActiveBackend().getClientSession(...args)
+
+export const getClientSessionCollabParent: ClientSessionsBackend['getClientSessionCollabParent'] =
+  (...args) => getActiveBackend().getClientSessionCollabParent(...args)
 
 export const classifyClientSessions: ClientSessionsBackend['classifyClientSessions'] =
   (...args) => getActiveBackend().classifyClientSessions(...args)

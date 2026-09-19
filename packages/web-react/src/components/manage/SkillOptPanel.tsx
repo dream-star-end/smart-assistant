@@ -146,15 +146,15 @@ function CostBody({
         ))}
       </ul>
       <p>
-        预计消耗:<span className="font-medium text-fg">{range}</span>
+        预计消耗：<span className="font-medium text-fg">{range}</span>
         {rates && (
           <span className="text-muted">
-            (按 {rates.displayName} 公开费率估算,实际以账单为准)
+            （按 {rates.displayName} 公开费率估算，实际以账单为准）
           </span>
         )}
       </p>
       {extra}
-      <p className="font-medium text-danger">本操作将消耗你的积分,确认后立即开始。</p>
+      <p className="font-medium text-danger">本操作将消耗你的积分，确认后立即开始。</p>
     </div>
   );
 }
@@ -168,12 +168,12 @@ function UsageLine({ usage, rates, label }: { usage?: SkillRunUsage; rates: Mode
   const credits = rates ? creditsForUsage(usage, rates) : null;
   return (
     <p className="text-meta text-muted">
-      {label ?? "本次消耗"}:输入 {usage.inputTokens.toLocaleString()} / 输出{" "}
-      {usage.outputTokens.toLocaleString()} tokens({usage.turns} 轮)
+      {label ?? "本次消耗"}：输入 {usage.inputTokens.toLocaleString()} / 输出{" "}
+      {usage.outputTokens.toLocaleString()} tokens（{usage.turns} 轮）
       {credits !== null && (
         <>
-          ,折算约 <span className="font-medium text-fg">{fmtCredits(credits)} 积分</span>
-          (实际扣费以账单为准)
+          ，折算约 <span className="font-medium text-fg">{fmtCredits(credits)} 积分</span>
+          （实际扣费以账单为准）
         </>
       )}
     </p>
@@ -186,7 +186,7 @@ const OP_LABEL: Record<string, string> = { create: "新建", update: "更新", d
 /** AI 生成端点错误 → 友好中文(409/403/404 单独措辞,其余回原始信息)。 */
 function genErrMessage(e: unknown): string {
   const status = e instanceof ApiError ? e.status : 0;
-  if (status === 409) return "该技能有评测或生成任务在进行中,请稍后再试";
+  if (status === 409) return "该技能有评测或生成任务在进行中，请稍后再试";
   if (status === 403) return "只有你自建的技能才能生成评测用例";
   if (status === 404) return "技能不存在或已删除";
   return apiErrorMessage(e, "AI 生成用例失败");
@@ -237,7 +237,7 @@ export function SkillEvalSection({
           })),
         );
         setLastRun(r.lastRun as typeof lastRun);
-        if (r.parseErrors?.length) setErr(`evals.json 解析失败:${r.parseErrors.join(";")}`);
+        if (r.parseErrors?.length) setErr(`evals.json 解析失败：${r.parseErrors.join("；")}`);
         setDirty(false);
         setDraftBanner(false);
       })
@@ -282,17 +282,17 @@ export function SkillEvalSection({
   const startRun = async () => {
     const n = cases.length;
     if (n === 0) return setErr("请先添加至少 1 个评测用例");
-    if (dirty) return setErr("有未保存的用例修改,先保存再运行");
+    if (dirty) return setErr("有未保存的用例修改，先保存再运行");
     const range = rates ? fmtCreditRange(estimateEvalRunCredits(n, 2, rates)) : "少量";
     const ok = await confirmDialog({
-      title: `运行评测(${n} 个用例)?`,
+      title: `运行评测（${n} 个用例）？`,
       body: (
         <CostBody
           lines={[
-            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
-            `${n} 个用例 × 2 组对照(有技能 / 无技能)+ 每用例 1 次评分`,
-            "全部在隔离会话中运行,不影响你的正常对话与技能库",
-            "开始后无法中止,请先确认用例无误",
+            `模型：${rates?.displayName ?? SKILL_RUN_MODEL}（平台锁定）`,
+            `${n} 个用例 × 2 组对照（有技能 / 无技能）+ 每用例 1 次评分`,
+            "全部在隔离会话中运行，不影响你的正常对话与技能库",
+            "开始后无法中止，请先确认用例无误",
           ]}
           range={range}
           rates={rates}
@@ -348,7 +348,7 @@ export function SkillEvalSection({
       setDraftBanner(true);
     } else {
       // failed:提示失败原因(note)。
-      setErr(genRun.note ? `AI 生成用例失败:${genRun.note}` : "AI 生成用例失败");
+      setErr(genRun.note ? `AI 生成用例失败：${genRun.note}` : "AI 生成用例失败");
     }
     // 仅终态(done/failed)清 job、停止轮询。
     setGenRunId(null);
@@ -359,21 +359,21 @@ export function SkillEvalSection({
   const startGenerate = async () => {
     const hasCases = cases.length > 0;
     const ok = await confirmDialog({
-      title: hasCases ? "AI 补充生成评测用例?" : "AI 生成评测用例?",
+      title: hasCases ? "AI 补充生成评测用例？" : "AI 生成评测用例？",
       body: (
         <CostBody
           lines={[
-            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
-            "单次一个对话轮次:AI 读技能内容 + 你的真实使用记录起草用例",
+            `模型：${rates?.displayName ?? SKILL_RUN_MODEL}（平台锁定）`,
+            "单次一个对话轮次：AI 读技能内容 + 你的真实使用记录起草用例",
             hasCases
-              ? "在现有用例基础上补充不重复的新场景(灌入编辑器,保存前不写入技能库)"
-              : "起草 3~5 个用例灌入下方编辑器,你审阅/修改后保存才写入技能库",
+              ? "在现有用例基础上补充不重复的新场景（灌入编辑器，保存前不写入技能库）"
+              : "起草 3~5 个用例灌入下方编辑器，你审阅 / 修改后保存才写入技能库",
           ]}
-          range="约 1~3 积分(一个对话轮次)"
+          range="约 1~3 积分（一个对话轮次）"
           rates={null}
         />
       ),
-      confirmText: hasCases ? "补充生成(接受消耗)" : "生成(接受消耗)",
+      confirmText: hasCases ? "补充生成（接受消耗）" : "生成（接受消耗）",
     });
     if (!ok) return;
     setErr(null);
@@ -396,13 +396,13 @@ export function SkillEvalSection({
     const next = !autoRegression;
     if (next) {
       const ok = await confirmDialog({
-        title: "开启每日自动回归?",
+        title: "开启每日自动回归？",
         body: (
           <CostBody
             lines={[
-              "平台每天自动跑一次本技能的评测,通过率下降时推送提醒到对话",
-              `每天约消耗:${perDay}`,
-              "不会自动改动技能内容,更不会自动开训练 —— 只提醒",
+              "平台每天自动跑一次本技能的评测，通过率下降时推送提醒到对话",
+              `每天约消耗：${perDay}`,
+              "不会自动改动技能内容，更不会自动开训练 —— 只提醒",
             ]}
             range={`${perDay} / 天`}
             rates={rates}
@@ -417,7 +417,7 @@ export function SkillEvalSection({
     const ok = await save(next);
     if (!ok) {
       setAutoRegression(prev);
-      toast(next ? "开启失败,已保持关闭" : "关闭失败,已保持开启", "error");
+      toast(next ? "开启失败，已保持关闭" : "关闭失败，已保持开启", "error");
       return;
     }
     toast(next ? "已开启每日自动回归" : "已关闭每日自动回归", "success");
@@ -447,7 +447,7 @@ export function SkillEvalSection({
       )}
       {draftBanner && (
         <Alert tone="info" density="compact">
-          AI 草稿已生成,请审阅修改后保存
+          AI 草稿已生成，请审阅修改后保存
         </Alert>
       )}
 
@@ -510,7 +510,7 @@ export function SkillEvalSection({
       {generating && (
         <Card tone="sunken" padding="sm" aria-live="polite" aria-atomic="true">
           <p className="flex items-center gap-2 text-body text-muted">
-            <Spinner size={14} /> AI 正在起草评测用例…(约一个对话轮次,请稍候)
+            <Spinner size={14} /> AI 正在起草评测用例…（约一个对话轮次，请稍候）
           </p>
         </Card>
       )}
@@ -519,7 +519,7 @@ export function SkillEvalSection({
           <EmptyState
             icon={FlaskConical}
             title="还没有评测用例"
-            hint="用例 = 一个真实任务 + 几条可判定的验收断言;它是「这个技能到底有没有用」的唯一事实标准。"
+            hint="用例 = 一个真实任务 + 几条可判定的验收断言；它是「这个技能到底有没有用」的唯一事实标准。"
             action={
               writable ? (
                 <div className="flex flex-col items-center gap-2">
@@ -528,7 +528,7 @@ export function SkillEvalSection({
                     AI 生成用例
                   </Button>
                   <p className="max-w-[19rem] text-meta text-muted">
-                    从技能内容和你的真实使用记录起草,生成后可编辑;也可点上方「加用例」手动写。
+                    从技能内容和你的真实使用记录起草，生成后可编辑；也可点上方「加用例」手动写。
                   </p>
                 </div>
               ) : undefined
@@ -581,10 +581,10 @@ export function SkillEvalSection({
                       setDirty(true);
                     }}
                     rows={2}
-                    placeholder="任务(真实措辞,含必要上下文)…"
+                    placeholder="任务（真实措辞，含必要上下文）…"
                   />
                 </Field>
-                <Field label="验收断言" hint="每行一条,例如:输出为英文且信息无遗漏 / 保留原文数字与单位">
+                <Field label="验收断言" hint="每行一条，例如：输出为英文且信息无遗漏 / 保留原文数字与单位">
                   <Textarea
                     value={c.assertions}
                     disabled={!writable}
@@ -594,7 +594,7 @@ export function SkillEvalSection({
                       setDirty(true);
                     }}
                     rows={3}
-                    placeholder={"验收断言,每行一条,例如:\n输出为英文且信息无遗漏\n保留原文数字与单位"}
+                    placeholder={"验收断言，每行一条，例如：\n输出为英文且信息无遗漏\n保留原文数字与单位"}
                     className="font-mono"
                   />
                 </Field>
@@ -617,13 +617,13 @@ export function SkillEvalSection({
               />
               <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-body text-muted">
                 <Spinner size={14} />
-                {run.status === "grading" ? "评分中" : "评测中"}({run.progress.done}/{run.progress.total} 组)…
+                {run.status === "grading" ? "评分中" : "评测中"}（{run.progress.done}/{run.progress.total} 组）…
                 <span className="text-meta text-muted">本次运行不可中止</span>
               </p>
             </div>
           ) : run.status === "failed" ? (
             <Alert tone="danger" density="compact">
-              评测失败:{run.error}
+              评测失败：{run.error}
             </Alert>
           ) : (
             <EvalResultView run={run} rates={rates} />
@@ -635,7 +635,7 @@ export function SkillEvalSection({
       {/* 上次结果(无进行中 run 时) */}
       {!run && lastRun?.benchmark && (
         <Card tone="sunken" padding="sm" className="flex flex-col gap-1">
-          <p className="text-body font-medium text-fg">上次评测:{lastRun.benchmark.verdict}</p>
+          <p className="text-body font-medium text-fg">上次评测：{lastRun.benchmark.verdict}</p>
           <UsageLine usage={lastRun.usage} rates={rates} label="上次消耗" />
         </Card>
       )}
@@ -652,7 +652,7 @@ export function SkillEvalSection({
           <label htmlFor={autoId} className="min-w-0 flex-1 cursor-pointer">
             <span className="block text-body font-medium text-fg">每日自动回归</span>
             <span className="block text-meta text-muted">
-              每天约消耗 {perDay},通过率下降时推送提醒;默认关闭。
+              每天约消耗 {perDay}，通过率下降时推送提醒；默认关闭。
             </span>
           </label>
         </Card>
@@ -665,7 +665,7 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
   const [openCase, setOpenCase] = useState<string | null>(null);
   const idBase = useId();
   const b = run.benchmark;
-  if (!b) return <p className="text-body text-muted">评测完成,但没有可用结果。</p>;
+  if (!b) return <p className="text-body text-muted">评测完成，但没有可用结果。</p>;
   const pct = (x?: number) => `${Math.round((x ?? 0) * 100)}%`;
   const armsShown = run.mode === "draft" ? (["with", "draft"] as const) : (["without", "with"] as const);
   return (
@@ -695,7 +695,8 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
                 type="button"
                 onClick={() => setOpenCase(open ? null : c.id)}
                 aria-expanded={open}
-                aria-controls={panelId}
+                // 用例详情只在展开时挂载:收起态不留悬空 IDREF(t-762 manage#2)。
+                aria-controls={open ? panelId : undefined}
                 className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               >
                 <ChevronRight size={13} className={cn("shrink-0 transition-transform", open && "rotate-90")} />
@@ -703,7 +704,7 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
                 {rs.map((r) => (
                   <span key={r.arm} className="shrink-0 text-caption text-muted">
                     {ARM_LABEL[r.arm]}{" "}
-                    {r.error ? "✗错" : `${r.assertions.filter((a) => a.passed).length}/${r.assertions.length}`}
+                    {r.error ? "出错" : `${r.assertions.filter((a) => a.passed).length}/${r.assertions.length}`}
                   </span>
                 ))}
               </button>
@@ -845,25 +846,25 @@ export function SkillTrainSection({
       ? fmtCreditRange({ low: trainRange.low, high: trainRange.high + evalRange.high })
       : "视会话量而定";
     const ok = await confirmDialog({
-      title: `训练优化「${skillName}」?`,
+      title: `训练优化「${skillName}」？`,
       body: (
         <CostBody
           lines={[
-            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定,最高思考档)`,
-            "AI 复盘你近期的真实会话,给这个技能起草改进(只产草稿,合并前不会改动技能)",
-            "草稿产出后自动跑评测门:草稿 vs 现版实测对比,给出「是否值得合并」的量化结论",
-            "开始后无法中止(可随时放弃草稿,但已产生的消耗不退)",
+            `模型：${rates?.displayName ?? SKILL_RUN_MODEL}（平台锁定，最高思考档）`,
+            "AI 复盘你近期的真实会话，给这个技能起草改进（只产草稿，合并前不会改动技能）",
+            "草稿产出后自动跑评测门：草稿 vs 现版实测对比，给出「是否值得合并」的量化结论",
+            "开始后无法中止（可随时放弃草稿，但已产生的消耗不退）",
           ]}
           range={total}
           rates={rates}
           extra={
             <p className="text-meta text-muted">
-              含训练 + 草稿评测两部分;若技能还没有评测用例,训练会一并提议用例(随草稿确认)。
+              含训练 + 草稿评测两部分；若技能还没有评测用例，训练会一并提议用例（随草稿确认）。
             </p>
           }
         />
       ),
-      confirmText: "开始训练(接受消耗)",
+      confirmText: "开始训练（接受消耗）",
     });
     if (!ok) return;
     setErr(null);
@@ -876,7 +877,7 @@ export function SkillTrainSection({
       // 旧后端不返回 feedbackRefs → undefined,不渲染提示(容错)。
       if (typeof r.feedbackRefs === "number" && r.feedbackRefs > 0) {
         setFeedbackNotice(
-          `已找到 ${r.feedbackRefs} 条你差评过的真实使用记录,本次训练将优先分析这些失败案例`,
+          `已找到 ${r.feedbackRefs} 条你差评过的真实使用记录，本次训练将优先分析这些失败案例`,
         );
       }
     } catch (e) {
@@ -886,9 +887,16 @@ export function SkillTrainSection({
 
   const discard = async () => {
     if (!runId) return;
-    const ok = await confirmDialog({ title: "放弃本次训练与全部草稿?", confirmText: "放弃", danger: true });
+    const ok = await confirmDialog({ title: "放弃本次训练与全部草稿？", confirmText: "放弃", danger: true });
     if (!ok) return;
-    await api.discardSkillTrainRun(auth, runId).catch(() => {});
+    // 服务端放弃失败就不能清本地 run：否则下次打开工作台又被 pickResumableTrainRun 找回，
+    // 用户看到「刚放弃的东西又回来了」。失败报在原地，run 原样留着可再试。
+    try {
+      await api.discardSkillTrainRun(auth, runId);
+    } catch (e) {
+      setErr(apiErrorMessage(e, "放弃失败"));
+      return;
+    }
     setRunId(null);
     setRun(null);
     setResumeNotice(null);
@@ -924,7 +932,7 @@ export function SkillTrainSection({
           )}
           <div className="flex flex-col items-start gap-3 md:flex-row md:items-start md:justify-between">
             <p className="text-meta leading-relaxed text-muted">
-              AI 复盘你近期的真实使用,起草这个技能的改进;草稿先过评测门(草稿 vs 现版实测),
+              AI 复盘你近期的真实使用，起草这个技能的改进；草稿先过评测门（草稿 vs 现版实测），
               再由你决定是否合并 —— 技能库永远不会被自动改动。
             </p>
             <Button variant="primary" size="sm" onClick={start} className="shrink-0 max-md:w-full">
@@ -946,7 +954,7 @@ export function SkillTrainSection({
             )}
             <span className="text-body font-medium text-fg">
               {PHASE_LABEL[run.phase] ?? run.phase}
-              {isActive(run) && `(已 ${run.toolCalls} 步)`}
+              {isActive(run) && `（已 ${run.toolCalls} 步）`}
             </span>
             <PhaseSteps phase={run.phase} />
             {isActive(run) && (
@@ -978,7 +986,7 @@ export function SkillTrainSection({
                 setResumeNotice(null);
                 setFeedbackNotice(null);
                 setMergedNotice(
-                  "已合并到技能库,可在「正文」页签查看新版本;旧版已存入「历史」,可随时回滚。",
+                  "已合并到技能库，可在「正文」页签查看新版本；旧版已存入「历史」，可随时回滚。",
                 );
                 toast("已合并到技能库", "success");
                 onSkillChanged?.();
@@ -1063,13 +1071,13 @@ function DraftDiff({ current, draft }: { current: string; draft: string }) {
         <div className="flex min-w-0 flex-col gap-1">
           <span className="text-caption font-medium text-muted">现版</span>
           <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-muted">
-            {current || "(空)"}
+            {current || "（空）"}
           </pre>
         </div>
         <div className="flex min-w-0 flex-col gap-1">
           <span className="text-caption font-medium text-muted">草稿</span>
           <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-fg">
-            {draft || "(空)"}
+            {draft || "（空）"}
           </pre>
         </div>
       </div>
@@ -1106,7 +1114,7 @@ function DraftDiff({ current, draft }: { current: string; draft: string }) {
               }
               className="block w-full px-2.5 py-1 text-left text-caption text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
-              … {g.lines.length} 行未变更(点击展开)
+              … {g.lines.length} 行未变更（点击展开）
             </button>
           ) : (
             g.lines.map((l, li) => (
@@ -1218,14 +1226,14 @@ function TrainDraftView({
 
   const merge = async () => {
     const evalNote = evalRun?.benchmark?.verdict
-      ? `评测门结论:${evalRun.benchmark.verdict}`
-      : "本草稿未经评测(无用例或评测未完成)。";
+      ? `评测门结论：${evalRun.benchmark.verdict}`
+      : "本草稿未经评测（无用例或评测未完成）。";
     const ok = await confirmDialog({
-      title: "合并草稿到技能库?",
+      title: "合并草稿到技能库？",
       body: (
         <div className="flex flex-col gap-2 text-body">
-          <p className="text-muted">{evalNote} 合并会覆盖现版(旧版自动存入历史,可回滚)。</p>
-          <p className="font-medium text-fg">本次将合并 {drafts.length} 项:</p>
+          <p className="text-muted">{evalNote} 合并会覆盖现版（旧版自动存入历史，可回滚）。</p>
+          <p className="font-medium text-fg">本次将合并 {drafts.length} 项：</p>
           <ul className="list-disc pl-4 text-muted">
             {drafts.map((d) => (
               <li key={d.name}>
@@ -1245,7 +1253,7 @@ function TrainDraftView({
     setBusy(true);
     try {
       const r = await api.mergeSkillTrainRun(auth, run.runId);
-      if (!r.ok) setErr(r.results.map((x) => x.error).filter(Boolean).join("; ") || "合并失败");
+      if (!r.ok) setErr(r.results.map((x) => x.error).filter(Boolean).join("；") || "合并失败");
       else onMerged();
     } catch (e) {
       setErr(apiErrorMessage(e, "合并失败"));
@@ -1259,15 +1267,15 @@ function TrainDraftView({
     if (!c || !detail) return;
     const range = rates ? fmtCreditRange(estimateTrainRunCredits(rates)) : "少量";
     const ok = await confirmDialog({
-      title: "让 AI 按评论修订草稿?",
+      title: "让 AI 按评论修订草稿？",
       body: (
         <CostBody
-          lines={["继续同一训练会话修订草稿(修订后可再次评测/合并)"]}
+          lines={["继续同一训练会话修订草稿（修订后可再次评测 / 合并）"]}
           range={range}
           rates={rates}
         />
       ),
-      confirmText: "修订(接受消耗)",
+      confirmText: "修订（接受消耗）",
     });
     if (!ok) return;
     setBusy(true);
@@ -1276,7 +1284,7 @@ function TrainDraftView({
       await api.commentSkillDraft(auth, run.runId, detail.draft.record.name, c);
       setComment("");
       // 成功不再塞进 err 通道靠字符串前缀判色 —— 瞬时提示走 Toast,不挂死在版面上。
-      toast("已提交修订,训练会话重新运行中,稍后回来看新草稿", "success");
+      toast("已提交修订，训练会话重新运行中，稍后回来看新草稿", "success");
     } catch (e) {
       setErr(apiErrorMessage(e, "提交修订失败"));
     } finally {
@@ -1312,7 +1320,7 @@ function TrainDraftView({
       )}
       <div className="flex flex-wrap items-center gap-1.5">
         <FlaskConical size={14} className="shrink-0 text-accent" />
-        <span className="text-body font-medium text-fg">草稿:{d.record.name}</span>
+        <span className="text-body font-medium text-fg">草稿：{d.record.name}</span>
         <Badge tone="accent">{OP_LABEL[d.record.op] ?? d.record.op}</Badge>
         {drafts.length > 1 && <Badge tone="neutral">共 {drafts.length} 份草稿</Badge>}
         {d.evalsJson && <Badge tone="info">附带评测用例</Badge>}
@@ -1328,11 +1336,12 @@ function TrainDraftView({
           ) : null)}
       </div>
 
-      {/* 多份草稿:逐份切换审阅。「看一份、合三份」是这块此前最危险的信息缺口。 */}
+      {/* 多份草稿:逐份切换审阅。「看一份、合三份」是这块此前最危险的信息缺口。
+          横滚而不是宫格:宫格在窄屏三列里长 slug 会被截到只剩 ✓。 */}
       {drafts.length > 1 && (
         <Tabs
           aria-label="切换草稿"
-          layout="grid"
+          layout="scroll"
           value={selected ?? drafts[0].name}
           onValueChange={setSelected}
           items={drafts.map((x) => ({
@@ -1342,7 +1351,7 @@ function TrainDraftView({
         />
       )}
 
-      {d.record.rationale && <p className="text-meta text-muted">理由:{d.record.rationale}</p>}
+      {d.record.rationale && <p className="text-meta text-muted">理由：{d.record.rationale}</p>}
 
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center gap-2">
@@ -1381,12 +1390,12 @@ function TrainDraftView({
           <span className="text-meta text-warning">还有 {unviewed.length} 份草稿未查看</span>
         )}
       </div>
-      <Field label="对草稿留评论让 AI 修订" hint="修订会继续同一训练会话,需再次确认消耗。">
+      <Field label="对草稿留评论让 AI 修订" hint="修订会继续同一训练会话，需再次确认消耗。">
         <Textarea
           value={comment}
           onChange={(e) => setComment(e.target.value)}
           rows={2}
-          placeholder="例:步骤 3 缺了鉴权说明,补上;删掉第 5 条空话"
+          placeholder="例：步骤 3 缺了鉴权说明，补上；删掉第 5 条空话"
         />
       </Field>
       <Button

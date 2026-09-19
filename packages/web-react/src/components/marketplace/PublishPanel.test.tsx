@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TooltipProvider } from "../ui";
 import type { AuthSession, MarketplaceMyPublish } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import { expectAriaControlsResolvable } from "../../test/ariaControls";
 
 const listSkills = vi.fn();
 const listMarketplaceMyPublishes = vi.fn();
@@ -37,6 +38,51 @@ import { PublishPanel } from "./PublishPanel";
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  localStorage.clear();
+});
+
+test("草稿落盘:填写后写入 localStorage,重新挂载原样恢复并给「已恢复」提示,丢弃后清空(K-01)", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  const onDirtyChange = vi.fn();
+
+  const { unmount } = render(<PublishPanel auth={auth} onDirtyChange={onDirtyChange} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  fireEvent.change(screen.getByPlaceholderText("例：学术翻译"), { target: { value: "学术翻译" } });
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  await waitFor(() =>
+    expect(localStorage.getItem("oc_v5_market_publish_draft:skill") ?? "").toContain("学术翻译"),
+  );
+  unmount();
+
+  // 重新挂载(= 关掉市场再打开):内容原样回来,顶部给「已恢复」提示。
+  render(<PublishPanel auth={auth} onDirtyChange={onDirtyChange} />);
+  expect(await screen.findByDisplayValue("学术翻译")).toBeInTheDocument();
+  expect(screen.getByText("已恢复上次未提交的草稿")).toBeInTheDocument();
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "丢弃草稿" }));
+  expect(screen.queryByText("已恢复上次未提交的草稿")).not.toBeInTheDocument();
+  expect((screen.getByPlaceholderText("例：学术翻译") as HTMLInputElement).value).toBe("");
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  await waitFor(() => expect(localStorage.getItem("oc_v5_market_publish_draft:skill")).toBeNull());
+});
+
+test("存储里的旧草稿缺字段 / 不是对象时不会读崩,按空表单起步", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue({ models: [], lockedModels: [] });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  localStorage.setItem("oc_v5_market_publish_draft:skill", JSON.stringify({ name: "只有名字" }));
+  localStorage.setItem("oc_v5_market_publish_draft:agent", "[]");
+
+  render(<PublishPanel auth={auth} />);
+  expect(await screen.findByDisplayValue("只有名字")).toBeInTheDocument();
+  // 缺失字段补默认值:版本号仍是 1.0.0,不是 undefined。
+  expect(screen.getByPlaceholderText("1.0.0")).toHaveValue("1.0.0");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  expect(screen.queryByText("已恢复上次未提交的草稿")).not.toBeInTheDocument();
 });
 
 beforeEach(() => {
@@ -232,6 +278,24 @@ function rejectedRow(over: Partial<MarketplaceMyPublish>): MarketplaceMyPublish 
   };
 }
 
+test("「我的发布」折叠态不落悬空 aria-controls,展开后 IDREF 解析到真实列表(t-762 market#2)", async () => {
+  listSkills.mockResolvedValue([]);
+
+  // 没有待办(审核中 / 未通过)时默认收起 —— 列表根本没挂载,IDREF 不能指向空气。
+  renderPanel(<PublishPanel auth={auth} publishes={[rejectedRow({ status: "approved" })]} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  const toggle = screen.getByRole("button", { name: /我的发布（1）/ });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  expect(toggle).not.toHaveAttribute("aria-controls");
+  expectAriaControlsResolvable();
+
+  fireEvent.click(toggle);
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(toggle).toHaveAttribute("aria-controls", "my-publishes-list");
+  expect(document.getElementById("my-publishes-list")).not.toBeNull();
+  expectAriaControlsResolvable();
+});
+
 test("技能:只改过版本号与标签,载入旧提交前也必须二次确认", async () => {
   listSkills.mockResolvedValue([]);
 
@@ -275,6 +339,41 @@ test("智能体:只改过工具集,载入旧提交前也必须二次确认", asy
   await waitFor(() =>
     expect(screen.getByRole("checkbox", { name: /浏览器/ })).toBeChecked(),
   );
+});
+
+test("K-27:智能体工具集勾选卡走 ui/Checkbox 原语;「必选」项已勾且禁用、不压暗", async () => {
+  listSkills.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue({
+    models: [{ id: "glm-5.2", displayName: "GLM" }],
+    lockedModels: [],
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  renderPanel(<PublishPanel auth={auth} publishes={[]} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  await screen.findByPlaceholderText("例：法律顾问");
+
+  const browser = screen.getByRole("checkbox", { name: /浏览器/ });
+  expect(browser).toHaveAttribute("data-ui", "checkbox");
+  expect(browser.className).not.toContain("accent-accent");
+  // 卡片式外观仍在调用方的 label 上:未勾 → 边框 + 次级字色;勾上 → 强调边框 + 浅底。
+  const card = browser.closest("label") as HTMLElement;
+  expect(card).toHaveClass("rounded-lg", "border", "text-muted");
+  fireEvent.click(browser);
+  expect(browser).toBeChecked();
+  expect(card).toHaveClass("bg-accent-soft", "text-fg");
+
+  // 「必选」工具集:已勾、禁用、带徽章,且不像不可用选项那样压暗。
+  const locked = screen.getAllByRole("checkbox").filter((b) => (b as HTMLInputElement).disabled);
+  expect(locked.length).toBeGreaterThan(0);
+  for (const box of locked) {
+    expect(box).toBeChecked();
+    expect(box).toHaveAttribute("data-ui", "checkbox");
+    const lockedCard = box.closest("label") as HTMLElement;
+    expect(lockedCard.className).toContain("opacity-100");
+    expect(lockedCard).toHaveTextContent("必选");
+  }
 });
 
 test("智能体:模型是系统自动选中的默认项,空白表单不该被当成「已填写」", async () => {
@@ -326,15 +425,19 @@ test("从我的技能导入:只填过一句话描述也必须先确认(导入会
   getSkill.mockResolvedValue({ body: "# 导入的正文", files: [] });
 
   render(<PublishPanel auth={auth} />);
-  await screen.findByRole("button", { name: "学术翻译" });
+  // 芯片显示的是展示名(描述首行),无障碍名再带上 slug 供核对(K-10)
+  const chip = await screen.findByRole("button", { name: "技能自带描述（学术翻译）" });
+  expect(chip).toHaveTextContent("技能自带描述");
 
   fireEvent.change(screen.getByPlaceholderText(/把中文学术论文翻译成地道英文/), {
     target: { value: "我自己写的描述" },
   });
 
-  fireEvent.click(screen.getByRole("button", { name: "学术翻译" }));
+  fireEvent.click(chip);
 
-  expect(await screen.findByText(/已填写的名称/)).toBeInTheDocument();
+  // 确认框里的名字与芯片一致,不再冒出用户没见过的 slug
+  expect(await screen.findByText("用「技能自带描述」覆盖当前内容？")).toBeInTheDocument();
+  expect(screen.getByText(/已填写的名称/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "取消" }));
   await waitFor(() =>
     expect(screen.getByPlaceholderText(/把中文学术论文翻译成地道英文/)).toHaveValue(
@@ -342,4 +445,47 @@ test("从我的技能导入:只填过一句话描述也必须先确认(导入会
     ),
   );
   expect(getSkill).not.toHaveBeenCalled();
+});
+
+test("导入芯片与管理中心同一套展示名:有描述用描述首行,没描述退回 slug(K-10)", async () => {
+  listSkills.mockResolvedValue([
+    { name: "ppt-master", description: "PPT 一键成稿\n第二行不算", writable: true },
+    { name: "sql-tuning", writable: true },
+  ]);
+
+  render(<PublishPanel auth={auth} />);
+  const ppt = await screen.findByRole("button", { name: "PPT 一键成稿（ppt-master）" });
+  expect(ppt).toHaveTextContent("PPT 一键成稿");
+  expect(ppt).not.toHaveTextContent("第二行不算");
+  // 没有描述的技能只能显示 slug,这时无障碍名就是 slug 本身,不重复
+  expect(screen.getByRole("button", { name: "sql-tuning" })).toHaveTextContent("sql-tuning");
+});
+
+test("底部操作条:缺项超过 3 项折成「还差 N 项必填 · 查看」,点开列全、可收起(K-21)", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+
+  render(<PublishPanel auth={auth} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+
+  // 空表单:6 项缺项 → 折叠,清单不直接铺开
+  const bar = screen.getByText(/还差 6 项必填/);
+  expect(bar).not.toHaveTextContent("显示名称");
+  const toggle = screen.getByRole("button", { name: "查看" });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  // 触控靶两边都要 ≥44:t-894 只补了高(38×44 仍被复扫命中),QA t-1232 补宽;「收起」同一副类(QA)。
+  expect(toggle).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
+  fireEvent.click(toggle);
+  expect(screen.getByText(/还差 6 项必填/)).toHaveTextContent(
+    "还差 6 项必填：显示名称、标识 slug、一句话描述、技能正文、分类、适用场景",
+  );
+  const collapse = screen.getByRole("button", { name: "收起" });
+  expect(collapse).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
+  fireEvent.click(collapse);
+  expect(screen.getByText(/还差 6 项必填/)).not.toHaveTextContent("显示名称");
+
+  // 填到只剩 3 项以内 → 直接全列,不再需要「查看」
+  fillBaseFields();
+  expect(screen.getByText(/还差 2 项必填/)).toHaveTextContent("还差 2 项必填：分类、适用场景");
+  expect(screen.queryByRole("button", { name: "查看" })).not.toBeInTheDocument();
 });

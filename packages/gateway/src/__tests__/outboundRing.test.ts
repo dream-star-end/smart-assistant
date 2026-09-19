@@ -292,14 +292,19 @@ describe('OutboundRingBuffer pruning', () => {
     assert.ok(r.bytes('s1') <= 80, `totalBytes should respect cap, got ${r.bytes('s1')}`)
   })
 
-  it('clear() drops both ring and lastSeq (enables fresh session)', () => {
+  it('clear() retires cached frames without reusing a wire sequence', () => {
     const r = new OutboundRingBuffer()
     const s = r.nextSeq('s1'); r.store('s1', s, 1000, frame(s))
     r.clear('s1')
     assert.equal(r.size('s1'), 0)
-    assert.equal(r.lastFrameSeq('s1'), 0)
-    // Post-clear, nextSeq starts from 1 again.
-    assert.equal(r.nextSeq('s1'), 1)
+    assert.equal(r.lastFrameSeq('s1'), s)
+    r.clear('s1') // destroy callbacks may clear the same session twice
+    const next = r.nextSeq('s1')
+    assert.equal(next, s + 1)
+    r.store('s1', next, Date.now(), frame(next))
+    const replay = r.peekReplay('s1', s)
+    assert.equal(replay.ok, true)
+    if (replay.ok) assert.deepEqual(replay.sent.map(f => f.seq), [next])
   })
 })
 

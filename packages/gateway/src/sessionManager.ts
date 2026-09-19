@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import {
+  resolveRuntimeExecutionAgent,
+  IdentityAssetsError,
+  type IdentityCompatRuntimeContext,
   type AgentDef,
   type OpenClaudeConfig,
   appendServerAuthoredMessageDurable,
@@ -106,6 +109,12 @@ import {
   type SessionWorkspaceMode,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
+import {
+  buildLateDelegateContinuationArgs,
+  isValidDelegateOwnerLocator,
+  lateDelegateGroupIdentity,
+  type DelegateOwnerTurnLocator,
+} from './delegateLateCompletion.js'
 import { classifyRunError } from './errorClassify.js'
 import type {
   GatewayEngineErrorEvent,
@@ -127,6 +136,11 @@ import {
   finalizeEfficiencyTurn,
   prepareEfficiencyTurnNote,
 } from './agentEfficiencyGuard.js'
+import {
+  advanceTransientBreaker,
+  formatTransientCircuitOpenError,
+  resolveTransientBreakerThreshold,
+} from './transientRetryCircuit.js'
 
 async function computeSessionContextFingerprint(
   projectId: string | null | undefined,
@@ -763,6 +777,14 @@ function scheduleSessionOutputAssetCollection(opts: {
 // 一个 sessionKey 对应一个 EngineAdapter(CCB = CcbAdapter 组合 SubprocessRunner)
 // + 一把 Mutex(同 session 串行)。跨 session 完全并行。
 export interface AgentSession {
+  /** In-memory execution identity only. Durable session/owner fields are untouched. */
+  _identityCreationOpts?: Omit<
+    Parameters<SessionManager['getOrCreate']>[0],
+    'promptQueueExecutionFence' | 'modelSwitchId'
+  >
+  _identityAgentFingerprint?: string
+  _identityCompat?: IdentityCompatRuntimeContext
+
   sessionKey: string
   agentId: string
   channel: string
@@ -827,15 +849,19 @@ export interface AgentSession {
    *
    * 委派跑在**独立子会话**,但 agent-group 卡属于**本(队长)会话/turn**:
    * handleDelegateTask 收尾时经 `bufferPendingAgentGroup` 按父 sessionKey 推入
-   * 这里(delegate_task 是队长工具调用,同步 await,故子委派完成必早于队长本
-   * turn 结束)。turn 收尾(persistServerAuthoredTurn 调用点)drain 本数组并清空,
+   * 这里。turn 收尾(persistServerAuthoredTurn 调用点)drain 本数组并清空,
    * 随同一 POST 下发给 master 落库为 role 'agent-group' 行。
+   *
+   * OCV5-180 B1 — 缓冲改为 exact-owner 准入:每条 entry 记录冻结的 owner
+   * turnKey(启动时定位);只有**仍处于打开状态的本 owner turn** 可入内存缓冲,
+   * owner turn 已 seal(drain 同步临界段封口)后一律走持久晚到通路
+   * (`deliverLateDelegateAgentGroup`),不再跨时段滞留内存数组。
    *
    * 只在 webchat 队长会话上累积(buffering 走 progressTarget,webchat-only,与
    * MASTER_SINK_PERSIST_CHANNELS 一致)。嵌套 delegate 的完整 transcript 先写入
    * 直接父 delegate 的 `_durableDelegateTranscript`,最终随一级团队卡一起入本缓冲。
    */
-  _pendingAgentGroups?: DurableAgentGroup[]
+  _pendingAgentGroups?: PendingAgentGroupEntry[]
   /** Turn-wide monotonic sequence shared by engine output and delegation cards. */
   _nextDurableEventOrdinal?: number
   /**
@@ -1064,10 +1090,15 @@ export interface AgentSession {
   /** 队长自主送审(2026-07-07)— 本 turn 是否为团队模式队长回合(dispatchInbound 每
    *  turn 刷新)。_runDelegateTask 的审查门读它:目标为隐藏审查员的委派仅在 true 时放行。 */
   _teamModeTurn?: boolean
+  /** Frozen collaboration mode for this inbound turn (main only). */
+  _collabModeTurn?: 'solo' | 'advisor' | 'team'
+  _advisorTurn?: { advisorModel: string; configVersion: string }
 
   /** 本 turn 入站用户文本的服务端权威快照(≤8000 字,dispatchInbound 每 turn 刷新)。
    *  审查任务书(buildTeamReviewContext)的"用户原始需求"取此,不采信模型自报。 */
   _currentTurnUserText?: string
+  /** Prefix actually prepended to this turn after stripping advisor tool preamble. */
+  _injectedTurnConstraints?: string
   /** 本 turn 的 master canonical traceId(submit 每 turn 刷新,含 undefined 清除残留)。
    *  市场使用信号(skillUsageReporter)在 tool.called(hub skill_view)派发时经
    *  SessionManager.getByKey 同步读取,作为评分归因键。单一铸造权威在 master,此处只
@@ -1076,6 +1107,20 @@ export interface AgentSession {
   _currentTurnTraceId?: string
   /** Stable logical turn key used by lossless persistence and cost joins. */
   _currentTurnKey?: string
+  /** Turn index of the turn that owns `_currentTurnKey` (seeded together at
+   * turn start). OCV5-180 B1 — exact-owner delegate cards freeze this so a
+   * late completion lands as a continuation of the same turn number. */
+  _currentTurnIndex?: number
+  /** OCV5-180 B1 — owner turns whose turn-end payload is already frozen
+   * (drain ran in the same synchronous critical section). A delegate group
+   * arriving after its owner key is sealed must go to the persistent late
+   * path, never back into `_pendingAgentGroups`. Bounded LRU. */
+  _sealedOwnerTurnKeys?: Map<string, number>
+  /** OCV5-180 B1 — runId → identity for groups that already rode the root
+   * tape (acked/queued drain). Lives on the owner session next to the sealed
+   * turn keys so FIFO eviction of `_exactOwnerRuns` cannot forget a frozen
+   * root payload. Bounded by the sealed-turn cap. */
+  _ackedExactOwnerRuns?: Map<string, Map<string, string>>
   /** Browser user-row id bound to the submit that currently owns session.lock.
    * Unlike _activeTurnCount, this never describes queued submits. */
   _runningClientMessageId?: string
@@ -1110,6 +1155,17 @@ export interface AgentSession {
 
 /** RFC-v5-durable-turn-dispatch §4 — recent-terminal ring 容量。 */
 const RECENT_TERMINAL_RING_CAP = 8
+
+/** OCV5-180 B1 — `_pendingAgentGroups` 元素:完成的团队卡 + 冻结的 exact
+ * owner turnKey(launch 时定位)。ownerTurnKey 缺省 = 旧调用方语义(随当前
+ * turn drain,不参与 seal 判定),仅存量测试路径使用。 */
+interface PendingAgentGroupEntry {
+  group: DurableAgentGroup
+  ownerTurnKey?: string
+}
+
+/** OCV5-180 B1 — `_sealedOwnerTurnKeys` 有界 LRU 容量。 */
+const SEALED_OWNER_TURN_KEYS_CAP = 32
 
 /**
  * 把一次客户 turn 的终态记入 per-session recent-terminal ring(endClientTurn 调用)。
@@ -1174,6 +1230,13 @@ function combineRetryAssistantOutput(
 }
 
 const TRANSIENT_RETRY_ERROR_CODES = new Set(['rate_limited', 'model_capacity', 'upstream_failed'])
+
+export {
+  TRANSIENT_SAME_CLASS_BREAKER,
+  advanceTransientBreaker,
+  formatTransientCircuitOpenError,
+  resolveTransientBreakerThreshold,
+} from './transientRetryCircuit.js'
 
 /** E12 — 瞬时错误自动重试的续跑输入。裸「继续」会让模型丢失重试语境(可能被
  *  理解成用户新指令);这里显式附带原始意图:上一轮因上游瞬时错误被打断,应
@@ -1249,6 +1312,17 @@ export interface CronBridgeEvent {
  *                四态下 fold 对 skipped **转发 + 更新 hash(保去重)但不计预算**(没写东西
  *                不占 cap),与"没落盘不消耗预算"语义一致。仅 legacy 分支产生。 */
 type TapePersistResult = 'acked' | 'queued' | 'dropped' | 'skipped'
+
+/** OCV5-180 B1 — shared exact-owner logical-run record. `inflight` is not
+ * durable: a dropped (non-queued) persist must delete it so the same frozen
+ * payload can retry. `queued`/`acked` are durable; `session_deleted` is
+ * terminal and must not resurrect. */
+type ExactOwnerRunState = 'buffered' | 'inflight' | 'queued' | 'acked' | 'session_deleted'
+
+interface ExactOwnerRunRecord {
+  identity: string
+  state: ExactOwnerRunState
+}
 
 /**
  * Persist the authoritative server-authored assistant text for a turn.
@@ -1397,6 +1471,8 @@ function persistServerAuthoredTurnOutcome(args: {
    * co-located with the immutable turn tape so a bridge disconnect or
    * bounded outbound-ring eviction cannot erase the only settle evidence. */
   engineBilling?: EngineBillingEvent
+  /** OCV5-180 B1 — fatal drop reason (stageDurable throw / 410 session_deleted). */
+  onDroppedReason?: (reason: string) => void
 }): Promise<TapePersistResult> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -1476,6 +1552,7 @@ function persistServerAuthoredTurnOutcome(args: {
           status: args.status,
           reason: outcome.droppedReason,
         })
+        args.onDroppedReason?.(outcome.droppedReason)
         return 'dropped'
       })
       .catch((err): TapePersistResult => {
@@ -1491,6 +1568,7 @@ function persistServerAuthoredTurnOutcome(args: {
           },
           err,
         )
+        args.onDroppedReason?.(err instanceof Error ? err.message : String(err))
         return 'dropped'
       })
   }
@@ -1715,6 +1793,34 @@ function persistPostTerminalRuntimeEvents(args: {
   })
 }
 
+/** OCV5-180 B1 — 把一张晚到的委派团队卡持久化为 owner turn 的受限
+ * continuation tape(agentGroups-only 分支)。tape key 由 (ownerTurnKey, runId)
+ * 推导:同一逻辑 run 永远命中同一 tape(master finalize 幂等 / 异内容 409);
+ * root 暂不可达由 v3 sink 的 fsynced 重试队列表达('queued' ≠ 丢弃),不落纯内存 bucket。 */
+function persistPostTerminalAgentGroup(args: {
+  sessionKey: string
+  owner: DelegateOwnerTurnLocator
+  group: DurableAgentGroup
+  onDroppedReason?: (reason: string) => void
+}): Promise<TapePersistResult> {
+  return persistServerAuthoredTurnOutcome({
+    ...buildLateDelegateContinuationArgs({
+      owner: args.owner,
+      group: args.group,
+      sessionKey: args.sessionKey,
+    }),
+    onDroppedReason: args.onDroppedReason,
+  }).catch((err): TapePersistResult => {
+    log.error(
+      'post-terminal agent-group persist threw',
+      { sessionKey: args.sessionKey, runId: args.group.runId },
+      err as Error,
+    )
+    args.onDroppedReason?.(err instanceof Error ? err.message : String(err))
+    return 'dropped'
+  })
+}
+
 /** A1 — 单条待折叠/持久化的 post-terminal bash_output_tail。归属值(ownerTurnKey/
  *  ownerSessionId/turnIndex/onEvent)由发起 turn 的闭包捕获传入;因 tool_use_id 是
  *  流键的一部分、且一个 tool_use_id 只归一个 turn,同一 stream key 的这些值恒定。 */
@@ -1868,6 +1974,11 @@ export interface PromptQueueExecutionFence {
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
+  /** OCV5-180 B1 — `${ownerTurnKey}\0${runId}` → exact-owner logical-run
+   *  状态(buffer / drain-seal / late 共用)。同内容唯一、异内容冲突可见;
+   *  inflight 不是 durable。有界 LRU 只淘汰已完成(acked/queued/session_deleted);
+   *  buffered/inflight 以活 owner bucket / 冻结 payload 为权威,不可 FIFO 丢弃。 */
+  private _exactOwnerRuns = new Map<string, ExactOwnerRunRecord>()
   /** Per-sessionKey mutex around getOrCreate so two concurrent turns cannot
    *  each replace the runner and --resume the same Cursor SQLite store. */
   private _sessionCreateGates = new Map<string, Promise<void>>()
@@ -2883,6 +2994,7 @@ export class SessionManager {
     })
     session.turns = turnIndex - 1
     session._currentTurnKey = turnKey
+    session._currentTurnIndex = turnIndex
     await queueLifecycle.onTurnReserved({
       turnIndex,
       turnKey,
@@ -2964,6 +3076,7 @@ export class SessionManager {
           session._runningClientMessageId = undefined
         }
         session._currentTurnKey = undefined
+        session._currentTurnIndex = undefined
         this.endClientTurn(session, outcome)
         if (queueTurn) {
           this._promptQueueExecutions.delete(session)
@@ -3658,6 +3771,8 @@ export class SessionManager {
     skillEvalDraft?: { name: string; dir: string }
     /** V5 Auto-Dream one-shot isolation profile (CCB only). */
     hermeticNoTools?: boolean
+    /** Frozen CCB advisor model/provider/profile; last catalog ticket must match. */
+    advisorExecutionLock?: import('./advisorMode.js').AdvisorConsultExecution
     /** Static CCB --json-schema contract for one-shot structured output. */
     structuredOutputSchema?: Readonly<Record<string, unknown>>
     /** delegate 子会话计费归因(仅 handleDelegateTask 设置)→ runner
@@ -3704,6 +3819,17 @@ export class SessionManager {
     ) {
       throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session')
     }
+    // Identity construction outlives an individual dispatch/switch. Never retain
+    // their one-use admission credentials in the reusable session template.
+    const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId, ...identityCreationOpts } = opts
+    // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
+    // Fetching marketplace identity here would fail-closed the no-tools path
+    // whenever master sync is briefly unavailable.
+    const identity = opts.hermeticNoTools
+      ? { agent: opts.agent, context: {} }
+      : await resolveRuntimeExecutionAgent(opts.agent)
+    opts = { ...opts, agent: identity.agent }
+    const identityAgentFingerprint = identity.context.assets ? JSON.stringify(opts.agent) : undefined
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
@@ -3730,6 +3856,13 @@ export class SessionManager {
     const engineId = resolveEngine(executionModel, opts.agent, opts.executionAuthority, {
       requireAuthority: isModelAuthorityRequired(),
     })
+    // CCB consumes --permission-mode. The other current engine adapters run
+    // fixed full-auto/force and cannot truthfully enforce a narrower profile.
+    if (identity.context.assets && engineId !== 'ccb' &&
+      identity.context.assets.effectivePermissionMode !== undefined &&
+      identity.context.assets.effectivePermissionMode !== 'bypassPermissions') {
+      throw new IdentityAssetsError('COMPAT_PERMISSION_CONFLICT', 'COMPAT_PERMISSION_CONFLICT: selected engine cannot enforce the registered permission mode')
+    }
     let existing = this.sessions.get(opts.sessionKey)
     if (existing?._modelSwitchTransition) {
       const transition = existing._modelSwitchTransition
@@ -3761,6 +3894,8 @@ export class SessionManager {
     let contextRebuildNotice: AgentSession['_contextRebuildNotice'] =
       previousEngine && previousEngine !== engineId ? 'engine-switch' : undefined
     const workspaceMode = opts.workspaceMode ?? existing?.workspaceMode ?? 'legacy'
+    let identityRefreshSession: AgentSession | undefined
+    try {
     if (existing) {
       // 跨 engine 切换判定:只有"caller 明确给了 model"/"有 master 权威"/"agent 显式 pin
       // 到 codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见 opts.model
@@ -3791,6 +3926,8 @@ export class SessionManager {
       // prompt slots. Replacing the runner for that would drop Cursor's live
       // native session and force a visible history replay on ordinary follow-ups.
       if (
+        existing.agentId !== opts.agent.id ||
+        existing._identityAgentFingerprint !== identityAgentFingerprint ||
         existing.providerTag !== desiredEngine ||
         cursorTransportChanged ||
         workspaceModeChanged ||
@@ -3827,6 +3964,8 @@ export class SessionManager {
                 ? engineId
                 : canonical.providerTag
             const stillNeedsReplace =
+              canonical.agentId !== opts.agent.id ||
+              canonical._identityAgentFingerprint !== identityAgentFingerprint ||
               canonical.providerTag !== desiredEngineNow ||
               Boolean(
                 (opts.model !== undefined || opts.executionAuthority !== undefined) &&
@@ -3848,11 +3987,26 @@ export class SessionManager {
               if (opts.projectId !== undefined) canonical.projectId = opts.projectId
               if (nextFingerprint) canonical.contextFingerprint = nextFingerprint
               if (opts.runContext) canonical.runContext = opts.runContext
+              canonical._identityCreationOpts = identityCreationOpts
               return canonical
             }
             existing = canonical
             existing._replacing = true
           }
+          // Identity-only runner refresh keeps the logical owner held by
+          // begin/endClientTurn and B1; general engine/workspace switches don't.
+          if (
+            identity.context.assets && existing._identityCompat?.assets &&
+            JSON.stringify(identity.context.assets.profile) ===
+              JSON.stringify(existing._identityCompat.assets.profile) &&
+            existing.agentId === opts.agent.id &&
+            existing._identityAgentFingerprint !== identityAgentFingerprint &&
+            existing.providerTag === engineId && existing.model === executionModel &&
+            !cursorTransportChanged && !workspaceModeChanged && !workspaceCwdChanged &&
+            !projectIdChanged &&
+            existing.workspaceCwd === (opts.workspaceCwd ?? opts.agent.cwd ??
+              resolveDefaultWorkspaceCwd(workspaceMode, opts.repoSessionId ?? opts.peerId))
+          ) identityRefreshSession = existing
           try {
             const legacyId = this._resumeMap.get(opts.sessionKey)
             const ids =
@@ -3887,6 +4041,7 @@ export class SessionManager {
           }
           await existing.runner.shutdown()
         } catch (err) {
+          if (identityRefreshSession) throw err
           log.warn(
             'session-replacement shutdown failed',
             {
@@ -3897,7 +4052,7 @@ export class SessionManager {
             err,
           )
         }
-        if (this.sessions.get(opts.sessionKey) === existing) {
+        if (!identityRefreshSession && this.sessions.get(opts.sessionKey) === existing) {
           this.sessions.delete(opts.sessionKey)
         }
       } else {
@@ -3916,6 +4071,7 @@ export class SessionManager {
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
         if (nextFingerprint) existing.contextFingerprint = nextFingerprint
         if (opts.runContext) existing.runContext = opts.runContext
+        existing._identityCreationOpts = identityCreationOpts
         return existing
       }
     }
@@ -3951,8 +4107,11 @@ export class SessionManager {
       agentBaseDir: cwd,
       config: this.config,
       persona,
+      identityCompat: opts.hermeticNoTools ? undefined : identity.context,
       model: executionModel,
-      permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
+      permissionMode: identity.context.assets
+        ? identity.context.assets.effectivePermissionMode
+        : opts.agent.permissionMode ?? this.config.defaults.permissionMode,
       agentProvider: opts.agent.provider,
       agentMcpServers: opts.agent.mcpServers,
       agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
@@ -3988,6 +4147,7 @@ export class SessionManager {
       skillEvalDraft: opts.skillEvalDraft,
       usageAttribution: opts.usageAttribution,
       hermeticNoTools: opts.hermeticNoTools,
+      advisorExecutionLock: opts.advisorExecutionLock,
       structuredOutputSchema: opts.structuredOutputSchema,
     })
     const resumeTransportMismatch =
@@ -3997,7 +4157,10 @@ export class SessionManager {
         Boolean(runner.isResumeIdCompatible && !runner.isResumeIdCompatible(mappedResumeId)))
     if (resumeTransportMismatch) contextRebuildNotice = 'native-resume-loss'
     const now = Date.now()
-    const session: AgentSession = {
+    const session: AgentSession = identityRefreshSession ?? {
+      _identityAgentFingerprint: identityAgentFingerprint,
+      _identityCreationOpts: identityCreationOpts,
+      _identityCompat: opts.hermeticNoTools ? undefined : identity.context,
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,
       channel: opts.channel ?? 'webchat',
@@ -4058,6 +4221,23 @@ export class SessionManager {
       _contextRebuildNotice: contextRebuildNotice,
       _forceHistoricalContextOnFirstTurn: resumeTransportMismatch || undefined,
     }
+    if (identityRefreshSession) {
+      // Publish only after construction succeeds; never overwrite counters,
+      // lock, owner evidence or cumulative state with fresh-session defaults.
+      session.runner = runner
+      session._identityAgentFingerprint = identityAgentFingerprint
+      session._identityCreationOpts = identityCreationOpts
+      session._identityCompat = identity.context
+      session.agentProvider = opts.agent.provider
+      session._contextRebuildNotice = contextRebuildNotice
+      session._forceHistoricalContextOnFirstTurn = resumeTransportMismatch || undefined
+      // These markers describe a runner's native context, not the logical
+      // owner. Let the existing resume/history gate evaluate the new runner:
+      // a valid native resume still skips replay; a cold runner gets history.
+      session._historicalContextInjected = false
+      session._historicalContextInjectedKey = undefined
+      session.lastUsedAt = now
+    }
     runner.on(
       'task_notification',
       (payload: {
@@ -4067,6 +4247,7 @@ export class SessionManager {
         summary: string
         toolUseId?: string
       }) => {
+        if (session.runner !== runner) return
         this.onCcbTaskNotification?.(session, payload)
       },
     )
@@ -4076,10 +4257,12 @@ export class SessionManager {
         taskId: string
         deliveredBy: 'ccb-mid-turn'
       }) => {
+        if (session.runner !== runner) return
         this.onCcbTaskNotificationDelivered?.(session, payload)
       },
     )
     runner.on('session_id', (id: string) => {
+      if (session.runner !== runner) return
       // Durable-artifact ladder: when the engine mints a NEW id for this
       // session (fresh spawn after the previous id failed to resume, codex
       // missing-rollout self-heal, cursor sand re-spawn…), keep the previous
@@ -4139,12 +4322,14 @@ export class SessionManager {
     //     a stricter fix would require CCB to persist STATE.totalCostUSD on
     //     every turn, not only at exit.
     runner.on('spawn', (info: { resumed: boolean }) => {
+      if (session.runner !== runner) return
       if (!info.resumed) {
         session._lastCcbCumulativeCost = 0
       }
     })
     // Monitor subprocess crashes — emit event so gateway can notify connected clients
     runner.on('exit', (info: { code: number | null; signal: string | null; crashed: boolean }) => {
+      if (session.runner !== runner) return
       // 子进程退出 → 清空 turn_status 缓存。crashed/正常 exit 都清:正常 exit
       // 意味着没有 in-flight turn(也就不会还有 compacting);crashed 期间如果
       // 恰好在 compact 中,这帧 cache 没有 turn_status:null 来源(子进程死了
@@ -4219,6 +4404,9 @@ export class SessionManager {
       this._sessionIdToKey.set(opts.peerId, opts.sessionKey)
     }
     return session
+    } finally {
+      if (identityRefreshSession) identityRefreshSession._replacing = false
+    }
   }
 
   async prepareModelSwitch(
@@ -4515,6 +4703,22 @@ export class SessionManager {
       modelSwitchInternal?: string
     },
   ): Promise<void> {
+    // Resolve/rebuild a warm legacy runner under the existing creation gate,
+    // before taking the per-turn lock. Never change its durable session key.
+    // prepareModelSwitch owns this runner while performing native compaction.
+    // It must not re-enter the creation gate that rejects concurrent switches;
+    // the existing queue ownership and locked fresh-identity gates still apply.
+    const preparingSwitchCompact =
+      session._modelSwitchTransition?.state === 'preparing' &&
+      opts?.modelSwitchInternal === session._modelSwitchTransition.id
+    if (session._identityCreationOpts && !preparingSwitchCompact) {
+      session = await this.getOrCreate({
+        ...session._identityCreationOpts,
+        ...(model ? { model } : {}),
+        modelSwitchId: opts?.modelSwitchId,
+        promptQueueExecutionFence: opts?.queueExecutionFence,
+      })
+    }
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
     // Commercial PG is the only authoritative history. Never execute a paid
     // turn when the lossless container→master sink failed to initialize: the
@@ -4668,6 +4872,35 @@ export class SessionManager {
         ) {
           return
         }
+      }
+      // Every execution, including direct warm submits, explicit models, cron
+      // and delegates, crosses this fresh authority gate AFTER its predecessor.
+      // A successful getOrCreate/display sync is not permission for this turn.
+      // Hermetic advisor/Auto-Dream sessions skip marketplace identity the same
+      // way getOrCreate does — fetching it here would fail-closed the no-tools path.
+      const hermeticNoTools = session._identityCreationOpts?.hermeticNoTools === true
+      const admission = hermeticNoTools
+        ? { agent: session._identityCreationOpts?.agent ?? { id: session.agentId }, context: {} }
+        : await resolveRuntimeExecutionAgent(
+            session._identityCreationOpts?.agent ?? { id: session.agentId },
+          )
+      if (admission.agent.id !== session.agentId) {
+        throw new Error('COMPAT_CONFIG_CONFLICT: runner identity changed; reopen this session')
+      }
+      if (admission.context.assets && session.providerTag !== 'ccb' &&
+        admission.context.assets.effectivePermissionMode !== undefined &&
+        admission.context.assets.effectivePermissionMode !== 'bypassPermissions') {
+        throw new IdentityAssetsError('COMPAT_PERMISSION_CONFLICT', 'COMPAT_PERMISSION_CONFLICT: selected engine cannot enforce the registered permission mode')
+      }
+      if (admission.context.assets && session._identityAgentFingerprint !== JSON.stringify(admission.agent)) {
+        throw new Error('COMPAT_CONFIG_CONFLICT: execution configuration changed while awaiting the safe turn boundary; retry')
+      }
+      if (session._identityCompat) {
+        const changed = session._identityCompat.fingerprint !== admission.context.fingerprint
+        Object.assign(session._identityCompat, { assets: undefined, fingerprint: undefined }, admission.context)
+        if (changed) await session.runner.shutdown() // native id is deliberately retained
+      } else if (admission.context.assets && session.channel !== 'auto-dream') {
+        throw new Error('COMPAT_CONFIG_CONFLICT: runner has no validated identity context')
       }
       // Browser Stop must own the complete logical turn, including the gap
       // between engine attempts while an automatic retry is backing off.
@@ -5322,6 +5555,7 @@ export class SessionManager {
           }
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined
+          session._currentTurnIndex = undefined
           session._currentDispatch = undefined
           session._turnCreditBudgetFen = undefined
           if (queueTurn) {
@@ -5447,6 +5681,7 @@ export class SessionManager {
       text: '',
     })
     session._currentTurnKey = turnKey
+    session._currentTurnIndex = projectedTurnIndex
     session._nextDurableEventOrdinal = 0
     // RFC-v5-durable-turn-dispatch §3 — durable inbox: queued → running,同事务落
     // finalize 元数据(agent_id/turn_index/turn_key/request_id/created_at),**先于
@@ -5672,6 +5907,25 @@ export class SessionManager {
           TRANSIENT_RETRY_ERROR_CODES.has(errorClass) ||
           /AbortError|operation was aborted|timed?\s*out/i.test(msg)
         if (!isTransient || !canRetry()) throw err
+        if (TRANSIENT_RETRY_ERROR_CODES.has(errorClass)) {
+          const breaker = advanceTransientBreaker(
+            retryState,
+            errorClass,
+            resolveTransientBreakerThreshold(),
+          )
+          if (breaker.open) {
+            log.warn('transient retry circuit open', {
+              sessionKey: session.sessionKey,
+              errorClass,
+              consecutive: breaker.consecutive,
+              attempt: retryState.attempt,
+              ...(traceId ? { traceId } : {}),
+            })
+            throw new Error(formatTransientCircuitOpenError(errorClass, breaker.consecutive), {
+              cause: err,
+            })
+          }
+        }
         const delay = this._transientRetryDelayMs(retryState.attempt)
         log.warn('transient error, retrying', {
           sessionKey: session.sessionKey,
@@ -6327,7 +6581,9 @@ export class SessionManager {
             thinkingSegments: [],
             runtimeEvents: [],
           }
-          const partialAgentGroups = this.drainPendingAgentGroups(session)
+          // OCV5-180 B1 — terminal partial persist 也是 payload 冻结点:exact-owner
+          // drain + 同步 seal(与 completed 路径同一封口语义)。
+          const partialAgentGroups = this.drainPendingAgentGroups(session, turnKey)
           retainTerminalError(status, reason, errorCode)
           const terminalRuntimeEvents = [
             ...retryRuntimeEvents.map((event) => structuredClone(event)),
@@ -6411,6 +6667,7 @@ export class SessionManager {
                   ? { engineBilling: terminalEngineBilling }
                   : {}),
               })
+              if (turnKey) this._settleDrainedOwnerGroups(session, turnKey, partialAgentGroups, partialOutcome)
               persistenceAcknowledged = partialOutcome === 'acked' || partialOutcome === 'skipped'
               // 同 finalizeTurn 主路径:降级投递仅限个人版本地 outbox;商用 v3
               // sink 的 queued 保持静默(master ACK 权威,契约测试锁此语义)。
@@ -7036,7 +7293,7 @@ export class SessionManager {
             Promise.all([
               upsertSessionMeta({
                 id: sessId,
-                agentId: session.agentId,
+                agentId: session.sessionKey.startsWith('agent:') ? session.sessionKey.split(':')[1] : session.agentId,
                 channel: session.channel,
                 peerId: session.peerId,
                 title: session.title,
@@ -7088,13 +7345,15 @@ export class SessionManager {
           // also non-empty — losing the durability fix in the rare case.
           const completedHasTools = completedTools.length > 0
           // P2 债A — drain the leader session's buffered team cards. Drained
-          // unconditionally (take-and-clear) so a completed turn never leaks
+          // unconditionally (exact-owner take) so a completed turn never leaks
           // its delegations into the next turn's persist, even if the persist
           // gate below is false (non-persisting channel). Added to the gate so
           // a delegation-only turn (leader produced no text/thinking/tools —
           // Agent tool is excluded from tools[] by ccbMessageParser) still
           // persists its team cards.
-          const completedAgentGroups = this.drainPendingAgentGroups(session)
+          // OCV5-180 B1 — turnKey = 本 turn 的 exact owner;drain 同步 seal 该
+          // owner(payload 即将冻结),seal 后到达的晚到卡改走持久 continuation。
+          const completedAgentGroups = this.drainPendingAgentGroups(session, turnKey)
           const completedHasAgentGroups = completedAgentGroups.length > 0
           const completedHasStructuredBlocks = completedStructuredBlocks.length > 0
           const completedRuntimeEvents = [
@@ -7235,6 +7494,9 @@ export class SessionManager {
                 : {}),
             })
             const persistence = persistenceOutcome.then((r) => r === 'acked' || r === 'skipped')
+            this._trackPersistence(persistenceOutcome.then((r) => {
+              if (turnKey) this._settleDrainedOwnerGroups(session, turnKey, completedAgentGroups, r)
+            }))
             this._trackPersistence(persistence)
             // Do not declare the paid turn complete until master has
             // durably finalized the immutable tape. A queued local spool is
@@ -7456,6 +7718,14 @@ export class SessionManager {
         nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
         onPostTerminalRuntimeEvent,
         collabAgentPolicy,
+        ...(session._collabModeTurn === 'advisor' && session._advisorTurn && turnKey
+          ? {
+              consultTurn: {
+                configVersion: session._advisorTurn.configVersion,
+                turnIndex: prevTurns + 1,
+              },
+            }
+          : {}),
         automaticRetryState,
         ...(session._usageAttribution ? { usageAttribution: session._usageAttribution } : {}),
         ...(session._turnCreditBudgetFen !== undefined
@@ -7527,34 +7797,381 @@ export class SessionManager {
    * so it drains into that session's turn-end server-authored persist.
    *
    * Called from `handleDelegateTask` collection at delegate完成/失败/超时 收尾,
-   * keyed by the parent (leader) sessionKey. Returns false when the parent
-   * session isn't live (raced away, or a non-webchat parent that the caller
-   * shouldn't have targeted) — the caller degrades to client-only team cards
-   * (no regression) in that case.
+   * keyed by the parent (leader) sessionKey.
+   *
+   * OCV5-180 B1 — exact-owner admission:带 `owner`(launch 时冻结的
+   * {parentSessionId,parentTurnKey,turnIndex})时,只有「parent 的当前 turn 仍是
+   * 该 owner turn 且该 turn 未被 seal」才接受入内存缓冲;否则返回 false,由调用方
+   * 走 `deliverLateDelegateAgentGroup` 持久晚到通路。不带 owner 保持旧语义
+   * (存量测试/旧调用方)。父会话不在内存同样返回 false —— 调用方凭冻结 locator
+   * 仍可持久化晚到卡,不再退化为 client-only 丢失。
    *
    * Array.push is safe under concurrent parallel delegations (single-threaded
-   * event loop, no torn writes). The buffer is drained + cleared at turn-end
-   * (`persistServerAuthoredTurn` call sites); it only accumulates within the
-   * leader turn a delegation belongs to.
+   * event loop, no torn writes).
    */
-  bufferPendingAgentGroup(parentSessionKey: string, group: DurableAgentGroup): boolean {
+  bufferPendingAgentGroup(
+    parentSessionKey: string,
+    group: DurableAgentGroup,
+    owner?: DelegateOwnerTurnLocator,
+  ): boolean {
     const parent = this.sessions.get(parentSessionKey)
     if (!parent) return false
+    if (owner) {
+      if (!isValidDelegateOwnerLocator(owner)) return false
+      if (parent.peerId !== owner.parentSessionId) return false
+      if (parent._currentTurnKey !== owner.parentTurnKey) return false
+      if (parent._sealedOwnerTurnKeys?.has(owner.parentTurnKey)) return false
+      const live = this._matchLiveOwnerRun(parent, owner, group)
+      if (live === 'conflict' || live === 'session_deleted') return false
+      if (live === 'duplicate') return true
+      const admission = this._admitExactOwnerRun(owner, group, 'buffered')
+      if (admission === 'conflict' || admission === 'session_deleted') return false
+      if (admission === 'duplicate') return true
+    }
+    // OCV5-189 diagnostics only: exact-owner requests for an earlier/sealed
+    // turn were already rejected above and the caller takes the durable late
+    // path. Legacy ownerless or anomalous billings may still reach this point;
+    // logging must not change admission, queue ownership or drain semantics.
+    const currentTurnKey = parent._currentTurnKey
+    const crossTurn = (group.engineBillings ?? []).filter(
+      (billing) => typeof billing.parentTurnKey === 'string' && billing.parentTurnKey !== currentTurnKey,
+    )
+    if (currentTurnKey && crossTurn.length > 0) {
+      log.warn('delegate team card drains into a later turn than its billing parent', {
+        parentSessionKey,
+        runId: group.runId,
+        agentId: group.agentId,
+        currentTurnKey,
+        billingParentTurnKeys: [...new Set(crossTurn.map((billing) => billing.parentTurnKey))],
+        requestIds: crossTurn.map((billing) => billing.requestId),
+      })
+    }
     ;(parent._pendingAgentGroups ??= []).push({
-      ...group,
-      _ocEventOrdinal: group._ocEventOrdinal ?? takeDurableEventOrdinal(parent),
+      group: {
+        ...group,
+        _ocEventOrdinal: group._ocEventOrdinal ?? takeDurableEventOrdinal(parent),
+      },
+      ownerTurnKey: owner?.parentTurnKey,
     })
     return true
   }
 
-  /** P2 债A — take-and-clear the leader session's buffered team cards for the
-   *  turn-end persist. Returns [] when empty. Clearing here prevents a turn's
-   *  delegations from leaking into the next turn's persist. */
-  drainPendingAgentGroups(session: AgentSession): DurableAgentGroup[] {
+  /** P2 债A — take the leader session's buffered team cards for the turn-end
+   *  persist. Returns [] when empty.
+   *
+   * OCV5-180 B1 — 带 `turnKey`(终态冻结点:completed persist 或 terminal
+   * partial persist,两处均在同一同步临界段内冻结 payload)时:
+   *  1. 只取 ownerTurnKey 匹配本 turn(或无 owner 的旧条目)的卡 —— 其他
+   *     turn 的晚到卡绝不再混入本 turn 的 tape(历史 65 条坏 tape 的根因);
+   *  2. 同步把该 turn 记入 `_sealedOwnerTurnKeys`(B-R2-1:封口判据 = payload
+   *     已冻结,不是 master ACK/finalized)。此后同 owner 的完成只能走持久
+   *     晚到通路。不带 turnKey 保持旧 take-and-clear 语义(存量测试)。 */
+  drainPendingAgentGroups(session: AgentSession, turnKey?: string): DurableAgentGroup[] {
     const pending = session._pendingAgentGroups
+    if (turnKey === undefined) {
+      if (!pending || pending.length === 0) return []
+      session._pendingAgentGroups = undefined
+      return pending.map((entry) => entry.group)
+    }
+    // Exact-owner drain: seal the turn **even when nothing was buffered** —
+    // the turn-end payload freeze happens regardless, so a late completion
+    // for this owner must never enter the in-memory buffer afterwards.
+    this._sealOwnerTurn(session, turnKey)
     if (!pending || pending.length === 0) return []
-    session._pendingAgentGroups = undefined
-    return pending
+    const take: DurableAgentGroup[] = []
+    const keep: PendingAgentGroupEntry[] = []
+    const takenRuns = new Set<string>()
+    for (const entry of pending) {
+      if (entry.ownerTurnKey === undefined || entry.ownerTurnKey === turnKey) {
+        if (takenRuns.has(entry.group.runId)) continue
+        takenRuns.add(entry.group.runId)
+        take.push(entry.group)
+      } else keep.push(entry)
+    }
+    session._pendingAgentGroups = keep.length > 0 ? keep : undefined
+    if (take.length > 0) {
+      this._claimDrainedOwnerGroups(session, turnKey, take)
+    }
+    return take
+  }
+
+  /** OCV5-180 B1 — 把 owner turn 已 seal 后到达(或 owner 会话已不在内存)的
+   * 委派团队卡,作为受限 continuation tape 持久化到原 owner 名下。
+   *
+   * 幂等/冲突契约:同一 (ownerTurnKey, runId) 首次写入登记 identity;
+   *  - 同 identity 重投(如 durable 重放)→ no-op(确定性 tape 本就幂等);
+   *  - 不同内容同 run → 记 `late_delegate_group_conflict`(可观察),保留首卡,
+   *    不再生成第二张卡。返回 false 仅表示「未调度新写」(invalid locator /
+   *    冲突抑制),不含 sink 排队('queued' 是可靠等待,由 sink drainer 送达)。 */
+  deliverLateDelegateAgentGroup(args: {
+    owner: DelegateOwnerTurnLocator
+    group: DurableAgentGroup
+    sessionKey?: string
+  }): boolean {
+    if (!isValidDelegateOwnerLocator(args.owner)) {
+      log.warn('late delegate group dropped: invalid owner locator', {
+        runId: args.group.runId,
+      })
+      return false
+    }
+    if (args.sessionKey) {
+      const live = this.sessions.get(args.sessionKey)
+      if (live && live.peerId !== args.owner.parentSessionId) {
+        log.warn('late delegate group dropped: session/peer mismatch', {
+          runId: args.group.runId,
+          ownerSessionId: args.owner.parentSessionId,
+        })
+        return false
+      }
+    }
+    const conflictKey = this._exactOwnerRunKey(args.owner.parentTurnKey, args.group.runId)
+    const live = this._matchLiveSessionsOwnerRun(args.owner, args.group, args.sessionKey)
+    if (live === 'conflict') {
+      log.warn('late_delegate_group_conflict: same run with different content', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      })
+      return false
+    }
+    if (live === 'session_deleted') {
+      log.warn('late delegate group dropped: session_deleted', {
+        runId: args.group.runId,
+      })
+      return false
+    }
+    if (live === 'duplicate') return true
+    const admission = this._admitExactOwnerRun(args.owner, args.group, 'inflight')
+    if (admission === 'conflict') {
+      log.warn('late_delegate_group_conflict: same run with different content', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      })
+      return false
+    }
+    if (admission === 'session_deleted') {
+      log.warn('late delegate group dropped: session_deleted', {
+        runId: args.group.runId,
+      })
+      return false
+    }
+    if (admission === 'duplicate') {
+      const seen = this._exactOwnerRuns.get(conflictKey)
+      if (seen?.state === 'inflight' || seen?.state === 'queued' || seen?.state === 'acked' || seen?.state === 'buffered') {
+        return true
+      }
+      return true
+    }
+    let droppedReason = ''
+    // No pre-stage local lookup: master owns cross-root idempotency. The
+    // async wrapper also captures a synchronous managed-sink rejection;
+    // register its complete outcome chain before returning to shutdown.
+    const persistence = (async () => persistPostTerminalAgentGroup({
+      sessionKey: args.sessionKey ?? args.owner.parentSessionId,
+      owner: args.owner,
+      group: args.group,
+      onDroppedReason: (reason) => {
+        droppedReason = reason
+      },
+    }))()
+    const settled = persistence.then((outcome) => {
+      const rec = this._exactOwnerRuns.get(conflictKey)
+      if (!rec || rec.identity !== lateDelegateGroupIdentity(args.owner, args.group)) return
+      if (outcome === 'acked') {
+        rec.state = 'acked'
+        return
+      }
+      if (outcome === 'queued') {
+        rec.state = 'queued'
+        return
+      }
+      if (/session_deleted/i.test(droppedReason)) {
+        rec.state = 'session_deleted'
+        log.warn('late delegate group persist session_deleted', {
+          runId: args.group.runId,
+          ownerTurnKey: args.owner.parentTurnKey,
+        })
+        return
+      }
+      this._exactOwnerRuns.delete(conflictKey)
+      log.warn('late delegate group persist dropped', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+        reason: droppedReason || outcome,
+      })
+    }, (err: unknown) => {
+      const rec = this._exactOwnerRuns.get(conflictKey)
+      if (rec?.identity === lateDelegateGroupIdentity(args.owner, args.group)) {
+        this._exactOwnerRuns.delete(conflictKey)
+      }
+      log.warn('late delegate group persist failed before durable handoff', {
+        runId: args.group.runId,
+        ownerTurnKey: args.owner.parentTurnKey,
+      }, err instanceof Error ? err : new Error(String(err)))
+    })
+    this._trackPersistence(settled)
+    return true
+  }
+
+  private _exactOwnerRunKey(ownerTurnKey: string, runId: string): string {
+    return `${ownerTurnKey}\0${runId}`
+  }
+
+  private _trimExactOwnerRuns(): void {
+    if (this._exactOwnerRuns.size <= 256) return
+    const evictable: string[] = []
+    for (const [key, rec] of this._exactOwnerRuns) {
+      if (rec.state === 'buffered' || rec.state === 'inflight') continue
+      evictable.push(key)
+    }
+    while (this._exactOwnerRuns.size > 256 && evictable.length > 0) {
+      const oldest = evictable.shift()
+      if (oldest === undefined) break
+      const rec = this._exactOwnerRuns.get(oldest)
+      if (!rec || rec.state === 'buffered' || rec.state === 'inflight') continue
+      this._exactOwnerRuns.delete(oldest)
+    }
+  }
+
+  private _ownerLocatorForSession(
+    session: AgentSession,
+    turnKey: string,
+  ): DelegateOwnerTurnLocator {
+    return {
+      parentSessionId: session.peerId,
+      parentTurnKey: turnKey,
+      turnIndex:
+        session._currentTurnIndex ??
+        (Number.isSafeInteger(session.turns) ? Math.max(1, session.turns) : 1),
+    }
+  }
+
+  /** Shared exact-owner logical-run admission for buffer / drain / late. */
+  private _admitExactOwnerRun(
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+    next: ExactOwnerRunState,
+  ): 'accept' | 'duplicate' | 'conflict' | 'session_deleted' {
+    const key = this._exactOwnerRunKey(owner.parentTurnKey, group.runId)
+    const identity = lateDelegateGroupIdentity(owner, group)
+    const seen = this._exactOwnerRuns.get(key)
+    if (!seen) {
+      this._exactOwnerRuns.set(key, { identity, state: next })
+      this._trimExactOwnerRuns()
+      return 'accept'
+    }
+    if (seen.identity !== identity) return 'conflict'
+    if (seen.state === 'session_deleted') return 'session_deleted'
+    return 'duplicate'
+  }
+
+  private _claimDrainedOwnerGroups(
+    session: AgentSession,
+    turnKey: string,
+    groups: DurableAgentGroup[],
+  ): void {
+    const owner = this._ownerLocatorForSession(session, turnKey)
+    if (!isValidDelegateOwnerLocator(owner)) return
+    for (const group of groups) {
+      const key = this._exactOwnerRunKey(turnKey, group.runId)
+      const identity = lateDelegateGroupIdentity(owner, group)
+      const seen = this._exactOwnerRuns.get(key)
+      if (seen && seen.identity !== identity) continue
+      this._exactOwnerRuns.set(key, { identity, state: 'inflight' })
+    }
+    this._trimExactOwnerRuns()
+  }
+
+  private _settleDrainedOwnerGroups(
+    session: AgentSession,
+    turnKey: string,
+    groups: DurableAgentGroup[],
+    outcome: TapePersistResult,
+  ): void {
+    const owner = this._ownerLocatorForSession(session, turnKey)
+    const durable = outcome === 'acked' || outcome === 'queued' || outcome === 'skipped'
+    if (durable && isValidDelegateOwnerLocator(owner)) {
+      const byTurn = (session._ackedExactOwnerRuns ??= new Map())
+      let runs = byTurn.get(turnKey)
+      if (!runs) {
+        runs = new Map()
+        byTurn.set(turnKey, runs)
+      }
+      for (const group of groups) {
+        runs.set(group.runId, lateDelegateGroupIdentity(owner, group))
+      }
+    }
+    for (const group of groups) {
+      const key = this._exactOwnerRunKey(turnKey, group.runId)
+      const rec = this._exactOwnerRuns.get(key)
+      if (!rec) continue
+      if (isValidDelegateOwnerLocator(owner) && rec.identity !== lateDelegateGroupIdentity(owner, group)) {
+        continue
+      }
+      if (outcome === 'acked') rec.state = 'acked'
+      else if (outcome === 'queued') rec.state = 'queued'
+      else if (outcome === 'skipped') rec.state = 'acked'
+      else this._exactOwnerRuns.delete(key)
+    }
+  }
+
+  private _compareOwnerRunIdentity(
+    seenIdentity: string,
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+  ): 'duplicate' | 'conflict' {
+    if (!seenIdentity) return 'duplicate'
+    return seenIdentity === lateDelegateGroupIdentity(owner, group) ? 'duplicate' : 'conflict'
+  }
+
+  private _matchLiveOwnerRun(
+    session: AgentSession,
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+  ): 'accept' | 'duplicate' | 'conflict' | 'session_deleted' {
+    const pending = session._pendingAgentGroups
+    if (pending) {
+      for (const entry of pending) {
+        if (entry.ownerTurnKey !== owner.parentTurnKey) continue
+        if (entry.group.runId !== group.runId) continue
+        return this._compareOwnerRunIdentity(lateDelegateGroupIdentity(owner, entry.group), owner, group)
+      }
+    }
+    const acked = session._ackedExactOwnerRuns?.get(owner.parentTurnKey)?.get(group.runId)
+    if (acked !== undefined) return this._compareOwnerRunIdentity(acked, owner, group)
+    return 'accept'
+  }
+
+  private _matchLiveSessionsOwnerRun(
+    owner: DelegateOwnerTurnLocator,
+    group: DurableAgentGroup,
+    sessionKey?: string,
+  ): 'accept' | 'duplicate' | 'conflict' | 'session_deleted' {
+    const liveSession = sessionKey ? this.sessions.get(sessionKey) : undefined
+    if (liveSession) {
+      const live = this._matchLiveOwnerRun(liveSession, owner, group)
+      if (live !== 'accept') return live
+    }
+    for (const session of this.sessions.values()) {
+      if (session.peerId !== owner.parentSessionId) continue
+      const live = this._matchLiveOwnerRun(session, owner, group)
+      if (live !== 'accept') return live
+    }
+    return 'accept'
+  }
+
+  /** OCV5-180 B1 — mark an owner turn sealed (payload frozen). Insertion-order
+   * LRU; re-sealing an already-sealed key is a no-op. */
+  private _sealOwnerTurn(session: AgentSession, turnKey: string): void {
+    const sealed = (session._sealedOwnerTurnKeys ??= new Map<string, number>())
+    if (sealed.has(turnKey)) return
+    sealed.set(turnKey, Date.now())
+    if (sealed.size > SEALED_OWNER_TURN_KEYS_CAP) {
+      const oldest = sealed.keys().next().value
+      if (oldest !== undefined) {
+        sealed.delete(oldest)
+        session._ackedExactOwnerRuns?.delete(oldest)
+      }
+    }
   }
 
   /** team-durability — 客户 turn 进入执行段(dispatchInbound 首次 submit 前)。

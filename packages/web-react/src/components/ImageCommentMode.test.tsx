@@ -49,7 +49,11 @@ describe('ImageCommentMode', () => {
     render(<ImageCommentMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
     // 点图打开输入条(占位「描述编辑」)。
     fireEvent.click(screen.getByRole('button', { name: '点按图片添加评论' }))
-    expect(screen.getByPlaceholderText('描述编辑')).toBeInTheDocument()
+    const input = screen.getByPlaceholderText('描述编辑')
+    expect(input).toBeInTheDocument()
+    // placeholder 在深底上 40% 白只有 3.8:1 → 60%(a11y-C,与圈选编辑器同源)。
+    expect(input).toHaveClass('placeholder:text-white/60')
+    expect(input).not.toHaveClass('placeholder:text-white/40')
     fireEvent.change(screen.getByLabelText('描述编辑'), { target: { value: '把天空改蓝' } })
     fireEvent.click(screen.getByRole('button', { name: '确认' }))
     expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
@@ -102,6 +106,71 @@ describe('ImageCommentMode', () => {
     expect(value.reuseUrl).toBeUndefined()
     expect(value.text.startsWith(LEAD)).toBe(true)
     expect(value.text).toContain('1. (x: 50%, y: 50%) 去掉背景路人')
+  })
+
+  test('发送(签名 URL 源):上传件扩展名跟 blob 真实类型(jpeg → .jpg)', async () => {
+    const blob = new Blob(['jpg'], { type: 'image/jpeg' })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => null }, blob: async () => blob }) as unknown as Response),
+    )
+    const onSubmit = vi.fn(async (_v: ImageCommentSubmit) => {})
+    render(<ImageCommentMode {...baseProps} canSubmit onSubmit={onSubmit} />)
+    addComment('提亮一点')
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    const file = onSubmit.mock.calls[0][0].sourceFile as File
+    expect(file.name).toBe('合影.jpg')
+    expect(file.type).toBe('image/jpeg')
+  })
+
+  // ── 审计 M-03:有未发送锚点时点 X 先确认;空白直接退。 ──
+  describe('返回预览的脏状态保护', () => {
+    test('空白点 X → 直接 onBack,不弹确认', () => {
+      const onBack = vi.fn()
+      render(<ImageCommentMode {...baseProps} onBack={onBack} canSubmit onSubmit={vi.fn()} />)
+      fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+      expect(onBack).toHaveBeenCalledTimes(1)
+    })
+
+    test('有锚点点 X → 弹确认;继续评论不退,放弃才 onBack', () => {
+      const onBack = vi.fn()
+      render(<ImageCommentMode {...baseProps} onBack={onBack} canSubmit onSubmit={vi.fn()} />)
+      addComment('第一处')
+      fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
+      const dialog = screen.getByRole('alertdialog', { name: '放弃评论确认' })
+      expect(dialog).toHaveTextContent('放弃这 1 条评论')
+      expect(onBack).not.toHaveBeenCalled()
+      fireEvent.click(screen.getByRole('button', { name: '继续评论' }))
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: '1 条评论' })).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
+      // 危险主键前景走 text-danger-fg:沉浸台恒为深色,深色 --danger #f0666e 上白字只有 3.07:1(a11y-C)。
+      const discard = screen.getByRole('button', { name: '放弃' })
+      expect(discard).toHaveClass('bg-danger', 'text-danger-fg')
+      expect(discard).not.toHaveClass('text-white')
+      fireEvent.click(discard)
+      expect(onBack).toHaveBeenCalledTimes(1)
+    })
+
+    test('输入条里有未确认文字点 X → 也先确认', () => {
+      const onBack = vi.fn()
+      render(<ImageCommentMode {...baseProps} onBack={onBack} canSubmit onSubmit={vi.fn()} />)
+      fireEvent.click(screen.getByRole('button', { name: '点按图片添加评论' }))
+      fireEvent.change(screen.getByLabelText('描述编辑'), { target: { value: '还没写完' } })
+      fireEvent.click(screen.getByRole('button', { name: '返回预览' }))
+      expect(screen.getByRole('alertdialog', { name: '放弃评论确认' })).toHaveTextContent('放弃正在输入的评论')
+      expect(onBack).not.toHaveBeenCalled()
+    })
+
+    test('锚点命中区 ≥44px(触屏),圆点视觉仍 28px', () => {
+      render(<ImageCommentMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
+      addComment('第一处')
+      const anchor = screen.getByRole('button', { name: '评论 1' })
+      expect(anchor).toHaveClass('size-11')
+      expect(anchor.querySelector('span')).toHaveClass('size-7')
+    })
   })
 
   test('渲染失败:图片 onError → 加载失败回退', () => {

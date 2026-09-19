@@ -1,0 +1,227 @@
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
+
+import {
+  AdvisorConsultStore,
+  hashEvidence,
+  mintConsultId,
+  type AdvisorConsultRecord,
+} from '../advisorConsultStore.js'
+
+function sample(dir: string, over: Partial<AdvisorConsultRecord> = {}): AdvisorConsultRecord {
+  const snapshotJson = JSON.stringify({ tools: [{ name: 'Read', result: 'x' }] })
+  return {
+    consultId: mintConsultId(),
+    invocationId: 'inv-1',
+    userId: '3',
+    sessionKey: 'agent:main:webchat:dm:s1',
+    clientSessionId: 's1',
+    originTurnKey: 'tk-1',
+    originTurnIndex: 1,
+    configVersion: 'v1:advisor:gpt-6-astra',
+    evidenceVersion: hashEvidence(snapshotJson),
+    advisorModel: 'gpt-6-astra',
+    question: 'why is the test red?',
+    concern: 'assertion mismatch',
+    snapshotJson,
+    jobId: null,
+    billingRequestId: null,
+    advice: null,
+    state: 'accepted',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    tokenReceipt: null,
+    ...over,
+  }
+}
+
+describe('advisorConsultStore', () => {
+  it('inserts snapshot in the same row and reuses the same invocation', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const first = store.insertNew(sample(dir))
+    assert.equal(first.reused, false)
+    assert.match(first.record.snapshotJson, /assertion mismatch|Read/)
+    const second = store.insertNew(
+      sample(dir, { consultId: mintConsultId(), question: 'why is the test red?' }),
+    )
+    assert.equal(second.reused, true)
+    assert.equal(second.record.consultId, first.record.consultId)
+    assert.equal(second.record.question, first.record.question)
+    store.close()
+  })
+
+  it('persists billingRequestId before spawned state', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const { record } = store.insertNew(sample(dir, { invocationId: 'inv-2' }))
+    const attempted = store.update(record.consultId, { state: 'admission_attempt' })
+    assert.equal(attempted.state, 'admission_attempt')
+    const admitted = store.update(record.consultId, {
+      state: 'admitted',
+      billingRequestId: 'a'.repeat(32),
+    })
+    assert.equal(admitted.billingRequestId?.length, 32)
+    const spawned = store.update(record.consultId, { state: 'spawned', jobId: 'dlgjob-x' })
+    assert.equal(spawned.state, 'spawned')
+    assert.equal(store.findByInvocation({
+      userId: '3',
+      originTurnKey: 'tk-1',
+      invocationId: 'inv-2',
+    })?.billingRequestId, 'a'.repeat(32))
+    store.close()
+  })
+
+  it('records admit-before-spawn order and refuses to spawn without requestId', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const { record } = store.insertNew(sample(dir, { invocationId: 'inv-order' }))
+    const order: string[] = []
+    order.push(record.state)
+    store.update(record.consultId, { state: 'admission_attempt' })
+    order.push('admission_attempt')
+    const admitted = store.update(record.consultId, {
+      state: 'admitted',
+      billingRequestId: 'b'.repeat(32),
+    })
+    order.push(`admitted:${admitted.billingRequestId?.length}`)
+    assert.equal(admitted.state, 'admitted')
+    assert.ok(admitted.billingRequestId)
+    const spawned = store.update(record.consultId, { state: 'spawned', jobId: 'dlgjob-1' })
+    order.push(spawned.state)
+    assert.deepEqual(order, ['accepted', 'admission_attempt', 'admitted:32', 'spawned'])
+    assert.throws(() => store.update(mintConsultId(), { state: 'failed' }), /not found/)
+    store.close()
+  })
+
+  it('keeps settle_pending instead of pretending settled', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const { record } = store.insertNew(sample(dir, { invocationId: 'inv-settle' }))
+    store.update(record.consultId, { state: 'admitted', billingRequestId: 'c'.repeat(32) })
+    const pending = store.update(record.consultId, { state: 'settle_pending' })
+    assert.equal(pending.state, 'settle_pending')
+    assert.equal(pending.billingRequestId?.length, 32)
+    assert.equal(store.listByState('settle_pending').length, 1)
+    assert.equal(store.findById(record.consultId)?.state, 'settle_pending')
+    store.close()
+  })
+
+  it('concurrent insertNew of the same invocation reuses one row', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const a = sample(dir, { invocationId: 'inv-race', consultId: mintConsultId() })
+    const b = sample(dir, { invocationId: 'inv-race', consultId: mintConsultId() })
+    const [one, two] = await Promise.all([
+      Promise.resolve(store.insertNew(a)),
+      Promise.resolve(store.insertNew(b)),
+    ])
+    const reused = [one, two].filter((row) => row.reused)
+    assert.equal(reused.length, 1)
+    assert.equal(one.record.consultId, two.record.consultId)
+    store.close()
+  })
+
+  it('two processes racing product insertNew reuse one invocation row', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-race-'))
+    const dbPath = join(dir, 'advisor-consults.db')
+    const barrier = join(dir, 'go')
+    const schema = new AdvisorConsultStore(dbPath)
+    schema.close()
+    const a = sample(dir, { invocationId: 'inv-conn-race', consultId: mintConsultId(), question: 'why red?' })
+    const b = sample(dir, {
+      invocationId: 'inv-conn-race',
+      consultId: mintConsultId(),
+      question: 'a different question',
+    })
+    const childPath = fileURLToPath(new URL('./advisorConsultStoreChild.ts', import.meta.url))
+    const run = (record: AdvisorConsultRecord) => {
+      let released!: () => void
+      const sawReady = new Promise<void>((r) => {
+        released = r
+      })
+      const result = new Promise<{ reused: boolean; consultId: string; question: string }>(
+        (resolve, reject) => {
+          const child = spawn(process.execPath, ['--import', 'tsx', childPath], {
+            env: {
+              ...process.env,
+              OC_ADVISOR_DB: dbPath,
+              OC_ADVISOR_RECORD: JSON.stringify(record),
+              OC_ADVISOR_BARRIER: barrier,
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          let out = ''
+          let err = ''
+          child.stdout.on('data', (chunk) => {
+            out += String(chunk)
+            if (out.includes('ready')) released()
+          })
+          child.stderr.on('data', (chunk) => {
+            err += String(chunk)
+          })
+          child.on('exit', (code) => {
+            if (code !== 0) reject(new Error(err || out || `exit ${code}`))
+            else {
+              const line = out
+                .trim()
+                .split('\n')
+                .filter((row) => row.startsWith('{'))
+                .pop()
+              resolve(JSON.parse(line || '{}'))
+            }
+          })
+        },
+      )
+      return { sawReady, result }
+    }
+    const first = run(a)
+    const second = run(b)
+    await Promise.all([first.sawReady, second.sawReady])
+    writeFileSync(barrier, 'go')
+    const [one, two] = await Promise.all([first.result, second.result])
+    const reused = [one, two].filter((row) => row.reused)
+    assert.equal(reused.length, 1, JSON.stringify({ one, two }))
+    assert.equal(one.consultId, two.consultId)
+    const verify = new AdvisorConsultStore(dbPath)
+    try {
+      const rec = verify.findByInvocation({
+        userId: '3',
+        originTurnKey: 'tk-1',
+        invocationId: 'inv-conn-race',
+      })
+      assert.ok(rec)
+      assert.equal(rec?.consultId, one.consultId)
+    } finally {
+      verify.close()
+    }
+  })
+
+  it('billing 2xx does not settle admitted/spawned rows without durable advice', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-advc-e3-'))
+    const store = new AdvisorConsultStore(join(dir, 'advisor-consults.db'))
+    const requestId = 'a'.repeat(32)
+    const { record } = store.insertNew(
+      sample(dir, {
+        invocationId: 'inv-e3',
+        state: 'spawned',
+        billingRequestId: requestId,
+        advice: null,
+      }),
+    )
+    assert.equal(store.projectOneReceipt(requestId), 'pending')
+    assert.equal(store.findById(record.consultId)?.state, 'spawned')
+    assert.equal(store.markSettledFromBilling(requestId).length, 0)
+    store.update(record.consultId, { advice: 'PERSISTED_ADVICE' })
+    assert.equal(store.projectOneReceipt(requestId), 'projected')
+    assert.equal(store.findById(record.consultId)?.state, 'settled')
+    assert.equal(store.findById(record.consultId)?.advice, 'PERSISTED_ADVICE')
+    store.close()
+  })
+})

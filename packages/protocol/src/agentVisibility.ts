@@ -20,11 +20,19 @@
 // 数组都能复用。
 
 /** 隐藏系统 agent id 集合(单一权威;新增系统 agent 只改这一处)。 */
-export const HIDDEN_SYSTEM_AGENT_IDS = new Set<string>(['hidden-reviewer'])
+export const HIDDEN_SYSTEM_AGENT_IDS = new Set<string>(['hidden-reviewer', 'advisor'])
 
 /** 该 agent id 是否为平台保留的隐藏系统 agent。判定/授权/执行面用它看全量。 */
 export function isHiddenSystemAgentId(agentId: string): boolean {
   return HIDDEN_SYSTEM_AGENT_IDS.has(agentId)
+}
+
+/**
+ * Formal team-review execution (hidden-reviewer). Visibility ≠ review role:
+ * `advisor` is hidden but must never enter request_review / verdict / slot.
+ */
+export function isTeamReviewExecution(agentId: string): boolean {
+  return agentId === 'hidden-reviewer'
 }
 
 /** 从「agent 列表」投影掉隐藏系统 agent(按 `.id` 过滤)。 */

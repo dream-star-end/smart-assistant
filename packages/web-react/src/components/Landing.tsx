@@ -8,6 +8,7 @@ import {
   FileCheck2,
   Globe2,
   Layers3,
+  Menu,
   Network,
   Puzzle,
   ReceiptText,
@@ -16,19 +17,40 @@ import {
   Sparkles,
   Users,
   Workflow,
+  X,
   Zap,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Theme } from '../hooks/useTheme'
 import { AGENTS } from '../lib/agents'
 import { api } from '../lib/api'
 import { BRAND } from '../lib/brand'
+import { filedIcp } from '../lib/legal'
 import { minSeatPriceYuan } from '../lib/orgBilling'
 import { AgentAvatar } from './AgentAvatar'
 import { BrandMark } from './BrandMark'
 import { DemoShowcase } from './landing/DemoShowcase'
+import { Tutorials } from './landing/Tutorials'
 import { ThemeToggle } from './ThemeToggle'
-import { Button, buttonVariants } from './ui'
+import { Button, IconButton, buttonVariants } from './ui'
+
+/** 顶部导航的分区锚点:桌面横排与窄屏折叠菜单共用同一份,保证两端跳得到的地方一致。 */
+const NAV_LINKS = [
+  { href: '#demo', label: '产品演示' },
+  { href: '#capabilities', label: '核心能力' },
+  { href: '#scenarios', label: '工作场景' },
+  { href: '#agents', label: '智能体' },
+  { href: '#enterprise', label: '团队版' },
+] as const
+
+/**
+ * 「联系合作」只在品牌配置给了联系邮箱时渲染成 mailto 链接;没有就整项不出现 ——
+ * 一个点了没反应的"链接"比没有更伤可信度。字段归 shell 的 brand.ts,这里只做前向兼容读取。
+ */
+function brandContactEmail(): string | undefined {
+  const email = (BRAND as typeof BRAND & { contactEmail?: string }).contactEmail?.trim()
+  return email || undefined
+}
 
 function Logo({ compact = false }: { compact?: boolean }) {
   return (
@@ -155,7 +177,7 @@ function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
         if (yuan) setAnchor(`¥${yuan}/席起`)
       })
       .catch(() => {
-        // 公开档位不可用时使用下方静态锚点，不阻断营销首页。
+        // 公开档位不可用时不显示价格(写死的兜底价会在调价后变成错误报价),只保留「随需加席」,不阻断营销首页。
       })
     return () => {
       alive = false
@@ -206,10 +228,10 @@ function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
               创建组织 <ArrowRight size={16} />
             </Button>
             <span className="text-[14px] text-[#8e9388]">
-              <strong className="mr-1.5 text-[18px] font-semibold text-[#f5f4ed]">
-                {anchor ?? '¥88/席起'}
-              </strong>
-              随需加席
+              {anchor && (
+                <strong className="mr-1.5 text-[18px] font-semibold text-[#f5f4ed]">{anchor}</strong>
+              )}
+              {anchor ? '随需加席' : '按席位计费，随需加席'}
             </span>
           </div>
         </div>
@@ -218,7 +240,7 @@ function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
           <div className="rounded-[20px] border border-white/8 bg-[#0a0c09] p-5 sm:p-6">
             <div className="flex items-center justify-between gap-4">
               <div>
-                <div className="text-[12px] font-medium uppercase tracking-[0.16em] text-[#747a70]">
+                <div className="text-[12px] font-medium uppercase tracking-[0.16em] text-[#8b9086]">
                   Team workspace
                 </div>
                 <h3 className="mt-1 text-[18px] font-semibold text-[#f5f4ed]">
@@ -245,7 +267,7 @@ function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
                         <span className="block truncate text-[13.5px] font-medium text-[#f5f4ed]">
                           {member.name}
                         </span>
-                        <span className="block truncate text-[11.5px] text-[#777d73]">
+                        <span className="block truncate text-[11.5px] text-[#8b9086]">
                           {member.role}
                         </span>
                       </span>
@@ -276,6 +298,10 @@ function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
   )
 }
 
+/** 页脚文字链接:桌面 18.8px 行高照旧,触屏撑到 44px 命中(a11y-B landing#2)。 */
+const FOOTER_LINK_CLS =
+  'text-[#8b9086] hover:text-white [@media(hover:none)]:flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center'
+
 export function Landing(props: {
   onStart: () => void
   onLogin: () => void
@@ -284,6 +310,23 @@ export function Landing(props: {
   onCycleTheme: () => void
 }) {
   const { onStart, onLogin, onCreateOrg, theme, onCycleTheme } = props
+  // 窄屏(<md)顶部导航折叠成菜单;点任一锚点 / 按 Esc 收起。桌面端零变化。
+  const [menuOpen, setMenuOpen] = useState(false)
+  // Esc 收起折叠导航时把焦点还给菜单按钮(a11y-B landing#1):<nav> 直接卸载,焦点在菜单链接上会掉到 body。
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
+  const icp = filedIcp(BRAND.icp)
+  const contactEmail = brandContactEmail()
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setMenuOpen(false)
+      menuButtonRef.current?.focus()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [menuOpen])
 
   return (
     <div className="congjian-landing h-full overflow-y-auto bg-[#090a08] text-[#f5f4ed]">
@@ -294,25 +337,18 @@ export function Landing(props: {
             className="hidden items-center gap-7 text-[13.5px] text-[#9da197] md:flex"
             aria-label="首页导航"
           >
-            <a href="#demo" className="transition-colors hover:text-white">
-              产品演示
-            </a>
-            <a href="#capabilities" className="transition-colors hover:text-white">
-              核心能力
-            </a>
-            <a href="#scenarios" className="transition-colors hover:text-white">
-              工作场景
-            </a>
-            <a href="#agents" className="transition-colors hover:text-white">
-              智能体
-            </a>
-            <a href="#enterprise" className="transition-colors hover:text-white">
-              团队版
-            </a>
+            {NAV_LINKS.map((link) => (
+              <a key={link.href} href={link.href} className="transition-colors hover:text-white">
+                {link.label}
+              </a>
+            ))}
           </nav>
           <div className="flex shrink-0 items-center gap-1.5">
-            {/* 首页固定深色,但这里切的主题会带进登录页/工作区 —— 提前说明,避免"切了没反应"的错觉。 */}
-            <ThemeToggle theme={theme} onCycle={onCycleTheme} titleHint="影响登录后的界面" />
+            {/* 首页固定深色,这里切的主题只会带进登录页/工作区。桌面端保留(hover 有 title 说明 +
+                切换 toast);窄屏收起 —— 触屏看不到 title,按了页面又不变,只剩困惑,登录页有同一枚开关。 */}
+            <div className="hidden md:block">
+              <ThemeToggle theme={theme} onCycle={onCycleTheme} titleHint="影响登录后的界面" />
+            </div>
             <Button
               variant="ghost"
               shape="pill"
@@ -324,8 +360,39 @@ export function Landing(props: {
             <Button variant="primary" shape="pill" onClick={onStart}>
               免费开始
             </Button>
+            <IconButton
+              ref={menuButtonRef}
+              aria-label={menuOpen ? '收起导航' : '打开导航'}
+              aria-expanded={menuOpen}
+              aria-controls={menuOpen ? 'landing-mobile-nav' : undefined}
+              onClick={() => setMenuOpen((open) => !open)}
+              className="text-[#b7bbb2] hover:bg-white/8 hover:text-white md:hidden"
+            >
+              {menuOpen ? <X size={20} /> : <Menu size={20} />}
+            </IconButton>
           </div>
         </div>
+        {menuOpen && (
+          <nav
+            id="landing-mobile-nav"
+            aria-label="首页导航（折叠菜单）"
+            className="border-t border-white/8 bg-[#090a08]/95 md:hidden"
+          >
+            <ul className="mx-auto flex max-w-6xl flex-col px-2 py-2">
+              {NAV_LINKS.map((link) => (
+                <li key={link.href}>
+                  <a
+                    href={link.href}
+                    onClick={() => setMenuOpen(false)}
+                    className="flex min-h-11 items-center rounded-xl px-3 text-[15px] text-[#d8d9d2] outline-none transition-colors hover:bg-white/[0.06] hover:text-white focus-visible:ring-2 focus-visible:ring-[#c7ff64]"
+                  >
+                    {link.label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </nav>
+        )}
       </header>
 
       <main>
@@ -350,7 +417,7 @@ export function Landing(props: {
                 onClick={onStart}
                 className="group min-w-[172px]"
               >
-                开始使用从简
+                免费开始
                 <ArrowRight
                   size={17}
                   className="transition-transform group-hover:translate-x-0.5"
@@ -365,7 +432,8 @@ export function Landing(props: {
                 看一个真实任务
               </a>
             </div>
-            <div className="mx-auto mt-8 flex max-w-3xl flex-wrap items-center justify-center gap-x-6 gap-y-2 text-[12.5px] text-[#747970]">
+            {/* 小字一律 #8b9086(对 #090a08 约 5.9:1);原 #74797x 系在玻璃底上只有 4.3–4.6:1,卡在 AA 门槛。 */}
+            <div className="mx-auto mt-8 flex max-w-3xl flex-wrap items-center justify-center gap-x-6 gap-y-2 text-[12.5px] text-[#8b9086]">
               {['多模型按任务切换', '智能体协同执行', '过程持续可追踪', '成果直接可使用'].map(
                 (item) => (
                   <span key={item} className="inline-flex items-center gap-1.5">
@@ -380,7 +448,7 @@ export function Landing(props: {
             id="demo"
             className="relative mx-auto max-w-6xl scroll-mt-24 px-3 pb-20 sm:px-5 md:pb-28"
           >
-            <div className="mb-4 flex items-center justify-between px-2 text-[11.5px] uppercase tracking-[0.16em] text-[#777d73]">
+            <div className="mb-4 flex items-center justify-between px-2 text-[11.5px] uppercase tracking-[0.16em] text-[#8b9086]">
               <span>Product workspace</span>
               <span className="inline-flex items-center gap-1.5 normal-case tracking-normal">
                 <span className="size-1.5 rounded-full bg-[#c7ff64]" /> 产品能力演示
@@ -397,6 +465,8 @@ export function Landing(props: {
             </div>
           </div>
         </section>
+
+        <Tutorials />
 
         <section className="congjian-section border-b border-white/8 bg-[#0c0e0b]">
           <div className="mx-auto max-w-6xl px-5 py-24">
@@ -422,7 +492,7 @@ export function Landing(props: {
                 return (
                   <div key={step.n} className="relative bg-[#10120f] p-6 md:min-h-[220px]">
                     <div className="flex items-center justify-between">
-                      <span className="font-mono text-[11px] tracking-[0.14em] text-[#777d73]">
+                      <span className="font-mono text-[11.5px] tracking-[0.14em] text-[#8b9086]">
                         {step.n}
                       </span>
                       <Icon size={19} className="text-[#c7ff64]" />
@@ -462,7 +532,7 @@ export function Landing(props: {
                       className="absolute -right-14 -top-14 size-36 rounded-full bg-[#c7ff64]/5 blur-3xl"
                     />
                     <div className="flex items-center justify-between">
-                      <span className="font-mono text-[10.5px] tracking-[0.15em] text-[#777d73]">
+                      <span className="font-mono text-[10.5px] tracking-[0.15em] text-[#8b9086]">
                         {capability.eyebrow}
                       </span>
                       <span className="grid size-10 place-items-center rounded-xl border border-white/8 bg-white/[0.035] text-[#c7ff64]">
@@ -530,7 +600,7 @@ export function Landing(props: {
                       “{scenario.prompt}”
                     </span>
                     <span className="mt-auto pt-8">
-                      <span className="mb-3 block text-[10.5px] uppercase tracking-[0.14em] text-[#777d73]">
+                      <span className="mb-3 block text-[10.5px] uppercase tracking-[0.14em] text-[#8b9086]">
                         Deliverables
                       </span>
                       <span className="flex flex-wrap gap-2">
@@ -580,7 +650,8 @@ export function Landing(props: {
                   onClick={onStart}
                   className="mt-8"
                 >
-                  浏览智能体市场 <ArrowRight size={16} />
+                  {/* onStart 落在开始使用 / 登录,不直达市场 —— 文案说实话,不许诺点了就到市场。 */}
+                  开始使用，再去市场安装 <ArrowRight size={16} />
                 </Button>
               </div>
 
@@ -594,7 +665,7 @@ export function Landing(props: {
                   >
                     <div className="flex items-start justify-between gap-4">
                       <AgentAvatar agent={agent} className="size-11 rounded-[14px]" iconSize={21} />
-                      <span className="rounded-full border border-white/8 px-2 py-0.5 text-[10px] text-[#777d73]">
+                      <span className="rounded-full border border-white/8 px-2 py-0.5 text-[10px] text-[#8b9086]">
                         {index === 0 ? '默认配备' : '市场安装'}
                       </span>
                     </div>
@@ -630,7 +701,7 @@ export function Landing(props: {
               <div className="divide-y divide-white/8 border-y border-white/8">
                 {FAQS.map((faq) => (
                   <details key={faq.q} className="group py-5 open:pb-6">
-                    <summary className="flex cursor-pointer list-none items-center justify-between gap-5 text-[15px] font-medium text-[#e7e7e0] outline-none focus-visible:ring-2 focus-visible:ring-[#c7ff64]">
+                    <summary className="flex cursor-pointer list-none items-center justify-between gap-5 text-[15px] font-medium text-[#e7e7e0] outline-none focus-visible:ring-2 focus-visible:ring-[#c7ff64] [@media(hover:none)]:min-h-11">
                       {faq.q}
                       <span className="grid size-7 shrink-0 place-items-center rounded-full border border-white/10 text-[#8f948a] transition-transform group-open:rotate-45">
                         +
@@ -663,7 +734,7 @@ export function Landing(props: {
               onClick={onStart}
               className="mt-8 group"
             >
-              免费开始使用
+              免费开始
               <ArrowRight size={17} className="transition-transform group-hover:translate-x-0.5" />
             </Button>
           </div>
@@ -675,38 +746,53 @@ export function Landing(props: {
           <div className="flex flex-col justify-between gap-8 md:flex-row md:items-start">
             <div>
               <Logo compact />
-              <p className="mt-4 max-w-sm text-[13px] leading-6 text-[#777d73]">{BRAND.intro}</p>
+              <p className="mt-4 max-w-sm text-[13px] leading-6 text-[#8b9086]">{BRAND.intro}</p>
             </div>
+            {/* 页脚链接触屏撑到 44px(a11y-B landing#2):列间距在 hover:none 下收掉,行高由链接自己撑。 */}
             <div className="flex flex-wrap gap-x-12 gap-y-5 text-[12.5px]">
-              <div className="flex flex-col gap-2.5">
+              <div className="flex flex-col gap-2.5 [@media(hover:none)]:gap-0">
                 <span className="font-medium text-[#d8d9d2]">产品</span>
-                <a href="#demo" className="text-[#777d73] hover:text-white">
+                <a href="#demo" className={FOOTER_LINK_CLS}>
                   产品演示
                 </a>
-                <a href="#capabilities" className="text-[#777d73] hover:text-white">
+                <a href="#capabilities" className={FOOTER_LINK_CLS}>
                   核心能力
                 </a>
-                <a href="#enterprise" className="text-[#777d73] hover:text-white">
+                <a href="#enterprise" className={FOOTER_LINK_CLS}>
                   团队版
                 </a>
               </div>
-              <div className="flex flex-col gap-2.5">
+              <div className="flex flex-col gap-2.5 [@media(hover:none)]:gap-0">
                 <span className="font-medium text-[#d8d9d2]">条款</span>
-                <a href="/terms" className="text-[#777d73] hover:text-white">
+                <a href="/terms" className={FOOTER_LINK_CLS}>
                   用户协议
                 </a>
-                <a href="/privacy" className="text-[#777d73] hover:text-white">
+                <a href="/privacy" className={FOOTER_LINK_CLS}>
                   隐私政策
                 </a>
-                <span className="text-[#777d73]">联系合作</span>
+                {contactEmail && (
+                  <a href={`mailto:${contactEmail}`} className={FOOTER_LINK_CLS}>
+                    联系合作
+                  </a>
+                )}
               </div>
             </div>
           </div>
-          <div className="mt-10 flex flex-col justify-between gap-2 border-t border-white/8 pt-6 text-[11.5px] text-[#777d73] sm:flex-row">
+          <div className="mt-10 flex flex-col justify-between gap-2 border-t border-white/8 pt-6 text-[11.5px] text-[#8b9086] sm:flex-row">
             <span>
               © {BRAND.year} {BRAND.company} 版权所有
             </span>
-            <span>{BRAND.icp}</span>
+            {/* 备案位只在拿到真实备案号后出现(并按工信部要求外链备案系统);占位文案不上页脚。 */}
+            {icp && (
+              <a
+                href="https://beian.miit.gov.cn/"
+                target="_blank"
+                rel="noreferrer"
+                className="hover:text-white [@media(hover:none)]:flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center"
+              >
+                {icp}
+              </a>
+            )}
           </div>
         </div>
       </footer>

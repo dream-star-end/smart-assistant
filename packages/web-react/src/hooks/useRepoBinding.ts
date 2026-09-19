@@ -209,6 +209,13 @@ export function useRepoBinding(opts: {
           default_branch: base?.default_branch,
           status,
           head_sha: frame.headSha || base?.head_sha,
+          // 失败原因随帧落进 selection：横幅就地展示，不再另弹一条 toast 双重提示（RB-03）。
+          ...(status === "failed"
+            ? {
+                error_code: frame.errorCode,
+                error_message: frame.errorMessage || githubErrorText(frame.errorCode),
+              }
+            : {}),
           selection_version: ver >= 0 ? ver : (base?.selection_version ?? 0),
         };
       });
@@ -223,10 +230,9 @@ export function useRepoBinding(opts: {
         scheduleBannerHide();
       } else if (status === "failed") {
         setProgressPct(0);
-        toast(githubErrorText(frame.errorCode), "error");
       }
     },
-    [startProgressTimer, stopProgressTimer, scheduleBannerHide, toast],
+    [startProgressTimer, stopProgressTimer, scheduleBannerHide],
   );
 
   const onRepoBindError = useCallback(

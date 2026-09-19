@@ -74,12 +74,14 @@ import {
   type ServerAuthoredStorage,
 } from "../http/internalServerAuthored.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
+import { prepareSessionRowResetForTest } from "./helpers/sessionRows.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const SCHEMA = "oc_p2_sessions_test";
 const GENERATION = 1;
+let resetSessionRows: (() => Promise<void>) | undefined;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATION_0066 = path.resolve(here, "../db/migrations/0066_wechat_pointer_outbox_audit.sql");
@@ -320,6 +322,7 @@ before(async () => {
        VALUES (true, 'pg_authoritative', $1, 'test-cutover', 'test-digest', $2)`,
     [GENERATION, Date.now()],
   );
+  resetSessionRows = await prepareSessionRowResetForTest(pool, SCHEMA);
   backend = createPgSessionsBackend(pool, { expectedGeneration: GENERATION });
 });
 
@@ -333,17 +336,11 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  // Some live-frame readers intentionally outlive the request that started
-  // them. Their final short SELECT can overlap the next fixture TRUNCATE and
-  // make PostgreSQL choose the reset as a 40P01 victim. Retry only that exact
-  // transient; every other setup error remains fatal.
+  assert.ok(resetSessionRows, "private session fixture setup must finish before each case");
+  // Retry the complete cleanup transaction only for the original 40P01 transient.
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await pool.query(
-        `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-                 server_authored_request_map, pending_usage_patches, turn_waivers,
-                 wechat_bindings, admin_audit CASCADE`,
-      );
+      await resetSessionRows();
       break;
     } catch (error) {
       if ((error as { code?: string }).code !== "40P01" || attempt === 2) throw error;
@@ -3523,6 +3520,15 @@ describe("pgSessionsBackend lossless turn tape", () => {
     const locker = await pool.connect();
     let staleFinalize: Promise<unknown> | null = null;
     let convertingFinalize: Promise<unknown> | null = null;
+    let completedBatches = 0;
+    let markStaleBatchCommitted!: () => void;
+    const staleBatchCommitted = new Promise<void>((resolve) => {
+      markStaleBatchCommitted = resolve;
+    });
+    let resumeStaleAfterConversion!: () => void;
+    const conversionStaged = new Promise<void>((resolve) => {
+      resumeStaleAfterConversion = resolve;
+    });
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
@@ -3530,6 +3536,48 @@ describe("pgSessionsBackend lossless turn tape", () => {
 
     process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
     try {
+      // Phase A also locks this header before the format claim. Observing a
+      // queued header query alone cannot identify the claimant's phase.
+      // Pause between committed batches, not on scheduler/lock FIFO timing.
+      _setAfterLosslessStageBatch(async () => {
+        const batch = ++completedBatches;
+        assert.ok(batch <= 2, "the stale writer must not commit a second batch");
+        const observed = (await pool.query<{
+          record_storage_format: number;
+          records: string;
+          finalized: boolean;
+        }>(
+          `SELECT t.record_storage_format,COUNT(r.*)::text AS records,
+                  t.finalized_at IS NOT NULL AS finalized
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format,t.finalized_at`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0];
+        if (batch === 1) {
+          assert.deepEqual(observed, {
+            record_storage_format: 2,
+            records: String(LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE),
+            finalized: false,
+          });
+          markStaleBatchCommitted();
+          await conversionStaged;
+        } else {
+          try {
+            assert.deepEqual(observed, {
+              record_storage_format: 3,
+              records: "4",
+              finalized: false,
+            });
+          } finally {
+            resumeStaleAfterConversion();
+          }
+          assert.ok(staleFinalize);
+          await Promise.allSettled([staleFinalize]);
+        }
+      });
       await locker.query("SELECT pg_advisory_lock($1)", [advisoryKey]);
       await pool.query(`
         CREATE OR REPLACE FUNCTION oc_test_pause_stale_format_two()
@@ -3557,20 +3605,13 @@ describe("pgSessionsBackend lossless turn tape", () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
+      await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+      await Promise.race([
+        staleBatchCommitted,
+        staleFinalize.then(() => assert.fail("stale writer finished before the first-batch barrier")),
+      ]);
       process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
       convertingFinalize = convertingBackend.finalizeLosslessTurnTape(userId, tape.finalize);
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const waiting = Number((await pool.query<{ count: string }>(
-          `SELECT COUNT(*)::text AS count FROM pg_stat_activity
-            WHERE datname=current_database() AND wait_event_type='Lock'
-              AND query LIKE '%client_session_turn_tapes%'`,
-        )).rows[0]!.count);
-        if (waiting > 0) break;
-        if (attempt === 99) assert.fail("format-3 claimant did not queue behind the stale writer");
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
       const [staleResult, convertingResult] = await Promise.allSettled([
         staleFinalize,
         convertingFinalize,
@@ -3597,6 +3638,8 @@ describe("pgSessionsBackend lossless turn tape", () => {
         { record_storage_format: 3, records: "4" },
       );
     } finally {
+      _setAfterLosslessStageBatch(null);
+      resumeStaleAfterConversion();
       await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]).catch(() => undefined);
       locker.release();
       await Promise.allSettled(
@@ -5478,13 +5521,26 @@ describe("pgSessionsBackend §9 并发(双连接 barrier)", () => {
 describe("startSessionsGcSweeper advisory lease", () => {
   maybe("持锁者独占执行,备者竞不到锁", async () => {
     let statsCount = 0;
-    const s1 = startSessionsGcSweeper({ pool, intervalMs: 50, recompeteMs: 50, onStats: () => statsCount++ });
-    // 给 s1 时间竞到锁并跑一轮
-    await new Promise((r) => setTimeout(r, 200));
-    // 备者:同一固定 key 竞不到 → 不成为持有者(直接探测)
-    const probe = await pool.query("SELECT pg_try_advisory_lock(hashtextextended('oc_sessions_sweep_gc',0)) AS ok");
-    assert.equal(probe.rows[0].ok, false, "s1 持锁期间他人不应竞到");
-    await s1.stop();
+    let reportFirstSweep!: () => void;
+    let rejectFirstSweep!: (error: unknown) => void;
+    const firstSweep = new Promise<void>((resolve, reject) => {
+      reportFirstSweep = resolve;
+      rejectFirstSweep = reject;
+    });
+    const s1 = startSessionsGcSweeper({
+      pool, intervalMs: 50, recompeteMs: 50,
+      onStats: () => { statsCount++; reportFirstSweep(); },
+      onError: rejectFirstSweep,
+    });
+    try {
+      // Wait for the real completed sweep, not an assumed 200ms scheduling budget.
+      await firstSweep;
+      // 备者:同一固定 key 竞不到 → 不成为持有者(直接探测)
+      const probe = await pool.query("SELECT pg_try_advisory_lock(hashtextextended('oc_sessions_sweep_gc',0)) AS ok");
+      assert.equal(probe.rows[0].ok, false, "s1 持锁期间他人不应竞到");
+    } finally {
+      await s1.stop();
+    }
     // stop 后锁释放 → 现在能竞到
     const probe2 = await pool.query("SELECT pg_try_advisory_lock(hashtextextended('oc_sessions_sweep_gc',0)) AS ok");
     assert.equal(probe2.rows[0].ok, true, "stop 后锁应释放");

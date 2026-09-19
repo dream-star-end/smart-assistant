@@ -302,6 +302,7 @@ describe('buildCodexLaunchOverrides', () => {
   it('stage / taskboard patrol sessions omit platform MCP skills', async () => {
     const { buildCodexLaunchOverrides, shouldOmitPlatformMcp } = await import('../codexLaunchOverrides.js')
     assert.equal(shouldOmitPlatformMcp('stage-triage', 'agent:stage-triage:taskboard:t:s:r'), true)
+    assert.equal(shouldOmitPlatformMcp('advisor', 'advisor:turn:consult'), true)
     assert.equal(shouldOmitPlatformMcp('main', 'agent:main:webchat:dm:x'), false)
     const out = await buildCodexLaunchOverrides({
       agentId: 'stage-triage',

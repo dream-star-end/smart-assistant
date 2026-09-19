@@ -14,21 +14,47 @@ import { agentDisplayName } from "../chat/agentNames";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { Alert, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
+import { StatTile } from "./StatTile";
 
+/**
+ * 项目范围 → 用量查询参数。
+ * `notice`:范围选了「当前聊天项目」但它还没绑看板 → 无法按项目过滤,**回落到全部项目**并
+ * 在页顶说明(审计 SET-04:之前这一态直接不请求、整页只剩一条提示,文案却说"按全部项目统计")。
+ */
 function boardProjectQuery(
   kind: string,
   workId: string | undefined,
-): { boardProjectId?: string; blocked?: string } {
+): { boardProjectId?: string; notice?: string } {
   if (kind === "ungrouped") return { boardProjectId: "none" };
   if (kind === "work" && workId) return { boardProjectId: workId };
   if (kind === "chat") {
     if (workId) return { boardProjectId: workId };
-    return { blocked: "当前是未绑定的聊天项目，用量不能按该 facade 过滤，已停用以免误查全局。" };
+    return { notice: "当前聊天项目还没绑定任务看板，以下按全部项目统计。" };
   }
   return {};
 }
 
 const SESSIONS_PAGE = 20;
+
+/**
+ * 会话明细是 offset 分页(后端契约),翻页期间若有新会话插到前面,下一页会把上一页末尾的行
+ * 再送一遍 —— 结果是同一 session_id 出现两行(React 还会报重复 key)。前端无法改分页语义,
+ * 但可以按 session_id 去重:已在列表里的行跳过,保留首次出现的那份。offset 仍按服务端原始
+ * 行数推进(它是位置游标,不是"去重后的条数")。导出供单测。
+ */
+export function appendSessionRows(
+  prev: readonly UsageSessionRow[],
+  next: readonly UsageSessionRow[],
+): UsageSessionRow[] {
+  const seen = new Set(prev.map((row) => row.session_id));
+  const out = [...prev];
+  for (const row of next) {
+    if (seen.has(row.session_id)) continue;
+    seen.add(row.session_id);
+    out.push(row);
+  }
+  return out;
+}
 
 /** 图表区窗口口径（默认 7d，作用于 stat 卡 + 全部图表）。 */
 const WINDOWS: { value: UsageReportWindow; label: string }[] = [
@@ -85,7 +111,13 @@ export function topModelsWithOther(
  * 所有大数字段全程字符串（formatCompactCount / formatCredits / groupDigits）；
  * 唯图表 dataset 经 chartNum 收口数值化。
  */
-export function UsageTab({ auth }: { auth: AuthSession }) {
+export function UsageTab({
+  auth,
+  onOpenProjectSettings,
+}: {
+  auth: AuthSession;
+  onOpenProjectSettings?: () => void;
+}) {
   const { scope } = useProjectScope();
   const scopeQuery = boardProjectQuery(scope.kind, scope.workProject?.id);
   const boardProjectId = scopeQuery.boardProjectId;
@@ -128,12 +160,6 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   // 全生命周期：首屏拉一次（会话首页 + 摘要 + 缓存 + 节省）。
   useEffect(() => {
     let alive = true;
-    if (scopeQuery.blocked) {
-      setLoading(false);
-      setData(null);
-      setErr(null);
-      return;
-    }
     setLoading(true);
     setErr(null);
     api
@@ -141,7 +167,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
       .then((u) => {
         if (!alive) return;
         setData(u);
-        setSessions(u.sessions.rows);
+        setSessions(appendSessionRows([], u.sessions.rows));
         setOffset(u.sessions.rows.length);
         setHasMore(u.sessions.has_more);
       })
@@ -154,17 +180,11 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, usageReloadTick, boardProjectId, scopeQuery.blocked]);
+  }, [auth, usageReloadTick, boardProjectId]);
 
   // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
     let alive = true;
-    if (scopeQuery.blocked) {
-      setReportLoading(false);
-      setReport(null);
-      setReportErr(null);
-      return;
-    }
     setReportLoading(true);
     setReportErr(null);
     setReport(null);
@@ -184,7 +204,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, window, reportReloadTick, boardProjectId, scopeQuery.blocked]);
+  }, [auth, window, reportReloadTick, boardProjectId]);
 
   // 会话标题：与用量首屏解耦，缺 listSessions / 失败均静默。
   useEffect(() => {
@@ -215,7 +235,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         sessionsOffset: offset,
         ...(boardProjectId ? { boardProjectId } : {}),
       });
-      setSessions((prev) => [...prev, ...u.sessions.rows]);
+      setSessions((prev) => appendSessionRows(prev, u.sessions.rows));
       setOffset((o) => o + u.sessions.rows.length);
       setHasMore(u.sessions.has_more);
     } catch (e) {
@@ -237,6 +257,10 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   // 两个首屏请求都完成后 canvas 才会挂载；把这个可见性边沿纳入图表 effect 依赖，
   // 避免 report 先返回时 useChart 因 ref=null no-op，随后仅 loading 变化却永不重画。
   const chartReady = !loading && !reportLoading && report !== null;
+  // 全 0 序列不画图(审计 SET-03):chart.js 对全 0 数据会画出 0–1.0 的小数刻度空图,
+  // 与同页「按模型 / Token 构成」两张卡的文字空态不一致。
+  const creditTrendHasData = creditTrend.some((v) => v > 0);
+  const requestTrendHasData = requestTrend.some((v) => v > 0);
 
   const creditRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<HTMLCanvasElement>(null);
@@ -290,6 +314,8 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     [report, window, chartReady],
   );
 
+  const scopeNotice = scopeQuery.notice;
+
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
@@ -311,15 +337,6 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         >
           重试
         </Button>
-      </div>
-    );
-  }
-  if (scopeQuery.blocked) {
-    return (
-      <div className="px-5 py-4">
-        <Alert tone="warning" className="text-meta">
-          {scopeQuery.blocked}
-        </Alert>
       </div>
     );
   }
@@ -353,11 +370,25 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
             className="ml-auto"
           />
         </div>
-        {scope.kind !== "all" && (
+        {scopeNotice ? (
+          <Alert
+            tone="warning"
+            className="text-meta"
+            action={
+              onOpenProjectSettings ? (
+                <Button size="sm" variant="secondary" onClick={onOpenProjectSettings}>
+                  去项目设置
+                </Button>
+              ) : undefined
+            }
+          >
+            {scopeNotice}
+          </Alert>
+        ) : scope.kind !== "all" ? (
           <p className="text-caption text-muted">
             按会话当时所属项目统计，后续移动会话不改写历史；组队成员的消耗计入发起会话。
           </p>
-        )}
+        ) : null}
       </div>
 
       {reportLoading ? (
@@ -395,14 +426,10 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                 近 {REPORT_WINDOW_NOUN[window]}
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <Stat label="请求数" value={groupDigits(rs.requests)} />
-                <Stat
-                  label="消耗积分"
-                  value={`${formatCredits(rs.credits)} 积分`}
-                  accent
-                />
-                <Stat label="输入 token" value={formatCompactCount(rs.input_tokens)} />
-                <Stat label="输出 token" value={formatCompactCount(rs.output_tokens)} />
+                <StatTile label="请求数" value={groupDigits(rs.requests)} />
+                <StatTile label="消耗积分" value={formatCredits(rs.credits)} unit="积分" accent />
+                <StatTile label="输入 token" value={formatCompactCount(rs.input_tokens)} />
+                <StatTile label="输出 token" value={formatCompactCount(rs.output_tokens)} />
               </div>
             </div>
 
@@ -459,7 +486,13 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                   emptyText: "该时段暂无积分消耗数据。",
                 }}
               >
-                <canvas ref={creditRef} />
+                {creditTrendHasData ? (
+                  <canvas ref={creditRef} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-meta text-faint">
+                    该时段暂无积分消耗数据。
+                  </div>
+                )}
               </ChartCard>
               <ChartCard
                 title="请求次数"
@@ -474,7 +507,13 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                   emptyText: "该时段暂无请求数据。",
                 }}
               >
-                <canvas ref={requestRef} />
+                {requestTrendHasData ? (
+                  <canvas ref={requestRef} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-meta text-faint">
+                    该时段暂无请求数据。
+                  </div>
+                )}
               </ChartCard>
               <ChartCard
                 title="按模型积分构成"
@@ -626,7 +665,8 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                         type="button"
                         onClick={() => toggleDelegates(row.session_id)}
                         aria-expanded={isOpen}
-                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                        // 触屏补 44px 命中高(t-762 settings#5:此前 22px);桌面 hover 可用时零变化。
+                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
                       >
                         含组队 {formatCredits(row.delegate_credits ?? "0")} 积分
                         <span
@@ -667,13 +707,16 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
             </ul>
             {hasMore && (
               <div className="pt-2 text-center">
-                <button
+                {/* 与账户页流水的「加载更多」同一原语,触屏下自动补到 44px(审计 SET-11)。 */}
+                <Button
+                  variant="ghost"
+                  size="sm"
                   onClick={loadMore}
                   disabled={loadingMore}
-                  className="text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                  className="text-muted"
                 >
                   {loadingMore ? "加载中…" : "加载更多"}
-                </button>
+                </Button>
               </div>
             )}
             {/[1-9]/.test(data.legacy_unattributed.requests) && (
@@ -683,22 +726,6 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
             )}
           </>
         )}
-      </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
-  return (
-    <div className="rounded-xl border border-border bg-surface px-3 py-2.5">
-      <div className="text-caption text-faint">{label}</div>
-      <div
-        className={cn(
-          "mt-0.5 text-[16px] font-semibold tabular-nums",
-          accent ? "text-accent" : "text-fg",
-        )}
-      >
-        {value}
       </div>
     </div>
   );

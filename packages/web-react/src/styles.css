@@ -25,6 +25,9 @@
   --color-bubble: var(--bubble);
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
+  /* 压在 bg-danger 填充块上的前景(Button danger 等)。暗色 --danger 为前景用途调亮过,
+     白字只有 3.07:1,故明暗各配一档,与 --accent-fg / --primary-fg 同族(shell 审计 S-03)。 */
+  --color-danger-fg: var(--danger-fg);
   --color-success: var(--success);
   --color-success-soft: var(--success-soft);
   --color-warning: var(--warning);
@@ -122,22 +125,27 @@
      是填充用法(bg-danger/… 约 30 处)的 10 倍,故基础色直接取达 AA 的深值,
      不另立 -on-soft 第二套 token。填充块配白字时底色变深,对比度只增不减。
      每个值都同时满足:vs surface(#fff)≥4.5 且 vs 自身 -soft 徽章底 ≥4.5。 */
-  --faint: #6f6f7b; /* was #8b8b97 — 3.37:1,却承载全站说明与引导文案 */
-  --accent: #6c54f0; /* was #6e56f0 — 作徽章前景时 vs soft 底仅 4.45,压 0.4% 明度即达标 */
-  --accent-soft: #6c54f014;
-  --accent-strong: #5a45d6;
+  /* a11y 走查(t-762 shell#3/#4)把口径再推一步:前景不只要 vs 白 ≥4.5,还要 vs「soft 底叠在
+     带色表面上」≥4.5 —— soft 是 8% 透明色,徽章/提示块落在 bg-hover / bg-sidebar / 选中行
+     (#e3e3e6–#ececef)时底色随之变深,原值实测只剩 3.6–4.4。每个值按 HSL 明度逐档压到
+     「vs soft@#ececef ≥4.5」为止(约 -4~-6% 明度),色相饱和度不变;填充块配 -fg 白字对比度只增。 */
+  --faint: #64646f; /* was #6f6f7b — 白底 4.96 但选中行 #e3e3e6 上 3.87;现 4.56 / 白底 5.84 */
+  --accent: #5a3fee; /* was #6c54f0 — vs accent-soft@#ececef 3.88 → 4.71 */
+  --accent-soft: #5a3fee14;
+  --accent-strong: #462ed1; /* 随 accent 同步压暗,保持 hover 比常态深一档 */
   --accent-fg: #ffffff;
   --primary: #17171d;
   --primary-fg: #ffffff;
   --bubble: #f4f4f7;
-  --danger: #d52430; /* was #e04953 — 4.00:1 */
-  --danger-soft: #d5243014;
-  --success: #187f4d; /* was #1fa463 — 3.21:1 */
-  --success-soft: #187f4d14;
-  --warning: #9e6213; /* was #d9871a — 2.83:1,连大字标准都不够 */
-  --warning-soft: #9e621314;
-  --info: #0c64f4; /* was #3b82f6 — 3.68:1 */
-  --info-soft: #0c64f414;
+  --danger: #bb202a; /* was #d52430 — vs danger-soft@#ececef 3.84 → 4.70 */
+  --danger-soft: #bb202a14;
+  --danger-fg: #ffffff; /* vs --danger 6.26:1 */
+  --success: #157044; /* was #187f4d — vs success-soft@#ececef 3.86 → 4.67 */
+  --success-soft: #15704414;
+  --warning: #8a5511; /* was #9e6213 — vs warning-soft@#ececef 3.85 → 4.73 */
+  --warning-soft: #8a551114;
+  --info: #0a58d8; /* was #0c64f4 — vs info-soft@#ececef 3.87 → 4.68 */
+  --info-soft: #0a58d814;
   /* 焦点环必须是实色:原 #6e56f059(35% alpha)合成后仅 ≈1.6:1,键盘用户
      看不见焦点落在哪。实色后 ≥3:1(WCAG 非文本对比)。 */
   --ring: #5a45d6;
@@ -164,7 +172,7 @@
   --border-control: #64647a;
   --fg: #f2f2f6;
   --muted: #bcbcc7;
-  --faint: #7e7e87; /* was #76767f — 4.04:1 */
+  --faint: #92929b; /* was #8a8a94 — vs accent-soft@elevated(#2b293f) 4.12 / hover@surface 4.29;现 4.56 / 4.75,vs surface 5.89 */
   --accent: #9a8aff;
   --accent-soft: #9a8aff1f;
   --accent-strong: #ab9cff;
@@ -174,6 +182,7 @@
   --bubble: #1c1c25;
   --danger: #f0666e;
   --danger-soft: #f0666e1f;
+  --danger-fg: #15151c; /* 白字只有 3.07:1;近黑(同 --accent-fg)约 6:1 */
   --success: #3dbe7e;
   --success-soft: #3dbe7e1f;
   --warning: #e0a03a;
@@ -194,6 +203,11 @@ html, body { height: 100%; margin: 0; }
    露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
    末个有效值生效)。iOS Safari 截图/地址栏/键盘显隐时 100dvh 与 visual viewport
    offset 仍会短暂抖动,React 侧用 visualViewport 写入 CSS var 作最终权威。 */
+/* 顶部 toast 轨道的顶距(components/ui/Toast.tsx `top-[var(--oc-toast-top,4rem)]`)。
+   取值 = ChatHeader 的最小高度 min-h-14(3.5rem)+ 0.5rem 呼吸空间;安全区内边距由轨道自己的
+   header-safe-t 再叠一层。原先 Toast.tsx 写死 top-16,与头部高度两处各写各的(shell 审计 S-20):
+   头部改高度时改这里一处即可,不要再去 Toast.tsx 里改 top-*。 */
+:root { --oc-toast-top: 4rem; }
 #root {
   position: fixed;
   top: var(--oc-visual-offset-top, 0px);
@@ -319,6 +333,15 @@ body {
   :where(button:not(:disabled), [role="button"]:not([aria-disabled="true"]), summary, label[for]) {
     cursor: pointer;
   }
+  /* ── placeholder 对比度(a11y 走查 t-762 shell#5):Tailwind v4 preflight 把 ::placeholder 定成
+     `color-mix(currentColor 50%, transparent)`,在白底上只有 3.4:1(#8a8a8d)。ui/Input 走
+     `placeholder:text-faint` 不受影响,但各模块手写的 <input>/<textarea>(taskboard 描述框、
+     评论框等)全都掉回 preflight。这里在 base 层把全站 placeholder 收敛到 --faint(浅 5.8 / 深 5.9),
+     工具类 placeholder:* 仍在 utilities 层,照旧能覆盖。 ── */
+  ::placeholder {
+    color: var(--faint);
+    opacity: 1;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -342,7 +365,7 @@ body {
   --border-control: #687064;
   --fg: #f5f4ed;
   --muted: #aeb1a8;
-  --faint: #777d73;
+  --faint: #8a9086; /* was #777d73 — vs surface 4.38 / elevated 4.16,低于 AA(shell 审计 S-05) */
   --accent: #c7ff64;
   --accent-soft: rgba(199, 255, 100, 0.1);
   --accent-strong: #d7ff91;
@@ -350,6 +373,11 @@ body {
   --primary: #c7ff64;
   --primary-fg: #0a0b09;
   --bubble: #1a1d17;
+  /* 错误态原先漏定义,回落 :root 的浅色主题红压在近黑画布上只有 ≈3.9:1,
+     --danger-soft 的 8% 红几乎不可见(shell 审计 S-04)。取与 success/warning/info 同一亮度带的暖红。 */
+  --danger: #ff8d80;
+  --danger-soft: rgba(255, 141, 128, 0.12);
+  --danger-fg: #0a0b09;
   --success: #8de68f;
   --success-soft: rgba(141, 230, 143, 0.1);
   --warning: #f6c66a;
@@ -373,7 +401,7 @@ body {
   --color-border-control: #687064;
   --color-fg: #f5f4ed;
   --color-muted: #aeb1a8;
-  --color-faint: #777d73;
+  --color-faint: #8a9086;
   --color-accent: #c7ff64;
   --color-accent-soft: rgba(199, 255, 100, 0.1);
   --color-accent-strong: #d7ff91;
@@ -381,6 +409,9 @@ body {
   --color-primary: #c7ff64;
   --color-primary-fg: #0a0b09;
   --color-bubble: #1a1d17;
+  --color-danger: #ff8d80;
+  --color-danger-soft: rgba(255, 141, 128, 0.12);
+  --color-danger-fg: #0a0b09;
   --color-success: #8de68f;
   --color-success-soft: rgba(141, 230, 143, 0.1);
   --color-warning: #f6c66a;
@@ -626,7 +657,7 @@ body {
   display: flex; min-height: 28px; max-width: calc(100% - 24px); transform: translateX(-50%);
   align-items: center; gap: 7px; white-space: nowrap; padding: 0 10px;
   border: 1px solid var(--preview-border); border-radius: 999px; background: rgba(12, 12, 17, 0.72);
-  color: var(--preview-muted); font-size: 10px; box-shadow: 0 5px 18px rgba(0, 0, 0, 0.16);
+  color: var(--preview-muted); font-size: var(--text-caption); box-shadow: 0 5px 18px rgba(0, 0, 0, 0.16);
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
 .preview-loading-state {
@@ -637,7 +668,7 @@ body {
   border-radius: 999px; background: var(--preview-accent-soft); color: var(--preview-accent);
 }
 .preview-state-title { color: var(--preview-muted); font-size: 13px; font-weight: 600; }
-.preview-state-copy { max-width: 320px; color: var(--preview-faint); font-size: 11px; line-height: 1.55; }
+.preview-state-copy { max-width: 320px; color: var(--preview-faint); font-size: var(--text-caption); line-height: 1.55; }
 .preview-error-state {
   display: flex; align-items: center; justify-content: center; overflow-y: auto; padding: 8px;
   background: transparent; text-align: center;
@@ -649,10 +680,13 @@ body {
 }
 .preview-error-title { margin-top: 10px; color: var(--preview-fg); font-size: 15px; font-weight: 650; line-height: 1.35; }
 .preview-error-copy { max-width: 300px; margin: 5px auto 0; color: var(--preview-muted); font-size: 12px; line-height: 1.55; }
-.preview-error-details { max-width: 320px; margin: 7px auto 0; color: var(--preview-faint); font-size: 11px; text-align: left; }
+/* 容器预览字号收编到全站字阶(media 审计 M-19 / M-27,X-M2):状态胶囊 10px → caption,
+   工具坞标签 / 提示条 / 次级按钮 / 错误详情的手抄 11px → caption token;「诊断详情」summary
+   升到 meta(12px)且命中高 44px(与 ContainerWebPreview 元素级 text-meta + minHeight 44 同源)。 */
+.preview-error-details { max-width: 320px; margin: 7px auto 0; color: var(--preview-faint); font-size: var(--text-caption); text-align: left; }
 .preview-error-details summary {
-  display: flex; min-height: 32px; align-items: center; justify-content: center; list-style-position: inside;
-  color: var(--preview-faint); text-align: center; transition: color 150ms var(--ease-standard);
+  display: flex; min-height: 44px; align-items: center; justify-content: center; list-style-position: inside;
+  color: var(--preview-faint); font-size: var(--text-meta); text-align: center; transition: color 150ms var(--ease-standard);
 }
 .preview-error-details summary:hover { color: var(--preview-muted); }
 .preview-error-detail-body {
@@ -697,7 +731,7 @@ body {
 .preview-action-dock { display: flex; align-items: flex-start; gap: clamp(14px, 4vw, 28px); }
 .preview-action-button {
   display: flex; width: 64px; min-height: 68px; flex-direction: column; align-items: center; justify-content: center;
-  gap: 6px; border-radius: 16px; color: var(--preview-muted); font-size: 11px; font-weight: 600;
+  gap: 6px; border-radius: 16px; color: var(--preview-muted); font-size: var(--text-caption); font-weight: 600;
   transition: color 150ms var(--ease-standard), transform 150ms var(--ease-standard);
 }
 .preview-action-button:hover:not(:disabled) { color: var(--preview-fg); }
@@ -734,13 +768,13 @@ body {
 .preview-composer-submit:disabled { cursor: not-allowed; opacity: 0.28; }
 .preview-comment-hint {
   display: flex; min-height: 44px; max-width: min(760px, 100%); align-items: center; justify-content: center; gap: 8px;
-  border-radius: 999px; padding: 4px 15px; color: var(--preview-muted); font-size: 11px; text-align: center;
+  border-radius: 999px; padding: 4px 15px; color: var(--preview-muted); font-size: var(--text-caption); text-align: center;
 }
 .preview-comment-hint button { min-height: 44px; padding: 0 4px; color: var(--preview-accent); font-weight: 700; }
 .preview-comment-editor { width: min(720px, 100%); border-radius: 22px; padding: 14px; }
 .preview-secondary-button {
   display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 6px;
-  border-radius: 12px; padding: 0 11px; color: var(--preview-muted); font-size: 11px; font-weight: 650;
+  border-radius: 12px; padding: 0 11px; color: var(--preview-muted); font-size: var(--text-caption); font-weight: 650;
 }
 .preview-secondary-button:hover { background: var(--preview-hover); color: var(--preview-fg); }
 .preview-destructive-button { color: #fecaca; }
@@ -845,14 +879,27 @@ body {
   max-height: min(var(--oc-center-max-h), calc(var(--oc-visual-height, 100dvh) - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
 }
 
-/* highlight.js bridged to our tokens */
+/* highlight.js bridged to our tokens
+   浅色四组色值按 a11y 走查(t-762 shell#2)重定:代码块底 --code #fbfbfd、白底、diff 行的
+   danger/success-soft 叠底(实测 #f8ebed / #e8f0ed)以及 surface-2 灰底(#ececef)上都 ≥4.8:1
+   (留 0.3 余量:soft 叠底随语义 token 走,token 再动一次不至于立刻掉回 4.4)。
+   原值 string/title 绿 #1fa463 只有 2.8–3.2、number 橙 #c2761b 3.1–3.6、keyword 紫 #a655c9 3.8–4.4、
+   attr 蓝 #3b6fd4 4.1–4.8。
+   深色档:每组浅色选择器**必须逐个**在 .dark 下覆盖 —— 此前 .dark 只覆盖了每组的前两三个
+   (literal / section / attribute / addition、symbol / bullet / link / deletion 都漏了),浅色值一旦压深,
+   深色代码块里这些 token 就掉到 3.4–3.8(复扫 messages-timeline-rich / tools-bodies 实测)。
+   深色四个值在 --code #0a0a0e 与 elevated #1c1c25 上均 ≥7:1。 */
 .hljs { color: var(--fg); background: transparent; }
 .hljs-comment, .hljs-quote { color: var(--faint); font-style: italic; }
-.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name, .hljs-tag { color: #a655c9; }
-.dark .hljs-keyword, .dark .hljs-selector-tag, .dark .hljs-built_in { color: #c792ea; }
-.hljs-string, .hljs-title, .hljs-section, .hljs-attribute, .hljs-literal, .hljs-type, .hljs-addition { color: #1fa463; }
-.dark .hljs-string, .dark .hljs-title, .dark .hljs-type { color: #3dbe7e; }
-.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-meta, .hljs-link, .hljs-deletion { color: #c2761b; }
-.dark .hljs-number, .dark .hljs-meta { color: #e0a45e; }
-.hljs-function, .hljs-variable, .hljs-attr { color: #3b6fd4; }
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name, .hljs-tag { color: #963dbb; }
+.dark .hljs-keyword, .dark .hljs-selector-tag, .dark .hljs-built_in, .dark .hljs-name, .dark .hljs-tag { color: #c792ea; }
+.hljs-string, .hljs-title, .hljs-section, .hljs-attribute, .hljs-literal, .hljs-type, .hljs-addition { color: #167547; }
+.dark .hljs-string, .dark .hljs-title, .dark .hljs-section, .dark .hljs-attribute, .dark .hljs-literal, .dark .hljs-type, .dark .hljs-addition { color: #3dbe7e; }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-meta, .hljs-link, .hljs-deletion { color: #925813; }
+.dark .hljs-number, .dark .hljs-symbol, .dark .hljs-bullet, .dark .hljs-meta, .dark .hljs-link, .dark .hljs-deletion { color: #e0a45e; }
+.hljs-function, .hljs-variable, .hljs-attr { color: #2d60c8; }
 .dark .hljs-function, .dark .hljs-attr, .dark .hljs-variable { color: #82aaff; }
+
+/* 本设备「大」字号：只放大助手/用户正文，不改工具卡。 */
+[data-font-size="large"] [data-testid="message-text"],
+[data-font-size="large"] .prose { font-size: 17px; }

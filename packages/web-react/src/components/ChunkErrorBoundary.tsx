@@ -1,4 +1,5 @@
-import { Component, Suspense, type ReactNode } from "react";
+import { Component, type ReactNode, Suspense } from "react";
+import { Button } from "./ui/Button";
 
 /**
  * 识别「动态 import 失败」错误:典型场景=SPA 长开的旧标签页,前端发了新版后 index.html 的
@@ -59,21 +60,25 @@ export class ChunkErrorBoundary extends Component<Props, State> {
           <p id="chunk-error-boundary-title" className="text-title font-medium text-fg">
             {this.state.stale ? "已发布新版本" : "此页面加载出错"}
           </p>
-          <p className="text-[13px] leading-relaxed text-muted">
+          <p className="text-body leading-relaxed text-muted">
             {this.state.stale
               ? "页面已更新，刷新后即可继续使用。"
-              : "刷新页面通常即可恢复。"}
+              : "请检查网络后刷新；若刚发版也请刷新。"}
           </p>
-          <button
-            type="button"
-            // 兜底全屏接管输入焦点:键盘用户不依赖 Tab 也能第一时间落到唯一恢复出口。
-            // biome-ignore lint/a11y/noAutofocus: 全屏 alertdialog 唯一可操作控件,自动聚焦是 WAI-ARIA 推荐行为
+          {/* 走 Button 原语:这是整页白屏的唯一出口,裸 <button> 在触屏上只有 ~36px 命中区,
+              点不中等于没有出口;原语自带 44px 触控靶与焦点环(shell 审计 S-09)。 */}
+          <Button
+            variant="primary"
+            size="md"
+            shape="pill"
+            className="mt-1 px-5"
+            // 兜底全屏接管输入焦点:键盘用户不依赖 Tab 也能第一时间落到唯一恢复出口
+            // (全屏 alertdialog 唯一可操作控件,自动聚焦是 WAI-ARIA 推荐行为)。
             autoFocus
             onClick={this.reload}
-            className="mt-1 rounded-full bg-primary px-5 py-2 text-body font-medium text-primary-fg transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             刷新
-          </button>
+          </Button>
         </div>
       </div>
     );

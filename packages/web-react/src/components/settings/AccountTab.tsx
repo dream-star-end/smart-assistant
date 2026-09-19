@@ -15,7 +15,13 @@ import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
 import { insufficientCreditsCopy } from "../../lib/chat/pure";
 import { CreateOrgDialog } from "../org/CreateOrgWizard";
 import { rememberSubscriptionPaid, requestSubscribeIntent } from "./SubscriptionDialog";
-import { formatReportBucket, ledgerReasonLabel, REPORT_WINDOW_NOUN, shortTime } from "./labels";
+import {
+  formatReportBucket,
+  ledgerReasonLabel,
+  ledgerReasonView,
+  REPORT_WINDOW_NOUN,
+  shortTime,
+} from "./labels";
 
 /** 账单收支卡窗口（默认 30d，独立于用量 Tab 的窗口）。 */
 const ACCT_WINDOWS: { value: UsageReportWindow; label: string }[] = [
@@ -42,8 +48,9 @@ function fmtDate(iso: string): string {
 const LEDGER_PAGE = 20;
 
 /**
- * 账户与计费 Tab：余额（credits 字符串大数）+ 充值入口 + 账单流水（credit_ledger，
- * id 游标 keyset 分页）。余额由 /api/me 权威，本面板只读展示；充值走 TopupDialog。
+ * 账户与计费 Tab：余额（credits 字符串大数）+ 订阅 / 加量包入口 + 账单流水（credit_ledger，
+ * id 游标 keyset 分页）。余额由 /api/me 权威，本面板只读展示；订阅与加量包都走
+ * SettingsCenter 托管的 SubscriptionDialog（onManageSub）。
  */
 export function AccountTab({
   auth,
@@ -69,6 +76,9 @@ export function AccountTab({
   const [err, setErr] = useState<string | null>(null);
   const [ledgerReloadTick, setLedgerReloadTick] = useState(0);
   const [sub, setSub] = useState<MySubscription | null>(null);
+  const [subLoading, setSubLoading] = useState(true);
+  const [subErr, setSubErr] = useState(false);
+  const [subReloadTick, setSubReloadTick] = useState(0);
 
   // 积分收支卡（窗口口径，独立于用量 Tab）。
   const [acctWindow, setAcctWindow] = useState<UsageReportWindow>("30d");
@@ -80,20 +90,28 @@ export function AccountTab({
   // 当前订阅（含双钱包余额明细）；reloadKey 变更（到账）后重拉。
   useEffect(() => {
     let alive = true;
+    setSubLoading(true);
+    setSubErr(false);
     api
       .getMySubscription(auth)
       .then((s) => {
         if (!alive) return;
         setSub(s);
+        setSubErr(false);
         rememberSubscriptionPaid(s.paid);
       })
       .catch(() => {
-        /* 订阅读取失败：仅不显示套餐卡，不阻断账户页 */
+        if (!alive) return;
+        setSub(null);
+        setSubErr(true);
+      })
+      .finally(() => {
+        if (alive) setSubLoading(false);
       });
     return () => {
       alive = false;
     };
-  }, [auth, reloadKey]);
+  }, [auth, reloadKey, subReloadTick]);
 
   // 收支报表：窗口切换 / 到账（reloadKey）/ 重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
@@ -168,17 +186,20 @@ export function AccountTab({
         : "成员"
     : "";
 
-  // 本期套餐进度（仅订阅有月度额度时显示）。已用 = 月度额度 − 期内剩余(balance.period)。
+  // 本期套餐进度（仅订阅有月度额度时显示）。进度条画的是**剩余**占比，与右侧「本期剩余 x / y」
+  // 同一语义(审计 SET-13：之前条画已用、字写剩余，余额 0 时满条紫色配「剩余 0」);
+  // 加量包进期内桶后剩余可能高于月度额度，此时按 100% 显示并加注。
   const monthlyBig = sub ? bigOr0(sub.monthlyCredits) : 0n;
   const periodRemainBig = sub ? bigOr0(sub.balance.period) : 0n;
   const showQuota = monthlyBig > 0n;
-  const usedPct = showQuota
-    ? Math.min(100, Math.max(0, Number(((monthlyBig - periodRemainBig) * 10000n) / monthlyBig) / 100))
+  const remainOverMonthly = showQuota && periodRemainBig > monthlyBig;
+  const remainPct = showQuota
+    ? Math.min(100, Math.max(0, Number((periodRemainBig * 10000n) / monthlyBig) / 100))
     : 0;
 
   // 收支图表数据（report 存在时才有值；null 时 canvas 不挂载，useChart 自 no-op）。
-  const ledgerTrend = report?.ledger.trend ?? [];
-  const byReason = report?.ledger.by_reason ?? [];
+  const ledgerTrend = report?.ledger?.trend ?? [];
+  const byReason = report?.ledger?.by_reason ?? [];
   const trendLabels = ledgerTrend.map((p) => formatReportBucket(p.bucket, acctWindow));
   const reasonHasData = byReason.some((r) => chartNum(r.debited) > 0);
   const trendHasData = ledgerTrend.some(
@@ -188,14 +209,25 @@ export function AccountTab({
   const flowRef = useRef<HTMLCanvasElement>(null);
   const reasonRef = useRef<HTMLCanvasElement>(null);
 
+  // 收入（一次充值百万级）与日扣费（十万级以下）差几个数量级，同轴会把支出压成一条线
+  // （审计 SET-17）：收入走右侧独立刻度，支出留在左轴看得出起伏。
   useChart(
     flowRef,
     (theme) =>
       barConfig(theme, {
         labels: trendLabels,
         series: [
-          { label: "收入", data: ledgerTrend.map((p) => chartNum(p.credited)), colorToken: "success" },
-          { label: "支出", data: ledgerTrend.map((p) => chartNum(p.debited)), colorToken: "danger" },
+          {
+            label: "收入（右轴）",
+            data: ledgerTrend.map((p) => chartNum(p.credited)),
+            colorToken: "success",
+            axis: "right",
+          },
+          {
+            label: "支出（左轴）",
+            data: ledgerTrend.map((p) => chartNum(p.debited)),
+            colorToken: "danger",
+          },
         ],
       }),
     [report, acctWindow],
@@ -213,7 +245,7 @@ export function AccountTab({
 
   return (
     <div className="flex flex-col">
-      {/* 我的组织(只读展示;管理功能在组织中心,仅 owner/admin 有入口) */}
+      {/* 我的组织(只读展示；管理功能在组织中心，仅 owner/admin 有入口) */}
       {org && (
         <div className="border-b border-border px-5 py-4">
           <div className="flex items-center gap-1.5 text-meta text-faint">
@@ -232,19 +264,19 @@ export function AccountTab({
           </div>
           {org.status === "suspended" ? (
             <Alert tone="warning" className="mt-2 text-meta">
-              该组织已被暂停,组织钱包与共享技能暂不可用。
+              该组织已被暂停，组织钱包与共享技能暂不可用。
             </Alert>
           ) : (
             <p className="mt-1 text-meta text-faint">
               {org.billing_enabled
                 ? "你的对话用量可由组织钱包统一结算。"
-                : "该组织未对你开启统一结算,用量按个人账户计费。"}
+                : "该组织未对你开启统一结算，用量按个人账户计费。"}
             </p>
           )}
         </div>
       )}
 
-      {/* 无 org:自助开通入口(Claude/GPT 式)。 */}
+      {/* 无 org：自助开通入口(Claude/GPT 式)。 */}
       {!org && (
         <div className="border-b border-border px-5 py-4">
           <div className="flex items-center gap-1.5 text-meta text-faint">
@@ -269,7 +301,19 @@ export function AccountTab({
               <Crown size={13} /> 当前套餐
             </div>
             <div className="mt-1 flex items-center gap-2">
-              <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
+              {subLoading ? (
+                <Skeleton className="h-7 w-28" />
+              ) : subErr ? (
+                <button
+                  type="button"
+                  className="rounded text-body text-danger outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => setSubReloadTick((tick) => tick + 1)}
+                >
+                  套餐信息加载失败 · 重试
+                </button>
+              ) : (
+                <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
+              )}
               {sub?.paid && (
                 <span className="rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent">
                   到期 {fmtDate(sub.periodEnd)}
@@ -277,13 +321,24 @@ export function AccountTab({
               )}
             </div>
             <div className="mt-1 text-meta text-faint">
-              每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
-              {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
+              {subLoading ? (
+                <Skeleton className="h-4 w-40" />
+              ) : subErr ? null : (
+                <>
+                  每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
+                  {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
+                </>
+              )}
             </div>
           </div>
-          <Button variant="secondary" size="sm" onClick={onManageSub} className="shrink-0">
-            {sub?.paid ? "续费 / 升档" : "升级套餐"}
-          </Button>
+          {/* 套餐行是「管理套餐」的唯一常驻入口(含续费 / 升档 / 加量包)。余额耗尽时下方红卡会
+              给出更明确的 CTA(开通 Lite / 加量包)，此时隐藏本按钮 —— 三个按钮开同一个弹层
+              是主次不清(审计 SET-14)。 */}
+          {!low && (
+            <Button variant="secondary" size="sm" onClick={onManageSub} className="shrink-0">
+              {sub?.paid ? "套餐与加量包" : "升级套餐"}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -314,36 +369,43 @@ export function AccountTab({
                 本期剩余 {formatCredits(sub.balance.period)} / {formatCredits(sub.monthlyCredits)}
               </span>
             </div>
-            <Progress value={usedPct} aria-label="本期套餐积分已用" />
+            <Progress value={remainPct} aria-label="本期套餐积分剩余" />
+            {remainOverMonthly && (
+              <p className="mt-1 text-caption text-faint">含加量包积分，剩余高于月度额度。</p>
+            )}
           </div>
         )}
         {low && (
-          <Alert tone="danger" className="mt-2 text-meta">
-            {insufficientCreditsCopy(sub?.paid === true).message}
-          </Alert>
+          <>
+            <Alert tone="danger" className="mt-2 text-meta">
+              {insufficientCreditsCopy(sub?.paid === true).message}
+            </Alert>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => {
+                  requestSubscribeIntent(sub?.paid ? "pack" : "lite");
+                  onManageSub();
+                }}
+              >
+                {sub?.paid ? <Plus size={15} /> : <Crown size={15} />}
+                {sub?.paid ? "购买加量包" : "开通 Lite"}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  requestSubscribeIntent(sub?.paid ? "lite" : "pack");
+                  onManageSub();
+                }}
+              >
+                {sub?.paid ? <Crown size={15} /> : <Plus size={15} />}
+                {sub?.paid ? "升级套餐" : "加量包"}
+              </Button>
+            </div>
+          </>
         )}
-        <div className="mt-3 flex flex-wrap gap-2">
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => {
-              requestSubscribeIntent("lite");
-              onManageSub();
-            }}
-          >
-            <Crown size={15} /> {sub?.paid ? "套餐订阅" : "开通 Lite"}
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => {
-              requestSubscribeIntent("pack");
-              onManageSub();
-            }}
-          >
-            <Plus size={15} /> {sub?.paid ? "购买加量包" : "加量包"}
-          </Button>
-        </div>
         <p className="mt-2 text-meta text-faint">
           按实际用量计量扣费，扣费优先消耗套餐期内积分。加量包仅在当前套餐有效期内可用；
           存量钱包余额永久有效、扣完期内桶后继续使用。
@@ -374,19 +436,21 @@ export function AccountTab({
             <Alert tone="danger" className="text-meta">
               {reportErr}
             </Alert>
-            <button
-              type="button"
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              aria-label="重试收支图表"
               onClick={() => setReportReloadTick((t) => t + 1)}
-              className="mt-2 text-body text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
             >
               重试
-            </button>
+            </Button>
           </>
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <ChartCard
               title="收支趋势"
-              hint="充值/赠送为收入，扣费为支出"
+              hint="充值/赠送为收入（右轴），扣费为支出（左轴）"
               height={200}
               ariaLabel={`收支趋势，近 ${REPORT_WINDOW_NOUN[acctWindow]}`}
               dataTable={{
@@ -464,14 +528,19 @@ export function AccountTab({
             <ul className="flex flex-col gap-0.5">
               {rows.map((r) => {
                 const neg = r.delta.trim().startsWith("-");
+                const reason = ledgerReasonView(r.reason);
                 return (
                   <li
                     key={r.id}
                     className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover"
                   >
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-section text-fg">
-                        {ledgerReasonLabel(r.reason)}
+                      {/* 未知 reason 显示「其他」，原枚举值留在 title 里(审计 SET-16)。 */}
+                      <span
+                        className="block truncate text-section text-fg"
+                        title={reason.raw ?? undefined}
+                      >
+                        {reason.label}
                         {r.memo ? <span className="text-faint"> · {r.memo}</span> : null}
                       </span>
                       <span className="block truncate text-caption text-faint">

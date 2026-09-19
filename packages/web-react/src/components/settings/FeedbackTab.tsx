@@ -291,7 +291,8 @@ export function FeedbackTab({
                   aria-pressed={category === option.value}
                   onClick={() => setCategory(option.value)}
                   className={cn(
-                    'rounded-full border px-3 py-1.5 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    // 触屏补 44px 命中高(t-762 settings#5:此前 32px);桌面 hover 可用时零变化。
+                    'rounded-full border px-3 py-1.5 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11',
                     category === option.value
                       ? 'border-accent/50 bg-accent-soft text-accent'
                       : 'border-border text-muted hover:border-accent/40 hover:text-fg',

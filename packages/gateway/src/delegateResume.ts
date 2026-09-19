@@ -1,3 +1,4 @@
+import { identityCompatAgentIdsEqual, type IdentityCompatProjection } from '@openclaude/protocol'
 /**
  * Optional resume for HTTP/MCP `delegate_task`.
  *
@@ -121,6 +122,8 @@ export class DelegateResumeRegistry {
     sourceAgent: string
     /** Client/request idempotency key. Same key + same resume session never dispatches twice. */
     idempotencyKey?: string
+    /** Successful authenticated projection; only changes pair semantics, never parent/key ownership. */
+    identityProjection?: IdentityCompatProjection
   }): DelegateResumePreflight {
     const evictedKeys = this.pruneExpired()
     const parentSessionKey =
@@ -130,6 +133,13 @@ export class DelegateResumeRegistry {
     const resumeKey = normalizeResumeSessionKey(input.resumeSessionKey)
     const idempotencyKey = normalizeResumeSessionKey(input.idempotencyKey)
 
+    if (resumeKey) {
+      const binding = this.bindings.get(resumeKey)
+      const idsEqual = (left: string, right: string) => left === right || Boolean(input.identityProjection && identityCompatAgentIdsEqual(left, right, input.identityProjection))
+      if (!binding || binding.parentSessionKey !== parentSessionKey || !idsEqual(binding.targetAgentId, targetAgentId) || !idsEqual(binding.sourceAgent, sourceAgent)) {
+        return this.reject(resumeKey, idempotencyKey, 400, 'resumeSessionKey 与当前父会话/目标 agent 不匹配', evictedKeys)
+      }
+    }
     this.pruneAttempts()
     if (resumeKey && idempotencyKey) {
       const existing = this.attempts.get(attemptId(resumeKey, idempotencyKey))
@@ -156,8 +166,8 @@ export class DelegateResumeRegistry {
       }
       if (
         binding.parentSessionKey !== parentSessionKey ||
-        binding.targetAgentId !== targetAgentId ||
-        binding.sourceAgent !== sourceAgent
+        (binding.targetAgentId !== targetAgentId && !(input.identityProjection && identityCompatAgentIdsEqual(binding.targetAgentId, targetAgentId, input.identityProjection))) ||
+        (binding.sourceAgent !== sourceAgent && !(input.identityProjection && identityCompatAgentIdsEqual(binding.sourceAgent, sourceAgent, input.identityProjection)))
       ) {
         return this.reject(
           resumeKey,

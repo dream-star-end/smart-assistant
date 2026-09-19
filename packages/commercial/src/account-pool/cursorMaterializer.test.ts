@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -14,10 +14,21 @@ import {
   normalizeCursorApiKey,
   slotFileName,
   syncCursorAuthDir,
+  createCursorAuthSyncScheduler,
+  listAllCursorAccounts,
 } from "./cursorMaterializer.js";
 
 const KEY_A = `crsr_${"a".repeat(64)}`;
 const KEY_B = `crsr_${"b".repeat(64)}`;
+
+async function within<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("materializer test barrier timed out")), 3000);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
 
 describe("cursor key helpers", () => {
   test("accepts crsr_ keys and rejects junk", () => {
@@ -302,8 +313,10 @@ describe("syncCursorAuthDir", () => {
     });
 
     assert.equal(afterDelete.imported, 0);
-    assert.equal(afterDelete.skipped, "empty-pool-keep-files");
-    assert.equal(readFileSync(join(authDir, "api-key"), "utf8"), `${KEY_A}\n`);
+    assert.equal(afterDelete.skipped, null);
+    assert.equal(existsSync(join(authDir, "api-key")), false);
+    const emptyGen = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8").trim();
+    assert.equal(existsSync(join(authDir, CURSOR_POOL_GENERATIONS_DIR, emptyGen, "api-key")), false);
     assert.equal(created.length, 1);
   });
 
@@ -338,7 +351,7 @@ describe("syncCursorAuthDir", () => {
     assert.equal(readdirSync(authDir).includes("api-key.bak-keep"), true);
   });
 
-  test("keeps host files when every pool row is disabled", async () => {
+  test("revokes root and active generation when every pool row is disabled", async () => {
     const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
     writeFileSync(join(authDir, "api-key"), `${KEY_A}\n`, { mode: 0o600 });
 
@@ -352,7 +365,87 @@ describe("syncCursorAuthDir", () => {
       getCursorTokenSnapshot: async () => null,
     });
 
-    assert.equal(result.skipped, "empty-pool-keep-files");
-    assert.equal(readFileSync(join(authDir, "api-key"), "utf8"), `${KEY_A}\n`);
+    assert.equal(result.skipped, null);
+    assert.equal(existsSync(join(authDir, "api-key")), false);
+    const emptyGen = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8").trim();
+    assert.equal(existsSync(join(authDir, CURSOR_POOL_GENERATIONS_DIR, emptyGen, "api-key")), false);
   });
+});
+
+test("Cursor account enumeration covers later pages without truncating readiness", async () => {
+  const rows = Array.from({ length: 601 }, (_, i) => ({ id: BigInt(i + 1) }));
+  const offsets: number[] = [];
+  const found = await listAllCursorAccounts(async (opts) => {
+    offsets.push(opts!.offset!);
+    return rows.slice(opts!.offset!, opts!.offset! + opts!.limit!) as never;
+  });
+  assert.deepEqual(offsets, [0, 500]);
+  assert.equal(found.length, 601);
+  assert.equal(found[0].id, 1n);
+  assert.equal(found[600].id, 601n);
+});
+
+test("stopped materializer owner cannot resurrect slots after a new owner publishes empty pool", { timeout: 5000 }, async () => {
+  const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-owner-"));
+  writeFileSync(join(authDir, CURSOR_POOL_OWNED_MARKER), "1\n");
+  let release!: () => void;
+  let entered!: () => void;
+  let freshDone!: () => void;
+  const blocked = new Promise<void>((r) => { release = r; });
+  const started = new Promise<void>((r) => { entered = r; });
+  const published = new Promise<void>((r) => { freshDone = r; });
+  const errors: unknown[] = [];
+  let freshRuns = 0;
+  const old = createCursorAuthSyncScheduler({ delayMs: 0, onError: (e) => errors.push(e), run: (canPublish) => syncCursorAuthDir({
+    authDir, canPublish,
+    listAccounts: async () => [{ id: 1n, provider: "cursor", status: "active", cooldown_until: null }] as never,
+    getCursorTokenSnapshot: async () => { entered(); await blocked; return { token: Buffer.from(KEY_A) } as never; },
+    createAccount: async () => { throw new Error("must not import"); },
+  }) });
+  const fresh = createCursorAuthSyncScheduler({ delayMs: 0, onError: (e) => errors.push(e), run: async (canPublish) => {
+    await syncCursorAuthDir({ authDir, canPublish, listAccounts: async () => [], getCursorTokenSnapshot: async () => null,
+      createAccount: async () => { throw new Error("must not import"); } });
+    freshRuns += 1; freshDone();
+  } });
+  try {
+    old.schedule("before-delete");
+    await within(started);
+    const draining = old.stop();
+    fresh.schedule("deleted");
+    await within(published);
+    const emptyGeneration = readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8");
+    release();
+    await draining;
+    old.schedule("late-admin-trigger");
+    await old.stop();
+    assert.equal(readFileSync(join(authDir, CURSOR_POOL_ACTIVE_FILE), "utf8"), emptyGeneration);
+    assert.equal(existsSync(join(authDir, "api-key")), false);
+    assert.equal(freshRuns, 1);
+    assert.deepEqual(errors, []);
+  } finally {
+    release();
+    await Promise.all([old.stop(), fresh.stop()]);
+    rmSync(authDir, { recursive: true, force: true });
+  }
+});
+
+test("an in-flight admin mutation schedules exactly one trailing materialization", { timeout: 5000 }, async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  let completed!: () => void;
+  const barrier = new Promise<void>((r) => { release = r; });
+  const started = new Promise<void>((r) => { entered = r; });
+  const done = new Promise<void>((r) => { completed = r; });
+  let runs = 0;
+  const actor = createCursorAuthSyncScheduler({ delayMs: 0, run: async () => {
+    runs += 1;
+    if (runs === 1) { entered(); await barrier; }
+    else completed();
+  } });
+  try {
+    actor.schedule("create"); await within(started);
+    actor.schedule("disable"); actor.schedule("delete"); release();
+    await within(done); await actor.stop();
+    assert.equal(runs, 2);
+  } finally { release(); await actor.stop(); }
 });

@@ -17,14 +17,15 @@
     <meta name="apple-mobile-web-app-title" content="从简" />
     <script>
       try {
-        var t = localStorage.getItem("oc_theme") || "system";
+        // 取值校验与 src/hooks/useTheme.ts 的 parseTheme 同口径:脏值回落 system。
+        var t = localStorage.getItem("oc_theme");
+        if (t !== "light" && t !== "dark" && t !== "system") t = "system";
         var dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
-        if (dark) {
-          document.documentElement.classList.add("dark");
-          // theme-color 同步写入:静态值是浅色,暗色用户首屏地址栏/状态栏会闪白。
-          var tc = document.querySelector('meta[name="theme-color"]');
-          if (tc) tc.setAttribute("content", "#090a08");
-        }
+        if (dark) document.documentElement.classList.add("dark");
+        // theme-color 两个分支都写,与 useTheme.ts 的 THEME_COLOR 取同一对值(useTheme.test 钉住):
+        // 静态默认值是营销页黑 #090a08,原先只在 dark 时改写,浅色用户直接进工作区时状态栏先黑后白。
+        var tc = document.querySelector('meta[name="theme-color"]');
+        if (tc) tc.setAttribute("content", dark ? "#0c0c11" : "#fafafb");
       } catch (e) {}
     </script>
   </head>

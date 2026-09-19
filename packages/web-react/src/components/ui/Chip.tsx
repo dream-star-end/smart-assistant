@@ -10,10 +10,12 @@ import { cn } from "../../lib/utils";
  * text-[12px]` 筛选药丸,选中态的底色/边框/字色三处各自漂移 —— 这条不变量收进原语。
  *
  * 字号一律走语义 token(text-meta / text-caption),不写任意值;触屏下补触控靶
- * `[@media(hover:none)]:min-h-9`(桌面 hover 可用时渲染零变化)。
+ * `[@media(hover:none)]:min-h-11`(44px,与 Button / IconButton / Input / Tabs 同一标准;
+ * 桌面 hover 可用时渲染零变化)。shell 审计 S-14:原先停在 min-h-9(36px),同一批可点元素
+ * 在触屏上两套命中标准,而 Chip 恰恰是筛选行里最密集、最需要命中面积的那个。
  */
 export const chipVariants = cva(
-  "inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-9",
+  "inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-11",
   {
     variants: {
       selected: {

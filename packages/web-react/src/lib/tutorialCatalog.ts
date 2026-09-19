@@ -20,7 +20,10 @@ const TUTORIAL_MEDIA_V3 = new Set<TutorialMediaKey>([
   "schedules-reminders",
   "skills-training",
   "team-mode",
+  "models-reasoning",
+  "sessions-history",
 ]);
+const TUTORIAL_MEDIA_V4 = new Set<TutorialMediaKey>(["agents", "chat-basics"]);
 const TUTORIAL_MEDIA_V5 = new Set<TutorialMediaKey>(["container-web-preview"]);
 
 export const TUTORIAL_MEDIA: Record<
@@ -44,8 +47,9 @@ export const TUTORIAL_MEDIA: Record<
       ],
       ["image-create-edit", "打开生成图片，进入圈选修改并查看下载操作。"],
       ["github-repository", "关联 GitHub，选择仓库与分支并确认绑定。"],
-      ["agents", "打开智能体选择器，查看并切换已安装的专业助手。"],
+      ["agents", "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。"],
       ["team-mode", "在智能体选择器中开启团队模式并确认队长说明。"],
+      ["advisor-mode", "在智能体选择器中选择顾问，并核对顶栏冻结的顾问型号。"],
       ["memory-auto-dream", "进入记忆中心，查看长期记忆与 Auto-Dream 报告。"],
       [
         "schedules-reminders",
@@ -69,9 +73,11 @@ export const TUTORIAL_MEDIA: Record<
     {
       version: TUTORIAL_MEDIA_V5.has(id)
         ? 5
-        : TUTORIAL_MEDIA_V3.has(id)
-          ? 3
-          : 2,
+        : TUTORIAL_MEDIA_V4.has(id)
+          ? 4
+          : TUTORIAL_MEDIA_V3.has(id)
+            ? 3
+            : 2,
       poster: `/tutorials/${id}.webp`,
       video: `/tutorials/${id}.webm`,
       caption,
@@ -101,7 +107,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 6,
+    contentVersion: 9,
     intro:
       "从简不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，有时还会出现可点击的选择卡。任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -112,16 +118,16 @@ export const TUTORIAL_TOPICS = {
     ],
     steps: [
       {
-        title: "先说结果",
-        body: "第一句先讲清最终想拿到什么，例如“一页汇报稿”或“一份可运行脚本”。",
+        title: "新建任务，先说结果",
+        body: "侧栏点击“新建会话”进入空白任务；需要专业助手时，点它右侧的下拉箭头“选择智能体后新建”。第一句先讲清最终想拿到什么，例如“一页汇报稿”或“一份可运行脚本”。",
       },
       {
         title: "补充材料与约束",
-        body: "告诉它受众、期限、格式、不能做什么；图片可直接粘贴到输入框，其他文件点“+”上传，不必手工粘贴全文。需要本会话始终对准同一目标时，再用“+”里的设定目标。",
+        body: "告诉它受众、期限、格式、不能做什么；图片可直接粘贴到输入框，其他文件点输入框工具条上的回形针按钮「添加附件」上传，不必手工粘贴全文。需要本会话始终对准同一目标时，再用“+”菜单里的设定目标。",
       },
       {
         title: "观察执行而不是反复催促",
-        body: "任务运行时查看进度、工具卡和计划；确需改方向时再停止或追加信息。",
+        body: "任务运行时查看进度、工具卡和计划；确需改方向时再停止。想补一句但不想打断这一轮，可先把内容写进输入框，再点工具条上的「排队发送」按钮（提示“本轮结束后自动发送”）：它会显示“已加入队列，本轮结束后发送”，等这一轮结束自动发出；生成中的「停止」仍是唯一的中止按钮。",
       },
       {
         title: "看清选择卡再点",
@@ -268,7 +274,7 @@ export const TUTORIAL_TOPICS = {
   },
   "models-reasoning": {
     featureId: "models-reasoning",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "顶栏模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。当前可选范围包含 GPT、DeepSeek、GLM，以及 Grok 4.6（官方 grok-build）和 Cursor 家族。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。",
     outcome: "按任务难度选择合适模型，在响应速度、质量与积分消耗之间取得平衡。",
@@ -297,7 +303,7 @@ export const TUTORIAL_TOPICS = {
     ],
     tips: [
       "模型越强不代表所有任务都更划算，批量简单处理优先选择速度与成本。",
-      "团队模式的队长引擎有独立说明，不完全等同于普通模型选择。",
+      "窄屏时模型选择器可能另起一行。团队模式的队长引擎有独立说明；若选择普通模型，需先按提示关闭团队模式后生效。外接 API 的 Haiku 4.5 是单档型号，无需选择思考档位；这不代表所有聊天入口均已开放该型号。",
     ],
     cautions: ["高思考深度通常耗时和积分更多；切换前可先查看账户用量。"],
     media: "models-reasoning",
@@ -305,9 +311,9 @@ export const TUTORIAL_TOPICS = {
   },
   "files-media": {
     featureId: "files-media",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
-      "图片可以直接粘贴到输入框，也可以和 PDF、Word、Excel、音频、视频及常见文本文件一样从“+”菜单上传。上传完成后，文件会作为本条消息的材料交给智能体；图片可先预览，失败的附件可单独重试或移除。",
+      "图片可以直接粘贴到输入框，也可以和 PDF、Word、Excel、音频、视频及常见文本文件一样，从输入框工具条上的回形针按钮「添加附件」上传。上传完成后，文件会作为本条消息的材料交给智能体；图片可先预览，失败的附件可单独重试或移除。",
     outcome: "直接让 AI 阅读真实材料，而不是复制粘贴后丢失格式与上下文。",
     scenarios: [
       "分析表格与合同",
@@ -317,7 +323,7 @@ export const TUTORIAL_TOPICS = {
     steps: [
       {
         title: "先添加附件",
-        body: "图片可直接粘贴到输入框；也可点击“+”选择一个或多个文件，等待每个附件显示上传完成。",
+        body: "图片可直接粘贴到输入框；也可点击输入框工具条上的回形针按钮「添加附件」，选择一个或多个文件，等待每个附件显示上传完成。",
       },
       {
         title: "说明材料角色",
@@ -541,7 +547,7 @@ export const TUTORIAL_TOPICS = {
   },
   "github-repository": {
     featureId: "github-repository",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
       "把 GitHub 账号授权给平台后，可为当前会话绑定一个仓库和分支。智能体会在绑定的真实代码上下文中查看文件、运行构建和测试，并按你的授权与指令提交或推送改动。仓库绑定是按会话隔离的。",
     outcome: "让编程任务直接落到仓库和分支，而不是只返回一段孤立代码。",
@@ -553,7 +559,7 @@ export const TUTORIAL_TOPICS = {
     steps: [
       {
         title: "连接 GitHub",
-        body: "点击输入框下方仓库入口，完成 GitHub OAuth 授权。",
+        body: "点击输入框下方仓库入口，在仓库对话框中完成 GitHub OAuth 授权及仓库、分支选择；关闭对话框会返回当前会话。",
       },
       {
         title: "选仓库与分支",
@@ -582,9 +588,9 @@ export const TUTORIAL_TOPICS = {
   },
   agents: {
     featureId: "agents",
-    contentVersion: 1,
+    contentVersion: 5,
     intro:
-      "智能体是一套长期稳定的角色、工作方式和专用能力。点击顶栏头像可以在全能助手、平台预设和已安装智能体之间切换；每个会话记录自己的智能体归属，重新打开时会恢复。",
+      "智能体是一套长期稳定的角色、工作方式和专用能力。新任务可从侧栏“新建会话”右侧箭头先选助手；已有任务可点击顶栏当前助手名称切换。每个会话记录自己的智能体归属，重新打开时会恢复。",
     outcome: "把专业任务交给更懂该领域、带有合适工具和流程的助手。",
     scenarios: [
       "编程、科研、办公等专业任务",
@@ -593,16 +599,16 @@ export const TUTORIAL_TOPICS = {
     ],
     steps: [
       {
-        title: "打开智能体选择器",
-        body: "点击顶栏当前助手名称，查看已安装智能体与简介。",
+        title: "先选助手，再开始新任务",
+        body: "点击侧栏“新建会话”右侧的“选择智能体后新建”箭头，进入空白会话并打开智能体选择器，查看已安装智能体与简介。旧会话仍可在侧栏找回。",
       },
       {
         title: "按任务而不是名字选择",
-        body: "查看能力说明、所需工具和适用场景；日常混合任务可继续用全能助手。",
+        body: "查看能力说明、所需工具和适用场景；日常混合任务可继续用全能助手。带「Plugin 待授权」或「能力待修复」徽章的智能体暂时选不了：卡片会写明原因（如“有 N 项插件待授权，完成授权后即可使用”），点击这张卡片或右下角的「去授权」/「去处理」按钮即可前往授权或修复所需能力，处理完回来就能选用。",
       },
       {
-        title: "切换后再下达任务",
-        body: "切换只影响当前会话后续执行；旧智能体的迟到结果不会混入新角色。",
+        title: "核对角色后再下达任务",
+        body: "选择后在顶栏核对助手名称，再输入新任务。全能助手卡片里还有单人/顾问/团队三选一，那是协作方式，不是换助手。窄屏可能截短名称并隐藏箭头，仍可点击整个助手按钮；助手入口用于切换角色，不是模型入口。已有会话切换不会另开会话，只影响后续执行。",
       },
       {
         title: "从市场补充",
@@ -615,11 +621,11 @@ export const TUTORIAL_TOPICS = {
     ],
     cautions: ["社区智能体安装前查看介绍、权限和依赖技能。"],
     media: "agents",
-    related: ["team-mode", "marketplace-discovery", "skills-training"],
+    related: ["team-mode", "advisor-mode", "marketplace-discovery"],
   },
   "team-mode": {
     featureId: "team-mode",
-    contentVersion: 3,
+    contentVersion: 5,
     intro:
       "团队模式由队长拆解任务，并按需委派给已安装的专业智能体并行工作。即使未开团队模式，对话里也可以用委派子任务；运行中会出现委派直播卡（delegate-progress），显示子任务正在做什么，而不是一条普通工具结果。界面还会展示成员进度、工具、结果和各自消耗。",
     outcome: "让调研、实现、验证等子任务并行推进，同时看清每一步委派进度。",
@@ -631,7 +637,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "在智能体选择器开启团队模式",
-        body: "开启后顶栏会常驻团队标识，并显示真实队长引擎说明。队长引擎与顶栏“当前模型”不是同一件事。",
+        body: "在全能助手卡片的「单人 / 顾问 / 团队」里点团队。开启后顶栏会常驻团队标识，并显示真实队长引擎说明。队长引擎与顶栏“当前模型”不是同一件事。顾问模式不会切换队长引擎。",
       },
       {
         title: "给出可拆分目标",
@@ -639,7 +645,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "看委派直播卡与成本",
-        body: "对话里的委派直播卡会持续更新子任务动作，不要当成已经结束的普通工具卡。终稿完成后检查各成员结果和积分明细。",
+        body: "对话里的委派直播卡会持续更新子任务动作，不要当成已经结束的普通工具卡。运行中的团队浮条不会自动收起，可展开查看成员；需要中止时点击“停止本轮”，只作用于当前会话这轮任务。终稿完成后检查各成员结果和积分明细。",
       },
     ],
     tips: [
@@ -651,6 +657,43 @@ export const TUTORIAL_TOPICS = {
     ],
     media: "team-mode",
     related: ["agents", "billing-usage", "marketplace-discovery"],
+  },
+  "advisor-mode": {
+    featureId: "advisor-mode",
+    contentVersion: 4,
+    intro:
+      "顾问模式给全能助手配一个只出主意的顾问。主模型不会因此被切换。目前只有 GLM、MiniMax 这类会话可以咨询；Grok、Cursor 等其它主模型会在选择或发送前直接说明不能用，不会偷偷换主模型或改成单人。需要时主模型向顾问提问。顾问只能给建议，不能改文件、跑命令或再派人。建议必须由执行者用证据验证后才交付，不能替代审批或正式审查。",
+    outcome: "在不换主模型的前提下获得第二意见，并由主模型负责核验与执行。",
+    scenarios: ["方案取舍需要第二意见", "主模型想核对实现约束", "对照普通/顾问/更强主模型的质量与费用"],
+    steps: [
+      {
+        title: "打开智能体选择器",
+        body: "点顶栏当前智能体名称，在全能助手卡片里看到「单人 / 顾问 / 团队」三选一。只有全能助手入口提供顾问。",
+      },
+      {
+        title: "选择顾问",
+        body: "点「顾问」。主模型选择器保持不变。若当前模型不能咨询，按钮会禁用并说明要把顶栏模型换成 GLM 或 MiniMax。新会话必须先正常创建，才能保存协作方式。若顾问列表为空，说明暂时没有可用顾问，也不会自动改成别的型号。",
+      },
+      {
+        title: "核对顶栏固定配置",
+        body: "顶栏顾问标识会显示本回合固定使用的顾问型号。发送、排队、失败重试和刷新都沿用这次选择。后来在本机或另一端改成单人/团队，或改新会话默认，都不会改写已经发出的原回合。",
+      },
+      {
+        title: "阅读建议并自行验证",
+        body: "对话里的「咨询顾问」卡片会显示问了什么、意见、状态和实际型号。用量未返回时标明未返回，不会填 0。本轮只有一个停止入口。主模型必须对照证据决定是否采纳；错误建议应被驳回。",
+      },
+    ],
+    tips: [
+      "只在需要第二意见时开顾问，简单问答用单人即可。",
+      "可以把「同时设为新对话的默认协作方式」勾上，但那只改默认，不会覆盖已经保存的会话设置，也不会改写原回合。",
+    ],
+    cautions: [
+      "目前只有 GLM、MiniMax 这类主模型可以咨询顾问；其它主模型会明确不可用。",
+      "顾问按实际型号计费，不承诺比单人更省。",
+      "顾问意见不是审批通过，也不能代替正式代码审查。",
+    ],
+    media: "advisor-mode",
+    related: ["team-mode", "agents", "billing-usage"],
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
@@ -957,9 +1000,9 @@ export const TUTORIAL_TOPICS = {
   },
   "billing-usage": {
     featureId: "billing-usage",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "账户与计费页展示套餐、期内积分、长期钱包、充值、订单和收支；用量页按时间、模型、Token、缓存命中和会话拆解消耗。获准使用外部 API 的账号还会看到 API Key 区，普通账号不会显示该入口。",
+      "账户与计费页展示套餐、期内积分、长期钱包、充值、订单和收支；用量页按时间、模型、Token、缓存命中和会话拆解消耗。窄屏可点击顶栏钱包图标打开账户入口。管理员在设置中另有独立的“API 接入”分区，普通账号不会显示该入口。",
     outcome: "知道积分从哪里来、花到哪里，并在预算内选择模型和工作方式。",
     scenarios: ["充值或升级套餐", "分析某段时间用量", "核对模型与缓存消耗"],
     steps: [
@@ -977,7 +1020,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "按权限管理 API Key",
-        body: "仅在页面出现该分区且确需外部调用时创建；明文只显示一次，泄露或不用时立即撤销。",
+        body: "管理员进入设置 → API 接入，按需创建密钥并复制接入配置。按密钥、按模型和密钥列表可本地翻页；最近明细用“加载更多”取回后续记录；请求审计可筛选密钥或只看失败，并展开查看消息摘要。明文密钥只显示一次，泄露或不用时立即撤销。",
       },
     ],
     tips: [

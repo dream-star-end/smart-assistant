@@ -183,6 +183,43 @@ describe("HupijiaoPaymentEntry 当前微信支付能力", () => {
     expect(onReorder).toHaveBeenCalledOnce();
   });
 
+  test("桌面二维码加载失败 → 提示 + 「重新获取二维码」调用 onReorder（审计 SET-31）", () => {
+    setNavigator({ userAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" });
+    const onReorder = vi.fn();
+    const { rerender } = render(
+      <HupijiaoPaymentEntry
+        qrcodeUrl="https://pay.test/qr.png"
+        mobileUrl={mobileUrl}
+        pendingPayment={pendingPayment}
+        amountCents="3800"
+        expiresAt={futureExpiry}
+        onReorder={onReorder}
+      />,
+    );
+    fireEvent.error(screen.getByRole("img", { name: "微信支付二维码" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.getByTestId("payment-qr-failed")).toHaveTextContent("二维码加载失败");
+    // 金额与倒计时仍在，用户知道订单还有效
+    expect(screen.getByTestId("payment-order-amount")).toHaveTextContent("¥38.00");
+    fireEvent.click(screen.getByTestId("payment-qr-retry"));
+    expect(onReorder).toHaveBeenCalledOnce();
+    // 重新下单拿到新二维码 URL → 失败态复位，重新挂图
+    rerender(
+      <HupijiaoPaymentEntry
+        qrcodeUrl="https://pay.test/qr-2.png"
+        mobileUrl={mobileUrl}
+        pendingPayment={{ ...pendingPayment, orderNo: "order-2" }}
+        amountCents="3800"
+        expiresAt={futureExpiry}
+        onReorder={onReorder}
+      />,
+    );
+    expect(screen.getByRole("img", { name: "微信支付二维码" })).toHaveAttribute(
+      "src",
+      "https://pay.test/qr-2.png",
+    );
+  });
+
   test("微信过期后复制按钮变为重新下单", () => {
     setNavigator({ userAgent: "Mozilla/5.0 (iPhone) Mobile MicroMessenger/8.0.60", mobile: true });
     render(

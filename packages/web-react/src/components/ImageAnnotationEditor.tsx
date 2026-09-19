@@ -13,7 +13,7 @@ import {
   Undo2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchImageBlobWithResign, type ResolveSignedSrc } from '../lib/chat/media'
 import { downloadPercent } from '../lib/chat/download'
 import { getCachedThumbnail } from '../lib/chat/imageBytes'
@@ -100,6 +100,68 @@ function hasSelection(canvas: HTMLCanvasElement): boolean {
 
 export const BRUSH_MIN = 12
 export const BRUSH_MAX = 180
+
+// 工具元数据(触发钮回显当前工具图标 + 菜单列表共用单一权威)。
+const TOOLS: { value: Tool; label: string; icon: React.ReactNode }[] = [
+  { value: 'brush', label: '画笔', icon: <Brush size={18} /> },
+  { value: 'rect', label: '矩形', icon: <Square size={18} /> },
+  { value: 'lasso', label: '套索', icon: <LassoSelect size={18} /> },
+  { value: 'erase', label: '橡皮', icon: <Eraser size={18} /> },
+]
+
+/**
+ * 底栏按钮两件套。**必须**定义在模块顶层:此前写在 ImageAnnotationEditor 函数体内,每次渲染都是
+ * 新的组件类型,任何一次 setState(撤销 / 缩放 / 落一笔)都让整段底栏卸载重挂 —— 焦点掉回 <body>,
+ * 键盘/读屏用户每按一下都要重新找位置(审计 M-12)。
+ */
+function ToolButton({
+  value,
+  label,
+  icon,
+  active,
+  onSelect,
+}: { value: Tool; label: string; icon: React.ReactNode; active: boolean; onSelect: (value: Tool) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(value)}
+      aria-pressed={active}
+      className={cn(
+        'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
+        active ? 'bg-white text-black' : 'text-white hover:bg-white/10',
+      )}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  )
+}
+
+function RoundBtn({
+  label,
+  icon,
+  onClick,
+  disabled,
+}: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex size-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 disabled:opacity-35"
+    >
+      {icon}
+    </button>
+  )
+}
+
+/** 提示词框自增高:单行起步,随内容长到 max-h-28(7rem)封顶后再内滚(审计 M-23)。 */
+function autoGrowTextarea(el: HTMLTextAreaElement) {
+  el.style.height = 'auto'
+  const max = 112 // 与 className 的 max-h-28 一致
+  el.style.height = `${Math.min(el.scrollHeight, max)}px`
+}
 
 /** 左侧竖直锥形笔刷滑杆(粗上细下)。**完整拖动交互**(需求 §3):pointerdown+move 连续跟手,
  * 鼠标/触摸同一路径(pointer 事件统一),拖动时右侧气泡显示当前粗细;命中区 44px 宽(w-11)。
@@ -266,7 +328,12 @@ export function ImageAnnotationEditor({
   // 时画布尚未画上任何东西,必须用**满画布错误面板 + 重试**覆盖,永不留纯白画布(需求 §1)。
   const [loadError, setLoadError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
-  const [revision, setRevision] = useState(0)
+  // 只为在历史栈(ref)变化后触发重渲染,让撤销 / 重做按钮的 disabled 跟上;值本身不读。
+  const [, setRevision] = useState(0)
+  // 选区有无(media M-23):抬手 / 撤销重做 / 清空 / 换图时**就地**定下来,不再在每次 revision 变化后
+  // 对整张 mask getImageData 全量扫描(每一笔都扫一遍 1280px 级位图)。画笔落笔必有选区不扫;
+  // 矩形 / 套索可能零面积、擦除可能擦空,这三种抬手后扫一次;撤销 / 重做恢复快照后扫一次。
+  const [selectionPresent, setSelectionPresent] = useState(false)
   const [historyPending, setHistoryPending] = useState(false)
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 })
 
@@ -364,6 +431,8 @@ export function ImageAnnotationEditor({
           // camera image. The original stays as compressed bytes for upload.
           imageRef.current = displaySource
           render()
+          // 新 mask 是空白的(M-23)。
+          setSelectionPresent(false)
           setRevision((v) => v + 1)
         } finally {
           URL.revokeObjectURL(url)
@@ -386,6 +455,7 @@ export function ImageAnnotationEditor({
       }
       imageRef.current = null
       sourceBlobRef.current = null
+      setSelectionPresent(false)
     }
   }, [open, source, render, resolveSrc, reloadKey, cacheIdentity])
 
@@ -416,6 +486,8 @@ export function ImageAnnotationEditor({
       ctx.drawImage(bitmap, 0, 0)
       bitmap.close()
       render()
+      // 恢复的快照可能是空白(撤销到第一笔之前)也可能有笔画:扫一次定(M-23)。
+      setSelectionPresent(hasSelection(mask))
       setRevision((v) => v + 1)
     },
     [render],
@@ -460,6 +532,7 @@ export function ImageAnnotationEditor({
       redoRef.current = []
       ctx.clearRect(0, 0, mask.width, mask.height)
       render()
+      setSelectionPresent(false)
       setRevision((v) => v + 1)
     } finally {
       setHistoryPending(false)
@@ -587,6 +660,10 @@ export function ImageAnnotationEditor({
       event.currentTarget.releasePointerCapture(event.pointerId)
     } catch {}
     if (snapshot) {
+      // 选区有无在抬手时就地定(M-23):画笔 pointerDown 即落点,必有选区、不扫;
+      // 矩形 / 套索可能拖出零面积、擦除可能把选区擦空,这三种扫一次 mask。
+      const mask = maskRef.current
+      setSelectionPresent(tool === 'brush' ? true : !!mask && hasSelection(mask))
       const generation = generationRef.current
       setHistoryPending(true)
       void toBlob(snapshot)
@@ -602,10 +679,6 @@ export function ImageAnnotationEditor({
     }
   }
 
-  const selectionPresent = useMemo(() => {
-    void revision
-    return !!maskRef.current && hasSelection(maskRef.current)
-  }, [revision])
   const canSubmit = selectionPresent && prompt.trim().length > 0 && !submitting && !historyPending
 
   // 脏状态 = 有圈选或有描述。关闭时据此决定「确认弹层 or 直接退」(需求 §5 误触保护)。
@@ -689,54 +762,12 @@ export function ImageAnnotationEditor({
     }
   }
 
-  // 工具元数据(触发钮回显当前工具图标 + 菜单列表共用单一权威)。
-  const TOOLS: { value: Tool; label: string; icon: React.ReactNode }[] = [
-    { value: 'brush', label: '画笔', icon: <Brush size={18} /> },
-    { value: 'rect', label: '矩形', icon: <Square size={18} /> },
-    { value: 'lasso', label: '套索', icon: <LassoSelect size={18} /> },
-    { value: 'erase', label: '橡皮', icon: <Eraser size={18} /> },
-  ]
   const activeTool = TOOLS.find((t) => t.value === tool) ?? TOOLS[0]!
-
-  const ToolButton = ({
-    value,
-    label,
-    icon,
-  }: { value: Tool; label: string; icon: React.ReactNode }) => (
-    <button
-      type="button"
-      // 选完自动收起菜单(需求 §4)。
-      onClick={() => {
-        setTool(value)
-        setToolsOpen(false)
-      }}
-      aria-pressed={tool === value}
-      className={cn(
-        'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
-        tool === value ? 'bg-white text-black' : 'text-white hover:bg-white/10',
-      )}
-    >
-      {icon}
-      <span>{label}</span>
-    </button>
-  )
-
-  const RoundBtn = ({
-    label,
-    icon,
-    onClick,
-    disabled,
-  }: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean }) => (
-    <button
-      type="button"
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-      className="flex size-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 disabled:opacity-35"
-    >
-      {icon}
-    </button>
-  )
+  // 选完自动收起菜单(需求 §4)。
+  const selectTool = (value: Tool) => {
+    setTool(value)
+    setToolsOpen(false)
+  }
 
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !submitting && onOpenChange(next)}>
@@ -769,7 +800,8 @@ export function ImageAnnotationEditor({
               title="关闭 (Esc)"
               // 走 requestClose:脏状态先弹确认,空白直接退(需求 §5)。
               onClick={requestClose}
-              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+              // 触屏补到 44px(a11y-B media#2);桌面 40px 圆钮不变。
+              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [@media(hover:none)]:size-11"
             >
               <X size={20} />
             </button>
@@ -777,7 +809,8 @@ export function ImageAnnotationEditor({
               <Dialog.Title className="text-sm font-semibold">
                 {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
               </Dialog.Title>
-              <span className="text-caption text-white/60">Image 2 · 每张 50 积分</span>
+              {/* 价格不在前端写死(审计 M-24):计费口径归后端/计费侧,前端没有可读的价格字段就不报数。 */}
+              <span className="text-caption text-white/60">Image 2</span>
             </div>
             <button
               type="button"
@@ -812,8 +845,10 @@ export function ImageAnnotationEditor({
               )}
             </button>
           </header>
-          {/* 画布区:左侧竖直笔刷滑杆 + 居中画布 */}
-          <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-3 py-2">
+          {/* 画布区:左侧竖直笔刷滑杆 + 居中画布。左内边距给滑杆让位(8px 边距 + 44px 命中区):
+              画布 max-w-full 从滑杆右侧起算,窄屏满宽图不再被滑杆压住左缘、也不再吃掉那一条的圈选
+              (审计 M-11);sm 起左右对称,画布回到居中。 */}
+          <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden py-2 pl-14 pr-3 sm:px-16">
             {loading && (
               <div className="absolute inset-0 z-20 overflow-hidden">
                 {/* 已缓存缩略图做模糊底图(零请求、禁纯白闪);未命中缓存则退化为纯深色底。 */}
@@ -896,6 +931,7 @@ export function ImageAnnotationEditor({
                 onChange={(e) => {
                   setPrompt(e.target.value)
                   setSubmitHint(null)
+                  autoGrowTextarea(e.currentTarget)
                 }}
                 // 桌面 Enter 提交、Shift+Enter 换行(需求 §5)。
                 onKeyDown={(e) => {
@@ -907,11 +943,12 @@ export function ImageAnnotationEditor({
                 rows={1}
                 maxLength={1200}
                 placeholder="描述想要的修改，例如：把杯子改成透明玻璃材质"
-                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-white outline-none placeholder:text-white/40"
+                // placeholder 40% 白叠在 bg-neutral-900 上只有 3.8:1(a11y-C 复扫);60% ≈ 7:1,仍比正文淡一档。
+                className="max-h-28 min-h-[1.5rem] w-full resize-none bg-transparent text-base leading-relaxed text-white outline-none placeholder:text-white/60"
               />
             </div>
             <p id="image-edit-help" className="sr-only">
-              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。每张 50 积分。
+              只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。
             </p>
             <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-2">
               {/* 次级:矩形/套索/橡皮/清空收进「更多工具」——受控开合(需求 §4):选完/点外部/ESC
@@ -942,7 +979,14 @@ export function ImageAnnotationEditor({
                     />
                     <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl bg-neutral-900/95 p-2 text-white shadow-float backdrop-blur">
                       {TOOLS.map((t) => (
-                        <ToolButton key={t.value} value={t.value} label={t.label} icon={t.icon} />
+                        <ToolButton
+                          key={t.value}
+                          value={t.value}
+                          label={t.label}
+                          icon={t.icon}
+                          active={tool === t.value}
+                          onSelect={selectTool}
+                        />
                       ))}
                       <button
                         type="button"
@@ -1011,7 +1055,7 @@ export function ImageAnnotationEditor({
                       setConfirmClose(false)
                       onOpenChange(false)
                     }}
-                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-white transition-opacity hover:opacity-90"
+                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-danger-fg transition-opacity hover:opacity-90"
                   >
                     放弃
                   </button>

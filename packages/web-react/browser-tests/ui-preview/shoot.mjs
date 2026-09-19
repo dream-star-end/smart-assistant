@@ -59,6 +59,8 @@ const VIEWPORTS = {
   mobile: { width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true },
 }
 const THEMES = ['light', 'dark'] // useTheme.ts 的落点是 <html class="dark">,见 applyTheme
+/** 移动视口整页替代方案(见 capture 内注释)的视口高度上限;Chromium 对超高视口的光栅化有硬限制。 */
+const MAX_TALL_VIEWPORT_PX = 12_000
 
 // ── 场景模块发现 ────────────────────────────────────────────────────────────
 // harness.tsx 静态 import './scenes-manage' 与 './scenes-market';这里把这两个 specifier
@@ -170,12 +172,21 @@ const cssFile = builtAssets.find((p) => p.endsWith('.css'))
 if (!cssFile) throw new Error('ui-preview: 预览 production CSS 构建失败(产物里没有 .css)')
 const assetByName = new Map(builtAssets.map((p) => [basename(p), p]))
 
+// bundle **不能内联进 <script>**:一旦场景把 Markdown 链路(highlight.js 的 `"<!--|-->"` 语言定义 +
+// react-dom 的 `"<script><\/script>"` 字面量)拉进依赖图,HTML 解析器会在 `<!--` 后进入
+// script-data-escaped 态、把后面的 `<script` 当双重转义,真正的 `</script>` 就闭合不了 →
+// 整段脚本静默不执行,window.__ocScenes 恒 undefined,shoot 侧表现为"零场景"。
+// 2026-09-15 messages 场景首次命中(bundle 14MB,含 10 处 `<!--`、6 处 `<script`)。
+// 改为经 page.route 以外链脚本供出,与字体资产同一条路。
+const HARNESS_URL = 'http://127.0.0.1/__openclaude_ui_preview__'
+const HARNESS_BUNDLE_URL = `${HARNESS_URL}/harness.js`
+const bundleText = readFileSync(bundlePath, 'utf8')
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#fafafb">
 <title>OpenClaude UI 预览台</title>
 <style>${readFileSync(cssFile, 'utf8')}</style>
-</head><body><div id="root"></div><script>${readFileSync(bundlePath, 'utf8')}</script></body></html>`
+</head><body><div id="root"></div><script src="${HARNESS_BUNDLE_URL}"></script></body></html>`
 
 const CONTENT_TYPES = {
   '.css': 'text/css; charset=utf-8',
@@ -191,8 +202,6 @@ const CONTENT_TYPES = {
 }
 
 // ── 驱动 ────────────────────────────────────────────────────────────────────
-const HARNESS_URL = 'http://127.0.0.1/__openclaude_ui_preview__'
-
 let browser
 try {
   browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true })
@@ -223,6 +232,9 @@ async function preparePage(page) {
   // 免得离线环境的失败请求污染控制台与渲染时序。
   await page.route('**/*', async (route) => {
     const url = route.request().url()
+    if (url === HARNESS_BUNDLE_URL) {
+      return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: bundleText })
+    }
     if (url.startsWith(HARNESS_URL)) {
       return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html })
     }
@@ -296,9 +308,27 @@ async function capture(page, scene, viewport, theme) {
       }
     }
 
+    // 移动视口**不能用 fullPage**:Playwright 在 isMobile 上下文里做整页扫描时会临时改写设备指标,
+    // 期间触摸/hover 仿真丢失((hover:none) 实测变为 false),于是 `[@media(hover:none)]` 驱动的
+    // 44px 触控尺寸与常显动作条在整页图里全部退回桌面形态 —— 2026-09-15 messages 场景实证:
+    // 截图前 opacity=1/44px,截图内与截图后 opacity=0/28px。改为把视口临时拉到文档高度后普通截图
+    // (setViewportSize 保留上下文的 isMobile/hasTouch),拍完还原。文档不超视口的场景(#root 固定
+    // 100dvh 的面板类)高度不变,与原行为逐像素一致。
+    const size = page.viewportSize()
+    let restoreViewport = null
+    if (!clip && VIEWPORTS[viewport]?.isMobile && size) {
+      const docHeight = await page.evaluate(() =>
+        Math.ceil(Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)),
+      )
+      if (docHeight > size.height) {
+        await page.setViewportSize({ width: size.width, height: Math.min(docHeight, MAX_TALL_VIEWPORT_PX) })
+        await page.waitForTimeout(80)
+        restoreViewport = size
+      }
+    }
     const shotOptions = {
       path: file,
-      ...(clip ? { clip } : { fullPage: true }),
+      ...(clip ? { clip } : VIEWPORTS[viewport]?.isMobile ? {} : { fullPage: true }),
       animations: 'disabled',
       caret: 'hide',
       timeout: SHOT_TIMEOUT,
@@ -312,6 +342,8 @@ async function capture(page, scene, viewport, theme) {
       await page.waitForTimeout(1000)
       await page.screenshot(shotOptions)
       retried.push(name)
+    } finally {
+      if (restoreViewport) await page.setViewportSize(restoreViewport)
     }
     shots.push({ name, scene: scene.id, label: scene.label, group: scene.group, viewport, theme, clipped: Boolean(clip) })
 

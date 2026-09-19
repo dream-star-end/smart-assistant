@@ -1,41 +1,28 @@
 import { ArrowUpCircle, Check, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import type { SubscribeIntent } from "../../lib/chat/pure";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
+import { TOPUP_PACK } from "../../lib/plans";
+import {
+  type SubscribeIntent,
+  consumeSubscribeIntent,
+  rememberSubscriptionPaid,
+} from "../../lib/subscribeIntent";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
-import { Alert, Button, Modal, Spinner } from "../ui";
+import { Alert, Button, Modal, Spinner, useConfirm } from "../ui";
 
+// 预选意图 / 最近已付费 的模块级状态已下沉到 lib/subscribeIntent(首屏同步渲染的红卡从那里读,
+// 不再把本弹窗拖进入口闭包);此处 re-export 供 AccountTab / 测试等既有引用继续使用。
 export type { SubscribeIntent };
-
-let pendingSubscribeIntent: SubscribeIntent | null = null;
-let knownSubscriptionPaid: boolean | null = null;
-
-/** 红卡/账户条在打开订阅弹窗前预选 Lite 或加量包。 */
-export function requestSubscribeIntent(intent: SubscribeIntent): void {
-  pendingSubscribeIntent = intent;
-}
-
-export function consumeSubscribeIntent(): SubscribeIntent | null {
-  const intent = pendingSubscribeIntent;
-  pendingSubscribeIntent = null;
-  return intent;
-}
-
-export function rememberSubscriptionPaid(paid: boolean): void {
-  knownSubscriptionPaid = paid;
-}
-
-export function lastKnownSubscriptionPaid(): boolean | null {
-  return knownSubscriptionPaid;
-}
-
-export function resetSubscribeUiState(): void {
-  pendingSubscribeIntent = null;
-  knownSubscriptionPaid = null;
-}
+export {
+  consumeSubscribeIntent,
+  lastKnownSubscriptionPaid,
+  rememberSubscriptionPaid,
+  requestSubscribeIntent,
+  resetSubscribeUiState,
+} from "../../lib/subscribeIntent";
 
 function litePlanOf(plans: SubscriptionPlanWire[]): SubscriptionPlanWire | undefined {
   return (
@@ -65,7 +52,7 @@ function fmtDate(iso: string): string {
 /**
  * 订阅中心：当前套餐 + 双钱包余额 + 4 档套餐卡（续费 / 升档·补差价 / 切换）→ 虎皮椒扫码到账。
  * 履约后端按 kind 分支（subscribe 重置期内桶 + 周期顺延；upgrade 补到新档额度 + 周期不变）。
- * QR + 订单轮询复用 TopupDialog 同款机制。
+ * QR 段用 HupijiaoPaymentEntry，订单轮询 GET /api/payment/orders/:orderNo（与 OrgPayQr 同款）。
  */
 export function SubscriptionDialog({
   open,
@@ -89,6 +76,7 @@ export function SubscriptionDialog({
   const [err, setErr] = useState<string | null>(null);
   const [busyCode, setBusyCode] = useState<string | null>(null);
   const [intent, setIntent] = useState<SubscribeIntent | null>(initialIntent ?? null);
+  const [confirmAction, confirmActionEl] = useConfirm();
   const pollRef = useRef<number | null>(null);
   // 当前 open 镜像：异步回调（下单/轮询）resolve 后据此丢弃关闭后的迟到 setState。
   const openRef = useRef(open);
@@ -137,7 +125,7 @@ export function SubscriptionDialog({
     }
   }, [open, stopPoll, initialIntent]);
 
-  // 打开 plans 段：拉套餐 + 当前订阅。plans!=null 守卫挡成功后回跑（同 TopupDialog 注意点）。
+  // 打开 plans 段：拉套餐 + 当前订阅。plans!=null 守卫挡成功后回跑。
   useEffect(() => {
     if (!open || stage.kind !== "plans" || plans != null) return;
     let alive = true;
@@ -165,9 +153,21 @@ export function SubscriptionDialog({
 
   async function choose(plan: SubscriptionPlanWire) {
     if (!sub || plan.tier === 0) return;
+    const isUpgrade = plan.tier > sub.tier && sub.paid;
+    // 有损操作先确认(审计 SET-01):续费 / 切换会把本期积分**重置**为新档月度额度,当前剩余不累计。
+    // 这条规则此前只写在弹层底部 11.5px 灰字里,付费用户点「续费」就直接进二维码。
+    // 升档按差价补齐、周期不变,免费 → 付费也没有可损失的余量,这两条不打断。
+    if (sub.paid && !isUpgrade) {
+      const isRenew = plan.code === sub.planCode;
+      const ok = await confirmAction({
+        title: isRenew ? `续费 ${plan.name}？` : `切换到 ${plan.name}？`,
+        body: `${isRenew ? "续费" : "切换"}后本期套餐积分会重置为 ${formatCredits(plan.monthlyCredits)}，当前剩余的 ${formatCredits(sub.balance.period)} 不会累计，计费周期顺延 ${plan.periodDays} 天。钱包余额不受影响。`,
+        confirmText: isRenew ? "确认续费" : "确认切换",
+      });
+      if (ok !== true) return;
+    }
     setErr(null);
     setBusyCode(plan.code);
-    const isUpgrade = plan.tier > sub.tier && sub.paid;
     const gen = ++genRef.current; // 本次下单代际；关闭/重开/再次 choose 都会令其失效
     try {
       const order: HupiCreateResult = isUpgrade
@@ -202,7 +202,10 @@ export function SubscriptionDialog({
     }
   }
 
-  // QR 段轮询（同 TopupDialog；额外按 open + cancelled 守卫，杜绝关闭/返回后迟到 setState）。
+  // QR 段轮询（按 open + cancelled 守卫，杜绝关闭/返回后迟到 setState）。
+  // 手机跳出收银台再返回：整页重载时本弹层已卸载，由 PendingPaymentRecovery 接手查单；
+  // bfcache 原页恢复时恢复条不会重读 storage，仍靠本轮询确认 —— 两者不会在同一 document 里并存
+  // （审计 SET-32 据此不改，理由见 docs/audit/settings.md §5）。
   useEffect(() => {
     if (stage.kind !== "qr" || !open) return;
     const orderNo = stage.order.orderNo;
@@ -257,9 +260,12 @@ export function SubscriptionDialog({
   }
 
   const title = stage.kind === "paid" ? "开通成功" : stage.kind === "qr" ? "微信支付" : "套餐订阅";
+  // 免费档月度额度从 plans 真值取(审计 SET-15),不再手抄「每月 300 积分」。
+  const freePlan = plans?.find((p) => p.tier === 0) ?? null;
 
   return (
     <Modal open={open} onOpenChange={(o) => !o && onClose()} title={title} className="max-w-lg">
+      {confirmActionEl}
       <div>
         {err && (
           <Alert tone="warning" className="mb-3 text-meta">
@@ -281,9 +287,10 @@ export function SubscriptionDialog({
                   <span className="text-body text-muted">当前套餐</span>
                   <span className="text-title font-semibold text-fg">{sub.planName}</span>
                 </div>
-                <div className="mt-1.5 flex items-center justify-between text-meta text-faint">
-                  <span>本期到期 {fmtDate(sub.periodEnd)}</span>
-                  <span>
+                {/* 两段都不许从中间折行(390px 下日期曾断成「2026-09-」「20」,审计 SET-18);放不下就整段换行。 */}
+                <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 text-meta text-faint">
+                  <span className="whitespace-nowrap">本期到期 {fmtDate(sub.periodEnd)}</span>
+                  <span className="whitespace-nowrap">
                     期内 {formatCredits(sub.periodCredits)} · 钱包 {formatCredits(sub.balance.wallet)}
                   </span>
                 </div>
@@ -324,7 +331,7 @@ export function SubscriptionDialog({
                       <div className="flex items-center gap-2">
                         <span className="text-title font-semibold text-fg">{p.name}</span>
                         {isCurrent && (
-                          <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-white">
+                          <span className="rounded-full bg-accent px-1.5 py-0.5 text-micro font-medium text-accent-fg">
                             当前
                           </span>
                         )}
@@ -350,7 +357,10 @@ export function SubscriptionDialog({
                         {action}
                       </Button>
                     ) : (
-                      <span className="shrink-0 text-meta text-faint">{isCurrent ? "" : "—"}</span>
+                      // 免费档没有动作按钮;说清为什么(审计 SET-19),而不是一个孤零零的「—」。
+                      <span className="shrink-0 text-right text-caption text-faint">
+                        {isCurrent ? "" : "到期未续自动回落"}
+                      </span>
                     )}
                   </div>
                 );
@@ -369,7 +379,10 @@ export function SubscriptionDialog({
               >
                 <div className="min-w-0">
                   <div className="text-title font-semibold text-fg">积分加量包</div>
-                  <div className="mt-0.5 text-meta text-faint">¥50 加 5,000 积分 · 仅当前套餐有效期内可用</div>
+                  <div className="mt-0.5 text-meta text-faint">
+                    ¥{TOPUP_PACK.price} 加 {TOPUP_PACK.credits.toLocaleString("zh-CN")} 积分 ·
+                    仅当前套餐有效期内可用
+                  </div>
                 </div>
                 <Button
                   variant="secondary"
@@ -386,8 +399,9 @@ export function SubscriptionDialog({
 
             <p className="text-[11.5px] leading-relaxed text-faint">
               扫码支付即时开通。升档按新旧套餐差价计费、周期不变；续费/订阅重置当期积分并顺延一个计费周期。
-              套餐积分为「当月使用」，到期未续将降级免费版（每月 300 积分），未用完的套餐 /
-              加量包积分不跨期结转。
+              套餐积分为「当月使用」，到期未续将降级免费版
+              {freePlan ? `（每月 ${formatCredits(freePlan.monthlyCredits)} 积分）` : ""}
+              ，未用完的套餐 / 加量包积分不跨期结转。
             </p>
           </div>
         )}

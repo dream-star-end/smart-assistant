@@ -638,7 +638,15 @@ class E2eCcbKernel extends EventEmitter {
   submitted = false
   lastActivityAt = Date.now()
   sessionId: string | null = 'ccb-prompt-queue-e2e'
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
   get isRunning() { return true }
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
+  }
   async submit(): Promise<void> { this.submitted = true }
   finish(): void {
     this.emit('message', {
@@ -669,7 +677,15 @@ class E2eCodexKernel extends EventEmitter {
   requestId: string | undefined
   lastActivityAt = Date.now()
   model: string | undefined = 'gpt-5.6-sol'
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined
   get isRunning() { return true }
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding
+  }
   async submit(_input: unknown, requestId?: string, _policy?: unknown, queueTurn?: boolean) {
     this.submitted = true
     this.requestId = requestId

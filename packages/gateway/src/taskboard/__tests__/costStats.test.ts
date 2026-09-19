@@ -13,6 +13,7 @@ import { type TaskboardDb, openTaskboardDb } from '../db/index.js'
 import { createPipeline, createStage } from '../db/pipelines.js'
 import { createProject } from '../db/projects.js'
 import { insertRun, updateRun } from '../db/runs.js'
+import { getUsage, getUsageWithReferenceCosts } from '../db/settings.js'
 import { createTicket } from '../db/tickets.js'
 
 const dirs: string[] = []
@@ -65,7 +66,7 @@ function putRun(
   ticketId: string,
   stageId: string,
   createdAt: number,
-  usage: { tokensIn: number | null; tokensOut: number | null; costUsd: number | null },
+  usage: { tokensIn: number | null; tokensOut: number | null; costUsd: number | null; costImprecise?: boolean | null },
   status: 'succeeded' | 'failed' | 'skipped' = 'succeeded',
 ): void {
   const run = insertRun(db, {
@@ -79,6 +80,7 @@ function putRun(
     tokensIn: usage.tokensIn,
     tokensOut: usage.tokensOut,
     costUsd: usage.costUsd,
+    costImprecise: usage.costImprecise,
   })
   db.prepare('UPDATE tb_ticket_run SET created_at = ? WHERE id = ?').run(createdAt, run.id)
 }
@@ -138,5 +140,81 @@ describe('queryCostStats', () => {
     assert.equal(stats.totals.unpriced.runCount, 1)
     assert.equal(stats.totals.priced.runCount, 0)
     db.close()
+  })
+})
+
+
+describe('OCV5-179 recorded amount provenance', () => {
+  it('keeps display aggregation out of guardrail query budget and preserves its counters', () => {
+    const db = freshDb()
+    try {
+      const { ticketId, stageId } = seedTicket(db)
+      const now = Date.now()
+      putRun(db, ticketId, stageId, now, { tokensIn: 10, tokensOut: 1, costUsd: 2, costImprecise: true })
+      const queries: string[] = []
+      const measured = { prepare(sql: string) { queries.push(sql); return db.prepare(sql) } } as TaskboardDb
+      const counters = getUsage(measured, now)
+      assert.equal(queries.length, 2)
+      assert.ok(queries.every(sql => !sql.includes('JOIN')))
+      assert.equal(counters.referenceCostsToday, undefined)
+      queries.length = 0
+      const { referenceCostsToday, ...displayCounters } = getUsageWithReferenceCosts(measured, now)
+      assert.equal(queries.length, 3)
+      assert.deepEqual(displayCounters, counters)
+      assert.equal(referenceCostsToday?.amounts.estimated.costUsd, 2)
+    } finally { db.close() }
+  })
+
+  it('digest distinguishes unpriced usage from wholly unrecorded runs without free zero', async () => {
+    const db = freshDb()
+    try {
+      const { ticketId, stageId } = seedTicket(db)
+      const { fromMs } = ymdRangeMs('2026-08-18', '2026-08-18')
+      putRun(db, ticketId, stageId, fromMs + 1, { tokensIn: 10, tokensOut: 1, costUsd: 0 })
+      putRun(db, ticketId, stageId, fromMs + 2, { tokensIn: null, tokensOut: null, costUsd: null })
+      const { collectDigestStats, formatDigestMessage } = await import('../notify.js')
+      const message = formatDigestMessage(collectDigestStats(db, '2026-08-18')).bodyMd
+      assert.match(message, /1 次有用量但无金额/)
+      assert.match(message, /1 次费用未记录/)
+      assert.doesNotMatch(message, /\$0/)
+    } finally { db.close() }
+  })
+  it('preserves estimates/unflagged/unknown provenance in every grouping and digest', async () => {
+    const db = freshDb()
+    try {
+      const { ticketId, stageId } = seedTicket(db)
+      const { fromMs, toMs } = ymdRangeMs('2026-08-18', '2026-08-18')
+      for (const [i, flag] of [true, false, null].entries()) {
+        putRun(db, ticketId, stageId, fromMs + 1 + i, { tokensIn: 100, tokensOut: 10, costUsd: i + 1, costImprecise: flag })
+      }
+      for (const groupBy of ['day', 'project', 'ticket', 'stage'] as const) {
+        const stats = queryCostStats(db, { fromMs, toMs, groupBy })
+        for (const s of [stats.totals, ...stats.buckets]) {
+          assert.equal(s.costUsd, 6)
+          assert.equal(s.amounts.estimated.costUsd, 1)
+          assert.equal(s.amounts.unflagged.costUsd, 2)
+          assert.equal(s.amounts.unverified.costUsd, 3)
+          assert.equal(s.coverage, 'full', 'coverage is availability, never proof of settlement')
+        }
+      }
+      const { collectDigestStats, formatDigestMessage } = await import('../notify.js')
+      const digest = collectDigestStats(db, '2026-08-18')
+      const message = formatDigestMessage(digest).bodyMd
+      assert.match(message, /参考费用/)
+      assert.match(message, /估算 \$1.0000/)
+      assert.match(message, /未标估算 \$2.0000/)
+      assert.match(message, /来源未证实 \$3.0000/)
+      assert.doesNotMatch(message, /实扣|已结算|精确/)
+    } finally { db.close() }
+  })
+
+  it('all unknown records are not full cost coverage or a free zero', () => {
+    const db = freshDb()
+    try {
+      const { ticketId, stageId } = seedTicket(db)
+      const { fromMs, toMs } = ymdRangeMs('2026-08-18', '2026-08-18')
+      putRun(db, ticketId, stageId, fromMs + 1, { tokensIn: null, tokensOut: null, costUsd: null })
+      assert.equal(queryCostStats(db, { fromMs, toMs }).totals.coverage, 'none')
+    } finally { db.close() }
   })
 })

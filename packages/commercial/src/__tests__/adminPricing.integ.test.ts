@@ -919,10 +919,17 @@ describe("admin pricing/plans — HTTP", () => {
         total: number; affected_users: number; latest_occurrence: string | null;
         outcomes: { recovered: number }; trace: { total: number; missing_trace: number };
       }>;
+      problemCards: {
+        funnel: { last_24h: unknown[]; last_7d: unknown[] };
+        decisions: unknown[]; jobs: unknown[]; fallbacks: unknown[];
+      };
     };
     assert.deepEqual(body.windows, { operational_days: 7, funnel_days: 30 });
     assert.ok(Array.isArray(body.models) && Array.isArray(body.images) && Array.isArray(body.orders));
     assert.ok(Array.isArray(body.github) && Array.isArray(body.ratings));
+    assert.ok(body.problemCards && Array.isArray(body.problemCards.funnel.last_24h));
+    assert.ok(Array.isArray(body.problemCards.decisions) && Array.isArray(body.problemCards.jobs));
+    assert.ok(Array.isArray(body.problemCards.fallbacks));
     assert.ok(body.event_summary.last_1h.total >= 1);
     assert.ok(body.event_summary.last_24h.latest_occurrence);
     assert.equal(body.event_summary.last_7d.trace.total, body.event_summary.last_7d.total);

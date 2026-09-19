@@ -27,6 +27,7 @@ import type {
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import { ToastProvider } from "../ui";
 import { ConnectorsTab } from "./ConnectorsTab";
 
 vi.mock("../../lib/api", async (importOriginal) => {
@@ -449,8 +450,8 @@ describe("ConnectorsTab 目录渲染", () => {
     const card = providerCard("邮箱");
     expect(within(card).getByText("已绑定 2 个账号")).toBeInTheDocument();
     expect(within(card).getByText("a***@qq.com")).toBeInTheDocument();
-    // 无 displayName 的行回退 accountHint 作主名（truncate 展示 + hint 行,至少出现一次）
-    expect(within(card).getAllByText("b***@163.com").length).toBeGreaterThan(0);
+    // 无 displayName 的行回退 accountHint 作主名,元信息行不再重复渲染同一串（manage 审计 M-18）
+    expect(within(card).getAllByText("b***@163.com")).toHaveLength(1);
     expect(within(card).getAllByText("正常")).toHaveLength(2);
     // 已绑 provider 的按钮变为「添加账号」
     expect(within(card).getByRole("button", { name: "添加账号" })).toBeInTheDocument();
@@ -2411,5 +2412,134 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }),
     )
     expect(await screen.findByRole('dialog')).toHaveTextContent('授权知识星球')
+  })
+})
+
+/** 承接 manage 审计落在本文件的 M-20 / M-21（M-18 见「已绑多账号」用例）。 */
+describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 备注名编辑）', () => {
+  test('声明式目录读失败:顶部出现可重试的 info 提示,重试后重新拉目录', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedDeclManagement.mockRejectedValue(new Error('boom'))
+    render(<ConnectorsTab auth={auth} />)
+
+    const degraded = await screen.findByTestId('connectors-degraded')
+    expect(degraded).toHaveTextContent('部分插件目录暂时读不到，已显示可用部分。')
+    // v1 目录照常渲染,且不是「整表读不到」那条 danger 提示
+    for (const p of PROVIDERS) expect(screen.getByText(p.label)).toBeInTheDocument()
+    expect(screen.queryByText('加载应用连接失败')).not.toBeInTheDocument()
+
+    mockedDeclManagement.mockResolvedValue({ connectors: [], connections: [] })
+    fireEvent.click(within(degraded).getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByTestId('connectors-degraded')).not.toBeInTheDocument())
+    warn.mockRestore()
+  })
+
+  test('运行时 Plugin 目录读失败同样提示;两套目录都正常时不出现', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockRejectedValue(new Error('boom'))
+    const { unmount } = render(<ConnectorsTab auth={auth} />)
+    expect(await screen.findByTestId('connectors-degraded')).toBeInTheDocument()
+
+    unmount()
+    mockedPluginManagement.mockResolvedValue({ catalog: [], accounts: [] })
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('WebDAV 网盘')
+    expect(screen.queryByTestId('connectors-degraded')).not.toBeInTheDocument()
+    warn.mockRestore()
+  })
+
+  test('市场回跳的 Plugin 未装到当前版本:提示落在该 Plugin 卡内,不占顶层错误通道', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [{ ...knowledgePlanetPlugin(), installedCurrent: false }],
+      accounts: [],
+    })
+    render(
+      <ConnectorsTab
+        auth={auth}
+        autoAuthorizePluginSlug="knowledge-planet"
+        onAutoAuthorizeConsumed={() => {}}
+      />,
+    )
+
+    const notice = await screen.findByText(
+      '知识星球尚未安装到当前版本，请返回市场完成安装或更新后重试。',
+    )
+    expect(providerCard('知识星球')).toContainElement(notice)
+    // 顶层只允许「整表读不到」:这里既没有 danger 提示,也没有为它挂的「去市场」按钮
+    expect(screen.getAllByText(/尚未安装到当前版本/)).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: /去市场/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  test('备注名失焦即提交 → renameConnector,成功后 toast「已改名」', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]))
+    mockedRename.mockResolvedValue(undefined)
+    render(
+      <ToastProvider>
+        <ConnectorsTab auth={auth} />
+      </ToastProvider>,
+    )
+    await screen.findByText('工作邮箱')
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    const input = screen.getByLabelText('备注名') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '私人邮箱' } })
+    fireEvent.blur(input)
+
+    await waitFor(() => expect(mockedRename).toHaveBeenCalledWith(auth, '11', '私人邮箱'))
+    expect(await screen.findByText('已改名')).toBeInTheDocument()
+    expect(screen.queryByLabelText('备注名')).not.toBeInTheDocument()
+  })
+
+  test('备注名未改动时失焦只收起编辑框,不发请求', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]))
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('工作邮箱')
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    fireEvent.blur(screen.getByLabelText('备注名'))
+
+    await waitFor(() => expect(screen.queryByLabelText('备注名')).not.toBeInTheDocument())
+    expect(mockedRename).not.toHaveBeenCalled()
+  })
+
+  test('点「取消」不提交:mousedown 让路后的 blur 不调 renameConnector,恢复原名', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]))
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('工作邮箱')
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    const input = screen.getByLabelText('备注名') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '改了又不想要' } })
+    // 浏览器时序:mousedown → 输入框 blur → click
+    const cancel = screen.getByRole('button', { name: '取消编辑' })
+    fireEvent.mouseDown(cancel)
+    fireEvent.blur(input)
+    fireEvent.click(cancel)
+
+    expect(screen.queryByLabelText('备注名')).not.toBeInTheDocument()
+    expect(screen.getByText('工作邮箱')).toBeInTheDocument()
+    expect(mockedRename).not.toHaveBeenCalled()
+  })
+
+  test('输入法合成中的 Enter 不提交,合成结束后的 Enter 才提交', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]))
+    mockedRename.mockResolvedValue(undefined)
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('工作邮箱')
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    const input = screen.getByLabelText('备注名') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '私人邮箱' } })
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    expect(mockedRename).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('备注名')).toBeInTheDocument()
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(mockedRename).toHaveBeenCalledWith(auth, '11', '私人邮箱'))
   })
 })

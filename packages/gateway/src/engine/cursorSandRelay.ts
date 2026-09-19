@@ -5,6 +5,13 @@
  * translated to Cursor's real Sand surface:
  *   POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream
  *   x-cursor-client-type: sand
+ *   x-cursor-client-source: sand-desktop
+ *   x-cursor-client-version: 3.21.12  (Direct; Grok Bot Box is opt-in)
+ *
+ * Direct Stream (default for the product adapter) uses the account session
+ * JWT on api2. The Grok Bot Box relay remains available for tests/rollback
+ * (`directStream: false` + `boxAccountId`) but that identity cannot run
+ * Claude families (`unavailable for Grok Bot inference`).
  *
  * The relay is loopback-only and route-token scoped. Cursor credentials are
  * read from the root-owned account mount for each auth cache generation and
@@ -34,8 +41,14 @@ import {
 import { createLogger } from '../logger.js'
 import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
 
+import { CursorSandBoxError, CursorSandBoxResolver, cursorSandBoxHeaders, cursorSandBoxTicketError, isCursorSandBoxError, type CursorSandBoxConnection, type CursorSandBoxPolicy } from './cursorSandBox.js'
+
 const log = createLogger({ module: 'cursorSandRelay' })
 const DEFAULT_UPSTREAM = 'https://api2.cursor.sh'
+/** Cursor 3.21.12 Sand desktop identity. Direct api2 Stream accepts Claude
+ * families with this pair; Grok Bot 0.24.0/0.44.0 Box does not. */
+export const CURSOR_SAND_DIRECT_CLIENT_VERSION = '3.21.12'
+export const CURSOR_SAND_DIRECT_CLIENT_SOURCE = 'sand-desktop'
 /**
  * Upstream body-read liveness. undici's global dispatcher defaults to
  * `bodyTimeout=300s`; a Sand inference that stays silent for five minutes
@@ -124,6 +137,9 @@ interface RelayDeps {
   fetchImpl?: typeof fetch
   readApiKey?: () => Buffer
   credentialName?: string
+  /** Trusted account id from the root selector; external API callers omit it. */
+  boxAccountId?: string
+  readBoxPolicy?: () => CursorSandBoxPolicy | null
   poolGeneration?: string
   keyFingerprint?: string
   /**
@@ -136,6 +152,11 @@ interface RelayDeps {
   machineId?: string | null
   upstreamBaseUrl?: string
   clientVersion?: string
+  /**
+   * Skip Grok Bot Box and POST InferenceService/Stream to api2 with the
+   * account JWT. Product adapter sets this true. Box tests omit it.
+   */
+  directStream?: boolean
   now?: () => number
   /** Max silence between upstream frames before the relay gives up (ms). */
   upstreamStallMs?: number
@@ -148,7 +169,54 @@ interface RelayDeps {
    * (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`); `null` disables.
    */
   passthrough?: RelayPassthrough | null
+  /**
+   * Human-readable name of the upstream used in client-visible error
+   * messages (`"<label> inference failed"`, `"<label> HTTP 502"`, …).
+   * Defaults to `'Cursor Sand'` for the in-container CCB path. The master's
+   * external API-key proxy passes a neutral label so third-party clients
+   * never learn which engine served them; internal `CURSOR_SAND_*` error
+   * codes are stripped of their prefix in those messages for the same reason.
+   */
+  upstreamLabel?: string
 }
+
+/** Per-call usage evidence for optional terminal hooks. `unobserved` means no
+ * upstream usage/extendedUsage frame arrived; `reported` includes an explicit
+ * zero. Callers must not treat initialised zeros as a report. */
+export type UsageEvidence =
+  | { kind: 'unobserved' }
+  | { kind: 'reported'; usage: CursorSandUsage }
+
+export type TerminalEvidence = {
+  evidence: UsageEvidence
+  outcome: 'completed' | 'failed'
+  /** Normalised error classification only — no prompt, frames, tools, or credentials. */
+  terminalCode?: string
+}
+
+/** Options for {@link CursorSandRelay.serveMessages}. */
+export interface ServeMessagesOptions {
+  /**
+   * Model id to echo in the Anthropic response (`message_start.message.model`
+   * / non-streaming `model`). Defaults to the upstream model id. The external
+   * API-key proxy passes the public id the client asked for so the response
+   * mirrors the request instead of leaking the internal engine id.
+   */
+  echoModel?: string
+  /**
+   * Optional per-call hook invoked at every terminal exit *before* writing a
+   * success `message_stop` / assistant JSON or an error frame. Default web
+   * callers omit it and keep the original exception/response semantics.
+   */
+  onTerminal?: (evidence: TerminalEvidence) => Promise<void>
+  /**
+   * Force the collect-then-emit streaming pipe. Production Sand routes use the
+   * native tool protocol; tests covering the buffered pipe set this.
+   */
+  bufferedStreaming?: boolean
+}
+
+export const DEFAULT_UPSTREAM_LABEL = 'Cursor Sand'
 
 export interface RelayPassthrough {
   baseUrl: string
@@ -205,6 +273,8 @@ interface StreamState {
   cacheReadTokens: number
   /** From `extendedUsage.cacheWriteTokens` (InferenceExtendedUsageInfo.cache_write_tokens). */
   cacheWriteTokens: number
+  /** True once a `usage` / `extendedUsage` frame has been applied this call. */
+  usageSeen: boolean
   text: string
   thinking: string
   failed: boolean
@@ -798,21 +868,122 @@ export function cursorSandPromptTooLongMessage(detail: string): string {
   return `${CURSOR_SAND_PROMPT_TOO_LONG_PREFIX}: ${trimmed}`
 }
 
+/**
+ * Structured view of a Sand error (stream `error` frame or gRPC-Web end
+ * trailer). Sand wraps the real cause in `details[].debug` as
+ * `aiserver.v1.ErrorDetails`; the top-level `message` is often the literal
+ * string "Error", which is what CCB / Claude Code users saw for the
+ * `ERROR_PROVIDER_ERROR` (provider HTTP 400) case on 2026-09-08.
+ */
+export interface UpstreamErrorInfo {
+  /** Human-readable text for the client: `Provider Error (400): We're having trouble…`. */
+  message: string
+  /** Sand's coarse code, e.g. `resource_exhausted`. */
+  code: string | null
+  /** `debug.error`, e.g. `ERROR_PROVIDER_ERROR`. */
+  debugError: string | null
+  /** `debug.details.additionalInfo.providerStatusCode`, e.g. `400`. */
+  providerStatusCode: string | null
+  /** `debug.details.isRetryable` — `false` means "retrying the same request won't help". */
+  retryable: boolean | null
+}
+
+const UPSTREAM_ERROR_FALLBACK_FRAME = 'Cursor Sand inference failed'
+const UPSTREAM_ERROR_FALLBACK_TRAILER = 'Cursor Sand transport error'
+
+/** Marker appended to the reason string so the external proxy can tell a
+ * non-retryable upstream fault apart without re-parsing the frame. */
+export const CURSOR_SAND_NON_RETRYABLE_SUFFIX = ' [non-retryable]'
+
+export function describeUpstreamError(
+  record: JsonObject,
+  fallback: string,
+  options: { /** Prefix `code:` onto a plain message (error-frame contract); trailers historically did not. */ codePrefix?: boolean } = {},
+): UpstreamErrorInfo {
+  const codePrefix = options.codePrefix ?? true
+  const code = typeof record.code === 'string' && record.code ? record.code : null
+  const topMessage = typeof record.message === 'string' && record.message.trim() ? record.message.trim() : ''
+  let debugError: string | null = null
+  let title = ''
+  let detail = ''
+  let providerStatusCode: string | null = null
+  let retryable: boolean | null = null
+  const details = Array.isArray(record.details) ? record.details : []
+  for (const entry of details) {
+    if (!entry || typeof entry !== 'object') continue
+    const debug = (entry as JsonObject).debug
+    if (!debug || typeof debug !== 'object') continue
+    const debugRecord = debug as JsonObject
+    if (typeof debugRecord.error === 'string' && debugRecord.error) debugError = debugRecord.error
+    const inner = debugRecord.details
+    if (inner && typeof inner === 'object') {
+      const innerRecord = inner as JsonObject
+      if (typeof innerRecord.title === 'string') title = innerRecord.title.trim()
+      if (typeof innerRecord.detail === 'string') detail = innerRecord.detail.trim()
+      if (typeof innerRecord.isRetryable === 'boolean') retryable = innerRecord.isRetryable
+      const extra = innerRecord.additionalInfo
+      if (extra && typeof extra === 'object') {
+        const status = (extra as JsonObject).providerStatusCode
+        if (typeof status === 'string' && status) providerStatusCode = status
+        else if (typeof status === 'number') providerStatusCode = String(status)
+      }
+    }
+    if (debugError || title || detail) break
+  }
+  // Prefer the structured title/detail; the bare top-level "Error" carries nothing.
+  const generic = !topMessage || /^error$/i.test(topMessage)
+  let message: string
+  if (title || detail) {
+    const head = title || debugError || code || fallback
+    const withStatus = providerStatusCode ? `${head} (${providerStatusCode})` : head
+    message = detail ? `${withStatus}: ${detail}` : withStatus
+  } else if (!generic) {
+    const prefix = codePrefix
+      ? (code ?? (typeof record.errorType === 'number' && record.errorType > 0 ? `error_type_${record.errorType}` : ''))
+      : ''
+    message = prefix ? `${prefix}: ${topMessage}` : topMessage
+  } else {
+    const head = debugError ?? code ?? fallback
+    message = providerStatusCode ? `${head} (${providerStatusCode})` : head
+  }
+  return { message, code, debugError, providerStatusCode, retryable }
+}
+
+/** True when the reason string was tagged by {@link describeUpstreamError} consumers as non-retryable. */
+export function isNonRetryableUpstreamReason(reason: string | null | undefined): boolean {
+  return typeof reason === 'string' && reason.endsWith(CURSOR_SAND_NON_RETRYABLE_SUFFIX)
+}
+
+/** Reason string without the internal `[non-retryable]` marker (for DB terminal codes / client text). */
+export function stripNonRetryableMarker(reason: string): string {
+  return isNonRetryableUpstreamReason(reason) ? reason.slice(0, -CURSOR_SAND_NON_RETRYABLE_SUFFIX.length) : reason
+}
+
 function errorMessage(value: unknown): string {
   if (value && typeof value === 'object') {
     const record = value as JsonObject
-    const message = typeof record.message === 'string' ? record.message : 'Cursor Sand inference failed'
-    const prefix = typeof record.code === 'string' && record.code
-      ? record.code
-      : typeof record.errorType === 'number' && record.errorType > 0
-        ? `error_type_${record.errorType}`
-        : ''
-    const composed = prefix ? `${prefix}: ${message}` : message
-    return isCursorSandOverflow({ code: record.code, errorType: record.errorType, text: message })
+    // Preserve the *whole* upstream error object in the log. No request
+    // content or credential rides in an error frame, so this is safe to emit
+    // verbatim (capped).
+    log.warn('cursor sand error frame', { raw: safeRaw(record) })
+    const info = describeUpstreamError(record, UPSTREAM_ERROR_FALLBACK_FRAME)
+    const composed = info.retryable === false ? `${info.message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}` : info.message
+    return isCursorSandOverflow({ code: record.code, errorType: record.errorType, text: info.message })
       ? cursorSandPromptTooLongMessage(composed)
       : composed
   }
-  return 'Cursor Sand inference failed'
+  return UPSTREAM_ERROR_FALLBACK_FRAME
+}
+
+/** JSON-serialise an upstream error object for logs, capped so a pathological
+ * payload can't blow up a log line. Never carries request content/credentials. */
+function safeRaw(value: unknown): string {
+  try {
+    const text = typeof value === 'string' ? value : JSON.stringify(value)
+    return text.length > 1500 ? `${text.slice(0, 1500)}…` : text
+  } catch {
+    return String(value)
+  }
 }
 
 function parseEndTrailer(bytes: Buffer): string | null {
@@ -822,10 +993,17 @@ function parseEndTrailer(bytes: Buffer): string | null {
     const error = parsed.error
     if (!error || typeof error !== 'object') return null
     const record = error as JsonObject
-    const message = typeof record.message === 'string' ? record.message : 'Cursor Sand transport error'
-    return isCursorSandOverflow({ code: record.code, text: message })
-      ? cursorSandPromptTooLongMessage(message)
-      : message
+    // Same rationale as errorMessage(): the gRPC-Web end trailer's error is
+    // where a mid-stream upstream fault lands as a bare "Error"; log the whole
+    // thing so the real reason (status/details) is recoverable.
+    log.warn('cursor sand end trailer error', { raw: safeRaw(record) })
+    // Trailers never carried the `code:` prefix on the wire (CCB's overflow
+    // matcher and existing tests depend on the bare text); keep that.
+    const info = describeUpstreamError(record, UPSTREAM_ERROR_FALLBACK_TRAILER, { codePrefix: false })
+    const composed = info.retryable === false ? `${info.message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}` : info.message
+    return isCursorSandOverflow({ code: record.code, text: info.message })
+      ? cursorSandPromptTooLongMessage(composed)
+      : composed
   } catch {
     return 'Cursor Sand transport trailer was malformed'
   }
@@ -1106,6 +1284,92 @@ function correctedToolBody(body: AnthropicMessagesBody, invalidResponse: string)
   return { ...body, messages }
 }
 
+class TerminalSession {
+  notified = false
+  hookFailed = false
+  hookError: unknown = null
+
+  constructor(private readonly onTerminal?: (ev: TerminalEvidence) => Promise<void>) {}
+
+  evidence(state: StreamState): UsageEvidence {
+    return state.usageSeen
+      ? { kind: 'reported', usage: usageSnapshot(state) }
+      : { kind: 'unobserved' }
+  }
+
+  async notify(
+    state: StreamState,
+    outcome: 'completed' | 'failed',
+    terminalCode?: string,
+  ): Promise<void> {
+    if (this.notified) return
+    this.notified = true
+    if (!this.onTerminal) return
+    try {
+      await this.onTerminal({
+        evidence: this.evidence(state),
+        outcome,
+        ...(terminalCode ? { terminalCode: classifyRelayTerminalCode(terminalCode) } : {}),
+      })
+    } catch (err) {
+      this.hookFailed = true
+      this.hookError = err
+      throw err
+    }
+  }
+
+  async notifyCatch(state: StreamState, error: unknown): Promise<void> {
+    if (this.notified) return
+    const code = classifyRelayTerminalCode(error)
+    try {
+      await this.notify(state, 'failed', code)
+    } catch {
+      // Hook failure must not replace the original cause or re-enter the hook.
+    }
+  }
+}
+
+/** Stable FS/plan terminalCode. Wire frames still use publicMessage separately. */
+const PERSISTED_RELAY_TERMINAL_CODES = new Set([
+  "USER_CANCELLED",
+  "CURSOR_SAND_ABORTED",
+  "CURSOR_SAND_DOWNSTREAM_CLOSED",
+  "CURSOR_SAND_UPSTREAM_ERROR",
+  "CURSOR_SAND_UPSTREAM_TERMINATED",
+  "CURSOR_SAND_UPSTREAM_STALLED",
+  "CURSOR_SAND_TRUNCATED_FRAME",
+  "CURSOR_SAND_PROMPT_TOO_LONG",
+  "CURSOR_SAND_HTTP_ERROR",
+  "CURSOR_SAND_AUTH_HTTP_ERROR",
+  "CURSOR_SAND_RETRY_HTTP_ERROR",
+]);
+
+export function classifyRelayTerminalCode(error: unknown): string {
+  if (error == null) return "CURSOR_SAND_UPSTREAM_ERROR"
+  const err = error as { name?: string; message?: string }
+  const msg = typeof error === "string" ? error : typeof err.message === "string" ? err.message : String(error)
+  if (msg === "USER_CANCELLED") return "USER_CANCELLED"
+  const token = msg.trim().split(/[\s:]/, 1)[0] ?? ""
+  // Cancellation is an exact controlled value; arbitrary upstream prefixes
+  // must never turn private error text into durable evidence or billable stop.
+  if (token !== "USER_CANCELLED" && PERSISTED_RELAY_TERMINAL_CODES.has(token)) return token
+  const http = /^CURSOR_SAND_(AUTH_|RETRY_)?HTTP_[1-5][0-9]{2}$/.exec(token)
+  if (http) return token
+  if (err.name === "AbortError" || msg === "AbortError") return "CURSOR_SAND_ABORTED"
+  if (err.name === "TypeError" || /terminated|ECONNRESET|EPIPE|UND_ERR|fetch failed/i.test(msg)) {
+    return "CURSOR_SAND_UPSTREAM_TERMINATED"
+  }
+  return "CURSOR_SAND_UPSTREAM_ERROR"
+}
+
+function addRetryUsage(dst: StreamState, src: StreamState): void {
+  dst.inputTokens += src.inputTokens
+  dst.outputTokens += src.outputTokens
+  dst.cacheReadTokens += src.cacheReadTokens
+  dst.cacheWriteTokens += src.cacheWriteTokens
+  dst.usageSeen = dst.usageSeen || src.usageSeen
+}
+
 export class CursorSandRelay {
   private readonly deps: Required<Pick<RelayDeps, 'fetchImpl' | 'readApiKey' | 'upstreamBaseUrl' | 'clientVersion' | 'now' | 'upstreamStallMs'>>
   private readonly credentialKind: RelayCredentialKind
@@ -1119,9 +1383,20 @@ export class CursorSandRelay {
   private readonly onRequestForTest?: (body: AnthropicMessagesBody) => void
   private readonly onRawTextForTest?: (text: string, attempt: number) => void
   private readonly passthrough: RelayPassthrough | null
+  private readonly upstreamLabel: string
+  private readonly boxResolver?: CursorSandBoxResolver
+  private readonly directStream: boolean
+  private readonly boxResponses = new WeakMap<Response, CursorSandBoxConnection>()
+  private readonly requestStats = { messages: 0, inferenceAttempts: 0, toolCorrections: 0, passthroughAttempts: 0 }
+
+  /** Non-secret counters for an isolated live smoke; never exposes request bodies or tickets. */
+  getRequestStats(): Readonly<{ messages: number; inferenceAttempts: number; toolCorrections: number; passthroughAttempts: number }> {
+    return { ...this.requestStats }
+  }
 
   constructor(deps: RelayDeps = {}) {
     this.credentialKind = deps.credentialKind ?? 'api_key'
+    this.upstreamLabel = deps.upstreamLabel?.trim() || DEFAULT_UPSTREAM_LABEL
     if (this.credentialKind === 'session') {
       // Fail closed at construction: a session slot without its persisted
       // machine id would either be rejected upstream or, worse, tempt a
@@ -1140,10 +1415,17 @@ export class CursorSandRelay {
       )),
       upstreamBaseUrl: (deps.upstreamBaseUrl ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
       clientVersion: deps.clientVersion
-        ?? (this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
+        ?? (deps.directStream
+          ? CURSOR_SAND_DIRECT_CLIENT_VERSION
+          : this.credentialKind === 'session' ? CURSOR_SESSION_CLIENT_VERSION : DEFAULT_CLIENT_VERSION),
       now: deps.now ?? Date.now,
       upstreamStallMs: deps.upstreamStallMs ?? upstreamStallMs(),
     }
+    this.directStream = deps.directStream === true
+    if (deps.boxAccountId !== undefined) this.boxResolver = new CursorSandBoxResolver({
+      accountId: deps.boxAccountId, credentialKind: this.credentialKind,
+      fetchImpl: (url, init) => this.fetchUpstream(url, init), readPolicy: deps.readBoxPolicy, now: this.deps.now,
+    })
     this.onRequestForTest = deps.onRequestForTest
     this.onRawTextForTest = deps.onRawTextForTest
     this.passthrough = deps.passthrough === undefined ? defaultRelayPassthrough() : deps.passthrough
@@ -1163,6 +1445,7 @@ export class CursorSandRelay {
     res: ServerResponse,
     signal: AbortSignal,
   ): Promise<void> {
+    this.requestStats.passthroughAttempts++
     const target = this.passthrough
     if (!target) {
       res.statusCode = 400
@@ -1229,8 +1512,8 @@ export class CursorSandRelay {
         // classifier) sees a stable code instead of a generic sentence.
         const known = raw === CURSOR_SAND_UPSTREAM_STALLED || raw === CURSOR_SAND_UPSTREAM_TERMINATED
         const message = known
-          ? `Cursor Sand inference failed: ${raw} (upstream produced no frames; try a smaller step)`
-          : 'Cursor Sand inference failed'
+          ? `${this.upstreamLabel} inference failed: ${this.publicCode(raw)} (upstream produced no frames; try a smaller step)`
+          : `${this.upstreamLabel} inference failed`
         log.warn('cursor sand relay request failed', { error: raw, code: known ? raw : 'relay_error' })
         if (!res.headersSent) {
           // 504 names the failure class (gateway timeout) for logs/metrics;
@@ -1271,6 +1554,7 @@ export class CursorSandRelay {
     this.server = null
     this.origin = null
     this.authCache = null
+    this.boxResolver?.clear()
     for (const controller of this.activeRequests) controller.abort()
     this.activeRequests.clear()
     if (!server) return
@@ -1392,6 +1676,12 @@ export class CursorSandRelay {
     }
   }
 
+  private fetchUpstream(url: string, init: RequestInit): Promise<Response> {
+    const request: RequestInit & { dispatcher?: Dispatcher } = { ...init }
+    if (this.deps.fetchImpl === fetch) request.dispatcher = upstreamDispatcher()
+    return this.deps.fetchImpl(url, request)
+  }
+
   private async openInference(
     body: AnthropicMessagesBody,
     signal: AbortSignal,
@@ -1403,6 +1693,7 @@ export class CursorSandRelay {
       'content-type': 'application/connect+proto',
       'connect-protocol-version': '1',
       'x-cursor-client-type': 'sand',
+      'x-cursor-client-source': CURSOR_SAND_DIRECT_CLIENT_SOURCE,
       'x-cursor-client-version': this.deps.clientVersion,
       'x-ghost-mode': 'true',
       'x-request-id': invocationId,
@@ -1417,13 +1708,29 @@ export class CursorSandRelay {
       body: new Uint8Array(connectEnvelope(bytes)),
       signal,
     }
-    // Only the real global fetch understands undici's `dispatcher` option;
-    // injected test doubles get the plain init.
-    if (this.deps.fetchImpl === fetch) init.dispatcher = upstreamDispatcher()
-    const response = await this.deps.fetchImpl(
-      `${this.deps.upstreamBaseUrl}/aiserver.v1.InferenceService/Stream`,
-      init,
-    )
+    const box = this.directStream ? null : await this.boxResolver?.resolve(token, this.machineId, signal)
+    let response: Response
+    try {
+      this.requestStats.inferenceAttempts++
+      response = await this.fetchUpstream(
+        box?.url ?? `${this.deps.upstreamBaseUrl}/aiserver.v1.InferenceService/Stream`,
+        box ? { ...init, headers: cursorSandBoxHeaders(box, headers), redirect: 'error' } : init,
+      )
+    } catch (error) {
+      if (box) throw new CursorSandBoxError('STREAM_FAILED')
+      throw error
+    }
+    if (box) {
+      const rejected = response.status === 401 || response.status === 403
+      const busy = response.status === 429 && response.headers.get('x-oc-sand-box-upstream') !== '1'
+      const unavailable = response.status === 404 || response.status >= 500 || !response.body
+      if (rejected || busy || unavailable) {
+        if (rejected) this.boxResolver!.invalidate(box)
+        await response.body?.cancel().catch(() => {})
+        throw new CursorSandBoxError(rejected ? 'CONNECTION_REJECTED' : busy ? 'BUSY' : response.status === 404 ? 'RELAY_NOT_READY' : 'UPSTREAM_FAILED')
+      }
+      this.boxResponses.set(response, box)
+    }
     return { response, upstreamModel }
   }
 
@@ -1431,8 +1738,11 @@ export class CursorSandRelay {
     body: AnthropicMessagesBody,
     res: ServerResponse,
     signal: AbortSignal,
+    options: ServeMessagesOptions = {},
   ): Promise<CursorSandServeResult> {
+    const terminal = new TerminalSession(options.onTerminal)
     this.onRequestForTest?.(structuredClone(body))
+    this.requestStats.messages++
     let opened: { response: Response; upstreamModel: string }
     try {
       opened = await this.openInference(body, signal)
@@ -1441,16 +1751,28 @@ export class CursorSandRelay {
       // rejected) are operator problems, not transient inference faults:
       // surface the code so the turn error names the real cause.
       const message = error instanceof Error ? error.message : ''
+      if (isCursorSandBoxError(message)) {
+        await terminal.notifyCatch(this.initialState(), message)
+        res.statusCode = 400
+        res.setHeader('content-type', 'application/json')
+        res.setHeader('x-should-retry', 'false')
+        res.end(JSON.stringify({ type: 'error', error: {
+          type: 'invalid_request_error', message: `${message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}`,
+        } }))
+        return { kind: 'rejected', status: 400, reason: message, written: true }
+      }
       if (/^CURSOR_SAND_(?:SESSION|AUTH)_/.test(message)) {
         log.warn('cursor sand credential rejected', { code: message, credentialKind: this.credentialKind })
+        await terminal.notifyCatch(this.initialState(), message)
         res.statusCode = 401
         res.setHeader('content-type', 'application/json')
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'authentication_error', message: `Cursor Sand credential rejected: ${message}` },
+          error: { type: 'authentication_error', message: `${this.upstreamLabel} credential rejected: ${this.publicCode(message)}` },
         }))
         return { kind: 'rejected', status: 401, reason: message, written: true }
       }
+      await terminal.notifyCatch(this.initialState(), error)
       throw error
     }
     const upstream = opened.response
@@ -1458,12 +1780,22 @@ export class CursorSandRelay {
       // Context overflow must reach CCB as "Prompt is too long" (413 or an
       // overflow body) so reactive compaction fires instead of a dead api_error.
       const bodyText = await upstream.text().then((text) => text.slice(0, 2000), () => '')
+      // The upstream HTTP status + body is the ground truth for a rejected open
+      // (429 capacity, 5xx, auth). It was only echoed as `CURSOR_SAND_HTTP_<n>`
+      // before, hiding the body; log it so operators see the real reason.
+      log.warn('cursor sand upstream http error', {
+        status: upstream.status,
+        body: safeRaw(bodyText),
+        upstreamModel: opened.upstreamModel,
+      })
       const overflow = isCursorSandOverflow({ status: upstream.status, text: bodyText })
+      const reason = overflow ? 'CURSOR_SAND_PROMPT_TOO_LONG' : `CURSOR_SAND_HTTP_${upstream.status}`
+      await terminal.notifyCatch(this.initialState(), reason)
       res.statusCode = overflow ? 413 : (upstream.status || 502)
       res.setHeader('content-type', 'application/json')
       const message = overflow
-        ? cursorSandPromptTooLongMessage(`Cursor Sand HTTP ${upstream.status}${bodyText ? ` ${bodyText}` : ''}`)
-        : `Cursor Sand HTTP ${upstream.status}`
+        ? cursorSandPromptTooLongMessage(`${this.upstreamLabel} HTTP ${upstream.status}${bodyText ? ` ${bodyText}` : ''}`)
+        : `${this.upstreamLabel} HTTP ${upstream.status}`
       res.end(JSON.stringify({
         type: 'error',
         error: { type: overflow ? 'invalid_request_error' : 'api_error', message },
@@ -1471,7 +1803,7 @@ export class CursorSandRelay {
       return {
         kind: 'rejected',
         status: res.statusCode,
-        reason: overflow ? 'CURSOR_SAND_PROMPT_TOO_LONG' : `CURSOR_SAND_HTTP_${upstream.status}`,
+        reason,
         written: true,
       }
     }
@@ -1479,32 +1811,82 @@ export class CursorSandRelay {
     // `stream` entirely. Treating "absent" as streaming handed an SSE body to a
     // JSON-parsing SDK call, which surfaced as `Cannot read properties of
     // undefined (reading 'input_tokens')` inside CCB.
+    const echoModel = options.echoModel ?? opened.upstreamModel
     if (body.stream !== true) {
-      return this.pipeNonStreaming(upstream, opened.upstreamModel, advertisedTools(body.tools), res)
+      return this.pipeNonStreaming(upstream, opened.upstreamModel, echoModel, advertisedTools(body.tools), res, terminal)
     }
     const retryInvalidTool = async (invalidResponse: string): Promise<Response> => {
+      this.requestStats.toolCorrections++
       const retry = await this.openInference(correctedToolBody(body, invalidResponse), signal)
       if (!retry.response.ok || !retry.response.body) {
         throw new Error(`CURSOR_SAND_RETRY_HTTP_${retry.response.status}`)
       }
       return retry.response
     }
-    if (nativeInferenceTools(opened.upstreamModel)) {
-      return this.pipeNativeStreaming(
+    if (options.bufferedStreaming === true || !nativeInferenceTools(opened.upstreamModel)) {
+      return this.pipeStreaming(
         upstream,
         opened.upstreamModel,
+        echoModel,
         advertisedTools(body.tools),
         res,
         retryInvalidTool,
+        terminal,
       )
     }
-    return this.pipeStreaming(
+    return this.pipeNativeStreaming(
       upstream,
       opened.upstreamModel,
+      echoModel,
       advertisedTools(body.tools),
       res,
       retryInvalidTool,
+      terminal,
     )
+  }
+
+  /**
+   * Internal `CURSOR_SAND_*` codes are meaningful to operators reading the
+   * container path; the external proxy's clients only get the suffix.
+   */
+  private publicCode(code: string): string {
+    return this.upstreamLabel === DEFAULT_UPSTREAM_LABEL ? code : code.replace(/^CURSOR_SAND_/, '')
+  }
+
+  /** Stream `error` event text: parser-level defaults mention the default label; relabel for external clients.
+   * The internal `[non-retryable]` marker never reaches the wire — it is turned into `x-should-retry: false`. */
+  private publicMessage(message: string | null): string {
+    const raw = message ?? `${this.upstreamLabel} inference failed`
+    const text = isNonRetryableUpstreamReason(raw) ? raw.slice(0, -CURSOR_SAND_NON_RETRYABLE_SUFFIX.length) : raw
+    if (this.upstreamLabel === DEFAULT_UPSTREAM_LABEL) return text
+    return text.split(DEFAULT_UPSTREAM_LABEL).join(this.upstreamLabel).replace(/\bCURSOR_SAND_/g, '')
+  }
+
+  /**
+   * Upstream said the fault is not retryable (provider 4xx such as the
+   * 2026-09-08 `ERROR_PROVIDER_ERROR` / providerStatusCode 400). Tell the
+   * client so before headers go out: Claude Code honours `x-should-retry:
+   * false` and stops its 10× backoff loop (users otherwise sat through
+   * "Retrying… attempt N/10" for minutes on a request that could never work).
+   * Streaming responses already have headers on the wire; there the SSE
+   * `error` text carries the reason and the client's own error type logic applies.
+   */
+  private markNonRetryable(res: ServerResponse, reason: string | null): void {
+    if (!isNonRetryableUpstreamReason(reason)) return
+    if (!res.headersSent) res.setHeader('x-should-retry', 'false')
+  }
+
+  /**
+   * SSE `error` event type for a stream failure. On the native streaming
+   * path `message_start` is already on the wire when the upstream trailer
+   * arrives, so a header cannot carry the retry hint; the Anthropic error
+   * *type* is the only signal left. `invalid_request_error` is the class the
+   * client maps to a 400 and never retries, which is exactly what a provider
+   * `isRetryable:false` fault deserves. Everything else stays `api_error`
+   * (retryable 5xx semantics), preserving CCB's existing recovery loop.
+   */
+  private streamErrorType(reason: string | null): 'api_error' | 'invalid_request_error' {
+    return isNonRetryableUpstreamReason(reason) ? 'invalid_request_error' : 'api_error'
   }
 
   /**
@@ -1522,6 +1904,7 @@ export class CursorSandRelay {
     body: AnthropicMessagesBody,
     res: ServerResponse,
     signal: AbortSignal,
+    options: ServeMessagesOptions = {},
   ): Promise<CursorSandServeResult> {
     if (!isSandRoutableModel(body.model)) {
       return { kind: 'rejected', status: 400, reason: 'NOT_SAND_ROUTE', written: false }
@@ -1532,7 +1915,7 @@ export class CursorSandRelay {
     else signal.addEventListener('abort', abort, { once: true })
     this.activeRequests.add(controller)
     try {
-      return await this.handleMessages(body, res, controller.signal)
+      return await this.handleMessages(body, res, controller.signal, options)
     } finally {
       signal.removeEventListener('abort', abort)
       this.activeRequests.delete(controller)
@@ -1549,6 +1932,7 @@ export class CursorSandRelay {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
+      usageSeen: false,
       text: '',
       thinking: '',
       failed: false,
@@ -1588,11 +1972,13 @@ export class CursorSandRelay {
       return
     }
     if (kind === 'usage') {
+      state.usageSeen = true
       if (typeof value.promptTokens === 'number') state.inputTokens = value.promptTokens
       if (typeof value.completionTokens === 'number') state.outputTokens = value.completionTokens
       return
     }
     if (kind === 'extendedUsage') {
+      state.usageSeen = true
       if (typeof value.inputTokens === 'number') state.inputTokens = value.inputTokens
       if (typeof value.outputTokens === 'number') state.outputTokens = value.outputTokens
       // cache_read_tokens / cache_write_tokens are carried on the same frame;
@@ -1663,9 +2049,19 @@ export class CursorSandRelay {
           buffer = buffer.subarray(5 + length)
           if ((flags & 0x02) !== 0) {
             const error = parseEndTrailer(payload)
-            if (error) onEndError(error)
+            if (error) {
+              const box = this.boxResponses.get(response)
+              const code = box ? (JSON.parse(payload.toString('utf8')) as { error?: { code?: unknown } }).error?.code : undefined
+              const ticket = box ? cursorSandBoxTicketError(error, code) : null
+              if (ticket && box) this.boxResolver?.invalidate(box)
+              onEndError(ticket ?? error)
+            }
           } else {
-            await onFrame(decodeFrame(payload))
+            const frame = decodeFrame(payload)
+            const box = this.boxResponses.get(response)
+            const ticket = box && frame.response === 'error' ? cursorSandBoxTicketError(errorMessage(frame.error), (frame.error as JsonObject | undefined)?.code ?? (frame.error as JsonObject | undefined)?.errorType) : null
+            if (ticket && box) { this.boxResolver?.invalidate(box); onEndError(ticket) }
+            else await onFrame(frame)
           }
         }
       }
@@ -1683,15 +2079,16 @@ export class CursorSandRelay {
   private async emitStreamFailure(res: ServerResponse, error: unknown): Promise<void> {
     if (res.destroyed || res.writableEnded) return
     const raw = error instanceof Error ? error.message : String(error)
+    const boxFailure = isCursorSandBoxError(raw)
     const known = raw === CURSOR_SAND_UPSTREAM_STALLED || raw === CURSOR_SAND_UPSTREAM_TERMINATED
-    const message = known
-      ? `Cursor Sand inference failed: ${raw} (upstream produced no frames; try a smaller step)`
+    const message = boxFailure ? `${raw}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}` : known
+      ? `${this.upstreamLabel} inference failed: ${this.publicCode(raw)} (upstream produced no frames; try a smaller step)`
       : raw === 'CURSOR_SAND_DOWNSTREAM_CLOSED'
         ? null
-        : 'Cursor Sand inference failed'
+        : `${this.upstreamLabel} inference failed`
     if (message === null) return
     try {
-      await emitSse(res, 'error', { type: 'error', error: { type: 'api_error', message } })
+      await emitSse(res, 'error', { type: 'error', error: { type: boxFailure ? 'invalid_request_error' : 'api_error', message } })
     } catch {
       // downstream already gone; nothing to tell
     }
@@ -1700,9 +2097,11 @@ export class CursorSandRelay {
   private async pipeNativeStreaming(
     upstream: Response,
     model: string,
+    echoModel: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
     retryInvalidTool: (invalidResponse: string) => Promise<Response>,
+    terminal: TerminalSession,
   ): Promise<CursorSandServeResult> {
     const state = this.initialState()
     const messageId = `msg_${randomBytes(16).toString('hex')}`
@@ -1783,7 +2182,7 @@ export class CursorSandRelay {
           id: messageId,
           type: 'message',
           role: 'assistant',
-          model,
+          model: echoModel,
           content: [],
           stop_reason: null,
           stop_sequence: null,
@@ -1856,17 +2255,23 @@ export class CursorSandRelay {
       if (pendingText) {
         let recovered = recoverXmlToolCalls(pendingText, allowedTools)
         if (
-          allowedTools.length > 0
+          !state.failed
+          && !streamError
+          && allowedTools.length > 0
           && recovered.tools.length === 0
           && looksLikeInvalidToolIntent(pendingText, allowedTools)
         ) {
           const retry = await retryInvalidTool(pendingText)
-          const collected = await this.collectInference(retry)
+          const retryState = this.initialState()
+          let collected: Awaited<ReturnType<CursorSandRelay["collectInference"]>>
+          try {
+            collected = await this.collectInference(retry, retryState)
+          } catch (err) {
+            addRetryUsage(state, retryState)
+            throw err
+          }
           this.onRawTextForTest?.(collected.state.text, 2)
-          state.inputTokens += collected.state.inputTokens
-          state.outputTokens += collected.state.outputTokens
-          state.cacheReadTokens += collected.state.cacheReadTokens
-          state.cacheWriteTokens += collected.state.cacheWriteTokens
+          addRetryUsage(state, collected.state)
           streamError ??= collected.streamError
           if (collected.state.thinking) {
             await closeText()
@@ -1903,12 +2308,13 @@ export class CursorSandRelay {
           pendingText = recovered.text
           if (
             !collected.state.failed
+            && !streamError
             && collected.state.tools.size === 0
             && recovered.tools.length === 0
             && looksLikeInvalidToolIntent(collected.state.text, allowedTools)
           ) {
             state.failed = true
-            streamError = 'Cursor Sand tool protocol remained invalid after one correction'
+            streamError = `${this.upstreamLabel} tool protocol remained invalid after one correction`
           }
         } else {
           pendingText = recovered.text
@@ -1938,12 +2344,15 @@ export class CursorSandRelay {
         if (!tool.closed || tool.contentIndex !== null) await finishTool(tool)
       }
       if (state.failed || streamError) {
+        const reason = streamError ?? `${this.upstreamLabel} inference failed`
+        await terminal.notify(state, 'failed', reason)
         await emitSse(res, 'error', {
           type: 'error',
-          error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
+          error: { type: this.streamErrorType(streamError), message: this.publicMessage(streamError) },
         })
-        return { kind: 'failed', reason: streamError ?? 'Cursor Sand inference failed', usage: usageSnapshot(state) }
+        return { kind: 'failed', reason, usage: usageSnapshot(state) }
       }
+      await terminal.notify(state, 'completed')
       const toolCount = [...state.tools.values()].filter((tool) => tool.name).length
       await emitSse(res, 'message_delta', {
         type: 'message_delta',
@@ -1960,6 +2369,7 @@ export class CursorSandRelay {
       // stream was closed cleanly here and the SSE `error` frame in start()'s
       // catch never went out, so CCB saw a truncated-but-"successful" message
       // (half-open tool_use → tool never executed → turn marked completed).
+      await terminal.notifyCatch(state, error)
       await this.emitStreamFailure(res, error)
       throw error
     } finally {
@@ -1968,12 +2378,12 @@ export class CursorSandRelay {
     }
   }
 
-  private async collectInference(upstream: Response): Promise<{
+  private async collectInference(upstream: Response, into: StreamState = this.initialState()): Promise<{
     state: StreamState
     thinkingSignature: string
     streamError: string | null
   }> {
-    const state = this.initialState()
+    const state = into
     let thinkingSignature = ''
     let streamError: string | null = null
     await this.consumeFrames(
@@ -2000,9 +2410,11 @@ export class CursorSandRelay {
   private async pipeStreaming(
     upstream: Response,
     model: string,
+    echoModel: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
     retryInvalidTool: (invalidResponse: string) => Promise<Response>,
+    terminal: TerminalSession,
   ): Promise<CursorSandServeResult> {
     let state = this.initialState()
     const messageId = `msg_${randomBytes(16).toString('hex')}`
@@ -2019,14 +2431,16 @@ export class CursorSandRelay {
     }, PING_MS)
     ping.unref()
     try {
-      let collected = await this.collectInference(upstream)
+      let collected = await this.collectInference(upstream, state)
       this.onRawTextForTest?.(collected.state.text, 1)
       state = collected.state
       streamError = collected.streamError
       thinkingSignature = collected.thinkingSignature
       let recovered = recoverXmlToolCalls(state.text, allowedTools)
       if (
-        allowedTools.length > 0
+        !state.failed
+        && !streamError
+        && allowedTools.length > 0
         && state.tools.size === 0
         && recovered.tools.length === 0
         && looksLikeInvalidToolIntent(state.text, allowedTools)
@@ -2035,33 +2449,48 @@ export class CursorSandRelay {
         const firstOutput = state.outputTokens
         const firstCacheRead = state.cacheReadTokens
         const firstCacheWrite = state.cacheWriteTokens
+        const firstUsageSeen = state.usageSeen
         const retry = await retryInvalidTool(state.text)
-        collected = await this.collectInference(retry)
+        const retryState = this.initialState()
+        try {
+          collected = await this.collectInference(retry, retryState)
+        } catch (err) {
+          addRetryUsage(state, retryState)
+          throw err
+        }
         this.onRawTextForTest?.(collected.state.text, 2)
         state = collected.state
         state.inputTokens += firstInput
         state.outputTokens += firstOutput
         state.cacheReadTokens += firstCacheRead
         state.cacheWriteTokens += firstCacheWrite
+        state.usageSeen = state.usageSeen || firstUsageSeen
         streamError = collected.streamError
         thinkingSignature = collected.thinkingSignature
         recovered = recoverXmlToolCalls(state.text, allowedTools)
         if (
           !state.failed
+          && !streamError
           && state.tools.size === 0
           && recovered.tools.length === 0
           && looksLikeInvalidToolIntent(state.text, allowedTools)
         ) {
           state.failed = true
-          streamError = 'Cursor Sand tool protocol remained invalid after one correction'
+          streamError = `${this.upstreamLabel} tool protocol remained invalid after one correction`
         }
       }
       if (state.failed || streamError) {
+        // Nothing has been written yet on this path (collectInference buffers
+        // the whole upstream stream first), so the retry hint can still ride
+        // as a header alongside the SSE error body.
+        this.markNonRetryable(res, streamError)
+        const reason = streamError ?? `${this.upstreamLabel} inference failed`
+        await terminal.notify(state, 'failed', reason)
         await emitSse(res, 'error', {
           type: 'error',
-          error: { type: 'api_error', message: streamError ?? 'Cursor Sand inference failed' },
+          error: { type: this.streamErrorType(streamError), message: this.publicMessage(streamError) },
         })
-        return { kind: 'failed', reason: streamError ?? 'Cursor Sand inference failed', usage: usageSnapshot(state) }
+        return { kind: 'failed', reason, usage: usageSnapshot(state) }
       }
 
       await emitSse(res, 'message_start', {
@@ -2070,7 +2499,7 @@ export class CursorSandRelay {
           id: messageId,
           type: 'message',
           role: 'assistant',
-          model,
+          model: echoModel,
           content: [],
           stop_reason: null,
           stop_sequence: null,
@@ -2130,6 +2559,7 @@ export class CursorSandRelay {
         state.recoveredToolCount++
       }
 
+      await terminal.notify(state, 'completed')
       await emitSse(res, 'message_delta', {
         type: 'message_delta',
         delta: {
@@ -2145,6 +2575,7 @@ export class CursorSandRelay {
       // stream was closed cleanly here and the SSE `error` frame in start()'s
       // catch never went out, so CCB saw a truncated-but-"successful" message
       // (half-open tool_use → tool never executed → turn marked completed).
+      await terminal.notifyCatch(state, error)
       await this.emitStreamFailure(res, error)
       throw error
     } finally {
@@ -2156,50 +2587,60 @@ export class CursorSandRelay {
   private async pipeNonStreaming(
     upstream: Response,
     model: string,
+    echoModel: string,
     allowedTools: readonly ToolRecoveryDefinition[],
     res: ServerResponse,
+    terminal: TerminalSession,
   ): Promise<CursorSandServeResult> {
     const state = this.initialState()
     const tools = new Map<number, ToolStreamState>()
     let error: string | null = null
-    await this.consumeFrames(
-      upstream,
-      (frame) => this.applyFrame(state, frame, {
-        text: () => {},
-        thinking: () => {},
-        tool: (part) => { mergeToolPart(tools, part) },
-        error: (message) => { error = message },
-      }),
-      (message) => { error = message },
-    )
-    if (error) {
-      res.statusCode = 502
+    try {
+      await this.consumeFrames(
+        upstream,
+        (frame) => this.applyFrame(state, frame, {
+          text: () => {},
+          thinking: () => {},
+          tool: (part) => { mergeToolPart(tools, part) },
+          error: (message) => { error = message },
+        }),
+        (message) => { error = message },
+      )
+      if (error) {
+        await terminal.notify(state, 'failed', error)
+        res.statusCode = isCursorSandBoxError(error) ? 400 : 502
+        res.setHeader('content-type', 'application/json')
+        this.markNonRetryable(res, error)
+        res.end(JSON.stringify({ type: 'error', error: { type: this.streamErrorType(error), message: this.publicMessage(error) } }))
+        return { kind: 'rejected', status: res.statusCode, reason: error, written: true }
+      }
+      await terminal.notify(state, 'completed')
+      const content: JsonObject[] = []
+      const recovered = recoverXmlToolCalls(state.text, allowedTools)
+      if (state.thinking) content.push({ type: 'thinking', thinking: state.thinking, signature: '' })
+      if (recovered.text) content.push({ type: 'text', text: recovered.text })
+      for (const tool of [...tools.values()].sort((a, b) => a.index - b.index)) {
+        let input: unknown = {}
+        try { input = tool.args ? JSON.parse(tool.args) : {} } catch { input = {} }
+        content.push({ type: 'tool_use', id: tool.id, name: tool.name, input })
+      }
+      for (const tool of recovered.tools) {
+        content.push({ type: 'tool_use', id: tool.id, name: tool.name, input: tool.input })
+      }
+      res.statusCode = 200
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: error } }))
-      return { kind: 'rejected', status: 502, reason: error, written: true }
+      res.end(JSON.stringify({
+        id: `msg_${randomBytes(16).toString('hex')}`,
+        type: 'message', role: 'assistant', model: echoModel,
+        content,
+        stop_reason: tools.size + recovered.tools.length > 0 ? 'tool_use' : 'end_turn',
+        stop_sequence: null,
+        usage: usageBlock(state),
+      }))
+      return { kind: 'completed', upstreamModel: model, usage: usageSnapshot(state) }
+    } catch (err) {
+      await terminal.notifyCatch(state, err)
+      throw err
     }
-    const content: JsonObject[] = []
-    const recovered = recoverXmlToolCalls(state.text, allowedTools)
-    if (state.thinking) content.push({ type: 'thinking', thinking: state.thinking, signature: '' })
-    if (recovered.text) content.push({ type: 'text', text: recovered.text })
-    for (const tool of [...tools.values()].sort((a, b) => a.index - b.index)) {
-      let input: unknown = {}
-      try { input = tool.args ? JSON.parse(tool.args) : {} } catch { input = {} }
-      content.push({ type: 'tool_use', id: tool.id, name: tool.name, input })
-    }
-    for (const tool of recovered.tools) {
-      content.push({ type: 'tool_use', id: tool.id, name: tool.name, input: tool.input })
-    }
-    res.statusCode = 200
-    res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify({
-      id: `msg_${randomBytes(16).toString('hex')}`,
-      type: 'message', role: 'assistant', model,
-      content,
-      stop_reason: tools.size + recovered.tools.length > 0 ? 'tool_use' : 'end_turn',
-      stop_sequence: null,
-      usage: usageBlock(state),
-    }))
-    return { kind: 'completed', upstreamModel: model, usage: usageSnapshot(state) }
   }
 }

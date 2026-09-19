@@ -248,6 +248,13 @@ export const InboundMessage = Type.Object({
   // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
   // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
   teamMode: Type.Optional(Type.Boolean()),
+  // Platform collaboration mode. Wire name MUST stay `collabMode` (not
+  // collaborationMode) so tape sanitizer private-field stripping cannot eat it.
+  collabMode: Type.Optional(
+    Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),
+  ),
+  advisorModel: Type.Optional(Type.String()),
+  collabConfigVersion: Type.Optional(Type.String()),
   // Codex-native app-server conversation mode. `plan` asks Codex to produce a
   // reviewable read-only plan; `default` runs the implementation turn. Omitted
   // means runner default (commercial UI normally omits this; autonomous plan
@@ -434,6 +441,11 @@ export const PromptQueueItem = Type.Object({
     modelSwitchId: Type.Optional(ControlId),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     teamMode: Type.Optional(Type.Boolean()),
+    collabMode: Type.Optional(
+      Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),
+    ),
+    advisorModel: Type.Optional(Type.String()),
+    collabConfigVersion: Type.Optional(Type.String()),
     contextTier: Type.Optional(
       Type.Union(CURSOR_CONTEXT_TIERS.map((tier) => Type.Literal(tier))),
     ),
@@ -521,6 +533,11 @@ export const InboundPromptQueueEnqueue = Type.Object({
     model: Type.Optional(Type.String()),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     teamMode: Type.Optional(Type.Boolean()),
+    collabMode: Type.Optional(
+      Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),
+    ),
+    advisorModel: Type.Optional(Type.String()),
+    collabConfigVersion: Type.Optional(Type.String()),
     contextTier: Type.Optional(
       Type.Union(CURSOR_CONTEXT_TIERS.map((tier) => Type.Literal(tier))),
     ),

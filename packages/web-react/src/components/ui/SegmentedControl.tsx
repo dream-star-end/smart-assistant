@@ -24,7 +24,8 @@ const groupClass =
   "no-scrollbar inline-flex max-w-full items-center gap-0.5 overflow-x-auto overscroll-x-contain rounded-full bg-hover p-0.5";
 
 const itemVariants = cva(
-  "inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-9",
+  // 触屏命中高与 Button / IconButton / Chip 同一标准 44px(a11y 走查 shell#9:此前 min-h-9 = 36px)。
+  "inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full font-medium outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:none)]:min-h-11",
   {
     variants: {
       size: {

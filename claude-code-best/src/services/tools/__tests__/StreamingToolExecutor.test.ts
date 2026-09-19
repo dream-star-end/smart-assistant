@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { StreamingToolExecutor } from '../StreamingToolExecutor.js'
 import type { ToolUseContext } from '../../../Tool.js'
 
@@ -125,5 +125,52 @@ describe('StreamingToolExecutor.discard()', () => {
     expect(internals.tools).toHaveLength(0)
     expect(internals.progressAvailableResolve).toBeUndefined()
     expect(internals.turnSpan).toBeNull()
+  })
+})
+
+function makeAssistant() {
+  return {
+    uuid: 'asst-a5',
+    type: 'assistant',
+    message: { id: 'msg-a5', role: 'assistant', content: [] },
+    requestId: 'req-a5',
+  } as any
+}
+
+function makeToolUse() {
+  return {
+    type: 'tool_use' as const,
+    id: 'toolu_a5',
+    name: 'Bash',
+    input: { command: 'true' },
+  }
+}
+
+describe('StreamingToolExecutor.addTool advisor hermetic vs empty tools', () => {
+  const saved = process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC
+    else process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC = saved
+  })
+
+  test('profile=true tools=[] aborts and does not queue unknown tool_result', () => {
+    process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC = '1'
+    const ctx = makeMinimalContext()
+    const executor = new StreamingToolExecutor([], () => true as any, ctx)
+    executor.addTool(makeToolUse() as any, makeAssistant())
+    expect(ctx.abortController.signal.aborted).toBe(true)
+    const queued = (executor as unknown as { tools: unknown[] }).tools
+    expect(queued).toHaveLength(0)
+  })
+
+  test('profile=false tools=[] keeps unknown tool_result and does not abort', () => {
+    delete process.env.OPENCLAUDE_CCB_ADVISOR_HERMETIC
+    const ctx = makeMinimalContext()
+    const executor = new StreamingToolExecutor([], () => true as any, ctx)
+    executor.addTool(makeToolUse() as any, makeAssistant())
+    expect(ctx.abortController.signal.aborted).toBe(false)
+    const queued = (executor as unknown as { tools: Array<{ results: unknown[] }> }).tools
+    expect(queued).toHaveLength(1)
+    expect(JSON.stringify(queued[0]?.results ?? [])).toContain('No such tool available: Bash')
   })
 })

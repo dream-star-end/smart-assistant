@@ -23,6 +23,7 @@ import {
   type DurableCodexBilling,
 } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
+import { AdvisorConsultStore } from './advisorConsultStore.js'
 import { request as undiciRequest } from 'undici'
 
 // Concatenated so the internal-route scanner does not treat these as new
@@ -52,6 +53,8 @@ export interface DelegateEngineBillingAdmitInput {
 export interface DelegateEngineBillingAdmission {
   requestId: string
   engineSessionId: string
+  /** Advisor-consult only. Regular delegate admits omit this. */
+  route?: unknown
 }
 
 export interface DelegateEngineBillingClient {
@@ -59,6 +62,7 @@ export interface DelegateEngineBillingClient {
   settle(billing: DurableCodexBilling): Promise<void>
   abandon(requestId: string): Promise<void>
   retryPending?(): Promise<void>
+  projectConsults?(store: AdvisorConsultStore): Promise<void>
 }
 
 export function shouldAdmitDelegateEngineBilling(args: {
@@ -105,6 +109,9 @@ export function mapDelegateEngineBillingError(err: unknown): {
   if (code.includes('INSUFFICIENT_CREDITS')) {
     return { httpStatus: 402, message: '余额不足，engine-reported 委派未启动' }
   }
+  if (code.includes('ROUTE_UNAVAILABLE')) {
+    return { httpStatus: 503, message: '顾问模型路由不可用，未启动' }
+  }
   if (code.includes('INVALID_')) {
     return { httpStatus: 400, message: `engine-reported 委派计费初始化失败: ${code}` }
   }
@@ -114,9 +121,15 @@ export function mapDelegateEngineBillingError(err: unknown): {
   }
 }
 
+interface BillingSettledReceipt {
+  requestId: string
+  at: number
+}
+
 interface BillingQueue {
   schemaVersion: 1
   pending: DurableCodexBilling[]
+  settledReceipts?: BillingSettledReceipt[]
 }
 
 function isNotFound(err: unknown): boolean {
@@ -142,11 +155,36 @@ async function readBillingQueue(queuePath: string): Promise<BillingQueue> {
     if (raw?.schemaVersion !== 1 || !Array.isArray(raw.pending)) {
       throw new Error('DELEGATE_ENGINE_BILLING_QUEUE_INVALID')
     }
-    return { schemaVersion: 1, pending: raw.pending }
+    return {
+      schemaVersion: 1,
+      pending: raw.pending,
+      settledReceipts: Array.isArray(raw.settledReceipts) ? raw.settledReceipts : [],
+    }
   } catch (err) {
     if (isNotFound(err)) return { schemaVersion: 1, pending: [] }
     throw err
   }
+}
+
+let defaultSettledHook: ((billing: DurableCodexBilling) => void | Promise<void>) | undefined
+
+export function setDelegateEngineBillingSettledHook(
+  hook: ((billing: DurableCodexBilling) => void | Promise<void>) | undefined,
+): void {
+  defaultSettledHook = hook
+}
+
+async function emitDelegateEngineBillingSettled(
+  billing: DurableCodexBilling,
+  extra?: (billing: DurableCodexBilling) => void | Promise<void>,
+): Promise<void> {
+  AdvisorConsultStore.projectSettledRequestId(billing.requestId)
+  await extra?.(billing)
+  await defaultSettledHook?.(billing)
+}
+
+export function defaultDelegateEngineBillingQueuePath(): string {
+  return join(paths.agentDir('_platform'), 'delegate-engine-billing.json')
 }
 
 export function createDelegateEngineBillingClient(args?: {
@@ -156,6 +194,8 @@ export function createDelegateEngineBillingClient(args?: {
   retryMs?: number
   /** Default true: drain leftover queue files after construct (C1). Tests may set false. */
   startupRecovery?: boolean
+  /** Fired only after an authoritative 2xx settle POST, never from an empty queue. */
+  onSettled?: (billing: DurableCodexBilling) => void | Promise<void>
 }): DelegateEngineBillingClient {
   const env = args?.env ?? process.env
   const fetcher = args?.fetcher ?? undiciRequest
@@ -224,12 +264,24 @@ export function createDelegateEngineBillingClient(args?: {
       await writeDurableJson(queuePath, queue)
     })
 
-  const dropSettled = async (requestId: string): Promise<void> =>
+  const dropSettled = async (billing: DurableCodexBilling): Promise<void> =>
     withQueueLock(async () => {
       const queue = await readBillingQueue(queuePath)
-      const next = queue.pending.filter((row) => row.requestId !== requestId)
-      if (next.length !== queue.pending.length) {
-        await writeDurableJson(queuePath, { schemaVersion: 1, pending: next })
+      const next = queue.pending.filter((row) => row.requestId !== billing.requestId)
+      const receipts = [...(queue.settledReceipts ?? [])]
+      const needsConsultProjection = billing.delegateAgentId === 'advisor'
+      if (
+        needsConsultProjection &&
+        !receipts.some((row) => row.requestId === billing.requestId)
+      ) {
+        receipts.push({ requestId: billing.requestId, at: Date.now() })
+      }
+      if (next.length !== queue.pending.length || receipts.length !== (queue.settledReceipts?.length ?? 0)) {
+        await writeDurableJson(queuePath, {
+          schemaVersion: 1,
+          pending: next,
+          settledReceipts: receipts,
+        })
       }
     })
 
@@ -260,6 +312,7 @@ export function createDelegateEngineBillingClient(args?: {
       return {
         requestId: result.requestId,
         engineSessionId: result.engineSessionId,
+        ...(result.route !== undefined ? { route: result.route } : {}),
       }
     },
     async settle(billing) {
@@ -268,13 +321,18 @@ export function createDelegateEngineBillingClient(args?: {
       }
       try {
         await post(SETTLE_PATH, billing)
-        await dropSettled(billing.requestId)
+        await dropSettled(billing)
       } catch (err) {
         // Same durable-boundary pattern as Auto-Dream: persist then retry.
         // UNIQUE(user_id, request_id) makes a later successful POST idempotent.
         await persistBilling(billing)
         scheduleRetry()
         throw err
+      }
+      try {
+        await emitDelegateEngineBillingSettled(billing, args?.onSettled)
+      } catch {
+        // Authoritative 2xx already recorded; consult projection retries from settledReceipts.
       }
     },
     async abandon(requestId) {
@@ -286,24 +344,62 @@ export function createDelegateEngineBillingClient(args?: {
     async retryPending() {
       return withQueueLock(async () => {
         const queue = await readBillingQueue(queuePath)
-        if (queue.pending.length === 0) {
-          clearRetry()
-          return
-        }
         const remaining: DurableCodexBilling[] = []
+        const receipts = [...(queue.settledReceipts ?? [])]
         for (const billing of queue.pending) {
           try {
             await post(SETTLE_PATH, billing)
+            if (
+              billing.delegateAgentId === 'advisor' &&
+              !receipts.some((row) => row.requestId === billing.requestId)
+            ) {
+              receipts.push({ requestId: billing.requestId, at: Date.now() })
+            }
+            try {
+              await emitDelegateEngineBillingSettled(billing, args?.onSettled)
+            } catch {
+              /* 2xx receipt kept; consult projection is retried from settledReceipts */
+            }
           } catch {
             remaining.push(billing)
           }
         }
-        await writeDurableJson(queuePath, { schemaVersion: 1, pending: remaining })
+        const kept: BillingSettledReceipt[] = []
+        for (const rec of receipts) {
+          const outcome = AdvisorConsultStore.projectSettledReceipt(rec.requestId)
+          if (outcome === 'pending' || outcome === 'store-closed') kept.push(rec)
+        }
+        await writeDurableJson(queuePath, {
+          schemaVersion: 1,
+          pending: remaining,
+          settledReceipts: kept,
+        })
         if (remaining.length > 0) {
           scheduleRetry()
           throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
         }
+        if (kept.length > 0) {
+          scheduleRetry()
+          return
+        }
         clearRetry()
+      })
+    },
+    async projectConsults(store: AdvisorConsultStore) {
+      return withQueueLock(async () => {
+        const queue = await readBillingQueue(queuePath)
+        const kept: BillingSettledReceipt[] = []
+        for (const rec of queue.settledReceipts ?? []) {
+          const outcome = store.projectOneReceipt(rec.requestId)
+          if (outcome === 'pending') kept.push(rec)
+        }
+        if (kept.length !== (queue.settledReceipts?.length ?? 0)) {
+          await writeDurableJson(queuePath, {
+            schemaVersion: 1,
+            pending: queue.pending,
+            settledReceipts: kept,
+          })
+        }
       })
     },
   }

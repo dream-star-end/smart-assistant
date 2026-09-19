@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -294,4 +298,144 @@ describe("incident ledger superset", () => {
     assert.equal(result.ok, false);
     assert.ok(!result.ok && result.errors.some((err) => err.includes("TRAILER") || err.includes("trailer") || err.includes("missing baseline tips")));
   });
+});
+
+// OCV5-188: executes the unmodified candidate CLI against metadata fixtures.
+// No marker is installed here: this does NOT claim historical trailer coverage,
+// nor execution of the synthetic proof artifact. Full repository gate is separate.
+const severityCheckerPath = path.join(root, "scripts/check-v5-incident-regressions.ts");
+const severityCheckerBytes = readFileSync(severityCheckerPath);
+const severityCheckerHash = createHash("sha256").update(severityCheckerBytes).digest("hex");
+const severityLoader = createRequire(import.meta.url).resolve("tsx");
+const severityCatalog = [
+  "P0 accepted", "P1 accepted", "P2 accepted", "P3 rejected", "lowercase rejected",
+  "empty rejected", "numeric rejected", "missing rejected", "padded rejected",
+  "regressions required", "proof declaration required", "artifact required",
+  "assertion required", "runner required", "lineage required", "pending ceiling preserved",
+] as const;
+
+type SeverityFixture = {
+  dir: string;
+  manifest: { schema: number; scope: string; fixedLiveMatrix: object[]; incidents: any[] };
+  unanchored: string;
+  write: (rel: string, data: string) => void;
+};
+function makeSeverityFixture(): SeverityFixture {
+  const dir = mkdtempSync(path.join(tmpdir(), "oc-incident-severity-"));
+  const write = (rel: string, data: string) => {
+    mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    writeFileSync(path.join(dir, rel), data);
+  };
+  const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=Incident Fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+    cwd: dir, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"],
+    env: { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+  }).trim();
+  try {
+    write("README.md", "isolated metadata admission fixture\n");
+    git("init", "-q"); git("add", "."); git("commit", "-qm", "chore: fixture baseline");
+    const unanchored = git("rev-parse", "HEAD").slice(0, 8);
+    write("scripts/check-v5-incident-regressions.ts", severityCheckerBytes.toString("utf8"));
+    write("package.json", JSON.stringify({ type: "module", fixture: "scripts/__tests__/p2Fixture.test.ts" }));
+    write("scripts/__tests__/p2Fixture.test.ts", "// P2_UNIT_ASSERTION\n");
+    write("scripts/p2-proof-fixture.ts", "// P2_PROOF_ASSERTION\n");
+    write(".github/workflows/v5-ci.yml", "# test:v5:ops\n");
+    write("scripts/deploy-v5.sh", "# p2-proof-fixture.ts\n");
+    write("e2e/session-display/run.sh", 'MATRIX=(gpt-5.6-luna deepseek-v4-flash)\nOC_E2E_REQUIRE_DIRECT_TIMELINE=1\nOC_E2E_EMAIL="v5-evals@claudeai.chat"\nexport CI=1\n');
+    mkdirSync(path.join(dir, "e2e/session-display/tests"), { recursive: true });
+    git("add", "."); git("commit", "-qm", "test: fixture proof metadata");
+    const rootFixCommit = git("rev-parse", "HEAD").slice(0, 8);
+    const manifest = {
+      schema: 2, scope: "metadata fixture; not a live deployment proof",
+      fixedLiveMatrix: [{ engine: "codex", model: "gpt-5.6-luna" }, { engine: "ccb", model: "deepseek-v4-flash" }],
+      incidents: [{ id: "INC-20260909-P2-GATE-SCHEMA", occurredAt: "2026-09-09", severity: "P2",
+        symptom: "synthetic metadata admission", rootFixCommit,
+        regressions: [
+          { layer: "unit", path: "scripts/__tests__/p2Fixture.test.ts", assertion: "P2_UNIT_ASSERTION" },
+          { layer: "deploy-gate", path: "scripts/p2-proof-fixture.ts", assertion: "P2_PROOF_ASSERTION" },
+        ],
+      }],
+    };
+    return { dir, write, manifest, unanchored };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+function runSeverityCli(f: SeverityFixture) {
+  f.write("e2e/session-display/incidents.json", JSON.stringify(f.manifest));
+  const result = spawnSync(process.execPath, ["--import", severityLoader, path.join(f.dir, "scripts/check-v5-incident-regressions.ts")], {
+    cwd: f.dir, encoding: "utf8", timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
+    env: { PATH: process.env.PATH, HOME: f.dir, LANG: "C.UTF-8", TZ: "UTC", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  return { exit: result.status, signal: result.signal, error: result.error?.message ?? null,
+    stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+describe("incident severity CLI admission", () => {
+  for (const name of severityCatalog) {
+    test(name, () => {
+      let f: SeverityFixture | undefined;
+      let phase = "fixture";
+      let before: ReturnType<typeof runSeverityCli> | undefined;
+      let actual: ReturnType<typeof runSeverityCli> | undefined;
+      let failure: string | null = null;
+      let expected: { exit: string; reason: string } = { exit: "0", reason: "PASS" };
+      try {
+        f = makeSeverityFixture();
+        // Every negative begins with the same real valid P2 fixture, not a
+        // disconnected mock validator. P0/P1 positives also verify no regression.
+        const item = f.manifest.incidents[0];
+        if (name === "P0 accepted") item.severity = "P0";
+        if (name === "P1 accepted") item.severity = "P1";
+        phase = "positive precondition";
+        before = runSeverityCli(f);
+        assert.equal(before.error, null, JSON.stringify(before));
+        assert.equal(before.signal, null, JSON.stringify(before));
+        assert.equal(before.exit, 0, JSON.stringify(before));
+        assert.match(before.stdout, /\[incident-regressions\] PASS:/);
+        if (name.endsWith("accepted")) { actual = before; return; }
+        phase = "mutation";
+        let reason: RegExp;
+        switch (name) {
+          case "P3 rejected": item.severity = "P3"; reason = /severity must be P0\/P1\/P2/; break;
+          case "lowercase rejected": item.severity = "p2"; reason = /severity must be P0\/P1\/P2/; break;
+          case "empty rejected": item.severity = ""; reason = /severity must be P0\/P1\/P2/; break;
+          case "numeric rejected": item.severity = 2; reason = /severity must be P0\/P1\/P2/; break;
+          case "missing rejected": delete item.severity; reason = /severity must be P0\/P1\/P2/; break;
+          case "padded rejected": item.severity = " P2 "; reason = /severity must be P0\/P1\/P2/; break;
+          case "regressions required": item.regressions = []; reason = /no automated regression/; break;
+          case "proof declaration required": item.regressions.pop(); reason = /必须写 proofPending/; break;
+          case "artifact required": rmSync(path.join(f.dir, "scripts/p2-proof-fixture.ts")); reason = /missing scripts\/p2-proof-fixture/; break;
+          case "assertion required": item.regressions[1].assertion = "ABSENT_ASSERTION"; reason = /找不到 assertion 锚点/; break;
+          case "runner required": f.write("scripts/deploy-v5.sh", "# no proof call\n"); reason = /未调用 scripts\/p2-proof-fixture/; break;
+          case "lineage required": item.rootFixCommit = f.unanchored; reason = /没有动过任何一条登记的证据/; break;
+          case "pending ceiling preserved":
+            item.regressions.pop();
+            item.proofPending = { reason: "isolated valid unit-only record", since: "2026-09-09" };
+            f.manifest.incidents = Array.from({ length: 12 }, (_, i) => ({ ...item, id: `INC-20260909-P2-PENDING-${String(i).padStart(2, "0")}` }));
+            reason = /proofPending 事故 12 条 > 基线 11/; break;
+          default: throw new Error(`unexpected catalog member: ${name}`);
+        }
+        expected = { exit: "nonzero", reason: reason.source };
+        phase = "mutated CLI";
+        actual = runSeverityCli(f);
+        assert.equal(actual.error, null, JSON.stringify(actual));
+        assert.equal(actual.signal, null, JSON.stringify(actual));
+        assert.ok(typeof actual.exit === "number" && actual.exit !== 0, JSON.stringify(actual));
+        assert.match(actual.stderr, reason);
+        assert.doesNotMatch(actual.stdout, /\[incident-regressions\] PASS:/);
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+        throw error;
+      } finally {
+        if (f) rmSync(f.dir, { recursive: true, force: true });
+        console.log(JSON.stringify({ contractId: `incident-severity:${name}`, catalogCount: severityCatalog.length,
+          phase, sourceHash: severityCheckerHash, expected,
+          precondition: before ? { exit: before.exit, signal: before.signal, error: before.error, pass: before.stdout.includes("[incident-regressions] PASS:") } : null,
+          actual: actual ?? before ?? { notRun: true }, failure,
+          cleanup: { directoryRemoved: f ? !existsSync(f.dir) : true },
+          boundary: "real checker CLI/Git/metadata; synthetic proof not executed; no historical marker" }));
+      }
+    });
+  }
 });

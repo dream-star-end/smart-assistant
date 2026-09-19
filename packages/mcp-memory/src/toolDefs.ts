@@ -409,6 +409,28 @@ export const TOOLS = [
       required: ['draft'],
     },
   },
+  {
+    name: 'consult_advisor',
+    description: [
+      '【仅顾问模式】向无工具顾问提出一个疑问或关注点。顾问不能执行工具、写文件或再委派。',
+      '只传 question（必填）和可选 concern。不要传 session/model/turn/权限。',
+      '顾问建议可能有错，必须用你自己的工具验证后再交付。失败时可继续主任务。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: '要咨询的疑问或关注点。',
+        },
+        concern: {
+          type: 'string',
+          description: '可选：补充关注点或风险。',
+        },
+      },
+      required: ['question'],
+    },
+  },
   // ── 任务面板(与网页 /board、oc-task CLI 同一份 /api/board)──
   // identifier 服务端生成,工具参数禁止收 identifier/userId/originSessionKey。
   // originSessionKey 由 handler 从 OPENCLAUDE_SESSION_KEY 注入,卡片才能点回原对话。
@@ -546,6 +568,25 @@ export const TOOLS = [
         expectedVersion: { type: 'number', description: '乐观锁,来自最近一次 get/create' },
       },
       required: ['id', 'expectedVersion'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'present_task_approval',
+    description: [
+      '向当前对话投递一张任务单人工审批卡。调用后立刻返回(不阻塞、不等待、不轮询)。',
+      '用户在对话里点「通过/批准」或「打回」会以用户本人身份改单据;done 仍不属于 AI。',
+      '只用于 backlog(立项批准)或 waiting_human(验收通过)。id 只用面板返回的 identifier 或 uuid。',
+      '返回后必须立刻结束本回合;不要让用户去打开任务面板,不要用选择题卡代替。',
+      '一次一张单;一条回复最多 4 次。子 agent 环境会 skipped。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        prompt: { type: 'string', description: '可选,展示在卡片上的一句话说明' },
+      },
+      required: ['id'],
       additionalProperties: false,
     },
   },

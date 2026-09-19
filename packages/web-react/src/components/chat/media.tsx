@@ -6,7 +6,7 @@
  * 多张卡 / 多次重渲反复签名。深层组件（用户卡媒体格、markdown 行内图）经 useSignedSrc /
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, lazy, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, Download, FileText, Pencil, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, needsSignedSrc, type ResolvedMedia } from "../../lib/chat/media";
@@ -26,8 +26,14 @@ import { reportClientFriction } from "../../lib/clientFriction";
 import { cn } from "../../lib/utils";
 import { authScopedImageIdentity, pickThumbnailWidth } from "../../lib/chat/imageBytes";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
-import { ImageViewer } from "../ImageViewer";
+import { LazyBoundary } from "../ChunkErrorBoundary";
 import { useTimelineEagerMedia } from "./timelineEager";
+
+// 首屏瘦身(2026-09-17 first-screen-budget 471.4KB > 460KB):全屏查看器及其三模式
+// (ImageAnnotationEditor 圈选编辑 / ImageCommentMode / ImageResizeMode,合计 ≈11.5KB gzip)
+// 只在用户点开大图时才需要,改 React.lazy 移出入口静态闭包。本模块(缩略图/签名/下载)仍是
+// 时间线首屏同步渲染的一部分,不动。空闲期由 App.prefetchLazyCentersOnIdle 预取同一 chunk。
+const ImageViewer = lazy(() => import("../ImageViewer").then((m) => ({ default: m.ImageViewer })));
 
 /** 气泡缩略默认按 dpr 选档:标屏 640,retina 1280(与服务端白名单一致)。 */
 function defaultThumbWidth(): 640 | 1280 {
@@ -291,6 +297,9 @@ export function ZoomableImage({
   loading?: React.ImgHTMLAttributes<HTMLImageElement>["loading"];
 }) {
   const [open, setOpen] = useState(false);
+  // 查看器懒块的挂载闸:首次打开前不挂载(不下载 chunk);打开过一次后常驻,保持与原先
+  // 「始终挂载、按 open 显隐」一致的状态保留语义(Radix Dialog 关闭态本就不渲染内容)。
+  const [viewerMounted, setViewerMounted] = useState(false);
   // 「当前可编辑图片」的唯一判定 = ImageEditActionsContext.submitImageEdit 是否注入
   // (image2 开放 + GPT 引擎模型)。收敛到单一权威,不再各自平行判定。
   const canEdit = !readOnly && !!useImageEditActions().submitImageEdit;
@@ -319,12 +328,16 @@ export function ZoomableImage({
   // 再从底部动作条三选 编辑/评论/调整大小。编辑可用性由查看器内动作条据 ImageEditActionsContext
   // 门控(单一权威),此处不再各自判定。
   const openViewer = () => {
+    setViewerMounted(true);
     setOpen(true);
     signFresh();
   };
   const handleOpenChange = (o: boolean) => {
     setOpen(o);
-    if (o) signFresh();
+    if (o) {
+      setViewerMounted(true);
+      signFresh();
+    }
   };
   return (
     <>
@@ -392,20 +405,26 @@ export function ZoomableImage({
       </span>
       {/* 全屏沉浸查看器(替代旧内联灯箱):三模式 编辑/评论/调整大小。签名不在此复制,
           下传 get/peek(点击时签名权威);submit 由 App 经 ImageEditActionsContext 供给。
-          display=开灯箱时现签的最新 URL;initialMode 恒 'view'(胶囊改开 view 模式,§5a)。 */}
-      <ImageViewer
-        open={open}
-        onOpenChange={handleOpenChange}
-        src={display}
-        alt={alt}
-        signPath={signPath ?? null}
-        cacheIdentity={cacheIdentity}
-        get={get}
-        peek={peek}
-        initialMode="view"
-        readOnly={readOnly}
-        referrerPolicy={referrerPolicy}
-      />
+          display=开灯箱时现签的最新 URL;initialMode 恒 'view'(胶囊改开 view 模式,§5a)。
+          查看器是懒块:首次点开才挂载(LazyBoundary = chunk 拉取期空 fallback + 发版后旧标签页
+          拉不到旧 chunk 时的「刷新」兜底),之后常驻。 */}
+      {viewerMounted && (
+        <LazyBoundary fallback={null}>
+          <ImageViewer
+            open={open}
+            onOpenChange={handleOpenChange}
+            src={display}
+            alt={alt}
+            signPath={signPath ?? null}
+            cacheIdentity={cacheIdentity}
+            get={get}
+            peek={peek}
+            initialMode="view"
+            readOnly={readOnly}
+            referrerPolicy={referrerPolicy}
+          />
+        </LazyBoundary>
+      )}
     </>
   );
 }

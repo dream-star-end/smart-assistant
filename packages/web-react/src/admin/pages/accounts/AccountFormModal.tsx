@@ -707,8 +707,8 @@ export function AccountFormModal({
                 <span className="text-body font-medium text-fg">启用 Sand 客户端模式</span>
                 <span className="text-caption text-muted">
                   {isCursorSession
-                    ? "会话凭证只服务 Sand 直连，此项固定开启"
-                    : "Opus 5 / Opus 4.8 / Fable 5 等高级模型携带 Sand 客户端请求头 (x-cursor-client-type: sand)；Grok 4.6 / Composer 2.5 保持原生 CLI 模式"}
+                    ? "会话凭证仅用于 Sand，此项固定开启；后台自动准备，工具仍在本地执行，不回退普通额度"
+                    : "后台自动准备此账号的 Sand 连接；就绪后供 Sand 模型使用，工具仍在本地执行，不回退普通额度"}
                 </span>
               </div>
               <label className="relative inline-flex cursor-pointer items-center">

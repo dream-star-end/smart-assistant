@@ -37,13 +37,21 @@ function locateStylesheet(): string {
 
 const CSS = readFileSync(locateStylesheet(), "utf8");
 
-/** 取某个主题块({ ... })内的 token 表。light = `:root`,dark = `.dark`。 */
+/**
+ * 取某个主题块({ ... })内的 token 表。light = `:root`,dark = `.dark`,landing = `.congjian-landing`。
+ * 颜色值收 `#rrggbb[aa]` 与 `rgba(r, g, b, a)` 两种写法(营销主题的 -soft / border 用 rgba);
+ * 渐变(--aurora / --grad-cta)不是单色,不入表。`--color-*` 是 Tailwind 编译后的双写,跳过,
+ * 只看底层 token。
+ */
 function tokensOf(selector: string): Record<string, string> {
   const start = CSS.indexOf(`${selector} {`);
   if (start === -1) throw new Error(`styles.css 缺少 ${selector} 块`);
   const body = CSS.slice(start, CSS.indexOf("\n}", start));
   const out: Record<string, string> = {};
-  for (const m of body.matchAll(/--([\w-]+):\s*(#[0-9a-fA-F]{6,8});/g)) out[m[1]] = m[2];
+  for (const m of body.matchAll(/--([\w-]+):\s*(#[0-9a-fA-F]{6,8}|rgba?\([^)]*\));/g)) {
+    if (m[1].startsWith("color-")) continue;
+    out[m[1]] = m[2];
+  }
   return out;
 }
 
@@ -54,9 +62,17 @@ function srgbToLinear(channel: number): number {
 
 type Rgb = [number, number, number];
 
-/** `#rrggbb` 或 `#rrggbbaa`;返回 rgb 与 alpha(缺省 1)。 */
-function parseHex(hex: string): { rgb: Rgb; alpha: number } {
-  const h = hex.replace("#", "");
+/** `#rrggbb` / `#rrggbbaa` / `rgba(r, g, b, a)`;返回 rgb 与 alpha(缺省 1)。 */
+function parseHex(color: string): { rgb: Rgb; alpha: number } {
+  if (color === undefined) throw new Error("token 缺失(undefined)—— 见「四套主题 token 键集合一致」用例");
+  const fn = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/.exec(color.trim());
+  if (fn) {
+    return {
+      rgb: [Number(fn[1]), Number(fn[2]), Number(fn[3])],
+      alpha: fn[4] === undefined ? 1 : Number(fn[4]),
+    };
+  }
+  const h = color.replace("#", "");
   const rgb: Rgb = [
     Number.parseInt(h.slice(0, 2), 16),
     Number.parseInt(h.slice(2, 4), 16),
@@ -80,25 +96,53 @@ function composite(fg: Rgb, alpha: number, bg: Rgb): Rgb {
   return fg.map((c, i) => c * alpha + bg[i] * (1 - alpha)) as Rgb;
 }
 
+/**
+ * 仓内共四套完整 token:`:root` / `.dark` / `.congjian-landing`(营销主题)/ `.preview-shell`。
+ * 前三套纳入守卫(shell 审计 S-05:原先只守前两套,营销主题的 --faint 4.38:1 与漏定义的
+ * --danger 都没人拦)。`.preview-shell` 用 `--preview-*` 前缀且 surface 是半透明 rgba,
+ * 需要先定义"合成到哪个底上"才有意义,本批先不纳入,记为遗留。
+ */
 const THEMES = [
   { name: "light", selector: ":root" },
   { name: "dark", selector: ".dark" },
+  { name: "landing", selector: ".congjian-landing" },
 ] as const;
 
 /** 承载文字的语义色。徽章标准组合是 `bg-<t>-soft text-<t>`,两个底都要过。 */
 const TEXT_TONES = ["muted", "faint", "accent", "danger", "success", "warning", "info"] as const;
 /** 有 -soft 徽章底的语义色(faint/muted 只做纯文字,无 soft 变体)。 */
 const BADGE_TONES = ["accent", "danger", "success", "warning", "info"] as const;
+/** 填充用法:`bg-<t> text-<t>-fg`(Button primary / accent / danger)。 */
+const FILL_PAIRS = [
+  ["primary", "primary-fg"],
+  ["accent", "accent-fg"],
+  ["danger", "danger-fg"],
+] as const;
+
+describe("四套主题 token 键集合一致(漏写一个 token 就会回落到别的主题)", () => {
+  const base = Object.keys(tokensOf(":root")).sort();
+  it.each(THEMES.filter((th) => th.selector !== ":root"))("$name 不缺 :root 里的任何颜色 token", ({ selector }) => {
+    const keys = new Set(Object.keys(tokensOf(selector)));
+    const missing = base.filter((k) => !keys.has(k));
+    expect(missing).toEqual([]);
+  });
+});
 
 describe.each(THEMES)("设计 token 对比度契约 · $name", ({ selector }) => {
   const t = tokensOf(selector);
   const surface = parseHex(t.surface).rgb;
   const bg = parseHex(t.bg).rgb;
+  const elevated = parseHex(t.elevated).rgb;
+
+  it.each(FILL_PAIRS)("--%s 作填充底、--%s 作其前景 ≥ 4.5:1(Button 填充变体)", (fill, fg) => {
+    expect(contrast(parseHex(t[fg]).rgb, parseHex(t[fill]).rgb)).toBeGreaterThanOrEqual(4.5);
+  });
 
   it.each(TEXT_TONES)("--%s 作正文前景 ≥ 4.5:1(vs surface 与 bg)", (tone) => {
     const { rgb } = parseHex(t[tone]);
     expect(contrast(rgb, surface)).toBeGreaterThanOrEqual(4.5);
     expect(contrast(rgb, bg)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(rgb, elevated)).toBeGreaterThanOrEqual(4.5);
   });
 
   it.each(BADGE_TONES)("--%s 在自身 -soft 徽章底上 ≥ 4.5:1", (tone) => {

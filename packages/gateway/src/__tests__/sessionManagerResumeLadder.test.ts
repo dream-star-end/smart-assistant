@@ -423,46 +423,51 @@ test('circuit breaker: id CCB refused is excluded from the ladder even though it
   try {
     await withEnv({ CLAUDE_CONFIG_DIR: configDir }, async () => {
       const m = newManager(dir) as BreakerInternals
-      const key = 'agent:main:webchat:dm:webmtqk468nmfkvrb'
-      // State right after the crash: CCB minted DEAD for the failed spawn, OLD
-      // (the refused id) sits on the history ladder.
-      m._resumeMap.set(key, `sand-ccb:${DEAD}`)
-      m._resumeMapProvider.set(key, 'cursor')
-      m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`])
+      try {
+        const key = 'agent:main:webchat:dm:webmtqk468nmfkvrb'
+        // State right after the crash: CCB minted DEAD for the failed spawn, OLD
+        // (the refused id) sits on the history ladder.
+        m._resumeMap.set(key, `sand-ccb:${DEAD}`)
+        m._resumeMapProvider.set(key, 'cursor')
+        m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`])
 
-      // Before the fix: ladder re-promotes sand-ccb:OLD → infinite loop.
-      assert.equal(
-        m._resolveDurableResumeId(key, 'cursor', undefined, undefined, { exclude: `sand-ccb:${DEAD}` }),
-        `sand-ccb:${OLD}`,
-      )
-      // Reset to crash-time state and apply the breaker as finalizeTurn does.
-      m._resumeMap.set(key, `sand-ccb:${DEAD}`)
-      m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`])
-      const marked = m._markResumeRejectedFromError(
-        key,
-        JSON.stringify({ errors: [`No conversation found with session ID: ${OLD}`] }),
-        `sand-ccb:${DEAD}`,
-      )
-      assert.deepEqual(marked, [`sand-ccb:${OLD}`])
-      // history entry is gone immediately…
-      assert.equal(m._resumeMapHistory.has(key), false)
-      // …and even if something pushes it back, the ladder refuses it.
-      m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`, `sand-ccb:${OLDER}`])
-      m._markResumeRejected(key, `sand-ccb:${DEAD}`)
-      assert.equal(
-        m._resolveDurableResumeId(key, 'cursor', undefined, undefined, { exclude: `sand-ccb:${DEAD}` }),
-        undefined,
-        'nothing resumable is left → caller drops to history replay instead of looping',
-      )
-      // _pushResumeHistory ignores rejected ids too (the session_id handler path).
-      m._resumeMapHistory.delete(key)
-      m._pushResumeHistory(key, `sand-ccb:${OLD}`)
-      assert.equal(m._resumeMapHistory.has(key), false)
-      m._pushResumeHistory(key, `sand-ccb:${OLDER}`)
-      assert.deepEqual(m._resumeMapHistory.get(key), [`sand-ccb:${OLDER}`])
-      // A head that is itself rejected is not returned even when its file exists.
-      m._resumeMap.set(key, `sand-ccb:${OLD}`)
-      assert.equal(m._resolveDurableResumeId(key, 'cursor', `sand-ccb:${OLD}`), undefined)
+        // Before the fix: ladder re-promotes sand-ccb:OLD → infinite loop.
+        assert.equal(
+          m._resolveDurableResumeId(key, 'cursor', undefined, undefined, { exclude: `sand-ccb:${DEAD}` }),
+          `sand-ccb:${OLD}`,
+        )
+        // Reset to crash-time state and apply the breaker as finalizeTurn does.
+        m._resumeMap.set(key, `sand-ccb:${DEAD}`)
+        m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`])
+        const marked = m._markResumeRejectedFromError(
+          key,
+          JSON.stringify({ errors: [`No conversation found with session ID: ${OLD}`] }),
+          `sand-ccb:${DEAD}`,
+        )
+        assert.deepEqual(marked, [`sand-ccb:${OLD}`])
+        // history entry is gone immediately…
+        assert.equal(m._resumeMapHistory.has(key), false)
+        // …and even if something pushes it back, the ladder refuses it.
+        m._resumeMapHistory.set(key, [`sand-ccb:${OLD}`, `sand-ccb:${OLDER}`])
+        m._markResumeRejected(key, `sand-ccb:${DEAD}`)
+        assert.equal(
+          m._resolveDurableResumeId(key, 'cursor', undefined, undefined, { exclude: `sand-ccb:${DEAD}` }),
+          undefined,
+          'nothing resumable is left → caller drops to history replay instead of looping',
+        )
+        // _pushResumeHistory ignores rejected ids too (the session_id handler path).
+        m._resumeMapHistory.delete(key)
+        m._pushResumeHistory(key, `sand-ccb:${OLD}`)
+        assert.equal(m._resumeMapHistory.has(key), false)
+        m._pushResumeHistory(key, `sand-ccb:${OLDER}`)
+        assert.deepEqual(m._resumeMapHistory.get(key), [`sand-ccb:${OLDER}`])
+        // A head that is itself rejected is not returned even when its file exists.
+        m._resumeMap.set(key, `sand-ccb:${OLD}`)
+        assert.equal(m._resolveDurableResumeId(key, 'cursor', `sand-ccb:${OLD}`), undefined)
+      } finally {
+        // Drain the real async writer before restoring env/removing its fixture directory.
+        await m.awaitResumeMapFlush()
+      }
     })
   } finally {
     rmSync(dir, { recursive: true, force: true })

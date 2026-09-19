@@ -1184,6 +1184,66 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.equal(attempts, 2)
   })
 
+  test('projectFallback writes visible_fallback friction after committed finalize', async () => {
+    _resetVisibleOrphanScanOffset()
+    const friction: unknown[] = []
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: null,
+        admitted_at: new Date(nowMs - 16 * 60_000),
+        accepted_at: new Date(nowMs - 16 * 60_000),
+        container_running: false,
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+      recordFriction: (event) => { friction.push(event) },
+    })
+    assert.equal(counts.visibleOrphans, 1)
+    assert.ok(pool.writes.includes('COMMIT'))
+    assert.equal(friction.length, 1)
+    assert.deepEqual(friction[0], {
+      correlation: 'd-vis-1',
+      userId: 42n,
+      surface: 'chat',
+      stage: 'visible_fallback',
+      code: 'interrupted',
+      outcome: 'failed',
+      path: 'reconciler',
+      reason: 'interrupt_tapeless',
+      sessionId: 'sess-vis',
+    })
+  })
+
+  test('CAS miss does not write visible_fallback friction', async () => {
+    _resetVisibleOrphanScanOffset()
+    const friction: unknown[] = []
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: new Date(nowMs - 20 * 60_000),
+        container_running: false,
+      })],
+      casToTerminalMiss: true,
+    })
+    await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+      recordFriction: (event) => { friction.push(event) },
+    })
+    assert.equal(friction.length, 0)
+  })
+
   test('CAS miss rolls back so fallback projection does not commit', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({

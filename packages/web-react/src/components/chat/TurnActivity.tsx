@@ -144,6 +144,12 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     }));
   }
 
+  // 读屏播报只跟**阶段文案**走:文案里每秒变化的「(Ns)」段单独包进 aria-hidden 的 span —— 它不在
+  // 无障碍树里,秒数跳动不产生 live region 变更;阶段文案(思考中 → 正在生成内容 → 深度思考中…)
+  // 的文本节点只在阶段真的切换时才变,读屏此时才播报一次,而不是整轮生成期间每秒被朗读
+  // 一遍「主助手 思考中 (12s)」。可见文案逐字不变。
+  const segments = splitElapsedSeconds(text);
+
   return (
     <div
       className={cn("flex items-center gap-2 py-1 text-body", retry ? "text-warning" : "text-muted", cls)}
@@ -151,7 +157,47 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
       aria-live="polite"
     >
       <ActivityDots />
-      <span className="min-w-0 break-words">{text}</span>
+      <span className="min-w-0 break-words">
+        {segments.map((segment, index) =>
+          segment.elapsed ? (
+            // biome-ignore lint/suspicious/noArrayIndexKey: 片段按位置稳定,无身份可取。
+            <span key={index} aria-hidden data-elapsed>
+              {segment.text}
+            </span>
+          ) : (
+            segment.text
+          ),
+        )}
+      </span>
     </div>
   );
+}
+
+/** 文案里每秒变化的经过秒数段,形如 ` (12s)` / ` (40s · 35s 无新数据)`(computeTypingLabel 产出)。 */
+const ELAPSED_RE = /\s*\(\d+s(?:\s*·\s*\d+s 无新数据)?\)/g;
+
+export type ActivityTextSegment = { text: string; elapsed: boolean };
+
+/** 把活动文案切成「阶段文案」与「经过秒数」两类片段;拼回去逐字等于原文。 */
+export function splitElapsedSeconds(text: string): ActivityTextSegment[] {
+  const out: ActivityTextSegment[] = [];
+  let last = 0;
+  ELAPSED_RE.lastIndex = 0;
+  for (let m = ELAPSED_RE.exec(text); m !== null; m = ELAPSED_RE.exec(text)) {
+    if (m.index > last) out.push({ text: text.slice(last, m.index), elapsed: false });
+    out.push({ text: m[0], elapsed: true });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push({ text: text.slice(last), elapsed: false });
+  return out;
+}
+
+/** 剥掉文案里的经过秒数,得到读屏实际播报的稳定阶段文案(供单测 / 调用方对照)。 */
+export function stripElapsedSeconds(text: string): string {
+  return splitElapsedSeconds(text)
+    .filter((segment) => !segment.elapsed)
+    .map((segment) => segment.text)
+    .join("")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }

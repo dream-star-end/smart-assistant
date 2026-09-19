@@ -23,7 +23,7 @@ import type {
   UsageResponse,
   UsageSessionRow,
 } from "../../lib/types";
-import { UsageTab, topModelsWithOther } from "./UsageTab";
+import { UsageTab, appendSessionRows, topModelsWithOther } from "./UsageTab";
 
 const projectScopeState = vi.hoisted(() => ({
   kind: "all" as "all" | "work" | "ungrouped" | "chat",
@@ -236,7 +236,8 @@ describe("UsageTab 图表化窗口口径", () => {
     expect(await screen.findByText("42")).toBeInTheDocument();
     expect(screen.getAllByText("12.3万").length).toBeGreaterThan(0);
     expect(screen.getAllByText("7,890").length).toBeGreaterThan(0);
-    expect(screen.getByText("888 积分")).toBeInTheDocument();
+    // StatTile 把数字与单位拆成两个 span(数字绝不从中间断行),按数字本体断言。
+    expect(screen.getAllByText("888").length).toBeGreaterThan(0);
     const trendTable = screen.getByRole("table", { name: "积分消耗趋势，近 7 天" });
     expect(within(trendTable).getByRole("cell", { name: "688 积分" })).toBeInTheDocument();
   });
@@ -440,5 +441,92 @@ describe("UsageTab 会话标题与口径说明", () => {
         "按会话当时所属项目统计，后续移动会话不改写历史；组队成员的消耗计入发起会话。",
       ),
     ).toBeInTheDocument();
+  });
+
+  test("未绑定聊天项目:回落到全部项目照常出数据,并给人话说明可去项目设置", async () => {
+    // 审计 SET-04:之前这一态不请求、整页只剩提示,文案却说"按全部项目统计"。
+    projectScopeState.kind = "chat";
+    const onOpenProjectSettings = vi.fn();
+    render(<UsageTab auth={auth} onOpenProjectSettings={onOpenProjectSettings} />);
+    expect(
+      await screen.findByText("当前聊天项目还没绑定任务看板，以下按全部项目统计。"),
+    ).toBeInTheDocument();
+    // 请求按「全部项目」发出(不带 boardProjectId),数据照常渲染。
+    expect(mockedGetUsage).toHaveBeenCalledWith(auth, { sessionsLimit: 20 });
+    expect(mockedGetReport).toHaveBeenCalledWith(auth, "7d");
+    expect(await screen.findByText("累计请求")).toBeInTheDocument();
+    expect(screen.getByText("uuid-chat-1")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "去项目设置" }));
+    expect(onOpenProjectSettings).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("UsageTab 空态", () => {
+  test("窗口内全 0:四张图都走文字空态,不挂 canvas 画假坐标轴", async () => {
+    // 审计 SET-03:此前趋势 / 请求两张图对全 0 数据仍挂 canvas,chart.js 画出 0–1.0 小数刻度。
+    const zero = makeReport("7d");
+    zero.summary = {
+      requests: "0",
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      credits: "0",
+    };
+    zero.trend = zero.trend.map((p) => ({ ...p, requests: "0", credits: "0" }));
+    zero.models = [];
+    mockedGetReport.mockResolvedValue(zero);
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("累计请求")).toBeInTheDocument();
+    expect(screen.getAllByText("该时段暂无积分消耗数据。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("该时段暂无请求数据。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("该时段暂无模型用量。").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("该时段暂无用量数据。").length).toBeGreaterThan(0);
+    expect(document.querySelectorAll("canvas")).toHaveLength(0);
+    expect(chartConstructed).not.toHaveBeenCalled();
+  });
+});
+
+// 二期(t-628):会话明细是 offset 分页,翻页期间新会话插到前面会让下一页重发上一页末尾的行。
+describe("appendSessionRows(会话明细翻页去重)", () => {
+  test("同 session_id 的行只保留首次出现的那份,其余原样追加", () => {
+    const a = chatRow({ session_id: "s-a", billed_credits: "1" });
+    const b = chatRow({ session_id: "s-b", billed_credits: "2" });
+    const bDup = chatRow({ session_id: "s-b", billed_credits: "999" });
+    const c = chatRow({ session_id: "s-c", billed_credits: "3" });
+    const merged = appendSessionRows([a, b], [bDup, c]);
+    expect(merged.map((r) => r.session_id)).toEqual(["s-a", "s-b", "s-c"]);
+    expect(merged[1].billed_credits).toBe("2");
+  });
+
+  test("同一页内部重复也只留一份;空输入返回空数组", () => {
+    const a = chatRow({ session_id: "s-a" });
+    expect(appendSessionRows([], [a, chatRow({ session_id: "s-a" })])).toHaveLength(1);
+    expect(appendSessionRows([], [])).toEqual([]);
+  });
+});
+
+describe("UsageTab 会话明细翻页", () => {
+  test("下一页重发上一页末尾的会话时只渲染一行,offset 仍按服务端行数推进", async () => {
+    const first = makeResponse([chatRow({ session_id: "uuid-chat-1" }), chatRow({ session_id: "uuid-chat-2" })]);
+    first.sessions.has_more = true;
+    // 第二页把 uuid-chat-2 又送了一遍(它在服务端被新会话顶后了一位)。
+    const second = makeResponse([chatRow({ session_id: "uuid-chat-2" }), chatRow({ session_id: "uuid-chat-3" })]);
+    second.sessions.offset = 2;
+    mockedGetUsage.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("uuid-chat-2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
+    expect(await screen.findByText("uuid-chat-3")).toBeInTheDocument();
+
+    expect(screen.getAllByText("uuid-chat-2")).toHaveLength(1);
+    expect(screen.getAllByText(/^uuid-chat-\d$/)).toHaveLength(3);
+    expect(mockedGetUsage).toHaveBeenLastCalledWith(
+      auth,
+      expect.objectContaining({ sessionsOffset: 2 }),
+    );
+    // has_more=false → 「加载更多」收起
+    expect(screen.queryByRole("button", { name: "加载更多" })).toBeNull();
   });
 });

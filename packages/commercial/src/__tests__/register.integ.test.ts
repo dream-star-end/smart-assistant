@@ -7,6 +7,7 @@ import { register, RegisterError, isEmailDomainBlocked } from "../auth/register.
 import { verifyPassword } from "../auth/passwords.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
+import { prepareAuthRowResetForTest } from "./helpers/authRows.js";
 
 /**
  * T-12 集成测试:注册流程端到端打通真 Postgres。
@@ -29,6 +30,7 @@ const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
+let resetAuthRows: (() => Promise<void>) | undefined;
 
 async function cleanCommercialSchema(): Promise<void> {
   await resetTestSchemaForTest();
@@ -79,6 +81,7 @@ before(async () => {
   setPoolOverride(pool);
   await cleanCommercialSchema();
   await runMigrations();
+  resetAuthRows = await prepareAuthRowResetForTest();
 });
 
 after(async () => {
@@ -90,10 +93,8 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  // 只清 user 相关表,保留种子(model_pricing/topup_plans),避免每次重跑迁移
-  await query(
-    "TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE",
-  );
+  assert.ok(resetAuthRows, "real auth fixture setup must finish before each case");
+  await resetAuthRows();
 });
 
 function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {

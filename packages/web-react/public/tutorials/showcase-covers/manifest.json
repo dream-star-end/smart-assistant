@@ -1,0 +1,29 @@
+{
+  "capturedAt": "2026-09-07T04:31:52.538Z",
+  "covers": [
+    {
+      "caseId": "research-bike-demand",
+      "sourcePath": "/tutorials/cases/research-bike-demand/showcase/dashboard.html",
+      "sourceSha256": "9b52d0d411a430dc57970fec6048843fa138c7fdb546fdccb29525777990b499",
+      "path": "/tutorials/showcase-covers/research-bike-demand.png",
+      "sha256": "5829d6f0d29a5c8ea56594a3dfa7e12107f9da276a3e6e5e9ef392d98fbd65b6",
+      "selector": "section.panel:first-of-type",
+      "viewport": {
+        "width": 1024,
+        "height": 740
+      }
+    },
+    {
+      "caseId": "general-public-data-brief",
+      "sourcePath": "/tutorials/cases/general-public-data-brief/showcase/dashboard.html",
+      "sourceSha256": "a3c2808a4a47c245e073d3f1dad2720f305b6f39dc0a567da8252a029c77764e",
+      "path": "/tutorials/showcase-covers/general-public-data-brief.png",
+      "sha256": "c6cad11dd1100b71f1a5ca4f3175b68e2db4b13444e12bb1300f7a513dd814d9",
+      "selector": "section.panel:first-of-type",
+      "viewport": {
+        "width": 1024,
+        "height": 740
+      }
+    }
+  ]
+}

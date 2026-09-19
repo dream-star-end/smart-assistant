@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
 import MarkdownImpl from './MarkdownImpl'
 
@@ -41,7 +41,7 @@ describe('MarkdownImpl readOnly', () => {
     expect(container.textContent).toContain('[本地图片]')
   })
 
-  test('只读链接图片只开灯箱，并保留 lazy loading 与全链路 no-referrer', () => {
+  test('只读链接图片只开灯箱，并保留 lazy loading 与全链路 no-referrer', async () => {
     const { container } = render(
       <MarkdownImpl signMedia readOnly>
         {'[**![外链](//cdn.test/image.png)**](https://report.test)'}
@@ -63,8 +63,9 @@ describe('MarkdownImpl readOnly', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: '放大查看 外链' }))
 
+    // 查看器是懒块(首屏预算):首开要等模块解析后大图才挂上。
+    await waitFor(() => expect(screen.getAllByAltText('外链').length).toBeGreaterThanOrEqual(2))
     const images = screen.getAllByAltText('外链')
-    expect(images.length).toBeGreaterThanOrEqual(2)
     for (const image of images) expect(image).toHaveAttribute('referrerpolicy', 'no-referrer')
     expect(screen.getByRole('button', { name: '下载' })).toBeInTheDocument()
     for (const action of ['编辑', '评论', '调整大小', '分享', '更多']) {
@@ -73,31 +74,137 @@ describe('MarkdownImpl readOnly', () => {
   })
 })
 
-test('GFM 长表格使用可聚焦滚动区，且同段代码块与公式保持真实渲染', () => {
-  const source = [
-    '| 第一列 | 第二列 | 第三列 | 第四列 | 第五列 | 第六列 |',
-    '| --- | --- | --- | --- | --- | --- |',
-    '| 很长的表格内容一 | 很长的表格内容二 | 很长的表格内容三 | 很长的表格内容四 | 很长的表格内容五 | 很长的表格内容六 |',
-    '',
-    '```ts',
-    'const answer = 42',
-    '```',
-    '',
-    '$$',
-    '\\frac{1}{2} + \\sqrt{4} = 2.5',
-    '$$',
-  ].join('\n')
-  const { container } = render(<MarkdownImpl>{source}</MarkdownImpl>)
+/** jsdom 无布局:按需伪造滚动区的 scrollWidth / clientWidth 来模拟「表格是否溢出容器」。 */
+function mockRegionGeometry(scrollWidth: number, clientWidth: number) {
+  const proto = HTMLElement.prototype
+  const original = {
+    scrollWidth: Object.getOwnPropertyDescriptor(proto, 'scrollWidth'),
+    clientWidth: Object.getOwnPropertyDescriptor(proto, 'clientWidth'),
+  }
+  Object.defineProperty(proto, 'scrollWidth', { configurable: true, get: () => scrollWidth })
+  Object.defineProperty(proto, 'clientWidth', { configurable: true, get: () => clientWidth })
+  return () => {
+    for (const key of ['scrollWidth', 'clientWidth'] as const) {
+      const descriptor = original[key]
+      if (descriptor) Object.defineProperty(proto, key, descriptor)
+      else delete (proto as unknown as Record<string, unknown>)[key]
+    }
+  }
+}
 
-  const region = screen.getByRole('region', { name: 'Markdown 表格，可横向滚动' })
-  expect(region).toHaveAttribute('tabindex', '0')
-  expect(within(region).getByRole('table')).toHaveTextContent('很长的表格内容六')
-  expect(screen.getByText('表格可左右滑动查看更多')).toHaveClass('sm:hidden')
-  fireEvent.scroll(region)
-  expect(screen.queryByText('表格可左右滑动查看更多')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '复制' })).toBeInTheDocument()
-  expect(container.querySelector('pre code')).toHaveTextContent('const answer = 42')
-  expect(container.querySelector('.katex-display .katex')).not.toBeNull()
+const TABLE_SOURCE = [
+  '| 第一列 | 第二列 | 第三列 | 第四列 | 第五列 | 第六列 |',
+  '| --- | --- | --- | --- | --- | --- |',
+  '| 很长的表格内容一 | 很长的表格内容二 | 很长的表格内容三 | 很长的表格内容四 | 很长的表格内容五 | 很长的表格内容六 |',
+  '',
+  '```ts',
+  'const answer = 42',
+  '```',
+  '',
+  '$$',
+  '\\frac{1}{2} + \\sqrt{4} = 2.5',
+  '$$',
+].join('\n')
+
+test('GFM 长表格使用可聚焦滚动区，且同段代码块与公式保持真实渲染', () => {
+  // 表格真的溢出容器(scrollWidth > clientWidth)→ 才出「可左右滑动」提示,滑过一次即消失。
+  const restore = mockRegionGeometry(900, 360)
+  try {
+    const { container } = render(<MarkdownImpl>{TABLE_SOURCE}</MarkdownImpl>)
+
+    const region = screen.getByRole('region', { name: 'Markdown 表格，可横向滚动' })
+    expect(region).toHaveAttribute('tabindex', '0')
+    expect(region).toHaveAttribute('data-overflowing', 'true')
+    expect(within(region).getByRole('table')).toHaveTextContent('很长的表格内容六')
+    expect(screen.getByText('表格可左右滑动查看更多')).toHaveClass('sm:hidden')
+    fireEvent.scroll(region)
+    expect(screen.queryByText('表格可左右滑动查看更多')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '复制' })).toBeInTheDocument()
+    expect(container.querySelector('pre code')).toHaveTextContent('const answer = 42')
+    expect(container.querySelector('.katex-display .katex')).not.toBeNull()
+  } finally {
+    restore()
+  }
+})
+
+// M-02:此前提示在表格并未溢出时也常显(文案与实际不符);单元格在 .prose{word-break:break-word} 下
+// 会把 `MessageRenderer.tsx` / 「风险」在任意位置拆行,把宽表硬压进 390px 容器。
+describe('MarkdownImpl 表格(M-02)', () => {
+  test('表格放得下(未溢出)时不出「可左右滑动」提示', () => {
+    const restore = mockRegionGeometry(360, 360)
+    try {
+      render(<MarkdownImpl>{TABLE_SOURCE}</MarkdownImpl>)
+      const region = screen.getByRole('region', { name: 'Markdown 表格，可横向滚动' })
+      expect(region).toHaveAttribute('data-overflowing', 'false')
+      expect(screen.queryByText('表格可左右滑动查看更多')).not.toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
+  test('单元格不拆词:th/td 用 keep-all,表头不折行,宽表按 min-content 撑进横滑区', () => {
+    render(<MarkdownImpl>{TABLE_SOURCE}</MarkdownImpl>)
+    const table = screen.getByRole('table')
+    expect(table).toHaveClass('[&_td]:[word-break:keep-all]')
+    expect(table).toHaveClass('[&_td]:[overflow-wrap:normal]')
+    expect(table).toHaveClass('[&_th]:[word-break:keep-all]')
+    expect(table).toHaveClass('[&_th]:whitespace-nowrap')
+  })
+})
+
+// M-06:流式光标此前是 Markdown 块级容器之后的兄弟节点,永远落在正文最后一行**下方**单独一行。
+// 现在由 rehype 注入到最后一个文本块末尾;末块是代码块等非文本块时回退到块后单独一行。
+describe('MarkdownImpl 流式光标(caret)', () => {
+  const caret = (container: HTMLElement) => container.querySelectorAll('[data-live-caret]')
+
+  test('caret=false 不注入任何光标', () => {
+    const { container } = render(<MarkdownImpl>{'第一段\n\n第二段'}</MarkdownImpl>)
+    expect(caret(container)).toHaveLength(0)
+  })
+
+  test('末块是段落:光标内联在最后一个 <p> 末尾,与文字同一行', () => {
+    const { container } = render(<MarkdownImpl caret>{'第一段\n\n第二段 **强调**'}</MarkdownImpl>)
+    const nodes = caret(container)
+    expect(nodes).toHaveLength(1)
+    const node = nodes[0]
+    expect(node.tagName.toLowerCase()).toBe('span')
+    expect(node).toHaveClass('caret-blink', 'inline-block', 'bg-current')
+    expect(node).toHaveAttribute('aria-hidden', 'true')
+    const paragraphs = container.querySelectorAll('.prose > p')
+    expect(paragraphs).toHaveLength(2)
+    expect(node.parentElement).toBe(paragraphs[1])
+    expect(paragraphs[1].lastElementChild).toBe(node)
+    expect(container.querySelector('[data-live-caret-fallback]')).toBeNull()
+  })
+
+  test('末块是列表 / 引用 / 表格:光标下钻到最后一个文本块(末项 li / 引用段 / 末格)', () => {
+    const list = render(<MarkdownImpl caret>{'说明\n\n- 甲\n- 乙'}</MarkdownImpl>)
+    const listItems = list.container.querySelectorAll('li')
+    expect(caret(list.container)[0].parentElement).toBe(listItems[listItems.length - 1])
+    cleanup()
+
+    const quote = render(<MarkdownImpl caret>{'> 引用第一段\n>\n> 引用第二段'}</MarkdownImpl>)
+    const quoteParagraphs = quote.container.querySelectorAll('blockquote > p')
+    expect(caret(quote.container)[0].parentElement).toBe(quoteParagraphs[quoteParagraphs.length - 1])
+    cleanup()
+
+    const table = render(
+      <MarkdownImpl caret>{'| a | b |\n| --- | --- |\n| 1 | 2 |'}</MarkdownImpl>,
+    )
+    const cells = table.container.querySelectorAll('td')
+    expect(caret(table.container)[0].parentElement).toBe(cells[cells.length - 1])
+  })
+
+  test('末块是代码块:回退到块后单独一行,不塞进 <pre>', () => {
+    const { container } = render(<MarkdownImpl caret>{'先说明\n\n```ts\nconst a = 1\n```'}</MarkdownImpl>)
+    const nodes = caret(container)
+    expect(nodes).toHaveLength(1)
+    expect(nodes[0].closest('pre')).toBeNull()
+    const fallback = container.querySelector('[data-live-caret-fallback]')
+    expect(fallback).not.toBeNull()
+    expect(fallback?.parentElement).toHaveClass('prose')
+    expect(fallback?.previousElementSibling?.tagName.toLowerCase()).toBe('div') // CodeBlock 外壳
+  })
 })
 
 // ── 代码高亮 ────────────────────────────────────────────────────────

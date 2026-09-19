@@ -90,7 +90,9 @@ describe('queued ImageEdit production Gateway path', () => {
     const guidePath = join(paths.uploadsDir, guideName)
     const previousMaster = process.env.OPENCLAUDE_V3_MASTER_BASE_URL
     const previousToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    const previousUserId = process.env.OC_USER_ID
     const previousAuthority = process.env.OC_MODEL_AUTHORITY
+    let identityReads = 0
     const relayBodies: Array<Record<string, unknown>> = []
     const tapeEnvelopes: Array<Record<string, unknown>> = []
     const delivered: Array<Record<string, unknown>> = []
@@ -106,6 +108,14 @@ describe('queued ImageEdit production Gateway path', () => {
     let executionFence: PromptQueueExecutionFence | undefined
     const master = createServer(async (req, res) => {
       try {
+        if (req.url === '/internal/v3/marketplace/sync') {
+          assert.equal(req.method, 'GET')
+          assert.equal(req.headers.authorization, 'Bearer queue-image-test-token')
+          identityReads++
+          res.setHeader('content-type', 'application/json')
+          res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '11', profiles: [] } }))
+          return
+        }
         if (req.url === `${V3_CODEX_RELAY_PREFIX}/backend-api/codex/images/annotated-edits`) {
           assert.equal(req.headers.authorization, 'Bearer queue-image-test-token')
           assert.equal(req.headers['x-openclaude-image-job'], JOB_ID)
@@ -143,6 +153,7 @@ describe('queued ImageEdit production Gateway path', () => {
       const baseUrl = `http://127.0.0.1:${address.port}`
       process.env.OPENCLAUDE_V3_MASTER_BASE_URL = baseUrl
       process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'queue-image-test-token'
+      process.env.OC_USER_ID = '11'
       process.env.OC_MODEL_AUTHORITY = '0'
 
       const retryQueue = makeV3MasterRetryQueue({
@@ -227,6 +238,7 @@ describe('queued ImageEdit production Gateway path', () => {
       }).dispatchInbound(frame)
 
       assert.equal(relayBodies.length, 1)
+      assert.ok(identityReads > 0, 'real Gateway admission must read authenticated identity authority')
       assert.equal(relayBodies[0]?.jobId, JOB_ID)
       assert.equal(reservations.length, 1)
       assert.equal(reservations[0]?.traceId, TRACE_ID)
@@ -257,6 +269,8 @@ describe('queued ImageEdit production Gateway path', () => {
       else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = previousMaster
       if (previousToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
       else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = previousToken
+      if (previousUserId === undefined) delete process.env.OC_USER_ID
+      else process.env.OC_USER_ID = previousUserId
       if (previousAuthority === undefined) delete process.env.OC_MODEL_AUTHORITY
       else process.env.OC_MODEL_AUTHORITY = previousAuthority
       await Promise.all([

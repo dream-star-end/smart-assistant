@@ -33,7 +33,8 @@ export const DropdownMenuItem = forwardRef<
   <RD.Item
     ref={ref}
     className={cn(
-      "flex cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-sm outline-none transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-hover",
+      // 触屏命中高 44px(a11y 走查 shell#9:菜单项 py-2 只有 36px);桌面端(hover 可用)零变化,与 IconButton / Chip 同一约定。
+      "flex cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-sm outline-none transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-hover [@media(hover:none)]:min-h-11",
       destructive && "text-danger data-[highlighted]:bg-danger-soft",
       className,
     )}
@@ -59,7 +60,7 @@ export const DropdownMenuSubTrigger = forwardRef<
   <RD.SubTrigger
     ref={ref}
     className={cn(
-      "flex cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-sm outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-hover data-[state=open]:bg-hover",
+      "flex cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-sm outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-hover data-[state=open]:bg-hover [@media(hover:none)]:min-h-11",
       className,
     )}
     {...props}

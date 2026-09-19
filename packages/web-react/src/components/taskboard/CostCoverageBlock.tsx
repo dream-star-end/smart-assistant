@@ -8,7 +8,8 @@ export function CostCoverageBlock({
   testId?: string
 }) {
   const money = formatCostMoneyLine(totals)
-  const warn = totals.coverage === 'partial' || totals.coverage === 'unpriced_only'
+  const warn = totals.coverage === 'partial' || totals.coverage === 'unpriced_only' ||
+    !totals.amounts || totals.amounts.estimated.runCount > 0 || totals.amounts.unverified.runCount > 0
   return (
     <div data-testid={testId} data-coverage={totals.coverage} className="flex flex-col gap-1">
       <p data-testid={`${testId}-tokens`} className="text-title font-semibold tabular-nums text-fg">

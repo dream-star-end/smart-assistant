@@ -64,6 +64,15 @@ class FakeCcbRunner extends EventEmitter {
   startCalls = 0;
   startDelayMs = 0;
   readonly submittedInputs: unknown[] = [];
+  consultTurnBinding:
+    | { turnKey: string; turnIndex: number; configVersion: string }
+    | undefined;
+
+  setConsultTurn(
+    binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
+  ): void {
+    this.consultTurnBinding = binding;
+  }
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
     super();
@@ -621,7 +630,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("capacity failure succeeds within the shared 10-retry budget and persists one exact paid turn", async () => {
+  test("capacity failure succeeds within the shared 3-failure circuit and persists one exact paid turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -640,11 +649,11 @@ describe("crash/interrupt partial persistence", () => {
             requestId,
             turnKey: session._currentTurnKey!,
             engineSessionId: `oceng-${String(attempt).repeat(48)}`,
-            status: attempt <= 3 ? "error" : "success",
+            status: attempt <= 2 ? "error" : "success",
             durationMs: attempt,
-            usage: { input_tokens: attempt, output_tokens: attempt <= 3 ? 0 : 4 },
+            usage: { input_tokens: attempt, output_tokens: attempt <= 2 ? 0 : 4 },
           });
-          if (attempt <= 3) {
+          if (attempt <= 2) {
             r.thinking(`attempt ${attempt} thinking`);
             r.text(`attempt ${attempt} process`);
             r.toolPair(`retry-tool-${attempt}`, "Read", `attempt ${attempt} output`);
@@ -680,10 +689,9 @@ describe("crash/interrupt partial persistence", () => {
         requestId,
       );
 
-      assert.equal(submits, 4, "initial attempt + three automatic retries before success");
+      assert.equal(submits, 3, "initial attempt + two automatic retries before success");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
-        TRANSIENT_RETRY_INPUT,
         TRANSIENT_RETRY_INPUT,
         TRANSIENT_RETRY_INPUT,
       ]);
@@ -692,15 +700,14 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(payload.status, "completed");
       assert.ok(payload.text.includes("attempt 1 process"));
       assert.ok(payload.text.includes("attempt 2 process"));
-      assert.ok(payload.text.includes("attempt 3 process"));
-      assert.ok(payload.text.endsWith("retry succeeded"));
+            assert.ok(payload.text.endsWith("retry succeeded"));
       assert.deepEqual(
         payload.thinkingSegments?.map((segment) => segment.text),
-        ["attempt 1 thinking", "attempt 2 thinking", "attempt 3 thinking"],
+        ["attempt 1 thinking", "attempt 2 thinking"],
       );
       assert.deepEqual(
         payload.tools?.map((tool) => tool.output),
-        ["attempt 1 output", "attempt 2 output", "attempt 3 output"],
+        ["attempt 1 output", "attempt 2 output"],
       );
       assert.ok(payload.tools?.every((tool) =>
         (tool as typeof tool & { _toolEffect?: { authority?: string; safety?: string } })
@@ -710,21 +717,21 @@ describe("crash/interrupt partial persistence", () => {
       ));
       assert.deepEqual(
         payload.structuredBlocks?.map((block) => block.text),
-        ["attempt 1 plan", "attempt 2 plan", "attempt 3 plan"],
+        ["attempt 1 plan", "attempt 2 plan"],
       );
       assert.equal(
         payload.runtimeEvents?.filter((event) =>
           (event.payload as { type?: unknown }).type === "retry_status"
         ).length,
-        3,
+        2,
       );
       assert.deepEqual(payload.engineBilling, {
         requestId,
         turnKey: payload.turnKey,
-        engineSessionId: `oceng-${"4".repeat(48)}`,
+        engineSessionId: `oceng-${"3".repeat(48)}`,
         status: "success",
-        durationMs: 4,
-        usage: { input_tokens: 4, output_tokens: 4 },
+        durationMs: 3,
+        usage: { input_tokens: 3, output_tokens: 4 },
       });
       assert.equal(
         events.filter((event) => event.kind === "codex_billing").length,
@@ -778,24 +785,23 @@ describe("crash/interrupt partial persistence", () => {
         _durableDelegateEngineBillings: [],
       } as Partial<AgentSession>);
 
-      await sm.submit(
-        session,
-        "finish the task",
-        (event) => events.push(event),
-        undefined,
-        undefined,
-        requestId,
+      await assert.rejects(
+        () => sm.submit(
+          session,
+          "finish the task",
+          (event) => events.push(event),
+          undefined,
+          undefined,
+          requestId,
+        ),
+        (err: unknown) => {
+          assert.match(String(err), /TRANSIENT_CIRCUIT_OPEN/);
+          return true;
+        },
       );
 
-      assert.equal(submits, 11);
-      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill(TRANSIENT_RETRY_INPUT)]);
-      assert.equal(captured.payloads.length, 1);
-      const payload = captured.payloads[0]!;
-      assert.equal(payload.errorCode, "model_capacity");
-      assert.equal(payload.engineBilling?.engineSessionId, `oceng-${"11".repeat(48)}`);
-      assert.equal(events.filter((event) => event.kind === "codex_billing").length, 1);
-      assert.equal(events.filter((event) => event.kind === "error").length, 1);
-      assert.deepEqual(session._durableDelegateEngineBillings, [payload.engineBilling]);
+      assert.equal(submits, 3);
+      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(2).fill(TRANSIENT_RETRY_INPUT)]);
     } finally {
       setV3MasterSinkSingleton(null);
     }

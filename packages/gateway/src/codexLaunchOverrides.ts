@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * codexLaunchOverrides — assemble per-spawn `-c` overrides for codex CLI.
  *
@@ -45,7 +46,9 @@ import { isPatrolSessionKey } from './taskboard/domain.js'
 /** 阶段 agent / 巡检会话不挂平台 MCP skills(TEST-10 / OCV5-46)。上下文走 prompt。 */
 export function shouldOmitPlatformMcp(agentId?: string, sessionKey?: string): boolean {
   if (agentId?.startsWith('stage-')) return true
+  if (agentId === 'advisor') return true
   if (sessionKey && isPatrolSessionKey(sessionKey)) return true
+  if (sessionKey?.startsWith('advisor:')) return true
   return false
 }
 
@@ -251,6 +254,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
+  identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
   /** Current gateway AgentSession key. Forwarded only to mcp-memory so
@@ -383,6 +387,7 @@ export async function buildCodexLaunchOverrides(
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
     persona: ctx.persona,
+    identityCompat: ctx.identityCompat?.assets,
     provider: ctx.provider,
     model: ctx.model,
     effortLevel: ctx.effortLevel,
@@ -488,6 +493,8 @@ export async function buildCodexLaunchOverrides(
     })}\n`
     const mcpEnv: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: ctx.agentId,
+      OC_AGENT_ID: ctx.agentId,
+      ...identityCompatEnvironment(ctx.identityCompat),
       ...(ctx.projectId ? { OPENCLAUDE_PROJECT_ID: ctx.projectId } : {}),
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),

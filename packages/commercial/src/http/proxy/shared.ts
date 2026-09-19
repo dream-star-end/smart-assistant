@@ -1607,7 +1607,9 @@ export interface AnthropicProxyDeps {
    * External API-key proxy only: serve `cursor-*` models on the master via
    * `CursorSandRelay` + `settleCursorExternalUsage` (see proxy/cursorExternal.ts).
    * Handler branches to it right after body parsing when
-   * `isCursorEngineModel(body.model)`. Not injected → cursor models fall through
+   * `resolveCursorPublicModel(body.model, output_config.effort)` names a cursor
+   * variant — public family id (`fable-5.1`) + client effort, effort-suffixed
+   * public id, or legacy internal id. Not injected → cursor models fall through
    * to the legacy oauth/static routing (and are rejected there), zero change.
    */
   cursorExternal?: import("./cursorExternal.js").CursorExternalRoute;

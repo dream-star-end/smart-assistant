@@ -7,9 +7,9 @@
 #
 # Multi-key pool: the host may provision interchangeable Cursor API keys as
 # additional `api-key.<N>` files (N >= 2, canonical decimal, no leading zeros)
-# inside the same root-only auth directory. `api-key` stays mandatory — the
-# supervisor's mount validation gates on it, so an absent primary means the
-# credential mount itself never happened. Non-canonical extra names are
+# inside the same root-only auth directory. `api-key` stays mandatory for
+# selection. A managed directory may already be mounted while preparation leaves
+# the pool empty; absence of the primary still rejects execution. Non-canonical extra names are
 # ignored. The primary `api-key` is the preferred key: every turn uses it
 # while it works, extras are failover only (see the slot-selection comment
 # below). The slot used for a turn is announced on stderr as an index only;
@@ -483,6 +483,11 @@ case "$model" in
   claude-sonnet-5-thinking-low|claude-sonnet-5-thinking-medium|claude-sonnet-5-thinking-high|\
   claude-sonnet-5-thinking-xhigh|claude-sonnet-5-thinking-max|\
   gemini-3.8-flash-low|gemini-3.8-flash-medium|gemini-3.8-flash-high|\
+  gemini-3.1-pro|\
+  gpt-5.6-luna-low|gpt-5.6-luna-low-fast|gpt-5.6-luna-medium|gpt-5.6-luna-medium-fast|\
+  gpt-5.6-luna-high|gpt-5.6-luna-high-fast|gpt-5.6-luna-xhigh|gpt-5.6-luna-xhigh-fast|\
+  gpt-5.6-luna-max|gpt-5.6-luna-max-fast|\
+  claude-haiku-4-5|\
   cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac

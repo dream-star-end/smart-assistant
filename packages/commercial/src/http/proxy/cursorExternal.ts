@@ -31,21 +31,44 @@
  * after each use, so `readApiKey` must return a fresh copy every call.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
 import {
   CursorSandRelay,
+  isNonRetryableUpstreamReason,
+  stripNonRetryableMarker,
   type CursorSandServeResult,
   type RelayCredentialKind,
+  type ServeMessagesOptions,
+  type TerminalEvidence,
 } from "@openclaude/gateway";
 import type { Logger } from "../../logging/logger.js";
 import type { ProxyIdentity } from "../../auth/proxyIdentity.js";
 import { AuthzDeniedError, AuthzLoadError } from "../../auth/proxyIdentity.js";
 import type { ModelPricing, PricingCache } from "../../billing/pricing.js";
 import { readTotalSpendableBalance } from "../../billing/preCheck.js";
-import { settleCursorExternalUsage } from "../../billing/cursorExternalSettle.js";
+import {
+  captureCursorPricingBasis,
+  freezePreparedCursorSettlePlan,
+  mapCursorReportedUsage,
+  planCursorExternalSettle,
+  settleCursorExternalUsage,
+} from "../../billing/cursorExternalSettle.js";
 import type { SettleResult } from "../../billing/proxyBilling.js";
+import {
+  describeRequestShape,
+  extractLastUserMessage,
+  recordApiKeyMessageAudit,
+  usageCounts,
+  type ApiKeyMessageAuditRow,
+} from "../../billing/apiKeyMessageAudit.js";
+import {
+  consumeReadyRecord,
+  newCursorExternalBillingId,
+  type CursorExternalApiOutbox,
+  type CursorExternalReadyRecord,
+} from "../../billing/cursorExternalApiOutbox.js";
 import {
   getCursorTokenSnapshot,
   listAccounts,
@@ -70,6 +93,7 @@ export interface CursorSandRelayLike {
     body: Record<string, unknown>,
     res: ServerResponse,
     signal: AbortSignal,
+    options?: ServeMessagesOptions,
   ): Promise<CursorSandServeResult>;
   close(): Promise<void>;
 }
@@ -94,11 +118,20 @@ export interface CursorExternalDeps {
   loadSnapshot?: (id: bigint) => Promise<CursorTokenSnapshot | null>;
   readBalance?: (uid: bigint) => Promise<bigint>;
   settle?: typeof settleCursorExternalUsage;
+  /** 0279 message-audit writer (default: INSERT into api_key_message_audit via pgPool). */
+  recordMessageAudit?: (row: ApiKeyMessageAuditRow) => Promise<void>;
   relayFactory?: (args: CursorExternalRelayFactoryArgs) => CursorSandRelayLike;
   /** Per-uid account stickiness window (default 15 min, mirrors oc-cursor.sh). */
   stickyTtlMs?: number;
   /** In-process cooldown after a credential rejection (default 10 min). */
   credentialCooldownMs?: number;
+  /**
+   * Durable FS outbox. Required in the selfhost composition; unit tests may
+   * omit it and keep the in-process settle-after-return path.
+   */
+  outbox?: CursorExternalApiOutbox;
+  /** Test-only: force the collect-then-emit streaming pipe. */
+  forceBufferedStreaming?: boolean;
 }
 
 export interface CursorExternalHandleArgs {
@@ -107,7 +140,27 @@ export interface CursorExternalHandleArgs {
   requestId: string;
   uid: bigint;
   identity: ProxyIdentity;
+  /**
+   * Body with `model` already normalised to the internal `cursor-*` variant id
+   * (family + client `output_config.effort` resolved by the proxy handler via
+   * `resolveCursorPublicModel`).
+   */
   body: ProxyBody;
+  /**
+   * Model id exactly as the client sent it (public family id `fable-5.1`,
+   * effort-suffixed `fable-5.1-high`, or legacy internal `cursor-fable-5.1-high`).
+   * Used for every client-visible surface — error text and the `model` echoed
+   * in the Anthropic response — so third parties never see the engine prefix
+   * or the resolved thinking-depth suffix. Defaults to `body.model`.
+   */
+  requestedModel?: string;
+  /**
+   * How the thinking depth was chosen (0279 audit): the effort actually applied
+   * and whether it came from the client (`request`), a clamp, the family default
+   * or an effort-pinned id. Optional — the container path never sets it.
+   */
+  effort?: string | null;
+  effortSource?: string | null;
   /** `deps.identity.authorize(identity, pricing, model)` bound by the handler. */
   authorize: (pricing: ModelPricing) => Promise<void>;
   appendCostCredits?: (
@@ -132,6 +185,13 @@ export interface CursorExternalRoute {
 }
 
 // ─── constants ─────────────────────────────────────────────────────────────
+
+/**
+ * Client-visible name of the upstream in relay error messages. Neutral on
+ * purpose: the external API-key surface never names the engine (operator
+ * decision 2026-09-07 — no "cursor" anywhere a third-party client can see).
+ */
+export const CURSOR_EXTERNAL_UPSTREAM_LABEL = "Upstream";
 
 export const CURSOR_EXTERNAL_STICKY_TTL_MS = 15 * 60_000;
 export const CURSOR_EXTERNAL_CREDENTIAL_COOLDOWN_MS = 10 * 60_000;
@@ -233,6 +293,8 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   const loadSnapshot = deps.loadSnapshot ?? ((id: bigint) => getCursorTokenSnapshot(id));
   const readBalance = deps.readBalance ?? ((uid: bigint) => readTotalSpendableBalance(uid));
   const settle = deps.settle ?? settleCursorExternalUsage;
+  const writeMessageAudit =
+    deps.recordMessageAudit ?? ((row: ApiKeyMessageAuditRow) => recordApiKeyMessageAudit(deps.pgPool, row));
   const relayFactory =
     deps.relayFactory
     ?? ((args: CursorExternalRelayFactoryArgs): CursorSandRelayLike =>
@@ -244,6 +306,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         // The master has no internal loopback proxy to hand non-Sand models to;
         // serveMessages already 400s NOT_SAND_ROUTE before reaching passthrough.
         passthrough: null,
+        upstreamLabel: CURSOR_EXTERNAL_UPSTREAM_LABEL,
       }));
 
   const relays = new Map<string, CachedRelay>();
@@ -316,6 +379,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   async function handle(args: CursorExternalHandleArgs): Promise<void> {
     const { req, res, requestId, uid, body, userLog } = args;
     const model = body.model;
+    const requestedModel = args.requestedModel ?? model;
     const nowMs = now();
 
     // 1) pricing — unknown / disabled cursor model
@@ -323,7 +387,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     if (!pricing || !pricing.enabled) {
       userLog.warn("proxy_unknown_model", { model, cursorExternal: true });
       incrAnthropicProxyReject("unknown_model");
-      sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${model}' not enabled`, requestId);
+      sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${requestedModel}' not enabled`, requestId);
       return;
     }
 
@@ -394,11 +458,12 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         excluded: excluded.size,
       });
       incrAnthropicProxyReject("account_pool");
+      // Error code / text are engine-neutral: this is a third-party-facing surface.
       sendJsonError(
         res,
         503,
-        "CURSOR_POOL_UNAVAILABLE",
-        "no cursor account available for this model, retry later",
+        "MODEL_POOL_UNAVAILABLE",
+        "no upstream capacity available for this model, retry later",
         requestId,
         { "retry-after": "30" },
       );
@@ -413,6 +478,38 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     const attribution = extractUsageAttribution(body.metadata);
     const relayBody: Record<string, unknown> = { ...body };
     if (body.stream !== true) relayBody.stream = false;
+    const billingRequestId = newCursorExternalBillingId(() => randomBytes(16));
+    const basis = captureCursorPricingBasis(pricing, process.env, new Date(nowMs));
+    const outbox = deps.outbox;
+
+    if (outbox) {
+      try {
+        await outbox.writeIntent({
+          schema: 1,
+          phase: "intent",
+          billingId: billingRequestId,
+          userId: uid.toString(),
+          modelId: model,
+          accountId: accountId.toString(),
+          apiKeyId: args.identity.apiKey?.id?.toString() ?? null,
+          sessionId: attribution.sessionId,
+          turnKey: attribution.turnKey,
+          parentTurnKey: attribution.parentTurnKey,
+          parentSessionId: attribution.parentSessionId,
+          delegateAgentId: attribution.delegateAgentId,
+          basis,
+          createdAt: new Date(nowMs).toISOString(),
+        });
+      } catch (err) {
+        userLog.error("cursor_external_intent_persist_failed", {
+          model,
+          accountId: accountId.toString(),
+          err: errSummary(err),
+        });
+        sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+        return;
+      }
+    }
 
     // Client-disconnect detection: `res` emits 'close' both after a normal
     // `end()` and when the peer hangs up. Only the latter happens while the
@@ -427,11 +524,77 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     };
     res.on("close", onClose);
 
+    let sealedReady: CursorExternalReadyRecord | null = null;
+    // The nonstream rejected result omits usage; keep actual terminal observation for the audit projection.
+    let reportedUsage: unknown;
+    let sealPromise: Promise<CursorExternalReadyRecord | null> | null = null;
+    const sealOnce = (ev: TerminalEvidence): Promise<CursorExternalReadyRecord | null> => {
+      if (!sealPromise) {
+        sealPromise = (async () => {
+          let engineStatus: "success" | "error" = ev.outcome === "completed" ? "success" : "error";
+          let terminalCode = ev.terminalCode ?? null;
+          if (clientAborted) {
+            engineStatus = "error";
+            terminalCode = "USER_CANCELLED";
+          }
+          if (ev.evidence.kind === "unobserved") {
+            if (engineStatus === "success") {
+              throw new Error("CURSOR_EXTERNAL_UNOBSERVED_SUCCESS");
+            }
+            return null;
+          }
+          reportedUsage = ev.evidence.usage;
+          const usage = mapCursorReportedUsage(ev.evidence.usage);
+          const plan = freezePreparedCursorSettlePlan(
+            planCursorExternalSettle({
+              engineStatus,
+              usage,
+              pricing,
+              pricingBasis: basis,
+              terminalCode,
+            }),
+          );
+          const ready: CursorExternalReadyRecord = {
+            schema: 1,
+            phase: "ready",
+            billingId: billingRequestId,
+            userId: uid.toString(),
+            modelId: model,
+            accountId: accountId.toString(),
+            apiKeyId: args.identity.apiKey?.id?.toString() ?? null,
+            sessionId: attribution.sessionId,
+            turnKey: attribution.turnKey,
+            parentTurnKey: attribution.parentTurnKey,
+            parentSessionId: attribution.parentSessionId,
+            delegateAgentId: attribution.delegateAgentId,
+            basis,
+            createdAt: new Date(nowMs).toISOString(),
+            engineStatus,
+            terminalCode,
+            usage: ev.evidence.usage,
+            plan,
+            sealedAt: new Date(now()).toISOString(),
+          };
+          if (outbox) {
+            sealedReady = await outbox.writeReady(ready);
+            return sealedReady;
+          }
+          sealedReady = ready;
+          return ready;
+        })();
+      }
+      return sealPromise;
+    };
+
     let result: CursorSandServeResult | null = null;
     let failure: unknown = null;
     const startedAt = nowMs;
     try {
-      result = await relay.serveMessages(relayBody, res, ac.signal);
+      result = await relay.serveMessages(relayBody, res, ac.signal, {
+        echoModel: requestedModel,
+        ...(outbox ? { onTerminal: (ev) => sealOnce(ev).then(() => undefined) } : {}),
+        ...(deps.forceBufferedStreaming ? { bufferedStreaming: true } : {}),
+      });
     } catch (err) {
       failure = err;
     } finally {
@@ -446,6 +609,8 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       settleKind: "final" | "partial" | "aborted";
     };
     let outcome: Outcome;
+    /** Client-visible failure text for the 0279 audit row (null on success). */
+    let auditError: string | null = null;
     if (result && result.kind === "completed") {
       outcome = { engineStatus: "success", terminalCode: null, usage: result.usage, settleKind: "final" };
     } else if (result && result.kind === "failed") {
@@ -453,26 +618,31 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       // A client that hung up mid-stream is still charged for what reached it
       // (same USER_CANCELLED semantics as the web engine's Stop button); a
       // genuine upstream fault leaves an audit row with no debit.
+      const nonRetryable = isNonRetryableUpstreamReason(result.reason);
       outcome = {
         engineStatus: "error",
         terminalCode: clientAborted ? "USER_CANCELLED" : "CURSOR_STREAM_FAILED",
         usage: result.usage,
         settleKind: clientAborted ? "aborted" : "partial",
       };
+      auditError = clientAborted ? "client disconnected" : stripNonRetryableMarker(result.reason);
       userLog.warn("cursor_external_stream_failed", {
         model,
         accountId: accountId.toString(),
-        reason: result.reason,
+        reason: stripNonRetryableMarker(result.reason),
+        nonRetryable,
         clientAborted,
       });
     } else if (result && result.kind === "rejected") {
+      const reason = stripNonRetryableMarker(result.reason);
+      const nonRetryable = isNonRetryableUpstreamReason(result.reason);
       if (result.status === 401) {
         cooled.set(accountId.toString(), nowMs + cooldownMs);
         sticky.delete(uid.toString());
         userLog.warn("cursor_external_credential_rejected", {
           model,
           accountId: accountId.toString(),
-          reason: result.reason,
+          reason,
           cooldownMs,
         });
         incrAnthropicProxyReject("upstream_auth");
@@ -481,17 +651,30 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
           model,
           accountId: accountId.toString(),
           status: result.status,
-          reason: result.reason,
+          reason,
+          nonRetryable,
         });
       }
       if (!result.written && !res.headersSent) {
-        sendJsonError(res, result.status, "CURSOR_UPSTREAM_REJECTED", result.reason, requestId);
+        // Provider said "don't bother retrying" → tell Claude Code so it stops its 10× loop.
+        if (nonRetryable) res.setHeader("x-should-retry", "false");
+        sendJsonError(
+          res,
+          result.status,
+          "UPSTREAM_REJECTED",
+          // Internal reasons are `CURSOR_SAND_*` / `NOT_SAND_ROUTE`; strip the engine prefix for the wire.
+          reason.replace(/^CURSOR_SAND_/, ""),
+          requestId,
+        );
       }
-      outcome = { engineStatus: "error", terminalCode: result.reason, usage: {}, settleKind: "aborted" };
+      // Terminal code is a DB/billing key: keep it short and marker-free.
+      outcome = { engineStatus: "error", terminalCode: reason.slice(0, 200), usage: {}, settleKind: "aborted" };
+      auditError = reason;
     } else {
       if (clientAborted || (isAbortLike(failure) && ac.signal.aborted)) {
         userLog.info("cursor_external_client_aborted", { model, accountId: accountId.toString() });
         outcome = { engineStatus: "error", terminalCode: "USER_CANCELLED", usage: {}, settleKind: "aborted" };
+        auditError = "client disconnected";
       } else {
         userLog.error("cursor_external_relay_failed", {
           model,
@@ -499,42 +682,124 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
           err: errSummary(failure),
         });
         if (!res.headersSent) {
-          sendJsonError(res, 502, "CURSOR_UPSTREAM_FAILED", "cursor upstream failed", requestId);
+          sendJsonError(res, 502, "UPSTREAM_FAILED", "upstream request failed", requestId);
         } else if (!res.writableEnded) {
           res.end();
         }
         outcome = { engineStatus: "error", terminalCode: "CURSOR_RELAY_FAILED", usage: {}, settleKind: "aborted" };
+        auditError = `relay failed: ${errSummary(failure)}`;
       }
     }
     if (!res.writableEnded) res.end();
 
     let settled: SettleResult | null = null;
-    try {
-      settled = await settle({
+    const settleFromReady = async (ready: CursorExternalReadyRecord): Promise<SettleResult | null> => {
+      if (outbox) {
+        const consumed = await consumeReadyRecord({
+          pool: deps.pgPool,
+          pricing: deps.pricing,
+          record: ready,
+          unlink: (id) => outbox.unlink(id),
+          settle,
+          logger: userLog,
+        });
+        return consumed.settled;
+      }
+      return settle({
         pool: deps.pgPool,
         pricing: deps.pricing,
         userId: uid,
-        requestId,
+        requestId: billingRequestId,
         modelId: model,
         sessionId: attribution.sessionId,
-        engineStatus: outcome.engineStatus,
-        terminalCode: outcome.terminalCode,
-        usage: outcome.usage,
+        engineStatus: ready.engineStatus,
+        terminalCode: ready.terminalCode,
+        usage: ready.usage,
         accountId,
         turnKey: attribution.turnKey,
         parentTurnKey: attribution.parentTurnKey,
         parentSessionId: attribution.parentSessionId,
         delegateAgentId: attribution.delegateAgentId,
-        // 0277 per-key attribution — always an API-key identity on this route.
         apiKeyId: args.identity.apiKey?.id ?? null,
+        preparedPlan: ready.plan,
       });
+    };
+
+    try {
+      if (sealedReady) {
+        settled = await settleFromReady(sealedReady);
+      } else if (outbox) {
+        const existing = await outbox.read(billingRequestId);
+        if (existing && existing.phase === "ready") {
+          settled = await settleFromReady(existing);
+        } else if (result?.kind === "rejected") {
+          const zeros = {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          };
+          const ready = await sealOnce({
+            evidence: { kind: "reported", usage: zeros },
+            outcome: "failed",
+            terminalCode: result.reason,
+          });
+          if (ready) settled = await settleFromReady(ready);
+        }
+        // unobserved failed/cancelled: leave intent; do not invent a zero ready.
+      } else {
+        settled = await settle({
+          pool: deps.pgPool,
+          pricing: deps.pricing,
+          userId: uid,
+          requestId: billingRequestId,
+          modelId: model,
+          sessionId: attribution.sessionId,
+          engineStatus: outcome.engineStatus,
+          terminalCode: outcome.terminalCode,
+          usage: outcome.usage,
+          accountId,
+          turnKey: attribution.turnKey,
+          parentTurnKey: attribution.parentTurnKey,
+          parentSessionId: attribution.parentSessionId,
+          delegateAgentId: attribution.delegateAgentId,
+          apiKeyId: args.identity.apiKey?.id ?? null,
+          pricingBasis: basis,
+        });
+      }
     } catch (err) {
       userLog.error("cursor_external_settle_failed", { model, accountId: accountId.toString(), err: errSummary(err) });
     }
     incrAnthropicProxySettle(outcome.settleKind);
 
+    // 6b) 0279 message audit — admin-visible record of what the user sent and
+    //     what came back. Fire-and-forget: never delays the response (already
+    //     ended above) and never affects billing. Success and failure both land
+    //     (usage_records only keeps billable rows).
+    void writeMessageAudit({
+      requestId,
+      userId: uid,
+      apiKeyId: args.identity.apiKey?.id ?? null,
+      requestedModel,
+      model,
+      effort: args.effort ?? null,
+      effortSource: args.effortSource ?? null,
+      accountId,
+      shape: describeRequestShape(body),
+      lastUserMessage: extractLastUserMessage(body.messages),
+      status: outcome.engineStatus,
+      terminalCode: outcome.terminalCode,
+      errorMessage: auditError,
+      durationMs: now() - startedAt,
+      usage: usageCounts(reportedUsage ?? outcome.usage),
+      clientUserAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"].slice(0, 256) : null,
+    }).catch((err: unknown) => {
+      userLog.warn("cursor_external_audit_failed", { requestId, err: errSummary(err) });
+    });
+
     // 7) post-commit — same order as core.ts: persist first, broadcast second;
-    //    both fail-soft.
+    //    both fail-soft. append is request-keyed on the server billing id;
+    //    cost_charged broadcasts only on a new debit.
     if (settled) {
       const persisted =
         settled.attributionCredits !== null
@@ -545,7 +810,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       if (persisted !== null && args.appendCostCredits) {
         try {
           await args.appendCostCredits(
-            requestId,
+            billingRequestId,
             uid.toString(),
             persisted.toString(),
             attribution.sessionId,
@@ -555,14 +820,14 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
             attribution.parentTurnKey,
           );
         } catch (err) {
-          userLog.warn("proxy_persist_costcredits_failed", { err: errSummary(err), requestId });
+          userLog.warn("proxy_persist_costcredits_failed", { err: errSummary(err), requestId: billingRequestId });
         }
       }
       if (settled.debitedCredits !== null && settled.debitedCredits > 0n && args.broadcastToUser) {
         try {
           args.broadcastToUser(uid, {
             type: "outbound.cost_charged",
-            requestId,
+            requestId: billingRequestId,
             costCredits: settled.debitedCredits.toString(),
             balanceAfter: settled.balanceAfter === null ? null : settled.balanceAfter.toString(),
             sessionId: attribution.sessionId,
@@ -576,11 +841,15 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
     userLog.info("cursor_external_settled", {
       model,
       accountId: accountId.toString(),
+      billingRequestId,
+      traceRequestId: requestId,
       engineStatus: outcome.engineStatus,
       terminalCode: outcome.terminalCode,
       usage: outcome.usage,
+      outboxPhase: sealedReady ? "ready" : outbox ? "intent" : null,
       debitedCredits: settled?.debitedCredits?.toString() ?? null,
       clamped: settled?.clamped ?? null,
+      commitDisposition: settled?.commitDisposition ?? null,
       durationMs: now() - startedAt,
     });
   }

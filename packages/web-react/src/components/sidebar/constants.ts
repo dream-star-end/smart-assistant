@@ -5,6 +5,11 @@ export const VIRTUALIZE_THRESHOLD = 120;
 export const SESSION_ROW_HEIGHT = 44;
 
 export const GROUP_HEADER_HEIGHT = 32;
+/**
+ * 触屏（hover:none）下带操作按钮的分组标题行高：IconButton 在触屏统一升到 44px，
+ * 32px 的标题行装不下会溢出盖住上一行（审计 S-04），拍平层按 item.height 排 offsets 故这里同步加高。
+ */
+export const GROUP_HEADER_HEIGHT_TOUCH = 44;
 export const PROJECT_ROW_HEIGHT = 44;
 export const HINT_ROW_HEIGHT = 36;
 export const SEARCH_HIT_HEIGHT = 62;

@@ -19,6 +19,7 @@ import {
   applyOutboundMessage,
   applyPermissionRequest,
   applyPermissionSettled,
+  applyPermissionSnapshot,
   applyResumeFailed,
   applyTurnStatus,
   applyTurnUsage,
@@ -32,6 +33,8 @@ import {
   resetFrameSeqCursor,
   type DeferredTerminalErrorPaint,
   type FrameEffects,
+  type ProblemCardMaterializeCause,
+  type ProblemCardReport,
 } from "./reducer";
 import {
   addMessage,
@@ -65,6 +68,7 @@ import {
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
+  reconcileLateDelegateAgentGroups,
   reconcileTimelineBashTailAuxiliaries,
   shouldRetainLiveProcessOnOwnerReset,
   type ServerTurnTerminal,
@@ -74,6 +78,7 @@ import {
 } from "../persist";
 import { appUpdate } from "../appUpdate";
 import { observeTimelineShadow } from "../timeline/shadowLifecycle";
+import type { PermissionPromptSnapshotPayload } from "../types";
 import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
@@ -102,6 +107,8 @@ import {
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
   isRecoveryControlUserTurn,
+  problemCardPresentation,
+  REPORT_EXEMPT_TURN_ERR_CODES,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
@@ -217,6 +224,8 @@ export type ChatSocketDeps = {
   refreshInbox?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
   reportClientError?: (p: { type: string; code: string; traceId?: string; sessionId?: string }) => void;
+  /** 问题卡闭环上报（surface=chat / stage=problem_card）。历史水合绝不调用。*/
+  reportProblemCard?: (p: ProblemCardReport & { sessionId: string }) => void;
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
   syncSession?: (
     sessId: string,
@@ -249,6 +258,8 @@ export type ChatSocketDeps = {
   persistSessionModel?: (sessId: string, modelId: string) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
+  /** Bounded requestId lookup when a permission snapshot page is truncated. */
+  lookupPermissionPrompts?: (sessId: string, requestIds: string[]) => void;
   /** Exact outbound journal. Production waits for one committed row before
    * the first physical WS send and exact-deletes it only after authority ACK. */
   persistPendingDispatch?: (sessId: string, item: StoredPendingDispatch) => Promise<void>;
@@ -796,17 +807,24 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout> | null;
     inFlight: boolean;
   }>();
-  /** Exact active-turn candidate sets already attempted on the current WS.
-   * History can arrive after the initial shell hello; each new candidate set
-   * gets one targeted registration hello, then waits for a reconnect before
-   * retrying to avoid a resume_failed/sync loop. */
+  /** Active candidate sets and idle cursor registrations attempted on this WS.
+   * History can arrive after the initial shell hello; each identity gets one
+   * successful targeted hello. A server-reset idle cursor is a new identity,
+   * while repeating the same snapshot cannot cause a resume_failed/sync loop. */
   private readonly activeReplayAttemptKeys = new Set<string>();
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
+  getActiveSessionId(): string | undefined {
+    return this.activeSessionId;
+  }
 
   // ── 重连 reconcile（§4）──
   private reconnectInFlightSet: Set<string> | null = null;
   private reconnectInFlightTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 恢复条的归属集合：钉上「正在恢复上一轮」时，仍在等终态的那批会话。
+   *  收口判据必须只看这批会话——用全量 sessions 判会让任意一条注水残留的
+   *  in-flight（其 turn 早已在服务端收尾、本 tab 永不再收到终态帧）永久钉死横幅。*/
+  private restoreBannerOwners: Set<string> | null = null;
   private reconnectReconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── durable dispatch journal / per-session FIFO ──
@@ -836,6 +854,10 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout>;
     decided: boolean;
   }>();
+  /** 问题卡去重：`${sessId}:${rootCmid}:${outcome}:${path}` 同键只报一次。*/
+  private readonly reportedProblemCards = new Set<string>();
+  /** 延后红卡的源错误码，供 recovered 在未落卡时取码（宁缺毋滥）。*/
+  private readonly problemCardSourceCodes = new Map<string, string>();
   private controlQueue: PendingControlItem[] = [];
   private controlPumpScheduled = false;
   private readonly controlPersistRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1694,7 +1716,15 @@ export class ChatSocket {
    */
   private dismissStaleRestoreBanner(): void {
     if (this.statusLabel !== "正在恢复上一轮…") return;
-    if ([...this.sessions.values()].some((session) => session._sendingInFlight)) return;
+    // 只有「钉这条横幅时确实在等终态、且至今仍在等」的会话才有资格继续钉住它。
+    const owners = this.restoreBannerOwners;
+    if (owners) {
+      for (const sessId of [...owners]) {
+        if (!this.sessions.get(sessId)?._sendingInFlight) owners.delete(sessId);
+      }
+      if (owners.size > 0) return;
+      this.restoreBannerOwners = null;
+    }
     if (this.ws?.readyState === 1) {
       const [label, cls] = onopenSetInitialStatus(this.offlineQueue.length);
       this.setStatus(label, cls);
@@ -1805,6 +1835,7 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
+        if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
         this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
         const settlement = sess._stopSettlement;
@@ -1838,6 +1869,10 @@ export class ChatSocket {
         if (!isCronOrHeartbeat) this.finishDispatch(sess.id, clientMessageId);
         // 生成中排队的后续消息:本轮 final 已清 _sendingInFlight → 顺序发出下一条。
         if (!isCronOrHeartbeat) this.kickQueuedDrainIfIdle();
+        // 正常终态同样要收口「正在恢复上一轮」。reducer 在 final/error 路径直接清
+        // _sendingInFlight（不经 clearSendingState），此前没有任何一处重估状态条，
+        // 横幅会一直钉到用户手动刷新。
+        if (!isCronOrHeartbeat) this.dismissStaleRestoreBanner();
         // turn 收尾：落地完成轮（reload 不丢；游标 + 完整 tape durable）。
         this.deps.persistSession?.(sess.id);
         // 真终态到达时 lossless tape 已完成，立即做一次精确 REST 对账，让
@@ -1900,6 +1935,7 @@ export class ChatSocket {
       onAuthControlError: () => {
         // 交给 close(1008) handler 续期，不渲染。
       },
+      reportProblemCard: (sessId, p) => this.reportProblemCard(sessId, p),
     };
   }
 
@@ -1967,7 +2003,13 @@ export class ChatSocket {
             }
             return;
           }
-          if (this.statusCls !== "connected") this.setStatus("正在恢复上一轮…", "connecting");
+          if (this.statusCls !== "connected") {
+            // 登记归属：这批会话收尾后必须由 dismissStaleRestoreBanner 自行摘掉横幅。
+            this.restoreBannerOwners = new Set(
+              [...snapped].filter((sessId) => this.sessions.get(sessId)?._sendingInFlight),
+            );
+            this.setStatus("正在恢复上一轮…", "connecting");
+          }
         }, 30000);
       } else {
         this.reconnectInFlightSet = null;
@@ -2273,6 +2315,9 @@ export class ChatSocket {
             if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
             else this.clearThinkingSafety(sess.id);
           }
+          // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
+          // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
+          this.dismissStaleRestoreBanner();
         }
         return;
       }
@@ -2295,6 +2340,9 @@ export class ChatSocket {
             if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
             else this.clearThinkingSafety(sess.id);
           }
+          // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
+          // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
+          this.dismissStaleRestoreBanner();
           this.deps.persistSession?.(sess.id);
         }
         return;
@@ -2493,6 +2541,20 @@ export class ChatSocket {
         return;
       }
       default:
+        if ((f as { type?: unknown }).type === "outbound.permission_hello_scan") {
+          const frame = f as {
+            truncated?: unknown;
+            rowLimited?: unknown;
+            uncoveredSessionIds?: unknown;
+          };
+          const uncovered = Array.isArray(frame.uncoveredSessionIds)
+            ? frame.uncoveredSessionIds.filter((id): id is string => typeof id === "string")
+            : [];
+          const active = this.activeSessionId;
+          if (active && (frame.truncated === true || frame.rowLimited === true || uncovered.includes(active))) {
+            this.deps.syncSession?.(active);
+          }
+        }
         // pong 已先处理；其余 v5 webchat 不消费。
         return;
     }
@@ -2734,11 +2796,12 @@ export class ChatSocket {
         clearTimeout(previous.timer);
         this.pendingRecoveryErrors.delete(sessId);
       } else {
-        this.materializePendingRecoveryError(sessId);
+        this.materializePendingRecoveryError(sessId, "decision_timeout");
       }
     }
-    const timer = setTimeout(() => this.materializePendingRecoveryError(sessId), RECOVERY_DECISION_GRACE_MS);
+    const timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
     this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false });
+    this.stashProblemCardSourceCode(sessId, clientMessageId, paint.normalized);
     return true;
   }
 
@@ -2755,7 +2818,7 @@ export class ChatSocket {
       if (matchesPending && pending) {
         clearTimeout(pending.timer);
         pending.decided = true;
-        pending.timer = setTimeout(() => this.materializePendingRecoveryError(sessId), RECOVERY_ADOPTION_GRACE_MS);
+        pending.timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "adoption_timeout"), RECOVERY_ADOPTION_GRACE_MS);
       }
       // 软状态仍在(延后路径)或本轮仍在飞:用权威 attempt 刷新文案;不凭裁决伪造 in-flight。
       if (sess._sendingInFlight && (matchesPending || sess._activeClientMessageId === frame.sourceClientMessageId)) {
@@ -2767,7 +2830,12 @@ export class ChatSocket {
       }
       return;
     }
-    if (matchesPending) this.materializePendingRecoveryError(sessId);
+    if (matchesPending) {
+      const reason = typeof frame.reason === "string" && /^[a-z0-9_]{1,48}$/.test(frame.reason)
+        ? frame.reason
+        : undefined;
+      this.materializePendingRecoveryError(sessId, "decision_declined", reason);
+    }
   }
 
   /** 正向收口(ack 领养 / lineage 拒绝前置):丢弃暂存错误。`declined` 时先物化红卡再返回。*/
@@ -2775,22 +2843,29 @@ export class ChatSocket {
     sessId: string,
     sourceClientMessageId: string | undefined,
     outcome: "adopted" | "declined",
+    cause?: ProblemCardMaterializeCause,
+    reason?: string,
   ): void {
     const pending = this.pendingRecoveryErrors.get(sessId);
     if (!pending) return;
     if (pending.clientMessageId && sourceClientMessageId && pending.clientMessageId !== sourceClientMessageId) return;
     if (outcome === "declined") {
-      this.materializePendingRecoveryError(sessId);
+      this.materializePendingRecoveryError(sessId, cause ?? "recovery_skipped", reason);
       return;
     }
+    this.stashProblemCardSourceCode(sessId, pending.clientMessageId, pending.paint.normalized);
     clearTimeout(pending.timer);
     this.pendingRecoveryErrors.delete(sessId);
     const sess = this.sessions.get(sessId);
     if (sess) sess._deferredTerminalErrorClientMessageId = undefined;
   }
 
-  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。*/
-  private materializePendingRecoveryError(sessId: string): void {
+  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。*/
+  private materializePendingRecoveryError(
+    sessId: string,
+    cause: ProblemCardMaterializeCause,
+    reason?: string,
+  ): void {
     const pending = this.pendingRecoveryErrors.get(sessId);
     if (!pending) return;
     clearTimeout(pending.timer);
@@ -2800,7 +2875,7 @@ export class ChatSocket {
     sess._deferredTerminalErrorClientMessageId = undefined;
     const wasActive = sess._sendingInFlight &&
       (!pending.clientMessageId || sess._activeClientMessageId === pending.clientMessageId);
-    paintDeferredTerminalError(sess, pending.paint, this.effects());
+    const painted = paintDeferredTerminalError(sess, pending.paint, this.effects());
     if (wasActive && !sess._sendingInFlight) {
       // painter 已清 in-flight;补齐 socket 侧收尾(thinking-safety / 排队消息续发)。
       this.clearThinkingSafety(sessId);
@@ -2808,6 +2883,144 @@ export class ChatSocket {
     }
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
+    if (!painted) return;
+    const code = pending.paint.normalized;
+    const rootCmid = this.problemCardRootCmid(sess, pending.clientMessageId);
+    if (!rootCmid) return;
+    this.reportProblemCard(sessId, {
+      rootCmid,
+      code,
+      outcome: cause === "stop_fenced" ? "cancelled" : "failed",
+      path: cause,
+      presentation: problemCardPresentation(code, false),
+      ...(reason ? { reason } : {}),
+      traceId: pending.paint.traceId,
+    });
+  }
+
+  private problemCardRootCmid(sess: ChatSession, cmid: string | undefined): string | undefined {
+    if (!cmid) return undefined;
+    const source = sess.messages.find((m) => m.role === "user" && m.id === cmid);
+    const root = source?._automaticRecoveryRootClientMessageId;
+    if (typeof root === "string" && root.length > 0) return root;
+    return cmid;
+  }
+
+  private stashProblemCardSourceCode(sessId: string, cmid: string | undefined, code: string): void {
+    if (!cmid || !code) return;
+    this.problemCardSourceCodes.set(`${sessId}:${cmid}`, code);
+    const sess = this.sessions.get(sessId);
+    const root = sess ? this.problemCardRootCmid(sess, cmid) : undefined;
+    if (root && root !== cmid) this.problemCardSourceCodes.set(`${sessId}:${root}`, code);
+  }
+
+  private lookupProblemCardSourceCode(sess: ChatSession, sourceCmid: string, rootCmid: string): string | undefined {
+    const cardFor = (cmid: string): string | undefined => {
+      const card = sess.messages.find((m) =>
+        m.role === "assistant" && m._clientMessageId === cmid && typeof m._errorCode === "string" && m._errorCode);
+      return card?._errorCode;
+    };
+    const fromCard = cardFor(sourceCmid) ?? cardFor(rootCmid);
+    if (fromCard) return fromCard;
+    return this.problemCardSourceCodes.get(`${sess.id}:${sourceCmid}`)
+      ?? this.problemCardSourceCodes.get(`${sess.id}:${rootCmid}`);
+  }
+
+  private isProblemCardErrorFinal(
+    sess: ChatSession,
+    frame: OutboundMessageWire,
+    clientMessageId?: string,
+  ): boolean {
+    if ((frame as { isError?: boolean }).isError === true) return true;
+    if (typeof frame.meta?.interrupted === "string" && frame.meta.interrupted.length > 0) return true;
+    const blocks = frame.blocks;
+    if (
+      Array.isArray(blocks) &&
+      blocks.length === 1 &&
+      blocks[0]?.kind === "text" &&
+      typeof (blocks[0] as { text?: unknown }).text === "string" &&
+      (blocks[0] as { text: string }).text.startsWith("[error]")
+    ) {
+      return true;
+    }
+    if (clientMessageId) {
+      if (sess.messages.some((m) =>
+        m.role === "assistant" && m._clientMessageId === clientMessageId && !!m._errorCode)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private reportRecoveredProblemCard(
+    sess: ChatSession,
+    frame: OutboundMessageWire,
+    clientMessageId?: string,
+  ): void {
+    const cmid = clientMessageId ?? frame.clientMessageId;
+    if (!cmid) return;
+    const user = sess.messages.find((m) => m.role === "user" && m.id === cmid);
+    if (!user || user._automaticRecovery !== true || typeof user._recoveryOfClientMessageId !== "string") return;
+    if (this.isProblemCardErrorFinal(sess, frame, cmid)) return;
+    const sourceCmid = user._recoveryOfClientMessageId;
+    const rootCmid = typeof user._automaticRecoveryRootClientMessageId === "string"
+      && user._automaticRecoveryRootClientMessageId.length > 0
+      ? user._automaticRecoveryRootClientMessageId
+      : sourceCmid;
+    const code = this.lookupProblemCardSourceCode(sess, sourceCmid, rootCmid);
+    if (!code) return;
+    const attempts = typeof user._automaticRecoveryAttempt === "number"
+      && Number.isSafeInteger(user._automaticRecoveryAttempt)
+      && user._automaticRecoveryAttempt >= 1
+      ? user._automaticRecoveryAttempt
+      : 1;
+    this.reportProblemCard(sess.id, {
+      rootCmid,
+      code,
+      outcome: "recovered",
+      path: "recovery_adopted",
+      presentation: "soft",
+      attempts,
+    });
+  }
+
+  private reportProblemCard(sessId: string, p: ProblemCardReport): void {
+    const code = normalizeTurnErrorCode(p.code);
+    if (!code) return;
+    if (REPORT_EXEMPT_TURN_ERR_CODES.has(code)) return;
+    if (code === "stopped" || code === "user_cancelled") return;
+    if (!p.rootCmid) return;
+    const key = `${sessId}:${p.rootCmid}:${p.outcome}:${p.path}`;
+    if (this.reportedProblemCards.has(key)) return;
+    this.reportedProblemCards.add(key);
+    const reason = typeof p.reason === "string" && /^[a-z0-9_]{1,48}$/.test(p.reason) ? p.reason : undefined;
+    const attempts = typeof p.attempts === "number"
+      && Number.isSafeInteger(p.attempts)
+      && p.attempts >= 1
+      && p.attempts <= 32
+      ? p.attempts
+      : undefined;
+    this.deps.reportProblemCard?.({
+      sessionId: sessId,
+      rootCmid: p.rootCmid,
+      code,
+      outcome: p.outcome,
+      path: p.path,
+      presentation: p.presentation,
+      ...(reason ? { reason } : {}),
+      ...(attempts != null ? { attempts } : {}),
+      ...(p.traceId ? { traceId: p.traceId } : {}),
+    });
+  }
+
+  private pruneProblemCardState(sessId: string): void {
+    const prefix = `${sessId}:`;
+    for (const key of this.reportedProblemCards) {
+      if (key.startsWith(prefix)) this.reportedProblemCards.delete(key);
+    }
+    for (const key of this.problemCardSourceCodes.keys()) {
+      if (key.startsWith(prefix)) this.problemCardSourceCodes.delete(key);
+    }
   }
 
   /** Atomic master lineage rejection: remove only the deterministic recovery
@@ -2822,7 +3035,7 @@ export class ChatSocket {
       ? frame.sourceClientMessageId
       : undefined;
     // 血统被 master 原子拒绝:延后的红卡必须先落地,下方的 skip 提示才有卡可挂。
-    this.settlePendingRecoveryError(sessId, sourceClientMessageId, "declined");
+    this.settlePendingRecoveryError(sessId, sourceClientMessageId, "declined", "recovery_skipped");
     if (sourceClientMessageId) {
       sess._automaticRecoveryDecisions = {
         ...(sess._automaticRecoveryDecisions ?? {}),
@@ -2960,7 +3173,7 @@ export class ChatSocket {
   private composeHelloFrame(
     includeInFlight = true,
     onlySessionId?: string,
-    requireFreshActiveCandidate = false,
+    requireFreshRegistration = false,
   ): { data: string; attemptKeys: string[] } {
     const peers: Array<{
       peerId: string;
@@ -2980,10 +3193,16 @@ export class ChatSocket {
         if (emitted.has(aid)) return;
         emitted.add(aid);
         const candidates = this.activeTurnReplayCandidates(s);
-        const attemptKey = candidates.length > 0 ? `${pid}:${aid}:${candidates.join(",")}` : "";
-        const hasFreshCandidates = !!attemptKey && !this.activeReplayAttemptKeys.has(attemptKey);
-        if (requireFreshActiveCandidate && !hasFreshCandidates) return;
-        if (hasFreshCandidates) attemptKeys.push(attemptKey);
+        // An idle session can be loaded after this socket's initial hello.
+        // Its persisted cursor still needs server arbitration before the next
+        // turn, even though completed history has no active replay candidate.
+        const attemptKey = candidates.length > 0
+          ? `${pid}:${aid}:${candidates.join(",")}`
+          : `${pid}:${aid}:idle-cursor:${lastFrameSeq}`;
+        const fresh = !this.activeReplayAttemptKeys.has(attemptKey);
+        const hasFreshCandidates = candidates.length > 0 && fresh;
+        if (requireFreshRegistration && !fresh) return;
+        if (fresh) attemptKeys.push(attemptKey);
         const emitInFlight = includeInFlight && !!s._sendingInFlight;
         peers.push({
           peerId: pid,
@@ -3029,10 +3248,10 @@ export class ChatSocket {
   private sendHelloFrame(
     includeInFlight = true,
     onlySessionId?: string,
-    requireFreshActiveCandidate = false,
+    requireFreshRegistration = false,
   ): boolean {
-    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshActiveCandidate);
-    if (requireFreshActiveCandidate && hello.attemptKeys.length === 0) return false;
+    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshRegistration);
+    if (requireFreshRegistration && hello.attemptKeys.length === 0) return false;
     const sent = this.safeWsSend(hello.data);
     if (sent) for (const key of hello.attemptKeys) this.activeReplayAttemptKeys.add(key);
     return sent;
@@ -3319,6 +3538,7 @@ export class ChatSocket {
       clearTimeout(pendingRecoveryError.timer);
       this.pendingRecoveryErrors.delete(sessId);
     }
+    this.pruneProblemCardState(sessId);
     this.lastSyncAt.delete(sessId);
     for (const key of this.activeReplayAttemptKeys) {
       if (key.startsWith(`${sessId}:`)) this.activeReplayAttemptKeys.delete(key);
@@ -3358,6 +3578,8 @@ export class ChatSocket {
     this.controlPersistRetryTimers.clear();
     for (const pending of this.pendingRecoveryErrors.values()) clearTimeout(pending.timer);
     this.pendingRecoveryErrors.clear();
+    this.reportedProblemCards.clear();
+    this.problemCardSourceCodes.clear();
     this.activeReplayAttemptKeys.clear();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
@@ -3662,6 +3884,7 @@ export class ChatSocket {
         clientMessageId: string;
         status: string;
       };
+      permissionPrompts?: PermissionPromptSnapshotPayload;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -3779,6 +4002,7 @@ export class ChatSocket {
           },
         );
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
@@ -3822,6 +4046,10 @@ export class ChatSocket {
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
     expireGenPlaceholdersAgainstServerRows(s);
+    if (archive?.permissionPrompts) {
+      const lookupIds = applyPermissionSnapshot(s, archive.permissionPrompts);
+      if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(s.id, lookupIds);
+    }
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
     this.reconcileUnpublishedTapeRetry(sessId);
@@ -3852,13 +4080,26 @@ export class ChatSocket {
     // hidden and「模型繁忙，正在重试中（n/10）」shows, same as the live path.
     if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
     // Login/reload can open WS before REST history arrives. If that initial
-    // shell hello had no user-row identity it can only produce a generic
-    // resume_failed. Once full history exposes trailing persisted user rows,
-    // issue one targeted registration hello so the server can verify and
-    // replay the exact active turn from its protected boundary.
+    // shell hello may not include this session at all. Register idle cursors
+    // too: otherwise a cached high cursor survives a gateway restart and
+    // swallows the next turn's low-numbered output on this still-open socket.
+    // Active candidates retain their separate exact-turn replay identity.
     if (full && this.ws && this.ws.readyState === 1) {
       this.sendHelloFrame(false, sessId, true);
     }
+  }
+
+  applyPermissionPromptSnapshot(
+    sessId: string,
+    snapshot: PermissionPromptSnapshotPayload | null | undefined,
+  ): string[] {
+    const sess = this.sessions.get(sessId);
+    if (!sess || !snapshot) return [];
+    const lookupIds = applyPermissionSnapshot(sess, snapshot);
+    this.deps.persistSession?.(sess.id);
+    this.scheduleNotify();
+    if (lookupIds.length > 0) this.deps.lookupPermissionPrompts?.(sess.id, lookupIds);
+    return lookupIds;
   }
 
   /**
@@ -4548,6 +4789,7 @@ export class ChatSocket {
     }));
     s.messages = mergeTimelineHistoryPage(s.messages, page);
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     s._historyPageSerial = serial;
     s._timelineCursor = nextCursor;
     s._timelineHasMore = hasMore && typeof nextCursor === "string" && nextCursor.length > 0;
@@ -4610,6 +4852,7 @@ export class ChatSocket {
       };
     }
     s.messages = reconcileTimelineBashTailAuxiliaries(next);
+    s.messages = reconcileLateDelegateAgentGroups(s.messages);
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
@@ -4743,6 +4986,9 @@ export class ChatSocket {
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
+    collabMode?: "solo" | "advisor" | "team";
+    advisorModel?: string;
+    collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
@@ -4769,6 +5015,9 @@ export class ChatSocket {
       model: p.model,
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       teamMode: !!p.teamMode,
+      ...(p.collabMode ? { collabMode: p.collabMode } : {}),
+      ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
+      ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
       effortLevel: p.effortLevel ?? null,
       ...(p.contextTier ? { contextTier: p.contextTier } : {}),
     };
@@ -4805,6 +5054,9 @@ export class ChatSocket {
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
+      ...(p.collabMode ? { collabMode: p.collabMode } : {}),
+      ...(p.advisorModel ? { advisorModel: p.advisorModel } : {}),
+      ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
       // Cursor Opus/Fable 上下文档位(300k/1m):master 逐 turn 收窄签名 descriptor 的窗口。
       ...(p.contextTier ? { contextTier: p.contextTier } : {}),
       ts: Date.now(),
@@ -4987,6 +5239,9 @@ export class ChatSocket {
       ...(routing.model ? { model: routing.model } : {}),
       ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
+      ...(routing.collabMode ? { collabMode: routing.collabMode } : {}),
+      ...(routing.advisorModel ? { advisorModel: routing.advisorModel } : {}),
+      ...(routing.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
@@ -5166,6 +5421,9 @@ export class ChatSocket {
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
+      ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
+      ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
     };
@@ -5522,7 +5780,7 @@ export class ChatSocket {
         if (rootId) sess._cancelledAutomaticRecoveryIds[rootId] = true;
       }
       const stopAgentId = sess._activeAgentId || sess.agentId || this.deps.defaultAgentId || "main";
-      this.materializePendingRecoveryError(sessId);
+      this.materializePendingRecoveryError(sessId, "stop_fenced");
       sess._recoveryStatus = { kind: "completed" };
       const fenceId = rootId ?? lineageId;
       if (fenceId) {
@@ -5790,6 +6048,9 @@ export class ChatSocket {
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
+      ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
+      ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
+      ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
       ts: Date.now(),
     };

@@ -33,6 +33,38 @@ describe('QqBindingCard', () => {
     expect(screen.getByAltText('QQ Bot 入口二维码')).toBeInTheDocument()
   })
 
+  test('复制绑定命令：clipboard 缺失（非安全上下文）不抛错并给出提示；可用时显示已复制', async () => {
+    // 审计 SET-23：此前 `void navigator.clipboard.writeText()` 无兜底，clipboard 为 undefined 会同步抛。
+    vi.spyOn(api, 'getQqBinding').mockResolvedValue({
+      available: true,
+      bound: false,
+      entry_url: 'https://qq.example/bot',
+    })
+    vi.spyOn(api, 'startQqBinding').mockResolvedValue({
+      available: true,
+      entry_url: 'https://qq.example/bot',
+      bind_code: '23AB45CD67',
+      expires_at: Date.now() + 600_000,
+    })
+    const original = Object.getOwnPropertyDescriptor(window.navigator, 'clipboard')
+    Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: undefined })
+    try {
+      render(<QqBindingCard auth={auth} prefs={{}} onPatch={async () => {}} />)
+      fireEvent.click(await screen.findByRole('button', { name: /扫码绑定 QQ/ }))
+      const copyBtn = await screen.findByRole('button', { name: '复制绑定命令' })
+      expect(() => fireEvent.click(copyBtn)).not.toThrow()
+      expect(await screen.findByText('复制失败，请手动输入上面的绑定命令。')).toBeInTheDocument()
+
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText } })
+      fireEvent.click(copyBtn)
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('/bind 23AB45CD67'))
+    } finally {
+      if (original) Object.defineProperty(window.navigator, 'clipboard', original)
+      else Reflect.deleteProperty(window.navigator, 'clipboard')
+    }
+  })
+
   test('bound user can toggle proactive delivery and unbind', async () => {
     vi.spyOn(api, 'getQqBinding')
       .mockResolvedValueOnce({
@@ -44,7 +76,10 @@ describe('QqBindingCard', () => {
     vi.spyOn(api, 'deleteQqBinding').mockResolvedValue({ ok: true, unbound: true })
     const patch = vi.fn(async () => {})
     render(<QqBindingCard auth={auth} prefs={{}} onPatch={patch} />)
-    const proactive = await screen.findByRole('switch')
+    // 开关的可访问名 / 说明来自左侧那两行文字（aria-labelledby / aria-describedby）：
+    // 此前 CDP 无障碍树里 name 为空，读屏只播「开关，已开启」（t-762 settings#1）。
+    const proactive = await screen.findByRole('switch', { name: '主动推送到 QQ' })
+    expect(proactive).toHaveAccessibleDescription('定时任务与提醒优先发送到已绑定 QQ')
     expect(proactive).toBeChecked()
     fireEvent.click(proactive)
     expect(patch).toHaveBeenCalledWith({ qq_proactive_push: false })

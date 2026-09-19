@@ -1,5 +1,5 @@
-import { UserPlus, Users, Wallet } from "lucide-react";
-import { type FormEvent, useEffect, useState } from "react";
+import { Search, UserPlus, Users, Wallet } from "lucide-react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
 import { budgetView } from "../../lib/orgBilling";
 import type {
@@ -10,9 +10,44 @@ import type {
   OrgSubscriptionView,
 } from "../../lib/types";
 import { formatCredits } from "../../lib/utils";
-import { Alert, Badge, Button, Input, Progress, Spinner, Switch, useConfirm, useToast } from "../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Input,
+  Progress,
+  Select,
+  Spinner,
+  Switch,
+  useConfirm,
+  useToast,
+} from "../ui";
 import { shortTime } from "../settings/labels";
+import { TablePager, useTablePage } from "../settings/TablePager";
 import { orgErrText, orgRoleLabel } from "./orgShared";
+
+/** 成员数超过这个值才显示搜索框与分页（小组织一屏看完，不加控件噪音）。 */
+export const MEMBER_SEARCH_THRESHOLD = 10;
+const MEMBER_PAGE_SIZE = 10;
+
+/**
+ * 客户端成员搜索：按显示名 / 邮箱大小写不敏感的子串匹配（审计 SET-39：max_members 50，
+ * 列表此前无搜索无分页）。空 query 原样返回。
+ */
+export function filterMembers(members: OrgMember[], query: string): OrgMember[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return members;
+  return members.filter(
+    (m) => (m.display_name ?? "").toLowerCase().includes(q) || m.email.toLowerCase().includes(q),
+  );
+}
+
+const ROLE_OPTIONS: { value: Exclude<OrgRole, "owner">; label: string }[] = [
+  { value: "admin", label: "管理员" },
+  { value: "member", label: "成员" },
+];
+/** 邀请表单默认角色是成员，放在第一位。 */
+const INVITE_ROLE_OPTIONS = [ROLE_OPTIONS[1], ROLE_OPTIONS[0]];
 
 /** org 角色 → 徽章色调。 */
 function roleTone(role: OrgRole): "accent" | "info" | "neutral" {
@@ -82,6 +117,15 @@ export function MembersTab({
   const isOwner = callerRole === "owner";
   // 限额是支出策略(非动钱):admin 亦可改。财务委派开关(动权限)仅 owner。
   const canEditBudget = callerRole === "owner" || callerRole === "admin";
+
+  // 成员搜索 + 本地分页(hooks 须在下面的 loading / err 早退之前调用)。
+  const [memberQuery, setMemberQuery] = useState("");
+  const showMemberSearch = members.length > MEMBER_SEARCH_THRESHOLD;
+  const filteredMembers = useMemo(
+    () => (showMemberSearch ? filterMembers(members, memberQuery) : members),
+    [members, memberQuery, showMemberSearch],
+  );
+  const memberPage = useTablePage(filteredMembers, MEMBER_PAGE_SIZE);
 
   // 首次挂载拉成员 + 邀请（依赖数组不含 loading，防转圈）。
   useEffect(() => {
@@ -269,9 +313,6 @@ export function MembersTab({
     );
   }
 
-  const selectCls =
-    "h-8 rounded-md border border-border bg-surface px-2 text-[12.5px] text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
-
   // 席位闸(友好前置提示;后端 SEATS_FULL 仍是权威):有订阅时活跃成员达 seats 即满。
   const activeMembers = members.filter((m) => m.status === "active").length;
   const seatFull = subscription != null && activeMembers >= subscription.seats;
@@ -280,11 +321,40 @@ export function MembersTab({
     <div className="flex flex-col">
       {/* 成员列表 */}
       <div className="px-5 py-4">
-        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
-          成员（{members.length}）
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-2">
+          <div className="text-caption font-medium uppercase tracking-wide text-faint">
+            成员（{members.length}）
+          </div>
+          {/* 成员多于阈值才出现搜索框（审计 SET-39）；分页条在列表底部，只有一页时不渲染。 */}
+          {showMemberSearch && (
+            <div className="relative w-full sm:w-64">
+              <Search
+                size={14}
+                aria-hidden="true"
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+              />
+              <Input
+                type="search"
+                inputSize="sm"
+                value={memberQuery}
+                onChange={(e) => setMemberQuery(e.target.value)}
+                placeholder="搜索姓名或邮箱"
+                aria-label="搜索成员"
+                className="pl-9"
+              />
+            </div>
+          )}
         </div>
+        {showMemberSearch && memberQuery.trim() && (
+          <p className="pb-2 text-caption text-faint" data-testid="member-search-summary">
+            匹配 {filteredMembers.length} / {members.length} 位成员
+          </p>
+        )}
+        {filteredMembers.length === 0 ? (
+          <p className="py-6 text-center text-meta text-faint">没有匹配的成员。</p>
+        ) : null}
         <ul className="flex flex-col gap-1.5">
-          {members.map((m) => {
+          {memberPage.pageRows.map((m) => {
             const ownerRow = m.org_role === "owner";
             const busy = busyUid === m.user_id;
             return (
@@ -294,9 +364,9 @@ export function MembersTab({
                     <div className="truncate text-section font-medium text-fg">
                       {m.display_name || m.email}
                     </div>
-                    <div className="truncate text-caption text-faint">
-                      {m.email} · 加入 {shortTime(m.joined_at)}
-                    </div>
+                    {/* 邮箱与加入时间分两行：单行 truncate 在移动端会把加入时间吃进省略号（审计 SET-38）。 */}
+                    <div className="truncate text-caption text-faint">{m.email}</div>
+                    <div className="text-caption text-faint">加入 {shortTime(m.joined_at)}</div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
                     <Badge tone={roleTone(m.org_role)}>{orgRoleLabel(m.org_role)}</Badge>
@@ -306,15 +376,25 @@ export function MembersTab({
                 </div>
 
                 <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-2">
-                  {/* 组织结算开关:服务端 owner-only(安全加固),非 owner 只读展示,消除"点了才 403"。 */}
-                  <label className="flex items-center gap-2 text-meta text-muted">
+                  {/* 组织结算开关:服务端 owner-only(安全加固),非 owner 只读展示,消除"点了才 403"。
+                      非 owner 看到的是禁用态,用 title 说明为什么不可点(审计 SET-40)。 */}
+                  <label
+                    className="flex items-center gap-2 text-meta text-muted"
+                    title={isOwner ? undefined : "仅组织拥有者可更改组织结算"}
+                  >
                     <Switch
                       checked={m.billing_enabled}
                       onCheckedChange={(v) => toggleBilling(m, v)}
                       disabled={busy || !isOwner}
                       aria-label="组织结算"
+                      aria-describedby={isOwner ? undefined : `billing-readonly-${m.user_id}`}
                     />
                     组织结算
+                    {!isOwner && (
+                      <span id={`billing-readonly-${m.user_id}`} className="text-caption text-faint">
+                        （仅拥有者可改）
+                      </span>
+                    )}
                   </label>
 
                   {/* 财务委派开关:仅 owner 可见可操作;owner 行本身恒有权限,不显开关。 */}
@@ -331,19 +411,22 @@ export function MembersTab({
                   )}
 
                   {isOwner && !ownerRow && (
-                    <label className="flex items-center gap-1.5 text-meta text-muted">
+                    <label
+                      htmlFor={`org-member-role-${m.user_id}`}
+                      className="flex items-center gap-1.5 text-meta text-muted"
+                    >
                       角色
-                      <select
-                        className={selectCls}
+                      {/* 下拉统一走 ui/Select（原生 select 与 API 接入页不同源，审计 SET-21），触屏自动 44px（SET-11）。 */}
+                      <Select
+                        id={`org-member-role-${m.user_id}`}
+                        aria-label={`角色 · ${m.display_name || m.email}`}
+                        inputSize="sm"
+                        className="w-auto"
                         value={m.org_role}
                         disabled={busy}
-                        onChange={(e) =>
-                          changeRole(m, e.target.value as Exclude<OrgRole, "owner">)
-                        }
-                      >
-                        <option value="admin">管理员</option>
-                        <option value="member">成员</option>
-                      </select>
+                        onValueChange={(v) => changeRole(m, v as Exclude<OrgRole, "owner">)}
+                        options={ROLE_OPTIONS}
+                      />
                     </label>
                   )}
 
@@ -384,6 +467,12 @@ export function MembersTab({
             );
           })}
         </ul>
+        <TablePager
+          page={memberPage.page}
+          pageCount={memberPage.pageCount}
+          onPageChange={memberPage.setPage}
+          label="成员"
+        />
       </div>
 
       {/* 邀请成员 */}
@@ -415,18 +504,19 @@ export function MembersTab({
               value={inviteEmail}
               onChange={(e) => setInviteEmail(e.target.value)}
               placeholder="成员邮箱"
+              // placeholder 一输入就消失,不是可访问名(t-762 settings#2);与右侧「邀请角色」同款给 aria-label。
+              aria-label="成员邮箱"
               className="h-9 min-w-[12rem] flex-1"
               required
             />
-            <select
-              className={selectCls.replace("h-8", "h-9")}
-              value={inviteRole}
-              onChange={(e) => setInviteRole(e.target.value as Exclude<OrgRole, "owner">)}
+            <Select
               aria-label="邀请角色"
-            >
-              <option value="member">成员</option>
-              <option value="admin">管理员</option>
-            </select>
+              inputSize="sm"
+              className="w-auto"
+              value={inviteRole}
+              onValueChange={(v) => setInviteRole(v as Exclude<OrgRole, "owner">)}
+              options={INVITE_ROLE_OPTIONS}
+            />
             <Button
               type="submit"
               variant="primary"

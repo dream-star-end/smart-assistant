@@ -16,18 +16,27 @@ import {
   Sparkles,
   MessageSquare,
   MessageSquarePlus,
+  MoreHorizontal,
+  Pencil,
   Quote,
   Square,
   Target,
   Type,
   Volume2,
   Wallet,
+  X,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
-import { insufficientCreditsCopy } from "../../lib/chat/pure";
+import {
+  formatDurationSeconds,
+  insufficientCreditsCopy,
+  problemCardPresentation,
+  speechLangFor,
+} from "../../lib/chat/pure";
+import { BRAND } from "../../lib/brand";
 import {
   CONTINUE_PROMPT,
   defaultCollapsed,
@@ -35,13 +44,15 @@ import {
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
-import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../settings/SubscriptionDialog";
+// 从 lib 取(不是 settings/SubscriptionDialog):红卡在首屏同步渲染,静态引订阅弹窗会把弹窗 +
+// 支付入口一并钉进入口闭包(2026-09-17 first-screen-budget 超限修复)。
+import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../../lib/subscribeIntent";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
+import { Alert, Avatar, Badge, Button, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
@@ -109,6 +120,10 @@ export type CardCallbacks = {
   resolveInterruptedContinuation?: (error: ChatMessage) => ChatMessage | undefined;
   /** 把 user / assistant 消息的精确快照带回 Composer。 */
   onQuote?: (msg: ChatMessage) => void;
+  /** 把用户原文放回输入框，改完发送即新 turn（不删原消息、不原地替换）。 */
+  onEditResend?: (msg: ChatMessage) => void;
+  /** 打开顶栏模型选择器（红卡「切换模型」）。 */
+  onOpenModelPicker?: () => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -149,6 +164,9 @@ function buildFeedbackCtx(m: ChatMessage): FeedbackContext {
   };
 }
 
+/** 剪贴板不可用(http 非安全上下文 / 权限被拒)时给用户一句可行动的提示,不再静默吞掉。 */
+export const COPY_FAILED_TOAST = "复制失败，请手动选中文本复制";
+
 // ─── 复制按钮（富文本 / 纯文本） ───────────────────────────────────────
 function CopyIconButton({
   getText,
@@ -160,6 +178,7 @@ function CopyIconButton({
   icon: React.ReactNode;
 }) {
   const [done, setDone] = useState(false);
+  const toast = useToast();
   return (
     <IconButton
       aria-label={label}
@@ -173,7 +192,7 @@ function CopyIconButton({
           setDone(true);
           setTimeout(() => setDone(false), 1500);
         } catch {
-          /* clipboard 不可用：静默 */
+          toast(COPY_FAILED_TOAST, "error");
         }
       }}
     >
@@ -185,6 +204,7 @@ function CopyIconButton({
 // ─── 请求ID 芯片 + 计费 meta ───────────────────────────────────────────
 function ReqIdChip({ traceId }: { traceId: string }) {
   const [copied, setCopied] = useState(false);
+  const toast = useToast();
   return (
     <button
       type="button"
@@ -196,10 +216,11 @@ function ReqIdChip({ traceId }: { traceId: string }) {
           setCopied(true);
           setTimeout(() => setCopied(false), 1500);
         } catch {
-          /* ignore */
+          toast(COPY_FAILED_TOAST, "error");
         }
       }}
-      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-caption text-faint transition-colors hover:text-muted"
+      // 触屏 44px 命中(a11y-B messages#2);桌面维持 20px 胶囊。
+      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-caption text-faint transition-colors hover:text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
     >
       {copied ? <Check size={11} /> : null}
       {copied ? "已复制" : `#${traceId.slice(0, 8)}`}
@@ -207,15 +228,25 @@ function ReqIdChip({ traceId }: { traceId: string }) {
   );
 }
 
-function MetaRow({ msg }: { msg: ChatMessage }) {
+/** 时间 · 积分 · token · 请求ID 同一行:token 用量不再孤零零悬在正文下方一个无单位的数字。 */
+function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
   const traceId = msg.usage?.traceId;
   const credits = msg.usage?.costCredits;
   const waived = msg.usage?.waived === true;
   // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
   const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
-  if (!traceId && !showCredits && !waived) return null;
+  const showTime = Boolean(msg.ts);
+  const showTokens = Boolean(tokenUsage && tokenUsage.totalTokens > 0);
+  if (!traceId && !showCredits && !waived && !showTime && !showTokens) return null;
   return (
-    <div className="mt-1.5 flex items-center gap-2 text-faint">
+    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-faint">
+      {showTime && (
+        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap">
+          <TooltipProvider>
+            <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+          </TooltipProvider>
+        </time>
+      )}
       {waived && (
         <Badge tone="success" aria-label="本轮已免单">
           <Wallet size={11} /> 已免单
@@ -226,6 +257,7 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
           <Wallet size={11} /> {groupDigits(credits!)} 积分
         </Badge>
       )}
+      {showTokens && <TokenUsageBadge usage={tokenUsage} />}
       {traceId && <ReqIdChip traceId={traceId} />}
     </div>
   );
@@ -268,7 +300,8 @@ function SpeakButton({ getText }: { getText: () => string }) {
       // 不在 UTF-16 代理对中间切块。块长只是浏览器队列的传输量子，不是总量上限。
       if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end -= 1;
       const utterance = new SpeechSynthesisUtterance(text.slice(start, end));
-      utterance.lang = "zh-CN";
+      // 英文回答用中文语音会逐字母拼读;按正文语言粗判(lib/chat/pure.speechLangFor)。
+      utterance.lang = speechLangFor(text);
       utterance.onend = () => speakFrom(end);
       utterance.onerror = () => {
         if (speechRun.current === run) setSpeaking(false);
@@ -291,26 +324,77 @@ function SpeakButton({ getText }: { getText: () => string }) {
   );
 }
 
+// ─── 触屏动作行折叠 ───────────────────────────────────────────────────────
+// 桌面:hover 露出整排动作(无预留高度以外的视觉噪音)。触屏没有 hover,原先整排 44px 图标
+// 对**每条**消息常显,长会话里 1 行正文配 3 行 chrome。现在触屏默认只露一个 44px「更多」开关,
+// 点开才展开整排;`defaultOpen` 让末轮末条助手回复(最常要复制/重新生成的那条)默认展开。
+// jsdom 无 CSS,开关与整排同时存在于 DOM,既有按钮断言不受影响。
+function TouchActionRow({
+  children,
+  defaultOpen = false,
+  className,
+}: {
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+}) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const open = userOpen ?? defaultOpen;
+  return (
+    <div className={cn("mt-1.5 flex items-center gap-0.5", className)}>
+      <IconButton
+        aria-label={open ? "收起操作" : "更多操作"}
+        title={open ? "收起操作" : "更多操作"}
+        aria-expanded={open}
+        size="sm"
+        shape="square"
+        className="hidden [@media(hover:none)]:inline-flex"
+        onClick={() => setUserOpen(!open)}
+      >
+        {open ? <X size={15} /> : <MoreHorizontal size={15} />}
+      </IconButton>
+      <div
+        className={cn(
+          "flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100",
+          open ? "[@media(hover:none)]:opacity-100" : "[@media(hover:none)]:hidden",
+        )}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 // ─── 动作条（copy 富/纯 + 朗读 + 重新生成 + 反馈） ─────────────────────────────
 function MessageActions({
   msg,
   cb,
   showRegen,
+  text,
+  minimal = false,
+  readOnly = false,
 }: {
   msg: ChatMessage;
   cb: CardCallbacks;
   showRegen: boolean;
+  /** 复制/朗读用的正文(缺省 msg.text;失败轮的合法部分回答传 errorPresentation.bodyText)。 */
+  text?: string;
+  /** 只留复制/纯文本/引用(已停止 / 失败但有部分回答的行),不出朗读/重新生成/反馈。 */
+  minimal?: boolean;
+  /** 只读面(教程回放 / 后台会话查看器):不出引用/重新生成/反馈这类会写回会话的动作。 */
+  readOnly?: boolean;
 }) {
+  const body = text ?? msg.text ?? "";
   return (
-    <div className="mt-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
-      <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
+    <TouchActionRow defaultOpen={showRegen && !readOnly}>
+      <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} />
       <CopyIconButton
-        getText={() => stripMarkdown(msg.text || "")}
+        getText={() => stripMarkdown(body)}
         label="复制纯文本"
         icon={<Type size={15} />}
       />
-      <SpeakButton getText={() => stripMarkdown(msg.text || "")} />
-      {cb.onQuote && (
+      {!minimal && <SpeakButton getText={() => stripMarkdown(body)} />}
+      {!readOnly && cb.onQuote && (
         <IconButton
           aria-label="引用"
           title="引用"
@@ -322,7 +406,7 @@ function MessageActions({
           <Quote size={15} />
         </IconButton>
       )}
-      {showRegen && cb.onRegenerate && (
+      {!minimal && !readOnly && showRegen && cb.onRegenerate && (
         <IconButton
           aria-label="重新生成"
           title="重新生成"
@@ -334,7 +418,7 @@ function MessageActions({
           <RotateCcw size={15} />
         </IconButton>
       )}
-      {cb.onFeedback && (
+      {!minimal && !readOnly && cb.onFeedback && (
         <IconButton
           aria-label="反馈"
           title="反馈"
@@ -346,17 +430,17 @@ function MessageActions({
           <MessageSquare size={15} />
         </IconButton>
       )}
-    </div>
+    </TouchActionRow>
   );
 }
 
 // ═══════════════ user ═══════════════
+// 只标注**过渡态**与失败:「已回复」是每条历史用户消息的终态,助手回复本身就是证据,再标一遍
+// 只剩噪音;「已读」同理。「已送达」保留 —— 它只在当前在飞轮出现,告诉用户服务端已受理。
 const USER_STATUS_LABEL: Record<string, string> = {
   sending: "发送中",
   queued: "排队中",
   sent: "已送达",
-  read: "已读",
-  replied: "已回复",
   error: "发送失败",
 };
 
@@ -373,7 +457,7 @@ function ReplyQuoteBlock({
       data-testid="message-reply-quote"
     >
       <div className="mb-0.5 text-caption font-medium">
-        {role === "assistant" ? "从简" : "你"}
+        {role === "assistant" ? BRAND.name : "你"}
       </div>
       <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5">
         {text}
@@ -389,14 +473,21 @@ export function UserCard({
   msg,
   cb,
   failurePresentedBelow = false,
+  readOnly = false,
 }: {
   msg: ChatMessage;
   cb?: CardCallbacks;
   /** 同一轮已有可见终态错误卡时，错误说明与重试出口由该卡独占。 */
   failurePresentedBelow?: boolean;
+  /** 只读面(教程回放 / 后台会话查看器):不出「编辑」「引用」这类会写回 Composer 的动作。 */
+  readOnly?: boolean;
 }) {
   const status = msg.status;
-  const showStatus = status && !(status === "error" && failurePresentedBelow);
+  // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
+  const statusLabel = status ? USER_STATUS_LABEL[status] : undefined;
+  const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
+  const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
+  const canEdit = !readOnly && Boolean(cb?.onEditResend);
   return (
     <div className="group flex flex-col items-end animate-in" data-testid="user-row">
       <div
@@ -418,7 +509,7 @@ export function UserCard({
             status === "error" ? "text-danger" : "text-faint",
           )}
         >
-          <span>{USER_STATUS_LABEL[status] ?? status}</span>
+          <span>{statusLabel}</span>
           {/* 发送失败 → 「重试」：复用原消息 payload（含附件引用）走既有发送入口原地重发。 */}
           {status === "error" && cb?.onRetrySend && (
             <button
@@ -431,19 +522,34 @@ export function UserCard({
           )}
         </div>
       )}
-      {status !== "sending" && status !== "queued" && status !== "error" && cb?.onQuote && (
-        <div className="mt-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
-          <IconButton
-            aria-label="引用"
-            title="引用"
-            size="sm"
-            shape="square"
-            className="[@media(hover:none)]:size-11"
-            onClick={() => cb.onQuote?.(msg)}
-          >
-            <Quote size={15} />
-          </IconButton>
-        </div>
+      {status !== "sending" && status !== "queued" && (
+        <TouchActionRow className="mt-1">
+          <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
+          {canQuote && (
+            <IconButton
+              aria-label="引用"
+              title="引用"
+              size="sm"
+              shape="square"
+              className="[@media(hover:none)]:size-11"
+              onClick={() => cb?.onQuote?.(msg)}
+            >
+              <Quote size={15} />
+            </IconButton>
+          )}
+          {canEdit && (
+            <IconButton
+              aria-label="编辑"
+              title="编辑并重新发送"
+              size="sm"
+              shape="square"
+              className="[@media(hover:none)]:size-11"
+              onClick={() => cb?.onEditResend?.(msg)}
+            >
+              <Pencil size={15} />
+            </IconButton>
+          )}
+        </TouchActionRow>
       )}
     </div>
   );
@@ -489,7 +595,17 @@ export function TurnStatusCard({
 const LONG_MARKDOWN_STEP = 128 * 1024;
 const LIVE_MARKDOWN_TAIL = 64 * 1024;
 
-function ProgressiveMarkdown({ text, live = false }: { text: string; live?: boolean }) {
+/** caret=流式光标内联在**正文最后一个文本块末尾**(Markdown 的 rehype 注入),不再作为块级容器之后
+ *  的兄弟节点单独占一行。分段(hasLiveGap)时只有尾段带光标。 */
+function ProgressiveMarkdown({
+  text,
+  live = false,
+  caret = false,
+}: {
+  text: string;
+  live?: boolean;
+  caret?: boolean;
+}) {
   const [visibleChars, setVisibleChars] = useState(LONG_MARKDOWN_STEP);
   const headEnd = Math.min(visibleChars, text.length);
   const hasLiveGap = live && text.length > headEnd + LIVE_MARKDOWN_TAIL;
@@ -497,7 +613,9 @@ function ProgressiveMarkdown({ text, live = false }: { text: string; live?: bool
   const primaryEnd = live && !hasLiveGap ? text.length : headEnd;
   return (
     <>
-      <Markdown signMedia live={live}>{text.slice(0, primaryEnd)}</Markdown>
+      <Markdown signMedia live={live} caret={caret && !hasLiveGap}>
+        {text.slice(0, primaryEnd)}
+      </Markdown>
       {(hasLiveGap || (!live && headEnd < text.length)) && (
         <button
           type="button"
@@ -509,7 +627,11 @@ function ProgressiveMarkdown({ text, live = false }: { text: string; live?: bool
             : "继续显示正文"}
         </button>
       )}
-      {hasLiveGap && <Markdown signMedia live>{text.slice(liveTailStart)}</Markdown>}
+      {hasLiveGap && (
+        <Markdown signMedia live caret={caret}>
+          {text.slice(liveTailStart)}
+        </Markdown>
+      )}
     </>
   );
 }
@@ -520,11 +642,14 @@ export function AssistantCard({
   ctx,
   cb,
   tokenUsage,
+  readOnly = false,
 }: {
   msg: ChatMessage;
   ctx: RenderCtx;
   cb: CardCallbacks;
   tokenUsage?: DisplayTokenUsage;
+  /** 只读面(教程回放 / 后台会话查看器):动作行只留复制/朗读,不出引用/重新生成/反馈。 */
+  readOnly?: boolean;
 }) {
   const live = isLive(msg, ctx);
   if (msg._hideUnpublishedFallback === true) return null;
@@ -538,7 +663,9 @@ export function AssistantCard({
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
   const sem = turnErrorSemantics(normalizedCode);
   const expectedError = sem.expected === true;
-  const errorTone = presentedError?.waived || expectedError ? "warning" : "danger";
+  const errorTone = problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
+    ? "warning"
+    : "danger";
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),
@@ -563,8 +690,8 @@ export function AssistantCard({
     retryEligible && msg._clientMessageId
       ? cb.resolveRetryTarget?.(msg._clientMessageId)
       : undefined;
-  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」引导。
-  // 模型选择器为非受控 DropdownMenu,无可编程打开入口(见报告),故只留文案不做次按钮。
+  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」。
+  // 有 onOpenModelPicker 时渲染可点按钮打开顶栏受控模型菜单，否则保留引导文案。
   const showSwitchModelHint =
     !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch";
   // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
@@ -622,6 +749,8 @@ export function AssistantCard({
   // genuine final assistant. Direct/single-card callers retain the old
   // `isLast` fallback when no turn-final annotation is available.
   const showRegenerate = isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast);
+  // MetaRow(时间 · 积分 · token · 请求ID)只在终态帧到达后出现(见 RenderCtx.inActiveTurn 注释)。
+  const metaVisible = !live && !(ctx.sending && ctx.inActiveTurn);
 
   return (
     <div className="group flex gap-4 animate-in" data-testid="assistant-row">
@@ -648,7 +777,8 @@ export function AssistantCard({
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
           <OptionsGroupProvider live={live}>
-            <ProgressiveMarkdown text={msg.text} live={live} />
+            {/* 流式光标由 Markdown(caret)内联注入到最后一个文本块末尾,不再落在正文下一行。 */}
+            <ProgressiveMarkdown text={msg.text} live={live} caret={live} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : hasError && presentedError?.bodyText ? (
@@ -659,9 +789,6 @@ export function AssistantCard({
         ) : live && !hasError && !ctx.activityInFooter ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
-        {live && msg.text && !hasError && (
-          <span className="caret-blink ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[3px] bg-fg" />
-        )}
 
         {/* 截断续写 banner */}
         {msg._truncated && !live && (
@@ -716,7 +843,7 @@ export function AssistantCard({
               </p>
               {presentedError.detail && (
                 <details className="mt-1.5 max-w-full">
-                  <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg">
+                  <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg [@media(hover:none)]:py-3.5">
                     查看请求信息
                   </summary>
                   <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
@@ -783,7 +910,13 @@ export function AssistantCard({
                     </Button>
                   ) : null}
                   {isLastTurn && showSwitchModelHint && (
-                    <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                    cb.onOpenModelPicker ? (
+                      <Button size="sm" variant="ghost" shape="pill" onClick={cb.onOpenModelPicker}>
+                        切换模型
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                    )
                   )}
                 </div>
               )}
@@ -800,18 +933,37 @@ export function AssistantCard({
           </output>
         )}
 
-        {tokenUsage && tokenUsage.totalTokens > 0 && (
+        {/* MetaRow 尚未出现(流式中 / 团队编排未终态)时 token 用量单独一行实时跳动;终态后并入
+            MetaRow 与时间·积分·请求ID 同一行,不再孤零零悬着一个无单位的数字。 */}
+        {!metaVisible && tokenUsage && tokenUsage.totalTokens > 0 && (
           <div className="mt-2">
             <TokenUsageBadge usage={tokenUsage} />
           </div>
         )}
         {/* 动作条 + meta（流式中不显示动作条，避免抖动） */}
         {!live && !hasError && msg.text && (
-          <MessageActions msg={msg} cb={cb} showRegen={showRegenerate && !hasError} />
+          <MessageActions
+            msg={msg}
+            cb={cb}
+            showRegen={showRegenerate && !hasError}
+            readOnly={readOnly}
+          />
+        )}
+        {/* 用户主动停止 / 失败但模型已产出合法部分回答:正文可见就必须可留存 —— 给精简动作行
+            (复制 / 复制纯文本 / 引用),不出朗读、重新生成、反馈(那些属于完整回答)。 */}
+        {!live && hasError && presentedError?.bodyText && (
+          <MessageActions
+            msg={msg}
+            cb={cb}
+            showRegen={false}
+            text={presentedError.bodyText}
+            minimal
+            readOnly={readOnly}
+          />
         )}
         {/* 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
             刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。 */}
-        {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
+        {metaVisible && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
         {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
             所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
             一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
@@ -864,12 +1016,18 @@ export const ThinkingCard = memo(
     // （不随 delta/角色切换闪烁）。
     const summary = live ? null : thinkingSummaryTitle(segments);
     const headline = live ? "思考过程" : summary ? `已思考 · ${summary}` : "已思考";
+    const bodyId = useId();
+    const hasBody = segments.length > 0;
     return (
       <div className="rounded-lg border border-border bg-surface/60 animate-in">
+        {/* 折叠开关暴露展开态(aria-expanded,与 DelegateProgressCard / RuntimeEventCard 一致);
+            触屏下头部加高到 44px 触控靶。 */}
         <button
           type="button"
           onClick={() => setUserCollapsed(!collapsed)}
-          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-body text-muted hover:bg-hover"
+          aria-expanded={!collapsed}
+          aria-controls={!collapsed && hasBody ? bodyId : undefined}
+          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-body text-muted hover:bg-hover [@media(hover:none)]:min-h-11"
         >
           <Brain size={14} className="shrink-0 text-faint" />
           <span className="min-w-0 truncate font-medium" title={headline}>
@@ -881,8 +1039,8 @@ export const ThinkingCard = memo(
             className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
           />
         </button>
-        {!collapsed && segments.length > 0 && (
-          <div className="border-t border-border px-3.5 py-2.5">
+        {!collapsed && hasBody && (
+          <div id={bodyId} className="border-t border-border px-3.5 py-2.5">
             {segments.map((seg, i) => (
               <div
                 key={i}
@@ -895,12 +1053,10 @@ export const ThinkingCard = memo(
                   i > 0 && "mt-2.5 border-t border-border/60 pt-2.5",
                 )}
               >
-                <ProgressiveMarkdown text={seg} live={live} />
+                {/* 光标只挂在最后一段的末尾文本块内(随 muted 色,bg-current)。 */}
+                <ProgressiveMarkdown text={seg} live={live} caret={live && i === segments.length - 1} />
               </div>
             ))}
-            {live && (
-              <span className="caret-blink ml-0.5 inline-block h-[1em] w-[2px] translate-y-[2px] bg-muted" />
-            )}
           </div>
         )}
       </div>
@@ -979,7 +1135,10 @@ export function GoalCard({ msg }: { msg: ChatMessage }) {
       {!msg.cleared && (
         <p className="mt-2 text-caption text-muted tabular-nums">
           Token {groupDigits(String(msg.tokensUsed ?? 0))}{msg.tokenBudget == null ? "" : ` / ${groupDigits(String(msg.tokenBudget))}`}
-          {typeof msg.timeUsedSeconds === "number" ? ` · ${msg.timeUsedSeconds}s` : ""}
+          {/* 用时走人类可读格式(1260s → 21 分钟),不再裸秒数。 */}
+          {typeof msg.timeUsedSeconds === "number" && formatDurationSeconds(msg.timeUsedSeconds)
+            ? ` · ${formatDurationSeconds(msg.timeUsedSeconds)}`
+            : ""}
         </p>
       )}
     </div>
@@ -1053,10 +1212,15 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
           className="border-t border-border px-3.5 py-2 text-meta text-muted"
         />
       )}
-      {/* 折叠态展示结果摘要（完成后）——与 AgentGroupCard 折叠页脚一致。 */}
+      {/* 折叠态展示结果摘要（完成后）——与 AgentGroupCard 折叠页脚一致;图标跟终态语义
+          (失败 → 红 X,不再对着「失败」徽记画绿勾)。 */}
       {collapsed && done && msg.summary && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
-          <Check size={13} className="mt-0.5 shrink-0 text-success" />
+          {msg._isError ? (
+            <X size={13} className="mt-0.5 shrink-0 text-danger" data-testid="delegate-summary-icon" />
+          ) : (
+            <Check size={13} className="mt-0.5 shrink-0 text-success" data-testid="delegate-summary-icon" />
+          )}
           <span className="line-clamp-2">
             {msg.summary.slice(0, 500)}{msg.summary.length > 500 ? "…" : ""}
           </span>

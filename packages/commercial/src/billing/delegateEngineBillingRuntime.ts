@@ -2,7 +2,6 @@ import { randomBytes } from 'node:crypto'
 
 import {
   DELEGATE_ENGINE_BILLING_SESSION_KEY_RE,
-  isGrokEngineModel,
   type DurableCodexBilling,
 } from '@openclaude/protocol'
 import type { Pool } from 'pg'
@@ -13,12 +12,21 @@ import {
   DELEGATE_ENGINE_BILLING_SETTLE_PATH,
   type DelegateEngineBillingRuntime,
 } from '../http/internalDelegateEngineBilling.js'
+import {
+  UserModelAuthzEpochMismatchError,
+  scopeFromAuthz,
+  type UserModelAuthzLoader,
+} from '../auth/userModelAuthz.js'
 import { composeMultiplier, getAgentCostMultiplier } from './agentMultiplier.js'
 import {
   DURABLE_CODEX_RECOVERY_VERSION,
   deriveEngineSessionId,
 } from './codexFinalizer.js'
 import { settleDurableCodexBilling } from './durableCodexBilling.js'
+import {
+  UnknownCapabilitySchemaError,
+  type ModelCatalogSnapshot,
+} from './modelCatalog.js'
 import { serializeBillingPricing } from './persistedBillingPricing.js'
 import type { PricingCache } from './pricing.js'
 import {
@@ -29,6 +37,7 @@ import {
   type PreCheckRedis,
 } from './preCheck.js'
 import { abortInflightJournal, startInflightJournal } from './proxyBilling.js'
+import type { AdvisorCodexAdmitRoute } from './advisorCodexAdmitRoute.js'
 
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
@@ -36,11 +45,23 @@ const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 const SESSION_ID_RE = DELEGATE_ENGINE_BILLING_SESSION_KEY_RE
 const PARENT_TURN_KEY_RE = /^[0-9a-f]{64}$/
 const MODEL_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
+const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
+const ADVISOR_AGENT_ID = 'advisor'
+
+export interface DelegateEngineCatalog {
+  assertFresh(): Promise<ModelCatalogSnapshot>
+}
 
 export interface DelegateEngineBillingRuntimeDeps {
   getPool: () => Pool
   preCheckRedis: PreCheckRedis
+  /**
+   * Settle/recovery compatibility only. New admit must not use this cache
+   * to decide authorization, engine match, or frozen price.
+   */
   pricing: PricingCache
+  catalog: DelegateEngineCatalog
+  loadUserModelAuthz: UserModelAuthzLoader
   newRequestId?: () => string
   preCheckWithCostFn?: typeof preCheckWithCost
   startInflightJournalFn?: typeof startInflightJournal
@@ -48,6 +69,18 @@ export interface DelegateEngineBillingRuntimeDeps {
   abortInflightJournalFn?: typeof abortInflightJournal
   releasePreCheckFn?: typeof releasePreCheck
   getAgentCostMultiplierFn?: typeof getAgentCostMultiplier
+  /**
+   * Advisor-consult only. Regular delegate admits must not call this.
+   * Selection is metadata + short-lived api_relay context; 179 catalog/authz/
+   * price/precheck/journal stay unchanged.
+   */
+  createAdvisorCodexRoute?: (args: {
+    containerId: number
+    userId: bigint
+    modelId: string
+    requestId: string
+  }) => Promise<AdvisorCodexAdmitRoute>
+  expireAdvisorCodexRoute?: (token: string) => Promise<void> | void
 }
 
 function requireString(
@@ -122,6 +155,19 @@ export function resolveDelegateBillingAttribution(
   }
 }
 
+async function loadFreshCatalogSnapshot(
+  catalog: DelegateEngineCatalog,
+): Promise<ModelCatalogSnapshot> {
+  try {
+    return await catalog.assertFresh()
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('DELEGATE_ENGINE_BILLING_')) {
+      throw err
+    }
+    throw new Error('DELEGATE_ENGINE_BILLING_CATALOG_UNAVAILABLE')
+  }
+}
+
 function usageFromBody(body: Record<string, unknown>): DurableCodexBilling['usage'] {
   const usage =
     body.usage && typeof body.usage === 'object' && !Array.isArray(body.usage)
@@ -156,15 +202,40 @@ export function createDelegateEngineBillingRuntime(
         const model = requireString(body, 'model', MODEL_ID_RE)
         const engineRaw = requireString(body, 'engine', /^(codex|grok)$/)
         const engine = engineRaw as 'codex' | 'grok'
-        if (engine === 'grok' && !isGrokEngineModel(model)) {
-          throw new Error('DELEGATE_ENGINE_BILLING_INVALID_MODEL')
-        }
         const agentId = requireString(body, 'agentId', AGENT_ID_RE)
         const delegateAgentId = requireString(body, 'delegateAgentId', AGENT_ID_RE)
         const sessionKey = requireString(body, 'sessionKey', SESSION_ID_RE)
         const parentSessionId = optionalString(body, 'parentSessionId', /^.{1,128}$/)
         const parentTurnKey = optionalString(body, 'parentTurnKey', PARENT_TURN_KEY_RE)
-        const basePricing = deps.pricing.get(model)
+        const snapshot = await loadFreshCatalogSnapshot(deps.catalog)
+        let authz
+        try {
+          authz = await deps.loadUserModelAuthz(userId, snapshot.securityEpoch)
+        } catch (err) {
+          if (err instanceof UserModelAuthzEpochMismatchError) {
+            throw new Error('DELEGATE_ENGINE_BILLING_EPOCH_MISMATCH')
+          }
+          throw new Error('DELEGATE_ENGINE_BILLING_AUTHZ_UNAVAILABLE')
+        }
+        const scope = scopeFromAuthz(userId, authz)
+        const canonical = snapshot.aliasToCanonical(model)
+        let descriptor
+        try {
+          descriptor = snapshot.resolve(canonical)
+        } catch (err) {
+          if (err instanceof UnknownCapabilitySchemaError) {
+            throw new Error('DELEGATE_ENGINE_BILLING_CAPABILITY_UNSUPPORTED')
+          }
+          throw err
+        }
+        if (!descriptor) throw new Error('DELEGATE_ENGINE_BILLING_MODEL_UNAVAILABLE')
+        if (descriptor.engine !== engine) {
+          throw new Error('DELEGATE_ENGINE_BILLING_INVALID_ENGINE')
+        }
+        if (!snapshot.canUseModel(scope, canonical)) {
+          throw new Error('DELEGATE_ENGINE_BILLING_NOT_AUTHORIZED')
+        }
+        const basePricing = snapshot.billingPricingFor(canonical)
         if (!basePricing) throw new Error('DELEGATE_ENGINE_BILLING_PRICING_UNAVAILABLE')
         const agentMul = await runAgentMul(deps.getPool(), agentId)
         const derivedPricing = {
@@ -183,12 +254,31 @@ export function createDelegateEngineBillingRuntime(
           throw err
         }
         const engineSessionId = deriveEngineSessionId(sessionKey)
+        const advisorConsult = delegateAgentId === ADVISOR_AGENT_ID && engine === 'codex'
+        let advisorRoute: AdvisorCodexAdmitRoute | undefined
+        if (advisorConsult) {
+          try {
+            advisorRoute = deps.createAdvisorCodexRoute
+              ? await deps.createAdvisorCodexRoute({
+                  containerId: identity.containerId,
+                  userId,
+                  modelId: canonical,
+                  requestId,
+                })
+              : { kind: 'unavailable', reason: 'selector_unwired' }
+          } catch {
+            await runReleasePreCheck(deps.preCheckRedis, precheck.reservation).catch(() => {})
+            throw new Error('DELEGATE_ENGINE_BILLING_ROUTE_UNAVAILABLE')
+          }
+        }
+        const advisorRouteToken =
+          advisorRoute?.kind === 'api_relay' ? advisorRoute.token : undefined
         try {
           const admitted = await runStartJournal(deps.getPool(), {
             requestId,
             userId,
             containerId: BigInt(identity.containerId),
-            model,
+            model: canonical,
             precheckCredits: precheck.maxCost,
             ctxJson: {
               agentId,
@@ -198,13 +288,27 @@ export function createDelegateEngineBillingRuntime(
               source: sourceForEngine(engine),
               durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
               billingPricing: serializeBillingPricing(derivedPricing),
+              // Nested so settle does not treat these as a bridge_signed stamp.
+              catalogGeneration: {
+                billingRevision: snapshot.billingRevision,
+                executionRevision: snapshot.executionRevision,
+                securityEpoch: snapshot.securityEpoch.toString(),
+              },
               engineSessionId,
+              ...(advisorRouteToken ? { advisorRouteToken } : {}),
+              ...(advisorRoute ? { advisorRouteKind: advisorRoute.kind } : {}),
             },
           })
           if (!admitted) throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
         } catch (err) {
           await runReleasePreCheck(deps.preCheckRedis, precheck.reservation).catch(() => {})
+          if (advisorRouteToken) {
+            await Promise.resolve(deps.expireAdvisorCodexRoute?.(advisorRouteToken)).catch(() => {})
+          }
           throw err
+        }
+        if (advisorConsult) {
+          return { requestId, engineSessionId, route: advisorRoute }
         }
         return { requestId, engineSessionId }
       }
@@ -263,6 +367,10 @@ export function createDelegateEngineBillingRuntime(
             ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits as DurableCodexBilling['rateLimits'] } : {}),
           },
         )
+        const settledRouteToken = journalString(journalRow.ctx, 'advisorRouteToken', ROUTE_TOKEN_RE)
+        if (settledRouteToken) {
+          await Promise.resolve(deps.expireAdvisorCodexRoute?.(settledRouteToken)).catch(() => {})
+        }
         return { settled: true }
       }
 
@@ -277,6 +385,10 @@ export function createDelegateEngineBillingRuntime(
           userId: String(identity.userId),
           requestId,
         }).catch(() => {})
+        const abandonedRouteToken = journalString(journalRow.ctx, 'advisorRouteToken', ROUTE_TOKEN_RE)
+        if (abandonedRouteToken) {
+          await Promise.resolve(deps.expireAdvisorCodexRoute?.(abandonedRouteToken)).catch(() => {})
+        }
         return { abandoned: true }
       }
 

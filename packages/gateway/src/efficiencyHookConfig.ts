@@ -13,7 +13,7 @@ import { resolveGuardMode, type GuardMode } from './agentEfficiencyGuard.js'
 export type HookProtocol = 'ccb' | 'cursor'
 
 /** Engine-side backstop (seconds). Our runner times out well below this. */
-export const EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC = 3
+export const EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC = 4
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`

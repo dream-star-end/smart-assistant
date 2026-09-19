@@ -91,7 +91,8 @@ function TagChip({
       aria-pressed={active}
       onClick={onClick}
       className={cn(
-        "rounded-full border px-2.5 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+        // 触屏下 chip 加高到 44px 触控靶(桌面保持紧凑)。
+        "rounded-full border px-2.5 py-1 text-meta outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3.5",
         active
           ? "border-accent/50 bg-accent-soft text-accent"
           : "border-border text-muted hover:border-accent/40 hover:text-fg",

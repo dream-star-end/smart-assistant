@@ -1,6 +1,7 @@
 import { AlertTriangle, RotateCcw, Sparkles, Wallet } from "lucide-react";
 import type { ReactNode } from "react";
 import type { AgentGatePhase } from "../hooks/useAgentGate";
+import { groupDigits } from "../lib/utils";
 import { Button, Spinner } from "./ui";
 
 /**
@@ -27,7 +28,8 @@ function Panel({
       <div className="mb-5 flex size-16 items-center justify-center rounded-xl2 bg-surface text-fg shadow-float">
         {icon}
       </div>
-      <h1 className="text-[22px] font-semibold tracking-tight text-fg">{title}</h1>
+      {/* App 已有页面级 sr-only h1,面板标题用 h2,一页只保留一个 h1(C-34)。 */}
+      <h2 className="text-[22px] font-semibold tracking-tight text-fg">{title}</h2>
       {desc && <p className="mt-2 max-w-md text-[14.5px] leading-relaxed text-muted">{desc}</p>}
       {children && <div className="mt-6 flex flex-col items-center gap-2">{children}</div>}
     </div>
@@ -97,7 +99,8 @@ export function AgentGate({
           title="余额不足"
           desc={
             phase.shortfall
-              ? `开通智能体所需积分不足，还差 ${phase.shortfall} 积分。充值后即可开通。`
+              ? // 顶栏余额是千分位「128,900」,这里的缺口也按同一格式,不再一处「12000」一处「12,000」(C-34)。
+                `开通智能体所需积分不足，还差 ${groupDigits(phase.shortfall)} 积分。充值后即可开通。`
               : "开通智能体所需积分不足，充值后即可开通。"
           }
         >

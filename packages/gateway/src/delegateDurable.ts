@@ -25,7 +25,37 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 3
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 4
+
+/**
+ * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
+ * process auditing. Before this, `sweep()` physically deleted the row at the
+ * 2h job TTL, so the ledger could never answer "what ran last week" — and the
+ * window was biased the wrong way, because rows with a stuck callback were the
+ * only ones sweep skipped. Env `OC_DELEGATE_LEDGER_RETENTION_DAYS` overrides.
+ */
+export const DELEGATE_LEDGER_RETENTION_MS = 7 * 24 * 60 * 60_000
+export const MIN_DELEGATE_LEDGER_RETENTION_MS = 24 * 60 * 60_000
+export const MAX_DELEGATE_LEDGER_RETENTION_MS = 90 * 24 * 60 * 60_000
+
+/**
+ * Row-count floor kept in addition to the time window ("取宽"): a retired row
+ * is pruned only when it is outside the retention window AND not among the
+ * newest N retired rows. Bounds nothing away from the 7d guarantee; it only
+ * keeps more history on a quiet container.
+ */
+export const DELEGATE_LEDGER_MIN_RETAINED_ROWS = 5_000
+
+export function resolveDelegateLedgerRetentionMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const days = Number.parseFloat(String(env.OC_DELEGATE_LEDGER_RETENTION_DAYS ?? ''))
+  if (!Number.isFinite(days) || days <= 0) return DELEGATE_LEDGER_RETENTION_MS
+  return Math.min(
+    MAX_DELEGATE_LEDGER_RETENTION_MS,
+    Math.max(MIN_DELEGATE_LEDGER_RETENTION_MS, Math.round(days * 24 * 60 * 60_000)),
+  )
+}
 
 export type DurableJobRecord = {
   id: string
@@ -64,6 +94,8 @@ export type DurableJobRecord = {
   terminalCommittedAt?: number
   /** Unix ms when lane A attempted an external write for this notifyId. */
   notifyAAttemptedAt?: number | null
+  /** OCV5-164: set when the TTL sweep retired the row (audit-only from then on). */
+  retiredAt?: number | null
 }
 
 const DDL_V1 = `
@@ -111,6 +143,25 @@ CREATE INDEX IF NOT EXISTS idx_delegate_jobs_active
   WHERE state IN ('queued','running','paused_for_cutover');
 `
 
+/**
+ * OCV5-164 v4. `retired_at` marks a row that the TTL sweep would previously
+ * have DELETEd. Retired rows are invisible to every runtime read (see the
+ * `retired_at IS NULL` guard on each statement below), so behaviour is
+ * unchanged; they exist only so the ledger can be audited for 7 days.
+ *
+ * The idempotency uniqueness must follow the same rule: a cron occurrence key
+ * whose row was retired has to be re-usable, exactly as it was when the row
+ * was physically deleted. Hence the unique index is rebuilt as partial.
+ */
+const DDL_V4 = `
+DROP INDEX IF EXISTS idx_delegate_jobs_idempotency;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegate_jobs_idempotency
+  ON delegate_jobs(idempotency_key)
+  WHERE idempotency_key IS NOT NULL AND retired_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_retired
+  ON delegate_jobs(retired_at) WHERE retired_at IS NOT NULL;
+`
+
 export function resolveDelegateJobsDbPath(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim()
   if (override) return override
@@ -139,6 +190,10 @@ export class DelegateDurableDb {
   private readonly listActiveStmt
   private readonly countActiveStmt
   private readonly deleteStmt
+  private readonly casRetireStmt
+  private readonly prunePastRetentionStmt
+  private readonly listRetiredStmt
+  private readonly countLedgerStmt
 
   constructor(dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true })
@@ -254,6 +309,7 @@ export class DelegateDurableDb {
         notify_claimed_until=@notify_claimed_until,
         terminal_committed_at=@terminal_committed_at
       WHERE job_id=@job_id
+        AND retired_at IS NULL
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
         AND (
@@ -265,6 +321,7 @@ export class DelegateDurableDb {
     this.casDeleteStmt = this.db.prepare(`
       DELETE FROM delegate_jobs
       WHERE job_id=@job_id
+        AND retired_at IS NULL
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
         AND (
@@ -280,6 +337,7 @@ export class DelegateDurableDb {
         last_activity_at=@now,
         updated_at=@now
       WHERE job_id=@job_id
+        AND retired_at IS NULL
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
         AND (
@@ -304,6 +362,7 @@ export class DelegateDurableDb {
         last_activity_at=@now,
         updated_at=@now
       WHERE job_id=@job_id
+        AND retired_at IS NULL
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
         AND (
@@ -324,6 +383,7 @@ export class DelegateDurableDb {
         last_activity_at=@now,
         updated_at=@now
       WHERE job_id=@job_id
+        AND retired_at IS NULL
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
         AND (
@@ -340,6 +400,7 @@ export class DelegateDurableDb {
         last_activity_at=@now,
         updated_at=@now
       WHERE job_id=@job_id
+        AND retired_at IS NULL
         AND state=@expected_state
         AND fencing_epoch=@expected_epoch
         AND (
@@ -350,18 +411,65 @@ export class DelegateDurableDb {
         AND notify_delivery_token=@delivery_token
       RETURNING *
     `)
-    this.getStmt = this.db.prepare('SELECT * FROM delegate_jobs WHERE job_id = ?')
-    this.getByIdemStmt = this.db.prepare(
-      'SELECT * FROM delegate_jobs WHERE idempotency_key = ? LIMIT 1',
+    // Every runtime read filters retired rows so the ledger is append-only for
+    // auditing while the live state machine sees exactly what it saw before.
+    this.getStmt = this.db.prepare(
+      'SELECT * FROM delegate_jobs WHERE job_id = ? AND retired_at IS NULL',
     )
-    this.listStmt = this.db.prepare('SELECT * FROM delegate_jobs')
+    this.getByIdemStmt = this.db.prepare(
+      'SELECT * FROM delegate_jobs WHERE idempotency_key = ? AND retired_at IS NULL LIMIT 1',
+    )
+    this.listStmt = this.db.prepare('SELECT * FROM delegate_jobs WHERE retired_at IS NULL')
     this.listActiveStmt = this.db.prepare(
-      `SELECT * FROM delegate_jobs WHERE state IN ('queued','running','paused_for_cutover')`,
+      `SELECT * FROM delegate_jobs
+        WHERE state IN ('queued','running','paused_for_cutover') AND retired_at IS NULL`,
     )
     this.countActiveStmt = this.db.prepare(
-      `SELECT COUNT(*) AS n FROM delegate_jobs WHERE state IN ('queued','running','paused_for_cutover')`,
+      `SELECT COUNT(*) AS n FROM delegate_jobs
+        WHERE state IN ('queued','running','paused_for_cutover') AND retired_at IS NULL`,
     )
     this.deleteStmt = this.db.prepare('DELETE FROM delegate_jobs WHERE job_id = ?')
+    /**
+     * OCV5-164 retire = the old TTL DELETE. Same fence predicate as casDelete
+     * so a racing writer still wins; the row simply stays on disk.
+     */
+    this.casRetireStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET retired_at=@now
+      WHERE job_id=@job_id
+        AND retired_at IS NULL
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+    `)
+    /**
+     * Time window OR newest-N floor ("取宽"): only rows failing both are
+     * dropped. COALESCE order mirrors what an auditor would call the row's
+     * settle time.
+     */
+    this.prunePastRetentionStmt = this.db.prepare(`
+      DELETE FROM delegate_jobs
+      WHERE retired_at IS NOT NULL
+        AND COALESCE(terminal_committed_at, updated_at, retired_at) < @cutoff
+        AND job_id NOT IN (
+          SELECT job_id FROM delegate_jobs
+           WHERE retired_at IS NOT NULL
+           ORDER BY COALESCE(terminal_committed_at, updated_at, retired_at) DESC
+           LIMIT @keep_rows
+        )
+    `)
+    this.listRetiredStmt = this.db.prepare(
+      `SELECT * FROM delegate_jobs WHERE retired_at IS NOT NULL
+        ORDER BY COALESCE(terminal_committed_at, updated_at, retired_at) DESC LIMIT ?`,
+    )
+    this.countLedgerStmt = this.db.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN retired_at IS NULL THEN 1 ELSE 0 END) AS live,
+              MIN(created_at) AS oldest
+         FROM delegate_jobs`,
+    )
   }
 
   private migrate(): void {
@@ -371,6 +479,7 @@ export class DelegateDurableDb {
       if (current < 1) this.db.exec(DDL_V1)
       if (current < 2) this.addNotifyDeliveryColumns()
       if (current < 3) this.addNotifyAAttemptedColumn()
+      if (current < 4) this.addRetiredAtColumn()
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
@@ -405,6 +514,19 @@ export class DelegateDurableDb {
     )
     if (existing.has('notify_a_attempted_at')) return
     this.db.exec('ALTER TABLE delegate_jobs ADD COLUMN notify_a_attempted_at INTEGER')
+  }
+
+  /** OCV5-164 v4: soft-retire marker + partial idempotency uniqueness. */
+  private addRetiredAtColumn(): void {
+    const existing = new Set(
+      (this.db.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    )
+    if (!existing.has('retired_at')) {
+      this.db.exec('ALTER TABLE delegate_jobs ADD COLUMN retired_at INTEGER')
+    }
+    this.db.exec(DDL_V4)
   }
 
   transaction<T>(fn: () => T): T {
@@ -576,6 +698,62 @@ export class DelegateDurableDb {
     return Number(row?.n ?? 0)
   }
 
+  /**
+   * OCV5-164 soft-retire, replacing the TTL DELETE. Returns false when the
+   * fence no longer matches, exactly like {@link casDelete}, so a concurrent
+   * writer still wins the row.
+   */
+  casRetire(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    now: number
+  }): boolean {
+    this.throwIfInjectedFailure()
+    const info = this.casRetireStmt.run({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      now: args.now,
+    })
+    return (info.changes ?? 0) > 0
+  }
+
+  /** Drop retired rows older than the retention window, keeping a newest-N floor. */
+  prunePastRetention(args: {
+    cutoff: number
+    keepRows?: number
+  }): number {
+    this.throwIfInjectedFailure()
+    const info = this.prunePastRetentionStmt.run({
+      cutoff: args.cutoff,
+      keep_rows: Math.max(0, args.keepRows ?? DELEGATE_LEDGER_MIN_RETAINED_ROWS),
+    })
+    return info.changes ?? 0
+  }
+
+  /** Audit-only read of retired history. Never feeds the state machine. */
+  loadRetired(limit = 1_000): DurableJobRecord[] {
+    return (this.listRetiredStmt.all(limit) as Record<string, unknown>[]).map(fromRow)
+  }
+
+  /** Audit/observability counters for the retention window. */
+  ledgerStats(): { total: number; live: number; retired: number; oldestCreatedAt: number | null } {
+    const row = this.countLedgerStmt.get() as
+      | { total?: number; live?: number; oldest?: number | null }
+      | undefined
+    const total = Number(row?.total ?? 0)
+    const live = Number(row?.live ?? 0)
+    return {
+      total,
+      live,
+      retired: Math.max(0, total - live),
+      oldestCreatedAt: row?.oldest == null ? null : Number(row.oldest),
+    }
+  }
+
   private throwIfInjectedFailure(): void {
     if (!this.failNextWrite) return
     this.failNextWrite = false
@@ -715,6 +893,7 @@ function fromRow(row: Record<string, unknown>): DurableJobRecord {
     notifyClaimedUntil: row.notify_claimed_until == null ? null : num(row.notify_claimed_until),
     terminalCommittedAt: row.terminal_committed_at == null ? undefined : num(row.terminal_committed_at),
     notifyAAttemptedAt: row.notify_a_attempted_at == null ? null : num(row.notify_a_attempted_at),
+    retiredAt: row.retired_at == null ? null : num(row.retired_at),
   }
 }
 

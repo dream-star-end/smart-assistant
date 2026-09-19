@@ -1,0 +1,2156 @@
+/**
+ * P5 会话渲染入口。
+ *
+ * MessageRenderer：按 role 分派单条 ChatMessage 到对应 Aurora 卡（tool 委托 ToolCardSlot）。
+ * 经 messageSignature 做 memo —— reducer 就地 mutation（同对象引用）下，React.memo 浅比较
+ * 会漏渲，故以「内容签名」为比较键：变才渲、不变则稳定（复刻现网 keyed-reconcile 防闪）。
+ *
+ * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
+ * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
+ */
+import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
+import {
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type {
+  ChatMessage,
+  LiveTurnTokenUsageSnapshot,
+} from "../lib/chat/model";
+import { UserUpwardPagingController } from "../lib/chat/tapePaging";
+import {
+  collectResolvedDispatchTurnIds,
+  HIDDEN_REVIEWER_AGENT_ID,
+  isRedundantRuntimeEnvelope,
+  isTurnStatusSuppressedByTape,
+  messageKind,
+  safeMessageSignature,
+} from "../lib/chat/render";
+import { isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
+import {
+  EAGER_MEDIA_TAIL_ITEMS,
+  EAGER_PAYLOAD_TAIL_ITEMS,
+  PAINT_ESTIMATE_PX,
+  PAINT_MIN_ITEMS,
+  computePaintRange,
+  createRowGeometryWarmup,
+  measureMountedRowHeight,
+  measuredRangePx,
+  paintWindowEnabled,
+  rowHeightEstimatePx,
+  selectPaintRange,
+} from "../lib/chat/timelinePaint";
+import {
+  BLANK_SAMPLE_INTERVAL_MS,
+  collectProbeInput,
+  createBlankDetector,
+  persistSnapshot,
+  readPersistedSnapshot,
+} from "../lib/chat/timelineBlankProbe";
+import { prefetchMarkdownImpl } from "./Markdown";
+import {
+  AssistantCard,
+  type CardCallbacks,
+  DelegateProgressCard,
+  GoalCard,
+  PlanCard,
+  SystemCard,
+  ThinkingCard,
+  TurnStatusCard,
+  UserCard,
+} from "./chat/cards";
+import { AgentGroupCard } from "./chat/AgentGroupCard";
+import { TimelineEagerMediaContext } from "./chat/timelineEager";
+import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
+import { TeamPanel } from "./chat/TeamPanel";
+import {
+  PermissionCard,
+  type PermissionRespond,
+  isAwaitingPermissionPrompt,
+} from "./chat/PermissionCard";
+import { ToolCardSlot } from "./chat/toolCardSlot";
+import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
+import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
+import {
+  captureVisibleVirtualRowAnchor,
+  correctedScrollTop,
+  correctToVisibleVirtualRowAnchor,
+  loadedArchivedMetrics,
+  type VisibleVirtualRowAnchor,
+} from "./chat/archivePaging";
+import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
+import { MessageBoundary } from "./MessageBoundary";
+import { asStr, resolveToolInput } from "./tool/format";
+import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
+import { cn } from "../lib/utils";
+import { findMatches, stepMatch, timelineMessageKey, type FindMatch } from "./chat/findInSession";
+import {
+  delegateTokenUsage,
+  displayCallTokenUsage,
+  type DisplayTokenUsage,
+  groupedCallTokenUsage,
+  tokenUsageSignature,
+  tokenUsageSnapshot,
+} from "./chat/tokenUsage";
+
+function FirstTextPaintCommitProbe({ message, cb }: { message: ChatMessage; cb: CardCallbacks }) {
+  const probe = message._firstTextPaintProbe;
+  const reportedRef = useRef(new Set<string>());
+  useLayoutEffect(() => {
+    if (!probe || !cb.onFirstTextPaint || reportedRef.current.has(probe.traceId)) return;
+    if (
+      typeof requestAnimationFrame !== "function" ||
+      typeof cancelAnimationFrame !== "function"
+    ) return;
+    let first = 0;
+    let second = 0;
+    let cancelled = false;
+    first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => {
+        if (cancelled) return;
+        reportedRef.current.add(probe.traceId);
+        cb.onFirstTextPaint?.({
+          traceId: probe.traceId,
+          sessionId: probe.sessionId,
+          clientMessageId: probe.clientMessageId,
+          latencyMs: Math.max(0, Date.now() - probe.startedAt),
+          backgroundAtFrame: probe.backgroundAtFrame,
+        });
+        delete message._firstTextPaintProbe;
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(first);
+      if (second) cancelAnimationFrame(second);
+    };
+  }, [probe, cb]);
+  return null;
+}
+
+type RendererProps = {
+  message: ChatMessage;
+  /** 渲染签名（变更触发重渲；不变则 memo 跳过——防闪核心）。*/
+  sig: string;
+  isLast: boolean;
+  sending: boolean;
+  /** 是否属于「当前活跃段」(最后一条 user 消息之后)。判定收口在 chat/turnSegment.ts,
+   *  与 PinnedTaskTracker 的任务源提取共用同一函数——决定 TodoWrite/plan 抑制还是渲染只读卡。*/
+  inActiveTurn: boolean;
+  /** 当前活跃会话的本轮活动快照（AssistantCard 流式空正文分支据此渲染阶段反馈）。透传，
+   *  不进 memo 比较键——TurnActivity 自带 1s tick，无需靠父级重渲驱动秒数。 */
+  turnActivity?: TurnActivityInfo | null;
+  /** 本轮活动状态由稳定的 MessageList footer 独占，避免行类型切换时重复挂卸。 */
+  activityInFooter?: boolean;
+  /** 服务端历史代次；隔离旧请求与同 id 的新时间线。 */
+  historyGeneration?: number | string;
+  /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
+  processPaging?: UserUpwardPagingController;
+  /** Exact call usage for this card, or the final assistant's turn fallback. */
+  tokenUsage?: DisplayTokenUsage;
+  /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
+   *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
+   *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
+  delegateCost?: string;
+  /** 该行是否为「所在轮末条 assistant 正文」(评价反馈行只挂末条,轮内中间回复不出)。
+   *  值随后续消息追加而翻转,**已编进 sig head**(messageSignature 的 turnFinalAssistant)→
+   *  由 a.sig===b.sig 覆盖翻转重渲,无需单列进 memo 比较器。*/
+  turnFinalAssistant?: boolean;
+  cb: CardCallbacks;
+  onRespondPermission: PermissionRespond;
+  /** 只读会话查看：禁止权限/问答卡触发任何写动作。 */
+  readOnly?: boolean;
+  /** 同一可见轮已有错误卡/状态卡，用户行不再重复展示失败标签和重试。 */
+  failurePresentedBelow?: boolean;
+  /** 初始尾部 locator：跳过 600px IO，进会话即兑付正文。 */
+  eagerPayload?: boolean;
+};
+
+export const MessageRenderer = memo(
+  function MessageRenderer({
+    message,
+    sig,
+    isLast,
+    sending,
+    inActiveTurn,
+    turnActivity,
+    activityInFooter,
+    historyGeneration,
+    processPaging,
+    tokenUsage,
+    delegateCost,
+    turnFinalAssistant,
+    cb,
+    onRespondPermission,
+    readOnly = false,
+    failurePresentedBelow = false,
+    eagerPayload = false,
+  }: RendererProps) {
+    const ctx = {
+      isLast,
+      sending,
+      turnActivity,
+      inActiveTurn,
+      turnFinalAssistant,
+      activityInFooter,
+    };
+    // Runtime envelopes and hidden reconciliation evidence are audit/transport
+    // data, not conversation cards. Their genuine thinking/tool/assistant
+    // counterparts are separate equal-rank timeline records.
+    if (message._timelineAuxiliary || message.role === "runtime-event") return null;
+    if (isRedundantRuntimeEnvelope(message)) return null;
+    if (message._payloadDeferred) {
+      return (
+        <DeferredTapeRecordCard
+          message={message}
+          isLast={isLast}
+          sending={sending}
+          inActiveTurn={inActiveTurn}
+          turnActivity={turnActivity}
+          activityInFooter={activityInFooter}
+          historyGeneration={historyGeneration}
+          processPaging={processPaging}
+          tokenUsage={tokenUsage}
+          turnFinalAssistant={turnFinalAssistant}
+          cb={cb}
+          onRespondPermission={onRespondPermission}
+          readOnly={readOnly}
+          failurePresentedBelow={failurePresentedBelow}
+          eagerPayload={eagerPayload}
+        />
+      );
+    }
+    // 过程控制不是 Agent 内容，只负责真实记录的惰性分页。
+    if (message._turnTapeProcess) {
+      return null;
+    }
+    if (message._turnStatusRecord) {
+      return <TurnStatusCard msg={message} cb={cb} currentTurn={inActiveTurn} />;
+    }
+    switch (messageKind(message)) {
+      case "user":
+        return <UserCard msg={message} cb={cb} failurePresentedBelow={failurePresentedBelow} />;
+      case "assistant":
+        return (
+          <>
+            <FirstTextPaintCommitProbe message={message} cb={cb} />
+            <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />
+          </>
+        );
+      case "thinking":
+        // 单条兜底路径(直接经 MessageRenderer,如测试/非列表场景)。列表内的连续 thinking
+        // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。
+        return (
+          <TapeBackedCard>
+            <ThinkingCard
+              msgs={[message]}
+              sig={sig}
+              ctx={ctx}
+              tokenUsage={tokenUsage}
+            />
+          </TapeBackedCard>
+        );
+      case "tool": {
+        // 模型原生 imagegen(codex:imageGeneration)running → 生成占位卡(需求 C，粒子特效框);
+        // 完成/失败回落 ToolCardSlot。running 判定语义与 bodies.tsx 一致(按 tool._completed/error
+        // + input.status,不 import bodies 内部),保证两处对同一态的判断不漂移。
+        if (message.toolName === "codex:imageGeneration") {
+          const input = resolveToolInput(message);
+          const failedStatus = /^(failed|error)$/i.test(asStr(input?.status)) || !!message.error;
+          const running = !message._completed && !message.error && !failedStatus;
+          if (running) {
+            // native imagegen 不带目标比例 → 默认 1:1(规格 §36);startedAt = 工具行 mint 时刻。
+            return <GeneratingPlaceholderCard aspect={1} status="running" startedAt={message.ts} />;
+          }
+        }
+        // 任务列表(TodoWrite):当前活跃段且本轮进行中 → 由钉在输入框上方的 PinnedTaskTracker
+        // (HUD)接管,inline 卡抑制避免上下重复;历史段(或 turn 已结束、HUD 隐藏后)渲染
+        // 既有 TodoWrite 只读紧凑卡(含步骤与完成状态),翻旧会话仍能看到当时的计划。
+        if (message.toolName === "TodoWrite") {
+          if (inActiveTurn && sending) return null;
+          return <ToolCardSlot message={message} tokenUsage={tokenUsage} />;
+        }
+        return <ToolCardSlot message={message} tokenUsage={tokenUsage} />;
+      }
+      case "plan":
+        // structured plan steps:当前活跃段且本轮进行中 → 统一进 composer 上方的
+        // PinnedTaskTracker,inline 抑制防同一计划上下重复两张卡;历史段渲染 PlanCard
+        // 只读卡(含步骤与状态)。text-only plan(无 steps)恒走 inline 兜底。
+        if ((message.steps?.length ?? 0) > 0 && inActiveTurn && sending) return null;
+        return (
+          <TapeBackedCard>
+            <PlanCard msg={message} tokenUsage={tokenUsage} />
+            <ExactTapeRecordDisclosure messages={[message]} label="计划" />
+          </TapeBackedCard>
+        );
+      case "goal":
+        return (
+          <TapeBackedCard>
+            <GoalCard msg={message} />
+            <ExactTapeRecordDisclosure messages={[message]} label="目标" />
+          </TapeBackedCard>
+        );
+      case "permission": {
+        // INC-20260904-STOP-LEAVES-PERMISSION-PENDING (fix C):
+        // A permission card owned by a master automatic-recovery turn
+        // (`m-recover-*`) may arrive while this tab is NOT `sending` — the
+        // recovery was not adopted locally, so `_sendingInFlight` stayed false
+        // even though the engine is genuinely blocked waiting on the answer.
+        // Treat such an unresolved, unexpired card as live so the question
+        // dialog auto-opens instead of silently sitting in the timeline.
+        const recoveryOwned = isRecoveryTurnClientMessageId(message._turnOwnerId);
+        const live =
+          !readOnly &&
+          inActiveTurn &&
+          (sending || (recoveryOwned && isAwaitingPermissionPrompt(message)));
+        return (
+          <PermissionCard
+            msg={message}
+            onRespond={onRespondPermission}
+            readOnly={readOnly}
+            livePrompt={live}
+          />
+        );
+      }
+      case "agent-group":
+        return <AgentGroupCard msg={message} delegateCost={delegateCost} />;
+      case "delegate-progress":
+        return <DelegateProgressCard msg={message} />;
+      case "system":
+        return <SystemCard msg={message} />;
+      default:
+        // Immutable tape rows must remain visible even when a newer engine
+        // introduces a role this web build does not yet understand. Render
+        // the exact raw record instead of silently dropping the event.
+        return message._timelineRecord === true || message._turnTapeId
+          ? <RuntimeEventCard message={message} />
+          : null;
+    }
+  },
+  (a, b) =>
+    a.sig === b.sig &&
+    // 段归属变化(新 user 消息推进边界)不体现在 sig 里,必须单独参与比较,
+    // 否则上一轮的 TodoWrite/plan 卡在跨轮时不会从"抑制"切到"只读卡"。
+    a.inActiveTurn === b.inActiveTurn &&
+    a.tokenUsage?.totalTokens === b.tokenUsage?.totalTokens &&
+    // 债D 委派成本来自别的行(助手行 usage.delegates),不进 message sig,单列比较,
+    // 否则成本在 agent-group 完成后才到达时 memo 会跳过重渲、单卡不显示「N 积分」。
+    a.delegateCost === b.delegateCost &&
+    a.activityInFooter === b.activityInFooter &&
+    a.historyGeneration === b.historyGeneration &&
+    a.processPaging === b.processPaging &&
+    a.readOnly === b.readOnly &&
+    a.failurePresentedBelow === b.failurePresentedBelow &&
+    a.eagerPayload === b.eagerPayload &&
+    a.cb === b.cb &&
+    a.onRespondPermission === b.onRespondPermission,
+);
+
+const RUNTIME_TEXT_STEP = 32 * 1024;
+
+function TapeBackedCard({ children }: { children: ReactNode }) {
+  return <div className="space-y-1">{children}</div>;
+}
+
+/** Readable cards retain their pre-direct-timeline UX, while the immutable
+ * source remains reachable byte-for-byte instead of being replaced by the
+ * formatted view. Serialization and mounting happen only after the click. */
+function ExactTapeRecordDisclosure({
+  messages,
+  label,
+}: {
+  messages: ChatMessage[];
+  label: string;
+}) {
+  const exactMessages = messages.filter((message) => !!message._turnTapeId);
+  const [open, setOpen] = useState(false);
+  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
+  if (exactMessages.length === 0) return null;
+
+  const raw = exactMessages.length === 1
+    ? exactMessages[0]._eventHistory ?? exactMessages[0]
+    : exactMessages.map((message) => message._eventHistory ?? message);
+  const serialized = open ? JSON.stringify(raw, null, 2) ?? String(raw) : "";
+
+  return (
+    <div className="px-1">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="text-caption text-faint hover:text-muted"
+      >
+        {open ? `收起原始${label}记录` : `查看原始${label}记录`}
+      </button>
+      {open && (
+        <div className="mt-1 rounded-md border border-border bg-surface px-3 py-2">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+            {serialized.slice(0, visibleChars)}
+          </pre>
+          {visibleChars < serialized.length && (
+            <button
+              type="button"
+              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+            >
+              继续显示原始记录
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Every persisted runtime event remains inspectable. The JSON body is
+ * progressively mounted so a multi-megabyte event never blocks a frame. */
+function RuntimeEventCard({ message }: { message: ChatMessage }) {
+  const raw = message._runtimeEvent ?? message;
+  const event = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  const eventLabel = [event.type, event.subtype].filter((part) => typeof part === "string").join(" · ");
+  const label = eventLabel || (message.role === "runtime-event"
+    ? "运行事件"
+    : `原始 Agent 记录 · ${message.role || "unknown"}`);
+  const [open, setOpen] = useState(false);
+  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
+  const serialized = open ? JSON.stringify(raw, null, 2) : "";
+  return (
+    <div className="overflow-hidden rounded-lg border border-border bg-surface animate-in">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-meta hover:bg-hover"
+      >
+        <span className="size-1.5 shrink-0 rounded-full bg-faint" />
+        <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
+        {message._runtimeSource && <span className="shrink-0 text-caption text-faint">{message._runtimeSource}</span>}
+        <span className="text-faint">{open ? "收起" : "查看原始记录"}</span>
+      </button>
+      {open && (
+        <div className="border-t border-border px-3.5 py-2.5">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+            {serialized.slice(0, visibleChars)}
+          </pre>
+          {visibleChars < serialized.length && (
+            <button
+              type="button"
+              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg"
+            >
+              继续显示原始记录
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DeferredTapeRecordCard({
+  message,
+  isLast,
+  sending,
+  inActiveTurn,
+  turnActivity,
+  activityInFooter,
+  historyGeneration,
+  processPaging,
+  tokenUsage,
+  cb,
+  onRespondPermission,
+  readOnly,
+  turnFinalAssistant,
+  failurePresentedBelow,
+  eagerPayload = false,
+}: Omit<RendererProps, "sig" | "delegateCost">) {
+  const ref = useRef<HTMLDivElement>(null);
+  const isUserPayload = message._userPayloadDeferred === true;
+  const payloadId = isUserPayload ? message._userPayloadId ?? message.id : message.id;
+  const payloadSha256 = message._payloadSha256;
+  const tapeId = message._turnTapeId;
+  const recordOrdinal = message._recordOrdinal;
+  const initialExpectation = {
+    recordId: payloadId,
+    role: message.role,
+    ...(payloadSha256 ? { contentSha256: payloadSha256 } : {}),
+  };
+  const [records, setRecords] = useState<ChatMessage[] | null>(() => {
+    if (isUserPayload) {
+      return cb.onPeekUserMessagePayload?.(payloadId, initialExpectation) ?? null;
+    }
+    if (tapeId && typeof recordOrdinal === "number") {
+      return cb.onPeekTapeRecordPayload?.(tapeId, recordOrdinal, initialExpectation) ?? null;
+    }
+    return null;
+  });
+  const started = useRef(records !== null);
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const [failed, setFailed] = useState(false);
+  const load = useCallback(async () => {
+    if (started.current) return;
+    const expected = {
+      recordId: payloadId,
+      role: message.role,
+      ...(payloadSha256 ? { contentSha256: payloadSha256 } : {}),
+    };
+    const controller = new AbortController();
+    let request: Promise<ChatMessage[] | null> | null = null;
+    if (isUserPayload) {
+      if (cb.onFetchUserMessagePayload) {
+        request = cb.onFetchUserMessagePayload(payloadId, expected, controller.signal);
+      }
+    } else {
+      if (cb.onFetchTapeRecordPayload && tapeId && typeof recordOrdinal === "number") {
+        request = cb.onFetchTapeRecordPayload(tapeId, recordOrdinal, expected, controller.signal);
+      }
+    }
+    if (!request) {
+      setFailed(true);
+      return;
+    }
+    started.current = true;
+    requestAbortRef.current = controller;
+    setFailed(false);
+    let loaded: ChatMessage[] | null = null;
+    try {
+      loaded = await request;
+    } catch {
+      loaded = null;
+    }
+    if (requestAbortRef.current === controller) requestAbortRef.current = null;
+    if (controller.signal.aborted) return;
+    if (!loaded) {
+      started.current = false;
+      setFailed(true);
+      return;
+    }
+    setRecords(loaded);
+  }, [
+    cb.onFetchTapeRecordPayload,
+    cb.onFetchUserMessagePayload,
+    isUserPayload,
+    message.role,
+    payloadId,
+    payloadSha256,
+    recordOrdinal,
+    tapeId,
+  ]);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const cancel = () => {
+      const controller = requestAbortRef.current;
+      if (!controller) return;
+      requestAbortRef.current = null;
+      started.current = false;
+      controller.abort();
+    };
+    if (eagerPayload || typeof IntersectionObserver === "undefined") {
+      void load();
+      return cancel;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          void load();
+        }
+      },
+      { rootMargin: "600px 0px" },
+    );
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      cancel();
+    };
+  }, [load, eagerPayload]);
+
+  if (records) {
+    return (
+      <div className="space-y-3">
+        {records.map((record, index) => {
+          // Payload bytes are immutable, but billing/status overlays on the
+          // small locator can advance after the first viewport load. Re-merge
+          // them on every locator render so late cost/waiver/reply state stays
+          // visible without downloading the immutable body again.
+          const currentUsage = record.id === message.id && message.usage
+            ? { ...(record.usage ?? {}), ...message.usage }
+            : record.usage;
+          const hydratedRecord: ChatMessage = isUserPayload
+            ? {
+                ...record,
+                // Keep UI actions bound to the current dispatch row; the
+                // immutable fetch key remains explicit and survives reload.
+                id: message.id,
+                _userPayloadId: message._userPayloadId ?? message.id,
+                _source: "server",
+                status: message.status ?? record.status,
+                ...(currentUsage ? { usage: currentUsage } : {}),
+                _payloadDeferred: undefined,
+                _userPayloadDeferred: undefined,
+                _payloadBytes: undefined,
+                _payloadSha256: undefined,
+                _seq: message._seq,
+                _orderSeq: message._orderSeq,
+                _timelineRecord: message._timelineRecord,
+                _timelineUnitKey: message._timelineUnitKey,
+                _timelineLogicalOrdinal: message._timelineLogicalOrdinal,
+                _historyPageLoadedFrom: message._historyPageLoadedFrom,
+                _historyPageKey: message._historyPageKey,
+                _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+                _routing: record._routing ?? message._routing,
+                _sendAttempt: message._sendAttempt ?? record._sendAttempt,
+                _deferredRetryEligible: undefined,
+              }
+            : {
+                ...record,
+                ...(currentUsage ? { usage: currentUsage } : {}),
+                _turnTapeId: message._turnTapeId,
+                _turnTapeSha256: message._turnTapeSha256,
+                _turnTapeOrdinal: message._recordOrdinal,
+                _recordOrdinal: message._recordOrdinal,
+                _turnTapeComplete: true,
+                _turnTapeProcessLoadedFrom: message._turnTapeProcessLoadedFrom,
+                _seq: message._seq,
+                _orderSeq: message._orderSeq,
+                _timelineRecord: message._timelineRecord,
+                _timelineUnitKey: `${message._timelineUnitKey ?? message.id}:logical:${index}`,
+                _timelineLogicalOrdinal: index,
+                _historyPageLoadedFrom: message._historyPageLoadedFrom,
+                _historyPageKey: message._historyPageKey,
+                _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+              };
+          const final = isLast && index === records.length - 1;
+          const recordIsFinalAssistant = turnFinalAssistant === true &&
+            hydratedRecord.role === "assistant" && index === records.length - 1;
+          const recordSig = safeMessageSignature(hydratedRecord, {
+            isLast: final,
+            sending,
+            turnFinalAssistant: recordIsFinalAssistant,
+          });
+          return (
+            <MessageRenderer
+              key={hydratedRecord.id}
+              message={hydratedRecord}
+              sig={recordSig}
+              isLast={final}
+              sending={sending}
+              inActiveTurn={inActiveTurn}
+              turnActivity={turnActivity}
+              activityInFooter={activityInFooter}
+              historyGeneration={historyGeneration}
+              processPaging={processPaging}
+              tokenUsage={tokenUsage}
+              turnFinalAssistant={recordIsFinalAssistant}
+              cb={cb}
+              onRespondPermission={onRespondPermission}
+              readOnly={readOnly}
+              failurePresentedBelow={failurePresentedBelow}
+            />
+          );
+        })}
+      </div>
+    );
+  }
+  return (
+    <div ref={ref} className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-xs text-muted">
+      {failed ? (
+        <button type="button" onClick={() => void load()} className="text-danger hover:underline">
+          {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
+        </button>
+      ) : (
+        <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
+      )}
+    </div>
+  );
+}
+
+/** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队",
+ *  或"连续多个 role=thinking 行合并成的单张多段思考卡"。
+ *  delegateCost / delegateCosts = 债D per-delegate 成本(见 coalesceTeam)。 */
+/**
+ * Measured row heights, bucketed per session. Row keys are timeline unit keys
+ * (unique per record), so a bucket survives leaving and re-entering a session:
+ * the first scroll-up after switching back no longer re-lays every row from
+ * the 200px estimate to its real height — that per-row growth above the
+ * viewport is the "snaps back a little on every row" feel. Bounded so long
+ * sessions cannot pin memory; eviction is oldest-session-first.
+ */
+const ROW_HEIGHT_BUCKETS_MAX = 12;
+const rowHeightBuckets = new Map<string, Map<string, number>>();
+function rowHeightBucket(sessionId: string | undefined): Map<string, number> {
+  const id = sessionId ?? "";
+  const existing = rowHeightBuckets.get(id);
+  if (existing) {
+    // Refresh recency.
+    rowHeightBuckets.delete(id);
+    rowHeightBuckets.set(id, existing);
+    return existing;
+  }
+  const created = new Map<string, number>();
+  rowHeightBuckets.set(id, created);
+  while (rowHeightBuckets.size > ROW_HEIGHT_BUCKETS_MAX) {
+    const oldest = rowHeightBuckets.keys().next().value;
+    if (oldest === undefined) break;
+    rowHeightBuckets.delete(oldest);
+  }
+  return created;
+}
+
+type RenderItem =
+  | {
+      kind: "single";
+      m: ChatMessage;
+      isLast: boolean;
+      idx: number;
+      delegateCost?: string;
+      tokenUsage?: DisplayTokenUsage;
+    }
+  | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> }
+  | {
+      kind: "thinking";
+      members: ChatMessage[];
+      sig: string;
+      isLast: boolean;
+      idx: number;
+      tokenUsage?: DisplayTokenUsage;
+    };
+
+function tapeRenderPageKey(message: ChatMessage | undefined): string {
+  if (!message) return "";
+  if (message._historyPageKey) return message._historyPageKey;
+  if (message._turnTapeProcessPageKey) return message._turnTapeProcessPageKey;
+  // Rows cached by the immediately preceding build do not yet carry a cursor
+  // page key. Derive a stable physical-ordinal bucket so an already-open long
+  // session becomes virtualized immediately after upgrade; this is only a UI
+  // render identity and does not alter, summarize or discard any record.
+  if (message._turnTapeProcessLoadedFrom) {
+    const ordinal = typeof message._turnTapeOrdinal === "number"
+      ? message._turnTapeOrdinal
+      : message._recordOrdinal;
+    if (typeof ordinal === "number" && Number.isFinite(ordinal)) {
+      return `${message._turnTapeProcessLoadedFrom}::legacy-bucket:${Math.floor(ordinal / 200)}`;
+    }
+  }
+  return "";
+}
+
+/**
+ * 把「队长**同一并行批次**委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个
+ * 退化回 AgentGroupCard)。团队 sig = 各成员 messageSignature 拼接(任一成员变 → 面板重渲,防闪)。
+ *
+ * **按 (turn 锚点, 叙事阶段) 归组**(2026-07-07,boss 时序反直觉反馈):
+ *   - turn 锚点 = 其前最近一条 user 消息下标(与 turnSegment 同一"轮"定义,user 行客户端
+ *     权威、server 从不重写/重排,最稳定)。
+ *   - 叙事阶段 = 同 turn 内被**队长 assistant 叙事文本行**(非空 text)切开的段序号。聚天线
+ *     只允许"同时并行"的委派共面板;队长叙事之后才启动的阶段(如 hidden-reviewer 审查)
+ *     属于新阶段 → **按时间顺序独立出现在叙事之后**,绝不吸回上方旧面板(旧行为把审查卡
+ *     塞回面板,造成"上面又动了/会话早就结束了"的错觉)。
+ *   - 隐藏审查员(hidden-reviewer)卡**永不入面板**:它语义上是编排阶段而非并行队员,恒走
+ *     单卡按时序渲染。
+ *   - 只有 assistant 叙事行断组;工具行/thinking/server-authored 骨架混排**不隔断**——保留
+ *     turn 锚点方案修掉的"混排劈裂面板"抗性(这是当年放弃纯相邻启发式的原因,勿回退)。
+ *
+ * 锚点/阶段用**完整 messages**(非仅渲染切片)计算:切片起点可能落在某轮中段,靠全量数组
+ * 才能找到该轮真正的边界。面板渲染在该批次**首个** agent-group 的位置,后续同批成员被吸收;
+ * 夹在成员之间的非 agent-group 行仍按各自位置渲染(可能落到面板之后,属可接受的次序取舍)。
+ */
+function coalesceTeam(
+  messages: ChatMessage[],
+  start: number,
+  sending: boolean,
+  liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot },
+): RenderItem[] {
+  const total = messages.length;
+  const slice = messages.slice(start);
+  // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1;
+  // stageOf[i] = 该行在本 turn 内的叙事阶段序号(assistant 非空文本行使**后续**行阶段 +1,
+  // user 行重置为 0)。
+  const anchorOf: number[] = new Array(total);
+  const stageOf: number[] = new Array(total);
+  let lastUser = -1;
+  let stage = 0;
+  for (let i = 0; i < total; i++) {
+    const row = messages[i];
+    if (row?.role === "user") {
+      lastUser = i;
+      stage = 0;
+    }
+    anchorOf[i] = lastUser;
+    stageOf[i] = stage;
+    if (row?.role === "assistant" && typeof row.text === "string" && row.text.trim().length > 0) {
+      stage++;
+    }
+  }
+  // A card only displays the model call that actually produced it. The
+  // turn-wide snapshot remains a fallback for the final assistant row; it is
+  // never projected onto every tool/thinking card.
+  let liveFallbackIdx = -1;
+  if (liveTurnUsage) {
+    const liveAnchor = messages.findIndex(
+      (message) => message.role === "user" && message.id === liveTurnUsage.clientMessageId,
+    );
+    if (liveAnchor >= 0) {
+      for (let i = liveAnchor + 1; i < total && messages[i]?.role !== "user"; i++) {
+        if (messages[i]?.role === "assistant") liveFallbackIdx = i;
+      }
+    }
+  }
+  const tokenUsageFor = (
+    absIdx: number,
+    message: ChatMessage,
+  ): DisplayTokenUsage | undefined =>
+    displayCallTokenUsage(message._callUsage) ??
+    tokenUsageSnapshot(message.usage) ??
+    (absIdx === liveFallbackIdx && liveTurnUsage
+      ? { ...liveTurnUsage.usage }
+      : undefined);
+  // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
+  const isPanelMember = (m: ChatMessage | undefined): boolean =>
+    !!m && m._timelineRecord !== true && messageKind(m) === "agent-group" &&
+    m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID;
+  // Loaded immutable pages are independent render quanta. Never merge a team
+  // or thinking card across their boundary: doing so would change an existing
+  // virtual item's height/key when an older page arrives.
+  const tapePageKeyOf = tapeRenderPageKey;
+  const batchKeyOf = (absIdx: number): string =>
+    `${anchorOf[absIdx]}:${stageOf[absIdx]}:${tapePageKeyOf(messages[absIdx])}`;
+  // 债D per-delegate 成本:队长**助手行**(role 'assistant',同一 turn 的最终答复)的
+  // usage.delegates 已由 master 按 agentId 分组求和。按 turn 锚点归拢成 anchor → {agentId:
+  // costCredits},供该轮团队卡/委派卡按 `_delegateAgentId` 匹配显示「· N 积分」。同一 agentId
+  // 一轮被多次委派(如审查跑 2 轮)时是合计值 → 多张同名卡显示相同合计,已知可接受粒度。
+  const delegateCostByAnchor = new Map<number, Record<string, string>>();
+  for (let i = 0; i < total; i++) {
+    const mm = messages[i];
+    const delegates = mm?.role === "assistant" && Array.isArray(mm.usage?.delegates)
+      ? mm.usage.delegates
+      : [];
+    if (delegates.length === 0) continue;
+    const rec = delegateCostByAnchor.get(anchorOf[i]) ?? {};
+    for (const d of delegates) {
+      // 同 turn 若多条助手行都带 delegates,后者(最终答复行)胜。
+      if (d && typeof d.agentId === "string" && typeof d.costCredits === "string") {
+        rec[d.agentId] = d.costCredits;
+      }
+    }
+    delegateCostByAnchor.set(anchorOf[i], rec);
+  }
+  const costFor = (absIdx: number, m: ChatMessage): string | undefined =>
+    delegateCostByAnchor.get(anchorOf[absIdx])?.[m._delegateAgentId ?? ""];
+  // 每个批次键在**渲染切片内**的可入面板 agent-group 计数(≥2 才成团;切片外成员不计入本屏面板)。
+  const teamCount = new Map<string, number>();
+  for (let i = 0; i < slice.length; i++) {
+    if (isPanelMember(slice[i])) {
+      const k = batchKeyOf(start + i);
+      teamCount.set(k, (teamCount.get(k) ?? 0) + 1);
+    }
+  }
+  const items: RenderItem[] = [];
+  const emittedTeam = new Set<string>();
+  // 连续 thinking 行合并:被吸收进某组的 thinking 行(首条除外)记入此集,外层循环跳过它们。
+  const consumedThinking = new Set<number>();
+  for (let i = 0; i < slice.length; i++) {
+    const m = slice[i];
+    const absIdx = start + i;
+    if (!m) continue;
+    if (consumedThinking.has(absIdx)) continue; // 已并入上方某思考卡 → 吸收跳过
+    // Persisted historical records are already the Agent's exact ordered
+    // logical stream. Never regroup, reorder or fold one record into another.
+    if (m._timelineRecord === true) {
+      items.push({
+        kind: "single",
+        m,
+        isLast: absIdx === total - 1,
+        idx: absIdx,
+        tokenUsage: tokenUsageFor(absIdx, m),
+      });
+      continue;
+    }
+    if (isPanelMember(m)) {
+      const batchKey = batchKeyOf(absIdx);
+      if ((teamCount.get(batchKey) ?? 0) >= 2) {
+        if (emittedTeam.has(batchKey)) continue; // 已并入该批次面板 → 吸收跳过
+        emittedTeam.add(batchKey);
+        const members: ChatMessage[] = [];
+        const memberIdx: number[] = [];
+        for (let j = 0; j < slice.length; j++) {
+          if (isPanelMember(slice[j]) && batchKeyOf(start + j) === batchKey) {
+            members.push(slice[j]);
+            memberIdx.push(start + j);
+          }
+        }
+        const delegateCosts = delegateCostByAnchor.get(anchorOf[absIdx]);
+        items.push({
+          kind: "team",
+          members,
+          // 成本值取自别的行(助手行),不在成员 message sig 内 → 折进团队 sig(每成员 cost 拼入),
+          // 否则成本后到时 TeamPanel 的 sig-only memo 会跳过重渲(见 TeamPanel 尾 memo 注释)。
+          sig: members
+            .map(
+              (mm, k) =>
+                `${safeMessageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
+            )
+            .join("||"),
+          delegateCosts,
+        });
+        continue;
+      }
+      items.push({
+        kind: "single",
+        m,
+        isLast: absIdx === total - 1,
+        idx: absIdx,
+        delegateCost: costFor(absIdx, m),
+        tokenUsage: tokenUsageFor(absIdx, m),
+      });
+      continue;
+    }
+    if (messageKind(m) === "agent-group") {
+      // 面板外的 agent-group(隐藏审查员卡/独居成员):单卡按时序渲染,委派成本徽记照常。
+      items.push({
+        kind: "single",
+        m,
+        isLast: absIdx === total - 1,
+        idx: absIdx,
+        delegateCost: costFor(absIdx, m),
+        tokenUsage: tokenUsageFor(absIdx, m),
+      });
+      continue;
+    }
+    if (messageKind(m) === "thinking") {
+      // 连续 thinking 行合并成单张多段卡(codex 一轮产十几条空正文标题卡)。中间夹**被跳过/
+      // 不渲染的行**(messageKind==='unknown',渲染层本就静默)透明跳过不断组;任何会渲染的
+      // 非 thinking 行(assistant/tool/agent-group 等)断组。参考 render.ts unknown 跳过 + 上方
+      // coalesceTeam 混排不劈裂先例。
+      const members: ChatMessage[] = [];
+      const tapePageKey = tapePageKeyOf(m);
+      let lastAbs = absIdx;
+      for (let j = i; j < slice.length; j++) {
+        const kj = messageKind(slice[j]);
+        if (tapePageKeyOf(slice[j]) !== tapePageKey) break;
+        if (kj === "thinking") {
+          members.push(slice[j]);
+          consumedThinking.add(start + j);
+          lastAbs = start + j;
+        } else if (kj === "unknown") {
+          continue; // 透明跳过(不打断连续性;该行仍会被外层循环按原位渲染成 null)
+        } else {
+          break;
+        }
+      }
+      // 组"live"取决于末条 thinking 是否为全列表末行且本轮在流(thinking isLive 语义)。
+      const groupIsLast = lastAbs === total - 1;
+      // 组 sig = 各成员签名拼接(仅末条按 groupIsLast 参与 isLast;文本 + 流式态都编进,
+      // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
+      const sig = members
+        .map((mm, k) => safeMessageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
+        .join("||");
+      const thinkingUsage = groupedCallTokenUsage(members.map((member) => member._callUsage));
+      items.push({
+        kind: "thinking",
+        members,
+        sig: `${sig}|tu:${tokenUsageSignature(thinkingUsage)}`,
+        isLast: groupIsLast,
+        idx: absIdx,
+        tokenUsage: thinkingUsage,
+      });
+      continue;
+    }
+    items.push({
+      kind: "single",
+      m,
+      isLast: absIdx === total - 1,
+      idx: absIdx,
+      tokenUsage: tokenUsageFor(absIdx, m),
+    });
+  }
+  return items;
+}
+
+// Ordinary DOM timeline. First paint mounts only the newest tail so a 600-row
+// session does not commit every card before the first frame. Scrolling near the
+// top reveals already-resident rows; server history still uses the explicit
+// hasMore / loadOlder button (scroll never issues a network page).
+export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
+
+export function shouldShowScrollToBottom(
+  following: boolean | undefined,
+  messageCount: number,
+  distance = Number.POSITIVE_INFINITY,
+): boolean {
+  return messageCount > 0 && following === false && distance > 80;
+}
+const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
+const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
+
+function defaultTailStart(length: number): number {
+  return Math.max(0, length - TIMELINE_INITIAL_TAIL_ITEMS);
+}
+
+function renderItemKey(item: RenderItem): string {
+  try {
+    if (item.kind === "single") {
+      return timelineMessageKey(item.m);
+    }
+    const key = item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
+    return typeof key === "string" && key.length > 0 ? key : item.kind;
+  } catch {
+    return "corrupt-item";
+  }
+}
+
+function lastUserItemIndex(items: RenderItem[]): number {
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item?.kind === "single" && item.m.role === "user") return i;
+  }
+  return -1;
+}
+
+function isNonEmptyId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Unified timeline paging context. Loading is an explicit-button action;
+ * scrolling only navigates already resident records.
+ */
+export type MessageListArchive = {
+  /** Unified server cursor reports an older exact page. */
+  hasMore?: boolean;
+  /** Rolling-test/old-caller compatibility only. */
+  archivedCount?: number;
+  archivedThroughSeq?: number;
+  /** 云端加载进行中(按钮转 loading 态、禁用)。 */
+  loading: boolean;
+  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
+  error: boolean;
+  /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
+  onLoadOlder: () => void | Promise<void>;
+  /** Hot live-unit window still has earlier units than the first pack. */
+  liveHasMoreBefore?: boolean;
+  onLoadOlderLiveUnits?: () => void | Promise<void>;
+};
+
+export function MessageList({
+  messages,
+  sending,
+  liveTurnUsage,
+  turnActivity,
+  transientNotice,
+  historyLoading = false,
+  journalDegraded = false,
+  onRetryJournal,
+  archive,
+  cb,
+  onRespondPermission,
+  readOnly = false,
+  scrollParent,
+  historyGeneration = "legacy",
+  sessionId,
+  followBottomRef,
+  find,
+}: {
+  messages: ChatMessage[];
+  sending: boolean;
+  /** Active browser turn's live token display; estimates are explicitly marked. */
+  liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot };
+  /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
+  turnActivity?: TurnActivityInfo | null;
+  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
+  transientNotice?: { text: string } | null;
+  /** 已有部分消息可见，但 canonical history 仍在加载。Journal 水合不再占用此位。 */
+  historyLoading?: boolean;
+  /** Background live-journal hydrate degraded; show an explicit retry. */
+  journalDegraded?: boolean;
+  onRetryJournal?: () => void;
+  /** 归档分页上下文；缺省=无归档(仅本地翻页)。*/
+  archive?: MessageListArchive | null;
+  cb: CardCallbacks;
+  onRespondPermission: PermissionRespond;
+  /** 管理端等只读 surface；默认 false，用户端行为不变。 */
+  readOnly?: boolean;
+  /** Existing chat scroller. When present, first paint mounts the newest tail. */
+  scrollParent?: HTMLElement | null;
+  /** Server history revision. A new revision gets a fresh paging intent owner. */
+  historyGeneration?: number | string;
+  sessionId?: string;
+  /**
+   * App stick-to-bottom intent. When true, content-height growth (late card
+   * layout, streaming) re-snaps the scroller to the end. Window expand sets
+   * this false and holds a preserve lock so ResizeObserver cannot yank to
+   * bottom while correctedScrollTop runs.
+   */
+  followBottomRef?: {
+    current: boolean;
+    jumpToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
+    scrollToBottom?: (el: { scrollTop: number; scrollHeight: number; clientHeight: number }) => void;
+    correctTo?: (
+      el: { scrollTop: number; scrollHeight: number; clientHeight: number },
+      nextTop: number,
+    ) => void;
+  };
+  /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
+  find?: { onClose: () => void };
+}) {
+  const pagingOwnerRef = useRef<{
+    generation: string;
+    controller: UserUpwardPagingController;
+  } | null>(null);
+  const pagingGeneration = String(historyGeneration);
+  if (!pagingOwnerRef.current || pagingOwnerRef.current.generation !== pagingGeneration) {
+    pagingOwnerRef.current = {
+      generation: pagingGeneration,
+      controller: new UserUpwardPagingController(),
+    };
+  }
+  const processPaging = pagingOwnerRef.current.controller;
+  const [archiveQueued, setArchiveQueued] = useState(false);
+  const archiveQueuedRef = useRef(false);
+  const archiveQueueTokenRef = useRef(0);
+  const [windowVersion, setWindowVersion] = useState(0);
+  const [paintRange, setPaintRange] = useState({ start: 0, end: TIMELINE_INITIAL_TAIL_ITEMS });
+  const itemCountRef = useRef(0);
+  const visibleCountRef = useRef(0);
+  const startOverrideRef = useRef<number | null>(null);
+  const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
+  const viewportPreserveLockRef = useRef(false);
+  const listRootRef = useRef<HTMLDivElement | null>(null);
+  const didSnapToBottomRef = useRef(false);
+  const followBottomRefBox = useRef(followBottomRef);
+  followBottomRefBox.current = followBottomRef;
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findCursor, setFindCursor] = useState(0);
+  const findMatchesList = useMemo(
+    () => (find ? findMatches(messages, findQuery) : []),
+    [find, messages, findQuery],
+  );
+  const findHitKeys = useMemo(() => new Set(findMatchesList.map((m) => m.key)), [findMatchesList]);
+  useEffect(() => {
+    setFindCursor(0);
+  }, [findQuery]);
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el || !followBottomRef) {
+      setShowScrollToBottom(false);
+      return;
+    }
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      // Store only visibility, not pixel distance: scrolling within the same
+      // state must not force the whole MessageList to re-render every frame.
+      setShowScrollToBottom(shouldShowScrollToBottom(
+        followBottomRef.current, messages.length, el.scrollHeight - el.clientHeight - el.scrollTop,
+      ));
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(sync);
+    };
+    sync();
+    el.addEventListener("scroll", schedule, { passive: true });
+    // Viewport/keyboard or content changes need not produce a scroll event.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+    observer?.observe(el);
+    if (listRootRef.current) observer?.observe(listRootRef.current);
+    return () => {
+      el.removeEventListener("scroll", schedule);
+      observer?.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [scrollParent, followBottomRef, sessionId, messages.length]);
+  const rowHeightCacheRef = useRef<Map<string, number>>(rowHeightBucket(sessionId));
+  const visibleKeysRef = useRef<string[]>([]);
+  const eagerPayloadKeysRef = useRef<Set<string> | null>(null);
+  const eagerMediaKeysRef = useRef<Set<string> | null>(null);
+  const lastViewportAnchorRef = useRef<VisibleVirtualRowAnchor | null>(null);
+  const lastPaintSpanRef = useRef({ start: -1, end: -1 });
+  const pinStartRef = useRef<number | undefined>(undefined);
+  // INC-20260905-TIMELINE-BLANK probe state (passive; never writes scrollTop).
+  const blankDetectorRef = useRef(createBlankDetector());
+  const blankProbeStateRef = useRef({ paintStart: 0, paintEnd: 0, sending: false, messagesLength: 0 });
+  const beginViewportPreserve = () => {
+    viewportPreserveLockRef.current = true;
+    const follow = followBottomRefBox.current;
+    if (follow) follow.current = false;
+  };
+  const endViewportPreserve = () => {
+    if (typeof requestAnimationFrame !== "function") {
+      viewportPreserveLockRef.current = false;
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        viewportPreserveLockRef.current = false;
+      });
+    });
+  };
+  const sessionIdRef = useRef(sessionId);
+  if (sessionIdRef.current !== sessionId) {
+    sessionIdRef.current = sessionId;
+    startOverrideRef.current = null;
+    didSnapToBottomRef.current = false;
+    viewportPreserveLockRef.current = false;
+    rowHeightCacheRef.current = rowHeightBucket(sessionId);
+    visibleKeysRef.current = [];
+    eagerPayloadKeysRef.current = null;
+    eagerMediaKeysRef.current = null;
+    lastViewportAnchorRef.current = null;
+    lastPaintSpanRef.current = { start: -1, end: -1 };
+  }
+
+  useEffect(() => {
+    archiveQueueTokenRef.current += 1;
+    archiveQueuedRef.current = false;
+    setArchiveQueued(false);
+  }, [processPaging]);
+
+  // User input is observed only to invalidate an older click's viewport
+  // correction. It never admits a history request: scrolling, touch momentum,
+  // keyboard navigation and scrollbar dragging are navigation, not pagination.
+  useEffect(() => {
+    const scroller = scrollParent;
+    if (!scroller) return;
+    let touchMomentum = false;
+    let touchIdleTimer: number | null = null;
+    let scrollbarPointerId: number | null = null;
+    const onWheel = () => processPaging.signalUserInteraction();
+    const onTouchStart = () => {
+      processPaging.signalUserInteraction();
+      touchMomentum = true;
+      if (touchIdleTimer !== null) {
+        window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = null;
+      }
+    };
+    const onTouchMove = () => {
+      touchMomentum = true;
+      processPaging.signalUserInteraction();
+    };
+    const endTouch = () => {
+      processPaging.signalUserInteraction();
+      touchMomentum = true;
+      if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+      touchIdleTimer = window.setTimeout(() => {
+        touchIdleTimer = null;
+        touchMomentum = false;
+      }, 240);
+    };
+    const cancelTouch = () => {
+      processPaging.signalUserInteraction();
+      touchMomentum = false;
+      if (touchIdleTimer !== null) {
+        window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = null;
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      const upward = event.key === "ArrowUp" || event.key === "PageUp" || event.key === "Home" ||
+        (event.key === " " && event.shiftKey);
+      const navigates = upward || event.key === "ArrowDown" || event.key === "PageDown" ||
+        event.key === "End" || event.key === " ";
+      if (navigates) processPaging.signalUserInteraction();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse" || scrollbarPointerId !== null) return;
+      const gutter = scroller.offsetWidth - scroller.clientWidth;
+      if (gutter <= 0) return;
+      const rect = scroller.getBoundingClientRect();
+      const inScrollbarGutter =
+        event.clientX >= rect.right - gutter - 1 ||
+        event.clientX <= rect.left + gutter + 1;
+      if (!inScrollbarGutter) return;
+      scrollbarPointerId = event.pointerId;
+      processPaging.signalUserInteraction();
+    };
+    const endPointer = (event?: PointerEvent) => {
+      if (
+        scrollbarPointerId === null ||
+        (event && event.pointerId !== scrollbarPointerId)
+      ) return;
+      scrollbarPointerId = null;
+      processPaging.signalUserInteraction();
+    };
+    const onWindowBlur = () => endPointer();
+    const onScroll = () => {
+      if (scrollbarPointerId !== null) {
+        processPaging.signalUserInteraction();
+      } else if (touchMomentum) {
+        processPaging.signalUserInteraction();
+        if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = window.setTimeout(() => {
+          touchIdleTimer = null;
+          touchMomentum = false;
+        }, 240);
+      }
+    };
+    scroller.addEventListener("wheel", onWheel, { passive: true });
+    scroller.addEventListener("touchstart", onTouchStart, { passive: true });
+    scroller.addEventListener("touchmove", onTouchMove, { passive: true });
+    scroller.addEventListener("touchend", endTouch, { passive: true });
+    scroller.addEventListener("touchcancel", cancelTouch, { passive: true });
+    scroller.addEventListener("keydown", onKeyDown);
+    scroller.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointerup", endPointer);
+    window.addEventListener("pointercancel", endPointer);
+    window.addEventListener("blur", onWindowBlur);
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    const onExpandNearTop = () => {
+      if (scroller.scrollTop > TIMELINE_EXPAND_NEAR_TOP_PX) return;
+      const total = itemCountRef.current;
+      const current = startOverrideRef.current ?? defaultTailStart(total);
+      if (current <= 0) return;
+      beginViewportPreserve();
+      pendingExpandCorrectionRef.current = {
+        height: scroller.scrollHeight,
+        top: scroller.scrollTop,
+      };
+      startOverrideRef.current = Math.max(0, current - TIMELINE_WINDOW_EXPAND_ITEMS);
+      setWindowVersion((value) => value + 1);
+    };
+    scroller.addEventListener("scroll", onExpandNearTop, { passive: true });
+    return () => {
+      if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+      scroller.removeEventListener("wheel", onWheel);
+      scroller.removeEventListener("touchstart", onTouchStart);
+      scroller.removeEventListener("touchmove", onTouchMove);
+      scroller.removeEventListener("touchend", endTouch);
+      scroller.removeEventListener("touchcancel", cancelTouch);
+      scroller.removeEventListener("keydown", onKeyDown);
+      scroller.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointerup", endPointer);
+      window.removeEventListener("pointercancel", endPointer);
+      window.removeEventListener("blur", onWindowBlur);
+      scroller.removeEventListener("scroll", onScroll);
+      scroller.removeEventListener("scroll", onExpandNearTop);
+    };
+  }, [processPaging, scrollParent]);
+
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const count = visibleCountRef.current;
+      if (!paintWindowEnabled(el, count)) return;
+      const keys = visibleKeysRef.current;
+      const followBottom = followBottomRefBox.current?.current === true;
+      const next = computePaintRange({
+        count,
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        followBottom,
+        keyAt: (index) => keys[index] ?? "",
+        heights: rowHeightCacheRef.current,
+        pinStart: pinStartRef.current,
+        estimatePx: rowHeightEstimatePx(rowHeightCacheRef.current),
+      });
+      setPaintRange((prev) => selectPaintRange({
+        prev,
+        next,
+        followBottom,
+        count,
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        keyAt: (index) => keys[index] ?? "",
+        heights: rowHeightCacheRef.current,
+        pinStart: pinStartRef.current,
+        estimatePx: rowHeightEstimatePx(rowHeightCacheRef.current),
+      }));
+    };
+    const onScroll = () => {
+      lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
+      if (raf) return;
+      raf = requestAnimationFrame(update);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
+    update();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [scrollParent, windowVersion, sessionId, messages.length]);
+
+  useEffect(() => {
+    if (!scrollParent) return;
+    void prefetchMarkdownImpl();
+  }, [sessionId, scrollParent]);
+
+  // INC-20260905-TIMELINE-BLANK: sample viewport geometry ~1/s while mounted
+  // (plus on scroll). A confirmed blank persists a snapshot to localStorage,
+  // exposes `window.__ocTimelineDump()` for manual pull and emits one bounded
+  // friction signal. Purely observational so it can ship before the root cause.
+  useEffect(() => {
+    const scroller = scrollParent;
+    if (!scroller || typeof window === "undefined") return;
+    blankDetectorRef.current = createBlankDetector();
+    let lastSampleAt = 0;
+    let disposed = false;
+    const collect = () => collectProbeInput({
+      scroller,
+      root: listRootRef.current,
+      paintStart: blankProbeStateRef.current.paintStart,
+      paintEnd: blankProbeStateRef.current.paintEnd,
+      sending: blankProbeStateRef.current.sending,
+      followBottom: followBottomRefBox.current ? followBottomRefBox.current.current === true : null,
+      messagesLength: blankProbeStateRef.current.messagesLength,
+    });
+    const sample = (force = false) => {
+      if (disposed) return;
+      const now = Date.now();
+      if (!force && now - lastSampleAt < BLANK_SAMPLE_INTERVAL_MS) return;
+      lastSampleAt = now;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      let report;
+      try {
+        report = blankDetectorRef.current.sample(collect(), now);
+      } catch {
+        return;
+      }
+      if (!report) return;
+      persistSnapshot(sessionId, report);
+      cb.onTimelineBlank?.({ sessionId, report });
+    };
+    const timer = window.setInterval(() => sample(false), BLANK_SAMPLE_INTERVAL_MS);
+    const onScroll = () => sample(false);
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    const w = window as typeof window & {
+      __ocTimelineDump?: () => unknown;
+      __ocTimelineBlankLast?: () => unknown;
+    };
+    w.__ocTimelineDump = () => {
+      const input = collect();
+      return {
+        sessionId,
+        now: Date.now(),
+        input,
+        classification: blankDetectorRef.current.sample(input, Date.now())?.classification ?? "sampled",
+        lastConfirmed: blankDetectorRef.current.lastSnapshot(),
+        persisted: readPersistedSnapshot(),
+      };
+    };
+    w.__ocTimelineBlankLast = () => readPersistedSnapshot();
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      scroller.removeEventListener("scroll", onScroll);
+      if (w.__ocTimelineDump) delete w.__ocTimelineDump;
+    };
+  }, [scrollParent, sessionId, cb]);
+
+  useEffect(() => {
+    const root = listRootRef.current;
+    const scroller = scrollParent;
+    if (!root || !scroller || !didSnapToBottomRef.current) return;
+    if (visibleCountRef.current === 0) return;
+    const warmup = createRowGeometryWarmup({
+      getRows: () => root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      cache: rowHeightCacheRef.current,
+    });
+    const abort = () => warmup.abort();
+    scroller.addEventListener("wheel", abort, { passive: true });
+    scroller.addEventListener("touchstart", abort, { passive: true });
+    scroller.addEventListener("pointerdown", abort);
+    scroller.addEventListener("keydown", abort);
+    warmup.start();
+    return () => {
+      abort();
+      scroller.removeEventListener("wheel", abort);
+      scroller.removeEventListener("touchstart", abort);
+      scroller.removeEventListener("pointerdown", abort);
+      scroller.removeEventListener("keydown", abort);
+    };
+  }, [scrollParent, sessionId, windowVersion, messages.length]);
+
+  // Drop legacy substitute rows from an old IndexedDB cache and duplicate
+  // engine transport envelopes. The latter remain byte-complete in the tape;
+  // their canonical immutable Agent blocks are the user-facing timeline.
+  const safeMessages = sanitizeChatMessages(messages, sessionId);
+  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
+  // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
+  // but are transport controls rather than another user utterance. Automatic
+  // and manual children are both hidden. While a child exists, its source
+  // terminal card is likewise an intermediate state; only the final
+  // exhausted/unsafe error remains visible.
+  const recoveredSourceIds = new Set(
+    safeMessages
+      .filter(isRecoveryControlUserTurn)
+      .map((message) => message._recoveryOfClientMessageId)
+      .filter(isNonEmptyId),
+  );
+  const renderableMessages = safeMessages.filter(
+    (m) =>
+      !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
+      typeof m.id === "string" &&
+      !m.id.startsWith("projection-") &&
+      !m.id.startsWith("oc-dispatch-err:") &&
+      m._turnTapeProcess !== true &&
+      m._timelineAuxiliary === undefined &&
+      m.role !== "runtime-event" &&
+      !isRecoveryControlUserTurn(m) &&
+      !(
+        m.role === "assistant" &&
+        !!m._errorCode &&
+        typeof m._clientMessageId === "string" &&
+        recoveredSourceIds.has(m._clientMessageId)
+      ) &&
+      !isRedundantRuntimeEnvelope(m) &&
+      !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
+  );
+  const visibleUserIds = new Set(
+    renderableMessages
+      .filter((message) => message.role === "user")
+      .map((message) => message.id),
+  );
+  const recoveryParents = new Map(
+    safeMessages
+      .filter(
+        (message) =>
+          isRecoveryControlUserTurn(message) &&
+          isNonEmptyId(message._recoveryOfClientMessageId),
+      )
+      .map((message) => [message.id, message._recoveryOfClientMessageId as string]),
+  );
+  const visibleErrorTurnId = (clientMessageId: string) => {
+    let current = clientMessageId;
+    const visited = new Set<string>();
+    while (!visibleUserIds.has(current) && !visited.has(current)) {
+      visited.add(current);
+      const parent = recoveryParents.get(current);
+      if (!parent) break;
+      current = parent;
+    }
+    return current;
+  };
+  const presentedErrorTurnIds = new Set(
+    renderableMessages
+      .filter(
+        (message) =>
+          typeof message._clientMessageId === "string" &&
+          message._clientMessageId.length > 0 &&
+          (message._turnStatusRecord === true ||
+            (message.role === "assistant" && !!message._errorCode)),
+      )
+      .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
+  );
+  const legacyArchivedRemaining = archive?.hasMore === undefined
+    ? Math.max(
+        0,
+        (archive?.archivedCount ?? 0) - loadedArchivedMetrics(
+          safeMessages,
+          archive?.archivedThroughSeq ?? 0,
+        ).anchors,
+      )
+    : 0;
+  const hasOlderHistory = archive?.hasMore ?? (legacyArchivedRemaining > 0);
+  const requestOlderArchive = useCallback(() => {
+    if (
+      !archive || !hasOlderHistory || archive.loading ||
+      archiveQueuedRef.current
+    ) return;
+    archiveQueuedRef.current = true;
+    setArchiveQueued(true);
+    const token = ++archiveQueueTokenRef.current;
+    const requestKey = `timeline::${pagingGeneration}`;
+    // The new explicit navigation cancels any older tape anchor correction
+    // immediately; its network task still finishes before this FIFO slot.
+    processPaging.signalUserInteraction();
+    void processPaging.runExplicit(requestKey, async () => {
+      await archive.onLoadOlder();
+    }).finally(() => {
+      if (archiveQueueTokenRef.current !== token) return;
+      archiveQueuedRef.current = false;
+      setArchiveQueued(false);
+    });
+  }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
+  const liveHasMore = archive?.liveHasMoreBefore === true;
+  const requestOlderLiveUnits = useCallback(() => {
+    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || archiveQueuedRef.current) {
+      return;
+    }
+    archiveQueuedRef.current = true;
+    setArchiveQueued(true);
+    const token = ++archiveQueueTokenRef.current;
+    const el = scrollParent;
+    beginViewportPreserve();
+    if (el) {
+      pendingExpandCorrectionRef.current = {
+        height: el.scrollHeight,
+        top: el.scrollTop,
+      };
+    }
+    void Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
+      if (archiveQueueTokenRef.current !== token) return;
+      archiveQueuedRef.current = false;
+      setArchiveQueued(false);
+      setWindowVersion((value) => value + 1);
+    });
+  }, [archive, liveHasMore, scrollParent, beginViewportPreserve]);
+  const expandLocalWindow = useCallback(() => {
+    const el = scrollParent;
+    const total = itemCountRef.current;
+    const current = startOverrideRef.current ?? defaultTailStart(total);
+    if (current <= 0) return;
+    beginViewportPreserve();
+    if (el) {
+      pendingExpandCorrectionRef.current = {
+        height: el.scrollHeight,
+        top: el.scrollTop,
+      };
+    }
+    startOverrideRef.current = Math.max(0, current - TIMELINE_WINDOW_EXPAND_ITEMS);
+    setWindowVersion((value) => value + 1);
+  }, [scrollParent]);
+  useLayoutEffect(() => {
+    const pending = pendingExpandCorrectionRef.current;
+    const el = scrollParent;
+    if (!pending || !el) return;
+    pendingExpandCorrectionRef.current = null;
+    if (typeof followBottomRef?.correctTo === "function") {
+      followBottomRef.correctTo(el, correctedScrollTop(pending.height, el.scrollHeight, pending.top));
+    }
+    endViewportPreserve();
+  }, [windowVersion, scrollParent]);
+  useLayoutEffect(() => {
+    const scroller = scrollParent;
+    const root = listRootRef.current;
+    if (!scroller || !root || !followBottomRef) return;
+    if (typeof ResizeObserver === "undefined") return;
+    const recapture = () => {
+      lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(scroller);
+    };
+    const follow = () => {
+      if (viewportPreserveLockRef.current) return;
+      if (followBottomRef.current) {
+        followBottomRef.scrollToBottom?.(scroller);
+        recapture();
+        return;
+      }
+      const anchor = lastViewportAnchorRef.current;
+      if (anchor && typeof followBottomRef.correctTo === "function") {
+        correctToVisibleVirtualRowAnchor(scroller, anchor, followBottomRef.correctTo);
+      }
+      recapture();
+    };
+    const observer = new ResizeObserver(follow);
+    observer.observe(root);
+    // 只在尚无锚点时初始化。本 effect 因 messages.length 重跑时 DOM 已提交:此刻重捕会用
+    // 已位移的几何覆盖 scroll 时捕获的锚点,让同一 commit 里后面的画窗 span 校正误判
+    // 「锚点未动」而跳过 —— 离底后每追加一行、画窗 start 后移一位就漏掉一行间距(16px),
+    // 视口内容随之上跳。span 校正 effect 结束时会自己重捕最新锚点。
+    if (!lastViewportAnchorRef.current) recapture();
+    return () => observer.disconnect();
+  }, [scrollParent, followBottomRef, windowVersion, messages.length]);
+  useLayoutEffect(() => {
+    const el = scrollParent;
+    if (!el || didSnapToBottomRef.current) return;
+    if (itemCountRef.current === 0) return;
+    didSnapToBottomRef.current = true;
+    if (typeof followBottomRef?.scrollToBottom === "function") {
+      followBottomRef.scrollToBottom(el);
+    } else {
+      // 无 controller 的只读消费方(admin/教程/harness)一次性初始定位,不参与 stick 竞态
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [scrollParent, windowVersion, messages.length, sessionId]);
+  // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
+  // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
+  const turnStart = currentTurnStartIndex(renderableMessages);
+  // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
+  // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
+  let ratingFinal: boolean[] = [];
+  let renderItems: RenderItem[] = [];
+  try {
+    ratingFinal = turnFinalAssistantFlags(renderableMessages);
+    renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
+  } catch {
+    ratingFinal = renderableMessages.map(() => false);
+    renderItems = renderableMessages.map((m, absIdx) => ({
+      kind: "single" as const,
+      m,
+      isLast: absIdx === renderableMessages.length - 1,
+      idx: absIdx,
+    }));
+  }
+  itemCountRef.current = renderItems.length;
+  const itemKey = renderItemKey;
+  // Production scroll surfaces freeze a start index on first content so streaming
+  // appends cannot unmount a row the user has scrolled up to read. Tests and
+  // other non-scroll surfaces keep the full tree.
+  if (scrollParent && renderItems.length > 0 && startOverrideRef.current === null) {
+    startOverrideRef.current = defaultTailStart(renderItems.length);
+  }
+  const windowStart = !scrollParent || renderItems.length === 0
+    ? 0
+    : Math.min(
+      startOverrideRef.current ?? defaultTailStart(renderItems.length),
+      defaultTailStart(renderItems.length),
+    );
+  const visibleItems = renderItems.slice(windowStart);
+  visibleCountRef.current = visibleItems.length;
+  visibleKeysRef.current = visibleItems.map(itemKey);
+  if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
+    eagerPayloadKeysRef.current = new Set(
+      visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey),
+    );
+    eagerMediaKeysRef.current = new Set(
+      visibleItems.slice(-EAGER_MEDIA_TAIL_ITEMS).map(itemKey),
+    );
+  }
+  const paintOn = paintWindowEnabled(scrollParent, visibleItems.length)
+    && !archive?.loading
+    && !archiveQueued;
+  const lastUserVisible = lastUserItemIndex(visibleItems);
+  const pinPaintStart = sending && lastUserVisible >= 0
+    ? lastUserVisible
+    : undefined;
+  pinStartRef.current = pinPaintStart;
+  let paintStart = 0;
+  let paintEnd = visibleItems.length;
+  const estimatePx = rowHeightEstimatePx(rowHeightCacheRef.current);
+  if (paintOn && scrollParent) {
+    const followBottom = followBottomRef?.current === true;
+    const keyAt = (index: number) => itemKey(visibleItems[index]);
+    const desired = computePaintRange({
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      followBottom,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+      estimatePx,
+    });
+    const chosen = selectPaintRange({
+      prev: paintRange,
+      next: desired,
+      followBottom,
+      count: visibleItems.length,
+      scrollTop: scrollParent.scrollTop,
+      clientHeight: scrollParent.clientHeight,
+      keyAt,
+      heights: rowHeightCacheRef.current,
+      pinStart: pinPaintStart,
+      estimatePx,
+    });
+    paintStart = chosen.start;
+    paintEnd = chosen.end;
+  }
+  const paintedItems = visibleItems.slice(paintStart, paintEnd);
+  blankProbeStateRef.current = { paintStart, paintEnd, sending, messagesLength: messages.length };
+  const topSpacerPx = paintStart > 0
+    ? measuredRangePx(
+      0,
+      paintStart,
+      (index) => itemKey(visibleItems[index]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    )
+    : 0;
+  const bottomSpacerPx = paintEnd < visibleItems.length
+    ? measuredRangePx(
+      paintEnd,
+      visibleItems.length,
+      (index) => itemKey(visibleItems[index]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    )
+    : 0;
+  useLayoutEffect(() => {
+    const root = listRootRef.current;
+    if (root) {
+      for (const row of root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]")) {
+        const key = row.getAttribute("data-chat-virtual-key");
+        const height = measureMountedRowHeight(row);
+        if (key && height !== null) rowHeightCacheRef.current.set(key, height);
+      }
+    }
+    const el = scrollParent;
+    if (!el) return;
+    const spanChanged =
+      lastPaintSpanRef.current.start !== paintStart || lastPaintSpanRef.current.end !== paintEnd;
+    lastPaintSpanRef.current = { start: paintStart, end: paintEnd };
+    const follow = followBottomRefBox.current;
+    if (
+      spanChanged &&
+      follow &&
+      follow.current !== true &&
+      !viewportPreserveLockRef.current &&
+      lastViewportAnchorRef.current &&
+      typeof follow.correctTo === "function"
+    ) {
+      correctToVisibleVirtualRowAnchor(el, lastViewportAnchorRef.current, follow.correctTo);
+    }
+    lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
+  }, [paintStart, paintEnd, scrollParent, windowVersion, sessionId, visibleItems.length]);
+  const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
+    (message) => typeof message._historyPageLoadedFrom === "string",
+  );
+
+  const renderItem = (it: RenderItem) => {
+    if (it.kind === "single" && it.m._genPlaceholder) {
+      const gp = it.m._genPlaceholder;
+      const placeholderSig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
+      return (
+        <MessageBoundary messageId={it.m.id} sig={placeholderSig}>
+          <GeneratingPlaceholderCard
+            aspect={gp.aspect}
+            status={gp.status}
+            startedAt={gp.startedAt}
+            reason={gp.reason}
+          />
+        </MessageBoundary>
+      );
+    }
+    if (it.kind === "team") {
+      return (
+        <MessageBoundary messageId={it.members[0].id} sig={it.sig}>
+          <TeamPanel members={it.members} sig={it.sig} delegateCosts={it.delegateCosts} />
+        </MessageBoundary>
+      );
+    }
+    if (it.kind === "thinking") {
+      return (
+        <MessageBoundary messageId={it.members[0].id} sig={it.sig}>
+          <TapeBackedCard>
+            <ThinkingCard
+              msgs={it.members}
+              sig={it.sig}
+              ctx={{ isLast: it.isLast, sending, activityInFooter: sending }}
+              tokenUsage={it.tokenUsage}
+            />
+          </TapeBackedCard>
+        </MessageBoundary>
+      );
+    }
+    const turnFinalAssistant = ratingFinal[it.idx] ?? false;
+    const failurePresentedBelow =
+      it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
+    const rowId = it.m._timelineUnitKey ?? it.m.id;
+    let rowSig: string;
+    try {
+      rowSig = `${safeMessageSignature(it.m, {
+        isLast: it.isLast,
+        sending,
+        turnFinalAssistant,
+      })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    } catch {
+      return (
+        <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
+          <div
+            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-meta text-muted"
+            data-testid="corrupt-message-placeholder"
+          >
+            此条消息数据结构异常，已跳过渲染
+          </div>
+        </MessageBoundary>
+      );
+    }
+    return (
+      <MessageBoundary messageId={rowId} sig={rowSig}>
+        <MessageRenderer
+          message={it.m}
+          sig={rowSig}
+          isLast={it.isLast}
+          sending={sending}
+          inActiveTurn={it.idx >= turnStart}
+          turnActivity={turnActivity}
+          activityInFooter={sending}
+          historyGeneration={historyGeneration}
+          processPaging={processPaging}
+          tokenUsage={it.tokenUsage}
+          delegateCost={it.delegateCost}
+          turnFinalAssistant={turnFinalAssistant}
+          cb={cb}
+          onRespondPermission={onRespondPermission}
+          readOnly={readOnly}
+          failurePresentedBelow={failurePresentedBelow}
+          eagerPayload={eagerPayloadKeysRef.current?.has(rowId) === true}
+        />
+      </MessageBoundary>
+    );
+  };
+  const canRevealOlder = windowStart > 0 || hasOlderHistory || liveHasMore;
+  const historyControl = showHistoryBoundary ? (
+    <div
+      className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
+      data-testid="history-page-loader"
+    >
+      <button
+        type="button"
+        onClick={windowStart > 0 ? expandLocalWindow : liveHasMore ? requestOlderLiveUnits : hasOlderHistory ? requestOlderArchive : undefined}
+        disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
+        aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
+        className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+      >
+        {!canRevealOlder
+          ? "已到最早记录"
+          : windowStart === 0 && (archive?.loading || archiveQueued)
+          ? <><Spinner size={12} /> 加载中…</>
+          : windowStart === 0 && archive?.error
+            ? <span className="text-danger">加载失败，点击重试</span>
+            : windowStart > 0
+              ? `查看更早历史记录（还有 ${windowStart} 条）`
+              : legacyArchivedRemaining > 0
+                ? `查看更早历史记录（还有 ${legacyArchivedRemaining} 条）`
+                : "查看更早历史记录"}
+      </button>
+    </div>
+  ) : null;
+  const footer = (
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
+      <div data-testid="turn-activity-footer">
+        {sending && (
+          <div className="flex gap-4">
+            {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
+            <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
+              <Sparkles size={16} />
+            </Avatar>
+            <div className="min-w-0 flex-1">
+              <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
+            </div>
+          </div>
+        )}
+      </div>
+      {/* 会话级 transient 软提示（超时软提示等，非消息卡片、不落库；刷新即消失，不与真内容矛盾）。 */}
+      {transientNotice && (
+        <Alert tone="info" icon={<Info size={16} />}>
+          {transientNotice.text}
+        </Alert>
+      )}
+      {historyLoading && <PartialHistorySkeleton />}
+      {journalDegraded && !historyLoading && onRetryJournal && (
+        <JournalHydrationRetry onRetry={onRetryJournal} />
+      )}
+    </div>
+  );
+
+  // App/admin pass an explicit null during the callback-ref's first commit.
+  // Do not mount the transcript in that frame; omitted/undefined remains the
+  // lightweight test/non-scroll surface contract.
+  if (scrollParent === null) {
+    return (
+      <div className="mx-auto flex max-w-3xl items-center justify-center px-5 py-8 text-muted" role="status">
+        <Spinner size={14} />
+        <span className="ml-2 text-xs">正在准备会话…</span>
+      </div>
+    );
+  }
+
+  // Empty data must still show loading/activity chrome. A cold mobile tab can
+  // have a real history request or active turn with no canonical row yet.
+  if (scrollParent && visibleItems.length === 0 && (
+    sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
+  )) {
+    return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
+  }
+
+  const findCurrent =
+    findMatchesList.length === 0
+      ? -1
+      : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
+  const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const estimateTopForIndex = (index: number): number => {
+    const visIdx = Math.max(0, Math.min(visibleItems.length, index - windowStart));
+    return measuredRangePx(
+      0,
+      visIdx,
+      (i) => itemKey(visibleItems[i]),
+      rowHeightCacheRef.current,
+      estimatePx,
+    );
+  };
+  const jumpTo = (match: FindMatch) => {
+    const follow = followBottomRef;
+    const scroller = scrollParent;
+    if (!follow || !scroller) return;
+    follow.current = false;
+    const top = estimateTopForIndex(match.index);
+    follow.correctTo?.(scroller, top);
+    requestAnimationFrame(() => {
+      const esc =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(match.key)
+          : match.key.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      if (!(el instanceof HTMLElement)) return;
+      const r = el.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      follow.correctTo?.(scroller, scroller.scrollTop + (r.top - s.top) - 48);
+    });
+  };
+  const goFind = (dir: 1 | -1) => {
+    if (sending || findMatchesList.length === 0) return;
+    const next = stepMatch(findMatchesList, findCurrent, dir);
+    if (next < 0) return;
+    setFindCursor(next);
+    const match = findMatchesList[next];
+    if (match) jumpTo(match);
+  };
+  return (
+    <>
+    {find ? (
+      <div className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2">
+        <Input
+          aria-label="在会话中查找"
+          autoFocus
+          inputSize="sm"
+          value={findQuery}
+          onChange={(e) => setFindQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              find.onClose();
+              return;
+            }
+            if (e.key === "Enter") {
+              e.preventDefault();
+              goFind(e.shiftKey ? -1 : 1);
+            }
+          }}
+          className="min-w-0 flex-1"
+        />
+        <span className="shrink-0 text-caption tabular-nums text-muted">
+          {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
+        </span>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="上一处"
+          title={sending ? "生成中暂不可跳转" : "上一处"}
+          disabled={sending || findMatchesList.length === 0}
+          onClick={() => goFind(-1)}
+        >
+          <ChevronUp size={16} />
+        </IconButton>
+        <IconButton
+          shape="square"
+          size="sm"
+          aria-label="下一处"
+          title={sending ? "生成中暂不可跳转" : "下一处"}
+          disabled={sending || findMatchesList.length === 0}
+          onClick={() => goFind(1)}
+        >
+          <ChevronDown size={16} />
+        </IconButton>
+        <IconButton shape="square" size="sm" aria-label="关闭查找" onClick={find.onClose}>
+          <X size={16} />
+        </IconButton>
+      </div>
+    ) : null}
+    <div
+      ref={listRootRef}
+      className="mx-auto max-w-3xl space-y-4 px-5 py-8"
+      data-testid="timeline-short-list"
+      data-timeline-window-count={visibleItems.length}
+      data-timeline-paint-count={paintedItems.length}
+    >
+      {historyControl}
+      {paintStart > 0 ? (
+        <div
+          aria-hidden
+          data-testid="timeline-paint-spacer-top"
+          style={{ height: topSpacerPx }}
+        />
+      ) : null}
+      {paintedItems.map((item, paintedIndex) => {
+        const key = itemKey(item);
+        const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
+        const visibleIndex = paintStart + paintedIndex;
+        const liveRow =
+          (typeof pinPaintStart === "number" && visibleIndex >= pinPaintStart) ||
+          visibleIndex >= visibleItems.length - PAINT_MIN_ITEMS;
+        // A row freshly (re)mounted by the paint window has no last-remembered
+        // size, so `content-visibility:auto` lays it out at the CSS estimate
+        // until it scrolls into relevancy, then grows to its real height. That
+        // growth above the viewport is a visible jump on every row scrolled
+        // past (and, before the wheel fence, a correction write). Seed the
+        // estimate with the measured height; for rows never measured in this
+        // session, use the session median instead of the 200px constant.
+        const cachedHeight = liveRow
+          ? undefined
+          : rowHeightCacheRef.current.get(key) ?? (estimatePx !== PAINT_ESTIMATE_PX ? estimatePx : undefined);
+        return (
+          <TimelineEagerMediaContext.Provider key={key} value={eagerMedia}>
+            <div
+              className={cn(
+                liveRow
+                  ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
+                  : "chat-virtual-item chat-timeline-row",
+                find && findCurrentKey === key && "ring-1 ring-accent/60",
+                find && findCurrentKey !== key && findHitKeys.has(key) && "bg-accent-soft/30",
+              )}
+              data-chat-virtual-key={key}
+              data-find-current={find && findCurrentKey === key ? "" : undefined}
+              style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
+            >
+              {renderItem(item)}
+            </div>
+          </TimelineEagerMediaContext.Provider>
+        );
+      })}
+      {paintEnd < visibleItems.length ? (
+        <div
+          aria-hidden
+          data-testid="timeline-paint-spacer-bottom"
+          style={{ height: bottomSpacerPx }}
+        />
+      ) : null}
+      {footer}
+      {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
+          **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
+          挂载/卸载,按钮自身 52px 就是 scrollHeight 的一部分:滑回底部 → following
+          翻真 → 按钮卸载 → scrollHeight 收缩 → 浏览器 clamp scrollTop → 篱笆仍在
+          (hadUserIntent)→ 零容差判成用户离底 → following 翻假 → 按钮再挂载……
+          几何自激,表现为每次滚回底部都弹一下(2026-09-07 rel-22a377d7f 复现)。
+          -mt-4 抵消 space-y-4 给前一个兄弟加的 16px 下边距,滚动内容总高与无按钮时一致。 */}
+      {followBottomRef?.jumpToBottom && messages.length > 0 && (
+        <div
+          aria-hidden={!showScrollToBottom}
+          data-testid="scroll-to-bottom-dock"
+          data-visible={showScrollToBottom ? "true" : "false"}
+          className="sticky bottom-4 z-10 -mt-4 h-0 overflow-visible"
+        >
+          <button
+            type="button"
+            data-testid="scroll-to-bottom"
+            aria-label="回到底部"
+            tabIndex={showScrollToBottom ? 0 : -1}
+            className={
+              "absolute bottom-0 right-0 flex size-9 items-center justify-center rounded-full bg-fg text-bg shadow-float transition-opacity duration-200 [@media(hover:none)]:size-11 " +
+              (showScrollToBottom ? "opacity-100" : "pointer-events-none opacity-0")
+            }
+            onClick={() => {
+              if (!scrollParent || !followBottomRef?.jumpToBottom) return;
+              pendingExpandCorrectionRef.current = null;
+              viewportPreserveLockRef.current = false;
+              lastViewportAnchorRef.current = null;
+              followBottomRef.jumpToBottom(scrollParent);
+              setShowScrollToBottom(shouldShowScrollToBottom(
+                followBottomRef.current, messages.length,
+                scrollParent.scrollHeight - scrollParent.clientHeight - scrollParent.scrollTop,
+              ));
+            }}
+          >
+            <ChevronDown size={18} />
+          </button>
+        </div>
+      )}
+    </div>
+    </>
+  );
+}

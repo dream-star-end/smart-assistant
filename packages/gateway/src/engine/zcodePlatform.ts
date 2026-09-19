@@ -1,3 +1,4 @@
+import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -21,6 +22,7 @@ export const ZCODE_MEMORY_MCP_TOOLS = [
   'delegate_task',
   'delegate_tasks',
   'request_review',
+  'consult_advisor',
   'task_create',
   'task_update',
   'task_comment',
@@ -43,6 +45,7 @@ export interface ZcodePlatformArtifacts {
 }
 
 export interface CreateZcodePlatformArtifactsInput {
+  identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   sessionKey: string
   gatewayPort: number
@@ -111,6 +114,8 @@ export function createZcodePlatformArtifacts(
       )
       const env: Record<string, string> = {
         OPENCLAUDE_AGENT_ID: input.agentId,
+      OC_AGENT_ID: input.agentId,
+      ...identityCompatEnvironment(input.identityCompat),
         ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
         OPENCLAUDE_HOME: openclaudeHome,
         OPENCLAUDE_SESSION_KEY: input.sessionKey,

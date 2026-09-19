@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -8,7 +9,18 @@ import { test } from 'node:test'
 // `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
 import protobuf from 'protobufjs'
 import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
-import { CursorSandRelay, classifyUpstreamReadFailure, encodeCursorSandRequest, recoverXmlToolCalls } from '../engine/cursorSandRelay.js'
+import {
+  CURSOR_SAND_DIRECT_CLIENT_SOURCE,
+  CURSOR_SAND_DIRECT_CLIENT_VERSION,
+  CURSOR_SAND_NON_RETRYABLE_SUFFIX,
+  CursorSandRelay,
+  classifyUpstreamReadFailure,
+  describeUpstreamError,
+  encodeCursorSandRequest,
+  isNonRetryableUpstreamReason,
+  recoverXmlToolCalls,
+  stripNonRetryableMarker,
+} from '../engine/cursorSandRelay.js'
 import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
 import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import {
@@ -500,6 +512,10 @@ test('transient Sand turn errors never record a slot failure; credential rejecti
     phantomSignals: { apiState: 'called', skipReason: null },
   }
   const cases: Array<{ detail: string; recorded: Array<'ok' | 'fail'>; terminalCode: string; slotResults: boolean }> = [
+    { detail: 'API Error: 400 CURSOR_SAND_BOX_CONNECTION_REJECTED [non-retryable]', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 400 CURSOR_SAND_BOX_BUSY [non-retryable]', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 400 CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED [non-retryable]', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
+    { detail: 'API Error: 401 CURSOR_SAND_AUTH_BOX_CONTROL_401', recorded: ['fail'], terminalCode: 'AUTH_UNAVAILABLE', slotResults: true },
     { detail: 'API Error: 504 {"error":{"message":"Cursor Sand HTTP 504"}}', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
     { detail: 'This operation was aborted', recorded: [], terminalCode: 'ENGINE_ERROR', slotResults: false },
     { detail: 'API Error: 401 Cursor Sand credential rejected: CURSOR_SAND_SESSION_EXPIRED', recorded: ['fail'], terminalCode: 'AUTH_UNAVAILABLE', slotResults: true },
@@ -1129,6 +1145,7 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     assert.equal(url, 'https://api2.cursor.sh/aiserver.v1.InferenceService/Stream')
     const headers = new Headers(init.headers)
     assert.equal(headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
     assert.equal(headers.get('x-cursor-client-version'), 'cli-2026.08.11-e8db854')
     assert.equal(headers.get('content-type'), 'application/connect+proto')
     const body = Buffer.from(init.body as Uint8Array)
@@ -1316,7 +1333,11 @@ class FakeServerResponse extends EventEmitter {
   text(): string { return this.chunks.join('') }
 }
 
-function serveRelay(frames: Buffer[], exchangeStatus = 200): CursorSandRelay {
+function serveRelay(
+  frames: Buffer[],
+  exchangeStatus = 200,
+  extra: { upstreamLabel?: string; inferenceStatus?: number } = {},
+): CursorSandRelay {
   const fetchImpl: typeof fetch = async (input) => {
     if (String(input).endsWith('/auth/exchange_user_api_key')) {
       return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
@@ -1324,14 +1345,110 @@ function serveRelay(frames: Buffer[], exchangeStatus = 200): CursorSandRelay {
         headers: { 'content-type': 'application/json' },
       })
     }
+    if (extra.inferenceStatus && extra.inferenceStatus !== 200) {
+      return new Response('upstream said no', { status: extra.inferenceStatus })
+    }
     return new Response(Buffer.concat([...frames, envelope(Buffer.from('{}'), 0x02)]), {
       status: 200,
       headers: { 'content-type': 'application/connect+proto' },
     })
   }
   // Fresh Buffer per read: the relay zeroes the returned key after every use.
-  return new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+  return new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: null,
+    ...(extra.upstreamLabel ? { upstreamLabel: extra.upstreamLabel } : {}),
+  })
 }
+
+test('serveMessages echoes the caller-supplied public model id instead of the upstream id (stream + json)', async () => {
+  const frames = [responseFrame('textPart', { text: 'ok' }), responseFrame('usage', { inputTokens: 3, outputTokens: 1 })]
+  const relay = serveRelay(frames)
+  try {
+    const streamed = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      streamed as never,
+      new AbortController().signal,
+      { echoModel: 'fable-5.1-high' },
+    )
+    assert.equal(result.kind, 'completed')
+    if (result.kind !== 'completed') throw new Error('unreachable')
+    // Settlement still sees the real upstream id; only the wire echo changes.
+    assert.equal(result.upstreamModel, 'claude-fable-5-1-thinking-high')
+    assert.match(streamed.text(), /"model":"fable-5\.1-high"/)
+    assert.doesNotMatch(streamed.text(), /cursor|claude-fable-5-1/i)
+
+    const json = new FakeServerResponse()
+    await relay.serveMessages(
+      { model: 'cursor-grok-4.6-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      json as never,
+      new AbortController().signal,
+      { echoModel: 'grok-4.6-high' },
+    )
+    assert.equal((JSON.parse(json.text()) as { model: string }).model, 'grok-4.6-high')
+
+    // Default (no option) keeps the historical upstream-id echo for the container path.
+    const legacy = new FakeServerResponse()
+    await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      legacy as never,
+      new AbortController().signal,
+    )
+    assert.equal((JSON.parse(legacy.text()) as { model: string }).model, 'claude-fable-5-1-thinking-high')
+  } finally {
+    await relay.close()
+  }
+})
+
+test('serveMessages with a neutral upstreamLabel never names the engine in client-visible errors', async () => {
+  const neutral = serveRelay([], 403, { upstreamLabel: 'Upstream' })
+  try {
+    const res = new FakeServerResponse()
+    const result = await neutral.serveMessages(
+      { model: 'cursor-grok-4.6-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    // Internal reason keeps the full code for operators / cooldown logic …
+    assert.deepEqual(result, { kind: 'rejected', status: 401, reason: 'CURSOR_SAND_AUTH_HTTP_403', written: true })
+    // … but the wire message is scrubbed.
+    assert.match(res.text(), /Upstream credential rejected: AUTH_HTTP_403/)
+    assert.doesNotMatch(res.text(), /cursor/i)
+  } finally {
+    await neutral.close()
+  }
+
+  const http502 = serveRelay([], 200, { upstreamLabel: 'Upstream', inferenceStatus: 502 })
+  try {
+    const res = new FakeServerResponse()
+    const result = await http502.serveMessages(
+      { model: 'cursor-grok-4.6-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.equal(result.kind, 'rejected')
+    assert.match(res.text(), /Upstream HTTP 502/)
+    assert.doesNotMatch(res.text(), /cursor/i)
+  } finally {
+    await http502.close()
+  }
+
+  // Default label is unchanged so the in-container CCB path (and its error classifier) is untouched.
+  const legacy = serveRelay([], 403)
+  try {
+    const res = new FakeServerResponse()
+    await legacy.serveMessages(
+      { model: 'cursor-grok-4.6-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.match(res.text(), /Cursor Sand credential rejected: CURSOR_SAND_AUTH_HTTP_403/)
+  } finally {
+    await legacy.close()
+  }
+})
 
 test('serveMessages runs without start() and returns the exact usage the client received (stream + json)', async () => {
   const frames = [
@@ -1457,10 +1574,59 @@ test('session credential is sent as Bearer with x-cursor-checksum and skips the 
     // readApiKey returns the raw slot bytes (trailing newline); Bearer must be the trimmed token.
     assert.equal(inference.headers.get('authorization'), `Bearer ${token.trim()}`)
     assert.equal(inference.headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(inference.headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
     assert.equal(inference.headers.get('x-cursor-client-version'), CURSOR_SESSION_CLIENT_VERSION)
     const checksum = inference.headers.get('x-cursor-checksum')
     assert.equal(checksum, cursorSessionChecksum(machineId, 1_700_000_000_000))
     assert.ok(checksum?.endsWith(machineId))
+  } finally {
+    await relay.close()
+  }
+})
+
+test('directStream skips Box and talks to api2 as Cursor 3.21.12 sand-desktop', async () => {
+  const machineId = 'abcdefghijklmnopqrstuvwxyz'
+  const token = sessionJwt(Math.floor(Date.now() / 1000) + 30 * 86400)
+  const seen: { url: string; headers: Headers }[] = []
+  const fetchImpl: typeof fetch = async (input, init) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) })
+    return new Response(Buffer.concat([responseFrame('textPart', { text: 'SAND_OK' }), envelope(Buffer.from('{}'), 0x02)]), {
+      status: 200,
+      headers: { 'content-type': 'application/connect+proto' },
+    })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from(`${token}\n`),
+    credentialKind: 'session',
+    machineId,
+    boxAccountId: '15',
+    directStream: true,
+    now: () => 1_700_000_000_000,
+    readBoxPolicy: () => {
+      throw new Error('directStream must not read Box policy')
+    },
+  })
+  const baseUrl = await relay.start()
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'cursor-opus-5-low', stream: false, max_tokens: 64,
+        messages: [{ role: 'user', content: 'Reply with exactly SAND_OK.' }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(seen.length, 1)
+    assert.equal(seen.some((call) => call.url.includes('GrokBotService') || call.url.includes('cursorvm.com')), false)
+    const inference = seen[0]!
+    assert.equal(inference.url, 'https://api2.cursor.sh/aiserver.v1.InferenceService/Stream')
+    assert.equal(inference.headers.get('authorization'), `Bearer ${token.trim()}`)
+    assert.equal(inference.headers.get('x-cursor-client-type'), 'sand')
+    assert.equal(inference.headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
+    assert.equal(inference.headers.get('x-cursor-client-version'), CURSOR_SAND_DIRECT_CLIENT_VERSION)
+    assert.equal(inference.headers.get('x-cursor-checksum'), cursorSessionChecksum(machineId, 1_700_000_000_000))
   } finally {
     await relay.close()
   }
@@ -1995,6 +2161,137 @@ test('relay maps overflow end-trailer text to "Prompt is too long"', async () =>
   }
 })
 
+// Regression (2026-09-08, external API-key user on Mac): Sand answered a
+// long-running fable-5.1 stream with an end trailer whose top-level message is
+// the literal "Error"; the real cause lives in details[].debug
+// (aiserver.v1.ErrorDetails → ERROR_PROVIDER_ERROR, providerStatusCode 400,
+// isRetryable:false). Clients saw "Error" and Claude Code retried 10× for
+// minutes on a request that could never succeed.
+const PROVIDER_400_TRAILER = {
+  code: 'resource_exhausted',
+  message: 'Error',
+  details: [{
+    type: 'aiserver.v1.ErrorDetails',
+    debug: {
+      error: 'ERROR_PROVIDER_ERROR',
+      details: {
+        title: 'Provider Error',
+        detail: "We're having trouble connecting to the model provider. This might be temporary - please try again in a moment.",
+        isRetryable: false,
+        additionalInfo: { providerStatusCode: '400' },
+      },
+      isExpected: true,
+    },
+    value: 'CDkSnQEK…',
+  }],
+}
+
+test('describeUpstreamError surfaces aiserver.v1.ErrorDetails instead of the bare "Error"', () => {
+  const info = describeUpstreamError(PROVIDER_400_TRAILER as never, 'Cursor Sand transport error')
+  assert.equal(info.code, 'resource_exhausted')
+  assert.equal(info.debugError, 'ERROR_PROVIDER_ERROR')
+  assert.equal(info.providerStatusCode, '400')
+  assert.equal(info.retryable, false)
+  assert.equal(
+    info.message,
+    "Provider Error (400): We're having trouble connecting to the model provider. This might be temporary - please try again in a moment.",
+  )
+  // Plain code+message errors keep the old composed shape.
+  const plain = describeUpstreamError({ code: 'resource_exhausted', message: 'context length exceeded' } as never, 'x')
+  assert.equal(plain.message, 'resource_exhausted: context length exceeded')
+  assert.equal(plain.retryable, null)
+  // Generic "Error" with no details falls back to code, never to the useless word.
+  const bare = describeUpstreamError({ code: 'internal', message: 'Error' } as never, 'Cursor Sand inference failed')
+  assert.equal(bare.message, 'internal')
+  const empty = describeUpstreamError({} as never, 'Cursor Sand inference failed')
+  assert.equal(empty.message, 'Cursor Sand inference failed')
+  // Marker helpers.
+  const tagged = `${info.message}${CURSOR_SAND_NON_RETRYABLE_SUFFIX}`
+  assert.equal(isNonRetryableUpstreamReason(tagged), true)
+  assert.equal(isNonRetryableUpstreamReason(info.message), false)
+  assert.equal(stripNonRetryableMarker(tagged), info.message)
+  assert.equal(stripNonRetryableMarker(info.message), info.message)
+})
+
+test('non-retryable provider error in end trailer → readable SSE error + x-should-retry:false, external label', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(envelope(Buffer.from(JSON.stringify({ error: PROVIDER_400_TRAILER })), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), upstreamLabel: 'Upstream' })
+  const baseUrl = await relay.start()
+  try {
+    // Streaming (native path): message_start is already on the wire when the
+    // trailer lands, so the retry hint travels as the Anthropic error *type*
+    // (`invalid_request_error` = 400-class, client never retries) rather than a header.
+    const streamed = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5.1-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    const text = await streamed.text()
+    assert.match(text, /event: error/)
+    assert.match(text, /"type":"invalid_request_error","message":"Provider Error \(400\): We're having trouble connecting to the model provider/)
+    assert.doesNotMatch(text, /non-retryable\]/)
+    assert.doesNotMatch(text, /Cursor Sand/)
+    // Non-streaming: 502 JSON with the same text, the 400-class type AND the header.
+    const plain = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5.1-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(plain.status, 502)
+    assert.equal(plain.headers.get('x-should-retry'), 'false')
+    const json = await plain.json() as { error: { type: string; message: string } }
+    assert.equal(json.error.type, 'invalid_request_error')
+    assert.match(json.error.message, /^Provider Error \(400\): /)
+    assert.doesNotMatch(json.error.message, /non-retryable\]/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('retryable / unclassified upstream errors do not set x-should-retry', async () => {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(envelope(Buffer.from(JSON.stringify({
+          error: { code: 'unavailable', message: 'upstream busy' },
+        })), 0x02))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test') })
+  const baseUrl = await relay.start()
+  try {
+    const plain = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'cursor-fable-5.1-high', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(plain.status, 502)
+    assert.equal(plain.headers.get('x-should-retry'), null)
+    const json = await plain.json() as { error: { type: string; message: string } }
+    assert.equal(json.error.type, 'api_error')
+    // Trailer text keeps its historical bare shape (no `code:` prefix).
+    assert.equal(json.error.message, 'upstream busy')
+  } finally {
+    await relay.close()
+  }
+})
+
 // Regression (2026-09-06, uid 4 session): a Sand inference that produced no
 // frames for >300s was torn down by undici's default bodyTimeout as a bare
 // `TypeError: terminated`. The relay then ended the SSE response *cleanly*
@@ -2117,4 +2414,416 @@ test('classifyUpstreamReadFailure normalises undici socket wording', () => {
   assert.equal(classifyUpstreamReadFailure(new Error('read ECONNRESET'), false), 'CURSOR_SAND_UPSTREAM_TERMINATED')
   assert.equal(classifyUpstreamReadFailure(new Error('anything'), true), 'CURSOR_SAND_UPSTREAM_STALLED')
   assert.equal(classifyUpstreamReadFailure(new Error('CURSOR_SAND_TRUNCATED_FRAME'), false), 'CURSOR_SAND_TRUNCATED_FRAME')
+})
+
+function serveRelayThrowingAfter(frames: Buffer[]): CursorSandRelay {
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    let pulled = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1
+        if (pulled === 1) {
+          controller.enqueue(Buffer.concat(frames))
+          return
+        }
+        controller.error(new TypeError('terminated'))
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  return new CursorSandRelay({
+    fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null,
+  })
+}
+
+const HOOK_USAGE_FRAMES = [
+  responseFrame('textPart', { text: 'partial' }),
+  responseFrame('extendedUsage', {
+    inputTokens: 40, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64,
+  }),
+]
+
+for (const pipe of [
+  { name: 'native streaming', stream: true as const, extra: {} },
+  { name: 'buffered streaming', stream: true as const, extra: { bufferedStreaming: true as const } },
+  { name: 'nonstream', stream: false as const, extra: {} },
+]) {
+  test(`serveMessages ${pipe.name}: persist failure before success terminal withholds message_stop/JSON`, async () => {
+    const frames = [
+      responseFrame('textPart', { text: 'ok' }),
+      responseFrame('extendedUsage', {
+        inputTokens: 12, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 8,
+      }),
+    ]
+    const relay = serveRelay(frames)
+    const terminals: Array<{ kind: string; outcome: string }> = []
+    try {
+      const res = new FakeServerResponse()
+      await assert.rejects(
+        () => relay.serveMessages(
+          { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+          res as never,
+          new AbortController().signal,
+          {
+            ...pipe.extra,
+            onTerminal: async (ev) => {
+              terminals.push({ kind: ev.evidence.kind, outcome: ev.outcome })
+              throw new Error('persist_failed')
+            },
+          },
+        ),
+        /persist_failed/,
+      )
+      assert.equal(terminals.length, 1)
+      assert.equal(terminals[0]!.kind, 'reported')
+      assert.equal(terminals[0]!.outcome, 'completed')
+      if (pipe.stream) {
+        assert.doesNotMatch(res.text(), /event: message_stop/)
+      } else {
+        assert.equal(res.statusCode !== 200 || res.text() === '' || !/"type":"message"/.test(res.text()) || !res.writableEnded, true)
+        assert.doesNotMatch(res.text(), /"stop_reason"/)
+      }
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`serveMessages ${pipe.name}: usage then reader throw keeps reported partial`, async () => {
+    const relay = serveRelayThrowingAfter(HOOK_USAGE_FRAMES)
+    const terminals: Array<{ kind: string; output: number }> = []
+    try {
+      const res = new FakeServerResponse()
+      await assert.rejects(
+        () => relay.serveMessages(
+          { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+          res as never,
+          new AbortController().signal,
+          {
+            ...pipe.extra,
+            onTerminal: async (ev) => {
+              terminals.push({
+                kind: ev.evidence.kind,
+                output: ev.evidence.kind === 'reported' ? ev.evidence.usage.output_tokens : -1,
+              })
+            },
+          },
+        ),
+        /CURSOR_SAND_UPSTREAM_TERMINATED|terminated/,
+      )
+      assert.equal(terminals.length, 1)
+      assert.equal(terminals[0]!.kind, 'reported')
+      assert.equal(terminals[0]!.output, 7)
+      if (pipe.stream) assert.doesNotMatch(res.text(), /event: message_stop/)
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`serveMessages ${pipe.name}: no usage frame is unobserved`, async () => {
+    const relay = serveRelay([responseFrame('textPart', { text: 'no-usage' })])
+    const kinds: string[] = []
+    try {
+      const res = new FakeServerResponse()
+      await relay.serveMessages(
+        { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+        res as never,
+        new AbortController().signal,
+        {
+          ...pipe.extra,
+          onTerminal: async (ev) => {
+            kinds.push(ev.evidence.kind)
+            if (ev.outcome === 'completed' && ev.evidence.kind === 'unobserved') {
+              throw new Error('CURSOR_EXTERNAL_UNOBSERVED_SUCCESS')
+            }
+          },
+        },
+      ).catch((err: unknown) => {
+        if (!(err instanceof Error) || !/UNOBSERVED_SUCCESS/.test(err.message)) throw err
+      })
+      assert.deepEqual(kinds, ['unobserved'])
+      if (pipe.stream) assert.doesNotMatch(res.text(), /event: message_stop/)
+    } finally {
+      await relay.close()
+    }
+  })
+
+  test(`serveMessages ${pipe.name}: explicit zero usage is reported`, async () => {
+    const relay = serveRelay([
+      responseFrame('textPart', { text: 'z' }),
+      responseFrame('extendedUsage', {
+        inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 8,
+      }),
+    ])
+    const kinds: string[] = []
+    try {
+      const res = new FakeServerResponse()
+      const result = await relay.serveMessages(
+        { model: 'cursor-fable-5.1-high', stream: pipe.stream, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+        res as never,
+        new AbortController().signal,
+        {
+          ...pipe.extra,
+          onTerminal: async (ev) => { kinds.push(ev.evidence.kind) },
+        },
+      )
+      assert.equal(result.kind, 'completed')
+      assert.deepEqual(kinds, ['reported'])
+    } finally {
+      await relay.close()
+    }
+  })
+}
+
+function invalidToolText(): string {
+  return '{"command":"printf ok"}\n\nFAKE_RESULT'
+}
+
+function retryFetch(firstReported: boolean): { fetchImpl: typeof fetch; calls: () => number } {
+  let calls = 0
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    calls += 1
+    if (calls === 1) {
+      const frames = [
+        responseFrame('textPart', { text: invalidToolText() }),
+        ...(firstReported
+          ? [responseFrame('extendedUsage', {
+              inputTokens: 8, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64,
+            })]
+          : []),
+        envelope(Buffer.from('{}'), 0x02),
+      ]
+      return new Response(Buffer.concat(frames), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+    }
+    let pulled = 0
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1
+        if (pulled === 1) {
+          controller.enqueue(responseFrame('extendedUsage', {
+            inputTokens: 40, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64,
+          }))
+          return
+        }
+        controller.error(new TypeError('terminated'))
+      },
+    }), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  return { fetchImpl, calls: () => calls }
+}
+
+const retryBody = {
+  model: 'cursor-fable-5.1-high',
+  stream: true as const,
+  max_tokens: 64,
+  messages: [{ role: 'user' as const, content: 'run it' }],
+  tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }],
+}
+
+for (const pipe of [
+  { name: 'native', extra: {} },
+  { name: 'buffered', extra: { bufferedStreaming: true as const } },
+]) {
+  for (const firstReported of [true, false]) {
+    test(`retry ${pipe.name} firstReported=${firstReported}: reader fault keeps retry usage`, async () => {
+      const { fetchImpl, calls } = retryFetch(firstReported)
+      const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+      const terms: Array<{ kind: string; usage?: { input_tokens: number; output_tokens: number } }> = []
+      try {
+        const res = new FakeServerResponse()
+        await assert.rejects(() => relay.serveMessages(
+          retryBody,
+          res as never,
+          new AbortController().signal,
+          {
+            ...pipe.extra,
+            onTerminal: async (ev) => {
+              terms.push({
+                kind: ev.evidence.kind,
+                usage: ev.evidence.kind === 'reported' ? ev.evidence.usage : undefined,
+              })
+            },
+          },
+        ))
+        assert.equal(calls(), 2)
+        assert.equal(terms.length, 1)
+        assert.equal(terms[0]?.kind, 'reported')
+        assert.equal(terms[0]?.usage?.input_tokens, firstReported ? 48 : 40)
+        assert.equal(terms[0]?.usage?.output_tokens, firstReported ? 13 : 7)
+      } finally {
+        await relay.close()
+      }
+    })
+  }
+}
+
+test('retry native success still reports combined usage once', async () => {
+  let calls = 0
+  const fetchImpl: typeof fetch = async (input) => {
+    if (String(input).endsWith('/auth/exchange_user_api_key')) {
+      return new Response(JSON.stringify({ accessToken: fakeJwt() }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      })
+    }
+    calls += 1
+    if (calls === 1) {
+      return new Response(Buffer.concat([
+        responseFrame('textPart', { text: invalidToolText() }),
+        responseFrame('extendedUsage', { inputTokens: 8, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64 }),
+        envelope(Buffer.from('{}'), 0x02),
+      ]), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+    }
+    return new Response(Buffer.concat([
+      responseFrame('textPart', { text: 'fixed output' }),
+      responseFrame('extendedUsage', { inputTokens: 40, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0, maxTokens: 64 }),
+      envelope(Buffer.from('{}'), 0x02),
+    ]), { status: 200, headers: { 'content-type': 'application/connect+proto' } })
+  }
+  const relay = new CursorSandRelay({ fetchImpl, readApiKey: () => Buffer.from('crsr_test'), passthrough: null })
+  try {
+    const res = new FakeServerResponse()
+    const terms: string[] = []
+    const result = await relay.serveMessages(
+      retryBody,
+      res as never,
+      new AbortController().signal,
+      { onTerminal: async (ev) => { terms.push(`${ev.evidence.kind}:${ev.evidence.kind === 'reported' ? ev.evidence.usage.input_tokens : 0}`) } },
+    )
+    assert.equal(result.kind, 'completed')
+    assert.equal(calls, 2)
+    assert.deepEqual(terms, ['reported:48'])
+    assert.match(res.text(), /event: message_stop/)
+  } finally {
+    await relay.close()
+  }
+})
+
+test('classifyRelayTerminalCode maps raw messages to stable codes', async () => {
+  const { classifyRelayTerminalCode } = await import('../engine/cursorSandRelay.js')
+  assert.equal(classifyRelayTerminalCode(new TypeError('terminated')), 'CURSOR_SAND_UPSTREAM_TERMINATED')
+  assert.equal(classifyRelayTerminalCode(Object.assign(new Error('AbortError'), { name: 'AbortError' })), 'CURSOR_SAND_ABORTED')
+  assert.equal(classifyRelayTerminalCode('CURSOR_SAND_RETRY_HTTP_502 extra'), 'CURSOR_SAND_RETRY_HTTP_502')
+  assert.equal(classifyRelayTerminalCode(new Error('secret=sk-live-abcdef prompt=do not persist')), 'CURSOR_SAND_UPSTREAM_ERROR')
+  assert.doesNotMatch(classifyRelayTerminalCode(new Error('secret=sk-live-abcdef')), /sk-live|prompt/)
+})
+
+test('default web callers without onTerminal keep original success semantics', async () => {
+  const relay = serveRelay([
+    responseFrame('textPart', { text: 'ok' }),
+    responseFrame('usage', { inputTokens: 3, outputTokens: 1 }),
+  ])
+  try {
+    const res = new FakeServerResponse()
+    const result = await relay.serveMessages(
+      { model: 'cursor-fable-5.1-high', stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      res as never,
+      new AbortController().signal,
+    )
+    assert.equal(result.kind, 'completed')
+    assert.match(res.text(), /event: message_stop/)
+  } finally {
+    await relay.close()
+  }
+})
+
+function boxProductFixture(mode: 'gate401'|'local429'|'upstream429'|'control401'|'ticket'|'quota', partialTool = false) {
+ const machine='abcdefghijklmnopqrstuvwxyz',subject='box-product-fixture';
+ const token=Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url')+'.'+Buffer.from(JSON.stringify({type:'session',sub:subject,exp:Math.floor(Date.now()/1000)+3600})).toString('base64url')+'.'+Buffer.from('synthetic-signature-not-real').toString('base64url');
+ const hash=(v:string)=>createHash('sha256').update(v).digest('hex');const calls:Array<{url:string;auth:string|null}>=[];
+ const relay=new CursorSandRelay({credentialKind:'session',machineId:machine,boxAccountId:'19',readApiKey:()=>Buffer.from(token),passthrough:null,readBoxPolicy:()=>({version:1,accounts:[{accountId:'19',subjectHash:hash(subject),machineHash:hash(machine)}]}),fetchImpl:async(input,init)=>{
+  const url=String(input),headers=new Headers(init?.headers);calls.push({url,auth:headers.get('authorization')});
+  if(url.endsWith('/GetSandBoxRunState'))return new Response(JSON.stringify({state:'SAND_BOX_RUN_STATE_RUNNING'}),{status:mode==='control401'?401:200});
+  if(url.endsWith('/EnsureSandBox'))return new Response(JSON.stringify({gatewayUrl:'https://box.cursorvm.com/prefix',gatewayToken:'GATEWAY_ONLY',networkToken:'NETWORK_ONLY'}));
+  assert.equal(url,'https://box.cursorvm.com/prefix/sand-stream-relay/aiserver.v1.InferenceService/Stream');assert.equal(headers.get('authorization'),'Bearer GATEWAY_ONLY');assert.equal(headers.get('x-anyrun-network-token'),'NETWORK_ONLY');assert.equal(headers.get('x-cursor-checksum'),null);
+  if(mode==='gate401')return new Response('gateway rejected',{status:401});
+  if(mode==='local429')return new Response('relay busy',{status:429});
+  if(mode==='upstream429')return new Response('quota exceeded',{status:429,headers:{'x-oc-sand-box-upstream':'1'}});
+  const error=mode==='ticket'?{code:'unauthenticated',message:'ticket rejected'}:{code:'resource_exhausted',message:'quota exceeded'};
+  return new Response(new Uint8Array(Buffer.concat([...(partialTool ? [responseFrame('textPart',{text:'tool_call: {\"name\":\"Read\", \"arguments\":'})] : []),envelope(Buffer.from(JSON.stringify({error})),2)])),{headers:{'content-type':'application/connect+proto','x-oc-sand-box-upstream':'1'}});
+ }});
+ return {relay,calls,token};
+}
+test('Box HTTP failures keep no-retry transport scope, descriptor cache, and true account/quota distinctions',async()=>{
+ for(const mode of ['gate401','local429','upstream429','control401'] as const){const f=boxProductFixture(mode);try{
+  for(let i=0;i<2;i++){const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);
+   if(mode==='gate401'||mode==='local429'){assert.equal(res.statusCode,400);assert.equal(res.headers['x-should-retry'],'false');assert.match(res.text(),new RegExp(mode==='gate401'?'BOX_CONNECTION_REJECTED':'BOX_BUSY'));}else assert.equal(res.statusCode,mode==='control401'?401:429);
+  }
+  const controls=f.calls.filter(c=>c.url.includes('GrokBotService'));for(const c of controls)assert.equal(c.auth,'Bearer '+f.token);assert.equal(controls.length,mode==='gate401'?4:mode==='control401'?2:2);assert.equal(f.calls.filter(c=>c.url.includes('cursorvm.com')).length,mode==='control401'?0:2);
+ }finally{await f.relay.close();}}
+})
+test('Box Connect unauthenticated trailers preserve transport identity in both response modes',async()=>{
+ for(const stream of [false,true]){const f=boxProductFixture('ticket');try{const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',stream,max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);assert.match(res.text(),/CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED/);assert.match(res.text(),/invalid_request_error/);if(!stream)assert.equal(res.statusCode,400);}finally{await f.relay.close();}}
+})
+test('actual Relay rejection feeds actual Adapter billing chain without poisoning the account',async()=>{
+ for(const mode of ['gate401','local429','control401','upstream429'] as const){const f=boxProductFixture(mode);const recorded:Array<string>=[];const billing:Array<any>=[];const adapter=new CursorSandAdapter({sessionKey:'agent:main:test:box-billing-'+mode,agentId:'main',agentBaseDir:process.cwd(),config:{} as never,model:'cursor-grok-4.6-high',cursorCredentialSelection:{...STABLE_SAND_SELECTION,accountId:'19',credentialKind:'session',machineId:'abcdefghijklmnopqrstuvwxyz'}},f.relay,()=>{
+  const summary=(async()=>{const res=new FakeServerResponse();await f.relay.serveMessages({model:'cursor-grok-4.6-high',max_tokens:32,messages:[{role:'user',content:'test'}]},res as never,new AbortController().signal);return {usage:{cost:0,inputTokens:0,outputTokens:0,cacheReadTokens:0,cacheCreationTokens:0,totalTokens:0},assistantText:'',thinkingText:'',assistantSegments:[],thinkingSegments:[],tools:[],runtimeEvents:[],stopReason:'error',numTurns:1,isError:true,staleResumeId:false,errorDetail:'API Error: '+res.statusCode+' '+res.text(),phantomSignals:{apiState:'called',skipReason:null}};})();return {...inertRun(),summary} as never;
+ },r=>recorded.push(r));adapter.on('external_billing',e=>billing.push(e));try{const run=adapter.submitTurn({input:'test',requestId:'a'.repeat(32),onEvent(){},sessionTotals:{totalCostUSD:0,turns:0},toolUseIdToName:new Map()});await run.submitted;await run.summary;await new Promise(r=>setImmediate(r));const transport=mode==='gate401'||mode==='local429';assert.deepEqual(recorded,transport?[]:['fail']);assert.equal(billing.length,1);assert.equal(billing[0].cursorAccountId,'19');assert.equal(billing[0].status,transport?'error':'unavailable');assert.equal('cursorSlotResults' in billing[0],!transport);}finally{await adapter.shutdown();}}
+})
+
+for(const model of ['cursor-fable-5-high','cursor-grok-4.6-high'])test(`terminal Box ticket error never enters tool correction: ${model}`,async()=>{
+ const f=boxProductFixture('ticket',true);try{const url=await f.relay.start();for(let request=1;request<=2;request++){const response=await fetch(url+'/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model,stream:true,max_tokens:64,messages:[{role:'user',content:'read the file'}],tools:[{name:'Read',description:'Read a local file',input_schema:{type:'object',properties:{file_path:{type:'string'}},required:['file_path']}}]})});const text=await response.text();assert.match(text,/CURSOR_SAND_BOX_INFERENCE_TICKET_REJECTED/);assert.deepEqual({inference:f.calls.filter(c=>c.url.includes('cursorvm.com')).length,controls:f.calls.filter(c=>c.url.includes('GrokBotService')).length},{inference:request,controls:2*request});assert.deepEqual(f.relay.getRequestStats(),{messages:request,inferenceAttempts:request,toolCorrections:0,passthroughAttempts:0});}}finally{await f.relay.close();}
+})
+
+
+// OCV5-181: exact shared Box transport + per-call durable terminal composition.
+for (const pipe of [
+  { name: 'native', stream: true, extra: {} },
+  { name: 'buffered', stream: true, extra: { bufferedStreaming: true } },
+  { name: 'nonstream', stream: false, extra: {} },
+]) for (const mode of ['gate401', 'local429', 'control401', 'upstream429', 'ticket'] as const) {
+  test(`Box terminal composition ${pipe.name}/${mode}: failed evidence precedes wire exactly once`, async () => {
+    const f = boxProductFixture(mode)
+    const res = new FakeServerResponse()
+    const evidence: Array<{ outcome: string; kind: string; code?: string }> = []
+    try {
+      const result = await f.relay.serveMessages(
+        { model: 'cursor-fable-5-high', stream: pipe.stream, max_tokens: 32, messages: [{ role: 'user', content: 'synthetic composition' }] },
+        res as never, new AbortController().signal,
+        { ...pipe.extra, onTerminal: async (ev) => {
+          assert.equal(res.writableEnded, false, 'terminal must precede response end')
+          assert.doesNotMatch(res.text(), /event: error|event: message_stop|"type":"error"|"stop_reason":"/, 'terminal must precede terminal wire')
+          evidence.push({ outcome: ev.outcome, kind: ev.evidence.kind, code: ev.terminalCode })
+          await new Promise<void>(r => setImmediate(r))
+          assert.equal(res.writableEnded, false, 'relay awaits terminal persistence')
+        } },
+      )
+      assert.deepEqual(evidence, [{ outcome: 'failed', kind: 'unobserved', code: mode === 'upstream429' ? 'CURSOR_SAND_HTTP_429' : 'CURSOR_SAND_UPSTREAM_ERROR' }])
+      assert.doesNotMatch(res.text(), /event: message_stop|"stop_reason":"/)
+      const expectedStatus = mode === 'control401' ? 401 : mode === 'upstream429' ? 429 : mode === 'ticket' && pipe.stream ? 200 : 400
+      assert.equal(res.statusCode, expectedStatus)
+      if (result.kind === 'rejected') assert.equal(result.status, expectedStatus)
+      else assert.equal(result.kind, 'failed')
+      assert.equal(f.relay.getRequestStats().toolCorrections, 0)
+      assert.equal(f.relay.getRequestStats().inferenceAttempts, mode === 'control401' ? 0 : 1)
+      if (mode === 'gate401' || mode === 'local429' || mode === 'ticket') assert.match(res.text(), /CURSOR_SAND_BOX_/)
+    } finally { await f.relay.close() }
+  })
+}
+
+test('Box terminal composition rejection: failing optional hook never duplicates or replaces wire error', async () => {
+  const f = boxProductFixture('gate401')
+  const res = new FakeServerResponse()
+  let calls = 0
+  try {
+    const result = await f.relay.serveMessages(
+      { model: 'cursor-fable-5-high', max_tokens: 32, messages: [{ role: 'user', content: 'synthetic composition' }] },
+      res as never, new AbortController().signal,
+      { onTerminal: async () => { calls++; throw new Error('synthetic persistence failure') } },
+    )
+    assert.equal(calls, 1)
+    assert.equal(result.kind, 'rejected')
+    assert.equal(res.statusCode, 400)
+    assert.match(res.text(), /CURSOR_SAND_BOX_CONNECTION_REJECTED/)
+    assert.doesNotMatch(res.text(), /synthetic persistence failure|message_stop/)
+  } finally { await f.relay.close() }
 })

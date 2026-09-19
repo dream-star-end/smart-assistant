@@ -44,7 +44,9 @@ export const buttonVariants = cva(
           "border border-border bg-surface text-fg hover:border-border-strong hover:bg-hover",
         ghost: "text-fg hover:bg-hover",
         subtle: "bg-hover text-fg hover:bg-active",
-        danger: "bg-danger text-white hover:opacity-90",
+        // 前景走 --danger-fg 而不是写死白字:暗色主题的 --danger 是为前景用途调亮过的
+        // #f0666e,配白字只有 3.07:1(shell 审计 S-03);明暗各配一档由 designTokens.test 守住。
+        danger: "bg-danger text-danger-fg hover:opacity-90",
         link: "text-accent underline-offset-4 hover:underline",
       },
       // 字号走语义档位(text-body=13px / text-title=15px),像素与原 text-[13px]/text-[15px]

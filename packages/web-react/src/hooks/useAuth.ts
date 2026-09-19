@@ -5,6 +5,7 @@ import { createMemoryAuthSession } from "../lib/authSession";
 import { clearAuthHint, hasAuthHint, setAuthHint } from "../lib/authHint";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
+import { teardownComposerDrafts } from "../lib/composerDraft";
 import { useLaneGate } from "./useLaneGate";
 
 const AUTH_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
@@ -109,6 +110,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const expiredUiRef = useRef<() => void>(() => {});
   const [authed, setAuthed] = useState(false);
   const [user, setUser] = useState<User | null>(opts.initialUser);
+  const userRef = useRef(user);
+  userRef.current = user;
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
@@ -129,6 +132,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
+    teardownComposerDrafts(userRef.current?.id);
     // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
     // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
     clearAuthHint();

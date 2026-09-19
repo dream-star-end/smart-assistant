@@ -1341,6 +1341,69 @@ export const api = {
       ),
     ),
 
+  getCollaborationConfig: (a: AuthSession, sessionId?: string) =>
+    jsonOrThrow<{
+      rev: number
+      defaultMode: "solo" | "advisor" | "team"
+      defaultAdvisorModel: string | null
+      session: {
+        mode: "solo" | "advisor" | "team"
+        advisorModel: string | null
+        configVersion: string
+        source: "session" | "default"
+      }
+      advisorModels?: Array<{ id: string; label: string; engine: string }>
+      advisorUnavailableReason?: string
+      advisorConsultParents?: string[]
+      advisorConsultParentReason?: string
+      advisorConsultAllowed?: boolean
+      parentEngine?: string
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/collaboration-config${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    ),
+
+  putCollaborationConfig: (
+    a: AuthSession,
+    body: {
+      sessionId?: string
+      mode: "solo" | "advisor" | "team"
+      advisorModel?: string | null
+      expectedRev?: number
+      asDefault?: boolean
+    },
+  ) =>
+    jsonOrThrow<{
+      rev: number
+      defaultMode: "solo" | "advisor" | "team"
+      defaultAdvisorModel: string | null
+      session: {
+        mode: "solo" | "advisor" | "team"
+        advisorModel: string | null
+        configVersion: string
+        source: "session" | "default"
+      }
+      advisorModels?: Array<{ id: string; label: string; engine: string }>
+      advisorUnavailableReason?: string
+      advisorConsultParents?: string[]
+      advisorConsultParentReason?: string
+      advisorConsultAllowed?: boolean
+      parentEngine?: string
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/collaboration-config", {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
   /** 改偏好（PATCH /api/me/preferences，Bearer）→ 新快照。 */
   patchPreferences: (a: AuthSession, patch: Preferences) =>
     jsonOrThrow<Preferences>(
@@ -1898,6 +1961,7 @@ export const api = {
     id: string,
     sinceSeq = 0,
     sinceHistoryRevision?: number,
+    permissionLookupIds?: string[],
   ): Promise<SessionDetail> => {
     const params = new URLSearchParams();
     if (sinceSeq > 0) {
@@ -1905,6 +1969,9 @@ export const api = {
       if (Number.isSafeInteger(sinceHistoryRevision) && (sinceHistoryRevision as number) >= 0) {
         params.set("since_history_revision", String(sinceHistoryRevision));
       }
+    }
+    if (permissionLookupIds && permissionLookupIds.length > 0) {
+      params.set("permission_lookup", permissionLookupIds.slice(0, 16).join(","));
     }
     const query = params.toString();
     const suffix = query ? `?${query}` : "";
@@ -4817,6 +4884,30 @@ export const api = {
         }),
       ),
     ),
+
+  /**
+   * 确认桌面 enrollment（POST /api/desktop/enroll/confirm，Bearer）。
+   * 成功 200 `{enrollment_id, code, deep_link}`；sim 平台 `deep_link` 为 null。
+   * `code` 只用于服务端拼深链，本 helper **不**把 code 交给调用方，以免误渲染。
+   * 失败经 ApiError 抛（401 / 403 DESKTOP_NOT_ENTITLED / 409 DEVICE_LIMIT|ENROLL_INVALID / 404 / 429）。
+   */
+  confirmDesktopEnroll: (
+    a: AuthSession,
+    enrollmentId: string,
+  ): Promise<{ enrollmentId: string; deepLink: string | null }> =>
+    jsonOrThrow<{ enrollment_id: string; code?: string; deep_link?: string | null }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/desktop/enroll/confirm", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ enrollment_id: enrollmentId }),
+        }),
+      ),
+    ).then((b) => ({
+      enrollmentId: b.enrollment_id,
+      deepLink: typeof b.deep_link === "string" && b.deep_link ? b.deep_link : null,
+    })),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

@@ -1,0 +1,7 @@
+# 教程夹具是「字节数 + SHA-256 逐位相等」的证据契约（docs/audit/tutorials.md TU-36）：
+# 标 -text 让 core.autocrlf=true 的 Windows 检出也保持仓库原样（LF），
+# src/lib/tutorialShowcase.test.ts 与 check:tutorials 的字节 / 哈希校验才不会被行尾改写打红。
+packages/web-react/public/tutorials/** -text
+packages/web-react/tutorial-sync*.json -text
+packages/web-react/tutorial-sync-history.jsonl -text
+packages/web-react/tutorial-capture-provenance.json -text
