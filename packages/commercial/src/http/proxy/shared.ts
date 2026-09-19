@@ -158,6 +158,14 @@ export const ALLOWED_BETA_VALUES: ReadonlySet<string> = new Set([
   "ccr-triggers-2026-01-30",
   "environments-2025-11-01",
   "mcp-servers-2025-12-04",
+  // 2026-09-20: official Claude Code sends fallback-credit so a refused
+  // Fable 5 turn can retry Opus without paying the prompt-cache twice.
+  // server-side-fallback is the sibling flag that grants the same fields.
+  // Add the family once so we do not hit ANTHROPIC_BETA_NOT_ALLOWED one by one.
+  "fallback-credit-2026-06-01",
+  "fallback-credit-2026-07-01",
+  "server-side-fallback-2026-06-01",
+  "server-side-fallback-2026-07-01",
 ]);
 
 /** body 字段字节预算(R3)。Buffer.byteLength(JSON.stringify(field), 'utf8') 口径。
