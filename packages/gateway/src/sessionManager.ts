@@ -6882,6 +6882,23 @@ export class SessionManager {
           return
         }
 
+        if (
+          session.providerTag === 'grok' &&
+          !session.runner.nativeSessionId &&
+          result?.stopReason === 'interrupted'
+        ) {
+          // Grok native sessions are dirtied by mid-turn SIGINT (incomplete
+          // tools on disk). Drop the resume-map head so the next submit does
+          // not --resume that id; OpenClaude history injection fills the gap.
+          this._forgetResumeEntry(session.sessionKey)
+          session.ccbSessionId = null
+          session._historicalContextInjected = false
+          session._historicalContextInjectedKey = undefined
+          session._forceHistoricalContextOnFirstTurn = true
+          session._contextRebuildNotice = 'native-resume-loss'
+          this._saveResumeMap()
+        }
+
         const terminalResultErrorClass =
           result?.errorClass ?? classifyRunError(result?.errorDetail).code
         if (
