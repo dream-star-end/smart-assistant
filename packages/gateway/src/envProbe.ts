@@ -49,6 +49,15 @@ const INIT_ENV_KEYS = [
 /** 用户面时区缺省。与 deploy 模板 `OC_USER_TZ` 及 commercial platformEnvelopeBuilder 的缺省一致。 */
 export const DEFAULT_USER_TZ = 'Asia/Shanghai'
 
+/** CCB extra-prompt 跟 18991 出口对齐；与 OC_USER_TZ 正交。 */
+export const DEFAULT_CCB_EGRESS_TZ = 'Asia/Tokyo'
+
+const CCB_PROMPT_PROVIDERS = new Set(['ccb', 'claude-subscription'])
+
+export function isCcbPromptProvider(provider?: string): boolean {
+  return provider != null && CCB_PROMPT_PROVIDERS.has(provider)
+}
+
 export type EnvInstance = 'v5-selfhost' | 'v5-commercial' | 'personal-legacy'
 
 export interface EnvFacts {
@@ -345,11 +354,21 @@ function factsAreEmpty(facts: EnvFacts): boolean {
   )
 }
 
-export function renderEnvSlot(facts: EnvFacts, agentId: string, now: Date = new Date()): EnvPromptSlot | null {
+export function renderEnvSlot(
+  facts: EnvFacts,
+  agentId: string,
+  now: Date = new Date(),
+  opts?: { provider?: string; env?: NodeJS.ProcessEnv },
+): EnvPromptSlot | null {
   if (factsAreEmpty(facts) && !sanitizeAgentId(agentId)) return null
   if (factsAreEmpty(facts)) return null
+  // CCB extra-prompt 走出口时区,避免 Anthropic 看到 OC_USER_TZ=Asia/Shanghai。
+  // Grok/Cursor 仍用 facts.userTz(OC_USER_TZ)。facts 缓存不按 provider 分叉。
+  const slotTz = isCcbPromptProvider(opts?.provider)
+    ? (sanitizeTimeZone(opts?.env?.OPENCLAUDE_CCB_TZ) ?? DEFAULT_CCB_EGRESS_TZ)
+    : facts.userTz
   // 偏移现算:facts 是进程级缓存,DST 时区的偏移不能跟着 uid/路径一起被冻住。
-  const userTzOffset = formatUtcOffset(facts.userTz, now) ?? facts.userTzOffset
+  const userTzOffset = formatUtcOffset(slotTz, now) ?? (slotTz === facts.userTz ? facts.userTzOffset : null)
 
   const lines: string[] = ['# Env · 勿重探']
   const ids: string[] = []
@@ -381,8 +400,8 @@ export function renderEnvSlot(facts: EnvFacts, agentId: string, now: Date = new 
   // 只给时区名+偏移(不给时刻,免得每轮撑爆 prompt 缓存);要时刻自己 `date -u` 再换算。
   lines.push(
     userTzOffset
-      ? `user_tz=${facts.userTz} ${userTzOffset} (shell date/TZ=出口时区,勿当用户时间)`
-      : `user_tz=${facts.userTz} (shell date/TZ=出口时区,勿当用户时间)`,
+      ? `user_tz=${slotTz} ${userTzOffset} (shell date/TZ=出口时区,勿当用户时间)`
+      : `user_tz=${slotTz} (shell date/TZ=出口时区,勿当用户时间)`,
   )
 
   let content = lines.join('\n')
@@ -396,10 +415,17 @@ export function renderEnvSlot(facts: EnvFacts, agentId: string, now: Date = new 
   return { name: 'ENV', content }
 }
 
-export function buildEnvSlot(ctx: { agentId: string }, deps?: EnvProbeDeps): EnvPromptSlot | null {
+export function buildEnvSlot(
+  ctx: { agentId: string; provider?: string },
+  deps?: EnvProbeDeps,
+): EnvPromptSlot | null {
   try {
     const facts = deps ? computeEnvFacts(deps) : probeEnvFacts()
-    return renderEnvSlot(facts, ctx.agentId)
+    const env = deps?.env ?? process.env
+    return renderEnvSlot(facts, ctx.agentId, deps?.now ?? new Date(), {
+      provider: ctx.provider,
+      env,
+    })
   } catch {
     return null
   }

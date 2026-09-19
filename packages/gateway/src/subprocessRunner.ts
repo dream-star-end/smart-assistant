@@ -2503,7 +2503,9 @@ export class SubprocessRunner extends EventEmitter {
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
         identityCompat: this.opts.identityCompat?.assets,
-        provider: effectiveProvider,
+        // CCB extra-prompt is this runner only. Force a CCB provider so ENV
+        // slot user_tz follows OPENCLAUDE_CCB_TZ, not OC_USER_TZ=Asia/Shanghai.
+        provider: effectiveProvider === 'claude-subscription' ? 'claude-subscription' : 'ccb',
         model: this.opts.model,
         modelSupportsVision: this.currentExecutionDescriptor?.supportsVision,
         availableMcpTools: projectedMcpTools,

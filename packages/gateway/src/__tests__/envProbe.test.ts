@@ -342,6 +342,39 @@ describe('envProbe', () => {
     assert.doesNotMatch(slot.content, /Tokyo/)
   })
 
+  it('CCB extra-prompt user_tz follows OPENCLAUDE_CCB_TZ and omits Asia/Shanghai', () => {
+    const env = {
+      ...selfhostEnv,
+      OC_USER_TZ: 'Asia/Shanghai',
+      TZ: 'Asia/Tokyo',
+      OPENCLAUDE_CCB_TZ: 'Asia/Tokyo',
+    }
+    const ccb = buildEnvSlot(
+      { agentId: 'main', provider: 'ccb' },
+      fakeDeps({ env, files: selfhostFiles }),
+    )
+    assert.ok(ccb)
+    assert.match(ccb.content, /^user_tz=Asia\/Tokyo UTC\+09:00 /m)
+    assert.doesNotMatch(ccb.content, /Shanghai/)
+    const grok = buildEnvSlot(
+      { agentId: 'main', provider: 'grok' },
+      fakeDeps({ env, files: selfhostFiles }),
+    )
+    assert.ok(grok)
+    assert.match(grok.content, /^user_tz=Asia\/Shanghai UTC\+08:00 /m)
+    assert.doesNotMatch(grok.content, /Tokyo/)
+  })
+
+  it('CCB extra-prompt defaults to Asia/Tokyo when OPENCLAUDE_CCB_TZ is absent', () => {
+    const slot = buildEnvSlot(
+      { agentId: 'main', provider: 'ccb' },
+      fakeDeps({ env: { ...selfhostEnv, OC_USER_TZ: 'Asia/Shanghai' }, files: selfhostFiles }),
+    )
+    assert.ok(slot)
+    assert.match(slot.content, /^user_tz=Asia\/Tokyo UTC\+09:00 /m)
+    assert.doesNotMatch(slot.content, /Shanghai/)
+  })
+
   it('user_tz is backfilled from init environ when the engine scrubbed process env', () => {
     const initPath = join(TEST_HOME, 'init-environ-tz')
     writeFileSync(initPath, Buffer.from(`${['OC_USER_ID=3', 'OC_USER_TZ=Europe/Berlin'].join('\0')}\0`))
