@@ -7834,7 +7834,7 @@ wait $!
       bootUses.length === 2,
       `BOOT_TIMEOUT 只应用于 J1 首屏落地(goto + 首个 click),当前传参 ${bootUses.length} 处`,
     )
-    assert.match(source, /getByPlaceholder\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
+    assert.match(source, /getByLabel\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
   })
 
   test('E2E journey seeds oc_auth_hint after API login cookie and before authed root reload', async () => {
