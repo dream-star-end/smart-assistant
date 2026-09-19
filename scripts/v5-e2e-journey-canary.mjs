@@ -74,7 +74,7 @@ const PRE_J5_TIMEOUT = 240_000;
  * 回归。固定 Luna 仍通过真实模型选择器和真实 J5 回复验证完整用户路径，同时避免
  * 旅程继承 canary 账号历史会话的粘滞模型。
  */
-const JOURNEY_MODEL_ID = "gpt-5.6-luna";
+const JOURNEY_MODEL_ID = "grok-build";
 /**
  * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
  * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件

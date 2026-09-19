@@ -30,7 +30,7 @@ test("TAP emits one result per line with timings and sanitizes diagnostics", () 
 });
 const sent = { type: "inbound.message", model: "grok-build", content: { text: "probe" }, peer: { id: "p" }, clientMessageId: "m" };
 test("outbound proof rejects wrong model engine text and team override", () => {
-  const expected = { model: sent.model, text: "probe", engine: "codex" };
+  const expected = { model: sent.model, text: "probe", engine: "grok" };
   assert.equal(assertOutbound(sent, expected, catalog), sent);
   for (const f of [{ ...sent, model: "deepseek-v4-flash" }, { ...sent, teamMode: true }, { ...sent, clientMessageId: "" }]) assert.throws(() => assertOutbound(f, expected, catalog));
   assert.throws(() => assertOutbound(sent, { ...expected, engine: "ccb" }, catalog));
