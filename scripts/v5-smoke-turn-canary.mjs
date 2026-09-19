@@ -21,7 +21,7 @@
 //   V5_BASE(默认 http://127.0.0.1:18790)
 //   V5_CANARY_EMAIL(默认 v5-canary@claudeai.chat)
 //   V5_CANARY_PASSWORD_FILE(默认 /root/.secrets/v5-canary.password)
-//   V5_TURN_MODEL(默认 gpt-5.6-sol —— codex 引擎侧,即 2026-07-17 的盲区面)
+//   V5_TURN_MODEL(默认 grok-build —— grok 引擎侧;不再默认消耗 GPT 额度)
 //   V5_TURN_ATTEMPTS(默认 8;容器冷启动时 bridge 会 close,需重连)
 //   V5_TURN_SILENCE_MS(默认 deepseek-v4-flash=270000,其它=90000;仅作兜底,判成靠三信号)
 //   V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE(默认 0;仅供 0% candidate 的 CCB
@@ -44,7 +44,7 @@ const { WebSocket } = require_('ws')
 const BASE = process.env.V5_BASE ?? 'http://127.0.0.1:18790'
 const EMAIL = process.env.V5_CANARY_EMAIL ?? 'v5-canary@claudeai.chat'
 const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? '/root/.secrets/v5-canary.password'
-const MODEL = process.env.V5_TURN_MODEL ?? 'gpt-5.6-sol'
+const MODEL = process.env.V5_TURN_MODEL ?? 'grok-build'
 const ATTEMPTS = Number(process.env.V5_TURN_ATTEMPTS ?? 8)
 // 两次独立生产实测 DeepSeek 正常完成均约 233 秒；270 秒仍受部署脚本 300 秒外层门约束。
 const DEFAULT_SILENCE_MS = MODEL === 'deepseek-v4-flash' ? 270_000 : 90_000

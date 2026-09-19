@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence } from "../lib/user-contract.mjs";
-const catalog = [{ id: "gpt-5.6-sol", engine: "codex" }, { id: "deepseek-v4-flash", engine: "ccb" }];
+const catalog = [{ id: "grok-build", engine: "grok" }, { id: "deepseek-v4-flash", engine: "ccb" }];
 test("contract options default dry and reject malformed modes/origins", () => {
   assert.equal(parseOptions({}).cost, "dry");
   assert.equal(parseOptions({ V5_CONTRACT_COST: "live" }).cost, "live");
@@ -28,9 +28,9 @@ test("TAP emits one result per line with timings and sanitizes diagnostics", () 
   assert.equal(tapResult(false, 2, "case\nname", 1.6, "bad\nreason"), "not ok 2 - case name\n# duration_ms 2 2\n# error bad reason");
   assert.match(tapResult(true, 1, "C1", 0), /^ok 1 - C1/);
 });
-const sent = { type: "inbound.message", model: "gpt-5.6-sol", content: { text: "probe" }, peer: { id: "p" }, clientMessageId: "m" };
+const sent = { type: "inbound.message", model: "grok-build", content: { text: "probe" }, peer: { id: "p" }, clientMessageId: "m" };
 test("outbound proof rejects wrong model engine text and team override", () => {
-  const expected = { model: sent.model, text: "probe", engine: "codex" };
+  const expected = { model: sent.model, text: "probe", engine: "grok" };
   assert.equal(assertOutbound(sent, expected, catalog), sent);
   for (const f of [{ ...sent, model: "deepseek-v4-flash" }, { ...sent, teamMode: true }, { ...sent, clientMessageId: "" }]) assert.throws(() => assertOutbound(f, expected, catalog));
   assert.throws(() => assertOutbound(sent, { ...expected, engine: "ccb" }, catalog));
