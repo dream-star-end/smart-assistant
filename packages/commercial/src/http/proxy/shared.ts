@@ -166,6 +166,36 @@ export const ALLOWED_BETA_VALUES: ReadonlySet<string> = new Set([
   "fallback-credit-2026-07-01",
   "server-side-fallback-2026-06-01",
   "server-side-fallback-2026-07-01",
+  // 2026-09-20: official Claude Code 2.1.278 still sent betas missing from
+  // the allowlist. thinking-token-count is the live miss (Opus 5 high).
+  // Add the rest of the CLI-dated family once.
+  "thinking-token-count-2026-05-13",
+  "thinking-display-updates-2026-08-18",
+  "thinking-binding-controls-2026-08-01",
+  "thinking-resumption-2026-07-17",
+  "agent-memory-2026-07-22",
+  "auto-mode-classifier-2026-07-16",
+  "cache-diagnosis-2026-04-07",
+  "compact-2026-01-12",
+  "context-hint-2026-04-09",
+  "dangerous-tool-use-2026-09-03",
+  "dreaming-2026-04-21",
+  "extended-cache-ttl-2025-04-11",
+  "managed-agents-2026-04-01",
+  "mcp-tunnels-2026-06-22",
+  "message-batches-2024-09-24",
+  "message-threads-2026-08-12",
+  "mid-conversation-output-config-2026-07-01",
+  "mid-conversation-system-2026-04-07",
+  "mid-conversation-system-clear-at-2026-08-21",
+  "mid-conversation-tool-changes-2026-07-01",
+  "oidc-federation-2026-04-01",
+  "per-turn-control-2026-07-01",
+  "prompt-caching-evict-2026-05-12",
+  "skills-2025-10-02",
+  "timing-2026-09-09",
+  "token-counting-2024-11-01",
+  "user-profiles-2026-03-24",
 ]);
 
 /** body 字段字节预算(R3)。Buffer.byteLength(JSON.stringify(field), 'utf8') 口径。
