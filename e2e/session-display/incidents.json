@@ -4262,6 +4262,33 @@
       "coverageCommits": [
         "929970ac9"
       ]
+    },
+    {
+      "id": "INC-20260920-CC-BETA-FALLBACK-CREDIT",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "刚加的官方 Claude Pro OAuth 一发请求就被 18892 代理拦下：官方 Claude Code 带头 anthropic-beta fallback-credit-2026-06-01，ALLOWED_BETA_VALUES 没有该项，ANTHROPIC_BETA_NOT_ALLOWED，账号 3 次失败进 cooldown，前台「上游连续失败」。",
+      "rootFixCommit": "419183882",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "ALLOWED_BETA_VALUES 包含 fallback-credit 家族(官方 CC 默认带头)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "fallback-credit-2026-06-01 单值 → 通过"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "oauth + fallback-credit 多值 → 全过"
+        }
+      ],
+      "coverageCommits": [
+        "419183882"
+      ]
     }
   ]
 }
