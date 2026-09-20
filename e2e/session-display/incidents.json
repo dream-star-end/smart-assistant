@@ -4311,6 +4311,33 @@
       "coverageCommits": [
         "6b22b40da"
       ]
+    },
+    {
+      "id": "INC-20260920-CLAUDE-QUOTA-RESET-STALE",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC Opus 5 黄卡「模型繁忙」：18892 proxy_account_pool_unavailable reason=no_active。唯一 Claude 号 quota_5h_pct=96 被 95% 阈值踢出池，但 quota_5h_resets_at 已过；占用只从响应头回写，出池后永不刷新。",
+      "rootFixCommit": "d08669ae4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
+          "assertion": "5h 占用 96% 且 resets_at 已过 → 仍可 pick"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
+          "assertion": "5h 占用 96% 且 resets_at 仍在未来 → no_active"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
+          "assertion": "5h 占用 96% 且 resets_at 为空 → no_active"
+        }
+      ],
+      "coverageCommits": [
+        "d08669ae4"
+      ]
     }
   ]
 }
