@@ -320,7 +320,8 @@ try {
 
   await step("J3 目标全链:菜单→创建→active 可见→清除", async () => {
     await page.getByRole("button", { name: "更多选项" }).click();
-    const goalItem = page.getByText("设定目标");
+    // EmptyState button "为这次会话设定目标" also contains 设定目标 (86ad3da3 J3 strict 2).
+    const goalItem = page.getByRole("menuitem", { name: "设定目标", exact: true });
     await goalItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await goalItem.click();
     const dialog = page.getByRole("dialog");

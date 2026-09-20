@@ -7564,6 +7564,12 @@ wait $!
       /getByText\("添加附件"\)/,
       "J2 must not look for overflow-menu text 添加附件; that string is no longer visible",
     )
+    assert.match(
+      journeySource,
+      /getByRole\("menuitem", \{ name: "设定目标", exact: true \}\)/,
+      "J3 must click the plus-menu menuitem, not EmptyState text that also contains 设定目标",
+    )
+    assert.doesNotMatch(journeySource, /getByText\("设定目标"\)/)
     assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
     assert.match(
       journeySource,
