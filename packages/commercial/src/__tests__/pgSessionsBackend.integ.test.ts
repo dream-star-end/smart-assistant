@@ -6017,7 +6017,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(recovered.kind, "admitted");
   });
 
-  maybe("SERVICE_RESTART leftover checkpoint allows automatic recovery even if tools are unproven", async () => {
+  maybe("SERVICE_RESTART leftover with live progress refuses automatic recovery", async () => {
     const sessionId = "s-dd-recovery-sr-leftover-auto";
     const sourceClientMessageId = "cm-dd-recovery-sr-leftover-auto";
     await seedRecoverableSource({
@@ -6057,7 +6057,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         max: 10,
       },
     }));
-    assert.equal(recovered.kind, "admitted");
+    assert.deepEqual(recovered, {
+      kind: "recovery_conflict",
+      reason: "automatic_checkpoint_unsafe",
+    });
   });
 
   maybe("lossless waiver recovery retains automatic checkpoint safety gate", async () => {

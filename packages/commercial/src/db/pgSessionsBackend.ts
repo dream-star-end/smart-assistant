@@ -1851,17 +1851,17 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
 /** Callers must pass payloads already through filterMonotonicLiveFramePayloads. */
 async function sessionTurnHasSuccessfulUsage(
   client: PoolClient,
-  sessionId: string,
+  uid: bigint,
   turnKey: string | undefined,
 ): Promise<boolean> {
   if (typeof turnKey !== "string" || !/^[0-9a-f]{64}$/.test(turnKey)) return false;
   const row = await client.query(
     `SELECT 1
        FROM usage_records
-      WHERE session_id=$1 AND turn_key=$2 AND status='success'
+      WHERE user_id=$1 AND turn_key=$2 AND status='success'
         AND (output_tokens > 0 OR cache_read_tokens > 0)
       LIMIT 1`,
-    [sessionId, turnKey],
+    [uid, turnKey],
   );
   return (row.rowCount ?? 0) > 0;
 }
@@ -2183,7 +2183,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const recoveryRecords = input.turn.records.map((record) => record.payload);
   const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
     client,
-    input.sessionId,
+    input.uid,
     input.turn.payload.turnKey,
   );
   if (shouldDeclineLiveServiceRestartRecovery({
@@ -9003,7 +9003,7 @@ export function createPgSessionsBackend(
                   leftoverRecords,
                   hasSuccessfulUpstreamUsage: await sessionTurnHasSuccessfulUsage(
                     client,
-                    input.sessionId,
+                    input.uid,
                     typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
                   ),
                 })
