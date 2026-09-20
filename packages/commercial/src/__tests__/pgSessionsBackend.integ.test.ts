@@ -161,7 +161,14 @@ before(async () => {
   await pool.query(
     "CREATE TABLE IF NOT EXISTS request_finalize_journal (request_id TEXT PRIMARY KEY)",
   );
-  await pool.query("CREATE TABLE IF NOT EXISTS usage_records (id BIGSERIAL PRIMARY KEY)");
+  await pool.query(`CREATE TABLE IF NOT EXISTS usage_records (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT,
+    turn_key TEXT,
+    status TEXT,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0
+  )`);
   await pool.query("CREATE TABLE IF NOT EXISTS turn_traces (trace_id TEXT PRIMARY KEY)");
   await pool.query(await readFile(MIGRATION_0170, { encoding: "utf8" }));
   // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。

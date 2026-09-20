@@ -167,7 +167,7 @@ function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): Mode
 
 function snapOfficialCc(epoch = EPOCH): ModelCatalogSnapshot {
   return new ModelCatalogSnapshot({
-    entries: [GLM, SOL, DISABLED, FLASH, ZAI, OPUS5],
+    entries: [GLM, SOL, DISABLED, FLASH, SUBAGENT, OPUS5],
     aliases: new Map([["glm-latest", 1]]),
     pricing: new Map(
       [
