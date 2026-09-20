@@ -83,7 +83,7 @@ import {
   type ArtifactInspectTarget,
   type ChatInteraction,
 } from "./components/tool/context";
-import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
+import { AgentPanelHost, useAgentPanelController } from "./components/agentPanel/AgentPanelHost";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
@@ -427,9 +427,8 @@ export function App() {
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
-  // 产物详情列(Codex 式第三列):选中产物是纯 UI 态(切会话/关面板即清),不进 ChatSocket。
-  // 桌面 md+ 内联第三列;窄屏用右侧 Sheet 抽屉,不硬挤三列。
-  const [inspectTarget, setInspectTarget] = useState<ArtifactInspectTarget | null>(null);
+  // 「Agent 电脑」面板(演进自产物详情列):跟随 / 固定 / 步骤状态由 useAgentPanelController 持有
+  // (见下方 wsMessages 之后),纯 UI 态,不进 ChatSocket;桌面 md+ 内联第三列 / rail,窄屏 chip + 贴底 Sheet。
   const isMdViewport = useMdViewport();
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
@@ -771,12 +770,6 @@ export function App() {
     onNotificationOpen: selectSession,
   });
   const sidebarWidth = useSidebarWidth();
-
-  // 切会话/进出任务看板时清掉产物详情列:消息对象引用属于旧会话上下文,跨会话保留只会
-  // 展示与当前消息流无关的陈旧内容。
-  useEffect(() => {
-    setInspectTarget(null);
-  }, [activeId, boardOpen]);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -2055,6 +2048,20 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+
+  // 「Agent 电脑」面板控制器(PRD_MANUS_A F1):自动跟随当前 turn 的顶层工具;看板占据 main 时不渲染但保留
+  // 状态(关看板后按当前状态恢复);demo 无工具流不启用。侧栏宽度只用于自动打开时决定展开还是 rail(★4)。
+  const agentPanel = useAgentPanelController(wsMessages, wsSending, {
+    enabled: !boardOpen && !demo,
+    sidebarWidth: collapsed ? 0 : sidebarWidth.width,
+  });
+  // 切会话时清掉面板:消息对象引用属于旧会话上下文,跨会话保留只会展示与当前消息流无关的陈旧内容。
+  const resetAgentPanel = agentPanel.reset;
+  useEffect(() => {
+    resetAgentPanel();
+  }, [activeId, resetAgentPanel]);
+  // 窄屏 chip 的挂点(composer-safe-b 内、HUD 之后);Host 通过 portal 把 chip 渲染进去。
+  const [agentChipSlot, setAgentChipSlot] = useState<HTMLDivElement | null>(null);
   const inflightDelegates = useInflightDelegates({
     sessionId: !demo && activeId ? activeId : null,
     messages: wsMessages,
@@ -2434,10 +2441,12 @@ export function App() {
     [demo, send, sending],
   );
 
-  // 产物详情列 open 回调:引用稳定,不随面板开合变化,避免打穿 MessageList 的 sig-memo。
+  // 工具卡表头 / 「查看全文」→ 面板定位到该消息并进入「已固定」(F1.6)。引用稳定,不随面板开合变化,
+  // 避免打穿 MessageList 的 sig-memo。
+  const pinAgentPanelMessage = agentPanel.pinMessage;
   const artifactInspect = useMemo(
-    () => ({ open: (t: ArtifactInspectTarget) => setInspectTarget(t) }),
-    [],
+    () => ({ open: (t: ArtifactInspectTarget) => pinAgentPanelMessage(t.message) }),
+    [pinAgentPanelMessage],
   );
 
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
@@ -3445,7 +3454,7 @@ export function App() {
     <ArtifactInspectContext.Provider value={artifactInspect}>
     {/* tools T-18:详情面板当前查看的那条 tool 消息 → 源卡片选中态。与 open 回调分开成独立 context,
         面板开合只重渲消费它的 ToolCard,不打穿 MessageList 的 sig-memo(tool/context.ts 注释)。 */}
-    <ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>
+    <ArtifactInspectActiveContext.Provider value={agentPanel.enabled ? agentPanel.target : null}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <ProjectScopeProvider
@@ -3817,6 +3826,8 @@ export function App() {
               onStop={wsSending ? stopTurn : undefined}
             />
           )}
+          {/* 窄屏「Agent 电脑」chip 挂点(F1.5):HUD 之后、审批槽之前,只占一行;桌面隐藏。 */}
+          {!demo && !gated && <div ref={setAgentChipSlot} className="md:hidden" data-agent-chip-slot="" />}
           {!demo && !gated && (
             <div
               id="pending-approval-bar-slot"
@@ -3950,25 +3961,11 @@ export function App() {
         )}
       </main>
 
-      {/* 产物详情列(Codex 式第三列)。桌面:与 Sidebar|main 并列的内联 aside;
-          窄屏:右侧 Sheet 抽屉(共用 InspectorPanelContent)。任务看板占据 main 时不渲染。 */}
-      {!boardOpen && inspectTarget && isMdViewport && (
-        <InspectorPanel target={inspectTarget} onClose={() => setInspectTarget(null)} />
+      {/* 「Agent 电脑」面板(PRD_MANUS_A F1)。桌面:与 Sidebar|main 并列的第三列 aside(展开)或 48px rail(折叠),
+          自动跟随当前 turn 的顶层工具;窄屏:chip(挂在 composer-safe-b)+ 贴底 Sheet。看板占据 main / gated 时不渲染。 */}
+      {!gated && (
+        <AgentPanelHost controller={agentPanel} chipSlot={agentChipSlot} onOpenPreview={setContainerPreviewUrl} />
       )}
-      <Sheet
-        open={!boardOpen && !!inspectTarget && !isMdViewport}
-        onOpenChange={(o) => {
-          if (!o) setInspectTarget(null);
-        }}
-        side="bottom"
-        srTitle="产物详情"
-        className="md:hidden"
-        overlayClassName="md:hidden"
-      >
-        {inspectTarget && (
-          <InspectorPanelContent target={inspectTarget} onClose={() => setInspectTarget(null)} />
-        )}
-      </Sheet>
 
       <AgentPicker
         open={pickerOpen}
