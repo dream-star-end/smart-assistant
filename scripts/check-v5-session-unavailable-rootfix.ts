@@ -295,6 +295,7 @@ const C_FULL_LEAVES = [
   'derives the monotonic retry counter from raw controls or compacted terminal stamps',
   'resets one first-event silent recovery, then persistently pauses the same no-progress lineage',
   'pauses a runner-loss lineage after two zero-progress attempts, not one',
+  'refuses leftover SERVICE_RESTART checkpoint recovery once the tape already produced output',
   'keeps the ordinary retry budget once model, tool, or token progress exists',
   'derives checkpoint safety from exact process and external-action states',
 ] as const
