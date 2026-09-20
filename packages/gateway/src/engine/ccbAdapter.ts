@@ -418,8 +418,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   /** Session-open preheat = spawn the long-lived CCB subprocess (bun boot +
    * `--resume` JSONL load) so a cold first turn skips ~20s. The idle process
-   * waits on stdin; no user line is written, no upstream LLM call happens. */
+   * waits on stdin; no user line is written, no upstream LLM call happens.
+   * Official Claude Code skips preheat: `--resume` without a master dispatch
+   * continues the native session (OCV5-241), and a cold spawn would drop the
+   * transcript. The next submitTurn() still `--resume`s under an admitted turn. */
   preheat(): Promise<void> {
+    if (this.harness === 'official-cc') return Promise.resolve()
     return this.runner.start()
   }
 

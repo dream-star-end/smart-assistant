@@ -70,6 +70,18 @@ describe('OC_CCB_OFFICIAL_CC flag', () => {
     assert.equal((on as unknown as { harness: string }).harness, 'official-cc')
     assert.equal((on as unknown as { authorityEngine: string }).authorityEngine, 'ccb')
   })
+
+  it('official-cc preheat does not spawn or --resume without a master dispatch', async () => {
+    process.env.OC_CCB_OFFICIAL_CC = '1'
+    let starts = 0
+    const runner = {
+      on() { return this },
+      start: async () => { starts += 1 },
+    }
+    const adapter = new CcbAdapter({ harness: 'official-cc' } as never, runner as never)
+    await adapter.preheat()
+    assert.equal(starts, 0)
+  })
 })
 
 describe('assertOfficialCcSpawnPreconditions', () => {

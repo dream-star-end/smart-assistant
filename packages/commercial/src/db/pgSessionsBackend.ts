@@ -63,6 +63,7 @@ import {
   normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
+  allowUnsafeAutomaticCheckpoint,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
   turnRecoveryAttemptIdentity,
@@ -1926,17 +1927,7 @@ function mergeTapeAndLeftoverRecoveryAssessment(
   return { ...tape, leftoverBacked: false };
 }
 
-/** Completed-error already resumes unsafe checkpoints. SERVICE_RESTART crash
- * tapes are error-only by leftover isolation, so leftover-backed process is
- * the designed checkpoint and uses the same continuation prompt. */
-function allowUnsafeAutomaticCheckpoint(
-  status: string,
-  errorCode: string,
-  leftoverBacked: boolean,
-): boolean {
-  if (status === "completed") return true;
-  return leftoverBacked && normalizeTurnErrorCode(errorCode) === "service_restart";
-}
+
 
 /** The last assistant record is the semantic terminal surface. An earlier
  * error followed by a later answer is not a failed turn, while trailing tool
@@ -2174,7 +2165,12 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
-    !allowUnsafeAutomaticCheckpoint(status, errorCode, assessment.leftoverBacked)
+    !allowUnsafeAutomaticCheckpoint({
+      status,
+      errorCode,
+      leftoverBacked: assessment.leftoverBacked,
+      records: input.turn.records.map((record) => record.payload),
+    })
   ) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
@@ -8967,11 +8963,12 @@ export function createPgSessionsBackend(
                 input.recovery.automatic &&
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
-                !allowUnsafeAutomaticCheckpoint(
-                  finalized.status,
-                  finalizedErrorCode,
-                  assessment.leftoverBacked,
-                )
+                !allowUnsafeAutomaticCheckpoint({
+                  status: finalized.status,
+                  errorCode: finalizedErrorCode,
+                  leftoverBacked: assessment.leftoverBacked,
+                  records,
+                })
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }

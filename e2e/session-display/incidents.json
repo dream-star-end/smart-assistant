@@ -4365,6 +4365,30 @@
       "coverageCommits": [
         "a63fbe791"
       ]
+    },
+    {
+      "id": "INC-20260920-OFFICIAL-CC-FALSE-SERVICE-RESTART",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC 活回合被误判 SERVICE_RESTART：黄卡「任务已中断」但进程仍在出活、过一会又自动续跑。",
+      "rootFixCommit": "PENDING",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "refuses leftover SERVICE_RESTART checkpoint recovery once the tape already produced output"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbOfficialCcHarness.test.ts",
+          "assertion": "official-cc preheat does not spawn or --resume without a master dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerArgs.test.ts",
+          "assertion": "omits --resume when preheat asks for a cold official-cc spawn"
+        }
+      ]
     }
   ]
 }

@@ -6,6 +6,7 @@ import {
   TURN_ERROR_TAXONOMY,
   assessTurnRecoveryTape,
   hasMeaningfulAutomaticRecoveryProgress,
+  allowUnsafeAutomaticCheckpoint,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
   maxAutomaticTurnRetryAttempt,
@@ -179,6 +180,43 @@ describe('automatic turn recovery policy', () => {
     // Non-silent, non-runner-loss transient codes are untouched.
     assert.equal(shouldPauseSilentAutomaticRecovery({
       errorCode: 'upstream_failed', currentAttempt: 9, records: empty,
+    }), false)
+  })
+
+  it('refuses leftover SERVICE_RESTART checkpoint recovery once the tape already produced output', () => {
+    const progressed = [{ role: 'assistant', text: 'API Error: Opus 4.8 safeguards flagged this message.' }]
+    const empty = [{ role: 'assistant', text: '子进程被信号 SIGKILL 终止', _errorCode: 'SERVICE_RESTART' }]
+    // OCV5-241: completed + leftover restart + real output → do not SIGKILL a live runner.
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'completed',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: progressed,
+    }), false)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'interrupted',
+      errorCode: 'SERVICE_RESTART',
+      leftoverBacked: true,
+      records: [{ kind: 'tool_use', id: 'tool-1' }],
+    }), false)
+    // Genuine deploy-kill-before-output still continues.
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'completed',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: empty,
+    }), true)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'interrupted',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: empty,
+    }), true)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'interrupted',
+      errorCode: 'runner_crashed',
+      leftoverBacked: false,
+      records: empty,
     }), false)
   })
 

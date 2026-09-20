@@ -285,6 +285,28 @@ export function isRunnerLossAutomaticRecoveryError(code: string): boolean {
   return RUNNER_LOSS_NO_PROGRESS_CODES.has(normalizeTurnErrorCode(code))
 }
 
+/**
+ * Leftover SERVICE_RESTART is a continuation checkpoint only when the tape
+ * itself has no semantic progress. A live official-cc that already produced
+ * assistant/tool/token output must not be recovered into a new child that
+ * the control plane then SIGKILLs (OCV5-241: yellow 「任务已中断」 while the
+ * runner is still billing Anthropic).
+ *
+ * Empty completed + leftover restart still returns true: that is the genuine
+ * deploy-kill-before-output case.
+ */
+export function allowUnsafeAutomaticCheckpoint(input: {
+  status: string
+  errorCode: string
+  leftoverBacked: boolean
+  records: readonly unknown[]
+}): boolean {
+  if (hasMeaningfulAutomaticRecoveryProgress(input.records)) return false
+  if (input.status === 'completed') return true
+  return input.leftoverBacked &&
+    normalizeTurnErrorCode(input.errorCode) === 'service_restart'
+}
+
 export function shouldPauseSilentAutomaticRecovery(input: {
   errorCode: string
   currentAttempt: number
