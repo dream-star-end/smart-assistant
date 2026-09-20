@@ -7823,8 +7823,11 @@ wait $!
     assert.match(source, /newestAssistant\.locator\('\[role="alert"\]'\)/)
     assert.match(source, /writeFileSync\(probePath, `\$\{probeToken\}\\n`\)/)
     assert.match(source, /finalBody\.includes\(probeToken\)/)
-    assert.match(source, /getByRole\("button", \{ name: "开始目标" \}\)\.click\(\)/)
+    assert.match(source, /getByRole\("button", \{ name: "设置并开始", exact: true \}\)\.click\(\)/)
     assert.match(source, /getByRole\("button", \{ name: \/清除\/ \}\)\.click\(\)/)
+    assert.match(source, /getByRole\("button", \{ name: "清除目标", exact: true \}\)\.click\(\)/)
+    assert.match(source, /getByText\("已启用", \{ exact: true \}\)/)
+    assert.doesNotMatch(source, /name: "开始目标"/)
     assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
   })
 

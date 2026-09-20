@@ -328,11 +328,19 @@ try {
     await dialog.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     const goalMarker = `e2e-goal-${Date.now().toString(36)}`;
     await dialog.getByPlaceholder("这次会话要达成什么？").fill(goalMarker);
-    await dialog.getByRole("button", { name: "开始目标" }).click();
-    await dialog.getByRole("button", { name: /清除/ }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    await dialog.getByText("进行中", { exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    // GoalDialog: first submit is 设置并开始 (2163a324 waited on 开始目标). Saving closes the modal.
+    await dialog.getByRole("button", { name: "设置并开始", exact: true }).click();
+    await dialog.waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
+
+    await page.getByRole("button", { name: "更多选项" }).click();
+    const openGoal = page.getByRole("menuitem", { name: "目标", exact: true });
+    await openGoal.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await openGoal.click();
+    await dialog.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await dialog.getByText("已启用", { exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await dialog.getByRole("button", { name: /清除/ }).click();
-    await dialog.getByRole("button", { name: "开始目标" }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await page.getByRole("button", { name: "清除目标", exact: true }).click();
+    await dialog.getByRole("button", { name: "设置并开始", exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
   });
