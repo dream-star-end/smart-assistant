@@ -4388,6 +4388,48 @@
           "assertion": "official-cc preheat does not spawn or --resume without a master dispatch"
         }
       ]
+    },
+    {
+      "id": "INC-20260920-OFFICIAL-CC-EXPIRED-AUTHORITY-LEASE",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC 长工具空闲后 403 model authority expired（sleep 240 > 120s TTL，过期 envelope 与有效 lease 同带）；随后 leftover/unpublished 磁带仍 SERVICE_RESTART 自动恢复出黄卡「任务已中断」，进程继续出 token。",
+      "rootFixCommit": "ac3dc10d8",
+      "coverageCommits": [
+        "ac3dc10d8"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "长 turn:authority 已过期、lease 仍有效 → 放行(R4-M1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "过期 authority 且无有效 lease → 仍 MODEL_AUTHORITY_INVALID"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "claude-opus-4-8 + 过期 authority + 有效 lease → 仍改写到票面主模型"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "refuses leftover SERVICE_RESTART when progress is only on leftover frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "refuses SERVICE_RESTART recovery when the turn already billed successful usage"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }
