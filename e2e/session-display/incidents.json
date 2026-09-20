@@ -4396,7 +4396,8 @@
       "symptom": "官方 CC 长工具空闲后 403 model authority expired（sleep 240 > 120s TTL，过期 envelope 与有效 lease 同带）；随后 leftover/unpublished 磁带仍 SERVICE_RESTART 自动恢复出黄卡「任务已中断」，进程继续出 token。",
       "rootFixCommit": "ac3dc10d8",
       "coverageCommits": [
-        "ac3dc10d8"
+        "ac3dc10d8",
+        "4a6812df4"
       ],
       "regressions": [
         {
@@ -4428,6 +4429,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "SERVICE_RESTART leftover with live progress refuses automatic recovery"
         }
       ]
     }
