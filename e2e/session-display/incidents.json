@@ -4338,6 +4338,33 @@
       "coverageCommits": [
         "d08669ae4"
       ]
+    },
+    {
+      "id": "INC-20260920-OFFICIAL-CC-OPUS48-GATE",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC 选 Opus 5 时另打 claude-opus-4-8，18892 MODEL_NOT_AVAILABLE；CLI 写成 Failed to authenticate，前台红卡认证状态异常。",
+      "rootFixCommit": "a63fbe791",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "claude-opus-4-8 + opus-5 票 → 放行且 canonical=claude-opus-5"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "claude-opus-4-8 无票 → 仍 MODEL_NOT_AVAILABLE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "非 claude-* 的未知型号即使有票也不改写"
+        }
+      ],
+      "coverageCommits": [
+        "a63fbe791"
+      ]
     }
   ]
 }
