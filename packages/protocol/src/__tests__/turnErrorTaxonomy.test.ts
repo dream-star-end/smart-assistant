@@ -240,6 +240,47 @@ describe('automatic turn recovery policy', () => {
     }), false)
   })
 
+  it('refuses leftover SERVICE_RESTART when progress is only on leftover frames', () => {
+    const unpublishedTape = [
+      { role: 'assistant', text: '任务因服务重启中断', _errorCode: 'SERVICE_RESTART', _isError: true },
+    ]
+    const leftover = [
+      { role: 'assistant', text: 'Failed to authenticate. API Error: 403 model authority missing or invalid' },
+    ]
+    assert.equal(hasMeaningfulAutomaticRecoveryProgress(unpublishedTape), false)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'SERVICE_RESTART',
+      records: unpublishedTape,
+    }), false)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'SERVICE_RESTART',
+      records: unpublishedTape,
+      leftoverRecords: leftover,
+    }), true)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'crashed',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: [...unpublishedTape, ...leftover],
+    }), false)
+  })
+
+  it('refuses SERVICE_RESTART recovery when the turn already billed successful usage', () => {
+    const empty = [
+      { role: 'assistant', text: '任务因服务重启中断', _errorCode: 'SERVICE_RESTART', _isError: true },
+    ]
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart',
+      records: empty,
+      hasSuccessfulUpstreamUsage: true,
+    }), true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart',
+      records: empty,
+      hasSuccessfulUpstreamUsage: false,
+    }), false)
+  })
+
   it('keeps the ordinary retry budget once model, tool, or token progress exists', () => {
     for (const records of [
       [{ role: 'thinking', text: 'checked state' }],

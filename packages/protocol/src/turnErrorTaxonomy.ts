@@ -310,13 +310,24 @@ export function allowUnsafeAutomaticCheckpoint(input: {
 /** Call this *before* the `checkpoint && !checkpointSafe` bypass.
  * Safe checkpoints with live official-cc output still schedule `--resume`
  * (OCV5-241). Only SERVICE_RESTART is gated; other completed-error
- * checkpoints stay on the existing path. */
+ * checkpoints stay on the existing path.
+ *
+ * Callers must pass leftover live-frame records as well as tape records.
+ * Unpublished tapes look empty even when leftover frames already have
+ * assistant/tool/token progress (OCV5-242). Successful upstream usage is
+ * an independent live-runner signal. */
 export function shouldDeclineLiveServiceRestartRecovery(input: {
   errorCode: string
   records: readonly unknown[]
+  leftoverRecords?: readonly unknown[]
+  hasSuccessfulUpstreamUsage?: boolean
 }): boolean {
-  return normalizeTurnErrorCode(input.errorCode) === 'service_restart' &&
-    hasMeaningfulAutomaticRecoveryProgress(input.records)
+  if (normalizeTurnErrorCode(input.errorCode) !== 'service_restart') return false
+  if (input.hasSuccessfulUpstreamUsage === true) return true
+  return hasMeaningfulAutomaticRecoveryProgress([
+    ...input.records,
+    ...(input.leftoverRecords ?? []),
+  ])
 }
 
 export function shouldPauseSilentAutomaticRecovery(input: {

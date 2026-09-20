@@ -18,7 +18,9 @@
  *   1. **bridge turn**(浏览器 → bridge → 容器):master 签名的 authority envelope +
  *      turn lease。裸 header 不作数(同 uid 进程可伪造,R3-M5)—— 必须 Ed25519 验签。
  *      · authority TTL 短(只约束"开始执行"),lease TTL = 最大 turn 窗口 + grace;
- *        turn 内**后续**上游请求只带 lease 是合法的(R4-M1),两张票都在时交叉对账。
+ *        turn 内**后续**上游请求只带 lease 是合法的(R4-M1)。官方 CC 会把过期
+ *        authority 和有效 lease 一起带上后续 `/v1/messages`：验签+同 turn 对账
+ *        仍 fail-closed，不得因 120s envelope 过期单独 403（OCV5-242）。
  *   2. **本地路径 turn**(cron / synthetic / delegate):容器 catalog client 自铸的
  *      `local_catalog` token(携 projectionRevision + epoch,R3-M6)。它**不是**授权凭据
  *      (容器无私钥,不可能签)——授权仍走既有的容器身份双因子 + canUseModel + catalog 判定;
@@ -329,8 +331,10 @@ function rewriteUnroutableOfficialCcModel(args: {
   if (!authorityRaw && !leaseRaw) return null;
   let ticketModel: string | null = null;
   try {
-    if (authorityRaw) ticketModel = verifyAuthority(authorityRaw, args.keyring, args.now).canonicalModel;
-    else if (leaseRaw) ticketModel = verifyTurnLease(leaseRaw, args.keyring, args.now).canonicalModel;
+    // Prefer the long-lived lease: official CC keeps sending the expired
+    // 120s authority envelope on later /v1/messages (OCV5-242).
+    if (leaseRaw) ticketModel = verifyTurnLease(leaseRaw, args.keyring, args.now).canonicalModel;
+    else if (authorityRaw) ticketModel = verifyAuthority(authorityRaw, args.keyring, args.now).canonicalModel;
   } catch {
     return null;
   }
@@ -562,8 +566,15 @@ function verifyBridgeAuthority(a: {
   let authority: ModelAuthorityPayload | null = null;
   let lease: TurnLease | null = null;
   try {
-    if (a.authorityRaw) authority = verifyAuthority(a.authorityRaw, a.keyring, a.now);
+    // Lease first: it is the long-lived turn credential. Authority TTL only
+    // constrains start-of-execution; official CC still attaches the expired
+    // envelope to later tool-loop /v1/messages (OCV5-242).
     if (a.leaseRaw) lease = verifyTurnLease(a.leaseRaw, a.keyring, a.now);
+    if (a.authorityRaw) {
+      authority = verifyAuthority(a.authorityRaw, a.keyring, a.now, {
+        allowExpired: lease !== null,
+      });
+    }
     // 两张票都在 → 必须属于同一个 turn(R4-M1:只验签不对账 = 跨 turn 降级攻击面)。
     if (authority && lease) assertLeaseMatchesAuthority(lease, authority);
   } catch (err) {

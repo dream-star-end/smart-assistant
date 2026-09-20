@@ -1849,6 +1849,23 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
  * hot hydrate path, so it may read them without putting leftover back into
  * GET /live-frames. */
 /** Callers must pass payloads already through filterMonotonicLiveFramePayloads. */
+async function sessionTurnHasSuccessfulUsage(
+  client: PoolClient,
+  sessionId: string,
+  turnKey: string | undefined,
+): Promise<boolean> {
+  if (typeof turnKey !== "string" || !/^[0-9a-f]{64}$/.test(turnKey)) return false;
+  const row = await client.query(
+    `SELECT 1
+       FROM usage_records
+      WHERE session_id=$1 AND turn_key=$2 AND status='success'
+        AND (output_tokens > 0 OR cache_read_tokens > 0)
+      LIMIT 1`,
+    [sessionId, turnKey],
+  );
+  return (row.rowCount ?? 0) > 0;
+}
+
 function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
   const records: Array<Record<string, unknown>> = [];
   for (const payload of payloads) {
@@ -2164,7 +2181,17 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     return done(declined("completed_without_checkpoint", errorCode));
   }
   const recoveryRecords = input.turn.records.map((record) => record.payload);
-  if (shouldDeclineLiveServiceRestartRecovery({ errorCode, records: recoveryRecords })) {
+  const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
+    client,
+    input.sessionId,
+    input.turn.payload.turnKey,
+  );
+  if (shouldDeclineLiveServiceRestartRecovery({
+    errorCode,
+    records: recoveryRecords,
+    leftoverRecords,
+    hasSuccessfulUpstreamUsage,
+  })) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
   if (
@@ -2174,7 +2201,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       status,
       errorCode,
       leftoverBacked: assessment.leftoverBacked,
-      records: recoveryRecords,
+      records: [...recoveryRecords, ...leftoverRecords],
     })
   ) {
     return done(declined("checkpoint_unsafe", errorCode));
@@ -8898,8 +8925,13 @@ export function createPgSessionsBackend(
               )
             ).rows[0];
             const finalized = (
-              await client.query<{ tape_id: string; status: string; waive_reason: string | null }>(
-                `SELECT tape_id,status,waive_reason
+              await client.query<{
+                tape_id: string;
+                status: string;
+                waive_reason: string | null;
+                turn_key: string | null;
+              }>(
+                `SELECT tape_id,status,waive_reason,turn_key
                    FROM client_session_turn_tapes
                   WHERE session_id=$1 AND user_id=$2
                     AND client_message_id=$3
@@ -8968,6 +9000,12 @@ export function createPgSessionsBackend(
                 shouldDeclineLiveServiceRestartRecovery({
                   errorCode: finalizedErrorCode,
                   records,
+                  leftoverRecords,
+                  hasSuccessfulUpstreamUsage: await sessionTurnHasSuccessfulUsage(
+                    client,
+                    input.sessionId,
+                    typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
+                  ),
                 })
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
@@ -8980,7 +9018,7 @@ export function createPgSessionsBackend(
                   status: finalized.status,
                   errorCode: finalizedErrorCode,
                   leftoverBacked: assessment.leftoverBacked,
-                  records,
+                  records: [...records, ...leftoverRecords],
                 })
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
