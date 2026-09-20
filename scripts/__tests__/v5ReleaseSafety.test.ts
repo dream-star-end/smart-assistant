@@ -7554,6 +7554,16 @@ wait $!
     const modelApplied = journeySource.indexOf('await selectJourneyModel(page, JOURNEY_MODEL_ID')
     const j2 = journeySource.indexOf('await step("J2 ')
     const j4 = journeySource.indexOf('await step("J4 ')
+    assert.match(
+      journeySource,
+      /getByRole\("button", \{ name: "添加附件", exact: true \}\)/,
+      "J2 must click the first-class paperclip (role=button name=添加附件)",
+    )
+    assert.doesNotMatch(
+      journeySource,
+      /getByText\("添加附件"\)/,
+      "J2 must not look for overflow-menu text 添加附件; that string is no longer visible",
+    )
     assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
     assert.match(
       journeySource,

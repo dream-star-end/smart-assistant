@@ -7,7 +7,7 @@
 //   J1 登录表单形态断言(widget 必须在 + turnstile_bypass 必须 false)+ API 登录种 cookie
 //      (2026-07-26 安全整改:全局旁路改账号级白名单,widget 对 headless 出交互挑战解不了,
 //       故登录本体走 API;表单形态仍被断言,反而多了一条'旁路被偷偷打开'的活体探针)
-//   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
+//   J2 附件全链:一级回形针「添加附件」→ filechooser 真实弹出 → 真实上传 → chip done
 //   J3 目标全链:「+」菜单 → 创建目标 → active 可见 → 清除并恢复未设置
 //   J4 带附件发送:消息上屏 + 附件区清空
 //   J5 送达硬断言:失败签名零容忍 + 助手回复完成且最终正文含附件秘密探针
@@ -287,8 +287,9 @@ try {
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
   const probeToken = `OC_ATTACH_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   await step("J2 附件全链:菜单→filechooser→真实上传→chip done", async () => {
-    await page.getByRole("button", { name: "更多选项" }).click();
-    const attachItem = page.getByText("添加附件");
+    // Composer: attach is a first-class paperclip label(role=button, accessible name 添加附件).
+    // The + menu only has 设定目标. Visible text attach item is gone (063d2c9b3 J2 timeout).
+    const attachItem = page.getByRole("button", { name: "添加附件", exact: true });
     await attachItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     const [chooser] = await Promise.all([
       page.waitForEvent("filechooser", { timeout: STEP_TIMEOUT }),

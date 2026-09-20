@@ -52,7 +52,7 @@ const agent = { id: 'main', model: 'gpt-5.6-sol' } as any
 
 after(async () => {
   await closeSessionsDb()
-  await rm(testHome, { recursive: true, force: true })
+  await rm(testHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
 })
 
 test('switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice', async () => {
