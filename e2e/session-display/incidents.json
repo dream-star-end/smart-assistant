@@ -4229,6 +4229,267 @@
           "assertion": "INC-20260915-CODEX-CHATGPT-WS: official provider disables ChatGPT Responses websocket, stderr fail-loud, interrupt recycles hung app-server"
         }
       ]
+    },
+    {
+      "id": "INC-20260915-CODEX-CHATGPT-WS",
+      "occurredAt": "2026-09-15",
+      "severity": "P0",
+      "symptom": "商业版 GPT-6-Astra x6.1/1M 卡死「正在启动引擎」数小时零 token：Codex ChatGPT-auth Responses websocket 直连 wss://chatgpt.com（容器 Network unreachable），stderr 被当成 liveness，USER_CANCELLED 后复用同一死 PID。",
+      "rootFixCommit": "497916e2",
+      "coverageCommits": [
+        "90824ce7",
+        "9e518cf7",
+        "25a5b3c9",
+        "3144c3a9",
+        "2b4af86e"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRelayPathGuard.test.ts",
+          "assertion": "识别 chatgpt.com Responses WS 直连,且不算 activity"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
+          "assertion": "webchat aborts on chatgpt.com Responses websocket direct connect"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
+          "assertion": "webchat session never aborts on PATH_NOT_ALLOWED burst"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
+          "assertion": "marks proc stale and recycleProcKeepQueue shuts it down without dropping queued turns"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexRouteOverride.test.ts",
+          "assertion": "official override → 完整 -c 序列含 requires_openai_auth=true"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "upstream_failed: Codex chatgpt.com Responses websocket direct"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-chatgpt-ws.ts",
+          "assertion": "INC-20260915-CODEX-CHATGPT-WS: official provider disables ChatGPT Responses websocket, stderr fail-loud, interrupt recycles hung app-server"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260919-GROK-RESUME-HANG",
+      "occurredAt": "2026-09-19",
+      "severity": "P1",
+      "symptom": "Grok 4.6 卡在「正在恢复会话」数小时无正文：容器重建或用户停止打断正在跑的工具后，下一轮 --resume 同一份写脏的 native 会话，CLI 卡在 session_create；keepalive 把 15min 空闲看门狗续掉。",
+      "rootFixCommit": "c19f7d5d",
+      "proofPending": {
+        "reason": "unit coverage on grokAdapter first-stdout watchdog, nativeId drop, and keepalive gate; live proof after user-container rebuild",
+        "since": "2026-09-19"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "interrupt without end drops nativeId so the next turn does not --resume"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "resume with no stdout retries the same turn without --resume"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "does not keepalive-refresh activity before the first stdout byte"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "crash without end does not flag staleResumeId and drops nativeId"
+        }
+      ],
+      "coverageCommits": [
+        "929970ac9"
+      ]
+    },
+    {
+      "id": "INC-20260920-CC-BETA-FALLBACK-CREDIT",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "刚加的官方 Claude Pro OAuth 一发请求就被 18892 代理拦下：官方 Claude Code 带头 anthropic-beta fallback-credit-2026-06-01，ALLOWED_BETA_VALUES 没有该项，ANTHROPIC_BETA_NOT_ALLOWED，账号 3 次失败进 cooldown，前台「上游连续失败」。",
+      "rootFixCommit": "419183882",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "ALLOWED_BETA_VALUES 包含 fallback-credit 家族(官方 CC 默认带头)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "fallback-credit-2026-06-01 单值 → 通过"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "oauth + fallback-credit 多值 → 全过"
+        }
+      ],
+      "coverageCommits": [
+        "419183882"
+      ]
+    },
+    {
+      "id": "INC-20260920-CC-BETA-THINKING-COUNT",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "OCV5-236 上线后官方 CC 能打，Opus 5 很高再被 18892 拦：anthropic-beta thinking-token-count-2026-05-13 不在 ALLOWED_BETA_VALUES，账号 cooldown，前台「模型繁忙」。",
+      "rootFixCommit": "6b22b40da",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "thinking-token-count-2026-05-13 单值 → 通过"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "oauth + thinking-token-count 多值 → 全过"
+        }
+      ],
+      "coverageCommits": [
+        "6b22b40da"
+      ]
+    },
+    {
+      "id": "INC-20260920-CLAUDE-QUOTA-RESET-STALE",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC Opus 5 黄卡「模型繁忙」：18892 proxy_account_pool_unavailable reason=no_active。唯一 Claude 号 quota_5h_pct=96 被 95% 阈值踢出池，但 quota_5h_resets_at 已过；占用只从响应头回写，出池后永不刷新。",
+      "rootFixCommit": "d08669ae4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
+          "assertion": "5h 占用 96% 且 resets_at 已过 → 仍可 pick"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
+          "assertion": "5h 占用 96% 且 resets_at 仍在未来 → no_active"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
+          "assertion": "5h 占用 96% 且 resets_at 为空 → no_active"
+        }
+      ],
+      "coverageCommits": [
+        "d08669ae4"
+      ]
+    },
+    {
+      "id": "INC-20260920-OFFICIAL-CC-OPUS48-GATE",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC 选 Opus 5 时另打 claude-opus-4-8，18892 MODEL_NOT_AVAILABLE；CLI 写成 Failed to authenticate，前台红卡认证状态异常。",
+      "rootFixCommit": "a63fbe791",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "claude-opus-4-8 + opus-5 票 → 放行且 canonical=claude-opus-5"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "claude-opus-4-8 无票 → 仍 MODEL_NOT_AVAILABLE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "非 claude-* 的未知型号即使有票也不改写"
+        }
+      ],
+      "coverageCommits": [
+        "a63fbe791"
+      ]
+    },
+    {
+      "id": "INC-20260920-OFFICIAL-CC-FALSE-SERVICE-RESTART",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC 活回合被误判 SERVICE_RESTART：黄卡「任务已中断」但进程仍在出活、过一会又自动续跑。",
+      "rootFixCommit": "2116af09f",
+      "coverageCommits": [
+        "2116af09f",
+        "b08aa77b4"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "refuses leftover SERVICE_RESTART checkpoint recovery once the tape already produced output"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbOfficialCcHarness.test.ts",
+          "assertion": "official-cc preheat does not spawn or --resume without a master dispatch"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260920-OFFICIAL-CC-EXPIRED-AUTHORITY-LEASE",
+      "occurredAt": "2026-09-20",
+      "severity": "P1",
+      "symptom": "官方 CC 长工具空闲后 403 model authority expired（sleep 240 > 120s TTL，过期 envelope 与有效 lease 同带）；随后 leftover/unpublished 磁带仍 SERVICE_RESTART 自动恢复出黄卡「任务已中断」，进程继续出 token。",
+      "rootFixCommit": "ac3dc10d8",
+      "coverageCommits": [
+        "ac3dc10d8",
+        "4a6812df4"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "长 turn:authority 已过期、lease 仍有效 → 放行(R4-M1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "过期 authority 且无有效 lease → 仍 MODEL_AUTHORITY_INVALID"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityGate.test.ts",
+          "assertion": "claude-opus-4-8 + 过期 authority + 有效 lease → 仍改写到票面主模型"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "refuses leftover SERVICE_RESTART when progress is only on leftover frames"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "assertion": "refuses SERVICE_RESTART recovery when the turn already billed successful usage"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "SERVICE_RESTART leftover with live progress refuses automatic recovery"
+        }
+      ]
     }
   ]
 }

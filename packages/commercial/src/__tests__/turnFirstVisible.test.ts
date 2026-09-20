@@ -95,6 +95,9 @@ describe("recordTurnFirstVisible", () => {
     assert.equal(warns.length, 1);
     assert.equal(warns[0].msg, "turn first-visible record failed");
     assert.equal(warns[0].fields?.attempts, 3);
+    // OCV5-242 freeze 3: persist miss is a warn + onSettled(false) only.
+    // It must not throw or mint a SERVICE_RESTART / 「任务已中断」 terminal.
+    assert.equal(settled.length, 1);
   });
 });
 

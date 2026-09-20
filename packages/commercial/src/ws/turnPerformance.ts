@@ -271,6 +271,9 @@ export function recordTurnFirstVisible(
   const scheduleRetry = (index: number, err: unknown | undefined): void => {
     const next = index + 1;
     if (next >= delays.length) {
+      // Persist miss is lag or a missing turn_traces row. It is not a turn
+      // terminal and must not be mapped to SERVICE_RESTART / 「任务已中断」
+      // while a dispatch is still accepted (OCV5-242 freeze 3).
       warn?.("turn first-visible record failed", {
         err: err !== undefined ? String(err) : "missed",
         traceId: input.traceId,

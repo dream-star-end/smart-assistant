@@ -1186,3 +1186,84 @@ describe('pick — terminal account race self-heal', () => {
     assert.equal(pin?.status, 'unbound', 'handlePinnedAccountUnavailable 必须 self-heal csap 到 unbound')
   })
 })
+
+describe('pick — Claude 5h/7d 占用窗口过期后不再踢出池', () => {
+  async function seedClaudeWith5h(opts: { pct: number; resetsSql: string | null }) {
+    const a = await createAccount(
+      {
+        runtime_channel: 'v3',
+        label: `q5h-${opts.pct}-${opts.resetsSql === null ? 'null' : 'set'}`,
+        plan: 'pro',
+        token: 'T-Q5H',
+        egress_proxy_id: await insertTestEgressProxy(KEY),
+      },
+      keyFn,
+    )
+    if (opts.resetsSql === null) {
+      await query(
+        `UPDATE claude_accounts SET quota_5h_pct = $2, quota_5h_resets_at = NULL WHERE id = $1`,
+        [a.id.toString(), opts.pct],
+      )
+    } else {
+      await query(
+        `UPDATE claude_accounts SET quota_5h_pct = $2, quota_5h_resets_at = ${opts.resetsSql} WHERE id = $1`,
+        [a.id.toString(), opts.pct],
+      )
+    }
+    return a
+  }
+
+  test('5h 占用 96% 且 resets_at 已过 → 仍可 pick', async (t) => {
+    if (skipIfNoDb(t)) return
+    const a = await seedClaudeWith5h({ pct: 96, resetsSql: "NOW() - interval '1 hour'" })
+    const { tracker } = mkTracker()
+    const p = await mkScheduler(tracker).pick({ mode: 'chat' })
+    assert.equal(p.account_id.toString(), a.id.toString())
+  })
+
+  test('5h 占用 96% 且 resets_at 仍在未来 → no_active', async (t) => {
+    if (skipIfNoDb(t)) return
+    await seedClaudeWith5h({ pct: 96, resetsSql: "NOW() + interval '1 hour'" })
+    const { tracker } = mkTracker()
+    await assert.rejects(
+      mkScheduler(tracker).pick({ mode: 'chat' }),
+      (err: unknown) =>
+        err instanceof AccountPoolUnavailableError &&
+        (err as AccountPoolUnavailableError).code === ERR_ACCOUNT_POOL_UNAVAILABLE,
+    )
+  })
+
+  test('5h 占用 96% 且 resets_at 为空 → no_active', async (t) => {
+    if (skipIfNoDb(t)) return
+    await seedClaudeWith5h({ pct: 96, resetsSql: null })
+    const { tracker } = mkTracker()
+    await assert.rejects(
+      mkScheduler(tracker).pick({ mode: 'chat' }),
+      AccountPoolUnavailableError,
+    )
+  })
+
+  test('7d 占用 96% 且 resets_at 已过 → 仍可 pick', async (t) => {
+    if (skipIfNoDb(t)) return
+    const a = await createAccount(
+      {
+        runtime_channel: 'v3',
+        label: 'q7d-past',
+        plan: 'pro',
+        token: 'T-Q7D',
+        egress_proxy_id: await insertTestEgressProxy(KEY),
+      },
+      keyFn,
+    )
+    await query(
+      `UPDATE claude_accounts
+          SET quota_7d_pct = 96,
+              quota_7d_resets_at = NOW() - interval '1 hour'
+        WHERE id = $1`,
+      [a.id.toString()],
+    )
+    const { tracker } = mkTracker()
+    const p = await mkScheduler(tracker).pick({ mode: 'chat' })
+    assert.equal(p.account_id.toString(), a.id.toString())
+  })
+})

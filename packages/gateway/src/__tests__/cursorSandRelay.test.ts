@@ -21,7 +21,7 @@ import {
   recoverXmlToolCalls,
   stripNonRetryableMarker,
 } from '../engine/cursorSandRelay.js'
-import { CursorSandAdapter } from '../engine/cursorSandAdapter.js'
+import { CursorSandAdapter, cursorSandProductDirectStream } from '../engine/cursorSandAdapter.js'
 import { CREDIT_EXHAUSTED_DETAIL } from '../creditExhaustion.js'
 import {
   cursorSandEnabledForSelection,
@@ -1582,6 +1582,13 @@ test('session credential is sent as Bearer with x-cursor-checksum and skips the 
   } finally {
     await relay.close()
   }
+})
+
+test('product Sand default is Box unless OC_CURSOR_SAND_DIRECT_STREAM=1', () => {
+  assert.equal(cursorSandProductDirectStream({}), false)
+  assert.equal(cursorSandProductDirectStream({ OC_CURSOR_SAND_DIRECT_STREAM: '0' }), false)
+  assert.equal(cursorSandProductDirectStream({ OC_CURSOR_SAND_DIRECT_STREAM: 'true' }), false)
+  assert.equal(cursorSandProductDirectStream({ OC_CURSOR_SAND_DIRECT_STREAM: '1' }), true)
 })
 
 test('directStream skips Box and talks to api2 as Cursor 3.21.12 sand-desktop', async () => {

@@ -6882,6 +6882,23 @@ export class SessionManager {
           return
         }
 
+        if (
+          session.providerTag === 'grok' &&
+          !session.runner.nativeSessionId
+        ) {
+          // Grok native sessions are dirtied by interrupt, crash without
+          // `end`, or a hung `--resume` that was cold-started without PG
+          // tape. Drop the resume-map head so the next submit does not
+          // --resume that id; OpenClaude history injection fills the gap.
+          this._forgetResumeEntry(session.sessionKey)
+          session.ccbSessionId = null
+          session._historicalContextInjected = false
+          session._historicalContextInjectedKey = undefined
+          session._forceHistoricalContextOnFirstTurn = true
+          session._contextRebuildNotice = 'native-resume-loss'
+          this._saveResumeMap()
+        }
+
         const terminalResultErrorClass =
           result?.errorClass ?? classifyRunError(result?.errorDetail).code
         if (

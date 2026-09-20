@@ -63,6 +63,8 @@ import {
   normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
+  allowUnsafeAutomaticCheckpoint,
+  shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
   turnRecoveryAttemptIdentity,
@@ -1847,6 +1849,23 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
  * hot hydrate path, so it may read them without putting leftover back into
  * GET /live-frames. */
 /** Callers must pass payloads already through filterMonotonicLiveFramePayloads. */
+async function sessionTurnHasSuccessfulUsage(
+  client: PoolClient,
+  uid: bigint,
+  turnKey: string | undefined,
+): Promise<boolean> {
+  if (typeof turnKey !== "string" || !/^[0-9a-f]{64}$/.test(turnKey)) return false;
+  const row = await client.query(
+    `SELECT 1
+       FROM usage_records
+      WHERE user_id=$1 AND turn_key=$2 AND status='success'
+        AND (output_tokens > 0 OR cache_read_tokens > 0)
+      LIMIT 1`,
+    [uid, turnKey],
+  );
+  return (row.rowCount ?? 0) > 0;
+}
+
 function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
   const records: Array<Record<string, unknown>> = [];
   for (const payload of payloads) {
@@ -1926,17 +1945,7 @@ function mergeTapeAndLeftoverRecoveryAssessment(
   return { ...tape, leftoverBacked: false };
 }
 
-/** Completed-error already resumes unsafe checkpoints. SERVICE_RESTART crash
- * tapes are error-only by leftover isolation, so leftover-backed process is
- * the designed checkpoint and uses the same continuation prompt. */
-function allowUnsafeAutomaticCheckpoint(
-  status: string,
-  errorCode: string,
-  leftoverBacked: boolean,
-): boolean {
-  if (status === "completed") return true;
-  return leftoverBacked && normalizeTurnErrorCode(errorCode) === "service_restart";
-}
+
 
 /** The last assistant record is the semantic terminal surface. An earlier
  * error followed by a later answer is not a failed turn, while trailing tool
@@ -2171,10 +2180,29 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (status === "completed" && assessment.mode !== "checkpoint") {
     return done(declined("completed_without_checkpoint", errorCode));
   }
+  const recoveryRecords = input.turn.records.map((record) => record.payload);
+  const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
+    client,
+    input.uid,
+    input.turn.payload.turnKey,
+  );
+  if (shouldDeclineLiveServiceRestartRecovery({
+    errorCode,
+    records: recoveryRecords,
+    leftoverRecords,
+    hasSuccessfulUpstreamUsage,
+  })) {
+    return done(declined("checkpoint_unsafe", errorCode));
+  }
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
-    !allowUnsafeAutomaticCheckpoint(status, errorCode, assessment.leftoverBacked)
+    !allowUnsafeAutomaticCheckpoint({
+      status,
+      errorCode,
+      leftoverBacked: assessment.leftoverBacked,
+      records: [...recoveryRecords, ...leftoverRecords],
+    })
   ) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
@@ -2201,11 +2229,10 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const currentAttempt = Math.max(
     sourceAttempt,
     maxAutomaticTurnRetryAttempt(
-      input.turn.records.map((record) => record.payload),
+      recoveryRecords,
       rootClientMessageId,
     ),
   );
-  const recoveryRecords = input.turn.records.map((record) => record.payload);
   if (shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt, records: recoveryRecords })) {
     const paused = await pauseSilentRecoveryLineage(client, {
       userId: input.uid,
@@ -8898,8 +8925,13 @@ export function createPgSessionsBackend(
               )
             ).rows[0];
             const finalized = (
-              await client.query<{ tape_id: string; status: string; waive_reason: string | null }>(
-                `SELECT tape_id,status,waive_reason
+              await client.query<{
+                tape_id: string;
+                status: string;
+                waive_reason: string | null;
+                turn_key: string | null;
+              }>(
+                `SELECT tape_id,status,waive_reason,turn_key
                    FROM client_session_turn_tapes
                   WHERE session_id=$1 AND user_id=$2
                     AND client_message_id=$3
@@ -8965,13 +8997,29 @@ export function createPgSessionsBackend(
               }
               if (
                 input.recovery.automatic &&
+                shouldDeclineLiveServiceRestartRecovery({
+                  errorCode: finalizedErrorCode,
+                  records,
+                  leftoverRecords,
+                  hasSuccessfulUpstreamUsage: await sessionTurnHasSuccessfulUsage(
+                    client,
+                    input.uid,
+                    typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
+                  ),
+                })
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+              }
+              if (
+                input.recovery.automatic &&
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
-                !allowUnsafeAutomaticCheckpoint(
-                  finalized.status,
-                  finalizedErrorCode,
-                  assessment.leftoverBacked,
-                )
+                !allowUnsafeAutomaticCheckpoint({
+                  status: finalized.status,
+                  errorCode: finalizedErrorCode,
+                  leftoverBacked: assessment.leftoverBacked,
+                  records: [...records, ...leftoverRecords],
+                })
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }

@@ -455,6 +455,44 @@ describe("buildSafeUpstreamHeaders", () => {
     assert.equal(ALLOWED_BETA_VALUES.has("oauth-2025-04-20"), true);
     assert.equal(ALLOWED_BETA_VALUES.has("claude-code-20250219"), true);
   });
+
+  test("ALLOWED_BETA_VALUES 包含 fallback-credit 家族(官方 CC 默认带头)", () => {
+    assert.equal(ALLOWED_BETA_VALUES.has("fallback-credit-2026-06-01"), true);
+    assert.equal(ALLOWED_BETA_VALUES.has("fallback-credit-2026-07-01"), true);
+    assert.equal(ALLOWED_BETA_VALUES.has("server-side-fallback-2026-06-01"), true);
+    assert.equal(ALLOWED_BETA_VALUES.has("server-side-fallback-2026-07-01"), true);
+  });
+
+  test("fallback-credit-2026-06-01 单值 → 通过", () => {
+    const h = buildSafeUpstreamHeaders({
+      "anthropic-beta": "fallback-credit-2026-06-01",
+    });
+    assert.equal(h["anthropic-beta"], "fallback-credit-2026-06-01");
+  });
+
+  test("oauth + fallback-credit 多值 → 全过", () => {
+    const h = buildSafeUpstreamHeaders({
+      "anthropic-beta": "oauth-2025-04-20, fallback-credit-2026-06-01",
+    });
+    assert.equal(h["anthropic-beta"], "oauth-2025-04-20,fallback-credit-2026-06-01");
+  });
+
+  test("thinking-token-count-2026-05-13 单值 → 通过", () => {
+    const h = buildSafeUpstreamHeaders({
+      "anthropic-beta": "thinking-token-count-2026-05-13",
+    });
+    assert.equal(h["anthropic-beta"], "thinking-token-count-2026-05-13");
+  });
+
+  test("oauth + thinking-token-count 多值 → 全过", () => {
+    const h = buildSafeUpstreamHeaders({
+      "anthropic-beta": "oauth-2025-04-20, thinking-token-count-2026-05-13",
+    });
+    assert.equal(
+      h["anthropic-beta"],
+      "oauth-2025-04-20,thinking-token-count-2026-05-13",
+    );
+  });
 });
 
 // ─── concurrency limiter ──────────────────────────────────────────────────

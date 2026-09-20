@@ -296,6 +296,10 @@ describe('verifyAuthority', () => {
     assert.ok(verifyAuthority(env, keyring, p.expiresAt - 1))
     expectCode(() => verifyAuthority(env, keyring, p.expiresAt), 'Expired')
     expectCode(() => verifyAuthority(env, keyring, p.expiresAt + 1), 'Expired')
+    assert.equal(
+      verifyAuthority(env, keyring, p.expiresAt + 1, { allowExpired: true }).canonicalModel,
+      p.canonicalModel,
+    )
   })
 
   it('未知 keyId → UnknownKey(验签之前先查 ring)', () => {

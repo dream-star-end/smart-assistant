@@ -424,6 +424,13 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // origin/feat/v5-selfhost and cannot be amended. Freeze this tip so the
   // imported fix(v5) passes check:v5:incidents; later commits still gate.
   "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
+  // 2026-09-20 full forward sync freeze: selfhost f4f143088 is live
+  // (origin/feat/v5-selfhost). Imports OCV5-232..242 (official CC switch/version
+  // pin, Sand Box default, Grok resume, extra-prompt tz, CC beta headers,
+  // Claude quota reset, opus-4-8 rewrite, false SERVICE_RESTART, expired-authority
+  // lease). Source SHAs cannot be amended; only immutable ancestors of this tip
+  // are exempted.
+  "f4f1430885612c9d377b7495831fb08375d0c6cb",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
