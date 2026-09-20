@@ -300,6 +300,56 @@ export interface EnforceArgs {
  *   ④ 用同一 fenced epoch 原子读取 role/grants，并用快照内 visibility 做最终授权。
  * 反过来(先验票再 fence)会让"票是旧 epoch 签的、但本进程快照恰好也旧"的双旧场景蒙混过关。
  */
+/**
+ * 官方 Claude Code 会在已授权 turn 里另打自己的内部型号(2026-09-20:
+ * 用户选 claude-opus-5,CLI 另发 claude-opus-4-8 → 403 MODEL_NOT_AVAILABLE,
+ * CLI 再写成 Failed to authenticate,前台「认证状态异常」)。
+ *
+ * 这些名字不在 catalog(也不是 disable 行)。可路由性先于验票的原门会直接 403,
+ * 连票面主模型都走不到。已知 catalog 行(含 disable 的 aux)仍走原门,避免
+ * 「disable 的次级模型被主模型顶替计费」。
+ *
+ * 仅当请求名是 `claude-*` 且 bridge 票验签得到可路由的 ccb 主模型时,改写到票面型号。
+ * 之后 body.model = gate.canonicalModel,上游与计费都落主模型。
+ */
+const OFFICIAL_CC_INTERNAL_MODEL = /^claude[-/]/i;
+
+function rewriteUnroutableOfficialCcModel(args: {
+  requested: string;
+  snapshot: ModelCatalogSnapshot;
+  headers: IncomingHttpHeaders;
+  keyring: AuthorityKeyring | null;
+  now: number;
+  logger?: Logger;
+}): { canonicalModel: string; descriptor: ModelExecutionDescriptor } | null {
+  if (!OFFICIAL_CC_INTERNAL_MODEL.test(args.requested)) return null;
+  if (!args.keyring || args.keyring.size === 0) return null;
+  const authorityRaw = readHeader(args.headers, AUTHORITY_HEADER);
+  const leaseRaw = readHeader(args.headers, TURN_LEASE_HEADER);
+  if (!authorityRaw && !leaseRaw) return null;
+  let ticketModel: string | null = null;
+  try {
+    if (authorityRaw) ticketModel = verifyAuthority(authorityRaw, args.keyring, args.now).canonicalModel;
+    else if (leaseRaw) ticketModel = verifyTurnLease(leaseRaw, args.keyring, args.now).canonicalModel;
+  } catch {
+    return null;
+  }
+  if (!ticketModel) return null;
+  let descriptor: ModelExecutionDescriptor | null;
+  try {
+    descriptor = args.snapshot.resolve(ticketModel);
+  } catch {
+    return null;
+  }
+  if (!descriptor || descriptor.engine !== "ccb") return null;
+  const log = args.logger ?? rootLogger.child({ module: "modelAuthorityGate" });
+  log.warn("rewrote unroutable official-cc model to turn canonical", {
+    requested: args.requested,
+    canonicalModel: descriptor.canonicalModel,
+  });
+  return { canonicalModel: descriptor.canonicalModel, descriptor };
+}
+
 export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAuthorityDecision> {
   const now = args.now ?? Date.now();
 
@@ -318,7 +368,7 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
   }
 
   // ② 可路由性(active + 有价 + capability schema 可理解)
-  const canonicalModel = snapshot.aliasToCanonical(args.model);
+  let canonicalModel = snapshot.aliasToCanonical(args.model);
   let descriptor: ModelExecutionDescriptor | null;
   try {
     descriptor = snapshot.resolve(canonicalModel);
@@ -328,6 +378,20 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
       throw new ModelGateReject("not_available", `unknown capability schema: ${err.message}`);
     }
     throw err;
+  }
+  if (!descriptor) {
+    const rewritten = rewriteUnroutableOfficialCcModel({
+      requested: canonicalModel,
+      snapshot,
+      headers: args.headers,
+      keyring: args.keyring,
+      now,
+      logger: args.logger,
+    });
+    if (rewritten) {
+      canonicalModel = rewritten.canonicalModel;
+      descriptor = rewritten.descriptor;
+    }
   }
   if (!descriptor) {
     throw new ModelGateReject("not_available", `model '${canonicalModel}' not routable`);
