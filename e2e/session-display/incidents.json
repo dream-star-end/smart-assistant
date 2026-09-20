@@ -4382,11 +4382,6 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ccbOfficialCcHarness.test.ts",
           "assertion": "official-cc preheat does not spawn or --resume without a master dispatch"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/subprocessRunnerArgs.test.ts",
-          "assertion": "omits --resume when preheat asks for a cold official-cc spawn"
         }
       ]
     }

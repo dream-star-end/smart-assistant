@@ -7,6 +7,7 @@ import {
   assessTurnRecoveryTape,
   hasMeaningfulAutomaticRecoveryProgress,
   allowUnsafeAutomaticCheckpoint,
+  shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
   maxAutomaticTurnRetryAttempt,
@@ -186,7 +187,26 @@ describe('automatic turn recovery policy', () => {
   it('refuses leftover SERVICE_RESTART checkpoint recovery once the tape already produced output', () => {
     const progressed = [{ role: 'assistant', text: 'API Error: Opus 4.8 safeguards flagged this message.' }]
     const empty = [{ role: 'assistant', text: '子进程被信号 SIGKILL 终止', _errorCode: 'SERVICE_RESTART' }]
-    // OCV5-241: completed + leftover restart + real output → do not SIGKILL a live runner.
+    const incidentTape = [
+      { role: 'assistant', text: 'API Error: Opus 4.8 safeguards flagged this message.' },
+      { role: 'assistant', text: '任务因服务重启中断', _errorCode: 'SERVICE_RESTART', _isError: true },
+    ]
+    // Caller consults this *before* `!checkpointSafe`. Incident tapes are safe
+    // checkpoints, so the unsafe-bypass helper alone is dead code.
+    assert.equal(assessTurnRecoveryTape(incidentTape).mode, 'checkpoint')
+    assert.equal(assessTurnRecoveryTape(incidentTape).checkpointSafe, true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart', records: incidentTape,
+    }), true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'SERVICE_RESTART', records: progressed,
+    }), true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'upstream_failed', records: progressed,
+    }), false)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart', records: empty,
+    }), false)
     assert.equal(allowUnsafeAutomaticCheckpoint({
       status: 'completed',
       errorCode: 'service_restart',

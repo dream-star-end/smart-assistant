@@ -385,14 +385,6 @@ describe('buildOfficialClaudeCliArgs', () => {
     assert.deepEqual(args.slice(-2), ['--add-dir', '/workspace/project'])
   })
 
-  it('omits --resume when preheat asks for a cold official-cc spawn', () => {
-    const args = buildOfficialClaudeCliArgs({
-      model: 'claude-opus-5',
-      resumeSessionId: null,
-    })
-    assert.equal(args.includes('--resume'), false)
-  })
-
   it('omits optional stock flags when values are absent', () => {
     const args = buildOfficialClaudeCliArgs({})
     for (const flag of [

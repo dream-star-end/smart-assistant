@@ -307,6 +307,18 @@ export function allowUnsafeAutomaticCheckpoint(input: {
     normalizeTurnErrorCode(input.errorCode) === 'service_restart'
 }
 
+/** Call this *before* the `checkpoint && !checkpointSafe` bypass.
+ * Safe checkpoints with live official-cc output still schedule `--resume`
+ * (OCV5-241). Only SERVICE_RESTART is gated; other completed-error
+ * checkpoints stay on the existing path. */
+export function shouldDeclineLiveServiceRestartRecovery(input: {
+  errorCode: string
+  records: readonly unknown[]
+}): boolean {
+  return normalizeTurnErrorCode(input.errorCode) === 'service_restart' &&
+    hasMeaningfulAutomaticRecoveryProgress(input.records)
+}
+
 export function shouldPauseSilentAutomaticRecovery(input: {
   errorCode: string
   currentAttempt: number

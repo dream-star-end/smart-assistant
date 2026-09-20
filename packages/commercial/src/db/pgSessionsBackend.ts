@@ -64,6 +64,7 @@ import {
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
   allowUnsafeAutomaticCheckpoint,
+  shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
   turnRecoveryAttemptIdentity,
@@ -2162,6 +2163,10 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (status === "completed" && assessment.mode !== "checkpoint") {
     return done(declined("completed_without_checkpoint", errorCode));
   }
+  const recoveryRecords = input.turn.records.map((record) => record.payload);
+  if (shouldDeclineLiveServiceRestartRecovery({ errorCode, records: recoveryRecords })) {
+    return done(declined("checkpoint_unsafe", errorCode));
+  }
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
@@ -2169,7 +2174,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       status,
       errorCode,
       leftoverBacked: assessment.leftoverBacked,
-      records: input.turn.records.map((record) => record.payload),
+      records: recoveryRecords,
     })
   ) {
     return done(declined("checkpoint_unsafe", errorCode));
@@ -2197,11 +2202,10 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const currentAttempt = Math.max(
     sourceAttempt,
     maxAutomaticTurnRetryAttempt(
-      input.turn.records.map((record) => record.payload),
+      recoveryRecords,
       rootClientMessageId,
     ),
   );
-  const recoveryRecords = input.turn.records.map((record) => record.payload);
   if (shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt, records: recoveryRecords })) {
     const paused = await pauseSilentRecoveryLineage(client, {
       userId: input.uid,
@@ -8958,6 +8962,15 @@ export function createPgSessionsBackend(
               }
               if (assessment.mode !== input.recovery.mode) {
                 return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
+              }
+              if (
+                input.recovery.automatic &&
+                shouldDeclineLiveServiceRestartRecovery({
+                  errorCode: finalizedErrorCode,
+                  records,
+                })
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }
               if (
                 input.recovery.automatic &&
