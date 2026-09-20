@@ -4371,7 +4371,7 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 活回合被误判 SERVICE_RESTART：黄卡「任务已中断」但进程仍在出活、过一会又自动续跑。",
-      "rootFixCommit": "PENDING",
+      "rootFixCommit": "2116af09f",
       "regressions": [
         {
           "layer": "unit",
