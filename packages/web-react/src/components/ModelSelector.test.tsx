@@ -636,37 +636,21 @@ describe('ModelSelector 「更多 GPT 模型」折叠组(2026-09-05 Terra/Luna)'
   })
 })
 
-const SEARCH_MODELS: PublicModel[] = Array.from({ length: 8 }, (_, i) => ({
-  id: `plain-search-${i}`,
+const MANY_MODELS: PublicModel[] = Array.from({ length: 9 }, (_, i) => ({
+  id: `plain-many-${i}`,
   display_name: i === 3 ? 'Zebra Unique' : `Alpha ${i}`,
 }))
 
-describe('ModelSelector 搜索', () => {
-  it('≥8 模型时渲染搜索框，输入后只剩匹配项', async () => {
-    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+describe('ModelSelector 无搜索框', () => {
+  it('模型再多也不渲染搜索框，列表仍可见', async () => {
+    render(<ModelSelector models={MANY_MODELS} selectedId="plain-many-0" onSelect={() => {}} />)
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    const input = await screen.findByLabelText('搜索模型')
-    fireEvent.change(input, { target: { value: 'Zebra' } })
-    const items = screen.getAllByRole('menuitem')
-    expect(items).toHaveLength(1)
-    expect(items[0]).toHaveTextContent('Zebra Unique')
-    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(false)
-  })
-
-  it('无匹配时显示「无匹配模型」', async () => {
-    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    const input = await screen.findByLabelText('搜索模型')
-    fireEvent.change(input, { target: { value: 'no-such-model-zzz' } })
-    expect(screen.getByText('无匹配模型')).toBeInTheDocument()
-    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
-  })
-
-  it('<8 模型不渲染搜索框', async () => {
-    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    await screen.findAllByRole('menuitem')
+    const items = await screen.findAllByRole('menuitem')
     expect(screen.queryByLabelText('搜索模型')).toBeNull()
+    expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
+    expect(screen.queryByText('无匹配模型')).toBeNull()
+    expect(items.some((i) => i.textContent?.includes('Zebra Unique'))).toBe(true)
+    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(true)
   })
 })
 
@@ -704,21 +688,8 @@ describe('ModelSelector 切换中态', () => {
   })
 })
 
-// C-29:菜单打开后焦点落在首项,搜索框(≥8 模型才出现)不自动聚焦,键盘用户要多按一次。
-describe('ModelSelector 搜索框自动聚焦', () => {
-  const MANY: PublicModel[] = Array.from({ length: 9 }, (_, i) => ({
-    id: `model-${i}`,
-    display_name: `Model ${i}`,
-  }))
-
-  it('≥8 模型时打开菜单焦点直接落在搜索框', async () => {
-    render(<ModelSelector models={MANY} selectedId="model-0" onSelect={() => {}} />)
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    const search = await screen.findByRole('textbox', { name: '搜索模型' })
-    await waitFor(() => expect(document.activeElement).toBe(search))
-  })
-
-  it('<8 模型无搜索框,焦点仍按 Radix 默认落在菜单内', async () => {
+describe('ModelSelector 打开后焦点', () => {
+  it('无搜索框时焦点仍按 Radix 默认落在菜单内', async () => {
     render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')

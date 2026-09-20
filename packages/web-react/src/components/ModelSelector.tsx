@@ -13,7 +13,7 @@ import {
   cursorModelById,
 } from '@openclaude/protocol'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   availableCursorEfforts,
   contextFamilyHasLong,
@@ -48,7 +48,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  Input,
   useConfirm,
 } from './ui'
 
@@ -108,16 +107,6 @@ function lockedPlainLabel(model: LockedPublicModel): string {
 export function teamEngineLabel(models: PublicModel[]): string {
   const m = models.find((x) => x.id === DEFAULT_CODEX_ENGINE_MODEL)
   return m ? modelLabel(m) : DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME
-}
-
-function rowSearchHaystack(row: ReturnType<typeof modelPickerRows>[number]): string {
-  if (row.kind === 'plain') return `${modelLabel(row.model)} ${row.model.id}`
-  if (row.kind === 'locked-plain') return `${lockedPlainLabel(row.model)} ${row.model.id}`
-  if (row.kind === 'cursor-family' || row.kind === 'context-family') {
-    const members = row.row.members.map((m) => `${modelLabel(m)} ${m.id}`).join(' ')
-    return `${row.row.label} ${members}`
-  }
-  return `${row.row.label} ${row.row.representative.id}`
 }
 
 function triggerLabel(
@@ -218,29 +207,8 @@ export function ModelSelector({
     if (selectedInCollapsed) setCollapsedOpen(true)
   }, [selectedInCollapsed])
   const showCollapsedGroup = collapsedRows.length > 0
-  const [query, setQuery] = useState('')
-  const queryNorm = query.trim().toLowerCase()
-  const searching = queryNorm.length > 0
-  const showSearch = models.length + lockedModels.length >= 8
-  // 菜单打开时焦点直接落进搜索框(C-29):此前落在首项,键盘用户要多按一次才能开始搜。
-  // Radix DropdownMenu.Content 不公开 onOpenAutoFocus,改为镜像 open 状态、在其挂载聚焦之后接管焦点。
-  const searchRef = useRef<HTMLInputElement>(null)
-  const [menuOpenMirror, setMenuOpenMirror] = useState(false)
-  const menuOpen = open ?? menuOpenMirror
-  useEffect(() => {
-    if (!menuOpen || !showSearch) return
-    const id = window.setTimeout(() => searchRef.current?.focus({ preventScroll: true }), 0)
-    return () => window.clearTimeout(id)
-  }, [menuOpen, showSearch])
-  const filteredRows = searching
-    ? rows.filter((row) => rowSearchHaystack(row).toLowerCase().includes(queryNorm))
-    : null
-  const listRows = searching ? (filteredRows ?? []) : visibleRows
-  const listCollapsed = searching ? [] : collapsedRows
-  const listShowCollapsed = searching ? false : showCollapsedGroup
   const [, setRecentTick] = useState(0)
   const recentRows = (() => {
-    if (searching) return [] as typeof rows
     const seen = new Set<string>()
     const out: typeof rows = []
     for (const id of readRecentModels()) {
@@ -504,14 +472,7 @@ export function ModelSelector({
 
   return (
     <>
-      <DropdownMenu
-        open={open}
-        onOpenChange={(v) => {
-          onOpenChange?.(v)
-          setMenuOpenMirror(v)
-          if (!v) setQuery('')
-        }}
-      >
+      <DropdownMenu open={open} onOpenChange={onOpenChange}>
         <DropdownMenuTrigger asChild>
           <button
             type="button"
@@ -582,21 +543,6 @@ export function ModelSelector({
           className="flex max-h-[80vh] min-w-[15rem] flex-col"
         >
           <DropdownMenuLabel className="shrink-0">对话模型</DropdownMenuLabel>
-          {showSearch && (
-            <div className="shrink-0 px-1.5 pb-1">
-              <Input
-                ref={searchRef}
-                inputSize="sm"
-                aria-label="搜索模型"
-                placeholder="搜索模型…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key !== 'Escape' && e.key !== 'ArrowDown') e.stopPropagation()
-                }}
-              />
-            </div>
-          )}
           {teamEngineActive && (
             <div
               role="note"
@@ -633,12 +579,8 @@ export function ModelSelector({
                 <DropdownMenuSeparator />
               </>
             )}
-            {searching && listRows.length === 0 ? (
-              <div className="px-2 py-3 text-caption text-faint">无匹配模型</div>
-            ) : (
-              listRows.map((row) => renderRow(row))
-            )}
-            {listShowCollapsed && (
+            {visibleRows.map((row) => renderRow(row))}
+            {showCollapsedGroup && (
               <>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -659,10 +601,10 @@ export function ModelSelector({
                     <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
                   </span>
                   <span className="text-caption font-normal text-faint">
-                    {listCollapsed.length} 个
+                    {collapsedRows.length} 个
                   </span>
                 </DropdownMenuItem>
-                {collapsedOpen && listCollapsed.map((row) => renderRow(row))}
+                {collapsedOpen && collapsedRows.map((row) => renderRow(row))}
               </>
             )}
           </div>
