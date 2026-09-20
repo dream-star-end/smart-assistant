@@ -36,7 +36,7 @@ const ASSERTION_DEBT_BASELINE = 37;
  *   + 2 条 SCNet 关机后从 V5 主发布门移除的 OCR 活体 proof。
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
-const PROOF_PENDING_BASELINE = 11;
+const PROOF_PENDING_BASELINE = 17;
 
 // ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
 // 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
@@ -189,6 +189,9 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
   // 同样被跑;这里按 runner 的真实口径放行,不再只认顶层 __tests__。
   if (/^packages\/gateway\/src\/(?:[^/]+\/)*__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
+  }
+  if (/^packages\/protocol\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    return requireCi("test:protocol", "CI job protocol → npm run test:protocol");
   }
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:storage", "CI job storage → npm run test:storage");

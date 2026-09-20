@@ -33,7 +33,8 @@
           "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
           "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260718-FIRST-TURN-REJECTED",
@@ -81,7 +82,8 @@
           "path": "e2e/session-display/tests/05-turn-status.spec.ts",
           "assertion": "verified turn status:未计费状态展示 + late-tape 状态不显示"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260718-ZERO-TERMINAL",
@@ -104,7 +106,8 @@
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260718-RESEND-DUPLICATE",
@@ -126,7 +129,8 @@
           "path": "e2e/session-display/tests/07-resend-dedup.spec.ts",
           "assertion": "resend-dedup:同 clientMessageId 重发不出双回复/不双计费"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260718-ATTACH-NOOP",
@@ -155,7 +159,8 @@
           "path": "scripts/v5-e2e-journey-canary.mjs",
           "assertion": "J2 附件全链:菜单→filechooser→真实上传→chip done"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260719-PROCESS-AFTER-FINAL",
@@ -173,7 +178,8 @@
           "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts",
           "assertion": "poisoned IDB + empty incremental：过程卡在最终答复前且修复可持久化"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260719-POISONED-IDB-ORDER",
@@ -191,7 +197,8 @@
           "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts",
           "assertion": "poisoned IDB + empty incremental：过程卡在最终答复前且修复可持久化"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260721-LAZY-TIMELINE-LOSS",
@@ -280,7 +287,8 @@
           "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
           "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260721-RUNTIME-RAW-LEAK",
@@ -302,7 +310,8 @@
           "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
           "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260721-HISTORICAL-THINKING-OPEN",
@@ -320,7 +329,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T11 direct-timeline 思考完成后自动折叠且可完整展开"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260721-STAGED-FINALIZE-STUCK",
@@ -399,7 +409,8 @@
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260721-WEIBO-IMAGE-BROKEN",
@@ -478,7 +489,8 @@
       "proofPending": {
         "reason": "同上:原 deploy-gate 证据与微博 worker OOM 无关,已移除;活体证据待补(需要大图 OOM 的可控复现路径)。",
         "since": "2026-07-26"
-      }
+      },
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-KIMI-QUOTA-EXHAUSTED",
@@ -503,7 +515,8 @@
       "proofPending": {
         "reason": "同上:原 deploy-gate 证据(J1-J5 旅程)不含任何 provider 配额熔断断言,已移除;活体证据待补(需要可注入的配额耗尽 provider)。",
         "since": "2026-07-26"
-      }
+      },
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-PG-NUL-SIDECAR",
@@ -521,7 +534,8 @@
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-RUNTIME-FINALIZE-UNBOUNDED",
@@ -547,7 +561,8 @@
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-ASK-MARKDOWN-DEADEND",
@@ -573,7 +588,8 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chatCreateTemplates.test.ts"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-LEASE-DISPATCH-UNLINKED",
@@ -595,7 +611,8 @@
           "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
           "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-E2E-MODEL-DRIFT",
@@ -627,7 +644,8 @@
           "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts",
           "assertion": "@smoke 回复中途刷新:终态正确收敛,spinner 不永挂"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260723-FINALIZE-STALE-ACTIVE",
@@ -644,7 +662,8 @@
       "proofPending": {
         "reason": "证据 scripts/__tests__/v5ReleaseSafety.test.ts 实际在 CI job v5-ops 里跑,属 unit 层(此前误标 deploy-gate);部署门内的活体证据待补。",
         "since": "2026-07-26"
-      }
+      },
+      "coverageCommits": []
     },
     {
       "id": "INC-20260725-USER-IMPACT-LOOPS",
@@ -846,7 +865,8 @@
           "path": "scripts/v5-auto-dream-collector-smoke.ts",
           "assertion": "Auto-Dream usage/call_usage sidebands preserve structured output"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260803-MOBILE-WECHAT-QR",
@@ -870,7 +890,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260804-DEPLOY-RETRY-RECOVERY",
@@ -899,7 +920,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260804-RETRY-ERROR-REDCARD",
@@ -947,7 +969,8 @@
           "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
           "assertion": "登录响应必须已有可用额度，不依赖后续 /api/me"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260804-QWEN38-CODEX-ADAPTER",
@@ -1036,7 +1059,8 @@
       "proofPending": {
         "reason": "SCNet 已由产品负责人明确关机，OCR 不再属于 V5 主版本上线验证；独立严格 smoke 及其 CI 单测保留，活体 OCR proof 待专门 OCR 环境恢复后执行。",
         "since": "2026-08-07"
-      }
+      },
+      "coverageCommits": []
     },
     {
       "id": "INC-20260805-V5-IP-RETRY-TX",
@@ -1060,7 +1084,8 @@
           "path": "scripts/v5-remount-ccb-baseline.ts",
           "assertion": "reprovision failed"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260805-OCR-SMOKE-STDIN",
@@ -1083,7 +1108,8 @@
       "proofPending": {
         "reason": "SCNet 已由产品负责人明确关机，OCR 不再属于 V5 主版本上线验证；独立严格 smoke 及其 CI 单测保留，活体 OCR proof 待专门 OCR 环境恢复后执行。",
         "since": "2026-08-07"
-      }
+      },
+      "coverageCommits": []
     },
     {
       "id": "INC-20260807-LIVE-PROCESS-LOSS",
@@ -1188,7 +1214,8 @@
           "path": "e2e/session-display/tests/11-cron-inbox-delivery.spec.ts",
           "assertion": "cron durable inbox：真实容器直投 candidate 后用户 API 可见且字段完整"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260808-WEIBO-RELINK",
@@ -1217,7 +1244,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T33 当前微博账号重新扫码登录不会先解绑旧连接"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260809-CCB-CONTEXT-OVERFLOW",
@@ -1381,7 +1409,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260811-INTERRUPTED-TOOL-STATUS",
@@ -1400,7 +1429,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260812-H3-WORKER-MIGRATION-CANCEL",
@@ -1447,7 +1477,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260813-GROK-AUTHORITY-REJECTED",
@@ -1466,7 +1497,8 @@
           "path": "scripts/v5-smoke-turn-canary.mjs",
           "assertion": "turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260813-CURSOR-AUTHORITY-REJECTED",
@@ -1490,7 +1522,8 @@
           "path": "scripts/deploy-v5.sh",
           "assertion": "candidate Cursor authority ticket consume gate"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260813-CURSOR-STREAM-JSON",
@@ -1566,7 +1599,8 @@
           "path": "scripts/deploy-v5.sh",
           "assertion": "candidate Cursor stream-json parser gate + hot-config wrapper gate(exact immutable release)"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260815-ZAI-AUDIT-JSON-NULL",
@@ -1590,7 +1624,8 @@
           "path": "scripts/deploy-v5.sh",
           "assertion": "required migration not applied"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260815-ENGINE-STOP-DRAIN-HANG",
@@ -1700,7 +1735,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260823-TAPE-ANCHOR-DRIFT",
@@ -1734,7 +1770,8 @@
           "path": "scripts/check-v5-lossless-anchor-contract.ts",
           "assertion": "lossless-anchor-contract: PASS"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260825-HOST-FULL-POOL-SATURATION",
@@ -1826,7 +1863,8 @@
           "path": "scripts/v5-e2e-journey-canary.mjs",
           "assertion": "必须等到 chip done 终态再放行"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260824-AUTOMATIC-WAIVER-LOOP",
@@ -1870,7 +1908,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T46 Codex 等待用户回答保持人类等待态，不显示模型卡住或自动免单"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260823-SELFHOST-AUDIT-CLOSURE",
@@ -1932,7 +1971,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T49 Phase-A unpublished 后空 live-units reset 仍保留思考/工具/计划"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260827-WEIBO-SETUP-PIN-DRIFT",
@@ -1978,7 +2018,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T50 persist 后用户气泡只显示原文，不含论文任务系统提示"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260827-WEIBO-ERRCODE-ACTIONABLE",
@@ -2096,7 +2137,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T55 Phase-B deferred agent-group 后空 live-units reset 仍保留委派过程行"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260829-CUTOVER-SURVIVOR-STALE-WD",
@@ -2125,7 +2167,8 @@
           "path": "scripts/v5-runtime-release-lib.sh",
           "assertion": "restart_cmd 失败;摘录 egress/master 最近日志"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260831-TURNEND-ORDER-COLLAPSE",
@@ -2164,7 +2207,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T59 Phase-A unpublished 后交错 live assistant 段仍保持 thinking/正文1/tool/正文2"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260831-CURSOR-MCP-DELEGATE-CONTEXT",
@@ -2509,7 +2553,6 @@
         "cd25a50a",
         "cd7ec21d",
         "5ff831e4",
-        "a5da8cea",
         "e3f11e62"
       ]
     },
@@ -2562,7 +2605,6 @@
         }
       ],
       "coverageCommits": [
-        "db14273e",
         "2a38336c"
       ]
     },
@@ -2687,7 +2729,6 @@
         }
       ],
       "coverageCommits": [
-        "51674b8c",
         "226edfac",
         "d18bd587",
         "0d6a19ea"
@@ -2767,7 +2808,6 @@
         }
       ],
       "coverageCommits": [
-        "654ca01f",
         "97677249",
         "de1dd178",
         "6c2ee090"
@@ -2834,7 +2874,8 @@
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
           "assertion": "Codex 已产出可见内容后强制停止必须恰好结算一笔 partial usage"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260903-OCV5-84-CRON-SUBMIT-BOUNDARY",
@@ -2858,7 +2899,8 @@
           "path": "scripts/__tests__/cronSubmitBoundaryGate.test.ts",
           "assertion": "cron submit-boundary gate rejects deletion of the regular runJob boundary"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260903-OCV5-87-RELEASE-MARKER-GATE",
@@ -2882,7 +2924,8 @@
           "path": "scripts/deploy-v5.sh",
           "assertion": "invalid strong release marker"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260903-OCV5-82-SESSION-UNAVAILABLE",
@@ -3005,7 +3048,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T62 Phase-A fallback 与最后一段 live 正文同 id 时最后一段正文不闪没"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260903-CURSOR-CLI-ERROR-WASH",
@@ -3024,7 +3068,8 @@
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "INC-20260903-CURSOR-CLI-ERROR-WASH: finish() must keep sanitized Cursor CLI error text on tape."
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS",
@@ -3048,7 +3093,8 @@
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "INC-20260904-OFFICIAL-CC-STOP-STALE-PROCESS: official Claude Code answers Stop with an"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260906-COMMERCIAL-TASKBOARD-DIGEST",
@@ -3082,7 +3128,8 @@
           "path": "scripts/check-v5-taskboard-commercial-gate.ts",
           "assertion": "commercial containers get OC_TASKBOARD_ENABLED=0, gateway gates patrol/digest on it, empty boards never emit a digest"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260905-QUEUED-CONSUMER",
@@ -3178,7 +3225,8 @@
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL: the bridge rewrites teamMode:true"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260907-MEDIA-CURSOR-PRECISION",
@@ -3197,7 +3245,8 @@
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof."
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260907-DELEGATE-LEDGER-REAP",
@@ -3226,7 +3275,8 @@
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof."
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-COMPOSER-DRAFT-BLEED",
@@ -3260,7 +3310,8 @@
           "path": "packages/web-react/browser-tests/composer-draft.node-test.mjs",
           "assertion": "allocating an ID before send preserves unsent new draft"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-CHAT-NAVIGATION",
@@ -3284,7 +3335,8 @@
           "path": "packages/web-react/browser-tests/chat-navigation.node-test.mjs",
           "assertion": "Chat navigation: real components, production CSS, trusted pointer/touch"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-GROK-POOL-NO-COOLDOWN",
@@ -3360,7 +3412,8 @@
           "path": "packages/web-react/browser-tests/human-wait-resume.node-test.mjs",
           "assertion": "Human wait: real PermissionCard click resumes the CCB adapter after twenty minutes"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-IDLE-CURSOR-BLACKHOLE",
@@ -3384,7 +3437,8 @@
           "path": "packages/web-react/browser-tests/chat-navigation.node-test.mjs",
           "assertion": "OCV5-178 warm socket shows new text after restoring an idle cursor"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-CALLBACK-PAYLOAD-HASH",
@@ -3861,7 +3915,8 @@
           "path": "scripts/check-v5-lossless-anchor-contract.ts",
           "assertion": "OCV5-189 deploy proof: cross-turn delegate billing materializes and settles by its own locator"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-TIMELINE-HOOK-ORDER",
@@ -3890,7 +3945,8 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T21 真 WS 帧驱动真时间线:条目顺序、工具卡内容、思考折叠、终态清发送"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260908-CURSOR-EXTERNAL-BILLING",
@@ -4097,7 +4153,8 @@
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "[cursor-auth-mount] PASS — real FS empty-pool transitions and production read-only bind configuration verified (Docker/PG substituted)"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260909-CURSOR-SAND-BOX-NOT-RUNNING",
@@ -4131,7 +4188,8 @@
           "path": "scripts/check-v5-cursor-sand-inference.ts",
           "assertion": "[cursor-sand-box-classify] PASS — Box transport faults classify as recoverable upstream outage in both gateway retry seams"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260915-ADVISOR-CONSULT-CARD",
@@ -4155,7 +4213,8 @@
           "path": "packages/web-react/browser-tests/ocv5-210-advisor-ui.node-test.mjs",
           "assertion": "{ name: /主模型不变/ }"
         }
-      ]
+      ],
+      "coverageCommits": []
     },
     {
       "id": "INC-20260915-ADVISOR-1M-DUP-PICKER",
@@ -4190,58 +4249,10 @@
       "rootFixCommit": "25a5b3c9",
       "coverageCommits": [
         "3144c3a9",
-        "2b4af86e"
-      ],
-      "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/codexRelayPathGuard.test.ts",
-          "assertion": "识别 chatgpt.com Responses WS 直连,且不算 activity"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
-          "assertion": "webchat aborts on chatgpt.com Responses websocket direct connect"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
-          "assertion": "webchat session never aborts on PATH_NOT_ALLOWED burst"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/codexAppServerRunner.test.ts",
-          "assertion": "marks proc stale and recycleProcKeepQueue shuts it down without dropping queued turns"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/codexRouteOverride.test.ts",
-          "assertion": "official override → 完整 -c 序列含 requires_openai_auth=true"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
-          "assertion": "upstream_failed: Codex chatgpt.com Responses websocket direct"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/check-v5-codex-chatgpt-ws.ts",
-          "assertion": "INC-20260915-CODEX-CHATGPT-WS: official provider disables ChatGPT Responses websocket, stderr fail-loud, interrupt recycles hung app-server"
-        }
-      ]
-    },
-    {
-      "id": "INC-20260915-CODEX-CHATGPT-WS",
-      "occurredAt": "2026-09-15",
-      "severity": "P0",
-      "symptom": "商业版 GPT-6-Astra x6.1/1M 卡死「正在启动引擎」数小时零 token：Codex ChatGPT-auth Responses websocket 直连 wss://chatgpt.com（容器 Network unreachable），stderr 被当成 liveness，USER_CANCELLED 后复用同一死 PID。",
-      "rootFixCommit": "497916e2",
-      "coverageCommits": [
+        "2b4af86e",
         "90824ce7",
         "9e518cf7",
-        "25a5b3c9",
-        "3144c3a9",
-        "2b4af86e"
+        "497916e2"
       ],
       "regressions": [
         {
@@ -4314,7 +4325,7 @@
         }
       ],
       "coverageCommits": [
-        "929970ac9"
+        "929970ac"
       ]
     },
     {
@@ -4322,7 +4333,7 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "刚加的官方 Claude Pro OAuth 一发请求就被 18892 代理拦下：官方 Claude Code 带头 anthropic-beta fallback-credit-2026-06-01，ALLOWED_BETA_VALUES 没有该项，ANTHROPIC_BETA_NOT_ALLOWED，账号 3 次失败进 cooldown，前台「上游连续失败」。",
-      "rootFixCommit": "419183882",
+      "rootFixCommit": "41918388",
       "regressions": [
         {
           "layer": "unit",
@@ -4340,16 +4351,18 @@
           "assertion": "oauth + fallback-credit 多值 → 全过"
         }
       ],
-      "coverageCommits": [
-        "419183882"
-      ]
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "unit coverage on official CC anthropic-beta fallback-credit allowlist; live proof after commercial runtime image rebuild",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-CC-BETA-THINKING-COUNT",
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "OCV5-236 上线后官方 CC 能打，Opus 5 很高再被 18892 拦：anthropic-beta thinking-token-count-2026-05-13 不在 ALLOWED_BETA_VALUES，账号 cooldown，前台「模型繁忙」。",
-      "rootFixCommit": "6b22b40da",
+      "rootFixCommit": "6b22b40d",
       "regressions": [
         {
           "layer": "unit",
@@ -4362,43 +4375,47 @@
           "assertion": "oauth + thinking-token-count 多值 → 全过"
         }
       ],
-      "coverageCommits": [
-        "6b22b40da"
-      ]
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "unit coverage on official CC anthropic-beta thinking-token-count allowlist; live proof after commercial runtime image rebuild",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-CLAUDE-QUOTA-RESET-STALE",
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC Opus 5 黄卡「模型繁忙」：18892 proxy_account_pool_unavailable reason=no_active。唯一 Claude 号 quota_5h_pct=96 被 95% 阈值踢出池，但 quota_5h_resets_at 已过；占用只从响应头回写，出池后永不刷新。",
-      "rootFixCommit": "d08669ae4",
+      "rootFixCommit": "d08669ae",
       "regressions": [
         {
-          "layer": "unit",
+          "layer": "integration",
           "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
           "assertion": "5h 占用 96% 且 resets_at 已过 → 仍可 pick"
         },
         {
-          "layer": "unit",
+          "layer": "integration",
           "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
           "assertion": "5h 占用 96% 且 resets_at 仍在未来 → no_active"
         },
         {
-          "layer": "unit",
+          "layer": "integration",
           "path": "packages/commercial/src/__tests__/accountScheduler.integ.test.ts",
           "assertion": "5h 占用 96% 且 resets_at 为空 → no_active"
         }
       ],
-      "coverageCommits": [
-        "d08669ae4"
-      ]
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "unit coverage on Claude quota-window reset not kicking the account; live proof on commercial pool after a 5h window rollover",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-OFFICIAL-CC-OPUS48-GATE",
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 选 Opus 5 时另打 claude-opus-4-8，18892 MODEL_NOT_AVAILABLE；CLI 写成 Failed to authenticate，前台红卡认证状态异常。",
-      "rootFixCommit": "a63fbe791",
+      "rootFixCommit": "a63fbe79",
       "regressions": [
         {
           "layer": "unit",
@@ -4416,19 +4433,20 @@
           "assertion": "非 claude-* 的未知型号即使有票也不改写"
         }
       ],
-      "coverageCommits": [
-        "a63fbe791"
-      ]
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "unit coverage rewriting in-flight claude-opus-4-8 to the turn canonical; live proof on official-cc harness",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-OFFICIAL-CC-FALSE-SERVICE-RESTART",
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 活回合被误判 SERVICE_RESTART：黄卡「任务已中断」但进程仍在出活、过一会又自动续跑。",
-      "rootFixCommit": "2116af09f",
+      "rootFixCommit": "2116af09",
       "coverageCommits": [
-        "2116af09f",
-        "b08aa77b4"
+        "b08aa77b"
       ],
       "regressions": [
         {
@@ -4441,17 +4459,20 @@
           "path": "packages/gateway/src/__tests__/ccbOfficialCcHarness.test.ts",
           "assertion": "official-cc preheat does not spawn or --resume without a master dispatch"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "unit coverage declining leftover SERVICE_RESTART auto-recovery after live progress; live proof on official-cc leftover frames",
+        "since": "2026-09-20"
+      }
     },
     {
       "id": "INC-20260920-OFFICIAL-CC-EXPIRED-AUTHORITY-LEASE",
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 长工具空闲后 403 model authority expired（sleep 240 > 120s TTL，过期 envelope 与有效 lease 同带）；随后 leftover/unpublished 磁带仍 SERVICE_RESTART 自动恢复出黄卡「任务已中断」，进程继续出 token。",
-      "rootFixCommit": "ac3dc10d8",
+      "rootFixCommit": "ac3dc10d",
       "coverageCommits": [
-        "ac3dc10d8",
-        "4a6812df4"
+        "4a6812df"
       ],
       "regressions": [
         {
@@ -4485,7 +4506,7 @@
           "assertion": "source regression guard, not end-to-end proof"
         },
         {
-          "layer": "unit",
+          "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "SERVICE_RESTART leftover with live progress refuses automatic recovery"
         }
