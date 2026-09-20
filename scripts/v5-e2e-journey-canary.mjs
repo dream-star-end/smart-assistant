@@ -286,7 +286,7 @@ try {
 
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
   const probeToken = `OC_ATTACH_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-  await step("J2 附件全链:回形针→filechooser→真实上传→chip done", async () => {
+  await step("J2 附件全链:菜单→filechooser→真实上传→chip done", async () => {
     // Composer: attach is a first-class paperclip label(role=button, accessible name 添加附件).
     // The + menu only has 设定目标. Visible text attach item is gone (063d2c9b3 J2 timeout).
     const attachItem = page.getByRole("button", { name: "添加附件", exact: true });
