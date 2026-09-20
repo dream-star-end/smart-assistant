@@ -749,3 +749,92 @@ describe('ModelSelector 最近使用', () => {
     expect(recentItem?.textContent).toContain('DeepSeek-V4')
   })
 })
+
+function stubNarrowViewport(narrow: boolean) {
+  const original = window.matchMedia
+  window.matchMedia = ((query: string) =>
+    ({
+      matches: query === '(max-width: 639px)' ? narrow : false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as MediaQueryList) as typeof window.matchMedia
+  return () => {
+    window.matchMedia = original
+  }
+}
+
+describe('ModelSelector 窄屏贴底 sheet', () => {
+  const CURSOR_MODELS: PublicModel[] = [
+    { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+    { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
+    { id: 'cursor-grok-4.6-medium', display_name: 'Grok 4.6 Medium' },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('宽屏仍走下拉菜单,不渲染 dialog sheet', async () => {
+    const restore = stubNarrowViewport(false)
+    try {
+      render(
+        <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high" onSelect={() => {}} />,
+      )
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findAllByRole('menuitem')
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(screen.queryByTestId('model-picker-sheet')).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('窄屏打开为贴底 sheet:遮罩 dialog + 单一滚动容器容纳模型与思考档', async () => {
+    const restore = stubNarrowViewport(true)
+    try {
+      render(
+        <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high" onSelect={() => {}} />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog.className).toContain('model-picker-sheet')
+      expect(dialog.className).toContain('overflow-hidden')
+      expect(screen.getByTestId('model-picker-sheet')).toBeInTheDocument()
+      const scroll = screen.getByTestId('model-picker-sheet-scroll')
+      expect(scroll).toHaveAttribute('role', 'menu')
+      expect(scroll.className).toContain('overflow-y-auto')
+      expect(scroll.className).toContain('overscroll-contain')
+      expect(scroll.querySelector('.overflow-y-auto')).toBeNull()
+      expect(screen.getAllByText('选择对话模型').length).toBeGreaterThan(0)
+      expect(screen.getByTestId('model-picker-sheet').textContent).toMatch(/选择对话模型/)
+      expect(screen.getAllByText(/Grok 4\.6/).length).toBeGreaterThan(0)
+      expect(screen.getByText('思考档位')).toBeInTheDocument()
+      const summary = screen.getByText('思考档位').parentElement
+      expect(summary?.textContent).toMatch(/高/)
+      expect(screen.getByRole('menuitem', { name: '高' })).toBeInTheDocument()
+      expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('窄屏点选模型后关闭 sheet', async () => {
+    const restore = stubNarrowViewport(true)
+    try {
+      const onSelect = vi.fn()
+      render(
+        <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high" onSelect={onSelect} />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+      fireEvent.click(screen.getByRole('menuitem', { name: /GLM-5\.2/ }))
+      expect(onSelect).toHaveBeenCalledWith('glm-5.2')
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    } finally {
+      restore()
+    }
+  })
+})
