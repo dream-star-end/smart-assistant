@@ -56,6 +56,12 @@ test("host 1af23fe layout with isEventsEcho and createHostAuthService installs p
     assert.equal(ok.status,200);assert.equal((await ok.json()).moduleSha256,hash(readFileSync(modulePath)));
   } finally { if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}rmSync(dir,{recursive:true,force:true}); }
 });
+test("syntax check timeout covers 26MB live host-main.cjs", () => {
+  const r = spawnSync("python3", ["-c", `import importlib.util,sys
+s=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+assert m.SYNTAX_CHECK_TIMEOUT_SEC >= 180, m.SYNTAX_CHECK_TIMEOUT_SEC`, installer], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+});
 test("unknown source, hash mismatch and syntax failure leave host and module unchanged", () => {
   const dir=mkdtempSync(join(tmpdir(),"sand-installer-reject-")),host=join(dir,"host-main.cjs"),target=join(dir,"ocv5-197-relay.cjs"),bad=join(dir,"bad.cjs");
   const original=readFileSync(join(__dirname,"fixtures/host-original.cjs"));

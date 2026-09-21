@@ -13,6 +13,9 @@ import sys
 import uuid
 
 MODULE = "ocv5-197-relay.cjs"
+# Live host-main.cjs is ~26MB; node --check on it exceeds the old 30s kill.
+# Fixture-sized files still return immediately, so the longer cap does not stall them.
+SYNTAX_CHECK_TIMEOUT_SEC = 180
 # Inspected native consumer. Unknown versions can stage, never actively restart.
 SUPERVISOR_SHA256 = "a387f70a2134addc6a1f576b9a50589a2680d047daed15ecf7d102afc8f741c8"
 OLD_ROUTE_KIND = '  const isSandStreamRelay = req.method === "POST" && url2.pathname === SAND_STREAM_RELAY_PATH;'
@@ -174,7 +177,15 @@ def install(host, module, expected_hash, nonce, check_owner=lambda: None):
             write_new(module_next, module)
             write_new(host_next, after, host.stat().st_mode & 0o777)
             for candidate in [module_next, host_next]:
-                result = subprocess.run(["node", "--check", str(candidate)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                try:
+                    result = subprocess.run(
+                        ["node", "--check", str(candidate)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=SYNTAX_CHECK_TIMEOUT_SEC,
+                    )
+                except subprocess.TimeoutExpired:
+                    fail("SYNTAX_CHECK_FAILED")
                 if result.returncode != 0:
                     fail("SYNTAX_CHECK_FAILED")
             check_owner()
