@@ -18,6 +18,8 @@
  * 契约测试(turnErrorTaxonomyContract)锁 1↔2↔3 的 code 集合同源。
  */
 
+import { observeUnknownRunError } from './errorClassifyJevShadow.js'
+
 export type ClassifiedErrorCode =
   | 'insufficient_credits'
   | 'rate_limited'
@@ -196,6 +198,11 @@ export function classifyRunError(raw: string | undefined | null): ClassifiedErro
   if (!s) return { code: 'unknown', message: '' }
   for (const p of PATTERNS) {
     if (p.re.test(s)) return { code: p.code, message: p.message }
+  }
+  try {
+    observeUnknownRunError(s)
+  } catch {
+    // OCV5-253: shadow must never change classification or throw into the turn.
   }
   return { code: 'unknown', message: '' }
 }
