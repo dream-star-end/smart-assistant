@@ -111,6 +111,20 @@ describe('errorClassify Jev shadow', () => {
     assert.equal(record.textHash, hashErrorText(`unrecognized ${SENTINEL}`))
   })
 
+  it('reads confidence from providerMetadata.typesafe when the answer omits it', async () => {
+    enable()
+    installFetch({
+      answers: { code: { type: 'choice', choice: 'auth_error', probabilities: { auth_error: 0.99 } } },
+      providerMetadata: { typesafe: { confidence: { code: 0.99 } } },
+    })
+    classifyRunError('metadata confidence only')
+    await flushErrorClassifyJevShadowForTests()
+    const record = logs[0]?.ctx as { confidence?: number; thresholdMet?: boolean; jevCode?: string }
+    assert.equal(record.jevCode, 'auth_error')
+    assert.equal(record.confidence, 0.99)
+    assert.equal(record.thresholdMet, true)
+  })
+
   it('confidence below 0.9 does not meet the adopt threshold', async () => {
     enable()
     installFetch(okBody('bad_request', JEV_SHADOW_CONFIDENCE_MIN - 0.01))

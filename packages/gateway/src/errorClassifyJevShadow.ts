@@ -275,10 +275,7 @@ function parseEvaluateBody(body: unknown): {
   const answers = asRecord(root?.answers)
   const codeAnswer = asRecord(answers?.code)
   const choice = typeof codeAnswer?.choice === 'string' ? codeAnswer.choice : null
-  const confidence =
-    typeof codeAnswer?.confidence === 'number' && Number.isFinite(codeAnswer.confidence)
-      ? codeAnswer.confidence
-      : null
+  const confidence = readConfidence(codeAnswer, root, 'code')
   return {
     jevCode: choice,
     confidence,
@@ -286,6 +283,23 @@ function parseEvaluateBody(body: unknown): {
     thresholdMet:
       confidence !== null && confidence >= JEV_SHADOW_CONFIDENCE_MIN && choice !== null && ADOPTABLE.has(choice),
   }
+}
+
+/** HTTP evaluate puts confidence on the answer. AI SDK also reports it at providerMetadata.typesafe.confidence[questionId]. */
+function readConfidence(
+  answer: Record<string, unknown> | null,
+  root: Record<string, unknown> | null,
+  questionId: string,
+): number | null {
+  const direct = finiteNumber(answer?.confidence)
+  if (direct !== null) return direct
+  const typesafe = asRecord(asRecord(root?.providerMetadata)?.typesafe)
+  const byQuestion = asRecord(typesafe?.confidence)
+  return finiteNumber(byQuestion?.[questionId])
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function readUpstreamMs(root: Record<string, unknown> | null): number | null {
