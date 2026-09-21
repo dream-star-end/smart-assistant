@@ -157,7 +157,7 @@ for (const event of [
       }])
 
       const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; promptFile: string; promptMode: number; prompt: string; env: Record<string, string> }
-      assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.6'])
+      assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.7'])
       assert.match(captured.prompt, /OpenClaude Platform Context \(Grok adapter\)/)
       assert.match(captured.prompt, /fix it/)
       assert.equal(captured.promptMode, 0o600)

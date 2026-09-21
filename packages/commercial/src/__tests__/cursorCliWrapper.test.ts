@@ -792,6 +792,31 @@ describe('oc-cursor wrapper', () => {
     }
   })
 
+  test('accepts the Cursor Grok 4.7 upstream ids and rejects unlisted siblings', () => {
+    const f = fixture()
+    for (const model of [
+      'grok-4.7-low',
+      'grok-4.7-high',
+      'grok-4.7-xhigh-fast',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+    }
+    for (const model of ['grok-4.7', 'grok-4.7-max', 'cursor-grok-4.7-high']) {
+      const blocked = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(blocked.status, 2, model)
+      assert.match(blocked.stderr, /model is not allowlisted/)
+    }
+  })
+
   test('accepts the Cursor Grok 4.6 High Fast upstream id', () => {
     const f = fixture()
     const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high-fast', '--', 'hello'], {

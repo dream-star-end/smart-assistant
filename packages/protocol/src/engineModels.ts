@@ -184,7 +184,7 @@ export function codexTransportModelId(modelId: string | undefined): string | und
 
 /** xAI 官方 Grok CLI 的编码产品型号。 */
 export const GROK_ENGINE_MODELS = [
-  { id: 'grok-build', displayName: 'Grok Build', upstreamModel: 'grok-4.6' },
+  { id: 'grok-build', displayName: 'Grok 4.7', upstreamModel: 'grok-4.7' },
 ] as const
 
 export const GROK_ENGINE_MODEL_IDS = GROK_ENGINE_MODELS.map((m) => m.id)
@@ -261,6 +261,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  */
 export type CursorEngineFamilyId =
   | 'auto'
+  | 'grok-4.7'
   | 'grok-4.6'
   | 'composer-2.5'
   | 'opus-5'
@@ -283,6 +284,78 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Cursor Auto',
     effort: null,
     fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-low',
+    displayName: 'Grok 4.7 Low',
+    upstreamModel: 'grok-4.7-low',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-low-fast',
+    displayName: 'Grok 4.7 Low Fast',
+    upstreamModel: 'grok-4.7-low-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'low',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.7-medium',
+    displayName: 'Grok 4.7 Medium',
+    upstreamModel: 'grok-4.7-medium',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-medium-fast',
+    displayName: 'Grok 4.7 Medium Fast',
+    upstreamModel: 'grok-4.7-medium-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'medium',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.7-high',
+    displayName: 'Grok 4.7 High',
+    upstreamModel: 'grok-4.7-high',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-high-fast',
+    displayName: 'Grok 4.7 High Fast',
+    upstreamModel: 'grok-4.7-high-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'high',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.7-xhigh',
+    displayName: 'Grok 4.7 Extra High',
+    upstreamModel: 'grok-4.7-xhigh',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-xhigh-fast',
+    displayName: 'Grok 4.7 Extra High Fast',
+    upstreamModel: 'grok-4.7-xhigh-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'xhigh',
+    fast: true,
   },
   {
     id: 'cursor-grok-4.6-low',
@@ -1194,7 +1267,7 @@ export function cursorCredentialModelFamily(
   const known = cursorModelById(raw)
   const upstream = known ? known.upstreamModel ?? 'auto' : raw
   if (!upstream || upstream === 'auto') return 'cursor_models'
-  return /^(?:cursor-grok-4\.[56]|composer-2\.5)(?:-|$)/.test(upstream)
+  return /^(?:cursor-grok-4\.[56]|grok-4\.7|composer-2\.5)(?:-|$)/.test(upstream)
     ? 'cursor_models'
     : 'other_models'
 }

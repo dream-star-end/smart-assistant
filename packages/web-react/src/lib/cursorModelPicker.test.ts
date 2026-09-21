@@ -13,6 +13,8 @@ import type { LockedPublicModel, PublicModel } from './types'
 
 const CURSOR_PUBLIC: PublicModel[] = [
   { id: 'cursor-auto', display_name: 'Cursor Auto' },
+  { id: 'cursor-grok-4.7-high', display_name: 'Grok 4.7 High' },
+  { id: 'cursor-grok-4.7-high-fast', display_name: 'Grok 4.7 High Fast' },
   { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
   { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
   { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
@@ -40,6 +42,7 @@ describe('cursorModelPicker', () => {
     const rows = modelPickerRows(CURSOR_PUBLIC)
     expect(rows.map(rowKey)).toEqual([
       'auto',
+      'grok-4.7',
       'grok-4.6',
       'glm-5.2',
       'composer-2.5',
@@ -137,6 +140,7 @@ describe('cursorModelPicker', () => {
   })
 
   it('uses protocol family labels without the Cursor prefix (except Auto)', () => {
+    expect(cursorModelById('cursor-grok-4.7-high')?.familyLabel).toBe('Grok 4.7')
     expect(cursorModelById('cursor-grok-4.6-high')?.familyLabel).toBe('Grok 4.6')
     expect(cursorModelById('cursor-opus-5-high')?.displayName).toBe('Opus 5 High')
     expect(cursorModelById('cursor-fable-5.1-xhigh')?.displayName).toBe(
