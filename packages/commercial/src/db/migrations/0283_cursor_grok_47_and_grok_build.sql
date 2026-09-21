@@ -1,7 +1,9 @@
 -- 0283_cursor_grok_47_and_grok_build.sql
 -- order-dependency: 0281_cursor_sand_usable_families
 -- Onboard Grok 4.7 (xAI 2026-09-21):
---   1. Official grok-build catalog: upstream grok-4.6 → grok-4.7, display Grok 4.7.
+--   1. Official grok-build catalog: switch upstream grok-4.6 → grok-4.7 via
+--      fn_model_switch_version (active execution fields are immutable; a
+--      direct UPDATE is rejected by fn_model_catalog_guard). Display Grok 4.7.
 --      Live grok-relay GET /v1/models already lists grok-4.7 (and grok-4.7-build-fast).
 --      Adapter still passes --model <upstream>; pinned CLI 1.0.5 forwards the id.
 --      grok-4.7-build-fast is intentionally not catalogued (Grok Build Fast SKU stays off).
@@ -25,6 +27,7 @@ DECLARE
   actual INTEGER;
   existing INTEGER;
   grok_build_upstream TEXT;
+  grok_build_entry BIGINT;
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM model_catalog c JOIN model_pricing p USING (model_id)
@@ -40,18 +43,34 @@ BEGIN
     RAISE EXCEPTION '0283 requires active enabled grok-build floor';
   END IF;
 
-  -- ── 1. grok-build upstream 4.6 → 4.7 ────────────────────────────────
+  -- ── 1. grok-build upstream 4.6 → 4.7 (active execution fields are immutable)
   SELECT upstream_model_id INTO grok_build_upstream
-    FROM model_catalog WHERE model_id = 'grok-build' AND engine = 'grok';
+    FROM model_catalog
+   WHERE model_id = 'grok-build' AND engine = 'grok' AND state = 'active';
   IF grok_build_upstream IS DISTINCT FROM 'grok-4.7' THEN
     IF grok_build_upstream IS DISTINCT FROM 'grok-4.6' THEN
       RAISE EXCEPTION '0283 grok-build upstream is %, expected grok-4.6 or grok-4.7', grok_build_upstream;
     END IF;
-    UPDATE model_catalog
-       SET upstream_model_id = 'grok-4.7'
-     WHERE model_id = 'grok-build' AND engine = 'grok' AND state = 'active';
-    IF NOT FOUND THEN
-      RAISE EXCEPTION '0283 failed to retarget grok-build upstream to grok-4.7';
+    IF EXISTS (
+      SELECT 1 FROM model_catalog WHERE model_id = 'grok-build' AND state = 'staged'
+    ) THEN
+      RAISE EXCEPTION '0283 grok-build has a pending staged version; activate or drop it first';
+    END IF;
+    SELECT fn_model_switch_version(
+      c.model_id, c.engine, c.provider_id, 'grok-4.7', c.context_window,
+      c.capability_profile, c.capability_schema_version, NULL, c.lock_version
+    ) INTO grok_build_entry
+      FROM model_catalog c
+     WHERE c.model_id = 'grok-build' AND c.engine = 'grok' AND c.state = 'active';
+    IF grok_build_entry IS NULL THEN
+      RAISE EXCEPTION '0283 failed to switch grok-build to grok-4.7';
+    END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM model_catalog
+       WHERE entry_id = grok_build_entry AND model_id = 'grok-build'
+         AND state = 'active' AND upstream_model_id = 'grok-4.7'
+    ) THEN
+      RAISE EXCEPTION '0283 grok-build switch did not activate grok-4.7';
     END IF;
   END IF;
 
