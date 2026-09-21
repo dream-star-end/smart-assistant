@@ -124,6 +124,7 @@ describe('Grok Build engine model authority', () => {
   test('pins grok-build onto grok-4.7', () => {
     assert.deepEqual(GROK_ENGINE_MODELS, [
       { id: 'grok-build', displayName: 'Grok 4.7', upstreamModel: 'grok-4.7' },
+      { id: 'grok-build-fast', displayName: 'Grok 4.7 Fast', upstreamModel: 'grok-4.7-build-fast' },
     ])
   })
 })

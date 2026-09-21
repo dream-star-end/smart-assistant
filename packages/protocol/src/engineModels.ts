@@ -185,6 +185,7 @@ export function codexTransportModelId(modelId: string | undefined): string | und
 /** xAI 官方 Grok CLI 的编码产品型号。 */
 export const GROK_ENGINE_MODELS = [
   { id: 'grok-build', displayName: 'Grok 4.7', upstreamModel: 'grok-4.7' },
+  { id: 'grok-build-fast', displayName: 'Grok 4.7 Fast', upstreamModel: 'grok-4.7-build-fast' },
 ] as const
 
 export const GROK_ENGINE_MODEL_IDS = GROK_ENGINE_MODELS.map((m) => m.id)

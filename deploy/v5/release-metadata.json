@@ -163,7 +163,8 @@
     "0279_api_key_message_audit",
     "0280_cursor_haiku_45",
     "0281_cursor_sand_usable_families",
-    "0283_cursor_grok_47_and_grok_build"
+    "0283_cursor_grok_47_and_grok_build",
+    "0284_grok_build_fast_retire_grok_46"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

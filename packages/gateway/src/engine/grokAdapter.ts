@@ -53,6 +53,11 @@ const log = createLogger({ module: 'grokAdapter' })
 const GROK_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const GROK_UPSTREAM_MODEL = 'grok-4.7'
+const GROK_FAST_UPSTREAM_MODEL = 'grok-4.7-build-fast'
+
+function grokUpstreamModel(model: string | undefined): string {
+  return model === 'grok-build-fast' ? GROK_FAST_UPSTREAM_MODEL : GROK_UPSTREAM_MODEL
+}
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
 const PROCESS_KEEPALIVE_INTERVAL_MIN_MS = 5_000
@@ -556,7 +561,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (!spec) throw new Error('GROK_LAUNCH_SPEC_MISSING')
     const args = [
       '--agent', 'grok-build',
-      '--model', GROK_UPSTREAM_MODEL,
+      '--model', grokUpstreamModel(this.currentModel),
       '--prompt-file', spec.promptFile,
       '--output-format', 'streaming-json',
       '--always-approve',
