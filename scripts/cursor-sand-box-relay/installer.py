@@ -18,8 +18,10 @@ SUPERVISOR_SHA256 = "a387f70a2134addc6a1f576b9a50589a2680d047daed15ecf7d102afc8f
 OLD_ROUTE_KIND = '  const isSandStreamRelay = req.method === "POST" && url2.pathname === SAND_STREAM_RELAY_PATH;'
 ROUTE_KIND = '  const isSandStreamRelay = (req.method === "POST" || req.method === "GET") && url2.pathname === SAND_STREAM_RELAY_PATH;'
 HANDLE = "async function handleRequest(deps, req, res) {"
+HANDLE_V2 = "async function handleRequest(deps, req, res, eventStreamEchoes) {"
 CLASSIFY = '  const isCommand = req.method === "POST" && url2.pathname.startsWith(`${GATEWAY_API_PREFIX}/`);'
 GROUP = "  if (isEvents || isAvatar || isCommand || isPrepareUpgrade || isLocalExecRequests || isLocalExecResponses || isWebAuthnRequests || isWebAuthnResponses || isCookieOriginApprovalRequests || isCookieOriginApprovalResponses) {"
+GROUP_V2 = "  if (isEvents || isEventsEcho || isAvatar || isCommand || isPrepareUpgrade || isLocalExecRequests || isLocalExecResponses || isWebAuthnRequests || isWebAuthnResponses || isCookieOriginApprovalRequests || isCookieOriginApprovalResponses) {"
 AUTH = '''    if (deps.authToken != null && !isAuthorized(req, deps.authToken)) {
       return respondError(res, 401, "unauthorized");
     }
@@ -28,6 +30,10 @@ SERVICE = '''      log: (message) => context2.host.log(message),
       credentials: context2.host.environment.auth
     });
     context2.onStop(() => service.dispose());'''
+SERVICE_V2 = '''      credentials: context2.host.environment.auth
+    });
+    context2.onStop(() => service.dispose());
+    const getTeamId = createSelectedTeamReader({'''
 REGISTER = '''    registerSandStreamRelayAuth({
       getGrokBotToken: () => service.getGrokBotToken(),
       getMachineId: () => service.getMachineId(),
@@ -66,12 +72,21 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def layout_anchors(source):
+    if source.count(HANDLE_V2) == 1:
+        return HANDLE_V2, GROUP_V2, SERVICE_V2
+    if source.count(HANDLE) == 1:
+        return HANDLE, GROUP, SERVICE
+    fail("UNSUPPORTED_HOST_LAYOUT")
+
+
 def patch_source(source):
+    handle, group, service = layout_anchors(source)
     if "handleSandStreamRelay" in source:
         old_hook = 'const __ocv5Relay = require("./ocv5-197-relay.cjs").createRelay({'
         old_body = 'function handleSandStreamRelay(deps, req, res) {\n  return __ocv5Relay(deps, req, res);\n}'
         owned = HOOK in source or (old_hook in source and old_body in source)
-        if not owned or source.count(HANDLE) != 1 or REGISTER not in source or ROUTE not in source:
+        if not owned or source.count(handle) != 1 or REGISTER not in source or ROUTE not in source:
             fail("UNSUPPORTED_EXISTING_HOOK")
         # Add a GET-only capability route without changing the original auth gate.
         if source.count(OLD_ROUTE_KIND) == 1:
@@ -79,17 +94,17 @@ def patch_source(source):
         if source.count(ROUTE_KIND) != 1:
             fail("UNSUPPORTED_EXISTING_HOOK")
         return source
-    for anchor in [HANDLE, CLASSIFY, GROUP, AUTH, SERVICE]:
+    for anchor in [handle, CLASSIFY, group, AUTH, service]:
         if source.count(anchor) != 1:
             fail("UNSUPPORTED_HOST_LAYOUT")
     for name in ["createNodeHttpClient", "isAuthorized", "createCursorChecksum"]:
         if not re.search(r"function " + name + r"\s*\(", source):
             fail("UNSUPPORTED_HOST_LAYOUT")
-    source = source.replace(HANDLE, HOOK + HANDLE, 1)
+    source = source.replace(handle, HOOK + handle, 1)
     source = source.replace(CLASSIFY, CLASSIFY + '\n' + ROUTE_KIND, 1)
-    source = source.replace(GROUP, GROUP.replace(") {", " || isSandStreamRelay) {"), 1)
+    source = source.replace(group, group.replace(") {", " || isSandStreamRelay) {"), 1)
     source = source.replace(AUTH, AUTH.replace("    if (isPrepareUpgrade) {", ROUTE + "    if (isPrepareUpgrade) {"), 1)
-    source = source.replace(SERVICE, SERVICE.replace("    context2.onStop(() => service.dispose());", REGISTER), 1)
+    source = source.replace(service, service.replace("    context2.onStop(() => service.dispose());", REGISTER), 1)
     return source
 
 
