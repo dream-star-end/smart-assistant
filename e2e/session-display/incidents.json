@@ -4572,6 +4572,28 @@
           "assertion": "source regression guard, not end-to-end proof"
         }
       ]
+    },
+    {
+      "id": "INC-20260921-CLAUDE-EGRESS-PRECHECK-ACTIVE",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "管理台新建 Claude 账号绑同一 egress 失败：预检把 disabled Claude 也算占用，与只约束 active 的唯一索引不一致。",
+      "rootFixCommit": "1d7f79c7a",
+      "coverageCommits": [
+        "1d7f79c7a"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/adminAccounts.egressPrecheck.unit.test.ts",
+          "assertion": "只统计 active Claude，与 idx_claude_accounts_egress_proxy_uniq 一致"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败"
+        }
+      ]
     }
   ]
 }
