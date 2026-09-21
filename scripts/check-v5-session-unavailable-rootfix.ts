@@ -149,6 +149,23 @@ if (!sessionManagerSrc.includes('TRANSIENT_RETRY_INPUT resumes')) {
 }
 console.log('[ccb-transient-continue] PASS — INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.')
 
+// INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.
+const identityGuardSrc = readFileSync(
+  join(root, 'packages/commercial/src/http/proxy/claudeIdentityGuard.ts'),
+  'utf8',
+)
+const identityCoreSrc = readFileSync(join(root, 'packages/commercial/src/http/proxy/core.ts'), 'utf8')
+if (!identityGuardSrc.includes('export async function assertClaudeOAuthIdentity(')) {
+  throw new Error('[claude-identity-guard] missing assertClaudeOAuthIdentity')
+}
+if (!identityCoreSrc.includes('await assertClaudeOAuthIdentity({')) {
+  throw new Error('[claude-identity-guard] core.ts must call assertClaudeOAuthIdentity before fetch')
+}
+if (!identityCoreSrc.includes('EGRESS_IDENTITY_MISMATCH')) {
+  throw new Error('[claude-identity-guard] mismatch must fail-closed with EGRESS_IDENTITY_MISMATCH')
+}
+console.log('[claude-identity-guard] PASS — INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.')
+
 // INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
 // The delegateDurable unit suite separately exercises real SQLite retire/prune and
 // a real-interval cron heartbeat; this gate only stops the contracts regressing.

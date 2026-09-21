@@ -205,6 +205,28 @@ export const SUPPORTED_PROXY_REGIONS = Object.freeze(
   Object.keys(REGION_ACCEPT_LANGUAGE),
 ) as ReadonlyArray<string>;
 
+/** 代理国 → 与 ACCEPT_LANGUAGE_TIMEZONE 一致的 IANA 时区。 */
+export const PROXY_REGION_TIMEZONE: Readonly<Record<string, string>> = Object.freeze({
+  US: "America/New_York",
+  GB: "Europe/London",
+  CN: "Asia/Shanghai",
+  JP: "Asia/Tokyo",
+  DE: "Europe/Berlin",
+});
+
+export function timezoneForProxyRegion(region: string | null | undefined): string | null {
+  if (!region) return null;
+  return PROXY_REGION_TIMEZONE[region] ?? null;
+}
+
+export function countryForTimezone(tz: string | null | undefined): string | null {
+  if (!tz) return null;
+  for (const [country, mapped] of Object.entries(PROXY_REGION_TIMEZONE)) {
+    if (mapped === tz) return country;
+  }
+  return null;
+}
+
 /** 判定一个字符串是否合法的代理地域码。 */
 export function isSupportedProxyRegion(region: unknown): region is string {
   return typeof region === "string" && region in REGION_ACCEPT_LANGUAGE;
@@ -222,8 +244,13 @@ export function isSupportedProxyRegion(region: unknown): region is string {
  * defaultHeaders 里用 getUserAgent() 覆盖了 SDK 默认 UA,所以 Anthropic 网关看到
  * 的就是 `claude-cli/*`。SDK 的身份仍通过 x-stainless-* 头单独表达。
  */
-function pickUserAgent(): string {
+/** 当前活体 CLI 的 wire UA，供出站一致性门核对。 */
+export function liveClaudeCliUserAgent(): string {
   return `claude-cli/${liveClaudeCliVersion()} (${CCB_USER_TYPE}, ${CCB_ENTRYPOINT})`;
+}
+
+function pickUserAgent(): string {
+  return liveClaudeCliUserAgent();
 }
 
 /**

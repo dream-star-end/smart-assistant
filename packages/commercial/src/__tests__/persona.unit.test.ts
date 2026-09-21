@@ -22,6 +22,8 @@ import {
   isSupportedProxyRegion,
   liveClaudeCliVersion,
   OFFICIAL_CC_CLI_VERSION,
+  timezoneForProxyRegion,
+  countryForTimezone,
   type Persona,
 } from "../account-pool/persona.js";
 
@@ -351,6 +353,13 @@ describe("generatePersona — 代理地域驱动(反封 #1)", () => {
       fps.add(`${p.x_stainless_os}|${p.x_stainless_arch}|${p.x_stainless_runtime_version}`);
     }
     assert.ok(fps.size >= 2, `US 号仍应在 os/arch/node 上有差异, got ${fps.size}`);
+  });
+
+  test("timezoneForProxyRegion / countryForTimezone 与 JP 出口互逆", () => {
+    assert.equal(timezoneForProxyRegion("JP"), "Asia/Tokyo");
+    assert.equal(countryForTimezone("Asia/Tokyo"), "JP");
+    assert.equal(timezoneForProxyRegion(null), null);
+    assert.equal(countryForTimezone("Mars/Phobos"), null);
   });
 
   test("null / 未知地域 → 回退随机(accept_language 仍合法)", () => {

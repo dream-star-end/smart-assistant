@@ -79,6 +79,7 @@ import {
   stripMalformedThinkingBlocks,
   type ProxyBody,
 } from "./shared.js";
+import { ClaudeIdentityGuardError } from "./claudeIdentityGuard.js";
 
 // ─── 路由决策 + 早拒绝 ────────────────────────────────────────────────────────
 
@@ -308,6 +309,8 @@ export interface PreparedUpstreamSession {
   readonly slotId: string | null;
   /** 反风控锚定 device_id;`null` = 静态 key 路径 */
   readonly pinnedUserId: string | null;
+  /** OAuth persona IANA 时区；静态 key 路径为 null */
+  readonly personaTimezone: string | null;
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
   /**
@@ -338,7 +341,7 @@ export interface PreparedUpstreamSession {
    *   - `safeHeaders.authorization = Bearer ${pick.token utf8}`
    *   - `anthropic-beta` merge `oauth-2025-04-20`(允许多 token 共存,不覆盖)
    *   - `body.metadata.user_id` rewrite via `rewriteMetadataDeviceId`(pinned hex 合法时);
-   *     pinned schema breach 时 fail-open + log.warn `pinned_user_id_invariant_breach`。
+   *     pinned schema breach 时 fail-closed（ClaudeIdentityGuardError），不出站。
    *
    * 静态 key(deepseek/minimax/ark,见 makeStaticKeyUpstream):
    *   - `safeHeaders.authorization = Bearer ${apiKey}`
@@ -512,6 +515,7 @@ function makeStaticKeyUpstream(
     accountId: null,
     slotId: null,
     pinnedUserId: null,
+    personaTimezone: null,
     endpoint: spec.upstreamEndpoint,
     upstreamModel,
     dispatcher,
@@ -690,6 +694,7 @@ function makeOAuthPoolUpstream(
     accountId: pick.account_id,
     slotId: pick.slotId,
     pinnedUserId: pick.pinned_user_id,
+    personaTimezone: pick.persona?.timezone ?? null,
     endpoint,
     upstreamModel,
     dispatcher,
@@ -733,8 +738,8 @@ function makeOAuthPoolUpstream(
         .filter(Boolean);
       if (!existing.includes("oauth-2025-04-20")) existing.unshift("oauth-2025-04-20");
       safeHeaders["anthropic-beta"] = existing.join(",");
-      // (iii) device_id pin —— pinned_user_id 由 0067 migration schema 强约束;
-      //       breach 时 fail-open 不阻塞请求(运维介入修脏数据)。
+      // (iii) device_id pin —— pinned_user_id 由 0067 schema 强约束;
+      //       breach 时 fail-closed，避免短命 device_id 打到 Anthropic。
       const pinned = pick.pinned_user_id;
       if (typeof pinned === "string" && /^[0-9a-f]{64}$/.test(pinned)) {
         body.metadata ??= {};
@@ -744,6 +749,10 @@ function makeOAuthPoolUpstream(
           account_id: pick.account_id.toString(),
           pinned_type: typeof pinned,
         });
+        throw new ClaudeIdentityGuardError(
+          "device_mismatch",
+          "pinned_user_id missing or not 64-hex",
+        );
       }
       // (iv) Phase 6 account_uuid pin —— 锚定 OAuth account 真 UUID(0070 migration)。
       //

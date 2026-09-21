@@ -1162,19 +1162,25 @@ describe("PreparedUpstreamSession (OAuth) — applyUpstreamAuth", () => {
     assert.equal(parsed.device_id, PINNED_OK, "device_id 必须被锚定到 pinned_user_id");
   });
 
-  test("pinned schema breach → fail-open + log.warn,不重写 device_id", async () => {
+  test("pinned schema breach → fail-closed,不重写 device_id", async () => {
     const { session } = await makeSession({ pinned_user_id: PINNED_BAD as unknown as string });
     const body = {
       metadata: { user_id: JSON.stringify({ device_id: "client-original" }) },
     } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
-    session.applyUpstreamAuth({}, body, log);
+    assert.throws(
+      () => session.applyUpstreamAuth({}, body, log),
+      (err: unknown) =>
+        err instanceof Error &&
+        err.name === "ClaudeIdentityGuardError" &&
+        /device_mismatch/.test(err.message),
+    );
     const parsed = JSON.parse(
       String((body as { metadata?: { user_id?: unknown } }).metadata!.user_id),
     );
     assert.equal(
       parsed.device_id,
       "client-original",
-      "breach 时保留客户端原值,不阻塞请求",
+      "breach 时保留客户端原值且不出站",
     );
   });
 
