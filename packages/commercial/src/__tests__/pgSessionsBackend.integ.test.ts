@@ -6513,7 +6513,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "runtime-incomplete",
-        expectConflict: true,
+        expectConflict: false,
         record: {
           id: "runtime-incomplete",
           role: "runtime-event",
