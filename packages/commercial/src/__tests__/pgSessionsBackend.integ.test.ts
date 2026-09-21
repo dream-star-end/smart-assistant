@@ -6559,21 +6559,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           max: 10,
         },
       }));
-      assert.equal(recovered.kind, "admitted", testCase.suffix);
-      const stored = await backend.getClientSession(sessionId, CUSER);
-      assert.equal(
-        (stored!.messages as MessageLike[]).some((message) =>
-          message.id === identity.clientMessageId &&
-          message._recoveryMode === "checkpoint" &&
-          message._automaticRecovery === true),
-        true,
-        testCase.suffix,
-      );
-      const dispatch = await pool.query(
-        "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
-        [UID, sessionId, identity.clientMessageId],
-      );
-      assert.equal(dispatch.rowCount, 1, testCase.suffix);
+      assert.deepEqual(recovered, {
+        kind: "recovery_conflict",
+        reason: "automatic_checkpoint_unsafe",
+      }, testCase.suffix);
     }
   });
 

@@ -1938,7 +1938,7 @@ describe("crash/interrupt partial persistence", () => {
           dispatchId: "77777777-7777-4777-8777-777777777777",
           attemptNo: 1,
         },
-      } as Partial<AgentSession>, { harness: "official-cc" } as EngineCreateOpts);
+      } as Partial<AgentSession>, { harness: "official-cc", authorityEngine: "cursor" } as EngineCreateOpts);
       (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
 
       const completion = runOneTurn(sm, session, events);
