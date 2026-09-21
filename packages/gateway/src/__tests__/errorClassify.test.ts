@@ -225,10 +225,72 @@ describe('classifyRunError', () => {
     )
   })
 
-  it('model_capacity: at capacity + try a different model', () => {
-    const r = classifyRunError('Selected model is at capacity. Please try a different model.')
-    assert.equal(r.code, 'model_capacity')
-    assert.equal(r.message, '模型繁忙，请稍后重试或切换模型')
+  it('model_not_available: grok route expired (bare + JSON wrap)', () => {
+    const bare =
+      'Internal error: {"message":"API error (status 404 Not Found): grok route expired","http_status":404}'
+    const wrapped = JSON.stringify({
+      subtype: 'error_during_execution',
+      result: bare,
+    })
+    for (const raw of [bare, wrapped, 'API error (status 404 Not Found): grok route expired']) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'model_not_available', raw)
+      assert.equal(r.message, '当前模型不可用，请切换模型后再试')
+    }
+  })
+
+  it('model_not_available: provider says try a different model (bare + JSON wrap)', () => {
+    const bare = 'Selected model is at capacity. Please try a different model.'
+    const wrapped = JSON.stringify({
+      subtype: 'error_during_execution',
+      result: bare,
+    })
+    for (const raw of [bare, wrapped]) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'model_not_available', raw)
+      assert.equal(r.message, '当前模型不可用，请切换模型后再试')
+    }
+  })
+
+  it('ordinary at-capacity without "try a different model" stays model_capacity', () => {
+    const raw =
+      'The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier'
+    assert.equal(classifyRunError(raw).code, 'model_capacity')
+  })
+
+  it('model_not_available: MOONSHOT_NOT_CONFIGURED (bare + JSON wrap)', () => {
+    const bare = 'API Error: 503 MOONSHOT_NOT_CONFIGURED'
+    const wrapped = JSON.stringify({
+      subtype: 'error_during_execution',
+      result:
+        'API Error: 503 {"error":{"code":"MOONSHOT_NOT_CONFIGURED","message":"moonshot upstream not configured"}}',
+    })
+    for (const raw of [bare, wrapped]) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'model_not_available', raw)
+      assert.equal(r.message, '当前模型不可用，请切换模型后再试')
+    }
+  })
+
+  it('generic 503 without MOONSHOT_NOT_CONFIGURED stays upstream_failed', () => {
+    assert.equal(classifyRunError('API Error: 503 Service Unavailable').code, 'upstream_failed')
+  })
+
+  it('CURSOR_SAND_BOX_* [non-retryable] classification is unchanged (OCV5-252 regression)', () => {
+    // These markers only stop CCB's in-request loop; turn-level class must
+    // stay the 2026-09-09 mapping. Do not let new rules steal them.
+    assert.equal(
+      classifyRunError('CURSOR_SAND_BOX_NOT_RUNNING [non-retryable]').code,
+      'upstream_failed',
+    )
+    assert.equal(
+      classifyRunError('CURSOR_SAND_BOX_BUSY [non-retryable]').code,
+      'model_capacity',
+    )
+    assert.equal(
+      classifyRunError('CURSOR_SAND_BOX_CONTROL_FAILED [non-retryable]').code,
+      'upstream_failed',
+    )
   })
 
   it('model_capacity: overloaded', () => {
@@ -272,6 +334,7 @@ describe('classifyRunError', () => {
     // 不绑定具体厂商(E7):同一分类被 CCB/Codex/多提供商路径共用。
     assert.equal(classifiedMessageForCode('upstream_failed'), '模型服务上游暂时异常，请稍后重试')
     assert.equal(classifiedMessageForCode('auth_error'), '模型服务认证失败，请重新登录或检查凭据后重试')
+    assert.equal(classifiedMessageForCode('model_not_available'), '当前模型不可用，请切换模型后再试')
     // classifyRunError 命中同码时,message 与 classifiedMessageForCode 完全一致。
     assert.equal(
       classifyRunError('model is overloaded').message,

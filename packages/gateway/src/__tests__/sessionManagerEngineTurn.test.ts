@@ -286,7 +286,7 @@ test("an aborted logical-turn signal fences both pre-submit and retry backoff wi
   try {
     (sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => {
       attempts += 1;
-      throw new Error("Selected model is at capacity. Please try a different model.");
+      throw new Error("model is overloaded");
     };
     (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 30_000;
 
