@@ -109,6 +109,19 @@ if (!mediaEncoder.includes('JSON.stringify([timestamp, id])') || mediaEncoder.in
 }
 console.log('[media-cursor-rootfix] PASS — INC-20260907-MEDIA-CURSOR-PRECISION source contracts locked')
 
+// INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.
+const sandLifecycleSrc = readFileSync(join(root, 'packages/commercial/src/account-pool/cursorSandLifecycle.ts'), 'utf8')
+if (sandLifecycleSrc.includes('if (this.now() - op.startedAt > 15 * 60_000) throw new SandProvisionError("UNKNOWN_OPERATION_RESULT")')) {
+  throw new Error('[sand-uor-loop] stale in-flight still throws UNKNOWN_OPERATION_RESULT without resetting the operation')
+}
+if (!sandLifecycleSrc.includes('Stale in-flight must not loop on UNKNOWN_OPERATION_RESULT')) {
+  throw new Error('[sand-uor-loop] missing stale in-flight reset contract')
+}
+if (!/if \(op\.agentId\) \{\s*op\.phase = "created";/.test(sandLifecycleSrc)) {
+  throw new Error('[sand-uor-loop] stale submitted must retry sendPrompt on the owned agent')
+}
+console.log('[sand-uor-loop] PASS — INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.')
+
 // INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
 // The delegateDurable unit suite separately exercises real SQLite retire/prune and
 // a real-interval cron heartbeat; this gate only stops the contracts regressing.
