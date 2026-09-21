@@ -4513,6 +4513,33 @@
           "assertion": "source regression guard, not end-to-end proof"
         }
       ]
+    },
+    {
+      "id": "INC-20260921-OFFICIAL-CC-UA-PIN",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "官方 CC 开着时 OAuth 池 persona UA 仍发 CCB fork claude-cli/2.8.4，活体容器是官方 Claude Code 2.1.278；出口日本但 persona 随机美东。",
+      "rootFixCommit": "231f30c1f",
+      "coverageCommits": [
+        "231f30c1f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/persona.unit.test.ts",
+          "assertion": "OC_CCB_OFFICIAL_CC=1 → UA 钉官方 Claude Code 版本"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/persona.unit.test.ts",
+          "assertion": "OFFICIAL_CC_CLI_VERSION 与 runtime-build.env 钉一致"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }
