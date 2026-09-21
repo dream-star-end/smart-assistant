@@ -4540,6 +4540,38 @@
           "assertion": "source regression guard, not end-to-end proof"
         }
       ]
+    },
+    {
+      "id": "INC-20260921-CLAUDE-IDENTITY-GUARD",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "Claude OAuth 出站不核对出口 IP/时区/设备一致性，persona 与日本出口错配或 device_id 未钉仍打到 Anthropic。",
+      "rootFixCommit": "0c37e008f",
+      "coverageCommits": [
+        "0c37e008f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/claudeIdentityGuard.unit.test.ts",
+          "assertion": "persona 时区与出口时区不一致 → tz_mismatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/claudeIdentityGuard.unit.test.ts",
+          "assertion": "出口 IP 相对 env 钉漂移 → ip_drift"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyUpstream.unit.test.ts",
+          "assertion": "pinned schema breach → fail-closed,不重写 device_id"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }
