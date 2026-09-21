@@ -962,7 +962,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("completed Bash with no native session never auto-continues", async () => {
+  test("capacity failure after a completed tool with unknown external outcome never auto-continues", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {

@@ -4466,7 +4466,8 @@
       "symptom": "官方 CC 终端工具已完成后，瞬时 Anthropic 5xx 被 checkpointSafe 拦住不自动续跑，直接红卡收轮。",
       "rootFixCommit": "6781147ea",
       "coverageCommits": [
-        "6781147ea"
+        "6781147ea",
+        "5ef1a5994"
       ],
       "regressions": [
         {
@@ -4477,7 +4478,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
-          "assertion": "completed Bash with no native session never auto-continues"
+          "assertion": "capacity failure after a completed tool with unknown external outcome never auto-continues"
         },
         {
           "layer": "deploy-gate",
