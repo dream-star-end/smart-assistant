@@ -159,7 +159,10 @@ export class CursorSandLifecycleCoordinator {
           }
           // Stale in-flight must not loop on UNKNOWN_OPERATION_RESULT: keep the
           // owned agent and retry sendPrompt, or start a new create if none.
+          // Box sendPrompt is idempotent on clientNonce=nonce+"-install"; reuse
+          // accepts without executing. Rotate nonce, keep agentId/agentMarker.
           if (op.agentId) {
+            op.nonce = nonce();
             op.phase = "created";
             op.startedAt = this.now();
             op.nextAttemptAt = 0;

@@ -4460,6 +4460,33 @@
       ]
     },
     {
+      "id": "INC-20260921-SAND-INSTALL-RETRY",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "Cursor Sand Box sendPrompt 对 clientNonce=nonce-install 幂等，同 nonce 重试 accepted 但不执行；维护 bot 自造 INSTALLER_B64_MISSING 而不跑官方 python heredoc，空池无法恢复。",
+      "rootFixCommit": "66dc86caa",
+      "coverageCommits": [
+        "66dc86caa"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandActor.test.ts",
+          "assertion": "installer prompt contains exact reviewed source and module bytes, not credentials"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
       "id": "INC-20260921-CCB-TRANSIENT-CONTINUE",
       "occurredAt": "2026-09-21",
       "severity": "P1",

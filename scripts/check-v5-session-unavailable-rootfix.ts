@@ -117,10 +117,24 @@ if (sandLifecycleSrc.includes('if (this.now() - op.startedAt > 15 * 60_000) thro
 if (!sandLifecycleSrc.includes('Stale in-flight must not loop on UNKNOWN_OPERATION_RESULT')) {
   throw new Error('[sand-uor-loop] missing stale in-flight reset contract')
 }
-if (!/if \(op\.agentId\) \{\s*op\.phase = "created";/.test(sandLifecycleSrc)) {
-  throw new Error('[sand-uor-loop] stale submitted must retry sendPrompt on the owned agent')
+if (!/if \(op\.agentId\) \{\s*op\.nonce = nonce\(\);\s*op\.phase = "created";/.test(sandLifecycleSrc)) {
+  throw new Error('[sand-uor-loop] stale submitted must rotate nonce then retry sendPrompt on the owned agent')
 }
 console.log('[sand-uor-loop] PASS — INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.')
+
+// INC-20260921-SAND-INSTALL-RETRY: Box sendPrompt is idempotent on nonce+"-install";
+// the maintenance bot must exec the heredoc, not invent INSTALLER_B64_MISSING.
+const sandInstallerSrc = readFileSync(join(root, 'packages/commercial/src/account-pool/cursorSandInstaller.ts'), 'utf8')
+if (!sandInstallerSrc.includes('Do not spawn a subagent')) {
+  throw new Error('[sand-install-retry] installer prompt must forbid spawning a subagent')
+}
+if (!sandInstallerSrc.includes('INSTALLER_B64_MISSING')) {
+  throw new Error('[sand-install-retry] installer prompt must forbid invented INSTALLER_B64_MISSING')
+}
+if (!sandInstallerSrc.includes('execute the exact python3 heredoc below once in THIS Bot')) {
+  throw new Error('[sand-install-retry] installer prompt must require executing the heredoc in this Bot')
+}
+console.log('[sand-install-retry] PASS — INC-20260921-SAND-INSTALL-RETRY: source regression guard, not end-to-end proof.')
 
 // INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.
 const sessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
