@@ -123,7 +123,7 @@ BEGIN
     UPDATE model_pricing
        SET enabled = FALSE, visibility = 'hidden', promo_label = NULL,
            lock_version = lock_version + 1, updated_at = clock_timestamp()
-     WHERE model_id LIKE 'cursor-grok-4.6-%' AND enabled IS TRUE;
+     WHERE model_id LIKE 'cursor-grok-4.6-%';
     GET DIAGNOSTICS n = ROW_COUNT;
     IF n <> 8 THEN
       RAISE EXCEPTION '0284 expected to hide 8 Grok 4.6 pricing rows, updated %', n;
