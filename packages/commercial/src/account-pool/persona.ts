@@ -89,10 +89,15 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
  * SDK 画像。
  *
  * 两个版本号是**不同**的东西,不能混用:
- *   - CCB_CLI_VERSION      → UA 里的 `claude-cli/<x>`,= claude-code-best/package.json version
- *   - CCB_SDK_VERSION      → `x-stainless-package-version`,= 内置 @anthropic-ai/sdk 版本
+ *   - CCB_CLI_VERSION         → CCB fork(`claude-code-best`) 的 `claude-cli/<x>`
+ *   - OFFICIAL_CC_CLI_VERSION → 官方 Claude Code,必须与
+ *                               `deploy/v5-selfhost/runtime-build.env` 的
+ *                               `OC_OFFICIAL_CLAUDE_VERSION` 以及 runtime 镜像
+ *                               `claude --version` 一致
+ *   - CCB_SDK_VERSION         → `x-stainless-package-version`,= 内置 @anthropic-ai/sdk
  *
- * 升级 CCB 时**同步**改这两个常量(与 claude-code-best/package.json 对齐)。
+ * `OC_CCB_OFFICIAL_CC=1` 时容器跑官方 CLI,UA 必须跟官方版本,不能写成 CCB fork。
+ * 升级官方 CC 时同步改 OFFICIAL_CC_CLI_VERSION;升级 CCB 时同步改 CCB_CLI_VERSION。
  * 为什么用常量而非"版本池":同一 ship 的二进制,全网真实用户发的就是同一
  * `claude-cli/<x>` + 同一 SDK 版本;伪造一批我们根本没在跑的旧版本,反而会
  * 在"UA 版本 vs 实际请求能力"上露馅(旧版 CLI 发不出新版才有的 body 特征)。
@@ -101,6 +106,17 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
  */
 const CCB_CLI_VERSION = "2.8.4";
 const CCB_SDK_VERSION = "0.81.0";
+/** 与 deploy/v5-selfhost/runtime-build.env OC_OFFICIAL_CLAUDE_VERSION 对齐。 */
+export const OFFICIAL_CC_CLI_VERSION = "2.1.278";
+
+export function isOfficialClaudeCodeEnabled(): boolean {
+  return process.env.OC_CCB_OFFICIAL_CC === "1";
+}
+
+/** 当前活体 CLI 版本:官方 CC 开着走官方钉,否则走 CCB fork。 */
+export function liveClaudeCliVersion(): string {
+  return isOfficialClaudeCodeEnabled() ? OFFICIAL_CC_CLI_VERSION : CCB_CLI_VERSION;
+}
 
 /**
  * UA 里的 USER_TYPE / ENTRYPOINT —— 对应容器内外接用户的真实取值。
@@ -199,14 +215,15 @@ export function isSupportedProxyRegion(region: unknown): region is string {
  *
  * 真实格式(claude-code-best/src/utils/http.ts::getUserAgent):
  *   "claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)"
- *   例:"claude-cli/2.8.4 (external, cli)"
+ *   例:"claude-cli/2.1.278 (external, cli)"(官方 CC)或
+ *       "claude-cli/2.8.4 (external, cli)"(CCB fork)
  *
  * 注意:不再是 stainless 默认 UA(`anthropic-ai-claude-code/...`)。真实 CLI 在
  * defaultHeaders 里用 getUserAgent() 覆盖了 SDK 默认 UA,所以 Anthropic 网关看到
  * 的就是 `claude-cli/*`。SDK 的身份仍通过 x-stainless-* 头单独表达。
  */
 function pickUserAgent(): string {
-  return `claude-cli/${CCB_CLI_VERSION} (${CCB_USER_TYPE}, ${CCB_ENTRYPOINT})`;
+  return `claude-cli/${liveClaudeCliVersion()} (${CCB_USER_TYPE}, ${CCB_ENTRYPOINT})`;
 }
 
 /**

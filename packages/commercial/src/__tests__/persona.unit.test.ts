@@ -20,6 +20,8 @@ import {
   personaToHeaderPairs,
   SUPPORTED_PROXY_REGIONS,
   isSupportedProxyRegion,
+  liveClaudeCliVersion,
+  OFFICIAL_CC_CLI_VERSION,
   type Persona,
 } from "../account-pool/persona.js";
 
@@ -44,10 +46,46 @@ describe("generatePersona — without seed", () => {
     // 全池共用真实 claude-cli 版本 + 真实 SDK 版本;账号差异化改由 os/arch/node/lang 承载。
     const a = generatePersona();
     const b = generatePersona();
-    assert.equal(a.user_agent, "claude-cli/2.8.4 (external, cli)");
+    assert.equal(a.user_agent, `claude-cli/${liveClaudeCliVersion()} (external, cli)`);
     assert.equal(a.user_agent, b.user_agent);
     assert.equal(a.x_stainless_package_version, "0.81.0");
     assert.equal(b.x_stainless_package_version, "0.81.0");
+  });
+
+  test("OC_CCB_OFFICIAL_CC=1 → UA 钉官方 Claude Code 版本", () => {
+    const prev = process.env.OC_CCB_OFFICIAL_CC;
+    process.env.OC_CCB_OFFICIAL_CC = "1";
+    try {
+      assert.equal(liveClaudeCliVersion(), OFFICIAL_CC_CLI_VERSION);
+      const p = generatePersona();
+      assert.equal(p.user_agent, `claude-cli/${OFFICIAL_CC_CLI_VERSION} (external, cli)`);
+    } finally {
+      if (prev === undefined) delete process.env.OC_CCB_OFFICIAL_CC;
+      else process.env.OC_CCB_OFFICIAL_CC = prev;
+    }
+  });
+
+  test("OC_CCB_OFFICIAL_CC 未开 → UA 钉 CCB fork 2.8.4", () => {
+    const prev = process.env.OC_CCB_OFFICIAL_CC;
+    delete process.env.OC_CCB_OFFICIAL_CC;
+    try {
+      assert.equal(liveClaudeCliVersion(), "2.8.4");
+      const p = generatePersona();
+      assert.equal(p.user_agent, "claude-cli/2.8.4 (external, cli)");
+    } finally {
+      if (prev === undefined) delete process.env.OC_CCB_OFFICIAL_CC;
+      else process.env.OC_CCB_OFFICIAL_CC = prev;
+    }
+  });
+
+  test("OFFICIAL_CC_CLI_VERSION 与 runtime-build.env 钉一致", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const envPath = fileURLToPath(new URL("../../../../deploy/v5-selfhost/runtime-build.env", import.meta.url));
+    const text = await readFile(envPath, "utf8");
+    const m = text.match(/^OC_OFFICIAL_CLAUDE_VERSION=(.+)$/m);
+    assert.ok(m, "runtime-build.env missing OC_OFFICIAL_CLAUDE_VERSION");
+    assert.equal(OFFICIAL_CC_CLI_VERSION, m[1].trim());
   });
 
   test("固定字段值符合 persona.ts 注释承诺", () => {
