@@ -161,7 +161,8 @@
     "0277_api_key_usage_and_controls",
     "0278_friction_problem_card_dims",
     "0279_api_key_message_audit",
-    "0282_scnet_glm53_flash"
+    "0282_scnet_glm53_flash",
+    "0283_cursor_gpt56_luna_sand"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
