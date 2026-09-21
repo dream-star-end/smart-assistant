@@ -165,6 +165,7 @@ test("stale submitted retries sendPrompt on the same agent instead of looping UN
   const token = "x." + Buffer.from(JSON.stringify({ type: "session", sub: "stale-principal", exp: 2_000_000_000 })).toString("base64url") + ".y";
   const moduleHash = "d".repeat(64), machine = "a".repeat(32);
   let now = Date.now(), creates = 0, sends = 0, acceptSend = false;
+  const sendNonces: string[] = [];
   const agents: any[] = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []; req.on("data", (x) => chunks.push(x));
@@ -184,6 +185,7 @@ test("stale submitted retries sendPrompt on the same agent instead of looping UN
       }
       if (path.endsWith("/sendPrompt")) {
         sends++;
+        sendNonces.push(JSON.parse(body).clientNonce);
         if (!acceptSend) { req.socket.destroy(); return; }
         return reply({ accepted: true });
       }
@@ -210,9 +212,12 @@ test("stale submitted retries sendPrompt on the same agent instead of looping UN
     assert.deepEqual({ creates, sends }, { creates: 1, sends: 2 }, "must retry sendPrompt without a second createAgent");
     const after = readSandLifecycleState(dir);
     const op = Object.values(after.operations)[0];
-    assert.equal(op.nonce, original.nonce);
+    assert.notEqual(op.nonce, original.nonce);
     assert.equal(op.agentId, original.agentId);
+    assert.equal(op.agentMarker, original.agentMarker);
     assert.equal(op.phase, "submitted");
+    assert.equal(sendNonces.length, 2);
+    assert.notEqual(sendNonces[0], sendNonces[1]);
     assert.notEqual(after.accounts["1"].phase, "error");
     assert.notEqual(after.accounts["1"].errorCode, "UNKNOWN_OPERATION_RESULT");
     now += 60_000;

@@ -19,6 +19,9 @@ test("installer prompt contains exact reviewed source and module bytes, not cred
   assert.equal(payload.agentId, "own");
   assert.equal(sandHash(Buffer.from(payload.moduleBase64, "base64").toString()), assets.moduleHash);
   assert.equal(Object.keys(payload).some((k) => /token|credential/i.test(k)), false);
+  assert.match(prompt, /Do not spawn a subagent/);
+  assert.match(prompt, /invent JSON codes such as INSTALLER_B64_MISSING/);
+  assert.match(prompt, /execute the exact python3 heredoc below once in THIS Bot/);
   assert.throws(() => assets.prompt({ nonce: "bad", hostPid: 321, agentId: "own", moduleHash: assets.moduleHash }));
   assert.throws(() => assets.prompt({ nonce: "oc-sand-" + "b".repeat(32), hostPid: 321, agentId: "../other", moduleHash: assets.moduleHash }));
 });
