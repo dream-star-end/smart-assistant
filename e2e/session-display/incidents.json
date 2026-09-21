@@ -4436,6 +4436,28 @@
           "assertion": "SERVICE_RESTART leftover with live progress refuses automatic recovery"
         }
       ]
+    },
+    {
+      "id": "INC-20260921-SAND-UOR-LOOP",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "唯一 active Cursor Sand 账号 20 的 Box install 卡在 submitted 后，UNKNOWN_OPERATION_RESULT 死循环，空池导致整条 Cursor 引擎 DISPATCH_NOT_ACCEPTED。",
+      "rootFixCommit": "9bfa706c7",
+      "coverageCommits": [
+        "9bfa706c7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }
