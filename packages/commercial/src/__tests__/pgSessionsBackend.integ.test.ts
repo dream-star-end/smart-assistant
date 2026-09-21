@@ -6476,9 +6476,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
   });
 
   maybe("checkpoint continuation admits uncertain durable actions and never replays them", async () => {
-    const cases: Array<{ suffix: string; record: MessageLike }> = [
+    const cases: Array<{ suffix: string; record: MessageLike; expectConflict: boolean }> = [
       {
         suffix: "incomplete-tool",
+        expectConflict: true,
         record: {
           id: "tool-incomplete",
           role: "tool",
@@ -6489,6 +6490,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "unknown-outcome",
+        expectConflict: true,
         record: {
           id: "tool-unknown",
           role: "tool",
@@ -6500,6 +6502,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "permission",
+        expectConflict: false,
         record: {
           id: "permission-pending",
           role: "permission",
@@ -6510,6 +6513,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "runtime-incomplete",
+        expectConflict: true,
         record: {
           id: "runtime-incomplete",
           role: "runtime-event",
@@ -6559,10 +6563,28 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           max: 10,
         },
       }));
-      assert.deepEqual(recovered, {
-        kind: "recovery_conflict",
-        reason: "automatic_checkpoint_unsafe",
-      }, testCase.suffix);
+      if (testCase.expectConflict) {
+        assert.deepEqual(recovered, {
+          kind: "recovery_conflict",
+          reason: "automatic_checkpoint_unsafe",
+        }, testCase.suffix);
+        continue;
+      }
+      assert.equal(recovered.kind, "admitted", testCase.suffix);
+      const stored = await backend.getClientSession(sessionId, CUSER);
+      assert.equal(
+        (stored!.messages as MessageLike[]).some((message) =>
+          message.id === identity.clientMessageId &&
+          message._recoveryMode === "checkpoint" &&
+          message._automaticRecovery === true),
+        true,
+        testCase.suffix,
+      );
+      const dispatch = await pool.query(
+        "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
+        [UID, sessionId, identity.clientMessageId],
+      );
+      assert.equal(dispatch.rowCount, 1, testCase.suffix);
     }
   });
 
