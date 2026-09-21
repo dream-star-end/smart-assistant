@@ -4578,8 +4578,9 @@
       "occurredAt": "2026-09-21",
       "severity": "P1",
       "symptom": "管理台新建 Claude 账号绑同一 egress 失败：预检把 disabled Claude 也算占用，与只约束 active 的唯一索引不一致。",
-      "rootFixCommit": "1d7f79c7a",
+      "rootFixCommit": "b0c1c07a",
       "coverageCommits": [
+        "b0c1c07a",
         "1d7f79c7a"
       ],
       "regressions": [
