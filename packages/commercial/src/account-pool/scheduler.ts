@@ -234,9 +234,9 @@ export const DEFAULT_MAX_CONCURRENT_PER_ACCOUNT = 10
  * 反封复盘 2026-08 — 配额感知主动退避阈值(百分比)。
  *
  * 账号的 5h / 7d 滚动配额利用率(quota_5h_pct / quota_7d_pct,从 Anthropic 响应头
- * 被动上报)达到/超过该阈值时,**直接从候选池剔除**(不是仅降权),让它歇到配额
- * 窗口滚动恢复 —— 而不是一路把请求打到上游 429。反复撞限额是"规避限额"的封号
- * 画像;主动退避把这个信号消掉。
+ * 被动上报)达到/超过该阈值、且对应 resets_at 仍在未来时,**直接从候选池剔除**
+ * (不是仅降权)。窗口结束后不得继续按陈旧 pct 踢出 —— pct 不会自己刷新,没有
+ * 请求就没有新头。反复撞限额是"规避限额"的封号画像;主动退避把这个信号消掉。
  *
  * 与 computeAccountWeight 里的 quotaFactor(50→95% 线性降权)分工:降权是"少用",
  * 这里是"到顶就不用"。阈值默认 95(留一点余量给 header 上报抖动),env 可调。
@@ -1277,9 +1277,13 @@ export class AccountScheduler {
     const base = activePoolWhere({ provider, groupId })
     const params: unknown[] = [...base.params]
     const where = [...base.clauses]
-    // 反封复盘 2026-08 — 配额感知主动退避:5h / 7d 利用率达到阈值的账号直接剔除候选,
-    // 歇到窗口滚动恢复(pct 由响应头回落),而不是被 WRH 低权重选中后一路打到 429。
-    // NULL(未上报)保留在池内。pin-hit 命中被剔除账号 → pickPinnedAccount 返 null →
+    // 反封复盘 2026-08 — 配额感知主动退避:5h / 7d 利用率达到阈值且窗口未结束时
+    // 直接剔除候选,避免一路打到上游 429。pct 只从 Anthropic 响应头被动回写;
+    // 踩出池后再无请求,pct 会停在阈值上。2026-09-20 官方 Claude 单号 96% +
+    // resets_at 已过 → no_active → 前台「模型繁忙」。5h/7d 因此对齐 grok 的
+    // period_end 保护:quota_*_resets_at <= NOW() 不剔除。resets_at IS NULL 不
+    // fail-open(与 grok `period_end IS NULL` 放行不同)。NULL pct 仍保留在池内。
+    // pin-hit 命中被剔除账号 → pickPinnedAccount 返 null →
     // handlePinnedAccountUnavailable 走 ready→503 retry(不再把请求推到已耗尽账号)。
     //
     // grok 的 quota_5h/7d 恒 NULL,周额度走 grok_credit_usage_pct。到顶直接剔除
@@ -1289,8 +1293,10 @@ export class AccountScheduler {
     params.push(this.quotaBackoffPct)
     const pctIdx = params.length
     where.push(
-      `(quota_5h_pct IS NULL OR quota_5h_pct < $${pctIdx})`,
-      `(quota_7d_pct IS NULL OR quota_7d_pct < $${pctIdx})`,
+      // 过窗陈旧占用不再踢出(INC-20260920-CLAUDE-QUOTA-RESET-STALE)。
+      // resets_at IS NULL → `<= NOW()` 为 unknown,OR 不成立,仍按 pct 剔除。
+      `(quota_5h_pct IS NULL OR quota_5h_pct < $${pctIdx} OR quota_5h_resets_at <= NOW())`,
+      `(quota_7d_pct IS NULL OR quota_7d_pct < $${pctIdx} OR quota_7d_resets_at <= NOW())`,
       `(grok_credit_usage_pct IS NULL OR grok_credit_usage_pct < $${pctIdx} OR grok_credit_period_end IS NULL OR grok_credit_period_end <= NOW())`,
     )
     const res = await query<CandidateRow>(

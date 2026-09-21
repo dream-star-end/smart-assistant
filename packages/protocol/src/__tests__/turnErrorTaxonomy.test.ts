@@ -6,6 +6,8 @@ import {
   TURN_ERROR_TAXONOMY,
   assessTurnRecoveryTape,
   hasMeaningfulAutomaticRecoveryProgress,
+  allowUnsafeAutomaticCheckpoint,
+  shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
   maxAutomaticTurnRetryAttempt,
@@ -179,6 +181,103 @@ describe('automatic turn recovery policy', () => {
     // Non-silent, non-runner-loss transient codes are untouched.
     assert.equal(shouldPauseSilentAutomaticRecovery({
       errorCode: 'upstream_failed', currentAttempt: 9, records: empty,
+    }), false)
+  })
+
+  it('refuses leftover SERVICE_RESTART checkpoint recovery once the tape already produced output', () => {
+    const progressed = [{ role: 'assistant', text: 'API Error: Opus 4.8 safeguards flagged this message.' }]
+    const empty = [{ role: 'assistant', text: '子进程被信号 SIGKILL 终止', _errorCode: 'SERVICE_RESTART' }]
+    const incidentTape = [
+      { role: 'assistant', text: 'API Error: Opus 4.8 safeguards flagged this message.' },
+      { role: 'assistant', text: '任务因服务重启中断', _errorCode: 'SERVICE_RESTART', _isError: true },
+    ]
+    // Caller consults this *before* `!checkpointSafe`. Incident tapes are safe
+    // checkpoints, so the unsafe-bypass helper alone is dead code.
+    assert.equal(assessTurnRecoveryTape(incidentTape).mode, 'checkpoint')
+    assert.equal(assessTurnRecoveryTape(incidentTape).checkpointSafe, true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart', records: incidentTape,
+    }), true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'SERVICE_RESTART', records: progressed,
+    }), true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'upstream_failed', records: progressed,
+    }), false)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart', records: empty,
+    }), false)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'completed',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: progressed,
+    }), false)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'interrupted',
+      errorCode: 'SERVICE_RESTART',
+      leftoverBacked: true,
+      records: [{ kind: 'tool_use', id: 'tool-1' }],
+    }), false)
+    // Genuine deploy-kill-before-output still continues.
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'completed',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: empty,
+    }), true)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'interrupted',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: empty,
+    }), true)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'interrupted',
+      errorCode: 'runner_crashed',
+      leftoverBacked: false,
+      records: empty,
+    }), false)
+  })
+
+  it('refuses leftover SERVICE_RESTART when progress is only on leftover frames', () => {
+    const unpublishedTape = [
+      { role: 'assistant', text: '任务因服务重启中断', _errorCode: 'SERVICE_RESTART', _isError: true },
+    ]
+    const leftover = [
+      { role: 'assistant', text: 'Failed to authenticate. API Error: 403 model authority missing or invalid' },
+    ]
+    assert.equal(hasMeaningfulAutomaticRecoveryProgress(unpublishedTape), false)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'SERVICE_RESTART',
+      records: unpublishedTape,
+    }), false)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'SERVICE_RESTART',
+      records: unpublishedTape,
+      leftoverRecords: leftover,
+    }), true)
+    assert.equal(allowUnsafeAutomaticCheckpoint({
+      status: 'crashed',
+      errorCode: 'service_restart',
+      leftoverBacked: true,
+      records: [...unpublishedTape, ...leftover],
+    }), false)
+  })
+
+  it('refuses SERVICE_RESTART recovery when the turn already billed successful usage', () => {
+    const empty = [
+      { role: 'assistant', text: '任务因服务重启中断', _errorCode: 'SERVICE_RESTART', _isError: true },
+    ]
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart',
+      records: empty,
+      hasSuccessfulUpstreamUsage: true,
+    }), true)
+    assert.equal(shouldDeclineLiveServiceRestartRecovery({
+      errorCode: 'service_restart',
+      records: empty,
+      hasSuccessfulUpstreamUsage: false,
     }), false)
   })
 

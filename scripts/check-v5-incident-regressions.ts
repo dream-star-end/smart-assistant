@@ -36,7 +36,7 @@ const ASSERTION_DEBT_BASELINE = 37;
  *   + 2 条 SCNet 关机后从 V5 主发布门移除的 OCR 活体 proof。
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
-const PROOF_PENDING_BASELINE = 11;
+const PROOF_PENDING_BASELINE = 17;
 
 // ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
 // 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
@@ -189,6 +189,9 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
   // 同样被跑;这里按 runner 的真实口径放行,不再只认顶层 __tests__。
   if (/^packages\/gateway\/src\/(?:[^/]+\/)*__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
+  }
+  if (/^packages\/protocol\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    return requireCi("test:protocol", "CI job protocol → npm run test:protocol");
   }
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:storage", "CI job storage → npm run test:storage");
@@ -424,6 +427,13 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // origin/feat/v5-selfhost and cannot be amended. Freeze this tip so the
   // imported fix(v5) passes check:v5:incidents; later commits still gate.
   "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
+  // 2026-09-20 full forward sync freeze: selfhost f4f143088 is live
+  // (origin/feat/v5-selfhost). Imports OCV5-232..242 (official CC switch/version
+  // pin, Sand Box default, Grok resume, extra-prompt tz, CC beta headers,
+  // Claude quota reset, opus-4-8 rewrite, false SERVICE_RESTART, expired-authority
+  // lease). Source SHAs cannot be amended; only immutable ancestors of this tip
+  // are exempted.
+  "f4f1430885612c9d377b7495831fb08375d0c6cb",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an

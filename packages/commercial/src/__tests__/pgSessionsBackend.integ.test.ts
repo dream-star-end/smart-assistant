@@ -161,7 +161,14 @@ before(async () => {
   await pool.query(
     "CREATE TABLE IF NOT EXISTS request_finalize_journal (request_id TEXT PRIMARY KEY)",
   );
-  await pool.query("CREATE TABLE IF NOT EXISTS usage_records (id BIGSERIAL PRIMARY KEY)");
+  await pool.query(`CREATE TABLE IF NOT EXISTS usage_records (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT,
+    turn_key TEXT,
+    status TEXT,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0
+  )`);
   await pool.query("CREATE TABLE IF NOT EXISTS turn_traces (trace_id TEXT PRIMARY KEY)");
   await pool.query(await readFile(MIGRATION_0170, { encoding: "utf8" }));
   // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。
@@ -6017,7 +6024,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(recovered.kind, "admitted");
   });
 
-  maybe("SERVICE_RESTART leftover checkpoint allows automatic recovery even if tools are unproven", async () => {
+  maybe("SERVICE_RESTART leftover with live progress refuses automatic recovery", async () => {
     const sessionId = "s-dd-recovery-sr-leftover-auto";
     const sourceClientMessageId = "cm-dd-recovery-sr-leftover-auto";
     await seedRecoverableSource({
@@ -6057,7 +6064,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         max: 10,
       },
     }));
-    assert.equal(recovered.kind, "admitted");
+    assert.deepEqual(recovered, {
+      kind: "recovery_conflict",
+      reason: "automatic_checkpoint_unsafe",
+    });
   });
 
   maybe("lossless waiver recovery retains automatic checkpoint safety gate", async () => {
@@ -6466,9 +6476,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
   });
 
   maybe("checkpoint continuation admits uncertain durable actions and never replays them", async () => {
-    const cases: Array<{ suffix: string; record: MessageLike }> = [
+    const cases: Array<{ suffix: string; record: MessageLike; expectConflict: boolean }> = [
       {
         suffix: "incomplete-tool",
+        expectConflict: true,
         record: {
           id: "tool-incomplete",
           role: "tool",
@@ -6479,6 +6490,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "unknown-outcome",
+        expectConflict: true,
         record: {
           id: "tool-unknown",
           role: "tool",
@@ -6490,6 +6502,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "permission",
+        expectConflict: false,
         record: {
           id: "permission-pending",
           role: "permission",
@@ -6500,6 +6513,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "runtime-incomplete",
+        expectConflict: false,
         record: {
           id: "runtime-incomplete",
           role: "runtime-event",
@@ -6549,6 +6563,13 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           max: 10,
         },
       }));
+      if (testCase.expectConflict) {
+        assert.deepEqual(recovered, {
+          kind: "recovery_conflict",
+          reason: "automatic_checkpoint_unsafe",
+        }, testCase.suffix);
+        continue;
+      }
       assert.equal(recovered.kind, "admitted", testCase.suffix);
       const stored = await backend.getClientSession(sessionId, CUSER);
       assert.equal(

@@ -6,12 +6,12 @@
  *   POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream
  *   x-cursor-client-type: sand
  *   x-cursor-client-source: sand-desktop
- *   x-cursor-client-version: 3.21.12  (Direct; Grok Bot Box is opt-in)
+ *   x-cursor-client-version: 3.21.12  (Direct opt-in; product default is Box)
  *
- * Direct Stream (default for the product adapter) uses the account session
- * JWT on api2. The Grok Bot Box relay remains available for tests/rollback
- * (`directStream: false` + `boxAccountId`) but that identity cannot run
- * Claude families (`unavailable for Grok Bot inference`).
+ * Product adapter default is Grok Bot Box (`directStream` unset). Direct
+ * Stream (account session JWT on api2, 3.21.12 sand-desktop) is opt-in via
+ * `OC_CURSOR_SAND_DIRECT_STREAM=1`. Box historically cannot run Opus/Fable
+ * (`unavailable for Grok Bot inference`).
  *
  * The relay is loopback-only and route-token scoped. Cursor credentials are
  * read from the root-owned account mount for each auth cache generation and

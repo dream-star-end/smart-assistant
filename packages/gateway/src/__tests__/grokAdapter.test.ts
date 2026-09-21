@@ -558,10 +558,67 @@ async function waitUntil(pred: () => boolean, ms: number, label: string): Promis
   }
 }
 
-test('refreshes lastActivityAt while the Grok CLI pid is alive even with no stdout', { timeout: 10_000 }, async () => {
+test('does not keepalive-refresh activity before the first stdout byte', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-pre-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  await writeFile(fake, `#!/usr/bin/env node
+setTimeout(() => {
+  console.log(JSON.stringify({
+    type: 'end',
+    stopReason: 'end_turn',
+    sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 },
+  }))
+}, 400)
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  _internals.setProcessKeepaliveTestHooks({ intervalMs: 40 })
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    const run = adapter.submitTurn({
+      input: 'think silently',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'grok process running')
+    const countAfterStart = activity.count
+    await new Promise((resolve) => setTimeout(resolve, 160))
+    assert.equal(
+      activity.count,
+      countAfterStart,
+      `keepalive must not emit before first stdout, got ${activity.count - countAfterStart} extra`,
+    )
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+    assert.ok(summary)
+  } finally {
+    _internals.setProcessKeepaliveTestHooks(null)
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('refreshes lastActivityAt after first stdout while the Grok CLI pid is alive', { timeout: 10_000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-'))
   const fake = path.join(dir, 'fake-grok.cjs')
   await writeFile(fake, `#!/usr/bin/env node
+console.log(JSON.stringify({ type: 'thought', data: 'holding' }))
 setTimeout(() => {
   console.log(JSON.stringify({
     type: 'end',
@@ -596,6 +653,7 @@ setTimeout(() => {
     })
     await run.submitted
     await waitUntil(() => adapter.isRunning, 3_000, 'grok process running')
+    await waitUntil(() => activity.count >= 1, 3_000, 'first stdout activity')
     const activityAt = adapter.lastActivityAt
     const countAfterStart = activity.count
     await new Promise((resolve) => setTimeout(resolve, 200))
@@ -622,6 +680,7 @@ test('late close of an abandoned Grok turn does not stop the next turn keepalive
   const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-late-'))
   const hanging = path.join(dir, 'fake-grok-hanging.cjs')
   await writeFile(hanging, `#!/usr/bin/env node
+console.log(JSON.stringify({ type: 'thought', data: 'live' }))
 setInterval(() => {}, 1000)
 `)
   await chmod(hanging, 0o755)
@@ -661,14 +720,16 @@ setInterval(() => {}, 1000)
       sessionTotals: { totalCostUSD: 0, turns: 0 },
       toolUseIdToName: new Map(),
     })
-    await live.submitted
-    await waitUntil(() => adapter.isRunning, 3_000, 'second grok running')
     const activity = { count: 0 }
     adapter.on('activity', () => { activity.count += 1 })
+    await live.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'second grok running')
+    await waitUntil(() => activity.count >= 1, 3_000, 'live stdout activity')
     const activityAt = adapter.lastActivityAt
-    await new Promise((resolve) => setTimeout(resolve, 180))
+    const countAfterStdout = activity.count
+    await new Promise((resolve) => setTimeout(resolve, 200))
     assert.ok(adapter.lastActivityAt > activityAt, 'live turn keepalive must keep ticking after abandoned close')
-    assert.ok(activity.count >= 2, `expected live keepalive emits, got ${activity.count}`)
+    assert.ok(activity.count - countAfterStdout >= 2, `expected live keepalive emits, got ${activity.count - countAfterStdout}`)
     live.end()
     await adapter.shutdown()
   } finally {
@@ -677,6 +738,189 @@ setInterval(() => {}, 1000)
     restoreEnv('OPENCLAUDE_HOME', previousHome)
     restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', previousGrace)
     restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', previousFinal)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('interrupt without end drops nativeId so the next turn does not --resume', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-interrupt-resume-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv }))
+if (process.env.FAKE_GROK_HANG === '1') {
+  setInterval(() => {}, 1000)
+  return
+}
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'fresh-after-stop', usage: { input_tokens: 1, output_tokens: 1 } }))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  const previousHang = process.env.FAKE_GROK_HANG
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  process.env.FAKE_GROK_HANG = '1'
+  const previousGrace = process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS
+  const previousFinal = process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS
+  process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS = '80'
+  process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS = '80'
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const first = adapter.submitTurn({
+      input: 'hang then stop',
+      requestId: REQUEST_ID,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await first.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'first grok running')
+    assert.equal(adapter.interrupt(), true)
+    await adapter.shutdown()
+    await first.summary
+    assert.equal(adapter.nativeSessionId, null)
+    process.env.FAKE_GROK_HANG = '0'
+    const second = adapter.submitTurn({
+      input: 'continue',
+      requestId: 'd'.repeat(32),
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await second.submitted
+    await second.summary
+    await adapter.waitForOutputDrain()
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[] }
+    assert.equal(captured.argv.includes('--resume'), false)
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    restoreEnv('FAKE_GROK_HANG', previousHang)
+    restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', previousGrace)
+    restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', previousFinal)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('resume with no stdout retries the same turn without --resume', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-resume-watchdog-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+const capturePath = process.env.FAKE_GROK_CAPTURE
+fs.appendFileSync(capturePath, JSON.stringify(argv) + '\\n')
+try { fs.fsyncSync(fs.openSync(capturePath, 'r+')) } catch {}
+if (argv.includes('--resume')) {
+  setInterval(() => {}, 1000)
+  return
+}
+console.log(JSON.stringify({ type: 'text', data: 'cold start' }))
+console.log(JSON.stringify({
+  type: 'end',
+  stopReason: 'end_turn',
+  sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+  usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 },
+}))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  _internals.setProcessKeepaliveTestHooks({ intervalMs: 40, firstStdoutMs: 80 })
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const spawns: Array<{ resumed?: boolean; argv?: string[] }> = []
+    const sessionIds: string[] = []
+    adapter.on('spawn', (info: { resumed?: boolean; argv?: string[] }) => { spawns.push(info) })
+    adapter.on('session_id', (id: string) => { sessionIds.push(id) })
+    const run = adapter.submitTurn({
+      input: 'resume then hang',
+      requestId: REQUEST_ID,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+    assert.ok(summary)
+    assert.equal(summary.isError, false)
+    assert.equal(summary.staleResumeId, false)
+    // Cold-start prompt skipped PG tape. Do not pin later turns to the empty
+    // native session the retry minted.
+    assert.equal(adapter.nativeSessionId, null)
+    assert.deepEqual(sessionIds, [])
+    assert.ok(spawns.length >= 2, `expected resume then cold spawn, got ${JSON.stringify(spawns)}`)
+    assert.equal(spawns[0]?.resumed, true)
+    assert.equal(spawns.at(-1)?.resumed, false)
+    assert.equal(spawns[0]?.argv?.includes('--resume'), true)
+    assert.equal(spawns.at(-1)?.argv?.includes('--resume'), false)
+  } finally {
+    _internals.setProcessKeepaliveTestHooks(null)
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('crash without end does not flag staleResumeId and drops nativeId', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-crash-no-end-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  await writeFile(fake, `#!/usr/bin/env node
+process.exit(1)
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const run = adapter.submitTurn({
+      input: 'crash',
+      requestId: REQUEST_ID,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+    assert.ok(summary)
+    assert.equal(summary.isError, true)
+    assert.equal(summary.staleResumeId, false)
+    assert.equal(summary.stopReason !== 'interrupted', true)
+    assert.equal(adapter.nativeSessionId, null)
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
     await rm(dir, { recursive: true, force: true })
   }
 })

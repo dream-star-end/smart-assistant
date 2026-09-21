@@ -417,7 +417,7 @@ export function encodeEnvelope(kind: string, payload: JsonValue, sig: Uint8Array
  * 顺序 = BadShape → UnknownKey → VerifyFail → Expired(先证明「这是 master 签的」,
  * 再谈时效 —— 反过来会把伪造签名报成 Expired,丢失告警语义)。
  *
- * **本函数只回答「这份 envelope 是 master 签的且未过期」**。以下必须由调用方(gateway)
+ * **本函数默认回答「这份 envelope 是 master 签的且未过期」**。以下必须由调用方(gateway)
  * 另行断言,不在这里:
  *   - authorityTurnId 未重放(AuthorityReplayGuard);
  *   - connectionChallenge == 当前连接的 challenge;
@@ -425,16 +425,21 @@ export function encodeEnvelope(kind: string, payload: JsonValue, sig: Uint8Array
  *   - uid/containerId == 本容器身份;
  *   - descriptor.canonicalModel == frame.model(alias 归一后);
  *   - capabilitySchemaVersion <= 本容器支持的最高版本(未知版本 fail-closed)。
+ *
+ * `allowExpired` 只给 egress 在**已经验过同 turn、未过期 lease** 之后用：120s
+ * authority 只约束开始执行，官方 CC 仍会把过期 envelope 和有效 lease 一起带上
+ * 后续 `/v1/messages`。签名/形状门不变；无有效 lease 时不得开此开关。
  */
 export function verifyAuthority(
   envelopeB64: string,
   keyring: AuthorityKeyring,
   now: number,
+  opts?: { allowExpired?: boolean },
 ): ModelAuthorityPayload {
   const { payload, sig } = decodeEnvelope(envelopeB64, AUTHORITY_KIND)
   const typed = parseAuthorityPayload(payload)
   verifySignature(authoritySigningInput(typed), sig, typed.keyId, keyring)
-  assertNotExpired(typed.expiresAt, now)
+  if (opts?.allowExpired !== true) assertNotExpired(typed.expiresAt, now)
   return typed
 }
 

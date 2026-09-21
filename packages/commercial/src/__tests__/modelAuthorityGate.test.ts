@@ -10,7 +10,7 @@
  *   - 伪造签名 / 换 keyring / 篡改字段 → MODEL_AUTHORITY_INVALID
  *   - body.model ≠ descriptor.canonicalModel → 拒(计费与执行分裂的形状)
  *   - uid / containerId 不匹配 → 拒(跨用户、跨容器复用票据)
- *   - 长 turn:authority 过期但 lease 有效 → 放行(R4-M1);lease 与 authority 不同 turn → 拒
+ *   - 长 turn:authority 过期但 lease 有效 → 放行(R4-M1);官方 CC 同时带过期 authority+有效 lease 也放行;无 lease 仍拒;lease 与 authority 不同 turn → 拒
  *   - 本地路径 local_catalog token:epoch 相等放行 / 漂移拒;无凭据 → 拒
  *   - **projectionRevision 由服务端按 uid 的 role/grants 重算**(R1 MAJOR-7):容器自铸 token 里的
  *     值只作比对(不一致 → 告警),绝不落库;authz 读不到 → fail-closed 503
@@ -136,6 +136,12 @@ const SUBAGENT = entry({
   providerId: "scnet",
   contextWindow: 200_000,
 });
+const OPUS5 = entry({
+  entryId: 6,
+  modelId: "claude-opus-5",
+  providerId: "anthropic",
+  contextWindow: 200_000,
+});
 
 function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): ModelCatalogSnapshot {
   return new ModelCatalogSnapshot({
@@ -153,6 +159,28 @@ function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): Mode
           cacheReadPerMtok: 3n,
         }),
         price(DEFAULT_CCB_SUBAGENT_MODEL),
+      ].map((p) => [p.modelId, p]),
+    ),
+    securityEpoch: epoch,
+  });
+}
+
+function snapOfficialCc(epoch = EPOCH): ModelCatalogSnapshot {
+  return new ModelCatalogSnapshot({
+    entries: [GLM, SOL, DISABLED, FLASH, SUBAGENT, OPUS5],
+    aliases: new Map([["glm-latest", 1]]),
+    pricing: new Map(
+      [
+        price("glm-5.2"),
+        price("gpt-5.6-sol"),
+        price("glm-5.1"),
+        price(DEFAULT_SECONDARY_UTILITY_MODEL, {
+          inputPerMtok: 101n,
+          outputPerMtok: 202n,
+          cacheReadPerMtok: 3n,
+        }),
+        price(DEFAULT_CCB_SUBAGENT_MODEL),
+        price("claude-opus-5"),
       ].map((p) => [p.modelId, p]),
     ),
     securityEpoch: epoch,
@@ -421,15 +449,35 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
     assert.equal(d.authorityKind, "bridge_signed");
     assert.equal(d.turnLeaseIssuedAtMs, issuedAt);
     assert.equal(d.turnLeaseVerifiedAtMs, later);
-    // 同一时刻带**过期的 authority** → 必须拒(不能"有 lease 就不看 authority 的过期")
+    // Official CC keeps sending the expired 120s envelope with the valid
+    // lease. Same-turn matching lease makes that legal (OCV5-242).
+    const both = await enforceModelAuthority({
+      catalog: source(s),
+      keyring,
+      headers: headers({
+        [AUTHORITY_HEADER]: minted.bundle.authority,
+        [TURN_LEASE_HEADER]: minted.bundle.lease,
+      }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "glm-5.2",
+      now: later,
+    });
+    assert.equal(both.authorityKind, "bridge_signed");
+    assert.equal(both.canonicalModel, "glm-5.2");
+    assert.equal(both.turnLeaseIssuedAtMs, issuedAt);
+  });
+
+  test("过期 authority 且无有效 lease → 仍 MODEL_AUTHORITY_INVALID", async () => {
+    const s = snap();
+    const issuedAt = 1_800_000_000_000;
+    const { minted, keyring } = signerFor(s, {}, { now: issuedAt });
+    const later = issuedAt + AUTHORITY_TTL_MS + 60_000;
     await expectReject(
       enforceModelAuthority({
         catalog: source(s),
         keyring,
-        headers: headers({
-          [AUTHORITY_HEADER]: minted.bundle.authority,
-          [TURN_LEASE_HEADER]: minted.bundle.lease,
-        }),
+        headers: headers({ [AUTHORITY_HEADER]: minted.bundle.authority }),
         uid: UID,
         containerId: CONTAINER_ID,
         model: "glm-5.2",
@@ -703,6 +751,92 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
         uid: UID,
         containerId: CONTAINER_ID,
         model: DEFAULT_SECONDARY_UTILITY_MODEL,
+      }),
+      "MODEL_NOT_AVAILABLE",
+    );
+  });
+});
+
+describe("modelAuthorityGate — 官方 CC 内部型号改写到票面主模型", () => {
+  test("claude-opus-4-8 + opus-5 票 → 放行且 canonical=claude-opus-5", async () => {
+    const s = snapOfficialCc();
+    const { minted, keyring } = signerFor(s, { canonicalModel: "claude-opus-5" });
+    const d = await enforceModelAuthority({
+      catalog: source(s),
+      keyring,
+      headers: headers({ [AUTHORITY_HEADER]: minted.bundle.authority }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "claude-opus-4-8",
+    });
+    assert.equal(d.canonicalModel, "claude-opus-5");
+    assert.equal(d.descriptor.canonicalModel, "claude-opus-5");
+    assert.equal(d.descriptor.providerId, "anthropic");
+    assert.equal(d.authorityCanonicalModel, "claude-opus-5");
+  });
+
+  test("claude-opus-4-8 + 过期 authority + 有效 lease → 仍改写到票面主模型", async () => {
+    const s = snapOfficialCc();
+    const issuedAt = 1_800_000_000_000;
+    const { minted, keyring } = signerFor(s, { canonicalModel: "claude-opus-5" }, { now: issuedAt });
+    const later = issuedAt + AUTHORITY_TTL_MS + 60_000;
+    const d = await enforceModelAuthority({
+      catalog: source(s),
+      keyring,
+      headers: headers({
+        [AUTHORITY_HEADER]: minted.bundle.authority,
+        [TURN_LEASE_HEADER]: minted.bundle.lease,
+      }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "claude-opus-4-8",
+      now: later,
+    });
+    assert.equal(d.canonicalModel, "claude-opus-5");
+    assert.equal(d.authorityCanonicalModel, "claude-opus-5");
+  });
+
+  test("claude-opus-4-8 只带 lease → 同样改写到票面主模型", async () => {
+    const s = snapOfficialCc();
+    const { minted, keyring } = signerFor(s, { canonicalModel: "claude-opus-5" });
+    const d = await enforceModelAuthority({
+      catalog: source(s),
+      keyring,
+      headers: headers({ [TURN_LEASE_HEADER]: minted.bundle.lease }),
+      uid: UID,
+      containerId: CONTAINER_ID,
+      model: "claude-opus-4-8",
+    });
+    assert.equal(d.canonicalModel, "claude-opus-5");
+    assert.equal(d.authorityCanonicalModel, "claude-opus-5");
+  });
+
+  test("claude-opus-4-8 无票 → 仍 MODEL_NOT_AVAILABLE", async () => {
+    const s = snapOfficialCc();
+    await expectReject(
+      enforceModelAuthority({
+        catalog: source(s),
+        keyring: null,
+        headers: headers({}),
+        uid: UID,
+        containerId: CONTAINER_ID,
+        model: "claude-opus-4-8",
+      }),
+      "MODEL_NOT_AVAILABLE",
+    );
+  });
+
+  test("非 claude-* 的未知型号即使有票也不改写", async () => {
+    const s = snapOfficialCc();
+    const { minted, keyring } = signerFor(s, { canonicalModel: "claude-opus-5" });
+    await expectReject(
+      enforceModelAuthority({
+        catalog: source(s),
+        keyring,
+        headers: headers({ [AUTHORITY_HEADER]: minted.bundle.authority }),
+        uid: UID,
+        containerId: CONTAINER_ID,
+        model: "mystery-internal-model",
       }),
       "MODEL_NOT_AVAILABLE",
     );
