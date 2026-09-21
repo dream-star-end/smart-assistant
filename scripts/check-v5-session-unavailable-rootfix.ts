@@ -122,6 +122,19 @@ if (!/if \(op\.agentId\) \{\s*op\.phase = "created";/.test(sandLifecycleSrc)) {
 }
 console.log('[sand-uor-loop] PASS — INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.')
 
+// INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.
+const sessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+if (!sessionManagerSrc.includes('export function isNativeEngineTransientContinuationSafe(')) {
+  throw new Error('[ccb-transient-continue] missing native continuation predicate')
+}
+if (!sessionManagerSrc.includes('turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)')) {
+  throw new Error('[ccb-transient-continue] transient continuation must OR native session resume with read-only checkpoint')
+}
+if (!sessionManagerSrc.includes('TRANSIENT_RETRY_INPUT resumes')) {
+  throw new Error('[ccb-transient-continue] missing native-continuation-is-not-replay contract')
+}
+console.log('[ccb-transient-continue] PASS — INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.')
+
 // INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
 // The delegateDurable unit suite separately exercises real SQLite retire/prune and
 // a real-interval cron heartbeat; this gate only stops the contracts regressing.

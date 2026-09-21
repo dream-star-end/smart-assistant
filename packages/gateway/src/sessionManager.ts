@@ -1243,6 +1243,26 @@ export {
  *  继续完成同一任务。导出供引擎回放测试引用同一权威串。 */
 export const TRANSIENT_RETRY_INPUT = '上一条消息因上游瞬时错误中断，请继续完成该任务。'
 
+/**
+ * CCB/Codex 轮内瞬时重试走 TRANSIENT_RETRY_INPUT,接同一 native session,
+ * 不是重放原用户口令。已完成的 Bash/MCP 因此不会再跑一遍。
+ *
+ * checkpointSafe 仍只给 Read/Glob/Grep 盖章;本谓词补上「会话还在 + 工具已
+ * 完成 + 无挂起权限」的续跑。没有 native session 时拒绝,避免变成重放。
+ */
+export function isNativeEngineTransientContinuationSafe(input: {
+  providerTag: string | undefined
+  nativeSessionId: string | null | undefined
+  ccbSessionId: string | null | undefined
+  permissionCount: number
+  tools: readonly { completed?: boolean }[]
+}): boolean {
+  if (input.providerTag !== 'ccb' && input.providerTag !== 'codex') return false
+  if (!input.nativeSessionId && !input.ccbSessionId) return false
+  if (input.permissionCount !== 0) return false
+  return input.tools.every((tool) => tool.completed !== false)
+}
+
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
 
@@ -6971,17 +6991,26 @@ export class SessionManager {
           result.thinkingSegments.length === 0 &&
           result.tools.length === 0 &&
           !contextOverflowHasUsage
+        const checkpointSafe = assessTurnRecoveryTape(
+          freezeTools(result?.tools ?? []).map((tool) => ({
+            role: 'tool',
+            ...tool,
+            // TurnToolEntry omits completed for a matched result; the
+            // durable recovery contract requires an explicit terminal bit.
+            _completed: tool.completed !== false,
+          })),
+        ).checkpointSafe
+        const nativeContinuationSafe = isNativeEngineTransientContinuationSafe({
+          providerTag: session.providerTag,
+          nativeSessionId: session.runner.nativeSessionId,
+          ccbSessionId: session.ccbSessionId,
+          permissionCount: turnPermissionCount,
+          tools: result?.tools ?? [],
+        })
+        // Native continuation is not a replay: TRANSIENT_RETRY_INPUT resumes
+        // the same engine session. Completed Bash is therefore safe here.
         const transientContinuationIsSafe =
-          turnPermissionCount === 0 &&
-          assessTurnRecoveryTape(
-            freezeTools(result?.tools ?? []).map((tool) => ({
-              role: 'tool',
-              ...tool,
-              // TurnToolEntry omits completed for a matched result; the
-              // durable recovery contract requires an explicit terminal bit.
-              _completed: tool.completed !== false,
-            })),
-          ).checkpointSafe
+          turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)
         if (
           result?.isError &&
           retryTransientErrors &&
