@@ -254,6 +254,12 @@
       "reason": "oc-task ticket list stdout was cut at the 64KiB pipe buffer because main() called process.exit() before the async pipe flush; adds --ndjson/--full/slim default. In-container CLI tooling only; no user-visible production incident, no turn/billing/data semantics change.",
       "approvedBy": "user 2026-09-07 授权「a,b,c都搞,派opus5去搞,交由你全权负责」(OCV5-163 审计整改;OCV5-165)",
       "expiresAt": "2026-10-07"
+    },
+    {
+      "commit": "c2d0923c3f0d875ee187a412b1ceb50f3253fb1b",
+      "reason": "0283 first apply failed because active catalog execution fields are immutable; follow-up only switches grok-build onto grok-4.7 via fn_model_switch_version before the first deploy. No production incident; migration had not been applied.",
+      "approvedBy": "user 2026-09-22 要求把 Grok 4.7 对接到当前 V5 自用环境 (OCV5-256)",
+      "expiresAt": "2026-10-22"
     }
   ]
 }
