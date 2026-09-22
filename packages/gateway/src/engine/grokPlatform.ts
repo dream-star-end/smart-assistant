@@ -4,6 +4,7 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
  * Grok CLI. Grok does not inherit CCB/Cursor wiring; this module is the
  * explicit projection (see v5-official-cli-subscription-integration).
  */
+import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -133,8 +134,12 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
 
   const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
   if (mcpLaunch && input.gatewayToken) {
-    const tokenFile = join(grokHome, 'gateway-token')
-    delegateContextFile = join(grokHome, 'delegate-context')
+    // One directory per launch. A shared delegate-context file lets a later
+    // Grok turn overwrite the token the already-running MCP child re-reads.
+    const callerDir = join(grokHome, 'caller', randomBytes(8).toString('hex'))
+    mkdirSync(callerDir, { recursive: true, mode: 0o700 })
+    const tokenFile = join(callerDir, 'gateway-token')
+    delegateContextFile = join(callerDir, 'delegate-context')
     writePrivate(tokenFile, input.gatewayToken)
     writePrivate(
       delegateContextFile,

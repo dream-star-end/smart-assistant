@@ -38,8 +38,9 @@ describe('grok platform projection', () => {
       assert.match(raw, /\[shell_environment_policy\]/)
       assert.match(raw, /\[mcp_servers\."openclaude-memory"\]/)
       assert.equal(raw.includes('bearer-must-not-enter-config'), false)
-      const tokenFile = path.join(projected.grokHome, 'gateway-token')
+      const tokenFile = path.join(path.dirname(projected.delegateContextFile!), 'gateway-token')
       assert.equal(readFileSync(tokenFile, 'utf8'), 'bearer-must-not-enter-config')
+      assert.notEqual(tokenFile, path.join(projected.grokHome, 'gateway-token'))
       assert.equal(lstatSync(tokenFile).mode & 0o777, 0o600)
       assert.match(raw, /OPENCLAUDE_ENGINE = "grok"/)
       assert.match(raw, /tool_timeout_sec = 600/)
@@ -74,6 +75,18 @@ describe('grok platform projection', () => {
       assert.ok(inspected?.hmacOk)
       assert.equal(inspected?.claims.collabMode, 'advisor')
       assert.equal(inspected?.claims.turnIndex, 2)
+      const firstPath = projected.delegateContextFile!
+      const firstToken = token
+      const other = projectGrokPlatform({
+        agentId: 'main',
+        sessionKey: 'agent:main:webchat:dm:grok-other',
+        gatewayPort: 18790,
+        gatewayToken: 'bearer-stays-in-token-file',
+        delegationDepth: 0,
+      })
+      assert.notEqual(other.delegateContextFile, firstPath)
+      assert.equal(readFileSync(firstPath, 'utf8').trim(), firstToken)
+      assert.equal(inspectConsultTurnToken(readFileSync(firstPath, 'utf8').trim())?.claims.sessionKey, 'agent:main:webchat:dm:grok-advisor')
     } finally {
       rmSync(home, { recursive: true, force: true })
       restore('OPENCLAUDE_HOME', oldHome)
