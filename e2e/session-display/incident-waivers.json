@@ -278,6 +278,12 @@
       "reason": "Advisor consult token wiring for Grok/Cursor. Not a production incident; no data loss or billing change.",
       "approvedBy": "agent:main OCV5-266",
       "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "3ec0821e4080ea1bf55d55e9a39876bd78a44dfa",
+      "reason": "Per-launch Grok consult token file. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
     }
   ]
 }
