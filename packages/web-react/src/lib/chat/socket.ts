@@ -4719,8 +4719,34 @@ export class ChatSocket {
       ? Math.max(0, streamGeneration)
       : 0;
     const mapped = units.map((unit) => liveUnitToMessage(unit, { streamGeneration: generation }));
-    if (resetClientMessageIds.length > 0) {
-      this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
+    if (units.length === 0) {
+      // An empty pack is an explicit reset. A non-empty pack is only the tail
+      // window (plus open subtask cards). Wiping every local row for the turn
+      // and painting that window is what left a refresh with just the subtask.
+      if (resetClientMessageIds.length > 0) {
+        this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
+      }
+    } else {
+      const incomingIds = new Set<string>();
+      const incomingBlockIds = new Set<string>();
+      for (const unit of units) {
+        if (typeof unit.id === "string" && unit.id) incomingIds.add(unit.id);
+        const messageId = (unit as { messageId?: unknown }).messageId;
+        if (typeof messageId === "string" && messageId) incomingIds.add(messageId);
+        if (typeof unit.blockId === "string" && unit.blockId) incomingBlockIds.add(unit.blockId);
+      }
+      sess.messages = sess.messages.filter((message) => {
+        if (message._source === "server" || typeof message._turnTapeId === "string") return true;
+        if (incomingIds.has(message.id)) return false;
+        if (typeof message.blockId === "string" && incomingBlockIds.has(message.blockId)) return false;
+        return true;
+      });
+      if (sess._streamingAssistant && !sess.messages.includes(sess._streamingAssistant)) {
+        sess._streamingAssistant = null;
+      }
+      if (sess._streamingThinking && !sess.messages.includes(sess._streamingThinking)) {
+        sess._streamingThinking = null;
+      }
     }
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);

@@ -4552,6 +4552,50 @@ describe("Phase-A final-only tape projection retry", () => {
     sock.stop();
   });
 
+  test("a tail live-units pack keeps parent steps the pack did not cover", () => {
+    const sessionId = "s-units-keep-uncovered-parent";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess.messages = [
+      { id: clientMessageId, role: "user", text: "rebuild", ts: 1 },
+      {
+        id: "local-parent-tool",
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        blockId: "parent-old",
+        output: "edited migration",
+        _completed: true,
+        ts: 2,
+        _clientMessageId: clientMessageId,
+        _turnOwnerId: clientMessageId,
+      },
+    ];
+    sock.applyLiveUnits(sessionId, [{
+      id: "agent_group:dlg",
+      kind: "agent_group",
+      seqFirst: 9,
+      seqLast: 9,
+      recordIdFirst: "90",
+      recordIdLast: "90",
+      open: true,
+      clientMessageId,
+      blockId: "dlg-tool",
+      runId: "dlg-huge",
+      agentId: "auditor",
+      goal: "审查上下文",
+      toolName: "delegate_task",
+      children: [],
+      completed: false,
+    }], [clientMessageId]);
+    expect(sess.messages.some((message) => message.id === "local-parent-tool" && message.output === "edited migration")).toBe(true);
+    expect(sess.messages.some((message) => message.role === "agent-group" && message.runId === "dlg-huge")).toBe(true);
+    sock.stop();
+  });
+
   test("complete tape without degrade replaces live thinking/tool/plan", () => {
     const sessionId = "s-degrade-then-exact";
     const sock = makeSocket();
