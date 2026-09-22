@@ -3888,9 +3888,14 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
-    const repairedStoredMessages = repairPostFinalProcessOrder(s.messages);
-    const repairedStoredOrder = repairedStoredMessages !== s.messages;
-    if (repairedStoredOrder) s.messages = repairedStoredMessages;
+    // An in-flight reload must keep the stored live order. Terminal repair
+    // runs only after the turn has actually stopped. OCV5-272
+    let repairedStoredOrder = false;
+    if (!restoredExactInFlight) {
+      const repairedStoredMessages = repairPostFinalProcessOrder(s.messages);
+      repairedStoredOrder = repairedStoredMessages !== s.messages;
+      if (repairedStoredOrder) s.messages = repairedStoredMessages;
+    }
     this.sessions.set(stored.id, s);
     this.restoreDeferredTerminalError(s, stored);
     const storedControls = Array.isArray(stored._pendingControls)
@@ -4142,6 +4147,7 @@ export class ChatSocket {
         );
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
     s.messages = reconcileLateDelegateAgentGroups(s.messages);
+    const settlingActiveTurn = !!sendingCmid && terminalTurns.has(sendingCmid);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
@@ -4180,7 +4186,9 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
-    s.messages = repairPostFinalProcessOrder(s.messages);
+    if (!s._sendingInFlight || settlingActiveTurn) {
+      s.messages = repairPostFinalProcessOrder(s.messages);
+    }
     freezeErrorCardSnapshots(
       s.messages,
       s._deferredTerminalErrorClientMessageId,
