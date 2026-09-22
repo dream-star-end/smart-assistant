@@ -9,12 +9,12 @@ import {
   CSV_NAME,
   CSV_PATH,
   DASHBOARD_HTML,
+  OLD_SESSION,
   OLD_TS,
   READ_PATH,
   STAGE_TEXT,
   WAIT_SESSION,
   answerText,
-  recentTs,
 } from "./process-disclosure-story.mjs";
 
 const CSV_URL = "/api/media-signed?t=inventory-board";
@@ -57,19 +57,42 @@ function stamp(messages, startSeq) {
   });
 }
 
-export function boardMessages() {
-  const now = recentTs();
+function sessionListRow(id, title, clock, messageCount) {
+  return {
+    id,
+    agentId: "main",
+    title,
+    pinned: false,
+    createdAt: clock.createdAt,
+    lastAt: clock.updatedAt,
+    messageCount,
+    updatedAt: clock.updatedAt,
+    modelId: "glm-5.2",
+  };
+}
+
+/** Recent gallery clock: created <= first message <= last message <= updated. */
+export function boardMessages(clock) {
+  const { createdAt, updatedAt } = clock;
+  const tUser = createdAt + 8 * 60_000;
+  const tStage = tUser + 15_000;
+  const tBash = tStage + 10_000;
+  const tRead = tBash + 10_000;
+  const tAnswer = tRead + 20_000;
+  const tRecentUser = updatedAt - 8_000;
+  const tRecent = updatedAt - 2_000;
   let n = 1;
   const next = (id, role, text, extra) => row(n++, id, role, text, extra);
   return [
-    next("u1", "user", "做一版库存看板", { status: "replied" }),
-    next("stage-1", "assistant", STAGE_TEXT, { _clientMessageId: "u1" }),
+    next("u1", "user", "做一版库存看板", { status: "replied", ts: tUser }),
+    next("stage-1", "assistant", STAGE_TEXT, { _clientMessageId: "u1", ts: tStage }),
     next("bash-1", "tool", "终端", {
       _clientMessageId: "u1",
       toolName: "Bash",
       inputJson: { command: BASH_CMD },
       _completed: true,
       output: "ok",
+      ts: tBash,
     }),
     next("read-1", "tool", "读取", {
       _clientMessageId: "u1",
@@ -77,10 +100,11 @@ export function boardMessages() {
       inputJson: { file_path: READ_PATH },
       _completed: true,
       output: "threshold",
+      ts: tRead,
     }),
     next("answer-1", "assistant", answerText(), {
       _clientMessageId: "u1",
-      ts: OLD_TS,
+      ts: tAnswer,
       usage: {
         costCredits: "12",
         totalTokens: 1840,
@@ -89,38 +113,43 @@ export function boardMessages() {
         traceId: "abc12345xyz",
       },
     }),
-    next("u-recent", "user", "数字还在吗？", { status: "replied", ts: now }),
+    next("u-recent", "user", "数字还在吗？", { status: "replied", ts: tRecentUser }),
     next("a-recent", "assistant", "还在，可售合计 128。", {
       _clientMessageId: "u-recent",
-      ts: now,
+      ts: tRecent,
       usage: { costCredits: "3", totalTokens: 420, inputTokens: 280, outputTokens: 140 },
     }),
   ];
 }
 
-/** Two earlier turns of the same inventory task. Not a technical probe. */
-export function olderMessages() {
-  const day = 86_400_000;
-  const t0 = OLD_TS - 2 * day;
+/** Two earlier turns of the same inventory task, still inside the recent window. */
+export function olderMessages(clock) {
+  const t0 = clock.createdAt + 60_000;
   let n = 1;
   const next = (id, role, text, extra) => row(n++, id, role, text, extra);
   return [
     next("u-scope", "user", "先把北仓和南仓的可售范围说清楚", { status: "replied", ts: t0 }),
     next("a-scope", "assistant", "可售只算在架库存。冻结库存不进合计，也不进这张看板。", {
       _clientMessageId: "u-scope",
-      ts: t0 + 1000,
+      ts: t0 + 20_000,
     }),
-    next("u-freeze", "user", "冻结库存这次要不要单独列出？", { status: "replied", ts: t0 + day }),
+    next("u-freeze", "user", "冻结库存这次要不要单独列出？", { status: "replied", ts: t0 + 4 * 60_000 }),
     next("a-freeze", "assistant", "先不单列。看板只放北仓和南仓的可售数。", {
       _clientMessageId: "u-freeze",
-      ts: t0 + day + 1000,
+      ts: t0 + 4 * 60_000 + 20_000,
     }),
   ];
 }
 
-export function waitMessages() {
+export function waitMessages(clock) {
+  let t = clock.createdAt + 30_000;
+  const at = () => {
+    const value = t;
+    t += 12_000;
+    return value;
+  };
   let n = 1;
-  const next = (id, role, text, extra) => row(n++, id, role, text, extra);
+  const next = (id, role, text, extra) => row(n++, id, role, text, { ts: at(), ...extra });
   return [
     next("u-att", "user", "看板发布前等我确认", { status: "sent" }),
     next("stage-att", "assistant", "我先核对南仓可售，再请你拍板。", { _clientMessageId: "u-att" }),
@@ -158,7 +187,6 @@ export function waitMessages() {
           },
         ],
       },
-      ts: Date.now(),
     }),
     next("perm-att", "permission", "执行命令", {
       _clientMessageId: "u-att",
@@ -167,7 +195,6 @@ export function waitMessages() {
       _resolved: false,
       inputPreview: "确认发布库存看板",
       inputJson: { command: "确认发布库存看板" },
-      ts: Date.now(),
     }),
     next("approval-att", "tool", "审批", {
       _clientMessageId: "u-att",
@@ -180,17 +207,47 @@ export function waitMessages() {
   ];
 }
 
+/** Old absolute date only. Session lifetime stays short so the sidebar is not "1970" or "N万天". */
+export function oldMetaMessages() {
+  let n = 1;
+  const next = (id, role, text, extra) => row(n++, id, role, text, extra);
+  return [
+    next("u-old", "user", "做一版库存看板", { status: "replied", ts: OLD_TS - 5_000 }),
+    next("a-old", "assistant", answerText(), {
+      _clientMessageId: "u-old",
+      ts: OLD_TS,
+      usage: {
+        costCredits: "12",
+        totalTokens: 1840,
+        inputTokens: 1200,
+        outputTokens: 640,
+        traceId: "abc12345xyz",
+      },
+    }),
+  ];
+}
+
 function createStore() {
+  const end = Date.now();
+  const boardClock = { createdAt: end - 50 * 60_000, updatedAt: end };
+  const waitClock = { createdAt: end - 25 * 60_000, updatedAt: end - 30_000 };
+  const oldClock = { createdAt: OLD_TS - 120_000, updatedAt: OLD_TS + 5_000 };
   return {
-    board: stamp(boardMessages(), 100),
-    older: stamp(olderMessages(), 1),
-    wait: stamp(waitMessages(), 1),
+    board: stamp(boardMessages(boardClock), 100),
+    older: stamp(olderMessages(boardClock), 1),
+    wait: stamp(waitMessages(waitClock), 1),
+    old: stamp(oldMetaMessages(), 1),
+    clocks: {
+      [BOARD_SESSION]: boardClock,
+      [WAIT_SESSION]: waitClock,
+      [OLD_SESSION]: oldClock,
+    },
     revision: 1,
-    updatedAt: Date.now(),
   };
 }
 
 function detail(id, title, messages, store, hasMore, cursor) {
+  const clock = store.clocks[id];
   const maxSeq = messages.reduce((max, message) => Math.max(max, message._seq || 0), 0);
   return {
     id,
@@ -198,10 +255,10 @@ function detail(id, title, messages, store, hasMore, cursor) {
     agentId: "main",
     title,
     pinned: false,
-    createdAt: 1,
-    lastAt: store.updatedAt,
+    createdAt: clock.createdAt,
+    lastAt: clock.updatedAt,
     messages,
-    updatedAt: store.updatedAt,
+    updatedAt: clock.updatedAt,
     historyRevision: store.revision,
     timelineGeneration: 1,
     timelineCursor: hasMore ? cursor : null,
@@ -217,28 +274,9 @@ function detail(id, title, messages, store, hasMore, cursor) {
 function listBody(store) {
   return {
     sessions: [
-      {
-        id: BOARD_SESSION,
-        agentId: "main",
-        title: "库存看板",
-        pinned: false,
-        createdAt: 1,
-        lastAt: store.updatedAt,
-        messageCount: store.board.length + store.older.length,
-        updatedAt: store.updatedAt,
-        modelId: "glm-5.2",
-      },
-      {
-        id: WAIT_SESSION,
-        agentId: "main",
-        title: "待你确认",
-        pinned: false,
-        createdAt: 1,
-        lastAt: 2,
-        messageCount: store.wait.length,
-        updatedAt: 2,
-        modelId: "glm-5.2",
-      },
+      sessionListRow(BOARD_SESSION, "库存看板", store.clocks[BOARD_SESSION], store.board.length + store.older.length),
+      sessionListRow(WAIT_SESSION, "待你确认", store.clocks[WAIT_SESSION], store.wait.length),
+      sessionListRow(OLD_SESSION, "旧日期对照", store.clocks[OLD_SESSION], store.old.length),
     ],
   };
 }
@@ -426,6 +464,7 @@ export function startPreviewServer(assetDir, options = {}) {
           }
         } else if (path === `/api/sessions/${BOARD_SESSION}`) body = detail(BOARD_SESSION, "库存看板", store.board, store, true, OLDER_CURSOR);
         else if (path === `/api/sessions/${WAIT_SESSION}`) body = detail(WAIT_SESSION, "待你确认", store.wait, store, false, null);
+        else if (path === `/api/sessions/${OLD_SESSION}`) body = detail(OLD_SESSION, "旧日期对照", store.old, store, false, null);
         else if (path.endsWith("/live-frames")) {
           body = { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false, view: url.searchParams.get("view") || "frames" };
         } else if (path === "/api/response-rating") body = { ratings: {}, nudges: {} };
@@ -523,7 +562,8 @@ export function startPreviewServer(assetDir, options = {}) {
           card._behavior = frame.behavior;
         }
         store.revision += 1;
-        store.updatedAt = Date.now();
+        const clockId = frame.peer?.id === WAIT_SESSION ? WAIT_SESSION : frame.peer?.id === OLD_SESSION ? OLD_SESSION : BOARD_SESSION;
+        store.clocks[clockId].updatedAt = Date.now();
         send({
           type: "outbound.control.receipt",
           controlId,
@@ -707,7 +747,8 @@ async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
   const start = (bucket.at(-1)?._seq || 0) + 1;
   bucket.push(...stamp(persisted, start));
   store.revision += 1;
-  store.updatedAt = Date.now();
+  const clockId = sessId === WAIT_SESSION ? WAIT_SESSION : sessId === OLD_SESSION ? OLD_SESSION : BOARD_SESSION;
+  store.clocks[clockId].updatedAt = Date.now();
   send({
     ...base,
     frameSeq: nextSeq(sessId),

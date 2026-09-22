@@ -9,6 +9,8 @@ export const BASH_CMD = "node scripts/summarize-stock.mjs";
 export const READ_PATH = "inventory/thresholds.md";
 export const BOARD_SESSION = "ocv5board01";
 export const WAIT_SESSION = "ocv5wait01";
+/** Dedicated route for the 2023-11-15 meta line. Not the default gallery. */
+export const OLD_SESSION = "ocv5old01";
 
 export const DASHBOARD_HTML = [
   "<style>",

@@ -8,7 +8,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
-import { BOARD_SESSION, CSV_BODY, CSV_NAME, WAIT_SESSION } from "./process-disclosure-story.mjs";
+import { BOARD_SESSION, CSV_BODY, CSV_NAME, OLD_SESSION, WAIT_SESSION } from "./process-disclosure-story.mjs";
 
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
@@ -122,8 +122,8 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       return { context, page, errors, traffic };
     }
 
-    async function metaMetrics(page) {
-      return page.getByTestId("assistant-meta").filter({ hasText: "2023-11-15" }).evaluate((el) => {
+    async function metaMetrics(page, needle) {
+      return page.getByTestId("assistant-meta").filter({ hasText: needle }).evaluate((el) => {
         const time = el.querySelector("time.tabular-nums");
         let bg = "rgba(0, 0, 0, 0)";
         let node = time;
@@ -186,14 +186,35 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(await desktop.page.getByText("paper.pdf").count(), 0);
       assert.equal(await desktop.page.getByText("还在，可售合计 128。").count(), 1);
       assert.equal(await desktop.page.getByTestId("process-disclosure").count(), 1, "plain follow-up has no process shell");
-      const meta = await metaMetrics(desktop.page);
+      const chronology = await desktop.page.evaluate(async (id) => {
+        const detail = await (await fetch(`/api/sessions/${id}`)).json();
+        const listed = (await (await fetch("/api/sessions/list")).json()).sessions;
+        return { detail, listed };
+      }, BOARD_SESSION);
+      const times = chronology.detail.messages.map((message) => message.ts);
+      assert.ok(chronology.detail.createdAt <= times[0], "session created after its first message");
+      assert.ok(times.every((ts, index) => index === 0 || ts >= times[index - 1]), "message timestamps go backwards");
+      assert.ok(chronology.detail.updatedAt >= times.at(-1) && chronology.detail.lastAt >= times.at(-1));
+      assert.ok(Date.now() - chronology.detail.createdAt < 3 * 60 * 60_000, "default board is not a recent session");
+      assert.equal(chronology.detail.messages.some((message) => message.ts < 1_600_000_000_000), false, "default board still has a 2023 timestamp");
+      const waitListed = chronology.listed.find((session) => session.id === WAIT_SESSION);
+      assert.ok(waitListed.createdAt > 1_600_000_000_000 && waitListed.createdAt <= waitListed.lastAt);
+      const chatText = await desktop.page.locator(".chat-scroll-area").innerText();
+      assert.doesNotMatch(chatText, /2023-11-15|1970/);
+      const boardLabel = await desktop.page.getByRole("button", { name: "库存看板" }).innerText();
+      const waitLabel = await desktop.page.getByRole("button", { name: "待你确认" }).innerText();
+      assert.doesNotMatch(boardLabel, /1970|\d{4,}天/);
+      assert.doesNotMatch(waitLabel, /1970|\d{4,}天/);
+      const meta = await metaMetrics(desktop.page, "12 积分");
       assert.equal(meta.fontSize, "11px");
       assert.ok(meta.rowHeight < 36, `meta row too tall: ${meta.rowHeight}`);
-      assert.ok(Math.abs(meta.timeTop - meta.creditTop) < 8, "old date and credits are not one compact row");
+      assert.ok(Math.abs(meta.timeTop - meta.creditTop) < 8, "time and credits are not one compact row");
       assert.match(meta.text, /12\s*积分/);
       assert.match(meta.text, /token/);
+      assert.match(meta.text, /刚刚|分钟前/);
+      assert.doesNotMatch(meta.text, /2023-11-15|1970/);
       assert.ok(contrastRatio(meta.color, meta.bg) >= 4.5, `light contrast ${contrastRatio(meta.color, meta.bg)}`);
-      await desktop.page.getByText("刚刚").waitFor();
+      await desktop.page.getByText("刚刚").first().waitFor();
       const iframeSrc = await desktop.page.getByTitle("HTML 沙盒预览").getAttribute("srcdoc");
       assert.match(iframeSrc ?? "", /库存看板/);
       assert.match(iframeSrc ?? "", /可售合计 128/);
@@ -450,15 +471,55 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await narrow.context.close();
     }
 
+    async function assertOldDateVisible(page) {
+      const time = page.locator("time.tabular-nums").filter({ hasText: "2023-11-15" }).first();
+      await time.waitFor();
+      await align(page, time);
+      const info = await time.evaluate((el) => {
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll(".sr-only").forEach((node) => node.remove());
+        const rect = el.getBoundingClientRect();
+        return {
+          text: (clone.textContent || "").replace(/\s+/g, " ").trim(),
+          top: rect.top,
+          bottom: rect.bottom,
+          height: rect.height,
+          view: window.innerHeight,
+        };
+      });
+      assert.match(info.text, /^2023-11-15/);
+      assert.ok(info.height > 8, `old date is not a visible line: ${JSON.stringify(info)}`);
+      assert.ok(info.top >= 24 && info.bottom <= info.view - 8, `old date outside the viewport: ${JSON.stringify(info)}`);
+      return info;
+    }
+
+    const oldUrl = preview.url.replace(`/s/${BOARD_SESSION}`, `/s/${OLD_SESSION}`);
+    const oldLight = await open(1280, false);
+    try {
+      await oldLight.page.goto(oldUrl, { waitUntil: "domcontentloaded" });
+      await oldLight.page.getByText("看板已经做好").waitFor();
+      const meta = await metaMetrics(oldLight.page, "2023-11-15");
+      assert.equal(meta.fontSize, "11px");
+      assert.ok(meta.rowHeight < 36, `old-date meta row too tall: ${meta.rowHeight}`);
+      assert.ok(Math.abs(meta.timeTop - meta.creditTop) < 8, "old date and credits are not one compact row");
+      assert.match(meta.text, /12\s*积分/);
+      assert.ok(contrastRatio(meta.color, meta.bg) >= 4.5, `old-date light contrast ${contrastRatio(meta.color, meta.bg)}`);
+      await assertOldDateVisible(oldLight.page);
+      await oldLight.page.screenshot({ path: join(shots, "ocv5-265-e2e-olddate-light.png") });
+    } finally {
+      await oldLight.context.close();
+    }
+
     const dark = await open(1280, false, "dark");
     try {
-      await dark.page.getByText("2023-11-15").waitFor();
-      const meta = await metaMetrics(dark.page);
+      await dark.page.goto(oldUrl, { waitUntil: "domcontentloaded" });
+      await dark.page.getByText("看板已经做好").waitFor();
+      const meta = await metaMetrics(dark.page, "2023-11-15");
       assert.equal(meta.fontSize, "11px");
       assert.ok(contrastRatio(meta.color, meta.bg) >= 4.5, `dark contrast ${contrastRatio(meta.color, meta.bg)} color=${meta.color} bg=${meta.bg}`);
-      await dark.page.getByText("刚刚").first().waitFor();
-      await align(dark.page, dark.page.getByText("2023-11-15").first());
+      await assertOldDateVisible(dark.page);
       await dark.page.screenshot({ path: join(shots, "ocv5-265-e2e-dark-meta.png") });
+      await dark.page.screenshot({ path: join(shots, "ocv5-265-e2e-olddate-dark.png") });
     } finally {
       await dark.context.close();
     }
