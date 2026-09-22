@@ -165,7 +165,8 @@
     "0281_cursor_sand_usable_families",
     "0283_cursor_grok_47_and_grok_build",
     "0284_grok_build_fast_retire_grok_46",
-    "0285_content_review_strikes"
+    "0285_content_review_strikes",
+    "0286_claude_opus_55"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
