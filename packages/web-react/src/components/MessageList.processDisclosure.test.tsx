@@ -471,22 +471,275 @@ describe("MessageList Manus 过程披露", () => {
     const shared = await screen.findAllByText(/shared-board\.csv/);
     expect(shared.some((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
     expect(shared.every((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
-    const onlyRow = document.querySelector("[data-chat-virtual-key=only]");
-    expect(onlyRow).not.toBeNull();
-    expect(onlyRow?.closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(onlyRow?.querySelector("[title]")?.getAttribute("title") ?? "").toMatch(
-      /^cp y \/home\/agent\/\.openclaude\/generated\//,
-    );
+    // 命令里的生成路径不是交付：only 不得作为顶层文件成品出现。
+    expect(screen.queryByText(/only-board\.csv/)).not.toBeInTheDocument();
+    expect(document.querySelector("[data-chat-virtual-key=only]")).toBeNull();
     expect(screen.getByText("未成功").closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.queryByText(/paper\.pdf/)).not.toBeInTheDocument();
     expect(screen.queryByText("生成图片")).not.toBeInTheDocument();
     expect(screen.queryByText("货架静物")).not.toBeInTheDocument();
 
+    const toggles = screen.getAllByTestId("process-toggle");
+    expect(toggles).toHaveLength(2);
+    fireEvent.click(toggles[0]!);
+    fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
+    const first = screen.getAllByTestId("process-details")[0]!;
+    expect(within(first).getByText(/paper\.pdf/).closest("[data-testid=process-details]")).not.toBeNull();
+    expect(within(first).getByText("生成图片").closest("[data-testid=process-details]")).not.toBeNull();
+    expect(first.textContent ?? "").toMatch(/cp x \/home\/agent\/\.openclaude\/generated\//);
+    fireEvent.click(toggles[1]!);
+    fireEvent.click(screen.getAllByTestId("process-detail-toggle")[1]!);
+    const second = screen.getAllByTestId("process-details")[1]!;
+    for (const button of within(second).getAllByRole("button")) {
+      if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
+    }
+    const onlyText = within(second).getByText(/only-board\.csv/);
+    expect(onlyText.closest("[data-testid=process-details]")).not.toBeNull();
+    expect(onlyText.closest("[title='文件准备中…(容器冷启时稍候)']")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=only]")).toBeNull();
+  });
+
+  test("请求路径、未完成命令、Read 和办公日志不冒充顶层文件成品", async () => {
+    renderList([
+      row("u", "user", "打包", { status: "replied" }),
+      row("stage", "assistant", "先跑构建", { _clientMessageId: "u" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "python build.py --output /home/agent/.openclaude/generated/not-created.pdf" },
+        inputPreview: "python build.py --output /home/agent/.openclaude/generated/not-created.pdf",
+        _completed: true,
+        output: "ok",
+      }),
+      row("live", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "python build.py --output /home/agent/.openclaude/generated/still-running.pdf" },
+        _completed: false,
+        output: "ok",
+      }),
+      row("read", "tool", "读取", {
+        _clientMessageId: "u",
+        toolName: "Read",
+        inputJson: { file_path: "/home/agent/.openclaude/generated/already-there.docx" },
+        _completed: true,
+        output: "正文 /home/agent/.openclaude/generated/already-there.docx",
+      }),
+      row("office", "tool", "PDF", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-pdf paper.qmd -o /home/agent/.openclaude/generated/guess.pdf" },
+        _completed: true,
+        output: "wrote /home/agent/.openclaude/generated/guess.pdf",
+      }),
+      row("answer", "assistant", "构建记录在过程里", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByText("构建记录在过程里")).toBeInTheDocument();
+    expect(screen.queryByText(/not-created\.pdf/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/still-running\.pdf/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/already-there\.docx/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/guess\.pdf/)).not.toBeInTheDocument();
+    expect(screen.queryByTitle("文件准备中…(容器冷启时稍候)")).not.toBeInTheDocument();
+    expect(document.querySelector("[data-chat-virtual-key=bash]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=read]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=office]")).toBeNull();
+
     fireEvent.click(screen.getByTestId("process-toggle"));
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
-    expect(screen.getByText(/paper\.pdf/).closest("[data-testid=process-details]")).not.toBeNull();
-    expect(screen.getByText("生成图片").closest("[data-testid=process-details]")).not.toBeNull();
-    expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/cp x \/home\/agent\/\.openclaude\/generated\//);
+    const details = screen.getByTestId("process-details");
+    for (const button of within(details).getAllByRole("button")) {
+      if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
+    }
+    expect(details.textContent ?? "").toMatch(/not-created\.pdf/);
+    expect(details.textContent ?? "").toMatch(/still-running\.pdf/);
+    expect(details.textContent ?? "").toMatch(/already-there\.docx/);
+    const guesses = screen.getAllByText(/guess\.pdf/);
+    expect(guesses.length).toBeGreaterThan(0);
+    expect(guesses.every((node) => node.closest("[data-testid=process-details]") != null)).toBe(true);
+    expect(screen.getByText("构建记录在过程里").closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("不同 HTML 预览各自保留，同一内容或同一 id 才折进过程", async () => {
+    const alpha = "```htmlpreview\n<div>PREVIEW_ALPHA</div>\n```";
+    const beta = "```htmlpreview\n<div>PREVIEW_BETA</div>\n```";
+    const sameId = "```htmlpreview id=board-a\n<div>PREVIEW_OTHER</div>\n```";
+    const otherId = "```htmlpreview id=board-b\n<div>PREVIEW_OTHER</div>\n```";
+    renderList([
+      row("u", "user", "出预览", { status: "replied" }),
+      row("plain", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("preview", "assistant", `看两份\n${alpha}\n${sameId}`, { _clientMessageId: "u" }),
+      row("same-body", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "cat alpha.html" },
+        _completed: true,
+        output: alpha,
+      }),
+      row("same-id", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "cat board.html" },
+        _completed: true,
+        output: sameId,
+      }),
+      row("html-beta", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "cat beta.html" },
+        _completed: true,
+        output: beta,
+      }),
+      row("html-b", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "cat b.html" },
+        _completed: true,
+        output: otherId,
+      }),
+      row("answer", "assistant", "预览在上面", { _clientMessageId: "u" }),
+    ]);
+    const previews = await screen.findAllByTitle("HTML 沙盒预览");
+    expect(previews.length).toBeGreaterThanOrEqual(2);
+    expect(previews.every((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
+    expect(document.querySelector("[data-chat-virtual-key=same-body]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=same-id]")).toBeNull();
+    const betaRow = document.querySelector("[data-chat-virtual-key=html-beta]");
+    const idRow = document.querySelector("[data-chat-virtual-key=html-b]");
+    expect(betaRow).not.toBeNull();
+    expect(idRow).not.toBeNull();
+    expect(betaRow?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(idRow?.closest("[data-testid=process-disclosure]")).toBeNull();
+    fireEvent.click(within(betaRow as HTMLElement).getByRole("button"));
+    expect(within(betaRow as HTMLElement).getByText(/PREVIEW_BETA/)).toBeInTheDocument();
+    expect(screen.queryByText(/PREVIEW_BETA/)?.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("查询和句末标点归一后同一生成文件才去重，真实文件名保留", async () => {
+    renderList([
+      row("u", "user", "对一下文件", { status: "replied" }),
+      row("noise", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        _completed: true,
+        output: "ok",
+      }),
+      row(
+        "shot",
+        "assistant",
+        "图 ![图](/home/agent/.openclaude/generated/my.report.v2.png?x=1)\n表 /home/agent/.openclaude/generated/notes.v2.pdf。",
+        { _clientMessageId: "u" },
+      ),
+      row("dup-image", "tool", "生成图片", {
+        _clientMessageId: "u",
+        toolName: "codex:imageGeneration",
+        inputJson: { type: "imageGeneration", prompt: "同一张" },
+        _completed: true,
+        output: "imageGeneration → /home/agent/.openclaude/generated/my.report.v2.png",
+      }),
+      row("other-image", "tool", "生成图片", {
+        _clientMessageId: "u",
+        toolName: "codex:imageGeneration",
+        inputJson: { type: "imageGeneration", prompt: "另一张" },
+        _completed: true,
+        output: "imageGeneration → /home/agent/.openclaude/generated/other.v2.png",
+      }),
+      row("dup-report", "tool", "报告", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-report --schema s" },
+        _completed: true,
+        output: JSON.stringify({ output: "/home/agent/.openclaude/generated/notes.v2.pdf" }),
+      }),
+      row("other-report", "tool", "报告", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-report --schema s" },
+        _completed: true,
+        output: JSON.stringify({ output: "/home/agent/.openclaude/generated/notes.v2.final.pdf" }),
+      }),
+      row("answer", "assistant", "对过了", { _clientMessageId: "u" }),
+    ]);
+    const picture = await screen.findByText("图");
+    expect(picture.closest("[data-testid=process-disclosure]")).toBeNull();
+    const note = await screen.findByText("notes.v2.pdf");
+    expect(note.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(note.textContent).toBe("notes.v2.pdf");
+    // 带查询的 my.report.v2.png 与工具返回的同一文件名折成一件；裁短文件名则对不上，卡会留在顶层。
+    expect(document.querySelector("[data-chat-virtual-key=dup-image]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=dup-report]")).toBeNull();
+    const otherImage = document.querySelector("[data-chat-virtual-key=other-image]");
+    const otherReport = document.querySelector("[data-chat-virtual-key=other-report]");
+    expect(otherImage?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(otherReport?.closest("[data-testid=process-disclosure]")).toBeNull();
+    fireEvent.click(within(otherImage as HTMLElement).getByRole("button"));
+    expect(within(otherImage as HTMLElement).getByText("图片已生成")).toBeInTheDocument();
+    expect(within(otherImage as HTMLElement).getByText(/other\.v2\.png/)).toBeInTheDocument();
+  });
+
+  test("只有输出里的真实图像留在结果层，命令里的截图路径不算", async () => {
+    renderList([
+      row("u", "user", "出图", { status: "replied" }),
+      row("noise", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("named", "tool", "截图", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-browser screenshot --filename=/home/agent/.openclaude/generated/requested-only.png" },
+        _completed: true,
+        output: "Saved screenshot",
+      }),
+      row("shot", "tool", "截图", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-browser screenshot" },
+        _completed: true,
+        output: "saved /home/agent/.openclaude/generated/from-output.png",
+      }),
+      row("mmx", "tool", "媒体", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "mmx image generate \"货架\"" },
+        _completed: true,
+        output: "/home/agent/.openclaude/generated/shelf-unique.png\nbilling: 12 credits-cents",
+      }),
+      row("empty-image", "tool", "生成图片", {
+        _clientMessageId: "u",
+        toolName: "codex:imageGeneration",
+        inputJson: { type: "imageGeneration", savedPath: "/home/agent/.openclaude/generated/input-only.png", prompt: "不要凭输入路径" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("answer", "assistant", "图在结果里", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByText("图在结果里")).toBeInTheDocument();
+    expect(screen.queryByText(/requested-only\.png/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/input-only\.png/)).not.toBeInTheDocument();
+    expect(document.querySelector("[data-chat-virtual-key=named]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=empty-image]")).toBeNull();
+    const shot = document.querySelector("[data-chat-virtual-key=shot]");
+    const media = document.querySelector("[data-chat-virtual-key=mmx]");
+    expect(shot?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(media?.closest("[data-testid=process-disclosure]")).toBeNull();
+    fireEvent.click(within(shot as HTMLElement).getByRole("button"));
+    fireEvent.click(within(media as HTMLElement).getByRole("button"));
+    const shotImage = within(shot as HTMLElement).queryByText("页面截图")
+      ?? within(shot as HTMLElement).queryByAltText("页面截图");
+    expect(shotImage).not.toBeNull();
+    expect(shotImage?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(within(media as HTMLElement).getByText("shelf-unique.png")).toBeInTheDocument();
+    expect(screen.getByText("shelf-unique.png").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
   test("回答元信息用 caption，旧日期和近时都在，积分与 token 仍在", () => {

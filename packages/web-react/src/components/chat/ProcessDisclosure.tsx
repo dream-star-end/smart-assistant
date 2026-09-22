@@ -2,6 +2,9 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { Markdown } from "../Markdown";
+import { normalizeToolForDisplay, parseCodexTypeName, type ToolInput } from "../tool/format";
+import { detectOcCli } from "../tool/meta";
+import { safeArtifactSrc } from "../tool/researchCards";
 import { timelineMessageKey } from "./findInSession";
 
 /**
@@ -41,41 +44,94 @@ function commandText(message: ChatMessage): string {
 
 const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd"]);
 
-const HTML_FENCE_RE = /```(?:htmlpreview|html)\b/i;
 const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+const GENERATED_PREFIX = "/home/agent/.openclaude/generated/";
 const GENERATED_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/\S+/g;
+/** Prose/markdown closers only. `+`, `=`, `@`, and interior dots stay — they occur in real names. */
 const TRAILING_PATH_JUNK = /[),.;:，。；"'`\]}>]+$/u;
+const ARTIFACT_CLIS = new Set(["oc-report", "oc-slides", "oc-poster"]);
 
-function cleanEvidenceToken(value: string): string {
-  return value.replace(TRAILING_PATH_JUNK, "");
+function dedupe(keys: string[]): string[] {
+  return [...new Set(keys)];
+}
+
+function stableTextId(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+/** Query/hash and trailing punctuation come off generated paths; the filename itself is kept. */
+function normalizeGeneratedPath(raw: string): string {
+  const start = raw.indexOf(GENERATED_PREFIX);
+  if (start < 0) return "";
+  let value = raw.slice(start).replace(TRAILING_PATH_JUNK, "");
+  const cut = value.search(/[?#]/);
+  if (cut >= 0) value = value.slice(0, cut);
+  value = value.replace(TRAILING_PATH_JUNK, "");
+  if (!value.startsWith(GENERATED_PREFIX) || value.length <= GENERATED_PREFIX.length) return "";
+  return value;
+}
+
+function generatedFileKey(raw: string): string | null {
+  const normalized = normalizeGeneratedPath(raw);
+  return normalized ? `file:${normalized}` : null;
+}
+
+function htmlStableId(info: string, code: string): string | null {
+  const idMatch = /(?:^|[\s,])id=(?:"([^"]+)"|'([^']+)'|([^\s]+))/i.exec(info);
+  const explicit = (idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? "").trim();
+  if (explicit) return `id:${explicit}`;
+  const body = code.trim();
+  if (!body) return null;
+  return `b:${stableTextId(body)}`;
+}
+
+/** One key per real preview. Same body or same explicit id collapses; different previews do not. */
+function htmlEvidenceKeys(text: string): string[] {
+  const keys: string[] = [];
+  const openRe = /```(?:htmlpreview|html)\b([^\n]*)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = openRe.exec(text))) {
+    const info = match[1] ?? "";
+    let codeStart = match.index + match[0].length;
+    if (text[codeStart] === "\r") codeStart += 1;
+    if (text[codeStart] === "\n") codeStart += 1;
+    const rest = text.slice(codeStart);
+    const close = /\r?\n```[ \t]*(?:\r?\n|$)/.exec(rest);
+    const code = close ? rest.slice(0, close.index) : rest;
+    const id = htmlStableId(info, code);
+    if (id) keys.push(`html:${id}`);
+    if (!close) break;
+    openRe.lastIndex = codeStart + close.index + close[0].length;
+  }
+  return keys;
+}
+
+function evidenceKeyForLocator(raw: string): string | null {
+  const generated = generatedFileKey(raw);
+  if (generated) return generated;
+  const cleaned = raw.trim().replace(TRAILING_PATH_JUNK, "");
+  return cleaned ? `img:${cleaned}` : null;
 }
 
 /** Stable keys for a real preview, image, or generated file. Tool names are not keys. */
 export function artifactEvidenceKeys(text: string): string[] {
   MD_IMAGE_RE.lastIndex = 0;
   GENERATED_PATH_RE.lastIndex = 0;
-  const keys: string[] = [];
-  if (HTML_FENCE_RE.test(text)) keys.push("html");
+  const keys = htmlEvidenceKeys(text);
   for (const match of text.matchAll(MD_IMAGE_RE)) {
-    if (match[1]) keys.push(`img:${cleanEvidenceToken(match[1])}`);
+    const key = evidenceKeyForLocator(match[1] ?? "");
+    if (key) keys.push(key);
   }
   for (const match of text.matchAll(GENERATED_PATH_RE)) {
-    keys.push(`file:${cleanEvidenceToken(match[0])}`);
+    const key = generatedFileKey(match[0]);
+    if (key) keys.push(key);
   }
-  return keys;
-}
-
-function messageEvidenceText(message: ChatMessage): string {
-  const parts = [message.text ?? "", message.output ?? "", message.inputPreview ?? ""];
-  const input = message.inputJson;
-  if (input && typeof input === "object") {
-    try {
-      parts.push(JSON.stringify(input));
-    } catch {
-      /* non-json input is not artifact evidence */
-    }
-  }
-  return parts.join("\n");
+  return dedupe(keys);
 }
 
 /** Preview, image, or generated-file assistant rows stay beside the answer. */
@@ -86,17 +142,175 @@ export function assistantCarriesDeliverable(message: ChatMessage): boolean {
   return artifactEvidenceKeys(text).length > 0;
 }
 
+function toolSucceeded(message: ChatMessage): boolean {
+  return message.role === "tool" && message._completed === true && !message.error && !message._isError;
+}
+
+function commandOf(input: ToolInput): string {
+  if (!input) return "";
+  if (typeof input.command === "string") return input.command;
+  if (typeof input.cmd === "string") return input.cmd;
+  return "";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A path the existing card will actually sign and render, not a mention in a log line. */
+function renderedLocatorKey(raw: string): string | null {
+  const generated = generatedFileKey(raw);
+  if (generated) return generated;
+  const cleaned = raw.trim().replace(TRAILING_PATH_JUNK, "");
+  if (!cleaned || !safeArtifactSrc(cleaned)) return null;
+  if (/\.(?:png|jpe?g|gif|webp|mp3|wav|m4a|flac|mp4|mov|webm)$/i.test(cleaned)) return `img:${cleaned}`;
+  return `file:${cleaned}`;
+}
+
+function isInspectionTool(name: string): boolean {
+  if (parseCodexTypeName(name) === "imageView") return true;
+  const head = name.toLowerCase();
+  return head === "read" || head === "view" || head.endsWith(":read") || head.endsWith(":view");
+}
+
+function imageGenerationKeys(name: string, input: ToolInput, output: string): string[] {
+  const type = typeof input?.type === "string" ? input.type : "";
+  if (parseCodexTypeName(name) !== "imageGeneration" && type !== "imageGeneration") return [];
+  const keys: string[] = [];
+  const arrow = /imageGeneration\s*→\s*(\S+)/.exec(output);
+  if (arrow?.[1]) {
+    const key = renderedLocatorKey(arrow[1]);
+    if (key) keys.push(key);
+  }
+  const imagePath = /((?:\/[\w. -]+)+\.(?:png|jpe?g|webp|gif))/i.exec(output);
+  if (imagePath?.[1]) {
+    const key = renderedLocatorKey(imagePath[1]);
+    if (key) keys.push(key);
+  }
+  return keys;
+}
+
+function minimaxOutputKeys(command: string, output: string): string[] {
+  const cli = detectOcCli(command);
+  if (cli !== "oc-minimax" && cli !== "mmx") return [];
+  const subMatch = /(?:oc-minimax|mmx)\s+([a-z]+)/i.exec(command);
+  const sub = (subMatch?.[1] ?? "").toLowerCase();
+  const kind = sub === "lyric" ? "lyrics" : sub;
+  if (kind !== "image" && kind !== "speech" && kind !== "music" && kind !== "video") return [];
+  const keys: string[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const token = line.trim();
+    if (!token || /^(?:billing|status):/i.test(token) || /^task_id:/i.test(token)) continue;
+    if (!/\.(?:png|jpe?g|webp|gif|mp3|wav|m4a|flac|mp4|mov|webm)$/i.test(token)) continue;
+    const key = renderedLocatorKey(token);
+    if (key) keys.push(key);
+  }
+  return keys;
+}
+
+function isScreenshotTool(name: string, command: string): boolean {
+  if (/browser_take_screenshot/i.test(name)) return true;
+  if (detectOcCli(command) !== "oc-browser") return false;
+  for (const match of command.matchAll(/oc-browser\s+([a-z-]+)/gi)) {
+    if ((match[1] ?? "").toLowerCase() === "screenshot") return true;
+  }
+  return false;
+}
+
+function screenshotOutputKeys(name: string, command: string, output: string): string[] {
+  if (!isScreenshotTool(name, command)) return [];
+  const match = /\/[^\s"'<>]+\.(?:png|jpe?g|webp)/i.exec(output);
+  if (!match) return [];
+  const key = renderedLocatorKey(match[0]);
+  return key ? [key] : [];
+}
+
+function artifactRecord(output: string, outputJson: unknown): Record<string, unknown> | null {
+  const fromJson = asRecord(outputJson);
+  if (typeof fromJson?.output === "string" || typeof fromJson?.qmd === "string") return fromJson;
+  return asRecord(output);
+}
+
+function artifactOutputKeys(command: string, output: string, outputJson: unknown): string[] {
+  const cli = detectOcCli(command);
+  if (!cli || !ARTIFACT_CLIS.has(cli)) return [];
+  const data = artifactRecord(output, outputJson);
+  if (!data) return [];
+  const keys: string[] = [];
+  for (const field of ["output", "qmd"]) {
+    const value = data[field];
+    if (typeof value !== "string") continue;
+    const key = renderedLocatorKey(value);
+    if (key) keys.push(key);
+  }
+  return keys;
+}
+
+function outputEvidence(message: ChatMessage, displayOutput: string, outputJson: unknown): string {
+  const parts = [displayOutput];
+  const tail = message.bashTail?.tail;
+  if (typeof tail === "string" && tail.trim() && !displayOutput.includes(tail)) parts.push(tail);
+  if (typeof outputJson === "string") parts.push(outputJson);
+  else if (outputJson !== undefined && outputJson !== null) {
+    try {
+      parts.push(JSON.stringify(outputJson));
+    } catch {
+      /* non-json output is not media evidence */
+    }
+  }
+  return parts.join("\n");
+}
+
 /**
- * A successful tool stays on the result layer only when its payload contains
- * artifact evidence the assistant does not already show. CLI and imageGeneration
- * names are execution logs, not evidence.
+ * Media the existing tool card renders from a successful output/outputJson.
+ * Request paths are ignored. Office CLI cards guess a download from the
+ * command, and Read/imageView only inspect a file — neither is a deliverable.
+ * Image generation, minimax/mmx, screenshots, and oc-report/slides/poster
+ * stay up only when that card has a returned file it can actually show.
+ */
+function renderedToolMediaKeys(message: ChatMessage): string[] {
+  if (!toolSucceeded(message)) return [];
+  let name = message.toolName ?? "";
+  let input: ToolInput = null;
+  let output = typeof message.output === "string" ? message.output : "";
+  let outputJson = message.outputJson;
+  try {
+    const display = normalizeToolForDisplay(message);
+    name = display.name || name;
+    input = display.input;
+    if (typeof display.tool.output === "string") output = display.tool.output;
+    if (display.tool.outputJson !== undefined) outputJson = display.tool.outputJson;
+  } catch {
+    /* fall back to the raw tool row */
+  }
+  if (isInspectionTool(name)) return [];
+  const command = commandOf(input);
+  const evidence = outputEvidence(message, output, outputJson);
+  return dedupe([
+    ...htmlEvidenceKeys(evidence),
+    ...imageGenerationKeys(name, input, evidence),
+    ...minimaxOutputKeys(command, evidence),
+    ...screenshotOutputKeys(name, command, evidence),
+    ...artifactOutputKeys(command, output, outputJson),
+  ]);
+}
+
+/**
+ * A successful tool stays on the result layer only when its card renders media
+ * the assistant does not already show.
  */
 export function toolShowsUniqueArtifact(
   message: ChatMessage,
   assistantArtifactKeys?: ReadonlySet<string>,
 ): boolean {
-  if (message.role !== "tool" || message.error || message._isError) return false;
-  const keys = artifactEvidenceKeys(messageEvidenceText(message));
+  const keys = renderedToolMediaKeys(message);
   if (keys.length === 0) return false;
   const owned = assistantArtifactKeys ?? new Set<string>();
   return keys.some((key) => !owned.has(key));
