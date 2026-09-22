@@ -487,13 +487,75 @@ function toolStillRunning(message: ChatMessage): boolean {
   return message.role === "tool" && !message._completed && !message.error && !message._isError;
 }
 
-function commandPositionOp(command: string, cli: string): string {
-  const escaped = cli.replace(/-/g, "\\-");
-  const match = new RegExp(
-    `(?:^\\s*|[\\n;&|(]\\s*)(?:\\w+=\\S*\\s+)*(?:\\S*/)?${escaped}\\s+([\\w-]+)`,
-    "i",
-  ).exec(command);
-  return (match?.[1] ?? "").toLowerCase();
+function skipHeadSpace(command: string, index: number): number {
+  while (index < command.length && /[\t \n]/.test(command[index] ?? "")) index += 1;
+  return index;
+}
+
+/**
+ * One shell word at the head. Quoted text stays inside the word, so a semicolon
+ * in an argument is not a new command. `$`, backticks, or an unfinished quote
+ * make the head unreliable and return null.
+ */
+function readHeadWord(command: string, index: number): { word: string; next: number } | null {
+  let i = skipHeadSpace(command, index);
+  if (i >= command.length) return { word: "", next: i };
+  let word = "";
+  let started = false;
+  while (i < command.length) {
+    const ch = command[i] ?? "";
+    if (started && /[\t \n]/.test(ch)) break;
+    if (!started && /[;&|<>()]/.test(ch)) return null;
+    if (started && /[;&|<>()]/.test(ch)) break;
+    if (ch === "'") {
+      const end = command.indexOf("'", i + 1);
+      if (end < 0) return null;
+      word += command.slice(i + 1, end);
+      i = end + 1;
+      started = true;
+      continue;
+    }
+    if (ch === '"') {
+      i += 1;
+      while (i < command.length && command[i] !== '"') {
+        if (command[i] === "\\" ) {
+          word += command[i + 1] ?? "";
+          i += 2;
+          continue;
+        }
+        if (command[i] === "$" || command[i] === "`") return null;
+        word += command[i] ?? "";
+        i += 1;
+      }
+      if (command[i] !== '"') return null;
+      i += 1;
+      started = true;
+      continue;
+    }
+    if (ch === "$" || ch === "`" || ch === "\\") return null;
+    word += ch;
+    i += 1;
+    started = true;
+  }
+  return { word, next: i };
+}
+
+/** First command only. Later statements and quoted lookalikes are ignored. */
+function reliableHeadCall(command: string): { bin: string; op: string } | null {
+  let i = 0;
+  for (;;) {
+    const word = readHeadWord(command, i);
+    if (!word) return null;
+    if (!word.word) return null;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word.word)) {
+      i = word.next;
+      continue;
+    }
+    const bin = word.word.split("/").pop() ?? "";
+    const opWord = readHeadWord(command, word.next);
+    if (!opWord) return null;
+    return { bin, op: opWord.word.toLowerCase() };
+  }
 }
 
 function toolToken(name: string): string {
@@ -531,14 +593,14 @@ const SEARCH_TOOL_TOKENS = new Set([
 function runningToolPhrase(message: ChatMessage): string {
   const name = message.toolName ?? "";
   const command = stripShellWrapperForDisplay(commandText(message));
-  const cli = detectOcCli(command);
-  if (cli === "oc-memory") {
-    const op = commandPositionOp(command, cli);
-    if (op === "delegate-wait") return "等待子任务完成";
-    if (op === "core-search" || op === "session-search" || op === "archival-search") return "正在搜索资料";
+  const head = reliableHeadCall(command);
+  if (head?.bin === "oc-memory") {
+    if (head.op === "delegate-wait") return "等待子任务完成";
+    if (head.op === "core-search" || head.op === "session-search" || head.op === "archival-search") return "正在搜索资料";
   }
-  if (cli === "oc-vision" && commandPositionOp(command, cli) === "understand") return "正在识别图片";
-  if (isScreenshotTool(name, command)) return "工具执行中";
+  if (head?.bin === "oc-vision" && head.op === "understand") return "正在识别图片";
+  if (head?.bin === "oc-browser" && head.op === "screenshot") return "工具执行中";
+  if (/browser_take_screenshot/i.test(name)) return "工具执行中";
 
   const codex = parseCodexTypeName(name);
   const input = message.inputJson;
@@ -563,22 +625,22 @@ function runningToolPhrase(message: ChatMessage): string {
   if (SEARCH_TOOL_TOKENS.has(token)) return "正在搜索资料";
 
   if (SHELL_TOOLS.has(token) || token === "bash" || token === "sh") {
-    const head = commandHead({ ...message, inputJson: { command } }).toLowerCase();
-    if (head === "rg" || head === "grep" || head === "find") return "正在搜索资料";
-    if (head === "cat" || head === "view") return "正在读取文件";
+    const bin = (head?.bin ?? "").toLowerCase();
+    if (bin === "rg" || bin === "grep" || bin === "find") return "正在搜索资料";
+    if (bin === "cat" || bin === "view") return "正在读取文件";
   }
   return "工具执行中";
 }
 
 function rawAuditCommand(message: ChatMessage): string {
   if (message.role !== "tool") return "";
-  const command = stripShellWrapperForDisplay(commandText(message)).trim();
-  // Only the delegate cards hide the command entirely. Other oc-* cards already
-  // show their own summary; a second copy makes the audit row ambiguous.
-  if (detectOcCli(command) !== "oc-memory") return "";
-  const op = commandPositionOp(command, "oc-memory");
-  if (op !== "delegate" && op !== "delegate-wait" && op !== "request-review") return "";
-  return command;
+  const original = commandText(message).trim();
+  if (!original) return "";
+  // Classify the unwrapped head, but show the command the transcript actually stored.
+  const head = reliableHeadCall(stripShellWrapperForDisplay(original).trim());
+  if (head?.bin !== "oc-memory") return "";
+  if (head.op !== "delegate" && head.op !== "delegate-wait" && head.op !== "request-review") return "";
+  return original;
 }
 
 /** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.

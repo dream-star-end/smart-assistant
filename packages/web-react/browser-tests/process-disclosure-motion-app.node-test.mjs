@@ -14,7 +14,7 @@ const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const shots = process.env.OC_PROCESS_SHOT_DIR || "/home/agent/.openclaude/generated";
-const assetDir = process.env.OC_PROCESS_MOTION_DIR || "/tmp/ocv5-265-motion-app";
+const assetDir = process.env.OC_PROCESS_MOTION_DIR || "/tmp/ocv5-265-motion-review-app";
 
 function oscillation(samples, key, epsilon = 1) {
   let flips = 0;
@@ -38,30 +38,30 @@ function oscillation(samples, key, epsilon = 1) {
     if (lastSign && sign !== lastSign) flips += 1;
     lastSign = sign;
   }
-  return {
-    flips,
-    span: min === Infinity ? 0 : Math.round((max - min) * 10) / 10,
-  };
+  return { flips, span: min === Infinity ? 0 : Math.round((max - min) * 10) / 10 };
 }
 
 function summarize(samples) {
-  const remounts = samples.filter((sample, index) => index > 0 && sample.anchorId && sample.anchorId !== samples[index - 1].anchorId).length;
+  const remounts = samples.filter((sample, index) => index > 0 && sample.anchorId && samples[index - 1].anchorId && sample.anchorId !== samples[index - 1].anchorId).length;
+  const texts = samples.map((sample) => sample.text).filter(Boolean);
   return {
     count: samples.length,
+    updates: texts.filter((text, index) => index === 0 || text !== texts[index - 1]).length - (texts.length ? 1 : 0),
+    sawAnchor: texts.some((text) => text.includes("REVIEW_ANCHOR")),
+    sawTail: texts.some((text) => text.includes("尾段")),
+    sawLive: [...new Set(samples.map((sample) => sample.live).filter(Boolean))],
     remounts,
     anchorTop: oscillation(samples, "anchorTop"),
     anchorHeight: oscillation(samples, "anchorHeight"),
     scrollTop: oscillation(samples, "scrollTop", 2),
     scrollHeight: oscillation(samples, "scrollHeight", 2),
-    transform: [...new Set(samples.map((sample) => sample.transform).filter(Boolean))],
-    opacity: [...new Set(samples.map((sample) => sample.opacity).filter(Boolean))],
-    fontSize: [...new Set(samples.map((sample) => sample.fontSize).filter(Boolean))],
-    animation: [...new Set(samples.map((sample) => sample.animation).filter(Boolean))],
-    live: [...new Set(samples.map((sample) => sample.live).filter(Boolean))],
+    transform: [...new Set(samples.flatMap((sample) => sample.transforms || []))],
+    opacity: [...new Set(samples.flatMap((sample) => sample.opacities || []))],
+    animation: [...new Set(samples.flatMap((sample) => sample.animations || []))],
   };
 }
 
-test("OCV5-265 motion: real App WebSocket trajectory, desktop and 390", { timeout: 240000 }, async () => {
+test("OCV5-265 motion review: current-turn prefix, desktop and 390", { timeout: 240000 }, async () => {
   mkdirSync(shots, { recursive: true });
   mkdirSync(assetDir, { recursive: true });
   await build({
@@ -100,7 +100,6 @@ test("OCV5-265 motion: real App WebSocket trajectory, desktop and 390", { timeou
   });
   const cssName = readdirSync(cssDir).find((name) => name.endsWith(".css"));
   writeFileSync(join(assetDir, "styles.css"), readFileSync(join(cssDir, cssName)));
-  console.log("motion-bundle-ready");
 
   const preview = await startPreviewServer(assetDir);
   const browser = await chromium.launch({
@@ -108,7 +107,7 @@ test("OCV5-265 motion: real App WebSocket trajectory, desktop and 390", { timeou
     headless: true,
     args: ["--no-sandbox"],
   });
-  const report = { viewports: [] };
+  const report = { note: "Samples the current-turn REVIEW_ANCHOR, not the previous inventory sentence.", viewports: [] };
   try {
     async function open(width, height) {
       const context = await browser.newContext({
@@ -123,50 +122,63 @@ test("OCV5-265 motion: real App WebSocket trajectory, desktop and 390", { timeou
       await page.goto(preview.url, { waitUntil: "domcontentloaded" });
       await page.getByText("看板已经做好").waitFor();
       await page.waitForFunction(() => !document.body.innerText.includes("未连接"));
-      return { context, page, errors };
-    }
-
-    async function installRecorder(page) {
       await page.evaluate(() => {
-        const state = { samples: [], stopped: false };
-        window.__motionRec = state;
-        const anchor = () => [...document.querySelectorAll("p, div, span")].find((node) => {
-          const text = node.textContent || "";
-          return text.includes("还在，可售合计 128") && text.length < 80;
-        }) || null;
+        const state = { samples: [], stopped: false, seq: 1 };
+        window.__reviewRec = state;
+        window.__reviewAnchor = () => {
+          const roots = [...document.querySelectorAll("[data-testid=process-stage]")].filter((node) => (node.textContent || "").includes("REVIEW_ANCHOR"));
+          const root = roots.at(-1);
+          if (!root) return null;
+          const inner = [...root.querySelectorAll("p, li, div, span")].filter((node) => (node.textContent || "").includes("REVIEW_ANCHOR"));
+          inner.sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
+          return inner[0] || root;
+        };
         const tick = () => {
           if (state.stopped) return;
-          const node = anchor();
-          if (node && !node.dataset.motionId) node.dataset.motionId = `a${state.samples.length}-${node.tagName}`;
+          const node = window.__reviewAnchor();
+          const stage = node?.closest("[data-testid=process-stage]");
+          if (node && !node.dataset.reviewId) node.dataset.reviewId = `r${state.seq++}`;
           const scroller = document.querySelector(".chat-scroll-area");
           const rect = node?.getBoundingClientRect();
-          const style = node ? getComputedStyle(node) : null;
+          const box = scroller instanceof HTMLElement ? scroller.getBoundingClientRect() : null;
+          const chain = [];
+          let cursor = node;
+          while (cursor && chain.length < 6) {
+            const style = getComputedStyle(cursor);
+            chain.push({ transform: style.transform, opacity: style.opacity, animation: style.animationName });
+            if (cursor === scroller) break;
+            cursor = cursor.parentElement;
+          }
           const live = document.querySelector("[data-testid=process-step-live]");
+          const text = (stage?.textContent || node?.textContent || "").replace(/\s+/g, " ").trim();
           state.samples.push({
             t: Math.round(performance.now()),
-            anchorId: node?.dataset.motionId || "",
+            anchorId: node?.dataset.reviewId || "",
+            text: text.slice(0, 180),
             anchorTop: rect ? Math.round(rect.top * 10) / 10 : null,
             anchorHeight: rect ? Math.round(rect.height * 10) / 10 : null,
+            inView: !!(rect && box && rect.height > 8 && rect.top >= box.top - 2 && rect.bottom <= box.bottom + 2 && rect.top < box.bottom - 8),
             scrollTop: scroller instanceof HTMLElement ? Math.round(scroller.scrollTop * 10) / 10 : null,
             scrollHeight: scroller instanceof HTMLElement ? scroller.scrollHeight : null,
-            transform: style?.transform || "",
-            opacity: style?.opacity || "",
-            fontSize: style?.fontSize || "",
-            animation: style?.animationName || "",
+            gap: scroller instanceof HTMLElement ? Math.round(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) : null,
+            transforms: chain.map((item) => item.transform),
+            opacities: chain.map((item) => item.opacity),
+            animations: chain.map((item) => item.animation),
             live: (live?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
           });
           requestAnimationFrame(tick);
         };
         requestAnimationFrame(tick);
       });
-    }
-
-    async function sliceFrom(page, mark) {
-      return page.evaluate((start) => window.__motionRec.samples.slice(start), mark);
+      return { context, page, errors };
     }
 
     async function mark(page) {
-      return page.evaluate(() => window.__motionRec.samples.length);
+      return page.evaluate(() => window.__reviewRec.samples.length);
+    }
+
+    async function sliceFrom(page, start) {
+      return page.evaluate((from) => window.__reviewRec.samples.slice(from), start);
     }
 
     async function release() {
@@ -174,74 +186,166 @@ test("OCV5-265 motion: real App WebSocket trajectory, desktop and 390", { timeou
       assert.equal(response.ok, true);
     }
 
-    async function run(width, height, shotsFor) {
+    async function proveVisible(page, file) {
+      const proof = await page.evaluate(() => {
+        const node = window.__reviewAnchor();
+        const scroller = document.querySelector(".chat-scroll-area");
+        if (!(node instanceof HTMLElement) || !(scroller instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        const measure = () => {
+          const rect = node.getBoundingClientRect();
+          const box = scroller.getBoundingClientRect();
+          return {
+            ok: rect.height > 8 && rect.top >= box.top + 4 && rect.bottom <= box.bottom - 4 && rect.top < box.bottom - 8,
+            top: Math.round(rect.top),
+            bottom: Math.round(rect.bottom),
+            height: Math.round(rect.height),
+            viewTop: Math.round(box.top),
+            viewBottom: Math.round(box.bottom),
+          };
+        };
+        const before = measure();
+        if (!before.ok) {
+          const rect = node.getBoundingClientRect();
+          const box = scroller.getBoundingClientRect();
+          scroller.scrollTop += rect.top - box.top - 80;
+          scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+        }
+        const after = measure();
+        return {
+          ...after,
+          before,
+          nudged: !before.ok,
+          text: (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
+          id: node.dataset.reviewId || "",
+        };
+      });
+      assert.ok(proof.ok, `${file} anchor not in view: ${JSON.stringify(proof)}`);
+      assert.match(proof.text, /REVIEW_ANCHOR/);
+      await page.screenshot({ path: join(shots, file) });
+      return proof;
+    }
+
+    function assertActive(summary, label) {
+      assert.ok(summary.count > 0, `${label} collected no samples`);
+      assert.ok(summary.updates > 0, `${label} update count is 0: ${JSON.stringify(summary)}`);
+      assert.equal(summary.sawAnchor, true, `${label} never saw the current prefix`);
+    }
+
+    async function run(width, height, names) {
       const session = await open(width, height);
       try {
-        await installRecorder(session.page);
         const box = session.page.getByPlaceholder(/对话/);
         await box.click();
-        await box.fill("抖动探针");
+        await box.fill("抖动复核");
         await session.page.getByRole("button", { name: "发送" }).click();
-        await session.page.getByText("MOTION_ANCHOR").waitFor();
+        await session.page.getByTestId("process-stage").filter({ hasText: "REVIEW_ANCHOR" }).waitFor();
+        const dock = session.page.getByTestId("scroll-to-bottom-dock");
+        if (await dock.getAttribute("data-visible") === "true") {
+          await session.page.getByTestId("scroll-to-bottom").click({ force: true });
+          await session.page.waitForTimeout(250);
+        }
         const followMark = await mark(session.page);
-        await session.page.waitForFunction(() => document.body.innerText.includes("尾段6"));
-        await session.page.waitForTimeout(300);
+        await release();
+        await session.page.getByText("尾段6").waitFor();
+        await session.page.waitForTimeout(250);
         const follow = await sliceFrom(session.page, followMark);
-        if (shotsFor.follow) await session.page.screenshot({ path: join(shots, shotsFor.follow) });
+        const followSummary = summarize(follow);
+        assertActive(followSummary, "follow");
+        assert.equal(followSummary.sawTail, true, "follow did not see appended tail text");
+        const followShot = await proveVisible(session.page, names.follow);
 
-        const scroller = session.page.locator(".chat-scroll-area").first();
-        const beforePause = await scroller.evaluate((el) => {
-          el.scrollTop = Math.max(0, el.scrollTop - Math.min(280, el.scrollTop));
-          el.dispatchEvent(new Event("scroll", { bubbles: true }));
-          return el.scrollTop;
+        const pausedAt = await session.page.evaluate(() => {
+          const scroller = document.querySelector(".chat-scroll-area");
+          if (!(scroller instanceof HTMLElement)) return { ok: false, reason: "scroller" };
+          const place = () => {
+            const node = window.__reviewAnchor();
+            if (!(node instanceof HTMLElement)) return { ok: false, reason: "anchor" };
+            const rect = node.getBoundingClientRect();
+            const box = scroller.getBoundingClientRect();
+            const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+            return {
+              ok: rect.height > 8 && rect.height < box.height - 16 && rect.top >= box.top + 4 && rect.bottom <= box.bottom - 4,
+              top: Math.round(rect.top),
+              bottom: Math.round(rect.bottom),
+              height: Math.round(rect.height),
+              viewTop: Math.round(box.top),
+              viewBottom: Math.round(box.bottom),
+              gap: Math.round(gap),
+              scrollTop: Math.round(scroller.scrollTop),
+              text: (node.textContent || "").slice(0, 40),
+            };
+          };
+          let placed = place();
+          if (!placed.ok && typeof placed.top === "number" && typeof placed.viewTop === "number") {
+            scroller.scrollTop += placed.top - placed.viewTop - 88;
+            placed = place();
+          }
+          if (placed.gap < 80 && placed.ok) {
+            scroller.scrollTop = Math.max(0, scroller.scrollTop - 120);
+            placed = place();
+          }
+          scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+          return placed;
         });
+        assert.ok(pausedAt.ok && pausedAt.gap > 40, `could not pause away from the bottom while keeping the prefix: ${JSON.stringify(pausedAt)}`);
         await session.page.waitForTimeout(200);
         const pausedMark = await mark(session.page);
         await release();
-        await session.page.waitForFunction(() => document.body.innerText.includes("尾段10") || document.body.innerText.includes("MOTION_THINK") || !!document.querySelector("[data-testid=process-step-live]"));
-        await session.page.waitForTimeout(400);
-        const paused = await sliceFrom(session.page, pausedMark);
-        const pausedScroll = await scroller.evaluate((el) => el.scrollTop);
-        if (shotsFor.paused) await session.page.screenshot({ path: join(shots, shotsFor.paused) });
-
-        const toolMark = await mark(session.page);
-        await release();
-        await session.page.getByText("MOTION_NEXT").waitFor();
+        await session.page.getByText("尾段10").waitFor();
         await session.page.waitForTimeout(250);
-        const switched = await sliceFrom(session.page, toolMark);
-        if (shotsFor.switched) await session.page.screenshot({ path: join(shots, shotsFor.switched) });
+        const paused = await sliceFrom(session.page, pausedMark);
+        const pausedSummary = summarize(paused);
+        assertActive(pausedSummary, "paused");
+        const pausedShot = await proveVisible(session.page, names.paused);
+        const pausedScroll = await session.page.locator(".chat-scroll-area").first().evaluate((el) => el.scrollTop);
 
-        const toggle = session.page.getByTestId("process-detail-toggle").last();
-        if (await toggle.count()) {
-          await toggle.click();
-          await session.page.waitForTimeout(200);
-        }
-        if (shotsFor.expanded) await session.page.screenshot({ path: join(shots, shotsFor.expanded) });
-        const expandedCommand = await session.page.locator("body").innerText();
-
-        const finalMark = await mark(session.page);
+        const expandMark = await mark(session.page);
         await release();
-        await session.page.getByText("MOTION_FINAL").waitFor();
-        await session.page.waitForTimeout(300);
-        const finished = await sliceFrom(session.page, finalMark);
-        if (shotsFor.finished) await session.page.screenshot({ path: join(shots, shotsFor.finished) });
+        await session.page.getByText("REVIEW_THINK").waitFor({ timeout: 8_000 }).catch(() => {});
+        const stageToggle = session.page.getByTestId("process-stage-toggle").filter({ hasText: "REVIEW_ANCHOR" });
+        if (await stageToggle.count()) await stageToggle.click();
+        await session.page.getByTestId("process-stage").filter({ hasText: "REVIEW_ANCHOR" }).waitFor();
+        await session.page.waitForTimeout(200);
+        const opened = await sliceFrom(session.page, expandMark);
+        const openedShot = await proveVisible(session.page, names.expanded);
+        const pinnedId = openedShot.id;
+
+        const metaMark = await mark(session.page);
+        await release();
+        await session.page.waitForTimeout(700);
+        const meta = await sliceFrom(session.page, metaMark);
+        const metaSummary = summarize(meta);
+        assert.ok(metaSummary.count > 0, "meta phase collected no samples");
+        assert.ok(metaSummary.sawLive.length > 0 || metaSummary.updates > 0, `meta phase saw neither a live line nor a text update: ${JSON.stringify(metaSummary)}`);
+        assert.equal(metaSummary.sawAnchor, true, "expanded prefix disappeared during tool metadata updates");
+        const metaShot = await proveVisible(session.page, names.meta);
+        assert.equal(metaShot.id, pinnedId, `prefix remounted while the stage stayed open: ${pinnedId} -> ${metaShot.id}`);
+
+        const switchMark = await mark(session.page);
+        await release();
+        await session.page.getByText("REVIEW_NEXT").waitFor();
+        await session.page.waitForTimeout(250);
+        const switched = await sliceFrom(session.page, switchMark);
+        const switchSummary = summarize(switched);
+        assert.ok(switchSummary.count > 0, "switch phase collected no samples");
+        const switchShot = names.switched ? await proveVisible(session.page, names.switched).catch((error) => ({ ok: false, error: String(error) })) : null;
+
         assert.equal(session.errors.length, 0, session.errors.join("\n"));
-        const pausedLive = paused.map((sample) => sample.live).join("\n");
         return {
           width,
           height,
-          beforePause,
+          pausedAt,
           pausedScroll,
-          leakedJob: /dlgjob-motion-SECRET|delegate-wait/.test(pausedLive),
-          expandedHasCommand: expandedCommand.includes("dlgjob-motion-SECRET"),
-          follow: summarize(follow),
-          paused: summarize(paused),
-          switched: summarize(switched),
-          finished: summarize(finished),
+          follow: followSummary,
+          paused: pausedSummary,
+          openedUpdates: summarize(opened).updates,
+          meta: metaSummary,
+          switched: switchSummary,
+          shots: { follow: followShot, paused: pausedShot, expanded: openedShot, meta: metaShot, switched: switchShot },
           samples: {
-            follow: follow.filter((_, index) => index % 4 === 0).slice(0, 40),
-            paused: paused.filter((_, index) => index % 4 === 0).slice(0, 40),
-            switched: switched.filter((_, index) => index % 4 === 0).slice(0, 40),
+            follow: follow.filter((_, index) => index % 3 === 0).slice(0, 24),
+            paused: paused.filter((_, index) => index % 3 === 0).slice(0, 24),
+            meta: meta.filter((_, index) => index % 3 === 0).slice(0, 24),
           },
         };
       } finally {
@@ -250,27 +354,28 @@ test("OCV5-265 motion: real App WebSocket trajectory, desktop and 390", { timeou
     }
 
     report.viewports.push(await run(1280, 1000, {
-      follow: "ocv5-265-motion-follow-desktop.png",
-      paused: "ocv5-265-motion-paused-desktop.png",
-      switched: "ocv5-265-motion-switch-desktop.png",
-      expanded: "ocv5-265-motion-expand-desktop.png",
-      finished: "ocv5-265-motion-final-desktop.png",
+      follow: "ocv5-265-motion-review-follow-desktop.png",
+      paused: "ocv5-265-motion-review-paused-desktop.png",
+      expanded: "ocv5-265-motion-review-expanded-desktop.png",
+      meta: "ocv5-265-motion-review-meta-desktop.png",
+      switched: "ocv5-265-motion-review-switch-desktop.png",
     }));
     report.viewports.push(await run(390, 844, {
-      follow: "ocv5-265-motion-follow-390.png",
-      paused: "ocv5-265-motion-paused-390.png",
-      finished: "ocv5-265-motion-final-390.png",
+      follow: "ocv5-265-motion-review-follow-390.png",
+      paused: "ocv5-265-motion-review-paused-390.png",
+      expanded: "ocv5-265-motion-review-expanded-390.png",
+      meta: "ocv5-265-motion-review-meta-390.png",
+      switched: "ocv5-265-motion-review-switch-390.png",
     }));
-    writeFileSync(join(shots, "ocv5-265-motion-trajectory.json"), JSON.stringify(report, null, 2));
+    writeFileSync(join(shots, "ocv5-265-motion-review-trajectory.json"), JSON.stringify(report, null, 2));
     console.log(JSON.stringify(report.viewports.map((item) => ({
       width: item.width,
-      leakedJob: item.leakedJob,
-      expandedHasCommand: item.expandedHasCommand,
+      pausedAt: item.pausedAt,
       follow: item.follow,
       paused: item.paused,
+      meta: item.meta,
       switched: item.switched,
-      finished: item.finished,
-      scroll: [item.beforePause, item.pausedScroll],
+      shots: item.shots,
     }))));
   } finally {
     await browser.close();

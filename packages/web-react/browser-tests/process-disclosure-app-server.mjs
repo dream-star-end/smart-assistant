@@ -741,14 +741,21 @@ async function playPolishTurn(emit, remember, clientMessageId) {
   });
 }
 
-async function playMotionTurn(emit, remember, clientMessageId) {
-  const stageId = `motion-stage-${clientMessageId}`;
-  const bashId = `motion-bash-${clientMessageId}`;
-  const nextId = `motion-next-${clientMessageId}`;
-  const answerId = `motion-answer-${clientMessageId}`;
-  const prefix = `MOTION_ANCHOR 已显示的段落保持不动。\n\n${"稳定行内容。".repeat(24)}`;
-  let stageText = prefix;
-  await emit([{ kind: "text", text: prefix, messageId: stageId }]);
+async function playReviewTurn(emit, remember, clientMessageId) {
+  const stageId = `review-stage-${clientMessageId}`;
+  const bashId = `review-bash-${clientMessageId}`;
+  const nextId = `review-next-${clientMessageId}`;
+  const prefix = "REVIEW_ANCHOR 当前轮已显示的前缀保持不动。";
+  let stageText = `${prefix}\n\n${"稳定行。".repeat(6)}`;
+  // A bare assistant turn is a plain answer, not a process stage. Thinking
+  // opens the current-turn shell so the prefix stays inside it.
+  await emit([{
+    kind: "thinking",
+    text: "REVIEW_OPEN 先打开当前过程。",
+    messageId: `review-open-${clientMessageId}`,
+  }]);
+  await emit([{ kind: "text", text: stageText, messageId: stageId }]);
+  await waitFixtureStep();
   for (let i = 1; i <= 6; i += 1) {
     const piece = ` 尾段${i}`;
     stageText += piece;
@@ -760,18 +767,32 @@ async function playMotionTurn(emit, remember, clientMessageId) {
     stageText += piece;
     await emit([{ kind: "text", text: piece, messageId: stageId }]);
   }
+  await waitFixtureStep();
   await emit([{
     kind: "thinking",
-    text: "MOTION_THINK 正文不变，只更新思考。",
-    messageId: `motion-think-${clientMessageId}`,
+    text: "REVIEW_THINK 正文前缀不变。",
+    messageId: `review-think-${clientMessageId}`,
   }]);
   const commands = [
-    "oc-memory delegate-wait dlgjob-motion-SECRET",
-    "oc-memory delegate-wait dlgjob-motion-SECRET --note view_image",
-    "oc-memory delegate-wait dlgjob-motion-SECRET --note view_image /home/agent/.openclaude/generated/not-shown.png",
-    "oc-memory delegate-wait dlgjob-motion-SECRET --note view_image /home/agent/.openclaude/generated/not-shown.png AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "oc-memory delegate-wait dlgjob-review-SECRET",
+    "oc-memory delegate-wait dlgjob-review-SECRET --note view_image",
   ];
   for (const command of commands) {
+    await emit([{
+      kind: "tool_use",
+      blockId: bashId,
+      toolName: "Bash",
+      messageId: bashId,
+      partial: false,
+      inputJson: { command },
+    }]);
+  }
+  await waitFixtureStep();
+  const grown = [
+    "oc-memory delegate-wait dlgjob-review-SECRET --note view_image /home/agent/.openclaude/generated/not-shown.png",
+    "oc-memory delegate-wait dlgjob-review-SECRET --note view_image /home/agent/.openclaude/generated/not-shown.png AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  ];
+  for (const command of grown) {
     await emit([{
       kind: "tool_use",
       blockId: bashId,
@@ -788,26 +809,22 @@ async function playMotionTurn(emit, remember, clientMessageId) {
     toolUseBlockId: bashId,
     toolName: "Bash",
     isError: false,
-    output: "MOTION_TOOL_SECRET",
+    output: "REVIEW_TOOL_SECRET",
   }]);
-  const next = "MOTION_NEXT 阶段已经切换。";
+  const next = "REVIEW_NEXT 阶段已经切换。";
   await emit([{ kind: "text", text: next, messageId: nextId }]);
-  await waitFixtureStep();
-  const answer = "MOTION_FINAL 这是最终回答，不再放在过程里。";
-  await emit([{ kind: "text", text: answer, messageId: answerId }]);
   remember(stageId, "assistant", stageText, { _clientMessageId: clientMessageId });
-  remember(`motion-think-${clientMessageId}`, "thinking", "MOTION_THINK 正文不变，只更新思考。", {
+  remember(`review-think-${clientMessageId}`, "thinking", "REVIEW_THINK 正文前缀不变。", {
     _clientMessageId: clientMessageId,
   });
   remember(bashId, "tool", "终端", {
     _clientMessageId: clientMessageId,
     toolName: "Bash",
-    inputJson: { command: commands[commands.length - 1] },
+    inputJson: { command: grown[grown.length - 1] },
     _completed: true,
-    output: "MOTION_TOOL_SECRET",
+    output: "REVIEW_TOOL_SECRET",
   });
   remember(nextId, "assistant", next, { _clientMessageId: clientMessageId });
-  remember(answerId, "assistant", answer, { _clientMessageId: clientMessageId });
 }
 
 async function playPhasedTurn(emit, remember, clientMessageId) {
@@ -977,8 +994,8 @@ async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
   };
   remember(clientMessageId, "user", text, { status: "replied" });
 
-  if (text.includes("抖动探针")) {
-    await playMotionTurn(emit, remember, clientMessageId);
+  if (text.includes("抖动复核")) {
+    await playReviewTurn(emit, remember, clientMessageId);
   } else if (text.includes("分段过程")) {
     await playPhasedTurn(emit, remember, clientMessageId);
   } else if (text.includes("排版对照")) {

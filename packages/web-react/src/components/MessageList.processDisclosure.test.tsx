@@ -1319,6 +1319,18 @@ describe("MessageList Manus 过程披露", () => {
       toolName: "Bash",
       inputJson: { command: "echo view_image /tmp/a.png imagegen dlgjob-fake" },
     }, "工具执行中", /view_image|imagegen|dlgjob|\/tmp/);
+    expectPhrase("quoted-semi", {
+      toolName: "Bash",
+      inputJson: { command: "printf '%s' '; oc-vision understand fake.png'" },
+    }, "工具执行中", /正在识别图片|fake\.png|understand|oc-vision/);
+    expectPhrase("quoted-wait", {
+      toolName: "Bash",
+      inputJson: { command: "printf '%s' '; oc-memory delegate-wait dlgjob-quoted'" },
+    }, "工具执行中", /等待子任务完成|dlgjob/);
+    expectPhrase("and-chain", {
+      toolName: "Bash",
+      inputJson: { command: "cd /tmp && oc-vision understand fake.png" },
+    }, "工具执行中", /正在识别图片|fake\.png|understand/);
     expectPhrase("py", {
       toolName: "Bash",
       inputJson: { command: "python build.py --output /tmp/view_image.png --note imagegen" },
@@ -1421,6 +1433,22 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
     expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+
+    cleanup();
+    const wrapped = "/bin/bash -lc 'oc-memory delegate-wait dlgjob-wrap-SECRET'";
+    renderList([
+      user,
+      row("wrap-audit", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: wrapped },
+        _completed: false,
+      }),
+    ], { sending: true });
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
+    expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/\/bin\/bash|dlgjob/);
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByTestId("process-raw-command").textContent ?? "").toBe(wrapped);
   });
 
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {
