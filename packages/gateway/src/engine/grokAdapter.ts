@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { synthesizeEmptyFailedToolPreview, type GoalStateSnapshot, type OutboundContentBlock } from '@openclaude/protocol'
@@ -57,6 +57,24 @@ const GROK_FAST_UPSTREAM_MODEL = 'grok-4.7-build-fast'
 
 function grokUpstreamModel(model: string | undefined): string {
   return model === 'grok-build-fast' ? GROK_FAST_UPSTREAM_MODEL : GROK_UPSTREAM_MODEL
+}
+
+/**
+ * Fast 不和标准档共用 GROK_HOME。标准档的常驻 leader 会把 --model 当成
+ * 切模型，而它内存里的清单要等自己刷新后才认得 grok-4.7-build-fast，
+ * 在那之前固定回 unknown model id。独立 home 会自己拉一份模型清单再启动。
+ */
+function grokRuntimeHome(baseHome: string, model: string | undefined): string {
+  if (model !== 'grok-build-fast') return baseHome
+  const home = join(baseHome, 'fast')
+  mkdirSync(home, { recursive: true, mode: 0o700 })
+  const config = join(baseHome, 'config.toml')
+  if (existsSync(config)) {
+    const target = join(home, 'config.toml')
+    writeFileSync(target, readFileSync(config), { mode: 0o600 })
+    chmodSync(target, 0o600)
+  }
+  return home
 }
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
@@ -547,7 +565,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_MODELS_LIST_URL: `${route.baseUrl.replace(/\/$/, '')}/models`,
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
-      GROK_HOME: platform.grokHome,
+      GROK_HOME: grokRuntimeHome(platform.grokHome, this.currentModel),
       ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
@@ -1287,13 +1305,18 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   waitForOutputDrain(): Promise<void> { return this.drain }
   readCompactionHandoffSince(compactStartedAt: number): Promise<NativeModelHandoffArtifact> {
     if (!this.nativeId) return Promise.reject(new Error('GROK_COMPACTION_SESSION_NOT_READY'))
-    return readLatestGrokNativeHandoff(prepareGrokHome(), this.nativeId, compactStartedAt)
+    return readLatestGrokNativeHandoff(grokRuntimeHome(prepareGrokHome(), this.currentModel), this.nativeId, compactStartedAt)
   }
 
   get nativeSessionId(): string | null { return this.nativeId }
   clearSessionId(): void { this.nativeId = null }
   setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
-  setModel(model: string | undefined): void { this.currentModel = model }
+  setModel(model: string | undefined): void {
+    const nextFast = model === 'grok-build-fast'
+    const currentFast = this.currentModel === 'grok-build-fast'
+    if (nextFast !== currentFast) this.nativeId = null
+    this.currentModel = model
+  }
   get model(): string | undefined { return this.currentModel }
   setEffortLevel(level: string | undefined): void { this.currentEffort = level }
   get effortLevel(): string | undefined { return this.currentEffort }
