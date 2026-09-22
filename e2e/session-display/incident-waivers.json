@@ -284,6 +284,12 @@
       "reason": "Per-launch Grok consult token file. Not a production incident; no data loss or billing change.",
       "approvedBy": "agent:main OCV5-266",
       "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "811993846bad026ad8548c59fb76546e7168f8a3",
+      "reason": "Per-launch Grok MCP config. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
     }
   ]
 }
