@@ -34,7 +34,7 @@ describe('grok platform projection', () => {
       assert.ok(projected.advertisedMcpTools.includes('skill_search'))
       assert.ok(projected.advertisedMcpTools.includes('present_task_approval'))
       assert.ok(projected.delegateContextFile)
-      const raw = readFileSync(path.join(projected.grokHome, 'config.toml'), 'utf8')
+      const raw = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
       assert.match(raw, /\[shell_environment_policy\]/)
       assert.match(raw, /\[mcp_servers\."openclaude-memory"\]/)
       assert.equal(raw.includes('bearer-must-not-enter-config'), false)
@@ -87,6 +87,10 @@ describe('grok platform projection', () => {
       assert.notEqual(other.delegateContextFile, firstPath)
       assert.equal(readFileSync(firstPath, 'utf8').trim(), firstToken)
       assert.equal(inspectConsultTurnToken(readFileSync(firstPath, 'utf8').trim())?.claims.sessionKey, 'agent:main:webchat:dm:grok-advisor')
+      const firstConfig = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
+      assert.match(firstConfig, /grok-advisor/)
+      assert.equal(firstConfig.includes(other.delegateContextFile!), false)
+      assert.equal(readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8'), firstConfig)
     } finally {
       rmSync(home, { recursive: true, force: true })
       restore('OPENCLAUDE_HOME', oldHome)
@@ -105,7 +109,7 @@ describe('grok platform projection', () => {
         gatewayToken: '',
         delegationDepth: 0,
       })
-      const raw = readFileSync(path.join(projected.grokHome, 'config.toml'), 'utf8')
+      const raw = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
       assert.equal(projected.advertisedMcpTools.length, 0)
       assert.equal(projected.delegateContextFile, null)
       assert.equal(raw.includes('mcp_servers'), false)
