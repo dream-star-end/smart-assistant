@@ -107,7 +107,7 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
 const CCB_CLI_VERSION = "2.8.4";
 const CCB_SDK_VERSION = "0.81.0";
 /** 与 deploy/v5-selfhost/runtime-build.env OC_OFFICIAL_CLAUDE_VERSION 对齐。 */
-export const OFFICIAL_CC_CLI_VERSION = "2.1.278";
+export const OFFICIAL_CC_CLI_VERSION = "2.1.280";
 
 export function isOfficialClaudeCodeEnabled(): boolean {
   return process.env.OC_CCB_OFFICIAL_CC === "1";
@@ -237,7 +237,7 @@ export function isSupportedProxyRegion(region: unknown): region is string {
  *
  * 真实格式(claude-code-best/src/utils/http.ts::getUserAgent):
  *   "claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)"
- *   例:"claude-cli/2.1.278 (external, cli)"(官方 CC)或
+ *   例:"claude-cli/2.1.280 (external, cli)"(官方 CC)或
  *       "claude-cli/2.8.4 (external, cli)"(CCB fork)
  *
  * 注意:不再是 stainless 默认 UA(`anthropic-ai-claude-code/...`)。真实 CLI 在
