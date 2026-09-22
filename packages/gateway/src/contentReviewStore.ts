@@ -31,6 +31,8 @@ export interface ContentReviewStore {
   insert(row: NewContentReview): ContentReviewRecord
   markAlerted(id: number): void
   list(limit: number): ContentReviewRecord[]
+  get(reviewId: number): ContentReviewRecord | null
+  markNotified(reviewId: number): void
   ban(reviewId: number, actor: string): ContentReviewRecord | null
   isBanned(userId: string, sessionKey: string): boolean
   close(): void
@@ -115,6 +117,13 @@ export function openContentReviewStore(dbPath: string): ContentReviewStore {
     list(limit) {
       const n = Math.max(1, Math.min(200, limit))
       return (listStmt.all(n) as SqlRow[]).map(mapRow)
+    },
+    get(reviewId) {
+      const row = byId.get(reviewId)
+      return row ? mapRow(row) : null
+    },
+    markNotified(reviewId) {
+      banReview.run(Date.now(), reviewId)
     },
     ban(reviewId, actor) {
       const current = byId.get(reviewId) as SqlRow | undefined

@@ -179,7 +179,7 @@ export async function runUserContentReview(input: {
           '',
           record.excerpt,
           '',
-          '未拦截本条消息。确认后可在管理页封禁该会话。',
+          '未拦截本条消息。确认后可发送站内信并记一次违规。累计 3 次封禁账号。',
         ].join('\n'),
       }
       await alerter(event)

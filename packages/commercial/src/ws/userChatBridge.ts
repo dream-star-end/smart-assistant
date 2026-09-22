@@ -1,4 +1,4 @@
-import { inboundSessionKey, isContentReviewSessionBanned, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
+import { inboundSessionKey, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -5740,11 +5740,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 agentId: effectiveFrameAgentId ?? "main",
               })
               const reviewUserId = uid.toString()
-              if (reviewSessionKey && isContentReviewSessionBanned(reviewUserId, reviewSessionKey)) {
-                rejectPromptQueueDispatch("SESSION_BANNED")
-                sendErrorFrame(userWs, "SESSION_BANNED", "这个会话已被管理员封禁", inboundTurnIdentityForFrame)
-                return
-              }
               const reviewText = reviewFrame.content?.text
               if (typeof reviewText === "string" && reviewText.trim()) {
                 observeUserContentReview({

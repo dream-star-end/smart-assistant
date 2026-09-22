@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 
 import { openContentReviewStore, setContentReviewStoreForTests } from '../contentReviewStore.js'
+import { appealStrikeId, shouldBanForStrikes, violationInbox } from '../contentReviewNotice.js'
 
 import {
   CONTENT_REVIEW_FLAG,
@@ -113,5 +114,13 @@ describe('jev content review', () => {
     await flushContentReviewForTests()
     assert.equal(alerts, 0)
     assert.equal(store.list(20).some((row) => row.choice === 'none'), true)
+  })
+
+  it('counts the third open strike as an account ban and tags the appeal', () => {
+    assert.equal(shouldBanForStrikes(2), false)
+    assert.equal(shouldBanForStrikes(3), true)
+    const notice = violationInbox({ strikeId: '41', excerpt: 'sample', activeCount: 3 })
+    assert.equal(appealStrikeId(notice.bodyMd), '41')
+    assert.match(notice.title, /封禁/)
   })
 })

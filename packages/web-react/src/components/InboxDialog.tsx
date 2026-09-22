@@ -372,6 +372,7 @@ export function InboxDialog({
                 <InboxItem
                   key={m.id}
                   message={m}
+                  auth={auth}
                   expanded={expandedId === m.id}
                   onToggle={() => toggle(m)}
                 />
@@ -415,12 +416,19 @@ export function InboxDialog({
 }
 
 /** 单条卡片：摘要态轻扫，点击后在卡内展开只读 Markdown / 图片 / 图表。 */
+function appealStrikeId(body: string): string | null {
+  const match = /<!--\s*oc-appeal:(\d+)\s*-->/.exec(body);
+  return match?.[1] ?? null;
+}
+
 function InboxItem({
   message: m,
+  auth,
   expanded,
   onToggle,
 }: {
   message: InboxMessage;
+  auth: AuthSession | null;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -436,6 +444,9 @@ function InboxItem({
     () => /```(?:chart|mermaid)\b/i.test(m.body_md),
     [m.body_md],
   );
+  const strikeId = appealStrikeId(m.body_md);
+  const [appealState, setAppealState] = useState<"idle" | "sending" | "sent">("idle");
+  const [appealErr, setAppealErr] = useState<string | null>(null);
 
   return (
     <li
@@ -521,6 +532,33 @@ function InboxItem({
           <Markdown signMedia readOnly>
             {body}
           </Markdown>
+          {strikeId && auth ? (
+            <div className="mt-3">
+              {appealState === "sent" ? (
+                <p className="text-caption text-muted">申诉已提交，等待审核。</p>
+              ) : (
+                <Button
+                  disabled={appealState === "sending"}
+                  onClick={() => {
+                    const statement = window.prompt("请填写申诉说明") ?? "";
+                    if (!statement.trim()) return;
+                    setAppealState("sending");
+                    setAppealErr(null);
+                    void api
+                      .appealContentStrike(auth, strikeId, statement.trim())
+                      .then(() => setAppealState("sent"))
+                      .catch((err: unknown) => {
+                        setAppealState("idle");
+                        setAppealErr(apiErrorMessage(err));
+                      });
+                  }}
+                >
+                  申诉
+                </Button>
+              )}
+              {appealErr ? <p className="mt-2 text-caption text-danger">{appealErr}</p> : null}
+            </div>
+          ) : null}
         </div>
       )}
     </li>
