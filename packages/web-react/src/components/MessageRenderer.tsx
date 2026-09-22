@@ -8,6 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
+import { ProcessDisclosure, isFoldableWorkRole, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
 import {
   memo,
@@ -740,7 +741,7 @@ function rowHeightBucket(sessionId: string | undefined): Map<string, number> {
   return created;
 }
 
-type RenderItem =
+type LeafRenderItem =
   | {
       kind: "single";
       m: ChatMessage;
@@ -758,6 +759,93 @@ type RenderItem =
       idx: number;
       tokenUsage?: DisplayTokenUsage;
     };
+
+type RenderItem = LeafRenderItem | {
+  kind: "process"; key: string; members: ChatMessage[]; items: LeafRenderItem[]; active: boolean;
+};
+function itemMessages(item: LeafRenderItem): ChatMessage[] {
+  return item.kind === "single" ? [item.m] : item.members;
+}
+
+/**
+ * Visible answer ids for disclosure. `finals` is the settled last assistant
+ * body. While the current turn is still streaming, that flag is provisional:
+ * the tail text stays inside the process group so the group key (first work
+ * row) does not change on the next token. An empty deferred assistant that is
+ * the last assistant of its turn is the answer locator and stays outside.
+ */
+function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
+  const ids = new Set<string>();
+  const turnStart = currentTurnStartIndex(messages);
+  for (let i = 0; i < messages.length; i++) {
+    if (!finals[i]) continue;
+    if (sending && i >= turnStart) continue;
+    const id = messages[i]?.id;
+    if (id) ids.add(id);
+  }
+  const lastAssistant = new Map<string, number>();
+  let segment = "head";
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!message) continue;
+    if (message.role === "user") {
+      segment = message.id;
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    lastAssistant.set(message._clientMessageId || segment, i);
+  }
+  for (const index of lastAssistant.values()) {
+    const message = messages[index];
+    if (!message?._payloadDeferred || !message.id) continue;
+    if (sending && index >= turnStart) continue;
+    ids.add(message.id);
+  }
+  return ids;
+}
+
+/** Contiguous, owner/page-bounded display groups; never move an actionable row. */
+function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
+  const out: RenderItem[] = [];
+  const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const activeStart = currentTurnStartIndex(messages);
+  const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
+  let owner = "head";
+  let group: Extract<RenderItem, { kind: "process" }> | undefined;
+  let boundary = "";
+  const seal = (current: Extract<RenderItem, { kind: "process" }> | undefined) => {
+    if (!current) return;
+    const work = current.members.find(isFoldableWorkRole);
+    current.key = `process:${boundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
+    if (!work) {
+      const index = out.indexOf(current);
+      if (index >= 0) out.splice(index, 1, ...current.items);
+    }
+  };
+  for (const item of items) {
+    const rows = itemMessages(item);
+    if (rows[0]?.role === "user") owner = rows[0].id;
+    const nextBoundary = `${rows[0]?._clientMessageId || owner}:${tapeRenderPageKey(rows[0])}`;
+    const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id)));
+    if (!fold) {
+      seal(group);
+      group = undefined;
+      out.push(item);
+      continue;
+    }
+    if (!group || boundary !== nextBoundary) {
+      seal(group);
+      group = { kind: "process", key: "", members: [], items: [], active: false };
+      boundary = nextBoundary;
+      out.push(group);
+    }
+    group.items.push(item);
+    group.members.push(...rows);
+    if (rows.some((message) => activeIds.has(message.id))) group.active = true;
+  }
+  seal(group);
+  return out;
+}
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
   if (!message) return "";
@@ -803,7 +891,7 @@ function coalesceTeam(
   start: number,
   sending: boolean,
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot },
-): RenderItem[] {
+): LeafRenderItem[] {
   const total = messages.length;
   const slice = messages.slice(start);
   // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1;
@@ -888,7 +976,7 @@ function coalesceTeam(
       teamCount.set(k, (teamCount.get(k) ?? 0) + 1);
     }
   }
-  const items: RenderItem[] = [];
+  const items: LeafRenderItem[] = [];
   const emittedTeam = new Set<string>();
   // 连续 thinking 行合并:被吸收进某组的 thinking 行(首条除外)记入此集,外层循环跳过它们。
   const consumedThinking = new Set<number>();
@@ -1032,6 +1120,7 @@ function defaultTailStart(length: number): number {
 
 function renderItemKey(item: RenderItem): string {
   try {
+    if (item.kind === "process") return item.key;
     if (item.kind === "single") {
       return timelineMessageKey(item.m);
     }
@@ -1105,7 +1194,18 @@ type FindPinState = {
   gen: number;
   renderIndex: number;
   renderKey: string;
+  /** Timeline key of the matched message. Equals renderKey for a single row. */
+  memberKey?: string;
 };
+
+function pinnedFindElement(scroller: HTMLElement, pin: FindPinState): HTMLElement | null {
+  if (pin.memberKey) {
+    const member = scroller.querySelector(`[data-find-member="${escapeFindSelector(pin.memberKey)}"]`);
+    if (member instanceof HTMLElement) return member;
+  }
+  const row = scroller.querySelector(`[data-chat-virtual-key="${escapeFindSelector(pin.renderKey)}"]`);
+  return row instanceof HTMLElement ? row : null;
+}
 
 function lastUserItemIndex(items: RenderItem[]): number {
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -1141,6 +1241,7 @@ export type MessageListArchive = {
 };
 
 export function MessageList({
+  processDisclosure = false,
   messages,
   sending,
   liveTurnUsage,
@@ -1159,6 +1260,8 @@ export function MessageList({
   followBottomRef,
   find,
 }: {
+  /** Main chat uses result-first presentation; diagnostics may retain raw rows. */
+  processDisclosure?: boolean;
   messages: ChatMessage[];
   sending: boolean;
   /** Active browser turn's live token display; estimates are explicitly marked. */
@@ -1203,6 +1306,12 @@ export function MessageList({
   /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
   find?: { onClose: () => void };
 }) {
+  // MessageList owns expansion so virtual unmounts and live→history updates cannot reset user intent.
+  const [disclosureState, setDisclosureState] = useState<{ session?: string; values: Record<string, boolean> }>({ values: {} });
+  const disclosureValues = disclosureState.session === sessionId ? disclosureState.values : {};
+  const setDisclosure = (key: string, open: boolean) => setDisclosureState(previous => ({
+    session: sessionId, values: { ...(previous.session === sessionId ? previous.values : {}), [key]: open },
+  }));
   const pagingOwnerRef = useRef<{
     generation: string;
     controller: UserUpwardPagingController;
@@ -1288,7 +1397,7 @@ export function MessageList({
   useEffect(() => {
     const pin = findPinRef.current;
     if (!pin) return;
-    const stillHit = findMatchesList.some((match) => match.key === pin.renderKey);
+    const stillHit = findMatchesList.some((match) => match.key === (pin.memberKey ?? pin.renderKey));
     if (!stillHit) bumpFindGeneration();
   }, [findMatchesList, bumpFindGeneration]);
   useEffect(() => {
@@ -1335,8 +1444,7 @@ export function MessageList({
     const tick = () => {
       frame = 0;
       if (findGenRef.current !== gen || findPinRef.current?.gen !== gen) return;
-      const esc = escapeFindSelector(pin.renderKey);
-      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      const el = pinnedFindElement(scroller, pin);
       if (el instanceof HTMLElement) {
         const row = el.getBoundingClientRect();
         follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
@@ -1352,7 +1460,7 @@ export function MessageList({
                 if (left <= 0 || findGenRef.current !== gen) return;
                 requestAnimationFrame(() => {
                   if (findGenRef.current !== gen) return;
-                  const node = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+                  const node = pinnedFindElement(scroller, pin);
                   if (node instanceof HTMLElement) {
                     const next = node.getBoundingClientRect();
                     follow.correctTo?.(scroller, scroller.scrollTop + (next.top - findViewTop(scroller)));
@@ -1931,6 +2039,7 @@ export function MessageList({
       idx: absIdx,
     }));
   }
+  if (processDisclosure) renderItems = discloseProcess(renderItems as LeafRenderItem[], renderableMessages, ratingFinal, sending);
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -1949,9 +2058,14 @@ export function MessageList({
   visibleCountRef.current = visibleItems.length;
   visibleKeysRef.current = visibleItems.map(itemKey);
   if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
-    eagerPayloadKeysRef.current = new Set(
-      visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey),
-    );
+    const eager = new Set(visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey));
+    for (const item of visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS)) {
+      if (item.kind !== "process") continue;
+      for (const message of item.members) {
+        if (message._payloadDeferred) eager.add(message._timelineUnitKey ?? message.id);
+      }
+    }
+    eagerPayloadKeysRef.current = eager;
     eagerMediaKeysRef.current = new Set(
       visibleItems.slice(-EAGER_MEDIA_TAIL_ITEMS).map(itemKey),
     );
@@ -2055,7 +2169,36 @@ export function MessageList({
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
 
-  const renderItem = (it: RenderItem) => {
+  const renderItem = (it: RenderItem): ReactNode => {
+    if (it.kind === "process") {
+      const sections = processSections(it.items, itemMessages, renderItemKey);
+      const needle = findQuery.trim().toLowerCase();
+      const sectionHit = (section: { messages: ChatMessage[]; narrative: boolean }) =>
+        !!needle && section.messages.some((message) =>
+          (message.role === "assistant" || message.role === "user") &&
+          (message.text ?? "").toLowerCase().includes(needle)
+        );
+      const eager = eagerPayloadKeysRef.current?.has(it.key) === true
+        || it.members.some((message) => message._payloadDeferred && eagerPayloadKeysRef.current?.has(timelineMessageKey(message)));
+      return (
+        <ProcessDisclosure
+          sections={sections}
+          active={it.active}
+          open={sections.some(sectionHit) || disclosureValues[it.key] === true}
+          setOpen={(open) => setDisclosure(it.key, open)}
+          detailOpen={(key) => {
+            if (disclosureValues[`detail:${key}`] === true) return true;
+            const section = sections.find((candidate) => candidate.key === key);
+            return !!section && !section.narrative && sectionHit(section);
+          }}
+          setDetailOpen={(key, open) => setDisclosure(`detail:${key}`, open)}
+          renderItem={renderItem}
+          keyOf={renderItemKey}
+          messagesOf={itemMessages}
+          eagerDeferred={eager}
+        />
+      );
+    }
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
       const placeholderSig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
@@ -2237,7 +2380,8 @@ export function MessageList({
     findMatchesList.length === 0
       ? -1
       : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
-  const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const findLookup = findLookupItems(renderItems);
+  const findCurrentTarget = findCurrent >= 0 ? locateFindMatch(findLookup, findMatchesList[findCurrent]) : null;
   const jumpTo = (match: FindMatch) => {
     const follow = followBottomRef;
     const scroller = scrollParent;
@@ -2257,11 +2401,10 @@ export function MessageList({
       startOverrideRef.current = target.renderIndex;
       setWindowVersion((value) => value + 1);
     }
-    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey };
+    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey, memberKey: target.memberKey };
     findPinRef.current = pin;
     setFindPin(pin);
-    const esc = escapeFindSelector(target.renderKey);
-    const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+    const el = pinnedFindElement(scroller, pin);
     if (el instanceof HTMLElement) {
       const row = el.getBoundingClientRect();
       follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
@@ -2399,6 +2542,8 @@ export function MessageList({
       ) : null}
       {paintedItems.map((item, paintedIndex) => {
         const key = itemKey(item);
+        const findCurrentHere = findCurrentTarget?.renderKey === key;
+        const findRowHit = findLookup.some((entry) => entry.key === key && entry.memberKeys.some((member) => findHitKeys.has(member)));
         const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
         const visibleIndex = paintStart + paintedIndex;
         const liveRow =
@@ -2421,11 +2566,11 @@ export function MessageList({
                 liveRow
                   ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
                   : "chat-virtual-item chat-timeline-row",
-                find && findCurrentKey === key && "ring-1 ring-accent/60",
-                find && findCurrentKey !== key && findHitKeys.has(key) && "bg-accent-soft/30",
+                find && findCurrentHere && "ring-1 ring-accent/60",
+                find && !findCurrentHere && findRowHit && "bg-accent-soft/30",
               )}
               data-chat-virtual-key={key}
-              data-find-current={find && findCurrentKey === key ? "" : undefined}
+              data-find-current={find && findCurrentHere ? "" : undefined}
               style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}

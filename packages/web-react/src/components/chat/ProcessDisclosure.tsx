@@ -1,0 +1,278 @@
+import { ChevronRight } from "lucide-react";
+import type { ReactNode } from "react";
+import type { ChatMessage } from "../../lib/chat/model";
+import { timelineMessageKey } from "./findInSession";
+import { detectOcCli } from "../tool/meta";
+
+/**
+ * View-only fold for the main chat. Message ids, tape bytes, and scroll
+ * ownership stay where they were; this only decides which rows share a
+ * disclosure.
+ *
+ * Duration is never invented. Counts are the only summary when the transcript
+ * has no trustworthy elapsed time.
+ */
+
+const WORK_ROLES = new Set<ChatMessage["role"]>([
+  "tool",
+  "thinking",
+  "plan",
+  "agent-group",
+  "delegate-progress",
+]);
+
+const ARTIFACT_CLIS = new Set([
+  "oc-report",
+  "oc-slides",
+  "oc-poster",
+  "oc-docx",
+  "oc-pdf",
+  "oc-xlsx",
+]);
+
+const INTERACTIVE_TOOL_RE =
+  /^(?:AskUserQuestion|ExitPlanMode)$|ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode/i;
+
+export function isFoldableWorkRole(message: ChatMessage): boolean {
+  return WORK_ROLES.has(message.role);
+}
+
+function commandText(message: ChatMessage): string {
+  const input = message.inputJson;
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const record = input as Record<string, unknown>;
+    if (typeof record.command === "string") return record.command;
+    if (typeof record.cmd === "string") return record.cmd;
+  }
+  if (typeof message.inputPreview === "string") return message.inputPreview;
+  return message.text ?? "";
+}
+
+/** User-visible files and generated media stay beside the answer, not inside a tool count. */
+export function isDeliverableTool(message: ChatMessage): boolean {
+  if (message.role !== "tool" || message.error) return false;
+  if (/imageGeneration/i.test(message.toolName ?? "")) return true;
+  const cli = detectOcCli(commandText(message)) ?? detectOcCli(message.toolName);
+  return cli != null && ARTIFACT_CLIS.has(cli);
+}
+
+function interactiveTool(message: ChatMessage): boolean {
+  return INTERACTIVE_TOOL_RE.test(message.toolName ?? "");
+}
+
+/** A background child that has not reached a terminal status must stay on the top level. */
+function liveBackgroundSubtask(message: ChatMessage): boolean {
+  if (message.role !== "agent-group" && message.role !== "delegate-progress") return false;
+  if (message._source === "server") return false;
+  if (message._completed === true || message._delegateStatus === "ok") return false;
+  if (message._isError || message.error) return false;
+  if (message._delegateStatus === "failed" || message._delegateStatus === "timeout") return false;
+  return message._background === true;
+}
+
+/**
+ * Fold only quiet process rows. `final` means this assistant is the turn's
+ * visible answer (including a deferred locator that will become that answer).
+ */
+export function isProcessMessage(message: ChatMessage, final: boolean): boolean {
+  if (
+    message.error ||
+    message._isError ||
+    message._errorCode ||
+    message._turnStatusRecord ||
+    message._genPlaceholder ||
+    message._turnTapeProcess
+  ) {
+    return false;
+  }
+  if (message._delegateStatus === "failed" || message._delegateStatus === "timeout") return false;
+  if (liveBackgroundSubtask(message)) return false;
+  if (interactiveTool(message)) return false;
+  if (isDeliverableTool(message)) return false;
+  if (message.role === "assistant") return !final;
+  return isFoldableWorkRole(message);
+}
+
+function countLabel(message: ChatMessage): string {
+  if (message.role === "tool") {
+    const name = `${message.toolName ?? ""} ${commandText(message)}`;
+    if (/read|view|cat/i.test(name)) return "读取";
+    if (/edit|write|patch/i.test(name)) return "编辑";
+    if (/search|grep|glob|find/i.test(name)) return "搜索";
+    if (/exec|bash|terminal|command/i.test(name)) return "命令";
+    return "工具";
+  }
+  if (message.role === "thinking") return "思考";
+  if (message.role === "plan") return "计划";
+  if (message.role === "agent-group" || message.role === "delegate-progress") return "子任务";
+  return "";
+}
+
+export function operationSummary(messages: readonly ChatMessage[]): string {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    const label = countLabel(message);
+    if (!label) continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  if (counts.size === 0) return "执行记录";
+  return [...counts].map(([label, count]) => `${label} ${count} 项`).join(" · ");
+}
+
+export type ProcessSection<T> = {
+  key: string;
+  narrative: boolean;
+  items: T[];
+  messages: ChatMessage[];
+};
+
+export function processSections<T>(
+  items: readonly T[],
+  messagesOf: (item: T) => ChatMessage[],
+  keyOf: (item: T) => string,
+): ProcessSection<T>[] {
+  const sections: ProcessSection<T>[] = [];
+  for (const item of items) {
+    const messages = messagesOf(item);
+    const narrative = messages.length > 0 && messages.every((message) => message.role === "assistant");
+    const previous = sections.at(-1);
+    if (!narrative && previous && !previous.narrative) {
+      previous.items.push(item);
+      previous.messages.push(...messages);
+    } else {
+      sections.push({ key: keyOf(item), narrative, items: [item], messages: [...messages] });
+    }
+  }
+  return sections;
+}
+
+const toggleClass =
+  "group flex min-h-10 w-full items-center gap-2 rounded-md py-1.5 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
+
+function StageText({ message }: { message: ChatMessage }) {
+  if (message._payloadDeferred) return null;
+  const text = message.text?.trim() ?? "";
+  if (!text) return null;
+  return (
+    <p
+      data-testid="process-stage"
+      data-find-member={timelineMessageKey(message)}
+      className="whitespace-pre-wrap break-words text-sm leading-6 text-fg"
+    >
+      {text}
+    </p>
+  );
+}
+
+export function ProcessDisclosure<T>({
+  sections,
+  active,
+  open,
+  setOpen,
+  detailOpen,
+  setDetailOpen,
+  renderItem,
+  keyOf,
+  messagesOf,
+  eagerDeferred,
+}: {
+  sections: ProcessSection<T>[];
+  active: boolean;
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  detailOpen: (key: string) => boolean;
+  setDetailOpen: (key: string, open: boolean) => void;
+  renderItem: (item: T) => ReactNode;
+  keyOf: (item: T) => string;
+  messagesOf: (item: T) => ChatMessage[];
+  /** Tail locators keep hydrating while the disclosure stays collapsed. */
+  eagerDeferred: boolean;
+}) {
+  const messages = sections.flatMap((section) => section.messages);
+  const latest = [...messages].reverse().find((message) => message.role === "assistant" && message.text.trim() && !message._payloadDeferred);
+  const title = active ? "处理过程" : "工作过程";
+  const summary = operationSummary(messages);
+
+  const clippedDeferred = (item: T) =>
+    eagerDeferred && messagesOf(item).some((message) => message._payloadDeferred) ? (
+      <div key={`deferred:${keyOf(item)}`} className="h-px overflow-hidden" data-testid="process-deferred-hydrate" aria-hidden>
+        {renderItem(item)}
+      </div>
+    ) : null;
+
+  return (
+    <section data-testid="process-disclosure" data-process-active={active ? "true" : "false"} className="min-w-0 sm:ml-[52px]">
+      <button
+        type="button"
+        className={toggleClass}
+        aria-expanded={open}
+        data-testid="process-toggle"
+        onClick={() => setOpen(!open)}
+      >
+        <ChevronRight size={14} className={open ? "shrink-0 rotate-90 transition-transform" : "shrink-0 transition-transform"} aria-hidden />
+        <span className="shrink-0">{title}</span>
+        <span className="min-w-0 truncate text-xs text-muted">{summary}</span>
+      </button>
+      {active && !open && latest ? (
+        <p className="line-clamp-2 pl-6 text-sm leading-6 text-muted" data-testid="process-live-summary">
+          {latest.text}
+        </p>
+      ) : null}
+      {!open
+        ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
+        : (
+          <div className="space-y-3 border-l border-border pl-3" data-testid="process-stages">
+            {sections.map((section) => {
+              if (section.narrative) {
+                return (
+                  <div key={section.key} className="space-y-2">
+                    {section.items.map((item) => {
+                      const rows = messagesOf(item);
+                      if (rows.some((message) => message._payloadDeferred)) {
+                        return <div key={keyOf(item)}>{renderItem(item)}</div>;
+                      }
+                      return (
+                        <div key={keyOf(item)} className="space-y-2">
+                          {rows.map((message) => (
+                            <StageText key={message.id} message={message} />
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              }
+              const details = detailOpen(section.key);
+              return (
+                <div key={section.key}>
+                  <button
+                    type="button"
+                    className={toggleClass}
+                    aria-expanded={details}
+                    data-testid="process-detail-toggle"
+                    onClick={() => setDetailOpen(section.key, !details)}
+                  >
+                    <ChevronRight
+                      size={13}
+                      aria-hidden
+                      className={details ? "shrink-0 rotate-90 transition-transform" : "shrink-0 transition-transform"}
+                    />
+                    <span className="min-w-0 break-words">{operationSummary(section.messages)}</span>
+                  </button>
+                  {details ? (
+                    <div className="space-y-3 pt-2" data-testid="process-details">
+                      {section.items.map((item) => (
+                        <div key={keyOf(item)}>{renderItem(item)}</div>
+                      ))}
+                    </div>
+                  ) : (
+                    section.items.map((item) => clippedDeferred(item))
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+    </section>
+  );
+}
