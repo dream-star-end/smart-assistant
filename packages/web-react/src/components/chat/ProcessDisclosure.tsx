@@ -469,28 +469,6 @@ export function processSections<T>(
   return sections;
 }
 
-const STAGE_SUMMARY_LIMIT = 42;
-
-/**
- * Collapsed stage label. A readable clause, not the mounted paragraph.
- * Layout ellipsis (`truncate`) shortens the row; do not hard-cut to a few characters.
- */
-function narrativeLabel(messages: readonly ChatMessage[]): string {
-  const text = messages.map((message) => message.text ?? "").join(" ").replace(/\s+/g, " ").trim();
-  if (!text) return "阶段说明";
-  const sentenceEnd = text.search(/[。！？!?]/);
-  const sentence = (sentenceEnd > 0 ? text.slice(0, sentenceEnd) : text).trim();
-  if (sentence.length <= STAGE_SUMMARY_LIMIT) return sentence;
-  const window = sentence.slice(0, STAGE_SUMMARY_LIMIT);
-  const breakAt = Math.max(
-    window.lastIndexOf(" "),
-    window.lastIndexOf("，"),
-    window.lastIndexOf(","),
-    window.lastIndexOf("、"),
-  );
-  return (breakAt >= 8 ? window.slice(0, breakAt) : window).trim();
-}
-
 function toolStillRunning(message: ChatMessage): boolean {
   return message.role === "tool" && !message._completed && !message.error && !message._isError;
 }
@@ -705,7 +683,6 @@ export function ProcessDisclosure<T>({
   setOpen,
   detailOpen,
   setDetailOpen,
-  narrativeClosed = () => false,
   renderItem,
   keyOf,
   messagesOf,
@@ -717,8 +694,6 @@ export function ProcessDisclosure<T>({
   setOpen: (open: boolean) => void;
   detailOpen: (key: string) => boolean;
   setDetailOpen: (key: string, open: boolean) => void;
-  /** True only after the reader closes that stage. Unset stays painted. */
-  narrativeClosed?: (key: string) => boolean;
   renderItem: (item: T) => ReactNode;
   keyOf: (item: T) => string;
   messagesOf: (item: T) => ChatMessage[];
@@ -792,43 +767,12 @@ export function ProcessDisclosure<T>({
               }
               if (section.narrative) {
                 const current = active && index === currentIndex;
-                const closed = narrativeClosed(section.key);
-                // A finished turn shows every stage at level 2. While the turn
-                // is still running, a stage that has already been painted stays
-                // mounted: unmounting it drops the scroll height and the
-                // stick-to-bottom correction snaps the viewport. Only an
-                // explicit close removes the body. The current stage stays
-                // open, and it is the only one rendered live.
-                const show = !active || current || !closed;
-                if (!show) {
-                  return (
-                    <button
-                      key={section.key}
-                      type="button"
-                      className={toggleClass}
-                      aria-expanded={false}
-                      data-testid="process-stage-toggle"
-                      onClick={() => setDetailOpen(section.key, true)}
-                    >
-                      <ChevronRight size={13} className="shrink-0" aria-hidden />
-                      <span className="min-w-0 truncate">{narrativeLabel(section.messages)}</span>
-                    </button>
-                  );
-                }
+                // Intermediate replies stay fully readable for the whole turn.
+                // A one-line stage hid text the reader had already seen, then
+                // showed it again only after the turn ended. Tool groups still
+                // collapse. Only the current stage is live.
                 return (
                   <div key={section.key}>
-                    {!current && active ? (
-                      <button
-                        type="button"
-                        className={toggleClass}
-                        aria-expanded
-                        data-testid="process-stage-toggle"
-                        onClick={() => setDetailOpen(section.key, false)}
-                      >
-                        <ChevronRight size={13} className="shrink-0 rotate-90" aria-hidden />
-                        <span className="min-w-0 truncate">{narrativeLabel(section.messages)}</span>
-                      </button>
-                    ) : null}
                     {narrativeBody(section, current)}
                   </div>
                 );

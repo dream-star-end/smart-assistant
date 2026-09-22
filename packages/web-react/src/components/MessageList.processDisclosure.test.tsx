@@ -916,14 +916,8 @@ describe("MessageList Manus 过程披露", () => {
     expectOne();
     expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("STAGE_TWO"))).toBe(true);
     expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("我先对一下这班发布落在哪"))).toBe(true);
-    const collapsePrevious = screen.getByTestId("process-stage-toggle");
-    expect(collapsePrevious.textContent ?? "").toContain("我先对一下这班发布落在哪");
-    expect((collapsePrevious.textContent ?? "").replace(/\s/g, "").length).toBeGreaterThan(6);
+    expect(screen.queryByTestId("process-stage-toggle")).not.toBeInTheDocument();
     expect(screen.queryByText("LIVE_CMD_MARKER")).not.toBeInTheDocument();
-    fireEvent.click(collapsePrevious);
-    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("我先对一下这班发布落在哪"))).toBe(false);
-    fireEvent.click(screen.getByTestId("process-stage-toggle"));
-    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("我先对一下这班发布落在哪"))).toBe(true);
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
@@ -1108,7 +1102,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("LATER_DONE_SECRET")).not.toBeInTheDocument();
   });
 
-  test("折叠阶段用可读短摘要，不硬切前六字", () => {
+  test("进行中的旧阶段正文直接显示，不折成一行摘要", () => {
     const long = `先核对北仓南仓可售口径然后再决定预警是否单列。${"后文不该整段挂上。".repeat(8)}`;
     renderList([
       row("u", "user", "展开旧阶段", { status: "sent" }),
@@ -1121,14 +1115,11 @@ describe("MessageList Manus 过程披露", () => {
       }),
       row("now", "assistant", "当前阶段还在写", { _clientMessageId: "u" }),
     ], { sending: true });
-    const toggle = screen.getByTestId("process-stage-toggle");
-    const label = (toggle.textContent ?? "").replace(/\s/g, "");
-    expect(label.length).toBeGreaterThan(6);
-    expect(label.startsWith("先核对北")).toBe(true);
-    expect(label).not.toBe("先核对北仓南");
-    expect(toggle.textContent ?? "").not.toContain("后文不该整段挂上");
+    expect(screen.queryByTestId("process-stage-toggle")).not.toBeInTheDocument();
     const bodies = screen.getAllByTestId("process-stage");
-    expect(bodies.some((node) => (node.textContent ?? "").includes("后文不该整段挂上"))).toBe(true);
+    const previous = bodies.find((node) => (node.textContent ?? "").includes("先核对北仓南仓"));
+    expect(previous).toBeTruthy();
+    expect(previous?.textContent ?? "").toContain("后文不该整段挂上");
     expect(bodies.some((node) => (node.textContent ?? "").includes("当前阶段还在写"))).toBe(true);
   });
 
@@ -1294,14 +1285,9 @@ describe("MessageList Manus 过程披露", () => {
     );
     expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("NEXT_STAGE_ONLY"))).toBe(true);
     expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("长段"))).toBe(true);
+    expect(screen.queryByTestId("process-stage-toggle")).not.toBeInTheDocument();
     expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "继续显示正文" })).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("process-stage-toggle"));
-    expect(screen.queryByRole("button", { name: "继续显示正文" })).not.toBeInTheDocument();
-    expect(screen.getAllByTestId("process-stage").every((node) => !(node.textContent ?? "").includes("长段"))).toBe(true);
-    fireEvent.click(screen.getByTestId("process-stage-toggle"));
-    expect(screen.getByRole("button", { name: "继续显示正文" })).toBeInTheDocument();
-    expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
     expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("NEXT_STAGE_ONLY"))).toBe(true);
   });
 
