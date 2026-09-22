@@ -274,6 +274,36 @@
       "expiresAt": "2026-10-22"
     },
     {
+      "commit": "c7c99f1ec9e3f14643efef56bbaf9e31a3ae798a",
+      "reason": "OCV5-260 error-card freeze. Display only: one committed card, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "6a42f1768c236a2959a6d1e12dce608d2560005c",
+      "reason": "OCV5-260 keep the first error card across tape ids. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "960a1fa3f214ce79d08ff5b8f783e3bda614b154",
+      "reason": "OCV5-260 do not paint while recovery is pending. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "59ed125fff3dcc0471db97633d1273a0cac433b1",
+      "reason": "OCV5-260 keep a stopped recovery from painting later. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "09a9662545a9e0bd276d3fe03cf35d1c6f14ede0",
+      "reason": "OCV5-260 keep an undecided refresh and a late error after stop from painting. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
       "commit": "09b40bf2dcbe721ef7a2906752d206af26ef58a6",
       "reason": "Advisor consult token wiring for Grok/Cursor. Not a production incident; no data loss or billing change.",
       "approvedBy": "agent:main OCV5-266",
