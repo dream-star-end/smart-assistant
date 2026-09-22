@@ -826,6 +826,7 @@ export function commitErrorCardSnapshot(message: ChatMessage, messageOverride?: 
 export function freezeErrorCardSnapshots(
   messages: readonly ChatMessage[],
   deferredClientMessageId?: string,
+  cancelledClientMessageIds?: ReadonlySet<string>,
 ): void {
   const recoveringSources = new Set<string>();
   if (deferredClientMessageId) recoveringSources.add(deferredClientMessageId);
@@ -841,6 +842,16 @@ export function freezeErrorCardSnapshots(
   }
   for (const message of messages) {
     if (message._errorCardSnapshot?.disposition === "card") {
+      message._errorHeldForRecovery = undefined;
+      continue;
+    }
+    if (
+      cancelledClientMessageIds &&
+      typeof message._clientMessageId === "string" &&
+      cancelledClientMessageIds.has(message._clientMessageId) &&
+      message._errorCode
+    ) {
+      message._errorCardSnapshot = { disposition: "silent" };
       message._errorHeldForRecovery = undefined;
       continue;
     }

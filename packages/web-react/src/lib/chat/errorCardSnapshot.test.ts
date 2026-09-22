@@ -108,4 +108,16 @@ describe("commitErrorCardSnapshot", () => {
     expect(source._errorCardSnapshot).toBeUndefined();
     expect(source._errorHeldForRecovery).toBe(true);
   });
+
+  test("a stopped recovery lineage stays silent when the source error arrives later", () => {
+    const source = message({
+      id: "srv-err",
+      _clientMessageId: "u1",
+      _errorCode: "upstream_failed",
+      text: "boom",
+    });
+    freezeErrorCardSnapshots([source], undefined, new Set(["u1"]));
+    expect(source._errorCardSnapshot).toEqual({ disposition: "silent" });
+    expect(source._errorHeldForRecovery).toBeUndefined();
+  });
 });
