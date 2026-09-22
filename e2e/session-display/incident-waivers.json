@@ -326,6 +326,12 @@
       "reason": "Fast Grok session symlink stays on the fast home. Not a production incident; no data loss or billing change.",
       "approvedBy": "agent:main OCV5-266",
       "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "c3304a9e7aee46ef552df7df24365ad87451f62c",
+      "reason": "Grok Fast routes are stored as grok-build-fast. The relay treated every other model id as expired, so Fast turns returned 404 grok route expired. Allow only grok-build and grok-build-fast and forward that route model. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-22 要求改掉 Fast 中继拒绝 (OCV5-267)",
+      "expiresAt": "2026-10-22"
     }
   ]
 }
