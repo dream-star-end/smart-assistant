@@ -1,4 +1,4 @@
-import { cursorModelById } from '@openclaude/protocol'
+import { CONTEXT_TIER_FAMILIES, cursorModelById } from '@openclaude/protocol'
 import { describe, expect, it } from 'vitest'
 import {
   lockedModelUnlockNotice,
@@ -246,15 +246,13 @@ describe('context family picker', () => {
   })
 
   it('defaults GPT/Kimi to the standard window', () => {
-    const gpt = MODELS.filter((m) => m.id.startsWith('gpt-5.6-sol'))
-    const spec = {
-      family: 'gpt-5.6-sol',
-      familyLabel: 'GPT-5.6-Sol',
-      standardId: 'gpt-5.6-sol',
-      longId: 'gpt-5.6-sol-1m',
-      collapsedByDefault: false,
-    } as const
-    expect(resolveContextPickerSelection(gpt, spec, 'glm-5.3')).toBe('gpt-5.6-sol')
+    const gpt: PublicModel[] = [
+      { id: 'gpt-6-sol', display_name: 'GPT-6-Sol' },
+      { id: 'gpt-6-sol-1m', display_name: 'GPT-6-Sol' },
+    ]
+    const spec = CONTEXT_TIER_FAMILIES.find((family) => family.family === 'gpt-6-sol')
+    expect(spec).toBeDefined()
+    expect(resolveContextPickerSelection(gpt, spec!, 'glm-5.3')).toBe('gpt-6-sol')
     const kimi = MODELS.filter((m) => m.id === 'k3-256k' || m.id === 'kimi-k3')
     const kimiSpec = {
       family: 'kimi-k3',
@@ -267,18 +265,13 @@ describe('context family picker', () => {
   })
 
   it('preserves 1M when switching GPT families', () => {
-    const terra: PublicModel[] = [
-      { id: 'gpt-5.6-terra', display_name: 'GPT-5.6-Terra' },
-      { id: 'gpt-5.6-terra-1m', display_name: 'GPT-5.6-Terra' },
+    const luna: PublicModel[] = [
+      { id: 'gpt-6-luna', display_name: 'GPT-6-Luna' },
+      { id: 'gpt-6-luna-1m', display_name: 'GPT-6-Luna' },
     ]
-    const spec = {
-      family: 'gpt-5.6-terra',
-      familyLabel: 'GPT-5.6-Terra',
-      standardId: 'gpt-5.6-terra',
-      longId: 'gpt-5.6-terra-1m',
-      collapsedByDefault: true,
-    } as const
-    expect(resolveContextPickerSelection(terra, spec, 'gpt-5.6-sol-1m')).toBe('gpt-5.6-terra-1m')
+    const spec = CONTEXT_TIER_FAMILIES.find((family) => family.family === 'gpt-6-luna')
+    expect(spec).toBeDefined()
+    expect(resolveContextPickerSelection(luna, spec!, 'gpt-6-sol-1m')).toBe('gpt-6-luna-1m')
   })
 })
 
