@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { operationSummary } from "./chat/ProcessDisclosure";
 import { MessageList } from "./MessageRenderer";
 
@@ -129,7 +130,8 @@ describe("MessageList Manus 过程披露", () => {
     expect(stage.className).not.toMatch(/line-clamp/);
     expect(screen.queryByTestId("assistant-row")).not.toBeInTheDocument();
     expect(within(screen.getByTestId("process-disclosure")).queryByTestId("assistant-meta")).toBeNull();
-    expect(screen.queryByText("先核对库存口径")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-stage").textContent ?? "").not.toContain("先核对库存口径");
+    expect(screen.getByTestId("process-stage-toggle")).toHaveTextContent("先核对库存口径");
 
     fireEvent.click(screen.getByTestId("process-toggle"));
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
@@ -877,11 +879,14 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[2]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    const goal = screen.getByText("会话目标");
-    expect(goal.closest("[data-testid=process-disclosure]")).not.toBeNull();
-    expect(screen.getByText("已清除").closest("[data-testid=process-goal]")).not.toBeNull();
+    const goalLine = screen.getByTestId("process-goal-line");
+    expect(goalLine.closest("[data-testid=process-goal]")).not.toBeNull();
+    expect(goalLine).toHaveTextContent("目标已清除");
+    expect(goalLine.textContent ?? "").not.toMatch(/会话目标/);
+    expect(goalLine.querySelector(".rounded-lg")).toBeNull();
+    expect(screen.queryByText(/tape-goal/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "查看原始目标记录" }));
-    expect(screen.getByText(/tape-goal/)).toBeInTheDocument();
+    expect(screen.getByTestId("process-goal-record")).toHaveTextContent("tape-goal");
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[3]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
@@ -897,10 +902,13 @@ describe("MessageList Manus 过程披露", () => {
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[5]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
     expect(screen.getByTestId("process-stage")).toHaveTextContent("STAGE_TWO");
-    expect(screen.queryByText("我先对一下这班发布落在哪")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-stage").textContent ?? "").not.toContain("我先对一下这班发布落在哪");
+    const collapsedStage = screen.getByTestId("process-stage-toggle");
+    expect(collapsedStage.textContent ?? "").toContain("我先对一下这班发布落在哪");
+    expect((collapsedStage.textContent ?? "").replace(/\s/g, "").length).toBeGreaterThan(6);
     expect(screen.queryByText("LIVE_CMD_MARKER")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("process-stage-toggle"));
-    expect(screen.getByText("我先对一下这班发布落在哪")).toBeInTheDocument();
+    fireEvent.click(collapsedStage);
+    expect(screen.getAllByText("我先对一下这班发布落在哪").some((node) => node.closest("[data-testid=process-stage]"))).toBe(true);
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
@@ -913,7 +921,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(body).toBeTruthy();
     expect(body?.className ?? "").not.toMatch(/line-clamp/);
     expect(body?.closest("[data-testid=assistant-row]")).toBeNull();
-    expect(screen.getByText("我先对一下这班发布落在哪")).toBeInTheDocument();
+    expect(screen.getAllByText("我先对一下这班发布落在哪").some((node) => node.closest("[data-testid=process-stage]"))).toBe(true);
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[7]!]} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
@@ -970,6 +978,138 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/goal-not-a-card/);
     expect(screen.getByText("会话目标已清除这句话只是阶段说明").closest("[data-testid=process-stage]")).not.toBeNull();
+  });
+
+  test("回答与生成状态不留头像列，已有过程或正文时不再挂独立思考块", () => {
+    const view = renderList([
+      row("u", "user", "你好", { status: "sent" }),
+    ], { sending: true, turnActivity: { startedAt: Date.now(), agentName: "助手" } });
+    expect(screen.getByLabelText("生成中")).toHaveTextContent("思考中");
+    expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
+    expect(screen.getByTestId("turn-activity-footer").className).not.toMatch(/ml-\[52px\]|gap-4/);
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[
+          row("u", "user", "你好", { status: "sent" }),
+          row("a", "assistant", "纯聊回答已经写出来了", { _clientMessageId: "u" }),
+        ]}
+        sending
+        sessionId="session-a"
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const answer = screen.getByTestId("assistant-row");
+    expect(answer).toHaveTextContent("纯聊回答已经写出来了");
+    expect(answer.querySelector(".bg-grad-cta")).toBeNull();
+    expect(answer.className).not.toMatch(/gap-4/);
+    expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("process-disclosure")).not.toBeInTheDocument();
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[
+          row("u", "user", "继续", { status: "sent" }),
+          row("stage", "assistant", "先看实时步骤", { _clientMessageId: "u" }),
+          row("tool", "tool", "终端", {
+            _clientMessageId: "u",
+            toolName: "Bash",
+            inputJson: { command: "echo live" },
+            _completed: false,
+          }),
+          row("ask", "permission", "要不要继续", {
+            _clientMessageId: "u",
+            toolName: "AskUserQuestion",
+            requestId: "req-avatar",
+            _resolved: true,
+            _behavior: "allow",
+            inputJson: { questions: [{ question: "要不要继续", options: [{ label: "继续" }] }] },
+          }),
+        ]}
+        sending
+        sessionId="session-a"
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("process-disclosure").className).not.toMatch(/ml-\[52px\]/);
+    expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[
+          row("u", "user", "继续", { status: "sent" }),
+          row("stage", "assistant", "先看实时步骤", { _clientMessageId: "u" }),
+        ]}
+        sending
+        sessionId="session-a"
+        turnActivity={{ startedAt: Date.now(), agentName: "助手", recoveryStatus: { kind: "stopping" } }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("正在停止…")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
+    cleanup();
+    const { unmount } = render(<><MessageListSkeleton /><PartialHistorySkeleton /></>);
+    expect(document.querySelector(".bg-grad-cta")).toBeNull();
+    unmount();
+  });
+
+  test("同轮前一个工具仍在跑时，当前步骤不把后一个已完成当成整段结束", () => {
+    renderList([
+      row("u", "user", "并行查两处", { status: "sent" }),
+      row("running", "tool", "读取", {
+        _clientMessageId: "u",
+        toolName: "Read",
+        inputJson: { file_path: "STILL_RUNNING_FILE" },
+        _completed: false,
+      }),
+      row("done", "tool", "搜索", {
+        _clientMessageId: "u",
+        toolName: "Grep",
+        inputJson: { pattern: "LATER_DONE_PATTERN" },
+        _completed: true,
+        output: "LATER_DONE_SECRET",
+      }),
+    ], { sending: true });
+    const live = screen.getByTestId("process-step-live");
+    expect(live).toHaveTextContent("进行中");
+    expect(live).toHaveTextContent("Read");
+    expect(live).toHaveTextContent("STILL_RUNNING_FILE");
+    expect(live).not.toHaveTextContent("已完成");
+    expect(live).not.toHaveTextContent("LATER_DONE_PATTERN");
+    expect(screen.queryByText("LATER_DONE_SECRET")).not.toBeInTheDocument();
+  });
+
+  test("折叠阶段用可读短摘要，不硬切前六字", () => {
+    const long = `先核对北仓南仓可售口径然后再决定预警是否单列。${"后文不该整段挂上。".repeat(8)}`;
+    renderList([
+      row("u", "user", "展开旧阶段", { status: "sent" }),
+      row("old", "assistant", long, { _clientMessageId: "u" }),
+      row("tool", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "echo next" },
+        _completed: true,
+      }),
+      row("now", "assistant", "当前阶段还在写", { _clientMessageId: "u" }),
+    ], { sending: true });
+    const toggle = screen.getByTestId("process-stage-toggle");
+    const label = (toggle.textContent ?? "").replace(/\s/g, "");
+    expect(label.length).toBeGreaterThan(6);
+    expect(label.startsWith("先核对北")).toBe(true);
+    expect(label).not.toBe("先核对北仓南");
+    expect(toggle.textContent ?? "").not.toContain("后文不该整段挂上");
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("当前阶段还在写");
   });
 
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {

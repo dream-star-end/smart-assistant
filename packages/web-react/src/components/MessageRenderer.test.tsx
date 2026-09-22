@@ -2273,8 +2273,9 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getAllByLabelText("生成中")).toHaveLength(1);
-    expect(screen.getByLabelText("生成中")).toBe(status);
+    expect(screen.getByText("正在生成正文")).toBeInTheDocument();
+    expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
+    expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
   });
 
   test("移动端冷会话首条记录未到时仍显示加载/活动状态，不留整屏空白", () => {

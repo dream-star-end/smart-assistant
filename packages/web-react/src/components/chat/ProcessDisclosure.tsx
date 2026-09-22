@@ -443,15 +443,38 @@ export function processSections<T>(
   return sections;
 }
 
-/** Collapsed stage label. Short on purpose so the full paragraph is not mounted. */
+const STAGE_SUMMARY_LIMIT = 42;
+
+/**
+ * Collapsed stage label. A readable clause, not the mounted paragraph.
+ * Layout ellipsis (`truncate`) shortens the row; do not hard-cut to a few characters.
+ */
 function narrativeLabel(messages: readonly ChatMessage[]): string {
   const text = messages.map((message) => message.text ?? "").join(" ").replace(/\s+/g, " ").trim();
-  return text.slice(0, 6) || "阶段说明";
+  if (!text) return "阶段说明";
+  const sentenceEnd = text.search(/[。！？!?]/);
+  const sentence = (sentenceEnd > 0 ? text.slice(0, sentenceEnd) : text).trim();
+  if (sentence.length <= STAGE_SUMMARY_LIMIT) return sentence;
+  const window = sentence.slice(0, STAGE_SUMMARY_LIMIT);
+  const breakAt = Math.max(
+    window.lastIndexOf(" "),
+    window.lastIndexOf("，"),
+    window.lastIndexOf(","),
+    window.lastIndexOf("、"),
+  );
+  return (breakAt >= 8 ? window.slice(0, breakAt) : window).trim();
 }
 
-/** Name plus a one-line status. Never the raw tool JSON or the full thinking trace. */
+function toolStillRunning(message: ChatMessage): boolean {
+  return message.role === "tool" && !message._completed && !message.error && !message._isError;
+}
+
+/** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
+ * A later completed sibling must not hide a tool that is still running. */
 function stepLiveLine(messages: readonly ChatMessage[]): string {
-  const latest = [...messages].reverse().find((message) => message.role !== "assistant" && message.role !== "user");
+  const work = messages.filter((message) => message.role !== "assistant" && message.role !== "user");
+  const runningTool = [...work].reverse().find(toolStillRunning);
+  const latest = runningTool ?? work.at(-1);
   if (!latest) return "";
   if (latest.role === "thinking") return "正在思考";
   if (latest.role === "plan") return (latest.text || "计划").replace(/\s+/g, " ").trim().slice(0, 48);
@@ -542,7 +565,7 @@ export function ProcessDisclosure<T>({
   );
 
   return (
-    <section data-testid="process-disclosure" data-process-active={active ? "true" : "false"} className="min-w-0 sm:ml-[52px]">
+    <section data-testid="process-disclosure" data-process-active={active ? "true" : "false"} className="min-w-0">
       <button
         type="button"
         className={toggleClass}

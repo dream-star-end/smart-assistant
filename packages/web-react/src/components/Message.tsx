@@ -1,9 +1,9 @@
-import { Check, Copy, RotateCcw, Sparkles } from "lucide-react";
+import { Check, Copy, RotateCcw } from "lucide-react";
 import { useState } from "react";
 import type { Message as MessageT, ToolCard as ToolCardT } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "./optionsGroup";
-import { Avatar, IconButton, useToast } from "./ui";
+import { IconButton, useToast } from "./ui";
 
 // demo 通道动作条:桌面 hover 露出;触屏没有 hover,常显并给 44px 触控靶(与 chat/cards 的口径一致)。
 const DEMO_ACTIONS_CLASS =
@@ -66,11 +66,8 @@ export function AssistantMessage({
   onRegenerate?: () => void;
 }) {
   return (
-    <div className="group flex gap-4 animate-in">
-      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-        <Sparkles size={16} />
-      </Avatar>
-      <div className="min-w-0 flex-1">
+    <div className="group min-w-0 animate-in">
+      <div className="min-w-0">
         {message.content ? (
           // live 与 chat/cards 同口径:流式期 options 块禁止隐式发送(demo 下 ChatInteraction 为空,
           // 块本就不可交互,但契约要一致,别让 demo 通道成为唯一「流式也点击即发」的路径)。

@@ -9,7 +9,7 @@
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { ProcessDisclosure, artifactEvidenceKeys, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
-import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
+import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -20,9 +20,10 @@ import {
   useRef,
   useState,
 } from "react";
-import type {
-  ChatMessage,
-  LiveTurnTokenUsageSnapshot,
+import {
+  isRetryingTurnStatus,
+  type ChatMessage,
+  type LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
@@ -33,7 +34,7 @@ import {
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
-import { isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
@@ -92,7 +93,7 @@ import {
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
-import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
+import { Alert, IconButton, Input, Spinner } from "./ui";
 import { cn } from "../lib/utils";
 import {
   findMatches,
@@ -319,6 +320,9 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "goal":
+        if (isHistoricalGoalRecord(message)) {
+          return <HistoricalGoalDiagnostic message={message} />;
+        }
         return (
           <TapeBackedCard>
             <GoalCard msg={message} />
@@ -386,6 +390,59 @@ const RUNTIME_TEXT_STEP = 32 * 1024;
 
 function TapeBackedCard({ children }: { children: ReactNode }) {
   return <div className="space-y-1">{children}</div>;
+}
+
+function historicalGoalLine(message: ChatMessage): string {
+  const status = (message.goalStatus ?? "").trim().toLowerCase();
+  const cleared = message.cleared === true || status === "cleared";
+  const label = cleared ? "目标已清除" : status === "completed" ? "目标已完成" : "目标记录";
+  const objective = (message.text ?? "").replace(/\s+/g, " ").trim();
+  if (!objective || objective === "会话目标") return label;
+  return `${label} · ${objective}`;
+}
+
+/** Cleared/completed goals are a one-line diagnostic. The raw record is the next click. */
+function HistoricalGoalDiagnostic({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(false);
+  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
+  const line = historicalGoalLine(message);
+  const hasTape = !!message._turnTapeId;
+  const raw = message._eventHistory ?? message;
+  const serialized = open && hasTape ? JSON.stringify(raw, null, 2) ?? String(raw) : "";
+  return (
+    <div data-testid="process-goal-line" className="min-w-0">
+      {hasTape ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label="查看原始目标记录"
+          className="flex min-h-10 w-full items-center gap-2 rounded-md py-1 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11"
+          onClick={() => setOpen((value) => !value)}
+        >
+          <ChevronRight size={13} aria-hidden className={open ? "shrink-0 rotate-90" : "shrink-0"} />
+          <span className="min-w-0 truncate">{line}</span>
+        </button>
+      ) : (
+        <p className="py-1 text-sm text-muted">{line}</p>
+      )}
+      {open && hasTape ? (
+        <div className="mt-1 px-1" data-testid="process-goal-record">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+            {serialized.slice(0, visibleChars)}
+          </pre>
+          {visibleChars < serialized.length ? (
+            <button
+              type="button"
+              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            >
+              继续显示原始记录
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 /** Readable cards retain their pre-direct-timeline UX, while the immutable
@@ -1268,6 +1325,32 @@ export type MessageListArchive = {
   liveHasMoreBefore?: boolean;
   onLoadOlderLiveUnits?: () => void | Promise<void>;
 };
+
+function turnHasVisibleWork(
+  processDisclosure: boolean,
+  items: RenderItem[],
+  messages: ChatMessage[],
+  turnStart: number,
+): boolean {
+  if (processDisclosure && items.some((item) => item.kind === "process" && item.active)) return true;
+  for (let i = Math.max(0, turnStart); i < messages.length; i += 1) {
+    const message = messages[i];
+    if (message && isPlatedAssistantMessage(message)) return true;
+  }
+  return false;
+}
+
+/** Retry, stop, and engine status stay. A second 「思考中」 under live steps or body does not. */
+function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
+  if (!info) return false;
+  if (info.recoveryStatus?.kind === "stopping") return true;
+  if (isRetryingTurnStatus(info.turnStatus)) return true;
+  const status = info.turnStatus;
+  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
+    return true;
+  }
+  return !!info.leaderStep;
+}
 
 export function MessageList({
   processDisclosure = false,
@@ -2347,21 +2430,17 @@ export function MessageList({
     </div>
   ) : null;
   // footer 不再自带 px-5:它嵌在列表根(px-5)内,双份内边距会让本轮活动指示 / 软提示 / 尾部骨架比
-  // 时间线内容多缩进 20px(footer 头像与助手头像不对齐)。空列表早返回分支由外层容器补 px-5。
+  // 时间线内容多缩进 20px。空列表早返回分支由外层容器补 px-5。
+  const workVisible = turnHasVisibleWork(processDisclosure, renderItems, renderableMessages, turnStart);
+  const showTurnActivity = sending && (!workVisible || keepDistinctActivity(turnActivity));
   const footer = (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 pb-8 pt-4" data-testid="timeline-footer">
       <div data-testid="turn-activity-footer">
-        {sending && (
-          <div className="flex gap-4">
-            {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
-            <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-              <Sparkles size={16} />
-            </Avatar>
-            <div className="min-w-0 flex-1">
-              <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
-            </div>
+        {showTurnActivity ? (
+          <div className="min-w-0">
+            <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
           </div>
-        )}
+        ) : null}
       </div>
       {/* 会话级 transient 软提示（超时软提示等，非消息卡片、不落库；刷新即消失，不与真内容矛盾）。 */}
       {transientNotice && (

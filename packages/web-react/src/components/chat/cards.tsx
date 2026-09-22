@@ -53,7 +53,8 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Avatar, Badge, Button, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
+import { Alert, Badge, Button, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
+import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
@@ -763,14 +764,15 @@ export function AssistantCard({
   const showRegenerate = isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast);
   // MetaRow(时间 · 积分 · token · 请求ID)只在终态帧到达后出现(见 RenderCtx.inActiveTurn 注释)。
   const metaVisible = !live && !(ctx.sending && ctx.inActiveTurn);
+  const speakerId = (msg.agentId || msg._delegateAgentId || "").trim();
+  const speaker = speakerId && speakerId !== "main" ? agentDisplayName(speakerId) : "";
 
   return (
-    <div className="group flex gap-4 animate-in" data-testid="assistant-row">
-      {/* 移动端隐藏助手头像:窄屏下头像+间距挤占正文宽度(boss 反馈),≥sm 才显示。 */}
-      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-        <Sparkles size={16} />
-      </Avatar>
-      <div className="min-w-0 flex-1">
+    <div className="group min-w-0 animate-in" data-testid="assistant-row">
+      <div className="min-w-0">
+        {speaker ? (
+          <p className="mb-1 text-xs text-muted" data-testid="assistant-speaker">{speaker}</p>
+        ) : null}
         {msg.cronPush && (
           <div className="mb-1.5">
             <Badge tone="accent">

@@ -71,6 +71,31 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       return { context, page, errors };
     }
 
+    async function frameInView(page, locator) {
+      await locator.waitFor();
+      const visible = await locator.evaluate((el) => {
+        const scroller = el.closest(".chat-scroll-area") || document.scrollingElement;
+        if (!(el instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        const box = scroller instanceof HTMLElement ? scroller.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+        const row = el.getBoundingClientRect();
+        if (scroller instanceof HTMLElement) scroller.scrollTop += row.top - box.top - 28;
+        else window.scrollTo(0, window.scrollY + row.top - 28);
+        const next = el.getBoundingClientRect();
+        const view = scroller instanceof HTMLElement ? scroller.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+        return {
+          ok: next.height > 8 && next.top >= view.top - 2 && next.top <= view.bottom - 24,
+          top: Math.round(next.top),
+          bottom: Math.round(next.bottom),
+          height: Math.round(next.height),
+          viewTop: Math.round(view.top),
+          viewBottom: Math.round(view.bottom),
+          text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
+        };
+      });
+      assert.ok(visible.ok, `target not in view: ${JSON.stringify(visible)}`);
+      return visible;
+    }
+
     const desktop = await open(1280, false);
     try {
       await desktop.page.evaluate(() => window.__processPage.setMode("legacy"));
@@ -173,7 +198,22 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.equal(clipped.lineClamp, false, "streaming answer must not be line-clamped");
       assert.equal(clipped.inProcess, true, "streaming answer left the work area");
       assert.equal(clipped.inAnswer, false, "streaming answer was promoted to the final card");
+      const streamChrome = await stream.page.evaluate(() => {
+        const process = document.querySelector("[data-testid=process-disclosure]");
+        const footer = document.querySelector("[data-testid=turn-activity-footer]");
+        const avatar = document.querySelector("[data-testid=assistant-row] .bg-grad-cta, [data-testid=turn-activity-footer] .bg-grad-cta, [data-testid=process-disclosure] .bg-grad-cta");
+        return {
+          marginLeft: process ? getComputedStyle(process).marginLeft : "",
+          avatar: !!avatar,
+          thinking: (footer?.textContent || "").includes("思考中"),
+        };
+      });
+      assert.equal(streamChrome.marginLeft, "0px", "process still reserves the avatar column");
+      assert.equal(streamChrome.avatar, false, "response avatar is still painted");
+      assert.equal(streamChrome.thinking, false, "thinking block repeats under the live body");
+      await frameInView(stream.page, stream.page.getByText("STREAM_TAIL_MARKER"));
       await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-body.png") });
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-stream-body.png") });
       await stream.page.evaluate(() => {
         const el = document.querySelector("[data-testid=process-chat-scroll]");
         if (!(el instanceof HTMLElement)) throw new Error("missing scroller");
@@ -224,6 +264,25 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.equal(stream.errors.length, 0, stream.errors.join("\n"));
     } finally {
       await stream.context.close();
+    }
+
+    const parallel = await open(1280, false);
+    try {
+      await parallel.page.evaluate(() => window.__processPage.setScene("parallel"));
+      await parallel.page.getByTestId("process-step-live").waitFor();
+      const live = await parallel.page.getByTestId("process-step-live").innerText();
+      assert.match(live, /进行中/);
+      assert.match(live, /STILL_RUNNING_FILE/);
+      assert.doesNotMatch(live, /已完成/);
+      assert.equal(await parallel.page.getByText("LATER_DONE_SECRET").count(), 0);
+      await frameInView(parallel.page, parallel.page.getByTestId("process-step-live"));
+      await parallel.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-parallel.png") });
+      await parallel.page.setViewportSize({ width: 390, height: 844 });
+      await frameInView(parallel.page, parallel.page.getByTestId("process-step-live"));
+      await parallel.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-parallel-390.png") });
+      assert.equal(parallel.errors.length, 0, parallel.errors.join("\n"));
+    } finally {
+      await parallel.context.close();
     }
 
     const find = await open(1280, false);

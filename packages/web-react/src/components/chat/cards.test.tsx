@@ -1058,3 +1058,29 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     expect(pending.closest("[data-testid=assistant-row]")).toBe(row);
   });
 });
+
+describe("普通回答不再占头像列", () => {
+  test("最终回答没有头像占位；别的 agent 只用名称", () => {
+    const { rerender } = render(
+      <AssistantCard
+        msg={{ id: "a", role: "assistant", text: "这是最终回答", ts: 1 } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    const row = screen.getByTestId("assistant-row");
+    expect(row).toHaveTextContent("这是最终回答");
+    expect(row.querySelector(".bg-grad-cta")).toBeNull();
+    expect(row.className).not.toMatch(/gap-4/);
+    expect(screen.queryByTestId("assistant-speaker")).not.toBeInTheDocument();
+    rerender(
+      <AssistantCard
+        msg={{ id: "a", role: "assistant", text: "队员回复", ts: 1, agentId: "coding-assistant" } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("coding-assistant");
+    expect(screen.getByTestId("assistant-row").querySelector(".bg-grad-cta")).toBeNull();
+  });
+});

@@ -6,7 +6,7 @@ import type { ChatMessage } from "../src/lib/chat/model";
 import { TooltipProvider } from "../src/components/ui";
 import { BASH_CMD, OLD_TS, READ_PATH, STAGE_TEXT, answerText, recentTs } from "./process-disclosure-story.mjs";
 
-type Scene = "gallery" | "stream" | "find" | "attention";
+type Scene = "gallery" | "stream" | "find" | "attention" | "parallel";
 type Mode = "legacy" | "manus";
 
 function row(id: string, role: ChatMessage["role"], text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
@@ -130,10 +130,30 @@ function attentionMessages(): ChatMessage[] {
   ];
 }
 
+function parallelMessages(): ChatMessage[] {
+  return [
+    row("u-par", "user", "两处一起查", { status: "sent" }),
+    row("read-par", "tool", "读取", {
+      _clientMessageId: "u-par",
+      toolName: "Read",
+      inputJson: { file_path: "STILL_RUNNING_FILE" },
+      _completed: false,
+    }),
+    row("grep-par", "tool", "搜索", {
+      _clientMessageId: "u-par",
+      toolName: "Grep",
+      inputJson: { pattern: "LATER_DONE_PATTERN" },
+      _completed: true,
+      output: "LATER_DONE_SECRET",
+    }),
+  ];
+}
+
 function messagesFor(scene: Scene, extra: string): ChatMessage[] {
   if (scene === "stream") return streamMessages(extra);
   if (scene === "find") return findMessages();
   if (scene === "attention") return attentionMessages();
+  if (scene === "parallel") return parallelMessages();
   return galleryMessages();
 }
 
@@ -166,7 +186,7 @@ function Harness() {
     setScene(next: Scene) {
       setScene(next);
       setExtra("");
-      setSending(next === "stream");
+      setSending(next === "stream" || next === "parallel");
       setFindOpen(next === "find");
       setRespondCount(0);
     },

@@ -91,7 +91,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
     headless: true,
     args: ["--no-sandbox"],
   });
-  const evidence = { scroll: null, clamp: null, permission: null };
+  const evidence = { scroll: null, clamp: null, permission: null, frames: [] };
   try {
     async function open(width, touch, theme) {
       const context = await browser.newContext({
@@ -146,6 +146,37 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
           text: el.textContent ?? "",
         };
       });
+    }
+
+    async function frameInView(page, locator, name) {
+      await locator.waitFor();
+      const visible = await locator.evaluate((el) => {
+        const scroller = el.closest(".chat-scroll-area");
+        if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        const view = scroller.getBoundingClientRect();
+        const row = el.getBoundingClientRect();
+        scroller.scrollTop += row.top - view.top - 28;
+        const next = el.getBoundingClientRect();
+        const box = scroller.getBoundingClientRect();
+        return {
+          ok: next.height > 8 && next.top >= box.top - 2 && next.top <= box.bottom - 24,
+          top: Math.round(next.top),
+          bottom: Math.round(next.bottom),
+          height: Math.round(next.height),
+          viewTop: Math.round(box.top),
+          viewBottom: Math.round(box.bottom),
+          text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 90),
+        };
+      });
+      assert.ok(visible.ok, `${name} not in view: ${JSON.stringify(visible)}`);
+      evidence.frames.push({ name, ...visible });
+      return visible;
+    }
+
+    async function shotFramed(page, locator, name) {
+      const visible = await frameInView(page, locator, name);
+      await page.screenshot({ path: join(shots, `${name}.png`) });
+      return visible;
     }
 
     async function align(page, locator) {
@@ -246,9 +277,26 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.getByText("先按北仓和南仓核对可售口径").waitFor();
       const clearedGoal = desktop.page.getByText("已清除的库存目标");
       await clearedGoal.waitFor();
-      assert.equal(await clearedGoal.evaluate((el) => !!el.closest("[data-testid=process-goal]")), true);
+      const goalChrome = await clearedGoal.evaluate((el) => {
+        const line = el.closest("[data-testid=process-goal-line]");
+        const card = el.closest(".rounded-lg.border");
+        return {
+          inGoal: !!el.closest("[data-testid=process-goal]"),
+          line: line instanceof HTMLElement,
+          card: !!card,
+          text: (line?.textContent || "").replace(/\s+/g, " ").trim(),
+        };
+      });
+      assert.equal(goalChrome.inGoal, true);
+      assert.equal(goalChrome.line, true, "cleared goal is still a tombstone card");
+      assert.equal(goalChrome.card, false, "cleared goal still paints a bordered card");
+      assert.match(goalChrome.text, /^目标已清除/);
+      assert.doesNotMatch(goalChrome.text, /会话目标/);
+      assert.equal(await desktop.page.getByText("tape-cleared-goal").count(), 0, "raw goal record is visible before the third level");
+      await shotFramed(desktop.page, clearedGoal, "ocv5-265-avatar-polish-cleared-goal");
       await desktop.page.getByRole("button", { name: "查看原始目标记录" }).click();
       await desktop.page.getByText("tape-cleared-goal").waitFor();
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-goal-record"), "ocv5-265-avatar-polish-goal-record");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-cleared-goal.png") });
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0);
       await align(desktop.page, desktop.page.getByTestId("process-stage").first());
@@ -364,6 +412,14 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await sendText(desktop.page, "合计还在就行");
       await desktop.page.getByText("还在。可售合计 128，南仓预警已经分开标出。").waitFor({ timeout: 20_000 });
       assert.equal(await desktop.page.getByTestId("process-disclosure").count(), shells, "plain chat grew a process shell");
+      const pureAnswer = desktop.page.getByText("还在。可售合计 128，南仓预警已经分开标出。");
+      const pureChrome = await pureAnswer.evaluate((el) => ({
+        inProcess: !!el.closest("[data-testid=process-disclosure]"),
+        avatar: !!el.closest("[data-testid=assistant-row]")?.querySelector(".bg-grad-cta"),
+      }));
+      assert.equal(pureChrome.inProcess, false, "plain chat grew a process shell");
+      assert.equal(pureChrome.avatar, false, "plain chat answer still has an avatar");
+      await shotFramed(desktop.page, pureAnswer, "ocv5-265-avatar-polish-pure");
       await desktop.page.getByRole("button", { name: "发送" }).waitFor();
 
       async function fixtureStep() {
@@ -378,6 +434,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.getByText("正在思考").waitFor();
       assert.equal(await activeShells(), 1, "thinking split the turn");
       assert.equal(await desktop.page.getByText("THINK_HIDDEN_TAIL").count(), 0, "thinking trace opened by default");
+      await shotFramed(desktop.page, desktop.page.getByText("正在思考"), "ocv5-265-avatar-polish-thinking");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-thinking.png") });
       await fixtureStep();
 
@@ -394,6 +451,10 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await phasedGoal.waitFor();
       assert.equal(await phasedGoal.evaluate((el) => !!el.closest("[data-testid=process-disclosure]")), true);
       assert.equal(await activeShells(), 1, "cleared goal split the turn");
+      const phasedGoalLine = await phasedGoal.evaluate((el) => (el.closest("[data-testid=process-goal-line]")?.textContent || "").replace(/\s+/g, " ").trim());
+      assert.match(phasedGoalLine, /^目标已清除/);
+      assert.equal(await phasedGoal.evaluate((el) => !!el.closest(".rounded-lg.border")), false);
+      await shotFramed(desktop.page, desktop.page.getByText("我先对一下这班发布落在哪"), "ocv5-265-avatar-polish-stage");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stage.png") });
       await fixtureStep();
 
@@ -401,25 +462,36 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("进行中"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0);
       assert.equal(await activeShells(), 1, "running tool split the turn");
+      const runningLive = desktop.page.getByTestId("process-step-live").filter({ hasText: "进行中" });
+      await shotFramed(desktop.page, runningLive, "ocv5-265-avatar-polish-tool-running");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-running.png") });
       await fixtureStep();
 
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("已完成"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0, "finished tool log opened itself");
       assert.equal(await activeShells(), 1);
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "已完成" }), "ocv5-265-avatar-polish-tool-done");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-done.png") });
       await fixtureStep();
 
       await desktop.page.getByText("STAGE_TWO 继续核对切流窗口").waitFor();
-      assert.equal(await desktop.page.getByText("我先对一下这班发布落在哪").count(), 0, "previous stage stayed open");
+      const previousStage = await desktop.page.locator("[data-testid=process-stage]", { hasText: "我先对一下这班发布落在哪" }).count();
+      const previousLabel = await desktop.page.getByTestId("process-stage-toggle").first().innerText();
+      assert.equal(previousStage, 0, "previous stage stayed open");
+      assert.ok(previousLabel.replace(/\s/g, "").length > 6, `stage label hard-cut: ${previousLabel}`);
+      assert.match(previousLabel, /我先对一下这班发布/);
       assert.equal(await activeShells(), 1);
+      await shotFramed(desktop.page, desktop.page.getByText("STAGE_TWO 继续核对切流窗口"), "ocv5-265-avatar-polish-next-stage");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-stage.png") });
       await fixtureStep();
 
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("VERSION"));
       assert.equal(await desktop.page.getByText("READ_SECRET").count(), 0, "read log opened itself");
-      assert.equal(await desktop.page.getByText("STAGE_TWO 继续核对切流窗口").count(), 0, "previous stage stayed open after the next tool");
+      assert.equal(await desktop.page.locator("[data-testid=process-stage]", { hasText: "STAGE_TWO 继续核对切流窗口" }).count(), 0, "previous stage stayed open after the next tool");
+      const stageLabels = await desktop.page.getByTestId("process-stage-toggle").allInnerTexts();
+      assert.ok(stageLabels.some((label) => label.includes("STAGE_TWO") && label.replace(/\s/g, "").length > 6), `stage labels hard-cut: ${stageLabels.join(" | ")}`);
       assert.equal(await activeShells(), 1, "next tool split the turn");
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "VERSION" }), "ocv5-265-avatar-polish-next-tool");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-tool.png") });
       await fixtureStep();
 
@@ -442,6 +514,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.waitForFunction(() => document.querySelector("[data-process-active=true] [data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
       await phasedToggle.click();
       await desktop.page.waitForFunction(() => document.querySelector("[data-process-active=true] [data-testid=process-toggle]")?.getAttribute("aria-expanded") === "true");
+      await shotFramed(desktop.page, desktop.page.getByText("FINAL_LONG"), "ocv5-265-avatar-polish-final-streaming");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-final-streaming.png") });
       await fixtureStep();
       await desktop.page.getByTestId("assistant-row").filter({ hasText: "FINAL_LONG" }).waitFor({ timeout: 20_000 });
@@ -453,6 +526,24 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(finalPlacement.inAnswer, true);
       assert.equal(finalPlacement.inProcess, false);
       assert.equal(await activeShells(), 0);
+      const aligned = await desktop.page.evaluate(() => {
+        const answer = [...document.querySelectorAll("[data-testid=assistant-row]")].find((el) => el.textContent?.includes("FINAL_LONG"));
+        const processes = [...document.querySelectorAll("[data-testid=process-disclosure]")];
+        const process = processes.at(-1);
+        if (!(answer instanceof HTMLElement) || !(process instanceof HTMLElement)) return null;
+        return {
+          answerLeft: Math.round(answer.getBoundingClientRect().left),
+          processLeft: Math.round(process.getBoundingClientRect().left),
+          marginLeft: getComputedStyle(process).marginLeft,
+          avatar: !!answer.querySelector(".bg-grad-cta"),
+        };
+      });
+      assert.ok(aligned, "final answer or process missing");
+      assert.equal(aligned.avatar, false, "final answer still has an avatar");
+      assert.equal(aligned.marginLeft, "0px");
+      assert.ok(Math.abs(aligned.answerLeft - aligned.processLeft) < 2, `body and process left edges differ: ${JSON.stringify(aligned)}`);
+      evidence.align = aligned;
+      await shotFramed(desktop.page, desktop.page.getByText("FINAL_LONG"), "ocv5-265-avatar-polish-final");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-final.png") });
 
       await desktop.page.getByText("待你确认").click();
@@ -557,6 +648,31 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       });
       assert.equal(order, "stage-after-user", "mobile expand left this turn");
       assert.equal(await mobile.page.getByText("数字还在吗？").count(), 1);
+      await mobile.page.getByText("FINAL_LONG").waitFor();
+      const mobileAlign = await mobile.page.evaluate(() => {
+        const answer = [...document.querySelectorAll("[data-testid=assistant-row]")].find((el) => el.textContent?.includes("FINAL_LONG"));
+        const process = answer?.previousElementSibling?.getAttribute("data-testid") === "process-disclosure"
+          ? answer.previousElementSibling
+          : [...document.querySelectorAll("[data-testid=process-disclosure]")].at(-1);
+        if (!(answer instanceof HTMLElement) || !(process instanceof HTMLElement)) return null;
+        return {
+          answerLeft: Math.round(answer.getBoundingClientRect().left),
+          processLeft: Math.round(process.getBoundingClientRect().left),
+          marginLeft: getComputedStyle(process).marginLeft,
+          avatar: !!answer.querySelector(".bg-grad-cta"),
+          width: window.innerWidth,
+        };
+      });
+      assert.ok(mobileAlign, "390 final answer missing");
+      assert.equal(mobileAlign.avatar, false);
+      assert.equal(mobileAlign.marginLeft, "0px");
+      assert.ok(Math.abs(mobileAlign.answerLeft - mobileAlign.processLeft) < 2, JSON.stringify(mobileAlign));
+      evidence.mobileAlign = mobileAlign;
+      await shotFramed(mobile.page, mobile.page.getByText("FINAL_LONG"), "ocv5-265-avatar-polish-mobile390-answer");
+      const stepToggle = mobile.page.getByTestId("process-toggle").last();
+      if (await stepToggle.getAttribute("aria-expanded") !== "true") await stepToggle.tap();
+      await mobile.page.getByText("STAGE_TWO 继续核对切流窗口").waitFor();
+      await shotFramed(mobile.page, mobile.page.getByText("STAGE_TWO 继续核对切流窗口"), "ocv5-265-avatar-polish-mobile390-step");
       assert.equal(mobile.errors.filter((error) => !/ResizeObserver/.test(error)).length, 0, mobile.errors.join("\n"));
     } catch (error) {
       console.error("APP_MOBILE_BODY", (await mobile.page.locator("body").innerText()).slice(0, 2000));
