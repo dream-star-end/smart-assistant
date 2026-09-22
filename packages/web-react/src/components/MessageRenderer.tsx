@@ -2312,9 +2312,38 @@ export function MessageList({
     }
     lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
   }, [paintStart, paintEnd, scrollParent, windowVersion, sessionId, visibleItems.length]);
-  const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
+  const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
+  // Live-unit backlog is earlier steps of the loaded turn, not an older
+  // conversation. Keep it on the latest process shell so it cannot sit
+  // above the opening message as "查看更早历史记录".
+  const olderLiveStepsKey = (() => {
+    if (!liveHasMore) return null;
+    let key: string | null = null;
+    for (const item of visibleItems) {
+      if (item.kind === "process") key = itemKey(item);
+    }
+    return key;
+  })();
+  const olderLiveStepsBusy = Boolean(archive?.loading) || archiveQueued;
+  const olderLiveStepsControl = liveHasMore ? (
+    <div className="flex justify-center pb-2" data-testid="older-live-steps-loader">
+      <button
+        type="button"
+        onClick={requestOlderLiveUnits}
+        disabled={olderLiveStepsBusy}
+        aria-busy={olderLiveStepsBusy}
+        className="inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+      >
+        {olderLiveStepsBusy
+          ? <><Spinner size={12} /> 加载中…</>
+          : archive?.error
+            ? <span className="text-danger">加载失败，点击重试</span>
+            : "加载更早的处理步骤"}
+      </button>
+    </div>
+  ) : null;
 
   const renderItem = (it: RenderItem): ReactNode => {
     if (it.kind === "process") {
@@ -2333,7 +2362,9 @@ export function MessageList({
       // reset when tokens arrive or the turn completes.
       const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
       return (
-        <ProcessDisclosure
+        <>
+          {olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
+          <ProcessDisclosure
           sections={sections}
           active={it.active}
           open={open}
@@ -2349,6 +2380,7 @@ export function MessageList({
           messagesOf={itemMessages}
           eagerDeferred={eager}
         />
+        </>
       );
     }
     if (it.kind === "single" && it.m._genPlaceholder) {
@@ -2434,7 +2466,7 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const canRevealOlder = windowStart > 0 || hasOlderHistory || liveHasMore;
+  const canRevealOlder = windowStart > 0 || hasOlderHistory;
   const historyControl = showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
@@ -2442,7 +2474,7 @@ export function MessageList({
     >
       <button
         type="button"
-        onClick={windowStart > 0 ? expandLocalWindow : liveHasMore ? requestOlderLiveUnits : hasOlderHistory ? requestOlderArchive : undefined}
+        onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
         disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
         aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
@@ -2733,6 +2765,7 @@ export function MessageList({
           style={{ height: bottomSpacerPx }}
         />
       ) : null}
+      {olderLiveStepsKey === null ? olderLiveStepsControl : null}
       {footer}
       {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
           **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following

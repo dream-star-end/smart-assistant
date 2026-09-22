@@ -1660,6 +1660,68 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
+  test("仅本轮还有未加载步骤时，不在第一句话上面显示查看更早历史记录", () => {
+    const onLoadOlderLiveUnits = vi.fn();
+    const view = render(
+      <MessageList
+        processDisclosure
+        messages={[
+          mk("user", { id: "u-open", text: "升级 codex" }),
+          mk("tool", { id: "tool-open", toolName: "Bash", text: "ls", output: "ok", _completed: true }),
+          mk("thinking", { id: "think-open", text: "看看版本" }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
+    const html = view.container.innerHTML;
+    expect(html.indexOf("升级 codex")).toBeGreaterThan(-1);
+    expect(html.indexOf("升级 codex")).toBeLessThan(html.indexOf("加载更早的处理步骤"));
+    expect(html.indexOf("加载更早的处理步骤")).toBeLessThan(html.indexOf("process-disclosure"));
+    fireEvent.click(screen.getByRole("button", { name: "加载更早的处理步骤" }));
+    expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
+  });
+
+  test("既有更早对话又有本轮未加载步骤时，顶部按钮只翻对话", async () => {
+    const onLoadOlder = vi.fn();
+    const onLoadOlderLiveUnits = vi.fn();
+    render(
+      <MessageList
+        processDisclosure
+        messages={[
+          mk("user", { id: "u-both", text: "上一页问题" }),
+          mk("tool", { id: "tool-both", toolName: "Bash", text: "pwd", output: "ok", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: true,
+          loading: false,
+          error: false,
+          onLoadOlder,
+          liveHasMoreBefore: true,
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+    expect(onLoadOlderLiveUnits).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "加载更早的处理步骤" }));
+    expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
+  });
+
   test("统一时间线保留最新思考、工具和回答，完成态思考默认折叠且可完整展开", () => {
     const rows = [
       mk("user", { id: "u-latest", text: "最新问题", ts: 1, _timelineRecord: true }),
