@@ -527,7 +527,7 @@ describe('advisor consult route lifecycle', () => {
     assert.equal(r.status, 401)
   })
 
-  it('missing invocation header is 400 and does not admit', async () => {
+  it('missing invocation header without an in-flight consult does not admit', async () => {
     const { gw, billing } = await makeGateway()
     const token = issueConsultTurnToken({
       agentId: 'main',
@@ -541,7 +541,9 @@ describe('advisor consult route lifecycle', () => {
     const r = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, {
       [DELEGATE_CONTEXT_HEADER]: token,
     })
-    assert.equal(r.status, 400)
+    assert.equal(r.status, 409)
+    assert.match(String(r.body.error), /再问一次/)
+    assert.doesNotMatch(String(r.body.error), /tool_use|一期|CCB/)
     assert.equal(billing.admits.length, 0)
   })
 
@@ -812,7 +814,7 @@ describe('advisor consult route lifecycle', () => {
     assert.equal(gw._spawnCount ?? 0, 0)
   })
 
-  it('codex parent consult is a visible capability limit, not a silent model swap', async () => {
+  it('codex parent with a stable invocation consults without switching the main model', async () => {
     const { gw, billing } = await makeGateway()
     const parent = gw.sessions.getByKey(PARENT_KEY)
     parent.providerTag = 'codex'
@@ -823,9 +825,36 @@ describe('advisor consult route lifecycle', () => {
       { question: 'why red?' },
       consultHeaders(),
     )
-    assert.equal(r.status, 409)
-    assert.match(String(r.body.error), /CCB/)
-    assert.equal(billing.admits.length, 0)
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.advice, 'check the assertion first')
+    assert.equal(billing.admits.length, 1)
+    assert.equal(parent.providerTag, 'codex')
+  })
+
+  it('grok parent without an invocation header binds the single in-flight consult tool', async () => {
+    const { gw, billing } = await makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent.providerTag = 'grok'
+    parent.runner = {
+      getPartialSnapshot: () => ({
+        completedTools: [
+          {
+            toolName: 'mcp__openclaude-memory__consult_advisor',
+            toolUseId: 'call_grok_consult_1',
+            completed: false,
+          },
+        ],
+      }),
+    }
+    const headers = consultHeaders()
+    delete headers[CONSULT_INVOCATION_HEADER]
+    const r = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.advice, 'check the assertion first')
+    assert.equal(billing.admits.length, 1)
+    const again = await http(gw, 'POST', '/api/agents/advisor/consult', { question: 'why red?' }, headers)
+    assert.equal(again.body.reused, true)
+    assert.equal(billing.admits.length, 1)
   })
 })
 
@@ -920,28 +949,36 @@ describe('M4c recovery contracts', () => {
     }
   })
 
-  it('GET/PUT consume parent engine capability: non-CCB session cannot select advisor', async () => {
-    const { gw } = await makeGateway()
-    const parent = gw.sessions.getByKey(PARENT_KEY)
-    parent.providerTag = 'codex'
-    const get = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
-    assert.equal(get.status, 200, JSON.stringify(get.body))
-    assert.equal(get.body.advisorConsultAllowed, false)
-    assert.equal(get.body.parentEngine, 'codex')
-    assert.deepEqual(get.body.advisorConsultParents, ['ccb'])
-    const before = gw._advisorConfig.read()
-    const put = await http(gw, 'PUT', '/api/collaboration-config', {
-      sessionId: 'wsess-advisor-route',
-      mode: 'advisor',
-      advisorModel: 'gpt-6-astra',
-      expectedRev: 0,
+  it('GET/PUT let every main engine select advisor and still close an unknown engine', async () => {
+    await withAdvisorCatalog(async () => {
+      const { gw } = await makeGateway()
+      const parent = gw.sessions.getByKey(PARENT_KEY)
+      parent.providerTag = 'grok'
+      const get = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
+      assert.equal(get.status, 200, JSON.stringify(get.body))
+      assert.equal(get.body.advisorConsultAllowed, true)
+      assert.equal(get.body.parentEngine, 'grok')
+      assert.deepEqual(get.body.advisorConsultParents, ['ccb', 'codex', 'grok', 'cursor'])
+      assert.doesNotMatch(String(get.body.advisorConsultParentReason), /一期|CCB|tool_use/)
+      const put = await http(gw, 'PUT', '/api/collaboration-config', {
+        sessionId: 'wsess-advisor-route',
+        mode: 'advisor',
+        advisorModel: 'gpt-6-astra',
+        expectedRev: 0,
+      })
+      assert.equal(put.status, 200, JSON.stringify(put.body))
+      assert.equal(put.body.session.mode, 'advisor')
+      parent.providerTag = 'custom-engine'
+      const denied = await http(gw, 'PUT', '/api/collaboration-config', {
+        sessionId: 'wsess-advisor-route',
+        mode: 'advisor',
+        advisorModel: 'gpt-6-astra',
+        expectedRev: put.body.rev,
+      })
+      assert.equal(denied.status, 409, JSON.stringify(denied.body))
+      assert.match(String(denied.body.error), /不能开顾问/)
+      assert.doesNotMatch(String(denied.body.error), /一期|tool_use|consult/)
     })
-    assert.equal(put.status, 409, JSON.stringify(put.body))
-    assert.match(String(put.body.error), /CCB|未知/)
-    assert.equal(gw._advisorConfig.read().rev, before.rev)
-    parent.providerTag = 'ccb'
-    const allowed = await http(gw, 'GET', '/api/collaboration-config?sessionId=wsess-advisor-route', undefined)
-    assert.equal(allowed.body.advisorConsultAllowed, true)
   })
 
   it('unknown explicit session parent engine fail-closes advisor PUT', async () => {
@@ -955,7 +992,8 @@ describe('M4c recovery contracts', () => {
       expectedRev: 0,
     })
     assert.equal(put.status, 409, JSON.stringify(put.body))
-    assert.match(String(put.body.error), /未知|fail closed|CCB/)
+    assert.match(String(put.body.error), /不能开顾问/)
+    assert.doesNotMatch(String(put.body.error), /fail closed|一期|tool_use/)
   })
 
   it('SessionManager.interrupt drives consult cancelled without test-side resume', async () => {

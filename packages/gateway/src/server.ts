@@ -286,6 +286,7 @@ import {
   historyFromSessionMessages,
   isAdvisorConsultParentEngine,
   isAdvisorEngineOpen,
+  uniquePendingConsultInvocationId,
   isCcbAdvisorModelProven,
   listProvenAdvisorModels,
   matchConsultIdentity,
@@ -12394,6 +12395,21 @@ export class Gateway {
     }
   }
 
+  private async _invocationFromLiveConsultTool(parent: {
+    runner?: { getPartialSnapshot?: () => { completedTools?: unknown[] } }
+  } | undefined): Promise<{ ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' }> {
+    const read = () => {
+      const tools = parent?.runner?.getPartialSnapshot?.()?.completedTools
+      return uniquePendingConsultInvocationId(Array.isArray(tools) ? (tools as never) : [])
+    }
+    let found = read()
+    for (let i = 0; !found.ok && found.reason === 'none' && i < 8; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      found = read()
+    }
+    return found
+  }
+
   private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!isEngineLocalTurnExempt()) return this.sendError(res, 404, 'advisor consult is selfhost only')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
@@ -12415,9 +12431,21 @@ export class Gateway {
     }
     const claims = inspected.claims
     const invocationRaw = req.headers[CONSULT_INVOCATION_HEADER]
-    const invocationId = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim()
-    if (!invocationId || !/^[A-Za-z0-9:_-]{8,128}$/.test(invocationId)) {
-      return this.sendError(res, 400, 'x-openclaude-consult-invocation required')
+    const headerInvocation = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim() ?? ''
+    if (headerInvocation && !/^[A-Za-z0-9:_-]{8,128}$/.test(headerInvocation)) {
+      return this.sendError(res, 400, 'x-openclaude-consult-invocation invalid')
+    }
+    let invocationId = headerInvocation
+    if (!invocationId) {
+      const liveParent = this.sessions?.getByKey(claims.sessionKey)
+      const bound = await this._invocationFromLiveConsultTool(liveParent)
+      if (!bound.ok) {
+        const message = bound.reason === 'ambiguous'
+          ? '这一轮有多次顾问提问叠在一起，请一次只问一个。主模型不会被切换。'
+          : '这次顾问提问还没对上同一次调用，请再问一次。主模型不会被切换。'
+        return this.sendError(res, 409, message)
+      }
+      invocationId = bound.invocationId
     }
     const userId = String(this.getUserId(req) ?? '')
     if (!userId) return this.sendError(res, 401, 'missing user')
