@@ -659,7 +659,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("续跑被拒后错误卡改写说明并隐藏「从断点继续」", () => {
+  test("计划内重启不再出错误卡，也不提供从断点继续按钮", () => {
     const error = errMsg({
       _errorCode: "SERVICE_RESTART",
       _clientMessageId: "u1",
@@ -670,7 +670,8 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       onContinueInterrupted: vi.fn(),
       resolveInterruptedContinuation: () => retryableUser,
     });
-    expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeNull();
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 

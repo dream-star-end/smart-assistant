@@ -172,6 +172,16 @@ export type StoredSession = {
    *  `outbound.permission_request` for them must not open a new card. */
   _settledPermissionRequestIds?: Record<string, true>;
   _automaticRecoveryDecisions?: Record<string, true>;
+  /** 刷新后仍未裁决的源轮。历史失败 tape 不能把它当成终态否决。 */
+  _deferredTerminalErrorClientMessageId?: string;
+  _deferredTerminalErrorPaint?: {
+    normalized: string;
+    text: string;
+    detail?: string;
+    displayMessage?: string;
+    clientMessageId?: string;
+    traceId?: string;
+  };
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
@@ -1082,6 +1092,29 @@ function isCoveredStaleLocalRow(
 }
 
 
+/** 实时 m-* 行和 tape 的 srv-* 行不是同一个 id。已提交的错误卡按 clientMessageId 迁到权威行上。 */
+function transplantCommittedErrorCards(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+  const snaps = new Map<string, NonNullable<ChatMessage["_errorCardSnapshot"]>>();
+  for (const row of local) {
+    if (
+      row?.role === "assistant" &&
+      row._errorCardSnapshot &&
+      typeof row._clientMessageId === "string" &&
+      row._clientMessageId.length > 0
+    ) {
+      snaps.set(row._clientMessageId, row._errorCardSnapshot);
+    }
+  }
+  if (snaps.size === 0) return server;
+  return server.map((row) => {
+    if (!row || row._errorCardSnapshot || row.role !== "assistant") return row;
+    if (typeof row._errorCode !== "string" || row._errorCode.length === 0) return row;
+    if (typeof row._clientMessageId !== "string") return row;
+    const snap = snaps.get(row._clientMessageId);
+    return snap ? { ...row, _errorCardSnapshot: snap } : row;
+  });
+}
+
 export function mergeFullServerWins(
   server: ChatMessage[],
   local: ChatMessage[],
@@ -1105,6 +1138,7 @@ export function mergeFullServerWins(
     adoptUnifiedTimeline?: boolean;
   },
 ): ChatMessage[] {
+  server = transplantCommittedErrorCards(server, local);
   const shadowInput = [...server, ...local];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
@@ -1346,6 +1380,7 @@ export function applyServerIncremental(
     activeClientMessageId?: string;
   },
 ): ChatMessage[] {
+  incoming = transplantCommittedErrorCards(incoming, local);
   const shadowInput = [...local, ...incoming];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
@@ -1810,6 +1845,10 @@ function mergeLocalClientFields(
   preserveTapeProcessExpansion = true,
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // 已提交的错误卡快照单调保留。后到的 tape / 免单 / 重分类不得改已经看见的颜色和文案。
+  if (localMsg._errorCardSnapshot && !serverMsg._errorCardSnapshot) {
+    serverMsg = { ...serverMsg, _errorCardSnapshot: localMsg._errorCardSnapshot };
+  }
   // INC-20260903-TURNEND-LAST-SEGMENT-FLASH: the Phase-A fallback is stamped
   // with visible_head.messageId = the LAST assistant segment id, so server-wins
   // by id swallows the live row that streamed that segment. Carry the segment

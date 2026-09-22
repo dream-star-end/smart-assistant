@@ -7088,16 +7088,14 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop();
   });
 
-  test("no decision within the grace window materializes the red card (backend silent fallback)", () => {
-    const { sock, session, user } = deferredErrorFixture("s-defer-timeout");
+  test("no decision within the grace window does not materialize an error card", () => {
+    const { sock, session } = deferredErrorFixture("s-defer-timeout");
     vi.advanceTimersByTime(19_999);
     expect(errorCards(session)).toHaveLength(0);
     expect(session._sendingInFlight).toBe(true);
-    vi.advanceTimersByTime(1);
-    expect(errorCards(session)).toHaveLength(1);
-    expect(errorCards(session)[0]._clientMessageId).toBe(user.id);
-    expect(session._sendingInFlight).toBe(false);
-    expect(user.status).toBe("error");
+    vi.advanceTimersByTime(60_000);
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
     sock.stop();
   });
 
@@ -7113,10 +7111,10 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop();
   });
 
-  test("user Stop during the soft state fences the lineage, paints the card, sends a fence-only stop and rejects a late ack adoption", () => {
+  test("user Stop during the soft state fences the lineage without painting an error card", () => {
     const { sock, ws, session, user } = deferredErrorFixture("s-defer-stop");
     sock.stopTurn("s-defer-stop");
-    expect(errorCards(session)).toHaveLength(1);
+    expect(errorCards(session)).toHaveLength(0);
     expect(session._sendingInFlight).toBe(false);
     expect(session._stopSettlement).toBeUndefined();
     expect(session._recoveryStatus).toEqual({ kind: "completed" });
@@ -7156,7 +7154,7 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
       rootClientMessageId: user.id, mode: "checkpoint", attempt: 1, max: 10,
     }) });
     expect(session._sendingInFlight).toBe(false);
-    expect(errorCards(session)).toHaveLength(1);
+    expect(errorCards(session)).toHaveLength(0);
     sock.stop();
   });
 
@@ -7319,18 +7317,17 @@ describe("ChatSocket problem card reporting", () => {
     sock.stop();
   });
 
-  test("20s grace timeout reports one failed/decision_timeout", () => {
+  test("20s grace timeout does not report a failed card", () => {
     const { sock, reports } = problemCardFixture("s-pc-dtimeout");
     vi.advanceTimersByTime(19_999);
     expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
-    vi.advanceTimersByTime(1);
-    expect(reports.filter((r) => r.outcome === "failed")).toEqual([
-      expect.objectContaining({ path: "decision_timeout", presentation: "red" }),
-    ]);
+    vi.advanceTimersByTime(60_000);
+    expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
+    expect(reports.filter((r) => r.path === "decision_timeout")).toHaveLength(0);
     sock.stop();
   });
 
-  test("scheduled:true then 30s without ack reports adoption_timeout", () => {
+  test("scheduled:true then 30s without ack does not report a failed card", () => {
     const { sock, ws, user, reports } = problemCardFixture("s-pc-atimeout");
     ws.onmessage?.({ data: JSON.stringify({
       type: "sys.recovery_decision", peer: { id: "s-pc-atimeout", kind: "dm" },
@@ -7339,10 +7336,9 @@ describe("ChatSocket problem card reporting", () => {
     }) });
     vi.advanceTimersByTime(29_999);
     expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
-    vi.advanceTimersByTime(1);
-    expect(reports.filter((r) => r.outcome === "failed")).toEqual([
-      expect.objectContaining({ path: "adoption_timeout" }),
-    ]);
+    vi.advanceTimersByTime(60_000);
+    expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
+    expect(reports.filter((r) => r.path === "adoption_timeout")).toHaveLength(0);
     sock.stop();
   });
 
@@ -7383,7 +7379,6 @@ describe("ChatSocket problem card reporting", () => {
     vi.advanceTimersByTime(20_000);
     expect(second.reports.map((r) => `${r.outcome}/${r.path}`)).toEqual([
       "pending/deferred",
-      "failed/decision_timeout",
     ]);
     second.sock.stop();
     expect(session.id).toBe("s-pc-dedupe");
