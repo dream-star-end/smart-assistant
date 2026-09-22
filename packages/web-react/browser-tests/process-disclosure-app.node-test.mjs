@@ -444,8 +444,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
         };
       });
       if (liveStagePlacement.answerInProcess) {
-        assert.equal(liveStagePlacement.previousFolded, true, `previous stage stayed open after the answer started: ${JSON.stringify(liveStagePlacement)}`);
-        assert.equal(liveStagePlacement.previousOpen, false, `previous stage stayed fully open: ${JSON.stringify(liveStagePlacement)}`);
+        assert.equal(liveStagePlacement.previousOpen, true, `previous stage unmounted after the answer started: ${JSON.stringify(liveStagePlacement)}`);
         assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
       } else {
         assert.equal(liveStagePlacement.answerOutside, true, `streaming answer left both the work area and the answer card: ${JSON.stringify(liveStagePlacement)}`);
@@ -544,10 +543,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
 
       await desktop.page.getByText("STAGE_TWO 继续核对切流窗口").waitFor();
       const previousStage = await desktop.page.locator("[data-testid=process-stage]", { hasText: "我先对一下这班发布落在哪" }).count();
-      const previousLabel = await desktop.page.getByTestId("process-stage-toggle").first().innerText();
-      assert.equal(previousStage, 0, "previous stage stayed open");
-      assert.ok(previousLabel.replace(/\s/g, "").length > 6, `stage label hard-cut: ${previousLabel}`);
-      assert.match(previousLabel, /我先对一下这班发布/);
+      assert.ok(previousStage > 0, "previous stage unmounted when the next sentence started");
       assert.equal(await activeShells(), 1);
       await shotFramed(desktop.page, desktop.page.getByText("STAGE_TWO 继续核对切流窗口"), "ocv5-265-avatar-polish-next-stage");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-stage.png") });
@@ -558,9 +554,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
         return text.includes("工具执行完成") && !text.includes("VERSION");
       });
       assert.equal(await desktop.page.getByText("READ_SECRET").count(), 0, "read log opened itself");
-      assert.equal(await desktop.page.locator("[data-testid=process-stage]", { hasText: "STAGE_TWO 继续核对切流窗口" }).count(), 0, "previous stage stayed open after the next tool");
-      const stageLabels = await desktop.page.getByTestId("process-stage-toggle").allInnerTexts();
-      assert.ok(stageLabels.some((label) => label.includes("STAGE_TWO") && label.replace(/\s/g, "").length > 6), `stage labels hard-cut: ${stageLabels.join(" | ")}`);
+      assert.ok(await desktop.page.locator("[data-testid=process-stage]", { hasText: "STAGE_TWO 继续核对切流窗口" }).count() > 0, "previous stage unmounted after the next tool");
       assert.equal(await activeShells(), 1, "next tool split the turn");
       await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "工具执行完成" }), "ocv5-265-avatar-polish-next-tool");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-tool.png") });

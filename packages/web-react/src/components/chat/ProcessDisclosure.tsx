@@ -705,6 +705,7 @@ export function ProcessDisclosure<T>({
   setOpen,
   detailOpen,
   setDetailOpen,
+  narrativeClosed = () => false,
   renderItem,
   keyOf,
   messagesOf,
@@ -716,6 +717,8 @@ export function ProcessDisclosure<T>({
   setOpen: (open: boolean) => void;
   detailOpen: (key: string) => boolean;
   setDetailOpen: (key: string, open: boolean) => void;
+  /** True only after the reader closes that stage. Unset stays painted. */
+  narrativeClosed?: (key: string) => boolean;
   renderItem: (item: T) => ReactNode;
   keyOf: (item: T) => string;
   messagesOf: (item: T) => ChatMessage[];
@@ -789,11 +792,14 @@ export function ProcessDisclosure<T>({
               }
               if (section.narrative) {
                 const current = active && index === currentIndex;
-                const revealed = detailOpen(section.key);
+                const closed = narrativeClosed(section.key);
                 // A finished turn shows every stage at level 2. While the turn
-                // is still running, only the current stage stays open; older
-                // stages collapse until the reader asks for them.
-                const show = !active || current || revealed;
+                // is still running, a stage that has already been painted stays
+                // mounted: unmounting it drops the scroll height and the
+                // stick-to-bottom correction snaps the viewport. Only an
+                // explicit close removes the body. The current stage stays
+                // open, and it is the only one rendered live.
+                const show = !active || current || !closed;
                 if (!show) {
                   return (
                     <button

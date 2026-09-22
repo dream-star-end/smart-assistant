@@ -302,8 +302,9 @@ test("OCV5-265 motion review: current-turn prefix, desktop and 390", { timeout: 
         const expandMark = await mark(session.page);
         await release();
         await session.page.getByText("REVIEW_THINK").waitFor({ timeout: 8_000 }).catch(() => {});
+        const stageBody = session.page.getByTestId("process-stage").filter({ hasText: "REVIEW_ANCHOR" });
         const stageToggle = session.page.getByTestId("process-stage-toggle").filter({ hasText: "REVIEW_ANCHOR" });
-        if (await stageToggle.count()) await stageToggle.click();
+        if ((await stageBody.count()) === 0 && (await stageToggle.count())) await stageToggle.click();
         await session.page.getByTestId("process-stage").filter({ hasText: "REVIEW_ANCHOR" }).waitFor();
         await session.page.waitForTimeout(200);
         const opened = await sliceFrom(session.page, expandMark);

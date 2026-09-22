@@ -2316,6 +2316,11 @@ export function MessageList({
             const section = sections.find((candidate) => candidate.key === key);
             return !!section && sectionHit(section);
           }}
+          narrativeClosed={(key) => {
+            if (disclosureValues[`detail:${key}`] !== false) return false;
+            const section = sections.find((candidate) => candidate.key === key);
+            return !(section && sectionHit(section));
+          }}
           setDetailOpen={(key, open) => setDisclosure(`detail:${key}`, open)}
           renderItem={renderItem}
           keyOf={renderItemKey}

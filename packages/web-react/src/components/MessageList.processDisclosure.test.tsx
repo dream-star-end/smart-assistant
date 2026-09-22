@@ -124,14 +124,16 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("turn-activity-footer")).toBeInTheDocument();
     expect(within(screen.getByTestId("process-disclosure")).queryByRole("button", { name: "停止" })).toBeNull();
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
-    const stage = screen.getByTestId("process-stage");
+    const stage = screen.getAllByTestId("process-stage").find((node) => (node.textContent ?? "").includes("看板已经做好"));
+    if (!stage) throw new Error("missing live stage");
     expect(stage).toHaveTextContent("看板已经做好");
     expect(stage.closest("[data-testid=assistant-row]")).toBeNull();
     expect(stage.className).not.toMatch(/line-clamp/);
     expect(screen.queryByTestId("assistant-row")).not.toBeInTheDocument();
     expect(within(screen.getByTestId("process-disclosure")).queryByTestId("assistant-meta")).toBeNull();
-    expect(screen.getByTestId("process-stage").textContent ?? "").not.toContain("先核对库存口径");
-    expect(screen.getByTestId("process-stage-toggle")).toHaveTextContent("先核对库存口径");
+    const openStages = screen.getAllByTestId("process-stage");
+    expect(openStages.some((node) => (node.textContent ?? "").includes("先核对库存口径"))).toBe(true);
+    expect(openStages.some((node) => (node.textContent ?? "").includes("看板已经做好"))).toBe(true);
 
     fireEvent.click(screen.getByTestId("process-toggle"));
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
@@ -152,7 +154,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("尾部仍在增长")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-toggle"));
-    expect(screen.getByTestId("process-stage")).toHaveTextContent("尾部仍在增长");
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("尾部仍在增长"))).toBe(true);
     const grownAgain = grown.map((message) =>
       message.id === "answer-1" ? { ...message, text: `${long}\n尾部仍在增长\n又一段` } : message,
     );
@@ -167,7 +169,8 @@ describe("MessageList Manus 过程披露", () => {
       />,
     );
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByTestId("process-stage")).toHaveTextContent("又一段");
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("又一段"))).toBe(true);
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("先核对库存口径"))).toBe(true);
     expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
 
     view.rerender(
@@ -911,14 +914,16 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[5]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-stage")).toHaveTextContent("STAGE_TWO");
-    expect(screen.getByTestId("process-stage").textContent ?? "").not.toContain("我先对一下这班发布落在哪");
-    const collapsedStage = screen.getByTestId("process-stage-toggle");
-    expect(collapsedStage.textContent ?? "").toContain("我先对一下这班发布落在哪");
-    expect((collapsedStage.textContent ?? "").replace(/\s/g, "").length).toBeGreaterThan(6);
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("STAGE_TWO"))).toBe(true);
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("我先对一下这班发布落在哪"))).toBe(true);
+    const collapsePrevious = screen.getByTestId("process-stage-toggle");
+    expect(collapsePrevious.textContent ?? "").toContain("我先对一下这班发布落在哪");
+    expect((collapsePrevious.textContent ?? "").replace(/\s/g, "").length).toBeGreaterThan(6);
     expect(screen.queryByText("LIVE_CMD_MARKER")).not.toBeInTheDocument();
-    fireEvent.click(collapsedStage);
-    expect(screen.getAllByText("我先对一下这班发布落在哪").some((node) => node.closest("[data-testid=process-stage]"))).toBe(true);
+    fireEvent.click(collapsePrevious);
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("我先对一下这班发布落在哪"))).toBe(false);
+    fireEvent.click(screen.getByTestId("process-stage-toggle"));
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("我先对一下这班发布落在哪"))).toBe(true);
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
@@ -1122,7 +1127,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(label.startsWith("先核对北")).toBe(true);
     expect(label).not.toBe("先核对北仓南");
     expect(toggle.textContent ?? "").not.toContain("后文不该整段挂上");
-    expect(screen.getByTestId("process-stage")).toHaveTextContent("当前阶段还在写");
+    const bodies = screen.getAllByTestId("process-stage");
+    expect(bodies.some((node) => (node.textContent ?? "").includes("后文不该整段挂上"))).toBe(true);
+    expect(bodies.some((node) => (node.textContent ?? "").includes("当前阶段还在写"))).toBe(true);
   });
 
   test("进行中的长正文后追加已清除目标，正文仍默认全文可读", () => {
@@ -1194,8 +1201,8 @@ describe("MessageList Manus 过程披露", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.queryByTestId("process-stage")).not.toBeInTheDocument();
-    expect(screen.getByTestId("process-stage-toggle")).toHaveTextContent("LONG_BODY_MARKER");
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("LONG_BODY_MARKER");
+    expect(screen.getByTestId("process-stage").textContent ?? "").toContain(sentence.repeat(2));
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在读取文件");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("NEXT_STEP_FILE");
 
@@ -1285,15 +1292,17 @@ describe("MessageList Manus 过程披露", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByTestId("process-stage")).toHaveTextContent("NEXT_STAGE_ONLY");
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("NEXT_STAGE_ONLY"))).toBe(true);
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("长段"))).toBe(true);
     expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
-    const oldToggle = screen.getByTestId("process-stage-toggle");
-    fireEvent.click(oldToggle);
     expect(screen.getByRole("button", { name: "继续显示正文" })).toBeInTheDocument();
-    expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("process-stage-toggle"));
     expect(screen.queryByRole("button", { name: "继续显示正文" })).not.toBeInTheDocument();
-    expect(screen.getByTestId("process-stage")).toHaveTextContent("NEXT_STAGE_ONLY");
+    expect(screen.getAllByTestId("process-stage").every((node) => !(node.textContent ?? "").includes("长段"))).toBe(true);
+    fireEvent.click(screen.getByTestId("process-stage-toggle"));
+    expect(screen.getByRole("button", { name: "继续显示正文" })).toBeInTheDocument();
+    expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("process-stage").some((node) => (node.textContent ?? "").includes("NEXT_STAGE_ONLY"))).toBe(true);
   });
 
   test("实时状态说人话，默认不露命令、路径和任务号，展开仍能审计原命令", () => {
