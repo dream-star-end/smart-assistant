@@ -179,6 +179,66 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       return visible;
     }
 
+    async function shotActiveGoalStage(page, kind, fileName) {
+      const shell = page.locator("[data-process-active=true]").last();
+      const toggle = shell.getByTestId("process-toggle");
+      const proof = kind === "tool"
+        ? shell.getByTestId("process-step-live")
+        : shell.getByTestId("process-stage").filter({ hasText: "FINAL_LONG" });
+      await toggle.waitFor();
+      await proof.waitFor();
+      const placed = await shell.evaluate((el, expected) => {
+        const scroller = el.closest(".chat-scroll-area");
+        if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        const toggleEl = el.querySelector("[data-testid=process-toggle]");
+        const proofEl = expected === "tool"
+          ? el.querySelector("[data-testid=process-step-live]")
+          : [...el.querySelectorAll("[data-testid=process-stage]")].find((node) => node.textContent?.includes("FINAL_LONG"));
+        if (!(toggleEl instanceof HTMLElement) || !(proofEl instanceof HTMLElement)) return { ok: false, reason: "target" };
+        const view = scroller.getBoundingClientRect();
+        scroller.scrollTop += toggleEl.getBoundingClientRect().top - view.top - 12;
+        const box = scroller.getBoundingClientRect();
+        const toggleBox = toggleEl.getBoundingClientRect();
+        const proofBox = proofEl.getBoundingClientRect();
+        const goal = el.querySelector("[data-testid=process-goal]");
+        let lineClamp = "none";
+        let node = proofEl;
+        while (node) {
+          const value = getComputedStyle(node).webkitLineClamp;
+          if (value && value !== "none") lineClamp = value;
+          node = node.parentElement;
+        }
+        const inside = (rect) => rect.height > 8 && rect.top >= box.top - 2 && rect.bottom <= box.bottom + 2 && rect.top < box.bottom - 8;
+        return {
+          ok: inside(toggleBox) && proofBox.top >= box.top - 2 && proofBox.top < box.bottom - 24 && proofBox.height > 8,
+          title: (toggleEl.textContent || "").replace(/\s+/g, " ").trim(),
+          expanded: toggleEl.getAttribute("aria-expanded"),
+          active: el.getAttribute("data-process-active"),
+          avatar: !!el.querySelector(".bg-grad-cta"),
+          lineClamp,
+          proofHeight: Math.round(proofBox.height),
+          proofText: (proofEl.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
+          goalText: (goal?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40),
+          toggle: { top: Math.round(toggleBox.top), bottom: Math.round(toggleBox.bottom), left: Math.round(toggleBox.left), width: Math.round(toggleBox.width) },
+          proof: { top: Math.round(proofBox.top), bottom: Math.round(proofBox.bottom), height: Math.round(proofBox.height) },
+          view: { top: Math.round(box.top), bottom: Math.round(box.bottom), width: window.innerWidth },
+        };
+      }, kind);
+      assert.equal(placed.active, "true", `${kind} shell is not the active process`);
+      assert.match(placed.title, /处理过程/, `${kind} title: ${placed.title}`);
+      assert.equal(placed.expanded, "true", `${kind} shell is collapsed`);
+      assert.equal(placed.avatar, false, `${kind} still paints an avatar`);
+      assert.equal(placed.lineClamp, "none", `${kind} proof is line-clamped`);
+      assert.ok(placed.proofHeight > (kind === "tool" ? 16 : 72), `${kind} proof looks truncated: ${JSON.stringify(placed)}`);
+      assert.ok(placed.ok, `${kind} target rect is outside the viewport: ${JSON.stringify(placed)}`);
+      if (kind === "tool") assert.match(placed.proofText, /进行中/);
+      if (kind === "body") assert.match(placed.proofText, /FINAL_LONG/);
+      assert.ok(placed.goalText.length > 0, `${kind} diagnostic goal is missing: ${JSON.stringify(placed)}`);
+      evidence.frames.push({ name: fileName, ...placed });
+      await page.screenshot({ path: join(shots, `${fileName}.png`) });
+      return placed;
+    }
+
     async function align(page, locator) {
       const scroller = page.locator(".chat-scroll-area");
       await scroller.hover();
@@ -390,10 +450,27 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       const liveToggle = desktop.page.getByTestId("process-toggle").last();
       assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "active process hid the current step");
       await desktop.page.getByText("南仓预警已补进看板").waitFor();
-      const liveStage = desktop.page.getByText("冻结库存仍然不进看板");
-      await liveStage.waitFor();
-      assert.equal(await liveStage.evaluate((el) => !!el.closest("[data-testid=process-stage]") && !el.closest("[data-testid=assistant-row]")), true, "current stage is not readable in the work area");
-      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+      const liveStagePlacement = await desktop.page.evaluate(() => {
+        const textIn = (selector, needle) => [...document.querySelectorAll(selector)].some((el) => el.textContent?.includes(needle));
+        return {
+          answerInProcess: textIn("[data-testid=process-stage]", "预警段落"),
+          answerOutside: textIn("[data-testid=assistant-row]", "南仓预警已补进看板"),
+          previousOpen: textIn("[data-testid=process-stage]", "冻结库存仍然不进看板"),
+          previousFolded: textIn("[data-testid=process-stage-toggle]", "冻结库存仍然不进看板"),
+          active: document.querySelector("[data-process-active=true]") ? "true" : "false",
+        };
+      });
+      if (liveStagePlacement.answerInProcess) {
+        assert.equal(liveStagePlacement.previousFolded, true, `previous stage stayed open after the answer started: ${JSON.stringify(liveStagePlacement)}`);
+        assert.equal(liveStagePlacement.previousOpen, false, `previous stage stayed fully open: ${JSON.stringify(liveStagePlacement)}`);
+        assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+      } else {
+        assert.equal(liveStagePlacement.answerOutside, true, `streaming answer left both the work area and the answer card: ${JSON.stringify(liveStagePlacement)}`);
+        if (liveStagePlacement.active === "true") {
+          assert.equal(liveStagePlacement.previousOpen, true, `stage collapsed after the answer left the shell: ${JSON.stringify(liveStagePlacement)}`);
+          assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+        }
+      }
       await desktop.page.getByTestId("scroll-to-bottom").click();
       await desktop.page.waitForFunction(() => {
         const el = document.querySelector(".chat-scroll-area");
@@ -454,6 +531,11 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       const phasedGoalLine = await phasedGoal.evaluate((el) => (el.closest("[data-testid=process-goal-line]")?.textContent || "").replace(/\s+/g, " ").trim());
       assert.match(phasedGoalLine, /^目标已清除/);
       assert.equal(await phasedGoal.evaluate((el) => !!el.closest(".rounded-lg.border")), false);
+      assert.equal(
+        await desktop.page.getByText("我先对一下这班发布落在哪").evaluate((el) => !!el.closest("[data-testid=process-stage]")),
+        true,
+        "goal clear collapsed the current stage",
+      );
       await shotFramed(desktop.page, desktop.page.getByText("我先对一下这班发布落在哪"), "ocv5-265-avatar-polish-stage");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stage.png") });
       await fixtureStep();
@@ -462,9 +544,15 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("进行中"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0);
       assert.equal(await activeShells(), 1, "running tool split the turn");
+      await desktop.page.getByText("工具仍在执行时的目标诊断").waitFor();
       const runningLive = desktop.page.getByTestId("process-step-live").filter({ hasText: "进行中" });
+      assert.match(await runningLive.innerText(), /进行中/);
       await shotFramed(desktop.page, runningLive, "ocv5-265-avatar-polish-tool-running");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-running.png") });
+      await shotActiveGoalStage(desktop.page, "tool", "ocv5-265-final-goal-stage-desktop-tool");
+      await desktop.page.setViewportSize({ width: 390, height: 844 });
+      await shotActiveGoalStage(desktop.page, "tool", "ocv5-265-final-goal-stage-mobile390-tool");
+      await desktop.page.setViewportSize({ width: 1280, height: 1000 });
       await fixtureStep();
 
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("已完成"));
@@ -496,7 +584,8 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await fixtureStep();
 
       await desktop.page.getByText("FINAL_LONG").waitFor();
-      const longPlacement = await desktop.page.getByText("FINAL_LONG").evaluate((el) => {
+      await desktop.page.getByText("正文仍在进行时的目标诊断").waitFor();
+      const longPlacement = await desktop.page.getByTestId("process-stage").filter({ hasText: "FINAL_LONG" }).evaluate((el) => {
         let lineClamp = "none";
         let node = el;
         while (node) {
@@ -509,7 +598,11 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(longPlacement.lineClamp, "none");
       assert.equal(longPlacement.inProcess, true);
       assert.equal(await activeShells(), 1, "final tokens split the turn");
-      const phasedToggle = desktop.page.getByTestId("process-toggle").last();
+      await shotActiveGoalStage(desktop.page, "body", "ocv5-265-final-goal-stage-desktop-body");
+      await desktop.page.setViewportSize({ width: 390, height: 844 });
+      await shotActiveGoalStage(desktop.page, "body", "ocv5-265-final-goal-stage-mobile390-body");
+      await desktop.page.setViewportSize({ width: 1280, height: 1000 });
+      const phasedToggle = desktop.page.getByTestId("process-toggle").filter({ hasText: "思考" }).last();
       await phasedToggle.click();
       await desktop.page.waitForFunction(() => document.querySelector("[data-process-active=true] [data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
       await phasedToggle.click();
@@ -669,7 +762,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(Math.abs(mobileAlign.answerLeft - mobileAlign.processLeft) < 2, JSON.stringify(mobileAlign));
       evidence.mobileAlign = mobileAlign;
       await shotFramed(mobile.page, mobile.page.getByText("FINAL_LONG"), "ocv5-265-avatar-polish-mobile390-answer");
-      const stepToggle = mobile.page.getByTestId("process-toggle").last();
+      const stepToggle = mobile.page.getByTestId("process-toggle").filter({ hasText: "思考" }).last();
       if (await stepToggle.getAttribute("aria-expanded") !== "true") await stepToggle.tap();
       await mobile.page.getByText("STAGE_TWO 继续核对切流窗口").waitFor();
       await shotFramed(mobile.page, mobile.page.getByText("STAGE_TWO 继续核对切流窗口"), "ocv5-265-avatar-polish-mobile390-step");

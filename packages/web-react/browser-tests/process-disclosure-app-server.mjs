@@ -693,6 +693,20 @@ async function playPhasedTurn(emit, remember, clientMessageId) {
     partialJsonDelta: "{\"command\":\"LIVE_CMD_MARKER\"}",
     partialJsonOffset: 0,
   }]);
+  await emit([{
+    kind: "goal",
+    objective: "工具仍在执行时的目标诊断",
+    status: "cleared",
+    cleared: true,
+    platformGoalId: `phased-tool-${clientMessageId}`,
+  }]);
+  remember(`goal-tool-${clientMessageId}`, "goal", "工具仍在执行时的目标诊断", {
+    _clientMessageId: clientMessageId,
+    cleared: true,
+    goalStatus: "cleared",
+    _turnTapeId: "tape-phased-tool",
+    platformGoalId: `phased-tool-${clientMessageId}`,
+  });
   await waitFixtureStep();
 
   await emit([{
@@ -753,6 +767,20 @@ async function playPhasedTurn(emit, remember, clientMessageId) {
   await emit([{ kind: "text", text: answer.slice(0, 24), messageId: answerId }]);
   await emit([{ kind: "text", text: answer.slice(24), messageId: answerId }]);
   remember(answerId, "assistant", answer, { _clientMessageId: clientMessageId });
+  await emit([{
+    kind: "goal",
+    objective: "正文仍在进行时的目标诊断",
+    status: "cleared",
+    cleared: true,
+    platformGoalId: `phased-body-${clientMessageId}`,
+  }]);
+  remember(`goal-body-${clientMessageId}`, "goal", "正文仍在进行时的目标诊断", {
+    _clientMessageId: clientMessageId,
+    cleared: true,
+    goalStatus: "cleared",
+    _turnTapeId: "tape-phased-body",
+    platformGoalId: `phased-body-${clientMessageId}`,
+  });
   await waitFixtureStep();
 }
 

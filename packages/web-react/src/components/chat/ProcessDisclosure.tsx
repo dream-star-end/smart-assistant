@@ -537,7 +537,15 @@ export function ProcessDisclosure<T>({
   const messages = sections.flatMap((section) => section.messages);
   const title = active ? "处理过程" : "工作过程";
   const summary = operationSummary(messages);
-  const lastIndex = sections.length - 1;
+  // Cleared/completed goals are diagnostics, not a new step. They must not
+  // take the current-stage identity from the work still in progress.
+  let currentIndex = -1;
+  for (let i = sections.length - 1; i >= 0; i -= 1) {
+    if (!sections[i]?.goal) {
+      currentIndex = i;
+      break;
+    }
+  }
 
   const clippedDeferred = (item: T) =>
     eagerDeferred && messagesOf(item).some((message) => message._payloadDeferred) ? (
@@ -592,7 +600,7 @@ export function ProcessDisclosure<T>({
                 );
               }
               if (section.narrative) {
-                const current = active && index === lastIndex;
+                const current = active && index === currentIndex;
                 const revealed = detailOpen(section.key);
                 // A finished turn shows every stage at level 2. While the turn
                 // is still running, only the current stage stays open; older
@@ -632,7 +640,7 @@ export function ProcessDisclosure<T>({
                 );
               }
               const details = detailOpen(section.key);
-              const live = active && index === lastIndex && !details ? stepLiveLine(section.messages) : "";
+              const live = active && index === currentIndex && !details ? stepLiveLine(section.messages) : "";
               return (
                 <div key={section.key}>
                   <button

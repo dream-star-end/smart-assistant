@@ -1112,6 +1112,126 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-stage")).toHaveTextContent("当前阶段还在写");
   });
 
+  test("进行中的长正文后追加已清除目标，正文仍默认全文可读", () => {
+    const user = row("u", "user", "写说明", { status: "sent" });
+    const prep = row("prep", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "echo PREP_DONE" },
+      _completed: true,
+      output: "PREP_SECRET",
+    });
+    const sentence = "这是还在进行的阶段说明，不该被目标诊断收起。";
+    const long = `LONG_BODY_MARKER ${sentence.repeat(8)}`;
+    const stage = row("st", "assistant", long, { _clientMessageId: "u" });
+    const goal = row("g", "goal", "库存目标", {
+      _clientMessageId: "u",
+      cleared: true,
+      goalStatus: "cleared",
+      _turnTapeId: "tape-after-body",
+    });
+    const view = renderList([user, prep, stage], { sending: true });
+    const before = screen.getByTestId("process-stage");
+    expect(before).toHaveTextContent("LONG_BODY_MARKER");
+    expect(before.textContent ?? "").toContain(sentence.repeat(2));
+    expect(before.className).not.toMatch(/line-clamp/);
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("处理过程");
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[user, prep, stage, goal]}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const body = screen.getByTestId("process-stage");
+    expect(body).toHaveTextContent("LONG_BODY_MARKER");
+    expect(body.textContent ?? "").toContain(sentence.repeat(2));
+    expect(body.className).not.toMatch(/line-clamp/);
+    expect(screen.queryByTestId("process-stage-toggle")).not.toBeInTheDocument();
+    expect(body.closest("[data-testid=process-goal]")).toBeNull();
+    expect(screen.getByTestId("process-goal")).toBeInTheDocument();
+    expect(screen.getByTestId("process-disclosure")).toHaveAttribute("data-process-active", "true");
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("process-stage")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("process-stage").textContent ?? "").toContain(sentence.repeat(2));
+
+    const next = row("next", "tool", "读取", {
+      _clientMessageId: "u",
+      toolName: "Read",
+      inputJson: { file_path: "NEXT_STEP_FILE" },
+      _completed: false,
+    });
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[user, prep, stage, goal, next]}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("process-stage")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-stage-toggle")).toHaveTextContent("LONG_BODY_MARKER");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("进行中");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("NEXT_STEP_FILE");
+
+    cleanup();
+    renderList([user, prep, stage, goal, row("ans", "assistant", "终答在壳外", { _clientMessageId: "u" })]);
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("终答在壳外").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByTestId("process-stage")).not.toBeInTheDocument();
+  });
+
+  test("进行中的工具后追加已完成目标，当前工具仍默认可见", () => {
+    const user = row("u", "user", "接着查", { status: "sent" });
+    const running = row("cmd", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "LIVE_STILL_RUNNING" },
+      _completed: false,
+    });
+    const goal = row("g", "goal", "做完的目标", {
+      _clientMessageId: "u",
+      goalStatus: "completed",
+      _turnTapeId: "tape-after-tool",
+    });
+    const view = renderList([user, running], { sending: true });
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("进行中");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("LIVE_STILL_RUNNING");
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[user, running, goal]}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const live = screen.getByTestId("process-step-live");
+    expect(live).toHaveTextContent("进行中");
+    expect(live).toHaveTextContent("LIVE_STILL_RUNNING");
+    expect(live).not.toHaveTextContent("已完成");
+    expect(screen.getByTestId("process-goal")).toBeInTheDocument();
+    expect(screen.getByTestId("process-disclosure")).toHaveAttribute("data-process-active", "true");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("处理过程");
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-details")).toHaveTextContent("LIVE_STILL_RUNNING");
+  });
+
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {
     expect(operationSummary([
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo complicated-catalog" } }),
