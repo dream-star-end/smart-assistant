@@ -231,7 +231,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(placed.lineClamp, "none", `${kind} proof is line-clamped`);
       assert.ok(placed.proofHeight > (kind === "tool" ? 16 : 72), `${kind} proof looks truncated: ${JSON.stringify(placed)}`);
       assert.ok(placed.ok, `${kind} target rect is outside the viewport: ${JSON.stringify(placed)}`);
-      if (kind === "tool") assert.match(placed.proofText, /进行中/);
+      if (kind === "tool") assert.match(placed.proofText, /工具执行中/);
       if (kind === "body") assert.match(placed.proofText, /FINAL_LONG/);
       assert.equal(placed.goalText, "", `${kind} cleared goal is still visible: ${JSON.stringify(placed)}`);
       evidence.frames.push({ name: fileName, ...placed });
@@ -520,12 +520,13 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await fixtureStep();
 
       await desktop.page.getByTestId("process-step-live").waitFor();
-      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("进行中"));
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("工具执行中"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0);
       assert.equal(await activeShells(), 1, "running tool split the turn");
       assert.equal(await desktop.page.getByText("工具仍在执行时的目标诊断").count(), 0);
-      const runningLive = desktop.page.getByTestId("process-step-live").filter({ hasText: "进行中" });
-      assert.match(await runningLive.innerText(), /进行中/);
+      const runningLive = desktop.page.getByTestId("process-step-live").filter({ hasText: "工具执行中" });
+      assert.match(await runningLive.innerText(), /工具执行中/);
+      assert.doesNotMatch(await runningLive.innerText(), /LIVE_CMD_MARKER|Bash/);
       await shotFramed(desktop.page, runningLive, "ocv5-265-avatar-polish-tool-running");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-running.png") });
       await shotActiveGoalStage(desktop.page, "tool", "ocv5-265-final-goal-stage-desktop-tool");
@@ -534,10 +535,10 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.setViewportSize({ width: 1280, height: 1000 });
       await fixtureStep();
 
-      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("已完成"));
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("工具执行完成"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0, "finished tool log opened itself");
       assert.equal(await activeShells(), 1);
-      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "已完成" }), "ocv5-265-avatar-polish-tool-done");
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "工具执行完成" }), "ocv5-265-avatar-polish-tool-done");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-done.png") });
       await fixtureStep();
 
@@ -552,13 +553,16 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-stage.png") });
       await fixtureStep();
 
-      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("VERSION"));
+      await desktop.page.waitForFunction(() => {
+        const text = document.querySelector("[data-testid=process-step-live]")?.textContent ?? "";
+        return text.includes("工具执行完成") && !text.includes("VERSION");
+      });
       assert.equal(await desktop.page.getByText("READ_SECRET").count(), 0, "read log opened itself");
       assert.equal(await desktop.page.locator("[data-testid=process-stage]", { hasText: "STAGE_TWO 继续核对切流窗口" }).count(), 0, "previous stage stayed open after the next tool");
       const stageLabels = await desktop.page.getByTestId("process-stage-toggle").allInnerTexts();
       assert.ok(stageLabels.some((label) => label.includes("STAGE_TWO") && label.replace(/\s/g, "").length > 6), `stage labels hard-cut: ${stageLabels.join(" | ")}`);
       assert.equal(await activeShells(), 1, "next tool split the turn");
-      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "VERSION" }), "ocv5-265-avatar-polish-next-tool");
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "工具执行完成" }), "ocv5-265-avatar-polish-next-tool");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-tool.png") });
       await fixtureStep();
 

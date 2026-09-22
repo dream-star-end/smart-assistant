@@ -889,13 +889,15 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[3]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("LIVE_CMD_MARKER");
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("进行中");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行中");
+    expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
+    expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("Bash");
     expect(screen.queryByText("RAW_JSON_SECRET")).not.toBeInTheDocument();
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[4]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("已完成");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行完成");
+    expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
     expect(screen.queryByText("CMD_DONE_SECRET")).not.toBeInTheDocument();
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[5]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
@@ -911,7 +913,8 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("VERSION");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行完成");
+    expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("VERSION");
     expect(screen.queryByText("READ_SECRET")).not.toBeInTheDocument();
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[7]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
@@ -1083,10 +1086,10 @@ describe("MessageList Manus 过程披露", () => {
       }),
     ], { sending: true });
     const live = screen.getByTestId("process-step-live");
-    expect(live).toHaveTextContent("进行中");
-    expect(live).toHaveTextContent("Read");
-    expect(live).toHaveTextContent("STILL_RUNNING_FILE");
-    expect(live).not.toHaveTextContent("已完成");
+    expect(live).toHaveTextContent("正在读取文件");
+    expect(live).not.toHaveTextContent("Read");
+    expect(live).not.toHaveTextContent("STILL_RUNNING_FILE");
+    expect(live).not.toHaveTextContent("工具执行完成");
     expect(live).not.toHaveTextContent("LATER_DONE_PATTERN");
     expect(screen.queryByText("LATER_DONE_SECRET")).not.toBeInTheDocument();
   });
@@ -1184,8 +1187,8 @@ describe("MessageList Manus 过程披露", () => {
     );
     expect(screen.queryByTestId("process-stage")).not.toBeInTheDocument();
     expect(screen.getByTestId("process-stage-toggle")).toHaveTextContent("LONG_BODY_MARKER");
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("进行中");
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("NEXT_STEP_FILE");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在读取文件");
+    expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("NEXT_STEP_FILE");
 
     cleanup();
     renderList([user, prep, stage, goal, row("ans", "assistant", "终答在壳外", { _clientMessageId: "u" })]);
@@ -1208,8 +1211,8 @@ describe("MessageList Manus 过程披露", () => {
       _turnTapeId: "tape-after-tool",
     });
     const view = renderList([user, running], { sending: true });
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("进行中");
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("LIVE_STILL_RUNNING");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行中");
+    expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_STILL_RUNNING");
 
     view.rerender(
       <MessageList
@@ -1222,8 +1225,8 @@ describe("MessageList Manus 过程披露", () => {
       />,
     );
     const live = screen.getByTestId("process-step-live");
-    expect(live).toHaveTextContent("进行中");
-    expect(live).toHaveTextContent("LIVE_STILL_RUNNING");
+    expect(live).toHaveTextContent("工具执行中");
+    expect(live).not.toHaveTextContent("LIVE_STILL_RUNNING");
     expect(live).not.toHaveTextContent("已完成");
     expect(screen.getByTestId("process-goal")).toBeInTheDocument();
     expect(screen.getByTestId("process-disclosure")).toHaveAttribute("data-process-active", "true");
@@ -1282,6 +1285,142 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-stage-toggle"));
     expect(screen.queryByRole("button", { name: "继续显示正文" })).not.toBeInTheDocument();
     expect(screen.getByTestId("process-stage")).toHaveTextContent("NEXT_STAGE_ONLY");
+  });
+
+  test("实时状态说人话，默认不露命令、路径和任务号，展开仍能审计原命令", () => {
+    const user = row("u", "user", "查一下", { status: "sent" });
+    const hidden = (live: HTMLElement, pattern: RegExp) => {
+      expect(live.textContent ?? "").not.toMatch(pattern);
+      expect(live.getAttribute("title")).toBeNull();
+      expect(live.getAttribute("aria-label")).toBeNull();
+      const toggle = screen.getByTestId("process-detail-toggle");
+      expect(`${toggle.getAttribute("title") ?? ""} ${toggle.getAttribute("aria-label") ?? ""} ${toggle.textContent ?? ""}`).not.toMatch(pattern);
+    };
+    const expectPhrase = (id: string, extra: Partial<ChatMessage>, phrase: string, pattern: RegExp) => {
+      cleanup();
+      renderList([
+        user,
+        row(id, "tool", "工具", { _clientMessageId: "u", _completed: false, ...extra }),
+      ], { sending: true });
+      const live = screen.getByTestId("process-step-live");
+      expect(live).toHaveTextContent(phrase);
+      hidden(live, pattern);
+    };
+
+    expectPhrase("wait", {
+      toolName: "Bash",
+      inputJson: { command: "OPENCLAUDE_GATEWAY_PORT=18790 oc-memory delegate-wait dlgjob-motion-SECRET" },
+    }, "等待子任务完成", /dlgjob|delegate-wait|Bash|18790/);
+    expectPhrase("wrap", {
+      toolName: "Bash",
+      inputJson: { command: "/bin/bash -lc 'oc-memory delegate-wait dlgjob-wrapped-SECRET'" },
+    }, "等待子任务完成", /dlgjob|SECRET|bash/);
+    expectPhrase("echo", {
+      toolName: "Bash",
+      inputJson: { command: "echo view_image /tmp/a.png imagegen dlgjob-fake" },
+    }, "工具执行中", /view_image|imagegen|dlgjob|\/tmp/);
+    expectPhrase("py", {
+      toolName: "Bash",
+      inputJson: { command: "python build.py --output /tmp/view_image.png --note imagegen" },
+    }, "工具执行中", /view_image|imagegen|\/tmp|python/);
+    expectPhrase("shot", {
+      toolName: "Bash",
+      inputJson: { command: "oc-browser screenshot --filename /home/agent/.openclaude/generated/secret-shot.png" },
+    }, "工具执行中", /secret-shot|screenshot|oc-browser|generated/);
+    expectPhrase("see", {
+      toolName: "view_image",
+      inputJson: { path: "/tmp/pic.png" },
+    }, "正在查看图片", /\/tmp|pic\.png|view_image/);
+    expectPhrase("vision", {
+      toolName: "Bash",
+      inputJson: { command: "oc-vision understand /tmp/pic.png --prompt 这是什么" },
+    }, "正在识别图片", /\/tmp|pic\.png|understand|oc-vision/);
+    expectPhrase("gen", {
+      toolName: "imagegen",
+      inputJson: { prompt: "a cat /tmp/out.png" },
+    }, "正在生成图片", /\/tmp|imagegen|cat/);
+    expectPhrase("codexgen", {
+      toolName: "codex:imageGeneration",
+      inputJson: { type: "imageGeneration", prompt: "x" },
+    }, "正在生成图片", /imageGeneration/);
+    expectPhrase("read", {
+      toolName: "Read",
+      inputJson: { file_path: "/tmp/VERSION" },
+    }, "正在读取文件", /VERSION|\/tmp|Read/);
+    expectPhrase("readimg", {
+      toolName: "Read",
+      inputJson: { file_path: "/tmp/imagegen.png" },
+    }, "正在读取文件", /imagegen|\/tmp/);
+    expectPhrase("search", {
+      toolName: "Grep",
+      inputJson: { pattern: "delegate-wait dlgjob-search" },
+    }, "正在搜索资料", /dlgjob|delegate-wait|Grep/);
+    expectPhrase("memsearch", {
+      toolName: "Bash",
+      inputJson: { command: "oc-memory core-search --query secret-topic" },
+    }, "正在搜索资料", /secret-topic|core-search|oc-memory/);
+    expectPhrase("unk", {
+      toolName: "CustomWidget",
+      inputJson: { query: "/tmp/secret" },
+    }, "工具执行中", /CustomWidget|\/tmp|secret/);
+    expectPhrase("done", {
+      toolName: "Read",
+      inputJson: { file_path: "/tmp/VERSION" },
+      _completed: true,
+      output: "ok",
+    }, "工具执行完成", /VERSION|\/tmp|Read/);
+
+    cleanup();
+    renderList([
+      user,
+      row("running", "tool", "读取", {
+        _clientMessageId: "u",
+        toolName: "Read",
+        inputJson: { file_path: "/tmp/STILL" },
+        _completed: false,
+      }),
+      row("later", "tool", "搜索", {
+        _clientMessageId: "u",
+        toolName: "Grep",
+        inputJson: { pattern: "LATER" },
+        _completed: true,
+        output: "hit",
+      }),
+    ], { sending: true });
+    const parallel = screen.getByTestId("process-step-live");
+    expect(parallel).toHaveTextContent("正在读取文件");
+    expect(parallel.textContent ?? "").not.toMatch(/工具执行完成|STILL|LATER/);
+
+    cleanup();
+    renderList([
+      user,
+      row("err", "tool", "失败命令", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "broken-probe" },
+        _completed: true,
+        error: true,
+        output: "probe-error-detail",
+      }),
+    ], { sending: true });
+    expect(screen.getByText("未成功")).toBeInTheDocument();
+    expect(screen.queryByText("工具执行完成")).not.toBeInTheDocument();
+
+    cleanup();
+    renderList([
+      user,
+      row("audit", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-memory delegate-wait dlgjob-audit-SECRET" },
+        _completed: false,
+      }),
+    ], { sending: true });
+    expect(screen.queryByText(/dlgjob-audit-SECRET/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
+    expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
   });
 
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {

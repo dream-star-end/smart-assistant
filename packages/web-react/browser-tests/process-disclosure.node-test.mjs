@@ -271,9 +271,11 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await parallel.page.evaluate(() => window.__processPage.setScene("parallel"));
       await parallel.page.getByTestId("process-step-live").waitFor();
       const live = await parallel.page.getByTestId("process-step-live").innerText();
-      assert.match(live, /进行中/);
-      assert.match(live, /STILL_RUNNING_FILE/);
+      assert.match(live, /正在读取文件/);
+      assert.doesNotMatch(live, /STILL_RUNNING_FILE/);
+      assert.doesNotMatch(live, /Read/);
       assert.doesNotMatch(live, /已完成/);
+      assert.doesNotMatch(live, /工具执行完成/);
       assert.equal(await parallel.page.getByText("LATER_DONE_SECRET").count(), 0);
       await frameInView(parallel.page, parallel.page.getByTestId("process-step-live"));
       await parallel.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-parallel.png") });

@@ -2,7 +2,7 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ProgressiveMarkdown } from "./cards";
-import { normalizeToolForDisplay, parseCodexTypeName, type ToolInput } from "../tool/format";
+import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli } from "../tool/meta";
 import { safeArtifactSrc } from "../tool/researchCards";
 import { timelineMessageKey } from "./findInSession";
@@ -487,6 +487,100 @@ function toolStillRunning(message: ChatMessage): boolean {
   return message.role === "tool" && !message._completed && !message.error && !message._isError;
 }
 
+function commandPositionOp(command: string, cli: string): string {
+  const escaped = cli.replace(/-/g, "\\-");
+  const match = new RegExp(
+    `(?:^\\s*|[\\n;&|(]\\s*)(?:\\w+=\\S*\\s+)*(?:\\S*/)?${escaped}\\s+([\\w-]+)`,
+    "i",
+  ).exec(command);
+  return (match?.[1] ?? "").toLowerCase();
+}
+
+function toolToken(name: string): string {
+  let token = name.trim();
+  const lower = token.toLowerCase();
+  const mcpAt = lower.indexOf("mcp__");
+  if (mcpAt >= 0) {
+    const segs = token.slice(mcpAt + 5).split("__");
+    token = (segs.length >= 2 ? segs[segs.length - 1] : segs[0]) ?? token;
+  } else if (lower.startsWith("codex:")) {
+    token = token.slice(token.indexOf(":") + 1);
+  }
+  return token.replace(/-/g, "_").toLowerCase();
+}
+
+const SEARCH_TOOL_TOKENS = new Set([
+  "grep",
+  "glob",
+  "websearch",
+  "web_search",
+  "webfetch",
+  "web_fetch",
+  "search_tool",
+  "semantic_search",
+  "semanticsearch",
+  "list_dir",
+  "glob_file_search",
+  "globfilesearch",
+]);
+
+/**
+ * Default live status. Tool metadata and command-position CLI verbs only —
+ * never a substring of the arguments, and never the raw command, path, or job id.
+ */
+function runningToolPhrase(message: ChatMessage): string {
+  const name = message.toolName ?? "";
+  const command = stripShellWrapperForDisplay(commandText(message));
+  const cli = detectOcCli(command);
+  if (cli === "oc-memory") {
+    const op = commandPositionOp(command, cli);
+    if (op === "delegate-wait") return "等待子任务完成";
+    if (op === "core-search" || op === "session-search" || op === "archival-search") return "正在搜索资料";
+  }
+  if (cli === "oc-vision" && commandPositionOp(command, cli) === "understand") return "正在识别图片";
+  if (isScreenshotTool(name, command)) return "工具执行中";
+
+  const codex = parseCodexTypeName(name);
+  const input = message.inputJson;
+  const inputType =
+    input && typeof input === "object" && !Array.isArray(input) && typeof (input as { type?: unknown }).type === "string"
+      ? (input as { type: string }).type
+      : "";
+  const token = toolToken(name);
+  if (
+    codex === "imageGeneration" ||
+    inputType === "imageGeneration" ||
+    token === "imagegen" ||
+    token === "image_gen" ||
+    token === "image_generation" ||
+    token === "generate_image"
+  ) {
+    return "正在生成图片";
+  }
+  if (codex === "imageView" || token === "view_image") return "正在查看图片";
+  if (token === "understand_image") return "正在识别图片";
+  if (isInspectionTool(name) || token === "read" || token === "read_file") return "正在读取文件";
+  if (SEARCH_TOOL_TOKENS.has(token)) return "正在搜索资料";
+
+  if (SHELL_TOOLS.has(token) || token === "bash" || token === "sh") {
+    const head = commandHead({ ...message, inputJson: { command } }).toLowerCase();
+    if (head === "rg" || head === "grep" || head === "find") return "正在搜索资料";
+    if (head === "cat" || head === "view") return "正在读取文件";
+  }
+  return "工具执行中";
+}
+
+function rawAuditCommand(message: ChatMessage): string {
+  if (message.role !== "tool") return "";
+  const command = stripShellWrapperForDisplay(commandText(message)).trim();
+  // Only the delegate cards hide the command entirely. Other oc-* cards already
+  // show their own summary; a second copy makes the audit row ambiguous.
+  if (detectOcCli(command) !== "oc-memory") return "";
+  const op = commandPositionOp(command, "oc-memory");
+  if (op !== "delegate" && op !== "delegate-wait" && op !== "request-review") return "";
+  return command;
+}
+
 /** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
  * A later completed sibling must not hide a tool that is still running. */
 function stepLiveLine(messages: readonly ChatMessage[]): string {
@@ -500,10 +594,12 @@ function stepLiveLine(messages: readonly ChatMessage[]): string {
     return (latest.text || "子任务").replace(/\s+/g, " ").trim().slice(0, 48);
   }
   if (latest.role === "tool") {
-    const name = latest.toolName || "工具";
-    const command = commandText(latest).replace(/\s+/g, " ").trim().slice(0, 72);
-    const state = latest._completed ? "已完成" : "进行中";
-    return command ? `${state} · ${name} · ${command}` : `${state} · ${name}`;
+    if (latest.error || latest._isError || latest._errorCode) {
+      const output = typeof latest.output === "string" ? latest.output.replace(/\s+/g, " ").trim() : "";
+      return output ? output.slice(0, 160) : "执行失败";
+    }
+    if (!latest._completed) return runningToolPhrase(latest);
+    return "工具执行完成";
   }
   return countLabel(latest);
 }
@@ -685,7 +781,22 @@ export function ProcessDisclosure<T>({
                   {details ? (
                     <div className="space-y-1.5 pt-1" data-testid="process-details">
                       {section.items.map((item) => (
-                        <div key={keyOf(item)}>{renderItem(item)}</div>
+                        <div key={keyOf(item)}>
+                          {renderItem(item)}
+                          {messagesOf(item).map((message) => {
+                            const raw = rawAuditCommand(message);
+                            if (!raw) return null;
+                            return (
+                              <pre
+                                key={`${message.id}:raw`}
+                                data-testid="process-raw-command"
+                                className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-hover/60 px-2 py-1 font-mono text-xs text-muted"
+                              >
+                                {raw}
+                              </pre>
+                            );
+                          })}
+                        </div>
                       ))}
                     </div>
                   ) : (
