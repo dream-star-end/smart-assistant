@@ -58,6 +58,7 @@ import {
 } from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
+  freezeErrorCardSnapshots,
   isDispatchLostCode,
   isDispatchTerminalRow,
 } from "./render";
@@ -1916,6 +1917,7 @@ export class ChatSocket {
         }
       },
       deferTerminalErrorForRecovery: (sessId, paint) => this.deferTerminalErrorForRecovery(sessId, paint),
+      discardDeferredTerminalError: (sessId, clientMessageId) => this.discardDeferredTerminalError(sessId, clientMessageId),
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
@@ -2860,7 +2862,21 @@ export class ChatSocket {
     if (sess) sess._deferredTerminalErrorClientMessageId = undefined;
   }
 
-  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。*/
+  /** 静默终态到达时丢掉还没画上的延后卡。已经提交的卡不动。 */
+  private discardDeferredTerminalError(sessId: string, clientMessageId?: string): void {
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    if (!pending) return;
+    if (pending.clientMessageId && clientMessageId && pending.clientMessageId !== clientMessageId) return;
+    clearTimeout(pending.timer);
+    this.pendingRecoveryErrors.delete(sessId);
+    const sess = this.sessions.get(sessId);
+    if (sess && (!clientMessageId || sess._deferredTerminalErrorClientMessageId === clientMessageId)) {
+      sess._deferredTerminalErrorClientMessageId = undefined;
+    }
+  }
+
+  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。
+   * 宽限超时不准画卡：软状态继续等真正的裁决。点停也不补错误卡。 */
   private materializePendingRecoveryError(
     sessId: string,
     cause: ProblemCardMaterializeCause,
@@ -2868,6 +2884,10 @@ export class ChatSocket {
   ): void {
     const pending = this.pendingRecoveryErrors.get(sessId);
     if (!pending) return;
+    if (cause === "decision_timeout" || cause === "adoption_timeout") {
+      clearTimeout(pending.timer);
+      return;
+    }
     clearTimeout(pending.timer);
     this.pendingRecoveryErrors.delete(sessId);
     const sess = this.sessions.get(sessId);
@@ -2875,6 +2895,29 @@ export class ChatSocket {
     sess._deferredTerminalErrorClientMessageId = undefined;
     const wasActive = sess._sendingInFlight &&
       (!pending.clientMessageId || sess._activeClientMessageId === pending.clientMessageId);
+    if (cause === "stop_fenced") {
+      if (wasActive) {
+        sess._sendingInFlight = false;
+        sess._activeClientMessageId = undefined;
+        sess._turnStatus = null;
+        this.clearThinkingSafety(sessId);
+        this.kickQueuedDrainIfIdle();
+      }
+      this.deps.persistSession?.(sessId);
+      this.scheduleNotify();
+      const rootCmid = this.problemCardRootCmid(sess, pending.clientMessageId);
+      if (rootCmid) {
+        this.reportProblemCard(sessId, {
+          rootCmid,
+          code: pending.paint.normalized,
+          outcome: "cancelled",
+          path: "stop_fenced",
+          presentation: "soft",
+          traceId: pending.paint.traceId,
+        });
+      }
+      return;
+    }
     const painted = paintDeferredTerminalError(sess, pending.paint, this.effects());
     if (wasActive && !sess._sendingInFlight) {
       // painter 已清 in-flight;补齐 socket 侧收尾(thinking-safety / 排队消息续发)。
@@ -2890,7 +2933,7 @@ export class ChatSocket {
     this.reportProblemCard(sessId, {
       rootCmid,
       code,
-      outcome: cause === "stop_fenced" ? "cancelled" : "failed",
+      outcome: "failed",
       path: cause,
       presentation: problemCardPresentation(code, false),
       ...(reason ? { reason } : {}),
@@ -4042,6 +4085,7 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
+    freezeErrorCardSnapshots(s.messages);
     // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
@@ -4759,6 +4803,7 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
+    freezeErrorCardSnapshots(s.messages);
     this.scheduleNotify();
   }
 

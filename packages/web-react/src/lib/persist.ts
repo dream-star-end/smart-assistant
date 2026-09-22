@@ -1810,6 +1810,10 @@ function mergeLocalClientFields(
   preserveTapeProcessExpansion = true,
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // 已提交的错误卡快照单调保留。后到的 tape / 免单 / 重分类不得改已经看见的颜色和文案。
+  if (localMsg._errorCardSnapshot && !serverMsg._errorCardSnapshot) {
+    serverMsg = { ...serverMsg, _errorCardSnapshot: localMsg._errorCardSnapshot };
+  }
   // INC-20260903-TURNEND-LAST-SEGMENT-FLASH: the Phase-A fallback is stamped
   // with visible_head.messageId = the LAST assistant segment id, so server-wins
   // by id swallows the live row that streamed that segment. Carry the segment

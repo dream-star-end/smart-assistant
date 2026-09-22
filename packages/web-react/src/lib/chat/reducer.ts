@@ -21,6 +21,7 @@ import {
   friendlyBridgeErrorMessage,
   getFrameSeqCursor,
   isBridgeAuthControlError,
+  isSilentTurnErrorCode,
   normalizeBridgeErrorCode,
   problemCardPresentation,
   REPORT_EXEMPT_TURN_ERR_CODES,
@@ -48,6 +49,7 @@ import {
   unwrapExecuteExtraToolInput,
 } from "./extraTool";
 import { repairPostFinalProcessOrder } from "./order";
+import { commitErrorCardSnapshot } from "./render";
 import type { PermissionPromptSnapshotPayload } from "../types";
 import {
   permissionSnapshotToRequestFrame,
@@ -103,6 +105,8 @@ export type FrameEffects = {
    * reducer 只把本轮保持在软状态「模型繁忙,正在重试中」。返回 false / 缺省 → 立即落红卡。
    */
   deferTerminalErrorForRecovery?: (sessId: string, paint: DeferredTerminalErrorPaint) => boolean;
+  /** 后到的静默终态（重启/点停）丢掉尚未画上的延后卡，不准补画。 */
+  discardDeferredTerminalError?: (sessId: string, clientMessageId?: string) => void;
   /** 非 final 且 in-flight：socket 重置 thinking-safety（证明后端活着）。*/
   onLiveFrame?: (sess: ChatSession) => void;
   /** 空轮 end_turn → deferred(setTimeout 0) 自动续写。*/
@@ -2529,12 +2533,24 @@ export type DeferredTerminalErrorPaint = {
 };
 
 function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): void {
-  addMessage(sess, "assistant", paint.text, {
-    _errorCode: paint.normalized,
-    _errorDetail: paint.detail,
-    ...(paint.clientMessageId ? { _clientMessageId: paint.clientMessageId } : {}),
-    ...(paint.traceId ? { usage: { traceId: paint.traceId } } : {}),
-  });
+  const silent = isSilentTurnErrorCode(paint.normalized);
+  const keepQuietStopLine = paint.normalized === "stopped" || paint.normalized === "user_cancelled";
+  const alreadyCommitted = paint.clientMessageId
+    ? sess.messages.some((m) =>
+      m.role === "assistant" &&
+      m._clientMessageId === paint.clientMessageId &&
+      m._errorCardSnapshot?.disposition === "card")
+    : false;
+  // 已经提交过的卡不再画第二张，也不改第一张。静默终态（重启/容器回收）不落错误行。
+  if (!alreadyCommitted && (!silent || keepQuietStopLine)) {
+    const msg = addMessage(sess, "assistant", paint.text, {
+      _errorCode: paint.normalized,
+      _errorDetail: paint.detail,
+      ...(paint.clientMessageId ? { _clientMessageId: paint.clientMessageId } : {}),
+      ...(paint.traceId ? { usage: { traceId: paint.traceId } } : {}),
+    });
+    commitErrorCardSnapshot(msg);
+  }
   // outbound.error is the structured error card; the following [error] text final is only a
   // compatibility terminator. Clear/persist locally now so a refresh in that tiny gap does not
   // resurrect the stop button or let late non-final frames revive the failed turn.
@@ -2548,14 +2564,14 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
     resetReplyTracker(sess);
     sess._localTeardownAt = sess._trackerResetAt;
     // 用户主动停止不应留下失败卡；真正错误仍把运行中生成占位转为失败态。
-    if (userCancelled) resolveGenPlaceholders(sess);
+    if (userCancelled || silent) resolveGenPlaceholders(sess);
     else failGenPlaceholders(sess, errorLabel(paint.normalized));
   }
   const exactUser = paint.clientMessageId
     ? sess.messages.find((m) => m?.role === "user" && m.id === paint.clientMessageId)
     : undefined;
   if (exactUser) {
-    exactUser.status = userCancelled ? "sent" : "error";
+    exactUser.status = userCancelled || silent ? "sent" : "error";
   } else if (!paint.clientMessageId) {
     for (let i = sess.messages.length - 1; i >= 0; i--) {
       const m = sess.messages[i];
@@ -2646,6 +2662,9 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
   };
+  if (isSilentTurnErrorCode(normalized)) {
+    effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
+  }
   // Master 拥有恢复且错误可自动恢复:红卡延后,本轮保持软状态直到 master 裁决。遥测仍照常上报。
   if (
     !userCancelled &&
@@ -2680,7 +2699,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
   const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
   paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  if (!userCancelled && immediateRoot) {
+  if (!isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
       code: normalized,
@@ -2722,6 +2741,9 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
   };
+  if (isSilentTurnErrorCode(normalized)) {
+    effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
+  }
   // legacy error 无后续 final,前端自己收尾本轮 UI;master 拥有恢复时同样延后红卡。
   if (
     !userCancelled &&
@@ -2748,7 +2770,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
   paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  if (!userCancelled && immediateRoot) {
+  if (!isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
       code: normalized,

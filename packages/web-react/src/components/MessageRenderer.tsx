@@ -1751,7 +1751,9 @@ export function MessageList({
         m.role === "assistant" &&
         !!m._errorCode &&
         typeof m._clientMessageId === "string" &&
-        recoveredSourceIds.has(m._clientMessageId)
+        recoveredSourceIds.has(m._clientMessageId) &&
+        // 已经提交的卡不许因恢复子轮再被藏掉。没提交的中间态仍隐藏。
+        m._errorCardSnapshot?.disposition !== "card"
       ) &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),

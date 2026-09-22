@@ -33,6 +33,7 @@ import type { ChatMessage } from "../../lib/chat/model";
 import {
   formatDurationSeconds,
   insufficientCreditsCopy,
+  isSilentTurnErrorCode,
   problemCardPresentation,
   speechLangFor,
 } from "../../lib/chat/pure";
@@ -663,10 +664,17 @@ export function AssistantCard({
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
   const sem = turnErrorSemantics(normalizedCode);
   const expectedError = sem.expected === true;
-  const errorTone = problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
-    ? "warning"
-    : "danger";
+  const frozenCard = msg._errorCardSnapshot?.disposition === "card" ? msg._errorCardSnapshot : undefined;
+  const errorTone = frozenCard
+    ? (frozenCard.tone === "yellow" ? "warning" : "danger")
+    : (problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
+      ? "warning"
+      : "danger");
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
+  const suppressErrorAlert =
+    !isUserCancelled &&
+    (msg._errorCardSnapshot?.disposition === "silent" ||
+      (!frozenCard && isSilentTurnErrorCode(normalizedCode)));
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),
   );
@@ -675,6 +683,9 @@ export function AssistantCard({
   const showUnpublishedProcessPending =
     msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
+  const shownTitle = frozenCard?.title ?? presentedError?.title;
+  const shownMessage = frozenCard?.message ?? presentedError?.message;
+  const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
   const creditsCopy = insufficientCreditsCopy(
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
   );
@@ -828,26 +839,26 @@ export function AssistantCard({
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
           </output>
-        ) : presentedError && (
+        ) : !suppressErrorAlert && presentedError && (
           <Alert
             tone={errorTone}
-            density={expectedError && !presentedError.waived ? "compact" : "comfortable"}
+            density={expectedError && !presentedError.waived && !frozenCard ? "compact" : "comfortable"}
             className="mt-2.5 max-w-full overflow-hidden"
-            icon={presentedError.waived ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
-            title={isInsufficient ? creditsCopy.title : presentedError.title}
+            icon={presentedError.waived && !frozenCard ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
+            title={isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
           >
             <div className="min-w-0">
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
                 {msg._recoverySkippedNotice ??
-                  (isInsufficient ? creditsCopy.message : presentedError.message)}
+                  (isInsufficient && !frozenCard ? creditsCopy.message : shownMessage)}
               </p>
-              {presentedError.detail && (
+              {shownDetail && (
                 <details className="mt-1.5 max-w-full">
                   <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg [@media(hover:none)]:py-3.5">
                     查看请求信息
                   </summary>
                   <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
-                    {presentedError.detail}
+                    {shownDetail}
                   </pre>
                 </details>
               )}

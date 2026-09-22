@@ -7664,18 +7664,28 @@ export class SessionManager {
         settle(() => resolve())
       }
 
+      let runnerExitInfo: { signal: string | null; crashed?: boolean } | undefined
       const handleError = (err: Error) => {
         // All unexpected runner failures share one recovery-facing code.  The
         // immutable detail still preserves the concrete transport/process
         // error, while the Master can make one deterministic retry decision.
-        const planned = this.shouldClassifyExitAsServiceRestart(session)
-        const persistence =
-          requestTerminalPersistence?.(
+        // Wait past handleExit's 150ms drain so a planned SIGTERM is classified
+        // once. Emitting RUNNER_CRASHED first and SERVICE_RESTART second is what
+        // repainted the same turn from red to yellow.
+        const persistence = (async () => {
+          await new Promise<void>((resolveWait) => {
+            const timer = setTimeout(resolveWait, 200)
+            timer.unref?.()
+          })
+          if (terminalPersistenceClaim !== 'none' || turn?.finalized) return
+          const planned = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+          await (requestTerminalPersistence?.(
             planned ? 'interrupted' : 'crashed',
             err.message,
             planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
             planned ? 'no_response' : undefined,
-          ) ?? Promise.resolve()
+          ) ?? Promise.resolve())
+        })()
         this._trackPersistence(persistence)
       }
 
@@ -7686,6 +7696,7 @@ export class SessionManager {
         signal: string | null
         crashed: boolean
       }) => {
+        runnerExitInfo = { signal: info.signal, crashed: info.crashed }
         // Normal lifecycle restarts (model/effort/toolset swaps and Codex
         // app-server route-token respawns) emit a clean `exit` before the turn
         // continues on the replacement process. Do not finalize/detach the

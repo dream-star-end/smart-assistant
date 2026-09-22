@@ -311,6 +311,19 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /**
+   * 错误卡第一次提交时写死的展示。之后错误码、免单、历史同步都不得改颜色、标题或正文。
+   * `silent` = 这一轮不出现错误卡（点停 / 计划内重启 / 容器回收）。
+   */
+  _errorCardSnapshot?:
+    | { disposition: "silent" }
+    | {
+        disposition: "card";
+        tone: "red" | "yellow";
+        title: string;
+        message: string;
+        detail?: string;
+      };
   /** Browser-only: last recovery skip copy, attached to the source error card. */
   _recoverySkippedNotice?: string;
   /** Highest gateway-local retry consumed before this terminal error. */

@@ -19,7 +19,7 @@ import {
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import { isServerAuthoredRow } from "./model";
 import type { BashTail, ChatMessage, ChildBlock } from "./model";
-import { friendlyBridgeErrorMessage, insufficientCreditsCopy } from "./pure";
+import { friendlyBridgeErrorMessage, insufficientCreditsCopy, isSilentTurnErrorCode, problemCardPresentation } from "./pure";
 
 /**
  * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
@@ -331,6 +331,10 @@ export function messageSignature(
         m.usage?.waived ? 1 : 0,
         m._truncated ?? "",
         m._errorCode ?? "",
+        m._errorCardSnapshot?.disposition ?? "",
+        m._errorCardSnapshot?.disposition === "card"
+          ? `${m._errorCardSnapshot.tone}:${m._errorCardSnapshot.title}:${m._errorCardSnapshot.message}`
+          : "",
         m._errorDetail ? m._errorDetail.length : 0,
         m._emptyTurn ? 1 : 0,
         m._emptyTurnSoft ? 1 : 0,
@@ -784,6 +788,40 @@ export function errorPresentation(
     ...(detailOut ? { detail: detailOut } : {}),
     waived: false,
   };
+}
+
+/**
+ * 第一次看到这条错误时写死展示。已有快照则原样返回，禁止按新错误码重算。
+ * 静默终态写 `silent`，渲染器不出错误卡。
+ */
+export function commitErrorCardSnapshot(message: ChatMessage): void {
+  if (message._errorCardSnapshot) return;
+  if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return;
+  if (isSilentTurnErrorCode(message._errorCode)) {
+    message._errorCardSnapshot = { disposition: "silent" };
+    return;
+  }
+  const presented = errorPresentation(
+    message._errorCode,
+    message.text,
+    message._errorDetail,
+    message.usage?.waived === true,
+  );
+  const tone: "red" | "yellow" =
+    presented.waived || problemCardPresentation(message._errorCode, false) === "yellow"
+      ? "yellow"
+      : "red";
+  message._errorCardSnapshot = {
+    disposition: "card",
+    tone,
+    title: presented.title,
+    message: presented.message,
+    ...(presented.detail ? { detail: presented.detail } : {}),
+  };
+}
+
+export function freezeErrorCardSnapshots(messages: readonly ChatMessage[]): void {
+  for (const message of messages) commitErrorCardSnapshot(message);
 }
 
 /**
