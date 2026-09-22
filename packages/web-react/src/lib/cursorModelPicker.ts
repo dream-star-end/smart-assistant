@@ -41,10 +41,30 @@ export type LockedCursorFamilyRow = {
   representative: LockedPublicModel
 }
 
+/** 官方 Grok Build 的标准档与 Fast 档。计费 id 仍分开，选择器里收成一行。 */
+export const GROK_BUILD_MODEL_ID = 'grok-build'
+export const GROK_BUILD_FAST_MODEL_ID = 'grok-build-fast'
+export const GROK_BUILD_FAMILY = 'grok-build'
+
+export type GrokBuildPickerRow = {
+  family: typeof GROK_BUILD_FAMILY
+  label: string
+  members: PublicModel[]
+}
+
+export function isGrokBuildCatalogId(id: string | null | undefined): boolean {
+  return id === GROK_BUILD_MODEL_ID || id === GROK_BUILD_FAST_MODEL_ID
+}
+
+export function grokBuildFastSelected(id: string | null | undefined): boolean {
+  return id === GROK_BUILD_FAST_MODEL_ID
+}
+
 export type ModelPickerRow =
   | { kind: 'plain'; model: PublicModel }
   | { kind: 'cursor-family'; row: CursorPickerRow }
   | { kind: 'context-family'; row: ContextPickerRow }
+  | { kind: 'grok-build-family'; row: GrokBuildPickerRow }
   | { kind: 'locked-cursor-family'; row: LockedCursorFamilyRow }
   | { kind: 'locked-plain'; model: LockedPublicModel }
 
@@ -125,6 +145,11 @@ function lockedPickerRows(
   return rows
 }
 
+function grokBuildMemberLabel(model: PublicModel): string {
+  const dn = (model as { display_name?: unknown }).display_name
+  return typeof dn === 'string' && dn.trim() ? dn : 'Grok 4.7'
+}
+
 /** Collapse public Cursor / GPT / Kimi catalog rows into one picker row per family. */
 export function modelPickerRows(
   models: readonly PublicModel[],
@@ -132,8 +157,24 @@ export function modelPickerRows(
 ): ModelPickerRow[] {
   const seenCursor = new Set<CursorEngineFamilyId>()
   const seenContext = new Set<ContextTierFamilyId>()
+  let seenGrokBuild = false
   const rows: ModelPickerRow[] = []
   for (const model of models) {
+    if (isGrokBuildCatalogId(model.id)) {
+      if (seenGrokBuild) continue
+      seenGrokBuild = true
+      const members = models.filter((item) => isGrokBuildCatalogId(item.id))
+      const standard = members.find((item) => item.id === GROK_BUILD_MODEL_ID)
+      rows.push({
+        kind: 'grok-build-family',
+        row: {
+          family: GROK_BUILD_FAMILY,
+          label: standard ? grokBuildMemberLabel(standard) : 'Grok 4.7',
+          members,
+        },
+      })
+      continue
+    }
     const cursor = cursorModelById(model.id)
     if (cursor) {
       if (seenCursor.has(cursor.family)) continue

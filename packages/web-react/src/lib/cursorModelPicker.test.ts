@@ -334,6 +334,20 @@ describe('collapsed GPT family group (2026-09-05)', () => {
     expect(collapsed.map(rowKey)).toEqual(['gpt-5.6-luna'])
     expect(visible.map(rowKey)).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra'])
   })
+
+  it('collapses official Grok 4.7 and Fast into one row labeled from the standard model', () => {
+    const rows = modelPickerRows([
+      { id: 'grok-build-fast', display_name: 'Grok 4.7 Fast' },
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'grok-build', display_name: 'Grok 4.7' },
+    ])
+    expect(rows.map(rowKey)).toEqual(['grok-build', 'glm-5.2'])
+    const grok = rows[0]
+    expect(grok?.kind).toBe('grok-build-family')
+    if (grok?.kind !== 'grok-build-family') return
+    expect(grok.row.label).toBe('Grok 4.7')
+    expect(grok.row.members.map((member) => member.id)).toEqual(['grok-build-fast', 'grok-build'])
+  })
 })
 
 describe('lockedModelUnlockNotice (OCV5-86)', () => {

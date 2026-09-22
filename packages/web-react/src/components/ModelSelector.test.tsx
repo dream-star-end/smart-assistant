@@ -249,6 +249,43 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
   })
 })
 
+describe('ModelSelector 官方 Grok 4.7 Fast 是速度开关', () => {
+  const GROK_MODELS: PublicModel[] = [
+    { id: 'grok-build', display_name: 'Grok 4.7', cost_x: 3.4 },
+    { id: 'grok-build-fast', display_name: 'Grok 4.7 Fast', cost_x: 6.8 },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('触发器保持 Grok 4.7，Fast 只出现在档位里', () => {
+    render(
+      <ModelSelector
+        models={GROK_MODELS}
+        selectedId="grok-build-fast"
+        onSelect={() => {}}
+        effortSupported={['high']}
+        effortActive="high"
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('Grok 4.7')
+    expect(trigger.textContent).not.toContain('Grok 4.7 Fast')
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('Fast')
+  })
+
+  it('菜单只有一行 Grok 4.7，Fast 开关改写 catalog id', async () => {
+    const onSelect = vi.fn()
+    render(<ModelSelector models={GROK_MODELS} selectedId="grok-build" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-grok-family="grok-build"]')).toBeTruthy()
+    expect(screen.queryByText('Grok 4.7 Fast')).toBeNull()
+    const fast = document.querySelector('[data-fast="true"]')
+    expect(fast).toBeTruthy()
+    if (fast) fireEvent.click(fast)
+    expect(onSelect).toHaveBeenCalledWith('grok-build-fast')
+  })
+})
+
 // C-08:当前模型被后端标 degraded 时 trigger 无任何标识,只有点开菜单才看到。
 describe('ModelSelector 降级模型 trigger 标识', () => {
   const DEG_MODELS: PublicModel[] = [

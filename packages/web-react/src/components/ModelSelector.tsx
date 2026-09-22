@@ -19,8 +19,12 @@ import {
   availableCursorEfforts,
   contextFamilyHasLong,
   contextFamilyHasStandard,
+  GROK_BUILD_FAST_MODEL_ID,
+  GROK_BUILD_MODEL_ID,
   cursorFamilyHasFast,
   cursorFamilyHasStandard,
+  grokBuildFastSelected,
+  isGrokBuildCatalogId,
   isModelDegraded,
   longContextCostConfirmationRequired,
   modelCostLabel,
@@ -223,6 +227,10 @@ function triggerLabel(
     if (cursor) return cursor.familyLabel
     const context = contextFamilyByModelId(selected.id)
     if (context) return context.familyLabel
+    if (isGrokBuildCatalogId(selected.id)) {
+      const standard = models.find((m) => m.id === GROK_BUILD_MODEL_ID)
+      return standard ? modelLabel(standard) : 'Grok 4.7'
+    }
     return modelLabel(selected)
   }
   if (loading) return '加载模型…'
@@ -236,6 +244,7 @@ function triggerLabel(
  * agent→model 的最终权威在后端）。
  *
  * Cursor 公开家族在菜单里收成一行，思考档与 Fast 作为独立控件映射回 canonical id。
+ * 官方 Grok 4.7 同样收成一行：Fast 是速度开关，对应 grok-build / grok-build-fast，不另占模型名。
  * GPT / Kimi 收成一行，上下文标准/1M 作为独立控件。
  */
 export function ModelSelector({
@@ -291,9 +300,12 @@ export function ModelSelector({
       const effort = EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label
       if (effort) parts.push(effort)
       if (selectedCursor.fast) parts.push('Fast')
-    } else if (effortSupported && effortSupported.length > 0 && effortActive) {
-      const effort = EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label
-      if (effort) parts.push(effort)
+    } else {
+      if (effortSupported && effortSupported.length > 0 && effortActive) {
+        const effort = EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label
+        if (effort) parts.push(effort)
+      }
+      if (grokBuildFastSelected(selectedId)) parts.push('Fast')
     }
     return parts.length > 0 ? parts.join(' · ') : null
   })()
@@ -327,7 +339,11 @@ export function ModelSelector({
       if (lockedModels.some((m) => m.id === id)) continue
       const row = rows.find((item) => {
         if (item.kind === 'plain') return item.model.id === id
-        if (item.kind === 'cursor-family' || item.kind === 'context-family') {
+        if (
+          item.kind === 'cursor-family' ||
+          item.kind === 'context-family' ||
+          item.kind === 'grok-build-family'
+        ) {
           return item.row.members.some((m) => m.id === id)
         }
         return false
@@ -337,10 +353,13 @@ export function ModelSelector({
       // 「最近」再出现一次同名同 ✓ 的行只会让人以为是两个模型。
       if (row.kind === 'cursor-family' && selectedCursor && row.row.family === selectedCursor.family) continue
       if (row.kind === 'context-family' && selectedContext && row.row.family === selectedContext.family) continue
+      if (row.kind === 'grok-build-family' && isGrokBuildCatalogId(selectedId)) continue
       const ident =
         row.kind === 'plain'
           ? `plain:${row.model.id}`
-          : row.kind === 'cursor-family' || row.kind === 'context-family'
+          : row.kind === 'cursor-family' ||
+              row.kind === 'context-family' ||
+              row.kind === 'grok-build-family'
             ? `${row.kind}:${row.row.family}`
             : `other:${id}`
       if (seen.has(ident)) continue
@@ -364,6 +383,10 @@ export function ModelSelector({
     selectedCursor.family !== 'auto' &&
     cursorFamilySupportsFast(selectedCursor.family) &&
     cursorMembers.some((member) => cursorModelById(member.id)?.fast)
+  const showGrokFast =
+    isGrokBuildCatalogId(selectedId) &&
+    models.some((model) => model.id === GROK_BUILD_MODEL_ID) &&
+    models.some((model) => model.id === GROK_BUILD_FAST_MODEL_ID)
   const selectedContextRow = rows.find(
     (row) => row.kind === 'context-family' && row.row.family === selectedContext?.family,
   )
@@ -519,6 +542,47 @@ export function ModelSelector({
           <span className="flex shrink-0 items-center gap-1.5">
             <CostMark model={locked} />
             <PromoBadge label={promoLabelOf(locked)} />
+          </span>
+        </PickerItem>
+      )
+    }
+    if (row.kind === 'grok-build-family') {
+      const familyActive = isGrokBuildCatalogId(selectedId)
+      const representative = familyActive
+        ? selectedId
+        : (row.row.members.find((member) => member.id === GROK_BUILD_MODEL_ID)?.id ??
+          row.row.members[0]?.id)
+      const representativeModel = row.row.members.find((item) => item.id === representative)
+      const degraded = row.row.members.every(isDegraded)
+      return (
+        <PickerItem
+          mode={mode}
+          key={`${keyPrefix}${row.row.family}`}
+          data-model-id={representative}
+          data-grok-family={row.row.family}
+          disabled={degraded}
+          onSelect={
+            degraded
+              ? undefined
+              : () => {
+                  if (representative) rememberAndSelect(representative)
+                }
+          }
+          className="justify-between"
+        >
+          <span className="truncate">{row.row.label}</span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <CostMark model={representativeModel} />
+            <PromoBadge label={promoLabelOf(representativeModel)} />
+            {degraded && <Badge tone="danger">暂不可用</Badge>}
+            {familyActive && !degraded && (
+              <>
+                {teamEngineActive && (
+                  <span className="text-caption text-faint">团队模式关闭后生效</span>
+                )}
+                <Check size={14} className="shrink-0 text-accent" />
+              </>
+            )}
           </span>
         </PickerItem>
       )
@@ -720,6 +784,39 @@ export function ModelSelector({
             >
               <span>Fast</span>
               {selectedCursor.fast && <Check size={14} className="shrink-0 text-accent" />}
+            </PickerItem>
+          </div>
+        )}
+        {showGrokFast && (
+          <div className={mode === 'menu' ? 'shrink-0' : undefined}>
+            <PickerSeparator mode={mode} />
+            <PickerLabel mode={mode} className="flex items-center justify-between">
+              速度
+              <PickerSectionSummary mode={mode}>
+                {grokBuildFastSelected(selectedId) ? 'Fast' : '标准'}
+              </PickerSectionSummary>
+            </PickerLabel>
+            <PickerItem
+              mode={mode}
+              data-fast="false"
+              onSelect={() => rememberAndSelect(GROK_BUILD_MODEL_ID)}
+              className="justify-between"
+            >
+              <span>标准</span>
+              {!grokBuildFastSelected(selectedId) && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
+            </PickerItem>
+            <PickerItem
+              mode={mode}
+              data-fast="true"
+              onSelect={() => rememberAndSelect(GROK_BUILD_FAST_MODEL_ID)}
+              className="justify-between"
+            >
+              <span>Fast</span>
+              {grokBuildFastSelected(selectedId) && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
             </PickerItem>
           </div>
         )}
