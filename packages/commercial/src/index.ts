@@ -1,3 +1,5 @@
+import { setContentReviewAlerter } from '../../gateway/src/jevContentReview.js'
+import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
  *
@@ -6878,6 +6880,8 @@ export async function registerCommercial(
     await leaderBundle.start();
     await seedPlatformAgentsForLeadership();
   }
+
+  setContentReviewAlerter((event) => { void alertContentReview(event) })
 
   return {
     handle: async (req, res) => {

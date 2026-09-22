@@ -111,6 +111,7 @@ export const adminPages: AdminPage[] = [
   // ── 运行与事故 ──
   { key: "health", title: "健康与 SLO", group: "运行与事故", desc: "业务 SLO、服务依赖和当前行动", icon: Activity, Component: lz(() => import("./pages/health")) },
   { key: "alerts", title: "告警", group: "运行与事故", desc: "当前行动、确认、静默和投递", icon: Bell, Component: lz(() => import("./pages/alerts")) },
+  { key: "contentReviews", title: "内容记录", group: "审计与安全", desc: "违规记录和一键封禁会话", icon: ShieldCheck, Component: lz(() => import("./pages/contentReviews")) },
   { key: "selfheal", title: "自愈修复", group: "运行与事故", desc: "异常事故、持续时间与自动修复审计", icon: Wrench, Component: lz(() => import("./pages/selfheal")) },
   // ── 审计与安全 ──
   { key: "audit", title: "审计与安全", group: "审计与安全", desc: "管理操作、安全事件与主机审计", icon: History, Component: lz(() => import("./pages/audit")) },

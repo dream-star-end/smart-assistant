@@ -181,6 +181,7 @@ import {
   handleAdminResolveIncident,
   handleAdminUnsuppressCondition,
 } from './admin/selfheal.js'
+import { handleAdminBanContentReview, handleAdminListContentReviews } from './admin/contentReviews.js'
 import {
   handleAdminCreateModelCatalogEntry,
   handleAdminListModelCatalog,
@@ -1058,6 +1059,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     // T-60 超管审计记录(整改批:+target/时间过滤;新增安全事件/主机审计/trace 反查)
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
+    { method: 'GET', path: '/api/admin/content-reviews', handler: handleAdminListContentReviews },
+    { method: 'POST', pathPrefix: '/api/admin/content-reviews/', handler: handleAdminBanContentReview },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
     { method: 'GET', path: '/api/admin/product-friction', handler: handleAdminProductFriction },
     { method: 'GET', path: '/api/admin/ops-overview', handler: handleAdminOpsOverview },
