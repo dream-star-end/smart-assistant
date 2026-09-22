@@ -374,7 +374,7 @@ RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
 # First `hsqs` offset in this AppImage is a false positive; use the embedded
 # --appimage-extract runtime instead of unsquashfs -o $first_offset.
 ARG OC_ZCODE_APPIMAGE_VERSION=3.8.1
-ARG OC_ZCODE_APPIMAGE_SHA256=b420dea50961b77d5c75b08b924da41ab529c720a7ec32eacbe95a6d843199e0
+ARG OC_ZCODE_APPIMAGE_SHA256=ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61
 ARG OC_ZCODE_CLI_VERSION=0.16.3
 ARG OC_INCLUDE_ZCODE=0
 RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
