@@ -290,6 +290,12 @@
       "reason": "Per-launch Grok MCP config. Not a production incident; no data loss or billing change.",
       "approvedBy": "agent:main OCV5-266",
       "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "7789592fc54c9f0c34d075fe5aa18b4b3a1c7630",
+      "reason": "Fast Grok session symlink stays on the fast home. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
     }
   ]
 }
