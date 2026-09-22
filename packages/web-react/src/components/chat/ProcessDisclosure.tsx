@@ -274,6 +274,9 @@ function outputEvidence(message: ChatMessage, displayOutput: string, outputJson:
  * command, and Read/imageView only inspect a file — neither is a deliverable.
  * Image generation, minimax/mmx, screenshots, and oc-report/slides/poster
  * stay up only when that card has a returned file it can actually show.
+ * An html/htmlpreview fence in tool output is not media: no tool body mounts
+ * HtmlPreview. Bash shows that fence as terminal text. Assistant fences still
+ * use artifactEvidenceKeys.
  */
 function renderedToolMediaKeys(message: ChatMessage): string[] {
   if (!toolSucceeded(message)) return [];
@@ -294,7 +297,6 @@ function renderedToolMediaKeys(message: ChatMessage): string[] {
   const command = commandOf(input);
   const evidence = outputEvidence(message, output, outputJson);
   return dedupe([
-    ...htmlEvidenceKeys(evidence),
     ...imageGenerationKeys(name, input, evidence),
     ...minimaxOutputKeys(command, evidence),
     ...screenshotOutputKeys(name, command, evidence),

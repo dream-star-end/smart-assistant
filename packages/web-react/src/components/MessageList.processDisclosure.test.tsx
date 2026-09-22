@@ -559,7 +559,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("构建记录在过程里").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("不同 HTML 预览各自保留，同一内容或同一 id 才折进过程", async () => {
+  test("助手的不同 HTML 预览留在顶层，Bash 里的 htmlpreview 只是终端日志", async () => {
     const alpha = "```htmlpreview\n<div>PREVIEW_ALPHA</div>\n```";
     const beta = "```htmlpreview\n<div>PREVIEW_BETA</div>\n```";
     const sameId = "```htmlpreview id=board-a\n<div>PREVIEW_OTHER</div>\n```";
@@ -604,20 +604,40 @@ describe("MessageList Manus 过程披露", () => {
       }),
       row("answer", "assistant", "预览在上面", { _clientMessageId: "u" }),
     ]);
-    const previews = await screen.findAllByTitle("HTML 沙盒预览");
-    expect(previews.length).toBeGreaterThanOrEqual(2);
-    expect(previews.every((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
+    expect(document.querySelector("[data-chat-virtual-key=html-beta]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=html-b]")).toBeNull();
     expect(document.querySelector("[data-chat-virtual-key=same-body]")).toBeNull();
     expect(document.querySelector("[data-chat-virtual-key=same-id]")).toBeNull();
-    const betaRow = document.querySelector("[data-chat-virtual-key=html-beta]");
-    const idRow = document.querySelector("[data-chat-virtual-key=html-b]");
-    expect(betaRow).not.toBeNull();
-    expect(idRow).not.toBeNull();
-    expect(betaRow?.closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(idRow?.closest("[data-testid=process-disclosure]")).toBeNull();
-    fireEvent.click(within(betaRow as HTMLElement).getByRole("button"));
-    expect(within(betaRow as HTMLElement).getByText(/PREVIEW_BETA/)).toBeInTheDocument();
-    expect(screen.queryByText(/PREVIEW_BETA/)?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText(/PREVIEW_BETA/)).not.toBeInTheDocument();
+
+    const previews = await screen.findAllByTitle("HTML 沙盒预览");
+    expect(previews).toHaveLength(2);
+    expect(previews.every((node) => node.tagName === "IFRAME")).toBe(true);
+    expect(previews.every((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
+    const docs = previews.map((node) => node.getAttribute("srcdoc") ?? "");
+    expect(docs.some((doc) => doc.includes("PREVIEW_ALPHA"))).toBe(true);
+    expect(docs.some((doc) => doc.includes("PREVIEW_OTHER"))).toBe(true);
+    expect(docs.some((doc) => doc.includes("PREVIEW_BETA"))).toBe(false);
+    expect(new Set(docs).size).toBe(2);
+
+    for (const toggle of screen.getAllByTestId("process-toggle")) fireEvent.click(toggle);
+    for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+    for (const details of screen.getAllByTestId("process-details")) {
+      for (const button of within(details).getAllByRole("button")) {
+        if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
+      }
+    }
+    const betaSource = screen.getByText(/PREVIEW_BETA/);
+    const betaPre = betaSource.closest("pre");
+    expect(betaPre?.closest("[data-testid=process-details]")).not.toBeNull();
+    expect(betaPre?.closest("[data-chat-virtual-key=html-beta]")).toBeNull();
+    expect(betaPre?.textContent ?? "").toMatch(/\$ cat beta\.html/);
+    expect(betaPre?.textContent ?? "").toMatch(/```htmlpreview/);
+    expect(betaPre?.textContent ?? "").toMatch(/PREVIEW_BETA/);
+    const folded = screen.getAllByTestId("process-details").map((node) => node.textContent ?? "").join("\n");
+    expect(folded).toMatch(/\$ cat alpha\.html/);
+    expect(folded).toMatch(/PREVIEW_ALPHA/);
+    expect(folded).toMatch(/id=board-b/);
   });
 
   test("查询和句末标点归一后同一生成文件才去重，真实文件名保留", async () => {
