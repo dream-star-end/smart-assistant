@@ -365,22 +365,30 @@ function liveBackgroundSubtask(message: ChatMessage): boolean {
 }
 
 /**
- * Fold only quiet process rows. `final` means this assistant is the turn's
- * visible answer (including a deferred locator that will become that answer).
+ * A finished tool, thought, or plan that merely missed (missing path, empty
+ * probe, nonzero exit). It stays inside the disclosure. The error fact is
+ * unchanged; only the standalone card is avoided.
+ */
+function ordinaryToolMiss(message: ChatMessage): boolean {
+  if (message.role !== "tool" && message.role !== "thinking" && message.role !== "plan") return false;
+  return Boolean(message.error || message._isError || message._errorCode);
+}
+
+/**
+ * Fold quiet process rows, including an ordinary tool miss. Rows that need
+ * the user, a failed or still-running subtask, and a turn-level failure stay
+ * outside. `final` means this assistant is the turn's visible answer
+ * (including a deferred locator that will become that answer).
  */
 export function isProcessMessage(
   message: ChatMessage,
   final: boolean,
   assistantArtifactKeys?: ReadonlySet<string>,
 ): boolean {
-  if (
-    message.error ||
-    message._isError ||
-    message._errorCode ||
-    message._turnStatusRecord ||
-    message._genPlaceholder ||
-    message._turnTapeProcess
-  ) {
+  if (message._turnStatusRecord || message._genPlaceholder || message._turnTapeProcess) {
+    return false;
+  }
+  if ((message.error || message._isError || message._errorCode) && !ordinaryToolMiss(message)) {
     return false;
   }
   if (message._delegateStatus === "failed" || message._delegateStatus === "timeout") return false;
@@ -657,8 +665,8 @@ function stepLiveLine(messages: readonly ChatMessage[]): string {
   }
   if (latest.role === "tool") {
     if (latest.error || latest._isError || latest._errorCode) {
-      const output = typeof latest.output === "string" ? latest.output.replace(/\s+/g, " ").trim() : "";
-      return output ? output.slice(0, 160) : "执行失败";
+      // The raw miss stays in the expanded card. The live line only says the step did not succeed.
+      return "未成功";
     }
     if (!latest._completed) return runningToolPhrase(latest);
     return "工具执行完成";

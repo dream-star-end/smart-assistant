@@ -187,7 +187,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(answer.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("提问、失败、审批和后台子任务不被折进过程", async () => {
+  test("提问、审批和后台子任务不被折进过程，普通工具失败收在过程里", async () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
       row("stage", "assistant", "我先查一下", { _clientMessageId: "u" }),
@@ -230,12 +230,20 @@ describe("MessageList Manus 过程披露", () => {
       row("answer", "assistant", "还差你的确认", { _clientMessageId: "u" }),
     ]);
     expect(screen.getByText("还差你的确认")).toBeInTheDocument();
-    expect(screen.getByText("未成功")).toBeInTheDocument();
+    expect(screen.queryByText("未成功")).not.toBeInTheDocument();
+    expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     expect(screen.getByTestId("permission-card")).toBeInTheDocument();
     const approval = await screen.findByText("任务待你确认");
     expect(approval.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.getByText("后台盘点还在跑")).toBeInTheDocument();
     expect(screen.queryByText("hidden-probe-cmd")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    const details = screen.getByTestId("process-details");
+    expect(within(details).getAllByText("未成功").length).toBeGreaterThan(0);
+    expect(within(details).getAllByText("probe-error-detail").length).toBeGreaterThan(0);
+    expect(details.closest("[data-testid=process-disclosure]")).not.toBeNull();
   });
 
   test("两轮、分页、刷新和切会话不会串组或带走展开", () => {
@@ -500,7 +508,7 @@ describe("MessageList Manus 过程披露", () => {
     // 命令里的生成路径不是交付：only 不得作为顶层文件成品出现。
     expect(screen.queryByText(/only-board\.csv/)).not.toBeInTheDocument();
     expect(document.querySelector("[data-chat-virtual-key=only]")).toBeNull();
-    expect(screen.getByText("未成功").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText("未成功")).not.toBeInTheDocument();
     expect(screen.queryByText(/paper\.pdf/)).not.toBeInTheDocument();
     expect(screen.queryByText("生成图片")).not.toBeInTheDocument();
     expect(screen.queryByText("货架静物")).not.toBeInTheDocument();
@@ -521,6 +529,7 @@ describe("MessageList Manus 过程披露", () => {
     }
     const onlyText = within(second).getByText(/only-board\.csv/);
     expect(onlyText.closest("[data-testid=process-details]")).not.toBeNull();
+    expect(within(second).getAllByText("未成功").length).toBeGreaterThan(0);
     expect(onlyText.closest("[title='文件准备中…(容器冷启时稍候)']")).toBeNull();
     expect(document.querySelector("[data-chat-virtual-key=only]")).toBeNull();
   });
@@ -1415,7 +1424,9 @@ describe("MessageList Manus 过程披露", () => {
         output: "probe-error-detail",
       }),
     ], { sending: true });
-    expect(screen.getByText("未成功")).toBeInTheDocument();
+    const missed = screen.getByText("未成功");
+    expect(missed.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     expect(screen.queryByText("工具执行完成")).not.toBeInTheDocument();
 
     cleanup();
