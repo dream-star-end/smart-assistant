@@ -295,16 +295,21 @@ describe('collapsed GPT family group (2026-09-05)', () => {
     { id: 'gpt-5.6-luna-1m', display_name: 'GPT-5.6-Luna' },
   ]
 
-  it('flags Terra/Luna rows collapsed and leaves Astra/Sol visible', () => {
-    const rows = modelPickerRows(MODELS)
+  it('keeps GPT-6 families expanded and does not group retired GPT-5.6 rows', () => {
+    const rows = modelPickerRows([
+      ...MODELS,
+      { id: 'gpt-6-sol', display_name: 'GPT-6-Sol' },
+      { id: 'gpt-6-sol-1m', display_name: 'GPT-6-Sol' },
+      { id: 'gpt-6-luna', display_name: 'GPT-6-Luna' },
+      { id: 'gpt-6-luna-1m', display_name: 'GPT-6-Luna' },
+    ])
     const flags = rows
       .filter((row) => row.kind === 'context-family')
       .map((row) => (row.kind === 'context-family' ? [row.row.family, row.row.collapsed] : []))
     expect(flags).toEqual([
-      ['gpt-5.6-sol', false],
       ['gpt-6-astra', false],
-      ['gpt-5.6-terra', true],
-      ['gpt-5.6-luna', true],
+      ['gpt-6-sol', false],
+      ['gpt-6-luna', false],
     ])
   })
 

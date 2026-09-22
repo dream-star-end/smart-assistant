@@ -48,7 +48,7 @@ import {
 } from '../engineModels.js'
 
 describe('GPT-5.6 / GPT-6 engine model authority', () => {
-  test('exactly the GPT-5.6 series plus GPT-6-Astra are Codex models; GPT-5.5 is retired', () => {
+  test('exactly the GPT-5.6 series plus GPT-6 Astra/Sol/Luna are Codex models; GPT-5.5 is retired', () => {
     assert.deepEqual(CODEX_ENGINE_MODEL_IDS, [
       'gpt-5.6-sol',
       'gpt-5.6-terra',
@@ -58,6 +58,10 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
       'gpt-5.6-luna-1m',
       'gpt-6-astra',
       'gpt-6-astra-1m',
+      'gpt-6-sol',
+      'gpt-6-sol-1m',
+      'gpt-6-luna',
+      'gpt-6-luna-1m',
     ])
     assert.equal(DEFAULT_CODEX_ENGINE_MODEL, 'gpt-6-astra')
     assert.equal(isCodexLongContextModel('gpt-6-astra'), false)
@@ -65,6 +69,12 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     assert.equal(codexTransportModelId('gpt-6-astra-1m'), 'gpt-6-astra')
     assert.equal(modelReasoningPolicy('gpt-6-astra').codexModelDefault, 'xhigh')
     assert.equal(modelReasoningPolicy('gpt-6-astra-1m').codexModelDefault, 'xhigh')
+    assert.equal(modelReasoningPolicy('gpt-6-sol').codexModelDefault, 'medium')
+    assert.equal(modelReasoningPolicy('gpt-6-luna').codexModelDefault, 'medium')
+    assert.equal(codexTransportModelId('gpt-6-sol-1m'), 'gpt-6-sol')
+    assert.equal(codexTransportModelId('gpt-6-luna-1m'), 'gpt-6-luna')
+    assert.equal(isCodexLongContextModel('gpt-6-sol-1m'), true)
+    assert.equal(isCodexLongContextModel('gpt-6-luna'), false)
     assert.equal(isCodexEngineModel('gpt-6'), false)
     for (const id of CODEX_ENGINE_MODEL_IDS) assert.equal(isCodexEngineModel(id), true)
     assert.equal(isCodexEngineModel('gpt-5.5'), false)
@@ -90,21 +100,23 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     assert.equal(modelReasoningPolicy('gpt-5.6-sol').supported.includes('ultra' as never), false)
   })
 
-  test('context-tier families: Astra first, Terra/Luna collapsed by default', () => {
+  test('context-tier families: GPT-6 Astra/Sol/Luna expanded, GPT-5.6 not selectable', () => {
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.map((f) => f.family),
-      ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'kimi-k3'],
+      ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'kimi-k3'],
     )
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.filter((f) => f.collapsedByDefault).map((f) => f.family),
-      ['gpt-5.6-terra', 'gpt-5.6-luna'],
+      [],
     )
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-astra'), false)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-sol'), false)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-terra'), true)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-luna'), true)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6-sol'), false)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6-luna'), false)
+    assert.equal(contextFamilyByModelId('gpt-5.6-sol'), undefined)
     assert.equal(contextFamilyCollapsedByDefault('kimi-k3'), false)
     assert.equal(contextFamilyByModelId('gpt-6-astra-1m')?.family, 'gpt-6-astra')
+    assert.equal(contextFamilyByModelId('gpt-6-sol-1m')?.family, 'gpt-6-sol')
+    assert.equal(contextFamilyByModelId('gpt-6-luna-1m')?.family, 'gpt-6-luna')
     assert.equal(COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL, '更多 GPT 模型')
     for (const family of CONTEXT_TIER_FAMILIES) {
       if (family.family === 'kimi-k3') continue

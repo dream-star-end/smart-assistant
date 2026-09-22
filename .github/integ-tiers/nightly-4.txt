@@ -56,6 +56,7 @@ packages/commercial/src/__tests__/migration0257.integ.test.ts
 packages/commercial/src/__tests__/migration0258.integ.test.ts
 packages/commercial/src/__tests__/migration0259CursorGemini38Flash.integ.test.ts
 packages/commercial/src/__tests__/migration0263Gpt6Astra.integ.test.ts
+packages/commercial/src/__tests__/migration0288Gpt6SolLuna.integ.test.ts
 packages/commercial/src/__tests__/migration0264.integ.test.ts
 packages/commercial/src/__tests__/runtimeKindIsolation.integ.test.ts
 packages/commercial/src/__tests__/desktopEnroll.integ.test.ts

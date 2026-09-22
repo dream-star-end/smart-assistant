@@ -167,7 +167,8 @@
     "0284_grok_build_fast_retire_grok_46",
     "0285_content_review_strikes",
     "0286_claude_opus_55",
-    "0287_claude_opus_55_context_1m"
+    "0287_claude_opus_55_context_1m",
+    "0288_gpt6_sol_luna_retire_gpt56"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

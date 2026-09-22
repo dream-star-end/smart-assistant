@@ -291,7 +291,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
-      npm install -g @openai/codex@0.153.3 --no-audit --no-fund \
+      npm install -g @openai/codex@0.155.1 --no-audit --no-fund \
       && npm cache clean --force \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
