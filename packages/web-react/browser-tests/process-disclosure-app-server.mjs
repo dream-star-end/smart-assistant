@@ -1,12 +1,14 @@
 import { createServer } from "node:http";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, sep } from "node:path";
+import { WebSocketServer } from "ws";
 import {
   BASH_CMD,
   BOARD_SESSION,
   CSV_BODY,
   CSV_NAME,
   CSV_PATH,
+  DASHBOARD_HTML,
   OLD_TS,
   READ_PATH,
   STAGE_TEXT,
@@ -16,20 +18,43 @@ import {
 } from "./process-disclosure-story.mjs";
 
 const CSV_URL = "/api/media-signed?t=inventory-board";
+const OLDER_CURSOR = "inventory-older-1";
+
+function streamGapMs() {
+  const value = Number(process.env.OC_E2E_STREAM_GAP_MS || 160);
+  return Number.isFinite(value) && value >= 0 ? value : 160;
+}
 
 function row(seq, id, role, text, extra = {}) {
+  const owner = extra._clientMessageId;
   return {
     id,
     role,
     text,
-    ts: OLD_TS,
+    ts: extra.ts ?? OLD_TS,
     _source: "server",
     _orderSeq: seq,
     _seq: seq,
     _timelineRecord: true,
-    _timelineUnitKey: `outer:${seq}:${id}`,
+    _timelineUnitKey: extra._timelineUnitKey || `unit:${seq}:${id}`,
+    ...(owner ? { _turnOwnerId: owner } : {}),
     ...extra,
   };
+}
+
+function stamp(messages, startSeq) {
+  return messages.map((message, index) => {
+    const seq = startSeq + index;
+    const owner = message._clientMessageId;
+    return {
+      ...message,
+      _orderSeq: seq,
+      _seq: seq,
+      _timelineRecord: true,
+      _timelineUnitKey: `unit:${seq}:${message.id}`,
+      ...(owner ? { _clientMessageId: owner, _turnOwnerId: owner } : {}),
+    };
+  });
 }
 
 export function boardMessages() {
@@ -73,34 +98,75 @@ export function boardMessages() {
   ];
 }
 
+/** Two earlier turns of the same inventory task. Not a technical probe. */
+export function olderMessages() {
+  const day = 86_400_000;
+  const t0 = OLD_TS - 2 * day;
+  let n = 1;
+  const next = (id, role, text, extra) => row(n++, id, role, text, extra);
+  return [
+    next("u-scope", "user", "先把北仓和南仓的可售范围说清楚", { status: "replied", ts: t0 }),
+    next("a-scope", "assistant", "可售只算在架库存。冻结库存不进合计，也不进这张看板。", {
+      _clientMessageId: "u-scope",
+      ts: t0 + 1000,
+    }),
+    next("u-freeze", "user", "冻结库存这次要不要单独列出？", { status: "replied", ts: t0 + day }),
+    next("a-freeze", "assistant", "先不单列。看板只放北仓和南仓的可售数。", {
+      _clientMessageId: "u-freeze",
+      ts: t0 + day + 1000,
+    }),
+  ];
+}
+
 export function waitMessages() {
   let n = 1;
   const next = (id, role, text, extra) => row(n++, id, role, text, extra);
   return [
-    next("u-att", "user", "等我确认", { status: "sent" }),
-    next("stage-att", "assistant", "我先查一下隐藏命令", { _clientMessageId: "u-att" }),
+    next("u-att", "user", "看板发布前等我确认", { status: "sent" }),
+    next("stage-att", "assistant", "我先核对南仓可售，再请你拍板。", { _clientMessageId: "u-att" }),
     next("bash-att", "tool", "终端", {
       _clientMessageId: "u-att",
       toolName: "Bash",
-      inputJson: { command: "hidden-probe-cmd" },
+      inputJson: { command: "node scripts/check-available.mjs" },
       _completed: true,
       output: "ok",
     }),
     next("err-att", "tool", "失败命令", {
       _clientMessageId: "u-att",
       toolName: "Bash",
-      inputJson: { command: "broken-probe" },
+      inputJson: { command: "node scripts/publish-board.mjs" },
       _completed: true,
       error: true,
-      output: "probe-error-detail",
+      output: "南仓对账没有通过，看板先不发布。",
     }),
-    next("ask-att", "permission", "执行命令", {
+    next("ask-att", "permission", "冻结库存", {
+      _clientMessageId: "u-att",
+      toolName: "AskUserQuestion",
+      requestId: "ask-board-freeze",
+      _resolved: false,
+      inputPreview: "冻结库存要不要单独列在看板上？",
+      inputJson: {
+        questions: [
+          {
+            question: "冻结库存要不要单独列在看板上？",
+            header: "冻结库存",
+            options: [
+              { label: "不单列", description: "看板只放可售" },
+              { label: "单独一列", description: "和可售分开" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      ts: Date.now(),
+    }),
+    next("perm-att", "permission", "执行命令", {
       _clientMessageId: "u-att",
       toolName: "Bash",
       requestId: "req-browser-deny",
       _resolved: false,
-      inputPreview: "ls",
-      inputJson: { command: "ls" },
+      inputPreview: "确认发布库存看板",
+      inputJson: { command: "确认发布库存看板" },
       ts: Date.now(),
     }),
     next("approval-att", "tool", "审批", {
@@ -114,7 +180,18 @@ export function waitMessages() {
   ];
 }
 
-function detail(id, title, messages) {
+function createStore() {
+  return {
+    board: stamp(boardMessages(), 100),
+    older: stamp(olderMessages(), 1),
+    wait: stamp(waitMessages(), 1),
+    revision: 1,
+    updatedAt: Date.now(),
+  };
+}
+
+function detail(id, title, messages, store, hasMore, cursor) {
+  const maxSeq = messages.reduce((max, message) => Math.max(max, message._seq || 0), 0);
   return {
     id,
     userId: "u1",
@@ -122,22 +199,22 @@ function detail(id, title, messages) {
     title,
     pinned: false,
     createdAt: 1,
-    lastAt: 2,
+    lastAt: store.updatedAt,
     messages,
-    updatedAt: 2,
-    historyRevision: 1,
+    updatedAt: store.updatedAt,
+    historyRevision: store.revision,
     timelineGeneration: 1,
-    timelineCursor: null,
-    timelineHasMore: false,
-    timelineSnapshotMaxSeq: messages.length,
+    timelineCursor: hasMore ? cursor : null,
+    timelineHasMore: hasMore,
+    timelineSnapshotMaxSeq: maxSeq,
     isPartial: false,
-    totalMessageCount: messages.length,
-    maxSeq: messages.length,
+    totalMessageCount: messages.length + (hasMore ? store.older.length : 0),
+    maxSeq,
     modelId: "glm-5.2",
   };
 }
 
-function listBody() {
+function listBody(store) {
   return {
     sessions: [
       {
@@ -146,9 +223,9 @@ function listBody() {
         title: "库存看板",
         pinned: false,
         createdAt: 1,
-        lastAt: 3,
-        messageCount: 7,
-        updatedAt: 3,
+        lastAt: store.updatedAt,
+        messageCount: store.board.length + store.older.length,
+        updatedAt: store.updatedAt,
         modelId: "glm-5.2",
       },
       {
@@ -158,7 +235,7 @@ function listBody() {
         pinned: false,
         createdAt: 1,
         lastAt: 2,
-        messageCount: 7,
+        messageCount: store.wait.length,
         updatedAt: 2,
         modelId: "glm-5.2",
       },
@@ -185,7 +262,6 @@ function indexHtml() {
 <script>
 if (!localStorage.getItem("oc_auth_hint")) localStorage.setItem("oc_auth_hint", "1");
 if (!localStorage.getItem("oc_theme")) localStorage.setItem("oc_theme", "light");
-window.WebSocket = undefined;
 </script>
 <script type="module" src="/app.js"></script>
 `;
@@ -212,8 +288,54 @@ function sendJson(res, status, body) {
   res.end(raw);
 }
 
-export function startPreviewServer(assetDir) {
+function sessionKey(id) {
+  return `agent:main:webchat:dm:${id}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function streamAnswerTail() {
+  return [
+    "```htmlpreview",
+    DASHBOARD_HTML.replace("可售合计 128。", "可售合计 128。南仓预警已分开标出。"),
+    "```",
+    "",
+    `明细表：${CSV_PATH}`,
+    "",
+    "这张预览和 CSV 仍是界面验收夹具，不是线上库存。",
+  ].join("\n");
+}
+
+function warningChunks() {
+  const chunks = ["南仓预警已补进看板。\n\n"];
+  for (let i = 1; i <= 8; i += 1) {
+    const n = String(i).padStart(2, "0");
+    chunks.push(`预警段落-${n} 北仓可售 80、南仓可售 48，低于预警线的数量单独标出，冻结库存不进可售合计。\n\n`);
+  }
+  chunks.push(streamAnswerTail());
+  return chunks;
+}
+
+export function startPreviewServer(assetDir, options = {}) {
+  const store = createStore();
   const unknown = [];
+  const stats = {
+    hellos: 0,
+    inboundMessages: [],
+    permissionResponses: [],
+    permissionAcks: [],
+    outbound: 0,
+    outboundByType: {},
+  };
+  const seqBySession = new Map();
+  const nextSeq = (id) => {
+    const n = (seqBySession.get(id) || 0) + 1;
+    seqBySession.set(id, n);
+    return n;
+  };
+
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -228,6 +350,30 @@ export function startPreviewServer(assetDir) {
         res.end(body);
         return;
       }
+      if (path === "/api/e2e-fixture") {
+        sendJson(res, 200, {
+          fixture: "ocv5-265-app-ws",
+          note: "Frontend WebSocket fixture. Not the production LLM backend.",
+          hellos: stats.hellos,
+          inboundMessages: stats.inboundMessages.map((frame) => ({
+            type: frame.type,
+            sessionId: frame.peer?.id,
+            clientMessageId: frame.clientMessageId,
+            text: frame.content?.text,
+          })),
+          permissionResponses: stats.permissionResponses.map((frame) => ({
+            type: frame.type,
+            requestId: frame.requestId,
+            behavior: frame.behavior,
+            controlId: frame.controlId,
+          })),
+          permissionAcks: stats.permissionAcks,
+          outbound: stats.outbound,
+          outboundByType: stats.outboundByType,
+          unknown,
+        });
+        return;
+      }
       if (path.startsWith("/api/")) {
         const method = req.method || "GET";
         const user = {
@@ -238,7 +384,6 @@ export function startPreviewServer(assetDir) {
           display_name: "验收",
           credits: "1000",
         };
-        let status = 200;
         let body = {};
         if (path === "/api/public/config") body = { turnstile_bypass: true, require_email_verified: false, allow_registration: true };
         else if (path === "/api/auth/refresh") body = { access_token: "test-token", access_exp: Date.now() / 1000 + 3600, remember: true };
@@ -246,7 +391,7 @@ export function startPreviewServer(assetDir) {
         else if (path === "/api/public/models") body = { models: [{ id: "glm-5.2", display_name: "GLM-5.2", engine: "ccb" }] };
         else if (path === "/api/me/preferences") body = { prefs: { default_model: "glm-5.2" } };
         else if (path === "/api/agent/status") body = { runtime_ready: true, container: { id: "c1", status: "running" }, subscription: { status: "active" } };
-        else if (path === "/api/sessions/list") body = listBody();
+        else if (path === "/api/sessions/list") body = listBody(store);
         else if (path === "/api/marketplace/my-agents") body = { agents: [{ id: "main", slug: "main", name: "全能助手", installed: true, isDefault: true }] };
         else if (path === "/api/collaboration-config") {
           body = {
@@ -264,17 +409,47 @@ export function startPreviewServer(assetDir) {
             if (item === CSV_PATH) urls[item] = CSV_URL;
           }
           body = { urls, expMs: Date.now() + 10 * 60_000 };
-        } else if (path === `/api/sessions/${BOARD_SESSION}`) body = detail(BOARD_SESSION, "库存看板", boardMessages());
-        else if (path === `/api/sessions/${WAIT_SESSION}`) body = detail(WAIT_SESSION, "待你确认", waitMessages());
+        } else if (path === `/api/sessions/${BOARD_SESSION}/timeline`) {
+          const cursor = url.searchParams.get("cursor");
+          if (cursor === OLDER_CURSOR) {
+            const maxSeq = store.older.reduce((max, message) => Math.max(max, message._seq || 0), 0);
+            body = {
+              messages: store.older,
+              nextCursor: null,
+              hasMore: false,
+              timelineGeneration: 1,
+              historyRevision: store.revision,
+              snapshotMaxSeq: maxSeq,
+            };
+          } else {
+            body = { messages: [], nextCursor: null, hasMore: false, timelineGeneration: 1, historyRevision: store.revision, snapshotMaxSeq: 0 };
+          }
+        } else if (path === `/api/sessions/${BOARD_SESSION}`) body = detail(BOARD_SESSION, "库存看板", store.board, store, true, OLDER_CURSOR);
+        else if (path === `/api/sessions/${WAIT_SESSION}`) body = detail(WAIT_SESSION, "待你确认", store.wait, store, false, null);
         else if (path.endsWith("/live-frames")) {
-          body = { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false };
+          body = { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false, view: url.searchParams.get("view") || "frames" };
         } else if (path === "/api/response-rating") body = { ratings: {}, nudges: {} };
-        else if (path.startsWith("/api/session-goals/")) body = { goal: null };
-        else {
+        else if (path === "/api/board/tickets/OCV5-265") {
+          body = {
+            ticket: {
+              id: "OCV5-265",
+              identifier: "OCV5-265",
+              title: "库存看板发布前确认",
+              status: "waiting_human",
+              version: 1,
+              type: "task",
+              priority: "medium",
+              body: "确认北仓 80、南仓 48 的可售数后再发布。这是界面验收夹具，不是线上任务。",
+            },
+          };
+        } else if (path.startsWith("/api/session-goals/")) body = { goal: null };
+        else if (path === `/api/sessions/${BOARD_SESSION}/archive` || path === `/api/sessions/${WAIT_SESSION}/archive`) {
+          body = { messages: [], hasMore: false, oldestSeq: null, historyRevision: store.revision };
+        } else {
           unknown.push(`${method} ${path}`);
           body = {};
         }
-        sendJson(res, status, body);
+        sendJson(res, 200, body);
         return;
       }
       const rel = decodeURIComponent(path).replace(/^\/+/, "");
@@ -296,16 +471,248 @@ export function startPreviewServer(assetDir) {
       res.end(String(error?.stack || error));
     }
   });
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    handleProtocols: (protocols) => (protocols.has("bearer") ? "bearer" : false),
+  });
+  server.on("upgrade", (req, socket, head) => {
+    const url = new URL(req.url || "/", "http://127.0.0.1");
+    if (url.pathname !== "/ws/user-chat-bridge") {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
+
+  wss.on("connection", (ws) => {
+    const send = (frame) => {
+      if (ws.readyState !== 1) return false;
+      const type = frame?.type || "unknown";
+      stats.outbound += 1;
+      stats.outboundByType[type] = (stats.outboundByType[type] || 0) + 1;
+      ws.send(JSON.stringify(frame));
+      return true;
+    };
+    send({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" });
+    ws.on("message", (raw) => {
+      let frame;
+      try {
+        frame = JSON.parse(String(raw));
+      } catch {
+        return;
+      }
+      if (frame.type === "ping") {
+        send({ type: "pong", id: frame.id });
+        return;
+      }
+      if (frame.type === "inbound.hello") {
+        stats.hellos += 1;
+        send({ type: "sys.relay_ready", automaticRecoveryOwner: "master-v1" });
+        return;
+      }
+      if (frame.type === "inbound.permission_response") {
+        stats.permissionResponses.push(frame);
+        const controlId = String(frame.controlId || "");
+        if (!controlId || stats.permissionAcks.includes(controlId)) return;
+        stats.permissionAcks.push(controlId);
+        const bucket = frame.peer?.id === WAIT_SESSION ? store.wait : store.board;
+        const card = bucket.find((message) => message.requestId === frame.requestId);
+        if (card) {
+          card._resolved = true;
+          card._behavior = frame.behavior;
+        }
+        store.revision += 1;
+        store.updatedAt = Date.now();
+        send({
+          type: "outbound.control.receipt",
+          controlId,
+          controlKind: "permission",
+          status: "applied",
+          peer: { id: frame.peer?.id, kind: "dm" },
+          requestId: frame.requestId,
+          attempt: 1,
+        });
+        return;
+      }
+      if (frame.type !== "inbound.message") return;
+      stats.inboundMessages.push(frame);
+      const sessId = frame.peer?.id;
+      const clientMessageId = frame.clientMessageId;
+      const text = String(frame.content?.text || "");
+      send({
+        type: "outbound.ack",
+        admitted: true,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+      });
+      void playTurn(send, store, sessId, clientMessageId, text, nextSeq).catch((error) => {
+        send({
+          type: "outbound.error",
+          sessionKey: sessionKey(sessId),
+          channel: "webchat",
+          peer: { id: sessId, kind: "dm" },
+          clientMessageId,
+          code: "fixture_error",
+          message: String(error?.message || error),
+          isFinal: true,
+          frameSeq: nextSeq(sessId),
+          ts: Date.now(),
+        });
+      });
+    });
+  });
+
   return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(options.port ?? 0, "127.0.0.1", () => {
       const address = server.address();
       const port = typeof address === "object" && address ? address.port : 0;
       resolve({
         server,
+        wss,
         port,
         unknown,
+        stats,
+        store,
         url: `http://127.0.0.1:${port}/s/${BOARD_SESSION}`,
       });
     });
+  });
+}
+
+async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
+  const key = sessionKey(sessId);
+  const base = {
+    type: "outbound.message",
+    sessionKey: key,
+    channel: "webchat",
+    peer: { id: sessId, kind: "dm" },
+    clientMessageId,
+    isFinal: false,
+  };
+  const emit = async (blocks, final = false) => {
+    send({
+      ...base,
+      frameSeq: nextSeq(sessId),
+      ts: Date.now(),
+      blocks,
+      isFinal: final,
+    });
+    const gap = streamGapMs();
+    if (gap > 0) await sleep(gap);
+  };
+  const bucket = sessId === WAIT_SESSION ? store.wait : store.board;
+  const persisted = [];
+  const remember = (id, role, textValue, extra = {}) => {
+    persisted.push({
+      id,
+      role,
+      text: textValue,
+      ts: Date.now() + persisted.length,
+      status: role === "user" ? "replied" : undefined,
+      _clientMessageId: role === "user" ? undefined : clientMessageId,
+      ...extra,
+    });
+  };
+  remember(clientMessageId, "user", text, { status: "replied" });
+
+  if (text.includes("合计还在就行") || sessId === WAIT_SESSION) {
+    const reply = sessId === WAIT_SESSION
+      ? "这轮先等你确认，看板不会发布。"
+      : "还在。可售合计 128，南仓预警已经分开标出。";
+    await emit([{ kind: "text", text: reply.slice(0, 8), messageId: `plain-${clientMessageId}` }]);
+    await emit([{ kind: "text", text: reply.slice(8), messageId: `plain-${clientMessageId}` }]);
+    remember(`plain-${clientMessageId}`, "assistant", reply, { _clientMessageId: clientMessageId });
+  } else {
+    const bashId = `bash-${clientMessageId}`;
+    const readId = `read-${clientMessageId}`;
+    const stageId = `stage-${clientMessageId}`;
+    const answerId = `answer-${clientMessageId}`;
+    const command = "node scripts/summarize-stock.mjs --warn-south";
+    let partial = "";
+    for (const piece of ['{"command":"node ', "scripts/summarize-stock.mjs --warn-south\"}"]) {
+      partial += piece;
+      await emit([{
+        kind: "tool_use",
+        blockId: bashId,
+        toolName: "Bash",
+        messageId: bashId,
+        partial: true,
+        partialJsonDelta: piece,
+        partialJsonOffset: partial.length - piece.length,
+      }]);
+    }
+    await emit([{
+      kind: "tool_use",
+      blockId: bashId,
+      toolName: "Bash",
+      messageId: bashId,
+      partial: false,
+      inputJson: { command },
+    }]);
+    await emit([{
+      kind: "tool_result",
+      blockId: `${bashId}:result`,
+      toolUseBlockId: bashId,
+      toolName: "Bash",
+      isError: false,
+      output: "south-warning=separated",
+    }]);
+    remember(bashId, "tool", "终端", {
+      _clientMessageId: clientMessageId,
+      toolName: "Bash",
+      inputJson: { command },
+      _completed: true,
+      output: "south-warning=separated",
+    });
+    await emit([{
+      kind: "tool_use",
+      blockId: readId,
+      toolName: "Read",
+      messageId: readId,
+      partial: false,
+      inputJson: { file_path: "inventory/thresholds.md" },
+    }]);
+    await emit([{
+      kind: "tool_result",
+      blockId: `${readId}:result`,
+      toolUseBlockId: readId,
+      toolName: "Read",
+      isError: false,
+      output: "south warning separated",
+    }]);
+    remember(readId, "tool", "读取", {
+      _clientMessageId: clientMessageId,
+      toolName: "Read",
+      inputJson: { file_path: "inventory/thresholds.md" },
+      _completed: true,
+      output: "south warning separated",
+    });
+    const stage = "先把南仓预警从可售里拆出来，冻结库存仍然不进看板。";
+    await emit([{ kind: "text", text: stage.slice(0, 12), messageId: stageId }]);
+    await emit([{ kind: "text", text: stage.slice(12), messageId: stageId }]);
+    remember(stageId, "assistant", stage, { _clientMessageId: clientMessageId });
+    let answer = "";
+    for (const chunk of warningChunks()) {
+      answer += chunk;
+      await emit([{ kind: "text", text: chunk, messageId: answerId }]);
+      if (chunk.includes("预警段落-02")) await sleep(4500);
+    }
+    remember(answerId, "assistant", answer, {
+      _clientMessageId: clientMessageId,
+      usage: { costCredits: "6", totalTokens: 960, inputTokens: 400, outputTokens: 560 },
+    });
+  }
+
+  const start = (bucket.at(-1)?._seq || 0) + 1;
+  bucket.push(...stamp(persisted, start));
+  store.revision += 1;
+  store.updatedAt = Date.now();
+  send({
+    ...base,
+    frameSeq: nextSeq(sessId),
+    ts: Date.now(),
+    blocks: [],
+    isFinal: true,
   });
 }

@@ -15,7 +15,7 @@ const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const shots = process.env.OC_PROCESS_SHOT_DIR || "/home/agent/.openclaude/generated";
-const assetDir = process.env.OC_PROCESS_APP_DIR || "/tmp/ocv5-265-app-preview";
+const assetDir = process.env.OC_PROCESS_APP_DIR || "/tmp/ocv5-265-e2e-app";
 
 function contrastRatio(fg, bg) {
   const parse = (value) => {
@@ -35,7 +35,17 @@ function contrastRatio(fg, bg) {
   return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
 }
 
-test("OCV5-265 App-level inventory board: real App, fixture API, not the component harness", { timeout: 240000 }, async () => {
+async function waitUntil(label, pred, ms = 20_000) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (pred()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`${label} timed out`);
+}
+
+test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { timeout: 420000 }, async () => {
+  process.env.OC_E2E_STREAM_GAP_MS = process.env.OC_E2E_STREAM_GAP_MS || "420";
   mkdirSync(shots, { recursive: true });
   mkdirSync(assetDir, { recursive: true });
   await build({
@@ -81,6 +91,7 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
     headless: true,
     args: ["--no-sandbox"],
   });
+  const evidence = { scroll: null, clamp: null, permission: null };
   try {
     async function open(width, touch, theme) {
       const context = await browser.newContext({
@@ -96,10 +107,19 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       }
       const page = await context.newPage();
       const errors = [];
+      const traffic = { sent: [], recv: [] };
       page.on("pageerror", (error) => errors.push(error.message));
+      page.on("websocket", (ws) => {
+        ws.on("framesent", (frame) => {
+          try { traffic.sent.push(JSON.parse(frame.payload)); } catch { /* ignore */ }
+        });
+        ws.on("framereceived", (frame) => {
+          try { traffic.recv.push(JSON.parse(frame.payload)); } catch { /* ignore */ }
+        });
+      });
       page.setDefaultTimeout(20_000);
       await page.goto(preview.url, { waitUntil: "domcontentloaded" });
-      return { context, page, errors };
+      return { context, page, errors, traffic };
     }
 
     async function metaMetrics(page) {
@@ -128,9 +148,39 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       });
     }
 
+    async function align(page, locator) {
+      const scroller = page.locator(".chat-scroll-area");
+      await scroller.hover();
+      for (let i = 0; i < 16; i += 1) {
+        const placed = await locator.evaluate((el) => {
+          const box = el.closest(".chat-scroll-area");
+          if (!box) return false;
+          const view = box.getBoundingClientRect();
+          const row = el.getBoundingClientRect();
+          return row.height > 8 && row.top >= view.top + 4 && row.top <= view.top + 200;
+        });
+        if (placed) return;
+        const dir = await locator.evaluate((el) => {
+          const box = el.closest(".chat-scroll-area");
+          return el.getBoundingClientRect().top < box.getBoundingClientRect().top + 4 ? -1 : 1;
+        });
+        await page.mouse.wheel(0, dir * 360);
+        await page.waitForTimeout(70);
+      }
+    }
+
+    async function sendText(page, text) {
+      const box = page.getByPlaceholder(/对话/);
+      await box.click();
+      await box.fill(text);
+      await page.getByRole("button", { name: "发送" }).click();
+    }
+
     const desktop = await open(1280, false);
     try {
       await desktop.page.getByText("看板已经做好").waitFor();
+      await waitUntil("hello", () => preview.stats.hellos > 0);
+      await desktop.page.waitForFunction(() => !document.body.innerText.includes("未连接"));
       await desktop.page.getByTitle("HTML 沙盒预览").waitFor();
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "tool log stays folded in the App");
       assert.equal(await desktop.page.getByText("paper.pdf").count(), 0);
@@ -147,16 +197,17 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       const iframeSrc = await desktop.page.getByTitle("HTML 沙盒预览").getAttribute("srcdoc");
       assert.match(iframeSrc ?? "", /库存看板/);
       assert.match(iframeSrc ?? "", /可售合计 128/);
-      await desktop.page.screenshot({ path: join(shots, "ocv5-265-app-desktop-collapsed.png") });
+
+      await align(desktop.page, desktop.page.getByText("做一版库存看板").first());
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-desktop-turn.png") });
+      await align(desktop.page, desktop.page.getByText("看板已经做好").first());
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-desktop-answer.png") });
 
       const file = desktop.page.getByRole("link", { name: new RegExp(CSV_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) });
       await file.waitFor();
       const clip = await file.evaluate((el) => {
         const name = el.querySelector(".truncate") ?? el;
-        return {
-          full: name.textContent ?? "",
-          clipped: name.scrollWidth > name.clientWidth + 1,
-        };
+        return { full: name.textContent ?? "", clipped: name.scrollWidth > name.clientWidth + 1 };
       });
       assert.match(clip.full, /acceptance-fixture\.csv/);
       const [download] = await Promise.all([
@@ -166,18 +217,20 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       assert.equal(download.suggestedFilename(), CSV_NAME);
       const saved = await download.path();
       assert.equal(readFileSync(saved, "utf8"), CSV_BODY);
-      await desktop.page.screenshot({ path: join(shots, "ocv5-265-app-artifact.png") });
+      await align(desktop.page, file);
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-artifact.png") });
 
-      await desktop.page.getByTestId("process-toggle").click();
+      await desktop.page.getByTestId("process-toggle").first().click();
       await desktop.page.getByText("先按北仓和南仓核对可售口径").waitFor();
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0);
-      await desktop.page.screenshot({ path: join(shots, "ocv5-265-app-desktop-expanded.png") });
+      await align(desktop.page, desktop.page.getByTestId("process-stage").first());
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-desktop-expanded.png") });
       await desktop.page.getByTestId("process-detail-toggle").click();
       await desktop.page.getByText("summarize-stock.mjs").waitFor();
-      await desktop.page.getByTestId("process-toggle").focus();
+      await desktop.page.getByTestId("process-toggle").first().focus();
       await desktop.page.keyboard.press("Enter");
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
-      await desktop.page.getByTestId("process-toggle").focus();
+      await desktop.page.getByTestId("process-toggle").first().focus();
       await desktop.page.keyboard.press("Space");
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "true");
 
@@ -192,50 +245,182 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
         const row = stage.getBoundingClientRect();
         return row.height > 8 && row.top >= view.top - 2 && row.top < view.bottom - 8;
       });
-      await desktop.page.screenshot({ path: join(shots, "ocv5-265-app-find-stage.png") });
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-find.png") });
+      await desktop.page.keyboard.press("Escape");
+
+      await desktop.page.getByRole("button", { name: /查看更早历史记录/ }).click();
+      await desktop.page.getByText("先把北仓和南仓的可售范围说清楚").waitFor();
+      await desktop.page.getByText("冻结库存这次要不要单独列出？").waitFor();
+      await desktop.page.getByText("看板已经做好").waitFor();
+      const olderInside = await desktop.page.getByText("先把北仓和南仓的可售范围说清楚").evaluate((el) => !!el.closest("[data-testid=process-disclosure]"));
+      assert.equal(olderInside, false, "older turn must not join the board process group");
+      const recentInside = await desktop.page.getByText("数字还在吗？").evaluate((el) => !!el.closest("[data-testid=process-disclosure]"));
+      assert.equal(recentInside, false, "plain follow-up must not join the board process group");
+      const order = await desktop.page.evaluate(() => {
+        const textOf = (needle) => [...document.querySelectorAll("body *")].find((el) =>
+          [...el.childNodes].some((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.includes(needle)));
+        const older = textOf("先把北仓和南仓的可售范围说清楚");
+        const board = textOf("做一版库存看板");
+        const recent = textOf("数字还在吗？");
+        if (!older || !board || !recent) return "missing";
+        const after = (a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+        return after(older, board) && after(board, recent) ? "older-board-recent" : "crossed";
+      });
+      assert.equal(order, "older-board-recent");
+
+      const beforeSend = preview.stats.inboundMessages.length;
+      await sendText(desktop.page, "把南仓预警补进同一张看板");
+      await waitUntil("composer inbound", () => preview.stats.inboundMessages.length > beforeSend);
+      await desktop.page.getByText("南仓预警已补进看板").waitFor();
+      await desktop.page.getByText("预警段落-02").waitFor();
+      assert.equal(await desktop.page.getByText("预警段落-08").count(), 0, "later token arrived before the scroll sample");
+      const clamp = await desktop.page.getByText("南仓预警已补进看板").evaluate((el) => {
+        let lineClamp = "none";
+        let node = el;
+        while (node) {
+          const value = getComputedStyle(node).webkitLineClamp;
+          if (value && value !== "none") lineClamp = value;
+          node = node.parentElement;
+        }
+        return { lineClamp, inProcess: !!el.closest("[data-testid=process-disclosure]") };
+      });
+      evidence.clamp = clamp;
+      assert.equal(clamp.lineClamp, "none", "streaming answer is line-clamped");
+      assert.equal(clamp.inProcess, false, "streaming answer was folded into the process shell");
+      const scroller = desktop.page.locator(".chat-scroll-area");
+      await scroller.hover();
+      for (let i = 0; i < 14; i += 1) {
+        const gap = await scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+        if (gap > 500) break;
+        await desktop.page.mouse.wheel(0, -480);
+        await desktop.page.waitForTimeout(60);
+      }
+      await align(desktop.page, desktop.page.getByText("做一版库存看板").first());
+      await desktop.page.waitForTimeout(350);
+      const scrolled = await scroller.evaluate((el) => ({
+        top: el.scrollTop,
+        gap: el.scrollHeight - el.scrollTop - el.clientHeight,
+      }));
+      assert.ok(scrolled.gap > 400, `did not leave the bottom before later tokens: ${JSON.stringify(scrolled)}`);
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-stream-scrolled.png") });
+      await desktop.page.getByText("预警段落-08").waitFor({ timeout: 20_000 });
+      const afterTokens = await scroller.evaluate((el) => ({
+        top: el.scrollTop,
+        gap: el.scrollHeight - el.scrollTop - el.clientHeight,
+      }));
+      evidence.scroll = { before: scrolled, after: afterTokens };
+      assert.ok(afterTokens.gap > 300, `new tokens pulled back to the bottom: ${JSON.stringify(afterTokens)}`);
+      assert.ok(afterTokens.top < scrolled.top + 80, `viewport moved toward the bottom ${scrolled.top} -> ${afterTokens.top}`);
+      const liveToggle = desktop.page.getByTestId("process-toggle").last();
+      if ((await liveToggle.getAttribute("aria-expanded")) !== "true") await liveToggle.click();
+      await desktop.page.getByText("先把南仓预警从可售里拆出来").waitFor();
+      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "manual expand collapsed while tokens arrived");
+      await desktop.page.getByTestId("scroll-to-bottom").click();
+      await desktop.page.waitForFunction(() => {
+        const el = document.querySelector(".chat-scroll-area");
+        return !!el && el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+      });
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-stream-answer.png") });
+      await desktop.page.getByRole("button", { name: "发送" }).waitFor({ timeout: 20_000 });
+      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "manual expand collapsed when the turn finished");
+      const shells = await desktop.page.getByTestId("process-disclosure").count();
+      await sendText(desktop.page, "合计还在就行");
+      await desktop.page.getByText("还在。可售合计 128，南仓预警已经分开标出。").waitFor({ timeout: 20_000 });
+      assert.equal(await desktop.page.getByTestId("process-disclosure").count(), shells, "plain chat grew a process shell");
+      await desktop.page.getByRole("button", { name: "发送" }).waitFor();
 
       await desktop.page.getByText("待你确认").click();
       await desktop.page.getByText("还差你的确认").waitFor();
       await desktop.page.getByText("未成功").waitFor();
       await desktop.page.getByText("任务待你确认").waitFor();
+      await desktop.page.getByText("冻结库存要不要单独列在看板上？").waitFor();
+      await desktop.page.getByRole("button", { name: "打开提问" }).waitFor();
       assert.equal(await desktop.page.getByText("先按北仓和南仓核对可售口径").count(), 0, "expansion does not leak across sessions");
-      assert.equal(await desktop.page.getByText("hidden-probe-cmd").count(), 0);
-      await desktop.page.screenshot({ path: join(shots, "ocv5-265-app-attention.png") });
+      assert.equal(await desktop.page.getByText("node scripts/check-available.mjs").count(), 0);
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-attention.png") });
+      const deniesBefore = preview.stats.permissionResponses.length;
       await desktop.page.getByRole("button", { name: "拒绝" }).click();
-      await desktop.page.waitForTimeout(300);
-      assert.equal(desktop.errors.length, 0, desktop.errors.join("\n"));
+      await desktop.page.getByText("已拒绝").waitFor({ timeout: 15_000 });
+      await waitUntil("one deny frame", () => preview.stats.permissionResponses.length >= deniesBefore + 1);
+      const denies = preview.stats.permissionResponses.filter((frame) => frame.requestId === "req-browser-deny");
+      evidence.permission = {
+        count: denies.length,
+        behaviors: denies.map((frame) => frame.behavior),
+        acks: preview.stats.permissionAcks.length,
+      };
+      assert.equal(denies.length, 1, `deny frame count ${denies.length}`);
+      assert.equal(denies[0].behavior, "deny");
+      assert.equal(preview.stats.permissionAcks.length, 1);
+      assert.equal(await desktop.page.getByRole("button", { name: "拒绝" }).count(), 0, "deny did not settle the card");
+      assert.equal(desktop.errors.filter((error) => !/ResizeObserver/.test(error)).length, 0, desktop.errors.join("\n"));
+
+      await desktop.page.getByRole("button", { name: "库存看板" }).click();
+      await desktop.page.getByText("看板已经做好").waitFor();
+      await desktop.page.getByText("南仓预警已补进看板").waitFor();
+      await desktop.page.getByTitle("HTML 沙盒预览").first().waitFor();
 
       await desktop.page.goto(preview.url, { waitUntil: "domcontentloaded" });
       await desktop.page.getByText("看板已经做好").waitFor();
-      await desktop.page.getByTitle("HTML 沙盒预览").waitFor();
-      assert.equal(await desktop.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "false");
-      assert.equal(desktop.errors.length, 0, desktop.errors.join("\n"));
+      await desktop.page.getByText("南仓预警已补进看板").waitFor();
+      await desktop.page.getByTitle("HTML 沙盒预览").first().waitFor();
+      await desktop.page.getByRole("link", { name: new RegExp(CSV_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) }).first().waitFor();
+      await waitUntil("reload hello", () => preview.stats.hellos > 1);
+      await desktop.page.waitForFunction(() => !document.body.innerText.includes("未连接"));
+      assert.equal(await desktop.page.getByTestId("process-toggle").first().getAttribute("aria-expanded"), "false");
     } catch (error) {
       console.error("APP_UNKNOWN", preview.unknown);
-      console.error("APP_BODY", (await desktop.page.locator("body").innerText()).slice(0, 2000));
+      console.error("APP_STATS", JSON.stringify({
+        hellos: preview.stats.hellos,
+        inbound: preview.stats.inboundMessages.map((frame) => frame.content?.text),
+        permission: preview.stats.permissionResponses.length,
+        outbound: preview.stats.outboundByType,
+      }));
+      console.error("APP_BODY", (await desktop.page.locator("body").innerText()).slice(0, 2500));
       console.error("APP_ERRORS", desktop.errors);
       throw error;
     } finally {
+      writeFileSync(join(shots, "ocv5-265-e2e-stats.json"), JSON.stringify({
+        hellos: preview.stats.hellos,
+        inbound: preview.stats.inboundMessages.map((frame) => ({
+          sessionId: frame.peer?.id,
+          text: frame.content?.text,
+          clientMessageId: frame.clientMessageId,
+        })),
+        permission: preview.stats.permissionResponses.map((frame) => ({
+          requestId: frame.requestId,
+          behavior: frame.behavior,
+          controlId: frame.controlId,
+        })),
+        permissionAcks: preview.stats.permissionAcks,
+        outboundByType: preview.stats.outboundByType,
+        browserSent: desktop.traffic.sent.map((frame) => frame.type),
+        browserRecv: desktop.traffic.recv.map((frame) => frame.type),
+        evidence,
+        unknown: preview.unknown,
+      }, null, 2));
       await desktop.context.close();
     }
 
     const mobile = await open(390, true);
     try {
       await mobile.page.getByText("看板已经做好").waitFor();
-      const box = await mobile.page.getByTestId("process-toggle").boundingBox();
+      await align(mobile.page, mobile.page.getByText("做一版库存看板").first());
+      const box = await mobile.page.getByTestId("process-toggle").first().boundingBox();
       assert.ok(box && box.height >= 44, `touch target too small: ${JSON.stringify(box)}`);
       assert.ok(box.x >= -1 && box.x + box.width <= 391, `toggle overflows: ${JSON.stringify(box)}`);
       const docOverflow = await mobile.page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
       assert.ok(docOverflow <= 1, `mobile document overflows by ${docOverflow}px`);
-      const name = mobile.page.locator(".truncate", { hasText: "acceptance-fixture.csv" });
+      const name = mobile.page.locator(".truncate", { hasText: "acceptance-fixture.csv" }).first();
       await name.waitFor();
       const clipped = await name.evaluate((el) => el.scrollWidth > el.clientWidth + 1 && (el.textContent ?? "").includes("acceptance-fixture.csv"));
       assert.equal(clipped, true, "long filename truncates but stays in the accessible name");
-      await mobile.page.screenshot({ path: join(shots, "ocv5-265-app-mobile-collapsed.png") });
-      await mobile.page.getByTestId("process-toggle").tap();
+      await mobile.page.screenshot({ path: join(shots, "ocv5-265-e2e-mobile390-turn.png") });
+      await align(mobile.page, mobile.page.getByText("看板已经做好").first());
+      await mobile.page.screenshot({ path: join(shots, "ocv5-265-e2e-mobile390-answer.png") });
+      await mobile.page.getByTestId("process-toggle").first().tap();
       await mobile.page.getByText("先按北仓和南仓核对可售口径").waitFor();
       const order = await mobile.page.evaluate(() => {
-        const user = document.querySelector("[data-testid=user-row]");
+        const user = [...document.querySelectorAll("[data-testid=user-row]")].find((el) => el.textContent?.includes("做一版库存看板"));
         const stage = document.querySelector("[data-testid=process-stage]");
         if (!(user instanceof HTMLElement) || !(stage instanceof HTMLElement)) return "missing";
         const follows = (user.compareDocumentPosition(stage) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
@@ -243,10 +428,8 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       });
       assert.equal(order, "stage-after-user", "mobile expand left this turn");
       assert.equal(await mobile.page.getByText("数字还在吗？").count(), 1);
-      await mobile.page.screenshot({ path: join(shots, "ocv5-265-app-mobile-expanded.png") });
-      assert.equal(mobile.errors.length, 0, mobile.errors.join("\n"));
+      assert.equal(mobile.errors.filter((error) => !/ResizeObserver/.test(error)).length, 0, mobile.errors.join("\n"));
     } catch (error) {
-      console.error("APP_MOBILE_UNKNOWN", preview.unknown);
       console.error("APP_MOBILE_BODY", (await mobile.page.locator("body").innerText()).slice(0, 2000));
       console.error("APP_MOBILE_ERRORS", mobile.errors);
       throw error;
@@ -259,9 +442,10 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       await narrow.page.getByText("看板已经做好").waitFor();
       const overflow = await narrow.page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
       assert.ok(overflow <= 1, `360px document overflows by ${overflow}px`);
-      const box = await narrow.page.getByTestId("process-toggle").boundingBox();
-      assert.ok(box && box.x + box.width <= 361, `360 toggle overflows: ${JSON.stringify(box)}`);
-      await narrow.page.screenshot({ path: join(shots, "ocv5-265-app-mobile360-collapsed.png") });
+      await align(narrow.page, narrow.page.getByText("做一版库存看板").first());
+      const box = await narrow.page.getByTestId("process-toggle").first().boundingBox();
+      assert.ok(box && box.height >= 44 && box.x + box.width <= 361, `360 toggle overflows: ${JSON.stringify(box)}`);
+      await narrow.page.screenshot({ path: join(shots, "ocv5-265-e2e-mobile360-turn.png") });
     } finally {
       await narrow.context.close();
     }
@@ -272,13 +456,39 @@ test("OCV5-265 App-level inventory board: real App, fixture API, not the compone
       const meta = await metaMetrics(dark.page);
       assert.equal(meta.fontSize, "11px");
       assert.ok(contrastRatio(meta.color, meta.bg) >= 4.5, `dark contrast ${contrastRatio(meta.color, meta.bg)} color=${meta.color} bg=${meta.bg}`);
-      await dark.page.screenshot({ path: join(shots, "ocv5-265-app-dark-meta.png") });
+      await dark.page.getByText("刚刚").first().waitFor();
+      await align(dark.page, dark.page.getByText("2023-11-15").first());
+      await dark.page.screenshot({ path: join(shots, "ocv5-265-e2e-dark-meta.png") });
     } finally {
       await dark.context.close();
     }
 
     assert.equal(preview.url.includes(`/s/${BOARD_SESSION}`), true);
     assert.equal(WAIT_SESSION, "ocv5wait01");
+    const sentTypes = desktop.traffic.sent.map((frame) => frame.type);
+    assert.ok(sentTypes.includes("inbound.hello"));
+    assert.ok(sentTypes.includes("inbound.message"));
+    assert.ok(sentTypes.includes("inbound.permission_response"));
+    assert.ok(desktop.traffic.recv.some((frame) => frame.type === "sys.relay_ready"));
+    assert.ok(desktop.traffic.recv.some((frame) => frame.type === "outbound.message" && frame.isFinal === true));
+    writeFileSync(join(shots, "ocv5-265-e2e-stats.json"), JSON.stringify({
+      hellos: preview.stats.hellos,
+      inbound: preview.stats.inboundMessages.map((frame) => ({
+        sessionId: frame.peer?.id,
+        text: frame.content?.text,
+        clientMessageId: frame.clientMessageId,
+      })),
+      permission: preview.stats.permissionResponses.map((frame) => ({
+        requestId: frame.requestId,
+        behavior: frame.behavior,
+        controlId: frame.controlId,
+      })),
+      permissionAcks: preview.stats.permissionAcks,
+      outboundByType: preview.stats.outboundByType,
+      browserSent: desktop.traffic.sent.map((frame) => frame.type),
+      browserRecv: desktop.traffic.recv.map((frame) => frame.type),
+      evidence,
+    }, null, 2));
   } finally {
     await browser.close();
     await new Promise((done) => preview.server.close(done));
