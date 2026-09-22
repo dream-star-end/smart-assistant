@@ -230,16 +230,16 @@ function ReqIdChip({ traceId }: { traceId: string }) {
   );
 }
 
-/** 时间 · 积分 · token · 请求ID 同一行。时间用 caption:超过 30 天的绝对日期不能继承正文 16px。 */
-function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
+/** 时间 · 积分 · 请求ID 同一行。时间用 caption:超过 30 天的绝对日期不能继承正文 16px。
+ *  token 计数留在消息上给定价和上下文，最终回答底部不再打印。 */
+function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
   const traceId = msg.usage?.traceId;
   const credits = msg.usage?.costCredits;
   const waived = msg.usage?.waived === true;
   // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
   const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
   const showTime = Boolean(msg.ts);
-  const showTokens = Boolean(tokenUsage && tokenUsage.totalTokens > 0);
-  if (!traceId && !showCredits && !waived && !showTime && !showTokens) return null;
+  if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
     <div data-testid="assistant-meta" className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-faint">
       {showTime && (
@@ -259,7 +259,6 @@ function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTo
           <Wallet size={11} /> {groupDigits(credits!)} 积分
         </Badge>
       )}
-      {showTokens && <TokenUsageBadge usage={tokenUsage} />}
       {traceId && <ReqIdChip traceId={traceId} />}
     </div>
   );
@@ -599,7 +598,7 @@ const LIVE_MARKDOWN_TAIL = 64 * 1024;
 
 /** caret=流式光标内联在**正文最后一个文本块末尾**(Markdown 的 rehype 注入),不再作为块级容器之后
  *  的兄弟节点单独占一行。分段(hasLiveGap)时只有尾段带光标。 */
-function ProgressiveMarkdown({
+export function ProgressiveMarkdown({
   text,
   live = false,
   caret = false,
@@ -949,14 +948,7 @@ export function AssistantCard({
           </output>
         )}
 
-        {/* MetaRow 尚未出现(流式中 / 团队编排未终态)时 token 用量单独一行实时跳动;终态后并入
-            MetaRow 与时间·积分·请求ID 同一行,不再孤零零悬着一个无单位的数字。 */}
-        {!metaVisible && tokenUsage && tokenUsage.totalTokens > 0 && (
-          <div className="mt-2">
-            <TokenUsageBadge usage={tokenUsage} />
-          </div>
-        )}
-        {/* 动作条 + meta（流式中不显示动作条，避免抖动） */}
+        {/* 动作条 + meta（流式中不显示动作条，避免抖动）。流式阶段不单挂 token。 */}
         {!live && !hasError && msg.text && (
           <MessageActions
             msg={msg}

@@ -653,6 +653,94 @@ function waitFixtureStep() {
   return new Promise((resolve) => fixtureWaiters.push(resolve));
 }
 
+export const POLISH_MARKDOWN = [
+  "**对照重点**",
+  "",
+  "第一段说明口径。",
+  "",
+  "- 北仓",
+  "- 南仓",
+  "",
+  "行内 `sku` 保持同样大小。",
+  "",
+  "> 引用不该变成另一套字",
+  "",
+  "| 仓 | 可售 |",
+  "| --- | --- |",
+  "| 北 | 80 |",
+].join("\n");
+
+async function playPolishTurn(emit, remember, clientMessageId) {
+  const bashId = `bash-${clientMessageId}`;
+  const stageId = `stage-${clientMessageId}`;
+  const answerId = `answer-${clientMessageId}`;
+  await emit([{
+    kind: "tool_use",
+    blockId: bashId,
+    toolName: "Bash",
+    messageId: bashId,
+    partial: false,
+    inputJson: { command: "echo POLISH_STEP" },
+  }]);
+  await emit([{
+    kind: "tool_result",
+    blockId: `${bashId}:result`,
+    toolUseBlockId: bashId,
+    toolName: "Bash",
+    isError: false,
+    output: "ok",
+  }]);
+  remember(bashId, "tool", "终端", {
+    _clientMessageId: clientMessageId,
+    toolName: "Bash",
+    inputJson: { command: "echo POLISH_STEP" },
+    _completed: true,
+    output: "ok",
+  });
+  await emit([{ kind: "text", text: POLISH_MARKDOWN, messageId: stageId }]);
+  remember(stageId, "assistant", POLISH_MARKDOWN, { _clientMessageId: clientMessageId });
+  await emit([{
+    kind: "goal",
+    objective: "排版对照已清除目标",
+    status: "cleared",
+    cleared: true,
+    platformGoalId: `polish-cleared-${clientMessageId}`,
+  }]);
+  remember(`goal-cleared-${clientMessageId}`, "goal", "排版对照已清除目标", {
+    _clientMessageId: clientMessageId,
+    cleared: true,
+    goalStatus: "cleared",
+    _turnTapeId: "tape-polish-cleared",
+    platformGoalId: `polish-cleared-${clientMessageId}`,
+  });
+  await emit([{
+    kind: "goal",
+    objective: "排版对照已完成目标",
+    status: "completed",
+    cleared: false,
+    platformGoalId: `polish-done-${clientMessageId}`,
+  }]);
+  remember(`goal-done-${clientMessageId}`, "goal", "排版对照已完成目标", {
+    _clientMessageId: clientMessageId,
+    cleared: false,
+    goalStatus: "completed",
+    _turnTapeId: "tape-polish-done",
+    platformGoalId: `polish-done-${clientMessageId}`,
+  });
+  await waitFixtureStep();
+  await emit([{ kind: "text", text: POLISH_MARKDOWN, messageId: answerId }]);
+  remember(answerId, "assistant", POLISH_MARKDOWN, {
+    _clientMessageId: clientMessageId,
+    usage: {
+      costCredits: "8",
+      totalTokens: 27500,
+      inputTokens: 20000,
+      outputTokens: 7500,
+      traceId: "polishtrace",
+    },
+  });
+}
+
 async function playPhasedTurn(emit, remember, clientMessageId) {
   const thinkId = `think-${clientMessageId}`;
   const stageId = `stage-${clientMessageId}`;
@@ -822,6 +910,14 @@ async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
 
   if (text.includes("分段过程")) {
     await playPhasedTurn(emit, remember, clientMessageId);
+  } else if (text.includes("排版对照")) {
+    await playPolishTurn(emit, remember, clientMessageId);
+    send({
+      type: "outbound.cost_charged",
+      requestId: `polish-${clientMessageId}`,
+      costCredits: "8",
+      debitedCredits: "8",
+    });
   } else if (text.includes("合计还在就行") || sessId === WAIT_SESSION) {
     const reply = sessId === WAIT_SESSION
       ? "这轮先等你确认，看板不会发布。"

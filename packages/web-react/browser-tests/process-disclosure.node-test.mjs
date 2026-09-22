@@ -130,7 +130,7 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.ok(metaBox.rowHeight < 36, `meta row too tall: ${metaBox.rowHeight}`);
       assert.equal(metaBox.sameLine, true, "date and credits share one compact row");
       assert.match(metaBox.credits, /12\s*积分/);
-      assert.match(metaBox.credits, /token/);
+      assert.doesNotMatch(metaBox.credits, /token/i);
       await desktop.page.getByText("刚刚").waitFor();
       const collapsedShot = join(shots, "ocv5-265-manus-desktop-collapsed.png");
       await desktop.page.screenshot({ path: collapsedShot });

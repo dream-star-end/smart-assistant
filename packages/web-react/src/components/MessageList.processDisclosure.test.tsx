@@ -816,11 +816,11 @@ describe("MessageList Manus 过程披露", () => {
     expect(metas[0]).toHaveClass("text-caption");
     expect(metas[0]).toHaveTextContent("2023-11-15");
     expect(metas[0]).toHaveTextContent("12 积分");
-    expect(metas[0]).toHaveTextContent("token");
+    expect(metas[0]).not.toHaveTextContent(/token/i);
     expect(metas[0].querySelector("time.tabular-nums")?.className ?? "").toContain("text-caption");
     expect(metas[1]).toHaveTextContent("刚刚");
     expect(metas[1]).toHaveTextContent("3 积分");
-    expect(metas[1]).toHaveTextContent("token");
+    expect(metas[1]).not.toHaveTextContent(/token/i);
     expect(screen.queryByTestId("process-disclosure")).not.toBeInTheDocument();
   });
 
@@ -879,14 +879,13 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[2]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    const goalLine = screen.getByTestId("process-goal-line");
-    expect(goalLine.closest("[data-testid=process-goal]")).not.toBeNull();
-    expect(goalLine).toHaveTextContent("目标已清除");
-    expect(goalLine.textContent ?? "").not.toMatch(/会话目标/);
-    expect(goalLine.querySelector(".rounded-lg")).toBeNull();
+    expect(screen.queryByTestId("process-goal")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("process-goal-line")).not.toBeInTheDocument();
+    expect(screen.queryByText("目标已清除")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始目标记录" })).not.toBeInTheDocument();
     expect(screen.queryByText(/tape-goal/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "查看原始目标记录" }));
-    expect(screen.getByTestId("process-goal-record")).toHaveTextContent("tape-goal");
+    expect(screen.getByTestId("process-toggle")).not.toHaveTextContent("目标");
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("我先对一下这班发布落在哪");
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[3]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
@@ -930,8 +929,10 @@ describe("MessageList Manus 过程披露", () => {
     expect(finals).toHaveLength(1);
     expect(finals[0]?.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.queryByText("会话目标")).not.toBeInTheDocument();
+    expect(screen.queryByText("目标已清除")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("process-toggle"));
-    expect(screen.getByRole("button", { name: "查看原始目标记录" }).closest("[data-testid=process-disclosure]")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "查看原始目标记录" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("process-goal")).not.toBeInTheDocument();
   });
 
   test("进行中的目标和待确认不收进过程，普通句子里的目标二字也不当目标卡", () => {
@@ -1153,7 +1154,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(body.className).not.toMatch(/line-clamp/);
     expect(screen.queryByTestId("process-stage-toggle")).not.toBeInTheDocument();
     expect(body.closest("[data-testid=process-goal]")).toBeNull();
-    expect(screen.getByTestId("process-goal")).toBeInTheDocument();
+    expect(screen.queryByTestId("process-goal")).not.toBeInTheDocument();
+    expect(screen.queryByText("目标已清除")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-toggle")).not.toHaveTextContent("目标");
     expect(screen.getByTestId("process-disclosure")).toHaveAttribute("data-process-active", "true");
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
 
@@ -1242,5 +1245,116 @@ describe("MessageList Manus 过程披露", () => {
     expect(operationSummary([
       row("t", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/tmp/a" } }),
     ])).toBe("读取 1 项");
+    expect(operationSummary([
+      row("g", "goal", "库存目标", { cleared: true, goalStatus: "cleared" }),
+      row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo keep" } }),
+    ])).toBe("命令 1 项");
+    expect(operationSummary([
+      row("g", "goal", "做完的目标", { goalStatus: "completed" }),
+    ])).toBe("目标 1 项");
+  });
+
+  test("已清除目标不占过程，只剩它时没有空壳，普通句子里的同样字句还在", () => {
+    renderList([
+      row("u", "user", "目标已清除", { status: "replied" }),
+      row("g", "goal", "库存目标", {
+        _clientMessageId: "u",
+        cleared: true,
+        goalStatus: "cleared",
+        _turnTapeId: "tape-only",
+      }),
+    ]);
+    expect(screen.getByText("目标已清除")).toBeInTheDocument();
+    expect(screen.queryByTestId("process-disclosure")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("process-goal")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始目标记录" })).not.toBeInTheDocument();
+    expect(screen.queryByText("tape-only")).not.toBeInTheDocument();
+    expect(screen.queryByText("库存目标")).not.toBeInTheDocument();
+
+    cleanup();
+    const sample = "**对照重点**\n\n第一段说明。\n\n- 北仓\n\n`sku`";
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("flag", "goal", "只看清除标记", {
+        _clientMessageId: "u",
+        cleared: true,
+        goalStatus: "active",
+        _turnTapeId: "tape-flag",
+      }),
+      row("status", "goal", "只看状态", {
+        _clientMessageId: "u",
+        goalStatus: " Cleared ",
+        _turnTapeId: "tape-status",
+      }),
+      row("done", "goal", "做完的目标", {
+        _clientMessageId: "u",
+        goalStatus: "completed",
+        cleared: false,
+        _turnTapeId: "tape-done",
+      }),
+      row("paused", "goal", "暂停的目标", {
+        _clientMessageId: "u",
+        goalStatus: "paused",
+        cleared: false,
+      }),
+      row("blocked", "goal", "堵住的目标", {
+        _clientMessageId: "u",
+        goalStatus: "blocked",
+        cleared: false,
+      }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "echo KEEP_STEP" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("stage", "assistant", sample, { _clientMessageId: "u" }),
+      row("main", "assistant", "目标已清除这句话是主助手回答", {
+        _clientMessageId: "u",
+        agentId: "main",
+        ts: Date.now() - 5_000,
+        usage: { costCredits: "9", totalTokens: 27_500, inputTokens: 20_000, outputTokens: 7_500 },
+      }),
+    ]);
+    expect(screen.queryByText("只看清除标记")).not.toBeInTheDocument();
+    expect(screen.queryByText("只看状态")).not.toBeInTheDocument();
+    expect(screen.queryByText("目标已清除")).not.toBeInTheDocument();
+    expect(screen.getByText("目标已清除这句话是主助手回答")).toBeInTheDocument();
+    expect(screen.getByText("暂停的目标").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getByText("堵住的目标").closest("[data-testid=process-disclosure]")).toBeNull();
+    const meta = screen.getByTestId("assistant-meta");
+    expect(meta).toHaveTextContent("9 积分");
+    expect(meta.querySelector("time")).not.toBeNull();
+    expect(meta).not.toHaveTextContent(/token/i);
+    const toggles = screen.getAllByTestId("process-toggle");
+    const goalToggle = toggles.find((node) => node.textContent?.includes("目标"));
+    const commandToggle = toggles.find((node) => node.textContent?.includes("命令"));
+    expect(goalToggle).toHaveTextContent("目标 1 项");
+    expect(goalToggle).not.toHaveTextContent("目标 2");
+    expect(commandToggle).not.toHaveTextContent("目标");
+    fireEvent.click(goalToggle!);
+    expect(screen.getByText(/做完的目标/).closest("[data-testid=process-goal]")).not.toBeNull();
+    fireEvent.click(commandToggle!);
+    const stage = screen.getByTestId("process-stage");
+    expect(stage.className).not.toMatch(/\btext-sm\b|\bleading-6\b|\btext-muted\b/);
+    expect(stage.querySelector(".prose")).not.toBeNull();
+    expect(screen.getByText("目标已清除这句话是主助手回答").closest("[data-testid=assistant-row]")?.querySelector(".prose")).not.toBeNull();
+
+    cleanup();
+    renderList([
+      row("u2", "user", "另一个助手", { status: "replied" }),
+      row("other", "assistant", "研究助手的最终回答", {
+        _clientMessageId: "u2",
+        agentId: "research-assistant",
+        ts: Date.now() - 4_000,
+        usage: { costCredits: "4", totalTokens: 8_000, inputTokens: 5_000, outputTokens: 3_000, traceId: "agenttrace1" },
+      }),
+    ]);
+    const other = screen.getByTestId("assistant-meta");
+    expect(other).toHaveTextContent("4 积分");
+    expect(other.querySelector("time")).not.toBeNull();
+    expect(other).not.toHaveTextContent(/token/i);
+    expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("research-assistant");
   });
 });

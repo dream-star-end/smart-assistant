@@ -233,7 +233,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(placed.ok, `${kind} target rect is outside the viewport: ${JSON.stringify(placed)}`);
       if (kind === "tool") assert.match(placed.proofText, /进行中/);
       if (kind === "body") assert.match(placed.proofText, /FINAL_LONG/);
-      assert.ok(placed.goalText.length > 0, `${kind} diagnostic goal is missing: ${JSON.stringify(placed)}`);
+      assert.equal(placed.goalText, "", `${kind} cleared goal is still visible: ${JSON.stringify(placed)}`);
       evidence.frames.push({ name: fileName, ...placed });
       await page.screenshot({ path: join(shots, `${fileName}.png`) });
       return placed;
@@ -301,7 +301,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(meta.rowHeight < 36, `meta row too tall: ${meta.rowHeight}`);
       assert.ok(Math.abs(meta.timeTop - meta.creditTop) < 8, "time and credits are not one compact row");
       assert.match(meta.text, /12\s*积分/);
-      assert.match(meta.text, /token/);
+      assert.doesNotMatch(meta.text, /token/i);
       assert.match(meta.text, /刚刚|分钟前/);
       assert.doesNotMatch(meta.text, /2023-11-15|1970/);
       assert.ok(contrastRatio(meta.color, meta.bg) >= 4.5, `light contrast ${contrastRatio(meta.color, meta.bg)}`);
@@ -335,28 +335,11 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(await desktop.page.getByText("已清除的库存目标").count(), 0, "cleared goal is its own top card while the process is closed");
       await desktop.page.getByTestId("process-toggle").first().click();
       await desktop.page.getByText("先按北仓和南仓核对可售口径").waitFor();
-      const clearedGoal = desktop.page.getByText("已清除的库存目标");
-      await clearedGoal.waitFor();
-      const goalChrome = await clearedGoal.evaluate((el) => {
-        const line = el.closest("[data-testid=process-goal-line]");
-        const card = el.closest(".rounded-lg.border");
-        return {
-          inGoal: !!el.closest("[data-testid=process-goal]"),
-          line: line instanceof HTMLElement,
-          card: !!card,
-          text: (line?.textContent || "").replace(/\s+/g, " ").trim(),
-        };
-      });
-      assert.equal(goalChrome.inGoal, true);
-      assert.equal(goalChrome.line, true, "cleared goal is still a tombstone card");
-      assert.equal(goalChrome.card, false, "cleared goal still paints a bordered card");
-      assert.match(goalChrome.text, /^目标已清除/);
-      assert.doesNotMatch(goalChrome.text, /会话目标/);
-      assert.equal(await desktop.page.getByText("tape-cleared-goal").count(), 0, "raw goal record is visible before the third level");
-      await shotFramed(desktop.page, clearedGoal, "ocv5-265-avatar-polish-cleared-goal");
-      await desktop.page.getByRole("button", { name: "查看原始目标记录" }).click();
-      await desktop.page.getByText("tape-cleared-goal").waitFor();
-      await shotFramed(desktop.page, desktop.page.getByTestId("process-goal-record"), "ocv5-265-avatar-polish-goal-record");
+      assert.equal(await desktop.page.getByText("已清除的库存目标").count(), 0, "cleared goal still paints a line after expand");
+      assert.equal(await desktop.page.getByTestId("process-goal").count(), 0, "cleared goal left an empty process section");
+      assert.equal(await desktop.page.getByRole("button", { name: "查看原始目标记录" }).count(), 0);
+      assert.doesNotMatch(await desktop.page.getByTestId("process-toggle").first().innerText(), /目标/);
+      await shotFramed(desktop.page, desktop.page.getByText("先按北仓和南仓核对可售口径"), "ocv5-265-avatar-polish-cleared-goal");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-cleared-goal.png") });
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0);
       await align(desktop.page, desktop.page.getByTestId("process-stage").first());
@@ -524,13 +507,9 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(stagePlacement.inProcess, true, "stage assistant is not in the work area");
       assert.equal(stagePlacement.inAnswer, false, "stage assistant was promoted to the final card");
       assert.equal(stagePlacement.meta, false, "stage assistant shows its own token row");
-      const phasedGoal = desktop.page.getByText("已清除的分段目标");
-      await phasedGoal.waitFor();
-      assert.equal(await phasedGoal.evaluate((el) => !!el.closest("[data-testid=process-disclosure]")), true);
+      assert.equal(await desktop.page.getByText("已清除的分段目标").count(), 0, "cleared goal line came back");
+      assert.equal(await desktop.page.getByTestId("process-goal").count(), 0, "cleared goal left a section");
       assert.equal(await activeShells(), 1, "cleared goal split the turn");
-      const phasedGoalLine = await phasedGoal.evaluate((el) => (el.closest("[data-testid=process-goal-line]")?.textContent || "").replace(/\s+/g, " ").trim());
-      assert.match(phasedGoalLine, /^目标已清除/);
-      assert.equal(await phasedGoal.evaluate((el) => !!el.closest(".rounded-lg.border")), false);
       assert.equal(
         await desktop.page.getByText("我先对一下这班发布落在哪").evaluate((el) => !!el.closest("[data-testid=process-stage]")),
         true,
@@ -544,7 +523,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("进行中"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0);
       assert.equal(await activeShells(), 1, "running tool split the turn");
-      await desktop.page.getByText("工具仍在执行时的目标诊断").waitFor();
+      assert.equal(await desktop.page.getByText("工具仍在执行时的目标诊断").count(), 0);
       const runningLive = desktop.page.getByTestId("process-step-live").filter({ hasText: "进行中" });
       assert.match(await runningLive.innerText(), /进行中/);
       await shotFramed(desktop.page, runningLive, "ocv5-265-avatar-polish-tool-running");
@@ -584,7 +563,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await fixtureStep();
 
       await desktop.page.getByText("FINAL_LONG").waitFor();
-      await desktop.page.getByText("正文仍在进行时的目标诊断").waitFor();
+      assert.equal(await desktop.page.getByText("正文仍在进行时的目标诊断").count(), 0);
       const longPlacement = await desktop.page.getByTestId("process-stage").filter({ hasText: "FINAL_LONG" }).evaluate((el) => {
         let lineClamp = "none";
         let node = el;

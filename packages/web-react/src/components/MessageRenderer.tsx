@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ProcessDisclosure, artifactEvidenceKeys, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -320,6 +320,7 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "goal":
+        if (isClearedGoalRecord(message)) return null;
         if (isHistoricalGoalRecord(message)) {
           return <HistoricalGoalDiagnostic message={message} />;
         }
@@ -899,7 +900,8 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   let boundary = "";
   const seal = (current: Extract<RenderItem, { kind: "process" }> | undefined) => {
     if (!current) return;
-    const work = current.members.find((message) => isFoldableWorkRole(message) || isHistoricalGoalRecord(message));
+    const work = current.members.find((message) =>
+      !isClearedGoalRecord(message) && (isFoldableWorkRole(message) || isHistoricalGoalRecord(message)));
     current.key = `process:${boundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
     if (!work) {
       const index = out.indexOf(current);
@@ -908,6 +910,9 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   };
   for (const item of items) {
     const rows = itemMessages(item);
+    // A cleared goal is not a row, a count, or a shell. Skipping it must not
+    // seal the current process or move the owner/page boundary.
+    if (rows.length > 0 && rows.every(isClearedGoalRecord)) continue;
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;

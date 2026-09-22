@@ -1,7 +1,7 @@
 import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import { Markdown } from "../Markdown";
+import { ProgressiveMarkdown } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, type ToolInput } from "../tool/format";
 import { detectOcCli } from "../tool/meta";
 import { safeArtifactSrc } from "../tool/researchCards";
@@ -31,17 +31,34 @@ export function isFoldableWorkRole(message: ChatMessage): boolean {
   return WORK_ROLES.has(message.role);
 }
 
+function goalStatusValue(message: ChatMessage): string {
+  return (message.goalStatus ?? "").trim().toLowerCase();
+}
+
 /**
- * Cleared / completed goal rows are historical diagnostics. Active, paused,
- * and blocked goals stay on the top level — they are still a current objective.
- * Role is the goal card itself, not a tool or sentence that happens to say "goal".
+ * A real goal row whose normalized status is cleared. `cleared: true` is the
+ * reducer flag; `goalStatus === "cleared"` covers history that only stored the
+ * status. This is not a text match — an assistant sentence can still say the
+ * words. Errored rows stay visible.
+ */
+export function isClearedGoalRecord(message: ChatMessage): boolean {
+  if (message.role !== "goal") return false;
+  if (message.error || message._isError || message._errorCode) return false;
+  if (message.cleared === true) return true;
+  return goalStatusValue(message) === "cleared";
+}
+
+/**
+ * Completed goal rows are historical diagnostics. Cleared rows are omitted
+ * entirely by the caller. Active, paused, and blocked goals stay on the top
+ * level — they are still a current objective. Role is the goal card itself,
+ * not a tool or sentence that happens to say "goal".
  */
 export function isHistoricalGoalRecord(message: ChatMessage): boolean {
   if (message.role !== "goal") return false;
   if (message.error || message._isError || message._errorCode) return false;
-  if (message.cleared === true) return true;
-  const status = (message.goalStatus ?? "").trim().toLowerCase();
-  return status === "cleared" || status === "completed";
+  if (isClearedGoalRecord(message)) return true;
+  return goalStatusValue(message) === "completed";
 }
 
 function commandText(message: ChatMessage): string {
@@ -406,6 +423,7 @@ function countLabel(message: ChatMessage): string {
 export function operationSummary(messages: readonly ChatMessage[]): string {
   const counts = new Map<string, number>();
   for (const message of messages) {
+    if (isClearedGoalRecord(message)) continue;
     const label = countLabel(message);
     if (!label) continue;
     counts.set(label, (counts.get(label) ?? 0) + 1);
@@ -495,17 +513,20 @@ const toggleClass =
 
 function StageText({ message }: { message: ChatMessage }) {
   // Same suppression as AssistantCard: an unpublished fallback must not
-  // reappear just because the row was grouped into the process.
+  // reappear just because the row was grouped into the process. The body
+  // itself is ProgressiveMarkdown, the final answer's renderer, with no
+  // extra size or color on the wrapper.
   if (message._payloadDeferred || message._hideUnpublishedFallback === true) return null;
+  if (message.error || message._isError || message._errorCode) return null;
   const text = message.text ?? "";
   if (!text.trim()) return null;
   return (
     <div
       data-testid="process-stage"
       data-find-member={timelineMessageKey(message)}
-      className="min-w-0 text-sm leading-6 text-fg"
+      className="min-w-0"
     >
-      <Markdown signMedia>{text}</Markdown>
+      <ProgressiveMarkdown text={text} />
     </div>
   );
 }
