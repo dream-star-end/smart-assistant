@@ -620,7 +620,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_TELEMETRY_ENABLED: 'false',
       GROK_HOME: (() => {
         const runtimeHome = grokRuntimeHome(platform.launchHome, this.currentModel)
-        const stableSessions = join(platform.grokHome, 'sessions')
+        const stableRoot = this.currentModel === 'grok-build-fast'
+          ? join(platform.grokHome, 'fast')
+          : platform.grokHome
+        const stableSessions = join(stableRoot, 'sessions')
         mkdirSync(stableSessions, { recursive: true, mode: 0o700 })
         const dest = join(runtimeHome, 'sessions')
         if (dest !== stableSessions && !existsSync(dest)) symlinkSync(stableSessions, dest)
