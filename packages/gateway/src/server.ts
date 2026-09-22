@@ -1,9 +1,4 @@
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
-import {
-  inboundSessionKey,
-  isContentReviewSessionBanned,
-  observeUserContentReview,
-} from './jevContentReview.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import {
@@ -20167,24 +20162,6 @@ export class Gateway {
     if (frame.type !== 'inbound.message') {
       // TODO: 权限响应处理
       return
-    }
-    // Content review records only. A banned session drops later messages; the
-    // review itself never blocks the message that triggered it.
-    try {
-      const reviewSessionKey = inboundSessionKey(frame)
-      if (reviewSessionKey && isContentReviewSessionBanned(reviewSessionKey)) {
-        this.log.info('content review session banned', { sessionKey: reviewSessionKey })
-        return
-      }
-      const reviewText = frame.content?.text
-      if (typeof reviewText === 'string' && reviewText.trim()) {
-        const reviewUserId = typeof (frame as { _userId?: unknown })._userId === 'string'
-          ? (frame as { _userId: string })._userId
-          : 'default'
-        observeUserContentReview({ text: reviewText, userId: reviewUserId, sessionKey: reviewSessionKey })
-      }
-    } catch {
-      // Review must not affect dispatch.
     }
     const syntheticBarrierKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
     const syntheticBarrier = this._syntheticTurnBarriers?.get(syntheticBarrierKey)

@@ -1,3 +1,4 @@
+import { inboundSessionKey, isContentReviewSessionBanned, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -5663,6 +5664,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             (parsed as { type?: unknown }).type === "inbound.message"
           ) {
             inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed(parsed);
+            try {
+              const reviewFrame = parsed as {
+                agentId?: unknown
+                channel?: unknown
+                peer?: { kind?: unknown; id?: unknown }
+                content?: { text?: unknown }
+              }
+              const reviewSessionKey = inboundSessionKey(reviewFrame)
+              if (reviewSessionKey && isContentReviewSessionBanned(reviewSessionKey)) {
+                sendErrorFrame(userWs, "SESSION_BANNED", "这个会话已被管理员封禁", inboundTurnIdentityForFrame)
+                return
+              }
+              const reviewText = reviewFrame.content?.text
+              if (typeof reviewText === "string" && reviewText.trim()) {
+                observeUserContentReview({
+                  text: reviewText,
+                  userId: uid.toString(),
+                  sessionKey: reviewSessionKey,
+                })
+              }
+            } catch {
+              // Recording must not block delivery of this message.
+            }
             inboundPeerIdForFrame = inboundTurnIdentityForFrame.peerId;
             const frameModelRaw = (parsed as { model?: unknown }).model;
             const frameModelId = typeof frameModelRaw === "string" ? frameModelRaw : null;

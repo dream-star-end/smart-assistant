@@ -79,7 +79,8 @@ export function inboundSessionKey(frame: {
   channel?: unknown
   peer?: { kind?: unknown; id?: unknown }
 }): string {
-  if (typeof frame.sessionKey === 'string' && frame.sessionKey.trim()) return frame.sessionKey.trim()
+  // Client-supplied sessionKey is not authoritative. Execution keys are derived
+  // from agent, channel and peer; a forged sessionKey must not bypass a ban.
   const agentId = typeof frame.agentId === 'string' && frame.agentId ? frame.agentId : 'main'
   const channel = typeof frame.channel === 'string' ? frame.channel : ''
   const kind = typeof frame.peer?.kind === 'string' ? frame.peer.kind : ''

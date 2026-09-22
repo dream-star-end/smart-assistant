@@ -42,9 +42,14 @@ describe('jev content review', () => {
     else process.env[CONTENT_REVIEW_KEY] = prevKey
   })
 
-  it('builds the webchat session key', () => {
+  it('builds the webchat session key and ignores a client override', () => {
     assert.equal(
-      inboundSessionKey({ agentId: 'main', channel: 'webchat', peer: { kind: 'dm', id: 'wsess-abc' } }),
+      inboundSessionKey({
+        sessionKey: 'not-banned',
+        agentId: 'main',
+        channel: 'webchat',
+        peer: { kind: 'dm', id: 'wsess-abc' },
+      }),
       'agent:main:webchat:dm:wsess-abc',
     )
   })
