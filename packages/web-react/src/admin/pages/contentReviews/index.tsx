@@ -62,7 +62,7 @@ export default function ContentReviewsPage() {
                 <td className="pr-3">
                   {row.choice}
                   {row.confidence != null ? ` ${row.confidence.toFixed(2)}` : ""}
-                  {row.thresholdMet ? " · 已告警" : ""}
+                  {row.thresholdMet ? " · 达阈值" : ""}
                 </td>
                 <td className="pr-3">{row.excerpt}</td>
                 <td>

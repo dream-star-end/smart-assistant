@@ -5741,6 +5741,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               })
               const reviewUserId = uid.toString()
               if (reviewSessionKey && isContentReviewSessionBanned(reviewUserId, reviewSessionKey)) {
+                rejectPromptQueueDispatch("SESSION_BANNED")
                 sendErrorFrame(userWs, "SESSION_BANNED", "这个会话已被管理员封禁", inboundTurnIdentityForFrame)
                 return
               }
