@@ -549,7 +549,7 @@ function InboxItem({
                       .then(() => setAppealState("sent"))
                       .catch((err: unknown) => {
                         setAppealState("idle");
-                        setAppealErr(apiErrorMessage(err));
+                        setAppealErr(apiErrorMessage(err, "请求失败"));
                       });
                   }}
                 >

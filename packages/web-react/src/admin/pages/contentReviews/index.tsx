@@ -38,7 +38,7 @@ export default function ContentReviewsPage() {
   }, []);
 
   useEffect(() => {
-    load().catch((err: unknown) => toast(apiErrorMessage(err), "error"));
+    load().catch((err: unknown) => toast(apiErrorMessage(err, "请求失败"), "error"));
   }, [load, toast]);
 
   async function notify(id: number) {
@@ -51,7 +51,7 @@ export default function ContentReviewsPage() {
       toast(result.accountBanned ? "已记次并封禁账号" : "已发送站内信并记一次违规", "success");
       await load();
     } catch (err) {
-      toast(apiErrorMessage(err), "error");
+      toast(apiErrorMessage(err, "请求失败"), "error");
     } finally {
       setBusy(null);
     }
@@ -64,7 +64,7 @@ export default function ContentReviewsPage() {
       toast(approve ? "已通过申诉，这一次不再计入" : "已驳回申诉", "success");
       await load();
     } catch (err) {
-      toast(apiErrorMessage(err), "error");
+      toast(apiErrorMessage(err, "请求失败"), "error");
     } finally {
       setBusy(null);
     }
