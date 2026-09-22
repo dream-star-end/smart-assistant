@@ -332,6 +332,12 @@
       "reason": "Grok Fast routes are stored as grok-build-fast. The relay treated every other model id as expired, so Fast turns returned 404 grok route expired. Allow only grok-build and grok-build-fast and forward that route model. No billing or stored-data change.",
       "approvedBy": "user 2026-09-22 要求改掉 Fast 中继拒绝 (OCV5-267)",
       "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "e2d2d23af579b676c08969304edc69ef3ec8ca21",
+      "reason": "Grok Fast transcripts live under grok-build/fast/sessions. The resume probe only scanned the standard root, so same-tier follow-ups replayed history and still --resume. The probe now sees the Fast root, restores a mis-tagged id, and a real miss clears the live head instead of saving it as implicit ccb. No billing change.",
+      "approvedBy": "user 2026-09-23 说有问题就改下 (OCV5-270)",
+      "expiresAt": "2026-10-23"
     }
   ]
 }
