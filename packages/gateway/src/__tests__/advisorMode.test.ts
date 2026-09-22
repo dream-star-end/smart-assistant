@@ -328,6 +328,15 @@ describe('advisorMode snapshot', () => {
       { toolName: 'Bash', toolUseId: 'call_cursor_shell_1', completed: false, inputJson: { command: 'oc-memory consult-advisor --question "x"' } },
     ])
     assert.equal(bash.ok, true)
+    const decoy = uniquePendingConsultInvocationId([
+      { toolName: 'Read', toolUseId: 'read_call_12345', completed: false, inputJson: { file_path: '/tmp/consult_advisor.md' } },
+    ])
+    assert.deepEqual(decoy, { ok: false, reason: 'none' })
+    const mixed = uniquePendingConsultInvocationId([
+      { toolName: 'consult_advisor', toolUseId: 'call_real_consult', completed: false },
+      { toolName: 'Read', toolUseId: 'read_call_12345', completed: false, inputJson: { file_path: '/tmp/consult_advisor.md' } },
+    ])
+    assert.deepEqual(mixed, { ok: true, invocationId: 'call_real_consult' })
     const two = uniquePendingConsultInvocationId([
       { toolName: 'consult_advisor', toolUseId: 'call_one_consult', completed: false },
       { toolName: 'consult_advisor', toolUseId: 'call_two_consult', completed: false },

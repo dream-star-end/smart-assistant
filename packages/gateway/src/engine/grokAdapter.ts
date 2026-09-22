@@ -561,6 +561,15 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,
+      ...(ctx.params.consultTurn && ctx.params.turnKey
+        ? {
+            consultTurn: {
+              turnKey: ctx.params.turnKey,
+              turnIndex: ctx.params.consultTurn.turnIndex,
+              configVersion: ctx.params.consultTurn.configVersion,
+            },
+          }
+        : {}),
       claudeCodePath: this.opts.config.auth.claudeCodePath,
       skillEvalMode: this.opts.skillEvalMode,
       skillEvalExclude: this.opts.skillEvalExclude,

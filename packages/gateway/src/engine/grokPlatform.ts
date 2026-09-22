@@ -8,7 +8,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { paths } from '@openclaude/storage'
-import { issueDelegateContextToken } from '../delegateContext.js'
+import { issueParentCallerToken } from '../delegateContext.js'
 import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 
 export const GROK_MEMORY_MCP_TOOLS = [
@@ -101,6 +101,7 @@ export interface GrokPlatformInput {
   gatewayPort: number
   gatewayToken: string
   delegationDepth: number
+  consultTurn?: { turnKey: string; turnIndex: number; configVersion: string } | null
   claudeCodePath?: string
   skillEvalMode?: boolean
   skillEvalExclude?: string
@@ -137,10 +138,11 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
     writePrivate(tokenFile, input.gatewayToken)
     writePrivate(
       delegateContextFile,
-      `${issueDelegateContextToken({
+      `${issueParentCallerToken({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
         depth: input.delegationDepth,
+        consultTurn: input.consultTurn,
       })}\n`,
     )
     const env: Record<string, string> = {

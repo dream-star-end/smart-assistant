@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 
+import { inspectConsultTurnToken } from '../delegateContext.js'
 import { GROK_PREAMBLE, projectGrokPlatform } from '../engine/grokPlatform.js'
 
 function restore(name: string, value: string | undefined): void {
@@ -45,6 +46,34 @@ describe('grok platform projection', () => {
       assert.ok(GROK_PREAMBLE.includes('Grok adapter'))
       assert.ok(GROK_PREAMBLE.includes('options'))
       assert.ok(GROK_PREAMBLE.includes('present_task_approval'))
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      restore('OPENCLAUDE_HOME', oldHome)
+    }
+  })
+
+  test('advisor turn writes a v2 consult token, not a v1 delegate token', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'oc-grok-platform-consult-'))
+    const oldHome = process.env.OPENCLAUDE_HOME
+    process.env.OPENCLAUDE_HOME = home
+    try {
+      const projected = projectGrokPlatform({
+        agentId: 'main',
+        sessionKey: 'agent:main:webchat:dm:grok-advisor',
+        gatewayPort: 18790,
+        gatewayToken: 'bearer-stays-in-token-file',
+        delegationDepth: 0,
+        consultTurn: {
+          turnKey: 'a'.repeat(64),
+          turnIndex: 2,
+          configVersion: 'v1:advisor:gpt-6-astra',
+        },
+      })
+      const token = readFileSync(projected.delegateContextFile!, 'utf8').trim()
+      const inspected = inspectConsultTurnToken(token)
+      assert.ok(inspected?.hmacOk)
+      assert.equal(inspected?.claims.collabMode, 'advisor')
+      assert.equal(inspected?.claims.turnIndex, 2)
     } finally {
       rmSync(home, { recursive: true, force: true })
       restore('OPENCLAUDE_HOME', oldHome)

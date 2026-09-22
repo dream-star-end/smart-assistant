@@ -52,15 +52,15 @@ export function isConsultAdvisorToolName(name: string | undefined): boolean {
   return trimmed === 'consult_advisor' || trimmed.endsWith('__consult_advisor')
 }
 
-function inputRequestsConsult(input: unknown): boolean {
-  if (input == null) return false
-  let text = ''
-  try {
-    text = typeof input === 'string' ? input : JSON.stringify(input)
-  } catch {
-    return false
-  }
-  return text.includes('consult_advisor') || text.includes('consult-advisor')
+function commandRequestsConsult(input: unknown): boolean {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false
+  const record = input as Record<string, unknown>
+  const command = typeof record.command === 'string'
+    ? record.command
+    : typeof record.cmd === 'string'
+      ? record.cmd
+      : ''
+  return /(^|[\s;&|`(])oc-memory\s+consult-advisor(?:\s|$)/.test(command)
 }
 
 /** Bind a retry identity to the single in-flight consult call. Never mint one. */
@@ -70,7 +70,8 @@ export function uniquePendingConsultInvocationId(
   const pending = (tools ?? []).filter(
     (tool) =>
       tool.completed !== true &&
-      (isConsultAdvisorToolName(tool.toolName) || inputRequestsConsult(tool.inputJson)),
+      (isConsultAdvisorToolName(tool.toolName) ||
+        ((tool.toolName === 'Bash' || tool.toolName === 'Shell') && commandRequestsConsult(tool.inputJson))),
   )
   if (pending.length > 1) return { ok: false, reason: 'ambiguous' }
   const id = pending.length === 1 && typeof pending[0]?.toolUseId === 'string'
