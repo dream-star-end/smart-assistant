@@ -1235,6 +1235,55 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-details")).toHaveTextContent("LIVE_STILL_RUNNING");
   });
 
+  test("进行中的长阶段超过128KiB后追加的尾部默认可读，旧阶段不再标成正在写", () => {
+    const head = "长段".repeat((128 * 1024) / 2);
+    const user = row("u", "user", "写长说明", { status: "sent" });
+    const prep = row("prep", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "echo LONG_PREP" },
+      _completed: true,
+      output: "ok",
+    });
+    const stage = (text: string) => row("st", "assistant", text, { _clientMessageId: "u" });
+    const view = renderList([user, prep, stage(head)], { sending: true });
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[user, prep, stage(`${head}\nTAIL_MARKER_NOW`)]}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const body = screen.getByTestId("process-stage");
+    expect(body).toHaveTextContent("TAIL_MARKER_NOW");
+    expect(screen.queryByRole("button", { name: "继续显示正文" })).not.toBeInTheDocument();
+    expect(body.className).not.toMatch(/\btext-sm\b|\bleading-6\b/);
+
+    const next = row("st2", "assistant", "NEXT_STAGE_ONLY", { _clientMessageId: "u" });
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[user, prep, stage(`${head}\nTAIL_MARKER_NOW`), next]}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("NEXT_STAGE_ONLY");
+    expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
+    const oldToggle = screen.getByTestId("process-stage-toggle");
+    fireEvent.click(oldToggle);
+    expect(screen.getByRole("button", { name: "继续显示正文" })).toBeInTheDocument();
+    expect(screen.queryByText("TAIL_MARKER_NOW")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-stage-toggle"));
+    expect(screen.queryByRole("button", { name: "继续显示正文" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("NEXT_STAGE_ONLY");
+  });
+
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {
     expect(operationSummary([
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo complicated-catalog" } }),

@@ -511,11 +511,12 @@ function stepLiveLine(messages: readonly ChatMessage[]): string {
 const toggleClass =
   "group flex min-h-10 w-full items-center gap-2 rounded-md py-1.5 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
-function StageText({ message }: { message: ChatMessage }) {
+function StageText({ message, live = false }: { message: ChatMessage; live?: boolean }) {
   // Same suppression as AssistantCard: an unpublished fallback must not
   // reappear just because the row was grouped into the process. The body
   // itself is ProgressiveMarkdown, the final answer's renderer, with no
-  // extra size or color on the wrapper.
+  // extra size or color on the wrapper. Only the current live stage keeps
+  // the streaming tail; a finished or reopened stage uses the normal pager.
   if (message._payloadDeferred || message._hideUnpublishedFallback === true) return null;
   if (message.error || message._isError || message._errorCode) return null;
   const text = message.text ?? "";
@@ -526,7 +527,7 @@ function StageText({ message }: { message: ChatMessage }) {
       data-find-member={timelineMessageKey(message)}
       className="min-w-0"
     >
-      <ProgressiveMarkdown text={text} />
+      <ProgressiveMarkdown text={text} live={live} />
     </div>
   );
 }
@@ -575,7 +576,7 @@ export function ProcessDisclosure<T>({
       </div>
     ) : null;
 
-  const narrativeBody = (section: ProcessSection<T>) => (
+  const narrativeBody = (section: ProcessSection<T>, live: boolean) => (
     <div className="space-y-1">
       {section.items.map((item) => {
         const rows = messagesOf(item);
@@ -585,7 +586,7 @@ export function ProcessDisclosure<T>({
         return (
           <div key={keyOf(item)} className="space-y-1">
             {rows.map((message) => (
-              <StageText key={message.id} message={message} />
+              <StageText key={message.id} message={message} live={live} />
             ))}
           </div>
         );
@@ -656,7 +657,7 @@ export function ProcessDisclosure<T>({
                         <span className="min-w-0 truncate">{narrativeLabel(section.messages)}</span>
                       </button>
                     ) : null}
-                    {narrativeBody(section)}
+                    {narrativeBody(section, current)}
                   </div>
                 );
               }

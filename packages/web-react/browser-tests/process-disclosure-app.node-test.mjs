@@ -563,6 +563,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await fixtureStep();
 
       await desktop.page.getByText("FINAL_LONG").waitFor();
+      await desktop.page.getByText("段落。".repeat(8)).waitFor();
       assert.equal(await desktop.page.getByText("正文仍在进行时的目标诊断").count(), 0);
       const longPlacement = await desktop.page.getByTestId("process-stage").filter({ hasText: "FINAL_LONG" }).evaluate((el) => {
         let lineClamp = "none";
