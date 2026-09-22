@@ -768,18 +768,18 @@ function itemMessages(item: LeafRenderItem): ChatMessage[] {
 }
 
 /**
- * Visible answer ids for disclosure. `finals` is the settled last assistant
- * body. While the current turn is still streaming, that flag is provisional:
- * the tail text stays inside the process group so the group key (first work
- * row) does not change on the next token. An empty deferred assistant that is
- * the last assistant of its turn is the answer locator and stays outside.
+ * Visible answer ids for disclosure. The last assistant body of a turn stays
+ * outside the process group as soon as it has text, including while that turn
+ * is still streaming, so Markdown and deliverables are not clamped to two
+ * lines. Earlier stage rows fold once a later assistant or tool arrives.
+ * The process group key stays the first work row, so growing this answer does
+ * not remount an open disclosure. An empty deferred assistant that is the
+ * last assistant of its turn is the answer locator and stays outside too.
  */
-function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
+function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[]): Set<string> {
   const ids = new Set<string>();
-  const turnStart = currentTurnStartIndex(messages);
   for (let i = 0; i < messages.length; i++) {
     if (!finals[i]) continue;
-    if (sending && i >= turnStart) continue;
     const id = messages[i]?.id;
     if (id) ids.add(id);
   }
@@ -798,7 +798,6 @@ function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending
   for (const index of lastAssistant.values()) {
     const message = messages[index];
     if (!message?._payloadDeferred || !message.id) continue;
-    if (sending && index >= turnStart) continue;
     ids.add(message.id);
   }
   return ids;
@@ -807,7 +806,7 @@ function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending
 /** Contiguous, owner/page-bounded display groups; never move an actionable row. */
 function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
   const out: RenderItem[] = [];
-  const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const answerIds = disclosureAnswerIds(messages, finals);
   const activeStart = currentTurnStartIndex(messages);
   const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
   let owner = "head";

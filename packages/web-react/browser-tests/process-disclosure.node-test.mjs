@@ -122,6 +122,79 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
     } finally {
       await mobile.context.close();
     }
+
+    const stream = await open(1280, false);
+    try {
+      await stream.page.evaluate(() => window.__processPage.setScene("stream"));
+      await stream.page.getByText("STREAM_TAIL_MARKER").waitFor();
+      const clipped = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => {
+        if (node.closest("[data-testid=process-live-summary]")) return true;
+        let el = node.parentElement;
+        while (el) {
+          const clamp = getComputedStyle(el).webkitLineClamp;
+          if (clamp && clamp !== "none") return true;
+          el = el.parentElement;
+        }
+        return false;
+      });
+      assert.equal(clipped, false, "streaming answer must not be line-clamped");
+      await stream.page.getByTestId("process-toggle").click();
+      await stream.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "true");
+      await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
+      await stream.page.getByText("尾部仍在增长").waitFor();
+      await stream.page.evaluate(() => window.__processPage.setSending(false));
+      await stream.page.getByText("尾部仍在增长").waitFor();
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true");
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-manus-stream-answer.png") });
+      assert.equal(stream.errors.length, 0, stream.errors.join("\n"));
+    } finally {
+      await stream.context.close();
+    }
+
+    const find = await open(1280, false);
+    try {
+      await find.page.evaluate(() => window.__processPage.setScene("find"));
+      await find.page.getByTestId("process-chat-scroll").waitFor();
+      await find.page.waitForFunction(() => {
+        const el = document.querySelector("[data-testid=process-chat-scroll]");
+        return !!el && el.scrollHeight > el.clientHeight + 80;
+      });
+      assert.equal(await find.page.getByText("阶段锚点ALPHATOKEN").count(), 0, "folded stage is not mounted yet");
+      await find.page.getByLabel("在会话中查找").fill("阶段锚点ALPHATOKEN");
+      await find.page.keyboard.press("Enter");
+      await find.page.waitForFunction(() => {
+        const scroller = document.querySelector("[data-testid=process-chat-scroll]");
+        const stage = document.querySelector("[data-find-member]");
+        if (!(scroller instanceof HTMLElement) || !(stage instanceof HTMLElement)) return false;
+        const view = scroller.getBoundingClientRect();
+        const row = stage.getBoundingClientRect();
+        const input = document.querySelector("[aria-label='在会话中查找']");
+        const bar = input instanceof HTMLElement ? input.getBoundingClientRect() : null;
+        const top = bar && bar.height > 0 ? bar.bottom : view.top;
+        return row.height > 8 && row.top >= top - 2 && row.bottom > top + 8 && row.top < view.bottom - 8;
+      });
+      await find.page.screenshot({ path: join(shots, "ocv5-265-manus-find-stage.png") });
+      assert.equal(find.errors.length, 0, find.errors.join("\n"));
+    } finally {
+      await find.context.close();
+    }
+
+    const attention = await open(1280, false);
+    try {
+      await attention.page.evaluate(() => window.__processPage.setScene("attention"));
+      await attention.page.getByText("未成功").waitFor();
+      await attention.page.getByTestId("permission-card").waitFor();
+      await attention.page.getByText("任务待你确认").waitFor();
+      assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
+      await attention.page.getByRole("button", { name: "拒绝" }).click();
+      await attention.page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-respond-count") === "1");
+      await attention.page.waitForTimeout(200);
+      assert.equal(await attention.page.getByTestId("process-harness").getAttribute("data-respond-count"), "1");
+      await attention.page.screenshot({ path: join(shots, "ocv5-265-manus-attention.png") });
+      assert.equal(attention.errors.length, 0, attention.errors.join("\n"));
+    } finally {
+      await attention.context.close();
+    }
   } finally {
     await browser.close();
   }

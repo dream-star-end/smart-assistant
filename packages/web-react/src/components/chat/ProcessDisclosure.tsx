@@ -1,8 +1,9 @@
 import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import { timelineMessageKey } from "./findInSession";
+import { Markdown } from "../Markdown";
 import { detectOcCli } from "../tool/meta";
+import { timelineMessageKey } from "./findInSession";
 
 /**
  * View-only fold for the main chat. Message ids, tape bytes, and scroll
@@ -48,6 +49,18 @@ function commandText(message: ChatMessage): string {
   return message.text ?? "";
 }
 
+const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd"]);
+
+/** Preview, image, or generated-file assistant rows stay beside the answer. */
+export function assistantCarriesDeliverable(message: ChatMessage): boolean {
+  if (message.role !== "assistant" || message._hideUnpublishedFallback === true) return false;
+  const text = message.text ?? "";
+  if (!text.trim()) return false;
+  if (/```(?:htmlpreview|html)\b/i.test(text)) return true;
+  if (/!\[[^\]]*\]\([^)\s]+\)/.test(text)) return true;
+  return /\/home\/agent\/\.openclaude\/generated\/\S+/.test(text);
+}
+
 /** User-visible files and generated media stay beside the answer, not inside a tool count. */
 export function isDeliverableTool(message: ChatMessage): boolean {
   if (message.role !== "tool" || message.error) return false;
@@ -89,17 +102,29 @@ export function isProcessMessage(message: ChatMessage, final: boolean): boolean 
   if (liveBackgroundSubtask(message)) return false;
   if (interactiveTool(message)) return false;
   if (isDeliverableTool(message)) return false;
-  if (message.role === "assistant") return !final;
+  if (message.role === "assistant") {
+    if (assistantCarriesDeliverable(message)) return false;
+    return !final;
+  }
   return isFoldableWorkRole(message);
+}
+
+function commandHead(message: ChatMessage): string {
+  const command = commandText(message).trim();
+  const token = command.split(/\s+/)[0] ?? "";
+  const base = token.split("/").pop() ?? token;
+  return base.replace(/^['"]|['"]$/g, "");
 }
 
 function countLabel(message: ChatMessage): string {
   if (message.role === "tool") {
-    const name = `${message.toolName ?? ""} ${commandText(message)}`;
-    if (/read|view|cat/i.test(name)) return "读取";
-    if (/edit|write|patch/i.test(name)) return "编辑";
-    if (/search|grep|glob|find/i.test(name)) return "搜索";
-    if (/exec|bash|terminal|command/i.test(name)) return "命令";
+    const tool = (message.toolName ?? "").toLowerCase();
+    const head = commandHead(message).toLowerCase();
+    const verb = SHELL_TOOLS.has(tool) ? head : tool || head;
+    if (verb === "read" || verb === "view" || verb === "cat") return "读取";
+    if (verb === "edit" || verb === "write" || verb === "patch" || verb === "multiedit") return "编辑";
+    if (verb === "grep" || verb === "rg" || verb === "glob" || verb === "find" || verb === "search") return "搜索";
+    if (SHELL_TOOLS.has(tool) || verb === "bash" || verb === "sh" || verb === "exec") return "命令";
     return "工具";
   }
   if (message.role === "thinking") return "思考";
@@ -150,17 +175,19 @@ const toggleClass =
   "group flex min-h-10 w-full items-center gap-2 rounded-md py-1.5 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
 function StageText({ message }: { message: ChatMessage }) {
-  if (message._payloadDeferred) return null;
-  const text = message.text?.trim() ?? "";
-  if (!text) return null;
+  // Same suppression as AssistantCard: an unpublished fallback must not
+  // reappear just because the row was grouped into the process.
+  if (message._payloadDeferred || message._hideUnpublishedFallback === true) return null;
+  const text = message.text ?? "";
+  if (!text.trim()) return null;
   return (
-    <p
+    <div
       data-testid="process-stage"
       data-find-member={timelineMessageKey(message)}
-      className="whitespace-pre-wrap break-words text-sm leading-6 text-fg"
+      className="min-w-0 text-sm leading-6 text-fg"
     >
-      {text}
-    </p>
+      <Markdown signMedia>{text}</Markdown>
+    </div>
   );
 }
 

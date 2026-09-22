@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { operationSummary } from "./chat/ProcessDisclosure";
 import { MessageList } from "./MessageRenderer";
 
 afterEach(() => {
@@ -102,21 +103,42 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("先核对库存口径")).toBeInTheDocument();
   });
 
-  test("执行中展开后，完成时保留展开并放出最终回答", () => {
-    const messages = settledTurn().filter((message) => message.id !== "pdf-1");
+  test("执行中末条回答全文可见，手动展开在结束后仍保持", () => {
+    const base = settledTurn().filter((message) => message.id !== "pdf-1");
+    const long = `${"进度明细。".repeat(30)}看板已经做好`;
+    const messages = base.map((message) => (message.id === "answer-1" ? { ...message, text: long } : message));
     const view = renderList(messages, { sending: true });
     expect(screen.getByTestId("turn-activity-footer")).toBeInTheDocument();
-    expect(screen.queryByTestId("assistant-row")).not.toBeInTheDocument();
-    expect(screen.getByTestId("process-live-summary")).toHaveTextContent("看板已经做好");
     expect(within(screen.getByTestId("process-disclosure")).queryByRole("button", { name: "停止" })).toBeNull();
+    const answer = screen.getByTestId("assistant-row");
+    expect(answer).toHaveTextContent("看板已经做好");
+    expect(answer.closest("[data-testid=process-live-summary]")).toBeNull();
+    expect(screen.getByTestId("process-live-summary")).toHaveTextContent("先核对库存口径");
+    expect(screen.getByTestId("process-live-summary")).not.toHaveTextContent("看板已经做好");
 
     fireEvent.click(screen.getByTestId("process-toggle"));
     expect(screen.getByText("先核对库存口径")).toBeInTheDocument();
 
+    const grown = messages.map((message) =>
+      message.id === "answer-1" ? { ...message, text: `${long}\n尾部仍在增长` } : message,
+    );
     view.rerender(
       <MessageList
         processDisclosure
-        messages={messages}
+        messages={grown}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-row")).toHaveTextContent("尾部仍在增长");
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={grown}
         sending={false}
         sessionId="session-a"
         cb={{}}
@@ -125,8 +147,7 @@ describe("MessageList Manus 过程披露", () => {
     );
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("先核对库存口径")).toBeInTheDocument();
-    expect(screen.getByTestId("assistant-row")).toHaveTextContent("看板已经做好");
-    expect(screen.queryByTestId("process-live-summary")).not.toBeInTheDocument();
+    expect(screen.getByTestId("assistant-row")).toHaveTextContent("尾部仍在增长");
   });
 
   test("提问、失败、审批和后台子任务不被折进过程", async () => {
@@ -334,5 +355,72 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("probe-stock-layout")).not.toBeInTheDocument();
     const current = document.querySelector("[data-find-current]");
     expect(current?.textContent ?? "").toContain("先核对库存口径");
+  });
+
+  test("带预览、图片或生成附件的助手留在顶层，普通阶段仍走 Markdown", async () => {
+    renderList([
+      row("u", "user", "出图", { status: "replied" }),
+      row("plain", "assistant", "普通阶段见 [口径说明](https://example.com/stock-note)", { _clientMessageId: "u" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "echo complicated-catalog" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("preview", "assistant", "看预览\n```htmlpreview\n<div>PREVIEW_STOCK</div>\n```", { _clientMessageId: "u" }),
+      row("shot", "assistant", "配图 ![仓库](/home/agent/.openclaude/generated/warehouse.png)", { _clientMessageId: "u" }),
+      row("file", "assistant", "文件在 /home/agent/.openclaude/generated/stock-report.docx", { _clientMessageId: "u" }),
+      row("answer", "assistant", "最终总结在这里", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByText("最终总结在这里")).toBeInTheDocument();
+    expect(screen.queryByText(/普通阶段见/)).not.toBeInTheDocument();
+    expect(screen.queryByText("echo complicated-catalog")).not.toBeInTheDocument();
+    const preview = await screen.findByTitle("HTML 沙盒预览");
+    expect(preview.closest("[data-testid=process-disclosure]")).toBeNull();
+    const image = await screen.findByText("仓库");
+    expect(image.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText(/!\[仓库\]/)).not.toBeInTheDocument();
+    const file = await screen.findByText("stock-report.docx");
+    expect(file.closest("[data-testid=process-disclosure]")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const link = await screen.findByRole("link", { name: "口径说明" });
+    expect(link).toHaveAttribute("href", "https://example.com/stock-note");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 1 项");
+  });
+
+  test("未发布降级正文放进过程后仍然不可见", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("hidden", "assistant", "不该再出现的降级正文", {
+        _clientMessageId: "u",
+        _hideUnpublishedFallback: true,
+      }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("answer", "assistant", "可见的最终回答", { _clientMessageId: "u" }),
+    ]);
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByText("可见的最终回答")).toBeInTheDocument();
+    expect(screen.queryByText("不该再出现的降级正文")).not.toBeInTheDocument();
+  });
+
+  test("命令计数看工具名或命令首词，不扫参数里的子串", () => {
+    expect(operationSummary([
+      row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo complicated-catalog" } }),
+    ])).toBe("命令 1 项");
+    expect(operationSummary([
+      row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "cat /tmp/a" } }),
+    ])).toBe("读取 1 项");
+    expect(operationSummary([
+      row("t", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/tmp/a" } }),
+    ])).toBe("读取 1 项");
   });
 });
