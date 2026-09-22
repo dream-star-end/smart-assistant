@@ -3315,7 +3315,19 @@ export class SessionManager {
   ): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
-    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    let tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    // A false "no transcript" drop used to delete the provider and let the
+    // live-session overlay save the same id back as implicit ccb. The Fast
+    // transcript is still on disk; a positive Grok artifact puts the tag back.
+    // An unknown probe has no path and must not retag a real ccb id.
+    if (tag !== wantProvider && wantProvider === 'grok' && tag === SessionManager.CCB_PROVIDER_TAG) {
+      const recovered = probeResumeArtifact('grok', id)
+      if (recovered.exists && recovered.path) {
+        this._resumeMapProvider.set(sessionKey, 'grok')
+        tag = 'grok'
+        this._saveResumeMap()
+      }
+    }
     if (tag !== wantProvider) return undefined
 
     if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
@@ -3383,10 +3395,26 @@ export class SessionManager {
       provider: tag,
       resumeId: id,
     })
+    if (tag === 'grok') this._releaseGrokResumeHead(sessionKey)
     this._forgetResumeEntry(sessionKey)
     this._saveResumeMap()
     return undefined
   }
+
+  /** A Grok id with no on-disk transcript must not stay --resume-able.
+   *  Clearing the live head before `_saveResumeMap` also stops the overlay
+   *  from writing that dead id back. */
+  private _releaseGrokResumeHead(sessionKey: string): void {
+    const live = this.sessions.get(sessionKey)
+    if (!live || live.providerTag !== 'grok') return
+    live.ccbSessionId = null
+    live.runner.clearSessionId()
+    live._historicalContextInjected = false
+    live._historicalContextInjectedKey = undefined
+    live._forceHistoricalContextOnFirstTurn = true
+    live._contextRebuildNotice = 'native-resume-loss'
+  }
+
 
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
    *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
@@ -3593,7 +3621,12 @@ export class SessionManager {
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
         if (sess.costImprecise === true) entry.costImprecise = true
-        const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
+        // Provider map wins when set. When a drop just cleared it, fall back
+        // to the live engine so a Grok id is not rewritten as implicit ccb
+        // (historyContextVersion only) and then refused on the next lookup.
+        const prov = SessionManager.normalizeEngineTag(
+          this._resumeMapProvider.get(key) ?? sess.providerTag,
+        )
         if (prov === SessionManager.CCB_PROVIDER_TAG) {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
         }

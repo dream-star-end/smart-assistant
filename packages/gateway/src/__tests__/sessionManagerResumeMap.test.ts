@@ -253,3 +253,112 @@ exit 0
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+const FAST_GROK_ID = '11111111-1111-4111-8111-111111111111'
+
+test('implicit ccb resume id is recovered when the Grok Fast transcript is on disk', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-grok-fast-retag-'))
+  const previousHome = process.env.OPENCLAUDE_HOME
+  try {
+    const home = join(dir, 'oc-home')
+    const fastDir = join(home, 'grok-build', 'fast', 'sessions', '%2Fws', FAST_GROK_ID)
+    mkdirSync(fastDir, { recursive: true })
+    writeFileSync(join(fastDir, 'chat_history.jsonl'), '{}\n')
+    mkdirSync(join(home, 'grok-build', 'sessions'), { recursive: true })
+    process.env.OPENCLAUDE_HOME = home
+
+    const manager = new SessionManager(makeConfigStub())
+    const internals = manager as unknown as ResumeMapInternals
+    internals.resumeMapPath = join(dir, 'resume-map.json')
+    internals._resumeMap.set('fast-session', FAST_GROK_ID)
+    internals._resumeMapProvider.set('fast-session', 'ccb')
+    internals._resumeMapTimestamps.set('fast-session', 1)
+
+    assert.equal(internals._resumeIdFor('fast-session', 'grok'), FAST_GROK_ID)
+    assert.equal(internals._resumeMapProvider.get('fast-session'), 'grok')
+    await internals.awaitResumeMapFlush()
+    const saved = JSON.parse(readFileSync(internals.resumeMapPath, 'utf8')) as Record<string, { provider?: string; historyContextVersion?: number }>
+    assert.equal(saved['fast-session']?.provider, 'grok')
+    assert.equal(saved['fast-session']?.historyContextVersion, undefined)
+  } finally {
+    if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME
+    else process.env.OPENCLAUDE_HOME = previousHome
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a missing Grok transcript drops the head instead of resuming and rewriting it as ccb', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-grok-fast-miss-'))
+  const previousHome = process.env.OPENCLAUDE_HOME
+  try {
+    const home = join(dir, 'oc-home')
+    mkdirSync(join(home, 'grok-build', 'sessions'), { recursive: true })
+    mkdirSync(join(home, 'grok-build', 'fast', 'sessions'), { recursive: true })
+    process.env.OPENCLAUDE_HOME = home
+    let cleared = 0
+    const manager = new SessionManager(makeConfigStub())
+    const internals = manager as unknown as ResumeMapInternals & {
+      sessions: Map<string, {
+        providerTag: string
+        ccbSessionId: string | null
+        runner: { clearSessionId: () => void }
+        _historicalContextInjected: boolean
+        _forceHistoricalContextOnFirstTurn?: boolean
+        _contextRebuildNotice?: string
+        _lastCcbCumulativeCost: number
+        costImprecise?: boolean
+      }>
+    }
+    internals.resumeMapPath = join(dir, 'resume-map.json')
+    internals._resumeMap.set('fast-session', FAST_GROK_ID)
+    internals._resumeMapProvider.set('fast-session', 'grok')
+    internals.sessions.set('fast-session', {
+      providerTag: 'grok',
+      ccbSessionId: FAST_GROK_ID,
+      runner: { clearSessionId: () => { cleared += 1 } },
+      _historicalContextInjected: true,
+      _lastCcbCumulativeCost: 0,
+    })
+
+    assert.equal(internals._resumeIdFor('fast-session', 'grok'), undefined)
+    assert.equal(cleared, 1)
+    assert.equal(internals.sessions.get('fast-session')?.ccbSessionId, null)
+    assert.equal(internals.sessions.get('fast-session')?._forceHistoricalContextOnFirstTurn, true)
+    assert.equal(internals.sessions.get('fast-session')?._contextRebuildNotice, 'native-resume-loss')
+    assert.equal(internals._resumeMap.has('fast-session'), false)
+    await internals.awaitResumeMapFlush()
+    const saved = JSON.parse(readFileSync(internals.resumeMapPath, 'utf8')) as Record<string, unknown>
+    assert.equal(saved['fast-session'], undefined)
+  } finally {
+    if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME
+    else process.env.OPENCLAUDE_HOME = previousHome
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('live Grok overlay keeps provider when the resume-map provider slot is empty', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-grok-overlay-provider-'))
+  try {
+    const manager = new SessionManager(makeConfigStub())
+    const internals = manager as unknown as ResumeMapInternals & {
+      sessions: Map<string, {
+        providerTag: string
+        ccbSessionId: string | null
+        _lastCcbCumulativeCost: number
+      }>
+    }
+    internals.resumeMapPath = join(dir, 'resume-map.json')
+    internals.sessions.set('fast-session', {
+      providerTag: 'grok',
+      ccbSessionId: FAST_GROK_ID,
+      _lastCcbCumulativeCost: 0,
+    })
+    internals._saveResumeMap()
+    await internals.awaitResumeMapFlush()
+    const saved = JSON.parse(readFileSync(internals.resumeMapPath, 'utf8')) as Record<string, { provider?: string; historyContextVersion?: number }>
+    assert.equal(saved['fast-session']?.provider, 'grok')
+    assert.equal(saved['fast-session']?.historyContextVersion, undefined)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
