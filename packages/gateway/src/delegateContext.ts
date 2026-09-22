@@ -125,6 +125,32 @@ export function issueConsultTurnToken(input: {
   return `${payload}.${signPayload(payload)}`
 }
 
+/** Advisor turns get an immutable v2 token. Other turns keep the v1 delegate token. */
+export function issueParentCallerToken(input: {
+  agentId: string
+  sessionKey: string
+  depth: number
+  consultTurn?: { turnKey: string; turnIndex: number; configVersion: string } | null
+}): string {
+  const consult = input.consultTurn
+  if (consult?.turnKey && consult.configVersion) {
+    return issueConsultTurnToken({
+      agentId: input.agentId,
+      sessionKey: input.sessionKey,
+      depth: input.depth,
+      turnKey: consult.turnKey,
+      turnIndex: consult.turnIndex,
+      collabMode: 'advisor',
+      configVersion: consult.configVersion,
+    })
+  }
+  return issueDelegateContextToken({
+    agentId: input.agentId,
+    sessionKey: input.sessionKey,
+    depth: input.depth,
+  })
+}
+
 export function isConsultTurnClaims(claims: DelegateContextClaims): claims is DelegateContextClaimsV2 {
   return claims.v === 2
 }

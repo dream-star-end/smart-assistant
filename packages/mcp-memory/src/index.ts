@@ -863,11 +863,10 @@ async function handleConsultAdvisor(
     mcpMeta: req?.params?._meta,
     jsonRpcId: req?.id,
   })
-  if (!invocation.ok) return toolError(invocation.error)
   const headers = {
     ...gatewayDelegateHeaders(),
-    [CONSULT_INVOCATION_HEADER]: invocation.invocationId,
   }
+  if (invocation.ok) headers[CONSULT_INVOCATION_HEADER] = invocation.invocationId
   try {
     const result = await consultAdvisorUntilAdvice({
       post: () =>

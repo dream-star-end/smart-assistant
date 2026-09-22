@@ -274,9 +274,9 @@ export const TUTORIAL_TOPICS = {
   },
   "models-reasoning": {
     featureId: "models-reasoning",
-    contentVersion: 6,
+    contentVersion: 7,
     intro:
-      "顶栏模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。当前可选范围包含 GPT、DeepSeek、GLM，以及 Grok 4.6（官方 grok-build）和 Cursor 家族。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。",
+      "顶栏模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。当前可选范围包含 GPT、DeepSeek、GLM、官方 Grok 和 Cursor 家族。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。窄屏上选择器从底部弹出，不再带搜索框。",
     outcome: "按任务难度选择合适模型，在响应速度、质量与积分消耗之间取得平衡。",
     scenarios: [
       "快速润色与摘要",
@@ -290,7 +290,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "按家族和档位选择",
-        body: "先选家族（GPT、DeepSeek、GLM、Grok、Cursor），再选思考档。Cursor 家族另有 Fast 档；官方 Grok Build（grok-build）没有 Fast，不要按 Cursor 的 Fast 去找。",
+        body: "先选家族（GPT、DeepSeek、GLM、Grok、Cursor），再选思考档。需要更快时再开速度档（Fast）。窄屏点顶栏模型后，列表从底部弹出。",
       },
       {
         title: "切换只影响后续消息",
@@ -660,9 +660,9 @@ export const TUTORIAL_TOPICS = {
   },
   "advisor-mode": {
     featureId: "advisor-mode",
-    contentVersion: 4,
+    contentVersion: 5,
     intro:
-      "顾问模式给全能助手配一个只出主意的顾问。主模型不会因此被切换。目前只有 GLM、MiniMax 这类会话可以咨询；Grok、Cursor 等其它主模型会在选择或发送前直接说明不能用，不会偷偷换主模型或改成单人。需要时主模型向顾问提问。顾问只能给建议，不能改文件、跑命令或再派人。建议必须由执行者用证据验证后才交付，不能替代审批或正式审查。",
+      "顾问模式给全能助手配一个只出主意的顾问。主模型不会因此被切换。Grok、Codex、Cursor、GLM、MiniMax 都可以开启。需要时主模型向顾问提问。顾问只能给建议，不能改文件、跑命令或再派人。建议必须由执行者用证据验证后才交付，不能替代审批或正式审查。",
     outcome: "在不换主模型的前提下获得第二意见，并由主模型负责核验与执行。",
     scenarios: ["方案取舍需要第二意见", "主模型想核对实现约束", "对照普通/顾问/更强主模型的质量与费用"],
     steps: [
@@ -672,7 +672,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "选择顾问",
-        body: "点「顾问」。主模型选择器保持不变。若当前模型不能咨询，按钮会禁用并说明要把顶栏模型换成 GLM 或 MiniMax。新会话必须先正常创建，才能保存协作方式。若顾问列表为空，说明暂时没有可用顾问，也不会自动改成别的型号。",
+        body: "点「顾问」。主模型选择器保持不变，这些主模型都可以开。新会话必须先正常创建，才能保存协作方式。若顾问列表为空，说明暂时没有可用顾问，也不会自动改成别的型号。",
       },
       {
         title: "核对顶栏固定配置",
@@ -688,7 +688,7 @@ export const TUTORIAL_TOPICS = {
       "可以把「同时设为新对话的默认协作方式」勾上，但那只改默认，不会覆盖已经保存的会话设置，也不会改写原回合。",
     ],
     cautions: [
-      "目前只有 GLM、MiniMax 这类主模型可以咨询顾问；其它主模型会明确不可用。",
+      "Grok、Codex、Cursor、GLM、MiniMax 都可以开顾问。认不出来的会话会直接说明不能用，不会偷偷换主模型。",
       "顾问按实际型号计费，不承诺比单人更省。",
       "顾问意见不是审批通过，也不能代替正式代码审查。",
     ],
@@ -930,7 +930,7 @@ export const TUTORIAL_TOPICS = {
   },
   inbox: {
     featureId: "inbox",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
       "顶栏铃铛汇总服务通知、任务送达、账户提醒和平台公告。未读红点显示需要关注的数量；消息卡可包含格式化正文、图片、图表和链接，并能按全部/未读筛选或一键全部已读。",
     outcome: "在一个位置接收异步任务结果与真正需要处理的服务信息。",
@@ -942,7 +942,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "展开消息详情",
-        body: "阅读时间、级别、正文和相关链接；富内容只用于展示，不会在站内信里执行编辑动作。",
+        body: "阅读时间、级别、正文和相关链接。内容提醒如果带申诉入口，可以在卡片里提交说明；其它富内容只用于展示。",
       },
       {
         title: "按需标记已读",

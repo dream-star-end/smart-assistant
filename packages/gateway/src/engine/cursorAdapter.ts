@@ -36,7 +36,7 @@ import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWith
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
-import { issueDelegateContextToken } from '../delegateContext.js'
+import { issueParentCallerToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
@@ -1981,10 +1981,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         const contextFile = resolve(contextDir, 'delegate-context')
         writeFileSync(
           contextFile,
-          `${issueDelegateContextToken({
+          `${issueParentCallerToken({
             agentId: this.opts.agentId,
             sessionKey: this.opts.sessionKey,
             depth: this.opts.delegationDepth ?? 0,
+            consultTurn: ctx.params.consultTurn && ctx.params.turnKey
+              ? {
+                  turnKey: ctx.params.turnKey,
+                  turnIndex: ctx.params.consultTurn.turnIndex,
+                  configVersion: ctx.params.consultTurn.configVersion,
+                }
+              : null,
           })}\n`,
           { mode: 0o600 },
         )

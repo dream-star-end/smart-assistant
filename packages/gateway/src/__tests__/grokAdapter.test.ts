@@ -4,7 +4,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/grokAdapter.test.ts
  */
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { describe, test } from 'node:test'
@@ -172,7 +172,11 @@ for (const event of [
       assert.equal(captured.env.GROK_CLI_CHAT_PROXY_BASE_URL, baseUrl)
       assert.equal(captured.env.GROK_MODELS_BASE_URL, baseUrl)
       assert.equal(captured.env.GROK_MODELS_LIST_URL, `${baseUrl}/models`)
-      assert.equal(captured.env.GROK_HOME, path.join(process.env.OPENCLAUDE_HOME!, 'grok-build'))
+      assert.match(captured.env.GROK_HOME, /grok-build\/caller\/[0-9a-f]{16}$/)
+      assert.equal(
+        await realpath(path.join(captured.env.GROK_HOME, 'sessions')),
+        path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'sessions'),
+      )
       assert.equal(captured.env.OPENCLAUDE_ENGINE, 'grok')
       assert.equal(captured.env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
@@ -538,7 +542,11 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'bb
     const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; home: string }
     assert.equal(captured.argv[captured.argv.indexOf('--model') + 1], 'grok-4.7-build-fast')
     assert.equal(captured.argv.includes('--resume'), false)
-    assert.equal(captured.home, path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'fast'))
+    assert.match(captured.home, /grok-build\/caller\/[0-9a-f]{16}\/fast$/)
+    assert.equal(
+      await realpath(path.join(captured.home, 'sessions')),
+      path.join(baseHome, 'fast', 'sessions'),
+    )
     const seeded = JSON.parse(await readFile(path.join(captured.home, 'models_cache.json'), 'utf8')) as {
       models: Record<string, { api_key: string | null }>
     }
@@ -562,7 +570,7 @@ const fs = require('node:fs')
 const argv = process.argv.slice(2)
 const promptFile = argv[argv.indexOf('--prompt-file') + 1]
 const prompt = fs.readFileSync(promptFile, 'utf8')
-fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt }))
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt, home: process.env.GROK_HOME }))
 console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
 `)
   await chmod(fake, 0o755)
@@ -594,17 +602,17 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
     })
     await run.submitted
     await run.summary
-    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string }
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string; home: string }
     assert.match(captured.prompt, /use memory/)
     assert.equal(captured.prompt.includes('bearer-must-not-enter-argv'), false)
     assert.equal(JSON.stringify(captured.argv).includes('bearer-must-not-enter-argv'), false)
-    const managedConfig = await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'config.toml'), 'utf8')
+    assert.match(captured.home, /grok-build\/caller\/[0-9a-f]{16}$/)
+    const managedConfig = await readFile(path.join(captured.home, 'config.toml'), 'utf8')
     assert.match(managedConfig, /\[mcp_servers\."openclaude-memory"\]/)
     assert.equal(managedConfig.includes('bearer-must-not-enter-argv'), false)
-    assert.equal(
-      await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'gateway-token'), 'utf8'),
-      'bearer-must-not-enter-argv',
-    )
+    const tokenPath = managedConfig.match(/OPENCLAUDE_GATEWAY_TOKEN_FILE = "([^"]+)"/)?.[1]
+    assert.ok(tokenPath)
+    assert.equal(await readFile(tokenPath!, 'utf8'), 'bearer-must-not-enter-argv')
   } finally {
     restoreEnv('OC_GROK_CLI_BIN', previousBin)
     restoreEnv('OPENCLAUDE_HOME', previousHome)

@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { synthesizeEmptyFailedToolPreview, type GoalStateSnapshot, type OutboundContentBlock } from '@openclaude/protocol'
@@ -561,6 +561,15 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,
+      ...(ctx.params.consultTurn && ctx.params.turnKey
+        ? {
+            consultTurn: {
+              turnKey: ctx.params.turnKey,
+              turnIndex: ctx.params.consultTurn.turnIndex,
+              configVersion: ctx.params.consultTurn.configVersion,
+            },
+          }
+        : {}),
       claudeCodePath: this.opts.config.auth.claudeCodePath,
       skillEvalMode: this.opts.skillEvalMode,
       skillEvalExclude: this.opts.skillEvalExclude,
@@ -609,7 +618,17 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_MODELS_LIST_URL: `${route.baseUrl.replace(/\/$/, '')}/models`,
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
-      GROK_HOME: grokRuntimeHome(platform.grokHome, this.currentModel),
+      GROK_HOME: (() => {
+        const runtimeHome = grokRuntimeHome(platform.launchHome, this.currentModel)
+        const stableRoot = this.currentModel === 'grok-build-fast'
+          ? join(platform.grokHome, 'fast')
+          : platform.grokHome
+        const stableSessions = join(stableRoot, 'sessions')
+        mkdirSync(stableSessions, { recursive: true, mode: 0o700 })
+        const dest = join(runtimeHome, 'sessions')
+        if (dest !== stableSessions && !existsSync(dest)) symlinkSync(stableSessions, dest)
+        return runtimeHome
+      })(),
       ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()

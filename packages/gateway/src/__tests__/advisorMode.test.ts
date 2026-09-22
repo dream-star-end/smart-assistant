@@ -11,6 +11,7 @@ import {
   assertAdvisorModelAllowed,
   coerceHistoryMessages,
   isAdvisorConsultParentEngine,
+  uniquePendingConsultInvocationId,
   advisorConsultParentGate,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
@@ -305,15 +306,47 @@ describe('advisorMode snapshot', () => {
     assert.equal(hist.records?.[0]?.text, 'keep me')
   })
 
-  it('isAdvisorConsultParentEngine is CCB-only in phase 1', () => {
+  it('isAdvisorConsultParentEngine allows every main engine and closes unknowns', () => {
     assert.equal(isAdvisorConsultParentEngine('ccb'), true)
-    assert.equal(isAdvisorConsultParentEngine('codex'), false)
-    assert.equal(isAdvisorConsultParentEngine('grok'), false)
-    assert.equal(isAdvisorConsultParentEngine('cursor'), false)
-    assert.equal(advisorConsultParentGate('ccb').allowed, true)
-    assert.equal(advisorConsultParentGate('codex').allowed, false)
+    assert.equal(isAdvisorConsultParentEngine('codex'), true)
+    assert.equal(isAdvisorConsultParentEngine('grok'), true)
+    assert.equal(isAdvisorConsultParentEngine('cursor'), true)
+    assert.equal(isAdvisorConsultParentEngine('zcode'), false)
+    assert.equal(advisorConsultParentGate('grok').allowed, true)
+    assert.equal(advisorConsultParentGate('nope').allowed, false)
     assert.equal(advisorConsultParentGate(undefined).allowed, false)
-    assert.match(String(advisorConsultParentGate(undefined).reason), /未知/)
+    assert.match(String(advisorConsultParentGate(undefined).reason), /不能开顾问/)
+    assert.doesNotMatch(String(advisorConsultParentGate('nope').reason), /CCB|tool_use|一期/)
+  })
+
+  it('uniquePendingConsultInvocationId uses one in-flight consult and never mints', () => {
+    const one = uniquePendingConsultInvocationId([
+      { toolName: 'mcp__openclaude-memory__consult_advisor', toolUseId: 'call_grok_consult_1', completed: false },
+    ])
+    assert.deepEqual(one, { ok: true, invocationId: 'call_grok_consult_1' })
+    const bash = uniquePendingConsultInvocationId([
+      { toolName: 'Bash', toolUseId: 'call_cursor_shell_1', completed: false, inputJson: { command: 'oc-memory consult-advisor --question "x"' } },
+    ])
+    assert.equal(bash.ok, true)
+    const decoy = uniquePendingConsultInvocationId([
+      { toolName: 'Read', toolUseId: 'read_call_12345', completed: false, inputJson: { file_path: '/tmp/consult_advisor.md' } },
+    ])
+    assert.deepEqual(decoy, { ok: false, reason: 'none' })
+    const mixed = uniquePendingConsultInvocationId([
+      { toolName: 'consult_advisor', toolUseId: 'call_real_consult', completed: false },
+      { toolName: 'Read', toolUseId: 'read_call_12345', completed: false, inputJson: { file_path: '/tmp/consult_advisor.md' } },
+    ])
+    assert.deepEqual(mixed, { ok: true, invocationId: 'call_real_consult' })
+    const two = uniquePendingConsultInvocationId([
+      { toolName: 'consult_advisor', toolUseId: 'call_one_consult', completed: false },
+      { toolName: 'consult_advisor', toolUseId: 'call_two_consult', completed: false },
+    ])
+    assert.deepEqual(two, { ok: false, reason: 'ambiguous' })
+    assert.deepEqual(uniquePendingConsultInvocationId([]), { ok: false, reason: 'none' })
+    assert.deepEqual(
+      uniquePendingConsultInvocationId([{ toolName: 'consult_advisor', toolUseId: 'short', completed: false }]),
+      { ok: false, reason: 'none' },
+    )
   })
 
   it('assertAdvisorModelAllowed refuses silent fallback when the requested slug is absent', () => {

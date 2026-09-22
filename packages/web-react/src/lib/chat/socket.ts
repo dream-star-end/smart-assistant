@@ -58,6 +58,7 @@ import {
 } from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
+  freezeErrorCardSnapshots,
   isDispatchLostCode,
   isDispatchTerminalRow,
 } from "./render";
@@ -160,6 +161,26 @@ import {
 import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
+
+
+function deferredTerminalErrorPaintForStore(
+  paint: DeferredTerminalErrorPaint | undefined,
+): StoredSession["_deferredTerminalErrorPaint"] | undefined {
+  if (!paint) return undefined;
+  const normalized = typeof paint.normalized === "string" ? paint.normalized.slice(0, 64) : "";
+  const text = typeof paint.text === "string" ? paint.text.slice(0, 4000) : "";
+  if (!normalized || !text) return undefined;
+  return {
+    normalized,
+    text,
+    ...(typeof paint.detail === "string" && paint.detail ? { detail: paint.detail.slice(0, 2000) } : {}),
+    ...(typeof paint.displayMessage === "string" && paint.displayMessage
+      ? { displayMessage: paint.displayMessage.slice(0, 4000) }
+      : {}),
+    ...(isClientMessageId(paint.clientMessageId) ? { clientMessageId: paint.clientMessageId } : {}),
+    ...(typeof paint.traceId === "string" && paint.traceId ? { traceId: paint.traceId.slice(0, 128) } : {}),
+  };
+}
 
 function messageHasVisibleBody(message: ChatMessage): boolean {
   if (typeof message.text === "string" && message.text.trim().length > 0) return true;
@@ -1916,6 +1937,7 @@ export class ChatSocket {
         }
       },
       deferTerminalErrorForRecovery: (sessId, paint) => this.deferTerminalErrorForRecovery(sessId, paint),
+      discardDeferredTerminalError: (sessId, clientMessageId) => this.discardDeferredTerminalError(sessId, clientMessageId),
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
@@ -2860,7 +2882,21 @@ export class ChatSocket {
     if (sess) sess._deferredTerminalErrorClientMessageId = undefined;
   }
 
-  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。*/
+  /** 静默终态到达时丢掉还没画上的延后卡。已经提交的卡不动。 */
+  private discardDeferredTerminalError(sessId: string, clientMessageId?: string): void {
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    if (!pending) return;
+    if (pending.clientMessageId && clientMessageId && pending.clientMessageId !== clientMessageId) return;
+    clearTimeout(pending.timer);
+    this.pendingRecoveryErrors.delete(sessId);
+    const sess = this.sessions.get(sessId);
+    if (sess && (!clientMessageId || sess._deferredTerminalErrorClientMessageId === clientMessageId)) {
+      sess._deferredTerminalErrorClientMessageId = undefined;
+    }
+  }
+
+  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。
+   * 宽限超时不准画卡：软状态继续等真正的裁决。点停也不补错误卡。 */
   private materializePendingRecoveryError(
     sessId: string,
     cause: ProblemCardMaterializeCause,
@@ -2868,6 +2904,10 @@ export class ChatSocket {
   ): void {
     const pending = this.pendingRecoveryErrors.get(sessId);
     if (!pending) return;
+    if (cause === "decision_timeout" || cause === "adoption_timeout") {
+      clearTimeout(pending.timer);
+      return;
+    }
     clearTimeout(pending.timer);
     this.pendingRecoveryErrors.delete(sessId);
     const sess = this.sessions.get(sessId);
@@ -2875,6 +2915,29 @@ export class ChatSocket {
     sess._deferredTerminalErrorClientMessageId = undefined;
     const wasActive = sess._sendingInFlight &&
       (!pending.clientMessageId || sess._activeClientMessageId === pending.clientMessageId);
+    if (cause === "stop_fenced") {
+      if (wasActive) {
+        sess._sendingInFlight = false;
+        sess._activeClientMessageId = undefined;
+        sess._turnStatus = null;
+        this.clearThinkingSafety(sessId);
+        this.kickQueuedDrainIfIdle();
+      }
+      this.deps.persistSession?.(sessId);
+      this.scheduleNotify();
+      const rootCmid = this.problemCardRootCmid(sess, pending.clientMessageId);
+      if (rootCmid) {
+        this.reportProblemCard(sessId, {
+          rootCmid,
+          code: pending.paint.normalized,
+          outcome: "cancelled",
+          path: "stop_fenced",
+          presentation: "soft",
+          traceId: pending.paint.traceId,
+        });
+      }
+      return;
+    }
     const painted = paintDeferredTerminalError(sess, pending.paint, this.effects());
     if (wasActive && !sess._sendingInFlight) {
       // painter 已清 in-flight;补齐 socket 侧收尾(thinking-safety / 排队消息续发)。
@@ -2890,7 +2953,7 @@ export class ChatSocket {
     this.reportProblemCard(sessId, {
       rootCmid,
       code,
-      outcome: cause === "stop_fenced" ? "cancelled" : "failed",
+      outcome: "failed",
       path: cause,
       presentation: problemCardPresentation(code, false),
       ...(reason ? { reason } : {}),
@@ -3034,6 +3097,21 @@ export class ChatSocket {
     const sourceClientMessageId = isClientMessageId(frame.sourceClientMessageId)
       ? frame.sourceClientMessageId
       : undefined;
+    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
+    const hadCommittedCard = sourceClientMessageId
+      ? sess.messages.some((message) =>
+        message.role === "assistant" &&
+        message._clientMessageId === sourceClientMessageId &&
+        message._errorCardSnapshot?.disposition === "card")
+      : false;
+    const pendingPaint = this.pendingRecoveryErrors.get(sessId);
+    if (
+      !hadCommittedCard &&
+      pendingPaint &&
+      (!pendingPaint.clientMessageId || pendingPaint.clientMessageId === sourceClientMessageId)
+    ) {
+      pendingPaint.paint = { ...pendingPaint.paint, displayMessage: skipNotice };
+    }
     // 血统被 master 原子拒绝:延后的红卡必须先落地,下方的 skip 提示才有卡可挂。
     this.settlePendingRecoveryError(sessId, sourceClientMessageId, "declined", "recovery_skipped");
     if (sourceClientMessageId) {
@@ -3042,7 +3120,6 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
-    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
     let attachedToError = false;
     if (sourceClientMessageId) {
       for (const message of sess.messages) {
@@ -3647,6 +3724,14 @@ export class ChatSocket {
         return clean;
       });
     }
+    const pendingDeferred = this.pendingRecoveryErrors.get(s.id);
+    const pendingDeferredId = pendingDeferred?.clientMessageId;
+    const deferredTerminalErrorId = isClientMessageId(s._deferredTerminalErrorClientMessageId)
+      ? s._deferredTerminalErrorClientMessageId
+      : isClientMessageId(pendingDeferredId)
+        ? pendingDeferredId
+        : undefined;
+    const deferredTerminalErrorPaint = deferredTerminalErrorPaintForStore(pendingDeferred?.paint);
     return {
       id: s.id,
       agentId: s.agentId,
@@ -3673,6 +3758,10 @@ export class ChatSocket {
         : {}),
       ...(s._automaticRecoveryDecisions
         ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
+        : {}),
+      ...(deferredTerminalErrorId ? { _deferredTerminalErrorClientMessageId: deferredTerminalErrorId } : {}),
+      ...(deferredTerminalErrorId && deferredTerminalErrorPaint
+        ? { _deferredTerminalErrorPaint: deferredTerminalErrorPaint }
         : {}),
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
@@ -3803,6 +3892,7 @@ export class ChatSocket {
     const repairedStoredOrder = repairedStoredMessages !== s.messages;
     if (repairedStoredOrder) s.messages = repairedStoredMessages;
     this.sessions.set(stored.id, s);
+    this.restoreDeferredTerminalError(s, stored);
     const storedControls = Array.isArray(stored._pendingControls)
       ? stored._pendingControls.filter((item) =>
           item?.kind === "control" &&
@@ -3842,6 +3932,55 @@ export class ChatSocket {
     }
     if (storedPending.length > 0 && !s._dispatchPaused) this.kickDispatchPump();
     this.scheduleNotify();
+  }
+
+
+  /** 刷新后继续等裁决。历史失败 tape 不能自行把源轮提交成错误卡。 */
+  private restoreDeferredTerminalError(s: ChatSession, stored: StoredSession): void {
+    const cmid = stored._deferredTerminalErrorClientMessageId;
+    const paint = stored._deferredTerminalErrorPaint;
+    if (!isClientMessageId(cmid) || !paint) return;
+    if (typeof paint.normalized !== "string" || typeof paint.text !== "string") return;
+    if (paint.normalized.length === 0 || paint.normalized.length > 64) return;
+    if (paint.text.length === 0 || paint.text.length > 4000) return;
+    if (s._cancelledAutomaticRecoveryIds?.[cmid] === true) return;
+    if (s._automaticRecoveryDecisions?.[cmid] === true) return;
+    s._deferredTerminalErrorClientMessageId = cmid;
+    if (!s._sendingInFlight) {
+      s._sendingInFlight = true;
+      s._activeClientMessageId = cmid;
+    }
+    const source = s.messages.find((message) => message.role === "user" && message.id === cmid);
+    const sourceAttempt = typeof source?._automaticRecoveryAttempt === "number" &&
+        Number.isSafeInteger(source._automaticRecoveryAttempt) &&
+        source._automaticRecoveryAttempt >= 1
+      ? source._automaticRecoveryAttempt
+      : 0;
+    s._turnStatus = {
+      kind: "retrying",
+      attempt: Math.min(sourceAttempt + 1, AUTOMATIC_TURN_RETRY_MAX),
+      max: AUTOMATIC_TURN_RETRY_MAX,
+      retryAt: Date.now(),
+    };
+    const restored: DeferredTerminalErrorPaint = {
+      normalized: paint.normalized,
+      text: paint.text,
+      ...(typeof paint.detail === "string" ? { detail: paint.detail } : {}),
+      ...(typeof paint.displayMessage === "string" ? { displayMessage: paint.displayMessage } : {}),
+      clientMessageId: isClientMessageId(paint.clientMessageId) ? paint.clientMessageId : cmid,
+      ...(typeof paint.traceId === "string" ? { traceId: paint.traceId } : {}),
+    };
+    const timer = setTimeout(
+      () => this.materializePendingRecoveryError(s.id, "decision_timeout"),
+      RECOVERY_DECISION_GRACE_MS,
+    );
+    if (typeof timer === "object" && timer && "unref" in timer) timer.unref();
+    this.pendingRecoveryErrors.set(s.id, {
+      paint: restored,
+      clientMessageId: cmid,
+      timer,
+      decided: false,
+    });
   }
 
   /**
@@ -4042,6 +4181,11 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
+    freezeErrorCardSnapshots(
+      s.messages,
+      s._deferredTerminalErrorClientMessageId,
+      new Set(Object.keys(s._cancelledAutomaticRecoveryIds ?? {})),
+    );
     // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
@@ -4063,6 +4207,7 @@ export class ChatSocket {
     if (
       !this.masterOwnsAutomaticRecovery &&
       tailRecoverableError &&
+      s._deferredTerminalErrorClientMessageId !== tailRecoverableError._clientMessageId &&
       s._automaticRecoveryDecisions?.[recoveryDecisionKey] !== true
     ) {
       setTimeout(
@@ -4714,6 +4859,8 @@ export class ChatSocket {
   private convergeTerminalTurns(s: ChatSession, terminalTurns: Map<string, ServerTurnTerminal>): void {
     if (terminalTurns.size === 0) return;
     for (const [cmid, kind] of terminalTurns) {
+      // 恢复还没裁决。源轮 tape 不是终态否决，不能清掉「正在重试」也不能画卡。
+      if (s._deferredTerminalErrorClientMessageId === cmid) continue;
       const userRow = s.messages.find((m) => m.role === "user" && m.id === cmid);
       if (userRow) {
         if (kind === "completed") {
@@ -4759,6 +4906,11 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
+    freezeErrorCardSnapshots(
+      s.messages,
+      s._deferredTerminalErrorClientMessageId,
+      new Set(Object.keys(s._cancelledAutomaticRecoveryIds ?? {})),
+    );
     this.scheduleNotify();
   }
 
