@@ -362,6 +362,12 @@
       "reason": "A refresh treated an open turn as a finished tape and changed the process fold. In-flight reloads now keep the live rows and skip terminal reordering. No billing or stored-data change.",
       "approvedBy": "user:default approved OCV5-272",
       "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "696660100903d4311293b8425c6368dadb198c7e",
+      "reason": "A refresh kept only the open subtask card and dropped the parent turn steps. The first live-unit pack now shrinks that card before evicting parent tools, and a non-empty pack no longer deletes local steps it did not replace. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 要求根治过程区刷新 OCV5-275",
+      "expiresAt": "2026-10-23"
     }
   ]
 }
