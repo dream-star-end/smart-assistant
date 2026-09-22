@@ -324,6 +324,8 @@ export type ChatMessage = {
         message: string;
         detail?: string;
       };
+  /** 恢复裁决还没到。历史里的源错误行先不展示，避免抢先画卡。 */
+  _errorHeldForRecovery?: true;
   /** Browser-only: last recovery skip copy, attached to the source error card. */
   _recoverySkippedNotice?: string;
   /** Highest gateway-local retry consumed before this terminal error. */

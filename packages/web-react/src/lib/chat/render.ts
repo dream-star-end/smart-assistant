@@ -823,8 +823,12 @@ export function commitErrorCardSnapshot(message: ChatMessage, messageOverride?: 
   };
 }
 
-export function freezeErrorCardSnapshots(messages: readonly ChatMessage[]): void {
+export function freezeErrorCardSnapshots(
+  messages: readonly ChatMessage[],
+  deferredClientMessageId?: string,
+): void {
   const recoveringSources = new Set<string>();
+  if (deferredClientMessageId) recoveringSources.add(deferredClientMessageId);
   for (const message of messages) {
     if (
       message?.role === "user" &&
@@ -836,11 +840,16 @@ export function freezeErrorCardSnapshots(messages: readonly ChatMessage[]): void
     }
   }
   for (const message of messages) {
-    if (message._errorCardSnapshot) continue;
+    if (message._errorCardSnapshot?.disposition === "card") {
+      message._errorHeldForRecovery = undefined;
+      continue;
+    }
     if (
       typeof message._clientMessageId === "string" &&
-      recoveringSources.has(message._clientMessageId)
+      recoveringSources.has(message._clientMessageId) &&
+      message._errorCode
     ) {
+      message._errorHeldForRecovery = true;
       continue;
     }
     commitErrorCardSnapshot(message);

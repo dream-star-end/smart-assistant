@@ -2601,8 +2601,18 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
     const adopted = sess.messages.some((m) =>
       m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid);
     if (adopted) return false;
-    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode)) return false;
-    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && m._turnTapeComplete === true)) return false;
+    const existing = sess.messages.find((m) =>
+      m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode);
+    if (existing?._errorCardSnapshot?.disposition === "card") return false;
+    if (existing) {
+      existing._errorHeldForRecovery = undefined;
+      if (paint.displayMessage) existing.text = paint.displayMessage;
+      commitErrorCardSnapshot(existing, paint.displayMessage);
+      paintTerminalError(sess, paint, false);
+      effects.persistSession?.(sess.id);
+      return existing._errorCardSnapshot?.disposition === "card";
+    }
+    if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && m._turnTapeComplete === true && !m._errorCode)) return false;
   }
   paintTerminalError(sess, paint, false);
   effects.persistSession?.(sess.id);

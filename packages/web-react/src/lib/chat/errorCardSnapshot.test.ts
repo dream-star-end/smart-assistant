@@ -96,4 +96,16 @@ describe("commitErrorCardSnapshot", () => {
     freezeErrorCardSnapshots([source]);
     expect(source._errorCardSnapshot?.disposition).toBe("card");
   });
+
+  test("a deferred source error is held instead of committed before the recovery decision", () => {
+    const source = message({
+      id: "srv-err",
+      _clientMessageId: "u1",
+      _errorCode: "model_capacity",
+      text: "busy",
+    });
+    freezeErrorCardSnapshots([source], "u1");
+    expect(source._errorCardSnapshot).toBeUndefined();
+    expect(source._errorHeldForRecovery).toBe(true);
+  });
 });

@@ -654,6 +654,7 @@ export function AssistantCard({
 }) {
   const live = isLive(msg, ctx);
   if (msg._hideUnpublishedFallback === true) return null;
+  if (msg._errorHeldForRecovery === true && msg._errorCardSnapshot?.disposition !== "card") return null;
   const hasError = !!msg._errorCode;
   const presentedError = hasError
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)

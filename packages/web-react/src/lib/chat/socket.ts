@@ -4099,7 +4099,7 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
-    freezeErrorCardSnapshots(s.messages);
+    freezeErrorCardSnapshots(s.messages, s._deferredTerminalErrorClientMessageId);
     // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
@@ -4772,6 +4772,8 @@ export class ChatSocket {
   private convergeTerminalTurns(s: ChatSession, terminalTurns: Map<string, ServerTurnTerminal>): void {
     if (terminalTurns.size === 0) return;
     for (const [cmid, kind] of terminalTurns) {
+      // 恢复还没裁决。源轮 tape 不是终态否决，不能清掉「正在重试」也不能画卡。
+      if (s._deferredTerminalErrorClientMessageId === cmid) continue;
       const userRow = s.messages.find((m) => m.role === "user" && m.id === cmid);
       if (userRow) {
         if (kind === "completed") {
@@ -4817,7 +4819,7 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
-    freezeErrorCardSnapshots(s.messages);
+    freezeErrorCardSnapshots(s.messages, s._deferredTerminalErrorClientMessageId);
     this.scheduleNotify();
   }
 
