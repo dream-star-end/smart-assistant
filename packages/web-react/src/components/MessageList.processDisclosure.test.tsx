@@ -1579,4 +1579,72 @@ describe("MessageList Manus 过程披露", () => {
     expect(other).not.toHaveTextContent(/token/i);
     expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("research-assistant");
   });
+
+  test("正文后面的计划收回上面的工作过程，不在回答下面再开一节", () => {
+    renderList([
+      ...settledTurn(),
+      row("plan-late", "plan", "晚到的执行计划", {
+        _clientMessageId: "u1",
+        steps: [{ step: "核对折叠", status: "completed" }],
+      }),
+      row("ask-after", "permission", "现在发布吗？", {
+        _clientMessageId: "u1",
+        toolName: "AskUserQuestion",
+        requestId: "req-after-plan",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "现在发布吗？", options: [{ label: "可以" }] }] },
+      }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    const disclosure = screen.getByTestId("process-disclosure");
+    const answer = screen.getByText("看板已经做好").closest("[data-testid=assistant-row]");
+    if (!answer) throw new Error("missing answer row");
+    expect(disclosure.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(answer.compareDocumentPosition(screen.getByTestId("permission-card")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByText("核对折叠")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByText("核对折叠").closest("[data-testid=process-disclosure]")).toBe(disclosure);
+  });
+
+  test("只有回答时，后到的计划单独成节并排在回答前面", () => {
+    renderList([
+      row("u", "user", "问一句", { status: "replied" }),
+      row("a", "assistant", "答完了", { _clientMessageId: "u" }),
+      row("p", "plan", "晚到的执行计划", {
+        _clientMessageId: "u",
+        steps: [{ step: "只剩计划", status: "pending" }],
+      }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    const disclosure = screen.getByTestId("process-disclosure");
+    const answer = screen.getByText("答完了").closest("[data-testid=assistant-row]");
+    if (!answer) throw new Error("missing answer row");
+    expect(disclosure.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByText("只剩计划").closest("[data-testid=process-disclosure]")).toBe(disclosure);
+  });
+
+  test("正文后面的普通工具仍另起一节，不跟计划一起被提前", () => {
+    renderList([
+      ...settledTurn(),
+      row("late-tool", "tool", "后补命令", {
+        _clientMessageId: "u1",
+        toolName: "Bash",
+        inputJson: { command: "late-probe-cmd" },
+        _completed: true,
+        output: "ok",
+      }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(2);
+    const answer = screen.getByText("看板已经做好").closest("[data-testid=assistant-row]");
+    if (!answer) throw new Error("missing answer row");
+    const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells[0].compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(answer.compareDocumentPosition(shells[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
 });

@@ -896,18 +896,24 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     }
   }
   let owner = "head";
-  let group: Extract<RenderItem, { kind: "process" }> | undefined;
+  type ProcessGroup = Extract<RenderItem, { kind: "process" }>;
+  let group: ProcessGroup | undefined;
   let boundary = "";
-  const seal = (current: Extract<RenderItem, { kind: "process" }> | undefined) => {
+  // A static plan that arrives after the final answer is still this turn's
+  // work. Keep it in the shell above the answer. Do not open a second shell
+  // underneath, and do not move a question, approval, failure, or artifact.
+  let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
+  const seal = (current: ProcessGroup | undefined, keyBoundary: string) => {
     if (!current) return;
     const work = current.members.find((message) =>
       !isClearedGoalRecord(message) && (isFoldableWorkRole(message) || isHistoricalGoalRecord(message)));
-    current.key = `process:${boundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
+    current.key = `process:${keyBoundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
     if (!work) {
       const index = out.indexOf(current);
       if (index >= 0) out.splice(index, 1, ...current.items);
     }
   };
+  const planOnly = (rows: ChatMessage[]) => rows.length > 0 && rows.every((message) => message.role === "plan");
   for (const item of items) {
     const rows = itemMessages(item);
     // A cleared goal is not a row, a count, or a shell. Skipping it must not
@@ -919,13 +925,33 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
     const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id), ownedArtifacts));
     if (!fold) {
-      seal(group);
+      seal(group, boundary);
+      const crossedAnswer = rows.some((message) => answerIds.has(message.id));
+      if (crossedAnswer) {
+        const kept = group ?? (carry?.boundary === nextBoundary ? carry.group : undefined);
+        carry = { boundary: nextBoundary, group: kept, answerIndex: out.length };
+      } else {
+        carry = undefined;
+      }
       group = undefined;
       out.push(item);
       continue;
     }
+    if (carry && carry.boundary === nextBoundary && !group && planOnly(rows)) {
+      if (!carry.group || out.indexOf(carry.group) < 0) {
+        const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
+        carry.group = created;
+        out.splice(carry.answerIndex, 0, created);
+        carry.answerIndex += 1;
+      }
+      carry.group.items.push(item);
+      carry.group.members.push(...rows);
+      if (rows.some((message) => activeIds.has(message.id))) carry.group.active = true;
+      continue;
+    }
+    if (carry && !planOnly(rows)) carry = undefined;
     if (!group || boundary !== nextBoundary) {
-      seal(group);
+      seal(group, boundary);
       group = { kind: "process", key: "", members: [], items: [], active: false };
       boundary = nextBoundary;
       out.push(group);
@@ -934,7 +960,8 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     group.members.push(...rows);
     if (rows.some((message) => activeIds.has(message.id))) group.active = true;
   }
-  seal(group);
+  seal(group, boundary);
+  if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
   return out;
 }
 
