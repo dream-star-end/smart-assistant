@@ -726,9 +726,9 @@ export type ChatSession = {
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;
   /**
-   * Master 拥有自动恢复时被**延后**的终态错误所属 cmid(浏览器内存态,不持久化)。存在期间本轮
-   * 保持 `_sendingInFlight` + retrying 软状态,兼容 [error] final 不得收尾;由 socket 在
-   * `sys.recovery_decision` / `outbound.ack{recovery}` 领养 / 宽限超时时清除。
+   * Master 拥有自动恢复时被延后的终态错误所属 cmid。存在期间本轮保持
+   * `_sendingInFlight` + retrying 软状态,历史失败 tape 不得把它收成错误卡。
+   * 随会话快照持久化,刷新后继续等真正的 declined / skipped / adopted / stop。
    */
   _deferredTerminalErrorClientMessageId?: string;
 

@@ -2654,6 +2654,51 @@ function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: stri
   };
 }
 
+
+function committedErrorCard(sess: ChatSession, clientMessageId: string | undefined): boolean {
+  if (!clientMessageId) return false;
+  return sess.messages.some((message) =>
+    message.role === "assistant" &&
+    message._clientMessageId === clientMessageId &&
+    message._errorCardSnapshot?.disposition === "card");
+}
+
+/** 点停围栏。和「master 不接管所以应该立刻画卡」不是同一件事。 */
+function automaticRecoveryCancelFenced(sess: ChatSession, clientMessageId: string | undefined): boolean {
+  if (!clientMessageId) return false;
+  const fence = sess._cancelledAutomaticRecoveryIds;
+  if (!fence) return false;
+  if (fence[clientMessageId] === true) return true;
+  const root = problemCardRootCmid(sess, clientMessageId);
+  return !!root && root !== clientMessageId && fence[root] === true;
+}
+
+/** 停止之后才到的第一条错误:收口发送态,不提交错误卡。已提交的卡不走这里。 */
+function settleCancelFencedTerminalError(
+  sess: ChatSession,
+  paint: DeferredTerminalErrorPaint,
+  effects: FrameEffects,
+): void {
+  const cmid = paint.clientMessageId;
+  effects.discardDeferredTerminalError?.(sess.id, cmid);
+  if (cmid && sess._deferredTerminalErrorClientMessageId === cmid) {
+    sess._deferredTerminalErrorClientMessageId = undefined;
+  }
+  if (cmid && sess._activeClientMessageId === cmid) {
+    sess._sendingInFlight = false;
+    sess._activeClientMessageId = undefined;
+    clearTurnTiming(sess);
+    resetReplyTracker(sess);
+    sess._localTeardownAt = sess._trackerResetAt;
+    resolveGenPlaceholders(sess);
+  }
+  const exactUser = cmid
+    ? sess.messages.find((message) => message?.role === "user" && message.id === cmid)
+    : undefined;
+  if (exactUser && exactUser.status !== "replied") exactUser.status = "sent";
+  effects.persistSession?.(sess.id);
+}
+
 export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
   if (shouldSuppressStaleOutboundError(sess, frame)) return;
   if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
@@ -2676,6 +2721,14 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
   };
   if (isSilentTurnErrorCode(normalized)) {
     effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
+  }
+  if (
+    !userCancelled &&
+    automaticRecoveryCancelFenced(sess, paint.clientMessageId ?? sess._activeClientMessageId) &&
+    !committedErrorCard(sess, paint.clientMessageId)
+  ) {
+    settleCancelFencedTerminalError(sess, paint, effects);
+    return;
   }
   // Master 拥有恢复且错误可自动恢复:红卡延后,本轮保持软状态直到 master 裁决。遥测仍照常上报。
   if (
@@ -2755,6 +2808,14 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   };
   if (isSilentTurnErrorCode(normalized)) {
     effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
+  }
+  if (
+    !userCancelled &&
+    automaticRecoveryCancelFenced(sess, paint.clientMessageId ?? sess._activeClientMessageId) &&
+    !committedErrorCard(sess, paint.clientMessageId)
+  ) {
+    settleCancelFencedTerminalError(sess, paint, effects);
+    return;
   }
   // legacy error 无后续 final,前端自己收尾本轮 UI;master 拥有恢复时同样延后红卡。
   if (

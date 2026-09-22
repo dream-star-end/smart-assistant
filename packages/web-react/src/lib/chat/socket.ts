@@ -162,6 +162,26 @@ import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../
 
 export type { ChatStatusClass };
 
+
+function deferredTerminalErrorPaintForStore(
+  paint: DeferredTerminalErrorPaint | undefined,
+): StoredSession["_deferredTerminalErrorPaint"] | undefined {
+  if (!paint) return undefined;
+  const normalized = typeof paint.normalized === "string" ? paint.normalized.slice(0, 64) : "";
+  const text = typeof paint.text === "string" ? paint.text.slice(0, 4000) : "";
+  if (!normalized || !text) return undefined;
+  return {
+    normalized,
+    text,
+    ...(typeof paint.detail === "string" && paint.detail ? { detail: paint.detail.slice(0, 2000) } : {}),
+    ...(typeof paint.displayMessage === "string" && paint.displayMessage
+      ? { displayMessage: paint.displayMessage.slice(0, 4000) }
+      : {}),
+    ...(isClientMessageId(paint.clientMessageId) ? { clientMessageId: paint.clientMessageId } : {}),
+    ...(typeof paint.traceId === "string" && paint.traceId ? { traceId: paint.traceId.slice(0, 128) } : {}),
+  };
+}
+
 function messageHasVisibleBody(message: ChatMessage): boolean {
   if (typeof message.text === "string" && message.text.trim().length > 0) return true;
   const blocks = (message as ChatMessage & { blocks?: unknown[] }).blocks;
@@ -3704,6 +3724,14 @@ export class ChatSocket {
         return clean;
       });
     }
+    const pendingDeferred = this.pendingRecoveryErrors.get(s.id);
+    const pendingDeferredId = pendingDeferred?.clientMessageId;
+    const deferredTerminalErrorId = isClientMessageId(s._deferredTerminalErrorClientMessageId)
+      ? s._deferredTerminalErrorClientMessageId
+      : isClientMessageId(pendingDeferredId)
+        ? pendingDeferredId
+        : undefined;
+    const deferredTerminalErrorPaint = deferredTerminalErrorPaintForStore(pendingDeferred?.paint);
     return {
       id: s.id,
       agentId: s.agentId,
@@ -3730,6 +3758,10 @@ export class ChatSocket {
         : {}),
       ...(s._automaticRecoveryDecisions
         ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
+        : {}),
+      ...(deferredTerminalErrorId ? { _deferredTerminalErrorClientMessageId: deferredTerminalErrorId } : {}),
+      ...(deferredTerminalErrorId && deferredTerminalErrorPaint
+        ? { _deferredTerminalErrorPaint: deferredTerminalErrorPaint }
         : {}),
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
@@ -3860,6 +3892,7 @@ export class ChatSocket {
     const repairedStoredOrder = repairedStoredMessages !== s.messages;
     if (repairedStoredOrder) s.messages = repairedStoredMessages;
     this.sessions.set(stored.id, s);
+    this.restoreDeferredTerminalError(s, stored);
     const storedControls = Array.isArray(stored._pendingControls)
       ? stored._pendingControls.filter((item) =>
           item?.kind === "control" &&
@@ -3899,6 +3932,55 @@ export class ChatSocket {
     }
     if (storedPending.length > 0 && !s._dispatchPaused) this.kickDispatchPump();
     this.scheduleNotify();
+  }
+
+
+  /** 刷新后继续等裁决。历史失败 tape 不能自行把源轮提交成错误卡。 */
+  private restoreDeferredTerminalError(s: ChatSession, stored: StoredSession): void {
+    const cmid = stored._deferredTerminalErrorClientMessageId;
+    const paint = stored._deferredTerminalErrorPaint;
+    if (!isClientMessageId(cmid) || !paint) return;
+    if (typeof paint.normalized !== "string" || typeof paint.text !== "string") return;
+    if (paint.normalized.length === 0 || paint.normalized.length > 64) return;
+    if (paint.text.length === 0 || paint.text.length > 4000) return;
+    if (s._cancelledAutomaticRecoveryIds?.[cmid] === true) return;
+    if (s._automaticRecoveryDecisions?.[cmid] === true) return;
+    s._deferredTerminalErrorClientMessageId = cmid;
+    if (!s._sendingInFlight) {
+      s._sendingInFlight = true;
+      s._activeClientMessageId = cmid;
+    }
+    const source = s.messages.find((message) => message.role === "user" && message.id === cmid);
+    const sourceAttempt = typeof source?._automaticRecoveryAttempt === "number" &&
+        Number.isSafeInteger(source._automaticRecoveryAttempt) &&
+        source._automaticRecoveryAttempt >= 1
+      ? source._automaticRecoveryAttempt
+      : 0;
+    s._turnStatus = {
+      kind: "retrying",
+      attempt: Math.min(sourceAttempt + 1, AUTOMATIC_TURN_RETRY_MAX),
+      max: AUTOMATIC_TURN_RETRY_MAX,
+      retryAt: Date.now(),
+    };
+    const restored: DeferredTerminalErrorPaint = {
+      normalized: paint.normalized,
+      text: paint.text,
+      ...(typeof paint.detail === "string" ? { detail: paint.detail } : {}),
+      ...(typeof paint.displayMessage === "string" ? { displayMessage: paint.displayMessage } : {}),
+      clientMessageId: isClientMessageId(paint.clientMessageId) ? paint.clientMessageId : cmid,
+      ...(typeof paint.traceId === "string" ? { traceId: paint.traceId } : {}),
+    };
+    const timer = setTimeout(
+      () => this.materializePendingRecoveryError(s.id, "decision_timeout"),
+      RECOVERY_DECISION_GRACE_MS,
+    );
+    if (typeof timer === "object" && timer && "unref" in timer) timer.unref();
+    this.pendingRecoveryErrors.set(s.id, {
+      paint: restored,
+      clientMessageId: cmid,
+      timer,
+      decided: false,
+    });
   }
 
   /**
@@ -4125,6 +4207,7 @@ export class ChatSocket {
     if (
       !this.masterOwnsAutomaticRecovery &&
       tailRecoverableError &&
+      s._deferredTerminalErrorClientMessageId !== tailRecoverableError._clientMessageId &&
       s._automaticRecoveryDecisions?.[recoveryDecisionKey] !== true
     ) {
       setTimeout(

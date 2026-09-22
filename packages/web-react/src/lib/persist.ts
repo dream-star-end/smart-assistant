@@ -172,6 +172,16 @@ export type StoredSession = {
    *  `outbound.permission_request` for them must not open a new card. */
   _settledPermissionRequestIds?: Record<string, true>;
   _automaticRecoveryDecisions?: Record<string, true>;
+  /** 刷新后仍未裁决的源轮。历史失败 tape 不能把它当成终态否决。 */
+  _deferredTerminalErrorClientMessageId?: string;
+  _deferredTerminalErrorPaint?: {
+    normalized: string;
+    text: string;
+    detail?: string;
+    displayMessage?: string;
+    clientMessageId?: string;
+    traceId?: string;
+  };
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
