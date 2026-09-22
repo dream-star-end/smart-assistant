@@ -6,7 +6,7 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
  */
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -75,6 +75,50 @@ function grokRuntimeHome(baseHome: string, model: string | undefined): string {
     chmodSync(target, 0o600)
   }
   return home
+}
+
+function seedFastCatalog(baseHome: string, fastHome: string, listUrl: string | undefined): void {
+  const src = join(baseHome, 'models_cache.json')
+  const dest = join(fastHome, 'models_cache.json')
+  if (!existsSync(src) || existsSync(dest)) return
+  let parsed: {
+    models?: Record<string, { info?: { base_url?: string }; api_key?: string | null }>
+    origin?: string
+    fetched_at?: string
+  }
+  try {
+    parsed = JSON.parse(readFileSync(src, 'utf8')) as typeof parsed
+  } catch {
+    return
+  }
+  if (!parsed.models?.[GROK_FAST_UPSTREAM_MODEL]) return
+  const base = listUrl?.replace(/\/models$/, '')
+  if (listUrl) parsed.origin = listUrl
+  parsed.fetched_at = new Date().toISOString()
+  for (const entry of Object.values(parsed.models)) {
+    if (!entry) continue
+    entry.api_key = null
+    if (base && entry.info) entry.info.base_url = base
+  }
+  writeFileSync(dest, JSON.stringify(parsed), { mode: 0o600 })
+  chmodSync(dest, 0o600)
+}
+
+function ensureFastCatalog(bin: string, env: NodeJS.ProcessEnv, fastHome: string): void {
+  const dest = join(fastHome, 'models_cache.json')
+  if (existsSync(dest)) {
+    try {
+      const parsed = JSON.parse(readFileSync(dest, 'utf8')) as { models?: Record<string, unknown> }
+      if (parsed.models?.[GROK_FAST_UPSTREAM_MODEL]) return
+    } catch {
+      // Fall through and ask the CLI to fetch.
+    }
+  }
+  try {
+    spawnSync(bin, ['models'], { env, timeout: 8_000, stdio: 'ignore' })
+  } catch {
+    // The turn reports the model error if the catalog is still empty.
+  }
 }
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
@@ -571,6 +615,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
     ctx.launchSpec = { cwd, env, bin, promptFile }
+    if (this.currentModel === 'grok-build-fast' && env.GROK_HOME) {
+      seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
+      ensureFastCatalog(bin, env, env.GROK_HOME)
+    }
     this.spawnGrokChild(ctx, { resume: Boolean(this.nativeId) })
   }
 

@@ -507,6 +507,15 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'bb
   process.env.OC_GROK_CLI_BIN = fake
   process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
   process.env.FAKE_GROK_CAPTURE = capture
+  const baseHome = path.join(process.env.OPENCLAUDE_HOME, 'grok-build')
+  await mkdir(baseHome, { recursive: true })
+  await writeFile(path.join(baseHome, 'models_cache.json'), JSON.stringify({
+    fetched_at: '2026-09-22T00:00:00Z',
+    origin: 'http://old.example/models',
+    models: {
+      'grok-4.7-build-fast': { info: { id: 'grok-4.7-build-fast', base_url: 'http://old.example' }, api_key: 'nope' },
+    },
+  }))
   try {
     const adapter = new GrokAdapter(createOpts(dir))
     adapter.setGrokRoute({
@@ -530,6 +539,12 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'bb
     assert.equal(captured.argv[captured.argv.indexOf('--model') + 1], 'grok-4.7-build-fast')
     assert.equal(captured.argv.includes('--resume'), false)
     assert.equal(captured.home, path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'fast'))
+    const seeded = JSON.parse(await readFile(path.join(captured.home, 'models_cache.json'), 'utf8')) as {
+      models: Record<string, { api_key: string | null }>
+    }
+    assert.ok(seeded.models['grok-4.7-build-fast'])
+    assert.equal(seeded.models['grok-4.7-build-fast']?.api_key, null)
+    assert.equal((seeded as { origin?: string }).origin, `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1/models`)
   } finally {
     restoreEnv('OC_GROK_CLI_BIN', previousBin)
     restoreEnv('OPENCLAUDE_HOME', previousHome)

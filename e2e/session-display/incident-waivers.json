@@ -262,6 +262,12 @@
       "expiresAt": "2026-10-22"
     },
     {
+      "commit": "c531f8ea9a859e1993889c9f60f181562e8a3a29",
+      "reason": "First Grok 4.7 Fast turn on a fresh home applies --model before the CLI catalog fetch has credentials, so the id is unknown. Seeds the already fetched model list. No data loss or billing change.",
+      "approvedBy": "user 2026-09-22 截图追问 Fast 仍然任务执行失败",
+      "expiresAt": "2026-10-22"
+    },
+    {
       "commit": "1a22942e5f04ce2a7e34c89f00c2736442bdbe70",
       "reason": "Grok 4.7 Fast turns failed with CLI unknown model id because they joined the standard grok-build leader before its catalog refresh. Isolates GROK_HOME for grok-build-fast. No data loss or billing change.",
       "approvedBy": "user 2026-09-22 追问为什么用不了 Fast 模式 (OCV5-258)",
