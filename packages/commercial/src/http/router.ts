@@ -182,6 +182,13 @@ import {
   handleAdminUnsuppressCondition,
 } from './admin/selfheal.js'
 import {
+  handleAdminDecideContentAppeal,
+  handleAdminListContentAppeals,
+  handleAdminListContentReviews,
+  handleAdminNotifyContentReview,
+  handleFileContentAppeal,
+} from './admin/contentReviews.js'
+import {
   handleAdminCreateModelCatalogEntry,
   handleAdminListModelCatalog,
   handleAdminModelCatalogAction,
@@ -1058,6 +1065,10 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     // T-60 超管审计记录(整改批:+target/时间过滤;新增安全事件/主机审计/trace 反查)
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
+    { method: 'GET', path: '/api/admin/content-reviews', handler: handleAdminListContentReviews },
+    { method: 'POST', pathPrefix: '/api/admin/content-reviews/', handler: handleAdminNotifyContentReview },
+    { method: 'GET', path: '/api/admin/content-appeals', handler: handleAdminListContentAppeals },
+    { method: 'POST', pathPrefix: '/api/admin/content-appeals/', handler: handleAdminDecideContentAppeal },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
     { method: 'GET', path: '/api/admin/product-friction', handler: handleAdminProductFriction },
     { method: 'GET', path: '/api/admin/ops-overview', handler: handleAdminOpsOverview },
@@ -1484,6 +1495,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/me/messages/unread_count', handler: handleCountMyInboxUnread },
     { method: 'POST', path: '/api/me/messages/read_all', handler: handleReadAllInbox },
     { method: 'POST', pathPrefix: '/api/me/messages/', handler: handleMarkInboxRead },
+    { method: 'POST', path: '/api/me/content-appeals', handler: handleFileContentAppeal },
     // 站内信 admin 侧
     //   GET    /api/admin/messages              → 列表(只读 requireAdmin)
     //   POST   /api/admin/messages              → 创建(requireAdminVerifyDb)

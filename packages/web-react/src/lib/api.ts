@@ -3802,6 +3802,23 @@ export const api = {
       ),
     ),
 
+  /** 对一条违规记录申诉（POST /api/me/content-appeals）。 */
+  appealContentStrike: (
+    a: AuthSession,
+    strikeId: string,
+    statement: string,
+  ): Promise<{ ok: boolean; appealId: string }> =>
+    jsonOrThrow(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/content-appeals", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ strikeId, statement }),
+        }),
+      ),
+    ),
+
   /** 全部标记已读（POST /api/me/messages/read_all，Bearer）。返插入行数。 */
   markAllInboxRead: (a: AuthSession): Promise<{ ok: boolean; inserted: number }> =>
     jsonOrThrow<{ ok: boolean; inserted: number }>(

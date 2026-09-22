@@ -490,6 +490,69 @@ setInterval(() => {}, 1000)
 })
 
 
+test('grok-build-fast uses its own GROK_HOME and does not resume a standard session', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-fast-home-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, home: process.env.GROK_HOME }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  const baseHome = path.join(process.env.OPENCLAUDE_HOME, 'grok-build')
+  await mkdir(baseHome, { recursive: true })
+  await writeFile(path.join(baseHome, 'models_cache.json'), JSON.stringify({
+    fetched_at: '2026-09-22T00:00:00Z',
+    origin: 'http://old.example/models',
+    models: {
+      'grok-4.7-build-fast': { info: { id: 'grok-4.7-build-fast', base_url: 'http://old.example' }, api_key: 'nope' },
+    },
+  }))
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    adapter.setResumeSessionId('prior-session')
+    adapter.setModel('grok-build-fast')
+    const run = adapter.submitTurn({
+      input: 'fast',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    await run.summary
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; home: string }
+    assert.equal(captured.argv[captured.argv.indexOf('--model') + 1], 'grok-4.7-build-fast')
+    assert.equal(captured.argv.includes('--resume'), false)
+    assert.equal(captured.home, path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'fast'))
+    const seeded = JSON.parse(await readFile(path.join(captured.home, 'models_cache.json'), 'utf8')) as {
+      models: Record<string, { api_key: string | null }>
+    }
+    assert.ok(seeded.models['grok-4.7-build-fast'])
+    assert.equal(seeded.models['grok-4.7-build-fast']?.api_key, null)
+    assert.equal((seeded as { origin?: string }).origin, `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1/models`)
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('projects openclaude-memory into GROK_HOME when a gateway token is present', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-mcp-'))
   const fake = path.join(dir, 'fake-grok.cjs')

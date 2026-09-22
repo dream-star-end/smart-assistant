@@ -164,7 +164,8 @@
     "0280_cursor_haiku_45",
     "0281_cursor_sand_usable_families",
     "0283_cursor_grok_47_and_grok_build",
-    "0284_grok_build_fast_retire_grok_46"
+    "0284_grok_build_fast_retire_grok_46",
+    "0285_content_review_strikes"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
