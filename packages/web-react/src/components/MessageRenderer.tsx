@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ProcessDisclosure, artifactEvidenceKeys, isFoldableWorkRole, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
 import {
   memo,
@@ -768,18 +768,19 @@ function itemMessages(item: LeafRenderItem): ChatMessage[] {
 }
 
 /**
- * Visible answer ids for disclosure. The last assistant body of a turn stays
- * outside the process group as soon as it has text, including while that turn
- * is still streaming, so Markdown and deliverables are not clamped to two
- * lines. Earlier stage rows fold once a later assistant or tool arrives.
- * The process group key stays the first work row, so growing this answer does
- * not remount an open disclosure. An empty deferred assistant that is the
- * last assistant of its turn is the answer locator and stays outside too.
+ * Visible answer ids for disclosure. While a turn is still sending, no
+ * assistant is promoted to the final answer — a later tool must not split the
+ * one process shell, and the live body stays inside that shell as Markdown.
+ * After the turn stops, the last assistant of the turn is the only top-level
+ * answer. A deferred empty locator for a finished turn stays outside too.
+ * Deliverable rows are excluded separately by isProcessMessage.
  */
-function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[]): Set<string> {
+function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
   const ids = new Set<string>();
+  const activeStart = currentTurnStartIndex(messages);
+  const live = (index: number) => sending && index >= activeStart;
   for (let i = 0; i < messages.length; i++) {
-    if (!finals[i]) continue;
+    if (!finals[i] || live(i)) continue;
     const id = messages[i]?.id;
     if (id) ids.add(id);
   }
@@ -796,6 +797,7 @@ function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[]): Set<st
     lastAssistant.set(message._clientMessageId || segment, i);
   }
   for (const index of lastAssistant.values()) {
+    if (live(index)) continue;
     const message = messages[index];
     if (!message?._payloadDeferred || !message.id) continue;
     ids.add(message.id);
@@ -814,7 +816,7 @@ function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner:
 /** Contiguous, owner/page-bounded display groups; never move an actionable row. */
 function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
   const out: RenderItem[] = [];
-  const answerIds = disclosureAnswerIds(messages, finals);
+  const answerIds = disclosureAnswerIds(messages, finals, sending);
   const activeStart = currentTurnStartIndex(messages);
   const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
   const assistantArtifactKeys = new Map<string, Set<string>>();
@@ -840,7 +842,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   let boundary = "";
   const seal = (current: Extract<RenderItem, { kind: "process" }> | undefined) => {
     if (!current) return;
-    const work = current.members.find(isFoldableWorkRole);
+    const work = current.members.find((message) => isFoldableWorkRole(message) || isHistoricalGoalRecord(message));
     current.key = `process:${boundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
     if (!work) {
       const index = out.indexOf(current);
@@ -2210,16 +2212,21 @@ export function MessageList({
         );
       const eager = eagerPayloadKeysRef.current?.has(it.key) === true
         || it.members.some((message) => message._payloadDeferred && eagerPayloadKeysRef.current?.has(timelineMessageKey(message)));
+      const explicit = disclosureValues[it.key];
+      // Absent means the default: open while this turn is still running,
+      // closed once it has finished. A click stores true or false and is not
+      // reset when tokens arrive or the turn completes.
+      const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
       return (
         <ProcessDisclosure
           sections={sections}
           active={it.active}
-          open={sections.some(sectionHit) || disclosureValues[it.key] === true}
-          setOpen={(open) => setDisclosure(it.key, open)}
+          open={open}
+          setOpen={(next) => setDisclosure(it.key, next)}
           detailOpen={(key) => {
             if (disclosureValues[`detail:${key}`] === true) return true;
             const section = sections.find((candidate) => candidate.key === key);
-            return !!section && !section.narrative && sectionHit(section);
+            return !!section && sectionHit(section);
           }}
           setDetailOpen={(key, open) => setDisclosure(`detail:${key}`, open)}
           renderItem={renderItem}

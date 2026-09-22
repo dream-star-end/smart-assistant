@@ -156,17 +156,24 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await stream.page.evaluate(() => window.__processPage.setScene("stream"));
       await stream.page.getByTestId("process-chat-scroll").waitFor();
       await stream.page.getByText("STREAM_TAIL_MARKER").waitFor();
+      assert.equal(await stream.page.getByTestId("process-disclosure").count(), 1, "streaming turn split into more than one shell");
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "active turn hides the current stage");
       const clipped = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => {
-        if (node.closest("[data-testid=process-live-summary]")) return true;
+        const inProcess = !!node.closest("[data-testid=process-disclosure]");
+        const inAnswer = !!node.closest("[data-testid=assistant-row]");
+        let lineClamp = false;
         let el = node.parentElement;
         while (el) {
           const clamp = getComputedStyle(el).webkitLineClamp;
-          if (clamp && clamp !== "none") return true;
+          if (clamp && clamp !== "none") lineClamp = true;
           el = el.parentElement;
         }
-        return false;
+        return { lineClamp, inProcess, inAnswer };
       });
-      assert.equal(clipped, false, "streaming answer must not be line-clamped");
+      assert.equal(clipped.lineClamp, false, "streaming answer must not be line-clamped");
+      assert.equal(clipped.inProcess, true, "streaming answer left the work area");
+      assert.equal(clipped.inAnswer, false, "streaming answer was promoted to the final card");
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-body.png") });
       await stream.page.evaluate(() => {
         const el = document.querySelector("[data-testid=process-chat-scroll]");
         if (!(el instanceof HTMLElement)) throw new Error("missing scroller");
@@ -199,13 +206,21 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
         return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       });
       await stream.page.getByTestId("process-toggle").click();
+      await stream.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
+      await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
+      await stream.page.waitForTimeout(200);
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "false", "tokens reopened a closed process");
+      await stream.page.getByTestId("process-toggle").click();
       await stream.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "true");
       await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
       await stream.page.getByText("尾部仍在增长").waitFor();
       await stream.page.evaluate(() => window.__processPage.setSending(false));
       await stream.page.getByText("尾部仍在增长").waitFor();
-      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true");
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "manual open collapsed when the turn finished");
+      const finished = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => !!node.closest("[data-testid=assistant-row]") && !node.closest("[data-testid=process-disclosure]"));
+      assert.equal(finished, true, "finished answer did not become the only top-level reply");
       await stream.page.screenshot({ path: join(shots, "ocv5-265-manus-stream-answer.png") });
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-finished.png") });
       assert.equal(stream.errors.length, 0, stream.errors.join("\n"));
     } finally {
       await stream.context.close();

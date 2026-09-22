@@ -114,22 +114,25 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("先核对库存口径")).toBeInTheDocument();
   });
 
-  test("执行中末条回答全文可见，手动展开在结束后仍保持", () => {
+  test("执行中长正文留在同一个过程里，手动展开跨 token 和结束后保持", () => {
     const base = settledTurn().filter((message) => message.id !== "pdf-1");
     const long = `${"进度明细。".repeat(30)}看板已经做好`;
     const messages = base.map((message) => (message.id === "answer-1" ? { ...message, text: long } : message));
     const view = renderList(messages, { sending: true });
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
     expect(screen.getByTestId("turn-activity-footer")).toBeInTheDocument();
     expect(within(screen.getByTestId("process-disclosure")).queryByRole("button", { name: "停止" })).toBeNull();
-    const answer = screen.getByTestId("assistant-row");
-    expect(answer).toHaveTextContent("看板已经做好");
-    expect(answer.closest("[data-testid=process-live-summary]")).toBeNull();
-    expect(screen.getByTestId("process-live-summary")).toHaveTextContent("先核对库存口径");
-    expect(screen.getByTestId("process-live-summary")).not.toHaveTextContent("看板已经做好");
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+    const stage = screen.getByTestId("process-stage");
+    expect(stage).toHaveTextContent("看板已经做好");
+    expect(stage.closest("[data-testid=assistant-row]")).toBeNull();
+    expect(stage.className).not.toMatch(/line-clamp/);
+    expect(screen.queryByTestId("assistant-row")).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("process-disclosure")).queryByTestId("assistant-meta")).toBeNull();
+    expect(screen.queryByText("先核对库存口径")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-toggle"));
-    expect(screen.getByText("先核对库存口径")).toBeInTheDocument();
-
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
     const grown = messages.map((message) =>
       message.id === "answer-1" ? { ...message, text: `${long}\n尾部仍在增长` } : message,
     );
@@ -143,13 +146,32 @@ describe("MessageList Manus 过程披露", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByTestId("assistant-row")).toHaveTextContent("尾部仍在增长");
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("尾部仍在增长")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("尾部仍在增长");
+    const grownAgain = grown.map((message) =>
+      message.id === "answer-1" ? { ...message, text: `${long}\n尾部仍在增长\n又一段` } : message,
+    );
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={grownAgain}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("又一段");
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
 
     view.rerender(
       <MessageList
         processDisclosure
-        messages={grown}
+        messages={grownAgain}
         sending={false}
         sessionId="session-a"
         cb={{}}
@@ -158,7 +180,9 @@ describe("MessageList Manus 过程披露", () => {
     );
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("先核对库存口径")).toBeInTheDocument();
-    expect(screen.getByTestId("assistant-row")).toHaveTextContent("尾部仍在增长");
+    const answer = screen.getByTestId("assistant-row");
+    expect(answer).toHaveTextContent("又一段");
+    expect(answer.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
   test("提问、失败、审批和后台子任务不被折进过程", async () => {
@@ -796,6 +820,156 @@ describe("MessageList Manus 过程披露", () => {
     expect(metas[1]).toHaveTextContent("3 积分");
     expect(metas[1]).toHaveTextContent("token");
     expect(screen.queryByTestId("process-disclosure")).not.toBeInTheDocument();
+  });
+
+  test("同一轮分段过程始终一个壳，已清除目标不另起顶层卡", async () => {
+    const user = row("u", "user", "这班发布", { status: "sent" });
+    const thinking = row("th", "thinking", `THINK_HEAD ${"痕迹".repeat(80)} THINK_HIDDEN_TAIL`, { _clientMessageId: "u" });
+    const stage = row("st", "assistant", "我先对一下这班发布落在哪", { _clientMessageId: "u" });
+    const cleared = row("g", "goal", "", {
+      _clientMessageId: "u",
+      cleared: true,
+      goalStatus: "cleared",
+      _turnTapeId: "tape-goal",
+    });
+    const running = row("cmd", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "LIVE_CMD_MARKER", payload: { raw: true, noise: "RAW_JSON_SECRET" } },
+      _completed: false,
+    });
+    const done = { ...running, _completed: true, output: "CMD_DONE_SECRET" };
+    const stageTwo = row("st2", "assistant", "STAGE_TWO 继续核对切流", { _clientMessageId: "u" });
+    const read = row("rd", "tool", "读取", {
+      _clientMessageId: "u",
+      toolName: "Read",
+      inputJson: { file_path: "VERSION" },
+      _completed: true,
+      output: "READ_SECRET",
+    });
+    const long = `FINAL_LONG ${"段落。".repeat(40)}`;
+    const answer = row("ans", "assistant", long, { _clientMessageId: "u" });
+    const phases = [
+      [thinking],
+      [thinking, stage],
+      [thinking, stage, cleared],
+      [thinking, stage, cleared, running],
+      [thinking, stage, cleared, done],
+      [thinking, stage, cleared, done, stageTwo],
+      [thinking, stage, cleared, done, stageTwo, read],
+      [thinking, stage, cleared, done, stageTwo, read, answer],
+    ];
+    const view = renderList([user, ...phases[0]!], { sending: true });
+    const expectOne = () => {
+      expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+      expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
+    };
+    expectOne();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考");
+    expect(screen.queryByText(/THINK_HIDDEN_TAIL/)).not.toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[1]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    const liveStage = screen.getByTestId("process-stage");
+    expect(liveStage).toHaveTextContent("我先对一下这班发布落在哪");
+    expect(liveStage.closest("[data-testid=assistant-row]")).toBeNull();
+    expect(screen.queryByTestId("assistant-meta")).not.toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[2]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    const goal = screen.getByText("会话目标");
+    expect(goal.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    expect(screen.getByText("已清除").closest("[data-testid=process-goal]")).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看原始目标记录" }));
+    expect(screen.getByText(/tape-goal/)).toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[3]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("LIVE_CMD_MARKER");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("进行中");
+    expect(screen.queryByText("RAW_JSON_SECRET")).not.toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[4]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("已完成");
+    expect(screen.queryByText("CMD_DONE_SECRET")).not.toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[5]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("STAGE_TWO");
+    expect(screen.queryByText("我先对一下这班发布落在哪")).not.toBeInTheDocument();
+    expect(screen.queryByText("LIVE_CMD_MARKER")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-stage-toggle"));
+    expect(screen.getByText("我先对一下这班发布落在哪")).toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("VERSION");
+    expect(screen.queryByText("READ_SECRET")).not.toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[7]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expectOne();
+    const body = screen.getAllByTestId("process-stage").find((node) => node.textContent?.includes("FINAL_LONG"));
+    expect(body).toBeTruthy();
+    expect(body?.className ?? "").not.toMatch(/line-clamp/);
+    expect(body?.closest("[data-testid=assistant-row]")).toBeNull();
+    expect(screen.getByText("我先对一下这班发布落在哪")).toBeInTheDocument();
+
+    view.rerender(<MessageList processDisclosure messages={[user, ...phases[7]!]} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+    const finals = screen.getAllByText(/FINAL_LONG/);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText("会话目标")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByRole("button", { name: "查看原始目标记录" }).closest("[data-testid=process-disclosure]")).not.toBeNull();
+  });
+
+  test("进行中的目标和待确认不收进过程，普通句子里的目标二字也不当目标卡", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("stage", "assistant", "会话目标已清除这句话只是阶段说明", { _clientMessageId: "u" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "echo goal-not-a-card" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("live-goal", "goal", "发布前确认目标", {
+        _clientMessageId: "u",
+        goalStatus: "active",
+        cleared: false,
+        _turnTapeId: "tape-live-goal",
+      }),
+      row("blocked-goal", "goal", "被堵住的目标", {
+        _clientMessageId: "u",
+        goalStatus: "blocked",
+        cleared: false,
+        _turnTapeId: "tape-blocked",
+      }),
+      row("ask", "permission", "目标要不要改", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-goal-ask",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "目标要不要改", options: [{ label: "保持" }] }] },
+      }),
+      row("answer", "assistant", "目标先保持", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByText("发布前确认目标").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getByText("被堵住的目标").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "查看原始目标记录" })).toHaveLength(2);
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getByText("目标先保持").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText("goal-not-a-card")).not.toBeInTheDocument();
+    expect(screen.queryByText("会话目标已清除这句话只是阶段说明")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/goal-not-a-card/);
+    expect(screen.getByText("会话目标已清除这句话只是阶段说明").closest("[data-testid=process-stage]")).not.toBeNull();
   });
 
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {

@@ -241,12 +241,19 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await align(desktop.page, file);
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-artifact.png") });
 
+      assert.equal(await desktop.page.getByText("已清除的库存目标").count(), 0, "cleared goal is its own top card while the process is closed");
       await desktop.page.getByTestId("process-toggle").first().click();
       await desktop.page.getByText("先按北仓和南仓核对可售口径").waitFor();
+      const clearedGoal = desktop.page.getByText("已清除的库存目标");
+      await clearedGoal.waitFor();
+      assert.equal(await clearedGoal.evaluate((el) => !!el.closest("[data-testid=process-goal]")), true);
+      await desktop.page.getByRole("button", { name: "查看原始目标记录" }).click();
+      await desktop.page.getByText("tape-cleared-goal").waitFor();
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-cleared-goal.png") });
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0);
       await align(desktop.page, desktop.page.getByTestId("process-stage").first());
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-desktop-expanded.png") });
-      await desktop.page.getByTestId("process-detail-toggle").click();
+      await desktop.page.getByTestId("process-detail-toggle").first().click();
       await desktop.page.getByText("summarize-stock.mjs").waitFor();
       await desktop.page.getByTestId("process-toggle").first().focus();
       await desktop.page.keyboard.press("Enter");
@@ -307,7 +314,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       });
       evidence.clamp = clamp;
       assert.equal(clamp.lineClamp, "none", "streaming answer is line-clamped");
-      assert.equal(clamp.inProcess, false, "streaming answer was folded into the process shell");
+      assert.equal(clamp.inProcess, true, "streaming answer left the single work area");
       const scroller = desktop.page.locator(".chat-scroll-area");
       await scroller.hover();
       for (let i = 0; i < 14; i += 1) {
@@ -333,9 +340,12 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(afterTokens.gap > 300, `new tokens pulled back to the bottom: ${JSON.stringify(afterTokens)}`);
       assert.ok(afterTokens.top < scrolled.top + 80, `viewport moved toward the bottom ${scrolled.top} -> ${afterTokens.top}`);
       const liveToggle = desktop.page.getByTestId("process-toggle").last();
-      if ((await liveToggle.getAttribute("aria-expanded")) !== "true") await liveToggle.click();
-      await desktop.page.getByText("先把南仓预警从可售里拆出来").waitFor();
-      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "manual expand collapsed while tokens arrived");
+      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "active process hid the current step");
+      await desktop.page.getByText("南仓预警已补进看板").waitFor();
+      const liveStage = desktop.page.getByText("冻结库存仍然不进看板");
+      await liveStage.waitFor();
+      assert.equal(await liveStage.evaluate((el) => !!el.closest("[data-testid=process-stage]") && !el.closest("[data-testid=assistant-row]")), true, "current stage is not readable in the work area");
+      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
       await desktop.page.getByTestId("scroll-to-bottom").click();
       await desktop.page.waitForFunction(() => {
         const el = document.querySelector(".chat-scroll-area");
@@ -343,14 +353,112 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       });
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-stream-answer.png") });
       await desktop.page.getByRole("button", { name: "发送" }).waitFor({ timeout: 20_000 });
-      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "manual expand collapsed when the turn finished");
+      assert.equal(await liveToggle.getAttribute("aria-expanded"), "false", "finished turn stayed expanded without an explicit open");
+      const finishedAnswer = await desktop.page.getByText("南仓预警已补进看板").evaluate((el) => ({
+        inProcess: !!el.closest("[data-testid=process-disclosure]"),
+        inAnswer: !!el.closest("[data-testid=assistant-row]"),
+      }));
+      assert.equal(finishedAnswer.inProcess, false, "finished answer stayed inside the process");
+      assert.equal(finishedAnswer.inAnswer, true, "finished answer has no top-level card");
       const shells = await desktop.page.getByTestId("process-disclosure").count();
       await sendText(desktop.page, "合计还在就行");
       await desktop.page.getByText("还在。可售合计 128，南仓预警已经分开标出。").waitFor({ timeout: 20_000 });
       assert.equal(await desktop.page.getByTestId("process-disclosure").count(), shells, "plain chat grew a process shell");
       await desktop.page.getByRole("button", { name: "发送" }).waitFor();
 
+      async function fixtureStep() {
+        const endpoint = new URL("/api/fixture/step", preview.url);
+        const response = await fetch(endpoint, { method: "POST" });
+        assert.equal(response.ok, true);
+      }
+      async function activeShells() {
+        return desktop.page.locator("[data-process-active=true]").count();
+      }
+      await sendText(desktop.page, "分段过程请按步走");
+      await desktop.page.getByText("正在思考").waitFor();
+      assert.equal(await activeShells(), 1, "thinking split the turn");
+      assert.equal(await desktop.page.getByText("THINK_HIDDEN_TAIL").count(), 0, "thinking trace opened by default");
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-thinking.png") });
+      await fixtureStep();
+
+      await desktop.page.getByText("我先对一下这班发布落在哪").waitFor();
+      const stagePlacement = await desktop.page.getByText("我先对一下这班发布落在哪").evaluate((el) => ({
+        inProcess: !!el.closest("[data-testid=process-stage]"),
+        inAnswer: !!el.closest("[data-testid=assistant-row]"),
+        meta: !!el.closest("[data-testid=process-disclosure]")?.querySelector("[data-testid=assistant-meta]"),
+      }));
+      assert.equal(stagePlacement.inProcess, true, "stage assistant is not in the work area");
+      assert.equal(stagePlacement.inAnswer, false, "stage assistant was promoted to the final card");
+      assert.equal(stagePlacement.meta, false, "stage assistant shows its own token row");
+      const phasedGoal = desktop.page.getByText("已清除的分段目标");
+      await phasedGoal.waitFor();
+      assert.equal(await phasedGoal.evaluate((el) => !!el.closest("[data-testid=process-disclosure]")), true);
+      assert.equal(await activeShells(), 1, "cleared goal split the turn");
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stage.png") });
+      await fixtureStep();
+
+      await desktop.page.getByTestId("process-step-live").waitFor();
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("进行中"));
+      assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0);
+      assert.equal(await activeShells(), 1, "running tool split the turn");
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-running.png") });
+      await fixtureStep();
+
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("已完成"));
+      assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0, "finished tool log opened itself");
+      assert.equal(await activeShells(), 1);
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-done.png") });
+      await fixtureStep();
+
+      await desktop.page.getByText("STAGE_TWO 继续核对切流窗口").waitFor();
+      assert.equal(await desktop.page.getByText("我先对一下这班发布落在哪").count(), 0, "previous stage stayed open");
+      assert.equal(await activeShells(), 1);
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-stage.png") });
+      await fixtureStep();
+
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("VERSION"));
+      assert.equal(await desktop.page.getByText("READ_SECRET").count(), 0, "read log opened itself");
+      assert.equal(await desktop.page.getByText("STAGE_TWO 继续核对切流窗口").count(), 0, "previous stage stayed open after the next tool");
+      assert.equal(await activeShells(), 1, "next tool split the turn");
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-tool.png") });
+      await fixtureStep();
+
+      await desktop.page.getByText("FINAL_LONG").waitFor();
+      const longPlacement = await desktop.page.getByText("FINAL_LONG").evaluate((el) => {
+        let lineClamp = "none";
+        let node = el;
+        while (node) {
+          const value = getComputedStyle(node).webkitLineClamp;
+          if (value && value !== "none") lineClamp = value;
+          node = node.parentElement;
+        }
+        return { lineClamp, inProcess: !!el.closest("[data-testid=process-disclosure]") };
+      });
+      assert.equal(longPlacement.lineClamp, "none");
+      assert.equal(longPlacement.inProcess, true);
+      assert.equal(await activeShells(), 1, "final tokens split the turn");
+      const phasedToggle = desktop.page.getByTestId("process-toggle").last();
+      await phasedToggle.click();
+      await desktop.page.waitForFunction(() => document.querySelector("[data-process-active=true] [data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
+      await phasedToggle.click();
+      await desktop.page.waitForFunction(() => document.querySelector("[data-process-active=true] [data-testid=process-toggle]")?.getAttribute("aria-expanded") === "true");
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-final-streaming.png") });
+      await fixtureStep();
+      await desktop.page.getByTestId("assistant-row").filter({ hasText: "FINAL_LONG" }).waitFor({ timeout: 20_000 });
+      assert.equal(await phasedToggle.getAttribute("aria-expanded"), "true", "manual open collapsed after isFinal");
+      const finalPlacement = await desktop.page.getByText("FINAL_LONG").evaluate((el) => ({
+        inProcess: !!el.closest("[data-testid=process-disclosure]"),
+        inAnswer: !!el.closest("[data-testid=assistant-row]"),
+      }));
+      assert.equal(finalPlacement.inAnswer, true);
+      assert.equal(finalPlacement.inProcess, false);
+      assert.equal(await activeShells(), 0);
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-final.png") });
+
       await desktop.page.getByText("待你确认").click();
+      await desktop.page.getByText("发布前确认目标").waitFor();
+      assert.equal(await desktop.page.getByText("发布前确认目标").evaluate((el) => el.closest("[data-testid=process-disclosure]")), null);
+      await desktop.page.getByRole("button", { name: "查看原始目标记录" }).waitFor();
       await desktop.page.getByText("还差你的确认").waitFor();
       await desktop.page.getByText("未成功").waitFor();
       await desktop.page.getByText("任务待你确认").waitFor();

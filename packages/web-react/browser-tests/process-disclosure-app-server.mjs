@@ -94,6 +94,13 @@ export function boardMessages(clock) {
       output: "ok",
       ts: tBash,
     }),
+    next("goal-cleared", "goal", "已清除的库存目标", {
+      _clientMessageId: "u1",
+      cleared: true,
+      goalStatus: "cleared",
+      _turnTapeId: "tape-cleared-goal",
+      ts: tBash + 5_000,
+    }),
     next("read-1", "tool", "读取", {
       _clientMessageId: "u1",
       toolName: "Read",
@@ -153,6 +160,12 @@ export function waitMessages(clock) {
   return [
     next("u-att", "user", "看板发布前等我确认", { status: "sent" }),
     next("stage-att", "assistant", "我先核对南仓可售，再请你拍板。", { _clientMessageId: "u-att" }),
+    next("goal-att", "goal", "发布前确认目标", {
+      _clientMessageId: "u-att",
+      goalStatus: "active",
+      cleared: false,
+      _turnTapeId: "tape-live-goal",
+    }),
     next("bash-att", "tool", "终端", {
       _clientMessageId: "u-att",
       toolName: "Bash",
@@ -481,6 +494,9 @@ export function startPreviewServer(assetDir, options = {}) {
               body: "确认北仓 80、南仓 48 的可售数后再发布。这是界面验收夹具，不是线上任务。",
             },
           };
+        } else if (path === "/api/fixture/step" && method === "POST") {
+          releaseFixtureStep();
+          body = { ok: true };
         } else if (path.startsWith("/api/session-goals/")) body = { goal: null };
         else if (path === `/api/sessions/${BOARD_SESSION}/archive` || path === `/api/sessions/${WAIT_SESSION}/archive`) {
           body = { messages: [], hasMore: false, oldestSeq: null, historyRevision: store.revision };
@@ -620,6 +636,126 @@ export function startPreviewServer(assetDir, options = {}) {
   });
 }
 
+const fixtureWaiters = [];
+let fixtureCredits = 0;
+
+function releaseFixtureStep() {
+  const waiter = fixtureWaiters.shift();
+  if (waiter) waiter();
+  else fixtureCredits += 1;
+}
+
+function waitFixtureStep() {
+  if (fixtureCredits > 0) {
+    fixtureCredits -= 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => fixtureWaiters.push(resolve));
+}
+
+async function playPhasedTurn(emit, remember, clientMessageId) {
+  const thinkId = `think-${clientMessageId}`;
+  const stageId = `stage-${clientMessageId}`;
+  const bashId = `bash-${clientMessageId}`;
+  const stageTwoId = `stage2-${clientMessageId}`;
+  const readId = `read-${clientMessageId}`;
+  const answerId = `answer-${clientMessageId}`;
+  const hidden = `${"思考痕迹".repeat(30)} THINK_HIDDEN_TAIL`;
+  await emit([{ kind: "thinking", text: `THINK_HEAD ${hidden}`, messageId: thinkId }]);
+  remember(thinkId, "thinking", `THINK_HEAD ${hidden}`, { _clientMessageId: clientMessageId });
+  await waitFixtureStep();
+
+  const stage = "STAGE_ONE 我先对一下这班发布落在哪。";
+  await emit([{ kind: "text", text: stage, messageId: stageId }]);
+  remember(stageId, "assistant", stage, { _clientMessageId: clientMessageId });
+  await emit([{
+    kind: "goal",
+    objective: "已清除的分段目标",
+    status: "cleared",
+    cleared: true,
+    platformGoalId: `phased-${clientMessageId}`,
+  }]);
+  remember(`goal-${clientMessageId}`, "goal", "已清除的分段目标", {
+    _clientMessageId: clientMessageId,
+    cleared: true,
+    goalStatus: "cleared",
+    _turnTapeId: "tape-phased-goal",
+    platformGoalId: `phased-${clientMessageId}`,
+  });
+  await waitFixtureStep();
+
+  await emit([{
+    kind: "tool_use",
+    blockId: bashId,
+    toolName: "Bash",
+    messageId: bashId,
+    partial: true,
+    partialJsonDelta: "{\"command\":\"LIVE_CMD_MARKER\"}",
+    partialJsonOffset: 0,
+  }]);
+  await waitFixtureStep();
+
+  await emit([{
+    kind: "tool_use",
+    blockId: bashId,
+    toolName: "Bash",
+    messageId: bashId,
+    partial: false,
+    inputJson: { command: "LIVE_CMD_MARKER" },
+  }]);
+  await emit([{
+    kind: "tool_result",
+    blockId: `${bashId}:result`,
+    toolUseBlockId: bashId,
+    toolName: "Bash",
+    isError: false,
+    output: "CMD_DONE_SECRET",
+  }]);
+  remember(bashId, "tool", "终端", {
+    _clientMessageId: clientMessageId,
+    toolName: "Bash",
+    inputJson: { command: "LIVE_CMD_MARKER" },
+    _completed: true,
+    output: "CMD_DONE_SECRET",
+  });
+  await waitFixtureStep();
+
+  const stageTwo = "STAGE_TWO 继续核对切流窗口。";
+  await emit([{ kind: "text", text: stageTwo, messageId: stageTwoId }]);
+  remember(stageTwoId, "assistant", stageTwo, { _clientMessageId: clientMessageId });
+  await waitFixtureStep();
+  await emit([{
+    kind: "tool_use",
+    blockId: readId,
+    toolName: "Read",
+    messageId: readId,
+    partial: false,
+    inputJson: { file_path: "VERSION" },
+  }]);
+  await emit([{
+    kind: "tool_result",
+    blockId: `${readId}:result`,
+    toolUseBlockId: readId,
+    toolName: "Read",
+    isError: false,
+    output: "READ_SECRET",
+  }]);
+  remember(readId, "tool", "读取", {
+    _clientMessageId: clientMessageId,
+    toolName: "Read",
+    inputJson: { file_path: "VERSION" },
+    _completed: true,
+    output: "READ_SECRET",
+  });
+  await waitFixtureStep();
+
+  const answer = `FINAL_LONG ${"段落。".repeat(40)}`;
+  await emit([{ kind: "text", text: answer.slice(0, 24), messageId: answerId }]);
+  await emit([{ kind: "text", text: answer.slice(24), messageId: answerId }]);
+  remember(answerId, "assistant", answer, { _clientMessageId: clientMessageId });
+  await waitFixtureStep();
+}
+
 async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
   const key = sessionKey(sessId);
   const base = {
@@ -656,7 +792,9 @@ async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
   };
   remember(clientMessageId, "user", text, { status: "replied" });
 
-  if (text.includes("合计还在就行") || sessId === WAIT_SESSION) {
+  if (text.includes("分段过程")) {
+    await playPhasedTurn(emit, remember, clientMessageId);
+  } else if (text.includes("合计还在就行") || sessId === WAIT_SESSION) {
     const reply = sessId === WAIT_SESSION
       ? "这轮先等你确认，看板不会发布。"
       : "还在。可售合计 128，南仓预警已经分开标出。";

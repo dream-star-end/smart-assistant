@@ -31,12 +31,27 @@ export function isFoldableWorkRole(message: ChatMessage): boolean {
   return WORK_ROLES.has(message.role);
 }
 
+/**
+ * Cleared / completed goal rows are historical diagnostics. Active, paused,
+ * and blocked goals stay on the top level — they are still a current objective.
+ * Role is the goal card itself, not a tool or sentence that happens to say "goal".
+ */
+export function isHistoricalGoalRecord(message: ChatMessage): boolean {
+  if (message.role !== "goal") return false;
+  if (message.error || message._isError || message._errorCode) return false;
+  if (message.cleared === true) return true;
+  const status = (message.goalStatus ?? "").trim().toLowerCase();
+  return status === "cleared" || status === "completed";
+}
+
 function commandText(message: ChatMessage): string {
   const input = message.inputJson;
   if (input && typeof input === "object" && !Array.isArray(input)) {
     const record = input as Record<string, unknown>;
     if (typeof record.command === "string") return record.command;
     if (typeof record.cmd === "string") return record.cmd;
+    if (typeof record.file_path === "string") return record.file_path;
+    if (typeof record.path === "string") return record.path;
   }
   if (typeof message.inputPreview === "string") return message.inputPreview;
   return message.text ?? "";
@@ -355,6 +370,7 @@ export function isProcessMessage(
   if (liveBackgroundSubtask(message)) return false;
   if (interactiveTool(message)) return false;
   if (toolShowsUniqueArtifact(message, assistantArtifactKeys)) return false;
+  if (isHistoricalGoalRecord(message)) return true;
   if (message.role === "assistant") {
     if (assistantCarriesDeliverable(message)) return false;
     return !final;
@@ -382,6 +398,7 @@ function countLabel(message: ChatMessage): string {
   }
   if (message.role === "thinking") return "思考";
   if (message.role === "plan") return "计划";
+  if (message.role === "goal") return "目标";
   if (message.role === "agent-group" || message.role === "delegate-progress") return "子任务";
   return "";
 }
@@ -400,6 +417,7 @@ export function operationSummary(messages: readonly ChatMessage[]): string {
 export type ProcessSection<T> = {
   key: string;
   narrative: boolean;
+  goal: boolean;
   items: T[];
   messages: ChatMessage[];
 };
@@ -413,15 +431,40 @@ export function processSections<T>(
   for (const item of items) {
     const messages = messagesOf(item);
     const narrative = messages.length > 0 && messages.every((message) => message.role === "assistant");
+    const goal = !narrative && messages.length > 0 && messages.every((message) => isHistoricalGoalRecord(message));
     const previous = sections.at(-1);
-    if (!narrative && previous && !previous.narrative) {
+    if (!narrative && !goal && previous && !previous.narrative && !previous.goal) {
       previous.items.push(item);
       previous.messages.push(...messages);
     } else {
-      sections.push({ key: keyOf(item), narrative, items: [item], messages: [...messages] });
+      sections.push({ key: keyOf(item), narrative, goal, items: [item], messages: [...messages] });
     }
   }
   return sections;
+}
+
+/** Collapsed stage label. Short on purpose so the full paragraph is not mounted. */
+function narrativeLabel(messages: readonly ChatMessage[]): string {
+  const text = messages.map((message) => message.text ?? "").join(" ").replace(/\s+/g, " ").trim();
+  return text.slice(0, 6) || "阶段说明";
+}
+
+/** Name plus a one-line status. Never the raw tool JSON or the full thinking trace. */
+function stepLiveLine(messages: readonly ChatMessage[]): string {
+  const latest = [...messages].reverse().find((message) => message.role !== "assistant" && message.role !== "user");
+  if (!latest) return "";
+  if (latest.role === "thinking") return "正在思考";
+  if (latest.role === "plan") return (latest.text || "计划").replace(/\s+/g, " ").trim().slice(0, 48);
+  if (latest.role === "agent-group" || latest.role === "delegate-progress") {
+    return (latest.text || "子任务").replace(/\s+/g, " ").trim().slice(0, 48);
+  }
+  if (latest.role === "tool") {
+    const name = latest.toolName || "工具";
+    const command = commandText(latest).replace(/\s+/g, " ").trim().slice(0, 72);
+    const state = latest._completed ? "已完成" : "进行中";
+    return command ? `${state} · ${name} · ${command}` : `${state} · ${name}`;
+  }
+  return countLabel(latest);
 }
 
 const toggleClass =
@@ -469,9 +512,9 @@ export function ProcessDisclosure<T>({
   eagerDeferred: boolean;
 }) {
   const messages = sections.flatMap((section) => section.messages);
-  const latest = [...messages].reverse().find((message) => message.role === "assistant" && message.text.trim() && !message._payloadDeferred);
   const title = active ? "处理过程" : "工作过程";
   const summary = operationSummary(messages);
+  const lastIndex = sections.length - 1;
 
   const clippedDeferred = (item: T) =>
     eagerDeferred && messagesOf(item).some((message) => message._payloadDeferred) ? (
@@ -479,6 +522,24 @@ export function ProcessDisclosure<T>({
         {renderItem(item)}
       </div>
     ) : null;
+
+  const narrativeBody = (section: ProcessSection<T>) => (
+    <div className="space-y-1">
+      {section.items.map((item) => {
+        const rows = messagesOf(item);
+        if (rows.some((message) => message._payloadDeferred)) {
+          return <div key={keyOf(item)}>{renderItem(item)}</div>;
+        }
+        return (
+          <div key={keyOf(item)} className="space-y-1">
+            {rows.map((message) => (
+              <StageText key={message.id} message={message} />
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
 
   return (
     <section data-testid="process-disclosure" data-process-active={active ? "true" : "false"} className="min-w-0 sm:ml-[52px]">
@@ -493,36 +554,62 @@ export function ProcessDisclosure<T>({
         <span className="shrink-0">{title}</span>
         <span className="min-w-0 truncate text-xs text-muted">{summary}</span>
       </button>
-      {active && !open && latest ? (
-        <p className="line-clamp-2 pl-6 text-sm leading-6 text-muted" data-testid="process-live-summary">
-          {latest.text}
-        </p>
-      ) : null}
       {!open
         ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
         : (
-          <div className="space-y-3 border-l border-border pl-3" data-testid="process-stages">
-            {sections.map((section) => {
-              if (section.narrative) {
+          <div className="space-y-1.5 border-l border-border pl-2" data-testid="process-stages">
+            {sections.map((section, index) => {
+              if (section.goal) {
                 return (
-                  <div key={section.key} className="space-y-2">
-                    {section.items.map((item) => {
-                      const rows = messagesOf(item);
-                      if (rows.some((message) => message._payloadDeferred)) {
-                        return <div key={keyOf(item)}>{renderItem(item)}</div>;
-                      }
-                      return (
-                        <div key={keyOf(item)} className="space-y-2">
-                          {rows.map((message) => (
-                            <StageText key={message.id} message={message} />
-                          ))}
-                        </div>
-                      );
-                    })}
+                  <div key={section.key} data-testid="process-goal" className="min-w-0">
+                    {section.items.map((item) => (
+                      <div key={keyOf(item)}>{renderItem(item)}</div>
+                    ))}
+                  </div>
+                );
+              }
+              if (section.narrative) {
+                const current = active && index === lastIndex;
+                const revealed = detailOpen(section.key);
+                // A finished turn shows every stage at level 2. While the turn
+                // is still running, only the current stage stays open; older
+                // stages collapse until the reader asks for them.
+                const show = !active || current || revealed;
+                if (!show) {
+                  return (
+                    <button
+                      key={section.key}
+                      type="button"
+                      className={toggleClass}
+                      aria-expanded={false}
+                      data-testid="process-stage-toggle"
+                      onClick={() => setDetailOpen(section.key, true)}
+                    >
+                      <ChevronRight size={13} className="shrink-0" aria-hidden />
+                      <span className="min-w-0 truncate">{narrativeLabel(section.messages)}</span>
+                    </button>
+                  );
+                }
+                return (
+                  <div key={section.key}>
+                    {!current && active ? (
+                      <button
+                        type="button"
+                        className={toggleClass}
+                        aria-expanded
+                        data-testid="process-stage-toggle"
+                        onClick={() => setDetailOpen(section.key, false)}
+                      >
+                        <ChevronRight size={13} className="shrink-0 rotate-90" aria-hidden />
+                        <span className="min-w-0 truncate">{narrativeLabel(section.messages)}</span>
+                      </button>
+                    ) : null}
+                    {narrativeBody(section)}
                   </div>
                 );
               }
               const details = detailOpen(section.key);
+              const live = active && index === lastIndex && !details ? stepLiveLine(section.messages) : "";
               return (
                 <div key={section.key}>
                   <button
@@ -539,8 +626,11 @@ export function ProcessDisclosure<T>({
                     />
                     <span className="min-w-0 break-words">{operationSummary(section.messages)}</span>
                   </button>
+                  {live ? (
+                    <p className="pl-6 text-sm leading-6 text-fg" data-testid="process-step-live">{live}</p>
+                  ) : null}
                   {details ? (
-                    <div className="space-y-3 pt-2" data-testid="process-details">
+                    <div className="space-y-1.5 pt-1" data-testid="process-details">
                       {section.items.map((item) => (
                         <div key={keyOf(item)}>{renderItem(item)}</div>
                       ))}
