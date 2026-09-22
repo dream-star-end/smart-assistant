@@ -146,7 +146,9 @@ export function resolveDelegateBillingAttribution(
     re: RegExp,
   ): string | undefined => journalString(journalCtx, key, re) ?? fromFrame(frame[key], re)
   const delegateAgentId = pick('delegateAgentId', AGENT_ID_RE)
-  const parentSessionId = pick('parentSessionId', /^.{1,128}$/)
+  // A taskboard parent has no web client id, so this value is the raw
+  // session key (~155, worst ~207). Same 240-char contract as sessionKey.
+  const parentSessionId = pick('parentSessionId', SESSION_ID_RE)
   const parentTurnKey = pick('parentTurnKey', PARENT_TURN_KEY_RE)
   return {
     ...(delegateAgentId ? { delegateAgentId } : {}),
@@ -205,7 +207,7 @@ export function createDelegateEngineBillingRuntime(
         const agentId = requireString(body, 'agentId', AGENT_ID_RE)
         const delegateAgentId = requireString(body, 'delegateAgentId', AGENT_ID_RE)
         const sessionKey = requireString(body, 'sessionKey', SESSION_ID_RE)
-        const parentSessionId = optionalString(body, 'parentSessionId', /^.{1,128}$/)
+        const parentSessionId = optionalString(body, 'parentSessionId', SESSION_ID_RE)
         const parentTurnKey = optionalString(body, 'parentTurnKey', PARENT_TURN_KEY_RE)
         const snapshot = await loadFreshCatalogSnapshot(deps.catalog)
         let authz
