@@ -3077,6 +3077,21 @@ export class ChatSocket {
     const sourceClientMessageId = isClientMessageId(frame.sourceClientMessageId)
       ? frame.sourceClientMessageId
       : undefined;
+    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
+    const hadCommittedCard = sourceClientMessageId
+      ? sess.messages.some((message) =>
+        message.role === "assistant" &&
+        message._clientMessageId === sourceClientMessageId &&
+        message._errorCardSnapshot?.disposition === "card")
+      : false;
+    const pendingPaint = this.pendingRecoveryErrors.get(sessId);
+    if (
+      !hadCommittedCard &&
+      pendingPaint &&
+      (!pendingPaint.clientMessageId || pendingPaint.clientMessageId === sourceClientMessageId)
+    ) {
+      pendingPaint.paint = { ...pendingPaint.paint, displayMessage: skipNotice };
+    }
     // 血统被 master 原子拒绝:延后的红卡必须先落地,下方的 skip 提示才有卡可挂。
     this.settlePendingRecoveryError(sessId, sourceClientMessageId, "declined", "recovery_skipped");
     if (sourceClientMessageId) {
@@ -3085,7 +3100,6 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
-    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
     let attachedToError = false;
     if (sourceClientMessageId) {
       for (const message of sess.messages) {

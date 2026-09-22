@@ -794,7 +794,7 @@ export function errorPresentation(
  * 第一次看到这条错误时写死展示。已有快照则原样返回，禁止按新错误码重算。
  * 静默终态写 `silent`，渲染器不出错误卡。
  */
-export function commitErrorCardSnapshot(message: ChatMessage): void {
+export function commitErrorCardSnapshot(message: ChatMessage, messageOverride?: string): void {
   if (message._errorCardSnapshot) return;
   if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return;
   if (isSilentTurnErrorCode(message._errorCode)) {
@@ -811,17 +811,40 @@ export function commitErrorCardSnapshot(message: ChatMessage): void {
     presented.waived || problemCardPresentation(message._errorCode, false) === "yellow"
       ? "yellow"
       : "red";
+  const body = typeof messageOverride === "string" && messageOverride.length > 0
+    ? messageOverride
+    : presented.message;
   message._errorCardSnapshot = {
     disposition: "card",
     tone,
     title: presented.title,
-    message: presented.message,
+    message: body,
     ...(presented.detail ? { detail: presented.detail } : {}),
   };
 }
 
 export function freezeErrorCardSnapshots(messages: readonly ChatMessage[]): void {
-  for (const message of messages) commitErrorCardSnapshot(message);
+  const recoveringSources = new Set<string>();
+  for (const message of messages) {
+    if (
+      message?.role === "user" &&
+      message._automaticRecovery === true &&
+      typeof message._recoveryOfClientMessageId === "string" &&
+      message._recoveryOfClientMessageId.length > 0
+    ) {
+      recoveringSources.add(message._recoveryOfClientMessageId);
+    }
+  }
+  for (const message of messages) {
+    if (message._errorCardSnapshot) continue;
+    if (
+      typeof message._clientMessageId === "string" &&
+      recoveringSources.has(message._clientMessageId)
+    ) {
+      continue;
+    }
+    commitErrorCardSnapshot(message);
+  }
 }
 
 /**

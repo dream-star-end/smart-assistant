@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "./model";
-import { commitErrorCardSnapshot } from "./render";
+import { applyServerIncremental, mergeFullServerWins } from "../persist";
+import { commitErrorCardSnapshot, freezeErrorCardSnapshots } from "./render";
 
 function message(partial: Partial<ChatMessage>): ChatMessage {
   return {
@@ -43,5 +44,56 @@ describe("commitErrorCardSnapshot", () => {
       commitErrorCardSnapshot(row);
       expect(row._errorCardSnapshot).toEqual({ disposition: "silent" });
     }
+  });
+
+  test("a canonical tape row with a different id keeps the first card snapshot", () => {
+    const snapshot = {
+      disposition: "card" as const,
+      tone: "red" as const,
+      title: "模型服务暂时中断",
+      message: "任务执行暂时中断，你的消息已保留，可直接重试。",
+    };
+    const local = [message({
+      id: "m-local",
+      _clientMessageId: "u1",
+      _errorCode: "upstream_failed",
+      text: snapshot.message,
+      _errorCardSnapshot: snapshot,
+    })];
+    const server = [message({
+      id: "srv-1",
+      _source: "server",
+      _clientMessageId: "u1",
+      _errorCode: "model_capacity",
+      text: "容量满了",
+      _seq: 2,
+    })];
+    for (const merged of [
+      mergeFullServerWins(server, local),
+      applyServerIncremental(local, server),
+    ]) {
+      const row = merged.find((item) => item.id === "srv-1");
+      expect(row?._errorCardSnapshot).toEqual(snapshot);
+    }
+  });
+
+  test("history sync does not commit a card for a source turn that is still recovering", () => {
+    const source = message({
+      id: "srv-err",
+      _clientMessageId: "u1",
+      _errorCode: "model_capacity",
+      text: "busy",
+    });
+    const child = message({
+      id: "m-recover-1",
+      role: "user",
+      _automaticRecovery: true,
+      _recoveryOfClientMessageId: "u1",
+      text: "retry",
+    });
+    freezeErrorCardSnapshots([source, child]);
+    expect(source._errorCardSnapshot).toBeUndefined();
+    freezeErrorCardSnapshots([source]);
+    expect(source._errorCardSnapshot?.disposition).toBe("card");
   });
 });

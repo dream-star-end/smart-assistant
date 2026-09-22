@@ -1082,6 +1082,29 @@ function isCoveredStaleLocalRow(
 }
 
 
+/** 实时 m-* 行和 tape 的 srv-* 行不是同一个 id。已提交的错误卡按 clientMessageId 迁到权威行上。 */
+function transplantCommittedErrorCards(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+  const snaps = new Map<string, NonNullable<ChatMessage["_errorCardSnapshot"]>>();
+  for (const row of local) {
+    if (
+      row?.role === "assistant" &&
+      row._errorCardSnapshot &&
+      typeof row._clientMessageId === "string" &&
+      row._clientMessageId.length > 0
+    ) {
+      snaps.set(row._clientMessageId, row._errorCardSnapshot);
+    }
+  }
+  if (snaps.size === 0) return server;
+  return server.map((row) => {
+    if (!row || row._errorCardSnapshot || row.role !== "assistant") return row;
+    if (typeof row._errorCode !== "string" || row._errorCode.length === 0) return row;
+    if (typeof row._clientMessageId !== "string") return row;
+    const snap = snaps.get(row._clientMessageId);
+    return snap ? { ...row, _errorCardSnapshot: snap } : row;
+  });
+}
+
 export function mergeFullServerWins(
   server: ChatMessage[],
   local: ChatMessage[],
@@ -1105,6 +1128,7 @@ export function mergeFullServerWins(
     adoptUnifiedTimeline?: boolean;
   },
 ): ChatMessage[] {
+  server = transplantCommittedErrorCards(server, local);
   const shadowInput = [...server, ...local];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
@@ -1346,6 +1370,7 @@ export function applyServerIncremental(
     activeClientMessageId?: string;
   },
 ): ChatMessage[] {
+  incoming = transplantCommittedErrorCards(incoming, local);
   const shadowInput = [...local, ...incoming];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {

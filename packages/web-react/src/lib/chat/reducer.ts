@@ -2528,6 +2528,8 @@ export type DeferredTerminalErrorPaint = {
   normalized: string;
   text: string;
   detail?: string;
+  /** 首次提交时的最终正文。已有快照后忽略。 */
+  displayMessage?: string;
   clientMessageId?: string;
   traceId?: string;
 };
@@ -2543,13 +2545,13 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
     : false;
   // 已经提交过的卡不再画第二张，也不改第一张。静默终态（重启/容器回收）不落错误行。
   if (!alreadyCommitted && (!silent || keepQuietStopLine)) {
-    const msg = addMessage(sess, "assistant", paint.text, {
+    const msg = addMessage(sess, "assistant", paint.displayMessage ?? paint.text, {
       _errorCode: paint.normalized,
       _errorDetail: paint.detail,
       ...(paint.clientMessageId ? { _clientMessageId: paint.clientMessageId } : {}),
       ...(paint.traceId ? { usage: { traceId: paint.traceId } } : {}),
     });
-    commitErrorCardSnapshot(msg);
+    commitErrorCardSnapshot(msg, paint.displayMessage);
   }
   // outbound.error is the structured error card; the following [error] text final is only a
   // compatibility terminator. Clear/persist locally now so a refresh in that tiny gap does not

@@ -7671,7 +7671,14 @@ export class SessionManager {
         // error, while the Master can make one deterministic retry decision.
         // Wait past handleExit's 150ms drain so a planned SIGTERM is classified
         // once. Emitting RUNNER_CRASHED first and SERVICE_RESTART second is what
-        // repainted the same turn from red to yellow.
+        // repainted the same turn from red to yellow. The diagnostic event is
+        // recorded immediately; only the client-visible terminal waits.
+        const plannedAtError = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+        retainTerminalError(
+          plannedAtError ? 'interrupted' : 'crashed',
+          err.message,
+          plannedAtError ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+        )
         const persistence = (async () => {
           await new Promise<void>((resolveWait) => {
             const timer = setTimeout(resolveWait, 200)

@@ -849,8 +849,10 @@ export function AssistantCard({
           >
             <div className="min-w-0">
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
-                {msg._recoverySkippedNotice ??
-                  (isInsufficient && !frozenCard ? creditsCopy.message : shownMessage)}
+                {frozenCard
+                  ? frozenCard.message
+                  : (msg._recoverySkippedNotice ??
+                    (isInsufficient ? creditsCopy.message : shownMessage))}
               </p>
               {shownDetail && (
                 <details className="mt-1.5 max-w-full">
