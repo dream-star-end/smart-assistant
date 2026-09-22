@@ -332,6 +332,12 @@
       "reason": "Grok Fast routes are stored as grok-build-fast. The relay treated every other model id as expired, so Fast turns returned 404 grok route expired. Allow only grok-build and grok-build-fast and forward that route model. No billing or stored-data change.",
       "approvedBy": "user 2026-09-22 要求改掉 Fast 中继拒绝 (OCV5-267)",
       "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "5bdaffa03255c2fc3d3febfaad20586b2a90e30f",
+      "reason": "Shown stage text stays mounted while a turn is running so the chat no longer snaps when the next tool arrives. Display only; no billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 要求根治已显示正文抖动 (OCV5-269)",
+      "expiresAt": "2026-10-23"
     }
   ]
 }
