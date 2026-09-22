@@ -338,6 +338,12 @@
       "reason": "Shown stage text stays mounted while a turn is running so the chat no longer snaps when the next tool arrives. Display only; no billing or stored-data change.",
       "approvedBy": "user 2026-09-23 要求根治已显示正文抖动 (OCV5-269)",
       "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "6b7b778df6c9659e2683ef429de598582984e9cd",
+      "reason": "Intermediate assistant notes stay fully visible inside the process area instead of collapsing to a one-line stage. Display only; no billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 要求中间响应直接显示不折叠 (OCV5-271)",
+      "expiresAt": "2026-10-23"
     }
   ]
 }
