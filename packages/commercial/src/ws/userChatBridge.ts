@@ -5664,29 +5664,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             (parsed as { type?: unknown }).type === "inbound.message"
           ) {
             inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed(parsed);
-            try {
-              const reviewFrame = parsed as {
-                agentId?: unknown
-                channel?: unknown
-                peer?: { kind?: unknown; id?: unknown }
-                content?: { text?: unknown }
-              }
-              const reviewSessionKey = inboundSessionKey(reviewFrame)
-              if (reviewSessionKey && isContentReviewSessionBanned(reviewSessionKey)) {
-                sendErrorFrame(userWs, "SESSION_BANNED", "这个会话已被管理员封禁", inboundTurnIdentityForFrame)
-                return
-              }
-              const reviewText = reviewFrame.content?.text
-              if (typeof reviewText === "string" && reviewText.trim()) {
-                observeUserContentReview({
-                  text: reviewText,
-                  userId: uid.toString(),
-                  sessionKey: reviewSessionKey,
-                })
-              }
-            } catch {
-              // Recording must not block delivery of this message.
-            }
             inboundPeerIdForFrame = inboundTurnIdentityForFrame.peerId;
             const frameModelRaw = (parsed as { model?: unknown }).model;
             const frameModelId = typeof frameModelRaw === "string" ? frameModelRaw : null;
@@ -5752,6 +5729,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               teamModeRequested &&
               (frameAgentId === "main" || frameAgentId === null || teamModeNonMainAgentDemotesToMain);
             const effectiveFrameAgentId = teamModeMain ? "main" : frameAgentId;
+            try {
+              const reviewFrame = parsed as {
+                channel?: unknown
+                peer?: { kind?: unknown; id?: unknown }
+                content?: { text?: unknown }
+              }
+              const reviewSessionKey = inboundSessionKey({
+                ...reviewFrame,
+                agentId: effectiveFrameAgentId ?? "main",
+              })
+              const reviewUserId = uid.toString()
+              if (reviewSessionKey && isContentReviewSessionBanned(reviewUserId, reviewSessionKey)) {
+                sendErrorFrame(userWs, "SESSION_BANNED", "这个会话已被管理员封禁", inboundTurnIdentityForFrame)
+                return
+              }
+              const reviewText = reviewFrame.content?.text
+              if (typeof reviewText === "string" && reviewText.trim()) {
+                observeUserContentReview({
+                  text: reviewText,
+                  userId: reviewUserId,
+                  sessionKey: reviewSessionKey,
+                })
+              }
+            } catch {
+              // Recording must not block delivery of this message.
+            }
             const agentImpliedModel =
               effectiveFrameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[effectiveFrameAgentId] : undefined;
             // P0 计费旁路封堵 —— master agent 权威推导:帧无 model 时容器 gateway

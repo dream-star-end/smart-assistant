@@ -89,10 +89,10 @@ export function inboundSessionKey(frame: {
   return `agent:${agentId}:${channel}:${kind}:${id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
 }
 
-export function isContentReviewSessionBanned(sessionKey: string): boolean {
-  if (!sessionKey) return false
+export function isContentReviewSessionBanned(userId: string, sessionKey: string): boolean {
+  if (!userId || !sessionKey) return false
   try {
-    return getContentReviewStore().isBanned(sessionKey)
+    return getContentReviewStore().isBanned(userId, sessionKey)
   } catch {
     return false
   }
@@ -158,7 +158,7 @@ export async function runUserContentReview(input: {
     const parsed = parseRisk(await res.json())
     const record = getContentReviewStore().insert({
       userId: input.userId.slice(0, 80),
-      sessionKey: input.sessionKey.slice(0, 240),
+      sessionKey: input.sessionKey,
       textHash: createHash('sha256').update(text).digest('hex'),
       excerpt: text.slice(0, 180),
       choice: parsed.choice ?? 'none',

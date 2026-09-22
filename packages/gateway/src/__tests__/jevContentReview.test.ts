@@ -89,10 +89,11 @@ describe('jev content review', () => {
     assert.equal(row?.thresholdMet, true)
     assert.equal(alerts.length, 1)
     assert.equal(alerts[0]?.includes('forbidden'), true)
-    assert.equal(isContentReviewSessionBanned('agent:main:webchat:dm:wsess-1'), false)
+    assert.equal(isContentReviewSessionBanned('9', 'agent:main:webchat:dm:wsess-1'), false)
     const banned = store.ban(row!.id, 'admin:1')
     assert.equal(banned?.bannedAt != null, true)
-    assert.equal(isContentReviewSessionBanned('agent:main:webchat:dm:wsess-1'), true)
+    assert.equal(isContentReviewSessionBanned('9', 'agent:main:webchat:dm:wsess-1'), true)
+    assert.equal(isContentReviewSessionBanned('8', 'agent:main:webchat:dm:wsess-1'), false)
   })
 
   it('ordinary traffic is stored and not alerted', async () => {

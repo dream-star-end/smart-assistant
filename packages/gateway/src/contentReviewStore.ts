@@ -32,7 +32,7 @@ export interface ContentReviewStore {
   markAlerted(id: number): void
   list(limit: number): ContentReviewRecord[]
   ban(reviewId: number, actor: string): ContentReviewRecord | null
-  isBanned(sessionKey: string): boolean
+  isBanned(userId: string, sessionKey: string): boolean
   close(): void
 }
 
@@ -70,10 +70,12 @@ export function openContentReviewStore(dbPath: string): ContentReviewStore {
       banned_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS session_bans (
-      session_key TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      session_key TEXT NOT NULL,
       banned_at INTEGER NOT NULL,
       review_id INTEGER,
-      actor TEXT NOT NULL
+      actor TEXT NOT NULL,
+      PRIMARY KEY (user_id, session_key)
     );
   `)
   const insert = db.prepare(`
@@ -86,11 +88,11 @@ export function openContentReviewStore(dbPath: string): ContentReviewStore {
   const listStmt = db.prepare(`SELECT * FROM content_reviews ORDER BY id DESC LIMIT ?`)
   const banReview = db.prepare(`UPDATE content_reviews SET banned_at = ? WHERE id = ?`)
   const banSession = db.prepare(`
-    INSERT INTO session_bans (session_key, banned_at, review_id, actor)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(session_key) DO UPDATE SET banned_at = excluded.banned_at, review_id = excluded.review_id, actor = excluded.actor
+    INSERT INTO session_bans (user_id, session_key, banned_at, review_id, actor)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, session_key) DO UPDATE SET banned_at = excluded.banned_at, review_id = excluded.review_id, actor = excluded.actor
   `)
-  const banned = db.prepare(`SELECT 1 FROM session_bans WHERE session_key = ?`)
+  const banned = db.prepare(`SELECT 1 FROM session_bans WHERE user_id = ? AND session_key = ?`)
 
   return {
     insert(row) {
@@ -121,14 +123,14 @@ export function openContentReviewStore(dbPath: string): ContentReviewStore {
       const now = Date.now()
       const tx = db.transaction(() => {
         banReview.run(now, reviewId)
-        banSession.run(current.session_key, now, reviewId, actor.slice(0, 120))
+        banSession.run(current.user_id, current.session_key, now, reviewId, actor.slice(0, 120))
       })
       tx()
       return mapRow(byId.get(reviewId))
     },
-    isBanned(sessionKey) {
-      if (!sessionKey) return false
-      return Boolean(banned.get(sessionKey))
+    isBanned(userId, sessionKey) {
+      if (!userId || !sessionKey) return false
+      return Boolean(banned.get(userId, sessionKey))
     },
     close() {
       db.close()
