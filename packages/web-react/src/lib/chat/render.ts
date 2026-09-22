@@ -794,12 +794,15 @@ export function errorPresentation(
  * 第一次看到这条错误时写死展示。已有快照则原样返回，禁止按新错误码重算。
  * 静默终态写 `silent`，渲染器不出错误卡。
  */
-export function commitErrorCardSnapshot(message: ChatMessage, messageOverride?: string): void {
-  if (message._errorCardSnapshot) return;
-  if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return;
+export function commitErrorCardSnapshot(
+  message: ChatMessage,
+  messageOverride?: string,
+): "card" | "silent" | undefined {
+  if (message._errorCardSnapshot) return message._errorCardSnapshot.disposition;
+  if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return undefined;
   if (isSilentTurnErrorCode(message._errorCode)) {
     message._errorCardSnapshot = { disposition: "silent" };
-    return;
+    return "silent";
   }
   const presented = errorPresentation(
     message._errorCode,
@@ -821,6 +824,7 @@ export function commitErrorCardSnapshot(message: ChatMessage, messageOverride?: 
     message: body,
     ...(presented.detail ? { detail: presented.detail } : {}),
   };
+  return "card";
 }
 
 export function freezeErrorCardSnapshots(

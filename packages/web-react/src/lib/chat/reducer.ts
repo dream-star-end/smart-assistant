@@ -2607,10 +2607,10 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
     if (existing) {
       existing._errorHeldForRecovery = undefined;
       if (paint.displayMessage) existing.text = paint.displayMessage;
-      commitErrorCardSnapshot(existing, paint.displayMessage);
+      const disposition = commitErrorCardSnapshot(existing, paint.displayMessage);
       paintTerminalError(sess, paint, false);
       effects.persistSession?.(sess.id);
-      return existing._errorCardSnapshot?.disposition === "card";
+      return disposition === "card";
     }
     if (sess.messages.some((m) => m.role === "assistant" && m._clientMessageId === cmid && m._turnTapeComplete === true && !m._errorCode)) return false;
   }
