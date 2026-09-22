@@ -228,7 +228,7 @@ function ReqIdChip({ traceId }: { traceId: string }) {
   );
 }
 
-/** 时间 · 积分 · token · 请求ID 同一行:token 用量不再孤零零悬在正文下方一个无单位的数字。 */
+/** 时间 · 积分 · token · 请求ID 同一行。时间用 caption:超过 30 天的绝对日期不能继承正文 16px。 */
 function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
   const traceId = msg.usage?.traceId;
   const credits = msg.usage?.costCredits;
@@ -239,11 +239,11 @@ function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTo
   const showTokens = Boolean(tokenUsage && tokenUsage.totalTokens > 0);
   if (!traceId && !showCredits && !waived && !showTime && !showTokens) return null;
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-faint">
+    <div data-testid="assistant-meta" className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-faint">
       {showTime && (
-        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap">
+        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap text-caption">
           <TooltipProvider>
-            <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+            <TimeAgo value={msg.ts} format="relative" tooltip className="text-caption text-faint" />
           </TooltipProvider>
         </time>
       )}

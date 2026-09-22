@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ProcessDisclosure, isFoldableWorkRole, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isFoldableWorkRole, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
 import {
   memo,
@@ -803,12 +803,38 @@ function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[]): Set<st
   return ids;
 }
 
+function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner: string; boundary: string } {
+  const nextOwner = rows[0]?.role === "user" ? rows[0].id : owner;
+  return {
+    owner: nextOwner,
+    boundary: `${rows[0]?._clientMessageId || nextOwner}:${tapeRenderPageKey(rows[0])}`,
+  };
+}
+
 /** Contiguous, owner/page-bounded display groups; never move an actionable row. */
 function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
   const out: RenderItem[] = [];
   const answerIds = disclosureAnswerIds(messages, finals);
   const activeStart = currentTurnStartIndex(messages);
   const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
+  const assistantArtifactKeys = new Map<string, Set<string>>();
+  let scanOwner = "head";
+  for (const item of items) {
+    const rows = itemMessages(item);
+    const advanced = advanceDisclosureBoundary(rows, scanOwner);
+    scanOwner = advanced.owner;
+    for (const message of rows) {
+      if (message.role !== "assistant" || message._hideUnpublishedFallback === true) continue;
+      const keys = artifactEvidenceKeys(message.text ?? "");
+      if (keys.length === 0) continue;
+      let owned = assistantArtifactKeys.get(advanced.boundary);
+      if (!owned) {
+        owned = new Set();
+        assistantArtifactKeys.set(advanced.boundary, owned);
+      }
+      for (const key of keys) owned.add(key);
+    }
+  }
   let owner = "head";
   let group: Extract<RenderItem, { kind: "process" }> | undefined;
   let boundary = "";
@@ -823,9 +849,11 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   };
   for (const item of items) {
     const rows = itemMessages(item);
-    if (rows[0]?.role === "user") owner = rows[0].id;
-    const nextBoundary = `${rows[0]?._clientMessageId || owner}:${tapeRenderPageKey(rows[0])}`;
-    const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id)));
+    const advanced = advanceDisclosureBoundary(rows, owner);
+    owner = advanced.owner;
+    const nextBoundary = advanced.boundary;
+    const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
+    const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id), ownedArtifacts));
     if (!fold) {
       seal(group);
       group = undefined;

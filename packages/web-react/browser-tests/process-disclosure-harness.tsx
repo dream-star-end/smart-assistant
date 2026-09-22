@@ -4,6 +4,7 @@ import { MessageList } from "../src/components/MessageRenderer";
 import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import type { ChatMessage } from "../src/lib/chat/model";
 import { TooltipProvider } from "../src/components/ui";
+import { BASH_CMD, OLD_TS, READ_PATH, STAGE_TEXT, answerText, recentTs } from "./process-disclosure-story.mjs";
 
 type Scene = "gallery" | "stream" | "find" | "attention";
 type Mode = "legacy" | "manus";
@@ -12,35 +13,47 @@ function row(id: string, role: ChatMessage["role"], text: string, extra: Partial
   return { id, role, text, ts: 1_700_000_000_000, ...extra };
 }
 
-const gallery: ChatMessage[] = [
-  row("u1", "user", "做一版库存看板", { status: "replied" }),
-  row("stage-1", "assistant", "先核对库存口径，再出桌面和手机两套布局。", { _clientMessageId: "u1" }),
-  row("bash-1", "tool", "终端", {
-    _clientMessageId: "u1",
-    toolName: "Bash",
-    inputJson: { command: "probe-stock-layout" },
-    _completed: true,
-    output: "ok",
-  }),
-  row("read-1", "tool", "读取", {
-    _clientMessageId: "u1",
-    toolName: "Read",
-    inputJson: { file_path: "/tmp/stock-threshold.txt" },
-    _completed: true,
-    output: "threshold",
-  }),
-  row("answer-1", "assistant", "看板已经做好。桌面和手机布局都过了检查。", { _clientMessageId: "u1" }),
-  row("pdf-1", "tool", "PDF", {
-    _clientMessageId: "u1",
-    toolName: "Bash",
-    inputJson: { command: "oc-pdf paper.qmd -o /home/agent/out/paper.pdf" },
-    _completed: true,
-    output: "wrote pdf",
-  }),
-];
+function galleryMessages(): ChatMessage[] {
+  const now = recentTs();
+  return [
+    row("u1", "user", "做一版库存看板", { status: "replied" }),
+    row("stage-1", "assistant", STAGE_TEXT, { _clientMessageId: "u1" }),
+    row("bash-1", "tool", "终端", {
+      _clientMessageId: "u1",
+      toolName: "Bash",
+      inputJson: { command: BASH_CMD },
+      _completed: true,
+      output: "ok",
+    }),
+    row("read-1", "tool", "读取", {
+      _clientMessageId: "u1",
+      toolName: "Read",
+      inputJson: { file_path: READ_PATH },
+      _completed: true,
+      output: "threshold",
+    }),
+    row("answer-1", "assistant", answerText(), {
+      _clientMessageId: "u1",
+      ts: OLD_TS,
+      usage: {
+        costCredits: "12",
+        totalTokens: 1840,
+        inputTokens: 1200,
+        outputTokens: 640,
+        traceId: "abc12345xyz",
+      },
+    }),
+    row("u-recent", "user", "数字还在吗？", { status: "replied", ts: now }),
+    row("a-recent", "assistant", "还在，可售合计 128。", {
+      _clientMessageId: "u-recent",
+      ts: now,
+      usage: { costCredits: "3", totalTokens: 420, inputTokens: 280, outputTokens: 140 },
+    }),
+  ];
+}
 
 function streamMessages(extra: string): ChatMessage[] {
-  const body = `${"这是正在写入的长回答，应该整段可见。".repeat(8)}\nSTREAM_TAIL_MARKER${extra}`;
+  const body = `${"这是正在写入的长回答，应该整段可见。".repeat(80)}\nSTREAM_TAIL_MARKER${extra}`;
   return [
     row("u-stream", "user", "继续写看板说明", { status: "sent" }),
     row("stage-stream", "assistant", "先核对库存口径，再出桌面和手机两套布局。", { _clientMessageId: "u-stream" }),
@@ -121,7 +134,7 @@ function messagesFor(scene: Scene, extra: string): ChatMessage[] {
   if (scene === "stream") return streamMessages(extra);
   if (scene === "find") return findMessages();
   if (scene === "attention") return attentionMessages();
-  return gallery;
+  return galleryMessages();
 }
 
 function Harness() {
@@ -146,7 +159,7 @@ function Harness() {
     releaseUserIntent: stick.releaseUserIntent,
   }), [stick]);
   const messages = messagesFor(scene, extra);
-  const scrolled = scene === "find";
+  const scrolled = scene === "find" || scene === "stream";
 
   const page = {
     setMode,

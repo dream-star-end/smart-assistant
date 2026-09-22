@@ -49,7 +49,13 @@ function settledTurn(): ChatMessage[] {
       _completed: true,
       output: "ok",
     }),
-    row("answer-1", "assistant", "看板已经做好", { _clientMessageId: "u1" }),
+    row("img-1", "tool", "生成图片", {
+      _clientMessageId: "u1",
+      toolName: "codex:imageGeneration",
+      inputJson: { type: "imageGeneration", prompt: "仓库货架" },
+      _completed: true,
+      output: "ok",
+    }),
     row("pdf-1", "tool", "PDF", {
       _clientMessageId: "u1",
       toolName: "Bash",
@@ -57,6 +63,7 @@ function settledTurn(): ChatMessage[] {
       _completed: true,
       output: "wrote pdf",
     }),
+    row("answer-1", "assistant", "看板已经做好", { _clientMessageId: "u1" }),
   ];
 }
 
@@ -64,8 +71,8 @@ describe("MessageList Manus 过程披露", () => {
   test("默认只见回答和交付物，两级点击才看见阶段和工具", () => {
     renderList(settledTurn());
     expect(screen.getByText("看板已经做好")).toBeInTheDocument();
-    const deliverable = screen.getByText(/paper\.pdf/);
-    expect(deliverable.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText(/paper\.pdf/)).not.toBeInTheDocument();
+    expect(screen.queryByText("生成图片")).not.toBeInTheDocument();
     expect(screen.queryByText("先核对库存口径")).not.toBeInTheDocument();
     expect(screen.queryByText("probe-stock-layout")).not.toBeInTheDocument();
     expect(screen.queryByText(/probe-thinking-trace/)).not.toBeInTheDocument();
@@ -75,9 +82,13 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-toggle"));
     expect(screen.getByTestId("process-stage")).toHaveTextContent("先核对库存口径");
     expect(screen.queryByText("probe-stock-layout")).not.toBeInTheDocument();
+    expect(screen.queryByText(/paper\.pdf/)).not.toBeInTheDocument();
     expect(screen.queryByText(/probe-thinking-trace/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    const pdf = screen.getByText(/paper\.pdf/);
+    expect(pdf.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    expect(screen.getByText("生成图片").closest("[data-testid=process-disclosure]")).not.toBeNull();
     expect(screen.getByText("probe-stock-layout")).toBeInTheDocument();
     expect(screen.getByText(/probe-thinking-trace/)).toBeInTheDocument();
     expect(screen.getByText("已经结束的子任务")).toBeInTheDocument();
@@ -410,6 +421,108 @@ describe("MessageList Manus 过程披露", () => {
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByText("可见的最终回答")).toBeInTheDocument();
     expect(screen.queryByText("不该再出现的降级正文")).not.toBeInTheDocument();
+  });
+
+  test("成功的办公和图像执行记录折进过程，助手没有的生成文件才留在结果层", async () => {
+    renderList([
+      row("u", "user", "出文件", { status: "replied" }),
+      row("stage", "assistant", "先跑命令", { _clientMessageId: "u" }),
+      row("img", "tool", "生成图片", {
+        _clientMessageId: "u",
+        toolName: "codex:imageGeneration",
+        inputJson: { type: "imageGeneration", prompt: "货架静物" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("pdf", "tool", "PDF", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-pdf paper.qmd -o /home/agent/out/paper.pdf" },
+        _completed: true,
+        output: "wrote pdf",
+      }),
+      row("dup", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "cp x /home/agent/.openclaude/generated/shared-board.csv" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("answer", "assistant", "总结在这里\n表在 /home/agent/.openclaude/generated/shared-board.csv", {
+        _clientMessageId: "u",
+      }),
+      row("bad", "tool", "失败", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "oc-pdf bad.qmd -o /home/agent/out/broken.pdf" },
+        _completed: true,
+        error: true,
+        output: "fail",
+      }),
+      row("only", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "cp y /home/agent/.openclaude/generated/only-board.csv" },
+        _completed: true,
+        output: "ok",
+      }),
+    ]);
+    expect(screen.getByText(/总结在这里/)).toBeInTheDocument();
+    const shared = await screen.findAllByText(/shared-board\.csv/);
+    expect(shared.some((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
+    expect(shared.every((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
+    const onlyRow = document.querySelector("[data-chat-virtual-key=only]");
+    expect(onlyRow).not.toBeNull();
+    expect(onlyRow?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(onlyRow?.querySelector("[title]")?.getAttribute("title") ?? "").toMatch(
+      /^cp y \/home\/agent\/\.openclaude\/generated\//,
+    );
+    expect(screen.getByText("未成功").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText(/paper\.pdf/)).not.toBeInTheDocument();
+    expect(screen.queryByText("生成图片")).not.toBeInTheDocument();
+    expect(screen.queryByText("货架静物")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByText(/paper\.pdf/).closest("[data-testid=process-details]")).not.toBeNull();
+    expect(screen.getByText("生成图片").closest("[data-testid=process-details]")).not.toBeNull();
+    expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/cp x \/home\/agent\/\.openclaude\/generated\//);
+  });
+
+  test("回答元信息用 caption，旧日期和近时都在，积分与 token 仍在", () => {
+    const oldTs = 1_700_000_000_000;
+    const recentTs = Date.now() - 2_000;
+    renderList([
+      row("u", "user", "看时间", { status: "replied", ts: oldTs }),
+      row("a", "assistant", "旧日期回答", {
+        _clientMessageId: "u",
+        ts: oldTs,
+        usage: {
+          costCredits: "12",
+          totalTokens: 1840,
+          inputTokens: 1200,
+          outputTokens: 640,
+          traceId: "abc12345xyz",
+        },
+      }),
+      row("u2", "user", "现在呢", { status: "replied", ts: recentTs }),
+      row("a2", "assistant", "近时回答", {
+        _clientMessageId: "u2",
+        ts: recentTs,
+        usage: { costCredits: "3", totalTokens: 420, inputTokens: 300, outputTokens: 120 },
+      }),
+    ]);
+    const metas = screen.getAllByTestId("assistant-meta");
+    expect(metas).toHaveLength(2);
+    expect(metas[0]).toHaveClass("text-caption");
+    expect(metas[0]).toHaveTextContent("2023-11-15");
+    expect(metas[0]).toHaveTextContent("12 积分");
+    expect(metas[0]).toHaveTextContent("token");
+    expect(metas[0].querySelector("time.tabular-nums")?.className ?? "").toContain("text-caption");
+    expect(metas[1]).toHaveTextContent("刚刚");
+    expect(metas[1]).toHaveTextContent("3 积分");
+    expect(metas[1]).toHaveTextContent("token");
+    expect(screen.queryByTestId("process-disclosure")).not.toBeInTheDocument();
   });
 
   test("命令计数看工具名或命令首词，不扫参数里的子串", () => {

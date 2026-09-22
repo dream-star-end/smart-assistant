@@ -2,7 +2,6 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { Markdown } from "../Markdown";
-import { detectOcCli } from "../tool/meta";
 import { timelineMessageKey } from "./findInSession";
 
 /**
@@ -20,15 +19,6 @@ const WORK_ROLES = new Set<ChatMessage["role"]>([
   "plan",
   "agent-group",
   "delegate-progress",
-]);
-
-const ARTIFACT_CLIS = new Set([
-  "oc-report",
-  "oc-slides",
-  "oc-poster",
-  "oc-docx",
-  "oc-pdf",
-  "oc-xlsx",
 ]);
 
 const INTERACTIVE_TOOL_RE =
@@ -51,22 +41,65 @@ function commandText(message: ChatMessage): string {
 
 const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd"]);
 
+const HTML_FENCE_RE = /```(?:htmlpreview|html)\b/i;
+const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+const GENERATED_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/\S+/g;
+const TRAILING_PATH_JUNK = /[),.;:，。；"'`\]}>]+$/u;
+
+function cleanEvidenceToken(value: string): string {
+  return value.replace(TRAILING_PATH_JUNK, "");
+}
+
+/** Stable keys for a real preview, image, or generated file. Tool names are not keys. */
+export function artifactEvidenceKeys(text: string): string[] {
+  MD_IMAGE_RE.lastIndex = 0;
+  GENERATED_PATH_RE.lastIndex = 0;
+  const keys: string[] = [];
+  if (HTML_FENCE_RE.test(text)) keys.push("html");
+  for (const match of text.matchAll(MD_IMAGE_RE)) {
+    if (match[1]) keys.push(`img:${cleanEvidenceToken(match[1])}`);
+  }
+  for (const match of text.matchAll(GENERATED_PATH_RE)) {
+    keys.push(`file:${cleanEvidenceToken(match[0])}`);
+  }
+  return keys;
+}
+
+function messageEvidenceText(message: ChatMessage): string {
+  const parts = [message.text ?? "", message.output ?? "", message.inputPreview ?? ""];
+  const input = message.inputJson;
+  if (input && typeof input === "object") {
+    try {
+      parts.push(JSON.stringify(input));
+    } catch {
+      /* non-json input is not artifact evidence */
+    }
+  }
+  return parts.join("\n");
+}
+
 /** Preview, image, or generated-file assistant rows stay beside the answer. */
 export function assistantCarriesDeliverable(message: ChatMessage): boolean {
   if (message.role !== "assistant" || message._hideUnpublishedFallback === true) return false;
   const text = message.text ?? "";
   if (!text.trim()) return false;
-  if (/```(?:htmlpreview|html)\b/i.test(text)) return true;
-  if (/!\[[^\]]*\]\([^)\s]+\)/.test(text)) return true;
-  return /\/home\/agent\/\.openclaude\/generated\/\S+/.test(text);
+  return artifactEvidenceKeys(text).length > 0;
 }
 
-/** User-visible files and generated media stay beside the answer, not inside a tool count. */
-export function isDeliverableTool(message: ChatMessage): boolean {
-  if (message.role !== "tool" || message.error) return false;
-  if (/imageGeneration/i.test(message.toolName ?? "")) return true;
-  const cli = detectOcCli(commandText(message)) ?? detectOcCli(message.toolName);
-  return cli != null && ARTIFACT_CLIS.has(cli);
+/**
+ * A successful tool stays on the result layer only when its payload contains
+ * artifact evidence the assistant does not already show. CLI and imageGeneration
+ * names are execution logs, not evidence.
+ */
+export function toolShowsUniqueArtifact(
+  message: ChatMessage,
+  assistantArtifactKeys?: ReadonlySet<string>,
+): boolean {
+  if (message.role !== "tool" || message.error || message._isError) return false;
+  const keys = artifactEvidenceKeys(messageEvidenceText(message));
+  if (keys.length === 0) return false;
+  const owned = assistantArtifactKeys ?? new Set<string>();
+  return keys.some((key) => !owned.has(key));
 }
 
 function interactiveTool(message: ChatMessage): boolean {
@@ -87,7 +120,11 @@ function liveBackgroundSubtask(message: ChatMessage): boolean {
  * Fold only quiet process rows. `final` means this assistant is the turn's
  * visible answer (including a deferred locator that will become that answer).
  */
-export function isProcessMessage(message: ChatMessage, final: boolean): boolean {
+export function isProcessMessage(
+  message: ChatMessage,
+  final: boolean,
+  assistantArtifactKeys?: ReadonlySet<string>,
+): boolean {
   if (
     message.error ||
     message._isError ||
@@ -101,7 +138,7 @@ export function isProcessMessage(message: ChatMessage, final: boolean): boolean 
   if (message._delegateStatus === "failed" || message._delegateStatus === "timeout") return false;
   if (liveBackgroundSubtask(message)) return false;
   if (interactiveTool(message)) return false;
-  if (isDeliverableTool(message)) return false;
+  if (toolShowsUniqueArtifact(message, assistantArtifactKeys)) return false;
   if (message.role === "assistant") {
     if (assistantCarriesDeliverable(message)) return false;
     return !final;
