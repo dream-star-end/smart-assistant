@@ -302,7 +302,7 @@ describe('collapsed GPT family group (2026-09-05)', () => {
     expect(flags).toEqual([
       ['gpt-6-astra', false],
       ['gpt-6-sol', false],
-      ['gpt-6-luna', false],
+      ['gpt-6-luna', true],
     ])
   })
 
