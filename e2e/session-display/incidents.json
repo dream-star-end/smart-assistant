@@ -4595,6 +4595,28 @@
           "assertion": "apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败"
         }
       ]
+    },
+    {
+      "id": "INC-20260923-EMPTY-TURN-NO-REPLY",
+      "occurredAt": "2026-09-23",
+      "severity": "P1",
+      "symptom": "继续聊天时模型 0 token 仍被记成完成，空回复句挂上评价和操作；同一条停止通知会再开一轮；自动续跑被拒后界面不说明。",
+      "rootFixCommit": "fc0e393ac",
+      "coverageCommits": [
+        "fc0e393ac"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/emptyCompletedTurn.test.ts",
+          "assertion": "token 全 0 且无产出时 shouldFailClosedEmptyModelTurn 为真；有正文/工具/token/斜杠命令不为真"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbLocalAgentCallback.test.ts",
+          "assertion": "两分钟内相同 status+summary 的第二条本地子 Agent 通知不再注入"
+        }
+      ]
     }
   ]
 }
