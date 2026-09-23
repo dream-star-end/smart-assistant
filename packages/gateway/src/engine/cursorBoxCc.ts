@@ -20,6 +20,30 @@ export const BOX_CC_HOME = '/home/box'
 
 const SAFE_FLAG = new Set(['--model', '--resume', '--permission-mode'])
 
+const BOX_OFFICIAL_MODELS: Record<string, string> = {
+  'box-claude-opus-5-5': 'claude-opus-5-5',
+  'box-claude-sonnet-5': 'claude-sonnet-5',
+  'box-claude-haiku-4-5': 'claude-haiku-4-5',
+}
+
+/** Catalog ids for the box CLI. Old cursor-opus/sonnet/haiku/fable ids map
+ * to the same official names so a not-yet-migrated session still speaks
+ * Claude Code's model id, not a Cursor Sand slug. */
+export function boxOfficialClaudeModel(model: string | undefined): string | undefined {
+  if (!model) return undefined
+  const exact = BOX_OFFICIAL_MODELS[model]
+  if (exact) return exact
+  if (model.startsWith('cursor-opus-') || model.startsWith('cursor-fable-')) return 'claude-opus-5-5'
+  if (model.startsWith('cursor-sonnet-')) return 'claude-sonnet-5'
+  if (model === 'cursor-haiku-4.5' || model.startsWith('cursor-haiku-')) return 'claude-haiku-4-5'
+  return undefined
+}
+
+export function isBoxClaudeCatalogModel(model: string | undefined): boolean {
+  return !!model && Object.prototype.hasOwnProperty.call(BOX_OFFICIAL_MODELS, model)
+}
+
+
 export function cursorBoxCcEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.OC_CURSOR_SAND_BOX_CC === '1'
 }
@@ -59,7 +83,8 @@ export function remoteClaudeArgs(argv: readonly string[]): string[] {
     if (!flag || !SAFE_FLAG.has(flag)) continue
     const value = argv[i + 1]
     if (!value || value.startsWith('-')) continue
-    out.push(flag, value)
+    const forwarded = flag === '--model' ? (boxOfficialClaudeModel(value) ?? value) : value
+    out.push(flag, forwarded)
     i++
     if (flag === '--permission-mode' && value === 'bypassPermissions') {
       out.push('--dangerously-skip-permissions')

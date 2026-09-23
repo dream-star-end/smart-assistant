@@ -286,6 +286,9 @@ export type CursorEngineFamilyId =
   | 'gpt-5.6-luna-sand'
   | 'grok-4.5'
   | 'haiku-4.5'
+  | 'box-claude-opus'
+  | 'box-claude-sonnet'
+  | 'box-claude-haiku'
 
 export const CURSOR_ENGINE_MODELS = [
   {
@@ -1028,6 +1031,37 @@ export const CURSOR_ENGINE_MODELS = [
     effort: null,
     fast: false,
   },
+  // Official Claude Code inside the account Grok Bot box. These ids are not
+  // Cursor Sand slugs; upstreamModel is the id the box CLI accepts.
+  // One family each: the picker collapses a family to a single effort row,
+  // and these three names are different models, not effort levels.
+  {
+    id: 'box-claude-opus-5-5',
+    displayName: 'Claude Opus 5.5',
+    upstreamModel: 'claude-opus-5-5',
+    family: 'box-claude-opus',
+    familyLabel: 'Claude Opus 5.5',
+    effort: null,
+    fast: false,
+  },
+  {
+    id: 'box-claude-sonnet-5',
+    displayName: 'Claude Sonnet 5',
+    upstreamModel: 'claude-sonnet-5',
+    family: 'box-claude-sonnet',
+    familyLabel: 'Claude Sonnet 5',
+    effort: null,
+    fast: false,
+  },
+  {
+    id: 'box-claude-haiku-4-5',
+    displayName: 'Claude Haiku 4.5',
+    upstreamModel: 'claude-haiku-4-5',
+    family: 'box-claude-haiku',
+    familyLabel: 'Claude Haiku 4.5',
+    effort: null,
+    fast: false,
+  },
 ] as const
 
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
@@ -1055,7 +1089,10 @@ export function cursorModelById(modelId: string | null | undefined): CursorEngin
 export const CURSOR_ENGINE_ID_PREFIX = 'cursor-'
 
 export function publicCursorModelId(modelId: string): string {
-  return isCursorEngineModel(modelId) ? modelId.slice(CURSOR_ENGINE_ID_PREFIX.length) : modelId
+  // Box Claude catalog ids do not use the cursor- prefix. Slicing them would
+  // turn box-claude-opus-5-5 into laude-opus-5-5 and break the public round-trip.
+  if (!isCursorEngineModel(modelId) || !modelId.startsWith(CURSOR_ENGINE_ID_PREFIX)) return modelId
+  return modelId.slice(CURSOR_ENGINE_ID_PREFIX.length)
 }
 
 /**
@@ -1291,7 +1328,10 @@ export function cursorFamilyDefaultEffort(
     family === 'auto' ||
     family === 'composer-2.5' ||
     family === 'haiku-4.5' ||
-    family === 'gemini-3.1-pro'
+    family === 'gemini-3.1-pro' ||
+    family === 'box-claude-opus' ||
+    family === 'box-claude-sonnet' ||
+    family === 'box-claude-haiku'
   ) {
     return null
   }

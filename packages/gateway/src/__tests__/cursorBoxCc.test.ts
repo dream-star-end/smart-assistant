@@ -55,7 +55,8 @@ test('box Claude is an account-pool session transport, not a second account syst
   assert.equal(cursorBoxCcEnabled(env), true)
   assert.equal(cursorBoxCcSelectionEligible(selection), true)
   assert.equal(cursorBoxCcSelectionEligible(apiKeySelection), false)
-  assert.equal(cursorVariantFor('cursor-opus-5-max-fast', selection, { kind: 'local' }, env), 'sand-box-cc')
+  assert.equal(cursorVariantFor('box-claude-opus-5-5', selection, { kind: 'local' }, env), 'sand-box-cc')
+  assert.equal(cursorVariantFor('cursor-opus-5-max-fast', selection, { kind: 'local' }, env), 'sand-official-cc')
   assert.equal(cursorVariantFor('cursor-opus-5-max-fast', apiKeySelection, { kind: 'local' }, env), 'sand-official-cc')
   assert.equal(cursorVariantFor('cursor-opus-5-max-fast', selection, { kind: 'local' }, {}), 'sand-ccb')
   assert.equal(
@@ -68,7 +69,7 @@ test('box Claude is an account-pool session transport, not a second account syst
 test('remote argv keeps model and resume and drops container paths', () => {
   const args = remoteClaudeArgs([
     '-p',
-    '--model', 'claude-opus-4-8',
+    '--model', 'box-claude-opus-5-5',
     '--settings', '/home/agent/.claude/settings.json',
     '--mcp-config', '/tmp/mcp.json',
     '--add-dir', '/home/agent/work',
@@ -83,12 +84,31 @@ test('remote argv keeps model and resume and drops container paths', () => {
     '--include-partial-messages',
     '--verbose',
     '--permission-prompt-tool', 'stdio',
-    '--model', 'claude-opus-4-8',
+    '--model', 'claude-opus-5-5',
     '--resume', '3bdc1a6e-63e3-4a3b-a29f-9aeb4e08c1cd',
     '--permission-mode', 'bypassPermissions',
     '--dangerously-skip-permissions',
   ])
 })
+
+
+test('legacy Cursor Sand slugs map to the box CLI ids', () => {
+  const head = [
+    '-p',
+    '--input-format=stream-json',
+    '--output-format=stream-json',
+    '--include-partial-messages',
+    '--verbose',
+    '--permission-prompt-tool',
+    'stdio',
+  ]
+  assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-opus-5-high']), [...head, '--model', 'claude-opus-5-5'])
+  assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-fable-5.1-high']), [...head, '--model', 'claude-opus-5-5'])
+  assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-sonnet-5-high']), [...head, '--model', 'claude-sonnet-5'])
+  assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-haiku-4.5']), [...head, '--model', 'claude-haiku-4-5'])
+  assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-grok-4.7-high']), [...head, '--model', 'cursor-grok-4.7-high'])
+})
+
 
 test('parent Anthropic route is stripped before the bridge starts', () => {
   const next = stripBoxCcParentAuth({

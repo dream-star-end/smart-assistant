@@ -30,7 +30,7 @@ import {
 } from './cursorAdapter.js'
 import { CursorSandAdapter } from './cursorSandAdapter.js'
 import { CursorBoxCcAdapter } from './cursorBoxCcAdapter.js'
-import { cursorBoxCcEnabled, cursorBoxCcSelectionEligible } from './cursorBoxCc.js'
+import { cursorBoxCcEnabled, cursorBoxCcSelectionEligible, isBoxClaudeCatalogModel } from './cursorBoxCc.js'
 import {
   cursorSandEnabledForSelection,
   selectCursorCredential,
@@ -81,12 +81,13 @@ export function cursorVariantFor(
   executionTarget?: ExecutionTarget,
   env: NodeJS.ProcessEnv = process.env,
 ): CursorVariant {
-  if (!cursorSandEnabledForSelection(model, selection)) return 'native'
   if (
     executionTarget?.kind !== 'remote'
     && cursorBoxCcEnabled(env)
     && cursorBoxCcSelectionEligible(selection)
+    && isBoxClaudeCatalogModel(model)
   ) return 'sand-box-cc'
+  if (!cursorSandEnabledForSelection(model, selection)) return 'native'
   if (
     executionTarget?.kind !== 'remote'
     && cursorOfficialCcEnabledForModel(model, env)
