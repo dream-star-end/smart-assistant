@@ -630,26 +630,29 @@ function rawAuditCommand(message: ChatMessage): string {
 }
 
 /** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
- * A later completed sibling must not hide a tool that is still running. */
-function stepLiveLine(messages: readonly ChatMessage[]): string {
+ * A later completed sibling must not hide a tool that is still running.
+ * `pending` is only the still-running status phrase. Finished and failed lines stay still. */
+function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pending: boolean } {
   const work = messages.filter((message) => message.role !== "assistant" && message.role !== "user");
   const runningTool = [...work].reverse().find(toolStillRunning);
   const latest = runningTool ?? work.at(-1);
-  if (!latest) return "";
-  if (latest.role === "thinking") return "正在思考";
-  if (latest.role === "plan") return (latest.text || "计划").replace(/\s+/g, " ").trim().slice(0, 48);
+  if (!latest) return { text: "", pending: false };
+  if (latest.role === "thinking") return { text: "正在思考", pending: true };
+  if (latest.role === "plan") {
+    return { text: (latest.text || "计划").replace(/\s+/g, " ").trim().slice(0, 48), pending: false };
+  }
   if (latest.role === "agent-group" || latest.role === "delegate-progress") {
-    return (latest.text || "子任务").replace(/\s+/g, " ").trim().slice(0, 48);
+    return { text: (latest.text || "子任务").replace(/\s+/g, " ").trim().slice(0, 48), pending: true };
   }
   if (latest.role === "tool") {
     if (latest.error || latest._isError || latest._errorCode) {
       // The raw miss stays in the expanded card. The live line only says the step did not succeed.
-      return "未成功";
+      return { text: "未成功", pending: false };
     }
-    if (!latest._completed) return runningToolPhrase(latest);
-    return "工具执行完成";
+    if (!latest._completed) return { text: runningToolPhrase(latest), pending: true };
+    return { text: "工具执行完成", pending: false };
   }
-  return countLabel(latest);
+  return { text: countLabel(latest), pending: false };
 }
 
 const toggleClass =
@@ -783,7 +786,7 @@ export function ProcessDisclosure<T>({
                 );
               }
               const details = detailOpen(section.key);
-              const live = active && index === currentIndex && !details ? stepLiveLine(section.messages) : "";
+              const liveStatus = active && index === currentIndex && !details ? stepLiveStatus(section.messages) : null;
               return (
                 <div key={section.key}>
                   <button
@@ -800,8 +803,14 @@ export function ProcessDisclosure<T>({
                     />
                     <span className="min-w-0 break-words">{operationSummary(section.messages)}</span>
                   </button>
-                  {live ? (
-                    <p className="pl-6 text-sm leading-6 text-fg" data-testid="process-step-live">{live}</p>
+                  {liveStatus?.text ? (
+                    <p
+                      className={liveStatus.pending ? "oc-live-status-shine pl-6 text-sm leading-6 text-fg" : "pl-6 text-sm leading-6 text-fg"}
+                      data-testid="process-step-live"
+                      data-live-pending={liveStatus.pending ? "true" : "false"}
+                    >
+                      {liveStatus.text}
+                    </p>
                   ) : null}
                   {details ? (
                     <div className="space-y-1.5 pt-1" data-testid="process-details">

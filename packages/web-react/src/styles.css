@@ -313,6 +313,32 @@ body {
 }
 @keyframes oc-shimmer { 100% { transform: translateX(100%); } }
 
+/* 进行中的处理过程状态行:沿文字扫一道高光,表示这一步还没结束。
+   基色与高光取 --muted / --fg,明暗主题都可读。完成态和失败态不加此类。
+   减少动态效果时本段不生效,文字保持 text-fg,避免透明字配上被压到 0.01ms 的扫光。 */
+@media (prefers-reduced-motion: no-preference) {
+  .oc-live-status-shine {
+    background-image: linear-gradient(
+      100deg,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 0%,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 36%,
+      var(--fg) 50%,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 64%,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 100%
+    );
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    animation: oc-live-status-sweep 1.8s linear infinite;
+  }
+}
+@keyframes oc-live-status-sweep {
+  from { background-position: 120% 0; }
+  to { background-position: -20% 0; }
+}
+
 /* ── 生成占位卡(GeneratingPlaceholderCard)的粒子场景色。刻意明暗主题一致:
    粒子发光基面贴 image viewer 黑底质感 —— 浅色主题下也必须是深色,淡蓝粒子才
    可见,因此不走会随主题翻转的 surface token,固化在 styles.css 单一权威处。

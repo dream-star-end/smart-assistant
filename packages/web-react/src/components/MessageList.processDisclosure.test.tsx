@@ -908,6 +908,8 @@ describe("MessageList Manus 过程披露", () => {
     };
     expectOne();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考");
+    expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
+    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
     expect(screen.queryByText(/THINK_HIDDEN_TAIL/)).not.toBeInTheDocument();
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[1]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
@@ -930,6 +932,8 @@ describe("MessageList Manus 过程披露", () => {
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[3]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行中");
+    expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
+    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("Bash");
     expect(screen.queryByText("RAW_JSON_SECRET")).not.toBeInTheDocument();
@@ -937,6 +941,8 @@ describe("MessageList Manus 过程披露", () => {
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[4]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行完成");
+    expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "false");
+    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
     expect(screen.queryByText("CMD_DONE_SECRET")).not.toBeInTheDocument();
 
@@ -1448,6 +1454,8 @@ describe("MessageList Manus 过程披露", () => {
       }),
     ], { sending: true });
     const missed = screen.getByText("未成功");
+    expect(missed).toHaveAttribute("data-live-pending", "false");
+    expect(missed.className).not.toContain("oc-live-status-shine");
     expect(missed.closest("[data-testid=process-disclosure]")).not.toBeNull();
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     expect(screen.queryByText("工具执行完成")).not.toBeInTheDocument();
@@ -1464,6 +1472,7 @@ describe("MessageList Manus 过程披露", () => {
     ], { sending: true });
     expect(screen.queryByText(/dlgjob-audit-SECRET/)).not.toBeInTheDocument();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
+    expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
     expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
