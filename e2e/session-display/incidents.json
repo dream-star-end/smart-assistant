@@ -4660,7 +4660,8 @@
       "symptom": "继续聊天时模型 0 token 仍被记成完成，空回复句挂上评价和操作；同一条停止通知会再开一轮；自动续跑被拒后界面不说明。",
       "rootFixCommit": "fc0e393ac",
       "coverageCommits": [
-        "fc0e393ac"
+        "fc0e393ac",
+        "21e9b0c848cdff5daa0e5631738fe65d4554d6d5"
       ],
       "regressions": [
         {
