@@ -1684,11 +1684,11 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
       />,
     );
     expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
-    const html = view.container.innerHTML;
-    expect(html.indexOf("升级 codex")).toBeGreaterThan(-1);
-    expect(html.indexOf("升级 codex")).toBeLessThan(html.indexOf("加载更早的处理步骤"));
-    expect(html.indexOf("加载更早的处理步骤")).toBeLessThan(html.indexOf("process-disclosure"));
-    fireEvent.click(screen.getByRole("button", { name: "加载更早的处理步骤" }));
+    expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
+    const disclosure = screen.getByTestId("process-disclosure");
+    expect(screen.getByText("升级 codex").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(within(disclosure).getByRole("button", { name: "加载更早的处理步骤" })).toBeTruthy();
+    fireEvent.click(within(disclosure).getByRole("button", { name: "加载更早的处理步骤" }));
     expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
   });
 

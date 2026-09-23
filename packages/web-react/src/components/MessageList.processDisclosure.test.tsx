@@ -314,7 +314,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getAllByTestId("process-toggle").every((button) => button.getAttribute("aria-expanded") === "false")).toBe(true);
   });
 
-  test("同一轮跨历史页的过程不会并成一组", () => {
+  test("同一轮跨历史页仍是一组处理过程", () => {
     renderList([
       row("u", "user", "翻页", { status: "replied" }),
       row("s", "assistant", "页一阶段", { _clientMessageId: "u", _historyPageKey: "page-1" }),
@@ -337,10 +337,12 @@ describe("MessageList Manus 过程披露", () => {
       }),
       row("a", "assistant", "翻页后的回答", { _clientMessageId: "u", _historyPageKey: "page-2" }),
     ]);
-    expect(screen.getAllByTestId("process-toggle")).toHaveLength(2);
-    fireEvent.click(screen.getAllByTestId("process-toggle")[0]!);
-    expect(screen.getByText("页一阶段")).toBeInTheDocument();
-    expect(screen.queryByText("页二阶段")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
+    expect(screen.getByText("翻页后的回答").closest("[data-testid=process-disclosure]")).toBeNull();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const disclosure = screen.getByTestId("process-disclosure");
+    expect(within(disclosure).getByText("页一阶段")).toBeInTheDocument();
+    expect(within(disclosure).getByText("页二阶段")).toBeInTheDocument();
   });
 
   test("延迟加载的最终回答留在外面，过程里的延迟行仍会挂上读取入口", async () => {

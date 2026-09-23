@@ -865,13 +865,15 @@ function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending
 
 function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner: string; boundary: string } {
   const nextOwner = rows[0]?.role === "user" ? rows[0].id : owner;
+  // One shell per turn. History/live page keys stay on the rows for other
+  // cards, but must not open a second "处理过程" in the middle of the same turn.
   return {
     owner: nextOwner,
-    boundary: `${rows[0]?._clientMessageId || nextOwner}:${tapeRenderPageKey(rows[0])}`,
+    boundary: rows[0]?._clientMessageId || nextOwner,
   };
 }
 
-/** Contiguous, owner/page-bounded display groups; never move an actionable row. */
+/** Contiguous, turn-bounded display groups; never move an actionable row. */
 function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
   const out: RenderItem[] = [];
   const answerIds = disclosureAnswerIds(messages, finals, sending);
@@ -903,11 +905,16 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   // work. Keep it in the shell above the answer. Do not open a second shell
   // underneath, and do not move a question, approval, failure, or artifact.
   let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
+  // Key off the turn, not the first row. Prepending an older live page must
+  // not remount the shell the reader already has open.
+  const shellOrdinal = new Map<string, number>();
   const seal = (current: ProcessGroup | undefined, keyBoundary: string) => {
     if (!current) return;
     const work = current.members.find((message) =>
       !isClearedGoalRecord(message) && (isFoldableWorkRole(message) || isHistoricalGoalRecord(message)));
-    current.key = `process:${keyBoundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
+    const ordinal = shellOrdinal.get(keyBoundary) ?? 0;
+    shellOrdinal.set(keyBoundary, ordinal + 1);
+    current.key = ordinal === 0 ? `process:${keyBoundary}` : `process:${keyBoundary}:${ordinal}`;
     if (!work) {
       const index = out.indexOf(current);
       if (index >= 0) out.splice(index, 1, ...current.items);
@@ -2315,9 +2322,9 @@ export function MessageList({
   const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
-  // Live-unit backlog is earlier steps of the loaded turn, not an older
-  // conversation. Keep it on the latest process shell so it cannot sit
-  // above the opening message as "查看更早历史记录".
+  // Live-unit backlog is earlier steps of this turn, not an older
+  // conversation. Render the control inside the latest process shell so it
+  // cannot sit above the opening message or between two shells.
   const olderLiveStepsKey = (() => {
     if (!liveHasMore) return null;
     let key: string | null = null;
@@ -2362,9 +2369,7 @@ export function MessageList({
       // reset when tokens arrive or the turn completes.
       const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
       return (
-        <>
-          {olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
-          <ProcessDisclosure
+        <ProcessDisclosure
           sections={sections}
           active={it.active}
           open={open}
@@ -2379,8 +2384,8 @@ export function MessageList({
           keyOf={renderItemKey}
           messagesOf={itemMessages}
           eagerDeferred={eager}
+          olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
         />
-        </>
       );
     }
     if (it.kind === "single" && it.m._genPlaceholder) {

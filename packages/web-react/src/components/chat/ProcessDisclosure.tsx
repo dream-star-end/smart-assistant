@@ -687,6 +687,7 @@ export function ProcessDisclosure<T>({
   keyOf,
   messagesOf,
   eagerDeferred,
+  olderSteps,
 }: {
   sections: ProcessSection<T>[];
   active: boolean;
@@ -699,6 +700,8 @@ export function ProcessDisclosure<T>({
   messagesOf: (item: T) => ChatMessage[];
   /** Tail locators keep hydrating while the disclosure stays collapsed. */
   eagerDeferred: boolean;
+  /** Unloaded earlier steps of this same turn. Stays inside the shell. */
+  olderSteps?: ReactNode;
 }) {
   const messages = sections.flatMap((section) => section.messages);
   const title = active ? "处理过程" : "工作过程";
@@ -753,9 +756,11 @@ export function ProcessDisclosure<T>({
       </button>
       {!open
         ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
-        : (
-          <div className="space-y-1.5 border-l border-border pl-2" data-testid="process-stages">
-            {sections.map((section, index) => {
+        : null}
+      {(olderSteps || open) ? (
+          <div className="space-y-1.5 border-l border-border pl-2" data-testid={open ? "process-stages" : "process-older-steps"}>
+            {olderSteps}
+            {open ? sections.map((section, index) => {
               if (section.goal) {
                 return (
                   <div key={section.key} data-testid="process-goal" className="min-w-0">
@@ -824,9 +829,9 @@ export function ProcessDisclosure<T>({
                   )}
                 </div>
               );
-            })}
+            }) : null}
           </div>
-        )}
+        ) : null}
     </section>
   );
 }
