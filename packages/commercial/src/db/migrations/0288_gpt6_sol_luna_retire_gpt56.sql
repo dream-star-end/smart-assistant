@@ -18,8 +18,9 @@
 -- already names. Cursor gpt-5.6-luna-* is a different engine and stays.
 --
 -- Idempotent: a hot apply may insert the new rows before schema_migrations
--- records this file. Replay accepts the expected rows and a fully retired
--- GPT-5.6 set; any other shape raises.
+-- records this file. Replay accepts the expected rows. A partial active
+-- subset of the six Codex GPT-5.6 ids is retired too (commercial had
+-- already disabled five of them). Any other shape raises.
 
 DO $$
 DECLARE
@@ -180,10 +181,33 @@ BEGIN
        'gpt-5.6-luna', 'gpt-5.6-luna-1m',
        'gpt-5.6-terra', 'gpt-5.6-terra-1m'
      );
-  IF active_56 NOT IN (0, 6) THEN
-    RAISE EXCEPTION '0288 refuses partial GPT-5.6 retirement (active %)', active_56;
+  -- Commercial already disabled some of these six (only gpt-5.6-sol stayed
+  -- active, and it is default_codex_engine). Retire whatever subset is still
+  -- active, and hide pricing that is still public. An active Codex gpt-5.6
+  -- id outside this set still fails. Selfhost applied the earlier all-six
+  -- text; schema_migrations does not re-run this file there.
+  IF EXISTS (
+    SELECT 1 FROM model_catalog
+     WHERE state = 'active'
+       AND engine = 'codex'
+       AND model_id LIKE 'gpt-5.6-%'
+       AND model_id NOT IN (
+         'gpt-5.6-sol', 'gpt-5.6-sol-1m',
+         'gpt-5.6-luna', 'gpt-5.6-luna-1m',
+         'gpt-5.6-terra', 'gpt-5.6-terra-1m'
+       )
+  ) THEN
+    RAISE EXCEPTION '0288 refuses an active Codex gpt-5.6 row outside Sol/Terra/Luna';
   END IF;
-  IF active_56 = 6 THEN
+  IF active_56 > 0 OR EXISTS (
+    SELECT 1 FROM model_pricing
+     WHERE model_id IN (
+       'gpt-5.6-sol', 'gpt-5.6-sol-1m',
+       'gpt-5.6-luna', 'gpt-5.6-luna-1m',
+       'gpt-5.6-terra', 'gpt-5.6-terra-1m'
+     )
+       AND (enabled IS TRUE OR visibility <> 'hidden')
+  ) THEN
     DELETE FROM account_group_models
      WHERE model_id IN (
        'gpt-5.6-sol', 'gpt-5.6-sol-1m',
@@ -209,10 +233,11 @@ BEGIN
        'gpt-5.6-sol', 'gpt-5.6-sol-1m',
        'gpt-5.6-luna', 'gpt-5.6-luna-1m',
        'gpt-5.6-terra', 'gpt-5.6-terra-1m'
-     );
+     )
+       AND (enabled IS TRUE OR visibility <> 'hidden');
     GET DIAGNOSTICS n = ROW_COUNT;
-    IF n <> 6 THEN
-      RAISE EXCEPTION '0288 expected to hide 6 GPT-5.6 pricing rows, updated %', n;
+    IF n < 1 THEN
+      RAISE EXCEPTION '0288 expected to hide at least one GPT-5.6 pricing row, updated %', n;
     END IF;
   END IF;
 
