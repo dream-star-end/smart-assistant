@@ -4693,6 +4693,23 @@
           "assertion": "待发送卡片有修改和立即发送；对话流不渲染 status=queued 的用户消息"
         }
       ]
+    },
+    {
+      "id": "INC-20260923-PROCESS-STEPS-AUTO",
+      "occurredAt": "2026-09-23",
+      "severity": "P2",
+      "symptom": "工作过程区要手动点「加载更早的处理步骤」才能看到本轮更早的步骤。",
+      "rootFixCommit": "f8f619b77ee6ca2206e030de3b440e12aaa11604",
+      "coverageCommits": [
+        "f8f619b77ee6ca2206e030de3b440e12aaa11604"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "本轮还有更早步骤时按游标自动补齐，不显示加载按钮；失败才出现重试；历史按钮仍只翻对话"
+        }
+      ]
     }
   ]
 }
