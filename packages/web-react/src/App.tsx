@@ -3355,7 +3355,8 @@ export function App() {
     historyError: !demo && historyError !== null,
   });
 
-  // 统一真实时间线分页：仅显式按钮加载，滚动绝不发请求。
+  // 更早对话仍只靠显式按钮，滚动不发请求。
+  // 本轮处理步骤按游标自动补齐，不在过程区放「加载更早的处理步骤」。
   // demo / 无选中会话时不下发(MessageList 退化为纯本地翻页)。
   const messageListArchive: MessageListArchive | undefined =
     !demo && activeId
@@ -3365,9 +3366,8 @@ export function App() {
           error: archiveError,
           onLoadOlder: onLoadOlderHistory,
           liveHasMoreBefore: activeSess?._liveUnitsHasMoreBefore === true,
-          onLoadOlderLiveUnits: async () => {
-            await chat.loadOlderLiveUnits(activeId);
-          },
+          liveUnitsCursor: activeSess?._liveUnitsBeforeCursor ?? null,
+          onLoadOlderLiveUnits: () => chat.loadOlderLiveUnits(activeId),
         }
       : undefined;
 

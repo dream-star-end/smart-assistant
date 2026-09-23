@@ -1660,9 +1660,9 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
-  test("仅本轮还有未加载步骤时，不在第一句话上面显示查看更早历史记录", () => {
-    const onLoadOlderLiveUnits = vi.fn();
-    const view = render(
+  test("仅本轮还有未加载步骤时，自动补齐且不显示加载按钮", async () => {
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: true, hasMore: true }));
+    render(
       <MessageList
         processDisclosure
         messages={[
@@ -1679,6 +1679,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
           error: false,
           onLoadOlder: () => {},
           liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
           onLoadOlderLiveUnits,
         }}
       />,
@@ -1687,14 +1688,95 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
     const disclosure = screen.getByTestId("process-disclosure");
     expect(screen.getByText("升级 codex").closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(within(disclosure).getByRole("button", { name: "加载更早的处理步骤" })).toBeTruthy();
-    fireEvent.click(within(disclosure).getByRole("button", { name: "加载更早的处理步骤" }));
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1));
+    expect(within(disclosure).queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+  });
+
+  test("游标前移后继续自动补齐更早步骤", async () => {
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: true, hasMore: true }));
+    const view = render(
+      <MessageList
+        processDisclosure
+        sessionId="s-live"
+        messages={[
+          mk("user", { id: "u-cursor", text: "继续" }),
+          mk("tool", { id: "tool-cursor", toolName: "Bash", text: "pwd", output: "ok", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <MessageList
+        processDisclosure
+        sessionId="s-live"
+        messages={[
+          mk("user", { id: "u-cursor", text: "继续" }),
+          mk("tool", { id: "tool-cursor", toolName: "Bash", text: "pwd", output: "ok", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:20",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+  });
+
+  test("更早步骤加载失败时才出现重试，点击再请求一次", async () => {
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: false, error: true, hasMore: true }));
+    render(
+      <MessageList
+        processDisclosure
+        messages={[
+          mk("user", { id: "u-fail", text: "失败" }),
+          mk("tool", { id: "tool-fail", toolName: "Bash", text: "false", output: "no", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:10",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击重试" })).toBeTruthy());
     expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击重试" }));
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
   });
 
   test("既有更早对话又有本轮未加载步骤时，顶部按钮只翻对话", async () => {
     const onLoadOlder = vi.fn();
-    const onLoadOlderLiveUnits = vi.fn();
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: true, hasMore: true }));
     render(
       <MessageList
         processDisclosure
@@ -1711,15 +1793,16 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
           error: false,
           onLoadOlder,
           liveHasMoreBefore: true,
+          liveUnitsCursor: "u:15",
           onLoadOlderLiveUnits,
         }}
       />,
     );
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
-    expect(onLoadOlderLiveUnits).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "加载更早的处理步骤" }));
     expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
   });
 
   test("统一时间线保留最新思考、工具和回答，完成态思考默认折叠且可完整展开", () => {

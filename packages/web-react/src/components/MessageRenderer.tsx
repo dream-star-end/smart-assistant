@@ -1253,6 +1253,8 @@ export function shouldShowScrollToBottom(
   return messageCount > 0 && following === false && distance > 80;
 }
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
+/** Safety stop for a cursor that keeps moving. One manual page remains after this. */
+const LIVE_UNITS_AUTO_PAGE_CAP = 40;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 
 function defaultTailStart(length: number): number {
@@ -1378,7 +1380,14 @@ export type MessageListArchive = {
   onLoadOlder: () => void | Promise<void>;
   /** Hot live-unit window still has earlier units than the first pack. */
   liveHasMoreBefore?: boolean;
-  onLoadOlderLiveUnits?: () => void | Promise<void>;
+  /** Server cursor for the next older live-unit page. Auto-load keys on this. */
+  liveUnitsCursor?: string | null;
+  onLoadOlderLiveUnits?: () => void | Promise<void | {
+    ok?: boolean;
+    hasMore?: boolean;
+    error?: boolean;
+    inflight?: boolean;
+  }>;
 };
 
 function turnHasVisibleWork(
@@ -1496,6 +1505,14 @@ export function MessageList({
   const [archiveQueued, setArchiveQueued] = useState(false);
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
+  const liveQueuedRef = useRef(false);
+  const [liveUnitsBusy, setLiveUnitsBusy] = useState(false);
+  const requestedLiveCursorRef = useRef<string | null>(null);
+  const liveAutoPagesRef = useRef<{ session?: string; count: number }>({ count: 0 });
+  const [liveUnitsAttention, setLiveUnitsAttention] = useState<{
+    session?: string;
+    kind: "error" | "cap";
+  } | null>(null);
   const [windowVersion, setWindowVersion] = useState(0);
   const [paintRange, setPaintRange] = useState({ start: 0, end: TIMELINE_INITIAL_TAIL_ITEMS });
   const itemCountRef = useRef(0);
@@ -2103,12 +2120,18 @@ export function MessageList({
     });
   }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
   const liveHasMore = archive?.liveHasMoreBefore === true;
+  const liveAttention = liveUnitsAttention && liveUnitsAttention.session === sessionId
+    ? liveUnitsAttention.kind
+    : null;
+  if (liveAutoPagesRef.current.session !== sessionId) {
+    liveAutoPagesRef.current = { session: sessionId, count: 0 };
+  }
   const requestOlderLiveUnits = useCallback(() => {
-    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || archiveQueuedRef.current) {
-      return;
+    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || liveQueuedRef.current) {
+      return false;
     }
-    archiveQueuedRef.current = true;
-    setArchiveQueued(true);
+    liveQueuedRef.current = true;
+    setLiveUnitsBusy(true);
     const token = ++archiveQueueTokenRef.current;
     const el = scrollParent;
     beginViewportPreserve();
@@ -2118,13 +2141,51 @@ export function MessageList({
         top: el.scrollTop,
       };
     }
-    void Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
+    const pending = Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
       if (archiveQueueTokenRef.current !== token) return;
-      archiveQueuedRef.current = false;
-      setArchiveQueued(false);
+      liveQueuedRef.current = false;
+      setLiveUnitsBusy(false);
       setWindowVersion((value) => value + 1);
     });
+    return pending;
   }, [archive, liveHasMore, scrollParent, beginViewportPreserve]);
+  // Earlier steps of this turn load themselves. History stays a manual button,
+  // and scrolling never starts either request.
+  useEffect(() => {
+    if (!liveHasMore) {
+      if (liveAttention) setLiveUnitsAttention(null);
+      return;
+    }
+    if (liveAttention) return;
+    const cursor = archive?.liveUnitsCursor;
+    if (typeof cursor !== "string" || cursor.length === 0) return;
+    if (archive?.loading) return;
+    const mark = `${sessionId ?? ""}\0${cursor}`;
+    if (requestedLiveCursorRef.current === mark) return;
+    if (liveAutoPagesRef.current.count >= LIVE_UNITS_AUTO_PAGE_CAP) {
+      setLiveUnitsAttention({ session: sessionId, kind: "cap" });
+      return;
+    }
+    const pending = requestOlderLiveUnits();
+    if (pending === false) return;
+    requestedLiveCursorRef.current = mark;
+    liveAutoPagesRef.current.count += 1;
+    void pending.then((result) => {
+      if (!result || result.inflight) return;
+      if (requestedLiveCursorRef.current !== mark) return;
+      if (result.error || result.ok === false) {
+        requestedLiveCursorRef.current = null;
+        setLiveUnitsAttention({ session: sessionId, kind: "error" });
+      }
+    });
+  }, [
+    liveHasMore,
+    liveAttention,
+    archive?.liveUnitsCursor,
+    archive?.loading,
+    sessionId,
+    requestOlderLiveUnits,
+  ]);
   const expandLocalWindow = useCallback(() => {
     const el = scrollParent;
     const total = itemCountRef.current;
@@ -2340,30 +2401,44 @@ export function MessageList({
   const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
-  // Live-unit backlog is earlier steps of this turn, not an older
-  // conversation. Render the control inside the latest process shell so it
-  // cannot sit above the opening message or between two shells.
+  // Earlier live units belong to this turn. They auto-fill from the server
+  // cursor, so the process shell does not show a load button. A control only
+  // appears after a failed page or the auto-page cap, and stays inside the
+  // latest process shell rather than above the opening message.
   const olderLiveStepsKey = (() => {
-    if (!liveHasMore) return null;
+    if (!liveHasMore || !liveAttention) return null;
     let key: string | null = null;
     for (const item of visibleItems) {
       if (item.kind === "process") key = itemKey(item);
     }
     return key;
   })();
-  const olderLiveStepsBusy = Boolean(archive?.loading) || archiveQueued;
-  const olderLiveStepsControl = liveHasMore ? (
+  const olderLiveStepsControl = liveHasMore && liveAttention ? (
     <div className="flex justify-center pb-2" data-testid="older-live-steps-loader">
       <button
         type="button"
-        onClick={requestOlderLiveUnits}
-        disabled={olderLiveStepsBusy}
-        aria-busy={olderLiveStepsBusy}
+        onClick={() => {
+          if (liveAttention === "error") {
+            requestedLiveCursorRef.current = null;
+            setLiveUnitsAttention(null);
+            return;
+          }
+          const pending = requestOlderLiveUnits();
+          if (pending === false) return;
+          void pending.then((result) => {
+            if (!result || result.inflight) return;
+            if (result.error || result.ok === false) {
+              setLiveUnitsAttention({ session: sessionId, kind: "error" });
+            }
+          });
+        }}
+        disabled={liveUnitsBusy}
+        aria-busy={liveUnitsBusy}
         className="inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
-        {olderLiveStepsBusy
+        {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
-          : archive?.error
+          : liveAttention === "error"
             ? <span className="text-danger">加载失败，点击重试</span>
             : "加载更早的处理步骤"}
       </button>

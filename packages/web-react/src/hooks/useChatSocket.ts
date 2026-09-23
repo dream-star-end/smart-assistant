@@ -189,7 +189,7 @@ export type UseChatSocket = {
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   loadOlderLiveUnits: (
     sessId: string | undefined,
-  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
+  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean; inflight?: boolean }>;
   /** 按需读取、校验并在 worker 中解析一条超大 immutable record。 */
   fetchTapeRecordPayload: (
     sessId: string | undefined,
@@ -874,6 +874,7 @@ export function useChatSocket(opts: {
   // 统一时间线点击加载并发闸。同一页只能由显式按钮触发一次；滚动与重渲染
   // 都不会进入这里，成功页在刷新前一直驻留内存。
   const olderHistoryFetchingRef = useRef<Set<string>>(new Set());
+  const liveUnitsFetchingRef = useRef<Set<string>>(new Set());
   const loadOlderHistory = useCallback<UseChatSocket["loadOlderHistory"]>(
     async (sessId) => {
       const a = authRef.current;
@@ -935,6 +936,11 @@ export function useChatSocket(opts: {
       if (!session || session._liveUnitsHasMoreBefore !== true || !before) {
         return { ok: true, loaded: 0, hasMore: false };
       }
+      const inflightKey = `${sessId}\0${before}`;
+      if (liveUnitsFetchingRef.current.has(inflightKey)) {
+        return { ok: true, loaded: 0, hasMore: true, inflight: true };
+      }
+      liveUnitsFetchingRef.current.add(inflightKey);
       try {
         const raw = await api.getSessionLiveUnits(a, sessId, { n: 20, before });
         if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") {
@@ -951,6 +957,8 @@ export function useChatSocket(opts: {
         return { ok: true, loaded, hasMore: raw.hasMoreBefore };
       } catch {
         return { ok: false, loaded: 0, hasMore: true, error: true };
+      } finally {
+        liveUnitsFetchingRef.current.delete(inflightKey);
       }
     },
     [socket],
