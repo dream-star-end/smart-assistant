@@ -793,6 +793,13 @@ export function AssistantCard({
   const showRegenerate = isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast);
   // MetaRow(时间 · 积分 · token · 请求ID)只在终态帧到达后出现(见 RenderCtx.inActiveTurn 注释)。
   const metaVisible = !live && !(ctx.sending && ctx.inActiveTurn);
+  const positiveCharge =
+    msg.usage?.waived !== true &&
+    !!msg.usage?.costCredits &&
+    /^\d+$/.test(msg.usage.costCredits) &&
+    msg.usage.costCredits !== "0";
+  // 空正文 + 静默错误卡（不画 Alert）+ 无正向扣费：底栏只剩时间/免单/trace，不挂。
+  const hideOrphanSilentMeta = suppressErrorAlert && !hasDisplayableBody && !positiveCharge;
   const speakerId = (msg.agentId || msg._delegateAgentId || "").trim();
   const speaker = speakerId && speakerId !== "main" ? agentDisplayName(speakerId) : "";
 
@@ -1043,7 +1050,7 @@ export function AssistantCard({
         )}
         {/* 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
             刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。 */}
-        {metaVisible && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
+        {metaVisible && !hideOrphanSilentMeta && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
         {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
             所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
             一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。

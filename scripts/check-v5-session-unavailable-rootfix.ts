@@ -166,6 +166,30 @@ if (!identityCoreSrc.includes('EGRESS_IDENTITY_MISMATCH')) {
 }
 console.log('[claude-identity-guard] PASS — INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.')
 
+// INC-20260923-CCB-FOREGROUND-BASH-CALLBACK: source regression guard, not end-to-end proof.
+const foregroundBashCallbackSrc = readFileSync(join(root, 'packages/gateway/src/ccbLocalAgentCallback.ts'), 'utf8')
+const foregroundBashServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const foregroundBashCardsSrc = readFileSync(join(root, 'packages/web-react/src/components/chat/cards.tsx'), 'utf8')
+if (!foregroundBashCallbackSrc.includes('export function finalizeCcbLocalAgentPendingInjections(')) {
+  throw new Error('[ccb-foreground-bash] flush predicate missing from ccbLocalAgentCallback.ts')
+}
+if (!foregroundBashCallbackSrc.includes('foreground_bash_tool_result_already_delivered')) {
+  throw new Error('[ccb-foreground-bash] drop reason missing')
+}
+if (!foregroundBashCallbackSrc.includes("if (!toolUseId || !ids.has(toolUseId)) continue")) {
+  throw new Error('[ccb-foreground-bash] missing tool_use_id must still inject')
+}
+if (!foregroundBashServerSrc.includes('finalizeCcbLocalAgentPendingInjections(session.sessionKey)')) {
+  throw new Error('[ccb-foreground-bash] server finalize flush must call the predicate')
+}
+if (!foregroundBashServerSrc.includes('noteForegroundBashToolResult({')) {
+  throw new Error('[ccb-foreground-bash] server must record parser tool_result blocks')
+}
+if (!foregroundBashCardsSrc.includes('const hideOrphanSilentMeta = suppressErrorAlert && !hasDisplayableBody && !positiveCharge')) {
+  throw new Error('[ccb-foreground-bash] empty silent waived rows must skip MetaRow')
+}
+console.log('[ccb-foreground-bash] PASS — INC-20260923-CCB-FOREGROUND-BASH-CALLBACK: source regression guard, not end-to-end proof.')
+
 // INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
 // The delegateDurable unit suite separately exercises real SQLite retire/prune and
 // a real-interval cron heartbeat; this gate only stops the contracts regressing.

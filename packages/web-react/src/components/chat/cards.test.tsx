@@ -433,6 +433,87 @@ describe("ThinkingCard 折叠开关可访问性(M-10)", () => {
   });
 });
 
+describe("AssistantCard 空正文静默免单不挂底栏", () => {
+  const quietCtx: RenderCtx = { isLast: true, sending: false, inActiveTurn: false };
+
+  test("空正文且静默错误卡隐藏且免单时不渲染 assistant-meta", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-silent",
+          role: "assistant",
+          text: "",
+          ts: Date.now() - 60_000,
+          _errorCode: "service_restart",
+          usage: { waived: true, traceId: "trace-silent", costCredits: "0" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.queryByTestId("assistant-meta")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+  });
+
+  test("有正文的免单轮仍显示已免单", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-waived-body",
+          role: "assistant",
+          text: "这是已经交付的回答",
+          ts: Date.now() - 60_000,
+          usage: { waived: true, traceId: "trace-body", costCredits: "0" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("本轮已免单")).toBeInTheDocument();
+  });
+
+  test("空正文静默错误但有正向积分时仍显示积分", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-silent-pay",
+          role: "assistant",
+          text: "",
+          ts: Date.now() - 60_000,
+          _errorCode: "service_restart",
+          usage: { traceId: "trace-silent-pay", costCredits: "6" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 6 积分")).toBeInTheDocument();
+  });
+
+  test("正向积分显示积分", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-credits",
+          role: "assistant",
+          text: "扣了费的回答",
+          ts: Date.now() - 60_000,
+          usage: { traceId: "trace-pay", costCredits: "6" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 6 积分")).toBeInTheDocument();
+    expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+  });
+});
+
 describe("AssistantCard MetaRow 时间", () => {
   test("助手卡 MetaRow 有 time 元素", () => {
     const ts = Date.now() - 60_000;
