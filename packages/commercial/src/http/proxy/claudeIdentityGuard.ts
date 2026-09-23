@@ -53,7 +53,9 @@ type GuardRuntime = {
   enabled: boolean;
 };
 
-const PROBE_TTL_MS = 60_000;
+// One hour. The JP egress TLS handshake to ipinfo.io often exceeds the
+// 4s abort, and a 60s cache made the next call probe again.
+const PROBE_TTL_MS = 3_600_000;
 const PINNED_USER_ID_RE = /^[0-9a-f]{64}$/;
 
 let lastIpByAccount = new Map<string, { ip: string; atMs: number }>();

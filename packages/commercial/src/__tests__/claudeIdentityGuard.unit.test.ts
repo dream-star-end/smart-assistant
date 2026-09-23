@@ -117,7 +117,7 @@ describe("assertClaudeOAuthIdentity", () => {
       },
     });
     await assertClaudeOAuthIdentity(baseInput());
-    now = 61_000;
+    now = 3_600_001;
     await assert.rejects(
       () => assertClaudeOAuthIdentity(baseInput()),
       (err: unknown) =>
