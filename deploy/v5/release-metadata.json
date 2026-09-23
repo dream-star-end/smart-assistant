@@ -168,7 +168,8 @@
     "0285_content_review_strikes",
     "0286_claude_opus_55",
     "0287_claude_opus_55_context_1m",
-    "0288_gpt6_sol_luna_retire_gpt56"
+    "0288_gpt6_sol_luna_retire_gpt56",
+    "0289_luna_x04_opus55_match_retire_opus5"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

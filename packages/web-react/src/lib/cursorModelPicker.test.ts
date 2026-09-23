@@ -219,30 +219,30 @@ describe('cursorModelPicker', () => {
 
 describe('longContextCostConfirmationRequired', () => {
   it('warns whenever a non-1M source resolves to a selectable 1M target', () => {
-    expect(longContextCostConfirmationRequired('gpt-5.6-sol', 'gpt-5.6-sol-1m')).toBe(true)
+    expect(longContextCostConfirmationRequired('gpt-6-sol', 'gpt-6-sol-1m')).toBe(true)
     expect(longContextCostConfirmationRequired(undefined, 'kimi-k3')).toBe(true)
-    expect(longContextCostConfirmationRequired('glm-5.3', 'gpt-5.6-terra-1m')).toBe(true)
+    expect(longContextCostConfirmationRequired('glm-5.3', 'gpt-6-luna-1m')).toBe(true)
   })
 
   it('does not re-warn across 1M families or when leaving/staying standard', () => {
-    expect(longContextCostConfirmationRequired('gpt-5.6-sol-1m', 'gpt-5.6-terra-1m')).toBe(false)
-    expect(longContextCostConfirmationRequired('gpt-5.6-sol-1m', 'gpt-5.6-sol')).toBe(false)
-    expect(longContextCostConfirmationRequired('gpt-5.6-sol', 'gpt-5.6-terra')).toBe(false)
+    expect(longContextCostConfirmationRequired('gpt-6-sol-1m', 'gpt-6-luna-1m')).toBe(false)
+    expect(longContextCostConfirmationRequired('gpt-6-sol-1m', 'gpt-6-sol')).toBe(false)
+    expect(longContextCostConfirmationRequired('gpt-6-sol', 'gpt-6-luna')).toBe(false)
   })
 })
 
 describe('context family picker', () => {
   const MODELS: PublicModel[] = [
     { id: 'glm-5.3', display_name: 'GLM-5.3' },
-    { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
-    { id: 'gpt-5.6-sol-1m', display_name: 'GPT-5.6-Sol' },
+    { id: 'gpt-6-sol', display_name: 'GPT-6-Sol' },
+    { id: 'gpt-6-sol-1m', display_name: 'GPT-6-Sol' },
     { id: 'k3-256k', display_name: 'Kimi K3 256K' },
     { id: 'kimi-k3', display_name: 'Kimi K3' },
   ]
 
   it('collapses GPT and Kimi context twins into one row each', () => {
     const rows = modelPickerRows(MODELS)
-    expect(rows.map(rowKey)).toEqual(['glm-5.3', 'gpt-5.6-sol', 'kimi-k3'])
+    expect(rows.map(rowKey)).toEqual(['glm-5.3', 'gpt-6-sol', 'kimi-k3'])
   })
 
   it('defaults GPT/Kimi to the standard window', () => {
@@ -302,26 +302,35 @@ describe('collapsed GPT family group (2026-09-05)', () => {
     expect(flags).toEqual([
       ['gpt-6-astra', false],
       ['gpt-6-sol', false],
-      ['gpt-6-luna', true],
+      ['gpt-6-luna', false],
     ])
   })
 
-  it('partitions collapsed families out of the visible list, preserving order', () => {
+  it('leaves retired GPT-5.6 rows visible because they are no longer a collapsed family', () => {
     const rows = modelPickerRows(MODELS)
     const { visible, collapsed, selectedInCollapsed } = partitionCollapsedRows(rows, 'gpt-5.6-sol')
-    expect(visible.map(rowKey)).toEqual(['glm-5.3', 'gpt-5.6-sol', 'gpt-6-astra'])
-    expect(collapsed.map(rowKey)).toEqual(['gpt-5.6-terra', 'gpt-5.6-luna'])
+    expect(collapsed).toEqual([])
+    expect(visible.map(rowKey)).toEqual([
+      'glm-5.3',
+      'gpt-5.6-sol',
+      'gpt-5.6-sol-1m',
+      'gpt-6-astra',
+      'gpt-5.6-terra',
+      'gpt-5.6-terra-1m',
+      'gpt-5.6-luna',
+      'gpt-5.6-luna-1m',
+    ])
     expect(selectedInCollapsed).toBe(false)
   })
 
-  it('reports when the selected model (either window) lives in the collapsed group', () => {
+  it('does not treat a retired GPT-5.6 id as selected inside the collapsed group', () => {
     const rows = modelPickerRows(MODELS)
-    expect(partitionCollapsedRows(rows, 'gpt-5.6-terra').selectedInCollapsed).toBe(true)
-    expect(partitionCollapsedRows(rows, 'gpt-5.6-luna-1m').selectedInCollapsed).toBe(true)
+    expect(partitionCollapsedRows(rows, 'gpt-5.6-terra').selectedInCollapsed).toBe(false)
+    expect(partitionCollapsedRows(rows, 'gpt-5.6-luna-1m').selectedInCollapsed).toBe(false)
     expect(partitionCollapsedRows(rows, undefined).selectedInCollapsed).toBe(false)
   })
 
-  it('keeps degraded collapsed families out of the group so the degraded tail stays visible', () => {
+  it('keeps retired degraded rows in the visible list', () => {
     const rows = modelPickerRows([
       { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
       { id: 'gpt-5.6-terra', display_name: 'GPT-5.6-Terra', degraded: true },
@@ -329,8 +338,8 @@ describe('collapsed GPT family group (2026-09-05)', () => {
       { id: 'gpt-5.6-luna', display_name: 'GPT-5.6-Luna' },
     ])
     const { visible, collapsed } = partitionCollapsedRows(rows, undefined)
-    expect(collapsed.map(rowKey)).toEqual(['gpt-5.6-luna'])
-    expect(visible.map(rowKey)).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra'])
+    expect(collapsed).toEqual([])
+    expect(visible.map(rowKey)).toEqual(['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-terra-1m'])
   })
 
   it('collapses official Grok 4.7 and Fast into one row labeled from the standard model', () => {

@@ -107,11 +107,11 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     )
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.filter((f) => f.collapsedByDefault).map((f) => f.family),
-      ['gpt-6-luna'],
+      [],
     )
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-astra'), false)
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-sol'), false)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-6-luna'), true)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6-luna'), false)
     assert.equal(contextFamilyByModelId('gpt-5.6-sol'), undefined)
     assert.equal(contextFamilyCollapsedByDefault('kimi-k3'), false)
     assert.equal(contextFamilyByModelId('gpt-6-astra-1m')?.family, 'gpt-6-astra')

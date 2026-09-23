@@ -28,7 +28,7 @@ export type ContextPickerRow = {
   spec: ContextTierFamily
   /**
    * protocol CONTEXT_TIER_FAMILIES.collapsedByDefault 的投影:为 true 的家族默认收进
-   * 「更多 GPT 模型」折叠组(2026-09-05:Terra/Luna)。纯展示语义,不改准入/计费。
+   * 「更多 GPT 模型」折叠组。纯展示语义,不改准入/计费。
    */
   collapsed: boolean
 }

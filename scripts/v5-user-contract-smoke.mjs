@@ -44,7 +44,7 @@ try {
   page.setDefaultNavigationTimeout(20_000);
   await step(() => coldUiLogin(page, options, password));
   await step(async () => {
-    await selectJourneyModel(page, options.model, { requireCollapsed: true });
+    await selectJourneyModel(page, options.model, { requireCollapsed: false });
     await sendContractTurn(page, probe, { model: options.model, catalog: [], cost: "dry", requireHttpModel: true });
     // C2 is always intercepted: no background paid turn competes with C3.
   });

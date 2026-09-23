@@ -121,8 +121,8 @@ export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 /**
  * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
  * 收进「更多 GPT 模型」折叠组。2026-09-23 起 GPT-5.6 退出选择器(catalog 由 0288 下线);
- * GPT-6 Luna 默认折叠,给 Astra / Sol 腾位,也让切流冒烟 C2 仍有折叠组可点。
- * 当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
+ * GPT-6 Astra / Sol / Luna 都直接展示,Luna 不进「更多」。切流冒烟 C2 选可见模型,
+ * 不再依赖折叠组。当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
  */
 export const CONTEXT_TIER_FAMILIES = [
   {
@@ -144,7 +144,7 @@ export const CONTEXT_TIER_FAMILIES = [
     familyLabel: 'GPT-6-Luna',
     standardId: 'gpt-6-luna',
     longId: 'gpt-6-luna-1m',
-    collapsedByDefault: true,
+    collapsedByDefault: false,
   },
   {
     family: 'kimi-k3',
