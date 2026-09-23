@@ -12,7 +12,7 @@ import {
   remoteClaudeArgs,
   type BoxCcControl,
   type BoxCcExecRequest,
-} from './cursorBoxCc.js'
+} from './cursorBoxCcExec.js'
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>
 
