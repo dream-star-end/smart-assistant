@@ -4676,6 +4676,23 @@
           "assertion": "两分钟内相同 status+summary 的第二条本地子 Agent 通知不再注入"
         }
       ]
+    },
+    {
+      "id": "INC-20260923-QUEUE-ABOVE-COMPOSER",
+      "occurredAt": "2026-09-23",
+      "severity": "P1",
+      "symptom": "上一条还在跑时，新消息被画进对话窗口。用户要的是输入框上方的待发送列表，右侧是修改和立即发送。",
+      "rootFixCommit": "fc121930733cec01557e8b274ec856137895ad2f",
+      "coverageCommits": [
+        "fc121930733cec01557e8b274ec856137895ad2f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
+          "assertion": "待发送卡片有修改和立即发送；对话流不渲染 status=queued 的用户消息"
+        }
+      ]
     }
   ]
 }
