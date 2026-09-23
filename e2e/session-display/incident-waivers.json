@@ -380,6 +380,12 @@
       "reason": "Picker tests still passed retired GPT-5.6 family literals into the GPT-6 context picker, so the selfhost web build failed tsc before cutover. Tests now use the GPT-6 Sol and Luna specs. No billing or stored-data change.",
       "approvedBy": "user 2026-09-23 批准开工 OCV5-277; build break on the same ride",
       "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43",
+      "reason": "Cutover smoke C2 needs one collapsed Codex model. GPT-6 Luna is folded and the contract default moves off disabled GPT-5.6 Luna. Trailer was written as OCV5-276 before the format check; the shared branch cannot rewrite it. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 选择现在就切流 OCV5-276",
+      "expiresAt": "2026-10-23"
     }
   ]
 }

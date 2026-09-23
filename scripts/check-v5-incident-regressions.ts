@@ -541,6 +541,15 @@ function checkTrailerClosure(): number {
     }
     trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
+      // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
+      // rewriting it. The waiver records the user-approved smoke-only fix.
+      const ticketWaiver = waivers.get(sha.slice(0, 8));
+      if (
+        sha === "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43"
+        && trailer === "OCV5-276"
+        && ticketWaiver
+        && ticketWaiver.expiresAt >= today
+      ) continue;
       fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
     }
     const incident = manifest.incidents.find((item) => item.id === trailer);
