@@ -888,6 +888,8 @@ describe('oc-cursor wrapper', () => {
     const f = fixture()
     for (const model of [
       'claude-haiku-4-5',
+      'claude-opus-5-5',
+      'claude-sonnet-5',
       'gemini-3.1-pro',
       'gpt-5.6-luna-low',
       'gpt-5.6-luna-high-fast',

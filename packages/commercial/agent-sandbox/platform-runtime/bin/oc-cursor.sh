@@ -490,6 +490,7 @@ case "$model" in
   gpt-5.6-luna-high|gpt-5.6-luna-high-fast|gpt-5.6-luna-xhigh|gpt-5.6-luna-xhigh-fast|\
   gpt-5.6-luna-max|gpt-5.6-luna-max-fast|\
   claude-haiku-4-5|\
+  claude-opus-5-5|claude-sonnet-5|\
   cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac
