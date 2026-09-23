@@ -865,11 +865,13 @@ function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending
 
 function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner: string; boundary: string } {
   const nextOwner = rows[0]?.role === "user" ? rows[0].id : owner;
-  // One shell per turn. History/live page keys stay on the rows for other
-  // cards, but must not open a second "处理过程" in the middle of the same turn.
+  // One visible user turn, one shell. A step's own _clientMessageId often
+  // disagrees with that turn while the live pack and the tape are both on
+  // screen (or a hidden recovery id is stamped on later rows). Page keys
+  // already stay off this boundary; the row id must too.
   return {
     owner: nextOwner,
-    boundary: rows[0]?._clientMessageId || nextOwner,
+    boundary: nextOwner,
   };
 }
 
@@ -908,8 +910,13 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   // Key off the turn, not the first row. Prepending an older live page must
   // not remount the shell the reader already has open.
   const shellOrdinal = new Map<string, number>();
+  // Shells still open for a turn that has not crossed its final answer.
+  // A later step with a different row id rejoins this shell instead of
+  // painting a second 处理过程. Crossing the answer drops the entry so a
+  // tool that arrives under the answer stays a separate section below it.
+  const beforeAnswer = new Map<string, ProcessGroup>();
   const seal = (current: ProcessGroup | undefined, keyBoundary: string) => {
-    if (!current) return;
+    if (!current || current.key) return;
     const work = current.members.find((message) =>
       !isClearedGoalRecord(message) && (isFoldableWorkRole(message) || isHistoricalGoalRecord(message)));
     const ordinal = shellOrdinal.get(keyBoundary) ?? 0;
@@ -935,8 +942,12 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       seal(group, boundary);
       const crossedAnswer = rows.some((message) => answerIds.has(message.id));
       if (crossedAnswer) {
+        beforeAnswer.delete(boundary);
         const kept = group ?? (carry?.boundary === nextBoundary ? carry.group : undefined);
         carry = { boundary: nextBoundary, group: kept, answerIndex: out.length };
+      } else if (group && out.includes(group)) {
+        beforeAnswer.set(boundary, group);
+        carry = undefined;
       } else {
         carry = undefined;
       }
@@ -957,10 +968,15 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       continue;
     }
     if (carry && !planOnly(rows)) carry = undefined;
-    if (!group || boundary !== nextBoundary) {
+    const rejoin = !group ? beforeAnswer.get(nextBoundary) : undefined;
+    if (rejoin && out.includes(rejoin)) {
+      group = rejoin;
+      boundary = nextBoundary;
+    } else if (!group || boundary !== nextBoundary) {
       seal(group, boundary);
       group = { kind: "process", key: "", members: [], items: [], active: false };
       boundary = nextBoundary;
+      beforeAnswer.set(nextBoundary, group);
       out.push(group);
     }
     group.items.push(item);

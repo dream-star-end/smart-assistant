@@ -345,6 +345,32 @@ describe("MessageList Manus 过程披露", () => {
     expect(within(disclosure).getByText("页二阶段")).toBeInTheDocument();
   });
 
+  test("同一轮里步骤编号不一致仍是一张处理过程", () => {
+    renderList([
+      row("u", "user", "统一替换下", { status: "replied" }),
+      row("early", "tool", "终端", {
+        _clientMessageId: "live-pack",
+        toolName: "Grep",
+        inputJson: { pattern: "early-step" },
+        _completed: true,
+        output: "a",
+      }),
+      row("later", "tool", "终端", {
+        _clientMessageId: "tape-row",
+        toolName: "Edit",
+        inputJson: { file_path: "later-step.ts" },
+        _completed: true,
+        output: "b",
+      }),
+      row("note", "assistant", "运行时选型已经改到 4.7", { _clientMessageId: "tape-row" }),
+      row("answer", "assistant", "最终回答在外面", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("搜索 1 项");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("编辑 1 项");
+    expect(screen.getByText("最终回答在外面").closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
   test("延迟加载的最终回答留在外面，过程里的延迟行仍会挂上读取入口", async () => {
     const messages: ChatMessage[] = [
       row("u", "user", "看记录", { status: "replied" }),
@@ -1551,15 +1577,13 @@ describe("MessageList Manus 过程披露", () => {
     expect(meta).toHaveTextContent("9 积分");
     expect(meta.querySelector("time")).not.toBeNull();
     expect(meta).not.toHaveTextContent(/token/i);
-    const toggles = screen.getAllByTestId("process-toggle");
-    const goalToggle = toggles.find((node) => node.textContent?.includes("目标"));
-    const commandToggle = toggles.find((node) => node.textContent?.includes("命令"));
+    expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
+    const goalToggle = screen.getByTestId("process-toggle");
     expect(goalToggle).toHaveTextContent("目标 1 项");
+    expect(goalToggle).toHaveTextContent("命令 1 项");
     expect(goalToggle).not.toHaveTextContent("目标 2");
-    expect(commandToggle).not.toHaveTextContent("目标");
-    fireEvent.click(goalToggle!);
+    fireEvent.click(goalToggle);
     expect(screen.getByText(/做完的目标/).closest("[data-testid=process-goal]")).not.toBeNull();
-    fireEvent.click(commandToggle!);
     const stage = screen.getByTestId("process-stage");
     expect(stage.className).not.toMatch(/\btext-sm\b|\bleading-6\b|\btext-muted\b/);
     expect(stage.querySelector(".prose")).not.toBeNull();
