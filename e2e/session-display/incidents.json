@@ -4595,6 +4595,55 @@
           "assertion": "apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败"
         }
       ]
+    },
+    {
+      "id": "INC-20260923-CCB-FOREGROUND-BASH-CALLBACK",
+      "occurredAt": "2026-09-23",
+      "severity": "P1",
+      "symptom": "CLI 2.1.280 对已以前台 tool_result 交付的 Bash 仍发无 ack 的 task_notification，父回合 finalize 把它注入成新的计费轮；空正文且错误卡被静默隐藏、又没有正向扣费时，助手底栏仍单独挂出。",
+      "rootFixCommit": "692c3c6c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "foreground bash tool_result already delivered then task_notification with no ack injects 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "timeout moved to background tool_result then task_notification injects 1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "task_notification without tool_use_id still injects 1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "bookend before foreground tool_result still injects 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "空正文且静默错误卡隐藏且免单时不渲染 assistant-meta"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "有正文的免单轮仍显示已免单"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "正向积分显示积分"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }
