@@ -457,6 +457,26 @@ describe("AssistantCard 空正文静默免单不挂底栏", () => {
     expect(screen.getByLabelText("本轮已免单")).toBeInTheDocument();
   });
 
+  test("空正文静默错误但有正向积分时仍显示积分", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-silent-pay",
+          role: "assistant",
+          text: "",
+          ts: Date.now() - 60_000,
+          _errorCode: "service_restart",
+          usage: { traceId: "trace-silent-pay", costCredits: "6" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 6 积分")).toBeInTheDocument();
+  });
+
   test("正向积分显示积分", () => {
     render(
       <AssistantCard
