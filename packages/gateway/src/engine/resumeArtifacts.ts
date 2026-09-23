@@ -31,8 +31,10 @@ import { join } from 'node:path'
 import { paths } from '@openclaude/storage'
 import {
   cursorResumeStorePath,
+  cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
   cursorSandResumeInnerId,
+  isCursorSandBoxCcResumeId,
   isAnyCursorSandResumeId,
 } from './cursorAdapter.js'
 
@@ -215,6 +217,10 @@ export function probeResumeArtifact(
       r = ccbJsonlArtifact(resumeId, claudeConfigDir)
       break
     case 'cursor': {
+      if (isCursorSandBoxCcResumeId(resumeId)) {
+        r = cursorSandBoxCcResumeInnerId(resumeId) ? { exists: true } : null
+        break
+      }
       const inner = cursorSandResumeInnerId(resumeId) ?? cursorSandOfficialCcResumeInnerId(resumeId)
       if (inner) {
         r = ccbJsonlArtifact(inner, claudeConfigDir)

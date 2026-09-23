@@ -39,9 +39,11 @@ import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
 import {
+  cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
   cursorResumeStoreExists,
   cursorSandResumeInnerId,
+  isCursorSandBoxCcResumeId,
   isAnyCursorSandResumeId,
   relocateCursorResumeStore,
   usableCursorResumeId,
@@ -3330,6 +3332,20 @@ export class SessionManager {
     }
     if (tag !== wantProvider) return undefined
 
+    if (tag === 'cursor' && isCursorSandBoxCcResumeId(id)) {
+      if (!cursorSandBoxCcResumeInnerId(id)) {
+        log.warn('resume-map Cursor box Claude entry is malformed — dropping silently', {
+          sessionKey,
+          resumeId: id,
+        })
+        this._forgetResumeEntry(sessionKey)
+        this._saveResumeMap()
+        return undefined
+      }
+      // The JSONL is on the account box, not in this container.
+      return id
+    }
+
     if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
       const sandJsonlId = cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
       if (!sandJsonlId) {
@@ -5216,6 +5232,9 @@ export class SessionManager {
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
       const liveNativeId = session.runner.nativeSessionId
+      const liveBoxId = session.providerTag === 'cursor'
+        ? cursorSandBoxCcResumeInnerId(liveNativeId)
+        : undefined
       const liveSandJsonlId =
         session.providerTag === 'cursor'
           ? (cursorSandResumeInnerId(liveNativeId) ??
@@ -5223,7 +5242,9 @@ export class SessionManager {
           : undefined
       const usableCursorId =
         session.providerTag === 'cursor'
-          ? liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
+          ? liveBoxId
+            ? (liveNativeId ?? undefined)
+            : liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
             ? (liveNativeId ?? undefined)
             : usableCursorResumeId({
                 workspacePath: spawnCwd,

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
+import { boxCcBridgePath, stripBoxCcParentAuth } from './engine/cursorBoxCc.js'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { atomicWriteJsonFile, buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
@@ -866,6 +867,10 @@ export interface SubprocessRunnerOpts {
    * unless `OC_CCB_OFFICIAL_CC=1`). Official-cc is either Cursor Sand
    * loopback (`authorityEngine=cursor`) or the engine=ccb Anthropic proxy. */
   harness?: 'ccb' | 'official-cc'
+  /** Official Claude Code runs inside the selected account's Grok Bot box. */
+  boxResidentCc?: boolean
+  /** Writes the 0600 exec control file on first spawn. */
+  prepareBoxCc?: () => Promise<string>
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   /** Engine-agnostic durable-artifact ladder: given the native id the engine
@@ -1344,6 +1349,7 @@ export class SubprocessRunner extends EventEmitter {
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
+  private boxCcControlPath: string | null = null
   private officialAbortResultObserved = false
   /** engine=ccb official-cc: headers applied at next spawn (stock CLI cannot
    * hot-update env). Cursor Sand official-cc leaves this unset. */
@@ -1519,13 +1525,28 @@ export class SubprocessRunner extends EventEmitter {
     // is assigned would never bump _consecutiveCrashes, and the caller could
     // retry immediately and re-throw, burning CPU.
     try {
+    if (this.opts.boxResidentCc && !this.boxCcControlPath) {
+      if (!this.opts.prepareBoxCc) {
+        this.starting = false
+        throw new Error('BOX_CC_CONTROL_REQUIRED')
+      }
+      this.boxCcControlPath = await this.opts.prepareBoxCc()
+    }
     const { config } = this.opts
     const harness = resolveCcbHarness(this.opts.harness)
     let binaryDir: string
     let command: string
     let ccbEntry: string | undefined
     let ccbRuntime: string | undefined
-    if (harness === 'official-cc') {
+    if (this.opts.boxResidentCc) {
+      const bridge = boxCcBridgePath()
+      if (!existsSync(bridge)) {
+        this.starting = false
+        throw new Error('BOX_CC_BRIDGE_MISSING')
+      }
+      command = process.execPath
+      binaryDir = dirname(bridge)
+    } else if (harness === 'official-cc') {
       try {
         assertOfficialCcSpawnPreconditions(this.opts)
       } catch (err) {
@@ -1633,7 +1654,7 @@ export class SubprocessRunner extends EventEmitter {
         })
       }
     }
-    const args = harness === 'official-cc'
+    let args = harness === 'official-cc'
       ? buildOfficialClaudeCliArgs({
           model: this.opts.model,
           permissionMode: this.opts.permissionMode,
@@ -1661,6 +1682,7 @@ export class SubprocessRunner extends EventEmitter {
           settingsFile: learningContext.settingsFile,
           structuredOutputSchema: this.opts.structuredOutputSchema,
         })
+    if (this.opts.boxResidentCc) args = [boxCcBridgePath(), ...args]
 
     // ── Provider-aware auth injection ──
     // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
@@ -1699,7 +1721,7 @@ export class SubprocessRunner extends EventEmitter {
     if (this.opts.providerEnvOverride) {
       Object.assign(finalizedProviderEnv, this.opts.providerEnvOverride)
     }
-    if (harness === 'official-cc' && this.opts.authorityEngine === 'cursor') {
+    if (harness === 'official-cc' && this.opts.authorityEngine === 'cursor' && !this.opts.boxResidentCc) {
       if (!isOfficialClaudeCursorSandLoopbackEnv(finalizedProviderEnv)) {
         this.starting = false
         this._boundRepoBinding = null
@@ -1807,12 +1829,22 @@ export class SubprocessRunner extends EventEmitter {
                 CLAUDE_CODE_UNATTENDED_RETRY: '0',
               }
             : {}),
-          ...(harness === 'official-cc' && this.pendingOfficialSpawnEnv
+          ...(harness === 'official-cc' && !this.opts.boxResidentCc && this.pendingOfficialSpawnEnv
             ? this.pendingOfficialSpawnEnv
             : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children
+      }
+      if (this.opts.boxResidentCc) {
+        if (!this.boxCcControlPath) {
+          this.starting = false
+          throw new Error('BOX_CC_CONTROL_REQUIRED')
+        }
+        spawnOpts.env = stripBoxCcParentAuth(
+          spawnOpts.env as Record<string, string>,
+          this.boxCcControlPath,
+        )
       }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)

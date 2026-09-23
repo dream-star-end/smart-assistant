@@ -182,6 +182,37 @@ export class CursorSandBoxResolver {
     this.cachedMachineHash = entry.machineHash
     return connection
   }
+
+  async resolveExec(token: string, machine: string, signal: AbortSignal): Promise<CursorSandBoxExecTarget> {
+    await this.resolve(token, machine, signal)
+    const response = await this.control('EnsureSandBox', token, machine, signal)
+    return parseCursorSandBoxExecTarget(response)
+  }
+}
+
+export interface CursorSandBoxExecTarget {
+  execUrl: string
+  execToken: string
+  networkToken: string
+}
+
+export function parseCursorSandBoxExecTarget(body: Record<string, unknown>): CursorSandBoxExecTarget {
+  const raw = body.execDaemonUrl
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2048) throw new CursorSandBoxError('DESCRIPTOR_INVALID')
+  let url: URL
+  try { url = new URL(raw) } catch { throw new CursorSandBoxError('DESCRIPTOR_INVALID') }
+  if (url.protocol !== 'https:' || !url.hostname.endsWith('.cursorvm.com') || url.username || url.password || url.search || url.hash) {
+    throw new CursorSandBoxError('DESCRIPTOR_INVALID')
+  }
+  const prefix = url.pathname.replace(/\/+$/, '')
+  if (!prefix.endsWith('/agent.v1.ControlService/Exec')) {
+    url.pathname = `${prefix}/agent.v1.ControlService/Exec`
+  }
+  return {
+    execUrl: url.href,
+    execToken: secret(body.execDaemonAuthToken),
+    networkToken: secret(body.networkToken),
+  }
 }
 
 export function cursorSandBoxHeaders(connection: CursorSandBoxConnection, original: Record<string, string>): Record<string, string> {

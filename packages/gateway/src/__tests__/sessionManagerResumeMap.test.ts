@@ -362,3 +362,22 @@ test('live Grok overlay keeps provider when the resume-map provider slot is empt
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test("box Claude resume id is kept without a local JSONL", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "oc-box-cc-resume-"))
+  try {
+    const manager = new SessionManager(makeConfigStub())
+    const internals = manager as unknown as ResumeMapInternals
+    internals.resumeMapPath = join(dir, "resume-map.json")
+    const id = "sand-box-cc:3bdc1a6e-63e3-4a3b-a29f-9aeb4e08c1cd"
+    internals._resumeMap.set("box-session", id)
+    internals._resumeMapProvider.set("box-session", "cursor")
+    assert.equal(internals._resumeIdFor("box-session", "cursor", join(dir, "missing")), id)
+    internals._resumeMap.set("bad-box", "sand-box-cc:not-a-uuid")
+    internals._resumeMapProvider.set("bad-box", "cursor")
+    assert.equal(internals._resumeIdFor("bad-box", "cursor", join(dir, "missing")), undefined)
+    await internals.awaitResumeMapFlush()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
