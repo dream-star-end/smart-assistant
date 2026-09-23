@@ -392,10 +392,11 @@ import {
   evaluateCcbLocalAgentInjectLimit,
   failCcbLocalAgentInject,
   getCcbLocalAgentCallbackState,
+  finalizeCcbLocalAgentPendingInjections,
   noteCcbLocalAgentFinalizeRoundExhausted,
   noteCcbTaskNotification,
+  noteForegroundBashToolResult,
   sessionHasInFlightTurn,
-  takePendingInjectionsForSession,
   type CcbLocalAgentNotification,
 } from './ccbLocalAgentCallback.js'
 import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
@@ -16331,8 +16332,16 @@ export class Gateway {
   private flushCcbLocalAgentPendingOnFinalize(
     session: { sessionKey: string; userId?: string },
   ): void {
-    const due = takePendingInjectionsForSession(session.sessionKey)
-    for (const item of due) {
+    const { inject, dropped } = finalizeCcbLocalAgentPendingInjections(session.sessionKey)
+    for (const item of dropped) {
+      this.log.info('ccb local-agent callback dropped', {
+        sessionKey: item.sessionKey,
+        taskId: item.taskId,
+        toolUseId: item.toolUseId,
+        reason: item.reason,
+      })
+    }
+    for (const item of inject) {
       this.queueCcbLocalAgentInject(session.sessionKey, item.payload, item.userId ?? session.userId)
     }
   }
@@ -21686,6 +21695,15 @@ export class Gateway {
         // 必须放在 _apiErrorIntercepted guard 之前:本 turn 先启动 bg bash 再
         // 命中 API_ERROR 时,parser 已允许 finalized 后的 bash_output_tail 进来,
         // 这里若被 API_ERROR 吞掉,前端会再次卡在第一行——回归到修复前的症状。
+        if (b?.kind === 'tool_result') {
+          noteForegroundBashToolResult({
+            sessionKey,
+            toolUseId: typeof b.toolUseBlockId === 'string' ? b.toolUseBlockId : '',
+            toolName: typeof b.toolName === 'string' ? b.toolName : undefined,
+            output: typeof b.output === 'string' ? b.output : '',
+            parentToolUseId: typeof b.parentToolUseId === 'string' ? b.parentToolUseId : undefined,
+          })
+        }
         const isTail = b?.kind === 'tool_output_tail'
         if (isTail) {
           if (liveWechatAdapter) {
