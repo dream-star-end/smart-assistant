@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { CURSOR_ENGINE_MODELS } from '../../../protocol/src/engineModels.ts'
 import { uniqueCursorAccountIdFromSlotResults } from '../account-pool/cursorQuota.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
@@ -881,6 +882,21 @@ describe('oc-cursor wrapper', () => {
       })
       assert.equal(blocked.status, 2, model)
       assert.match(blocked.stderr, /model is not allowlisted/)
+    }
+  })
+
+  test('accepts every declared Box Claude upstream model before a turn starts', () => {
+    const f = fixture()
+    const boxModels = CURSOR_ENGINE_MODELS.filter((model) => model.id.startsWith('box-claude-'))
+    assert.ok(boxModels.length > 0)
+    for (const model of boxModels) {
+      assert.ok(model.upstreamModel)
+      const result = spawnSync(f.wrapper, ['--model', model.upstreamModel, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, `${model.id} -> ${model.upstreamModel}: ${result.stderr}`)
     }
   })
 
