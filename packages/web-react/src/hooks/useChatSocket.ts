@@ -113,6 +113,10 @@ export type UseChatSocket = {
     errorMessageId: string;
     agentId: string;
   }) => void;
+  /** 排队中的消息收回输入框，并从发送队列拿掉。 */
+  editQueuedMessage: (sessId: string, msgId: string) => string | undefined;
+  /** 停掉当前轮，马上发送这条已排队的消息。 */
+  sendQueuedNow: (sessId: string, msgId: string) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;
   /** Apply REST/WS platform goal snapshots to the live session model. */
@@ -771,6 +775,14 @@ export function useChatSocket(opts: {
     (p) => socket.continueInterruptedTurn(p),
     [socket],
   );
+  const editQueuedMessage = useCallback<UseChatSocket["editQueuedMessage"]>(
+    (sessId, msgId) => socket.editQueuedMessage(sessId, msgId),
+    [socket],
+  );
+  const sendQueuedNow = useCallback<UseChatSocket["sendQueuedNow"]>(
+    (sessId, msgId) => socket.sendQueuedNow(sessId, msgId),
+    [socket],
+  );
   const setActiveSession = useCallback((sessId: string | undefined) => socket.setActiveSession(sessId), [socket]);
   const setGoalState = useCallback<UseChatSocket["setGoalState"]>(
     (sessId, goal) => socket.setGoalState(sessId, goal),
@@ -1129,6 +1141,8 @@ export function useChatSocket(opts: {
       stop,
       retryMessage,
       continueInterruptedTurn,
+      editQueuedMessage,
+      sendQueuedNow,
       setActiveSession,
       setGoalState,
       getTransientNotice,
@@ -1168,6 +1182,8 @@ export function useChatSocket(opts: {
       stop,
       retryMessage,
       continueInterruptedTurn,
+      editQueuedMessage,
+      sendQueuedNow,
       setActiveSession,
       setGoalState,
       getTransientNotice,
