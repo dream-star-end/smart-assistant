@@ -4602,6 +4602,9 @@
       "severity": "P1",
       "symptom": "CLI 2.1.280 对已以前台 tool_result 交付的 Bash 仍发无 ack 的 task_notification，父回合 finalize 把它注入成新的计费轮；空正文且错误卡被静默隐藏、又没有正向扣费时，助手底栏仍单独挂出。",
       "rootFixCommit": "692c3c6c",
+      "coverageCommits": [
+        "a9040b8d"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -4627,6 +4630,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/cards.test.tsx",
           "assertion": "空正文且静默错误卡隐藏且免单时不渲染 assistant-meta"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "空正文静默错误但有正向积分时仍显示积分"
         },
         {
           "layer": "unit",
